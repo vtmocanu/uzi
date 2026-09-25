@@ -111,6 +111,7 @@ const ALLOWED: string[] = [
   "sh -c 'npm run build'", // benign inner command
   "bash -c \"git status && git commit -m ok\"", // benign inner chain
   "timeout 30 npm test", // timeout wrapper around a benign command
+  "nice -n 10 npm test", // nice wrapper with its -n value
   // Local-worktree force ops are NOT a directive concern — must stay allowed.
   "git clean -f",
   "git clean -fd",
@@ -315,6 +316,401 @@ describe("existing denies still fire on a wired docker worker (PRD #83 B3)", () 
       true,
       "second segment (token read) denies the whole compound",
     );
+  });
+});
+
+// #1576: mass-signal kill commands reach the agent's own process tree (a busybox lsof
+// ignores its filters and lists every process, so `kill $(lsof -ti :3000)` kills the
+// agent). The reason literal is module-private, so it is spelled out here; the
+// "deny reasons carry the user-facing phrase" table below reaches it too.
+describe("mass-signal guardrail (#1576)", () => {
+  const MASS_SIGNAL_REASON =
+    "denied by guardrail: mass-signal kill commands (pkill, killall, skill, fuser -k, kill of a broadcast/process-group target, or kill of PIDs enumerated by lsof/pgrep/ps/fuser/pidof) can kill the agent's own process tree; stop a background task through the harness, or kill \"$pid\" with the exact PID saved at launch (run it as its own command, without lsof/pgrep/ps/fuser/pidof in the same command)";
+
+  const DENIED_MASS = [
+    "pkill -f vite",
+    "pkill node",
+    "killall node",
+    "sudo killall -9 node",
+    "sh -c 'pkill -f npm'",
+    'eval "killall node"',
+    "timeout 5 pkill x",
+    "fuser -k 3000/tcp",
+    "fuser -km /mnt",
+    "kill -- -1",
+    "kill -9 -1",
+    "kill -KILL -1",
+    "kill -s KILL -1",
+    "kill 0",
+    "kill -- -4242",
+    "kill -TERM -- -$pgid",
+    "kill $(lsof -ti :3000)",
+    "kill -9 $(pgrep node)",
+    "kill `pgrep node`",
+    "kill `lsof -t -i :5173`",
+    "pid=$(lsof -ti :3000); kill $pid",
+    'kill "$(ps -o pid= -g 1)"',
+    "lsof -ti :3000 | xargs kill",
+    "bash -c 'kill $(fuser 3000/tcp)'",
+    // Wrapper option values are skipped, not taken as the command word.
+    "lsof -ti :3000 | xargs -n 1 kill",
+    "lsof -ti :3000 | xargs -P 4 kill",
+    "sudo -u root pkill node",
+    // xargs placeholders are dynamic targets.
+    "lsof -ti :3000 | xargs -I{} kill -9 {}",
+    "lsof -ti :3000 | xargs -I % kill -9 %",
+    // Shell reserved words do not hide the command word.
+    "lsof -ti :3000 | while read p; do kill $p; done",
+    "for p in $(lsof -ti :3000); do kill -9 $p; done",
+    // Numeric targets <= 0, and padded negatives.
+    "kill -9 00",
+    "kill -9 +0",
+    'kill -9 " -1"',
+    'kill -0 " -1"',
+    // Enumerators found from tokens, so escaping does not hide them.
+    "kill $(\\lsof -t)",
+    "kill $(ls''of -t)",
+    "\\lsof -ti :3000 | xargs kill",
+    "kill $(pidof node)",
+    "pidof node | xargs kill",
+    // A mass-signal command inside a backtick or double-quoted substitution, which the
+    // tokenizer keeps in one word: each substitution body is screened as a command.
+    "echo `pkill node`",
+    "x=`killall node`",
+    'echo "$(pkill node)"',
+    'echo "`pkill node`"',
+    'echo "$(kill -- -1)"',
+    'echo "$(kill 0)"',
+    "echo `kill -9 -1`",
+    "x=`kill 0`",
+    'echo "$(sudo kill -9 -1)"',
+    'echo "$(fuser -k 3000/tcp)"',
+    "echo `fuser -k 3000/tcp`",
+    // The body is tokenized, so an escape inside it does not hide the command word.
+    'kill "$(\\lsof -t)"',
+    'echo "`\\pkill x`"',
+    "skill -KILL -u runner",
+    // Pins the keep-scanning loop in screenWithDepth: the pgrep segment denies first.
+    "pid=$(pgrep node); kill $pid",
+    // An enumerator anywhere inside a quoted substitution, not only right after `$(`.
+    'kill "$(command lsof -ti :3000)"',
+    'kill "$(sudo lsof -ti :3000)"',
+    'kill "$(true; lsof -ti :3000)"',
+    'kill "`command pgrep node`"',
+    // Clustered wrapper flags whose last letter takes the next word as its value.
+    "lsof -ti :3000 | xargs -rn 1 kill",
+    "lsof -ti :3000 | xargs -rI {} kill {}",
+    // xargs -e takes only an attached value, so `kill` is the command word.
+    "lsof -ti :3000 | xargs -e kill",
+    // A cluster led by an optional-value letter takes the rest of the word (`-en` sets
+    // the eof string to `n`), so the next word is the command.
+    "true | xargs -en pkill node",
+    "lsof -t -i:3000 | xargs -en kill -9",
+    // Targets bash evaluates statically to -1 (KILL_STATIC_EVAL_RE).
+    "kill -9 $'-1'",
+    "kill -9 $((-1))",
+    "kill -9 $((0-1))",
+    // `$[…]` arithmetic and brace expansion are evaluated statically too.
+    "kill -9 $[-1]",
+    'kill -9 "$[-1]"',
+    "kill -9 {-1,}",
+    // `exec -a NAME` takes a value, so the command after it is screened.
+    'exec -a x bash -c "pkill node"',
+    // A unique prefix of a value-taking long option takes the next word (getopt_long).
+    "timeout --si 9 5 pkill node",
+    "timeout --k 1 5 pkill node",
+    // A backtick span in an UNQUOTED-delimiter heredoc runs, so it is screened.
+    "cat <<EOF\n`pkill node`\nEOF",
+    // ... also inside a `$(…)` whose end is found by jumping over the heredoc body.
+    "git commit -m \"$(cat <<EOF\nfix: a) `pkill node`\nEOF\n)\"",
+    // A quoted heredoc closes at its delimiter line, so it does not hide a later
+    // substitution the tokenizer keeps inside one word.
+    "cat <<'EOF'\nhi\nEOF\necho \"$(pkill node)\"",
+    "cat <<'EOF'\nhi\nEOF\nkill \"$(lsof -ti :3000)\"",
+    // `<<-` strips leading tabs from the delimiter line, so the heredoc closes there.
+    "cat <<-'EOF'\n\tbody\n\tEOF\necho \"$(pkill node)\"",
+    // `EOF)` closes a heredoc inside `$(…)` and its `)` closes the substitution, so the
+    // backtick after it is screened.
+    "git commit -m \"$(cat <<'EOF'\nmsg\nEOF)\"; echo `pkill node`",
+    // A `<<` inside a `#` comment opens no heredoc.
+    "echo x # <<'EOF'\necho \"$(pkill node)\"",
+    // A `<<<` here-string opens no heredoc.
+    "cat <<<'EOF'\necho \"$(pkill node)\"",
+    // A delimiter holding `$` or a backtick counts as unquoted, so its body is scanned.
+    "cat <<'E'$x\n`pkill node`\nE$x",
+    "cat <<\"E$x\"\n`pkill node`\nE$x",
+    "cat <<'E'`x`\n`pkill node`\nE`x`",
+    // bash joins a backslash-newline, so `<<E\<newline>OF` is the unquoted delimiter EOF.
+    "cat <<E\\\nOF\n`pkill node`\nEOF",
+    // Two heredocs on one line: each body is consumed in order, the unquoted one scanned.
+    "cat <<'A' <<B\nx\nA\n`pkill node`\nB",
+    "cat <<'A' <<'B'\nx\nA\ny\nB\necho \"$(pkill node)\"",
+    // timeout's duration may be `.5` or `inf`.
+    "timeout .5 pkill node",
+    "timeout inf pkill node",
+  ];
+  for (const cmd of DENIED_MASS) {
+    it(`denies with the mass-signal reason: ${cmd}`, () => {
+      const r = screenBashCommand(cmd);
+      assert.strictEqual(r.denied, true, `expected denied for: ${cmd}`);
+      assert.strictEqual(r.reason, MASS_SIGNAL_REASON);
+    });
+  }
+
+  const ALLOWED_KILLS = [
+    'kill "$pid"',
+    "kill $pid",
+    'kill -9 "$pid"',
+    "kill %1",
+    "kill 12345",
+    "kill -9 12345",
+    "kill -s TERM 12345",
+    "kill -1",
+    "kill -l",
+    "fuser 3000/tcp",
+    'pid=$!; sleep 1; kill "$pid"',
+    // An enumerator NAME that is not a command word is not an enumerator.
+    "kill $pid; echo ps",
+    'kill "$pid" # ps',
+    "kill $pid; cat notes/ps",
+    "kill %vite",
+  ];
+  for (const cmd of ALLOWED_KILLS) {
+    it(`allows: ${cmd}`, () => {
+      assert.strictEqual(screenBashCommand(cmd).denied, false, `expected allowed for: ${cmd}`);
+    });
+  }
+
+  it("allows docker compose ps next to kill $pid on a wired worker", () => {
+    assert.strictEqual(screenBashCommand("docker compose ps && kill $pid", [], true).denied, false);
+  });
+
+  it("keeps a prior non-ps denial reason (git push) over the mass-signal reason", () => {
+    const r = screenBashCommand("git push origin main; kill $(pgrep x)");
+    assert.strictEqual(r.denied, true);
+    assert.ok(r.reason?.includes("git push"), `unexpected reason: ${r.reason}`);
+  });
+
+  // A statically evaluated arithmetic target is caught by a raw-string heuristic, so a
+  // harmless `kill $((pid))` is over-denied too (degrades safe; documented at the regex).
+  it("denies the harmless kill $((pid)) (accepted over-denial of the arithmetic heuristic)", () => {
+    assert.strictEqual(screenBashCommand("kill $((pid))").reason, MASS_SIGNAL_REASON);
+  });
+
+  // The wrapper-value and reserved-word peels reach every rule, not only this one.
+  for (const cmd of [
+    "sudo -u root git push origin x",
+    "timeout -s 9 5 git push",
+    "if true; then git push origin x; fi",
+    // Clustered short flags: the last letter takes the next word.
+    "sudo -Eu root git push",
+    "timeout -vs 9 5 git push",
+    // Options that take NO separate value must not swallow the command word
+    // (regression pins: base 613f1434 denied all of these).
+    "true | xargs -e git push --force",
+    "true | xargs --eof git push",
+    "true | xargs --max-lines git push origin HEAD:main",
+    "sudo -h git push --force",
+    // A cluster skips the next word only when every letter before the last is a known
+    // no-argument letter; `-e`/`-i`/`-l` take the rest of the word as their value.
+    "xargs -en git push origin main",
+    "xargs -in git push",
+    "xargs -ln git push",
+    "xargs -eP git push",
+    "sudo -uroot git push",
+    // `--host` always takes a separate value.
+    "sudo --host h git push",
+    // A backtick is a plain word character to the tokenizer, so push stays the
+    // subcommand after a backtick-substituted global option value.
+    "git -C `pwd` push",
+    "git -C `pwd` push --force origin main",
+    "git --git-dir `pwd`/.git push",
+    // GNU timeout's `-p`/`-f` take no argument, so `-ps`/`-fs` end in the value letter.
+    "timeout -ps 9 5 git push --force origin main",
+    "timeout -fs 9 5 git push",
+    "exec -a x git push",
+    "sudo --us root git push",
+    // bash `exec -c`/`-l` take no argument, so `-ca` ends in the value letter.
+    "exec -ca x git push",
+    // An ambiguous long-option prefix (`--r`: --role, --remove-timestamp,
+    // --reset-timestamp) takes no value, so git stays the command word.
+    "sudo --r git push",
+    // nice/ionice take no positional number (regression pins: base 613f1434 denied the
+    // option forms), so a digit-led word after them is the command.
+    "nice -n 5 9d/git push",
+    "nice --adjustment 5 9d/git push",
+    "ionice -c 2 9d/git push",
+    "nice 9d/git push",
+    // timeout's DURATION and chrt's priority are positional.
+    "timeout inf git push",
+    "timeout .5 git push",
+    "chrt 5 git push",
+  ]) {
+    it(`denies git push behind a wrapper option, reserved word or backtick: ${cmd}`, () => {
+      const r = screenBashCommand(cmd);
+      assert.strictEqual(r.denied, true, `expected denied for: ${cmd}`);
+      assert.ok(r.reason?.includes("git push"), `unexpected reason: ${r.reason}`);
+    });
+  }
+
+  // Backticks in plain text (a commit message, a markdown heredoc body) are not commands.
+  for (const cmd of ['git commit -m "use `foo`"', "cat > notes.md <<'X'\nRun `npm test` first\nX"]) {
+    it(`allows backticks in plain text: ${JSON.stringify(cmd)}`, () => {
+      assert.strictEqual(screenBashCommand(cmd).denied, false, `expected allowed for: ${cmd}`);
+    });
+  }
+
+  // A value letter before the last letter of a cluster takes the rest of the word
+  // (`sudo -hu` sets the host to `u`, `-au` the auth type), so the NEXT word, not git, is
+  // the command that runs. The peel keeps the cluster to one word, as base 613f1434 did.
+  for (const cmd of ["sudo -hu root git push", "sudo -au x git push", "sudo -cu x git push", "doas -aC x git push"]) {
+    it(`does not skip past an attached-value cluster: ${cmd}`, () => {
+      assert.strictEqual(screenBashCommand(cmd).denied, false, `expected allowed for: ${cmd}`);
+    });
+  }
+
+  // Substitution bodies are screened, but a word that is not the command word of a body
+  // line passes: commit and PR bodies that mention these tools stay allowed.
+  const heredoc = (body: string): string => `"$(cat <<'EOF'\n${body}\nEOF\n)"`;
+  for (const cmd of [
+    `git commit -m ${heredoc("docs: refresh\n\n...update the uzi-lander skill...")}`,
+    'git commit -m "docs: `uzi-cli` skill update"',
+    `gh pr create --title t --body ${heredoc("This PR teaches the watcher skill to poll")}`,
+    `git commit -m ${heredoc("guardrail: deny pkill and killall")}`,
+    'echo "$(date)"',
+    "echo `git rev-parse HEAD`",
+    // A quoted-delimiter heredoc body is literal in bash, so its backtick spans are
+    // prose, not substitutions, and never pair a `kill` with an enumerator.
+    `git commit -m ${heredoc('Use `kill "$pid"` instead of `ps` scans')}`,
+    `gh pr create --title t --body ${heredoc("## Summary\n- Deny `lsof` + `kill` pairing")}`,
+    `git commit -m ${heredoc('Replace `kill $(lsof -ti :3000)` with `kill "$pid"`')}`,
+    "cat > notes.md <<'EOF'\nUse `kill \"$pid\"`, not `ps`\nEOF",
+    `git commit -m ${heredoc("guardrail: deny `pkill` and `killall`")}`,
+    // A `)` in quoted heredoc prose does not end the `$(…)` early (regression pins: base
+    // 613f1434 allowed these), so the backticked prose after it is not screened.
+    `git commit -m ${heredoc("fix: a) `pkill` is denied")}`,
+    `git commit -m ${heredoc("guardrail: deny mass-signal kills\n\nNote :) `pkill` stays denied")}`,
+    `git commit -m ${heredoc("fix: things\n\n1) replace `kill $(lsof -ti :3000)`\n2) use `ps`")}`,
+    `git commit -m ${heredoc("fix :) `kill` then `lsof`")}`,
+    // `<<"EOF"` and `<<\EOF` are quoted delimiters too, so their bodies are literal.
+    "cat > n.md <<\"EOF\"\nUse `pkill node` sparingly\nEOF",
+    "cat > n.md <<\\EOF\nUse `pkill node` sparingly\nEOF",
+    // Two quoted heredocs on one line: both bodies are skipped.
+    "cat <<'A' <<'B'\n`pkill x`\nA\n`pkill y`\nB",
+    "git commit -m \"$(cat <<'EOF'\nfix: a) `pkill`\nEOF)\"",
+  ]) {
+    it(`allows a benign substitution body: ${JSON.stringify(cmd)}`, () => {
+      assert.strictEqual(screenBashCommand(cmd).denied, false, `expected allowed for: ${cmd}`);
+    });
+  }
+
+  // Scope pin: a quoted substitution body is screened for the mass-signal rule ONLY. A
+  // body denial for any other rule is ignored, which keeps base 613f1434 behavior (it
+  // never screened quoted substitution bodies), so `echo "$(git push)"` stays allowed.
+  it("ignores a non-mass-signal denial from a quoted substitution body", () => {
+    assert.strictEqual(screenBashCommand('echo "$(git push)"').denied, false);
+    assert.strictEqual(screenBashCommand("echo `git push --force`").denied, false);
+  });
+
+  // An unbounded number of substitutions fails closed rather than screening each one;
+  // the cap (1024 per string) is far above any normal command.
+  it("denies a command with more substitution bodies than the screen extracts", () => {
+    assert.strictEqual(screenBashCommand("echo " + '"$(a)" '.repeat(1000)).denied, false);
+    const r = screenBashCommand("echo " + '"$(a)" '.repeat(1100));
+    assert.strictEqual(r.denied, true);
+    assert.ok(r.reason?.includes("nested too deeply"), `unexpected reason: ${r.reason}`);
+  });
+
+  for (const cmd of [
+    "echo \"$(echo ')'; pkill node)\"",
+    "git commit -m \"$(printf 'fix: a) b'; pkill node)\"",
+    'echo "$(echo \\"x)\\"; pkill node)"',
+  ]) it(`screens after a quoted parenthesis: ${cmd}`, () => {
+    assert.strictEqual(screenBashCommand(cmd).denied, true, cmd);
+  });
+
+  for (const cmd of [
+    '(( 1 << "1" ))\necho "$(pkill node)"',
+    "x=$((1<<'E'))\necho \"$(pkill node)\"",
+    "${x//<<'E'/}\necho \"$(pkill node)\"",
+  ]) it(`screens after an unmatched heredoc lookalike: ${JSON.stringify(cmd)}`, () => {
+    assert.strictEqual(screenBashCommand(cmd).denied, true, cmd);
+  });
+  it("keeps a terminated quoted heredoc inert", () => {
+    assert.strictEqual(screenBashCommand("cat <<'EOF'\n`pkill`\nEOF").denied, false);
+  });
+
+  for (const cmd of [
+    '(( 1 << "1" ))\necho "$(pkill node)"\n1',
+    "x=$((1<<'E'))\necho \"$(pkill node)\"\nE",
+    "${x//<<'E'/}\necho \"$(pkill node)\"\nE",
+  ]) it(`screens a matched delimiter after a non-heredoc shift: ${JSON.stringify(cmd)}`, () => {
+    assert.strictEqual(screenBashCommand(cmd).denied, true, cmd);
+  });
+  it("keeps a real quoted heredoc literal and screens an unquoted one", () => {
+    assert.strictEqual(screenBashCommand("cat <<'1'\necho \"$(pkill node)\"\n1").denied, false);
+    assert.strictEqual(screenBashCommand('cat <<1\necho "$(pkill node)"\n1').denied, true);
+  });
+
+  for (const cmd of [
+    'echo "$(echo ${x:-)}; pkill node)"',
+    'echo "$(echo ${x:-ok}; pkill node)"',
+    'echo "$(echo ${x:-$(pkill node)})"',
+    'echo "$(echo ${x:-${y:-$(pkill node)}})"',
+    'echo "$(echo ${x:-$((1+2))}; pkill node)"',
+  ]) it(`screens inside and after a parameter expansion: ${cmd}`, () => {
+    assert.strictEqual(screenBashCommand(cmd).denied, true, cmd);
+  });
+  it("allows benign parentheses inside a parameter expansion", () => {
+    assert.strictEqual(screenBashCommand('echo "$(echo ${x:-(a)})"').denied, false);
+  });
+
+  for (const cmd of [
+    'echo "$(echo ${x:-"}"foo)}; pkill node)"',
+    "echo \"$(echo ${x:-'}'foo)}; pkill node)\"",
+    'echo "$(echo ${x:-\\}foo)}; pkill node)"',
+  ]) it(`denies ambiguous quoting inside a parameter expansion: ${cmd}`, () => {
+    assert.strictEqual(screenBashCommand(cmd).denied, true, cmd);
+  });
+  it("keeps unquoted parameter expansions and simple quoted substitutions allowed", () => {
+    assert.strictEqual(screenBashCommand("echo ${HOME}").denied, false);
+    assert.strictEqual(screenBashCommand('echo "$(echo ${x:-ok})"').denied, false);
+  });
+
+  for (const [name, cmd] of [
+    ['quoted long backtick body', 'echo "`' + "((1<<E))\n".repeat(1100) + 'pkill node`"'],
+    ['unquoted long backtick body', 'echo `' + "((1<<E))\n".repeat(1100) + 'pkill node`'],
+    ['many nested backtick spans', 'echo "$(' + '``;'.repeat(1025) + ' echo `pkill node`)"'],
+  ] as const) it(`fails closed for ${name}`, () => {
+    assert.strictEqual(screenBashCommand(cmd).denied, true);
+  });
+
+  it("denies nested command substitutions past the screening depth", () => {
+    const cmd = 'echo "' + '$('.repeat(7) + 'printf ok' + ')'.repeat(7) + '"';
+    const result = screenBashCommand(cmd);
+    assert.strictEqual(result.denied, true);
+    assert.ok(result.reason?.includes("nested too deeply"), result.reason);
+  });
+
+  it("denies extreme substitution nesting without throwing", () => {
+    const cmd = 'echo "' + '$('.repeat(8192) + 'printf ok' + ')'.repeat(8192) + '"';
+    const result = screenBashCommand(cmd);
+    assert.strictEqual(result.denied, true);
+    assert.ok(result.reason?.includes("nested too deeply"), result.reason);
+  });
+
+  it("allows shallow nested command substitutions", () => {
+    const cmd = `echo "$(printf '%s' "$(printf ok)")"`;
+    assert.strictEqual(screenBashCommand(cmd).denied, false);
+  });
+
+  it("denies if the screener itself throws", () => {
+    const badPaths = new Proxy([] as string[], {
+      get() { throw new Error("injected screener failure"); },
+    });
+    const result = screenBashCommand("echo ok", badPaths);
+    assert.strictEqual(result.denied, true);
+    assert.ok(result.reason?.includes("screening failed"), result.reason);
   });
 });
 
@@ -683,7 +1079,7 @@ describe("file-tool path guard is UNCHANGED by agent memory (PRD #90 M2)", () =>
 // the UI (which nobody would notice, because the run still works).
 //
 // Two tests, deliberately overlapping, because neither alone is sufficient:
-//   (a) behavioural — drives all 15 deny paths that exist TODAY through the public
+//   (a) behavioural — drives all 16 deny paths that exist TODAY through the public
 //       API, which is the only way to reach the reasons (they are module-private).
 //       It cannot cover a reason that does not exist yet.
 //   (b) source scan — greps the reason literals straight out of guardrails.ts, so a
@@ -720,7 +1116,7 @@ describe("deny reasons carry the user-facing phrase (PRD #116)", () => {
   // they already exist — if a case ever stops denying, the TRIGGER is wrong (fix it),
   // never the assertion.
   const REASON_CASES: Array<{ name: string; trigger: () => Promise<string | undefined> }> = [
-    // 12 reachable via screenBashCommand(command, extraSecretPaths?, dockerWired?).
+    // 13 reachable via screenBashCommand(command, extraSecretPaths?, dockerWired?).
     { name: "git push", trigger: async () => screenBashCommand("git push origin main").reason },
     { name: "git remote mutation", trigger: async () => screenBashCommand("git remote set-url origin https://evil.example/x.git").reason },
     { name: "forced git operation", trigger: async () => screenBashCommand("git checkout --force other").reason },
@@ -728,6 +1124,7 @@ describe("deny reasons carry the user-facing phrase (PRD #116)", () => {
     { name: "git config write", trigger: async () => screenBashCommand("git config remote.origin.url https://evil.example/x.git").reason },
     { name: "environment dump", trigger: async () => screenBashCommand("env").reason },
     { name: "process table", trigger: async () => screenBashCommand("ps aux").reason },
+    { name: "mass-signal kill", trigger: async () => screenBashCommand("pkill -f vite").reason },
     { name: "/proc read", trigger: async () => screenBashCommand(`cat ${PROC_PATH}`).reason },
     // The built-in /run/secrets/ prefix; extraSecretPaths reaches the same reason.
     { name: "secret file read", trigger: async () => screenBashCommand(`cat ${SECRET_PATH}`).reason },
@@ -755,12 +1152,12 @@ describe("deny reasons carry the user-facing phrase (PRD #116)", () => {
     });
   }
 
-  // 15 cases producing 15 DISTINCT strings is what proves the table actually exercises
-  // 15 different deny paths, rather than the same path fifteen times.
-  it("covers all 15 deny reasons, and each case reaches a DISTINCT one", async () => {
-    assert.strictEqual(REASON_CASES.length, 15, "expected one case per REASON_* constant in src/guardrails.ts");
+  // 16 cases producing 16 DISTINCT strings is what proves the table actually exercises
+  // 16 different deny paths, rather than the same path sixteen times.
+  it("covers all 16 deny reasons, and each case reaches a DISTINCT one", async () => {
+    assert.strictEqual(REASON_CASES.length, 16, "expected one case per REASON_* constant in src/guardrails.ts");
     const reasons = await Promise.all(REASON_CASES.map((c) => c.trigger()));
-    assert.strictEqual(new Set(reasons).size, 15, `expected 15 distinct reasons, got: ${JSON.stringify(reasons, null, 2)}`);
+    assert.strictEqual(new Set(reasons).size, 16, `expected 16 distinct reasons, got: ${JSON.stringify(reasons, null, 2)}`);
   });
 
   // (b) The future-proofing half: read the reason literals out of the source itself.

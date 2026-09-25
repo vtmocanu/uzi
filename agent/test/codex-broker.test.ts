@@ -187,6 +187,16 @@ describe("CodexCallbackBroker: shell (screenBashCommand integration)", () => {
     assert.equal(h.spawn.calls.length, 0);
   });
 
+  // #1576: the mass-signal rule reaches the Codex lane through the same screener.
+  for (const command of ["pkill -f vite", "kill $(lsof -ti :3000)"]) {
+    it(`denies a mass-signal kill (${command}) without spawning`, async () => {
+      const h = makeBroker();
+      const r = await h.broker.handleToolCall(rt(), "Bash", { command }, "root");
+      assertDenied(r, "shell_denied");
+      assert.equal(h.spawn.calls.length, 0);
+    });
+  }
+
   it("denies a Bash with no command string", async () => {
     const h = makeBroker();
     const r = await h.broker.handleToolCall(rt(), "Bash", { notcommand: 1 }, "root");
