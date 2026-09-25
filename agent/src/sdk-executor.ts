@@ -256,20 +256,23 @@ const CLI_SIGNAL_DEATH_MAX_RETRIES = 2;
  * issue #1656: the SDK CLI child died from a foreign SIGTERM/SIGKILL (or exited 143/137) with
  * no uzi trip pending. Thrown from driveTurn's catch and resumed in-process on the same session
  * by {@link SdkExecutor.driveTurnWithEmptyRecovery}. `sessionId` is the session observed THIS
- * turn, if any; `death` names the signal or exit code (never the SDK's stderr tail) for the
- * feed notice; `original` is the SDK's own error, rethrown unchanged when the resume is not
- * possible or its bound is spent, so the run fails exactly as it did before.
+ * turn, if any; `pid` is the dead CLI's pid, reaped before any resume; `death` names the signal
+ * or exit code (never the SDK's stderr tail) for the feed notice; `original` is the SDK's own
+ * error, rethrown unchanged when the resume is not possible or its bound is spent, so the run
+ * fails exactly as it did before.
  */
 class CliSignalDeathError extends Error {
   public readonly original: Error;
   public readonly death: string;
   public readonly sessionId?: string;
-  constructor(original: Error, death: string, sessionId?: string) {
+  public readonly pid?: number;
+  constructor(original: Error, death: string, sessionId?: string, pid?: number) {
     super(original.message);
     this.name = "CliSignalDeathError";
     this.original = original;
     this.death = death;
     this.sessionId = sessionId;
+    this.pid = pid;
   }
 }
 
@@ -644,7 +647,9 @@ export class SdkExecutor implements Executor {
   /** issue #1197 (D-RC2b): bounded in-process re-drive count for a positively-empty
    *  turn before escalating to {@link TransientRecoveryError}. Injectable for tests. */
   private readonly emptyTurnMaxRetries: number;
-  /** Every pid spawned across the current run's turns, for the done-path reap.
+  /** Every pid spawned across the current run's turns, for the done-path reap
+   *  (a CLI that died from a foreign signal is reaped and removed at resume time,
+   *  issue #1656).
    *  Private to THIS instance — one SdkExecutor is built per run (PRD #42 Decision
    *  4), so two concurrent runs can never wipe/kill each other's set. Shared with
    *  the Claude adapter, which records pids into it; killAgentTree (below, the
@@ -3551,7 +3556,7 @@ export class SdkExecutor implements Executor {
       // SIGTERM/SIGKILL death of the CLI foreign, and resumable by the recovery wrapper.
       const death = err instanceof Error ? foreignCliTermination(err) : undefined;
       if (err instanceof Error && death !== undefined) {
-        throw new CliSignalDeathError(err, death, observedSessionId);
+        throw new CliSignalDeathError(err, death, observedSessionId, state.currentChild.pid);
       }
       throw err instanceof Error ? err : new Error(errMessage(err));
     } finally {
@@ -3638,6 +3643,13 @@ export class SdkExecutor implements Executor {
           // A usage-limit death routes to the usage-limit wait path, unchanged.
           if (err instanceof LimitReachedError) throw err;
           if (err instanceof CliSignalDeathError) {
+            // Reap the dead CLI's process group NOW (its orphans, e.g. a nohup'd child that
+            // could read the PAT, go with it) and forget its pid: a resumed run can last hours,
+            // and a pid left for the run-end killAgentTree could by then name a recycled group.
+            if (err.pid !== undefined) {
+              this.kill(err.pid);
+              this.spawnedPids.delete(err.pid);
+            }
             // issue #1656: resume the same session: this turn's observed one, else the
             // caller's. With neither, or once the bound is spent, fail exactly as before with
             // the SDK's own error: never a fresh session labelled a resume, never recovery_wait.

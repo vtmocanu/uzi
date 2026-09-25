@@ -415,6 +415,51 @@ async function realSdkError(body: string): Promise<Error & Record<string, unknow
   throw new Error("the SDK did not throw on the child's exit");
 }
 
+describe("dead CLI reap before a resume (issue #1656)", () => {
+  it("group-kills the dead CLI's pid once at resume time and drops it from the final reap", async () => {
+    // A resumed run can live for hours; a dead pid left in spawnedPids until the run-end
+    // killAgentTree could by then name a RECYCLED process group. The dead child is reaped
+    // (its orphans with it) before the re-drive, and never killed again.
+    const children: ChildProcess[] = [];
+    const events: string[] = [];
+    const fake = fakeTurns([
+      [submitPlan("# Plan", "prev"), resultSuccess("prev")],
+      [signalDone("prev"), resultSuccess("prev")],
+    ]);
+    let call = 0;
+    const queryFn: SdkQueryFn = (params) => {
+      events.push(`query${call}`);
+      return call++ === 0 ? defaultQueryFn(params) : fake.queryFn(params);
+    };
+    const spawnSelfEnding = selfEndingSpawn("process.exit(143);", children);
+    const executor = new SdkExecutor(
+      nullLogger(),
+      homeDir,
+      opts(queryFn, {
+        spawn: (o) => spawnSelfEnding(o),
+        // Record only: nothing here signals a real process.
+        kill: (pid) => {
+          events.push(`kill:${pid}`);
+          return true;
+        },
+      }),
+    );
+    try {
+      const result = await executor.run(makeCtx({ sessionId: "prev" }).ctx);
+      assert.equal(result.branch, "agent/issue-5");
+      const dead = children[0]?.pid;
+      assert.ok(dead !== undefined, "the real SDK spawned the self-ending CLI");
+      assert.deepEqual(
+        events.filter((e) => e.startsWith("query") || e === `kill:${dead}`),
+        ["query0", `kill:${dead}`, "query1", "query2"],
+        "killed exactly once, between the death and the resume, and not by the final reap",
+      );
+    } finally {
+      await reaped(children);
+    }
+  });
+});
+
 describe("SDK process-exit error shape (issue #1656 pin)", () => {
   it("exit 143 carries own errorClass=process_exited_nonzero and exitCode=143", async () => {
     const err = await realSdkError("process.exit(143);");
