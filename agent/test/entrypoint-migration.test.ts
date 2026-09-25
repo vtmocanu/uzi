@@ -119,12 +119,22 @@ function makeHarness(opts: { mutate?: (patched: string) => string } = {}): Harne
   // posture (STUB_TOKEN_TARGET_POSTURE, default a valid kube posture) but fails (exit 1) on a
   // dangling chain ([ -e ] false) or when STUB_TOKEN_STAT_FAIL is set; without -L (lstat) it
   // returns the symlink's own 0777 (STUB_TOKEN_LINK_POSTURE). `cat` honors STUB_TOKEN_UNREADABLE
-  // (exit 1) as the dropped-worker read-denial seam, else reads for real.
+  // (exit 1) as the dropped-worker read-denial seam, else reads for real. Issue #1696: a
+  // `stat -c %h <path>` (the dot loops' link-count probe) is answered with the REAL link count,
+  // read from `ls -ld` field 2 (no symlink follow, like `stat -c %h`). That field is the link
+  // count on GNU, BusyBox and BSD alike; the host's own `stat` is not portable (BSD/macOS
+  // `stat` rejects `-c`). Every other stat call keeps the token-posture behaviour above unchanged.
   writeStub(
     stubDir,
     "busybox",
     '#!/bin/sh\nsub=$1; shift\ncase "$sub" in\n' +
       "  stat)\n" +
+      '    if [ "$#" -eq 3 ] && [ "$1" = "-c" ] && [ "$2" = "%h" ]; then\n' +
+      '      n=$(ls -ld -- "$3" 2>/dev/null | awk \'{print $2}\')\n' +
+      '      case "$n" in ""|*[!0-9]*) exit 1 ;; esac\n' +
+      '      printf "%s\\n" "$n"\n' +
+      "      exit 0\n" +
+      "    fi\n" +
       "    follow=\n" +
       '    for a in "$@"; do [ "$a" = "-L" ] && follow=1; done\n' +
       '    for p in "$@"; do target=$p; done\n' +
@@ -206,6 +216,32 @@ function run(h: Harness, extraEnv: Record<string, string> = {}): RunResult {
 /** True if some recorded op line contains ALL of the given fragments. */
 function opMatches(ops: string[], ...fragments: string[]): boolean {
   return ops.some((op) => fragments.every((f) => op.includes(f)));
+}
+
+/** The last whitespace-delimited token of an op line (its path argument; test paths have no spaces). */
+function opPathArg(op: string): string {
+  const parts = op.trim().split(/\s+/);
+  return parts[parts.length - 1] ?? "";
+}
+
+/**
+ * Every op line for `verb` (chown OR chmod, recursive or not) whose path argument's REAL
+ * (symlink-resolved) path is repos/ itself or under it — catching a root symlink dereferenced
+ * ONTO repos/ (the chmod-dereference hole) as well as a mid-path prefix descending through it.
+ */
+function opsReachingRepos(ops: string[], reposReal: string, verb: "chown" | "chmod"): string[] {
+  const hits: string[] = [];
+  for (const op of ops) {
+    if (!op.startsWith(verb + " ")) continue;
+    let resolved: string;
+    try {
+      resolved = fs.realpathSync(opPathArg(op));
+    } catch {
+      continue; // no longer resolvable => cannot reach repos
+    }
+    if (resolved === reposReal || resolved.startsWith(reposReal + path.sep)) hits.push(`${op} -> ${resolved}`);
+  }
+  return hits;
 }
 
 // ─── Group 1: portable (any uid) — the ownership MAP + env, from the op-log ──────────────
@@ -559,6 +595,148 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
       fs.rmSync(h.root, { recursive: true, force: true });
     }
   });
+
+  // Issue #1696: /data/agent-home is ALSO the shared HOME of runner-uid processes (provisioning's
+  // devbox/nix, the chat SDK CLI). Its own top-level dot entries are that shared state, never a
+  // per-run HOME, so they must end up runner-owned: wholesale (chown -R) inside the legacy walk,
+  // and top-level-inode-only (non-recursive) in the separate one-time repair for volumes the old
+  // walk already damaged. Planted symlinks at the dot level (and one nested in .cache) and a
+  // top-level HARDLINK to a repos/ file are planted too. The harness only RECORDS ops and never
+  // walks the tree, so these tests prove only that no op NAMES a planted link; that the recursive
+  // chown does not traverse the NESTED .cache/devbox link rests on the measured BusyBox behaviour
+  // noted in entrypoint.sh, not on this test.
+  const LEGACY_SENTINEL_NAME = ".uzi-legacy-split-migrated";
+  const PROVISION_SENTINEL_NAME = ".uzi-provision-home-repaired";
+  const LEGACY_BANNER = /one-time ownership-aware migration/;
+  const PROVISION_BANNER = /one-time repair of shared provisioning HOME/;
+
+  /** Plant the shared-HOME dot state, a run HOME, the repos cache, and the attacker symlinks. */
+  function plantSharedHome(h: Harness): { ah: string; runX: string; reposReal: string } {
+    fs.mkdirSync(h.nix);
+    const ah = path.join(h.data, "agent-home");
+    fs.mkdirSync(path.join(ah, ".cache", "jetify"), { recursive: true });
+    fs.mkdirSync(path.join(ah, ".local", "state", "nix"), { recursive: true });
+    fs.mkdirSync(path.join(ah, ".claude", "projects"), { recursive: true });
+    fs.writeFileSync(path.join(ah, ".claude.json"), "chat-cli-config");
+    // devbox's profile link: dangling here (no profiles/profile), which must be skipped too.
+    fs.symlinkSync(".local/state/nix/profiles/profile", path.join(ah, ".nix-profile"));
+    const runX = path.join(ah, "run-x");
+    fs.mkdirSync(path.join(runX, "codex-session-store"), { recursive: true });
+    fs.writeFileSync(path.join(runX, "codex-session-store", "session.json"), "resume");
+    fs.mkdirSync(path.join(h.data, "repos"), { recursive: true });
+    fs.writeFileSync(path.join(h.data, "repos", "x"), "bare-config\n");
+    const reposReal = fs.realpathSync(path.join(h.data, "repos"));
+    // Attacker-planted escapes into the worker-only repos/ cache.
+    fs.symlinkSync("../repos", path.join(ah, ".config"));
+    fs.symlinkSync("../repos/x", path.join(ah, ".claude.json.bak"));
+    fs.symlinkSync("../../repos", path.join(ah, ".cache", "devbox"));
+    // A HARDLINK to the worker's bare-repo config: it passes [ -L ] / [ -e ] / [ -f ], so only the
+    // link-count filter keeps root from handing that shared inode to runner.
+    fs.mkdirSync(path.join(h.data, "repos", "r.git"), { recursive: true });
+    fs.writeFileSync(path.join(h.data, "repos", "r.git", "config"), "[core]\n");
+    fs.linkSync(path.join(h.data, "repos", "r.git", "config"), path.join(ah, ".gitconfig-planted"));
+    // A FIFO: a single-link, non-regular entry, so only the `[ -f ]` filter keeps it from a chown.
+    const fifo = spawnSync("mkfifo", [path.join(ah, ".planted-fifo")], { encoding: "utf8" });
+    assert.equal(fifo.status, 0, `mkfifo must succeed to plant the fifo fixture (${fifo.stderr})`);
+    fs.writeFileSync(h.token, "t");
+    return { ah, runX, reposReal };
+  }
+
+  function sentinelWritten(h: Harness, r: RunResult, name: string): boolean {
+    const p = path.join(h.data, name);
+    return r.ops.includes(`chown worker:worker ${p}`) || fs.existsSync(p);
+  }
+
+  it("issue #1696: an ALREADY-MIGRATED volume gets a one-time NON-recursive repair of agent-home's dot entries", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.data);
+      fs.writeFileSync(path.join(h.data, LEGACY_SENTINEL_NAME), "");
+      const { ah, reposReal } = plantSharedHome(h);
+
+      const r = run(h, { STUB_NOOP: "1" });
+      assert.equal(r.status, 0, `repair run must succeed (stderr: ${r.stderr})`);
+
+      // Exactly the four real top-level dot entries, re-owned non-recursively (dirs AND the
+      // single-link file); no other agent-home dot entry is chowned.
+      const dotChowns = r.ops.filter((o) => o.startsWith("chown ") && o.includes(`${ah}/.`)).sort();
+      assert.deepEqual(
+        dotChowns,
+        [".cache", ".claude", ".claude.json", ".local"].map((n) => `chown runner:runner ${ah}/${n}`),
+        "exactly the real dirs and the single-link dot file are re-owned (top-level inode only)",
+      );
+      assert.ok(
+        !r.ops.some((o) => o.startsWith("chown -R") && o.includes(`${ah}/`)),
+        `the repair must never recurse under agent-home (ops: ${r.ops.join(" | ")})`,
+      );
+      for (const frag of ["run-x", "codex-session-store", ".nix-profile", `${ah}/.config`, ".claude.json.bak", ".cache/devbox", ".gitconfig-planted", ".planted-fifo"]) {
+        assert.ok(!r.ops.some((o) => o.includes(frag)), `no op may touch ${frag}`);
+      }
+      assert.deepEqual(opsReachingRepos(r.ops, reposReal, "chown"), [], "no chown may reach repos/");
+      assert.deepEqual(opsReachingRepos(r.ops, reposReal, "chmod"), [], "no chmod may reach repos/");
+      assert.doesNotMatch(r.stderr, LEGACY_BANNER, "the legacy walk must stay sentinel-gated");
+      assert.match(r.stderr, PROVISION_BANNER, "the one-time repair announces itself");
+      assert.ok(sentinelWritten(h, r, PROVISION_SENTINEL_NAME), "the repair writes its own sentinel");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #1696: a FIRST migration re-owns agent-home's dot entries wholesale, never as run HOMEs", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.data);
+      const { ah, runX, reposReal } = plantSharedHome(h);
+      fs.mkdirSync(path.join(runX, "codex-data", "epoch-1"), { recursive: true });
+      fs.mkdirSync(path.join(runX, ".claude", "projects"), { recursive: true });
+
+      const r = run(h, { STUB_NOOP: "1" });
+      assert.equal(r.status, 0, `first migration must succeed (stderr: ${r.stderr})`);
+
+      // The real run HOME keeps the existing map.
+      assert.ok(r.ops.includes(`chown worker:runner ${runX}`), "run HOME root -> worker:runner");
+      assert.ok(r.ops.includes(`chown worker:runner ${runX}/codex-data`), "codex-data root -> worker:runner");
+      assert.ok(r.ops.includes(`chown -R runner:runner ${runX}/codex-data/epoch-1`), "epoch tree -> runner");
+      assert.ok(r.ops.includes(`chown -R runner:runner ${runX}/.claude`), "run HOME .claude -> runner");
+      assert.ok(!r.ops.some((o) => o.includes("codex-session-store")), "codex-session-store is never touched");
+
+      // The shared HOME's dot entries are NOT treated as run HOMEs...
+      for (const name of [".cache", ".local", ".claude"]) {
+        assert.ok(!r.ops.includes(`chown worker:runner ${ah}/${name}`), `${name} must not be kept worker-owned as a run HOME`);
+      }
+      // ...but re-owned wholesale to runner, the top-level dot FILE included.
+      for (const name of [".cache", ".local", ".claude", ".claude.json"]) {
+        assert.ok(r.ops.includes(`chown -R runner:runner ${ah}/${name}`), `${name} must be re-owned to runner recursively`);
+      }
+      for (const frag of [".nix-profile", `${ah}/.config`, ".claude.json.bak", ".cache/devbox", ".gitconfig-planted", ".planted-fifo"]) {
+        assert.ok(!r.ops.some((o) => o.includes(frag)), `planted entry ${frag} must never be an op target`);
+      }
+      assert.deepEqual(opsReachingRepos(r.ops, reposReal, "chown"), [], "no chown may reach repos/");
+      assert.deepEqual(opsReachingRepos(r.ops, reposReal, "chmod"), [], "no chmod may reach repos/");
+      assert.ok(sentinelWritten(h, r, LEGACY_SENTINEL_NAME), "the legacy migration writes its sentinel");
+      assert.ok(sentinelWritten(h, r, PROVISION_SENTINEL_NAME), "the repair writes its sentinel");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #1696: with BOTH sentinels present, agent-home's dot entries are left alone", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.data);
+      fs.writeFileSync(path.join(h.data, LEGACY_SENTINEL_NAME), "");
+      fs.writeFileSync(path.join(h.data, PROVISION_SENTINEL_NAME), "");
+      const { ah } = plantSharedHome(h);
+
+      const r = run(h, { STUB_NOOP: "1" });
+      assert.equal(r.status, 0, `sentinel-gated run must succeed (stderr: ${r.stderr})`);
+      assert.ok(!r.ops.some((o) => o.includes(`${ah}/.`)), `no op may touch an agent-home dot entry (ops: ${r.ops.join(" | ")})`);
+      assert.doesNotMatch(r.stderr, LEGACY_BANNER, "no legacy banner");
+      assert.doesNotMatch(r.stderr, PROVISION_BANNER, "no repair banner");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
 });
 
 // ─── Group 1b: symlink give-away DEFENSE (portable, record-only) ──────────────────────────
@@ -595,32 +773,6 @@ describe("PRD #1493 M2: legacy migration resists a symlink give-away (portable, 
         continue; // no longer resolvable => cannot reach repos
       }
       if (resolved === reposReal || resolved.startsWith(reposReal + path.sep)) hits.push(`${arg} -> ${resolved}`);
-    }
-    return hits;
-  }
-
-  /** The last whitespace-delimited token of an op line (its path argument; test paths have no spaces). */
-  function opPathArg(op: string): string {
-    const parts = op.trim().split(/\s+/);
-    return parts[parts.length - 1] ?? "";
-  }
-
-  /**
-   * Every op line for `verb` (chown OR chmod, recursive or not) whose path argument's REAL
-   * (symlink-resolved) path is repos/ itself or under it — catching a root symlink dereferenced
-   * ONTO repos/ (the chmod-dereference hole) as well as a mid-path prefix descending through it.
-   */
-  function opsReachingRepos(ops: string[], reposReal: string, verb: "chown" | "chmod"): string[] {
-    const hits: string[] = [];
-    for (const op of ops) {
-      if (!op.startsWith(verb + " ")) continue;
-      let resolved: string;
-      try {
-        resolved = fs.realpathSync(opPathArg(op));
-      } catch {
-        continue; // no longer resolvable => cannot reach repos
-      }
-      if (resolved === reposReal || resolved.startsWith(reposReal + path.sep)) hits.push(`${op} -> ${resolved}`);
     }
     return hits;
   }
