@@ -93,8 +93,8 @@ different failure on the same branch can still be auto-fixed. The manual
 **Fix CI** button is still there as your escape hatch any time. The attempt
 counter only resets once the branch's pipeline actually goes green, which
 also clears the board marker; pressing **Fix CI** and letting automatic
-fixing proceed again clears it too. The marker also goes away once the
-merge request is closed or merged, since there is nothing left to fix.
+fixing proceed again clears it too. The marker also goes away once uzi
+sees the merge request closed or merged, since there is nothing left to fix.
 
 ## Code fixes push automatically; CI-config fixes wait for you
 

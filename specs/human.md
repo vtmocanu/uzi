@@ -895,7 +895,7 @@ Tracked as GitHub issue vtmocanu/uzi#1624.
 
 ## Feature #1650 — Retire the Notifications inbox tab
 
-Tracked as GitHub issue vtmocanu/uzi#1650; PRD at `prds/1650-retire-notifications-inbox.md`.
+Tracked as GitHub issue vtmocanu/uzi#1650; PRD at `prds/done/1650-retire-notifications-inbox.md`.
 
 - The web Notifications inbox (tab, bell, unread badge) is retired; actionable signals reach users by Slack DM (when linked) plus the page that owns the thing. [user 2026-09-25, #1650] (AI-synced 2026-09-25)
 - "Settings → Notifications" (Slack linking) is not the inbox and stays. [user 2026-09-25, #1650] (AI-synced 2026-09-25)

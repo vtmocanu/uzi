@@ -985,9 +985,9 @@ chain in the diagram above, with no intervening `running`.
   covered by `slacksvc`'s own Slack DM for opted-in users (PRD #1650 removed
   the separate, duplicate `run_failed` notification). A run whose failure
   reason is the cancel sentinel ("run cancelled": a user cancel, or a server
-  auto-stop of a run on a live worker) renders as "Cancelled" without the ❌
-  glyph; every other failed run, plan rejections included, posts
-  "❌ *Failed*" with its reason. The DM is not gated on `stop_kind`.
+  auto-stop the live worker carries out) renders as "Cancelled" without the ❌
+  glyph; every other failed run, plan rejections and an escalated auto-stop
+  included, posts a ❌ Failed message with its reason. The DM is not gated on `stop_kind`.
   The `notifications` table itself is not gone (PRD #1650): it stays as a
   pruned (200 rows/user), write-only event log and the incidental-finding
   Slack de-dup latch (`notifysvc.Notify`) — nothing in the product reads it
