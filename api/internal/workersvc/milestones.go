@@ -140,7 +140,9 @@ func milestonesParam(kind string, ms *[]Milestone) []byte {
 //   - a stored NON-EMPTY milestones_candidate is passed through unchanged when the report
 //     re-presents the SAME plan (issue #1626 B1): its NUL-stripped plan_md equals the stored
 //     plan_md (which SetRunAwaitingApproval writes NUL-stripped), the stored plan_md is NULL
-//     (nothing to prove a new plan against), or the report carries no plan_md at all.
+//     (nothing to prove a new plan against), or the report carries an explicit EMPTY milestones
+//     list with no plan_md. A report carrying NEITHER plan_md nor milestones returns nil and
+//     clears the candidate, consistent with SetRunAwaitingApproval also writing plan_md NULL.
 //     SetRunAwaitingApproval assigns the candidate directly, and a reclaim at the gate (a
 //     credential switch or requeue while parked) re-presents the plan without the milestones it
 //     was first reported with; reading that as `[]` would freeze an empty contract against an
@@ -179,7 +181,8 @@ func planMilestonesParam(run store.Run, planMd *string, ms *[]Milestone) []byte 
 	storedCandidate := priorErr == nil && len(run.MilestonesCandidate) > 0
 	// samePlan: this report re-presents the stored plan rather than revising it. The stored
 	// plan_md was written NUL-stripped (stripNULParam), so the report's text is compared the same
-	// way. A NULL stored plan_md, or a report with no plan_md, cannot prove a revise.
+	// way. A NULL stored plan_md, or a report with no plan_md, cannot prove a revise (a report
+	// with neither plan_md nor milestones still returns nil below, clearing plan and candidate).
 	samePlan := !run.PlanMd.Valid || planMd == nil
 	if !samePlan {
 		clean, _ := stripNUL(*planMd)
