@@ -195,8 +195,9 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    ```
 
    A conflict on `CHANGELOG.md` alone is auto-resolved as a union (`changelog-union.sh`),
-   unless a bullet or `## ` heading appears on both sides of a hunk (a shared `### X` under
-   `[Unreleased]` is fine) or a side rewords a line: then it refuses and the stop is exit 5. Duplicate `###` headings under `[Unreleased]` get their own collapse commit.
+   unless a bullet appears on both sides of a hunk (a shared `### X` under `[Unreleased]` is
+   fine), a hunk holds a `## ` heading, or a side rewords a line: then it refuses and the
+   stop is exit 5. Duplicate `###` headings under `[Unreleased]` get their own collapse commit.
    Exit 5 = any other conflict, worktree left mid-rebase: resolve (a union of both sides is
    usual for a shared list), `git rebase --continue`, re-run with `--skip-rebase`. Exit 6 = the
    renumber helper reported references to fix by hand. Exit 7 = a gate failed (log path

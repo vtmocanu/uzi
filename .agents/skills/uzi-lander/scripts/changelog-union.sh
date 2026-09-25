@@ -8,7 +8,8 @@
 # (`|||||||` .. `=======`) is dropped. FAIL-CLOSED: when a bullet, a continuation line or a
 # `## [...]` heading appears on BOTH sides of one conflict block, the union would duplicate
 # it, so the helper refuses and leaves the file for a human (land-prep then stops with exit
-# 5). Each block must carry a diff3 base section (land-prep rebases with
+# 5). A `## ` heading anywhere inside a conflict block (either side or the base) refuses too:
+# a version-heading conflict is release territory. Each block must carry a diff3 base section (land-prep rebases with
 # merge.conflictStyle=diff3): a non-blank base line missing from either side means that side
 # deleted or REWORDED it (a later commit editing its own earlier bullet), and a union would
 # keep both wordings, so that refuses too, as does a block with no base section. A shared `### <Section>` subsection heading is allowed (each side bringing its own
@@ -111,18 +112,22 @@ if ! awk -v before="$tmpd/before" '
   /^>>>>>>>( |$)/ {
     if (st != 3) { bad = "stray >>>>>>> at line " NR; exit 1 }
     # A line on both sides would be written twice: refuse rather than guess a dedupe. Only
-    # a `### ` subsection heading may be shared, inside [Unreleased] with no `## ` heading in
-    # either side, where pass 2 folds the repeat into its first occurrence.
+    # a `### ` subsection heading may be shared, inside [Unreleased], where pass 2 folds the
+    # repeat into its first occurrence.
     if (!hasbase) { bad = "conflict ending at line " NR " has no diff3 base section (rebase with -c merge.conflictStyle=diff3)"; exit 1 }
-    split("", seen); split("", seenb); h2 = 0
+    # A `## ` version heading anywhere in a block is release territory, never an auto-union
+    # (and it would make the [Unreleased] tracking below unreliable for later blocks).
+    for (i = 1; i <= na; i++) if (A[i] ~ /^## /) { bad = "a `## ` heading inside the conflict ending at line " NR ": " A[i]; exit 1 }
+    for (i = 1; i <= nb; i++) if (B[i] ~ /^## /) { bad = "a `## ` heading inside the conflict ending at line " NR ": " B[i]; exit 1 }
+    for (i = 1; i <= nc; i++) if (C[i] ~ /^## /) { bad = "a `## ` heading inside the conflict ending at line " NR ": " C[i]; exit 1 }
+    split("", seen); split("", seenb)
     for (i = 1; i <= nb; i++) if (B[i] !~ /^[ \t]*$/) seenb[B[i]] = 1
-    for (i = 1; i <= na; i++) { if (A[i] !~ /^[ \t]*$/) seen[A[i]] = 1; if (A[i] ~ /^## /) h2 = 1 }
+    for (i = 1; i <= na; i++) if (A[i] !~ /^[ \t]*$/) seen[A[i]] = 1
     for (i = 1; i <= nc; i++) if (C[i] !~ /^[ \t]*$/ && !((C[i] in seen) && (C[i] in seenb))) {
       bad = "a side deletes or rewords a line of the conflict ending at line " NR ": " C[i]; exit 1
     }
-    for (i = 1; i <= nb; i++) if (B[i] ~ /^## /) h2 = 1
     for (i = 1; i <= nb; i++) if (B[i] !~ /^[ \t]*$/ && (B[i] in seen)) {
-      if (B[i] ~ /^### / && unrel && !h2) continue
+      if (B[i] ~ /^### / && unrel) continue
       bad = "line on both sides of the conflict ending at line " NR ": " B[i]; exit 1
     }
     st = 0; na = 0; nb = 0; nc = 0; hasbase = 0; next

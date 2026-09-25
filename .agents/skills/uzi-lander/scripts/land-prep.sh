@@ -42,11 +42,11 @@
 #      --continue`, then re-run with --skip-rebase. A stop whose ONLY conflicted path is
 #      CHANGELOG.md is resolved automatically (changelog-union.sh keeps both sides) and the
 #      rebase continued, commit by commit; the CHANGELOG guard (exit 9) still runs after.
-#      The helper refuses (so this stays exit 5) when a bullet, continuation line or `## `
-#      heading appears on both sides of one conflict block (a shared `### ` subsection
-#      heading under [Unreleased] is allowed and folded), when a side deletes or rewords a
-#      line of the diff3 base section (rebases run with merge.conflictStyle=diff3), or when
-#      the union would repeat a `## [<version>]` heading.
+#      The helper refuses (so this stays exit 5) when a bullet or continuation line appears
+#      on both sides of one conflict block (a shared `### ` subsection heading under
+#      [Unreleased] is allowed and folded), when a block holds any `## ` heading, when a
+#      side deletes or rewords a line of the diff3 base section (rebases run with
+#      merge.conflictStyle=diff3), or when the union would repeat a `## [<version>]` heading.
 #      After every completed rebase that leaves CHANGELOG.md in the branch diff, repeated
 #      `### <Section>` headings under [Unreleased] are collapsed in a separate
 #      "chore: collapse duplicate CHANGELOG section headings" commit (only if it changes

@@ -227,8 +227,9 @@ rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "a two-sided [Unreleased] section returned rc=$rc, want 1: $(cat "$WORK/twosec.out")"
 cmp -s "$WORK/twosec.orig" "$WORK/twosec.md" || fail "a two-sided [Unreleased] section modified the file"
-# 3d. The post-check: sides that share no line but would repeat a version heading (same
-#     version, different dates) are refused too.
+# 3d. Sides that share no line but would repeat a version heading (same version, different
+#     dates) are refused: a `## ` heading inside a block always refuses (the repeated-version
+#     post-check stays as a second line of defence behind it).
 cat > "$WORK/twover.md" <<'EOF'
 ## [Unreleased]
 
@@ -250,7 +251,7 @@ rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "a repeated version heading returned rc=$rc, want 1: $(cat "$WORK/twover.out")"
 cmp -s "$WORK/twover.orig" "$WORK/twover.md" || fail "a repeated version heading modified the file"
-grep -qF 'repeats version heading(s) ## [0.2.0]' "$WORK/twover.out" || fail "the repeated version was not named: $(cat "$WORK/twover.out")"
+grep -qF 'a `## ` heading inside the conflict' "$WORK/twover.out" || fail "the version-heading conflict was not named: $(cat "$WORK/twover.out")"
 # 3e. Positive: distinct bullets on the two sides still union.
 printf '## [Unreleased]\n\n### Fixed\n\n<<<<<<< HEAD\n- **main only**\n||||||| parent\n=======\n- **branch only**\n>>>>>>> abc (b)\n' > "$WORK/distinct.md"
 bash "$SCRIPT" "$WORK/distinct.md" > "$WORK/distinct.out" 2>&1 || fail "distinct bullets did not union: $(cat "$WORK/distinct.out")"
@@ -391,6 +392,40 @@ set -e
 cmp -s "$WORK/nobase.orig" "$WORK/nobase.md" || fail "a block without a base section modified the file"
 grep -qF 'no diff3 base section' "$WORK/nobase.out" || fail "missing base not named: $(cat "$WORK/nobase.out")"
 
+# 3k. Two blocks: the first carries DISTINCT `## [0.1.0]` / `## [0.2.0]` headings, so the
+#     second sits in a released section; its shared `### Fixed` must not be treated as
+#     [Unreleased]. Refused, file untouched.
+cat > "$WORK/twoblk.md" <<'EOF'
+## [Unreleased]
+
+- **u**
+
+<<<<<<< HEAD
+## [0.1.0] - 2026-01-01
+||||||| parent
+=======
+## [0.2.0] - 2026-02-01
+>>>>>>> abc1234 (branch)
+
+<<<<<<< HEAD
+### Fixed
+
+- **main old**
+||||||| parent
+=======
+### Fixed
+
+- **branch old**
+>>>>>>> abc1234 (branch)
+EOF
+cp "$WORK/twoblk.md" "$WORK/twoblk.orig"
+set +e
+bash "$SCRIPT" "$WORK/twoblk.md" > "$WORK/twoblk.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "a block after a version-heading block returned rc=$rc, want 1: $(cat "$WORK/twoblk.out")"
+cmp -s "$WORK/twoblk.orig" "$WORK/twoblk.md" || fail "a version-heading block modified the file"
+
 # 4. No markers: success, file untouched (even with a duplicate heading).
 printf '## [Unreleased]\n\n### Fixed\n\n- a\n\n### Fixed\n\n- b\n' > "$WORK/clean.md"
 cp "$WORK/clean.md" "$WORK/clean.orig"
@@ -473,4 +508,4 @@ set -e
 [ "$rc" -eq 1 ] || fail "--collapse on a conflicted file returned rc=$rc, want 1"
 cmp -s "$WORK/lossy.orig" "$WORK/mk.md" || fail "--collapse modified a conflicted file"
 
-echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, both-sides and repeated-version refusals, shared ### subsections, reword and no-base refusals, no-op, --collapse"
+echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, both-sides and repeated-version refusals, shared ### subsections, reword, no-base and version-heading refusals, no-op, --collapse"
