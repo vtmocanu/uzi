@@ -370,7 +370,7 @@ A few worth knowing:
   single `--repo` is unchanged, dumping the one schedule object), and a mid-loop
   failure still reports the schedules that already landed before it exits non-zero.
   Creating on **N>1 repos** stamps the rows with one shared **display-only** group id
-  so the web renders them as one expandable group; the rows stay fully independent
+  (the web lists each as its own row); the rows stay fully independent
   (editing/pausing/removing one never touches a sibling), and a single-`--repo` create
   is standalone (no group). An **`--issue` target cannot span repos** (the issue
   number is repo-relative), so `--repo A --repo B ... --issue N` is a usage error
@@ -541,7 +541,7 @@ A few worth knowing:
   onto **another** repo you own as a new **grouped sibling** — the new row is an
   independent, fully-editable copy of the source's current config, and both the source
   and the new row carry one shared **display-only** group id (the web Schedules tab
-  renders siblings as independent rows; filter by job or repo to see them together —
+  renders siblings as independent rows —
   the CLI twin of the web "Add to another repo" action). `--repo` is
   required (the target repo id from `uzi repo list`). Only a **user** schedule can be
   added onto; a foreign source or target repo is a `404`. An **issue-target schedule

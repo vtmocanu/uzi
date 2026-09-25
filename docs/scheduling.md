@@ -211,9 +211,11 @@ Schedules created together this way share a **display-only** group id
 server-side, but the **Schedules** tab renders each sibling as its own
 independent row — no expandable summary, no sub-rows — the same as a
 default enabled on several repos (see [Default jobs](#default-jobs)
-below). To see a multi-repo job's siblings together, filter the list by
-that job (follow a catalog card's "Enabled on N repos" link, or a row's
-"from catalog" link) or by repo.
+below). The list does not keep siblings adjacent: it sorts by next fire.
+For a default job, a catalog card's "Enabled on N repos" link shows every
+repo it runs on by filtering the list to that job; custom siblings have no
+job filter; they share the schedule's name, and the Repo select narrows
+the list to one repo.
 
 **The grouping is data only, not a linked job.** Each sibling is its own
 independent schedule row: editing, pausing, or removing one never touches
@@ -239,7 +241,7 @@ repo's own issue.
 
 **CLI**: `uzi schedule create --repo A --repo B ...` creates the same
 grouped siblings as the web multi-select; `uzi schedule add-repo <id> --repo
-<id>` is the CLI twin of "Add another repo" — see [the CLI
+<id>` is the CLI twin of "Add to another repo" — see [the CLI
 reference](./cli.md#commands) for the full flag list.
 
 ### Pausing everything at once
@@ -414,8 +416,8 @@ the catalog — its entry is cadence and model only (see
   agents" toggle, `override_subagent_model`) are yours to edit like any
   schedule — as is owner **guidance** on a prompt-target or sweep-target
   default (on a sweep default it is an overlay composed onto the read-only
-  baked catalog guidance); a **Reset** action (labelled "Reset to catalog
-  defaults", shown only on a customized row) restores cron, timezone, model,
+  baked catalog guidance); a **Reset** action (shown only on a customized row)
+  restores cron, timezone, model,
   auto-approve, wait-on-limit, max issues and output mode to the catalog
   values in one step, sets `override_subagent_model` back to its catalog
   baseline of `false`, and clears MR rework, owner guidance, the harness pin
@@ -459,11 +461,11 @@ the catalog — its entry is cadence and model only (see
   custom alike, is one flat row on the **Schedules** tab — default rows
   carry a lock marker on the baked prompt, plus inline Run now, Edit, a
   Reset action (only when the row has been customized) and a More actions
-  menu (Clone, Enable on another repo, Remove); nothing to expand to act on
+  menu (Clone, Enable on another repo, Remove; a custom row offers Add to
+  another repo in place of Enable); nothing to expand to act on
   a row, even for a default enabled on several repos — each repo is its own
   row (see [Running a schedule on several
-  repos](#running-a-schedule-on-several-repos) above for how to see them
-  together). **Job catalog** is for discovery: one card per built-in job,
+  repos](#running-a-schedule-on-several-repos) above). **Job catalog** is for discovery: one card per built-in job,
   each with its own "Enable on…" repo picker and a status line ("Not
   enabled", or "Enabled on N repos" linking back to the Schedules tab
   filtered to that job). **CLI**: `uzi schedule catalog list` shows the

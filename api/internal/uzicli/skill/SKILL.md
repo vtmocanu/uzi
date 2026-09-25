@@ -641,7 +641,7 @@ nothing a manual start cannot.
   a CLIENT-SIDE fan-out that issues one independent create per `--repo` (each repo prints its
   own `created schedule …` line, and `--json` returns them all as an array; a single `--repo`
   is unchanged and dumps the one schedule object). Creating on **N>1 repos** stamps the rows
-  with one shared **display-only** group id so the web renders them as one expandable group;
+  with one shared **display-only** group id (the web lists each as its own row);
   the rows stay fully independent (editing/pausing/removing one never touches a sibling), and a
   single-`--repo` create is standalone (no group). A mid-loop failure still reports the
   schedules that already landed before it exits non-zero. You pick exactly one **target** and
@@ -824,8 +824,8 @@ nothing a manual start cannot.
 - `uzi schedule add-repo <schedule-id> --repo <repo-id>` — replicate an existing schedule you
   own onto **another** repo you own as a new **grouped sibling**: the new row is an
   independent, fully-editable copy of the source's current config, and both the source and the
-  new row are stamped with one shared **display-only** group id so they render as one
-  expandable group (the CLI twin of the web "Add another repo" action). `--repo` is required
+  new row are stamped with one shared **display-only** group id; the web lists each as its
+  own row (the CLI twin of the web "Add to another repo" action). `--repo` is required
   (the target repo id from `uzi repo list`). Only a **user** schedule can be added onto; a
   foreign source or target repo is a `404`. If the schedule already has a sibling on that repo
   this is a clean **no-op** (exit 0). `--json` dumps the new sibling object.

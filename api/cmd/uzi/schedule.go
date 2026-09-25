@@ -130,8 +130,8 @@ func newScheduleCloneCmd(env Env, gf *globalFlags) *cobra.Command {
 // newScheduleAddRepoCmd — `uzi schedule add-repo <id> --repo <repoID>` (PRD #636 M4,
 // Decision 5): replicate an existing user schedule's current config onto ANOTHER repo you
 // own as a new grouped sibling. It stamps both the source and the new row with one shared
-// display-only sibling_group_id (allocated server-side, race-safely), so they render as one
-// expandable group — the CLI twin of the web "Add another repo" action. Only a user-origin
+// display-only sibling_group_id (allocated server-side, race-safely); the web lists each as its
+// own row — the CLI twin of the web "Add to another repo" action. Only a user-origin
 // schedule can be added onto; a foreign source or target repo is a 404.
 //
 // A 409 means the schedule already has a sibling on that repo (the (sibling_group_id,
@@ -142,7 +142,7 @@ func newScheduleAddRepoCmd(env Env, gf *globalFlags) *cobra.Command {
 		Use:   "add-repo <schedule-id>",
 		Short: "Replicate a schedule onto another repo as a grouped sibling",
 		Long: "Replicate an existing schedule you own onto ANOTHER repo you own as a new sibling,\n" +
-			"grouped with the source so they render as one expandable group. The new row is an\n" +
+			"grouped with the source (the web lists each as its own row). The new row is an\n" +
 			"independent, fully-editable copy of the source's current config (edit/pause/remove it\n" +
 			"on its own). Pass --repo <repoID> for the target repo (from `uzi repo list`). If the\n" +
 			"schedule already has a sibling on that repo this is a clean no-op.",
@@ -241,8 +241,8 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			// Multi-repo client-side fan-out: one independent create per --repo. Generate ONE
 			// display-only sibling_group_id (uuid v4) here and stamp it on every create body so
-			// the N rows share a group and the web renders them as one expandable summary (PRD
-			// #636 Decision 4). The single-repo fast path above leaves it nil (a standalone row).
+			// the N rows share a group (PRD #636 Decision 4; since PRD #1645 the web lists each
+			// sibling as its own row). The single-repo fast path above leaves it nil (a standalone row).
 			// The group id is cosmetic — the rows stay fully independent; owner-scoping bounds
 			// its blast radius to the caller's own rows.
 			groupID := uuid.NewString()
