@@ -95,6 +95,9 @@ export class FakeApi {
       // "budget_exhausted"), the shape the server produces on a SERVER-side wall park — paired with
       // runStatus:"paused" + disposition:"stale_claim" it drives the ServerWallParkedError path.
       holdReason?: string;
+      // Issue #1626: when set, the 409 refusal's run DTO carries this completion_revision, so a test
+      // can prove a STALE ack's revision is never adopted.
+      completionRevision?: unknown;
       fired: boolean;
     }
   >();
@@ -314,7 +317,13 @@ export class FakeApi {
   failStateWhen(
     runId: string,
     matchesState: (body: StateRequest) => boolean,
-    opts: { httpStatus?: number; runStatus?: string; disposition?: string; holdReason?: string } = {},
+    opts: {
+      httpStatus?: number;
+      runStatus?: string;
+      disposition?: string;
+      holdReason?: string;
+      completionRevision?: unknown;
+    } = {},
   ): void {
     this.stateFailWhen.set(runId, {
       matchesState,
@@ -322,6 +331,7 @@ export class FakeApi {
       runStatus: opts.runStatus,
       disposition: opts.disposition,
       holdReason: opts.holdReason,
+      completionRevision: opts.completionRevision,
       fired: false,
     });
   }
@@ -758,6 +768,7 @@ export class FakeApi {
             // beside status:"paused"; the reportState closure reads the pair (+ disposition) to throw
             // ServerWallParkedError. Absent unless armed, so existing stale_claim tests are unchanged.
             ...(when.holdReason ? { hold_reason: when.holdReason } : {}),
+            ...(when.completionRevision !== undefined ? { completion_revision: when.completionRevision } : {}),
           },
           // PRD #1247 M5b: a stale_claim (or other) disposition rides TOP-LEVEL when armed.
           ...(when.disposition ? { disposition: when.disposition } : {}),

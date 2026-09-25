@@ -154,3 +154,24 @@ func TestBuildCompletionContractEmpty(t *testing.T) {
 		}
 	}
 }
+
+// TestCreateRunNoStampForSeededPlan (issue #1626 B2): a SEEDED-plan run (PRD #209) skips the plan
+// gate, so no plan-bearing report ever freezes its completion contract and an interlocked seeded
+// run would hold at finalize. It therefore stays legacy (NULL completion_contract_version) even
+// with the rollout switch on.
+func TestCreateRunNoStampForSeededPlan(t *testing.T) {
+	svc, fs := newInterlockCreateSvc(t, fakeCompletionInterlock{on: true})
+	seed := &SeededPlan{PlanMD: "Refactor the token store; add a test in queries_test.go"}
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, seed, nil, nil); err != nil {
+		t.Fatalf("CreateRun (seeded): %v", err)
+	}
+	if fs.createRunParams == nil {
+		t.Fatal("CreateRun store insert must run")
+	}
+	if !fs.createRunParams.PlanMd.Valid || fs.createRunParams.PlanSource != planSourceSeeded {
+		t.Fatalf("seed not applied: plan_md=%+v plan_source=%q", fs.createRunParams.PlanMd, fs.createRunParams.PlanSource)
+	}
+	if fs.createRunParams.CompletionContractVersion.Valid {
+		t.Fatalf("completion_contract_version = %+v, want NULL for a seeded-plan run (it never freezes a contract)", fs.createRunParams.CompletionContractVersion)
+	}
+}

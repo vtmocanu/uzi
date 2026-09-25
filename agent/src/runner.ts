@@ -879,8 +879,9 @@ interface RunFlight {
    *  claim is assembled BEFORE the contract freezes (at plan approval, or on the autopilot plan
    *  report) and the worker stays in-process across the plan gate with no re-claim, so the claim's
    *  `config.contract_revision` is absent; the ack is the only channel that brings the revision
-   *  in. Updated at the flight.reportState choke point from every non-stale ACK that carries one;
-   *  the finalize permit request uses it ahead of the claim's value. undefined until then. */
+   *  in. Updated at the flight.reportState choke point from every non-stale ACK that carries one,
+   *  monotonically (the highest revision seen wins, so a late ACK cannot roll it back); the
+   *  finalize permit request uses it ahead of the claim's value. undefined until then. */
   latestContractRevision: number | undefined;
   barePath: string | undefined;
   worktreePath: string | undefined;
@@ -5014,8 +5015,10 @@ export class RunRunner {
         if (ack.staleClaim) throw new StaleClaimError();
         // Issue #1626: remember the frozen completion-contract revision this (non-stale) ACK
         // carries, so the interlocked finalize can bind its permit to a contract that froze after
-        // the claim was issued. Every report goes through here, so the latest ACK wins.
-        if (ack.contractRevision !== undefined) flight.latestContractRevision = ack.contractRevision;
+        // the claim was issued. Every report goes through here. MONOTONE: only ever raised, so a
+        // late/reordered ACK carrying an older revision can never roll the bound revision back.
+        if (ack.contractRevision !== undefined)
+          flight.latestContractRevision = Math.max(flight.latestContractRevision ?? 0, ack.contractRevision);
         // issue #1582 M2: a TERMINAL report's ACK drives the settlement lifecycle (promote the
         // write-ahead `pushed` head on a completed outcome, else stop the records). Here, inside the
         // send, so it lands BEFORE the terminal resolve retires the outbox journal.

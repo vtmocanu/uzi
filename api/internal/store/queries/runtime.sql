@@ -1775,9 +1775,15 @@ UPDATE runs SET
     -- PRD #122 M1: the CANDIDATE milestone list this pre-approval report carries.
     -- DIRECT assignment, not COALESCE — the candidate is REPLACED each revision round
     -- (Decision 2), so a fresh awaiting_approval report overwrites the prior proposal.
-    -- A report with no milestones passes NULL and clears the candidate, which is
-    -- correct: the candidate reflects only the latest proposal. The immutable
-    -- frozen list is untouched here (it is written at approve / by autopilot).
+    -- The VALUE is decided in Go (planMilestonesParam, issue #1626). On a LEGACY run
+    -- a report with no milestones passes NULL and clears the candidate (the candidate
+    -- reflects only the latest proposal). On an INTERLOCKED run a milestone-less plan
+    -- passes the explicit '[]' (so approval freezes an empty contract) — EXCEPT that it
+    -- never downgrades a stored non-empty candidate: a re-presented gate or a revise
+    -- round with no milestones passes the stored candidate back unchanged (fail-closed),
+    -- and a re-report of the same plan_md over a NULL candidate stays NULL. A rejected
+    -- (invalid) list passes NULL on either kind. The immutable frozen list is untouched
+    -- here (it is written at approve / by autopilot).
     milestones_candidate = sqlc.narg('milestones_candidate')::jsonb,
     -- PRD #84 M4 (unit 4b): persist the plan-time INFERRED requirement set the worker
     -- emits on this report. ALL THREE assignments are ABSENT-SAFE (a nil param must not

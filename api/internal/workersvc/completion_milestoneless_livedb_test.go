@@ -208,3 +208,64 @@ func TestMilestonelessLegacyRunStaysNullLiveDB(t *testing.T) {
 		t.Fatalf("legacy autopilot plan report froze a contract (%s, rev %v)", c, r)
 	}
 }
+
+// TestRepresentedGateKeepsCandidateLiveDB (issue #1626 B1): a reclaim at the plan gate (a
+// credential switch or requeue while parked) re-presents the SAME plan with no milestones —
+// assembleClaim replayed only the (still NULL) frozen list, so the worker had none to send. The
+// re-presented report must NOT downgrade the stored non-empty candidate to `[]`: approval then
+// freezes a 2-criterion contract and the permit is DENIED while m1/m2 are undone. Before the fix
+// the direct-assignment candidate write stored `[]`, the approve froze criteria:[], and the
+// permit was granted vacuously against a two-milestone plan.
+func TestRepresentedGateKeepsCandidateLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	wkr := store.Worker{ID: wid}
+	runID := e.seedOwnedRun(t, wid, "running", true, false)
+
+	const plan = "# Plan\n\nTwo milestones.\n"
+	ms := []Milestone{{ID: "m1", Title: "First"}, {ID: "m2", Title: "Second"}}
+	if _, applied, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "awaiting_approval", PlanMd: strPtr(plan), Milestones: &ms}); err != nil || !applied {
+		t.Fatalf("SetState awaiting_approval (with milestones): applied=%v err=%v", applied, err)
+	}
+	// The re-presented gate: same plan_md, milestones absent.
+	if _, _, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "awaiting_approval", PlanMd: strPtr(plan)}); err != nil {
+		t.Fatalf("SetState awaiting_approval (re-presented): %v", err)
+	}
+	cand, _ := e.milestoneColumns(t, runID)
+	if got, err := DecodeMilestones(cand); err != nil || len(got) != 2 || got[0].ID != "m1" || got[1].ID != "m2" {
+		t.Fatalf("milestones_candidate = %s (err %v), want the original m1,m2 (a re-presented gate must not downgrade it)", cand, err)
+	}
+
+	if _, err := svc.SubmitInput(e.ctx, e.userID, runID, "approve_plan", "", &AgentSelection{Source: AgentSourceOwn}); err != nil {
+		t.Fatalf("SubmitInput approve_plan: %v", err)
+	}
+	contract, rev := e.readContract(t, runID)
+	if contract == nil || rev == nil || *rev != 1 {
+		t.Fatalf("approve froze contract %s rev %v, want a revision-1 contract", contract, rev)
+	}
+	var c struct {
+		Criteria []json.RawMessage `json:"criteria"`
+	}
+	if err := json.Unmarshal(contract, &c); err != nil {
+		t.Fatalf("decode contract %s: %v", contract, err)
+	}
+	if len(c.Criteria) != 2 {
+		t.Fatalf("contract has %d criteria, want 2 (contract %s)", len(c.Criteria), contract)
+	}
+
+	if _, err := svc.ConsumeInputs(e.ctx, wkr, runID); err != nil {
+		t.Fatalf("ConsumeInputs: %v", err)
+	}
+	if _, applied, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "running"}); err != nil || !applied {
+		t.Fatalf("SetState running after approve: applied=%v err=%v", applied, err)
+	}
+	permit, err := svc.RequestCompletionPermit(e.ctx, wkr, runID,
+		CompletionPermitRequest{ContractRevision: 1, Branch: "agent/issue-1626", Head: "0123abcd"})
+	if err != nil {
+		t.Fatalf("RequestCompletionPermit: %v", err)
+	}
+	if permit.Granted {
+		t.Fatalf("permit granted with m1/m2 undone (vacuous grant against a two-milestone plan): %+v", permit)
+	}
+}

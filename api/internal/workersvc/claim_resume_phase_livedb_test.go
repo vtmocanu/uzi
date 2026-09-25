@@ -49,6 +49,8 @@ func TestAssembleClaimResumePhaseAwaitingApprovalLiveDB(t *testing.T) {
 		SessionID: pgconv.TextOrNull("sess-resume-1"),
 		ID:        runID,
 		WorkerID:  pgconv.UUID(workerID),
+		// Issue #1626 (B1): the candidate breakdown the gate resume must re-deliver.
+		MilestonesCandidate: []byte(`[{"id":"m1","title":"First"},{"id":"m2","title":"Second"}]`),
 	})
 	if err != nil {
 		t.Fatalf("SetRunAwaitingApproval: %v", err)
@@ -108,6 +110,11 @@ func TestAssembleClaimResumePhaseAwaitingApprovalLiveDB(t *testing.T) {
 	// The gate must resume the SAME unapproved plan, not skip to implementing.
 	if payload.PlanApproved {
 		t.Fatalf("assembled claim PlanApproved = true, want false for an awaiting_approval resume")
+	}
+	// Issue #1626 (B1): the gate resume carries the unapproved CANDIDATE (nothing is frozen yet),
+	// so the worker re-presents the plan WITH its milestones rather than without them.
+	if len(payload.Milestones) != 2 || payload.Milestones[0].ID != "m1" || payload.Milestones[1].ID != "m2" {
+		t.Fatalf("assembled claim Milestones = %+v, want the m1,m2 candidate on an awaiting_approval resume", payload.Milestones)
 	}
 }
 

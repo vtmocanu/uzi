@@ -3444,7 +3444,8 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// PRD #122 M1: the CANDIDATE milestone list rides the pre-approval report.
 		// milestonesParam validates + kind-gates it (Decision 12/13) and returns NULL
 		// when the list is absent, rejected, or from a non-issue run — the query writes
-		// that directly, clearing the candidate (Decision 2: replaced each round).
+		// that directly, clearing the candidate (Decision 2: replaced each round). An
+		// interlocked run goes through planMilestonesParam instead (issue #1626, below).
 		//
 		// PRD #84 M4 4b: the plan-time INFERRED requirement set also rides this report.
 		// Each array is a tri-state pointer — absent (nil) means "no change", and the
@@ -3458,7 +3459,9 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		rows, err = q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
 			PlanMd: stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			// Issue #1626: an interlocked run's milestone-less plan is the explicit `[]`
-			// (planMilestonesParam), so the approve freeze builds a criteria:[] contract.
+			// (planMilestonesParam), so the approve freeze builds a criteria:[] contract — but a
+			// milestone-less re-presentation (a gate reclaim) or revise round never downgrades a
+			// stored non-empty candidate: planMilestonesParam passes it back unchanged.
 			MilestonesCandidate:  planMilestonesParam(owned, req.PlanMd, req.Milestones),
 			InferredCapabilities: inferredCaps,
 			InferredTools:        inferredTools,
@@ -5448,8 +5451,14 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// state) unless on. createRun only ever creates issue-kind rows, so this is inherently
 	// issue-scoped; the contract CONTENT is frozen later at approval / the first running
 	// report, not here.
+	//
+	// Issue #1626: a SEEDED-plan run (PRD #209, seed != nil) is never stamped and stays legacy.
+	// Its plan arrives at create time, the worker takes the plan-approved skip, and it never
+	// sends a plan-bearing report (no awaiting_approval, no autopilot running report carrying
+	// plan_md); a SeededPlan carries no milestone list either. Nothing would ever freeze its
+	// contract, so an interlocked seeded run would hold at finalize on every completion.
 	var completionContractVersion pgtype.Int4
-	if s.completionInterlockOn(ctx) {
+	if seed == nil && s.completionInterlockOn(ctx) {
 		completionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
 	}
 	run, err := s.createRunResolved(ctx, userID, explicit, func(q Store, resolved resolvedHarness) (store.Run, error) {

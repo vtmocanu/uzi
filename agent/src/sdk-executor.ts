@@ -395,6 +395,10 @@ interface TurnResult {
   /** PRD #122 M1: the candidate milestone list the lead passed to submit_plan this
    *  turn, if any. Rides the gate call so the human approves the breakdown. */
   milestones?: Milestone[];
+  /** Issue #1626: the lead's entirely-malformed submit_plan milestone list (see
+   *  ScannedSignals.rejectedMilestones). Sent on the gate report in place of `milestones` so the
+   *  server rejects it; never used as the worker's own breakdown. */
+  rejectedMilestones?: Milestone[];
   /** PRD #122 M2: the latest milestone progress the lead reported via report_progress
    *  during this turn (last-wins within the turn). The loop carries it into the NEXT
    *  iteration's `running` report. */
@@ -1578,6 +1582,11 @@ export class SdkExecutor implements Executor {
         // it re-presents the ALREADY-CAPTURED plan (the persisted plan_md → ctx.approvedPlan) at the
         // gate, so `planPrompt` built above is consumed only on the planning path.
         let candidateMilestones: Milestone[] | undefined;
+        // Issue #1626: what the gate REPORTS as the candidate. Equal to candidateMilestones except
+        // when the lead's list was entirely malformed: then the worker keeps no breakdown
+        // (candidateMilestones undefined) but the report carries the rejected entries, so the
+        // server drops the candidate to NULL rather than reading "no milestones" as an empty contract.
+        let gateMilestones: Milestone[] | undefined;
         if (resumeAtGate) {
           ctx.emit({
             kind: "status",
@@ -1587,9 +1596,14 @@ export class SdkExecutor implements Executor {
             },
           });
           approvedPlan = ctx.approvedPlan!;
-          // The frozen breakdown rides the claim so the re-presented gate shows the same
-          // milestones; absent ⇒ no milestones on the report, as for a plan turn producing none.
+          // Nothing is frozen before approval: on a resume_phase "awaiting_approval" claim the
+          // server delivers the stored CANDIDATE breakdown in `milestones` (issue #1626), which
+          // lands here, so the re-presented gate re-sends the same milestones. An older server
+          // sent only the (NULL) frozen list, so this is undefined there; the server's
+          // planMilestonesParam guard then keeps the stored non-empty candidate rather than
+          // reading the milestone-less re-presentation as an empty breakdown.
           candidateMilestones = ctx.frozenMilestones ?? undefined;
+          gateMilestones = candidateMilestones;
         } else {
           const planningLabel = isCIFix
             ? "diagnosing CI failure"
@@ -1617,6 +1631,7 @@ export class SdkExecutor implements Executor {
           // PRD #122 M1: the CANDIDATE milestone list rides every gate call so the human
           // approves the breakdown. It is REPLACED on each revision round (Decision 2).
           candidateMilestones = plan.milestones;
+          gateMilestones = plan.rejectedMilestones ?? plan.milestones;
         }
 
         // --- Plan gate (+ revision loop, PRD #41) -----------------------------
@@ -1644,7 +1659,7 @@ export class SdkExecutor implements Executor {
         // re-presents the SAME gate on the OLD token (re-run ctx.gatePlan — keep waiting for a real
         // verdict). The gate already loops for revisions; this only adds switch-survival to each wait.
         const g0 = await this.runThroughSwitch(ctx, state, () =>
-          ctx.gatePlan!(approvedPlan, candidateMilestones, (planMd) =>
+          ctx.gatePlan!(approvedPlan, gateMilestones, (planMd) =>
             this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
           ),
         );
@@ -1678,7 +1693,7 @@ export class SdkExecutor implements Executor {
               },
             });
             const gExhausted = await this.runThroughSwitch(ctx, state, () =>
-              ctx.gatePlan!(approvedPlan, candidateMilestones),
+              ctx.gatePlan!(approvedPlan, gateMilestones),
             );
             if ("released" in gExhausted) return { branch: ctx.branch, switchReleased: true };
             verdict = gExhausted.value;
@@ -1712,11 +1727,12 @@ export class SdkExecutor implements Executor {
           approvedPlan = turn.plan;
           // Decision 2: the candidate is REPLACED across a revision round.
           candidateMilestones = turn.milestones;
+          gateMilestones = turn.rejectedMilestones ?? turn.milestones;
           // PRD #362 M3c: a re-plan REGENERATES the plan summary (Decision 2), fired from
           // the gate's onAwaitingApproval callback (after the re-report persists the NEW
           // plan_md) so its stale-write guard matches the new plan.
           const gRev = await this.runThroughSwitch(ctx, state, () =>
-            ctx.gatePlan!(approvedPlan, candidateMilestones, (planMd) =>
+            ctx.gatePlan!(approvedPlan, gateMilestones, (planMd) =>
               this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
             ),
           );

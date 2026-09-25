@@ -436,6 +436,19 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// worker just cannot correlate a buffered approve_plan to a specific plan revision.
 	var resumePlanSeq int64
 	if resumePhase == "awaiting_approval" {
+		// Issue #1626 (B1): a gate resume re-presents the SUBMITTED plan, whose milestones are
+		// still only the CANDIDATE (milestones_frozen is NULL until approval). Deliver that
+		// candidate so the worker re-sends the same breakdown with the re-presented plan instead
+		// of a milestone-less report. Never overrides a frozen list; a malformed candidate
+		// degrades to none, like the frozen decode above (the server's planMilestonesParam
+		// guard keeps the stored candidate either way).
+		if len(milestones) == 0 {
+			if cand, cerr := DecodeMilestones(run.MilestonesCandidate); cerr != nil {
+				slog.Error("workersvc: decode run milestone candidate", "run_id", run.ID, "error", cerr)
+			} else {
+				milestones = cand
+			}
+		}
 		if seq, err := s.q.LatestPlanSeqForRun(ctx, run.ID); err != nil {
 			slog.Warn("workersvc: latest plan seq for resume", "run_id", run.ID, "error", err)
 		} else {

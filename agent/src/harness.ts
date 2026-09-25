@@ -406,6 +406,8 @@ export interface TurnSignals {
   milestonesCompleted?: string[];
   questions?: AskUserQuestion[];
   milestones?: Milestone[];
+  /** Issue #1626: see ScannedSignals.rejectedMilestones (wire-only; exclusive with milestones). */
+  rejectedMilestones?: Milestone[];
   progress?: MilestoneProgress;
   checkpoint?: boolean;
   summary?: string;

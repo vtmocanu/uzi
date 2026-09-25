@@ -545,6 +545,28 @@ describe("scanSignals milestones (PRD #122 M1)", () => {
       }),
     ) as Record<string, unknown>;
     assert.ok(!("milestones" in junk), "all-junk milestones must not be captured");
+    // Issue #1626: a NON-EMPTY list that normalises to nothing is not "no milestones": it rides
+    // as rejectedMilestones (every entry with a blank id or title, so the server rejects it) and
+    // the server drops the candidate to NULL instead of inferring an empty completion contract.
+    assert.deepStrictEqual(junk["rejectedMilestones"], [
+      { id: "", title: "" },
+      { id: "", title: "" },
+      { id: "", title: "" },
+      { id: "", title: "" },
+      { id: "m1", title: "" },
+      { id: "", title: "no id" },
+      { id: "", title: "blank id" },
+      { id: "m2", title: "" },
+    ]);
+    for (const m of junk["rejectedMilestones"] as { id: string; title: string }[]) {
+      assert.ok(m.id === "" || m.title === "", `every rejected entry is server-invalid: ${JSON.stringify(m)}`);
+    }
+    // No list, an empty list, or a non-array stays additive-absent (a genuinely milestone-less plan).
+    for (const ms of [undefined, [], "nope"]) {
+      const r = scanSignals(toolUse(PLAN, { plan_md: "p", ...(ms === undefined ? {} : { milestones: ms }) })) as Record<string, unknown>;
+      assert.ok(!("rejectedMilestones" in r), `no rejectedMilestones for ${JSON.stringify(ms)}`);
+      assert.ok(!("milestones" in r), `no milestones for ${JSON.stringify(ms)}`);
+    }
 
     // A mixed list keeps only the well-formed entries.
     const mixed = scanSignals(
@@ -554,6 +576,7 @@ describe("scanSignals milestones (PRD #122 M1)", () => {
       }),
     );
     assert.deepStrictEqual(mixed.milestones, [{ id: "m1", title: "good" }]);
+    assert.ok(!("rejectedMilestones" in mixed), "a partly-valid list keeps its valid entries, no rejected list");
   });
 
   it("clamps over-long id and title (worker-side hygiene, not the real cap)", () => {

@@ -1157,7 +1157,9 @@ export interface ClaimResponse {
   /** The FROZEN milestone list for this run (PRD #122 M1, Decision 11), carried so a
    *  future resume's planning prompt can name what is already committed. Null/absent
    *  when the approved plan had no milestones. Additive + optional; nothing consumes
-   *  it in M1 — the field is declared now so the wire contract is complete. */
+   *  it in M1 — the field is declared now so the wire contract is complete.
+   *  Issue #1626: on a `resume_phase: "awaiting_approval"` claim (nothing frozen yet) it
+   *  carries the unapproved CANDIDATE list instead, so the re-presented gate re-sends it. */
   milestones?: Milestone[] | null;
   /** Whether this run's plan is already approved (PRD #35 Decision 6b), derived
    *  SERVER-side as "a consumed approve_plan input exists for the run, OR the run is

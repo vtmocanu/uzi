@@ -19,6 +19,15 @@ func TestPlanMilestonesParam(t *testing.T) {
 	one := &[]Milestone{{ID: "m1", Title: "First"}}
 	bad := &[]Milestone{{ID: "", Title: "no id"}}
 	empty := &[]Milestone{}
+	const twoJSON = `[{"id": "m1", "title": "First"}, {"id": "m2", "title": "Second"}]`
+	withCandidate := interlocked
+	withCandidate.MilestonesCandidate = []byte(twoJSON)
+	withEmptyCandidate := interlocked
+	withEmptyCandidate.MilestonesCandidate = []byte("[]")
+	samePlanNullCandidate := interlocked
+	samePlanNullCandidate.PlanMd = pgtype.Text{String: *plan, Valid: true}
+	legacyWithCandidate := legacy
+	legacyWithCandidate.MilestonesCandidate = []byte(twoJSON)
 
 	cases := []struct {
 		name string
@@ -35,6 +44,16 @@ func TestPlanMilestonesParam(t *testing.T) {
 		{"interlocked, blank plan_md", interlocked, strPtr(" \n\x00 "), nil, ""},
 		{"legacy plan, absent milestones", legacy, plan, nil, ""},
 		{"interlocked non-issue kind", store.Run{Kind: runkind.Chat, CompletionContractVersion: interlocked.CompletionContractVersion}, plan, nil, ""},
+		// B1: a re-presented gate (or a revise round) whose report carries no milestones never
+		// downgrades a stored NON-EMPTY candidate: it is passed through unchanged (fail-closed).
+		{"interlocked, absent milestones, non-empty candidate kept", withCandidate, plan, nil, twoJSON},
+		{"interlocked, explicit empty, non-empty candidate kept", withCandidate, plan, empty, twoJSON},
+		{"interlocked, absent milestones, stored [] stays []", withEmptyCandidate, plan, nil, "[]"},
+		{"interlocked, real milestones replace the candidate", withCandidate, plan, one, `[{"id":"m1","title":"First"}]`},
+		// A re-report of the SAME plan whose milestones previously resolved to NULL (a rejected
+		// list) stays NULL rather than inferring the vacuous `[]`.
+		{"interlocked, same plan re-reported after a NULL candidate", samePlanNullCandidate, plan, nil, ""},
+		{"legacy, absent milestones, candidate not carried", legacyWithCandidate, plan, nil, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

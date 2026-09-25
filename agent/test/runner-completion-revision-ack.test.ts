@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { nullLogger } from "./helpers.js";
-import { StubExecutor } from "../src/executor.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
+import { StubExecutor, type Executor } from "../src/executor.js";
 import {
   api,
   fakeGitlab,
@@ -56,6 +56,72 @@ describe("RunRunner — completion revision off the /state ACK (issue #1626)", (
 
     assert.strictEqual(api.completionPermitRequests.length, 1);
     assert.strictEqual(api.completionPermitRequests[0]!.body.contract_revision, 2, "the ACK's newer revision is echoed");
+  });
+
+  it("the bound revision is MONOTONE: a later ACK carrying an OLDER revision never rolls it back", async () => {
+    const { gitlab } = fakeGitlab({ head: H });
+    const claim = gitlabClaim(1629, { config: { completion_contract_version: 1 } });
+    // The first ACK carries revision 2; every later one carries a stale 1 (a late/reordered ACK).
+    let first = true;
+    api.onState(claim.run_id, () => {
+      api.setStateAckCompletionRevision(claim.run_id, first ? 2 : 1);
+      first = false;
+    });
+    api.setCompletionPermitResponse(true);
+    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
+    await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
+
+    assert.strictEqual(api.completionPermitRequests.length, 1);
+    assert.strictEqual(
+      api.completionPermitRequests[0]!.body.contract_revision,
+      2,
+      "the highest revision seen is kept; a later ACK's older revision does not roll it back",
+    );
+  });
+
+  it("a STALE-claim ACK's completion_revision is never adopted", async () => {
+    const { gitlab } = fakeGitlab({ head: H });
+    const claim = gitlabClaim(1630, {
+      claim_generation: 3,
+      config: { completion_contract_version: 1, contract_revision: 1 },
+    });
+    // The executor's fire-and-forget session-id report (the first report carrying its session id)
+    // is answered as a released/superseded claim whose run DTO carries revision 9. Its
+    // StaleClaimError is swallowed by that report's .catch, so the flight still finalizes — and
+    // must bind the permit to the claim's revision, not the stale ACK's. The executor waits for
+    // that report to settle before finishing, so the stale ACK is processed before the finalize.
+    const { logger, lines } = recordingLogger();
+    const SESSION = "sess-1626-stale";
+    api.failStateWhen(claim.run_id, (b) => b.session_id === SESSION, {
+      httpStatus: 409,
+      runStatus: "running",
+      disposition: "stale_claim",
+      completionRevision: 9,
+    });
+    api.setCompletionPermitResponse(true);
+    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
+    const stub = new StubExecutor(nullLogger());
+    const executor: Executor = {
+      run: async (ctx) => {
+        ctx.onSessionId?.(SESSION);
+        await new Promise((r) => setTimeout(r, 100));
+        return stub.run(ctx);
+      },
+    };
+    await runnerWith(() => ({ executor }), gitlab, undefined, logger).execute(claim);
+
+    assert.ok(
+      lines.some((l) => (l as { msg?: string }).msg === "could not persist session id"),
+      "the stale ACK was served (its StaleClaimError was swallowed by the session-id report)",
+    );
+    assert.strictEqual(api.completionPermitRequests.length, 1, "the run still reached the permit");
+    assert.strictEqual(
+      api.completionPermitRequests[0]!.body.contract_revision,
+      1,
+      "the stale ACK's revision 9 was not adopted; the claim's revision is echoed",
+    );
   });
 
   it("no revision on the claim NOR any ACK → still holds fail-closed (completion identity unresolvable)", async () => {

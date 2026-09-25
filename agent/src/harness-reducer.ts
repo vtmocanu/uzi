@@ -166,7 +166,16 @@ export class RunTurnReducerImpl implements RunTurnReducer {
    *  reduction so the owner reports it off the hot stream without awaiting. */
   private foldSignals(s: Readonly<Partial<TurnSignals>>, reduction: TurnReduction): void {
     if (s.plan !== undefined) this.result.plan = s.plan;
-    if (s.milestones) this.result.milestones = s.milestones;
+    // Last-wins across the two exclusive shapes of a submit_plan milestone list (issue #1626):
+    // the latest submit_plan's valid list, or its entirely-malformed one, replaces the other.
+    if (s.milestones) {
+      this.result.milestones = s.milestones;
+      delete this.result.rejectedMilestones;
+    }
+    if (s.rejectedMilestones) {
+      this.result.rejectedMilestones = s.rejectedMilestones;
+      delete this.result.milestones;
+    }
     if (s.progress) {
       this.result.progress = s.progress;
       reduction.progress = s.progress;

@@ -133,14 +133,51 @@ func milestonesParam(kind string, ms *[]Milestone) []byte {
 //     freeze before the plan's real milestones arrive (TestCompletionContractNotFrozenBeforeMilestonesLiveDB);
 //   - a PRESENT list that fails validation still drops to NULL (a malformed plan must not
 //     silently freeze an empty, vacuously-met contract).
+//
+// FAIL-CLOSED guards (issue #1626 review, B1), both for an interlocked issue run whose report
+// resolves to an EMPTY list (milestones absent, or an explicit `[]`):
+//   - it never DOWNGRADES a stored NON-EMPTY milestones_candidate: that candidate is passed
+//     through unchanged. SetRunAwaitingApproval assigns the candidate directly, and a reclaim at
+//     the gate (a credential switch or requeue while parked) re-presents the plan without the
+//     milestones it was first reported with; reading that as `[]` would make the approve freeze
+//     an empty contract and grant the permit vacuously against an N-milestone plan. The same
+//     guard covers a REVISE round whose new plan omits milestones: the prior non-empty candidate
+//     is kept, so at worst the contract requires milestones the new plan dropped (the lead can
+//     still report them complete, or the owner decides at the hold) — never a vacuous grant;
+//   - a re-report of the SAME plan_md the run already stores, while the stored candidate is
+//     NULL, stays NULL instead of inferring `[]`: that NULL means the earlier report of this
+//     exact plan carried a list the server rejected (or predates this rule), so inferring an
+//     empty contract would erase a rejection. NULL freezes nothing and the run holds.
+//
+// The `[]` inference therefore applies only when the stored candidate is NULL or already `[]`
+// and the plan is not a re-report of a plan whose milestones resolved to NULL.
 func planMilestonesParam(run store.Run, planMd *string, ms *[]Milestone) []byte {
-	if ms != nil || run.Kind != runkind.Issue || !run.CompletionContractVersion.Valid || planMd == nil {
+	if run.Kind != runkind.Issue || !run.CompletionContractVersion.Valid {
 		return milestonesParam(run.Kind, ms)
 	}
-	if clean, _ := stripNUL(*planMd); strings.TrimSpace(clean) == "" {
-		return nil
+	var resolved []byte
+	if ms != nil {
+		resolved = milestonesParam(run.Kind, ms)
+		if string(resolved) != "[]" {
+			return resolved
+		}
+	} else {
+		if planMd == nil {
+			return nil
+		}
+		clean, _ := stripNUL(*planMd)
+		if strings.TrimSpace(clean) == "" {
+			return nil
+		}
+		if run.MilestonesCandidate == nil && run.PlanMd.Valid && run.PlanMd.String == clean {
+			return nil
+		}
+		resolved = []byte("[]")
 	}
-	return []byte("[]")
+	if prior, err := DecodeMilestones(run.MilestonesCandidate); err == nil && len(prior) > 0 {
+		return run.MilestonesCandidate
+	}
+	return resolved
 }
 
 // progressParams validates a worker-reported progress update (Decision 3/12): every
