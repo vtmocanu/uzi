@@ -22,7 +22,9 @@
 #      released section also carries `### Security` (the collapse exception is scoped to
 #      [Unreleased] duplicates), and still refused when the branch adds a new `### Security`
 #      elsewhere in [Unreleased] (the base never repeated it);
-#   M. deleting EVERY copy of a heading the base repeats is refused (HEAD must keep one).
+#   M. deleting EVERY copy of a heading the base repeats is refused (HEAD must keep one);
+#   N. deleting the FIRST copy of a repeated heading (its bullet stranded under the section
+#      above) is refused: only exactly what --collapse makes is accepted.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -310,5 +312,20 @@ commit_push bm 'branch m'
 run bm 214 --no-push --gate none
 [ "$rc" -eq 9 ] || fail "M: deleting every copy of a repeated heading returned rc=$rc, want 9: $(cat "$WORK/out.214")"
 grep -qx -- '-### Fixed' "$WORK/out.214" || fail "M: the removed heading was not printed"
+
+# N. base [Unreleased]: Added / Fixed (first) / Changed / Fixed (second). The branch deletes
+#    the FIRST `### Fixed` and its blank line, stranding `- **first fix**` under Added. The
+#    counts (base 2, HEAD 1) look like a collapse; the content is not one: exit 9.
+git -C "$SEED" switch -q main
+printf '# Changelog\n\n## [Unreleased]\n\n### Added\n\n- **added**\n\n### Fixed\n\n- **first fix**\n\n### Changed\n\n- **changed**\n\n### Fixed\n\n- **second fix**\n\n## [0.1.0] - 2026-01-01\n\n- **old**\n' > "$SEED/CHANGELOG.md"
+git -C "$SEED" commit -qam 'codex layout'; git -C "$SEED" push -q origin main
+mk_branch bn
+awk 'skip && /^$/ {skip=0; next} $0=="### Fixed" && !done {skip=1; done=1; next} {skip=0; print}' "$SEED/CHANGELOG.md" > "$SEED/CHANGELOG.md.tmp"
+mv "$SEED/CHANGELOG.md.tmp" "$SEED/CHANGELOG.md"
+[ "$(grep -c '^### Fixed$' "$SEED/CHANGELOG.md")" -eq 1 ] || fail "N: fixture did not delete exactly one ### Fixed"
+commit_push bn 'branch n'
+run bn 217 --no-push --gate none
+[ "$rc" -eq 9 ] || fail "N: deleting the first copy of a repeated heading returned rc=$rc, want 9: $(cat "$WORK/out.217")"
+grep -qx -- '-### Fixed' "$WORK/out.217" || fail "N: the removed heading was not printed: $(cat "$WORK/out.217")"
 
 echo "PASS land-prep base move: disjoint tolerated without re-gate, overlap/conflict refused, CHANGELOG union auto-resolve, heading collapse and guard"

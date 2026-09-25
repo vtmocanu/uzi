@@ -69,9 +69,9 @@
 #      branch-head check has no such tolerance.
 #   9  the branch deletes CHANGELOG.md lines the base carries (usually a conflict resolved
 #      from a stale copy, e.g. a --fresh backup); restore them, or pass
-#      --allow-changelog-removals for a deliberate reword. A pure heading collapse (a
-#      `### ` heading repeated in the base's [Unreleased], left once, plus adjacent blank
-#      lines) is not a removal
+#      --allow-changelog-removals for a deliberate reword. Deleted `### ` headings and
+#      blank lines are not a removal only when they are exactly what
+#      `changelog-union.sh --collapse` makes of the branch's file
 set -uo pipefail
 
 REPO=""; PR=""; WT=""; SKIP_REBASE=0; GATE="auto"; PUSH=1; ROOT=""; REWORK_CHECK=1; FRESH=0; ALLOW_CL_RM=0
@@ -381,42 +381,70 @@ fi
 # ---- CHANGELOG guard ------------------------------------------------------------------------
 # A rebase conflict resolved from a stale copy (a --fresh backup, an older branch state)
 # silently deletes entries that landed on the base meanwhile. The branch adds its own entry;
-# it has no business removing the base's. One removal is accepted: a pure heading collapse,
-# a hunk whose removed lines are only blank lines plus `### X` headings where the base's
-# [Unreleased] carries `### X` at least twice and HEAD's exactly once (collapse_changelog's
-# output). Both counts are scoped to [Unreleased]: a released section's `### X` must not
-# vouch for deleting the only [Unreleased] one. Runs again after a pre-push base-move
-# rebase, which can union-resolve CHANGELOG.md.
-unreleased_headings() { # FILE-or-empty on stdin -> the `### ` lines inside [Unreleased]
-  awk '/^## \[Unreleased\]/{u=1; next} /^## /{u=0} u && /^### /{sub(/[ \t]+$/, ""); print}'
-}
+# it has no business removing the base's. One removal is accepted, EXACTLY: hunks that only
+# delete blank lines and `### ` headings pass when restoring those lines into HEAD's file and
+# running `changelog-union.sh --collapse` on the result reproduces HEAD's file byte for byte,
+# i.e. the deletions are precisely what collapse_changelog would make. A heading deleted
+# anywhere else (the first copy, the only copy, every copy) strands its bullets under the
+# wrong section and stops here. Runs again after a pre-push base-move rebase, which can
+# union-resolve CHANGELOG.md.
 changelog_guard() {
-  local cl_diff removed
+  local cl_diff removed gd heads
   [ "$ALLOW_CL_RM" -eq 0 ] || return 0
   if ! cl_diff=$(git diff --unified=0 "origin/$BASE..HEAD" -- CHANGELOG.md); then
     echo "cannot diff CHANGELOG.md against origin/$BASE" >&2; exit 3
   fi
-  removed=$(printf '%s\n' "$cl_diff" | awk '
-    function flush(   i, ok, head, h) {
+  gd=$(mktemp -d "${TMPDIR:-/tmp}/land-prep-${PR}-clguard.XXXXXX") || exit 3
+  printf '%s\n' "$cl_diff" > "$gd/diff"
+  git show HEAD:CHANGELOG.md > "$gd/head.raw" 2>/dev/null || : > "$gd/head.raw"
+  # Emits every removed line that is not part of a heading-only deletion hunk (stdout), and
+  # writes: pre = HEAD with the heading-only deletions restored; head = HEAD as awk prints
+  # it (same newline handling as pre); heads = the restored heading lines.
+  if ! removed=$(awk -v pre="$gd/pre" -v headout="$gd/head" -v heads="$gd/heads" '
+    function flush(   i, ok, hd) {
       if (nr == 0) return
-      ok = 1; head = 0
+      ok = (nadd == 0); hd = 0
       for (i = 1; i <= nr; i++) {
         if (R[i] ~ /^[ \t]*$/) continue
-        h = R[i]; sub(/[ \t]+$/, "", h)
-        if (h ~ /^### / && basen[h] >= 2 && headn[h] == 1) { head = 1; continue }
+        if (R[i] ~ /^### /) { hd = 1; continue }
         ok = 0
       }
-      if (!ok || !head) for (i = 1; i <= nr; i++) print "-" R[i]
+      if (ok && hd) { for (i = 1; i <= nr; i++) { ins[at] = ins[at] R[i] "\n"; if (R[i] ~ /^### /) print R[i] > heads } }
+      else for (i = 1; i <= nr; i++) print "-" R[i]
       nr = 0
     }
-    FILENAME == ARGV[1] { basen[$0]++; next }
-    FILENAME == ARGV[2] { headn[$0]++; next }
-    /^@@/ { flush(); inh = 1; next }
-    !inh { next }
-    /^-/ { R[++nr] = substr($0, 2) }
-    END { flush() }
-  ' <(git show "origin/$BASE:CHANGELOG.md" 2>/dev/null | unreleased_headings) \
-    <({ unreleased_headings < CHANGELOG.md; } 2>/dev/null) -) || { echo "cannot read the CHANGELOG.md diff" >&2; exit 3; }
+    FILENAME == ARGV[1] {
+      if (/^@@/) {
+        flush(); inh = 1; nadd = 0
+        x = $3; sub(/^\+/, "", x); split(x, a, ","); at = a[1] + 0
+        next
+      }
+      if (!inh) next
+      if (/^-/) R[++nr] = substr($0, 2)
+      else if (/^\+/) nadd++
+      next
+    }
+    { H[++nh] = $0 }
+    END {
+      flush()
+      printf "" > heads; printf "" > pre; printf "" > headout
+      if (0 in ins) printf "%s", ins[0] > pre
+      for (i = 1; i <= nh; i++) {
+        print H[i] > pre; print H[i] > headout
+        if (i in ins) printf "%s", ins[i] > pre
+      }
+    }
+  ' "$gd/diff" "$gd/head.raw"); then
+    rm -rf "$gd"; echo "cannot read the CHANGELOG.md diff" >&2; exit 3
+  fi
+  if [ -z "$removed" ] && [ -s "$gd/heads" ]; then
+    heads=$(cat "$gd/heads")
+    if ! bash "$HERE/changelog-union.sh" --collapse "$gd/pre" > /dev/null 2>&1 || ! cmp -s "$gd/pre" "$gd/head"; then
+      removed=$(printf '%s\n' "$heads" | sed 's/^/-/')
+      log "the deleted CHANGELOG.md heading(s) are not exactly a --collapse of the branch's file (bullets would change section)"
+    fi
+  fi
+  rm -rf "$gd"
   if [ -n "$removed" ]; then
     log "branch deletes CHANGELOG.md line(s) that origin/$BASE carries:"
     printf '%s\n' "$removed" | cut -c1-160
