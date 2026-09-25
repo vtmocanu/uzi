@@ -785,11 +785,14 @@ uzi run export <run-id> --output ./recovered.bundle
   run is refused. The download reaches the API directly — no contact with the worker,
   which may no longer exist.
 - **Explicit capture selection.** A run can retain more than one capture. When more
-  than one is *available*, export refuses to guess: it exits with a usage error listing
-  every capture's id and state, and you re-run with `--capture <id>`. It never silently
-  picks a different attempt. When exactly one is available it is used automatically. A
-  capture that is not in the `available` state (still preparing/uploading, `needs_action`,
-  `expired` or discarded) is refused with its honest state rather than downloaded.
+  than one is *available*, export refuses to guess: it prints a capture table (id, state,
+  source, size, created) to stderr — even under `--quiet` — exits 2, and you re-run with
+  `--capture <id>`. It never silently picks a different attempt. When exactly one is
+  available it is used automatically. When captures exist but none is `available` (still
+  preparing/uploading, `needs_action`, `expired` or discarded), the same table is printed
+  and it exits 5; with no captures at all it exits 4. With `--capture <id>` naming a
+  capture that isn't `available`, export refuses with its honest state rather than
+  downloading.
 - **Verified, atomic, no-clobber writes.** The download is streamed into a private
   `0600` temp file, its byte count and checksum are verified against the server manifest,
   and only then is the destination created — by an atomic link that **refuses to overwrite
@@ -801,8 +804,10 @@ uzi run export <run-id> --output ./recovered.bundle
 - **Review before you publish.** The archive is the run's *original* committed history
   and may contain secrets. Review it before publishing anywhere; a real credential must
   be revoked/rotated and removed from the affected history. No raw bytes are ever printed
-  to stdout — `--json` prints the metadata result only (`capture_id`, `output`,
-  `byte_size`, `checksum`, `source_sha`, `verified`).
+  to stdout — on success, `--json` prints the metadata result only (`capture_id`, `output`,
+  `byte_size`, `checksum`, `source_sha`, `verified`). On the capture-choice refusal above,
+  `--json` instead prints the listed captures (archive DTOs, each with a `hold_id`) as a
+  JSON array on stdout, still exiting 2 or 5.
 
 `uzi run get` also shows a metadata-only recovery summary for a terminal run that has
 captures (the archive count, per-state tally, and each available capture's id) so you
@@ -823,7 +828,10 @@ uzi run recovery <run-id> [--json]
 - Shows each hold's exact id, claim generation, and its attention state — active
   protection, a capture in flight, an archive ready (which releases automatically), or a
   capture-less source that needs a decision — plus any retained captures. `--json` prints
-  the raw rows for scripting. Owner-only.
+  the raw rows for scripting, each hold with a `captures` array (id, state, source_sha,
+  byte_size, created_at) whose ids `uzi run export --capture` takes; it's always `[]`
+  rather than null, including when the run itself was deleted (a released hold outlives
+  its run) or the server predates capture-hold linking. Owner-only.
 
 When a capture-less hold is genuinely not worth keeping, discard that one exact held
 source:
