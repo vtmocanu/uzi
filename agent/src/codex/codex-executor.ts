@@ -309,6 +309,28 @@ function progressAfterCheckpoint(progress: MilestoneProgress | undefined): Miles
 
 /** Issue #1674: append the shared milestone tracker guidance to a Codex implement-phase prompt.
  *  An empty note (no approved breakdown) leaves the prompt byte-identical. */
+/** Issue #1674: the Codex dispatch addendum to the shared tracker guidance. The shared note names
+ *  the SDK's Agent/Task dispatch; a Codex lead has neither and delegates through `spawn_agent`, so
+ *  this names the tool the model can actually call. Lane attribution depends on the model tagging
+ *  that dispatch. Appended only when the shared note is non-empty (a milestone-bearing run). */
+const CODEX_MILESTONE_DISPATCH_NOTE = [
+  "On this run you delegate through the `spawn_agent` tool (there is no Agent or Task tool): read",
+  "\"Agent/Task dispatch\" above as a `spawn_agent` call. Pass the role as its `subagent_type` and",
+  "BEGIN its `description` with the milestone id in square brackets, e.g. `[<id>] Wire the limiter`.",
+  "In `report_progress` `milestones_agents`, name that same role as the `agent` for the milestone.",
+].join("\n");
+
+/** Issue #1674: the shared milestone tracker guidance plus the Codex dispatch addendum; empty when
+ *  the run has no approved breakdown, so a milestone-less prompt stays byte-identical. */
+function codexMilestoneNote(
+  milestones: readonly Milestone[] | undefined,
+  progress: MilestoneProgress | undefined,
+  progressMissedLastTurn: boolean,
+): string {
+  const shared = milestoneStatusNote(milestones, progress, progressMissedLastTurn);
+  return shared ? `${shared}\n\n${CODEX_MILESTONE_DISPATCH_NOTE}` : "";
+}
+
 function withMilestoneNote(prompt: string, note: string): string {
   return note ? `${prompt}\n\n${note}` : prompt;
 }
@@ -1946,7 +1968,7 @@ export class CodexExecutor implements Executor {
       // turn's milestones_completed reaches the ExecutorResult after the loop breaks.
       let declaredMilestonesCompleted: string[] | undefined;
       const isIssueRun = resolveRunKind(ctx.kind) === "issue";
-      const milestoneNote = (): string => milestoneStatusNote(milestones, latestProgress, progressMissedLastTurn);
+      const milestoneNote = (): string => codexMilestoneNote(milestones, latestProgress, progressMissedLastTurn);
       const interlockedIssue = ctx.completionInterlock && resolveRunKind(ctx.kind) === "issue"
         && !ctx.interactive && !!ctx.recordCompletionAttempt;
       for (;;) {

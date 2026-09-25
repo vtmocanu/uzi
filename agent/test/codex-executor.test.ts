@@ -6081,6 +6081,10 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
     assert.ok(text!.includes("- [m2] Render the badge — not started"));
     assert.ok(text!.includes(TRACKER) && text!.includes("`report_progress`") && text!.includes("`[<id>]"));
     assert.ok(text!.indexOf(TRACKER) > text!.indexOf("</approved_plan>"), "the guidance is APPENDED after the framing");
+    // The Codex lead has no Agent/Task tool: the addendum names spawn_agent, its subagent_type and the
+    // [<id>] description prefix, after the shared note (which stays byte-identical to the SDK's).
+    assert.ok(text!.includes("`spawn_agent`") && text!.includes("`subagent_type`") && text!.includes("[<id>] Wire the limiter"));
+    assert.ok(text!.indexOf("`spawn_agent`") > text!.indexOf(TRACKER), "the Codex addendum follows the shared note");
     assert.ok(!text!.includes("Stale claim milestone"), "the approved list wins over the claim list");
     assert.ok(!text!.includes(REASK), "no re-ask on the first implement turn");
     assert.deepEqual(transitions(emitted), [], "the planning phase emits no transition frames");
