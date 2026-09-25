@@ -9,9 +9,11 @@
 // One DOM serves both layouts. From md up it is a table row; below md (D11) the same
 // <tr>/<td>s restyle into a stacked card (a two-column grid) so there is no horizontal
 // scroll and no duplicate controls: name, badges and the toggle; repo and "from catalog";
-// When and Next run; Last run; the action buttons; then the option chips.
+// When and Next run; Last run; the action buttons; then the option chips. The toggle is
+// rendered in exactly one place per layout (the name line on a card, the last column on a
+// table row), so its DOM and focus order always match where it is drawn.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { Repo, Schedule } from "../lib/api";
 import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
@@ -43,6 +45,17 @@ export const scheduleNameId = (id: string) => `schedule-name-${id}`;
 // normal table cell. `full` spans both card columns.
 const TD = "block px-4 py-1.5 md:table-cell md:py-3";
 const FULL = "col-span-2";
+
+// Tailwind's md breakpoint (48rem). Without matchMedia (tests, SSR) it reads as the table
+// layout.
+const MD_UP = "(min-width: 48rem)";
+function subscribeMdUp(onChange: () => void) {
+  if (typeof window === "undefined" || !window.matchMedia) return () => {};
+  const mql = window.matchMedia(MD_UP);
+  mql.addEventListener("change", onChange);
+  return () => mql.removeEventListener("change", onChange);
+}
+const readMdUp = () => (typeof window === "undefined" || !window.matchMedia ? true : window.matchMedia(MD_UP).matches);
 
 export function ScheduleListRow({
   s,
@@ -82,8 +95,9 @@ export function ScheduleListRow({
   onClone: () => void;
   onRemove: () => void;
   onAddRepo: (repoId: string) => void;
-  // Switch to the Job catalog tab and focus this default's entry (default rows only).
-  onShowInCatalog: () => void;
+  // Switch to the Job catalog tab and focus this default's entry. Absent when the row is
+  // not a default or its slug has no catalog entry (nothing to show or enable from).
+  onShowInCatalog?: () => void;
 }) {
   const demo = useDemoMode();
   const isDefault = s.origin === "default";
@@ -98,6 +112,16 @@ export function ScheduleListRow({
   const [expanded, setExpanded] = useState(false);
   const [addingRepo, setAddingRepo] = useState(false);
   const addPanelRef = useRef<HTMLTableCellElement>(null);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const mdUp = useSyncExternalStore(subscribeMdUp, readMdUp, () => true);
+
+  // Closing the add-repo panel (Cancel or a submit) puts focus back on the More actions
+  // button that opened it, rather than letting it fall to <body> with the panel. A
+  // successful add then moves it on to the new row (D12); a 409 or error leaves it here.
+  const closeAddPanel = () => {
+    setAddingRepo(false);
+    menuButtonRef.current?.focus();
+  };
 
   // Opening the add-repo panel from the menu moves focus to its repo picker.
   useEffect(() => {
@@ -109,7 +133,7 @@ export function ScheduleListRow({
     { key: "clone", label: "Clone to an editable copy", disabled: busy, onSelect: onClone },
   ];
   if (isDefault) {
-    menuItems.push({ key: "enable", label: "Enable on another repo", onSelect: onShowInCatalog });
+    if (onShowInCatalog) menuItems.push({ key: "enable", label: "Enable on another repo", onSelect: onShowInCatalog });
   } else {
     menuItems.push(
       s.target === "issue"
@@ -119,67 +143,77 @@ export function ScheduleListRow({
   }
   menuItems.push({ key: "remove", label: "Remove", danger: true, disabled: busy, onSelect: onRemove });
 
+  // The row's one toggle, placed by layout (see the header comment and D11).
+  const toggle = (
+    <Toggle checked={s.enabled} onChange={onToggle} disabled={busy} label={s.enabled ? `Pause ${on}` : `Resume ${on}`} />
+  );
+
   return (
     <>
       <tr
         className={cx(
-          "relative grid grid-cols-2 border-t border-edge py-2 align-middle md:table-row md:py-0",
+          "grid grid-cols-2 border-t border-edge py-2 align-middle md:table-row md:py-0",
           off && "opacity-60",
         )}
       >
-        {/* Target · repo */}
-        <td className={cx(TD, FULL, "pr-16 md:pr-4")}>
-          <div
-            id={scheduleNameId(s.id)}
-            tabIndex={-1}
-            className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded font-medium text-fg outline-hidden focus-visible:ring-2 focus-visible:ring-brand/60"
-          >
-            <span>{name}</span>
-            {isDefault && s.target !== "self_improve" && (
-              <span
-                className="inline-flex items-center text-muted"
-                title="Baked prompt — shipped and sealed"
-                aria-label="Baked prompt, read-only"
+        {/* Target · repo (and, on a phone card, the toggle at the end of the name line) */}
+        <td className={cx(TD, FULL)}>
+          <div className="flex items-start gap-3">
+            <div className="min-w-0 flex-1">
+              <div
+                id={scheduleNameId(s.id)}
+                tabIndex={-1}
+                className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded font-medium text-fg outline-hidden focus-visible:ring-2 focus-visible:ring-brand/60"
               >
-                <LockIcon />
-              </span>
-            )}
-            <KindPill s={s} />
-            {!isDefault && s.target === "prompt" && s.output_mode && (
-              <Badge tone="neutral">{s.output_mode}</Badge>
-            )}
-            {!isDefault && s.timing === "once" && (
-              <Badge tone="brand" dot>
-                once
-              </Badge>
-            )}
-            {parked && (
-              <Badge tone="danger" dot>
-                parked
-              </Badge>
-            )}
-            {s.customized && <Badge tone="warning">customized</Badge>}
-            {clonedFrom && (
-              <Badge tone="neutral" title={`Cloned from ${clonedFrom}`}>
-                cloned from {clonedFrom}
-              </Badge>
-            )}
-          </div>
-          <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-[12px]">
-            <span className="break-all font-mono text-faint">
-              {repoLabel}
-              {s.target === "prompt" && " · no issue"}
-            </span>
-            {isDefault && (
-              <button
-                type="button"
-                onClick={onShowInCatalog}
-                aria-label={`from catalog: ${name}`}
-                className="rounded text-brand underline-offset-2 hover:underline"
-              >
-                from catalog
-              </button>
-            )}
+                <span>{name}</span>
+                {isDefault && s.target !== "self_improve" && (
+                  <span
+                    className="inline-flex items-center text-muted"
+                    title="Baked prompt — shipped and sealed"
+                    aria-label="Baked prompt, read-only"
+                  >
+                    <LockIcon />
+                  </span>
+                )}
+                <KindPill s={s} />
+                {!isDefault && s.target === "prompt" && s.output_mode && (
+                  <Badge tone="neutral">{s.output_mode}</Badge>
+                )}
+                {!isDefault && s.timing === "once" && (
+                  <Badge tone="brand" dot>
+                    once
+                  </Badge>
+                )}
+                {parked && (
+                  <Badge tone="danger" dot>
+                    parked
+                  </Badge>
+                )}
+                {s.customized && <Badge tone="warning">customized</Badge>}
+                {clonedFrom && (
+                  <Badge tone="neutral" title={`Cloned from ${clonedFrom}`}>
+                    cloned from {clonedFrom}
+                  </Badge>
+                )}
+              </div>
+              <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-[12px]">
+                <span className="break-all font-mono text-faint">
+                  {repoLabel}
+                  {s.target === "prompt" && " · no issue"}
+                </span>
+                {isDefault && onShowInCatalog && (
+                  <button
+                    type="button"
+                    onClick={onShowInCatalog}
+                    aria-label={`from catalog: ${name}`}
+                    className="rounded text-brand underline-offset-2 hover:underline"
+                  >
+                    from catalog
+                  </button>
+                )}
+              </div>
+            </div>
+            {!mdUp && toggle}
           </div>
         </td>
 
@@ -270,16 +304,8 @@ export function ScheduleListRow({
                 <RotateCcwIcon /> Reset
               </button>
             )}
-            <MoreActionsMenu label={`More actions for ${on}`} items={menuItems} />
-            {/* On a phone card the toggle sits top-right on the name line (D11). */}
-            <span className="absolute right-4 top-3.5 md:static">
-              <Toggle
-                checked={s.enabled}
-                onChange={onToggle}
-                disabled={busy}
-                label={s.enabled ? `Pause ${on}` : `Resume ${on}`}
-              />
-            </span>
+            <MoreActionsMenu label={`More actions for ${on}`} items={menuItems} buttonRef={menuButtonRef} />
+            {mdUp && toggle}
           </div>
         </td>
       </tr>
@@ -300,10 +326,10 @@ export function ScheduleListRow({
                 busy={addBusy}
                 onAddRepo={(repoId) => {
                   onAddRepo(repoId);
-                  setAddingRepo(false);
+                  closeAddPanel();
                 }}
               />
-              <Button variant="ghost" size="sm" onClick={() => setAddingRepo(false)}>
+              <Button variant="ghost" size="sm" onClick={closeAddPanel}>
                 Cancel
               </Button>
             </div>

@@ -10,11 +10,15 @@
 // first item right after opening cannot activate it natively. A disabled item stays
 // focusable (APG), is marked aria-disabled, and carries its reason as a description.
 //
-// The menu is position:fixed, anchored to the button, so a table wrapper's overflow can
-// never clip it; it is re-anchored on scroll and resize, and flips above the button when
-// it would run off the bottom of the viewport.
+// The menu is portalled into document.body and position:fixed, anchored to the button: a
+// table wrapper's overflow cannot clip it, and an ancestor's stacking context (a paused
+// row's opacity) cannot paint later rows over it. It is re-anchored on scroll and resize,
+// and flips above the button when it would run off the bottom of the viewport. It renders
+// hidden until its first placement, and focus moves into it only once it is placed:
+// a browser refuses focus on a visibility:hidden element.
 
-import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type RefObject } from "react";
+import { createPortal } from "react-dom";
 import { cx } from "./ui";
 
 export interface MoreActionsItem {
@@ -31,15 +35,20 @@ export interface MoreActionsItem {
 export function MoreActionsMenu({
   label,
   items,
+  buttonRef: externalButtonRef,
 }: {
   // The button's accessible name, naming the job and repo (D13).
   label: string;
   items: MoreActionsItem[];
+  // Lets the owner return focus to the button after a flow the menu started (an inline
+  // panel's Cancel, a failed add).
+  buttonRef?: RefObject<HTMLButtonElement | null>;
 }) {
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
   const [pos, setPos] = useState<{ top: number; right: number } | null>(null);
-  const buttonRef = useRef<HTMLButtonElement>(null);
+  const internalButtonRef = useRef<HTMLButtonElement>(null);
+  const buttonRef = externalButtonRef ?? internalButtonRef;
   const menuRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<(HTMLDivElement | null)[]>([]);
   const baseId = useId();
@@ -65,7 +74,8 @@ export function MoreActionsMenu({
       const h = menuRef.current?.offsetHeight ?? 0;
       const below = r.bottom + 4;
       const top = below + h > window.innerHeight && r.top - h - 4 > 0 ? r.top - h - 4 : below;
-      setPos({ top, right: Math.max(4, window.innerWidth - r.right) });
+      // clientWidth excludes a vertical scrollbar, matching what `right` is measured from.
+      setPos({ top, right: Math.max(4, document.documentElement.clientWidth - r.right) });
     };
     place();
     window.addEventListener("scroll", place, true);
@@ -73,14 +83,19 @@ export function MoreActionsMenu({
     return () => {
       window.removeEventListener("scroll", place, true);
       window.removeEventListener("resize", place);
+      // The next open starts hidden again, so it is never shown at a stale anchor.
+      setPos(null);
     };
-  }, [open]);
+  }, [open, buttonRef]);
 
-  // Move DOM focus with the active index (roving focus inside the menu).
+  // Move DOM focus with the active index (roving focus inside the menu), but only once the
+  // menu is placed and visible; keyed on `placed` rather than `pos` so a scroll re-anchor
+  // does not pull focus back to the active item.
+  const placed = pos !== null;
   useEffect(() => {
-    if (!open) return;
+    if (!open || !placed) return;
     itemRefs.current[active]?.focus({ preventScroll: true });
-  }, [open, active]);
+  }, [open, active, placed]);
 
   // A pointerdown outside the button and the menu closes it (focus stays where the user put it).
   useEffect(() => {
@@ -92,7 +107,7 @@ export function MoreActionsMenu({
     };
     document.addEventListener("pointerdown", onPointerDown);
     return () => document.removeEventListener("pointerdown", onPointerDown);
-  }, [open]);
+  }, [open, buttonRef]);
 
   const activate = (item: MoreActionsItem) => {
     if (item.disabled) return;
@@ -135,7 +150,10 @@ export function MoreActionsMenu({
         close(true);
         break;
       case "Tab":
-        setOpen(false);
+        // The portalled menu sits at the end of <body>, so letting Tab run from inside it
+        // would leave the page. Put focus back on the button first and let the default
+        // action carry on from there: Tab lands after the button, Shift+Tab before it.
+        close(true);
         break;
       case "Enter":
       case " ":
@@ -162,49 +180,51 @@ export function MoreActionsMenu({
       >
         <DotsIcon />
       </button>
-      {open && (
-        <div
-          ref={menuRef}
-          id={menuId}
-          role="menu"
-          aria-labelledby={buttonId}
-          onKeyDown={onMenuKeyDown}
-          style={{ position: "fixed", top: pos?.top ?? 0, right: pos?.right ?? 0, visibility: pos ? "visible" : "hidden" }}
-          className="z-50 w-64 max-w-[calc(100vw-8px)] rounded-lg border border-edge-strong bg-surface p-1 text-left shadow-lg"
-        >
-          {items.map((item, i) => {
-            // Name from the label span alone, so the description stays a description.
-            const labelId = `${baseId}-label-${i}`;
-            const descId = item.description ? `${baseId}-desc-${i}` : undefined;
-            return (
-              <div
-                key={item.key}
-                ref={(el) => {
-                  itemRefs.current[i] = el;
-                }}
-                role="menuitem"
-                tabIndex={-1}
-                aria-disabled={item.disabled || undefined}
-                aria-labelledby={labelId}
-                aria-describedby={descId}
-                onClick={() => activate(item)}
-                onMouseEnter={() => setActive(i)}
-                className={cx(
-                  "cursor-pointer rounded-md px-2.5 py-1.5 text-[13px] outline-hidden focus:bg-raised",
-                  item.disabled ? "cursor-not-allowed text-faint" : item.danger ? "text-danger" : "text-fg",
-                )}
-              >
-                <span id={labelId}>{item.label}</span>
-                {item.description && (
-                  <div id={descId} className="mt-0.5 text-[11.5px] leading-snug text-faint">
-                    {item.description}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
+      {open &&
+        createPortal(
+          <div
+            ref={menuRef}
+            id={menuId}
+            role="menu"
+            aria-labelledby={buttonId}
+            onKeyDown={onMenuKeyDown}
+            style={{ position: "fixed", top: pos?.top ?? 0, right: pos?.right ?? 0, visibility: pos ? "visible" : "hidden" }}
+            className="z-50 w-64 max-w-[calc(100vw-8px)] rounded-lg border border-edge-strong bg-surface p-1 text-left shadow-lg"
+          >
+            {items.map((item, i) => {
+              // Name from the label span alone, so the description stays a description.
+              const labelId = `${baseId}-label-${i}`;
+              const descId = item.description ? `${baseId}-desc-${i}` : undefined;
+              return (
+                <div
+                  key={item.key}
+                  ref={(el) => {
+                    itemRefs.current[i] = el;
+                  }}
+                  role="menuitem"
+                  tabIndex={-1}
+                  aria-disabled={item.disabled || undefined}
+                  aria-labelledby={labelId}
+                  aria-describedby={descId}
+                  onClick={() => activate(item)}
+                  onMouseEnter={() => setActive(i)}
+                  className={cx(
+                    "cursor-pointer rounded-md px-2.5 py-1.5 text-[13px] outline-hidden focus:bg-raised",
+                    item.disabled ? "cursor-not-allowed text-faint" : item.danger ? "text-danger" : "text-fg",
+                  )}
+                >
+                  <span id={labelId}>{item.label}</span>
+                  {item.description && (
+                    <div id={descId} className="mt-0.5 text-[11.5px] leading-snug text-faint">
+                      {item.description}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>,
+          document.body,
+        )}
     </>
   );
 }

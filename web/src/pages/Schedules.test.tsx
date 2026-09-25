@@ -4,11 +4,12 @@
 // per-row enable toggle PATCHes { enabled } and adopts the server's returned row.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, useLocation } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { Schedules } from "./Schedules";
 import { api, type LastFire, type Schedule } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 import { formatStamp } from "../components/LastRun";
+import { relativeFromNow } from "../components/ScheduleModal";
 import { resolvePreset } from "../lib/schedulePausePresets";
 import { schedulesApi } from "../mocks/mockApi/schedules";
 
@@ -987,6 +988,171 @@ describe("Schedules — clone reveals the copy (PRD #1645 D12)", () => {
   });
 });
 
+// ── PRD #1645 M1 review follow-ups: history, focus handoffs, card order, orphan slugs ──
+function BackProbe() {
+  const navigate = useNavigate();
+  const loc = useLocation();
+  return (
+    <>
+      <output data-testid="path">{loc.pathname + loc.search}</output>
+      <button type="button" onClick={() => navigate(-1)}>
+        history back
+      </button>
+    </>
+  );
+}
+
+describe("Schedules — M1 review follow-ups", () => {
+  // D1: a tab change REPLACES the history entry, so Back leaves the page rather than
+  // stepping back through tab switches.
+  it("a tab change replaces the history entry: Back returns to the previous page", async () => {
+    render(
+      <MemoryRouter initialEntries={["/before", "/schedules"]} initialIndex={1}>
+        <Schedules />
+        <BackProbe />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText("Sweep eligible issues")).toBeTruthy());
+    fireEvent.click(tabNamed(/^Job catalog/));
+    expect(screen.getByTestId("path").textContent).toBe("/schedules?tab=catalog");
+    fireEvent.click(tabNamed(/^Schedules/));
+    expect(screen.getByTestId("path").textContent).toBe("/schedules?tab=schedules");
+    fireEvent.click(screen.getByRole("button", { name: "history back" }));
+    expect(screen.getByTestId("path").textContent).toBe("/before");
+  });
+
+  const moreButtons = () => screen.getAllByRole("button", { name: /^More actions for / });
+
+  it("Remove hands focus to the next row's name cell", async () => {
+    mockApi.listSchedules
+      .mockResolvedValueOnce([
+        sched({ id: "s1", target: "sweep", enabled: true }),
+        sched({ id: "s2", target: "prompt", prompt: "hunt flaky tests", enabled: false }),
+      ])
+      .mockResolvedValue([sched({ id: "s2", target: "prompt", prompt: "hunt flaky tests", enabled: false })]);
+    mockApi.deleteSchedule.mockResolvedValue(null);
+    renderPage();
+    await waitFor(() => expect(moreButtons()).toHaveLength(2));
+    fireEvent.click(moreButtons()[0]);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove" }));
+    await waitFor(() => expect(mockApi.deleteSchedule).toHaveBeenCalledWith("s1"));
+    await waitFor(() => expect(document.activeElement).toBe(document.getElementById("schedule-name-s2")));
+  });
+
+  it("Remove of the last row hands focus to the previous row, and of the only row to the Schedules tab", async () => {
+    mockApi.listSchedules
+      .mockResolvedValueOnce([
+        sched({ id: "s1", target: "sweep", enabled: true }),
+        sched({ id: "s2", target: "prompt", prompt: "hunt flaky tests", enabled: false }),
+      ])
+      .mockResolvedValueOnce([sched({ id: "s1", target: "sweep", enabled: true })])
+      .mockResolvedValue([]);
+    mockApi.deleteSchedule.mockResolvedValue(null);
+    renderPage();
+    await waitFor(() => expect(moreButtons()).toHaveLength(2));
+    fireEvent.click(moreButtons()[1]);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove" }));
+    await waitFor(() => expect(mockApi.deleteSchedule).toHaveBeenCalledWith("s2"));
+    await waitFor(() => expect(document.activeElement).toBe(document.getElementById("schedule-name-s1")));
+
+    fireEvent.click(moreButtons()[0]);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove" }));
+    await waitFor(() => expect(mockApi.deleteSchedule).toHaveBeenCalledWith("s1"));
+    await waitFor(() => expect(screen.getByText(/Nothing runs on a clock yet/)).toBeTruthy());
+    await waitFor(() => expect(document.activeElement).toBe(tabNamed(/^Schedules/)));
+  });
+
+  const siblings = () => [
+    sched({ id: "g1", target: "prompt", prompt: "grouped job", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi", sibling_group_id: "grp-1" }),
+    sched({ id: "g2", target: "prompt", prompt: "grouped job", repo_id: "repo-atlas", repo_path: "vtmocanu/atlas", sibling_group_id: "grp-1" }),
+  ];
+  const UZI_MORE = "More actions for Prompt: grouped job on vtmocanu/uzi";
+
+  it("Cancel on the add-repo panel returns focus to the row's More actions button", async () => {
+    mockApi.listRepos.mockResolvedValue(REPOS3);
+    mockApi.listSchedules.mockResolvedValue(siblings());
+    renderPage();
+    const more = await screen.findByRole("button", { name: UZI_MORE });
+    fireEvent.click(more);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Add to another repo" }));
+    const picker = await screen.findByRole("combobox", { name: /Add Prompt: grouped job on another repo/ });
+    await waitFor(() => expect(document.activeElement).toBe(picker));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("combobox", { name: /Add Prompt: grouped job on another repo/ })).toBeNull();
+    expect(document.activeElement).toBe(more);
+  });
+
+  it.each([
+    ["a 409", 409],
+    ["an error", 500],
+  ])("after %s from add-repo, focus is on the row's More actions button", async (_label, status) => {
+    mockApi.listRepos.mockResolvedValue(REPOS3);
+    mockApi.listSchedules.mockResolvedValue(siblings());
+    const { ApiError } = await vi.importActual<typeof import("../lib/api")>("../lib/api");
+    mockApi.addScheduleRepo.mockRejectedValue(new ApiError(status, "nope"));
+    renderPage();
+    const more = await screen.findByRole("button", { name: UZI_MORE });
+    fireEvent.click(more);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Add to another repo" }));
+    const picker = await screen.findByRole("combobox", { name: /Add Prompt: grouped job on another repo/ });
+    fireEvent.change(picker, { target: { value: "repo-new" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    await waitFor(() => expect(mockApi.addScheduleRepo).toHaveBeenCalledWith("g1", "repo-new"));
+    await waitFor(() => expect(screen.queryByText(status === 409 ? /already on that repo/i : /nope/i)).toBeTruthy());
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: UZI_MORE }));
+  });
+
+  // D11 / N3: the toggle is rendered once, where it is drawn, so DOM and focus order
+  // match the layout: on a phone card it leads (name line), on a table row it trails.
+  describe("toggle placement by layout", () => {
+    const setMatchMedia = (matches: boolean) => {
+      Object.defineProperty(window, "matchMedia", {
+        configurable: true,
+        writable: true,
+        value: vi.fn(() => ({ matches, addEventListener: vi.fn(), removeEventListener: vi.fn() })),
+      });
+    };
+    afterEach(() => {
+      delete (window as unknown as { matchMedia?: unknown }).matchMedia;
+    });
+
+    it("below md the one toggle sits in the name cell, before the row's action buttons", async () => {
+      setMatchMedia(false);
+      mockApi.listSchedules.mockResolvedValue([sched({ id: "s1", target: "sweep", enabled: true })]);
+      renderPage();
+      const sw = await screen.findByRole("switch");
+      expect(screen.getAllByRole("switch")).toHaveLength(1);
+      expect(sw.closest("td")!.contains(document.getElementById("schedule-name-s1"))).toBe(true);
+      const runNow = screen.getByRole("button", { name: /^Run now: / });
+      expect(sw.compareDocumentPosition(runNow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
+    it("from md up the one toggle trails the More actions button in the last column", async () => {
+      setMatchMedia(true);
+      mockApi.listSchedules.mockResolvedValue([sched({ id: "s1", target: "sweep", enabled: true })]);
+      renderPage();
+      const sw = await screen.findByRole("switch");
+      expect(screen.getAllByRole("switch")).toHaveLength(1);
+      expect(sw.closest("td")!.contains(document.getElementById("schedule-name-s1"))).toBe(false);
+      const more = screen.getByRole("button", { name: /^More actions for / });
+      expect(more.compareDocumentPosition(sw) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+  });
+
+  // N7: a default whose slug the catalog no longer carries has nothing to show or enable.
+  it("a default row with no catalog entry offers no 'from catalog' link and no 'Enable on another repo'", async () => {
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    mockApi.listSchedules.mockResolvedValue([customizedDefault({ catalog_slug: "retired-job" })]);
+    renderPage();
+    const more = await screen.findByRole("button", { name: /^More actions for / });
+    expect(screen.queryByRole("button", { name: /^from catalog/ })).toBeNull();
+    fireEvent.click(more);
+    expect(screen.getByRole("menuitem", { name: "Clone to an editable copy" })).toBeTruthy();
+    expect(screen.queryByRole("menuitem", { name: "Enable on another repo" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Add to another repo" })).toBeNull();
+  });
+});
+
 // ── PRD #1093 M4: the "Pause all schedules" switch (button / picker / banner) ───
 describe("Schedules — pause all (PRD #1093)", () => {
   function renderRoot() {
@@ -1242,10 +1408,11 @@ describe("Schedules — pause all (PRD #1093)", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: /^Pause all$/ })).toBeTruthy());
   });
 
-  it("every Next-run cell shows a warn 'paused until <stamp>' line while paused", async () => {
+  it("a row with a next fire shows a warn 'paused until <stamp>' line in place of its relative 'in …' line while paused", async () => {
     const future = new Date(Date.now() + 6 * 3_600_000).toISOString();
+    const nextFire = new Date(Date.now() + 3_600_000).toISOString();
     mockApi.getSchedulePause.mockResolvedValue({ paused: true, until: future });
-    mockApi.listSchedules.mockResolvedValue([sched({ id: "s1", target: "sweep", enabled: true })]);
+    mockApi.listSchedules.mockResolvedValue([sched({ id: "s1", target: "sweep", enabled: true, next_fire_at: nextFire })]);
     render(
       <MemoryRouter>
         <Schedules />
@@ -1254,7 +1421,12 @@ describe("Schedules — pause all (PRD #1093)", () => {
     await waitFor(() => expect(screen.getByText("Sweep eligible issues")).toBeTruthy());
     // The row's Next-run cell carries the paused note (the banner uses different copy:
     // "All schedules paused until …"), so match the cell's "paused until <stamp>" form.
-    expect(screen.getByText(`paused until ${formatStamp(future)}`)).toBeTruthy();
+    const note = screen.getByText(`paused until ${formatStamp(future)}`);
+    const cell = note.closest("td")!;
+    expect(within(cell).getByText(formatStamp(nextFire), { exact: false })).toBeTruthy();
+    // The relative line is replaced, not joined: no "in …" anywhere in the cell.
+    expect(within(cell).queryByText(relativeFromNow(nextFire))).toBeNull();
+    expect(cell.textContent).not.toMatch(/\bin \d/);
   });
 
   // D4: pause-all / resume-all never write a per-row `enabled`, so resuming restores the

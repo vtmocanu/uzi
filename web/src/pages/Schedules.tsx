@@ -269,12 +269,21 @@ export function Schedules() {
     }
   };
 
+  // Remove, then hand focus to where the row was instead of letting it fall to <body>
+  // with the row's menu button: the next row's name cell, else the previous row's, else
+  // (the list is now empty) the Schedules tab. A remove started from the Job catalog tab
+  // keeps its own focus handling.
   const removeSchedule = async (s: Schedule) => {
+    const fromList = tab === "schedules";
+    const at = rows.findIndex((r) => r.id === s.id);
+    const neighbour = at < 0 ? undefined : (rows[at + 1] ?? rows[at - 1]);
     setBusyId(s.id);
     setError("");
     try {
       await api.deleteSchedule(s.id);
       await reload();
+      if (fromList && neighbour) setPendingReveal({ id: neighbour.id, focus: true });
+      else if (fromList) tabRefs.current.schedules?.focus();
     } catch (err) {
       setError(errorMessage(err, "Could not remove the schedule"));
     } finally {
@@ -399,7 +408,15 @@ export function Schedules() {
   useEffect(() => {
     if (!pendingReveal || tab !== "schedules") return;
     const el = document.getElementById(scheduleNameId(pendingReveal.id));
-    if (!el) return;
+    if (!el) {
+      // The row is gone from a loaded list (removed meanwhile): drop the request so it
+      // cannot fire on some later render, and keep focus off <body>.
+      if (schedules && !schedules.some((r) => r.id === pendingReveal.id)) {
+        setPendingReveal(null);
+        if (pendingReveal.focus) tabRefs.current.schedules?.focus();
+      }
+      return;
+    }
     el.scrollIntoView?.({ block: "nearest" });
     if (pendingReveal.focus) el.focus();
     setPendingReveal(null);
@@ -408,7 +425,11 @@ export function Schedules() {
   useEffect(() => {
     if (!pendingCatalogFocus || tab !== "catalog") return;
     const el = document.getElementById(catalogEntryId(pendingCatalogFocus));
-    if (!el) return;
+    if (!el) {
+      // A slug the loaded catalog does not carry will never render: drop the request.
+      if (catalog && !catalog.entries.some((e) => e.slug === pendingCatalogFocus)) setPendingCatalogFocus(null);
+      return;
+    }
     el.scrollIntoView?.({ block: "nearest" });
     el.focus();
     setPendingCatalogFocus(null);
@@ -420,6 +441,12 @@ export function Schedules() {
     [catalog],
   );
   const nameOf = (s: Schedule) => scheduleDisplayName(s, entriesBySlug);
+  // Only a default whose slug the loaded catalog still carries has an entry to show; any
+  // other row gets no "from catalog" link and no "Enable on another repo" item.
+  const catalogLinkFor = (s: Schedule) => {
+    const slug = s.origin === "default" ? s.catalog_slug : null;
+    return slug && entriesBySlug.has(slug) ? () => showInCatalog(slug) : undefined;
+  };
   const all = schedules ?? [];
   const rows = sortSchedules(all, nameOf);
   const total = all.length;
@@ -635,7 +662,7 @@ export function Schedules() {
                         onClone={() => cloneSchedule(s)}
                         onRemove={() => removeSchedule(s)}
                         onAddRepo={(repoId) => addRepo(s, repoId)}
-                        onShowInCatalog={() => s.catalog_slug && showInCatalog(s.catalog_slug)}
+                        onShowInCatalog={catalogLinkFor(s)}
                       />
                     ))}
                   </tbody>

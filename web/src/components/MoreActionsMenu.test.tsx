@@ -15,14 +15,14 @@ function setup(over: Partial<MoreActionsItem>[] = []) {
     { key: "b", label: "Bravo", onSelect: onSelect[1] },
     { key: "c", label: "Charlie", onSelect: onSelect[2] },
   ].map((it, i) => ({ ...it, ...over[i] }));
-  render(
+  const { container } = render(
     <div>
       <MoreActionsMenu label="More actions for Job on repo" items={items} />
       <button type="button">outside</button>
     </div>,
   );
   const button = screen.getByRole("button", { name: "More actions for Job on repo" });
-  return { button, onSelect };
+  return { button, onSelect, container };
 }
 
 const item = (name: string) => screen.getByRole("menuitem", { name });
@@ -122,5 +122,72 @@ describe("MoreActionsMenu", () => {
     expect(screen.getByRole("menu")).toBeTruthy();
     fireEvent.pointerDown(screen.getByRole("button", { name: "outside" }));
     expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  // B1: a browser refuses focus on a visibility:hidden element, and jsdom does not, so pin
+  // the order directly: every focus() the menu makes on an item must happen while the
+  // menu is already visible (placed), on the first open and on a re-open alike.
+  it("moves focus into the menu only once it is visible, on the first open and a re-open", () => {
+    const seen: string[] = [];
+    const real = HTMLElement.prototype.focus;
+    const spy = vi.spyOn(HTMLElement.prototype, "focus").mockImplementation(function (this: HTMLElement, opts) {
+      if (this.getAttribute("role") === "menuitem") {
+        seen.push((this.closest('[role="menu"]') as HTMLElement).style.visibility);
+      }
+      real.call(this, opts);
+    });
+    try {
+      const { button } = setup();
+      fireEvent.keyDown(button, { key: "ArrowDown" });
+      expect(document.activeElement).toBe(item("Alpha"));
+      fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+      fireEvent.keyDown(button, { key: "ArrowUp" });
+      expect(document.activeElement).toBe(item("Charlie"));
+      expect(seen.length).toBeGreaterThanOrEqual(2);
+      expect(seen.every((v) => v === "visible")).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  // B2: the menu escapes its row (a paused row's opacity is a stacking context), so it
+  // renders in document.body, and a press inside it still counts as inside.
+  it("renders the menu in document.body, outside the owner's subtree, wired to its button", () => {
+    const { button, container } = setup();
+    fireEvent.click(button);
+    const menu = screen.getByRole("menu");
+    expect(container.contains(menu)).toBe(false);
+    expect(menu.parentElement).toBe(document.body);
+    expect(button.getAttribute("aria-controls")).toBe(menu.id);
+    expect(menu.getAttribute("aria-labelledby")).toBe(button.id);
+    fireEvent.pointerDown(item("Bravo"));
+    expect(screen.getByRole("menu")).toBe(menu);
+  });
+
+  it("Tab closes the menu and puts focus back on the button, so the tab sequence resumes from it", () => {
+    const { button } = setup();
+    fireEvent.keyDown(button, { key: "ArrowDown" });
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Tab" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(button);
+  });
+
+  it("anchors its right edge from the layout viewport's clientWidth (scrollbar excluded)", () => {
+    const html = document.documentElement;
+    const had = Object.getOwnPropertyDescriptor(html, "clientWidth");
+    Object.defineProperty(html, "clientWidth", { configurable: true, value: 1000 });
+    try {
+      const { button } = setup();
+      vi.spyOn(button, "getBoundingClientRect").mockReturnValue({
+        top: 100, bottom: 128, left: 900, right: 940, width: 40, height: 28, x: 900, y: 100, toJSON: () => ({}),
+      });
+      fireEvent.click(button);
+      const menu = screen.getByRole("menu");
+      expect(menu.style.right).toBe("60px");
+      expect(menu.style.top).toBe("132px");
+    } finally {
+      if (had) Object.defineProperty(html, "clientWidth", had);
+      else delete (html as unknown as { clientWidth?: number }).clientWidth;
+    }
   });
 });
