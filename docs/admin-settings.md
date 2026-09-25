@@ -25,8 +25,8 @@ full stop. There's no PRD link, no escape-hatch label, and no admin waiver
 to reason about — a prior model tangled those together, and it's gone.
 `Planned` and `bug` are unaffected **sweep selectors** (see
 [Scheduling](./scheduling.md)): they decide which open issues a sweep even
-considers, but a picked candidate only actually fires once it's also
-eligible — labelled `uzi` or assigned to the bot.
+considers, and a sweep only picks the ones that are also eligible —
+labelled `uzi` or assigned to the bot.
 
 Assignment grants **eligibility only** — it never starts a run by itself.
 An issue merely assigned to the bot sits exactly like a `uzi`-labelled one

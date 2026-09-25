@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"reflect"
 	"testing"
 
 	"github.com/google/uuid"
@@ -23,12 +24,18 @@ import (
 // exercises the assigned positive that could NOT exist under the pre-change label-only query
 // (which had no Selector/BotID params and no assignee predicate at all).
 //
+// Issue #1543 added an eligibility predicate (uzi label OR bot assignment) that both
+// queries apply before the LIMIT, and turned the count into an {Eligible, Matched} row.
+// The fixture's 46-49 rows exercise it under a non-uzi ["bug"] selector.
+//
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres;
 // e2e/run-store-it.sh provides one.
 
 const (
 	sweepAssignBotID   int64 = 6060 // the uzi-bot's forge user id
 	sweepAssignHumanID int64 = 7070 // a different (human) assignee id
+	// sweepAssignUziLabel is the eligibility label the helpers pass as @uzi_label.
+	sweepAssignUziLabel = "uzi"
 )
 
 // sweepAssignmentFixture seeds one repo whose issues cover the assigned/label sweep matrix.
@@ -76,6 +83,15 @@ func sweepAssignmentFixture(ctx context.Context, t *testing.T) (*store.Queries, 
 	seed(44, "opened", `["uzi"]`, `[]`)
 	// 45: bot-assigned but CLOSED                    → excluded from both (state gate).
 	seed(45, "closed", `[]`, fmt.Sprintf("[%d]", sweepAssignBotID))
+	// 46-49 carry a non-uzi "bug" selector label (issue #1543 eligibility-before-LIMIT):
+	// 46: bug + uzi, not assigned                   → eligible via the uzi label.
+	seed(46, "opened", `["bug","uzi"]`, `[]`)
+	// 47: bug, bot-assigned, no uzi label           → eligible via bot assignment.
+	seed(47, "opened", `["bug"]`, fmt.Sprintf("[%d]", sweepAssignBotID))
+	// 48: bug only, unassigned                      → selector match, NOT eligible.
+	seed(48, "opened", `["bug"]`, `[]`)
+	// 49: bug, human-assigned only                  → selector match, NOT eligible (numeric id).
+	seed(49, "opened", `["bug"]`, fmt.Sprintf("[%d]", sweepAssignHumanID))
 	return store.New(pool), repoID
 }
 
@@ -86,6 +102,7 @@ func sweepAssignedIIDs(t *testing.T, q *store.Queries, repoID uuid.UUID, selecto
 		Selector: selector,
 		Labels:   labels,
 		BotID:    botID,
+		UziLabel: sweepAssignUziLabel,
 	})
 	if err != nil {
 		t.Fatalf("ListSweepCandidateIssues: %v", err)
@@ -97,18 +114,19 @@ func sweepAssignedIIDs(t *testing.T, q *store.Queries, repoID uuid.UUID, selecto
 	return out
 }
 
-func sweepAssignedCount(t *testing.T, q *store.Queries, repoID uuid.UUID, selector string, labels []byte, botID int64) int64 {
+func sweepAssignedCount(t *testing.T, q *store.Queries, repoID uuid.UUID, selector string, labels []byte, botID int64) store.CountSweepCandidateIssuesRow {
 	t.Helper()
-	n, err := q.CountSweepCandidateIssues(context.Background(), store.CountSweepCandidateIssuesParams{
+	row, err := q.CountSweepCandidateIssues(context.Background(), store.CountSweepCandidateIssuesParams{
 		RepoID:   repoID,
 		Selector: selector,
 		Labels:   labels,
 		BotID:    botID,
+		UziLabel: sweepAssignUziLabel,
 	})
 	if err != nil {
 		t.Fatalf("CountSweepCandidateIssues: %v", err)
 	}
-	return n
+	return row
 }
 
 // TestListSweepCandidateIssuesAssignedSelectorLiveDB asserts the exact candidate set for the
@@ -119,18 +137,20 @@ func TestListSweepCandidateIssuesAssignedSelectorLiveDB(t *testing.T) {
 	ctx := context.Background()
 	q, repoID := sweepAssignmentFixture(ctx, t)
 
-	// Assigned selector, real bot id: the two OPEN bot-assigned issues, in iid order.
+	// Assigned selector, real bot id: the three OPEN bot-assigned issues, in iid order.
 	got := sweepAssignedIIDs(t, q, repoID, "assigned", []byte("[]"), sweepAssignBotID)
-	if len(got) != 2 || got[0] != 41 || got[1] != 42 {
-		t.Fatalf("assigned candidates = %v, want [41 42]:\n"+
-			"  41 bot-assigned, no uzi → the NEW assigned candidate\n"+
-			"  42 bot-assigned + uzi   → assigned candidate\n"+
-			"  43 human-assigned       → NOT (numeric bot id must match — jsonb trap guard)\n"+
-			"  44 uzi label only       → NOT (not assigned)\n"+
-			"  45 bot-assigned CLOSED  → NOT (state gate)", got)
+	if !reflect.DeepEqual(got, []int64{41, 42, 47}) {
+		t.Fatalf("assigned candidates = %v, want [41 42 47]:\n"+
+			"  41 bot-assigned, no uzi       → the NEW assigned candidate\n"+
+			"  42 bot-assigned + uzi         → assigned candidate\n"+
+			"  43 human-assigned             → NOT (numeric bot id must match — jsonb trap guard)\n"+
+			"  44 uzi label only             → NOT (not assigned)\n"+
+			"  45 bot-assigned CLOSED        → NOT (state gate)\n"+
+			"  47 bot-assigned, bug label    → assigned candidate (labels ignored)", got)
 	}
-	if n := sweepAssignedCount(t, q, repoID, "assigned", []byte("[]"), sweepAssignBotID); n != 2 {
-		t.Fatalf("assigned count = %d, want 2 (matches the list)", n)
+	// The assigned selector is eligible by construction: every match counts as eligible.
+	if c := sweepAssignedCount(t, q, repoID, "assigned", []byte("[]"), sweepAssignBotID); c.Eligible != 3 || c.Matched != 3 {
+		t.Fatalf("assigned count = %+v, want {Eligible:3 Matched:3} (matches the list; assigned is always eligible)", c)
 	}
 
 	// BotID = 0: the assigned branch's `@bot_id > 0` guard keeps it off — nothing matches,
@@ -138,26 +158,51 @@ func TestListSweepCandidateIssuesAssignedSelectorLiveDB(t *testing.T) {
 	if got := sweepAssignedIIDs(t, q, repoID, "assigned", []byte("[]"), 0); len(got) != 0 {
 		t.Fatalf("assigned candidates with BotID=0 = %v, want none (the @bot_id > 0 guard)", got)
 	}
-	if n := sweepAssignedCount(t, q, repoID, "assigned", []byte("[]"), 0); n != 0 {
-		t.Fatalf("assigned count with BotID=0 = %d, want 0", n)
+	if c := sweepAssignedCount(t, q, repoID, "assigned", []byte("[]"), 0); c.Eligible != 0 || c.Matched != 0 {
+		t.Fatalf("assigned count with BotID=0 = %+v, want {Eligible:0 Matched:0}", c)
 	}
 }
 
-// TestListSweepCandidateIssuesLabelSelectorUnchangedLiveDB pins that the label selector is
-// byte-for-byte the old behavior: label containment, and a bot-assigned-only issue (41) is
-// excluded because it carries no uzi label. BotID is passed but must be ignored on the label
-// branch.
-func TestListSweepCandidateIssuesLabelSelectorUnchangedLiveDB(t *testing.T) {
+// TestListSweepCandidateIssuesLabelSelectorMatchVsEligibilityLiveDB separates the label
+// selector's two filters (issue #1543). Selector MATCHING is label containment over @labels;
+// ELIGIBILITY (uzi label OR bot assignment) is a second predicate applied before the LIMIT.
+// A selector match that is not eligible is dropped from the list but still counted in
+// Matched; an issue that does not match the selector is in neither, however eligible it is.
+func TestListSweepCandidateIssuesLabelSelectorMatchVsEligibilityLiveDB(t *testing.T) {
 	ctx := context.Background()
 	q, repoID := sweepAssignmentFixture(ctx, t)
 
-	uzi := []byte(`["uzi"]`)
-	got := sweepAssignedIIDs(t, q, repoID, "label", uzi, sweepAssignBotID)
-	// The uzi-labelled OPEN issues (42, 44), in iid order; 41 (bot-assigned, no label) is out.
-	if len(got) != 2 || got[0] != 42 || got[1] != 44 {
-		t.Fatalf("label candidates = %v, want [42 44] (label containment; bot-assigned-only 41 excluded)", got)
+	// Non-uzi selector ["bug"]: 46-49 match; 46 (uzi) and 47 (bot-assigned) are eligible.
+	bug := []byte(`["bug"]`)
+	if got := sweepAssignedIIDs(t, q, repoID, "label", bug, sweepAssignBotID); !reflect.DeepEqual(got, []int64{46, 47}) {
+		t.Fatalf("bug-selector candidates = %v, want [46 47]:\n"+
+			"  46 bug + uzi              → eligible (uzi label)\n"+
+			"  47 bug + bot-assigned     → eligible (bot assignment)\n"+
+			"  48 bug only               → NOT (selector match, ineligible)\n"+
+			"  49 bug + human-assigned   → NOT (selector match, ineligible)\n"+
+			"  41 bot-assigned, no bug   → NOT (does not match the selector)", got)
 	}
-	if n := sweepAssignedCount(t, q, repoID, "label", uzi, sweepAssignBotID); n != 2 {
-		t.Fatalf("label count = %d, want 2 (matches the list)", n)
+	if c := sweepAssignedCount(t, q, repoID, "label", bug, sweepAssignBotID); c.Eligible != 2 || c.Matched != 4 {
+		t.Fatalf("bug-selector count = %+v, want {Eligible:2 Matched:4} (48, 49 ineligible; 41 not matched)", c)
+	}
+
+	// Same selector with BotID = 0: bot assignment no longer confers eligibility, so 47 drops
+	// out of the list but stays a selector match.
+	if got := sweepAssignedIIDs(t, q, repoID, "label", bug, 0); !reflect.DeepEqual(got, []int64{46}) {
+		t.Fatalf("bug-selector candidates with BotID=0 = %v, want [46] (the @bot_id > 0 guard)", got)
+	}
+	if c := sweepAssignedCount(t, q, repoID, "label", bug, 0); c.Eligible != 1 || c.Matched != 4 {
+		t.Fatalf("bug-selector count with BotID=0 = %+v, want {Eligible:1 Matched:4}", c)
+	}
+
+	// Default ["uzi"] selector: every match is eligible by its uzi label, so the result is the
+	// uzi-labelled OPEN issues; 41 (bot-assigned, unlabelled) is out because it does not match
+	// the selector, not because it is ineligible.
+	uzi := []byte(`["uzi"]`)
+	if got := sweepAssignedIIDs(t, q, repoID, "label", uzi, sweepAssignBotID); !reflect.DeepEqual(got, []int64{42, 44, 46}) {
+		t.Fatalf("uzi-selector candidates = %v, want [42 44 46] (41 does not match the selector)", got)
+	}
+	if c := sweepAssignedCount(t, q, repoID, "label", uzi, sweepAssignBotID); c.Eligible != 3 || c.Matched != 3 {
+		t.Fatalf("uzi-selector count = %+v, want {Eligible:3 Matched:3}", c)
 	}
 }

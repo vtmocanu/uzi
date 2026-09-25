@@ -440,12 +440,13 @@ func runNowResponse(out schedsvc.FireOutcome) apitypes.RunNowResponse {
 		})
 	}
 	return apitypes.RunNowResponse{
-		Created: len(started),
-		RunIDs:  runIDs,
-		Matched: out.Matched,
-		Capped:  out.Capped,
-		Started: started,
-		Skips:   skips,
+		Created:           len(started),
+		RunIDs:            runIDs,
+		Matched:           out.Matched,
+		Capped:            out.Capped,
+		IneligibleMatched: out.IneligibleMatched,
+		Started:           started,
+		Skips:             skips,
 	}
 }
 

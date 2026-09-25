@@ -150,15 +150,36 @@ func skipReasonLabel(reason string) string {
 // per-candidate breakdown. A reason with no actionable hint is absent (empty), and the
 // caller omits the trailing `# …` for it.
 var skipReasonHints = map[string]string{
-	"not_eligible": "add the configured uzi label or assign the issue to uzi, or raise --max-issues",
+	"not_eligible": "add the configured uzi label or assign the issue to uzi",
 }
 
 // skipReasonHint returns the remediation hint for a skip reason, or "" when none applies.
 func skipReasonHint(reason string) string { return skipReasonHints[reason] }
 
 // lastFireCappedHint is the one-line steer shown when a capped fire started nothing and
-// every examined candidate was skipped — the newest issues were never reached.
-const lastFireCappedHint = "newer issues not reached — raise --max-issues, or add the configured uzi label / assign the issue to uzi"
+// every examined candidate was skipped — newer eligible issues were never reached. It
+// names no reason: the per-candidate skip lines above already say why each was skipped.
+const lastFireCappedHint = "newer eligible issues not reached — the candidates ahead of them were skipped; see the reasons above"
+
+// ineligibleMatchedLine returns the diagnostic for a label sweep whose selector matched
+// open issues that are not eligible (issue #1543), or "" when the count is unknown (nil:
+// a historical fire or a non-label sweep) or zero.
+func ineligibleMatchedLine(n *int64) string {
+	if n == nil || *n <= 0 {
+		return ""
+	}
+	if *n == 1 {
+		return "  1 open issue matches the selector but is not eligible — add the configured uzi label or assign it to uzi"
+	}
+	return fmt.Sprintf("  %d open issues match the selector but are not eligible — add the configured uzi label or assign them to uzi", *n)
+}
+
+// printIneligibleMatched prints the ineligible-matched diagnostic line when it applies.
+func printIneligibleMatched(p *uzicli.Printer, n *int64) {
+	if line := ineligibleMatchedLine(n); line != "" {
+		p.Printf("%s\n", line)
+	}
+}
 
 // fireCandidateLabel renders a started/skipped candidate's identity: "#<iid>" for an
 // issue/sweep candidate, or "prompt" for a prompt schedule (which carries a nil iid).
@@ -171,8 +192,9 @@ func fireCandidateLabel(iid *int64) string {
 
 // renderLastFire appends the "Last fire" block to a schedule detail (PRD #308 M5),
 // summarising the schedule's most recent persisted fire: a one-line summary, the runs it
-// started, the candidates it skipped (with human reason labels), and — when a capped fire
-// reached nobody — the raise-the-cap hint. A nil last_fire means the schedule never fired.
+// started, the candidates it skipped (with human reason labels), when a capped fire
+// reached nobody the not-reached hint, and (label sweeps, issue #1543) how many selector
+// matches are not eligible. A nil last_fire means the schedule never fired.
 func renderLastFire(p *uzicli.Printer, lf *apitypes.LastFire) {
 	if lf == nil {
 		p.Printf("Last fire: never fired\n")
@@ -190,15 +212,25 @@ func renderLastFire(p *uzicli.Printer, lf *apitypes.LastFire) {
 	if lf.Capped && len(lf.Skips) > 0 && len(lf.Started) == 0 {
 		p.Printf("  %s\n", lastFireCappedHint)
 	}
+	printIneligibleMatched(p, lf.IneligibleMatched)
 }
 
 // renderRunNow prints the human outcome of a `schedule run-now` fire (PRD #308 M5) from
 // the widened RunNowResponse: a header with the started run ids, a per-started line, and —
 // when candidates were skipped — the examined/skipped tally with a human reason label and
 // an optional remediation hint per skip. A fire that started nothing AND skipped nothing is
-// a benign dedup (a prior run still live), reported as such rather than as "started 0".
+// a benign dedup (a prior run still live), reported as such rather than as "started 0" —
+// unless the label sweep reports ineligible selector matches, in which case it says there
+// were no eligible candidates (issue #1543). The ineligible line ends every other path.
 func renderRunNow(p *uzicli.Printer, id string, res apitypes.RunNowResponse) {
 	if res.Created == 0 && len(res.Skips) == 0 {
+		if ineligibleMatchedLine(res.IneligibleMatched) != "" {
+			// Nothing was a candidate because every selector match is ineligible (issue
+			// #1543): say so instead of blaming a benign dedup.
+			p.Printf("no run started from %s: no eligible candidates\n", id)
+			printIneligibleMatched(p, res.IneligibleMatched)
+			return
+		}
 		p.Printf("no run started from %s (a matching run may already be active)\n", id)
 		return
 	}
@@ -227,4 +259,5 @@ func renderRunNow(p *uzicli.Printer, id string, res apitypes.RunNowResponse) {
 			p.Printf("%s\n", line)
 		}
 	}
+	printIneligibleMatched(p, res.IneligibleMatched)
 }

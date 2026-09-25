@@ -220,41 +220,66 @@ func (q *Queries) CoalesceScheduleSiblingGroup(ctx context.Context, arg Coalesce
 }
 
 const countSweepCandidateIssues = `-- name: CountSweepCandidateIssues :one
-SELECT count(*)
+SELECT
+  count(*) FILTER (WHERE
+    $1::text = 'assigned'
+    OR jsonb_exists(labels, $2::text)
+    OR ($3::bigint > 0 AND assignee_ids @> to_jsonb($3::bigint))
+  ) AS eligible,
+  count(*) AS matched
 FROM issues
-WHERE repo_id = $1 AND state = 'opened'
+WHERE repo_id = $4 AND state = 'opened'
   AND (
-    ($2::text = 'label' AND labels @> $3::jsonb)
-    OR ($2::text = 'assigned' AND $4::bigint > 0 AND assignee_ids @> to_jsonb($4::bigint))
+    ($1::text = 'label' AND labels @> $5::jsonb)
+    OR ($1::text = 'assigned' AND $3::bigint > 0 AND assignee_ids @> to_jsonb($3::bigint))
   )
 `
 
 type CountSweepCandidateIssuesParams struct {
-	RepoID   uuid.UUID `json:"repo_id"`
 	Selector string    `json:"selector"`
-	Labels   []byte    `json:"labels"`
+	UziLabel string    `json:"uzi_label"`
 	BotID    int64     `json:"bot_id"`
+	RepoID   uuid.UUID `json:"repo_id"`
+	Labels   []byte    `json:"labels"`
 }
 
-// The truncation probe for the sweep fire outcome's Capped flag (PRD #308 M1): the total
-// number of open issues in the repo matching the same selector as ListSweepCandidateIssues,
-// WITHOUT the max_issues LIMIT. fireSweep compares this against the (capped) candidate set
-// it fetched to know the cap truncated newer eligible issues. It is called only when the
-// schedule carries a set cap (a NULL cap can never truncate → Capped stays false), so the
-// extra count never runs on the unbounded path. @selector/@bot_id discriminate the label
-// vs. assigned kinds exactly as in ListSweepCandidateIssues — the assigned branch uses the
-// numeric-containment form `assignee_ids @> to_jsonb(@bot_id::bigint)` (NOT jsonb_exists,
-// which is string-only), guarded by `@bot_id > 0` (PRD #767 M4/R3).
-func (q *Queries) CountSweepCandidateIssues(ctx context.Context, arg CountSweepCandidateIssuesParams) (int64, error) {
+type CountSweepCandidateIssuesRow struct {
+	Eligible int64 `json:"eligible"`
+	Matched  int64 `json:"matched"`
+}
+
+// The truncation probe for the sweep fire outcome's Capped flag (PRD #308 M1), over the
+// same selector as ListSweepCandidateIssues WITHOUT the max_issues LIMIT. It runs for
+// every LABEL sweep (the ineligible_matched diagnostic covers the whole backlog, cap or
+// not) and for an assigned sweep only when a cap is set; Capped is derived only when a cap
+// is set (a NULL cap can never truncate). @selector/@bot_id
+// discriminate the label vs. assigned kinds exactly as in ListSweepCandidateIssues — the
+// assigned branch uses the numeric-containment form `assignee_ids @> to_jsonb(@bot_id::bigint)`
+// (NOT jsonb_exists, which is string-only), guarded by `@bot_id > 0` (PRD #767 M4/R3).
+//
+// One statement, two columns (issue #1543):
+//   - eligible: the selector matches that ALSO pass the eligibility predicate
+//     ListSweepCandidateIssues filters on before its LIMIT (@uzi_label OR bot
+//     assignment; the assigned selector is eligible by construction). This is the
+//     list's unlimited size, so fireSweep compares it against the (capped) candidate
+//     set to know the cap truncated newer eligible issues.
+//   - matched: every open selector match, eligible or not. `matched - eligible` is the
+//     aggregate ineligible_matched diagnostic: selector matches that are not uzi's work
+//     and are no longer fetched, across the whole backlog rather than one scan window.
+//
+// The eligibility predicate must stay byte-identical to ListSweepCandidateIssues' so
+// the two agree on what "eligible" means.
+func (q *Queries) CountSweepCandidateIssues(ctx context.Context, arg CountSweepCandidateIssuesParams) (CountSweepCandidateIssuesRow, error) {
 	row := q.db.QueryRow(ctx, countSweepCandidateIssues,
-		arg.RepoID,
 		arg.Selector,
-		arg.Labels,
+		arg.UziLabel,
 		arg.BotID,
+		arg.RepoID,
+		arg.Labels,
 	)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
+	var i CountSweepCandidateIssuesRow
+	err := row.Scan(&i.Eligible, &i.Matched)
+	return i, err
 }
 
 const createDefaultSchedule = `-- name: CreateDefaultSchedule :one
@@ -983,8 +1008,13 @@ WHERE repo_id = $1 AND state = 'opened'
     ($2::text = 'label' AND labels @> $3::jsonb)
     OR ($2::text = 'assigned' AND $4::bigint > 0 AND assignee_ids @> to_jsonb($4::bigint))
   )
+  AND (
+    $2::text = 'assigned'
+    OR jsonb_exists(labels, $5::text)
+    OR ($4::bigint > 0 AND assignee_ids @> to_jsonb($4::bigint))
+  )
 ORDER BY forge_issue_iid ASC
-LIMIT $5
+LIMIT $6
 `
 
 type ListSweepCandidateIssuesParams struct {
@@ -992,6 +1022,7 @@ type ListSweepCandidateIssuesParams struct {
 	Selector  string      `json:"selector"`
 	Labels    []byte      `json:"labels"`
 	BotID     int64       `json:"bot_id"`
+	UziLabel  string      `json:"uzi_label"`
 	MaxIssues pgtype.Int4 `json:"max_issues"`
 }
 
@@ -1022,12 +1053,28 @@ type ListSweepCandidateIssuesRow struct {
 // unbounded behaviour for free, and the ORDER BY forge_issue_iid ASC above makes LIMIT N
 // a deterministic oldest-first batch. The narg FUNCTION form (not @max_issues) is
 // deliberate — see .claude/rules/go.md on the runtime-comment byte-offset gotcha.
+//
+// Eligibility is filtered BEFORE the LIMIT (issue #1543): a label selector such as
+// ["bug"] also matches issues that are not uzi's work, and when eligibility was only
+// checked per-row afterwards a long ineligible oldest-first prefix consumed every
+// scan-window slot and starved the eligible issues behind it. The predicate mirrors
+// ListAutopilotCandidateIssues (autopilot.sql): the configured @uzi_label (string
+// membership via jsonb_exists, labels are strings) OR assignment to the uzi-bot (the
+// same numeric-containment + `@bot_id > 0` form as the assigned selector). The assigned
+// selector is eligible by construction, so it short-circuits. This supersedes the
+// issue #416 decision (prds/done/416-sweep-backfill-skipped-slots.md) to keep
+// eligibility out of SQL, which was forced by the then-needed PRD-link body check; PRD
+// #764 replaced that check with a cached-label check and PRD #767 added cached bot
+// assignment, so eligibility is now answerable from the issues cache. createRun stays
+// the authoritative per-row gate, catching a cache change between this SELECT and the
+// run create.
 func (q *Queries) ListSweepCandidateIssues(ctx context.Context, arg ListSweepCandidateIssuesParams) ([]ListSweepCandidateIssuesRow, error) {
 	rows, err := q.db.Query(ctx, listSweepCandidateIssues,
 		arg.RepoID,
 		arg.Selector,
 		arg.Labels,
 		arg.BotID,
+		arg.UziLabel,
 		arg.MaxIssues,
 	)
 	if err != nil {

@@ -38,6 +38,7 @@
     "fired_at": "2020-01-02T03:04:05Z",
     "matched": 1,
     "capped": true,
+    "ineligible_matched": 1,
     "started": [
       {
         "issue_iid": 1,

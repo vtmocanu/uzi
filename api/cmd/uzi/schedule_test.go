@@ -1729,7 +1729,7 @@ func TestScheduleGetLastFireBlock(t *testing.T) {
 	}
 	// Capped fire with skips but no starts would show the hint; here it started one, so the
 	// hint must be ABSENT (the capped-and-reached-nobody guard).
-	if strings.Contains(out, "newer issues not reached") {
+	if strings.Contains(out, lastFireCappedHint) {
 		t.Errorf("capped hint shown despite a started run\n%s", out)
 	}
 	// The raw wire strings must never reach the user in the human block.
@@ -1739,7 +1739,7 @@ func TestScheduleGetLastFireBlock(t *testing.T) {
 }
 
 // TestScheduleGetLastFireCappedHint: a capped fire that started nothing and skipped every
-// examined candidate shows the raise-the-cap hint.
+// examined candidate shows the generic not-reached hint.
 func TestScheduleGetLastFireCappedHint(t *testing.T) {
 	lf := &apitypes.LastFire{
 		FiredAt: time.Date(2026, 8, 13, 9, 0, 0, 0, time.UTC),
@@ -1758,8 +1758,12 @@ func TestScheduleGetLastFireCappedHint(t *testing.T) {
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
-	if !strings.Contains(out, "newer issues not reached — raise --max-issues, or add the configured uzi label / assign the issue to uzi") {
-		t.Errorf("capped fire missing the raise-the-cap hint\n%s", out)
+	if !strings.Contains(out, "newer eligible issues not reached — the candidates ahead of them were skipped; see the reasons above") {
+		t.Errorf("capped fire missing the not-reached hint\n%s", out)
+	}
+	// Legacy last_fire (no ineligible_matched) → no ineligible diagnostic line.
+	if strings.Contains(out, "not eligible —") {
+		t.Errorf("legacy last_fire rendered an ineligible line\n%s", out)
 	}
 }
 
@@ -1846,7 +1850,7 @@ func TestScheduleRunNowBreakdown(t *testing.T) {
 		"Started 1 run(s) from sch_rn: run_c81a",
 		"#158 → run run_c81a  Fix the thing",
 		"Examined 3 candidate(s), skipped 2:",
-		"#96  not eligible   # add the configured uzi label or assign the issue to uzi, or raise --max-issues", // LABEL + hint
+		"#96  not eligible   # add the configured uzi label or assign the issue to uzi", // LABEL + hint
 		"#97  already running",
 	} {
 		if !strings.Contains(out, want) {
@@ -1877,7 +1881,7 @@ func TestScheduleRunNowStartedNothing(t *testing.T) {
 	for _, want := range []string{
 		"Started 0 runs from sch_rn.",
 		"Examined 1 candidate(s), skipped 1:",
-		"#96  not eligible   # add the configured uzi label or assign the issue to uzi, or raise --max-issues",
+		"#96  not eligible   # add the configured uzi label or assign the issue to uzi",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("started-nothing run-now missing %q\n%s", want, out)
@@ -1923,6 +1927,151 @@ func TestScheduleRunNowNoneStarted(t *testing.T) {
 	}
 	if !strings.Contains(out, "no run started from sch_rn") {
 		t.Errorf("empty fire should report 'no run started'\n%s", out)
+	}
+}
+
+// TestScheduleHintsNeverAdviseMaxIssues (issue #1543): eligibility is filtered before the
+// scan window, so raising --max-issues never fixes an ineligible skip; no hint may advise
+// it, and the capped hint names no specific skip reason (the per-row lines already do).
+func TestScheduleHintsNeverAdviseMaxIssues(t *testing.T) {
+	hints := []string{lastFireCappedHint, ineligibleMatchedLine(ptrInt64(1)), ineligibleMatchedLine(ptrInt64(5))}
+	for _, h := range skipReasonHints {
+		hints = append(hints, h)
+	}
+	for _, h := range hints {
+		if strings.Contains(h, "--max-issues") {
+			t.Errorf("hint advises --max-issues: %q", h)
+		}
+	}
+	for _, reason := range []string{"already_running", "already running", "fetch_failed", "fetch failed", "description_too_large", "description too large", "not_eligible", "not eligible"} {
+		if strings.Contains(lastFireCappedHint, reason) {
+			t.Errorf("capped hint names skip reason %q: %q", reason, lastFireCappedHint)
+		}
+	}
+}
+
+// TestIneligibleMatchedLine: nil (unknown) and 0 render nothing; 1 and N pluralize.
+func TestIneligibleMatchedLine(t *testing.T) {
+	cases := []struct {
+		n    *int64
+		want string
+	}{
+		{nil, ""},
+		{ptrInt64(0), ""},
+		{ptrInt64(1), "  1 open issue matches the selector but is not eligible — add the configured uzi label or assign it to uzi"},
+		{ptrInt64(16), "  16 open issues match the selector but are not eligible — add the configured uzi label or assign them to uzi"},
+	}
+	for _, c := range cases {
+		if got := ineligibleMatchedLine(c.n); got != c.want {
+			t.Errorf("ineligibleMatchedLine(%v) = %q, want %q", c.n, got, c.want)
+		}
+	}
+}
+
+// TestScheduleGetLastFireIneligibleMatched (issue #1543): a label sweep's last fire that
+// examined nothing but reports ineligible selector matches prints the diagnostic line.
+func TestScheduleGetLastFireIneligibleMatched(t *testing.T) {
+	lf := &apitypes.LastFire{
+		FiredAt:           time.Date(2026, 8, 13, 9, 0, 0, 0, time.UTC),
+		Matched:           0,
+		IneligibleMatched: ptrInt64(16),
+		Started:           []apitypes.LastFireStarted{},
+		Skips:             []apitypes.LastFireSkip{},
+	}
+	fc := &uzicli.FakeClient{ScheduleByID: map[string]apitypes.ScheduleDTO{
+		"sch_im": {ID: "sch_im", Target: "sweep", Labels: []string{"bug"}, Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", Enabled: true, LastFire: lf},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "get", "sch_im")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	for _, want := range []string{
+		"examined 0 · started 0 · skipped 0",
+		"16 open issues match the selector but are not eligible — add the configured uzi label or assign them to uzi",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("last-fire block missing %q\n%s", want, out)
+		}
+	}
+}
+
+// TestScheduleGetLastFireIneligibleZero: ineligible_matched 0 is known-zero; no line.
+func TestScheduleGetLastFireIneligibleZero(t *testing.T) {
+	lf := &apitypes.LastFire{
+		FiredAt:           time.Date(2026, 8, 13, 9, 0, 0, 0, time.UTC),
+		IneligibleMatched: ptrInt64(0),
+		Started:           []apitypes.LastFireStarted{},
+		Skips:             []apitypes.LastFireSkip{},
+	}
+	fc := &uzicli.FakeClient{ScheduleByID: map[string]apitypes.ScheduleDTO{
+		"sch_iz": {ID: "sch_iz", Target: "sweep", Labels: []string{"bug"}, Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", Enabled: true, LastFire: lf},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "get", "sch_iz")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if strings.Contains(out, "not eligible —") {
+		t.Errorf("zero ineligible_matched must print no diagnostic\n%s", out)
+	}
+}
+
+// TestScheduleRunNowNoEligibleCandidates (issue #1543): a label sweep with zero candidates
+// but ineligible selector matches reports "no eligible candidates" plus the diagnostic,
+// NOT the benign-dedup "(a matching run may already be active)".
+func TestScheduleRunNowNoEligibleCandidates(t *testing.T) {
+	fc := &uzicli.FakeClient{RunNowResult: apitypes.RunNowResponse{
+		Created: 0, RunIDs: []string{}, IneligibleMatched: ptrInt64(1),
+		Started: []apitypes.LastFireStarted{}, Skips: []apitypes.LastFireSkip{},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "run-now", "sch_rn")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	for _, want := range []string{
+		"no run started from sch_rn: no eligible candidates",
+		"1 open issue matches the selector but is not eligible — add the configured uzi label or assign it to uzi",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("run-now missing %q\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "a matching run may already be active") {
+		t.Errorf("ineligible-only fire must not blame a benign dedup\n%s", out)
+	}
+}
+
+// TestScheduleRunNowNoneStartedKnownZeroIneligible: ineligible_matched 0 keeps the old
+// benign-dedup text (nil is covered by TestScheduleRunNowNoneStarted).
+func TestScheduleRunNowNoneStartedKnownZeroIneligible(t *testing.T) {
+	fc := &uzicli.FakeClient{RunNowResult: apitypes.RunNowResponse{
+		Created: 0, RunIDs: []string{}, IneligibleMatched: ptrInt64(0),
+		Started: []apitypes.LastFireStarted{}, Skips: []apitypes.LastFireSkip{},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "run-now", "sch_rn")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "no run started from sch_rn (a matching run may already be active)") {
+		t.Errorf("zero ineligible should keep the benign-dedup text\n%s", out)
+	}
+	if strings.Contains(out, "no eligible candidates") || strings.Contains(out, "not eligible —") {
+		t.Errorf("zero ineligible must print no diagnostic\n%s", out)
+	}
+}
+
+// TestScheduleRunNowStartedWithIneligible: the normal path appends the diagnostic at the end.
+func TestScheduleRunNowStartedWithIneligible(t *testing.T) {
+	fc := &uzicli.FakeClient{RunNowResult: apitypes.RunNowResponse{
+		Created: 1, RunIDs: []string{"run_c81a"}, Matched: 1, IneligibleMatched: ptrInt64(3),
+		Started: []apitypes.LastFireStarted{{IssueIID: ptrInt64(158), RunID: "run_c81a", Title: "Fix the thing"}},
+		Skips:   []apitypes.LastFireSkip{},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "run-now", "sch_rn")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.HasSuffix(strings.TrimRight(out, "\n"), "3 open issues match the selector but are not eligible — add the configured uzi label or assign them to uzi") {
+		t.Errorf("run-now should end with the ineligible diagnostic\n%s", out)
 	}
 }
 

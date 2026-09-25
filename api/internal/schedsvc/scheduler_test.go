@@ -17,6 +17,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/schedtmpl"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -56,6 +57,14 @@ type fakeStore struct {
 	sweepCountErr   error
 	sweepCountCalls int
 	countLabelParam []byte
+	// sweepMatched is the whole-selector-backlog Matched the count probe returns (issue
+	// #1543), independent of sweepCount (= Eligible). nil defaults Matched to sweepCount so
+	// pre-#1543 tests read "every selector match is eligible".
+	sweepMatched *int64
+	// sweepUziLabelParam / countUziLabelParam record the eligibility label each query was
+	// threaded with (issue #1543).
+	sweepUziLabelParam string
+	countUziLabelParam string
 
 	// self_improve fire path (PRD #590 M1).
 	activeSelfImprove      int64
@@ -171,15 +180,21 @@ func (f *fakeStore) ListSweepCandidateIssues(_ context.Context, arg store.ListSw
 	f.sweepMaxIssuesParam = arg.MaxIssues
 	f.sweepSelectorParam = arg.Selector
 	f.sweepBotIDParam = arg.BotID
+	f.sweepUziLabelParam = arg.UziLabel
 	return f.sweepRows, nil
 }
-func (f *fakeStore) CountSweepCandidateIssues(_ context.Context, arg store.CountSweepCandidateIssuesParams) (int64, error) {
+func (f *fakeStore) CountSweepCandidateIssues(_ context.Context, arg store.CountSweepCandidateIssuesParams) (store.CountSweepCandidateIssuesRow, error) {
 	f.sweepCountCalls++
 	f.countLabelParam = arg.Labels
+	f.countUziLabelParam = arg.UziLabel
 	if f.sweepCountErr != nil {
-		return 0, f.sweepCountErr
+		return store.CountSweepCandidateIssuesRow{}, f.sweepCountErr
 	}
-	return f.sweepCount, nil
+	matched := f.sweepCount
+	if f.sweepMatched != nil {
+		matched = *f.sweepMatched
+	}
+	return store.CountSweepCandidateIssuesRow{Eligible: f.sweepCount, Matched: matched}, nil
 }
 func (f *fakeStore) HasActiveRunForIssue(_ context.Context, arg store.HasActiveRunForIssueParams) (bool, error) {
 	if f.activeByIssue != nil {
@@ -1616,16 +1631,103 @@ func TestFireSweepCapped(t *testing.T) {
 		}
 	})
 
-	t.Run("null_cap_never_counts_or_caps", func(t *testing.T) {
+	// A NULL-cap LABEL sweep still runs the count probe once (issue #1543: it reports
+	// IneligibleMatched over the whole selector backlog), but a NULL cap can never truncate,
+	// so Capped stays false however many eligible issues the count reports.
+	t.Run("null_cap_label_sweep_counts_but_never_caps", func(t *testing.T) {
 		h := newHarness()
 		h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 96}}
-		h.st.sweepCount = 9 // would be "capped" IF the probe ran
+		h.st.sweepCount = 9 // would be "capped" IF a NULL cap could truncate
+		h.st.sweepMatched = ptrI64(12)
 		out, _ := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{}))
 		if out.Capped {
 			t.Fatalf("NULL cap can never truncate; Capped must be false")
 		}
+		if h.st.sweepCountCalls != 1 {
+			t.Fatalf("NULL-cap label sweep must count once (for IneligibleMatched), got %d calls", h.st.sweepCountCalls)
+		}
+		if out.IneligibleMatched == nil || *out.IneligibleMatched != 3 {
+			t.Fatalf("IneligibleMatched = %v, want 3 (Matched 12 - Eligible 9)", out.IneligibleMatched)
+		}
+	})
+
+	// A NULL-cap ASSIGNED sweep has nothing to count: no cap to truncate and no
+	// ineligible-selector diagnostic (assignment IS eligibility).
+	t.Run("null_cap_assigned_sweep_never_counts", func(t *testing.T) {
+		h := newHarness()
+		h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 96}}
+		h.st.sweepCount = 9
+		out, err := h.sched.fireSweep(context.Background(), h.assignedSweepSchedule(pgtype.Int4{}))
+		if err != nil {
+			t.Fatalf("fireSweep: %v", err)
+		}
 		if h.st.sweepCountCalls != 0 {
-			t.Fatalf("NULL cap must skip the count probe entirely, got %d calls", h.st.sweepCountCalls)
+			t.Fatalf("NULL-cap assigned sweep must skip the count probe, got %d calls", h.st.sweepCountCalls)
+		}
+		if out.Capped || out.IneligibleMatched != nil {
+			t.Fatalf("assigned NULL-cap outcome Capped=%v IneligibleMatched=%v, want false/nil", out.Capped, out.IneligibleMatched)
+		}
+	})
+
+	// Capped compares ELIGIBLE (not selector Matched) against the fetched window (issue
+	// #1543): ineligible selector matches are never candidates, so they cannot make a fire
+	// "capped". Eligible == fetched with a larger Matched → not capped, and the difference
+	// surfaces as IneligibleMatched.
+	t.Run("capped_uses_eligible_not_matched", func(t *testing.T) {
+		h := newHarness()
+		h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 96}, {ForgeIssueIid: 97}}
+		h.st.sweepCount = 2 // Eligible == len(candidates)
+		h.st.sweepMatched = ptrI64(7)
+		out, err := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{Int32: 1, Valid: true}))
+		if err != nil {
+			t.Fatalf("RunNow: %v", err)
+		}
+		if out.Capped {
+			t.Fatalf("Capped = true, want false (Eligible 2 == fetched 2; Matched 7 must not count)")
+		}
+		if out.IneligibleMatched == nil || *out.IneligibleMatched != 5 {
+			t.Fatalf("IneligibleMatched = %v, want 5 (Matched 7 - Eligible 2)", out.IneligibleMatched)
+		}
+	})
+
+	// A capped ASSIGNED sweep still counts (the cap can truncate) but reports no
+	// IneligibleMatched.
+	t.Run("capped_assigned_sweep_counts_without_ineligible", func(t *testing.T) {
+		h := newHarness()
+		h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 96}}
+		h.st.sweepCount = 4
+		h.st.sweepMatched = ptrI64(10)
+		out, err := h.sched.fireSweep(context.Background(), h.assignedSweepSchedule(pgtype.Int4{Int32: 1, Valid: true}))
+		if err != nil {
+			t.Fatalf("fireSweep: %v", err)
+		}
+		if h.st.sweepCountCalls != 1 || !out.Capped {
+			t.Fatalf("count calls=%d Capped=%v, want 1/true (Eligible 4 > fetched 1)", h.st.sweepCountCalls, out.Capped)
+		}
+		if out.IneligibleMatched != nil {
+			t.Fatalf("assigned sweep IneligibleMatched = %d, want nil", *out.IneligibleMatched)
+		}
+		if h.st.sweepUziLabelParam != "" || h.st.countUziLabelParam != "" {
+			t.Fatalf("assigned sweep threaded uzi label list=%q count=%q, want empty", h.st.sweepUziLabelParam, h.st.countUziLabelParam)
+		}
+	})
+
+	// Zero-candidate label sweep: every selector match is ineligible. No rows, Matched 0,
+	// IneligibleMatched carries the whole backlog, no error.
+	t.Run("zero_candidates_all_ineligible", func(t *testing.T) {
+		h := newHarness()
+		h.st.sweepRows = nil
+		h.st.sweepCount = 0
+		h.st.sweepMatched = ptrI64(16)
+		out, err := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{Int32: 3, Valid: true}))
+		if err != nil {
+			t.Fatalf("RunNow: %v", err)
+		}
+		if out.Matched != 0 || out.Capped || len(out.Started) != 0 || len(out.Skips) != 0 {
+			t.Fatalf("outcome = %+v, want the empty outcome", out)
+		}
+		if out.IneligibleMatched == nil || *out.IneligibleMatched != 16 {
+			t.Fatalf("IneligibleMatched = %v, want 16", out.IneligibleMatched)
 		}
 	})
 
@@ -1791,25 +1893,30 @@ func TestFireSweepBackfillPastAlreadyRunningAndNotEligible(t *testing.T) {
 	assertBalances(t, out)
 }
 
-// TestFireSweepBackfillScanBound: a head of all-ineligible candidates under-fills the fire
-// (starts fewer than max_issues) and the forge cost is bounded by the scan window. Two
-// fake caveats (PRD M2): the fake store applies no LIMIT, so we (a) assert the THREADED
-// limit param is max_issues+backfillHeadroom (the real truncation is covered by the live-DB
-// test), and (b) hand the fake exactly the window's worth of rows.
+// TestFireSweepBackfillScanBound: a head of all-skipped candidates under-fills the fire
+// (starts fewer than max_issues) and the forge cost is bounded by the scan window. Since
+// issue #1543 the SQL filters eligibility before the window, so a window can no longer be
+// a wall of ineligible issues; the wall here is the skips that still happen AFTER
+// selection — already_running (the active-run pre-check, no forge call) and fetch_failed
+// (the forge GetIssue errors). Two fake caveats (PRD M2): the fake store applies no LIMIT,
+// so we (a) assert the THREADED limit param is max_issues+backfillHeadroom (the real
+// truncation is covered by the live-DB test), and (b) hand the fake exactly the window's
+// worth of rows.
 func TestFireSweepBackfillScanBound(t *testing.T) {
 	const maxIssues = 3
 	window := maxIssues + backfillHeadroom
 	rows := make([]store.ListSweepCandidateIssuesRow, 0, window)
-	errs := map[int64]error{}
+	active := map[int64]bool{}
 	for i := 0; i < window; i++ {
 		iid := int64(100 + i)
 		rows = append(rows, store.ListSweepCandidateIssuesRow{ForgeIssueIid: iid})
-		errs[iid] = workersvc.ErrNotPRDIssue // the whole window is ineligible
+		active[iid] = i%2 == 0 // even slots already running; odd slots fail the forge fetch
 	}
 	h := newHarness()
 	h.st.sweepRows = rows
-	h.st.sweepCount = int64(window + 5) // more matching issues exist beyond the window → Capped
-	h.runs.errByIssue = errs
+	h.st.sweepCount = int64(window + 5) // more ELIGIBLE issues exist beyond the window → Capped
+	h.st.activeByIssue = active
+	h.fb.f.err = errors.New("forge unavailable") // every GetIssue fails → fetch_failed
 	out, err := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{Int32: maxIssues, Valid: true}))
 	if err != nil {
 		t.Fatalf("scan-bound fire must not error, got %v", err)
@@ -1820,17 +1927,32 @@ func TestFireSweepBackfillScanBound(t *testing.T) {
 		t.Fatalf("threaded max_issues param = %+v, want {Int32:%d Valid:true}", got, window)
 	}
 	if len(out.Started) != 0 {
-		t.Fatalf("all-ineligible head must start nothing, got %d started", len(out.Started))
+		t.Fatalf("all-skipped head must start nothing, got %d started", len(out.Started))
 	}
 	if len(out.Skips) != window || out.Matched != window {
 		t.Fatalf("Matched=%d skips=%d, want %d each (examined the whole window, no early break)", out.Matched, len(out.Skips), window)
 	}
-	// Forge calls are bounded by the window — the fire does not walk past it.
-	if len(h.fb.f.getIID) != window {
-		t.Fatalf("GetIssue calls = %d, want %d (bounded by the scan window)", len(h.fb.f.getIID), window)
+	wantFetched := 0
+	for _, sk := range out.Skips {
+		switch {
+		case sk.IssueIID != nil && active[*sk.IssueIID]:
+			if sk.Reason != SkipAlreadyRunning {
+				t.Fatalf("skip %d reason = %q, want already_running", *sk.IssueIID, sk.Reason)
+			}
+		default:
+			wantFetched++
+			if sk.Reason != SkipFetchFailed {
+				t.Fatalf("skip %v reason = %q, want fetch_failed", sk.IssueIID, sk.Reason)
+			}
+		}
+	}
+	// Forge calls are bounded by the window — the fire does not walk past it — and only the
+	// non-already_running candidates reach the forge (the active-run pre-check skips first).
+	if got := len(h.fb.f.getIID); got > window || got != wantFetched {
+		t.Fatalf("GetIssue calls = %d, want %d (non-already_running candidates, <= window %d)", got, wantFetched, window)
 	}
 	if !out.Capped {
-		t.Fatalf("Capped = false, want true (more matching issues than the scan window reached)")
+		t.Fatalf("Capped = false, want true (more eligible issues than the scan window reached)")
 	}
 	assertBalances(t, out)
 }
@@ -1838,6 +1960,11 @@ func TestFireSweepBackfillScanBound(t *testing.T) {
 // TestFireSweepBackfillNullCapUnchanged: a NULL cap threads NULL (unlimited, not widened),
 // has no started ceiling (no early break), and still records skips inline — it examines
 // every candidate and starts all it can, exactly as before issue #416.
+//
+// It also pins the SELECT→create race (issue #1543): the SQL returned 20 as eligible, but
+// by the time createRun re-checks the gate the issue lost its uzi label / bot assignment,
+// so the run layer's ErrNotPRDIssue still lands as a per-row not_eligible skip. The SQL
+// eligibility filter narrows that window; it does not remove the per-row mapping.
 func TestFireSweepBackfillNullCapUnchanged(t *testing.T) {
 	h := newHarness()
 	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{
@@ -1853,6 +1980,10 @@ func TestFireSweepBackfillNullCapUnchanged(t *testing.T) {
 	}
 	if out.Matched != 3 || len(out.Skips) != 1 {
 		t.Fatalf("Matched=%d skips=%d, want 3 and 1 (examined all, no cap ceiling)", out.Matched, len(out.Skips))
+	}
+	// The SELECT→create race still maps to a per-row not_eligible skip (issue #1543).
+	if out.Skips[0].Reason != SkipNotEligible || out.Skips[0].IssueIID == nil || *out.Skips[0].IssueIID != 20 {
+		t.Fatalf("skip = %+v, want not_eligible for 20 (eligibility lost between SELECT and createRun)", out.Skips[0])
 	}
 	assertBalances(t, out)
 }
@@ -2223,6 +2354,38 @@ func TestTickParkDoesNotPersistLastFire(t *testing.T) {
 	}
 	if len(h.st.statusCalls) != 1 || h.st.statusCalls[0].Status != "error" {
 		t.Fatalf("park must SetRunScheduleStatus to error, got %+v", h.st.statusCalls)
+	}
+}
+
+// TestMarshalLastFireIneligibleMatched (issue #1543): ineligible_matched is emitted when
+// set — including a known 0 — and omitted when nil (non-label sweeps, issue/prompt), so a
+// reader can tell "unknown" from "zero".
+func TestMarshalLastFireIneligibleMatched(t *testing.T) {
+	firedAt := time.Date(2026, 8, 12, 9, 0, 0, 0, time.UTC)
+	for _, c := range []struct {
+		name    string
+		n       *int64
+		wantKey string // "" = key must be absent
+	}{
+		{"nil_omitted", nil, ""},
+		{"zero_emitted", ptrI64(0), `"ineligible_matched":0`},
+		{"set_emitted", ptrI64(16), `"ineligible_matched":16`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			raw, err := marshalLastFire(FireOutcome{IneligibleMatched: c.n}, firedAt)
+			if err != nil {
+				t.Fatalf("marshalLastFire: %v", err)
+			}
+			if c.wantKey == "" {
+				if strings.Contains(string(raw), "ineligible_matched") {
+					t.Fatalf("nil IneligibleMatched must omit the key: %s", raw)
+				}
+				return
+			}
+			if !strings.Contains(string(raw), c.wantKey) {
+				t.Fatalf("last_fire JSON missing %s: %s", c.wantKey, raw)
+			}
+		})
 	}
 }
 
@@ -3014,14 +3177,75 @@ func TestFireSweepAssignedDefaultThreadsSelectorAndBotID(t *testing.T) {
 	if strings.Contains(string(h.st.sweepLabelParam), "uzi") {
 		t.Fatalf("assigned sweep leaked the uzi label into the selector: %s", h.st.sweepLabelParam)
 	}
+	// Issue #1543: an assigned sweep threads no uzi label (assignment IS eligibility) and
+	// reports no IneligibleMatched.
+	if h.st.sweepUziLabelParam != "" {
+		t.Fatalf("assigned sweep uzi label param = %q, want empty", h.st.sweepUziLabelParam)
+	}
+	if out.IneligibleMatched != nil {
+		t.Fatalf("assigned sweep IneligibleMatched = %d, want nil", *out.IneligibleMatched)
+	}
+}
+
+// assignedSweepSchedule builds a default-origin assigned-sweep row (PRD #767 M4) with the
+// given cap, for the issue #1543 count-probe cases.
+func (h *harness) assignedSweepSchedule(maxIssues pgtype.Int4) store.RunSchedule {
+	return store.RunSchedule{
+		ID:          uuid.New(),
+		UserID:      h.owner,
+		RepoID:      h.repoID,
+		Target:      "sweep",
+		Origin:      "default",
+		CatalogSlug: pgtype.Text{String: "assigned-sweep", Valid: true},
+		Timing:      "recurring",
+		CronExpr:    pgtype.Text{String: "0 * * * *", Valid: true},
+		Timezone:    "UTC",
+		AutoApprove: true,
+		Status:      "active",
+		Enabled:     true,
+		MaxIssues:   maxIssues,
+	}
+}
+
+func ptrI64(n int64) *int64 { return &n }
+
+// TestFireSweepLabelSweepThreadsUziLabel (issue #1543): the label sweep threads the
+// resolved eligibility label into BOTH the list and the count query — the configured
+// setting when present, settings.DefaultUziLabel when the setting is blank or
+// whitespace-only.
+func TestFireSweepLabelSweepThreadsUziLabel(t *testing.T) {
+	for _, c := range []struct {
+		name, setting, want string
+	}{
+		{"default_setting", "uzi", "uzi"},
+		{"custom_setting", "robot-ok", "robot-ok"},
+		{"blank_setting", "", settings.DefaultUziLabel},
+		{"whitespace_setting", "   ", settings.DefaultUziLabel},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness()
+			h.set.uziLabel = c.setting
+			h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 7}}
+			if _, err := h.sched.fireSweep(context.Background(), h.sweepSchedule(pgtype.Int4{})); err != nil {
+				t.Fatalf("fireSweep: %v", err)
+			}
+			if h.st.sweepUziLabelParam != c.want {
+				t.Fatalf("list uzi label param = %q, want %q", h.st.sweepUziLabelParam, c.want)
+			}
+			if h.st.countUziLabelParam != c.want {
+				t.Fatalf("count uzi label param = %q, want %q (probe runs for a NULL-cap label sweep)", h.st.countUziLabelParam, c.want)
+			}
+		})
+	}
 }
 
 // TestFireSweepLabelSweepThreadsLabelSelector is the regression guard paired with the
 // assigned case: a label sweep (a user-origin row here) still resolves Selector="label",
-// threads its resolved labels, and passes BotID=0 (the assigned branch stays off).
+// threads its resolved labels, and — since issue #1543 filters eligibility in SQL — also
+// threads the repo's bot id, because a bot-assigned issue is eligible under a label selector.
 func TestFireSweepLabelSweepThreadsLabelSelector(t *testing.T) {
 	h := newHarness()
-	h.st.repoRow.BotForgeUserID = 9999  // present but must NOT be threaded for a label sweep
+	h.st.repoRow.BotForgeUserID = 9999  // threaded: bot assignment is an eligibility path (#1543)
 	s := h.sweepSchedule(pgtype.Int4{}) // user-origin, Labels ["PRD"]
 	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 7}}
 
@@ -3038,8 +3262,12 @@ func TestFireSweepLabelSweepThreadsLabelSelector(t *testing.T) {
 	if string(h.st.sweepLabelParam) != `["PRD"]` {
 		t.Fatalf("sweep label param = %s, want the resolved [\"PRD\"] selector", h.st.sweepLabelParam)
 	}
-	if h.st.sweepBotIDParam != 0 {
-		t.Fatalf("sweep bot id param = %d, want 0 (the assigned branch is off for a label sweep)", h.st.sweepBotIDParam)
+	if h.st.sweepBotIDParam != 9999 {
+		t.Fatalf("sweep bot id param = %d, want the repo bot id 9999 (bot assignment is an eligibility path, #1543)", h.st.sweepBotIDParam)
+	}
+	// The default configured uzi label is threaded to both the list and the count query.
+	if h.st.sweepUziLabelParam != "uzi" || h.st.countUziLabelParam != "uzi" {
+		t.Fatalf("uzi label params list=%q count=%q, want \"uzi\" for both", h.st.sweepUziLabelParam, h.st.countUziLabelParam)
 	}
 }
 

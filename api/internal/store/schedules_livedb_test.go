@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -164,8 +165,9 @@ func TestRunSchedulesClaimAdvanceLiveDB(t *testing.T) {
 // against a fake store — the LIMIT and the oldest-first ORDER BY ARE the SQL — so this
 // prepares and runs it against real Postgres.
 //
-// It seeds five open issues carrying the sweep label with ASCENDING forge_issue_iid and
-// asserts: a cap of N returns the N OLDEST (smallest iids), and a NULL cap returns all.
+// It seeds five open, eligible (uzi-labelled) issues carrying the sweep label with ASCENDING
+// forge_issue_iid and asserts: a cap of N returns the N OLDEST (smallest iids), and a NULL
+// cap returns all.
 func TestListSweepCandidateIssuesMaxIssuesLiveDB(t *testing.T) {
 	ctx := context.Background()
 	q, _, repoID := schedFixture(ctx, t)
@@ -177,11 +179,12 @@ func TestListSweepCandidateIssuesMaxIssuesLiveDB(t *testing.T) {
 	}
 	t.Cleanup(pool.Close)
 
-	// Five candidates, all open and carrying the "bug" label, ascending iids.
+	// Five candidates, all open, carrying the "bug" label and eligible via the uzi label
+	// (issue #1543 filters eligibility before the LIMIT), ascending iids.
 	for _, iid := range []int64{101, 102, 103, 104, 105} {
 		mustExec(ctx, t, pool,
 			`INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
-			 VALUES ($1, $2, 't', 'opened', '["bug"]'::jsonb, 'https://x', true, now(), now())`,
+			 VALUES ($1, $2, 't', 'opened', '["bug","uzi"]'::jsonb, 'https://x', true, now(), now())`,
 			repoID, iid)
 	}
 
@@ -189,7 +192,7 @@ func TestListSweepCandidateIssuesMaxIssuesLiveDB(t *testing.T) {
 
 	sweepIIDs := func(max pgtype.Int4) []int64 {
 		rows, err := q.ListSweepCandidateIssues(ctx, store.ListSweepCandidateIssuesParams{
-			RepoID: repoID, Selector: "label", Labels: labels, MaxIssues: max,
+			RepoID: repoID, Selector: "label", Labels: labels, UziLabel: "uzi", MaxIssues: max,
 		})
 		if err != nil {
 			t.Fatalf("ListSweepCandidateIssues: %v", err)
@@ -224,7 +227,8 @@ func TestListSweepCandidateIssuesMaxIssuesLiveDB(t *testing.T) {
 //
 // window = 13 mirrors the enabled sweeps' shape (max_issues 3 + backfillHeadroom 10); the
 // value is a literal here on purpose, keeping the store-layer test agnostic of schedsvc's
-// package constant. It seeds MORE issues than the window (16) so truncation is observable.
+// package constant. It seeds MORE eligible (uzi-labelled) issues than the window (16) so
+// truncation is observable.
 func TestListSweepCandidateIssuesScanWindowLiveDB(t *testing.T) {
 	ctx := context.Background()
 	q, _, repoID := schedFixture(ctx, t)
@@ -241,12 +245,12 @@ func TestListSweepCandidateIssuesScanWindowLiveDB(t *testing.T) {
 	for i := 0; i < seeded; i++ {
 		mustExec(ctx, t, pool,
 			`INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
-			 VALUES ($1, $2, 't', 'opened', '["bug"]'::jsonb, 'https://x', true, now(), now())`,
+			 VALUES ($1, $2, 't', 'opened', '["bug","uzi"]'::jsonb, 'https://x', true, now(), now())`,
 			repoID, int64(301+i))
 	}
 
 	rows, err := q.ListSweepCandidateIssues(ctx, store.ListSweepCandidateIssuesParams{
-		RepoID: repoID, Selector: "label", Labels: []byte(`["bug"]`), MaxIssues: pgtype.Int4{Int32: window, Valid: true},
+		RepoID: repoID, Selector: "label", Labels: []byte(`["bug"]`), UziLabel: "uzi", MaxIssues: pgtype.Int4{Int32: window, Valid: true},
 	})
 	if err != nil {
 		t.Fatalf("ListSweepCandidateIssues: %v", err)
@@ -259,6 +263,138 @@ func TestListSweepCandidateIssuesScanWindowLiveDB(t *testing.T) {
 		if want := int64(301 + i); r.ForgeIssueIid != want {
 			t.Fatalf("row %d = iid %d, want %d (oldest-first, truncated at the window)", i, r.ForgeIssueIid, want)
 		}
+	}
+}
+
+// seedSweepIssue seeds an issue into schedFixture's repo for the issue #1543
+// eligibility tests: open, with the given labels and (numeric) assignee ids.
+func seedSweepIssue(ctx context.Context, t *testing.T, pool *pgxpool.Pool, repoID uuid.UUID, iid int64, labels, assignees string) {
+	t.Helper()
+	mustExec(ctx, t, pool,
+		`INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, assignee_ids, web_url, has_prd_link, forge_updated_at, synced_at)
+		 VALUES ($1, $2, 't', 'opened', $3::jsonb, $4::jsonb, 'https://x', true, now(), now())`,
+		repoID, iid, labels, assignees)
+}
+
+// sweepEligibleIIDs runs ListSweepCandidateIssues for a label selector and returns the iids.
+func sweepEligibleIIDs(ctx context.Context, t *testing.T, q *store.Queries, arg store.ListSweepCandidateIssuesParams) []int64 {
+	t.Helper()
+	rows, err := q.ListSweepCandidateIssues(ctx, arg)
+	if err != nil {
+		t.Fatalf("ListSweepCandidateIssues: %v", err)
+	}
+	out := make([]int64, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.ForgeIssueIid)
+	}
+	return out
+}
+
+// TestListSweepCandidateIssuesEligibilityBeforeScanWindowLiveDB is the issue #1543
+// regression: a label sweep's candidates are chosen oldest-first under a scan-window
+// LIMIT, and eligibility (uzi label OR bot assignment) used to be checked per-row only
+// AFTER the LIMIT. A long prefix of older selector-matching but ineligible issues then
+// filled every window slot and the eligible issue behind it was never reached. With the
+// eligibility predicate applied before the LIMIT, the eligible issue is the whole result.
+//
+// It seeds 16 older open ["bug"] issues (no uzi label, unassigned) — more than the
+// 13-slot window (max_issues 3 + backfillHeadroom 10) — then one later ["bug","uzi"].
+func TestListSweepCandidateIssuesEligibilityBeforeScanWindowLiveDB(t *testing.T) {
+	ctx := context.Background()
+	q, _, repoID := schedFixture(ctx, t)
+	pool, err := store.OpenPool(ctx, os.Getenv("UZI_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	const window = 13
+	const ineligible = 16
+	for i := 0; i < ineligible; i++ {
+		seedSweepIssue(ctx, t, pool, repoID, int64(501+i), `["bug"]`, `[]`)
+	}
+	const eligibleIID int64 = 601
+	seedSweepIssue(ctx, t, pool, repoID, eligibleIID, `["bug","uzi"]`, `[]`)
+
+	got := sweepEligibleIIDs(ctx, t, q, store.ListSweepCandidateIssuesParams{
+		RepoID: repoID, Selector: "label", Labels: []byte(`["bug"]`), UziLabel: "uzi",
+		MaxIssues: pgtype.Int4{Int32: window, Valid: true},
+	})
+	if !reflect.DeepEqual(got, []int64{eligibleIID}) {
+		t.Fatalf("scan-window candidates = %v, want exactly [%d]: the %d older ineligible [\"bug\"] "+
+			"issues must be filtered before the LIMIT, not consume the %d window slots", got, eligibleIID, ineligible, window)
+	}
+}
+
+// TestListSweepCandidateIssuesEligibilityRulesLiveDB pins the eligibility predicate's
+// two arms and its @uzi_label parameterisation under a non-uzi ["bug"] selector, plus
+// list/count parity: Count's Eligible equals the unlimited list's length, and
+// Matched - Eligible equals the ineligible selector matches across the WHOLE backlog
+// (not just one scan window).
+func TestListSweepCandidateIssuesEligibilityRulesLiveDB(t *testing.T) {
+	ctx := context.Background()
+	q, _, repoID := schedFixture(ctx, t)
+	pool, err := store.OpenPool(ctx, os.Getenv("UZI_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	const botID int64 = 7101 // schedFixture's bot_forge_user_id
+	bot := fmt.Sprintf("[%d]", botID)
+
+	// 701: bug + uzi                    → eligible with the default uzi label
+	// 702: bug, bot-assigned, unlabelled → eligible only when BotID is set
+	// 703: bug + run-me                 → eligible only under the custom "run-me" label
+	// 704: bug, unassigned              → never eligible
+	// 705: bug, human-assigned          → never eligible (numeric id must be the bot's)
+	// 706..725: 20 more plain bug rows   → a backlog of ineligibles larger than any window
+	seedSweepIssue(ctx, t, pool, repoID, 701, `["bug","uzi"]`, `[]`)
+	seedSweepIssue(ctx, t, pool, repoID, 702, `["bug"]`, bot)
+	seedSweepIssue(ctx, t, pool, repoID, 703, `["bug","run-me"]`, `[]`)
+	seedSweepIssue(ctx, t, pool, repoID, 704, `["bug"]`, `[]`)
+	seedSweepIssue(ctx, t, pool, repoID, 705, `["bug"]`, `[7999]`)
+	const extraIneligible = 20
+	for i := 0; i < extraIneligible; i++ {
+		seedSweepIssue(ctx, t, pool, repoID, int64(706+i), `["bug"]`, `[]`)
+	}
+	const matched = 5 + extraIneligible
+
+	bug := []byte(`["bug"]`)
+	cases := []struct {
+		name     string
+		uziLabel string
+		botID    int64
+		want     []int64
+	}{
+		{"uzi label, bot id set", "uzi", botID, []int64{701, 702}},
+		{"uzi label, bot id 0", "uzi", 0, []int64{701}},
+		{"custom run-me label, bot id 0", "run-me", 0, []int64{703}},
+		{"custom run-me label, bot id set", "run-me", botID, []int64{702, 703}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sweepEligibleIIDs(ctx, t, q, store.ListSweepCandidateIssuesParams{
+				RepoID: repoID, Selector: "label", Labels: bug, UziLabel: tc.uziLabel, BotID: tc.botID,
+			})
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("candidates = %v, want %v", got, tc.want)
+			}
+			c, err := q.CountSweepCandidateIssues(ctx, store.CountSweepCandidateIssuesParams{
+				RepoID: repoID, Selector: "label", Labels: bug, UziLabel: tc.uziLabel, BotID: tc.botID,
+			})
+			if err != nil {
+				t.Fatalf("CountSweepCandidateIssues: %v", err)
+			}
+			if c.Eligible != int64(len(got)) {
+				t.Fatalf("count Eligible = %d, want %d (the unlimited list's length)", c.Eligible, len(got))
+			}
+			if c.Matched != matched {
+				t.Fatalf("count Matched = %d, want %d (every open bug-labelled issue)", c.Matched, matched)
+			}
+			if inel := c.Matched - c.Eligible; inel != int64(matched-len(tc.want)) {
+				t.Fatalf("Matched - Eligible = %d, want %d (ineligible matches across the whole backlog)", inel, matched-len(tc.want))
+			}
+		})
 	}
 }
 

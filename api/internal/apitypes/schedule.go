@@ -341,11 +341,16 @@ type LastFireSkip struct {
 // 4). Tags mirror schedsvc's lastFireRecord exactly so the raw jsonb column unmarshals
 // straight into this struct.
 type LastFire struct {
-	FiredAt time.Time         `json:"fired_at"`
-	Matched int               `json:"matched"`
-	Capped  bool              `json:"capped"`
-	Started []LastFireStarted `json:"started"`
-	Skips   []LastFireSkip    `json:"skips"`
+	FiredAt time.Time `json:"fired_at"`
+	Matched int       `json:"matched"`
+	Capped  bool      `json:"capped"`
+	// IneligibleMatched (issue #1543, label sweeps only) is the number of open issues that
+	// match the sweep's selector but are not eligible (neither carrying the configured uzi
+	// label nor assigned to the bot), over the whole selector backlog. Absent/nil (a
+	// historical fire, or a non-label-sweep fire) means UNKNOWN, NOT zero.
+	IneligibleMatched *int64            `json:"ineligible_matched,omitempty"`
+	Started           []LastFireStarted `json:"started"`
+	Skips             []LastFireSkip    `json:"skips"`
 }
 
 // CatalogEntryDTO is the wire view of one builtin default scheduled job (PRD #589). It
@@ -479,10 +484,15 @@ type SchedulePreviewResponse struct {
 // fields carry the full per-candidate outcome so a caller can render it without a second
 // fetch. Started/Skips are non-nil empty slices, matching the persisted convention.
 type RunNowResponse struct {
-	Created int               `json:"created"`
-	RunIDs  []string          `json:"run_ids"`
-	Matched int               `json:"matched"`
-	Capped  bool              `json:"capped"`
-	Started []LastFireStarted `json:"started"`
-	Skips   []LastFireSkip    `json:"skips"`
+	Created int      `json:"created"`
+	RunIDs  []string `json:"run_ids"`
+	Matched int      `json:"matched"`
+	Capped  bool     `json:"capped"`
+	// IneligibleMatched (issue #1543, label sweeps only) is the number of open issues that
+	// match the sweep's selector but are not eligible (neither carrying the configured uzi
+	// label nor assigned to the bot), over the whole selector backlog. Absent/nil (a
+	// non-label-sweep fire, or an older server) means UNKNOWN, NOT zero.
+	IneligibleMatched *int64            `json:"ineligible_matched,omitempty"`
+	Started           []LastFireStarted `json:"started"`
+	Skips             []LastFireSkip    `json:"skips"`
 }
