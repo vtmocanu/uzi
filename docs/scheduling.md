@@ -52,8 +52,9 @@ their own right, so a sweep over one of them (e.g. everything tagged `bug`)
 fires only on the candidates that are also eligible — pair a raw-bug-report
 sweep with the `uzi` label (or bot assignment) if you want it to run
 anything. A bare selector issue that's neither `uzi`-labelled nor
-bot-assigned is a benign skip (see [Fire outcomes](#fire-outcomes)) that
-advances the schedule like any other. The `assigned-sweep` default sidesteps
+bot-assigned is filtered out before the scan window and is never a
+candidate; the fire counts it in `ineligible_matched` (see
+[Fire outcomes](#fire-outcomes)). The `assigned-sweep` default sidesteps
 this pairing by construction: its selector *is* the eligibility signal, so
 every candidate it matches is already eligible. The **ad-hoc prompt** target
 is the deliberate exception: with no issue to gate on, it bypasses the
