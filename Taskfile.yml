@@ -2345,6 +2345,26 @@ tasks:
     cmds:
       - ./e2e/home-uid-split/run.sh
 
+  test:provision-path-split:
+    desc: Opt-in build and run the worker-image provision PATH and Codex command fixture (#1685)
+    # Separate build and fixture targets permit reusing an existing image after source edits.
+    # Requires Docker; unavailable Docker/image or uid split prints SKIP and exits 77.
+    # Build and fixture have bounded timeouts (600s/120s by default).
+    # Not wired into gate. Set PROVISION_SPLIT_MOUNT_SRC=1 to use this tree's agent/src.
+    cmds:
+      - task: test:provision-path-split:build
+      - task: test:provision-path-split:fixture
+
+  test:provision-path-split:build:
+    desc: Opt-in build the real base worker image for the provision PATH fixture
+    cmds:
+      - ./e2e/provision-path-split/run.sh build
+
+  test:provision-path-split:fixture:
+    desc: Opt-in run the provision PATH fixture in the prebuilt worker image
+    cmds:
+      - ./e2e/provision-path-split/run.sh fixture
+
   test:codex-m3a:matrix:
     desc: Opt-in real base and jvm package matrix for amd64 and arm64 with negative controls
     # Builds every actual template/architecture cell. Each Dockerfile executes the positive
