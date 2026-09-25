@@ -986,7 +986,7 @@ chain in the diagram above, with no intervening `running`.
   the separate, duplicate `run_failed` notification). A run whose failure
   reason is the cancel sentinel ("run cancelled": a user cancel, or a server
   auto-stop the live worker carries out) renders as "Cancelled" without the ❌
-  glyph; every other failed run, plan rejections and an escalated auto-stop
+  glyph; every other failed run, plan rejections and an escalated or no-live-worker auto-stop
   included, posts a ❌ Failed message with its reason. The DM is not gated on `stop_kind`.
   The `notifications` table itself is not gone (PRD #1650): it stays as a
   pruned (200 rows/user), write-only event log and the incidental-finding

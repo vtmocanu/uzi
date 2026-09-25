@@ -173,8 +173,8 @@ WHERE repo_id = @repo_id::uuid AND ref <> ALL(@keep_refs::text[]);
 -- prompt-schedule MR) has no row here; the Slack halt DM is its only surface.
 -- The marker also drops once the newest run's MR is recorded closed or merged: a
 -- terminal mr_state takes the branch out of the watch set, but the ledger row is
--- only evicted on the next reconcile (DeleteCIAutofixAttemptsNotIn), and a
--- finished MR leaves nothing to fix in that gap. runs.mr_state
+-- only evicted on the next reconcile (DeleteCIAutofixAttemptsNotIn), so the
+-- query hides the marker in the gap before eviction. runs.mr_state
 -- holds only forge.MRState* values (opened|closed|merged|locked, gated by
 -- IsKnownMRState in the watchers); NULL (no MR observed yet), 'opened' and
 -- 'locked' keep the marker.
