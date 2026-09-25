@@ -232,8 +232,7 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   judge](./judge.md), a finished review arrives as a DM leading with 🔎 *Run
   review ready*, a fact row (verdict glyph + word, recommendation count, and a
   `code` chip per category), and the summary as a blockquoted excerpt with an
-  Open-in-uzi link — richer formatting than the inbox row, same underlying
-  content. If you've enabled the `self-improve` default job (see
+  Open-in-uzi link. If you've enabled the `self-improve` default job (see
   [Scheduling](./scheduling.md#default-jobs)) on a repo, you get a DM when a
   cycle starts and when one is skipped (vault locked, repo disconnected, a
   cycle already running). A judge or self-improvement run's *own* state changes (queued,
@@ -258,6 +257,17 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   any locked vault with blocked work, not only after a deploy, and clears once
   you unlock. Unlock the same way you always do: the in-app banner or password
   prompt, not from Slack.
+- **Autofix, rework, and override decisions**: three more one-time DMs, each
+  linking straight to where you act. **"CI auto-fix stopped"** fires when
+  [automatic CI fixing](./ci-autofix.md#the-loop-guard) halts on a branch
+  (attempt cap or no-progress), and links the pipeline when the URL is safe
+  to show. **"MR rework stopped"** fires when [automatic MR
+  rework](./mr-review-watcher.md) hits its per-MR cap, and links the run
+  page. **Guardrail override decided** fires when an admin approves or
+  rejects your [guardrail override
+  request](./admin-settings.md#guardrail-override-per-repo), and links the
+  Repos page. All three need Slack enabled and your account linked, like
+  every DM here.
 
 ## Markdown rendering
 

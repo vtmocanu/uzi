@@ -51,9 +51,9 @@ It surfaces five ways:
 - **`uzi admin health`** (below), plus roll-health columns (`VERSION`,
   `UPGRADE`, `BLOCKING`) on `uzi admin workers`, which previously showed no
   upgrade information at all for another user's worker.
-- **One notice per admin per Danger episode**, in the web inbox and, for a
-  linked admin, as a Slack DM — because a tab nobody is looking at does not
-  wake anyone. It fires on the evaluation *after* the one that opened the
+- **One notice per admin per Danger episode**, as a Slack DM for a linked
+  admin — because a tab nobody is looking at does not wake anyone. It fires
+  on the evaluation *after* the one that opened the
   episode (a one-tick danger blip that recovers on the next tick opens and
   closes an episode and notifies nobody), and it is gated by the same
   "Enable run-health detection" (`health_enabled`) setting the run-health

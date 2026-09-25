@@ -81,13 +81,17 @@ A persistently red pipeline can't loop forever:
   *same* failure signature as the attempt before it, uzi halts early rather
   than spending a second identical attempt.
 
-Either way, uzi lands an in-app notification and, on an issue-run branch, also
-posts one comment on the backing issue (worded differently for "hit the attempt
-limit" than for "no progress"); a scheduled prompt MR has no backing issue, so
-it gets the in-app notification only. uzi then stops trying automatically — **it
-does not retry on its own**. The manual **Fix CI** button is still there as your escape hatch any
-time. The attempt counter only resets once the branch's pipeline actually
-goes green.
+Either way, uzi sends you a Slack DM (if you've linked your account, see
+[Slack](./slack.md)) and, on an issue-run branch, also posts one comment on
+the backing issue (worded differently for "hit the attempt limit" than for
+"no progress") and shows an **"Autofix stopped"** marker on that issue's board
+card (with the attempt count in its title), so you know **Fix CI** is now
+yours to press. A scheduled prompt MR has no backing issue card, so it gets
+the Slack DM only. uzi then stops trying automatically — **it does not retry
+on its own**. The manual **Fix CI** button is still there as your escape
+hatch any time. The attempt counter only resets once the branch's pipeline
+actually goes green, which also clears the board marker; pressing **Fix CI**
+and letting automatic fixing proceed again clears it too.
 
 ## Code fixes push automatically; CI-config fixes wait for you
 
@@ -106,13 +110,16 @@ hand — the manual button, or an approved CI-config plan — pushes normally.
 
 ## Notifications
 
-You get an in-app notification when an automatic fix starts, when it halts,
-and when a fix lands (its pipeline goes green and the run is verified). On an
-issue-run branch (`agent/issue-N`) the start and halt notifications also post a
-comment on the backing issue; a scheduled-run branch (`uzi/prompt-<id>`,
-`uzi/self-improve/<id>`) has no such issue, so those events are in-app only.
-These are in-app and issue-comment only — automatic CI-fix events don't
-currently go out as Slack DMs, unlike some other run notifications.
+An automatic fix starting or landing (its pipeline goes green and the run is
+verified) no longer notifies you — you can already see the `ci_fix` run in
+Runs and its verdict chip on the run page, and, on an issue-run branch, the
+forge comment those events already post stays unchanged.
+
+A halt is the one event that reaches you: a Slack DM (if you've linked your
+account, see [Slack](./slack.md)) plus, on an issue-run branch, the board's
+**"Autofix stopped"** marker on the issue's card and a comment on the backing
+issue. A scheduled prompt MR has no backing issue card, so it gets the Slack
+DM only — see [The loop guard](#the-loop-guard) above.
 
 ## Forge support
 

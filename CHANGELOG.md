@@ -22,6 +22,20 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **A halted CI auto-fix, a halted MR rework, and a decided guardrail override each reach a Slack-linked owner as a one-time DM ([#1650](https://github.com/vtmocanu/uzi/issues/1650)).**
+  These three had a home only in the Notifications inbox before; each DM links straight to where you act (the pipeline for `ci_autofix_halted`, the run page for `mr_rework_halted`, the Repos page for `guardrail_override_decided`). A CI auto-fix halt also shows an "Autofix stopped" marker, with the attempt count, on the issue's board card, clearing once the pipeline goes green or auto-fix proceeds again; a prompt-schedule MR with no backing issue card relies on the Slack DM alone.
+- **Runs → Past runs gets a Failed filter, and the Schedules nav item surfaces parked schedules ([#1650](https://github.com/vtmocanu/uzi/issues/1650)).**
+  The filter counts and shows only genuine failures, excluding a deliberate stop or plan rejection. The Schedules nav badge switches to the parked count in an alert tone whenever any schedule is parked (`status = 'error'`), falling back to today's enabled count otherwise.
+
+### Changed
+
+- **The Notifications inbox tab, bell icon and unread badge are retired; `run_failed`, `ci_autofix_started`, `ci_autofix_landed` and `selfimprove_started` are no longer produced ([#1650](https://github.com/vtmocanu/uzi/issues/1650)).**
+  Every signal the inbox carried already has, or now has, a home elsewhere: Findings, Judge, Schedules, Admin Health, the run page, or a Slack DM (see the three new DM kinds above). The four status-only kinds duplicated a page surface or a Slack DM that already existed, so they stop firing; the forge comments those paths post are unchanged. Visiting `/notifications` now falls through to the app's normal not-found handling. The favicon's amber dot now means only "a run needs you" (awaiting approval or an answer) — the inbox's unread count no longer feeds it. The `notifications` table itself is unaffected: it stays as a pruned, write-only event log and the incidental-finding Slack de-dup latch that nothing in the product reads back.
+- **The early-limit-reset alert is now Slack-only ([#1650](https://github.com/vtmocanu/uzi/issues/1650)).**
+  Without a linked Slack account you no longer get this alert at all; the early reset still shows up on the rate-limit meters either way.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added

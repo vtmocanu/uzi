@@ -496,9 +496,9 @@ Each cycle:
 
 **Concurrent-open-MR cap.** At most **2** self-improvement merge requests can
 be open on a repo at once (a fixed default, not per-schedule configurable).
-Once that many are open, further cycles are skipped — with a notification —
-until you merge or close one; nothing piles onto an existing branch and
-nothing is silently dropped.
+Once that many are open, further cycles are skipped — with a Slack DM if
+you've linked your account — until you merge or close one; nothing piles
+onto an existing branch and nothing is silently dropped.
 
 **uzi dogfooding is an explicit, per-repo capability**, not automatic
 behavior tied to any particular repo. An owner can flag a repo to fold their
@@ -562,9 +562,9 @@ issue runs open:
 Both lanes act only on a **still-open** MR and spend the schedule owner's own
 Anthropic token, the same as any other run. A prompt schedule's MR has no
 backing issue, so the notices these lanes post as an issue comment on an
-issue-run MR (ci_autofix's start and halt; mr_rework's per-MR cap halt) arrive
-as an **in-app notification only** for a prompt MR; a self-improvement MR's
-shared tracking issue is likewise left untouched.
+issue-run MR (ci_autofix's halt; mr_rework's per-MR cap halt) arrive as a
+**Slack DM only** for a prompt MR; a self-improvement MR's shared tracking
+issue is likewise left untouched.
 
 ## Restarts and missed fires
 

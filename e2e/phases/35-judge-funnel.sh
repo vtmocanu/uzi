@@ -119,8 +119,8 @@ J_REREAD="$(apiget "/api/runs/$J_RUN/review")"
 [ "$(printf '%s' "$J_REREAD" | jq -r '.review.target_run_id')" = "$J_RUN" ] \
   || fail "PRD #46: the persisted review is not anchored to the reviewed run $J_RUN"
 [ "$(printf '%s' "$J_REREAD" | jq -r '.review.judge_run.judge_run_id // empty')" = "$J_JUDGE" ] \
-  || fail "PRD #46: the persisted review is not linked to the judge run $J_JUDGE that posted it"
-pass "durable: review $J_REVIEW_ID re-reads through the judge API, anchored to $J_RUN and linked to judge run $J_JUDGE"
+  || fail "PRD #46: the review's recorded judge run does not re-read as $J_JUDGE through the API"
+pass "durable: review $J_REVIEW_ID re-reads through the judge API, anchored to $J_RUN; the review's recorded judge run re-reads through the API"
 
 # Restore judge OFF here, in-phase, so no later phase is left relying on 39 to do it.
 # The judged run + its review are already persisted above, and nothing downstream needs

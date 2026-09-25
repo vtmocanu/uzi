@@ -135,7 +135,7 @@ mode](#judge-mode-off-optional-enforced) above).
 ## What you get
 
 When a judged run finishes (completed or failed — a cancelled run is never
-judged), a review lands in six places:
+judged), a review lands in five places:
 
 - **The run page**: a verdict chip (Ideal / OK / Issues found) plus a list of
   recommendations, each with a category, a target (the tool/agent/repo it's
@@ -146,9 +146,8 @@ judged), a review lands in six places:
   recommendation raised by many runs is **one row** to triage once. This is
   where you work the list; the run page is where you see one run's verdict.
 - **The runs list**: each judged run's row carries a `⚖ verdict · N` badge.
-- **Your [inbox](#the-inbox)**: a "Run review ready" notification, which opens
-  the Judge menu anchored to that run.
-- **Slack** (if you've linked your account): the same summary as a DM.
+- **Slack** (if you've linked your account): a "Run review ready" DM with the
+  same summary, opening the Judge menu anchored to that run.
 - **The [uzi CLI](./cli.md)**: `uzi review show <run-id>` prints the same
   verdict, recommendations, and your triage state from the terminal — see
   [Reading a review from the CLI](#reading-a-review-from-the-cli) below.
@@ -384,32 +383,10 @@ One more run is deliberately skipped: a run that **failed before its agent ever
 started** — a provisioning, credential, or guardrail block that stopped the run
 at zero iterations. There is no agent behaviour to retrospect on such a run, and
 judging it would only spend the (strongest, most expensive) model on a run that
-did nothing, so the judge is skipped. **The failure notification still lands** —
+did nothing, so the judge is skipped. **The failed-run Slack DM still lands** —
 the skip drops only the retrospective, never the "your run failed" alert. (A run
 that started and then crashed early is *not* in this set; it carries agent
 behaviour and is still judged.)
-
-## The inbox
-
-The bell icon in the sidebar (**Notifications**) opens your inbox: every
-review, and any other notification uzi produces, in one place. You see your
-own; an admin can switch to **All users** to see everyone's (each row shows
-its owner). Unread rows are highlighted; **Mark read** clears them from your
-unread count. Marking read is scoped to your own rows even in the admin
-all-view.
-
-A run of consecutive review notifications collapses into one "N reviews
-ready" header you can expand — the rows underneath keep their own read state
-and **Mark read**. A review row opens the
-**[Judge menu](./judge-menu.md)** anchored to its run; every other kind of
-notification still opens its run.
-
-That same unread count, together with your own runs' state, also drives a
-small dot on the browser tab icon: rose if one of your runs has failed,
-amber if one is awaiting your approval or you have something unread here,
-ember while work is running, and no dot when everything's idle. It's a
-convenience for a backgrounded or pinned tab, updating live in Chrome and
-Firefox (Safari shows the plain uzi mark, without the live dot).
 
 ## Admins: the All users view
 
@@ -462,10 +439,9 @@ stats` (see [Reviewing and triaging from the CLI](./cli.md#reviewing-and-triagin
   the run's trace, billed to the run owner exactly like any other run on
   their token. With the feature off (globally, or for you), nothing fires and
   nothing is spent.
-- **What's shared**: the inbox row and the Slack DM carry the verdict, a
-  short (secret-scrubbed) summary, and the recommendation count and
-  categories. The full recommendation detail (target, rationale) stays on the
-  run page.
+- **What's shared**: the Slack DM carries the verdict, a short
+  (secret-scrubbed) summary, and the recommendation count and categories. The
+  full recommendation detail (target, rationale) stays on the run page.
 - **Untrusted text, rendered safely**: every free-text field the judge
   produces is validated, length-capped, and secret-scrubbed before it's
   stored. The run page renders the judge's `summary_md` and each
