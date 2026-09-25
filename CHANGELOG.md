@@ -38,6 +38,8 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Deleting an Anthropic token names the workers bound to it, even when you click Delete right away.**
+  The workers bound to the token are now read at the click. Before, the confirmation used a list loaded when the page opened, so an early click, or a failed load, said "Nothing is bound to it" about a token workers were using. If the list cannot be read, the token is not deleted and the page says why.
 - **Runs that provision tools get a usable PATH and CA-bundle path again.**
   The worker now strips the `;` terminator that `devbox shellenv` puts on each `export` line. Previously the provisioned `PATH` kept a stray leading quote and a trailing `";`, so its first tool directory and `/bin` never resolved, and `NIX_SSL_CERT_FILE` pointed at a file that does not exist.
 - **The run list no longer times out under load with "could not refresh: cannot reach uzi … context deadline exceeded" ([#1620](https://github.com/vtmocanu/uzi/issues/1620)).**
