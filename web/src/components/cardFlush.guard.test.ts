@@ -21,15 +21,20 @@ function tsxSources(): string[] {
   return out.sort();
 }
 
-// Every `<Card …>` opening tag whose className string (plain, template or inside
-// an expression) carries a `p-0` class token.
+// Every `<Card …>` opening tag whose className carries a `p-0` class token: a
+// double- or single-quoted string, or a `{…}` expression up to its first `}`
+// (so a template literal counts only when `p-0` precedes any `${…}`).
+// A regex scan, not a JSX parser. Known misses: `p-0` after a `${…}`
+// interpolation in the same expression, and any tag with an earlier `>` in its
+// attributes (an arrow function prop ends the match there). Those shapes are
+// not in the tree today; review is the backstop for them.
 function cardP0Offenders(text: string): string[] {
   const offenders: string[] = [];
   for (const m of text.matchAll(/<Card(?=[\s>/])([^>]*)>/g)) {
     const attrs = m[1];
-    const cls = attrs.match(/className=(?:"([^"]*)"|\{([^}]*)\})/);
+    const cls = attrs.match(/className=(?:"([^"]*)"|'([^']*)'|\{([^}]*)\})/);
     if (!cls) continue;
-    if (/(^|[\s"'`])p-0(?=$|[\s"'`])/.test(cls[1] ?? cls[2] ?? "")) offenders.push(m[0]);
+    if (/(^|[\s"'`])p-0(?=$|[\s"'`])/.test(cls[1] ?? cls[2] ?? cls[3] ?? "")) offenders.push(m[0]);
   }
   return offenders;
 }
@@ -39,6 +44,7 @@ describe("Card p-0 source guard", () => {
     expect(cardP0Offenders('<Card className="p-0">')).toHaveLength(1);
     expect(cardP0Offenders('<Card className="overflow-hidden p-0">')).toHaveLength(1);
     expect(cardP0Offenders("<Card className={`p-0 ${x}`}>")).toHaveLength(1);
+    expect(cardP0Offenders("<Card className='p-0'>")).toHaveLength(1);
     expect(cardP0Offenders('<Card flush className="overflow-hidden">')).toHaveLength(0);
     expect(cardP0Offenders('<CardHeader className="p-0">')).toHaveLength(0);
   });

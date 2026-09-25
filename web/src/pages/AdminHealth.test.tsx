@@ -7,8 +7,8 @@
 // the all-clear line, the All checks inventory (disclosure, chips, counts, poll survival,
 // in-page jumps with reduced motion), na on a no-hosted-workers fixture, and the Fleet card
 // (M5: headers, status/upgrade badge words, skeleton loading, last-good rows on a failed poll).
-// Severity is asserted by ACCESSIBLE NAME / TEXT (the badge word, the shape's label), never a
-// colour class; the tab pip's worded aria-label is asserted; and a hostile worker name /
+// Severity is asserted by ACCESSIBLE NAME / TEXT (the badge word, or the sr-only span beside
+// the aria-hidden severity shape that carries the word), never a colour class; the tab pip's worded aria-label is asserted; and a hostile worker name /
 // blocking reason rendered into a `title=` attribute is asserted on the attribute.
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -484,12 +484,19 @@ describe("AdminHealth — Fleet card (M5)", () => {
     const body = table.querySelector("tbody")!;
     expect(body.querySelectorAll("tr").length).toBe(3);
     expect(body.textContent).toBe("");
-    expect(screen.queryByText(/Loading fleet/)).toBeNull();
+    // The retired visible copy (with its ellipsis) is gone; a visually hidden caption without
+    // the ellipsis is what a screen reader announces instead. Exact-string matches, so the
+    // negative cannot match the positive.
+    expect(screen.queryByText("Loading fleet\u2026")).toBeNull();
+    const caption = within(table).getByText("Loading fleet");
+    expect(caption.tagName).toBe("CAPTION");
+    expect(caption.classList.contains("sr-only")).toBe(true);
 
     await act(async () => resolve({ workers: [fleetWorker({ id: "w-1", name: "w-loaded" })] }));
     expect(await within(fleetCard()).findByTitle("w-loaded")).toBeTruthy();
     expect(table.getAttribute("aria-busy")).toBe("false");
     expect(body.querySelectorAll("tr").length).toBe(1);
+    expect(within(table).queryByText("Loading fleet")).toBeNull();
   });
 
   it("empty fleet keeps its text", async () => {

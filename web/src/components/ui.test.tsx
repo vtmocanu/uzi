@@ -5,7 +5,7 @@
 
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { Card, RUN_STATUS_TONES, Select, StatusPill, Toggle } from "./ui";
+import { Card, CountPill, RUN_STATUS_TONES, Select, StatusPill, Toggle } from "./ui";
 import { runBadge } from "../lib/runBadge";
 import type { LatestRun, RunStatus } from "../lib/api";
 
@@ -243,5 +243,20 @@ describe("Card flush", () => {
     const card = container.firstElementChild as HTMLElement;
     expect(card.classList.contains("p-5")).toBe(true);
     for (const c of FLUSH_CLASSES) expect(card.classList.contains(c)).toBe(false);
+  });
+});
+
+// PRD #1648 D9: the visible count caps at "99+"; the accessible name is the caller's label,
+// untouched by the cap.
+describe("CountPill", () => {
+  it("caps the visible count at 99+ and keeps the caller's aria-label", () => {
+    render(<CountPill count={150} label="150 unread" />);
+    const pill = screen.getByLabelText("150 unread");
+    expect(pill.textContent).toBe("99+");
+  });
+
+  it("renders a small count as-is", () => {
+    render(<CountPill count={5} label="5 unread" />);
+    expect(screen.getByLabelText("5 unread").textContent).toBe("5");
   });
 });

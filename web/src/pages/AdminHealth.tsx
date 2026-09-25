@@ -514,6 +514,9 @@ function FleetCard() {
       </header>
       <div className="overflow-x-auto">
         <table className="w-full text-left text-sm" aria-busy={loading}>
+          {/* The skeleton rows carry no text, so a visually hidden caption is the only thing
+              a screen reader announces while the first fetch is pending. */}
+          {loading && <caption className="sr-only">Loading fleet</caption>}
           <thead className="border-b border-edge text-muted">
             <tr>
               {FLEET_COLUMNS.map((c) => (
