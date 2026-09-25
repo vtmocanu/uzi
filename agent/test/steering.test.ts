@@ -22,7 +22,10 @@ function fakeClient(batches: UserInput[][]): WorkerClient {
   return { getInputs: async () => ({ inputs: batches[i++] ?? [] }) } as unknown as WorkerClient;
 }
 
-const inp = (kind: UserInput["kind"], body?: string): UserInput => ({ id: 1, kind, body: body ?? null });
+// Every input gets a fresh id, as real run_user_inputs rows do (issue #1660: follow-ups are
+// de-duplicated by id, so a shared constant id would read as one repeated row).
+let nextInputId = 1;
+const inp = (kind: UserInput["kind"], body?: string): UserInput => ({ id: nextInputId++, kind, body: body ?? null });
 const tick = (ms = 10): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 function makeChannel(batches: UserInput[][], cancel = new AbortController()): { ch: SteeringChannel; cancel: AbortController } {
@@ -1108,6 +1111,53 @@ describe("SteeringChannel reconcile never blocks /inputs (issue #1660)", () => {
       assert.strictEqual(reads, 1, "single-flight: one read in flight, not one per poll");
       assert.strictEqual(ch.operatorConstraints(), "reconciling", "dispatches stay denied until the read succeeds");
     } finally {
+      await ch.stop();
+    }
+  });
+});
+
+// Issue #1660 (PR #1667 review): a reconcile read can overlap a successful /inputs poll, and
+// both responses can carry the same newly consumed follow-up. Whichever path lands first, the
+// lead gets it once and the constraints hold it once (one id-keyed record both paths check).
+describe("SteeringChannel dedups a follow-up seen by both reconcile and /inputs (issue #1660)", () => {
+  it("reconcile first, then the same id live: the lead gets it once, the constraints hold it once", async () => {
+    const RULE = "screen strings only";
+    let polls = 0;
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((r) => (releaseRead = r));
+    let releasePoll!: () => void;
+    const pollGate = new Promise<void>((r) => (releasePoll = r));
+    const client = {
+      getInputs: async () => {
+        polls++;
+        if (polls === 1) throw new Error("lost reply");
+        // Poll 2 carries id 9, but its reply lands only after the reconcile read has merged it.
+        if (polls === 2) {
+          await pollGate;
+          return { inputs: [{ id: 9, kind: "follow_up", body: RULE }] };
+        }
+        return { inputs: [] };
+      },
+      getConsumedFollowUps: async () => {
+        await readGate;
+        return [{ id: 9, kind: "follow_up", body: RULE }];
+      },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      while (polls < 2) await tick(2);
+      releaseRead();
+      await tick(20);
+      assert.deepStrictEqual(ch.operatorConstraints(), [RULE], "reconcile merged it first");
+      releasePoll();
+      await tick(20);
+      assert.deepStrictEqual(ch.operatorConstraints(), [RULE], "the live copy is not added twice");
+      assert.strictEqual(ch.pullFollowUp(), RULE);
+      assert.strictEqual(ch.pullFollowUp(), undefined, "the lead gets it exactly once");
+    } finally {
+      releaseRead();
+      releasePoll();
       await ch.stop();
     }
   });

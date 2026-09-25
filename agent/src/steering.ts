@@ -172,6 +172,10 @@ export class SteeringChannel {
   /** Issue #1660: ids seeded from earlier claims, so a row the live drain also returns is
    *  recorded once. */
   private readonly seededFollowUpIds = new Set<number>();
+  /** Issue #1660: ids of follow-ups already queued for the lead this claim, by EITHER the live
+   *  /inputs path or the reconcile path. Both check it first, so a follow-up an overlapping
+   *  reconcile read and /inputs poll both return reaches the lead once. */
+  private readonly leadQueuedIds = new Set<number>();
   /** Issue #1660: set when the claim-time reload of earlier follow-ups failed. The earlier
    *  constraints are then unknown, so operatorConstraints reports null and the Agent guard
    *  denies every dispatch for this claim. */
@@ -593,22 +597,31 @@ export class SteeringChannel {
    *  it joins the constraints AND is queued for the lead once, since the lead never got it
    *  either. Atomic like seedOperatorConstraints: state changes only after the batch is built. */
   private reconcileFollowUps(inputs: readonly UserInput[]): void {
+    // Constraints merge by id against everything recorded; the lead queue checks leadQueuedIds
+    // (shared with the live path) and never takes a seeded row, which an earlier claim delivered.
     const known = new Set([...this.seededFollowUpIds, ...this.receivedFollowUps.map((f) => f.id)]);
     const recovered: { id: number; body: string }[] = [];
+    const forLead: { id: number; body: string }[] = [];
     for (const input of inputs) {
       const body = input.body?.trim();
-      if (input.kind !== "follow_up" || !body || known.has(input.id)) continue;
-      known.add(input.id);
-      recovered.push({ id: input.id, body });
+      if (input.kind !== "follow_up" || !body) continue;
+      if (!known.has(input.id)) {
+        known.add(input.id);
+        recovered.push({ id: input.id, body });
+      }
+      if (!this.seededFollowUpIds.has(input.id) && !this.leadQueuedIds.has(input.id)) forLead.push({ id: input.id, body });
     }
-    if (recovered.length === 0) return;
+    if (recovered.length === 0 && forLead.length === 0) return;
     this.receivedFollowUps.push(...recovered);
     this.receivedFollowUps.sort((a, b) => a.id - b.id);
-    for (const f of recovered) this.followUps.push({ id: f.id, body: f.body });
+    for (const f of forLead) {
+      this.leadQueuedIds.add(f.id);
+      this.followUps.push(f);
+    }
     this.followUps.sort((a, b) => a.id - b.id);
     this.log.warn("steering: recovered follow-ups a failed poll had consumed", {
       run_id: this.runId,
-      count: recovered.length,
+      count: forLead.length,
     });
   }
 
@@ -942,8 +955,13 @@ export class SteeringChannel {
         // issue #559 M2: carry the input id alongside the body so a delivery (takeFollowUp)
         // can advance the wake-guard watermark. The other kinds ignore the id.
         if (body && body.trim()) {
-          this.followUps.push({ id, body: body.trim() });
-          if (!this.seededFollowUpIds.has(id)) this.receivedFollowUps.push({ id, body: body.trim() });
+          // Issue #1660: an overlapping reconcile read may already have queued and recorded it.
+          if (!this.leadQueuedIds.has(id)) {
+            this.leadQueuedIds.add(id);
+            this.followUps.push({ id, body: body.trim() });
+          }
+          if (!this.seededFollowUpIds.has(id) && !this.receivedFollowUps.some((f) => f.id === id))
+            this.receivedFollowUps.push({ id, body: body.trim() });
         }
         break;
       case "answer": {
