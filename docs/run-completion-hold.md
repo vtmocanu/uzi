@@ -29,12 +29,11 @@ This default also gates who can pick up the run: a worker must advertise the
 For a Codex run, the worker must also advertise `codex_completion_interlock_v1`
 so it can run the Codex completion-attempt loop.
 If none of the run owner's online workers has the required protocol
-capabilities, the run stays queued. When the shared `completion_interlock_v1`
-capability is absent, the health reason names that shared capability first.
-When the shared capability and Codex harness capability are present but no
-worker advertises `codex_completion_interlock_v1` together with them, the
-reason names `codex_completion_interlock_v1`. Upgrade the owner's workers to
-this release to clear it (a worker from v0.83.0 onward can claim an interlocked
+capabilities, the run stays queued. Health can report an earlier placement
+blocker, such as a missing repo capability. Once those checks pass, it names
+a missing shared `completion_interlock_v1` protocol before a missing
+`codex_completion_interlock_v1` protocol; a custom Codex model can have its
+own capability gap. Upgrade the owner's workers to this release to clear it (a worker from v0.83.0 onward can claim an interlocked
 Claude run, but an older one than this release may still pause it at finalize;
 see the CHANGELOG). Turning Completion check off does **not**
 release a run already queued this way, since the switch is only read when a
