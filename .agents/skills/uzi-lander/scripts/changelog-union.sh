@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# changelog-union.sh — resolve a CHANGELOG.md rebase conflict by keeping BOTH sides, the
+# answer for a shared append-only list where every PR adds a bullet under the same heading.
+#
+# Usage: changelog-union.sh [FILE]      (default: CHANGELOG.md)
+#
+# Every conflict block keeps its first side, then its second; a diff3 base section
+# (`|||||||` .. `=======`) is dropped. Inside `## [Unreleased]`, a repeated `### <Section>`
+# heading is collapsed into its first occurrence (its bullets move under it) and blank lines
+# left between bullet items are dropped. A file with no conflict markers is left untouched.
+#
+# Verification before the file is replaced: no marker survives, the multiset of content
+# lines (non-blank, non-marker, non-heading) from the resolved sides is identical before and
+# after, and the set of distinct headings is unchanged. Any miss leaves FILE untouched.
+#
+# Exit codes: 0 resolved (or no markers), 1 verification failed or malformed markers,
+#             2 usage / unreadable file.
+set -uo pipefail
+
+FILE="${1:-CHANGELOG.md}"
+[ $# -le 1 ] || { echo "usage: changelog-union.sh [FILE]" >&2; exit 2; }
+[ -f "$FILE" ] && [ -r "$FILE" ] || { echo "changelog-union: cannot read $FILE" >&2; exit 2; }
+
+MARKER_RE='^(<<<<<<<( |$)|>>>>>>>( |$)|[|]{7}( |$)|=======$)'
+if ! grep -Eq "$MARKER_RE" "$FILE"; then
+  echo "changelog-union: no conflict markers in $FILE; nothing to do"
+  exit 0
+fi
+
+tmpd=$(mktemp -d "${TMPDIR:-/tmp}/changelog-union.XXXXXX") || exit 2
+trap 'rm -rf "$tmpd"' EXIT
+
+# Pass 1: union the conflict blocks. Also emits, into $tmpd/before, every line the result
+# must keep (both sides and the unconflicted text; the diff3 base is dropped on purpose).
+if ! awk -v before="$tmpd/before" '
+  BEGIN { st = 0 }  # 0 outside, 1 first side, 2 diff3 base, 3 second side
+  /^<<<<<<<( |$)/ { if (st != 0) { bad = "nested <<<<<<< at line " NR; exit 1 } st = 1; next }
+  /^[|]{7}( |$)/  { if (st != 1) { bad = "stray ||||||| at line " NR; exit 1 } st = 2; next }
+  /^=======$/     { if (st != 1 && st != 2) { bad = "stray ======= at line " NR; exit 1 } st = 3; next }
+  /^>>>>>>>( |$)/ { if (st != 3) { bad = "stray >>>>>>> at line " NR; exit 1 } st = 0; next }
+  st == 2 { next }
+  { print; print > before }
+  END {
+    if (bad != "") { print "changelog-union: malformed markers: " bad > "/dev/stderr"; exit 1 }
+    if (st != 0) { print "changelog-union: unterminated conflict block" > "/dev/stderr"; exit 1 }
+  }
+' "$FILE" > "$tmpd/union"; then
+  echo "changelog-union: $FILE left untouched" >&2
+  exit 1
+fi
+
+# Pass 2: collapse repeated `### ` headings inside `## [Unreleased]`, trim each section's
+# body, and drop blank lines between list items (a bullet line or its indented
+# continuation, followed after the blanks by another bullet).
+awk '
+  function islist(s) { return s ~ /^[-*] / || s ~ /^  / }
+  function isbullet(s) { return s ~ /^[-*] / }
+  function emit_body(h,   i, lo, hi, j, k, prev) {
+    lo = 1; hi = cnt[h]
+    while (lo <= hi && B[h, lo] ~ /^[ \t]*$/) lo++
+    while (hi >= lo && B[h, hi] ~ /^[ \t]*$/) hi--
+    prev = ""
+    for (i = lo; i <= hi; i++) {
+      if (B[h, i] ~ /^[ \t]*$/) {
+        j = i; while (j <= hi && B[h, j] ~ /^[ \t]*$/) j++
+        if (islist(prev) && isbullet(B[h, j])) { i = j - 1; continue }
+        for (k = i; k < j; k++) print B[h, k]
+        i = j - 1; continue
+      }
+      print B[h, i]; prev = B[h, i]
+    }
+  }
+  { L[++n] = $0 }
+  END {
+    u = 0
+    for (i = 1; i <= n; i++) if (L[i] ~ /^## \[Unreleased\]/) { u = i; break }
+    if (u == 0) { for (i = 1; i <= n; i++) print L[i]; exit 0 }
+    e = n + 1
+    for (i = u + 1; i <= n; i++) if (L[i] ~ /^## /) { e = i; break }
+    for (i = 1; i <= u; i++) print L[i]
+    cur = 0; nh = 0
+    for (i = u + 1; i < e; i++) {
+      if (L[i] ~ /^### /) {
+        key = L[i]; sub(/[ \t]+$/, "", key)
+        if (!(key in idx)) { idx[key] = ++nh; hd[nh] = L[i]; cnt[nh] = 0 }
+        else { B[idx[key], ++cnt[idx[key]]] = "" }  # a later occurrence joins after a gap the trim/blank rule removes
+        cur = idx[key]; continue
+      }
+      if (cur == 0) print L[i]
+      else B[cur, ++cnt[cur]] = L[i]
+    }
+    for (h = 1; h <= nh; h++) {
+      print hd[h]; print ""
+      emit_body(h)
+      print ""
+    }
+    for (i = e; i <= n; i++) print L[i]
+  }
+' "$tmpd/union" > "$tmpd/out" || { echo "changelog-union: collapse failed; $FILE left untouched" >&2; exit 1; }
+
+# ---- verification ---------------------------------------------------------------------------
+if grep -Eq "$MARKER_RE" "$tmpd/out"; then
+  echo "changelog-union: conflict markers remain; $FILE left untouched" >&2; exit 1
+fi
+content() { grep -Ev '^[[:space:]]*$' "$1" | grep -Ev '^#' | LC_ALL=C sort; }
+headings() { grep -E '^#' "$1" | sed -E 's/[[:space:]]+$//' | LC_ALL=C sort -u; }
+if ! diff <(content "$tmpd/before") <(content "$tmpd/out") > "$tmpd/content.diff"; then
+  echo "changelog-union: content lines would change (< lost, > gained); $FILE left untouched:" >&2
+  cat "$tmpd/content.diff" >&2; exit 1
+fi
+if ! diff <(headings "$tmpd/before") <(headings "$tmpd/out") > "$tmpd/headings.diff"; then
+  echo "changelog-union: headings would change; $FILE left untouched:" >&2
+  cat "$tmpd/headings.diff" >&2; exit 1
+fi
+
+cat "$tmpd/out" > "$FILE" || { echo "changelog-union: cannot write $FILE" >&2; exit 2; }
+echo "changelog-union: resolved $FILE (both sides kept)"
+exit 0

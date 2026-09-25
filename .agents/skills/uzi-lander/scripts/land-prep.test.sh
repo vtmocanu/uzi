@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Hermetic regression: land-prep must not push after the PR base moves during gates.
+# Hermetic regression: land-prep must not push after the PR base moves during gates in a way
+# that touches the branch's own files (a disjoint move is tolerated: land-prep-basemove.test.sh).
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -17,7 +18,7 @@ git init -q --bare "$ORIGIN"
 git init -q -b main "$SEED"
 git -C "$SEED" config user.name test
 git -C "$SEED" config user.email test@example.com
-printf 'base\n' > "$SEED/base.txt"
+printf 'base\none\ntwo\nthree\nfour\n' > "$SEED/base.txt"
 git -C "$SEED" add base.txt
 git -C "$SEED" commit -qm base
 git -C "$SEED" remote add origin "$ORIGIN"
@@ -27,7 +28,10 @@ git --git-dir="$ORIGIN" symbolic-ref HEAD refs/heads/main
 git -C "$SEED" switch -qc feature
 mkdir -p "$SEED/web"
 printf 'feature\n' > "$SEED/web/feature.txt"
-git -C "$SEED" add web/feature.txt
+# The branch also edits base.txt's first line, so the base move below touches a branch path
+# (overlap) while still rebasing cleanly: the refusal comes from the overlap, not a conflict.
+printf 'base-feature\none\ntwo\nthree\nfour\n' > "$SEED/base.txt"
+git -C "$SEED" add web/feature.txt base.txt
 git -C "$SEED" commit -qm feature
 FEATURE_HEAD=$(git -C "$SEED" rev-parse HEAD)
 git -C "$SEED" push -q -u origin feature
@@ -73,7 +77,8 @@ PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/uzi 99 --repo-root "$ROOT" --worktree
   || fail "initial preparation failed: $(cat "$WORK/prepared.out")"
 grep -q '^RESULT=prepared ' "$WORK/prepared.out" || fail "initial preparation did not stop before push"
 
-# Move main after preparation, matching a long gate or delayed --skip-rebase re-entry.
+# Move main after preparation, matching a long gate or delayed --skip-rebase re-entry. The
+# move touches base.txt, which the branch also changes, so it is not tolerated.
 printf 'advanced\n' >> "$SEED/base.txt"
 git -C "$SEED" add base.txt
 git -C "$SEED" commit -qm 'advance main after preparation'

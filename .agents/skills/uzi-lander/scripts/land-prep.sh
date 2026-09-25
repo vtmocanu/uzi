@@ -39,12 +39,25 @@
 #   3  gh/git error, or refusing (branch is main / not the PR's head branch)
 #   4  an mr_rework run is active on this MR — defer (scripts/wait-mrrework.sh)
 #   5  rebase conflict — the worktree is left mid-rebase: resolve, `git add`, `git rebase
-#      --continue`, then re-run with --skip-rebase
+#      --continue`, then re-run with --skip-rebase. A stop whose ONLY conflicted path is
+#      CHANGELOG.md is resolved automatically (changelog-union.sh keeps both sides) and the
+#      rebase continued, commit by commit; the CHANGELOG guard (exit 9) still runs after
 #   6  migration renumber needs hand work — the helper's report is printed and the tree is
 #      left dirty in the worktree: fix the other references, commit, re-run --skip-rebase
-#   7  a gate failed — log path printed; fix in the worktree, commit, re-run --skip-rebase
+#   7  a gate failed — log path printed; fix in the worktree, commit, re-run --skip-rebase.
+#      Before gate:web / gate:agent, `npm ci --ignore-scripts` runs when node_modules is
+#      missing or its recorded package-lock.json sha256 (node_modules/.uzi-lander-lock.sha256)
+#      is absent or stale
 #   8  the remote head or base moved since this landing started, or the worktree and the
-#      remote diverged with no landing on record — start over with --fresh
+#      remote diverged with no landing on record — start over with --fresh. A BASE move is
+#      tolerated (before the push, and at a --skip-rebase re-entry) when the base delta
+#      (`git diff --name-only <recorded> <new>`) and the branch's own files are disjoint
+#      (the migrations directory counts as one path) and `git rebase <new>` applies
+#      cleanly: the branch is rebased, the recorded base updated, and the push proceeds
+#      WITHOUT re-running the local gate. The local gate is a pre-push courtesy; merge.sh
+#      refuses anything without green required CI on the exact head, so CI stays the
+#      authoritative gate. An intersecting delta or a conflicting rebase (aborted, worktree
+#      restored) is still exit 8. The branch-head check has no such tolerance.
 #   9  the branch deletes CHANGELOG.md lines the base carries (usually a conflict resolved
 #      from a stale copy, e.g. a --fresh backup); restore them, or pass
 #      --allow-changelog-removals for a deliberate reword
@@ -61,7 +74,7 @@ while [ $# -gt 0 ]; do
     --no-rework-check) REWORK_CHECK=0; shift;;
     --allow-changelog-removals) ALLOW_CL_RM=1; shift;;
     --repo-root) ROOT="${2:?}"; shift 2;;
-    -h|--help) sed -n '2,50p' "$0"; exit 2;;
+    -h|--help) sed -n '2,65p' "$0"; exit 2;;
     -*) echo "unknown flag: $1" >&2; exit 2;;
     *) if [ -z "$REPO" ]; then REPO="$1"; elif [ -z "$PR" ]; then PR="$1"; else echo "unexpected arg: $1" >&2; exit 2; fi; shift;;
   esac
@@ -76,6 +89,7 @@ fi
 [ -n "$WT" ] || WT="${ROOT}-land-${PR}"
 
 log() { printf '%s [land-prep #%s] %s\n' "$(date +%H:%M:%S)" "$PR" "$*"; }
+HERE=$(cd "$(dirname "$0")" && pwd) || exit 3
 
 # ---- PR coordinates ---------------------------------------------------------------------
 pj=$(gh pr view "$PR" --repo "$REPO" --json state,headRefName,baseRefName,headRefOid,headRepository,headRepositoryOwner 2>/dev/null) \
@@ -178,6 +192,41 @@ if [ "$FRESH" -eq 1 ]; then
   fi
   git reset -q --hard "origin/$BRANCH"; rm -f "$LEASE_FILE" "$BASE_FILE"; log "--fresh: worktree reset to origin/$BRANCH (${remote_now:0:8})"
 fi
+rebase_in_progress() {
+  [ -d "$(git rev-parse --git-path rebase-merge)" ] || [ -d "$(git rev-parse --git-path rebase-apply)" ]
+}
+delta_paths() {
+  printf '%s\n' "$1" | sed -e '/^$/d' -e 's|^api/internal/store/migrations/.*|api/internal/store/migrations/|' | LC_ALL=C sort -u
+}
+# try_base_move OLD NEW WHAT: origin/$BASE moved OLD -> NEW since this landing started.
+# Rebase onto NEW and re-record the base only when the base delta and the branch's own files
+# are disjoint and the rebase applies cleanly; otherwise leave the worktree as it was and
+# fail. The migrations directory counts as ONE path: a disjoint delta can still take the
+# branch's migration number. WHAT names what follows the rebase, for the log line.
+try_base_move() {
+  local old="$1" new="$2" what="$3" delta mine both pre n
+  rebase_in_progress && return 1
+  [ -z "$(git status --porcelain)" ] || { log "worktree is dirty; not rebasing onto the moved base"; return 1; }
+  delta=$(git diff --no-renames --name-only "$old" "$new") || return 1
+  mine=$(git diff --no-renames --name-only "$new...HEAD") || return 1
+  both=$(LC_ALL=C comm -12 <(delta_paths "$delta") <(delta_paths "$mine"))
+  if [ -n "$both" ]; then
+    log "base delta ${old:0:8}..${new:0:8} touches the branch's own path(s): $(printf '%s' "$both" | tr '\n' ' ')"
+    return 1
+  fi
+  pre=$(git rev-parse HEAD)
+  if ! git rebase "$new" --quiet >/dev/null 2>&1; then
+    git rebase --abort >/dev/null 2>&1
+    [ "$(git rev-parse HEAD)" = "$pre" ] || git reset -q --hard "$pre"
+    log "rebase onto the moved base ${new:0:8} conflicts; aborted, worktree back at ${pre:0:8}"
+    return 1
+  fi
+  BASE_SHA="$new"
+  printf '%s' "$BASE_SHA" > "$BASE_FILE"
+  n=$(printf '%s\n' "$delta" | sed '/^$/d' | wc -l | tr -d ' ')
+  log "base moved ${old:0:8} -> ${new:0:8}; delta disjoint from the branch ($n files); $what"
+  return 0
+}
 if [ -f "$LEASE_FILE" ]; then
   LEASE=$(cat "$LEASE_FILE")
   [ -f "$BASE_FILE" ] || { log "landing has no recorded base; start over with --fresh"; echo "RESULT=base_unknown"; exit 8; }
@@ -186,7 +235,8 @@ if [ -f "$LEASE_FILE" ]; then
     log "remote $BRANCH moved ${LEASE:0:8} -> ${remote_now:0:8} since this landing started; start over with --fresh (resets the worktree)"
     echo "RESULT=remote_moved"; exit 8
   fi
-  if [ "$base_now" != "$BASE_SHA" ]; then
+  if [ "$base_now" != "$BASE_SHA" ] && ! { [ "$SKIP_REBASE" -eq 1 ] \
+      && try_base_move "$BASE_SHA" "$base_now" "rebased; the gates below run on the new head"; }; then
     log "remote $BASE moved ${BASE_SHA:0:8} -> ${base_now:0:8} since this landing started; start over with --fresh"
     echo "RESULT=base_moved"; exit 8
   fi
@@ -212,7 +262,25 @@ fi
 
 # ---- rebase -----------------------------------------------------------------------------
 if [ "$SKIP_REBASE" -eq 0 ]; then
+  rebased=0
   if git rebase "origin/$BASE" --quiet; then
+    rebased=1
+  else
+    # Nearly every PR adds a CHANGELOG.md bullet under the same heading, so a stop whose
+    # ONLY conflicted path is CHANGELOG.md is resolved as a union and the rebase continued;
+    # a later commit may stop again, hence the loop. Anything else stops as exit 5.
+    while rebase_in_progress; do
+      conflicted=$(git diff --name-only --diff-filter=U | LC_ALL=C sort -u)
+      [ "$conflicted" = "CHANGELOG.md" ] || break
+      if ! cu_out=$(bash "$HERE/changelog-union.sh" CHANGELOG.md 2>&1); then
+        printf '%s\n' "$cu_out"; break
+      fi
+      git add CHANGELOG.md || break
+      log "auto-resolved the CHANGELOG.md conflict at $(git rev-parse --short REBASE_HEAD 2>/dev/null || echo '?') (union of both sides)"
+      if GIT_EDITOR=true git rebase --continue >/dev/null 2>&1; then rebased=1; break; fi
+    done
+  fi
+  if [ "$rebased" -eq 1 ]; then
     log "rebased onto origin/$BASE ($(git rev-list --count "origin/$BASE..HEAD") commits)"
   else
     log "REBASE CONFLICT — worktree left mid-rebase in $WT:"
@@ -224,7 +292,7 @@ else
   # Resolve the state dirs through git: in a worktree `.git` is a FILE, so `.git/rebase-merge`
   # never exists there. REBASE_HEAD is not a signal: git can leave it behind after a rebase
   # that completed (seen on #1574, 2026-09-23), which blocked a finished landing.
-  if [ -d "$(git rev-parse --git-path rebase-merge)" ] || [ -d "$(git rev-parse --git-path rebase-apply)" ]; then
+  if rebase_in_progress; then
     echo "a rebase is still in progress in $WT; finish it (git rebase --continue) first" >&2; exit 5
   fi
   log "skip-rebase: continuing from $(git rev-parse --short HEAD)"
@@ -287,6 +355,9 @@ if [ "$ALLOW_CL_RM" -eq 0 ]; then
 fi
 
 # ---- gates --------------------------------------------------------------------------------
+lock_sha() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | awk '{print $1}'
+}
 if [ "$GATE" != "none" ]; then
   if [ "$GATE" = "auto" ]; then
     changed=$(git diff --name-only "origin/$BASE...HEAD")
@@ -304,16 +375,27 @@ if [ "$GATE" != "none" ]; then
   # A fresh sibling worktree has no node_modules, and deps-check then fails the gate as an
   # instrument failure. Install from the lockfile, always with --ignore-scripts (agent/'s
   # agent-browser postinstall rewrites a host-wide binary; deps-check-gate.sh).
+  # A REUSED worktree keeps node_modules across a base move that bumped the lockfile, which
+  # deps-check fails the same way: reinstall whenever the sha256 recorded at the last install
+  # differs from the current package-lock.json, or none was recorded (fail toward a reinstall).
   for g in "${GATES[@]}"; do
     case "$g" in gate:web) pkg=web;; gate:agent) pkg=agent;; *) continue;; esac
-    if [ -f "$pkg/package-lock.json" ] && [ ! -d "$pkg/node_modules" ]; then
-      npmlog=$(mktemp "${TMPDIR:-/tmp}/land-prep-${PR}-npm-ci-${pkg}.XXXXXX")
-      log "installing $pkg/ dependencies (npm ci --ignore-scripts) -> $npmlog"
-      if ! (cd "$pkg" && npm ci --ignore-scripts --no-audit --no-fund) > "$npmlog" 2>&1; then
-        tail -n 40 "$npmlog"
-        echo "RESULT=gate_failed GATE=$g LOG=$npmlog WORKTREE=$WT"; exit 7
-      fi
+    [ -f "$pkg/package-lock.json" ] || continue
+    want=$(lock_sha "$pkg/package-lock.json")
+    [ -n "$want" ] || { echo "cannot hash $pkg/package-lock.json (sha256sum/shasum)" >&2; exit 3; }
+    stamp="$pkg/node_modules/.uzi-lander-lock.sha256"
+    if [ ! -d "$pkg/node_modules" ]; then why="node_modules missing"
+    elif [ ! -f "$stamp" ]; then why="no recorded lockfile hash"
+    elif [ "$(cat "$stamp")" != "$want" ]; then why="package-lock.json changed since the last install"
+    else continue
     fi
+    npmlog=$(mktemp "${TMPDIR:-/tmp}/land-prep-${PR}-npm-ci-${pkg}.XXXXXX")
+    log "installing $pkg/ dependencies ($why; npm ci --ignore-scripts) -> $npmlog"
+    if ! (cd "$pkg" && npm ci --ignore-scripts --no-audit --no-fund) > "$npmlog" 2>&1; then
+      tail -n 40 "$npmlog"
+      echo "RESULT=gate_failed GATE=$g LOG=$npmlog WORKTREE=$WT"; exit 7
+    fi
+    printf '%s\n' "$want" > "$stamp" || { echo "cannot record $stamp" >&2; exit 3; }
   done
   for g in "${GATES[@]}"; do
     logf=$(mktemp "${TMPDIR:-/tmp}/land-prep-${PR}-${g//:/-}.XXXXXX")
@@ -348,9 +430,17 @@ fi
 base_remote_now=$(git ls-remote origin "refs/heads/$BASE" | cut -f1)
 [ -n "$base_remote_now" ] || { echo "cannot read the remote head of $BASE" >&2; exit 3; }
 if [ "$base_remote_now" != "$BASE_SHA" ]; then
-  log "remote $BASE moved ${BASE_SHA:0:8} -> ${base_remote_now:0:8} during preparation; refusing stale-base push"
-  echo "RESULT=base_moved"
-  exit 8
+  moved=0
+  if git fetch origin "$BASE" --quiet && base_fetched=$(git rev-parse "origin/$BASE") \
+      && try_base_move "$BASE_SHA" "$base_fetched" "rebased without re-gating: CI on the pushed head is the authoritative gate"; then
+    moved=1
+    NEW_HEAD=$(git rev-parse HEAD)
+  fi
+  if [ "$moved" -eq 0 ]; then
+    log "remote $BASE moved ${BASE_SHA:0:8} -> ${base_remote_now:0:8} during preparation; refusing stale-base push"
+    echo "RESULT=base_moved"
+    exit 8
+  fi
 fi
 if git push --force-with-lease="${BRANCH}:${LEASE}" origin "HEAD:refs/heads/${BRANCH}" --quiet; then
   rm -f "$LEASE_FILE" "$BASE_FILE"
