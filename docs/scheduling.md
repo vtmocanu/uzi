@@ -303,7 +303,10 @@ exceed `max_issues` once backfill walks past a skip), which ones
   the schedule advances normally.
 - `already_running` — an active run already exists for that issue, or a
   CI-fix run (or, once its MR has closed, an MR-rework run) is working its
-  branch (or, for the schedule itself, a dedup at fire time).
+  branch (or, for the schedule itself, a dedup at fire time). For a
+  one-time issue schedule, a CI-fix or MR-rework run on the branch holds
+  the fire instead: no run starts and nothing is recorded, the schedule
+  stays active and due, and it fires once that run releases the branch.
 - `description_too_large` — the composed run instruction (issue body
   plus any [guidance](#guidance)) exceeds the size limit.
 - `fetch_failed` — a transient forge or database error while checking

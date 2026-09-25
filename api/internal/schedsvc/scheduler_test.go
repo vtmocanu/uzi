@@ -1171,6 +1171,39 @@ func TestTickOnceIssueBranchInUseHoldsThenFires(t *testing.T) {
 			t.Fatalf("recurring advance status = %q, want active", h.st.advanceCalls[0].Status)
 		}
 	})
+
+	t.Run("once_sweep_still_skips_already_running", func(t *testing.T) {
+		// The hold is scoped to Target=="issue": fireSweep folds any createIssueRun error
+		// into fetch_failed, so a once sweep must keep the benign already_running skip.
+		h := newHarness()
+		s := h.sweepSchedule(pgtype.Int4{})
+		s.Timing = "once"
+		s.CronExpr = pgtype.Text{} // once carries run_at, not cron
+		h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 96}}
+		h.st.due = []store.RunSchedule{s}
+		h.runs.err = workersvc.ErrBranchInUse
+
+		h.sched.Boot(context.Background())
+
+		if len(h.st.advanceCalls) != 1 {
+			t.Fatalf("once sweep branch-in-use skip must advance: advance calls = %d, want 1", len(h.st.advanceCalls))
+		}
+		adv := h.st.advanceCalls[0]
+		if adv.Status != "fired" {
+			t.Fatalf("once sweep advance status = %q, want fired", adv.Status)
+		}
+		var lf struct {
+			Skips []struct {
+				Reason string `json:"reason"`
+			} `json:"skips"`
+		}
+		if err := json.Unmarshal(adv.LastFire, &lf); err != nil {
+			t.Fatalf("decode persisted last_fire: %v (raw %s)", err, adv.LastFire)
+		}
+		if len(lf.Skips) != 1 || lf.Skips[0].Reason != string(SkipAlreadyRunning) {
+			t.Fatalf("last_fire skips = %+v, want one already_running (not fetch_failed)", lf.Skips)
+		}
+	})
 }
 
 func TestTickDedupSkipStillAdvances(t *testing.T) {

@@ -373,7 +373,8 @@ func (e *Scheduler) RunNow(ctx context.Context, sched store.RunSchedule) (FireOu
 	out, err := e.fireOne(ctx, sched)
 	// Issue #1626: createIssueRun returns ErrBranchInUse as an error for a once issue
 	// schedule so the tick path holds the row. RunNow never advances, so there is nothing
-	// to hold: answer with the benign already_running skip, as before, instead of a 502.
+	// to hold: answer with the benign already_running skip instead of a 502. The skip
+	// carries no title or web URL, like the active-run pre-check skip in fireIssue.
 	if errors.Is(err, workersvc.ErrBranchInUse) && sched.Target == "issue" {
 		iid := sched.IssueIid.Int64
 		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iid, Reason: SkipAlreadyRunning}}}, nil
@@ -825,8 +826,10 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 	// Issue #1626 exception: a ONE-TIME issue schedule refused with ErrBranchInUse (a
 	// ci_fix / mr_rework run holds agent/issue-<iid>) is transient, not a benign skip —
 	// advancing would mark the row fired and the issue run would never start. Returned as
-	// an error it takes fireOne's transient arm (not advanced, retried next tick), like the
-	// paused-once hold in process(). Scoped to Target=="issue": fireSweep also calls
+	// an error it takes advance's transient arm: not advanced, logged as a "transient fire
+	// error, will retry" warning, and the issue re-fetched every tick until the branch
+	// frees (unlike the paused-once hold in process(), which returns before firing and
+	// never reaches advance). Scoped to Target=="issue": fireSweep also calls
 	// createIssueRun and turns any error into fetch_failed, so a once sweep keeps the
 	// benign already_running skip.
 	if errors.Is(err, workersvc.ErrBranchInUse) && sched.Target == "issue" && sched.Timing == "once" {
