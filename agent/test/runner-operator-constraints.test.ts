@@ -57,14 +57,15 @@ describe("operator constraints survive a re-claim (issue #1660)", () => {
     api.setInputs(claim.run_id, [{ id: 7, kind: "follow_up", body: rule }]);
 
     // Claim 1: wait until the live drain consumed the follow-up, then end the flight.
-    let claim1Saw: readonly string[] = [];
+    let claim1Saw: unknown = [];
     const claim1: Executor = {
       async run(ctx) {
         const deadline = Date.now() + 5_000;
-        while (!(ctx.operatorConstraints?.() ?? []).length && Date.now() < deadline) {
+        const seen = () => ctx.operatorConstraints?.() ?? [];
+        while (!(Array.isArray(seen()) && seen().length) && Date.now() < deadline) {
           await new Promise((r) => setTimeout(r, 5));
         }
-        claim1Saw = ctx.operatorConstraints?.() ?? [];
+        claim1Saw = seen();
         throw new Error("claim 1 ends here");
       },
     };

@@ -968,3 +968,107 @@ describe("SteeringChannel.markOperatorConstraintsUnavailable (issue #1660)", () 
     }
   });
 });
+
+// Issue #1660 (PR #1667 review): /inputs is consume-on-read, so a poll whose reply is lost after
+// the server committed the consume drops that follow-up for the rest of the claim. After ANY poll
+// error the channel reports "reconciling" (the Agent guard denies dispatches), and the next poll
+// first re-reads /follow-ups and merges by id, delivering a recovered follow-up to the lead once.
+describe("SteeringChannel reconciles after a failed poll (issue #1660)", () => {
+  const RULE = "never execute a string containing kill; screen strings only";
+  const dispatchWith = async (ch: SteeringChannel) => {
+    const hook = buildAgentGuardHook(["reviewer"], nullLogger(), () => ch.operatorConstraints());
+    return (await hook({
+      session_id: "s",
+      transcript_path: "/t",
+      cwd: "/w",
+      hook_event_name: "PreToolUse",
+      tool_name: NESTED_AGENT_TOOL,
+      tool_input: { subagent_type: "reviewer", prompt: "review HEAD" },
+      tool_use_id: "tu",
+    } as HookInput)) as {
+      hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string; updatedInput?: { prompt?: string } };
+    };
+  };
+  const until = async (cond: () => boolean, ms = 2_000): Promise<void> => {
+    const deadline = Date.now() + ms;
+    while (!cond() && Date.now() < deadline) await tick(2);
+    assert.ok(cond(), "condition reached");
+  };
+
+  it("denies while pending, then recovers the lost follow-up for dispatches and the lead, once", async () => {
+    // Poll 1: live follow-up 3 arrives. Poll 2: the server consumes 7 but the reply is lost.
+    // The /follow-ups read is held until the test releases it, to observe the pending window.
+    let polls = 0;
+    let reads = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const client = {
+      getInputs: async () => {
+        polls++;
+        if (polls === 1) return { inputs: [{ id: 3, kind: "follow_up", body: "live one" }] };
+        if (polls === 2) throw new Error("socket hang up after commit");
+        return { inputs: [] };
+      },
+      getConsumedFollowUps: async () => {
+        reads++;
+        await gate;
+        return [
+          { id: 3, kind: "follow_up", body: "live one" },
+          { id: 7, kind: "follow_up", body: RULE },
+        ];
+      },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      await until(() => reads === 1);
+      const pending = await dispatchWith(ch);
+      assert.strictEqual(pending.hookSpecificOutput?.permissionDecision, "deny", "denied while reconciling");
+      assert.match(pending.hookSpecificOutput?.permissionDecisionReason ?? "", /operator constraints are being reconciled; retry/);
+
+      release();
+      await until(() => Array.isArray(ch.operatorConstraints()));
+      assert.deepStrictEqual(ch.operatorConstraints(), ["live one", RULE], "merged by id, no duplicate");
+      const after = await dispatchWith(ch);
+      assert.ok(after.hookSpecificOutput?.updatedInput?.prompt?.includes(RULE), "a later dispatch carries it");
+
+      // The lead gets the live one and the recovered one, each exactly once.
+      await tick(20);
+      assert.strictEqual(ch.pullFollowUp(), "live one");
+      assert.strictEqual(ch.pullFollowUp(), RULE);
+      assert.strictEqual(ch.pullFollowUp(), undefined);
+    } finally {
+      release();
+      await ch.stop();
+    }
+  });
+
+  it("stays denied while the reconcile read itself fails, and does not re-deliver on a second reconcile", async () => {
+    let polls = 0;
+    let reads = 0;
+    const client = {
+      getInputs: async () => {
+        polls++;
+        if (polls === 1 || polls === 3) throw new Error("lost reply");
+        return { inputs: [] };
+      },
+      getConsumedFollowUps: async () => {
+        reads++;
+        if (reads === 1) throw new Error("follow-ups read failed");
+        return [{ id: 7, kind: "follow_up", body: RULE }];
+      },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      await until(() => reads === 1);
+      assert.strictEqual(ch.operatorConstraints(), "reconciling", "a failed reconcile read keeps it pending");
+      await until(() => reads >= 3 && Array.isArray(ch.operatorConstraints()));
+      assert.deepStrictEqual(ch.operatorConstraints(), [RULE]);
+      assert.strictEqual(ch.pullFollowUp(), RULE);
+      assert.strictEqual(ch.pullFollowUp(), undefined, "the second reconcile does not re-deliver");
+    } finally {
+      await ch.stop();
+    }
+  });
+});

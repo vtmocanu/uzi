@@ -214,6 +214,8 @@ const REASON_CONSTRAINTS_UNATTACHABLE =
   "denied by guardrail: this dispatch has no text prompt to carry the run's operator constraints";
 const REASON_CONSTRAINTS_UNAVAILABLE =
   "denied by guardrail: operator constraints could not be loaded; retry the run";
+const REASON_CONSTRAINTS_RECONCILING =
+  "denied by guardrail: operator constraints are being reconciled; retry";
 const REASON_CONSTRAINTS_TOO_LARGE =
   "denied by guardrail: the run's operator constraints are too large to attach to a subagent; shorten or consolidate them";
 
@@ -1259,7 +1261,8 @@ function subagentTypeOf(toolInput: unknown): string | undefined {
  *     not be relied on to relay. Rendered by buildOperatorConstraintsBlock (nonce-fenced,
  *     size-capped); an already-synchronous call is rewritten too when there is a block.
  *     It DENIES rather than dispatch without them: when they could not be loaded this claim
- *     (the provider returns null), when the block exceeds OPERATOR_CONSTRAINTS_MAX_CHARS, or
+ *     (the provider returns null), while a failed poll is being reconciled ("reconciling"),
+ *     when the block exceeds OPERATOR_CONSTRAINTS_MAX_CHARS, or
  *     when the call's `prompt` is not a string.
  *
  * The lead keeps the Agent tool to delegate to the allowed roles; every subagent
@@ -1269,7 +1272,7 @@ function subagentTypeOf(toolInput: unknown): string | undefined {
 export function buildAgentGuardHook(
   allowed: Iterable<string>,
   log: Logger,
-  operatorConstraints: () => readonly string[] | null = () => [],
+  operatorConstraints: () => readonly string[] | null | "reconciling" = () => [],
 ): (input: HookInput) => Promise<HookJSONOutput> {
   const allowSet = new Set(allowed);
   return async (input: HookInput): Promise<HookJSONOutput> => {
@@ -1294,11 +1297,13 @@ export function buildAgentGuardHook(
     // Fail closed on every way the constraints could go missing: not loaded this claim (null),
     // no text prompt to carry them, or a block over the hard ceiling. Never dispatch without.
     const loaded = operatorConstraints();
-    const constraints = loaded === null ? "" : buildOperatorConstraintsBlock(loaded);
+    const constraints = loaded === null || loaded === "reconciling" ? "" : buildOperatorConstraintsBlock(loaded);
     const refusal =
       loaded === null
         ? REASON_CONSTRAINTS_UNAVAILABLE
-        : constraints.length > OPERATOR_CONSTRAINTS_MAX_CHARS
+        : loaded === "reconciling"
+          ? REASON_CONSTRAINTS_RECONCILING
+          : constraints.length > OPERATOR_CONSTRAINTS_MAX_CHARS
           ? REASON_CONSTRAINTS_TOO_LARGE
           : constraints !== "" && typeof prompt !== "string"
             ? REASON_CONSTRAINTS_UNATTACHABLE

@@ -362,9 +362,10 @@ export interface RunContext {
   pullSafetySteer?(): string | undefined;
   /** Issue #1660: every operator follow-up received so far (steering.operatorConstraints), read
    *  by the Agent guard at each dispatch and attached to the subagent's prompt, or null when the
-   *  earlier ones could not be loaded this claim (the guard then denies). Unlike pullFollowUp it
-   *  consumes nothing. Optional; absent ⇒ no constraints. */
-  operatorConstraints?(): readonly string[] | null;
+   *  earlier ones could not be loaded this claim, or "reconciling" while a failed poll is being
+   *  reconciled (the guard denies both). Unlike pullFollowUp it consumes nothing. Optional;
+   *  absent ⇒ no constraints. */
+  operatorConstraints?(): readonly string[] | null | "reconciling";
   /**
    * M4: report a running/iteration heartbeat (server persists via GREATEST).
    *

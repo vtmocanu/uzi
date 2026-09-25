@@ -176,6 +176,11 @@ export class SteeringChannel {
    *  constraints are then unknown, so operatorConstraints reports null and the Agent guard
    *  denies every dispatch for this claim. */
   private operatorConstraintsLost = false;
+  /** Issue #1660: set by ANY /inputs poll error. /inputs is consume-on-read, so a reply lost
+   *  after the server committed the consume drops its follow-ups; until the next poll re-reads
+   *  /follow-ups and merges them (reconcileFollowUps), operatorConstraints reports "reconciling"
+   *  and the Agent guard denies dispatches. */
+  private reconcilePending = false;
   /** issue #559 M2: the highest `follow_up` input id this channel has already handed to the
    *  executor — via pullFollowUp or awaitFollowUp/serviceFollowUp. This is the wake-guard
    *  watermark the runner reports at the interactive park (open_followup_id). Buffering a
@@ -572,9 +577,34 @@ export class SteeringChannel {
   /** Issue #1660: the run's operator constraints, every follow-up received so far in arrival
    *  order, or null when the earlier ones could not be loaded this claim. A copy, so a caller
    *  cannot rewrite the record. */
-  operatorConstraints(): readonly string[] | null {
+  operatorConstraints(): readonly string[] | null | "reconciling" {
     if (this.operatorConstraintsLost) return null;
+    if (this.reconcilePending) return "reconciling";
     return this.receivedFollowUps.map((f) => f.body);
+  }
+
+  /** Issue #1660: merge the run's consumed follow-ups (GET /follow-ups, id order) after a failed
+   *  poll. A row not already known (seeded or received live) is one a lost poll reply dropped:
+   *  it joins the constraints AND is queued for the lead once, since the lead never got it
+   *  either. Atomic like seedOperatorConstraints: state changes only after the batch is built. */
+  private reconcileFollowUps(inputs: readonly UserInput[]): void {
+    const known = new Set([...this.seededFollowUpIds, ...this.receivedFollowUps.map((f) => f.id)]);
+    const recovered: { id: number; body: string }[] = [];
+    for (const input of inputs) {
+      const body = input.body?.trim();
+      if (input.kind !== "follow_up" || !body || known.has(input.id)) continue;
+      known.add(input.id);
+      recovered.push({ id: input.id, body });
+    }
+    if (recovered.length === 0) return;
+    this.receivedFollowUps.push(...recovered);
+    this.receivedFollowUps.sort((a, b) => a.id - b.id);
+    for (const f of recovered) this.followUps.push({ id: f.id, body: f.body });
+    this.followUps.sort((a, b) => a.id - b.id);
+    this.log.warn("steering: recovered follow-ups a failed poll had consumed", {
+      run_id: this.runId,
+      count: recovered.length,
+    });
   }
 
   /** Issue #1660: the claim-time reload failed; report the constraints unavailable (null). */
@@ -938,6 +968,18 @@ export class SteeringChannel {
 
   private async pollLoop(): Promise<void> {
     while (!this.stopped) {
+      // Issue #1660: a previous poll failed, so its reply may have carried follow-ups the server
+      // already consumed. Re-read and merge them first. A failed read only keeps the flag set
+      // (dispatches stay denied): it must never stop the /inputs poll below, which carries
+      // cancel, stop and the plan verdicts.
+      if (this.reconcilePending) {
+        try {
+          this.reconcileFollowUps(await this.client.getConsumedFollowUps(this.runId));
+          this.reconcilePending = false;
+        } catch (err) {
+          this.log.warn("steering: follow-up reconcile failed", { run_id: this.runId, error: errMessage(err) });
+        }
+      }
       try {
         const { inputs, credentialSwitch } = await this.client.getInputs(this.runId);
         for (const inp of inputs)
@@ -959,6 +1001,7 @@ export class SteeringChannel {
           run_id: this.runId,
           error: errMessage(err),
         });
+        this.reconcilePending = true;
       }
       // Service the parked waiters on EVERY tick, OUTSIDE the try above, so a getInputs
       // failure cannot starve them (PRD #517 M5). serviceGate/serviceAnswer/serviceFollowUp
