@@ -62,3 +62,16 @@ describe("buildCodexDynamicTools: worker-owned app-server callback surface", () 
     assert.deepEqual([...input.allowedTools], before);
   });
 });
+
+describe("buildCodexDynamicTools: report_progress milestone attribution (issue #1674)", () => {
+  it("accepts milestones_agents entries of {id, agent, agent_label?}", () => {
+    const spec = buildCodexDynamicTools(grants(["report_progress"])).find((s) => s.name === "report_progress");
+    const props = spec?.inputSchema.properties as Record<string, { type?: string; items?: Record<string, unknown> }>;
+    assert.equal(props["milestones_agents"]?.type, "array");
+    const item = props["milestones_agents"]!.items!;
+    assert.deepEqual(Object.keys(item["properties"] as object).sort(), ["agent", "agent_label", "id"]);
+    assert.deepEqual(item["required"], ["id", "agent"]);
+    assert.equal(item["additionalProperties"], false);
+    assert.equal(spec?.inputSchema.additionalProperties, false, "the top-level schema stays closed");
+  });
+});
