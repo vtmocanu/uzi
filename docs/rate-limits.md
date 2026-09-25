@@ -32,10 +32,11 @@ token, you see one meter and nothing has changed.
 In the sidebar and on the Settings card every token is named by its own label,
 even when you hold only one, so adding a second token never renames the first.
 
-The sidebar and the Settings card stay hidden until you've saved a token.
-While uzi is waiting on a token's first reading, that token stays out of the
-sidebar (no empty bars to puzzle over), but the Settings card shows a "No reading yet" placeholder
-with two greyed bars — a reading appears within a few minutes of saving.
+The Settings card stays hidden until you've saved a token. While uzi is
+waiting on a token's first reading, that token stays out of the sidebar (no
+empty bars to puzzle over), but the Settings card shows a "No reading yet"
+placeholder with two greyed bars — a reading appears within a few minutes of
+saving.
 A token added later shows that placeholder until its first poll, while your
 other meters keep reading normally.
 
