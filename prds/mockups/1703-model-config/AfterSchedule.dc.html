@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>After: Schedule modal</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#080a0f}
+.r{font-family:'IBM Plex Sans',system-ui,sans-serif;color:#e4e8f0;background:#05070b;box-sizing:border-box}
+.xs{font-size:11.5px;color:#8a95a9;line-height:1.5;margin:0}
+.lbl{font-size:13px;font-weight:500;color:#aab3c4}
+.sel{display:flex;justify-content:space-between;align-items:center;gap:8px;height:36px;padding:0 12px;border:1px solid #3a4256;border-radius:8px;background:#171b26;font-family:inherit;font-size:13.5px;color:#e4e8f0;text-align:left;width:100%;box-sizing:border-box}
+.btn{display:inline-flex;align-items:center;height:34px;padding:0 14px;border-radius:8px;background:#fb923c;color:#1c0e03;font-family:inherit;font-weight:600;font-size:13px;border:0}
+.btn2{display:inline-flex;align-items:center;height:34px;padding:0 14px;border-radius:8px;background:#171b26;color:#e4e8f0;font-family:inherit;font-weight:500;font-size:13px;border:1px solid #3a4256}
+.dim{opacity:.4}
+.tog{width:34px;height:20px;border-radius:10px;background:#3a4256;position:relative;flex-shrink:0}
+.knob{position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:7px;background:#e4e8f0}
+.f{display:flex;flex-direction:column;gap:6px}
+.new{display:inline-flex;align-items:center;height:18px;padding:0 7px;border-radius:9px;background:rgba(52,211,153,.14);color:#34d399;font-size:10.5px;font-weight:700;letter-spacing:.05em}
+.pv{display:grid;grid-template-columns:90px 150px minmax(0,1fr);row-gap:8px;column-gap:12px;margin:0;font-size:12.5px;align-items:baseline}
+.pv dt{color:#8a95a9}
+.pv dd{margin:0;font-family:'IBM Plex Mono',monospace;color:#e4e8f0}
+dd.pvs{margin:0;color:#aab3c4;font-family:'IBM Plex Sans',sans-serif}
+a{color:#fdba74;text-decoration:none}a:hover{color:#fed7aa}
+</style>
+</helmet>
+<div class="r" style="width: 720px; height: 1100px; display: flex; flex-direction: column">
+<div style="height: 40px; background: #0d2a20; color: #6ee7b7; display: flex; align-items: center; padding: 0 24px; font-size: 12px; font-weight: 600; letter-spacing: .08em">AFTER · OPTION B · New schedule · Claude (both harnesses usable)</div>
+<div style="margin: 28px; background: #0f121a; border: 1px solid #272d3c; border-radius: 14px; display: flex; flex-direction: column">
+<div style="padding: 18px 22px; border-bottom: 1px solid #272d3c; display: flex; justify-content: space-between; align-items: center"><span style="font-size: 17px; font-weight: 600">New schedule</span><span style="color: #7a859a; font-size: 18px">×</span></div>
+<div style="padding: 20px 22px; display: flex; flex-direction: column; gap: 18px">
+<div class="dim" style="display: flex; flex-direction: column; gap: 12px">
+<div class="f"><span class="lbl">Repo</span><button type="button" class="sel"><span>acme/web-app</span></button></div>
+<div class="f"><span class="lbl">Target · Timing</span><button type="button" class="sel"><span>Prompt · Weekly, Monday 03:00</span></button></div>
+</div>
+
+<fieldset style="margin: 0; border: 1px solid #34d399; border-radius: 12px; padding: 16px 18px; display: flex; flex-direction: column; gap: 14px">
+<legend style="padding: 0 8px; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px">Where it runs: harness, model &amp; token <span class="new">GROUPED</span></legend>
+<p class="xs" style="margin-top: -4px">Leave a field on Default to follow <a href="#">Settings → Models</a>. Each field says when it is decided.</p>
+<div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px">
+<div class="f"><span class="lbl">Harness</span><button type="button" class="sel"><span>Default · Claude (automatic)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><p class="xs">Fixed when the schedule fires.</p></div>
+<div class="f"><span class="lbl">Model</span><button type="button" class="sel"><span>Default · opus (your Claude default)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><p class="xs">A pin is fixed when it fires; Default is read when a worker picks the run up.</p></div>
+</div>
+<div class="f"><span class="lbl">Anthropic token</span><button type="button" class="sel"><span>Default · worker's token (worker binding)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><p class="xs">Runs fired by this schedule spend this token.</p></div>
+<div style="display: flex; gap: 12px; align-items: flex-start"><span class="tog"><span class="knob"></span></span><div><div style="font-size: 13px">Use the run's resolved model for subagents too</div><p class="xs">On: overrides every subagent's own pin. Off: subagents with their own pin keep it (e.g. researcher → sonnet); the rest follow the lead.</p></div></div>
+
+<div style="border-top: 1px solid #1f2431; padding-top: 14px; display: flex; flex-direction: column; gap: 10px">
+<div style="display: flex; justify-content: space-between; align-items: baseline"><span style="font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: #6ee7b7">If fired and claimed now</span><span class="xs">updates as you change the picks above</span></div>
+<dl class="pv">
+<dt>Harness</dt><dd>Claude</dd><dd class="pvs">predicted · automatic, both harnesses usable</dd>
+<dt>Model</dt><dd>opus</dd><dd class="pvs">predicted · your Claude default</dd>
+<dt>Effort</dt><dd>xhigh</dd><dd class="pvs">predicted · your Claude effort, set in <a href="#">Settings → Models</a> (schedules can't change it)</dd>
+<dt>Token</dt><dd>worker's token</dd><dd class="pvs">worker binding</dd>
+<dt>Subagents</dt><dd>own pins, else lead</dd><dd class="pvs">researcher → sonnet, the rest → opus</dd>
+</dl>
+<p class="xs">"Pinned" values are fixed when the schedule fires. "Predicted" values are read when a worker picks the run up, so they follow later changes to your settings or credentials.</p>
+</div>
+</fieldset>
+
+<div class="dim" style="display: flex; flex-direction: column; gap: 10px">
+<span style="font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: #949eb0">Run options</span>
+<div style="display: flex; gap: 12px; align-items: center"><span class="tog"><span class="knob"></span></span><span style="font-size: 13px">Wait on usage limit</span></div>
+<div class="f"><span class="lbl">Auto-rework MR review comments</span><button type="button" class="sel"><span>Default · on (your setting)</span></button></div>
+</div>
+</div>
+<div style="padding: 16px 22px; border-top: 1px solid #272d3c; display: flex; justify-content: flex-end; gap: 10px"><button type="button" class="btn2">Cancel</button><button type="button" class="btn">Create schedule</button></div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":720,"height":1100}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

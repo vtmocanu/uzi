@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Option A: fix in place</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#080a0f}
+.r{font-family:'IBM Plex Sans',system-ui,sans-serif;color:#e4e8f0;background:#080a0f;box-sizing:border-box}
+.sel{display:flex;justify-content:space-between;align-items:center;gap:8px;height:36px;padding:0 12px;border:1px solid #3a4256;border-radius:8px;background:#171b26;font-family:inherit;font-size:13.5px;color:#e4e8f0;text-align:left;width:100%;box-sizing:border-box}
+.bad{border-color:rgba(251,113,133,.6)}
+.good{border-color:rgba(52,211,153,.7)}
+.row{display:grid;grid-template-columns:260px minmax(0,1fr) 30px minmax(0,1fr);gap:16px;align-items:center;padding:12px 0;border-top:1px solid #1f2431}
+.ctx{font-size:13.5px;font-weight:500}
+.th{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#7a859a}
+.fx{display:grid;grid-template-columns:260px minmax(0,1fr) 30px minmax(0,1fr);gap:16px;padding:11px 0;border-top:1px solid #1f2431;font-size:13px;align-items:start;line-height:1.5}
+.old{color:#fda4af}
+.nw{color:#a7f3d0}
+.mono{font-family:'IBM Plex Mono',monospace}
+</style>
+</helmet>
+<div class="r" style="width: 1280px; height: 900px; display: flex; flex-direction: column">
+<div style="height: 40px; background: #16233a; color: #93c5fd; display: flex; align-items: center; padding: 0 24px; font-size: 12px; font-weight: 600; letter-spacing: .08em">OPTION A · fix in place, no layout change · also Phase 1 of Option B</div>
+<div style="padding: 32px 56px; display: flex; flex-direction: column; gap: 28px">
+<div style="background: #0f121a; border: 1px solid #272d3c; border-radius: 12px; padding: 20px">
+<div style="font-size: 16px; font-weight: 600; margin-bottom: 8px">Default labels name the value and its source (was: Inherit)</div>
+<div class="row" style="border-top: 0"><span class="th">Where</span><span class="th">Before</span><span></span><span class="th">After</span></div>
+<div class="row"><span class="ctx">Run defaults · Judge model</span><button type="button" class="sel bad"><span>Inherit (account default)</span></button><span style="color: #7a859a">→</span><button type="button" class="sel good"><span>Default · opus (instance default)</span></button></div>
+<div class="row"><span class="ctx">Run defaults · Summary model</span><button type="button" class="sel bad"><span>Inherit (account default)</span></button><span style="color: #7a859a">→</span><button type="button" class="sel good"><span>Default · haiku (instance default)</span></button></div>
+<div class="row"><span class="ctx">Run defaults · Claude model</span><button type="button" class="sel bad"><span>Inherit (account default)</span></button><span style="color: #7a859a">→</span><button type="button" class="sel good"><span>Default · opus (lead template)</span></button></div>
+<div class="row"><span class="ctx">Run defaults · Codex model</span><button type="button" class="sel bad"><span>Inherit (account default)</span></button><span style="color: #7a859a">→</span><button type="button" class="sel good"><span>Default · gpt-6-astra (Codex default)</span></button></div>
+<div class="row"><span class="ctx">Schedule · Model</span><button type="button" class="sel bad"><span>Inherit (account default)</span></button><span style="color: #7a859a">→</span><button type="button" class="sel good"><span>Default · opus (your Claude default)</span></button></div>
+<div class="row"><span class="ctx">Agent template (subagent) · Model</span><button type="button" class="sel bad"><span>Inherit (account default)</span></button><span style="color: #7a859a">→</span><button type="button" class="sel good"><span>Default · follows the lead's model</span></button></div>
+</div>
+
+<div style="background: #0f121a; border: 1px solid #272d3c; border-radius: 12px; padding: 20px">
+<div style="font-size: 16px; font-weight: 600; margin-bottom: 8px">Copy and control fixes</div>
+<div class="fx"><span class="ctx">Reasoning effort card</span><span class="old">"The Agent SDK reasoning-effort level your runs use."</span><span style="color: #7a859a">→</span><span class="nw">"…your Claude runs, chat and the judge use. Codex runs don't use it yet."</span></div>
+<div class="fx"><span class="ctx">Schedule · Model help</span><span class="old">"…use your per-user Worker default."</span><span style="color: #7a859a">→</span><span class="nw">"…use your worker model from Settings → Run defaults."</span></div>
+<div class="fx"><span class="ctx">Admin · Judge + Summary model</span><span class="old">Free-text input, no alias list, no validation</span><span style="color: #7a859a">→</span><span class="nw">Same dropdown users get (opus, sonnet, haiku, fable, Other…) + same validation</span></div>
+<div class="fx"><span class="ctx">Admin · Enforce help</span><span class="old">"Pin <span class="mono">judge_model</span> to a cheaper model…"</span><span style="color: #7a859a">→</span><span class="nw">"Pick a cheaper judge model above…"</span></div>
+<div class="fx"><span class="ctx">Run defaults · Harness</span><span class="old">"Use my default" on the control that is the default</span><span style="color: #7a859a">→</span><span class="nw">"Automatic (Claude)"</span></div>
+<div class="fx"><span class="ctx">Agents list · Model column</span><span class="old">"inherit"</span><span style="color: #7a859a">→</span><span class="nw">"follows lead" / "opus (your default)"</span></div>
+</div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":900}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

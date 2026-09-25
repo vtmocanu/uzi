@@ -131,6 +131,12 @@ func TestIsActionableReviewComment(t *testing.T) {
 		{"human CodeRabbit full-review command", ReviewCommentSnapshot{ReviewState: forge.ReviewCommentSummary, AuthorUsername: "maintainer", Body: "@coderabbitai full review"}, false},
 		{"human CodeRabbit quota alias", ReviewCommentSnapshot{ReviewState: forge.ReviewCommentSummary, AuthorUsername: "maintainer", Body: "@coderabbitai reviews remaining?"}, false},
 		{"human CodeRabbit command plus prose", ReviewCommentSnapshot{ReviewState: forge.ReviewCommentSummary, AuthorUsername: "maintainer", Body: "@coderabbitai review please also rename X"}, true},
+		{"human Greptile review command", ReviewCommentSnapshot{ReviewState: forge.ReviewCommentSummary, AuthorUsername: "maintainer", Body: "@greptileai review"}, false},
+		{"human Greptile short-handle review command", ReviewCommentSnapshot{ReviewState: forge.ReviewCommentSummary, AuthorUsername: "maintainer", Body: "@greptile review"}, false},
+		{"human Greptile review command normalizes case and whitespace", ReviewCommentSnapshot{ReviewState: forge.ReviewCommentSummary, AuthorUsername: "maintainer", Body: "  @GreptileAI\n review  "}, false},
+		{"human Greptile command plus prose", ReviewCommentSnapshot{ReviewState: forge.ReviewCommentSummary, AuthorUsername: "maintainer", Body: "@greptileai review, also rename X"}, true},
+		{"bare Greptile mention stays actionable", ReviewCommentSnapshot{ReviewState: forge.ReviewCommentSummary, AuthorUsername: "maintainer", Body: "@greptileai"}, true},
+		{"inline Greptile command stays actionable", ReviewCommentSnapshot{ReviewState: forge.ReviewCommentInline, AuthorUsername: "maintainer", Body: "@greptileai review"}, true},
 		{"human top-level note", ReviewCommentSnapshot{ReviewState: forge.ReviewCommentSummary, AuthorUsername: "maintainer", Body: "please also rename X"}, true},
 		{"unknown review state defaults to actionable", ReviewCommentSnapshot{ReviewState: "", AuthorUsername: "coderabbitai[bot]", Body: summaryMarker}, true},
 	}

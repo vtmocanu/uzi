@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>After: Agents</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#080a0f}
+.r{font-family:'IBM Plex Sans',system-ui,sans-serif;color:#e4e8f0;background:#080a0f;box-sizing:border-box}
+.card{background:#0f121a;border:1px solid #272d3c;border-radius:12px;display:flex;flex-direction:column}
+.lbl{font-size:13px;font-weight:500;color:#aab3c4;display:flex;align-items:center;gap:6px}
+.sel{display:flex;justify-content:space-between;align-items:center;gap:8px;height:36px;padding:0 12px;border:1px solid #3a4256;border-radius:8px;background:#171b26;font-family:inherit;font-size:13.5px;color:#e4e8f0;text-align:left;width:100%;box-sizing:border-box}
+.in{display:flex;align-items:center;height:36px;padding:0 12px;border:1px solid #3a4256;border-radius:8px;background:#171b26;font-size:13.5px;color:#e4e8f0;box-sizing:border-box}
+.xs{font-size:12px;color:#8a95a9;line-height:1.5;margin:0}
+.dim{opacity:.4}
+.tr{display:grid;grid-template-columns:100px 66px minmax(0,1fr) 220px;gap:14px;padding:11px 18px;border-top:1px solid #1f2431;font-size:13px;align-items:center}
+.th{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#7a859a}
+.mono{font-family:'IBM Plex Mono',monospace}
+.m{color:#949eb0}
+.badge{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:10px;font-size:11px;background:#171b26;border:1px solid #272d3c;color:#aab3c4;justify-self:start}
+.mv{display:flex;flex-direction:column;gap:2px}
+.src{font-size:11.5px;color:#8a95a9}
+.ns{display:inline-flex;align-items:center;height:18px;padding:0 7px;border-radius:9px;background:rgba(56,189,248,.12);color:#7dd3fc;font-size:10.5px;font-weight:600}
+.dot{width:8px;height:8px;border-radius:4px;display:inline-block}
+.hlg{outline:2px dashed #34d399;outline-offset:4px;border-radius:8px}
+</style>
+</helmet>
+<div class="r" style="width: 760px; height: 940px; display: flex; flex-direction: column">
+<div style="height: 40px; background: #0d2a20; color: #6ee7b7; display: flex; align-items: center; padding: 0 24px; font-size: 12px; font-weight: 600; letter-spacing: .08em">AFTER · OPTION B · /agents list + template editor (model pin per harness)</div>
+<div style="padding: 28px; display: flex; flex-direction: column; gap: 22px">
+<div style="font-size: 22px; font-weight: 600">Agents</div>
+<div class="card">
+<div class="tr" style="border-top: 0"><span class="th">Name</span><span class="th">Scope</span><span class="th">Description</span><span class="th">Model pin</span></div>
+<div class="tr"><span class="mono">lead</span><span class="badge">Global</span><span class="m">Orchestrates the run</span><span class="mv"><span class="mono">Claude: default · built-in (opus)</span><span class="mono">Codex: default · built-in (gpt-6-astra)</span><span class="src">For your Claude runs: opus · your Claude default wins</span></span></div>
+<div class="tr"><span class="mono">reviewer</span><span class="badge">Global</span><span class="m">Reviews changes for correctness</span><span class="mv"><span class="mono">Default · follows lead</span><span class="src">both harnesses</span></span></div>
+<div class="tr"><span class="mono">researcher</span><span class="badge">Global</span><span class="m">Gathers context</span><span class="mv"><span class="mono">Claude: sonnet</span><span class="mono">Codex: default · follows lead</span></span></div>
+<div class="tr"><span class="mono">tester</span><span class="badge">Mine</span><span class="m">Runs the quality gate</span><span class="mv"><span class="mono">Default · follows lead</span><span class="src">both harnesses</span></span></div>
+</div>
+
+<div class="card" style="padding: 20px; gap: 14px">
+<div style="font-size: 16px; font-weight: 600">Edit template · researcher</div>
+<div class="dim" style="display: flex; flex-direction: column; gap: 6px"><span class="lbl">Description (single sentence, used for routing)</span><div class="in">Gathers context</div></div>
+<div class="hlg" style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px">
+<div style="display: flex; flex-direction: column; gap: 6px"><span class="lbl"><span class="dot" style="background: #fb923c"></span>Claude model</span><button type="button" class="sel"><span>sonnet</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><span class="src">Pinned for Claude runs</span></div>
+<div style="display: flex; flex-direction: column; gap: 6px"><span class="lbl"><span class="dot" style="background: #7dd3fc"></span>Codex model <span class="ns">new setting</span></span><button type="button" class="sel"><span>Default · follows the lead</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><span class="src">Curated Codex models only</span></div>
+</div>
+<p class="xs">Leave a harness on Default so this subagent uses whatever the lead runs on. Pin a cheaper model for light work. A schedule with "Use the schedule's model for subagents too" overrides these pins.</p>
+<div class="dim" style="display: flex; flex-direction: column; gap: 6px"><span class="lbl">Tools (blank = all tools)</span><div class="in">Bash, Read, Grep</div></div>
+</div>
+<p class="xs">On the lead template the Default option reads "Default · built-in (opus)" for Claude and "Default · built-in (gpt-6-astra)" for Codex; each user's own worker model overrides it. The agent detail page and the builtin diff use the same wording (never "inherit"). Agents defined in a repo's own .claude/agents files have a single model field; the issue must decide how it maps (proposal: it is the Claude pin, Codex follows the lead).</p>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":760,"height":940}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

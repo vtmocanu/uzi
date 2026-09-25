@@ -1,0 +1,255 @@
+{
+  "v": 3,
+  "createdOnFiles": {
+    "v": 1,
+    "at": "2026-09-25T18:40:00Z"
+  },
+  "title": "uzi model settings mock",
+  "launch": {
+    "view": "canvas"
+  },
+  "pages": [],
+  "boards": {
+    "Main.dc.html": {
+      "x": 0,
+      "y": 0,
+      "w": 1280,
+      "h": 2140,
+      "title": "BEFORE · Settings → Run defaults"
+    },
+    "AfterModels.dc.html": {
+      "x": 1360,
+      "y": 0,
+      "w": 1280,
+      "h": 1300,
+      "title": "AFTER (B) · Settings → Models (new tab)"
+    },
+    "AfterRunDefaults.dc.html": {
+      "x": 2720,
+      "y": 0,
+      "w": 1280,
+      "h": 1300,
+      "title": "AFTER (B) · Settings → Run defaults (slimmed)"
+    },
+    "BeforeAdmin.dc.html": {
+      "x": 0,
+      "y": 2520,
+      "w": 1280,
+      "h": 1260,
+      "title": "BEFORE · Admin → Instance"
+    },
+    "AfterAdmin.dc.html": {
+      "x": 1360,
+      "y": 2520,
+      "w": 1280,
+      "h": 1260,
+      "title": "AFTER (B) · Admin → Instance"
+    },
+    "BeforeSchedule.dc.html": {
+      "x": 0,
+      "y": 4160,
+      "w": 720,
+      "h": 1000,
+      "title": "BEFORE · Schedule modal"
+    },
+    "AfterSchedule.dc.html": {
+      "x": 800,
+      "y": 4160,
+      "w": 720,
+      "h": 1100,
+      "title": "AFTER (B) · Schedule modal"
+    },
+    "BeforeAgents.dc.html": {
+      "x": 2400,
+      "y": 4160,
+      "w": 760,
+      "h": 800,
+      "title": "BEFORE · Agents list + template editor"
+    },
+    "AfterAgents.dc.html": {
+      "x": 3240,
+      "y": 4160,
+      "w": 760,
+      "h": 940,
+      "title": "AFTER (B) · Agents list + template editor"
+    },
+    "BeforeBoard.dc.html": {
+      "x": 0,
+      "y": 5940,
+      "w": 420,
+      "h": 560,
+      "title": "BEFORE · Board card start"
+    },
+    "AfterBoard.dc.html": {
+      "x": 500,
+      "y": 5940,
+      "w": 1300,
+      "h": 900,
+      "title": "AFTER (B) · Board card start: states"
+    },
+    "OptionA.dc.html": {
+      "x": 0,
+      "y": 7380,
+      "w": 1280,
+      "h": 900,
+      "title": "OPTION A · fix in place (= Phase 1 of B)"
+    },
+    "OptionC.dc.html": {
+      "x": 1360,
+      "y": 7380,
+      "w": 1280,
+      "h": 900,
+      "title": "OPTION C · precedence matrix"
+    },
+    "AfterScheduleCodex.dc.html": {
+      "x": 1600,
+      "y": 4160,
+      "w": 720,
+      "h": 1300,
+      "title": "AFTER (B) · Schedule states: Codex, pin ignored, self-improve, catalog"
+    },
+    "AfterStartSurfaces.dc.html": {
+      "x": 1880,
+      "y": 5940,
+      "w": 1100,
+      "h": 900,
+      "title": "AFTER (B) · Issue page, chat card, run header"
+    }
+  },
+  "order": [
+    "Main.dc.html",
+    "AfterModels.dc.html",
+    "AfterRunDefaults.dc.html",
+    "BeforeAdmin.dc.html",
+    "AfterAdmin.dc.html",
+    "BeforeSchedule.dc.html",
+    "AfterSchedule.dc.html",
+    "AfterScheduleCodex.dc.html",
+    "BeforeAgents.dc.html",
+    "AfterAgents.dc.html",
+    "BeforeBoard.dc.html",
+    "AfterBoard.dc.html",
+    "AfterStartSurfaces.dc.html",
+    "OptionA.dc.html",
+    "OptionC.dc.html"
+  ],
+  "notes": {
+    "t1": {
+      "x": 0,
+      "y": -300,
+      "text": "1 · User settings: before → after",
+      "kind": "title1",
+      "maxW": 4000
+    },
+    "t2": {
+      "x": 0,
+      "y": 2240,
+      "text": "2 · Admin instance defaults",
+      "kind": "title1",
+      "maxW": 2640
+    },
+    "t3": {
+      "x": 0,
+      "y": 3880,
+      "text": "3 · Schedules and agent templates",
+      "kind": "title1",
+      "maxW": 4400
+    },
+    "t4": {
+      "x": 0,
+      "y": 5660,
+      "text": "4 · Starting a run",
+      "kind": "title1",
+      "maxW": 3500
+    },
+    "t5": {
+      "x": 0,
+      "y": 7100,
+      "text": "5 · Alternative options",
+      "kind": "title1",
+      "maxW": 2640
+    },
+    "rec": {
+      "x": -560,
+      "y": 0,
+      "w": 460,
+      "maxH": 900,
+      "fill": "green",
+      "size": "m",
+      "text": "RECOMMENDED: Option B, phased (agreed with buddy123)\n\nRule: every model setting is a Claude/Codex pair, at admin (instance default) and user level. Models tab = one grid, rows x harness columns, each cell shows value + source, one Save.\n\nJudge + summaries get 'Runs on': Same as the run (default) / Claude / Codex, so a Claude run can get a Codex judge. An explicit choice is a hard choice (like a run's harness pin): no usable credential = skipped with a visible reason + retry, never charged to the other provider. Admin-enforced judge respects the user's choice.\n\nPhase 1 (Option A): honest Default labels (value + source), copy fixes, admin dropdowns for today's Claude fields.\n\nLater (epic): Codex effort, Codex judge + summary models, Codex summaries, 'Runs on' for helpers, one effective-settings API for web + CLI, then Models tab / admin grid / schedule group / run-start chip.\n\nBlue 'new setting' chips = needs backend work.\n\nNOT doing: per-run model override on Board, admin worker/effort defaults, Option C matrix for users.\n\nDECIDED (user, 2026-09-25): reasoning effort is per harness (Claude and Codex each have their own). Choosing between Codex credentials (pool / per-run / switch) is out of scope; the Codex credential cell stays read-only and can become a dropdown later without moving anything.\n\nLOCKED (user, 2026-09-25): sections 1, 2, 3, 4. Design complete."
+    },
+    "p1": {
+      "x": 4080,
+      "y": 0,
+      "w": 440,
+      "maxH": 1100,
+      "fill": "red",
+      "size": "s",
+      "text": "Issues (red pins)\n\n1  Every model dropdown says 'Inherit (account default)', but it means: admin instance default (judge, summary), lead template (Claude worker), gpt-6-astra (Codex worker).\n2  The value in effect is never shown; copy hard-codes 'opus unless your admin changed it'.\n3  The main setting (worker model) is card 8 of 9, under 7 unrelated toggles.\n4  Four separate Save buttons for model settings, while the toggles on the same page save instantly.\n5  Judge + summary models live inside feature cards; worker model and effort live elsewhere.\n6  'Use my default' is an option on the control that IS your default.\n7  Effort says 'your runs', but Codex worker runs ignore it today (codexEffort() returns undefined)."
+    },
+    "p2": {
+      "x": 2720,
+      "y": 2520,
+      "w": 440,
+      "maxH": 700,
+      "fill": "red",
+      "size": "s",
+      "text": "Issues\n\n8  Admin model fields are free text: no alias list, no validation (users get a dropdown for the same setting).\n9  Help text shows the raw field name `judge_model`.\n10 The section index has no link for Run summaries.\n11 The two instance model defaults are split across two feature cards, below Forge labels."
+    },
+    "p3": {
+      "x": 4080,
+      "y": 4160,
+      "w": 440,
+      "maxH": 700,
+      "fill": "red",
+      "size": "s",
+      "text": "Issues\n\n1  Same misleading Inherit label (schedule: your default; subagent: the lead).\n12 'your per-user Worker default' names a section that doesn't exist.\n13 Nothing says what the schedule will actually run on.\n14 Agents list prints bare 'inherit'.\n15 Template Model field has no help text; Claude-only list with no harness context."
+    },
+    "p4": {
+      "x": 3060,
+      "y": 5940,
+      "w": 440,
+      "maxH": 500,
+      "fill": "red",
+      "size": "s",
+      "text": "Issue\n\n16 You pick harness + token at start, but can't see which model or effort the run will use.\n\nAfter: read-only chip + breakdown. It adds visibility, not another override rung (buddy123 dropped its per-run override idea for this)."
+    },
+    "ac": {
+      "x": 1360,
+      "y": 1380,
+      "w": 620,
+      "maxH": 740,
+      "fill": "blue",
+      "size": "s",
+      "text": "For the issue (acceptance criteria, not drawn) · from web-ux review, agreed with buddy123\n\nA1 Every select has an accessible name built from its row + column (\"Codex reasoning effort\", \"Judge runs on\"), aria-describedby points at its In-effect line, real select semantics.\nA2 One atomic save for the Models tab: validate the whole payload, write all model/effort settings in one transaction, return per-field errors + the saved effective values. Unsaved-changes guard on in-app navigation.\nA3 Custom model ID input + blocking validation warning work inside a grid cell (Claude and the Codex worker lane allow custom IDs).\nA4 Below ~768px each setting stacks as a card with labelled Claude / Codex fields; bottom padding clears the sticky Save bar.\nA5 Visible focus ring distinct from the orange unsaved outline; theme tokens instead of raw colors, checked on the light themes.\nA6 Dim only the disabled control, never its reason text (contrast).\nA7 Blue new-setting chips are design notes only, never shipped."
+    },
+    "ac2": {
+      "x": 3220,
+      "y": 2520,
+      "w": 520,
+      "maxH": 700,
+      "fill": "blue",
+      "size": "s",
+      "text": "For the issue (admin, not drawn) · from web-ux review\n\nB1 Each select has an accessible name (\"Judge model, Codex\"); real select semantics.\nB2 Per-cell save errors under each select; Save disabled until dirty; success announced via aria-live.\nB3 Column headers use the existing Claude / OpenAI provider logos and theme tokens, not hardcoded dots.\nB4 Remove or redirect the old #run-summaries jump anchor.\nB5 The green NEW tag does not ship.\nB6 Stored empty = Default (follows the built-in); a chosen value = pinned.\n\nLater, if wanted: an \"N users override\" line per row (needs an aggregate API).\nNot doing: an admin default for \"Runs on\" (an instance-wide Codex default would silently skip users without a Codex credential)."
+    },
+    "ac3": {
+      "x": 4080,
+      "y": 4900,
+      "w": 520,
+      "maxH": 700,
+      "fill": "blue",
+      "size": "s",
+      "text": "For the issue (schedules + agents, not drawn) · web-ux review + buddy123\n\nC1 Preview is server-resolved and live; marks each value pinned (fixed at fire) or predicted (read at claim: user model, effort).\nC2 Per-harness agent template pins are their own epic child: storage, API, template rendering, Codex delegation (render.ts drops non-curated role models today).\nC3 Decide how a repo's own .claude/agents single model field maps (proposal: Claude pin; Codex follows lead).\nC4 Fix advice for an ignored pin depends on how many harnesses are usable (picker hidden with one).\nC5 One shared label helper for Default · value (source) across schedule, board, issue page and token picker.\nC6 Shared catalog cards never show a per-viewer value."
+    },
+    "ac4": {
+      "x": 3060,
+      "y": 6480,
+      "w": 520,
+      "maxH": 600,
+      "fill": "blue",
+      "size": "s",
+      "text": "For the issue (starting a run, not drawn) · web-ux review + buddy123\n\nD1 One shared preview component (compact line on the board card, open list on the issue page, static line on the chat card), one shared label helper.\nD2 Board: one server response per board with both harness predictions plus credential availability; cards pick by harness. Never reimplement the resolver in the browser; creating the run validates again.\nD3 Error state never claims defaults; Start stays available and shows the API's real validation error.\nD4 Own epic child: record the resolved lead model, effort and source per claim attempt (retries can differ), show it in the run header and the CLI.\nD5 Gate reason visible as text (not only a tooltip)."
+    }
+  },
+  "designSystems": []
+}

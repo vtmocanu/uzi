@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model settings redesign mock (#1703)</title>
+<style>
+:root{--bg:#f4f5f7;--fg:#151a22;--muted:#4a5567;--card:#fff;--edge:#d6dbe4}
+@media (prefers-color-scheme: dark){:root{--bg:#0b0d12;--fg:#e4e8f0;--muted:#949eb0;--card:#12151d;--edge:#272d3c}}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif;padding:24px 16px}
+main{max-width:1440px;margin:0 auto}
+h1{font-size:26px;margin:0 0 6px}
+h2{font-size:22px;margin:48px 0 16px;padding-top:16px;border-top:1px solid var(--edge)}
+p.lead{color:var(--muted);margin:0 0 8px;max-width:900px}
+figure{margin:0 0 28px;overflow-x:auto}
+figcaption{font-weight:600;margin-bottom:8px}
+iframe{border:1px solid var(--edge);border-radius:8px;background:#080a0f;display:block;max-width:none}
+.note{white-space:pre-line;border-radius:8px;padding:12px 14px;margin:0 0 16px;max-width:900px;font-size:14px;border:1px solid var(--edge);background:var(--card)}
+.note.green{border-left:4px solid #2f9e6f}.note.red{border-left:4px solid #d9485f}.note.blue{border-left:4px solid #2f7fd9}
+a{color:#b45309}
+</style>
+</head>
+<body>
+<main>
+<h1>Model settings redesign: before / after mock</h1>
+<p class="lead">Design for issue #1703 (consistent model configuration across Claude and Codex). Every screen is a static artboard; notes carry the decisions (green), the issues marked with red pins (red) and the requirements for the issues (blue). Open this file in a browser from a checkout; the artboards load from this directory.</p>
+<section><h2>1 · User settings: before → after</h2><aside class="note green">RECOMMENDED: Option B, phased (agreed with buddy123)
+
+Rule: every model setting is a Claude/Codex pair, at admin (instance default) and user level. Models tab = one grid, rows x harness columns, each cell shows value + source, one Save.
+
+Judge + summaries get &apos;Runs on&apos;: Same as the run (default) / Claude / Codex, so a Claude run can get a Codex judge. An explicit choice is a hard choice (like a run&apos;s harness pin): no usable credential = skipped with a visible reason + retry, never charged to the other provider. Admin-enforced judge respects the user&apos;s choice.
+
+Phase 1 (Option A): honest Default labels (value + source), copy fixes, admin dropdowns for today&apos;s Claude fields.
+
+Later (epic): Codex effort, Codex judge + summary models, Codex summaries, &apos;Runs on&apos; for helpers, one effective-settings API for web + CLI, then Models tab / admin grid / schedule group / run-start chip.
+
+Blue &apos;new setting&apos; chips = needs backend work.
+
+NOT doing: per-run model override on Board, admin worker/effort defaults, Option C matrix for users.
+
+DECIDED (user, 2026-09-25): reasoning effort is per harness (Claude and Codex each have their own). Choosing between Codex credentials (pool / per-run / switch) is out of scope; the Codex credential cell stays read-only and can become a dropdown later without moving anything.
+
+LOCKED (user, 2026-09-25): sections 1, 2, 3, 4. Design complete.</aside><aside class="note red">Issues (red pins)
+
+1  Every model dropdown says &apos;Inherit (account default)&apos;, but it means: admin instance default (judge, summary), lead template (Claude worker), gpt-6-astra (Codex worker).
+2  The value in effect is never shown; copy hard-codes &apos;opus unless your admin changed it&apos;.
+3  The main setting (worker model) is card 8 of 9, under 7 unrelated toggles.
+4  Four separate Save buttons for model settings, while the toggles on the same page save instantly.
+5  Judge + summary models live inside feature cards; worker model and effort live elsewhere.
+6  &apos;Use my default&apos; is an option on the control that IS your default.
+7  Effort says &apos;your runs&apos;, but Codex worker runs ignore it today (codexEffort() returns undefined).</aside><aside class="note blue">For the issue (acceptance criteria, not drawn) · from web-ux review, agreed with buddy123
+
+A1 Every select has an accessible name built from its row + column (&quot;Codex reasoning effort&quot;, &quot;Judge runs on&quot;), aria-describedby points at its In-effect line, real select semantics.
+A2 One atomic save for the Models tab: validate the whole payload, write all model/effort settings in one transaction, return per-field errors + the saved effective values. Unsaved-changes guard on in-app navigation.
+A3 Custom model ID input + blocking validation warning work inside a grid cell (Claude and the Codex worker lane allow custom IDs).
+A4 Below ~768px each setting stacks as a card with labelled Claude / Codex fields; bottom padding clears the sticky Save bar.
+A5 Visible focus ring distinct from the orange unsaved outline; theme tokens instead of raw colors, checked on the light themes.
+A6 Dim only the disabled control, never its reason text (contrast).
+A7 Blue new-setting chips are design notes only, never shipped.</aside><figure><figcaption>BEFORE · Settings → Run defaults · <a href="Main.dc.html">open alone</a></figcaption><iframe src="Main.dc.html" width="1280" height="2140" loading="lazy" title="BEFORE · Settings → Run defaults"></iframe></figure><figure><figcaption>AFTER (B) · Settings → Models (new tab) · <a href="AfterModels.dc.html">open alone</a></figcaption><iframe src="AfterModels.dc.html" width="1280" height="1300" loading="lazy" title="AFTER (B) · Settings → Models (new tab)"></iframe></figure><figure><figcaption>AFTER (B) · Settings → Run defaults (slimmed) · <a href="AfterRunDefaults.dc.html">open alone</a></figcaption><iframe src="AfterRunDefaults.dc.html" width="1280" height="1300" loading="lazy" title="AFTER (B) · Settings → Run defaults (slimmed)"></iframe></figure></section>
+<section><h2>2 · Admin instance defaults</h2><aside class="note red">Issues
+
+8  Admin model fields are free text: no alias list, no validation (users get a dropdown for the same setting).
+9  Help text shows the raw field name `judge_model`.
+10 The section index has no link for Run summaries.
+11 The two instance model defaults are split across two feature cards, below Forge labels.</aside><aside class="note blue">For the issue (admin, not drawn) · from web-ux review
+
+B1 Each select has an accessible name (&quot;Judge model, Codex&quot;); real select semantics.
+B2 Per-cell save errors under each select; Save disabled until dirty; success announced via aria-live.
+B3 Column headers use the existing Claude / OpenAI provider logos and theme tokens, not hardcoded dots.
+B4 Remove or redirect the old #run-summaries jump anchor.
+B5 The green NEW tag does not ship.
+B6 Stored empty = Default (follows the built-in); a chosen value = pinned.
+
+Later, if wanted: an &quot;N users override&quot; line per row (needs an aggregate API).
+Not doing: an admin default for &quot;Runs on&quot; (an instance-wide Codex default would silently skip users without a Codex credential).</aside><figure><figcaption>BEFORE · Admin → Instance · <a href="BeforeAdmin.dc.html">open alone</a></figcaption><iframe src="BeforeAdmin.dc.html" width="1280" height="1260" loading="lazy" title="BEFORE · Admin → Instance"></iframe></figure><figure><figcaption>AFTER (B) · Admin → Instance · <a href="AfterAdmin.dc.html">open alone</a></figcaption><iframe src="AfterAdmin.dc.html" width="1280" height="1260" loading="lazy" title="AFTER (B) · Admin → Instance"></iframe></figure></section>
+<section><h2>3 · Schedules and agent templates</h2><aside class="note red">Issues
+
+1  Same misleading Inherit label (schedule: your default; subagent: the lead).
+12 &apos;your per-user Worker default&apos; names a section that doesn&apos;t exist.
+13 Nothing says what the schedule will actually run on.
+14 Agents list prints bare &apos;inherit&apos;.
+15 Template Model field has no help text; Claude-only list with no harness context.</aside><aside class="note blue">For the issue (schedules + agents, not drawn) · web-ux review + buddy123
+
+C1 Preview is server-resolved and live; marks each value pinned (fixed at fire) or predicted (read at claim: user model, effort).
+C2 Per-harness agent template pins are their own epic child: storage, API, template rendering, Codex delegation (render.ts drops non-curated role models today).
+C3 Decide how a repo&apos;s own .claude/agents single model field maps (proposal: Claude pin; Codex follows lead).
+C4 Fix advice for an ignored pin depends on how many harnesses are usable (picker hidden with one).
+C5 One shared label helper for Default · value (source) across schedule, board, issue page and token picker.
+C6 Shared catalog cards never show a per-viewer value.</aside><figure><figcaption>BEFORE · Schedule modal · <a href="BeforeSchedule.dc.html">open alone</a></figcaption><iframe src="BeforeSchedule.dc.html" width="720" height="1000" loading="lazy" title="BEFORE · Schedule modal"></iframe></figure><figure><figcaption>AFTER (B) · Schedule modal · <a href="AfterSchedule.dc.html">open alone</a></figcaption><iframe src="AfterSchedule.dc.html" width="720" height="1100" loading="lazy" title="AFTER (B) · Schedule modal"></iframe></figure><figure><figcaption>AFTER (B) · Schedule states: Codex, pin ignored, self-improve, catalog · <a href="AfterScheduleCodex.dc.html">open alone</a></figcaption><iframe src="AfterScheduleCodex.dc.html" width="720" height="1300" loading="lazy" title="AFTER (B) · Schedule states: Codex, pin ignored, self-improve, catalog"></iframe></figure><figure><figcaption>BEFORE · Agents list + template editor · <a href="BeforeAgents.dc.html">open alone</a></figcaption><iframe src="BeforeAgents.dc.html" width="760" height="800" loading="lazy" title="BEFORE · Agents list + template editor"></iframe></figure><figure><figcaption>AFTER (B) · Agents list + template editor · <a href="AfterAgents.dc.html">open alone</a></figcaption><iframe src="AfterAgents.dc.html" width="760" height="940" loading="lazy" title="AFTER (B) · Agents list + template editor"></iframe></figure></section>
+<section><h2>4 · Starting a run</h2><aside class="note red">Issue
+
+16 You pick harness + token at start, but can&apos;t see which model or effort the run will use.
+
+After: read-only chip + breakdown. It adds visibility, not another override rung (buddy123 dropped its per-run override idea for this).</aside><aside class="note blue">For the issue (starting a run, not drawn) · web-ux review + buddy123
+
+D1 One shared preview component (compact line on the board card, open list on the issue page, static line on the chat card), one shared label helper.
+D2 Board: one server response per board with both harness predictions plus credential availability; cards pick by harness. Never reimplement the resolver in the browser; creating the run validates again.
+D3 Error state never claims defaults; Start stays available and shows the API&apos;s real validation error.
+D4 Own epic child: record the resolved lead model, effort and source per claim attempt (retries can differ), show it in the run header and the CLI.
+D5 Gate reason visible as text (not only a tooltip).</aside><figure><figcaption>BEFORE · Board card start · <a href="BeforeBoard.dc.html">open alone</a></figcaption><iframe src="BeforeBoard.dc.html" width="420" height="560" loading="lazy" title="BEFORE · Board card start"></iframe></figure><figure><figcaption>AFTER (B) · Board card start: states · <a href="AfterBoard.dc.html">open alone</a></figcaption><iframe src="AfterBoard.dc.html" width="1300" height="900" loading="lazy" title="AFTER (B) · Board card start: states"></iframe></figure><figure><figcaption>AFTER (B) · Issue page, chat card, run header · <a href="AfterStartSurfaces.dc.html">open alone</a></figcaption><iframe src="AfterStartSurfaces.dc.html" width="1100" height="900" loading="lazy" title="AFTER (B) · Issue page, chat card, run header"></iframe></figure></section>
+<section><h2>5 · Alternative options</h2><figure><figcaption>OPTION A · fix in place (= Phase 1 of B) · <a href="OptionA.dc.html">open alone</a></figcaption><iframe src="OptionA.dc.html" width="1280" height="900" loading="lazy" title="OPTION A · fix in place (= Phase 1 of B)"></iframe></figure><figure><figcaption>OPTION C · precedence matrix · <a href="OptionC.dc.html">open alone</a></figcaption><iframe src="OptionC.dc.html" width="1280" height="900" loading="lazy" title="OPTION C · precedence matrix"></iframe></figure></section>
+</main>
+</body>
+</html>

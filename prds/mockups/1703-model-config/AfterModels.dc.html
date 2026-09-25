@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>After: Models tab</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#080a0f}
+.r{font-family:'IBM Plex Sans',system-ui,sans-serif;color:#e4e8f0;background:#080a0f;box-sizing:border-box}
+.card{background:#0f121a;border:1px solid #272d3c;border-radius:12px;padding:20px;display:flex;flex-direction:column;gap:14px}
+.t{font-size:16px;font-weight:600;margin:0;color:#e4e8f0;display:flex;align-items:center;gap:10px}
+.p{font-size:13.5px;color:#949eb0;line-height:1.55;margin:0}
+.xs{font-size:12px;color:#8a95a9;line-height:1.5;margin:0}
+.sel{display:flex;justify-content:space-between;align-items:center;gap:8px;height:36px;padding:0 12px;border:1px solid #3a4256;border-radius:8px;background:#171b26;font-family:inherit;font-size:13.5px;color:#e4e8f0;text-align:left;width:100%;box-sizing:border-box}
+.dirty{border-color:#fb923c}
+.btn{display:inline-flex;align-items:center;height:34px;padding:0 14px;border-radius:8px;background:#fb923c;color:#1c0e03;font-family:inherit;font-weight:600;font-size:13px;border:0}
+.btn2{display:inline-flex;align-items:center;height:34px;padding:0 14px;border-radius:8px;background:#171b26;color:#e4e8f0;font-family:inherit;font-weight:500;font-size:13px;border:1px solid #3a4256}
+.tab{padding:10px 14px;font-size:13.5px;color:#949eb0;border-bottom:2px solid transparent;display:flex;align-items:center;gap:6px}
+.tabon{color:#e4e8f0;border-bottom-color:#fb923c}
+.new{display:inline-flex;align-items:center;height:18px;padding:0 7px;border-radius:9px;background:rgba(52,211,153,.14);color:#34d399;font-size:10.5px;font-weight:700;letter-spacing:.05em}
+.ns{display:inline-flex;align-items:center;height:18px;padding:0 7px;border-radius:9px;background:rgba(56,189,248,.12);color:#7dd3fc;font-size:10.5px;font-weight:600}
+.g{display:grid;grid-template-columns:210px minmax(0,1fr) minmax(0,1fr);column-gap:24px}
+.gh{padding:10px 0;border-bottom:1px solid #272d3c;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600}
+.sec{grid-column:1 / 4;padding:18px 0 6px;font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#7a859a}
+.name{padding:14px 0;border-top:1px solid #1f2431;display:flex;flex-direction:column;gap:3px}
+.nm{font-size:14px;font-weight:500;display:flex;align-items:center;gap:8px}
+.cell{padding:14px 0;border-top:1px solid #1f2431;display:flex;flex-direction:column;gap:6px}
+.src{font-size:12px;color:#8a95a9;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.v{font-family:'IBM Plex Mono',monospace;color:#e4e8f0}
+.chip{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:10px;font-size:11px;font-weight:500;background:#171b26;border:1px solid #272d3c;color:#aab3c4}
+.chipb{background:rgba(251,146,60,.14);border-color:rgba(251,146,60,.35);color:#fdba74}
+.dot{width:8px;height:8px;border-radius:4px}
+a{color:#fdba74;text-decoration:none}a:hover{color:#fed7aa}
+</style>
+</helmet>
+<div class="r" style="width: 1280px; height: 1300px; display: flex; flex-direction: column">
+<div style="height: 40px; background: #0d2a20; color: #6ee7b7; display: flex; align-items: center; padding: 0 24px; font-size: 12px; font-weight: 600; letter-spacing: .08em">AFTER · OPTION B (recommended) · /settings/models · one grid, Claude and Codex side by side</div>
+<div style="padding: 36px 56px 0; display: flex; flex-direction: column; gap: 4px">
+<div style="font-size: 24px; font-weight: 600">Settings</div>
+<p class="p">Your personal uzi configuration.</p>
+</div>
+<div style="display: flex; gap: 4px; border-bottom: 1px solid #272d3c; margin: 20px 56px 0">
+<span class="tab">Account &amp; tokens</span><span class="tab">Appearance</span><span class="tab tabon">Models <span class="new">NEW</span></span><span class="tab">Run defaults</span><span class="tab">Forge</span><span class="tab">Access</span><span class="tab">Memory</span>
+</div>
+<div style="padding: 20px 56px 0; width: 1100px; box-sizing: content-box; display: flex; flex-direction: column; gap: 20px">
+<p class="p">Settings for future runs, once per harness. Each cell shows the value that will be used and where it comes from. A schedule's model pin overrides your worker model default.</p>
+
+<div class="card" style="flex-direction: row; align-items: center; gap: 24px; padding: 16px 20px">
+<span style="font-size: 14px; font-weight: 500; width: 186px">Default harness</span>
+<button type="button" class="sel" style="width: 300px"><span>Automatic</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button>
+<span class="src">In effect: <span class="v">Claude</span> · both harnesses usable, so Claude. A run or schedule can still pick Codex. Changing the harness doesn't overwrite either model choice.</span>
+</div>
+
+<div class="card" style="padding: 8px 20px 20px">
+<div class="g">
+<span class="gh" style="color: #7a859a; font-size: 11px; letter-spacing: .08em; text-transform: uppercase">Setting</span>
+<span class="gh"><span class="dot" style="background: #fb923c"></span>Claude <span class="chip chipb">default harness</span></span>
+<span class="gh"><span class="dot" style="background: #7dd3fc"></span>Codex</span>
+
+<span class="sec">Worker runs</span>
+<div class="name"><span class="nm">Worker model</span><span class="xs">Lead agent, plus subagents without their own model</span></div>
+<div class="cell"><button type="button" class="sel"><span>Default · opus (lead template)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><span class="src">In effect <span class="v">opus</span> · lead agent template</span></div>
+<div class="cell"><button type="button" class="sel dirty"><span>gpt-5.6-sol</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><span class="src">In effect <span class="v">gpt-5.6-sol</span> · your choice (unsaved) · curated Codex models, plus a custom ID</span></div>
+
+<div class="name"><span class="nm">Reasoning effort</span><span class="xs">Deeper reasoning costs more</span></div>
+<div class="cell"><button type="button" class="sel"><span>Default · xhigh (uzi default)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><span class="src">In effect <span class="v">xhigh</span> · uzi default</span></div>
+<div class="cell"><button type="button" class="sel"><span>high</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><span class="src">In effect <span class="v">high</span> · your choice <span class="ns">new setting</span></span></div>
+
+<span class="sec">Helper runs · pick where each runs, then its model per harness</span>
+<div class="name"><span class="nm">Judge runs on</span><span style="display: inline-flex; align-items: center; gap: 8px; align-self: flex-start; height: 26px; padding: 0 10px; border-radius: 13px; border: 1px solid #3a4256; background: #171b26; font-size: 12px; color: #e4e8f0">Judge off · <a href="#">Turn on →</a></span></div>
+<div class="cell" style="grid-column: 2 / 4"><button type="button" class="sel"><span>Codex</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><span class="src" style="color: #aab3c4">Every run is judged on Codex, so Claude runs get a Codex judge. If Codex can't run, the judge is skipped with a reason on the run page, never charged to Claude.</span></div>
+<div class="name" style="border-top: 0; padding-top: 8px"><span class="nm" style="font-weight: 400; color: #aab3c4">Judge model</span></div>
+<div class="cell" style="border-top: 0; padding-top: 0"><button type="button" class="sel" style="opacity: .45"><span>Default · opus (instance default)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><span class="src">Not used: the judge runs on Codex · opus is set by your admin</span></div>
+<div class="cell" style="border-top: 0; padding-top: 0"><button type="button" class="sel"><span>Default · gpt-6-astra (instance default)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><span class="src">In effect <span class="v">gpt-6-astra</span> · set by your admin <span class="ns">new setting</span></span></div>
+
+<div class="name"><span class="nm">Summaries run on</span><span class="xs">Two short summaries per run. Always on, never blocks a run.</span></div>
+<div class="cell" style="grid-column: 2 / 4"><button type="button" class="sel"><span>Same as the run</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><span class="src" style="color: #aab3c4">Claude runs use the Claude model, Codex runs the Codex model. Pick Claude or Codex to use one harness for every run; if it can't run, summaries are skipped, never charged to the other provider.</span></div>
+<div class="name" style="border-top: 0; padding-top: 8px"><span class="nm" style="font-weight: 400; color: #aab3c4">Summary model</span></div>
+<div class="cell" style="border-top: 0; padding-top: 0"><button type="button" class="sel"><span>sonnet</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><span class="src">In effect <span class="v">sonnet</span> · your choice (instance default: haiku)</span></div>
+<div class="cell" style="border-top: 0; padding-top: 0"><button type="button" class="sel"><span>Default · gpt-6-astra (instance default)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><span class="src">In effect <span class="v">gpt-6-astra</span> · set by your admin <span class="ns">new setting</span></span></div>
+</div>
+<p class="xs" style="border-top: 1px solid #1f2431; padding-top: 12px; margin-top: 4px">Claude runs spend your Anthropic token; Codex runs spend your Codex credential. Manage both in <a href="#">Account &amp; tokens →</a>. Blue "new setting" chips are design notes (needs backend work), not shipped UI.</p>
+</div>
+
+<div class="card" style="padding: 14px 20px">
+<div style="display: flex; justify-content: space-between; align-items: center"><span style="font-size: 14px; font-weight: 500">How uzi picks a worker model</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M4.5 3l3 3-3 3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></div>
+<p class="xs">Schedule pin → your choice above → lead agent template → built-in default. Subagents keep their own pin unless a schedule applies its model to all agents.</p>
+</div>
+</div>
+
+<div style="margin-top: auto; border-top: 1px solid #272d3c; background: #0f121a; padding: 14px 56px; display: flex; align-items: center; gap: 12px">
+<span style="width: 8px; height: 8px; border-radius: 4px; background: #fb923c"></span>
+<span style="font-size: 13.5px">1 unsaved change: Codex worker model</span>
+<span style="flex-grow: 1"></span>
+<button type="button" class="btn2">Discard</button>
+<button type="button" class="btn">Save changes</button>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":1300}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

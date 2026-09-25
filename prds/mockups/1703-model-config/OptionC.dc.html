@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Option C: precedence matrix</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#080a0f}
+.r{font-family:'IBM Plex Sans',system-ui,sans-serif;color:#e4e8f0;background:#080a0f;box-sizing:border-box}
+.g{display:grid;grid-template-columns:190px repeat(5, minmax(0, 1fr)) 150px;gap:0}
+.h{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#7a859a;padding:10px 12px;border-bottom:1px solid #272d3c}
+.c{padding:14px 12px;border-bottom:1px solid #1f2431;font-family:'IBM Plex Mono',monospace;font-size:13px;color:#e4e8f0;display:flex;align-items:center}
+.n{font-family:'IBM Plex Sans',sans-serif;font-weight:500;font-size:13.5px}
+.x{color:#6b7488;text-decoration:line-through}
+.na{color:#4b5366;font-family:'IBM Plex Sans',sans-serif;font-size:12px}
+.none{color:#6b7488}
+.w{color:#6ee7b7;font-weight:500;outline:1.5px solid rgba(52,211,153,.6);outline-offset:-6px;border-radius:10px}
+.eff{background:rgba(52,211,153,.06);font-weight:600}
+</style>
+</helmet>
+<div class="r" style="width: 1280px; height: 900px; display: flex; flex-direction: column">
+<div style="height: 40px; background: #2a2210; color: #fcd34d; display: flex; align-items: center; padding: 0 24px; font-size: 12px; font-weight: 600; letter-spacing: .08em">OPTION C · one precedence matrix · not recommended for end users</div>
+<div style="padding: 32px 56px; display: flex; flex-direction: column; gap: 18px">
+<div style="font-size: 22px; font-weight: 600">How your models resolve</div>
+<p style="margin: 0; font-size: 13.5px; color: #949eb0">Left to right, the rightmost value that is set wins. Crossed out = set but overridden. — = not set. n/a = can't be set at this level.</p>
+<div style="background: #0f121a; border: 1px solid #272d3c; border-radius: 12px; padding: 8px 12px">
+<div class="g">
+<span class="h">Setting</span><span class="h">Built-in</span><span class="h">Admin</span><span class="h">Lead template</span><span class="h">You</span><span class="h">Schedule</span><span class="h">In effect</span>
+<span class="c n">Claude worker model</span><span class="c x">SDK default</span><span class="c na">n/a</span><span class="c x">opus</span><span class="c w">sonnet</span><span class="c none">—</span><span class="c eff">sonnet</span>
+<span class="c n">Codex worker model</span><span class="c x">gpt-6-astra</span><span class="c na">n/a</span><span class="c na">n/a</span><span class="c w">gpt-5.6-sol</span><span class="c none">—</span><span class="c eff">gpt-5.6-sol</span>
+<span class="c n">Reasoning effort</span><span class="c w">xhigh</span><span class="c na">n/a</span><span class="c na">n/a</span><span class="c none">—</span><span class="c na">n/a</span><span class="c eff">xhigh</span>
+<span class="c n">Judge model</span><span class="c x">opus</span><span class="c w">opus</span><span class="c na">n/a</span><span class="c none">—</span><span class="c na">n/a</span><span class="c eff">opus</span>
+<span class="c n">Summary model</span><span class="c x">haiku</span><span class="c x">haiku</span><span class="c na">n/a</span><span class="c w">sonnet</span><span class="c na">n/a</span><span class="c eff">sonnet</span>
+<span class="c n">Harness</span><span class="c x">Claude</span><span class="c na">n/a</span><span class="c na">n/a</span><span class="c w">Automatic</span><span class="c none">—</span><span class="c eff">Claude</span>
+</div>
+</div>
+<p style="margin: 0; font-size: 12.5px; color: #8a95a9; line-height: 1.55">Complete and exact, but most cells are n/a or —, and users mostly need only the last column. Better kept as an admin diagnostic (Admin → Health or Users → a user) than as the main settings UI.</p>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":900}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

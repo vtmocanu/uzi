@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Before: Admin instance</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#080a0f}
+.r{font-family:'IBM Plex Sans',system-ui,sans-serif;color:#e4e8f0;background:#080a0f;box-sizing:border-box}
+.card{background:#0f121a;border:1px solid #272d3c;border-radius:12px;padding:20px;display:flex;flex-direction:column;gap:14px}
+.t{font-size:16px;font-weight:600;margin:0;color:#e4e8f0;display:flex;align-items:center;gap:10px}
+.p{font-size:13.5px;color:#949eb0;line-height:1.55;margin:0}
+.xs{font-size:12px;color:#8a95a9;line-height:1.5;margin:0}
+.lbl{font-size:13px;font-weight:500;color:#aab3c4;display:flex;align-items:center;gap:8px}
+.in{display:flex;align-items:center;height:36px;padding:0 12px;border:1px solid #3a4256;border-radius:8px;background:#171b26;font-size:13.5px;color:#e4e8f0;box-sizing:border-box;width:420px}
+.btn{display:inline-flex;align-items:center;height:34px;padding:0 14px;border-radius:8px;background:#fb923c;color:#1c0e03;font-family:inherit;font-weight:600;font-size:13px;border:0;align-self:flex-start}
+.chk{display:flex;align-items:center;gap:10px;font-size:13.5px;color:#e4e8f0}
+.box{width:16px;height:16px;border-radius:4px;border:1px solid #3a4256;background:#171b26;box-sizing:border-box}
+.on{background:#fb923c;border-color:#fb923c}
+.pin{display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:22px;border-radius:11px;background:#fb7185;color:#22060c;font-size:12px;font-weight:700;padding:0 6px;box-sizing:border-box;flex-shrink:0}
+.dim{opacity:.4}
+.code{font-family:'IBM Plex Mono',monospace;font-size:12px;background:#171b26;border-radius:4px;padding:1px 5px;color:#e4e8f0}
+.tab{padding:10px 14px;font-size:13.5px;color:#949eb0;border-bottom:2px solid transparent}
+.tabon{color:#e4e8f0;border-bottom-color:#fb923c}
+.hl{outline:2px dashed #fb7185;outline-offset:4px}
+.pill{display:inline-flex;align-items:center;height:26px;padding:0 10px;border-radius:13px;border:1px solid #272d3c;background:#0f121a;font-size:12px;color:#aab3c4}
+</style>
+</helmet>
+<div class="r" style="width: 1280px; height: 1260px; display: flex; flex-direction: column">
+<div style="height: 40px; background: #2a1117; color: #fda4af; display: flex; align-items: center; padding: 0 24px; font-size: 12px; font-weight: 600; letter-spacing: .08em">BEFORE · current main · /admin/settings</div>
+<div style="padding: 36px 56px 0; display: flex; flex-direction: column; gap: 4px">
+<div style="font-size: 24px; font-weight: 600">Admin</div>
+<p class="p">Configuration and controls for this uzi instance.</p>
+</div>
+<div style="display: flex; gap: 4px; border-bottom: 1px solid #272d3c; margin: 20px 56px 0">
+<span class="tab">Users</span><span class="tab">Rate limits</span><span class="tab">Tool allowlist</span><span class="tab">Blocked repos</span><span class="tab tabon">Instance</span><span class="tab">Branding</span><span class="tab">Health</span>
+</div>
+<div style="padding: 20px 56px 56px; width: 900px; box-sizing: content-box; display: flex; flex-direction: column; gap: 20px">
+<p class="p">Configuration shared across every user of this uzi instance.</p>
+<div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center"><span class="pill">Forge labels</span><span class="pill">Run judge</span><span class="pill">Single sign-on</span><span class="pill">Slack</span><span class="pill">Run health</span><span class="pill">Docker workers</span><span class="pill">Ephemeral workers</span><span class="pill">Capability scheduling</span><span class="pill">Completion check</span><span class="pin">10</span></div>
+
+<div class="card dim"><p class="t">Forge labels</p><p class="p">Label names, default appearance mode, light and dark theme, typeface…</p></div>
+
+<div class="card hl">
+<p class="t">Run judge <span class="pin">11</span></p>
+<p class="p">When on, every finished run of an opted-in user is reviewed by an LLM on that user's own Anthropic tokens. This switch arms the feature instance-wide; each user still opts in under their own Settings. Off by default.</p>
+<label class="chk"><span class="box on"></span>Enable the run judge for this instance</label>
+<div style="display: flex; flex-direction: column; gap: 6px"><span class="lbl">Judge model <span class="pin">8</span></span><div class="in">opus</div>
+<p class="xs">The Claude model the judge runs on. The default is <span class="code">opus</span>, the strongest model, since judge recommendations feed self-improvement. Admins and users can pin <span class="code">haiku</span> or <span class="code">sonnet</span> to spend less.</p></div>
+<label class="chk"><span class="box"></span>Enforce the judge on every run (no per-user opt-in)</label>
+<div style="display: flex; gap: 8px; align-items: flex-start"><p class="xs">With this on, EVERY user's finished runs are judged, bypassing their per-user opt-in… Pin <span class="code">judge_model</span> to a cheaper model (opus is the default) before enforcing.</p><span class="pin">9</span></div>
+<div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px">
+<div style="display: flex; flex-direction: column; gap: 6px"><span class="lbl">Per-user cooldown (seconds)</span><div class="in" style="width: auto">60</div></div>
+<div style="display: flex; flex-direction: column; gap: 6px"><span class="lbl">Per-user daily budget (runs)</span><div class="in" style="width: auto">0</div></div>
+</div>
+<button type="button" class="btn">Save run judge settings</button>
+</div>
+
+<div class="card hl">
+<p class="t">Run summaries <span class="pin">11</span></p>
+<p class="p">Each run generates two short plain-English summaries on the run owner's own Anthropic token. This sets the instance-default model; a user can override it under their own Settings.</p>
+<div style="display: flex; flex-direction: column; gap: 6px"><span class="lbl">Summary model <span class="pin">8</span></span><div class="in">haiku</div>
+<p class="xs">The Claude model the run-summary generator runs on. The default is <span class="code">haiku</span>. Pin <span class="code">sonnet</span> or <span class="code">opus</span> for richer summaries.</p></div>
+<button type="button" class="btn">Save run summary settings</button>
+</div>
+
+<div class="card dim"><p class="t">Agent source · Updates · Single sign-on · Slack · Run health · Docker workers · …</p></div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":1260}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

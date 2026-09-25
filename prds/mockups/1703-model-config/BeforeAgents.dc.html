@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Before: Agents</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#080a0f}
+.r{font-family:'IBM Plex Sans',system-ui,sans-serif;color:#e4e8f0;background:#080a0f;box-sizing:border-box}
+.card{background:#0f121a;border:1px solid #272d3c;border-radius:12px;display:flex;flex-direction:column}
+.lbl{font-size:13px;font-weight:500;color:#aab3c4;display:flex;align-items:center;gap:8px}
+.sel{display:flex;justify-content:space-between;align-items:center;gap:8px;height:36px;padding:0 12px;border:1px solid #3a4256;border-radius:8px;background:#171b26;font-family:inherit;font-size:13.5px;color:#e4e8f0;text-align:left;width:100%;box-sizing:border-box}
+.in{display:flex;align-items:center;height:36px;padding:0 12px;border:1px solid #3a4256;border-radius:8px;background:#171b26;font-size:13.5px;color:#e4e8f0;box-sizing:border-box}
+.pin{display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:22px;border-radius:11px;background:#fb7185;color:#22060c;font-size:12px;font-weight:700;padding:0 6px;box-sizing:border-box;flex-shrink:0}
+.dim{opacity:.4}
+.tr{display:grid;grid-template-columns:130px 80px minmax(0,1fr) 110px;gap:14px;padding:11px 18px;border-top:1px solid #1f2431;font-size:13px;align-items:center}
+.th{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#7a859a}
+.mono{font-family:'IBM Plex Mono',monospace}
+.m{color:#949eb0}
+.badge{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:10px;font-size:11px;background:#171b26;border:1px solid #272d3c;color:#aab3c4;justify-self:start}
+</style>
+</helmet>
+<div class="r" style="width: 760px; height: 800px; display: flex; flex-direction: column">
+<div style="height: 40px; background: #2a1117; color: #fda4af; display: flex; align-items: center; padding: 0 24px; font-size: 12px; font-weight: 600; letter-spacing: .08em">BEFORE · /agents list + template editor</div>
+<div style="padding: 28px; display: flex; flex-direction: column; gap: 22px">
+<div style="font-size: 22px; font-weight: 600">Agents</div>
+<div class="card">
+<div class="tr" style="border-top: 0"><span class="th">Name</span><span class="th">Scope</span><span class="th">Description</span><span class="th" style="display: flex; gap: 6px; align-items: center">Model <span class="pin">14</span></span></div>
+<div class="tr"><span class="mono">lead</span><span class="badge">Global</span><span class="m">Orchestrates the run</span><span class="m">inherit</span></div>
+<div class="tr"><span class="mono">reviewer</span><span class="badge">Global</span><span class="m">Reviews changes for correctness</span><span class="m">inherit</span></div>
+<div class="tr"><span class="mono">researcher</span><span class="badge">Global</span><span class="m">Gathers context</span><span class="m">sonnet</span></div>
+<div class="tr"><span class="mono">tester</span><span class="badge">Mine</span><span class="m">Runs the quality gate</span><span class="m">inherit</span></div>
+</div>
+
+<div class="card" style="padding: 20px; gap: 14px">
+<div style="font-size: 16px; font-weight: 600">Edit template · reviewer</div>
+<div class="dim" style="display: flex; flex-direction: column; gap: 6px"><span class="lbl">Description (single sentence, used for routing)</span><div class="in">Reviews changes for correctness</div></div>
+<div style="display: flex; flex-direction: column; gap: 6px"><span class="lbl">Model <span class="pin">1</span> <span class="pin">15</span></span><button type="button" class="sel"><span>Inherit (account default)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button></div>
+<div class="dim" style="display: flex; flex-direction: column; gap: 6px"><span class="lbl">Tools (blank = inherit all)</span><div class="in">Bash, Read, Grep</div></div>
+</div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":760,"height":800}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

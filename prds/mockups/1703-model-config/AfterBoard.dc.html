@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>After: Board card start</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#080a0f}
+.r{font-family:'IBM Plex Sans',system-ui,sans-serif;color:#e4e8f0;background:#080a0f;box-sizing:border-box}
+.col{width:290px;padding:14px;background:#0b0e15;border:1px solid #272d3c;border-radius:12px;display:flex;flex-direction:column;gap:12px;box-sizing:border-box}
+.cap{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#6ee7b7}
+.c{background:#0f121a;border:1px solid #272d3c;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:9px}
+.sel{display:flex;justify-content:space-between;align-items:center;gap:8px;height:32px;padding:0 10px;border:1px solid #3a4256;border-radius:8px;background:#171b26;font-family:inherit;font-size:12px;color:#e4e8f0;text-align:left;width:100%;box-sizing:border-box}
+.btn{display:flex;justify-content:center;align-items:center;height:32px;border-radius:8px;background:#fb923c;color:#1c0e03;font-family:inherit;font-weight:600;font-size:12.5px;border:0;width:100%}
+.btng{display:flex;justify-content:center;align-items:center;height:32px;border-radius:8px;background:#171b26;color:#949eb0;font-family:inherit;font-weight:600;font-size:12.5px;border:1px solid #3a4256;width:100%}
+.lab{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:10px;font-size:11px;background:#171b26;border:1px solid #272d3c;color:#aab3c4}
+.will{display:flex;align-items:center;gap:6px;min-height:26px;background:none;border:0;padding:0;font-family:inherit;font-size:12px;color:#aab3c4;text-align:left;cursor:pointer}
+.mono{font-family:'IBM Plex Mono',monospace;color:#e4e8f0}
+.panel{border-top:1px solid #272d3c;padding-top:9px;display:grid;grid-template-columns:62px minmax(0,1fr);row-gap:6px;column-gap:8px;font-size:11.5px;margin:0}
+.panel dt{color:#8a95a9}
+.panel dd{margin:0;color:#aab3c4}
+.gate{font-size:11.5px;color:#fde68a;line-height:1.45}
+.note{font-size:11.5px;color:#8a95a9;line-height:1.45}
+a{color:#fdba74;text-decoration:none}a:hover{color:#fed7aa}
+</style>
+</helmet>
+<div class="r" style="width: 1300px; height: 900px; display: flex; flex-direction: column">
+<div style="height: 40px; background: #0d2a20; color: #6ee7b7; display: flex; align-items: center; padding: 0 24px; font-size: 12px; font-weight: 600; letter-spacing: .08em">AFTER · OPTION B · Board card: one quiet line under Start, opens inline (no popover, no hover)</div>
+<div style="padding: 24px; display: flex; gap: 20px; align-items: flex-start">
+
+<div class="col">
+<span class="cap">1 · Closed (default)</span>
+<div class="c">
+<div style="font-size: 12px; color: #7a859a">#[ISSUE]</div>
+<div style="font-size: 14px; font-weight: 500">[Issue title]</div>
+<div style="display: flex; gap: 6px"><span class="lab">uzi</span><span class="lab">Planned</span></div>
+<button type="button" class="sel" aria-label="Harness for this run"><span>Default · Claude (automatic)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button>
+<button type="button" class="sel" aria-label="Anthropic token for this run"><span>Default · worker's token (worker binding)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button>
+<button type="button" class="btn">Start run</button>
+<button type="button" class="will" aria-expanded="false">If started now: <span class="mono">Claude · opus · xhigh</span> ▸</button>
+</div>
+</div>
+
+<div class="col">
+<span class="cap">2 · Opened</span>
+<div class="c">
+<div style="font-size: 12px; color: #7a859a">#[ISSUE]</div>
+<div style="font-size: 14px; font-weight: 500">[Issue title]</div>
+<button type="button" class="sel"><span>Default · Claude (automatic)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button>
+<button type="button" class="sel"><span>Default · worker's token (worker binding)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button>
+<button type="button" class="btn">Start run</button>
+<button type="button" class="will" aria-expanded="true">If started now: <span class="mono">Claude · opus · xhigh</span> ▾</button>
+<dl class="panel">
+<dt>Harness</dt><dd><span class="mono">Claude</span> · automatic</dd>
+<dt>Model</dt><dd><span class="mono">opus</span> · your Claude default</dd>
+<dt>Effort</dt><dd><span class="mono">xhigh</span> · your Claude effort</dd>
+<dt>Token</dt><dd>worker's token · worker binding, confirmed at claim</dd>
+</dl>
+<div class="note">A prediction: the worker confirms these when it picks the run up. <a href="#">Settings → Models</a></div>
+</div>
+</div>
+
+<div class="col">
+<span class="cap">3 · Codex-only user</span>
+<div class="c">
+<div style="font-size: 12px; color: #7a859a">#[ISSUE]</div>
+<div style="font-size: 14px; font-weight: 500">[Issue title]</div>
+<div class="note">No harness or token picker: Codex is your only harness and has one credential.</div>
+<button type="button" class="btn">Start run</button>
+<button type="button" class="will" aria-expanded="true">If started now: <span class="mono">Codex · gpt-5.6-sol · high</span> ▾</button>
+<dl class="panel">
+<dt>Harness</dt><dd><span class="mono">Codex</span> · only usable harness</dd>
+<dt>Model</dt><dd><span class="mono">gpt-5.6-sol</span> · your Codex default</dd>
+<dt>Effort</dt><dd><span class="mono">high</span> · your Codex effort</dd>
+<dt>Credential</dt><dd>your default Codex credential</dd>
+</dl>
+</div>
+</div>
+
+<div class="col">
+<span class="cap">4 · Gated · loading · error</span>
+<div class="c">
+<div style="font-size: 14px; font-weight: 500">[Issue title]</div>
+<button type="button" class="btng">Start run (gated)</button>
+<div class="gate">Gated: [reason shown as text, not only in a tooltip]</div>
+<div class="will">If started now: <span class="mono">Claude · opus · xhigh</span> ▸</div>
+</div>
+<div class="c">
+<div style="font-size: 14px; font-weight: 500">[Issue title]</div>
+<button type="button" class="btn">Start run</button>
+<div class="will">Resolving…</div>
+</div>
+<div class="c">
+<div style="font-size: 14px; font-weight: 500">[Issue title]</div>
+<button type="button" class="btn">Start run</button>
+<div class="note">Preview unavailable; Start will validate your choices.</div>
+</div>
+</div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1300,"height":900}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>
