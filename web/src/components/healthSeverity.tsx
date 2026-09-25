@@ -19,16 +19,14 @@ import { Badge, cx, type BadgeTone } from "./ui";
 
 export type Sev = "ok" | "warn" | "danger" | "unknown" | "na";
 
-// Per-severity presentation. `label` is the visible word tests assert on; `tone` is the
-// shared Badge tone. `glyph` and `pill` are LEGACY fields read only by pages/AdminHealth.tsx
-// (its tally pills and verdict icon) until PRD #1648 M3 rewrites that page on SeverityBadge;
-// drop them with it.
-export const SEV: Record<Sev, { label: string; tone: BadgeTone; glyph: string; pill: string }> = {
-  ok: { label: "OK", tone: "ok", glyph: "●", pill: "border-ok/30 bg-ok/10 text-ok" },
-  warn: { label: "Warn", tone: "warning", glyph: "▲", pill: "border-warn/40 bg-warn/10 text-warn" },
-  danger: { label: "Danger", tone: "danger", glyph: "◆", pill: "border-danger/45 bg-danger/10 text-danger" },
-  unknown: { label: "Unknown", tone: "neutral", glyph: "?", pill: "border-dashed border-edge-strong bg-raised text-muted" },
-  na: { label: "N/A", tone: "neutral", glyph: "○", pill: "border-edge bg-transparent text-faint" },
+// Per-severity presentation. `label` is the visible word tests assert on (and the accessible
+// name of a bare SeverityShape on the Health inventory); `tone` is the shared Badge tone.
+export const SEV: Record<Sev, { label: string; tone: BadgeTone }> = {
+  ok: { label: "OK", tone: "ok" },
+  warn: { label: "Warn", tone: "warning" },
+  danger: { label: "Danger", tone: "danger" },
+  unknown: { label: "Unknown", tone: "neutral" },
+  na: { label: "N/A", tone: "neutral" },
 };
 
 export function sevOf(s: string): Sev {
@@ -111,10 +109,4 @@ export function SeverityBadge({ severity, count }: { severity: string; count?: n
       <span>{count != null ? `${count} ${m.label}` : m.label}</span>
     </Badge>
   );
-}
-
-// SeverityPill is the pre-#1648 name, kept only because pages/AdminHealth.tsx still imports
-// it; it now renders the SeverityBadge anatomy. Removed when M3 moves that page over.
-export function SeverityPill({ severity }: { severity: string }) {
-  return <SeverityBadge severity={severity} />;
 }
