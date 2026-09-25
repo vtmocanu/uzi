@@ -620,6 +620,33 @@ describe("mass-signal guardrail (#1576)", () => {
     assert.strictEqual(r.denied, true);
     assert.ok(r.reason?.includes("nested too deeply"), `unexpected reason: ${r.reason}`);
   });
+
+  for (const cmd of [
+    "echo \"$(echo ')'; pkill node)\"",
+    "git commit -m \"$(printf 'fix: a) b'; pkill node)\"",
+    'echo "$(echo \\"x)\\"; pkill node)"',
+  ]) it(`screens after a quoted parenthesis: ${cmd}`, () => {
+    assert.strictEqual(screenBashCommand(cmd).denied, true, cmd);
+  });
+
+  for (const cmd of [
+    '(( 1 << "1" ))\necho "$(pkill node)"',
+    "x=$((1<<'E'))\necho \"$(pkill node)\"",
+    "${x//<<'E'/}\necho \"$(pkill node)\"",
+  ]) it(`screens after an unmatched heredoc lookalike: ${JSON.stringify(cmd)}`, () => {
+    assert.strictEqual(screenBashCommand(cmd).denied, true, cmd);
+  });
+  it("keeps a terminated quoted heredoc inert", () => {
+    assert.strictEqual(screenBashCommand("cat <<'EOF'\n`pkill`\nEOF").denied, false);
+  });
+
+  for (const [name, cmd] of [
+    ['quoted long backtick body', 'echo "`' + "((1<<E))\n".repeat(1100) + 'pkill node`"'],
+    ['unquoted long backtick body', 'echo `' + "((1<<E))\n".repeat(1100) + 'pkill node`'],
+    ['many nested backtick spans', 'echo "$(' + '``;'.repeat(1025) + ' echo `pkill node`)"'],
+  ] as const) it(`fails closed for ${name}`, () => {
+    assert.strictEqual(screenBashCommand(cmd).denied, true);
+  });
 });
 
 function baseInput(): Omit<HookInput, "hook_event_name" | "tool_name" | "tool_input" | "tool_use_id"> {

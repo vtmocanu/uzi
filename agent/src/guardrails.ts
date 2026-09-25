@@ -77,17 +77,15 @@
 //    execute in bash, so the substitution scanner screens them (`cat <<EOF` + a line
 //    `` `pkill node` `` is denied); a QUOTED-delimiter body (`<<'EOF'`, `<<"EOF"`,
 //    `<<\EOF`) is literal, so the scanner skips it and backticked prose there passes.
-//    Substitutions nested past MAX_DEPTH are not screened, and more than
-//    MAX_SUBST_BODIES bodies in one string fails closed with REASON_DEPTH.
+//    Substitutions nested past MAX_DEPTH, or more than MAX_SUBST_BODIES bodies
+//    in one string, fail closed with REASON_DEPTH.
 //    Known evasions: a PID read back from a file an earlier command wrote, the variable
 //    PID forms above, and the substitution scanner's desyncs, where its raw quote/paren
 //    count ends or skips a body in the wrong place so a later substitution is not
-//    screened: a quoted or escaped `)` inside a `$(…)`, a `case` pattern `)`, a `#`
-//    comment inside a `$(…)`, and `$'\''` ANSI-C quoting (the last desyncs the tokenizer
-//    for every rule too, as at base). A `<<` that is not a heredoc operator is also read
-//    as one, and its "body" (to the end of the string when no delimiter line follows) is
-//    skipped: a `<<` in a parameter expansion (`${x//<<'E'/}`) or in arithmetic
-//    (`(( 1 << 'E' ))`, `$((1<<'E'))`) hides every later line from the scanner. An
+//    screened: a `case` pattern `)`, a `#` comment inside a `$(…)`, and `$'\''`
+//    ANSI-C quoting (the last desyncs the tokenizer for every rule too, as at base).
+//    An unmatched `<<` lookalike is scanned as ordinary text; a false match for a
+//    delimiter line remains a possible desync. An
 //    apostrophe in a heredoc body (`don't`) desyncs the tokenizer for every rule, which
 //    predates #1576.
 //    Accepted false positives (all degrade safe): an enumerator anywhere in the same
@@ -712,7 +710,9 @@ function consumeHeredocBodies(command: string, pos: number, docs: Heredoc[], bod
   const n = command.length;
   for (const doc of docs) {
     const { bodyEnd, resume } = heredocBodyEnd(command, pos, doc);
-    if (!doc.quoted) {
+    // An unmatched delimiter may be a `<<` in arithmetic or parameter expansion.
+    // Its apparent body is not proven literal, so scan it even when quoted.
+    if (!doc.quoted || bodyEnd === n) {
       const inner = extractSubstitutionBodies(command.slice(pos, bodyEnd), false);
       if (inner === undefined || bodies.length + inner.length > MAX_SUBST_BODIES) return -1;
       bodies.push(...inner);
@@ -725,20 +725,40 @@ function consumeHeredocBodies(command: string, pos: number, docs: Heredoc[], bod
 
 /**
  * The index of the `)` that closes the `$(` whose body starts at `start`, or the end of
- * the string when it is unbalanced. A raw paren-depth count, except that a heredoc opened
+ * the string when it is unbalanced. A quote-aware paren-depth count; a heredoc opened
  * inside the body (`$(cat <<'EOF'` …) has its body jumped over, quoted or not, because
  * bash's own parse does not read parens in a heredoc body: prose like `a)` or `:)` in a
  * commit message must not end the substitution early (#1576). The body string is later
  * screened on its own, where an unquoted heredoc body is still scanned for
- * substitutions. A quoted paren or a `#` comment still shifts the count (file header).
+ * substitutions. A `#` comment can still shift the count (file header).
  */
 function substitutionEnd(command: string, start: number): number {
   const n = command.length;
   const pending: Heredoc[] = [];
   let depth = 1;
   let j = start;
+  let inSingle = false;
+  let inDouble = false;
+  let escapedDouble = false;
   while (j < n) {
     const c = command[j]!;
+    // Treat paired escaped quotes conservatively as a quoted span too. Bash may
+    // read them literally, but counting a `)` inside would hide later commands.
+    if (c === "\\" && command[j + 1] === '"' && (!inDouble || escapedDouble)) {
+      inDouble = !inDouble;
+      escapedDouble = inDouble;
+      j += 2;
+      continue;
+    }
+    if (c === "\\" && !inSingle) { j += 2; continue; }
+    if (c === "'" && !inDouble) { inSingle = !inSingle; j++; continue; }
+    if (c === '"' && !inSingle) { inDouble = !inDouble; j++; continue; }
+    if (inSingle) { j++; continue; }
+    if (c === "$" && command[j + 1] === "(") {
+      j = substitutionEnd(command, j + 2) + 1;
+      continue;
+    }
+    if (inDouble) { j++; continue; }
     if (c === "\n" && pending.length > 0) {
       j += 1;
       for (const doc of pending.splice(0)) j = heredocBodyEnd(command, j, doc).resume;
@@ -762,7 +782,7 @@ function substitutionEnd(command: string, start: number): number {
  * The bodies of the command substitutions the tokenizer keeps inside one word (#1576),
  * in one linear pass: single-quoted regions are literal and skipped; each `$(` inside
  * double quotes yields the text up to its matching `)` (substitutionEnd: a paren-depth
- * count that jumps heredoc bodies, so a quoted paren inside the body still shifts it;
+ * count that jumps heredoc bodies and quoted parens;
  * unbalanced means up to the end of the string); each unquoted or double-quoted
  * backtick yields the text up to the next unescaped backtick. An UNQUOTED `$(` is not a body: the tokenizer already splits it
  * into segments that the caller screens under every rule, so the scan walks into it and
@@ -1041,11 +1061,12 @@ function screenWithDepth(
   // A body denial for any other reason is IGNORED on purpose: base 613f1434 never
   // screened quoted substitution bodies for the other rules (`echo "$(git push)"` is
   // allowed there and here), and screening them would over-deny prose in commit
-  // messages. A body screened past MAX_DEPTH returns REASON_DEPTH and is ignored too.
+  // messages. A body screened past MAX_DEPTH must fail closed.
   const bodies = extractSubstitutionBodies(command);
   if (bodies === undefined) return deny(REASON_DEPTH);
   for (const body of bodies) {
     const r = screenWithDepth(body, depth + 1, secretPaths, dockerWired, ctx, assignments);
+    if (r.reason === REASON_DEPTH) return r;
     if (r.reason === REASON_MASS_SIGNAL && (!first || first.reason === REASON_PS)) first = r;
   }
   return first ?? ALLOW;
