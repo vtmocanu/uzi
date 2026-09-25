@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Before: Run defaults</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#080a0f}
+.r{font-family:'IBM Plex Sans',system-ui,sans-serif;color:#e4e8f0;background:#080a0f;box-sizing:border-box}
+.card{background:#0f121a;border:1px solid #272d3c;border-radius:12px;padding:20px;display:flex;flex-direction:column;gap:14px}
+.t{font-size:16px;font-weight:600;margin:0;color:#e4e8f0;display:flex;align-items:center;gap:10px}
+.p{font-size:13.5px;color:#949eb0;line-height:1.55;margin:0}
+.xs{font-size:12px;color:#8a95a9;line-height:1.5;margin:0}
+.lbl{font-size:13px;font-weight:500;color:#aab3c4;display:flex;align-items:center;gap:8px}
+.sel{display:flex;justify-content:space-between;align-items:center;gap:8px;height:36px;padding:0 12px;border:1px solid #3a4256;border-radius:8px;background:#171b26;font-family:inherit;font-size:13.5px;color:#e4e8f0;text-align:left;width:100%;box-sizing:border-box}
+.btn{display:inline-flex;align-items:center;height:34px;padding:0 14px;border-radius:8px;background:#fb923c;color:#1c0e03;font-family:inherit;font-weight:600;font-size:13px;border:0;align-self:flex-start}
+.chk{display:flex;align-items:center;gap:10px;font-size:13.5px;color:#e4e8f0}
+.box{width:16px;height:16px;border-radius:4px;border:1px solid #3a4256;background:#171b26;box-sizing:border-box}
+.on{background:#fb923c;border-color:#fb923c}
+.pin{display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:22px;border-radius:11px;background:#fb7185;color:#22060c;font-size:12px;font-weight:700;padding:0 6px;box-sizing:border-box;flex-shrink:0}
+.dim{opacity:.4}
+.code{font-family:'IBM Plex Mono',monospace;font-size:12px;background:#171b26;border-radius:4px;padding:1px 5px;color:#e4e8f0}
+.tab{padding:10px 14px;font-size:13.5px;color:#949eb0;border-bottom:2px solid transparent}
+.tabon{color:#e4e8f0;border-bottom-color:#fb923c}
+.hl{outline:2px dashed #fb7185;outline-offset:4px}
+.lane{border:1px solid #272d3c;background:rgba(23,27,38,.4);border-radius:10px;padding:16px;display:flex;flex-direction:column;gap:12px}
+.badge{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 8px;border-radius:11px;font-size:11.5px;font-weight:500;background:rgba(251,146,60,.14);color:#fdba74}
+.info{border:1px solid rgba(56,189,248,.35);background:rgba(56,189,248,.08);color:#bae6fd;border-radius:8px;padding:10px 12px;font-size:13px;line-height:1.5}
+</style>
+</helmet>
+<div class="r" style="width: 1280px; height: 2140px; display: flex; flex-direction: column">
+<div style="height: 40px; background: #2a1117; color: #fda4af; display: flex; align-items: center; padding: 0 24px; font-size: 12px; font-weight: 600; letter-spacing: .08em">BEFORE · current main · /settings/run-defaults</div>
+<div style="padding: 36px 56px 0; display: flex; flex-direction: column; gap: 4px">
+<div style="font-size: 24px; font-weight: 600">Settings</div>
+<p class="p">Your personal uzi configuration.</p>
+</div>
+<div style="display: flex; gap: 4px; border-bottom: 1px solid #272d3c; margin: 20px 56px 0">
+<span class="tab">Account &amp; tokens</span><span class="tab">Appearance</span><span class="tab tabon">Run defaults</span><span class="tab">Forge</span><span class="tab">Access</span><span class="tab">Memory</span>
+</div>
+<div style="padding: 20px 56px 56px; width: 900px; box-sizing: content-box; display: flex; flex-direction: column; gap: 20px">
+<p class="p">How your runs behave: autopilot, usage limits, the judge, CI fixes, the model, and reasoning effort.</p>
+
+<div class="card dim"><p class="t">Autopilot</p><p class="p">With autopilot on, adding the autopilot label alongside uzi on an issue starts a run unattended…</p><label class="chk"><span class="box"></span>Enable autopilot for my account</label></div>
+<div class="card dim"><p class="t">Anthropic usage limits</p><p class="p">When a run exhausts your Anthropic usage window it normally fails… With this on, a run pauses instead…</p><label class="chk"><span class="box on"></span>Pause my new runs on a usage limit instead of failing them</label><label class="chk"><span class="box on"></span>Alert me when my 7-day limit resets early</label></div>
+
+<div class="card hl">
+<p class="t">Run judge <span class="pin">5</span></p>
+<p class="p">With the run judge on, each of your finished runs is reviewed by an LLM on your own Anthropic tokens. It reads the run trace and produces a verdict plus recommendations. Results appear on the Judge page and on the run's page, plus a Slack DM when your Slack account is linked. It only recommends and never changes code. Off by default.</p>
+<label class="chk"><span class="box"></span>Judge my finished runs</label>
+<div style="display: flex; flex-direction: column; gap: 6px"><span class="lbl">Token the judge spends</span><button type="button" class="sel" style="width: 420px"><span>Use my default token</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><p class="xs">Retrospectives can bill a different account from the runs they review.</p></div>
+<div style="display: flex; flex-direction: column; gap: 6px"><span class="lbl">Judge model <span class="pin">1</span></span><button type="button" class="sel" style="width: 420px"><span>Inherit (account default)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button></div>
+<div style="display: flex; gap: 8px; align-items: flex-start"><p class="xs">The Claude model your finished runs are judged on. Leave it on <em>Inherit</em> to use the instance default (opus unless your admin changed it); pin a cheaper alias to spend less.</p><span class="pin">2</span></div>
+<div style="display: flex; gap: 8px; align-items: center"><button type="button" class="btn">Save judge model</button><span class="pin">4</span></div>
+</div>
+
+<div class="card hl">
+<p class="t">Run summaries <span class="pin">5</span></p>
+<p class="p">Each of your runs generates two short plain-English summaries on your own Anthropic token. Pinning a model here overrides the instance default for your own runs.</p>
+<div style="display: flex; flex-direction: column; gap: 6px"><span class="lbl">Summary model <span class="pin">1</span></span><button type="button" class="sel" style="width: 420px"><span>Inherit (account default)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button></div>
+<p class="xs">The Claude model your run summaries are generated on. Leave it on <em>Inherit</em> to use the instance default (haiku unless your admin changed it).</p>
+<div style="display: flex; gap: 8px; align-items: center"><button type="button" class="btn">Save summary model</button><span class="pin">4</span></div>
+</div>
+
+<div class="card dim"><p class="t">Automatic CI fixes</p><label class="chk"><span class="box on"></span>Automatically fix my failed CI pipelines</label></div>
+<div class="card dim"><p class="t">AI attribution in commits</p><label class="chk"><span class="box on"></span>Include the Co-Authored-By: Claude trailer in my worker commits</label></div>
+<div class="card dim"><p class="t">MR review rework</p><label class="chk"><span class="box on"></span>Auto-rework MR review comments on my runs</label></div>
+
+<div class="card hl">
+<p class="t">Harness and worker models <span class="pin">3</span></p>
+<p class="p">Choose how new runs start, then keep a model default for each harness. The worker model is what your runs use (the lead orchestrator and the subagents that inherit it) and overrides the lead template for your own runs only. <strong style="color: #e4e8f0">Changing the harness doesn't overwrite either model choice.</strong></p>
+<div style="display: flex; flex-direction: column; gap: 6px"><span class="lbl">Harness <span class="pin">6</span></span><button type="button" class="sel" style="width: 420px"><span>Use my default</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><p class="xs">Used when a run or schedule doesn't choose a harness explicitly. Leave it on <em>Use my default</em> to let uzi resolve it automatically.</p></div>
+<div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px">
+<div class="lane">
+<div style="display: flex; justify-content: space-between"><div><div style="font-size: 14px; font-weight: 600">Anthropic</div><p class="xs">Used for Claude runs</p></div><span class="badge">● Default harness</span></div>
+<span class="lbl">Claude model <span class="pin">1</span></span><button type="button" class="sel"><span>Inherit (account default)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button>
+<p class="xs">Curated Claude aliases plus a custom model ID. Leave on <em>Inherit</em> to use the lead template's model (opus by default).</p>
+</div>
+<div class="lane">
+<div><div style="font-size: 14px; font-weight: 600">Codex</div><p class="xs">Used for Codex runs</p></div>
+<span class="lbl">Codex model <span class="pin">1</span></span><button type="button" class="sel"><span>Inherit (account default)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button>
+<p class="xs">Curated Codex models plus a custom model ID. Leave on <em>Inherit</em> to use the Codex default (currently <span class="code">gpt-6-astra</span>).</p>
+</div>
+</div>
+<div class="info">Harness selection is automatic. Both model choices stay saved; uzi uses your only usable harness, or Claude when both are usable.</div>
+<div style="display: flex; gap: 8px; align-items: center"><button type="button" class="btn">Save defaults</button><span class="pin">4</span></div>
+</div>
+
+<div class="card hl">
+<p class="t">Reasoning effort <span class="pin">7</span></p>
+<p class="p">The Agent SDK reasoning-effort level your runs use. Leave it on <em>Inherit</em> to use the uzi default (<span class="code">xhigh</span>). Higher levels reason more deeply and cost more. It applies to your own runs only.</p>
+<div style="display: flex; flex-direction: column; gap: 6px"><span class="lbl">Effort</span><button type="button" class="sel" style="width: 420px"><span>Inherit (uzi default: xhigh)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button></div>
+<div style="display: flex; gap: 8px; align-items: center"><button type="button" class="btn">Save effort</button><span class="pin">4</span></div>
+</div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":2140}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

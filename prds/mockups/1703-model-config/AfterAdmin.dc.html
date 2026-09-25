@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>After: Admin instance</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#080a0f}
+.r{font-family:'IBM Plex Sans',system-ui,sans-serif;color:#e4e8f0;background:#080a0f;box-sizing:border-box}
+.card{background:#0f121a;border:1px solid #272d3c;border-radius:12px;padding:20px;display:flex;flex-direction:column;gap:14px}
+.t{font-size:16px;font-weight:600;margin:0;color:#e4e8f0;display:flex;align-items:center;gap:10px}
+.p{font-size:13.5px;color:#949eb0;line-height:1.55;margin:0}
+.xs{font-size:12px;color:#8a95a9;line-height:1.5;margin:0}
+.lbl{font-size:13px;font-weight:500;color:#aab3c4}
+.sel{display:flex;justify-content:space-between;align-items:center;gap:8px;height:36px;padding:0 12px;border:1px solid #3a4256;border-radius:8px;background:#171b26;font-family:inherit;font-size:13.5px;color:#e4e8f0;text-align:left;width:100%;box-sizing:border-box}
+.in{display:flex;align-items:center;height:36px;padding:0 12px;border:1px solid #3a4256;border-radius:8px;background:#171b26;font-size:13.5px;color:#e4e8f0;box-sizing:border-box}
+.ro{display:flex;align-items:center;gap:10px;height:36px;padding:0 12px;border:1px solid #272d3c;border-radius:8px;background:#0b0e15;font-size:13.5px;box-sizing:border-box}
+.btn{display:inline-flex;align-items:center;height:34px;padding:0 14px;border-radius:8px;background:#fb923c;color:#1c0e03;font-family:inherit;font-weight:600;font-size:13px;border:0;align-self:flex-start}
+.chk{display:flex;align-items:center;gap:10px;font-size:13.5px;color:#e4e8f0}
+.box{width:16px;height:16px;border-radius:4px;border:1px solid #3a4256;background:#171b26;box-sizing:border-box}
+.on{background:#fb923c;border-color:#fb923c}
+.dim{opacity:.4}
+.tab{padding:10px 14px;font-size:13.5px;color:#949eb0;border-bottom:2px solid transparent}
+.tabon{color:#e4e8f0;border-bottom-color:#fb923c}
+.hlg{outline:2px dashed #34d399;outline-offset:4px}
+.pill{display:inline-flex;align-items:center;height:26px;padding:0 10px;border-radius:13px;border:1px solid #272d3c;background:#0f121a;font-size:12px;color:#aab3c4}
+.pillg{border-color:rgba(52,211,153,.5);color:#6ee7b7}
+.new{display:inline-flex;align-items:center;height:18px;padding:0 7px;border-radius:9px;background:rgba(52,211,153,.14);color:#34d399;font-size:10.5px;font-weight:700;letter-spacing:.05em}
+.row{display:grid;grid-template-columns:180px minmax(0,1fr) minmax(0,1fr);gap:24px;align-items:start;padding:12px 0;border-top:1px solid #1f2431}
+.th{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#7a859a}
+.mono{font-family:'IBM Plex Mono',monospace}
+.src{font-size:12px;color:#8a95a9}
+a{color:#fdba74;text-decoration:none}a:hover{color:#fed7aa}
+</style>
+</helmet>
+<div class="r" style="width: 1280px; height: 1260px; display: flex; flex-direction: column">
+<div style="height: 40px; background: #0d2a20; color: #6ee7b7; display: flex; align-items: center; padding: 0 24px; font-size: 12px; font-weight: 600; letter-spacing: .08em">AFTER · OPTION B · /admin/settings</div>
+<div style="padding: 36px 56px 0; display: flex; flex-direction: column; gap: 4px">
+<div style="font-size: 24px; font-weight: 600">Admin</div>
+<p class="p">Configuration and controls for this uzi instance.</p>
+</div>
+<div style="display: flex; gap: 4px; border-bottom: 1px solid #272d3c; margin: 20px 56px 0">
+<span class="tab">Users</span><span class="tab">Rate limits</span><span class="tab">Tool allowlist</span><span class="tab">Blocked repos</span><span class="tab tabon">Instance</span><span class="tab">Branding</span><span class="tab">Health</span>
+</div>
+<div style="padding: 20px 56px 56px; width: 960px; box-sizing: content-box; display: flex; flex-direction: column; gap: 20px">
+<p class="p">Configuration shared across every user of this uzi instance.</p>
+<div style="display: flex; flex-wrap: wrap; gap: 8px"><span class="pill pillg">Model defaults</span><span class="pill">Forge labels</span><span class="pill">Run judge</span><span class="pill">Single sign-on</span><span class="pill">Slack</span><span class="pill">Run health</span><span class="pill">Docker workers</span><span class="pill">Ephemeral workers</span><span class="pill">Capability scheduling</span><span class="pill">Completion check</span></div>
+
+<div class="card hlg">
+<div><p class="t">Instance model defaults <span class="new">NEW</span></p><p class="p" style="margin-top: 6px">Used when a user leaves a model on Default. Each user can pick their own under Settings → Models.</p></div>
+<div class="row" style="border-top: 0; padding-bottom: 2px"><span class="th">Setting</span><span class="th" style="display: flex; align-items: center; gap: 6px"><span style="width: 8px; height: 8px; border-radius: 4px; background: #fb923c"></span>Claude</span><span class="th" style="display: flex; align-items: center; gap: 6px"><span style="width: 8px; height: 8px; border-radius: 4px; background: #7dd3fc"></span>Codex</span></div>
+<div class="row">
+<span style="font-size: 14px; font-weight: 500">Judge model</span>
+<div style="display: flex; flex-direction: column; gap: 5px"><button type="button" class="sel"><span>Default · opus (built-in)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><span class="src">Follows the built-in default. Why opus: judge advice feeds self-improvement, so it gets the strongest model.</span></div>
+<div style="display: flex; flex-direction: column; gap: 5px"><button type="button" class="sel" style="border-color: #3a4256"><span>gpt-6-astra</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><span class="src"><span style="color: #e4e8f0">Pinned</span> · built-in is [Codex built-in]; choose Default to follow it again · <span style="color: #7dd3fc">new setting</span></span></div>
+</div>
+<div class="row">
+<span style="font-size: 14px; font-weight: 500">Summary model</span>
+<div style="display: flex; flex-direction: column; gap: 5px"><button type="button" class="sel"><span>Default · haiku (built-in)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><span class="src">Follows the built-in default. Why haiku: two short summaries on every run, so fast and near-free.</span></div>
+<div style="display: flex; flex-direction: column; gap: 5px"><button type="button" class="sel"><span>Default · gpt-6-astra (built-in)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><span class="src">Follows the built-in default · <span style="color: #7dd3fc">new setting</span></span></div>
+</div>
+<p class="xs" style="border-top: 1px solid #1f2431; padding-top: 12px">"Default" follows uzi's built-in model, including future changes to it; picking a model pins it. Each column offers only that harness's models, with the same list and validation users get. By default the judge and summaries use the run's harness; each user can choose Claude or Codex in Settings → Models. Worker models have no instance default: each user's choice, then the lead agent template, applies.</p>
+<button type="button" class="btn">Save model defaults</button>
+</div>
+
+<div class="card dim"><p class="t">Forge labels</p><p class="p">Label names, default appearance mode, light and dark theme, typeface…</p></div>
+
+<div class="card hlg">
+<p class="t">Run judge</p>
+<p class="p">When on, every finished run of an opted-in user is reviewed by an LLM on that user's own credential for the provider it runs on (Anthropic or Codex). This switch arms the feature instance-wide; each user still opts in under their own Settings. Off by default.</p>
+<label class="chk"><span class="box on"></span>Enable the run judge for this instance</label>
+<div class="ro" style="width: 640px"><span class="src">Instance default:</span><span class="mono">opus</span><span class="src">(Claude) ·</span><span class="mono">gpt-6-astra</span><span class="src">(Codex) · users may override</span><span style="flex-grow: 1"></span><a href="#" style="font-size: 12.5px">Model defaults ↑</a></div>
+<label class="chk"><span class="box"></span>Enforce the judge on every run (no per-user opt-in)</label>
+<p class="xs">With this on, EVERY user's finished runs are judged, bypassing their per-user opt-in. Enforcing charges each user's own Claude or Codex credential, following their "Judge runs on" choice; a user with no usable credential is skipped, with a reason shown. Consider a cheaper judge model in Model defaults before enforcing.</p>
+<div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px">
+<div style="display: flex; flex-direction: column; gap: 6px"><span class="lbl">Per-user cooldown (seconds)</span><div class="in">60</div></div>
+<div style="display: flex; flex-direction: column; gap: 6px"><span class="lbl">Per-user daily budget (runs)</span><div class="in">0</div></div>
+</div>
+<button type="button" class="btn">Save run judge settings</button>
+</div>
+
+<div style="border: 1px dashed #34d399; border-radius: 12px; padding: 14px 20px; color: #6ee7b7; font-size: 13.5px">The separate "Run summaries" card is gone: its only field is now a row in Model defaults.</div>
+<div class="card dim"><p class="t">Agent source · Updates · Single sign-on · Slack · Run health · …</p></div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":1260}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

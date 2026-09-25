@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>After: Schedule on Codex</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#080a0f}
+.r{font-family:'IBM Plex Sans',system-ui,sans-serif;color:#e4e8f0;background:#05070b;box-sizing:border-box}
+.xs{font-size:11.5px;color:#8a95a9;line-height:1.5;margin:0}
+.lbl{font-size:13px;font-weight:500;color:#aab3c4}
+.sel{display:flex;justify-content:space-between;align-items:center;gap:8px;height:36px;padding:0 12px;border:1px solid #3a4256;border-radius:8px;background:#171b26;font-family:inherit;font-size:13.5px;color:#e4e8f0;text-align:left;width:100%;box-sizing:border-box}
+.ro{display:flex;align-items:center;gap:10px;min-height:36px;padding:8px 12px;border:1px solid #272d3c;border-radius:8px;background:#0b0e15;font-size:13px;color:#aab3c4;box-sizing:border-box}
+.tog{width:34px;height:20px;border-radius:10px;background:#3a4256;position:relative;flex-shrink:0}
+.knob{position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:7px;background:#e4e8f0}
+.f{display:flex;flex-direction:column;gap:6px}
+.pv{display:grid;grid-template-columns:90px 150px minmax(0,1fr);row-gap:8px;column-gap:12px;margin:0;font-size:12.5px;align-items:baseline}
+.pv dt{color:#8a95a9}
+.pv dd{margin:0;font-family:'IBM Plex Mono',monospace;color:#e4e8f0}
+dd.pvs{margin:0;color:#aab3c4;font-family:'IBM Plex Sans',sans-serif}
+.card{background:#0f121a;border:1px solid #272d3c;border-radius:12px;padding:16px 18px;display:flex;flex-direction:column;gap:10px}
+.h{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#7a859a}
+.chip{display:inline-flex;align-items:center;height:22px;padding:0 9px;border-radius:11px;font-size:11.5px;background:#171b26;border:1px solid #272d3c;color:#aab3c4}
+.warn{border:1px solid rgba(251,191,36,.45);background:rgba(251,191,36,.08);color:#fde68a;border-radius:8px;padding:8px 12px;font-size:12.5px;line-height:1.5}
+a{color:#fdba74;text-decoration:none}a:hover{color:#fed7aa}
+</style>
+</helmet>
+<div class="r" style="width: 720px; height: 1300px; display: flex; flex-direction: column">
+<div style="height: 40px; background: #0d2a20; color: #6ee7b7; display: flex; align-items: center; padding: 0 24px; font-size: 12px; font-weight: 600; letter-spacing: .08em">AFTER · OPTION B · Schedule states: Codex, pin ignored, self-improve, catalog</div>
+<div style="padding: 24px 28px; display: flex; flex-direction: column; gap: 18px">
+
+<div class="card">
+<span class="h">A · Schedule pinned to Codex (the "Where it runs" group)</span>
+<div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px">
+<div class="f"><span class="lbl">Harness</span><button type="button" class="sel"><span>Codex</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button></div>
+<div class="f"><span class="lbl">Model</span><button type="button" class="sel"><span>gpt-5.6-sol</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><p class="xs">Curated Codex models only (no custom ID on schedules).</p></div>
+</div>
+<div class="f"><span class="lbl">Credential</span><div class="ro">Runs on Codex: spends your default Codex credential. <a href="#">Account &amp; tokens →</a></div></div>
+<dl class="pv" style="border-top: 1px solid #1f2431; padding-top: 12px">
+<dt>Harness</dt><dd>Codex</dd><dd class="pvs">pinned · fixed when it fires</dd>
+<dt>Model</dt><dd>gpt-5.6-sol</dd><dd class="pvs">pinned · fixed when it fires</dd>
+<dt>Effort</dt><dd>high</dd><dd class="pvs">predicted · your Codex effort, set in Settings → Models</dd>
+<dt>Credential</dt><dd>Codex default</dd><dd class="pvs">your default Codex credential</dd>
+<dt>Subagents</dt><dd>own Codex pins, else lead</dd><dd class="pvs">researcher → gpt-5.6-sol (no Codex pin, follows lead)</dd>
+</dl>
+</div>
+
+<div class="card">
+<span class="h">B · A Claude model pin that ends up on Codex</span>
+<p class="xs">Harness left on Default, model pinned to sonnet, and the harness resolves to Codex (for example, your Claude token was removed). The preview and a warning say so before you save:</p>
+<dl class="pv">
+<dt>Harness</dt><dd>Codex</dd><dd class="pvs">automatic: only usable harness</dd>
+<dt>Model</dt><dd style="color: #fde68a">gpt-6-astra</dd><dd class="pvs" style="color: #fde68a">sonnet pin ignored on Codex; using your Codex default</dd>
+</dl>
+<div class="warn">The sonnet pin only applies to Claude runs. Pick a Codex model, or add a Claude token in <a href="#">Account &amp; tokens</a>. (When both harnesses are usable, the advice is "Pin the harness to Claude" instead, since only then is that picker shown.)</div>
+</div>
+
+<div class="card">
+<span class="h">C · Claude-only user (one usable harness)</span>
+<div class="ro">No Harness picker is shown. Model offers Claude models only.</div>
+<dl class="pv"><dt>Harness</dt><dd>Claude</dd><dd class="pvs">your only usable harness</dd></dl>
+</div>
+<div class="card">
+<span class="h">D · Self-improvement schedule</span>
+<div class="ro">Self-improvement runs always use your worker's token; no per-schedule override.</div>
+<dl class="pv"><dt>Token</dt><dd>worker's token</dd><dd class="pvs">fixed for self-improvement</dd></dl>
+</div>
+
+<div class="card">
+<span class="h">E · Schedule list and Job catalog chips (were "inherit model" / "model X")</span>
+<div style="display: grid; grid-template-columns: 200px minmax(0, 1fr); row-gap: 10px; column-gap: 14px; align-items: center; font-size: 12.5px">
+<span style="color: #8a95a9">Catalog card, unpinned</span><span><span class="chip">model: default</span></span>
+<span style="color: #8a95a9">Your schedule, unpinned (a prediction)</span><span><span class="chip">model: default · now opus</span> <span class="chip">codex · model: default · now gpt-6-astra</span></span>
+<span style="color: #8a95a9">Pinned</span><span><span class="chip">model: sonnet · pinned</span></span>
+<span style="color: #8a95a9">Pinned + subagents toggle</span><span><span class="chip">model: sonnet · pinned + agents</span></span>
+</div>
+<p class="xs">Shared catalog cards never show a per-viewer value; only your own schedule rows resolve it.</p>
+</div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":720,"height":1300}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

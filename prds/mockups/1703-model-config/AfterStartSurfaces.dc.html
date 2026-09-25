@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>After: Other start surfaces</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#080a0f}
+.r{font-family:'IBM Plex Sans',system-ui,sans-serif;color:#e4e8f0;background:#080a0f;box-sizing:border-box}
+.card{background:#0f121a;border:1px solid #272d3c;border-radius:12px;padding:18px 20px;display:flex;flex-direction:column;gap:12px}
+.h{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#6ee7b7}
+.lbl{font-size:12.5px;font-weight:500;color:#aab3c4}
+.sel{display:flex;justify-content:space-between;align-items:center;gap:8px;height:36px;padding:0 12px;border:1px solid #3a4256;border-radius:8px;background:#171b26;font-family:inherit;font-size:13px;color:#e4e8f0;text-align:left;width:100%;box-sizing:border-box}
+.btn{display:inline-flex;align-items:center;height:36px;padding:0 16px;border-radius:8px;background:#fb923c;color:#1c0e03;font-family:inherit;font-weight:600;font-size:13px;border:0}
+.btn2{display:inline-flex;align-items:center;height:32px;padding:0 12px;border-radius:8px;background:#171b26;color:#e4e8f0;font-family:inherit;font-size:12.5px;border:1px solid #3a4256}
+.mono{font-family:'IBM Plex Mono',monospace;color:#e4e8f0}
+.pv{display:grid;grid-template-columns:90px 130px minmax(0,1fr);row-gap:7px;column-gap:12px;margin:0;font-size:12.5px}
+.pv dt{color:#8a95a9}
+.pv dd{margin:0}
+.src{color:#aab3c4}
+.xs{font-size:11.5px;color:#8a95a9;line-height:1.5;margin:0}
+.badge{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 10px;border-radius:12px;font-size:12px;background:#171b26;border:1px solid #272d3c;color:#e4e8f0}
+.tip{background:#171b26;border:1px solid #3a4256;border-radius:8px;padding:8px 10px;font-size:12px;color:#aab3c4;line-height:1.5}
+a{color:#fdba74;text-decoration:none}a:hover{color:#fed7aa}
+</style>
+</helmet>
+<div class="r" style="width: 1100px; height: 900px; display: flex; flex-direction: column">
+<div style="height: 40px; background: #0d2a20; color: #6ee7b7; display: flex; align-items: center; padding: 0 24px; font-size: 12px; font-weight: 600; letter-spacing: .08em">AFTER · OPTION B · Same preview on every start surface, plus the run header</div>
+<div style="padding: 24px; display: flex; flex-direction: column; gap: 18px">
+
+<div class="card">
+<span class="h">A · Issue page start row (room to show it open)</span>
+<div style="display: flex; gap: 12px; align-items: flex-end">
+<div style="display: flex; flex-direction: column; gap: 6px; width: 240px"><span class="lbl">Harness</span><button type="button" class="sel"><span>Default · Claude (automatic)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button></div>
+<div style="display: flex; flex-direction: column; gap: 6px; width: 320px"><span class="lbl">Anthropic token</span><button type="button" class="sel"><span>Default · worker's token (worker binding)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button></div>
+<button type="button" class="btn">Start run</button>
+</div>
+<div style="border-top: 1px solid #1f2431; padding-top: 12px; display: flex; flex-direction: column; gap: 8px">
+<span style="font-size: 12px; font-weight: 600; color: #aab3c4">If it started now</span>
+<dl class="pv">
+<dt>Harness</dt><dd class="mono">Claude</dd><dd class="src">automatic: both harnesses usable</dd>
+<dt>Model</dt><dd class="mono">opus</dd><dd class="src">your Claude default</dd>
+<dt>Effort</dt><dd class="mono">xhigh</dd><dd class="src">your Claude effort</dd>
+<dt>Token</dt><dd class="mono">worker's token</dd><dd class="src">worker binding</dd>
+</dl>
+<p class="xs">The worker confirms these when it picks the run up. Change defaults in <a href="#">Settings → Models</a>.</p>
+</div>
+</div>
+
+<div class="card">
+<span class="h">B · Chat-proposed run (no pickers today)</span>
+<div style="border: 1px solid #272d3c; border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 10px; max-width: 560px">
+<span style="font-size: 14px; font-weight: 600">Start a run</span>
+<span style="font-size: 13px; color: #aab3c4">[Proposed issue / prompt summary]</span>
+<span style="font-size: 12px; color: #aab3c4">If started now: <span class="mono">Claude · opus · xhigh</span> (your defaults) · <a href="#">Settings → Models</a></span>
+<div style="display: flex; gap: 8px"><button type="button" class="btn" style="height: 32px">Start run</button><button type="button" class="btn2">Dismiss</button></div>
+</div>
+</div>
+
+<div class="card">
+<span class="h">C · Run page header, every run (not only schedule-fixed ones): the lead agent's configuration</span>
+<div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap">
+<span style="font-size: 16px; font-weight: 600">[Run title]</span>
+<span class="badge">Claude</span>
+<span class="badge">lead: <span class="mono">opus</span> · <span class="mono">xhigh</span></span>
+<span class="badge">worker's token</span>
+</div>
+<div class="tip" style="max-width: 460px">opus: your Claude default · xhigh: your Claude effort · recorded when the worker picked the run up (a retry records its own). This is the lead agent; subagents with their own pin may differ. A schedule-fixed model says "fixed by schedule".</div>
+<div style="display: flex; gap: 10px; align-items: center">
+<span style="font-size: 13px; color: #8a95a9">Before a worker picks it up:</span>
+<span class="badge">Claude</span>
+<span class="badge" style="color: #8a95a9">model and effort resolve at claim</span>
+</div>
+</div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1100,"height":900}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Before: Schedule modal</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#080a0f}
+.r{font-family:'IBM Plex Sans',system-ui,sans-serif;color:#e4e8f0;background:#05070b;box-sizing:border-box}
+.p{font-size:13.5px;color:#949eb0;line-height:1.55;margin:0}
+.xs{font-size:11.5px;color:#8a95a9;line-height:1.5;margin:0}
+.lbl{font-size:13px;font-weight:500;color:#aab3c4;display:flex;align-items:center;gap:8px}
+.sel{display:flex;justify-content:space-between;align-items:center;gap:8px;height:36px;padding:0 12px;border:1px solid #3a4256;border-radius:8px;background:#171b26;font-family:inherit;font-size:13.5px;color:#e4e8f0;text-align:left;width:100%;box-sizing:border-box}
+.btn{display:inline-flex;align-items:center;height:34px;padding:0 14px;border-radius:8px;background:#fb923c;color:#1c0e03;font-family:inherit;font-weight:600;font-size:13px;border:0}
+.btn2{display:inline-flex;align-items:center;height:34px;padding:0 14px;border-radius:8px;background:#171b26;color:#e4e8f0;font-family:inherit;font-weight:500;font-size:13px;border:1px solid #3a4256}
+.pin{display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:22px;border-radius:11px;background:#fb7185;color:#22060c;font-size:12px;font-weight:700;padding:0 6px;box-sizing:border-box;flex-shrink:0}
+.dim{opacity:.4}
+.tog{width:34px;height:20px;border-radius:10px;background:#3a4256;position:relative;flex-shrink:0}
+.knob{position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:7px;background:#e4e8f0}
+.f{display:flex;flex-direction:column;gap:6px}
+.hl{outline:2px dashed #fb7185;outline-offset:6px;border-radius:6px}
+</style>
+</helmet>
+<div class="r" style="width: 720px; height: 1000px; display: flex; flex-direction: column">
+<div style="height: 40px; background: #2a1117; color: #fda4af; display: flex; align-items: center; padding: 0 24px; font-size: 12px; font-weight: 600; letter-spacing: .08em">BEFORE · Schedules → New schedule</div>
+<div style="margin: 28px; background: #0f121a; border: 1px solid #272d3c; border-radius: 14px; display: flex; flex-direction: column">
+<div style="padding: 18px 22px; border-bottom: 1px solid #272d3c; display: flex; justify-content: space-between; align-items: center"><span style="font-size: 17px; font-weight: 600">New schedule</span><span style="color: #7a859a; font-size: 18px">×</span></div>
+<div style="padding: 20px 22px; display: flex; flex-direction: column; gap: 18px">
+<div class="dim" style="display: flex; flex-direction: column; gap: 12px">
+<div class="f"><span class="lbl">Repo</span><button type="button" class="sel"><span>acme/web-app</span></button></div>
+<div class="f"><span class="lbl">Target</span><button type="button" class="sel"><span>Prompt</span></button></div>
+<div class="f"><span class="lbl">Timing · Cadence</span><button type="button" class="sel"><span>Weekly, Monday 03:00</span></button></div>
+</div>
+<div class="f"><span class="lbl">Harness (optional)</span><button type="button" class="sel"><span>Use my default</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><p class="xs">Runs fired by this schedule use this harness, frozen at fire time. Leave on "Use my default" to resolve it automatically.</p></div>
+<div class="f"><span class="lbl">Model (optional) <span class="pin">1</span></span><button type="button" class="sel"><span>Inherit (account default)</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><div style="display: flex; gap: 8px; align-items: flex-start"><p class="xs">Runs fired by this schedule use this model on every target. Leave on Inherit to use your per-user Worker default.</p><span class="pin">12</span></div></div>
+<div class="f"><span class="lbl">Anthropic token (optional)</span><button type="button" class="sel"><span>Inherit the worker's token</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><p class="xs">Runs fired by this schedule spend this token. Leave on Inherit to follow the worker's binding.</p></div>
+<div style="display: flex; gap: 12px; align-items: flex-start"><span class="tog"><span class="knob"></span></span><div><div style="font-size: 13px">Apply model also to agents</div><p class="xs">Subagents run on the same model as the lead; overrides each agent's own model.</p></div></div>
+<div class="hl" style="display: flex; gap: 10px; align-items: center; padding: 10px 12px; color: #fda4af; font-size: 12.5px"><span class="pin">13</span>No summary of what this schedule will actually run on (harness · model · effort · token).</div>
+<div class="dim" style="display: flex; flex-direction: column; gap: 10px">
+<span style="font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: #949eb0">Run options</span>
+<div style="display: flex; gap: 12px; align-items: center"><span class="tog"><span class="knob"></span></span><span style="font-size: 13px">Wait on usage limit</span></div>
+<div class="f"><span class="lbl">Auto-rework MR review comments</span><button type="button" class="sel"><span>Inherit (use my default)</span></button></div>
+</div>
+</div>
+<div style="padding: 16px 22px; border-top: 1px solid #272d3c; display: flex; justify-content: flex-end; gap: 10px"><button type="button" class="btn2">Cancel</button><button type="button" class="btn">Create schedule</button></div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":720,"height":1000}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

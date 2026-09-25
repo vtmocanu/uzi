@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>After: Run defaults</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#080a0f}
+.r{font-family:'IBM Plex Sans',system-ui,sans-serif;color:#e4e8f0;background:#080a0f;box-sizing:border-box}
+.card{background:#0f121a;border:1px solid #272d3c;border-radius:12px;padding:20px;display:flex;flex-direction:column;gap:14px}
+.t{font-size:16px;font-weight:600;margin:0;color:#e4e8f0}
+.p{font-size:13.5px;color:#949eb0;line-height:1.55;margin:0}
+.xs{font-size:12px;color:#8a95a9;line-height:1.5;margin:0}
+.lbl{font-size:13px;font-weight:500;color:#aab3c4}
+.sel{display:flex;justify-content:space-between;align-items:center;gap:8px;height:36px;padding:0 12px;border:1px solid #3a4256;border-radius:8px;background:#171b26;font-family:inherit;font-size:13.5px;color:#e4e8f0;text-align:left;width:100%;box-sizing:border-box}
+.ro{display:flex;align-items:center;gap:10px;height:36px;padding:0 12px;border:1px solid #272d3c;border-radius:8px;background:#0b0e15;font-size:13.5px;box-sizing:border-box}
+.chk{display:flex;align-items:center;gap:10px;font-size:13.5px;color:#e4e8f0}
+.box{width:16px;height:16px;border-radius:4px;border:1px solid #3a4256;background:#171b26;box-sizing:border-box}
+.on{background:#fb923c;border-color:#fb923c}
+.dim{opacity:.4}
+.tab{padding:10px 14px;font-size:13.5px;color:#949eb0;border-bottom:2px solid transparent}
+.tabon{color:#e4e8f0;border-bottom-color:#fb923c}
+.hlg{outline:2px dashed #34d399;outline-offset:4px}
+.mono{font-family:'IBM Plex Mono',monospace}
+.src{font-size:12px;color:#8a95a9}
+a{color:#fdba74;text-decoration:none}a:hover{color:#fed7aa}
+</style>
+</helmet>
+<div class="r" style="width: 1280px; height: 1300px; display: flex; flex-direction: column">
+<div style="height: 40px; background: #0d2a20; color: #6ee7b7; display: flex; align-items: center; padding: 0 24px; font-size: 12px; font-weight: 600; letter-spacing: .08em">AFTER · OPTION B · /settings/run-defaults (model controls moved out)</div>
+<div style="padding: 36px 56px 0; display: flex; flex-direction: column; gap: 4px">
+<div style="font-size: 24px; font-weight: 600">Settings</div>
+<p class="p">Your personal uzi configuration.</p>
+</div>
+<div style="display: flex; gap: 4px; border-bottom: 1px solid #272d3c; margin: 20px 56px 0">
+<span class="tab">Account &amp; tokens</span><span class="tab">Appearance</span><span class="tab">Models</span><span class="tab tabon">Run defaults</span><span class="tab">Forge</span><span class="tab">Access</span><span class="tab">Memory</span>
+</div>
+<div style="padding: 20px 56px 56px; width: 900px; box-sizing: content-box; display: flex; flex-direction: column; gap: 20px">
+<p class="p">How your runs behave: autopilot, usage limits, the judge, CI fixes and MR rework. Models, effort and run summaries live in <a href="#">Models</a>.</p>
+
+<div class="card dim"><p class="t">Autopilot</p><label class="chk"><span class="box"></span>Enable autopilot for my account</label></div>
+<div class="card dim"><p class="t">Anthropic usage limits</p><label class="chk"><span class="box on"></span>Pause my new runs on a usage limit instead of failing them</label><label class="chk"><span class="box on"></span>Alert me when my 7-day limit resets early</label></div>
+
+<div class="card hlg">
+<p class="t">Run judge</p>
+<p class="p">With the run judge on, each of your finished runs is reviewed by an LLM using the credential shown below. Results appear on the Judge page and on the run's page, plus a Slack DM when your Slack account is linked. It only recommends and never changes code. Off by default.</p>
+<label class="chk"><span class="box"></span>Judge my finished runs</label>
+<div class="ro" style="width: 100%"><span class="src">Runs on</span><span class="mono">Codex</span><span class="src">for every run, so Claude runs get a Codex judge</span><span style="flex-grow: 1"></span><a href="#" style="font-size: 12.5px">Change in Models →</a></div>
+<div style="display: grid; grid-template-columns: 150px minmax(0, 1fr) minmax(0, 1fr); gap: 10px 16px; align-items: center">
+<span></span>
+<span class="lbl" style="display: flex; align-items: center; gap: 6px"><span style="width: 8px; height: 8px; border-radius: 4px; background: #fb923c"></span>Claude</span>
+<span class="lbl" style="display: flex; align-items: center; gap: 6px"><span style="width: 8px; height: 8px; border-radius: 4px; background: #7dd3fc"></span>Codex</span>
+<span class="lbl">Credential</span>
+<div style="display: flex; flex-direction: column; gap: 4px"><button type="button" class="sel" style="opacity: .45"><span>Use my default token</span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" stroke="#949eb0" stroke-width="1.5" fill="none"></path></svg></button><span class="src">Not used: the judge runs on Codex</span></div>
+<div style="display: flex; flex-direction: column; gap: 4px"><div class="ro"><span>Your default Codex credential</span><span style="flex-grow: 1"></span><a href="#" style="font-size: 12.5px">Manage →</a></div><span class="src">Codex has one default credential today, nothing to pick</span></div>
+<span class="lbl">Model</span>
+<div class="ro"><span class="mono" style="color: #7a859a">opus</span><span class="src">set by your admin · not used</span></div>
+<div class="ro"><span class="mono">gpt-6-astra</span><span class="src">set by your admin</span></div>
+</div>
+<p class="xs">Retrospectives can bill a different account from the runs they review: point the Claude side at a cheaper console key while your runs stay on a subscription. If the judge's harness can't run, the judge is skipped with a reason on the run page, never charged to the other provider.</p>
+</div>
+
+<div class="card dim"><p class="t">Automatic CI fixes</p><label class="chk"><span class="box on"></span>Automatically fix my failed CI pipelines</label></div>
+<div class="card dim"><p class="t">AI attribution in commits</p><label class="chk"><span class="box on"></span>Include the Co-Authored-By: Claude trailer in my worker commits</label></div>
+<div class="card dim"><p class="t">MR review rework</p><label class="chk"><span class="box on"></span>Auto-rework MR review comments on my runs</label></div>
+
+<div style="border: 1px dashed #34d399; border-radius: 12px; padding: 16px 20px; display: flex; align-items: center; gap: 12px; color: #6ee7b7; font-size: 13.5px">
+<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8h9M9 4.5L12.5 8 9 11.5" stroke="#6ee7b7" stroke-width="1.6" fill="none"></path></svg>
+Removed from this page: "Harness and worker models", "Reasoning effort" and "Run summaries" (summaries have no on/off switch, only a model, so the whole card becomes a row in Models). No more per-card model Save buttons here.
+</div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":1300}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>
