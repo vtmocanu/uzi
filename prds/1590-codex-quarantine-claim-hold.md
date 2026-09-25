@@ -2,7 +2,7 @@
 
 **Issue:** [#1590](https://github.com/vtmocanu/uzi/issues/1590)
 
-**Status:** M1–M6 implemented on the branch `agent/issue-1590` and reviewed (2026-09-24). M3–M6 are ticked; M1 and M2 stay unticked for two reasons: their fail-on-unfixed-code regression direction has no recorded observation (M3 and M4 record theirs as mutation evidence), and `task gate:repo`, their migration-milestone gate, is red until the landing renumber (see the M1 note). M7 (acceptance on hosted k8s, maintainer) is pending, so the PRD stays open. The branch is merged with `main` up to #1615 (3b802713); its draft migrations `00251`/`00252` collide with `main`'s `00251` and are renumbered at landing (`task migration:renumber`), so `task gate:repo`'s `check:migration-numbering` is red on the branch until then, deliberately deferred to landing.
+**Status:** M1–M6 implemented on the branch `agent/issue-1590` and reviewed (2026-09-24). M3–M6 are ticked; M1 and M2 stay unticked because their fail-on-unfixed-code regression direction has no recorded observation (M3 and M4 record theirs as mutation evidence). M7 (acceptance on hosted k8s, maintainer) is pending, so the PRD stays open. The branch is merged with `main` up to #1615 (3b802713); its draft migrations `00251`/`00252` collided with `main`'s `00251` and were renumbered at landing (`task migration:renumber`) to `00252`/`00253`.
 
 **Priority:** High
 
@@ -84,7 +84,7 @@ Verified against `main` at `45c1acec` on 2026-09-24. Recheck anchors before impl
 - **Budget display.** `budget_used_seconds` is computed per request (`api/internal/handler/runs_dto.go` ~462-475) as `now − started_at − budget_paused_seconds` for every non-paused started row, terminal rows included. That is why the failed run reported 30226 s. It is a separate display defect (see Out of scope).
 - **Surfaces.** `recovery_wait_cause` is an untyped string in `api/internal/apitypes/run.go:678` and `web/src/lib/apiTypes.ts:2525`. It is rendered in `web/src/pages/RunView.tsx` ~1515-1575 (`RecoveryWaitPanel`, a binary `forgePark` check) and in the CLI/TUI at `api/cmd/uzi/run_render.go:1459,1542-1550`, `run_steer.go:471`, `tui_render.go:230`, `tui_detail.go:670`, `tui_board.go:149`, `tui_board_rows.go:225` and `tui_steer.go:157`.
 - **Docs.** `docs/run-recovery-wait.md` (embedded copy under `api/internal/uzidocs/embed/`) documents recovery_wait, pool_wait, limit_wait and paused, and has a "Forge unreachable at clone" section to follow. No doc mentions Codex quarantine.
-- **Migration head** was `00246_user_per_harness_models.sql` at PRD verification; at implementation base `df8e1df3` it is `00249_validate_codex_reauth_reason.sql`, and `00250` is claimed by open PR #1602. This PRD drafts `00251` (the cause CHECK) and `00252` (the bounded-sweep partial indexes). Both are renumbered at landing (`task migration:renumber`).
+- **Migration head** was `00246_user_per_harness_models.sql` at PRD verification; at implementation base `df8e1df3` it is `00249_validate_codex_reauth_reason.sql`, and `00250` is claimed by open PR #1602. This PRD drafts `00251` (the cause CHECK) and `00252` (the bounded-sweep partial indexes). Both were renumbered at landing (`task migration:renumber`) to `00252` and `00253`.
 
 ## Decisions
 
@@ -133,7 +133,7 @@ Landed with M1 from M2 and M3: the ClaimRun account gate and its peer mirror, an
   - The statement returns the page size, the last scanned id and the parked ids, even when nothing parks. The service advances its mutex-guarded cursor to the last scanned id and wraps it to the start after a page shorter than the cap (100). A locked candidate is skipped and retried after the wrap.
   - The park sets `status_since`, clears `recovery_retry_not_before`, `started_at`, the capability hash and health, zeroes `budget_paused_seconds`, and bumps `codex_claim_epoch`.
   - The pass runs in `Sweep` before the health detector, publishes each parked run, and is best-effort like the survivor pass: an error is logged and the sweep continues. `SweepResult.CodexAccountParked` counts it.
-  - Migration `00252_index_codex_account_wait.sql` (draft number) builds `idx_runs_codex_sub_queued` and `idx_runs_codex_account_wait` (the held set M3's promoter scans) concurrently.
+  - Migration `00253_index_codex_account_wait.sql` (drafted as `00252`) builds `idx_runs_codex_sub_queued` and `idx_runs_codex_account_wait` (the held set M3's promoter scans) concurrently.
 - **Health.** Before the park tick, a gated queued run's health row carries `codex_account_gated`, and the queued arm reports "your Codex account is unavailable (quarantined or being re-linked), so this run can't start", ahead of every worker reason.
 - **Assembly fallback.** When assembly sees a hold-class sentinel, it runs a new transaction, `ParkRunCodexAccountUnavailable`, that composes the two precedents:
   - It locks the run `FOR UPDATE`, and refuses (with nothing mutated) unless `status='claimed'`, `worker_id` is the claimant and `claim_generation` is the claim's generation. A cancel or a competing reclaim wins.
@@ -271,7 +271,7 @@ Each milestone ends green on `task gate:api`, plus `task gate:web` for M5 and `t
     - `api_key` and Claude runs are unaffected;
     - a claim-versus-quarantine race reaching assembly lands on M1's park;
     - no claim or requeue loop over N sweep ticks.
-  - Implementation note (reviewed): M3 rework dropped the quarantine case's NULL-key disjunct (see D2's as-built note); `TestUnfrozenQuarantinedRunFailsNotHeldLiveDB` pins that such a run is neither gated nor parked, and fails at claim with `credential_unavailable`. Also: the A1 gate case, `ParkQueuedCodexAccountUnavailablePage` and its sweeper pass, `codex_account_gated` on the health read, draft migration `00252`, the copies-identical store test, the shared fixture table, and the LiveDB tests are on the branch. The claim-versus-quarantine race is covered by M1's `TestClaimObservedCaseReplayParksLiveDB`.
+  - Implementation note (reviewed): M3 rework dropped the quarantine case's NULL-key disjunct (see D2's as-built note); `TestUnfrozenQuarantinedRunFailsNotHeldLiveDB` pins that such a run is neither gated nor parked, and fails at claim with `credential_unavailable`. Also: the A1 gate case, `ParkQueuedCodexAccountUnavailablePage` and its sweeper pass, `codex_account_gated` on the health read, migration `00253` (drafted as `00252`), the copies-identical store test, the shared fixture table, and the LiveDB tests are on the branch. The claim-versus-quarantine race is covered by M1's `TestClaimObservedCaseReplayParksLiveDB`.
 - [x] **M3: Account-driven promotion.** Depends on M2 (same files: `runtime.sql`, `sweep.go`).
   - `promote_codex_account_available` (D3: one transaction locking run, then alias, then account; existing predicate), and both timer promoters skipping this cause.
   - Tests:

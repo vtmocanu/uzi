@@ -6246,7 +6246,7 @@ type ListCodexAccountWaitRunsPageParams struct {
 // PRD #1590 M3 (D3): one keyset page of the promote_codex_account_available pass. The ids of at
 // most @page_cap runs held in recovery_wait with cause codex_account_unavailable, with id past
 // the service's in-memory cursor, in id order, over the partial index
-// idx_runs_codex_account_wait (00252). A pure read: every decision is re-made per run under
+// idx_runs_codex_account_wait (00253). A pure read: every decision is re-made per run under
 // lock (LockCodexAccountWaitRunForUpdate and the alias/account FOR SHARE NOWAIT pair), so a run
 // that moved after this list is simply skipped.
 func (q *Queries) ListCodexAccountWaitRunsPage(ctx context.Context, arg ListCodexAccountWaitRunsPageParams) ([]uuid.UUID, error) {
@@ -8741,7 +8741,7 @@ type ParkQueuedCodexAccountUnavailablePageRow struct {
 // codex_account_unavailable, so the hold is visible instead of an invisible queued wait.
 //
 // BOUNDED BY ROWS EXAMINED, not rows updated. `page` is a MATERIALIZED keyset page over the
-// partial index idx_runs_codex_sub_queued (00252): at most @page_cap queued Codex subscription
+// partial index idx_runs_codex_sub_queued (00253): at most @page_cap queued Codex subscription
 // runs with id > @after_id, in id order. The LIMIT applies BEFORE the alias/account predicate
 // is evaluated, so a large queue in which few runs are gated still costs one page per tick; the
 // service advances its in-memory cursor to last_scanned_id and wraps to the start (uuid.Nil)
