@@ -640,12 +640,52 @@ describe("mass-signal guardrail (#1576)", () => {
     assert.strictEqual(screenBashCommand("cat <<'EOF'\n`pkill`\nEOF").denied, false);
   });
 
+  for (const cmd of [
+    '(( 1 << "1" ))\necho "$(pkill node)"\n1',
+    "x=$((1<<'E'))\necho \"$(pkill node)\"\nE",
+    "${x//<<'E'/}\necho \"$(pkill node)\"\nE",
+  ]) it(`screens a matched delimiter after a non-heredoc shift: ${JSON.stringify(cmd)}`, () => {
+    assert.strictEqual(screenBashCommand(cmd).denied, true, cmd);
+  });
+  it("keeps a real quoted heredoc literal and screens an unquoted one", () => {
+    assert.strictEqual(screenBashCommand("cat <<'1'\necho \"$(pkill node)\"\n1").denied, false);
+    assert.strictEqual(screenBashCommand('cat <<1\necho "$(pkill node)"\n1').denied, true);
+  });
+
   for (const [name, cmd] of [
     ['quoted long backtick body', 'echo "`' + "((1<<E))\n".repeat(1100) + 'pkill node`"'],
     ['unquoted long backtick body', 'echo `' + "((1<<E))\n".repeat(1100) + 'pkill node`'],
     ['many nested backtick spans', 'echo "$(' + '``;'.repeat(1025) + ' echo `pkill node`)"'],
   ] as const) it(`fails closed for ${name}`, () => {
     assert.strictEqual(screenBashCommand(cmd).denied, true);
+  });
+
+  it("denies nested command substitutions past the screening depth", () => {
+    const cmd = 'echo "' + '$('.repeat(7) + 'printf ok' + ')'.repeat(7) + '"';
+    const result = screenBashCommand(cmd);
+    assert.strictEqual(result.denied, true);
+    assert.ok(result.reason?.includes("nested too deeply"), result.reason);
+  });
+
+  it("denies extreme substitution nesting without throwing", () => {
+    const cmd = 'echo "' + '$('.repeat(8192) + 'printf ok' + ')'.repeat(8192) + '"';
+    const result = screenBashCommand(cmd);
+    assert.strictEqual(result.denied, true);
+    assert.ok(result.reason?.includes("nested too deeply"), result.reason);
+  });
+
+  it("allows shallow nested command substitutions", () => {
+    const cmd = `echo "$(printf '%s' "$(printf ok)")"`;
+    assert.strictEqual(screenBashCommand(cmd).denied, false);
+  });
+
+  it("denies if the screener itself throws", () => {
+    const badPaths = new Proxy([] as string[], {
+      get() { throw new Error("injected screener failure"); },
+    });
+    const result = screenBashCommand("echo ok", badPaths);
+    assert.strictEqual(result.denied, true);
+    assert.ok(result.reason?.includes("screening failed"), result.reason);
   });
 });
 

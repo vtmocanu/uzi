@@ -84,7 +84,8 @@
 //    count ends or skips a body in the wrong place so a later substitution is not
 //    screened: a `case` pattern `)`, a `#` comment inside a `$(…)`, and `$'\''`
 //    ANSI-C quoting (the last desyncs the tokenizer for every rule too, as at base).
-//    An unmatched `<<` lookalike is scanned as ordinary text; a false match for a
+//    `<<` inside arithmetic or parameter expansion is not a heredoc. An unmatched
+//    `<<` lookalike elsewhere is scanned as ordinary text; a false match for a
 //    delimiter line remains a possible desync. An
 //    apostrophe in a heredoc body (`don't`) desyncs the tokenizer for every rule, which
 //    predates #1576.
@@ -202,6 +203,7 @@ const REASON_DOCKER_NO_DAEMON = "denied by guardrail: docker requires a daemon s
 // the client to a different daemon and is denied. Defense-in-depth, NOT containment.
 const REASON_DOCKER_REDIRECT = "denied by guardrail: redirecting the docker client to a different daemon is not permitted";
 const REASON_DEPTH = "denied by guardrail: command wrapping is nested too deeply to screen safely";
+const REASON_SCREEN_ERROR = "denied by guardrail: command screening failed; refusing to run Bash";
 const REASON_OUTSIDE_WORKTREE = "denied by guardrail: file access outside the run worktree is not permitted";
 const REASON_DOTGIT = "denied by guardrail: accessing the .git directory is not permitted";
 const REASON_UNKNOWN_SUBAGENT = "denied by guardrail: only the run's assembled subagents may be invoked";
@@ -704,16 +706,16 @@ function heredocBodyEnd(command: string, pos: number, doc: Heredoc): { bodyEnd: 
  * (just past that line's newline); heredocBodyEnd finds each body's end. A
  * quoted-delimiter body is literal in bash and skipped; an unquoted one expands, so its
  * substitutions are appended to `bodies`. Returns the resume index, or -1 past
- * MAX_SUBST_BODIES.
+ * MAX_SUBST_BODIES or MAX_DEPTH.
  */
-function consumeHeredocBodies(command: string, pos: number, docs: Heredoc[], bodies: string[]): number {
+function consumeHeredocBodies(command: string, pos: number, docs: Heredoc[], bodies: string[], depth: number): number {
   const n = command.length;
   for (const doc of docs) {
     const { bodyEnd, resume } = heredocBodyEnd(command, pos, doc);
     // An unmatched delimiter may be a `<<` in arithmetic or parameter expansion.
     // Its apparent body is not proven literal, so scan it even when quoted.
     if (!doc.quoted || bodyEnd === n) {
-      const inner = extractSubstitutionBodies(command.slice(pos, bodyEnd), false);
+      const inner = extractSubstitutionBodies(command.slice(pos, bodyEnd), false, depth);
       if (inner === undefined || bodies.length + inner.length > MAX_SUBST_BODIES) return -1;
       bodies.push(...inner);
     }
@@ -723,18 +725,52 @@ function consumeHeredocBodies(command: string, pos: number, docs: Heredoc[], bod
   return pos;
 }
 
+type ShellExpression = { kind: "arithmetic"; parens: number } | { kind: "parameter" };
+
+/** Track constructs where `<<` is an operator or pattern text, never a heredoc.
+ * Called after quote handling by both substitution scanners. */
+function advanceShellExpression(command: string, pos: number, stack: ShellExpression[], allowBareArithmetic: boolean): number | undefined {
+  if (command.startsWith("$((", pos)) {
+    stack.push({ kind: "arithmetic", parens: 2 });
+    return pos + 3;
+  }
+  if (command.startsWith("${", pos)) {
+    stack.push({ kind: "parameter" });
+    return pos + 2;
+  }
+  if (allowBareArithmetic && stack.length === 0 && command.startsWith("((", pos)) {
+    stack.push({ kind: "arithmetic", parens: 2 });
+    return pos + 2;
+  }
+  const top = stack[stack.length - 1];
+  if (top?.kind === "arithmetic") {
+    if (command[pos] === "(") { top.parens++; return pos + 1; }
+    if (command[pos] === ")") {
+      if (--top.parens === 0) stack.pop();
+      return pos + 1;
+    }
+  } else if (top?.kind === "parameter" && command[pos] === "}") {
+    stack.pop();
+    return pos + 1;
+  }
+  return undefined;
+}
+
 /**
  * The index of the `)` that closes the `$(` whose body starts at `start`, or the end of
- * the string when it is unbalanced. A quote-aware paren-depth count; a heredoc opened
+ * the string when it is unbalanced. Returns undefined past MAX_DEPTH so callers deny.
+ * A quote-aware paren-depth count; a heredoc opened
  * inside the body (`$(cat <<'EOF'` …) has its body jumped over, quoted or not, because
  * bash's own parse does not read parens in a heredoc body: prose like `a)` or `:)` in a
  * commit message must not end the substitution early (#1576). The body string is later
  * screened on its own, where an unquoted heredoc body is still scanned for
  * substitutions. A `#` comment can still shift the count (file header).
  */
-function substitutionEnd(command: string, start: number): number {
+function substitutionEnd(command: string, start: number, substDepth: number): number | undefined {
+  if (substDepth > MAX_DEPTH) return undefined;
   const n = command.length;
   const pending: Heredoc[] = [];
+  const expressions: ShellExpression[] = [];
   let depth = 1;
   let j = start;
   let inSingle = false;
@@ -754,8 +790,12 @@ function substitutionEnd(command: string, start: number): number {
     if (c === "'" && !inDouble) { inSingle = !inSingle; j++; continue; }
     if (c === '"' && !inSingle) { inDouble = !inDouble; j++; continue; }
     if (inSingle) { j++; continue; }
+    const expressionNext = advanceShellExpression(command, j, expressions, !inDouble);
+    if (expressionNext !== undefined) { j = expressionNext; continue; }
     if (c === "$" && command[j + 1] === "(") {
-      j = substitutionEnd(command, j + 2) + 1;
+      const nestedEnd = substitutionEnd(command, j + 2, substDepth + 1);
+      if (nestedEnd === undefined) return undefined;
+      j = nestedEnd + 1;
       continue;
     }
     if (inDouble) { j++; continue; }
@@ -764,7 +804,7 @@ function substitutionEnd(command: string, start: number): number {
       for (const doc of pending.splice(0)) j = heredocBodyEnd(command, j, doc).resume;
       continue;
     }
-    if (c === "<" && command[j + 1] === "<") {
+    if (expressions.length === 0 && c === "<" && command[j + 1] === "<") {
       if (command[j + 2] === "<") { j += 3; continue; } // `<<<` here-string
       const doc = parseHeredocOperator(command, j + 2);
       if (doc) { pending.push(doc); j = doc.end; continue; }
@@ -792,14 +832,16 @@ function substitutionEnd(command: string, start: number): number {
  * `<<"EOF"`, `<<\EOF`, `<<-'EOF'`) has a literal body in bash, where a backtick does not
  * run, so that body is skipped (consumeHeredocBodies); an unquoted-delimiter body still
  * expands and is scanned. A `<<` after an unquoted `#` comment opener, or inside double
- * quotes, opens no heredoc. Returns undefined past MAX_SUBST_BODIES.
+ * quotes, arithmetic or parameter expansion opens no heredoc. Returns undefined
+ * past MAX_SUBST_BODIES or MAX_DEPTH.
  */
-function extractSubstitutionBodies(command: string, heredocs = true): string[] | undefined {
+function extractSubstitutionBodies(command: string, heredocs = true, depth = 0): string[] | undefined {
   const bodies: string[] = [];
   const n = command.length;
   let inDouble = false;
   // Heredocs opened on the current line, in order; their bodies start after its newline.
   const pending: Heredoc[] = [];
+  const expressions: ShellExpression[] = [];
   // An unquoted `#` at a word start opens a comment: a `<<` after it is no heredoc.
   let inComment = false;
   let i = 0;
@@ -809,7 +851,7 @@ function extractSubstitutionBodies(command: string, heredocs = true): string[] |
     if (ch === "\n" && !inDouble) {
       inComment = false;
       if (heredocs && pending.length > 0) {
-        i = consumeHeredocBodies(command, i + 1, pending.splice(0), bodies);
+        i = consumeHeredocBodies(command, i + 1, pending.splice(0), bodies, depth);
         if (i < 0) return undefined;
         continue;
       }
@@ -820,8 +862,10 @@ function extractSubstitutionBodies(command: string, heredocs = true): string[] |
       continue;
     }
     if (ch === '"') { inDouble = !inDouble; i++; continue; }
+    const expressionNext = inComment ? undefined : advanceShellExpression(command, i, expressions, !inDouble);
+    if (expressionNext !== undefined) { i = expressionNext; continue; }
     if (!inDouble && ch === "#" && (i === 0 || /[\s;&|()]/.test(command[i - 1]!))) inComment = true;
-    if (heredocs && !inDouble && !inComment && ch === "<" && command[i + 1] === "<") {
+    if (heredocs && !inDouble && !inComment && expressions.length === 0 && ch === "<" && command[i + 1] === "<") {
       if (command[i + 2] === "<") { i += 3; continue; } // `<<<` here-string, not a heredoc
       const doc = parseHeredocOperator(command, i + 2);
       if (doc) { pending.push(doc); i = doc.end; continue; }
@@ -830,7 +874,8 @@ function extractSubstitutionBodies(command: string, heredocs = true): string[] |
     }
     let body: string | undefined;
     if (ch === "$" && command[i + 1] === "(" && inDouble) {
-      const j = substitutionEnd(command, i + 2);
+      const j = substitutionEnd(command, i + 2, depth + 1);
+      if (j === undefined) return undefined;
       body = command.slice(i + 2, j);
       i = j + 1;
     } else if (ch === "`") {
@@ -1062,7 +1107,7 @@ function screenWithDepth(
   // screened quoted substitution bodies for the other rules (`echo "$(git push)"` is
   // allowed there and here), and screening them would over-deny prose in commit
   // messages. A body screened past MAX_DEPTH must fail closed.
-  const bodies = extractSubstitutionBodies(command);
+  const bodies = extractSubstitutionBodies(command, true, depth);
   if (bodies === undefined) return deny(REASON_DEPTH);
   for (const body of bodies) {
     const r = screenWithDepth(body, depth + 1, secretPaths, dockerWired, ctx, assignments);
@@ -1083,25 +1128,31 @@ function screenWithDepth(
  * this analyzer (auditor B2 — the screener stays pure): the worker resolves docker
  * wiring ONCE at startup (docker-wiring.ts) and passes the resolved boolean here.
  * false (the default) DENIES docker entirely; true allows it (minus daemon redirects).
+ * An unexpected screening error is denied rather than escaping the PreToolUse hook.
  */
 export function screenBashCommand(
   command: string,
   extraSecretPaths: readonly string[] = [],
   dockerWired = false,
 ): BashScreenResult {
-  const ctx: ScreenCtx = { dynamicKill: false, enumerator: false };
-  const result = screenWithDepth(command, 0, [...SECRET_PATH_PREFIXES, ...extraSecretPaths], dockerWired, ctx);
-  // #1576: a `kill` of a run-time PID in the same command as a PID enumerator
-  // (`kill $(lsof -ti :3000)`, `lsof -ti :3000 | xargs kill`) is a mass-signal kill: a
-  // busybox lsof ignores its filters and lists every process, the agent's own included.
-  // Replaces only REASON_PS (`kill $(pgrep x)`) or an allow, because it names the
-  // supported alternative; any other denial (`git push …; kill $(pgrep x)`) keeps its
-  // own reason. A heuristic, not containment (file header).
-  // A statically evaluated `kill` target (`$'-1'`, `$((-1))`) is a raw-string check with
-  // the same precedence.
-  const massSignal = (ctx.dynamicKill && ctx.enumerator) || KILL_STATIC_EVAL_RE.test(command);
-  if (massSignal && (!result.denied || result.reason === REASON_PS)) return deny(REASON_MASS_SIGNAL);
-  return result;
+  try {
+    const ctx: ScreenCtx = { dynamicKill: false, enumerator: false };
+    const result = screenWithDepth(command, 0, [...SECRET_PATH_PREFIXES, ...extraSecretPaths], dockerWired, ctx);
+    // #1576: a `kill` of a run-time PID in the same command as a PID enumerator
+    // (`kill $(lsof -ti :3000)`, `lsof -ti :3000 | xargs kill`) is a mass-signal kill: a
+    // busybox lsof ignores its filters and lists every process, the agent's own included.
+    // Replaces only REASON_PS (`kill $(pgrep x)`) or an allow, because it names the
+    // supported alternative; any other denial (`git push …; kill $(pgrep x)`) keeps its
+    // own reason. A heuristic, not containment (file header).
+    // A statically evaluated `kill` target (`$'-1'`, `$((-1))`) is a raw-string check with
+    // the same precedence.
+    const massSignal = (ctx.dynamicKill && ctx.enumerator) || KILL_STATIC_EVAL_RE.test(command);
+    if (massSignal && (!result.denied || result.reason === REASON_PS)) return deny(REASON_MASS_SIGNAL);
+    return result;
+  } catch {
+    // Never let a parser failure turn into an unhandled PreToolUse hook error.
+    return deny(REASON_SCREEN_ERROR);
+  }
 }
 
 /** Extract the `command` field from a Bash tool_input, if present. */
