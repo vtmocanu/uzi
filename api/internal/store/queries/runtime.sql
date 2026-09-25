@@ -2520,16 +2520,16 @@ WHERE id = @id AND worker_id = @worker_id
 -- overtaken by this run's first completion attempt. The completion hold WINS that race, so it
 -- SETTLES the wall request in the same statement: it clears the three pause columns (the CASE on
 -- the OLD pause_mode leaves a milestone/now/NULL request untouched) and the leading `consumed_wall`
--- CTE stamps consumed_at on the run's unconsumed kind='pause' body='wall' input, so a resumed flight
--- is never handed a stale wall abort. By the D18 invariant an unconsumed wall input exists iff
--- pause_mode = 'wall', so the CTE's EXISTS guard mirrors this UPDATE's WHERE plus pause_mode = 'wall'.
+-- CTE settles the run's unapplied kind='pause' body='wall' input, so a resumed flight
+-- is never handed a stale wall abort. An ACKed receipt may already have consumed_at set;
+-- applied_at remains NULL until worker delivery or this server settlement.
 --
 -- THE HEALTH RESET is mandatory for SetRunPaused's reason: ListActiveRunsForHealth is a positive
 -- allowlist that never revisits a park, so a flag live at hold time would freeze for the whole
 -- hold. session_id is COALESCE'd (sqlc.narg) so an omitting report preserves it.
 WITH consumed_wall AS (
     UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
-    WHERE u.kind = 'pause' AND u.body = 'wall' AND u.consumed_at IS NULL
+    WHERE u.kind = 'pause' AND u.body = 'wall' AND u.applied_at IS NULL
       AND EXISTS (
           SELECT 1 FROM runs r
           WHERE r.id = u.run_id AND r.id = @id AND r.worker_id = @worker_id
@@ -2664,7 +2664,7 @@ RETURNING id, user_id, status;
 -- COALESCE'd so an omitting report preserves it; health reset for SetRunPaused's allowlist reason.
 WITH consumed_wall AS (
     UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
-    WHERE u.kind = 'pause' AND u.body = 'wall' AND u.consumed_at IS NULL
+    WHERE u.kind = 'pause' AND u.body = 'wall' AND u.applied_at IS NULL
       AND EXISTS (
           SELECT 1 FROM runs r
           WHERE r.id = u.run_id AND r.id = @id AND r.worker_id = @worker_id
@@ -4027,7 +4027,7 @@ wall_input_consumed AS (
     -- flight a stale 'wall' abort.
     UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
     FROM parked p
-    WHERE u.run_id = p.id AND u.kind = 'pause' AND u.body = 'wall' AND u.consumed_at IS NULL
+    WHERE u.run_id = p.id AND u.kind = 'pause' AND u.body = 'wall' AND u.applied_at IS NULL
 )
 SELECT id, user_id, status FROM parked;
 
@@ -5584,12 +5584,12 @@ WITH extended AS (
     RETURNING id, budget_extension_seconds
 ),
 -- PRD #1497 M1 (D18): settle the voided wall request's input too, so ConsumeRunInputs never hands
--- the resumed flight a stale 'wall' abort. By the D18 invariant an unconsumed wall input exists iff
--- pause_mode was 'wall', so this is a no-op on any non-wall extend.
+-- the resumed flight a stale 'wall' abort. An ACKed wall receipt can already have
+-- consumed_at set; applied_at stays NULL until delivery or this settlement.
 consumed_wall AS (
     UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
     FROM extended e
-    WHERE u.run_id = e.id AND u.kind = 'pause' AND u.body = 'wall' AND u.consumed_at IS NULL
+    WHERE u.run_id = e.id AND u.kind = 'pause' AND u.body = 'wall' AND u.applied_at IS NULL
 )
 INSERT INTO run_user_inputs (run_id, kind, body, disposition)
 SELECT sqlc.arg('id'), 'extend', sqlc.narg('body'), 'applied' FROM extended
@@ -5641,7 +5641,7 @@ WITH extended AS (
 ),
 consumed_wall AS (
     UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
-    WHERE u.run_id = sqlc.arg('id') AND u.kind = 'pause' AND u.body = 'wall' AND u.consumed_at IS NULL
+    WHERE u.run_id = sqlc.arg('id') AND u.kind = 'pause' AND u.body = 'wall' AND u.applied_at IS NULL
       AND EXISTS (SELECT 1 FROM extended)
 ),
 extend_audit AS (
@@ -5714,7 +5714,7 @@ superseded AS (
 ),
 consumed_wall AS (
     UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
-    WHERE u.run_id = sqlc.arg('id') AND u.kind = 'pause' AND u.body = 'wall' AND u.consumed_at IS NULL
+    WHERE u.run_id = sqlc.arg('id') AND u.kind = 'pause' AND u.body = 'wall' AND u.applied_at IS NULL
       AND EXISTS (SELECT 1 FROM stopped)
 ),
 scope_audit AS (

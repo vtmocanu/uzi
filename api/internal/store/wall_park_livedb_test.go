@@ -910,12 +910,33 @@ func TestWallInputSettlementLiveDB(t *testing.T) {
 		w := fx.worker("stale", wpWorker{heartbeatAgo: time.Hour, nonce: "n"})
 		id := fx.run(wpRun{worker: &w, budgetWall: p32(60), claimGen: 1, startedAgo: 2 * time.Hour, pauseMode: "wall"})
 		armWall(id)
+		// Model an ACK whose reply was lost before the worker applied the wall abort.
+		mustExec(fx.ctx, t, fx.pool, `UPDATE run_user_inputs SET consumed_at=now(),
+			consumed_claim_generation=1, consumed_worker_id=$2
+			WHERE run_id=$1 AND kind='pause' AND body='wall'`, id, w)
 		if _, err := fx.q.ParkRunsAtWall(fx.ctx, store.ParkRunsAtWallParams{
 			Now: wpNow(), GlobalTimeoutSeconds: 1, WorkerStaleCutoff: wpAgo(45 * time.Second), GraceSeconds: 600}); err != nil {
 			t.Fatalf("ParkRunsAtWall: %v", err)
 		}
 		if fx.unconsumedWall(id) != 0 {
 			t.Fatal("ParkRunsAtWall must consume the wall input (D18)")
+		}
+		var applied bool
+		if err := fx.pool.QueryRow(fx.ctx, `SELECT applied_at IS NOT NULL FROM run_user_inputs
+			WHERE run_id=$1 AND kind='pause' AND body='wall'`, id).Scan(&applied); err != nil {
+			t.Fatal(err)
+		}
+		if !applied {
+			t.Fatal("ParkRunsAtWall must settle an ACKed but unapplied wall input")
+		}
+		rows, err := fx.q.ListReplayRunInputs(fx.ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range rows {
+			if row.Kind == "pause" && row.Body.String == "wall" {
+				t.Fatal("a server-settled wall abort remained replayable")
+			}
 		}
 	})
 
