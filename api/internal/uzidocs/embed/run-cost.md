@@ -47,6 +47,37 @@ and the measured under-count it replaced, and
 [ADR-1562](../adr/1562-run-usage-session-cumulative-basis.md) for the
 session-cumulative fold and what it does not backfill.
 
+## Metered, subscription, and unreported cost
+
+Not every run's cost is a real dollar figure. Each run's folded `run_usage`
+row carries a `cost_status` of `metered`, `subscription`, or `unreported`,
+and every reader that shows a per-run cost branches on that status rather
+than guessing from `cost_usd` alone: the run page, `/api/usage`, the admin
+usage pages, `uzi run get`'s COST row, and the TUI. `uzi run list` shows no
+cost at all (its columns are ID, KIND, STATUS, AGE, HARNESS, TITLE); reach
+for `uzi run get <id>` or the TUI for a run's cost from the CLI.
+
+A Claude run is always `metered`: the SDK reports a dollar figure per
+call, folded exactly as described above. A Codex run's status instead
+follows the credential mode the run is bound to: a **subscription** Codex
+login has no per-token charge at all, so every one of its runs is
+`subscription`, cost pinned to $0. An OpenAI **API key** run is `metered`
+from OpenAI's own price table only when every observed response prices
+cleanly; it falls back to `unreported` whenever that evidence is
+incomplete — no price row for the model (e.g. an unrecognized custom Codex
+model), or no, unreconciled, or malformed usage evidence for one of its
+responses — so a partial or uncertain read is never presented as a real
+metered dollar figure.
+
+The UI never renders a non-metered run as a bare "$0" or dash, since that
+would be ambiguous with a real zero-cost metered call. It spells the status
+out instead: a headline of "Subscription" or "Unavailable" (in place of a
+dollar figure), a sub-label like "subscription usage · no metered cost" or
+"tokens only · cost unavailable", and a dense table cell of `sub` or `n/a`.
+An aggregate (Self usage, Admin usage) totals only the metered subset and
+discloses what it left out, e.g. "Cost excludes 2 Codex subscription runs
+and 1 unreported run".
+
 ## The model tier is not the difference
 
 `override_subagent_model` (added by migration `00119_schedule_run_override_subagent_model.sql`,

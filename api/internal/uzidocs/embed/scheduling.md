@@ -170,6 +170,34 @@ reference](./cli.md#commands)) or in the web schedule modal.
 - **CLI**: `uzi schedule create | list | get | pause | resume | run-now |
   delete` — see [the CLI reference](./cli.md#commands) for the full flag list.
 
+### Which harness a schedule runs on
+
+A schedule either **pins** a harness (Claude or Codex) or leaves it
+**unpinned**. Pin it with the modal's **Harness (optional)** picker (shown
+only when you hold a usable credential for both harnesses) or with
+`uzi schedule create/edit --harness claude|codex`; `--harness ""` clears the
+pin. Its default option is "Use my default" — leave it there to resolve the
+harness automatically at fire time.
+
+- **Unpinned** (the default): each fire resolves the harness afresh, the same
+  way a manual start does — your default harness if its credential is usable,
+  otherwise whichever harness you have a usable credential for, Claude if
+  both. If neither is usable, the fire records the `no_usable_credential`
+  skip (see [Fire outcomes](#fire-outcomes)). An unpinned schedule with a
+  stored Anthropic credential override that now resolves to Codex fails
+  closed instead, with the `codex_override_conflict` skip.
+- **Pinned**: every fire uses that harness and never falls back to the
+  other. If its credential is missing or unusable, the behavior differs by
+  target: a **single-issue** or **prompt** schedule starts nothing, records
+  no outcome, and does not advance — it retries each tick until the
+  credential is usable again or you change the pin. A **sweep** schedule
+  instead records each affected candidate as a `fetch_failed` skip and
+  keeps advancing, since one bad candidate shouldn't stall the rest of the
+  fan-out.
+
+Each run a fire starts records the harness it actually ran on, shown on the
+run.
+
 ### Running a schedule on several repos
 
 Creating a custom schedule can target more than one repo at once: the "New
@@ -288,6 +316,23 @@ exceed `max_issues` once backfill walks past a skip), which ones
   came due, so nothing started. It's benign and self-resolving: the
   schedule's cadence advances normally and re-fires on schedule next time,
   and nothing replays on resume.
+- `no_usable_credential` — neither harness has a usable credential for the
+  owner (no Anthropic token and no usable Codex credential — an API key
+  counts), and the fire has no explicit harness pin forcing one. It's
+  benign: the schedule's cadence advances normally and re-fires next time,
+  once the owner configures a usable credential for either harness. This
+  reason is recorded (and the schedule advances) for issue, sweep, and
+  prompt fires; the `self-improve` [default job](#default-jobs) is the one
+  exception — there, the same condition instead leaves the fire unrecorded
+  and non-advancing, retrying each tick, the same as any other pinned
+  harness with no usable credential (see [Which harness a schedule runs
+  on](#which-harness-a-schedule-runs-on)).
+- `codex_override_conflict` — the schedule is unpinned but carries a stored
+  Anthropic credential override, and the owner's harness now resolves to
+  Codex. The override can't ride a Codex run and there's no cross-harness
+  fallback, so the fire starts nothing and leaves the stored override
+  untouched. Benign: the schedule advances and re-fires next cadence, and
+  may resolve back to Claude (or the override may be changed) by then.
 
 `examined == started + skipped` always holds — every candidate the fire
 reaches lands in exactly one bucket, so the tally never silently drops one.

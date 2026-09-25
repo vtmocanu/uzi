@@ -100,7 +100,7 @@ set -f
 
 # The canonical infra hosts every worker egress render must Allow, independent of
 # the forge configuration. Kept here as the single source of the STATIC expectation.
-STATIC_HOSTS="*.anthropic.com cache.nixos.org search.devbox.sh api.github.com ghcr.io pkg-containers.githubusercontent.com"
+STATIC_HOSTS="*.anthropic.com api.openai.com chatgpt.com auth.openai.com cache.nixos.org search.devbox.sh api.github.com ghcr.io pkg-containers.githubusercontent.com"
 
 # has_worker_egress_policy <file> -- succeed iff the render contains the crd.antrea.io
 # `-worker-egress` NetworkPolicy specifically. Keyed on that document's metadata name
@@ -208,6 +208,135 @@ check_completeness() {
   return 0
 }
 
+# ---------------------------------------------------------------------------------
+# Codex egress SHAPE (PRD #1106 D12, issue #1623).
+#
+# Completeness above only proves each Codex host is PRESENT somewhere in the Allow set.
+# D12 is narrower than that: exactly api.openai.com, chatgpt.com and auth.openai.com,
+# each on TCP 443 only, and NO wildcard or further OpenAI/ChatGPT host. A widening
+# (`*.openai.com`, `*`, `*openai*`, another port) renders fine and passes completeness,
+# so this check asserts the shape directly.
+#
+# check_codex_egress <file> -- within the crd.antrea.io `-worker-egress` NetworkPolicy
+# only (the same document scoping as collect_allow_fqdns), and over Allow entries only,
+# with every fqdn lowercased and one trailing `.` stripped first:
+#   - each Codex host must match exactly one Allow entry (string equality), and every
+#     entry matching it must have ports of exactly one `protocol: TCP` + `port: 443`;
+#   - any other Allow fqdn that equals or ends with `openai.com` or `chatgpt.com`
+#     (literal string comparison) is a finding;
+#   - any other Allow fqdn containing `*` is read as a glob (`*` = any run of
+#     characters, anchored at both ends) and is a finding if it matches a host in
+#     CODEX_PROBES, so `*`, `*.com` and `*openai*` fail while `*.anthropic.com` passes.
+# Forge-derived Allows that are not OpenAI/ChatGPT hosts are ignored. One FAIL line per
+# finding on stdout; returns 1 on a finding, 2 when the -worker-egress document is
+# absent, 0 (with an OK line) otherwise.
+CODEX_HOSTS="api.openai.com chatgpt.com auth.openai.com"
+CODEX_PROBES="api.openai.com chatgpt.com auth.openai.com platform.openai.com x.openai.com x.chatgpt.com"
+
+check_codex_egress() {
+  _file="$1"
+  if ! has_worker_egress_policy "$_file"; then
+    echo "BROKEN: no crd.antrea.io -worker-egress NetworkPolicy document in $_file --" >&2
+    echo "        the Codex egress shape check has nothing to inspect." >&2
+    return 2
+  fi
+  awk -v hosts="$CODEX_HOSTS" -v probes="$CODEX_PROBES" '
+    # Value after the first `key:`, quotes and whitespace stripped.
+    function val(line,   v) {
+      v = line
+      sub(/^[^:]*:[[:space:]]*/, "", v)
+      gsub(/"/, "", v)
+      gsub(/[[:space:]]/, "", v)
+      return v
+    }
+    # Close the current ports item into the entry signature, e.g. `TCP/443`.
+    function closeitem(   one) {
+      if (item) {
+        one = proto "/" port (extra ? "+other" : "")
+        sig = (sig == "" ? one : sig "," one)
+      }
+      item = 0; proto = ""; port = ""; extra = 0
+    }
+    # Record each fqdn of the finished entry, if it was an Allow.
+    function flush(   i) {
+      closeitem()
+      if (inentry && action == "Allow")
+        for (i = 1; i <= nf; i++) { n++; F[n] = fq[i]; S[n] = (sig == "" ? "none" : sig) }
+      inentry = 0; nf = 0; sig = ""; action = ""; inports = 0
+    }
+    function endswith(s, suf) {
+      return length(s) >= length(suf) && substr(s, length(s) - length(suf) + 1) == suf
+    }
+    # Anchored regex for a wildcard fqdn: `*` matches any run, everything else literal.
+    function globre(s,   i, ch, r) {
+      r = "^"
+      for (i = 1; i <= length(s); i++) {
+        ch = substr(s, i, 1)
+        if (ch == "*") r = r ".*"
+        else if (ch ~ /[a-z0-9-]/) r = r ch
+        else if (ch == "\\" || ch == "^" || ch == "]") r = r "\\" ch
+        else r = r "[" ch "]"
+      }
+      return r "$"
+    }
+    /^---[[:space:]]*$/                       { if (we) flush(); antrea = 0; we = 0; eg = 0; next }
+    /^apiVersion:[[:space:]]*crd\.antrea\.io/ { antrea = 1; next }
+    antrea && !we && /^[[:space:]]+name:[[:space:]].*-worker-egress[[:space:]]*$/ { we = 1; next }
+    !we { next }
+    /^[[:space:]]*(#.*)?$/                    { next }   # comments and blank lines carry no keys
+    /^[[:space:]]*egress:[[:space:]]*$/       { eg = 1; next }
+    !eg { next }
+    /^[[:space:]]*-[[:space:]]+name:/         { flush(); inentry = 1; next }
+    /^[[:space:]]*action:/                    { action = val($0); next }
+    /^[[:space:]]*to:[[:space:]]*$/           { closeitem(); inports = 0; next }
+    /^[[:space:]]*ports:/                     { closeitem(); inports = 1; next }
+    /^[[:space:]]*(-[[:space:]]+)?fqdn:/      { v = tolower(val($0)); sub(/\.$/, "", v); fq[++nf] = v; next }
+    inports && /^[[:space:]]*-[[:space:]]/    { closeitem(); item = 1 }
+    inports && item {
+      k = $0
+      sub(/^[[:space:]]*(-[[:space:]]+)?/, "", k)
+      sub(/:.*$/, "", k)
+      if (k == "protocol") proto = val($0)
+      else if (k == "port") port = val($0)
+      else extra = 1
+    }
+    END {
+      if (we) flush()
+      bad = 0
+      nh = split(hosts, H, " ")
+      np = split(probes, P, " ")
+      for (j = 1; j <= nh; j++) { want[H[j]] = 1; c = 0
+        for (i = 1; i <= n; i++) if (F[i] == H[j]) c++
+        if (c == 0) {
+          printf "FAIL: Codex worker egress %s: no Allow entry\n", H[j]; bad = 1
+        } else if (c > 1) {
+          printf "FAIL: Codex worker egress %s: %d Allow entries, want exactly one\n", H[j], c; bad = 1
+        }
+        for (i = 1; i <= n; i++) if (F[i] == H[j] && S[i] != "TCP/443") {
+          printf "FAIL: Codex worker egress %s: ports are %s, want exactly TCP/443\n", H[j], S[i]; bad = 1
+        }
+      }
+      for (i = 1; i <= n; i++) {
+        f = F[i]
+        if (f in want) continue
+        if (endswith(f, "openai.com") || endswith(f, "chatgpt.com")) {
+          printf "FAIL: Codex worker egress %s: unexpected OpenAI/ChatGPT Allow (only the exact api.openai.com, chatgpt.com and auth.openai.com are permitted)\n", f
+          bad = 1
+        } else if (index(f, "*")) {
+          re = globre(f)
+          for (p = 1; p <= np; p++) if (P[p] ~ re) {
+            printf "FAIL: Codex worker egress %s: wildcard Allow covers %s (only the exact api.openai.com, chatgpt.com and auth.openai.com are permitted)\n", f, P[p]
+            bad = 1
+            break
+          }
+        }
+      }
+      if (bad) exit 1
+      printf "OK: Codex worker egress is exactly %s, each on TCP/443 only\n", hosts
+    }
+  ' "$_file"
+}
+
 # --- canary self-test: prove the detector fires on a known-incomplete render --------
 # Run the completeness check against the committed, deliberately-incomplete canary
 # BEFORE trusting it on the real render. The canary omits TWO hosts, one per detector
@@ -232,5 +361,108 @@ else
   exit 2
 fi
 
-# --- the real check on the render under test ----------------------------------------
+# --- Codex canary self-test: prove the shape check fires ---------------------------
+# The committed canary plants one defect per detector path (its header lists them):
+# a wrong port, a duplicate (written upper-case with a trailing dot), a suffix
+# widening, a widening that only matches once normalized, a catch-all `*` glob and a
+# missing host. It also carries entries that must NOT be reported: a correct
+# api.openai.com, `*.anthropic.com`, a Drop entry (Allow-only filter) and an Allow in
+# a second Antrea policy (document scoping). A working check returns 1 with EXACTLY
+# the six FAIL lines below and none of the must-not-report hosts; anything else means
+# the instrument is broken.
+CODEX_CANARY="$SCRIPT_DIR/codex-egress-canary.yaml"
+[ -f "$CODEX_CANARY" ] || { echo "BROKEN: Codex canary fixture missing at $CODEX_CANARY" >&2; exit 2; }
+
+CODEX_ONLY="(only the exact api.openai.com, chatgpt.com and auth.openai.com are permitted)"
+codex_out=$(check_codex_egress "$CODEX_CANARY") && codex_rc=0 || codex_rc=$?
+codex_ok=0
+if [ "$codex_rc" -eq 1 ] \
+   && [ "$(printf '%s\n' "$codex_out" | grep -c '^FAIL: ')" -eq 6 ] \
+   && printf '%s\n' "$codex_out" | is_present "FAIL: Codex worker egress chatgpt.com: ports are TCP/80, want exactly TCP/443" \
+   && printf '%s\n' "$codex_out" | is_present "FAIL: Codex worker egress chatgpt.com: 2 Allow entries, want exactly one" \
+   && printf '%s\n' "$codex_out" | is_present "FAIL: Codex worker egress *.openai.com: unexpected OpenAI/ChatGPT Allow $CODEX_ONLY" \
+   && printf '%s\n' "$codex_out" | is_present "FAIL: Codex worker egress *.chatgpt.com: unexpected OpenAI/ChatGPT Allow $CODEX_ONLY" \
+   && printf '%s\n' "$codex_out" | is_present "FAIL: Codex worker egress *: wildcard Allow covers api.openai.com $CODEX_ONLY" \
+   && printf '%s\n' "$codex_out" | is_present "FAIL: Codex worker egress auth.openai.com: no Allow entry"; then
+  codex_ok=1
+  for _absent in "api.openai.com:" "*.anthropic.com" "evil.chatgpt.com" "platform.openai.com"; do
+    if printf '%s\n' "$codex_out" | grep -F -q -- "$_absent"; then codex_ok=0; fi
+  done
+fi
+if [ "$codex_ok" -eq 1 ]; then
+  echo "OK: Codex canary self-test named exactly its six findings (port, duplicate, two widenings, catch-all glob, missing host) and none of the out-of-scope entries"
+else
+  echo "BROKEN: Codex canary self-test did not fire as expected (rc=$codex_rc) on a" >&2
+  echo "        known-wrong render -- the Codex egress shape check is not working," >&2
+  echo "        so a widened or missing Codex rule would read as green. Output was:" >&2
+  printf '%s\n' "$codex_out" | sed 's/^/          /' >&2
+  exit 2
+fi
+
+# --- the real checks on the render under test ---------------------------------------
 check_completeness "$RENDER" || exit $?
+check_codex_egress "$RENDER" || exit $?
+
+# --- chart defaults: default-off, and the chart's OWN allowFQDNs --------------------
+# The render under test (CI: deploy/values/ci-render.yaml) REPLACES allowFQDNs, so it
+# proves nothing about deploy/chart/values.yaml's defaults. Render the chart twice more
+# from its defaults: (i) with fqdnEgress left at its default, which must emit NO
+# -worker-egress policy (off by default, fail-closed on clusters without Antrea); and
+# (ii) with fqdnEgress enabled (plus the forge.allowedBaseURLs its guard requires),
+# which must pass both completeness and the Codex shape check. Rendered from an
+# offline copy with the `dependencies:` block stripped (the assert-drain-knobs-render.sh
+# approach), so no subchart fetch is needed.
+if ! command -v helm >/dev/null 2>&1; then
+  echo "SKIP: helm not on PATH -- chart-default and default-off checks did not run"
+  exit 0
+fi
+
+CHART_DIR="$SCRIPT_DIR/../deploy/chart"
+[ -f "$CHART_DIR/Chart.yaml" ] || { echo "BROKEN: no Chart.yaml under $CHART_DIR" >&2; exit 2; }
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+trap 'exit 2' INT TERM
+
+STRIPPED="$WORK/chart"
+cp -R "$CHART_DIR" "$STRIPPED"
+rm -f "$STRIPPED/Chart.lock"
+# Drop any built subchart archives (CI runs `helm dependency build` first), so the
+# defaults render the same offline chart everywhere, without the CNPG subchart.
+rm -rf "$STRIPPED/charts"
+awk '
+  BEGIN { skip = 0 }
+  /^dependencies:/ { skip = 1; next }        # drop the dependencies: list ...
+  skip && /^[^[:space:]-]/ { skip = 0 }      # ... until the next top-level key
+  skip { next }
+  { print }
+' "$CHART_DIR/Chart.yaml" > "$STRIPPED/Chart.yaml"
+
+DEFAULT_OFF="$WORK/default-off.yaml"
+if ! helm template uzi "$STRIPPED" \
+     --set workers.enabled=true --set api.tls.enabled=true > "$DEFAULT_OFF" 2> "$WORK/err"; then
+  echo "BROKEN: helm template of the chart defaults failed:" >&2
+  sed 's/^/          /' "$WORK/err" >&2
+  exit 2
+fi
+if has_worker_egress_policy "$DEFAULT_OFF"; then
+  echo "FAIL: the chart defaults render a -worker-egress policy; workers.fqdnEgress must default off"
+  exit 1
+fi
+echo "OK: default-off -- the chart defaults render no -worker-egress policy"
+
+DEFAULT_ON="$WORK/default-on.yaml"
+if ! helm template uzi "$STRIPPED" \
+     --set workers.enabled=true --set api.tls.enabled=true \
+     --set workers.fqdnEgress.enabled=true \
+     --set 'forge.allowedBaseURLs={https://gitlab.example.com}' > "$DEFAULT_ON" 2> "$WORK/err"; then
+  echo "BROKEN: helm template of the chart defaults with fqdnEgress enabled failed:" >&2
+  sed 's/^/          /' "$WORK/err" >&2
+  exit 2
+fi
+_rc=0
+check_completeness "$DEFAULT_ON" || _rc=$?
+[ "$_rc" -eq 0 ] || { echo "FAIL: chart-default allowFQDNs (deploy/chart/values.yaml) failed completeness"; exit "$_rc"; }
+check_codex_egress "$DEFAULT_ON" || _rc=$?
+[ "$_rc" -eq 0 ] || { echo "FAIL: chart-default allowFQDNs (deploy/chart/values.yaml) failed the Codex egress shape check"; exit "$_rc"; }
+echo "OK: chart defaults -- deploy/chart/values.yaml allowFQDNs pass completeness and the Codex shape check"

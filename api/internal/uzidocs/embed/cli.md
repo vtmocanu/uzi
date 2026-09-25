@@ -88,6 +88,7 @@ uzi run wait <id> [--until <status,...>] [--interval <dur>] [--timeout <dur>] [-
 uzi run create --repo <id> --issue <iid> [--plan-file <path>]
                 [--agent-source own|repo] [--exclude-agents a,b]
                 [--planned-commit <sha>] [--require-base] [--force]
+                [--harness claude|codex]
 uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
 uzi run reject <id> [--message <text>]
 uzi run revise <id> [--message <text>]
@@ -113,6 +114,7 @@ uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--la
                     [--max-issues <n>] [--guidance <text>]
                     [--output mr|issues]
                     [--model <alias|id>] [--apply-model-to-agents[=false]]
+                    [--harness claude|codex]
 uzi schedule list | get <id> | pause <id> | resume <id> | run-now <id> | delete <id>
 uzi schedule pause-all --until <when> | resume-all | pause-status
 uzi schedule edit <id> [--cron <expr> | --at <rfc3339>] [--tz <iana>]
@@ -122,6 +124,7 @@ uzi schedule edit <id> [--cron <expr> | --at <rfc3339>] [--tz <iana>]
                    [--max-issues <n> | --clear-max-issues]
                    [--output mr|issues|""]
                    [--model <alias|id>] [--apply-model-to-agents[=false]] [--repo <id>]
+                   [--harness claude|codex|""]
 uzi schedule catalog list
 uzi schedule catalog enable <slug> --repo <id> [--repo <id> ...] [--create-missing-labels]
 uzi schedule reset <id>
@@ -163,6 +166,20 @@ Global flags: `--json`, `--url <url>`, `--quiet`, `--no-color`,
 
 A few worth knowing:
 
+- **`--harness` picks the run's execution engine; omit it to let the server
+  resolve one.** `run create --harness claude|codex` and `schedule create
+  --harness claude|codex` request a specific harness outright; omitting the
+  flag leaves the server's own resolution in charge (your effective default,
+  or whichever harness you have a usable credential for). `schedule edit
+  --harness ""` clears a schedule's pin back to per-fire resolution; leaving
+  the flag unset on edit leaves the stored pin unchanged. The resolved
+  harness shows as a `HARNESS` row on `uzi run get`; on `uzi run list` it's
+  a `HARNESS` column that shows `codex` for a Codex run and is left blank
+  for a Claude run (the terse convention the CLI's list view uses
+  throughout). A schedule's pin (or `implicit` when unset) shows on `uzi
+  schedule get`.
+  There's no CLI setter for your own default harness; that's a **Settings →
+  Run defaults** web-only control (see [Worker model](./worker-model.md)).
 - **`version` reports two coordinates, not one.** It always prints the CLI's own
   version (the `v*` release this binary was built from). When a server URL is
   configured it additionally reports that server's build info — version, full

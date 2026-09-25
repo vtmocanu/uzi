@@ -29,8 +29,13 @@ a card between columns relabels the issue on the forge. See [Board](./board.md).
 
 ## 4. Add your Anthropic token
 
-Agents run with your own Anthropic credential. Paste it once in Settings:
-see [Anthropic token](./anthropic-token.md).
+Agents run with your own credential. Paste an Anthropic token once in
+Settings: see [Anthropic token](./anthropic-token.md). Prefer Codex
+instead? Connect a [Codex credential](./codex-credentials.md) rather than
+an Anthropic token; uzi picks the harness for your runs from whichever
+credential(s) you hold. Hold both, and you choose the default harness
+yourself from **Settings → Run defaults** — see [Harness and worker
+models](./worker-model.md#harness-and-worker-models).
 
 ## 5. Run an agent
 

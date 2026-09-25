@@ -81,6 +81,15 @@ workers:
       - name: allow-anthropic
         fqdn: "*.anthropic.com"
         ports: [443]
+      - name: allow-openai-api
+        fqdn: "api.openai.com"
+        ports: [443]
+      - name: allow-chatgpt
+        fqdn: "chatgpt.com"
+        ports: [443]
+      - name: allow-openai-auth
+        fqdn: "auth.openai.com"
+        ports: [443]
       - name: allow-nix-substituters
         fqdn: "cache.nixos.org"
         ports: [443]

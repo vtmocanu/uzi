@@ -97,9 +97,16 @@ the admin's own responsibility to match what the image actually bakes.
   (`https://cache.nixos.org` plus any you add). This is
   the *new* egress this feature adds; a worker's full outbound set is `api`,
   the forge (for git clone/fetch/push), `*.anthropic.com` (the Claude API),
+  `api.openai.com`/`chatgpt.com`/`auth.openai.com` (the Codex API,
+  ChatGPT-subscription backend, and OpenAI auth host — allowlisted
+  namespace-wide, so reachable even on a worker running only Claude runs),
   the container-registry pair `ghcr.io` + `pkg-containers.githubusercontent.com`,
-  and now the resolver, `api.github.com`, and the substituters. Allow all three through an egress firewall if you run one; a
-  hosted kube-native worker already has them on its shipped FQDN allow-list.
+  and now the resolver, `api.github.com`, and the substituters. Allow all
+  three through an egress firewall if you run one; a hosted kube-native
+  worker already has the resolver, `api.github.com`, and the default
+  substituter (`cache.nixos.org`) on its shipped FQDN allow-list — but not
+  any additional substituter you configure yourself, which you'll need to
+  allow separately.
 - **First-run-only.** The nix store lives on its own named volume
   (`agentnix` at `/nix`); the first run downloads, later runs on the same
   worker warm-start from it. It survives `docker compose down`/`up`.
