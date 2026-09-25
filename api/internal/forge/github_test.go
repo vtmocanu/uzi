@@ -541,6 +541,38 @@ func TestGitHubBranchProtection(t *testing.T) {
 		}
 	})
 
+	// go-github v92 path-escapes the branch in ListRulesForBranch (GetBranch already
+	// did), so a slashed branch reaches the rulesets endpoint as ONE segment. Before
+	// v92 the raw slash split it and the lookup fell to the fail-safe unverified shape.
+	t.Run("slashed-branch-ruleset-path-escaped", func(t *testing.T) {
+		protectionHit = false
+		var branchPath, rulesPath string
+		m := newMockGitHub(t, map[string]http.HandlerFunc{
+			"/repos/acme/widgets/branches/": func(w http.ResponseWriter, r *http.Request) {
+				branchPath = r.URL.EscapedPath()
+				_ = json.NewEncoder(w).Encode(map[string]any{"name": "release/next", "protected": true})
+			},
+			"/repos/acme/widgets/rules/branches/": func(w http.ResponseWriter, r *http.Request) {
+				rulesPath = r.URL.EscapedPath()
+				_, _ = w.Write([]byte(`[{"type":"non_fast_forward"}]`))
+			},
+		})
+		d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+		bp, err := d.DefaultBranchProtection(context.Background(), 7, "release/next", 1)
+		if err != nil {
+			t.Fatalf("DefaultBranchProtection: %v", err)
+		}
+		if want := "/api/v3/repos/acme/widgets/branches/release%2Fnext"; branchPath != want {
+			t.Fatalf("GetBranch path = %q, want %q", branchPath, want)
+		}
+		if want := "/api/v3/repos/acme/widgets/rules/branches/release%2Fnext"; rulesPath != want {
+			t.Fatalf("ListRulesForBranch path = %q, want %q", rulesPath, want)
+		}
+		if !bp.Protected || bp.WriteRoleCanPush || bp.WriteRoleCanMerge || bp.ProtectionUnverified {
+			t.Fatalf("slashed protected+ruleset must be Protected, Can* false, verified: %+v", bp)
+		}
+	})
+
 	if protectionHit {
 		t.Fatal("the driver must NEVER call the admin-gated /branches/{b}/protection endpoint")
 	}

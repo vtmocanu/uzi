@@ -10,7 +10,7 @@ import (
 	"context"
 	"net/http"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 )
 
 // ListMergeRequestRefs lists the repo's open pull requests as cheap refs,

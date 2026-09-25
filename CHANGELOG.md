@@ -33,6 +33,8 @@ through `[0.52.0]`.)
   A checkpoint that did not reach origin now reports one of a fixed set of classes (`timeout`, `boundary_blocked`, `publish_rejected`, `publish_skipped`, `publish_error`, `no_local_tip`, `tick_process_survived`, `bare_lock_retained`) rather than a thrown error's message or remote text, and a publish that lands wins over a later, unrelated boundary error.
 - **Dependency: bump `gitlab.com/gitlab-org/api/client-go` to v3 ([#1377](https://github.com/vtmocanu/uzi/pull/1377)).**
   The GitLab driver moves to the `/v3` module path and replaces the deprecated `gitlab.Ptr` helper with Go 1.26 `new(value)`. The client calls uzi makes are unchanged upstream, and v3 drops several of the library's transitive dependencies.
+- **Dependency: bump `github.com/google/go-github` to v92 ([#1545](https://github.com/vtmocanu/uzi/pull/1545)).**
+  The GitHub driver moves to the `/v92` module path. v92 path-escapes the branch when reading rulesets, so branch protection on a branch with a slash in its name (for example `release/next`) is now read from its ruleset instead of falling back to "protection unverified".
 
 ### Fixed
 
