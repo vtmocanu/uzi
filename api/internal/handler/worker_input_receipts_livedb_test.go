@@ -121,23 +121,48 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 	if pendingCount != 0 {
 		t.Fatalf("GET consumed %d inputs", pendingCount)
 	}
+	type receiptStamp struct {
+		consumedAt string
+		generation int64
+		workerID   uuid.UUID
+	}
+	readStamp := func(kind string) receiptStamp {
+		t.Helper()
+		var stamp receiptStamp
+		if err := pool.QueryRow(ctx, `SELECT consumed_at::text, consumed_claim_generation, consumed_worker_id FROM run_user_inputs WHERE id=$1`, ids[kind]).Scan(&stamp.consumedAt, &stamp.generation, &stamp.workerID); err != nil {
+			t.Fatal(err)
+		}
+		return stamp
+	}
+	firstStamps := make(map[string]receiptStamp)
+	assertRetry := func(kind, stage string, out map[string]any, active bool) {
+		t.Helper()
+		inputs := out["inputs"].([]any)
+		if out["active"] != active || len(inputs) != 1 {
+			t.Fatalf("%s %s: %v", stage, kind, out)
+		}
+		input := inputs[0].(map[string]any)
+		if got := int64(input["id"].(float64)); got != ids[kind] {
+			t.Fatalf("%s %s returned row ID %d, want %d", stage, kind, got, ids[kind])
+		}
+		if got := readStamp(kind); got != firstStamps[kind] {
+			t.Fatalf("%s %s changed receipt: got %+v, first ACK %+v", stage, kind, got, firstStamps[kind])
+		}
+	}
 	for _, kind := range []string{"cancel", "approve_plan", "follow_up"} {
 		body := fmt.Sprintf(`{"ids":[%d],"claim_generation":1}`, ids[kind])
 		out := call("POST", "/inputs/ack", body, wkr, 200)
 		if out["active"] != true || len(out["inputs"].([]any)) != 1 {
 			t.Fatalf("ACK %s: %v", kind, out)
 		}
+		firstStamps[kind] = readStamp(kind)
 		get(wkr, 3) // consumed but unapplied is replayed
 		// Model a lost ACK response: the worker retries the same receipt.
 		repeat := call("POST", "/inputs/ack", body, wkr, 200)
-		if repeat["active"] != true || len(repeat["inputs"].([]any)) != 1 {
-			t.Fatalf("lost ACK retry %s: %v", kind, repeat)
-		}
+		assertRetry(kind, "lost ACK retry", repeat, true)
 		exec(`UPDATE runs SET claim_released_at=now() WHERE id=$1`, run)
 		retry := call("POST", "/inputs/ack", body, wkr, 200)
-		if retry["active"] != false || len(retry["inputs"].([]any)) != 1 {
-			t.Fatalf("released retry %s: %v", kind, retry)
-		}
+		assertRetry(kind, "released retry", retry, false)
 		call("POST", "/inputs/applied", body, wkr, 409)
 		exec(`UPDATE runs SET claim_released_at=NULL WHERE id=$1`, run)
 	}
@@ -147,25 +172,19 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 	for _, kind := range []string{"cancel", "approve_plan", "follow_up"} {
 		body := fmt.Sprintf(`{"ids":[%d],"claim_generation":1}`, ids[kind])
 		retry := call("POST", "/inputs/ack", body, wkr, 200)
-		if retry["active"] != false || len(retry["inputs"].([]any)) != 1 {
-			t.Fatalf("switched retry %s: %v", kind, retry)
-		}
+		assertRetry(kind, "switched retry", retry, false)
 	}
 	exec(`UPDATE runs SET claim_released_at=now() WHERE id=$1`, run)
 	for _, kind := range []string{"cancel", "approve_plan", "follow_up"} {
 		body := fmt.Sprintf(`{"ids":[%d],"claim_generation":1}`, ids[kind])
 		retry := call("POST", "/inputs/ack", body, wkr, 200)
-		if retry["active"] != false || len(retry["inputs"].([]any)) != 1 {
-			t.Fatalf("released switch retry %s: %v", kind, retry)
-		}
+		assertRetry(kind, "released switch retry", retry, false)
 	}
 	exec(`UPDATE runs SET worker_id=$2,claim_generation=2,claim_released_at=NULL,credential_switch_requested_at=NULL,credential_switch_generation=NULL WHERE id=$1`, run, nextWorker)
 	for _, kind := range []string{"cancel", "approve_plan", "follow_up"} {
 		body := fmt.Sprintf(`{"ids":[%d],"claim_generation":1}`, ids[kind])
 		retry := call("POST", "/inputs/ack", body, wkr, 200)
-		if retry["active"] != false || len(retry["inputs"].([]any)) != 1 {
-			t.Fatalf("old claim retry %s: %v", kind, retry)
-		}
+		assertRetry(kind, "old claim retry", retry, false)
 	}
 	body := fmt.Sprintf(`{"ids":[%d],"claim_generation":1}`, ids["cancel"])
 	newer := store.Worker{ID: nextWorker, UserID: user, ProtocolCapabilities: []string{capability.InputReceiptsV1}}
