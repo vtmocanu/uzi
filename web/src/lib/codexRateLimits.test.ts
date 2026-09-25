@@ -1,11 +1,15 @@
 import { describe, it, expect } from "vitest";
 import {
+  CODEX_MAIN_BUCKET_ID,
   codexAccountLabel,
   codexAccountWorstPct,
+  codexBucketCaption,
+  codexBucketDisplayName,
   codexResetEpoch,
   codexStatusBadge,
   codexWindowForecast,
   formatCodexWindowLabel,
+  hasCodexMicroReading,
   hasCodexReading,
   isCodexAccountShownInSidebar,
   sortCodexAdminRows,
@@ -228,5 +232,35 @@ describe("sortCodexAdminRows", () => {
     ]);
     const mid = user("mid", [acct("m", "fresh", [bucket("b", win(50, 18000, nowFuture))])]);
     expect(sortCodexAdminRows([mid, hot]).map((u) => u.id)).toEqual(["hot", "mid"]);
+  });
+});
+
+// PRD #1653 D-W3: the main bucket (the api's top-level rate_limit, id "codex", empty
+// display name) is never captioned; every other bucket keeps its name.
+describe("Codex bucket naming (PRD #1653 D-W3)", () => {
+  it("pins the main bucket id to the api's codexMainBucketID", () => {
+    expect(CODEX_MAIN_BUCKET_ID).toBe("codex");
+  });
+
+  it("names a bucket by its trimmed display name, else its id", () => {
+    expect(codexBucketDisplayName({ id: "code", display_name: "  Code (3-hour) " })).toBe("Code (3-hour)");
+    expect(codexBucketDisplayName({ id: "code", display_name: "   " })).toBe("code");
+    expect(codexBucketDisplayName({ id: "code" })).toBe("code");
+    // The main bucket still has a name for accessible labels.
+    expect(codexBucketDisplayName({ id: "codex", display_name: "" })).toBe("codex");
+  });
+
+  it("drops the caption for the main bucket only", () => {
+    expect(codexBucketCaption({ id: "codex", display_name: "" })).toBeNull();
+    expect(codexBucketCaption({ id: "codex", display_name: "Codex" })).toBeNull();
+    expect(codexBucketCaption({ id: "code", display_name: "Code (3-hour)" })).toBe("Code (3-hour)");
+    expect(codexBucketCaption({ id: "tokens" })).toBe("tokens");
+  });
+
+  it("reports whether any window carries a percentage to draw", () => {
+    expect(hasCodexMicroReading({ buckets: [] })).toBe(false);
+    expect(hasCodexMicroReading({ buckets: [bucket("codex", win(null, 18000, null), win(null, 604800, null))] })).toBe(false);
+    expect(hasCodexMicroReading({ buckets: [bucket("codex", win(null, 18000, null), win(12, 604800, null))] })).toBe(true);
+    expect(hasCodexMicroReading({ buckets: [bucket("codex", null), bucket("code", win(0, 10800, null))] })).toBe(true);
   });
 });

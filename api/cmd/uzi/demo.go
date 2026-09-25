@@ -106,6 +106,9 @@ func boolPtr(b bool) *bool { return &b }
 // CodexRateLimitWindowDTO.UsedPercent, where nil = no reading rather than 0%).
 func fPtr(f float64) *float64 { return &f }
 
+// i64Ptr returns a pointer to an int64, for CodexRateLimitWindowDTO.LimitWindowSeconds.
+func i64Ptr(n int64) *int64 { return &n }
+
 func newDemoClient() *uzicli.FakeClient {
 	now := time.Now()
 	runs := demoRuns(now)
@@ -144,37 +147,37 @@ func newDemoClient() *uzicli.FakeClient {
 		// Claude ones (PRD #1209 M3), mirroring the web sidebar's Codex selection. The default
 		// account always shows; "codex-team" shows because it is in SidebarCodexAccountIds
 		// below; "codex-unlisted" is readable but NOT shown; "codex-old" is stale (shown
-		// dimmed); a no_reading account never appears. Each carries a 5h bucket (primary +
-		// secondary) with percentages on the ok/warn/danger tone bands.
+		// dimmed); a no_reading account never appears. Each carries the main "codex" bucket (5h primary +
+		// 7d secondary, PRD #1653) with percentages on the ok/warn/danger tone bands.
 		SelfCodexMeters: []apitypes.CodexAccountRateLimitDTO{
 			{
 				AccountID: "cx-primary", Aliases: []string{"primary"}, IsDefault: true, Status: "fresh",
 				Buckets: []apitypes.CodexRateLimitBucketDTO{{
-					ID: "5h", DisplayName: "5h",
-					Primary:   &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(41)},
-					Secondary: &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(63)},
+					ID:        "codex",
+					Primary:   &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(41), LimitWindowSeconds: i64Ptr(18000)},
+					Secondary: &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(63), LimitWindowSeconds: i64Ptr(604800)},
 				}},
 			},
 			{
 				AccountID: "cx-team", Aliases: []string{"team"}, Status: "fresh",
 				Buckets: []apitypes.CodexRateLimitBucketDTO{{
-					ID: "5h", DisplayName: "5h",
-					Primary:   &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(88)},
-					Secondary: &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(52)},
+					ID:        "codex",
+					Primary:   &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(88), LimitWindowSeconds: i64Ptr(18000)},
+					Secondary: &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(52), LimitWindowSeconds: i64Ptr(604800)},
 				}},
 			},
 			{
 				AccountID: "cx-unlisted", Aliases: []string{"unlisted"}, Status: "fresh",
 				Buckets: []apitypes.CodexRateLimitBucketDTO{{
-					ID: "5h", DisplayName: "5h",
-					Primary: &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(12)},
+					ID:      "codex",
+					Primary: &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(12), LimitWindowSeconds: i64Ptr(18000)},
 				}},
 			},
 			{
 				AccountID: "cx-old", Aliases: []string{"archive"}, Status: "stale", Stale: boolPtr(true),
 				Buckets: []apitypes.CodexRateLimitBucketDTO{{
-					ID: "5h", DisplayName: "5h",
-					Primary: &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(70)},
+					ID:      "codex",
+					Primary: &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(70), LimitWindowSeconds: i64Ptr(18000)},
 				}},
 			},
 			{AccountID: "cx-pending", Aliases: []string{"pending"}, Status: "no_reading"},

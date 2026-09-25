@@ -948,12 +948,15 @@ export const mockRuns: Run[] = [
     // AUTOMATIC rework loop has hit its cap (5 of 5 cycles). It exercises the run view's
     // past-cap panel: the "Automatic rework: 5 of 5 cycles used · stopped" line and the
     // on-demand "Rework now" affordance the owner uses to keep iterating past the cap.
+    // It is also the default scenario's ONE Codex run (PRD #1653 M4), so the run list and
+    // this run's page show the OpenAI harness chip among Claude runs; the codex-only
+    // scenario still flips every run (harnessOverlay).
     id: "run-rework-capped",
     repo_id: "repo-uzi",
     issue_iid: 61,
     issue_title: "Board: virtualize the card list for very large boards",
     issue_description: "See prds/61-board-virtualization.md.",
-    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
+    harness: "codex",
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -999,9 +1002,10 @@ export const mockRuns: Run[] = [
     budget_extension_cap_seconds: 57600,
     budget_total_seconds: null,
     budget_used_seconds: 8340,
-    anthropic_secret_id: "sec-console",
-    anthropic_secret_label: "console-key",
-    anthropic_select_reason: "default",
+    // A Codex run spends no Anthropic token, so no Anthropic credential is recorded.
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_select_reason: null,
     anthropic_headroom_pct: null,
     wait_on_limit: false,
     limit_resets_at: null,

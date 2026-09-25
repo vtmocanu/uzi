@@ -774,7 +774,8 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 			Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 10}, SevenDay: &apitypes.RateLimitWindow{Pct: 20}}},
 	}})
 	board = next.(tuiModel)
-	// Two readable tokens ⇒ showLabel true ⇒ the hostile Label is actually drawn.
+	// The board strip labels every shown token (PRD #1653 D-T2), so the hostile Label is actually
+	// drawn; the second readable token keeps it drawn on the detail rail too (showLabel there).
 	next, _ = board.Update(settingsMsg{settings: apitypes.UserSettingsDTO{SidebarTokenIds: []string{"sec-second"}}})
 	board = next.(tuiModel)
 	// PRD #1251 M3 D7: locking the vault with the own board's hostile HealthReason present drives

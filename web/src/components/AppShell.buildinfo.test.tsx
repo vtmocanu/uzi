@@ -36,7 +36,7 @@ vi.mock("../lib/api", () => ({
     getFindingsStats: vi.fn().mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
     listRuns: vi.fn().mockResolvedValue({ runs: [] }),
     getMyRateLimits: vi.fn().mockResolvedValue({ status: "no_token" }),
-    // SidebarRateLimits fetches the chosen sidebar-token set on mount.
+    // SidebarUsageLimits fetches the chosen sidebar-account set on mount.
     getMySettings: vi.fn().mockResolvedValue({ settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: null } }),
     version: vi.fn(),
     // AppShell's useBranding() (PRD #685) polls GET /api/branding on mount. Give it a

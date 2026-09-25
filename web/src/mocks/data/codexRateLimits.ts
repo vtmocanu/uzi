@@ -70,9 +70,12 @@ function acct(
   return a;
 }
 
-// vlad's default subscription account: a healthy 5-hour/7-day bucket PLUS a bucket on a
-// NONSTANDARD 3-hour window. The 3-hour bucket is the proof that the surface reads the
-// reported limit_window_seconds (10800 → "3h") rather than a hardcoded 5h/7d map — its
+// vlad's default subscription account, shaped like the real api (codexauth/usage.go): its
+// MAIN limit is the bucket with id "codex" and an EMPTY display name (the top-level
+// rate_limit), a healthy 5-hour/7-day pair whose caption the sidebar and the Settings card
+// hide (PRD #1653 D-W3), PLUS an additional bucket on a NONSTANDARD 3-hour window, which
+// keeps its "Code (3-hour)" caption. The 3-hour bucket is the proof that the surface reads
+// the reported limit_window_seconds (10800 → "3h") rather than a hardcoded 5h/7d map — its
 // forecast anchors to 10800s, so its ghost/marker geometry differs from what a 5h
 // assumption would draw.
 const acctDefault = acct(
@@ -81,7 +84,8 @@ const acctDefault = acct(
   true,
   "fresh",
   [
-    bucket("requests", "Requests", win(28, 5 * H, 1 * H + 40 * MIN), win(46, 7 * D, 3 * D + 2 * H)),
+    // The main limit: id "codex", empty display name (never captioned in the UI).
+    bucket("codex", "", win(28, 5 * H, 1 * H + 40 * MIN), win(46, 7 * D, 3 * D + 2 * H)),
     // NONSTANDARD 3-hour window (10800s). Renders the "3h" chip; the forecast uses 10800,
     // never 18000. 63% is a warn-tone bar climbing toward a near reset.
     bucket("code", "Code (3-hour)", win(63, 3 * H, 38 * MIN), null),

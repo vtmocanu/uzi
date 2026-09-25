@@ -2,9 +2,10 @@ package main
 
 // PRD #519 F2 — the factory-floor rate-limit strip mirrors the web left-bottom sidebar's
 // selection (RateLimitMeters SidebarRateLimits + sidebarTokens.ts): readable = status "ok",
-// nothing readable → no strip; showLabel keyed off readable (>1); shown = readable filtered by
-// (IsDefault || SecretID ∈ sidebar_token_ids); nothing shown → no strip. Each shown token draws
-// its 5h + 7d windows as a tone-coloured mini bar plus always-present NN% text.
+// nothing readable → no strip; shown = readable filtered by (IsDefault || SecretID ∈
+// sidebar_token_ids); nothing shown → no strip. Each shown token draws its label (always on the
+// strip, PRD #1653 D-T2; the detail rail keeps showLabel keyed off readable > 1) then its 5h + 7d
+// windows as a tone-coloured mini bar plus always-present NN% text.
 
 import (
 	"strings"
@@ -86,30 +87,35 @@ func TestBoardRateLimitStripSelection(t *testing.T) {
 	}
 }
 
-// TestBoardRateLimitStripLabelKeyedOffReadable — the label shows only when len(readable) > 1,
-// and it is keyed off readable, not the shown subset.
-func TestBoardRateLimitStripLabelKeyedOffReadable(t *testing.T) {
-	// Single readable token → no label (showLabel false), but the windows still render.
+// TestBoardRateLimitStripAlwaysLabels — PRD #1653 D-T2 supersedes the PRD 1519
+// hide-when-one-readable rule on the board strip: the label shows for EVERY shown token, a lone
+// readable one included, and whether or not other readable tokens exist. (The detail rail keeps
+// its readable-keyed showLabel; TestRailRateMetersLabelKeyedOffReadable pins that.)
+func TestBoardRateLimitStripAlwaysLabels(t *testing.T) {
+	// Single readable token → still labelled, right after its accent bar, before its windows.
 	single := stripModel(t, []apitypes.TokenRateLimitDTO{
 		okMeter("sec-personal", "solotoken", true, 33, 61),
 	}, nil)
 	singleOut := single.View().Content
-	if strings.Contains(singleOut, "solotoken") {
-		t.Errorf("label rendered for a single readable token (showLabel must be false):\n%s", singleOut)
+	if !strings.Contains(stripANSI(singleOut), "▎solotoken 5h ") {
+		t.Errorf("a single readable token must be labelled on the strip (`▎solotoken 5h …`):\n%s", stripANSI(singleOut))
 	}
 	if !strings.Contains(singleOut, "33%") || !strings.Contains(singleOut, "5h") {
 		t.Errorf("single-token windows are missing from the strip:\n%s", singleOut)
 	}
 
-	// Two readable tokens where only the default is SHOWN — showLabel is still true because it is
-	// keyed off readable (2 > 1), not off shown (1). The default's label must render.
+	// Two readable tokens where only the default is SHOWN — the default's label renders, and the
+	// unlisted token (readable but not shown) does not.
 	multi := stripModel(t, []apitypes.TokenRateLimitDTO{
 		okMeter("sec-personal", "labelled", true, 33, 61),
 		okMeter("sec-unlisted", "unlisted", false, 11, 22),
 	}, nil)
 	multiOut := multi.View().Content
 	if !strings.Contains(multiOut, "labelled") {
-		t.Errorf("label absent when len(readable) > 1 (showLabel is keyed off readable):\n%s", multiOut)
+		t.Errorf("the shown default token's label is absent:\n%s", multiOut)
+	}
+	if strings.Contains(multiOut, "unlisted") {
+		t.Errorf("a readable-but-unlisted token leaked into the strip:\n%s", multiOut)
 	}
 }
 
@@ -645,8 +651,9 @@ func TestRailRateMetersSanitizesLabel(t *testing.T) {
 }
 
 // TestSelectedRateMetersSharedByBoardAndRail — the anti-drift guarantee: selectedRateMeters()
-// returns the SAME shown set and showLabel the board strip derives, from one shared fixture. The
-// board strip and the rail block both consume this method, so they cannot disagree on selection.
+// returns the SAME shown set the board strip draws, from one shared fixture. The board strip and
+// the rail block both consume this method, so they cannot disagree on selection. showLabel is
+// still pinned here because the rail consumes it; the strip labels every token (PRD #1653 D-T2).
 func TestSelectedRateMetersSharedByBoardAndRail(t *testing.T) {
 	meters := []apitypes.TokenRateLimitDTO{
 		okMeter("sec-personal", "personal", true, 33, 61),

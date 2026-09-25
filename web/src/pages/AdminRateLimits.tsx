@@ -28,6 +28,7 @@ import {
 } from "../lib/rateLimits";
 import {
   codexAccountLabel,
+  codexBucketDisplayName,
   codexResetEpoch,
   codexStatusBadge,
   codexWindowForecast,
@@ -153,10 +154,6 @@ function UserCell({
 // ACCOUNT, sorted by valid utilization (sortCodexAdminRows). Alias capacity is never
 // double-counted (one account = one budget); only the safe DTO fields are read.
 
-function bucketDisplayName(bucket: CodexRateLimitBucket): string {
-  return bucket.display_name?.trim() || bucket.id;
-}
-
 function bucketWindows(bucket: CodexRateLimitBucket): CodexRateLimitWindow[] {
   return [bucket.primary, bucket.secondary].filter(
     (w): w is CodexRateLimitWindow => w != null,
@@ -225,7 +222,7 @@ function CodexUtilizationCell({ account, now }: { account: CodexAccountRateLimit
   const dim = account.status !== "fresh";
   const rows = account.buckets.flatMap((b) =>
     bucketWindows(b).map((w, i) => (
-      <CodexWindowRow key={`${b.id}:${i}`} bucketName={bucketDisplayName(b)} win={w} dim={dim} now={now} />
+      <CodexWindowRow key={`${b.id}:${i}`} bucketName={codexBucketDisplayName(b)} win={w} dim={dim} now={now} />
     )),
   );
   if (rows.length === 0) return <span className="text-faint">—</span>;

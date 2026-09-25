@@ -1,47 +1,48 @@
 // The two "my own Codex limits" surfaces of PRD #1209 M3: the Settings → "Codex limits"
-// card and the sidebar-footer micro-meters. Both read GET /me/codex-rate-limits (the
-// login never leaves the api — the SPA only ever sees percentages + labels) and reuse the
-// shared MeterTrack + toneFor thresholds + anchored forecast, so Codex reads as a
-// PROVIDER-LABELED SIBLING of the Claude meters, not a redesign. The admin table is a
-// separate section on AdminRateLimits.
+// card and one account's sidebar micro-meters (CodexAccountMicroMeters, placed in the
+// shared account list by SidebarUsageLimits since PRD #1653). Both read GET
+// /me/codex-rate-limits (the login never leaves the api — the SPA only ever sees
+// percentages + labels) and reuse the shared MeterTrack + toneFor thresholds + anchored
+// forecast, so Codex reads as a sibling of the Claude meters, not a redesign. The admin
+// table is a separate section on AdminRateLimits.
 //
 // The ONE Codex-specific rule vs. the Anthropic side: a Codex window carries its OWN
 // server-reported length (limit_window_seconds), so the forecast anchors to THAT — never a
 // hardcoded 5h/7d — and a 3-hour bucket renders a "3h" chip and a 3-hour projection. See
 // lib/codexRateLimits.ts (codexWindowForecast / formatCodexWindowLabel).
 
-import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
 import {
   api,
   type CodexAccountRateLimit,
   type CodexRateLimitBucket,
   type CodexRateLimitWindow,
 } from "../lib/api";
-import { onSidebarTokensChanged } from "../lib/sidebarTokens";
 import { MICRO_METER_GRID_COLS } from "../lib/rateLimitLayout";
 import { useAsyncData } from "../lib/useAsyncData";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { formatAgo, formatCountdown, formatResetLabel, useNow, type PaceForecast } from "../lib/rateLimits";
 import {
   codexAccountLabel,
+  codexBucketCaption,
+  codexBucketDisplayName,
   codexLoginRejected,
   codexResetEpoch,
   codexStatusBadge,
   codexWindowForecast,
   formatCodexWindowLabel,
-  hasCodexReading,
   isCodexAccountShownInSidebar,
 } from "../lib/codexRateLimits";
-import { Badge, Card, cx, SectionTitle } from "./ui";
+import { Badge, Card, SectionTitle } from "./ui";
 import { MeterTrack } from "./Meter";
+import { OpenAIIcon } from "./icons";
 import { RateLimitForecastMeter } from "./RateLimitForecast";
 
 // useMyCodexRateLimits polls GET /me/codex-rate-limits while the tab is visible, exactly
 // like useMyRateLimits on the Anthropic side. An empty array means the user has no linked
 // subscription account (the no_subscription shape) — an API-key-only default supplies NO
-// implicit subscription meter, since the read returns only linked accounts.
-function useMyCodexRateLimits(intervalMs: number): {
+// implicit subscription meter, since the read returns only linked accounts. Exported for
+// the sidebar account list (SidebarUsageLimits), which polls it at the same 60s cadence.
+export function useMyCodexRateLimits(intervalMs: number): {
   accounts: CodexAccountRateLimit[] | null;
   loading: boolean;
 } {
@@ -55,10 +56,6 @@ function useMyCodexRateLimits(intervalMs: number): {
 
 const CARD_BLURB =
   "Live utilization of each linked Codex subscription account. Each bucket is metered on its own window, so the reset countdown and the burn-rate forecast use the length Codex reports for that window. API keys have no subscription windows and do not appear here.";
-
-function bucketDisplayName(bucket: CodexRateLimitBucket): string {
-  return bucket.display_name?.trim() || bucket.id;
-}
 
 // The two windows of a bucket, in order, skipping absent slots. A window with a null
 // used_percent is a PARTIAL window — kept so the surface can say "no reading" for it,
@@ -183,17 +180,25 @@ function CodexAccountBlock({
 
       {account.buckets.length > 0 ? (
         <div className="mt-2 space-y-3">
-          {account.buckets.map((b) => (
-            <div key={b.id}>
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-medium text-muted">{bucketDisplayName(b)}</span>
-                {b.limit_reached === true && <Badge tone="danger">limit reached</Badge>}
+          {account.buckets.map((b) => {
+            // The main bucket ("codex") draws no caption (PRD #1653 D-W3): its name would
+            // only repeat the provider. Its window rows keep the name in their accessible
+            // label, and a limit-reached badge still gets its own line.
+            const caption = codexBucketCaption(b);
+            return (
+              <div key={b.id}>
+                {(caption != null || b.limit_reached === true) && (
+                  <div className="flex items-center gap-2">
+                    {caption != null && <span className="text-xs font-medium text-muted">{caption}</span>}
+                    {b.limit_reached === true && <Badge tone="danger">limit reached</Badge>}
+                  </div>
+                )}
+                {bucketWindows(b).map((w, i) => (
+                  <CodexSettingsWindowRow key={`${b.id}:${i}`} bucketName={codexBucketDisplayName(b)} win={w} dim={dim} now={now} />
+                ))}
               </div>
-              {bucketWindows(b).map((w, i) => (
-                <CodexSettingsWindowRow key={`${b.id}:${i}`} bucketName={bucketDisplayName(b)} win={w} dim={dim} now={now} />
-              ))}
-            </div>
-          ))}
+            );
+          })}
         </div>
       ) : (
         // No buckets to draw: state the explicit reason in place of the meters.
@@ -254,7 +259,12 @@ export function CodexRateLimitCard({
   return (
     <Card className="space-y-5">
       <div>
-        <SectionTitle>Codex limits</SectionTitle>
+        {/* The provider logo sits in the title only (PRD #1653 D-W4): every account in
+            this card is Codex, so no per-account logo. aria-hidden; the title names it. */}
+        <SectionTitle className="flex items-center gap-2">
+          <OpenAIIcon className="h-4 w-4 flex-none text-fg" />
+          Codex limits
+        </SectionTitle>
         <p className="mt-2 text-sm text-muted">{CARD_BLURB}</p>
       </div>
       <div className="space-y-4">
@@ -312,111 +322,59 @@ function CodexMicroRow({
   );
 }
 
-// CodexAccountMicroMeters is one account's stack of 5px bars, the account named above them
-// only when the user surfaces several. Only windows with an actual reading render; a stale
-// account is dimmed.
-function CodexAccountMicroMeters({
+// CodexAccountMicroMeters is one account's stack of 5px bars for the sidebar account list
+// (SidebarUsageLimits renders the account's logo + name header and the group around it).
+// Only windows with an actual reading render; a stale account is dimmed. Rows are grouped by
+// bucket: every bucket but the main one ("codex") gets a small faint caption line above its
+// rows (PRD #1653 D-W3), and every row's accessible name keeps the bucket name. Returns null
+// when no window has a reading; callers skip such an account (hasCodexMicroReading).
+export function CodexAccountMicroMeters({
   account,
-  showLabel,
   now,
 }: {
   account: CodexAccountRateLimit;
-  showLabel: boolean;
   now: number;
 }) {
   const dim = account.status !== "fresh";
   const label = codexAccountLabel(account);
-  const rows = account.buckets.flatMap((b) =>
-    bucketWindows(b)
-      .filter((w) => w.used_percent != null)
-      .map((w) => ({ bucket: b, win: w, chip: formatCodexWindowLabel(w.limit_window_seconds) })),
-  );
-  if (rows.length === 0) return null;
+  const groups = account.buckets
+    .map((b) => ({
+      bucket: b,
+      caption: codexBucketCaption(b),
+      rows: bucketWindows(b)
+        .filter((w) => w.used_percent != null)
+        .map((w) => ({ win: w, chip: formatCodexWindowLabel(w.limit_window_seconds) })),
+    }))
+    .filter((g) => g.rows.length > 0);
+  if (groups.length === 0) return null;
   const title = [
-    showLabel && label,
-    ...rows.map((r) => {
-      const c = formatCountdown(codexResetEpoch(r.win, now), now);
-      return c ? `${r.chip} resets in ${c}` : null;
-    }),
+    label,
+    ...groups.flatMap((g) =>
+      g.rows.map((r) => {
+        const c = formatCountdown(codexResetEpoch(r.win, now), now);
+        return c ? `${r.chip} resets in ${c}` : null;
+      }),
+    ),
   ]
     .filter(Boolean)
     .join(" · ");
   return (
-    <div className="space-y-1.5" title={title || undefined}>
-      {showLabel && (
-        <div className="truncate text-[10px] font-medium uppercase tracking-wide text-faint">
-          {label}
+    <div className="space-y-1.5" title={title}>
+      {groups.map((g) => (
+        <div key={g.bucket.id} className="space-y-1.5">
+          {g.caption != null && <div className="truncate text-[10px] text-faint">{g.caption}</div>}
+          {g.rows.map((r, i) => (
+            <CodexMicroRow
+              key={`${g.bucket.id}:${i}`}
+              chip={r.chip}
+              ariaLabel={`${codexBucketDisplayName(g.bucket)} ${r.chip} window`}
+              win={r.win}
+              dim={dim}
+              now={now}
+            />
+          ))}
         </div>
-      )}
-      {rows.map((r, i) => (
-        <CodexMicroRow
-          key={`${r.bucket.id}:${i}`}
-          chip={r.chip}
-          ariaLabel={`${bucketDisplayName(r.bucket)} ${r.chip} window`}
-          win={r.win}
-          dim={dim}
-          now={now}
-        />
       ))}
-    </div>
-  );
-}
-
-// SidebarCodexRateLimits is the Codex micro-bars, rendered beside the Claude ones under
-// the user block. It carries an explicit "Codex" provider label (Claude renders unmarked,
-// the harness-labeling convention). Hidden while loading and for a user with no linked
-// account; only accounts with a reading (fresh/stale) render, a stale one dimmed. Refetches
-// its selection on the shared sidebar-changed event so a Settings save updates it at once.
-export function SidebarCodexRateLimits() {
-  const { accounts } = useMyCodexRateLimits(60_000);
-  const now = useNow();
-  const [sidebarIds, setSidebarIds] = useState<string[]>([]);
-  useEffect(() => {
-    let alive = true;
-    const load = () =>
-      api
-        .getMySettings()
-        .then(({ settings }) => {
-          if (alive) setSidebarIds(settings.sidebar_codex_account_ids ?? []);
-        })
-        // A failed fetch keeps the last known set — degrading to default-only on a
-        // transient error would look like the user's choice being reverted.
-        .catch(() => {});
-    load();
-    const off = onSidebarTokensChanged(load);
-    return () => {
-      alive = false;
-      off();
-    };
-  }, []);
-  if (!accounts || accounts.length === 0) return null;
-  const readable = accounts.filter((a) => hasCodexReading(a.status));
-  if (readable.length === 0) return null;
-  const shown = readable.filter((a) => isCodexAccountShownInSidebar(a, sidebarIds));
-  const hidden = readable.length - shown.length;
-  return (
-    <div className="mt-2 space-y-1.5" aria-label="Codex rate limits">
-      <div className="text-[10px] font-medium uppercase tracking-wide text-faint">Codex</div>
-      <div className="space-y-2.5">
-        {shown.map((a) => (
-          <CodexAccountMicroMeters
-            key={a.account_id}
-            account={a}
-            showLabel={readable.length > 1}
-            now={now}
-          />
-        ))}
-      </div>
-      {hidden > 0 && (
-        <Link
-          to="/settings"
-          className={cx(
-            "block text-[11px] font-medium text-faint transition-colors hover:text-fg",
-          )}
-        >
-          +{hidden} more Codex account{hidden === 1 ? "" : "s"} in Settings
-        </Link>
-      )}
     </div>
   );
 }

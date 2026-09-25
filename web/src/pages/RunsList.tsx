@@ -458,9 +458,9 @@ export function RunRow({
             </Badge>
           ) : (
             <>
-              {/* PRD #1429 M4a: the run's actual harness. Claude stays unmarked (renders
-                  nothing); Codex is explicit — self-hiding, so a Claude-only fleet's list
-                  renders byte-identical to before this milestone. */}
+              {/* PRD #1429 M4a / #1653 D-W5: the run's actual harness, a round logo chip
+                  for Claude and Codex alike, named for screen readers. Like everything after it
+                  in this cluster, it gives way to the vault badge on a vault-waiting row. */}
               <HarnessBadge harness={run.harness} />
               {/* PRD #122: compact milestone progress; a non-milestone run adds nothing.
                   PRD #265 M2: "not reported" (M–/N) reads distinct from a genuine 0/N. */}

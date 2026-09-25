@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
 //
-// HarnessBadge (PRD #1429 M4a): Claude stays visually unmarked (renders nothing);
-// Codex is explicit (renders a small badge naming it).
+// HarnessBadge (PRD #1429 M4a, reworked by PRD #1653 D-W5): every run carries a round
+// provider-logo chip, Claude included. The chip is role="img" named "Claude" / "Codex"
+// with a "Runs on …" title; the logo inside is aria-hidden. The retired "Codex" text
+// badge is gone.
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { HarnessBadge } from "./HarnessBadge";
@@ -9,23 +11,30 @@ import { HarnessBadge } from "./HarnessBadge";
 afterEach(cleanup);
 
 describe("HarnessBadge", () => {
-  it("renders nothing for claude (unmarked — adds no information)", () => {
-    const { container } = render(<HarnessBadge harness="claude" />);
+  it("renders a Claude chip for a claude run", () => {
+    render(<HarnessBadge harness="claude" />);
+    const chip = screen.getByRole("img", { name: "Claude" });
+    expect(chip.getAttribute("title")).toBe("Runs on Claude");
+    const logo = chip.querySelector("svg");
+    expect(logo?.getAttribute("viewBox")).toBe("0 0 24 24");
+    expect(logo?.getAttribute("aria-hidden")).toBe("true");
+    expect(screen.queryByRole("img", { name: "Codex" })).toBeNull();
+  });
+
+  it("renders a Codex chip with the OpenAI logo for a codex run", () => {
+    const { container } = render(<HarnessBadge harness="codex" />);
+    const chip = screen.getByRole("img", { name: "Codex" });
+    expect(chip.getAttribute("title")).toBe("Runs on Codex");
+    const logo = chip.querySelector("svg");
+    expect(logo?.getAttribute("viewBox")).toBe("0 0 16 16");
+    expect(logo?.getAttribute("aria-hidden")).toBe("true");
+    // No visible provider word: the old "Codex" text badge is gone.
     expect(container.textContent).toBe("");
+    expect(screen.queryByText("Codex")).toBeNull();
   });
 
-  it("renders nothing for a null/undefined harness (fail-safe, not a false Codex claim)", () => {
-    expect(render(<HarnessBadge harness={null} />).container.textContent).toBe("");
-    expect(render(<HarnessBadge harness={undefined} />).container.textContent).toBe("");
-  });
-
-  it("renders an explicit Codex badge", () => {
-    render(<HarnessBadge harness="codex" />);
-    expect(screen.getByText("Codex")).toBeTruthy();
-  });
-
-  it("carries the caller's title on the Codex badge", () => {
-    render(<HarnessBadge harness="codex" title="Pinned to Codex" />);
-    expect(screen.getByText("Codex").closest("[title]")?.getAttribute("title")).toBe("Pinned to Codex");
+  it("renders nothing for a null/undefined harness (fail-safe, not a false provider claim)", () => {
+    expect(render(<HarnessBadge harness={null} />).container.innerHTML).toBe("");
+    expect(render(<HarnessBadge harness={undefined} />).container.innerHTML).toBe("");
   });
 });

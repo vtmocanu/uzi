@@ -47,10 +47,23 @@ describe("the default scenario is unaffected by the codex-only overlay (negative
     expect(secrets.some((s) => s.kind === "anthropic_token" && s.is_default)).toBe(true);
   });
 
-  it("every listed run reads harness claude", async () => {
+  // PRD #1653 M4: the default scenario seeds exactly ONE Codex run among Claude runs, so
+  // the harness chip shows both providers offline; the overlay leaves it as seeded.
+  it("every listed run reads harness claude except the one seeded Codex run", async () => {
     const { runs } = await mockApi.listRuns();
-    expect(runs.length).toBeGreaterThan(0);
-    expect(runs.every((r) => r.harness === "claude")).toBe(true);
+    expect(runs.length).toBeGreaterThan(1);
+    expect(runs.filter((r) => r.harness === "codex").map((r) => r.id)).toEqual(["run-rework-capped"]);
+    expect(runs.filter((r) => r.id !== "run-rework-capped").every((r) => r.harness === "claude")).toBe(true);
+  });
+
+  it("getMyRateLimits still returns the seeded Claude token meters", async () => {
+    const { tokens } = await mockApi.getMyRateLimits();
+    expect(tokens.length).toBeGreaterThan(0);
+  });
+
+  it("getRun on the seeded Codex run reads harness codex (list and detail agree)", async () => {
+    const { run } = await mockApi.getRun("run-rework-capped");
+    expect(run.harness).toBe("codex");
   });
 });
 
@@ -67,6 +80,12 @@ describe("?mock=codex-only makes Codex the account's active harness (PRD #1429 M
     // default is usable only when linked.
     const usable = codexDefault?.kind === "openai_api_key" || codexDefault?.codex_status === "linked";
     expect(usable).toBe(true);
+  });
+
+  it("getMyRateLimits returns no Claude token meters (no Anthropic secret to meter)", async () => {
+    setScenario("codex-only");
+    const { tokens } = await mockApi.getMyRateLimits();
+    expect(tokens).toEqual([]);
   });
 
   it("every listed run reads harness codex", async () => {

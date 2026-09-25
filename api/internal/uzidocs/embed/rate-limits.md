@@ -26,16 +26,17 @@ token, you see one meter and nothing has changed.
 | Surface | What you see |
 |---|---|
 | **Settings → Claude limits** | A card under your tokens, with one block per stored token — its name, a **default** badge, both windows as bars, current percentage, and a reset countdown. |
-| **Sidebar** | Two thin bars per readable token under your signed-in name — a glance without leaving the page you're on. |
+| **Sidebar** | One usage list under your signed-in name: each shown token under a Claude logo and its name, with two thin bars — a glance without leaving the page you're on. Codex accounts follow in the same list (see [Codex account limits](#codex-account-limits)). |
 | **Admin → Rate limits** | Every user's meters on one page, one row per token, sorted so whoever is closest to a limit shows first. |
 
-Your token names appear next to the bars only when you hold more than one —
-with a single credential the surfaces look exactly as they did before.
+In the sidebar and on the Settings card every token is named by its own label,
+even when you hold only one, so adding a second token never renames the first.
 
-Both surfaces are hidden entirely until you've saved a token. While uzi is
-waiting on its first reading, the sidebar stays hidden (no empty bars to
-puzzle over), but the Settings card shows a "No reading yet" placeholder
-with two greyed bars — a reading appears within a few minutes of saving.
+The Settings card stays hidden until you've saved a token. While uzi is
+waiting on a token's first reading, that token stays out of the sidebar (no
+empty bars to puzzle over), but the Settings card shows a "No reading yet"
+placeholder with two greyed bars — a reading appears within a few minutes of
+saving.
 A token added later shows that placeholder until its first poll, while your
 other meters keep reading normally.
 
@@ -185,9 +186,9 @@ shows nothing here, and Settings says so next to the credential itself.
 | Surface | What you see |
 |---|---|
 | **Settings → Codex limits** | A card next to your Codex credentials, one block per linked subscription account: its aliases, a **default** badge, a **Show in sidebar and TUI** checkmark, every reported bucket with its own windows, percentages and reset countdown. |
-| **Sidebar** | Codex meters for your default subscription account, plus any additional account you've checked, provider-labeled next to your Claude meters. |
+| **Sidebar** | Your default subscription account, plus any additional account you've checked, in the same usage list as your Claude tokens (after them), each under an OpenAI logo and its account name. The account's main limit is unlabeled; any additional bucket is captioned with its name. One "+N more accounts in Settings" link counts the hidden Claude tokens and Codex accounts together. |
 | **Admin → Rate limits** | A separate Codex section, grouped by user then by account, sorted by utilization. |
-| **CLI / TUI** | `uzi rate-limits --provider codex` and `uzi admin rate-limits --provider codex` (see [uzi CLI](./cli.md)); the TUI board and rail carry provider-labeled Codex meters too. |
+| **CLI / TUI** | `uzi rate-limits --provider codex` and `uzi admin rate-limits --provider codex` (see [uzi CLI](./cli.md)); the TUI board strip and detail rail carry the Codex meters too, each account named, behind a single `codex` tag, with window lengths (`5h`, `7d`; `?` when Codex reports no length). |
 
 **Choosing which accounts appear in the sidebar and TUI** works exactly like
 the Claude side: your subscription's **default** Codex account always shows,

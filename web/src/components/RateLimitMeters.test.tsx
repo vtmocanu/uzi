@@ -1,23 +1,19 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { RateLimitAnnouncer, RateLimitCard, SidebarRateLimits } from "./RateLimitMeters";
+import { RateLimitAnnouncer, RateLimitCard } from "./RateLimitMeters";
 import { api, type MyRateLimits } from "../lib/api";
-import { MICRO_METER_GRID_COLS } from "../lib/rateLimitLayout";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
-  // getMySettings feeds SidebarRateLimits' chosen-token set; default-only unless a
-  // test overrides it.
   return { ...actual, api: { getMyRateLimits: vi.fn(), getMySettings: vi.fn() } };
 });
 
 const mockApi = vi.mocked(api);
 
 beforeEach(() => {
-  // Default-only chosen set unless a test overrides it; SidebarRateLimits fetches
-  // this on mount, so an unstubbed mock would throw inside the effect.
+  // Default-only chosen set; nothing in this file reads it today, but a stub keeps an
+  // effect that fetches it from throwing on an undefined mock.
   mockApi.getMySettings.mockResolvedValue({
     settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null, sidebar_token_ids: [] },
   });
@@ -176,6 +172,39 @@ describe("RateLimitCard (Settings)", () => {
     expect(bar5h.className).not.toMatch(/bg-warn/);
   });
 
+  // PRD #1653 D-W4: the Claude logo leads the card title (aria-hidden, so the heading's
+  // accessible name stays "Claude limits").
+  it("carries the Claude logo in the card title", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(okReading));
+    render(<RateLimitCard />);
+    const heading = await screen.findByRole("heading", { name: "Claude limits" });
+    const logo = heading.querySelector("svg");
+    expect(logo).not.toBeNull();
+    expect(logo?.getAttribute("viewBox")).toBe("0 0 24 24");
+    expect(logo?.getAttribute("aria-hidden")).toBe("true");
+  });
+
+  // PRD #1653 D-W4: a lone token is named too (it used to be named only with several),
+  // so adding a second token never renames the first.
+  it("names a lone token by its label", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue({
+      tokens: [{ ...tokens(okReading).tokens[0], label: "team" }],
+    });
+    render(<RateLimitCard />);
+    await screen.findByText("Claude limits");
+    expect(screen.getByText("team")).toBeTruthy();
+    expect(screen.getByText("default")).toBeTruthy(); // the default badge beside it
+  });
+
+  it("names a lone token with no reading yet as well", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue({
+      tokens: [{ ...tokens({ status: "unavailable" }).tokens[0], label: "team" }],
+    });
+    render(<RateLimitCard />);
+    await screen.findByText("Claude limits");
+    expect(screen.getByText("team")).toBeTruthy();
+  });
+
   it("keeps a warn reading on the Live badge but paints the bar amber", async () => {
     mockApi.getMyRateLimits.mockResolvedValue(tokens(warnReading));
     render(<RateLimitCard />);
@@ -186,134 +215,8 @@ describe("RateLimitCard (Settings)", () => {
   });
 });
 
-describe("SidebarRateLimits", () => {
-  it("shows the 5h/7d micro-bars on an ok reading", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue(tokens(okReading));
-    render(<SidebarRateLimits />);
-    await screen.findByLabelText("Claude rate limits");
-    expect(screen.getByText("5h")).toBeTruthy();
-    expect(screen.getByText("7d")).toBeTruthy();
-    expect(screen.getByText("8%")).toBeTruthy();
-  });
-
-  // PRD #1519 M2: the MicroRow uses the shared grid-template constant so its 1fr meter
-  // track lines up with the Codex sidebar bar (CodexRateLimitMeters.test.tsx asserts the
-  // Codex side uses the SAME constant). jsdom does no layout, so this asserts the shared
-  // class is applied, not pixel geometry.
-  it("lays each micro-row out on the shared grid-template constant", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue(tokens(okReading));
-    render(<SidebarRateLimits />);
-    await screen.findByLabelText("Claude rate limits");
-    const row = screen.getByText("5h").parentElement as HTMLElement;
-    expect(row.className).toContain(MICRO_METER_GRID_COLS);
-    // The constant must be the complete arbitrary-value literal (Tailwind content-scan).
-    expect(MICRO_METER_GRID_COLS).toBe("grid-cols-[1.4rem_1fr_2.6rem]");
-  });
-
-  it("renders nothing for no_token / unavailable (no dead chrome)", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue(tokens({ status: "unavailable" }));
-    render(<SidebarRateLimits />);
-    await waitFor(() => expect(mockApi.getMyRateLimits).toHaveBeenCalled());
-    await Promise.resolve();
-    expect(screen.queryByLabelText("Claude rate limits")).toBeNull();
-  });
-
-  // The forecast rows must carry the "resets in …" countdown, folded into
-  // MicroRow's valueText so it flows into RateLimitForecast's tooltip text. A 5h
-  // window at 90% with a near reset (elapsed ≈ 13000s on the 18000s window ⇒
-  // projected ≈ 125 ⇒ "over"): the wrapper's title is `${valueText} — projected …`,
-  // so after the fix it contains BOTH "resets in" (from valueText) and "projected".
-  it("carries the resets-in countdown into a forecast row's title", async () => {
-    const forecastReading: MyRateLimits = {
-      status: "ok",
-      five_hour: { pct: 90, resets_at: nowSecs + 5000 },
-      seven_day: { pct: 20, resets_at: nowSecs + 200_000 },
-      source: "usage_endpoint",
-      synced_at: new Date().toISOString(),
-      stale: false,
-    };
-    mockApi.getMyRateLimits.mockResolvedValue(tokens(forecastReading));
-    render(<SidebarRateLimits />);
-    await screen.findByLabelText("Claude rate limits");
-    const bar5h = screen.getByRole("progressbar", { name: "5h window" });
-    const titled = bar5h.closest("[title]") as HTMLElement;
-    const title = titled.getAttribute("title") ?? "";
-    expect(title).toMatch(/resets in/);
-    expect(title).toMatch(/projected/);
-  });
-
-  it("dims both micro-bars on a stale reading", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue(tokens(staleReading));
-    render(<SidebarRateLimits />);
-    await screen.findByLabelText("Claude rate limits");
-    const fills = screen.getAllByRole("progressbar").map((b) => b.lastChild as HTMLElement);
-    expect(fills).toHaveLength(2);
-    for (const fill of fills) expect(fill.className).toMatch(/opacity-40/);
-  });
-
-  // The rail shows the USER'S chosen set (round 3): the default token always,
-  // plus checked extras — never an automatic pick. Two tokens, nothing checked:
-  // only the default renders, however hot the other one runs.
-  it("shows only the default token plus a '+N more' link when nothing else is checked", async () => {
-    mockApi.getMySettings.mockResolvedValue({
-      settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null, sidebar_token_ids: [] },
-    });
-    mockApi.getMyRateLimits.mockResolvedValue({
-      tokens: [
-        { ...tokens(okReading).tokens[0], secret_id: "sec-1", label: "default", is_default: true },
-        {
-          ...tokens(warnReading).tokens[0],
-          secret_id: "sec-2",
-          label: "console-key",
-          is_default: false,
-        },
-      ],
-    });
-    render(
-      <MemoryRouter>
-        <SidebarRateLimits />
-      </MemoryRouter>,
-    );
-    await screen.findByLabelText("Claude rate limits");
-    // One pair of bars: the default's numbers, even though console-key is hotter.
-    expect(screen.getAllByRole("progressbar")).toHaveLength(2);
-    expect(screen.getByText("default")).toBeTruthy();
-    expect(screen.getByText("8%")).toBeTruthy();
-    expect(screen.queryByText("62%")).toBeNull();
-    // The link to the full meters says how many more there are.
-    const more = await screen.findByRole("link", { name: "+1 more token in Settings" });
-    expect(more.getAttribute("href")).toBe("/settings");
-  });
-
-  it("also shows a checked extra token, and drops the link when nothing is hidden", async () => {
-    mockApi.getMySettings.mockResolvedValue({
-      settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null, sidebar_token_ids: ["sec-2"] },
-    });
-    mockApi.getMyRateLimits.mockResolvedValue({
-      tokens: [
-        { ...tokens(okReading).tokens[0], secret_id: "sec-1", label: "default", is_default: true },
-        {
-          ...tokens(warnReading).tokens[0],
-          secret_id: "sec-2",
-          label: "console-key",
-          is_default: false,
-        },
-      ],
-    });
-    render(
-      <MemoryRouter>
-        <SidebarRateLimits />
-      </MemoryRouter>,
-    );
-    await screen.findByLabelText("Claude rate limits");
-    // Both pairs render once the chosen set arrives…
-    await waitFor(() => expect(screen.getAllByRole("progressbar")).toHaveLength(4));
-    expect(screen.getByText("default")).toBeTruthy();
-    expect(screen.getByText("console-key")).toBeTruthy();
-    // …and with every readable token shown, there is no "+N more" link.
-    expect(screen.queryByRole("link")).toBeNull();
-  });
-});
+// The sidebar micro-meters moved into the combined account list (PRD #1653 D-W2);
+// their tests live in SidebarUsageLimits.test.tsx.
 
 describe("RateLimitAnnouncer (aria-live)", () => {
   // Fake timers so we can advance the 60s poll and the 30s useNow clock and flush

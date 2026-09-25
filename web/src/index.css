@@ -362,6 +362,15 @@
   --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 }
 
+/* ── Provider brand colours (PRD #1653 D-W1) ────────────────────────────────
+   Fixed brand hues that do NOT vary by theme, so they live in one theme-free
+   :root rule rather than in each [data-theme] block. --brand-claude is the
+   Claude mark's orange (#d97757), consumed as text-brand-claude by ClaudeIcon.
+   The OpenAI mark has no token: it draws in currentColor. */
+:root {
+  --brand-claude: 217 119 87;
+}
+
 body {
   @apply bg-ink text-fg antialiased;
   font-family: var(--font-sans);

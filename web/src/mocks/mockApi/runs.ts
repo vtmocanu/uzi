@@ -195,7 +195,8 @@ function credentialOverlay(run: Run): Run {
 // harnessOverlay (PRD #1429 M4a): the "codex-only" mock scenario flips every run's
 // harness to codex, so the harness badge (RunsList/RunView) and the run's usage/cost
 // context show Codex as this account's active harness end to end, offline. A no-op
-// for every other scenario — every run keeps its seeded "claude" harness.
+// for every other scenario — every run keeps its seeded harness (mostly "claude";
+// run-rework-capped is seeded "codex", PRD #1653 M4).
 function harnessOverlay<T extends { harness: Harness }>(run: T): T {
   if (mockScenario() !== "codex-only") return run;
   return { ...run, harness: "codex" };
@@ -495,6 +496,9 @@ export const runsApi = {
   // row state. Percentages only — no token material ever appears here.
   getMyRateLimits: async () => {
     const me = requireSession();
+    // PRD #1653: "codex-only" removes every Anthropic secret (codexOnlySecrets), so
+    // there is no Claude token to meter either; the sidebar shows Codex accounts only.
+    if (mockScenario() === "codex-only") return delay({ tokens: [] }, 60);
     return delay({ tokens: mockMyRateLimitsByUser[me.id] ?? mockMyTokenRateLimits }, 60);
   },
   getAdminRateLimits: async () => delay({ users: mockAdminRateLimits.map((u) => ({ ...u })) }, 60),
