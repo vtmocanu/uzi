@@ -256,6 +256,9 @@ type FakeClient struct {
 	PartialCompletionDecisionErr error
 	AcceptCompletionDecisionErr  error
 
+	// SelfUsageV is the canned GET /api/usage reply.
+	SelfUsageV apitypes.SelfUsageDTO
+
 	// SelfMeters drives SelfRateLimits (PRD #111 D23): the caller's own per-token
 	// meters, each carrying the server-computed auto-selection status.
 	SelfMeters []apitypes.TokenRateLimitDTO
