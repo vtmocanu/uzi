@@ -105,6 +105,12 @@ jobs:
   # api image stamps into GET /api/version (commit count + prds done/open).
   assert-changelog:
     runs-on: ubuntu-latest
+    # pull-requests/issues: read lets the oracle ask which issues a squash-merged PR
+    # closes, so a section citing only the issue still covers that merge.
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
     outputs:
       commit_count: ${{ steps.counts.outputs.commit_count }}
       prds_done: ${{ steps.counts.outputs.prds_done }}
@@ -117,6 +123,9 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
       - name: Changelog covers release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: bash scripts/assert-changelog-covers-release.sh "${GITHUB_REF_NAME}"
       # The Release notes are the CHANGELOG section verbatim, so the section's
       # inline #N links and the compare-link footers must already be committed --

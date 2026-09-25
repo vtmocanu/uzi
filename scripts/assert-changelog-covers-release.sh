@@ -27,6 +27,8 @@
 # shipping code, at least one issue/PRD number from its branch name or commit body
 # must appear in the CHANGELOG section for the version being released. That matches
 # how entries are actually written here ("(issue #148)", "(PRD #121)", "(#60)").
+# When none does and `gh` is available, an issue the subject's PR "(#N)" closes on
+# GitHub also counts (see the closing-issues lookup below).
 #
 # ESCAPE HATCHES, both deliberate. A merge is exempt if it touched CHANGELOG.md
 # itself, or if its message carries `Changelog: none`. Internal refactors are real,
@@ -289,6 +291,23 @@ EOF
   for n in $refs; do
     if grep -qE -- "#0*$n([^0-9]|$)" "$SECTION_FILE"; then found=1; break; fi
   done
+
+  # A squash merge's body is its commits' messages, which need not name the issue the
+  # PR closes ("Closes #N" lives in the PR body). So also accept a section citing an
+  # issue that the subject's trailing "(#N)" PR closes on GitHub. Additive only:
+  # without `gh`, a token or network the verdict is exactly the offline one.
+  if [ "$found" = 0 ] && command -v gh >/dev/null 2>&1; then
+    pr="$(sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p' "$SUBJECT_FILE")"
+    if [ -n "$pr" ]; then
+      closing="$( { gh pr view "$pr" --json closingIssuesReferences \
+                      --jq '.closingIssuesReferences[].number' 2>/dev/null || true; } \
+                  | { grep -E '^[0-9]+$' || true; } | sort -un )"
+      for n in $closing; do
+        if grep -qE -- "#0*$n([^0-9]|$)" "$SECTION_FILE"; then found=1; break; fi
+      done
+      [ -z "$closing" ] || refs="$(printf '%s\n%s\n' "$refs" "$closing" | sort -un)"
+    fi
+  fi
 
   if [ "$found" = 0 ]; then
     if [ "$missing" = 0 ]; then printf '\nFAIL: merges not accounted for in the [%s] section:\n\n' "$BASE"; fi
