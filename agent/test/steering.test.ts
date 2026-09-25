@@ -1072,3 +1072,43 @@ describe("SteeringChannel reconciles after a failed poll (issue #1660)", () => {
     }
   });
 });
+
+// Issue #1660 (PR #1667 review): the reconcile read runs in the background, single-flight. A
+// stalled /follow-ups read must never delay the /inputs poll that carries cancel, stop and the
+// plan verdicts; the dispatch denial simply stays until the read succeeds.
+describe("SteeringChannel reconcile never blocks /inputs (issue #1660)", () => {
+  it("delivers a cancel on the next poll while the reconcile read is stalled, with one read in flight", async () => {
+    let polls = 0;
+    let reads = 0;
+    const client = {
+      getInputs: async () => {
+        polls++;
+        if (polls === 1) throw new Error("lost reply");
+        if (polls === 2) return { inputs: [inp("cancel")] };
+        return { inputs: [] };
+      },
+      // Stalls forever, like a read hanging until the HTTP timeout.
+      getConsumedFollowUps: () => {
+        reads++;
+        return new Promise<never>(() => {});
+      },
+    } as unknown as WorkerClient;
+    const cancel = new AbortController();
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
+    ch.start();
+    try {
+      const verdict = await Promise.race([
+        ch.awaitVerdict(),
+        new Promise<"blocked">((r) => setTimeout(() => r("blocked"), 1_000)),
+      ]);
+      assert.deepStrictEqual(verdict, { kind: "cancel" }, "the cancel is not held behind the stalled read");
+      assert.strictEqual(cancel.signal.aborted, true);
+      await tick(20);
+      assert.ok(polls > 3, `the /inputs poll keeps running (polls=${polls})`);
+      assert.strictEqual(reads, 1, "single-flight: one read in flight, not one per poll");
+      assert.strictEqual(ch.operatorConstraints(), "reconciling", "dispatches stay denied until the read succeeds");
+    } finally {
+      await ch.stop();
+    }
+  });
+});

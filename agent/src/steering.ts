@@ -181,6 +181,11 @@ export class SteeringChannel {
    *  /follow-ups and merges them (reconcileFollowUps), operatorConstraints reports "reconciling"
    *  and the Agent guard denies dispatches. */
   private reconcilePending = false;
+  /** Issue #1660: the single in-flight background reconcile read, if any. */
+  private reconcileInFlight: Promise<void> | undefined;
+  /** Issue #1660: bumped on every poll error. A reconcile read clears reconcilePending only if no
+   *  poll failed after it started, since a later lost reply postdates the snapshot it read. */
+  private pollErrorEpoch = 0;
   /** issue #559 M2: the highest `follow_up` input id this channel has already handed to the
    *  executor — via pullFollowUp or awaitFollowUp/serviceFollowUp. This is the wake-guard
    *  watermark the runner reports at the interactive park (open_followup_id). Buffering a
@@ -966,20 +971,35 @@ export class SteeringChannel {
     }
   }
 
+  /** Issue #1660: one background /follow-ups read that merges its rows and clears the pending
+   *  flag, unless a poll failed after it started. A failure leaves the flag set for the next
+   *  poll iteration to retry. */
+  private startReconcile(): void {
+    const epoch = this.pollErrorEpoch;
+    // Via Promise.resolve().then so a synchronous throw becomes a rejection, never a poll-loop crash.
+    this.reconcileInFlight = Promise.resolve()
+      .then(() => this.client.getConsumedFollowUps(this.runId))
+      .then(
+        (rows) => {
+          this.reconcileFollowUps(rows);
+          if (this.pollErrorEpoch === epoch) this.reconcilePending = false;
+        },
+        (err: unknown) => {
+          this.log.warn("steering: follow-up reconcile failed", { run_id: this.runId, error: errMessage(err) });
+        },
+      )
+      .finally(() => {
+        this.reconcileInFlight = undefined;
+      });
+  }
+
   private async pollLoop(): Promise<void> {
     while (!this.stopped) {
       // Issue #1660: a previous poll failed, so its reply may have carried follow-ups the server
-      // already consumed. Re-read and merge them first. A failed read only keeps the flag set
-      // (dispatches stay denied): it must never stop the /inputs poll below, which carries
-      // cancel, stop and the plan verdicts.
-      if (this.reconcilePending) {
-        try {
-          this.reconcileFollowUps(await this.client.getConsumedFollowUps(this.runId));
-          this.reconcilePending = false;
-        } catch (err) {
-          this.log.warn("steering: follow-up reconcile failed", { run_id: this.runId, error: errMessage(err) });
-        }
-      }
+      // already consumed. Re-read and merge them in the BACKGROUND, single-flight, never awaited
+      // here: the /inputs poll below carries cancel, stop and the plan verdicts and must not wait
+      // on it. Dispatches stay denied until a read succeeds.
+      if (this.reconcilePending && !this.reconcileInFlight) this.startReconcile();
       try {
         const { inputs, credentialSwitch } = await this.client.getInputs(this.runId);
         for (const inp of inputs)
@@ -1002,6 +1022,7 @@ export class SteeringChannel {
           error: errMessage(err),
         });
         this.reconcilePending = true;
+        this.pollErrorEpoch++;
       }
       // Service the parked waiters on EVERY tick, OUTSIDE the try above, so a getInputs
       // failure cannot starve them (PRD #517 M5). serviceGate/serviceAnswer/serviceFollowUp
