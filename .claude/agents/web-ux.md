@@ -128,12 +128,11 @@ real browser, not by reading code. Report findings only; never modify code.
 The SPA lives in `web/` (Vite/React/Tailwind, ember design tokens as CSS variables in
 `web/src/index.css` — flag hardcoded palette classes as token violations).
 
-**The app is deliberately dark-only** — "a dark factory", declared in `web/src/index.css`.
-There is no light mode, so a dispatch framing a change as a "light + dark" pass is wrong on
-its face; do not reorient around it, just validate the dark UI. It ships TWO dark themes
-selected by a `[data-theme]` attribute: the default **ember** (molten-orange on near-black)
-and **mission** (an ops-console blue set), both `color-scheme: dark`. Check appearance
-against those two themes, never against a light/dark split.
+**The app ships dark AND light themes**, selected by a `[data-theme]` attribute in
+`web/src/index.css`: dark **ember** (the default, molten-orange on near-black) and **mission**
+(an ops-console blue set), plus light **dawn**, **hall** and **shadow** (`color-scheme: light`).
+Check appearance against at least one dark and one light theme; opacity-based dimming and
+hardcoded colors are the usual casualties on the light ones.
 
 **Chromium in the worker needs `--no-sandbox`** or launches abort on the SUID sandbox. The
 launcher shim usually injects the flag; if a browser launch fails that way, pass

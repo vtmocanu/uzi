@@ -12,9 +12,9 @@
    Components carry
    STRUCTURE only; all look-and-feel lives here, so an alternative redesign can
    ship as a second `[data-theme="…"]` block overriding these variables over
-   the same component tree. This default theme is "ember": uzi is deliberately
-   dark-only — a dark factory — with molten-metal orange against near-black
-   steel. The `:not([data-theme])` guard means a set data-theme (e.g. mission)
+   the same component tree. This default theme is "ember": a dark factory, with
+   molten-metal orange against near-black steel; light themes (dawn, hall,
+   shadow) follow below. The `:not([data-theme])` guard means a set data-theme (e.g. mission)
    fully replaces this block instead of racing it on source order. */
 :root:not([data-theme]),
 [data-theme="ember"] {
