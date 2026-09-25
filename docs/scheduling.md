@@ -207,25 +207,28 @@ with its own cadence, pause/resume, and run history. Editing an existing
 schedule still targets exactly one repo, unchanged; the multi-select is a
 create-time affordance only.
 
-Schedules created together this way are shown grouped. On the **My
-schedules** list, a custom schedule that exists on two or more repos
-collapses into one expandable summary row — the schedule's name plus how
-many repos it's on — over a per-repo sub-row each. It's the same
-grouped/expandable look the [Default jobs](#default-jobs) tab already uses
-for a default enabled on several repos. A schedule that only exists on one
-repo still shows as a plain, standalone row.
+Schedules created together this way share a **display-only** group id
+server-side, but the **Schedules** tab renders each sibling as its own
+independent row — no expandable summary, no sub-rows — the same as a
+default enabled on several repos (see [Default jobs](#default-jobs)
+below). The list does not group siblings: it orders rows by status and
+next fire, so siblings sit together only when they share a fire time. For
+a default job, a catalog card's "Enabled on N repos" link filters the list
+to every repo that job runs on. Custom siblings have no job filter; the
+Repo select narrows the list to one repo.
 
-**The grouping is a display convenience, not a linked job.** Each sibling is
-its own independent schedule row: editing, pausing, or removing one never
-touches the others, and an edit on one never propagates to the rest of the
+**The grouping is data only, not a linked job.** Each sibling is its own
+independent schedule row: editing, pausing, or removing one never touches
+the others, and an edit on one never propagates to the rest of the
 group.
 
-**Add another repo**, on a row or a group's summary, extends that same job
-onto one more repo you own as a new sibling, without reopening the create
-modal and re-entering everything. If the schedule already has a sibling on
-that repo, this is a clean no-op rather than an error. A multi-repo create
-also runs the [sweep-label guardrail](#sweep-label-guardrail) once per
-selected repo, same as any other sweep schedule.
+**Add to another repo**, a row's More actions menu item, extends that same
+job onto one more repo you own as a new sibling, without reopening the
+create modal and re-entering everything. If the schedule already has a
+sibling on that repo, this is a clean no-op rather than an error. A
+multi-repo create also runs the [sweep-label
+guardrail](#sweep-label-guardrail) once per selected repo, same as any
+other sweep schedule.
 
 **Issue-target schedules cannot span repos.** An issue number is
 repo-relative (issue #7 on one repo is a different issue on another), so a
@@ -238,7 +241,7 @@ repo's own issue.
 
 **CLI**: `uzi schedule create --repo A --repo B ...` creates the same
 grouped siblings as the web multi-select; `uzi schedule add-repo <id> --repo
-<id>` is the CLI twin of "Add another repo" — see [the CLI
+<id>` is the CLI twin of "Add to another repo" — see [the CLI
 reference](./cli.md#commands) for the full flag list.
 
 ### Pausing everything at once
@@ -413,11 +416,14 @@ the catalog — its entry is cadence and model only (see
   agents" toggle, `override_subagent_model`) are yours to edit like any
   schedule — as is owner **guidance** on a prompt-target or sweep-target
   default (on a sweep default it is an overlay composed onto the read-only
-  baked catalog guidance); a **Reset to default** action puts an edited
-  default back to the catalog's cadence/model/options in one step — including
-  clearing `override_subagent_model` back to its catalog baseline of `false`
-  — and also clears any owner guidance you added to a prompt or sweep
-  default.
+  baked catalog guidance); a **Reset** action (shown only on a customized row)
+  restores cron, timezone, model,
+  auto-approve, wait-on-limit, max issues and output mode to the catalog
+  values in one step, sets `override_subagent_model` back to its catalog
+  baseline of `false`, and clears MR rework, owner guidance, the harness pin
+  and the credential override back to inherit. It also re-activates a parked
+  schedule on its catalog cadence (a schedule you had paused stays paused).
+  The catalog-owned prompt and labels are never touched by Reset.
 - **Enable on several repos at once.** Enabling a default (or creating a
   custom schedule) against multiple repos creates one independent schedule
   per repo — each with its own cadence, its own pause/resume, its own run
@@ -450,19 +456,24 @@ the catalog — its entry is cadence and model only (see
   below](#sweep-label-guardrail). It's advisory: it warns, never blocks. The
   `assigned-sweep` default has no label to check — its selector is bot
   assignment — so this guardrail doesn't apply to it.
-- **Where to manage them.** **Web**: the Schedules page has a **Default
-  jobs** tab alongside **My schedules** — default rows carry a lock marker
-  on the baked prompt, with Reset and Clone actions (no separate `DEFAULT`
-  badge; the tab header already says so); a default enabled on several repos
-  shows as one expandable summary row over its per-repo schedules, the same
-  grouped look a multi-repo [custom
-  schedule](#running-a-schedule-on-several-repos) gets. **CLI**: `uzi
-  schedule catalog list` shows the catalog
-  and how many of your repos already run each entry; `uzi schedule catalog
-  enable <slug> --repo <id>` enables one (repeatable `--repo` for several
-  repos at once); `uzi schedule reset <id>` and `uzi schedule clone <id>`
-  work as described above — see [the CLI reference](./cli.md#commands) for
-  the full flag list.
+- **Where to manage them.** **Web**: the Schedules page has two tabs,
+  **Schedules** and **Job catalog**. Every schedule you have, default and
+  custom alike, is one flat row on the **Schedules** tab — default rows
+  carry a lock marker on the baked prompt, plus inline Run now, Edit, a
+  Reset action (only when the row has been customized) and a More actions
+  menu (Clone, Enable on another repo, Remove; a custom row offers Add to
+  another repo in place of Enable); nothing to expand to act on
+  a row, even for a default enabled on several repos — each repo is its own
+  row (see [Running a schedule on several
+  repos](#running-a-schedule-on-several-repos) above). **Job catalog** is for discovery: one card per built-in job,
+  each with its own "Enable on…" repo picker and a status line ("Not
+  enabled", or "Enabled on N repos" linking back to the Schedules tab
+  filtered to that job). **CLI**: `uzi schedule catalog list` shows the
+  catalog and how many of your repos already run each entry; `uzi schedule
+  catalog enable <slug> --repo <id>` enables one (repeatable `--repo` for
+  several repos at once); `uzi schedule reset <id>` and `uzi schedule clone
+  <id>` work as described above — see [the CLI
+  reference](./cli.md#commands) for the full flag list.
 
 ### Self-improvement
 

@@ -243,6 +243,7 @@ export function Toggle({
   disabled = false,
   label,
   title,
+  focusableWhenDisabled = false,
   "aria-describedby": ariaDescribedby,
 }: {
   checked: boolean;
@@ -250,6 +251,10 @@ export function Toggle({
   disabled?: boolean;
   label: string;
   title?: string;
+  /** When set, `disabled` marks the switch aria-disabled and ignores clicks instead of
+   *  setting the native attribute, so a switch that disables itself while its own
+   *  request is in flight keeps keyboard focus (a browser blurs a disabled button). */
+  focusableWhenDisabled?: boolean;
   /** Optional id of an element describing this switch, so a screen reader reads the
    *  caveat/consequence copy alongside the accessible name. Every existing caller omits
    *  it, so it is backward-compatible. */
@@ -263,10 +268,13 @@ export function Toggle({
       aria-label={label}
       aria-describedby={ariaDescribedby}
       title={title ?? label}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
+      disabled={disabled && !focusableWhenDisabled}
+      aria-disabled={(disabled && focusableWhenDisabled) || undefined}
+      onClick={() => {
+        if (!disabled) onChange(!checked);
+      }}
       className={cx(
-        "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+        "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50",
         checked ? "bg-brand" : "bg-edge-strong",
       )}
     >

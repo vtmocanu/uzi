@@ -327,8 +327,8 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 // schedule.next_fires reconciliation (issue #1003): the mapper only sets NextFires for a
 // recurring schedule with a valid cron (handler/schedules_dto.go:125-126); a once (or
 // invalid-cron) schedule leaves it nil, so the wire emits `null`. The type is now widened
-// to `string[] | null` and both `next_fires[0]` index sites (components/DefaultJobs.tsx,
-// pages/Schedules.tsx) are guarded with `?.`, so `_scheduleZero` type-checks positively
+// to `string[] | null` and the `next_fires[0]` index site (lib/scheduleList.ts
+// nextFireOf) is guarded with `?.`, so `_scheduleZero` type-checks positively
 // against the fixture with no directive. labels is likewise typed `string[] | null`.
 {
   const _scheduleMissing: never = null as unknown as Exclude<keyof Schedule, keyof typeof scheduleFull>;

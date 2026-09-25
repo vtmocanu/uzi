@@ -8,6 +8,7 @@ import {
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { mockRepos, mockSecrets } from "../data";
+import { minsAgo } from "../data/time";
 import { nextRunId } from "../store";
 import { delay, requireSession } from "./shared";
 import { repos } from "./forge";
@@ -262,6 +263,63 @@ const userSchedules: Omit<
     enabled: true, status: "error", created_at: daysFromNow(-12, 15),
     updated_at: daysFromNow(-1, 1, 30), next_fires: [], last_fire: null,
   },
+  // Two one-time schedules that already fired (status='fired'): the Schedules list folds
+  // them into the "2 one-time schedules already fired" row with their issue refs (#18,
+  // #21), so the D6 fold is visible under VITE_UZI_MOCK=1. Each started the run the mock
+  // runs fixture already carries for that issue, so the run link resolves, and each fired
+  // a minute before that run was created (run-done ~3.75h ago, run-awaiting ~10 min ago).
+  {
+    id: "sch-f1rd", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi",
+    target: "issue", issue_iid: 18, labels: null, prompt: "",
+    timing: "once", cron_expr: "", run_at: minsAgo(226),
+    timezone: "Europe/Bucharest", next_fire_at: null,
+    last_fired_at: minsAgo(226), auto_approve: true, wait_on_limit: true,
+    max_issues: null,
+    guidance: null,
+    model: null,
+    output_mode: null,
+    override_subagent_model: false,
+    enabled: true, status: "fired", created_at: minsAgo(1666),
+    updated_at: minsAgo(226), next_fires: [],
+    last_fire: {
+      fired_at: minsAgo(226), matched: 1, capped: false,
+      started: [
+        {
+          issue_iid: 18,
+          run_id: "run-done",
+          title: "Run view: fold tool results under their calls",
+          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/18",
+        },
+      ],
+      skips: [],
+    },
+  },
+  {
+    id: "sch-f2rd", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi",
+    target: "issue", issue_iid: 21, labels: null, prompt: "",
+    timing: "once", cron_expr: "", run_at: minsAgo(11),
+    timezone: "Europe/Bucharest", next_fire_at: null,
+    last_fired_at: minsAgo(11), auto_approve: false, wait_on_limit: true,
+    max_issues: null,
+    guidance: null,
+    model: null,
+    output_mode: null,
+    override_subagent_model: false,
+    enabled: true, status: "fired", created_at: minsAgo(300),
+    updated_at: minsAgo(11), next_fires: [],
+    last_fire: {
+      fired_at: minsAgo(11), matched: 1, capped: false,
+      started: [
+        {
+          issue_iid: 21,
+          run_id: "run-awaiting",
+          title: "Plan-approval notifications via email",
+          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/21",
+        },
+      ],
+      skips: [],
+    },
+  },
 ];
 
 // The builtin default-jobs catalog (PRD #589), mirroring
@@ -422,11 +480,11 @@ function materializeDefault(
 const catalogBySlug = (slug: string): CatalogEntry | undefined =>
   scheduleCatalog.find((e) => e.slug === slug);
 
-// Seed a few materialized defaults so the Default-jobs UX is visible under
-// VITE_UZI_MOCK=1: bug-triage enabled on TWO repos (Layout A — one summary row
-// expanding to two per-repo sub-rows, one active + one paused so the resume
-// affordance shows), and docs-hygiene enabled + customized on one repo (the
-// "customized" indicator + a prominent Reset).
+// Seed a few materialized defaults so the default-row UX is visible under
+// VITE_UZI_MOCK=1: bug-triage enabled on TWO repos (two rows in the flat Schedules
+// list, one active + one paused so the resume affordance shows, and a Job catalog
+// card reading "Enabled on 2 repos, 1 paused"), and docs-hygiene enabled + customized
+// on one repo (the "customized" indicator + a prominent Reset).
 const seededDefaults: Schedule[] = [
   materializeDefault(catalogBySlug("bug-triage")!, "repo-uzi", "sch-def-bt-uzi", {
     last_fired_at: daysFromNow(-1, 2),

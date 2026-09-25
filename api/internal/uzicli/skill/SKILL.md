@@ -641,7 +641,7 @@ nothing a manual start cannot.
   a CLIENT-SIDE fan-out that issues one independent create per `--repo` (each repo prints its
   own `created schedule …` line, and `--json` returns them all as an array; a single `--repo`
   is unchanged and dumps the one schedule object). Creating on **N>1 repos** stamps the rows
-  with one shared **display-only** group id so the web renders them as one expandable group;
+  with one shared **display-only** group id (the web lists each as its own row);
   the rows stay fully independent (editing/pausing/removing one never touches a sibling), and a
   single-`--repo` create is standalone (no group). A mid-loop failure still reports the
   schedules that already landed before it exits non-zero. You pick exactly one **target** and
@@ -699,9 +699,11 @@ nothing a manual start cannot.
   - `--harness claude|codex` (valid on every target, including `self_improve` defaults)
     pins the harness every run this schedule fires uses; omit it to resolve the
     effective harness per fire instead of pinning one.
-- `uzi schedule list` — your schedules as a table (`ID`, `TARGET`, `REPO`, `WHEN`,
-  `NEXT`, `ON`, `HARNESS`); `--json` dumps the raw array. Each element's `target` is the
-  string enum `issue` | `sweep` | `prompt` (a plain string, NOT a nested object),
+- `uzi schedule list` — your schedules as a table (`ID`, `TARGET`, `SOURCE`, `REPO`,
+  `WHEN`, `NEXT`, `ON`, `HARNESS`); `SOURCE` is the catalog slug for a **default**
+  schedule (the `catalog_slug` of an `origin: "default"` row) and `custom` for one you
+  authored. `--json` dumps the raw array (no `SOURCE` field; read `origin` and
+  `catalog_slug`). Each element's `target` is the string enum `issue` | `sweep` | `prompt` (a plain string, NOT a nested object),
   and a sweep's label selector is the top-level `labels` array. So the correct way
   to answer "is there a sweep schedule, and on which label(s)?" is
   `uzi schedule list --json | jq '[.[] | select(.target=="sweep") | {id, labels, enabled}]'`.
@@ -806,10 +808,14 @@ nothing a manual start cannot.
   **purely advisory and never blocks the enable — not even on its own forge errors**: a
   failed label check or create prints a `WARNING` and proceeds (the enable otherwise reads
   nothing from the forge).
-- `uzi schedule reset <schedule-id>` — restore a **default** schedule's edited fields (cron,
-  timezone, model, apply-model-to-agents, auto-approve, wait-on-limit, max-issues) to the
-  builtin catalog values — `apply-model-to-agents` resets to `false` — and clear its
-  customized flag. Only a default-origin schedule can be reset; a user-origin one is a `409`.
+- `uzi schedule reset <schedule-id>` — restore a **default** schedule's edited fields to the
+  builtin catalog values: cron, timezone, model, auto-approve, wait-on-limit, max issues
+  and output mode return to the catalog values, `apply-model-to-agents` resets to `false`,
+  and MR rework, the guidance, the harness pin and the credential override are cleared to
+  inherit. It also clears the customized flag and re-activates the schedule on its catalog
+  cadence (a parked schedule fires again unless it is paused). The catalog-owned prompt and
+  labels are not touched.
+  Only a default-origin schedule can be reset; a user-origin one is a `409`.
 - `uzi schedule clone <schedule-id> [--repo <repo-id>]` — copy a schedule into a new, fully
   editable schedule you own. Cloning a **default** schedule lifts its catalog prompt lock (the
   baked prompt, or a sweep's labels/guidance, is copied into the new row, which becomes a
@@ -818,8 +824,8 @@ nothing a manual start cannot.
 - `uzi schedule add-repo <schedule-id> --repo <repo-id>` — replicate an existing schedule you
   own onto **another** repo you own as a new **grouped sibling**: the new row is an
   independent, fully-editable copy of the source's current config, and both the source and the
-  new row are stamped with one shared **display-only** group id so they render as one
-  expandable group (the CLI twin of the web "Add another repo" action). `--repo` is required
+  new row are stamped with one shared **display-only** group id; the web lists each as its
+  own row (the CLI twin of the web "Add to another repo" action). `--repo` is required
   (the target repo id from `uzi repo list`). Only a **user** schedule can be added onto; a
   foreign source or target repo is a `404`. If the schedule already has a sibling on that repo
   this is a clean **no-op** (exit 0). `--json` dumps the new sibling object.
