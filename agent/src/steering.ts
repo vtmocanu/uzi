@@ -27,7 +27,7 @@
 // [revise, approve] yields one revision round and a fresh gate — never an approve of the
 // pre-feedback plan.
 
-import { RequestError, type WorkerClient } from "./client.js";
+import { RequestError, type InputReceipt, type WorkerClient } from "./client.js";
 import type { FollowUpOutcome } from "./executor.js";
 import type { Logger } from "./log.js";
 import { parseAgentSelection, type AgentSelectionParse, type UserInput } from "./protocol.js";
@@ -160,6 +160,49 @@ const MAX_INPUT_BATCH = 1000;
 /** Issue #1673: applied attempts a stopping channel makes for a routed batch before it leaves
  *  the batch to the next claim (which replays it: at-least-once across claims). */
 const STOP_APPLY_ATTEMPTS = 3;
+/** Issue #1673: consecutive failed applied attempts on an ACTIVE claim before the channel gives
+ *  up. A state report waits on the applied receipt, so an unbounded retry would hold it forever. */
+const ACTIVE_APPLY_ATTEMPTS = 30;
+
+/** Issue #1673: the applied receipt for a routed batch could not be confirmed. Thrown to every
+ *  state report still waiting on it and to the parked waiters, so the run fails instead of
+ *  reporting a resume the server's applied-only guards would not recognise. */
+class InputReceiptError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InputReceiptError";
+  }
+}
+
+/** Issue #1673: a receipt said this claim was released or superseded (or the run is terminal).
+ *  The old flight's GETs would never see its inputs again, so it ends; its reports are refused
+ *  by the server's claim fence. */
+class ClaimFencedSignal extends Error {
+  constructor(readonly reason: string) {
+    super(`input claim is no longer active (${reason})`);
+    this.name = "ClaimFencedSignal";
+  }
+}
+
+/** Issue #1673: the claim fence a failed receipt names: a 409's `reason` ("" for a row-state
+ *  conflict), "stale" for a 404, undefined for anything else (retryable). */
+function receiptFenceReason(err: unknown): string | undefined {
+  if (!(err instanceof RequestError)) return undefined;
+  if (err.status === 404) return "stale";
+  if (err.status !== 409) return undefined;
+  try {
+    const reason = (JSON.parse(err.body) as { reason?: unknown }).reason;
+    return typeof reason === "string" ? reason : "";
+  } catch {
+    return "";
+  }
+}
+
+/** A fenced claim ends the old flight, except a pending credential switch, whose own signal
+ *  (on the next GET) releases the claim, and which may yet fail and leave the claim active. */
+function endsFlight(reason: string | undefined): boolean {
+  return reason === "released" || reason === "stale";
+}
 
 /** Issue #1673: a receipt response is trusted only when every row is well formed and the ids
  *  are exactly the held batch; anything else is retried like a lost reply. */
@@ -175,7 +218,7 @@ function validBatch(inputs: unknown): inputs is UserInput[] {
     new Set(inputs.map((input) => input.id)).size === inputs.length;
 }
 
-function validReceipt(receipt: { inputs: UserInput[]; active: boolean } | null | undefined, ids: number[]): boolean {
+function validReceipt(receipt: InputReceipt | null | undefined, ids: number[]): boolean {
   if (typeof receipt?.active !== "boolean" || !validBatch(receipt.inputs) || receipt.inputs.length !== ids.length)
     return false;
   const expected = new Set(ids);
@@ -211,14 +254,24 @@ export class SteeringChannel {
   private held: { ids: number[]; phase: "ack" | "routed" | "applied"; hasFollowUp: boolean } | undefined;
   /** Applied attempts made since stop(); bounded by STOP_APPLY_ATTEMPTS. */
   private stopApplyAttempts = 0;
-  private readonly receiptWaiters: Array<() => void> = [];
+  /** Consecutive failed applied attempts on the active claim; bounded by ACTIVE_APPLY_ATTEMPTS. */
+  private applyFailures = 0;
+  /** Set once the applied receipt is given up on an active claim; every later wait throws it. */
+  private receiptFailure: InputReceiptError | undefined;
+  /** Why the flight ended from this channel (a given-up receipt or a fenced claim): a park
+   *  armed after that rejects at once instead of waiting on a poll loop that has stopped. */
+  private flightEnded: Error | undefined;
+  private readonly receiptWaiters: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
 
   /** Issue #1673: resolves once no routed input awaits its applied receipt. The runner holds
-   *  every state report behind it, so the server's resume guards (which count only APPLIED
-   *  inputs) see the follow-up, verdict or answer that caused the report. */
+   *  every non-terminal state report behind it, so the server's resume guards (which count only
+   *  APPLIED inputs) see the follow-up, verdict or answer that caused the report. Rejects with
+   *  InputReceiptError once the receipt is given up, so no guarded report goes out as if the
+   *  input were applied. */
   async awaitReceiptSettlement(): Promise<void> {
+    if (this.receiptFailure) throw this.receiptFailure;
     if (!this.receiptPending()) return;
-    await new Promise<void>((resolve) => this.receiptWaiters.push(resolve));
+    await new Promise<void>((resolve, reject) => this.receiptWaiters.push({ resolve, reject }));
   }
 
   private receiptPending(): boolean {
@@ -227,7 +280,47 @@ export class SteeringChannel {
 
   private releaseHeld(): void {
     this.held = undefined;
-    for (const resolve of this.receiptWaiters.splice(0)) resolve();
+    this.applyFailures = 0;
+    for (const w of this.receiptWaiters.splice(0)) w.resolve();
+  }
+
+  /** Give up the applied receipt of a routed batch on an active claim: stop polling, fail every
+   *  report waiting on it and every parked waiter. The rows stay unapplied for a later claim. */
+  private failReceipts(err: InputReceiptError): void {
+    this.log.error("steering: giving up the applied receipt; failing the run", { run_id: this.runId, error: err.message });
+    this.receiptFailure = err;
+    this.flightEnded = err;
+    this.held = undefined;
+    this.stopped = true;
+    for (const w of this.receiptWaiters.splice(0)) w.reject(err);
+    this.rejectParkedWaiters(err);
+  }
+
+  /** The claim is released or superseded: route nothing more and end the old flight. A waiting
+   *  report is let go; the server refuses it as a stale claim. */
+  private endFencedFlight(reason: string): void {
+    this.log.warn("steering: input receipt claim is fenced; ending this flight", { run_id: this.runId, reason });
+    const signal = new ClaimFencedSignal(reason);
+    this.flightEnded = signal;
+    this.releaseHeld();
+    this.stopped = true;
+    if (!this.cancel.signal.aborted) this.cancel.abort(signal);
+    this.rejectParkedWaiters(signal);
+  }
+
+  /** Issue #1673: a failed receipt request. A fence reason ends the flight or drops the batch;
+   *  any other 4xx drops it; a retryable failure of the applied receipt counts toward the
+   *  active-claim bound. */
+  private onReceiptFailure(err: unknown): void {
+    if (!this.held) return;
+    const reason = receiptFenceReason(err);
+    if (endsFlight(reason)) return this.endFencedFlight(reason!);
+    if (reason !== undefined || (err instanceof RequestError && err.status >= 400 && err.status < 500))
+      return this.releaseHeld();
+    if (this.held.phase === "applied" && !this.stopped && ++this.applyFailures >= ACTIVE_APPLY_ATTEMPTS)
+      this.failReceipts(new InputReceiptError(
+        `could not confirm ${this.held.ids.length} applied operator input(s) after ${ACTIVE_APPLY_ATTEMPTS} attempts: ${errMessage(err)}`,
+      ));
   }
 
   /** issue #559 M2: the highest `follow_up` input id this channel has already handed to the
@@ -545,6 +638,8 @@ export class SteeringChannel {
   awaitGateEvent(epoch: number): Promise<PlanVerdict> {
     const v = this.takeGateEvent(epoch);
     if (v) return Promise.resolve(v);
+    // Issue #1673: the poll loop has stopped for good, so a new park would never be serviced.
+    if (this.flightEnded) return Promise.reject(this.flightEnded);
     return new Promise<PlanVerdict>((resolve, reject) => {
       this.gateWaiter = { epoch, resolve, reject };
     });
@@ -573,6 +668,8 @@ export class SteeringChannel {
   awaitAnswer(questionId: string): Promise<AnswerVerdict> {
     const v = this.takeAnswerEvent(questionId);
     if (v) return Promise.resolve(v);
+    // Issue #1673: the poll loop has stopped for good, so a new park would never be serviced.
+    if (this.flightEnded) return Promise.reject(this.flightEnded);
     return new Promise<AnswerVerdict>((resolve, reject) => {
       this.answerWaiter = { questionId, resolve, reject };
     });
@@ -739,6 +836,8 @@ export class SteeringChannel {
         body: f.body,
       });
     }
+    // Issue #1673: the poll loop has stopped for good, so a new park would never be serviced.
+    if (this.flightEnded) return Promise.reject(this.flightEnded);
     return new Promise<FollowUpOutcome>((resolve, reject) => {
       this.followUpWaiter = { resolve, reject, idleMs, parkedAt: this.now() };
     });
@@ -851,7 +950,11 @@ export class SteeringChannel {
     if (!this.cancel.signal.aborted) this.cancel.abort(new CredentialSwitchSignal());
     this.credentialSwitchInterrupt?.();
     // Idle at a waiter: reject it so a gate/question/follow-up park (no live turn) is released.
-    const err = new CredentialSwitchSignal();
+    this.rejectParkedWaiters(new CredentialSwitchSignal());
+  }
+
+  /** Reject every parked gate/answer/follow-up waiter with `err`. */
+  private rejectParkedWaiters(err: Error): void {
     if (this.gateWaiter) {
       const w = this.gateWaiter;
       this.gateWaiter = undefined;
@@ -1000,7 +1103,9 @@ export class SteeringChannel {
     if (held.phase === "applied") {
       const receipt = await this.client.applyInputs(this.runId, held.ids, this.claimGeneration);
       if (!validReceipt(receipt, held.ids)) throw new Error("invalid input applied response");
-      // Settled either way: active, or already applied before the claim was fenced.
+      // Settled either way: active, or already applied before the claim was fenced, in which
+      // case a released or superseded claim still ends this flight.
+      if (!receipt.active && endsFlight(receipt.reason)) return this.endFencedFlight(receipt.reason!);
       this.releaseHeld();
       return;
     }
@@ -1008,9 +1113,11 @@ export class SteeringChannel {
     const receipt = await this.client.ackInputs(this.runId, held.ids, this.claimGeneration);
     if (!validReceipt(receipt, held.ids)) throw new Error("invalid input ACK response");
     if (!receipt.active) {
-      // The claim is switching, released or superseded: route nothing, leave the rows to the
-      // next claim's GET. Polling continues, so a pending credential switch still trips.
-      this.log.warn("steering: input receipt claim is inactive; leaving the batch to the next claim", {
+      // Route nothing; the rows belong to the next claim. A released or superseded claim ends
+      // this flight. A pending credential switch keeps polling, so its signal still trips (a
+      // local cancel would report the run cancelled mid-switch) and a failed switch resumes.
+      if (endsFlight(receipt.reason ?? "stale")) return this.endFencedFlight(receipt.reason ?? "stale");
+      this.log.warn("steering: input receipt claim has a switch pending; leaving the batch to the next claim", {
         run_id: this.runId,
         count: held.ids.length,
       });
@@ -1060,10 +1167,10 @@ export class SteeringChannel {
         }
         if (this.held) await this.advanceHeld();
       } catch (err) {
-        // A 4xx on a receipt is definitive (stale claim, foreign or ineligible ids): retrying
-        // the same ids cannot succeed. Drop the batch; the server replays whatever is unapplied.
-        if (this.held && err instanceof RequestError && err.status >= 400 && err.status < 500)
-          this.releaseHeld();
+        // Issue #1673: a fenced claim ends the flight; any other 4xx is definitive for these ids
+        // (drop the batch, the server replays whatever is unapplied); a failing applied receipt
+        // on the active claim is bounded.
+        this.onReceiptFailure(err);
         // The loop continues on a failure (HTTP >=400 / timeout) — but only the request is
         // skipped, not the service step below. PRD #517 M5: serviceFollowUp()
         // evaluates the interactive park's idle clock and is called ONLY from this loop, so
@@ -1169,6 +1276,7 @@ export class ChatSteering implements ChatInputSource {
   /** Every input id routed on this claim, so a replayed batch never routes twice. */
   private readonly routedIds = new Set<number>();
   private stopApplyAttempts = 0;
+  private applyFailures = 0;
   private waiter:
     | { resolve: (i: ChatInput) => void; idleMs: number; parkedAt: number }
     | undefined;
@@ -1289,6 +1397,7 @@ export class ChatSteering implements ChatInputSource {
           const receipt = await this.client.ackInputs(this.runId, this.held.ids, this.claimGeneration);
           if (!validReceipt(receipt, this.held.ids)) throw new Error("invalid input ACK response");
           if (!receipt.active) {
+            // A chat has no credential switch; any inactive claim is another worker's.
             this.loseClaim();
           } else {
             for (const input of [...receipt.inputs].sort((a, b) => a.id - b.id)) {
@@ -1304,10 +1413,19 @@ export class ChatSteering implements ChatInputSource {
           if (!validReceipt(receipt, this.held.ids)) throw new Error("invalid input applied response");
           // Settled: active, or already applied before the claim was fenced.
           this.held = undefined;
+          this.applyFailures = 0;
         }
       } catch (err) {
-        if (err instanceof RequestError && (err.status === 404 || err.status === 409) && this.held) this.loseClaim();
-        else if (err instanceof RequestError && err.status >= 400 && err.status < 500) this.held = undefined;
+        const reason = receiptFenceReason(err);
+        if (this.held && (endsFlight(reason) || reason === "switch_pending")) this.loseClaim();
+        else if (this.held && (reason !== undefined || (err instanceof RequestError && err.status >= 400 && err.status < 500)))
+          this.held = undefined;
+        else if (this.held?.phase === "applied" && ++this.applyFailures >= ACTIVE_APPLY_ATTEMPTS) {
+          // Nothing waits on a chat's applied receipt, so giving it up only drops the batch: the
+          // next GET replays the rows, which are ACKed and applied again but not re-routed.
+          this.held = undefined;
+          this.applyFailures = 0;
+        }
         this.log.warn("chat steering: input poll failed", {
           run_id: this.runId,
           error: errMessage(err),

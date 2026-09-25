@@ -4969,9 +4969,11 @@ export class RunRunner {
       observedSessionId: undefined,
       latestContractRevision: undefined,
       reportState: async (body, signal) => {
-        // A routed input can trigger this report while its applied reply is uncertain.
-        // Keep the report behind that receipt so the server's follow-up wake guard sees it.
-        await steering.awaitReceiptSettlement();
+        // Issue #1673: a routed input can trigger this report while its applied reply is
+        // uncertain. Keep the report behind that receipt so the server's resume guards see it;
+        // the wait throws once the receipt is given up, so neither a resume nor a completion goes
+        // out as if the input were applied. Only `failed` never waits: it must land to end the run.
+        if (body.status !== "failed") await steering.awaitReceiptSettlement();
         // PRD #1390 M2a: this same choke point is where the run announces every phase
         // transition, so reflect the four snapshot phases (running / awaiting_approval /
         // awaiting_input / awaiting_followup) into the active-run registry BEFORE the report

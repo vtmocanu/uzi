@@ -44,6 +44,11 @@ export class FakeApi {
   private readonly receiptGeneration = new Map<string, number>();
   private readonly lostReceiptReplies = new Map<string, number>();
   private readonly seenInputIds = new Map<string, Set<number>>();
+  private readonly receiptFenceReason = new Map<string, string>();
+  private readonly failingReceipts = new Map<"ack" | "applied", number>();
+  /** Issue #1673: receipt tests set this so a receipt for a run with no explicit claim
+   *  generation fails loudly instead of being accepted as the only claim. */
+  strictReceiptGenerations = false;
   private nextSyntheticInputId = 1_000_000;
   readonly inputReceiptCalls: Array<{ runId: string; kind: "ack" | "applied"; ids: number[]; generation: number }> = [];
   // Issue #1660: the follow_up inputs /inputs has already drained, per run, oldest first — what
@@ -381,6 +386,17 @@ export class FakeApi {
     this.receiptGeneration.set(runId, generation);
   }
 
+  /** Why the run's claim is inactive once its generation moves on (default "stale"). */
+  setInputFenceReason(runId: string, reason: "switch_pending" | "released" | "stale"): void {
+    this.receiptFenceReason.set(runId, reason);
+  }
+
+  /** Answer every `kind` receipt with `status` (undefined restores normal replies). */
+  failInputReceipts(kind: "ack" | "applied", status: number | undefined): void {
+    if (status === undefined) this.failingReceipts.delete(kind);
+    else this.failingReceipts.set(kind, status);
+  }
+
   loseNextInputReceiptReply(kind: "ack" | "applied"): void {
     this.lostReceiptReplies.set(kind, (this.lostReceiptReplies.get(kind) ?? 0) + 1);
   }
@@ -642,20 +658,27 @@ export class FakeApi {
       const generation = json.claim_generation as number;
       this.inputReceiptCalls.push({ runId, kind, ids: [...ids], generation });
       // A run whose claim generation the test never set (it ran a claim without enqueueClaim)
-      // accepts any generation, as that claim is the only one.
+      // accepts any generation, as that claim is the only one, unless the test asked for strict
+      // generations: then an unset one is a fixture error, so a fencing regression cannot hide.
       const current = this.receiptGeneration.get(runId);
+      if (current === undefined && this.strictReceiptGenerations)
+        return send(res, 500, { error: `fake: no claim generation set for run ${runId}` });
       const active = current === undefined || generation === current;
+      // The claim's inactive reason, as the server names it (switch_pending | released | stale).
+      const reason = active ? undefined : (this.receiptFenceReason.get(runId) ?? "stale");
+      const failing = this.failingReceipts.get(kind);
+      if (failing !== undefined) return send(res, failing, { error: "fake: receipt failure" });
       const rows = this.inputsByRun.get(runId) ?? [];
       const acked = this.ackedByRun.get(runId) ?? new Set<number>();
       const applied = this.appliedByRun.get(runId) ?? new Set<number>();
       if (!Array.isArray(ids) || ids.length === 0 || ids.some((id) => !rows.some((row) => row.id === id)))
         return send(res, 400, { error: "invalid input ids" });
       if (kind === "ack" && !active && ids.some((id) => !acked.has(id)))
-        return send(res, 409, { error: "inactive claim" });
+        return send(res, 409, { error: "inactive claim", reason });
       // Like the server: a retried applied for rows already applied succeeds even after the
       // claim was fenced; an unapplied row needs the active claim.
       if (kind === "applied" && ids.some((id) => !acked.has(id) || (!active && !applied.has(id))))
-        return send(res, 409, { error: "inactive or unacked" });
+        return send(res, 409, { error: "inactive or unacked", reason: reason ?? "" });
       if (kind === "ack") {
         for (const id of ids) acked.add(id);
         this.ackedByRun.set(runId, acked);
@@ -674,7 +697,7 @@ export class FakeApi {
         res.destroy();
         return;
       }
-      return send(res, 200, { inputs: rows.filter((row) => ids.includes(row.id)).sort((a, b) => a.id - b.id), active });
+      return send(res, 200, { inputs: rows.filter((row) => ids.includes(row.id)).sort((a, b) => a.id - b.id), active, reason });
     }
 
     const runMatch =

@@ -564,6 +564,10 @@ describe("getInputs return shape (PRD #1247 M5)", () => {
 });
 
 describe("input receipts", () => {
+  beforeEach(() => {
+    api.strictReceiptGenerations = true;
+  });
+
   it("returns inactive on an old claim's ACK retry and replays to a new claim", async () => {
     const client = newClient();
     api.setInputClaimGeneration("switch-run", 7);
@@ -572,6 +576,7 @@ describe("input receipts", () => {
     api.setInputClaimGeneration("switch-run", 8);
     const old = await client.ackInputs("switch-run", [7], 7);
     assert.strictEqual(old.active, false);
+    assert.strictEqual(old.reason, "stale");
     assert.deepStrictEqual((await client.getInputs("switch-run")).inputs.map((r) => r.id), [7]);
     const next = await client.ackInputs("switch-run", [7], 8);
     assert.strictEqual(next.active, true);
@@ -616,6 +621,7 @@ describe("getConsumedFollowUps (issue #1660)", () => {
     assert.deepStrictEqual(await client.getConsumedFollowUps("run-fu"), [], "nothing consumed yet");
     await client.getInputs("run-fu");
     assert.deepStrictEqual(await client.getConsumedFollowUps("run-fu"), [], "GET is read only");
+    api.setInputClaimGeneration("run-fu", 0);
     await client.ackInputs("run-fu", [3, 4, 5], 0);
     assert.deepStrictEqual(await client.getConsumedFollowUps("run-fu"), [], "an ACK alone is not applied");
     await client.applyInputs("run-fu", [3, 4, 5], 0);

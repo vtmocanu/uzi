@@ -61,6 +61,14 @@ import {
 } from "./protocol.js";
 
 /** Error carrying the server's HTTP status + (truncated) body for retry logic. */
+/** Issue #1673: an /inputs/ack or /inputs/applied reply. `reason` says why an inactive claim is
+ *  inactive: switch_pending (keep polling), released or stale (end the old flight). */
+export interface InputReceipt {
+  inputs: UserInput[];
+  active: boolean;
+  reason?: string;
+}
+
 export class RequestError extends Error {
   constructor(
     readonly method: string,
@@ -882,14 +890,14 @@ export class WorkerClient {
     return { inputs: res.inputs ?? [], credentialSwitch: res.credential_switch };
   }
 
-  async ackInputs(runId: string, ids: number[], claimGeneration: number): Promise<{ inputs: UserInput[]; active: boolean }> {
+  async ackInputs(runId: string, ids: number[], claimGeneration: number): Promise<InputReceipt> {
     return (await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs/ack`,
-      { ids, claim_generation: claimGeneration })) as { inputs: UserInput[]; active: boolean };
+      { ids, claim_generation: claimGeneration })) as InputReceipt;
   }
 
-  async applyInputs(runId: string, ids: number[], claimGeneration: number): Promise<{ inputs: UserInput[]; active: boolean }> {
+  async applyInputs(runId: string, ids: number[], claimGeneration: number): Promise<InputReceipt> {
     return (await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs/applied`,
-      { ids, claim_generation: claimGeneration })) as { inputs: UserInput[]; active: boolean };
+      { ids, claim_generation: claimGeneration })) as InputReceipt;
   }
 
   /** Issue #1660: the run's ALREADY-CONSUMED follow_up inputs, oldest first (GET

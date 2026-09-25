@@ -981,7 +981,7 @@ describe("ChatSteering", () => {
       const client = {
         getInputs: async () => { gets++; return { inputs: [row] }; },
         ackInputs: async () => ({ inputs: [row], active: staleAt !== "ack" }),
-        applyInputs: async () => { applies++; throw new RequestError("POST", "/inputs/applied", 409, "stale"); },
+        applyInputs: async () => { applies++; throw new RequestError("POST", "/inputs/applied", 409, JSON.stringify({ error: "fenced", reason: "stale" })); },
       } as unknown as WorkerClient;
       const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController());
       ch.start();
@@ -1269,10 +1269,9 @@ describe("input receipts", () => {
     }
   });
 
-  it("routes nothing from an inactive ACK, keeps polling and does not cancel the flight", async () => {
-    // An inactive ACK means the claim is switching, released or superseded. The rows belong to
-    // the next claim; the flight is ended by the switch signal or the claim fence, never by a
-    // local cancel, which would report the run cancelled while a credential switch is pending.
+  it("routes nothing from a switch_pending ACK, keeps polling and does not cancel the flight", async () => {
+    // A pending credential switch: the rows belong to the next claim, and the switch signal on a
+    // later GET releases this one. A local cancel would report the run cancelled mid-switch.
     const row: UserInput = { id: 7, kind: "cancel", body: null };
     let gets = 0;
     let applied = 0;
@@ -1280,7 +1279,7 @@ describe("input receipts", () => {
     const cancel = new AbortController();
     const client = {
       getInputs: async () => { gets++; return { inputs: gets === 1 ? [row] : [] }; },
-      ackInputs: async () => { acked++; return { inputs: [row], active: false }; },
+      ackInputs: async () => { acked++; return { inputs: [row], active: false, reason: "switch_pending" }; },
       applyInputs: async () => { applied++; return { inputs: [row], active: true }; },
     } as unknown as WorkerClient;
     const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
@@ -1340,7 +1339,8 @@ describe("input receipts", () => {
       ackInputs: async () => ({ inputs: [row], active: true }),
       applyInputs: async () => {
         attempts++;
-        if (attempts === 1) throw new RequestError("POST", "/inputs/applied", 409, "stale claim");
+        // A row-state conflict on the active claim (no fence reason): drop the batch, keep going.
+        if (attempts === 1) throw new RequestError("POST", "/inputs/applied", 409, JSON.stringify({ error: "conflict", reason: "" }));
         return { inputs: [row], active: true };
       },
     } as unknown as WorkerClient;
@@ -1353,6 +1353,89 @@ describe("input receipts", () => {
       assert.strictEqual(interrupts, 1, "the replayed row was applied, not rerouted");
     } finally {
       await ch.stop();
+    }
+  });
+
+  it("ends the flight on a released or stale claim, from a 200 or a 409 receipt", async () => {
+    for (const reason of ["released", "stale"]) {
+      for (const via of ["200", "409"]) {
+        const row: UserInput = { id: 7, kind: "approve_plan", body: null };
+        let gets = 0;
+        const cancel = new AbortController();
+        const client = {
+          getInputs: async () => { gets++; return { inputs: [row] }; },
+          ackInputs: async () => {
+            if (via === "409") throw new RequestError("POST", "/inputs/ack", 409, JSON.stringify({ error: "fenced", reason }));
+            return { inputs: [row], active: false, reason };
+          },
+          applyInputs: async () => { throw Error("a fenced batch must not apply"); },
+        } as unknown as WorkerClient;
+        const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
+        const gate = ch.awaitVerdict();
+        ch.start();
+        try {
+          await assert.rejects(gate, (err: Error) => err.name === "ClaimFencedSignal", `${reason} via ${via}`);
+          assert.strictEqual((cancel.signal.reason as Error).name, "ClaimFencedSignal");
+          assert.strictEqual(ch.isCancelled(), false, "the fenced batch's inputs were not routed");
+          await assert.rejects(ch.awaitFollowUp(100_000), (err: Error) => err.name === "ClaimFencedSignal", "a later park fails at once");
+          const settled = gets;
+          await tick(20);
+          assert.strictEqual(gets, settled, "the old flight stopped polling");
+        } finally {
+          await ch.stop();
+        }
+      }
+    }
+  });
+
+  it("keeps a switch_pending flight parked and delivers the batch once the claim is active again", async () => {
+    const row: UserInput = { id: 7, kind: "approve_plan", body: null };
+    let acks = 0;
+    const cancel = new AbortController();
+    const client = {
+      getInputs: async () => ({ inputs: [row] }),
+      ackInputs: async () => {
+        acks++;
+        // The first two ACKs race a pending credential switch, which then fails: the claim is active again.
+        if (acks <= 2) throw new RequestError("POST", "/inputs/ack", 409, JSON.stringify({ error: "fenced", reason: "switch_pending" }));
+        return { inputs: [row], active: true };
+      },
+      applyInputs: async () => ({ inputs: [row], active: true }),
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
+    ch.start();
+    try {
+      assert.deepStrictEqual(await ch.awaitVerdict(), { kind: "approve", selection: { status: "absent" } });
+      assert.ok(acks >= 3);
+      assert.strictEqual(cancel.signal.aborted, false);
+    } finally {
+      await ch.stop();
+    }
+  });
+
+  it("fails a waiting state report and later parks when APPLIED keeps failing on the active claim", async () => {
+    for (const kind of ["approve_plan", "follow_up"] as const) {
+      const row: UserInput = { id: 7, kind, body: kind === "follow_up" ? "seven" : null };
+      let applies = 0;
+      const client = {
+        getInputs: async () => ({ inputs: [row] }),
+        ackInputs: async () => ({ inputs: [row], active: true }),
+        applyInputs: async () => { applies++; throw new RequestError("POST", "/inputs/applied", 503, "unavailable"); },
+      } as unknown as WorkerClient;
+      const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+      ch.start();
+      try {
+        // The routed input reaches the executor, which then reports the resume.
+        if (kind === "approve_plan") assert.strictEqual((await ch.awaitVerdict()).kind, "approve");
+        else assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "seven" });
+        await assert.rejects(ch.awaitReceiptSettlement(), (err: Error) => err.name === "InputReceiptError",
+          "the guarded report never goes out as if the input were applied");
+        assert.strictEqual(applies, 30, "bounded on the active claim");
+        await assert.rejects(ch.awaitReceiptSettlement(), (err: Error) => err.name === "InputReceiptError");
+        await assert.rejects(ch.awaitAnswer("q1"), (err: Error) => err.name === "InputReceiptError");
+      } finally {
+        await ch.stop();
+      }
     }
   });
 

@@ -17,6 +17,8 @@ const channels: SteeringChannel[] = [];
 
 beforeEach(async () => {
   api = new FakeApi(TOKEN);
+  // Every receipt test names its claim generation; an unset one fails loudly.
+  api.strictReceiptGenerations = true;
   baseUrl = await api.listen();
 });
 
@@ -141,7 +143,7 @@ describe("recoverable /inputs drain (issue #1673)", () => {
     assert.deepStrictEqual(await unapplied(), []);
   });
 
-  it("leaves an ACKed batch to the next claim when the ACK reply is lost across a reclaim", async () => {
+  it("ends the old flight and leaves an ACKed batch to the next claim when the ACK reply is lost across a reclaim", async () => {
     api.setInputClaimGeneration(RUN, 1);
     api.setInputs(RUN, [{ id: 7, kind: "cancel", body: null }]);
     // Hold the old flight's ACK reply until the claim has moved to generation 2.
@@ -160,8 +162,9 @@ describe("recoverable /inputs drain (issue #1673)", () => {
     api.setInputClaimGeneration(RUN, 2);
     await until(() => ackReplies.length >= 1);
     assert.deepStrictEqual(ackReplies, [false], "the retried ACK reports the old claim inactive");
-    await new Promise((r) => setTimeout(r, 20));
-    assert.strictEqual(oldCancel.signal.aborted, false, "the fenced flight routed nothing");
+    await until(() => oldCancel.signal.aborted);
+    assert.strictEqual((oldCancel.signal.reason as Error).name, "ClaimFencedSignal", "the superseded flight ends");
+    assert.strictEqual(old.isCancelled(), false, "the fenced flight routed nothing");
     assert.ok(!api.inputReceiptCalls.some((call) => call.kind === "applied" && call.generation === 1));
     await old.stop();
 
