@@ -130,6 +130,13 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    findings; `none` requires no reviewed-head signal (the local-review/Renovate lane) but
    STILL counts live findings from both bots.
 
+   **Greptile's clean pass posts no review and no comment:** only its `Greptile Review`
+   check-run plus the PR-body block's "Last reviewed commit". A push racing the trigger puts
+   the run on the OLDER commit. The scripts count the head reviewed when the body (or a head
+   review object) names it AND a completed run finished after the head's committer date;
+   the poll log names that evidence (`greptile=completed(body→<head> via run on <sha>)`).
+   Never read the body alone as a verdict: it is user-editable.
+
    **Ask CodeRabbit to ignore this PR:** put the exact text `@coderabbitai ignore` in the
    PR **description**, not a comment (https://docs.coderabbit.ai/guides/commands,
    "Disable automatic code reviews"). Preserve the existing description; the command

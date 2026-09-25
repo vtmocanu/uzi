@@ -29,6 +29,33 @@ review() { page "$(run 10 completed '"success"' "Greptile has reviewed the Pull 
 nothing() { echo '{"check_runs":[{"id":5,"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","output":{"summary":""}}]}'; }
 [ "${1:-}" = api ] || { echo "unexpected gh call: $*" >&2; exit 1; }
 [ "$MODE" = no_api ] && { echo "the helper called the API when it must not: $*" >&2; exit 1; }
+# pair_* modes exercise greptile_paired_verdict on PR 50. The head was committed 10:10; a run
+# finishing at or after that, on any PR commit, may pair with a marker naming the head.
+done_run() { printf '{"id":%s,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","completed_at":"%s","output":{"summary":"90 files reviewed, %s comments added."}}' "$1" "$2" "$3"; }
+case "$MODE" in pair_*)
+  case "$*" in
+    *'/pulls/50')
+      case "$MODE" in
+        pair_body_fail|pair_review) exit 1 ;;
+        *) jq -n --arg s "$HEAD_SHA" '{body:("<!-- greptile_comment -->\n<sub>Last reviewed commit: [x](https://github.com/o/r/commit/" + $s + ")</sub>\n<!-- /greptile_comment -->")}' ;;
+      esac ;;
+    *'/pulls/50/commits'*)
+      case "$MODE" in
+        pair_moved) printf '[{"sha":"%s","commit":{"committer":{"date":"2026-09-25T10:00:00Z"}}},{"sha":"%s","commit":{"committer":{"date":"2026-09-25T10:05:00Z"}}}]\n' "$OLD_SHA" "$PREV_SHA" ;;
+        pair_nodate) printf '[{"sha":"%s"},{"sha":"%s"}]\n' "$PREV_SHA" "$HEAD_SHA" ;;
+        *) printf '[{"sha":"%s","commit":{"committer":{"date":"2026-09-25T10:00:00Z"}}},{"sha":"%s","commit":{"committer":{"date":"2026-09-25T10:05:00Z"}}},{"sha":"%s","commit":{"committer":{"date":"2026-09-25T10:10:00Z"}}}]\n' "$OLD_SHA" "$PREV_SHA" "$HEAD_SHA" ;;
+      esac ;;
+    *"/commits/$OLD_SHA/check-runs"*) page "$(done_run 1 2026-09-25T10:20:00Z 0)" ;;
+    *"/commits/$PREV_SHA/check-runs"*)
+      # The newest qualifying run (id 2, 2 comments) wins over OLD's; id 3 finished before
+      # the head's committer date and cannot have seen the head.
+      if [ "$MODE" = pair_garbage ]; then echo '[]'
+      else page "$(done_run 2 2026-09-25T10:30:00Z 2),$(done_run 3 2026-09-25T10:09:00Z 5)"; fi ;;
+    *"/commits/$HEAD_SHA/check-runs"*) page "$(run 4 in_progress null '')" ;;
+    *) echo "unexpected gh api: $*" >&2; exit 1 ;;
+  esac
+  exit 0 ;;
+esac
 case "$*" in
   *'/pulls/44/commits'*) exit 1 ;;
   *'/pulls/43/commits'*)
@@ -235,6 +262,41 @@ scope 0 0 "bbbbbbbb/0" absent "" 2 "$(trigger "$now_iso" 'greptile already looke
 # Unreadable issue comments fail closed and keep the raw count.
 scope 1 2 "" absent "" 2 'x'
 
+# ---- greptile_paired_verdict ----------------------------------------------------------
+# pair MODE RC SHA ADDED NOTE [HEAD_REVIEW_ID]
+pair() {
+  local rc=0
+  MODE="$1"; export MODE
+  greptile_paired_verdict test/repo 50 "$HEAD_SHA" "${6:-}" || rc=$?
+  [ "$rc" -eq "$2" ] || fail "pair $1: rc=$rc, want $2"
+  [ "$GRP_SHA" = "$3" ] || fail "pair $1: GRP_SHA='$GRP_SHA', want '$3'"
+  [ "$GRP_ADDED" = "$4" ] || fail "pair $1: GRP_ADDED='$GRP_ADDED', want '$4'"
+  [ "$GRP_NOTE" = "$5" ] || fail "pair $1: GRP_NOTE='$GRP_NOTE', want '$5'"
+}
+# The body names the head: the newest qualifying run pairs, and its M is the verdict; a run
+# that finished before the head's committer date and the head's own in_progress run do not.
+pair pair_newest 0 "$PREV_SHA" 2 "body→cccccccc via run on bbbbbbbb"
+# A head review object is the marker first: the body is not even read.
+pair pair_review 0 "$PREV_SHA" 2 "review→cccccccc via run on bbbbbbbb" 77
+# Fail closed (rc 1): an unreadable body, a commit list that does not end at the head, an
+# unreadable check-run page. No head committer date is no evidence, never clean.
+pair pair_body_fail 1 "" "" ""
+pair pair_moved 1 "" "" ""
+pair pair_garbage 1 "" "" ""
+pair pair_nodate 0 "" "" ""
+
+# greptile_body_sha parses only inside the block, and only a full, unambiguous SHA.
+bs() { printf '%s' "$1" | greptile_body_sha; }
+blk() { jq -n --arg t "$1" '{body:("desc\n<!-- greptile_comment -->\n" + $t + "\n<!-- /greptile_comment -->")}'; }
+[ "$(bs "$(blk "Last reviewed commit: [x](https://g/o/r/commit/$HEAD_SHA)")")" = "$HEAD_SHA" ] || fail "body SHA not read"
+[ -z "$(bs "$(blk 'Last reviewed commit: [x](https://g/o/r/commit/cccccccc)')")" ] || fail "a short body SHA was accepted"
+[ -z "$(bs "$(blk "Last reviewed commit: [x](https://g/o/r/commit/${HEAD_SHA}ab)")")" ] || fail "an over-long body SHA was accepted"
+[ -z "$(bs "$(blk "Last reviewed commit: [x](https://g/o/r/commit/$HEAD_SHA) [y](https://g/o/r/commit/$PREV_SHA)")")" ] || fail "an ambiguous body SHA was accepted"
+[ -z "$(bs "$(blk "Reviewed [x](https://g/o/r/commit/$HEAD_SHA)")")" ] || fail "a SHA off the Last-reviewed line was accepted"
+[ -z "$(bs "{\"body\":\"Last reviewed commit: [x](https://g/o/r/commit/$HEAD_SHA)\"}")" ] || fail "a SHA outside any block was accepted"
+[ -z "$(bs '{"body":null}')" ] || fail "a null body produced a SHA"
+if bs '[]' >/dev/null; then fail "a non-object pull did not fail"; fi
+
 # ---- greptile_outside_diff -------------------------------------------------------------
 # Here-strings, not a pipe: the function sets GOD_* in the CALLER's shell.
 od() { greptile_outside_diff "$HEAD_SHA" <<<"$1"; }
@@ -247,4 +309,4 @@ od '[{"id":2,"user":{"login":"someone"},"body":"<!-- greptile_outside_diff -->\n
 [ "$GOD_TOTAL" = 0 ] || fail "a non-Greptile comment was counted"
 if od '{"not":"array"}'; then fail "unreadable issue comments did not fail closed"; fi
 
-echo "PASS greptile-verdict: earlier verdict scoped, newer evidence outranks it, unreadable fails closed"
+echo "PASS greptile-verdict: earlier verdict scoped, newer evidence outranks it, body-paired head verdict, unreadable fails closed"

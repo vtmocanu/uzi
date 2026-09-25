@@ -57,7 +57,10 @@
 # new branch-authored code exists for it to review (a logic-free merge commit; #819).
 # "Greptile reviewed this head" is its `Greptile Review` check-run on the head SHA at
 # status completed (its summary carries "N files reviewed, M comments added"); with 0
-# findings Greptile posts NO review object, so the check-run is the only per-head signal.
+# findings Greptile posts NO review object. When a push races the trigger the run lands on
+# an older commit instead, and the head's only marker is the PR-body "Last reviewed commit"
+# (or a head review object when comments were added), paired with that run
+# (lib/greptile-verdict.sh, greptile_paired_verdict).
 # The script errs toward timeout (exit 2) rather than a false "ready".
 set -euo pipefail
 
@@ -351,6 +354,23 @@ while [ "$i" -lt "$MAX" ]; do
     gr_state="unreadable"
     unknown=1
   fi
+  # No completed review run on the head: a push that raced `@greptileai review` leaves the run
+  # on an older commit while Greptile reviewed this head (PR #1698). A head review object or
+  # the PR-body "Last reviewed commit" naming this head, paired with a completed run that
+  # finished after the head's committer date, is a review of this head (lib/greptile-verdict.sh,
+  # greptile_paired_verdict). It also outranks a stale queued/in_progress duplicate on the head.
+  # A completed non-review run on the head (failure, no summary) keeps today's reading.
+  gr_via=""
+  case "$gr_state" in
+    absent|queued|in_progress)
+      gp_rc=0
+      greptile_paired_verdict "$REPO" "$PR" "$head" "$gr_review_id" || gp_rc=$?
+      if [ "$gp_rc" -ne 0 ]; then
+        unknown=1
+      elif [ -n "$GRP_SHA" ]; then
+        gr_state="completed"; gr_concl="success"; gr_summary="$GRP_SUMMARY"; gr_via="($GRP_NOTE)"
+      fi ;;
+  esac
   # Greptile's outside-diff findings live in one ISSUE comment, not in a review object
   # (lib/greptile-verdict.sh, greptile_outside_diff). They count toward its tally and stay
   # live until Greptile drops them from that comment.
@@ -488,7 +508,7 @@ while [ "$i" -lt "$MAX" ]; do
   [ "$equiv" -eq 1 ] && eqnote=" equiv=1"
   [ "$gr_reviewed" -eq 1 ] && grnote=" gr_scope=$gr_scoped_total+${god_head}od/${gr_added:-?}"
   [ -n "$gr_prior" ] && grnote=" gr_prior=$gr_prior"
-  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' cr_full_required=$cr_full_required greptile=$gr_state${gr_summary:+ ($gr_summary)}${grnote} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${unknown:+ unknown=$unknown}"
+  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' cr_full_required=$cr_full_required greptile=$gr_state$gr_via${gr_summary:+ ($gr_summary)}${grnote} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${unknown:+ unknown=$unknown}"
 
   # A failed lookup this iteration: defer, do not decide on masked values.
   if [ "$unknown" -ne 0 ]; then sleep "$INTERVAL"; continue; fi

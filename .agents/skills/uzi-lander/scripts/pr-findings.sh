@@ -38,12 +38,14 @@
 #     "not reviewed", the OPPOSITE of clean. The reason is read from CodeRabbit's commit
 #     STATUS on the head ("Review rate limited" / "Review skipped: <why>").
 #
-# 🔴 GREPTILE WITH ZERO FINDINGS POSTS NO REVIEW OBJECT AT ALL. Its only per-head signal is
-# the `Greptile Review` check-run (app greptile-apps) on the head SHA, whose output summary
+# 🔴 GREPTILE WITH ZERO FINDINGS POSTS NO REVIEW OBJECT AT ALL. Its per-head signal is the
+# `Greptile Review` check-run (app greptile-apps) on the head SHA, whose output summary
 # reads "N files reviewed, M comments added"; its findings (when M > 0) are inline comments
-# from greptile-apps[bot] with a P1/P2 badge. It may also rewrite the PR body with a
-# Confidence Score and "Last reviewed commit: <sha>", but not on every PR (measured 2 of 3,
-# 2026-09-17), so the check-run is what this script keys on.
+# from greptile-apps[bot] with a P1/P2 badge. When a push races the trigger, the run lands
+# on the OLDER commit while Greptile reviews the head, and the head's only marker is the
+# PR-body "Last reviewed commit: <sha>" block (or a head review object when M > 0). That
+# marker counts only paired with a completed run that finished after the head's committer
+# date (lib/greptile-verdict.sh, greptile_paired_verdict); the body alone is user-editable.
 #
 # Exit 0 = every PR reviewed on its head by CodeRabbit (tally or APPROVED) or, unless
 # --cr-only, by Greptile (check-run completed), findings shown or clean; 3 = at least one
@@ -159,16 +161,36 @@ for n in "$@"; do
       gr_line="check-runs on this head UNREADABLE (request failed or returned garbage) — NOT confirmed clean"
       unconfirmed="${unconfirmed} #${n}"
     fi
+    gr_via=""
     if [ -n "$gr_json" ]; then
       gr_status=$(printf '%s' "$gr_json" | jq -r '.status // ""')
       gr_concl=$(printf '%s' "$gr_json" | jq -r '.conclusion // ""')
       gr_sum=$(printf '%s' "$gr_json" | jq -r '.output.summary // ""' | grep -oE '[0-9]+ files reviewed, [0-9]+ comments added' || true)
+    fi
+    # No completed review run on the head: a push that raced `@greptileai review` leaves the
+    # run on an older commit while Greptile reviewed this head (PR #1698). A head review object
+    # or the PR-body "Last reviewed commit", paired with a completed run that finished after
+    # the head's committer date, is a review of this head (greptile_paired_verdict). It also
+    # outranks a stale queued/in_progress duplicate on the head. A completed non-review run on
+    # the head keeps today's reading.
+    case "$gr_status" in
+      absent|queued|in_progress)
+        gp_rc=0
+        greptile_paired_verdict "$repo" "$n" "$head" "$gr_review_id" || gp_rc=$?
+        if [ "$gp_rc" -ne 0 ]; then
+          echo "  🔴 Greptile PR-body / paired-run evidence UNREADABLE — this head's Greptile verdict is unknown; NOT confirmed clean"
+          unconfirmed="${unconfirmed} #${n}"
+        elif [ -n "$GRP_SHA" ]; then
+          gr_json='{}'; gr_status="completed"; gr_concl="success"; gr_sum="$GRP_SUMMARY"; gr_via=" (${GRP_NOTE})"
+        fi ;;
+    esac
+    if [ -n "$gr_json" ]; then
       # Reviewed = completed AND success AND the summary; anything else completed (failure,
       # cancelled, skipped, or no summary) is NOT a review and must not clear the gate.
       if [ "$gr_status" = "completed" ] && [ "$gr_concl" = "success" ] && [ -n "$gr_sum" ]; then
         gr_ok=1
         gr_added=$(printf '%s' "$gr_sum" | grep -oE '[0-9]+ comments added' | grep -oE '^[0-9]+' || true)
-        gr_line="completed on head — ${gr_sum}"
+        gr_line="completed on head${gr_via} — ${gr_sum}"
         # Outside-diff findings (one Greptile ISSUE comment) count toward the tally but carry
         # no review object; only the inline remainder needs a current-head review id.
         god_head=0
