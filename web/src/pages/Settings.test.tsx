@@ -212,15 +212,16 @@ describe("Settings — per-token 'Show in sidebar' toggle", () => {
 // ── Item 2 (issue #961): a stable `secrets` identity while `data` is null ──
 // Pre-fix `const secrets = data?.secrets ?? []` minted a fresh array identity on every
 // render WHILE `data` was null (during the load, and after a load failure `data` stays
-// null): `undefined ?? []` builds a new `[]` each render. AnthropicTokens' two fetching
-// effects are keyed on `[secrets]` (listWorkers, getMyRateLimits), so every re-render in
-// that window re-fired both requests and flickered the auto-fetch chips. The
+// null): `undefined ?? []` builds a new `[]` each render. AnthropicTokens' fetching effect
+// is keyed on `[secrets]` (getMyRateLimits; the bound-worker read moved to the Delete
+// click), so every re-render in that window re-fired the request and flickered the
+// auto-fetch chips. The
 // `useMemo(() => data?.secrets ?? [], [data])` fix memoizes the fallback on the (stable
 // null) `data`, so a re-render with `data` unchanged reuses the same `[]` and the effects
 // do not re-run. (Once `data` loads, `data?.secrets ?? []` already returns the stable
 // `data.secrets` — the churn is null-window-only, which is why this test keeps data null.)
 describe("Settings — stable secrets identity while data is null (item 2)", () => {
-  it("does not re-fire the token card's [secrets]-keyed fetches on a re-render while data is null", async () => {
+  it("does not re-fire the token card's [secrets]-keyed fetch on a re-render while data is null", async () => {
     // Fail the settings load so `data` stays null across re-renders (the churn window).
     mockApi.listSecrets.mockRejectedValue(new Error("load boom"));
 
@@ -229,12 +230,10 @@ describe("Settings — stable secrets identity while data is null (item 2)", () 
         <Settings />
       </MemoryRouter>,
     );
-    // Mount seeds the token card with secrets=[] and runs both effects once; the load then
-    // fails and leaves data null. Wait for both to settle, then reset the counters.
-    await waitFor(() => expect(mockApi.listWorkers).toHaveBeenCalled());
+    // Mount seeds the token card with secrets=[] and runs the effect once; the load then
+    // fails and leaves data null. Wait for it to settle, then reset the counter.
     await waitFor(() => expect(mockApi.getMyRateLimits).toHaveBeenCalled());
     await screen.findByText("Failed to load settings");
-    mockApi.listWorkers.mockClear();
     mockApi.getMyRateLimits.mockClear();
 
     // Re-render Settings twice with `data` still null (no refetch: the hook's deps are []).
@@ -253,10 +252,9 @@ describe("Settings — stable secrets identity while data is null (item 2)", () 
       await Promise.resolve();
     });
 
-    // Fixed: memoized `[]` is stable across the re-renders, so neither effect re-runs.
+    // Fixed: memoized `[]` is stable across the re-renders, so the effect does not re-run.
     // Mutation-checked: reverting Settings.tsx to `data?.secrets ?? []` mints a fresh `[]`
-    // each re-render and both fetches fire again here (observed red).
-    expect(mockApi.listWorkers).not.toHaveBeenCalled();
+    // each re-render and the fetch fires again here (observed red).
     expect(mockApi.getMyRateLimits).not.toHaveBeenCalled();
   });
 });

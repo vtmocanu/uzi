@@ -6,8 +6,8 @@
 // after saving — rotation is a re-paste, which is why "Replace value" is a form
 // and not an edit-in-place field.
 
-import { useEffect, useState, type FormEvent } from "react";
-import { api, type AutoStatus, type SecretMeta, type Worker } from "../lib/api";
+import { useEffect, useRef, useState, type FormEvent } from "react";
+import { api, type AutoStatus, type SecretMeta } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { isVaultLocked } from "../lib/api";
 import { autoChipFor } from "../lib/rateLimits";
@@ -95,7 +95,6 @@ function TokenRow({
   secret,
   busy,
   soleToken,
-  boundWorkers,
   judgeBound,
   autoStatus,
   autoFetchState,
@@ -108,7 +107,6 @@ function TokenRow({
   secret: SecretMeta;
   busy: boolean;
   soleToken: boolean;
-  boundWorkers: string[];
   judgeBound: boolean;
   // The SERVER's live eligibility answer for this token (PRD #111 M2), or
   // undefined while the meters have not loaded (or failed to). Never re-derived
@@ -132,6 +130,15 @@ function TokenRow({
   const [renaming, setRenaming] = useState(false);
   const [label, setLabel] = useState(secret.label);
   const [rowBusy, setRowBusy] = useState(false);
+  // The Delete click awaits a worker read before confirming; a row that unmounted
+  // meanwhile (the user left the page) must not confirm, delete or report.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const disabled = busy || rowBusy;
   const blockedByD6 = secret.is_default && !soleToken;
   const d6HintId = `d6-${secret.id}`;
@@ -243,11 +250,36 @@ function TokenRow({
               aria-describedby={blockedByD6 ? d6HintId : undefined}
               title={blockedByD6 ? D6_HINT : undefined}
               className={blockedByD6 ? "cursor-not-allowed opacity-50" : undefined}
-              onClick={() => {
+              onClick={async () => {
                 if (blockedByD6) return;
                 // Deleting a bound token silently returns its workers to the
                 // default (D5), so the confirmation must NAME them rather than let a
-                // user discover the move from a meter.
+                // user discover the move from a meter. The bindings are read fresh
+                // at the click, never from a mount-time snapshot: a snapshot still
+                // loading (or failed) would say "Nothing is bound" about a token
+                // that is bound. The last token names nobody, so it skips the read.
+                let boundWorkers: string[] = [];
+                if (!secret.is_default) {
+                  onError("");
+                  setRowBusy(true);
+                  try {
+                    const { workers } = await api.listWorkers();
+                    boundWorkers = workers
+                      .filter((w) => w.anthropic_secret_id === secret.id)
+                      .map((w) => w.name);
+                  } catch (err) {
+                    if (!mounted.current) return;
+                    // Without the names the D5 warning cannot be honest, so refuse
+                    // rather than delete on a guess.
+                    onError(
+                      errText(err, "Could not check which workers use this token, so it was not deleted"),
+                    );
+                    return;
+                  } finally {
+                    if (mounted.current) setRowBusy(false);
+                  }
+                  if (!mounted.current) return;
+                }
                 if (
                   !window.confirm(
                     deleteWarning(
@@ -413,28 +445,6 @@ export function AnthropicTokens({
   const [addBusy, setAddBusy] = useState(false);
   const [rotateFor, setRotateFor] = useState("");
   const [rotateValue, setRotateValue] = useState("");
-  // The card fetches workers itself, because naming the affected ones is the whole
-  // of D5 and no caller has that data. Re-fetched whenever `secrets` changes, which
-  // is what keeps it honest after a delete unbinds rows server-side. Failure is
-  // silent by design: a delete confirmation that cannot enumerate is still a
-  // correct (if less helpful) warning, and an error banner over an unrelated fetch
-  // would be worse than the missing names.
-  const [workers, setWorkers] = useState<Worker[]>([]);
-  useEffect(() => {
-    let cancelled = false;
-    void api
-      .listWorkers()
-      .then(({ workers }) => {
-        if (!cancelled) setWorkers(workers);
-      })
-      .catch(() => {
-        if (!cancelled) setWorkers([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [secrets]);
-
   // Per-token live auto-selection eligibility (PRD #111 M2), fetched here for the
   // same reason the workers are: the consequence of the toggle belongs beside the
   // toggle, and no caller has this data. Re-fetched whenever `secrets` changes, so
@@ -550,9 +560,6 @@ export function AnthropicTokens({
               secret={s}
               busy={anyBusy}
               soleToken={secrets.length === 1}
-              boundWorkers={workers
-                .filter((w) => w.anthropic_secret_id === s.id)
-                .map((w) => w.name)}
               judgeBound={judgeSecretId === s.id}
               autoStatus={autoStatuses[s.id]}
               autoFetchState={autoFetchState}
