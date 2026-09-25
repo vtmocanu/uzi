@@ -33,7 +33,7 @@ if [ "${1:-}" = api ]; then
       esac ;;
     *'/issues/42/comments'*)
       case "$MODE" in
-        prior_requested) printf '[{"user":{"login":"lander","type":"User"},"created_at":"%s","body":"@greptileai review"}]\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" ;;
+        prior_requested|prior_noanchor_requested) printf '[{"user":{"login":"lander","type":"User"},"created_at":"%s","body":"@greptileai review"}]\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" ;;
         issue_unreadable|od_issue_unreadable) exit 1 ;;
         od_only|od_mixed) jq -n --arg h deadbeefdeadbeefdeadbeefdeadbeefdeadbeef '[{id:900,user:{login:"greptile-apps[bot]"},body:("<!-- greptile_outside_diff -->\n\n- <img alt=\"P1\">&nbsp;**Outside bug** `out.go:5` <a href=\"https://x/blob/" + $h + "/out.go#L5\">x</a>")}]' ;;
         cr_ca_clean|cr_ca_findings) echo '[{"user":{"login":"coderabbitai[bot]"},"body":"<!-- walkthrough_start -->\n<!-- recent_review_start -->\nNo actionable comments were generated in the recent review. 🎉\n<!-- recent_review_end -->\n<!-- change_assessment_commit:\"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\" -->"}]' ;;
@@ -44,7 +44,7 @@ if [ "${1:-}" = api ]; then
       echo '[{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"sha":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}]' ;;
     *'/commits/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/check-runs'*)
       case "$MODE" in
-        prior_clean|prior_clean_noanchor|head_unreadable|head_failed|prior_requested|issue_unreadable) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
+        prior_clean|prior_clean_noanchor|prior_clean_capped|prior_noanchor_requested|head_unreadable|head_failed|prior_requested|issue_unreadable) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
         prior_pending) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"in_progress","conclusion":null,"output":{"summary":""}}]}' ;;
         *) echo '{"check_runs":[{"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","output":{"summary":""}}]}' ;;
       esac ;;
@@ -63,14 +63,16 @@ if [ "${1:-}" = api ]; then
       esac ;;
     *'/pulls/42/comments'*)
       case "$MODE" in
-        race|cr_ca_clean|cr_ca_findings|prior_clean_noanchor) echo '[]' ;;
+        race|cr_ca_clean|cr_ca_findings|prior_clean_noanchor|prior_clean_capped|prior_noanchor_requested) echo '[]' ;;
         od_mixed) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"in.go","line":3,"body":"<img alt=\"P2\"> inline finding","pull_request_review_id":7},{"user":{"login":"greptile-apps[bot]"},"path":"old.go","line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
         in_progress) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"partial.go","line":9,"body":"<img alt=\"P1\"> partial finding","pull_request_review_id":101}]' ;;
         head_two_runs) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"retrigger.go","line":8,"body":"<img alt=\"P1\"> found by the re-trigger","pull_request_review_id":77}]' ;;
         cr_resolved) echo '[{"user":{"login":"coderabbitai[bot]"},"path":"resolved.go","line":8,"body":"🟡 **resolved finding**","pull_request_review_id":9}]' ;;
         *) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"old.go","line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
       esac ;;
-    *'/compare/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb...deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'*) echo 'docs/a.md, api/internal/uzidocs/embed/a.md' ;;
+    *'/compare/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb...deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'*)
+      if [ "$MODE" = prior_clean_capped ]; then jq -nc '{files:[range(300)|{filename:"docs/f\(.).md"}]}'
+      else echo '{"files":[{"filename":"docs/a.md"},{"filename":"api/internal/uzidocs/embed/a.md"}]}'; fi ;;
     *) echo "unexpected gh api: $*" >&2; exit 1 ;;
   esac
   exit 0
@@ -158,6 +160,29 @@ set -e
 grep -q 'NOT REVIEWED on head by any bot' "$WORK/prior-noanchor.out" || fail "unreviewed head was not reported: $(cat "$WORK/prior-noanchor.out")"
 grep -q 'Greptile: no verdict on this head; last verdict on bbbbbbbb — 0 comments added. Changed since: docs/a.md, api/internal/uzidocs/embed/a.md' "$WORK/prior-noanchor.out" \
   || fail "earlier clean verdict and delta were not named: $(cat "$WORK/prior-noanchor.out")"
+
+# GitHub's compare lists at most 300 files: a full page must read INCOMPLETE, never as a
+# docs-only list that could hide code past file 300.
+MODE="prior_clean_capped"; export MODE
+set +e
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/prior-capped.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "capped delta cleared the gate, rc=$rc: $(cat "$WORK/prior-capped.out")"
+grep -q 'Changed since: INCOMPLETE (GitHub lists at most 300 files' "$WORK/prior-capped.out" \
+  || fail "a 300-file compare was printed as exhaustive: $(cat "$WORK/prior-capped.out")"
+if grep -q 'docs/f0.md' "$WORK/prior-capped.out"; then fail "capped file list was printed: $(cat "$WORK/prior-capped.out")"; fi
+
+# A review requested after the earlier verdict may not have a check-run yet: say it may be pending.
+MODE="prior_noanchor_requested"; export MODE
+set +e
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/prior-noanchor-req.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "requested-after-verdict head cleared the gate, rc=$rc: $(cat "$WORK/prior-noanchor-req.out")"
+grep -q 'a review was requested after that verdict' "$WORK/prior-noanchor-req.out" \
+  || fail "pending Greptile request was not noted: $(cat "$WORK/prior-noanchor-req.out")"
+if grep -q 'a review was requested after that verdict' "$WORK/prior-noanchor.out"; then fail "pending note shown with no request: $(cat "$WORK/prior-noanchor.out")"; fi
 
 # No earlier verdict: nothing superseded the comment, so it is still listed.
 MODE="prior_none"; export MODE

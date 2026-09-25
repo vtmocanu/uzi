@@ -279,9 +279,24 @@ for n in "$@"; do
       # and the files changed since, so the lander can judge the delta (e.g. docs-only).
       # Informational only: the gate above already recorded this head as unreviewed.
       if greptile_prior_verdict "$repo" "$n" "$head" && [ -n "$GRV_SHA" ]; then
-        delta=$(gh api "repos/${repo}/compare/${GRV_SHA}...${head}" --jq '[.files[].filename]|join(", ")' 2>/dev/null) \
-          || delta="(unreadable)"
-        echo "  Greptile: no verdict on this head; last verdict on ${GRV_SHA:0:8} — ${GRV_ADDED} comments added. Changed since: ${delta:-(none)}"
+        # GitHub's compare lists at most 300 files, so a full page is NOT exhaustive: name it
+        # incomplete rather than print a list that could hide code behind 300 docs files.
+        delta="(unreadable)"
+        if cmp_json=$(gh api "repos/${repo}/compare/${GRV_SHA}...${head}" 2>/dev/null); then
+          delta=$(printf '%s' "$cmp_json" | jq -r \
+            'if (.files|type)!="array" then error("no files array")
+             elif (.files|length) >= 300 then "INCOMPLETE (GitHub lists at most 300 files; the delta is unknown, inspect it locally)"
+             elif (.files|length) == 0 then "(none)"
+             else [.files[].filename]|join(", ") end' 2>/dev/null) || delta="(unreadable)"
+        fi
+        echo "  Greptile: no verdict on this head; last verdict on ${GRV_SHA:0:8} — ${GRV_ADDED} comments added. Changed since: ${delta}"
+        # A trigger posted after that verdict may not have a check-run yet (~12 s lag).
+        requested=$(printf '%s' "$gr_issue" | jq --arg since "$GRV_STARTED" \
+          '[.[]|select((.user.type // "") != "Bot")|select((.body // "")|test("@greptile(ai)?\\s+review"; "i"))
+               |select($since == "" or (.created_at|fromdateiso8601) > ($since|fromdateiso8601))]|length' 2>/dev/null || echo "?")
+        if [ "$requested" != "0" ]; then
+          echo "  Greptile: a review was requested after that verdict (or the request list is unreadable); it may be pending"
+        fi
       fi
     fi
   fi
