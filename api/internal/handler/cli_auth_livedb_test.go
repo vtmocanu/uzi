@@ -363,7 +363,7 @@ func TestCLIUsageBearerSelfScopeLiveDB(t *testing.T) {
 		t.Errorf("uzc_ /api/chats = %d, want 401; body: %s", rec.Code, rec.Body.String())
 	}
 	req := httptest.NewRequest(http.MethodGet, "/api/usage", nil)
-	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: adminJWT})
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: adminJWT}) //nolint:gosec // G124: test-only client cookie on an httptest request; response-side security attributes are irrelevant here.
 	req.Header.Set("Authorization", "Bearer malformed")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
