@@ -492,7 +492,11 @@ type Store interface {
 	GetTaskReviewForTarget(ctx context.Context, targetRunID uuid.UUID) (store.TaskReview, error)
 	ListTaskReviewFindings(ctx context.Context, reviewID uuid.UUID) ([]store.TaskReviewFinding, error)
 	CountActiveRunsWithBranch(ctx context.Context, arg store.CountActiveRunsWithBranchParams) (int64, error)
-	CountActiveCIFixForRef(ctx context.Context, arg store.CountActiveCIFixForRefParams) (int64, error)
+	CountActiveBranchRunsForRef(ctx context.Context, arg store.CountActiveBranchRunsForRefParams) (int64, error)
+	HasActiveIssueRunForIID(ctx context.Context, arg store.HasActiveIssueRunForIIDParams) (bool, error)
+	// LockRunBranch takes the per-(repo, branch) advisory lock that serializes issue /
+	// mr_rework / ci_fix creation on one agent branch (issue #1626, store.RunBranchLockClass).
+	LockRunBranch(ctx context.Context, repoID uuid.UUID, branch string) error
 	GetRunByIDForUser(ctx context.Context, arg store.GetRunByIDForUserParams) (store.Run, error)
 	GetRunByID(ctx context.Context, id uuid.UUID) (store.Run, error)
 	// GetRunMilestoneFreezeSnapshot reads the live milestone freeze state at the approve
@@ -5380,11 +5384,14 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		!isAssignedToBot(issue.AssigneeIds, row.BotForgeUserID) {
 		return store.Run{}, ErrNotPRDIssue
 	}
-	// Cross-kind same-branch exclusion (PRD #6): this issue run will use the
-	// worktree agent/issue-<iid>; refuse if an active ci_fix run is already fixing
-	// that ref. The reverse check lives in CreateCIFixRun; the two partial unique
-	// indexes are disjoint and cannot express this cross-kind rule.
-	fixing, err := s.q.CountActiveCIFixForRef(ctx, store.CountActiveCIFixForRefParams{
+	// Cross-kind same-branch exclusion (PRD #6, widened by issue #1626): this issue run will
+	// use the worktree agent/issue-<iid>; refuse if an active ci_fix OR mr_rework run is
+	// already working that ref. This pre-transaction read is only a cheap fast-fail, so a
+	// doomed create neither pays the forge comment fetch below nor reports OpenMRExistsError
+	// first; the authoritative re-check runs inside the create transaction, after
+	// LockRunBranch (see the insert closure). The reverse checks live in createCIFixRun and
+	// createMRReworkRun.
+	fixing, err := s.q.CountActiveBranchRunsForRef(ctx, store.CountActiveBranchRunsForRefParams{
 		RepoID:      repoID,
 		PipelineRef: pgtype.Text{String: agentIssueBranch(issueIID), Valid: true},
 	})
@@ -5466,7 +5473,32 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// plan_md); a SeededPlan carries no milestone list either. Nothing would ever freeze its
 	// contract, so an interlocked seeded run would hold at finalize on every completion.
 	interlockOn := seed == nil && s.completionInterlockOn(ctx)
+	// Read on the pool BEFORE the create transaction (issue #1626): the closure below holds the
+	// run-branch lock while a same-branch waiter holds a pool connection of its own, so these
+	// two plain reads are kept out of the lock-holding window rather than acquiring a second
+	// connection inside it. (An explicit credential override is still validated in-closure.)
+	originColumn := s.originColumn(ctx, repoID, issue)
+	resolvedWaitOnLimit := s.resolveWaitOnLimit(ctx, userID, waitOnLimit)
 	run, err := s.createRunResolved(ctx, userID, explicit, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		// Issue #1626: the authoritative cross-kind branch check, FIRST in the closure. The
+		// run-branch lock serializes this create against an mr_rework / ci_fix create on the
+		// same agent/issue-<iid> (they take the same key), and the count below is a new READ
+		// COMMITTED statement, so a waiter sees the holder's committed row. See
+		// store.RunBranchLockClass for why no index can express this.
+		branch := agentIssueBranch(issueIID)
+		if err := q.LockRunBranch(ctx, repoID, branch); err != nil {
+			return store.Run{}, err
+		}
+		busy, err := q.CountActiveBranchRunsForRef(ctx, store.CountActiveBranchRunsForRefParams{
+			RepoID:      repoID,
+			PipelineRef: pgtype.Text{String: branch, Valid: true},
+		})
+		if err != nil {
+			return store.Run{}, err
+		}
+		if busy > 0 {
+			return store.Run{}, ErrBranchInUse
+		}
 		// PRD #1429 M2 (D5), #1247 override resolved INSIDE the create transaction against the
 		// D11-resolved harness (not a pre-tx guess): a rawOverride (manual/chat-start request) is
 		// validated here — an effective-Codex harness + Anthropic override fails
@@ -5496,13 +5528,13 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			IssueIid:         pgtype.Int8{Int64: issueIID, Valid: true},
 			IssueTitle:       issue.Title,
 			IssueDescription: description,
-			OriginColumn:     s.originColumn(ctx, repoID, issue),
+			OriginColumn:     originColumn,
 			AutoApprove:      autoApprove,
 			// PRD #35 Decision 7. Stamped at creation from the owner's default (or the
 			// caller's explicit choice), never read from users at park time: a run must
 			// keep the behaviour it was created with, so flipping the default later cannot
 			// retroactively change a run already in flight.
-			WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, waitOnLimit),
+			WaitOnLimit: resolvedWaitOnLimit,
 			// PRD #841 M1 Decision D1: mr_rework is LIVE-INHERIT, the deliberate opposite of
 			// wait_on_limit's snapshot. The pointer is stamped THROUGH with no resolver — nil
 			// ⇒ NULL ⇒ the run inherits the owner default live at read time (the candidate

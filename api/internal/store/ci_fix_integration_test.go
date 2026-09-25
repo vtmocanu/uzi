@@ -99,11 +99,19 @@ func TestCIFixRunsLiveDB(t *testing.T) {
 	if err != nil || n != 1 {
 		t.Fatalf("CountActiveRunsWithBranch(agent/issue-9) = %d, %v; want 1", n, err)
 	}
-	// CountActiveCIFixForRef sees the active ci_fix fixing that ref.
-	n, err = q.CountActiveCIFixForRef(ctx, store.CountActiveCIFixForRefParams{
+	// CountActiveBranchRunsForRef sees the active ci_fix fixing that ref.
+	n, err = q.CountActiveBranchRunsForRef(ctx, store.CountActiveBranchRunsForRefParams{
 		RepoID: repoID, PipelineRef: pgtype.Text{String: "agent/issue-9", Valid: true}})
 	if err != nil || n != 1 {
-		t.Fatalf("CountActiveCIFixForRef(agent/issue-9) = %d, %v; want 1", n, err)
+		t.Fatalf("CountActiveBranchRunsForRef(agent/issue-9) = %d, %v; want 1", n, err)
+	}
+	// HasActiveIssueRunForIID (issue #1626) sees the active issue run for 9 by issue_iid, and
+	// nothing for an issue with no run.
+	if busy, err := q.HasActiveIssueRunForIID(ctx, store.HasActiveIssueRunForIIDParams{RepoID: repoID, IssueIid: 9}); err != nil || !busy {
+		t.Fatalf("HasActiveIssueRunForIID(9) = %v, %v; want true", busy, err)
+	}
+	if busy, err := q.HasActiveIssueRunForIID(ctx, store.HasActiveIssueRunForIIDParams{RepoID: repoID, IssueIid: 10}); err != nil || busy {
+		t.Fatalf("HasActiveIssueRunForIID(10) = %v, %v; want false", busy, err)
 	}
 
 	// ── the per-issue index is scoped to kind='issue': a ci_fix run never collides

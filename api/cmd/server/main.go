@@ -1738,7 +1738,7 @@ func startRunCardMessage(err error) string {
 	case errors.Is(err, workersvc.ErrActiveRunExists):
 		return "A run is already in progress for this issue."
 	case errors.Is(err, workersvc.ErrBranchInUse):
-		return "A CI-fix run is already working this issue's branch — cancel it first."
+		return "A CI-fix or MR-rework run is already working this issue's branch — cancel it first."
 	case errors.Is(err, workersvc.ErrDescriptionTooLarge):
 		return "That issue's description is too large to run."
 	case errors.Is(err, workersvc.ErrForgeIssueRead):

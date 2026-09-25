@@ -128,6 +128,26 @@ const SettingsMutationLockKey int64 = 0x757A7365 // "uzse"
 // the DSN without revisiting this and its siblings above.
 const JudgeDispositionCoordLockClass int32 = 0x757A6A64 // "uzjd"
 
+// RunBranchLockClass is the class half of the two-int advisory lock that serializes run
+// creation on one agent branch across run kinds (issue #1626): an issue run for N, an
+// mr_rework and a ci_fix on agent/issue-N all take pg_advisory_xact_lock(RunBranchLockClass,
+// RunBranchLockObjID(repo_id, branch)) as the first statement of their insert closure
+// (LockRunBranch), then run their cross-kind "is the branch taken?" checks and insert.
+//
+// It exists because those checks read DIFFERENT rows per kind (an issue run is keyed by
+// issue_iid, its runs.branch stays NULL until its terminal report; an mr_rework / ci_fix by
+// pipeline_ref), so no partial unique index spans the pair, and under READ COMMITTED two
+// concurrent creates each miss the other's uncommitted row. The lock is a mutex over the
+// (repo, branch) key: the waiter acquires it only after the holder commits, and its checks
+// are NEW statements whose fresh snapshot sees the holder's committed row, the mechanism
+// SettingsMutationLockKey documents above.
+//
+// Each create transaction takes exactly one run-branch lock, before its checks, so two
+// branch keys can never be acquired in opposite orders. Two-int space, disjoint from the other classes here; an objid
+// collision only serializes two unrelated branches for a moment. XACT-scoped. Depends on the
+// pool's default READ COMMITTED isolation (OpenPool sets none), like its siblings.
+const RunBranchLockClass int32 = 0x757A7262 // "uzrb"
+
 // Migrate runs all pending goose migrations against the database at dsn. It
 // retries the initial connection so the API can start slightly ahead of
 // Postgres becoming ready.
