@@ -22,9 +22,6 @@ vi.mock("./favicon", async () => {
 let nextRuns: FaviconRun[] = [];
 vi.mock("./api", () => ({ api: { listRuns: (...args: unknown[]) => listRuns(...args) } }));
 
-// notifications: capture the subscriber but we don't need to drive it here.
-vi.mock("./notifications", () => ({ onNotificationsChanged: () => () => {} }));
-
 import { useFavicon } from "./useFavicon";
 
 function run(id: string, status: string): FaviconRun {
@@ -56,22 +53,14 @@ afterEach(() => {
 });
 
 describe("useFavicon", () => {
-  it("Fix 3: applies attention from unread BEFORE any runs poll resolves", async () => {
-    // listRuns never resolves this tick, so the baseline stays null.
+  it("Fix 3: nothing is applied pre-baseline (no premature redden, no amber without a run)", async () => {
+    // First poll hangs, so the baseline stays null and runsRef stays empty. Every state
+    // derives from runs (the unread-inbox input is gone, PRD #1650 D5), so the
+    // pre-baseline branch has nothing to surface and must apply nothing at all — in
+    // particular it must not redden, which requires the seeded baseline to tell a fresh
+    // failure from a pre-existing one.
     listRuns.mockReturnValueOnce(new Promise(() => {}));
-    renderHook(() => useFavicon({ unread: 1, enabled: true, appLogoSrc: null }));
-
-    // The unread-keyed effect runs synchronously on mount; no poll has resolved.
-    expect(applyFavicon).toHaveBeenCalledWith("attention", null);
-  });
-
-  it("Fix 3: nothing is applied pre-baseline with no unread (no premature redden)", async () => {
-    // First poll hangs, so the baseline stays null and runsRef stays empty. With no
-    // unread there is nothing the pre-baseline branch can surface, so it must apply
-    // nothing at all — in particular it must not redden, which requires the seeded
-    // baseline to tell a fresh failure from a pre-existing one.
-    listRuns.mockReturnValueOnce(new Promise(() => {}));
-    renderHook(() => useFavicon({ unread: 0, enabled: true, appLogoSrc: null }));
+    renderHook(() => useFavicon({ enabled: true, appLogoSrc: null }));
 
     expect(applyFavicon).not.toHaveBeenCalledWith("failed", null);
     expect(applyFavicon).not.toHaveBeenCalled();
@@ -81,9 +70,7 @@ describe("useFavicon", () => {
     // First poll: empty, seeds an empty baseline. Second poll: a NEW failed run —
     // fresh relative to the seeded baseline, so it reddens.
     nextRuns = [];
-    const { rerender } = renderHook((props: { unread: number }) => useFavicon({ ...props, enabled: true, appLogoSrc: null }), {
-      initialProps: { unread: 0 },
-    });
+    renderHook(() => useFavicon({ enabled: true, appLogoSrc: null }));
     await flush(); // seed baseline (empty), derive idle
     expect(applyFavicon).not.toHaveBeenCalledWith("failed", null);
 
@@ -92,13 +79,12 @@ describe("useFavicon", () => {
       vi.advanceTimersByTime(20_000); // next poll tick
     });
     await flush();
-    rerender({ unread: 0 });
     expect(applyFavicon).toHaveBeenCalledWith("failed", null);
   });
 
   it("Fix 4: two polls with the SAME runs apply the icon at most once for that state", async () => {
     nextRuns = [run("r1", "running")];
-    renderHook(() => useFavicon({ unread: 0, enabled: true, appLogoSrc: null }));
+    renderHook(() => useFavicon({ enabled: true, appLogoSrc: null }));
     await flush(); // first poll resolves -> running
     expect(applyFavicon).toHaveBeenCalledWith("running", null);
     const callsAfterFirst = applyFavicon.mock.calls.length;
@@ -113,13 +99,13 @@ describe("useFavicon", () => {
 
   it("derives a normal seeded run (running) after the poll resolves", async () => {
     nextRuns = [run("r1", "running")];
-    renderHook(() => useFavicon({ unread: 0, enabled: true, appLogoSrc: null }));
+    renderHook(() => useFavicon({ enabled: true, appLogoSrc: null }));
     await flush();
     expect(applyFavicon).toHaveBeenCalledWith("running", null);
   });
 
   it("#331: marks the favicon poll passive so the server skips the rolling refresh", async () => {
-    renderHook(() => useFavicon({ unread: 0, enabled: true, appLogoSrc: null }));
+    renderHook(() => useFavicon({ enabled: true, appLogoSrc: null }));
     await flush(); // immediate seed poll
     expect(listRuns).toHaveBeenCalledWith({ passive: true });
   });
@@ -140,7 +126,7 @@ describe("useFavicon", () => {
     try {
       const { rerender } = renderHook(
         (props: { appLogoSrc: string | null }) =>
-          useFavicon({ unread: 0, enabled: true, appLogoSrc: props.appLogoSrc }),
+          useFavicon({ enabled: true, appLogoSrc: props.appLogoSrc }),
         { initialProps: { appLogoSrc: "/logo-a.png" } },
       );
 

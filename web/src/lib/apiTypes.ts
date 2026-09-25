@@ -3130,37 +3130,6 @@ export interface AdminCodexRateLimits {
   users: CodexAdminRateLimitRow[];
 }
 
-// ── Notifications inbox (PRD #46 M2) ─────────────────────────────────────────
-// A generic in-app notification. kind + payload let any feature enqueue one; the
-// judge is tenant #1. payload is the render blob — by convention a `title` and
-// optional `body` the inbox shows, but readers must tolerate any shape. run_id /
-// review_id are optional deep-link anchors. owner is present ONLY on the admin
-// all-view so the admin sees whose inbox a row belongs to.
-export interface NotificationOwner {
-  id: string;
-  email: string;
-  display_name: string | null;
-}
-
-export interface Notification {
-  id: string;
-  kind: string;
-  payload: Record<string, unknown>;
-  run_id: string | null;
-  review_id: string | null;
-  read_at: string | null;
-  created_at: string;
-  owner?: NotificationOwner;
-}
-
-// NotificationList is the inbox envelope: one page of rows, the caller's own
-// unread count (the bell badge), and the scope total for paging.
-export interface NotificationList {
-  notifications: Notification[];
-  unread: number;
-  total: number;
-}
-
 // ── Run judge review (PRD #46 M4) ────────────────────────────────────────────
 // The judge's retrospective of a finished run: a verdict + structured
 // recommendations. Every free-text field (summary_md, each rationale_md, target)
@@ -3405,7 +3374,7 @@ export interface JudgeRecommendationGroup {
 // JudgeBacklog is GET /api/me/judge/recommendations (PRD #98 M1). `bucket` echoes the
 // applied filter and `run` the ?run= anchor (""" when absent). `triage` is the
 // canonical GET /me/judge/stats aggregate — NEVER tallied from `groups` — so the page
-// tabs, the nav badge and the notification cannot drift; it survives both filters and
+// tabs and the nav badge cannot drift; it survives both filters and
 // truncation. `truncated` says the hard row cap bit: when true a SURVIVING group's
 // counts/rollup may be understated, so a truncated page is never authoritative.
 export interface JudgeBacklog {

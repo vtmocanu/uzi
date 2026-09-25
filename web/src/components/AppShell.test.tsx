@@ -17,7 +17,6 @@ vi.mock("../lib/api", () => ({
   api: {
     listRepos: vi.fn(),
     listConnections: vi.fn(),
-    unreadNotificationCount: vi.fn(),
     // The Judge nav badge (PRD #98) polls /me/judge/stats on mount; default to an empty
     // backlog so the badge is absent unless a test overrides it.
     // PRD #113 M6: AppShell now owns a workers-attention poll too. Zero by default so
@@ -194,7 +193,6 @@ beforeEach(() => {
   });
   mockApi.listRepos.mockResolvedValue({ repos });
   mockApi.listConnections.mockResolvedValue({ connections: [gitlabConnection] });
-  mockApi.unreadNotificationCount.mockResolvedValue({ unread: 0 });
 });
 
 const emptyTriage = { total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 };
@@ -394,11 +392,11 @@ describe("Workers nav alert badge (PRD #113 M6)", () => {
   it("badges the Workers nav item with the attention count, alert-toned", async () => {
     mockApi.workerUpgradeSummary.mockResolvedValue({ attention: 2, target_release: "0.6.0" });
     renderShell("/dashboard");
-    // The aria-label says what the number MEANS. "2 unread" for a worker count would be
+    // The aria-label says what the number MEANS. "2 pending" for a worker count would be
     // wrong in a way a screen-reader user could not recover from.
     const badge = await screen.findByLabelText("2 needing attention");
     expect(badge.textContent).toBe("2");
-    // Alert tone, not the brand pill the Judge/unread badges use (Decision 2): red reads
+    // Alert tone, not the brand pill the Judge/Runs badges use (Decision 2): red reads
     // "go look", grey reads "there is a queue".
     expect(badge.className).toContain("bg-danger");
   });
@@ -429,7 +427,10 @@ describe("Workers nav alert badge (PRD #113 M6)", () => {
     mockApi.getJudgeStats.mockResolvedValue({ ...emptyTriage, total: 4, todo: 4 });
     renderShell("/dashboard");
     const workers = await screen.findByLabelText("1 needing attention");
-    const judge = await screen.findByLabelText("4 unread");
+    // The Judge badge names its own noun (the page's To-triage tab), never the retired
+    // inbox's "unread" (PRD #1650).
+    const judge = await screen.findByLabelText("4 to triage");
+    expect(screen.queryByLabelText("4 unread")).toBeNull();
     expect(workers.className).toContain("bg-danger");
     expect(judge.className).not.toContain("bg-danger");
   });
@@ -438,8 +439,8 @@ describe("Workers nav alert badge (PRD #113 M6)", () => {
 // PRD #239: the Runs nav count badge. Brand "count" tone (Decision 2), not the Workers
 // alert red — in-progress runs are healthy activity, a queue to get to.
 describe("Runs nav count badge (PRD #239)", () => {
-  // The accessible noun is "in progress" (badgeLabel), NOT the count tone's default
-  // "unread" — a run is never unread. That also makes "N in progress" a label unique to
+  // The accessible noun is "in progress" (badgeLabel), NOT the count tone's fallback
+  // noun. That also makes "N in progress" a label unique to
   // this badge; assertions are still scoped to the Runs link with within() for robustness
   // (belt-and-braces against a future badge reusing the noun, and against a prior test's
   // leaked count since clearAllMocks keeps mock implementations).

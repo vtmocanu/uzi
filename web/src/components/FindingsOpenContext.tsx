@@ -28,7 +28,7 @@ export function useSetFindingsOpen(): (open: number) => void {
   return useContext(FindingsOpenContext);
 }
 
-// The READ side of the same channel, mirroring JudgeTodoValueContext. NULL means "no provider"
+// The READ side of the same channel. NULL means "no provider"
 // — rendered outside an AppShell. A displayed 0 would be the claim "you have nothing to
 // triage", so a provider-less consumer must render nothing rather than substitute 0.
 export const FindingsOpenValueContext = createContext<number | null>(null);

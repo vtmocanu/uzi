@@ -6,8 +6,8 @@
 // expander (bulk file-as-one-issue is a follow-up PRD, Decision 3).
 //
 // Three contracts consumed AS DOCUMENTED, not as assumed (see api.ts + the checkpoint):
-//   - `triage` is the canonical count from the separate stats query — the tabs, the nav
-//     badge and the notification all read it, never a tally of the groups on screen.
+//   - `triage` is the canonical count from the separate stats query — the tabs and the nav
+//     badge both read it, never a tally of the groups on screen.
 //   - `truncated` means a SURVIVING group may be understated and a just-acted-on group
 //     may be ABSENT; a missing group is UNKNOWN, never "settled and gone".
 //   - a bulk disposition RE-READS the acted-on groups at bucket=all, so a just-dismissed
@@ -602,8 +602,8 @@ export function Judge() {
             : "Recommendations across all your runs. Triage a whole group in one action."
         }
         // The Mine / All-users switch (PRD #1184 M4), admins only, and hidden while a ?run= anchor
-        // forces `mine` (a deep link into the caller's own run). The segmented control mirrors
-        // Notifications' — border-edge / bg-raised, no new tailwind stems.
+        // forces `mine` (a deep link into the caller's own run). The segmented control uses
+        // border-edge / bg-raised, no new tailwind stems.
         actions={
           isAdmin && !runAnchor ? (
             <div className="inline-flex overflow-hidden rounded-lg border border-edge text-sm">

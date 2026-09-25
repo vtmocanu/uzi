@@ -171,8 +171,8 @@ export const mockRuns: Run[] = [
     // takes its issue-less branch and renders the "MR rework" kind chip (not a
     // forge #anchor). It folds the fixes onto the EXISTING branch and MR rather than
     // opening a new one, hence branch/mr_iid/mr_state are populated and status is
-    // running. The per-MR cap is NOT a run status; a capped MR surfaces via the halt
-    // inbox notification (ntf-mr-rework-capped), mirroring M3's ci-autofix halt path.
+    // running. The per-MR cap is NOT a run status; a capped MR surfaces on the run view's
+    // "cycles used · stopped" line (run-rework-capped, PRD #1202).
     id: "run-mr-rework",
     repo_id: "repo-uzi",
     issue_iid: null,

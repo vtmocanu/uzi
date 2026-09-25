@@ -36,7 +36,6 @@ vi.mock("../lib/api", async (importOriginal) => {
       // no other badge in the way of the Findings badge assertions.
       getJudgeStats: vi.fn().mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
       listConnections: vi.fn().mockResolvedValue({ connections: [] }),
-      unreadNotificationCount: vi.fn().mockResolvedValue({ count: 0 }),
       workerUpgradeSummary: vi.fn().mockResolvedValue({ attention: 0, target_release: "0.6.0" }),
       runsInProgressCount: vi.fn().mockResolvedValue({ count: 0 }),
       listSchedules: vi.fn().mockResolvedValue([]),
