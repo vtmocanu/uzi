@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -46,23 +47,28 @@ const (
 	coderabbitWalkthroughMarker = "<!-- walkthrough_start -->"
 )
 
-// isCodeRabbitControlComment recognizes the exact, standalone CodeRabbit commands uzi's
-// own watcher workflow posts. A loose @coderabbitai prefix check would hide real human
-// feedback such as "@coderabbitai review; please also rename X", so normalized bodies
-// containing any extra words remain actionable.
-func isCodeRabbitControlComment(body string) bool {
-	fields := strings.Fields(strings.ToLower(body))
-	if len(fields) < 2 || (fields[0] != "@coderabbitai" && fields[0] != "@coderabbitai[bot]") {
-		return false
-	}
+// botControlCommands is the single allowlist of verified, standalone review-bot
+// commands, keyed by the lowercased mention handle, each mapped to the exact
+// normalized command words allowed after it. CodeRabbit's are the ones uzi's own
+// watcher workflow posts; Greptile's are its documented on-demand review triggers
+// (issue #1695). A bare mention is deliberately absent: it is not a verified trigger.
+var botControlCommands = map[string][]string{
+	"@coderabbitai":      {"review", "full review", "rate limit", "reviews remaining?"},
+	"@coderabbitai[bot]": {"review", "full review", "rate limit", "reviews remaining?"},
+	"@greptileai":        {"review"},
+	"@greptile":          {"review"},
+}
 
-	command := strings.Join(fields[1:], " ")
-	switch command {
-	case "review", "full review", "rate limit", "reviews remaining?":
-		return true
-	default:
+// isBotControlComment recognizes a body consisting solely of one allowlisted bot
+// command. A loose mention-prefix check would hide real human feedback such as
+// "@coderabbitai review; please also rename X", so normalized bodies containing any
+// extra words remain actionable.
+func isBotControlComment(body string) bool {
+	fields := strings.Fields(strings.ToLower(body))
+	if len(fields) < 2 {
 		return false
 	}
+	return slices.Contains(botControlCommands[fields[0]], strings.Join(fields[1:], " "))
 }
 
 // IsActionableReviewComment reports whether a kept review comment counts toward the
@@ -71,8 +77,8 @@ func isCodeRabbitControlComment(body string) bool {
 // their findings inline. A summary / top-level note does NOT count when it is a bot
 // walkthrough/status/tips note: authored by a GitHub App bot (login ends in "[bot]"),
 // carrying one of CodeRabbit's summary/walkthrough markers, or consisting solely of a
-// recognized CodeRabbit control command. A human top-level note ("please also rename X")
-// stays actionable, including one that adds prose after a bot command. Anything whose
+// recognized review-bot control command (botControlCommands: CodeRabbit, Greptile). A
+// human top-level note ("please also rename X") stays actionable, including one that adds prose after a bot command. Anything whose
 // review state is not the summary sentinel defaults to actionable, so the trigger set can
 // only ever shrink relative to the pre-#1142 behavior, never grow.
 //
@@ -90,7 +96,7 @@ func IsActionableReviewComment(c ReviewCommentSnapshot) bool {
 	if strings.Contains(c.Body, coderabbitSummaryMarker) || strings.Contains(c.Body, coderabbitWalkthroughMarker) {
 		return false
 	}
-	if isCodeRabbitControlComment(c.Body) {
+	if isBotControlComment(c.Body) {
 		return false
 	}
 	return true
