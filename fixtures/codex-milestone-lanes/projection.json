@@ -1,0 +1,93 @@
+{
+  "_comment": "Issue #1674 M3: one Codex delegation as the worker POSTS it (agent/src/codex projection through the real MessageBatcher), recorded by agent/test/codex-executor.test.ts ('projection-to-server lane fixture') and fed to Derive by api/internal/milestonelanes/derive_codex_fixture_test.go. Recorded, not authored: on drift, copy the frames the failing TS test prints. Normalized: the dispatch nonce (cx-000000000000-...), seq (1..n in posted order) and created_at (server-assigned, so synthetic: 2026-09-25T11:59:00Z plus one second per frame). now, milestones and in_progress are the server-side inputs; completion_seq is the lead tool_result that ends the lane; expected_lane is the lane Derive must report before it.",
+  "now": "2026-09-25T12:00:00Z",
+  "milestones": [
+    {
+      "id": "m1",
+      "title": "Wire the limiter"
+    }
+  ],
+  "in_progress": [
+    "m1"
+  ],
+  "completion_seq": 5,
+  "expected_lane": {
+    "milestone_id": "m1",
+    "agent": "coder",
+    "agent_instance": "cx-000000000000-t1-c-spawn",
+    "agent_label": "Wire the limiter",
+    "tool": "Bash",
+    "detail": "",
+    "at": "2026-09-25T11:59:01Z"
+  },
+  "frames": [
+    {
+      "kind": "tool_use",
+      "agent": "lead",
+      "agent_instance": "",
+      "agent_label": "",
+      "payload": {
+        "id": "cx-000000000000-t1-c-spawn",
+        "name": "Agent",
+        "input": {
+          "subagent_type": "coder",
+          "description": "[m1] Wire the limiter"
+        }
+      },
+      "created_at": "2026-09-25T11:59:00Z",
+      "seq": 1
+    },
+    {
+      "kind": "tool_use",
+      "agent": "coder",
+      "agent_instance": "cx-000000000000-t1-c-spawn",
+      "agent_label": "[m1] Wire the limiter",
+      "payload": {
+        "id": "cx-000000000000-t1-c-spawn/cc-bash",
+        "name": "Bash",
+        "input": {
+          "command": "go test ./..."
+        }
+      },
+      "created_at": "2026-09-25T11:59:01Z",
+      "seq": 2
+    },
+    {
+      "kind": "tool_result",
+      "agent": "coder",
+      "agent_instance": "cx-000000000000-t1-c-spawn",
+      "agent_label": "[m1] Wire the limiter",
+      "payload": {
+        "tool_use_id": "cx-000000000000-t1-c-spawn/cc-bash",
+        "content": "{\"code\":0,\"stdout\":\"ok\",\"stderr\":\"\"}",
+        "is_error": false
+      },
+      "created_at": "2026-09-25T11:59:02Z",
+      "seq": 3
+    },
+    {
+      "kind": "text",
+      "agent": "coder",
+      "agent_instance": "cx-000000000000-t1-c-spawn",
+      "agent_label": "[m1] Wire the limiter",
+      "payload": {
+        "text": "tests pass"
+      },
+      "created_at": "2026-09-25T11:59:03Z",
+      "seq": 4
+    },
+    {
+      "kind": "tool_result",
+      "agent": "lead",
+      "agent_instance": "",
+      "agent_label": "",
+      "payload": {
+        "tool_use_id": "cx-000000000000-t1-c-spawn",
+        "content": "{\"role\":\"coder\",\"text\":\"tests pass\"}",
+        "is_error": false
+      },
+      "created_at": "2026-09-25T11:59:04Z",
+      "seq": 5
+    }
+  ]
+}

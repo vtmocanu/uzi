@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   CodexExecutor,
@@ -6311,5 +6312,91 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
       if (expected === undefined) assert.ok(!("milestonesCompleted" in result), `${kind} ${JSON.stringify(args)}: omitted`);
       else assert.deepEqual(result.milestonesCompleted, expected);
     }
+  });
+});
+
+// ================================================================================
+// Issue #1674 M3: the Codex delegation projection, as the worker POSTS it, is the frame shape
+// the server's lane derivation (api/internal/milestonelanes.Derive) binds. This drives a real
+// `[<id>]`-tagged spawn_agent through the executor and a real MessageBatcher, keeps the dispatch,
+// the child's frames and the lead completion, normalizes the volatile dispatch nonce, the seq and
+// the (server-assigned) created_at, and asserts the result equals the checked-in fixture. The Go
+// half (milestonelanes/derive_codex_fixture_test.go) feeds the SAME frames to Derive.
+describe("CodexExecutor projection-to-server lane fixture (issue #1674 M3)", () => {
+  const FIXTURE = fileURLToPath(new URL("../../fixtures/codex-milestone-lanes/projection.json", import.meta.url));
+  const BASE_AT = Date.parse("2026-09-25T11:59:00Z");
+  interface FixtureFrame {
+    kind: string;
+    agent: string;
+    agent_instance: string;
+    agent_label: string;
+    payload: Record<string, unknown>;
+    created_at: string;
+    seq: number;
+  }
+
+  it("the posted spawn_agent dispatch, child frame and lead completion match the shared fixture", async () => {
+    const agents: AgentTemplate[] = [
+      { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [] },
+    ];
+    const rig = makeRig({
+      responder: (c) => {
+        if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child-1" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+          c.transport
+            .push(toolCall(11, "uzi_bash", { command: "go test ./..." }, "th-child-1", "tn-child", "cc-bash"))
+            .push(agentMessage("tests pass", "th-child-1"))
+            .push(turnCompleted("completed", "th-child-1", "tn-child"));
+          return { turn: { id: "tn-child" } };
+        }
+        return {};
+      },
+    });
+    rig.deps = { ...rig.deps, spawnCommand: async () => ({ code: 0, stdout: "ok", stderr: "" }) };
+    rig.transport
+      .push(threadStarted())
+      .push(toolCall(1, "spawn_agent", { subagent_type: "coder", description: "[m1] Wire the limiter", prompt: "wire it" }, "th-1", "tn-1", "c-spawn"));
+
+    const posted: OutgoingMessage[] = [];
+    const client = {
+      async postMessages(_runId: string, msgs: OutgoingMessage[]): Promise<void> {
+        posted.push(...msgs);
+      },
+    } as unknown as WorkerClient;
+    const batcher = new MessageBatcher(client, "run-1", 0, 5, noopLog, makeRedactor([]), makeTextRedactor([]));
+    const { ctx } = makeCtx({ agents, emit: (m) => batcher.emit(m) });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "parent spawn_agent reply", 5000);
+    rig.transport.push(signalDone("th-1", "tn-1")).push(turnCompleted("completed", "th-1", "tn-1")).end();
+    await withTimeout(runP, 5000, "projection fixture run");
+    await batcher.close();
+
+    const dispatch = posted.find((m) => m.kind === "tool_use" && m.payload.name === "Agent");
+    assert.ok(dispatch, "the spawn_agent dispatch was posted as an Agent tool_use");
+    const rawId = String(dispatch.payload.id);
+    assert.match(rawId, /^cx-[0-9a-f]{12}-t\d+-c-spawn$/);
+    const normId = rawId.replace(/^cx-[0-9a-f]{12}-/, "cx-000000000000-");
+    const norm = (v: unknown): unknown => JSON.parse(JSON.stringify(v).split(rawId).join(normId));
+    const delegation = posted.filter((m) =>
+      m === dispatch || m.agent_instance === rawId || (m.kind === "tool_result" && m.payload.tool_use_id === rawId));
+    const frames: FixtureFrame[] = delegation.map((m, i) => ({
+      kind: m.kind,
+      agent: m.agent ?? "",
+      agent_instance: String(norm(m.agent_instance ?? "")),
+      agent_label: m.agent_label ?? "",
+      payload: norm(m.payload) as Record<string, unknown>,
+      created_at: new Date(BASE_AT + i * 1000).toISOString().replace(".000Z", "Z"),
+      seq: i + 1,
+    }));
+    const kinds = frames.map((f) => `${f.agent}:${f.kind}`);
+    assert.deepEqual(kinds.slice(0, 1), ["lead:tool_use"], "the dispatch leads");
+    assert.ok(kinds.includes("coder:tool_use"), "an active child tool_use frame is captured");
+    assert.equal(kinds.at(-1), "lead:tool_result", "the projected lead completion closes the delegation");
+
+    const fixture = JSON.parse(await fs.readFile(FIXTURE, "utf8")) as { frames: FixtureFrame[] };
+    assert.deepEqual(frames, fixture.frames,
+      `the real projection drifted from the fixture; re-record frames from:\n${JSON.stringify(frames, null, 2)}`);
   });
 });
