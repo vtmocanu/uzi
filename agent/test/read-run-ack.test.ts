@@ -151,3 +151,24 @@ describe("readRunAck", () => {
     assert.deepEqual(out, {}, "malformed JSON yields the fields absent, never a throw");
   });
 });
+
+// Issue #1626 — the frozen completion-contract revision rides the same {run: RunDTO} body
+// (RunDTO.completion_revision), so a fresh interlocked run learns the revision frozen AFTER its
+// claim. A positive integer only; anything else leaves it undefined ("no revision update").
+describe("readRunAck completion_revision (issue #1626)", () => {
+  it("reads a numeric completion_revision off the run body", async () => {
+    const out = await readRunAck(jsonResponse({ run: { status: "running", completion_revision: 1 } }));
+    assert.equal(out.contractRevision, 1, "the frozen revision is passed through");
+    const bumped = await readRunAck(jsonResponse({ run: { completion_revision: 3 } }));
+    assert.equal(bumped.contractRevision, 3, "a revised contract's revision is passed through too");
+  });
+
+  it("leaves contractRevision undefined for null, string, absent or non-positive-integer values", async () => {
+    for (const value of [null, "1", 0, -1, 1.5, true]) {
+      const out = await readRunAck(jsonResponse({ run: { completion_revision: value } }));
+      assert.equal(out.contractRevision, undefined, `completion_revision ${JSON.stringify(value)} is ignored`);
+    }
+    const absent = await readRunAck(jsonResponse({ run: { status: "running" } }));
+    assert.equal(absent.contractRevision, undefined, "an absent field (legacy/never-frozen run, older server) is undefined");
+  });
+});

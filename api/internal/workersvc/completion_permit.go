@@ -153,8 +153,12 @@ type CompletionAttemptResult struct {
 // when the interlocked run's completion_contract is NULL (or corrupt) while milestones were
 // frozen: the permit path must DENY (contract_not_frozen), and to keep the attempt path
 // fail-closed too the returned unmet is then the FULL frozen milestone id set (nothing reads as
-// done). A genuinely milestone-less run has a NON-NULL contract with criteria:[] (M1 builds
-// that), so it returns (empty, true) — vacuously complete.
+// done). A genuinely milestone-less run has a NON-NULL contract with criteria:[], so it returns
+// (empty, true) — vacuously complete. That contract exists only because the freeze sees a
+// non-NULL milestone source: the worker omits an empty milestone list, so the server reads an
+// interlocked run's milestone-less PLAN-BEARING report as the explicit `[]`
+// (planMilestonesParam, issue #1626); before that, such a run froze nothing and held here
+// with verifiable=false.
 func computeUnmetCriteria(run store.Run) (unmet []string, verifiable bool) {
 	if len(run.CompletionContract) == 0 {
 		// Contract NULL: split-state (or a never-frozen interlocked row). Fail closed — treat

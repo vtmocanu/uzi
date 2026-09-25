@@ -175,7 +175,8 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			// Each carries its own user-facing reason (the service's sentinel message).
 			httpx.Error(w, http.StatusConflict, err.Error())
 		case errors.Is(err, workersvc.ErrBranchInUse):
-			httpx.Error(w, http.StatusConflict, "a CI fix is working this branch")
+			// Issue #1626: an active issue run for the branch's issue, or a CI fix, can hold it.
+			httpx.Error(w, http.StatusConflict, "another run (an issue run or a CI fix) is already working this branch")
 		case errors.Is(err, workersvc.ErrActiveMRReworkExists):
 			httpx.Error(w, http.StatusConflict, "a rework is already running for this merge request")
 		case errors.Is(err, workersvc.ErrNoCredentialForHarness):

@@ -64,6 +64,11 @@ export class FakeApi {
   // held-state switch is pending for the run's current claim; a test arms it to prove the state-ack
   // transport triggers the switch through the reportState closure, independent of /inputs.
   private readonly stateAckCredentialSwitch = new Map<string, number>();
+  // Issue #1626: runs whose 200 /state ACK carries `run.completion_revision` (the RunDTO's frozen
+  // completion-contract revision). The real server reports it once the contract froze (plan
+  // approval / the autopilot plan report); the worker reads it off the same body (readRunAck) and
+  // binds its completion permit to it when the claim carried no contract_revision.
+  private readonly stateAckCompletionRevision = new Map<string, unknown>();
   private readonly stateRawOverride = new Map<
     string,
     { status: number; body: string }
@@ -90,6 +95,9 @@ export class FakeApi {
       // "budget_exhausted"), the shape the server produces on a SERVER-side wall park — paired with
       // runStatus:"paused" + disposition:"stale_claim" it drives the ServerWallParkedError path.
       holdReason?: string;
+      // Issue #1626: when set, the 409 refusal's run DTO carries this completion_revision, so a test
+      // can prove a STALE ack's revision is never adopted.
+      completionRevision?: unknown;
       fired: boolean;
     }
   >();
@@ -309,7 +317,13 @@ export class FakeApi {
   failStateWhen(
     runId: string,
     matchesState: (body: StateRequest) => boolean,
-    opts: { httpStatus?: number; runStatus?: string; disposition?: string; holdReason?: string } = {},
+    opts: {
+      httpStatus?: number;
+      runStatus?: string;
+      disposition?: string;
+      holdReason?: string;
+      completionRevision?: unknown;
+    } = {},
   ): void {
     this.stateFailWhen.set(runId, {
       matchesState,
@@ -317,6 +331,7 @@ export class FakeApi {
       runStatus: opts.runStatus,
       disposition: opts.disposition,
       holdReason: opts.holdReason,
+      completionRevision: opts.completionRevision,
       fired: false,
     });
   }
@@ -372,6 +387,13 @@ export class FakeApi {
   setPauseRequestedAck(runId: string, requested = true): void {
     if (requested) this.pauseRequestedRuns.add(runId);
     else this.pauseRequestedRuns.delete(runId);
+  }
+
+  /** Issue #1626: make this run's 200 /state ACKs carry `run.completion_revision: rev` (the RunDTO's
+   *  frozen completion-contract revision). Any value is passed through verbatim so a test can also
+   *  model a malformed one. */
+  setStateAckCompletionRevision(runId: string, rev: unknown): void {
+    this.stateAckCompletionRevision.set(runId, rev);
   }
 
   /** PRD #1392 M2 (D7): set the raw `protocol_features` the register endpoint returns beside
@@ -746,6 +768,7 @@ export class FakeApi {
             // beside status:"paused"; the reportState closure reads the pair (+ disposition) to throw
             // ServerWallParkedError. Absent unless armed, so existing stale_claim tests are unchanged.
             ...(when.holdReason ? { hold_reason: when.holdReason } : {}),
+            ...(when.completionRevision !== undefined ? { completion_revision: when.completionRevision } : {}),
           },
           // PRD #1247 M5b: a stale_claim (or other) disposition rides TOP-LEVEL when armed.
           ...(when.disposition ? { disposition: when.disposition } : {}),
@@ -780,6 +803,10 @@ export class FakeApi {
         // PRD #1190 M2: the server-decided pause boundary rides the RunDTO the ACK wraps. Only
         // present when a test armed it; otherwise absent (the worker reads it as "no pause").
         ...(this.pauseRequestedRuns.has(runId) ? { pause_requested: true } : {}),
+        // Issue #1626: the frozen completion-contract revision, only when a test armed it.
+        ...(this.stateAckCompletionRevision.has(runId)
+          ? { completion_revision: this.stateAckCompletionRevision.get(runId) }
+          : {}),
       },
       // PRD #1247 M5b (BLOCKING-2): mirror the real server — an APPLIED credential_switch RELEASE
       // (a 200) carries disposition:"released", which the worker reads to accept the release

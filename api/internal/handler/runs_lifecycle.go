@@ -393,7 +393,8 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 	case errors.Is(err, workersvc.ErrActiveRunExists):
 		httpx.Error(w, http.StatusConflict, "a run is already in progress for this issue")
 	case errors.Is(err, workersvc.ErrBranchInUse):
-		httpx.Error(w, http.StatusConflict, "a CI-fix run is already working this issue's branch; cancel it before starting an issue run")
+		// Issue #1626: an active ci_fix OR mr_rework on agent/issue-<iid> holds the branch.
+		httpx.Error(w, http.StatusConflict, "a CI-fix or MR-rework run is already working this issue's branch; cancel it before starting an issue run")
 	case errors.Is(err, workersvc.ErrNoCredentialForHarness):
 		// PRD #1429 M2 (D2): an EXPLICIT harness (request or pin) whose credential is unusable —
 		// 422 with the stable no_credential_for_harness classification. Never falls back.

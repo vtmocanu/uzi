@@ -146,7 +146,7 @@ Auto-provisioning a throwaway worker on demand for a capability-unmet queued
 run **has shipped** (opt-in, off by default) — see
 [Auto-provisioning a worker for an unmet capability](./scheduling.md#auto-provisioning-a-worker-for-an-unmet-capability).
 Both of its gates are exposed in the web UI: the admin instance switch lives
-in Admin → Settings, and the per-user opt-in lives on the Workers page.
+in Admin → Instance settings, and the per-user opt-in lives on the Workers page.
 The other two remediations still apply: switch to an eligible worker you
 already have, or provision a persistent one yourself (see
 [Hosted workers](./hosted-workers.md)). What remains deferred is

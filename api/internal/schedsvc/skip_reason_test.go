@@ -73,6 +73,7 @@ func TestSkipReasonEnumIsHonest(t *testing.T) {
 		{"ErrOpenMRExists", workersvc.ErrOpenMRExists},
 		{"ErrCredentialOverrideHarnessUnsupported", workersvc.ErrCredentialOverrideHarnessUnsupported},
 		{"ErrNoUsableCredential", workersvc.ErrNoUsableCredential},
+		{"ErrBranchInUse", workersvc.ErrBranchInUse},
 	}
 	for _, c := range mapped {
 		got, ok := skipReasonForErr(c.err)

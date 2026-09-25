@@ -629,6 +629,10 @@ export class WorkerClient {
             ack.budgetMaxIterations = fields.budgetMaxIterations;
           if (fields.budgetWallSeconds !== undefined)
             ack.budgetWallSeconds = fields.budgetWallSeconds;
+          // Issue #1626: the frozen completion-contract revision rides the same ACK, so a fresh
+          // interlocked run learns the revision frozen after its claim (see StateAck.contractRevision).
+          if (fields.contractRevision !== undefined)
+            ack.contractRevision = fields.contractRevision;
           // PRD #1189 M1 (D6): the served TOTAL wall (frozen budget + extension) rides the same
           // ACK so the sdk-executor can re-arm its hard wall upward when an owner extends a run
           // already executing.
@@ -1484,6 +1488,7 @@ export async function readRunAck(res: Response): Promise<{
   holdReason?: string | null;
   budgetMaxIterations?: number;
   budgetWallSeconds?: number;
+  contractRevision?: number;
   budgetTotalSeconds?: number;
   budgetUsedSeconds?: number;
   scopeCeiling?: number;
@@ -1509,6 +1514,8 @@ export async function readRunAck(res: Response): Promise<{
         hold_reason?: unknown;
         budget_max_iterations?: unknown;
         budget_wall_seconds?: unknown;
+        // Issue #1626: the frozen completion-contract revision (RunDTO.completion_revision).
+        completion_revision?: unknown;
         budget_total_seconds?: unknown;
         budget_used_seconds?: unknown;
         scope_ceiling?: unknown;
@@ -1529,6 +1536,7 @@ export async function readRunAck(res: Response): Promise<{
       holdReason?: string | null;
       budgetMaxIterations?: number;
       budgetWallSeconds?: number;
+      contractRevision?: number;
       budgetTotalSeconds?: number;
       budgetUsedSeconds?: number;
       scopeCeiling?: number;
@@ -1550,6 +1558,14 @@ export async function readRunAck(res: Response): Promise<{
       out.budgetMaxIterations = run.budget_max_iterations;
     if (typeof run?.budget_wall_seconds === "number")
       out.budgetWallSeconds = run.budget_wall_seconds;
+    // Issue #1626: the frozen completion-contract revision, so an interlocked run whose contract
+    // froze AFTER its claim (plan approval / the autopilot plan report) can bind its completion
+    // permit to it. A positive integer only — null (legacy/never-frozen run), absent (older
+    // server) or any other shape leaves it undefined, which the finalize reads as "fall back to
+    // the claim's contract_revision" (and holds fail-closed when that is absent too).
+    const rev = run?.completion_revision;
+    if (typeof rev === "number" && Number.isInteger(rev) && rev >= 1)
+      out.contractRevision = rev;
     // PRD #1189 M1 (D6): the served TOTAL wall (frozen budget + extension). null (a run with no
     // wall deadline) or absent (older server) leaves it undefined, and the sdk-executor falls
     // back to budgetWallSeconds.

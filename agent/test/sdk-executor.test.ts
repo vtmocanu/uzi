@@ -1220,6 +1220,78 @@ function transitionFrames(emits: EmittedMessage[]): string[] {
     .map((m) => String(m.payload["text"]));
 }
 
+describe("SdkExecutor gate milestones for an entirely-malformed list (issue #1626)", () => {
+  it("reports the lead's rejected entries on the gate (so the server drops the candidate), but keeps no breakdown itself", async () => {
+    const gateMs: Array<Milestone[] | undefined> = [];
+    const { queryFn } = fakeTurns([
+      // Every entry fails normalisation (blank title / blank id).
+      [submitPlanWithMilestones([{ id: "m1", title: " " }, { id: "", title: "no id" }]), resultSuccess()],
+      [reportProgress([], ["m1"]), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ reportProgress: async () => {} });
+    const base = probe.ctx.gatePlan!;
+    probe.ctx.gatePlan = async (planMd, ms, hook) => {
+      gateMs.push(ms);
+      return base(planMd, ms, hook);
+    };
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(gateMs, [
+      [
+        { id: "m1", title: "" },
+        { id: "", title: "no id" },
+      ],
+    ], "the gate carries the rejected entries, never an absent (\"no milestones\") list");
+    // The worker's own breakdown stays empty: the progress frame for m1 is titleless, as for a
+    // milestone-less plan (the rejected entries are wire-only).
+    assert.deepStrictEqual(transitionFrames(probe.emits), ["milestone m1 started"]);
+  });
+
+  it("a revise round's malformed list rides its gate call as the rejected list", async () => {
+    // The revise-round call site (not only the first gate) must send turn.rejectedMilestones: a
+    // regression to `turn.milestones` would send undefined on the second gate call here, which the
+    // server would read as "no milestones" rather than a rejected list.
+    const gateMs: Array<Milestone[] | undefined> = [];
+    const { queryFn } = fakeTurns([
+      [submitPlanWithMilestones(MILESTONES, "# Plan v1"), resultSuccess()], // planning turn
+      [submitPlanWithMilestones([{ id: "r1", title: "fine" }, { id: "", title: "no id" }], "# Plan v2"), resultSuccess()], // revision turn
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ reportProgress: async () => {} }, [
+      { kind: "revise", feedback: "again" },
+      { kind: "approve", selection: { status: "absent" } },
+    ]);
+    const base = probe.ctx.gatePlan!;
+    probe.ctx.gatePlan = async (planMd, ms, hook) => {
+      gateMs.push(ms);
+      return base(planMd, ms, hook);
+    };
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(gateMs, [
+      MILESTONES,
+      [
+        { id: "r1", title: "fine" },
+        { id: "", title: "no id" },
+      ],
+    ], "the revise round's gate carries its rejected entries, never an absent list");
+  });
+
+  it("a valid list is reported as-is", async () => {
+    const gateMs: Array<Milestone[] | undefined> = [];
+    const { queryFn } = fakeTurns([
+      [submitPlanWithMilestones(), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ reportProgress: async () => {} });
+    const base = probe.ctx.gatePlan!;
+    probe.ctx.gatePlan = async (planMd, ms, hook) => {
+      gateMs.push(ms);
+      return base(planMd, ms, hook);
+    };
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(gateMs, [MILESTONES]);
+  });
+});
+
 describe("SdkExecutor immediate progress push + transition frames (PRD #1064 M1)", () => {
   it("(a) pushes the in-progress snapshot the moment report_progress is observed, before the next reportIteration", async () => {
     // iter 1 reports in_progress:[m2] and does NOT finish, so today the snapshot reaches the

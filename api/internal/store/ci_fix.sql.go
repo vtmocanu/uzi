@@ -12,23 +12,26 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const countActiveCIFixForRef = `-- name: CountActiveCIFixForRef :one
+const countActiveBranchRunsForRef = `-- name: CountActiveBranchRunsForRef :one
 SELECT count(*) FROM runs
-WHERE repo_id = $1::uuid AND kind = 'ci_fix' AND pipeline_ref = $2
+WHERE repo_id = $1::uuid AND kind IN ('ci_fix', 'mr_rework') AND pipeline_ref = $2
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
-type CountActiveCIFixForRefParams struct {
+type CountActiveBranchRunsForRefParams struct {
 	RepoID      uuid.UUID   `json:"repo_id"`
 	PipelineRef pgtype.Text `json:"pipeline_ref"`
 }
 
-// The reverse cross-kind check, used by the issue-run create path: count active
-// ci_fix runs whose pipeline_ref equals the branch an issue run will use
-// (agent/issue-N). Refuses starting an issue run onto a branch an active ci_fix is
-// fixing.
-func (q *Queries) CountActiveCIFixForRef(ctx context.Context, arg CountActiveCIFixForRefParams) (int64, error) {
-	row := q.db.QueryRow(ctx, countActiveCIFixForRef, arg.RepoID, arg.PipelineRef)
+// The reverse cross-kind check, used by the issue-run create path (issue #1626):
+// count active branch runs, ci_fix AND mr_rework, whose pipeline_ref equals the
+// branch an issue run will use (agent/issue-N). An mr_rework's pipeline_ref is the
+// agent branch itself; a ci_fix's is the failed ref, which for an agent MR is that
+// same branch. Refuses starting an issue run onto a branch either kind is working.
+// Run once as a cheap pre-transaction fast-fail and again, authoritatively, inside
+// the create transaction after LockRunBranch (see store.RunBranchLockClass).
+func (q *Queries) CountActiveBranchRunsForRef(ctx context.Context, arg CountActiveBranchRunsForRefParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveBranchRunsForRef, arg.RepoID, arg.PipelineRef)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -46,10 +49,14 @@ type CountActiveRunsWithBranchParams struct {
 }
 
 // Cross-kind same-branch exclusion for the Fix CI trigger (PRD #6): count active
-// runs of ANY kind whose branch equals a ref. Refuses a fix on a ref an issue run
-// is already working (they would collide in the same worktree). branch is NULL
-// until the worker creates the worktree, so this catches the already-progressed
-// case; git's "branch already checked out" backstops the race window.
+// runs of ANY kind whose branch equals a ref. Only a run whose runs.branch is
+// already set can match, which in practice means a task run (its branch is written
+// at creation, task.sql). It does NOT see an active ISSUE run: an issue run's
+// runs.branch is written only by its terminal report (SetRunCompleted, and
+// ReconcileRunMR beside it), so it stays NULL for the run's whole active life. Keep
+// it that way: ListWatchedRunRefsForRepo and other readers treat a non-NULL branch
+// as a finished run. The issue-run half of the exclusion is HasActiveIssueRunForIID
+// below, keyed on issue_iid (issue #1626).
 func (q *Queries) CountActiveRunsWithBranch(ctx context.Context, arg CountActiveRunsWithBranchParams) (int64, error) {
 	row := q.db.QueryRow(ctx, countActiveRunsWithBranch, arg.RepoID, arg.Branch)
 	var count int64
@@ -440,6 +447,31 @@ func (q *Queries) FindCIFixStampTarget(ctx context.Context, arg FindCIFixStampTa
 		&i.ReleasedWorkerNonce,
 	)
 	return i, err
+}
+
+const hasActiveIssueRunForIID = `-- name: HasActiveIssueRunForIID :one
+SELECT EXISTS (
+    SELECT 1 FROM runs
+    WHERE repo_id = $1::uuid AND kind = 'issue' AND issue_iid = $2::bigint
+      AND status NOT IN ('completed', 'failed', 'cancelled')
+) AS active
+`
+
+type HasActiveIssueRunForIIDParams struct {
+	RepoID   uuid.UUID `json:"repo_id"`
+	IssueIid int64     `json:"issue_iid"`
+}
+
+// Whether issue N has an active ISSUE-kind run (issue #1626). Used by the ci_fix and
+// mr_rework create paths when their ref is exactly agent/issue-N, inside the create
+// transaction after LockRunBranch: an issue run's runs.branch stays NULL until its
+// terminal report, so CountActiveRunsWithBranch cannot see it and issue_iid is the
+// only key that can. Scoped to kind='issue' (the kind that works agent/issue-N).
+func (q *Queries) HasActiveIssueRunForIID(ctx context.Context, arg HasActiveIssueRunForIIDParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasActiveIssueRunForIID, arg.RepoID, arg.IssueIid)
+	var active bool
+	err := row.Scan(&active)
+	return active, err
 }
 
 const stampFixVerdict = `-- name: StampFixVerdict :execrows

@@ -780,9 +780,10 @@ export interface ClaimConfig {
   /** PRD #1226 M3 (D1/D2): the completion-interlock discriminator. Non-nil (value 1 today)
    *  ⇒ this run is INTERLOCKED and the worker must run the structural completion protocol
    *  (checkpoint-first same-lead attempt loop, permit before PR). Read straight off
-   *  runs.completion_contract_version, stamped by the rollout switch at CreateRun (M1). This is
-   *  WORKER-ONLY claim config — deliberately NOT on the web RunDTO. Absent (a legacy run, or
-   *  rollout OFF) ⇒ the worker runs the legacy path, byte-identical to today. */
+   *  runs.completion_contract_version, stamped at CreateRun (M1) when the completion-interlock
+   *  switch is on (default on since #1626) for an unseeded Claude-harness run. This is
+   *  WORKER-ONLY claim config — deliberately NOT on the web RunDTO. Absent (a legacy, seeded or
+   *  Codex run, or the switch off) ⇒ the worker runs the legacy path, byte-identical to today. */
   completion_contract_version?: number;
   /** PRD #1226 M4 (D5): the FROZEN structural completion-contract revision, read straight off
    *  runs.contract_revision. The worker echoes it VERBATIM in its completion permit request so
@@ -1157,7 +1158,9 @@ export interface ClaimResponse {
   /** The FROZEN milestone list for this run (PRD #122 M1, Decision 11), carried so a
    *  future resume's planning prompt can name what is already committed. Null/absent
    *  when the approved plan had no milestones. Additive + optional; nothing consumes
-   *  it in M1 — the field is declared now so the wire contract is complete. */
+   *  it in M1 — the field is declared now so the wire contract is complete.
+   *  Issue #1626: on a `resume_phase: "awaiting_approval"` claim (nothing frozen yet) it
+   *  carries the unapproved CANDIDATE list instead, so the re-presented gate re-sends it. */
   milestones?: Milestone[] | null;
   /** Whether this run's plan is already approved (PRD #35 Decision 6b), derived
    *  SERVER-side as "a consumed approve_plan input exists for the run, OR the run is
@@ -2200,6 +2203,15 @@ export interface StateAck {
    *  worker's current budget unchanged. */
   budgetMaxIterations?: number;
   budgetWallSeconds?: number;
+  /** Issue #1626: the run's FROZEN completion-contract revision, read off the SAME
+   *  `{run: RunDTO}` body as `status` (the DTO's `completion_revision` field). It is the
+   *  mechanism by which a FRESH interlocked run — whose contract froze mid-run at plan approval
+   *  or on the autopilot plan report, AFTER its claim was issued without one — learns the
+   *  revision its completion permit must echo (a resume gets it on the claim config's
+   *  `contract_revision` instead). An integer >= 1 only; null/absent (older server, a
+   *  legacy/never-frozen run, an unparseable body, a non-integer value) ⇒ undefined = "no
+   *  revision update". */
+  contractRevision?: number;
   /** PRD #1189 M1 (D6): the run's TOTAL wall-clock budget the server serves — the DTO's
    *  `budget_total_seconds` field, COALESCE(budget_wall_seconds, RUN_TIMEOUT) +
    *  budget_extension_seconds. When present it is the authoritative served wall and the

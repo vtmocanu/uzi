@@ -205,6 +205,8 @@ type ClaimPayload struct {
 	// worker carries the immutable list. omitempty because a run with no frozen list
 	// (never proposed one, or is not an issue run) keeps today's claim wire shape
 	// exactly — an old worker ignores the key. Nil when the run has none.
+	// Issue #1626: on a ResumePhase=="awaiting_approval" claim (no frozen list yet) it carries
+	// the unapproved CANDIDATE instead, so the re-presented gate re-sends the same breakdown.
 	Milestones []Milestone `json:"milestones,omitempty"`
 
 	// TargetRunID is the run a JUDGE run reviews (PRD #46 Decision 1). Present only
@@ -583,9 +585,9 @@ type ClaimConfig struct {
 	// CompletionContractVersion is the completion-interlock discriminator (PRD #1226 M3,
 	// D1/D2): non-nil (value 1 today) when this run is INTERLOCKED, so the worker knows to
 	// run the structural completion protocol (checkpoint-first same-lead attempt loop, permit
-	// before PR). Read straight off runs.completion_contract_version, which the rollout switch
-	// stamps in CreateRun (M1). This is WORKER-ONLY claim config — deliberately NOT on the web
-	// RunDTO — so adding it touches no api-contract fixture. nil (a legacy run, or rollout OFF)
+	// before PR). Read straight off runs.completion_contract_version, which CreateRun stamps (M1)
+	// when the completion-interlock switch is on (default on, #1626) for an unseeded Claude run. This is WORKER-ONLY claim config — deliberately NOT on the web
+	// RunDTO — so adding it touches no api-contract fixture. nil (a non-interlocked run)
 	// ⇒ omitempty keeps the claim byte-identical to today's and the worker runs the legacy
 	// path; an un-upgraded worker ignores the key (but the M1/M2 hard claim clause prevents an
 	// incapable worker from claiming an interlocked run in the first place).

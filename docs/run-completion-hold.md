@@ -12,11 +12,29 @@ lead actually declared complete before it can open a closing pull/merge
 request. This page explains what a hold looks like when the interlock catches
 something, and what you can do about it.
 
-This is a **rollout feature, not yet active for every run**. It is gated by an
-instance switch (`completion_interlock_rollout`), off by default. Until an
-operator turns it on, an issue run behaves exactly as before this page
-describes anything — nothing here applies retroactively to a run already in
-flight.
+This is **on by default for a new, unseeded issue run using the Claude
+harness**. An admin can turn it off from **Admin → Instance settings →
+Completion check** (`completion_interlock_rollout`); an explicit off is the only way to
+disable it. A **Codex** issue run is not checked yet — the Codex executor
+doesn't run the completion-attempt loop this page describes, so the switch
+has no effect on one, regardless of its setting. A run started from a
+**seeded plan** (`uzi run create --plan-file`) is never checked either: it
+never goes through the plan-bearing report this interlock hooks into, so it
+is never interlocked in the first place. And a run created before this
+default changed is unaffected either way: the switch is read once, when the
+run is created, never retroactively against a run already in flight.
+
+This default also gates who can pick up the run: a worker must advertise the
+`completion_interlock_v1` protocol capability to claim a stamped run at all.
+If none of the run owner's online workers does, the run stays queued, and its
+health reason names it directly: "no online worker implements the completion
+interlock (completion_interlock_v1); provision a capable worker". Upgrade the
+owner's workers to this release to clear it (a worker from v0.83.0 onward can
+claim the run, but an older one than this release may still pause it at
+finalize; see the CHANGELOG). Turning Completion check off does **not**
+release a run already queued this way, since the switch is only read when a
+run is created: the stuck run needs a capable worker, or cancel it and create
+it again.
 
 ## Why a run holds
 

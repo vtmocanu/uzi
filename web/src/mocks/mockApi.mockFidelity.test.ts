@@ -133,6 +133,7 @@ describe("mockApi — F3 updateSettings accepts the nine missing AppSettings key
     await check("health_stall_seconds", { health_stall_seconds: "120" }, "120");
     await check("health_stall_seconds", { health_stall_seconds: "0" }, "0");
     await check("capability_aware_scheduling", { capability_aware_scheduling: "false" }, "false");
+    await check("completion_interlock_rollout", { completion_interlock_rollout: "false" }, "false");
     await check("github_project_sync_enabled", { github_project_sync_enabled: "true" }, "true");
     await check("docker_repo_allowlist", { docker_repo_allowlist: VALID_UUID }, VALID_UUID);
     await check("docker_repo_allowlist", { docker_repo_allowlist: "" }, "");
@@ -145,6 +146,10 @@ describe("mockApi — F3 updateSettings accepts the nine missing AppSettings key
     const api = await reload();
 
     await expect(api.updateSettings({ health_enabled: "yes" })).rejects.toMatchObject({
+      status: 400,
+    });
+    // Issue #1626: the completion interlock switch is a strict bool, not a label.
+    await expect(api.updateSettings({ completion_interlock_rollout: "yes" })).rejects.toMatchObject({
       status: 400,
     });
     await expect(api.updateSettings({ health_stall_seconds: "30" })).rejects.toMatchObject({

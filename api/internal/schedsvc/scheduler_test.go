@@ -1112,6 +1112,100 @@ func TestTickOnceScheduleFiresToStatus(t *testing.T) {
 	}
 }
 
+// TestTickOnceIssueBranchInUseHoldsThenFires (issue #1626): a one-time issue schedule that
+// fires while a ci_fix / mr_rework run holds agent/issue-<iid> must NOT advance (that would
+// mark it fired with no next fire, so the issue run never starts). It is held un-advanced
+// and fires on a later tick once the branch frees up. Recurring issue rows and once sweeps
+// keep the benign, advancing already_running skip.
+func TestTickOnceIssueBranchInUseHoldsThenFires(t *testing.T) {
+	t.Run("once_issue_holds_then_fires", func(t *testing.T) {
+		h := newHarness()
+		s := h.issueSchedule()
+		s.Timing = "once"
+		s.CronExpr = pgtype.Text{} // once carries run_at, not cron
+		h.st.due = []store.RunSchedule{s}
+		h.runs.err = workersvc.ErrBranchInUse
+
+		h.sched.Boot(context.Background())
+
+		if len(h.st.advanceCalls) != 0 {
+			t.Fatalf("branch in use on a once issue row must NOT advance: advance calls = %d, want 0", len(h.st.advanceCalls))
+		}
+		if len(h.st.statusCalls) != 0 {
+			t.Fatalf("branch in use on a once issue row must NOT park: status calls = %d, want 0", len(h.st.statusCalls))
+		}
+		if len(h.runs.autopilot) != 0 {
+			t.Fatalf("no run may be created while the branch is held: autopilot calls = %d, want 0", len(h.runs.autopilot))
+		}
+
+		// The branch frees up; the row is still due (never advanced) and fires next tick.
+		h.runs.err = nil
+		h.sched.Boot(context.Background())
+
+		if len(h.runs.autopilot) != 1 {
+			t.Fatalf("once issue retry: CreateScheduledAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
+		}
+		if len(h.st.advanceCalls) != 1 {
+			t.Fatalf("advance calls = %d, want 1", len(h.st.advanceCalls))
+		}
+		adv := h.st.advanceCalls[0]
+		if adv.Status != "fired" {
+			t.Fatalf("once advance status = %q, want fired", adv.Status)
+		}
+		if adv.NextFireAt.Valid {
+			t.Fatalf("once next_fire_at = %+v, want NULL", adv.NextFireAt)
+		}
+	})
+
+	t.Run("recurring_issue_still_advances", func(t *testing.T) {
+		h := newHarness()
+		h.st.due = []store.RunSchedule{h.issueSchedule()}
+		h.runs.err = workersvc.ErrBranchInUse
+
+		h.sched.Boot(context.Background())
+
+		if len(h.st.advanceCalls) != 1 {
+			t.Fatalf("recurring branch-in-use skip must advance: advance calls = %d, want 1", len(h.st.advanceCalls))
+		}
+		if h.st.advanceCalls[0].Status != "active" {
+			t.Fatalf("recurring advance status = %q, want active", h.st.advanceCalls[0].Status)
+		}
+	})
+
+	t.Run("once_sweep_still_skips_already_running", func(t *testing.T) {
+		// The hold is scoped to Target=="issue": fireSweep folds any createIssueRun error
+		// into fetch_failed, so a once sweep must keep the benign already_running skip.
+		h := newHarness()
+		s := h.sweepSchedule(pgtype.Int4{})
+		s.Timing = "once"
+		s.CronExpr = pgtype.Text{} // once carries run_at, not cron
+		h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 96}}
+		h.st.due = []store.RunSchedule{s}
+		h.runs.err = workersvc.ErrBranchInUse
+
+		h.sched.Boot(context.Background())
+
+		if len(h.st.advanceCalls) != 1 {
+			t.Fatalf("once sweep branch-in-use skip must advance: advance calls = %d, want 1", len(h.st.advanceCalls))
+		}
+		adv := h.st.advanceCalls[0]
+		if adv.Status != "fired" {
+			t.Fatalf("once sweep advance status = %q, want fired", adv.Status)
+		}
+		var lf struct {
+			Skips []struct {
+				Reason string `json:"reason"`
+			} `json:"skips"`
+		}
+		if err := json.Unmarshal(adv.LastFire, &lf); err != nil {
+			t.Fatalf("decode persisted last_fire: %v (raw %s)", err, adv.LastFire)
+		}
+		if len(lf.Skips) != 1 || lf.Skips[0].Reason != string(SkipAlreadyRunning) {
+			t.Fatalf("last_fire skips = %+v, want one already_running (not fetch_failed)", lf.Skips)
+		}
+	})
+}
+
 func TestTickDedupSkipStillAdvances(t *testing.T) {
 	h := newHarness()
 	h.st.activeIssue = true // a prior run for the issue is still live
@@ -1290,6 +1384,9 @@ func TestSkipReasonForErr(t *testing.T) {
 		{workersvc.ErrDescriptionTooLarge, SkipDescriptionTooLarge, true},
 		{workersvc.ErrOpenMRExists, SkipOpenMRExists, true},
 		{workersvc.ErrNoUsableCredential, SkipNoUsableCredential, true},
+		// Issue #1626: an active ci_fix / mr_rework holding agent/issue-<iid> is an active run
+		// working the issue → already_running (benign, advancing), not the transient default.
+		{workersvc.ErrBranchInUse, SkipAlreadyRunning, true},
 		{workersvc.ErrActivePromptExists, "", false},
 		{workersvc.ErrRepoNotFound, "", false},
 		{context.DeadlineExceeded, "", false},
@@ -1321,6 +1418,9 @@ func TestFireIssueSentinelSkips(t *testing.T) {
 		{"active_run", workersvc.ErrActiveRunExists, SkipAlreadyRunning},
 		{"not_eligible", workersvc.ErrNotPRDIssue, SkipNotEligible},
 		{"too_large", workersvc.ErrDescriptionTooLarge, SkipDescriptionTooLarge},
+		// Issue #1626: before the mapping this fell to the transient default, so the schedule
+		// never advanced and re-fired (and re-hit the forge) every tick.
+		{"branch_in_use", workersvc.ErrBranchInUse, SkipAlreadyRunning},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -1393,6 +1493,34 @@ func TestRunNowDoesNotPersistLastFire(t *testing.T) {
 	if len(h.st.advanceCalls) != 0 {
 		t.Fatalf("RunNow must NOT advance (and so must not persist last_fire): advance calls = %d, want 0", len(h.st.advanceCalls))
 	}
+}
+
+// TestRunNowOnceIssueBranchInUseSkips (issue #1626): a once issue schedule refused with
+// ErrBranchInUse is a transient hold on the tick path, but a manual RunNow still answers
+// with a benign already_running skip (202), not an error the handler maps to 502.
+func TestRunNowOnceIssueBranchInUseSkips(t *testing.T) {
+	h := newHarness()
+	s := h.issueSchedule()
+	s.Timing = "once"
+	s.CronExpr = pgtype.Text{}
+	h.runs.err = workersvc.ErrBranchInUse
+	out, err := h.sched.RunNow(context.Background(), s)
+	if err != nil {
+		t.Fatalf("RunNow on a held once issue must not surface an error, got %v", err)
+	}
+	if out.Matched != 1 || len(out.Started) != 0 || len(out.Skips) != 1 {
+		t.Fatalf("outcome = %+v, want Matched:1 Started:0 Skips:1", out)
+	}
+	if out.Skips[0].Reason != SkipAlreadyRunning {
+		t.Fatalf("reason = %q, want already_running", out.Skips[0].Reason)
+	}
+	if out.Skips[0].IssueIID == nil || *out.Skips[0].IssueIID != 7 {
+		t.Fatalf("skip IssueIID = %v, want 7", out.Skips[0].IssueIID)
+	}
+	if len(h.st.advanceCalls) != 0 {
+		t.Fatalf("RunNow must NOT advance: advance calls = %d, want 0", len(h.st.advanceCalls))
+	}
+	assertBalances(t, out)
 }
 
 // TestFireIssueSuccessStarted: a successful issue fire yields one Started pairing the issue
@@ -1547,6 +1675,22 @@ func TestFireSweepPerCandidateBuckets(t *testing.T) {
 		}
 		if out.Skips[0].Title != "Broken login" {
 			t.Fatalf("sweep skip Title = %q, want the fetched issue title", out.Skips[0].Title)
+		}
+		assertBalances(t, out)
+	})
+
+	t.Run("branch_in_use_is_already_running_not_fetch_failed", func(t *testing.T) {
+		// Issue #1626: an active ci_fix / mr_rework on agent/issue-<iid> refuses the create with
+		// ErrBranchInUse. Before the mapping the sweep recorded it as fetch_failed.
+		h := newHarness()
+		h.st.sweepRows = oneRow
+		h.runs.err = workersvc.ErrBranchInUse
+		out, err := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{}))
+		if err != nil {
+			t.Fatalf("sweep must not abort, got %v", err)
+		}
+		if out.Matched != 1 || len(out.Skips) != 1 || out.Skips[0].Reason != SkipAlreadyRunning {
+			t.Fatalf("outcome = %+v, want one already_running skip", out)
 		}
 		assertBalances(t, out)
 	})

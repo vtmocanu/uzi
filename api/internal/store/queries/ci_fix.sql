@@ -38,22 +38,41 @@ RETURNING *;
 
 -- name: CountActiveRunsWithBranch :one
 -- Cross-kind same-branch exclusion for the Fix CI trigger (PRD #6): count active
--- runs of ANY kind whose branch equals a ref. Refuses a fix on a ref an issue run
--- is already working (they would collide in the same worktree). branch is NULL
--- until the worker creates the worktree, so this catches the already-progressed
--- case; git's "branch already checked out" backstops the race window.
+-- runs of ANY kind whose branch equals a ref. Only a run whose runs.branch is
+-- already set can match, which in practice means a task run (its branch is written
+-- at creation, task.sql). It does NOT see an active ISSUE run: an issue run's
+-- runs.branch is written only by its terminal report (SetRunCompleted, and
+-- ReconcileRunMR beside it), so it stays NULL for the run's whole active life. Keep
+-- it that way: ListWatchedRunRefsForRepo and other readers treat a non-NULL branch
+-- as a finished run. The issue-run half of the exclusion is HasActiveIssueRunForIID
+-- below, keyed on issue_iid (issue #1626).
 SELECT count(*) FROM runs
 WHERE repo_id = @repo_id::uuid AND branch = @branch
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
--- name: CountActiveCIFixForRef :one
--- The reverse cross-kind check, used by the issue-run create path: count active
--- ci_fix runs whose pipeline_ref equals the branch an issue run will use
--- (agent/issue-N). Refuses starting an issue run onto a branch an active ci_fix is
--- fixing.
+-- name: CountActiveBranchRunsForRef :one
+-- The reverse cross-kind check, used by the issue-run create path (issue #1626):
+-- count active branch runs, ci_fix AND mr_rework, whose pipeline_ref equals the
+-- branch an issue run will use (agent/issue-N). An mr_rework's pipeline_ref is the
+-- agent branch itself; a ci_fix's is the failed ref, which for an agent MR is that
+-- same branch. Refuses starting an issue run onto a branch either kind is working.
+-- Run once as a cheap pre-transaction fast-fail and again, authoritatively, inside
+-- the create transaction after LockRunBranch (see store.RunBranchLockClass).
 SELECT count(*) FROM runs
-WHERE repo_id = @repo_id::uuid AND kind = 'ci_fix' AND pipeline_ref = @pipeline_ref
+WHERE repo_id = @repo_id::uuid AND kind IN ('ci_fix', 'mr_rework') AND pipeline_ref = @pipeline_ref
   AND status NOT IN ('completed', 'failed', 'cancelled');
+
+-- name: HasActiveIssueRunForIID :one
+-- Whether issue N has an active ISSUE-kind run (issue #1626). Used by the ci_fix and
+-- mr_rework create paths when their ref is exactly agent/issue-N, inside the create
+-- transaction after LockRunBranch: an issue run's runs.branch stays NULL until its
+-- terminal report, so CountActiveRunsWithBranch cannot see it and issue_iid is the
+-- only key that can. Scoped to kind='issue' (the kind that works agent/issue-N).
+SELECT EXISTS (
+    SELECT 1 FROM runs
+    WHERE repo_id = @repo_id::uuid AND kind = 'issue' AND issue_iid = @issue_iid::bigint
+      AND status NOT IN ('completed', 'failed', 'cancelled')
+) AS active;
 
 -- name: FindCIFixStampTarget :one
 -- Verification stamp-target selection (PRD #6). The ci_fix run whose fix branch is

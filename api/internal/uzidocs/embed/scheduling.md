@@ -301,8 +301,12 @@ exceed `max_issues` once backfill walks past a skip), which ones
   eligibility changed between candidate selection and run creation — or on
   a pinned-issue fire, where no upfront filter applies. It's benign, and
   the schedule advances normally.
-- `already_running` — an active run already exists for that issue (or,
-  for the schedule itself, a dedup at fire time).
+- `already_running` — an active run already exists for that issue, or a
+  CI-fix run (or, once its MR has closed, an MR-rework run) is working its
+  branch (or, for the schedule itself, a dedup at fire time). For a
+  one-time issue schedule, a CI-fix or MR-rework run on the branch holds
+  the fire instead: no run starts and nothing is recorded, the schedule
+  stays active and due, and it fires once that run releases the branch.
 - `description_too_large` — the composed run instruction (issue body
   plus any [guidance](#guidance)) exceeds the size limit.
 - `fetch_failed` — a transient forge or database error while checking
@@ -578,7 +582,7 @@ It claims as soon as you start, or already have, a capable worker online.
 With this on, uzi instead spins up a throwaway worker just for that one run.
 
 **Turning it on** takes two switches, both off by default: an admin enables
-the feature instance-wide from **Admin → Settings**, then you opt in from
+the feature instance-wide from **Admin → Instance settings**, then you opt in from
 your own **Workers page** (Settings → Workers), in the hosted-worker
 section — that per-user toggle only appears there once the admin switch is
 on. A per-user cap also bounds how many throwaway workers you can have

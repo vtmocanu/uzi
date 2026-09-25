@@ -254,14 +254,17 @@ func (c *Cache) CapabilityAwareScheduling(ctx context.Context) (bool, error) {
 	return c.boolSetting(ctx, KeyCapabilityAwareScheduling)
 }
 
-// CompletionInterlockRollout reports whether the completion-interlock rollout switch is
-// enabled instance-wide (PRD #1226 M1, D1). Stored as "true"/"false"; any other value
-// falls back to the compiled-in default (FALSE) — the same junk-tolerance as the other
-// bool accessors, but defaulting OFF, the deliberate opposite of CapabilityAwareScheduling.
-// The createRun path threads the result in as the completion_contract_version stamp gate:
-// a boolSetting read error propagates alongside the value so the caller can treat any read
-// failure as OFF (fail-safe — this gate must not accidentally engage a still-rolling-out
-// feature), rather than the fail-open the capability-aware path takes.
+// CompletionInterlockRollout reports whether the completion-interlock switch is enabled
+// instance-wide (PRD #1226 M1, D1; #1626). Stored as "true"/"false"; any other value
+// falls back to the compiled-in default (TRUE), the same junk-tolerance and the same
+// default-on posture as CapabilityAwareScheduling. It is an admin kill-switch (Admin ->
+// Instance settings -> Completion check): an explicit "false" row keeps it off. The
+// createRun path threads the result in as the completion_contract_version stamp gate
+// (Claude-harness, unseeded runs only). A boolSetting read error propagates alongside the
+// value: on a cold read error (no valid cache snapshot) the value is the default (true)
+// with a non-nil error, and the service's completionInterlockOn discards any errored
+// value, so no run is stamped; a failed refresh with a valid cache returns the cached
+// value with a nil error (snapshot's stale-on-error).
 func (c *Cache) CompletionInterlockRollout(ctx context.Context) (bool, error) {
 	return c.boolSetting(ctx, KeyCompletionInterlockRollout)
 }

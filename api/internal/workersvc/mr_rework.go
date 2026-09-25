@@ -58,6 +58,11 @@ var ErrActiveMRReworkExists = errors.New("an active MR-rework run already exists
 // ErrActiveMRReworkExists) — previously that path was shadowed by the broader predicate,
 // which returned ErrBranchInUse for a same-MR duplicate.
 //
+// Before that insert, inside the same transaction, the create takes the run-branch lock
+// and refuses (ErrBranchInUse) while an issue run for N is active on agent/issue-N
+// (issue #1626): the issue run writes no pipeline_ref and no runs.branch while active, so
+// neither the WHERE NOT EXISTS nor the spanning index can see it.
+//
 // The detector swallows all of these and retries next tick, exactly as ci-autofix does.
 func (s *Service) CreateAutoMRReworkRun(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, snapshot *ReviewCommentsSnapshot) (store.Run, error) {
 	return s.createMRReworkRun(ctx, userID, repoID, ref, mrIID, sourceRunID, title, description, snapshot, "mr_rework", nil)
@@ -137,6 +142,26 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 	sourceHarness := Harness(sourceRun.Harness)
 
 	run, err := s.createRunResolved(ctx, userID, &sourceHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		// Issue #1626: serialize against an issue-run create on the same agent branch. The
+		// run-branch lock is the closure's first statement (same (repo, ref) key the issue run
+		// for N takes on agent/issue-N, store.RunBranchLockClass); the check below is a new
+		// READ COMMITTED statement, so a waiter sees the holder's committed issue run. An
+		// active issue run for N keeps runs.branch NULL until its terminal report, so issue_iid
+		// is the only key that sees it; a non-canonical ref is not mapped
+		// (issueIIDFromAgentBranch). The returned ErrBranchInUse is a plain sentinel and passes
+		// straight through the error mapping after this call.
+		if err := q.LockRunBranch(ctx, repoID, ref); err != nil {
+			return store.Run{}, err
+		}
+		if iid, ok := issueIIDFromAgentBranch(ref); ok {
+			busy, err := q.HasActiveIssueRunForIID(ctx, store.HasActiveIssueRunForIIDParams{RepoID: repoID, IssueIid: iid})
+			if err != nil {
+				return store.Run{}, err
+			}
+			if busy {
+				return store.Run{}, ErrBranchInUse
+			}
+		}
 		if highWater == nil {
 			// Automatic path: the poller advances the ledger separately in its proceed step.
 			// PRD #1202: trigger_source is 'mr_rework' from the poller detector. kind stays

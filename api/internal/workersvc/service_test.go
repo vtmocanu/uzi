@@ -516,7 +516,8 @@ type fakeStore struct {
 	taskReviewFindings     []store.TaskReviewFinding
 	taskReviewFindingsErr  error
 	activeBranchRuns       int64 // CountActiveRunsWithBranch
-	activeCIFixRuns        int64 // CountActiveCIFixForRef
+	activeBranchRefRuns    int64 // CountActiveBranchRunsForRef
+	activeIssueRunForIID   bool  // HasActiveIssueRunForIID
 
 	// Create worker.
 	createWorkerResult store.Worker
@@ -1601,9 +1602,15 @@ func (f *fakeStore) ListTaskReviewFindings(context.Context, uuid.UUID) ([]store.
 func (f *fakeStore) CountActiveRunsWithBranch(context.Context, store.CountActiveRunsWithBranchParams) (int64, error) {
 	return f.activeBranchRuns, nil
 }
-func (f *fakeStore) CountActiveCIFixForRef(context.Context, store.CountActiveCIFixForRefParams) (int64, error) {
-	return f.activeCIFixRuns, nil
+func (f *fakeStore) CountActiveBranchRunsForRef(context.Context, store.CountActiveBranchRunsForRefParams) (int64, error) {
+	return f.activeBranchRefRuns, nil
 }
+func (f *fakeStore) HasActiveIssueRunForIID(context.Context, store.HasActiveIssueRunForIIDParams) (bool, error) {
+	return f.activeIssueRunForIID, nil
+}
+
+// LockRunBranch is a no-op: the in-memory fake has no transaction to serialize (issue #1626).
+func (f *fakeStore) LockRunBranch(context.Context, uuid.UUID, string) error { return nil }
 func (f *fakeStore) CreateWorker(_ context.Context, arg store.CreateWorkerParams) (store.Worker, error) {
 	f.createWorkerParams = &arg
 	return f.createWorkerResult, nil

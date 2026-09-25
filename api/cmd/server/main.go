@@ -534,9 +534,9 @@ func run() error {
 
 	// Completion-interlock rollout switch (PRD #1226 M1, D1): createRun reads it from the
 	// same settings cache to decide whether to stamp completion_contract_version=1 on a new
-	// issue run, so an admin flip takes effect within the cache TTL. Default OFF and
-	// FAIL-SAFE OFF — new runs stay legacy until the maintainer flips it on after the API
-	// and a capable worker image are deployed.
+	// issue run, so an admin flip takes effect within the cache TTL. Default ON for
+	// Claude-harness issue runs (issue #1626; Codex and seeded runs stay legacy); an explicit
+	// "false" is the admin kill-switch, and a cold read error still creates a legacy run.
 	wsvc.SetCompletionInterlockSettings(settingsCache)
 
 	// Completion-interlock permit transaction (PRD #1226 M2, D4): the permit-gated completion
@@ -1738,7 +1738,7 @@ func startRunCardMessage(err error) string {
 	case errors.Is(err, workersvc.ErrActiveRunExists):
 		return "A run is already in progress for this issue."
 	case errors.Is(err, workersvc.ErrBranchInUse):
-		return "A CI-fix run is already working this issue's branch — cancel it first."
+		return "A CI-fix or MR-rework run is already working this issue's branch — cancel it first."
 	case errors.Is(err, workersvc.ErrDescriptionTooLarge):
 		return "That issue's description is too large to run."
 	case errors.Is(err, workersvc.ErrForgeIssueRead):

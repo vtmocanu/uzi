@@ -675,7 +675,7 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 	// snapshot read just above (so it matches what the freeze reads a line later), falling
 	// back to the run snapshot if that read failed. The query still guards the assignment
 	// (freezes once, only when contract IS NULL), so a re-approve never re-freezes. A
-	// legacy/rollout-off run passes NULL and stays legacy. A build error is best-effort:
+	// non-interlocked run passes NULL and stays legacy. A build error is best-effort:
 	// log and pass NULL rather than fail the human approve (mirrors the #260 instrumentation).
 	var completionContract []byte
 	if run.CompletionContractVersion.Valid && len(run.CompletionContract) == 0 {
@@ -719,10 +719,12 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 	// live instant. Approves are human-gated and rare, so this logs unconditionally. The
 	// pathological signature is the #260 bug SHAPE specifically — a candidate WAS present at
 	// the pre-read yet frozen came out NULL after the freeze — raised to Warn with a stable
-	// signature field for alerting. A 0-milestone run correctly freezes NULL from a NULL
+	// signature field for alerting. A 0-milestone LEGACY run correctly freezes NULL from a NULL
 	// candidate (see CreateApprovePlanInput's own comment), so it must NOT trip the signature,
 	// or every no-milestone approve would drown the real signal; hence the before-candidate
-	// guard, not a bare after-frozen-empty test.
+	// guard, not a bare after-frozen-empty test. (Issue #1626: a 0-milestone INTERLOCKED run's
+	// candidate is the explicit `[]` (planMilestonesParam), which freezes `[]`: non-empty bytes
+	// on both sides, so it does not trip the signature either.)
 	logArgs := []any{
 		"run_id", run.ID,
 		"before_frozen", string(before.MilestonesFrozen),

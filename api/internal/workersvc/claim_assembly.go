@@ -436,6 +436,21 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// worker just cannot correlate a buffered approve_plan to a specific plan revision.
 	var resumePlanSeq int64
 	if resumePhase == "awaiting_approval" {
+		// Issue #1626 (B1): a gate resume re-presents the SUBMITTED plan, whose milestones are
+		// still only the CANDIDATE (milestones_frozen is NULL until approval). Deliver that
+		// candidate so the worker re-sends the same breakdown with the re-presented plan instead
+		// of a milestone-less report. Never overrides a frozen list; a malformed candidate
+		// degrades to none, like the frozen decode above (the server's planMilestonesParam
+		// guard keeps the stored candidate either way). Gated on an INTERLOCKED run
+		// (completion_contract_version stamped): a legacy run's claim stays byte-identical to
+		// before the interlock existed.
+		if len(milestones) == 0 && run.CompletionContractVersion.Valid {
+			if cand, cerr := DecodeMilestones(run.MilestonesCandidate); cerr != nil {
+				slog.Error("workersvc: decode run milestone candidate", "run_id", run.ID, "error", cerr)
+			} else {
+				milestones = cand
+			}
+		}
 		if seq, err := s.q.LatestPlanSeqForRun(ctx, run.ID); err != nil {
 			slog.Warn("workersvc: latest plan seq for resume", "run_id", run.ID, "error", err)
 		} else {
@@ -621,7 +636,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			CIConfigPaths: run.CiConfigPaths,
 			// PRD #1226 M3 (D1/D2): the completion-interlock discriminator, read straight off
 			// runs.completion_contract_version. Non-nil ⇒ the worker runs the structural
-			// completion protocol; nil (legacy run / rollout OFF) ⇒ omitted, legacy path. This
+			// completion protocol; nil (non-interlocked run) ⇒ omitted, legacy path. This
 			// is WORKER-ONLY claim config, NOT the web RunDTO, so it touches no api-contract fixture.
 			CompletionContractVersion: intPtr(run.CompletionContractVersion),
 			// PRD #1226 M4 (D5): the frozen structural contract revision, read straight off

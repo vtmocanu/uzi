@@ -84,7 +84,7 @@ func pauseRequestedRule(pauseMode string, frozenLen, completedLen, afterCount in
 // D8): the one derived label the web and CLI both render, so the two surfaces cannot
 // disagree about which of D8's three states an interlocked run is in. Like pauseRequestedRule
 // it lives in exactly one place and one test table.
-//   - not interlocked → "" (a legacy / rollout-OFF run has no completion phase).
+//   - not interlocked → "" (a legacy / non-interlocked run has no completion phase).
 //   - held ("completion_blocked") → "blocked" (takes precedence over the running states below).
 //   - parked in the LIVE completion-question window (awaiting_input, interlocked, with the
 //     dedicated completion-question marker set, before the hold so hold_reason is still empty) →

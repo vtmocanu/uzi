@@ -492,7 +492,11 @@ type Store interface {
 	GetTaskReviewForTarget(ctx context.Context, targetRunID uuid.UUID) (store.TaskReview, error)
 	ListTaskReviewFindings(ctx context.Context, reviewID uuid.UUID) ([]store.TaskReviewFinding, error)
 	CountActiveRunsWithBranch(ctx context.Context, arg store.CountActiveRunsWithBranchParams) (int64, error)
-	CountActiveCIFixForRef(ctx context.Context, arg store.CountActiveCIFixForRefParams) (int64, error)
+	CountActiveBranchRunsForRef(ctx context.Context, arg store.CountActiveBranchRunsForRefParams) (int64, error)
+	HasActiveIssueRunForIID(ctx context.Context, arg store.HasActiveIssueRunForIIDParams) (bool, error)
+	// LockRunBranch takes the per-(repo, branch) advisory lock that serializes issue /
+	// mr_rework / ci_fix creation on one agent branch (issue #1626, store.RunBranchLockClass).
+	LockRunBranch(ctx context.Context, repoID uuid.UUID, branch string) error
 	GetRunByIDForUser(ctx context.Context, arg store.GetRunByIDForUserParams) (store.Run, error)
 	GetRunByID(ctx context.Context, id uuid.UUID) (store.Run, error)
 	// GetRunMilestoneFreezeSnapshot reads the live milestone freeze state at the approve
@@ -1513,13 +1517,13 @@ type CapabilityScheduleReader interface {
 }
 
 // CompletionInterlockReader is the narrow settings view createRun reads for the
-// completion-interlock rollout switch (PRD #1226 M1, D1). *settings.Cache satisfies it.
+// completion-interlock switch (PRD #1226 M1, D1; #1626). *settings.Cache satisfies it.
 // Kept its own interface (interface segregation, like CapabilityScheduleReader) so a
-// test exercises only what it uses. Optional (nil-safe): a nil reader — or a read error
-// — DEFAULTS the flag OFF (the DELIBERATE opposite of CapabilityScheduleReader's
-// default-on), so a new run is interlocked ONLY on an affirmative "true". This gate must
-// not accidentally engage a still-rolling-out feature, so both the unconfigured and the
-// unreadable case fail safe to legacy (unstamped) runs.
+// test exercises only what it uses. The SETTING defaults ON (no row = on; an explicit
+// "false" row is the admin kill-switch), but this reader is optional and
+// fails safe: a nil reader, or any read error (settings.Cache returns one only on a cold
+// read with no valid cached snapshot), makes completionInterlockOn false, so the run is
+// created legacy (unstamped). Existing tests construct the service without it.
 type CompletionInterlockReader interface {
 	CompletionInterlockRollout(ctx context.Context) (bool, error)
 }
@@ -1581,12 +1585,12 @@ type Service struct {
 	// the flag DEFAULTS ON, so tests and deployments without a settings cache route
 	// capability-aware exactly as a live instance whose admin left the default in place.
 	capabilitySettings CapabilityScheduleReader
-	// completionInterlock reads the completion-interlock rollout switch createRun consults
-	// to decide whether to stamp completion_contract_version=1 on a new issue run (PRD
-	// #1226 M1, D1). Optional (nil-safe); set via SetCompletionInterlockSettings with the
-	// same settings cache the HTTP handlers hold. Nil ⇒ the flag DEFAULTS OFF, so tests and
-	// deployments without a settings cache create legacy (unstamped) runs exactly as before
-	// — the fail-safe direction, opposite the capability-aware default-on.
+	// completionInterlock reads the completion-interlock switch createRun consults to decide
+	// whether to stamp completion_contract_version=1 on a new unseeded Claude-harness issue
+	// run (PRD #1226 M1, D1; #1626). Optional (nil-safe); set via
+	// SetCompletionInterlockSettings with the same settings cache the HTTP handlers hold. The
+	// setting defaults ON, but a nil reader (tests, deployments without a settings cache) or a
+	// read error makes completionInterlockOn false, so such runs are created legacy (unstamped).
 	completionInterlock CompletionInterlockReader
 	// persistFail counts consecutive AppendMessages failures per run (PRD #108 M4),
 	// the signal a persistence wedge cannot suppress because the wedge IS the event
@@ -3359,6 +3363,24 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			if strings.TrimSpace(clean) == "" {
 				return store.Run{}, false, fmt.Errorf("%w: running report carries a blank plan_md", ErrInvalidState)
 			}
+			// Issue #1626: the plan write and SetRunRunning below must commit or fail TOGETHER.
+			// planMilestonesParam reads a stored plan_md beside a NULL candidate as an earlier
+			// REJECTED list (sticky: nothing freezes), so a plan_md that committed alone, with
+			// SetRunRunning then failing, would turn the worker's retry of this same report into
+			// a contract_not_frozen hold. A fenced report already runs both through fenceTx; an
+			// unfenced one (nil claim_generation) opens a plain tx here, with no FOR UPDATE and
+			// no generation check, so only atomicity changes, not the legacy fence semantics.
+			// The post-switch commit and the deferred Rollback own it from here. A nil
+			// txBeginner (unit tests; prod wires SetTxBeginner in cmd/server/main.go) keeps the
+			// previous non-atomic pair.
+			if fenceTx == nil && s.txBeginner != nil {
+				tx, berr := s.txBeginner.Begin(ctx)
+				if berr != nil {
+					return store.Run{}, false, berr
+				}
+				fenceTx = tx
+				q = store.New(tx)
+			}
 			var planRows int64
 			planRows, err = q.SetRunAutopilotPlan(ctx, store.SetRunAutopilotPlanParams{
 				PlanMd:   planBody,
@@ -3373,6 +3395,8 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				// Re-read after the guarded write so the worker receives the authoritative
 				// state through the ordinary applied=false / 409 contract. The initial
 				// ownership snapshot predates the race (issue #1197, verified 2026-09-08).
+				// The read goes to the pool, outside fenceTx; this tx has written nothing yet
+				// (the 0-row UPDATE matched no row), so the read misses no write of ours.
 				current, readErr := s.runOwnedByWorker(ctx, runID, wkr)
 				if readErr != nil {
 					return store.Run{}, false, readErr
@@ -3444,7 +3468,8 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// PRD #122 M1: the CANDIDATE milestone list rides the pre-approval report.
 		// milestonesParam validates + kind-gates it (Decision 12/13) and returns NULL
 		// when the list is absent, rejected, or from a non-issue run — the query writes
-		// that directly, clearing the candidate (Decision 2: replaced each round).
+		// that directly, clearing the candidate (Decision 2: replaced each round). An
+		// interlocked run goes through planMilestonesParam instead (issue #1626, below).
 		//
 		// PRD #84 M4 4b: the plan-time INFERRED requirement set also rides this report.
 		// Each array is a tri-state pointer — absent (nil) means "no change", and the
@@ -3457,7 +3482,16 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		inferredCaps, inferredTools, sizeClass := inferredRequirementParams(req)
 		rows, err = q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
 			PlanMd: stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
-			MilestonesCandidate:  milestonesParam(owned.Kind, req.Milestones),
+			// Issue #1626: an interlocked run's FIRST plan-bearing report with no milestones is the
+			// explicit `[]` (planMilestonesParam), so the approve freeze builds a criteria:[]
+			// contract. `owned` predates this report's plan_md write, which is what lets
+			// planMilestonesParam tell a first report (stored plan_md NULL) from a later one. A
+			// milestone-less re-presentation of the SAME plan (a gate reclaim) keeps a stored
+			// candidate unchanged, a revise round with a DIFFERENT plan and no milestones resets a
+			// non-empty candidate to `[]` (no superseded criteria freeze), and after a REJECTED list
+			// (stored candidate NULL beside a stored plan_md) it stays NULL: nothing freezes and the
+			// run holds at finalize.
+			MilestonesCandidate:  planMilestonesParam(owned, req.PlanMd, req.Milestones),
 			InferredCapabilities: inferredCaps,
 			InferredTools:        inferredTools,
 			SizeClass:            sizeClass,
@@ -4019,7 +4053,16 @@ func (s *Service) runningStateParams(ctx context.Context, run store.Run, req Sta
 	// never overwrites a frozen list and never disturbs the heartbeat. Unlike the
 	// RepoAgents/AgentSelection paths below, a bad milestone list is DROPPED rather
 	// than failing the report — additive-optional.
-	p.MilestonesFrozen = milestonesParam(run.Kind, req.Milestones)
+	//
+	// Issue #1626: for an INTERLOCKED run, the FIRST plan-bearing report (plan_md present) with
+	// no milestones freezes the explicit `[]` (planMilestonesParam), so the contract freeze below
+	// and in SetRunRunning lands criteria:[]. The claim-time report carries no plan_md and
+	// stays NULL, keeping the milestone-source guard intact. `run` is the SetState snapshot taken
+	// BEFORE SetRunAutopilotPlan stored this report's plan_md, so the first plan report sees a
+	// NULL stored plan_md and infers `[]`; a later plan report after a REJECTED list (frozen still
+	// NULL, plan_md already stored) stays NULL, so a rejection is never turned into a vacuous
+	// empty contract.
+	p.MilestonesFrozen = planMilestonesParam(run, req.PlanMd, req.Milestones)
 
 	// PRD #122 M2 (Decision 3/12): the live progress sets. Validated + membership-checked
 	// against the run's FROZEN list and kind-gated (progressParams); a bad or non-issue
@@ -5363,20 +5406,6 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		!isAssignedToBot(issue.AssigneeIds, row.BotForgeUserID) {
 		return store.Run{}, ErrNotPRDIssue
 	}
-	// Cross-kind same-branch exclusion (PRD #6): this issue run will use the
-	// worktree agent/issue-<iid>; refuse if an active ci_fix run is already fixing
-	// that ref. The reverse check lives in CreateCIFixRun; the two partial unique
-	// indexes are disjoint and cannot express this cross-kind rule.
-	fixing, err := s.q.CountActiveCIFixForRef(ctx, store.CountActiveCIFixForRefParams{
-		RepoID:      repoID,
-		PipelineRef: pgtype.Text{String: agentIssueBranch(issueIID), Valid: true},
-	})
-	if err != nil {
-		return store.Run{}, err
-	}
-	if fixing > 0 {
-		return store.Run{}, ErrBranchInUse
-	}
 	// Manual-path dedup pre-check (PRD #754 M4 Decision 8). The uq_runs_one_active_per_issue
 	// index — the ONLY dedup the manual/board/Slack path had (it relies solely on the index
 	// catching 23505 → ErrActiveRunExists below) — now EXCLUDES pool_wait so a held run is
@@ -5419,6 +5448,29 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			return store.Run{}, &OpenMRExistsError{IssueIID: issueIID, MRIID: mrIID.Int64}
 		}
 	}
+	// Cross-kind same-branch exclusion (PRD #6, widened by issue #1626): this issue run will
+	// use the worktree agent/issue-<iid>; refuse if an active ci_fix OR mr_rework run is
+	// already working that ref. This pre-transaction read is only a cheap fast-fail, so a
+	// doomed create does not pay the forge comment fetch below; the authoritative re-check
+	// runs inside the create transaction, after LockRunBranch (see the insert closure). The
+	// reverse checks live in createCIFixRun and createMRReworkRun.
+	//
+	// ORDER MATTERS: it runs AFTER the active-run gate and the open-MR guard above. An
+	// active mr_rework on agent/issue-<iid> normally implies a completed issue run with an OPEN
+	// MR, so an UNFORCED create normally keeps getting OpenMRExistsError (which every caller
+	// already maps to a skip / "use --force"). A FORCED create, an unforced one whose MR the
+	// watcher has since recorded merged/closed, and an unforced one against an active ci_fix
+	// with no open MR reach this check and get ErrBranchInUse.
+	fixing, err := s.q.CountActiveBranchRunsForRef(ctx, store.CountActiveBranchRunsForRefParams{
+		RepoID:      repoID,
+		PipelineRef: pgtype.Text{String: agentIssueBranch(issueIID), Valid: true},
+	})
+	if err != nil {
+		return store.Run{}, err
+	}
+	if fixing > 0 {
+		return store.Run{}, ErrBranchInUse
+	}
 	// PRD #381: snapshot the issue's human comments alongside the description. One
 	// extra forge round-trip, centralized here so every issue-backed origin (manual,
 	// autopilot, scheduled) captures it (D6) without rippling the Create*Run seam.
@@ -5434,31 +5486,72 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			}
 		}
 	}
-	// PRD #1226 M1 (D1): stamp the run as INTERLOCKED before its first claim when the
-	// rollout switch is on. completionInterlockOn is FAIL-SAFE OFF (nil reader or any read
-	// error → false), the opposite of the capability-aware fail-open, so this gate never
-	// accidentally engages a still-rolling-out feature. NULL (the not-interlocked legacy
-	// state) unless on. createRun only ever creates issue-kind rows, so this is inherently
+	// PRD #1226 M1 (D1), #1626: stamp the run as INTERLOCKED before its first claim when the
+	// completion-interlock switch is on (default ON; an explicit "false" row is the
+	// admin kill-switch). completionInterlockOn returns false for a nil reader or any read
+	// error, so a cold settings failure never stamps. NULL (the not-interlocked legacy state)
+	// otherwise. createRun only ever creates issue-kind rows, so this is inherently
 	// issue-scoped; the contract CONTENT is frozen later at approval / the first running
-	// report, not here.
-	var completionContractVersion pgtype.Int4
-	if s.completionInterlockOn(ctx) {
-		completionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
-	}
+	// report, not here. The setting is read here, before the create tx; the stamp itself is
+	// decided inside the closure below, against the harness resolved in that tx.
+	//
+	// Issue #1626: a SEEDED-plan run (PRD #209, seed != nil) is never stamped and stays legacy.
+	// Its plan arrives at create time, the worker takes the plan-approved skip, and it never
+	// sends a plan-bearing report (no awaiting_approval, no autopilot running report carrying
+	// plan_md); a SeededPlan carries no milestone list either. Nothing would ever freeze its
+	// contract, so an interlocked seeded run would hold at finalize on every completion.
+	interlockOn := seed == nil && s.completionInterlockOn(ctx)
+	// Read on the pool BEFORE the create transaction (issue #1626): the closure below holds the
+	// run-branch lock while a same-branch waiter holds a pool connection of its own, so these
+	// two plain reads are kept out of the lock-holding window rather than acquiring a second
+	// connection inside it. (An explicit credential override is still validated in-closure, on the
+	// tx-bound q, so it takes no second connection either.)
+	originColumn := s.originColumn(ctx, repoID, issue)
+	resolvedWaitOnLimit := s.resolveWaitOnLimit(ctx, userID, waitOnLimit)
 	run, err := s.createRunResolved(ctx, userID, explicit, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		// Issue #1626: the authoritative cross-kind branch check, FIRST in the closure. The
+		// run-branch lock serializes this create against an mr_rework / ci_fix create on the
+		// same agent/issue-<iid> (they take the same key), and the count below is a new READ
+		// COMMITTED statement, so a waiter sees the holder's committed row. See
+		// store.RunBranchLockClass for why no index can express this.
+		branch := agentIssueBranch(issueIID)
+		if err := q.LockRunBranch(ctx, repoID, branch); err != nil {
+			return store.Run{}, err
+		}
+		busy, err := q.CountActiveBranchRunsForRef(ctx, store.CountActiveBranchRunsForRefParams{
+			RepoID:      repoID,
+			PipelineRef: pgtype.Text{String: branch, Valid: true},
+		})
+		if err != nil {
+			return store.Run{}, err
+		}
+		if busy > 0 {
+			return store.Run{}, ErrBranchInUse
+		}
 		// PRD #1429 M2 (D5), #1247 override resolved INSIDE the create transaction against the
 		// D11-resolved harness (not a pre-tx guess): a rawOverride (manual/chat-start request) is
 		// validated here — an effective-Codex harness + Anthropic override fails
 		// ErrCredentialOverrideHarnessUnsupported and rolls the whole create back (no run row, no
 		// forge write after the invalid fact is known); a pre-resolved credOverride (a schedule's
 		// stored choice) is written as-is. nil override ⇒ inherit, byte-identical to a pre-#1247 run.
+		// The pinned-secret lookup reads through the tx-bound q (issue #1626), not the pool, so
+		// no second connection is taken while this closure holds the run-branch lock.
 		effOverride := credOverride
 		if rawOverride != nil {
-			ov, verr := s.ResolveCredentialOverride(ctx, userID, runkind.Issue, string(resolved.Harness), rawOverride.Mode, rawOverride.SecretID)
+			ov, verr := validateCredentialOverrideOn(ctx, q, userID, runkind.Issue, string(resolved.Harness), rawOverride.Mode, rawOverride.SecretID)
 			if verr != nil {
 				return store.Run{}, verr
 			}
 			effOverride = ov
+		}
+		// Issue #1626: only a CLAUDE-harness run is stamped. CodexExecutor does not run the
+		// completion-attempt loop (agent/src/codex/codex-executor.ts: "Codex does NOT enter the
+		// completion-attempt interlock"); the nudge port is #1627. An interlocked Codex run would
+		// skip the nudge and go straight to an owner hold on every incomplete completion, so a
+		// Codex run stays legacy (NULL) even with the switch on.
+		var completionContractVersion pgtype.Int4
+		if interlockOn && resolved.Harness == HarnessClaude {
+			completionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
 		}
 		return q.CreateRun(ctx, store.CreateRunParams{
 			UserID:           userID,
@@ -5466,13 +5559,13 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			IssueIid:         pgtype.Int8{Int64: issueIID, Valid: true},
 			IssueTitle:       issue.Title,
 			IssueDescription: description,
-			OriginColumn:     s.originColumn(ctx, repoID, issue),
+			OriginColumn:     originColumn,
 			AutoApprove:      autoApprove,
 			// PRD #35 Decision 7. Stamped at creation from the owner's default (or the
 			// caller's explicit choice), never read from users at park time: a run must
 			// keep the behaviour it was created with, so flipping the default later cannot
 			// retroactively change a run already in flight.
-			WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, waitOnLimit),
+			WaitOnLimit: resolvedWaitOnLimit,
 			// PRD #841 M1 Decision D1: mr_rework is LIVE-INHERIT, the deliberate opposite of
 			// wait_on_limit's snapshot. The pointer is stamped THROUGH with no resolver — nil
 			// ⇒ NULL ⇒ the run inherits the owner default live at read time (the candidate
@@ -5511,8 +5604,8 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			// issue #857 M2: the provenance stamp threaded from each public entrypoint
 			// ("manual"/"schedule"/"autopilot"), so a run records why it fired.
 			TriggerSource: triggerSource,
-			// PRD #1226 M1 (D1): NULL (legacy) unless the rollout switch is on, in which case
-			// this stamps the run interlocked (version 1) before its first claim. Listed
+			// PRD #1226 M1 (D1), #1626: version 1 (interlocked before its first claim) only for an
+			// unseeded Claude-harness run with the switch on; NULL (legacy) otherwise. Listed
 			// explicitly per runtime.sql's 🔴 silently-omittable-narg warning.
 			CompletionContractVersion: completionContractVersion,
 			// PRD #1429 M2 (D1): the AUDITOR INVARIANT — runs.harness is stamped from the D11 result
@@ -6035,8 +6128,7 @@ type SweepResult struct {
 	// served `budget_exhausted` steer (PRD #1226 M4, D3): the post-attempt live-worker
 	// interlocked rows past their wall budget that SweepRunningTimeout's carve-out spared, now
 	// stamped so their live lead is steered into the completion hold. Set from the execrows
-	// count. Normally 0 (the completion interlock is rollout-OFF and this only fires on a spared,
-	// budget-exhausted run).
+	// count. Normally 0 (this only fires on a spared, budget-exhausted interlocked run).
 	CompletionBudgetExhausted int64
 	// CustodyReleased is the number of OPEN custody holds this pass released because
 	// their release was warranted (a completed run, or a ready capture) but never

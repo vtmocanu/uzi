@@ -45,6 +45,7 @@ import { AgentSourceSettingsCard } from "./adminSettings/AgentSourceSettingsCard
 import { HealthSettingsCard } from "./adminSettings/HealthSettingsCard";
 import { DockerAllowlistCard } from "./adminSettings/DockerAllowlistCard";
 import { CapabilitySchedulingCard } from "./adminSettings/CapabilitySchedulingCard";
+import { CompletionInterlockCard } from "./adminSettings/CompletionInterlockCard";
 import { GithubProjectSyncCard } from "./adminSettings/GithubProjectSyncCard";
 import { SlackSettingsCard } from "./adminSettings/SlackSettingsCard";
 
@@ -271,6 +272,7 @@ export function AdminSettings() {
           { id: "docker-allowlist", label: "Docker workers" },
           { id: "ephemeral-workers", label: "Ephemeral workers" },
           { id: "capability-scheduling", label: "Capability scheduling" },
+          { id: "completion-interlock", label: "Completion check" },
         ]
       : []),
   ];
@@ -507,6 +509,12 @@ export function AdminSettings() {
       {!loading && saved && (
         <section id="capability-scheduling" className="scroll-mt-6">
           <CapabilitySchedulingCard settings={saved} sources={sources} onSaved={applyResponse} />
+        </section>
+      )}
+
+      {!loading && saved && (
+        <section id="completion-interlock" className="scroll-mt-6">
+          <CompletionInterlockCard settings={saved} sources={sources} onSaved={applyResponse} />
         </section>
       )}
 

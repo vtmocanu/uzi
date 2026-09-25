@@ -74,7 +74,8 @@ func TestCreateRunNoStampWhenRolloutOff(t *testing.T) {
 }
 
 // TestCreateRunNoStampWhenReaderUnset: a nil reader (a deployment/test that never wired the
-// switch) defaults OFF, the fail-safe direction — a new run is legacy, never interlocked.
+// switch) makes completionInterlockOn false even though the SETTING defaults on (#1626) — a
+// new run is legacy, never interlocked.
 func TestCreateRunNoStampWhenReaderUnset(t *testing.T) {
 	svc, fs := newInterlockCreateSvc(t, nil)
 	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, nil, nil, nil); err != nil {
@@ -85,9 +86,9 @@ func TestCreateRunNoStampWhenReaderUnset(t *testing.T) {
 	}
 }
 
-// TestCreateRunNoStampOnReadError: a rollout read ERROR is treated as OFF (fail-safe) —
-// the DELIBERATE opposite of the capability-aware fail-open, so the interlock never
-// accidentally engages a still-rolling-out feature on a momentary settings-read blip.
+// TestCreateRunNoStampOnReadError: a switch read ERROR is treated as OFF even when the value
+// returned alongside it is true (settings.Cache's cold-error shape: the default, now true,
+// plus the error), so a momentary cold settings-read failure never stamps a run.
 func TestCreateRunNoStampOnReadError(t *testing.T) {
 	svc, fs := newInterlockCreateSvc(t, fakeCompletionInterlock{on: true, err: context.DeadlineExceeded})
 	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, nil, nil, nil); err != nil {
@@ -152,5 +153,26 @@ func TestBuildCompletionContractEmpty(t *testing.T) {
 		if !strings.Contains(string(got), `"criteria":[]`) {
 			t.Errorf("empty-milestone contract must carry `\"criteria\":[]`, got %s", got)
 		}
+	}
+}
+
+// TestCreateRunNoStampForSeededPlan (issue #1626 B2): a SEEDED-plan run (PRD #209) skips the plan
+// gate, so no plan-bearing report ever freezes its completion contract and an interlocked seeded
+// run would hold at finalize. It therefore stays legacy (NULL completion_contract_version) even
+// with the rollout switch on.
+func TestCreateRunNoStampForSeededPlan(t *testing.T) {
+	svc, fs := newInterlockCreateSvc(t, fakeCompletionInterlock{on: true})
+	seed := &SeededPlan{PlanMD: "Refactor the token store; add a test in queries_test.go"}
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, seed, nil, nil); err != nil {
+		t.Fatalf("CreateRun (seeded): %v", err)
+	}
+	if fs.createRunParams == nil {
+		t.Fatal("CreateRun store insert must run")
+	}
+	if !fs.createRunParams.PlanMd.Valid || fs.createRunParams.PlanSource != planSourceSeeded {
+		t.Fatalf("seed not applied: plan_md=%+v plan_source=%q", fs.createRunParams.PlanMd, fs.createRunParams.PlanSource)
+	}
+	if fs.createRunParams.CompletionContractVersion.Valid {
+		t.Fatalf("completion_contract_version = %+v, want NULL for a seeded-plan run (it never freezes a contract)", fs.createRunParams.CompletionContractVersion)
 	}
 }

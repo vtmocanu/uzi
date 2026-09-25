@@ -901,6 +901,11 @@ export interface AppSettings {
   // (e.g. a docker-needing run only to a docker worker). Turning it OFF reverts to
   // best-effort claiming; it does NOT disable the docker repo allowlist.
   capability_aware_scheduling: string;
+  // Completion interlock kill-switch (issue #1626, PRD #1226). The text "true"/"false"
+  // (default "true"). When on, a Claude issue run that would close its issue is held
+  // until every milestone of its approved plan is marked done. Codex runs are not
+  // checked yet.
+  completion_interlock_rollout: string;
   // GitHub Projects v2 sync instance kill-switch (PRD #534 / issue #534 M2). The
   // text "true"/"false" (default "false"). When OFF, no run mirrors board-column
   // labels to a linked GitHub Projects Status field — an instance-wide rate-limit /

@@ -65,6 +65,7 @@ const settings = (over: Partial<Settings> = {}): Settings => ({
   run_extension_cap_seconds: "57600",
   docker_repo_allowlist: "",
   capability_aware_scheduling: "true",
+  completion_interlock_rollout: "true",
   github_project_sync_enabled: "false",
   app_logo_mode: "default",
   app_logo_preset: "",

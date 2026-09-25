@@ -9,6 +9,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // Milestone is one entry of a run's milestone list (PRD #122): a small {id, title}
@@ -112,6 +113,111 @@ func milestonesParam(kind string, ms *[]Milestone) []byte {
 		return nil
 	}
 	return encoded
+}
+
+// planMilestonesParam is milestonesParam for a PLAN-BEARING report — the awaiting_approval
+// report (the candidate list) and the autopilot `running` report that carries the approved
+// plan_md (the frozen list). Issue #1626: the worker sends `milestones` only when the plan
+// has any, so a milestone-less plan used to persist NULL, and the completion-contract freeze
+// (CreateApprovePlanInput / SetRunRunning), which requires a non-NULL milestone source,
+// never froze a contract — an INTERLOCKED run then held at finalize with "completion
+// identity unresolvable". For an interlocked issue run only
+// (completion_contract_version stamped), the FIRST plan-bearing report whose milestones are
+// ABSENT is read as the explicit empty list `[]`, so the freeze lands criteria:[] at revision 1
+// and the permit grants vacuously (computeUnmetCriteria). Server-side so it holds for any
+// worker. Everything else is milestonesParam unchanged:
+//   - a legacy (unstamped) run, or a non-issue kind, keeps NULL — byte-identical to before;
+//   - a report WITHOUT a non-blank plan_md keeps NULL. This is load-bearing on the
+//     `running` path: an autopilot run reports `running` at claim time BEFORE it has
+//     planned (no plan_md), and freezing `[]` there would spend the contract-IS-NULL
+//     freeze before the plan's real milestones arrive (TestCompletionContractNotFrozenBeforeMilestonesLiveDB);
+//   - a PRESENT list that fails validation still drops to NULL, and a VALID non-empty list
+//     always replaces whatever is stored.
+//
+// `run` is the row as it stood BEFORE this report (the SetState snapshot, taken before
+// SetRunAwaitingApproval / SetRunAutopilotPlan write this report's plan_md). For an interlocked
+// issue run whose report resolves to an EMPTY list (milestones absent, or an explicit `[]`):
+//   - a stored NON-EMPTY milestones_candidate is passed through unchanged when the report
+//     re-presents the SAME plan (issue #1626 B1): its NUL-stripped plan_md equals the stored
+//     plan_md (which SetRunAwaitingApproval writes NUL-stripped), the stored plan_md is NULL
+//     (nothing to prove a new plan against), or the report carries an explicit EMPTY milestones
+//     list with no plan_md. A report carrying NEITHER plan_md nor milestones returns nil and
+//     clears the candidate, consistent with SetRunAwaitingApproval also writing plan_md NULL.
+//     SetRunAwaitingApproval assigns the candidate directly, and a reclaim at the gate (a
+//     credential switch or requeue while parked) re-presents the plan without the milestones it
+//     was first reported with; reading that as `[]` would freeze an empty contract against an
+//     N-milestone plan;
+//   - a REVISE round whose report carries a DIFFERENT plan_md and no milestones (absent, or an
+//     explicit `[]`) resets a stored non-empty candidate to `[]` (issue #1626 review, F2): the
+//     worker omits the field when the plan has none, so keeping the candidate would freeze the
+//     SUPERSEDED plan's criteria at approval and the completion permit could be denied for
+//     milestones the approved plan no longer has;
+//   - with milestones ABSENT, a stored `[]` candidate is kept (a re-presented or revised
+//     milestone-less gate stays `[]`);
+//   - with milestones ABSENT, or an explicit `[]`, and a NULL stored candidate, `[]` is the result
+//     ONLY when the stored plan_md is also NULL, i.e. this is the run's FIRST plan-bearing report
+//     (so an explicit `[]` on the first report is honoured as `[]`). A NULL candidate
+//     beside a non-NULL stored plan_md means an earlier plan-bearing report's list was REJECTED
+//     (a first milestone-less report would have stored `[]`, and seeded-plan runs, whose plan_md
+//     predates any report, are never stamped), so the rejection is STICKY for any worker, whether
+//     the later report omits the list or sends an explicit `[]`: the result stays NULL,
+//     nothing freezes, and the run holds at finalize until a later report carries a valid list
+//     or the owner decides (accept/partial). On the autopilot `running` path the same reading
+//     applies: the first plan-bearing report sees a NULL stored plan_md and freezes `[]`; a later
+//     one (after a rejected list left milestones_frozen NULL) sees the plan SetRunAutopilotPlan
+//     stored and stays NULL. Reading a stored plan_md as "an earlier report was processed" holds
+//     there only because SetState commits SetRunAutopilotPlan in the SAME transaction as
+//     SetRunRunning (fenced or not, whenever a TxBeginner is wired): a plan_md that committed
+//     while SetRunRunning failed would make the worker's retry of that same report look like a
+//     sticky rejection (TestAutopilotPlanWriteAtomicWithRunningLiveDB).
+//
+// The inference never replaces a REJECTED list with an empty one; the only downgrade of a
+// stored non-empty candidate to `[]` is a report that presents a different plan without milestones.
+func planMilestonesParam(run store.Run, planMd *string, ms *[]Milestone) []byte {
+	if run.Kind != runkind.Issue || !run.CompletionContractVersion.Valid {
+		return milestonesParam(run.Kind, ms)
+	}
+	prior, priorErr := DecodeMilestones(run.MilestonesCandidate)
+	storedCandidate := priorErr == nil && len(run.MilestonesCandidate) > 0
+	// samePlan: this report re-presents the stored plan rather than revising it. The stored
+	// plan_md was written NUL-stripped (stripNULParam), so the report's text is compared the same
+	// way. A NULL stored plan_md, or a report with no plan_md, cannot prove a revise (a report
+	// with neither plan_md nor milestones still returns nil below, clearing plan and candidate).
+	samePlan := !run.PlanMd.Valid || planMd == nil
+	if !samePlan {
+		clean, _ := stripNUL(*planMd)
+		samePlan = clean == run.PlanMd.String
+	}
+	if ms != nil {
+		resolved := milestonesParam(run.Kind, ms)
+		if string(resolved) == "[]" {
+			if storedCandidate && len(prior) > 0 && samePlan {
+				return run.MilestonesCandidate
+			}
+			if !storedCandidate && run.PlanMd.Valid {
+				// Sticky rejection: an explicit `[]` after a rejected list reads like an absent one.
+				return nil
+			}
+		}
+		return resolved
+	}
+	if planMd == nil {
+		return nil
+	}
+	if clean, _ := stripNUL(*planMd); strings.TrimSpace(clean) == "" {
+		return nil
+	}
+	if storedCandidate {
+		if len(prior) > 0 && !samePlan {
+			// F2: a revised plan without milestones drops the superseded plan's criteria.
+			return []byte("[]")
+		}
+		return run.MilestonesCandidate
+	}
+	if run.PlanMd.Valid {
+		return nil
+	}
+	return []byte("[]")
 }
 
 // progressParams validates a worker-reported progress update (Decision 3/12): every

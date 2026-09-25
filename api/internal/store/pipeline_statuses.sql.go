@@ -207,8 +207,9 @@ type ListWatchedRunRefsForRepoRow struct {
 // merged newest row and resurface that stale older run; collapsing first excludes
 // the branch correctly. (The board-free lane, SyncBoardFreeMRStates, records
 // mr_state per-run on issue-LESS runs, so this is not "newest run per issue"
-// unqualified.) A run has no branch until the worker creates its worktree, so blank
-// branches are excluded; the row returns the newest run's mr_iid, and the outer
+// unqualified.) An issue run has no runs.branch until its terminal report writes it
+// (SetRunCompleted / ReconcileRunMR), so blank branches are excluded; the row returns
+// the newest run's mr_iid, and the outer
 // ORDER BY + LIMIT keeps the newest @max_refs branches (the caller passes cap+1 and
 // logs entering/leaving the capped state, issue #1483).
 func (q *Queries) ListWatchedRunRefsForRepo(ctx context.Context, arg ListWatchedRunRefsForRepoParams) ([]ListWatchedRunRefsForRepoRow, error) {

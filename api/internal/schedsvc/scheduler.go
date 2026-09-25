@@ -367,9 +367,19 @@ func (e *Scheduler) process(ctx context.Context, sched store.RunSchedule, pc *pa
 // must not disturb the recurring cadence (next_fire_at stays where the tick left it) nor
 // terminate a once schedule. Errors ride up UNCHANGED — workersvc.ErrRepoNotFound (repo
 // gone / not owned), ErrBadConfig (malformed stored config), or a transient forge/DB
-// error — so the handler can map each to the right HTTP code.
+// error — so the handler can map each to the right HTTP code. The one exception is
+// ErrBranchInUse on an issue target, which becomes an already_running skip (see below).
 func (e *Scheduler) RunNow(ctx context.Context, sched store.RunSchedule) (FireOutcome, error) {
-	return e.fireOne(ctx, sched)
+	out, err := e.fireOne(ctx, sched)
+	// Issue #1626: createIssueRun returns ErrBranchInUse as an error for a once issue
+	// schedule so the tick path holds the row. RunNow never advances, so there is nothing
+	// to hold: answer with the benign already_running skip instead of a 502. The skip
+	// carries no title or web URL, like the active-run pre-check skip in fireIssue.
+	if errors.Is(err, workersvc.ErrBranchInUse) && sched.Target == "issue" {
+		iid := sched.IssueIid.Int64
+		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iid, Reason: SkipAlreadyRunning}}}, nil
+	}
+	return out, err
 }
 
 // fireOne dispatches on the schedule target and returns the FireOutcome for this fire,
@@ -812,6 +822,19 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 	// no_usable_credential — review fix, PRD #1429: neither harness usable for the owner is
 	// benign, not transient). The old link-less skip reason was retired with the PRD-link
 	// gate (PRD #764).
+	//
+	// Issue #1626 exception: a ONE-TIME issue schedule refused with ErrBranchInUse (a
+	// ci_fix / mr_rework run holds agent/issue-<iid>) is transient, not a benign skip —
+	// advancing would mark the row fired and the issue run would never start. Returned as
+	// an error it takes advance's transient arm: not advanced, logged as a "transient fire
+	// error, will retry" warning, and the issue re-fetched every tick until the branch
+	// frees (unlike the paused-once hold in process(), which returns before firing and
+	// never reaches advance). Scoped to Target=="issue": fireSweep also calls
+	// createIssueRun and turns any error into fetch_failed, so a once sweep keeps the
+	// benign already_running skip.
+	if errors.Is(err, workersvc.ErrBranchInUse) && sched.Target == "issue" && sched.Timing == "once" {
+		return FireOutcome{}, err
+	}
 	if reason, ok := skipReasonForErr(err); ok {
 		e.logger.Info("scheduler: issue fire skipped", "schedule", sched.ID.String(), "issue", iid, "reason", err)
 		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iidCopy, Title: title, Reason: reason, WebURL: webURL}}}, nil
