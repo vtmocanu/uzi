@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 
@@ -49,6 +51,21 @@ func runOutcomes(finished, completed, cancelled, planRejected, failed, needsLand
 	}
 }
 
+// decodeFailOrigins decodes a jsonb fail_origins column (issue #1451: the per-origin
+// breakdown computed in the same statement as the `failed` count) into the DTO map. The
+// query COALESCEs an empty group to '{}'; an absent column (nil, e.g. a zero-value row) also
+// yields an empty non-nil map. Malformed JSON is an error the caller turns into a 500.
+func decodeFailOrigins(raw []byte) (map[string]int64, error) {
+	origins := map[string]int64{}
+	if len(raw) == 0 {
+		return origins, nil
+	}
+	if err := json.Unmarshal(raw, &origins); err != nil {
+		return nil, fmt.Errorf("decode fail_origins: %w", err)
+	}
+	return origins, nil
+}
+
 // SelfUsage returns the requesting user's own usage (PRD #40): lifetime and
 // last-7-days totals, usage-bearing run count, failed-run outcomes (PRD #1293),
 // and subscription/unreported counts. RequireUser accepts a session or CLI Bearer;
@@ -71,21 +88,19 @@ func (h *Handler) SelfUsage(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	originRows, err := h.wsvc.SelfRunOutcomeOrigins(r.Context(), user.ID)
+	// The per-origin breakdown rides the same row as the counts (issue #1451), so
+	// sum(fail_origins) == failed holds within this response by construction.
+	lifetimeOrigins, err := decodeFailOrigins(outcomes.LifetimeFailOrigins)
 	if err != nil {
-		slog.Error("self run outcome origins", "error", err)
+		slog.Error("self run outcomes", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	lifetimeOrigins := map[string]int64{}
-	last7Origins := map[string]int64{}
-	for _, o := range originRows {
-		switch o.WindowTag {
-		case "lifetime":
-			lifetimeOrigins[o.Origin] = o.Cnt
-		case "last7":
-			last7Origins[o.Origin] = o.Cnt
-		}
+	last7Origins, err := decodeFailOrigins(outcomes.Last7FailOrigins)
+	if err != nil {
+		slog.Error("self run outcomes", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
 	}
 	httpx.JSON(w, http.StatusOK, apitypes.SelfUsageDTO{
 		Lifetime: apitypes.UsageDTO{
@@ -145,9 +160,17 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	factoryOriginRows, err := h.wsvc.AdminRunOutcomeOrigins(r.Context())
+	// The per-origin breakdowns ride the same rows as the counts (issue #1451), so
+	// sum(fail_origins) == failed holds per scope within this response by construction.
+	factoryLifetimeOrigins, err := decodeFailOrigins(factoryOutcomes.LifetimeFailOrigins)
 	if err != nil {
-		slog.Error("admin run outcome origins", "error", err)
+		slog.Error("admin run outcomes", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	factoryLast7Origins, err := decodeFailOrigins(factoryOutcomes.Last7FailOrigins)
+	if err != nil {
+		slog.Error("admin run outcomes", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
@@ -157,38 +180,20 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	perUserOriginRows, err := h.wsvc.AdminRunOutcomeOriginsPerUser(r.Context())
-	if err != nil {
-		slog.Error("admin run outcome origins per user", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
 
-	// Fold the factory per-origin rows into per-window maps.
-	factoryLifetimeOrigins := map[string]int64{}
-	factoryLast7Origins := map[string]int64{}
-	for _, o := range factoryOriginRows {
-		switch o.WindowTag {
-		case "lifetime":
-			factoryLifetimeOrigins[o.Origin] = o.Cnt
-		case "last7":
-			factoryLast7Origins[o.Origin] = o.Cnt
-		}
-	}
-	// Fold the per-user (lifetime-only) origin rows keyed by user id.
-	originsByUser := map[uuid.UUID]map[string]int64{}
-	for _, o := range perUserOriginRows {
-		m := originsByUser[o.UserID]
-		if m == nil {
-			m = map[string]int64{}
-			originsByUser[o.UserID] = m
-		}
-		m[o.Origin] = o.Cnt
-	}
-	// Index the per-user outcome counts by user id, so a usage row can attach its outcomes.
+	// Index the per-user outcome counts (and their decoded lifetime origins) by user id, so
+	// a usage row can attach its outcomes.
 	outcomesByUser := map[uuid.UUID]store.AdminRunOutcomesPerUserRow{}
+	originsByUser := map[uuid.UUID]map[string]int64{}
 	for _, o := range perUserOutcomes {
+		origins, err := decodeFailOrigins(o.FailOrigins)
+		if err != nil {
+			slog.Error("admin run outcomes per user", "error", err, "user_id", o.UserID)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
 		outcomesByUser[o.UserID] = o
+		originsByUser[o.UserID] = origins
 	}
 
 	users := make([]apitypes.AdminUserUsageDTO, 0, len(rows)+len(perUserOutcomes))

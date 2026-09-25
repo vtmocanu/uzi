@@ -1004,9 +1004,6 @@ type Store interface {
 	SelfRunOutcomes(ctx context.Context, arg store.SelfRunOutcomesParams) (store.SelfRunOutcomesRow, error)
 	AdminRunOutcomes(ctx context.Context, landableOrigins []string) (store.AdminRunOutcomesRow, error)
 	AdminRunOutcomesPerUser(ctx context.Context, landableOrigins []string) ([]store.AdminRunOutcomesPerUserRow, error)
-	SelfRunOutcomeOrigins(ctx context.Context, userID uuid.UUID) ([]store.SelfRunOutcomeOriginsRow, error)
-	AdminRunOutcomeOrigins(ctx context.Context) ([]store.AdminRunOutcomeOriginsRow, error)
-	AdminRunOutcomeOriginsPerUser(ctx context.Context) ([]store.AdminRunOutcomeOriginsPerUserRow, error)
 	CreateRunInput(ctx context.Context, arg store.CreateRunInputParams) (store.RunUserInput, error)
 	// CountRunReviseInputs is the read-only reporting view of the PRD #41 plan-revision
 	// cap: all revise_plan rows for the run (no consumed_at filter), so a consumed
@@ -5962,24 +5959,6 @@ func (s *Service) AdminRunOutcomes(ctx context.Context) (store.AdminRunOutcomesR
 // needs_landing (issue #1418) keyed on the Go-owned human-landable set.
 func (s *Service) AdminRunOutcomesPerUser(ctx context.Context) ([]store.AdminRunOutcomesPerUserRow, error) {
 	return s.q.AdminRunOutcomesPerUser(ctx, AllHumanLandableFailOrigins())
-}
-
-// SelfRunOutcomeOrigins returns the user's per-origin failure causes for both windows
-// (PRD #1293 M1), folded into RunOutcomesDTO.fail_origins by the handler.
-func (s *Service) SelfRunOutcomeOrigins(ctx context.Context, userID uuid.UUID) ([]store.SelfRunOutcomeOriginsRow, error) {
-	return s.q.SelfRunOutcomeOrigins(ctx, userID)
-}
-
-// AdminRunOutcomeOrigins returns the factory-wide per-origin failure causes for both
-// windows (PRD #1293 M1).
-func (s *Service) AdminRunOutcomeOrigins(ctx context.Context) ([]store.AdminRunOutcomeOriginsRow, error) {
-	return s.q.AdminRunOutcomeOrigins(ctx)
-}
-
-// AdminRunOutcomeOriginsPerUser returns the per-user lifetime per-origin failure causes
-// (PRD #1293 M1), keyed by user id so the handler attaches each user's causes.
-func (s *Service) AdminRunOutcomeOriginsPerUser(ctx context.Context) ([]store.AdminRunOutcomeOriginsPerUserRow, error) {
-	return s.q.AdminRunOutcomeOriginsPerUser(ctx)
 }
 
 // SubmitInputResult reports how a steering input was handled.

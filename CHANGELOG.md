@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **The failure-cause breakdown on the usage cards always adds up to the failed count ([#1451](https://github.com/vtmocanu/uzi/issues/1451)).**
+  The failed-run count and its per-cause breakdown (`fail_origins`) on `GET /api/usage` and `GET /api/admin/usage` were read in two separate queries, so a run that failed between them could make the causes sum to one more than `failed` in the same response. Each scope (your own, factory-wide and per user) now computes both in one query, so they always describe the same runs. The response shape is unchanged.
+
 - **A cancel, stop, plan verdict or follow-up is no longer lost when the worker's reply from the server is lost, and follow-ups reach the lead in the order you sent them ([#1673](https://github.com/vtmocanu/uzi/issues/1673)).**
   Before, the worker's input poll marked your inputs delivered as it returned them, so a reply lost to a network error or timeout dropped a cancel or plan verdict for good and could deliver an older follow-up after a newer one. A worker that advertises the new `input_receipts_v1` capability now reads inputs without consuming them, acknowledges them (`POST /api/worker/runs/{id}/inputs/ack`), and confirms them once acted on (`POST /api/worker/runs/{id}/inputs/applied`); it retries a lost reply with the same inputs, acts on each input once, in the order sent, and an input still unconfirmed when a claim ends goes to the run's next claim. A follow-up shows as delivered when the worker acknowledges it. Older worker images keep the previous behaviour until they are upgraded; a migration marks every input delivered before the upgrade as confirmed.
 

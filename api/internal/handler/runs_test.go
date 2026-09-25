@@ -101,12 +101,9 @@ type runsStore struct {
 	adminTotals      store.AdminUsageTotalsRow
 	adminPerUser     []store.AdminUsagePerUserRow
 	// PRD #1293 failed-run rate outcome aggregates.
-	selfRunOutcomes               store.SelfRunOutcomesRow
-	selfRunOutcomeOrigins         []store.SelfRunOutcomeOriginsRow
-	adminRunOutcomes              store.AdminRunOutcomesRow
-	adminRunOutcomesPerUser       []store.AdminRunOutcomesPerUserRow
-	adminRunOutcomeOrigins        []store.AdminRunOutcomeOriginsRow
-	adminRunOutcomeOriginsPerUser []store.AdminRunOutcomeOriginsPerUserRow
+	selfRunOutcomes         store.SelfRunOutcomesRow
+	adminRunOutcomes        store.AdminRunOutcomesRow
+	adminRunOutcomesPerUser []store.AdminRunOutcomesPerUserRow
 	// PRD #95 steer queue: the follow_up rows ListFollowUpInputsForRun returns, and the
 	// row CreateRunInput echoes (so the richer follow-up write's id/created_at are
 	// assertable).
@@ -263,20 +260,11 @@ func (s *runsStore) AdminUsagePerUser(context.Context) ([]store.AdminUsagePerUse
 func (s *runsStore) SelfRunOutcomes(context.Context, store.SelfRunOutcomesParams) (store.SelfRunOutcomesRow, error) {
 	return s.selfRunOutcomes, nil
 }
-func (s *runsStore) SelfRunOutcomeOrigins(context.Context, uuid.UUID) ([]store.SelfRunOutcomeOriginsRow, error) {
-	return s.selfRunOutcomeOrigins, nil
-}
 func (s *runsStore) AdminRunOutcomes(context.Context, []string) (store.AdminRunOutcomesRow, error) {
 	return s.adminRunOutcomes, nil
 }
 func (s *runsStore) AdminRunOutcomesPerUser(context.Context, []string) ([]store.AdminRunOutcomesPerUserRow, error) {
 	return s.adminRunOutcomesPerUser, nil
-}
-func (s *runsStore) AdminRunOutcomeOrigins(context.Context) ([]store.AdminRunOutcomeOriginsRow, error) {
-	return s.adminRunOutcomeOrigins, nil
-}
-func (s *runsStore) AdminRunOutcomeOriginsPerUser(context.Context) ([]store.AdminRunOutcomeOriginsPerUserRow, error) {
-	return s.adminRunOutcomeOriginsPerUser, nil
 }
 
 func newRunsHandler(t *testing.T, st workersvc.Store) *Handler {

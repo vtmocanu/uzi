@@ -84,15 +84,11 @@ func TestSelfUsageReturnsScopedTotals(t *testing.T) {
 			LifetimeNeedsLanding: 4,
 			Last7Finished:        20, Last7Completed: 15, Last7Cancelled: 1, Last7PlanRejected: 1, Last7Failed: 3,
 			Last7NeedsLanding: 1,
-		},
-		// Per-origin causes: lifetime sums to 12 (=failed), last7 sums to 3 (=failed); a
-		// NULL origin arrives from the query already bucketed as "unknown".
-		selfRunOutcomeOrigins: []store.SelfRunOutcomeOriginsRow{
-			{WindowTag: "lifetime", Origin: "agent_failure", Cnt: 8},
-			{WindowTag: "lifetime", Origin: "run_timeout", Cnt: 3},
-			{WindowTag: "lifetime", Origin: "unknown", Cnt: 1},
-			{WindowTag: "last7", Origin: "agent_failure", Cnt: 2},
-			{WindowTag: "last7", Origin: "run_timeout", Cnt: 1},
+			// Per-origin causes (issue #1451: jsonb columns on the same row): lifetime sums to
+			// 12 (=failed), last7 sums to 3 (=failed); a NULL origin arrives from the query
+			// already bucketed as "unknown".
+			LifetimeFailOrigins: []byte(`{"agent_failure": 8, "run_timeout": 3, "unknown": 1}`),
+			Last7FailOrigins:    []byte(`{"agent_failure": 2, "run_timeout": 1}`),
 		},
 	}
 	h := newRunsHandler(t, st)
@@ -182,27 +178,20 @@ func TestAdminUsageShapesFactoryAndUsers(t *testing.T) {
 			LifetimeFinished: 200, LifetimeCompleted: 150, LifetimeCancelled: 10, LifetimePlanRejected: 5, LifetimeFailed: 35,
 			LifetimeNeedsLanding: 11,
 			Last7Finished:        40, Last7Completed: 30, Last7Cancelled: 2, Last7PlanRejected: 1, Last7Failed: 7,
-			Last7NeedsLanding: 2,
-		},
-		adminRunOutcomeOrigins: []store.AdminRunOutcomeOriginsRow{
-			{WindowTag: "lifetime", Origin: "agent_failure", Cnt: 20},
-			{WindowTag: "lifetime", Origin: "run_timeout", Cnt: 10},
-			{WindowTag: "lifetime", Origin: "unknown", Cnt: 5},
-			{WindowTag: "last7", Origin: "agent_failure", Cnt: 5},
-			{WindowTag: "last7", Origin: "run_timeout", Cnt: 2},
+			Last7NeedsLanding:   2,
+			LifetimeFailOrigins: []byte(`{"agent_failure": 20, "run_timeout": 10, "unknown": 5}`),
+			Last7FailOrigins:    []byte(`{"agent_failure": 5, "run_timeout": 2}`),
 		},
 		// Per-user outcomes: heavy has a usage row AND outcomes; light has a usage row but
 		// NO outcomes row (so it gets a zero RunOutcomesDTO with an empty fail_origins {});
 		// broken is OUTCOME-ONLY (no usage row) so it must be APPENDED after the cost-sorted
 		// usage rows with zero usage (D5). Order in the slice is heavy, broken (light omitted).
 		adminRunOutcomesPerUser: []store.AdminRunOutcomesPerUserRow{
-			{UserID: heavyID, Email: "heavy@x", Finished: 120, Completed: 100, Cancelled: 5, PlanRejected: 3, Failed: 12, NeedsLanding: 4},
-			{UserID: brokenID, Email: "broken@x", Finished: 30, Completed: 10, Cancelled: 2, PlanRejected: 1, Failed: 17, NeedsLanding: 7},
-		},
-		adminRunOutcomeOriginsPerUser: []store.AdminRunOutcomeOriginsPerUserRow{
-			{UserID: heavyID, Origin: "agent_failure", Cnt: 10},
-			{UserID: heavyID, Origin: "run_timeout", Cnt: 2},
-			{UserID: brokenID, Origin: "unknown", Cnt: 17}, // every broken-token run died with NULL origin
+			{UserID: heavyID, Email: "heavy@x", Finished: 120, Completed: 100, Cancelled: 5, PlanRejected: 3, Failed: 12, NeedsLanding: 4,
+				FailOrigins: []byte(`{"agent_failure": 10, "run_timeout": 2}`)},
+			// every broken-token run died with NULL origin
+			{UserID: brokenID, Email: "broken@x", Finished: 30, Completed: 10, Cancelled: 2, PlanRejected: 1, Failed: 17, NeedsLanding: 7,
+				FailOrigins: []byte(`{"unknown": 17}`)},
 		},
 	}
 	h := newRunsHandler(t, st)
@@ -331,6 +320,47 @@ func TestAdminUsageRequiresAdmin(t *testing.T) {
 	gated.ServeHTTP(admin, req.WithContext(mw.ContextWithUser(req.Context(), store.User{ID: uuid.New(), IsAdmin: true})))
 	if admin.Code != http.StatusOK {
 		t.Fatalf("admin on /api/admin/usage = %d, want 200", admin.Code)
+	}
+}
+
+// Issue #1451: fail_origins now arrives as a jsonb column on the outcome row. A column that
+// does not decode is a server fault, never silently rendered as "no failures": each of the
+// self, factory and per-user reads fails the endpoint with a 500 that leaks nothing.
+func TestUsageMalformedFailOriginsIs500(t *testing.T) {
+	bad := []byte(`{"agent_failure": "not-a-number"`)
+	user := store.User{ID: uuid.New(), IsAdmin: true}
+	cases := []struct {
+		name  string
+		st    *runsStore
+		admin bool
+	}{
+		{"self lifetime", &runsStore{selfRunOutcomes: store.SelfRunOutcomesRow{LifetimeFailOrigins: bad}}, false},
+		{"self last7", &runsStore{selfRunOutcomes: store.SelfRunOutcomesRow{
+			LifetimeFailOrigins: []byte(`{}`), Last7FailOrigins: bad}}, false},
+		{"factory lifetime", &runsStore{adminRunOutcomes: store.AdminRunOutcomesRow{LifetimeFailOrigins: bad}}, true},
+		{"factory last7", &runsStore{adminRunOutcomes: store.AdminRunOutcomesRow{
+			LifetimeFailOrigins: []byte(`{}`), Last7FailOrigins: bad}}, true},
+		{"per-user", &runsStore{adminRunOutcomesPerUser: []store.AdminRunOutcomesPerUserRow{
+			{UserID: uuid.New(), Email: "x@x", Finished: 1, Failed: 1, FailOrigins: bad}}}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newRunsHandler(t, tc.st)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/api/usage", nil)
+			req = req.WithContext(mw.ContextWithUser(req.Context(), user))
+			if tc.admin {
+				h.AdminUsage(rec, req)
+			} else {
+				h.SelfUsage(rec, req)
+			}
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("malformed fail_origins = %d, want 500", rec.Code)
+			}
+			if strings.Contains(rec.Body.String(), "not-a-number") || strings.Contains(rec.Body.String(), "decode") {
+				t.Fatalf("500 body must not leak the decode error: %s", rec.Body.String())
+			}
+		})
 	}
 }
 
