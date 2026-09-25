@@ -8,7 +8,14 @@
 #   D. a --skip-rebase re-entry after a disjoint base move rebases and continues;
 #   E. a rebase stopping on CHANGELOG.md alone is resolved as a union and continued;
 #   F. a stop on CHANGELOG.md plus another path is still exit 5;
-#   G. the CHANGELOG-removal guard (exit 9) still runs after an auto-resolution.
+#   G. the CHANGELOG-removal guard (exit 9) still runs after an auto-resolution;
+#   H. a base move sharing only CHANGELOG.md (conflicting) is union-resolved and pushed
+#      without re-running the gate;
+#   I. a CLEAN rebase that leaves two `### Fixed` under [Unreleased] gets a separate
+#      collapse commit;
+#   J. the guard accepts a pure heading collapse of the base's own duplicate heading
+#      without --allow-changelog-removals;
+#   K. ...and still refuses a real removal alongside one.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -154,6 +161,7 @@ run be 205 --no-push --gate none
 grep -q 'auto-resolved the CHANGELOG.md conflict' "$WORK/out.205" || fail "E: auto-resolution not logged"
 grep -qF -- '- **main e**' "$WORK/wt-205/CHANGELOG.md" && grep -qF -- '- **branch e**' "$WORK/wt-205/CHANGELOG.md" || fail "E: a side was lost"
 grep -q '^<<<<<<<' "$WORK/wt-205/CHANGELOG.md" && fail "E: markers left"
+[ "$(git -C "$WORK/wt-205" log -1 --format=%s)" = 'branch e' ] || fail "E: a collapse commit was made with no duplicate heading"
 [ -z "$(git -C "$WORK/wt-205" status --porcelain)" ] || fail "E: worktree dirty after the auto-resolution"
 
 # F. CHANGELOG plus another conflicted path: exit 5, left mid-rebase.
@@ -175,4 +183,70 @@ run bg 207 --no-push --gate none
 grep -q 'auto-resolved the CHANGELOG.md conflict' "$WORK/out.207" || fail "G: the conflict was not auto-resolved first"
 grep -qF -- '-- **one**' "$WORK/out.207" || fail "G: the removed line was not printed"
 
-echo "PASS land-prep base move: disjoint tolerated without re-gate, overlap/conflict refused, CHANGELOG union auto-resolve"
+# H. the base moves during the gate, sharing only CHANGELOG.md (a conflicting append).
+mk_branch bh; cl_append "$SEED/CHANGELOG.md" '- **branch h**'; printf 'h\n' > "$SEED/web/h.txt"; commit_push bh 'branch h'
+cat > "$GATE_HOOK" <<'EOF'
+set -e
+git -C "$SEED" switch -q main
+awk '{print} $0=="- **four**"{print "- **main h**"}' "$SEED/CHANGELOG.md" > "$SEED/CHANGELOG.md.tmp"
+mv "$SEED/CHANGELOG.md.tmp" "$SEED/CHANGELOG.md"
+git -C "$SEED" commit -qam 'main h'
+git -C "$SEED" push -q origin main
+EOF
+: > "$TASK_LOG"
+run bh 208
+[ "$rc" -eq 0 ] || fail "H: CHANGELOG-only overlap not tolerated, rc=$rc: $(cat "$WORK/out.208")"
+grep -q '^RESULT=pushed ' "$WORK/out.208" || fail "H: not pushed"
+grep -q 'auto-resolved the CHANGELOG.md conflict' "$WORK/out.208" || fail "H: the conflict was not union-resolved: $(cat "$WORK/out.208")"
+grep -q 'delta shares only CHANGELOG.md with the branch (1 files); rebased without re-gating' "$WORK/out.208" || fail "H: the tolerance was not logged"
+[ "$(grep -c '^gate:web$' "$TASK_LOG")" -eq 1 ] || fail "H: gate re-ran"
+git --git-dir="$ORIGIN" show refs/heads/bh:CHANGELOG.md > "$WORK/h.md"
+grep -qF -- '- **main h**' "$WORK/h.md" && grep -qF -- '- **branch h**' "$WORK/h.md" || fail "H: a side was lost in the pushed CHANGELOG"
+
+# I. a clean rebase keeps the branch's own `### Fixed` next to the base's: collapsed in a
+#    separate commit, both bullets kept, one heading left.
+mk_branch bi
+awk '{print} $0=="## [Unreleased]"{print ""; print "### Fixed"; print ""; print "- **branch i**"}' "$SEED/CHANGELOG.md" > "$SEED/CHANGELOG.md.tmp"
+mv "$SEED/CHANGELOG.md.tmp" "$SEED/CHANGELOG.md"; commit_push bi 'branch i'
+git -C "$SEED" switch -q main; printf 'i\n' > "$SEED/base-i.txt"; git -C "$SEED" add -A; git -C "$SEED" commit -qm 'main i'; git -C "$SEED" push -q origin main
+run bi 209 --no-push --gate none
+[ "$rc" -eq 0 ] || fail "I: clean-rebase collapse failed, rc=$rc: $(cat "$WORK/out.209")"
+[ "$(git -C "$WORK/wt-209" log -1 --format=%s)" = 'chore: collapse duplicate CHANGELOG section headings' ] || fail "I: no separate collapse commit"
+[ "$(git -C "$WORK/wt-209" log -1 --format=%s HEAD~1)" = 'branch i' ] || fail "I: the collapse was not on top of the branch commit"
+unrel() { awk '/^## \[Unreleased\]/{u=1; next} /^## /{u=0} u' "$1"; }
+[ "$(unrel "$WORK/wt-209/CHANGELOG.md" | grep -c '^### Fixed$')" -eq 1 ] || fail "I: duplicate ### Fixed left: $(cat "$WORK/wt-209/CHANGELOG.md")"
+grep -qF -- '- **branch i**' "$WORK/wt-209/CHANGELOG.md" && grep -qF -- '- **four**' "$WORK/wt-209/CHANGELOG.md" || fail "I: a bullet was lost"
+grep -q 'collapsed duplicate CHANGELOG.md section headings' "$WORK/out.209" || fail "I: the collapse was not logged"
+
+# J. main itself carries a duplicate `### Fixed` (an earlier bad resolution); the branch adds
+#    a bullet. The collapse removes the base's heading line: accepted without the flag.
+git -C "$SEED" switch -q main
+awk '$0=="## [0.1.0] - 2026-01-01"{print "### Fixed"; print ""; print "- **dup base**"; print ""} {print}' "$SEED/CHANGELOG.md" > "$SEED/CHANGELOG.md.tmp"
+mv "$SEED/CHANGELOG.md.tmp" "$SEED/CHANGELOG.md"; git -C "$SEED" commit -qam 'bad resolution'; git -C "$SEED" push -q origin main
+mk_branch bj; cl_append "$SEED/CHANGELOG.md" '- **branch j**'; commit_push bj 'branch j'
+run bj 210 --no-push --gate none
+[ "$rc" -eq 0 ] || fail "J: a pure heading collapse was refused, rc=$rc: $(cat "$WORK/out.210")"
+git -C "$WORK/wt-210" diff origin/main..HEAD -- CHANGELOG.md | grep -qx -- '-### Fixed' || fail "J: the collapse removed no base heading (fixture did not exercise the guard)"
+grep -qF -- '- **dup base**' "$WORK/wt-210/CHANGELOG.md" || fail "J: the base's bullet was lost"
+
+# K. the same collapse plus a real removal IN THE SAME HUNK: the branch deletes the base
+#    bullet right above the duplicate heading, so the removed block is that bullet, a blank,
+#    the heading and a blank. Still exit 9, the bullet named. A separate-hunk removal beside
+#    an accepted collapse hunk is refused too.
+mk_branch bk
+victim=$(awk '/^## \[Unreleased\]/{u=1} u && /^### Fixed$/{n++; if (n==2) {print prev2; exit}} {prev2=prev1; prev1=$0}' "$SEED/CHANGELOG.md")
+[ -n "$victim" ] || fail "K: fixture found no bullet above the duplicate heading"
+grep -vxF -- "$victim" "$SEED/CHANGELOG.md" > "$SEED/CHANGELOG.md.tmp"; mv "$SEED/CHANGELOG.md.tmp" "$SEED/CHANGELOG.md"
+commit_push bk 'branch k'
+run bk 211 --no-push --gate none
+[ "$rc" -eq 9 ] || fail "K: a removal in a collapse hunk returned rc=$rc, want 9: $(cat "$WORK/out.211")"
+grep -qxF -- "-$victim" "$WORK/out.211" || fail "K: the removed bullet was not printed: $(cat "$WORK/out.211")"
+mk_branch bk2; cl_append "$SEED/CHANGELOG.md" '- **branch k2**'
+grep -vxF -- '- **two**' "$SEED/CHANGELOG.md" > "$SEED/CHANGELOG.md.tmp"; mv "$SEED/CHANGELOG.md.tmp" "$SEED/CHANGELOG.md"
+commit_push bk2 'branch k2'
+run bk2 212 --no-push --gate none
+[ "$rc" -eq 9 ] || fail "K2: a removal beside a collapse returned rc=$rc, want 9: $(cat "$WORK/out.212")"
+grep -qF -- '-- **two**' "$WORK/out.212" || fail "K2: the removed bullet was not printed"
+grep -qx -- '-### Fixed' "$WORK/out.212" && fail "K2: the accepted heading collapse was reported as a removal"
+
+echo "PASS land-prep base move: disjoint tolerated without re-gate, overlap/conflict refused, CHANGELOG union auto-resolve, heading collapse and guard"

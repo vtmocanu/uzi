@@ -177,4 +177,80 @@ cp "$WORK/clean.md" "$WORK/clean.orig"
 bash "$SCRIPT" "$WORK/clean.md" > "$WORK/clean.out" 2>&1 || fail "a marker-free file failed: $(cat "$WORK/clean.out")"
 cmp -s "$WORK/clean.orig" "$WORK/clean.md" || fail "a marker-free file was modified"
 
-echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, no-op"
+# 5. --collapse on a clean file: a repeated `### Fixed` under [Unreleased] (non-adjacent too)
+#    folds into the first; every other line stays byte-identical, released sections included.
+cat > "$WORK/col.md" <<'EOF'
+## [Unreleased]
+
+### Fixed
+
+- **branch fix**
+  branch desc
+
+### Fixed
+
+- **base fix**
+
+- **spaced base**
+
+### Changed
+
+- **changed**
+
+### Fixed
+
+- **late fix**
+
+## [0.1.0] - 2026-01-01
+
+### Fixed
+
+- **old**
+
+### Fixed
+
+- **old two**
+EOF
+cat > "$WORK/col.want" <<'EOF'
+## [Unreleased]
+
+### Fixed
+
+- **branch fix**
+  branch desc
+- **base fix**
+
+- **spaced base**
+- **late fix**
+
+### Changed
+
+- **changed**
+
+## [0.1.0] - 2026-01-01
+
+### Fixed
+
+- **old**
+
+### Fixed
+
+- **old two**
+EOF
+bash "$SCRIPT" --collapse "$WORK/col.md" > "$WORK/col.out" 2>&1 || fail "--collapse failed: $(cat "$WORK/col.out")"
+diff -u "$WORK/col.want" "$WORK/col.md" || fail "--collapse produced the wrong file"
+# 6. --collapse with no repeat: untouched (blank lines between bullets included).
+printf '## [Unreleased]\n\n### Fixed\n\n- a\n\n- b\n\n### Added\n\n- c\n' > "$WORK/nodup.md"
+cp "$WORK/nodup.md" "$WORK/nodup.orig"
+bash "$SCRIPT" --collapse "$WORK/nodup.md" > "$WORK/nodup.out" 2>&1 || fail "--collapse on a clean file failed"
+cmp -s "$WORK/nodup.orig" "$WORK/nodup.md" || fail "--collapse changed a file with no repeated heading"
+# 7. --collapse refuses conflict markers, file untouched.
+cp "$WORK/lossy.orig" "$WORK/mk.md"
+set +e
+bash "$SCRIPT" --collapse "$WORK/mk.md" > "$WORK/mk.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "--collapse on a conflicted file returned rc=$rc, want 1"
+cmp -s "$WORK/lossy.orig" "$WORK/mk.md" || fail "--collapse modified a conflicted file"
+
+echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, no-op, --collapse"

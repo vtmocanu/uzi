@@ -41,7 +41,11 @@
 #   5  rebase conflict — the worktree is left mid-rebase: resolve, `git add`, `git rebase
 #      --continue`, then re-run with --skip-rebase. A stop whose ONLY conflicted path is
 #      CHANGELOG.md is resolved automatically (changelog-union.sh keeps both sides) and the
-#      rebase continued, commit by commit; the CHANGELOG guard (exit 9) still runs after
+#      rebase continued, commit by commit; the CHANGELOG guard (exit 9) still runs after.
+#      After every completed rebase that leaves CHANGELOG.md in the branch diff, repeated
+#      `### <Section>` headings under [Unreleased] are collapsed in a separate
+#      "chore: collapse duplicate CHANGELOG section headings" commit (only if it changes
+#      anything)
 #   6  migration renumber needs hand work — the helper's report is printed and the tree is
 #      left dirty in the worktree: fix the other references, commit, re-run --skip-rebase
 #   7  a gate failed — log path printed; fix in the worktree, commit, re-run --skip-rebase.
@@ -51,16 +55,17 @@
 #   8  the remote head or base moved since this landing started, or the worktree and the
 #      remote diverged with no landing on record — start over with --fresh. A BASE move is
 #      tolerated (before the push, and at a --skip-rebase re-entry) when the base delta
-#      (`git diff --name-only <recorded> <new>`) and the branch's own files are disjoint
-#      (the migrations directory counts as one path) and `git rebase <new>` applies
-#      cleanly: the branch is rebased, the recorded base updated, and the push proceeds
+#      (`git diff --name-only <recorded> <new>`) and the branch's own files share no path
+#      but CHANGELOG.md (the migrations directory counts as one path) and `git rebase <new>`
+#      applies, a CHANGELOG.md-only stop union-resolved as for exit 5: the branch is rebased, the recorded base updated, and the push proceeds
 #      WITHOUT re-running the local gate. The local gate is a pre-push courtesy; merge.sh
 #      refuses anything without green required CI on the exact head, so CI stays the
-#      authoritative gate. An intersecting delta or a conflicting rebase (aborted, worktree
-#      restored) is still exit 8. The branch-head check has no such tolerance.
+#      authoritative gate; the CHANGELOG guard (exit 9) re-runs. Any other shared path or
+#      conflict (the rebase aborted, worktree restored) is still exit 8. The branch-head check has no such tolerance.
 #   9  the branch deletes CHANGELOG.md lines the base carries (usually a conflict resolved
 #      from a stale copy, e.g. a --fresh backup); restore them, or pass
-#      --allow-changelog-removals for a deliberate reword
+#      --allow-changelog-removals for a deliberate reword. A pure heading collapse (a
+#      duplicate `### ` heading plus adjacent blank lines) is not a removal
 set -uo pipefail
 
 REPO=""; PR=""; WT=""; SKIP_REBASE=0; GATE="auto"; PUSH=1; ROOT=""; REWORK_CHECK=1; FRESH=0; ALLOW_CL_RM=0
@@ -74,7 +79,7 @@ while [ $# -gt 0 ]; do
     --no-rework-check) REWORK_CHECK=0; shift;;
     --allow-changelog-removals) ALLOW_CL_RM=1; shift;;
     --repo-root) ROOT="${2:?}"; shift 2;;
-    -h|--help) sed -n '2,65p' "$0"; exit 2;;
+    -h|--help) sed -n '2,68p' "$0"; exit 2;;
     -*) echo "unknown flag: $1" >&2; exit 2;;
     *) if [ -z "$REPO" ]; then REPO="$1"; elif [ -z "$PR" ]; then PR="$1"; else echo "unexpected arg: $1" >&2; exit 2; fi; shift;;
   esac
@@ -198,24 +203,59 @@ rebase_in_progress() {
 delta_paths() {
   printf '%s\n' "$1" | sed -e '/^$/d' -e 's|^api/internal/store/migrations/.*|api/internal/store/migrations/|' | LC_ALL=C sort -u
 }
+# union_continue: a rebase has stopped. Nearly every PR adds a CHANGELOG.md bullet under
+# the same heading, so while CHANGELOG.md is the ONLY conflicted path, resolve it as a union
+# (changelog-union.sh), stage it and continue; a later commit may stop again, hence the loop.
+# Returns 0 once the rebase completes, 1 on any other stop (the rebase is left in progress).
+union_continue() {
+  local conflicted cu_out
+  while rebase_in_progress; do
+    conflicted=$(git diff --name-only --diff-filter=U | LC_ALL=C sort -u)
+    [ "$conflicted" = "CHANGELOG.md" ] || return 1
+    if ! cu_out=$(bash "$HERE/changelog-union.sh" CHANGELOG.md 2>&1); then
+      printf '%s\n' "$cu_out"; return 1
+    fi
+    git add CHANGELOG.md || return 1
+    log "auto-resolved the CHANGELOG.md conflict at $(git rev-parse --short REBASE_HEAD 2>/dev/null || echo '?') (union of both sides)"
+    if GIT_EDITOR=true git rebase --continue >/dev/null 2>&1; then return 0; fi
+  done
+  return 1
+}
+# collapse_changelog BASEREF: after a completed rebase, when the branch touches CHANGELOG.md,
+# collapse repeated `### <Section>` headings under [Unreleased] (a clean rebase keeps both
+# when a commit adds its own heading next to the base's). Committed separately, and only
+# when it changed the file; the CHANGELOG guard accepts such a pure heading collapse.
+collapse_changelog() {
+  local touched cu_out
+  touched=$(git diff --name-only "$1...HEAD" -- CHANGELOG.md) || return 1
+  [ -n "$touched" ] || return 0
+  if ! cu_out=$(bash "$HERE/changelog-union.sh" --collapse CHANGELOG.md 2>&1); then
+    printf '%s\n' "$cu_out"; log "CHANGELOG.md heading collapse refused"; return 1
+  fi
+  git diff --quiet -- CHANGELOG.md && return 0
+  git commit -q -m "chore: collapse duplicate CHANGELOG section headings" -- CHANGELOG.md || return 1
+  log "collapsed duplicate CHANGELOG.md section headings ($(git rev-parse --short HEAD))"
+}
 # try_base_move OLD NEW WHAT: origin/$BASE moved OLD -> NEW since this landing started.
 # Rebase onto NEW and re-record the base only when the base delta and the branch's own files
-# are disjoint and the rebase applies cleanly; otherwise leave the worktree as it was and
-# fail. The migrations directory counts as ONE path: a disjoint delta can still take the
-# branch's migration number. WHAT names what follows the rebase, for the log line.
+# share no path but CHANGELOG.md and the rebase applies (a CHANGELOG.md-only stop resolved by
+# union_continue); otherwise leave the worktree as it was and fail. The migrations directory
+# counts as ONE path: a disjoint delta can still take the branch's migration number. WHAT
+# names what follows the rebase, for the log line.
 try_base_move() {
-  local old="$1" new="$2" what="$3" delta mine both pre n
+  local old="$1" new="$2" what="$3" delta mine both rest pre n shared
   rebase_in_progress && return 1
   [ -z "$(git status --porcelain)" ] || { log "worktree is dirty; not rebasing onto the moved base"; return 1; }
   delta=$(git diff --no-renames --name-only "$old" "$new") || return 1
   mine=$(git diff --no-renames --name-only "$new...HEAD") || return 1
   both=$(LC_ALL=C comm -12 <(delta_paths "$delta") <(delta_paths "$mine"))
-  if [ -n "$both" ]; then
-    log "base delta ${old:0:8}..${new:0:8} touches the branch's own path(s): $(printf '%s' "$both" | tr '\n' ' ')"
+  rest=$(printf '%s\n' "$both" | sed -e '/^CHANGELOG\.md$/d' -e '/^$/d')
+  if [ -n "$rest" ]; then
+    log "base delta ${old:0:8}..${new:0:8} touches the branch's own path(s): $(printf '%s' "$rest" | tr '\n' ' ')"
     return 1
   fi
   pre=$(git rev-parse HEAD)
-  if ! git rebase "$new" --quiet >/dev/null 2>&1; then
+  if ! git rebase "$new" --quiet >/dev/null 2>&1 && ! union_continue; then
     git rebase --abort >/dev/null 2>&1
     [ "$(git rev-parse HEAD)" = "$pre" ] || git reset -q --hard "$pre"
     log "rebase onto the moved base ${new:0:8} conflicts; aborted, worktree back at ${pre:0:8}"
@@ -224,7 +264,9 @@ try_base_move() {
   BASE_SHA="$new"
   printf '%s' "$BASE_SHA" > "$BASE_FILE"
   n=$(printf '%s\n' "$delta" | sed '/^$/d' | wc -l | tr -d ' ')
-  log "base moved ${old:0:8} -> ${new:0:8}; delta disjoint from the branch ($n files); $what"
+  if [ -n "$both" ]; then shared="shares only CHANGELOG.md with the branch"; else shared="disjoint from the branch"; fi
+  log "base moved ${old:0:8} -> ${new:0:8}; delta $shared ($n files); $what"
+  collapse_changelog "$new" || exit 3
   return 0
 }
 if [ -f "$LEASE_FILE" ]; then
@@ -262,26 +304,10 @@ fi
 
 # ---- rebase -----------------------------------------------------------------------------
 if [ "$SKIP_REBASE" -eq 0 ]; then
-  rebased=0
-  if git rebase "origin/$BASE" --quiet; then
-    rebased=1
-  else
-    # Nearly every PR adds a CHANGELOG.md bullet under the same heading, so a stop whose
-    # ONLY conflicted path is CHANGELOG.md is resolved as a union and the rebase continued;
-    # a later commit may stop again, hence the loop. Anything else stops as exit 5.
-    while rebase_in_progress; do
-      conflicted=$(git diff --name-only --diff-filter=U | LC_ALL=C sort -u)
-      [ "$conflicted" = "CHANGELOG.md" ] || break
-      if ! cu_out=$(bash "$HERE/changelog-union.sh" CHANGELOG.md 2>&1); then
-        printf '%s\n' "$cu_out"; break
-      fi
-      git add CHANGELOG.md || break
-      log "auto-resolved the CHANGELOG.md conflict at $(git rev-parse --short REBASE_HEAD 2>/dev/null || echo '?') (union of both sides)"
-      if GIT_EDITOR=true git rebase --continue >/dev/null 2>&1; then rebased=1; break; fi
-    done
-  fi
-  if [ "$rebased" -eq 1 ]; then
+  # A CHANGELOG.md-only stop is resolved by union_continue; anything else stops as exit 5.
+  if git rebase "origin/$BASE" --quiet || union_continue; then
     log "rebased onto origin/$BASE ($(git rev-list --count "origin/$BASE..HEAD") commits)"
+    collapse_changelog "origin/$BASE" || exit 3
   else
     log "REBASE CONFLICT — worktree left mid-rebase in $WT:"
     git status --short | grep -E '^(UU|AA|DU|UD|DD)' || git status --short
@@ -340,19 +366,43 @@ fi
 # ---- CHANGELOG guard ------------------------------------------------------------------------
 # A rebase conflict resolved from a stale copy (a --fresh backup, an older branch state)
 # silently deletes entries that landed on the base meanwhile. The branch adds its own entry;
-# it has no business removing the base's.
-if [ "$ALLOW_CL_RM" -eq 0 ]; then
+# it has no business removing the base's. One removal is accepted: a pure heading collapse,
+# a hunk whose removed lines are only blank lines plus a `### ` heading that HEAD's
+# CHANGELOG.md still carries (collapse_changelog's output). Runs again after a pre-push
+# base-move rebase, which can union-resolve CHANGELOG.md.
+changelog_guard() {
+  local cl_diff removed have=/dev/null
+  [ "$ALLOW_CL_RM" -eq 0 ] || return 0
   if ! cl_diff=$(git diff --unified=0 "origin/$BASE..HEAD" -- CHANGELOG.md); then
     echo "cannot diff CHANGELOG.md against origin/$BASE" >&2; exit 3
   fi
-  removed=$(printf '%s\n' "$cl_diff" | grep -E '^-' | grep -vE '^--- (a/|/dev/null)' || true)
+  [ -f CHANGELOG.md ] && have=CHANGELOG.md
+  removed=$(printf '%s\n' "$cl_diff" | awk '
+    function flush(   i, ok, head) {
+      if (nr == 0) return
+      ok = 1; head = 0
+      for (i = 1; i <= nr; i++) {
+        if (R[i] ~ /^[ \t]*$/) continue
+        if (R[i] ~ /^### / && (R[i] in have)) { head = 1; continue }
+        ok = 0
+      }
+      if (!ok || !head) for (i = 1; i <= nr; i++) print "-" R[i]
+      nr = 0
+    }
+    FILENAME == ARGV[1] { have[$0] = 1; next }
+    /^@@/ { flush(); inh = 1; next }
+    !inh { next }
+    /^-/ { R[++nr] = substr($0, 2) }
+    END { flush() }
+  ' "$have" -) || { echo "cannot read the CHANGELOG.md diff" >&2; exit 3; }
   if [ -n "$removed" ]; then
     log "branch deletes CHANGELOG.md line(s) that origin/$BASE carries:"
     printf '%s\n' "$removed" | cut -c1-160
     echo "RESULT=changelog_removal WORKTREE=$WT"
     exit 9
   fi
-fi
+}
+changelog_guard
 
 # ---- gates --------------------------------------------------------------------------------
 lock_sha() {
@@ -434,6 +484,7 @@ if [ "$base_remote_now" != "$BASE_SHA" ]; then
   if git fetch origin "$BASE" --quiet && base_fetched=$(git rev-parse "origin/$BASE") \
       && try_base_move "$BASE_SHA" "$base_fetched" "rebased without re-gating: CI on the pushed head is the authoritative gate"; then
     moved=1
+    changelog_guard
     NEW_HEAD=$(git rev-parse HEAD)
   fi
   if [ "$moved" -eq 0 ]; then

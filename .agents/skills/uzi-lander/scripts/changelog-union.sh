@@ -2,33 +2,94 @@
 # changelog-union.sh — resolve a CHANGELOG.md rebase conflict by keeping BOTH sides, the
 # answer for a shared append-only list where every PR adds a bullet under the same heading.
 #
-# Usage: changelog-union.sh [FILE]      (default: CHANGELOG.md)
+# Usage: changelog-union.sh [--collapse] [FILE]      (default: CHANGELOG.md)
 #
 # Every conflict block keeps its first side, then its second; a diff3 base section
 # (`|||||||` .. `=======`) is dropped. Inside `## [Unreleased]`, a repeated `### <Section>`
 # heading is collapsed into its first occurrence (its bullets move under it) and blank lines
 # left between bullet items are dropped. A file with no conflict markers is left untouched.
 #
+# --collapse: for a marker-free file (a clean rebase can leave two `### Fixed` headings when a
+# commit adds its own next to the base's). Only a repeated `### <Section>` inside
+# `## [Unreleased]` changes: the repeat's heading and surrounding blank lines go, its lines
+# are appended to the first occurrence's; every other line stays byte-identical. No repeat,
+# no change. Conflict markers are refused (exit 1).
+#
 # Verification before the file is replaced: no marker survives, the multiset of content
 # lines (non-blank, non-marker, non-heading) from the resolved sides is identical before and
 # after, and the set of distinct headings is unchanged. Any miss leaves FILE untouched.
 #
-# Exit codes: 0 resolved (or no markers), 1 verification failed or malformed markers,
+# Exit codes: 0 resolved / collapsed (or nothing to do), 1 verification failed or malformed
+#             markers (or markers under --collapse),
 #             2 usage / unreadable file.
 set -uo pipefail
 
+MODE=union
+if [ "${1:-}" = --collapse ]; then MODE=collapse; shift; fi
 FILE="${1:-CHANGELOG.md}"
-[ $# -le 1 ] || { echo "usage: changelog-union.sh [FILE]" >&2; exit 2; }
+[ $# -le 1 ] || { echo "usage: changelog-union.sh [--collapse] [FILE]" >&2; exit 2; }
 [ -f "$FILE" ] && [ -r "$FILE" ] || { echo "changelog-union: cannot read $FILE" >&2; exit 2; }
 
 MARKER_RE='^(<<<<<<<( |$)|>>>>>>>( |$)|[|]{7}( |$)|=======$)'
-if ! grep -Eq "$MARKER_RE" "$FILE"; then
+if [ "$MODE" = collapse ]; then
+  if grep -Eq "$MARKER_RE" "$FILE"; then
+    echo "changelog-union: --collapse refuses a file with conflict markers; $FILE left untouched" >&2; exit 1
+  fi
+elif ! grep -Eq "$MARKER_RE" "$FILE"; then
   echo "changelog-union: no conflict markers in $FILE; nothing to do"
   exit 0
 fi
 
 tmpd=$(mktemp -d "${TMPDIR:-/tmp}/changelog-union.XXXXXX") || exit 2
 trap 'rm -rf "$tmpd"' EXIT
+
+if [ "$MODE" = collapse ]; then
+cp "$FILE" "$tmpd/before" || exit 2
+awk '
+  function blank(s) { return s ~ /^[ \t]*$/ }
+  { L[++n] = $0 }
+  END {
+    u = 0
+    for (i = 1; i <= n; i++) if (L[i] ~ /^## \[Unreleased\]/) { u = i; break }
+    if (u == 0) { for (i = 1; i <= n; i++) print L[i]; exit 0 }
+    e = n + 1
+    for (i = u + 1; i <= n; i++) if (L[i] ~ /^## /) { e = i; break }
+    ns = 0; np = 0; dup = 0
+    for (i = u + 1; i < e; i++) {
+      if (L[i] ~ /^### /) {
+        key = L[i]; sub(/[ \t]+$/, "", key)
+        if (!(key in first)) { first[key] = ns + 1 } else dup = 1
+        ns++; hd[ns] = L[i]; owner[ns] = first[key]; sc[ns] = 0; continue
+      }
+      if (ns == 0) P[++np] = L[i]
+      else S[ns, ++sc[ns]] = L[i]
+    }
+    if (!dup) { for (i = 1; i <= n; i++) print L[i]; exit 0 }
+    for (i = 1; i <= u; i++) print L[i]
+    for (i = 1; i <= np; i++) print P[i]
+    for (s = 1; s <= ns; s++) {
+      if (owner[s] != s) continue
+      print hd[s]
+      hi = sc[s]; while (hi >= 1 && blank(S[s, hi])) hi--
+      for (i = 1; i <= hi; i++) print S[s, i]
+      for (t = s + 1; t <= ns; t++) {
+        if (owner[t] != s) continue
+        lo = 1; th = sc[t]
+        while (lo <= th && blank(S[t, lo])) lo++
+        while (th >= lo && blank(S[t, th])) th--
+        if (lo <= th && hi == 0) { print ""; hi = -1 }  # the first occurrence had no body
+        for (i = lo; i <= th; i++) print S[t, i]
+      }
+      for (i = (hi > 0 ? hi : 0) + 1; i <= sc[s]; i++) print S[s, i]
+    }
+    for (i = e; i <= n; i++) print L[i]
+  }
+' "$FILE" > "$tmpd/out" || { echo "changelog-union: collapse failed; $FILE left untouched" >&2; exit 1; }
+if cmp -s "$FILE" "$tmpd/out"; then
+  echo "changelog-union: no duplicate headings under [Unreleased] in $FILE; nothing to do"
+  exit 0
+fi
+else
 
 # Pass 1: union the conflict blocks. Also emits, into $tmpd/before, every line the result
 # must keep (both sides and the unconflicted text; the diff3 base is dropped on purpose).
@@ -97,6 +158,7 @@ awk '
     for (i = e; i <= n; i++) print L[i]
   }
 ' "$tmpd/union" > "$tmpd/out" || { echo "changelog-union: collapse failed; $FILE left untouched" >&2; exit 1; }
+fi
 
 # ---- verification ---------------------------------------------------------------------------
 if grep -Eq "$MARKER_RE" "$tmpd/out"; then
@@ -114,5 +176,5 @@ if ! diff <(headings "$tmpd/before") <(headings "$tmpd/out") > "$tmpd/headings.d
 fi
 
 cat "$tmpd/out" > "$FILE" || { echo "changelog-union: cannot write $FILE" >&2; exit 2; }
-echo "changelog-union: resolved $FILE (both sides kept)"
+if [ "$MODE" = collapse ]; then echo "changelog-union: collapsed duplicate headings in $FILE"; else echo "changelog-union: resolved $FILE (both sides kept)"; fi
 exit 0

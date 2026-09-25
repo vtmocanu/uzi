@@ -194,14 +194,15 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
                                            # on a collision, task gate:<touched>, --force-with-lease push
    ```
 
-   A conflict on `CHANGELOG.md` alone is auto-resolved as a union (`changelog-union.sh`).
+   A conflict on `CHANGELOG.md` alone is auto-resolved as a union (`changelog-union.sh`);
+   duplicate `###` headings under `[Unreleased]` get their own collapse commit.
    Exit 5 = any other conflict, worktree left mid-rebase: resolve (a union of both sides is
    usual for a shared list), `git rebase --continue`, re-run with `--skip-rebase`. Exit 6 = the
    renumber helper reported references to fix by hand. Exit 7 = a gate failed (log path
    printed; a missing or lockfile-stale `node_modules` is reinstalled first with
-   `npm ci --ignore-scripts`). A base move disjoint from the branch's files is rebased
-   without re-gating (CI on the pushed head is the gate). Exit 8 = the branch moved, or
-   the base moved into the branch's files or conflicts: restart with `--fresh`; it resets to
+   `npm ci --ignore-scripts`). A base move sharing no branch file but `CHANGELOG.md` is
+   rebased without re-gating (CI on the pushed head is the gate). Exit 8 = the branch
+   moved, or the base moved into other branch files or conflicts: restart with `--fresh`; it resets to
    the remote, so cherry-pick back any commit it names under `FRESH_BACKUP=`, but never a
    whole file from that backup: it predates what landed on the base since. Exit 9 = the
    branch deletes `CHANGELOG.md` lines the base carries (a stale-copy resolution): restore
