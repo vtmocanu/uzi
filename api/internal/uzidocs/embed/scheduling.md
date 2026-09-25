@@ -301,8 +301,9 @@ exceed `max_issues` once backfill walks past a skip), which ones
   eligibility changed between candidate selection and run creation — or on
   a pinned-issue fire, where no upfront filter applies. It's benign, and
   the schedule advances normally.
-- `already_running` — an active run already exists for that issue (or,
-  for the schedule itself, a dedup at fire time).
+- `already_running` — an active run already exists for that issue, or a
+  CI-fix / MR-rework run is working its branch (or, for the schedule itself,
+  a dedup at fire time).
 - `description_too_large` — the composed run instruction (issue body
   plus any [guidance](#guidance)) exceeds the size limit.
 - `fetch_failed` — a transient forge or database error while checking

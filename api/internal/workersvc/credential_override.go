@@ -84,8 +84,8 @@ var (
 // no work of its own beyond delegating — the validation, the D9/D10 refusals and the
 // column resolution all live in the one validator — and returns the same resolved
 // *CredentialOverride (nil = inherit) or one of the exported typed refusals the handler
-// maps to HTTP statuses (404/409/422/400). Wired by CreateRun in M2 and by run set-token /
-// schedule create-edit in M4/M6.
+// maps to HTTP statuses (404/409/422/400). Wired by run set-token / schedule create-edit in
+// M4/M6; createRun calls validateCredentialOverrideOn with its transaction's queries instead.
 func (s *Service) ResolveCredentialOverride(ctx context.Context, userID uuid.UUID, kind, harness, mode string, secretID *uuid.UUID) (*CredentialOverride, error) {
 	return s.validateCredentialOverride(ctx, userID, kind, harness, mode, secretID)
 }

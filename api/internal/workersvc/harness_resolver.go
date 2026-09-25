@@ -406,7 +406,7 @@ var errCodexCreateRequiresTx = errors.New("codex run creation requires an atomic
 //
 // The insert closure receives the transaction-bound *store.Queries AND the resolved harness, so
 // it stamps runs.harness with the D11 result and (M2/M3) can validate a #1247 credential
-// override against that EXACT harness inside the same tx via ResolveCredentialOverride(...,
+// override against that EXACT harness inside the same tx via validateCredentialOverrideOn(ctx, q, ...,
 // string(resolved.Harness), ...) — D5's "resolved-once-inside-the-tx", not a pre-transaction
 // guess. (M1 builds and proves the seam; M2/M3 wire the production origins onto it.)
 //

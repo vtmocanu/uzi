@@ -99,7 +99,7 @@ func TestActiveIssueRunBlocksMRReworkAndCIFixLiveDB(t *testing.T) {
 // (b) An active mr_rework on agent/issue-N blocks a FORCED issue run for N. force bypasses only
 // the open-MR guard; before issue #1626 the branch check saw only ci_fix, so a forced create
 // put an issue run beside the rework. An UNFORCED create keeps its pre-#1626 answer, the
-// open-MR refusal, NOT ErrBranchInUse: an active mr_rework always implies the completed source
+// open-MR refusal, NOT ErrBranchInUse: an active mr_rework normally implies the completed source
 // run's open MR, and every issue-create caller (autopilot, scheduler, handlers) already maps
 // OpenMRExistsError to a skip / "use --force". The branch fast-fail therefore runs AFTER the
 // active-run gate and the open-MR guard.
@@ -329,7 +329,7 @@ func testCreateWaitsOnRunBranchLock(t *testing.T, n int64,
 	select {
 	case err := <-done:
 		if !errors.Is(err, ErrBranchInUse) {
-			t.Fatalf("create after the issue run committed = %v, want ErrBranchInUse", err)
+			t.Fatalf("create after the held run committed = %v, want ErrBranchInUse", err)
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatalf("create did not return within 15s of the commit")

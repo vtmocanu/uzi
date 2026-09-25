@@ -258,7 +258,7 @@ func (c *Cache) CapabilityAwareScheduling(ctx context.Context) (bool, error) {
 // instance-wide (PRD #1226 M1, D1; #1626). Stored as "true"/"false"; any other value
 // falls back to the compiled-in default (TRUE), the same junk-tolerance and the same
 // default-on posture as CapabilityAwareScheduling. It is an admin kill-switch (Admin ->
-// Settings -> Completion check): an explicit "false" row keeps it off. The
+// Instance settings -> Completion check): an explicit "false" row keeps it off. The
 // createRun path threads the result in as the completion_contract_version stamp gate
 // (Claude-harness, unseeded runs only). A boolSetting read error propagates alongside the
 // value: on a cold read error (no valid cache snapshot) the value is the default (true)

@@ -5434,8 +5434,8 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// reverse checks live in createCIFixRun and createMRReworkRun.
 	//
 	// ORDER MATTERS: it runs AFTER the active-run gate and the open-MR guard above. An
-	// active mr_rework on agent/issue-<iid> always implies a completed issue run with an OPEN
-	// MR, so an UNFORCED create must keep getting OpenMRExistsError (which every caller
+	// active mr_rework on agent/issue-<iid> normally implies a completed issue run with an OPEN
+	// MR (unless that MR was merged or closed meanwhile), so an UNFORCED create must keep getting OpenMRExistsError (which every caller
 	// already maps to a skip / "use --force"); only a FORCED create reaches this check and
 	// gets ErrBranchInUse. An active ci_fix without an open MR likewise reaches it unforced.
 	fixing, err := s.q.CountActiveBranchRunsForRef(ctx, store.CountActiveBranchRunsForRefParams{
