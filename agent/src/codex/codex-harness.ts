@@ -104,7 +104,7 @@ import type {
 import type { CallbackResult, CodexCallbackBroker } from "./broker.js";
 import type { CodexAppServerAuthMode, CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { ExecutionRegistry, RegisteredRoot } from "./registry.js";
-import type { CodexNotification, CodexTransport } from "./transport.js";
+import { CodexTransportError, type CodexNotification, type CodexTransport } from "./transport.js";
 import type { RenderedCodexRun } from "./render.js";
 
 // --- typed harness error ------------------------------------------------------
@@ -121,6 +121,14 @@ export class CodexHarnessError extends Error {
     super(failure.message);
     this.name = "CodexHarnessError";
     this.failure = failure;
+  }
+}
+
+/** A rejected thread/resume, with no provider response content exposed to callers. */
+export class CodexResumeError extends Error {
+  constructor() {
+    super("codex thread/resume failed");
+    this.name = "CodexResumeError";
   }
 }
 
@@ -1231,23 +1239,31 @@ export class CodexHarness implements RunHarness {
     rendered: RenderedCodexRun,
   ): Promise<string> {
     const resumeId = request.resumeSessionId;
-    const res = await transport.request<{ thread?: { id?: string } }>(
-      "thread/resume",
-      {
-        threadId: resumeId,
-        model: this.currentModel,
-        modelProvider: this.provider.name,
-        cwd: this.workspace,
-        approvalPolicy: "never",
-        config: this.threadConfig(),
-        developerInstructions: rendered.leadPrompt.systemPrompt,
-      },
-      { signal: request.signal },
-    );
-    const id = res?.thread?.id;
-    if (typeof id !== "string" || id.length === 0) {
-      throw new CodexHarnessError({ category: "protocol", message: "codex thread/resume returned no thread id" });
+    let res: { thread?: { id?: string } };
+    try {
+      res = await transport.request<{ thread?: { id?: string } }>(
+        "thread/resume",
+        {
+          threadId: resumeId,
+          model: this.currentModel,
+          modelProvider: this.provider.name,
+          cwd: this.workspace,
+          approvalPolicy: "never",
+          config: this.threadConfig(),
+          developerInstructions: rendered.leadPrompt.systemPrompt,
+        },
+        { signal: request.signal },
+      );
+    } catch (error) {
+      // Only a provider rejection of thread/resume is a lost lineage. Transport
+      // timeouts, EOF, and cancellation must retain their original failure path.
+      if (request.signal.aborted || !(error instanceof CodexTransportError) ||
+          error.failure.category !== "protocol" ||
+          !error.message.startsWith("codex app-server returned a JSON-RPC error")) throw error;
+      throw new CodexResumeError();
     }
+    const id = res?.thread?.id;
+    if (typeof id !== "string" || id.length === 0) throw new CodexResumeError();
     return id;
   }
 

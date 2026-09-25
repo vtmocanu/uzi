@@ -45,7 +45,7 @@ import { MessageBatcher } from "../src/batcher.js";
 import { MAX_PROJECTED_BYTES } from "../src/codex/projection.js";
 import type { WorkerClient } from "../src/client.js";
 import type { OutgoingMessage } from "../src/protocol.js";
-import type { CodexNotification, CodexTransport } from "../src/codex/transport.js";
+import { CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
 import type { RunContext, EmittedMessage, Executor, WallParkOutcome } from "../src/executor.js";
 import { PauseNowSignal } from "../src/steering.js";
 import type { Logger } from "../src/log.js";
@@ -1370,26 +1370,65 @@ describe("CodexExecutor: credential bridge + isolation", () => {
 
   it("(12) a resume seeds adopt (credential-free) AND still releases a fresh token", async () => {
     const rig = makeRig();
-    rig.transport.push(threadStarted("resumed-1")).push(signalDone("resumed-1", "tn-1")).push(turnCompleted("completed", "resumed-1")).end();
+    rig.transport.requestOverride = (c) => c.method === "thread/resume"
+      ? Promise.resolve({ thread: { id: "prior-session" } })
+      : undefined;
+    rig.transport.push(threadStarted("prior-session")).push(signalDone("prior-session", "tn-1")).push(turnCompleted("completed", "prior-session")).end();
     const { ctx } = makeCtx({ sessionId: "prior-session" });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "resume run");
     assert.ok(rig.sessionOps.adopt >= 1, "adopt seeded the credential-free session subset");
     assert.equal(rig.client.releaseCalls.length, 1, "a resumed root still releases a fresh token");
     const resume = rig.transport.requests.find((r) => r.method === "thread/resume");
     assert.ok(resume, "the harness resumed the prior session");
-    assert.equal(rec(resume.params).threadId, "prior-session", "the claimed thread is the one adopted by the turn");
+    assert.equal(rec(resume.params).threadId, "prior-session", "the claimed thread is resumed");
+    const turnStart = rig.transport.requests.find((r) => r.method === "turn/start");
+    assert.ok(turnStart);
+    assert.equal(rec(turnStart.params).threadId, "prior-session", "the resumed turn uses the exact claimed thread id");
   });
 
   it("falls back to a fresh thread when the provider rejects the claimed resume", async () => {
     const rig = makeRig();
     rig.transport.requestOverride = (c) => c.method === "thread/resume"
-      ? Promise.reject(new Error("codex app-server returned a JSON-RPC error (code -32602)"))
+      ? Promise.reject(new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" }))
       : undefined;
     rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
     const { ctx, emitted } = makeCtx({ sessionId: "claimed-thread" });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "resume rejection fallback");
     assert.ok(rig.transport.requests.some((r) => r.method === "thread/resume"));
     assert.ok(rig.transport.requests.some((r) => r.method === "thread/start"));
+    assert.ok(emitted.some((m) => m.payload.event === "resume_lineage_break"));
+  });
+
+  it("does not break lineage when turn/start fails after a successful resume", async () => {
+    const rig = makeRig();
+    const rpcError = new Error("codex app-server returned a JSON-RPC error (code -32602)");
+    rig.transport.requestOverride = (c) => {
+      if (c.method === "thread/resume") return Promise.resolve({ thread: { id: "claimed-thread" } });
+      if (c.method === "turn/start") return Promise.reject(rpcError);
+      return undefined;
+    };
+    const { ctx, emitted } = makeCtx({ sessionId: "claimed-thread" });
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "resumed turn/start failure"),
+      (error: unknown) => error === rpcError,
+    );
+    assert.equal(rig.transport.requests.filter((r) => r.method === "thread/resume").length, 1);
+    const turns = rig.transport.requests.filter((r) => r.method === "turn/start");
+    assert.equal(turns.length, 1, "the failed turn is not retried");
+    assert.equal(rec(turns[0]?.params).threadId, "claimed-thread");
+    assert.equal(rig.transport.requests.filter((r) => r.method === "thread/start").length, 0);
+    assert.equal(emitted.filter((m) => m.payload.event === "resume_lineage_break").length, 0);
+  });
+
+  it("falls back when thread/resume returns no thread id", async () => {
+    const rig = makeRig();
+    rig.transport.requestOverride = (c) => c.method === "thread/resume"
+      ? Promise.resolve({ thread: {} })
+      : undefined;
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx, emitted } = makeCtx({ sessionId: "claimed-thread" });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "resume without id fallback");
+    assert.equal(rig.transport.requests.filter((r) => r.method === "thread/start").length, 1);
     assert.ok(emitted.some((m) => m.payload.event === "resume_lineage_break"));
   });
 

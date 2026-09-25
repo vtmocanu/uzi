@@ -94,6 +94,7 @@ import {
 } from "./safety.js";
 import {
   CodexHarness,
+  CodexResumeError,
   type CodexChildSink,
   type CodexLaunchRootResult,
   type CodexLaunchRootSpec,
@@ -2415,8 +2416,7 @@ export class CodexExecutor implements Executor {
         } catch (error) {
           // A rejected thread/resume has started no model turn. The persisted rollout may
           // have disappeared or the provider may refuse it despite a successful preflight.
-          const message = errMessage(error);
-          if (!resumeId || !/JSON-RPC error|thread\/resume returned no thread id/.test(message)) throw error;
+          if (!resumeId || !(error instanceof CodexResumeError)) throw error;
           this.log.warn("codex provider rejected resumed thread; starting a fresh session", { run_id: ctx.runId });
           ctx.emit({ kind: "status", agent: "worker", payload: {
             text: "the earlier Codex session was rejected by the provider — continuing WITHOUT its earlier context, so some work may be repeated",
