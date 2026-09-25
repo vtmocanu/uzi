@@ -211,11 +211,11 @@ Schedules created together this way share a **display-only** group id
 server-side, but the **Schedules** tab renders each sibling as its own
 independent row — no expandable summary, no sub-rows — the same as a
 default enabled on several repos (see [Default jobs](#default-jobs)
-below). The list does not keep siblings adjacent: it sorts by next fire.
-For a default job, a catalog card's "Enabled on N repos" link shows every
-repo it runs on by filtering the list to that job; custom siblings have no
-job filter; they share the schedule's name, and the Repo select narrows
-the list to one repo.
+below). The list does not group siblings: it orders rows by status and
+next fire, so siblings sit together only when they share a fire time. For
+a default job, a catalog card's "Enabled on N repos" link filters the list
+to every repo that job runs on. Custom siblings have no job filter; the
+Repo select narrows the list to one repo.
 
 **The grouping is data only, not a linked job.** Each sibling is its own
 independent schedule row: editing, pausing, or removing one never touches

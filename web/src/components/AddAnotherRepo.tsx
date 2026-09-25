@@ -33,7 +33,7 @@ export function AddAnotherRepo({
   }
   return (
     <div className="flex flex-wrap items-center gap-2 px-1 pt-1">
-      <span className="text-[12px] text-muted">Add another repo:</span>
+      <span className="text-[12px] text-muted">Add to another repo:</span>
       <select
         aria-label={`Add ${name} on another repo`}
         value={repoId}

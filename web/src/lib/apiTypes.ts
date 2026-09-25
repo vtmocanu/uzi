@@ -1615,8 +1615,9 @@ export interface Schedule {
   // Display-only sibling grouping key (PRD #636). Purely a view-grouping tag for custom
   // (origin='user') rows — the analog of catalog_slug for defaults — carrying no
   // behavior: editing one sibling never touches another. null = standalone row (the
-  // common single-repo case); a non-null id shared by ≥2 live rows renders them as one
-  // expandable group. Owner-scoped, so it can only ever group the caller's own rows.
+  // common single-repo case); a non-null id is shared by ≥2 live rows. The Schedules page
+  // lists each sibling as its own row (PRD #1645 D2). Owner-scoped, so it can only ever
+  // group the caller's own rows.
   sibling_group_id: string | null;
   created_at: string;
   updated_at: string;
