@@ -363,6 +363,15 @@ export class SteeringChannel {
     for (const w of this.receiptWaiters.splice(0)) w.resolve();
   }
 
+  /** Drop the held batch and reject the reports waiting on it, without making the failure
+   *  sticky: later reports, with nothing pending, go out. */
+  private rejectHeld(err: InputReceiptError): void {
+    this.held = undefined;
+    this.applyFailures = 0;
+    this.ackFailures = 0;
+    for (const w of this.receiptWaiters.splice(0)) w.reject(err);
+  }
+
   /** Give up the applied receipt of a routed batch on an active claim: stop polling, fail every
    *  report waiting on it and every parked waiter. The rows stay unapplied for a later claim. */
   private failReceipts(err: InputReceiptError): void {
@@ -399,10 +408,16 @@ export class SteeringChannel {
       // After routing, a definitive refusal (a row-state conflict and the like) means the applied
       // receipt will never land: fail the waiting reports like a give-up instead of releasing
       // them unapplied. A pending switch still just drops the batch; its own path releases the claim.
-      if (this.held.phase !== "ack" && reason !== "switch_pending")
-        return this.failReceipts(new InputReceiptError(
+      if (this.held.phase !== "ack") {
+        const refused = new InputReceiptError(
           `the applied receipt for ${this.held.ids.length} routed operator input(s) was refused: ${errMessage(err)}`,
-        ));
+        );
+        // A pending switch: reject only the reports waiting now and drop the batch for the next
+        // claim. Polling continues, so the switch signal still trips and its release report,
+        // which finds nothing pending, is not refused.
+        if (reason === "switch_pending") return this.rejectHeld(refused);
+        return this.failReceipts(refused);
+      }
       return this.releaseHeld();
     }
     if (this.held.phase === "ack") {
@@ -1556,10 +1571,9 @@ export class ChatSteering implements ChatInputSource {
           this.held = undefined;
           this.applyFailures = 0;
         } else if (this.held?.phase === "applied" && ++this.applyFailures >= ACTIVE_APPLY_ATTEMPTS) {
-          // Nothing waits on a chat's applied receipt, so giving it up only drops the batch: the
-          // next GET replays the rows, which are ACKed and applied again but not re-routed.
-          this.held = undefined;
-          this.applyFailures = 0;
+          // A routed follow-up is still unapplied: completing the chat would block its replay, so
+          // treat the claim as lost (no terminal report), as the stop path does.
+          this.loseClaim();
         }
         this.log.warn("chat steering: input poll failed", {
           run_id: this.runId,

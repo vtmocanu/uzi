@@ -694,14 +694,15 @@ export class FakeApi {
       if (kind === "ack") {
         for (const id of ids) acked.add(id);
         this.ackedByRun.set(runId, acked);
-      } else {
-        for (const id of ids) applied.add(id);
-        this.appliedByRun.set(runId, applied);
-        // GET /follow-ups returns APPLIED follow-ups (ListConsumedFollowUpInputsForRun).
+        // GET /follow-ups returns RECEIVED follow-ups, applied or not (ListConsumedFollowUpInputsForRun).
         const consumed = this.consumedFollowUpsByRun.get(runId) ?? [];
         for (const row of rows.filter((row) => ids.includes(row.id) && row.kind === "follow_up"))
           if (!consumed.some((old) => old.id === row.id)) consumed.push(row);
+        consumed.sort((a, b) => a.id - b.id);
         this.consumedFollowUpsByRun.set(runId, consumed);
+      } else {
+        for (const id of ids) applied.add(id);
+        this.appliedByRun.set(runId, applied);
       }
       const remaining = this.lostReceiptReplies.get(kind) ?? 0;
       if (remaining > 0) {

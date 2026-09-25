@@ -47,8 +47,8 @@ func TestListConsumedFollowUpInputsForRunLiveDB(t *testing.T) {
 		mustExec(ctx, t, f.pool, insert, run, s.kind, s.body, s.consumed, float64(i))
 	}
 	mustExec(ctx, t, f.pool, insert, other, "follow_up", "another run's follow-up", true, float64(0))
-	// An ACKed receipt has been picked up but is not yet applied; the next claim
-	// receives it through /inputs rather than treating it as earlier constraints.
+	// An ACKed receipt has been picked up but is not yet applied (issue #1673): it is already a
+	// constraint, so the next claim's seed includes it, in id order; /inputs still replays it.
 	mustExec(ctx, t, f.pool, `INSERT INTO run_user_inputs (run_id, kind, body, consumed_at)
 		VALUES ($1, 'follow_up', 'acked but unapplied', now())`, run)
 
@@ -60,9 +60,9 @@ func TestListConsumedFollowUpInputsForRunLiveDB(t *testing.T) {
 	for _, r := range rows {
 		got = append(got, r.Body.String)
 	}
-	want := []string{"screen strings only", "use port 5433"}
-	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
-		t.Fatalf("consumed follow-ups = %q, want %q (follow_up only, consumed only, this run only, oldest first)", got, want)
+	want := []string{"screen strings only", "use port 5433", "acked but unapplied"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("consumed follow-ups = %q, want %q (follow_up only, received only, this run only, oldest first)", got, want)
 	}
 	if rows[0].ID >= rows[1].ID {
 		t.Fatalf("ids %d, %d: want ascending creation order", rows[0].ID, rows[1].ID)

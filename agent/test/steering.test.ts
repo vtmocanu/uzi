@@ -993,6 +993,26 @@ describe("ChatSteering", () => {
     }
   });
 
+  it("marks the claim lost when a routed follow-up's APPLIED fails 30 times on the active claim", async () => {
+    const row = inp("follow_up", "never confirmed");
+    let applies = 0;
+    const client = {
+      getInputs: async () => ({ receipts: true, inputs: [row] }),
+      ackInputs: async () => ({ inputs: [row], active: true }),
+      applyInputs: async () => { applies++; throw new RequestError("POST", "/inputs/applied", 503, "unavailable"); },
+    } as unknown as WorkerClient;
+    const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "message", text: "never confirmed" });
+      for (let i = 0; i < 500 && !ch.claimLost(); i++) await tick(2);
+      assert.strictEqual(ch.claimLost(), true, "the chat must not complete over an unapplied follow-up");
+      assert.strictEqual(applies, 30);
+    } finally {
+      await ch.stop();
+    }
+  });
+
   it("marks the claim lost when an APPLIED retry reports the claim inactive", async () => {
     const row = inp("follow_up", "applied then released");
     let applies = 0;
@@ -1735,6 +1755,37 @@ describe("input receipts", () => {
       assert.strictEqual(ch.pullFollowUp(), "eight");
       await ch.awaitReceiptSettlement();
     } finally {
+      await ch.stop();
+    }
+  });
+
+  it("rejects the waiting report on a switch_pending APPLIED, drops the batch, and keeps polling", async () => {
+    const row: UserInput = { id: 7, kind: "follow_up", body: "seven" };
+    let gets = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const client = {
+      getInputs: async () => { gets++; return { receipts: true, inputs: gets === 1 ? [row] : [] }; },
+      ackInputs: async () => ({ inputs: [row], active: true }),
+      applyInputs: async () => {
+        await gate;
+        throw new RequestError("POST", "/inputs/applied", 409, JSON.stringify({ error: "conflict", reason: "switch_pending" }));
+      },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "seven" });
+      await tick();
+      const waiting = ch.awaitReceiptSettlement();
+      release();
+      await assert.rejects(waiting, (err: Error) => err.name === "InputReceiptError", "the resume report must not go out unapplied");
+      await ch.awaitReceiptSettlement(); // not sticky: the switch's own release report still goes out
+      const seen = gets;
+      await until(() => gets > seen);
+      assert.strictEqual(ch.claimFence(), undefined);
+    } finally {
+      release();
       await ch.stop();
     }
   });

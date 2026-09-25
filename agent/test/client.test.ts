@@ -623,7 +623,8 @@ describe("getConsumedFollowUps (issue #1660)", () => {
     assert.deepStrictEqual(await client.getConsumedFollowUps("run-fu"), [], "GET is read only");
     api.setInputClaimGeneration("run-fu", 0);
     await client.ackInputs("run-fu", [3, 4, 5], 0);
-    assert.deepStrictEqual(await client.getConsumedFollowUps("run-fu"), [], "an ACK alone is not applied");
+    // Issue #1673: a received (ACKed) follow-up is already a constraint, applied or not.
+    assert.deepStrictEqual((await client.getConsumedFollowUps("run-fu")).map((i) => i.id), [3, 5]);
     await client.applyInputs("run-fu", [3, 4, 5], 0);
     const got = await client.getConsumedFollowUps("run-fu");
     assert.deepStrictEqual(got.map((i) => [i.id, i.kind, i.body]), [
