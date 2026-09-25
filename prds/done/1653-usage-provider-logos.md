@@ -1,7 +1,7 @@
 # PRD #1653: Provider logos and account names on usage meters and run badges
 
 **Issue**: [#1653](https://github.com/vtmocanu/uzi/issues/1653) | **Priority**: Medium
-**Status**: In progress (M1–M5 and M7 landed on `agent/issue-1653`; M6's PNG render and M8 pending); every decision below was locked by the maintainer on 2026-09-25 after a two-agent brainstorm (Claude + Codex) over before/after mocks
+**Status**: Complete (M1–M8; landed via PR #1661, 2026-09-25); every decision below was locked by the maintainer on 2026-09-25 after a two-agent brainstorm (Claude + Codex) over before/after mocks
 **Evidence baseline**: `98b06216` (2026-09-25); refresh file anchors on the implementation base
 **Mocks**: `prds/mockups/1653-usage-provider-icons-mock.html` (web; open locally) and `prds/mockups/1653-usage-provider-icons-tui-mock.sh` (TUI strip; `bash` it, `NO_COLOR=1` for the stripped profile). Fixture names only. The web mock uses literal hex values; the product uses theme tokens. Where a mock and the *Binding design decisions* disagree, the decisions win. The web mock's "Icon options" section and its option C are exploration, not scope.
 
