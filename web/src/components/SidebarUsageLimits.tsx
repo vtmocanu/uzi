@@ -44,17 +44,22 @@ function useSidebarSelection(): { tokenIds: string[]; codexAccountIds: string[] 
   const [codexAccountIds, setCodexAccountIds] = useState<string[]>([]);
   useEffect(() => {
     let alive = true;
-    const load = () =>
-      api
+    // Each load gets a sequence number; a response is applied only if it belongs to the
+    // latest load, so a slow mount fetch cannot overwrite a newer selection saved since.
+    let latest = 0;
+    const load = () => {
+      const seq = ++latest;
+      return api
         .getMySettings()
         .then(({ settings }) => {
-          if (!alive) return;
+          if (!alive || seq !== latest) return;
           setTokenIds(settings.sidebar_token_ids ?? []);
           setCodexAccountIds(settings.sidebar_codex_account_ids ?? []);
         })
         // A failed fetch keeps the last known set — degrading to default-only on a
         // transient error would look like the user's choice being reverted.
         .catch(() => {});
+    };
     load();
     const off = onSidebarTokensChanged(load);
     return () => {

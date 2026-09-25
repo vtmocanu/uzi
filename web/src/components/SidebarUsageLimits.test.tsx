@@ -265,6 +265,27 @@ describe("SidebarUsageLimits: one account list (PRD #1653 D-W2)", () => {
   });
 });
 
+describe("SidebarUsageLimits: selection refetch ordering", () => {
+  it("ignores a stale settings response that resolves after a newer one", async () => {
+    // The mount load is held; a Settings save (the change event) then loads the newer
+    // selection, which resolves first. When the older mount response lands last it must
+    // not overwrite the user's newer choice.
+    let resolveMount: (v: Awaited<ReturnType<typeof api.getMySettings>>) => void = () => {};
+    mockApi.getMySettings.mockReset();
+    mockApi.getMySettings
+      .mockImplementationOnce(() => new Promise((r) => (resolveMount = r)))
+      .mockResolvedValueOnce(settings(["sec-2"], []));
+    mockData([team, consoleKey], [codexDefault]);
+    renderList();
+    await screen.findByRole("group", { name: "Claude account team" });
+    emitSidebarTokensChanged();
+    await screen.findByRole("group", { name: "Claude account console-key" });
+    resolveMount(settings([], []));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.getByRole("group", { name: "Claude account console-key" })).toBeTruthy();
+  });
+});
+
 describe("SidebarUsageLimits: Codex bucket captions (PRD #1653 D-W3)", () => {
   it("shows no caption for an account whose only bucket is the main 'codex' one", async () => {
     mockData([], [codexDefault]);
