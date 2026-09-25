@@ -9,7 +9,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/settings"
 )
 
-// completion_default_on_livedb_test.go pins issue #1626's default-on, Claude-only stamp
+// completion_default_on_livedb_test.go pins the default-on stamp for both harnesses
 // end to end: a REAL settings.Cache over the test database (no fake reader), the production
 // Service.CreateRun path, and the harness the create transaction actually resolves. The
 // completion_interlock_rollout row is instance-global, so these cases run serially (no
@@ -82,9 +82,8 @@ func TestCompletionInterlockDefaultOnStampsClaudeLiveDB(t *testing.T) {
 	assertContractVersion(t, env, runID, true)
 }
 
-// (ii) No row + a Codex-only user: the switch is on, but CodexExecutor does not run the
-// completion-attempt loop (#1627), so the run must stay legacy (NULL) with harness='codex'.
-func TestCompletionInterlockDefaultOnSkipsCodexLiveDB(t *testing.T) {
+// (ii) No row + a Codex-only user: the default-on switch stamps the Codex run.
+func TestCompletionInterlockDefaultOnStampsCodexLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	resetInterlockSetting(t, env)
 	userID, repoID := seedCodexOnlyOriginUser(t, env)
@@ -92,7 +91,7 @@ func TestCompletionInterlockDefaultOnSkipsCodexLiveDB(t *testing.T) {
 
 	const iid = 92002
 	runID := createInterlockRun(t, env, svc, userID, repoID, iid, HarnessCodex)
-	assertContractVersion(t, env, runID, false)
+	assertContractVersion(t, env, runID, true)
 }
 
 // (iii) An explicit "false" row is the admin kill-switch: a Claude run stays legacy.
@@ -108,8 +107,8 @@ func TestCompletionInterlockExplicitFalseKeepsClaudeLegacyLiveDB(t *testing.T) {
 	assertContractVersion(t, env, runID, false)
 }
 
-// (iv) An explicit "true" row still never stamps a Codex run.
-func TestCompletionInterlockExplicitTrueSkipsCodexLiveDB(t *testing.T) {
+// (iv) An explicit "true" row stamps a Codex run.
+func TestCompletionInterlockExplicitTrueStampsCodexLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	resetInterlockSetting(t, env)
 	setInterlockSetting(t, env, "true")
@@ -118,5 +117,36 @@ func TestCompletionInterlockExplicitTrueSkipsCodexLiveDB(t *testing.T) {
 
 	const iid = 92004
 	runID := createInterlockRun(t, env, svc, userID, repoID, iid, HarnessCodex)
+	assertContractVersion(t, env, runID, true)
+}
+
+// (v) The explicit kill switch leaves Codex runs unstamped too.
+func TestCompletionInterlockExplicitFalseKeepsCodexLegacyLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	resetInterlockSetting(t, env)
+	setInterlockSetting(t, env, "false")
+	userID, repoID := seedCodexOnlyOriginUser(t, env)
+	svc := interlockLiveSvc(env)
+
+	const iid = 92005
+	runID := createInterlockRun(t, env, svc, userID, repoID, iid, HarnessCodex)
 	assertContractVersion(t, env, runID, false)
+}
+
+// (vi) A seeded Codex plan stays legacy even with the default-on switch.
+func TestCompletionInterlockDefaultOnKeepsSeededCodexLegacyLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	resetInterlockSetting(t, env)
+	userID, repoID := seedCodexOnlyOriginUser(t, env)
+	svc := interlockLiveSvc(env)
+
+	const iid = 92006
+	seedEligibleIssue(t, env, repoID, iid)
+	seed := &SeededPlan{PlanMD: "Implement the approved plan"}
+	run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", nil, nil, false, seed, nil, nil)
+	if err != nil {
+		t.Fatalf("CreateRun (seeded Codex): %v", err)
+	}
+	assertRunHarness(t, env, run.ID, HarnessCodex)
+	assertContractVersion(t, env, run.ID, false)
 }

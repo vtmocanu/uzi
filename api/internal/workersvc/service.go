@@ -1589,7 +1589,7 @@ type Service struct {
 	// capability-aware exactly as a live instance whose admin left the default in place.
 	capabilitySettings CapabilityScheduleReader
 	// completionInterlock reads the completion-interlock switch createRun consults to decide
-	// whether to stamp completion_contract_version=1 on a new unseeded Claude-harness issue
+	// whether to stamp completion_contract_version=1 on a new unseeded issue
 	// run (PRD #1226 M1, D1; #1626). Optional (nil-safe); set via
 	// SetCompletionInterlockSettings with the same settings cache the HTTP handlers hold. The
 	// setting defaults ON, but a nil reader (tests, deployments without a settings cache) or a
@@ -5495,8 +5495,8 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// error, so a cold settings failure never stamps. NULL (the not-interlocked legacy state)
 	// otherwise. createRun only ever creates issue-kind rows, so this is inherently
 	// issue-scoped; the contract CONTENT is frozen later at approval / the first running
-	// report, not here. The setting is read here, before the create tx; the stamp itself is
-	// decided inside the closure below, against the harness resolved in that tx.
+	// report, not here. The setting is read here, before the create tx; the stamp is
+	// applied inside the closure below.
 	//
 	// Issue #1626: a SEEDED-plan run (PRD #209, seed != nil) is never stamped and stays legacy.
 	// Its plan arrives at create time, the worker takes the plan-approved skip, and it never
@@ -5547,13 +5547,9 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			}
 			effOverride = ov
 		}
-		// Issue #1626: only a CLAUDE-harness run is stamped. CodexExecutor does not run the
-		// completion-attempt loop (agent/src/codex/codex-executor.ts: "Codex does NOT enter the
-		// completion-attempt interlock"); the nudge port is #1627. An interlocked Codex run would
-		// skip the nudge and go straight to an owner hold on every incomplete completion, so a
-		// Codex run stays legacy (NULL) even with the switch on.
+		// Stamp unseeded issue runs for either resolved harness when the switch is on.
 		var completionContractVersion pgtype.Int4
-		if interlockOn && resolved.Harness == HarnessClaude {
+		if interlockOn {
 			completionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
 		}
 		return q.CreateRun(ctx, store.CreateRunParams{
@@ -5607,8 +5603,8 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			// issue #857 M2: the provenance stamp threaded from each public entrypoint
 			// ("manual"/"schedule"/"autopilot"), so a run records why it fired.
 			TriggerSource: triggerSource,
-			// PRD #1226 M1 (D1), #1626: version 1 (interlocked before its first claim) only for an
-			// unseeded Claude-harness run with the switch on; NULL (legacy) otherwise. Listed
+			// PRD #1226 M1 (D1), #1626: version 1 (interlocked before its first claim) for an
+			// unseeded issue run with the switch on, regardless of harness; NULL otherwise. Listed
 			// explicitly per runtime.sql's 🔴 silently-omittable-narg warning.
 			CompletionContractVersion: completionContractVersion,
 			// PRD #1429 M2 (D1): the AUDITOR INVARIANT — runs.harness is stamped from the D11 result
