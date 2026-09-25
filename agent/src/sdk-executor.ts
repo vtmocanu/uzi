@@ -106,6 +106,15 @@ import { emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_
 import { clampToDirCharset, errMessage } from "./util.js";
 import { SummaryRunner } from "./summary-runner.js";
 import { resolvePrdInput, type PrdInput } from "./prd-link.js";
+import {
+  STALL_LIMIT,
+  REASON_COMPLETION_NO_PROGRESS,
+  REASON_COMPLETION_BUDGET_EXHAUSTED,
+  completionAttemptFingerprint,
+  updateCompletionStreak,
+  routeCompletionHold,
+  buildCompletionReworkFollowUp,
+} from "./completion-attempt.js";
 
 // Fallbacks used only when the claim omits `config`. Wire units are SECONDS
 // (PRD §Configuration); converted to ms at the timer.
@@ -162,26 +171,10 @@ const PROGRESS_MISS_LIMIT = 2;
 // repeated lead response before the loop stops early rather than exhausting the budget.
 // First such turn = streak 1; each identical repeat +1; so this many trips on the
 // initial turn + (STALL_LIMIT-1) repeats. Conservative: any progress resets the streak.
-const STALL_LIMIT = 3;
 // Static, content-free (safe to persist as failure_reason). The lead's actual refusal
 // is already on the run feed as its per-turn text messages, which this references.
 const REASON_NO_PROGRESS =
   "the lead declined the task and made no progress: it repeated the same response with no new commits, no working-tree changes, and no subagent activity across consecutive iterations. Stopped early rather than exhausting the iteration budget; see the lead's response on the run feed.";
-// PRD #1226 M3 (D3): the completion-interlock no-progress reason. The lead declared the run
-// complete but the frozen completion contract still has unmet milestones, and repeated attempts
-// made no progress (the same unmet set, head and worktree fingerprint across STALL_LIMIT
-// attempts). Static and content-free (safe to persist as failure_reason on the LEGACY throw
-// fallback when the hold seam is unwired); when the seam IS wired this reason is passed to
-// enterCompletionHold instead, which parks the run without failing it.
-const REASON_COMPLETION_NO_PROGRESS =
-  "completion blocked: the lead declared the run complete but the frozen completion contract still has unmet milestones, and repeated completion attempts made no progress (the same unmet set, branch head and worktree across attempts). Held for an owner decision rather than shipping an incomplete run.";
-// PRD #1226 M4 (D3): the SERVER's budget-exhausted steer reason. Static and content-free (safe to
-// persist as failure_reason on the legacy throw fallback). A live POST-attempt interlocked run the
-// server has flagged past its completion budget enters the hold with this reason PROACTIVELY at the
-// loop top, even if the worker's own WALL/IDLE has not tripped.
-const REASON_COMPLETION_BUDGET_EXHAUSTED =
-  "completion budget exhausted: the server flagged this run past its completion budget after a completion attempt. Held for an owner decision rather than continuing to spend budget.";
-
 // issue #1197 (D-RC2b): bounded, budget-safe in-process retries on a POSITIVELY-EMPTY
 // SDK turn (0 turns, no model activity, no plan/questions/done). ONLY a positively-empty
 // RETURN is retried — a genuine wall/idle/cancel trip (state.tripReason) wins first, and
@@ -2154,7 +2147,7 @@ export class SdkExecutor implements Executor {
           served?.budgetExhausted &&
           ctx.completionInterlock &&
           completionAttempted &&
-          (await this.routeCompletionHold(ctx, REASON_COMPLETION_BUDGET_EXHAUSTED, completionAttempted))
+          (await routeCompletionHold(ctx, REASON_COMPLETION_BUDGET_EXHAUSTED, completionAttempted))
         ) {
           completionHeld = { reason: REASON_COMPLETION_BUDGET_EXHAUSTED };
           break;
@@ -2325,7 +2318,7 @@ export class SdkExecutor implements Executor {
               // wall seam so the wall NEVER becomes a terminal failure (D2/D17).
               if (
                 completionAttempted &&
-                (await this.routeCompletionHold(ctx, REASON_WALL, completionAttempted))
+                (await routeCompletionHold(ctx, REASON_WALL, completionAttempted))
               ) {
                 completionHeld = { reason: REASON_WALL };
                 break;
@@ -2369,7 +2362,7 @@ export class SdkExecutor implements Executor {
           if (
             err instanceof Error &&
             (err.message === REASON_WALL || err.message === REASON_IDLE) &&
-            (await this.routeCompletionHold(ctx, err.message, completionAttempted))
+            (await routeCompletionHold(ctx, err.message, completionAttempted))
           ) {
             completionHeld = { reason: err.message };
             break;
@@ -2617,16 +2610,16 @@ export class SdkExecutor implements Executor {
             //    is DISTINCT from the #281 prose fingerprint but shares STALL_LIMIT. An identical
             //    fingerprint across consecutive attempts advances the streak; any change resets it
             //    to 1 (this attempt).
-            const completionFingerprint = JSON.stringify([
-              [...unmet].sort(),
+            const completionFingerprint = completionAttemptFingerprint(
+              unmet,
               head,
               worktreeFingerprint,
-            ]);
-            completionStallStreak =
-              lastCompletionFingerprint !== undefined &&
-              completionFingerprint === lastCompletionFingerprint
-                ? completionStallStreak + 1
-                : 1;
+            );
+            completionStallStreak = updateCompletionStreak(
+              completionFingerprint,
+              lastCompletionFingerprint,
+              completionStallStreak,
+            );
             lastCompletionFingerprint = completionFingerprint;
             if (completionStallStreak >= STALL_LIMIT) {
               // No progress across STALL_LIMIT identical completion attempts. The run is
@@ -2652,7 +2645,7 @@ export class SdkExecutor implements Executor {
                         : "owner chose to continue — resuming for another completion attempt",
                     },
                   });
-                  followUp = this.buildCompletionReworkFollowUp(
+                  followUp = buildCompletionReworkFollowUp(
                     unmet,
                     frozenMilestones,
                     decision.guidance,
@@ -2678,7 +2671,7 @@ export class SdkExecutor implements Executor {
                 },
               });
               if (
-                await this.routeCompletionHold(
+                await routeCompletionHold(
                   ctx,
                   REASON_COMPLETION_NO_PROGRESS,
                   completionAttempted,
@@ -2702,7 +2695,7 @@ export class SdkExecutor implements Executor {
                 text: `completion check: ${unmet.length} frozen milestone(s) not yet complete (${unmet.join(", ")}) — returning to the lead`,
               },
             });
-            followUp = this.buildCompletionReworkFollowUp(unmet, frozenMilestones);
+            followUp = buildCompletionReworkFollowUp(unmet, frozenMilestones);
             resetStallState(); // a completion rework is new input → breaks any #281 refusal streak
             turn.done = false;
             continue;
@@ -2714,7 +2707,7 @@ export class SdkExecutor implements Executor {
           // (M4) rather than failing; PRE-attempt (or with the seam unwired) it throws the legacy
           // REASON_MAX_ITERATIONS exactly as before.
           if (
-            await this.routeCompletionHold(
+            await routeCompletionHold(
               ctx,
               REASON_MAX_ITERATIONS,
               completionAttempted,
@@ -2846,7 +2839,7 @@ export class SdkExecutor implements Executor {
             // legacy REASON_NO_PROGRESS. The #281 detector itself is unchanged for the
             // NON-completion phase (before any completion attempt), which is the common case.
             if (
-              await this.routeCompletionHold(
+              await routeCompletionHold(
                 ctx,
                 REASON_NO_PROGRESS,
                 completionAttempted,
@@ -3727,71 +3720,6 @@ export class SdkExecutor implements Executor {
       },
     });
     return ctx.parkForWall ? await ctx.parkForWall(at) : undefined;
-  }
-
-  /**
-   * PRD #1226 M3/M4 (D3): route a post-attempt terminal reason to the COMPLETION HOLD when the run
-   * has recorded at least one completion attempt AND the hold seam is wired, else fall back to the
-   * legacy throw. Returns the HOLD'S OWN verdict: true when the run ENTERED the verified hold (the
-   * caller latches completionHeld and breaks); false when the hold was NOT entered — the seam is
-   * unwired (tests / a legacy run), no attempt has run yet, OR the wired hold could not capture/ACK
-   * `paused` and kept the run LIVE — so the caller throws Error(reason) exactly as before. The
-   * false path never runs the destructive cleanup (the hold impl owns that invariant). `attempted`
-   * is the loop's completionAttempted latch.
-   */
-  private async routeCompletionHold(
-    ctx: RunContext,
-    reason: string,
-    attempted: boolean,
-  ): Promise<boolean> {
-    if (attempted && ctx.enterCompletionHold) {
-      return await ctx.enterCompletionHold(reason);
-    }
-    return false;
-  }
-
-  /**
-   * PRD #1226 M3 (D3): the same-session rework follow-up injected when a structural completion
-   * attempt still has unmet milestones. It names the exact frozen milestones not yet declared
-   * complete (id + title when the frozen list is known) and tells the lead to finish them or record
-   * a decision — folded into the next turn as ordinary UNTRUSTED user input (like the mid-loop
-   * pullFollowUp injection), so the SAME SDK session resumes with full context. Content is only
-   * frozen ids/titles, never secrets or model output.
-   */
-  private buildCompletionReworkFollowUp(
-    unmet: string[],
-    frozen?: Milestone[] | null,
-    // PRD #1226 M5 (D6): the owner's continue-with-guidance direction from the live completion
-    // window. When present it is appended as OWNER DIRECTION (untrusted, like the rest of the
-    // follow-up, folded into the next turn as ordinary user input). Absent on the autonomous
-    // same-session rework (the M3 progress-still-possible branch), which passes only unmet/frozen.
-    ownerGuidance?: string,
-  ): string {
-    const titleFor = (id: string): string | undefined =>
-      frozen?.find((m) => m.id === id)?.title;
-    const lines = unmet.map((id) => {
-      const t = titleFor(id);
-      return t ? `- ${id}: ${t}` : `- ${id}`;
-    });
-    const base = [
-      "Completion check (structural interlock): you signalled done, but the frozen completion",
-      "contract still has milestone(s) NOT declared complete:",
-      "",
-      ...lines,
-      "",
-      "Finish the remaining milestone(s) and declare each complete (report_progress / signal_done),",
-      "or record an explicit decision if one genuinely cannot be completed. Do not signal done again",
-      "until every frozen milestone above is complete — an incomplete run cannot open its closing PR.",
-    ].join("\n");
-    const guidance = ownerGuidance?.trim();
-    if (!guidance) return base;
-    return [
-      base,
-      "",
-      "The run owner reviewed this completion block and chose to CONTINUE, with direction:",
-      "",
-      guidance,
-    ].join("\n");
   }
 
   /** The error a tripped turn throws (PRD #1190 M2). A `now` pause trip (REASON_PAUSE_NOW)
