@@ -89,7 +89,20 @@ function oneShot(lines: readonly string[], code: number): (p: FakeModeProcess) =
   };
 }
 
-const REAP_OK = JSON.stringify({ event: "reap", scanned: 5, live: 1, removed: 2, retained: 1, foreign: 1, proof: "held" });
+const REAP_OK = JSON.stringify({
+  event: "reap", scanned: 5, live: 1, removed: 2, retained: 1, foreign: 1, proof: "held", truncated: false, dirents_examined: 7,
+});
+
+/** A well-formed empty reap line with `overrides` applied (issue #1621: nine keys). */
+const REAP_BASE: Readonly<Record<string, unknown>> = {
+  event: "reap", scanned: 0, live: 0, removed: 0, retained: 0, foreign: 0, proof: "held", truncated: false, dirents_examined: 0,
+};
+const reapLine = (overrides: Record<string, unknown> = {}): string => JSON.stringify({ ...REAP_BASE, ...overrides });
+const reapLineWithout = (key: string): string => {
+  const o: Record<string, unknown> = { ...REAP_BASE };
+  delete o[key];
+  return JSON.stringify(o);
+};
 
 let savedSplit: string | undefined;
 beforeEach(() => {
@@ -105,7 +118,9 @@ describe("reapCodexCommandOrphans", () => {
   it("runs the fixed reaper argv with a minimal env and parses the reap line", async () => {
     const f = fakeSpawn(oneShot([REAP_OK], 0));
     const result = await reapCodexCommandOrphans({ spawn: f.spawn });
-    assert.deepEqual(result, { ok: true, scanned: 5, live: 1, removed: 2, retained: 1, foreign: 1, proof: "held" });
+    assert.deepEqual(result, {
+      ok: true, scanned: 5, live: 1, removed: 2, retained: 1, foreign: 1, proof: "held", truncated: false, direntsExamined: 7,
+    });
     assert.equal(f.calls.length, 1);
     const call = f.calls[0]!;
     assert.equal(call.command, SUPERVISOR_BIN);
@@ -126,6 +141,21 @@ describe("reapCodexCommandOrphans", () => {
     ]);
   });
 
+  it("parses a truncated pass (issue #1621)", async () => {
+    const line = reapLine({ scanned: 64, removed: 60, retained: 4, truncated: true, dirents_examined: 4096 });
+    const f = fakeSpawn(oneShot([line], 0));
+    assert.deepEqual(await reapCodexCommandOrphans({ spawn: f.spawn }), {
+      ok: true, scanned: 64, live: 0, removed: 60, retained: 4, foreign: 0, proof: "held", truncated: true, direntsExamined: 4096,
+    });
+  });
+
+  it("accepts scanned equal to dirents_examined", async () => {
+    const f = fakeSpawn(oneShot([reapLine({ scanned: 3, removed: 3, dirents_examined: 3 })], 0));
+    const result = await reapCodexCommandOrphans({ spawn: f.spawn });
+    assert.equal(result.ok, true);
+    if (result.ok) assert.equal(result.direntsExamined, 3);
+  });
+
   it("reports a reap_error reason (exit 2)", async () => {
     const f = fakeSpawn(oneShot([JSON.stringify({ event: "reap_error", reason: "cache_root" })], 2));
     assert.deepEqual(await reapCodexCommandOrphans({ spawn: f.spawn }), { ok: false, reason: "cache_root" });
@@ -134,12 +164,22 @@ describe("reapCodexCommandOrphans", () => {
   const garbage: Array<[string, readonly string[], number]> = [
     ["not JSON", ["reap ok"], 0],
     ["an unknown event", [JSON.stringify({ event: "reaped", scanned: 0 })], 0],
-    ["an extra key", [JSON.stringify({ event: "reap", scanned: 0, live: 0, removed: 0, retained: 0, foreign: 0, proof: "held", x: 1 })], 0],
-    ["a missing key", [JSON.stringify({ event: "reap", scanned: 0, live: 0, removed: 0, retained: 0, proof: "held" })], 0],
-    ["counts that do not sum", [JSON.stringify({ event: "reap", scanned: 9, live: 0, removed: 0, retained: 0, foreign: 0, proof: "held" })], 0],
-    ["a negative count", [JSON.stringify({ event: "reap", scanned: 0, live: -1, removed: 1, retained: 0, foreign: 0, proof: "held" })], 0],
-    ["a fractional count", [JSON.stringify({ event: "reap", scanned: 1.5, live: 1.5, removed: 0, retained: 0, foreign: 0, proof: "held" })], 0],
-    ["an unknown proof", [JSON.stringify({ event: "reap", scanned: 0, live: 0, removed: 0, retained: 0, foreign: 0, proof: "maybe" })], 0],
+    ["an extra key", [reapLine({ x: 1 })], 0],
+    ["a missing key", [reapLineWithout("foreign")], 0],
+    ["counts that do not sum", [reapLine({ scanned: 9, dirents_examined: 9 })], 0],
+    ["a negative count", [reapLine({ live: -1, removed: 1 })], 0],
+    ["a fractional count", [reapLine({ scanned: 1.5, live: 1.5, dirents_examined: 2 })], 0],
+    ["an unknown proof", [reapLine({ proof: "maybe" })], 0],
+    ["the pre-#1621 seven-key line", [JSON.stringify({ event: "reap", scanned: 0, live: 0, removed: 0, retained: 0, foreign: 0, proof: "held" })], 0],
+    ["a missing truncated", [reapLineWithout("truncated")], 0],
+    ["a missing dirents_examined", [reapLineWithout("dirents_examined")], 0],
+    ["truncated as the string \"false\"", [reapLine({ truncated: "false" })], 0],
+    ["truncated as 0", [reapLine({ truncated: 0 })], 0],
+    ["truncated null", [reapLine({ truncated: null })], 0],
+    ["a negative dirents_examined", [reapLine({ dirents_examined: -1 })], 0],
+    ["a fractional dirents_examined", [reapLine({ dirents_examined: 1.5 })], 0],
+    ["dirents_examined as a string", [reapLine({ dirents_examined: "7" })], 0],
+    ["scanned above dirents_examined", [reapLine({ scanned: 2, removed: 2, dirents_examined: 1 })], 0],
     ["a reap line with exit 2", [REAP_OK], 2],
     ["a reap_error with exit 0", [JSON.stringify({ event: "reap_error", reason: "list" })], 0],
     ["an unknown reap_error reason", [JSON.stringify({ event: "reap_error", reason: "whatever" })], 2],

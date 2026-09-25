@@ -67,9 +67,13 @@ export async function reapCodexOrphansAtStartup(
       retained: result.retained,
       foreign: result.foreign,
       proof: result.proof,
+      truncated: result.truncated,
+      dirents_examined: result.direntsExamined,
     };
-    // A retained or live candidate, or an unproven pass, leaves disk behind for the next startup.
-    if (result.retained > 0 || result.live > 0 || result.proof !== "held") log.warn("codex command orphan reap left candidates", fields);
+    // A truncated pass (the pass budget stopped it early), a retained or live candidate, or
+    // an unproven pass leaves disk behind for the next startup. None of them blocks startup.
+    if (result.truncated) log.warn("codex command orphan reap was truncated; orphans may remain until a later startup", fields);
+    else if (result.retained > 0 || result.live > 0 || result.proof !== "held") log.warn("codex command orphan reap left candidates", fields);
     else log.info("codex command orphan reap", fields);
   } else if (result.reason === "timeout_unkilled") {
     log.error("codex command orphan reaper could not be stopped; no run may start while it may still run", {
