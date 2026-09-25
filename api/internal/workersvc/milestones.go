@@ -137,14 +137,20 @@ func milestonesParam(kind string, ms *[]Milestone) []byte {
 // `run` is the row as it stood BEFORE this report (the SetState snapshot, taken before
 // SetRunAwaitingApproval / SetRunAutopilotPlan write this report's plan_md). For an interlocked
 // issue run whose report resolves to an EMPTY list (milestones absent, or an explicit `[]`):
-//   - a stored NON-EMPTY milestones_candidate is passed through unchanged (issue #1626 B1).
+//   - a stored NON-EMPTY milestones_candidate is passed through unchanged when the report
+//     re-presents the SAME plan (issue #1626 B1): its NUL-stripped plan_md equals the stored
+//     plan_md (which SetRunAwaitingApproval writes NUL-stripped), the stored plan_md is NULL
+//     (nothing to prove a new plan against), or the report carries no plan_md at all.
 //     SetRunAwaitingApproval assigns the candidate directly, and a reclaim at the gate (a
 //     credential switch or requeue while parked) re-presents the plan without the milestones it
 //     was first reported with; reading that as `[]` would freeze an empty contract against an
-//     N-milestone plan. The same holds for a REVISE round whose new plan omits milestones: the
-//     prior candidate is kept, so the contract may require milestones the new plan dropped (the
-//     lead can still report them complete, or the owner decides at the finalize hold);
-//   - with milestones ABSENT, a stored `[]` candidate is likewise kept (a re-presented
+//     N-milestone plan;
+//   - a REVISE round whose report carries a DIFFERENT plan_md and no milestones (absent, or an
+//     explicit `[]`) resets a stored non-empty candidate to `[]` (issue #1626 review, F2): the
+//     worker omits the field when the plan has none, so keeping the candidate would freeze the
+//     SUPERSEDED plan's criteria at approval and the completion permit could be denied for
+//     milestones the approved plan no longer has;
+//   - with milestones ABSENT, a stored `[]` candidate is kept (a re-presented or revised
 //     milestone-less gate stays `[]`);
 //   - with milestones ABSENT, or an explicit `[]`, and a NULL stored candidate, `[]` is the result
 //     ONLY when the stored plan_md is also NULL, i.e. this is the run's FIRST plan-bearing report
@@ -163,17 +169,26 @@ func milestonesParam(kind string, ms *[]Milestone) []byte {
 //     while SetRunRunning failed would make the worker's retry of that same report look like a
 //     sticky rejection (TestAutopilotPlanWriteAtomicWithRunningLiveDB).
 //
-// The inference is therefore fail-closed: it never replaces a rejected list with an empty one.
+// The inference never replaces a REJECTED list with an empty one; the only downgrade of a
+// stored non-empty candidate to `[]` is a report that presents a different plan without milestones.
 func planMilestonesParam(run store.Run, planMd *string, ms *[]Milestone) []byte {
 	if run.Kind != runkind.Issue || !run.CompletionContractVersion.Valid {
 		return milestonesParam(run.Kind, ms)
 	}
 	prior, priorErr := DecodeMilestones(run.MilestonesCandidate)
 	storedCandidate := priorErr == nil && len(run.MilestonesCandidate) > 0
+	// samePlan: this report re-presents the stored plan rather than revising it. The stored
+	// plan_md was written NUL-stripped (stripNULParam), so the report's text is compared the same
+	// way. A NULL stored plan_md, or a report with no plan_md, cannot prove a revise.
+	samePlan := !run.PlanMd.Valid || planMd == nil
+	if !samePlan {
+		clean, _ := stripNUL(*planMd)
+		samePlan = clean == run.PlanMd.String
+	}
 	if ms != nil {
 		resolved := milestonesParam(run.Kind, ms)
 		if string(resolved) == "[]" {
-			if storedCandidate && len(prior) > 0 {
+			if storedCandidate && len(prior) > 0 && samePlan {
 				return run.MilestonesCandidate
 			}
 			if !storedCandidate && run.PlanMd.Valid {
@@ -190,6 +205,10 @@ func planMilestonesParam(run store.Run, planMd *string, ms *[]Milestone) []byte 
 		return nil
 	}
 	if storedCandidate {
+		if len(prior) > 0 && !samePlan {
+			// F2: a revised plan without milestones drops the superseded plan's criteria.
+			return []byte("[]")
+		}
 		return run.MilestonesCandidate
 	}
 	if run.PlanMd.Valid {

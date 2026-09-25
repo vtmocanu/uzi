@@ -3486,9 +3486,11 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// explicit `[]` (planMilestonesParam), so the approve freeze builds a criteria:[]
 			// contract. `owned` predates this report's plan_md write, which is what lets
 			// planMilestonesParam tell a first report (stored plan_md NULL) from a later one. A
-			// milestone-less re-presentation (a gate reclaim) or revise round keeps a stored
-			// candidate unchanged, and after a REJECTED list (stored candidate NULL beside a
-			// stored plan_md) it stays NULL: nothing freezes and the run holds at finalize.
+			// milestone-less re-presentation of the SAME plan (a gate reclaim) keeps a stored
+			// candidate unchanged, a revise round with a DIFFERENT plan and no milestones resets a
+			// non-empty candidate to `[]` (no superseded criteria freeze), and after a REJECTED list
+			// (stored candidate NULL beside a stored plan_md) it stays NULL: nothing freezes and the
+			// run holds at finalize.
 			MilestonesCandidate:  planMilestonesParam(owned, req.PlanMd, req.Milestones),
 			InferredCapabilities: inferredCaps,
 			InferredTools:        inferredTools,

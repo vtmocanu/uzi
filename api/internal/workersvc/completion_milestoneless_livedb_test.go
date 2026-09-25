@@ -274,6 +274,57 @@ func TestRepresentedGateKeepsCandidateLiveDB(t *testing.T) {
 	}
 }
 
+// TestMilestonelessReviseDropsCandidateLiveDB (issue #1626 review, F2): the first gate presents
+// plan A with two valid milestones (candidate m1,m2); a revise then presents a DIFFERENT plan B
+// with NO milestones (the worker omits an empty list). The superseded plan's criteria must not
+// survive: the candidate resets to `[]`, the approve freezes `[]` + criteria:[] at revision 1, and
+// the permit grants. Before the fix the candidate kept m1,m2, the approve froze them, and the
+// permit was denied for milestones the approved plan no longer has.
+func TestMilestonelessReviseDropsCandidateLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	wkr := store.Worker{ID: wid}
+	runID := e.seedOwnedRun(t, wid, "running", true, false)
+
+	ms := []Milestone{{ID: "m1", Title: "First"}, {ID: "m2", Title: "Second"}}
+	if _, applied, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "awaiting_approval", PlanMd: strPtr("# Plan A\n\nTwo milestones.\n"), Milestones: &ms}); err != nil || !applied {
+		t.Fatalf("SetState awaiting_approval (plan A, with milestones): applied=%v err=%v", applied, err)
+	}
+	if cand, _ := e.milestoneColumns(t, runID); len(cand) == 0 || string(cand) == "[]" {
+		t.Fatalf("milestones_candidate = %q, want plan A's m1,m2", cand)
+	}
+
+	if _, err := svc.SubmitInput(e.ctx, e.userID, runID, "revise_plan", "drop the milestones", nil); err != nil {
+		t.Fatalf("SubmitInput revise_plan: %v", err)
+	}
+	if _, err := svc.ConsumeInputs(e.ctx, wkr, runID); err != nil {
+		t.Fatalf("ConsumeInputs (revise): %v", err)
+	}
+	if _, applied, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "awaiting_approval", PlanMd: strPtr(milestonelessPlan)}); err != nil || !applied {
+		t.Fatalf("SetState awaiting_approval (plan B, no milestones): applied=%v err=%v", applied, err)
+	}
+	if cand, _ := e.milestoneColumns(t, runID); string(cand) != "[]" {
+		t.Fatalf("milestones_candidate = %q after a milestone-less revise to a different plan, want [] (the superseded plan's m1,m2 must not survive)", cand)
+	}
+
+	if _, err := svc.SubmitInput(e.ctx, e.userID, runID, "approve_plan", "", &AgentSelection{Source: AgentSourceOwn}); err != nil {
+		t.Fatalf("SubmitInput approve_plan: %v", err)
+	}
+	if _, frozen := e.milestoneColumns(t, runID); string(frozen) != "[]" {
+		t.Fatalf("milestones_frozen = %q, want [] after approving the milestone-less plan B", frozen)
+	}
+	e.assertEmptyCriteriaContract(t, runID)
+
+	if _, err := svc.ConsumeInputs(e.ctx, wkr, runID); err != nil {
+		t.Fatalf("ConsumeInputs (approve): %v", err)
+	}
+	if _, applied, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "running"}); err != nil || !applied {
+		t.Fatalf("SetState running after approve: applied=%v err=%v", applied, err)
+	}
+	e.grantAndComplete(t, svc, wkr, runID)
+}
+
 // TestRejectedListThenMilestonelessReviseHoldsLiveDB (issue #1626 B-a): an interlocked run's first
 // plan-bearing report carries a milestone list the server REJECTS (a duplicate id, which the
 // worker's blank-field check does not catch), so the candidate is NULL beside a stored plan_md.

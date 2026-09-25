@@ -12,8 +12,8 @@ import (
 // TestPlanMilestonesParam pins issue #1626's server-side reading of a milestone-less plan: only
 // an INTERLOCKED issue run's FIRST PLAN-BEARING report (non-blank plan_md, no stored plan_md)
 // with ABSENT milestones becomes the explicit `[]`; a stored candidate is kept on a later
-// milestone-less report, a rejected list stays sticky (NULL), and every other shape is
-// milestonesParam unchanged.
+// milestone-less report of the SAME plan and reset to `[]` by a milestone-less DIFFERENT plan
+// (F2), a rejected list stays sticky (NULL), and every other shape is milestonesParam unchanged.
 func TestPlanMilestonesParam(t *testing.T) {
 	interlocked := store.Run{Kind: runkind.Issue, CompletionContractVersion: pgtype.Int4{Int32: 1, Valid: true}}
 	legacy := store.Run{Kind: runkind.Issue}
@@ -38,6 +38,8 @@ func TestPlanMilestonesParam(t *testing.T) {
 	corruptCandidateStoredPlan := interlocked
 	corruptCandidateStoredPlan.MilestonesCandidate = []byte("{not json")
 	corruptCandidateStoredPlan.PlanMd = pgtype.Text{String: "# Plan A", Valid: true}
+	candidatePlanA := withCandidate
+	candidatePlanA.PlanMd = pgtype.Text{String: "# Plan A", Valid: true}
 	legacyWithCandidate := legacy
 	legacyWithCandidate.MilestonesCandidate = []byte(twoJSON)
 
@@ -56,8 +58,8 @@ func TestPlanMilestonesParam(t *testing.T) {
 		{"interlocked, blank plan_md", interlocked, strPtr(" \n\x00 "), nil, ""},
 		{"legacy plan, absent milestones", legacy, plan, nil, ""},
 		{"interlocked non-issue kind", store.Run{Kind: runkind.Chat, CompletionContractVersion: interlocked.CompletionContractVersion}, plan, nil, ""},
-		// B1: a re-presented gate (or a revise round) whose report carries no milestones never
-		// downgrades a stored NON-EMPTY candidate: it is passed through unchanged (fail-closed).
+		// B1: a re-presented gate whose report carries no milestones never downgrades a stored
+		// NON-EMPTY candidate: it is passed through unchanged (no stored plan_md to differ from).
 		{"interlocked, absent milestones, non-empty candidate kept", withCandidate, plan, nil, twoJSON},
 		{"interlocked, explicit empty, non-empty candidate kept", withCandidate, plan, empty, twoJSON},
 		{"interlocked, absent milestones, stored [] stays []", withEmptyCandidate, plan, nil, "[]"},
@@ -77,11 +79,16 @@ func TestPlanMilestonesParam(t *testing.T) {
 		{"interlocked, different plan after a rejected list, valid list wins", rejectedEarlierPlan, planB, one, `[{"id":"m1","title":"First"}]`},
 		{"interlocked, different plan after a rejected list, rejected again", rejectedEarlierPlan, planB, bad, ""},
 		{"interlocked, revise without milestones keeps a stored []", emptyCandidateStoredPlan, planB, nil, "[]"},
-		{"interlocked, revise without milestones keeps a stored non-empty candidate", func() store.Run {
-			r := withCandidate
-			r.PlanMd = pgtype.Text{String: "# Plan A", Valid: true}
-			return r
-		}(), planB, nil, twoJSON},
+		// F2 (issue #1626 review): a revise with a DIFFERENT plan and no milestones resets a stored
+		// non-empty candidate to `[]`, so the superseded plan's criteria never freeze; the SAME plan
+		// re-presented (a gate reclaim, compared NUL-stripped as plan_md is stored) keeps it (B1).
+		{"interlocked, revise without milestones resets a stored non-empty candidate", candidatePlanA, planB, nil, "[]"},
+		{"interlocked, new plan B absent milestones resets candidate", candidatePlanA, strPtr("# Plan B"), nil, "[]"},
+		{"interlocked, new plan B explicit empty resets candidate", candidatePlanA, strPtr("# Plan B"), empty, "[]"},
+		{"interlocked, plan A re-presented absent milestones keeps candidate", candidatePlanA, strPtr("# Plan A"), nil, twoJSON},
+		{"interlocked, plan A re-presented explicit empty keeps candidate", candidatePlanA, strPtr("# Plan A"), empty, twoJSON},
+		{"interlocked, plan A re-presented with a NUL keeps candidate", candidatePlanA, strPtr("# Pl\x00an A"), nil, twoJSON},
+		{"interlocked, plan A re-presented with a NUL, explicit empty keeps candidate", candidatePlanA, strPtr("# Plan A\x00"), empty, twoJSON},
 		{"interlocked, corrupt stored candidate beside a stored plan stays NULL", corruptCandidateStoredPlan, planB, nil, ""},
 		{"interlocked, rejected list replaces a stored candidate with NULL", withCandidate, plan, bad, ""},
 	}
