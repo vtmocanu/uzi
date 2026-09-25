@@ -668,6 +668,10 @@ export class SdkExecutor implements Executor {
    *  the Claude adapter, which records pids into it; killAgentTree (below, the
    *  legacy path) reaps it. */
   private readonly spawnedPids = new Set<number>();
+  /** issue #1656: the subset of spawnedPids whose CLI is known to have died from a foreign
+   *  signal (its group not confirmed gone). The run-end reap signals these group-only: after
+   *  the leader exited, killProcessGroup's bare-pid fallback could hit a recycled process. */
+  private readonly deadCliPids = new Set<number>();
   /** The Claude run-lane adapter (PRD #1146 M2). Owns query options finalization,
    *  frame decode, the lead context read, process ownership and terminal building;
    *  driveTurn drives it and the per-run reducer. */
@@ -756,11 +760,16 @@ export class SdkExecutor implements Executor {
    * and could read the PAT out of the git child's /proc/environ during the
    * worker's push. The runner calls this before pushBranch; run()'s finally also
    * calls it so no path leaks an orphan. Idempotent: the set is cleared so a
-   * recycled pid is never re-signalled.
+   * recycled pid is never re-signalled. A CLI known to have died from a foreign
+   * signal is signalled group-only, with no bare-pid fallback (issue #1656).
    */
   killAgentTree(): void {
-    for (const pid of this.spawnedPids) this.kill(pid);
+    for (const pid of this.spawnedPids) {
+      if (this.deadCliPids.has(pid)) this.killCliGroup(pid);
+      else this.kill(pid);
+    }
     this.spawnedPids.clear();
+    this.deadCliPids.clear();
   }
 
   /**
@@ -843,6 +852,7 @@ export class SdkExecutor implements Executor {
 
   async run(ctx: RunContext): Promise<ExecutorResult> {
     this.spawnedPids.clear();
+    this.deadCliPids.clear();
     // Fresh per-run reducer: the first-truthy-session latch must not survive a
     // second run() on this instance (one executor per run is the norm, but keep
     // the latch honest regardless).
@@ -3675,6 +3685,8 @@ export class SdkExecutor implements Executor {
           // A usage-limit death routes to the usage-limit wait path, unchanged.
           if (err instanceof LimitReachedError) throw err;
           if (err instanceof CliSignalDeathError) {
+            // The CLI is dead: from here on its pid is reaped group-only, whatever happens next.
+            if (err.pid !== undefined) this.deadCliPids.add(err.pid);
             // issue #1656: resume the session the dead turn ran (driveTurn resolved it against
             // the id the turn started with). With none, or once the bound is spent, fail exactly
             // as before with the SDK's own error: never a fresh session labelled a resume, never
@@ -3707,6 +3719,7 @@ export class SdkExecutor implements Executor {
               throw err.original;
             }
             this.spawnedPids.delete(pid);
+            this.deadCliPids.delete(pid);
             signalDeathRetries++;
             resumeId = sessionId;
             this.log.warn("agent CLI died from a foreign signal; resuming the session", {

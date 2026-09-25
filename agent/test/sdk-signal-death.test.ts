@@ -386,7 +386,7 @@ describe("SdkExecutor foreign CLI signal death (issue #1656)", () => {
     const err = await rejection(executor.run(makeCtx({ signal: ac.signal }).ctx));
     assert.match(err.message, /run cancelled/);
     const dead = spawned[0]!;
-    assert.equal(killed.filter((p) => p === dead).length, 1, `only the run-end reap kills it: ${JSON.stringify(killed)}`);
+    assert.equal(killed.filter((p) => p === dead).length, 0, `the fallback-capable kill never targets it: ${JSON.stringify(killed)}`);
   });
 
   it("a wall budget that expires during the reap confirmation ends with the wall outcome", async () => {
@@ -476,6 +476,26 @@ describe("SdkExecutor foreign CLI signal death (issue #1656)", () => {
       assert.equal(turns.length, 1, "nothing is driven after the trip");
     });
   }
+
+  it("a death that cannot resume (no session) leaves its pid to a group-only run-end reap", async () => {
+    const spawned: number[] = [];
+    const killed: string[] = [];
+    const { queryFn, turns } = fakeTurns([dies(sdkSignal("SIGTERM")), [submitPlan("# Plan"), resultSuccess()]]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, opts(queryFn, {
+      spawn: () => {
+        const pid = fakePid++;
+        spawned.push(pid);
+        return { pid };
+      },
+      kill: (pid) => { killed.push(`fallback:${pid}`); return true; },
+      killCliGroup: (pgid) => { killed.push(`groupOnly:${pgid}`); return true; },
+    }));
+    const err = await rejection(executor.run(makeCtx().ctx));
+    assert.equal(err.message, "Claude Code process terminated by signal SIGTERM");
+    assert.equal(turns.length, 1);
+    const dead = spawned[0]!;
+    assert.deepEqual(killed.filter((k) => k.endsWith(`:${dead}`)), [`groupOnly:${dead}`]);
+  });
 
   // ---- negative controls: unchanged behaviour ------------------------------------------
 
@@ -639,9 +659,9 @@ describe("dead CLI group confirmed gone before a resume (issue #1656)", () => {
   for (const [label, killResult, present] of [
     ["the signal fails and the group is still present", false, true],
     ["the signal is delivered but the group never disappears", true, true],
-    ["absence is unknowable (no /proc)", true, undefined],
+    ["absence is unknowable (an inconclusive probe)", true, undefined],
   ] as const) {
-    it(`fails closed when ${label}: no resume, pid kept for the run-end reap`, async () => {
+    it(`fails closed when ${label}: no resume, and the run-end reap of the dead pid is group-only`, async () => {
       const d = await driveRealDeath(() => killResult, () => present);
       try {
         const err = await rejection(d.run);
@@ -650,8 +670,13 @@ describe("dead CLI group confirmed gone before a resume (issue #1656)", () => {
         assert.ok(pid !== undefined);
         const seen = onDead(d.events, pid);
         assert.deepEqual(seen.filter((e) => e.startsWith("query")), ["query0"], "no resume");
-        assert.equal(seen.filter((e) => e === `killGroup:${pid}`).length, 1);
-        assert.equal(seen.at(-1), `reap:${pid}`, "the pid stayed in spawnedPids for the run-end reap");
+        // Once in the confirmation attempt, once more by the run-end reap: both group-only. The
+        // fallback-capable kill (bare pid on a failed group signal) never sees the dead pid.
+        assert.deepEqual(
+          seen.filter((e) => !e.startsWith("query") && !e.startsWith("probe:")),
+          [`killGroup:${pid}`, `killGroup:${pid}`],
+        );
+        assert.ok(!seen.includes(`reap:${pid}`), "never the fallback-capable kill");
       } finally {
         await reaped(d.children);
       }
