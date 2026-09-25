@@ -120,21 +120,20 @@ function makeHarness(opts: { mutate?: (patched: string) => string } = {}): Harne
   // dangling chain ([ -e ] false) or when STUB_TOKEN_STAT_FAIL is set; without -L (lstat) it
   // returns the symlink's own 0777 (STUB_TOKEN_LINK_POSTURE). `cat` honors STUB_TOKEN_UNREADABLE
   // (exit 1) as the dropped-worker read-denial seam, else reads for real. Issue #1696: a
-  // `stat -c %h <path>` (the dot loops' link-count probe) is answered with the REAL link count
-  // from the host's stat (GNU or BusyBox, both support it); every other stat call keeps the
-  // token-posture behaviour above unchanged.
+  // `stat -c %h <path>` (the dot loops' link-count probe) is answered with the REAL link count,
+  // read from `ls -ld` field 2 (no symlink follow, like `stat -c %h`). That field is the link
+  // count on GNU, BusyBox and BSD alike; the host's own `stat` is not portable (BSD/macOS
+  // `stat` rejects `-c`). Every other stat call keeps the token-posture behaviour above unchanged.
   writeStub(
     stubDir,
     "busybox",
     '#!/bin/sh\nsub=$1; shift\ncase "$sub" in\n' +
       "  stat)\n" +
       '    if [ "$#" -eq 3 ] && [ "$1" = "-c" ] && [ "$2" = "%h" ]; then\n' +
-      "      for s in /usr/bin/stat /bin/stat /bin/busybox; do\n" +
-      '        [ -x "$s" ] || continue\n' +
-      '        if [ "$s" = /bin/busybox ]; then exec "$s" stat -c %h "$3"; fi\n' +
-      '        exec "$s" -c %h "$3"\n' +
-      "      done\n" +
-      "      exit 1\n" +
+      '      n=$(ls -ld -- "$3" 2>/dev/null | awk \'{print $2}\')\n' +
+      '      case "$n" in ""|*[!0-9]*) exit 1 ;; esac\n' +
+      '      printf "%s\\n" "$n"\n' +
+      "      exit 0\n" +
       "    fi\n" +
       "    follow=\n" +
       '    for a in "$@"; do [ "$a" = "-L" ] && follow=1; done\n' +
