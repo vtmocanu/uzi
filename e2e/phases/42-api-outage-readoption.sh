@@ -291,7 +291,7 @@ pass "case c: X is the sole claimable (queued) run for the owner/repo before the
 SIB_TOKEN="$(apipost /api/workers '{"name":"e2e-readopt-sibling"}' | jq -r '.token')"
 { [ -n "$SIB_TOKEN" ] && [ "$SIB_TOKEN" != null ]; } || fail "case c: could not mint a second worker join token"
 SIB_ID="$(curl -fsS -H "Authorization: Bearer $SIB_TOKEN" -X POST "$BASE/api/worker/register" \
-  -H 'Content-Type: application/json' -d '{"name":"e2e-readopt-sibling","version":"0.0.0-e2e"}' | jq -r '.worker_id')"
+  -H 'Content-Type: application/json' -d '{"name":"e2e-readopt-sibling","version":"0.0.0-e2e","protocol_capabilities":["completion_interlock_v1"]}' | jq -r '.worker_id')"
 { [ -n "$SIB_ID" ] && [ "$SIB_ID" != null ]; } || fail "case c: the second worker did not register"
 [ "$SIB_ID" != "$WORKER_C" ] || fail "case c: the second worker reused the first worker's id"
 for _ in 1 2 3; do

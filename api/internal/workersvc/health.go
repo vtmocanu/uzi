@@ -869,7 +869,7 @@ func (s *Service) capabilityAwareOn(ctx context.Context) bool {
 
 // completionInterlockOn reads the completion-interlock switch (PRD #1226 M1, D1; #1626),
 // nil-safe and fail-safe. The setting itself defaults ON (no row = on; an explicit "false"
-// row or ENV value is the admin kill-switch), but a nil reader (tests, or a deployment
+// row is the admin kill-switch), but a nil reader (tests, or a deployment
 // without a settings cache) or ANY read error leaves this false: settings.Cache returns an
 // error only on a cold read with no valid cached snapshot (a failed refresh over a valid
 // cache serves the cached value error-free), and on that error the value is discarded, so a

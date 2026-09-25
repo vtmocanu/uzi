@@ -102,7 +102,7 @@ const (
 	// completion_contract_version=1 on a new, unseeded issue run whose resolved harness is
 	// Claude, before its first claim, so the run is interlocked and the non-bypassable
 	// ClaimRun protocol clause (D2) applies. It is an admin kill-switch (Admin -> Settings ->
-	// Completion check): an explicit "false" row or ENV value keeps it off. A junk value
+	// Completion check): an explicit "false" row keeps it off. A junk value
 	// falls to the default (now on), the same as the sibling bools. Read errors: a cold read
 	// error (no valid cache snapshot) means no stamp, because the service's
 	// completionInterlockOn discards any errored value; a failed refresh with a valid cache
@@ -325,7 +325,7 @@ const (
 	// PRD #1226 M1 (D1/D8), #1626: the completion-interlock switch defaults ON, so a new
 	// unseeded Claude-harness issue run is interlocked out of the box (Codex runs are never
 	// stamped; see workersvc createRun). It stays an admin kill-switch (Admin -> Settings ->
-	// Completion check): an explicit "false" row or ENV value keeps it off, junk falls to
+	// Completion check): an explicit "false" row keeps it off, junk falls to
 	// this default (on) like the sibling bools, and a cold read error means no stamp because
 	// completionInterlockOn discards any errored value, while a failed refresh with a valid
 	// cache keeps the cached value.

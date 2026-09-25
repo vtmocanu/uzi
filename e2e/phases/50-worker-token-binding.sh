@@ -60,6 +60,13 @@ BINDW_ID="$(printf '%s' "$BINDW" | jq -r '.worker.id')"
 BINDW_TOKEN="$(printf '%s' "$BINDW" | jq -r '.token')"
 { [ -n "$BINDW_ID" ] && [ "$BINDW_ID" != null ] && [ -n "$BINDW_TOKEN" ] && [ "$BINDW_TOKEN" != null ]; } \
   || fail "could not mint the binding-test worker"
+# Register it advertising completion_interlock_v1: the completion interlock is on by
+# default for Claude issue runs (issue #1626), and ClaimRun never hands an interlocked run
+# to a worker whose registered protocol capabilities lack it.
+curl -fsS -X POST "$BASE/api/worker/register" -H "Authorization: Bearer $BINDW_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"e2e-binding-worker","version":"0.0.0-e2e","protocol_capabilities":["completion_interlock_v1"]}' >/dev/null \
+  || fail "could not register the binding-test worker"
 
 # claim_token DESC — POST a claim as the binding-test worker and leave the delivered
 # Anthropic plaintext in $CLAIM_TOKEN. Sets a global rather than printing, because

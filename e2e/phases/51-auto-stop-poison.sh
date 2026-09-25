@@ -49,11 +49,13 @@ say "PRD #108 M5: auto-stop kills a run whose messages can't be saved (direct-to
 login  # fresh admin session: unlocks the vault so a claim can assemble its payload
 
 # Mint the synthetic worker's join token, register it, and land one heartbeat.
+# It advertises completion_interlock_v1 because the completion interlock is on by default
+# for Claude issue runs (issue #1626): an unadvertised worker could never claim these runs.
 ASW="$(apipost /api/workers '{"name":"e2e-autostop"}')"
 WTOK="$(printf '%s' "$ASW" | jq -r '.token')"
 { [ -n "$WTOK" ] && [ "$WTOK" != null ]; } || fail "auto-stop phase: could not mint the synthetic worker token"
 curl -fsS -X POST "$BASE/api/worker/register" -H "Authorization: Bearer $WTOK" \
-  -H 'Content-Type: application/json' -d '{"version":"0.9.0-e2e","max_concurrent_runs":2}' >/dev/null \
+  -H 'Content-Type: application/json' -d '{"version":"0.9.0-e2e","max_concurrent_runs":2,"protocol_capabilities":["completion_interlock_v1"]}' >/dev/null \
   || fail "auto-stop phase: synthetic worker register failed"
 curl -fsS -X POST "$BASE/api/worker/heartbeat" -H "Authorization: Bearer $WTOK" \
   -H 'Content-Type: application/json' -d '{}' >/dev/null \

@@ -1516,7 +1516,7 @@ type CapabilityScheduleReader interface {
 // completion-interlock switch (PRD #1226 M1, D1; #1626). *settings.Cache satisfies it.
 // Kept its own interface (interface segregation, like CapabilityScheduleReader) so a
 // test exercises only what it uses. The SETTING defaults ON (no row = on; an explicit
-// "false" row or ENV value is the admin kill-switch), but this reader is optional and
+// "false" row is the admin kill-switch), but this reader is optional and
 // fails safe: a nil reader, or any read error (settings.Cache returns one only on a cold
 // read with no valid cached snapshot), makes completionInterlockOn false, so the run is
 // created legacy (unstamped). Existing tests construct the service without it.
@@ -5452,7 +5452,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		}
 	}
 	// PRD #1226 M1 (D1), #1626: stamp the run as INTERLOCKED before its first claim when the
-	// completion-interlock switch is on (default ON; an explicit "false" row or ENV is the
+	// completion-interlock switch is on (default ON; an explicit "false" row is the
 	// admin kill-switch). completionInterlockOn returns false for a nil reader or any read
 	// error, so a cold settings failure never stamps. NULL (the not-interlocked legacy state)
 	// otherwise. createRun only ever creates issue-kind rows, so this is inherently
