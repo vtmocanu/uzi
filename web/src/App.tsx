@@ -32,7 +32,6 @@ import { RunView } from "./pages/RunView";
 import { Schedules } from "./pages/Schedules";
 import { Judge } from "./pages/Judge";
 import { Findings } from "./pages/Findings";
-import { Notifications } from "./pages/Notifications";
 import { ChatList, ChatConversation } from "./pages/Chat";
 import { WorkersSettings } from "./pages/WorkersSettings";
 import { Docs } from "./pages/Docs";
@@ -113,7 +112,6 @@ export const APP_ROUTES: AppRoute[] = [
   // PRD #333: the per-repo incidental-findings backlog. ?run= is the finding
   // notification deep-link anchor; ?repo= / ?bucket= drive the scope + segmented control.
   { path: "/findings", element: <Findings />, guard: "protected" },
-  { path: "/notifications", element: <Notifications />, guard: "protected" },
   { path: "/chat", element: <ChatList />, guard: "protected" },
   { path: "/chat/:id", element: <ChatConversation />, guard: "protected", sample: "/chat/chat-uzi-1" },
   { path: "/agents", element: <Agents />, guard: "protected" },

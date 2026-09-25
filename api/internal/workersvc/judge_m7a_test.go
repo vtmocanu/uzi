@@ -68,8 +68,8 @@ func TestJudgeClaimCarriesFailureClass(t *testing.T) {
 // TestPreStartInfraFailureSkipsJudge (Decision 12): a failed run at iteration_count == 0
 // whose fail_origin is one of the three pre-start policy/config-denied origins is NOT
 // judged — there is no agent behavior to retrospect, and skipping avoids the most
-// expensive per-run call. The deterministic failure notification is delivered separately
-// by RunFailureNotifier on the same PublishState transition (asserted by trace, not here).
+// expensive per-run call. The failure is surfaced separately on the same PublishState
+// transition (the slacksvc failed-run DM, the run page and Runs list), not here.
 func TestPreStartInfraFailureSkipsJudge(t *testing.T) {
 	for _, origin := range []string{"provisioning_failed", "credential_unavailable", "guardrail_blocked"} {
 		t.Run(origin+" at iter 0 is not enqueued", func(t *testing.T) {

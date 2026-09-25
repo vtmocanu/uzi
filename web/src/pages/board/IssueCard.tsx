@@ -53,6 +53,23 @@ function Highlighted({ text, query }: { text: string; query: string }) {
   );
 }
 
+// AutofixHaltedMarker (PRD #1650 D3a) says automatic CI fixing has stopped on the
+// card's branch (attempt cap or no-progress halt), so fixing CI is now up to the user.
+// It sits beside the pipeline badge, or in its place when no pipeline is cached (the
+// halt is read from the autofix ledger, not from `pipeline`). The copy never names the
+// Fix CI button: that renders only for a failed cached pipeline, while the marker also
+// shows with no pipeline or while a new one runs. Warn tone: a human owes the branch its
+// next step, like the run parks. role="img" gives the short visible label a full
+// accessible name that starts with the same words (WCAG 2.5.3) and adds the count.
+function AutofixHaltedMarker({ attempts }: { attempts: number }) {
+  const label = `Autofix stopped after ${attempts} ${attempts === 1 ? "attempt" : "attempts"}: fixing this failure is up to you.`;
+  return (
+    <span role="img" aria-label={label} title={label} className="inline-flex">
+      <Badge tone="warning">Autofix stopped</Badge>
+    </span>
+  );
+}
+
 /**
  * One board card. Exported for the same reason RunView factors out its panels: `Board`
  * itself needs routing, four API mocks and a drag context to mount, and this file had NO
@@ -439,6 +456,7 @@ export function IssueCard({
           </Badge>
         )}
         {card.pipeline && <PipelineBadge pipeline={card.pipeline} />}
+        {card.ci_autofix_halted && <AutofixHaltedMarker attempts={card.ci_autofix_attempts ?? 0} />}
         {card.pipeline && <FixCiButton pipeline={card.pipeline} busy={fixCiBusy} onClick={onFixCi} />}
       </div>
       {/* Label chips (PRD #102 M4). Deliberately their OWN row below the badges and

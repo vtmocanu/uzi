@@ -4,7 +4,7 @@
 // preference lists the non-default extras, persisted per user as
 // UserSettings.sidebar_token_ids.
 //
-// The change event mirrors lib/notifications.ts: a toggle saved on the Settings
+// A window change event: a toggle saved on the Settings
 // page must reach the sidebar (a separate mount) the moment it lands, without
 // threading state through the router. The rail also refetches on its own poll,
 // so this is a responsiveness nicety, not the source of truth.

@@ -43,12 +43,12 @@ function isFreshFailure(run: FaviconRun, baselineFailedIds: Set<string>): boolea
   );
 }
 
-// deriveFaviconState collapses the whole run list plus the unread-notification count
-// into one tab signal by a first-match-wins priority ladder (PRD #70 Decision Log):
+// deriveFaviconState collapses the whole run list into one tab signal by a first-match-wins priority ladder (PRD #70 Decision Log):
 //   1. failed    — a fresh genuine failure outranks everything: a break the user did
 //                  not already know about is the loudest thing a tab can say.
 //   2. attention — a run awaiting the user's approval OR their answer to a
-//                  clarification question (PRD #88), or any unread notification: the
+//                  clarification question (PRD #88). Only a run can raise it (the
+//                  unread-inbox input went with the inbox, PRD #1650 D5): the
 //                  user is the blocker and a worker is held. The tab dot cannot say
 //                  WHICH, and does not need to — it says "you are the blocker", and a
 //                  parked question is exactly that.
@@ -57,15 +57,13 @@ function isFreshFailure(run: FaviconRun, baselineFailedIds: Set<string>): boolea
 //   4. idle      — nothing live; restore the plain mark.
 export function deriveFaviconState(
   runs: FaviconRun[],
-  unread: number,
   baselineFailedIds: Set<string>,
 ): FaviconState {
   if (runs.some((r) => isFreshFailure(r, baselineFailedIds))) return "failed";
   // issue #750: classify from the EFFECTIVE status so a run re-planning after a revise
   // (status still "awaiting_approval" server-side, but effectiveRunStatus → "revising")
   // does NOT light the attention dot. The failure and running branches are unaffected.
-  if (unread > 0 || runs.some((r) => needsHumanAttention(effectiveRunStatus(r))))
-    return "attention";
+  if (runs.some((r) => needsHumanAttention(effectiveRunStatus(r)))) return "attention";
   if (runs.some((r) => RUNNING_STATUSES.has(r.status))) return "running";
   return "idle";
 }

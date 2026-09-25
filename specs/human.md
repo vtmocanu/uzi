@@ -328,9 +328,9 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/done/46-run-judge-self-imp
   shared one. [user 2026-07-12] (AI-synced 2026-09-24)
 - Per-user opt-in/out; admin can toggle the feature globally and force-disable
   per user (existing admin settings). [user 2026-07-12]
-- Recommendations land in an inbox/notifications surface — users see their own,
-  admins see all; also visible on the run page — and go out via the existing
-  Slack notifications too. [user 2026-07-12]
+- Recommendations show on the Judge page and the run page (users see their own)
+  and go out as a Slack DM. [user 2026-07-12] (AI-synced 2026-09-25: the
+  inbox/notifications surface and its admin all-users view were retired, #1650)
 - The deterministic "command not found" scan feeds the judge as an input signal.
   [user 2026-07-12; plan.md:64]
 - **Self-improvement scheduled job (per-user; any repo the owner enables it on)**:
@@ -343,8 +343,8 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/done/46-run-judge-self-imp
   gate blocks it — but the plan it worked from must be inspectable. If a
   self-improvement MR is already open, it reuses/extends that MR so everything
   is tested together. [user 2026-07-12]
-- One PRD covers both, phased: judge first, job second (shared settings/inbox
-  plumbing). [user 2026-07-12]
+- One PRD covers both, phased: judge first, job second (shared settings
+  plumbing). [user 2026-07-12] (AI-synced 2026-09-25: inbox retired, #1650)
 - Token for the job: each user can enable the job (on a repo they own) using their
   own token; the design also accommodates a general/instance token for later, when/if
   one is implemented (plan.md:69). [user 2026-07-12; user 2026-08-23: enablement
@@ -444,7 +444,7 @@ Tracked as GitLab issue vtmocanu/uzi#53; PRD at `prds/done/53-rate-limits.md`.
 - Server polls with the user's own token; the token never leaves the api container — SPA sees only percentages.
 - The header-probe fallback spends ~1 token/interval of the user's own quota; operators can disable the probe (`UZI_USAGE_PROBE=false`) or the whole poller (`UZI_USAGE_POLL_INTERVAL=0`).
 - No Anthropic token ever appears in a log line, API response, or the SPA.
-- Alert the user (opt-in, default on; Slack DM + inbox) whenever their Anthropic 7-day window clears early — on ANY early clear, not only after their runs were blocked on that window. [user, #1114]
+- Alert the user (opt-in, default on; Slack DM only) whenever their Anthropic 7-day window clears early — on ANY early clear, not only after their runs were blocked on that window; a user without Slack linked sees the reset only on the rate-limit meters. [user, #1114] (AI-synced 2026-09-25: inbox copy retired, #1650)
 
 ## Feature #55 — OIDC group → role/access mapping (Keycloak / Pocket ID)
 
@@ -892,6 +892,13 @@ Tracked as GitHub issue vtmocanu/uzi#1590; PRD at `prds/1590-codex-quarantine-cl
 Tracked as GitHub issue vtmocanu/uzi#1624.
 
 - (AI-synced 2026-09-24) An ephemeral (run-bound) worker reports `max_concurrent_runs` 1 and never counts as a free slot for another run; persistent workers report their advertised cap.
+
+## Feature #1650 — Retire the Notifications inbox tab
+
+Tracked as GitHub issue vtmocanu/uzi#1650; PRD at `prds/done/1650-retire-notifications-inbox.md`.
+
+- The web Notifications inbox (tab, bell, unread badge) is retired; actionable signals reach users by Slack DM (when linked) plus the page that owns the thing. [user 2026-09-25, #1650] (AI-synced 2026-09-25)
+- "Settings → Notifications" (Slack linking) is not the inbox and stays. [user 2026-09-25, #1650] (AI-synced 2026-09-25)
 
 ## Startup admin seed
 

@@ -21,10 +21,9 @@ uzi.**
   "incidental finding" card with **File**, **Edit & file**, and **Dismiss**.
   It's non-blocking by design — a different accent from the amber gate cards
   (plan approval, a clarifying question) that actually park the run.
-- **Your inbox**, and a **Slack DM** if you've linked your account (see
-  [Slack](./slack.md)) — even if you weren't watching. A run that flags
-  several findings sends **one** DM and **one** inbox entry whose count grows,
-  not one ping per finding.
+- **A Slack DM** if you've linked your account (see [Slack](./slack.md)) —
+  even if you weren't watching. A run that flags several findings sends
+  **one** DM, best-effort, not one ping per finding.
 
 Either surface lands you on the same place: the **Findings** backlog.
 
@@ -94,7 +93,7 @@ closes are never seen.
 A finding's title, description, and location are written by the agent, from
 whatever it was reading when it noticed the bug — treat them as data, not as
 something to trust. uzi renders them as inert text everywhere they show up
-(the stream card, the backlog, notifications), and the issue it files runs
+(the stream card, the backlog, the Slack DM), and the issue it files runs
 each field through the same sanitizers uzi's other forge writes use before
 anything reaches the forge.
 

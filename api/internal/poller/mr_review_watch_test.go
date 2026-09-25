@@ -144,6 +144,7 @@ type mrwNotifyCall struct {
 	userID  uuid.UUID
 	runID   *uuid.UUID
 	payload notifysvc.CIAutofixPayload
+	slack   *notifysvc.SlackRender
 }
 
 type mrwNotifier struct {
@@ -153,7 +154,7 @@ type mrwNotifier struct {
 
 func (n *mrwNotifier) Notify(_ context.Context, note notifysvc.Notification) (store.Notification, error) {
 	p, _ := note.Payload.(notifysvc.CIAutofixPayload)
-	n.calls = append(n.calls, mrwNotifyCall{note.Kind, note.UserID, note.RunID, p})
+	n.calls = append(n.calls, mrwNotifyCall{note.Kind, note.UserID, note.RunID, p, note.Slack})
 	if n.ops != nil {
 		*n.ops = append(*n.ops, "notify")
 	}
@@ -165,10 +166,13 @@ type mrwSettings struct {
 	enabledErr error
 	capVal     int
 	capErr     error
+	baseURL    string
+	baseErr    error
 }
 
 func (s mrwSettings) MrReworkEnabled(context.Context) (bool, error) { return s.enabled, s.enabledErr }
 func (s mrwSettings) MrReworkCap(context.Context) (int, error)      { return s.capVal, s.capErr }
+func (s mrwSettings) PublicBaseURL(context.Context) (string, error) { return s.baseURL, s.baseErr }
 
 // mrwForge embeds the CI-autofix test forge (which already satisfies forge.Forge and
 // captures issue-note posts in .notes) and overrides only the MR-comment read.

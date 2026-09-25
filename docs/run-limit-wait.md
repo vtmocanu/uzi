@@ -94,11 +94,12 @@ moment.
 - **On by default** — the same **Settings → Anthropic usage limits** card as
   the pause toggle above has its own checkbox, *"Alert me when my 7-day limit
   resets early"*. It's independent of whether waiting on limits is turned on.
-- **A Slack DM, loud on purpose** — a `🚨 7-DAY RATE LIMIT RESET EARLY` message
-  naming the expected reset time, when it was actually observed, and how many
-  hours you got back. It needs a linked Slack account to reach you (see
-  [Slack notifications](slack.md)); with no Slack linked, the alert is still
-  recorded as a notification in your inbox, just not DMed.
+- **A Slack DM, loud on purpose, and Slack-only** — a `🚨 7-DAY RATE LIMIT
+  RESET EARLY` message naming the expected reset time, when it was actually
+  observed, and how many hours you got back. It needs a linked Slack account
+  to reach you (see [Slack notifications](slack.md)); with no Slack linked,
+  you don't get this alert at all — the reset still shows up on the
+  rate-limit meters, just without the push.
 - **The 8-hour threshold is fixed**, not a setting you can tune.
 - **It only tells you** — it does not resume a paused run early or otherwise
   act on your behalf. A run parked with [wait on limit](#on-by-default) still

@@ -92,6 +92,16 @@ type cardDTO struct {
 	// null when that run has no branch, no CI, or the card has never run. It is what
 	// renders the per-card badge and gates the "Fix CI" affordance.
 	Pipeline *apitypes.PipelineDTO `json:"pipeline"`
+	// CIAutofixHalted reports that automatic CI fixing has stopped on the card's MOST
+	// RECENT run's branch (PRD #1650 D3a): its ci_autofix_attempts row latched
+	// halt_notified (the attempt cap or a no-progress halt), so fixing that failure is
+	// up to the user. Read from the ledger, never through Pipeline: a halt shows even
+	// when no pipeline is cached. Set on every card-returning response (assembleCards,
+	// MoveIssue, PromoteIssue); a freshly created issue has no run, so false.
+	CIAutofixHalted bool `json:"ci_autofix_halted"`
+	// CIAutofixAttempts is the automatic attempts spent on that branch when halted,
+	// 0 when not halted.
+	CIAutofixAttempts int32 `json:"ci_autofix_attempts"`
 }
 
 // latestRunDTO is the run summary a card carries (PRD #12 M2), so the board needs
@@ -446,6 +456,7 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 	// a cache-read failure logs and renders the board without badges.
 	repoPipeline := h.defaultBranchPipeline(r, repo)
 	cardPipelines := h.cardPipelines(r, repo.ID)
+	autofixHalts := h.cardAutofixHalts(r, repo.ID)
 
 	// Plan-revise display flag per card's latest run (issue #750). Best-effort like the
 	// pipeline badges above: the card is decoration, so a failure logs and leaves every
@@ -463,7 +474,7 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 	// repo.UserID is the board viewer (the connection owner); IsMine gates the
 	// owner-only run-view link. repo.ForgeType stamps every card's forge for the
 	// per-card MR/PR noun (all cards on one board share the repo's connection).
-	cards := assembleCards(issues, runRows, cardPipelines, position, repo.UserID, repo.ForgeType, revising, h.cfg.RunTimeout)
+	cards := assembleCards(issues, runRows, cardPipelines, autofixHalts, position, repo.UserID, repo.ForgeType, revising, h.cfg.RunTimeout)
 
 	return boardDTO{
 		RepoID:         repo.ID.String(),
@@ -510,6 +521,33 @@ func (h *Handler) cardPipelines(r *http.Request, repoID uuid.UUID) map[int64]*ap
 		out[row.IssueIid.Int64] = pipelineDTOFrom(row.Ref, row.Status, row.WebUrl, row.PipelineID, row.SyncedAt)
 	}
 	return out
+}
+
+// cardAutofixHalts reads which cards' most-recent-run branch has a halted CI-autofix
+// ledger row, keyed by issue iid to the attempts spent (PRD #1650 D3a). An iid absent
+// from the map is not halted. Like cardPipelines it is enrichment: a read error logs
+// and yields an empty map so the board still renders.
+func (h *Handler) cardAutofixHalts(r *http.Request, repoID uuid.UUID) map[int64]int32 {
+	out := map[int64]int32{}
+	rows, err := h.q.ListCIAutofixHaltsForRepo(r.Context(), repoID)
+	if err != nil {
+		slog.Warn("board card autofix halts", "repo", repoID, "error", err)
+		return out
+	}
+	for _, row := range rows {
+		out[row.IssueIid.Int64] = row.AttemptCount
+	}
+	return out
+}
+
+// setAutofixHalt stamps a card's CI-autofix halt fields for issue iid from the
+// cardAutofixHalts map. A nil map (or an absent iid) leaves them false/0.
+func setAutofixHalt(card *cardDTO, iid int64, halts map[int64]int32) {
+	attempts, halted := halts[iid]
+	card.CIAutofixHalted = halted
+	if halted {
+		card.CIAutofixAttempts = attempts
+	}
 }
 
 // decodeLabels turns a cached issue's labels jsonb into the slice every card DTO
@@ -581,8 +619,9 @@ func nonNilAssigneeIDs(ids []int64) []int64 {
 // keys each issue's latest_run by issue_iid (issues with no run get null), and
 // resolves each card's column. viewerID drives IsMine. revising is the set of run
 // ids whose latest plan-ish message is a plan_revising (issue #750); a nil map leaves
-// every IsRevising false.
-func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, cardPipelines map[int64]*apitypes.PipelineDTO, position map[string]int, viewerID uuid.UUID, forgeType string, revising map[uuid.UUID]bool, globalTimeout time.Duration) []cardDTO {
+// every IsRevising false. autofixHalts is cardAutofixHalts' iid -> attempts map (PRD
+// #1650 D3a); a nil map leaves every card un-halted.
+func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, cardPipelines map[int64]*apitypes.PipelineDTO, autofixHalts map[int64]int32, position map[string]int, viewerID uuid.UUID, forgeType string, revising map[uuid.UUID]bool, globalTimeout time.Duration) []cardDTO {
 	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
 	for _, rr := range runRows {
 		dto := mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.Kind, rr.IterationCount, rr.HasPlanMd.Bool, rr.MrIid, rr.MrWebUrl,
@@ -618,6 +657,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 			a := is.Author.String
 			card.Author = &a
 		}
+		setAutofixHalt(&card, is.ForgeIssueIid, autofixHalts)
 		cards = append(cards, card)
 	}
 	return cards
@@ -998,6 +1038,9 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	// Carry the card's CI badge too (PRD #6), so a manual drag never blanks it (a
 	// drag touches neither runs nor pipelines — the client replaces the whole card).
 	card.Pipeline = h.cardPipelines(r, repo.ID)[iid]
+	// And the CI-autofix halt marker (PRD #1650 D3a), for the same reason. Keyed by
+	// the route iid like the pipeline above.
+	setAutofixHalt(&card, iid, h.cardAutofixHalts(r, repo.ID))
 	httpx.JSON(w, http.StatusOK, map[string]any{"card": card})
 }
 
@@ -1100,6 +1143,8 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for promoted card", "error", err)
 	}
+	// Carry the CI-autofix halt marker (PRD #1650 D3a) so a promote never blanks it.
+	setAutofixHalt(&card, iid, h.cardAutofixHalts(r, repo.ID))
 	httpx.JSON(w, http.StatusOK, map[string]any{"card": card})
 }
 

@@ -31,7 +31,8 @@ import (
 
 // KindCustodyEpisode is the notifications.kind for the owner blocked-custody episode DM. kind is
 // a free-text column with no CHECK, so this needs no migration (like notifysvc's kinds and
-// schedsvc.KindVaultLocked). The web inbox renderer keys off this kind and reads the payload.
+// schedsvc.KindVaultLocked). The row is a write-only event-log entry (PRD #1650 D1); the
+// Slack DM is the only surface.
 const KindCustodyEpisode = "custody_episode"
 
 // custodyEpisodeStore is the DB surface the reconciler needs: the two M6 find-owners reads, the

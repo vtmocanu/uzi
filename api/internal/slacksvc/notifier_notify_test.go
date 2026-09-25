@@ -12,7 +12,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 )
 
-// The generic inbox-notification path (PRD #46 M2): PublishNotification →
+// The generic notification DM path (PRD #46 M2): PublishNotification →
 // handleNotify. It reuses the run-state path's delivery gating but NOT its
 // run/repo rendering, so these tests drive handleNotify directly with a
 // notifyEvent and assert on the DM text and the drop conditions.
@@ -238,15 +238,16 @@ func TestNotificationBlocksInjectedMentionInert(t *testing.T) {
 	}
 }
 
-// TestNotificationBlocksServerProseUnchanged: the three non-judge producers that share
-// notificationBlocks post FIXED server prose carrying no markdown, so routing them
-// through SlackMrkdwn is a safe superset — the rendered body equals the input (just
-// blockquoted), unchanged from before M4.
+// TestNotificationBlocksServerProseUnchanged: FIXED server prose carrying no markdown
+// routes through SlackMrkdwn as a safe superset — the rendered body equals the input
+// (just blockquoted), unchanged from before M4. The fixtures are representative fixed
+// prose; the two self-improve notices were retired as producers by PRD #1650 M1 and are
+// kept only as prose shapes.
 func TestNotificationBlocksServerProseUnchanged(t *testing.T) {
 	fixed := []string{
-		// selfimprove started (engine.go)
+		// fixed prose shape (the retired self-improve "started" notice)
 		"A self-improvement run has started on the uzi repo. It will open or extend one merge request; review its plan in the run view.",
-		// selfimprove skipped (engine.go)
+		// fixed prose shape (the retired self-improve "skipped" notice)
 		"A self-improvement run is still in progress, so this cycle was skipped. It will retry once the current run finishes.",
 		// schedule paused (scheduler.go), a representative rendered reason
 		"A scheduled run was paused because the repo was disconnected. Reconnect the repo or update the schedule to resume it.",

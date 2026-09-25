@@ -121,8 +121,8 @@ type Engine struct {
 	notifier EarlyResetNotifier
 }
 
-// SetNotifier wires the early-reset alert collaborator (PRD #1020 M3), mirroring
-// forgesvc.SetNotifier. Call once at startup, before the engine runs. A nil notifier
+// SetNotifier wires the early-reset alert collaborator (PRD #1020 M3). Call once at
+// startup, before the engine runs. A nil notifier
 // (the default) leaves detection running but silent.
 func (e *Engine) SetNotifier(n EarlyResetNotifier) { e.notifier = n }
 

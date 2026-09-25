@@ -195,16 +195,17 @@ func (h *Handler) WorkerRunReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The review is now durably persisted (persist-first). Surface it best-effort as a
-	// "review ready" notification to the run's OWNER (never cross-user): an inbox row
-	// plus an optional Slack DM. A notify failure never fails the worker POST — the
+	// "review ready" notification to the run's OWNER (never cross-user): a row in the
+	// pruned, write-only notifications event log plus an optional Slack DM. A notify failure never fails the worker POST — the
 	// review is the source of truth and re-running is cheap.
 	h.notifyReviewReady(r.Context(), targetID, res, sub)
 	httpx.JSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
-// judgeReviewNotificationKind is the inbox notification kind the judge produces at
-// review completion (PRD #46 M4). The inbox + Slack renderers key on the { title,
-// body } payload convention; this kind lets a reader recognize a judge review row.
+// judgeReviewNotificationKind is the notification kind the judge produces at review
+// completion (PRD #46 M4). The rows follow the { title, body } payload convention of
+// the write-only event log; this kind lets a reader of that log recognize a judge
+// review row. The Slack DM renders from the SlackRender, not the payload.
 const judgeReviewNotificationKind = "judge_review"
 
 // notifyReviewReady fires the "review ready" notification for a just-persisted review
@@ -229,7 +230,7 @@ func (h *Handler) notifyReviewReady(ctx context.Context, targetID uuid.UUID, res
 
 // buildReviewNotification assembles the "review ready" notification (PRD #46 M4,
 // Decision 6). It is PURE (no I/O) so the security-critical shape is unit-testable.
-// The inbox payload and the Slack body carry the verdict, the SCRUBBED summary, and
+// The event-log payload and the Slack body carry the verdict, the SCRUBBED summary, and
 // the recommendation count + categories (the full recommendation detail lives on the Judge
 // workbench behind the deep link — `/judge?run={target}` since PRD #98 M5, not the run
 // page). The summary is untrusted judge/worker text: it was
@@ -335,13 +336,13 @@ func recommendationCategoryChips(recs []workersvc.ReviewRecommendation) []string
 	return chips
 }
 
-// reviewNotificationBody renders the one-line summary shown in the web inbox row
-// (Payload["body"]): the verdict, how many recommendations came with it, and (when
-// present) the scrubbed summary preview. The summary preview is now MULTI-LINE (PRD #292
+// reviewNotificationBody renders the one-line summary stored as the event-log row's
+// Payload["body"]: the verdict, how many recommendations came with it, and (when
+// present) the scrubbed summary preview. The summary preview is MULTI-LINE (PRD #292
 // M4 preserves its newlines for the Slack blockquote), so its whitespace/newlines are
-// collapsed to single spaces HERE, at the append, to keep the inbox row a one-liner
-// (Decision 7 / SC4). The web inbox reads only payload.body — never payload.summary — so
-// the multi-line summary never reaches it.
+// collapsed to single spaces HERE, at the append, to keep payload.body a one-liner
+// (Decision 7 / SC4). Nothing renders the rows as an inbox any more (PRD #1650 D1);
+// the Slack DM takes the multi-line summary through SlackRender.Body instead.
 func reviewNotificationBody(verdict string, recCount int, summary string) string {
 	line := "verdict: " + verdict
 	if recCount == 1 {
@@ -357,7 +358,7 @@ func reviewNotificationBody(verdict string, recCount int, summary string) string
 
 // reviewSummaryPreviewMaxRunes caps the summary preview carried in the notification.
 // PRD #268 M3 raised it from 280 to 600: the fuller excerpt is for the Slack DM's
-// blockquote (the Body of the Block Kit render), which has room for it; the inbox
+// blockquote (the Body of the Block Kit render), which has room for it; the event-log
 // one-liner (Payload.body via reviewNotificationBody) is still capped, just to the same
 // longer preview. The run page still holds the full text.
 const reviewSummaryPreviewMaxRunes = 600
@@ -367,7 +368,7 @@ const reviewSummaryPreviewMaxRunes = 600
 // is already scrubbed at ingest, but the producer contract re-scrubs every free field
 // copied onto the verbatim payload path), then rune-capped. Newlines are kept so the
 // Slack blockquote/list structure survives when the body is rendered as mrkdwn (the
-// output feeds SlackRender.Body); the web inbox one-liner collapses them itself in
+// output feeds SlackRender.Body); the event-log one-liner collapses them itself in
 // reviewNotificationBody (Decision 7). Scrub the FULL text before the cap so no secret
 // byte can survive the cut regardless of where it lands — the cap may split a redaction
 // marker, but a split marker leaks nothing; only unscrubbed secret bytes would.
@@ -404,9 +405,7 @@ func recommendationCategories(recs []workersvc.ReviewRecommendation) []string {
 // no Slack digest (Decision 5, user-decided); only the destination moves.
 //
 // This function is judge-only by construction — it is called from exactly one place, the
-// judge review notification — which is why it is a plain URL change here and a
-// kind-conditional guard in the web inbox (see web/src/lib/notifications.ts, where the
-// same link is computed for a surface that renders EVERY kind).
+// judge review notification — which is why it is a plain URL change here.
 func reviewDeepLink(baseURL string, targetID uuid.UUID) string {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if baseURL == "" {

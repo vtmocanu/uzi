@@ -568,7 +568,8 @@ export function RunDefaults() {
             With the run judge on, each of your <strong className="text-fg">finished</strong> runs is
             reviewed by an LLM on <strong className="text-fg">your own Anthropic tokens</strong>. It reads
             the run trace and produces a verdict plus recommendations (a missing worker tool, an agent or
-            template to improve, and so on) in your inbox — it only recommends, and never changes code. Your
+            template to improve, and so on). Results appear on the Judge page and on the run&rsquo;s page,
+            plus a Slack DM when your Slack account is linked. It only recommends and never changes code. Your
             instance admin also has to enable the feature globally for anything to run. Off by default.
           </p>
         </div>

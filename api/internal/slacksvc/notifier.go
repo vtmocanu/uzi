@@ -123,8 +123,8 @@ type Notifier struct {
 	baseURL func(context.Context) (string, error)
 	logger  *slog.Logger
 	ch      chan stateEvent
-	// notifyCh carries generic inbox notifications (PRD #46 M2) — judge reviews,
-	// self-improvement MRs, anything the notifysvc seam publishes. It is a SEPARATE
+	// notifyCh carries generic notifications (PRD #46 M2): judge reviews, halts,
+	// override decisions, anything the notifysvc seam publishes. It is a SEPARATE
 	// queue from ch on purpose: these events do NOT go through GetSlackRunContext
 	// (they are not run-state transitions and a judge run is repo-less), so they
 	// share none of the state path's run/repo rendering.
@@ -181,7 +181,7 @@ type stateEvent struct {
 	status string
 }
 
-// notifyEvent is a generic inbox notification bound for a user's DM (PRD #46 M2).
+// notifyEvent is a generic notification bound for a user's DM (PRD #46 M2).
 // title is a caller-set fixed label; body is dynamic, potentially untrusted free
 // text; link is an in-app deep-link URL. emoji is a caller-set leading glyph and
 // facts are caller-built TRUSTED short strings carrying intentional markup, built
@@ -193,8 +193,10 @@ type notifyEvent struct {
 	title  string
 	body   string
 	link   string
-	emoji  string
-	facts  []string
+	// linkLabel is the caller-set fixed label for link; empty ⇒ "Open in uzi".
+	linkLabel string
+	emoji     string
+	facts     []string
 }
 
 // healthEvent is a run-health flag change (PRD #47 M4). nudge is set only when the
@@ -230,13 +232,14 @@ func NewNotifier(s NotifierStore, poster Poster, baseURL func(context.Context) (
 	return n
 }
 
-// PublishNotification enqueues a generic inbox notification for delivery to the
-// user's Slack DM (PRD #46 M2). It implements notifysvc.Slacker. Like PublishState
-// it MUST NOT block: it enqueues and returns, dropping the event if the queue is
-// full (Slack is strictly best-effort — the inbox row is already durable).
+// PublishNotification enqueues a generic notification for delivery to the user's
+// Slack DM (PRD #46 M2). It implements notifysvc.Slacker. Like PublishState it MUST
+// NOT block: it enqueues and returns, dropping the event if the queue is full (Slack
+// is strictly best-effort; the notifications row, a pruned write-only event log, is
+// already persisted).
 func (n *Notifier) PublishNotification(userID uuid.UUID, r notifysvc.SlackRender) {
 	select {
-	case n.notifyCh <- notifyEvent{userID: userID, title: r.Title, body: r.Body, link: r.Link, emoji: r.Emoji, facts: r.Facts}:
+	case n.notifyCh <- notifyEvent{userID: userID, title: r.Title, body: r.Body, link: r.Link, linkLabel: r.LinkLabel, emoji: r.Emoji, facts: r.Facts}:
 	default:
 		n.logger.Warn("slack: notifier queue full, dropping notification", "user", userID.String())
 	}

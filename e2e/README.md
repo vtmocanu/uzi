@@ -155,7 +155,7 @@ headers, not the rows.
 | 32 | agent-mr-fix-crosskind | gitlab | no | PRD #6: agent-MR same-branch fix + cross-kind race |
 | 33 | uzi-eligibility-gate | gitlab | no | PRD #764: uzi run-eligibility gate (no PRD link required + Promote) |
 | 34 | vault | gitlab | no | PRD #32: per-user vault (dek sealing, claim gating, restart lock, lazy rewrap) |
-| 35 | judge-funnel | gitlab | no | PRD #46: run judge (stub) — funnel enqueue -> claim -> review -> persist-first notification |
+| 35 | judge-funnel | gitlab | no | PRD #46: run judge (stub) — funnel enqueue -> claim -> review -> durable review via the judge API |
 | 36 | file-forge-issue | gitlab | no | PRD #68: file a forge issue from a judge recommendation |
 | 37 | printed-instructions-menu | gitlab | no | PRD #98 M8c: printed instructions EXECUTED verbatim from the emitting command's own output |
 | 38 | closed-issue-poller | gitlab | no | PRD #98 M8b/B6': a closed forge issue reaches Done THROUGH THE POLLER (M6's wiring) |
