@@ -32,8 +32,10 @@ type (
 // drain kills and reaps every current descendant until it observes ECHILD, or a
 // bound is hit. drained REQUIRES an observed ECHILD with no remaining children;
 // an ECHILD contradicted by a still-present child, or the deadline, yields
-// unconfirmed. It is idempotent: a second call over an already-empty tree
-// observes ECHILD immediately and reports drained with empty sets.
+// unconfirmed. Reaped contains only children waited by this drain call; children
+// already reaped by the periodic control loop are absent. It is idempotent:
+// a second call over an already-empty tree observes ECHILD immediately and
+// reports drained with empty sets.
 func drain(
 	deadline time.Time,
 	clock func() time.Time,
