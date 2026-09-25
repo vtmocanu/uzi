@@ -49,10 +49,15 @@ func realMain(args []string) int {
 			kill:           realKill,
 			reap:           realReap,
 			reapChild:      realReapChild,
-			snapshot:       func() ([]procRow, error) { return walkDescendants(os.Getpid()) },
-			now:            time.Now,
-			sleep:          func() { time.Sleep(2 * time.Millisecond) },
-			tmpCleanup:     tmpCleanupFor(tmp),
+			adoptedTick: func() (<-chan time.Time, func()) {
+				ticker := time.NewTicker(500 * time.Millisecond)
+				return ticker.C, ticker.Stop
+			},
+			reapAdopted: realReapAdopted,
+			snapshot:    func() ([]procRow, error) { return walkDescendants(os.Getpid()) },
+			now:         time.Now,
+			sleep:       func() { time.Sleep(2 * time.Millisecond) },
+			tmpCleanup:  tmpCleanupFor(tmp),
 		},
 	}
 	// The supervised child inherited stdio 0/1/2. Drop the supervisor's copies so
@@ -174,8 +179,8 @@ func watchChild(pid int) (<-chan error, error) {
 }
 
 // realReapChild reaps only the supervised primary child after its pidfd became
-// readable. Detached/background descendants remain adopted by the subreaper and
-// are accounted for by the later ECHILD+__WALL drain.
+// readable. Adopted direct children are reaped on periodic ticks; dispose
+// drains any descendants still present and confirms ECHILD+__WALL.
 func realReapChild(pid int) (int, error) {
 	var ws unix.WaitStatus
 	got, err := unix.Wait4(pid, &ws, unix.WNOHANG|unix.WALL, nil)
@@ -192,6 +197,12 @@ func realReapChild(pid int) (int, error) {
 		return 128 + int(ws.Signal()), nil
 	}
 	return 1, nil
+}
+
+// realReapAdopted checks one current direct child without blocking the control loop.
+func realReapAdopted(pid int) (int, error) {
+	var ws unix.WaitStatus
+	return unix.Wait4(pid, &ws, unix.WNOHANG|unix.WALL, nil)
 }
 
 var errBadArgs = errors.New("invalid arguments")

@@ -239,7 +239,9 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    (`git worktree list`, then `git worktree remove` / `git branch -D`), purge the completed
    trail with `S/claims.sh release '#PR' --purge`, then run
    `S/claims.sh reap --repo OWNER/REPO` (drops merged/closed claims and orphans of dead
-   sessions), and hand any still-open item on.
+   sessions), and hand any still-open item on. A run's off-task findings ("a finding was
+   filed" in its plan or log) are uzi incidental findings, not forge issues: list them with
+   `uzi findings list --run RUN --bucket all` before reporting them anywhere.
 
 ## Always yours, whichever review lane applies
 

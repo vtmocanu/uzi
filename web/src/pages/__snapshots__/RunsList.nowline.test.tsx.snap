@@ -16,54 +16,17 @@ exports[`RunsList row now line (PRD #1064 M3) > D5: a null-milestone null-activi
       data-live=""
     >
       <div
-        class="w-full min-w-0 sm:w-auto sm:flex-1"
-      >
-        <p
-          class="truncate text-sm font-medium text-fg"
-        >
-          A run
-        </p>
-        <p
-          class="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint"
-        >
-          <span
-            class="inline-flex items-center gap-1"
-          >
-            grp/proj
-             
-            <span>
-              #
-              7
-            </span>
-          </span>
-          <span>
-            · 
-            w1
-          </span>
-          <span>
-            · 
-            7/5/2026, 12:00:00 PM
-          </span>
-          <span
-            class="font-mono tabular-nums"
-          >
-            · 
-            running 40s
-          </span>
-        </p>
-      </div>
-      <div
-        class="relative z-10 flex flex-wrap items-center gap-2"
+        class="flex w-full min-w-0 items-start gap-2 sm:w-auto sm:flex-1"
       >
         <span
           aria-label="Claude"
-          class="inline-flex h-5 w-5 flex-none items-center justify-center rounded-full border border-edge bg-ink text-fg"
+          class="inline-flex h-7 w-7 flex-none items-center justify-center text-fg"
           role="img"
           title="Runs on Claude"
         >
           <svg
             aria-hidden="true"
-            class="text-brand-claude h-[13px] w-[13px]"
+            class="text-brand-claude h-[22px] w-[22px]"
             fill="currentColor"
             height="1em"
             viewBox="0 0 24 24"
@@ -74,6 +37,47 @@ exports[`RunsList row now line (PRD #1064 M3) > D5: a null-milestone null-activi
             />
           </svg>
         </span>
+        <div
+          class="min-w-0 flex-1"
+        >
+          <p
+            class="truncate text-sm font-medium text-fg"
+          >
+            A run
+          </p>
+          <p
+            class="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint"
+          >
+            <span
+              class="inline-flex items-center gap-1"
+            >
+              grp/proj
+               
+              <span>
+                #
+                7
+              </span>
+            </span>
+            <span>
+              · 
+              w1
+            </span>
+            <span>
+              · 
+              7/5/2026, 12:00:00 PM
+            </span>
+            <span
+              class="font-mono tabular-nums"
+            >
+              · 
+              running 40s
+            </span>
+          </p>
+        </div>
+      </div>
+      <div
+        class="relative z-10 flex flex-wrap items-center gap-2"
+      >
         <span
           class="inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium border-info/40 bg-info/10 text-info"
         >

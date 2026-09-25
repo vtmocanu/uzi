@@ -45,7 +45,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { Logger } from "./log.js";
 import { errMessage } from "./util.js";
-import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
+import { commandRootCommand, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { withRetry, classifyDevboxError, DEVBOX_RETRY_SCHEDULE } from "./forge-retry.js";
 
 const execFileAsync = promisify(execFile);
@@ -88,6 +88,8 @@ export interface ProvisionDeps {
   /** Injectable sleep for the devbox-install retry backoff (tests record delays
    *  and resolve immediately); default = real setTimeout-based sleep. */
   sleep?: (ms: number) => Promise<void>;
+  /** Inject the child process for deterministic PATH probe tests. */
+  runPathProbe?: (cmd: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv }) => Promise<RunResult>;
 }
 
 export interface ProvisionResult {
@@ -181,6 +183,48 @@ export function filterShellenv(output: string, basePath: string): Record<string,
   return out;
 }
 
+// One child checks the whole PATH under one consuming identity. JSON on both sides
+// avoids shell parsing of entries containing spaces, quotes, or newlines.
+const PATH_PROBE_SCRIPT = `const fs = require("node:fs");
+const entries = JSON.parse(process.argv[1]);
+const statuses = entries.map((entry) => {
+  try { fs.accessSync(entry || ".", fs.constants.X_OK); return "ok"; }
+  catch (err) { return err && err.code === "EACCES" ? "EACCES" : err && err.code === "ENOENT" ? "ENOENT" : "other"; }
+});
+process.stdout.write(JSON.stringify(statuses));`;
+
+type PathStatus = "ok" | "EACCES" | "ENOENT" | "other";
+
+async function defaultPathProbe(
+  cmd: string,
+  args: string[],
+  opts: { cwd: string; env: NodeJS.ProcessEnv },
+): Promise<RunResult> {
+  const { stdout, stderr } = await execFileAsync(cmd, args, {
+    cwd: opts.cwd, env: opts.env, timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
+  });
+  return { stdout, stderr };
+}
+
+async function probePath(
+  entries: string[],
+  identity: "runner" | "runner-cmd" | "current",
+  opts: { cwd: string; env: NodeJS.ProcessEnv },
+  run: NonNullable<ProvisionDeps["runPathProbe"]>,
+): Promise<PathStatus[]> {
+  const args = ["-e", PATH_PROBE_SCRIPT, JSON.stringify(entries)];
+  const wrapped = identity === "runner" ? runnerCommand(process.execPath, args)
+    : identity === "runner-cmd" ? commandRootCommand(process.execPath, args)
+      : { command: process.execPath, args };
+  const result = await run(wrapped.command, wrapped.args, opts);
+  const parsed: unknown = JSON.parse(result.stdout);
+  if (!Array.isArray(parsed) || parsed.length !== entries.length ||
+      !parsed.every((status) => status === "ok" || status === "EACCES" || status === "ENOENT" || status === "other")) {
+    throw new Error("invalid PATH probe response");
+  }
+  return parsed as PathStatus[];
+}
+
 /**
  * Provision the run's tool packages and return the allowlisted env to fold into
  * the SDK env. Throws on any failure (missing package, devbox error) so the run
@@ -231,6 +275,26 @@ export async function provisionTools(input: ProvisionInput, deps: ProvisionDeps)
   }
 
   const toolEnv = filterShellenv(shellenv.stdout, env.PATH ?? "");
+  if (toolEnv.PATH !== undefined) {
+    const originalPath = toolEnv.PATH;
+    const entries = originalPath.split(":");
+    const identities = uidSplitActive(source) ? ["runner", "runner-cmd"] as const : ["current"] as const;
+    try {
+      const results: PathStatus[][] = [];
+      for (const identity of identities) {
+        results.push(await probePath(entries, identity, { cwd: input.runDir, env }, deps.runPathProbe ?? defaultPathProbe));
+      }
+      const removed = entries.flatMap((entry, index) => {
+        const deniedBy = identities.filter((_, identityIndex) => results[identityIndex]?.[index] === "EACCES");
+        return deniedBy.length > 0 ? [{ entry, deniedBy }] : [];
+      });
+      toolEnv.PATH = entries.filter((_, index) => results.every((statuses) => statuses[index] !== "EACCES")).join(":");
+      if (removed.length > 0) deps.log.info("removed inaccessible PATH entries", { removed });
+    } catch (err) {
+      toolEnv.PATH = originalPath;
+      deps.log.warn("PATH probe failed; retaining original PATH", { error: errMessage(err) });
+    }
+  }
   deps.log.info("tools provisioned", { packages: input.packages, exported: Object.keys(toolEnv).sort() });
   return { toolEnv };
 }

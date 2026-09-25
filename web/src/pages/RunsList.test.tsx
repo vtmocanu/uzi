@@ -327,6 +327,9 @@ describe("RunsList — waiting for vault unlock (PRD #32)", () => {
 
     await waitFor(() => expect(screen.getByText("Queued run")).toBeTruthy());
     expect(screen.getByText(/waiting for vault unlock/)).toBeTruthy();
+    const row = screen.getByText("Queued run").closest("li")!;
+    expect(row.querySelector('[role="img"][aria-label="Claude"]')?.getAttribute("title")).toBe("Runs on Claude");
+    expect(row.querySelectorAll('[role="img"][aria-label="Claude"]')).toHaveLength(1);
     // The bare "queued" pill must not also render for that run.
     expect(screen.queryByText("queued")).toBeNull();
   });
@@ -394,12 +397,16 @@ describe("RunsList — autopilot badge", () => {
     await waitFor(() => expect(screen.getByText("Autopilot run")).toBeTruthy());
     expect(screen.getByText("Manual run")).toBeTruthy();
     // Exactly one badge — the manual run must not carry it.
+    const autoRow = screen.getByText("Autopilot run").closest("li")!;
+    const logo = autoRow.querySelector('[role="img"][aria-label="Claude"]')!;
+    const autopilot = autoRow.querySelector('[title="Autopilot: started from the label, plan auto-approved"]')!;
+    expect(logo.compareDocumentPosition(autopilot) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(screen.getAllByText("autopilot")).toHaveLength(1);
   });
 });
 
-describe("RunsList — harness chip (PRD #1429 M4a, PRD #1653 D-W5)", () => {
-  it("marks every run with its provider chip, Claude and Codex alike", async () => {
+describe("RunsList — harness logo (PRD #1429 M4a, PRD #1653 D-W5, issue #1681)", () => {
+  it("marks every run with its provider logo, Claude and Codex alike", async () => {
     mockApi.listRuns.mockResolvedValue({
       runs: [
         aRun({ id: "codex-run", issue_title: "Codex run", harness: "codex" }),
@@ -416,6 +423,21 @@ describe("RunsList — harness chip (PRD #1429 M4a, PRD #1653 D-W5)", () => {
     const claudeChip = screen.getByRole("img", { name: "Claude" });
     expect(codexChip.getAttribute("title")).toBe("Runs on Codex");
     expect(claudeChip.getAttribute("title")).toBe("Runs on Claude");
+    for (const [title, chip] of [["Codex run", codexChip], ["Claude run", claudeChip]] as const) {
+      const row = screen.getByText(title).closest("li")!;
+      const chrome = row.querySelector(":scope > div")!;
+      expect(chrome.children).toHaveLength(2);
+      const leading = chrome.children[0];
+      expect(leading.className).toContain("w-full min-w-0");
+      expect(leading.className).toContain("sm:w-auto sm:flex-1");
+      expect(leading.firstElementChild).toBe(chip);
+      expect(chip.className).not.toContain("z-10");
+      expect(chip.className).toContain("h-7 w-7");
+      expect(chip.querySelector("svg")?.getAttribute("class")).toContain("h-[22px] w-[22px]");
+      expect(leading.children[1].className).toContain("min-w-0 flex-1");
+      expect(leading.children[1].contains(screen.getByText(title))).toBe(true);
+      expect(chrome.children[1].contains(chip)).toBe(false);
+    }
     expect(screen.getAllByRole("img", { name: "Codex" })).toHaveLength(1);
     expect(screen.getAllByRole("img", { name: "Claude" })).toHaveLength(1);
     // The retired "Codex" text badge is gone.

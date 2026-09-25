@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
 import {
   buildProvisionEnv,
   filterShellenv,
@@ -93,6 +93,98 @@ describe("filterShellenv (output allowlist)", () => {
 });
 
 describe("provisionTools", () => {
+  async function provisionWithPath(
+    pathValue: string,
+    processEnv: NodeJS.ProcessEnv,
+    runPathProbe: NonNullable<Parameters<typeof provisionTools>[1]["runPathProbe"]>,
+    log = nullLogger(),
+  ) {
+    return provisionTools(
+      { packages: [], runDir: path.join(tmp, "run"), homeDir: "/data/agent-home" },
+      {
+        log, processEnv, runPathProbe,
+        run: async (_cmd, args) => ({ stdout: args[0] === "shellenv" ? `export PATH="${pathValue}"\n` : "", stderr: "" }),
+      },
+    );
+  }
+
+  for (const [deniedIdentity, deniedUid] of [["runner", "runner"], ["runner-cmd", "10003"]] as const) {
+    it(`drops entries inaccessible to ${deniedIdentity} while retaining ENOENT and duplicates`, async () => {
+      const previous = process.env.UZI_UID_SPLIT;
+      process.env.UZI_UID_SPLIT = "1";
+      try {
+        const calls: string[] = [];
+        const { logger, lines } = recordingLogger();
+        const runPathProbe: NonNullable<Parameters<typeof provisionTools>[1]["runPathProbe"]> = async (cmd, args, opts) => {
+          assert.equal(cmd, "/bin/setpriv");
+          assert.equal(args[0], "--reuid");
+          const uid = args[1] ?? "";
+          calls.push(uid);
+          assert.equal(args.at(-4), process.execPath);
+          assert.equal(args.at(-3), "-e");
+          assert.deepEqual(JSON.parse(args.at(-1) ?? ""), ["/kept", "/denied", "/missing", "/denied", "/kept"]);
+          assert.deepEqual(Object.keys(opts.env).sort(), ["HOME", "PATH"]);
+          assert.equal(opts.cwd, path.join(tmp, "run"));
+          return { stdout: JSON.stringify(["ok", uid === deniedUid ? "EACCES" : "ok", "ENOENT", uid === deniedUid ? "EACCES" : "ok", "ok"]), stderr: "" };
+        };
+        const result = await provisionWithPath("/kept:/denied:/missing:/denied:/kept", { PATH: "/base", UZI_UID_SPLIT: "1", UZI_WORKER_TOKEN: "secret" }, runPathProbe, logger);
+        assert.deepEqual(calls, ["runner", "10003"]);
+        assert.equal(result.toolEnv.PATH, "/kept:/missing:/kept");
+        assert.ok(lines.some((line) => {
+          const logged = JSON.stringify(line);
+          return logged.includes("removed inaccessible PATH entries") && logged.includes(deniedIdentity);
+        }));
+      } finally {
+        if (previous === undefined) delete process.env.UZI_UID_SPLIT;
+        else process.env.UZI_UID_SPLIT = previous;
+      }
+    });
+  }
+
+  for (const failure of ["spawn", "protocol"] as const) {
+    it(`retains the whole PATH and warns on ${failure} failure`, async () => {
+      const previous = process.env.UZI_UID_SPLIT;
+      process.env.UZI_UID_SPLIT = "1";
+      try {
+        let calls = 0;
+        const { logger, lines } = recordingLogger();
+        const result = await provisionWithPath("/a:/b", { PATH: "/base", UZI_UID_SPLIT: "1" }, async () => {
+          calls++;
+          if (calls === 2) {
+            if (failure === "spawn") throw new Error("spawn failed");
+            return { stdout: '{"statuses":["ok","EACCES"]}', stderr: "" };
+          }
+          return { stdout: '["EACCES","ok"]', stderr: "" };
+        }, logger);
+        assert.equal(calls, 2);
+        assert.equal(result.toolEnv.PATH, "/a:/b");
+        assert.ok(lines.some((line) => JSON.stringify(line).includes("PATH probe failed; retaining original PATH")));
+      } finally {
+        if (previous === undefined) delete process.env.UZI_UID_SPLIT;
+        else process.env.UZI_UID_SPLIT = previous;
+      }
+    });
+  }
+
+  it("probes once as the current identity without a UID split", async () => {
+    const previous = process.env.UZI_UID_SPLIT;
+    delete process.env.UZI_UID_SPLIT;
+    try {
+      let calls = 0;
+      const result = await provisionWithPath("/a:/b", { PATH: "/base" }, async (cmd, args) => {
+        calls++;
+        assert.equal(cmd, process.execPath);
+        assert.equal(args[0], "-e");
+        assert.deepEqual(JSON.parse(args[2] ?? ""), ["/a", "/b"]);
+        return { stdout: '["EACCES","ENOENT"]', stderr: "" };
+      });
+      assert.equal(calls, 1);
+      assert.equal(result.toolEnv.PATH, "/b");
+    } finally {
+      if (previous === undefined) delete process.env.UZI_UID_SPLIT;
+      else process.env.UZI_UID_SPLIT = previous;
+    }
+  });
   it("writes a packages-only devbox.json and installs in a scrubbed env", async () => {
     const calls: Array<{ cmd: string; args: string[]; env: NodeJS.ProcessEnv }> = [];
     const run = async (cmd: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv }): Promise<RunResult> => {

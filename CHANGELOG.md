@@ -31,6 +31,8 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Run list: harness logo leads each row ([#1681](https://github.com/vtmocanu/uzi/issues/1681)).**
+  Claude and Codex logos stay visible even while a run waits for vault unlock; the run header keeps its compact chip.
 - **The Notifications inbox tab, bell icon and unread badge are retired; `run_failed`, `ci_autofix_started`, `ci_autofix_landed` and `selfimprove_started` are no longer produced ([#1650](https://github.com/vtmocanu/uzi/issues/1650)).**
   Every signal the inbox carried already has, or now has, a home elsewhere: Findings, Judge, Schedules, Admin Health, the run page, or a Slack DM (see the three new DM kinds above). The four status-only kinds duplicated a page surface or a Slack DM that already existed, so they stop firing; the start comment an auto-fix posts (and its halt comment) are unchanged; a landed fix never posted a forge comment of its own. Visiting `/notifications` now redirects to the dashboard through the app's catch-all route. The favicon's amber dot now means only "a run needs you" (awaiting approval, an answer, or your next follow-up); the inbox's unread count no longer feeds it. The `notifications` table itself is unaffected: it stays as a pruned, write-only event log and the incidental-finding Slack de-dup latch; nothing reads it back to a user.
 - **The early-limit-reset alert is now Slack-only ([#1650](https://github.com/vtmocanu/uzi/issues/1650)).**

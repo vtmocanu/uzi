@@ -347,96 +347,98 @@ export function RunRow({
         data-live={shadow === "live" ? "" : undefined}
         data-attention={shadow === "attention" ? "" : undefined}
       >
-        {/* w-full below sm stacks the badge cluster UNDER the title (review-wave
-            fix 1): with min-w-0 alone the title column could shrink to nothing, so
-            at 390px the unshrinkable badges starved it to a few characters before
-            flex-wrap ever fired. From sm up the old one-row layout is unchanged. */}
-        <div className="w-full min-w-0 sm:w-auto sm:flex-1">
-          {/* Issue #124: the run title is the forge ISSUE title — writable by anyone who
-              can open an issue on the target repo, so it is untrusted free text on the same
-              footing as judge output. Display-only here; the raw value stays the identity. */}
-          <p className="truncate text-sm font-medium text-fg">{stripUnsafeChars(run.issue_title)}</p>
-          {/* PRD #362 M4: a one-line intent preview ("what this run will implement"),
-              shown once the summary lands. UNTRUSTED model output over an
-              attacker-influenceable issue/PRD, so it goes through stripUnsafeChars and is
-              truncated to one line like the title — never <Markdown>. Absent until the
-              worker posts the intent summary, so a pre-feature/early run shows only the title. */}
-          {run.summary_intent && run.summary_intent.trim() !== "" && (
-            <p className="mt-0.5 truncate text-xs text-muted">{stripUnsafeChars(run.summary_intent)}</p>
-          )}
-          {showNow && activity && (
-            <p className="mt-0.5 flex items-center gap-1.5 text-xs text-faint">
-              <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full bg-ok animate-pulse" />
-              <span className="shrink-0 font-medium text-ok">{stripUnsafeChars(activity.agent)}</span>
-              {nowMilestone && <span className="shrink-0 font-mono text-faint">{nowMilestone}</span>}
-              <span className="min-w-0 truncate italic text-muted">
-                {stripUnsafeChars(activity.agent_label || activity.detail || activity.tool)}
-              </span>
-              <span className="ml-auto shrink-0 whitespace-nowrap font-mono tabular-nums text-faint">
-                {activityAge(activity.at, now)}
-              </span>
-            </p>
-          )}
-          <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">
-            <span className="inline-flex items-center gap-1">
-              {maskRepoPath(run.repo_path, demo)}{" "}
-              <RunIssueRef
-                issueIid={run.issue_iid}
-                issueWebUrl={run.issue_web_url}
-                kind={run.kind}
-                forgeType={run.forge_type}
-                raised
-              />
-            </span>
-            {run.worker_name && <span>· {run.worker_name}</span>}
-            {showOwner && run.owner_email && <span>· {maskEmail(run.owner_email, demo)}</span>}
-            <span>· {new Date(run.updated_at).toLocaleString()}</span>
-            {duration && <span className="font-mono tabular-nums">· {duration}</span>}
-            {run.mr_iid != null && (
-              // The "· " separator lives OUTSIDE MrChip (issue #1253): the inline merged
-              // chip is now a bordered box, so a dot passed through `label` would render
-              // inside the border. Mirror IssueView — keep only the "MR "/"PR " abbrev in
-              // `label`, and emit the separator as a sibling text node.
-              <span>
-                ·{" "}
-                <MrChip
-                  variant="inline"
-                  label={`${mrAbbrev(run.forge_type)} `}
+        {/* The full-width leading group keeps the logo beside the title below sm while
+            the badge cluster stacks underneath. Its min-w-0 title column still
+            truncates long titles; above sm the groups share one row. */}
+        <div className="flex w-full min-w-0 items-start gap-2 sm:w-auto sm:flex-1">
+          <HarnessBadge harness={run.harness} variant="bare" />
+          <div className="min-w-0 flex-1">
+            {/* Issue #124: the run title is the forge ISSUE title — writable by anyone who
+                can open an issue on the target repo, so it is untrusted free text on the same
+                footing as judge output. Display-only here; the raw value stays the identity. */}
+            <p className="truncate text-sm font-medium text-fg">{stripUnsafeChars(run.issue_title)}</p>
+            {/* PRD #362 M4: a one-line intent preview ("what this run will implement"),
+                shown once the summary lands. UNTRUSTED model output over an
+                attacker-influenceable issue/PRD, so it goes through stripUnsafeChars and is
+                truncated to one line like the title — never <Markdown>. Absent until the
+                worker posts the intent summary, so a pre-feature/early run shows only the title. */}
+            {run.summary_intent && run.summary_intent.trim() !== "" && (
+              <p className="mt-0.5 truncate text-xs text-muted">{stripUnsafeChars(run.summary_intent)}</p>
+            )}
+            {showNow && activity && (
+              <p className="mt-0.5 flex items-center gap-1.5 text-xs text-faint">
+                <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full bg-ok animate-pulse" />
+                <span className="shrink-0 font-medium text-ok">{stripUnsafeChars(activity.agent)}</span>
+                {nowMilestone && <span className="shrink-0 font-mono text-faint">{nowMilestone}</span>}
+                <span className="min-w-0 truncate italic text-muted">
+                  {stripUnsafeChars(activity.agent_label || activity.detail || activity.tool)}
+                </span>
+                <span className="ml-auto shrink-0 whitespace-nowrap font-mono tabular-nums text-faint">
+                  {activityAge(activity.at, now)}
+                </span>
+              </p>
+            )}
+            <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">
+              <span className="inline-flex items-center gap-1">
+                {maskRepoPath(run.repo_path, demo)}{" "}
+                <RunIssueRef
+                  issueIid={run.issue_iid}
+                  issueWebUrl={run.issue_web_url}
+                  kind={run.kind}
                   forgeType={run.forge_type}
-                  mrIid={run.mr_iid}
-                  mrState={mrState}
-                  href={mrHref}
-                  // Issue #485 review FIX 1: raised above the card's stretched-link overlay
-                  // (relative z-10) so its native `title` fires on hover AND so the chip is
-                  // independently clickable — clicking it opens the PR/MR on the forge in a
-                  // new tab (`target="_blank"`), while clicking elsewhere on the card follows
-                  // the stretched link to the run detail view (issue #803).
-                  className="relative z-10 font-medium"
+                  raised
                 />
               </span>
-            )}
-            {/* PRD #40: tokens + cost join the meta line; hidden for a run with no
-                usage rows (a pre-feature run) — never a fabricated 0. A running run
-                shows its "so far" figure, which grows as phases fold. */}
-            {run.usage && cost && (
-              <>
-                <span className="font-mono tabular-nums">
-                  · {formatTokens(runUsageTotalTokens(run.usage))} tok
-                  {run.status === "running" ? " so far" : ""}
+              {run.worker_name && <span>· {run.worker_name}</span>}
+              {showOwner && run.owner_email && <span>· {maskEmail(run.owner_email, demo)}</span>}
+              <span>· {new Date(run.updated_at).toLocaleString()}</span>
+              {duration && <span className="font-mono tabular-nums">· {duration}</span>}
+              {run.mr_iid != null && (
+                // The "· " separator lives OUTSIDE MrChip (issue #1253): the inline merged
+                // chip is now a bordered box, so a dot passed through `label` would render
+                // inside the border. Mirror IssueView — keep only the "MR "/"PR " abbrev in
+                // `label`, and emit the separator as a sibling text node.
+                <span>
+                  ·{" "}
+                  <MrChip
+                    variant="inline"
+                    label={`${mrAbbrev(run.forge_type)} `}
+                    forgeType={run.forge_type}
+                    mrIid={run.mr_iid}
+                    mrState={mrState}
+                    href={mrHref}
+                    // Issue #485 review FIX 1: raised above the card's stretched-link overlay
+                    // (relative z-10) so its native `title` fires on hover AND so the chip is
+                    // independently clickable — clicking it opens the PR/MR on the forge in a
+                    // new tab (`target="_blank"`), while clicking elsewhere on the card follows
+                    // the stretched link to the run detail view (issue #803).
+                    className="relative z-10 font-medium"
+                  />
                 </span>
-                {/* PRD #1429 M4b (D7): metered shows the real $ figure; subscription/
-                    unreported get an honest marker — never a silent omission that
-                    reads as free, and never a bare "$0.00" for a non-metered run. */}
-                {cost.kind === "metered" ? (
-                  <span className="font-mono text-brand/90">· {cost.dollars}</span>
-                ) : (
-                  <span className="font-mono text-faint">
-                    · {cost.kind === "subscription" ? "subscription" : "cost n/a"}
+              )}
+              {/* PRD #40: tokens + cost join the meta line; hidden for a run with no
+                  usage rows (a pre-feature run) — never a fabricated 0. A running run
+                  shows its "so far" figure, which grows as phases fold. */}
+              {run.usage && cost && (
+                <>
+                  <span className="font-mono tabular-nums">
+                    · {formatTokens(runUsageTotalTokens(run.usage))} tok
+                    {run.status === "running" ? " so far" : ""}
                   </span>
-                )}
-              </>
-            )}
-          </p>
+                  {/* PRD #1429 M4b (D7): metered shows the real $ figure; subscription/
+                      unreported get an honest marker — never a silent omission that
+                      reads as free, and never a bare "$0.00" for a non-metered run. */}
+                  {cost.kind === "metered" ? (
+                    <span className="font-mono text-brand/90">· {cost.dollars}</span>
+                  ) : (
+                    <span className="font-mono text-faint">
+                      · {cost.kind === "subscription" ? "subscription" : "cost n/a"}
+                    </span>
+                  )}
+                </>
+              )}
+            </p>
+          </div>
         </div>
         {/* Issue #485 review FIX 1: raise the whole right-side badge cluster above the
             card's stretched-link overlay (relative z-10) so every badge's native `title`
@@ -458,10 +460,6 @@ export function RunRow({
             </Badge>
           ) : (
             <>
-              {/* PRD #1429 M4a / #1653 D-W5: the run's actual harness, a round logo chip
-                  for Claude and Codex alike, named for screen readers. Like everything after it
-                  in this cluster, it gives way to the vault badge on a vault-waiting row. */}
-              <HarnessBadge harness={run.harness} />
               {/* PRD #122: compact milestone progress; a non-milestone run adds nothing.
                   PRD #265 M2: "not reported" (M–/N) reads distinct from a genuine 0/N. */}
               {msBadge && (

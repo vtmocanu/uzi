@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"strconv"
+	"syscall"
 	"time"
 )
 
@@ -15,6 +16,8 @@ type seams struct {
 	kill           childKiller
 	reap           childReaper
 	childReady     <-chan error
+	adoptedTick    func() (<-chan time.Time, func())
+	reapAdopted    func(pid int) (int, error)
 	reapChild      func(pid int) (code int, err error)
 	snapshot       func() ([]procRow, error)
 	now            func() time.Time
@@ -95,6 +98,13 @@ func (s *supervisor) run(childPid int, st procStatus) int {
 	}()
 
 	childReady := s.seams.childReady
+	primaryPending := true
+	var ticks <-chan time.Time
+	if s.seams.adoptedTick != nil {
+		var stop func()
+		ticks, stop = s.seams.adoptedTick()
+		defer stop()
+	}
 	for {
 		select {
 		case readyErr := <-childReady:
@@ -105,10 +115,27 @@ func (s *supervisor) run(childPid int, st procStatus) int {
 			if err != nil {
 				return s.abnormal("child wait failed")
 			}
+			primaryPending = false
 			_ = s.ev.writeJSON(childExitEvidence{Event: "child_exit", Code: code})
 			// A nil channel disables this select arm. The root remains alive on fd3
-			// so the controller can drain adopted/background descendants explicitly.
+			// so the controller can drain any remaining descendants explicitly.
 			childReady = nil
+		case <-ticks:
+			for _, pid := range s.seams.directChildren() {
+				if primaryPending && pid == childPid {
+					continue
+				}
+				got, err := s.seams.reapAdopted(pid)
+				if err != nil {
+					if errors.Is(err, syscall.ECHILD) || errors.Is(err, syscall.EINTR) {
+						continue
+					}
+					return s.abnormal("adopted child wait failed")
+				}
+				if got != 0 && got != pid {
+					return s.abnormal("adopted child wait returned unexpected pid")
+				}
+			}
 		case result := <-controls:
 			line, err := result.line, result.err
 			if err != nil {
