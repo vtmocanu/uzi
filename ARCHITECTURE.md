@@ -1539,10 +1539,11 @@ on.
   **The two tiers' external egress is OPPOSITE, and a probe that does not name the
   tier is uninterpretable:** the **restricted** tier enforces an FQDN allowlist
   (`worker-fqdn-egress.yaml` over the `worker-networkpolicy.yaml` default-deny
-  floor; enforced per resolved IP, not per hostname, so a name on shared CDN IPs
-  also opens the other hosts on those IPs: the accepted residual in
-  [ADR-0285](adr/0285-worker-egress-tier-trust-model.md), L7 enforcement #1651)
-  reaching only `cache.nixos.org`, the forge (derived from
+  floor) at the IP level: Antrea permits TCP only to the addresses learned from
+  the allowlisted DNS names, so other hosts sharing those addresses stay
+  reachable (the accepted residual in
+  [ADR-0285](adr/0285-worker-egress-tier-trust-model.md); L7 enforcement is
+  #1651). The names are `cache.nixos.org`, the forge (derived from
   `FORGE_ALLOWED_BASE_URLS` through one chart value `forge.allowedBaseURLs`, since
   [PRD #808](prds/done/808-worker-egress-single-source.md), so the SSRF allowlist
   and the FQDN list cannot drift), `*.anthropic.com`, `api.openai.com`,
@@ -1551,8 +1552,8 @@ on.
   the allowlist is a namespace-level policy with no per-harness split, so a
   worker that only ever runs Claude still carries these three), `search.devbox.sh`,
   `api.github.com` (the devbox/nixpkgs resolver host), and the CNPG chart's OCI pair
-  (`ghcr.io` + `pkg-containers.githubusercontent.com`); `codeload.github.com` stays
-  **off**-allowlist there (**TIMEOUT**). The **docker** tier reaches arbitrary
+  (`ghcr.io` + `pkg-containers.githubusercontent.com`); `codeload.github.com`, at other
+  addresses, is **blocked** there (**TIMEOUT**). The **docker** tier reaches arbitrary
   internet hosts by design (`0.0.0.0/0`-except-in-cluster, `worker-docker-networkpolicy.yaml`),
   [PRD #50](prds/50-llm-egress-proxy.md)'s residual, not a broken control. A
   docker-tier reading looks exactly like a broken restricted-tier allowlist, so
