@@ -47,6 +47,10 @@ func TestListConsumedFollowUpInputsForRunLiveDB(t *testing.T) {
 		mustExec(ctx, t, f.pool, insert, run, s.kind, s.body, s.consumed, float64(i))
 	}
 	mustExec(ctx, t, f.pool, insert, other, "follow_up", "another run's follow-up", true, float64(0))
+	// An ACKed receipt has been picked up but is not yet applied; the next claim
+	// receives it through /inputs rather than treating it as earlier constraints.
+	mustExec(ctx, t, f.pool, `INSERT INTO run_user_inputs (run_id, kind, body, consumed_at)
+		VALUES ($1, 'follow_up', 'acked but unapplied', now())`, run)
 
 	rows, err := f.q.ListConsumedFollowUpInputsForRun(ctx, run)
 	if err != nil {

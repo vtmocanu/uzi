@@ -1594,6 +1594,7 @@ WITH pending AS (
     -- flag clear). Everything else consumes as before.
     WHERE p.run_id = $1 AND p.applied_at IS NULL AND p.kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
     ORDER BY p.id ASC
+    LIMIT 1000
     FOR UPDATE SKIP LOCKED
 ),
 consumed AS (
@@ -2371,7 +2372,7 @@ WITH extended AS (
     RETURNING id, budget_extension_seconds
 ),
 consumed_wall AS (
-    UPDATE run_user_inputs u SET consumed_at = now()
+    UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
     FROM extended e
     WHERE u.run_id = e.id AND u.kind = 'pause' AND u.body = 'wall' AND u.consumed_at IS NULL
 )
@@ -3283,7 +3284,7 @@ WITH extended AS (
     RETURNING budget_extension_seconds
 ),
 consumed_wall AS (
-    UPDATE run_user_inputs u SET consumed_at = now()
+    UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
     WHERE u.run_id = $3 AND u.kind = 'pause' AND u.body = 'wall' AND u.consumed_at IS NULL
       AND EXISTS (SELECT 1 FROM extended)
 ),
@@ -9565,7 +9566,7 @@ snap_del AS (
 wall_input_consumed AS (
     -- D18: settle the wall input in the same statement, so ConsumeRunInputs never hands the next
     -- flight a stale 'wall' abort.
-    UPDATE run_user_inputs u SET consumed_at = now()
+    UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
     FROM parked p
     WHERE u.run_id = p.id AND u.kind = 'pause' AND u.body = 'wall' AND u.consumed_at IS NULL
 )
@@ -12330,7 +12331,7 @@ func (q *Queries) SetRunCompleted(ctx context.Context, arg SetRunCompletedParams
 
 const setRunCompletionHold = `-- name: SetRunCompletionHold :one
 WITH consumed_wall AS (
-    UPDATE run_user_inputs u SET consumed_at = now()
+    UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
     WHERE u.kind = 'pause' AND u.body = 'wall' AND u.consumed_at IS NULL
       AND EXISTS (
           SELECT 1 FROM runs r
@@ -13638,7 +13639,7 @@ func (q *Queries) SetRunWaitOnLimit(ctx context.Context, arg SetRunWaitOnLimitPa
 
 const setRunWallPark = `-- name: SetRunWallPark :one
 WITH consumed_wall AS (
-    UPDATE run_user_inputs u SET consumed_at = now()
+    UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
     WHERE u.kind = 'pause' AND u.body = 'wall' AND u.consumed_at IS NULL
       AND EXISTS (
           SELECT 1 FROM runs r
@@ -14171,7 +14172,7 @@ superseded AS (
       AND EXISTS (SELECT 1 FROM stopped)
 ),
 consumed_wall AS (
-    UPDATE run_user_inputs u SET consumed_at = now()
+    UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
     WHERE u.run_id = $3 AND u.kind = 'pause' AND u.body = 'wall' AND u.consumed_at IS NULL
       AND EXISTS (SELECT 1 FROM stopped)
 ),
