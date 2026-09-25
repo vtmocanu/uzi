@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # phase:    schedules-sweep
-# title:    PRD #966 M4: scheduled Planned-sweep (catalog enable, run-now tallies, uzi-gate skip, open-MR skip)
+# title:    PRD #966 M4: scheduled Planned-sweep (catalog enable, run-now tallies, uzi-gate filter, open-MR skip)
 # critical: no
 # lane:     gitlab
 # executor: any
@@ -18,11 +18,13 @@
 #   - `catalog enable` is idempotent: a second enable reports the row already enabled
 #     (created=false), not a duplicate.
 #   - A sweep matches its candidates from the CACHED issues table (ListSweepCandidateIssues
-#     selects state='opened' AND labels @> ["Planned"], the selector label only — NOT the
-#     uzi label), so an issue is invisible until a repo `sync` populates the cache.
-#   - The uzi-label eligibility gate is applied at the RUN-CREATION seam, not at candidate
-#     selection: an issue with `Planned` but no `uzi` matches (matched++) yet is SKIPPED
-#     with reason `not_eligible`. `matched` is the positive control that the query saw both.
+#     selects state='opened' AND labels @> ["Planned"]), so an issue is invisible until a
+#     repo `sync` populates the cache.
+#   - Since #1543 the uzi-label eligibility gate is applied IN the candidate query, before
+#     the scan window: an issue with `Planned` but no `uzi` is not a candidate at all. It is
+#     neither started nor skipped; it is counted in `ineligible_matched`, and `matched`
+#     counts eligible candidates only. `ineligible_matched == 1` is the positive control
+#     that the query saw B. createRun keeps its own not_eligible gate as the per-row check.
 #   - A completed run that still owns an OPEN MR blocks a re-fire of the same issue with
 #     `open_mr_exists` (or `already_running` if its run is still live).
 #
@@ -34,7 +36,7 @@
 # are the authoritative outcome and are what this phase asserts. We additionally assert
 # `schedule get --json | .last_fire == null` as a POSITIVE control of Decision 3, so a
 # future refactor that routes RunNow through advance() reddens here, not silently.
-say "PRD #966 M4: scheduled Planned-sweep (catalog enable, run-now tallies, uzi-gate skip, open-MR skip)"
+say "PRD #966 M4: scheduled Planned-sweep (catalog enable, run-now tallies, uzi-gate filter, open-MR skip)"
 
 # --- catalog enable is idempotent -------------------------------------------
 # --create-missing-labels POSTs the selector label to the forge. On the gitlab lane the
@@ -70,16 +72,15 @@ IID_B="$(fake_post /_e2e/issues \
 apipost "/api/repos/$REPO_ID/sync" '' >/dev/null
 pass "staged sweep issues A #$IID_A (Planned+uzi) and B #$IID_B (Planned), synced into the cache"
 
-# --- 1st fire: A started, B skipped not_eligible -----------------------------
+# --- 1st fire: A started, B filtered out as ineligible ------------------------
 RN1="$(uzi_cli schedule run-now "$SID" --json)" || fail "schedule run-now (1st fire) failed (exit $?)"
-echo "$RN1" | jq -e '.matched == 2' >/dev/null \
-  || fail "1st fire: matched should be 2 (the query saw both Planned candidates): $RN1"
+echo "$RN1" | jq -e '.matched == 1 and .ineligible_matched == 1' >/dev/null \
+  || fail "1st fire: matched should be 1 (eligible A) and ineligible_matched 1 (B, Planned without uzi): $RN1"
 echo "$RN1" | jq -e --argjson a "$IID_A" '(.started | length) == 1 and .started[0].issue_iid == $a' >/dev/null \
   || fail "1st fire: exactly one start, on issue A #$IID_A: $RN1"
-echo "$RN1" | jq -e --argjson b "$IID_B" \
-  'any(.skips[]; .issue_iid == $b and .reason == "not_eligible")' >/dev/null \
-  || fail "1st fire: B #$IID_B must be skipped with reason not_eligible: $RN1"
-pass "1st fire: matched=2, started=1 on A #$IID_A, B #$IID_B skipped not_eligible"
+echo "$RN1" | jq -e --argjson b "$IID_B" 'all(.skips[]; .issue_iid != $b)' >/dev/null \
+  || fail "1st fire: B #$IID_B must be filtered before the scan window, not reach a skip: $RN1"
+pass "1st fire: matched=1, ineligible_matched=1, started=1 on A #$IID_A, B #$IID_B filtered as ineligible"
 
 RUN_A="$(echo "$RN1" | jq -r '.started[0].run_id')"
 { [ -n "$RUN_A" ] && [ "$RUN_A" != null ]; } || fail "1st fire: no run_id for the started run: $RN1"
@@ -124,7 +125,7 @@ pass "A #$IID_A left the Planned lane for Human Review after its run (board-colu
 curl -fsSk -X PUT "$FAKE_BASE/api/v4/projects/1/issues/$IID_A" \
   -H 'Content-Type: application/json' -d '{"add_labels":["Planned"],"remove_labels":["Human Review"]}' >/dev/null \
   || fail "could not re-queue A #$IID_A into Planned on the fake"
-# B: add uzi so it clears the uzi-eligibility gate at the run-creation seam on the 2nd fire.
+# B: add uzi so it passes the sweep's eligibility filter on the 2nd fire.
 curl -fsSk -X PUT "$FAKE_BASE/api/v4/projects/1/issues/$IID_B" \
   -H 'Content-Type: application/json' -d '{"add_labels":["uzi"]}' >/dev/null \
   || fail "could not add the uzi label to B #$IID_B on the fake"

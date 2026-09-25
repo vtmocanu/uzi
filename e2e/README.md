@@ -174,7 +174,7 @@ headers, not the rows.
 | 51 | auto-stop-poison | gitlab | no | PRD #108 M5: auto-stop kills a run whose messages can't be saved (direct-to-API poison) |
 | 52 | api-outage-outbox | gitlab | no | PRD #1391: worker outbox survives an api outage (M5 spill+drain/tombstones, M6 write-ahead terminal replay) |
 | 59 | restart-agent | gitlab | no | PRD #966: restart the agent worker before schedule phases 60-62 |
-| 60 | schedules-sweep | gitlab | no | PRD #966 M4: scheduled Planned-sweep (catalog enable, run-now tallies, uzi-gate skip, open-MR skip) |
+| 60 | schedules-sweep | gitlab | no | PRD #966 M4: scheduled Planned-sweep (catalog enable, run-now tallies, uzi-gate filter, open-MR skip) |
 | 61 | schedules-prompt | gitlab | no | PRD #966 M4: scheduled prompt run (issue-less repo->MR run via run-now) |
 | 62 | self-improve | gitlab | no | PRD #966 M4: scheduled self_improve run (tracking issue, MR opened) |
 | 70 | handoff | gitlab | no | PRD #966 M5: task/handoff run kind via `uzi handoff` (+ host-gitconfig transport) |
