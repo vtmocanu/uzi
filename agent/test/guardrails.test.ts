@@ -409,6 +409,19 @@ describe("mass-signal guardrail (#1576)", () => {
     "kill -9 $'-1'",
     "kill -9 $((-1))",
     "kill -9 $((0-1))",
+    // `$[…]` arithmetic and brace expansion are evaluated statically too.
+    "kill -9 $[-1]",
+    'kill -9 "$[-1]"',
+    "kill -9 {-1,}",
+    // `exec -a NAME` takes a value, so the command after it is screened.
+    'exec -a x bash -c "pkill node"',
+    // A unique prefix of a value-taking long option takes the next word (getopt_long).
+    "timeout --si 9 5 pkill node",
+    "timeout --k 1 5 pkill node",
+    // A backtick span in an UNQUOTED-delimiter heredoc runs, so it is screened; a
+    // quoted-delimiter heredoc does not hide a mass-signal command after it.
+    "cat <<EOF\n`pkill node`\nEOF",
+    "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)\"; pkill node",
   ];
   for (const cmd of DENIED_MASS) {
     it(`denies with the mass-signal reason: ${cmd}`, () => {
@@ -486,6 +499,11 @@ describe("mass-signal guardrail (#1576)", () => {
     "git -C `pwd` push",
     "git -C `pwd` push --force origin main",
     "git --git-dir `pwd`/.git push",
+    // GNU timeout's `-p`/`-f` take no argument, so `-ps`/`-fs` end in the value letter.
+    "timeout -ps 9 5 git push --force origin main",
+    "timeout -fs 9 5 git push",
+    "exec -a x git push",
+    "sudo --us root git push",
   ]) {
     it(`denies git push behind a wrapper option, reserved word or backtick: ${cmd}`, () => {
       const r = screenBashCommand(cmd);
@@ -520,6 +538,13 @@ describe("mass-signal guardrail (#1576)", () => {
     `git commit -m ${heredoc("guardrail: deny pkill and killall")}`,
     'echo "$(date)"',
     "echo `git rev-parse HEAD`",
+    // A quoted-delimiter heredoc body is literal in bash, so its backtick spans are
+    // prose, not substitutions, and never pair a `kill` with an enumerator.
+    `git commit -m ${heredoc('Use `kill "$pid"` instead of `ps` scans')}`,
+    `gh pr create --title t --body ${heredoc("## Summary\n- Deny `lsof` + `kill` pairing")}`,
+    `git commit -m ${heredoc('Replace `kill $(lsof -ti :3000)` with `kill "$pid"`')}`,
+    "cat > notes.md <<'EOF'\nUse `kill \"$pid\"`, not `ps`\nEOF",
+    `git commit -m ${heredoc("guardrail: deny `pkill` and `killall`")}`,
   ]) {
     it(`allows a benign substitution body: ${JSON.stringify(cmd)}`, () => {
       assert.strictEqual(screenBashCommand(cmd).denied, false, `expected allowed for: ${cmd}`);

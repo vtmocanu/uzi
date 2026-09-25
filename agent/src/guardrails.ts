@@ -62,20 +62,29 @@
 //  - The mass-signal rule (#1576: pkill, killall, skill, fuser -k, a broadcast/process-
 //    group `kill`, or `kill` of PIDs enumerated by lsof/pgrep/ps/fuser/pidof) is defense
 //    in depth, NOT containment. A shell parser cannot prove that a variable-expanded PID
-//    lies outside the agent's own process tree, so `kill "$pid"` stays allowed; the
+//    lies outside the agent's own process tree, so `kill "$pid"` stays allowed, and so does
+//    a default-value expansion that yields a broadcast target (`kill -9 ${x:--1}`); the
 //    enumerator co-occurrence test for a dynamic `kill` target is a whole-command
 //    heuristic. The tokenizer keeps a double-quoted `$(…)` and any backtick substitution
 //    inside one word, so each such body (extractSubstitutionBodies) is screened
 //    as a command FOR THE MASS-SIGNAL RULE ONLY: its `kill`/enumerator feed the pairing,
 //    and a mass-signal denial from it counts, while a body denial for any other rule is
 //    ignored (`echo "$(git push)"` stays allowed, as at base). Because a heredoc body is
-//    tokenized like commands (see above), a heredoc inside a substitution
-//    (`git commit -m "$(cat <<'EOF' … EOF)"`) is over-denied when one of its LINES
-//    STARTS with pkill, killall, skill, `fuser -k` or a `kill` of 0 or a negative target;
-//    the same word mid-line is not a command word and passes. Substitutions nested past
-//    MAX_DEPTH are not screened, and more than MAX_SUBST_BODIES bodies in one string
-//    fails closed with REASON_DEPTH. Known evasion: a PID read back from a file an
-//    earlier command wrote.
+//    tokenized like commands (see above), a heredoc, inside a substitution
+//    (`git commit -m "$(cat <<'EOF' … EOF)"`) or not, is over-denied when one of its
+//    LINES STARTS with pkill, killall, skill, `fuser -k` or a `kill` of 0 or a negative
+//    target, whatever its delimiter. Backtick spans in an UNQUOTED-delimiter heredoc body
+//    execute in bash, so the substitution scanner screens them (`cat <<EOF` + a line
+//    `` `pkill node` `` is denied); a QUOTED-delimiter body (`<<'EOF'`, `<<"EOF"`,
+//    `<<\EOF`) is literal, so the scanner skips it and backticked prose there passes.
+//    Substitutions nested past MAX_DEPTH are not screened, and more than
+//    MAX_SUBST_BODIES bodies in one string fails closed with REASON_DEPTH.
+//    Known evasions: a PID read back from a file an earlier command wrote, the variable
+//    PID forms above, and the substitution scanner's desyncs, where its raw quote/paren
+//    count ends or skips a body in the wrong place so a later substitution is not
+//    screened: a quoted or escaped `)` inside a `$(…)`, a `case` pattern `)`, a `#`
+//    comment, a heredoc line inside a `$(…)` body (paren-counted like code), and `$'\''`
+//    ANSI-C quoting (the last desyncs the tokenizer for every rule too, as at base).
 //    Accepted false positive: an enumerator anywhere in the same command as a
 //    `kill "$pid"` (`lsof -i :3000; kill "$SERVER_PID"`) is denied; the reason tells the
 //    agent to run the kill as its own command. The primary fixes are the worker image
@@ -225,6 +234,8 @@ const WRAPPER_VALUE_OPTS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["nice", new Set(["-n", "--adjustment"])],
   ["ionice", new Set(["-c", "-n", "-p", "-P", "-u", "--class", "--classdata", "--pid", "--pgid", "--uid"])],
   ["stdbuf", new Set(["-i", "-o", "-e", "--input", "--output", "--error"])],
+  // bash `exec -a NAME` sets argv[0] of the command that follows.
+  ["exec", new Set(["-a"])],
 ]);
 // Generic-wrapper short options known to take NO argument, as letters. A short-option
 // cluster skips the next word only when every letter before its last is listed here
@@ -235,9 +246,21 @@ const WRAPPER_VALUE_OPTS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
 const WRAPPER_NOARG_LETTERS: ReadonlyMap<string, string> = new Map([
   ["xargs", "0rtpxo"],
   ["sudo", "AbEHikKlnPSsVvBN"],
-  ["timeout", "v"],
+  ["timeout", "vpf"],
   ["ionice", "t"],
   ["doas", "nsL"],
+]);
+// Generic-wrapper long options that take no SEPARATE value (none, or an optional value
+// that must be attached with `=`). getopt_long accepts any unique prefix of a long option
+// (`timeout --si 9`), so wrapperOptTakesNext needs the whole long-option set of a wrapper
+// to tell a unique prefix of a value option from an ambiguous one (#1576).
+const WRAPPER_NOARG_LONG: ReadonlyMap<string, readonly string[]> = new Map([
+  ["xargs", ["--null", "--eof", "--replace", "--max-lines", "--open-tty", "--interactive", "--no-run-if-empty", "--show-limits", "--exit", "--verbose", "--help", "--version"]],
+  ["sudo", ["--askpass", "--background", "--bell", "--preserve-env", "--edit", "--set-home", "--help", "--login", "--remove-timestamp", "--reset-timestamp", "--list", "--non-interactive", "--preserve-groups", "--stdin", "--shell", "--version", "--validate"]],
+  ["timeout", ["--preserve-status", "--foreground", "--verbose", "--help", "--version"]],
+  ["nice", ["--help", "--version"]],
+  ["ionice", ["--ignore", "--help", "--version"]],
+  ["stdbuf", ["--help", "--version"]],
 ]);
 // Shell reserved words that can precede a real command in the same segment (`if git
 // push; then …`, `while read p; do kill $p; done`, `! git push`). The peel skips them
@@ -575,6 +598,103 @@ const KILL_STATIC_EVAL_RE = /(?:^|[\s;&|(`/])kill\b[^;&|\n]{0,256}?\$(?:\(\(|['"
  *  string. Past it the screen fails closed with REASON_DEPTH (#1576). */
 const MAX_SUBST_BODIES = 1024;
 
+/** A heredoc operator (`<<X`, `<<-X`) seen by extractSubstitutionBodies (#1576). */
+interface Heredoc {
+  /** The delimiter after quote removal. */
+  delim: string;
+  /** Whether any part of the delimiter was quoted, so bash leaves the body literal. */
+  quoted: boolean;
+  /** `<<-`: leading tabs are stripped from the delimiter line. */
+  stripTabs: boolean;
+  /** Index just past the delimiter word. */
+  end: number;
+}
+
+/** Parse the delimiter word of a heredoc operator whose `<<` ends just before `start`.
+ *  Undefined when no word follows or a quote in it is unterminated. A delimiter holding
+ *  `$` or a backtick counts as unquoted, so its body is still scanned: bash's quote
+ *  removal there (`<<$'X'`) is not modelled, and skipping on a wrong delimiter would
+ *  hide the rest of the command. */
+function parseHeredocOperator(command: string, start: number): Heredoc | undefined {
+  const n = command.length;
+  let j = start;
+  const stripTabs = command[j] === "-";
+  if (stripTabs) j++;
+  while (j < n && (command[j] === " " || command[j] === "\t")) j++;
+  let delim = "";
+  let quoted = false;
+  let dynamic = false;
+  while (j < n && !/[\s;&|<>()]/.test(command[j]!)) {
+    const c = command[j]!;
+    if (c === "'") {
+      const close = command.indexOf("'", j + 1);
+      if (close < 0) return undefined;
+      delim += command.slice(j + 1, close);
+      quoted = true;
+      j = close + 1;
+    } else if (c === '"') {
+      let k = j + 1;
+      while (k < n && command[k] !== '"') {
+        if (command[k] === "\\" && k + 1 < n && '"\\$`'.includes(command[k + 1]!)) k++;
+        else if (command[k] === "$" || command[k] === "`") dynamic = true;
+        delim += command[k];
+        k++;
+      }
+      if (k >= n) return undefined;
+      quoted = true;
+      j = k + 1;
+    } else if (c === "\\") {
+      if (j + 1 < n) delim += command[j + 1];
+      quoted = true;
+      j += 2;
+    } else {
+      if (c === "$" || c === "`") dynamic = true;
+      delim += c;
+      j++;
+    }
+  }
+  if (delim === "") return undefined;
+  return { delim, quoted: quoted && !dynamic, stripTabs, end: j };
+}
+
+/**
+ * Consume the bodies of the heredocs opened on one line, in order, starting at `pos`
+ * (just past that line's newline). A body runs up to the line equal to its delimiter
+ * (leading tabs ignored for `<<-`), or to a line that starts with the delimiter followed
+ * by `)`, which bash also accepts inside `$(…)`; without either it runs to the end. A
+ * quoted-delimiter body is literal in bash and skipped; an unquoted one expands, so its
+ * substitutions are appended to `bodies`. Returns the resume index, or -1 past
+ * MAX_SUBST_BODIES.
+ */
+function consumeHeredocBodies(command: string, pos: number, docs: Heredoc[], bodies: string[]): number {
+  const n = command.length;
+  for (const doc of docs) {
+    let p = pos;
+    let bodyEnd = n;
+    let resume = n;
+    while (p < n) {
+      const nl = command.indexOf("\n", p);
+      const lineEnd = nl < 0 ? n : nl;
+      const line = command.slice(p, lineEnd);
+      const cmp = doc.stripTabs ? line.replace(/^\t+/, "") : line;
+      if (cmp === doc.delim || (cmp.startsWith(doc.delim) && cmp[doc.delim.length] === ")")) {
+        bodyEnd = p;
+        resume = p + (line.length - cmp.length) + doc.delim.length;
+        break;
+      }
+      p = lineEnd + 1;
+    }
+    if (!doc.quoted) {
+      const inner = extractSubstitutionBodies(command.slice(pos, bodyEnd), false);
+      if (inner === undefined || bodies.length + inner.length > MAX_SUBST_BODIES) return -1;
+      bodies.push(...inner);
+    }
+    pos = resume;
+    if (pos >= n) return n;
+  }
+  return pos;
+}
+
 /**
  * The bodies of the command substitutions the tokenizer keeps inside one word (#1576),
  * in one linear pass: single-quoted regions are literal and skipped; each `$(` inside
@@ -585,22 +705,46 @@ const MAX_SUBST_BODIES = 1024;
  * into segments that the caller screens under every rule, so the scan walks into it and
  * still finds a quoted substitution or backtick nested there. The scan resumes after
  * each body, so bodies are disjoint and a substitution nested in a body is found when
- * that body is itself screened. Returns undefined past MAX_SUBST_BODIES.
+ * that body is itself screened. A heredoc whose delimiter is quoted (`<<'EOF'`,
+ * `<<"EOF"`, `<<\EOF`, `<<-'EOF'`) has a literal body in bash, where a backtick does not
+ * run, so that body is skipped (consumeHeredocBodies); an unquoted-delimiter body still
+ * expands and is scanned. A `<<` after an unquoted `#` comment opener, or inside double
+ * quotes, opens no heredoc. Returns undefined past MAX_SUBST_BODIES.
  */
-function extractSubstitutionBodies(command: string): string[] | undefined {
+function extractSubstitutionBodies(command: string, heredocs = true): string[] | undefined {
   const bodies: string[] = [];
   const n = command.length;
   let inDouble = false;
+  // Heredocs opened on the current line, in order; their bodies start after its newline.
+  const pending: Heredoc[] = [];
+  // An unquoted `#` at a word start opens a comment: a `<<` after it is no heredoc.
+  let inComment = false;
   let i = 0;
   while (i < n) {
     const ch = command[i]!;
     if (ch === "\\") { i += 2; continue; }
+    if (ch === "\n" && !inDouble) {
+      inComment = false;
+      if (heredocs && pending.length > 0) {
+        i = consumeHeredocBodies(command, i + 1, pending.splice(0), bodies);
+        if (i < 0) return undefined;
+        continue;
+      }
+    }
     if (ch === "'" && !inDouble) {
       const close = command.indexOf("'", i + 1);
       i = close < 0 ? n : close + 1;
       continue;
     }
     if (ch === '"') { inDouble = !inDouble; i++; continue; }
+    if (!inDouble && ch === "#" && (i === 0 || /[\s;&|()]/.test(command[i - 1]!))) inComment = true;
+    if (heredocs && !inDouble && !inComment && ch === "<" && command[i + 1] === "<") {
+      if (command[i + 2] === "<") { i += 3; continue; } // `<<<` here-string, not a heredoc
+      const doc = parseHeredocOperator(command, i + 2);
+      if (doc) { pending.push(doc); i = doc.end; continue; }
+      i += 2;
+      continue;
+    }
     let body: string | undefined;
     if (ch === "$" && command[i + 1] === "(" && inDouble) {
       let depth = 1;
@@ -636,7 +780,8 @@ function extractSubstitutionBodies(command: string): string[] | undefined {
  *
  * A target that is numeric and <= 0 (`0`, `00`, `+0`: the caller's own process group)
  * or that starts with `-` once trimmed (a broadcast or a process group, `" -1"`
- * included) is denied outright. Only an unpadded positive PID (`/^\d+$/`) or a job spec
+ * included), a `$[…]` arithmetic target or a `{…,…}`/`{a..b}` brace expansion is denied
+ * outright. Only an unpadded positive PID (`/^\d+$/`) or a job spec
  * (`%1`, `%vite`) is literal; any other target, or no target at all (`xargs kill`,
  * whose PIDs arrive on stdin), is only MARKED dynamic here: screenBashCommand denies it
  * when the same command also runs a PID enumerator. This is defense in depth, not
@@ -660,6 +805,8 @@ function analyzeKill(args: string[], ctx: ScreenCtx): BashScreenResult {
     targets++;
     const t = a.trim();
     if (t.startsWith("-")) return deny(REASON_MASS_SIGNAL);
+    // Statically evaluated targets: `$[-1]` is arithmetic, `{-1,}` a brace expansion.
+    if (t.includes("$[") || (t.startsWith("{") && (t.includes(",") || t.includes("..")))) return deny(REASON_MASS_SIGNAL);
     if (/^[+-]?\d+$/.test(t) && Number.parseInt(t, 10) <= 0) return deny(REASON_MASS_SIGNAL);
     if (!/^\d+$/.test(a) && !/^%./.test(a)) ctx.dynamicKill = true;
   }
@@ -721,14 +868,22 @@ function analyzeSimple(cmd: string[], secretPaths: readonly string[], dockerWire
 /** Whether option `opt` of generic wrapper `base` consumes the NEXT word as its value
  *  (#1576): an exact WRAPPER_VALUE_OPTS entry (`-u`, `--user`), or a single-dash cluster
  *  whose LAST letter takes a value and whose every earlier letter is in
- *  WRAPPER_NOARG_LETTERS (`sudo -Eu root`, `xargs -rn 1`, `timeout -vs 9`). Any other
- *  cluster (`-uroot`, `-n1`, `xargs -en`, `sudo -hu`) carries its value attached and
- *  takes nothing. */
+ *  WRAPPER_NOARG_LETTERS (`sudo -Eu root`, `xargs -rn 1`, `timeout -vs 9`), or a
+ *  `--` word without `=` that prefixes exactly one of the wrapper's long options, a
+ *  value-taking one (`timeout --si 9`, `sudo --us root`; getopt_long accepts a unique
+ *  prefix). Any other cluster (`-uroot`, `-n1`, `xargs -en`, `sudo -hu`) carries its
+ *  value attached, and an ambiguous or no-arg prefix takes nothing. */
 function wrapperOptTakesNext(base: string, opt: string): boolean {
   const valueOpts = WRAPPER_VALUE_OPTS.get(base);
   if (!valueOpts) return false;
   if (valueOpts.has(opt)) return true;
-  if (opt.startsWith("--") || opt.length < 3 || !valueOpts.has(`-${opt[opt.length - 1]}`)) return false;
+  if (opt.startsWith("--")) {
+    if (opt === "--" || opt.includes("=")) return false;
+    const longOpts = [...valueOpts, ...(WRAPPER_NOARG_LONG.get(base) ?? [])].filter((o) => o.startsWith("--"));
+    const matches = longOpts.filter((o) => o.startsWith(opt));
+    return matches.length === 1 && valueOpts.has(matches[0]!);
+  }
+  if (opt.length < 3 || !valueOpts.has(`-${opt[opt.length - 1]}`)) return false;
   const noArg = WRAPPER_NOARG_LETTERS.get(base) ?? "";
   for (let k = 1; k < opt.length - 1; k++) {
     if (!noArg.includes(opt[k]!)) return false;
