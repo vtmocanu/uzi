@@ -203,6 +203,10 @@ const boardFixtures: Record<string, Board> = {
           pipeline_id: 4201,
           synced_at: minsAgo(3),
         },
+        // PRD #1650 D3a: automatic CI fixing gave up on this branch, so the card shows
+        // the "Autofix stopped" marker beside the red badge and Fix CI is the user's.
+        ci_autofix_halted: true,
+        ci_autofix_attempts: 3,
       },
       {
         // PRD #35: the board's only parked card. It is what makes runBadge's
@@ -365,6 +369,10 @@ const boardFixtures: Record<string, Board> = {
           updated_at: minsAgo(120),
         }),
         pipeline: null,
+        // PRD #1650 D3a: a halt with no cached pipeline. The halt comes from the autofix
+        // ledger, not the badge, so the marker shows where the pipeline badge would be.
+        ci_autofix_halted: true,
+        ci_autofix_attempts: 1,
       },
       {
         iid: 15,

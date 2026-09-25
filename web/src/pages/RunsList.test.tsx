@@ -1059,6 +1059,31 @@ describe("RunsHistory — the Failed filter (PRD #1650 D7)", () => {
     expect(screen.queryByText("Done run 0")).toBeNull();
   });
 
+  it("resets an expanded reveal back to the baseline slice when the filter is toggled", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        ...Array.from({ length: 25 }, (_, i) => past(`f${i}`, `Failed run ${i}`, { status: "failed" }, 59 - i)),
+        ...Array.from({ length: 5 }, (_, i) => past(`c${i}`, `Done run ${i}`, { status: "completed" }, 30 - i)),
+      ],
+    });
+    renderHistory("/runs/history");
+
+    await waitFor(() => expect(screen.getByText("Failed run 0")).toBeTruthy());
+    expect(screen.getByText("10/30")).toBeTruthy();
+    // Expand the unfiltered archive past the default cap.
+    fireEvent.click(screen.getByText(/Show 20 more/));
+    expect(screen.getByText("Failed run 24")).toBeTruthy();
+    expect(screen.queryByText(/Show \d+ more/)).toBeNull();
+
+    // Toggling Failed on returns to the baseline slice of the filtered set, not the
+    // expanded one (which would read 25/25 and show every failure).
+    fireEvent.click(screen.getByRole("button", { name: "Failed · 25" }));
+    expect(screen.getByText("10/25")).toBeTruthy();
+    expect(screen.getByText("Failed run 9")).toBeTruthy();
+    expect(screen.queryByText("Failed run 10")).toBeNull();
+    expect(screen.getByText(/Show 15 more/)).toBeTruthy();
+  });
+
   it("keeps the search query when the filter is toggled on and off", async () => {
     mockApi.listRuns.mockResolvedValue({ runs: mixed });
     renderHistory("/runs/history?q=parser");

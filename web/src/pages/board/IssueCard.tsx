@@ -59,6 +59,21 @@ function Highlighted({ text, query }: { text: string; query: string }) {
  * test at all — so an assertion about a card could not otherwise be written, and the #124
  * strip on `card.title` would have shipped unverified.
  */
+// AutofixHaltedMarker (PRD #1650 D3a) says automatic CI fixing has stopped on the
+// card's branch (attempt cap or no-progress halt), so Fix CI is now the user's to
+// press. It sits beside the pipeline badge, or in its place when no pipeline is
+// cached (the halt is read from the autofix ledger, not from `pipeline`). Warn tone:
+// a human owes the branch its next step, like the run parks. role="img" gives the
+// short visible label a full accessible name carrying the attempt count.
+function AutofixHaltedMarker({ attempts }: { attempts: number }) {
+  const label = `CI auto-fix stopped after ${attempts} ${attempts === 1 ? "attempt" : "attempts"}. Fix CI is yours to press.`;
+  return (
+    <span role="img" aria-label={label} title={label} className="inline-flex">
+      <Badge tone="warning">Autofix stopped</Badge>
+    </span>
+  );
+}
+
 export function IssueCard({
   card,
   repoId,
@@ -439,6 +454,7 @@ export function IssueCard({
           </Badge>
         )}
         {card.pipeline && <PipelineBadge pipeline={card.pipeline} />}
+        {card.ci_autofix_halted && <AutofixHaltedMarker attempts={card.ci_autofix_attempts ?? 0} />}
         {card.pipeline && <FixCiButton pipeline={card.pipeline} busy={fixCiBusy} onClick={onFixCi} />}
       </div>
       {/* Label chips (PRD #102 M4). Deliberately their OWN row below the badges and
