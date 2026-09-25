@@ -68,9 +68,9 @@ func newScheduleResetCmd(env Env, gf *globalFlags) *cobra.Command {
 			"to the catalog values, apply-model-to-agents is set to false, and MR rework, the\n" +
 			"guidance, the harness pin and the credential override are cleared to inherit. The\n" +
 			"customized flag is cleared and the schedule is re-activated on its catalog cadence\n" +
-			"(a parked schedule fires again). The catalog-owned prompt and labels are not touched. Only a\n" +
-			"default-origin schedule can be reset; a user-origin one is a conflict (there is\n" +
-			"nothing to reset to).",
+			"(a parked schedule fires again unless it is paused). The catalog-owned prompt and\n" +
+			"labels are not touched. Only a default-origin schedule can be reset; a user-origin\n" +
+			"one is a conflict (there is nothing to reset to).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)

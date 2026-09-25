@@ -813,7 +813,8 @@ nothing a manual start cannot.
   and output mode return to the catalog values, `apply-model-to-agents` resets to `false`,
   and MR rework, the guidance, the harness pin and the credential override are cleared to
   inherit. It also clears the customized flag and re-activates the schedule on its catalog
-  cadence (a parked schedule fires again). The catalog-owned prompt and labels are not touched.
+  cadence (a parked schedule fires again unless it is paused). The catalog-owned prompt and
+  labels are not touched.
   Only a default-origin schedule can be reset; a user-origin one is a `409`.
 - `uzi schedule clone <schedule-id> [--repo <repo-id>]` — copy a schedule into a new, fully
   editable schedule you own. Cloning a **default** schedule lifts its catalog prompt lock (the

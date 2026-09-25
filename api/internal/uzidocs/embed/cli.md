@@ -519,11 +519,18 @@ A few worth knowing:
   create prints a `WARNING` and proceeds, so a transient forge outage cannot abort
   an enable (which otherwise reads nothing from the forge, computing the next fire
   from the catalog cron).
-- **`schedule reset <id>`** restores a **default** schedule's edited fields (cron,
-  timezone, model, apply-model-to-agents, auto-approve, wait-on-limit,
-  max-issues) to the builtin catalog values — `apply-model-to-agents` resets to
-  `false` — and clears its customized flag. Only a default-origin schedule can be
-  reset; a user-origin one is a `409`.
+- **`schedule list`** prints `ID`, `TARGET`, `SOURCE`, `REPO`, `WHEN`, `NEXT`,
+  `ON` and `HARNESS`. `SOURCE` is the catalog slug for a default schedule and
+  `custom` for one you authored; `--json` carries the same facts as `origin`
+  and `catalog_slug`.
+- **`schedule reset <id>`** restores a **default** schedule's edited fields —
+  cron, timezone, model, auto-approve, wait-on-limit, max issues and output
+  mode — to the builtin catalog values, sets `apply-model-to-agents` back to
+  `false`, and clears MR rework, guidance, the harness pin and the credential
+  override back to inherit. It clears the customized flag and re-activates the
+  schedule on its catalog cadence (a parked schedule fires again; a paused one
+  stays paused). The catalog-owned prompt and labels are untouched. Only a
+  default-origin schedule can be reset; a user-origin one is a `409`.
 - **`schedule clone <id> [--repo <id>]`** copies a schedule into a new, fully
   editable schedule you own. Cloning a **default** schedule lifts its catalog
   prompt lock — the baked prompt (or a sweep's labels and guidance) is copied into
@@ -533,8 +540,9 @@ A few worth knowing:
 - **`schedule add-repo <id> --repo <id>`** replicates an existing schedule you own
   onto **another** repo you own as a new **grouped sibling** — the new row is an
   independent, fully-editable copy of the source's current config, and both the source
-  and the new row carry one shared **display-only** group id so they render as one
-  expandable group (the CLI twin of the web "Add another repo" action). `--repo` is
+  and the new row carry one shared **display-only** group id (the web Schedules tab
+  renders siblings as independent rows; filter by job or repo to see them together —
+  the CLI twin of the web "Add to another repo" action). `--repo` is
   required (the target repo id from `uzi repo list`). Only a **user** schedule can be
   added onto; a foreign source or target repo is a `404`. An **issue-target schedule
   cannot be added onto** (the issue number is repo-relative); that is a `422`, so use a
