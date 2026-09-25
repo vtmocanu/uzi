@@ -131,6 +131,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   docker_repo_allowlist: "",
   // PRD #84 M2: capability-aware scheduling kill-switch, default ON.
   capability_aware_scheduling: "true",
+  // Issue #1626: completion interlock kill-switch, default ON (Claude issue runs only).
+  completion_interlock_rollout: "true",
   // Issue #534 M2: GitHub Projects v2 sync instance kill-switch, default OFF.
   github_project_sync_enabled: "false",
   // PRD #685: instance branding config, all string-space. Fresh installs are
@@ -711,6 +713,7 @@ export const settingsApi = {
         key === "release_check_banner_enabled" ||
         key === "health_enabled" ||
         key === "capability_aware_scheduling" ||
+        key === "completion_interlock_rollout" ||
         key === "github_project_sync_enabled"
       ) {
         if (value !== "true" && value !== "false") {

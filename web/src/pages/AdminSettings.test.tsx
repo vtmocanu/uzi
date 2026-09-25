@@ -62,6 +62,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   run_extension_cap_seconds: "57600",
   docker_repo_allowlist: "",
   capability_aware_scheduling: "true",
+  completion_interlock_rollout: "true",
   github_project_sync_enabled: "false",
   // PRD #685 branding config keys (owned by the Branding tab; unbranded defaults).
   app_logo_mode: "default",
@@ -812,6 +813,60 @@ describe("AdminSettings — capability-aware scheduling kill-switch (PRD #84 M2)
     );
     renderPage();
     await screen.findByText("Capability-aware scheduling");
+    expect(toggle().disabled).toBe(true);
+    expect(saveBtn().disabled).toBe(true);
+  });
+});
+
+describe("AdminSettings — completion check kill-switch (issue #1626)", () => {
+  const toggle = () => screen.getByLabelText(/enable the completion check/i) as HTMLInputElement;
+  const saveBtn = () =>
+    screen.getByRole("button", { name: /save completion check/i }) as HTMLButtonElement;
+
+  it("renders the toggle checked (default ON) with Save disabled until changed", async () => {
+    renderPage();
+    await waitFor(() => expect(toggle()).toBeTruthy());
+    expect(toggle().checked).toBe(true);
+    expect(saveBtn().disabled).toBe(true);
+
+    fireEvent.click(toggle());
+    expect(saveBtn().disabled).toBe(false);
+  });
+
+  it("renders the body copy verbatim", async () => {
+    renderPage();
+    await waitFor(() => expect(toggle()).toBeTruthy());
+    const body = [
+      "Before an issue run opens a pull request that closes its issue, uzi checks that the agent has marked every milestone of the approved plan done.",
+      "If some are missing, the agent is told which ones and keeps working.",
+      "If it still does not finish them, the run pauses for its owner to continue it, ship only some milestones without closing the issue, or accept specific criteria as met.",
+      "The check itself uses no model, though the extra work it triggers does.",
+      "Applies to Claude runs; Codex runs are not checked yet. Turn off only if it blocks runs you trust.",
+    ].join(" ");
+    expect(screen.getByText(body)).toBeTruthy();
+  });
+
+  it("saves the flag OFF sending only completion_interlock_rollout", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ completion_interlock_rollout: "false" }));
+    renderPage();
+    await waitFor(() => expect(toggle()).toBeTruthy());
+
+    fireEvent.click(toggle());
+    fireEvent.click(saveBtn());
+
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({ completion_interlock_rollout: "false" }),
+    );
+    expect(mockApi.updateSettings).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText("Completion check setting saved.")).toBeTruthy();
+  });
+
+  it("disables the toggle and Save when the setting is fixed by the environment", async () => {
+    mockApi.getSettings.mockResolvedValue(
+      response({ completion_interlock_rollout: "true" }, {}, { completion_interlock_rollout: "env" }),
+    );
+    renderPage();
+    await waitFor(() => expect(toggle()).toBeTruthy());
     expect(toggle().disabled).toBe(true);
     expect(saveBtn().disabled).toBe(true);
   });
