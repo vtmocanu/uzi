@@ -28,8 +28,9 @@
 //
 // PRD #1497 M2 EXCEPTION: the WALL-CLOCK park IS in scope for Codex (D2 — no live run is failed by
 // the wall, on either harness). A `wall` PauseNowSignal (REASON_PAUSE with getPauseMode()==='wall')
-// and the own wall timer's REASON_WALL both route to the capture-first wall park (ctx.parkForWall,
-// via driveTurnWithWallPark) — through the runner, reusing captureHoldContext's harness-aware path.
+// and the own wall timer's REASON_WALL route through driveTurnWithWallPark. After a recorded
+// completion attempt, a hold is tried first; otherwise the capture-first wall park runs through
+// the runner, reusing captureHoldContext's harness-aware path.
 // The runner's durability SINKS run through `this.safety.withBoundary`
 // (m4), each preceded by an executor-owned per-sink auth-mode reconcile (part 4). Under a
 // runner (deferRegistryTeardown), run()'s finally leaves the registry ALIVE for those
@@ -1760,7 +1761,7 @@ export class CodexExecutor implements Executor {
         // `round` counts clarification rounds only; the prose-only recovery below has its own budget.
         for (let round = 0; ; ) {
           const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, { completedCount: 0 }, shared.scrubProjected);
-          if (turn.kind === "walled") return turn;
+          if (turn.kind !== "turn") return turn;
           const result = turn.result;
           if (result.plan?.trim()) {
             emitIgnoredQuestions(result);
@@ -1805,6 +1806,7 @@ export class CodexExecutor implements Executor {
         // during planning (the completion interlock cannot have attempted completion yet).
         const planTurn = await drivePlan(this.planPrompt(ctx));
         if (planTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
+        if (planTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: planTurn.reason } };
         let planResult = planTurn.result;
         let planMd = planResult.plan;
         if (planMd === undefined || planMd.trim().length === 0) {
@@ -1826,6 +1828,7 @@ export class CodexExecutor implements Executor {
           ctx.emit({ kind: "plan_revising", agent: "worker", payload: { round: revisions } });
           const reviseTurn = await drivePlan(buildRevisePlanPrompt(feedback));
           if (reviseTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
+          if (reviseTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: reviseTurn.reason } };
           planResult = reviseTurn.result;
           planMd = planResult.plan;
           if (planMd === undefined || planMd.trim().length === 0) {
@@ -1906,8 +1909,9 @@ export class CodexExecutor implements Executor {
         let nextPrompt = turnPrompt;
         let result: ReducedTurnResult;
         for (let round = 0; ; round++) {
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, { completedCount: latestProgress?.completed?.length ?? 0 }, shared.scrubProjected);
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, { completedCount: latestProgress?.completed?.length ?? 0 }, shared.scrubProjected, completionAttempted);
           if (implTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
+          if (implTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: implTurn.reason } };
           result = implTurn.result;
           if (result.sessionId) lastSessionId = result.sessionId;
           // A quiet clarification turn does not erase milestone progress.
@@ -2465,14 +2469,14 @@ export class CodexExecutor implements Executor {
 
   /**
    * PRD #1497 M2: drive ONE Codex turn, routing a WALL-CLOCK trip to the capture-first wall park.
-   * BOTH harnesses park at the wall (D2): the own wall timer's REASON_WALL and a `wall` PauseNowSignal
-   * (REASON_PAUSE with getPauseMode()==='wall') route to ctx.parkForWall — through the runner, reusing
-   * captureHoldContext's harness-aware path — instead of failing/cancelling the run. Since Codex does
-   * NOT enter the completion-attempt interlock, its wall trip ALWAYS parks (no D14 race). Returns
-   * either the turn's result, or a `walled` sentinel the caller turns into `{branch, walled}` so
-   * phasePublish skips finalize. A REFUSED park (owner extended) re-drives the SAME turn; an ordinary
-   * owner pause and a cancel throw REASON_CANCEL (out of scope for Codex, PRD #1190); any non-wall
-   * error propagates unchanged.
+   * The own wall timer's REASON_WALL and a `wall` PauseNowSignal (REASON_PAUSE with
+   * getPauseMode()==='wall') route post-attempt to a completion hold first. Before an attempt,
+   * or when that hold is refused, they route to ctx.parkForWall through the runner's
+   * captureHoldContext path. Returns the turn's result, a completion hold, or a `walled`
+   * sentinel so phasePublish skips finalize. A REFUSED park (owner extended) re-drives the
+   * SAME turn; an ordinary owner pause and a cancel throw REASON_CANCEL (out of scope for
+   * Codex, PRD #1190). Idle trips hold after an attempt and otherwise rethrow; other errors
+   * propagate unchanged.
    */
   private async driveTurnWithWallPark(
     ctx: RunContext,
@@ -2486,7 +2490,8 @@ export class CodexExecutor implements Executor {
     buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker,
     at: { completedCount: number; total?: number },
     scrubLeadText: (s: string) => string,
-  ): Promise<{ kind: "turn"; result: ReducedTurnResult } | { kind: "walled" }> {
+    completionAttempted = false,
+  ): Promise<{ kind: "turn"; result: ReducedTurnResult } | { kind: "walled" } | { kind: "held"; reason: string }> {
     for (;;) {
       try {
         const result = await this.driveCodexTurn(
@@ -2500,6 +2505,13 @@ export class CodexExecutor implements Executor {
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
         return { kind: "turn", result };
       } catch (err) {
+        const msg = err instanceof Error ? err.message : "";
+        const wallTrip = msg === REASON_WALL ||
+          (msg === REASON_PAUSE && ctx.pauseModeRequested?.() === "wall");
+        if (completionAttempted && (wallTrip || msg === REASON_IDLE)) {
+          const reason = wallTrip ? REASON_WALL : REASON_IDLE;
+          if (await routeCompletionHold(ctx, reason, true)) return { kind: "held", reason };
+        }
         const outcome = await this.tryCodexWallPark(ctx, err, at);
         if (outcome === "parked") return { kind: "walled" };
         if (outcome === "refused") {

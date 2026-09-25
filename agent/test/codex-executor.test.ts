@@ -889,9 +889,9 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
 // PauseNowSignal trips REASON_PAUSE (not REASON_CANCEL). A `wall` PauseNowSignal (getPauseMode()
 // === 'wall') and the own wall timer's REASON_WALL both route to the capture-first wall park
 // (ctx.parkForWall). An ordinary owner now/milestone pause on a Codex run keeps today's behaviour
-// (the run cancels — Codex owner-pause is out of scope, PRD #1190). Codex does NOT enter the
-// completion-attempt interlock, so its wall trip ALWAYS parks (no D14 race). Tests cover BOTH trips
-// in BOTH the plan turn and the implement turn.
+// (the run cancels — Codex owner-pause is out of scope, PRD #1190). Before a recorded
+// completion attempt wall trips park; afterward they first route to the completion hold.
+// Tests cover both wall trips in the plan and implement turns.
 describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
   // Wire the wall-park seams onto a ctx: a mutable pause mode (read by pauseModeRequested), a
   // parkForWall spy returning a configurable outcome, and a clearWallMode spy.
@@ -5665,6 +5665,95 @@ describe("Codex completion interlock", () => {
   const firstEpoch = (n: number): Responder => epochResponder("th-1", `tn-${n}`, (t, th, tn) => {
     t.push(toolCall(n, "signal_done", { milestones_completed: ["m1"] }, th, tn, `done-${n}`))
       .push(turnCompleted("completed", th, tn));
+  });
+
+  const quietEpoch = (n: number): Responder => resumedEpochResponder("th-1", `tn-${n}`, () => {});
+
+  for (const trip of ["wall timer", "wall pause", "idle"] as const) {
+    it(`routes ${trip} after a recorded attempt to a completion hold`, async () => {
+      const rig = makeMultiEpochRig([firstEpoch(1), quietEpoch(2)]);
+      const controller = new AbortController();
+      rig.deps = { ...rig.deps, wallMs: trip === "wall timer" ? 30 : 5000, idleMs: trip === "idle" ? 30 : 5000 };
+      let attempts = 0;
+      let parks = 0;
+      const holds: string[] = [];
+      const { ctx } = makeCtx({
+        kind: "issue", completionInterlock: true, config: { max_iterations: 3 },
+        signal: controller.signal,
+        pauseModeRequested: () => trip === "wall pause" ? "wall" : null,
+        recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: ++attempts }),
+        enterCompletionHold: async (reason) => { holds.push(reason); return true; },
+        parkForWall: async () => { parks++; return "parked"; },
+      });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      if (trip === "wall pause") {
+        await waitFor(() => attempts === 1 && rig.epochs[1]!.transport.turnStartCount === 1, "post-attempt turn");
+        controller.abort(new PauseNowSignal());
+      }
+      const result = await withTimeout(running, 3000, `${trip} completion hold`);
+      const reason = trip === "idle" ? "codex run idle timeout" : "codex run wall-clock timeout";
+      assert.deepEqual(result.completionHeld, { reason });
+      assert.deepEqual(holds, [reason]);
+      assert.equal(attempts, 1);
+      assert.equal(parks, 0);
+    });
+  }
+
+  for (const trip of ["wall timer", "idle"] as const) {
+    it(`keeps ${trip} before an attempt on its existing path`, async () => {
+      const rig = makeRig();
+      rig.deps = { ...rig.deps, wallMs: trip === "wall timer" ? 25 : 5000, idleMs: trip === "idle" ? 25 : 5000 };
+      rig.transport.push(threadStarted());
+      let attempts = 0;
+      let parks = 0;
+      let holds = 0;
+      const { ctx } = makeCtx({
+        kind: "issue", completionInterlock: true,
+        recordCompletionAttempt: async () => { attempts++; return { unmet: ["m2"], attemptCount: attempts }; },
+        enterCompletionHold: async () => { holds++; return true; },
+        parkForWall: async () => { parks++; return "parked"; },
+      });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      if (trip === "idle") await assert.rejects(withTimeout(running, 3000, "pre-attempt idle"), /codex run idle timeout/);
+      else assert.deepEqual((await withTimeout(running, 3000, "pre-attempt wall")).walled, { reason: "codex run wall-clock timeout" });
+      assert.equal(attempts, 0);
+      assert.equal(holds, 0);
+      assert.equal(parks, trip === "wall timer" ? 1 : 0);
+    });
+  }
+
+  it("parks after an attempt when the wall completion hold is refused", async () => {
+    const rig = makeMultiEpochRig([firstEpoch(1), quietEpoch(2)]);
+    rig.deps = { ...rig.deps, wallMs: 30, idleMs: 5000 };
+    const holds: string[] = [];
+    let parks = 0;
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 3 },
+      recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: 1 }),
+      enterCompletionHold: async (reason) => { holds.push(reason); return false; },
+      parkForWall: async () => { parks++; return "parked"; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "refused wall hold");
+    assert.deepEqual(holds, ["codex run wall-clock timeout"]);
+    assert.equal(parks, 1);
+    assert.deepEqual(result.walled, { reason: "codex run wall-clock timeout" });
+    assert.equal(result.completionHeld, undefined);
+  });
+
+  it("rethrows idle after an attempt when the completion hold is refused", async () => {
+    const rig = makeMultiEpochRig([firstEpoch(1), quietEpoch(2)]);
+    rig.deps = { ...rig.deps, wallMs: 5000, idleMs: 30 };
+    const holds: string[] = [];
+    let parks = 0;
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 3 },
+      recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: 1 }),
+      enterCompletionHold: async (reason) => { holds.push(reason); return false; },
+      parkForWall: async () => { parks++; return "parked"; },
+    });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "refused idle hold"), /codex run idle timeout/);
+    assert.deepEqual(holds, ["codex run idle timeout"]);
+    assert.equal(parks, 0);
   });
 
   it("checkpoints before the server attempt and reworks on the same thread", async () => {
