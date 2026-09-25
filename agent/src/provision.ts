@@ -159,6 +159,11 @@ function unquote(v: string): string {
  * lines, keeps only PROVISION_ENV_ALLOWLIST keys, and resolves a `$PATH` /
  * `${PATH}` back-reference against the scrubbed base PATH (devbox prepends its tool
  * bins to the existing PATH). Everything not on the allowlist is dropped.
+ *
+ * Real devbox (0.17.x) terminates each line as a statement — `export PATH="…";` —
+ * so one trailing `;` is stripped before unquoting. Without that the value kept its
+ * leading `"` and trailing `";`, leaving the first and last PATH elements (and the
+ * whole NIX_SSL_CERT_FILE path) unresolvable.
  */
 export function filterShellenv(output: string, basePath: string): Record<string, string> {
   const out: Record<string, string> = {};
@@ -170,7 +175,7 @@ export function filterShellenv(output: string, basePath: string): Record<string,
     if (!key || !PROVISION_ENV_ALLOWLIST.has(key)) continue;
     // Function replacer so a `$&`/`$1` sequence in basePath is inserted literally,
     // not interpreted as a replacement pattern.
-    const value = unquote(m[2] ?? "").replace(/\$\{?PATH\}?/g, () => basePath);
+    const value = unquote((m[2] ?? "").trim().replace(/;$/, "")).replace(/\$\{?PATH\}?/g, () => basePath);
     out[key] = value;
   }
   return out;

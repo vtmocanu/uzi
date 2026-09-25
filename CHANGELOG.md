@@ -32,6 +32,11 @@ through `[0.52.0]`.)
 - **The graceful-shutdown checkpoint feed line names a bounded reason class instead of raw error text ([#1597](https://github.com/vtmocanu/uzi/issues/1597)).**
   A checkpoint that did not reach origin now reports one of a fixed set of classes (`timeout`, `boundary_blocked`, `publish_rejected`, `publish_skipped`, `publish_error`, `no_local_tip`, `tick_process_survived`, `bare_lock_retained`) rather than a thrown error's message or remote text, and a publish that lands wins over a later, unrelated boundary error.
 
+### Fixed
+
+- **Runs that provision tools get a usable PATH and CA-bundle path again.**
+  The worker now strips the `;` terminator that `devbox shellenv` puts on each `export` line. Previously the provisioned `PATH` kept a stray leading quote and a trailing `";`, so its first tool directory and `/bin` never resolved, and `NIX_SSL_CERT_FILE` pointed at a file that does not exist.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added

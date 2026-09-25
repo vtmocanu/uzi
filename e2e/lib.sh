@@ -598,14 +598,15 @@ chmod 0644 "$RUNROOT/certs/"*.pem
 # Stub `devbox` for the PRD #18 tool-provisioning scenario: the isolated stack has
 # no substituter egress, so a real `devbox install` is neither possible nor wanted.
 # This fake satisfies the worker's provision path — `install` is a no-op; `shellenv`
-# prints one allowlisted PATH line filterShellenv keeps — so the provisioning wiring
+# prints one allowlisted PATH line in real devbox's `export K="v";` form that
+# filterShellenv keeps — so the provisioning wiring
 # is exercised end to end, fast, with no network. Bind-mounted over the baked-in
 # binary by the overlay; only invoked when a run has tier-1 packages.
 cat > "$RUNROOT/fake-devbox" <<'EOF'
 #!/bin/sh
 case "$1" in
   install)  exit 0 ;;
-  shellenv) printf 'export PATH="/nix/e2e-tools/bin:${PATH}"\n'; exit 0 ;;
+  shellenv) printf 'export PATH="/nix/e2e-tools/bin:${PATH}";\n'; exit 0 ;;
   *)        exit 0 ;;
 esac
 EOF
