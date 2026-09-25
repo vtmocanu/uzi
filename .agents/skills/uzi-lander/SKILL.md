@@ -194,11 +194,17 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
                                            # on a collision, task gate:<touched>, --force-with-lease push
    ```
 
-   Exit 5 = conflict, worktree left mid-rebase: resolve (a union of both sides is usual for
-   a shared list), `git rebase --continue`, re-run with `--skip-rebase`. Exit 6 = the
+   A conflict on `CHANGELOG.md` alone is auto-resolved as a union (`changelog-union.sh`),
+   unless a bullet appears on both sides of a hunk (a shared `### X` under `[Unreleased]` is
+   fine), a hunk holds a `## ` heading, or a side rewords a line: then it refuses and the
+   stop is exit 5. Duplicate `###` headings under `[Unreleased]` get their own collapse commit.
+   Exit 5 = any other conflict, worktree left mid-rebase: resolve (a union of both sides is
+   usual for a shared list), `git rebase --continue`, re-run with `--skip-rebase`. Exit 6 = the
    renumber helper reported references to fix by hand. Exit 7 = a gate failed (log path
-   printed; a missing `node_modules` is installed first with `npm ci --ignore-scripts`).
-   Exit 8 = branch or base moved during preparation: restart with `--fresh`; it resets to
+   printed; a missing or lockfile-stale `node_modules` is reinstalled first with
+   `npm ci --ignore-scripts`). A base move sharing no branch file but `CHANGELOG.md` is
+   rebased without re-gating (CI on the pushed head is the gate). Exit 8 = the branch
+   moved, or the base moved into other branch files or conflicts: restart with `--fresh`; it resets to
    the remote, so cherry-pick back any commit it names under `FRESH_BACKUP=`, but never a
    whole file from that backup: it predates what landed on the base since. Exit 9 = the
    branch deletes `CHANGELOG.md` lines the base carries (a stale-copy resolution): restore
@@ -212,7 +218,7 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    S/merge.sh OWNER/REPO PR --expect-head <sha you watched>     # squash + delete-branch + admin
    ```
 
-   It refuses on a moved head, an active rework, red or pending required checks, or a
+   It refuses on a moved head, an active rework, red, pending or no passing required checks, or a
    git conflict, takes the repo-wide merge lock (exit 7 = another lander is merging; wait
    for its `main` run to appear), confirms `MERGED`, prints `MERGE_SHA`, writes the trail
    line and releases the claim. A classifier block prints the exact command for the
@@ -321,7 +327,8 @@ a user reply that arrives first wins.
   `scripts/pr-findings.sh` findings from both bots; `scripts/cr-rate-limit.sh` reset +
   wait; `scripts/review-quota.sh` who else consumes reviews; `scripts/wait-mrrework.sh`
   defer to uzi's rework.
-- `scripts/land-prep.sh` rebase / renumber / gate / lease push; `scripts/merge.sh` the
+- `scripts/land-prep.sh` rebase / renumber / gate / lease push (`scripts/changelog-union.sh`
+  unions a CHANGELOG-only conflict or refuses); `scripts/merge.sh` the
   guarded admin merge; `scripts/watch-run-ci.sh` job-level CI for a run, a branch, or a
   merge SHA; `scripts/watch-prs-ci.sh` CI-only for a batch of PRs (shared
   `scripts/lib/pr-checks-classify.sh`). The sibling and `lib/*.test.sh` scripts are the

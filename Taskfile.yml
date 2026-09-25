@@ -940,13 +940,15 @@ tasks:
       - ./.agents/skills/uzi-watcher/scripts/backup-loop.test.sh
 
   test:uzi-lander:
-    desc: hermetic tests of uzi-lander review routing, quota timing, CI discovery and stale-base push guards
+    desc: hermetic tests of uzi-lander review routing, quota timing, CI discovery, stale-base push guards, base-move tolerance and CHANGELOG union
     cmds:
       - ./.agents/skills/uzi-lander/scripts/lib/review-threads.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/greptile-verdict.test.sh
       - ./.agents/skills/uzi-lander/scripts/cr-rate-limit.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep-guards.test.sh
+      - ./.agents/skills/uzi-lander/scripts/land-prep-basemove.test.sh
+      - ./.agents/skills/uzi-lander/scripts/changelog-union.test.sh
       - ./.agents/skills/uzi-lander/scripts/watch-pr.test.sh
       - ./.agents/skills/uzi-lander/scripts/pr-findings.test.sh
       - ./.agents/skills/uzi-lander/scripts/merge.test.sh

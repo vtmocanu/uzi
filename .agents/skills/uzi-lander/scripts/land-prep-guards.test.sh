@@ -4,7 +4,8 @@
 #      (the old `ls-tree | xargs basename | grep -q` pipeline SIGPIPEd under pipefail and
 #      skipped the renumber);
 #   2. a branch that deletes CHANGELOG.md lines the base carries stops with exit 9;
-#   3. a gate on a worktree without node_modules installs them with --ignore-scripts first.
+#   3. a gate on a worktree without node_modules installs them with --ignore-scripts first;
+#   4. a reused worktree reinstalls when the recorded package-lock.json hash is absent or stale.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -28,6 +29,7 @@ mkdir -p "$MIG" "$SEED/agent"
 for i in $(seq -w 1 400); do printf -- '-- %s\n' "$i" > "$MIG/00${i}_m.sql"; done
 printf '## [Unreleased]\n\n- base entry one\n- base entry two\n' > "$SEED/CHANGELOG.md"
 printf '{"lockfileVersion":3}\n' > "$SEED/agent/package-lock.json"
+printf 'node_modules/\n' > "$SEED/.gitignore" # as in the repo: an install leaves the tree clean
 git -C "$SEED" add -A
 git -C "$SEED" commit -qm base
 git -C "$SEED" remote add origin "$ORIGIN"
@@ -142,5 +144,31 @@ grep -q -- 'ci --ignore-scripts' "$NPM_LOG" || fail "npm ci --ignore-scripts was
 grep -q '^gate:agent$' "$TASK_LOG" || fail "gate:agent did not run"
 # An added-only CHANGELOG line is not a removal.
 grep -q 'changelog_removal' "$WORK/out.103" && fail "an added CHANGELOG line was flagged as a removal"
+# The deps branch is already checked out by 3a's worktree, which land-prep reuses.
+DEPS_WT=$(sed -n 's/^RESULT=prepared .*WORKTREE=\([^ ]*\).*/\1/p' "$WORK/out.103")
+[ -d "$DEPS_WT" ] || fail "no worktree named in: $(cat "$WORK/out.103")"
+STAMP="$DEPS_WT/agent/node_modules/.uzi-lander-lock.sha256"
+[ -s "$STAMP" ] || fail "the install recorded no lockfile hash"
 
-echo "PASS land-prep guards: migration collision under pipefail, CHANGELOG removal stop, node_modules install"
+# 4. A reused worktree: node_modules whose recorded hash matches the lockfile is kept...
+: > "$NPM_LOG"
+run deps 103 --skip-rebase --no-push
+[ "$rc" -eq 0 ] || fail "matching-hash re-run failed, rc=$rc: $(cat "$WORK/out.103")"
+[ ! -s "$NPM_LOG" ] || fail "npm ci ran although the lockfile hash matched: $(cat "$NPM_LOG")"
+# ...a lockfile changed since the install (a base move that bumped it) reinstalls...
+printf '{"lockfileVersion":3,"bumped":true}\n' > "$DEPS_WT/agent/package-lock.json"
+git -C "$DEPS_WT" commit -qam 'bump lockfile'
+run deps 103 --skip-rebase --no-push
+[ "$rc" -eq 0 ] || fail "changed-lockfile re-run failed, rc=$rc: $(cat "$WORK/out.103")"
+grep -q -- 'ci --ignore-scripts' "$NPM_LOG" || fail "a changed lockfile did not reinstall"
+grep -q 'package-lock.json changed' "$WORK/out.103" || fail "the reinstall reason was not logged"
+[ "$(cat "$STAMP")" = "$(shasum -a 256 "$DEPS_WT/agent/package-lock.json" | cut -d' ' -f1)" ] || fail "the new lockfile hash was not recorded"
+# ...and an install with no recorded hash reinstalls once.
+rm -f "$STAMP"
+: > "$NPM_LOG"
+run deps 103 --skip-rebase --no-push
+[ "$rc" -eq 0 ] || fail "missing-hash re-run failed, rc=$rc: $(cat "$WORK/out.103")"
+grep -q -- 'ci --ignore-scripts' "$NPM_LOG" || fail "node_modules without a recorded hash was not reinstalled"
+[ -s "$STAMP" ] || fail "the reinstall recorded no hash"
+
+echo "PASS land-prep guards: migration collision under pipefail, CHANGELOG removal stop, node_modules install, lockfile-hash reinstall"
