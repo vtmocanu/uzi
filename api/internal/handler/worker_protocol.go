@@ -1131,6 +1131,56 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, body)
 }
 
+func (h *Handler) workerInputReceipt(w http.ResponseWriter, r *http.Request, applied bool) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	var body struct {
+		IDs             []int64 `json:"ids"`
+		ClaimGeneration *int64  `json:"claim_generation"`
+	}
+	if err := httpx.DecodeJSON(r, &body); err != nil || body.ClaimGeneration == nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid input receipt body")
+		return
+	}
+	var res workersvc.InputReceiptResult
+	var err error
+	if applied {
+		res, err = h.wsvc.ApplyInputs(r.Context(), wkr, runID, *body.ClaimGeneration, body.IDs)
+	} else {
+		res, err = h.wsvc.AckInputs(r.Context(), wkr, runID, *body.ClaimGeneration, body.IDs)
+	}
+	if err != nil {
+		switch {
+		case errors.Is(err, workersvc.ErrRunNotOwned):
+			httpx.Error(w, http.StatusNotFound, "run not found")
+		case errors.Is(err, workersvc.ErrInputReceiptInvalid):
+			httpx.Error(w, http.StatusBadRequest, "invalid input ids or capability")
+		case errors.Is(err, workersvc.ErrInputReceiptConflict):
+			httpx.Error(w, http.StatusConflict, "input receipt conflicts with claim")
+		default:
+			slog.Error("worker input receipt", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+	httpx.JSON(w, http.StatusOK, res)
+}
+
+func (h *Handler) WorkerRunInputsAck(w http.ResponseWriter, r *http.Request) {
+	h.workerInputReceipt(w, r, false)
+}
+
+func (h *Handler) WorkerRunInputsApplied(w http.ResponseWriter, r *http.Request) {
+	h.workerInputReceipt(w, r, true)
+}
+
 // WorkerRunFollowUps returns the already-consumed follow_up inputs of a run this worker owns,
 // oldest first, as {"inputs": [...]} in the /inputs shape (issue #1660). READ ONLY. The worker
 // reads it on every claim to rehydrate the run's operator constraints, which it attaches to

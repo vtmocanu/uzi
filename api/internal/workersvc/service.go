@@ -1048,6 +1048,7 @@ type Store interface {
 	// SetRunRunning's resume guard compares it in SQL.
 	CreateRunAnswerInput(ctx context.Context, arg store.CreateRunAnswerInputParams) (store.RunUserInput, error)
 	ConsumeRunInputs(ctx context.Context, runID uuid.UUID) ([]store.ConsumeRunInputsRow, error)
+	ListReplayRunInputs(ctx context.Context, runID uuid.UUID) ([]store.ListReplayRunInputsRow, error)
 	// ListConsumedFollowUpInputsForRun reads the run's already-consumed follow_up inputs,
 	// oldest first (issue #1660): the worker's operator-constraint rehydrate on every claim.
 	ListConsumedFollowUpInputsForRun(ctx context.Context, runID uuid.UUID) ([]store.ListConsumedFollowUpInputsForRunRow, error)
@@ -4245,6 +4246,17 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 		// Either way the buffered inputs belong to that reclaim; fence the drain (no signal — the switch
 		// for this claim, if any, is already released).
 		return ConsumeInputsResult{}, nil
+	}
+	if slices.Contains(wkr.ProtocolCapabilities, capability.InputReceiptsV1) {
+		rows, err := s.q.ListReplayRunInputs(ctx, runID)
+		if err != nil {
+			return ConsumeInputsResult{}, err
+		}
+		out := make([]InputDTO, 0, len(rows))
+		for _, row := range rows {
+			out = append(out, InputDTO{ID: row.ID, Kind: row.Kind, Body: textPtr(row.Body), CreatedAt: row.CreatedAt.Time})
+		}
+		return ConsumeInputsResult{Inputs: out}, nil
 	}
 	rows, err := s.q.ConsumeRunInputs(ctx, runID)
 	if err != nil {

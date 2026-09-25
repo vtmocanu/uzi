@@ -119,7 +119,7 @@ LIMIT @lim;
 -- what keeps sqlc returning the shared RunUserInput model rather than minting a
 -- query-specific row type — dropping one re-types this query and breaks the
 -- workersvc.Store interface and its fakes.
-SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition FROM run_user_inputs
+SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at FROM run_user_inputs
 WHERE run_id = @run_id
 ORDER BY id ASC
 LIMIT @lim;

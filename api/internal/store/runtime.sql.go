@@ -12,6 +12,57 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const ackRunInputRows = `-- name: AckRunInputRows :many
+UPDATE run_user_inputs SET consumed_at = COALESCE(consumed_at, now()), consumed_claim_generation = $1,
+    consumed_worker_id = $2
+WHERE run_id = $3 AND id = ANY($4::bigint[]) AND applied_at IS NULL
+RETURNING id, kind, body, created_at
+`
+
+type AckRunInputRowsParams struct {
+	ClaimGeneration pgtype.Int8 `json:"claim_generation"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	RunID           uuid.UUID   `json:"run_id"`
+	Ids             []int64     `json:"ids"`
+}
+
+type AckRunInputRowsRow struct {
+	ID        int64              `json:"id"`
+	Kind      string             `json:"kind"`
+	Body      pgtype.Text        `json:"body"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) AckRunInputRows(ctx context.Context, arg AckRunInputRowsParams) ([]AckRunInputRowsRow, error) {
+	rows, err := q.db.Query(ctx, ackRunInputRows,
+		arg.ClaimGeneration,
+		arg.WorkerID,
+		arg.RunID,
+		arg.Ids,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AckRunInputRowsRow{}
+	for rows.Next() {
+		var i AckRunInputRowsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Body,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const adminRunOutcomeOrigins = `-- name: AdminRunOutcomeOrigins :many
 SELECT 'lifetime'::text AS window_tag,
     COALESCE(fail_origin, 'unknown')::text AS origin,
@@ -391,6 +442,33 @@ func (q *Queries) AdminUsageTotals(ctx context.Context) (AdminUsageTotalsRow, er
 	return i, err
 }
 
+const applyRunInputRows = `-- name: ApplyRunInputRows :execrows
+UPDATE run_user_inputs SET applied_at = now()
+WHERE run_id = $1 AND id = ANY($2::bigint[])
+  AND consumed_claim_generation = $3 AND consumed_worker_id = $4
+  AND consumed_at IS NOT NULL AND applied_at IS NULL
+`
+
+type ApplyRunInputRowsParams struct {
+	RunID           uuid.UUID   `json:"run_id"`
+	Ids             []int64     `json:"ids"`
+	ClaimGeneration pgtype.Int8 `json:"claim_generation"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+}
+
+func (q *Queries) ApplyRunInputRows(ctx context.Context, arg ApplyRunInputRowsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, applyRunInputRows,
+		arg.RunID,
+		arg.Ids,
+		arg.ClaimGeneration,
+		arg.WorkerID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const bumpContractRevision = `-- name: BumpContractRevision :one
 UPDATE runs SET
     contract_revision = $1,
@@ -444,7 +522,7 @@ WITH cancelled AS (
 )
 INSERT INTO run_user_inputs (run_id, kind, body)
 SELECT cancelled.id, 'pause_cancel', NULL::text FROM cancelled
-RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at
 `
 
 // Withdraw a pending pause AND write the kind='pause_cancel' audit row in ONE statement
@@ -465,6 +543,9 @@ func (q *Queries) CancelPauseInput(ctx context.Context, id uuid.UUID) (RunUserIn
 		&i.CreatedAt,
 		&i.QuestionID,
 		&i.Disposition,
+		&i.ConsumedClaimGeneration,
+		&i.ConsumedWorkerID,
+		&i.AppliedAt,
 	)
 	return i, err
 }
@@ -1516,7 +1597,7 @@ WITH pending AS (
     FOR UPDATE SKIP LOCKED
 ),
 consumed AS (
-    UPDATE run_user_inputs u SET consumed_at = now()
+    UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
     FROM pending WHERE u.id = pending.id
     RETURNING u.id, u.kind, u.body, u.created_at
 )
@@ -2209,7 +2290,7 @@ WITH selected AS (
 )
 INSERT INTO run_user_inputs (run_id, kind, body)
 VALUES ($1, 'approve_plan', $2)
-RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at
 `
 
 type CreateApprovePlanInputParams struct {
@@ -2259,6 +2340,9 @@ func (q *Queries) CreateApprovePlanInput(ctx context.Context, arg CreateApproveP
 		&i.CreatedAt,
 		&i.QuestionID,
 		&i.Disposition,
+		&i.ConsumedClaimGeneration,
+		&i.ConsumedWorkerID,
+		&i.AppliedAt,
 	)
 	return i, err
 }
@@ -2351,7 +2435,7 @@ WITH paused_req AS (
 )
 INSERT INTO run_user_inputs (run_id, kind, body)
 SELECT paused_req.id, 'pause', $1 FROM paused_req
-RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at
 `
 
 type CreatePauseInputParams struct {
@@ -2390,6 +2474,9 @@ func (q *Queries) CreatePauseInput(ctx context.Context, arg CreatePauseInputPara
 		&i.CreatedAt,
 		&i.QuestionID,
 		&i.Disposition,
+		&i.ConsumedClaimGeneration,
+		&i.ConsumedWorkerID,
+		&i.AppliedAt,
 	)
 	return i, err
 }
@@ -2692,7 +2779,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 const createRunAnswerInput = `-- name: CreateRunAnswerInput :one
 INSERT INTO run_user_inputs (run_id, kind, body, question_id)
 VALUES ($1, 'answer', $2, $3)
-RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at
 `
 
 type CreateRunAnswerInputParams struct {
@@ -2728,6 +2815,9 @@ func (q *Queries) CreateRunAnswerInput(ctx context.Context, arg CreateRunAnswerI
 		&i.CreatedAt,
 		&i.QuestionID,
 		&i.Disposition,
+		&i.ConsumedClaimGeneration,
+		&i.ConsumedWorkerID,
+		&i.AppliedAt,
 	)
 	return i, err
 }
@@ -2736,7 +2826,7 @@ const createRunInput = `-- name: CreateRunInput :one
 
 INSERT INTO run_user_inputs (run_id, kind, body)
 VALUES ($1, $2, $3)
-RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at
 `
 
 type CreateRunInputParams struct {
@@ -2762,6 +2852,9 @@ func (q *Queries) CreateRunInput(ctx context.Context, arg CreateRunInputParams) 
 		&i.CreatedAt,
 		&i.QuestionID,
 		&i.Disposition,
+		&i.ConsumedClaimGeneration,
+		&i.ConsumedWorkerID,
+		&i.AppliedAt,
 	)
 	return i, err
 }
@@ -2775,7 +2868,7 @@ WITH bumped AS (
 INSERT INTO run_user_inputs (run_id, kind, body)
 SELECT bumped.run_id, 'revise_plan', $1
 FROM bumped
-RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at
 `
 
 type CreateRunReviseInputIfUnderCapParams struct {
@@ -2862,6 +2955,9 @@ func (q *Queries) CreateRunReviseInputIfUnderCap(ctx context.Context, arg Create
 		&i.CreatedAt,
 		&i.QuestionID,
 		&i.Disposition,
+		&i.ConsumedClaimGeneration,
+		&i.ConsumedWorkerID,
+		&i.AppliedAt,
 	)
 	return i, err
 }
@@ -2878,7 +2974,7 @@ capped AS (
 )
 INSERT INTO run_user_inputs (run_id, kind, body)
 VALUES ($1, 'scope', $2)
-RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at
 `
 
 type CreateScopeCeilingInputParams struct {
@@ -2912,6 +3008,9 @@ func (q *Queries) CreateScopeCeilingInput(ctx context.Context, arg CreateScopeCe
 		&i.CreatedAt,
 		&i.QuestionID,
 		&i.Disposition,
+		&i.ConsumedClaimGeneration,
+		&i.ConsumedWorkerID,
+		&i.AppliedAt,
 	)
 	return i, err
 }
@@ -2924,7 +3023,7 @@ WITH stamped AS (
 )
 INSERT INTO run_user_inputs (run_id, kind, body)
 VALUES ($1, $2, $3)
-RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at
 `
 
 type CreateStopVerdictInputParams struct {
@@ -2985,6 +3084,9 @@ func (q *Queries) CreateStopVerdictInput(ctx context.Context, arg CreateStopVerd
 		&i.CreatedAt,
 		&i.QuestionID,
 		&i.Disposition,
+		&i.ConsumedClaimGeneration,
+		&i.ConsumedWorkerID,
+		&i.AppliedAt,
 	)
 	return i, err
 }
@@ -6314,7 +6416,7 @@ func (q *Queries) ListCodexAccountWaitRunsPage(ctx context.Context, arg ListCode
 
 const listConsumedFollowUpInputsForRun = `-- name: ListConsumedFollowUpInputsForRun :many
 SELECT id, body, created_at FROM run_user_inputs
-WHERE run_id = $1 AND kind = 'follow_up' AND consumed_at IS NOT NULL
+WHERE run_id = $1 AND kind = 'follow_up' AND applied_at IS NOT NULL
 ORDER BY id ASC
 `
 
@@ -6414,7 +6516,7 @@ func (q *Queries) ListDockerBlockedReposForUser(ctx context.Context, arg ListDoc
 }
 
 const listFollowUpInputsForRun = `-- name: ListFollowUpInputsForRun :many
-SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition FROM run_user_inputs
+SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at FROM run_user_inputs
 WHERE run_id = $1 AND kind IN ('follow_up', 'scope')
 ORDER BY id DESC
 `
@@ -6450,6 +6552,9 @@ func (q *Queries) ListFollowUpInputsForRun(ctx context.Context, runID uuid.UUID)
 			&i.CreatedAt,
 			&i.QuestionID,
 			&i.Disposition,
+			&i.ConsumedClaimGeneration,
+			&i.ConsumedWorkerID,
+			&i.AppliedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -6503,6 +6608,58 @@ func (q *Queries) ListGaveUpColumnMoves(ctx context.Context, arg ListGaveUpColum
 			&i.IssueIid,
 			&i.Status,
 			&i.MovePendingSince,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listInputReceiptRows = `-- name: ListInputReceiptRows :many
+SELECT id, kind, body, created_at, consumed_at, consumed_claim_generation, consumed_worker_id, applied_at
+FROM run_user_inputs WHERE run_id = $1 AND id = ANY($2::bigint[])
+  AND kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
+ORDER BY id ASC
+`
+
+type ListInputReceiptRowsParams struct {
+	RunID uuid.UUID `json:"run_id"`
+	Ids   []int64   `json:"ids"`
+}
+
+type ListInputReceiptRowsRow struct {
+	ID                      int64              `json:"id"`
+	Kind                    string             `json:"kind"`
+	Body                    pgtype.Text        `json:"body"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+	ConsumedAt              pgtype.Timestamptz `json:"consumed_at"`
+	ConsumedClaimGeneration pgtype.Int8        `json:"consumed_claim_generation"`
+	ConsumedWorkerID        pgtype.UUID        `json:"consumed_worker_id"`
+	AppliedAt               pgtype.Timestamptz `json:"applied_at"`
+}
+
+func (q *Queries) ListInputReceiptRows(ctx context.Context, arg ListInputReceiptRowsParams) ([]ListInputReceiptRowsRow, error) {
+	rows, err := q.db.Query(ctx, listInputReceiptRows, arg.RunID, arg.Ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListInputReceiptRowsRow{}
+	for rows.Next() {
+		var i ListInputReceiptRowsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Body,
+			&i.CreatedAt,
+			&i.ConsumedAt,
+			&i.ConsumedClaimGeneration,
+			&i.ConsumedWorkerID,
+			&i.AppliedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -6783,6 +6940,45 @@ func (q *Queries) ListPoolWaitRuns(ctx context.Context) ([]ListPoolWaitRunsRow, 
 			&i.StatusSince,
 			&i.LimitDeadSecretID,
 			&i.RetryNotBefore,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listReplayRunInputs = `-- name: ListReplayRunInputs :many
+SELECT id, kind, body, created_at FROM run_user_inputs
+WHERE run_id = $1 AND applied_at IS NULL
+  AND kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
+ORDER BY id ASC
+`
+
+type ListReplayRunInputsRow struct {
+	ID        int64              `json:"id"`
+	Kind      string             `json:"kind"`
+	Body      pgtype.Text        `json:"body"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) ListReplayRunInputs(ctx context.Context, runID uuid.UUID) ([]ListReplayRunInputsRow, error) {
+	rows, err := q.db.Query(ctx, listReplayRunInputs, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListReplayRunInputsRow{}
+	for rows.Next() {
+		var i ListReplayRunInputsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Body,
+			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -8444,6 +8640,35 @@ func (q *Queries) LockOwnedRunsByIDs(ctx context.Context, arg LockOwnedRunsByIDs
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockRunForInputReceipt = `-- name: LockRunForInputReceipt :one
+SELECT id, worker_id, claim_generation, claim_released_at, credential_switch_requested_at,
+       credential_switch_generation
+FROM runs WHERE id = $1 FOR UPDATE
+`
+
+type LockRunForInputReceiptRow struct {
+	ID                          uuid.UUID          `json:"id"`
+	WorkerID                    pgtype.UUID        `json:"worker_id"`
+	ClaimGeneration             int64              `json:"claim_generation"`
+	ClaimReleasedAt             pgtype.Timestamptz `json:"claim_released_at"`
+	CredentialSwitchRequestedAt pgtype.Timestamptz `json:"credential_switch_requested_at"`
+	CredentialSwitchGeneration  pgtype.Int8        `json:"credential_switch_generation"`
+}
+
+func (q *Queries) LockRunForInputReceipt(ctx context.Context, runID uuid.UUID) (LockRunForInputReceiptRow, error) {
+	row := q.db.QueryRow(ctx, lockRunForInputReceipt, runID)
+	var i LockRunForInputReceiptRow
+	err := row.Scan(
+		&i.ID,
+		&i.WorkerID,
+		&i.ClaimGeneration,
+		&i.ClaimReleasedAt,
+		&i.CredentialSwitchRequestedAt,
+		&i.CredentialSwitchGeneration,
+	)
+	return i, err
 }
 
 const lowerLimitWaitRetryNow = `-- name: LowerLimitWaitRetryNow :execrows

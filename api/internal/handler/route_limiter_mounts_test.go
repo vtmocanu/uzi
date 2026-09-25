@@ -710,6 +710,8 @@ var wantRouteMounts = []routeMount{
 	// per-USER probe reads as noLimiter, like /findings and /proposals.
 	// TestRecoverySettleIsRateLimitedLiveDB proves the mount through the real WorkerRoutes.
 	{"POST", "/api/worker/runs/{id}/recovery-holds/{holdID}/settle", noLimiter},
+	{"POST", "/api/worker/runs/{id}/inputs/ack", noLimiter},
+	{"POST", "/api/worker/runs/{id}/inputs/applied", noLimiter},
 	{"POST", "/api/worker/runs/{id}/memory", noLimiter},
 	{"POST", "/api/worker/runs/{id}/messages", noLimiter},
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},

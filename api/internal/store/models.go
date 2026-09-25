@@ -781,14 +781,17 @@ type RunUsageTotal struct {
 }
 
 type RunUserInput struct {
-	ID          int64              `json:"id"`
-	RunID       uuid.UUID          `json:"run_id"`
-	Kind        string             `json:"kind"`
-	Body        pgtype.Text        `json:"body"`
-	ConsumedAt  pgtype.Timestamptz `json:"consumed_at"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	QuestionID  pgtype.Text        `json:"question_id"`
-	Disposition pgtype.Text        `json:"disposition"`
+	ID                      int64              `json:"id"`
+	RunID                   uuid.UUID          `json:"run_id"`
+	Kind                    string             `json:"kind"`
+	Body                    pgtype.Text        `json:"body"`
+	ConsumedAt              pgtype.Timestamptz `json:"consumed_at"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+	QuestionID              pgtype.Text        `json:"question_id"`
+	Disposition             pgtype.Text        `json:"disposition"`
+	ConsumedClaimGeneration pgtype.Int8        `json:"consumed_claim_generation"`
+	ConsumedWorkerID        pgtype.UUID        `json:"consumed_worker_id"`
+	AppliedAt               pgtype.Timestamptz `json:"applied_at"`
 }
 
 type Skill struct {

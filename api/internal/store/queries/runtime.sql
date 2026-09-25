@@ -5756,11 +5756,40 @@ WITH pending AS (
     FOR UPDATE SKIP LOCKED
 ),
 consumed AS (
-    UPDATE run_user_inputs u SET consumed_at = now()
+    UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
     FROM pending WHERE u.id = pending.id
     RETURNING u.id, u.kind, u.body, u.created_at
 )
 SELECT id, kind, body, created_at FROM consumed ORDER BY id ASC;
+
+-- name: ListReplayRunInputs :many
+SELECT id, kind, body, created_at FROM run_user_inputs
+WHERE run_id = @run_id AND applied_at IS NULL
+  AND kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
+ORDER BY id ASC;
+
+-- name: LockRunForInputReceipt :one
+SELECT id, worker_id, claim_generation, claim_released_at, credential_switch_requested_at,
+       credential_switch_generation
+FROM runs WHERE id = @run_id FOR UPDATE;
+
+-- name: ListInputReceiptRows :many
+SELECT id, kind, body, created_at, consumed_at, consumed_claim_generation, consumed_worker_id, applied_at
+FROM run_user_inputs WHERE run_id = @run_id AND id = ANY(@ids::bigint[])
+  AND kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
+ORDER BY id ASC;
+
+-- name: AckRunInputRows :many
+UPDATE run_user_inputs SET consumed_at = COALESCE(consumed_at, now()), consumed_claim_generation = @claim_generation,
+    consumed_worker_id = @worker_id
+WHERE run_id = @run_id AND id = ANY(@ids::bigint[]) AND applied_at IS NULL
+RETURNING id, kind, body, created_at;
+
+-- name: ApplyRunInputRows :execrows
+UPDATE run_user_inputs SET applied_at = now()
+WHERE run_id = @run_id AND id = ANY(@ids::bigint[])
+  AND consumed_claim_generation = @claim_generation AND consumed_worker_id = @worker_id
+  AND consumed_at IS NOT NULL AND applied_at IS NULL;
 
 -- name: ListConsumedFollowUpInputsForRun :many
 -- Issue #1660: the run's ALREADY-CONSUMED follow_up inputs, oldest first, for a worker to
@@ -5773,7 +5802,7 @@ SELECT id, kind, body, created_at FROM consumed ORDER BY id ASC;
 -- those, and the worker de-duplicates the two by id. Ordered by id, the same rule as the
 -- /inputs FIFO (ConsumeRunInputs), so the worker keeps the server's order as is.
 SELECT id, body, created_at FROM run_user_inputs
-WHERE run_id = @run_id AND kind = 'follow_up' AND consumed_at IS NOT NULL
+WHERE run_id = @run_id AND kind = 'follow_up' AND applied_at IS NOT NULL
 ORDER BY id ASC;
 
 -- name: ListFollowUpInputsForRun :many
@@ -5790,7 +5819,7 @@ ORDER BY id ASC;
 -- model instead of minting a query-specific row type. Dropping a column here is not a
 -- local edit: it re-types this query and breaks the workersvc.Store interface, the
 -- service signature, the handler and its fake.
-SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition FROM run_user_inputs
+SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at FROM run_user_inputs
 WHERE run_id = @run_id AND kind IN ('follow_up', 'scope')
 ORDER BY id DESC;
 

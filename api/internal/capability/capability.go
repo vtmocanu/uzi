@@ -117,6 +117,9 @@ const CredentialSwitchV1 = "credential_switch_v1" //nolint:gosec // G101: a capa
 // server-side at once (ParkRunsAtWall), never failed, so a mixed fleet is handled by construction.
 const WallParkV1 = "wall_park_v1"
 
+// InputReceiptsV1 advertises explicit ACK and applied receipts for steering inputs.
+const InputReceiptsV1 = "input_receipts_v1"
+
 // protocolVocabulary is the closed set of legal PROTOCOL capability names — kept
 // entirely separate from `vocabulary` so a protocol string is never offered to users
 // through Vocabulary()/the web mirror. FilterProtocol drops anything not in here.
@@ -129,11 +132,12 @@ var protocolVocabulary = map[string]struct{}{
 	CodexCompletionInterlockV1: {},
 	CredentialSwitchV1:         {},
 	WallParkV1:                 {},
+	InputReceiptsV1:            {},
 }
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1}
+var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but
