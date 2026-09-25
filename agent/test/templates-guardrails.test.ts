@@ -1019,15 +1019,20 @@ describe("the shared root-entry drop wrapper", () => {
     // A runner-writable agent-home lets a hardlink to a worker-owned repos/ file be planted as a
     // top-level dot entry; it passes [ -L ] / [ -e ], so each loop must filter on the link count
     // BEFORE its chown, and treat a failed stat as "skip".
-    const loops = [...entrypoint.matchAll(/for dot in "\$DATA_DIR"\/agent-home\/[^\n]*; do\n([\s\S]*?)\n\s*done/g)].map((m) => m[1]);
+    const loops = [...entrypoint.matchAll(/for dot in "\$DATA_DIR"\/agent-home\/[^\n]*; do\n([\s\S]*?)\n\s*done/g)].map((m) => m[1] ?? "");
     assert.equal(loops.length, 2, "expected exactly two agent-home dot loops (legacy walk + (a2c) repair)");
+    // Presence + ordering only (the behaviour tests in entrypoint-migration.test.ts plant a symlink,
+    // a hardlink and a fifo), so an equivalent rewrite of a guard does not redden this.
     for (const body of loops) {
       const chownAt = body.search(/"\$CHOWN"/);
-      const guard = body.search(
-        /\[ -L "\$dot" \] && continue[^\n]*\n\s*if \[ ! -d "\$dot" \]; then[^\n]*\n\s*\[ -f "\$dot" \] \|\| continue[^\n]*\n\s*nlink=\$\("\$BUSYBOX" stat -c %h "\$dot" 2>\/dev\/null\) \|\| continue[^\n]*\n\s*\[ "\$nlink" = 1 \] \|\| continue[^\n]*\n\s*fi/,
-      );
-      assert.ok(guard >= 0, `dot loop must skip symlinks, non-regular non-dirs and hardlinked files:\n${body}`);
-      assert.ok(chownAt > guard, "the link-count filter must precede the chown");
+      for (const [guard, why] of [
+        [/\[\s+-L\s+"\$dot"\s+\]/, "skip a symlink"],
+        [/\[\s+-f\s+"\$dot"\s+\]/, "skip anything that is neither a dir nor a regular file"],
+        [/"\$BUSYBOX"\s+stat\s+-c\s+%h\s+"\$dot"/, "read the link count"],
+      ] as const) {
+        const at = body.search(guard);
+        assert.ok(at >= 0 && at < chownAt, `dot loop must ${why} before its chown:\n${body}`);
+      }
     }
   });
 

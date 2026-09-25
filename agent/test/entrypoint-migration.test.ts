@@ -636,6 +636,9 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
     fs.mkdirSync(path.join(h.data, "repos", "r.git"), { recursive: true });
     fs.writeFileSync(path.join(h.data, "repos", "r.git", "config"), "[core]\n");
     fs.linkSync(path.join(h.data, "repos", "r.git", "config"), path.join(ah, ".gitconfig-planted"));
+    // A FIFO: a single-link, non-regular entry, so only the `[ -f ]` filter keeps it from a chown.
+    const fifo = spawnSync("mkfifo", [path.join(ah, ".planted-fifo")], { encoding: "utf8" });
+    assert.equal(fifo.status, 0, `mkfifo must succeed to plant the fifo fixture (${fifo.stderr})`);
     fs.writeFileSync(h.token, "t");
     return { ah, runX, reposReal };
   }
@@ -667,7 +670,7 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
         !r.ops.some((o) => o.startsWith("chown -R") && o.includes(`${ah}/`)),
         `the repair must never recurse under agent-home (ops: ${r.ops.join(" | ")})`,
       );
-      for (const frag of ["run-x", "codex-session-store", ".nix-profile", `${ah}/.config`, ".claude.json.bak", ".cache/devbox", ".gitconfig-planted"]) {
+      for (const frag of ["run-x", "codex-session-store", ".nix-profile", `${ah}/.config`, ".claude.json.bak", ".cache/devbox", ".gitconfig-planted", ".planted-fifo"]) {
         assert.ok(!r.ops.some((o) => o.includes(frag)), `no op may touch ${frag}`);
       }
       assert.deepEqual(opsReachingRepos(r.ops, reposReal, "chown"), [], "no chown may reach repos/");
@@ -706,8 +709,8 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
       for (const name of [".cache", ".local", ".claude", ".claude.json"]) {
         assert.ok(r.ops.includes(`chown -R runner:runner ${ah}/${name}`), `${name} must be re-owned to runner recursively`);
       }
-      for (const frag of [".nix-profile", `${ah}/.config`, ".claude.json.bak", ".cache/devbox", ".gitconfig-planted"]) {
-        assert.ok(!r.ops.some((o) => o.includes(frag)), `planted link ${frag} must never be an op target`);
+      for (const frag of [".nix-profile", `${ah}/.config`, ".claude.json.bak", ".cache/devbox", ".gitconfig-planted", ".planted-fifo"]) {
+        assert.ok(!r.ops.some((o) => o.includes(frag)), `planted entry ${frag} must never be an op target`);
       }
       assert.deepEqual(opsReachingRepos(r.ops, reposReal, "chown"), [], "no chown may reach repos/");
       assert.deepEqual(opsReachingRepos(r.ops, reposReal, "chmod"), [], "no chmod may reach repos/");
