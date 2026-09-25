@@ -79,7 +79,7 @@ describe("shared completion attempt", () => {
     assert.deepEqual(reasons, [REASON_COMPLETION_NO_PROGRESS]);
     assert.equal(
       await routeCompletionHold(
-        { enterCompletionHold: async () => true } as RunContext,
+        { enterCompletionHold: async () => true } as unknown as RunContext,
         REASON_COMPLETION_BUDGET_EXHAUSTED,
         true,
       ),
