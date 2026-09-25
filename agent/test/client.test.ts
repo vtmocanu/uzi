@@ -585,7 +585,17 @@ describe("getConsumedFollowUps (issue #1660)", () => {
 
   it("treats a 200 without an inputs array as an error, never as no follow-ups", async () => {
     const client = newClient();
-    for (const body of [{}, { inputs: null }, { inputs: "x" }, { inputs: {} }]) {
+    for (const body of [
+      {},
+      { inputs: null },
+      { inputs: "x" },
+      { inputs: {} },
+      // Every row is validated, not just the array.
+      { inputs: [{ id: 1, kind: "follow_up", body: "ok" }, { id: 2, kind: "follow_up", body: 42 }] },
+      { inputs: [{ id: "3", kind: "follow_up", body: "ok" }] },
+      { inputs: [{ id: 4, kind: "follow_up", body: "ok" }, null] },
+      { inputs: [{ id: 1.5, kind: "follow_up", body: "ok" }] },
+    ]) {
       api.overrideFollowUps("run-fu-bad", 200, body);
       await assert.rejects(client.getConsumedFollowUps("run-fu-bad"), /inputs/, JSON.stringify(body));
     }

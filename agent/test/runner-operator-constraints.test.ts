@@ -122,4 +122,30 @@ describe("operator constraints survive a re-claim (issue #1660)", () => {
     const feed = api.messages(claim.run_id).map((m) => JSON.stringify(m.payload));
     assert.ok(feed.some((t) => t.includes("could not reload this run's earlier follow-ups")), "the feed says so");
   });
+
+  it("a malformed row in a reload never loses an earlier valid row: the retry seeds both", async () => {
+    const safety = "never execute a string containing kill; screen strings only";
+    const claim = makeClaim({
+      issue_iid: 73,
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      last_seq: 0,
+    });
+    const valid = { id: 4, kind: "follow_up", body: safety, created_at: "2026-09-25T07:01:07Z" };
+    api.overrideFollowUpsSequence(claim.run_id, [
+      { status: 200, body: { inputs: [valid, { id: 5, kind: "follow_up", body: 42 }] } },
+      { status: 200, body: { inputs: [valid, { id: 5, kind: "follow_up", body: "use port 5433" }] } },
+    ]);
+    let prompt = "";
+    const executor: Executor = {
+      async run(ctx) {
+        prompt = await dispatchPrompt(ctx);
+        throw new Error("claim ends here");
+      },
+    };
+    await new RunRunner(client, git, () => ({ executor }), nullLogger(), 20, undefined, { pollMs: 5 }).execute(claim);
+    assert.strictEqual(api.followUpReads.get(claim.run_id), 2, "the malformed response was retried once");
+    assert.ok(prompt.includes(safety), "the earlier valid row reaches the dispatch");
+    assert.ok(prompt.includes("use port 5433"), "and so does the row the retry fixed");
+    assert.strictEqual(prompt.split(safety).length - 1, 1, "once");
+  });
 });

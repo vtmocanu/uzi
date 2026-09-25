@@ -586,15 +586,17 @@ export class SteeringChannel {
    *  order), before start(). follow_up only, blanks skipped, ahead of anything received live, and
    *  de-duplicated by input id. They are constraints only: the lead is NOT re-delivered them. */
   seedOperatorConstraints(inputs: readonly UserInput[]): void {
+    // Atomic: build the whole batch first and touch channel state only once it is complete, so
+    // a row that throws leaves nothing half-seeded for a retry to skip as already known.
     const known = new Set([...this.seededFollowUpIds, ...this.receivedFollowUps.map((f) => f.id)]);
     const seeded: { id: number; body: string }[] = [];
     for (const input of inputs) {
       const body = input.body?.trim();
       if (input.kind !== "follow_up" || !body || known.has(input.id)) continue;
       known.add(input.id);
-      this.seededFollowUpIds.add(input.id);
       seeded.push({ id: input.id, body });
     }
+    for (const f of seeded) this.seededFollowUpIds.add(f.id);
     this.receivedFollowUps.unshift(...seeded);
   }
 
