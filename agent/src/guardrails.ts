@@ -83,13 +83,22 @@
 //    PID forms above, and the substitution scanner's desyncs, where its raw quote/paren
 //    count ends or skips a body in the wrong place so a later substitution is not
 //    screened: a quoted or escaped `)` inside a `$(…)`, a `case` pattern `)`, a `#`
-//    comment, a heredoc line inside a `$(…)` body (paren-counted like code), and `$'\''`
-//    ANSI-C quoting (the last desyncs the tokenizer for every rule too, as at base).
-//    Accepted false positive: an enumerator anywhere in the same command as a
-//    `kill "$pid"` (`lsof -i :3000; kill "$SERVER_PID"`) is denied; the reason tells the
-//    agent to run the kill as its own command. The primary fixes are the worker image
-//    shipping a real lsof (#1575, a busybox lsof ignores its filters and lists every
-//    process) and the role guidance.
+//    comment inside a `$(…)`, and `$'\''` ANSI-C quoting (the last desyncs the tokenizer
+//    for every rule too, as at base). A `<<` that is not a heredoc operator is also read
+//    as one, and its "body" (to the end of the string when no delimiter line follows) is
+//    skipped: a `<<` in a parameter expansion (`${x//<<'E'/}`) or in arithmetic
+//    (`(( 1 << 'E' ))`, `$((1<<'E'))`) hides every later line from the scanner. An
+//    apostrophe in a heredoc body (`don't`) desyncs the tokenizer for every rule, which
+//    predates #1576.
+//    Accepted false positives (all degrade safe): an enumerator anywhere in the same
+//    command as a `kill "$pid"` (`lsof -i :3000; kill "$SERVER_PID"`) is denied, and the
+//    reason tells the agent to run the kill as its own command; KILL_STATIC_EVAL_RE denies
+//    `kill $((pid))` and `kill "$pid" > out.$((n))`; a brace-expansion target is denied
+//    even when every PID in it is positive (`kill {1234,5678}`); and a heredoc LINE that
+//    starts with pkill (or another mass-signal command) is denied even under a quoted
+//    delimiter, because the tokenizer reads heredoc bodies as commands (above).
+//    The primary fixes are the worker image shipping a real lsof (#1575, a busybox lsof
+//    ignores its filters and lists every process) and the role guidance.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -249,6 +258,8 @@ const WRAPPER_NOARG_LETTERS: ReadonlyMap<string, string> = new Map([
   ["timeout", "vpf"],
   ["ionice", "t"],
   ["doas", "nsL"],
+  // bash `exec -c` (empty environment) and `-l` (login dash) take no argument.
+  ["exec", "cl"],
 ]);
 // Generic-wrapper long options that take no SEPARATE value (none, or an optional value
 // that must be attached with `=`). getopt_long accepts any unique prefix of a long option
@@ -612,9 +623,10 @@ interface Heredoc {
 
 /** Parse the delimiter word of a heredoc operator whose `<<` ends just before `start`.
  *  Undefined when no word follows or a quote in it is unterminated. A delimiter holding
- *  `$` or a backtick counts as unquoted, so its body is still scanned: bash's quote
- *  removal there (`<<$'X'`) is not modelled, and skipping on a wrong delimiter would
- *  hide the rest of the command. */
+ *  `$`, a backtick or a backslash-newline counts as unquoted, so its body is still
+ *  scanned: bash's quote removal there (`<<$'X'`) and its line joining are not fully
+ *  modelled, and skipping on a wrong delimiter would hide the rest of the command. A
+ *  backslash-newline is dropped from the delimiter, as bash joins the lines. */
 function parseHeredocOperator(command: string, start: number): Heredoc | undefined {
   const n = command.length;
   let j = start;
@@ -635,6 +647,7 @@ function parseHeredocOperator(command: string, start: number): Heredoc | undefin
     } else if (c === '"') {
       let k = j + 1;
       while (k < n && command[k] !== '"') {
+        if (command[k] === "\\" && command[k + 1] === "\n") { dynamic = true; k += 2; continue; }
         if (command[k] === "\\" && k + 1 < n && '"\\$`'.includes(command[k + 1]!)) k++;
         else if (command[k] === "$" || command[k] === "`") dynamic = true;
         delim += command[k];
@@ -644,8 +657,12 @@ function parseHeredocOperator(command: string, start: number): Heredoc | undefin
       quoted = true;
       j = k + 1;
     } else if (c === "\\") {
-      if (j + 1 < n) delim += command[j + 1];
-      quoted = true;
+      if (command[j + 1] === "\n") {
+        dynamic = true;
+      } else {
+        if (j + 1 < n) delim += command[j + 1];
+        quoted = true;
+      }
       j += 2;
     } else {
       if (c === "$" || c === "`") dynamic = true;
@@ -658,10 +675,35 @@ function parseHeredocOperator(command: string, start: number): Heredoc | undefin
 }
 
 /**
+ * Find where the body of heredoc `doc` ends when it starts at `pos` (just past the
+ * newline of the line that opened it). The body runs up to the first line equal to the
+ * delimiter (leading tabs ignored for `<<-`), or to the first line that starts with the
+ * delimiter immediately followed by `)`. That second form is how bash closes a heredoc
+ * inside `$(…)`; this matcher accepts it at every nesting level, top level included,
+ * where bash would not, and resumes AT the `)` so an enclosing paren count sees it.
+ * With neither line the body runs to the end of the string. `bodyEnd` is the index where
+ * the delimiter line starts (the body is `[pos, bodyEnd)`); `resume` is just past the
+ * delimiter on that line.
+ */
+function heredocBodyEnd(command: string, pos: number, doc: Heredoc): { bodyEnd: number; resume: number } {
+  const n = command.length;
+  let p = pos;
+  while (p < n) {
+    const nl = command.indexOf("\n", p);
+    const lineEnd = nl < 0 ? n : nl;
+    const line = command.slice(p, lineEnd);
+    const cmp = doc.stripTabs ? line.replace(/^\t+/, "") : line;
+    if (cmp === doc.delim || (cmp.startsWith(doc.delim) && cmp[doc.delim.length] === ")")) {
+      return { bodyEnd: p, resume: p + (line.length - cmp.length) + doc.delim.length };
+    }
+    p = lineEnd + 1;
+  }
+  return { bodyEnd: n, resume: n };
+}
+
+/**
  * Consume the bodies of the heredocs opened on one line, in order, starting at `pos`
- * (just past that line's newline). A body runs up to the line equal to its delimiter
- * (leading tabs ignored for `<<-`), or to a line that starts with the delimiter followed
- * by `)`, which bash also accepts inside `$(…)`; without either it runs to the end. A
+ * (just past that line's newline); heredocBodyEnd finds each body's end. A
  * quoted-delimiter body is literal in bash and skipped; an unquoted one expands, so its
  * substitutions are appended to `bodies`. Returns the resume index, or -1 past
  * MAX_SUBST_BODIES.
@@ -669,21 +711,7 @@ function parseHeredocOperator(command: string, start: number): Heredoc | undefin
 function consumeHeredocBodies(command: string, pos: number, docs: Heredoc[], bodies: string[]): number {
   const n = command.length;
   for (const doc of docs) {
-    let p = pos;
-    let bodyEnd = n;
-    let resume = n;
-    while (p < n) {
-      const nl = command.indexOf("\n", p);
-      const lineEnd = nl < 0 ? n : nl;
-      const line = command.slice(p, lineEnd);
-      const cmp = doc.stripTabs ? line.replace(/^\t+/, "") : line;
-      if (cmp === doc.delim || (cmp.startsWith(doc.delim) && cmp[doc.delim.length] === ")")) {
-        bodyEnd = p;
-        resume = p + (line.length - cmp.length) + doc.delim.length;
-        break;
-      }
-      p = lineEnd + 1;
-    }
+    const { bodyEnd, resume } = heredocBodyEnd(command, pos, doc);
     if (!doc.quoted) {
       const inner = extractSubstitutionBodies(command.slice(pos, bodyEnd), false);
       if (inner === undefined || bodies.length + inner.length > MAX_SUBST_BODIES) return -1;
@@ -696,12 +724,47 @@ function consumeHeredocBodies(command: string, pos: number, docs: Heredoc[], bod
 }
 
 /**
+ * The index of the `)` that closes the `$(` whose body starts at `start`, or the end of
+ * the string when it is unbalanced. A raw paren-depth count, except that a heredoc opened
+ * inside the body (`$(cat <<'EOF'` …) has its body jumped over, quoted or not, because
+ * bash's own parse does not read parens in a heredoc body: prose like `a)` or `:)` in a
+ * commit message must not end the substitution early (#1576). The body string is later
+ * screened on its own, where an unquoted heredoc body is still scanned for
+ * substitutions. A quoted paren or a `#` comment still shifts the count (file header).
+ */
+function substitutionEnd(command: string, start: number): number {
+  const n = command.length;
+  const pending: Heredoc[] = [];
+  let depth = 1;
+  let j = start;
+  while (j < n) {
+    const c = command[j]!;
+    if (c === "\n" && pending.length > 0) {
+      j += 1;
+      for (const doc of pending.splice(0)) j = heredocBodyEnd(command, j, doc).resume;
+      continue;
+    }
+    if (c === "<" && command[j + 1] === "<") {
+      if (command[j + 2] === "<") { j += 3; continue; } // `<<<` here-string
+      const doc = parseHeredocOperator(command, j + 2);
+      if (doc) { pending.push(doc); j = doc.end; continue; }
+      j += 2;
+      continue;
+    }
+    if (c === "(") depth++;
+    else if (c === ")" && --depth === 0) return j;
+    j++;
+  }
+  return n;
+}
+
+/**
  * The bodies of the command substitutions the tokenizer keeps inside one word (#1576),
  * in one linear pass: single-quoted regions are literal and skipped; each `$(` inside
- * double quotes yields the text up to its matching `)` by paren-depth count (a raw
- * count, so a quoted paren inside the body shifts it; unbalanced means up to the end of
- * the string); each unquoted or double-quoted backtick yields the text up to the next
- * unescaped backtick. An UNQUOTED `$(` is not a body: the tokenizer already splits it
+ * double quotes yields the text up to its matching `)` (substitutionEnd: a paren-depth
+ * count that jumps heredoc bodies, so a quoted paren inside the body still shifts it;
+ * unbalanced means up to the end of the string); each unquoted or double-quoted
+ * backtick yields the text up to the next unescaped backtick. An UNQUOTED `$(` is not a body: the tokenizer already splits it
  * into segments that the caller screens under every rule, so the scan walks into it and
  * still finds a quoted substitution or backtick nested there. The scan resumes after
  * each body, so bodies are disjoint and a substitution nested in a body is found when
@@ -747,13 +810,7 @@ function extractSubstitutionBodies(command: string, heredocs = true): string[] |
     }
     let body: string | undefined;
     if (ch === "$" && command[i + 1] === "(" && inDouble) {
-      let depth = 1;
-      let j = i + 2;
-      for (; j < n; j++) {
-        const c = command[j];
-        if (c === "(") depth++;
-        else if (c === ")" && --depth === 0) break;
-      }
+      const j = substitutionEnd(command, i + 2);
       body = command.slice(i + 2, j);
       i = j + 1;
     } else if (ch === "`") {
@@ -945,7 +1002,11 @@ function analyzeSegment(words: string[], depth: number, secretPaths: readonly st
     if (GENERIC_WRAPPERS.has(base)) {
       i++;
       while (i < words.length && words[i]!.startsWith("-")) i += wrapperOptTakesNext(base, words[i]!) ? 2 : 1;
-      if ((base === "timeout" || base === "nice" || base === "ionice" || base === "chrt") && i < words.length && /^\d/.test(words[i]!)) i++;
+      // Only timeout (DURATION) and chrt (priority) take a positional number before the
+      // command. nice/ionice take theirs through an option (`-n 5`, `-c 2`), so a digit-led
+      // word after them is the command (`nice -n 5 9d/git push`). GNU timeout also reads
+      // `.5` and `inf` as durations.
+      if (i < words.length && ((base === "timeout" && /^(\d|\.\d|inf)/.test(words[i]!)) || (base === "chrt" && /^\d/.test(words[i]!)))) i++;
       continue;
     }
     break;

@@ -111,6 +111,7 @@ const ALLOWED: string[] = [
   "sh -c 'npm run build'", // benign inner command
   "bash -c \"git status && git commit -m ok\"", // benign inner chain
   "timeout 30 npm test", // timeout wrapper around a benign command
+  "nice -n 10 npm test", // nice wrapper with its -n value
   // Local-worktree force ops are NOT a directive concern — must stay allowed.
   "git clean -f",
   "git clean -fd",
@@ -418,10 +419,35 @@ describe("mass-signal guardrail (#1576)", () => {
     // A unique prefix of a value-taking long option takes the next word (getopt_long).
     "timeout --si 9 5 pkill node",
     "timeout --k 1 5 pkill node",
-    // A backtick span in an UNQUOTED-delimiter heredoc runs, so it is screened; a
-    // quoted-delimiter heredoc does not hide a mass-signal command after it.
+    // A backtick span in an UNQUOTED-delimiter heredoc runs, so it is screened.
     "cat <<EOF\n`pkill node`\nEOF",
-    "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)\"; pkill node",
+    // ... also inside a `$(…)` whose end is found by jumping over the heredoc body.
+    "git commit -m \"$(cat <<EOF\nfix: a) `pkill node`\nEOF\n)\"",
+    // A quoted heredoc closes at its delimiter line, so it does not hide a later
+    // substitution the tokenizer keeps inside one word.
+    "cat <<'EOF'\nhi\nEOF\necho \"$(pkill node)\"",
+    "cat <<'EOF'\nhi\nEOF\nkill \"$(lsof -ti :3000)\"",
+    // `<<-` strips leading tabs from the delimiter line, so the heredoc closes there.
+    "cat <<-'EOF'\n\tbody\n\tEOF\necho \"$(pkill node)\"",
+    // `EOF)` closes a heredoc inside `$(…)` and its `)` closes the substitution, so the
+    // backtick after it is screened.
+    "git commit -m \"$(cat <<'EOF'\nmsg\nEOF)\"; echo `pkill node`",
+    // A `<<` inside a `#` comment opens no heredoc.
+    "echo x # <<'EOF'\necho \"$(pkill node)\"",
+    // A `<<<` here-string opens no heredoc.
+    "cat <<<'EOF'\necho \"$(pkill node)\"",
+    // A delimiter holding `$` or a backtick counts as unquoted, so its body is scanned.
+    "cat <<'E'$x\n`pkill node`\nE$x",
+    "cat <<\"E$x\"\n`pkill node`\nE$x",
+    "cat <<'E'`x`\n`pkill node`\nE`x`",
+    // bash joins a backslash-newline, so `<<E\<newline>OF` is the unquoted delimiter EOF.
+    "cat <<E\\\nOF\n`pkill node`\nEOF",
+    // Two heredocs on one line: each body is consumed in order, the unquoted one scanned.
+    "cat <<'A' <<B\nx\nA\n`pkill node`\nB",
+    "cat <<'A' <<'B'\nx\nA\ny\nB\necho \"$(pkill node)\"",
+    // timeout's duration may be `.5` or `inf`.
+    "timeout .5 pkill node",
+    "timeout inf pkill node",
   ];
   for (const cmd of DENIED_MASS) {
     it(`denies with the mass-signal reason: ${cmd}`, () => {
@@ -504,6 +530,21 @@ describe("mass-signal guardrail (#1576)", () => {
     "timeout -fs 9 5 git push",
     "exec -a x git push",
     "sudo --us root git push",
+    // bash `exec -c`/`-l` take no argument, so `-ca` ends in the value letter.
+    "exec -ca x git push",
+    // An ambiguous long-option prefix (`--r`: --role, --remove-timestamp,
+    // --reset-timestamp) takes no value, so git stays the command word.
+    "sudo --r git push",
+    // nice/ionice take no positional number (regression pins: base 613f1434 denied the
+    // option forms), so a digit-led word after them is the command.
+    "nice -n 5 9d/git push",
+    "nice --adjustment 5 9d/git push",
+    "ionice -c 2 9d/git push",
+    "nice 9d/git push",
+    // timeout's DURATION and chrt's priority are positional.
+    "timeout inf git push",
+    "timeout .5 git push",
+    "chrt 5 git push",
   ]) {
     it(`denies git push behind a wrapper option, reserved word or backtick: ${cmd}`, () => {
       const r = screenBashCommand(cmd);
@@ -545,6 +586,18 @@ describe("mass-signal guardrail (#1576)", () => {
     `git commit -m ${heredoc('Replace `kill $(lsof -ti :3000)` with `kill "$pid"`')}`,
     "cat > notes.md <<'EOF'\nUse `kill \"$pid\"`, not `ps`\nEOF",
     `git commit -m ${heredoc("guardrail: deny `pkill` and `killall`")}`,
+    // A `)` in quoted heredoc prose does not end the `$(…)` early (regression pins: base
+    // 613f1434 allowed these), so the backticked prose after it is not screened.
+    `git commit -m ${heredoc("fix: a) `pkill` is denied")}`,
+    `git commit -m ${heredoc("guardrail: deny mass-signal kills\n\nNote :) `pkill` stays denied")}`,
+    `git commit -m ${heredoc("fix: things\n\n1) replace `kill $(lsof -ti :3000)`\n2) use `ps`")}`,
+    `git commit -m ${heredoc("fix :) `kill` then `lsof`")}`,
+    // `<<"EOF"` and `<<\EOF` are quoted delimiters too, so their bodies are literal.
+    "cat > n.md <<\"EOF\"\nUse `pkill node` sparingly\nEOF",
+    "cat > n.md <<\\EOF\nUse `pkill node` sparingly\nEOF",
+    // Two quoted heredocs on one line: both bodies are skipped.
+    "cat <<'A' <<'B'\n`pkill x`\nA\n`pkill y`\nB",
+    "git commit -m \"$(cat <<'EOF'\nfix: a) `pkill`\nEOF)\"",
   ]) {
     it(`allows a benign substitution body: ${JSON.stringify(cmd)}`, () => {
       assert.strictEqual(screenBashCommand(cmd).denied, false, `expected allowed for: ${cmd}`);
