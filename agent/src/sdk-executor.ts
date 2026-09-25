@@ -3669,17 +3669,20 @@ export class SdkExecutor implements Executor {
             // child that could read the PAT, go with it), and resume only once the group is
             // CONFIRMED gone: a resumed run can last hours, and a pid left for the run-end
             // killAgentTree could by then name a recycled group. Unconfirmed (still present or
-            // unknowable) fails the run as before and keeps the pid for the run-end reap.
-            if (err.pid !== undefined) {
-              if (!(await this.reapDeadCliGroup(state, err.pid))) {
-                this.log.warn("agent CLI died from a foreign signal; its process group is not confirmed gone, not resuming", {
-                  run_id: ctx.runId,
-                  death: err.death,
-                });
-                throw err.original;
-              }
-              this.spawnedPids.delete(err.pid);
+            // unknowable, or no recorded pid to check) fails the run as before and keeps any
+            // pid for the run-end reap. A trip landing during the confirmation poll wins with
+            // its existing outcome, on both branches.
+            const pid = err.pid;
+            const confirmed = pid !== undefined && (await this.reapDeadCliGroup(state, pid));
+            if (state.tripReason) throw this.tripError(state);
+            if (pid === undefined || !confirmed) {
+              this.log.warn("agent CLI died from a foreign signal; its process group is not confirmed gone, not resuming", {
+                run_id: ctx.runId,
+                death: err.death,
+              });
+              throw err.original;
             }
+            this.spawnedPids.delete(pid);
             signalDeathRetries++;
             resumeId = sessionId;
             this.log.warn("agent CLI died from a foreign signal; resuming the session", {
@@ -3777,13 +3780,16 @@ export class SdkExecutor implements Executor {
    * issue #1656: SIGKILL a dead CLI's process group (group only; the signal's result is not
    * trusted, since "already gone" and "failed" look alike) and poll, briefly and bounded, until
    * the group is confirmed empty. SIGKILL delivery is asynchronous, hence the poll. The wait is
-   * debited from the wall like the empty-turn backoff. @returns true only when confirmed gone.
+   * debited from the wall like the empty-turn backoff, and stops early on a trip (the caller
+   * checks tripReason). @returns true only when confirmed gone.
    */
   private async reapDeadCliGroup(state: RunDrive, pgid: number): Promise<boolean> {
     this.killCliGroup(pgid);
     const started = Date.now();
     try {
       for (;;) {
+        // A trip (cancel, pause) landing mid-poll ends it; the caller throws the trip outcome.
+        if (state.tripReason) return false;
         const present = this.cliGroupPresent(pgid);
         if (present === false) return true;
         if (present === undefined) return false;

@@ -86,13 +86,24 @@ interface Turn {
   startedAt: number;
 }
 
-function fakeTurns(scripts: Script[]): { queryFn: SdkQueryFn; turns: Turn[] } {
+/** Replays one scripted stream per turn. With `withPid` (the default) each turn "spawns" its
+ *  CLI through the executor's spawn hook, as the real SDK does, so the executor records a
+ *  (fake, never-signalled) pid for the turn; `withPid: false` models a turn with no pid. */
+function fakeTurns(scripts: Script[], withPid = true): { queryFn: SdkQueryFn; turns: Turn[] } {
   const turns: Turn[] = [];
   let i = 0;
   const queryFn: SdkQueryFn = (params) => {
     const script = scripts[Math.min(i, scripts.length - 1)]!;
     i++;
     turns.push({ options: params.options, startedAt: Date.now() });
+    if (withPid) {
+      params.options.spawnClaudeCodeProcess?.({
+        command: "claude",
+        args: [],
+        env: {},
+        signal: params.options.abortController!.signal,
+      });
+    }
     return (async function* () {
       for await (const _p of params.prompt) { /* drain the SDK prompt */ }
       const s = typeof script === "function" ? script(params.options.abortController!.signal) : script;
@@ -158,10 +169,14 @@ function makeCtx(overrides: Partial<RunContext> = {}): { ctx: RunContext; emits:
   return { ctx, emits, gated };
 }
 
+// Fake CLI pids handed out by the default spawn hook: nothing runs under them, and every kill
+// below is a recorder, so none is ever signalled.
+let fakePid = 900_000;
 const opts = (queryFn: SdkQueryFn, extra: Partial<SdkExecutorOptions> = {}): SdkExecutorOptions => ({
   queryFn,
   emptyTurnBackoffBaseMs: 0,
   emptyTurnMaxRetries: 2,
+  spawn: () => ({ pid: fakePid++ }),
   // No test here may signal anything: the fakes spawn nothing, and the real-SDK pin's
   // children end themselves. The dead-CLI reap is recorded-only and reports the group gone.
   kill: () => true,
@@ -323,6 +338,42 @@ describe("SdkExecutor foreign CLI signal death (issue #1656)", () => {
     assert.equal(turns.length, 1, "no second query: a fresh session is never labelled a resume");
   });
 
+  it("a death with no recorded CLI pid does not resume: its group cannot be confirmed gone", async () => {
+    const { queryFn, turns } = fakeTurns([
+      dies(sdkSignal("SIGTERM"), [assistantText("working")]),
+      [submitPlan("# Plan"), resultSuccess()],
+    ], false);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx().ctx));
+    assert.equal(err.message, "Claude Code process terminated by signal SIGTERM");
+    assert.equal(turns.length, 1, "no resume without a pid to confirm");
+  });
+
+  // Each entry builds a fresh probe: present on every poll, or present for four polls then gone.
+  const probes: Array<[string, () => () => boolean]> = [
+    ["the group stays present", () => () => true],
+    ["the group is then confirmed gone", () => { let n = 0; return () => n++ < 4; }],
+  ];
+  for (const [label, present] of probes) {
+    it(`a cancel that lands mid-confirmation wins over the death (${label})`, async () => {
+      const ac = new AbortController();
+      const probe = present();
+      const { queryFn, turns } = fakeTurns([
+        dies(sdkSignal("SIGTERM"), [assistantText("working")]),
+        [submitPlan("# Plan"), resultSuccess()],
+      ]);
+      const executor = new SdkExecutor(nullLogger(), homeDir, opts(queryFn, {
+        cliGroupPresent: () => {
+          // The first probe of the poll fires the cancel; the poll is then in flight.
+          if (!ac.signal.aborted) setTimeout(() => ac.abort(), 0);
+          return probe();
+        },
+      }));
+      const err = await rejection(executor.run(makeCtx({ signal: ac.signal }).ctx));
+      assert.match(err.message, /run cancelled/);
+      assert.equal(turns.length, 1, "nothing is driven after the trip");
+    });
+  }
+
   // ---- negative controls: unchanged behaviour ------------------------------------------
 
   for (const [label, err] of [
@@ -431,7 +482,7 @@ describe("dead CLI group confirmed gone before a resume (issue #1656)", () => {
     const fake = fakeTurns([
       [submitPlan("# Plan", "prev"), resultSuccess("prev")],
       [signalDone("prev"), resultSuccess("prev")],
-    ]);
+    ], false);
     let call = 0;
     const queryFn: SdkQueryFn = (params) => {
       events.push(`query${call}`);
@@ -529,7 +580,7 @@ describe("SDK process-exit error shape (issue #1656 pin)", () => {
       const fake = fakeTurns([
         [submitPlan("# Plan", "prev"), resultSuccess("prev")],
         [signalDone("prev"), resultSuccess("prev")],
-      ]);
+      ], false);
       const resumes: Array<string | undefined> = [];
       let call = 0;
       // Turn 0 runs the REAL SDK through the production query seam (its CLI is the
