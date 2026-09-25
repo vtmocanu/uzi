@@ -1838,7 +1838,7 @@ export class CodexExecutor implements Executor {
         let fallbackUsed = false;
         // `round` counts clarification rounds only; the prose-only recovery below has its own budget.
         for (let round = 0; ; ) {
-          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, { completedCount: 0 }, shared.scrubProjected);
+          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, { completedCount: 0 }, shared.scrubProjected);
           if (turn.kind !== "turn") return turn;
           const result = turn.result;
           if (result.plan?.trim()) {
@@ -2008,7 +2008,7 @@ export class CodexExecutor implements Executor {
           // Issue #1674 (PRD #1064 parity): each report_progress observation pushes at once and emits
           // its started / reported-complete frames exactly once, diffed from the last known progress.
           const onProgress = makeProgressObserver(ctx, latestProgress, milestones);
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, { completedCount: latestProgress?.completed?.length ?? 0 }, shared.scrubProjected, completionAttempted, onProgress);
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, { completedCount: latestProgress?.completed?.length ?? 0 }, shared.scrubProjected, completionAttempted, onProgress);
           if (implTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
           if (implTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: implTurn.reason } };
           result = implTurn.result;
@@ -2452,11 +2452,13 @@ export class CodexExecutor implements Executor {
    *   (c) a `turn_finished` `outcome:"failed"` is classified ONCE and materialized+thrown
    *       (the harness represents a provider terminal failure as DATA, never double-thrown);
    *   (d) a clean terminal → `finish({kind:"terminal"})`, else exhausted → `finish({exhausted})`.
-   * Idle re-arms on every event; the wall arms at turn start and disarms in finally.
+   * Idle runs only without admitted callbacks; events re-arm it when none are in flight.
+   * The wall arms at turn start and disarms in finally.
    */
   private async driveCodexTurn(
     ctx: RunContext,
     harness: CodexHarness,
+    registry: ExecutionRegistry,
     reducer: RunTurnReducerImpl,
     phase: "plan" | "implement",
     prompt: string,
@@ -2467,6 +2469,7 @@ export class CodexExecutor implements Executor {
     scrubLeadText: (s: string) => string,
     onProgress: (progress: MilestoneProgress) => void,
   ): Promise<ReducedTurnResult> {
+    const callbackCursor = registry.callbackAdmissionCursor();
     const turnAbort = new AbortController();
     let tripReason: string | undefined;
     const trip = (reason: string): void => {
@@ -2508,11 +2511,18 @@ export class CodexExecutor implements Executor {
       } else ctx.signal.addEventListener("abort", onCancel, { once: true });
     }
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    let currentTurnCallbacks = registry.inFlightCallbackCountSince(callbackCursor);
     const armIdle = (): void => {
       if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = undefined;
+      currentTurnCallbacks = registry.inFlightCallbackCountSince(callbackCursor);
+      if (currentTurnCallbacks > 0) return;
       idleTimer = setTimeout(() => trip(REASON_IDLE), idleMs);
       idleTimer.unref?.();
     };
+    const unsubscribeCallbacks = registry.subscribeCallbacks(() => {
+      if (registry.inFlightCallbackCountSince(callbackCursor) !== currentTurnCallbacks) armIdle();
+    });
     // Issue #1600: arm the RUN-WIDE remaining budget, not a fresh per-turn wall; the finally debits
     // this turn's elapsed time. An already-spent budget trips before the turn starts.
     const wallArmedAt = Date.now();
@@ -2559,7 +2569,7 @@ export class CodexExecutor implements Executor {
       })();
       for (; !first.done; first = await events.next()) {
         const event = first.value;
-        armIdle(); // any event is liveness
+        armIdle(); // events re-arm idle only while no callback is in flight
         const reduction = await reducer.accept(event);
         if (reduction.firstSessionId !== undefined) {
           try {
@@ -2606,6 +2616,7 @@ export class CodexExecutor implements Executor {
       if (tripReason) throw this.tripError(tripReason);
       throw err instanceof Error ? err : new Error(errMessage(err));
     } finally {
+      unsubscribeCallbacks();
       if (idleTimer) clearTimeout(idleTimer);
       if (wallTimer) clearTimeout(wallTimer);
       wall.remainingMs -= Date.now() - wallArmedAt;
@@ -2631,6 +2642,7 @@ export class CodexExecutor implements Executor {
   private async driveTurnWithWallPark(
     ctx: RunContext,
     harness: CodexHarness,
+    registry: ExecutionRegistry,
     reducer: RunTurnReducerImpl,
     phase: "plan" | "implement",
     prompt: string,
@@ -2646,7 +2658,7 @@ export class CodexExecutor implements Executor {
     for (;;) {
       try {
         const result = await this.driveCodexTurn(
-          ctx, harness, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, scrubLeadText, onProgress,
+          ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, scrubLeadText, onProgress,
         );
         // PRD #1497 M2 (CodeRabbit !1504): honor a sticky owner cancel that RACED a REFUSED
         // wall-park re-drive in EVERY phase. The wall PauseNowSignal permanently spent the shared

@@ -119,6 +119,7 @@ export type CallbackReservationResult =
 
 interface CallbackRecord {
   readonly fingerprint: string;
+  readonly admissionSequence: number;
   marker?: CallbackTerminalMarker;
 }
 
@@ -180,6 +181,8 @@ export class ExecutionRegistry {
   private readonly launches = new Map<string, LaunchReservation>();
   private readonly roots: RootRecord[] = [];
   private readonly callbacks = new Map<string, CallbackRecord>();
+  private readonly callbackListeners = new Set<() => void>();
+  private callbackAdmissionSequence = 0;
   private launchSeq = 0;
 
   // A single in-flight quiesce waiter, installed by `quiesceChildren` while it waits
@@ -222,6 +225,30 @@ export class ExecutionRegistry {
     let n = 0;
     for (const rec of this.callbacks.values()) if (!rec.marker) n++;
     return n;
+  }
+
+  /** Snapshot the last successful callback admission for a new turn. */
+  callbackAdmissionCursor(): number {
+    return this.callbackAdmissionSequence;
+  }
+
+  /** Count unsettled callbacks admitted after a turn's entry cursor. */
+  inFlightCallbackCountSince(cursor: number): number {
+    let n = 0;
+    for (const rec of this.callbacks.values()) {
+      if (!rec.marker && rec.admissionSequence > cursor) n++;
+    }
+    return n;
+  }
+
+  /** Observe successful callback admission and settlement for the lifetime of a turn. */
+  subscribeCallbacks(listener: () => void): () => void {
+    this.callbackListeners.add(listener);
+    return () => { this.callbackListeners.delete(listener); };
+  }
+
+  private notifyCallbacks(): void {
+    for (const listener of this.callbackListeners) listener();
   }
 
   rootCount(): number {
@@ -362,7 +389,11 @@ export class ExecutionRegistry {
       });
       return { kind: "denied", reason: "reservation_ceiling" };
     }
-    this.callbacks.set(key, { fingerprint: request.fingerprint });
+    this.callbacks.set(key, {
+      fingerprint: request.fingerprint,
+      admissionSequence: ++this.callbackAdmissionSequence,
+    });
+    this.notifyCallbacks();
     return { kind: "admitted", token: { key } };
   }
 
@@ -374,7 +405,9 @@ export class ExecutionRegistry {
       this.poison({ category: "protocol", message: "settleCallback: unknown callback token" });
       return;
     }
+    const wasInFlight = !rec.marker;
     rec.marker = { settled: true, outcome };
+    if (wasInFlight) this.notifyCallbacks();
     // An admitted callback just settled; a bounded quiesce wait may now be complete.
     this.maybeSignalQuiesce();
   }

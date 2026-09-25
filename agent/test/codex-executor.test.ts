@@ -831,17 +831,18 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
   });
 
   for (const scenario of [
-    { name: "idle", idleMs: 20, wallMs: 1000, expected: /idle timeout/ },
-    { name: "wall", idleMs: 1000, wallMs: 20, expected: /wall-clock timeout/ },
+    { name: "wall", idleMs: 80, wallMs: 250, expected: /wall-clock timeout/ },
   ] as const) {
     it(`${scenario.name} trip propagates the active turn signal into the shell effect`, async () => {
       const rig = makeRig();
       let shellObservedAbort = false;
+      let shellStarted = false;
       rig.deps = {
         ...rig.deps,
         idleMs: scenario.idleMs,
         wallMs: scenario.wallMs,
         spawnCommand: async (_argv, opts) => new Promise((resolve) => {
+          shellStarted = true;
           const settle = (): void => {
             shellObservedAbort = true;
             resolve({ code: 137, stdout: "", stderr: "" });
@@ -853,13 +854,40 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
       rig.transport
         .push(threadStarted())
         .push(toolCall(91, "Bash", { command: "sleep 60" }, "th-1", "tn-1", `trip-${scenario.name}`));
-      await assert.rejects(
-        withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, `${scenario.name} shell trip`),
-        scenario.expected,
-      );
+      const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx);
+      await waitFor(() => shellStarted, "shell effect start");
+      await assert.rejects(withTimeout(run, 3000, `${scenario.name} shell trip`), scenario.expected);
       assert.equal(shellObservedAbort, true, "the pending shell received the turn abort before run cleanup");
     });
   }
+
+  it("an admitted Bash callback suspends idle, then settlement starts a full idle window", async () => {
+    const idleMs = 100;
+    const rig = makeRig();
+    let releaseEffect: (() => void) | undefined;
+    let effectStarted = false;
+    let effectAborted = false;
+    rig.deps = { ...rig.deps, idleMs, wallMs: 2000,
+      spawnCommand: async (_argv, opts) => new Promise((resolve) => {
+        effectStarted = true;
+        releaseEffect = () => resolve({ code: 0, stdout: "ok", stderr: "" });
+        opts.signal?.addEventListener("abort", () => { effectAborted = true; releaseEffect?.(); }, { once: true });
+      }),
+    };
+    rig.transport.push(threadStarted()).push(toolCall(91, "Bash", { command: "sleep 60" }, "th-1", "tn-1", "idle-bash"));
+    let finished = false;
+    const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx);
+    void run.finally(() => { finished = true; }).catch(() => undefined);
+    await waitFor(() => effectStarted, "Bash effect start");
+    await new Promise((resolve) => setTimeout(resolve, idleMs + 40));
+    assert.equal(finished, false, "idle stays suspended through the running effect");
+    assert.equal(effectAborted, false);
+    releaseEffect?.();
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 91), "Bash reply");
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    assert.equal(finished, false, "settlement grants a fresh idle window");
+    await assert.rejects(withTimeout(run, 3000, "post-settle idle"), /idle timeout/);
+  });
 
   it("user cancel propagates the active turn signal into the shell effect", async () => {
     const controller = new AbortController();
@@ -1701,7 +1729,7 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     assert.ok(emitted.flatMap((m) => (typeof m.payload.text === "string" ? [m.payload.text] : [])).some((t) => t.includes("a plain root turn")));
   });
 
-  it("(20) a delegation whose child streams frames spanning longer than idleMs does NOT falsely trip REASON_IDLE — each demuxed child frame re-arms the root idle watchdog (fail-old/pass-fixed for B)", async () => {
+  it("(20) a delegation whose child streams frames spanning longer than idleMs does not trip idle while its callback is admitted", async () => {
     const IDLE_MS = 120;
     const GAP_MS = 30; // each child frame arrives well within IDLE_MS of the previous one
     const STEPS = 8; // the child turn spans ~STEPS*GAP_MS ≈ 240ms, TWICE the idle window
@@ -1709,10 +1737,8 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
       if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
       if (c.method === "turn/start") {
         if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
-        // The CHILD turn: stream liveness frames GAP_MS apart, total span > IDLE_MS. With
-        // the fix each demuxed child frame yields a CONTENT-FREE root `activity` that re-arms
-        // idle; with the OLD bare `continue` the root idle timer never re-armed during the
-        // delegation and REASON_IDLE tripped mid-child.
+        // The CHILD turn: stream frames across more than IDLE_MS while the parent
+        // delegation callback remains admitted.
         const t = c.transport;
         let n = 0;
         const pump = (): void => {
@@ -1737,8 +1763,7 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     const { ctx } = makeCtx({ agents });
     const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
 
-    // The idle watchdog is live throughout the child stream — a false trip would reject runP
-    // (with /idle timeout/) before the parent ever replies. The parent spawn_agent callback
+    // The idle watchdog stays suspended throughout the child stream. The parent spawn_agent callback
     // resolves only after the child fully settles; once it has, close the root turn.
     await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "parent spawn_agent reply", 5000);
     // The ROOT then signals done so the m2 implement/review loop finishes.
@@ -1747,6 +1772,63 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     assert.equal(result.branch, "agent/issue-42", "the root turn completed instead of tripping REASON_IDLE");
     assert.equal(rig.transport.turnStartCount, 2, "the child turn ran on the same transport");
     assert.equal(replyOf1(rig).success, true, "the parent spawn_agent callback succeeded after the child settled");
+  });
+
+  it("(20a) a refused wall-park re-drive ignores an unsettled callback from the interrupted drive for idle", async () => {
+    const IDLE_MS = 90;
+    const rig = makeRig({ responder: (c) => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) c.transport.push(threadStarted());
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    rig.deps = { ...rig.deps, idleMs: IDLE_MS, wallMs: 50, boundaryDeadlineMs: 50 };
+
+    // Capture the real epoch registry as the executor subscribes its idle watchdog.
+    // Both drives must use this same registry; the first reservation stays unsettled.
+    const subscribe = ExecutionRegistry.prototype.subscribeCallbacks;
+    let registry: ExecutionRegistry | undefined;
+    const captureRegistry = (value: ExecutionRegistry): void => { registry = value; };
+    ExecutionRegistry.prototype.subscribeCallbacks = function (listener) {
+      captureRegistry(this);
+      return subscribe.call(this, listener);
+    };
+    let parks = 0;
+    const { ctx } = makeCtx({
+      parkForWall: async () => ++parks === 1 ? "refused" : "parked",
+      takeWallParkRefresh: () => ({ totalSeconds: 1, usedSeconds: 0 }),
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    try {
+      await waitFor(() => rig.transport.turnStartCount === 1 && registry !== undefined, "first drive and registry");
+      const epoch = registry!;
+      const stale = epoch.reserveCallback({ threadId: "th-1", turnId: "tn-1", callId: "stale", fingerprint: "stale" });
+      assert.equal(stale.kind, "admitted");
+
+      await waitFor(() => rig.transport.turnStartCount === 2, "refused park re-drive");
+      assert.equal(registry, epoch, "the re-drive uses the same epoch registry");
+      assert.equal(epoch.inFlightCallbackCount(), 1, "the interrupted drive left one callback unsettled");
+      const current = epoch.reserveCallback({ threadId: "th-1", turnId: "tn-1", callId: "current", fingerprint: "current" });
+      assert.equal(current.kind, "admitted");
+      if (current.kind !== "admitted") return;
+
+      await new Promise<void>((resolve) => setTimeout(resolve, IDLE_MS + 50));
+      assert.equal(parks, 1, "a callback admitted in the current drive suppresses idle");
+      epoch.settleCallback(current.token, "ok");
+      assert.equal(epoch.inFlightCallbackCount(), 1, "only the stale callback remains");
+      await assert.rejects(
+        withTimeout(running, 2000, "idle after the current callback settles"),
+        /codex run idle timeout/,
+        "the current drive idles even though the interrupted drive's callback never settled",
+      );
+      assert.equal(parks, 1, "idle did not consume the bounded wall budget");
+    } finally {
+      ExecutionRegistry.prototype.subscribeCallbacks = subscribe;
+      rig.transport.end();
+      await running.catch(() => undefined);
+    }
   });
 
   it("(C4a) a child's token_usage_updated flows through the REAL delegation flow and is charged to the CHILD's configured model, not the root's", async () => {

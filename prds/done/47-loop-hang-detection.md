@@ -15,11 +15,12 @@ spot that leaves a sick run looking healthy until it dies (or forever):
   both server-side (sweeper, `api/internal/workersvc/service.go:1333`) and
   worker-side (`agent/src/sdk-executor.ts:528`, armed at :520). No signal at minute
   30 that something is off.
-- `RUN_IDLE_TIMEOUT` (default 10m) is worker-side only and re-arms on **every** SDK
-  message (`agent/src/sdk-executor.ts:436-441`, re-armed at :455). An agent
-  busy-looping — re-running the same failing command, re-reading the same file —
-  emits a steady message stream and never trips it. Nothing anywhere detects
-  repetition.
+- `RUN_IDLE_TIMEOUT` (default 10m) is worker-side only. The worker suspends
+  idle while Codex broker callbacks or non-signal SDK tool-use IDs are in flight,
+  then re-arms it after the last callback settles or tool result arrives (issue
+  #1686). An agent busy-looping — re-running the same failing command, re-reading
+  the same file — can keep producing activity without tripping idle. Nothing
+  anywhere detects repetition.
 - A `queued` run is never swept — no sweep query selects `status='queued'`
   (`api/internal/store/queries/runtime.sql:298-371`; deliberate, see the vault-gate
   comment at `service.go:314`) — and can sit invisible forever: no worker online,
@@ -201,13 +202,17 @@ idle / iteration caps remain the only liveness backstops.
 9. **The stalled signal is suppressed while a tool call is in flight** (↳review —
    design major). `last_activity_at` only advances on new messages, and a long
    `go build`/test-suite/provision emits one `tool_use` then nothing until its
-   `tool_result` — the worker's own idle watchdog re-arms per message and sits at
-   10m for exactly this reason. So: if the newest message for the run is a
+   `tool_result`. So: if the newest message for the run is a
    `tool_use` with no matching `tool_result`, the run is *working*, not stalled —
    no flag, regardless of elapsed time (the wall-clock `slow` signal still covers
    pathological single calls). Detection: compare the newest `tool_use.id` against
    existing `tool_result.tool_use_id` payloads in the same window fetch as loop
-   detection — no extra query.
+   detection — no extra query. Implementation note (issue #1686): the worker
+   suspends idle for in-flight Codex broker callbacks and non-signal SDK tool-use
+   IDs, then re-arms it after the last settlement/result; the wall bound remains
+   active, with wall exhaustion routed to park or post-attempt completion hold.
+   This corrects the original
+   per-message watchdog explanation without changing the stalled flag decision.
 
 10. **UI: one taxonomy change, four surfaces for free, plus a board strip.**
     `runBadge()` grows a warn variant: flagged runs in flaggable statuses render

@@ -370,6 +370,42 @@ describe("ExecutionRegistry: callback reservation idempotency", () => {
   });
 });
 
+describe("ExecutionRegistry: callback idle subscription", () => {
+  it("keeps idle suspended until both admitted callbacks settle", () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const observedCounts: number[] = [];
+    let idleArms = 0;
+    const onCallbackChange = (): void => {
+      const count = reg.inFlightCallbackCount();
+      observedCounts.push(count);
+      if (count === 0) idleArms++;
+    };
+    const unsubscribe = reg.subscribeCallbacks(onCallbackChange);
+    try {
+      const first = reg.reserveCallback({ threadId: "t", turnId: "u", callId: "first", fingerprint: "fp" });
+      const second = reg.reserveCallback({ threadId: "t", turnId: "u", callId: "second", fingerprint: "fp" });
+      assert.equal(first.kind, "admitted");
+      assert.equal(second.kind, "admitted");
+      if (first.kind !== "admitted" || second.kind !== "admitted") return;
+      assert.equal(reg.inFlightCallbackCount(), 2, "both callbacks are admitted before either settles");
+      assert.deepEqual(observedCounts, [1, 2]);
+      assert.equal(idleArms, 0);
+
+      reg.settleCallback(first.token, "ok");
+      assert.equal(reg.inFlightCallbackCount(), 1);
+      assert.deepEqual(observedCounts, [1, 2, 1]);
+      assert.equal(idleArms, 0, "first settlement cannot rearm idle");
+
+      reg.settleCallback(second.token, "ok");
+      assert.equal(reg.inFlightCallbackCount(), 0);
+      assert.deepEqual(observedCounts, [1, 2, 1, 0]);
+      assert.equal(idleArms, 1, "final settlement rearms idle");
+    } finally {
+      unsubscribe();
+    }
+  });
+});
+
 describe("ExecutionRegistry: callback reservation ceiling (fail-closed bound)", () => {
   it("poisons+denies a NEW distinct key at the ceiling, yet a replay of an existing key past the ceiling still returns its cached marker without poisoning again", () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
