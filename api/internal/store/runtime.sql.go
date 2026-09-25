@@ -6276,6 +6276,47 @@ func (q *Queries) ListCodexAccountWaitRunsPage(ctx context.Context, arg ListCode
 	return items, nil
 }
 
+const listConsumedFollowUpInputsForRun = `-- name: ListConsumedFollowUpInputsForRun :many
+SELECT id, body, created_at FROM run_user_inputs
+WHERE run_id = $1 AND kind = 'follow_up' AND consumed_at IS NOT NULL
+ORDER BY id ASC
+`
+
+type ListConsumedFollowUpInputsForRunRow struct {
+	ID        int64              `json:"id"`
+	Body      pgtype.Text        `json:"body"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+// Issue #1660: the run's ALREADY-CONSUMED follow_up inputs, oldest first, for a worker to
+// rehydrate its operator constraints on every claim (first and re-claim), so a follow-up a
+// previous claim consumed still reaches the subagents this claim dispatches. follow_up only:
+// answer, revise_plan, scope, pause and the rest are not operator constraints. READ ONLY and
+// UNCAPPED like ListFollowUpInputsForRun: the worker fits the set into its prompt budget and
+// must not lose an entry here. Worker-ownership is enforced at the run resolve
+// (GetRunOwnedByWorker), not here. Pending rows are excluded: the live /inputs drain delivers
+// those, and the worker de-duplicates the two by id. Ordered by id, the same rule as the
+// /inputs FIFO (ConsumeRunInputs), so the worker keeps the server's order as is.
+func (q *Queries) ListConsumedFollowUpInputsForRun(ctx context.Context, runID uuid.UUID) ([]ListConsumedFollowUpInputsForRunRow, error) {
+	rows, err := q.db.Query(ctx, listConsumedFollowUpInputsForRun, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListConsumedFollowUpInputsForRunRow{}
+	for rows.Next() {
+		var i ListConsumedFollowUpInputsForRunRow
+		if err := rows.Scan(&i.ID, &i.Body, &i.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listDockerBlockedReposForUser = `-- name: ListDockerBlockedReposForUser :many
 SELECT r.id
 FROM repos r

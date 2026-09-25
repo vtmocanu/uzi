@@ -1110,7 +1110,8 @@ export class SdkExecutor implements Executor {
       },
       {
         matcher: NESTED_AGENT_TOOL,
-        hooks: [buildAgentGuardHook(allowedSubagents, this.log)],
+        // null (constraints unavailable) must reach the guard as null, never coerce to [].
+        hooks: [buildAgentGuardHook(allowedSubagents, this.log, () => (ctx.operatorConstraints ? ctx.operatorConstraints() : []))],
       },
       {
         matcher: SEND_MESSAGE_TOOL,

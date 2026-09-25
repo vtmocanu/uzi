@@ -43,6 +43,9 @@ type protocolStore struct {
 	gapRows   []store.RunMessageGapsRow
 	gapErr    error
 	gapArg    store.RunMessageGapsParams
+	// Issue #1660: the consumed follow-ups the rehydrate read returns, and whether it ran.
+	followUpRows   []store.ListConsumedFollowUpInputsForRunRow
+	followUpCalled bool
 }
 
 func (p *protocolStore) ClaimRun(context.Context, store.ClaimRunParams) (store.Run, error) {
@@ -57,6 +60,10 @@ func (p *protocolStore) GetRunOrphanIdentity(context.Context, store.GetRunOrphan
 func (p *protocolStore) RunMessageGaps(_ context.Context, arg store.RunMessageGapsParams) ([]store.RunMessageGapsRow, error) {
 	p.gapArg = arg
 	return p.gapRows, p.gapErr
+}
+func (p *protocolStore) ListConsumedFollowUpInputsForRun(context.Context, uuid.UUID) ([]store.ListConsumedFollowUpInputsForRunRow, error) {
+	p.followUpCalled = true
+	return p.followUpRows, nil
 }
 func (p *protocolStore) SetRunCompleted(context.Context, store.SetRunCompletedParams) (int64, error) {
 	return p.completedRows, nil
@@ -1156,5 +1163,76 @@ func TestWorkerRegisterCarriesOutboxMaxPending(t *testing.T) {
 	}
 	if *resp.WorkerOutboxMaxPending != 32 {
 		t.Fatalf("worker_outbox_max_pending = %d, want 32 (= cfg.WorkerOutboxMaxPending)", *resp.WorkerOutboxMaxPending)
+	}
+}
+
+// Issue #1660: the worker rehydrates its operator constraints on every claim from the run's
+// already-consumed follow-ups. The read returns them as the same InputDTO shape /inputs uses,
+// oldest first, kind follow_up, and always an array.
+func TestWorkerRunFollowUpsReturnsConsumedFollowUps(t *testing.T) {
+	runID := uuid.New()
+	at := time.Date(2026, 9, 25, 7, 1, 7, 0, time.UTC)
+	st := &protocolStore{
+		ownedRun: store.Run{ID: runID, Status: "running"},
+		followUpRows: []store.ListConsumedFollowUpInputsForRunRow{
+			{ID: 4, Body: pgtype.Text{String: "screen strings only", Valid: true}, CreatedAt: pgtype.Timestamptz{Time: at, Valid: true}},
+			{ID: 9, Body: pgtype.Text{String: "use port 5433", Valid: true}, CreatedAt: pgtype.Timestamptz{Time: at.Add(time.Minute), Valid: true}},
+		},
+	}
+	h := newProtocolHandler(t, st)
+	rec := httptest.NewRecorder()
+	h.WorkerRunFollowUps(rec, workerReq(http.MethodGet, "", runID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		Inputs []workersvc.InputDTO `json:"inputs"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if len(got.Inputs) != 2 {
+		t.Fatalf("inputs = %+v, want the two consumed follow-ups", got.Inputs)
+	}
+	for i, want := range []struct {
+		id   int64
+		body string
+	}{{4, "screen strings only"}, {9, "use port 5433"}} {
+		in := got.Inputs[i]
+		if in.ID != want.id || in.Kind != "follow_up" || in.Body == nil || *in.Body != want.body {
+			t.Fatalf("inputs[%d] = %+v, want id %d kind follow_up body %q", i, in, want.id, want.body)
+		}
+	}
+	if !got.Inputs[0].CreatedAt.Equal(at) {
+		t.Fatalf("inputs[0].created_at = %v, want %v", got.Inputs[0].CreatedAt, at)
+	}
+}
+
+func TestWorkerRunFollowUpsEmptyIsArray(t *testing.T) {
+	runID := uuid.New()
+	h := newProtocolHandler(t, &protocolStore{ownedRun: store.Run{ID: runID, Status: "running"}})
+	rec := httptest.NewRecorder()
+	h.WorkerRunFollowUps(rec, workerReq(http.MethodGet, "", runID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if body := strings.TrimSpace(rec.Body.String()); body != `{"inputs":[]}` {
+		t.Fatalf("body = %s, want {\"inputs\":[]}", body)
+	}
+}
+
+// A run this worker does not hold is a 404, and the follow-up read never runs: another
+// worker's run constraints are not this worker's to read.
+func TestWorkerRunFollowUpsForeignRunReturns404(t *testing.T) {
+	runID := uuid.New()
+	st := &protocolStore{ownedErr: pgx.ErrNoRows}
+	h := newProtocolHandler(t, st)
+	rec := httptest.NewRecorder()
+	h.WorkerRunFollowUps(rec, workerReq(http.MethodGet, "", runID))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (run not owned by this worker)", rec.Code)
+	}
+	if st.followUpCalled {
+		t.Fatal("the follow-up read ran for a run this worker does not own")
 	}
 }

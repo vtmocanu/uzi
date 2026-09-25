@@ -52,7 +52,12 @@ import { MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { qualifiedSkillName } from "./skills-plugin.js";
 import { reportIncidentalIssueToolName, FINDINGS_SERVER_NAME } from "./findings-tools.js";
 import { FORGE_SERVER_NAME } from "./forge-tools.js";
-import { FINDINGS_NUDGE_APPEND, SECRET_FIXTURE_HYGIENE_APPEND, WORKER_RUNTIME_APPEND } from "./prompt.js";
+import {
+  FINDINGS_NUDGE_APPEND,
+  SECRET_FIXTURE_HYGIENE_APPEND,
+  SUBAGENT_SAFETY_APPEND,
+  WORKER_RUNTIME_APPEND,
+} from "./prompt.js";
 
 // Server-level MCP denial (PRD #43 M2 / Decision 3). A `mcp__<server>` entry in
 // disallowedTools removes EVERY tool the named in-process MCP server exposes
@@ -150,7 +155,7 @@ function toDefinition(
 ): AgentDefinition {
   const def: AgentDefinition = {
     description: t.description,
-    // Append two shared constants to every subagent's prompt regardless of its body,
+    // Append the shared constants to every subagent's prompt regardless of its body,
     // so shared-library repo agents get them WITHOUT editing their files:
     //  - FINDINGS_NUDGE_APPEND (PRD #457 M3): the incidental-findings discovery nudge,
     //    same constant as the lead nudge (buildLeadSystemPrompt) — one source of wording.
@@ -160,7 +165,10 @@ function toDefinition(
     //  - SECRET_FIXTURE_HYGIENE_APPEND (PRD #1120): the secret-shaped-fixture source-hygiene
     //    rule, same constant as the lead prompt (buildLeadSystemPrompt) — one source of
     //    wording — so every subagent gets it without editing its body.
-    prompt: `${t.prompt_body}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}`,
+    //  - SUBAGENT_SAFETY_APPEND (issue #1660): the worker-owned safety block, LAST. Both
+    //    rosters (assembleAgents, subagentsFromTemplates) build through here, so no role
+    //    body, repo-authored included, can drop it.
+    prompt: `${t.prompt_body}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`,
     // No subagent may spawn nested agents (defense-in-depth over the fact that
     // `agents` + settingSources:[] already limit spawnable agents to these), reach
     // the run's workflow-signal MCP tools (SIGNAL_SERVER_DENY — the plan gate and

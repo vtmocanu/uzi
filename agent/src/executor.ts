@@ -360,6 +360,12 @@ export interface RunContext {
    *  Distinct from pullFollowUp: it carries no server input id and never touches the follow-up
    *  wake-guard watermark. Optional; absent (a stub/older wiring) ⇒ no steer. */
   pullSafetySteer?(): string | undefined;
+  /** Issue #1660: every operator follow-up received so far (steering.operatorConstraints), read
+   *  by the Agent guard at each dispatch and attached to the subagent's prompt, or null when the
+   *  earlier ones could not be loaded this claim, or "reconciling" while a failed poll is being
+   *  reconciled (the guard denies both). Unlike pullFollowUp it consumes nothing. Optional;
+   *  absent ⇒ no constraints. */
+  operatorConstraints?(): readonly string[] | null | "reconciling";
   /**
    * M4: report a running/iteration heartbeat (server persists via GREATEST).
    *

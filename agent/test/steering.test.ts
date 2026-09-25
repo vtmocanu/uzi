@@ -9,6 +9,8 @@ import {
 } from "../src/steering.js";
 import type { WorkerClient } from "../src/client.js";
 import type { UserInput } from "../src/protocol.js";
+import { buildAgentGuardHook, NESTED_AGENT_TOOL } from "../src/guardrails.js";
+import type { HookInput } from "@anthropic-ai/claude-agent-sdk";
 import { nullLogger } from "./helpers.js";
 
 // The steering channel is the single /inputs poller; it routes verdicts,
@@ -20,7 +22,10 @@ function fakeClient(batches: UserInput[][]): WorkerClient {
   return { getInputs: async () => ({ inputs: batches[i++] ?? [] }) } as unknown as WorkerClient;
 }
 
-const inp = (kind: UserInput["kind"], body?: string): UserInput => ({ id: 1, kind, body: body ?? null });
+// Every input gets a fresh id, as real run_user_inputs rows do (issue #1660: follow-ups are
+// de-duplicated by id, so a shared constant id would read as one repeated row).
+let nextInputId = 1;
+const inp = (kind: UserInput["kind"], body?: string): UserInput => ({ id: nextInputId++, kind, body: body ?? null });
 const tick = (ms = 10): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 function makeChannel(batches: UserInput[][], cancel = new AbortController()): { ch: SteeringChannel; cancel: AbortController } {
@@ -834,5 +839,326 @@ describe("ChatSteering", () => {
     await tick();
     await ch.stop();
     assert.deepStrictEqual(await p, { kind: "ended" });
+  });
+});
+
+// Issue #1660: an operator follow-up is also a persistent RUN CONSTRAINT. The channel records it
+// on receipt (it is already consumed server-side by then), independently of the lead's FIFO
+// delivery, and the Agent guard attaches every recorded constraint to each later dispatch.
+describe("SteeringChannel operator constraints (issue #1660)", () => {
+  it("records follow-ups on receipt, in order, and keeps them after the lead's pull", async () => {
+    const { ch } = makeChannel([[inp("follow_up", "  first  "), inp("follow_up", "   "), inp("revise_plan", "not a constraint")], [inp("follow_up", "second")]]);
+    assert.deepStrictEqual(ch.operatorConstraints(), [], "nothing before any input is routed");
+    ch.start();
+    try {
+      await tick();
+      assert.deepStrictEqual(ch.operatorConstraints(), ["first", "second"], "trimmed, blanks and other kinds skipped");
+      // The lead's delivery is unchanged and does not consume the constraint record.
+      assert.strictEqual(ch.pullFollowUp(), "first");
+      assert.strictEqual(ch.pullFollowUp(), "second");
+      assert.deepStrictEqual(ch.operatorConstraints(), ["first", "second"]);
+    } finally {
+      await ch.stop();
+    }
+  });
+
+  it("returns a copy: a caller cannot rewrite the run's constraints", async () => {
+    const { ch } = makeChannel([[inp("follow_up", "keep")]]);
+    ch.start();
+    try {
+      await tick();
+      (ch.operatorConstraints() as string[]).push("injected");
+      assert.deepStrictEqual(ch.operatorConstraints(), ["keep"]);
+    } finally {
+      await ch.stop();
+    }
+  });
+
+  it("acceptance: a follow-up received after run start reaches a later dispatch and no earlier one", async () => {
+    const queue: UserInput[][] = [];
+    const client = { getInputs: async () => ({ inputs: queue.shift() ?? [] }) } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    const hook = buildAgentGuardHook(["reviewer", "auditor"], nullLogger(), () => ch.operatorConstraints());
+    const dispatch = async (subagent_type: string): Promise<string> => {
+      const out = (await hook({
+        session_id: "s",
+        transcript_path: "/t",
+        cwd: "/w",
+        hook_event_name: "PreToolUse",
+        tool_name: NESTED_AGENT_TOOL,
+        tool_input: { subagent_type, prompt: `${subagent_type} task` },
+        tool_use_id: "tu",
+      } as HookInput)) as { hookSpecificOutput?: { updatedInput?: { prompt?: string } } };
+      return out.hookSpecificOutput?.updatedInput?.prompt ?? "";
+    };
+    const rule = "never execute a string containing kill; screen strings only";
+
+    ch.start();
+    try {
+      await tick();
+      const early = await dispatch("reviewer");
+      assert.strictEqual(early, "reviewer task", "dispatch before the follow-up is unchanged");
+
+      queue.push([inp("follow_up", rule)]);
+      await tick();
+      const late = await dispatch("auditor");
+      assert.ok(late.startsWith("auditor task\n\n"));
+      assert.ok(late.includes(rule), "dispatch after the follow-up carries it");
+      // A later dispatch still carries it after the lead consumed its own copy.
+      assert.strictEqual(ch.pullFollowUp(), rule);
+      assert.ok((await dispatch("reviewer")).includes(rule), "persistent for the rest of the run");
+    } finally {
+      await ch.stop();
+    }
+  });
+});
+
+// Issue #1660: a re-claim starts a fresh channel, so the worker seeds it with the follow-ups
+// earlier claims consumed (GET /follow-ups) before the first dispatch.
+describe("SteeringChannel.seedOperatorConstraints (issue #1660)", () => {
+  const withId = (id: number, kind: UserInput["kind"], body: string | null): UserInput => ({ id, kind, body });
+
+  it("seeds consumed follow-ups ahead of live ones, follow_up only, blanks skipped, in server (id) order", async () => {
+    const { ch } = makeChannel([[withId(20, "follow_up", "live")]]);
+    ch.seedOperatorConstraints([
+      withId(4, "follow_up", "earlier"),
+      withId(9, "follow_up", " later "),
+      withId(6, "revise_plan", "not a constraint"),
+      withId(7, "follow_up", "   "),
+      withId(8, "follow_up", null),
+    ]);
+    assert.deepStrictEqual(ch.operatorConstraints(), ["earlier", "later"]);
+    ch.start();
+    try {
+      await tick();
+      assert.deepStrictEqual(ch.operatorConstraints(), ["earlier", "later", "live"]);
+      // Seeded constraints are NOT re-delivered to the lead: its FIFO holds only the live one.
+      assert.strictEqual(ch.pullFollowUp(), "live");
+      assert.strictEqual(ch.pullFollowUp(), undefined);
+    } finally {
+      await ch.stop();
+    }
+  });
+
+  it("de-duplicates by input id between the seed and the live drain", async () => {
+    const { ch } = makeChannel([[withId(5, "follow_up", "same row")]]);
+    ch.seedOperatorConstraints([withId(5, "follow_up", "same row"), withId(5, "follow_up", "same row")]);
+    ch.start();
+    try {
+      await tick();
+      assert.deepStrictEqual(ch.operatorConstraints(), ["same row"]);
+      assert.strictEqual(ch.pullFollowUp(), "same row", "the lead still gets the live delivery");
+    } finally {
+      await ch.stop();
+    }
+  });
+});
+
+// Issue #1660: a claim whose earlier constraints could not be reloaded must not dispatch
+// subagents without them: the channel reports them unavailable (null) until the run is retried.
+describe("SteeringChannel.markOperatorConstraintsUnavailable (issue #1660)", () => {
+  it("reports null, even after follow-ups arrive live", async () => {
+    const { ch } = makeChannel([[inp("follow_up", "live")]]);
+    ch.markOperatorConstraintsUnavailable();
+    assert.strictEqual(ch.operatorConstraints(), null);
+    ch.start();
+    try {
+      await tick();
+      assert.strictEqual(ch.operatorConstraints(), null);
+      assert.strictEqual(ch.pullFollowUp(), "live", "the lead's delivery is unaffected");
+    } finally {
+      await ch.stop();
+    }
+  });
+});
+
+// Issue #1660 (PR #1667 review): /inputs is consume-on-read, so a poll whose reply is lost after
+// the server committed the consume drops that follow-up for the rest of the claim. After ANY poll
+// error the channel reports "reconciling" (the Agent guard denies dispatches), and the next poll
+// first re-reads /follow-ups and merges by id, delivering a recovered follow-up to the lead once.
+describe("SteeringChannel reconciles after a failed poll (issue #1660)", () => {
+  const RULE = "never execute a string containing kill; screen strings only";
+  const dispatchWith = async (ch: SteeringChannel) => {
+    const hook = buildAgentGuardHook(["reviewer"], nullLogger(), () => ch.operatorConstraints());
+    return (await hook({
+      session_id: "s",
+      transcript_path: "/t",
+      cwd: "/w",
+      hook_event_name: "PreToolUse",
+      tool_name: NESTED_AGENT_TOOL,
+      tool_input: { subagent_type: "reviewer", prompt: "review HEAD" },
+      tool_use_id: "tu",
+    } as HookInput)) as {
+      hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string; updatedInput?: { prompt?: string } };
+    };
+  };
+  const until = async (cond: () => boolean, ms = 2_000): Promise<void> => {
+    const deadline = Date.now() + ms;
+    while (!cond() && Date.now() < deadline) await tick(2);
+    assert.ok(cond(), "condition reached");
+  };
+
+  it("denies while pending, then recovers the lost follow-up for dispatches and the lead, once", async () => {
+    // Poll 1: live follow-up 3 arrives. Poll 2: the server consumes 7 but the reply is lost.
+    // The /follow-ups read is held until the test releases it, to observe the pending window.
+    let polls = 0;
+    let reads = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const client = {
+      getInputs: async () => {
+        polls++;
+        if (polls === 1) return { inputs: [{ id: 3, kind: "follow_up", body: "live one" }] };
+        if (polls === 2) throw new Error("socket hang up after commit");
+        return { inputs: [] };
+      },
+      getConsumedFollowUps: async () => {
+        reads++;
+        await gate;
+        return [
+          { id: 3, kind: "follow_up", body: "live one" },
+          { id: 7, kind: "follow_up", body: RULE },
+        ];
+      },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      await until(() => reads === 1);
+      const pending = await dispatchWith(ch);
+      assert.strictEqual(pending.hookSpecificOutput?.permissionDecision, "deny", "denied while reconciling");
+      assert.match(pending.hookSpecificOutput?.permissionDecisionReason ?? "", /operator constraints are being reconciled; retry/);
+
+      release();
+      await until(() => Array.isArray(ch.operatorConstraints()));
+      assert.deepStrictEqual(ch.operatorConstraints(), ["live one", RULE], "merged by id, no duplicate");
+      const after = await dispatchWith(ch);
+      assert.ok(after.hookSpecificOutput?.updatedInput?.prompt?.includes(RULE), "a later dispatch carries it");
+
+      // The lead gets the live one and the recovered one, each exactly once.
+      await tick(20);
+      assert.strictEqual(ch.pullFollowUp(), "live one");
+      assert.strictEqual(ch.pullFollowUp(), RULE);
+      assert.strictEqual(ch.pullFollowUp(), undefined);
+    } finally {
+      release();
+      await ch.stop();
+    }
+  });
+
+  it("stays denied while the reconcile read itself fails, and does not re-deliver on a second reconcile", async () => {
+    let polls = 0;
+    let reads = 0;
+    const client = {
+      getInputs: async () => {
+        polls++;
+        if (polls === 1 || polls === 3) throw new Error("lost reply");
+        return { inputs: [] };
+      },
+      getConsumedFollowUps: async () => {
+        reads++;
+        if (reads === 1) throw new Error("follow-ups read failed");
+        return [{ id: 7, kind: "follow_up", body: RULE }];
+      },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      await until(() => reads === 1);
+      assert.strictEqual(ch.operatorConstraints(), "reconciling", "a failed reconcile read keeps it pending");
+      await until(() => reads >= 3 && Array.isArray(ch.operatorConstraints()));
+      assert.deepStrictEqual(ch.operatorConstraints(), [RULE]);
+      assert.strictEqual(ch.pullFollowUp(), RULE);
+      assert.strictEqual(ch.pullFollowUp(), undefined, "the second reconcile does not re-deliver");
+    } finally {
+      await ch.stop();
+    }
+  });
+});
+
+// Issue #1660 (PR #1667 review): the reconcile read runs in the background, single-flight. A
+// stalled /follow-ups read must never delay the /inputs poll that carries cancel, stop and the
+// plan verdicts; the dispatch denial simply stays until the read succeeds.
+describe("SteeringChannel reconcile never blocks /inputs (issue #1660)", () => {
+  it("delivers a cancel on the next poll while the reconcile read is stalled, with one read in flight", async () => {
+    let polls = 0;
+    let reads = 0;
+    const client = {
+      getInputs: async () => {
+        polls++;
+        if (polls === 1) throw new Error("lost reply");
+        if (polls === 2) return { inputs: [inp("cancel")] };
+        return { inputs: [] };
+      },
+      // Stalls forever, like a read hanging until the HTTP timeout.
+      getConsumedFollowUps: () => {
+        reads++;
+        return new Promise<never>(() => {});
+      },
+    } as unknown as WorkerClient;
+    const cancel = new AbortController();
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
+    ch.start();
+    try {
+      const verdict = await Promise.race([
+        ch.awaitVerdict(),
+        new Promise<"blocked">((r) => setTimeout(() => r("blocked"), 1_000)),
+      ]);
+      assert.deepStrictEqual(verdict, { kind: "cancel" }, "the cancel is not held behind the stalled read");
+      assert.strictEqual(cancel.signal.aborted, true);
+      await tick(20);
+      assert.ok(polls > 3, `the /inputs poll keeps running (polls=${polls})`);
+      assert.strictEqual(reads, 1, "single-flight: one read in flight, not one per poll");
+      assert.strictEqual(ch.operatorConstraints(), "reconciling", "dispatches stay denied until the read succeeds");
+    } finally {
+      await ch.stop();
+    }
+  });
+});
+
+// Issue #1660 (PR #1667 review): a reconcile read can overlap a successful /inputs poll, and
+// both responses can carry the same newly consumed follow-up. Whichever path lands first, the
+// lead gets it once and the constraints hold it once (one id-keyed record both paths check).
+describe("SteeringChannel dedups a follow-up seen by both reconcile and /inputs (issue #1660)", () => {
+  it("reconcile first, then the same id live: the lead gets it once, the constraints hold it once", async () => {
+    const RULE = "screen strings only";
+    let polls = 0;
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((r) => (releaseRead = r));
+    let releasePoll!: () => void;
+    const pollGate = new Promise<void>((r) => (releasePoll = r));
+    const client = {
+      getInputs: async () => {
+        polls++;
+        if (polls === 1) throw new Error("lost reply");
+        // Poll 2 carries id 9, but its reply lands only after the reconcile read has merged it.
+        if (polls === 2) {
+          await pollGate;
+          return { inputs: [{ id: 9, kind: "follow_up", body: RULE }] };
+        }
+        return { inputs: [] };
+      },
+      getConsumedFollowUps: async () => {
+        await readGate;
+        return [{ id: 9, kind: "follow_up", body: RULE }];
+      },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      while (polls < 2) await tick(2);
+      releaseRead();
+      await tick(20);
+      assert.deepStrictEqual(ch.operatorConstraints(), [RULE], "reconcile merged it first");
+      releasePoll();
+      await tick(20);
+      assert.deepStrictEqual(ch.operatorConstraints(), [RULE], "the live copy is not added twice");
+      assert.strictEqual(ch.pullFollowUp(), RULE);
+      assert.strictEqual(ch.pullFollowUp(), undefined, "the lead gets it exactly once");
+    } finally {
+      releaseRead();
+      releasePoll();
+      await ch.stop();
+    }
   });
 });

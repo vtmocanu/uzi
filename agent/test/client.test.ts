@@ -563,6 +563,45 @@ describe("getInputs return shape (PRD #1247 M5)", () => {
   });
 });
 
+// Issue #1660: the worker rehydrates its operator constraints from the run's already-consumed
+// follow-ups on every claim; the read consumes nothing.
+describe("getConsumedFollowUps (issue #1660)", () => {
+  it("returns the follow-ups earlier /inputs polls drained, oldest first, and drains nothing", async () => {
+    api.setInputs("run-fu", [
+      { id: 3, kind: "follow_up", body: "first" },
+      { id: 4, kind: "approve_plan", body: null },
+      { id: 5, kind: "follow_up", body: "second" },
+    ]);
+    const client = newClient();
+    assert.deepStrictEqual(await client.getConsumedFollowUps("run-fu"), [], "nothing consumed yet");
+    await client.getInputs("run-fu");
+    const got = await client.getConsumedFollowUps("run-fu");
+    assert.deepStrictEqual(got.map((i) => [i.id, i.kind, i.body]), [
+      [3, "follow_up", "first"],
+      [5, "follow_up", "second"],
+    ]);
+    assert.deepStrictEqual(await client.getConsumedFollowUps("run-fu"), got, "a read is repeatable");
+  });
+
+  it("treats a 200 without an inputs array as an error, never as no follow-ups", async () => {
+    const client = newClient();
+    for (const body of [
+      {},
+      { inputs: null },
+      { inputs: "x" },
+      { inputs: {} },
+      // Every row is validated, not just the array.
+      { inputs: [{ id: 1, kind: "follow_up", body: "ok" }, { id: 2, kind: "follow_up", body: 42 }] },
+      { inputs: [{ id: "3", kind: "follow_up", body: "ok" }] },
+      { inputs: [{ id: 4, kind: "follow_up", body: "ok" }, null] },
+      { inputs: [{ id: 1.5, kind: "follow_up", body: "ok" }] },
+    ]) {
+      api.overrideFollowUps("run-fu-bad", 200, body);
+      await assert.rejects(client.getConsumedFollowUps("run-fu-bad"), /inputs/, JSON.stringify(body));
+    }
+  });
+});
+
 describe("MessageBatcher seq numbering", () => {
   it("continues gapless numbering from last_seq across flushes", async () => {
     const client = newClient();

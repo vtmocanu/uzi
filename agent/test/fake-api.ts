@@ -39,6 +39,14 @@ export class FakeApi {
   // --- control -------------------------------------------------------------
   private readonly claimQueue: ClaimResponse[] = [];
   private readonly inputsByRun = new Map<string, UserInput[]>();
+  // Issue #1660: the follow_up inputs /inputs has already drained, per run, oldest first — what
+  // the real server's GET /runs/{id}/follow-ups (ListConsumedFollowUpInputsForRun) returns.
+  private readonly consumedFollowUpsByRun = new Map<string, UserInput[]>();
+  /** Issue #1660: the number of GET /runs/{id}/follow-ups reads, per run. */
+  readonly followUpReads = new Map<string, number>();
+  /** Issue #1660: a raw (status, body) answer for GET /runs/{id}/follow-ups, overriding the
+   *  drained-follow-ups default, so a test can model a persistent failure or a malformed 200. */
+  private readonly followUpsOverride = new Map<string, { status: number; body: unknown }[]>();
   private stateFailRemaining = 0;
   private stateFailStatus = 503;
   // PRD #1247 fix round E: model an rc.5-shaped api that strict-decodes the unknown
@@ -336,6 +344,17 @@ export class FakeApi {
     });
   }
 
+  /** Issue #1660: answer GET /runs/{id}/follow-ups with this status and body on every read. */
+  overrideFollowUps(runId: string, status: number, body: unknown): void {
+    this.followUpsOverride.set(runId, [{ status, body }]);
+  }
+
+  /** Issue #1660: answer successive GET /runs/{id}/follow-ups reads with these responses in
+   *  order; the last one repeats. */
+  overrideFollowUpsSequence(runId: string, responses: { status: number; body: unknown }[]): void {
+    this.followUpsOverride.set(runId, [...responses]);
+  }
+
   setInputs(runId: string, inputs: UserInput[]): void {
     this.inputsByRun.set(runId, inputs);
   }
@@ -603,8 +622,24 @@ export class FakeApi {
         // then clears the pending inputs; there is no separate ack).
         const pending = this.inputsByRun.get(runId) ?? [];
         this.inputsByRun.set(runId, []);
+        const consumed = this.consumedFollowUpsByRun.get(runId) ?? [];
+        consumed.push(...pending.filter((i) => i.kind === "follow_up"));
+        this.consumedFollowUpsByRun.set(runId, consumed);
         return send(res, 200, { inputs: pending });
       }
+    }
+
+    // Issue #1660: the read-only rehydrate of a run's already-consumed follow-ups.
+    const followUpsMatch = /^\/api\/worker\/runs\/([^/]+)\/follow-ups$/.exec(p);
+    if (req.method === "GET" && followUpsMatch) {
+      const runId = followUpsMatch[1] as string;
+      this.followUpReads.set(runId, (this.followUpReads.get(runId) ?? 0) + 1);
+      const queue = this.followUpsOverride.get(runId);
+      if (queue && queue.length > 0) {
+        const next = queue.length > 1 ? queue.shift()! : queue[0]!;
+        return send(res, next.status, next.body);
+      }
+      return send(res, 200, { inputs: this.consumedFollowUpsByRun.get(runId) ?? [] });
     }
 
     // issue #559 M3: the read-only ownership probe. Not part of the runMatch

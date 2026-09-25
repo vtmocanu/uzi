@@ -1078,6 +1078,10 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Post("/runs/{id}/messages", h.WorkerRunMessages)
 		r.Post("/runs/{id}/state", h.WorkerRunState)
 		r.Get("/runs/{id}/inputs", h.WorkerRunInputs)
+		// Issue #1660: the run's already-consumed follow-ups, READ ONLY, run-scoped via
+		// GetRunOwnedByWorker. The worker rehydrates its operator constraints from it on
+		// every claim so a follow-up survives into the subagents of a later claim.
+		r.Get("/runs/{id}/follow-ups", h.WorkerRunFollowUps)
 
 		// Completion interlock (PRD #1226 M2): the permit-issue and same-lead attempt
 		// endpoints. Both inherit RequireWorker, derive (run, owner) from the OWNED run

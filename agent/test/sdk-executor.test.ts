@@ -12,7 +12,12 @@ import type { AgentTemplate, ClaimSkill, Milestone, MilestoneAgent, MilestonePro
 import type { JsDepsResult } from "../src/js-deps.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { FINDINGS_SERVER_NAME, reportIncidentalIssueToolName } from "../src/findings-tools.js";
-import { FINDINGS_NUDGE_APPEND, SECRET_FIXTURE_HYGIENE_APPEND, WORKER_RUNTIME_APPEND } from "../src/prompt.js";
+import {
+  FINDINGS_NUDGE_APPEND,
+  SECRET_FIXTURE_HYGIENE_APPEND,
+  SUBAGENT_SAFETY_APPEND,
+  WORKER_RUNTIME_APPEND,
+} from "../src/prompt.js";
 import type { WorkerClient } from "../src/client.js";
 import type {
   SummaryRunner,
@@ -54,7 +59,7 @@ const FAKE_JOIN_TOKEN = "dummy-join-token-do-not-scan-2222";
 // the discovery nudge to every subagent prompt. Reference the helper, not a literal.
 const FINDINGS_TOOL = reportIncidentalIssueToolName();
 const withNudge = (body: string) =>
-  `${body}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}`;
+  `${body}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`;
 
 const coder: AgentTemplate = { name: "coder", description: "writes code", prompt_body: "You implement.", tools: ["Read", "Edit", "Write", "Bash"] };
 const reviewer: AgentTemplate = { name: "reviewer", description: "reviews", prompt_body: "You review.", tools: ["Read", "Grep"] };
@@ -1730,6 +1735,48 @@ describe("SdkExecutor guardrail options", () => {
       (allowed as { hookSpecificOutput?: { updatedInput?: Record<string, unknown> } }).hookSpecificOutput?.updatedInput?.run_in_background,
       false,
     );
+  });
+
+  it("issue #1660: the Agent guard attaches the run's operator constraints on every turn's roster", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const received: string[] = [];
+    const probe = makeCtx({ agents: [lead, coder, reviewer], operatorConstraints: () => received });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(turns.length >= 2, "plan and implement turns ran");
+    for (const [i, turn] of turns.entries()) {
+      const agentHook = turn.options.hooks!.PreToolUse![2]!.hooks[0]!;
+      const promptOf = async (): Promise<unknown> =>
+        (
+          (await agentHook(
+            { hook_event_name: "PreToolUse", tool_name: "Agent", tool_input: { subagent_type: "reviewer", prompt: "review" } } as unknown as HookInput,
+            "tu",
+            { signal: new AbortController().signal },
+          )) as { hookSpecificOutput?: { updatedInput?: Record<string, unknown> } }
+        ).hookSpecificOutput?.updatedInput?.prompt;
+      received.length = 0;
+      assert.strictEqual(await promptOf(), "review", `turn ${i}: no constraint yet`);
+      received.push("operator rule");
+      assert.ok(String(await promptOf()).includes("operator rule"), `turn ${i}: constraint read at dispatch time`);
+    }
+  });
+
+  it("issue #1660: an unavailable constraint set (null) reaches the Agent guard, which denies", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer], operatorConstraints: () => null });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    const agentHook = turns[0]!.options.hooks!.PreToolUse![2]!.hooks[0]!;
+    const out = (await agentHook(
+      { hook_event_name: "PreToolUse", tool_name: "Agent", tool_input: { subagent_type: "reviewer", prompt: "review" } } as unknown as HookInput,
+      "tu",
+      { signal: new AbortController().signal },
+    )) as { hookSpecificOutput?: { permissionDecision?: string } };
+    assert.strictEqual(out.hookSpecificOutput?.permissionDecision, "deny");
   });
 
   it("hands the SDK a sparse env with no worker secrets (every turn)", async () => {

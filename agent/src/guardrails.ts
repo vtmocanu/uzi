@@ -105,6 +105,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { HookInput, HookJSONOutput } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "./log.js";
+import { buildOperatorConstraintsBlock, OPERATOR_CONSTRAINTS_MAX_CHARS } from "./prompt.js";
 
 /**
  * The subagent-invocation tool. Blocking it on each mapped subagent (see
@@ -209,6 +210,14 @@ const REASON_SCREEN_ERROR = "denied by guardrail: command screening failed; refu
 const REASON_OUTSIDE_WORKTREE = "denied by guardrail: file access outside the run worktree is not permitted";
 const REASON_DOTGIT = "denied by guardrail: accessing the .git directory is not permitted";
 const REASON_UNKNOWN_SUBAGENT = "denied by guardrail: only the run's assembled subagents may be invoked";
+const REASON_CONSTRAINTS_UNATTACHABLE =
+  "denied by guardrail: this dispatch has no text prompt to carry the run's operator constraints";
+const REASON_CONSTRAINTS_UNAVAILABLE =
+  "denied by guardrail: operator constraints could not be loaded; retry the run";
+const REASON_CONSTRAINTS_RECONCILING =
+  "denied by guardrail: operator constraints are being reconciled; retry";
+const REASON_CONSTRAINTS_TOO_LARGE =
+  "denied by guardrail: the run's operator constraints are too large to attach to a subagent; shorten or consolidate them";
 
 const MAX_DEPTH = 6;
 
@@ -1245,6 +1254,17 @@ function subagentTypeOf(toolInput: unknown): string | undefined {
  *     subagent synchronously makes it complete IN-TURN, before the turn-end reap,
  *     so delegation works AND B1 stays closed (no survivor into the PAT push).
  *
+ *  3. for an ALLOWED subagent, appends the run's operator constraints (issue #1660):
+ *     every follow-up received so far, read from `operatorConstraints` AT DISPATCH TIME,
+ *     so a dispatch before a follow-up never carries it and every one after does. The
+ *     lead's own <follow_up> delivery is unchanged; this is the structural copy it could
+ *     not be relied on to relay. Rendered by buildOperatorConstraintsBlock (nonce-fenced,
+ *     size-capped); an already-synchronous call is rewritten too when there is a block.
+ *     It DENIES rather than dispatch without them: when they could not be loaded this claim
+ *     (the provider returns null), while a failed poll is being reconciled ("reconciling"),
+ *     when the block exceeds OPERATOR_CONSTRAINTS_MAX_CHARS, or
+ *     when the call's `prompt` is not a string.
+ *
  * The lead keeps the Agent tool to delegate to the allowed roles; every subagent
  * already carries `disallowedTools:['Agent']`, so this hook only ever sees the
  * lead's calls.
@@ -1252,6 +1272,7 @@ function subagentTypeOf(toolInput: unknown): string | undefined {
 export function buildAgentGuardHook(
   allowed: Iterable<string>,
   log: Logger,
+  operatorConstraints: () => readonly string[] | null | "reconciling" = () => [],
 ): (input: HookInput) => Promise<HookJSONOutput> {
   const allowSet = new Set(allowed);
   return async (input: HookInput): Promise<HookJSONOutput> => {
@@ -1267,16 +1288,47 @@ export function buildAgentGuardHook(
         },
       };
     }
-    // Allowed subagent: force synchronous delegation. Already-synchronous calls
-    // pass through untouched.
+    // Allowed subagent: force synchronous delegation and attach the operator
+    // constraints. An already-synchronous call with no constraints passes through untouched.
     const original = input.tool_input && typeof input.tool_input === "object"
       ? (input.tool_input as Record<string, unknown>)
       : {};
-    if (original["run_in_background"] === false) return {};
+    const prompt = original["prompt"];
+    // Fail closed on every way the constraints could go missing: not loaded this claim (null),
+    // no text prompt to carry them, or a block over the hard ceiling. Never dispatch without.
+    const loaded = operatorConstraints();
+    const constraints = loaded === null || loaded === "reconciling" ? "" : buildOperatorConstraintsBlock(loaded);
+    const refusal =
+      loaded === null
+        ? REASON_CONSTRAINTS_UNAVAILABLE
+        : loaded === "reconciling"
+          ? REASON_CONSTRAINTS_RECONCILING
+          : constraints.length > OPERATOR_CONSTRAINTS_MAX_CHARS
+          ? REASON_CONSTRAINTS_TOO_LARGE
+          : constraints !== "" && typeof prompt !== "string"
+            ? REASON_CONSTRAINTS_UNATTACHABLE
+            : undefined;
+    if (refusal !== undefined) {
+      log.warn("guardrail denied a subagent dispatch over operator constraints", { subagent_type: sub, reason: refusal });
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: refusal,
+        },
+      };
+    }
+    if (original["run_in_background"] === false && constraints === "") return {};
+    const updatedInput: Record<string, unknown> = { ...original, run_in_background: false };
+    if (constraints !== "") {
+      updatedInput["prompt"] = `${prompt as string}\n\n${constraints}`;
+      // Never the text: it is the operator's, and logs are not its audience.
+      log.debug("guardrail attached operator constraints to a subagent dispatch", { subagent_type: sub });
+    }
     return {
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
-        updatedInput: { ...original, run_in_background: false },
+        updatedInput,
       },
     };
   };

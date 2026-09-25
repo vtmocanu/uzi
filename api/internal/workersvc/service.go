@@ -1045,6 +1045,9 @@ type Store interface {
 	// SetRunRunning's resume guard compares it in SQL.
 	CreateRunAnswerInput(ctx context.Context, arg store.CreateRunAnswerInputParams) (store.RunUserInput, error)
 	ConsumeRunInputs(ctx context.Context, runID uuid.UUID) ([]store.ConsumeRunInputsRow, error)
+	// ListConsumedFollowUpInputsForRun reads the run's already-consumed follow_up inputs,
+	// oldest first (issue #1660): the worker's operator-constraint rehydrate on every claim.
+	ListConsumedFollowUpInputsForRun(ctx context.Context, runID uuid.UUID) ([]store.ListConsumedFollowUpInputsForRunRow, error)
 
 	// Agent memory (PRD #90): the worker-facing write/read of the per-(user,repo)
 	// cross-run store. Identity is derived from the run claim, never the body; the
@@ -4262,6 +4265,28 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 		s.bcast.PublishInput(runID)
 	}
 	return ConsumeInputsResult{Inputs: out}, nil
+}
+
+// ConsumedFollowUps returns the already-consumed follow_up inputs of a run the worker owns,
+// oldest first, as the same InputDTO shape ConsumeInputs returns (issue #1660). READ ONLY: it
+// consumes nothing and broadcasts nothing. The worker calls it on every claim, first and
+// re-claim, to rehydrate the run's operator constraints before any subagent dispatch, so a
+// follow-up a previous claim consumed is never lost to the subagents a later claim runs.
+// Pending follow-ups are not returned; the live /inputs drain delivers them, and the worker
+// de-duplicates the two sources by id.
+func (s *Service) ConsumedFollowUps(ctx context.Context, wkr store.Worker, runID uuid.UUID) ([]InputDTO, error) {
+	if _, err := s.runOwnedByWorker(ctx, runID, wkr); err != nil {
+		return nil, err
+	}
+	rows, err := s.q.ListConsumedFollowUpInputsForRun(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]InputDTO, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, InputDTO{ID: row.ID, Kind: "follow_up", Body: textPtr(row.Body), CreatedAt: row.CreatedAt.Time})
+	}
+	return out, nil
 }
 
 // SaveMemory persists one cross-run memory entry for the run's (user, repo), the

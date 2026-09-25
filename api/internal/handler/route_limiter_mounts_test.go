@@ -67,10 +67,13 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 202 as of this commit (PRD #1650 M2 retired the notifications inbox read path: GET
+// 203 as of this commit. PRD #1650 M2 retired the notifications inbox read path (GET
 // /api/notifications/, GET /api/notifications/unread_count and POST
 // /api/notifications/{id}/read were removed, all three noLimiter; the removal is pinned by
-// TestNotificationsInboxRoutesAreGone).
+// TestNotificationsInboxRoutesAreGone). Issue #1660 added GET /api/worker/runs/{id}/follow-ups,
+// the worker-authenticated, run-scoped read of the run's already-consumed follow-ups a worker
+// rehydrates its operator constraints from on every claim: noLimiter, like the other worker
+// /runs/{id}/... reads it sits beside (a READ ONLY DB query, no forge call and no token spend).
 // It was 205 until then (issue #1582 M1 added POST
 // /api/worker/runs/{id}/recovery-holds/{holdID}/settle — the worker-authenticated
 // predecessor-hold settle by the api's own forge ancestry proof. Each call can spend the owner's
@@ -440,6 +443,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/worker/chat/runs", noLimiter},
 	{"GET", "/api/worker/chat/runs/{id}", noLimiter},
 	{"GET", "/api/worker/chat/runs/{id}/messages", noLimiter},
+	{"GET", "/api/worker/runs/{id}/follow-ups", noLimiter},
 	{"GET", "/api/worker/runs/{id}/forge/issues", noLimiter},
 	{"GET", "/api/worker/runs/{id}/forge/issues/{iid}", noLimiter},
 	{"GET", "/api/worker/runs/{id}/forge/issues/{iid}/label-events", noLimiter},

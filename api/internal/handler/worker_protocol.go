@@ -1131,6 +1131,33 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, body)
 }
 
+// WorkerRunFollowUps returns the already-consumed follow_up inputs of a run this worker owns,
+// oldest first, as {"inputs": [...]} in the /inputs shape (issue #1660). READ ONLY. The worker
+// reads it on every claim to rehydrate the run's operator constraints, which it attaches to
+// every subagent dispatch. A run this worker does not hold is a 404.
+func (h *Handler) WorkerRunFollowUps(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	inputs, err := h.wsvc.ConsumedFollowUps(r.Context(), wkr, runID)
+	if err != nil {
+		if errors.Is(err, workersvc.ErrRunNotOwned) {
+			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+			return
+		}
+		slog.Error("worker run follow-ups", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"inputs": inputs})
+}
+
 // WorkerRunOwnership returns the current status of a run this worker owns —
 // a lightweight, READ-ONLY ownership/terminality probe (#559). The interactive
 // park-SKIP path uses it to detect a mid-turn reclaim (404) or a terminal
