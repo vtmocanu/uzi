@@ -395,7 +395,16 @@ export class SteeringChannel {
     if (!this.held) return;
     const reason = receiptFenceReason(err);
     if (endsFlight(reason)) return this.endFencedFlight(reason!);
-    if (reason !== undefined || definitiveReceiptError(err)) return this.releaseHeld();
+    if (reason !== undefined || definitiveReceiptError(err)) {
+      // After routing, a definitive refusal (a row-state conflict and the like) means the applied
+      // receipt will never land: fail the waiting reports like a give-up instead of releasing
+      // them unapplied. A pending switch still just drops the batch; its own path releases the claim.
+      if (this.held.phase !== "ack" && reason !== "switch_pending")
+        return this.failReceipts(new InputReceiptError(
+          `the applied receipt for ${this.held.ids.length} routed operator input(s) was refused: ${errMessage(err)}`,
+        ));
+      return this.releaseHeld();
+    }
     if (this.held.phase === "ack") {
       // Nothing is routed yet, so giving up only drops the batch: it blocks no report, but it
       // would block every newer GET. The next GET reads the rows again.
@@ -1247,9 +1256,17 @@ export class SteeringChannel {
       }
       try {
         if (!this.held && !this.stopped) {
-          const { inputs, credentialSwitch } = await this.client.getInputs(this.runId);
+          const { inputs, credentialSwitch, receipts } = await this.client.getInputs(this.runId);
           if (!validBatch(inputs)) throw new Error("invalid input GET response");
-          if (inputs.length) {
+          if (!receipts) {
+            // Issue #1673: no receipt marker, so an older api pod consumed these on read; nothing
+            // replays them. Route them now, in the server's FIFO order, with no ACK or APPLIED.
+            for (const input of inputs) {
+              if (this.routedIds.has(input.id)) continue;
+              this.routedIds.add(input.id);
+              this.route(input.kind, input.body ?? undefined, input.id);
+            }
+          } else if (inputs.length) {
             const batch = inputs.slice(0, MAX_INPUT_BATCH);
             this.held = {
               ids: batch.map((input) => input.id),
@@ -1479,17 +1496,30 @@ export class ChatSteering implements ChatInputSource {
     while (!this.stopped || this.held) {
       if ((this.stopped || this.cancel.signal.aborted) && this.held) {
         // Same bounded drain as SteeringChannel: an unrouted batch is left for the next claim.
-        if (this.held.phase === "ack" || this.stopApplyAttempts >= STOP_APPLY_ATTEMPTS) {
+        if (this.held.phase === "ack") {
           this.held = undefined;
+          break;
+        }
+        if (this.stopApplyAttempts >= STOP_APPLY_ATTEMPTS) {
+          // A routed follow-up is still unapplied: completing the chat would block its replay, so
+          // treat the claim as lost (no terminal report) and let the next claim replay it.
+          this.loseClaim();
           break;
         }
         this.stopApplyAttempts++;
       }
       try {
         if (!this.held && !this.stopped && !this.cancel.signal.aborted) {
-          const { inputs } = await this.client.getInputs(this.runId);
+          const { inputs, receipts } = await this.client.getInputs(this.runId);
           if (!validBatch(inputs)) throw new Error("invalid input GET response");
-          if (inputs.length) this.held = { ids: inputs.slice(0, MAX_INPUT_BATCH).map((input) => input.id), phase: "ack" };
+          if (!receipts) {
+            // Issue #1673: a consume-on-read reply (an older api pod): route now, no receipts.
+            for (const input of inputs) {
+              if (this.routedIds.has(input.id)) continue;
+              this.routedIds.add(input.id);
+              this.route(input.kind, input.body ?? undefined);
+            }
+          } else if (inputs.length) this.held = { ids: inputs.slice(0, MAX_INPUT_BATCH).map((input) => input.id), phase: "ack" };
         }
         if (this.held?.phase === "ack") {
           const receipt = await this.client.ackInputs(this.runId, this.held.ids, this.claimGeneration);
@@ -1510,7 +1540,9 @@ export class ChatSteering implements ChatInputSource {
         } else if (this.held?.phase === "applied") {
           const receipt = await this.client.applyInputs(this.runId, this.held.ids, this.claimGeneration);
           if (!validReceipt(receipt, this.held.ids)) throw new Error("invalid input applied response");
-          // Settled: active, or already applied before the claim was fenced.
+          // Settled. An inactive claim (already applied, then released) is another worker's now:
+          // this chat flight must not report completion.
+          if (!receipt.active) this.loseClaim();
           this.held = undefined;
           this.applyFailures = 0;
         }

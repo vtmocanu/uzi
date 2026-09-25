@@ -875,7 +875,7 @@ describe("ChatSteering", () => {
     let acks = 0;
     let applies = 0;
     const client = {
-      getInputs: async () => { gets++; return { inputs: rows }; },
+      getInputs: async () => { gets++; return { receipts: true, inputs: rows }; },
       ackInputs: async (_run: string, ids: number[], generation: number) => {
         assert.deepStrictEqual(ids, [8, 7]);
         assert.strictEqual(generation, 4);
@@ -903,7 +903,7 @@ describe("ChatSteering", () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const client = {
-      getInputs: async () => { gets++; return { inputs: [row] }; },
+      getInputs: async () => { gets++; return { receipts: true, inputs: [row] }; },
       ackInputs: async () => ({ inputs: [row], active: true }),
       applyInputs: async () => {
         if (++applies === 1) { await gate; throw Error("lost applied reply"); }
@@ -932,7 +932,7 @@ describe("ChatSteering", () => {
     let gets = 0;
     let applies = 0;
     const client = {
-      getInputs: async () => { gets++; return { inputs: rows }; },
+      getInputs: async () => { gets++; return { receipts: true, inputs: rows }; },
       ackInputs: async () => ({ inputs: rows, active: true }),
       applyInputs: async () => { if (++applies === 1) throw Error("lost applied reply"); return { inputs: rows, active: true }; },
     } as unknown as WorkerClient;
@@ -952,7 +952,7 @@ describe("ChatSteering", () => {
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let ackStarted = false;
     const client = {
-      getInputs: async () => { clock = 100; return { inputs: [row] }; },
+      getInputs: async () => { clock = 100; return { receipts: true, inputs: [row] }; },
       ackInputs: async () => { ackStarted = true; await gate; return { inputs: [row], active: true }; },
       applyInputs: async () => ({ inputs: [row], active: true }),
     } as unknown as WorkerClient;
@@ -973,13 +973,57 @@ describe("ChatSteering", () => {
     }
   });
 
+  it("marks the claim lost when stop gives up a routed follow-up's APPLIED, so the chat does not complete", async () => {
+    const row = inp("follow_up", "unapplied");
+    let applies = 0;
+    const client = {
+      getInputs: async () => ({ receipts: true, inputs: [row] }),
+      ackInputs: async () => ({ inputs: [row], active: true }),
+      applyInputs: async () => { applies++; throw new RequestError("POST", "/inputs/applied", 503, "unavailable"); },
+    } as unknown as WorkerClient;
+    const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "message", text: "unapplied" });
+      await ch.stop();
+      assert.ok(applies >= 1);
+      assert.strictEqual(ch.claimLost(), true, "a routed, unapplied follow-up must be replayed by the next claim");
+    } finally {
+      await ch.stop();
+    }
+  });
+
+  it("marks the claim lost when an APPLIED retry reports the claim inactive", async () => {
+    const row = inp("follow_up", "applied then released");
+    let applies = 0;
+    const client = {
+      getInputs: async () => ({ receipts: true, inputs: [row] }),
+      ackInputs: async () => ({ inputs: [row], active: true }),
+      applyInputs: async () => {
+        // The first reply is lost after the commit; the retry sees the claim already released.
+        if (++applies === 1) throw Error("lost applied reply");
+        return { inputs: [row], active: false, reason: "released" };
+      },
+    } as unknown as WorkerClient;
+    const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "message", text: "applied then released" });
+      for (let i = 0; i < 200 && applies < 2; i++) await tick(2);
+      await ch.stop();
+      assert.strictEqual(ch.claimLost(), true);
+    } finally {
+      await ch.stop();
+    }
+  });
+
   it("ends an inactive ACK and a definitive applied 409 without another GET", async () => {
     for (const staleAt of ["ack", "applied"]) {
       const row = inp("follow_up", "stale");
       let gets = 0;
       let applies = 0;
       const client = {
-        getInputs: async () => { gets++; return { inputs: [row] }; },
+        getInputs: async () => { gets++; return { receipts: true, inputs: [row] }; },
         ackInputs: async () => ({ inputs: [row], active: staleAt !== "ack" }),
         applyInputs: async () => { applies++; throw new RequestError("POST", "/inputs/applied", 409, JSON.stringify({ error: "fenced", reason: "stale" })); },
       } as unknown as WorkerClient;
@@ -1137,7 +1181,7 @@ describe("input receipts", () => {
     let acks = 0;
     let applied = 0;
     const client = {
-      getInputs: async () => { gets++; return { inputs: rows }; },
+      getInputs: async () => { gets++; return { receipts: true, inputs: rows }; },
       ackInputs: async (_run: string, ids: number[]) => {
         acks++;
         assert.deepStrictEqual(ids, [8, 7]);
@@ -1167,7 +1211,7 @@ describe("input receipts", () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const client = {
-      getInputs: async () => ({ inputs: [row] }),
+      getInputs: async () => ({ receipts: true, inputs: [row] }),
       ackInputs: async () => ({ inputs: [row], active: true }),
       applyInputs: async () => {
         attempts++;
@@ -1192,7 +1236,7 @@ describe("input receipts", () => {
     let releaseApply!: () => void;
     const applyGate = new Promise<void>((resolve) => { releaseApply = resolve; });
     const client = {
-      getInputs: async () => ({ inputs: rows }),
+      getInputs: async () => ({ receipts: true, inputs: rows }),
       ackInputs: async () => ({ inputs: rows, active: true }),
       applyInputs: async () => { applyCalls++; await applyGate; return { inputs: rows, active: true }; },
     } as unknown as WorkerClient;
@@ -1215,7 +1259,7 @@ describe("input receipts", () => {
     let acks = 0;
     const appliedIds: number[][] = [];
     const client = {
-      getInputs: async () => { gets++; return { inputs: gets === 1 ? rows : [] }; },
+      getInputs: async () => { gets++; return { receipts: true, inputs: gets === 1 ? rows : [] }; },
       ackInputs: async () => { acks++; return { inputs: rows, active: true }; },
       applyInputs: async (_run: string, ids: number[]) => {
         appliedIds.push([...ids]);
@@ -1245,7 +1289,7 @@ describe("input receipts", () => {
     let releaseAck!: () => void;
     const ackGate = new Promise<void>((resolve) => { releaseAck = resolve; });
     const client = {
-      getInputs: async () => { clock = 100; return { inputs: [row] }; },
+      getInputs: async () => { clock = 100; return { receipts: true, inputs: [row] }; },
       ackInputs: async () => {
         ackCalls++;
         if (ackCalls === 1) { await ackGate; throw Error("lost ACK reply"); }
@@ -1278,7 +1322,7 @@ describe("input receipts", () => {
     let acked = 0;
     const cancel = new AbortController();
     const client = {
-      getInputs: async () => { gets++; return { inputs: gets === 1 ? [row] : [] }; },
+      getInputs: async () => { gets++; return { receipts: true, inputs: gets === 1 ? [row] : [] }; },
       ackInputs: async () => { acked++; return { inputs: [row], active: false, reason: "switch_pending" }; },
       applyInputs: async () => { applied++; return { inputs: [row], active: true }; },
     } as unknown as WorkerClient;
@@ -1302,7 +1346,7 @@ describe("input receipts", () => {
     let gets = 0;
     let getsAtRetry = -1;
     const client = {
-      getInputs: async () => { gets++; return { inputs: gets === 1 ? [row] : [] }; },
+      getInputs: async () => { gets++; return { receipts: true, inputs: gets === 1 ? [row] : [] }; },
       ackInputs: async (_run: string, ids: number[]) => {
         assert.deepStrictEqual(ids, [7]);
         acks++;
@@ -1325,7 +1369,7 @@ describe("input receipts", () => {
     }
   });
 
-  it("drops the batch on a definitive applied 409 and never routes a replay of it again", async () => {
+  it("drops the batch on a switch_pending applied 409 and never routes a replay of it again", async () => {
     // A `now` pause fires the interrupt on every route, so a second route of the replayed row is
     // observable (follow-ups are also de-duplicated by the lead queue, so they would not show it).
     const row: UserInput = { id: 7, kind: "pause", body: "now" };
@@ -1335,12 +1379,12 @@ describe("input receipts", () => {
     const client = {
       // The claim is fenced and then reinstated (a failed credential switch): the same unapplied
       // row comes back on a later GET of this claim.
-      getInputs: async () => { gets++; return { inputs: gets === 1 || gets === 3 ? [row] : [] }; },
+      getInputs: async () => { gets++; return { receipts: true, inputs: gets === 1 || gets === 3 ? [row] : [] }; },
       ackInputs: async () => ({ inputs: [row], active: true }),
       applyInputs: async () => {
         attempts++;
-        // A row-state conflict on the active claim (no fence reason): drop the batch, keep going.
-        if (attempts === 1) throw new RequestError("POST", "/inputs/applied", 409, JSON.stringify({ error: "conflict", reason: "" }));
+        // A switch is pending, then fails: the batch is dropped and later replayed on this claim.
+        if (attempts === 1) throw new RequestError("POST", "/inputs/applied", 409, JSON.stringify({ error: "conflict", reason: "switch_pending" }));
         return { inputs: [row], active: true };
       },
     } as unknown as WorkerClient;
@@ -1363,7 +1407,7 @@ describe("input receipts", () => {
         let gets = 0;
         const cancel = new AbortController();
         const client = {
-          getInputs: async () => { gets++; return { inputs: [row] }; },
+          getInputs: async () => { gets++; return { receipts: true, inputs: [row] }; },
           ackInputs: async () => {
             if (via === "409") throw new RequestError("POST", "/inputs/ack", 409, JSON.stringify({ error: "fenced", reason }));
             return { inputs: [row], active: false, reason };
@@ -1393,7 +1437,7 @@ describe("input receipts", () => {
     let acks = 0;
     const cancel = new AbortController();
     const client = {
-      getInputs: async () => ({ inputs: [row] }),
+      getInputs: async () => ({ receipts: true, inputs: [row] }),
       ackInputs: async () => {
         acks++;
         // The first two ACKs race a pending credential switch, which then fails: the claim is active again.
@@ -1418,7 +1462,7 @@ describe("input receipts", () => {
       const row: UserInput = { id: 7, kind, body: kind === "follow_up" ? "seven" : null };
       let applies = 0;
       const client = {
-        getInputs: async () => ({ inputs: [row] }),
+        getInputs: async () => ({ receipts: true, inputs: [row] }),
         ackInputs: async () => ({ inputs: [row], active: true }),
         applyInputs: async () => { applies++; throw new RequestError("POST", "/inputs/applied", 503, "unavailable"); },
       } as unknown as WorkerClient;
@@ -1447,7 +1491,7 @@ describe("input receipts", () => {
       const notFound = (path: string): RequestError => new RequestError("POST", path, 404, "404 page not found");
       const cancel = new AbortController();
       const client = {
-        getInputs: async () => ({ inputs: [row] }),
+        getInputs: async () => ({ receipts: true, inputs: [row] }),
         ackInputs: async () => {
           if (at === "ack" && ++acks <= 2) throw notFound("/inputs/ack");
           return { inputs: [row], active: true };
@@ -1476,7 +1520,7 @@ describe("input receipts", () => {
       const row: UserInput = { id: 7, kind: "follow_up", body: "seven" };
       let applies = 0;
       const client = {
-        getInputs: async () => ({ inputs: [row] }),
+        getInputs: async () => ({ receipts: true, inputs: [row] }),
         ackInputs: async () => ({ inputs: [row], active: true }),
         applyInputs: async () => {
           applies++;
@@ -1505,7 +1549,7 @@ describe("input receipts", () => {
       const row: UserInput = { id: 7, kind: "approve_plan", body: null };
       const cancel = new AbortController();
       const client = {
-        getInputs: async () => ({ inputs: [row] }),
+        getInputs: async () => ({ receipts: true, inputs: [row] }),
         ackInputs: async () => ({ inputs: [row], active: true }),
         // Slow enough that only the abort can end the wait first.
         applyInputs: async () => { await tick(300); return { inputs: [row], active: true }; },
@@ -1542,7 +1586,7 @@ describe("input receipts", () => {
         new RequestError("POST", path, 404, JSON.stringify({ error: "run not found", reason: "stale" }));
       const cancel = new AbortController();
       const client = {
-        getInputs: async () => ({ inputs: [row] }),
+        getInputs: async () => ({ receipts: true, inputs: [row] }),
         ackInputs: async () => {
           if (at === "ack") throw typed("/inputs/ack");
           return { inputs: [row], active: true };
@@ -1567,7 +1611,7 @@ describe("input receipts", () => {
       let gets = 0;
       let acks = 0;
       const client = {
-        getInputs: async () => { gets++; return { inputs: [row] }; },
+        getInputs: async () => { gets++; return { receipts: true, inputs: [row] }; },
         ackInputs: async () => {
           acks++;
           // Attempts: fail fast. Deadline: each attempt takes 20 ms, past a 50 ms deadline.
@@ -1599,7 +1643,7 @@ describe("input receipts", () => {
     let appliedFollowUp = false;
     const cancel = new AbortController();
     const client = {
-      getInputs: async () => { gets++; return { inputs: gets === 1 ? [pause] : gets === 2 ? [followUp] : [] }; },
+      getInputs: async () => { gets++; return { receipts: true, inputs: gets === 1 ? [pause] : gets === 2 ? [followUp] : [] }; },
       ackInputs: async (_run: string, ids: number[]) => ({ inputs: ids[0] === 7 ? [pause] : [followUp], active: true }),
       applyInputs: async (_run: string, ids: number[]) => {
         if (ids[0] === 8) { await tick(150); appliedFollowUp = true; }
@@ -1628,8 +1672,8 @@ describe("input receipts", () => {
     const client = {
       getInputs: async () => {
         gets++;
-        if (gets === 1) return { inputs: [], credentialSwitch: { generation: 3 } };
-        return { inputs: gets === 3 ? [followUp] : [] };
+        if (gets === 1) return { receipts: true, inputs: [], credentialSwitch: { generation: 3 } };
+        return { receipts: true, inputs: gets === 3 ? [followUp] : [] };
       },
       ackInputs: async () => ({ inputs: [followUp], active: true }),
       applyInputs: async () => { await tick(150); appliedFollowUp = true; return { inputs: [followUp], active: true }; },
@@ -1648,11 +1692,58 @@ describe("input receipts", () => {
     }
   });
 
+  it("rejects a waiting report when APPLIED is refused with a definitive 4xx after routing", async () => {
+    for (const refusal of [
+      new RequestError("POST", "/inputs/applied", 409, JSON.stringify({ error: "conflict", reason: "" })),
+      new RequestError("POST", "/inputs/applied", 400, "invalid input ids"),
+    ]) {
+      const row: UserInput = { id: 7, kind: "follow_up", body: "seven" };
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const client = {
+        getInputs: async () => ({ receipts: true, inputs: [row] }),
+        ackInputs: async () => ({ inputs: [row], active: true }),
+        applyInputs: async () => { await gate; throw refusal; },
+      } as unknown as WorkerClient;
+      const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+      ch.start();
+      try {
+        assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "seven" });
+        await tick();
+        const waiting = ch.awaitReceiptSettlement();
+        release();
+        await assert.rejects(waiting, (err: Error) => err.name === "InputReceiptError", `status ${refusal.status}`);
+      } finally {
+        release();
+        await ch.stop();
+      }
+    }
+  });
+
+  it("routes a GET reply without the receipts marker at once, with no ACK or APPLIED (an older api pod)", async () => {
+    const rows: UserInput[] = [{ id: 7, kind: "approve_plan", body: null }, { id: 8, kind: "follow_up", body: "eight" }];
+    let gets = 0;
+    const client = {
+      getInputs: async () => { gets++; return { inputs: gets === 1 ? rows : [] }; },
+      ackInputs: async () => { throw Error("a consume-on-read reply must not be ACKed"); },
+      applyInputs: async () => { throw Error("a consume-on-read reply must not be applied"); },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      assert.deepStrictEqual(await ch.awaitVerdict(), { kind: "approve", selection: { status: "absent" } });
+      assert.strictEqual(ch.pullFollowUp(), "eight");
+      await ch.awaitReceiptSettlement();
+    } finally {
+      await ch.stop();
+    }
+  });
+
   it("gives up a routed receipt after a bounded number of applied attempts at stop", async () => {
     const row: UserInput = { id: 7, kind: "approve_plan", body: null };
     let attempts = 0;
     const client = {
-      getInputs: async () => ({ inputs: [row] }),
+      getInputs: async () => ({ receipts: true, inputs: [row] }),
       ackInputs: async () => ({ inputs: [row], active: true }),
       applyInputs: async () => { attempts++; throw Error("api down"); },
     } as unknown as WorkerClient;
@@ -1673,7 +1764,7 @@ describe("input receipts", () => {
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let appliedDone = false;
     const client = {
-      getInputs: async () => ({ inputs: [row] }),
+      getInputs: async () => ({ receipts: true, inputs: [row] }),
       ackInputs: async () => ({ inputs: [row], active: true }),
       applyInputs: async () => { await gate; appliedDone = true; return { inputs: [row], active: true }; },
     } as unknown as WorkerClient;

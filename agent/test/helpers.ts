@@ -71,7 +71,7 @@ export function withReceipts(client: WorkerClient): WorkerClient {
     getInputs: async (runId: string) => {
       const result = await getInputs(runId);
       latest = result.inputs;
-      return result;
+      return { ...result, receipts: true };
     },
     ackInputs: async (_runId: string, ids: number[]) => ({
       inputs: latest.filter((row) => ids.includes(row.id)).sort((a, b) => a.id - b.id),

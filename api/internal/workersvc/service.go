@@ -4210,6 +4210,10 @@ type InputDTO struct {
 type ConsumeInputsResult struct {
 	Inputs           []InputDTO
 	CredentialSwitch *CredentialSwitchSignal
+	// Receipts marks a read-only replay a receipt-capable worker must ACK and apply (issue
+	// #1673). Absent, the reply was consumed on read: an older api pod mid-roll, or a legacy
+	// worker, and the worker routes it with no receipts.
+	Receipts bool
 }
 
 // ConsumeInputs returns steering inputs for a run the worker owns, FIFO.
@@ -4256,7 +4260,7 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 		for _, row := range rows {
 			out = append(out, InputDTO{ID: row.ID, Kind: row.Kind, Body: textPtr(row.Body), CreatedAt: row.CreatedAt.Time})
 		}
-		return ConsumeInputsResult{Inputs: out}, nil
+		return ConsumeInputsResult{Inputs: out, Receipts: true}, nil
 	}
 	rows, err := s.q.ConsumeRunInputs(ctx, runID)
 	if err != nil {

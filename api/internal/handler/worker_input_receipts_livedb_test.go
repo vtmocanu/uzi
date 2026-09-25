@@ -111,6 +111,10 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 		if got := len(out["inputs"].([]any)); got != want {
 			t.Fatalf("GET inputs=%d want %d", got, want)
 		}
+		// A receipt-capable worker's read-only reply declares receipt mode.
+		if out["receipts"] != true {
+			t.Fatalf("GET for a receipt-capable worker lacks receipts:true: %v", out)
+		}
 	}
 	get(wkr, 3)
 	get(wkr, 3) // lost GET reply is safe to repeat before ACK
@@ -296,6 +300,9 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := call("GET", "/inputs", "", legacyWkr, 200)
+	if _, marked := out["receipts"]; marked {
+		t.Fatalf("a consume-on-read reply must not claim receipt mode: %v", out)
+	}
 	inputs := out["inputs"].([]any)
 	if len(inputs) != 2 || int64(inputs[0].(map[string]any)["id"].(float64)) != switched ||
 		int64(inputs[1].(map[string]any)["id"].(float64)) != freshLegacy {

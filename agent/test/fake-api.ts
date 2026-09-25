@@ -50,6 +50,8 @@ export class FakeApi {
   /** Issue #1673: receipt tests set this so a receipt for a run with no explicit claim
    *  generation fails loudly instead of being accepted as the only claim. */
   strictReceiptGenerations = false;
+  /** Issue #1673: answer GET /inputs like an older api pod: consume on read, no receipt marker. */
+  legacyConsumeOnRead = false;
   private nextSyntheticInputId = 1_000_000;
   readonly inputReceiptCalls: Array<{ runId: string; kind: "ack" | "applied"; ids: number[]; generation: number }> = [];
   /** Receipts answered 200, in reply order (a delayed reply lands here only once it is sent). */
@@ -723,7 +725,14 @@ export class FakeApi {
       if (req.method === "GET" && kind === "inputs") {
         const rows = this.inputsByRun.get(runId) ?? [];
         const applied = this.appliedByRun.get(runId) ?? new Set<number>();
-        return send(res, 200, { inputs: rows.filter((row) => !applied.has(row.id)).sort((a, b) => a.id - b.id) });
+        const pending = rows.filter((row) => !applied.has(row.id)).sort((a, b) => a.id - b.id);
+        if (this.legacyConsumeOnRead) {
+          // An older api pod: consume on read (mark applied now) and send no receipt marker.
+          for (const row of pending) applied.add(row.id);
+          this.appliedByRun.set(runId, applied);
+          return send(res, 200, { inputs: pending });
+        }
+        return send(res, 200, { inputs: pending, receipts: true });
       }
     }
 

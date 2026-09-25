@@ -177,4 +177,15 @@ describe("recoverable /inputs drain (issue #1673)", () => {
     assert.strictEqual(nextCancel.signal.aborted, true);
     assert.deepStrictEqual(await unapplied(), []);
   });
+
+  it("routes a consume-on-read reply from an older api pod at once, with no receipts", async () => {
+    api.setInputClaimGeneration(RUN, 1);
+    api.legacyConsumeOnRead = true;
+    api.setInputs(RUN, [{ id: 7, kind: "cancel", body: null }]);
+    const cancel = new AbortController();
+    const ch = channel(clientLosingGets(0), 1, cancel);
+    await until(() => ch.isCancelled());
+    assert.strictEqual(cancel.signal.aborted, true);
+    assert.deepStrictEqual(api.inputReceiptCalls, [], "no ACK or APPLIED for a reply without the receipts marker");
+  });
 });

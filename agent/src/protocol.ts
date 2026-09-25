@@ -2296,6 +2296,9 @@ export interface InputsResponse {
    *  only when a switch is pending for this claim; omitted otherwise. M5b trips the switch off it —
    *  the runner's inputs poll calls steering.maybeTripCredentialSwitch(generation). */
   credential_switch?: { generation: number };
+  /** Issue #1673: true when the reply is a read-only replay the worker must ACK and apply. Absent
+   *  on a consume-on-read reply (an older api pod mid-roll), which the worker routes at once. */
+  receipts?: boolean;
 }
 
 /** Response of the interactive park-skip ownership probe (issue #559): the current

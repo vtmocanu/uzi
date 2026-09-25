@@ -1128,6 +1128,12 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 	if res.CredentialSwitch != nil {
 		body["credential_switch"] = res.CredentialSwitch
 	}
+	// Issue #1673: declare receipt mode on the reply itself. A worker that advertised
+	// input_receipts_v1 can still reach an older api pod mid-roll, which consumes on read and
+	// sends no marker; the worker then routes that reply at once instead of waiting on an ACK.
+	if res.Receipts {
+		body["receipts"] = true
+	}
 	httpx.JSON(w, http.StatusOK, body)
 }
 
