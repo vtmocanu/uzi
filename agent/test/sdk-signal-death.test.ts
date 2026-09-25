@@ -302,6 +302,37 @@ describe("SdkExecutor foreign CLI signal death (issue #1656)", () => {
     assert.equal(turns.length, 4, "two signal-death resumes in total, however the provider retries fall");
   });
 
+  it("a later turn whose requested resume came back as a FRESH session resumes that session, not the stale one", async () => {
+    // The run-level first-session latch fired on the plan turn (sess-A). The implement turn
+    // asks to resume sess-A but the CLI starts sess-B, then dies: the retry must continue
+    // sess-B, the session this turn actually ran, never fall back to the stale sess-A.
+    const initB = { type: "system", subtype: "init", session_id: "sess-B" } as unknown as SDKMessage;
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan", "sess-A"), resultSuccess("sess-A")],
+      dies(sdkSignal("SIGTERM"), [initB, assistantText("working", "sess-B")]),
+      [signalDone("sess-B"), resultSuccess("sess-B")],
+    ]);
+    const result = await new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx().ctx);
+    assert.equal(result.branch, "agent/issue-5");
+    assert.deepEqual(turns.map((t) => t.options.resume), [undefined, "sess-A", "sess-B"]);
+  });
+
+  it("a wall budget that expires during the reap confirmation ends with the wall outcome", async () => {
+    // Wall 2s. The first drive spends ~1.5s then dies; the group never empties, so the
+    // (up to 1s) confirmation poll outlives the remaining ~0.5s of wall.
+    const { queryFn, turns } = fakeTurns([
+      dies(sdkSignal("SIGTERM"), [assistantText("working")], 1_500),
+      [submitPlan("# Plan"), resultSuccess()],
+    ]);
+    const err = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, opts(queryFn, { cliGroupPresent: () => true })).run(
+        makeCtx({ config: { run_timeout_seconds: 2 } }).ctx,
+      ),
+    );
+    assert.match(err.message, /wall-clock timeout/);
+    assert.equal(turns.length, 1);
+  });
+
   it("a resume does not reset the wall budget", async () => {
     // Wall 1.2s. The first drive spends ~0.8s then dies; the resume hangs until the wall
     // trips. With the remaining budget carried over the resume lasts ~0.4s; a reset would

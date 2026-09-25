@@ -63,7 +63,7 @@ export function killProcessGroupOnly(pgid: number): boolean {
  * issue #1656: whether any process is still in process group `pgid`, by scanning
  * `<procRoot>/<pid>/stat` (field 5, pgrp; zombies count as present). Independent of any kill's
  * exit status. @returns undefined when absence cannot be established: no readable procfs, a
- * procfs mounted with `hidepid`/`subset=pid` (other uids' processes, e.g. the runner's, would be
+ * procfs mounted with any `hidepid` but 0/off, or any `subset=` (other uids' processes, e.g. the runner's, would be
  * invisible and read as absent), a stat unreadable for any reason but the process exiting
  * mid-scan, or a scan that saw no process at all. `procRoot` is injectable for tests.
  */
@@ -97,7 +97,9 @@ export function processGroupPresent(pgid: number, procRoot = "/proc"): boolean |
   return scanned > 0 ? false : undefined;
 }
 
-/** Whether the procfs at `procRoot` lists every uid's processes (no hidepid/subset=pid). */
+/** Whether the procfs at `procRoot` provably lists every uid's processes. Fail closed: only a
+ *  proc mount with no `hidepid` option (or `hidepid=0`/`hidepid=off`) and no `subset=` option
+ *  counts; any other value, including one a future kernel adds, is not complete. */
 function procfsShowsAllProcesses(procRoot: string): boolean {
   let mountinfo: string;
   try {
@@ -110,8 +112,8 @@ function procfsShowsAllProcesses(procRoot: string): boolean {
     const sep = fields.indexOf("-");
     if (sep < 0 || fields[4] !== procRoot || fields[sep + 1] !== "proc") continue;
     const superOpts = (fields[sep + 3] ?? "").split(",");
-    return !superOpts.some(
-      (o) => /^hidepid=(1|2|invisible|noaccess)$/.test(o) || o === "subset=pid",
+    return superOpts.every((o) =>
+      o.startsWith("hidepid=") ? o === "hidepid=0" || o === "hidepid=off" : !o.startsWith("subset="),
     );
   }
   return false;
