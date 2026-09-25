@@ -87,6 +87,8 @@ describe("filterShellenv (output allowlist)", () => {
   it("resolves $PATH and strips the terminator together, quoted or not", () => {
     assert.strictEqual(filterShellenv('export PATH="/nix/bin:$PATH";\n', "/usr/bin:/bin").PATH, "/nix/bin:/usr/bin:/bin");
     assert.strictEqual(filterShellenv("export LOCALE_ARCHIVE=/nix/loc ;\n", "/b").LOCALE_ARCHIVE, "/nix/loc");
+    // Whitespace AFTER the terminator must not hide it.
+    assert.strictEqual(filterShellenv('export PATH="/a"; \n', "/b").PATH, "/a");
   });
 });
 
