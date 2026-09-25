@@ -69,9 +69,17 @@ type reapResult struct {
 	Proof           string `json:"proof"`
 	Truncated       bool   `json:"truncated"`
 	DirentsExamined int    `json:"dirents_examined"`
-	// outcomes is each candidate's outcome, for tests; never serialized.
+	// lastReason is the reason of the candidate recorded last.
+	lastReason string
+	// outcomes is each candidate's outcome, kept only when
+	// recordReapOutcomes is set (tests), so a pass's memory does not grow
+	// with the candidates it acts on; never serialized.
 	outcomes []reapOutcome
 }
+
+// recordReapOutcomes keeps each candidate's outcome in reapResult.outcomes.
+// Tests set it; production leaves it off.
+var recordReapOutcomes bool
 
 // reapOutcome is one candidate's outcome and, for "retained", its reason.
 type reapOutcome struct {
@@ -92,7 +100,10 @@ func (r *reapResult) record(name, state, reason string) {
 		r.Foreign++
 	}
 	r.Scanned++
-	r.outcomes = append(r.outcomes, reapOutcome{name: name, state: state, reason: reason})
+	r.lastReason = reason
+	if recordReapOutcomes {
+		r.outcomes = append(r.outcomes, reapOutcome{name: name, state: state, reason: reason})
+	}
 }
 
 // reapConfig is reap's inputs besides the two root fds.
@@ -132,7 +143,7 @@ type reapBounds struct {
 // reap runs one orphan-reaping pass over tmpFd (command tmps) and cacheFd
 // (per-run caches; -1 when the cache root is absent). It returns an error only
 // when a root cannot be read; a name not yet read from it is then untouched,
-// and the outcomes recorded before stay in the result.
+// and the counts recorded before stay in the result.
 //
 // A held lock always protects. A released lock only makes a directory a
 // candidate, because the lock follows the supervisor or holder process, not
@@ -195,7 +206,7 @@ func reapWith(tmpFd, cacheFd int, cfg reapConfig, bounds reapBounds) (reapResult
 					return res, nil
 				}
 				state := reapOne(&res, reapCandidate{parentFd: root.fd, name: name}, cfg, canRemove, passDeadline)
-				if state == reapRetained && res.outcomes[len(res.outcomes)-1].reason == "deadline" {
+				if state == reapRetained && res.lastReason == "deadline" {
 					res.Truncated = true
 				}
 			}

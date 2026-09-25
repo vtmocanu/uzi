@@ -53,6 +53,7 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(realMain(args))
 	}
+	recordReapOutcomes = true
 	os.Exit(m.Run())
 }
 
@@ -1197,6 +1198,40 @@ func TestReapRemovalDeadlineTruncates(t *testing.T) {
 		t.Fatalf("calls=%d reap = %s truncated=%v %+v", calls, counts(res), res.Truncated, res.outcomes)
 	}
 	requireExists(t, dir)
+}
+
+// With outcome recording off (production), a pass keeps no per-candidate
+// record, so its memory does not grow with the candidates it acts on, and a
+// "deadline" retention still truncates.
+func TestReapKeepsNoOutcomesInProduction(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	recordReapOutcomes = false
+	t.Cleanup(func() { recordReapOutcomes = true })
+	r := newRoots(t)
+	for i := range 3 {
+		mkTree(t, filepath.Join(r.tmp, tmpNameN(60+i)))
+	}
+	deadlined := filepath.Join(r.tmp, tmpNameN(63))
+	mkTree(t, deadlined)
+	reapRemoveBy = func(parentFd int, name string, pin safetree.Pin, deadline time.Time) error {
+		if name == tmpNameN(63) {
+			return fmt.Errorf("walk: %w", safetree.ErrDeadline)
+		}
+		return safetree.RemoveBy(parentFd, name, pin, deadline)
+	}
+	t.Cleanup(func() { reapRemoveBy = safetree.RemoveBy })
+	var calls int
+	res, err := reap(r.tmpFd, -1, proofConfig(&calls, proofHeld))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkSums(t, res)
+	if got := counts(res); got != "scanned=4 live=0 removed=3 retained=1 foreign=0 proof=held" || !res.Truncated || res.outcomes != nil {
+		t.Fatalf("reap = %s truncated=%v outcomes=%+v", got, res.Truncated, res.outcomes)
+	}
+	requireExists(t, deadlined)
 }
 
 // The deadline handed to RemoveBy is the candidate's 60 s limit, capped by the
