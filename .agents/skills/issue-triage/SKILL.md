@@ -15,31 +15,38 @@ Out of scope, read instead:
 
 Run both checks; report results before Step 1.
 
-**A. Spent one-shot schedules** (fired, still listed as enabled):
+- Run each pipeline with `set -o pipefail` and check its exit status. Empty output after a failure is not an empty result.
+- Never `2>&1` or `2>/dev/null` into `jq`: stderr stays on the terminal (the CLI's version-skew warning breaks `jq`; hiding it hides real errors).
+
+**A. Spent one-shot issue schedules** (fired, still listed as enabled). Rows with `no-run` fired without starting a run:
 
 ```sh
-uzi schedule list --json 2>/dev/null | jq -r '.[]
-  | select(.timing=="once" and .status=="fired")
-  | .id as $id | (.last_fire.started // [])[]
-  | "\($id)\t#\(.issue_iid)\t\(.run_id)"'
+set -o pipefail
+uzi schedule list --json | jq -r '.[]
+  | select(.target=="issue" and .timing=="once" and .status=="fired")
+  | .id as $id | .issue_iid as $iss
+  | ((.last_fire.started // []) | if length == 0 then [{}] else . end)[]
+  | "\($id)\t#\(.issue_iid // $iss // "?")\t\(.run_id // "no-run")"'
 ```
 
-- Per row, check run status (`uzi run get <run_id> --json | jq -r .status`), issue state, and the `agent/issue-<n>` PR.
-- Propose delete only if the run is terminal AND the work landed (PR merged or issue closed). Keep the rest.
+- Per row, check the run status (`uzi run get <run_id> --json | jq -r .status`) and the `agent/issue-<n>` PR.
+- Propose delete only when the run `completed` AND its PR is merged.
+- Anything else (`failed`, `cancelled`, `no-run`, unmerged PR, issue closed without a merged PR) is not landed: report it and delete only if the user confirms no retry is wanted.
 - On OK: `uzi schedule delete <id>` (run history is preserved).
-- Keep stderr out of `jq` pipes (CLI version-skew warning breaks them).
 
-**B. Non-maintainer issues** (triaged before Tier 1; `bot` rows are CI signals, not requests):
+**B. Non-maintainer issues** (triaged before Tier 1; `bot` rows are CI signals, not requests). Sorted external first, then by number:
 
 ```sh
+set -o pipefail
 gh issue list --repo vtmocanu/uzi --state open --limit 400 --json number,title,author,labels \
-  | jq -r '.[] | select(.author.login != "vtmocanu")
-      | (if (.author.login | startswith("app/")) then "bot" else "external" end) as $k
-      | "\($k)\t#\(.number)\t\(.author.login)\t[\([.labels[].name]|join(","))]\t\(.title[0:64])"' \
-  | sort
+  | jq -r '[.[] | (.author.login // "unknown") as $a | select($a != "vtmocanu")
+      | {k: (if ($a | startswith("app/")) then "bot" else "external" end), a: $a, n: .number,
+         l: ([.labels[].name] | join(",")), t: .title[0:64]}]
+    | sort_by([(.k != "external"), .n])[]
+    | "\(.k)\t#\(.n)\t\(.a)\t[\(.l)]\t\(.t)"'
 ```
 
-Empty = maintainer-only backlog. If suspicious, compare against the open-issue total.
+A successful empty result = maintainer-only backlog. If it looks wrong, compare it against the total number of open issues.
 
 ## Step 1: Pick
 
