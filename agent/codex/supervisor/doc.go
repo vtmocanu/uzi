@@ -138,25 +138,37 @@
 //
 // A pass takes one proof first, then, for /tmp and for the cache root (a
 // missing cache root is skipped; a present one must be a 0700 directory owned
-// by --expect-uid) in turn, reads at most 4096 entries and acts on the names
-// that match exactly (uzi-codex-command-<lowercase uuid> in /tmp, a bare
-// lowercase uuid in the cache root), at most 64 acted-on candidates PER ROOT.
-// For each, in order: a no-follow open and a pin that must be a directory
-// owned by --expect-uid (else "foreign", untouched; a foreign name, and one
-// gone before its open, does not count toward the root's 64). When the pass's
-// first proof was not "held", the candidate is then retained (reason "proof")
-// WITHOUT being locked, so such a pass never reports "live" and never makes a
-// concurrent setup's LOCK_NB fail. Otherwise: flock LOCK_EX|LOCK_NB
+// by --expect-uid) in turn, reads the root once from its start to its end and
+// acts on the names that match exactly (uzi-codex-command-<lowercase uuid> in
+// /tmp, a bare lowercase uuid in the cache root). It reads in pages of at most
+// 4096 entries, a page ending early once it holds 64 matching names; that
+// batch is acted on before the next page is read, and a name already read is
+// never dropped. These two numbers bound memory only: no count of entries or
+// candidates ends a pass. Only the 5-minute pass budget does, checked before
+// each page and before each candidate; the pass then stops, later roots
+// included, leaves every name it had not yet acted on untouched, and reports
+// truncated. For each candidate, in order: a no-follow open and a pin that
+// must be a directory owned by --expect-uid (else "foreign", untouched). When
+// the pass's first proof was not "held", the candidate is then retained
+// (reason "proof") WITHOUT being locked, so such a pass never reports "live"
+// and never makes a concurrent setup's LOCK_NB fail. Otherwise: flock LOCK_EX|LOCK_NB
 // (EWOULDBLOCK is "live", any other error "retained"); with the lock held, a
 // fresh proof; then removal through the pin with a 60 s deadline, capped by a
 // 5-minute pass budget. Closing the fd releases the lock. Its one line, with
 // proof the result of the last proof taken:
 //
-//	{"event":"reap","scanned":<n>,"live":<n>,"removed":<n>,"retained":<n>,"foreign":<n>,"proof":"held"|"unknown"|"user_alive"}  // exit 0
-//	{"event":"reap_error","reason":"fd_hygiene"|"args"|"uid"|"tmp_root"|"cache_root"|"list"}                                       // exit 2
+//	{"event":"reap","scanned":<n>,"live":<n>,"removed":<n>,"retained":<n>,"foreign":<n>,"proof":"held"|"unknown"|"user_alive","truncated":<bool>,"dirents_examined":<n>}  // exit 0
+//	{"event":"reap_error","reason":"fd_hygiene"|"args"|"uid"|"tmp_root"|"cache_root"|"list"}                                                                      // exit 2
 //
 // scanned is always live+removed+retained+foreign; a name gone before its
-// open is not counted.
+// open is not counted. truncated is true when the pass budget ran out before
+// every entry of both roots was handled, or when a candidate was retained with
+// reason "deadline" (the pass budget, or its own 60 s removal deadline); a
+// pass that read both roots to their end with no such candidate reports
+// false. dirents_examined is the number of directory entries read from the
+// roots ("." and ".." excluded), so scanned never exceeds it. A root that
+// cannot be read, at its start or midway, is reap_error "list"; a name not yet
+// read from it is untouched.
 //
 // --hold-cache runs for a whole run as the command uid. Its first step, before
 // the fd hygiene, is PR_SET_DUMPABLE 0 (confirmed by PR_GET_DUMPABLE), so a
