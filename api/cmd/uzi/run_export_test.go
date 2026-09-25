@@ -3,7 +3,9 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -129,6 +131,152 @@ func TestRunExportMultipleAvailableRequiresCapture(t *testing.T) {
 	}
 	if _, err := os.Stat(dest); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("no file must be written on an ambiguous selection; Stat err = %v", err)
+	}
+}
+
+// longCaptureID builds a full 36-char UUID-shaped capture id at runtime (issue #1417): real
+// capture ids are server UUIDs, and it is their full length that overflowed the one-line
+// error. Built from numbers, never a UUID literal in source.
+func longCaptureID(n uint64) string {
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", 0x1a2b0000+n, 0x5e6f, 0x4a1b, 0x8c2d, 0x3e4f5a6b0000+n)
+}
+
+// longRunID is the run id for the #1417 fixtures: a real run id is a server UUID too, and
+// its length is what pushes the second capture id past the error line's 200-char fold.
+var longRunID = longCaptureID(0xabc)
+
+// assertFullIDsListed checks both full ids reach stderr, and that the pre-#1417 one-line
+// error (oldPreamble + one "\n  <captureListLine>" per capture) exceeded the 200-char fold
+// before the end of the second id, so the check is meaningful.
+func assertFullIDsListed(t *testing.T, stderr, oldPreamble string, archives []apitypes.RecoveryArchiveDTO) {
+	t.Helper()
+	old := oldPreamble
+	for _, a := range archives {
+		old += "\n  " + captureListLine(a)
+	}
+	if len(archives) != 2 || len(archives[1].ID) != 36 || strings.Index(old, archives[1].ID)+36 <= 200 {
+		t.Fatalf("fixture does not exercise the 200-char error fold (old message %d chars)", len(old))
+	}
+	for _, a := range archives {
+		if !strings.Contains(stderr, a.ID) {
+			t.Errorf("stderr missing full capture id %q:\n%s", a.ID, stderr)
+		}
+	}
+}
+
+// TestRunExportMultipleAvailableListsFullIDs (issue #1417): with two available captures
+// whose ids are full UUIDs, the listing goes to stderr as a table, not inside the one-line
+// error the root folds and caps at 200 chars, so the SECOND id is printed whole.
+func TestRunExportMultipleAvailableListsFullIDs(t *testing.T) {
+	idA, idB := longCaptureID(1), longCaptureID(2)
+	a, b := []byte("bundle-A"), []byte("bundle-BB")
+	archives := []apitypes.RecoveryArchiveDTO{availableCapture(idA, a), availableCapture(idB, b)}
+	fc := &uzicli.FakeClient{
+		RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
+			longRunID: {Supported: true, Archives: archives},
+		},
+		RecoveryBytes: map[string][]byte{idA: a, idB: b},
+	}
+	dest := filepath.Join(t.TempDir(), "out.bundle")
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "export", longRunID, "--output", dest)
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage) (stderr: %s)", code, uzicli.ExitUsage, stderr)
+	}
+	assertFullIDsListed(t, stderr,
+		"run "+longRunID+" has 2 recovery archives available; choose one with --capture <id>:", archives)
+	if !strings.Contains(stderr, "(captures listed above)") {
+		t.Errorf("short error should point at the listing:\n%s", stderr)
+	}
+	if len(fc.RecoveryDownloadCalls) != 0 {
+		t.Errorf("no download on an ambiguous selection; got %v", fc.RecoveryDownloadCalls)
+	}
+	if _, err := os.Stat(dest); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("no file on an ambiguous selection; Stat err = %v", err)
+	}
+}
+
+// TestRunExportMultipleAvailableJSON: under --json the capture listing is emitted to stdout
+// as a JSON array of the capture DTOs, and the exit is still the usage error.
+func TestRunExportMultipleAvailableJSON(t *testing.T) {
+	idA, idB := longCaptureID(1), longCaptureID(2)
+	a, b := []byte("bundle-A"), []byte("bundle-BB")
+	fc := &uzicli.FakeClient{
+		RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
+			longRunID: {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{
+				availableCapture(idA, a), availableCapture(idB, b),
+			}},
+		},
+	}
+	dest := filepath.Join(t.TempDir(), "out.bundle")
+	stdout, stderr, code := runCLI(t, fakeEnv(fc), "run", "export", longRunID, "--output", dest, "--json")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage) (stderr: %s)", code, uzicli.ExitUsage, stderr)
+	}
+	var got []apitypes.RecoveryArchiveDTO
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("--json stdout is not a capture array: %v\n%s", err, stdout)
+	}
+	if len(got) != 2 || got[0].ID != idA || got[1].ID != idB {
+		t.Errorf("--json captures = %+v, want ids %s, %s", got, idA, idB)
+	}
+	if !strings.Contains(stderr, "--capture") || !strings.Contains(stderr, "(captures emitted as JSON)") {
+		t.Errorf("stderr error should name --capture and point at the JSON listing:\n%s", stderr)
+	}
+}
+
+// TestRunExportNoneAvailableListsFullIDs: captures exist but none is downloadable — exit 5
+// (conflict), and every capture's full id reaches stderr with its honest state.
+func TestRunExportNoneAvailableListsFullIDs(t *testing.T) {
+	idA, idB := longCaptureID(1), longCaptureID(2)
+	archives := []apitypes.RecoveryArchiveDTO{
+		{ID: idA, State: "needs_action", SourceSha: "deadbeefcafe0000", ByteSize: i64(8)},
+		{ID: idB, State: "expired", SourceSha: "deadbeefcafe0000", ByteSize: i64(8)},
+	}
+	fc := &uzicli.FakeClient{
+		RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
+			longRunID: {Supported: true, Archives: archives},
+		},
+	}
+	dest := filepath.Join(t.TempDir(), "out.bundle")
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "export", longRunID, "--output", dest)
+	if code != uzicli.ExitConflict {
+		t.Fatalf("exit = %d, want %d (conflict) (stderr: %s)", code, uzicli.ExitConflict, stderr)
+	}
+	assertFullIDsListed(t, stderr,
+		"run "+longRunID+" has no downloadable recovery archive; its captures are:", archives)
+	for _, st := range []string{"needs_action", "expired"} {
+		if !strings.Contains(stderr, st) {
+			t.Errorf("stderr missing state %q:\n%s", st, stderr)
+		}
+	}
+	if len(fc.RecoveryDownloadCalls) != 0 {
+		t.Errorf("no download when nothing is available; got %v", fc.RecoveryDownloadCalls)
+	}
+}
+
+// TestRunExportCaptureLongID: the full id copied from the listing selects that capture and
+// exports its verified bytes.
+func TestRunExportCaptureLongID(t *testing.T) {
+	idA, idB := longCaptureID(1), longCaptureID(2)
+	a, b := []byte("bundle-A"), []byte("bundle-BB")
+	fc := &uzicli.FakeClient{
+		RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
+			longRunID: {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{
+				availableCapture(idA, a), availableCapture(idB, b),
+			}},
+		},
+		RecoveryBytes: map[string][]byte{idA: a, idB: b},
+	}
+	dest := filepath.Join(t.TempDir(), "out.bundle")
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "export", longRunID, "--output", dest, "--capture", idB)
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if got := readBack(t, dest); got != string(b) {
+		t.Errorf("exported bytes = %q, want %q", got, b)
+	}
+	if len(fc.RecoveryDownloadCalls) != 1 || fc.RecoveryDownloadCalls[0] != idB {
+		t.Errorf("expected exactly one download of %s; got %v", idB, fc.RecoveryDownloadCalls)
 	}
 }
 

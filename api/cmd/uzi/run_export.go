@@ -9,9 +9,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -59,6 +61,10 @@ func newRunExportCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			chosen, err := selectExportCapture(runID, summary, captureID)
+			var choice *captureChoiceError
+			if errors.As(err, &choice) {
+				return renderCaptureChoice(env, gf, choice)
+			}
 			if err != nil {
 				return err
 			}
@@ -96,7 +102,7 @@ func mustFlagString(cmd *cobra.Command, name string) string {
 
 // selectExportCapture resolves which capture to export (PRD #1296 D7). It NEVER silently
 // picks an attempt when more than one is available: with no --capture and >1 available
-// capture, it returns a USAGE error listing every capture's id + state. With --capture it
+// capture, it returns a USAGE *captureChoiceError carrying every capture for the listing. With --capture it
 // resolves that exact id and refuses (with the honest state) anything not available.
 func selectExportCapture(runID string, summary apitypes.RecoveryArchiveSummaryDTO, captureID string) (apitypes.RecoveryArchiveDTO, error) {
 	archives := summary.Archives
@@ -126,35 +132,79 @@ func selectExportCapture(runID string, summary apitypes.RecoveryArchiveSummaryDT
 	case 0:
 		return apitypes.RecoveryArchiveDTO{}, noAvailableCaptureError(runID, archives)
 	default:
-		// More than one available — refuse to choose. List every capture so the user can
-		// pick one for --capture.
-		var b strings.Builder
-		fmt.Fprintf(&b, "run %s has %d recovery archives available; choose one with --capture <id>:", runID, len(available))
-		for _, a := range archives {
-			b.WriteString("\n  ")
-			b.WriteString(captureListLine(a))
+		// More than one available — refuse to choose. The captures are listed so the user
+		// can pick one for --capture.
+		return apitypes.RecoveryArchiveDTO{}, &captureChoiceError{
+			err: uzicli.Exitf(uzicli.ExitUsage,
+				"run %s has %d recovery archives available; choose one with --capture <id>", runID, len(available)),
+			archives: archives,
 		}
-		return apitypes.RecoveryArchiveDTO{}, uzicli.Exitf(uzicli.ExitUsage, "%s", b.String())
 	}
 }
 
 // noAvailableCaptureError explains why nothing can be exported when --capture was omitted
 // and no capture is available: either there are no captures at all (exit 4), or the ones
-// that exist are in non-downloadable states — listed with their honest state (exit 5).
+// that exist are in non-downloadable states — a *captureChoiceError whose listing shows
+// their honest state (exit 5).
 func noAvailableCaptureError(runID string, archives []apitypes.RecoveryArchiveDTO) error {
 	if len(archives) == 0 {
 		return uzicli.Exitf(uzicli.ExitNotFound, "run %s has no recovery archive to export", runID)
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "run %s has no downloadable recovery archive; its captures are:", runID)
-	for _, a := range archives {
-		b.WriteString("\n  ")
-		b.WriteString(captureListLine(a))
+	return &captureChoiceError{
+		err:      uzicli.Exitf(uzicli.ExitConflict, "run %s has no downloadable recovery archive", runID),
+		archives: archives,
 	}
-	return uzicli.Exitf(uzicli.ExitConflict, "%s", b.String())
 }
 
-// captureListLine renders one capture for an error/summary listing: id, state, the original
+// captureChoiceError is a capture-selection refusal that carries the run's captures to list
+// (issue #1417). The listing cannot ride inside the error text: root prints every error as
+// ONE line folded and capped at 200 chars, which truncated the second full capture id. So
+// the short exit error and the listing travel separately, and renderCaptureChoice prints
+// the listing on its own. Unwrap exposes the *uzicli.ExitError so the exit code holds.
+type captureChoiceError struct {
+	err      *uzicli.ExitError
+	archives []apitypes.RecoveryArchiveDTO
+}
+
+func (e *captureChoiceError) Error() string { return e.err.Error() }
+func (e *captureChoiceError) Unwrap() error { return e.err }
+
+// renderCaptureChoice prints a capture-selection refusal's listing and returns its short
+// error. --json emits the captures as a JSON array on stdout; the human form writes a table
+// to stderr, even under --quiet, since the listing is part of the error. The table prints
+// every id in full; its cells are sanitized by Printer.Table.
+func renderCaptureChoice(env Env, gf *globalFlags, e *captureChoiceError) error {
+	where := "listed above"
+	if gf.json {
+		where = "emitted as JSON"
+		archives := e.archives
+		if archives == nil {
+			archives = []apitypes.RecoveryArchiveDTO{}
+		}
+		if err := env.printer(gf).JSON(archives); err != nil {
+			return err
+		}
+	} else {
+		rows := make([][]string, 0, len(e.archives))
+		for _, a := range e.archives {
+			size, created := "-", "-"
+			if a.ByteSize != nil {
+				size = humanBytes(*a.ByteSize)
+			}
+			if !a.CreatedAt.IsZero() {
+				created = a.CreatedAt.UTC().Format(time.RFC3339)
+			}
+			rows = append(rows, []string{a.ID, sanitizeTTY(a.State), shortSHA(strings.TrimSpace(a.SourceSha)), size, created})
+		}
+		p := uzicli.NewPrinter(env.Stderr, false, false, true, gf.quiet)
+		if err := p.Table([]string{"CAPTURE ID", "STATE", "SOURCE", "SIZE", "CREATED"}, rows); err != nil {
+			return err
+		}
+	}
+	return uzicli.Exitf(e.err.Code, "%v (captures %s)", e.err.Err, where)
+}
+
+// captureListLine renders one capture for the `run get` summary listing: id, state, the original
 // committed head H (short), and the byte size when bound. The state enum and the hex SHA are
 // safe, and the state is sanitized defensively; no raw bytes and no reason echo.
 func captureListLine(a apitypes.RecoveryArchiveDTO) string {
