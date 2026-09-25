@@ -5156,6 +5156,44 @@ export class RunRunner {
     }
   }
 
+  /**
+   * Issue #1660: seed the steering channel with the run's already-consumed follow-ups (GET
+   * /follow-ups) on every claim, first and re-claim, so the operator's earlier constraints still
+   * reach this claim's subagents. A transient failure is retried; a failure that persists, or a 4xx
+   * (an older api without the route, or a run no longer ours), is logged AND put on the run's feed,
+   * never swallowed: subagents in this claim then see only the follow-ups received from here on,
+   * and the lead still has every earlier one in its resumed session.
+   */
+  private async rehydrateOperatorConstraints(
+    runId: string,
+    steering: SteeringChannel,
+    batcher: MessageBatcher,
+    runLog: Logger,
+  ): Promise<void> {
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        steering.seedOperatorConstraints(await this.client.getConsumedFollowUps(runId));
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (err instanceof RequestError && err.status >= 400 && err.status < 500 && err.status !== 429) break;
+        if (attempt < 3) await sleep(250 * attempt);
+      }
+    }
+    runLog.warn("could not reload the run's earlier follow-ups as operator constraints", {
+      run_id: runId,
+      error: errMessage(lastErr),
+    });
+    batcher.emit({
+      kind: "status",
+      agent: "worker",
+      payload: {
+        text: "could not reload this run's earlier follow-ups: subagents dispatched in this claim receive only follow-ups sent from now on",
+      },
+    });
+  }
+
   private async phaseClone(claim: ClaimResponse, flight: RunFlight): Promise<void> {
     const { runLog, reportState, steering, batcher, cancel } = flight;
     const runId = claim.run_id;
@@ -5177,6 +5215,9 @@ export class RunRunner {
       });
       throw new RunningAckTerminalError(runningAck.status);
     }
+    // Issue #1660: before the poll loop starts, and so before any subagent dispatch, seed the
+    // follow-ups earlier claims consumed so they keep reaching this claim's subagents.
+    await this.rehydrateOperatorConstraints(runId, steering, batcher, runLog);
     steering.start();
 
     // PRD #1390 M4 — env-gated e2e DROP-EXECUTION seam. OFF unless UZI_E2E_DROP_ON_SENTINEL

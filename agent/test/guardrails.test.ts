@@ -1258,7 +1258,7 @@ describe("buildAgentGuardHook operator constraints (issue #1660)", () => {
     assert.ok(!second.includes(open[0]), "a fresh nonce per dispatch");
   });
 
-  it("caps the block's size: an oversized constraint is truncated and old ones are dropped with a note", async () => {
+  it("caps the block's size by shrinking entries evenly, marking every cut, and never omitting one", async () => {
     const huge = "x".repeat(50_000);
     const many = Array.from({ length: 40 }, (_, i) => `constraint-${i} ${"y".repeat(1_000)}`);
     for (const constraints of [[huge], many, [...many, huge]]) {
@@ -1266,19 +1266,44 @@ describe("buildAgentGuardHook operator constraints (issue #1660)", () => {
       const prompt = String(promptOf(await hook(dispatch({ subagent_type: "coder", prompt: "p" }))));
       const block = prompt.slice("p\n\n".length);
       assert.ok(block.length > 0 && block.length <= OPERATOR_CONSTRAINTS_MAX_CHARS, `block ${block.length} within cap`);
-      assert.ok(block.includes("truncated") || block.includes("omitted"), "the loss is stated, not silent");
+      assert.ok(!block.includes("omitted"), "nothing is omitted");
+      for (let n = 1; n <= constraints.length; n++) {
+        assert.ok(block.includes(`\n${n}. `), `entry ${n} of ${constraints.length} present`);
+      }
+      // Every entry that did not fit whole carries its own cut marker.
+      const cut = constraints.filter((c) => !block.includes(c)).length;
+      assert.ok(cut > 0, "something had to be shortened");
+      assert.strictEqual(block.split("[truncated]").length - 1, cut, "one marker per shortened entry");
     }
-    // A single oversized constraint is truncated, never dropped whole.
+    // A single oversized constraint is truncated, never dropped whole: its head survives.
     const one = buildAgentGuardHook(["coder"], nullLogger(), () => [huge]);
     const truncated = String(promptOf(await one(dispatch({ subagent_type: "coder", prompt: "p" }))));
     assert.ok(truncated.includes(`1. ${"x".repeat(1_000)}`) && truncated.includes("[truncated]"), "head kept, cut stated");
-    assert.ok(!truncated.includes("omitted"), "not dropped");
-    // The NEWEST constraints survive the budget: the operator's latest word is kept.
-    const hook = buildAgentGuardHook(["coder"], nullLogger(), () => many);
+  });
+
+  it("keeps an early short safety follow-up whole behind many later large ones", async () => {
+    const safety = "never execute a candidate kill payload; screen strings only";
+    const later = Array.from({ length: 60 }, (_, i) => `later-${i} ${"z".repeat(3_000)}`);
+    const hook = buildAgentGuardHook(["coder"], nullLogger(), () => [safety, ...later]);
     const prompt = String(promptOf(await hook(dispatch({ subagent_type: "coder", prompt: "p" }))));
-    assert.ok(prompt.includes("constraint-39 "), "newest kept");
-    assert.ok(!prompt.includes("constraint-0 "), "oldest dropped");
-    assert.match(prompt, /\d+ earlier operator constraint/);
+    assert.ok(prompt.includes(`\n1. ${safety}\n`), "the early safety constraint survives whole");
+    assert.ok(prompt.includes("\n61. later-59 "), "the newest survives too");
+    assert.ok(prompt.length - "p\n\n".length <= OPERATOR_CONSTRAINTS_MAX_CHARS);
+  });
+
+  it("fails closed: denies an allowed dispatch whose prompt cannot carry the constraints", async () => {
+    const hook = buildAgentGuardHook(["coder"], nullLogger(), () => ["screen strings only"]);
+    for (const tool_input of [{ subagent_type: "coder" }, { subagent_type: "coder", prompt: 42 }]) {
+      const out = (await hook(dispatch(tool_input))) as Out & {
+        hookSpecificOutput?: { permissionDecisionReason?: string };
+      };
+      assert.strictEqual(out.hookSpecificOutput?.permissionDecision, "deny", JSON.stringify(tool_input));
+      assert.match(out.hookSpecificOutput?.permissionDecisionReason ?? "", /operator constraints/);
+    }
+    // With no constraints to attach, a prompt-less call keeps today's behaviour (allowed).
+    const none = buildAgentGuardHook(["coder"], nullLogger(), () => []);
+    const out = (await none(dispatch({ subagent_type: "coder" }))) as Out;
+    assert.notStrictEqual(out.hookSpecificOutput?.permissionDecision, "deny");
   });
 
   it("strips control characters from a constraint (only newline and tab kept)", async () => {

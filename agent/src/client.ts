@@ -882,6 +882,17 @@ export class WorkerClient {
     return { inputs: res.inputs ?? [], credentialSwitch: res.credential_switch };
   }
 
+  /** Issue #1660: the run's ALREADY-CONSUMED follow_up inputs, oldest first (GET
+   *  /worker/runs/{id}/follow-ups). READ ONLY: unlike getInputs it consumes nothing. The runner
+   *  seeds them into the steering channel on every claim so a follow-up an earlier claim consumed
+   *  still reaches this claim's subagents. Throws a RequestError on 4xx/5xx. */
+  async getConsumedFollowUps(runId: string): Promise<UserInput[]> {
+    const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/follow-ups`)) as
+      | { inputs?: UserInput[] }
+      | undefined;
+    return Array.isArray(res?.inputs) ? res.inputs : [];
+  }
+
   /** issue #559: lightweight read-only ownership/terminality probe for the interactive
    *  park-SKIP path. Returns the run's current status. Throws a RequestError on 4xx/5xx —
    *  the caller distinguishes a DEFINITIVE 404 (run not owned / reclaimed) from a transient

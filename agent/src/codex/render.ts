@@ -362,7 +362,9 @@ function resolveRoleModel(
 /** Render a subagent prompt exactly as agents.ts `toDefinition` composes it: the
  *  role body followed by the four shared appends, so a Codex subagent carries the
  *  same findings nudge, worker-runtime guidance, secret-fixture hygiene rule (PRD #1120)
- *  and worker-owned safety block (issue #1660) a Claude subagent does. */
+ *  and worker-owned safety block (issue #1660) a Claude subagent does. Only that STATIC block:
+ *  the run's operator constraints (follow-ups) are attached per dispatch by the Claude Agent
+ *  guard (guardrails.ts buildAgentGuardHook) and do NOT reach Codex subagents yet (#1660). */
 function renderSubagentPrompt(agent: HarnessAgent): string {
   return `${agent.prompt}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`;
 }

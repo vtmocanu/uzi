@@ -563,6 +563,27 @@ describe("getInputs return shape (PRD #1247 M5)", () => {
   });
 });
 
+// Issue #1660: the worker rehydrates its operator constraints from the run's already-consumed
+// follow-ups on every claim; the read consumes nothing.
+describe("getConsumedFollowUps (issue #1660)", () => {
+  it("returns the follow-ups earlier /inputs polls drained, oldest first, and drains nothing", async () => {
+    api.setInputs("run-fu", [
+      { id: 3, kind: "follow_up", body: "first" },
+      { id: 4, kind: "approve_plan", body: null },
+      { id: 5, kind: "follow_up", body: "second" },
+    ]);
+    const client = newClient();
+    assert.deepStrictEqual(await client.getConsumedFollowUps("run-fu"), [], "nothing consumed yet");
+    await client.getInputs("run-fu");
+    const got = await client.getConsumedFollowUps("run-fu");
+    assert.deepStrictEqual(got.map((i) => [i.id, i.kind, i.body]), [
+      [3, "follow_up", "first"],
+      [5, "follow_up", "second"],
+    ]);
+    assert.deepStrictEqual(await client.getConsumedFollowUps("run-fu"), got, "a read is repeatable");
+  });
+});
+
 describe("MessageBatcher seq numbering", () => {
   it("continues gapless numbering from last_seq across flushes", async () => {
     const client = newClient();

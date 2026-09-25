@@ -32,7 +32,7 @@
 import type { WorkerClient } from "./client.js";
 import type { FollowUpOutcome } from "./executor.js";
 import type { Logger } from "./log.js";
-import { parseAgentSelection, type AgentSelectionParse } from "./protocol.js";
+import { parseAgentSelection, type AgentSelectionParse, type UserInput } from "./protocol.js";
 import { errMessage, sleep } from "./util.js";
 
 /** The outcome of the plan-approval gate. On approve, `selection` is the parsed
@@ -161,13 +161,17 @@ export class SteeringChannel {
   private stopped = false;
   private loop: Promise<void> | undefined;
   private readonly followUps: { id: number; body: string }[] = [];
-  /** Issue #1660: every follow-up body RECEIVED so far, in arrival order: the run's operator
-   *  constraints. Recorded on route (the input is already consumed server-side), never
-   *  shifted, so the lead's FIFO delivery (followUps) is untouched and each later subagent
-   *  dispatch gets the whole set (the Agent guard reads it via operatorConstraints). All
-   *  follow-ups, not a subset: the operator has no way to tag a safety constraint today.
-   *  In-memory for this claim only. */
-  private readonly receivedFollowUps: string[] = [];
+  /** Issue #1660: the run's operator constraints, oldest first: the follow-ups earlier claims
+   *  consumed (seedOperatorConstraints, from GET /follow-ups, before start), then every
+   *  follow-up this claim receives (recorded on route; the input is already consumed
+   *  server-side). Never shifted, so the lead's FIFO delivery (followUps) is untouched and each
+   *  later subagent dispatch gets the whole set (the Agent guard reads it via
+   *  operatorConstraints). All follow-ups, not a subset: the operator has no way to tag a
+   *  safety constraint today. */
+  private readonly receivedFollowUps: { id: number; body: string }[] = [];
+  /** Issue #1660: ids seeded from earlier claims, so a row the live drain also returns is
+   *  recorded once. */
+  private readonly seededFollowUpIds = new Set<number>();
   /** issue #559 M2: the highest `follow_up` input id this channel has already handed to the
    *  executor — via pullFollowUp or awaitFollowUp/serviceFollowUp. This is the wake-guard
    *  watermark the runner reports at the interactive park (open_followup_id). Buffering a
@@ -564,7 +568,23 @@ export class SteeringChannel {
   /** Issue #1660: the run's operator constraints, every follow-up received so far in arrival
    *  order. A copy, so a caller cannot rewrite the record. */
   operatorConstraints(): readonly string[] {
-    return [...this.receivedFollowUps];
+    return this.receivedFollowUps.map((f) => f.body);
+  }
+
+  /** Issue #1660: seed the constraints earlier claims consumed (GET /follow-ups), before
+   *  start(). follow_up only, blanks skipped, in id order, ahead of anything received live, and
+   *  de-duplicated by input id. They are constraints only: the lead is NOT re-delivered them. */
+  seedOperatorConstraints(inputs: readonly UserInput[]): void {
+    const known = new Set([...this.seededFollowUpIds, ...this.receivedFollowUps.map((f) => f.id)]);
+    const seeded: { id: number; body: string }[] = [];
+    for (const input of [...inputs].sort((a, b) => a.id - b.id)) {
+      const body = input.body?.trim();
+      if (input.kind !== "follow_up" || !body || known.has(input.id)) continue;
+      known.add(input.id);
+      this.seededFollowUpIds.add(input.id);
+      seeded.push({ id: input.id, body });
+    }
+    this.receivedFollowUps.unshift(...seeded);
   }
 
   /** Dequeue the oldest un-consumed follow-up, or undefined if none. */
@@ -875,7 +895,7 @@ export class SteeringChannel {
         // can advance the wake-guard watermark. The other kinds ignore the id.
         if (body && body.trim()) {
           this.followUps.push({ id, body: body.trim() });
-          this.receivedFollowUps.push(body.trim());
+          if (!this.seededFollowUpIds.has(id)) this.receivedFollowUps.push({ id, body: body.trim() });
         }
         break;
       case "answer": {

@@ -1,0 +1,92 @@
+import { afterEach, beforeEach, describe, it } from "node:test";
+import assert from "node:assert/strict";
+import type { HookInput } from "@anthropic-ai/claude-agent-sdk";
+import { RunRunner } from "../src/runner.js";
+import { buildAgentGuardHook, NESTED_AGENT_TOOL } from "../src/guardrails.js";
+import { FakeApi } from "./fake-api.js";
+import { makeFixture, type Fixture } from "./fixture-repo.js";
+import { makeClaim, nullLogger } from "./helpers.js";
+import { WorkerClient } from "../src/client.js";
+import { GitCache } from "../src/git.js";
+import type { Executor, RunContext } from "../src/executor.js";
+
+// Issue #1660 acceptance across claims: a follow-up consumed during claim 1 must reach a
+// subagent dispatched during claim 2. The steering channel is per claim, so without the
+// rehydrate read (GET /runs/{id}/follow-ups) claim 2 starts with no constraints.
+describe("operator constraints survive a re-claim (issue #1660)", () => {
+  const TOKEN = "tkn-constraints-1660";
+  let api: FakeApi;
+  let fx: Fixture;
+  let client: WorkerClient;
+  let git: GitCache;
+
+  beforeEach(async () => {
+    api = new FakeApi(TOKEN);
+    const baseUrl = await api.listen();
+    fx = makeFixture();
+    git = new GitCache(fx.dataDir, nullLogger());
+    client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+  });
+  afterEach(async () => {
+    await api.close();
+    fx.cleanup();
+  });
+
+  // What the SDK executor's Agent guard would hand a reviewer dispatched right now.
+  const dispatchPrompt = async (ctx: RunContext): Promise<string> => {
+    const hook = buildAgentGuardHook(["reviewer"], nullLogger(), () => ctx.operatorConstraints?.() ?? []);
+    const out = (await hook({
+      session_id: "s",
+      transcript_path: "/t",
+      cwd: "/w",
+      hook_event_name: "PreToolUse",
+      tool_name: NESTED_AGENT_TOOL,
+      tool_input: { subagent_type: "reviewer", prompt: "review HEAD" },
+      tool_use_id: "tu",
+    } as HookInput)) as { hookSpecificOutput?: { updatedInput?: { prompt?: string } } };
+    return out.hookSpecificOutput?.updatedInput?.prompt ?? "";
+  };
+
+  it("a follow-up consumed in claim 1 is attached to a dispatch in claim 2", async () => {
+    const rule = "never execute a string containing kill; screen strings only";
+    const claim = makeClaim({
+      issue_iid: 71,
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      last_seq: 0,
+    });
+    api.setInputs(claim.run_id, [{ id: 7, kind: "follow_up", body: rule }]);
+
+    // Claim 1: wait until the live drain consumed the follow-up, then end the flight.
+    let claim1Saw: readonly string[] = [];
+    const claim1: Executor = {
+      async run(ctx) {
+        const deadline = Date.now() + 5_000;
+        while (!(ctx.operatorConstraints?.() ?? []).length && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 5));
+        }
+        claim1Saw = ctx.operatorConstraints?.() ?? [];
+        throw new Error("claim 1 ends here");
+      },
+    };
+    await new RunRunner(client, git, () => ({ executor: claim1 }), nullLogger(), 20, undefined, { pollMs: 5 }).execute(claim);
+    assert.deepStrictEqual(claim1Saw, [rule], "claim 1 consumed the follow-up live");
+
+    // Claim 2: a fresh runner (a re-claim, possibly on another worker). Nothing is pending on
+    // /inputs any more, so the only source is the rehydrate read.
+    let claim2Prompt = "";
+    const claim2: Executor = {
+      async run(ctx) {
+        claim2Prompt = await dispatchPrompt(ctx);
+        throw new Error("claim 2 ends here");
+      },
+    };
+    await new RunRunner(client, git, () => ({ executor: claim2 }), nullLogger(), 20, undefined, { pollMs: 5 }).execute({
+      ...claim,
+      last_seq: 0,
+    });
+    assert.ok(claim2Prompt.startsWith("review HEAD\n\n"), "the lead's prompt is kept first");
+    assert.ok(claim2Prompt.includes(rule), "claim 2's dispatch carries claim 1's follow-up");
+    assert.strictEqual(claim2Prompt.split(rule).length - 1, 1, "attached once, not duplicated");
+    assert.ok((api.followUpReads.get(claim.run_id) ?? 0) >= 2, "every claim rehydrates");
+  });
+});

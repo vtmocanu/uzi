@@ -909,3 +909,44 @@ describe("SteeringChannel operator constraints (issue #1660)", () => {
     }
   });
 });
+
+// Issue #1660: a re-claim starts a fresh channel, so the worker seeds it with the follow-ups
+// earlier claims consumed (GET /follow-ups) before the first dispatch.
+describe("SteeringChannel.seedOperatorConstraints (issue #1660)", () => {
+  const withId = (id: number, kind: UserInput["kind"], body: string | null): UserInput => ({ id, kind, body });
+
+  it("seeds consumed follow-ups ahead of live ones, follow_up only, blanks skipped, in id order", async () => {
+    const { ch } = makeChannel([[withId(20, "follow_up", "live")]]);
+    ch.seedOperatorConstraints([
+      withId(9, "follow_up", " later "),
+      withId(4, "follow_up", "earlier"),
+      withId(6, "revise_plan", "not a constraint"),
+      withId(7, "follow_up", "   "),
+      withId(8, "follow_up", null),
+    ]);
+    assert.deepStrictEqual(ch.operatorConstraints(), ["earlier", "later"]);
+    ch.start();
+    try {
+      await tick();
+      assert.deepStrictEqual(ch.operatorConstraints(), ["earlier", "later", "live"]);
+      // Seeded constraints are NOT re-delivered to the lead: its FIFO holds only the live one.
+      assert.strictEqual(ch.pullFollowUp(), "live");
+      assert.strictEqual(ch.pullFollowUp(), undefined);
+    } finally {
+      await ch.stop();
+    }
+  });
+
+  it("de-duplicates by input id between the seed and the live drain", async () => {
+    const { ch } = makeChannel([[withId(5, "follow_up", "same row")]]);
+    ch.seedOperatorConstraints([withId(5, "follow_up", "same row"), withId(5, "follow_up", "same row")]);
+    ch.start();
+    try {
+      await tick();
+      assert.deepStrictEqual(ch.operatorConstraints(), ["same row"]);
+      assert.strictEqual(ch.pullFollowUp(), "same row", "the lead still gets the live delivery");
+    } finally {
+      await ch.stop();
+    }
+  });
+});

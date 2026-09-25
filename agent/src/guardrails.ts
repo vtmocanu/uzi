@@ -210,6 +210,8 @@ const REASON_SCREEN_ERROR = "denied by guardrail: command screening failed; refu
 const REASON_OUTSIDE_WORKTREE = "denied by guardrail: file access outside the run worktree is not permitted";
 const REASON_DOTGIT = "denied by guardrail: accessing the .git directory is not permitted";
 const REASON_UNKNOWN_SUBAGENT = "denied by guardrail: only the run's assembled subagents may be invoked";
+const REASON_CONSTRAINTS_UNATTACHABLE =
+  "denied by guardrail: this dispatch has no text prompt to carry the run's operator constraints";
 
 const MAX_DEPTH = 6;
 
@@ -1251,7 +1253,8 @@ function subagentTypeOf(toolInput: unknown): string | undefined {
  *     so a dispatch before a follow-up never carries it and every one after does. The
  *     lead's own <follow_up> delivery is unchanged; this is the structural copy it could
  *     not be relied on to relay. Rendered by buildOperatorConstraintsBlock (nonce-fenced,
- *     size-capped); an already-synchronous call is rewritten too when there is a block.
+ *     size-capped); an already-synchronous call is rewritten too when there is a block,
+ *     and a call whose `prompt` is not a string is DENIED rather than run without them.
  *
  * The lead keeps the Agent tool to delegate to the allowed roles; every subagent
  * already carries `disallowedTools:['Agent']`, so this hook only ever sees the
@@ -1282,7 +1285,18 @@ export function buildAgentGuardHook(
       ? (input.tool_input as Record<string, unknown>)
       : {};
     const prompt = original["prompt"];
-    const constraints = typeof prompt === "string" ? buildOperatorConstraintsBlock(operatorConstraints()) : "";
+    const constraints = buildOperatorConstraintsBlock(operatorConstraints());
+    // Fail closed: a dispatch that cannot carry the constraints does not run without them.
+    if (constraints !== "" && typeof prompt !== "string") {
+      log.warn("guardrail denied a subagent dispatch that cannot carry operator constraints", { subagent_type: sub });
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: REASON_CONSTRAINTS_UNATTACHABLE,
+        },
+      };
+    }
     if (original["run_in_background"] === false && constraints === "") return {};
     const updatedInput: Record<string, unknown> = { ...original, run_in_background: false };
     if (constraints !== "") {
