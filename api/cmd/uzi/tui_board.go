@@ -663,8 +663,8 @@ func (m tuiModel) boardFooter() string {
 	parts := []string{m.keyHint("enter/→", "open"), m.keyHint("/", "filter")}
 	markedCost := !m.board.admin && m.selfUsageReady && (m.selfUsage.Last7SubscriptionRunCount > 0 || m.selfUsage.Last7UnreportedRunCount > 0)
 	if markedCost {
-		// Keep the explanation and quit key ahead of hints that may be clipped at ordinary widths.
-		parts = append(parts, m.keyHint("q", "quit"), m.pal.faint.Render("+ = subscription/unreported spend"))
+		// Keep the cost cue and quit key ahead of hints that may be clipped at narrow widths.
+		parts = append(parts, m.keyHint("q", "quit"), m.pal.faint.Render("+ partial"))
 	}
 	if m.board.admin {
 		parts = append(parts, m.keyHint("a", "my runs"))

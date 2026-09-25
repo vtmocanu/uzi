@@ -69,7 +69,7 @@ func TestTUIBoardUsageSummaryServerValueAndStates(t *testing.T) {
 	if got := stripANSI(m.boardSummary()); !strings.Contains(got, "$0+ 7d") {
 		t.Fatalf("marked zero missing: %q", got)
 	}
-	if got := stripANSI(m.boardFooter()); !strings.Contains(got, "+ = subscription/unreported spend") {
+	if got := stripANSI(m.boardFooter()); !strings.Contains(got, "+ partial") {
 		t.Fatalf("legend missing: %q", got)
 	}
 	m.board.admin = true
@@ -91,7 +91,7 @@ func TestTUIBoardMarkedCostLegendRenderedAtOrdinaryWidths(t *testing.T) {
 			m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 			m = usageReply(t, m, selfUsageMsg{reqID: m.selfUsageReqID, usage: tc.usage})
 			m.showVersion = true
-			for _, width := range []int{80, 120} {
+			for _, width := range []int{80, 100, 120} {
 				m.width = width
 				footer := stripANSI(m.boardFooterLine())
 				view := stripANSI(m.View().Content)
@@ -100,10 +100,19 @@ func TestTUIBoardMarkedCostLegendRenderedAtOrdinaryWidths(t *testing.T) {
 				}
 				renderedFooter := view[strings.LastIndex(view, "\n")+1:]
 				for _, got := range []string{footer, renderedFooter} {
-					if !strings.Contains(got, "+ = subscription/unreported spend") ||
+					if !strings.Contains(got, "+ partial") ||
 						!strings.Contains(got, "enter/→ open") || !strings.Contains(got, "/ filter") ||
 						!strings.Contains(got, "q quit") || !strings.Contains(got, "v0.63.0") {
-						t.Errorf("width %d footer lost cost explanation, key hint, or version: %q", width, got)
+						t.Errorf("width %d footer lost cost cue, key hint, or version: %q", width, got)
+					}
+					if !strings.Contains(got, "a factory") {
+						t.Errorf("width %d footer lost factory hint: %q", width, got)
+					}
+					if width >= 100 && (!strings.Contains(got, "r refresh") || !strings.Contains(got, "? keys")) {
+						t.Errorf("width %d footer lost refresh or help hint: %q", width, got)
+					}
+					if width >= 120 && !strings.Contains(got, "h fold done") {
+						t.Errorf("width %d footer lost fold-done hint: %q", width, got)
 					}
 					if visualWidth(got) > width {
 						t.Errorf("width %d footer overflowed: %q", width, got)
@@ -111,6 +120,12 @@ func TestTUIBoardMarkedCostLegendRenderedAtOrdinaryWidths(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestTUIBoardHelpExplainsMarkedCost(t *testing.T) {
+	if got := strings.Join(helpLines(viewBoard), "\n"); !strings.Contains(got, "+ after 7d cost means subscription/unreported costs excluded") {
+		t.Fatalf("board help missing marked-cost explanation: %q", got)
 	}
 }
 
