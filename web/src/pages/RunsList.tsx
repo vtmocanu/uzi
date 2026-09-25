@@ -378,15 +378,18 @@ export function RunRow({
               </p>
             )}
             <p className="mt-0.5 flex flex-wrap items-center gap-x-4 overflow-x-clip text-xs text-faint">
-              <span className="relative inline-flex items-center gap-1">
-                {maskRepoPath(run.repo_path, demo)}{" "}
-                <RunIssueRef
-                  issueIid={run.issue_iid}
-                  issueWebUrl={run.issue_web_url}
-                  kind={run.kind}
-                  forgeType={run.forge_type}
-                  raised
-                />
+              <span className="relative inline-flex min-w-0 max-w-full items-center gap-1">
+                <span className="min-w-0 truncate">{maskRepoPath(run.repo_path, demo)}</span>
+                <span className="shrink-0">
+                  <RunIssueRef
+                    issueIid={run.issue_iid}
+                    issueWebUrl={run.issue_web_url}
+                    kind={run.kind}
+                    forgeType={run.forge_type}
+                    raised
+                    className="focus-visible:ring-inset focus-visible:ring-offset-0"
+                  />
+                </span>
               </span>
               {run.worker_name && <span className="relative inline-flex items-center"><span aria-hidden className="absolute -left-4 w-4 text-center">·</span>{run.worker_name}</span>}
               {showOwner && run.owner_email && <span className="relative inline-flex items-center"><span aria-hidden className="absolute -left-4 w-4 text-center">·</span>{maskEmail(run.owner_email, demo)}</span>}
@@ -396,7 +399,7 @@ export function RunRow({
                 // The "· " separator lives OUTSIDE MrChip (issue #1253): the inline merged
                 // chip is now a bordered box, so a dot passed through `label` would render
                 // inside the border. Mirror IssueView — keep only the "MR "/"PR " abbrev in
-                // `label`, and emit the separator as a sibling text node.
+                // `label`, and emit the separator as a sibling element.
                 <span className="relative inline-flex items-center">
                   <span aria-hidden className="absolute -left-4 w-4 text-center">·</span>
                   <MrChip
@@ -411,7 +414,7 @@ export function RunRow({
                     // independently clickable — clicking it opens the PR/MR on the forge in a
                     // new tab (`target="_blank"`), while clicking elsewhere on the card follows
                     // the stretched link to the run detail view (issue #803).
-                    className="relative z-10 font-medium"
+                    className="relative z-10 font-medium focus-visible:ring-inset focus-visible:ring-offset-0"
                   />
                 </span>
               )}

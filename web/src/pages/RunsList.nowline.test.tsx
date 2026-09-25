@@ -157,6 +157,16 @@ describe("RunsList row now line (PRD #1064 M3)", () => {
     expect(meta.textContent).toContain("subscription");
   });
 
+  it("lets a long repo path truncate before the issue reference clips", () => {
+    const path = "grp/" + "a".repeat(80);
+    renderRow(aRun({ repo_path: path }));
+    const repo = screen.getByText(path);
+    expect(repo.className).toContain("min-w-0 truncate");
+    expect(repo.parentElement?.className).toContain("min-w-0 max-w-full");
+    expect(repo.nextElementSibling?.className).toContain("shrink-0");
+    expect(repo.nextElementSibling?.textContent).toContain("#7");
+  });
+
   it("keeps the MR separator outside its chip and masks repo and owner in demo mode", () => {
     setDemoMode(true);
     const { container } = render(

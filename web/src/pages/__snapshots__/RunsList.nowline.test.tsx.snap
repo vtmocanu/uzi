@@ -49,13 +49,22 @@ exports[`RunsList row now line (PRD #1064 M3) > D5: a null-milestone null-activi
             class="mt-0.5 flex flex-wrap items-center gap-x-4 overflow-x-clip text-xs text-faint"
           >
             <span
-              class="relative inline-flex items-center gap-1"
+              class="relative inline-flex min-w-0 max-w-full items-center gap-1"
             >
-              grp/proj
-               
-              <span>
-                #
-                7
+              <span
+                class="min-w-0 truncate"
+              >
+                grp/proj
+              </span>
+              <span
+                class="shrink-0"
+              >
+                <span
+                  class="focus-visible:ring-inset focus-visible:ring-offset-0"
+                >
+                  #
+                  7
+                </span>
               </span>
             </span>
             <span
