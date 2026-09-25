@@ -1045,7 +1045,10 @@ workers:
       #   auth.openai.com  -> the OpenAI auth host
       # EXACT names on purpose: the chatgpt.com rule does NOT cover its subdomains, and
       # no wildcard or further OpenAI host is added until a real M6 provisioning failure
-      # names one (the "expand from a REAL failure" rule above). Per the REPLACED-not-
+      # names one (the "expand from a REAL failure" rule above). Exact at DNS-match time
+      # only: Antrea allows the RESOLVED IPs, not the hostname (no SNI/Host check), so a
+      # name on shared CDN/anycast IPs (chatgpt.com) also reaches every other host on
+      # those IPs. Accepted residual, ADR-0285; L7 enforcement is #1651. Per the REPLACED-not-
       # merged note above, any deployment values that override this list must add the
       # same three before live Codex verification.
       - name: allow-openai-api

@@ -1539,7 +1539,10 @@ on.
   **The two tiers' external egress is OPPOSITE, and a probe that does not name the
   tier is uninterpretable:** the **restricted** tier enforces an FQDN allowlist
   (`worker-fqdn-egress.yaml` over the `worker-networkpolicy.yaml` default-deny
-  floor) reaching only `cache.nixos.org`, the forge (derived from
+  floor; enforced per resolved IP, not per hostname, so a name on shared CDN IPs
+  also opens the other hosts on those IPs: the accepted residual in
+  [ADR-0285](adr/0285-worker-egress-tier-trust-model.md), L7 enforcement #1651)
+  reaching only `cache.nixos.org`, the forge (derived from
   `FORGE_ALLOWED_BASE_URLS` through one chart value `forge.allowedBaseURLs`, since
   [PRD #808](prds/done/808-worker-egress-single-source.md), so the SSRF allowlist
   and the FQDN list cannot drift), `*.anthropic.com`, `api.openai.com`,
