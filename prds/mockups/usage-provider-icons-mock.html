@@ -1,0 +1,372 @@
+<title>uzi Usage Rail</title>
+<!-- Icons: Claude mark from simple-icons (CC0-1.0); OpenAI mark from Bootstrap Icons "openai" (MIT). Brand marks are their owners' trademarks, used only to identify the provider. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root {
+  --bg: #e9e4de;
+  --panel: #ffffff;
+  --fg: #1c2230;
+  --muted: #5d6576;
+  --faint: #7b8395;
+  --edge: #e3e5ea;
+  --track: #eceef3;
+  --ok: #3f6f5a;
+  --warn: #8a5518;
+  --danger: #b4233a;
+  --claude: #b4643c;
+  --codex: #3c5a8a;
+  --chip-claude: #f6ece5;
+  --chip-codex: #e7edf6;
+  --note: #6b5a3a;
+  --hl: #fff5d6;
+  --sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #07090e; --panel: #0f121a; --fg: #e4e8f0; --muted: #9ea7b8; --faint: #7a859a;
+    --edge: #272d3c; --track: #1d2230; --ok: #34d399; --warn: #d4a23a; --danger: #fb7185;
+    --claude: #e59a70; --codex: #8fb0e6; --chip-claude: #2a1d17; --chip-codex: #17213a;
+    --note: #cbb68a; --hl: #2a2412;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #07090e; --panel: #0f121a; --fg: #e4e8f0; --muted: #9ea7b8; --faint: #7a859a;
+  --edge: #272d3c; --track: #1d2230; --ok: #34d399; --warn: #d4a23a; --danger: #fb7185;
+  --claude: #e59a70; --codex: #8fb0e6; --chip-claude: #2a1d17; --chip-codex: #17213a;
+  --note: #cbb68a; --hl: #2a2412;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 14px; line-height: 1.45; }
+.wrap { max-width: 1040px; margin: 0 auto; padding-inline: 16px; padding-block: 32px 48px; display: grid; gap: 36px; }
+header h1 { font-size: 22px; font-weight: 600; margin: 0 0 6px; text-wrap: balance; }
+header p { margin: 0; color: var(--muted); max-width: 68ch; }
+.scenario { display: grid; gap: 14px; }
+.scenario h2 { font-size: 15px; font-weight: 600; margin: 0; }
+.scenario h2 small { font-weight: 400; color: var(--muted); margin-left: 6px; }
+.pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 20px; align-items: start; }
+.col { display: grid; gap: 8px; }
+.tag { font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); }
+.tag.after { color: var(--ok); }
+.notes { margin: 0; padding-left: 18px; color: var(--muted); font-size: 13px; display: grid; gap: 3px; }
+.notes b { color: var(--fg); font-weight: 500; }
+
+/* ── the sidebar replica ─────────────────────────── */
+.rail { width: 100%; max-width: 280px; background: var(--panel); border: 1px solid var(--edge); border-radius: 12px; overflow: hidden; }
+.rail-body { padding: 14px 16px 12px; display: grid; gap: 10px; }
+.user { display: flex; align-items: center; gap: 8px; padding-bottom: 4px; }
+.avatar { width: 26px; height: 26px; border-radius: 50%; background: var(--track); display: grid; place-items: center; font-size: 11px; font-weight: 600; color: var(--muted); }
+.user span { font-size: 13px; font-weight: 500; }
+.eyebrow { font-size: 10px; font-weight: 500; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acct { display: grid; gap: 6px; }
+.row { display: grid; grid-template-columns: 22px 1fr 34px; align-items: center; gap: 8px; font-size: 11px; }
+.row .chip { font-family: var(--mono); color: var(--faint); }
+.row .pct { font-family: var(--mono); color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+.bar { height: 5px; border-radius: 3px; background: var(--track); overflow: hidden; }
+.bar i { display: block; height: 100%; border-radius: 3px; }
+.t-ok { background: var(--ok); } .t-warn { background: var(--warn); } .t-danger { background: var(--danger); }
+.more { font-size: 11px; font-weight: 500; color: var(--faint); text-decoration: none; }
+.foot { border-top: 1px solid var(--edge); padding: 6px 16px 8px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.accts { display: grid; gap: 12px; }
+
+/* after: account header = provider mark + name, provider word as a quiet badge */
+.ahead { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.mark { flex: none; width: 16px; height: 16px; display: grid; place-items: center; }
+.mark svg { width: 16px; height: 16px; }
+.mark.claude { color: #d97757; }
+.mark.codex { color: var(--fg); }
+.ahead .name { font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ahead .prov { margin-left: auto; font-size: 10px; color: var(--faint); }
+.sub { font-size: 10px; color: var(--faint); font-family: var(--mono); padding-left: 0; }
+.hl { background: var(--hl); border-radius: 4px; outline: 3px solid var(--hl); }
+.legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 12px; color: var(--muted); align-items: center; }
+.legend span { display: inline-flex; gap: 6px; align-items: center; }
+.alt { display: grid; gap: 10px; }
+.alt h3 { margin: 0; font-size: 13px; font-weight: 600; }
+
+/* settings cards */
+.card { background: var(--panel); border: 1px solid var(--edge); border-radius: 12px; padding: 18px 20px; display: grid; gap: 14px; width: 100%; max-width: 440px; }
+.card h4 { margin: 0; font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.card .blurb { margin: 0; font-size: 12px; color: var(--muted); }
+.cacct { display: grid; gap: 8px; border-top: 1px solid var(--edge); padding-top: 12px; }
+.cacct:first-of-type { border-top: 0; padding-top: 0; }
+.chead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; font-weight: 500; }
+.badge { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 500; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--edge); color: var(--muted); background: var(--bg); }
+.badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.badge.info { color: var(--codex); border-color: color-mix(in srgb, var(--codex) 40%, transparent); background: var(--chip-codex); }
+.badge svg { width: 12px; height: 12px; }
+.wrow { display: grid; gap: 5px; font-size: 13px; }
+.wrow .top { display: flex; justify-content: space-between; gap: 12px; }
+.wrow .top span:last-child { color: var(--muted); font-variant-numeric: tabular-nums; }
+.wrow .top b { color: var(--fg); }
+.wrow .bar { height: 8px; }
+.cfoot { font-size: 12px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
+.cfoot input { margin: 0; }
+.card .mark svg, .chead .mark svg { width: 16px; height: 16px; }
+/* run rows */
+.runs { background: var(--panel); border: 1px solid var(--edge); border-radius: 12px; overflow: hidden; width: 100%; max-width: 520px; }
+.run { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 11px 14px; border-top: 1px solid var(--edge); flex-wrap: wrap; }
+.run:first-child { border-top: 0; }
+.run .rt { font-size: 13px; font-weight: 500; }
+.run .rt small { display: block; font-weight: 400; color: var(--faint); font-size: 11px; font-family: var(--mono); }
+.run .rb { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.pill { font-size: 11px; padding: 1px 8px; border-radius: 999px; background: color-mix(in srgb, var(--ok) 15%, transparent); color: var(--ok); font-weight: 500; }
+.icon-only { display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: 999px; border: 1px solid var(--edge); background: var(--bg); color: var(--fg); }
+.icon-only svg { width: 13px; height: 13px; }
+.icon-only.claude { color: #d97757; }
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-claude" viewBox="0 0 24 24"><path fill="currentColor" d="m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z"/></symbol>
+  <symbol id="i-codex" viewBox="0 0 16 16"><g fill="currentColor">
+  <path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/>
+</g></symbol>
+  <symbol id="o-codex" viewBox="0 0 24 24"><g fill="currentColor" fill-rule="evenodd"><path d="M9.205 8.658v-2.26c0-.19.072-.333.238-.428l4.543-2.616c.619-.357 1.356-.523 2.117-.523 2.854 0 4.662 2.212 4.662 4.566 0 .167 0 .357-.024.547l-4.71-2.759a.797.797 0 00-.856 0l-5.97 3.473zm10.609 8.8V12.06c0-.333-.143-.57-.429-.737l-5.97-3.473 1.95-1.118a.433.433 0 01.476 0l4.543 2.617c1.309.76 2.189 2.378 2.189 3.948 0 1.808-1.07 3.473-2.76 4.163zM7.802 12.703l-1.95-1.142c-.167-.095-.239-.238-.239-.428V5.899c0-2.545 1.95-4.472 4.591-4.472 1 0 1.927.333 2.712.928L8.23 5.067c-.285.166-.428.404-.428.737v6.898zM12 15.128l-2.795-1.57v-3.33L12 8.658l2.795 1.57v3.33L12 15.128zm1.796 7.23c-1 0-1.927-.332-2.712-.927l4.686-2.712c.285-.166.428-.404.428-.737v-6.898l1.974 1.142c.167.095.238.238.238.428v5.233c0 2.545-1.974 4.472-4.614 4.472zm-5.637-5.303l-4.544-2.617c-1.308-.761-2.188-2.378-2.188-3.948A4.482 4.482 0 014.21 6.327v5.423c0 .333.143.571.428.738l5.947 3.449-1.95 1.118a.432.432 0 01-.476 0zm-.262 3.9c-2.688 0-4.662-2.021-4.662-4.519 0-.19.024-.38.047-.57l4.686 2.71c.286.167.571.167.856 0l5.97-3.448v2.26c0 .19-.07.333-.237.428l-4.543 2.616c-.619.357-1.356.523-2.117.523zm5.899 2.83a5.947 5.947 0 005.827-4.756C22.287 18.339 24 15.84 24 13.296c0-1.665-.713-3.282-1.998-4.448.119-.5.19-.999.19-1.498 0-3.401-2.759-5.947-5.946-5.947-.642 0-1.26.095-1.88.31A5.962 5.962 0 0010.205 0a5.947 5.947 0 00-5.827 4.757C1.713 5.447 0 7.945 0 10.49c0 1.666.713 3.283 1.998 4.448-.119.5-.19 1-.19 1.499 0 3.401 2.759 5.946 5.946 5.946.642 0 1.26-.095 1.88-.309a5.96 5.96 0 004.162 1.713z"></path></g></symbol>
+  <symbol id="n-claude" viewBox="0 0 24 24"><g stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M12 3v18"/><path d="M3 12h18"/><path d="M5.6 5.6l12.8 12.8"/><path d="M18.4 5.6L5.6 18.4"/></g></symbol>
+  <symbol id="n-codex" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"><path d="M9 8l-4 4 4 4"/><path d="M15 8l4 4-4 4"/></g></symbol>
+</svg>
+
+<div class="wrap">
+  <header>
+    <h1>Sidebar usage: one list of accounts</h1>
+    <p>Today the Claude block is named by account (TEAM) and the Codex block by provider (CODEX), and a single account is never named at all. The proposal: every account is named by its own alias, with the provider icon in front, in one list, Claude first. No provider words; hover an icon for the provider name. One "+N more" line covers both providers.</p>
+  </header>
+
+  <div class="legend">
+    <span><span class="mark claude"><svg><use href="#i-claude"/></svg></span> Claude account</span>
+    <span><span class="mark codex"><svg><use href="#i-codex"/></svg></span> Codex account</span>
+    <span>Claude: the Claude mark from simple-icons (same source as the GitLab icon uzi already ships). Codex: the OpenAI mark from Bootstrap Icons (MIT), the usual icon other agent dashboards show for Codex.</span>
+  </div>
+
+  <!-- ── Scenario 1 ─────────────────────────────── -->
+  <section class="scenario">
+    <h2>1. Current screenshot <small>4 Claude tokens (1 shown), 1 Codex account</small></h2>
+    <div class="pair">
+      <div class="col">
+        <div class="tag">Before</div>
+        <div class="rail"><div class="rail-body">
+          <div class="user"><div class="avatar">AL</div><span>alex</span></div>
+          <div class="acct">
+            <div class="eyebrow">Team</div>
+            <div class="row"><span class="chip">5h</span><span class="bar"><i class="t-ok" style="width:31%"></i></span><span class="pct">31%</span></div>
+            <div class="row"><span class="chip">7d</span><span class="bar"><i class="t-warn" style="width:62%"></i></span><span class="pct">62%</span></div>
+          </div>
+          <a class="more">+3 more tokens in Settings</a>
+          <div class="acct">
+            <div class="eyebrow hl">Codex</div>
+            <div class="row"><span class="chip">7d</span><span class="bar"><i class="t-warn" style="width:62%"></i></span><span class="pct">62%</span></div>
+          </div>
+        </div><div class="foot">v0.84.0-rc.11</div></div>
+        <ul class="notes"><li>TEAM is an account, CODEX is a provider</li><li>"+3 more tokens" sits between the two providers</li></ul>
+      </div>
+      <div class="col">
+        <div class="tag after">After</div>
+        <div class="rail"><div class="rail-body">
+          <div class="user"><div class="avatar">AL</div><span>alex</span></div>
+          <div class="accts">
+            <div class="acct">
+              <div class="ahead"><span class="mark claude" title="Claude"><svg><use href="#i-claude"/></svg></span><span class="name">team</span></div>
+              <div class="row"><span class="chip">5h</span><span class="bar"><i class="t-ok" style="width:31%"></i></span><span class="pct">31%</span></div>
+              <div class="row"><span class="chip">7d</span><span class="bar"><i class="t-warn" style="width:62%"></i></span><span class="pct">62%</span></div>
+            </div>
+            <div class="acct">
+              <div class="ahead"><span class="mark codex" title="Codex"><svg><use href="#i-codex"/></svg></span><span class="name">default</span></div>
+              <div class="row"><span class="chip">7d</span><span class="bar"><i class="t-warn" style="width:62%"></i></span><span class="pct">62%</span></div>
+            </div>
+          </div>
+          <a class="more">+3 more accounts in Settings</a>
+        </div><div class="foot">v0.84.0-rc.11</div></div>
+        <ul class="notes"><li><b>Both named by account</b>, provider shown by the icon</li><li>One "+N more" line, at the bottom</li></ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Scenario 2 ─────────────────────────────── -->
+  <section class="scenario">
+    <h2>2. One of each <small>1 Claude token, 1 Codex account</small></h2>
+    <div class="pair">
+      <div class="col">
+        <div class="tag">Before</div>
+        <div class="rail"><div class="rail-body">
+          <div class="user"><div class="avatar">AL</div><span>alex</span></div>
+          <div class="acct">
+            <div class="row"><span class="chip">5h</span><span class="bar"><i class="t-ok" style="width:31%"></i></span><span class="pct">31%</span></div>
+            <div class="row"><span class="chip">7d</span><span class="bar"><i class="t-warn" style="width:62%"></i></span><span class="pct">62%</span></div>
+          </div>
+          <div class="acct">
+            <div class="eyebrow">Codex</div>
+            <div class="row"><span class="chip">7d</span><span class="bar"><i class="t-warn" style="width:62%"></i></span><span class="pct">62%</span></div>
+          </div>
+        </div><div class="foot">v0.84.0-rc.11</div></div>
+        <ul class="notes"><li>Claude bars have no label at all</li><li>Adding a second token suddenly names the first one</li></ul>
+      </div>
+      <div class="col">
+        <div class="tag after">After</div>
+        <div class="rail"><div class="rail-body">
+          <div class="user"><div class="avatar">AL</div><span>alex</span></div>
+          <div class="accts">
+            <div class="acct">
+              <div class="ahead"><span class="mark claude" title="Claude"><svg><use href="#i-claude"/></svg></span><span class="name">team</span></div>
+              <div class="row"><span class="chip">5h</span><span class="bar"><i class="t-ok" style="width:31%"></i></span><span class="pct">31%</span></div>
+              <div class="row"><span class="chip">7d</span><span class="bar"><i class="t-warn" style="width:62%"></i></span><span class="pct">62%</span></div>
+            </div>
+            <div class="acct">
+              <div class="ahead"><span class="mark codex" title="Codex"><svg><use href="#i-codex"/></svg></span><span class="name">default</span></div>
+              <div class="row"><span class="chip">7d</span><span class="bar"><i class="t-warn" style="width:62%"></i></span><span class="pct">62%</span></div>
+            </div>
+          </div>
+        </div><div class="foot">v0.84.0-rc.11</div></div>
+        <ul class="notes"><li>Names are stable: adding an account never renames the others</li></ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Scenario 3 ─────────────────────────────── -->
+  <section class="scenario">
+    <h2>3. Two of each, with an extra model bucket <small>ci-bot also reports a gpt-5.6-sol limit</small></h2>
+    <div class="pair">
+      <div class="col">
+        <div class="tag">Before</div>
+        <div class="rail"><div class="rail-body">
+          <div class="user"><div class="avatar">AL</div><span>alex</span></div>
+          <div class="accts">
+            <div class="acct">
+              <div class="eyebrow">Team</div>
+              <div class="row"><span class="chip">5h</span><span class="bar"><i class="t-ok" style="width:31%"></i></span><span class="pct">31%</span></div>
+              <div class="row"><span class="chip">7d</span><span class="bar"><i class="t-warn" style="width:62%"></i></span><span class="pct">62%</span></div>
+            </div>
+            <div class="acct">
+              <div class="eyebrow">Work</div>
+              <div class="row"><span class="chip">5h</span><span class="bar"><i class="t-ok" style="width:12%"></i></span><span class="pct">12%</span></div>
+              <div class="row"><span class="chip">7d</span><span class="bar"><i class="t-ok" style="width:20%"></i></span><span class="pct">20%</span></div>
+            </div>
+          </div>
+          <div class="acct">
+            <div class="eyebrow">Codex</div>
+            <div class="accts">
+              <div class="acct">
+                <div class="eyebrow">Default</div>
+                <div class="row"><span class="chip">7d</span><span class="bar"><i class="t-warn" style="width:62%"></i></span><span class="pct">62%</span></div>
+              </div>
+              <div class="acct">
+                <div class="eyebrow">Ci-bot</div>
+                <div class="row"><span class="chip">5h</span><span class="bar"><i class="t-ok" style="width:18%"></i></span><span class="pct">18%</span></div>
+                <div class="row"><span class="chip">7d</span><span class="bar"><i class="t-ok" style="width:44%"></i></span><span class="pct">44%</span></div>
+                <div class="row"><span class="chip">5h</span><span class="bar"><i class="t-danger" style="width:90%"></i></span><span class="pct">90%</span></div>
+              </div>
+            </div>
+          </div>
+        </div><div class="foot">v0.84.0-rc.11</div></div>
+        <ul class="notes"><li>Two header levels for Codex, one for Claude</li><li>The model bucket's second 5h row is unlabelled (name only in the aria label)</li></ul>
+      </div>
+      <div class="col">
+        <div class="tag after">After</div>
+        <div class="rail"><div class="rail-body">
+          <div class="user"><div class="avatar">AL</div><span>alex</span></div>
+          <div class="accts">
+            <div class="acct">
+              <div class="ahead"><span class="mark claude" title="Claude"><svg><use href="#i-claude"/></svg></span><span class="name">team</span></div>
+              <div class="row"><span class="chip">5h</span><span class="bar"><i class="t-ok" style="width:31%"></i></span><span class="pct">31%</span></div>
+              <div class="row"><span class="chip">7d</span><span class="bar"><i class="t-warn" style="width:62%"></i></span><span class="pct">62%</span></div>
+            </div>
+            <div class="acct">
+              <div class="ahead"><span class="mark claude" title="Claude"><svg><use href="#i-claude"/></svg></span><span class="name">work</span></div>
+              <div class="row"><span class="chip">5h</span><span class="bar"><i class="t-ok" style="width:12%"></i></span><span class="pct">12%</span></div>
+              <div class="row"><span class="chip">7d</span><span class="bar"><i class="t-ok" style="width:20%"></i></span><span class="pct">20%</span></div>
+            </div>
+            <div class="acct">
+              <div class="ahead"><span class="mark codex" title="Codex"><svg><use href="#i-codex"/></svg></span><span class="name">default</span></div>
+              <div class="row"><span class="chip">7d</span><span class="bar"><i class="t-warn" style="width:62%"></i></span><span class="pct">62%</span></div>
+            </div>
+            <div class="acct">
+              <div class="ahead"><span class="mark codex" title="Codex"><svg><use href="#i-codex"/></svg></span><span class="name">ci-bot</span></div>
+              <div class="row"><span class="chip">5h</span><span class="bar"><i class="t-ok" style="width:18%"></i></span><span class="pct">18%</span></div>
+              <div class="row"><span class="chip">7d</span><span class="bar"><i class="t-ok" style="width:44%"></i></span><span class="pct">44%</span></div>
+              <div class="sub">gpt-5.6-sol</div>
+              <div class="row"><span class="chip">5h</span><span class="bar"><i class="t-danger" style="width:90%"></i></span><span class="pct">90%</span></div>
+            </div>
+          </div>
+        </div><div class="foot">v0.84.0-rc.11</div></div>
+        <ul class="notes"><li>One flat list, one header level</li><li>The default "codex" bucket stays unnamed; an extra bucket gets a small caption</li></ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Settings ─────────────────────────────── -->
+  <section class="scenario">
+    <h2>4. Settings limit cards <small>the full per-account view</small></h2>
+    <div class="pair">
+      <div class="col"><div class="tag">Before</div><div class="card"><h4>Claude limits</h4><p class="blurb">Usage of each token's 5-hour and 7-day windows.</p>
+<div class="cacct"><div class="chead">team <span class="badge">default</span></div><div class="wrow"><div class="top"><span>5h window</span><span><b>31%</b> · resets in 2h 29m</span></div><span class="bar"><i class="t-ok" style="width:31%"></i></span></div><div class="wrow"><div class="top"><span>7d window</span><span><b>62%</b> · resets in 1d 13h</span></div><span class="bar"><i class="t-warn" style="width:62%"></i></span></div><div class="cfoot"><span class="badge ok">live</span> updated 2m ago</div></div>
+<div class="cacct"><div class="chead">personal</div><div class="wrow"><div class="top"><span>5h window</span><span><b>4%</b> · resets in 3h 50m</span></div><span class="bar"><i class="t-ok" style="width:4%"></i></span></div><div class="wrow"><div class="top"><span>7d window</span><span><b>11%</b> · resets in 4d 02h</span></div><span class="bar"><i class="t-ok" style="width:11%"></i></span></div><div class="cfoot"><span class="badge ok">live</span> updated 2m ago</div></div>
+</div>
+<div class="card"><h4>Codex limits</h4><p class="blurb">Usage of each linked Codex account.</p>
+<div class="cacct"><div class="chead">default <span class="badge ok">default</span> <span class="badge ok">fresh</span></div><div class="sub">codex</div><div class="wrow"><div class="top"><span>7d window</span><span><b>62%</b> · resets in 1d 10h</span></div><span class="bar"><i class="t-warn" style="width:62%"></i></span></div><div class="cfoot"><input type="checkbox" checked disabled> Show in sidebar and TUI</div></div>
+</div>
+        <ul class="notes"><li>A lone Claude token is unnamed (shown here with two, so named)</li><li>Codex repeats the default bucket name ("codex") above the bars</li></ul></div>
+      <div class="col"><div class="tag after">After</div><div class="card"><h4><span class="mark claude" title="Claude"><svg><use href="#i-claude"/></svg></span> Claude limits</h4><p class="blurb">Usage of each token's 5-hour and 7-day windows.</p>
+<div class="cacct"><div class="chead"><span class="mark claude" title="Claude"><svg><use href="#i-claude"/></svg></span> team <span class="badge">default</span></div><div class="wrow"><div class="top"><span>5h window</span><span><b>31%</b> · resets in 2h 29m</span></div><span class="bar"><i class="t-ok" style="width:31%"></i></span></div><div class="wrow"><div class="top"><span>7d window</span><span><b>62%</b> · resets in 1d 13h</span></div><span class="bar"><i class="t-warn" style="width:62%"></i></span></div><div class="cfoot"><span class="badge ok">live</span> updated 2m ago</div></div>
+<div class="cacct"><div class="chead"><span class="mark claude" title="Claude"><svg><use href="#i-claude"/></svg></span> personal</div><div class="wrow"><div class="top"><span>5h window</span><span><b>4%</b> · resets in 3h 50m</span></div><span class="bar"><i class="t-ok" style="width:4%"></i></span></div><div class="wrow"><div class="top"><span>7d window</span><span><b>11%</b> · resets in 4d 02h</span></div><span class="bar"><i class="t-ok" style="width:11%"></i></span></div><div class="cfoot"><span class="badge ok">live</span> updated 2m ago</div></div>
+</div>
+<div class="card"><h4><span class="mark codex" title="Codex"><svg><use href="#i-codex"/></svg></span> Codex limits</h4><p class="blurb">Usage of each linked Codex account.</p>
+<div class="cacct"><div class="chead"><span class="mark codex" title="Codex"><svg><use href="#i-codex"/></svg></span> default <span class="badge ok">default</span> <span class="badge ok">fresh</span></div><div class="wrow"><div class="top"><span>7d window</span><span><b>62%</b> · resets in 1d 10h</span></div><span class="bar"><i class="t-warn" style="width:62%"></i></span></div><div class="cfoot"><input type="checkbox" checked disabled> Show in sidebar and TUI</div></div>
+</div>
+        <ul class="notes"><li>Cards stay separate: each sits under its own credential card on the page</li><li>Logo on the card title and on every account; the account is always named</li><li>Default "codex" bucket caption dropped, as in the sidebar</li></ul></div>
+    </div>
+  </section>
+
+  <!-- ── Runs ─────────────────────────────── -->
+  <section class="scenario">
+    <h2>5. Run list harness badge <small>which agent runs this issue</small></h2>
+    <div class="pair">
+      <div class="col"><div class="tag">Before</div><div class="runs">
+<div class="run"><div class="rt">Admin health: triage-first layout<small>#1648 · 2h 10m</small></div><div class="rb"><span class="badge info">Codex</span><span class="badge info">3/7</span><span class="pill">running</span></div></div>
+<div class="run"><div class="rt">Schedules unified list<small>#1645 · 48m</small></div><div class="rb"><span class="badge info">5/6</span><span class="pill">running</span></div></div>
+</div>
+        <ul class="notes"><li>Codex runs get a "Codex" text badge; Claude runs are unmarked</li></ul></div>
+      <div class="col"><div class="tag after">After</div><div class="runs">
+<div class="run"><div class="rt">Admin health: triage-first layout<small>#1648 · 2h 10m</small></div><div class="rb"><span class="icon-only" title="Runs on Codex" aria-label="Codex"><svg><use href="#i-codex"/></svg></span><span class="badge info">3/7</span><span class="pill">running</span></div></div>
+<div class="run"><div class="rt">Schedules unified list<small>#1645 · 48m</small></div><div class="rb"><span class="icon-only claude" title="Runs on Claude" aria-label="Claude"><svg><use href="#i-claude"/></svg></span><span class="badge info">5/6</span><span class="pill">running</span></div></div>
+</div>
+        <ul class="notes"><li>A small logo chip on every run, tooltip and screen-reader name carry the word</li><li>Open question: mark Claude runs too (shown), or keep Claude unmarked as today</li></ul></div>
+    </div>
+  </section>
+
+  <!-- ── Icon options ───────────────────────────── -->
+  <section class="scenario">
+    <h2>Icon options <small>same data, pick one</small></h2>
+    <div class="pair">
+      <div class="alt">
+        <h3>A. Claude mark + OpenAI mark (used above)</h3>
+        <div class="rail"><div class="rail-body">
+          <div class="acct">
+            <div class="ahead"><span class="mark claude" title="Claude"><svg><use href="#i-claude"/></svg></span><span class="name">team</span></div>
+            <div class="row"><span class="chip">5h</span><span class="bar"><i class="t-ok" style="width:31%"></i></span><span class="pct">31%</span></div>
+          </div>
+          <div class="acct">
+            <div class="ahead"><span class="mark codex" title="Codex"><svg><use href="#i-codex"/></svg></span><span class="name">default</span></div>
+            <div class="row"><span class="chip">7d</span><span class="bar"><i class="t-warn" style="width:62%"></i></span><span class="pct">62%</span></div>
+          </div>
+        </div></div>
+        <ul class="notes"><li>Both recognisable at a glance</li></ul>
+      </div>
+      <div class="alt">
+        <h3>C. Both neutral</h3>
+        <div class="rail"><div class="rail-body">
+          <div class="acct">
+            <div class="ahead"><span class="mark claude" title="Claude"><svg><use href="#n-claude"/></svg></span><span class="name">team</span></div>
+            <div class="row"><span class="chip">5h</span><span class="bar"><i class="t-ok" style="width:31%"></i></span><span class="pct">31%</span></div>
+          </div>
+          <div class="acct">
+            <div class="ahead"><span class="mark codex" title="Codex"><svg><use href="#n-codex"/></svg></span><span class="name">default</span></div>
+            <div class="row"><span class="chip">7d</span><span class="bar"><i class="t-warn" style="width:62%"></i></span><span class="pct">62%</span></div>
+          </div>
+        </div></div>
+        <ul class="notes"><li>Symmetric and trademark-free, but both need learning</li></ul>
+      </div>
+    </div>
+  </section>
+</div>
