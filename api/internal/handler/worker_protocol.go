@@ -272,6 +272,16 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("worker reported an out-of-range max_concurrent_runs; dropping", "worker_id", wkr.ID.String(), "value", *advertisedCap)
 		advertisedCap = nil
 	}
+	// An ephemeral (run-bound) worker can claim only its bound run (PRD #529
+	// Decision 4: ClaimRun's is_ephemeral/ephemeral_run_id clause), so its effective
+	// run-lane cap is 1 whatever it advertises (absent, 2, out of range). Clamped
+	// here, server-side, so the stored cap does not depend on the worker image
+	// version; heartbeats never write the cap (only RegisterWorker does), so this is
+	// the one place it is set. Persistent workers keep their advertised cap (issue #1624).
+	if wkr.Ephemeral {
+		one := 1
+		advertisedCap = &one
+	}
 	// A register-carried snapshot is parsed only when the feature is enabled; #1390's worker
 	// never sends one, so this is nil in practice (the path is #1391's). An unparseable body
 	// yields nil (dropped, logged) — never a register failure.
