@@ -26,7 +26,18 @@ import { browserTimezone } from "../lib/timezone";
 import { DefaultJobs, catalogEntryId } from "../components/DefaultJobs";
 import { ScheduleListRow, scheduleNameId } from "../components/ScheduleListRow";
 import { formatStamp } from "../components/LastRun";
-import { scheduleDisplayName, sortSchedules } from "../lib/scheduleList";
+import { FILTER_ALL_ID, ScheduleFilters } from "../components/ScheduleFilters";
+import {
+  NO_FILTER,
+  clearHidingFilters,
+  foldRefs,
+  isFoldedOnce,
+  repoOptions,
+  scheduleDisplayName,
+  sourceCounts,
+  splitFold,
+  type ScheduleFilter,
+} from "../lib/scheduleList";
 import {
   Alert,
   Badge,
@@ -35,9 +46,12 @@ import {
   PageHeader,
   cx,
 } from "../components/ui";
-import { ClockIcon, PlusIcon } from "../components/icons";
+import { ChevronRightIcon, ClockIcon, PlusIcon } from "../components/icons";
 
 type Tab = "schedules" | "catalog";
+
+// A pending D12 reveal (see `pendingReveal` in the page).
+type Reveal = { id: string; focus: boolean; afterSeq: number };
 
 // The tab order, for the APG roving-tabindex arrow-key handler.
 const TAB_ORDER: Tab[] = ["schedules", "catalog"];
@@ -96,10 +110,28 @@ export function Schedules() {
   // mutation resolving in ONE React batch would still let the read land last.
   const pauseRev = useRef(0);
   // D12: a row to bring into view once it is rendered on the Schedules tab (after a clone
-  // or add-repo), and whether to move focus to its name cell. Consumed by the effect below.
-  const [pendingReveal, setPendingReveal] = useState<{ id: string; focus: boolean } | null>(null);
+  // or add-repo), and whether to move focus to its name cell. `afterSeq` is the load
+  // sequence of the reload that followed the mutation: the request is dropped as "the row
+  // is gone" only by a list loaded at or after it, never by an older one still on screen
+  // (an overlapping reload can supersede the awaited one, so `await reload()` returning
+  // does not mean its list was applied). Consumed by the effect below.
+  const [pendingReveal, setPendingReveal] = useState<Reveal | null>(null);
   // The cloned row whose name cell takes focus when the edit modal it opened closes (D12).
-  const [focusAfterEdit, setFocusAfterEdit] = useState<string | null>(null);
+  const [focusAfterEdit, setFocusAfterEdit] = useState<{ id: string; afterSeq: number } | null>(null);
+  // D5 filters: page-level state, so they survive switching tabs and back; not persisted
+  // and not in the URL. `foldOpen` is the D6 fold's disclosure: null follows the derived
+  // default (open only when the fold holds every match), a boolean is the user's own
+  // choice, honoured until the filters change.
+  const [filter, setFilter] = useState<ScheduleFilter>(NO_FILTER);
+  const [foldOpen, setFoldOpen] = useState<boolean | null>(null);
+  const applyFilter = (next: ScheduleFilter) => {
+    setFilter(next);
+    setFoldOpen(null);
+  };
+  // Load sequence: `loadSeq` is bumped as each list load starts; `loadedSeq` is the
+  // sequence of the load whose list is in `schedules` (see pendingReveal).
+  const loadSeq = useRef(0);
+  const [loadedSeq, setLoadedSeq] = useState(0);
   // A catalog entry to focus once the Job catalog tab has rendered ("from catalog").
   const [pendingCatalogFocus, setPendingCatalogFocus] = useState<string | null>(null);
   // Session-scoped clone provenance: the DTO carries no "cloned from" field (a clone
@@ -134,6 +166,7 @@ export function Schedules() {
   // renders the skeleton the same as the old code did with catalog still null.
   const { error: loadError, reload } = useAsyncData(
     async ({ isCurrent }) => {
+      const seq = ++loadSeq.current;
       const rev = pauseRev.current;
       const [rows, cat, repoList, pauseState] = await Promise.all([
         api.listSchedules(),
@@ -143,6 +176,7 @@ export function Schedules() {
       ]);
       if (!isCurrent()) return;
       setSchedules(rows);
+      setLoadedSeq(seq);
       setLanding((cur) => cur ?? (rows.length > 0 ? "schedules" : "catalog"));
       setCatalog(cat);
       setRepos(repoList);
@@ -152,6 +186,16 @@ export function Schedules() {
     [],
     { fallback: "Could not load schedules", onFetchStart: () => setError("") },
   );
+
+  // reloadMarked reloads and returns that load's sequence. The fetcher bumps loadSeq
+  // synchronously when reload() starts it, so reading it right after the call names
+  // exactly this load.
+  const reloadMarked = async () => {
+    const done = reload();
+    const seq = loadSeq.current;
+    await done;
+    return seq;
+  };
 
   const toggleEnabled = async (s: Schedule) => {
     setBusyId(s.id);
@@ -256,12 +300,12 @@ export function Schedules() {
       const clone = await api.cloneSchedule(s.id);
       const label = s.origin === "default" && s.catalog_slug ? catalogName(catalog, s.catalog_slug) : "a schedule";
       setClonedFrom((m) => ({ ...m, [clone.id]: label }));
-      await reload();
+      const afterSeq = await reloadMarked();
       setEditing(clone);
       // D12: show the clone on the Schedules tab behind the modal; its name cell takes
       // focus when the modal closes (the modal holds focus while open).
-      revealSchedule(clone.id, false);
-      setFocusAfterEdit(clone.id);
+      revealSchedule(clone.id, false, afterSeq);
+      setFocusAfterEdit({ id: clone.id, afterSeq });
     } catch (err) {
       setError(errorMessage(err, "Could not clone the schedule"));
     } finally {
@@ -275,14 +319,14 @@ export function Schedules() {
   // keeps its own focus handling.
   const removeSchedule = async (s: Schedule) => {
     const fromList = tab === "schedules";
-    const at = rows.findIndex((r) => r.id === s.id);
-    const neighbour = at < 0 ? undefined : (rows[at + 1] ?? rows[at - 1]);
+    const at = displayed.findIndex((r) => r.id === s.id);
+    const neighbour = at < 0 ? undefined : (displayed[at + 1] ?? displayed[at - 1]);
     setBusyId(s.id);
     setError("");
     try {
       await api.deleteSchedule(s.id);
       await reload();
-      if (fromList && neighbour) setPendingReveal({ id: neighbour.id, focus: true });
+      if (fromList && neighbour) setPendingReveal({ id: neighbour.id, focus: true, afterSeq: 0 });
       else if (fromList) tabRefs.current.schedules?.focus();
     } catch (err) {
       setError(errorMessage(err, "Could not remove the schedule"));
@@ -292,12 +336,12 @@ export function Schedules() {
   };
 
   // revealSchedule brings a just-created row into view (D12): switch to the Schedules tab,
-  // then (once the row is rendered) scroll it into view and optionally focus its name
-  // cell. M2 extends this to clear any filter that would hide the row and to expand the
-  // fired-one-shot fold when the row lands in it.
-  const revealSchedule = (id: string, focus: boolean) => {
+  // then, once the row is in the loaded list, clear any filter that would hide it, expand
+  // the fired-one-shot fold if it lands there, scroll it into view and optionally focus
+  // its name cell (the effect below). `afterSeq` is the mutation's reload (reloadMarked).
+  const revealSchedule = (id: string, focus: boolean, afterSeq: number) => {
     setTab("schedules");
-    setPendingReveal({ id, focus });
+    setPendingReveal({ id, focus, afterSeq });
   };
 
   // "from catalog" (and, until M3 wires its picker, "Enable on another repo"): switch to
@@ -311,7 +355,7 @@ export function Schedules() {
   const closeEditing = () => {
     setEditing(null);
     if (focusAfterEdit) {
-      setPendingReveal({ id: focusAfterEdit, focus: true });
+      setPendingReveal({ ...focusAfterEdit, focus: true });
       setFocusAfterEdit(null);
     }
   };
@@ -328,8 +372,7 @@ export function Schedules() {
     try {
       const sibling = await api.addScheduleRepo(source.id, repoId);
       setNotice("Added on another repo.");
-      await reload();
-      revealSchedule(sibling.id, true);
+      revealSchedule(sibling.id, true, await reloadMarked());
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
         setNotice("That schedule is already on that repo.");
@@ -403,25 +446,6 @@ export function Schedules() {
     reload();
   };
 
-  // D12 reveal: runs once the target row exists in the DOM (the list may still be
-  // reloading, and the tab switch lands a render later), then clears itself.
-  useEffect(() => {
-    if (!pendingReveal || tab !== "schedules") return;
-    const el = document.getElementById(scheduleNameId(pendingReveal.id));
-    if (!el) {
-      // The row is gone from a loaded list (removed meanwhile): drop the request so it
-      // cannot fire on some later render, and keep focus off <body>.
-      if (schedules && !schedules.some((r) => r.id === pendingReveal.id)) {
-        setPendingReveal(null);
-        if (pendingReveal.focus) tabRefs.current.schedules?.focus();
-      }
-      return;
-    }
-    el.scrollIntoView?.({ block: "nearest" });
-    if (pendingReveal.focus) el.focus();
-    setPendingReveal(null);
-  }, [pendingReveal, tab, schedules]);
-
   useEffect(() => {
     if (!pendingCatalogFocus || tab !== "catalog") return;
     const el = document.getElementById(catalogEntryId(pendingCatalogFocus));
@@ -448,7 +472,16 @@ export function Schedules() {
     return slug && entriesBySlug.has(slug) ? () => showInCatalog(slug) : undefined;
   };
   const all = schedules ?? [];
-  const rows = sortSchedules(all, nameOf);
+  // D5 → D6 → D3: filter, fold the fired one-shots that survived, sort each part.
+  const { shown, folded } = splitFold(all, filter, nameOf);
+  // The fold opens by itself when it holds every match, so a filter never looks empty
+  // while hiding its matches; a user's own open/close stands until the filters change.
+  const foldExpanded = foldOpen ?? (shown.length === 0 && folded.length > 0);
+  // The rows on screen, in order (Remove hands focus to a displayed neighbour).
+  const displayed = foldExpanded ? [...shown, ...folded] : shown;
+  const counts = sourceCounts(all);
+  const repoChoices = repoOptions(all);
+  const jobName = filter.jobSlug === null ? null : (entriesBySlug.get(filter.jobSlug)?.name ?? filter.jobSlug);
   const total = all.length;
   const enabledCount = all.filter((s) => s.enabled).length;
   const activeCount = all.filter((s) => s.enabled && s.status === "active").length;
@@ -456,6 +489,61 @@ export function Schedules() {
   const enabledSlugs = new Set(all.filter((s) => s.origin === "default" && s.catalog_slug).map((s) => s.catalog_slug));
   const notEnabled = (catalog?.entries ?? []).filter((e) => !enabledSlugs.has(e.slug)).length;
   const loaded = schedules !== null && catalog !== null;
+
+  const renderRow = (s: Schedule) => (
+    <ScheduleListRow
+      key={s.id}
+      s={s}
+      name={nameOf(s)}
+      busy={busyId === s.id}
+      addBusy={busyId !== ""}
+      clonedFrom={clonedFrom[s.id]}
+      pauseNote={pauseNote}
+      repos={repos}
+      onToggle={() => toggleEnabled(s)}
+      onRunNow={() => runNow(s)}
+      onEdit={() => setEditing(s)}
+      onReset={() => resetDefault(s)}
+      onClone={() => cloneSchedule(s)}
+      onRemove={() => removeSchedule(s)}
+      onAddRepo={(repoId) => addRepo(s, repoId)}
+      onShowInCatalog={catalogLinkFor(s)}
+    />
+  );
+
+  // D12 reveal: runs once the target row is in the loaded list (the list may still be
+  // reloading, and the tab switch lands a render later). First it clears the filters in
+  // the row's way and opens the fold it lands in, one render each; then it scrolls to and
+  // optionally focuses the row, and clears itself.
+  useEffect(() => {
+    if (!pendingReveal || tab !== "schedules") return;
+    const row = schedules?.find((r) => r.id === pendingReveal.id);
+    if (row) {
+      const cleared = clearHidingFilters(filter, row);
+      if (cleared !== filter) {
+        applyFilter(cleared);
+        return;
+      }
+      if (isFoldedOnce(row) && !foldExpanded) {
+        setFoldOpen(true);
+        return;
+      }
+    }
+    const el = document.getElementById(scheduleNameId(pendingReveal.id));
+    if (!el) {
+      // The row is gone from a list loaded after the mutation (removed meanwhile): drop
+      // the request so it cannot fire on some later render, and keep focus off <body>.
+      // A list that predates the mutation proves nothing, so keep waiting on it.
+      if (!row && schedules && loadedSeq >= pendingReveal.afterSeq) {
+        setPendingReveal(null);
+        if (pendingReveal.focus) tabRefs.current.schedules?.focus();
+      }
+      return;
+    }
+    el.scrollIntoView?.({ block: "nearest" });
+    if (pendingReveal.focus) el.focus();
+    setPendingReveal(null);
+  }, [pendingReveal, tab, schedules, loadedSeq, filter, foldExpanded]);
 
   // The pre-formatted "paused until <stamp>" line every Next-run cell shows while the
   // switch is on (warn-coloured at the render site); null when not paused. Computed once
@@ -608,7 +696,7 @@ export function Schedules() {
           {(error || loadError) && <Alert message={error || loadError} />}
           {notice && <Alert message={notice} tone="info" />}
 
-          {rows.length === 0 ? (
+          {all.length === 0 ? (
             <div className="rounded-xl border border-dashed border-edge p-10 text-center">
               <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-lg bg-raised text-lg text-muted">
                 <ClockIcon />
@@ -631,43 +719,70 @@ export function Schedules() {
               <p className="text-sm text-muted">
                 {`${total} schedule${total === 1 ? "" : "s"} · ${activeCount} active · ${enabledCount} enabled`}
               </p>
-              {/* Below md the table restyles into stacked cards (D11): no horizontal scroll. */}
-              <div className="rounded-xl border border-edge bg-surface md:overflow-x-auto">
-                <table className="block w-full text-left text-sm md:table">
-                  <thead className="hidden md:table-header-group">
-                    <tr className="border-b border-edge text-[12.5px] text-muted">
-                      <th className="px-4 py-3 font-medium">Target · repo</th>
-                      <th className="px-4 py-3 font-medium">When</th>
-                      <th className="px-4 py-3 font-medium">Next run</th>
-                      <th className="px-4 py-3 font-medium">Last run</th>
-                      <th className="px-4 py-3 font-medium">Options</th>
-                      <th className="px-4 py-3 text-right font-medium">Actions · On</th>
-                    </tr>
-                  </thead>
-                  <tbody className="block md:table-row-group">
-                    {rows.map((s) => (
-                      <ScheduleListRow
-                        key={s.id}
-                        s={s}
-                        name={nameOf(s)}
-                        busy={busyId === s.id}
-                        addBusy={busyId !== ""}
-                        clonedFrom={clonedFrom[s.id]}
-                        pauseNote={pauseNote}
-                        repos={repos}
-                        onToggle={() => toggleEnabled(s)}
-                        onRunNow={() => runNow(s)}
-                        onEdit={() => setEditing(s)}
-                        onReset={() => resetDefault(s)}
-                        onClone={() => cloneSchedule(s)}
-                        onRemove={() => removeSchedule(s)}
-                        onAddRepo={(repoId) => addRepo(s, repoId)}
-                        onShowInCatalog={catalogLinkFor(s)}
-                      />
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+              <ScheduleFilters
+                source={filter.source}
+                counts={counts}
+                onSource={(source) => applyFilter({ ...filter, source })}
+                repos={repoChoices}
+                repoId={filter.repoId}
+                onRepo={(repoId) => applyFilter({ ...filter, repoId })}
+                jobName={jobName}
+                onClearJob={() => applyFilter({ ...filter, jobSlug: null })}
+              />
+              {shown.length === 0 && folded.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-edge p-8 text-center">
+                  <p className="text-sm text-muted">No schedules match</p>
+                  <div className="mt-3">
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => {
+                        applyFilter(NO_FILTER);
+                        // The button unmounts with the empty state: hand focus to the
+                        // now-pressed "All" chip rather than letting it fall to <body>.
+                        document.getElementById(FILTER_ALL_ID)?.focus();
+                      }}
+                    >
+                      Clear filters
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                /* Below md the table restyles into stacked cards (D11): no horizontal scroll. */
+                <div className="rounded-xl border border-edge bg-surface md:overflow-x-auto">
+                  <table className="block w-full text-left text-sm md:table">
+                    <thead className="hidden md:table-header-group">
+                      <tr className="border-b border-edge text-[12.5px] text-muted">
+                        <th className="px-4 py-3 font-medium">Target · repo</th>
+                        <th className="px-4 py-3 font-medium">When</th>
+                        <th className="px-4 py-3 font-medium">Next run</th>
+                        <th className="px-4 py-3 font-medium">Last run</th>
+                        <th className="px-4 py-3 font-medium">Options</th>
+                        <th className="px-4 py-3 text-right font-medium">Actions · On</th>
+                      </tr>
+                    </thead>
+                    <tbody className="block md:table-row-group">
+                      {shown.map(renderRow)}
+                    </tbody>
+                    {folded.length > 0 && (
+                      <>
+                        <tbody className="block md:table-row-group">
+                          <FoldRow
+                            count={folded.length}
+                            refs={foldRefs(folded)}
+                            expanded={foldExpanded}
+                            onToggle={() => setFoldOpen(!foldExpanded)}
+                          />
+                        </tbody>
+                        {/* The disclosure's aria-controls target; rows render only while open. */}
+                        <tbody id={FOLD_ID} className="block md:table-row-group">
+                          {foldExpanded && folded.map(renderRow)}
+                        </tbody>
+                      </>
+                    )}
+                  </table>
+                </div>
+              )}
             </>
           )}
 
@@ -689,6 +804,53 @@ export function Schedules() {
         />
       )}
     </div>
+  );
+}
+
+// The D6 fold's rows (the disclosure's aria-controls target).
+const FOLD_ID = "schedules-fired-fold";
+
+// FoldRow is the D6 disclosure: one row at the bottom of the table standing for the
+// fired one-time schedules that match the filters, with their issue refs. A real button
+// carries the expanded state; it works on the narrow-card layout (D11) as a full-width row.
+function FoldRow({
+  count,
+  refs,
+  expanded,
+  onToggle,
+}: {
+  count: number;
+  refs: string[];
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const shownRefs = refs.slice(0, 8);
+  return (
+    <tr className="block border-t border-edge md:table-row">
+      <td colSpan={6} className="block px-4 py-2.5 md:table-cell">
+        <button
+          type="button"
+          aria-expanded={expanded}
+          aria-controls={FOLD_ID}
+          onClick={onToggle}
+          className="flex w-full flex-wrap items-center gap-x-2 gap-y-1 rounded text-left text-[12.5px] text-muted hover:text-fg"
+        >
+          <ChevronRightIcon
+            aria-hidden="true"
+            className={cx("shrink-0 transition-transform motion-reduce:transition-none", expanded && "rotate-90")}
+          />
+          <span className="font-medium">
+            {count} one-time schedule{count === 1 ? "" : "s"} already fired
+          </span>
+          {shownRefs.length > 0 && (
+            <span className="font-mono text-faint">
+              {shownRefs.join(" ")}
+              {refs.length > shownRefs.length && ` +${refs.length - shownRefs.length} more`}
+            </span>
+          )}
+        </button>
+      </td>
+    </tr>
   );
 }
 

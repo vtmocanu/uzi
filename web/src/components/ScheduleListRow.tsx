@@ -13,7 +13,7 @@
 // rendered in exactly one place per layout (the name line on a card, the last column on a
 // table row), so its DOM and focus order always match where it is drawn.
 
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { Repo, Schedule } from "../lib/api";
 import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
@@ -113,7 +113,28 @@ export function ScheduleListRow({
   const [addingRepo, setAddingRepo] = useState(false);
   const addPanelRef = useRef<HTMLTableCellElement>(null);
   const menuButtonRef = useRef<HTMLButtonElement>(null);
-  const mdUp = useSyncExternalStore(subscribeMdUp, readMdUp, () => true);
+  // The toggle moves between cells when the layout flips (see the header), which
+  // unmounts the focused switch and drops focus to <body>. The subscription notes, BEFORE
+  // the re-render, whether this row's switch held focus; the layout effect then focuses
+  // the remounted one before paint.
+  const rowRef = useRef<HTMLTableRowElement>(null);
+  const refocusToggle = useRef(false);
+  const subscribe = useCallback(
+    (onChange: () => void) =>
+      subscribeMdUp(() => {
+        const active = document.activeElement;
+        refocusToggle.current =
+          active !== null && active.getAttribute("role") === "switch" && !!rowRef.current?.contains(active);
+        onChange();
+      }),
+    [],
+  );
+  const mdUp = useSyncExternalStore(subscribe, readMdUp, () => true);
+  useLayoutEffect(() => {
+    if (!refocusToggle.current) return;
+    refocusToggle.current = false;
+    rowRef.current?.querySelector<HTMLElement>('[role="switch"]')?.focus();
+  }, [mdUp]);
 
   // Closing the add-repo panel (Cancel or a submit) puts focus back on the More actions
   // button that opened it, rather than letting it fall to <body> with the panel. A
@@ -151,6 +172,7 @@ export function ScheduleListRow({
   return (
     <>
       <tr
+        ref={rowRef}
         className={cx(
           "grid grid-cols-2 border-t border-edge py-2 align-middle md:table-row md:py-0",
           off && "opacity-60",

@@ -80,3 +80,107 @@ export function sortSchedules(rows: readonly Schedule[], nameOf: (s: Schedule) =
     );
   });
 }
+
+// ── D5 filters and the D6 fold ───────────────────────────────────────────────
+
+// The single-select source chip group (D5): All · From catalog · Mine · Paused.
+export type SourceFilter = "all" | "catalog" | "mine" | "paused";
+
+// The page-level filter state (D5). `repoId` and `jobSlug` are null when unset. Not
+// persisted and not in the URL: it lives in the page's state only.
+export interface ScheduleFilter {
+  source: SourceFilter;
+  repoId: string | null;
+  jobSlug: string | null;
+}
+
+export const NO_FILTER: ScheduleFilter = { source: "all", repoId: null, jobSlug: null };
+
+function matchesSource(s: Schedule, source: SourceFilter): boolean {
+  switch (source) {
+    case "all":
+      return true;
+    case "catalog":
+      return s.origin === "default";
+    case "mine":
+      return s.origin === "user";
+    case "paused":
+      return !s.enabled;
+  }
+}
+
+// matchesFilter is the intersection of every active dimension: source chip, repo, job.
+// The Job filter names a catalog entry, so it matches that entry's default rows.
+export function matchesFilter(s: Schedule, f: ScheduleFilter): boolean {
+  if (!matchesSource(s, f.source)) return false;
+  if (f.repoId !== null && s.repo_id !== f.repoId) return false;
+  if (f.jobSlug !== null && !(s.origin === "default" && s.catalog_slug === f.jobSlug)) return false;
+  return true;
+}
+
+// sourceCounts is what each source chip would show, computed over ALL schedules rather
+// than the current intersection (D5), so a count never depends on the other filters.
+export function sourceCounts(all: readonly Schedule[]): Record<SourceFilter, number> {
+  const counts: Record<SourceFilter, number> = { all: all.length, catalog: 0, mine: 0, paused: 0 };
+  for (const s of all) {
+    if (s.origin === "default") counts.catalog++;
+    else counts.mine++;
+    if (!s.enabled) counts.paused++;
+  }
+  return counts;
+}
+
+// repoOptions lists the distinct repos the schedules span, by path. The Repo select is
+// offered only when there are two or more (D5).
+export function repoOptions(all: readonly Schedule[]): { id: string; path: string }[] {
+  const byId = new Map<string, string>();
+  for (const s of all) if (!byId.has(s.repo_id)) byId.set(s.repo_id, s.repo_path);
+  return [...byId].map(([id, path]) => ({ id, path })).sort((a, b) => a.path.localeCompare(b.path));
+}
+
+// clearHidingFilters returns `f` with every dimension that would hide `s` reset (D12:
+// revealing a new row clears only the filters in its way). Returns `f` itself when
+// nothing hides the row, so a caller can compare by identity.
+export function clearHidingFilters(f: ScheduleFilter, s: Schedule): ScheduleFilter {
+  const next: ScheduleFilter = {
+    source: matchesSource(s, f.source) ? f.source : "all",
+    repoId: f.repoId !== null && s.repo_id !== f.repoId ? null : f.repoId,
+    jobSlug: matchesFilter(s, { ...NO_FILTER, jobSlug: f.jobSlug }) ? f.jobSlug : null,
+  };
+  return next.source === f.source && next.repoId === f.repoId && next.jobSlug === f.jobSlug ? f : next;
+}
+
+// isFoldedOnce: a fired one-time schedule, which folds away (D6). A parked row carries
+// status "error", never "fired", so it is never folded.
+export function isFoldedOnce(s: Schedule): boolean {
+  return s.timing === "once" && s.status === "fired";
+}
+
+// splitFold applies the D5 → D6 → D3 order: filter, then separate the fired one-shots
+// that survived the filter, then sort each part.
+export function splitFold(
+  all: readonly Schedule[],
+  f: ScheduleFilter,
+  nameOf: (s: Schedule) => string,
+): { shown: Schedule[]; folded: Schedule[] } {
+  const matching = all.filter((s) => matchesFilter(s, f));
+  return {
+    shown: sortSchedules(
+      matching.filter((s) => !isFoldedOnce(s)),
+      nameOf,
+    ),
+    folded: sortSchedules(matching.filter(isFoldedOnce), nameOf),
+  };
+}
+
+// foldRefs lists the folded rows' issue refs for the disclosure line ("#158"), in fold
+// order, without duplicates. Rows with no issue target carry no ref.
+export function foldRefs(folded: readonly Schedule[]): string[] {
+  const refs: string[] = [];
+  for (const s of folded) {
+    if (s.target !== "issue" || s.issue_iid == null) continue;
+    const ref = `#${s.issue_iid}`;
+    if (!refs.includes(ref)) refs.push(ref);
+  }
+  return refs;
+}

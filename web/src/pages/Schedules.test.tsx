@@ -160,8 +160,10 @@ describe("Schedules list", () => {
     renderPage();
     await waitFor(() => expect(screen.getAllByText("Prompt: grouped null next_fires")).toHaveLength(2));
     // Both rows rendered (their repo labels appear), so the null next_fires read did not throw.
-    expect(screen.getByText(/^vtmocanu\/uzi/)).toBeTruthy();
-    expect(screen.getByText(/^vtmocanu\/atlas/)).toBeTruthy();
+    // Scoped to the table: the D5 Repo select lists the same paths as options.
+    const table = screen.getByRole("table");
+    expect(within(table).getByText(/^vtmocanu\/uzi/)).toBeTruthy();
+    expect(within(table).getByText(/^vtmocanu\/atlas/)).toBeTruthy();
   });
 
   it("suppresses the auto-approve chip for a self_improve row (PRD #590 follow-up 2)", async () => {
@@ -1150,6 +1152,331 @@ describe("Schedules — M1 review follow-ups", () => {
     expect(screen.getByRole("menuitem", { name: "Clone to an editable copy" })).toBeTruthy();
     expect(screen.queryByRole("menuitem", { name: "Enable on another repo" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "Add to another repo" })).toBeNull();
+  });
+});
+
+// ── PRD #1645 M2: D5 filters, D6 fold, D12 reveal through them ───────────────
+const nameIds = () =>
+  [...document.querySelectorAll<HTMLElement>("[id^='schedule-name-']")].map((el) => el.id.replace("schedule-name-", ""));
+const chip = (label: RegExp) => screen.getByRole("button", { name: label });
+const FIRED_AT = new Date(Date.now() - 86_400_000).toISOString();
+const firedOnce = (over: Partial<Schedule>) =>
+  sched({ target: "issue", timing: "once", status: "fired", run_at: FIRED_AT, next_fire_at: null, cron_expr: "", ...over });
+
+describe("Schedules — filters (PRD #1645 D5)", () => {
+  // Five rows over two repos: two catalog defaults (one paused), three user rows (one paused).
+  const mixed = () => [
+    customizedDefault({ id: "d1", customized: false }),
+    customizedDefault({ id: "d2", repo_id: "repo-atlas", repo_path: "vtmocanu/atlas", enabled: false, customized: false }),
+    sched({ id: "u1", target: "prompt", prompt: "alpha", repo_id: "repo-atlas", repo_path: "vtmocanu/atlas" }),
+    sched({ id: "u2", target: "prompt", prompt: "beta", enabled: false }),
+    sched({ id: "u3", target: "prompt", prompt: "gamma" }),
+  ];
+  beforeEach(() => {
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    mockApi.listSchedules.mockResolvedValue(mixed());
+  });
+
+  it("each source chip shows only its rows and is the one pressed", async () => {
+    renderPage();
+    await waitFor(() => expect(nameIds()).toHaveLength(5));
+    expect(chip(/^All/).getAttribute("aria-pressed")).toBe("true");
+
+    fireEvent.click(chip(/^From catalog/));
+    expect(nameIds().sort()).toEqual(["d1", "d2"]);
+    expect(chip(/^From catalog/).getAttribute("aria-pressed")).toBe("true");
+    expect(chip(/^All/).getAttribute("aria-pressed")).toBe("false");
+
+    fireEvent.click(chip(/^Mine/));
+    expect(nameIds().sort()).toEqual(["u1", "u2", "u3"]);
+
+    fireEvent.click(chip(/^Paused/));
+    expect(nameIds().sort()).toEqual(["d2", "u2"]);
+
+    fireEvent.click(chip(/^All/));
+    expect(nameIds()).toHaveLength(5);
+  });
+
+  it("chip counts describe the full set, not the current intersection", async () => {
+    renderPage();
+    await waitFor(() => expect(nameIds()).toHaveLength(5));
+    // Narrow by repo AND source: the intersection holds one row (u1)...
+    fireEvent.change(screen.getByRole("combobox", { name: "Repo" }), { target: { value: "repo-atlas" } });
+    fireEvent.click(chip(/^Mine/));
+    expect(nameIds()).toEqual(["u1"]);
+    // ...but every chip still counts over all five schedules.
+    expect(chip(/^All/).textContent).toBe("All5");
+    expect(chip(/^From catalog/).textContent).toBe("From catalog2");
+    expect(chip(/^Mine/).textContent).toBe("Mine3");
+    expect(chip(/^Paused/).textContent).toBe("Paused2");
+  });
+
+  it("the Repo select appears only when schedules span two or more repos, and filters by repo", async () => {
+    renderPage();
+    const repo = await screen.findByRole("combobox", { name: "Repo" });
+    fireEvent.change(repo, { target: { value: "repo-uzi" } });
+    expect(nameIds().sort()).toEqual(["d1", "u2", "u3"]);
+    cleanup();
+
+    // One repo only (the default fixture): no select. Positive control first.
+    mockApi.listSchedules.mockResolvedValue([sched({ id: "s1" }), sched({ id: "s2", target: "prompt", prompt: "x" })]);
+    renderPage();
+    await waitFor(() => expect(nameIds()).toHaveLength(2));
+    expect(screen.queryByRole("combobox", { name: "Repo" })).toBeNull();
+  });
+
+  it("an empty filtered result shows 'No schedules match'; Clear filters restores every row and focuses All", async () => {
+    mockApi.listSchedules.mockResolvedValue([sched({ id: "s1" }), sched({ id: "s2", target: "prompt", prompt: "x" })]);
+    renderPage();
+    await waitFor(() => expect(nameIds()).toHaveLength(2));
+    fireEvent.click(chip(/^Paused/));
+    expect(screen.getByText("No schedules match")).toBeTruthy();
+    expect(nameIds()).toEqual([]);
+    // The D8 no-schedules copy is for an owner with none, not for a filter.
+    expect(screen.queryByText(/Nothing runs on a clock yet/)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+    expect(nameIds()).toHaveLength(2);
+    expect(screen.queryByText("No schedules match")).toBeNull();
+    expect(chip(/^All/).getAttribute("aria-pressed")).toBe("true");
+    expect(document.activeElement).toBe(chip(/^All/));
+  });
+
+  it("filter state survives a round-trip through the Job catalog tab", async () => {
+    renderPage();
+    await waitFor(() => expect(nameIds()).toHaveLength(5));
+    fireEvent.click(chip(/^Paused/));
+    fireEvent.change(screen.getByRole("combobox", { name: "Repo" }), { target: { value: "repo-atlas" } });
+    expect(nameIds()).toEqual(["d2"]);
+
+    fireEvent.click(tabNamed(/^Job catalog/));
+    expect(screen.queryByRole("button", { name: /^Paused/ })).toBeNull(); // the list is unmounted
+    fireEvent.click(tabNamed(/^Schedules/));
+
+    expect(chip(/^Paused/).getAttribute("aria-pressed")).toBe("true");
+    expect((screen.getByRole("combobox", { name: "Repo" }) as HTMLSelectElement).value).toBe("repo-atlas");
+    expect(nameIds()).toEqual(["d2"]);
+  });
+});
+
+describe("Schedules — fired one-shots fold away (PRD #1645 D6)", () => {
+  const disclosure = () => screen.getByRole("button", { name: /one-time schedules? already fired/ });
+
+  it("folds fired one-shots into one disclosure, counted within the filtered set, with their issue refs", async () => {
+    mockApi.listSchedules.mockResolvedValue([
+      sched({ id: "live-uzi", target: "prompt", prompt: "live on uzi" }),
+      sched({ id: "live-atlas", target: "prompt", prompt: "live on atlas", repo_id: "repo-atlas", repo_path: "vtmocanu/atlas" }),
+      firedOnce({ id: "f1", issue_iid: 158 }),
+      firedOnce({ id: "f2", issue_iid: 159 }),
+      firedOnce({ id: "f3", issue_iid: 160, repo_id: "repo-atlas", repo_path: "vtmocanu/atlas" }),
+    ]);
+    renderPage();
+    await waitFor(() => expect(nameIds()).toEqual(["live-atlas", "live-uzi"].sort()));
+    expect(disclosure().textContent).toContain("3 one-time schedules already fired");
+    expect(disclosure().textContent).toContain("#158 #159 #160");
+    expect(disclosure().getAttribute("aria-expanded")).toBe("false");
+    const controls = disclosure().getAttribute("aria-controls")!;
+    expect(document.getElementById(controls)).not.toBeNull();
+
+    // Within the uzi repo only two fired rows survive the filter.
+    fireEvent.change(screen.getByRole("combobox", { name: "Repo" }), { target: { value: "repo-uzi" } });
+    expect(disclosure().textContent).toContain("2 one-time schedules already fired");
+    expect(disclosure().textContent).not.toContain("#160");
+    expect(nameIds()).toEqual(["live-uzi"]);
+
+    // Expanding shows them as normal rows, inside the controlled region.
+    fireEvent.click(disclosure());
+    expect(disclosure().getAttribute("aria-expanded")).toBe("true");
+    expect(nameIds()).toEqual(["live-uzi", "f1", "f2"]);
+    expect(document.getElementById(controls)!.contains(document.getElementById("schedule-name-f1"))).toBe(true);
+  });
+
+  it("a single fired one-shot still folds", async () => {
+    mockApi.listSchedules.mockResolvedValue([sched({ id: "live" }), firedOnce({ id: "f1", issue_iid: 158 })]);
+    renderPage();
+    await waitFor(() => expect(nameIds()).toEqual(["live"]));
+    expect(disclosure().textContent).toContain("1 one-time schedule already fired");
+  });
+
+  it("starts expanded when the only matching rows are folded; a manual collapse holds until the filters change", async () => {
+    mockApi.listSchedules.mockResolvedValue([
+      sched({ id: "live", target: "prompt", prompt: "live" }),
+      firedOnce({ id: "f1", issue_iid: 158, repo_id: "repo-atlas", repo_path: "vtmocanu/atlas" }),
+    ]);
+    renderPage();
+    await waitFor(() => expect(nameIds()).toEqual(["live"]));
+    expect(disclosure().getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Repo" }), { target: { value: "repo-atlas" } });
+    // Only the folded row matches: the fold opens by itself, never an empty-looking list.
+    expect(disclosure().getAttribute("aria-expanded")).toBe("true");
+    expect(nameIds()).toEqual(["f1"]);
+    expect(screen.queryByText("No schedules match")).toBeNull();
+
+    fireEvent.click(disclosure());
+    expect(disclosure().getAttribute("aria-expanded")).toBe("false");
+    expect(nameIds()).toEqual([]);
+
+    // A filter change re-derives the default (still only folded rows match).
+    fireEvent.click(chip(/^Mine/));
+    expect(disclosure().getAttribute("aria-expanded")).toBe("true");
+    expect(nameIds()).toEqual(["f1"]);
+  });
+
+  it("a parked one-shot is never folded", async () => {
+    mockApi.listSchedules.mockResolvedValue([
+      sched({ id: "live" }),
+      firedOnce({ id: "parked", issue_iid: 7, status: "error" }),
+    ]);
+    renderPage();
+    await waitFor(() => expect(nameIds()).toEqual(["parked", "live"]));
+    expect(screen.queryByRole("button", { name: /already fired/ })).toBeNull();
+  });
+});
+
+describe("Schedules — reveal clears hiding filters and opens the fold (PRD #1645 D12)", () => {
+  it("clone clears a hiding source filter and reveals the copy, focused when the modal closes", async () => {
+    const clone = sched({ id: "c1", target: "sweep", labels: ["bug"], origin: "user" });
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    mockApi.listSchedules
+      .mockResolvedValueOnce([customizedDefault(), sched({ id: "u9", target: "prompt", prompt: "other" })])
+      .mockResolvedValue([customizedDefault(), sched({ id: "u9", target: "prompt", prompt: "other" }), clone]);
+    mockApi.cloneSchedule.mockResolvedValue(clone);
+    renderPage();
+    await waitFor(() => expect(nameIds()).toHaveLength(2));
+    fireEvent.click(chip(/^From catalog/));
+    expect(nameIds()).toEqual(["d1"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions for Bug triage sweep on vtmocanu/uzi" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Clone to an editable copy" }));
+    expect(await screen.findByRole("dialog")).toBeTruthy();
+    // The user-origin clone would be hidden by "From catalog": that filter is cleared.
+    await waitFor(() => expect(chip(/^All/).getAttribute("aria-pressed")).toBe("true"));
+    const nameCell = await waitFor(() => {
+      const el = document.getElementById("schedule-name-c1");
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(document.activeElement).toBe(nameCell));
+  });
+
+  const pair = () => [
+    sched({ id: "g1", target: "prompt", prompt: "grouped job", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi", sibling_group_id: "grp-1" }),
+    sched({ id: "g2", target: "prompt", prompt: "other job", repo_id: "repo-atlas", repo_path: "vtmocanu/atlas" }),
+  ];
+  const addFromG1 = async () => {
+    fireEvent.click(await screen.findByRole("button", { name: "More actions for Prompt: grouped job on vtmocanu/uzi" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Add to another repo" }));
+    const picker = await screen.findByRole("combobox", { name: /Add Prompt: grouped job on another repo/ });
+    fireEvent.change(picker, { target: { value: "repo-new" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+  };
+
+  it("add-repo clears a hiding repo filter and focuses the new row", async () => {
+    mockApi.listRepos.mockResolvedValue(REPOS3);
+    const added = sched({ id: "g3", target: "prompt", prompt: "grouped job", repo_id: "repo-new", repo_path: "vtmocanu/newrepo", sibling_group_id: "grp-1" });
+    mockApi.listSchedules.mockResolvedValueOnce(pair()).mockResolvedValue([...pair(), added]);
+    mockApi.addScheduleRepo.mockResolvedValue(added);
+    renderPage();
+    fireEvent.change(await screen.findByRole("combobox", { name: "Repo" }), { target: { value: "repo-uzi" } });
+    expect(nameIds()).toEqual(["g1"]);
+
+    await addFromG1();
+    await waitFor(() => expect(document.activeElement).toBe(document.getElementById("schedule-name-g3")));
+    expect((screen.getByRole("combobox", { name: "Repo" }) as HTMLSelectElement).value).toBe("");
+  });
+
+  it("add-repo whose new row lands in the fold expands it and focuses the row", async () => {
+    mockApi.listRepos.mockResolvedValue(REPOS3);
+    const added = firedOnce({ id: "g3", target: "prompt", prompt: "grouped job", repo_id: "repo-new", repo_path: "vtmocanu/newrepo", sibling_group_id: "grp-1" });
+    mockApi.listSchedules.mockResolvedValueOnce(pair()).mockResolvedValue([...pair(), added]);
+    mockApi.addScheduleRepo.mockResolvedValue(added);
+    renderPage();
+    await addFromG1();
+    await waitFor(() => expect(document.activeElement).toBe(document.getElementById("schedule-name-g3")));
+    expect(screen.getByRole("button", { name: /already fired/ }).getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("a reveal survives an overlapping reload that superseded the one it awaited", async () => {
+    // addRepo awaits reload B; a toggle's reload C starts before B settles, so B's list is
+    // dropped as stale and the page still shows the pre-add list when the reveal is asked
+    // for. That older list must not cancel the reveal; C's list then brings the row.
+    mockApi.listRepos.mockResolvedValue(REPOS3);
+    const added = sched({ id: "g3", target: "prompt", prompt: "grouped job", repo_id: "repo-new", repo_path: "vtmocanu/newrepo", sibling_group_id: "grp-1" });
+    type Rows = Schedule[];
+    let resolveB: (v: Rows) => void = () => {};
+    let resolveC: (v: Rows) => void = () => {};
+    mockApi.listSchedules
+      .mockResolvedValueOnce(pair())
+      .mockReturnValueOnce(new Promise<Rows>((r) => (resolveB = r)))
+      .mockReturnValueOnce(new Promise<Rows>((r) => (resolveC = r)));
+    mockApi.addScheduleRepo.mockResolvedValue(added);
+    mockApi.updateSchedule.mockImplementation(async (id: string, input) => ({ ...pair()[1], id, enabled: input.enabled ?? true }));
+    renderPage();
+
+    await addFromG1();
+    await waitFor(() => expect(mockApi.listSchedules).toHaveBeenCalledTimes(2)); // B in flight
+    fireEvent.click(screen.getByRole("switch", { name: "Pause Prompt: other job on vtmocanu/atlas" }));
+    await waitFor(() => expect(mockApi.listSchedules).toHaveBeenCalledTimes(3)); // C in flight
+    await act(async () => resolveB([...pair(), added])); // superseded: never applied
+    // The reveal is pending on the old list; focus has not been sent anywhere yet.
+    expect(document.getElementById("schedule-name-g3")).toBeNull();
+    expect(document.activeElement).not.toBe(tabNamed(/^Schedules/));
+
+    await act(async () => resolveC([...pair(), added]));
+    await waitFor(() => expect(document.activeElement).toBe(document.getElementById("schedule-name-g3")));
+  });
+});
+
+describe("Schedules — the toggle keeps focus across a layout flip (PRD #1645 D11)", () => {
+  let matches = true;
+  const listeners = new Set<() => void>();
+  beforeEach(() => {
+    matches = true;
+    listeners.clear();
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      writable: true,
+      value: vi.fn(() => ({
+        get matches() {
+          return matches;
+        },
+        addEventListener: (_: string, l: () => void) => listeners.add(l),
+        removeEventListener: (_: string, l: () => void) => listeners.delete(l),
+      })),
+    });
+  });
+  afterEach(() => {
+    delete (window as unknown as { matchMedia?: unknown }).matchMedia;
+  });
+  const flip = (to: boolean) =>
+    act(() => {
+      matches = to;
+      listeners.forEach((l) => l());
+    });
+
+  it("a focused toggle is refocused after it moves between cells", async () => {
+    mockApi.listSchedules.mockResolvedValue([sched({ id: "s1" })]);
+    renderPage();
+    const before = await screen.findByRole("switch");
+    before.focus();
+    flip(false);
+    const after = screen.getByRole("switch");
+    expect(after).not.toBe(before); // it really was remounted in the other cell
+    expect(document.activeElement).toBe(after);
+    flip(true);
+    expect(document.activeElement).toBe(screen.getByRole("switch"));
+  });
+
+  it("an unfocused toggle does not take focus on a flip (control)", async () => {
+    mockApi.listSchedules.mockResolvedValue([sched({ id: "s1" })]);
+    renderPage();
+    await screen.findByRole("switch");
+    const runNow = screen.getByRole("button", { name: /^Run now: / });
+    runNow.focus();
+    flip(false);
+    expect(document.activeElement).toBe(runNow);
   });
 });
 

@@ -1,7 +1,20 @@
-// scheduleList (PRD #1645): row naming (D4) and the D3 sort bands.
+// scheduleList (PRD #1645): row naming (D4), the D3 sort bands, D5 filters, the D6 fold.
 import { describe, expect, it } from "vitest";
 import type { CatalogEntry, Schedule } from "./api";
-import { nextFireOf, scheduleDisplayName, sortSchedules, targetTitle } from "./scheduleList";
+import {
+  NO_FILTER,
+  clearHidingFilters,
+  foldRefs,
+  isFoldedOnce,
+  matchesFilter,
+  nextFireOf,
+  repoOptions,
+  scheduleDisplayName,
+  sortSchedules,
+  sourceCounts,
+  splitFold,
+  targetTitle,
+} from "./scheduleList";
 
 const H = 3_600_000;
 const at = (ms: number) => new Date(Date.UTC(2026, 8, 25) + ms).toISOString();
@@ -110,5 +123,73 @@ describe("sortSchedules (D3)", () => {
     const rows = [sched({ id: "b", prompt: "b", enabled: false }), sched({ id: "a", prompt: "a", next_fire_at: at(H) })];
     sortSchedules(rows, byName);
     expect(rows.map((s) => s.id)).toEqual(["b", "a"]);
+  });
+});
+
+describe("filters (D5)", () => {
+  const def = sched({ id: "d", origin: "default", catalog_slug: "bug-triage", repo_id: "r1" });
+  const mine = sched({ id: "m", origin: "user", repo_id: "r2", repo_path: "o/b" });
+  const off = sched({ id: "o", origin: "user", enabled: false, repo_id: "r1" });
+
+  it("matches each source, the repo and the job, intersected", () => {
+    expect(matchesFilter(def, { ...NO_FILTER, source: "catalog" })).toBe(true);
+    expect(matchesFilter(mine, { ...NO_FILTER, source: "catalog" })).toBe(false);
+    expect(matchesFilter(mine, { ...NO_FILTER, source: "mine" })).toBe(true);
+    expect(matchesFilter(off, { ...NO_FILTER, source: "paused" })).toBe(true);
+    expect(matchesFilter(mine, { ...NO_FILTER, source: "paused" })).toBe(false);
+    expect(matchesFilter(def, { ...NO_FILTER, repoId: "r2" })).toBe(false);
+    expect(matchesFilter(def, { ...NO_FILTER, jobSlug: "bug-triage" })).toBe(true);
+    // A user clone of the job keeps no catalog_slug, so the Job filter never matches it.
+    expect(matchesFilter(mine, { ...NO_FILTER, jobSlug: "bug-triage" })).toBe(false);
+    expect(matchesFilter(def, { source: "catalog", repoId: "r1", jobSlug: "other" })).toBe(false);
+  });
+
+  it("counts each chip over the whole set", () => {
+    expect(sourceCounts([def, mine, off])).toEqual({ all: 3, catalog: 1, mine: 2, paused: 1 });
+  });
+
+  it("lists the distinct repos by path", () => {
+    expect(repoOptions([off, mine, def])).toEqual([
+      { id: "r2", path: "o/b" },
+      { id: "r1", path: "o/r" },
+    ]);
+  });
+
+  it("clearHidingFilters resets only the dimensions hiding the row, and returns the same filter when none do", () => {
+    const f = { source: "catalog" as const, repoId: "r1", jobSlug: "bug-triage" };
+    expect(clearHidingFilters(f, def)).toBe(f);
+    expect(clearHidingFilters(f, mine)).toEqual(NO_FILTER);
+    expect(clearHidingFilters({ ...NO_FILTER, source: "mine", repoId: "r1" }, mine)).toEqual({ ...NO_FILTER, source: "mine" });
+    expect(clearHidingFilters({ ...NO_FILTER, source: "paused" }, def)).toEqual(NO_FILTER);
+  });
+});
+
+describe("the fired one-shot fold (D6)", () => {
+  const fired = (over: Partial<Schedule>) => sched({ target: "issue", timing: "once", status: "fired", ...over });
+
+  it("folds only fired one-shots, never a parked or a pending one", () => {
+    expect(isFoldedOnce(fired({}))).toBe(true);
+    expect(isFoldedOnce(fired({ status: "error" }))).toBe(false);
+    expect(isFoldedOnce(fired({ status: "active" }))).toBe(false);
+    expect(isFoldedOnce(sched({ status: "fired" }))).toBe(false); // recurring
+  });
+
+  it("filters first, then folds within the filtered set, then sorts each part", () => {
+    const rows = [
+      fired({ id: "f2", issue_iid: 2, repo_id: "r1" }),
+      sched({ id: "b", prompt: "b", repo_id: "r1" }),
+      fired({ id: "f1", issue_iid: 1, repo_id: "r1" }),
+      fired({ id: "fx", issue_iid: 9, repo_id: "r2" }),
+      sched({ id: "a", prompt: "a", repo_id: "r1" }),
+    ];
+    const { shown, folded } = splitFold(rows, { ...NO_FILTER, repoId: "r1" }, (s) => s.prompt || s.id);
+    expect(shown.map((s) => s.id)).toEqual(["a", "b"]);
+    expect(folded.map((s) => s.id)).toEqual(["f1", "f2"]);
+  });
+
+  it("foldRefs lists issue refs once, skipping rows with no issue", () => {
+    expect(
+      foldRefs([fired({ issue_iid: 158 }), fired({ issue_iid: 158 }), fired({ target: "prompt" }), fired({ issue_iid: 7 })]),
+    ).toEqual(["#158", "#7"]);
   });
 });
