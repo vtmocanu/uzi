@@ -147,7 +147,7 @@ for n in "$@"; do
   fi
 
   # ---- Greptile ----------------------------------------------------------------------
-  gr_ok=0; gr_added=""; gr_status="absent"; gr_line="not triggered on this head (on-demand: gh pr comment ${n} --body '@greptileai review')"
+  gr_ok=0; gr_added=""; gr_inline_added=0; gr_status="absent"; gr_line="not triggered on this head (on-demand: gh pr comment ${n} --body '@greptileai review')"
   if [ -n "$head" ]; then
     # An unreadable listing is NOT `absent`. `absent` means "read, and Greptile has no run
     # here", which is what lets an earlier verdict scope the findings below; a request that
@@ -169,7 +169,12 @@ for n in "$@"; do
         gr_ok=1
         gr_added=$(printf '%s' "$gr_sum" | grep -oE '[0-9]+ comments added' | grep -oE '^[0-9]+' || true)
         gr_line="completed on head — ${gr_sum}"
-        if [ "$gr_added" != "0" ] && [ -z "$gr_review_id" ]; then
+        # Outside-diff findings (one Greptile ISSUE comment) count toward the tally but carry
+        # no review object; only the inline remainder needs a current-head review id.
+        god_head=0
+        if [ "$gr_issue" != "x" ] && greptile_outside_diff "$head" <<<"$gr_issue"; then god_head="$GOD_HEAD"; fi
+        gr_inline_added=$(( ${gr_added:-0} - god_head ))
+        if [ "$gr_added" != "0" ] && [ "$gr_inline_added" -gt 0 ] && [ -z "$gr_review_id" ]; then
           echo "  🔴 Greptile added comments but its current-head review id is missing; findings cannot be scoped"
           unconfirmed="${unconfirmed} #${n}"
         fi
@@ -220,11 +225,11 @@ for n in "$@"; do
     unconfirmed="${unconfirmed} #${n}"
     inline_raw='[]'
   fi
-  if [ "$gr_ok" -eq 1 ] && [ "$gr_added" != "0" ] && [ -n "$gr_review_id" ]; then
+  if [ "$gr_ok" -eq 1 ] && [ "$gr_added" != "0" ] && [ "${gr_inline_added:-0}" -gt 0 ] && [ -n "$gr_review_id" ]; then
     gr_scoped_total=$(printf '%s' "$inline_raw" | jq --argjson rid "$gr_review_id" \
       '[.[]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid)]|length' 2>/dev/null || echo -1)
-    if [ "$gr_scoped_total" -ne "$gr_added" ]; then
-      echo "  🔴 Greptile finding set incomplete (${gr_scoped_total}/${gr_added} current-review comments readable) — NOT confirmed clean"
+    if [ "$gr_scoped_total" -ne "$gr_inline_added" ]; then
+      echo "  🔴 Greptile finding set incomplete (${gr_scoped_total}/${gr_inline_added} current-review comments readable) — NOT confirmed clean"
       unconfirmed="${unconfirmed} #${n}"
     fi
   fi
@@ -247,6 +252,8 @@ for n in "$@"; do
       | "  CR  \($c.path):\($c.line // $c.originalLine // "-")  [\($sev)] \($t|gsub("\\*";""))"' 2>/dev/null \
     || { echo "  🔴 could not render CodeRabbit review threads — NOT confirmed clean"; unconfirmed="${unconfirmed} #${n}"; }
   gr_clean=0; [ "$gr_ok" -eq 1 ] && [ "$gr_added" = "0" ] && gr_clean=1
+  # A head pass whose every comment is outside the diff supersedes older inline comments.
+  [ "$gr_ok" -eq 1 ] && [ "$gr_added" != "0" ] && [ "${gr_inline_added:-0}" -le 0 ] && gr_clean=1
   # No Greptile review on THIS head, yet Greptile comments are still anchored. A push
   # re-anchors every older comment, so lib/greptile-verdict.sh scopes them to Greptile's
   # newest EARLIER verdict rather than re-listing a finding a later pass superseded. It
@@ -275,6 +282,19 @@ for n in "$@"; do
           | (.body|gsub("<[^>]*>";"")|gsub("[[:space:]]+";" ")|.[0:110]) as $t
           | "  GR  \(.path):\(.line)  [\($p)] \($t)"
         end' 2>/dev/null || { echo "  🔴 could not render Greptile findings — NOT confirmed clean"; unconfirmed="${unconfirmed} #${n}"; }
+  # Outside-diff findings: live until Greptile drops them from its comment, except under a
+  # clean zero-comment verdict on this head, which speaks for the whole diff.
+  if [ "$gr_issue" = "x" ]; then
+    echo "  🔴 issue comments UNREADABLE — Greptile outside-diff findings unknown; NOT confirmed clean"
+    unconfirmed="${unconfirmed} #${n}"
+  elif ! { [ "$gr_ok" -eq 1 ] && [ "$gr_added" = "0" ]; }; then
+    if greptile_outside_diff "$head" <<<"$gr_issue"; then
+      [ -n "$GOD_LINES" ] && printf '%s\n' "$GOD_LINES"
+    else
+      echo "  🔴 could not read Greptile outside-diff findings — NOT confirmed clean"
+      unconfirmed="${unconfirmed} #${n}"
+    fi
+  fi
 done
 
 if [ -n "$unreviewed" ] || [ -n "$unconfirmed" ]; then
