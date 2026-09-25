@@ -38,6 +38,8 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Builtin agents no longer execute the commands they are checking, and stop processes only by their own handle ([#1655](https://github.com/vtmocanu/uzi/issues/1655)).**
+  The coder, reviewer, auditor and tester builtins now screen a candidate command as a string when probing whether it is blocked or dangerous, never running it directly or through a generated script. The coder, reviewer, auditor, tester, web-ux and ux-designer builtins stop a process by the handle or PID they saved at launch, never by pattern or port lookup (`pkill -f`, `killall`, `fuser -k`, `kill $(lsof -ti :<port>)`), which on a BusyBox `lsof` can signal the agent itself. Builtins synced to upstream role library v0.39.0.
 - **Deleting an Anthropic token names the workers bound to it, even when you click Delete right away.**
   The workers bound to the token are now read at the click. Before, the confirmation used a list loaded when the page opened, so an early click, or a failed load, said "Nothing is bound to it" about a token workers were using. If the list cannot be read, the token is not deleted and the page says why.
 - **Runs that provision tools get a usable PATH and CA-bundle path again.**

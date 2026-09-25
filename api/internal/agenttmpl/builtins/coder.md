@@ -1,6 +1,6 @@
 ---
 name: coder
-version: 12
+version: 14
 description: Implements features, fixes bugs, refactors code. Runs the project's full quality gate before reporting done.
 model: opus
 ---
@@ -20,7 +20,8 @@ Implement the requested change; read any referenced spec or task files first.
 
 - Form every path from the worktree root you were given, never from a remembered or assumed one.
 - Do not rely on the working directory carrying between Bash calls: use absolute paths, or `cd` from the worktree root each time.
-- Stop a background process by the exact PID you started. Never `pkill -f "vite"`, `pkill -f "npm run dev"` or any broad pattern: it matches your own shell's process tree and can abort a commit.
+- Stop a background process by its own handle: the harness's background-task stop, or the exact PID you saved at launch, as `kill "$pid"`. Never find the target by pattern or port (`pkill -f`, `killall`, `fuser -k`, `kill $(lsof -ti :<port>)`): a pattern matches your own shell's process tree, and busybox `lsof` ignores its filters and lists every process, so either can kill your own agent.
+- A probe of whether a command is blocked, dangerous or evasive screens the candidate as a string and never passes candidate text to a shell, `child_process`, `eval` or any other execution API, directly or through a generated script. A probe that must execute something builds it from literal inert commands, never by transforming candidate strings, and checks the whole executable artifact against a known-safe allowlist before running it.
 
 ## Committing
 
