@@ -23,6 +23,12 @@ import (
 //     with no ledger row: absent (the newest-run pick, not "any run").
 //   - issue 4: halted with a cached pipeline too (attempt_count 3): present.
 //   - issue 5: newest run has no branch yet, an older run's branch is halted: absent.
+//   - issues 6 and 7: halted, but the newest run's MR is 'closed' / 'merged': absent
+//     (nothing left to fix on a finished MR).
+//   - issues 8 and 9: halted, newest run's MR is 'opened' / 'locked': present. Issue 1
+//     (mr_state NULL, no MR recorded yet) covers the NULL arm.
+//   - issue 10: an OLDER run on the same branch had its MR closed, the newest run's MR
+//     is 'opened': present (the MR state is the newest run's, not any run's).
 //   - a SECOND repo halts the same ref issue 2 uses: absent from repo A (tenant scope
 //     on the ledger join).
 //
@@ -63,6 +69,12 @@ func TestListCIAutofixHaltsForRepoLiveDB(t *testing.T) {
 			 VALUES ($1, $2, 'issue', $3, 't', 'd', 'completed', $4, now() - $5::interval)`,
 			owner, repo, issueIID, branch, createdOffset)
 	}
+	insertRunMR := func(repo uuid.UUID, issueIID int64, branch, mrState, createdOffset string) {
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, branch, mr_iid, mr_state, created_at)
+			 VALUES ($1, $2, 'issue', $3, 't', 'd', 'completed', $4, $3, $5, now() - $6::interval)`,
+			owner, repo, issueIID, branch, mrState, createdOffset)
+	}
 	ledger := func(repo uuid.UUID, ref string, attempts int, halted bool) {
 		mustExec(ctx, t, pool,
 			`INSERT INTO ci_autofix_attempts (repo_id, ref, attempt_count, halt_notified) VALUES ($1, $2, $3, $4)`,
@@ -89,6 +101,22 @@ func TestListCIAutofixHaltsForRepoLiveDB(t *testing.T) {
 	insertRun(repoA, 5, nil, "1 hour")
 	ledger(repoA, "agent/issue-5-old", 2, true)
 
+	insertRunMR(repoA, 6, "agent/issue-6", "closed", "1 hour")
+	ledger(repoA, "agent/issue-6", 2, true)
+
+	insertRunMR(repoA, 7, "agent/issue-7", "merged", "1 hour")
+	ledger(repoA, "agent/issue-7", 2, true)
+
+	insertRunMR(repoA, 8, "agent/issue-8", "opened", "1 hour")
+	ledger(repoA, "agent/issue-8", 2, true)
+
+	insertRunMR(repoA, 9, "agent/issue-9", "locked", "1 hour")
+	ledger(repoA, "agent/issue-9", 1, true)
+
+	insertRunMR(repoA, 10, "agent/issue-10", "closed", "2 hours")
+	insertRunMR(repoA, 10, "agent/issue-10", "opened", "1 hour")
+	ledger(repoA, "agent/issue-10", 2, true)
+
 	// Repo B: same ref as repo A's non-halted issue 2, halted. Must not leak into A.
 	insertRun(repoB, 2, "agent/issue-2", "1 hour")
 	ledger(repoB, "agent/issue-2", 2, true)
@@ -104,7 +132,7 @@ func TestListCIAutofixHaltsForRepoLiveDB(t *testing.T) {
 		}
 		got[r.IssueIid.Int64] = r.AttemptCount
 	}
-	want := map[int64]int32{1: 2, 4: 3}
+	want := map[int64]int32{1: 2, 4: 3, 8: 2, 9: 1, 10: 2}
 	if len(got) != len(want) {
 		t.Fatalf("halts = %v, want %v", got, want)
 	}

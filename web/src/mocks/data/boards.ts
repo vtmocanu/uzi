@@ -380,9 +380,37 @@ const boardFixtures: Record<string, Board> = {
           updated_at: minsAgo(120),
         }),
         pipeline: null,
+      },
+      {
+        // run-rework-capped's issue: a completed run whose MR !61 is still open.
         // PRD #1650 D3a: a halt with no cached pipeline. The halt comes from the autofix
         // ledger, not the badge, so the marker shows where the pipeline badge would be,
-        // and no Fix CI button renders (it needs a failed pipeline).
+        // and no Fix CI button renders (it needs a failed pipeline). The MR must be open:
+        // the server drops the marker once the latest run's MR is closed or merged.
+        iid: 61,
+        title: "Board: virtualize the card list for very large boards",
+        state: "opened",
+        labels: ["uzi", "Review"],
+        web_url: uziUrl(61),
+        author: "mira",
+        forge_type: "gitlab",
+        has_prd_link: true,
+        column: "Review",
+        closed: false,
+        conflict: false,
+        assignee_ids: [],
+        forge_updated_at: minsAgo(96),
+        latest_run: latestRun({
+          id: "run-rework-capped",
+          status: "completed",
+          mr_iid: 61,
+          mr_web_url: "https://gitlab.example.com/myorg/uzi/-/merge_requests/61",
+          mr_state: "opened",
+          worker_name: "laptop",
+          created_at: minsAgo(145),
+          updated_at: minsAgo(96),
+        }),
+        pipeline: null,
         ci_autofix_halted: true,
         ci_autofix_attempts: 1,
       },

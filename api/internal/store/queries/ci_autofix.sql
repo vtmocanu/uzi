@@ -171,8 +171,14 @@ WHERE repo_id = @repo_id::uuid AND ref <> ALL(@keep_refs::text[]);
 -- NOT join pipeline_statuses: that cache row exists only while a pipeline is
 -- cached, and a halt must stay visible without one. A ref with no issue card (a
 -- prompt-schedule MR) has no row here; the Slack halt DM is its only surface.
+-- The marker also drops once the newest run's MR is closed or merged: the ledger
+-- row outlives the MR (it is cleared only on a green pipeline or when the branch
+-- leaves the watch window), but a finished MR leaves nothing to fix. runs.mr_state
+-- holds only forge.MRState* values (opened|closed|merged|locked, gated by
+-- IsKnownMRState in the watchers); NULL (no MR observed yet), 'opened' and
+-- 'locked' keep the marker.
 WITH latest_run AS (
-    SELECT DISTINCT ON (r.issue_iid) r.issue_iid, r.branch
+    SELECT DISTINCT ON (r.issue_iid) r.issue_iid, r.branch, r.mr_state
     FROM runs r
     WHERE r.repo_id = @repo_id::uuid AND r.issue_iid IS NOT NULL
     ORDER BY r.issue_iid, r.created_at DESC
@@ -181,4 +187,5 @@ SELECT lr.issue_iid, a.attempt_count
 FROM latest_run lr
 JOIN ci_autofix_attempts a ON a.repo_id = @repo_id::uuid AND a.ref = lr.branch
 WHERE lr.branch IS NOT NULL AND lr.branch <> ''
+  AND (lr.mr_state IS NULL OR lr.mr_state NOT IN ('closed', 'merged'))
   AND a.halt_notified;
