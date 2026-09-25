@@ -467,3 +467,76 @@ describe("AdminRateLimits — Codex section", () => {
     expect(within(section()).getByText("Failed to load Codex rate limits")).toBeTruthy();
   });
 });
+
+// ── Flush Card outer-edge padding vs rowspan (PRD #1648 D8) ──────────────────
+// A flush Card pads each row's first td to 20px. On a rowspan continuation row the
+// first td in the DOM is the token/account cell, which sits right of the spanning
+// user cell, so it must carry data-flush-inner and fall outside that selector. The
+// selector is derived from the Card's own class token, so this pins the real rule.
+describe("AdminRateLimits — flush Card first-cell selector", () => {
+  function flushCard(el: Element): Element {
+    let cur: Element | null = el;
+    while (cur) {
+      if (Array.from(cur.classList).some((c) => c.startsWith("[&_td:first-child"))) return cur;
+      cur = cur.parentElement;
+    }
+    throw new Error("no flush Card ancestor");
+  }
+  function firstCellSelector(card: Element): string {
+    const token = Array.from(card.classList).find((c) => c.startsWith("[&_td:first-child"));
+    if (!token) throw new Error("flush Card has no first-cell token");
+    const inner = token.replace(/^\[/, "").replace(/\]:pl-5$/, "");
+    return inner.replace(/^&/, ":scope").replace(/_/g, " ");
+  }
+  const td = (text: string) => {
+    const cell = screen.getByText(text).closest("td");
+    if (!cell) throw new Error(`no td for ${text}`);
+    return cell;
+  };
+
+  function twoTokenUser(): AdminRateLimitUser {
+    const base = row("multitok", ok(40, 30));
+    const t = base.tokens[0];
+    return {
+      ...base,
+      tokens: [
+        { ...t, secret_id: "sec-a", label: "tok-alpha" },
+        { ...t, secret_id: "sec-b", label: "tok-beta", is_default: false },
+      ],
+    };
+  }
+
+  it("matches first-row user cells and skips rowspan continuation cells", async () => {
+    mockApi.getAdminRateLimits.mockResolvedValue({ users: [twoTokenUser()] });
+    mockApi.getAdminCodexRateLimits.mockResolvedValue({
+      users: [
+        crow("multiacct", [
+          cacct("cdx-a", ["acct-alpha"], true, "fresh", [cbucket("requests", "Requests", cwin(20, 18000, 5000))]),
+          cacct("cdx-b", ["acct-beta"], false, "fresh", [cbucket("requests", "Requests", cwin(10, 18000, 5000))]),
+        ]),
+      ],
+    });
+    render(
+      <MemoryRouter>
+        <AdminRateLimits />
+      </MemoryRouter>,
+    );
+    await screen.findByText("tok-beta");
+    await screen.findByText("acct-beta");
+
+    const cases = [
+      { user: "multitok", first: "tok-alpha", cont: "tok-beta" },
+      { user: "multiacct", first: "acct-alpha", cont: "acct-beta" },
+    ];
+    for (const c of cases) {
+      const userCell = td(c.user);
+      const card = flushCard(userCell);
+      const matched = Array.from(card.querySelectorAll(firstCellSelector(card)));
+      expect(matched).toContain(userCell);
+      expect(matched).not.toContain(td(c.first));
+      const cont = td(c.cont);
+      expect(matched).not.toContain(cont);
+      expect(cont.hasAttribute("data-flush-inner")).toBe(true);
+    }
+  });
+});

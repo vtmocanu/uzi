@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { Worker } from "../lib/api";
 import { stripUnsafeChars } from "../lib/safeText";
+import type { BadgeTone } from "./ui";
 
 /**
  * Per-worker upgrade badge and the Fleet upgrade summary (PRD #113 M5).
@@ -30,7 +31,12 @@ export function needsAttention(w: Worker): boolean {
 // (including the fix that made the key correct for external workers, who are the
 // population it exists for), but the UI action is not in this milestone's scope, and a
 // badge branch for a state nothing can set would be dead code asserting a feature.
-type Tone = "alert" | "warn" | "info" | "ok";
+//
+// Tones are the shared Badge tone names (ui.tsx BadgeTone) so another surface (the admin
+// health fleet section, PRD #1648) can render the same status on the shared Badge through
+// upgradePresentation; this file keeps its own TONE_CLASS so the Workers page badge is
+// unchanged.
+type Tone = Extract<BadgeTone, "danger" | "warning" | "info" | "ok">;
 
 const PRESENTATION: Record<Worker["upgrade_status"], { label: string; tone: Tone } | null> = {
   // `unknown` renders NOTHING. An unstamped local image, an unparseable report and a
@@ -38,20 +44,28 @@ const PRESENTATION: Record<Worker["upgrade_status"], { label: string; tone: Tone
   // worker of every local stack is how a reader learns to stop looking at badges.
   unknown: null,
   up_to_date: { label: "up to date", tone: "ok" },
-  outdated: { label: "outdated", tone: "warn" },
+  outdated: { label: "outdated", tone: "warning" },
   upgrading: { label: "upgrading", tone: "info" },
-  upgrade_failed: { label: "upgrade failed", tone: "alert" },
+  upgrade_failed: { label: "upgrade failed", tone: "danger" },
 };
 
+// upgradePresentation is the one label + tone per upgrade status, or null for `unknown`
+// (which renders no badge: nothing on the Workers page, a faint dash in the Health fleet). The Workers badge, the fleet summary legend and the
+// Admin Health fleet card (AdminHealth.tsx FleetRow) read it.
+// The tone is typed as the narrow subset actually used; it is assignable to BadgeTone.
+export function upgradePresentation(status: Worker["upgrade_status"]): { label: string; tone: Tone } | null {
+  return PRESENTATION[status];
+}
+
 const TONE_CLASS: Record<Tone, string> = {
-  alert: "border-danger/40 bg-danger/10 text-danger",
-  warn: "border-warn/40 bg-warn/10 text-warn",
+  danger: "border-danger/40 bg-danger/10 text-danger",
+  warning: "border-warn/40 bg-warn/10 text-warn",
   info: "border-info/40 bg-info/10 text-info",
   ok: "border-ok/40 bg-ok/10 text-ok",
 };
 
 export function WorkerUpgradeBadge({ worker }: { worker: Worker }) {
-  const p = PRESENTATION[worker.upgrade_status];
+  const p = upgradePresentation(worker.upgrade_status);
   if (!p) return null;
   return (
     <span
@@ -448,7 +462,7 @@ export function FleetUpgradePanel({
         {segments.map(({ key }) =>
           counts[key] > 0 ? (
             <span key={key}>
-              {counts[key]} {PRESENTATION[key]?.label}
+              {counts[key]} {upgradePresentation(key)?.label}
             </span>
           ) : null,
         )}

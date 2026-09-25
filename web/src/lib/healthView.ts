@@ -36,8 +36,9 @@ export function healthVerdict(status: string, counts: HealthDoc["counts"]): { ti
     };
   }
   if (status === "warn" || status === "unknown") {
-    // warn implies at least one warn or unknown check. The aggregate signal is worded
-    // "warning" everywhere (the tab pip's aria-label too), so unknowns fold in here.
+    // warn implies at least one warn or unknown check. The verdict headline folds unknowns
+    // into "warning" (the pips' healthPipLabel names unknown separately, since a pip has no
+    // headline to lean on).
     const n = counts.warn + counts.unknown;
     return {
       title: `${n} ${n === 1 ? "warning" : "warnings"}, nothing is blocked`,
@@ -48,4 +49,23 @@ export function healthVerdict(status: string, counts: HealthDoc["counts"]): { ti
     title: "All systems normal",
     sub: "Every check uzi can make about itself is passing.",
   };
+}
+
+// healthPipLabel is the accessible name of the attention pips (the sidebar Admin item, the
+// Admin > Health tab and the collapsed rail's sr-only text), PRD #1648 D9: "N health checks
+// need attention: X danger, Y unknown, Z warning", naming only the non-zero severities,
+// worst first. N = 1 reads "1 health check needs attention: ..." (singular noun and verb).
+export function healthPipLabel(counts: HealthDoc["counts"]): string {
+  const n = counts.danger + counts.unknown + counts.warn;
+  const parts = (
+    [
+      [counts.danger, "danger"],
+      [counts.unknown, "unknown"],
+      [counts.warn, "warning"],
+    ] as const
+  )
+    .filter(([c]) => c > 0)
+    .map(([c, word]) => `${c} ${word}`);
+  const head = n === 1 ? "1 health check needs attention" : `${n} health checks need attention`;
+  return parts.length > 0 ? `${head}: ${parts.join(", ")}` : head;
 }

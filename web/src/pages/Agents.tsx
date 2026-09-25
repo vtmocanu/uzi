@@ -137,7 +137,7 @@ export function Agents() {
       {loading ? (
         <ListSkeleton rows={6} />
       ) : (
-        <Card className="p-0">
+        <Card flush>
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm">
               <thead className="border-b border-edge text-muted">

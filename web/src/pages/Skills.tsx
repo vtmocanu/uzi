@@ -299,7 +299,7 @@ function SkillGroup({
       {skills.length === 0 ? (
         emptyNode ?? (emptyText ? <p className="text-sm text-faint">{emptyText}</p> : null)
       ) : (
-        <Card className="p-0">
+        <Card flush>
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm">
               <thead className="border-b border-edge text-muted">

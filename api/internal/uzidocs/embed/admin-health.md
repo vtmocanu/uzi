@@ -16,18 +16,32 @@ showed anything, and nothing pushed a notice to anyone.
 
 It surfaces five ways:
 
-- **Admin → Health**, the last tab in the admin strip (after Branding). A
-  verdict with a per-severity tally, a needs-attention list that jumps to and
-  scrolls each check into view, "Checked N s ago" plus a Copy diagnostics
-  button, one card per group, and — at the bottom of the workers group — a
-  cross-user fleet table (owner, worker, kind, status, version, upgrade,
-  blocking reason, since). The sidebar Admin nav item and the tab itself carry
-  a severity pip with a count when anything needs attention.
+- **Admin → Health**, the last tab in the admin strip (after Branding), laid
+  out triage first ([PRD #1648](../prds/done/1648-admin-health-triage-first.md)),
+  always in the same order:
+  - a header line with "Checked N s ago" and a **Copy diagnostics** button;
+  - when anything needs attention, an attention card: the verdict, a count
+    per severity, and every danger, unknown and warn check fully expanded,
+    worst first, each with its summary, what to do, evidence, a copyable
+    command and its docs link (a `fleet.*` check also links down to the
+    fleet). When nothing needs attention, one quiet "All systems normal" line
+    instead;
+  - **All checks**: "P of T passing" (not-applicable checks are counted
+    separately, never as passing) and one row per group, collapsed by
+    default, showing a chip per check; a check that needs attention links up
+    to its item, and expanding a group lists each check's own summary;
+  - **Fleet, all users**: a cross-user table (owner, worker, status, version,
+    upgrade, blocking reason, last seen).
+
+  The sidebar Admin nav item and the tab itself carry a count pill when
+  anything needs attention, red when any check is danger and amber
+  otherwise; its accessible label names each severity ("3 health checks need
+  attention: 2 danger, 1 warning").
 - **Overview**, for an admin: a self-hiding card beside the custody-hold
   alert. When every check passes it collapses to one quiet line ("System
   health: all N checks passing"); otherwise it shows the verdict and the top
-  three attention items, each linking to the Health tab. It makes no request
-  at all for a non-admin.
+  three attention items, with one Open health link to the Health tab. It
+  makes no request at all for a non-admin.
 - **An app-wide Danger banner**, admins only, shown only while the overall
   status is `danger`. It carries the verdict, the top danger check's own
   summary, an Open health link, and **Snooze 1 h** — per admin, per danger

@@ -15,6 +15,7 @@ import {
   fleetSummary,
   likelyCause,
   needsAttention,
+  upgradePresentation,
 } from "./WorkerUpgradeBadge";
 
 afterEach(cleanup);
@@ -484,5 +485,17 @@ describe("copy feedback", () => {
     const btn = screen.getByRole("button", { name: /copy kubectl/i });
     fireEvent.click(btn);
     expect(await screen.findByRole("button", { name: /copied/i })).toBeTruthy();
+  });
+});
+
+// PRD #1648: the one label + shared-Badge tone per upgrade status, which the admin health
+// fleet section renders on the shared Badge. `unknown` is null (never a badge anywhere).
+describe("upgradePresentation", () => {
+  it("maps every status to its label and Badge tone, and unknown to nothing", () => {
+    expect(upgradePresentation("upgrade_failed")).toEqual({ label: "upgrade failed", tone: "danger" });
+    expect(upgradePresentation("outdated")).toEqual({ label: "outdated", tone: "warning" });
+    expect(upgradePresentation("upgrading")).toEqual({ label: "upgrading", tone: "info" });
+    expect(upgradePresentation("up_to_date")).toEqual({ label: "up to date", tone: "ok" });
+    expect(upgradePresentation("unknown")).toBeNull();
   });
 });

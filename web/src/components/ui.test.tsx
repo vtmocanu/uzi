@@ -5,7 +5,7 @@
 
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { RUN_STATUS_TONES, Select, StatusPill, Toggle } from "./ui";
+import { Card, CountPill, RUN_STATUS_TONES, Select, StatusPill, Toggle } from "./ui";
 import { runBadge } from "../lib/runBadge";
 import type { LatestRun, RunStatus } from "../lib/api";
 
@@ -217,5 +217,46 @@ describe("Toggle", () => {
   it("omits aria-describedby when not supplied", () => {
     render(<Toggle label="Bare" checked={false} onChange={() => {}} />);
     expect(screen.getByRole("switch", { name: "Bare" }).hasAttribute("aria-describedby")).toBe(false);
+  });
+});
+
+// PRD #1648 D8: `className="p-0"` never removed Card's padding (cx has no
+// tailwind-merge and Tailwind emits .p-0 before .p-5), so flush is a prop that
+// drops p-5 and pads the outermost table cells to 20px instead.
+describe("Card flush", () => {
+  const FLUSH_CLASSES = [
+    "[&_th:first-child]:pl-5",
+    "[&_th:last-child]:pr-5",
+    "[&_td:last-child]:pr-5",
+    "[&_td:first-child:not([data-flush-inner])]:pl-5",
+  ];
+
+  it("drops p-5 and carries the outer-cell padding classes when flush", () => {
+    const { container } = render(<Card flush>body</Card>);
+    const card = container.firstElementChild as HTMLElement;
+    expect(card.classList.contains("p-5")).toBe(false);
+    for (const c of FLUSH_CLASSES) expect(card.classList.contains(c)).toBe(true);
+  });
+
+  it("keeps p-5 and no flush classes by default", () => {
+    const { container } = render(<Card>body</Card>);
+    const card = container.firstElementChild as HTMLElement;
+    expect(card.classList.contains("p-5")).toBe(true);
+    for (const c of FLUSH_CLASSES) expect(card.classList.contains(c)).toBe(false);
+  });
+});
+
+// PRD #1648 D9: the visible count caps at "99+"; the accessible name is the caller's label,
+// untouched by the cap.
+describe("CountPill", () => {
+  it("caps the visible count at 99+ and keeps the caller's aria-label", () => {
+    render(<CountPill count={150} label="150 unread" />);
+    const pill = screen.getByLabelText("150 unread");
+    expect(pill.textContent).toBe("99+");
+  });
+
+  it("renders a small count as-is", () => {
+    render(<CountPill count={5} label="5 unread" />);
+    expect(screen.getByLabelText("5 unread").textContent).toBe("5");
   });
 });

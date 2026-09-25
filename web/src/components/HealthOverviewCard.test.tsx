@@ -44,6 +44,10 @@ describe("HealthOverviewCard", () => {
     // No verdict/attention items in the quiet form.
     expect(within(card).queryByText(/uzi cannot run work/)).toBeNull();
     expect(within(card).getByRole("link", { name: "Open health" })).toBeTruthy();
+    // PRD #1648 D6: the OK severity badge (word + decorative SVG shape), no font glyph.
+    expect(within(card).getByText("OK")).toBeTruthy();
+    expect(card.querySelector('svg[aria-hidden="true"]')).not.toBeNull();
+    expect(card.textContent).not.toMatch(/[\u25cf\u25b2\u25c6\u25cb]/);
   });
 
   it("shows the verdict and the top three attention items when checks need attention", async () => {
@@ -57,5 +61,8 @@ describe("HealthOverviewCard", () => {
     expect(within(card).getByText("Worker capacity")).toBeTruthy();
     expect(within(card).getByText("Runs waiting for a worker")).toBeTruthy();
     expect(within(card).getByText("and 1 more")).toBeTruthy();
+    // PRD #1648 D6: severity by word on the shared badge (headline + three danger items).
+    expect(within(card).getAllByText("Danger").length).toBe(4);
+    expect(card.textContent).not.toMatch(/[\u25cf\u25b2\u25c6\u25cb]/);
   });
 });

@@ -8,16 +8,16 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useEffect, useState, type ReactNode } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { api, MOCK_MODE, type Branding, type BuildInfo, type Repo } from "../lib/api";
+import { api, MOCK_MODE, type Branding, type BuildInfo, type HealthDoc, type Repo } from "../lib/api";
 import { prefs } from "../lib/prefs";
 import { presetAssetForSlug, presetForSlug } from "../lib/brandPresets";
-import { cx } from "./ui";
+import { CountPill, cx, type CountPillTone } from "./ui";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail, maskName, maskRepoPath } from "../lib/demoMask";
 import { VaultBadge, VaultLockedBanner } from "./VaultControls";
 import { UpdateEscalationBanner } from "./UpdateEscalationBanner";
 import { HealthDangerBanner } from "./HealthDangerBanner";
-import { HealthPip } from "./healthSeverity";
+import { healthPipLabel } from "../lib/healthView";
 import { HealthStatusProvider, useHealthStatus } from "../lib/useAdminHealth";
 import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
 import { SidebarCodexRateLimits } from "./CodexRateLimitMeters";
@@ -451,8 +451,10 @@ function NavItem({
   //
   // A new TONE rather than a new mechanism, deliberately: two badge implementations
   // would drift in position, size and collapsed-rail behaviour, and the rail's dot has
-  // no room to distinguish them by anything but colour.
-  badgeTone?: "count" | "alert";
+  // no room to distinguish them by anything but colour. `warn` (amber, PRD #1648 D9) is
+  // the "something is degraded, nothing is blocked" tone; its contrast measurement lives
+  // with the pill in CountPill (ui.tsx).
+  badgeTone?: CountPillTone;
   // badgeLabel is the NOUN the accessible count announces — "in progress" for the Runs
   // badge, so a screen reader says "Runs, 5 in progress" rather than the meaningless
   // "5 unread" (a run is never unread). Defaults per tone when unset: the `count` tone
@@ -461,21 +463,26 @@ function NavItem({
   // above already states the label must say what the number MEANS; this makes that
   // reachable per-item instead of one hardcoded string for the whole tone.
   badgeLabel?: string;
-  // The Admin entry's health severity pip (PRD #1484 M5): a severity entry point per D1.
-  // count 0 / null renders nothing. Reuses the shared HealthPip when expanded; on the
-  // collapsed rail it becomes a severity dot on the icon with an sr-only worded count, so
-  // the severity is never colour-only. Distinct from `badge` so the Admin item's pip and any
-  // future count badge would not fight over the one trailing slot.
-  healthPip?: { count: number; danger: boolean } | null;
+  // The Admin entry's health severity pip (PRD #1484 M5, reshaped by PRD #1648 D9): the
+  // doc's per-severity tally. No attention (danger + unknown + warn = 0) or null renders
+  // nothing. Expanded it is a CountPill (alert tone when any check is danger, else warn)
+  // carrying the attention total; on the collapsed rail it becomes a severity dot on the
+  // icon with sr-only text. Both name every non-zero severity in words (healthPipLabel),
+  // so the severity is never colour-only. Distinct from `badge` so the Admin item's pip and
+  // any future count badge would not fight over the one trailing slot.
+  healthPip?: HealthDoc["counts"] | null;
 }) {
   const { pathname } = useLocation();
   const active = exactOnly ? pathname === to : isNavActive(pathname, to);
   const hasBadge = badge > 0;
   const alert = badgeTone === "alert";
-  const pip = healthPip && healthPip.count > 0 ? healthPip : null;
-  const pipWord = pip?.danger ? "danger" : "warning";
+  const pipCount = healthPip ? healthPip.danger + healthPip.unknown + healthPip.warn : 0;
+  const pip =
+    healthPip && pipCount > 0
+      ? { count: pipCount, danger: healthPip.danger > 0, label: healthPipLabel(healthPip) }
+      : null;
   // The accessible noun: explicit override, else the per-tone default.
-  const badgeNoun = badgeLabel ?? (alert ? "needing attention" : "unread");
+  const badgeNoun = badgeLabel ?? (alert || badgeTone === "warn" ? "needing attention" : "unread");
   return (
     <Link
       to={to}
@@ -507,7 +514,7 @@ function NavItem({
               aria-hidden="true"
               className={cx(
                 "absolute -right-1 -top-1 h-2 w-2 rounded-full ring-2 ring-surface",
-                alert ? "bg-danger" : "bg-brand",
+                alert ? "bg-danger" : badgeTone === "warn" ? "bg-warn" : "bg-brand",
               )}
             />
           )}
@@ -528,14 +535,12 @@ function NavItem({
       {/* The health pip's count survives collapse as sr-only text, mirroring the badge: a
           collapsed rail is not a reason to withhold an incident count from assistive tech. */}
       {collapsed && pip && (
-        <span className="sr-only">{`${pip.count} health ${pip.count === 1 ? "check" : "checks"} need attention (${pipWord})`}</span>
+        <span className="sr-only">{pip.label}</span>
       )}
-      {/* Expanded: the shared HealthPip (dot + count + worded aria-label), reused from the
-          Admin > Health tab so the two entry points read identically (PRD #1484 M5). */}
+      {/* Expanded: the shared CountPill with the worded label, the same anatomy the Admin >
+          Health tab carries so the two entry points read identically (PRD #1648 D9). */}
       {!collapsed && pip && (
-        <span className="ml-auto">
-          <HealthPip count={pip.count} danger={pip.danger} />
-        </span>
+        <CountPill className="ml-auto" count={pip.count} tone={pip.danger ? "alert" : "warn"} label={pip.label} />
       )}
       {/* The count SURVIVES COLLAPSE. The pill below is gated on !collapsed and the rail's
           dot is aria-hidden, so without this an assistive-tech user got no count and no
@@ -549,21 +554,10 @@ function NavItem({
         <span className="sr-only">{`${badge} ${badgeNoun}`}</span>
       )}
       {!collapsed && hasBadge && (
-        <span
-          // The label says what the number MEANS. "3 unread" for a worker count would be
-          // wrong in a way a screen-reader user could not recover from — nothing else on
-          // the page would explain it.
-          aria-label={`${badge} ${badgeNoun}`}
-          className={cx(
-            "ml-auto min-w-[1.25rem] rounded-full px-1.5 py-0.5 text-center text-[10px] font-semibold leading-none",
-            // text-on-brand, NOT text-white: measured 2.69:1 for white on bg-danger at 10px/600
-            // against 8.27:1 for the Notifications and Judge badges. The badge whose entire
-            // purpose is to be noticed mid-incident was the only sidebar badge failing AA.
-            alert ? "bg-danger text-on-brand" : "bg-brand text-on-brand",
-          )}
-        >
-          {badge > 99 ? "99+" : badge}
-        </span>
+        // The label says what the number MEANS. "3 unread" for a worker count would be
+        // wrong in a way a screen-reader user could not recover from — nothing else on
+        // the page would explain it. Contrast notes for every tone live in CountPill.
+        <CountPill className="ml-auto" count={badge} tone={badgeTone} label={`${badge} ${badgeNoun}`} />
       )}
     </Link>
   );
@@ -650,10 +644,10 @@ function SidebarContent({
   const demoMode = useDemoMode();
   // The Admin entry's health pip (PRD #1484 M5): a severity entry point in the sidebar (D1),
   // fed by the ONE shared HealthStatusProvider — no second poll here, and a non-admin never
-  // fetches (the provider's isAdmin gate leaves doc null, so attentionCount is 0). Danger
-  // dominates the pip colour, else warning (which covers unknown).
-  const { doc: health, attentionCount: healthAttention } = useHealthStatus();
-  const healthPipDanger = (health?.counts.danger ?? 0) > 0;
+  // fetches (the provider's isAdmin gate leaves doc null, so no pip). NavItem derives the
+  // attention total, the tone (danger dominates, else warn) and the worded label from the
+  // doc's per-severity counts.
+  const { doc: health } = useHealthStatus();
   // Single masked identity label (PRD #886 M3). Preserve the raw display_name ?? email
   // fallback precedence, masking whichever branch is chosen, and derive the initial from
   // the masked label so it matches the shown name (decision 7: Vlad → V, not the raw one).
@@ -888,7 +882,7 @@ function SidebarContent({
               label="Admin"
               onNavigate={onNavigate}
               collapsed={collapsed}
-              healthPip={{ count: healthAttention, danger: healthPipDanger }}
+              healthPip={health?.counts ?? null}
             />
           )}
           <NavItem to="/docs" icon={<BookIcon />} label="Docs" onNavigate={onNavigate} collapsed={collapsed} />

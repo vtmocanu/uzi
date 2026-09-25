@@ -24,6 +24,7 @@ import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import { healthVerdict } from "../lib/healthView";
 import { useHealthStatus } from "../lib/useAdminHealth";
+import { SeverityShape } from "./healthSeverity";
 import { Button, cx } from "./ui";
 
 const SNOOZE_MS = 60 * 60 * 1000; // 1 h (D2)
@@ -105,9 +106,8 @@ export function HealthDangerBanner({ now = Date.now }: { now?: () => number } = 
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="min-w-0">
           <p className="text-sm font-semibold text-fg">
-            <span aria-hidden="true" className="text-danger">
-              ◆
-            </span>{" "}
+            {/* The danger shape (PRD #1648 D6), decorative: the verdict text names the state. */}
+            <SeverityShape severity="danger" className="mr-1.5 align-middle text-danger" />
             {verdict.title}
           </p>
           {topDanger && <p className="mt-0.5 text-sm text-muted">{topDanger.summary}</p>}

@@ -60,6 +60,11 @@ describe("HealthDangerBanner", () => {
     // Verdict line derived from counts.danger (3 danger checks in the incident fixture).
     expect(screen.getByText("uzi cannot run work: 3 blocking checks")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Snooze 1 h" })).toBeTruthy();
+    // PRD #1648 D6: the danger mark is the decorative SVG shape, not a font glyph.
+    const el = banner();
+    if (!el) throw new Error("banner not rendered");
+    expect(el.querySelector('svg[aria-hidden="true"]')).not.toBeNull();
+    expect(el.textContent).not.toMatch(/[\u25cf\u25b2\u25c6\u25cb]/);
   });
 
   it("hides the Snooze button while episode_id is null (a danger doc with no open episode)", async () => {

@@ -109,7 +109,7 @@ export function ToolAllowlist() {
           description="Add a package above before users can select it in a repo's tool profile."
         />
       ) : (
-        <Card className="p-0">
+        <Card flush>
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm">
               <thead className="border-b border-edge text-muted">
