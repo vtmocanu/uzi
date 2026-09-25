@@ -161,6 +161,13 @@ export class SteeringChannel {
   private stopped = false;
   private loop: Promise<void> | undefined;
   private readonly followUps: { id: number; body: string }[] = [];
+  /** Issue #1660: every follow-up body RECEIVED so far, in arrival order: the run's operator
+   *  constraints. Recorded on route (the input is already consumed server-side), never
+   *  shifted, so the lead's FIFO delivery (followUps) is untouched and each later subagent
+   *  dispatch gets the whole set (the Agent guard reads it via operatorConstraints). All
+   *  follow-ups, not a subset: the operator has no way to tag a safety constraint today.
+   *  In-memory for this claim only. */
+  private readonly receivedFollowUps: string[] = [];
   /** issue #559 M2: the highest `follow_up` input id this channel has already handed to the
    *  executor — via pullFollowUp or awaitFollowUp/serviceFollowUp. This is the wake-guard
    *  watermark the runner reports at the interactive park (open_followup_id). Buffering a
@@ -554,6 +561,12 @@ export class SteeringChannel {
     return this.lastDeliveredFollowUpIdValue;
   }
 
+  /** Issue #1660: the run's operator constraints, every follow-up received so far in arrival
+   *  order. A copy, so a caller cannot rewrite the record. */
+  operatorConstraints(): readonly string[] {
+    return [...this.receivedFollowUps];
+  }
+
   /** Dequeue the oldest un-consumed follow-up, or undefined if none. */
   pullFollowUp(): string | undefined {
     return this.takeFollowUp()?.body;
@@ -860,8 +873,10 @@ export class SteeringChannel {
       case "follow_up":
         // issue #559 M2: carry the input id alongside the body so a delivery (takeFollowUp)
         // can advance the wake-guard watermark. The other kinds ignore the id.
-        if (body && body.trim())
+        if (body && body.trim()) {
           this.followUps.push({ id, body: body.trim() });
+          this.receivedFollowUps.push(body.trim());
+        }
         break;
       case "answer": {
         // PRD #88. Reaching the default arm instead would DESTROY the answer: /inputs

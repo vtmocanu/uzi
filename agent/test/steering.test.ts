@@ -9,6 +9,8 @@ import {
 } from "../src/steering.js";
 import type { WorkerClient } from "../src/client.js";
 import type { UserInput } from "../src/protocol.js";
+import { buildAgentGuardHook, NESTED_AGENT_TOOL } from "../src/guardrails.js";
+import type { HookInput } from "@anthropic-ai/claude-agent-sdk";
 import { nullLogger } from "./helpers.js";
 
 // The steering channel is the single /inputs poller; it routes verdicts,
@@ -834,5 +836,76 @@ describe("ChatSteering", () => {
     await tick();
     await ch.stop();
     assert.deepStrictEqual(await p, { kind: "ended" });
+  });
+});
+
+// Issue #1660: an operator follow-up is also a persistent RUN CONSTRAINT. The channel records it
+// on receipt (it is already consumed server-side by then), independently of the lead's FIFO
+// delivery, and the Agent guard attaches every recorded constraint to each later dispatch.
+describe("SteeringChannel operator constraints (issue #1660)", () => {
+  it("records follow-ups on receipt, in order, and keeps them after the lead's pull", async () => {
+    const { ch } = makeChannel([[inp("follow_up", "  first  "), inp("follow_up", "   "), inp("revise_plan", "not a constraint")], [inp("follow_up", "second")]]);
+    assert.deepStrictEqual(ch.operatorConstraints(), [], "nothing before any input is routed");
+    ch.start();
+    try {
+      await tick();
+      assert.deepStrictEqual(ch.operatorConstraints(), ["first", "second"], "trimmed, blanks and other kinds skipped");
+      // The lead's delivery is unchanged and does not consume the constraint record.
+      assert.strictEqual(ch.pullFollowUp(), "first");
+      assert.strictEqual(ch.pullFollowUp(), "second");
+      assert.deepStrictEqual(ch.operatorConstraints(), ["first", "second"]);
+    } finally {
+      await ch.stop();
+    }
+  });
+
+  it("returns a copy: a caller cannot rewrite the run's constraints", async () => {
+    const { ch } = makeChannel([[inp("follow_up", "keep")]]);
+    ch.start();
+    try {
+      await tick();
+      (ch.operatorConstraints() as string[]).push("injected");
+      assert.deepStrictEqual(ch.operatorConstraints(), ["keep"]);
+    } finally {
+      await ch.stop();
+    }
+  });
+
+  it("acceptance: a follow-up received after run start reaches a later dispatch and no earlier one", async () => {
+    const queue: UserInput[][] = [];
+    const client = { getInputs: async () => ({ inputs: queue.shift() ?? [] }) } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    const hook = buildAgentGuardHook(["reviewer", "auditor"], nullLogger(), () => ch.operatorConstraints());
+    const dispatch = async (subagent_type: string): Promise<string> => {
+      const out = (await hook({
+        session_id: "s",
+        transcript_path: "/t",
+        cwd: "/w",
+        hook_event_name: "PreToolUse",
+        tool_name: NESTED_AGENT_TOOL,
+        tool_input: { subagent_type, prompt: `${subagent_type} task` },
+        tool_use_id: "tu",
+      } as HookInput)) as { hookSpecificOutput?: { updatedInput?: { prompt?: string } } };
+      return out.hookSpecificOutput?.updatedInput?.prompt ?? "";
+    };
+    const rule = "never execute a string containing kill; screen strings only";
+
+    ch.start();
+    try {
+      await tick();
+      const early = await dispatch("reviewer");
+      assert.strictEqual(early, "reviewer task", "dispatch before the follow-up is unchanged");
+
+      queue.push([inp("follow_up", rule)]);
+      await tick();
+      const late = await dispatch("auditor");
+      assert.ok(late.startsWith("auditor task\n\n"));
+      assert.ok(late.includes(rule), "dispatch after the follow-up carries it");
+      // A later dispatch still carries it after the lead consumed its own copy.
+      assert.strictEqual(ch.pullFollowUp(), rule);
+      assert.ok((await dispatch("reviewer")).includes(rule), "persistent for the rest of the run");
+    } finally {
+      await ch.stop();
+    }
   });
 });

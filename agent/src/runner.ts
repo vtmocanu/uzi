@@ -6216,6 +6216,8 @@ export class RunRunner {
       // (maybeSteerOnDivergence) armed on this same steering channel, in-process. Consumed by
       // both executors at their loop top ahead of the follow-up drain.
       pullSafetySteer: () => steering.pullSafetySteer(),
+      // Issue #1660: the follow-ups received so far, attached to every later subagent dispatch.
+      operatorConstraints: () => steering.operatorConstraints(),
       // PRD #517 M3: the interactive-task follow-up park. The executor calls this after a
       // clean signal_done on an interactive run (it has already checkpoint-pushed): report
       // awaiting_followup, verify the park took, then BLOCK on the steering channel until

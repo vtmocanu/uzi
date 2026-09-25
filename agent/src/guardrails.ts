@@ -105,6 +105,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { HookInput, HookJSONOutput } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "./log.js";
+import { buildOperatorConstraintsBlock } from "./prompt.js";
 
 /**
  * The subagent-invocation tool. Blocking it on each mapped subagent (see
@@ -1245,6 +1246,13 @@ function subagentTypeOf(toolInput: unknown): string | undefined {
  *     subagent synchronously makes it complete IN-TURN, before the turn-end reap,
  *     so delegation works AND B1 stays closed (no survivor into the PAT push).
  *
+ *  3. for an ALLOWED subagent, appends the run's operator constraints (issue #1660):
+ *     every follow-up received so far, read from `operatorConstraints` AT DISPATCH TIME,
+ *     so a dispatch before a follow-up never carries it and every one after does. The
+ *     lead's own <follow_up> delivery is unchanged; this is the structural copy it could
+ *     not be relied on to relay. Rendered by buildOperatorConstraintsBlock (nonce-fenced,
+ *     size-capped); an already-synchronous call is rewritten too when there is a block.
+ *
  * The lead keeps the Agent tool to delegate to the allowed roles; every subagent
  * already carries `disallowedTools:['Agent']`, so this hook only ever sees the
  * lead's calls.
@@ -1252,6 +1260,7 @@ function subagentTypeOf(toolInput: unknown): string | undefined {
 export function buildAgentGuardHook(
   allowed: Iterable<string>,
   log: Logger,
+  operatorConstraints: () => readonly string[] = () => [],
 ): (input: HookInput) => Promise<HookJSONOutput> {
   const allowSet = new Set(allowed);
   return async (input: HookInput): Promise<HookJSONOutput> => {
@@ -1267,16 +1276,24 @@ export function buildAgentGuardHook(
         },
       };
     }
-    // Allowed subagent: force synchronous delegation. Already-synchronous calls
-    // pass through untouched.
+    // Allowed subagent: force synchronous delegation and attach the operator
+    // constraints. An already-synchronous call with no constraints passes through untouched.
     const original = input.tool_input && typeof input.tool_input === "object"
       ? (input.tool_input as Record<string, unknown>)
       : {};
-    if (original["run_in_background"] === false) return {};
+    const prompt = original["prompt"];
+    const constraints = typeof prompt === "string" ? buildOperatorConstraintsBlock(operatorConstraints()) : "";
+    if (original["run_in_background"] === false && constraints === "") return {};
+    const updatedInput: Record<string, unknown> = { ...original, run_in_background: false };
+    if (constraints !== "") {
+      updatedInput["prompt"] = `${prompt as string}\n\n${constraints}`;
+      // Never the text: it is the operator's, and logs are not its audience.
+      log.debug("guardrail attached operator constraints to a subagent dispatch", { subagent_type: sub });
+    }
     return {
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
-        updatedInput: { ...original, run_in_background: false },
+        updatedInput,
       },
     };
   };

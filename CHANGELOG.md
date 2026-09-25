@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Operator follow-ups and a worker safety block now reach every subagent, not just the lead ([#1660](https://github.com/vtmocanu/uzi/issues/1660)).**
+  Every follow-up a run receives is kept as a run constraint and attached, fenced and size-capped, to each subagent the lead dispatches after it arrives; dispatches made before it are unchanged, and the lead still receives it as before. Every subagent prompt, from uzi's templates or the repository's own agents, also ends with a worker-owned rule block: never execute a candidate command payload (screen it as a string), and stop a process only by its own handle, never by pattern, port, `kill -1` or `kill 0`. Constraints are held in memory for the current claim, so after a pause, resume or requeue (a new claim) subagents no longer receive follow-ups sent before it.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added
