@@ -53,7 +53,7 @@ export interface ChatRunnerOptions {
    * over `GET /inputs`. Tests inject a fake that yields scripted ChatInputs so the
    * user_message emission and the turn/idle/cancel flow are provable without HTTP.
    */
-  makeSource?: (runId: string, cancel: AbortController, log: Logger) => ChatInputSource;
+  makeSource?: (runId: string, cancel: AbortController, log: Logger, claimGeneration: number) => ChatInputSource;
   /**
    * The SDK HOME the chat executor runs under, so a Continue can check whether the
    * session it was handed is actually resolvable on THIS worker (issue #105). The check
@@ -91,7 +91,7 @@ export interface ChatRunnerOptions {
  * a chat produces conversation, not a branch.
  */
 export class ChatRunner {
-  private readonly makeSource: (runId: string, cancel: AbortController, log: Logger) => ChatInputSource;
+  private readonly makeSource: (runId: string, cancel: AbortController, log: Logger, claimGeneration: number) => ChatInputSource;
   private readonly sdkHomeDir?: string;
   /** PRD #1391 M2 — spill collaborators threaded into the chat batcher (see execute). */
   private readonly outbox: Outbox | undefined;
@@ -114,7 +114,7 @@ export class ChatRunner {
   ) {
     this.makeSource =
       opts.makeSource ??
-      ((runId, cancel, runLog) => new ChatSteering(this.client, runId, this.defaults.pollMs, runLog, cancel));
+      ((runId, cancel, runLog, generation) => new ChatSteering(this.client, runId, this.defaults.pollMs, runLog, cancel, {}, generation));
     this.sdkHomeDir = opts.sdkHomeDir;
     this.outbox = opts.outbox;
     this.rearm = opts.rearm;
@@ -173,7 +173,8 @@ export class ChatRunner {
       if (signal.aborted) cancel.abort();
       else signal.addEventListener("abort", onShutdown, { once: true });
     }
-    const source = this.makeSource(runId, cancel, runLog);
+    // Issue #1673: the chat claim carries its generation for the input receipts (normally 0).
+    const source = this.makeSource(runId, cancel, runLog, claim.claim_generation ?? 0);
 
     // The uzi tools MCP server (M3): bound to THIS run's client + run id, so
     // propose_issue can only ever propose on this chat run, and the read tools call
@@ -299,11 +300,21 @@ export class ChatRunner {
       };
 
       const result = await executor.run(ctx);
+      await source.stop();
+      if (source.claimLost?.()) {
+        await batcher.close().catch(() => undefined);
+        return;
+      }
       batcher.emit({ kind: "status", agent: "worker", payload: { text: chatEndText(result) } });
       await batcher.close();
       await reportState({ status: "completed" });
       runLog.info("chat completed", { turns: result.turns, end_reason: result.endReason });
     } catch (err) {
+      await source.stop().catch(() => undefined);
+      if (source.claimLost?.()) {
+        await batcher.close().catch(() => undefined);
+        return;
+      }
       const reason = redactText(errMessage(err));
       runLog.error("chat failed", { error: reason });
       batcher.emit({ kind: "error", agent: "worker", payload: { text: reason } });

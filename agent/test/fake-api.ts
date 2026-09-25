@@ -39,6 +39,13 @@ export class FakeApi {
   // --- control -------------------------------------------------------------
   private readonly claimQueue: ClaimResponse[] = [];
   private readonly inputsByRun = new Map<string, UserInput[]>();
+  private readonly ackedByRun = new Map<string, Set<number>>();
+  private readonly appliedByRun = new Map<string, Set<number>>();
+  private readonly receiptGeneration = new Map<string, number>();
+  private readonly lostReceiptReplies = new Map<string, number>();
+  private readonly seenInputIds = new Map<string, Set<number>>();
+  private nextSyntheticInputId = 1_000_000;
+  readonly inputReceiptCalls: Array<{ runId: string; kind: "ack" | "applied"; ids: number[]; generation: number }> = [];
   // Issue #1660: the follow_up inputs /inputs has already drained, per run, oldest first — what
   // the real server's GET /runs/{id}/follow-ups (ListConsumedFollowUpInputsForRun) returns.
   private readonly consumedFollowUpsByRun = new Map<string, UserInput[]>();
@@ -241,6 +248,7 @@ export class FakeApi {
   }
 
   enqueueClaim(claim: ClaimResponse): void {
+    this.receiptGeneration.set(claim.run_id, claim.claim_generation ?? 0);
     this.claimQueue.push(claim);
   }
 
@@ -356,7 +364,25 @@ export class FakeApi {
   }
 
   setInputs(runId: string, inputs: UserInput[]): void {
+    // Issue #1673: a real row id is never reused, and receipts are keyed by id. Many older
+    // fixtures send every input as id 1; a row whose id this run has already seen gets a fresh
+    // one (also within one batch), so a later input is a new row rather than a replay.
+    const seen = this.seenInputIds.get(runId) ?? new Set<number>();
+    inputs = inputs.map((row) => {
+      const fresh = seen.has(row.id) ? { ...row, id: this.nextSyntheticInputId++ } : row;
+      seen.add(fresh.id);
+      return fresh;
+    });
+    this.seenInputIds.set(runId, seen);
     this.inputsByRun.set(runId, inputs);
+  }
+
+  setInputClaimGeneration(runId: string, generation: number): void {
+    this.receiptGeneration.set(runId, generation);
+  }
+
+  loseNextInputReceiptReply(kind: "ack" | "applied"): void {
+    this.lostReceiptReplies.set(kind, (this.lostReceiptReplies.get(kind) ?? 0) + 1);
   }
 
   /** PRD #1247 M5b (MINOR-7): arm a TOP-LEVEL credential_switch signal on every /state ACK for a
@@ -608,6 +634,49 @@ export class FakeApi {
       });
     }
 
+    const receiptMatch = /^\/api\/worker\/runs\/([^/]+)\/inputs\/(ack|applied)$/.exec(p);
+    if (req.method === "POST" && receiptMatch) {
+      const runId = receiptMatch[1]!;
+      const kind = receiptMatch[2] as "ack" | "applied";
+      const ids = json.ids as number[];
+      const generation = json.claim_generation as number;
+      this.inputReceiptCalls.push({ runId, kind, ids: [...ids], generation });
+      // A run whose claim generation the test never set (it ran a claim without enqueueClaim)
+      // accepts any generation, as that claim is the only one.
+      const current = this.receiptGeneration.get(runId);
+      const active = current === undefined || generation === current;
+      const rows = this.inputsByRun.get(runId) ?? [];
+      const acked = this.ackedByRun.get(runId) ?? new Set<number>();
+      const applied = this.appliedByRun.get(runId) ?? new Set<number>();
+      if (!Array.isArray(ids) || ids.length === 0 || ids.some((id) => !rows.some((row) => row.id === id)))
+        return send(res, 400, { error: "invalid input ids" });
+      if (kind === "ack" && !active && ids.some((id) => !acked.has(id)))
+        return send(res, 409, { error: "inactive claim" });
+      // Like the server: a retried applied for rows already applied succeeds even after the
+      // claim was fenced; an unapplied row needs the active claim.
+      if (kind === "applied" && ids.some((id) => !acked.has(id) || (!active && !applied.has(id))))
+        return send(res, 409, { error: "inactive or unacked" });
+      if (kind === "ack") {
+        for (const id of ids) acked.add(id);
+        this.ackedByRun.set(runId, acked);
+      } else {
+        for (const id of ids) applied.add(id);
+        this.appliedByRun.set(runId, applied);
+        // GET /follow-ups returns APPLIED follow-ups (ListConsumedFollowUpInputsForRun).
+        const consumed = this.consumedFollowUpsByRun.get(runId) ?? [];
+        for (const row of rows.filter((row) => ids.includes(row.id) && row.kind === "follow_up"))
+          if (!consumed.some((old) => old.id === row.id)) consumed.push(row);
+        this.consumedFollowUpsByRun.set(runId, consumed);
+      }
+      const remaining = this.lostReceiptReplies.get(kind) ?? 0;
+      if (remaining > 0) {
+        this.lostReceiptReplies.set(kind, remaining - 1);
+        res.destroy();
+        return;
+      }
+      return send(res, 200, { inputs: rows.filter((row) => ids.includes(row.id)).sort((a, b) => a.id - b.id), active });
+    }
+
     const runMatch =
       /^\/api\/worker\/runs\/([^/]+)\/(messages|state|inputs)$/.exec(p);
     if (runMatch) {
@@ -618,14 +687,9 @@ export class FakeApi {
       if (req.method === "POST" && kind === "state")
         return this.handleState(res, runId, json);
       if (req.method === "GET" && kind === "inputs") {
-        // Consume-on-read, FIFO — matches M1's ConsumeInputs (each GET returns
-        // then clears the pending inputs; there is no separate ack).
-        const pending = this.inputsByRun.get(runId) ?? [];
-        this.inputsByRun.set(runId, []);
-        const consumed = this.consumedFollowUpsByRun.get(runId) ?? [];
-        consumed.push(...pending.filter((i) => i.kind === "follow_up"));
-        this.consumedFollowUpsByRun.set(runId, consumed);
-        return send(res, 200, { inputs: pending });
+        const rows = this.inputsByRun.get(runId) ?? [];
+        const applied = this.appliedByRun.get(runId) ?? new Set<number>();
+        return send(res, 200, { inputs: rows.filter((row) => !applied.has(row.id)).sort((a, b) => a.id - b.id) });
       }
     }
 

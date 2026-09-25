@@ -184,10 +184,9 @@ export type MessageKind =
  *  `answer` — the human's reply to an ask_user question, body = JSON AnswerBody).
  *
  *  Widening this union is NOT sufficient on its own: SteeringChannel.route() must
- *  also learn the kind. `GET /inputs` is consume-on-read, so an unrouted kind is
- *  marked consumed server-side and then dropped by route()'s default arm — the input
- *  is destroyed with no error and no retry, and it looks exactly like a user who
- *  never answered. route() takes a bare string, so nothing here typechecks that. */
+ *  also learn the kind. An unrouted kind is ACKed and applied like any other input
+ *  (issue #1673) and then dropped by route()'s default arm — the input is destroyed
+ *  with no error and no retry, and it looks exactly like a user who never answered. route() takes a bare string, so nothing here typechecks that. */
 export type InputKind =
   | "follow_up"
   | "approve_plan"
@@ -1333,6 +1332,7 @@ export interface TaskReviewRequest {
  */
 export interface ChatClaimResponse {
   run_id: string;
+  claim_generation?: number;
   kind: "chat";
   /** Conversation display title (server-derived; may be empty). */
   title: string;

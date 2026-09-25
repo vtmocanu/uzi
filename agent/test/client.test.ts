@@ -563,6 +563,46 @@ describe("getInputs return shape (PRD #1247 M5)", () => {
   });
 });
 
+describe("input receipts", () => {
+  it("returns inactive on an old claim's ACK retry and replays to a new claim", async () => {
+    const client = newClient();
+    api.setInputClaimGeneration("switch-run", 7);
+    api.setInputs("switch-run", [{ id: 7, kind: "follow_up", body: "handoff" }]);
+    await client.ackInputs("switch-run", [7], 7);
+    api.setInputClaimGeneration("switch-run", 8);
+    const old = await client.ackInputs("switch-run", [7], 7);
+    assert.strictEqual(old.active, false);
+    assert.deepStrictEqual((await client.getInputs("switch-run")).inputs.map((r) => r.id), [7]);
+    const next = await client.ackInputs("switch-run", [7], 8);
+    assert.strictEqual(next.active, true);
+    await client.applyInputs("switch-run", [7], 8);
+    assert.deepStrictEqual((await client.getInputs("switch-run")).inputs, []);
+  });
+
+  it("replays GET until applied and retries lost ACK/applied replies with the same IDs", async () => {
+    const client = newClient();
+    api.setInputClaimGeneration("receipt-run", 7);
+    api.setInputs("receipt-run", [
+      { id: 7, kind: "follow_up", body: "first" },
+      { id: 8, kind: "stop", body: null },
+    ]);
+    assert.deepStrictEqual((await client.getInputs("receipt-run")).inputs.map((r) => r.id), [7, 8]);
+    api.loseNextInputReceiptReply("ack");
+    await assert.rejects(client.ackInputs("receipt-run", [7, 8], 7));
+    const ack = await client.ackInputs("receipt-run", [7, 8], 7);
+    assert.strictEqual(ack.active, true);
+    assert.deepStrictEqual(ack.inputs.map((r) => r.id), [7, 8]);
+    api.loseNextInputReceiptReply("applied");
+    await assert.rejects(client.applyInputs("receipt-run", [7, 8], 7));
+    await client.applyInputs("receipt-run", [7, 8], 7);
+    assert.deepStrictEqual((await client.getInputs("receipt-run")).inputs, []);
+    assert.deepStrictEqual(api.inputReceiptCalls.map((c) => [c.kind, c.ids, c.generation]), [
+      ["ack", [7, 8], 7], ["ack", [7, 8], 7],
+      ["applied", [7, 8], 7], ["applied", [7, 8], 7],
+    ]);
+  });
+});
+
 // Issue #1660: the worker rehydrates its operator constraints from the run's already-consumed
 // follow-ups on every claim; the read consumes nothing.
 describe("getConsumedFollowUps (issue #1660)", () => {
@@ -575,6 +615,10 @@ describe("getConsumedFollowUps (issue #1660)", () => {
     const client = newClient();
     assert.deepStrictEqual(await client.getConsumedFollowUps("run-fu"), [], "nothing consumed yet");
     await client.getInputs("run-fu");
+    assert.deepStrictEqual(await client.getConsumedFollowUps("run-fu"), [], "GET is read only");
+    await client.ackInputs("run-fu", [3, 4, 5], 0);
+    assert.deepStrictEqual(await client.getConsumedFollowUps("run-fu"), [], "an ACK alone is not applied");
+    await client.applyInputs("run-fu", [3, 4, 5], 0);
     const got = await client.getConsumedFollowUps("run-fu");
     assert.deepStrictEqual(got.map((i) => [i.id, i.kind, i.body]), [
       [3, "follow_up", "first"],

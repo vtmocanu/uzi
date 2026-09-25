@@ -18,7 +18,7 @@ import { SteeringChannel } from "../src/steering.js";
 import type { ClaimResponse, UserInput } from "../src/protocol.js";
 import type { WorkerClient } from "../src/client.js";
 import { RequestError } from "../src/client.js";
-import { makeClaim, nullLogger } from "./helpers.js";
+import { makeClaim, nullLogger, stopStartedChannels, withReceipts } from "./helpers.js";
 import {
   api,
   client,
@@ -596,13 +596,16 @@ describe("SdkExecutor interactive task park (PRD #517 M3)", () => {
 
 // ── SteeringChannel.awaitFollowUp ────────────────────────────────────────────
 describe("SteeringChannel.awaitFollowUp (PRD #517 M3)", () => {
+  afterEach(stopStartedChannels);
   function fakeClient(batches: UserInput[][]): WorkerClient {
     let i = 0;
     // PRD #1247 M5: getInputs now returns { inputs, credentialSwitch? }; the poller reads `.inputs`.
-    return { getInputs: async () => ({ inputs: batches[i++] ?? [] }) } as unknown as WorkerClient;
+    return withReceipts({ getInputs: async () => ({ inputs: batches[i++] ?? [] }) } as unknown as WorkerClient);
   }
+  // A fresh id per input, as real rows have: issue #1673 routes each input id once per claim.
+  let nextId = 1;
   const inp = (kind: UserInput["kind"], body?: string): UserInput => ({
-    id: 1,
+    id: nextId++,
     kind,
     body: body ?? null,
   });

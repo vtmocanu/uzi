@@ -882,6 +882,16 @@ export class WorkerClient {
     return { inputs: res.inputs ?? [], credentialSwitch: res.credential_switch };
   }
 
+  async ackInputs(runId: string, ids: number[], claimGeneration: number): Promise<{ inputs: UserInput[]; active: boolean }> {
+    return (await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs/ack`,
+      { ids, claim_generation: claimGeneration })) as { inputs: UserInput[]; active: boolean };
+  }
+
+  async applyInputs(runId: string, ids: number[], claimGeneration: number): Promise<{ inputs: UserInput[]; active: boolean }> {
+    return (await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs/applied`,
+      { ids, claim_generation: claimGeneration })) as { inputs: UserInput[]; active: boolean };
+  }
+
   /** Issue #1660: the run's ALREADY-CONSUMED follow_up inputs, oldest first (GET
    *  /worker/runs/{id}/follow-ups). READ ONLY: unlike getInputs it consumes nothing. The runner
    *  seeds them into the steering channel on every claim so a follow-up an earlier claim consumed

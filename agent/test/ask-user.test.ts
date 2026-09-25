@@ -1,10 +1,13 @@
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { SteeringChannel, type AnswerVerdict } from "../src/steering.js";
 import type { WorkerClient } from "../src/client.js";
 import type { UserInput } from "../src/protocol.js";
 import { scanSignals, isSignalToolName, ASK_USER_TOOL, SIGNAL_SERVER_NAME } from "../src/signals.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, stopStartedChannels, withReceipts } from "./helpers.js";
+
+// Issue #1663: stop every started channel after each test, even one whose assertion threw.
+afterEach(stopStartedChannels);
 
 // PRD #88 M1: the ask_user signal and the answer half of the steering channel.
 // Driven with a scripted getInputs and hand-built SDK frames — no live server, no
@@ -15,10 +18,12 @@ const ASK_USER_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${ASK_USER_TOOL}`;
 function fakeClient(batches: UserInput[][]): WorkerClient {
   let i = 0;
   // PRD #1247 M5: getInputs now returns { inputs, credentialSwitch? }; the poller reads `.inputs`.
-  return { getInputs: async () => ({ inputs: batches[i++] ?? [] }) } as unknown as WorkerClient;
+  return withReceipts({ getInputs: async () => ({ inputs: batches[i++] ?? [] }) } as unknown as WorkerClient);
 }
 
-const inp = (kind: UserInput["kind"], body?: string): UserInput => ({ id: 1, kind, body: body ?? null });
+// A fresh id per input, as real rows have: issue #1673 routes each input id once per claim.
+let nextInputId = 1;
+const inp = (kind: UserInput["kind"], body?: string): UserInput => ({ id: nextInputId++, kind, body: body ?? null });
 const answerInput = (questionId: string, ...answers: string[]): UserInput =>
   inp("answer", JSON.stringify({ question_id: questionId, answers }));
 const tick = (ms = 10): Promise<void> => new Promise((r) => setTimeout(r, ms));
