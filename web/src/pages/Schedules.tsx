@@ -719,18 +719,18 @@ export function Schedules() {
           }}
           onKeyDown={onTabKeyDown}
           onClick={() => setTab("catalog")}
+          // With the badge shown, name the tab explicitly so the count and the badge read
+          // as "Job catalog · 9, 6 not enabled" rather than "· 9 6 not enabled". A hidden
+          // separator node would need a whitespace flex item, doubling the visible gap.
+          aria-label={
+            loaded && notEnabled > 0
+              ? `Job catalog · ${catalog.entries.length}, ${notEnabled} not enabled`
+              : undefined
+          }
           className={cx(TAB_BASE, "inline-flex items-center gap-2", tab === "catalog" ? TAB_ACTIVE : TAB_INACTIVE)}
         >
           Job catalog{loaded ? ` · ${catalog.entries.length}` : ""}
-          {/* The hidden comma and space separate the count from the badge in the tab's
-              accessible name ("Job catalog · 9, 6 not enabled", not "· 9 6 not enabled");
-              CSS flex layout does not render a whitespace-only text run between items. */}
-          {loaded && notEnabled > 0 && (
-            <>
-              <span className="sr-only">,</span>{" "}
-              <Badge tone="neutral">{notEnabled} not enabled</Badge>
-            </>
-          )}
+          {loaded && notEnabled > 0 && <Badge tone="neutral">{notEnabled} not enabled</Badge>}
         </button>
         {/* Running state only: the button sits at the right end of the tab row (ml-auto),
             directly under "New schedule", so no header height is added. It disappears
