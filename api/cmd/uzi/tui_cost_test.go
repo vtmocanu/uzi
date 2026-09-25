@@ -1,11 +1,6 @@
 package main
 
-import (
-	"math"
-	"testing"
-
-	"github.com/vtmocanu/uzi/api/internal/apitypes"
-)
+import "testing"
 
 // These pin the exact web-parity reference values (web/src/lib/formatTokens.ts,
 // web/src/lib/runUsage.ts) so the terminal and web read a figure identically.
@@ -103,54 +98,5 @@ func TestCacheDisplayPct(t *testing.T) {
 			t.Errorf("%s: cacheDisplayPct(%d,%d,%d) = %d, want %d",
 				c.name, c.input, c.cacheRead, c.cacheCreate, got, c.want)
 		}
-	}
-}
-
-func TestBoardCostTotal(t *testing.T) {
-	// round(1.6)+round(1.6) = 2+2 = 4, but round(1.6+1.6) = round(3.2) = 3.
-	// Proves the total sums raw values, not the rounded per-row cells. The
-	// nil-Usage run must be ignored.
-	runs := []apitypes.RunListItemDTO{
-		{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostUSD: 1.6}}},
-		{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostUSD: 1.6}}},
-		{RunDTO: apitypes.RunDTO{Usage: nil}},
-	}
-	if got, ok := boardCostTotal(runs); !ok || got != "$3" {
-		t.Errorf("boardCostTotal(mixed) = (%q, %v), want (\"$3\", true)", got, ok)
-	}
-
-	// Empty slice → no usage-bearing runs.
-	if got, ok := boardCostTotal(nil); ok || got != "" {
-		t.Errorf("boardCostTotal(nil) = (%q, %v), want (\"\", false)", got, ok)
-	}
-
-	// All-nil slice → no usage-bearing runs.
-	allNil := []apitypes.RunListItemDTO{
-		{RunDTO: apitypes.RunDTO{Usage: nil}},
-		{RunDTO: apitypes.RunDTO{Usage: nil}},
-	}
-	if got, ok := boardCostTotal(allNil); ok || got != "" {
-		t.Errorf("boardCostTotal(allNil) = (%q, %v), want (\"\", false)", got, ok)
-	}
-
-	// Raw sum that rounds to 0 (0.2 + 0.2 = 0.4 → round 0) → dropped.
-	roundsToZero := []apitypes.RunListItemDTO{
-		{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostUSD: 0.2}}},
-		{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostUSD: 0.2}}},
-	}
-	if got, ok := boardCostTotal(roundsToZero); ok || got != "" {
-		t.Errorf("boardCostTotal(roundsToZero) = (%q, %v), want (\"\", false)", got, ok)
-	}
-
-	// A NaN/Inf/negative row cost is skipped, not allowed to poison the total: $10
-	// plus a NaN, an Inf, and a -5 must still total $10, not vanish or shrink.
-	withInvalid := []apitypes.RunListItemDTO{
-		{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostUSD: 10}}},
-		{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostUSD: math.NaN()}}},
-		{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostUSD: math.Inf(1)}}},
-		{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostUSD: -5}}},
-	}
-	if got, ok := boardCostTotal(withInvalid); !ok || got != "$10" {
-		t.Errorf("boardCostTotal(withInvalid) = (%q, %v), want (\"$10\", true)", got, ok)
 	}
 }

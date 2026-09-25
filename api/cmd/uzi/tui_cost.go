@@ -142,35 +142,23 @@ func cacheDisplayPct(input, cacheRead, cacheCreation int64) int {
 	return pct
 }
 
-// boardCostTotal is the factory-floor total (PRD #650 M1): the sum of the raw
-// CostUSD over every run whose Usage is non-nil, rounded for display as
-// "$" + round(sum). The sum is over raw values, NOT the rounded per-row cells, so
-// the aggregate is accurate even though individual rounded rows may not visibly
-// add up to it (documented dashboard behaviour). Returns ("", false) when the
-// summed total is 0 (or no usage-bearing runs), so the caller drops the segment.
-func boardCostTotal(runs []apitypes.RunListItemDTO) (string, bool) {
-	var sum float64
-	for _, r := range runs {
-		if r.Usage == nil {
-			continue
-		}
-		// Skip an invalid per-row cost the same way fmtCostWhole clamps it, so one
-		// bad row cannot poison the whole total: a lone NaN would make the sum NaN
-		// and drop the segment, and a negative would silently shrink the aggregate.
-		cost := r.Usage.CostUSD
-		if math.IsNaN(cost) || math.IsInf(cost, 0) || cost < 0 {
-			continue
-		}
-		sum += cost
-	}
-	rounded := math.Round(sum)
-	// sum is now always finite and >= 0 (invalid rows were skipped above), so the
-	// segment is dropped only when there is genuinely nothing to show: no
-	// usage-bearing runs, or a raw sum that rounds to 0.
-	if rounded <= 0 {
+// boardUsageCost is the seven-day server aggregate shown on the own board.
+// A plus marks a dollar subtotal with subscription or unreported runs.
+func boardUsageCost(usage apitypes.SelfUsageDTO) (string, bool) {
+	cost := usage.Last7Days.CostUSD
+	if math.IsNaN(cost) || math.IsInf(cost, 0) || cost < 0 {
 		return "", false
 	}
-	return "$" + strconv.FormatInt(int64(rounded), 10), true
+	marked := usage.Last7SubscriptionRunCount > 0 || usage.Last7UnreportedRunCount > 0
+	rounded := math.Round(cost)
+	if rounded == 0 && !marked {
+		return "", false
+	}
+	value := "$" + strconv.FormatInt(int64(rounded), 10)
+	if marked {
+		value += "+"
+	}
+	return value + " 7d", true
 }
 
 // fmtCostBoard formats a run's cost for the FIXED-WIDTH board COST cell: fmtCostWhole
