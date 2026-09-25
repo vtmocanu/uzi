@@ -1,8 +1,12 @@
 package workersvc
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -365,5 +369,106 @@ func TestAutopilotRejectedListThenMilestonelessReportHoldsLiveDB(t *testing.T) {
 	}
 	if permit.Granted {
 		t.Fatalf("autopilot permit granted after a rejected milestone list (vacuous grant): %+v", permit)
+	}
+}
+
+// planMdStored reports whether the run's plan_md column is non-NULL.
+func (e interlockLiveDB) planMdStored(t *testing.T, runID uuid.UUID) bool {
+	t.Helper()
+	var stored bool
+	if err := e.pool.QueryRow(e.ctx, `SELECT plan_md IS NOT NULL FROM runs WHERE id = $1`, runID).Scan(&stored); err != nil {
+		t.Fatalf("read plan_md: %v", err)
+	}
+	return stored
+}
+
+// failClaimedToRunning installs a Postgres trigger that makes the claimed -> running UPDATE of
+// runID raise, so SetRunRunning fails at the real DB boundary while SetRunAutopilotPlan (which
+// keeps the status) still succeeds. The returned func drops it; t.Cleanup drops it too.
+func (e interlockLiveDB) failClaimedToRunning(t *testing.T, runID uuid.UUID) func() {
+	t.Helper()
+	suffix := strings.ReplaceAll(runID.String(), "-", "")
+	fn, trg := "uzi_test_fail_running_"+suffix, "uzi_test_fail_running_trg_"+suffix
+	e.exec(t, `CREATE FUNCTION `+fn+`() RETURNS trigger LANGUAGE plpgsql AS $$
+	           BEGIN
+	             IF OLD.status = 'claimed' AND NEW.status = 'running' THEN
+	               RAISE EXCEPTION 'issue #1626 test: injected SetRunRunning failure';
+	             END IF;
+	             RETURN NEW;
+	           END $$`)
+	e.exec(t, `CREATE TRIGGER `+trg+` BEFORE UPDATE ON runs FOR EACH ROW
+	           WHEN (OLD.id = '`+runID.String()+`'::uuid) EXECUTE FUNCTION `+fn+`()`)
+	drop := func() {
+		_, _ = e.pool.Exec(e.ctx, `DROP TRIGGER IF EXISTS `+trg+` ON runs`)
+		_, _ = e.pool.Exec(e.ctx, `DROP FUNCTION IF EXISTS `+fn+`()`)
+	}
+	t.Cleanup(drop)
+	return drop
+}
+
+// TestAutopilotPlanWriteAtomicWithRunningLiveDB (issue #1626 review): an UNFENCED (nil
+// claim_generation) autopilot plan report whose SetRunRunning fails must not leave plan_md
+// committed on its own. If it did, planMilestonesParam would read the worker's retry of that same
+// report as a sticky rejection (stored plan_md, NULL candidate), freeze nothing, and the run would
+// hold at finalize with contract_not_frozen. The plan write and SetRunRunning share one tx, so
+// the failed report rolls back plan_md and the retry freezes `[]` + criteria:[].
+func TestAutopilotPlanWriteAtomicWithRunningLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	wkr := store.Worker{ID: wid}
+	runID := e.seedOwnedRun(t, wid, "claimed", true, true)
+
+	drop := e.failClaimedToRunning(t, runID)
+	report := StateRequest{State: "running", PlanMd: strPtr(milestonelessPlan)} // no ClaimGeneration: unfenced
+	if _, _, err := svc.SetState(e.ctx, wkr, runID, report); err == nil {
+		t.Fatal("SetState running succeeded despite the injected SetRunRunning failure")
+	}
+	if e.planMdStored(t, runID) {
+		t.Fatal("plan_md committed although SetRunRunning failed; the retry would read it as a sticky rejection")
+	}
+	if got := e.runStatus(t, runID); got != "claimed" {
+		t.Fatalf("status = %q after the failed report, want claimed", got)
+	}
+
+	drop()
+	run, applied, err := svc.SetState(e.ctx, wkr, runID, report)
+	if err != nil || !applied {
+		t.Fatalf("SetState running (retry): applied=%v err=%v", applied, err)
+	}
+	if _, frozen := e.milestoneColumns(t, runID); string(frozen) != "[]" {
+		t.Fatalf("milestones_frozen = %q after the retried plan report, want []", frozen)
+	}
+	e.assertEmptyCriteriaContract(t, runID)
+	if !run.ContractRevision.Valid || run.ContractRevision.Int32 != 1 {
+		t.Fatalf("retry ack row contract_revision = %+v, want 1", run.ContractRevision)
+	}
+}
+
+// TestUnfencedPlanRefusalReadsOutsideTxLiveDB: the planRows == 0 refusal branch re-reads the run
+// on the pool while the unfenced plan tx is open. A human-gated (non-autopilot) run makes
+// SetRunAutopilotPlan match no row; the report must come back promptly as ErrInvalidState (no
+// wait on the open tx) with nothing stored.
+func TestUnfencedPlanRefusalReadsOutsideTxLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	wkr := store.Worker{ID: wid}
+	runID := e.seedOwnedRun(t, wid, "claimed", true, false)
+
+	ctx, cancel := context.WithTimeout(e.ctx, 15*time.Second)
+	defer cancel()
+	_, applied, err := svc.SetState(ctx, wkr, runID, StateRequest{State: "running", PlanMd: strPtr(milestonelessPlan)})
+	if ctx.Err() != nil {
+		t.Fatalf("refusal branch blocked until the deadline: %v", err)
+	}
+	if !errors.Is(err, ErrInvalidState) || applied {
+		t.Fatalf("human-gated run's plan report: applied=%v err=%v, want ErrInvalidState", applied, err)
+	}
+	if e.planMdStored(t, runID) {
+		t.Fatal("a refused plan report stored plan_md")
+	}
+	if got := e.runStatus(t, runID); got != "claimed" {
+		t.Fatalf("status = %q after a refused plan report, want claimed", got)
 	}
 }

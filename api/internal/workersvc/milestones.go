@@ -157,7 +157,11 @@ func milestonesParam(kind string, ms *[]Milestone) []byte {
 //     or the owner decides (accept/partial). On the autopilot `running` path the same reading
 //     applies: the first plan-bearing report sees a NULL stored plan_md and freezes `[]`; a later
 //     one (after a rejected list left milestones_frozen NULL) sees the plan SetRunAutopilotPlan
-//     stored and stays NULL.
+//     stored and stays NULL. Reading a stored plan_md as "an earlier report was processed" holds
+//     there only because SetState commits SetRunAutopilotPlan in the SAME transaction as
+//     SetRunRunning (fenced or not, whenever a TxBeginner is wired): a plan_md that committed
+//     while SetRunRunning failed would make the worker's retry of that same report look like a
+//     sticky rejection (TestAutopilotPlanWriteAtomicWithRunningLiveDB).
 //
 // The inference is therefore fail-closed: it never replaces a rejected list with an empty one.
 func planMilestonesParam(run store.Run, planMd *string, ms *[]Milestone) []byte {

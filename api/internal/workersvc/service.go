@@ -3363,6 +3363,24 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			if strings.TrimSpace(clean) == "" {
 				return store.Run{}, false, fmt.Errorf("%w: running report carries a blank plan_md", ErrInvalidState)
 			}
+			// Issue #1626: the plan write and SetRunRunning below must commit or fail TOGETHER.
+			// planMilestonesParam reads a stored plan_md beside a NULL candidate as an earlier
+			// REJECTED list (sticky: nothing freezes), so a plan_md that committed alone, with
+			// SetRunRunning then failing, would turn the worker's retry of this same report into
+			// a contract_not_frozen hold. A fenced report already runs both through fenceTx; an
+			// unfenced one (nil claim_generation) opens a plain tx here, with no FOR UPDATE and
+			// no generation check, so only atomicity changes, not the legacy fence semantics.
+			// The post-switch commit and the deferred Rollback own it from here. A nil
+			// txBeginner (unit tests; prod wires SetTxBeginner in cmd/server/main.go) keeps the
+			// previous non-atomic pair.
+			if fenceTx == nil && s.txBeginner != nil {
+				tx, berr := s.txBeginner.Begin(ctx)
+				if berr != nil {
+					return store.Run{}, false, berr
+				}
+				fenceTx = tx
+				q = store.New(tx)
+			}
 			var planRows int64
 			planRows, err = q.SetRunAutopilotPlan(ctx, store.SetRunAutopilotPlanParams{
 				PlanMd:   planBody,
@@ -3377,6 +3395,9 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				// Re-read after the guarded write so the worker receives the authoritative
 				// state through the ordinary applied=false / 409 contract. The initial
 				// ownership snapshot predates the race (issue #1197, verified 2026-09-08).
+				// The read goes to the pool, outside fenceTx; this tx has written nothing yet
+				// (the 0-row UPDATE matched no row), so the read misses no write of ours.
+				// TestUnfencedPlanRefusalReadsOutsideTxLiveDB drives it with the unfenced tx open.
 				current, readErr := s.runOwnedByWorker(ctx, runID, wkr)
 				if readErr != nil {
 					return store.Run{}, false, readErr
