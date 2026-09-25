@@ -3397,7 +3397,6 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				// ownership snapshot predates the race (issue #1197, verified 2026-09-08).
 				// The read goes to the pool, outside fenceTx; this tx has written nothing yet
 				// (the 0-row UPDATE matched no row), so the read misses no write of ours.
-				// TestUnfencedPlanRefusalReadsOutsideTxLiveDB drives it with the unfenced tx open.
 				current, readErr := s.runOwnedByWorker(ctx, runID, wkr)
 				if readErr != nil {
 					return store.Run{}, false, readErr

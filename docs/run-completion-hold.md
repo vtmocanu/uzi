@@ -25,12 +25,16 @@ default changed is unaffected either way: the switch is read once, when the
 run is created, never retroactively against a run already in flight.
 
 This default also gates who can pick up the run: a worker must advertise the
-`completion_interlock_v1` protocol capability (shipped in v0.83.0) to claim a
-stamped run at all. If no online worker advertises it, the run stays queued,
-and its health reason names it directly: "no online worker implements the
-completion interlock (completion_interlock_v1); provision a capable worker."
-Upgrade your workers to clear it, or turn Completion check off if you'd
-rather run without the interlock for now.
+`completion_interlock_v1` protocol capability to claim a stamped run at all.
+If none of the run owner's online workers does, the run stays queued, and its
+health reason names it directly: "no online worker implements the completion
+interlock (completion_interlock_v1); provision a capable worker". Upgrade the
+owner's workers to this release to clear it (a worker from v0.83.0 onward can
+claim the run, but an older one than this release may still pause it at
+finalize; see the CHANGELOG). Turning Completion check off does **not**
+release a run already queued this way, since the switch is only read when a
+run is created: the stuck run needs a capable worker, or cancel it and create
+it again.
 
 ## Why a run holds
 

@@ -448,7 +448,8 @@ func TestAutopilotPlanWriteAtomicWithRunningLiveDB(t *testing.T) {
 // TestUnfencedPlanRefusalReadsOutsideTxLiveDB: the planRows == 0 refusal branch re-reads the run
 // on the pool while the unfenced plan tx is open. A human-gated (non-autopilot) run makes
 // SetRunAutopilotPlan match no row; the report must come back promptly as ErrInvalidState (no
-// wait on the open tx) with nothing stored.
+// wait on the open tx) with nothing stored. A behavioural pin, not a mutation guard: it passes on
+// the pre-#1626 code too, since a pool read never waits on a row lock and a 0-row UPDATE holds none.
 func TestUnfencedPlanRefusalReadsOutsideTxLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	svc := e.permitService(t)
