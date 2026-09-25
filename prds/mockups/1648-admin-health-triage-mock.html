@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>PRD #1648 mock: Admin Health, triage first</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;display=swap">
+<!--
+  PRD #1648 mock. Open locally in a browser. Fixture data only (example.com owners).
+  Frame 1 is today's Health tab (incident scenario). Frames 2-3 are the accepted target
+  (incident, all clear). Frame 4 is the badge / count-pill vocabulary. Frame 5 is the
+  Card flush fix. Colours are the Dawn theme tokens from web/src/index.css; the product
+  must use the theme tokens (text-ok, bg-danger/10, ...), never these literal hexes.
+  Where this mock and the PRD's Binding design decisions disagree, the decisions win.
+-->
+<style>
+html{background:#e4e7ec;font-family:"IBM Plex Sans",system-ui,sans-serif;color:#151A22}
+body{margin:0;padding:24px}
+h2.frame{font:600 20px "IBM Plex Sans",sans-serif;margin:32px 0 8px}
+.frameNote{font-size:14px;color:#4A5567;margin:0 0 12px;max-width:1100px}
+.board{background:#F2F4F7;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.12);width:1240px;box-sizing:border-box;padding:28px 40px 40px;display:flex;flex-direction:column;gap:22px;margin-bottom:24px}
+a{color:#0369A1}
+.mono{font-family:"IBM Plex Mono",ui-monospace,monospace}
+.card{background:#fff;border:1px solid #D6DBE4;border-radius:14px;overflow:hidden}
+.pad{padding:20px}
+.tabs{display:flex;gap:4px;border-bottom:1px solid #D6DBE4}
+.tab{display:flex;align-items:center;gap:6px;padding:8px 12px;font-size:14px;font-weight:500;color:#4A5567;border-bottom:2px solid transparent;margin-bottom:-1px}
+.tab.on{color:#151A22;border-bottom-color:#B93C0B}
+.sect{font-size:12px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:#5F6A82;margin:0}
+.muted{color:#4A5567}.faint{color:#5F6A82}.small{font-size:12px}
+/* target vocabulary */
+.badge{display:inline-flex;align-items:center;gap:4px;border:1px solid;border-radius:8px;padding:2px 6px;font-size:11px;font-weight:500;white-space:nowrap;line-height:14px}
+.b-ok{border-color:rgba(3,112,90,.4);background:rgba(3,112,90,.1);color:#03705A}
+.b-warn{border-color:rgba(154,74,5,.4);background:rgba(154,74,5,.1);color:#9A4A05}
+.b-danger{border-color:rgba(190,18,60,.4);background:rgba(190,18,60,.1);color:#BE123C}
+.b-unknown,.b-na,.b-neutral{border-color:#D6DBE4;background:#EBEEF3;color:#4A5567}
+.b-info{border-color:rgba(3,105,161,.4);background:rgba(3,105,161,.1);color:#0369A1}
+.count{display:inline-block;min-width:20px;box-sizing:border-box;text-align:center;border-radius:999px;padding:2px 6px;font-size:10px;font-weight:600;line-height:1;color:#fff}
+.btn{display:inline-flex;align-items:center;height:28px;border:1px solid #D6DBE4;border-radius:10px;background:#EBEEF3;color:#151A22;font:inherit;font-size:12px;font-weight:500;padding:0 10px}
+.item{padding:14px 20px;border-top:1px solid #D6DBE4;display:grid;grid-template-columns:76px 1fr auto;column-gap:12px;row-gap:10px;font-size:14px}
+.item:first-of-type{border-top:0}
+.item .body{grid-column:2 / 4;display:flex;flex-direction:column;gap:10px}
+.dl{display:grid;grid-template-columns:max-content 1fr;column-gap:16px;row-gap:4px;font-size:12px;margin:0}
+.dl dt{color:#5F6A82}.dl dd{margin:0}
+.cmd{display:flex;gap:8px}
+.cmd pre{flex:1;margin:0;background:#080A0F;color:#E4E8F0;border-radius:10px;border:1px solid #272D3C;padding:6px 10px;font-size:12px}
+.grow{display:grid;grid-template-columns:210px 1fr 170px;align-items:center;column-gap:16px;padding:10px 20px;font-size:14px}
+.grp{border-top:1px solid #D6DBE4}.grp:first-of-type{border-top:0}
+.disc{display:flex;align-items:center;gap:8px;border:0;background:transparent;font:inherit;font-weight:500;padding:4px 0;cursor:pointer;color:#151A22;text-align:left}
+.chip{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:#4A5567;margin-right:18px;line-height:22px;text-decoration:none}
+a.chip{color:#151A22;font-weight:500}
+a.chip span{text-decoration:underline;text-decoration-color:#AEB6C4;text-underline-offset:3px}
+.sub{display:grid;grid-template-columns:14px 1fr auto;column-gap:10px;padding:7px 0;border-top:1px dashed #D6DBE4;font-size:13px}
+.sub:first-child{border-top:0}
+table{width:100%;border-collapse:collapse;font-size:14px;text-align:left}
+th{font-weight:500;color:#4A5567;padding:12px 16px;border-bottom:1px solid #D6DBE4}
+td{padding:12px 16px;border-top:1px solid #D6DBE4}
+th:first-child,td:first-child{padding-left:20px}th:last-child,td:last-child{padding-right:20px}
+/* today's vocabulary (frame 1 and the left of frame 4) */
+.pill{display:inline-flex;align-items:center;gap:4px;border:1px solid;border-radius:999px;padding:2px 8px;font-size:12px;font-weight:600;white-space:nowrap;line-height:16px}
+.pill .g{width:10px;text-align:center;font-size:10px}
+.p-ok{border-color:rgba(3,112,90,.3);background:rgba(3,112,90,.1);color:#03705A}
+.p-warn{border-color:rgba(154,74,5,.4);background:rgba(154,74,5,.1);color:#9A4A05}
+.p-danger{border-color:rgba(190,18,60,.45);background:rgba(190,18,60,.1);color:#BE123C}
+.p-unknown{border:1px dashed #AEB6C4;background:#EBEEF3;color:#4A5567}
+.hpip{display:inline-flex;align-items:center;gap:4px;border-radius:999px;padding:0 6px;font-size:11px;font-weight:600;line-height:18px}
+.row16{display:grid;grid-template-columns:auto 1fr auto;align-items:baseline;column-gap:12px;padding:10px 20px;border-top:1px solid #D6DBE4;font-size:16px}
+.defect{outline:2px dashed #D97757;outline-offset:-2px}
+.nav{width:220px;display:flex;flex-direction:column;gap:2px;border:1px solid #D6DBE4;border-radius:10px;padding:8px;background:#fff}
+.ni{display:flex;align-items:center;gap:10px;padding:6px 10px;border-radius:10px;font-size:14px;color:#4A5567}
+.ni.on{background:#EBEEF3;color:#151A22;font-weight:500}
+.ni .ic{width:14px;height:14px;border-radius:4px;border:1.5px solid #AEB6C4;flex:none}
+.ni .r{margin-left:auto}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+.sr{font-size:12px;color:#4A5567;background:#EBEEF3;border-radius:6px;padding:6px 8px}
+</style></head><body>
+
+<h2 class="frame">Frame 1. Today (incident scenario)</h2>
+<p class="frameNote">Dashed orange outlines mark measured defects: the group cards are double-padded (<code>Card className="p-0"</code> is a no-op, so the card keeps 20px and the rows add another 20px), rows render at 16px, every check carries a pill, the fleet table uses uppercase headers and developer copy.</p>
+<div class="board" id="today"></div>
+
+<h2 class="frame">Frame 2. Target, incident</h2>
+<p class="frameNote">Triage first. Everything that needs attention sits in one card at the top, worst first, fully explained. The inventory is compact; its non-OK chips jump to their triage item. Fleet keeps a fixed position in its own card.</p>
+<div class="board" id="target-incident"></div>
+
+<h2 class="frame">Frame 3. Target, all clear (one group opened)</h2>
+<p class="frameNote">One quiet line replaces the attention card. Groups are collapsed by default; opening one shows each check's own summary (the numbers the passing checks carry).</p>
+<div class="board" id="target-ok"></div>
+
+<h2 class="frame">Frame 4. Badges and count pills</h2>
+<p class="frameNote">Left: today. Right: one count-pill anatomy for the sidebar and the tab strip, one <code>Badge</code> anatomy for every status. Severity keeps a distinct shape per level, drawn as SVG.</p>
+<div class="board" id="badges"></div>
+
+<h2 class="frame">Frame 5. Card flush fix (schematic)</h2>
+<p class="frameNote">Same table in a card, today and after the fix. The fix applies at every <code>Card</code> call site that asks for no padding (10 sites, PRD Decision D8). Outer cells get 20px so table text shares the left edge of ordinary card content.</p>
+<div class="board" id="flush"></div>
+
+<script>
+(function () {
+  var SHAPE = {
+    ok: '<svg width="8" height="8" viewBox="0 0 8 8" aria-hidden="true"><circle cx="4" cy="4" r="3.2" fill="#03705A"/></svg>',
+    warn: '<svg width="8" height="8" viewBox="0 0 8 8" aria-hidden="true"><path d="M4 .6 7.6 7.2H.4Z" fill="#9A4A05"/></svg>',
+    danger: '<svg width="8" height="8" viewBox="0 0 8 8" aria-hidden="true"><path d="M4 .3 7.7 4 4 7.7.3 4Z" fill="#BE123C"/></svg>',
+    unknown: '<svg width="8" height="8" viewBox="0 0 8 8" aria-hidden="true"><circle cx="4" cy="4" r="3" fill="none" stroke="#4A5567" stroke-width="1.2"/></svg>',
+    na: '<svg width="8" height="8" viewBox="0 0 8 8" aria-hidden="true"><circle cx="4" cy="4" r="3" fill="none" stroke="#5F6A82" stroke-width="1" stroke-dasharray="1.6 1.2"/></svg>'
+  };
+  var CHECK = '<svg width="10" height="10" viewBox="0 0 8 8" aria-hidden="true"><path d="M1.4 4.2 3.3 6 6.8 2.2" fill="none" stroke="#03705A" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  var LABEL = { ok: "OK", warn: "Warn", danger: "Danger", unknown: "Unknown", na: "N/A" };
+  var GLYPH = { ok: "●", warn: "▲", danger: "◆", unknown: "?" };
+  function badge(sev, text) { return '<span class="badge b-' + sev + '">' + SHAPE[sev] + (text || LABEL[sev]) + '</span>'; }
+  function pill(sev, text) { return '<span class="pill p-' + sev + '"><span class="g">' + GLYPH[sev] + '</span>' + (text || LABEL[sev]) + '</span>'; }
+  function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+
+  var OK = {
+    "fleet.roll": "All 4 hosted workers are rolling cleanly.", "fleet.capacity": "Every owner with queued work has a usable worker.",
+    "fleet.disk": "No worker is under sustained disk pressure.", "queue.waiting": "No run is waiting for a worker.",
+    "queue.undispatched": "No task run is stuck undispatched.", "controller.report": "The controller is reporting.",
+    db: "Database reachable (2ms); schema at head.", loops: "All 4 background loops are ticking.",
+    "forge.ciwatch": "Every repo's run branches fit within the CI watch cap.", "slack.socket": "Slack socket is connected.",
+    "schedules.paused": "No user has paused schedules while owning enabled ones.", "board.drift": "No column move has been given up in the last 24 hours.",
+    "custody.holds": "No owner is at the custody-hold admission limit.", "release.check": "This instance is on a recent release."
+  };
+  var BAD = {
+    "fleet.roll": { sev: "danger", summary: "4 of 4 hosted workers stuck rolling to 0.84.0-rc.2: ImagePullBackOff", since: "for 38m", action: "Publish the image, or release a chart whose workers.image.tag names a published tag.", evidence: [["Target tag", "0.84.0-rc.2"], ["Blocking reason", "ImagePullBackOff"], ["Stuck workers", "4 of 4"]], command: "kubectl -n <worker-namespace> describe pod -l uzi.dev/hosted-worker-id=<id>", doc: "worker-upgrades" },
+    "fleet.capacity": { sev: "danger", summary: "2 owners have queued runs and no usable worker (oldest waiting 36m).", since: "for 36m", action: "Recover or provision a worker for the affected owners, or check fleet.roll for stuck pods.", evidence: [["Owners affected", "2"]], command: "kubectl -n <worker-namespace> get pods", doc: "hosted-workers" },
+    "queue.waiting": { sev: "danger", summary: "A run has been waiting for a worker for 34m.", since: "for 34m", action: "Check fleet.capacity and fleet.roll: a stuck roll or zero capacity is the usual cause.", evidence: [] },
+    "slack.socket": { sev: "unknown", summary: "No socket status reported for 6m.", since: "for 6m", action: "Check the api log for Slack reconnect errors.", evidence: [["Last event", "6m ago"]] },
+    "forge.ciwatch": { sev: "warn", summary: "1 repo has more run branches than the CI watch cap of 20.", since: "for 3d", action: "Raise CI_WATCH_MAX_REFS, or close finished run branches, so every run branch is watched.", evidence: [["Busiest repo", "acme/factory"], ["Eligible branches", "27 of 20 watched"]] }
+  };
+  var GROUPS = [
+    ["Workers and capacity", [["fleet.roll", "Worker image roll"], ["fleet.capacity", "Worker capacity"], ["fleet.disk", "Worker disk"]]],
+    ["Queue", [["queue.waiting", "Runs waiting for a worker"], ["queue.undispatched", "Undispatched task runs"]]],
+    ["Control plane", [["controller.report", "Controller reporting"], ["db", "Database"], ["loops", "Background loops"]]],
+    ["Integrations", [["forge.ciwatch", "CI watch capacity"], ["slack.socket", "Slack socket"]]],
+    ["Housekeeping", [["schedules.paused", "Paused schedules"], ["board.drift", "Board drift"], ["custody.holds", "Recovery custody holds"], ["release.check", "Upstream release"]]]
+  ];
+  function checks(incident) {
+    return GROUPS.map(function (g) {
+      return { title: g[0], checks: g[1].map(function (c) {
+        var b = incident ? BAD[c[0]] : null;
+        return { id: c[0], title: c[1], sev: b ? b.sev : "ok", summary: b ? b.summary : OK[c[0]], since: b ? b.since : "", action: b && b.action, evidence: (b && b.evidence) || [], command: b && b.command, doc: (b && b.doc) || null, group: g[0] };
+      }) };
+    });
+  }
+  var RANK = { danger: 0, unknown: 1, warn: 2 };
+  function attention(groups) { var a = []; groups.forEach(function (g) { g.checks.forEach(function (c) { if (c.sev !== "ok" && c.sev !== "na") a.push(c); }); }); return a.sort(function (x, y) { return RANK[x.sev] - RANK[y.sev]; }); }
+  var TABS = ["Users", "Rate limits", "Tool allowlist", "Blocked repos", "Instance", "Branding"];
+  function header(pipHtml, rightHtml) {
+    return '<div><div style="font-size:20px;font-weight:600">Admin</div><div class="muted" style="font-size:14px;margin-top:4px">Configuration and controls for this uzi instance.</div></div>' +
+      '<nav class="tabs">' + TABS.map(function (t) { return '<span class="tab">' + t + '</span>'; }).join("") + '<span class="tab on">Health ' + pipHtml + '</span></nav>' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:16px"><p class="muted" style="margin:0;font-size:14px">What uzi can tell about its own health. Read-only: nothing here restarts, retries or rolls anything back.</p>' + (rightHtml || "") + '</div>';
+  }
+  function fleetRows(incident, today) {
+    return ["7c2e", "19af", "3d04", "c8b1"].map(function (h, i) {
+      var owner = i < 2 ? "owner-a@example.com" : "owner-b@example.com";
+      if (today) {
+        var col = incident ? "#BE123C" : "#03705A";
+        return '<tr><td>' + owner + '</td><td class="mono">base.l-' + h + '</td><td>hosted</td><td style="color:' + col + '">● ' + (incident ? "offline" : "online") + '</td><td class="mono">' + (incident ? "0.83.1" : "0.84.0") + '</td><td><span style="border:1px solid;border-radius:6px;padding:2px 6px;font-size:12px;color:' + col + '">' + (incident ? "upgrade failed" : "up to date") + '</span></td><td class="mono" style="color:' + (incident ? "#BE123C" : "#5F6A82") + '">' + (incident ? "worker: ImagePullBackOff" : "none") + '</td><td class="small faint">' + (incident ? "38m ago" : "8s ago") + '</td></tr>';
+      }
+      return '<tr><td>' + owner + '</td><td><span class="mono" style="font-size:13px">base.l-' + h + '</span> <span class="small faint">hosted</span></td><td>' +
+        (incident ? '<span class="badge b-neutral"><span style="width:6px;height:6px;border-radius:9px;background:currentColor"></span>offline</span>' : '<span class="badge b-ok"><span style="width:6px;height:6px;border-radius:9px;background:currentColor"></span>online</span>') +
+        '</td><td class="mono" style="font-size:13px">' + (incident ? "0.83.1" : "0.84.0") + '</td><td>' + (incident ? '<span class="badge b-danger">upgrade failed</span>' : '<span class="badge b-ok">up to date</span>') +
+        '</td><td class="mono" style="font-size:13px;color:' + (incident ? "#BE123C" : "#5F6A82") + '">' + (incident ? "worker: ImagePullBackOff" : "none") + '</td><td class="small faint">' + (incident ? "38m ago" : "8s ago") + '</td></tr>';
+    }).join("");
+  }
+
+  // Frame 1: today
+  (function () {
+    var groups = checks(true), att = attention(groups);
+    var h = header('<span class="hpip" style="background:rgba(190,18,60,.15);color:#BE123C"><span style="width:6px;height:6px;border-radius:9px;background:#BE123C"></span>5</span>');
+    h += '<section class="card pad" style="display:flex;flex-direction:column;gap:16px"><div style="display:flex;justify-content:space-between;gap:24px"><div style="display:flex;gap:12px"><span style="font-size:24px;line-height:1.2;color:#BE123C">◆</span><div><div style="font-size:18px;font-weight:600">uzi cannot run work: 3 blocking checks</div><div class="muted" style="font-size:14px">Work is blocked until these clear. Start with the flagged checks below.</div></div></div><div style="display:flex;gap:6px">' + pill("danger", "3 Danger") + pill("unknown", "1 Unknown") + pill("warn", "1 Warn") + pill("ok", "9 OK") + '</div></div>' +
+      '<ul style="list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px;font-size:16px">' + att.map(function (c) { return '<li style="display:flex;gap:12px;align-items:baseline">' + pill(c.sev) + '<span style="flex:1"><b style="font-weight:500">' + c.title + '</b> <span class="muted">' + esc(c.summary) + '</span></span><span class="small faint">' + c.since + '</span></li>'; }).join("") + '</ul>' +
+      '<div class="small faint" style="display:flex;gap:16px;align-items:center;border-top:1px solid #D6DBE4;padding-top:12px"><span>Checked 16s ago, refreshes every 10 s</span><span>14 checks</span><span style="border:1px solid #AEB6C4;border-radius:10px;padding:4px 10px;color:#151A22">Copy diagnostics</span></div></section>';
+    groups.forEach(function (g, gi) {
+      var n = g.checks.filter(function (c) { return c.sev !== "ok"; }).length;
+      h += '<section class="card pad defect"><header style="display:flex;justify-content:space-between;padding:12px 20px;border-bottom:1px solid #D6DBE4"><h3 class="sect">' + g.title + '</h3><span class="small faint">' + (n ? n + " need attention" : "all passing") + '</span></header>' +
+        g.checks.map(function (c, i) { var bg = c.sev === "danger" ? "rgba(190,18,60,.05)" : c.sev === "warn" ? "rgba(154,74,5,.05)" : "transparent"; return '<div class="row16" style="background:' + bg + (i === 0 ? ';border-top:0' : '') + '">' + pill(c.sev) + '<span><b style="font-weight:500">' + c.title + '</b> <span class="muted">' + esc(c.summary) + '</span></span><span class="small faint">' + c.since + '</span></div>'; }).join("") +
+        (gi === 0 ? '<div style="border-top:1px solid #D6DBE4"><header style="display:flex;justify-content:space-between;padding:12px 20px 4px"><h3 class="sect">Fleet, all users</h3><span class="small faint">Upgrade and Blocking read the roll health the admin list now carries</span></header><table style="font-size:14px"><thead><tr>' + ["Owner", "Worker", "Kind", "Status", "Version", "Upgrade", "Blocking", "Since"].map(function (t) { return '<th style="font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:#5F6A82;font-weight:600">' + t + '</th>'; }).join("") + '</tr></thead><tbody>' + fleetRows(true, true) + '</tbody></table></div>' : "") + '</section>';
+    });
+    document.getElementById("today").innerHTML = h;
+  })();
+
+  // Frames 2 and 3: target
+  function target(el, incident, openGroup) {
+    var groups = checks(incident), att = attention(groups);
+    var d = att.filter(function (c) { return c.sev === "danger"; }).length, rest = att.length - d;
+    var count = { danger: d, unknown: 0, warn: 0 }; att.forEach(function (c) { if (c.sev !== "danger") count[c.sev]++; });
+    var pip = incident ? '<span class="count" style="background:#BE123C" aria-label="5 health checks need attention: 3 danger, 1 unknown, 1 warning">5</span>' : "";
+    var h = header(pip, '<div class="small faint" style="display:flex;align-items:center;gap:12px;white-space:nowrap"><span>Checked 16s ago</span><button class="btn" type="button">Copy diagnostics</button></div>');
+    if (incident) {
+      h += '<section class="card" style="border-color:rgba(190,18,60,.4)"><header role="alert" style="background:rgba(190,18,60,.08);border-bottom:1px solid rgba(190,18,60,.25);padding:14px 20px;display:flex;justify-content:space-between;gap:16px;align-items:center"><div><div style="font-size:14px;font-weight:600">' + SHAPE.danger.replace('width="8" height="8"', 'width="10" height="10"') + ' uzi cannot run work: ' + d + ' blocking checks</div><div class="muted" style="font-size:14px;margin:2px 0 0 16px">Plus ' + rest + ' more that need attention without blocking work. Worst first, each with what to do.</div></div><div style="display:flex;gap:6px">' +
+        ["danger", "unknown", "warn"].filter(function (k) { return count[k]; }).map(function (k) { return badge(k, count[k] + " " + LABEL[k]); }).join("") + '</div></header>' +
+        att.map(function (c) {
+          return '<div class="item" id="t-' + c.id + '"><span>' + badge(c.sev) + '</span><span><b style="font-weight:500">' + c.title + '</b> <span class="muted">' + esc(c.summary) + '</span> <span class="small faint">· ' + c.group + '</span></span><span class="small faint">' + c.since + '</span>' +
+            '<div class="body"><p style="margin:0;max-width:70ch"><b style="font-weight:600">What to do.</b> ' + esc(c.action) + '</p>' +
+            (c.evidence.length ? '<dl class="dl">' + c.evidence.map(function (e) { return '<dt>' + e[0] + '</dt><dd class="mono">' + esc(e[1]) + '</dd>'; }).join("") + '</dl>' : "") +
+            (c.command ? '<div class="cmd"><pre class="mono">' + esc(c.command) + '</pre><button class="btn" type="button">Copy</button></div>' : "") +
+            '<div class="small faint" style="display:flex;gap:12px"><span class="mono">' + c.id + '</span>' + (c.doc ? '<a href="#">Docs: ' + c.doc + '</a>' : "") + (c.id.indexOf("fleet.") === 0 ? '<a href="#fleet-' + el + '">See the affected workers in Fleet ↓</a>' : "") + '</div></div></div>';
+        }).join("") + '</section>';
+    } else {
+      h += '<section class="card" style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px"><span style="display:flex;align-items:center;gap:10px;font-size:14px"><svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><circle cx="9" cy="9" r="8" fill="rgba(3,112,90,.12)"/><path d="M5.2 9.3 7.8 11.8 12.8 6.4" fill="none" stroke="#03705A" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><b style="font-weight:600">All systems normal.</b> <span class="muted">Nothing needs attention.</span></span><span class="small faint">refreshes every 10 s</span></section>';
+    }
+    var passing = 0; groups.forEach(function (g) { g.checks.forEach(function (c) { if (c.sev === "ok") passing++; }); });
+    h += '<section class="card"><header style="display:flex;justify-content:space-between;padding:12px 20px;border-bottom:1px solid #D6DBE4"><h3 class="sect">All checks</h3><span class="small faint">' + passing + ' of 14 passing</span></header>' +
+      groups.map(function (g) {
+        var bad = g.checks.filter(function (c) { return c.sev !== "ok"; });
+        var open = g.title === openGroup;
+        var status = bad.length ? badge(bad.some(function (c) { return c.sev === "danger"; }) ? "danger" : "warn", bad.length + " of " + g.checks.length + " need attention").replace(/<svg[\s\S]*?<\/svg>/, "") : '<span class="small faint">all ' + g.checks.length + ' passing</span>';
+        return '<div class="grp"><div class="grow"><button class="disc" type="button" aria-expanded="' + open + '"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true" style="transform:' + (open ? "rotate(90deg)" : "none") + '"><path d="M4.5 2.5 8 6 4.5 9.5" fill="none" stroke="#4A5567" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>' + g.title + '</button><span>' +
+          g.checks.map(function (c) { return c.sev === "ok" ? '<span class="chip">' + CHECK + '<span>' + c.title + '</span></span>' : '<a class="chip" href="#t-' + c.id + '">' + SHAPE[c.sev] + '<span>' + c.title + '</span></a>'; }).join("") +
+          '</span><span style="text-align:right">' + status + '</span></div>' +
+          (open ? '<div style="padding:0 20px 12px 52px">' + g.checks.map(function (c) { return '<div class="sub">' + (c.sev === "ok" ? CHECK : SHAPE[c.sev]) + '<span><span>' + c.title + '</span> <span class="muted">' + esc(c.summary) + '</span></span><span class="mono small faint">' + c.id + '</span></div>'; }).join("") + '</div>' : "") + '</div>';
+      }).join("") + '</section>';
+    h += '<section class="card" id="fleet-' + el + '"><header style="display:flex;justify-content:space-between;padding:12px 20px;border-bottom:1px solid #D6DBE4"><h3 class="sect">Fleet, all users</h3><span class="small faint">Worker status and upgrade blockers across every user</span></header><table><thead><tr><th>Owner</th><th>Worker</th><th>Status</th><th>Version</th><th>Upgrade</th><th>Blocking</th><th>Last seen</th></tr></thead><tbody>' + fleetRows(incident, false) + '</tbody></table></section>';
+    document.getElementById(el).innerHTML = h;
+  }
+  target("target-incident", true, null);
+  target("target-ok", false, "Control plane");
+
+  // Frame 4: badges
+  (function () {
+    function nav(adminHtml, warnHtml) {
+      return '<div class="nav"><div class="ni"><span class="ic"></span>Runs<span class="r count" style="background:#B93C0B">5</span></div><div class="ni"><span class="ic"></span>Workers<span class="r count" style="background:#BE123C">2</span></div><div class="ni"><span class="ic"></span>Judge<span class="r count" style="background:#B93C0B">3</span></div><div class="ni on"><span class="ic"></span>Admin<span class="r">' + adminHtml + '</span></div><div class="ni"><span class="ic"></span>Admin (warn only)<span class="r">' + warnHtml + '</span></div></div>';
+    }
+    var todayPip = function (c, n) { return '<span class="hpip" style="background:' + (c === "d" ? "rgba(190,18,60,.15);color:#BE123C" : "rgba(154,74,5,.15);color:#9A4A05") + '"><span style="width:6px;height:6px;border-radius:9px;background:currentColor"></span>' + n + '</span>'; };
+    var left = '<div style="display:flex;flex-direction:column;gap:16px"><h3 class="sect">Today</h3>' + nav(todayPip("d", 5), todayPip("w", 2)) +
+      '<div class="sr mono">aria-label: "5 health checks need attention (warning)" when the worst check is Unknown</div>' +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap">' + pill("ok") + pill("warn") + pill("danger") + pill("unknown") + pill("ok", "14 OK") + '<span style="border:1px solid rgba(190,18,60,.4);border-radius:6px;padding:2px 6px;font-size:12px;color:#BE123C">upgrade failed</span><span style="color:#03705A;font-size:14px">● online</span></div>' +
+      '<p class="small muted" style="margin:0">Four anatomies on one page: full-round 12px semibold pills with font glyphs, 6px-radius regular upgrade badges, bare coloured status text, and the app\'s own Badge elsewhere.</p></div>';
+    var right = '<div style="display:flex;flex-direction:column;gap:16px"><h3 class="sect" style="color:#0369A1">Target</h3>' + nav('<span class="count" style="background:#BE123C">5</span>', '<span class="count" style="background:#9A4A05">2</span>') +
+      '<div class="sr mono">aria-label: "5 health checks need attention: 3 danger, 1 unknown, 1 warning"</div>' +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap">' + badge("ok") + badge("warn") + badge("danger") + badge("unknown") + badge("na") + badge("danger", "3 Danger") + '<span class="badge b-danger">upgrade failed</span><span class="badge b-ok"><span style="width:6px;height:6px;border-radius:9px;background:currentColor"></span>online</span></div>' +
+      '<p class="small muted" style="margin:0">Every status is the shared Badge (8px radius, 11px, medium). Severity shapes: filled circle OK, filled triangle Warn, filled diamond Danger, hollow circle Unknown, dashed circle N/A. The count pill is the sidebar\'s existing anatomy with a new warn tone.</p></div>';
+    document.getElementById("badges").innerHTML = '<div class="two">' + left + right + '</div>';
+  })();
+
+  // Frame 5: flush
+  (function () {
+    function tbl() { return '<table><thead><tr><th>Email</th><th>Role</th><th>Status</th><th style="text-align:right">Action</th></tr></thead><tbody>' + [["owner-a@example.com", "Admin", "Active"], ["owner-b@example.com", "User", "Active"], ["owner-c@example.com", "User", "Deactivated"]].map(function (r) { return '<tr><td>' + r[0] + '</td><td><span class="badge b-neutral">' + r[1] + '</span></td><td><span class="badge ' + (r[2] === "Active" ? "b-ok" : "b-danger") + '"><span style="width:6px;height:6px;border-radius:9px;background:currentColor"></span>' + r[2] + '</span></td><td style="text-align:right"><span class="small" style="color:#BE123C">Deactivate</span></td></tr>'; }).join("") + '</tbody></table>'; }
+    document.getElementById("flush").innerHTML = '<div class="two"><div style="display:flex;flex-direction:column;gap:10px"><h3 class="sect">Today: p-0 is ignored</h3><div class="card defect" style="padding:20px">' + tbl() + '</div></div><div style="display:flex;flex-direction:column;gap:10px"><h3 class="sect" style="color:#0369A1">Target: Card flush</h3><div class="card">' + tbl() + '</div></div></div>';
+  })();
+})();
+</script>
+</body></html>
