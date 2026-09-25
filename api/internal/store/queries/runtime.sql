@@ -2528,7 +2528,7 @@ WHERE id = @id AND worker_id = @worker_id
 -- allowlist that never revisits a park, so a flag live at hold time would freeze for the whole
 -- hold. session_id is COALESCE'd (sqlc.narg) so an omitting report preserves it.
 WITH consumed_wall AS (
-    UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
+    UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
     WHERE u.kind = 'pause' AND u.body = 'wall' AND u.applied_at IS NULL
       AND EXISTS (
           SELECT 1 FROM runs r
@@ -2663,7 +2663,7 @@ RETURNING id, user_id, status;
 -- resumed flight is never handed a stale abort; its EXISTS mirrors this UPDATE's WHERE. session_id is
 -- COALESCE'd so an omitting report preserves it; health reset for SetRunPaused's allowlist reason.
 WITH consumed_wall AS (
-    UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
+    UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
     WHERE u.kind = 'pause' AND u.body = 'wall' AND u.applied_at IS NULL
       AND EXISTS (
           SELECT 1 FROM runs r
@@ -4025,7 +4025,7 @@ snap_del AS (
 wall_input_consumed AS (
     -- D18: settle the wall input in the same statement, so ConsumeRunInputs never hands the next
     -- flight a stale 'wall' abort.
-    UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
+    UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
     FROM parked p
     WHERE u.run_id = p.id AND u.kind = 'pause' AND u.body = 'wall' AND u.applied_at IS NULL
 )
@@ -5587,7 +5587,7 @@ WITH extended AS (
 -- the resumed flight a stale 'wall' abort. An ACKed wall receipt can already have
 -- consumed_at set; applied_at stays NULL until delivery or this settlement.
 consumed_wall AS (
-    UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
+    UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
     FROM extended e
     WHERE u.run_id = e.id AND u.kind = 'pause' AND u.body = 'wall' AND u.applied_at IS NULL
 )
@@ -5640,7 +5640,7 @@ WITH extended AS (
     RETURNING budget_extension_seconds
 ),
 consumed_wall AS (
-    UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
+    UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
     WHERE u.run_id = sqlc.arg('id') AND u.kind = 'pause' AND u.body = 'wall' AND u.applied_at IS NULL
       AND EXISTS (SELECT 1 FROM extended)
 ),
@@ -5713,7 +5713,7 @@ superseded AS (
       AND EXISTS (SELECT 1 FROM stopped)
 ),
 consumed_wall AS (
-    UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
+    UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
     WHERE u.run_id = sqlc.arg('id') AND u.kind = 'pause' AND u.body = 'wall' AND u.applied_at IS NULL
       AND EXISTS (SELECT 1 FROM stopped)
 ),
