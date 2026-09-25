@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   CodexHarness,
   CodexHarnessError,
+  CodexResumeError,
   type CodexLaunchRootResult,
   type CodexProviderConfig,
   type LaunchRootSeam,
@@ -769,7 +770,7 @@ describe("CodexHarness: kind + thread configuration", () => {
     const { harness } = makeHarness({ transport });
     await assert.rejects(
       collect(harness.startTurn(makeRequest({ resumeSessionId: "requested-session" })).events),
-      (err: unknown) => err instanceof CodexHarnessError && /thread\/resume returned no thread id/.test(err.message),
+      (err: unknown) => err instanceof CodexResumeError && err.message === "codex thread/resume failed",
     );
     assert.equal(
       transport.requests.some((r) => r.method === "turn/start"),
