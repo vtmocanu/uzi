@@ -210,7 +210,8 @@ idle / iteration caps remain the only liveness backstops.
    detection — no extra query. Implementation note (issue #1686): the worker
    suspends idle for in-flight Codex broker callbacks and non-signal SDK tool-use
    IDs, then re-arms it after the last settlement/result; the wall bound remains
-   active and wall exhaustion routes to the existing park. This corrects the original
+   active, with wall exhaustion routed to park or post-attempt completion hold.
+   This corrects the original
    per-message watchdog explanation without changing the stalled flag decision.
 
 10. **UI: one taxonomy change, four surfaces for free, plus a board strip.**
