@@ -20,6 +20,10 @@ import (
 	"uzi.local/codex-supervisor/internal/safetree"
 )
 
+// recordReapOutcomesDefault is recordReapOutcomes as the binary started, before
+// TestMain turns it on.
+var recordReapOutcomesDefault bool
+
 // Helper-process modes of this test binary (see TestMain).
 const (
 	testHelperEnv     = "SUPERVISOR_TEST_HELPER"
@@ -53,6 +57,8 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(realMain(args))
 	}
+	recordReapOutcomesDefault = recordReapOutcomes
+	recordReapOutcomes = true
 	os.Exit(m.Run())
 }
 
@@ -268,10 +274,104 @@ func mustReap(t *testing.T, r testRoots, cfg reapConfig) reapResult {
 	if err != nil {
 		t.Fatalf("reap: %v", err)
 	}
+	checkSums(t, res)
+	if res.Truncated {
+		t.Fatalf("a pass with budget to spare is truncated: %s", counts(res))
+	}
+	return res
+}
+
+// checkSums asserts the result line's invariants.
+func checkSums(t *testing.T, res reapResult) {
+	t.Helper()
 	if res.Scanned != res.Live+res.Removed+res.Retained+res.Foreign {
 		t.Fatalf("scanned %d != sum of %+v", res.Scanned, res)
 	}
-	return res
+	if res.Scanned > res.DirentsExamined {
+		t.Fatalf("scanned %d > dirents_examined %d", res.Scanned, res.DirentsExamined)
+	}
+}
+
+// dirEntries lists dir through getdents on a fresh fd, in the order the
+// kernel returns them ("." and ".." skipped).
+func dirEntries(t *testing.T, dir string) []string {
+	t.Helper()
+	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	buf := make([]byte, 8192)
+	var names []string
+	for {
+		n, err := unix.Getdents(fd, buf)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n <= 0 {
+			return names
+		}
+		_, _, names = unix.ParseDirent(buf[:n], -1, names)
+	}
+}
+
+// snapshotTree renders every entry under root: name, mode, size, mtime and a
+// regular file's content.
+func snapshotTree(t *testing.T, root string) string {
+	t.Helper()
+	var b strings.Builder
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := os.Lstat(p)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(&b, "%s %v %d %d", p, info.Mode(), info.Size(), info.ModTime().UnixNano())
+		if info.Mode().IsRegular() {
+			data, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(&b, " %q", data)
+		}
+		b.WriteString("\n")
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("snapshot %s: %v", root, err)
+	}
+	return b.String()
+}
+
+// countSeeks counts reapSeek calls per fd.
+func countSeeks(t *testing.T) map[int]int {
+	t.Helper()
+	seeks := map[int]int{}
+	reapSeek = func(fd int, offset int64, whence int) (int64, error) {
+		seeks[fd]++
+		return unix.Seek(fd, offset, whence)
+	}
+	t.Cleanup(func() { reapSeek = unix.Seek })
+	return seeks
+}
+
+// lockDir holds LOCK_EX on dir through a separate open file description until
+// cleanup.
+func lockDir(t *testing.T, dir string) {
+	t.Helper()
+	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unix.Close(fd) })
+	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func counts(res reapResult) string {
@@ -590,35 +690,123 @@ func TestReapSkipsNonCandidatesAndForeign(t *testing.T) {
 	requireExists(t, owned)
 }
 
-// (h) One pass acts on at most maxReapCandidates in EACH root; the next pass
-// continues.
-func TestReapBoundsCandidatesPerRoot(t *testing.T) {
+// (h) One pass reads each root to its end in pages and batches: far more
+// candidates than one batch holds are all removed, in both roots, by ONE pass.
+func TestReapHandlesManyBatchesInOnePass(t *testing.T) {
 	if !requireNonRootCommandUID(t) {
 		return
 	}
 	r := newRoots(t)
-	const n = maxReapCandidates + 6
-	for i := range n {
+	const nTmp = 3*maxReapCandidates + 6
+	const nCache = maxReapCandidates + 5
+	for i := range nTmp {
 		if err := os.Mkdir(filepath.Join(r.tmp, tmpNameN(100+i)), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Mkdir(filepath.Join(r.cache, tokenN(300+i)), 0o700); err != nil {
+	}
+	for i := range nCache {
+		if err := os.Mkdir(filepath.Join(r.cache, tokenN(1000+i)), 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
-	var calls int
-	res := mustReap(t, r, proofConfig(&calls, proofHeld))
-	if res.Scanned != 2*maxReapCandidates || res.Removed != 2*maxReapCandidates {
-		t.Fatalf("first pass: %s", counts(res))
+	// A clock advancing 1 ms per call: the pass stays well inside its budget.
+	start := time.Now()
+	calls := 0
+	cfg := reapConfig{uid: os.Geteuid(), prove: func() string { return proofHeld }, now: func() time.Time {
+		calls++
+		return start.Add(time.Duration(calls) * time.Millisecond)
+	}}
+	res := mustReap(t, r, cfg)
+	if last := start.Add(time.Duration(calls) * time.Millisecond); !last.Before(start.Add(reapPassBudget)) {
+		t.Fatalf("the test clock reached the pass deadline after %d calls", calls)
 	}
-	res = mustReap(t, r, proofConfig(&calls, proofHeld))
-	if res.Scanned != 12 || res.Removed != 12 {
-		t.Fatalf("second pass: %s", counts(res))
+	if got, want := counts(res), fmt.Sprintf("scanned=%d live=0 removed=%d retained=0 foreign=0 proof=held", nTmp+nCache, nTmp+nCache); got != want {
+		t.Fatalf("reap = %s, want %s", got, want)
+	}
+	if res.DirentsExamined != nTmp+nCache {
+		t.Fatalf("dirents_examined = %d, want %d", res.DirentsExamined, nTmp+nCache)
+	}
+	if left := len(dirEntries(t, r.tmp)) + len(dirEntries(t, r.cache)); left != 0 {
+		t.Fatalf("%d entries left after one pass", left)
 	}
 }
 
-// A candidate that pins as foreign is counted but does not consume its root's
-// cap: many foreign names cannot starve the real candidates.
+// A candidate past the first maxReapDirents entries of a root is reached by
+// the same pass.
+func TestReapReachesBeyondTheFirstPage(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	r := newRoots(t)
+	if err := os.Chmod(r.tmp, 0o1777); err != nil {
+		t.Fatal(err)
+	}
+	// Twice a page of fillers, with candidates made before and after them: a
+	// creation-ordered directory (tmpfs) lists the early ones last, and a
+	// hash-ordered one puts about half of the later ones past the first page;
+	// more are made (up to 32) until one is there.
+	const fillers = 2 * maxReapDirents
+	var cands []string
+	mk := func(n int) {
+		name := tmpNameN(n)
+		mkTree(t, filepath.Join(r.tmp, name))
+		cands = append(cands, name)
+	}
+	for i := range 3 {
+		mk(2000 + i)
+	}
+	for i := range fillers {
+		if err := os.WriteFile(filepath.Join(r.tmp, fmt.Sprintf("filler-%05d", i)), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var entries []string
+	late := 0
+	for i := 0; i < 32 && (i < 3 || late == 0); i++ {
+		mk(3000 + i)
+		entries = dirEntries(t, r.tmp)
+		late = 0
+		for pos, name := range entries {
+			if pos >= maxReapDirents && isCommandTmpName(name) {
+				late++
+			}
+		}
+	}
+	if late == 0 {
+		t.Fatalf("invalid fixture: no candidate at position >= %d of %d entries", maxReapDirents, len(entries))
+	}
+	cacheCand := filepath.Join(r.cache, tokenN(4000))
+	mkTree(t, cacheCand)
+	if err := os.WriteFile(filepath.Join(r.cache, "not-a-token"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cacheEntries := len(dirEntries(t, r.cache))
+
+	var calls int
+	res := mustReap(t, r, proofConfig(&calls, proofHeld))
+	if got, want := counts(res), fmt.Sprintf("scanned=%d live=0 removed=%d retained=0 foreign=0 proof=held", len(cands)+1, len(cands)+1); got != want {
+		t.Fatalf("reap = %s, want %s (%d candidates past the first page)", got, want, late)
+	}
+	if res.DirentsExamined != len(entries)+cacheEntries {
+		t.Fatalf("dirents_examined = %d, want %d", res.DirentsExamined, len(entries)+cacheEntries)
+	}
+	for _, c := range cands {
+		requireGone(t, filepath.Join(r.tmp, c))
+	}
+	requireGone(t, cacheCand)
+	if left := dirEntries(t, r.tmp); len(left) != fillers {
+		t.Fatalf("%d entries left in tmp, want the %d fillers", len(left), fillers)
+	}
+	for i := range fillers {
+		if _, err := os.Lstat(filepath.Join(r.tmp, fmt.Sprintf("filler-%05d", i))); err != nil {
+			t.Fatalf("filler %d: %v", i, err)
+		}
+	}
+}
+
+// Names that pin as foreign are counted and left alone, and many of them
+// (more than a batch holds) cannot starve the real candidates.
 func TestReapForeignDoesNotConsumeTheCap(t *testing.T) {
 	if !requireNonRootCommandUID(t) {
 		return
@@ -685,26 +873,276 @@ func TestReapWithoutAHeldProofNeverLocks(t *testing.T) {
 	}
 }
 
-// The dirent bound: a name past the first maxDirents entries is not seen.
-func TestListCandidatesDirentBound(t *testing.T) {
-	dir := t.TempDir()
-	for i := range 10 {
-		if err := os.Mkdir(filepath.Join(dir, tmpNameN(i)), 0o700); err != nil {
+// pagingFixture is a tmp and cache root for small-bounds paging: candidates
+// mixed with non-matching names, one tmp candidate held live by a lock.
+type pagingFixture struct {
+	r        testRoots
+	live     string   // the locked tmp candidate's path
+	cands    []string // every other candidate's path
+	entries  int      // entries of both roots
+	tmpOrder []string // tmp names in getdents order
+}
+
+func newPagingFixture(t *testing.T) pagingFixture {
+	t.Helper()
+	f := pagingFixture{r: newRoots(t)}
+	for i := range 7 {
+		p := filepath.Join(f.r.tmp, tmpNameN(60+i))
+		mkTree(t, p)
+		f.cands = append(f.cands, p)
+	}
+	for i := range 5 {
+		if err := os.WriteFile(filepath.Join(f.r.tmp, fmt.Sprintf("other-%d", i)), []byte("o"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	fd := openParent(t, dir)
-	names, err := listCandidates(fd, isCommandTmpName, 4)
-	if err != nil || len(names) != 4 {
-		t.Fatalf("bounded listing = %v %v", names, err)
+	f.live = filepath.Join(f.r.tmp, tmpNameN(70))
+	mkTree(t, f.live)
+	lockDir(t, f.live)
+	for i := range 3 {
+		p := filepath.Join(f.r.cache, tokenN(80+i))
+		mkTree(t, p)
+		f.cands = append(f.cands, p)
 	}
-	names, err = listCandidates(fd, isCommandTmpName, maxReapDirents)
-	if err != nil || len(names) != 10 {
-		t.Fatalf("full listing (from offset 0 again) = %v %v", names, err)
+	mkTree(t, filepath.Join(f.r.cache, "not-a-token"))
+	f.tmpOrder = dirEntries(t, f.r.tmp)
+	f.entries = len(f.tmpOrder) + len(dirEntries(t, f.r.cache))
+	return f
+}
+
+// Small pages and batches: every candidate is acted on exactly once, each root
+// is rewound once only, a live one is left byte for byte, and every deletion
+// had its own fresh proof under the lock.
+func TestReapPagesWithSmallBounds(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newPagingFixture(t)
+	before := snapshotTree(t, f.live)
+	seeks := countSeeks(t)
+	var calls int
+	res, err := reapWith(f.r.tmpFd, f.r.cacheFd, proofConfig(&calls, proofHeld), reapBounds{pageDirents: 3, batchCandidates: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkSums(t, res)
+	want := fmt.Sprintf("scanned=%d live=1 removed=%d retained=0 foreign=0 proof=held", len(f.cands)+1, len(f.cands))
+	if got := counts(res); got != want || res.Truncated {
+		t.Fatalf("reap = %s truncated=%v, want %s", got, res.Truncated, want)
+	}
+	if res.DirentsExamined != f.entries {
+		t.Fatalf("dirents_examined = %d, want %d", res.DirentsExamined, f.entries)
+	}
+	seen := map[string]bool{}
+	for _, o := range res.outcomes {
+		if seen[o.name] {
+			t.Fatalf("%s recorded twice: %+v", o.name, res.outcomes)
+		}
+		seen[o.name] = true
+	}
+	if len(seeks) != 2 || seeks[f.r.tmpFd] != 1 || seeks[f.r.cacheFd] != 1 {
+		t.Fatalf("seeks per fd = %v, want exactly one per root", seeks)
+	}
+	if calls != 1+len(f.cands) {
+		t.Fatalf("proofs = %d, want 1 + %d locked candidates", calls, len(f.cands))
+	}
+	for _, p := range f.cands {
+		requireGone(t, p)
+	}
+	if after := snapshotTree(t, f.live); after != before {
+		t.Fatalf("live candidate changed:\nbefore %s\nafter  %s", before, after)
 	}
 }
 
-// A pass whose budget is spent retains instead of starting a removal.
+// A fresh proof that is not held for a candidate on a later page retains that
+// candidate untouched; the rest are still removed.
+func TestReapPagesRetainOnALaterPageProof(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newPagingFixture(t)
+	bounds := reapBounds{pageDirents: 3, batchCandidates: 2}
+	// The first page ends after pageDirents entries or batchCandidates
+	// matches; the target is the first removable candidate after it.
+	firstPage, matched := 0, 0
+	for firstPage < len(f.tmpOrder) && firstPage < bounds.pageDirents && matched < bounds.batchCandidates {
+		if isCommandTmpName(f.tmpOrder[firstPage]) {
+			matched++
+		}
+		firstPage++
+	}
+	target := ""
+	for _, name := range f.tmpOrder[firstPage:] {
+		if p := filepath.Join(f.r.tmp, name); isCommandTmpName(name) && p != f.live {
+			target = p
+			break
+		}
+	}
+	if target == "" {
+		t.Fatalf("invalid fixture: no removable candidate past the first page of %v", f.tmpOrder)
+	}
+	var targetStat unix.Stat_t
+	if err := unix.Stat(target, &targetStat); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotTree(t, target)
+	// The pin seam marks which candidate the next fresh proof is for.
+	current := false
+	pinFromFd = func(fd, uid int) (safetree.Pin, error) {
+		var st unix.Stat_t
+		current = unix.Fstat(fd, &st) == nil && st.Dev == targetStat.Dev && st.Ino == targetStat.Ino
+		return safetree.PinFromFd(fd, uid)
+	}
+	t.Cleanup(func() { pinFromFd = safetree.PinFromFd })
+	calls := 0
+	cfg := reapConfig{uid: os.Geteuid(), now: time.Now, prove: func() string {
+		calls++
+		if current && calls > 1 {
+			return proofUnknown
+		}
+		return proofHeld
+	}}
+	res, err := reapWith(f.r.tmpFd, f.r.cacheFd, cfg, bounds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkSums(t, res)
+	if res.Live != 1 || res.Retained != 1 || res.Removed != len(f.cands)-1 || res.Truncated {
+		t.Fatalf("reap = %s truncated=%v", counts(res), res.Truncated)
+	}
+	for _, o := range res.outcomes {
+		if o.state == reapRetained && (filepath.Join(f.r.tmp, o.name) != target || o.reason != "proof") {
+			t.Fatalf("retained %+v, want %s for proof", o, target)
+		}
+	}
+	if after := snapshotTree(t, target); after != before {
+		t.Fatalf("retained candidate changed:\nbefore %s\nafter  %s", before, after)
+	}
+	for _, p := range f.cands {
+		if p != target {
+			requireGone(t, p)
+		}
+	}
+}
+
+// The pass budget runs out before the second batch: the pass stops there,
+// truncated, and what it did not reach is untouched.
+func TestReapTruncatesBetweenBatches(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	r := newRoots(t)
+	var cands []string
+	for i := range 5 {
+		p := filepath.Join(r.tmp, tmpNameN(110+i))
+		mkTree(t, p)
+		cands = append(cands, p)
+	}
+	for i := range 4 {
+		if err := os.WriteFile(filepath.Join(r.tmp, fmt.Sprintf("other-%d", i)), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries := len(dirEntries(t, r.tmp))
+	start := time.Now()
+	removals := 0
+	hookBeforeReapRemove = func(int, string) { removals++ }
+	t.Cleanup(func() { hookBeforeReapRemove = nil })
+	cfg := reapConfig{uid: os.Geteuid(), prove: func() string { return proofHeld }, now: func() time.Time {
+		if removals >= 2 {
+			return start.Add(reapPassBudget)
+		}
+		return start
+	}}
+	res, err := reapWith(r.tmpFd, r.cacheFd, cfg, reapBounds{pageDirents: 3, batchCandidates: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkSums(t, res)
+	if got := counts(res); got != "scanned=2 live=0 removed=2 retained=0 foreign=0 proof=held" || !res.Truncated {
+		t.Fatalf("reap = %s truncated=%v", got, res.Truncated)
+	}
+	if res.DirentsExamined >= entries {
+		t.Fatalf("dirents_examined = %d, want fewer than %d", res.DirentsExamined, entries)
+	}
+	left := 0
+	for _, p := range cands {
+		if _, err := os.Lstat(p); err == nil {
+			requireExists(t, p)
+			left++
+		}
+	}
+	if left != len(cands)-2 {
+		t.Fatalf("%d candidates left, want %d", left, len(cands)-2)
+	}
+}
+
+// The pass budget runs out inside the one batch of the only root: the check
+// before the next candidate alone truncates (no later page or root check runs
+// to set it instead).
+func TestReapTruncatesWithinABatch(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	r := newRoots(t)
+	for i := range 3 {
+		mkTree(t, filepath.Join(r.tmp, tmpNameN(140+i)))
+	}
+	start := time.Now()
+	removals := 0
+	hookBeforeReapRemove = func(int, string) { removals++ }
+	t.Cleanup(func() { hookBeforeReapRemove = nil })
+	cfg := reapConfig{uid: os.Geteuid(), prove: func() string { return proofHeld }, now: func() time.Time {
+		if removals >= 1 {
+			return start.Add(reapPassBudget)
+		}
+		return start
+	}}
+	res, err := reap(r.tmpFd, -1, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkSums(t, res)
+	if got := counts(res); got != "scanned=1 live=0 removed=1 retained=0 foreign=0 proof=held" || !res.Truncated || res.DirentsExamined != 3 {
+		t.Fatalf("reap = %s truncated=%v dirents_examined=%d", got, res.Truncated, res.DirentsExamined)
+	}
+}
+
+// The pass budget runs out once the tmp root is done: the cache root is not
+// examined at all.
+func TestReapTruncatesBeforeTheCacheRoot(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	r := newRoots(t)
+	tmpDir := filepath.Join(r.tmp, tmpNameN(120))
+	cacheDir := filepath.Join(r.cache, tokenN(121))
+	mkTree(t, tmpDir)
+	mkTree(t, cacheDir)
+	start := time.Now()
+	removed := false
+	hookBeforeReapRemove = func(int, string) { removed = true }
+	t.Cleanup(func() { hookBeforeReapRemove = nil })
+	cfg := reapConfig{uid: os.Geteuid(), prove: func() string { return proofHeld }, now: func() time.Time {
+		if removed {
+			return start.Add(reapPassBudget)
+		}
+		return start
+	}}
+	res, err := reap(r.tmpFd, r.cacheFd, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkSums(t, res)
+	if got := counts(res); got != "scanned=1 live=0 removed=1 retained=0 foreign=0 proof=held" || !res.Truncated || res.DirentsExamined != 1 {
+		t.Fatalf("reap = %s truncated=%v dirents_examined=%d", got, res.Truncated, res.DirentsExamined)
+	}
+	requireGone(t, tmpDir)
+	requireExists(t, cacheDir)
+}
+
+// A pass whose budget is spent retains instead of starting a removal, and is
+// truncated.
 func TestReapPassBudget(t *testing.T) {
 	if !requireNonRootCommandUID(t) {
 		return
@@ -713,7 +1151,9 @@ func TestReapPassBudget(t *testing.T) {
 	dir := filepath.Join(r.tmp, tmpNameN(20))
 	mkTree(t, dir)
 	start := time.Now()
-	clock := []time.Time{start, start.Add(reapPassBudget)}
+	// The pass start, the page check and the pre-candidate check are in
+	// budget; the check inside reapOne, after the fresh proof, is not.
+	clock := []time.Time{start, start, start, start.Add(reapPassBudget)}
 	cfg := reapConfig{uid: os.Geteuid(), prove: func() string { return proofHeld }, now: func() time.Time {
 		now := clock[0]
 		if len(clock) > 1 {
@@ -721,11 +1161,214 @@ func TestReapPassBudget(t *testing.T) {
 		}
 		return now
 	}}
-	res := mustReap(t, r, cfg)
-	if res.Retained != 1 || res.outcomes[0].reason != "deadline" {
-		t.Fatalf("reap = %s %+v", counts(res), res.outcomes)
+	// No cache root, and the tmp root reaches its end within the one page, so
+	// only the "deadline" retention can set truncated.
+	res, err := reap(r.tmpFd, -1, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkSums(t, res)
+	if res.Retained != 1 || res.outcomes[0].reason != "deadline" || !res.Truncated {
+		t.Fatalf("reap = %s truncated=%v %+v", counts(res), res.Truncated, res.outcomes)
 	}
 	requireExists(t, dir)
+}
+
+// A removal that RemoveBy itself cuts short with ErrDeadline retains the
+// candidate (reason "deadline") and truncates the pass, with the pass budget
+// never spent, so no pre-removal budget check can set truncated instead.
+func TestReapRemovalDeadlineTruncates(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	r := newRoots(t)
+	dir := filepath.Join(r.tmp, tmpNameN(30))
+	mkTree(t, dir)
+	calls := 0
+	reapRemoveBy = func(int, string, safetree.Pin, time.Time) error {
+		calls++
+		return fmt.Errorf("walk: %w", safetree.ErrDeadline)
+	}
+	t.Cleanup(func() { reapRemoveBy = safetree.RemoveBy })
+	start := time.Now()
+	cfg := reapConfig{uid: os.Geteuid(), prove: func() string { return proofHeld }, now: func() time.Time { return start }}
+	// No cache root, and the tmp root reaches its end within the one page, so
+	// only the "deadline" retention can set truncated.
+	res, err := reap(r.tmpFd, -1, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkSums(t, res)
+	if calls != 1 || res.Retained != 1 || len(res.outcomes) != 1 || res.outcomes[0].reason != "deadline" || !res.Truncated {
+		t.Fatalf("calls=%d reap = %s truncated=%v %+v", calls, counts(res), res.Truncated, res.outcomes)
+	}
+	requireExists(t, dir)
+}
+
+// With outcome recording off (production), a pass keeps no per-candidate
+// record, so its memory does not grow with the candidates it acts on, and a
+// "deadline" retention still truncates.
+func TestReapKeepsNoOutcomesInProduction(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	if recordReapOutcomesDefault {
+		t.Fatal("recordReapOutcomes defaults to on: a production pass would keep a record per candidate")
+	}
+	recordReapOutcomes = false
+	t.Cleanup(func() { recordReapOutcomes = true })
+	r := newRoots(t)
+	for i := range 3 {
+		mkTree(t, filepath.Join(r.tmp, tmpNameN(60+i)))
+	}
+	deadlined := filepath.Join(r.tmp, tmpNameN(63))
+	mkTree(t, deadlined)
+	reapRemoveBy = func(parentFd int, name string, pin safetree.Pin, deadline time.Time) error {
+		if name == tmpNameN(63) {
+			return fmt.Errorf("walk: %w", safetree.ErrDeadline)
+		}
+		return safetree.RemoveBy(parentFd, name, pin, deadline)
+	}
+	t.Cleanup(func() { reapRemoveBy = safetree.RemoveBy })
+	var calls int
+	res, err := reap(r.tmpFd, -1, proofConfig(&calls, proofHeld))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkSums(t, res)
+	if got := counts(res); got != "scanned=4 live=0 removed=3 retained=1 foreign=0 proof=held" || !res.Truncated || res.outcomes != nil {
+		t.Fatalf("reap = %s truncated=%v outcomes=%+v", got, res.Truncated, res.outcomes)
+	}
+	requireExists(t, deadlined)
+}
+
+// The deadline handed to RemoveBy is the candidate's 60 s limit, capped by the
+// pass deadline once fewer than 60 s of the pass budget remain.
+func TestReapRemovalDeadlineIsCapped(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	cases := []struct {
+		name string
+		// inReapOne is the clock at reapOne's own now(), relative to start.
+		inReapOne time.Duration
+		// want is the deadline RemoveBy must get, relative to start.
+		want time.Duration
+	}{
+		{"plenty of budget left", 0, reapCandidateBudget},
+		{"under 60 s of budget left", reapPassBudget - 10*time.Second, reapPassBudget},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRoots(t)
+			dir := filepath.Join(r.tmp, tmpNameN(31))
+			mkTree(t, dir)
+			var got []time.Time
+			reapRemoveBy = func(parentFd int, name string, pin safetree.Pin, deadline time.Time) error {
+				got = append(got, deadline)
+				return safetree.RemoveBy(parentFd, name, pin, deadline)
+			}
+			t.Cleanup(func() { reapRemoveBy = safetree.RemoveBy })
+			start := time.Now()
+			// The pass start, the page check and the pre-candidate check are
+			// at start; the check inside reapOne, after the fresh proof, is at
+			// start+inReapOne.
+			clock := []time.Time{start, start, start, start.Add(tc.inReapOne)}
+			cfg := reapConfig{uid: os.Geteuid(), prove: func() string { return proofHeld }, now: func() time.Time {
+				now := clock[0]
+				if len(clock) > 1 {
+					clock = clock[1:]
+				}
+				return now
+			}}
+			res, err := reap(r.tmpFd, -1, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkSums(t, res)
+			if len(got) != 1 || !got[0].Equal(start.Add(tc.want)) {
+				t.Fatalf("RemoveBy deadlines = %v, want [start+%v] (start %v)", got, tc.want, start)
+			}
+			if res.Removed != 1 || res.Truncated {
+				t.Fatalf("reap = %s truncated=%v %+v", counts(res), res.Truncated, res.outcomes)
+			}
+			requireGone(t, dir)
+		})
+	}
+}
+
+// A getdents failure mid-traversal is an error; a name it had not yet
+// returned is untouched, and what was done before stays recorded.
+func TestReapListErrorMidTraversal(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	setup := func(t *testing.T) (testRoots, []string, map[string]bool) {
+		r := newRoots(t)
+		var cands []string
+		for i := range 6 {
+			name := tmpNameN(130 + i)
+			mkTree(t, filepath.Join(r.tmp, name))
+			cands = append(cands, name)
+		}
+		// The first call returns only what fits 200 bytes (at least one
+		// candidate); the second fails.
+		returned := map[string]bool{}
+		calls := 0
+		reapGetdents = func(fd int, buf []byte) (int, error) {
+			calls++
+			if calls == 2 {
+				return 0, unix.EIO
+			}
+			n, err := unix.Getdents(fd, buf[:200])
+			if n > 0 {
+				_, _, names := unix.ParseDirent(buf[:n], -1, nil)
+				for _, name := range names {
+					returned[name] = true
+				}
+			}
+			return n, err
+		}
+		t.Cleanup(func() { reapGetdents = unix.Getdents })
+		return r, cands, returned
+	}
+	checkUntouched := func(t *testing.T, r testRoots, cands []string, returned map[string]bool) {
+		t.Helper()
+		notReturned := 0
+		for _, c := range cands {
+			if !returned[c] {
+				notReturned++
+				requireExists(t, filepath.Join(r.tmp, c))
+			}
+		}
+		if notReturned == 0 {
+			t.Fatalf("invalid fixture: the first getdents returned every candidate")
+		}
+	}
+
+	t.Run("reap", func(t *testing.T) {
+		r, cands, returned := setup(t)
+		var calls int
+		res, err := reapWith(r.tmpFd, r.cacheFd, proofConfig(&calls, proofHeld), reapBounds{pageDirents: maxReapDirents, batchCandidates: 1})
+		if !errors.Is(err, unix.EIO) {
+			t.Fatalf("reap error = %v, want EIO", err)
+		}
+		if len(returned) == 0 || res.Removed != len(returned) || res.Scanned != res.Removed {
+			t.Fatalf("reap = %s, want the %d names returned before the failure removed", counts(res), len(returned))
+		}
+		checkUntouched(t, r, cands, returned)
+	})
+	t.Run("runMode", func(t *testing.T) {
+		r, cands, returned := setup(t)
+		uid := fmt.Sprint(os.Geteuid())
+		selfOnly := staticTable{list: []procUserRow{{pid: os.Getpid(), uids: uids4(os.Geteuid())}}}
+		var out bytes.Buffer
+		code := runMode([]string{modeReapOrphans, "--expect-uid", uid, "--cache-root", r.cache}, testModeEnv(&out, r.tmp, selfOnly))
+		if want := `{"event":"reap_error","reason":"list"}` + "\n"; code != 2 || out.String() != want {
+			t.Fatalf("code %d, line %q, want %q", code, out.String(), want)
+		}
+		checkUntouched(t, r, cands, returned)
+	})
 }
 
 // testModeEnv is a modeEnv for in-process runs.
@@ -755,17 +1398,19 @@ func TestRunModeReapOrphans(t *testing.T) {
 	r := newRoots(t)
 	mkTree(t, filepath.Join(r.tmp, tmpNameN(30)))
 	mkTree(t, filepath.Join(r.cache, tokenN(31)))
+	examined := len(dirEntries(t, r.tmp)) + len(dirEntries(t, r.cache))
 	var out bytes.Buffer
 	code := runMode([]string{modeReapOrphans, "--expect-uid", uid, "--cache-root", r.cache}, testModeEnv(&out, r.tmp, selfOnly))
-	if want := `{"event":"reap","scanned":2,"live":0,"removed":2,"retained":0,"foreign":0,"proof":"held"}` + "\n"; code != 0 || out.String() != want {
+	if want := fmt.Sprintf(`{"event":"reap","scanned":2,"live":0,"removed":2,"retained":0,"foreign":0,"proof":"held","truncated":false,"dirents_examined":%d}`, examined) + "\n"; code != 0 || out.String() != want {
 		t.Fatalf("reap: code %d, line %q, want %q", code, out.String(), want)
 	}
 
 	// A missing cache root is skipped; the tmp is still reaped.
 	mkTree(t, filepath.Join(r.tmp, tmpNameN(32)))
+	examined = len(dirEntries(t, r.tmp))
 	out.Reset()
 	code = runMode([]string{modeReapOrphans, "--expect-uid", uid, "--cache-root", filepath.Join(r.cache, "absent")}, testModeEnv(&out, r.tmp, selfOnly))
-	if want := `{"event":"reap","scanned":1,"live":0,"removed":1,"retained":0,"foreign":0,"proof":"held"}` + "\n"; code != 0 || out.String() != want {
+	if want := fmt.Sprintf(`{"event":"reap","scanned":1,"live":0,"removed":1,"retained":0,"foreign":0,"proof":"held","truncated":false,"dirents_examined":%d}`, examined) + "\n"; code != 0 || out.String() != want {
 		t.Fatalf("missing cache root: code %d, line %q", code, out.String())
 	}
 

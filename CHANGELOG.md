@@ -43,6 +43,11 @@ through `[0.52.0]`.)
 - **A CLI request that times out now says so, instead of "cannot reach uzi" ([#1620](https://github.com/vtmocanu/uzi/issues/1620)).**
   Hitting a request deadline now reports "uzi at <url> did not respond in time (the server may be slow or unreachable): …", distinguishing a slow/overloaded server from one that's actually unreachable; the exit code is unchanged.
 
+### Fixed
+
+- **The Codex startup orphan reaper no longer strands orphans past its first 4,096 entries or 64 candidates ([#1621](https://github.com/vtmocanu/uzi/issues/1621)).**
+  Both roots (command tmps in `/tmp` and the per-run cache root) are now read to their end in bounded pages within the existing five-minute pass budget, instead of stopping after the first page. The reap line gains `truncated` and `dirents_examined`, and a pass the budget cut short, or one in which a removal hit its deadline, is logged as a startup warning (orphans may remain until a later startup) without blocking the worker. Deletion stays fail-closed, unchanged.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added

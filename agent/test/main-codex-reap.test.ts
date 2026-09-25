@@ -20,7 +20,9 @@ function recorder(): { log: { info: LogFn; warn: LogFn; error: LogFn }; lines: A
   };
 }
 
-const CLEAN: ReapOrphansResult = { ok: true, scanned: 3, live: 0, removed: 3, retained: 0, foreign: 0, proof: "held" };
+const CLEAN: ReapOrphansResult = {
+  ok: true, scanned: 3, live: 0, removed: 3, retained: 0, foreign: 0, proof: "held", truncated: false, direntsExamined: 5,
+};
 
 describe("reapCodexOrphansAtStartup", () => {
   it("does nothing without the uid split", async () => {
@@ -41,7 +43,7 @@ describe("reapCodexOrphansAtStartup", () => {
     assert.deepEqual(r.lines, [{
       level: "info",
       msg: "codex command orphan reap",
-      fields: { scanned: 3, live: 0, removed: 3, retained: 0, foreign: 0, proof: "held" },
+      fields: { scanned: 3, live: 0, removed: 3, retained: 0, foreign: 0, proof: "held", truncated: false, dirents_examined: 5 },
     }]);
   });
 
@@ -55,6 +57,19 @@ describe("reapCodexOrphansAtStartup", () => {
       await reapCodexOrphansAtStartup(r.log, { splitActive: true, reap: async () => result });
       assert.equal(r.lines[0]?.level, "warn");
     }
+  });
+
+  it("warns on a truncated pass even when it removed everything it scanned (issue #1621)", async () => {
+    const truncated: ReapOrphansResult = { ...CLEAN, scanned: 64, removed: 64, truncated: true, direntsExamined: 4096 };
+    const r = recorder();
+    const result = await reapCodexOrphansAtStartup(r.log, { splitActive: true, reap: async () => truncated });
+    assert.deepEqual(result, truncated);
+    assert.deepEqual(r.lines, [{
+      level: "warn",
+      msg: "codex command orphan reap was truncated; orphans may remain until a later startup",
+      fields: { scanned: 64, live: 0, removed: 64, retained: 0, foreign: 0, proof: "held", truncated: true, dirents_examined: 4096 },
+    }]);
+    assert.equal(startupReapVerdict(result, false), "run", "truncation never blocks startup");
   });
 
   it("a failed pass (binary absent, reap_error) warns and never throws", async () => {

@@ -1264,7 +1264,9 @@ async function stopReaper(
  *  worker-side reasons "timeout" / "aborted" (the reaper was killed and closed), "spawn",
  *  "protocol" (garbage, a missing line or an exit code inconsistent with the line), or
  *  "timeout_unkilled" (a timed-out or aborted reaper did not close after the kill, so it
- *  may still be running: no run may start). */
+ *  may still be running: no run may start). On `ok:true`, `truncated` means the pass
+ *  budget ran out or a removal hit its deadline, so orphans may remain for a later startup,
+ *  and `direntsExamined` (never below `scanned`) counts the entries the pass read. */
 export type ReapOrphansResult =
   | {
       readonly ok: true;
@@ -1274,6 +1276,8 @@ export type ReapOrphansResult =
       readonly retained: number;
       readonly foreign: number;
       readonly proof: "held" | "unknown" | "user_alive";
+      readonly truncated: boolean;
+      readonly direntsExamined: number;
     }
   | { readonly ok: false; readonly reason: string; readonly detail?: string };
 
@@ -1298,10 +1302,14 @@ export async function reapCodexCommandOrphans(deps: StandaloneModeDeps = {}): Pr
     }
     const event = eventOf(run.line);
     if (event === "reap") {
-      const r = parseExactObject(run.line, ["event", "scanned", "live", "removed", "retained", "foreign", "proof"]);
+      const r = parseExactObject(run.line, [
+        "event", "scanned", "live", "removed", "retained", "foreign", "proof", "truncated", "dirents_examined",
+      ]);
       if (r && isCount(r.scanned) && isCount(r.live) && isCount(r.removed) && isCount(r.retained) && isCount(r.foreign)
         && r.scanned === r.live + r.removed + r.retained + r.foreign
-        && typeof r.proof === "string" && REAP_PROOFS.has(r.proof) && run.code === 0) {
+        && typeof r.proof === "string" && REAP_PROOFS.has(r.proof)
+        && typeof r.truncated === "boolean" && isCount(r.dirents_examined) && r.scanned <= r.dirents_examined
+        && run.code === 0) {
         return {
           ok: true,
           scanned: r.scanned,
@@ -1310,6 +1318,8 @@ export async function reapCodexCommandOrphans(deps: StandaloneModeDeps = {}): Pr
           retained: r.retained,
           foreign: r.foreign,
           proof: r.proof as "held" | "unknown" | "user_alive",
+          truncated: r.truncated,
+          direntsExamined: r.dirents_examined,
         };
       }
     } else if (event === "reap_error") {
