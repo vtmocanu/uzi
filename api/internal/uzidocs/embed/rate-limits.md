@@ -29,12 +29,12 @@ token, you see one meter and nothing has changed.
 | **Sidebar** | One usage list under your signed-in name: each shown token under a Claude logo and its name, with two thin bars — a glance without leaving the page you're on. Codex accounts follow in the same list (see [Codex account limits](#codex-account-limits)). |
 | **Admin → Rate limits** | Every user's meters on one page, one row per token, sorted so whoever is closest to a limit shows first. |
 
-Every token is named by its own label, even when you hold only one, so adding
-a second token never renames the first.
+In the sidebar and on the Settings card every token is named by its own label,
+even when you hold only one, so adding a second token never renames the first.
 
-Both surfaces are hidden entirely until you've saved a token. While uzi is
-waiting on its first reading, the sidebar stays hidden (no empty bars to
-puzzle over), but the Settings card shows a "No reading yet" placeholder
+The sidebar and the Settings card stay hidden until you've saved a token.
+While uzi is waiting on a token's first reading, that token stays out of the
+sidebar (no empty bars to puzzle over), but the Settings card shows a "No reading yet" placeholder
 with two greyed bars — a reading appears within a few minutes of saving.
 A token added later shows that placeholder until its first poll, while your
 other meters keep reading normally.
