@@ -69,7 +69,11 @@ func TestPlanMilestonesParam(t *testing.T) {
 		// B-a (sticky rejection): a NULL stored candidate beside a non-NULL stored plan_md means an
 		// earlier list was rejected; only the FIRST plan-bearing report (stored plan_md NULL) infers.
 		{"interlocked, different plan after a rejected list stays NULL", rejectedEarlierPlan, planB, nil, ""},
-		{"interlocked, different plan after a rejected list, explicit [] wins", rejectedEarlierPlan, planB, empty, "[]"},
+		// N2: an EXPLICIT `[]` after a rejected list is read like an absent list (sticky NULL), so
+		// the rejection holds whichever worker sent the report; only the first report's `[]` counts.
+		{"interlocked, different plan after a rejected list, explicit [] stays NULL", rejectedEarlierPlan, planB, empty, ""},
+		{"interlocked, same plan after a rejected list, explicit [] stays NULL", samePlanNullCandidate, plan, empty, ""},
+		{"interlocked, stored [] candidate, explicit [] stays []", emptyCandidateStoredPlan, planB, empty, "[]"},
 		{"interlocked, different plan after a rejected list, valid list wins", rejectedEarlierPlan, planB, one, `[{"id":"m1","title":"First"}]`},
 		{"interlocked, different plan after a rejected list, rejected again", rejectedEarlierPlan, planB, bad, ""},
 		{"interlocked, revise without milestones keeps a stored []", emptyCandidateStoredPlan, planB, nil, "[]"},

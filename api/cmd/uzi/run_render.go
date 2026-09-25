@@ -234,7 +234,7 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	// The honest completion-interlock block (PRD #1226 M5, D8): the phase label, the unmet
 	// milestone ids, the attempt count and the same-worker-only HOLD_CONTEXT. Placed right after
 	// the milestone block it references (COMPLETION_UNMET names frozen-list ids). Every row is
-	// emit-only-when-set, so a non-interlocked run (the rollout OFF) adds nothing here.
+	// emit-only-when-set, so a non-interlocked run (legacy, seeded, Codex, or kill-switched) adds nothing.
 	rows = append(rows, completionRows(r)...)
 	// The HOLD row (PRD #1497 M3): a one-line summary of ANY held run — a wall park
 	// (hold_reason=budget_exhausted) or a completion hold (completion_blocked) — naming why
@@ -384,7 +384,7 @@ func completionPhaseLabel(phase string) string {
 
 // completionRows renders the honest completion-interlock state of `uzi run get` (PRD #1226 M5,
 // D8), the CLI twin of the web's CompletionStatePanel. Every row is emit-only-when-set, so a
-// NON-interlocked run (legacy, or the rollout OFF) — completion_phase "", an empty unmet list,
+// NON-interlocked run (legacy, seeded, Codex, or kill-switched) — completion_phase "", an empty unmet list,
 // zero attempts and a null hold_context — adds NOTHING and renders byte-for-byte as today.
 //
 //   - COMPLETION: the phase as a human label, via completionPhaseLabel (the SINGLE

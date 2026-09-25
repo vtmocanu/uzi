@@ -579,8 +579,8 @@ export interface RunContext {
    *  throwing a terminal failure, so the run enters a recoverable hold that preserves its Git work
    *  rather than failing. M4 wires the real implementation (SetRunCompletionHold + captureHoldContext
    *  + the fixed park order); when the runner leaves it UNWIRED the executor falls back to the
-   *  legacy throw (the feature is rollout-OFF until #1232 and M3+M4 ship together, so an unwired
-   *  seam never fires in production).
+   *  legacy throw (the runner wires it in production; an unwired seam, as in tests, never fires
+   *  the hold).
    *
    *  Returns TRUE when the run ENTERED the verified hold (parked; the runner preserved the clone
    *  and HOME and the caller latches {@link ExecutorResult.completionHeld} and breaks so the runner
@@ -604,8 +604,8 @@ export interface RunContext {
    *  REASON_QUESTION_TIMEOUT: expiry is a normal outcome, not a failure, and it must not surface as a
    *  `failed` report. `unmet` is the server-authoritative unmet-milestone id set at the stall.
    *
-   *  Optional: nil in tests/legacy (and while the completion interlock is rollout-OFF) ⇒ the
-   *  executor falls back to routeCompletionHold at the stall exactly as M4 behaved. */
+   *  Optional: nil in tests/legacy ⇒ the executor falls back to routeCompletionHold at the stall
+   *  exactly as M4 behaved. Only reached on an interlocked run (see completionInterlock). */
   askCompletionQuestion?(
     unmet: string[],
   ): Promise<{ outcome: "continue"; guidance?: string } | { outcome: "expired" }>;

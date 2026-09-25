@@ -74,7 +74,8 @@ func TestCreateRunNoStampWhenRolloutOff(t *testing.T) {
 }
 
 // TestCreateRunNoStampWhenReaderUnset: a nil reader (a deployment/test that never wired the
-// switch) defaults OFF, the fail-safe direction — a new run is legacy, never interlocked.
+// switch) makes completionInterlockOn false even though the SETTING defaults on (#1626) — a
+// new run is legacy, never interlocked.
 func TestCreateRunNoStampWhenReaderUnset(t *testing.T) {
 	svc, fs := newInterlockCreateSvc(t, nil)
 	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, nil, nil, nil); err != nil {
@@ -85,9 +86,9 @@ func TestCreateRunNoStampWhenReaderUnset(t *testing.T) {
 	}
 }
 
-// TestCreateRunNoStampOnReadError: a rollout read ERROR is treated as OFF (fail-safe) —
-// the DELIBERATE opposite of the capability-aware fail-open, so the interlock never
-// accidentally engages a still-rolling-out feature on a momentary settings-read blip.
+// TestCreateRunNoStampOnReadError: a switch read ERROR is treated as OFF even when the value
+// returned alongside it is true (settings.Cache's cold-error shape: the default, now true,
+// plus the error), so a momentary cold settings-read failure never stamps a run.
 func TestCreateRunNoStampOnReadError(t *testing.T) {
 	svc, fs := newInterlockCreateSvc(t, fakeCompletionInterlock{on: true, err: context.DeadlineExceeded})
 	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, nil, nil, nil); err != nil {

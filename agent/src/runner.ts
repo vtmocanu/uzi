@@ -6497,9 +6497,10 @@ export class RunRunner {
       // failure. enterCompletionHold reaps, captures a VERIFIED same-worker restore point, requests
       // the hold, and returns true ONLY on a `paused` ACK (parked; the finally preserves the clone
       // and HOME); false means it did NOT park (it cleared its preserve flags), so the executor falls
-      // back to the legacy throw and the run's normal terminal cleanup runs. The feature is
-      // rollout-OFF (completion_interlock_rollout defaults OFF)
-      // until #1232, so this seam is inert in production — completionInterlock above is false.
+      // back to the legacy throw and the run's normal terminal cleanup runs. Live for every
+      // interlocked run: completion_interlock_rollout defaults ON (#1626), so an unseeded
+      // Claude-harness issue run carries completion_contract_version and completionInterlock
+      // above is true; a legacy, seeded or Codex run leaves it false and never reaches this seam.
       // issue #1597 M2: gated against the mid-turn tick (it reaps and captures a restore point).
       enterCompletionHold: (reason) =>
         this.runGatedSink(flight, () => this.enterCompletionHold(flight, claim, reason, runLog)),
@@ -6510,9 +6511,9 @@ export class RunRunner {
       // and the owner continue-decision endpoint resolves it) and gives the owner a live window
       // (completion_hold_window_seconds, default 900s) to continue-with-guidance before the run
       // parks. On expiry (or a park the server won't ACK) it resolves "expired" and the executor
-      // routes to enterCompletionHold (M4) — it NEVER throws a timeout. Inert while the interlock is
-      // rollout-OFF (completionInterlock above is false, so the stall path is never reached in
-      // production). Sources its window from claim.config, exactly like askUser sources its deadline.
+      // routes to enterCompletionHold (M4) — it NEVER throws a timeout. Reached only on an
+      // interlocked run (completionInterlock above true; a legacy run never hits the stall path).
+      // Sources its window from claim.config, exactly like askUser sources its deadline.
       askCompletionQuestion: (unmet) =>
         this.askCompletionQuestion(
           runId,

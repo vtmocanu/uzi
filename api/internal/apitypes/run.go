@@ -304,7 +304,7 @@ type RunDTO struct {
 	// The HONEST-STATE completion fields (PRD #1226 M5, D8) — the wire contract the web + CLI
 	// render the completion-interlock states from. CompletionInterlock is the discriminator:
 	// true iff run.CompletionContractVersion is non-null (this run runs the structural
-	// completion protocol). A NON-interlocked run (legacy, or the rollout OFF) carries every
+	// completion protocol). A NON-interlocked run (legacy, rollout off, Codex or seeded) carries every
 	// field below at its inert default (0/[]/null/"") and renders exactly as today. All are
 	// always on the wire.
 	CompletionInterlock bool `json:"completion_interlock"`

@@ -1597,12 +1597,14 @@ export class SdkExecutor implements Executor {
             },
           });
           approvedPlan = ctx.approvedPlan!;
-          // Nothing is frozen before approval: on a resume_phase "awaiting_approval" claim the
-          // server delivers the stored CANDIDATE breakdown in `milestones` (issue #1626), which
-          // lands here, so the re-presented gate re-sends the same milestones. An older server
-          // sent only the (NULL) frozen list, so this is undefined there; the server's
-          // planMilestonesParam guard then keeps the stored non-empty candidate rather than
-          // reading the milestone-less re-presentation as an empty breakdown.
+          // Nothing is frozen before approval: on a resume_phase "awaiting_approval" claim for an
+          // INTERLOCKED run (completion_contract_version set) the server delivers the stored
+          // CANDIDATE breakdown in `milestones` (issue #1626), which lands here, so the
+          // re-presented gate re-sends the same milestones. A legacy (non-interlocked) run's claim,
+          // or an older server's, carries only the (NULL) frozen list, so this is undefined there;
+          // for an interlocked run the server's planMilestonesParam guard then keeps the stored
+          // non-empty candidate rather than reading the milestone-less re-presentation as an empty
+          // breakdown (a legacy run never had a completion contract to protect).
           candidateMilestones = ctx.frozenMilestones ?? undefined;
           gateMilestones = candidateMilestones;
         } else {
@@ -3732,7 +3734,7 @@ export class SdkExecutor implements Executor {
    * has recorded at least one completion attempt AND the hold seam is wired, else fall back to the
    * legacy throw. Returns the HOLD'S OWN verdict: true when the run ENTERED the verified hold (the
    * caller latches completionHeld and breaks); false when the hold was NOT entered — the seam is
-   * unwired (M3 / rollout OFF), no attempt has run yet, OR the wired hold could not capture/ACK
+   * unwired (tests / a legacy run), no attempt has run yet, OR the wired hold could not capture/ACK
    * `paused` and kept the run LIVE — so the caller throws Error(reason) exactly as before. The
    * false path never runs the destructive cleanup (the hold impl owns that invariant). `attempted`
    * is the loop's completionAttempted latch.

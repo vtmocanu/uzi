@@ -138,9 +138,10 @@ const (
 	// and the capability-aware flag), so an interlocked run in an all-legacy fleet is genuinely
 	// unclaimable until a protocol-capable worker comes online. Maps to the SAME
 	// healthWaitingWorker enum (no migration — runs.health_reason is free text). NOT gated by the
-	// interlock rollout switch: a run that IS interlocked stays subject to the claim clause
-	// regardless of the flag, so the reason reflects the run's actual state (rollout-OFF, no run
-	// is interlocked, so this stays inert).
+	// interlock switch: a run that IS interlocked stays subject to the claim clause regardless of
+	// the flag, so the reason reflects the run's actual state. With the switch ON by default
+	// (#1626) every new unseeded Claude-harness issue run is interlocked, so this fires whenever
+	// such a run's owner has no protocol-capable worker online.
 	reasonNoCompletionCapableWorker = "no online worker implements the completion interlock (completion_interlock_v1); provision a capable worker"
 	// reasonNoCodexCapableWorker (PRD #1332 M5A, D3) is emitted for a CODEX-INDICATING queued run
 	// (harness='codex', or a surviving M1 binding sentinel) whose owner has NO online worker
@@ -708,11 +709,12 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// can never be satisfied. Placed right after the ordinary capability-gap rung and AHEAD of the
 	// priority-class re-label, for the same reason that rung is: an actionable "provision a capable
 	// worker" block must not be hidden behind a yield/restored message. NOT gated by the interlock
-	// rollout switch — a run that IS interlocked is subject to the claim clause regardless of the
-	// flag, and with rollout OFF no run is interlocked so this stays inert. The per-run Count sits
-	// behind the queued-threshold guard in healthTargetFor, so it runs for ~0 runs/tick; a read
-	// error falls through to the generic reasons below rather than inventing a reason on a failed
-	// lookup (the conservative degrade the sibling per-run lookups use).
+	// switch — a run that IS interlocked is subject to the claim clause regardless of the flag
+	// (flipping the kill-switch off stamps no NEW run but leaves stamped runs interlocked). The
+	// per-run Count sits behind the queued-threshold guard in healthTargetFor, so it runs for
+	// ~0 runs/tick; a read error falls through to the generic reasons below rather than
+	// inventing a reason on a failed lookup (the conservative degrade the sibling per-run
+	// lookups use).
 	if r.CompletionContractVersion.Valid {
 		p, perr := s.q.CountOnlineWorkersSatisfyingProtocol(ctx, r.UserID)
 		if perr != nil {
@@ -865,13 +867,14 @@ func (s *Service) capabilityAwareOn(ctx context.Context) bool {
 	return on
 }
 
-// completionInterlockOn reads the completion-interlock rollout switch (PRD #1226 M1, D1),
-// nil-safe and FAIL-SAFE OFF — the DELIBERATE opposite of capabilityAwareOn's default-on.
-// A nil reader (tests, or a deployment without a settings cache) or ANY read error both
-// leave it false, so createRun stamps completion_contract_version ONLY on an affirmative
-// "true". This gate must not accidentally engage a still-rolling-out feature: an
-// unconfigured or momentarily-unreadable setting creates a legacy (unstamped) run rather
-// than an interlocked one no worker in the fleet can yet claim.
+// completionInterlockOn reads the completion-interlock switch (PRD #1226 M1, D1; #1626),
+// nil-safe and fail-safe. The setting itself defaults ON (no row = on; an explicit "false"
+// row or ENV value is the admin kill-switch), but a nil reader (tests, or a deployment
+// without a settings cache) or ANY read error leaves this false: settings.Cache returns an
+// error only on a cold read with no valid cached snapshot (a failed refresh over a valid
+// cache serves the cached value error-free), and on that error the value is discarded, so a
+// momentarily-unreadable setting creates a legacy (unstamped) run. createRun additionally
+// stamps only unseeded Claude-harness runs.
 func (s *Service) completionInterlockOn(ctx context.Context) bool {
 	if s.completionInterlock == nil {
 		return false

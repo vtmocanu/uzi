@@ -2123,10 +2123,10 @@ WITH selected AS (
         -- PRD #1226 M1 (D1): freeze the STRUCTURAL COMPLETION CONTRACT at the SAME approve
         -- freeze as milestones_frozen, IDEMPOTENTLY. The freeze condition is TIED to the
         -- milestone freeze: the run is INTERLOCKED (completion_contract_version IS NOT NULL,
-        -- stamped at CreateRun when the rollout switch was on), the contract is not yet frozen
+        -- stamped at CreateRun when the interlock switch was on), the contract is not yet frozen
         -- (completion_contract IS NULL), AND the resolved milestone source is present — the SAME
         -- COALESCE(milestones_frozen, milestones_candidate) milestones_frozen above freezes from.
-        -- So a double-approve or re-gate resume never re-freezes, a legacy/rollout-off run keeps
+        -- So a double-approve or re-gate resume never re-freezes, a non-interlocked run keeps
         -- NULL, and a run with no candidate freezes no contract (consistent with milestones_frozen
         -- staying NULL — the interlock still holds via the version). The Go caller (submitApproval)
         -- builds @completion_contract from that same source. contract_revision is set to 1 in the
@@ -2456,9 +2456,11 @@ type CreateRunParams struct {
 //
 // 🔴 completion_contract_version (PRD #1226 M1, D1) is listed here for the SAME reason as
 // the fields above: it is a silently-omittable nullable param (sqlc.narg). createRun reads
-// the completion_interlock_rollout switch (fail-safe OFF) and passes 1 ONLY when it is on,
-// stamping the run as INTERLOCKED before its first claim; a legacy/rollout-off run passes
-// NULL and stays the explicit legacy state. An omitted Go struct field would compile green
+// the completion_interlock_rollout switch (default ON; an explicit "false" is the admin
+// kill-switch; a cold read error counts as off) and passes 1 ONLY when it is on AND the run
+// is not seeded AND its resolved harness is Claude (#1626: Codex does not run the
+// completion-attempt loop), stamping the run as INTERLOCKED before its first claim; every
+// other run (switch off, seeded, Codex) passes NULL and stays the explicit legacy state. An omitted Go struct field would compile green
 // and silently ship NULL for every run (the feature inert), so a per-path test guards it,
 // not the compiler. Stamped BEFORE the first claim on purpose: approval does not re-claim,
 // so stamping only at approval would make the D2 hard claim clause vacuous for the

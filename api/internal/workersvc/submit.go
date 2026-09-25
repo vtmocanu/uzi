@@ -675,7 +675,7 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 	// snapshot read just above (so it matches what the freeze reads a line later), falling
 	// back to the run snapshot if that read failed. The query still guards the assignment
 	// (freezes once, only when contract IS NULL), so a re-approve never re-freezes. A
-	// legacy/rollout-off run passes NULL and stays legacy. A build error is best-effort:
+	// non-interlocked run passes NULL and stays legacy. A build error is best-effort:
 	// log and pass NULL rather than fail the human approve (mirrors the #260 instrumentation).
 	var completionContract []byte
 	if run.CompletionContractVersion.Valid && len(run.CompletionContract) == 0 {

@@ -92,7 +92,7 @@ func textPtr(t pgtype.Text) *string {
 // intPtr returns the persisted int4 as *int, nil when the column is NULL — the mirror of
 // textPtr for a nullable int served on the claim (PRD #1226 M3: the completion-contract
 // version discriminator, which the wire renders as `completion_contract_version` with
-// omitempty so a legacy/rollout-off run omits the key entirely).
+// omitempty so a non-interlocked run omits the key entirely).
 func intPtr(v pgtype.Int4) *int {
 	if !v.Valid {
 		return nil

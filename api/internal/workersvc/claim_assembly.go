@@ -636,7 +636,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			CIConfigPaths: run.CiConfigPaths,
 			// PRD #1226 M3 (D1/D2): the completion-interlock discriminator, read straight off
 			// runs.completion_contract_version. Non-nil ⇒ the worker runs the structural
-			// completion protocol; nil (legacy run / rollout OFF) ⇒ omitted, legacy path. This
+			// completion protocol; nil (non-interlocked run) ⇒ omitted, legacy path. This
 			// is WORKER-ONLY claim config, NOT the web RunDTO, so it touches no api-contract fixture.
 			CompletionContractVersion: intPtr(run.CompletionContractVersion),
 			// PRD #1226 M4 (D5): the frozen structural contract revision, read straight off

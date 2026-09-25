@@ -26,9 +26,10 @@ import (
 // It prints a one-line confirmation (the run's new status, plus decision detail) like `run resume`;
 // --json emits the resumed RunDTO for the agent contract. Owner-only.
 //
-// The completion interlock is rollout-OFF (inert) at HEAD, so on a non-interlocked run the server
-// answers 409 (ErrCompletionNotBlocked → exit 5); the CLI drives the decision honestly regardless,
-// keeping web and CLI on the one endpoint.
+// The completion interlock is on by default for unseeded Claude-harness issue runs (#1626), but a
+// Codex, seeded or kill-switched run is not interlocked, and on a non-interlocked or not-blocked
+// run the server answers 409 (ErrCompletionNotBlocked → exit 5); the CLI drives the decision
+// honestly regardless, keeping web and CLI on the one endpoint.
 func newRunDecideCmd(env Env, gf *globalFlags) *cobra.Command {
 	decide := &cobra.Command{
 		Use:   "decide <run-id>",

@@ -433,7 +433,7 @@ func TestCompletionRowsEmitWhenSet(t *testing.T) {
 	}
 }
 
-// TestCompletionRowsOmitWhenInert: a NON-interlocked run (rollout OFF) carries every completion
+// TestCompletionRowsOmitWhenInert: a NON-interlocked run (legacy, seeded, Codex, or kill-switched) carries every completion
 // field at its inert default, so completionRows returns nothing — the detail renders as today.
 func TestCompletionRowsOmitWhenInert(t *testing.T) {
 	r := apitypes.RunDTO{
@@ -473,7 +473,7 @@ func TestRunGetRendersCompletionRows(t *testing.T) {
 }
 
 // TestRunGetOmitsCompletionRows: a non-interlocked run's detail carries NONE of the completion
-// rows (the rollout-OFF / legacy case renders exactly as before).
+// rows (the non-interlocked / legacy case renders exactly as before).
 func TestRunGetOmitsCompletionRows(t *testing.T) {
 	plain := apitypes.RunDTO{
 		ID: "r1", Kind: "issue", Status: "running", Health: "ok",

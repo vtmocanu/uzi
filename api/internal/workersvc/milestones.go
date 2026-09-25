@@ -146,11 +146,13 @@ func milestonesParam(kind string, ms *[]Milestone) []byte {
 //     lead can still report them complete, or the owner decides at the finalize hold);
 //   - with milestones ABSENT, a stored `[]` candidate is likewise kept (a re-presented
 //     milestone-less gate stays `[]`);
-//   - with milestones ABSENT and a NULL stored candidate, `[]` is inferred ONLY when the stored
-//     plan_md is also NULL, i.e. this is the run's FIRST plan-bearing report. A NULL candidate
+//   - with milestones ABSENT, or an explicit `[]`, and a NULL stored candidate, `[]` is the result
+//     ONLY when the stored plan_md is also NULL, i.e. this is the run's FIRST plan-bearing report
+//     (so an explicit `[]` on the first report is honoured as `[]`). A NULL candidate
 //     beside a non-NULL stored plan_md means an earlier plan-bearing report's list was REJECTED
 //     (a first milestone-less report would have stored `[]`, and seeded-plan runs, whose plan_md
-//     predates any report, are never stamped), so the rejection is STICKY: the result stays NULL,
+//     predates any report, are never stamped), so the rejection is STICKY for any worker, whether
+//     the later report omits the list or sends an explicit `[]`: the result stays NULL,
 //     nothing freezes, and the run holds at finalize until a later report carries a valid list
 //     or the owner decides (accept/partial). On the autopilot `running` path the same reading
 //     applies: the first plan-bearing report sees a NULL stored plan_md and freezes `[]`; a later
@@ -166,8 +168,14 @@ func planMilestonesParam(run store.Run, planMd *string, ms *[]Milestone) []byte 
 	storedCandidate := priorErr == nil && len(run.MilestonesCandidate) > 0
 	if ms != nil {
 		resolved := milestonesParam(run.Kind, ms)
-		if string(resolved) == "[]" && storedCandidate && len(prior) > 0 {
-			return run.MilestonesCandidate
+		if string(resolved) == "[]" {
+			if storedCandidate && len(prior) > 0 {
+				return run.MilestonesCandidate
+			}
+			if !storedCandidate && run.PlanMd.Valid {
+				// Sticky rejection: an explicit `[]` after a rejected list reads like an absent one.
+				return nil
+			}
 		}
 		return resolved
 	}

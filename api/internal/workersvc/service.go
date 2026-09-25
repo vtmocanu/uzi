@@ -1513,13 +1513,13 @@ type CapabilityScheduleReader interface {
 }
 
 // CompletionInterlockReader is the narrow settings view createRun reads for the
-// completion-interlock rollout switch (PRD #1226 M1, D1). *settings.Cache satisfies it.
+// completion-interlock switch (PRD #1226 M1, D1; #1626). *settings.Cache satisfies it.
 // Kept its own interface (interface segregation, like CapabilityScheduleReader) so a
-// test exercises only what it uses. Optional (nil-safe): a nil reader — or a read error
-// — DEFAULTS the flag OFF (the DELIBERATE opposite of CapabilityScheduleReader's
-// default-on), so a new run is interlocked ONLY on an affirmative "true". This gate must
-// not accidentally engage a still-rolling-out feature, so both the unconfigured and the
-// unreadable case fail safe to legacy (unstamped) runs.
+// test exercises only what it uses. The SETTING defaults ON (no row = on; an explicit
+// "false" row or ENV value is the admin kill-switch), but this reader is optional and
+// fails safe: a nil reader, or any read error (settings.Cache returns one only on a cold
+// read with no valid cached snapshot), makes completionInterlockOn false, so the run is
+// created legacy (unstamped). Existing tests construct the service without it.
 type CompletionInterlockReader interface {
 	CompletionInterlockRollout(ctx context.Context) (bool, error)
 }
@@ -1581,12 +1581,12 @@ type Service struct {
 	// the flag DEFAULTS ON, so tests and deployments without a settings cache route
 	// capability-aware exactly as a live instance whose admin left the default in place.
 	capabilitySettings CapabilityScheduleReader
-	// completionInterlock reads the completion-interlock rollout switch createRun consults
-	// to decide whether to stamp completion_contract_version=1 on a new issue run (PRD
-	// #1226 M1, D1). Optional (nil-safe); set via SetCompletionInterlockSettings with the
-	// same settings cache the HTTP handlers hold. Nil ⇒ the flag DEFAULTS OFF, so tests and
-	// deployments without a settings cache create legacy (unstamped) runs exactly as before
-	// — the fail-safe direction, opposite the capability-aware default-on.
+	// completionInterlock reads the completion-interlock switch createRun consults to decide
+	// whether to stamp completion_contract_version=1 on a new unseeded Claude-harness issue
+	// run (PRD #1226 M1, D1; #1626). Optional (nil-safe); set via
+	// SetCompletionInterlockSettings with the same settings cache the HTTP handlers hold. The
+	// setting defaults ON, but a nil reader (tests, deployments without a settings cache) or a
+	// read error makes completionInterlockOn false, so such runs are created legacy (unstamped).
 	completionInterlock CompletionInterlockReader
 	// persistFail counts consecutive AppendMessages failures per run (PRD #108 M4),
 	// the signal a persistence wedge cannot suppress because the wedge IS the event
@@ -5451,23 +5451,21 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			}
 		}
 	}
-	// PRD #1226 M1 (D1): stamp the run as INTERLOCKED before its first claim when the
-	// rollout switch is on. completionInterlockOn is FAIL-SAFE OFF (nil reader or any read
-	// error → false), the opposite of the capability-aware fail-open, so this gate never
-	// accidentally engages a still-rolling-out feature. NULL (the not-interlocked legacy
-	// state) unless on. createRun only ever creates issue-kind rows, so this is inherently
+	// PRD #1226 M1 (D1), #1626: stamp the run as INTERLOCKED before its first claim when the
+	// completion-interlock switch is on (default ON; an explicit "false" row or ENV is the
+	// admin kill-switch). completionInterlockOn returns false for a nil reader or any read
+	// error, so a cold settings failure never stamps. NULL (the not-interlocked legacy state)
+	// otherwise. createRun only ever creates issue-kind rows, so this is inherently
 	// issue-scoped; the contract CONTENT is frozen later at approval / the first running
-	// report, not here.
+	// report, not here. The setting is read here, before the create tx; the stamp itself is
+	// decided inside the closure below, against the harness resolved in that tx.
 	//
 	// Issue #1626: a SEEDED-plan run (PRD #209, seed != nil) is never stamped and stays legacy.
 	// Its plan arrives at create time, the worker takes the plan-approved skip, and it never
 	// sends a plan-bearing report (no awaiting_approval, no autopilot running report carrying
 	// plan_md); a SeededPlan carries no milestone list either. Nothing would ever freeze its
 	// contract, so an interlocked seeded run would hold at finalize on every completion.
-	var completionContractVersion pgtype.Int4
-	if seed == nil && s.completionInterlockOn(ctx) {
-		completionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
-	}
+	interlockOn := seed == nil && s.completionInterlockOn(ctx)
 	run, err := s.createRunResolved(ctx, userID, explicit, func(q Store, resolved resolvedHarness) (store.Run, error) {
 		// PRD #1429 M2 (D5), #1247 override resolved INSIDE the create transaction against the
 		// D11-resolved harness (not a pre-tx guess): a rawOverride (manual/chat-start request) is
@@ -5482,6 +5480,15 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 				return store.Run{}, verr
 			}
 			effOverride = ov
+		}
+		// Issue #1626: only a CLAUDE-harness run is stamped. CodexExecutor does not run the
+		// completion-attempt loop (agent/src/codex/codex-executor.ts: "Codex does NOT enter the
+		// completion-attempt interlock"); the nudge port is #1627. An interlocked Codex run would
+		// skip the nudge and go straight to an owner hold on every incomplete completion, so a
+		// Codex run stays legacy (NULL) even with the switch on.
+		var completionContractVersion pgtype.Int4
+		if interlockOn && resolved.Harness == HarnessClaude {
+			completionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
 		}
 		return q.CreateRun(ctx, store.CreateRunParams{
 			UserID:           userID,
@@ -5534,8 +5541,8 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			// issue #857 M2: the provenance stamp threaded from each public entrypoint
 			// ("manual"/"schedule"/"autopilot"), so a run records why it fired.
 			TriggerSource: triggerSource,
-			// PRD #1226 M1 (D1): NULL (legacy) unless the rollout switch is on, in which case
-			// this stamps the run interlocked (version 1) before its first claim. Listed
+			// PRD #1226 M1 (D1), #1626: version 1 (interlocked before its first claim) only for an
+			// unseeded Claude-harness run with the switch on; NULL (legacy) otherwise. Listed
 			// explicitly per runtime.sql's 🔴 silently-omittable-narg warning.
 			CompletionContractVersion: completionContractVersion,
 			// PRD #1429 M2 (D1): the AUDITOR INVARIANT — runs.harness is stamped from the D11 result
@@ -6058,8 +6065,7 @@ type SweepResult struct {
 	// served `budget_exhausted` steer (PRD #1226 M4, D3): the post-attempt live-worker
 	// interlocked rows past their wall budget that SweepRunningTimeout's carve-out spared, now
 	// stamped so their live lead is steered into the completion hold. Set from the execrows
-	// count. Normally 0 (the completion interlock is rollout-OFF and this only fires on a spared,
-	// budget-exhausted run).
+	// count. Normally 0 (this only fires on a spared, budget-exhausted interlocked run).
 	CompletionBudgetExhausted int64
 	// CustodyReleased is the number of OPEN custody holds this pass released because
 	// their release was warranted (a completed run, or a ready capture) but never
