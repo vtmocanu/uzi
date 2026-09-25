@@ -78,6 +78,42 @@ func TestTUIBoardUsageSummaryServerValueAndStates(t *testing.T) {
 	}
 }
 
+func TestTUIBoardMarkedCostLegendRenderedAtOrdinaryWidths(t *testing.T) {
+	withVersion(t, "v0.63.0")
+	for _, tc := range []struct {
+		name  string
+		usage apitypes.SelfUsageDTO
+	}{
+		{"subscription", apitypes.SelfUsageDTO{Last7SubscriptionRunCount: 1}},
+		{"unreported", apitypes.SelfUsageDTO{Last7UnreportedRunCount: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+			m = usageReply(t, m, selfUsageMsg{reqID: m.selfUsageReqID, usage: tc.usage})
+			m.showVersion = true
+			for _, width := range []int{80, 120} {
+				m.width = width
+				footer := stripANSI(m.boardFooterLine())
+				view := stripANSI(m.View().Content)
+				if !strings.Contains(view, "$0+ 7d") {
+					t.Errorf("width %d board did not show marked cost: %q", width, view)
+				}
+				renderedFooter := view[strings.LastIndex(view, "\n")+1:]
+				for _, got := range []string{footer, renderedFooter} {
+					if !strings.Contains(got, "+ = subscription/unreported spend") ||
+						!strings.Contains(got, "enter/→ open") || !strings.Contains(got, "/ filter") ||
+						!strings.Contains(got, "q quit") || !strings.Contains(got, "v0.63.0") {
+						t.Errorf("width %d footer lost cost explanation, key hint, or version: %q", width, got)
+					}
+					if visualWidth(got) > width {
+						t.Errorf("width %d footer overflowed: %q", width, got)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestTUISelfUsageReplyOrdering(t *testing.T) {
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 	old := m.selfUsageReqID

@@ -661,6 +661,11 @@ func (m tuiModel) boardEyebrow(it boardItem) string {
 // boardFooter is the one-line key legend; key letters are tungsten (keyHint), labels faint.
 func (m tuiModel) boardFooter() string {
 	parts := []string{m.keyHint("enter/→", "open"), m.keyHint("/", "filter")}
+	markedCost := !m.board.admin && m.selfUsageReady && (m.selfUsage.Last7SubscriptionRunCount > 0 || m.selfUsage.Last7UnreportedRunCount > 0)
+	if markedCost {
+		// Keep the explanation and quit key ahead of hints that may be clipped at ordinary widths.
+		parts = append(parts, m.keyHint("q", "quit"), m.pal.faint.Render("+ = subscription/unreported spend"))
+	}
 	if m.board.admin {
 		parts = append(parts, m.keyHint("a", "my runs"))
 	} else {
@@ -673,9 +678,9 @@ func (m tuiModel) boardFooter() string {
 			parts = append(parts, m.keyHint("h", "fold done"))
 		}
 	}
-	parts = append(parts, m.keyHint("r", "refresh"), m.keyHint("?", "keys"), m.keyHint("q", "quit"))
-	if !m.board.admin && m.selfUsageReady && (m.selfUsage.Last7SubscriptionRunCount > 0 || m.selfUsage.Last7UnreportedRunCount > 0) {
-		parts = append(parts, m.pal.faint.Render("+ = subscription/unreported spend"))
+	parts = append(parts, m.keyHint("r", "refresh"), m.keyHint("?", "keys"))
+	if !markedCost {
+		parts = append(parts, m.keyHint("q", "quit"))
 	}
 	return " " + strings.Join(parts, m.pal.faint.Render(" · "))
 }
