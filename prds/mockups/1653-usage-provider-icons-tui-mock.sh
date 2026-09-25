@@ -3,8 +3,8 @@
 # Proposal: no provider icons (a terminal cannot draw the web logos). Every account is
 # named; a single faint "codex" tag leads the Codex group (Claude stays untagged, as
 # today); the repeated default "codex" bucket name is dropped; P/S become 5h/7d.
-#   bash usage-provider-icons-tui-mock.sh             colour
-#   NO_COLOR=1 bash usage-provider-icons-tui-mock.sh  tint stripped
+#   bash 1653-usage-provider-icons-tui-mock.sh             colour
+#   NO_COLOR=1 bash 1653-usage-provider-icons-tui-mock.sh  tint stripped
 set -u
 
 if [[ -n "${NO_COLOR:-}" ]]; then
