@@ -17,7 +17,7 @@ showed anything, and nothing pushed a notice to anyone.
 It surfaces five ways:
 
 - **Admin → Health**, the last tab in the admin strip (after Branding), laid
-  out triage first ([PRD #1648](../prds/1648-admin-health-triage-first.md)),
+  out triage first ([PRD #1648](../prds/done/1648-admin-health-triage-first.md)),
   always in the same order:
   - a header line with "Checked N s ago" and a **Copy diagnostics** button;
   - when anything needs attention, an attention card: the verdict, a count
