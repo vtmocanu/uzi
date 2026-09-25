@@ -1521,9 +1521,14 @@ describe("input receipts", () => {
         (via === "cancel" ? cancel : report).abort();
         await assert.rejects(waiting, (err: Error) => err.name === "ReceiptWaitInterrupted", via);
         assert.ok(Date.now() - started < 200, `${via}: the abort ended the wait before the applied reply`);
-        // Already aborted: a later report is refused at once while the receipt is uncertain.
-        await assert.rejects(ch.awaitReceiptSettlement(report.signal.aborted ? report.signal : undefined),
-          (err: Error) => err.name === "ReceiptWaitInterrupted");
+        if (via === "report") {
+          // The report's own signal, already aborted: refused at once while the receipt is uncertain.
+          await assert.rejects(ch.awaitReceiptSettlement(report.signal), (err: Error) => err.name === "ReceiptWaitInterrupted");
+        } else {
+          // The shared controller aborts once and stays aborted; that stale abort says nothing
+          // about a later report, which waits for the applied receipt and then goes out.
+          await ch.awaitReceiptSettlement();
+        }
       } finally {
         await ch.stop();
       }
@@ -1582,6 +1587,34 @@ describe("input receipts", () => {
       } finally {
         await ch.stop();
       }
+    }
+  });
+
+  it("after a declined `now` park, a later follow-up's report still waits for its APPLIED", async () => {
+    // A `now` pause aborts the shared controller once; the park is declined and the turn restarts
+    // with the controller still aborted. A follow-up routed afterwards must still hold its report.
+    const pause: UserInput = { id: 7, kind: "pause", body: "now" };
+    const followUp: UserInput = { id: 8, kind: "follow_up", body: "eight" };
+    let gets = 0;
+    let appliedFollowUp = false;
+    const cancel = new AbortController();
+    const client = {
+      getInputs: async () => { gets++; return { inputs: gets === 1 ? [pause] : gets === 2 ? [followUp] : [] }; },
+      ackInputs: async (_run: string, ids: number[]) => ({ inputs: ids[0] === 7 ? [pause] : [followUp], active: true }),
+      applyInputs: async (_run: string, ids: number[]) => {
+        if (ids[0] === 8) { await tick(150); appliedFollowUp = true; }
+        return { inputs: ids[0] === 7 ? [pause] : [followUp], active: true };
+      },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
+    ch.start();
+    try {
+      await until(() => cancel.signal.aborted);
+      assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "eight" });
+      await ch.awaitReceiptSettlement();
+      assert.strictEqual(appliedFollowUp, true, "the running report waited for the follow-up's APPLIED");
+    } finally {
+      await ch.stop();
     }
   });
 

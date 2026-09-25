@@ -304,9 +304,13 @@ export class SteeringChannel {
     // Abort-aware: a cancel, pause or switch trip (the shared controller) or the report's own
     // signal ends the wait by REJECTING, so the report does not go out without the applied receipt
     // its server guard needs. Only the explicit `failed` path skips this wait (the runner).
-    const signals = [this.cancel.signal, signal].filter((s): s is AbortSignal => s !== undefined);
-    const aborted = signals.find((s) => s.aborted);
-    if (aborted) throw new ReceiptWaitInterrupted(aborted.reason);
+    // The shared controller aborts ONCE and stays aborted: a declined `now` park restarts the turn
+    // and a given-up credential switch continues in place, so its `aborted` flag says nothing about
+    // this report. React to it only when it aborts DURING the wait (a listener on an already-aborted
+    // signal never fires); a sticky cancel is the one earlier abort that still refuses the report.
+    if (signal?.aborted) throw new ReceiptWaitInterrupted(signal.reason);
+    if (this.cancelled) throw new ReceiptWaitInterrupted(this.cancel.signal.reason);
+    const signals = [this.cancel.signal, signal].filter((s): s is AbortSignal => s !== undefined && !s.aborted);
     await new Promise<void>((resolve, reject) => {
       const done = (): void => {
         clearTimeout(timer);
