@@ -195,6 +195,30 @@ func TestRunExportMultipleAvailableListsFullIDs(t *testing.T) {
 	}
 }
 
+// TestRunExportMultipleAvailableQuiet (issue #1417): --quiet does not suppress the capture
+// listing, since it is part of the error: both full ids still reach stderr.
+func TestRunExportMultipleAvailableQuiet(t *testing.T) {
+	idA, idB := longCaptureID(1), longCaptureID(2)
+	a, b := []byte("bundle-A"), []byte("bundle-BB")
+	archives := []apitypes.RecoveryArchiveDTO{availableCapture(idA, a), availableCapture(idB, b)}
+	fc := &uzicli.FakeClient{
+		RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
+			longRunID: {Supported: true, Archives: archives},
+		},
+		RecoveryBytes: map[string][]byte{idA: a, idB: b},
+	}
+	dest := filepath.Join(t.TempDir(), "out.bundle")
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "export", longRunID, "--output", dest, "--quiet")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage) (stderr: %s)", code, uzicli.ExitUsage, stderr)
+	}
+	assertFullIDsListed(t, stderr,
+		"run "+longRunID+" has 2 recovery archives available; choose one with --capture <id>:", archives)
+	if len(fc.RecoveryDownloadCalls) != 0 {
+		t.Errorf("no download on an ambiguous selection; got %v", fc.RecoveryDownloadCalls)
+	}
+}
+
 // TestRunExportMultipleAvailableJSON: under --json the capture listing is emitted to stdout
 // as a JSON array of the capture DTOs, and the exit is still the usage error.
 func TestRunExportMultipleAvailableJSON(t *testing.T) {

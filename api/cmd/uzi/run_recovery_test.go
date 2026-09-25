@@ -72,6 +72,99 @@ func TestRunRecoveryEmptyJSON(t *testing.T) {
 	}
 }
 
+// TestRunRecoveryJSONCaptures (issue #1417) proves --json attaches each hold's captures, in
+// archive order, joined on hold_id: a capture reserved under another hold, or with no hold_id
+// (an older server), is attached nowhere, and the hold's own keys stay flat.
+func TestRunRecoveryJSONCaptures(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		RecoveryHoldsResult: recoveryHoldsFixture(),
+		RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
+			"run1": {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{
+				{ID: "cap-1", HoldID: "hold-run1-gen1", State: "available", SourceSha: "aaaa", ByteSize: i64(8)},
+				{ID: "cap-other", HoldID: "hold-run1-gen0", State: "expired", SourceSha: "bbbb"},
+				{ID: "cap-2", HoldID: "hold-run1-gen1", State: "needs_action", SourceSha: "cccc"},
+				{ID: "cap-legacy", State: "available", SourceSha: "dddd"},
+			}},
+		},
+	}
+	out, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", "run1", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, errb)
+	}
+	var holds []struct {
+		ID        string `json:"id"`
+		Attention string `json:"attention"`
+		Captures  []struct {
+			ID        string `json:"id"`
+			State     string `json:"state"`
+			SourceSha string `json:"source_sha"`
+			ByteSize  *int64 `json:"byte_size"`
+		} `json:"captures"`
+	}
+	if err := json.Unmarshal([]byte(out), &holds); err != nil {
+		t.Fatalf("run recovery --json is not a hold array: %v\n%s", err, out)
+	}
+	if len(holds) != 1 || holds[0].ID != "hold-run1-gen1" || holds[0].Attention != "source_only" {
+		t.Fatalf("run recovery --json = %+v, want run1's single hold with its flat keys", holds)
+	}
+	caps := holds[0].Captures
+	if len(caps) != 2 || caps[0].ID != "cap-1" || caps[1].ID != "cap-2" {
+		t.Fatalf("captures = %+v, want exactly cap-1 then cap-2", caps)
+	}
+	if caps[0].State != "available" || caps[0].SourceSha != "aaaa" || caps[0].ByteSize == nil || *caps[0].ByteSize != 8 {
+		t.Errorf("cap-1 metadata wrong: %+v", caps[0])
+	}
+	if caps[1].ByteSize != nil {
+		t.Errorf("cap-2 has no byte size, want byte_size omitted; got %d", *caps[1].ByteSize)
+	}
+}
+
+// TestRunRecoveryJSONNoCaptures proves a hold with no captures carries "captures": [] (never
+// null), so a consuming agent iterates it unconditionally.
+func TestRunRecoveryJSONNoCaptures(t *testing.T) {
+	fc := &uzicli.FakeClient{RecoveryHoldsResult: recoveryHoldsFixture()}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", "run1", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, `"captures": []`) {
+		t.Errorf("a capture-less hold should emit \"captures\": []; got:\n%s", out)
+	}
+}
+
+// TestRunRecoveryJSONArchivesError proves a failed archives read fails --json rather than
+// emitting holds with silently empty captures.
+func TestRunRecoveryJSONArchivesError(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		RecoveryHoldsResult: recoveryHoldsFixture(),
+		RecoveryArchivesErr: uzicli.Exitf(uzicli.ExitGeneric, "archives read failed"),
+	}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", "run1", "--json")
+	if code == uzicli.ExitOK {
+		t.Fatalf("exit = 0 on an archives read error, want non-zero; stdout=%q", out)
+	}
+	if strings.TrimSpace(out) != "" {
+		t.Errorf("a failed archives read must print no holds; stdout=%q", out)
+	}
+}
+
+// TestRunRecoveryNoArchivesReadWithoutNeed proves the archives are read only when they are
+// joined: the human table and a --json run with no holds both succeed with the read failing.
+func TestRunRecoveryNoArchivesReadWithoutNeed(t *testing.T) {
+	for _, args := range [][]string{
+		{"run", "recovery", "run1"},
+		{"run", "recovery", "run-none", "--json"},
+	} {
+		fc := &uzicli.FakeClient{
+			RecoveryHoldsResult: recoveryHoldsFixture(),
+			RecoveryArchivesErr: uzicli.Exitf(uzicli.ExitGeneric, "archives read failed"),
+		}
+		if _, errb, code := runCLI(t, fakeEnv(fc), args...); code != uzicli.ExitOK {
+			t.Errorf("%v: exit = %d, want 0 (no archives read needed); stderr=%q", args, code, errb)
+		}
+	}
+}
+
 // TestRunDiscardRequiresHold proves `uzi run discard <run-id>` with no --hold is a usage error
 // that mutates nothing.
 func TestRunDiscardRequiresHold(t *testing.T) {

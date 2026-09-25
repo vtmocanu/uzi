@@ -60,6 +60,7 @@ func captureToDTO(c store.RecoveryCapture) apitypes.RecoveryArchiveDTO {
 	out := apitypes.RecoveryArchiveDTO{
 		ID:               c.ID.String(),
 		RunID:            c.RunID.String(),
+		HoldID:           c.HoldID.String(),
 		State:            c.State,
 		SourceSha:        c.SourceSha,
 		PrerequisiteShas: c.PrerequisiteShas,

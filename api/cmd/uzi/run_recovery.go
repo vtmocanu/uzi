@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -33,7 +34,9 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			"is available, or discard the held source with `run discard <run-id> --hold <hold-id> " +
 			"--yes`. An `archive_ready` hold releases itself once its archive is durable; `active` is " +
 			"healthy protection of a still-running run and needs nothing.\n\n" +
-			"--json emits the run's raw hold DTOs.",
+			"--json emits the run's raw hold DTOs, each with a `captures` array listing that " +
+			"hold's recovery captures (id, state, source_sha, byte_size, created_at); a capture id " +
+			"is what `run export --capture` takes.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)
@@ -52,24 +55,71 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 					forRun = append(forRun, h)
 				}
 			}
-			return renderRunRecovery(env, gf, runID, forRun)
+			// --json joins each hold's captures (#1417) so an agent reads the capture ids as
+			// data. The human table is unchanged and makes no extra call; a run with no holds
+			// has nothing to join onto, so it skips the archives read too.
+			var archives []apitypes.RecoveryArchiveDTO
+			if gf.json && len(forRun) > 0 {
+				summary, err := c.RecoveryArchives(cmd.Context(), runID)
+				if err != nil {
+					return err
+				}
+				archives = summary.Archives
+			}
+			return renderRunRecovery(env, gf, runID, forRun, archives)
 		},
 	}
 	return recovery
 }
 
-// renderRunRecovery emits a run's custody holds. --json prints the raw filtered hold DTOs;
-// the human form prints one table row per hold with its exact id, generation, disposition and
+// recoveryHoldCapture is one capture listed under its hold in `run recovery --json` (#1417):
+// the metadata an agent needs to pick a capture for `run export --capture`, nothing more.
+type recoveryHoldCapture struct {
+	ID        string    `json:"id"`
+	State     string    `json:"state"`
+	SourceSha string    `json:"source_sha"`
+	ByteSize  *int64    `json:"byte_size,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// recoveryHoldJSON is one hold in `run recovery --json`: the hold DTO's keys, flat and
+// unchanged, plus the captures reserved under it.
+type recoveryHoldJSON struct {
+	apitypes.RecoveryCustodyHoldDTO
+	Captures []recoveryHoldCapture `json:"captures"`
+}
+
+// holdsWithCaptures attaches each archive to the hold whose id it names, in archive order.
+// Every hold gets a non-nil captures slice, so the JSON is [] and never null. An archive
+// whose hold_id is empty (a server predating the field) or names no listed hold is attached
+// nowhere.
+func holdsWithCaptures(holds []apitypes.RecoveryCustodyHoldDTO, archives []apitypes.RecoveryArchiveDTO) []recoveryHoldJSON {
+	out := make([]recoveryHoldJSON, 0, len(holds))
+	for _, h := range holds {
+		caps := []recoveryHoldCapture{}
+		for _, a := range archives {
+			if a.HoldID == "" || a.HoldID != h.ID {
+				continue
+			}
+			caps = append(caps, recoveryHoldCapture{
+				ID: a.ID, State: a.State, SourceSha: a.SourceSha, ByteSize: a.ByteSize, CreatedAt: a.CreatedAt,
+			})
+		}
+		out = append(out, recoveryHoldJSON{RecoveryCustodyHoldDTO: h, Captures: caps})
+	}
+	return out
+}
+
+// renderRunRecovery emits a run's custody holds. --json prints the filtered hold DTOs, each
+// with its captures joined from archives; the human form prints one table row per hold with its exact id, generation, disposition and
 // capture state, plus a one-line hint when a hold needs an owner decision.
-func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.RecoveryCustodyHoldDTO) error {
+func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.RecoveryCustodyHoldDTO,
+	archives []apitypes.RecoveryArchiveDTO) error {
 	p := env.printer(gf)
 	if p.Format == uzicli.FormatJSON {
 		// Never emit a null slice: an empty result is [] so a consuming agent iterates it
 		// unconditionally.
-		if holds == nil {
-			holds = []apitypes.RecoveryCustodyHoldDTO{}
-		}
-		return p.JSON(holds)
+		return p.JSON(holdsWithCaptures(holds, archives))
 	}
 	if len(holds) == 0 {
 		if !gf.quiet {

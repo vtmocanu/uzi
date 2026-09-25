@@ -2159,6 +2159,7 @@ describe("RunView landing hint (issue #1418)", () => {
     return {
       id: "cap-ok",
       run_id: "r1",
+      hold_id: "h1",
       state: "available",
       source_sha: "0123456789abcdef0123456789abcdef01234567",
       created_at: "2026-09-13T00:00:00Z",

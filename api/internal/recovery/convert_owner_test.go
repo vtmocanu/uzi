@@ -110,3 +110,13 @@ func TestCustodyHoldToDTO(t *testing.T) {
 		t.Errorf("released ReleasedAt = %v, want %v", relDTO.ReleasedAt, releasedAt)
 	}
 }
+
+// TestCaptureToDTOHoldID (issue #1417) proves the owner archive DTO names the custody hold the
+// capture was reserved under, so `uzi run recovery --json` can list each hold's captures.
+func TestCaptureToDTOHoldID(t *testing.T) {
+	id, runID, holdID := uuid.New(), uuid.New(), uuid.New()
+	got := captureToDTO(store.RecoveryCapture{ID: id, RunID: runID, HoldID: holdID, State: "available", SourceSha: "abc"})
+	if got.ID != id.String() || got.RunID != runID.String() || got.HoldID != holdID.String() {
+		t.Errorf("identity fields wrong: %+v", got)
+	}
+}

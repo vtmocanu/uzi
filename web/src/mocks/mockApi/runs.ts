@@ -854,6 +854,7 @@ export const runsApi = {
             {
               id: capId,
               run_id: id,
+              hold_id: `${id}-hold1`,
               state: "available",
               source_sha: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
               attempted_head_sha: "f0e1d2c3b4a5968778695a4b3c2d1e0f01234567",

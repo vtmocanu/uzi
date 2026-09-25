@@ -10,8 +10,9 @@ import "time"
 
 // RecoveryArchiveDTO is one owner-visible capture's metadata (PRD #1296 D7). It carries
 // NO raw bytes and no idempotency key — only what the run page and `uzi run export`
-// render: the capture id, its run, lifecycle state, the original committed head H
-// (source_sha), the provenance attempted head H' (attempted_head_sha, absent when the run
+// render: the capture id, its run, the custody hold it was reserved under (hold_id, so
+// `uzi run recovery --json` can list each hold's captures, #1417), lifecycle state, the
+// original committed head H (source_sha), the provenance attempted head H' (attempted_head_sha, absent when the run
 // never attempted a publish), the byte manifest facts (byte_size/checksum, absent until
 // bound), a bounded sanitized reason, the resolved prerequisite closure, and the ready
 // expiry (absent until the artifact is available). Every optional field is omitempty, so
@@ -19,6 +20,7 @@ import "time"
 type RecoveryArchiveDTO struct {
 	ID               string     `json:"id"`
 	RunID            string     `json:"run_id"`
+	HoldID           string     `json:"hold_id"`
 	State            string     `json:"state"`
 	SourceSha        string     `json:"source_sha"`
 	AttemptedHeadSha *string    `json:"attempted_head_sha,omitempty"`
