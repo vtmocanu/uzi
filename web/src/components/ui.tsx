@@ -373,6 +373,51 @@ export function Badge({
   );
 }
 
+// CountPill is the small solid count pill the sidebar nav badges and the health attention
+// pips share (PRD #1648 D9), so the two cannot drift in size, cap or contrast. The count
+// caps at "99+". `label` is the accessible name and must say what the number MEANS ("3
+// unread", "2 health checks need attention: ..."); the bare number alone is not enough.
+//
+// text-on-brand, NOT text-white, on every tone. Measured 2.69:1 for white on bg-danger at
+// 10px/600 against 8.27:1 for the Notifications and Judge badges: the badge whose entire
+// purpose is to be noticed mid-incident was the only sidebar badge failing AA. The `warn`
+// tone, measured from the theme tokens (WCAG relative luminance): white on --warn
+// (154 74 5) = 6.26:1 on the light themes; 26 16 8 on 251 191 36 = 11.22:1 on Ember (and
+// Hall's dark sidebar remap); 2 6 23 on 251 191 36 = 12.08:1 on Mission. All clear AA.
+export type CountPillTone = "count" | "alert" | "warn";
+
+const COUNT_PILL_TONES: Record<CountPillTone, string> = {
+  count: "bg-brand text-on-brand",
+  alert: "bg-danger text-on-brand",
+  warn: "bg-warn text-on-brand",
+};
+
+export function CountPill({
+  count,
+  tone = "count",
+  label,
+  className,
+}: {
+  count: number;
+  tone?: CountPillTone;
+  label: string;
+  // Layout only (e.g. `ml-auto` at a nav call site); the pill's own look is fixed here.
+  className?: string;
+}) {
+  return (
+    <span
+      aria-label={label}
+      className={cx(
+        className,
+        "min-w-[1.25rem] rounded-full px-1.5 py-0.5 text-center text-[10px] font-semibold leading-none",
+        COUNT_PILL_TONES[tone],
+      )}
+    >
+      {count > 99 ? "99+" : count}
+    </span>
+  );
+}
+
 // StatusPill renders a run status with a colored dot.
 //
 // Exported so runBadge.test.ts can assert the two tone surfaces agree. runBadge.ts

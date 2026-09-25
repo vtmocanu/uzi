@@ -7,6 +7,7 @@ import { AppShell, forgeIcon } from "./AppShell";
 import { GitIcon, GitLabIcon } from "./icons";
 import { api } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
+import { incidentDoc, unknownDoc } from "../mocks/data/health";
 
 // AppShell joins repos (board children) with forge connections web-side and gates
 // the signed-in shell on useAuth; both are mocked so these stay page-level and
@@ -59,6 +60,9 @@ vi.mock("../lib/api", () => ({
     // scope and vitest isolates per file, so a second shape could not be driven
     // through this one.
     version: vi.fn().mockResolvedValue({ version: "9.9.9-test", founded: "2026-07-03" }),
+    // The shared HealthStatusProvider (PRD #1484 M5) fetches only for an admin; the health
+    // pip tests below set a document, every other test runs as a non-admin and never calls it.
+    getAdminHealth: vi.fn(),
   },
 }));
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
@@ -579,5 +583,36 @@ describe("the collapsed rail keeps the badge's meaning (BLK-4)", () => {
 
     // The tone-bearing string must still be reachable by name.
     expect(await screen.findByText("2 needing attention")).toBeTruthy();
+  });
+});
+
+// PRD #1648 D9: the sidebar Admin item's health pip. Expanded it is a count pill whose
+// accessible name lists every non-zero severity; on the collapsed rail the count and the
+// same wording survive as sr-only text next to the decorative severity dot.
+describe("the Admin item's health pip (PRD #1648 D9)", () => {
+  function asAdmin() {
+    const auth = vi.mocked(useAuth)();
+    vi.mocked(useAuth).mockReturnValue({ ...auth, user: { ...user, is_admin: true } });
+  }
+
+  it("expanded: a count pill named by severity (danger and warning)", async () => {
+    asAdmin();
+    mockApi.getAdminHealth.mockResolvedValue(incidentDoc()); // 3 danger + 1 warn
+    renderShell("/dashboard");
+    const pip = await screen.findByLabelText("4 health checks need attention: 3 danger, 1 warning");
+    expect(within(pip).getByText("4")).toBeTruthy();
+    expect(screen.getByRole("link", { name: /Admin/ }).contains(pip)).toBe(true);
+  });
+
+  it("collapsed rail: the worded count survives as sr-only text, unknown named as unknown", async () => {
+    asAdmin();
+    mockApi.getAdminHealth.mockResolvedValue(unknownDoc()); // 4 unknown
+    renderShell("/dashboard");
+    await screen.findByLabelText("4 health checks need attention: 4 unknown");
+    fireEvent.click(screen.getByRole("button", { name: /collapse sidebar/i }));
+    const text = await screen.findByText("4 health checks need attention: 4 unknown");
+    // The rail carries no visible pill: the text is the sr-only span inside the Admin link.
+    expect(text.className).toContain("sr-only");
+    expect(screen.queryByLabelText(/health checks? needs? attention/)).toBeNull();
   });
 });

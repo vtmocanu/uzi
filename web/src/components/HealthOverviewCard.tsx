@@ -13,7 +13,7 @@ import { Link } from "react-router-dom";
 import { attentionChecks, healthVerdict } from "../lib/healthView";
 import { formatAgo } from "../lib/rateLimits";
 import { useHealthStatus } from "../lib/useAdminHealth";
-import { SeverityPill } from "./healthSeverity";
+import { SeverityBadge } from "./healthSeverity";
 import { cx } from "./ui";
 
 // "for 38m" from an RFC3339 `since`, or empty when the check carries none. Static (no live
@@ -52,7 +52,7 @@ export function HealthOverviewCard() {
         className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 rounded-xl border border-edge bg-surface px-4 py-3"
       >
         <span className="flex flex-wrap items-center gap-2">
-          <SeverityPill severity="ok" />
+          <SeverityBadge severity="ok" />
           <span className="text-sm text-fg">
             System health: all {doc.counts.ok} {doc.counts.ok === 1 ? "check" : "checks"} passing
             {doc.counts.na > 0 ? `, ${doc.counts.na} not applicable` : ""}
@@ -77,7 +77,7 @@ export function HealthOverviewCard() {
     >
       <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
         <span className="flex min-w-0 flex-wrap items-center gap-2">
-          <SeverityPill severity={danger ? "danger" : "warn"} />
+          <SeverityBadge severity={danger ? "danger" : "warn"} />
           <span className="text-sm font-semibold text-fg">System health: {verdict.title}</span>
         </span>
         <OpenHealthLink />
@@ -85,7 +85,7 @@ export function HealthOverviewCard() {
       <ul className="space-y-1.5">
         {top.map((c) => (
           <li key={c.id} className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-            <SeverityPill severity={c.severity} />
+            <SeverityBadge severity={c.severity} />
             <span className="min-w-0 flex-1 text-sm">
               <span className="font-medium text-fg">{c.title}</span>{" "}
               <span className="text-muted">{c.summary}</span>

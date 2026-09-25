@@ -8,8 +8,8 @@
 import { useEffect, useRef } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import type { ReactNode } from "react";
-import { cx, PageHeader } from "./ui";
-import { HealthPip } from "./healthSeverity";
+import { CountPill, cx, PageHeader } from "./ui";
+import { healthPipLabel } from "../lib/healthView";
 import { useHealthStatus } from "../lib/useAdminHealth";
 
 // Health is LAST (PRD #1484 D1), after Branding — its entry points are the sidebar pip
@@ -30,8 +30,11 @@ export function AdminShell({ description, children }: { description: ReactNode; 
   // and the page read the ONE shared HealthStatusProvider mounted in AppShell (PRD #1484 M5),
   // so there is a single poll app-wide and the isAdmin gate lives in the provider alone.
   const { doc: health, attentionCount: attention } = useHealthStatus();
-  // Danger dominates the pip colour, else warn (warn covers unknown, which ranks as warn).
+  // Danger dominates the pip tone, else warn (warn covers unknown, which ranks as warn). The
+  // label names every non-zero severity in words (PRD #1648 D9), so the tone is never the
+  // only carrier of severity.
   const pipDanger = (health?.counts.danger ?? 0) > 0;
+  const pipLabel = health ? healthPipLabel(health.counts) : "";
 
   // On a narrow tab strip the row scrolls (overflow-x-auto); keep the ACTIVE tab in view so
   // Health — the last, rightmost tab — is reachable without a horizontal scroll the user
@@ -76,7 +79,9 @@ export function AdminShell({ description, children }: { description: ReactNode; 
             }
           >
             {t.label}
-            {t.pip && attention > 0 && <HealthPip count={attention} danger={pipDanger} />}
+            {t.pip && attention > 0 && (
+              <CountPill count={attention} tone={pipDanger ? "alert" : "warn"} label={pipLabel} />
+            )}
           </NavLink>
         ))}
       </div>

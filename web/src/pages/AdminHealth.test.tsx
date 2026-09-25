@@ -67,7 +67,7 @@ describe("AdminHealth — the five states", () => {
     // Every group header reads "all passing".
     expect(screen.getAllByText("all passing").length).toBe(5);
     // No tab pip when nothing needs attention.
-    expect(screen.queryByLabelText(/need attention/)).toBeNull();
+    expect(screen.queryByLabelText(/health checks? needs? attention/)).toBeNull();
     // A danger/unknown-only expansion rule: with all ok, nothing is force-open.
     expect(checkDetails(container, "db").open).toBe(false);
   });
@@ -85,7 +85,7 @@ describe("AdminHealth — the five states", () => {
     expect(screen.getByRole("link", { name: "Paused schedules" })).toBeTruthy();
     // Tab pip: present, warning-worded accessible name, count 2 (non-ok/non-na count). Awaited
     // because AdminShell's own useAdminHealth resolves independently of the page's.
-    const pip = await screen.findByLabelText(/checks need attention \(warning\)/);
+    const pip = await screen.findByLabelText("2 health checks need attention: 2 warning");
     expect(within(pip).getByText("2")).toBeTruthy();
   });
 
@@ -96,7 +96,7 @@ describe("AdminHealth — the five states", () => {
     expect(screen.getByRole("heading", { name: "uzi cannot run work: 3 blocking checks" })).toBeTruthy();
     expect(screen.getAllByText("Danger").length).toBeGreaterThan(0);
     // Tab pip worded as danger, count 4 (3 danger + 1 warn). Awaited for the same reason.
-    const pip = await screen.findByLabelText(/checks need attention \(danger\)/);
+    const pip = await screen.findByLabelText("4 health checks need attention: 3 danger, 1 warning");
     expect(within(pip).getByText("4")).toBeTruthy();
     // fleet.roll is danger, so its row renders EXPANDED.
     expect(checkDetails(container, "fleet.roll").open).toBe(true);
@@ -123,7 +123,7 @@ describe("AdminHealth — the five states", () => {
     // fleet.roll, controller.report and slack.socket are N/A (never green, never gone).
     expect(screen.getAllByText("N/A").length).toBeGreaterThanOrEqual(3);
     // A check that cannot apply still carries a signal, but does not count as attention.
-    expect(screen.queryByLabelText(/need attention/)).toBeNull();
+    expect(screen.queryByLabelText(/health checks? needs? attention/)).toBeNull();
   });
 });
 

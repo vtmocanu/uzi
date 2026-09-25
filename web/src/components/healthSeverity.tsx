@@ -1,63 +1,120 @@
-// Shared severity presentation for the admin-health surfaces (PRD #1484). Severity is
-// encoded in FORM as well as colour: a distinct glyph and a text label per severity, so a
-// screen reader and a colour-blind admin both get the signal — never colour alone. The
-// Health page, the Overview admin card, the Health tab pip and the sidebar Admin pip all
-// render from here so the language is identical across every surface.
+// Shared severity presentation for the admin-health surfaces (PRD #1484, reshaped by PRD
+// #1648 D6). Severity is encoded in FORM as well as colour: a distinct SHAPE and a text word
+// per severity, so a screen reader and a colour-blind admin both get the signal, never
+// colour alone. The shape is an 8px inline SVG drawn in `currentColor` (no font glyph, whose
+// size and baseline drift per typeface):
+//
+//   ok      filled circle        warn     filled triangle      danger   filled diamond
+//   unknown hollow circle        na       dashed hollow circle
+//
+// OK deliberately has a second, quieter mark: the `check` variant (no fill, no border), used
+// on passing inventory chips so they do not compete with the attention marks.
+//
+// SeverityBadge (the shared `Badge` anatomy + shape + word) is the labelled mark every health
+// surface renders; SeverityShape is exported on its own for the attention band, the non-OK
+// inventory chips and the danger banner. The attention pips (sidebar Admin item and the
+// Admin tab strip) use `CountPill` from ui.tsx with `healthPipLabel` from lib/healthView.
 
-import { cx } from "./ui";
+import { Badge, cx, type BadgeTone } from "./ui";
 
 export type Sev = "ok" | "warn" | "danger" | "unknown" | "na";
 
-// Per-severity presentation: a glyph (form), a word (accessible text), and the pill classes.
-// The glyph is aria-hidden; the word is the accessible name a test asserts on.
-export const SEV: Record<Sev, { label: string; glyph: string; pill: string }> = {
-  ok: { label: "OK", glyph: "●", pill: "border-ok/30 bg-ok/10 text-ok" },
-  warn: { label: "Warn", glyph: "▲", pill: "border-warn/40 bg-warn/10 text-warn" },
-  danger: { label: "Danger", glyph: "◆", pill: "border-danger/45 bg-danger/10 text-danger" },
-  unknown: { label: "Unknown", glyph: "?", pill: "border-dashed border-edge-strong bg-raised text-muted" },
-  na: { label: "N/A", glyph: "○", pill: "border-edge bg-transparent text-faint" },
+// Per-severity presentation. `label` is the visible word tests assert on; `tone` is the
+// shared Badge tone. `glyph` and `pill` are LEGACY fields read only by pages/AdminHealth.tsx
+// (its tally pills and verdict icon) until PRD #1648 M3 rewrites that page on SeverityBadge;
+// drop them with it.
+export const SEV: Record<Sev, { label: string; tone: BadgeTone; glyph: string; pill: string }> = {
+  ok: { label: "OK", tone: "ok", glyph: "●", pill: "border-ok/30 bg-ok/10 text-ok" },
+  warn: { label: "Warn", tone: "warning", glyph: "▲", pill: "border-warn/40 bg-warn/10 text-warn" },
+  danger: { label: "Danger", tone: "danger", glyph: "◆", pill: "border-danger/45 bg-danger/10 text-danger" },
+  unknown: { label: "Unknown", tone: "neutral", glyph: "?", pill: "border-dashed border-edge-strong bg-raised text-muted" },
+  na: { label: "N/A", tone: "neutral", glyph: "○", pill: "border-edge bg-transparent text-faint" },
 };
 
 export function sevOf(s: string): Sev {
   return (s in SEV ? s : "unknown") as Sev;
 }
 
-// SeverityPill is the labelled pill (glyph + word) the Health page and the Overview card
-// share.
-export function SeverityPill({ severity }: { severity: string }) {
+// The drawn form per severity, on an 8x8 viewBox. Hollow shapes inset their stroke so it
+// is not clipped at the viewBox edge.
+function shapePath(s: Sev) {
+  switch (s) {
+    case "ok":
+      return <circle cx="4" cy="4" r="4" fill="currentColor" />;
+    case "warn":
+      return <polygon points="4,0.4 7.9,7.6 0.1,7.6" fill="currentColor" />;
+    case "danger":
+      return <polygon points="4,0 8,4 4,8 0,4" fill="currentColor" />;
+    case "unknown":
+      return <circle cx="4" cy="4" r="3.25" fill="none" stroke="currentColor" strokeWidth="1.5" />;
+    case "na":
+      return (
+        <circle cx="4" cy="4" r="3.25" fill="none" stroke="currentColor" strokeWidth="1.5" strokeDasharray="1.7 1.3" />
+      );
+  }
+}
+
+// SeverityShape is the bare mark. Decorative (aria-hidden) by default, because it normally
+// sits next to its word; pass `label` when the shape stands alone and must carry the
+// severity itself (then it is role="img" with that aria-label). `variant="check"` draws the
+// quiet OK check mark instead of the severity shape. `size` is the edge in px (default 8,
+// the h-2 w-2 mark; the all-clear icon passes a larger one).
+export function SeverityShape({
+  severity,
+  variant = "shape",
+  label,
+  size,
+  className,
+}: {
+  severity: string;
+  variant?: "shape" | "check";
+  label?: string;
+  size?: number;
+  className?: string;
+}) {
   const s = sevOf(severity);
-  const m = SEV[s];
+  const a11y = label ? { role: "img", "aria-label": label } : { "aria-hidden": true as const };
   return (
-    <span
-      className={cx(
-        "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-semibold whitespace-nowrap",
-        m.pill,
-      )}
+    <svg
+      viewBox="0 0 8 8"
+      focusable="false"
+      {...a11y}
+      width={size}
+      height={size}
+      className={cx("inline-block shrink-0", size == null && "h-2 w-2", className)}
     >
-      <span aria-hidden="true" className="w-2.5 text-center text-[10px]">
-        {m.glyph}
-      </span>
-      {m.label}
-    </span>
+      {variant === "check" ? (
+        <path
+          d="M1 4.3 3.2 6.4 7 1.8"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.4"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      ) : (
+        shapePath(s)
+      )}
+    </svg>
   );
 }
 
-// HealthPip is the "needs attention" marker the Health tab (AdminShell) and the sidebar
-// Admin link both carry. A coloured dot (form: a round pip) plus the attention count.
-// Severity is NOT colour-only — the count is visible text and the aria-label names the
-// severity in words, so a screen reader and a colour-blind admin both get the signal.
-export function HealthPip({ count, danger }: { count: number; danger: boolean }) {
-  const word = danger ? "danger" : "warning";
+// SeverityBadge is the labelled mark (shape + optional count + word) on the shared Badge
+// anatomy. An unrecognised severity renders as Unknown (a stale or unexpected signal is
+// never shown as green).
+export function SeverityBadge({ severity, count }: { severity: string; count?: number }) {
+  const s = sevOf(severity);
+  const m = SEV[s];
   return (
-    <span
-      className={cx(
-        "inline-flex items-center gap-1 rounded-full px-1.5 text-[11px] font-semibold tabular-nums",
-        danger ? "bg-danger/15 text-danger" : "bg-warn/15 text-warn",
-      )}
-      aria-label={`${count} health ${count === 1 ? "check" : "checks"} need attention (${word})`}
-    >
-      <span aria-hidden="true" className={cx("h-1.5 w-1.5 rounded-full", danger ? "bg-danger" : "bg-warn")} />
-      {count}
-    </span>
+    <Badge tone={m.tone}>
+      <SeverityShape severity={s} />
+      <span>{count != null ? `${count} ${m.label}` : m.label}</span>
+    </Badge>
   );
+}
+
+// SeverityPill is the pre-#1648 name, kept only because pages/AdminHealth.tsx still imports
+// it; it now renders the SeverityBadge anatomy. Removed when M3 moves that page over.
+export function SeverityPill({ severity }: { severity: string }) {
+  return <SeverityBadge severity={severity} />;
 }
