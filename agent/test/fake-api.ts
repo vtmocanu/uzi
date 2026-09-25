@@ -52,6 +52,8 @@ export class FakeApi {
   strictReceiptGenerations = false;
   private nextSyntheticInputId = 1_000_000;
   readonly inputReceiptCalls: Array<{ runId: string; kind: "ack" | "applied"; ids: number[]; generation: number }> = [];
+  /** Receipts answered 200, in reply order (a delayed reply lands here only once it is sent). */
+  readonly inputReceiptReplies: Array<{ runId: string; kind: "ack" | "applied" }> = [];
   // Issue #1660: the follow_up inputs /inputs has already drained, per run, oldest first — what
   // the real server's GET /runs/{id}/follow-ups (ListConsumedFollowUpInputsForRun) returns.
   private readonly consumedFollowUpsByRun = new Map<string, UserInput[]>();
@@ -705,6 +707,7 @@ export class FakeApi {
         res.destroy();
         return;
       }
+      this.inputReceiptReplies.push({ runId, kind });
       return send(res, 200, { inputs: rows.filter((row) => ids.includes(row.id)).sort((a, b) => a.id - b.id), active, reason });
     }
 

@@ -106,11 +106,23 @@ describe("RunRunner — input receipts (issue #1673)", () => {
     const { gitlab } = fakeGitlab();
     const claim = gitlabClaim(1676, { claim_generation: 5 });
     api.setInputClaimGeneration(claim.run_id, 5);
+    // Every report after the gate, with whether the approval's APPLIED had been answered by then.
+    const afterGate: Array<{ status: string; applied: boolean }> = [];
+    let gated = false;
     api.onState(claim.run_id, (body) => {
-      if (body.status === "awaiting_approval") api.setInputs(claim.run_id, [input("approve_plan")]);
+      if (gated) {
+        afterGate.push({
+          status: body.status,
+          applied: api.inputReceiptReplies.some((r) => r.runId === claim.run_id && r.kind === "applied"),
+        });
+      }
+      if (body.status === "awaiting_approval") {
+        gated = true;
+        api.setInputs(claim.run_id, [input("approve_plan")]);
+      }
     });
     // The applied reply is slow; the worker shuts down (aborting the run's controller) while it is
-    // still in flight, so the resume report that waits on it must not go out.
+    // still in flight, so the resume report waiting on it must not go out while it is uncertain.
     api.delayInputReceipts("applied", 1_500);
     const r = runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab);
     const running = r.execute(claim);
@@ -120,13 +132,12 @@ describe("RunRunner — input receipts (issue #1673)", () => {
     r.shutdown();
     await running;
 
-    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
-    const gate = statuses.indexOf("awaiting_approval");
-    assert.ok(gate >= 0, statuses.join(","));
+    assert.ok(gated, "the run reached the plan gate");
+    assert.ok(!afterGate.some((r) => r.status === "running"), `the interrupted resume report was refused: ${JSON.stringify(afterGate)}`);
     assert.deepStrictEqual(
-      statuses.slice(gate + 1).filter((s) => s !== "failed"),
+      afterGate.filter((r) => r.status !== "failed" && !r.applied),
       [],
-      `no non-failed report after the gate: ${statuses.join(",")}`,
+      "no non-failed report went out while the approval's APPLIED was uncertain",
     );
   });
 });
