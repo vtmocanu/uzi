@@ -340,13 +340,25 @@ rename_and_fold() { # skiprc: rename `## [IB]`->`## [NEW]` (date today), move [U
   mv "$tmp" CHANGELOG.md; rm -f "$bodyf"
 }
 
+# fold_line_tags <base> <file>: sorted `section<TAB>subsection<TAB>line` for every non-blank,
+# non-heading line; [Unreleased] lines are tagged as <base>'s, so a correct fold is a no-op.
+fold_line_tags() {
+  awk -v base="$1" '
+    /^## \[/ { sec = $0; sub(/^## \[/, "", sec); sub(/\].*/, "", sec); if (sec == "Unreleased") sec = base; sub_ = ""; next }
+    /^### / { sub_ = substr($0, 5); sub(/[[:space:]]+$/, "", sub_); next }
+    /^[[:space:]]*$/ { next }
+    { print sec "\t" sub_ "\t" $0 }
+  ' "$2" | LC_ALL=C sort
+}
+
 # fold_into_open <base>: nextrc: move the [Unreleased] body into the open `## [base]`
 # section, subsection by subsection (D3, amended): each `### X` bucket is appended to the
 # end of the section's own `### X`, or opens that subsection at the section's end. PRs
 # land their entries in [Unreleased], so a re-spin nearly always has some. Guarded, because
 # a malformed merge is invisible to the oracle and changelog-links --check: refuses (exit 3,
 # CHANGELOG untouched) on text before the first `###`, a subsection name outside Keep a
-# Changelog's six, a duplicate `###` in the result, or any line lost or invented.
+# Changelog's six, a duplicate `###` in the result, or any line lost, invented or moved to
+# another subsection. A `### X` repeated inside [Unreleased] is collapsed, with a NOTE.
 fold_into_open() {
   local base="$1" tmp; tmp="$(mktemp)"
   awk -v base="$base" '
@@ -365,7 +377,10 @@ fold_into_open() {
       if ($0 ~ /^### /) {
         cur = substr($0, 5); sub(/[[:space:]]+$/, "", cur)
         if (cur !~ /^(Added|Changed|Deprecated|Removed|Fixed|Security)$/) { print "release-cut: [Unreleased] has an unknown subsection: ### " cur > "/dev/stderr"; bad = 1 }
+        # A repeated `### X` in [Unreleased] is a known clean-rebase shape (changelog-union.sh
+        # --collapse); collapse it into one bucket, say so, and let guard 2 prove no line moved.
         if (!(cur in bucket)) { order[++no] = cur; bucket[cur] = "" }
+        else print "  NOTE: [Unreleased] repeats ### " cur "; its entries are folded into one ### " cur > "/dev/stderr"
         next
       }
       if (cur == "") { if ($0 ~ /[^[:space:]]/) { print "release-cut: [Unreleased] has text before its first ### subsection: " $0 > "/dev/stderr"; bad = 1 }; next }
@@ -405,13 +420,15 @@ fold_into_open() {
   # Guard 1: no subsection appears twice in the open section.
   local dups
   dups="$(awk -v base="$base" 'index($0, "## [" base "]") == 1 { s = 1; next } s && /^## \[/ { exit } s && /^### / { print }' "$tmp" | sort | uniq -d)"
-  # Guard 2: every non-blank line survives exactly once, nothing invented. `###` lines are
-  # excluded: folding a bucket into an existing subsection drops its heading by design.
+  # Guard 2: every non-blank, non-heading line survives exactly once, nothing invented, and
+  # each stays under the same `###` name (an [Unreleased] line counts as the open section's).
+  # Headings are excluded as lines: folding a bucket into an existing subsection, or
+  # collapsing a repeated one, drops a heading by design.
   local before after
-  before="$(grep -v -e '^[[:space:]]*$' -e '^### ' CHANGELOG.md | sort)"
-  after="$(grep -v -e '^[[:space:]]*$' -e '^### ' "$tmp" | sort)"
+  before="$(fold_line_tags "$base" CHANGELOG.md)"
+  after="$(fold_line_tags "$base" "$tmp")"
   if [ -n "$dups" ] || [ "$before" != "$after" ] || [ -n "$(awk '/^## \[Unreleased\]/{f=1;next} f&&/^## \[/{exit} f' "$tmp" | tr -d '[:space:]')" ]; then
-    echo "release-cut: [Unreleased] fold into [$base] failed its guard (duplicate subsection: ${dups:-none}; line set changed: $([ "$before" = "$after" ] && echo no || echo yes)); CHANGELOG untouched" >&2
+    echo "release-cut: [Unreleased] fold into [$base] failed its guard (duplicate subsection in [$base]: ${dups:-none}; a line lost, invented or moved: $([ "$before" = "$after" ] && echo no || echo yes)); CHANGELOG untouched" >&2
     rm -f "$tmp"; exit 3
   fi
   mv "$tmp" CHANGELOG.md

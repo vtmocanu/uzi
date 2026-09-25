@@ -545,6 +545,81 @@ MD
 run_rc "$S3T" 0.2.0
 assert_eq "fold refuses text before the first ### (exit 3)" "3" "$RC_RC"
 assert_contains "refusal quotes the stray line" "text before its first ### subsection" "$RC_OUT"
+S3D="$(mktemp -d)"
+next_rc_fixture "$S3D" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.2.0] - 2026-10-01
+### Added
+- **Feature 201** (#201)
+
+### Added
+- **Older duplicate** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+cl_before="$(cat "$S3D/CHANGELOG.md")"
+run_rc "$S3D" 0.2.0
+assert_eq "fold refuses an open section that already repeats a ### (exit 3)" "3" "$RC_RC"
+assert_contains "refusal names the duplicate subsection" "duplicate subsection in [0.2.0]: ### Added" "$RC_OUT"
+assert_eq "duplicate-refused fold leaves CHANGELOG untouched" "$cl_before" "$(cat "$S3D/CHANGELOG.md")"
+
+echo "=== M2: next RC fold collapses a repeated ### in [Unreleased] ==="
+# A clean rebase can leave two `### Added` in [Unreleased] (changelog-union.sh --collapse).
+S3R="$(mktemp -d)"
+next_rc_fixture "$S3R" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Late one** (#250)
+
+### Fixed
+- **Late fix** (#250)
+
+### Added
+- **Late two** (#250)
+
+## [0.2.0] - 2026-10-01
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S3R" 0.2.0
+assert_eq "repeated ### in [Unreleased] folds (exit 0)" "0" "$RC_RC"
+assert_contains "the collapse is reported, not silent" "[Unreleased] repeats ### Added" "$RC_OUT"
+assert_eq "both repeats land under the one ### Added, in order" "### Added|- **Feature 201**|- **Late one**|- **Late two**|### Fixed|- **Late fix**" \
+  "$(open_section "$S3R" | grep -v '^[[:space:]]*$' | sed 's/^\(- \*\*[^*]*\*\*\).*/\1/' | paste -sd'|' -)"
+
+echo "=== M2: next RC fold when the open section is the last in the file ==="
+S3E="$(mktemp -d)"
+next_rc_fixture "$S3E" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Late thing** (#250)
+
+### Security
+- **Late hardening** (#250)
+
+## [0.2.0] - 2026-10-01
+### Added
+- **Feature 201** (#201)
+MD
+run_rc "$S3E" 0.2.0
+assert_eq "fold with the open section last exits 0" "0" "$RC_RC"
+assert_eq "last-section fold appends and opens subsections at EOF" "### Added|- **Feature 201**|- **Late thing**|### Security|- **Late hardening**" \
+  "$(open_section "$S3E" | grep -v -e '^[[:space:]]*$' -e '^\[' | sed 's/^\(- \*\*[^*]*\*\*\).*/\1/' | paste -sd'|' -)"
 
 echo "=== M2: refuse a new version with no verb + --stable refused in flight ==="
 S4="$(mktemp -d)"; seed_repo "$S4"; add_feature "$S4" 201
