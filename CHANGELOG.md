@@ -31,6 +31,8 @@ through `[0.52.0]`.)
 
 - **The graceful-shutdown checkpoint feed line names a bounded reason class instead of raw error text ([#1597](https://github.com/vtmocanu/uzi/issues/1597)).**
   A checkpoint that did not reach origin now reports one of a fixed set of classes (`timeout`, `boundary_blocked`, `publish_rejected`, `publish_skipped`, `publish_error`, `no_local_tip`, `tick_process_survived`, `bare_lock_retained`) rather than a thrown error's message or remote text, and a publish that lands wins over a later, unrelated boundary error.
+- **Dependency: bump `gitlab.com/gitlab-org/api/client-go` to v3 ([#1377](https://github.com/vtmocanu/uzi/pull/1377)).**
+  The GitLab driver moves to the `/v3` module path and replaces the deprecated `gitlab.Ptr` helper with Go 1.26 `new(value)`. The client calls uzi makes are unchanged upstream, and v3 drops several of the library's transitive dependencies.
 
 ### Fixed
 

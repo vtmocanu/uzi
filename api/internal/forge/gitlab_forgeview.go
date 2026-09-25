@@ -11,7 +11,7 @@ import (
 	"context"
 	"net/http"
 
-	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
+	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 )
 
 // ListMergeRequestRefs lists the project's open merge requests as cheap refs,
@@ -21,9 +21,9 @@ import (
 func (g *gitLab) ListMergeRequestRefs(ctx context.Context, projectID int64, opts ListMergeRequestsOptions) ([]MergeRequestRef, error) {
 	opt := &gitlab.ListProjectMergeRequestsOptions{
 		ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage},
-		State:       gitlab.Ptr(gitlabMRStateParam(opts.State)),
-		OrderBy:     gitlab.Ptr("updated_at"),
-		Sort:        gitlab.Ptr("desc"),
+		State:       new(gitlabMRStateParam(opts.State)),
+		OrderBy:     new("updated_at"),
+		Sort:        new("desc"),
 	}
 	if opts.Limit > 0 && int64(opts.Limit) < opt.PerPage {
 		opt.PerPage = int64(opts.Limit)
@@ -202,7 +202,7 @@ func gitlabMRStateParam(state string) string {
 func (g *gitLab) ListChecks(ctx context.Context, projectID int64, sha string) ([]Check, error) {
 	opt := &gitlab.ListProjectPipelinesOptions{
 		ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage},
-		SHA:         gitlab.Ptr(sha),
+		SHA:         new(sha),
 	}
 	pipelines, _, err := g.client.Pipelines.ListProjectPipelines(projectID, opt, gitlab.WithContext(ctx))
 	if err != nil {
@@ -342,20 +342,20 @@ func gitlabStatusToCheck(raw string) (status, conclusion string) {
 func (g *gitLab) ListWorkflowRuns(ctx context.Context, projectID int64, opts ListWorkflowRunsOptions) ([]WorkflowRun, error) {
 	opt := &gitlab.ListProjectPipelinesOptions{
 		ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage},
-		OrderBy:     gitlab.Ptr("id"),
-		Sort:        gitlab.Ptr("desc"),
+		OrderBy:     new("id"),
+		Sort:        new("desc"),
 	}
 	if opts.Limit > 0 && int64(opts.Limit) < opt.PerPage {
 		opt.PerPage = int64(opts.Limit)
 	}
 	if opts.Branch != "" {
-		opt.Ref = gitlab.Ptr(opts.Branch)
+		opt.Ref = new(opts.Branch)
 	}
 	if opts.Event != "" {
-		opt.Source = gitlab.Ptr(opts.Event)
+		opt.Source = new(opts.Event)
 	}
 	if opts.Status != "" {
-		opt.Status = gitlab.Ptr(gitlab.BuildStateValue(opts.Status))
+		opt.Status = new(gitlab.BuildStateValue(opts.Status))
 	}
 	pipelines, _, err := g.client.Pipelines.ListProjectPipelines(projectID, opt, gitlab.WithContext(ctx))
 	if err != nil {

@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
+	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 )
 
 // This file holds the GitLab driver's CI / pipeline read seam: latest pipeline for
@@ -21,7 +21,7 @@ func (g *gitLab) LatestPipeline(ctx context.Context, projectID int64, ref string
 	// those; a ref with no branch pipeline yields an empty list → ErrNoPipeline.
 	opt := &gitlab.ListProjectPipelinesOptions{
 		ListOptions: gitlab.ListOptions{Page: 1, PerPage: 1},
-		Ref:         gitlab.Ptr(ref),
+		Ref:         new(ref),
 	}
 	pipelines, _, err := g.client.Pipelines.ListProjectPipelines(projectID, opt, gitlab.WithContext(ctx))
 	if err != nil {
