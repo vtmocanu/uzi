@@ -2407,8 +2407,28 @@ export class CodexExecutor implements Executor {
       harness.useBroker(buildPhaseBroker(phase, turnAbort.signal));
       if (tripReason) throw this.tripError(tripReason);
       armIdle();
-      const turn = harness.startTurn(request);
-      for await (const event of turn.events) {
+      let turn = harness.startTurn(request);
+      let events = turn.events[Symbol.asyncIterator]();
+      let first = await (async () => {
+        try {
+          return await events.next();
+        } catch (error) {
+          // A rejected thread/resume has started no model turn. The persisted rollout may
+          // have disappeared or the provider may refuse it despite a successful preflight.
+          const message = errMessage(error);
+          if (!resumeId || !/JSON-RPC error|thread\/resume returned no thread id/.test(message)) throw error;
+          this.log.warn("codex provider rejected resumed thread; starting a fresh session", { run_id: ctx.runId });
+          ctx.emit({ kind: "status", agent: "worker", payload: {
+            text: "the earlier Codex session was rejected by the provider — continuing WITHOUT its earlier context, so some work may be repeated",
+            event: "resume_lineage_break",
+          } });
+          turn = harness.startTurn(this.buildRunRequest(ctx, phase, prompt, undefined, turnAbort.signal));
+          events = turn.events[Symbol.asyncIterator]();
+          return events.next();
+        }
+      })();
+      for (; !first.done; first = await events.next()) {
+        const event = first.value;
         armIdle(); // any event is liveness
         const reduction = await reducer.accept(event);
         if (reduction.firstSessionId !== undefined) {

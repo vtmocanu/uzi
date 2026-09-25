@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { type RunContext, type ExecutorResult } from "../src/executor.js";
+import { CodexSessionStore } from "../src/codex/session-state.js";
 import {
   type ExecutorFactory,
   RESUME_CONTINUED_EVENT,
@@ -62,6 +63,41 @@ describe("RunRunner — resume preflight (issue #105)", () => {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, `${sessionId}.jsonl`), "{}\n");
   }
+
+  it("Codex resumes only when the claimed thread is persisted on this worker", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-codex-resume-"));
+    const codexHome = path.join(homeRoot, "source");
+    const codex = {
+      auth_mode: "subscription" as const, access_token: "fixture-access", capability: "fixture-capability",
+      generation: 3, chatgpt_account_id: "fixture-account", chatgpt_plan_type: null,
+    };
+    try {
+      for (const [index, expected] of [[1, undefined], [2, SID], [3, undefined]] as const) {
+        const { gitlab } = fakeGitlab();
+        const seen: RunContext[] = [];
+        const claim = gitlabClaim(700 + index, { session_id: SID, secrets: {
+          forge_pat: "fixture-forge", forge_username: "bot", anthropic_oauth_token: "fixture-oauth", codex,
+        } });
+        const store = path.join(homeRoot, claim.run_id, "codex-session-store");
+        fs.mkdirSync(path.dirname(store), { recursive: true });
+        if (index === 2) {
+          fs.mkdirSync(path.join(codexHome, "sessions"), { recursive: true });
+          fs.writeFileSync(path.join(codexHome, "sessions", `rollout-2026-09-25-${SID}.jsonl`), "{}\n");
+          await CodexSessionStore.persist(codexHome, store);
+        } else if (index === 3) {
+          fs.rmSync(path.join(codexHome, "sessions", `rollout-2026-09-25-${SID}.jsonl`));
+          fs.writeFileSync(path.join(codexHome, "sessions", "rollout-2026-09-25-ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl"), "{}\n");
+          await CodexSessionStore.persist(codexHome, store);
+        }
+        await runnerWith(capturingFactory(homeRoot, seen), gitlab).execute(claim);
+        assert.equal(seen[0]?.sessionId, expected);
+        const events = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => m.payload.event);
+        assert.ok(events.includes(expected ? RESUME_CONTINUED_EVENT : RESUME_LINEAGE_BREAK_EVENT));
+      }
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
 
   it("drops the resume and says so when the transcript is not on this worker", async () => {
     const { gitlab } = fakeGitlab();

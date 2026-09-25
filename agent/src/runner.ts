@@ -2,6 +2,7 @@ import { AsyncResource } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
+import { join } from "node:path";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
 import type { GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange } from "./git.js";
@@ -81,6 +82,7 @@ import { GitLabClient, ForgejoClient, GitHubClient, type ForgeClient } from "./f
 import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
+import { CodexSessionStore } from "./codex/session-state.js";
 import { errMessage, RUN_ID_RE, sleep } from "./util.js";
 import {
   CHECKPOINT_SCAN_TIMEOUT_MS,
@@ -5442,11 +5444,13 @@ export class RunRunner {
     if (
       sessionId &&
       runHome &&
-      !(await sessionTranscriptResolvable(runHome, sessionId, runLog))
+      (claim.secrets.codex
+        ? (await CodexSessionStore.inspectSession(join(runHome, "codex-session-store"), sessionId)) !== "present"
+        : !(await sessionTranscriptResolvable(runHome, sessionId, runLog)))
     ) {
       sessionId = undefined;
       runLog.warn(
-        "resume session transcript is not resolvable here; starting a fresh SDK session",
+        "resume session transcript is not resolvable here; starting a fresh session",
         {
           run_home: runHome,
           event: RESUME_LINEAGE_BREAK_EVENT,
@@ -5478,7 +5482,7 @@ export class RunRunner {
       // silent there, matching the lineage-break guard's intent.
       if (runHome) {
         runLog.info(
-          "resume session transcript resolved here; continuing the prior SDK session",
+          "resume session transcript resolved here; continuing the prior session",
           {
             run_home: runHome,
             event: RESUME_CONTINUED_EVENT,

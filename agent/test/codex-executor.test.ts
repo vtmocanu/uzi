@@ -1377,6 +1377,20 @@ describe("CodexExecutor: credential bridge + isolation", () => {
     assert.equal(rig.client.releaseCalls.length, 1, "a resumed root still releases a fresh token");
     const resume = rig.transport.requests.find((r) => r.method === "thread/resume");
     assert.ok(resume, "the harness resumed the prior session");
+    assert.equal(rec(resume.params).threadId, "prior-session", "the claimed thread is the one adopted by the turn");
+  });
+
+  it("falls back to a fresh thread when the provider rejects the claimed resume", async () => {
+    const rig = makeRig();
+    rig.transport.requestOverride = (c) => c.method === "thread/resume"
+      ? Promise.reject(new Error("codex app-server returned a JSON-RPC error (code -32602)"))
+      : undefined;
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx, emitted } = makeCtx({ sessionId: "claimed-thread" });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "resume rejection fallback");
+    assert.ok(rig.transport.requests.some((r) => r.method === "thread/resume"));
+    assert.ok(rig.transport.requests.some((r) => r.method === "thread/start"));
+    assert.ok(emitted.some((m) => m.payload.event === "resume_lineage_break"));
   });
 
   it("(13) the fileop helper is spawned with a SCRUBBED, replaced env (no inherited secrets)", async () => {
