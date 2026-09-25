@@ -20,6 +20,10 @@ import (
 	"uzi.local/codex-supervisor/internal/safetree"
 )
 
+// recordReapOutcomesDefault is recordReapOutcomes as the binary started, before
+// TestMain turns it on.
+var recordReapOutcomesDefault bool
+
 // Helper-process modes of this test binary (see TestMain).
 const (
 	testHelperEnv     = "SUPERVISOR_TEST_HELPER"
@@ -53,6 +57,7 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(realMain(args))
 	}
+	recordReapOutcomesDefault = recordReapOutcomes
 	recordReapOutcomes = true
 	os.Exit(m.Run())
 }
@@ -1206,6 +1211,9 @@ func TestReapRemovalDeadlineTruncates(t *testing.T) {
 func TestReapKeepsNoOutcomesInProduction(t *testing.T) {
 	if !requireNonRootCommandUID(t) {
 		return
+	}
+	if recordReapOutcomesDefault {
+		t.Fatal("recordReapOutcomes defaults to on: a production pass would keep a record per candidate")
 	}
 	recordReapOutcomes = false
 	t.Cleanup(func() { recordReapOutcomes = true })

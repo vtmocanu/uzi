@@ -11,9 +11,10 @@ import (
 )
 
 // Bounds of one reap pass. maxReapDirents bounds the entries examined between
-// two batches, and maxReapCandidates the names one batch holds; the memory a
-// pass holds is the names parsed from its one 8 KiB getdents buffer plus one
-// batch. Neither count limits how much of a root a pass reaches: a pass reads
+// two batches, and maxReapCandidates the names one batch holds; the names a
+// pass holds are those parsed from its one 8 KiB getdents buffer plus one
+// batch (a candidate's removal walk adds bounded per-depth buffers, freed once
+// it ends). Neither count limits how much of a root a pass reaches: a pass reads
 // each root to its end unless the pass budget runs out first or a read error
 // ends it (reap_error "list").
 const (
@@ -69,7 +70,8 @@ type reapResult struct {
 	Proof           string `json:"proof"`
 	Truncated       bool   `json:"truncated"`
 	DirentsExamined int    `json:"dirents_examined"`
-	// lastReason is the reason of the candidate recorded last.
+	// lastReason is the reason of the candidate recorded last; reapWith reads
+	// it to spot a "deadline" retention, so it is kept in production too.
 	lastReason string
 	// outcomes is each candidate's outcome, kept only when
 	// recordReapOutcomes is set (tests), so a pass's memory does not grow
@@ -78,7 +80,9 @@ type reapResult struct {
 }
 
 // recordReapOutcomes keeps each candidate's outcome in reapResult.outcomes.
-// Tests set it; production leaves it off.
+// Tests set it (TestMain, and TestReapKeepsNoOutcomesInProduction checks the
+// production default is off); production leaves it off. A package global:
+// a reaper test that changes it must not run in parallel.
 var recordReapOutcomes bool
 
 // reapOutcome is one candidate's outcome and, for "retained", its reason.

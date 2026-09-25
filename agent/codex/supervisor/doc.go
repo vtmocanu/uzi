@@ -145,8 +145,8 @@
 // batch is acted on before the next page is read, and on the normal path a
 // name already read is never dropped (on a read error the current partial
 // batch is left untouched, not acted on). The 4096 bounds the entries examined
-// between two batches and the 64 the names one batch holds; the memory a pass
-// holds is the names parsed from its one 8 KiB getdents buffer plus one batch.
+// between two batches and the 64 the names one batch holds; the names a pass
+// holds are those parsed from its one 8 KiB getdents buffer plus one batch.
 // No count of entries or candidates ends a pass. Only the 5-minute pass budget
 // or a read error (reap_error "list") does. The budget is checked before each
 // page and before each candidate; when it has run out the pass stops, later
