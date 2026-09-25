@@ -50,7 +50,7 @@ const PRESENTATION: Record<Worker["upgrade_status"], { label: string; tone: Tone
 };
 
 // upgradePresentation is the one label + tone per upgrade status, or null for `unknown`
-// (which renders nothing anywhere). The Workers badge, the fleet summary legend and the
+// (which renders no badge: nothing on the Workers page, a faint dash in the Health fleet). The Workers badge, the fleet summary legend and the
 // Admin Health fleet card (AdminHealth.tsx FleetRow) read it.
 // The tone is typed as the narrow subset actually used; it is assignable to BadgeTone.
 export function upgradePresentation(status: Worker["upgrade_status"]): { label: string; tone: Tone } | null {

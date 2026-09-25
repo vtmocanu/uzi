@@ -6,7 +6,7 @@
 //
 // When every check passes it collapses to one quiet line so it costs no attention on a
 // normal day; otherwise it shows the verdict and the top three attention items (worst-first),
-// each linking to the Health tab.
+// with one Open health link to the Health tab.
 
 import { Link } from "react-router-dom";
 

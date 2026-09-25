@@ -40,8 +40,8 @@ It surfaces five ways:
 - **Overview**, for an admin: a self-hiding card beside the custody-hold
   alert. When every check passes it collapses to one quiet line ("System
   health: all N checks passing"); otherwise it shows the verdict and the top
-  three attention items, each linking to the Health tab. It makes no request
-  at all for a non-admin.
+  three attention items, with one Open health link to the Health tab. It
+  makes no request at all for a non-admin.
 - **An app-wide Danger banner**, admins only, shown only while the overall
   status is `danger`. It carries the verdict, the top danger check's own
   summary, an Open health link, and **Snooze 1 h** — per admin, per danger
