@@ -89,4 +89,37 @@ describe("operator constraints survive a re-claim (issue #1660)", () => {
     assert.strictEqual(claim2Prompt.split(rule).length - 1, 1, "attached once, not duplicated");
     assert.ok((api.followUpReads.get(claim.run_id) ?? 0) >= 2, "every claim rehydrates");
   });
+
+  it("a claim whose constraint reload fails denies every subagent dispatch and says so on the feed", async () => {
+    const claim = makeClaim({
+      issue_iid: 72,
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      last_seq: 0,
+    });
+    api.overrideFollowUps(claim.run_id, 503, { error: "unavailable" });
+    let decision: { permissionDecision?: string; permissionDecisionReason?: string } | undefined;
+    const executor: Executor = {
+      async run(ctx) {
+        // As sdk-executor.ts wires it: null (unavailable) must reach the guard, not become [].
+        const hook = buildAgentGuardHook(["reviewer"], nullLogger(), () => (ctx.operatorConstraints ? ctx.operatorConstraints() : []));
+        const out = (await hook({
+          session_id: "s",
+          transcript_path: "/t",
+          cwd: "/w",
+          hook_event_name: "PreToolUse",
+          tool_name: NESTED_AGENT_TOOL,
+          tool_input: { subagent_type: "reviewer", prompt: "review HEAD" },
+          tool_use_id: "tu",
+        } as HookInput)) as { hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string } };
+        decision = out.hookSpecificOutput;
+        throw new Error("claim ends here");
+      },
+    };
+    await new RunRunner(client, git, () => ({ executor }), nullLogger(), 20, undefined, { pollMs: 5 }).execute(claim);
+    assert.ok((api.followUpReads.get(claim.run_id) ?? 0) > 1, "the reload was retried");
+    assert.strictEqual(decision?.permissionDecision, "deny");
+    assert.match(decision?.permissionDecisionReason ?? "", /operator constraints could not be loaded; retry the run/);
+    const feed = api.messages(claim.run_id).map((m) => JSON.stringify(m.payload));
+    assert.ok(feed.some((t) => t.includes("could not reload this run's earlier follow-ups")), "the feed says so");
+  });
 });

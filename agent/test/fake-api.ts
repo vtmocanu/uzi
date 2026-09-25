@@ -44,6 +44,9 @@ export class FakeApi {
   private readonly consumedFollowUpsByRun = new Map<string, UserInput[]>();
   /** Issue #1660: the number of GET /runs/{id}/follow-ups reads, per run. */
   readonly followUpReads = new Map<string, number>();
+  /** Issue #1660: a raw (status, body) answer for GET /runs/{id}/follow-ups, overriding the
+   *  drained-follow-ups default, so a test can model a persistent failure or a malformed 200. */
+  private readonly followUpsOverride = new Map<string, { status: number; body: unknown }>();
   private stateFailRemaining = 0;
   private stateFailStatus = 503;
   // PRD #1247 fix round E: model an rc.5-shaped api that strict-decodes the unknown
@@ -341,6 +344,11 @@ export class FakeApi {
     });
   }
 
+  /** Issue #1660: answer GET /runs/{id}/follow-ups with this status and body on every read. */
+  overrideFollowUps(runId: string, status: number, body: unknown): void {
+    this.followUpsOverride.set(runId, { status, body });
+  }
+
   setInputs(runId: string, inputs: UserInput[]): void {
     this.inputsByRun.set(runId, inputs);
   }
@@ -620,6 +628,8 @@ export class FakeApi {
     if (req.method === "GET" && followUpsMatch) {
       const runId = followUpsMatch[1] as string;
       this.followUpReads.set(runId, (this.followUpReads.get(runId) ?? 0) + 1);
+      const override = this.followUpsOverride.get(runId);
+      if (override) return send(res, override.status, override.body);
       return send(res, 200, { inputs: this.consumedFollowUpsByRun.get(runId) ?? [] });
     }
 

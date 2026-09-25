@@ -915,11 +915,11 @@ describe("SteeringChannel operator constraints (issue #1660)", () => {
 describe("SteeringChannel.seedOperatorConstraints (issue #1660)", () => {
   const withId = (id: number, kind: UserInput["kind"], body: string | null): UserInput => ({ id, kind, body });
 
-  it("seeds consumed follow-ups ahead of live ones, follow_up only, blanks skipped, in id order", async () => {
+  it("seeds consumed follow-ups ahead of live ones, follow_up only, blanks skipped, in server (id) order", async () => {
     const { ch } = makeChannel([[withId(20, "follow_up", "live")]]);
     ch.seedOperatorConstraints([
-      withId(9, "follow_up", " later "),
       withId(4, "follow_up", "earlier"),
+      withId(9, "follow_up", " later "),
       withId(6, "revise_plan", "not a constraint"),
       withId(7, "follow_up", "   "),
       withId(8, "follow_up", null),
@@ -945,6 +945,24 @@ describe("SteeringChannel.seedOperatorConstraints (issue #1660)", () => {
       await tick();
       assert.deepStrictEqual(ch.operatorConstraints(), ["same row"]);
       assert.strictEqual(ch.pullFollowUp(), "same row", "the lead still gets the live delivery");
+    } finally {
+      await ch.stop();
+    }
+  });
+});
+
+// Issue #1660: a claim whose earlier constraints could not be reloaded must not dispatch
+// subagents without them: the channel reports them unavailable (null) until the run is retried.
+describe("SteeringChannel.markOperatorConstraintsUnavailable (issue #1660)", () => {
+  it("reports null, even after follow-ups arrive live", async () => {
+    const { ch } = makeChannel([[inp("follow_up", "live")]]);
+    ch.markOperatorConstraintsUnavailable();
+    assert.strictEqual(ch.operatorConstraints(), null);
+    ch.start();
+    try {
+      await tick();
+      assert.strictEqual(ch.operatorConstraints(), null);
+      assert.strictEqual(ch.pullFollowUp(), "live", "the lead's delivery is unaffected");
     } finally {
       await ch.stop();
     }

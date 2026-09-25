@@ -1763,6 +1763,22 @@ describe("SdkExecutor guardrail options", () => {
     }
   });
 
+  it("issue #1660: an unavailable constraint set (null) reaches the Agent guard, which denies", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer], operatorConstraints: () => null });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    const agentHook = turns[0]!.options.hooks!.PreToolUse![2]!.hooks[0]!;
+    const out = (await agentHook(
+      { hook_event_name: "PreToolUse", tool_name: "Agent", tool_input: { subagent_type: "reviewer", prompt: "review" } } as unknown as HookInput,
+      "tu",
+      { signal: new AbortController().signal },
+    )) as { hookSpecificOutput?: { permissionDecision?: string } };
+    assert.strictEqual(out.hookSpecificOutput?.permissionDecision, "deny");
+  });
+
   it("hands the SDK a sparse env with no worker secrets (every turn)", async () => {
     const { queryFn, turns } = fakeTurns([
       [submitPlan("plan"), resultSuccess()],

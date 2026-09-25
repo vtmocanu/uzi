@@ -885,12 +885,15 @@ export class WorkerClient {
   /** Issue #1660: the run's ALREADY-CONSUMED follow_up inputs, oldest first (GET
    *  /worker/runs/{id}/follow-ups). READ ONLY: unlike getInputs it consumes nothing. The runner
    *  seeds them into the steering channel on every claim so a follow-up an earlier claim consumed
-   *  still reaches this claim's subagents. Throws a RequestError on 4xx/5xx. */
+   *  still reaches this claim's subagents. Throws a RequestError on 4xx/5xx, and an Error on a
+   *  200 whose body has no `inputs` array. */
   async getConsumedFollowUps(runId: string): Promise<UserInput[]> {
-    const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/follow-ups`)) as
-      | { inputs?: UserInput[] }
-      | undefined;
-    return Array.isArray(res?.inputs) ? res.inputs : [];
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/follow-ups`;
+    const res = (await this.getJSON(path)) as { inputs?: unknown } | undefined;
+    // A 200 without an inputs array is an error, never "no follow-ups": treating it as empty
+    // would dispatch subagents without the run's earlier constraints.
+    if (!Array.isArray(res?.inputs)) throw new Error(`GET ${path}: response has no inputs array`);
+    return res.inputs as UserInput[];
   }
 
   /** issue #559: lightweight read-only ownership/terminality probe for the interactive

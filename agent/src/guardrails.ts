@@ -105,7 +105,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { HookInput, HookJSONOutput } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "./log.js";
-import { buildOperatorConstraintsBlock } from "./prompt.js";
+import { buildOperatorConstraintsBlock, OPERATOR_CONSTRAINTS_MAX_CHARS } from "./prompt.js";
 
 /**
  * The subagent-invocation tool. Blocking it on each mapped subagent (see
@@ -212,6 +212,10 @@ const REASON_DOTGIT = "denied by guardrail: accessing the .git directory is not 
 const REASON_UNKNOWN_SUBAGENT = "denied by guardrail: only the run's assembled subagents may be invoked";
 const REASON_CONSTRAINTS_UNATTACHABLE =
   "denied by guardrail: this dispatch has no text prompt to carry the run's operator constraints";
+const REASON_CONSTRAINTS_UNAVAILABLE =
+  "denied by guardrail: operator constraints could not be loaded; retry the run";
+const REASON_CONSTRAINTS_TOO_LARGE =
+  "denied by guardrail: the run's operator constraints are too large to attach to a subagent; shorten or consolidate them";
 
 const MAX_DEPTH = 6;
 
@@ -1253,8 +1257,10 @@ function subagentTypeOf(toolInput: unknown): string | undefined {
  *     so a dispatch before a follow-up never carries it and every one after does. The
  *     lead's own <follow_up> delivery is unchanged; this is the structural copy it could
  *     not be relied on to relay. Rendered by buildOperatorConstraintsBlock (nonce-fenced,
- *     size-capped); an already-synchronous call is rewritten too when there is a block,
- *     and a call whose `prompt` is not a string is DENIED rather than run without them.
+ *     size-capped); an already-synchronous call is rewritten too when there is a block.
+ *     It DENIES rather than dispatch without them: when they could not be loaded this claim
+ *     (the provider returns null), when the block exceeds OPERATOR_CONSTRAINTS_MAX_CHARS, or
+ *     when the call's `prompt` is not a string.
  *
  * The lead keeps the Agent tool to delegate to the allowed roles; every subagent
  * already carries `disallowedTools:['Agent']`, so this hook only ever sees the
@@ -1263,7 +1269,7 @@ function subagentTypeOf(toolInput: unknown): string | undefined {
 export function buildAgentGuardHook(
   allowed: Iterable<string>,
   log: Logger,
-  operatorConstraints: () => readonly string[] = () => [],
+  operatorConstraints: () => readonly string[] | null = () => [],
 ): (input: HookInput) => Promise<HookJSONOutput> {
   const allowSet = new Set(allowed);
   return async (input: HookInput): Promise<HookJSONOutput> => {
@@ -1285,15 +1291,25 @@ export function buildAgentGuardHook(
       ? (input.tool_input as Record<string, unknown>)
       : {};
     const prompt = original["prompt"];
-    const constraints = buildOperatorConstraintsBlock(operatorConstraints());
-    // Fail closed: a dispatch that cannot carry the constraints does not run without them.
-    if (constraints !== "" && typeof prompt !== "string") {
-      log.warn("guardrail denied a subagent dispatch that cannot carry operator constraints", { subagent_type: sub });
+    // Fail closed on every way the constraints could go missing: not loaded this claim (null),
+    // no text prompt to carry them, or a block over the hard ceiling. Never dispatch without.
+    const loaded = operatorConstraints();
+    const constraints = loaded === null ? "" : buildOperatorConstraintsBlock(loaded);
+    const refusal =
+      loaded === null
+        ? REASON_CONSTRAINTS_UNAVAILABLE
+        : constraints.length > OPERATOR_CONSTRAINTS_MAX_CHARS
+          ? REASON_CONSTRAINTS_TOO_LARGE
+          : constraints !== "" && typeof prompt !== "string"
+            ? REASON_CONSTRAINTS_UNATTACHABLE
+            : undefined;
+    if (refusal !== undefined) {
+      log.warn("guardrail denied a subagent dispatch over operator constraints", { subagent_type: sub, reason: refusal });
       return {
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
           permissionDecision: "deny",
-          permissionDecisionReason: REASON_CONSTRAINTS_UNATTACHABLE,
+          permissionDecisionReason: refusal,
         },
       };
     }

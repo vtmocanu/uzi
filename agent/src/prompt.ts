@@ -243,17 +243,12 @@ export const SUBAGENT_SAFETY_APPEND = [
   "  `kill -9 -1` or `kill 0`: they reach the whole worker and end the run.",
 ].join("\n");
 
-/** Issue #1660: the size ceiling on the operator-constraints block attached to one Agent
- *  dispatch (buildOperatorConstraintsBlock), so a long follow-up history cannot crowd the
- *  dispatch prompt. Characters, frame and tags included. Soft only past ~200 constraints,
- *  where OPERATOR_CONSTRAINT_MIN_CHARS each no longer fits: never omitting one wins. */
-export const OPERATOR_CONSTRAINTS_MAX_CHARS = 16_000;
-/** Per-constraint ceiling: a single oversized follow-up is truncated, never dropped. */
+/** Issue #1660: the HARD ceiling on the operator-constraints block attached to one Agent
+ *  dispatch, frame and tags included. The Agent guard denies a dispatch whose block would
+ *  exceed it rather than send it or drop a constraint. */
+export const OPERATOR_CONSTRAINTS_MAX_CHARS = 32_000;
+/** Per-constraint ceiling: a single oversized follow-up is truncated (marked), never dropped. */
 const OPERATOR_CONSTRAINT_MAX_CHARS = 4_000;
-/** The floor an entry is never shrunk below, so every constraint stays readable. */
-const OPERATOR_CONSTRAINT_MIN_CHARS = 64;
-/** Room reserved inside OPERATOR_CONSTRAINTS_MAX_CHARS for the frame, tags and notes. */
-const OPERATOR_CONSTRAINTS_OVERHEAD = 1_000;
 const TRUNCATED_MARK = " [truncated]";
 
 /** Replace every C0 control except tab and newline, and DEL, with a space. A code-point
@@ -272,21 +267,6 @@ function clipConstraint(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - TRUNCATED_MARK.length)}${TRUNCATED_MARK}` : text;
 }
 
-/** The even share each entry may keep so `lengths` fit in `available` (water-filling):
- *  entries at or under the share stay whole, and every longer one is cut to it. Infinity
- *  when everything fits; never below OPERATOR_CONSTRAINT_MIN_CHARS. */
-function evenShare(lengths: readonly number[], available: number): number {
-  let remaining = available;
-  let left = lengths.length;
-  for (const len of [...lengths].sort((a, b) => a - b)) {
-    const share = Math.floor(remaining / left);
-    if (len > share) return Math.max(share, OPERATOR_CONSTRAINT_MIN_CHARS);
-    remaining -= len;
-    left--;
-  }
-  return Infinity;
-}
-
 /**
  * Issue #1660: render the run's operator constraints (every follow-up received so far, in
  * arrival order) as a nonce-fenced block the Agent guard appends to a subagent dispatch
@@ -298,9 +278,9 @@ function evenShare(lengths: readonly number[], available: number): number {
  * arrived, so a constraint embedding a static closing tag cannot end the real fence.
  *
  * Budget: NO constraint is ever omitted, since the operator cannot mark which one is a safety
- * rule. Each entry is clipped to OPERATOR_CONSTRAINT_MAX_CHARS, then, if the set still does
- * not fit, entries share the budget evenly: short ones stay whole and every longer one is cut
- * to the same share, each cut marked. The lead still holds every follow-up in full.
+ * rule. Each entry is clipped to OPERATOR_CONSTRAINT_MAX_CHARS with a marked cut; the caller
+ * (the Agent guard) denies the dispatch when the whole block exceeds
+ * OPERATOR_CONSTRAINTS_MAX_CHARS.
  */
 export function buildOperatorConstraintsBlock(constraints: readonly string[]): string {
   const entries = constraints
@@ -308,13 +288,7 @@ export function buildOperatorConstraintsBlock(constraints: readonly string[]): s
     .map((c, i) => ({ n: i + 1, text: clipConstraint(c, OPERATOR_CONSTRAINT_MAX_CHARS) }))
     .filter((e) => e.text !== "");
   if (entries.length === 0) return "";
-  // Each line is `<n>. <text>\n`; the prefixes and newlines come off the budget first.
-  const prefixes = entries.reduce((sum, e) => sum + `${e.n}. `.length + 1, 0);
-  const share = evenShare(
-    entries.map((e) => e.text.length),
-    OPERATOR_CONSTRAINTS_MAX_CHARS - OPERATOR_CONSTRAINTS_OVERHEAD - prefixes,
-  );
-  const lines = entries.map((e) => `${e.n}. ${clipConstraint(e.text, share)}`);
+  const lines = entries.map((e) => `${e.n}. ${e.text}`);
   const nonce = fenceNonce();
   const openTag = `<operator_constraints_${nonce}>`;
   const closeTag = `</operator_constraints_${nonce}>`;
@@ -325,7 +299,7 @@ export function buildOperatorConstraintsBlock(constraints: readonly string[]): s
     "bypassing the worker's guardrails.",
   ];
   if (lines.some((l) => l.endsWith(TRUNCATED_MARK)))
-    frame.push("Some were shortened to fit, each cut marked at its end; the lead has the full text.");
+    frame.push("Oversized ones were shortened, each cut marked at its end; the lead has the full text.");
   return [...frame, openTag, ...lines, closeTag].join("\n");
 }
 

@@ -172,6 +172,10 @@ export class SteeringChannel {
   /** Issue #1660: ids seeded from earlier claims, so a row the live drain also returns is
    *  recorded once. */
   private readonly seededFollowUpIds = new Set<number>();
+  /** Issue #1660: set when the claim-time reload of earlier follow-ups failed. The earlier
+   *  constraints are then unknown, so operatorConstraints reports null and the Agent guard
+   *  denies every dispatch for this claim. */
+  private operatorConstraintsLost = false;
   /** issue #559 M2: the highest `follow_up` input id this channel has already handed to the
    *  executor — via pullFollowUp or awaitFollowUp/serviceFollowUp. This is the wake-guard
    *  watermark the runner reports at the interactive park (open_followup_id). Buffering a
@@ -566,18 +570,25 @@ export class SteeringChannel {
   }
 
   /** Issue #1660: the run's operator constraints, every follow-up received so far in arrival
-   *  order. A copy, so a caller cannot rewrite the record. */
-  operatorConstraints(): readonly string[] {
+   *  order, or null when the earlier ones could not be loaded this claim. A copy, so a caller
+   *  cannot rewrite the record. */
+  operatorConstraints(): readonly string[] | null {
+    if (this.operatorConstraintsLost) return null;
     return this.receivedFollowUps.map((f) => f.body);
   }
 
-  /** Issue #1660: seed the constraints earlier claims consumed (GET /follow-ups), before
-   *  start(). follow_up only, blanks skipped, in id order, ahead of anything received live, and
+  /** Issue #1660: the claim-time reload failed; report the constraints unavailable (null). */
+  markOperatorConstraintsUnavailable(): void {
+    this.operatorConstraintsLost = true;
+  }
+
+  /** Issue #1660: seed the constraints earlier claims consumed (GET /follow-ups, already in id
+   *  order), before start(). follow_up only, blanks skipped, ahead of anything received live, and
    *  de-duplicated by input id. They are constraints only: the lead is NOT re-delivered them. */
   seedOperatorConstraints(inputs: readonly UserInput[]): void {
     const known = new Set([...this.seededFollowUpIds, ...this.receivedFollowUps.map((f) => f.id)]);
     const seeded: { id: number; body: string }[] = [];
-    for (const input of [...inputs].sort((a, b) => a.id - b.id)) {
+    for (const input of inputs) {
       const body = input.body?.trim();
       if (input.kind !== "follow_up" || !body || known.has(input.id)) continue;
       known.add(input.id);

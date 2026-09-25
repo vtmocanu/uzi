@@ -63,6 +63,19 @@ func TestListConsumedFollowUpInputsForRunLiveDB(t *testing.T) {
 		t.Fatalf("ids %d, %d: want ascending creation order", rows[0].ID, rows[1].ID)
 	}
 
+	// One ordering rule, by id, matching the /inputs FIFO: a later row whose created_at is
+	// EARLIER still comes after the one inserted before it.
+	skew := f.seedInteractiveTaskRun(ctx, t, "running", &wkr)
+	mustExec(ctx, t, f.pool, insert, skew, "follow_up", "inserted first", true, float64(60))
+	mustExec(ctx, t, f.pool, insert, skew, "follow_up", "inserted second", true, float64(-60))
+	skewed, err := f.q.ListConsumedFollowUpInputsForRun(ctx, skew)
+	if err != nil {
+		t.Fatalf("ListConsumedFollowUpInputsForRun(skew): %v", err)
+	}
+	if len(skewed) != 2 || skewed[0].Body.String != "inserted first" || skewed[1].Body.String != "inserted second" {
+		t.Fatalf("skewed order = %+v, want id order (inserted first, inserted second)", skewed)
+	}
+
 	none, err := f.q.ListConsumedFollowUpInputsForRun(ctx, f.seedInteractiveTaskRun(ctx, t, "running", &wkr))
 	if err != nil {
 		t.Fatalf("ListConsumedFollowUpInputsForRun(empty run): %v", err)

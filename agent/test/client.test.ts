@@ -582,6 +582,14 @@ describe("getConsumedFollowUps (issue #1660)", () => {
     ]);
     assert.deepStrictEqual(await client.getConsumedFollowUps("run-fu"), got, "a read is repeatable");
   });
+
+  it("treats a 200 without an inputs array as an error, never as no follow-ups", async () => {
+    const client = newClient();
+    for (const body of [{}, { inputs: null }, { inputs: "x" }, { inputs: {} }]) {
+      api.overrideFollowUps("run-fu-bad", 200, body);
+      await assert.rejects(client.getConsumedFollowUps("run-fu-bad"), /inputs/, JSON.stringify(body));
+    }
+  });
 });
 
 describe("MessageBatcher seq numbering", () => {

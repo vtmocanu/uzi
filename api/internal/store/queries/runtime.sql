@@ -5763,10 +5763,11 @@ SELECT id, kind, body, created_at FROM consumed ORDER BY id ASC;
 -- UNCAPPED like ListFollowUpInputsForRun: the worker fits the set into its prompt budget and
 -- must not lose an entry here. Worker-ownership is enforced at the run resolve
 -- (GetRunOwnedByWorker), not here. Pending rows are excluded: the live /inputs drain delivers
--- those, and the worker de-duplicates the two by id.
+-- those, and the worker de-duplicates the two by id. Ordered by id, the same rule as the
+-- /inputs FIFO (ConsumeRunInputs), so the worker keeps the server's order as is.
 SELECT id, body, created_at FROM run_user_inputs
 WHERE run_id = @run_id AND kind = 'follow_up' AND consumed_at IS NOT NULL
-ORDER BY created_at ASC, id ASC;
+ORDER BY id ASC;
 
 -- name: ListFollowUpInputsForRun :many
 -- The steer queue for a run, NEWEST FIRST and UNCAPPED (PRD #95 Decision 4, #634): the

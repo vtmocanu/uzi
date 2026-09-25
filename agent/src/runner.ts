@@ -5160,9 +5160,9 @@ export class RunRunner {
    * Issue #1660: seed the steering channel with the run's already-consumed follow-ups (GET
    * /follow-ups) on every claim, first and re-claim, so the operator's earlier constraints still
    * reach this claim's subagents. A transient failure is retried; a failure that persists, or a 4xx
-   * (an older api without the route, or a run no longer ours), is logged AND put on the run's feed,
-   * never swallowed: subagents in this claim then see only the follow-ups received from here on,
-   * and the lead still has every earlier one in its resumed session.
+   * (an older api without the route, or a run no longer ours), FAILS CLOSED: the channel reports the
+   * constraints unavailable, so the Agent guard denies every subagent dispatch for this claim, and
+   * the failure is logged and put on the run's feed.
    */
   private async rehydrateOperatorConstraints(
     runId: string,
@@ -5181,6 +5181,7 @@ export class RunRunner {
         if (attempt < 3) await sleep(250 * attempt);
       }
     }
+    steering.markOperatorConstraintsUnavailable();
     runLog.warn("could not reload the run's earlier follow-ups as operator constraints", {
       run_id: runId,
       error: errMessage(lastErr),
@@ -5189,7 +5190,7 @@ export class RunRunner {
       kind: "status",
       agent: "worker",
       payload: {
-        text: "could not reload this run's earlier follow-ups: subagents dispatched in this claim receive only follow-ups sent from now on",
+        text: "could not reload this run's earlier follow-ups: subagent dispatches are denied for this claim; retry the run",
       },
     });
   }

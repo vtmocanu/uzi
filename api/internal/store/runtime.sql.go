@@ -6279,7 +6279,7 @@ func (q *Queries) ListCodexAccountWaitRunsPage(ctx context.Context, arg ListCode
 const listConsumedFollowUpInputsForRun = `-- name: ListConsumedFollowUpInputsForRun :many
 SELECT id, body, created_at FROM run_user_inputs
 WHERE run_id = $1 AND kind = 'follow_up' AND consumed_at IS NOT NULL
-ORDER BY created_at ASC, id ASC
+ORDER BY id ASC
 `
 
 type ListConsumedFollowUpInputsForRunRow struct {
@@ -6295,7 +6295,8 @@ type ListConsumedFollowUpInputsForRunRow struct {
 // UNCAPPED like ListFollowUpInputsForRun: the worker fits the set into its prompt budget and
 // must not lose an entry here. Worker-ownership is enforced at the run resolve
 // (GetRunOwnedByWorker), not here. Pending rows are excluded: the live /inputs drain delivers
-// those, and the worker de-duplicates the two by id.
+// those, and the worker de-duplicates the two by id. Ordered by id, the same rule as the
+// /inputs FIFO (ConsumeRunInputs), so the worker keeps the server's order as is.
 func (q *Queries) ListConsumedFollowUpInputsForRun(ctx context.Context, runID uuid.UUID) ([]ListConsumedFollowUpInputsForRunRow, error) {
 	rows, err := q.db.Query(ctx, listConsumedFollowUpInputsForRun, runID)
 	if err != nil {
