@@ -22,55 +22,6 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-### Added
-
-- **A halted CI auto-fix, a halted MR rework, and a decided guardrail override each reach a Slack-linked owner as a one-time DM ([#1650](https://github.com/vtmocanu/uzi/issues/1650)).**
-  Before, a CI auto-fix halt reached you in the app only through the Notifications inbox, and none of the three was pushed to Slack (both halts also post a forge issue comment on an issue-run branch; the rework halt shows on its run page and the override decision on its Repos row); each DM links straight to where you act (the pipeline for `ci_autofix_halted`, the run page for `mr_rework_halted`, the Repos page for `guardrail_override_decided`). A CI auto-fix halt also shows an "Autofix stopped" marker, with the attempt count, on the issue's board card, clearing once the pipeline goes green, auto-fix proceeds again, or uzi sees the merge request closed or merged; a prompt-schedule MR with no backing issue card relies on the Slack DM alone.
-- **Runs → Past runs gets a Failed filter, and the Schedules nav item surfaces parked schedules ([#1650](https://github.com/vtmocanu/uzi/issues/1650)).**
-  The filter counts and shows only genuine failures, excluding a deliberate stop or plan rejection. The Schedules nav badge switches to the parked count in an alert tone whenever any schedule is parked (`status = 'error'`), falling back to today's enabled count otherwise.
-
-### Changed
-
-- **Run list: harness logo leads each row ([#1681](https://github.com/vtmocanu/uzi/issues/1681)).**
-  Claude and Codex logos stay visible even while a run waits for vault unlock; the run header keeps its compact chip.
-- **The Notifications inbox tab, bell icon and unread badge are retired; `run_failed`, `ci_autofix_started`, `ci_autofix_landed` and `selfimprove_started` are no longer produced ([#1650](https://github.com/vtmocanu/uzi/issues/1650)).**
-  Every signal the inbox carried already has, or now has, a home elsewhere: Findings, Judge, Schedules, Admin Health, the run page, or a Slack DM (see the three new DM kinds above). The four status-only kinds duplicated a page surface or a Slack DM that already existed, so they stop firing; the start comment an auto-fix posts (and its halt comment) are unchanged; a landed fix never posted a forge comment of its own. Visiting `/notifications` now redirects to the dashboard through the app's catch-all route. The favicon's amber dot now means only "a run needs you" (awaiting approval, an answer, or your next follow-up); the inbox's unread count no longer feeds it. The `notifications` table itself is unaffected: it stays as a pruned, write-only event log and the incidental-finding Slack de-dup latch; nothing reads it back to a user.
-- **The early-limit-reset alert is now Slack-only ([#1650](https://github.com/vtmocanu/uzi/issues/1650)).**
-  Without a linked Slack account you no longer get this alert at all; the early reset still shows up on the rate-limit meters either way.
-- **The completion check now covers Codex issue runs too ([#1627](https://github.com/vtmocanu/uzi/issues/1627), PR [#1683](https://github.com/vtmocanu/uzi/pull/1683)).**
-  With Completion check on (the default), a new, unseeded issue run on either the Claude or the Codex harness is stamped for it; a seeded-plan run stays exempt. A Codex run with unmet milestones is nudged back into the same thread to finish them before it enters the recoverable completion hold. An interlocked Codex run needs a worker advertising `codex_completion_interlock_v1` (this release's worker) and stays queued, with a health reason naming the missing capability, until one is online.
-- **The TUI board header shows your server-side cost for the last 7 days ([#1672](https://github.com/vtmocanu/uzi/issues/1672), PR [#1680](https://github.com/vtmocanu/uzi/pull/1680)).**
-  It replaces a sum over the last 200 visible runs. A trailing `+` marks that subscription or unreported costs are excluded; the figure refreshes every 60 seconds and on a manual refresh, is hidden on the admin board, and is hidden after a failed request until the next successful one.
-- **The bundled uzi-cli skill treats "issue not found on this repo's board" for a just-filed issue as poller sync lag and retries within 90 seconds ([#1692](https://github.com/vtmocanu/uzi/pull/1692)).**
-
-### Fixed
-
-- **A standalone `@greptileai review` or `@greptile review` comment no longer starts an MR rework ([#1695](https://github.com/vtmocanu/uzi/issues/1695)).**
-  Like CodeRabbit's control commands, a top-level comment consisting solely of a Greptile review trigger is not treated as review feedback, so an on-demand Greptile review no longer spends a rework cycle with nothing to act on; add any other words, or post it inline, and it still counts.
-- **Provisioning and the chat CLI can use the shared worker HOME again on a volume migrated to the uid split ([#1696](https://github.com/vtmocanu/uzi/issues/1696)).**
-  The one-time legacy `/data` migration treated the shared HOME's own dot entries (`.cache`, `.local`, `.claude`) as per-run HOMEs, leaving them worker-owned in a private mode, and skipped top-level dot files such as `.claude.json`, so runner-uid processes (devbox/nix provisioning, the chat SDK CLI) could not use them. A first migration now re-owns those entries to the runner, and a new one-time repair at worker startup, gated on its own `/data/.uzi-provision-home-repaired` sentinel, re-owns the top-level dot entries (not their contents, never through a symlink) on volumes that were already migrated. Neither path re-owns a hardlinked top-level dot file or anything that is not a directory or regular file.
-- **Operator follow-ups and a worker safety block now reach every subagent, not just the lead ([#1660](https://github.com/vtmocanu/uzi/issues/1660)).**
-  Every follow-up a run receives is kept as a run constraint and attached, fenced, to each subagent the lead dispatches after it arrives; dispatches made before it are unchanged, and the lead still receives it as before. Constraints persist across claims: on every claim (including after a pause, resume or requeue) the worker reloads the run's already-consumed follow-ups through a new read-only worker route, `GET /api/worker/runs/{id}/follow-ups`, and if that reload fails, subagent dispatches are denied for that claim and the run feed says so. No entry is omitted: an oversized one is cut to 4000 characters with a marked cut, and a dispatch is denied when the whole set exceeds 32000 characters or the dispatch cannot carry it. Every subagent prompt, from uzi's templates or the repository's own agents, also ends with a worker-owned rule block: never execute a candidate command payload (screen it as a string), and stop a process only by its own handle, never by pattern, port, `kill -1` or `kill 0`. Codex subagents get the rule block but not yet the operator constraints.
-- **A turn whose agent CLI is killed from outside uzi with SIGTERM or SIGKILL can now resume instead of failing the run ([#1656](https://github.com/vtmocanu/uzi/issues/1656)).**
-  When the CLI dies from SIGTERM/SIGKILL (or exits 143/137) with no uzi watchdog, cancel or pause behind it, the worker resumes the session that turn was running, at most twice per turn, on the run's remaining wall budget, and only when that session is known and the dead CLI's process group is confirmed gone after being killed. Otherwise the run fails as before: crash signals and other exit codes, a death whose session is unknown, a process group that cannot be confirmed gone, and a third death in the same turn.
-- **A run no longer fails on the idle watchdog while a quiet command it started is still running ([#1686](https://github.com/vtmocanu/uzi/issues/1686), PR [#1697](https://github.com/vtmocanu/uzi/pull/1697)).**
-  A long command with redirected output (a gate writing to a log file) produced no harness events, so the idle timer read a busy run as stalled. The worker now suspends the idle timer while a Codex command callback or a Claude tool call is in flight and re-arms it once the last one settles; the run's wall-clock bound still applies.
-- **Codex issue runs report milestone progress ([#1674](https://github.com/vtmocanu/uzi/issues/1674)).**
-  The run card's `M x/N`, the TUI milestone bars and the feed's milestone started / reported complete frames now work for Codex runs as they do for Claude runs.
-- **Codex runs on Docker-wired workers can use Docker ([#1677](https://github.com/vtmocanu/uzi/issues/1677), PR [#1678](https://github.com/vtmocanu/uzi/pull/1678)).**
-  The resolved Docker access (including `DOCKER_HOST`) now reaches Codex commands. Docker commands are still denied when the worker has no trusted Docker connection, and a command that tries to redirect Docker to another host or context is blocked, including inside delegated commands.
-- **The Codex supervisor reaps adopted descendant processes while a command is still running ([#1684](https://github.com/vtmocanu/uzi/issues/1684)).**
-  Before, orphaned grandchildren stayed zombies until the command ended, so liveness probes and process-group checks saw dead processes as alive.
-- **A missing command in a provisioned devbox environment fails with "not found" again instead of a permission error ([#1685](https://github.com/vtmocanu/uzi/issues/1685), PR [#1694](https://github.com/vtmocanu/uzi/pull/1694)).**
-  The provisioned `PATH` no longer includes a HOME nix-profile directory the runner cannot search, which turned ENOENT into EACCES.
-
-### Security
-
-- **Run-keyed forge token lookups are scoped to the run's owner ([#1688](https://github.com/vtmocanu/uzi/issues/1688)).**
-  Defense in depth: the queries that load a run's forge connection for claim, move and worker use now also require the connection to belong to the run's owner, so a run pointing at another user's repo would find no token (treated as a benign skip) rather than use it. No reachable mismatch was found; the schema just did not enforce it.
-- **Docs: on hosted Kubernetes workers, Docker-in-Docker shares the whole run workdir ([#1689](https://github.com/vtmocanu/uzi/issues/1689)).**
-  A Docker bind mount from one run can read or write a sibling run's clone on the same worker. Hosted workers only claim their owner's runs, so this is a same-owner residual accepted for the opt-in Docker tier; compose DinD does not share the workdir.
-
 ## [0.84.0] - 2026-09-20
 
 ### Added
@@ -112,6 +63,11 @@ through `[0.52.0]`.)
   The sidebar lists Claude tokens and Codex accounts together, each with its provider icon, account name and usage meter, plus a link to Settings for the rest. Run lists and run details carry a provider chip for Claude and Codex runs alike, and the terminal dashboard labels Codex accounts and window lengths (`?` when a window length is unknown).
 - **Admin → Health puts what needs attention first ([#1648](https://github.com/vtmocanu/uzi/pull/1648)).**
   The tab now opens with the checks that need action, fully explained, followed by a compact, expandable inventory of every check and the fleet table in its own card. Health surfaces use the shared badge style with stable severity shapes, the Health count on the sidebar matches the other nav counts, and a card padding bug that affected pages across the app is fixed.
+
+- **A halted CI auto-fix, a halted MR rework, and a decided guardrail override each reach a Slack-linked owner as a one-time DM ([#1650](https://github.com/vtmocanu/uzi/issues/1650)).**
+  Before, a CI auto-fix halt reached you in the app only through the Notifications inbox, and none of the three was pushed to Slack (both halts also post a forge issue comment on an issue-run branch; the rework halt shows on its run page and the override decision on its Repos row); each DM links straight to where you act (the pipeline for `ci_autofix_halted`, the run page for `mr_rework_halted`, the Repos page for `guardrail_override_decided`). A CI auto-fix halt also shows an "Autofix stopped" marker, with the attempt count, on the issue's board card, clearing once the pipeline goes green, auto-fix proceeds again, or uzi sees the merge request closed or merged; a prompt-schedule MR with no backing issue card relies on the Slack DM alone.
+- **Runs → Past runs gets a Failed filter, and the Schedules nav item surfaces parked schedules ([#1650](https://github.com/vtmocanu/uzi/issues/1650)).**
+  The filter counts and shows only genuine failures, excluding a deliberate stop or plan rejection. The Schedules nav badge switches to the parked count in an alert tone whenever any schedule is parked (`status = 'error'`), falling back to today's enabled count otherwise.
 
 ### Fixed
 
@@ -204,6 +160,25 @@ through `[0.52.0]`.)
 - **Codex execution deadlines cancel reliably under load ([#1513](https://github.com/vtmocanu/uzi/pull/1513)).**
   A deadline now cancels its request even when background work is slow, and the deadline timer is cleaned up when the execution boundary settles.
 
+- **A standalone `@greptileai review` or `@greptile review` comment no longer starts an MR rework ([#1695](https://github.com/vtmocanu/uzi/issues/1695)).**
+  Like CodeRabbit's control commands, a top-level comment consisting solely of a Greptile review trigger is not treated as review feedback, so an on-demand Greptile review no longer spends a rework cycle with nothing to act on; add any other words, or post it inline, and it still counts.
+- **Provisioning and the chat CLI can use the shared worker HOME again on a volume migrated to the uid split ([#1696](https://github.com/vtmocanu/uzi/issues/1696)).**
+  The one-time legacy `/data` migration treated the shared HOME's own dot entries (`.cache`, `.local`, `.claude`) as per-run HOMEs, leaving them worker-owned in a private mode, and skipped top-level dot files such as `.claude.json`, so runner-uid processes (devbox/nix provisioning, the chat SDK CLI) could not use them. A first migration now re-owns those entries to the runner, and a new one-time repair at worker startup, gated on its own `/data/.uzi-provision-home-repaired` sentinel, re-owns the top-level dot entries (not their contents, never through a symlink) on volumes that were already migrated. Neither path re-owns a hardlinked top-level dot file or anything that is not a directory or regular file.
+- **Operator follow-ups and a worker safety block now reach every subagent, not just the lead ([#1660](https://github.com/vtmocanu/uzi/issues/1660)).**
+  Every follow-up a run receives is kept as a run constraint and attached, fenced, to each subagent the lead dispatches after it arrives; dispatches made before it are unchanged, and the lead still receives it as before. Constraints persist across claims: on every claim (including after a pause, resume or requeue) the worker reloads the run's already-consumed follow-ups through a new read-only worker route, `GET /api/worker/runs/{id}/follow-ups`, and if that reload fails, subagent dispatches are denied for that claim and the run feed says so. No entry is omitted: an oversized one is cut to 4000 characters with a marked cut, and a dispatch is denied when the whole set exceeds 32000 characters or the dispatch cannot carry it. Every subagent prompt, from uzi's templates or the repository's own agents, also ends with a worker-owned rule block: never execute a candidate command payload (screen it as a string), and stop a process only by its own handle, never by pattern, port, `kill -1` or `kill 0`. Codex subagents get the rule block but not yet the operator constraints.
+- **A turn whose agent CLI is killed from outside uzi with SIGTERM or SIGKILL can now resume instead of failing the run ([#1656](https://github.com/vtmocanu/uzi/issues/1656)).**
+  When the CLI dies from SIGTERM/SIGKILL (or exits 143/137) with no uzi watchdog, cancel or pause behind it, the worker resumes the session that turn was running, at most twice per turn, on the run's remaining wall budget, and only when that session is known and the dead CLI's process group is confirmed gone after being killed. Otherwise the run fails as before: crash signals and other exit codes, a death whose session is unknown, a process group that cannot be confirmed gone, and a third death in the same turn.
+- **A run no longer fails on the idle watchdog while a quiet command it started is still running ([#1686](https://github.com/vtmocanu/uzi/issues/1686), PR [#1697](https://github.com/vtmocanu/uzi/pull/1697)).**
+  A long command with redirected output (a gate writing to a log file) produced no harness events, so the idle timer read a busy run as stalled. The worker now suspends the idle timer while a Codex command callback or a Claude tool call is in flight and re-arms it once the last one settles; the run's wall-clock bound still applies.
+- **Codex issue runs report milestone progress ([#1674](https://github.com/vtmocanu/uzi/issues/1674)).**
+  The run card's `M x/N`, the TUI milestone bars and the feed's milestone started / reported complete frames now work for Codex runs as they do for Claude runs.
+- **Codex runs on Docker-wired workers can use Docker ([#1677](https://github.com/vtmocanu/uzi/issues/1677), PR [#1678](https://github.com/vtmocanu/uzi/pull/1678)).**
+  The resolved Docker access (including `DOCKER_HOST`) now reaches Codex commands. Docker commands are still denied when the worker has no trusted Docker connection, and a command that tries to redirect Docker to another host or context is blocked, including inside delegated commands.
+- **The Codex supervisor reaps adopted descendant processes while a command is still running ([#1684](https://github.com/vtmocanu/uzi/issues/1684)).**
+  Before, orphaned grandchildren stayed zombies until the command ended, so liveness probes and process-group checks saw dead processes as alive.
+- **A missing command in a provisioned devbox environment fails with "not found" again instead of a permission error ([#1685](https://github.com/vtmocanu/uzi/issues/1685), PR [#1694](https://github.com/vtmocanu/uzi/pull/1694)).**
+  The provisioned `PATH` no longer includes a HOME nix-profile directory the runner cannot search, which turned ENOENT into EACCES.
+
 ### Changed
 
 - **The worker toolchain uses a refreshed nixpkgs pin ([#1530](https://github.com/vtmocanu/uzi/pull/1530)).**
@@ -231,6 +206,25 @@ through `[0.52.0]`.)
 
 - **Chat describes run eligibility as the run label or bot assignment ([#1629](https://github.com/vtmocanu/uzi/pull/1629)).**
   When proposing an issue, chat no longer asks for a `prds/*.md` file or the `PRD` label. It says an issue can run when it carries the instance's run label or is assigned to the bot account, asks for the exact label name, and adds a label only with your agreement. Chat and tool text also say "forge issue" instead of "GitLab issue" ([#1628](https://github.com/vtmocanu/uzi/pull/1628)).
+
+- **Run list: harness logo leads each row ([#1681](https://github.com/vtmocanu/uzi/issues/1681)).**
+  Claude and Codex logos stay visible even while a run waits for vault unlock; the run header keeps its compact chip.
+- **The Notifications inbox tab, bell icon and unread badge are retired; `run_failed`, `ci_autofix_started`, `ci_autofix_landed` and `selfimprove_started` are no longer produced ([#1650](https://github.com/vtmocanu/uzi/issues/1650)).**
+  Every signal the inbox carried already has, or now has, a home elsewhere: Findings, Judge, Schedules, Admin Health, the run page, or a Slack DM (see the three new DM kinds above). The four status-only kinds duplicated a page surface or a Slack DM that already existed, so they stop firing; the start comment an auto-fix posts (and its halt comment) are unchanged; a landed fix never posted a forge comment of its own. Visiting `/notifications` now redirects to the dashboard through the app's catch-all route. The favicon's amber dot now means only "a run needs you" (awaiting approval, an answer, or your next follow-up); the inbox's unread count no longer feeds it. The `notifications` table itself is unaffected: it stays as a pruned, write-only event log and the incidental-finding Slack de-dup latch; nothing reads it back to a user.
+- **The early-limit-reset alert is now Slack-only ([#1650](https://github.com/vtmocanu/uzi/issues/1650)).**
+  Without a linked Slack account you no longer get this alert at all; the early reset still shows up on the rate-limit meters either way.
+- **The completion check now covers Codex issue runs too ([#1627](https://github.com/vtmocanu/uzi/issues/1627), PR [#1683](https://github.com/vtmocanu/uzi/pull/1683)).**
+  With Completion check on (the default), a new, unseeded issue run on either the Claude or the Codex harness is stamped for it; a seeded-plan run stays exempt. A Codex run with unmet milestones is nudged back into the same thread to finish them before it enters the recoverable completion hold. An interlocked Codex run needs a worker advertising `codex_completion_interlock_v1` (this release's worker) and stays queued, with a health reason naming the missing capability, until one is online.
+- **The TUI board header shows your server-side cost for the last 7 days ([#1672](https://github.com/vtmocanu/uzi/issues/1672), PR [#1680](https://github.com/vtmocanu/uzi/pull/1680)).**
+  It replaces a sum over the last 200 visible runs. A trailing `+` marks that subscription or unreported costs are excluded; the figure refreshes every 60 seconds and on a manual refresh, is hidden on the admin board, and is hidden after a failed request until the next successful one.
+- **The bundled uzi-cli skill treats "issue not found on this repo's board" for a just-filed issue as poller sync lag and retries within 90 seconds ([#1692](https://github.com/vtmocanu/uzi/pull/1692)).**
+
+### Security
+
+- **Run-keyed forge token lookups are scoped to the run's owner ([#1688](https://github.com/vtmocanu/uzi/issues/1688)).**
+  Defense in depth: the queries that load a run's forge connection for claim, move and worker use now also require the connection to belong to the run's owner, so a run pointing at another user's repo would find no token (treated as a benign skip) rather than use it. No reachable mismatch was found; the schema just did not enforce it.
+- **Docs: on hosted Kubernetes workers, Docker-in-Docker shares the whole run workdir ([#1689](https://github.com/vtmocanu/uzi/issues/1689)).**
+  A Docker bind mount from one run can read or write a sibling run's clone on the same worker. Hosted workers only claim their owner's runs, so this is a same-owner residual accepted for the opt-in Docker tier; compose DinD does not share the workdir.
 
 ## [0.83.1] - 2026-09-19
 
