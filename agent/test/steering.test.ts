@@ -1439,6 +1439,94 @@ describe("input receipts", () => {
     }
   });
 
+  it("retries an untyped 404 on ACK or APPLIED (an api pod without the route) instead of ending the flight", async () => {
+    for (const at of ["ack", "applied"] as const) {
+      const row: UserInput = { id: 7, kind: "approve_plan", body: null };
+      let acks = 0;
+      let applies = 0;
+      const notFound = (path: string): RequestError => new RequestError("POST", path, 404, "404 page not found");
+      const cancel = new AbortController();
+      const client = {
+        getInputs: async () => ({ inputs: [row] }),
+        ackInputs: async () => {
+          if (at === "ack" && ++acks <= 2) throw notFound("/inputs/ack");
+          return { inputs: [row], active: true };
+        },
+        applyInputs: async () => {
+          if (at === "applied" && ++applies <= 2) throw notFound("/inputs/applied");
+          return { inputs: [row], active: true };
+        },
+      } as unknown as WorkerClient;
+      const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
+      ch.start();
+      try {
+        assert.deepStrictEqual(await ch.awaitVerdict(), { kind: "approve", selection: { status: "absent" } }, at);
+        await until(() => (at === "ack" ? acks : applies) >= 3);
+        await ch.awaitReceiptSettlement();
+        assert.strictEqual(ch.claimFence(), undefined, `${at}: an untyped 404 is not a fence`);
+        assert.strictEqual(cancel.signal.aborted, false);
+      } finally {
+        await ch.stop();
+      }
+    }
+  });
+
+  it("gives up an applied receipt by elapsed time when the request hangs or is slow", async () => {
+    for (const mode of ["hung", "slow"] as const) {
+      const row: UserInput = { id: 7, kind: "follow_up", body: "seven" };
+      let applies = 0;
+      const client = {
+        getInputs: async () => ({ inputs: [row] }),
+        ackInputs: async () => ({ inputs: [row], active: true }),
+        applyInputs: async () => {
+          applies++;
+          // A hung request answers only at the client's HTTP timeout (here 500 ms, past the
+          // 100 ms deadline); a slow one fails after 20 ms each time.
+          await tick(mode === "hung" ? 500 : 20);
+          throw new RequestError("POST", "/inputs/applied", 504, "timeout");
+        },
+      } as unknown as WorkerClient;
+      const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { receiptDeadlineMs: 100 });
+      ch.start();
+      try {
+        assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "seven" });
+        const started = Date.now();
+        await assert.rejects(ch.awaitReceiptSettlement(), (err: Error) => err.name === "InputReceiptError", mode);
+        assert.ok(Date.now() - started < 2_000, `${mode}: bounded by the deadline, not the attempt count`);
+        assert.ok(applies < 30, `${mode}: gave up after ${applies} attempts`);
+      } finally {
+        await ch.stop();
+      }
+    }
+  });
+
+  it("ends a settlement wait on a cancel or the report's own abort, leaving the outcome to the report", async () => {
+    for (const via of ["cancel", "report"] as const) {
+      const row: UserInput = { id: 7, kind: "approve_plan", body: null };
+      const cancel = new AbortController();
+      const client = {
+        getInputs: async () => ({ inputs: [row] }),
+        ackInputs: async () => ({ inputs: [row], active: true }),
+        // Slow enough that only the abort can end the wait first.
+        applyInputs: async () => { await tick(300); return { inputs: [row], active: true }; },
+      } as unknown as WorkerClient;
+      const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
+      ch.start();
+      try {
+        await ch.awaitVerdict();
+        await tick();
+        const report = new AbortController();
+        const waiting = ch.awaitReceiptSettlement(report.signal);
+        const started = Date.now();
+        (via === "cancel" ? cancel : report).abort();
+        await waiting;
+        assert.ok(Date.now() - started < 200, `${via}: the abort ended the wait before the applied reply`);
+      } finally {
+        await ch.stop();
+      }
+    }
+  });
+
   it("gives up a routed receipt after a bounded number of applied attempts at stop", async () => {
     const row: UserInput = { id: 7, kind: "approve_plan", body: null };
     let attempts = 0;

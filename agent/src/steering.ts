@@ -66,6 +66,9 @@ export interface SteeringOptions {
    *  so a channel constructed without it never trips a switch (the behaviour of every test and
    *  chat path that omits it). Threaded from the flight by the runner. */
   claimGeneration?: number;
+  /** Issue #1673: how long a routed batch may wait for its applied receipt on the active claim
+   *  before the channel gives up (default ACTIVE_APPLY_DEADLINE_MS). Injectable for tests. */
+  receiptDeadlineMs?: number;
 }
 
 /** Feed notices for events discarded because they were written against a plan version
@@ -163,6 +166,9 @@ const STOP_APPLY_ATTEMPTS = 3;
 /** Issue #1673: consecutive failed applied attempts on an ACTIVE claim before the channel gives
  *  up. A state report waits on the applied receipt, so an unbounded retry would hold it forever. */
 const ACTIVE_APPLY_ATTEMPTS = 30;
+/** Issue #1673: the same bound in elapsed time, from routing. An applied request can itself take
+ *  a full HTTP timeout, so the attempt count alone could hold a report for many minutes. */
+const ACTIVE_APPLY_DEADLINE_MS = 60_000;
 
 /** Issue #1673: the applied receipt for a routed batch could not be confirmed. Thrown to every
  *  state report still waiting on it and to the parked waiters, so the run fails instead of
@@ -185,17 +191,23 @@ class ClaimFencedSignal extends Error {
 }
 
 /** Issue #1673: the claim fence a failed receipt names: a 409's `reason` ("" for a row-state
- *  conflict), "stale" for a 404, undefined for anything else (retryable). */
+ *  conflict), undefined for anything else. Only the new route's typed body fences a claim: an
+ *  untyped 404 (an api pod that predates the route, mid-roll) is an availability error. */
 function receiptFenceReason(err: unknown): string | undefined {
-  if (!(err instanceof RequestError)) return undefined;
-  if (err.status === 404) return "stale";
-  if (err.status !== 409) return undefined;
+  if (!(err instanceof RequestError) || err.status !== 409) return undefined;
   try {
     const reason = (JSON.parse(err.body) as { reason?: unknown }).reason;
     return typeof reason === "string" ? reason : "";
   } catch {
     return "";
   }
+}
+
+/** A 4xx that no retry of the same ids can fix. 404/405 (a route an older api pod lacks), 408
+ *  and 429 are availability errors and retry like a 5xx. */
+function definitiveReceiptError(err: unknown): boolean {
+  return err instanceof RequestError && err.status >= 400 && err.status < 500 &&
+    ![404, 405, 408, 429].includes(err.status);
 }
 
 /** A fenced claim ends the old flight, except a pending credential switch, whose own signal
@@ -251,7 +263,7 @@ export class SteeringChannel {
   /** Issue #1673: the one input batch in flight. No newer GET replaces it until its ACK and
    *  applied receipts settle: "ack" retries the same ids, "routed" is serviced by the waiters
    *  on the tick that routed it, "applied" retries the applied receipt without rerouting. */
-  private held: { ids: number[]; phase: "ack" | "routed" | "applied"; hasFollowUp: boolean } | undefined;
+  private held: { ids: number[]; phase: "ack" | "routed" | "applied"; hasFollowUp: boolean; routedAt?: number } | undefined;
   /** Applied attempts made since stop(); bounded by STOP_APPLY_ATTEMPTS. */
   private stopApplyAttempts = 0;
   /** Consecutive failed applied attempts on the active claim; bounded by ACTIVE_APPLY_ATTEMPTS. */
@@ -262,16 +274,61 @@ export class SteeringChannel {
    *  armed after that rejects at once instead of waiting on a poll loop that has stopped. */
   private flightEnded: Error | undefined;
   private readonly receiptWaiters: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
+  private readonly receiptDeadlineMs: number;
+  /** Why this flight was fenced (released | stale), once it was; the runner then stops quietly. */
+  private fence: string | undefined;
 
   /** Issue #1673: resolves once no routed input awaits its applied receipt. The runner holds
    *  every non-terminal state report behind it, so the server's resume guards (which count only
    *  APPLIED inputs) see the follow-up, verdict or answer that caused the report. Rejects with
    *  InputReceiptError once the receipt is given up, so no guarded report goes out as if the
    *  input were applied. */
-  async awaitReceiptSettlement(): Promise<void> {
+  async awaitReceiptSettlement(signal?: AbortSignal): Promise<void> {
     if (this.receiptFailure) throw this.receiptFailure;
     if (!this.receiptPending()) return;
-    await new Promise<void>((resolve, reject) => this.receiptWaiters.push({ resolve, reject }));
+    // Abort-aware: a cancel, pause or switch trip (the shared controller) or the report's own
+    // signal ends the wait, and the report then takes its own outcome.
+    const signals = [this.cancel.signal, signal].filter((s): s is AbortSignal => s !== undefined);
+    if (signals.some((s) => s.aborted)) return;
+    await new Promise<void>((resolve, reject) => {
+      const done = (): void => {
+        clearTimeout(timer);
+        for (const s of signals) s.removeEventListener("abort", onAbort);
+      };
+      const waiter = {
+        resolve: () => { done(); resolve(); },
+        reject: (err: Error) => { done(); reject(err); },
+      };
+      const onAbort = (): void => {
+        const i = this.receiptWaiters.indexOf(waiter);
+        if (i >= 0) this.receiptWaiters.splice(i, 1);
+        waiter.resolve();
+      };
+      // Deadline-bound even while an applied request is still in flight (a slow or hung reply).
+      const timer = setTimeout(() => {
+        if (this.receiptPending())
+          this.failReceipts(new InputReceiptError(
+            `could not confirm ${this.held!.ids.length} applied operator input(s) within ${this.receiptDeadlineMs} ms`,
+          ));
+      }, this.receiptRemainingMs());
+      timer.unref?.();
+      for (const s of signals) s.addEventListener("abort", onAbort, { once: true });
+      this.receiptWaiters.push(waiter);
+    });
+  }
+
+  /** Why this flight was fenced by a receipt (released | stale), or undefined. */
+  claimFence(): string | undefined {
+    return this.fence;
+  }
+
+  private receiptRemainingMs(): number {
+    const since = this.held?.routedAt ?? this.now();
+    return Math.max(0, this.receiptDeadlineMs - (this.now() - since));
+  }
+
+  private receiptOverdue(): boolean {
+    return this.receiptRemainingMs() === 0;
   }
 
   private receiptPending(): boolean {
@@ -301,6 +358,7 @@ export class SteeringChannel {
   private endFencedFlight(reason: string): void {
     this.log.warn("steering: input receipt claim is fenced; ending this flight", { run_id: this.runId, reason });
     const signal = new ClaimFencedSignal(reason);
+    this.fence = reason;
     this.flightEnded = signal;
     this.releaseHeld();
     this.stopped = true;
@@ -315,11 +373,12 @@ export class SteeringChannel {
     if (!this.held) return;
     const reason = receiptFenceReason(err);
     if (endsFlight(reason)) return this.endFencedFlight(reason!);
-    if (reason !== undefined || (err instanceof RequestError && err.status >= 400 && err.status < 500))
-      return this.releaseHeld();
-    if (this.held.phase === "applied" && !this.stopped && ++this.applyFailures >= ACTIVE_APPLY_ATTEMPTS)
+    if (reason !== undefined || definitiveReceiptError(err)) return this.releaseHeld();
+    if (this.held.phase !== "applied" || this.stopped) return;
+    const attempts = ++this.applyFailures;
+    if (attempts >= ACTIVE_APPLY_ATTEMPTS || this.receiptOverdue())
       this.failReceipts(new InputReceiptError(
-        `could not confirm ${this.held.ids.length} applied operator input(s) after ${ACTIVE_APPLY_ATTEMPTS} attempts: ${errMessage(err)}`,
+        `could not confirm ${this.held.ids.length} applied operator input(s) after ${attempts} attempts: ${errMessage(err)}`,
       ));
   }
 
@@ -462,6 +521,7 @@ export class SteeringChannel {
     this.notify = opts.notify;
     this.now = opts.now ?? Date.now;
     this.claimGeneration = opts.claimGeneration ?? 0;
+    this.receiptDeadlineMs = opts.receiptDeadlineMs ?? ACTIVE_APPLY_DEADLINE_MS;
   }
 
   /** Seed the sticky `stop` state at construction time (issue #552 M3), before the poll
@@ -1130,6 +1190,7 @@ export class SteeringChannel {
       this.route(input.kind, input.body ?? undefined, input.id);
     }
     held.phase = "routed";
+    held.routedAt = this.now();
   }
 
   private async pollLoop(): Promise<void> {
@@ -1418,7 +1479,7 @@ export class ChatSteering implements ChatInputSource {
       } catch (err) {
         const reason = receiptFenceReason(err);
         if (this.held && (endsFlight(reason) || reason === "switch_pending")) this.loseClaim();
-        else if (this.held && (reason !== undefined || (err instanceof RequestError && err.status >= 400 && err.status < 500)))
+        else if (this.held && (reason !== undefined || definitiveReceiptError(err)))
           this.held = undefined;
         else if (this.held?.phase === "applied" && ++this.applyFailures >= ACTIVE_APPLY_ATTEMPTS) {
           // Nothing waits on a chat's applied receipt, so giving it up only drops the batch: the

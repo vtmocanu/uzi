@@ -2072,6 +2072,17 @@ export class RunRunner {
           { run_id: flight.runId },
         );
         await batcher.close().catch(() => undefined);
+      } else if (flight.steering?.claimFence() !== undefined) {
+        // Issue #1673: an input receipt said this claim was released or superseded (or the run is
+        // terminal), and the steering channel ended the flight. Like the StaleClaimError arm below:
+        // report NO terminal state and journal nothing (the server fence would refuse it), close
+        // the batcher, and let the finally run ordinary teardown. A server wall park is still
+        // recognised by the ServerWallParkedError arm above, when a report surfaced it first.
+        runLog.info("input receipt fenced this claim; stopping this flight", {
+          run_id: flight.runId,
+          reason: flight.steering.claimFence(),
+        });
+        await batcher.close().catch(() => undefined);
       } else if (err instanceof StaleClaimError) {
         // PRD #1247 M5b: a /state report came back with the stale_claim disposition — a held-state
         // credential switch RELEASED this claim, or a reclaim SUPERSEDED it. Another claim owns the
@@ -2387,6 +2398,9 @@ export class RunRunner {
     // behaviour is identical.
     beforeResolve?: () => Promise<void>,
   ): Promise<void> {
+    // Issue #1673: a flight an input receipt fenced (released or superseded claim) sends and
+    // journals no terminal; the StaleClaimError reaches executeClaim's quiet stop.
+    if (flight.steering?.claimFence() !== undefined) throw new StaleClaimError();
     const deps = this.terminalDeps();
     if (!deps) {
       // No usable outbox: run beforeResolve (abort + reap) then send un-journaled exactly as today. A
@@ -4973,7 +4987,7 @@ export class RunRunner {
         // uncertain. Keep the report behind that receipt so the server's resume guards see it;
         // the wait throws once the receipt is given up, so neither a resume nor a completion goes
         // out as if the input were applied. Only `failed` never waits: it must land to end the run.
-        if (body.status !== "failed") await steering.awaitReceiptSettlement();
+        if (body.status !== "failed") await steering.awaitReceiptSettlement(signal);
         // PRD #1390 M2a: this same choke point is where the run announces every phase
         // transition, so reflect the four snapshot phases (running / awaiting_approval /
         // awaiting_input / awaiting_followup) into the active-run registry BEFORE the report
