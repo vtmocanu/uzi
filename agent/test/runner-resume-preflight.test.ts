@@ -4,6 +4,11 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
+import { CodexExecutor } from "../src/codex/codex-executor.js";
+import { selectCodexBinding } from "../src/codex/select.js";
+import type { CodexNotification, CodexTransport } from "../src/codex/transport.js";
+import type { CodexRootHandle } from "../src/codex/launcher.js";
 import { type RunContext, type ExecutorResult } from "../src/executor.js";
 import { CodexSessionStore } from "../src/codex/session-state.js";
 import {
@@ -13,6 +18,7 @@ import {
 } from "../src/runner.js";
 import {
   api,
+  client,
   fakeGitlab,
   fx,
   gitlabClaim,
@@ -342,4 +348,107 @@ describe("RunRunner — resume preflight (issue #105)", () => {
     // 'resume_continued'`) by the server/web; a silent rename would break it (PRD #556 M2).
     assert.strictEqual(RESUME_CONTINUED_EVENT, "resume_continued");
   });
+});
+
+it("a resumed Codex runner turn adopts the claimed persisted thread", async () => {
+  const sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const turnId = "resumed-turn";
+  const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-codex-runner-resume-"));
+  const source = path.join(homeRoot, "source");
+  const { gitlab } = fakeGitlab();
+  const codex = {
+    auth_mode: "subscription" as const, access_token: "fixture-access", capability: "fixture-capability",
+    generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: null,
+  };
+  const claim = gitlabClaim(1627, {
+    session_id: sid,
+    plan_approved: true,
+    plan_md: "Approved plan",
+    secrets: {
+      forge_pat: "fixture-forge", forge_username: "bot", anthropic_oauth_token: "fixture-oauth", codex,
+    },
+  });
+  const requests: Array<{ method: string; params: unknown }> = [];
+  let artifactAtLaunch = false;
+  let waiter: ((value: IteratorResult<CodexNotification>) => void) | undefined;
+  const queue: CodexNotification[] = [];
+  const push = (note: CodexNotification): void => {
+    if (waiter) { const resolve = waiter; waiter = undefined; resolve({ value: note, done: false }); }
+    else queue.push(note);
+  };
+  const transport: CodexTransport = {
+    async request<T>(method: string, params?: unknown): Promise<T> {
+      requests.push({ method, params });
+      if (method === "initialize") return { userAgent: "codex/0.153.2", codexHome: source, platformFamily: "unix", platformOs: "linux" } as T;
+      if (method === "account/login/start") return { type: (params as { type: string }).type } as T;
+      if (method === "thread/resume") return { thread: { id: sid } } as T;
+      if (method === "thread/start") throw new Error("resumed claim started a new thread");
+      if (method === "turn/start") {
+        push({ kind: "activity", method: "item/tool/call", requestId: 1,
+          params: { threadId: sid, turnId, callId: "done-1", tool: "signal_done", arguments: {} } });
+        push({ kind: "turn_completed", method: "turn/completed", threadId: sid, turnId,
+          status: "completed", params: { threadId: sid, turn: { id: turnId, status: "completed" } } });
+        return { turn: { id: turnId } } as T;
+      }
+      return {} as T;
+    },
+    notify() {},
+    respond() {},
+    installServerRequestInterceptor: () => () => {},
+    notifications() {
+      return {
+        next: () => queue.length ? Promise.resolve({ value: queue.shift()!, done: false as const })
+          : new Promise<IteratorResult<CodexNotification>>((resolve) => { waiter = resolve; }),
+        return: async () => ({ value: undefined, done: true as const }),
+        [Symbol.asyncIterator]() { return this; },
+      };
+    },
+    async close() { if (waiter) { waiter({ value: undefined, done: true }); waiter = undefined; } },
+  };
+  try {
+    fs.mkdirSync(path.join(source, "sessions"), { recursive: true });
+    fs.writeFileSync(path.join(source, "sessions", `rollout-2026-09-25-${sid}.jsonl`), "{}\n");
+    const runHome = path.join(homeRoot, claim.run_id);
+    const store = path.join(runHome, "codex-session-store");
+    // The injected launcher owns the synthetic provider HOME's parent.
+    fs.mkdirSync(path.join(runHome, "codex-data", "epoch-0"), { recursive: true });
+    await CodexSessionStore.persist(source, store);
+    const selected = selectCodexBinding({ codex });
+    assert.equal(selected.kind, "codex");
+    if (selected.kind !== "codex") throw new Error("invalid Codex fixture");
+    const provider = { name: "openai", baseUrl: "http://127.0.0.1:9/v1", envKey: "OPENAI_API_KEY", model: "gpt-6-astra" };
+    await runnerWith((runId) => ({
+      homeDir: path.join(homeRoot, runId),
+      executor: new CodexExecutor({ debug() {}, info() {}, warn() {}, error() {}, addSecret() {}, removeSecret() {}, child() { return this; } },
+        path.join(homeRoot, runId), { binding: selected.binding, client, provider }, {
+          launchProviderRoot: async () => {
+            artifactAtLaunch = fs.existsSync(path.join(runHome, "codex-data", "epoch-0", "codex", "sessions", `rollout-2026-09-25-${sid}.jsonl`));
+            return { root: { kind: "provider", reap: async () => ({ ok: true }), dispose: async () => {} }, transport, supervisorPid: 1234 };
+          },
+          launchEffectRoot: async (): Promise<CodexRootHandle> => ({
+            started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
+              nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+            supervisorPid: 200,
+            transport: { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() },
+            snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+            waitChild: async () => ({ event: "child_exit", code: 0 }),
+            dispose: async () => ({ clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }),
+            failed: undefined, whenFailed: new Promise<Error>(() => undefined),
+          }),
+          wireFileop: () => ({ client: { op: async () => ({ ok: true }) }, dispose: async () => {} }),
+          spawnCommand: async () => ({ code: 0, stdout: "", stderr: "" }),
+          provisionRunTools: async () => ({ toolEnv: {} }),
+          idleMs: 5000, wallMs: 5000, childTurnDeadlineMs: 5000,
+        }),
+    }), gitlab).execute(claim);
+    const events = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => m.payload.event);
+    assert.ok(events.includes(RESUME_CONTINUED_EVENT), "runner accepted the persisted claimed thread");
+    assert.equal(artifactAtLaunch, true, `session artifact missing at launch; requests=${JSON.stringify(requests.map((r) => r.method))} messages=${JSON.stringify(api.messages(claim.run_id).map((m) => [m.kind, m.payload.event, m.payload.text]))}`);
+    const resume = requests.find((r) => r.method === "thread/resume");
+    const turn = requests.find((r) => r.method === "turn/start");
+    assert.equal((resume?.params as { threadId?: string })?.threadId, sid);
+    assert.equal((turn?.params as { threadId?: string })?.threadId, sid);
+  } finally {
+    fs.rmSync(homeRoot, { recursive: true, force: true });
+  }
 });
