@@ -699,8 +699,11 @@ nothing a manual start cannot.
   - `--harness claude|codex` (valid on every target, including `self_improve` defaults)
     pins the harness every run this schedule fires uses; omit it to resolve the
     effective harness per fire instead of pinning one.
-- `uzi schedule list` — your schedules as a table (`ID`, `TARGET`, `REPO`, `WHEN`,
-  `NEXT`, `ON`, `HARNESS`); `--json` dumps the raw array. Each element's `target` is the
+- `uzi schedule list` — your schedules as a table (`ID`, `TARGET`, `SOURCE`, `REPO`,
+  `WHEN`, `NEXT`, `ON`, `HARNESS`); `SOURCE` is the catalog slug for a **default**
+  schedule (the `catalog_slug` of an `origin: "default"` row) and `custom` for one you
+  authored. `--json` dumps the raw array (no `SOURCE` field; read `origin` and
+  `catalog_slug`). Each element's `target` is the
   string enum `issue` | `sweep` | `prompt` (a plain string, NOT a nested object),
   and a sweep's label selector is the top-level `labels` array. So the correct way
   to answer "is there a sweep schedule, and on which label(s)?" is
@@ -806,10 +809,12 @@ nothing a manual start cannot.
   **purely advisory and never blocks the enable — not even on its own forge errors**: a
   failed label check or create prints a `WARNING` and proceeds (the enable otherwise reads
   nothing from the forge).
-- `uzi schedule reset <schedule-id>` — restore a **default** schedule's edited fields (cron,
-  timezone, model, apply-model-to-agents, auto-approve, wait-on-limit, max-issues) to the
-  builtin catalog values — `apply-model-to-agents` resets to `false` — and clear its
-  customized flag. Only a default-origin schedule can be reset; a user-origin one is a `409`.
+- `uzi schedule reset <schedule-id>` — restore a **default** schedule's edited fields to the
+  builtin catalog values: cron, timezone, model, auto-approve, wait-on-limit, MR rework,
+  max issues and output mode return to the catalog values, `apply-model-to-agents` resets
+  to `false`, and the guidance, the harness pin and the credential override are cleared.
+  It also clears the customized flag. The catalog-owned prompt and labels are not touched.
+  Only a default-origin schedule can be reset; a user-origin one is a `409`.
 - `uzi schedule clone <schedule-id> [--repo <repo-id>]` — copy a schedule into a new, fully
   editable schedule you own. Cloning a **default** schedule lifts its catalog prompt lock (the
   baked prompt, or a sweep's labels/guidance, is copied into the new row, which becomes a

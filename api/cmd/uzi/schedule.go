@@ -63,10 +63,13 @@ func newScheduleResetCmd(env Env, gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "reset <schedule-id>",
 		Short: "Reset a default schedule's edited fields back to the catalog defaults",
-		Long: "Restore a default-origin schedule's editable fields (cron, timezone, model,\n" +
-			"auto-approve, wait-on-limit, mr-rework, max-issues) to the builtin catalog values and clear its\n" +
-			"customized flag. Only a default-origin schedule can be reset; a user-origin one is a\n" +
-			"conflict (there is nothing to reset to).",
+		Long: "Restore a default-origin schedule's editable fields to the builtin catalog values:\n" +
+			"cron, timezone, model, auto-approve, wait-on-limit, MR rework, max issues and output\n" +
+			"mode return to the catalog values, apply-model-to-agents is set to false, and the\n" +
+			"guidance, the harness pin and the credential override are cleared. The customized\n" +
+			"flag is cleared too. The catalog-owned prompt and labels are not touched. Only a\n" +
+			"default-origin schedule can be reset; a user-origin one is a conflict (there is\n" +
+			"nothing to reset to).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)
@@ -323,6 +326,7 @@ func newScheduleListCmd(env Env, gf *globalFlags) *cobra.Command {
 				rows = append(rows, []string{
 					s.ID,
 					scheduleTarget(s),
+					scheduleSource(s),
 					strOr(&s.RepoPath, "-"),
 					scheduleWhen(s),
 					scheduleNextCell(s, now, pause),
@@ -333,7 +337,7 @@ func newScheduleListCmd(env Env, gf *globalFlags) *cobra.Command {
 					strOr(s.Harness, "-"),
 				})
 			}
-			return p.Table([]string{"ID", "TARGET", "REPO", "WHEN", "NEXT", "ON", "HARNESS"}, rows)
+			return p.Table([]string{"ID", "TARGET", "SOURCE", "REPO", "WHEN", "NEXT", "ON", "HARNESS"}, rows)
 		},
 	}
 }
@@ -710,6 +714,16 @@ func scheduleTarget(s apitypes.ScheduleDTO) string {
 	default:
 		return s.Target
 	}
+}
+
+// scheduleSource renders the list table's SOURCE column (PRD #1645 D10): the catalog
+// slug for a default-origin schedule ("-" when a default carries no slug), else "custom"
+// for an owner-authored one.
+func scheduleSource(s apitypes.ScheduleDTO) string {
+	if s.Origin == schedOriginDefault {
+		return strOr(s.CatalogSlug, "-")
+	}
+	return "custom"
 }
 
 // maxIssuesStr renders the sweep cap for the detail block: the number when set, or
