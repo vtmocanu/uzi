@@ -338,7 +338,7 @@ git -C "$SEED" commit -qam 'reset changelog'; git -C "$SEED" push -q origin main
 mk_branch bo
 cl_one() { awk -v add="$2" '{print} $0=="- **one**"{print add}' "$1" > "$1.tmp" && mv "$1.tmp" "$1"; }
 cl_one "$SEED/CHANGELOG.md" '- **note, first wording**'; git -C "$SEED" commit -qam 'bo 1'
-gsed -i 's/- \*\*note, first wording\*\*/- **note, second wording**/' "$SEED/CHANGELOG.md"; commit_push bo 'bo 2'
+sed 's/- \*\*note, first wording\*\*/- **note, second wording**/' "$SEED/CHANGELOG.md" > "$SEED/CHANGELOG.md.tmp" && mv "$SEED/CHANGELOG.md.tmp" "$SEED/CHANGELOG.md"; commit_push bo 'bo 2'
 git -C "$SEED" switch -q main; cl_one "$SEED/CHANGELOG.md" '- **main o**'; git -C "$SEED" commit -qam 'main o'; git -C "$SEED" push -q origin main
 run bo 219 --no-push --gate none
 [ "$rc" -eq 5 ] || fail "O: a reworded bullet returned rc=$rc, want 5: $(cat "$WORK/out.219")"
