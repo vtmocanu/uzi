@@ -1101,19 +1101,25 @@ A newer release is available.
   the TITLE; there are no STATUS/HEALTH/MILE column headers or full-width
   rules. The list windows to the terminal height so the wordmark and key
   legend stay on screen however many runs there are, with the visible run
-  span (`lo–hi`) and a rounded floor total shown in the top-right summary
-  cluster (`⚑ N · ✎ N · ➤ N · ⚿ N · ▲ N · $N · T runs`) — the total is the sum of every
-  usage-bearing run's cost, rounded from the raw sum rather than added up
-  from the visible per-row cells (so the two won't always visibly agree —
-  the total is the accurate figure), and it's dropped when zero. Each
-  segment is dropped when its count is zero, so a healthy factory reads
-  simply `N runs`: `⚑` is the plan gate, `✎` a clarifying question, `➤` an
-  interactive task waiting on your next follow-up, `⚿` a Codex run needing
-  you to log in again (see [Codex account
+  span (`lo–hi`) and a seven-day cost shown in the top-right summary
+  cluster (`⚑ N · ✎ N · ➤ N · ⚿ N · ▲ N · $N 7d · T runs`). On your own
+  board, `$N 7d` is the rounded `Last7Days.CostUSD` from the server's
+  `GET /api/usage` response, covering the last seven days even when runs
+  are outside the visible list window. A `+` after the dollar amount means
+  subscription or unreported run costs are excluded from that amount;
+  `$0+ 7d` can therefore appear. The cost segment is hidden while the
+  initial fetch is pending, after a failed fetch, or when a fully metered
+  total rounds to zero. It never appears on the admin/factory board. Each
+  count segment is dropped when its count is zero, so a healthy factory
+  reads simply `N runs`: `⚑` is the plan gate, `✎` a clarifying question,
+  `➤` an interactive task waiting on your next follow-up, `⚿` a Codex run
+  needing you to log in again (see [Codex account
   unavailable](run-recovery-wait.md#codex-account-unavailable)), and `▲` a
-  stalled/looping/near-timeout run. The whole
-  board refreshes on the poll, so status, health, milestones, age, cost and
-  the judge verdict stay live. **A locked vault gets its own line** beside
+  stalled/looping/near-timeout run. The two-second board poll refreshes
+  rows and their per-run COST cells, along with status, health, milestones,
+  age and the judge verdict. The header's `7d` cost fetches separately on
+  the 60-second side-fetch, manual refresh and board toggle. **A locked
+  vault gets its own line** beside
   the per-token rate-limit strip under the wordmark — the strip is never
   hidden — matching the web SPA's "waiting for vault unlock": a quiet, faint
   `🔒 vault locked` hint (`[locked] vault locked` under NO_COLOR or a
