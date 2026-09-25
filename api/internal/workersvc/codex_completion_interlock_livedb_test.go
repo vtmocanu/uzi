@@ -86,6 +86,45 @@ func TestCodexCompletionReleasedWorkerHealthLiveDB(t *testing.T) {
 	}
 }
 
+func TestCodexCompletionClaimableCountLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	e.seedHeartbeatWorker(t, []string{capability.CompletionInterlockV1, capability.CodexHarnessV1})
+	runID := e.seedCodexQueuedRun(t)
+	e.exec(t, `UPDATE runs SET completion_contract_version = 1 WHERE id = $1`, runID)
+
+	if got := e.claimableForRun(t, runID); got != 0 {
+		t.Fatalf("interlocked Codex run with only an old worker: claimable count = %d, want 0", got)
+	}
+	e.seedHeartbeatWorker(t, codexCompletionCaps())
+	if got := e.claimableForRun(t, runID); got != 1 {
+		t.Fatalf("interlocked Codex run after adding a capable worker: claimable count = %d, want 1", got)
+	}
+}
+
+func TestCodexCompletionCustomRootProtocolIntersectionLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	e.seedWorker(t, codexCompletionCaps())
+	e.seedWorker(t, []string{capability.CompletionInterlockV1, capability.CodexHarnessV1, capability.CodexCustomModelV1})
+
+	count := func() int64 {
+		t.Helper()
+		n, err := e.q.CountOnlineWorkersSatisfyingCodexCompletion(e.ctx, store.CountOnlineWorkersSatisfyingCodexCompletionParams{
+			UserID: e.userID, CustomRoot: true,
+		})
+		if err != nil {
+			t.Fatalf("CountOnlineWorkersSatisfyingCodexCompletion: %v", err)
+		}
+		return n
+	}
+	if got := count(); got != 0 {
+		t.Fatalf("split custom-root fleet: protocol intersection count = %d, want 0", got)
+	}
+	e.seedWorker(t, append(codexCompletionCaps(), capability.CodexCustomModelV1))
+	if got := count(); got != 1 {
+		t.Fatalf("four-capability custom-root worker: protocol intersection count = %d, want 1", got)
+	}
+}
+
 func TestCodexCompletionHealthIntersectionLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	svc := e.permitService(t)
