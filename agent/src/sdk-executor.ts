@@ -3435,8 +3435,11 @@ export class SdkExecutor implements Executor {
     state.currentChild = {};
 
     let idleTimer: NodeJS.Timeout | undefined;
+    const outstandingTools = new Set<string>();
     const armIdle = (): void => {
       if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = undefined;
+      if (outstandingTools.size > 0) return;
       idleTimer = setTimeout(() => this.trip(state, REASON_IDLE), idleMs);
       idleTimer.unref?.();
     };
@@ -3495,7 +3498,17 @@ export class SdkExecutor implements Executor {
       };
       const turn = this.harness.startTurn(request);
       for await (const event of turn.events) {
-        armIdle(); // any event is liveness
+        if (event.kind === "frame") {
+          for (const item of event.items) {
+            if (item.kind !== "tool" || item.id === undefined) continue;
+            if (item.phase === "started" && item.signal === undefined) {
+              outstandingTools.add(item.id);
+            } else if (item.phase === "finished") {
+              outstandingTools.delete(item.id);
+            }
+          }
+        }
+        armIdle(); // any event is liveness when no tool is outstanding
         if (event.kind === "initialized") {
           if (event.sessionId) initSessionId = event.sessionId;
           if (event.freshSession === true) freshInit = true;

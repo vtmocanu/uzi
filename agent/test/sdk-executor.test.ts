@@ -1918,6 +1918,105 @@ describe("SdkExecutor failure + watchdog paths", () => {
     assert.strictEqual(turns[0]!.options.abortController!.signal.aborted, true);
   });
 
+  // Keep the SDK stream live while the watchdog decides whether to abort it.
+  // A ref'd delay also lets the unref'd watchdog fire under node --test.
+  const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+  const toolUse = (id: string | undefined, name = "Bash"): SDKMessage => ({
+    type: "assistant", session_id: "sess-1",
+    message: { content: [{ type: "tool_use", id, name, input: {} }] },
+  }) as unknown as SDKMessage;
+  const toolResult = (id: string): SDKMessage => ({
+    type: "user", session_id: "sess-1",
+    message: { content: [{ type: "tool_result", tool_use_id: id, content: "ok" }] },
+  }) as unknown as SDKMessage;
+
+  it("suspends idle for a quiet Bash tool and gives its result a full interval", async () => {
+    let aliveBeforeResult = false;
+    let resultAt = 0;
+    let abortedAt = 0;
+    const script = (signal: AbortSignal): AsyncIterable<unknown> => ({
+      async *[Symbol.asyncIterator]() {
+        signal.addEventListener("abort", () => { abortedAt = Date.now(); }, { once: true });
+        yield toolUse("bash-1");
+        await delay(90); // more than twice the 40 ms idle interval
+        aliveBeforeResult = !signal.aborted;
+        resultAt = Date.now();
+        yield toolResult("bash-1");
+        yield* hangUntilAbort(signal);
+      },
+    });
+    const { queryFn } = fakeTurns([script]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({ config: {
+        idle_timeout_seconds: 0.04, run_timeout_seconds: 2,
+      } }).ctx),
+      /idle timeout/,
+    );
+    assert.equal(aliveBeforeResult, true);
+    assert.ok(abortedAt - resultAt >= 25, "result should start a fresh idle interval");
+  });
+
+  it("wall timeout still fires while a Bash tool is outstanding", async () => {
+    const script = (signal: AbortSignal): AsyncIterable<unknown> => ({
+      async *[Symbol.asyncIterator]() {
+        yield toolUse("bash-1");
+        yield* hangUntilAbort(signal);
+      },
+    });
+    const { queryFn, turns } = fakeTurns([script]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({ config: {
+        idle_timeout_seconds: 0.03, run_timeout_seconds: 0.09,
+      } }).ctx),
+      /wall-clock timeout/,
+    );
+    assert.equal(turns[0]!.options.abortController!.signal.aborted, true);
+  });
+
+  it("keeps idle suspended across overlapping tools and unrelated results", async () => {
+    const alive: boolean[] = [];
+    const script = (signal: AbortSignal): AsyncIterable<unknown> => ({
+      async *[Symbol.asyncIterator]() {
+        yield toolUse("bash-1");
+        yield toolUse("bash-2");
+        await delay(90);
+        alive.push(!signal.aborted);
+        yield toolResult("other");
+        yield toolResult("bash-1");
+        await delay(90);
+        alive.push(!signal.aborted);
+        yield toolResult("bash-2");
+        yield* hangUntilAbort(signal);
+      },
+    });
+    const { queryFn } = fakeTurns([script]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({ config: {
+        idle_timeout_seconds: 0.04, run_timeout_seconds: 2,
+      } }).ctx),
+      /idle timeout/,
+    );
+    assert.deepEqual(alive, [true, true]);
+  });
+
+  it("still idles after signal-only and ID-less tool starts", async () => {
+    for (const start of [signalDone(), toolUse(undefined)]) {
+      const script = (signal: AbortSignal): AsyncIterable<unknown> => ({
+        async *[Symbol.asyncIterator]() {
+          yield start;
+          yield* hangUntilAbort(signal);
+        },
+      });
+      const { queryFn } = fakeTurns([script]);
+      await assert.rejects(
+        new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({ config: {
+          idle_timeout_seconds: 0.03, run_timeout_seconds: 1,
+        } }).ctx),
+        /idle timeout/,
+      );
+    }
+  });
+
   it("trips the wall-clock watchdog even while the agent is active and aborts", async () => {
     const script = (signal: AbortSignal): AsyncIterable<unknown> => ({
       async *[Symbol.asyncIterator]() {
