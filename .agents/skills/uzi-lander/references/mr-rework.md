@@ -49,11 +49,12 @@ by anything on the PR itself.
    review-summary, `github_mr.go` Sources A/B/C). An inline finding is silently skipped when
    a prior rework already consumed a higher-id actionable top-level/issue comment: its id
    sits below the mark, so GATE 3 in `mr_review_watch.go` never fires and no run appears
-   though the finding is the newest actionable comment. Standalone CodeRabbit control
-   comments such as `@coderabbitai review` and `@coderabbitai rate limit` are filtered and
-   do not advance this high-water. A fresh TOP-LEVEL PR comment lands above the mark and
-   fires it. Fail-safe (a skipped comment just falls back to human review), so the tell is
-   silence, not an error. Durable per-sequence-high-water fix tracked in #1199.
+   though the finding is the newest actionable comment. Standalone review-bot control
+   comments such as `@coderabbitai review`, `@coderabbitai rate limit`, `@greptileai review`
+   and `@greptile review` are filtered and do not advance this high-water. A fresh
+   TOP-LEVEL PR comment lands above the mark and fires it. Fail-safe (a skipped comment
+   just falls back to human review), so the tell is silence, not an error.
+   Durable per-sequence-high-water fix tracked in #1199.
 2. **If uzi is (or is about to be) reworking, DEFER — do not fix locally, do not merge.**
    The trigger needs a green pipeline + settled review, so the run may not have spawned yet
    even though it will; if the findings are uzi-fixable (below) and the owner is opted in,

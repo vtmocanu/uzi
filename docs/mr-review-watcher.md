@@ -29,9 +29,11 @@ it queues a new `mr_rework` run, auto-approved so it starts working right away:
 - there's at least one **actionable** review comment uzi hasn't already acted
   on; a review bot's walkthrough or summary note (the "here's what changed" or
   "no actionable comments" write-ups CodeRabbit and friends post at the top of a
-  PR) does not count, and neither does a standalone CodeRabbit control comment
-  such as `@coderabbitai review` or `@coderabbitai rate limit`; a human's top-level
-  note with actual feedback and any inline finding do count, and
+  PR) does not count, and neither does a comment consisting solely of a review-bot
+  control command: CodeRabbit's (`@coderabbitai review`, `@coderabbitai rate limit`,
+  and similar) or Greptile's (`@greptileai review`, `@greptile review`); add any
+  other words and it counts again. A human's top-level note with actual feedback
+  and any inline finding do count, and
 - the MR hasn't hit its [rework-cycle cap](#the-per-mr-cap).
 
 The rework run reads the MR's review comments (human reviewers and

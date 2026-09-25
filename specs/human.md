@@ -901,6 +901,12 @@ Tracked as GitHub issue vtmocanu/uzi#1650; PRD at `prds/done/1650-retire-notific
 - The web Notifications inbox (tab, bell, unread badge) is retired; actionable signals reach users by Slack DM (when linked) plus the page that owns the thing. [user 2026-09-25, #1650] (AI-synced 2026-09-25)
 - "Settings → Notifications" (Slack linking) is not the inbox and stays. [user 2026-09-25, #1650] (AI-synced 2026-09-25)
 
+## Feature #1695 — Review-bot control commands never trigger an MR rework
+
+Tracked as GitHub issue vtmocanu/uzi#1695.
+
+- A top-level MR comment consisting solely of an allowlisted review-bot control command (CodeRabbit's `@coderabbitai review` family; Greptile's `@greptileai review` / `@greptile review`) is not actionable review feedback and never starts an mr_rework; any added prose, or an inline comment, still counts. (AI-synced 2026-09-25)
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
