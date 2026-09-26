@@ -479,8 +479,8 @@ export class RunnerCloneMaterializationError extends Error {
  * imported into a SELF-CONTAINED (Codex) runner clone. Such a clone has no alternate into the
  * bare, so the finalize base-align cannot reach the tip's objects until
  * {@link GitCache.ensureRunnerCloneObjects} copies them in; when that copy fails (either side of
- * the pack stream, or the post-import verification), this is thrown and no process of the
- * import is left running.
+ * the pack stream, or the post-import verification), this is thrown once both processes of the
+ * import have exited (see that method for how a boundary producer is ended).
  */
 export class RunnerCloneImportError extends Error {
   constructor(
@@ -3771,17 +3771,27 @@ export class GitCache {
    * and default-branch commits) become `--not` exclusions, after filtering to the ones the bare
    * actually has: `pack-objects --revs` exits 128 on an unknown `--not` object.
    *
-   * Ordering inside a boundary: the `worker_pat` producer is spawned FIRST, while no command
-   * root is live — the safety facade's existing guard admits a `worker_pat` boundary process
-   * only while admission is closed and the registry reports no live `command`-kind root (every
-   * probe above has already completed and been reaped). The `command`-identity consumer is
-   * spawned second; the facade registers it as a `boundary_action` root, which that guard does
-   * not count and which is admitted like any other boundary process.
+   * Ordering inside a boundary: the safety facade admits a `worker_pat` boundary process only
+   * while admission is closed and the registry reports no live `command`-kind (model tool) root.
+   * Every process this method starts through the boundary, the `cat-file` probes and the
+   * `command`-identity consumer included, is registered as a `boundary_action` root, which that
+   * guard does not count, so none of them can trip it. The `worker_pat` producer is spawned
+   * first all the same, so no runner-identity process of this import is alive when it starts.
    *
    * Both exit statuses are awaited (inside a boundary each completion includes its root's
-   * reap). If either side fails, the pipe is torn down, the other side is ended/killed and
-   * awaited, and a {@link RunnerCloneImportError} is thrown; no process is left running. On
-   * success the clone is re-probed for `tip^{commit}`, and a miss is also an import error.
+   * reap). If either side fails or the pipe breaks, the side that failed first is named in the
+   * error, the other side is torn down and awaited, and a {@link RunnerCloneImportError} is
+   * thrown. How a torn-down side actually ends depends on where it runs:
+   *  - outside a boundary, the producer's stdout is destroyed and its child SIGKILLed; the
+   *    consumer's stdin is destroyed and its child SIGKILLed;
+   *  - inside a boundary, the handle exposes no way to signal the root, so the producer's stdout
+   *    is only DESTROYED: `pack-objects` ends at its next write (EPIPE), and a producer that
+   *    writes nothing more (still counting objects under `-q`) keeps running until the boundary
+   *    deadline aborts the wait and the registry reaps (disposes) its root; a reap that is not
+   *    clean poisons the registry. The consumer's stdin is destroyed, so `index-pack` reads EOF
+   *    and exits.
+   * Either way this method returns only once both exit statuses have settled. On success the
+   * clone is re-probed for `tip^{commit}`, and a miss is also an import error.
    */
   async ensureRunnerCloneObjects(barePath: string, clonePath: string, tip: string, haves: string[]): Promise<void> {
     const fail = (cause: string): RunnerCloneImportError => {
@@ -3796,10 +3806,12 @@ export class GitCache {
         return false;
       }
     };
-    if (await cloneHasTip()) return;
     // `tip` and every have are written to pack-objects' rev-list stdin one per line, so only a
-    // plain object id is accepted there (never an option-shaped or multi-line value).
+    // plain object id is accepted there (never an option-shaped or multi-line value). Checked
+    // before the probe too, so a symbolic tip (`HEAD`) the clone happens to resolve is refused
+    // rather than silently accepted as already present.
     if (!SHA40_RE.test(tip)) throw fail("tip is not a full object id");
+    if (await cloneHasTip()) return;
     const present: string[] = [];
     for (const have of new Set(haves)) {
       if (!have || !SHA40_RE.test(have)) continue;
@@ -3827,11 +3839,15 @@ export class GitCache {
       producerStopped = true;
       killProducer();
     };
-    // Keep a producer failure's message (spawnGit destroys stdout with the git stderr on a
-    // nonzero exit) without letting an unobserved stream error escape.
+    // Which stream errored FIRST: `pipeline` destroys every stream with the first error, so the
+    // side that broke is the one whose error event fired before the other's. Only that first
+    // producer error is kept as its message (spawnGit destroys stdout with git's stderr on a
+    // nonzero exit); a consumer error pipeline copied onto stdout is not the producer's cause.
+    let firstBroken: "producer" | "consumer" | undefined;
     let producerError = "";
     producer.stdout.on("error", (err: unknown) => {
-      producerError ||= gitErrorMessage(err);
+      firstBroken ??= "producer";
+      if (firstBroken === "producer") producerError ||= gitErrorMessage(err);
     });
     let consumer: Awaited<ReturnType<GitCache["spawnGitAsRunnerWithStdin"]>>;
     try {
@@ -3847,6 +3863,9 @@ export class GitCache {
       consumerStopped = true;
       consumer.abort();
     };
+    consumer.stdin.on("error", () => {
+      firstBroken ??= "consumer";
+    });
     const producerExit = producer.exited.then((code) => {
       if (code !== 0 && !producerStopped) stopConsumer();
       return code;
@@ -3858,7 +3877,13 @@ export class GitCache {
     const piped = pipeline(producer.stdout, consumer.stdin).then(
       () => undefined,
       (err: unknown) => {
-        // A broken pipe does not say which side failed; tear both down without attributing it.
+        // Attribute the break unless an exit handler already did: the producer when its stream
+        // errored first, otherwise the consumer (an EPIPE on its stdin, or a premature close with
+        // no error at all). Then tear both sides down.
+        if (!producerStopped && !consumerStopped) {
+          if (firstBroken === "producer") stopConsumer();
+          else stopProducer();
+        }
         killProducer();
         consumer.abort();
         return err;
