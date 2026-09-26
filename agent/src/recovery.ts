@@ -755,26 +755,26 @@ export class RecoveryCoordinator {
   /**
    * PRD #1349 M2 (D1) — remove ONLY the released generation's record(s) + their bundle files,
    * leaving every sibling generation's record (and its possibly-last-local-copy bundle) intact.
-   * When this was the run's only generation the now-empty run dir is dropped, so a clean release of
-   * the sole hold still tidies the journal exactly as the v1 whole-dir removal did.
+   * The run dir is then removed only if it is EMPTY, with a non-recursive rmdir (issue #1751 M2
+   * rework, N5): a settle-driven forgetGeneration runs while the successor generation is live, and
+   * that generation may write its own record/bundle into the same dir concurrently, so the dir is
+   * never removed recursively from a count taken earlier. A non-empty (or already gone) dir is
+   * left as is.
    */
   private async removeGenerationRecords(runId: string, generation: number): Promise<void> {
     const records = await this.listRecords(runId);
-    let remaining = 0;
     for (const record of records) {
-      if (record.generation === generation) {
-        await fs.rm(this.recordPath(record), { force: true }).catch(() => undefined);
-        // The bundle lives at the canonical <captureId>.bundle path; remove any distinct
-        // journaled bundlePath too, so a released generation never leaks its bytes.
-        await fs.rm(this.bundlePath(record), { force: true }).catch(() => undefined);
-        if (record.bundlePath && record.bundlePath !== this.bundlePath(record)) {
-          await fs.rm(record.bundlePath, { force: true }).catch(() => undefined);
-        }
-      } else {
-        remaining++;
+      if (record.generation !== generation) continue;
+      await fs.rm(this.recordPath(record), { force: true }).catch(() => undefined);
+      // The bundle lives at the canonical <captureId>.bundle path; remove any distinct
+      // journaled bundlePath too, so a released generation never leaks its bytes.
+      await fs.rm(this.bundlePath(record), { force: true }).catch(() => undefined);
+      if (record.bundlePath && record.bundlePath !== this.bundlePath(record)) {
+        await fs.rm(record.bundlePath, { force: true }).catch(() => undefined);
       }
     }
-    if (remaining === 0) await this.removeRunDir(runId);
+    // ENOTEMPTY / ENOENT (and any other failure) leave the dir: never a recursive removal here.
+    await fs.rmdir(this.runDir(runId)).catch(() => undefined);
   }
 }
 

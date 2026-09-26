@@ -43,22 +43,46 @@ import { canonicalJson } from "./recovery.js";
 export type SettlementState = "adopted" | "pushed" | "pending_settle" | "terminal";
 
 /** What a live settle proves the published tip against (issue #1751 M2): the run's checkpoint ref
- *  (`checkpoint`, issue/self_improve runs) or its creation-time branch (`branch`). */
+ *  (`checkpoint`, issue/self_improve runs) or its creation-time branch (`branch`, task runs only). */
 export type LiveSettleTarget = "checkpoint" | "branch";
 
 /** The live-settle leg of a record (issue #1751 M2). `sent` is persisted BEFORE the first request
  *  leaves, so a leg that may have reached the api is never dropped by the record's lifecycle: it
- *  is retried (whatever the record state) until an answer resolves it. */
+ *  is retried (whatever the record state) until an answer resolves it, and nothing replaces it
+ *  meanwhile (a newer publication is ignored until it resolves).
+ *
+ *  The leg is SELF-CONTAINED: it snapshots the full request it sends (the generations and the
+ *  candidate SHAs, next to the published tip and target), so a record whose evidence is later
+ *  replaced by a NEWER successor generation's adoption still re-sends exactly the request that may
+ *  have reached the api, and resolves on that identity alone.
+ *
+ *  Sends for one hold are serialised under the hold's lock ({@link PredecessorSettler}), so an
+ *  in-flight live send delays a same-hold completion step; each live RPC is therefore bounded by
+ *  its own short timeout ({@link LIVE_SETTLE_TIMEOUT_MS}, combined with the caller's signal), not
+ *  only by the client's HTTP timeout. */
 export interface LiveSettleLeg {
   target: LiveSettleTarget;
   /** The successor generation's published tip, pinned under `refs/uzi-settle/.../published`. */
   publishedSha: string;
+  /** The request snapshot this leg sends (issue #1751 M2 rework, N2). */
+  predecessorGeneration: number;
+  successorGeneration: number;
+  sourceSha: string;
+  adoptedSha: string;
   sent: boolean;
   attempts: number;
   nextAttemptAt?: number;
   lastReason?: string;
 }
 
+/** A leg as parsed from disk: a leg written before the request snapshot existed (deb4c72b1)
+ *  carries none of its four fields, and is completed from its record after the MAC check. */
+type StoredLiveLeg = Omit<LiveSettleLeg, "predecessorGeneration" | "successorGeneration" | "sourceSha" | "adoptedSha"> &
+  Partial<Pick<LiveSettleLeg, "predecessorGeneration" | "successorGeneration" | "sourceSha" | "adoptedSha">>;
+
+/** Rollback note (issue #1751): a worker older than #1751 does not know the `live` field, so it
+ *  drops it when it re-derives the MAC and reads a record carrying a live leg as a MAC mismatch
+ *  (fail-closed: the record is refused, nothing is sent or cleaned up, the hold stays retained). */
 export interface SettlementRecord {
   version: 1;
   runId: string;
@@ -131,6 +155,14 @@ export interface SettlementLiveGit {
   /** Drop ONLY the `published` pin (a live leg cleared without a release). */
   unpinPublished(barePath: string, runId: string, holdId: string): Promise<void>;
 }
+
+/** The record shape the journal parses and MACs: identical to {@link SettlementRecord} except that a
+ *  legacy live leg may lack its request snapshot. */
+type StoredSettlementRecord = Omit<SettlementRecord, "live"> & { live?: StoredLiveLeg };
+
+/** The dedicated bound of ONE live settle RPC (issue #1751 M2 rework, N1): the send runs under the
+ *  hold's lock, so this caps how long it can delay a same-hold completion step. */
+const LIVE_SETTLE_TIMEOUT_MS = 10_000;
 
 /** Retained reasons that are transient: retry later with backoff. */
 const RETRY_REASONS: ReadonlySet<string> = new Set(["ancestry_unknown", "state_changed"]);
@@ -296,10 +328,10 @@ export class SettlementJournal {
       this.log.warn("recovery settlement: journal record path does not match its identity; refusing", { file });
       return null;
     }
-    return record;
+    return completeLegacyLeg(record);
   }
 
-  private mac(record: SettlementRecord): string {
+  private mac(record: StoredSettlementRecord): string {
     if (!this.key) throw new Error("recovery settlement: MAC key unavailable");
     return createHmac("sha256", this.key).update(canonicalJson(record)).digest("hex");
   }
@@ -315,6 +347,8 @@ export interface PredecessorSettlerOptions {
   cleanup: SettlementCleanup;
   /** issue #1751 M2: the local git the live leg needs. Absent ⇒ no live leg is ever recorded. */
   liveGit?: SettlementLiveGit;
+  /** The bound of one live settle RPC (default {@link LIVE_SETTLE_TIMEOUT_MS}; a test shortens it). */
+  liveTimeoutMs?: number;
   log: Logger;
 }
 
@@ -327,6 +361,18 @@ function sameSnapshot(a: SettlementRecord, b: SettlementRecord): boolean {
     a.pushedSha === b.pushedSha &&
     a.predecessorGeneration === b.predecessorGeneration &&
     a.successorGeneration === b.successorGeneration
+  );
+}
+
+/** Whether two live legs are the same request (the identity a leg resolves on). */
+function sameLeg(a: LiveSettleLeg, b: LiveSettleLeg): boolean {
+  return (
+    a.target === b.target &&
+    a.publishedSha === b.publishedSha &&
+    a.predecessorGeneration === b.predecessorGeneration &&
+    a.successorGeneration === b.successorGeneration &&
+    a.sourceSha === b.sourceSha &&
+    a.adoptedSha === b.adoptedSha
   );
 }
 
@@ -351,13 +397,16 @@ function transientStatus(s: number): boolean {
  * every send, completed or live, with its outcome and released cleanup) runs under that hold's
  * QUEUED lock ({@link withHoldLock}) and re-reads the record under it before writing. A second
  * operation on the same hold WAITS (never skipped), so a promotion is never lost; different holds
- * never block each other.
+ * never block each other. A send holds the lock across its RPC (by design: one answer is applied
+ * before the next attempt reads the record); a live RPC is bounded by LIVE_SETTLE_TIMEOUT_MS, so it
+ * delays a same-hold completion step by at most that bound.
  */
 export class PredecessorSettler {
   private readonly journal: SettlementJournal;
   private readonly client: RecoverySettleClient;
   private readonly cleanup: SettlementCleanup;
   private readonly liveGit: SettlementLiveGit | undefined;
+  private readonly liveTimeoutMs: number;
   private readonly log: Logger;
   /** Per-(runId, holdId) queued lock: the tail of that hold's promise chain (deleted when idle). */
   private readonly holdLocks = new Map<string, Promise<void>>();
@@ -367,6 +416,7 @@ export class PredecessorSettler {
     this.client = opts.client;
     this.cleanup = opts.cleanup;
     this.liveGit = opts.liveGit;
+    this.liveTimeoutMs = opts.liveTimeoutMs ?? LIVE_SETTLE_TIMEOUT_MS;
     this.log = opts.log;
   }
 
@@ -454,8 +504,10 @@ export class PredecessorSettler {
   /**
    * A newer claim generation of `runId` started: every record whose successor generation is OLDER
    * and still `adopted`/`pushed` can never be settled by that successor (it never completed), so it
-   * goes `terminal` / `superseded` (pins and any live leg kept; the newer generation re-evidences the
-   * hold itself if it adopts it). Never throws.
+   * goes `terminal` / `superseded` (pins kept; the newer generation re-evidences the hold itself if
+   * it adopts it). A SENT live leg rides along (it resolves on its own request snapshot); an UNSENT
+   * leg is dropped with its `published` pin, since its successor is no longer live and it could only
+   * be answered `not_eligible`. Never throws.
    */
   async supersedeOlderGenerations(runId: string, currentGeneration: number): Promise<void> {
     if (!this.journal.enabled) return;
@@ -466,7 +518,9 @@ export class PredecessorSettler {
           const rec = await this.journal.get(runId, snap.holdId);
           if (!rec || rec.successorGeneration >= currentGeneration) return;
           if (rec.state !== "adopted" && rec.state !== "pushed") return;
-          await this.markTerminalLocked(rec, "superseded");
+          const dropUnsent = rec.live !== undefined && !rec.live.sent;
+          const next = dropUnsent ? { ...rec, live: undefined } : rec;
+          if ((await this.markTerminalLocked(next, "superseded")) && dropUnsent) await this.unpinPublished(rec);
         });
       }
     } catch (err) {
@@ -478,23 +532,31 @@ export class PredecessorSettler {
   }
 
   /**
-   * Record adoption evidence (a new `adopted` record) under the hold's lock. A record already
-   * carrying a SENT live leg is kept as is (its answer may be in flight or lost; the leg resolves
-   * it), so false is returned and nothing is written. An unsent leg of a replaced record has its
-   * `published` pin dropped. Throws on a journal error (the caller logs it).
+   * Record adoption evidence (a new `adopted` record) under the hold's lock. When the existing
+   * record carries a SENT live leg (its answer may be in flight or lost), evidence from a NEWER
+   * successor generation replaces the record's evidence while CARRYING that leg unchanged: the leg
+   * snapshots its own request, so it is re-sent and resolved on its own identity, and its
+   * `published` pin (a descendant of the old adopted tip) keeps the old candidates reachable.
+   * Evidence from the same or an older generation never replaces such a record (false, nothing
+   * written). An UNSENT leg of a replaced record is dropped with its `published` pin. Throws on a
+   * journal error (the caller logs it).
    */
   async recordAdoption(record: SettlementRecord): Promise<boolean> {
     if (!this.journal.enabled) return false;
     return this.withHoldLock(record.runId, record.holdId, async () => {
       const existing = await this.journal.get(record.runId, record.holdId);
-      if (existing?.live?.sent) {
-        this.log.info("recovery settlement: a sent live settle is unresolved for this hold; adoption evidence not replaced", {
-          run_id: record.runId,
-          hold_id: record.holdId,
-        });
-        return false;
+      const sentLeg = existing?.live?.sent ? existing.live : undefined;
+      if (existing && sentLeg) {
+        if (record.successorGeneration <= existing.successorGeneration) {
+          this.log.info("recovery settlement: a sent live settle is unresolved for this hold; adoption evidence not replaced", {
+            run_id: record.runId,
+            hold_id: record.holdId,
+          });
+          return false;
+        }
+        return this.journal.put({ ...record, live: sentLeg });
       }
-      if (!(await this.journal.put(record))) return false;
+      if (!(await this.journal.put({ ...record, live: undefined }))) return false;
       if (existing?.live) await this.unpinPublished(existing);
       return true;
     });
@@ -598,7 +660,7 @@ export class PredecessorSettler {
     }
     const sameHold = res?.run_id === rec.runId && res?.hold_id === rec.holdId;
     if (res?.outcome === "released" && sameHold) {
-      await this.releasedCleanupLocked(rec, "completed", res.final_head_sha);
+      await this.releasedCleanupLocked(rec, rec, "completed", res.final_head_sha);
       return "released";
     }
     if (res?.outcome === "released") return this.retry(rec, "response_mismatch");
@@ -618,22 +680,25 @@ export class PredecessorSettler {
 
   /** The one local cleanup a `released` answer (completed or live) authorizes, run under the
    *  hold's lock: every settlement pin (the live `published` pin included), the predecessor's
-   *  recovery pin and journal, then the settlement record LAST. A crash mid-cleanup re-sends the
-   *  identical settle, which the api answers `released` again, and the cleanup re-runs. */
+   *  recovery pin and journal, then the settlement record LAST. A crash (or a failed step)
+   *  mid-cleanup leaves the record, so the identical settle is re-sent, the api answers `released`
+   *  again, and the cleanup re-runs. `sent` names the generations of the request that was answered
+   *  (a live leg's own snapshot, or the record for the completed path). */
   private async releasedCleanupLocked(
     rec: SettlementRecord,
+    sent: Pick<SettlementRecord, "predecessorGeneration" | "successorGeneration">,
     via: "completed" | "live",
     finalHeadSha: string | undefined,
   ): Promise<void> {
     await this.cleanup.deleteSettlementRefs(rec.barePath, rec.runId, rec.holdId);
-    await this.cleanup.deleteRecoveryPin(rec.barePath, rec.runId, rec.predecessorGeneration);
-    await this.cleanup.forgetGeneration(rec.runId, rec.predecessorGeneration);
+    await this.cleanup.deleteRecoveryPin(rec.barePath, rec.runId, sent.predecessorGeneration);
+    await this.cleanup.forgetGeneration(rec.runId, sent.predecessorGeneration);
     await this.journal.remove(rec.runId, rec.holdId);
     this.log.info("recovery settlement: predecessor hold released by server-proven ancestry", {
       run_id: rec.runId,
       hold_id: rec.holdId,
-      predecessor_generation: rec.predecessorGeneration,
-      successor_generation: rec.successorGeneration,
+      predecessor_generation: sent.predecessorGeneration,
+      successor_generation: sent.successorGeneration,
       via,
       final_head_sha: finalHeadSha,
     });
@@ -695,9 +760,10 @@ export class PredecessorSettler {
    * and generation that is still `adopted`, under the hold's lock: check locally that the record's
    * source and adopted tip are ancestors of the published tip in the trusted bare, pin it under
    * `.../published`, and write an unsent live leg. Never creates a record (a released + removed one
-   * stays removed) and never touches a `pushed`/`pending_settle`/`terminal` record. An unresolved
-   * leg is replaced only by a NEWER publication (one descending its tip). Returns the number of legs
-   * written. Never throws.
+   * stays removed) and never touches a `pushed`/`pending_settle`/`terminal` record. A SENT leg is
+   * never replaced (it is retried until answered; a newer publication is ignored until then); an
+   * unsent leg is replaced only by a NEWER publication (one descending its tip). Returns the number
+   * of legs written. Never throws.
    */
   async observeLivePublication(
     runId: string,
@@ -717,15 +783,23 @@ export class PredecessorSettler {
           if (!rec || rec.state !== "adopted" || rec.successorGeneration !== successorGeneration) return false;
           const prior = rec.live;
           if (prior) {
-            if (prior.publishedSha === publishedSha) return false;
+            if (prior.sent || prior.publishedSha === publishedSha) return false;
             if (!(await liveGit.isAncestor(rec.barePath, prior.publishedSha, publishedSha))) return false;
           }
           if (!(await liveGit.isAncestor(rec.barePath, rec.sourceSha, publishedSha))) return false;
           if (!(await liveGit.isAncestor(rec.barePath, rec.adoptedSha, publishedSha))) return false;
           if (!(await liveGit.pinPublished(rec.barePath, runId, rec.holdId, publishedSha))) return false;
-          if (!(await this.journal.put({ ...rec, live: { target, publishedSha, sent: false, attempts: 0 } }))) {
-            return false;
-          }
+          const live: LiveSettleLeg = {
+            target,
+            publishedSha,
+            predecessorGeneration: rec.predecessorGeneration,
+            successorGeneration: rec.successorGeneration,
+            sourceSha: rec.sourceSha,
+            adoptedSha: rec.adoptedSha,
+            sent: false,
+            attempts: 0,
+          };
+          if (!(await this.journal.put({ ...rec, live }))) return false;
           this.log.info("recovery settlement: live publication recorded for a predecessor hold", {
             run_id: runId,
             hold_id: rec.holdId,
@@ -790,19 +864,25 @@ export class PredecessorSettler {
 
   private async settleLiveLocked(rec: SettlementRecord, signal?: AbortSignal): Promise<SettleResult> {
     const leg = rec.live!;
+    // Exactly the leg's own snapshot: the record's evidence may since belong to a newer generation.
     const req: RecoveryLiveSettleRequest = {
-      predecessor_generation: rec.predecessorGeneration,
-      successor_generation: rec.successorGeneration,
+      predecessor_generation: leg.predecessorGeneration,
+      successor_generation: leg.successorGeneration,
       published_sha: leg.publishedSha,
-      source_sha: rec.sourceSha,
-      adopted_sha: rec.adoptedSha,
+      source_sha: leg.sourceSha,
+      adopted_sha: leg.adoptedSha,
       target: leg.target,
     };
+    // A dedicated short bound (N1): the send holds the hold's lock, so it must not wait out the
+    // client's full HTTP timeout before a same-hold completion step can run.
+    const timeout = AbortSignal.timeout(this.liveTimeoutMs);
+    const rpcSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
     let res: RecoverySettleResponse;
     try {
-      res = await this.client.settleRecoveryHoldLive!(rec.runId, rec.holdId, req, signal);
+      res = await this.client.settleRecoveryHoldLive!(rec.runId, rec.holdId, req, rpcSignal);
     } catch (err) {
       if (signal?.aborted) return "skipped";
+      if (timeout.aborted) return this.retryLive(rec, "timeout");
       if (err instanceof RequestError) {
         if (transientStatus(err.status)) return this.retryLive(rec, `http_${err.status}`);
         return this.clearLive(rec, `http_${err.status}`);
@@ -811,7 +891,7 @@ export class PredecessorSettler {
     }
     const sameHold = res?.run_id === rec.runId && res?.hold_id === rec.holdId;
     if (res?.outcome === "released" && sameHold) {
-      await this.releasedCleanupLocked(rec, "live", res.final_head_sha);
+      await this.releasedCleanupLocked(rec, leg, "live", res.final_head_sha);
       return "released";
     }
     if (res?.outcome === "released") return this.retryLive(rec, "response_mismatch");
@@ -829,7 +909,7 @@ export class PredecessorSettler {
     const attempts = leg.attempts + 1;
     if (attempts >= SETTLE_MAX_ATTEMPTS) return this.clearLive(rec, reason);
     const current = await this.journal.get(rec.runId, rec.holdId);
-    if (!current?.live || current.live.publishedSha !== leg.publishedSha) return "skipped";
+    if (!current?.live || !sameLeg(current.live, leg)) return "skipped";
     const nextAttemptAt = this.journal.now() + settleBackoffMs(attempts);
     const live: LiveSettleLeg = { ...current.live, sent: true, attempts, lastReason: reason, nextAttemptAt };
     if (!(await this.journal.put({ ...current, live }))) return "skipped";
@@ -847,7 +927,7 @@ export class PredecessorSettler {
   private async clearLive(rec: SettlementRecord, reason: string): Promise<SettleResult> {
     const leg = rec.live!;
     const current = await this.journal.get(rec.runId, rec.holdId);
-    if (!current?.live || current.live.publishedSha !== leg.publishedSha) return "skipped";
+    if (!current?.live || !sameLeg(current.live, leg)) return "skipped";
     if (!(await this.journal.put({ ...current, live: undefined }))) return "skipped";
     await this.unpinPublished(current);
     this.log.warn("recovery settlement: live settle stopped for this publication (record kept)", {
@@ -893,7 +973,7 @@ function macEqual(a: string, b: string): boolean {
 
 /** Validate the untrusted parsed object into a SettlementRecord (shape only; the MAC is the
  *  integrity gate). Returns null on any mismatch. */
-function coerceSettlementRecord(o: Record<string, unknown>): SettlementRecord | null {
+function coerceSettlementRecord(o: Record<string, unknown>): StoredSettlementRecord | null {
   const str = (v: unknown): v is string => typeof v === "string";
   const int = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v);
   if (o.version !== SETTLEMENT_VERSION) return null;
@@ -904,7 +984,7 @@ function coerceSettlementRecord(o: Record<string, unknown>): SettlementRecord | 
   if (o.state !== "adopted" && o.state !== "pushed" && o.state !== "pending_settle" && o.state !== "terminal") {
     return null;
   }
-  const rec: SettlementRecord = {
+  const rec: StoredSettlementRecord = {
     version: SETTLEMENT_VERSION,
     runId: o.runId,
     holdId: o.holdId,
@@ -944,15 +1024,27 @@ function coerceSettlementRecord(o: Record<string, unknown>): SettlementRecord | 
   return rec;
 }
 
-/** Validate an untrusted live leg (issue #1751 M2); null on any mismatch. */
-function coerceLiveLeg(v: unknown): LiveSettleLeg | null {
+/** Validate an untrusted live leg (issue #1751 M2); null on any mismatch. The request snapshot is
+ *  all-or-nothing: a legacy leg (deb4c72b1) carries none of it, any other partial shape is refused. */
+function coerceLiveLeg(v: unknown): StoredLiveLeg | null {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return null;
   const o = v as Record<string, unknown>;
   const int = (x: unknown): x is number => typeof x === "number" && Number.isSafeInteger(x);
+  const sha = (x: unknown): x is string => typeof x === "string" && SHA_RE.test(x);
   if (o.target !== "checkpoint" && o.target !== "branch") return null;
-  if (typeof o.publishedSha !== "string" || !SHA_RE.test(o.publishedSha)) return null;
+  if (!sha(o.publishedSha)) return null;
   if (typeof o.sent !== "boolean" || !int(o.attempts)) return null;
-  const leg: LiveSettleLeg = { target: o.target, publishedSha: o.publishedSha, sent: o.sent, attempts: o.attempts };
+  const leg: StoredLiveLeg = { target: o.target, publishedSha: o.publishedSha, sent: o.sent, attempts: o.attempts };
+  const snapshot = [o.predecessorGeneration, o.successorGeneration, o.sourceSha, o.adoptedSha];
+  if (snapshot.some((x) => x !== undefined)) {
+    if (!int(o.predecessorGeneration) || !int(o.successorGeneration) || !sha(o.sourceSha) || !sha(o.adoptedSha)) {
+      return null;
+    }
+    leg.predecessorGeneration = o.predecessorGeneration;
+    leg.successorGeneration = o.successorGeneration;
+    leg.sourceSha = o.sourceSha;
+    leg.adoptedSha = o.adoptedSha;
+  }
   if (o.nextAttemptAt !== undefined) {
     if (!int(o.nextAttemptAt)) return null;
     leg.nextAttemptAt = o.nextAttemptAt;
@@ -962,4 +1054,23 @@ function coerceLiveLeg(v: unknown): LiveSettleLeg | null {
     leg.lastReason = o.lastReason;
   }
   return leg;
+}
+
+/** Complete an AUTHENTICATED record's legacy live leg (written by deb4c72b1, before the leg carried
+ *  its request snapshot) from the record itself. That is exactly what such a leg sent: back then
+ *  the record's evidence was never replaced while its leg was sent, and an unsent leg was dropped
+ *  with any replacement. Called only after the MAC check. */
+function completeLegacyLeg(rec: StoredSettlementRecord): SettlementRecord {
+  const { live, ...rest } = rec;
+  if (!live) return rest;
+  return {
+    ...rest,
+    live: {
+      ...live,
+      predecessorGeneration: live.predecessorGeneration ?? rec.predecessorGeneration,
+      successorGeneration: live.successorGeneration ?? rec.successorGeneration,
+      sourceSha: live.sourceSha ?? rec.sourceSha,
+      adoptedSha: live.adoptedSha ?? rec.adoptedSha,
+    },
+  };
 }

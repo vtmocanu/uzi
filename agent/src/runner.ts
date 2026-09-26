@@ -4549,17 +4549,8 @@ export class RunRunner {
       }
     }
     // issue #1751 M2: the finalize push landed, so the pushed tracking tip is a confirmed publication
-    // on runs.branch. triggerLiveSettle fires only for kinds whose runs.branch is set at creation
-    // (not issue / self_improve, which settle live off their checkpoint publishes instead). The tip
-    // read is local and runs inside the fire-and-forget, never on the finalize path.
-    if (flight.runKind !== "issue" && flight.runKind !== "self_improve") {
-      void this.git
-        .trackingTip(finalizeBarePath, result.branch)
-        .then((tip) => {
-          if (tip) this.triggerLiveSettle(flight, tip, "branch");
-        })
-        .catch(() => undefined);
-    }
+    // on runs.branch (task runs only; see triggerBranchLiveSettle).
+    this.triggerBranchLiveSettle(flight, finalizeBarePath, result.branch);
     if (bridged) {
       // Worded GENERICALLY: the branch may have been bridged by THIS worker OR by the agent (the M2
       // steer's `git merge -s ours <P>`), so it never says "the worker bridged it".
@@ -8040,18 +8031,19 @@ export class RunRunner {
    * an older custody hold while the run is still live. Records the live leg on each still-`adopted`
    * settlement record of this generation, then sends the due legs, FIRE-AND-FORGET: never awaited
    * on the execution path, errors caught, and bounded by the flight's cancel signal (the worker
-   * sweep retries whatever is left). Kind-gated by what the api can prove against:
+   * sweep retries whatever is left). Kind-gated by what the api can prove against while the run is
+   * live:
    *   - `checkpoint`: issue / self_improve runs (the checkpoint-publishing kinds; their runs.branch
    *     is NULL while live, so `branch` would only answer not_eligible);
-   *   - `branch`: the other code-publishing kinds (task / ci_fix / mr_rework / prompt), whose
-   *     runs.branch is set at creation.
+   *   - `branch`: task runs ONLY — the one kind whose runs.branch is set at creation (task.sql).
+   *     prompt (CreatePromptRun), ci_fix and mr_rework runs leave runs.branch NULL, so the api
+   *     answers not_eligible for them while live; they fire nothing and settle on completion.
    */
   private triggerLiveSettle(flight: RunFlight, publishedSha: string, target: LiveSettleTarget): void {
     if (!this.settlement.enabled) return;
     const kind = flight.runKind;
     if (kind === undefined) return;
-    const checkpointKind = kind === "issue" || kind === "self_improve";
-    const eligible = target === "checkpoint" ? checkpointKind : !checkpointKind && isCodePublishingKind(kind);
+    const eligible = target === "checkpoint" ? kind === "issue" || kind === "self_improve" : kind === "task";
     if (!eligible) return;
     const generation = flight.claimGeneration;
     if (!Number.isSafeInteger(generation) || generation <= 0) return;
@@ -8066,6 +8058,22 @@ export class RunRunner {
         error: errMessage(err),
       });
     });
+  }
+
+  /**
+   * issue #1751 M2 — after a landed finalize push, a TASK run's pushed tracking tip is a confirmed
+   * publication on its creation-time runs.branch: fire the `branch` live settle for it. Every other
+   * kind returns before any git read (see {@link triggerLiveSettle} for why). The tip read is local
+   * and runs inside the fire-and-forget, never on the finalize path.
+   */
+  private triggerBranchLiveSettle(flight: RunFlight, barePath: string, branch: string): void {
+    if (flight.runKind !== "task" || !this.settlement.enabled) return;
+    void this.git
+      .trackingTip(barePath, branch)
+      .then((tip) => {
+        if (tip) this.triggerLiveSettle(flight, tip, "branch");
+      })
+      .catch(() => undefined);
   }
 
   /**

@@ -18,7 +18,7 @@ import {
 } from "../src/recovery-settlement.js";
 import type { RecoveryLiveSettleRequest, RecoverySettleRequest, RecoverySettleResponse } from "../src/protocol.js";
 import { FakeRecoveryClient, FakeRecoveryGit, commitInTree, fixture as codexFixture } from "./codex-reap-fixture.js";
-import { nullLogger, recordingLogger } from "./helpers.js";
+import { makeClaim, nullLogger, recordingLogger } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
@@ -772,6 +772,8 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
     settleClient: FakeLiveSettleClient;
     runner: ReturnType<typeof runnerWith>;
     observed: Array<Promise<number>>;
+    /** The arguments of every observeLivePublication call (runId, generation, tip, target). */
+    observedArgs: unknown[][];
     settled: Array<Promise<void>>;
     bare: string;
     src: string;
@@ -801,9 +803,11 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
       };
     }).settler;
     const observed: Array<Promise<number>> = [];
+    const observedArgs: unknown[][] = [];
     const settled: Array<Promise<void>> = [];
     const obs = settler.observeLivePublication.bind(settler);
     settler.observeLivePublication = (...a: unknown[]) => {
+      observedArgs.push(a);
       const p = obs(...a);
       observed.push(p);
       return p;
@@ -820,6 +824,7 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
       settleClient,
       runner,
       observed,
+      observedArgs,
       settled,
       bare: bareP,
       src,
@@ -971,6 +976,119 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
       }
     });
   }
+
+  // ── the finalize-push `branch` trigger (issue #1751 M2 rework, B1/N4): task runs only ──────────
+
+  const TASK_BRANCH = "uzi/task/live-settle";
+
+  /** Fire the finalize-push trigger through its private seam, with the branch's runner tracking
+   *  ref at the published tip (what a landed finalize push leaves in the bare). */
+  function finalizePushed(r: LiveRig, flight: Record<string, unknown>): void {
+    gitOut(r.bare, "update-ref", `refs/uzi-runner/${TASK_BRANCH}`, r.published);
+    (r.runner as unknown as {
+      triggerBranchLiveSettle: (f: unknown, bare: string, branch: string) => void;
+    }).triggerBranchLiveSettle(flight, r.bare, TASK_BRANCH);
+  }
+
+  /** Wait (bounded) for `want` fire-and-forget triggers, then for their observe + send to finish. */
+  async function drained(r: LiveRig, want: number): Promise<void> {
+    for (let i = 0; i < 200 && r.observed.length < want; i++) await new Promise((res) => setTimeout(res, 5));
+    await Promise.all(r.observed);
+    await Promise.all(r.settled);
+  }
+
+  it("a TASK run's finalize push fires a live settle with target branch and the exact body; released cleans up", async () => {
+    const r = await liveRig();
+    try {
+      await r.settlement.put(adoptedRecord(r, HOLD_A));
+      assert.ok(await git.pinSettlementRefs(r.bare, RUN_ID, HOLD_A, { source: r.src, adopted: r.adopted }));
+      r.settleClient.liveAnswer = (h) => released(RUN_ID, h);
+      finalizePushed(r, liveFlight({ runKind: "task" }));
+      await drained(r, 1);
+      assert.deepEqual(r.observedArgs, [[RUN_ID, 2, r.published, "branch"]]);
+      assert.deepEqual(r.settleClient.liveCalls, [
+        {
+          runId: RUN_ID,
+          holdId: HOLD_A,
+          req: {
+            predecessor_generation: 1,
+            successor_generation: 2,
+            published_sha: r.published,
+            source_sha: r.src,
+            adopted_sha: r.adopted,
+            target: "branch",
+          },
+        },
+      ]);
+      assert.equal(r.settleClient.calls.length, 0, "no completed /settle");
+      assert.deepEqual(await r.settlement.listRun(RUN_ID), [], "released: the record is removed");
+      for (const kind of ["source", "adopted", "published"]) {
+        assert.equal(refOrNull(r.bare, settleRef(RUN_ID, HOLD_A, kind)), null, `${kind} pin deleted`);
+      }
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  for (const kind of ["ci_fix", "mr_rework", "prompt", "issue", "self_improve"]) {
+    it(`a ${kind} run's finalize push fires nothing (runs.branch is not a live target for it)`, async () => {
+      const r = await liveRig();
+      try {
+        await r.settlement.put(adoptedRecord(r, HOLD_A));
+        r.settleClient.liveAnswer = (h) => released(RUN_ID, h);
+        finalizePushed(r, liveFlight({ runKind: kind }));
+        await new Promise((res) => setTimeout(res, 100));
+        assert.equal(r.observed.length, 0, "no live trigger");
+        assert.equal(r.settleClient.liveCalls.length, 0);
+        assert.equal((await r.settlement.listRun(RUN_ID))[0]!.live, undefined, "no leg recorded");
+        assert.equal(refOrNull(r.bare, settleRef(RUN_ID, HOLD_A, "published")), null, "no published pin");
+      } finally {
+        r.cleanup();
+      }
+    });
+  }
+
+  it("a self_improve run's confirmed checkpoint publish fires a live settle with target checkpoint", async () => {
+    const r = await liveRig();
+    try {
+      await r.settlement.put(adoptedRecord(r, HOLD_A));
+      r.settleClient.liveAnswer = (h) => released(RUN_ID, h);
+      assert.equal(await publish(r, liveFlight({ runKind: "self_improve" }), PUBLISHED_OK), true);
+      await drained(r, 1);
+      assert.deepEqual(r.observedArgs, [[RUN_ID, 2, r.published, "checkpoint"]]);
+      assert.equal(r.settleClient.liveCalls.length, 1);
+      assert.equal(r.settleClient.liveCalls[0]!.req.target, "checkpoint");
+      assert.deepEqual(await r.settlement.listRun(RUN_ID), []);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it("end to end: a completing TASK run's landed finalize push fires the branch trigger with its pushed tip", async () => {
+    const r = await liveRig();
+    try {
+      const branch = `feature/live-settle-${Date.now()}`;
+      const claim = makeClaim({
+        kind: "task",
+        issue_iid: null,
+        issue_title: "Handoff: live settle",
+        issue_description: "Do the task.",
+        branch,
+        open_mr: false,
+        claim_generation: 2,
+        repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+        last_seq: 0,
+        secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
+      });
+      await r.runner.execute(claim);
+      assert.ok(hasStatus(claim.run_id, "completed"), "the task run completed");
+      await drained(r, 1);
+      const pushed = gitOut(fx.originPath, "rev-parse", `refs/heads/${branch}`);
+      assert.deepEqual(r.observedArgs, [[claim.run_id, 2, pushed, "branch"]], "fired once, with the pushed tip");
+    } finally {
+      r.cleanup();
+    }
+  });
 
   it("the live trigger never blocks execution: a hanging settle does not delay the publish, and the cancel signal ends it", async () => {
     const r = await liveRig();

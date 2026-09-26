@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
+import { createHmac } from "node:crypto";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
@@ -8,7 +9,7 @@ import type { AddressInfo } from "node:net";
 
 import { RequestError, WorkerClient } from "../src/client.js";
 import { GitCache } from "../src/git.js";
-import { RecoveryCoordinator } from "../src/recovery.js";
+import { RecoveryCoordinator, canonicalJson } from "../src/recovery.js";
 import {
   PredecessorSettler,
   SETTLE_BACKOFF_BASE_MS,
@@ -234,6 +235,49 @@ describe("PredecessorSettler outcome rules (issue #1582 M2)", () => {
     ]);
     assert.deepEqual(cleanup.calls, [`refs:${RUN}/${HOLD}`, `pin:${RUN}/1`, `journal:${RUN}/1`]);
     assert.deepEqual((await j.listRun(RUN)).map((r) => r.holdId), [HOLD2], "the sibling record is untouched");
+  });
+
+  it("the released cleanup removes the journal record LAST: a failed cleanup step keeps it, and a re-send redoes the cleanup", async () => {
+    const file = path.join(root, RUN, `${HOLD}.json`);
+    // Each step records whether the settlement record still existed when it ran; the first
+    // deleteSettlementRefs fails (e.g. a git error), which must leave the record for a re-send.
+    class OrderedCleanup extends RecordingCleanup {
+      failRefs = 1;
+      override async deleteSettlementRefs(bare: string, runId: string, holdId: string): Promise<void> {
+        await super.deleteSettlementRefs(bare, runId, holdId);
+        this.calls.push(`record-present:${fs.existsSync(file)}`);
+        if (this.failRefs-- > 0) throw new Error("git: cannot lock ref");
+      }
+      override async deleteRecoveryPin(bare: string, runId: string, gen: number): Promise<void> {
+        await super.deleteRecoveryPin(bare, runId, gen);
+        this.calls.push(`record-present:${fs.existsSync(file)}`);
+      }
+      override async forgetGeneration(runId: string, gen: number): Promise<void> {
+        await super.forgetGeneration(runId, gen);
+        this.calls.push(`record-present:${fs.existsSync(file)}`);
+      }
+    }
+    const ordered = new OrderedCleanup();
+    const s2 = new PredecessorSettler({ journal: j, client, cleanup: ordered, log: nullLogger() });
+    await j.put(record());
+    assert.equal(await s2.settleOne((await j.listRun(RUN))[0]!), "skipped", "the failed cleanup is a local failure");
+    const kept = (await j.listRun(RUN))[0];
+    assert.ok(kept, "the journal record survives a failed cleanup step");
+    assert.deepEqual([kept.state, kept.attempts], ["pending_settle", 0], "unchanged, so it is re-sent");
+    assert.equal(await s2.settleOne(kept), "released");
+    assert.equal(client.calls.length, 2, "the identical settle was re-sent");
+    assert.deepEqual(client.calls[1]!.req, client.calls[0]!.req);
+    assert.deepEqual(ordered.calls, [
+      `refs:${RUN}/${HOLD}`,
+      "record-present:true",
+      `refs:${RUN}/${HOLD}`,
+      "record-present:true",
+      `pin:${RUN}/1`,
+      "record-present:true",
+      `journal:${RUN}/1`,
+      "record-present:true",
+    ]);
+    assert.deepEqual(await j.listRun(RUN), [], "removed last, once every cleanup step succeeded");
   });
 
   for (const reason of ["ancestry_unknown", "state_changed"]) {
@@ -573,6 +617,9 @@ describe("WorkerClient.settleRecoveryHold wire (issue #1582 M2 ↔ M1 handler)",
 
 const PUBLISHED = "5".repeat(40);
 const PUBLISHED2 = "6".repeat(40);
+const ADOPTED3 = "7".repeat(40);
+/** Drop undefined-valued keys (the journal round-trip omits them). */
+const plain = (x: unknown): unknown => JSON.parse(JSON.stringify(x));
 
 /** A settle client with BOTH RPCs; the live one can be gated so a test holds a send in flight. */
 class FakeLiveClient extends FakeSettleClient {
@@ -643,6 +690,10 @@ function adoptedRecord(over: Partial<SettlementRecord> = {}): SettlementRecord {
 const liveLeg = (over: Partial<LiveSettleLeg> = {}): LiveSettleLeg => ({
   target: "checkpoint",
   publishedSha: PUBLISHED,
+  predecessorGeneration: 1,
+  successorGeneration: 2,
+  sourceSha: SRC,
+  adoptedSha: ADOPTED,
   sent: false,
   attempts: 0,
   ...over,
@@ -849,8 +900,117 @@ describe("PredecessorSettler live leg (issue #1751 M2)", () => {
     assert.equal(await settler.observeLivePublication(RUN, 2, PUBLISHED, "checkpoint"), 1);
   });
 
-  it("an unresolved leg is replaced only by a NEWER publication of the same generation", async () => {
-    await j.put(adoptedRecord({ live: liveLeg({ sent: true, attempts: 2, nextAttemptAt: NOW + 1 }) }));
+  it("a SENT leg is never replaced: a newer publication is ignored until the original request resolves", async () => {
+    await j.put(adoptedRecord());
+    assert.equal(await settler.observeLivePublication(RUN, 2, PUBLISHED, "checkpoint"), 1);
+    client.liveAnswers = [new TypeError("fetch failed")]; // the ACK is lost
+    await settler.settleLive(RUN);
+    const sent = (await one())!.live!;
+    assert.deepEqual([sent.sent, sent.attempts], [true, 1]);
+    // A newer publication (it descends the sent tip) arrives while the sent leg is unresolved.
+    assert.equal(await settler.observeLivePublication(RUN, 2, PUBLISHED2, "checkpoint"), 0, "ignored");
+    assert.deepEqual((await one())!.live, sent, "the sent leg is unchanged");
+    assert.deepEqual(lg.calls, [`pin:${RUN}/${HOLD}/${PUBLISHED}`], "the newer tip is never pinned");
+    clock = NOW + SETTLE_BACKOFF_BASE_MS;
+    client.liveAnswers = [{ run_id: RUN, hold_id: HOLD, outcome: "released" }];
+    await settler.sweep();
+    assert.equal(client.liveCalls.length, 2);
+    assert.deepEqual(client.liveCalls[1]!.req, client.liveCalls[0]!.req, "the retry re-sends the ORIGINAL identity");
+    assert.equal(client.liveCalls[1]!.req.published_sha, PUBLISHED);
+    assert.deepEqual(cleanup.calls, [`refs:${RUN}/${HOLD}`, `pin:${RUN}/1`, `journal:${RUN}/1`]);
+    assert.deepEqual(await j.listRun(RUN), []);
+  });
+
+  it("supersede drops an UNSENT leg with its published pin; a SENT leg rides along", async () => {
+    await j.put(adoptedRecord({ live: liveLeg() }));
+    await j.put(adoptedRecord({ holdId: HOLD2, live: liveLeg({ sent: true }) }));
+    await settler.supersedeOlderGenerations(RUN, 3);
+    const r1 = (await one())!;
+    const r2 = (await one(HOLD2))!;
+    assert.deepEqual([r1.state, r1.lastReason, r1.live], ["terminal", "superseded", undefined]);
+    assert.deepEqual([r2.state, r2.lastReason, r2.live], ["terminal", "superseded", liveLeg({ sent: true })]);
+    assert.deepEqual(lg.calls, [`unpin:${RUN}/${HOLD}`], "only the dropped unsent leg's published pin is removed");
+    await settler.sweep();
+    assert.deepEqual(client.liveCalls.map((c) => c.holdId), [HOLD2], "only the sent leg is still sent");
+  });
+
+  it("each live RPC is bounded by its own timeout: a hanging send backs off and frees the hold's lock", async () => {
+    await j.put(record({ live: liveLeg() })); // pending_settle with a due live leg
+    const hanging = new PredecessorSettler({
+      journal: j,
+      client: {
+        settleRecoveryHold: async (runId, holdId) => ({ run_id: runId, hold_id: holdId, outcome: "released" }),
+        settleRecoveryHoldLive: (_r, _h, _req, signal) =>
+          new Promise((_res, rej) => {
+            signal?.addEventListener("abort", () => rej(signal.reason), { once: true });
+            setTimeout(() => rej(new Error("never aborted")), 5_000).unref();
+          }),
+      },
+      cleanup,
+      liveGit: lg,
+      liveTimeoutMs: 50,
+      log: nullLogger(),
+    });
+    const t0 = Date.now();
+    const live = hanging.settleLive(RUN);
+    await new Promise((r) => setImmediate(r));
+    // A same-hold completion step queues behind the in-flight live send, then runs.
+    const completed = hanging.settleRun(RUN);
+    await Promise.all([live, completed]);
+    assert.ok(Date.now() - t0 < 2_000, "bounded by the live timeout, not the hang");
+    assert.deepEqual(await j.listRun(RUN), [], "the queued completed settle ran after the bound and released");
+    assert.deepEqual(cleanup.calls, [`refs:${RUN}/${HOLD}`, `pin:${RUN}/1`, `journal:${RUN}/1`]);
+  });
+
+  it("a timed-out live RPC counts as a transient attempt (reason timeout)", async () => {
+    await j.put(adoptedRecord({ live: liveLeg() }));
+    const hanging = new PredecessorSettler({
+      journal: j,
+      client: {
+        settleRecoveryHold: async (runId, holdId) => ({ run_id: runId, hold_id: holdId, outcome: "released" }),
+        settleRecoveryHoldLive: (_r, _h, _req, signal) =>
+          new Promise((_res, rej) => {
+            signal?.addEventListener("abort", () => rej(signal.reason), { once: true });
+            setTimeout(() => rej(new Error("never aborted")), 5_000).unref();
+          }),
+      },
+      cleanup,
+      liveGit: lg,
+      liveTimeoutMs: 50,
+      log: nullLogger(),
+    });
+    await hanging.settleLive(RUN);
+    assert.deepEqual((await one())!.live, liveLeg({ sent: true, attempts: 1, lastReason: "timeout", nextAttemptAt: NOW + SETTLE_BACKOFF_BASE_MS }));
+  });
+
+  it("a legacy leg (written before the request snapshot) parses under its MAC and is sent from its record", async () => {
+    const rec = adoptedRecord();
+    const legacy = { ...rec, live: { target: "checkpoint", publishedSha: PUBLISHED, sent: true, attempts: 1 } };
+    const key = createHmac("sha256", TOKEN).update("uzi-recovery-settlement-v1").digest();
+    const mac = createHmac("sha256", key).update(canonicalJson(legacy)).digest("hex");
+    fs.mkdirSync(path.join(root, RUN), { recursive: true });
+    fs.writeFileSync(path.join(root, RUN, `${HOLD}.json`), JSON.stringify({ ...legacy, mac }));
+    assert.deepEqual((await one())!.live, liveLeg({ sent: true, attempts: 1 }), "completed from the record");
+    client.liveAnswers = [retained("ancestry_unknown")];
+    await settler.sweep();
+    assert.deepEqual(client.liveCalls[0]!.req, {
+      predecessor_generation: 1,
+      successor_generation: 2,
+      published_sha: PUBLISHED,
+      source_sha: SRC,
+      adopted_sha: ADOPTED,
+      target: "checkpoint",
+    });
+    assert.equal((await one())!.live!.attempts, 2, "the retry rewrote the leg (now with its snapshot)");
+    // A partial snapshot is not a legacy shape: refused.
+    const partial = { ...rec, live: { target: "checkpoint", publishedSha: PUBLISHED, sent: true, attempts: 1, sourceSha: SRC } };
+    const pmac = createHmac("sha256", key).update(canonicalJson(partial)).digest("hex");
+    fs.writeFileSync(path.join(root, RUN, `${HOLD}.json`), JSON.stringify({ ...partial, mac: pmac }));
+    assert.deepEqual(await j.listRun(RUN), []);
+  });
+
+  it("an UNSENT leg is replaced only by a NEWER publication of the same generation", async () => {
+    await j.put(adoptedRecord({ live: liveLeg({ attempts: 0 }) }));
     assert.equal(await settler.observeLivePublication(RUN, 2, PUBLISHED, "checkpoint"), 0, "the same tip is a no-op");
     lg.notAncestor.add(`${PUBLISHED}>${PUBLISHED2}`);
     assert.equal(await settler.observeLivePublication(RUN, 2, PUBLISHED2, "checkpoint"), 0, "not newer: kept");
@@ -1143,10 +1303,53 @@ describe("PredecessorSettler — a SENT live leg survives the record's lifecycle
     assert.deepEqual(await j.listRun(RUN), []);
   });
 
-  it("new adoption evidence for the same hold never replaces a record whose leg was sent", async () => {
-    assert.equal(await settler.recordAdoption(adoptedRecord({ successorGeneration: 3 })), false);
+  it("same/older-generation evidence never replaces a record whose leg was sent", async () => {
+    for (const gen of [2, 1]) {
+      assert.equal(await settler.recordAdoption(adoptedRecord({ successorGeneration: gen, adoptedSha: ADOPTED3 })), false);
+    }
     assert.deepEqual((await one())!.live, sentLeg());
-    assert.equal((await one())!.successorGeneration, 2);
+    assert.deepEqual([(await one())!.successorGeneration, (await one())!.adoptedSha], [2, ADOPTED]);
+  });
+
+  it("NEWER-generation evidence replaces the record's evidence and CARRIES the sent leg, which re-sends its own snapshot and releases", async () => {
+    const gen3 = adoptedRecord({ successorGeneration: 3, adoptedSha: ADOPTED3, createdAt: NOW + 5 });
+    assert.equal(await settler.recordAdoption(gen3), true);
+    const r = (await one())!;
+    assert.deepEqual(plain({ ...r, live: undefined }), plain(gen3), "the evidence is gen 3's");
+    assert.deepEqual(r.live, sentLeg(), "the gen-2 sent leg is carried unchanged");
+    assert.deepEqual(lg.calls, [`pin:${RUN}/${HOLD}/${PUBLISHED}`], "the published pin is kept");
+    // A gen-3 publication is ignored while the gen-2 leg is unresolved.
+    assert.equal(await settler.observeLivePublication(RUN, 3, PUBLISHED2, "checkpoint"), 0);
+    clock = NOW + SETTLE_BACKOFF_BASE_MS;
+    client.liveAnswers = [{ run_id: RUN, hold_id: HOLD, outcome: "released" }];
+    await settler.sweep();
+    assert.equal(client.liveCalls.length, 2);
+    assert.deepEqual(client.liveCalls[1]!.req, client.liveCalls[0]!.req, "exactly the gen-2 request");
+    assert.equal(client.liveCalls[1]!.req.successor_generation, 2);
+    assert.deepEqual(cleanup.calls, [`refs:${RUN}/${HOLD}`, `pin:${RUN}/1`, `journal:${RUN}/1`]);
+    assert.deepEqual(await j.listRun(RUN), []);
+  });
+
+  it("gen-2 sent leg, gen-3 adoption, then gen 2 answers not_eligible: the leg clears and gen 3 settles via the completed path", async () => {
+    const gen3 = adoptedRecord({ successorGeneration: 3, adoptedSha: ADOPTED3 });
+    assert.equal(await settler.recordAdoption(gen3), true);
+    clock = NOW + SETTLE_BACKOFF_BASE_MS;
+    client.liveAnswers = [retained("not_eligible")];
+    await settler.sweep();
+    const r = (await one())!;
+    assert.equal(r.live, undefined, "the gen-2 leg is cleared");
+    assert.deepEqual(plain(r), plain(gen3), "the record still carries gen 3's evidence");
+    assert.deepEqual(lg.calls, [`pin:${RUN}/${HOLD}/${PUBLISHED}`, `unpin:${RUN}/${HOLD}`]);
+    assert.deepEqual(cleanup.calls, []);
+    // Generation 3 completes: pushed head, completion ACK, completed settle.
+    assert.equal(await settler.recordPushedHead(r, PUSHED), true);
+    await settler.observeTerminalAck(RUN, 3, { status: "completed" }, { applied: true, status: "completed" });
+    await settler.settleRun(RUN);
+    assert.deepEqual(client.calls.map((c) => c.req), [
+      { predecessor_generation: 1, successor_generation: 3, pushed_sha: PUSHED, source_sha: SRC, adopted_sha: ADOPTED3 },
+    ]);
+    assert.deepEqual(cleanup.calls, [`refs:${RUN}/${HOLD}`, `pin:${RUN}/1`, `journal:${RUN}/1`]);
+    assert.deepEqual(await j.listRun(RUN), []);
   });
 });
 
