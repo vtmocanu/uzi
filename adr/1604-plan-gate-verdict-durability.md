@@ -37,7 +37,7 @@ plan the owner answered.
    executor (`resumesAtGate = true`, `agent/src/sdk-executor.ts`) a replayed revise re-runs the
    revision with the owner's original feedback and does not re-offer the superseded plan.
    Codex has no resume-at-gate: a replayed approve, reject or revise is ignored with a notice
-   (bar the superseded cases of point 6), and a fresh plan is shown (see residuals).
+   (superseded ones as in point 6), and a fresh plan is shown (see residuals).
 2. **A claim says when its plan was shown.** A claim carrying an unapproved persisted plan
    carries `resume_plan_at` (`ResumePlanAt` in `api/internal/workersvc/claim.go`, filled in
    `claim_assembly.go` via `LatestPersistedPlanFrameAtForRun`). It is the `created_at` of the
@@ -158,13 +158,14 @@ plan the owner answered.
   gates a fresh plan (the runner puts the run in `gatedRuns`, so its first gate bumps the
   epoch). A carried-over approve, reject or revise is ignored with a notice asking to re-send
   it: on arrival when it predates the shown plan or has no comparable `created_at` ("… sent
-  before this plan was shown …") or
-  the claim cannot say when the plan was shown ("Could not confirm which plan …", approve and
-  reject only), otherwise as epoch-stale at that first gate ("Approval ignored …", "Rejection
-  ignored …", "Feedback ignored …"). The owner must re-send it: a reject sent before the
-  interruption does not stop a Codex run. As in point 6, a verdict superseded by a later
-  carried-over approve or reject gets no re-send notice: an approve is dropped silently, a
-  reject gets "an earlier plan rejection was superseded by a newer verdict".
+  before this plan was shown …") or the claim cannot say when the plan was shown ("Could not
+  confirm which plan …", approve and reject only; an older api that consumed an approve on
+  read says it was recorded instead), otherwise as epoch-stale at that first gate ("Approval
+  ignored …", "Rejection ignored …", "Feedback ignored …"). The owner must re-send it: a
+  reject sent before the interruption does not stop a Codex run. As in point 6, a verdict
+  superseded by a later carried-over approve or reject gets no re-send notice (an approve is
+  dropped silently, a reject gets "an earlier plan rejection was superseded by a newer
+  verdict"), and an empty revise is only logged.
 - **An api from before this change** sends no `resume_plan_at` (every replayed approve or
   reject fails closed as unjudged) and has no discard route (404). Those approves stay
   unapplied and pending, and count toward the replay `LIMIT 1000` window until the api is
