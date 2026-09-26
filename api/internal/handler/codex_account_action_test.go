@@ -9,6 +9,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -109,6 +110,133 @@ func (s *heldRunsStore) ListCodexAccountActionInputs(_ context.Context, ids []uu
 		}
 	}
 	return out, nil
+}
+
+// TestCodexCredentialGetRoute executes a real chi route with its URL parameter.
+func TestCodexCredentialGetRoute(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	st := &runsStore{ownerID: owner.ID, run: store.Run{ID: runID, UserID: owner.ID,
+		Harness: "codex", Status: "running",
+		CodexSecretLabel: pgtype.Text{String: "bound-login", Valid: true}}}
+	h := newRunsHandler(t, st)
+	router := chi.NewRouter()
+	router.Get("/api/runs/{id}", h.GetRun)
+	req := httptest.NewRequest(http.MethodGet, "/api/runs/"+runID.String(), nil)
+	req = req.WithContext(mw.ContextWithUser(req.Context(), owner))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Run struct {
+			CodexSecretLabel *string `json:"codex_secret_label"`
+		} `json:"run"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Run.CodexSecretLabel == nil || *body.Run.CodexSecretLabel != "bound-login" {
+		t.Fatalf("route label=%v err=%v body=%s", body.Run.CodexSecretLabel, err, rec.Body.String())
+	}
+}
+
+// TestCodexCredentialReadHandlers verifies ordinary and deleted-alias Codex runs
+// use the run snapshot on each owner-or-admin read without a held action.
+func TestCodexCredentialReadHandlers(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	admin := store.User{ID: uuid.New(), IsAdmin: true}
+	boundID, deletedID, secretID := uuid.New(), uuid.New(), uuid.New()
+	bound := store.Run{ID: boundID, UserID: owner.ID, Harness: "codex", Status: "running",
+		CodexSecretID:    pgtype.UUID{Bytes: secretID, Valid: true},
+		CodexSecretLabel: pgtype.Text{String: "work-laptop", Valid: true}}
+	deleted := store.Run{ID: deletedID, UserID: owner.ID, Harness: "codex", Status: "completed",
+		CodexSecretLabel: pgtype.Text{String: "retired-login", Valid: true}}
+	type runJSON struct {
+		ID                 string  `json:"id"`
+		CodexSecretID      *string `json:"codex_secret_id"`
+		CodexSecretLabel   *string `json:"codex_secret_label"`
+		CodexAccountAction *string `json:"codex_account_action"`
+	}
+	check := func(t *testing.T, got runJSON, want store.Run) {
+		t.Helper()
+		if got.ID != want.ID.String() || got.CodexAccountAction != nil {
+			t.Fatalf("run=%+v, want id %s and no action", got, want.ID)
+		}
+		if got.CodexSecretLabel == nil || *got.CodexSecretLabel != want.CodexSecretLabel.String {
+			t.Fatalf("label=%v, want %q", got.CodexSecretLabel, want.CodexSecretLabel.String)
+		}
+		if want.CodexSecretID.Valid {
+			if got.CodexSecretID == nil || *got.CodexSecretID != secretID.String() {
+				t.Fatalf("id=%v, want %s", got.CodexSecretID, secretID)
+			}
+		} else if got.CodexSecretID != nil {
+			t.Fatalf("deleted alias id=%v, want null", got.CodexSecretID)
+		}
+	}
+	newStore := func(run store.Run) *runsStore {
+		return &runsStore{ownerID: owner.ID, run: run,
+			userRuns:   []store.ListRunsForUserRow{{Run: bound}, {Run: deleted}},
+			activeRuns: []store.ListActiveRunsAllRow{{Run: bound}, {Run: deleted}}}
+	}
+	for _, viewer := range []store.User{owner, admin} {
+		for _, run := range []store.Run{bound, deleted} {
+			t.Run("get/"+viewer.ID.String()+"/"+run.ID.String(), func(t *testing.T) {
+				rec := httptest.NewRecorder()
+				newRunsHandler(t, newStore(run)).GetRun(rec, runReq(viewer, run.ID))
+				if rec.Code != http.StatusOK {
+					t.Fatalf("GetRun=%d: %s", rec.Code, rec.Body.String())
+				}
+				var body struct {
+					Run runJSON `json:"run"`
+				}
+				if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+					t.Fatal(err)
+				}
+				check(t, body.Run, run)
+			})
+		}
+	}
+	for _, tc := range []struct {
+		name, path string
+		viewer     store.User
+		admin      bool
+	}{
+		{"owner list", "/api/runs", owner, false},
+		{"admin list", "/api/admin/runs", admin, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			h := newRunsHandler(t, newStore(bound))
+			req = req.WithContext(mw.ContextWithUser(req.Context(), tc.viewer))
+			if tc.admin {
+				h.AdminListRuns(rec, req)
+			} else {
+				h.ListRuns(rec, req)
+			}
+			if rec.Code != http.StatusOK {
+				t.Fatalf("list=%d: %s", rec.Code, rec.Body.String())
+			}
+			var body struct {
+				Runs []runJSON `json:"runs"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if len(body.Runs) != 2 {
+				t.Fatalf("runs=%+v, want two", body.Runs)
+			}
+			for _, got := range body.Runs {
+				switch got.ID {
+				case boundID.String():
+					check(t, got, bound)
+				case deletedID.String():
+					check(t, got, deleted)
+				default:
+					t.Fatalf("unexpected run %s", got.ID)
+				}
+			}
+		})
+	}
 }
 
 // TestCodexAccountActionReadHandlersWiring pins the PRD #1590 D6 overlay in every read that

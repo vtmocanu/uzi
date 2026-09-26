@@ -348,6 +348,11 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		dto.AnthropicSecretID = &s
 	}
 	dto.AnthropicSecretLabel = textPtrValue(r.AnthropicSecretLabel.Valid, r.AnthropicSecretLabel.String)
+	if r.CodexSecretID.Valid {
+		s := uuid.UUID(r.CodexSecretID.Bytes).String()
+		dto.CodexSecretID = &s
+	}
+	dto.CodexSecretLabel = textPtrValue(r.CodexSecretLabel.Valid, r.CodexSecretLabel.String)
 	// PRD #111 M5. Mapped independently of BOTH fields above, for the same reason and
 	// one more: the reason is present on every M1-era run (all three lanes write one)
 	// while the headroom is present only on an auto pick, so a run legitimately
@@ -631,11 +636,10 @@ func steerInputToDTO(i store.RunUserInput) apitypes.SteerInputDTO {
 	}
 }
 
-// overlayCodexAccountActions sets codex_account_action and the run's own codex_secret_label
-// (PRD #1590 D6) on the DTOs of runs held on codex_account_unavailable. runToDTO stays pure, so the read handlers overlay it here. Only
-// held runs are looked up, in ONE batched read per call, so a response with no held run costs no
-// query. Best-effort: a read error logs and leaves every action and label null, never failing the
-// read.
+// overlayCodexAccountActions sets the derived codex_account_action on runs held on
+// codex_account_unavailable (PRD #1590 D6). runToDTO maps the snapshotted label
+// independently, so a failed action lookup does not erase it. Only held runs are
+// looked up, in one batched read per call.
 func (h *Handler) overlayCodexAccountActions(ctx context.Context, dtos ...*apitypes.RunDTO) {
 	var ids []uuid.UUID
 	byID := make(map[uuid.UUID][]*apitypes.RunDTO)
@@ -668,7 +672,7 @@ func (h *Handler) overlayCodexAccountActions(ctx context.Context, dtos ...*apity
 		for _, d := range ds {
 			a := hold.Action
 			d.CodexAccountAction = &a
-			if hold.Label != nil {
+			if d.CodexSecretLabel == nil && hold.Label != nil {
 				l := *hold.Label
 				d.CodexSecretLabel = &l
 			}

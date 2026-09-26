@@ -844,6 +844,21 @@ func TestNoDiskStatsColumnsInSchedulingQueries(t *testing.T) {
 	}
 }
 
+// A foreign worker must not receive the newly exposed Codex alias in any state response.
+func TestWorkerStateForeignClaimDoesNotRevealCodexAlias(t *testing.T) {
+	runID := uuid.New()
+	h := newProtocolHandler(t, &protocolStore{
+		ownedRun: store.Run{ID: runID, Harness: "codex", Status: "running",
+			CodexSecretLabel: pgtype.Text{String: "private-alias", Valid: true}},
+		ownedErr: pgx.ErrNoRows,
+	})
+	rec := httptest.NewRecorder()
+	h.WorkerRunState(rec, workerReq(http.MethodPost, `{"status":"completed"}`, runID))
+	if rec.Code != http.StatusNotFound || strings.Contains(rec.Body.String(), "private-alias") || strings.Contains(rec.Body.String(), "codex_secret_id") {
+		t.Fatalf("foreign worker got status=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
 func TestWorkerStateAlreadyTerminalReturns409(t *testing.T) {
 	runID := uuid.New()
 	// Owned run is cancelled; the guarded completed-update touches 0 rows.

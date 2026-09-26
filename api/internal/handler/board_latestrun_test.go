@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +17,19 @@ func nullTxt() pgtype.Text     { return pgtype.Text{} }
 func i8(v int64) pgtype.Int8   { return pgtype.Int8{Int64: v, Valid: true} }
 func tstamp(t time.Time) pgtype.Timestamptz {
 	return pgtype.Timestamptz{Time: t, Valid: true}
+}
+
+func TestSharedBoardLatestRunExcludesCodexCredential(t *testing.T) {
+	for _, mine := range []bool{false, true} {
+		row := latestRunDTO{ID: uuid.NewString(), IsMine: mine}
+		body, err := json.Marshal(row)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(body), "codex_secret_label") || strings.Contains(string(body), "codex_secret_id") {
+			t.Fatalf("shared board revealed a Codex credential: %s", body)
+		}
+	}
 }
 
 func TestMapLatestRun(t *testing.T) {
