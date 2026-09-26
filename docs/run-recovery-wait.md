@@ -209,7 +209,8 @@ see [issue #1770](https://github.com/vtmocanu/uzi/issues/1770).
   any other self-resolving recovery park; it also counts toward the board's
   vault-locked indicator alongside runs that are queued and blocked on the
   same lock. Selecting the run shows the same park sentence and next retry
-  time as the run page and `uzi run get`, on the row's second line.
+  time as the run page and `uzi run get`, on the row's second line and in
+  the run detail.
 - The repo board's run badge carries no vault-specific tooltip; check the
   run page for the detail above.
 
