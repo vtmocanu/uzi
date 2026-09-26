@@ -5345,7 +5345,7 @@ export class RunRunner {
     }
     let retained = false;
     try {
-      const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
+      const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, flight.executor));
       flight.worktreePath = runnerClone.path;
       flight.branch = runnerClone.branch;
     } catch (err) {
@@ -5365,7 +5365,7 @@ export class RunRunner {
         // else fail closed. Replaces the old worker-scoped getRunOwnership probe, which
         // 404'd on a worker move (Gap 2).
         await this.reclaimTerminalOrphan(barePath, claim, err.clonePath, err.branch, err.ownerRunId, err);
-        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
+        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, flight.executor));
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;
       } else if (err instanceof CapturePathMismatchError) {
@@ -5373,7 +5373,7 @@ export class RunRunner {
         // divergence, e.g. an issue owner's `issue-N` vs this mr_rework's `agent-issue-N`).
         // The SAME owner-derived validation decides; any unmet predicate fails closed.
         await this.reclaimTerminalOrphan(barePath, claim, err.journaledPath, err.branch, err.ownerRunId, err);
-        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
+        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, flight.executor));
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;
       } else {
@@ -9432,7 +9432,7 @@ export class RunRunner {
    * vs the repo's default branch. The working tree lives ONLY in this clone; the
    * worker fetches the agent branch back from it before pushing (fetchAgentBranch).
    */
-  private async runnerCloneForClaim(barePath: string, claim: ClaimResponse) {
+  private async runnerCloneForClaim(barePath: string, claim: ClaimResponse, executor: Executor) {
     // PRD #218 M2: thread the run id as the tracking-ref OWNERSHIP anchor. The git layer
     // stays claim-agnostic — it consults the tracking ref only when its stamp matches
     // this run id, so neither a fresh run nor a different run on the same issue can
@@ -9455,6 +9455,10 @@ export class RunRunner {
     // cannot seed off a PRIOR (possibly plan-rejected) run's work. `?? undefined` maps the
     // wire's null (a never-published run) to the "do not adopt" sentinel the git layer reads.
     const expectedCheckpointTip = claim.checkpoint_tip ?? undefined;
+    // issue #1769: a Codex (sandboxed) run's command sandbox does not grant the worker bare,
+    // so its clone is dissociated from the bare at seed. Harness-agnostic: keyed on
+    // `!!executor.safety`, like every other Codex branch; the Claude path passes false.
+    const cloneOpts = { selfContained: !!executor.safety };
     // PRD #983 M4b: the per-kind branch derivations (ci_fix's default-branch vs run-branch
     // choice, self_improve/prompt's fresh-per-cycle run-id branch, task/mr_rework's
     // pre-seeded branch with its loud missing-branch guard) live in RUN_KIND_PROFILES. A
@@ -9472,10 +9476,11 @@ export class RunRunner {
         runId,
         resume,
         expectedCheckpointTip,
+        cloneOpts,
       );
     if (claim.issue_iid == null)
       throw new Error("issue run claim is missing issue_iid");
-    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId, resume, expectedCheckpointTip);
+    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId, resume, expectedCheckpointTip, cloneOpts);
   }
 
   /** Post awaiting_approval with the plan and await the steering verdict, bounded.

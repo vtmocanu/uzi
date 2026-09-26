@@ -455,6 +455,24 @@ export class CapturePathMismatchError extends Error {
   }
 }
 
+/**
+ * issue #1769 — a sandboxed (Codex) runner clone could not be made self-contained. The
+ * Codex command sandbox does not grant the worker bare, so a clone still borrowing objects
+ * through `objects/info/alternates` is unusable there; the run fails before the executor
+ * starts rather than handing the agent a clone its git cannot read. On this error the
+ * clone's alternates file has been restored in place (best-effort) and the temporary
+ * `refs/uzi-materialize/*` anchors removed.
+ */
+export class RunnerCloneMaterializationError extends Error {
+  constructor(
+    readonly clonePath: string,
+    readonly causeMessage: string,
+  ) {
+    super(`runner clone could not be made self-contained: ${causeMessage}`);
+    this.name = "RunnerCloneMaterializationError";
+  }
+}
+
 function recoveryCaptureKey(branch: string): string {
   return `uzi-recovery.${branch}.clone`;
 }
@@ -613,6 +631,9 @@ export interface RunnerClone {
  *                                    from the bare — the runner cannot corrupt the
  *                                    bare's objects through the alternate); the agent
  *                                    checks out + commits here. Removed on terminal.
+ *                                    A Codex (sandboxed) clone is dissociated after
+ *                                    setup (repack, alternates removed, issue #1769):
+ *                                    its sandbox does not grant the bare.
  *
  * The (b) split closes the shared-git cross-uid channels by construction (B2): no
  * worker-side git ever reads a runner-owned config source (no worktree add checkout,
@@ -831,8 +852,15 @@ export class GitCache {
    * bare's refs/remotes/origin/<branch>), the clone's branch is based off that fresh
    * tip so successive runs build on prior work; else off the repo's default branch.
    */
-  async createOrAttachRunnerClone(barePath: string, issueIid: number, runId?: string, resume = false, expectedCheckpointTip?: string): Promise<RunnerClone> {
-    return this.runnerCloneForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`, runId, resume, expectedCheckpointTip);
+  async createOrAttachRunnerClone(
+    barePath: string,
+    issueIid: number,
+    runId?: string,
+    resume = false,
+    expectedCheckpointTip?: string,
+    opts?: { selfContained?: boolean },
+  ): Promise<RunnerClone> {
+    return this.runnerCloneForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`, runId, resume, expectedCheckpointTip, opts);
   }
 
   /** The canonical runner-clone path for a clone key under a bare's repo dir: the single
@@ -922,8 +950,22 @@ export class GitCache {
    * local clone (worker bare → runner clone), so the local optimization here is safe;
    * the untrusted direction (worker fetching BACK from the runner clone) is the one
    * forced onto the pack transport in fetchAgentBranch (B2 invariant 3).
+   *
+   * issue #1769 — `opts.selfContained` (the runner passes `!!executor.safety`, i.e. Codex):
+   * after every ref/checkpoint step, still under this bare's lock, the clone is dissociated
+   * from the bare (materializeRunnerClone), because the Codex command sandbox does not grant
+   * the bare and git there cannot follow the alternate. Default false: the Claude path keeps
+   * the shared clone unchanged.
    */
-  async runnerCloneForBranch(barePath: string, branch: string, key: string, runId?: string, resume = false, expectedCheckpointTip?: string): Promise<RunnerClone> {
+  async runnerCloneForBranch(
+    barePath: string,
+    branch: string,
+    key: string,
+    runId?: string,
+    resume = false,
+    expectedCheckpointTip?: string,
+    opts?: { selfContained?: boolean },
+  ): Promise<RunnerClone> {
     return this.withLock(barePath, async () => {
       const clonePath = this.runnerClonePath(barePath, key);
       // #1197, verified 2026-09-08: the clone is the only remaining copy when a
@@ -1259,6 +1301,7 @@ export class GitCache {
       // it). `--shared` references the bare's objects read-only (alternate); `--no-checkout`
       // skips populating the stale default so we check the agent branch out at the
       // resolved base SHA (reachable via the alternate) in one step. No PAT (local op).
+      // A Codex (selfContained) clone is dissociated from the bare after setup, below.
       await this.runGitAsRunner(undefined, ["clone", "--shared", "--no-checkout", barePath, clonePath]);
       // Issue #134 (production half of #127). ONE detached `git maintenance run --auto
       // --detach` per object-writing command (fetch/commit/push) outlives the git we awaited
@@ -1303,6 +1346,9 @@ export class GitCache {
       // and so leaves seededFrom ∈ {origin, default} — so the structure below can pick at most
       // one.
       let wipRecovered = false;
+      // issue #1769: the diverged-checkpoint marker SHA, set only when its cherry-pick applied,
+      // so a selfContained clone anchors it before dissociating.
+      let recoveredCheckpointMarkerSha = "";
       if (willRecoverMarker) {
         // #3 — SAME-WORKER + CROSS-WORKER-CLEAN. The checkout materialized the marker's
         // tree at HEAD; `reset --soft` moves HEAD back to the marker's parent while leaving
@@ -1334,7 +1380,8 @@ export class GitCache {
         //      recover. The OBJECTS are reachable via the `--shared` alternate; only the ref
         //      NAME is missing. So resolve the marker to a 40-char SHA against the BARE
         //      (mirroring the strict-descendant guard's rev-parse ~:483) and cherry-pick the
-        //      SHA, which the clone can name through its alternate.
+        //      SHA, which the clone can name through its alternate. (A Codex clone is
+        //      dissociated only after this, with the marker SHA among the anchored objects.)
         //  (2) Silent milestone drop. `cherry-pick --no-commit <marker>` applies ONLY the
         //      marker's diff against ITS OWN parent (the WIP delta). If the diverged
         //      checkpoint carries committed-but-unpushed milestones between the fork point
@@ -1374,6 +1421,7 @@ export class GitCache {
             // so seededFrom stays the floor leg. It was recovered, not set aside.
             wipRecovered = true;
             checkpointSetAside = false;
+            recoveredCheckpointMarkerSha = checkpointMarkerSha;
             this.log.info("runner clone: recovered diverged wip(park) checkpoint onto new floor (cherry-pick --no-commit)", {
               branch,
               checkpoint: checkpointRef,
@@ -1479,11 +1527,114 @@ export class GitCache {
         if ((err as { code?: unknown }).code === 5) return;
         throw err;
       });
+      // issue #1769 — a Codex (selfContained) clone is dissociated from the bare HERE, after
+      // every ref/checkpoint step and still inside this bare's withLock, so no bare maintenance
+      // can interleave with the copy. A failure throws RunnerCloneMaterializationError, which
+      // fails the run before the executor starts.
+      if (opts?.selfContained) {
+        const originBranchSha = await this.originBranchTip(barePath, branch);
+        const required = [
+          baseSha,
+          effectiveBase,
+          markerParent,
+          recoveredCheckpointMarkerSha,
+          defaultBranchCommit,
+          ratchetBase,
+          originBranchSha,
+        ].filter((sha): sha is string => typeof sha === "string" && sha !== "");
+        await this.materializeRunnerClone(clonePath, [...new Set(required)]);
+      }
       // PRD #759 M2: baseCommit is the REAL fork point — effectiveBase, which is the
       // marker's parent when a wip(park) marker was reset --soft'd back to uncommitted, and
       // baseSha (byte-identical) on every other leg. wipRecovered surfaces the recovery to
       // M4/M5.
       return { path: clonePath, branch, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered };
+    });
+  }
+
+  /**
+   * issue #1769 — make a runner clone SELF-CONTAINED: copy every object it borrows from the
+   * worker bare into its own object store, then retire `objects/info/alternates`. The Codex
+   * command sandbox does not grant the bare, so a `--shared` clone is unreadable to git there.
+   *
+   * Every git/mv/rm runs as the RUNNER uid (the clone is runner-owned); nothing touches the
+   * clone as worker. Called only by runnerCloneForBranch, inside withLock(barePath). Steps:
+   * anchor each required SHA under a temporary `refs/uzi-materialize/<n>`; `repack -a -d`
+   * (no `-l`, so borrowed objects are packed locally); rename the alternates file aside;
+   * verify with every alternate source disabled (fsck connectivity + `cat-file -e` of HEAD
+   * and each required SHA); then drop the anchors and the renamed file. On any failure the
+   * renamed file is moved back and the anchors deleted (best-effort) and a
+   * RunnerCloneMaterializationError is thrown. A clone with no alternates file is left as is.
+   */
+  private async materializeRunnerClone(clonePath: string, requiredShas: readonly string[]): Promise<void> {
+    if (this.boundaryProcesses.getStore()) {
+      throw new RunnerCloneMaterializationError(clonePath, "materialization must not run inside a permit-held boundary");
+    }
+    const infoDir = path.join(clonePath, ".git", "objects", "info");
+    const alternates = path.join(infoDir, "alternates");
+    const parked = path.join(infoDir, "alternates.uzi-materialize");
+    if (!(await pathExists(alternates))) {
+      this.log.info("runner clone: no alternates, already self-contained (materialization skipped)", { path: clonePath });
+      return;
+    }
+    const started = Date.now();
+    // The same runner env runGitAsRunner builds, with the env-level alternate sources removed
+    // explicitly: gitEnv() is a replacement env, but the verification below must not be able to
+    // succeed through an alternate object directory whatever the caller's environment holds.
+    const env: NodeJS.ProcessEnv = { ...gitEnv(), PATH: runnerPath() };
+    const tmp = runnerTmpdir();
+    if (tmp) env.TMPDIR = tmp;
+    delete env.GIT_ALTERNATE_OBJECT_DIRECTORIES;
+    delete env.GIT_OBJECT_DIRECTORY;
+    const run = async (command: string, args: string[]): Promise<string> => {
+      const wrapped = runnerCommand(command, args);
+      this.log.debug("runner clone materialize (runner uid)", { command, args });
+      const { stdout } = await this.execScoped(wrapped.command, wrapped.args, {
+        env,
+        timeout: GIT_TIMEOUT_MS,
+        maxBuffer: GIT_MAX_BUFFER,
+      }, "command");
+      return stdout;
+    };
+    const git = (args: string[]): Promise<string> => run("git", withDir(clonePath, args));
+    const anchors: string[] = [];
+    let renamed = false;
+    let verified: string[] = [];
+    try {
+      const head = (await git(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+      verified = [...new Set([head, ...requiredShas])];
+      for (const [n, sha] of verified.entries()) {
+        const ref = `refs/uzi-materialize/${n}`;
+        await git(["update-ref", ref, sha]);
+        anchors.push(ref);
+      }
+      await git(["repack", "-a", "-d", "-q"]);
+      await run("/bin/mv", ["-f", alternates, parked]);
+      renamed = true;
+      await git(["fsck", "--connectivity-only", "--no-dangling", "--no-progress"]);
+      for (const sha of ["HEAD", ...verified]) {
+        await git(["cat-file", "-e", `${sha}^{commit}`]);
+      }
+    } catch (err) {
+      if (renamed || (await pathExists(parked))) {
+        await run("/bin/mv", ["-f", parked, alternates]).catch((e: unknown) =>
+          this.log.warn("runner clone: could not restore alternates after failed materialization", {
+            path: clonePath,
+            error: gitErrorMessage(e),
+          }),
+        );
+      }
+      for (const ref of anchors) await git(["update-ref", "-d", ref]).catch(() => undefined);
+      const cause = gitErrorMessage(err);
+      this.log.warn("runner clone: materialization failed (alternates restored)", { path: clonePath, error: cause });
+      throw new RunnerCloneMaterializationError(clonePath, cause);
+    }
+    for (const ref of anchors) await git(["update-ref", "-d", ref]);
+    await run("/bin/rm", ["-f", parked]);
+    this.log.info("runner clone: materialized (self-contained)", {
+      path: clonePath,
+      duration_ms: Date.now() - started,
+      required: verified.length,
     });
   }
 
