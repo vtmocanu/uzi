@@ -940,6 +940,39 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
     }
   });
 
+  it("a live settle fired from inside an ended boundary scope does not inherit that scope", async () => {
+    // issue #1751 M2 review: the checkpoint publish runs inside Codex permits and the mid-turn
+    // tick, under GitCache's AsyncLocalStorage boundary scope. The fire-and-forget live settle
+    // must run in the runner's own (permit-free) context, or its git reads use the scope's
+    // spawner and signal after the permit has ended.
+    const r = await liveRig();
+    try {
+      await git.ensureClone(fx.originPath);
+      await r.settlement.put(adoptedRecord(r, HOLD_A));
+      assert.ok(await git.pinSettlementRefs(r.bare, RUN_ID, HOLD_A, { source: r.src, adopted: r.adopted }));
+      r.settleClient.liveAnswer = (h) => released(RUN_ID, h);
+      const ended = new AbortController();
+      ended.abort(new Error("permit ended"));
+      let scopedSpawns = 0;
+      const deadSpawner = async () => {
+        scopedSpawns += 1;
+        throw new Error("boundary spawner used after its permit ended");
+      };
+      assert.equal(
+        await git.withBoundaryProcessSpawner(deadSpawner, ended.signal, () => publish(r, liveFlight(), PUBLISHED_OK)),
+        true,
+      );
+      assert.equal(r.observed.length, 1, "the confirmed publish fired the live trigger");
+      await Promise.all(r.observed);
+      await Promise.all(r.settled);
+      assert.equal(scopedSpawns, 0, "no git child went through the ended permit's spawner");
+      assert.equal(r.settleClient.liveCalls.length, 1, "the live leg was recorded and sent");
+      assert.deepEqual(await r.settlement.listRun(RUN_ID), [], "released cleaned the record up");
+    } finally {
+      r.cleanup();
+    }
+  });
+
   for (const [label, result] of [
     ["published:false (a 2xx skip)", { ok: true, body: { published: false, ref: "", skipped: "workflow_scope" } }],
     ["a non-ok publish (HTTP 500)", { ok: false, httpStatus: 500 }],

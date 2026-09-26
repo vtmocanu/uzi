@@ -683,3 +683,46 @@ func TestRecoveryLiveAncestryChecksLiveDB(t *testing.T) {
 		}
 	})
 }
+
+// TestRecoveryLiveSettleRacesConcurrentChangeLiveDB (issue #1751 M2 review): a terminal
+// completion or a successor-hold settlement that is still uncommitted when the guarded live
+// release runs must not be passed. The release locks the run and successor-hold rows it checks
+// (FOR SHARE), so it waits for the other transaction and re-evaluates on its committed row:
+// 0 rows, retained. Without the locks the UPDATE reads the pre-commit snapshot and releases.
+func TestRecoveryLiveSettleRacesConcurrentChangeLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sql  string
+		arg  func(e *liveEnv) uuid.UUID
+	}{
+		{"run completes", `UPDATE runs SET status = 'completed' WHERE id = $1`, func(e *liveEnv) uuid.UUID { return e.run }},
+		{"successor hold discarded", `UPDATE recovery_custody_holds SET state = 'discarded', release_evidence = 'owner_discard',
+		      live_worker_id = NULL, live_run_id = NULL WHERE id = $1`, func(e *liveEnv) uuid.UUID { return e.sibGen }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newLiveEnv(t)
+			tx, err := e.pool.Begin(e.ctx)
+			if err != nil {
+				t.Fatalf("begin: %v", err)
+			}
+			committed := make(chan error, 1)
+			e.fake.beforeCompare = func() {
+				if _, err := tx.Exec(e.ctx, tc.sql, tc.arg(e)); err != nil {
+					t.Errorf("concurrent change: %v", err)
+				}
+				// Commit only after the settle's guarded UPDATE has had time to start and, with
+				// the locks, to block on the uncommitted row.
+				go func() {
+					time.Sleep(400 * time.Millisecond)
+					committed <- tx.Commit(e.ctx)
+				}()
+			}
+			code, res, raw := e.settleLive(e.tokenA, e.run, e.pred, goodLiveBody(apitypes.RecoverySettleTargetCheckpoint))
+			if err := <-committed; err != nil {
+				t.Fatalf("commit concurrent change: %v", err)
+			}
+			e.assertRetained(code, res, raw, apitypes.RecoverySettleStateChanged)
+			e.assertOpen(e.pred)
+		})
+	}
+}

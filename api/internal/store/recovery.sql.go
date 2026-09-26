@@ -1400,6 +1400,12 @@ WHERE h.id = $8
             r.kind = $14::text
             AND r.issue_iid IS NOT DISTINCT FROM $15::bigint
         ))
+      -- FOR SHARE (here and on the successor hold below): PostgreSQL re-checks a concurrent
+      -- change only on the UPDATE's target row, not on rows a subquery merely reads. Locking
+      -- them makes a terminal completion (or a successor-hold settlement) either wait for this
+      -- release, or, when it committed first, re-evaluate these predicates on the committed
+      -- row, so the two can never pass each other.
+      FOR SHARE
   )
   AND EXISTS (
       SELECT 1 FROM recovery_custody_holds s
@@ -1408,6 +1414,7 @@ WHERE h.id = $8
         AND s.generation = $5::bigint
         AND s.original_worker_id = $12::uuid
         AND s.state = 'open'
+      FOR SHARE
   )
   AND (
       NOT EXISTS (SELECT 1 FROM recovery_captures c, cutoff

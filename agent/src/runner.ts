@@ -1173,6 +1173,13 @@ export class RunRunner {
    *  and the settler that drives the api settle for them. Disabled without a worker token. */
   private readonly settlement: SettlementJournal;
   private readonly settler: PredecessorSettler;
+  /** issue #1751 M2 review — runs `fn` in the async context captured when this runner was
+   *  constructed (permit-free), not the caller's. A live settle is triggered from inside Codex
+   *  permits and the mid-turn tick, where GitCache's AsyncLocalStorage boundary scope is active;
+   *  a fire-and-forget promise would inherit that scope and, after the permit ends, run its git
+   *  reads (isAncestor, the published pin) through a stale, aborted boundary spawner. Same idea
+   *  as the tick's `armedFire`. */
+  private readonly detached: (fn: () => void) => void = AsyncResource.bind((fn: () => void) => fn());
   /** PRD #1391 M2 — the worker message outbox the batcher spills to, the shared re-arm
    *  registry, the spill trip window and the spill-buffer cap. All threaded into every
    *  run's MessageBatcher; `outbox`/`rearm` undefined ⇒ today's trip behaviour. */
@@ -8048,14 +8055,16 @@ export class RunRunner {
     const generation = flight.claimGeneration;
     if (!Number.isSafeInteger(generation) || generation <= 0) return;
     const signal = flight.cancel.signal;
-    void (async () => {
-      await this.settler.observeLivePublication(flight.runId, generation, publishedSha, target);
-      if (signal.aborted) return;
-      await this.settler.settleLive(flight.runId, signal);
-    })().catch((err: unknown) => {
-      flight.runLog.warn("recovery settlement: live settle trigger failed (the sweep retries)", {
-        run_id: flight.runId,
-        error: errMessage(err),
+    this.detached(() => {
+      void (async () => {
+        await this.settler.observeLivePublication(flight.runId, generation, publishedSha, target);
+        if (signal.aborted) return;
+        await this.settler.settleLive(flight.runId, signal);
+      })().catch((err: unknown) => {
+        flight.runLog.warn("recovery settlement: live settle trigger failed (the sweep retries)", {
+          run_id: flight.runId,
+          error: errMessage(err),
+        });
       });
     });
   }
@@ -8068,12 +8077,14 @@ export class RunRunner {
    */
   private triggerBranchLiveSettle(flight: RunFlight, barePath: string, branch: string): void {
     if (flight.runKind !== "task" || !this.settlement.enabled) return;
-    void this.git
-      .trackingTip(barePath, branch)
-      .then((tip) => {
-        if (tip) this.triggerLiveSettle(flight, tip, "branch");
-      })
-      .catch(() => undefined);
+    this.detached(() => {
+      void this.git
+        .trackingTip(barePath, branch)
+        .then((tip) => {
+          if (tip) this.triggerLiveSettle(flight, tip, "branch");
+        })
+        .catch(() => undefined);
+    });
   }
 
   /**
