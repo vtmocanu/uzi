@@ -227,3 +227,46 @@ func TestVaultBandCountsOwnVaultLockedParks(t *testing.T) {
 		t.Errorf("untyped recovery park counted: ownParkedOnVaultCount = %d, want 0", got)
 	}
 }
+
+// TestVaultParkBoardSecondLine: the selected vault_locked row draws the vault park sentence as
+// its second line, clamped to m.width, and boardShowSecondLine reserves that physical line in
+// boardCapacity, so a board with more runs than fit keeps its frame within m.height at 60 and
+// 80 columns. Reddening mutations: drop the vaultParkLine branch in boardSecondLine (the line
+// is missing), drop its clampVisual (a row overflows m.width), or drop the vaultParkLine term in
+// boardShowSecondLine (the capacity is not reserved and the frame overflows by one row).
+func TestVaultParkBoardSecondLine(t *testing.T) {
+	for _, width := range []int{60, 80} {
+		runs := []apitypes.RunListItemDTO{{RunDTO: vaultParkRun("00000000-vault")}}
+		for i := 0; i < 40; i++ {
+			id := "1" + strings.Repeat("0", 6) + string(rune('a'+i%26)) + "-run"
+			runs = append(runs, apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: id, Kind: "issue", Status: "running", IssueTitle: "busy", Health: "ok"}})
+		}
+		m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+		m.width, m.height = width, 20
+		m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: runs})
+		if r, ok := m.board.selected(); !ok || r.ID != "00000000-vault" {
+			t.Fatalf("width %d: cursor is not on the vault park: %+v", width, r.ID)
+		}
+		if !m.boardShowSecondLine(m.board.runs[0]) {
+			t.Errorf("width %d: boardShowSecondLine(vault park) = false; its second line is not reserved", width)
+		}
+		out := stripANSI(m.View().Content)
+		if !strings.Contains(out, "▸ waiting for vault unlock") {
+			t.Fatalf("width %d: board lacks the vault park second line:\n%s", width, out)
+		}
+		rows := strings.Split(out, "\n")
+		for i, row := range rows {
+			if w := visualWidth(row); w > width {
+				t.Errorf("width %d: row %d is %d columns wide, overflowing the terminal: %q", width, i, w, row)
+			}
+		}
+		if len(rows) > m.height {
+			t.Errorf("width %d: board frame is %d rows, want at most m.height %d\n%s", width, len(rows), m.height, out)
+		}
+		held := m.boardCapacity()
+		m.board.cursor = 1
+		if plain := m.boardCapacity(); held != plain-1 {
+			t.Errorf("width %d: boardCapacity(vault park selected) = %d, want %d (one fewer than %d)", width, held, plain-1, plain)
+		}
+	}
+}

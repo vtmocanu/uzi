@@ -501,12 +501,14 @@ func (m tuiModel) milestoneMarker(r apitypes.RunListItemDTO, dim bool, bg color.
 }
 
 // boardShowSecondLine reports whether the SELECTED row gets its second "now" line (PRD #1064
-// D4): a non-terminal run with a server-derived current_activity, or a run held on its Codex
-// account (PRD #1590), whose second line is the account action. It has no milestone
+// D4): a non-terminal run with a server-derived current_activity, a run held on its Codex
+// account (PRD #1590), whose second line is the account action, or a vault_locked park (issue
+// #1766), whose second line is the vault park sentence. It has no milestone
 // precondition (D5) — the board reads current_activity directly. Used both by the row window
 // math (which must reserve a physical line for it) and by renderBoard.
 func (m tuiModel) boardShowSecondLine(r apitypes.RunListItemDTO) bool {
-	return (r.CurrentActivity != nil && !terminalRunStatuses[r.Status]) || codexAccountActionLine(r.RunDTO) != ""
+	return (r.CurrentActivity != nil && !terminalRunStatuses[r.Status]) ||
+		codexAccountActionLine(r.RunDTO) != "" || vaultParkLine(r.RunDTO) != ""
 }
 
 // boardSecondLine is the selected row's second line (PRD #1064 D4): `▸ <id> <title> · <role>
@@ -524,6 +526,13 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 	// codexAccountActionLine and through renderer.Plain here (D7).
 	if line := codexAccountActionLine(r.RunDTO); line != "" {
 		out := paintSeg(m.pal.tungsten, bg, false, "  ▸ ") + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 120))
+		return padSeg(clampVisual(out, m.width), m.width, bg)
+	}
+	// Issue #1766: a vault_locked park likewise has no live activity; its second line is the
+	// owner-neutral vault park sentence (vaultParkLine), in the same wait ink and slot. The
+	// sentence outruns any normal terminal, so clampVisual holds it to one physical row.
+	if line := vaultParkLine(r.RunDTO); line != "" {
+		out := paintSeg(m.pal.tungsten, bg, false, "  ▸ ") + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 240))
 		return padSeg(clampVisual(out, m.width), m.width, bg)
 	}
 	act := r.CurrentActivity
