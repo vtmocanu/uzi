@@ -11,7 +11,7 @@
 # Agent SDK spawns a real Bash tool and the git flow needs git + coreutils. This
 # is a minimal Node 24 + git + bash base (digest shared with web/Dockerfile), run
 # as a non-root user (PRD §Worker runtime).
-FROM node:24-alpine@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf
+FROM node:24-alpine@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf AS runtime
 WORKDIR /app
 
 # git for clone/fetch/worktree; bash for the SDK Bash tool (M3); tini as PID 1 so
@@ -407,6 +407,20 @@ RUN addgroup -g 10004 codex-session && addgroup worker codex-session && addgroup
 # supervisor's reaper) bounds its size.
 RUN mkdir -p /var/cache/uzi-codex-cmd && chmod 0755 /var/cache/uzi-codex-cmd
 
+# --- #1720: runtime / release stage boundary -------------------------------------------
+# Everything ABOVE is the `runtime` stage: the expensive, slow-moving toolchain (packages,
+# nix/devbox, Chromium + agent-browser, gitleaks, npm deps, Codex, the supervisor).
+# release.yml publishes it as ghcr.io/vtmocanu/uzi/agent-runtime-<template>:<input key>
+# (scripts/agent-runtime-key.sh) and builds it only when that key is absent, then builds
+# the stage BELOW on top of it with `--build-context runtime=docker-image://<base>@<digest>`,
+# which replaces this stage outright. Every other build (compose, e2e, KinD, PR CI) builds
+# both stages from this one file, unchanged. The key covers the runtime stage's text and
+# every file it COPYs, so anything added above this line is keyed automatically; the key
+# script fails closed on any form it cannot account for (ADD, COPY --from, RUN --mount...).
+# The release stage is ALWAYS built, so a release image never aliases another release
+# (ADR-1720).
+FROM runtime AS release
+
 COPY agent/tsconfig.json ./
 COPY agent/src ./src
 
@@ -455,6 +469,13 @@ ENV UZI_AGENT_VERSION=${UZI_AGENT_VERSION#v}
 # Links this package to the repository on the registry (GHCR reads this label).
 # Kept below the expensive nix/Chromium layers with the version stamp above.
 LABEL org.opencontainers.image.source="https://github.com/vtmocanu/uzi"
+# #1720: release identity, read back from the registry by release.yml's
+# assert-agent-version job without pulling the image. RUNTIME_BASE_REF names the published
+# runtime base (<repo>@sha256:<digest>) a release was built on; `local` for every other build.
+ARG RUNTIME_BASE_REF=local
+LABEL org.opencontainers.image.version="${UZI_AGENT_VERSION}" \
+      org.opencontainers.image.revision="${UZI_SRC_SHA}" \
+      io.github.vtmocanu.uzi.runtime-base="${RUNTIME_BASE_REF}"
 
 # Bake the template identity into the image so the worker self-reports the image
 # it was actually built from (PRD #18 register `template`). This is a HARDCODED

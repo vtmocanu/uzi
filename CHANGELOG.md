@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Every release's agent image now reports the version it is tagged with ([#1682](https://github.com/vtmocanu/uzi/issues/1682), [#1720](https://github.com/vtmocanu/uzi/issues/1720)).**
+  A release whose agent code had not changed used to re-tag the previous release's worker image, so a stable promote shipped `agent-base:X.Y.Z` still reporting `X.Y.Z-rc.N`, and a self-managed worker showed `outdated` forever. Each agent template is now split into a runtime base, published as `agent-runtime-<template>:<input key>` and rebuilt only when one of its inputs changes, and a release stage that is built and stamped on every release. The release job checks that each published agent image reports exactly its tagged version and commit before the chart is published. Images already published keep their old stamps. Credit to @mauromorales for the report and the design.
+
 - **The failure-cause breakdown on the usage cards always adds up to the failed count ([#1451](https://github.com/vtmocanu/uzi/issues/1451)).**
   The failed-run count and its per-cause breakdown (`fail_origins`) on `GET /api/usage` and `GET /api/admin/usage` were read in two separate queries, so a run that failed between them could make the causes sum to one more than `failed` in the same response. Each scope (your own, factory-wide and per user) now computes both in one query, so they always describe the same runs. The response shape is unchanged.
 
