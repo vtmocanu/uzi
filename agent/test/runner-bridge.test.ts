@@ -409,6 +409,50 @@ describe("RunRunner — the MR bridge-note is history-derived, not flight-local 
 });
 
 describe("RunRunner — a concurrent remote advance is not a rewrite (PRD #1416 M3)", () => {
+  it("an aligned GitHub mr_rework whose remote branch advances reports branch_moved", async () => {
+    commitToOriginMain({ ".github/workflows/ci.yml": CI_V1 }, "seed workflows");
+    const branch = "agent/issue-779";
+    const P = publishBranch(branch);
+    const { github } = fakeGitHub();
+    let concurrentTip = "";
+    let alignCalls = 0;
+    const originalAlign = git.alignBranchWithDefault.bind(git);
+    git.alignBranchWithDefault = (async (...args: Parameters<typeof git.alignBranchWithDefault>) => {
+      alignCalls++;
+      return originalAlign(...args);
+    }) as typeof git.alignBranchWithDefault;
+    const executor: Executor = {
+      run: async (ctx) => {
+        fs.writeFileSync(path.join(ctx.worktreePath, "rework.ts"), "1\n");
+        gitIn(ctx.worktreePath, ["add", "rework.ts"]);
+        gitIn(ctx.worktreePath, [...IDENT, "commit", "-m", "rework"]);
+        commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "main advances workflows");
+        gitIn(fx.originPath, ["checkout", branch]);
+        fs.writeFileSync(path.join(fx.originPath, "concurrent.md"), "someone else\n");
+        gitIn(fx.originPath, ["add", "concurrent.md"]);
+        gitIn(fx.originPath, [...IDENT, "commit", "-m", "concurrent writer"]);
+        concurrentTip = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+        gitIn(fx.originPath, ["checkout", "main"]);
+        return { branch: ctx.branch };
+      },
+    };
+    const remoteTip = () => gitIn(fx.originPath, ["rev-parse", branch]);
+    const claim = githubTaskClaim(branch, { kind: "mr_rework", open_mr: true });
+    try {
+      await githubRunner(github, executor).execute(claim);
+    } finally {
+      git.alignBranchWithDefault = originalAlign;
+    }
+    assert.ok(alignCalls > 0, "the GitHub workflow alignment ran before publication");
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
+    assert.equal(failed?.branch_moved, true);
+    assert.equal(failed?.fail_origin, undefined);
+    assert.notEqual(concurrentTip, P);
+    assert.equal(remoteTip(), concurrentTip, "the concurrent writer's commit remains the remote tip");
+    assert.equal(statusesFor(claim.run_id).includes("completed"), false);
+    assert.deepStrictEqual(bridgeStatusLines(claim.run_id), []);
+  });
+
   it("an mr_rework whose branch was advanced by a concurrent writer takes branch_moved, no bridge", async () => {
     const { gitlab } = fakeGitlab();
     const branch = "agent/issue-777";

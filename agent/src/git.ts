@@ -33,6 +33,13 @@ export class ScratchPublicationError extends Error {
   }
 }
 
+export class RemoteBranchAdvancedError extends Error {
+  constructor() {
+    super("non-fast-forward: remote branch advanced");
+    this.name = "RemoteBranchAdvancedError";
+  }
+}
+
 export class ScratchProvisionError extends Error {
   readonly code = "scratch_provision_failed";
   constructor(cause: unknown) {
@@ -898,9 +905,8 @@ export class GitCache {
     } finally {
       await this.runGit(barePath, ["update-ref", "-d", scratchRef]).catch(() => undefined);
     }
-    // Let the existing mr_rework non-fast-forward handler verify the moved branch
-    // and report branch_moved; this is not a scratch/range refusal.
-    if (forwardAdvance) throw new Error("non-fast-forward: remote branch advanced");
+    // The caller verifies the moved branch before reporting branch_moved.
+    if (forwardAdvance) throw new RemoteBranchAdvancedError();
   }
 
   /** The default branch's short name (e.g. `main`), for an MR target. */

@@ -3855,7 +3855,6 @@ export class RunRunner {
     const pushToOrigin = () =>
       withForgeRetry(
         async () => {
-          await this.git.scratchPublicationPreflight(finalizeBarePath, result.branch);
           await this.git.pushBranch(
             finalizeBarePath,
             result.branch,
@@ -3994,6 +3993,33 @@ export class RunRunner {
           "The MR branch was advanced by a concurrent writer, so this rework was superseded and not applied. The branch and the concurrent commits are intact.",
         branch_moved: true,
       });
+    };
+
+    // Verify a concurrent forward advance against the origin tip captured at clone.
+    // The remote fetch may fail, so only a proven descendant gets branch_moved.
+    const reportMovedBranchIfVerified = async (error: unknown): Promise<boolean> => {
+      if (claim.kind !== "mr_rework" || !isNonFastForwardRejection(error)) return false;
+      const originAtClone = await this.git
+        .originBranchTip(finalizeBarePath, result.branch)
+        .catch(() => null);
+      let remoteTip: string | null = null;
+      try {
+        remoteTip = await this.git.fetchDefaultTip(
+          finalizeBarePath,
+          result.branch,
+          claim.secrets.forge_pat,
+          claim.repo.clone_url,
+          claim.secrets.forge_username,
+        );
+      } catch {
+        return false;
+      }
+      if (
+        !originAtClone || !remoteTip || remoteTip === originAtClone ||
+        !(await this.git.isAncestorRef(finalizeBarePath, originAtClone, remoteTip))
+      ) return false;
+      await failBranchMoved();
+      return true;
     };
 
     // PRD #1416 M4: the typed terminal for a run whose branch was rewritten at/below the published
@@ -4228,6 +4254,7 @@ export class RunRunner {
                 return false;
               } catch (e) {
                 if (e instanceof ScratchPublicationError) throw e;
+                if (await reportMovedBranchIfVerified(e)) return true;
                 // PRD #974 M2: an aligned push rejected by GitHub Push Protection (GH013) is a
                 // secret the pre-push gitleaks scan missed — route it to the typed
                 // push_secret_blocked fail (NO preserved diff: it may carry the detected secret)
@@ -4319,6 +4346,7 @@ export class RunRunner {
                   // secret gitleaks missed — typed push_secret_blocked fail (NO preserved diff:
                   // it may carry the secret), not a fall-back to merge/rebase (which cannot clear
                   // a secret) nor the generic catch.
+                  if (await reportMovedBranchIfVerified(e)) return;
                   if (isPushProtectionRejection(e)) {
                     runLog.info(
                       "finalize base-align: workflow-subtree overlay push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
@@ -4350,6 +4378,7 @@ export class RunRunner {
                   // gitleaks missed — typed push_secret_blocked fail (NO preserved diff: it may
                   // carry the secret), not the rebase fallback (which cannot clear a secret) nor
                   // the generic catch.
+                  if (await reportMovedBranchIfVerified(e)) return;
                   if (isPushProtectionRejection(e)) {
                     runLog.info(
                       "finalize base-align: merge push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
@@ -4496,42 +4525,7 @@ export class RunRunner {
         // mr_rework rework rejected non-fast-forward can mean a concurrent same-branch writer
         // advanced the MR branch under the run; route that distinct case to the branch_moved
         // disposition instead of letting it rethrow into the generic agent_failure catch.
-        if (claim.kind === "mr_rework" && isNonFastForwardRejection(e)) {
-          // Capture O — the origin branch tip at clone — BEFORE the detection fetch overwrites
-          // refs/remotes/origin/<branch> with the fresh remote tip. The base is the ORIGIN tip
-          // at clone, NOT runnerClone.baseCommit: on a resume the reseed sets baseCommit to the
-          // tracking tip (ahead of origin), which would fail the ancestor check below and
-          // silently regress a resumed run back to agent_failure.
-          const originAtClone = await this.git
-            .originBranchTip(finalizeBarePath, result.branch)
-            .catch(() => null);
-          let remoteTip: string | null = null;
-          try {
-            remoteTip = await this.git.fetchDefaultTip(
-              finalizeBarePath,
-              result.branch,
-              claim.secrets.forge_pat,
-              claim.repo.clone_url,
-              claim.secrets.forge_username,
-            );
-          } catch {
-            // Fetch failed → fall through to the generic throw (fail-safe): never mislabel a
-            // real problem as benign.
-          }
-          // A genuine concurrent-writer advance: the remote tip changed since our clone AND
-          // strictly descends from it (advanced forward, not rewritten/rewound). Anything else
-          // (unchanged tip, fetch failure, divergent/rewound history) falls through to today's
-          // behavior — never a false positive.
-          if (
-            originAtClone &&
-            remoteTip &&
-            remoteTip !== originAtClone &&
-            (await this.git.isAncestorRef(finalizeBarePath, originAtClone, remoteTip))
-          ) {
-            await failBranchMoved();
-            return;
-          }
-        }
+        if (await reportMovedBranchIfVerified(e)) return;
         throw e;
       }
     }
@@ -6949,8 +6943,11 @@ export class RunRunner {
       else if (rel === "unknown") anyUnknown = true;
     }
     if (!anyDivergent) {
-      // All ancestor, OR a mix of ancestor+unknown (no divergent): a broken read must NEVER bridge.
-      return anyUnknown ? { kind: "unknown" } : { kind: "clean" };
+      // A broken read must never bridge. A proven clean published tip is checked
+      // before the runner attempts a push; unpublished tips use pushBranch's check.
+      if (anyUnknown) return { kind: "unknown" };
+      await this.git.scratchPublicationPreflight(barePath, branch, H);
+      return { kind: "clean" };
     }
     // Build B over the floors (bridgeToFloors appends only the ones actually missing).
     const bridgeResult = await this.git.bridgeToFloors(barePath, H, floors);
