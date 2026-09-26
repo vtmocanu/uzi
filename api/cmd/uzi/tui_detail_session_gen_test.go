@@ -343,3 +343,106 @@ func TestTUIDetailStaleSessionStreamReadyRejectedViaPR(t *testing.T) {
 	requireStreamClosed(t, stale.stream, "session A's late socket")
 	requireStreamOpen(t, own.stream, "the PR-opened session's stream")
 }
+
+// (e) The current session's OWN read chain must keep its generation. Every other test here starts
+// session A on the `--run` path at gen 0, where a dropped stamp (the zero value) still equals the
+// session's gen, so a slip in readStreamCmd's returns or in a handler's re-read would go unseen.
+// A board-opened session has gen >= 1: there such a slip makes the live session discard its own
+// frames. Drives the model's own openStreamCmd over a fake stream with message frames, feeds every
+// read back through Update, then closes the socket so the chain's closed batch is exercised too,
+// and finally round-trips a meta poll from the same session.
+func TestTUIDetailBoardOpenedSessionOwnReadChainApplies(t *testing.T) {
+	runID := "cccccccc-8888-2222-3333-444444444444"
+	title := "run"
+	fake := sessionGenFake(runID, &title)
+	agent := "lead"
+	at := time.Now()
+	for seq := int32(1); seq <= 3; seq++ {
+		fake.StreamEvents = append(fake.StreamEvents, apitypes.RunEventDTO{
+			Type: uzicli.RunEventTypeMessage, Seq: seq, Kind: "text", Agent: &agent, CreatedAt: &at,
+			Payload: json.RawMessage(`{"text":"own frame"}`),
+		})
+	}
+
+	m := tuiTestModel(t, fake, runID) // `--run` session, gen 0
+	m = reopenFromBoard(t, m, fake, runID)
+	if m.detail.gen == 0 {
+		t.Fatalf("the board-opened session has gen 0; this test needs a non-zero generation")
+	}
+	gen := m.detail.gen
+	next, _ := m.Update(m.loadRunCmd(runID)())
+	m = next.(tuiModel)
+
+	own := streamOf(t, m.openStreamCmd(runID))
+	if own.gen != gen {
+		t.Fatalf("openStreamCmd stamped gen %d, want the board-opened session's %d", own.gen, gen)
+	}
+	next, read := m.Update(own)
+	m = next.(tuiModel)
+	if read == nil || m.detail.stream != own.stream {
+		t.Fatalf("the board-opened session did not adopt its own stream (cmd=%v)", read)
+	}
+
+	// Frame reads: a read drains whatever the pump has queued, so the three frames arrive over one
+	// or more reads. Every one must be applied and must re-arm the chain; the stream stays open
+	// after the last frame, so the final re-read is held, not executed, until the socket closes.
+	reads := 0
+	for len(m.detail.frames) < len(fake.StreamEvents) {
+		if reads == len(fake.StreamEvents) {
+			t.Fatalf("%d reads applied only %d of %d frames", reads, len(m.detail.frames), len(fake.StreamEvents))
+		}
+		batch, ok := read().(streamEventsMsg)
+		if !ok || batch.closed || len(batch.events) == 0 {
+			t.Fatalf("read %d of the board-opened session's stream = %#v, want a frame batch", reads+1, batch)
+		}
+		if batch.gen != gen {
+			t.Fatalf("read %d stamped gen %d, want %d", reads+1, batch.gen, gen)
+		}
+		before := len(m.detail.frames)
+		next, read = m.Update(batch)
+		m = next.(tuiModel)
+		reads++
+		if got := len(m.detail.frames) - before; got != len(batch.events) {
+			t.Fatalf("read %d: %d of its %d frames applied (the session discarded its own batch)", reads, got, len(batch.events))
+		}
+		if read == nil {
+			t.Fatalf("read %d: the session's own batch returned no re-read (the read chain ended)", reads)
+		}
+	}
+	if m.detail.highSeq != 3 || m.detail.stream != own.stream || m.detail.polling {
+		t.Fatalf("after the frame reads: highSeq=%d stream kept=%v polling=%v", m.detail.highSeq, m.detail.stream == own.stream, m.detail.polling)
+	}
+
+	// The next read, after the socket closes, is the chain's closed batch: it must carry the same
+	// gen and be applied (stream dropped, REST poll fallback armed), not discarded.
+	own.stream.Close()
+	closed, ok := read().(streamEventsMsg)
+	if !ok || !closed.closed || closed.gen != gen {
+		t.Fatalf("the read after close = %#v, want a closed batch for gen %d", closed, gen)
+	}
+	next, cmd := m.Update(closed)
+	m = next.(tuiModel)
+	if cmd == nil || m.detail.stream != nil || !m.detail.polling {
+		t.Fatalf("the session's own closed batch was not applied: cmd=%v stream nil=%v polling=%v",
+			cmd, m.detail.stream == nil, m.detail.polling)
+	}
+	if len(m.detail.frames) != len(fake.StreamEvents) {
+		t.Fatalf("frames after the closed batch = %d, want %d", len(m.detail.frames), len(fake.StreamEvents))
+	}
+
+	// A meta poll from the board-opened session applies and clears its guard.
+	metaCmd := (&m).startDetailMetaReq()
+	if m.detail.metaWaitID == 0 {
+		t.Fatalf("startDetailMetaReq did not arm the meta guard")
+	}
+	title = "own meta"
+	meta, ok := metaCmd().(detailMetaMsg)
+	if !ok || meta.gen != gen {
+		t.Fatalf("the session's meta reply = %#v, want gen %d", meta, gen)
+	}
+	next, _ = m.Update(meta)
+	m = next.(tuiModel)
+	if m.detail.metaWaitID != 0 || m.detail.run.IssueTitle != "own meta" {
+		t.Fatalf("the session's own meta reply was not applied: metaWaitID=%d IssueTitle=%q", m.detail.metaWaitID, m.detail.run.IssueTitle)
+	}
+}
