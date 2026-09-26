@@ -218,13 +218,14 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 								_, _ = fmt.Fprintf(env.Stderr,
 									"run %s %s — still following; it resumes on its own\n",
 									args[0], forgeParkLine(run))
-							} else if isVaultLockedPark(run) {
-								// Issue #1766: the vault locked while the run was saving its
-								// work. It resumes at its next retry once the vault is
-								// unlocked, not the instant of unlock.
+							} else if line := vaultParkLine(run); line != "" {
+								// Issue #1766: a Codex credential refresh or release found the
+								// run owner's vault locked. It resumes at its next retry once
+								// the vault is unlocked, not the instant of unlock; the wording
+								// is owner-neutral (the follower may be an admin).
 								_, _ = fmt.Fprintf(env.Stderr,
-									"run %s paused — waiting for vault unlock; still following, unlock your vault and it resumes at its next retry\n",
-									args[0])
+									"run %s %s; still following\n",
+									args[0], line)
 							} else {
 								_, _ = fmt.Fprintf(env.Stderr,
 									"run %s recovering — a transient interruption parked it; still following, it resumes on its own\n",

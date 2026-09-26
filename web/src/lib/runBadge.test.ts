@@ -226,6 +226,24 @@ describe("runBadge taxonomy", () => {
     }
   });
 
+  // Issue #1766: a vault_locked park is not a transient interruption. Its tooltip names the
+  // vault unlock and the next-retry resume; label and tone stay the recovery park's.
+  it("recovery_wait + vault_locked → the vault-unlock tooltip, never 'transient interruption'", () => {
+    const b = runBadge({ ...run({ status: "recovery_wait" }), recovery_wait_cause: "vault_locked" }, NOW);
+    expect(b).toMatchObject({ kind: "badge", label: "recovery wait", tone: "warning", pulse: false });
+    if (b.kind === "badge") {
+      expect(b.title).toBe(
+        "Waiting for vault unlock — resumes at its next retry once the vault is unlocked.",
+      );
+      expect(b.title).not.toMatch(/transient interruption/i);
+    }
+    // Any other cause (and the board's cause-less LatestRun) keeps the generic tooltip.
+    for (const cause of [null, "forge_unreachable", undefined]) {
+      const g = runBadge({ ...run({ status: "recovery_wait" }), recovery_wait_cause: cause }, NOW);
+      if (g.kind === "badge") expect(g.title).toMatch(/transient interruption/i);
+    }
+  });
+
   it("🔴 recovery_wait's badge is STATIC — no countdown, no elapsed, on any input", () => {
     // The backoff instant is server-owned and carries no DTO field, so there is nothing
     // here to count down from.
