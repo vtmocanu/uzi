@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **A plan-gate verdict no longer gets lost or applied to the wrong plan when a run is interrupted ([#1604](https://github.com/vtmocanu/uzi/issues/1604)).**
+  Approve, reject, and request-changes verdicts now survive a credential switch, a worker restart, or a resumed run. A requested revision is kept until the revised plan is saved, so a resumed run revises with your original feedback instead of re-showing the old plan; a reject is recorded together with stopping the run; a verdict sent before the current plan was shown is ignored, with a note in the run feed explaining why. Workers and the api should be upgraded together: an older api without the new discard endpoint still works, but leaves an ignored approval pending instead of clearing it.
+
 - **Five run and schedule states now display correctly in the web UI and CLI ([#1727](https://github.com/vtmocanu/uzi/issues/1727)).**
   A failed run start on the issue page keeps its error instead of clearing it on reload. A paused run's "Paused by you at" time and elapsed time, and the CLI's parked ages, come from when the run entered its status (the run now exposes `status_since`), so an extend no longer shifts them. Runs parked on a usage limit or an empty token pool show as waiting in the activity feed, not idle. Judge rationale loads again after collapsing a row mid-fetch. A sweep whose matches were all ineligible shows as starved instead of "matched 0".
 
