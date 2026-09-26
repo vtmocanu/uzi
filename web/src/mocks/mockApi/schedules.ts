@@ -381,8 +381,8 @@ const scheduleCatalog: CatalogEntry[] = [
     slug: "bug-triage",
     name: "Bug triage sweep",
     description: "Daily sweep over open issues labelled \"bug\", starting a run for the oldest few.",
-    target: "sweep", cron: "0 2 * * *", timezone: "UTC", model: "", output_mode: "",
-    prompt: "", labels: ["bug"], max_issues: 3, auto_approve: true, wait_on_limit: true,
+    target: "sweep", cron: "0 0 * * *", timezone: "UTC", model: "", output_mode: "",
+    prompt: "", labels: ["bug"], max_issues: 4, auto_approve: true, wait_on_limit: true,
     guidance:
       "Triage the sweep's bug issue. Reproduce or confirm the reported problem, find its root cause, and fix it if the fix is small and well-contained; otherwise document the diagnosis and the minimal reproduction so a maintainer can act. Keep changes scoped to the bug at hand and back any fix with a test that would have caught it.",
   },
@@ -399,7 +399,7 @@ const scheduleCatalog: CatalogEntry[] = [
     slug: "assigned-sweep",
     name: "Assigned-work sweep",
     description: "Daily sweep over open issues assigned to the uzi bot account, starting a run for the oldest few.",
-    target: "sweep", cron: "0 2 * * *", timezone: "UTC", model: "", output_mode: "",
+    target: "sweep", cron: "0 6 * * *", timezone: "UTC", model: "", output_mode: "",
     prompt: "", labels: null, max_issues: 3, auto_approve: true, wait_on_limit: true,
     guidance:
       "Implement the sweep's assigned issue. This sweep selects by assignee rather than a label, so there is no selector label to match. Treat the issue description (and any linked spec) as the specification, deliver the change end to end with tests, and run the project's gate before finishing. Keep the work scoped to what the issue asks for and stop to report if it turns out to depend on something not yet in place.",
