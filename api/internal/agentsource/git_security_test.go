@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -167,4 +168,66 @@ func (f fakeRT) RoundTrip(*http.Request) (*http.Response, error) {
 		Body:       io.NopCloser(strings.NewReader(f.body)),
 		Header:     make(http.Header),
 	}, nil
+}
+
+// TestFetchRefusesRedirectToOtherAllowlistedOrigin: the allowlist alone would let the clone
+// credential follow a redirect to ANOTHER allowlisted origin (a second listed host, or the same
+// host on another listed port). A credentialed redirect must also stay on the origin of the
+// request that started the chain, so the second origin receives nothing.
+func TestFetchRefusesRedirectToOtherAllowlistedOrigin(t *testing.T) {
+	var otherHits atomic.Int64
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		otherHits.Add(1)
+		http.NotFound(w, nil)
+	}))
+	defer other.Close()
+	var sameOriginHits atomic.Int64
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/moved/"):
+			sameOriginHits.Add(1)
+			http.NotFound(w, r)
+		case strings.HasPrefix(r.URL.Path, "/xhost.git/"):
+			// Another hostname for the same allowlisted listener: a cross-host redirect.
+			http.Redirect(w, r, strings.Replace(other.URL, "127.0.0.1", "localhost", 1)+"/roster.git/info/refs?service=git-upload-pack", http.StatusFound)
+		case strings.HasPrefix(r.URL.Path, "/self.git/"):
+			http.Redirect(w, r, "/moved/roster.git/info/refs?service=git-upload-pack", http.StatusFound)
+		default:
+			http.Redirect(w, r, other.URL+"/roster.git/info/refs?service=git-upload-pack", http.StatusFound)
+		}
+	}))
+	defer src.Close()
+	// The clone credential, assembled at runtime so no credential-shaped literal is committed.
+	cloneCred := strings.Join([]string{"clone", "credential", "0123456789"}, "-")
+	// Both origins are allowlisted, under either hostname.
+	port := func(s *httptest.Server) string {
+		return s.Listener.Addr().(*net.TCPAddr).AddrPort().String()[len("127.0.0.1"):]
+	}
+	allowBoth := func(raw string) bool {
+		return strings.Contains(raw, port(src)+"/") || strings.Contains(raw, port(other)+"/")
+	}
+
+	for _, c := range []struct{ name, repo string }{
+		{"same host, other port", "/roster.git"},
+		{"other host", "/xhost.git"},
+	} {
+		_, _, err := FetchRoleFiles(context.Background(), CloneOptions{
+			CloneURL: src.URL + c.repo, Token: cloneCred, RedirectAllowed: allowBoth,
+		})
+		if err == nil {
+			t.Errorf("%s: clone redirected to another allowlisted origin must fail", c.name)
+		}
+		if n := otherHits.Load(); n != 0 {
+			t.Errorf("%s: the other allowlisted origin received %d request(s); want 0", c.name, n)
+			otherHits.Store(0)
+		}
+	}
+
+	// Positive control: a same-origin redirect is still followed (the moved path is reached).
+	_, _, _ = FetchRoleFiles(context.Background(), CloneOptions{
+		CloneURL: src.URL + "/self.git", Token: cloneCred, RedirectAllowed: allowBoth,
+	})
+	if n := sameOriginHits.Load(); n != 1 {
+		t.Fatalf("same-origin redirect target hits = %d, want 1", n)
+	}
 }

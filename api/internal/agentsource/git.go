@@ -23,6 +23,8 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport/client"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/go-git/go-git/v5/storage/memory"
+
+	"github.com/vtmocanu/uzi/api/internal/redirectguard"
 )
 
 // sourceAgentsDir is the repo-root directory the source's role files live in — the
@@ -199,7 +201,8 @@ func transportForEndpoint(ep *transport.Endpoint, redirectAllowed func(string) b
 }
 
 // redirectGuard builds the http.Client CheckRedirect that enforces FINDING 2: a
-// redirect is refused unless its TARGET still passes the SSRF allowlist predicate, and
+// redirect is refused unless its TARGET still passes the SSRF allowlist predicate AND
+// stays on the origin (scheme, host, port) of the request that started the chain, and
 // the hop count is bounded. A nil predicate (no allowlist threaded in — the file://
 // fixture path never installs this client, so nil means an unconfigured caller) refuses
 // ALL redirects, fail-closed. It runs as the `next` link after go-git's own redirect
@@ -211,6 +214,12 @@ func redirectGuard(redirectAllowed func(string) bool) func(*http.Request, []*htt
 		}
 		if redirectAllowed == nil || !redirectAllowed(req.URL.String()) {
 			return fmt.Errorf("agentsource: refusing redirect to non-allowlisted target %q", req.URL.Redacted())
+		}
+		// The allowlist alone would let the clone credential follow a redirect to ANOTHER
+		// allowlisted origin (a second listed host, or the same host on another listed
+		// port); a credentialed redirect must also stay on the chain's starting origin.
+		if err := redirectguard.SameOrigin(req, via); err != nil {
+			return fmt.Errorf("agentsource: refusing redirect: %w", err)
 		}
 		return nil
 	}
