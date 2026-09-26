@@ -2067,6 +2067,15 @@ type WorkerStats struct {
 	DiskNixTotalBytes  *int64
 	DiskDataBytes      *int64
 	DiskDataTotalBytes *int64
+	// Docker-in-docker volume sample (issue #1759), docker-tier workers only: used and
+	// total bytes AND used and total inodes of the dind-data volume, each nil when the
+	// worker has no such volume or its statfs failed. DISPLAY-ONLY and NEVER a
+	// disk_pressure input: diskOverThreshold deliberately reads nix/data only, so a full
+	// dind volume (reclaimable by a docker prune) can never drain or replace the worker.
+	DiskDindBytes       *int64
+	DiskDindTotalBytes  *int64
+	DiskDindInodes      *int64
+	DiskDindTotalInodes *int64
 }
 
 // Heartbeat refreshes liveness, overwrites the worker's latest resource sample (PRD
@@ -2103,6 +2112,10 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		arg.StatsDiskNixTotalBytes = pgconv.Int8Ptr(stats.DiskNixTotalBytes)
 		arg.StatsDiskDataBytes = pgconv.Int8Ptr(stats.DiskDataBytes)
 		arg.StatsDiskDataTotalBytes = pgconv.Int8Ptr(stats.DiskDataTotalBytes)
+		arg.StatsDiskDindBytes = pgconv.Int8Ptr(stats.DiskDindBytes)
+		arg.StatsDiskDindTotalBytes = pgconv.Int8Ptr(stats.DiskDindTotalBytes)
+		arg.StatsDiskDindInodes = pgconv.Int8Ptr(stats.DiskDindInodes)
+		arg.StatsDiskDindTotalInodes = pgconv.Int8Ptr(stats.DiskDindTotalInodes)
 		// Disk-pressure debounce input (PRD #837 M4): whether THIS sample crossed the
 		// threshold. HeartbeatWorker increments the streak when true and resets it to 0
 		// when false; a nil stats leaves this false, which correctly resets the streak
@@ -2216,6 +2229,23 @@ func snapshotRunIDs(snap *ActiveSnapshot) []uuid.UUID {
 		}
 	}
 	return ids
+}
+
+// RetainingUnpublishedWork reports whether wkr is the live holder of any OPEN
+// durable-recovery custody hold (issue #1759), owner-scoped to the worker row's own
+// user_id exactly like DeleteWorker's custody guard. The heartbeat surfaces it on the
+// worker DTO so a docker-tier worker can refuse a destructive docker prune while it still
+// keeps the only local copy of work a run could not publish. The error is returned
+// unwrapped; the caller decides the fail-closed default.
+func (s *Service) RetainingUnpublishedWork(ctx context.Context, wkr store.Worker) (bool, error) {
+	n, err := s.q.CountOpenCustodyHoldsForWorker(ctx, store.CountOpenCustodyHoldsForWorkerParams{
+		WorkerID: wkr.ID,
+		UserID:   wkr.UserID,
+	})
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // diskOverThreshold: any reported volume at/above threshold. >= pins the comparator

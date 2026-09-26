@@ -314,6 +314,14 @@ UPDATE workers SET
     stats_disk_nix_total_bytes  = sqlc.narg('stats_disk_nix_total_bytes'),
     stats_disk_data_bytes       = sqlc.narg('stats_disk_data_bytes'),
     stats_disk_data_total_bytes = sqlc.narg('stats_disk_data_total_bytes'),
+    -- docker-in-docker volume sample (issue #1759): bytes AND inodes, same
+    -- write-every-tick-incl-NULL discipline; display-only, NEVER a disk_pressure input
+    -- (diskOverThreshold reads nix/data only, and @disk_over_threshold below never
+    -- sees these columns).
+    stats_disk_dind_bytes        = sqlc.narg('stats_disk_dind_bytes'),
+    stats_disk_dind_total_bytes  = sqlc.narg('stats_disk_dind_total_bytes'),
+    stats_disk_dind_inodes       = sqlc.narg('stats_disk_dind_inodes'),
+    stats_disk_dind_total_inodes = sqlc.narg('stats_disk_dind_total_inodes'),
     -- Disk-pressure debounce streak (PRD #837 M4). Increment (bounded to 100 so a
     -- perpetually-full worker can't overflow the counter) when THIS tick's sample is
     -- over threshold, else reset to 0 — so a single under-threshold (or absent) sample

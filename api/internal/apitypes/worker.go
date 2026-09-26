@@ -139,6 +139,15 @@ type WorkerDTO struct {
 	StatsDiskNixTotalBytes  *int64 `json:"stats_disk_nix_total_bytes"`
 	StatsDiskDataBytes      *int64 `json:"stats_disk_data_bytes"`
 	StatsDiskDataTotalBytes *int64 `json:"stats_disk_data_total_bytes"`
+	// Latest docker-in-docker volume sample (issue #1759), docker-tier workers only;
+	// null on every other worker and whenever the dind statfs failed. Used + total
+	// bytes AND used + total inodes of the dind-data volume (a layer-heavy image store
+	// can run out of inodes first). DISPLAY-ONLY: never a disk_pressure input, which
+	// stays nix/data only. Same freshness contract as the fields above.
+	StatsDiskDindBytes       *int64 `json:"stats_disk_dind_bytes"`
+	StatsDiskDindTotalBytes  *int64 `json:"stats_disk_dind_total_bytes"`
+	StatsDiskDindInodes      *int64 `json:"stats_disk_dind_inodes"`
+	StatsDiskDindTotalInodes *int64 `json:"stats_disk_dind_total_inodes"`
 	// Which Anthropic credential this worker's RUN-lane claims spend (PRD #104 M3).
 	// Both null means "unbound": the worker spends its owner's default token, which
 	// is every worker's state until someone binds one. The label rides alongside the

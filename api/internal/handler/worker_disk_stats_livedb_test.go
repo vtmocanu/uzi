@@ -80,10 +80,19 @@ func TestWorkerDiskStatsRoundTripLiveDB(t *testing.T) {
 		nixTotal  = int64(4_096_000)
 		dataUsed  = int64(2_048_000)
 		dataTotal = int64(8_192_000)
+		// issue #1759: the dind-data volume's bytes AND inodes, distinct from every
+		// other value so a bytes<->inodes or dind<->nix/data mixup fails.
+		dindUsed        = int64(5_120_000)
+		dindTotal       = int64(10_240_000)
+		dindInodes      = int64(7_001)
+		dindTotalInodes = int64(65_536)
 	)
 	body := fmt.Sprintf(`{"version":"1","stats":{"mem_bytes":100,"source":"cgroup",`+
 		`"disk_nix_bytes":%d,"disk_nix_total_bytes":%d,`+
-		`"disk_data_bytes":%d,"disk_data_total_bytes":%d}}`, nixUsed, nixTotal, dataUsed, dataTotal)
+		`"disk_data_bytes":%d,"disk_data_total_bytes":%d,`+
+		`"disk_dind_bytes":%d,"disk_dind_total_bytes":%d,`+
+		`"disk_dind_inodes":%d,"disk_dind_total_inodes":%d}}`,
+		nixUsed, nixTotal, dataUsed, dataTotal, dindUsed, dindTotal, dindInodes, dindTotalInodes)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/worker/heartbeat", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -102,6 +111,7 @@ func TestWorkerDiskStatsRoundTripLiveDB(t *testing.T) {
 	}
 	// workerDTOFromWorker (heartbeat/get-by-id mapper) site.
 	assertDiskDTO(t, "workerDTOFromWorker (heartbeat response)", hbResp.Worker, nixUsed, nixTotal, dataUsed, dataTotal)
+	assertDindDTO(t, "workerDTOFromWorker (heartbeat response)", hbResp.Worker, dindUsed, dindTotal, dindInodes, dindTotalInodes)
 
 	// (2) list DTO — ListWorkersByUser scans the persisted row (real DB round-trip of the
 	// new columns) and workerDTOFromRow maps it. This is the SECOND mapper site.
@@ -117,6 +127,7 @@ func TestWorkerDiskStatsRoundTripLiveDB(t *testing.T) {
 		found = true
 		dto := workerDTOFromRow(row, "", "", time.Now(), time.Now())
 		assertDiskDTO(t, "workerDTOFromRow (list)", dto, nixUsed, nixTotal, dataUsed, dataTotal)
+		assertDindDTO(t, "workerDTOFromRow (list)", dto, dindUsed, dindTotal, dindInodes, dindTotalInodes)
 	}
 	if !found {
 		t.Fatalf("worker %s not returned by ListWorkersByUser", workerID)
@@ -137,4 +148,21 @@ func assertDiskDTO(t *testing.T, site string, dto apitypes.WorkerDTO, nixUsed, n
 	check("StatsDiskNixTotalBytes", dto.StatsDiskNixTotalBytes, nixTotal)
 	check("StatsDiskDataBytes", dto.StatsDiskDataBytes, dataUsed)
 	check("StatsDiskDataTotalBytes", dto.StatsDiskDataTotalBytes, dataTotal)
+}
+
+// assertDindDTO pins the four dind-data volume fields (issue #1759) on one mapper site.
+func assertDindDTO(t *testing.T, site string, dto apitypes.WorkerDTO, used, total, inodes, totalInodes int64) {
+	t.Helper()
+	check := func(name string, got *int64, want int64) {
+		if got == nil {
+			t.Fatalf("%s: %s is nil, want %d", site, name, want)
+		}
+		if *got != want {
+			t.Fatalf("%s: %s = %d, want %d", site, name, *got, want)
+		}
+	}
+	check("StatsDiskDindBytes", dto.StatsDiskDindBytes, used)
+	check("StatsDiskDindTotalBytes", dto.StatsDiskDindTotalBytes, total)
+	check("StatsDiskDindInodes", dto.StatsDiskDindInodes, inodes)
+	check("StatsDiskDindTotalInodes", dto.StatsDiskDindTotalInodes, totalInodes)
 }

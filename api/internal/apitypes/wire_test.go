@@ -821,6 +821,11 @@ var workerDTOKeys = []string{
 	// until the worker reports a statfs sample (and re-nulled if it stops). Display-only.
 	"stats_disk_nix_bytes", "stats_disk_nix_total_bytes",
 	"stats_disk_data_bytes", "stats_disk_data_total_bytes",
+	// issue #1759: dind-data volume usage on docker-tier workers, used + total bytes AND
+	// used + total inodes. Null on non-docker workers and until a statfs sample arrives.
+	// Display-only, never a disk_pressure input (that stays nix/data only).
+	"stats_disk_dind_bytes", "stats_disk_dind_total_bytes",
+	"stats_disk_dind_inodes", "stats_disk_dind_total_inodes",
 	// PRD #104 M3: which Anthropic credential this worker's run-lane claims spend.
 	// Both null ⇒ unbound ⇒ the owner's default. The LABEL, never the token value —
 	// this DTO is the shape the web UI and the CLI both read.

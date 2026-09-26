@@ -152,6 +152,52 @@ func TestPollDiskPressureFreshnessGateLiveDB(t *testing.T) {
 	}
 }
 
+// TestPollDindFullNeverDiskPressureLiveDB is issue #1759's end-to-end display-only proof:
+// three consecutive heartbeats whose dind-data volume is at 99% bytes AND 99% inodes (nix
+// and data low) persist the dind sample yet leave the streak at 0, so the poll's
+// disk_pressure stays false. A full dind store is reclaimable by a prune, never a reason to
+// drain or replace the worker.
+func TestPollDindFullNeverDiskPressureLiveDB(t *testing.T) {
+	h, pool, q, box, userID := hostedLiveDB(t, "5")
+	ctx := context.Background()
+	wsvc := workersvc.New(q, box, workersvc.Params{DiskPressureThreshold: diskPressureThreshold})
+	poll := hostedsvc.New(q, box, time.Now, time.Hour)
+
+	wkr, err := h.provisionHostedWorker(ctx, userID, "dind-full", "base", "m", false, 5)
+	if err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	low, total, full := int64(10), int64(100), int64(99)
+	stats := &workersvc.WorkerStats{
+		MemBytes: 1, Source: "cgroup",
+		DiskNixBytes: &low, DiskNixTotalBytes: &total,
+		DiskDataBytes: &low, DiskDataTotalBytes: &total,
+		DiskDindBytes: &full, DiskDindTotalBytes: &total,
+		DiskDindInodes: &full, DiskDindTotalInodes: &total,
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := wsvc.Heartbeat(ctx, wkr, stats, nil, nil); err != nil {
+			t.Fatalf("heartbeat %d: %v", i, err)
+		}
+	}
+	var streak int32
+	var dindBytes, dindInodes *int64
+	if err := pool.QueryRow(ctx,
+		`SELECT stats_disk_pressure_streak, stats_disk_dind_bytes, stats_disk_dind_inodes FROM workers WHERE id = $1`,
+		wkr.ID).Scan(&streak, &dindBytes, &dindInodes); err != nil {
+		t.Fatalf("read worker row: %v", err)
+	}
+	if dindBytes == nil || *dindBytes != full || dindInodes == nil || *dindInodes != full {
+		t.Fatalf("precondition: the dind sample must be persisted, got bytes=%v inodes=%v", dindBytes, dindInodes)
+	}
+	if streak != 0 {
+		t.Fatalf("stats_disk_pressure_streak = %d after dind-only full heartbeats, want 0", streak)
+	}
+	if diskPressureOf(ctx, t, poll, wkr.ID) {
+		t.Fatal("disk_pressure true for a worker whose only full volume is dind; dind must be display-only")
+	}
+}
+
 // diskPressureOf polls and returns the derived disk_pressure for one worker.
 func diskPressureOf(ctx context.Context, t *testing.T, svc *hostedsvc.Service, id uuid.UUID) bool {
 	t.Helper()

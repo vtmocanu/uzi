@@ -145,6 +145,11 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 		StatsDiskNixTotalBytes:  int8PtrValue(w.StatsDiskNixTotalBytes),
 		StatsDiskDataBytes:      int8PtrValue(w.StatsDiskDataBytes),
 		StatsDiskDataTotalBytes: int8PtrValue(w.StatsDiskDataTotalBytes),
+
+		StatsDiskDindBytes:       int8PtrValue(w.StatsDiskDindBytes),
+		StatsDiskDindTotalBytes:  int8PtrValue(w.StatsDiskDindTotalBytes),
+		StatsDiskDindInodes:      int8PtrValue(w.StatsDiskDindInodes),
+		StatsDiskDindTotalInodes: int8PtrValue(w.StatsDiskDindTotalInodes),
 	}
 }
 
@@ -202,6 +207,11 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersi
 		StatsDiskNixTotalBytes:  int8PtrValue(w.StatsDiskNixTotalBytes),
 		StatsDiskDataBytes:      int8PtrValue(w.StatsDiskDataBytes),
 		StatsDiskDataTotalBytes: int8PtrValue(w.StatsDiskDataTotalBytes),
+
+		StatsDiskDindBytes:       int8PtrValue(w.StatsDiskDindBytes),
+		StatsDiskDindTotalBytes:  int8PtrValue(w.StatsDiskDindTotalBytes),
+		StatsDiskDindInodes:      int8PtrValue(w.StatsDiskDindInodes),
+		StatsDiskDindTotalInodes: int8PtrValue(w.StatsDiskDindTotalInodes),
 	}
 }
 

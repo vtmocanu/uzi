@@ -491,6 +491,20 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	dto := workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
 	h.overlayOutbox(&dto, updated.ID)
+	// Custody flag (issue #1759): whether this worker still holds an OPEN durable-recovery
+	// custody hold, i.e. keeps the only local copy of work a run could not publish. The
+	// docker-tier worker reads it off this response to decide whether a destructive
+	// `docker system prune` of its dind-data volume is allowed. FAIL CLOSED: on a query
+	// error we log and report TRUE, so a transient DB fault can only make the worker skip
+	// a prune (recoverable: the next heartbeat retries), never let it destroy retained
+	// work. The owner is the authenticated worker row's own user_id.
+	retaining, err := h.wsvc.RetainingUnpublishedWork(r.Context(), wkr)
+	if err != nil {
+		slog.Error("worker heartbeat: custody lookup failed; reporting retaining_unpublished_work=true",
+			"worker_id", wkr.ID.String(), "error", err)
+		retaining = true
+	}
+	dto.RetainingUnpublishedWork = retaining
 	httpx.JSON(w, http.StatusOK, map[string]any{"worker": dto})
 }
 
@@ -697,6 +711,12 @@ func parseWorkerStats(raw json.RawMessage, workerID uuid.UUID) *workersvc.Worker
 		DiskNixTotalBytes  *json.Number `json:"disk_nix_total_bytes"`
 		DiskDataBytes      *json.Number `json:"disk_data_bytes"`
 		DiskDataTotalBytes *json.Number `json:"disk_data_total_bytes"`
+		// Docker-in-docker volume (issue #1759): bytes AND inodes, same tolerant
+		// per-field *json.Number decode as the nix/data fields. Display-only.
+		DiskDindBytes       *json.Number `json:"disk_dind_bytes"`
+		DiskDindTotalBytes  *json.Number `json:"disk_dind_total_bytes"`
+		DiskDindInodes      *json.Number `json:"disk_dind_inodes"`
+		DiskDindTotalInodes *json.Number `json:"disk_dind_total_inodes"`
 	}
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return drop()
@@ -735,6 +755,12 @@ func parseWorkerStats(raw json.RawMessage, workerID uuid.UUID) *workersvc.Worker
 	out.DiskNixTotalBytes = diskBytesOrNil(s.DiskNixTotalBytes)
 	out.DiskDataBytes = diskBytesOrNil(s.DiskDataBytes)
 	out.DiskDataTotalBytes = diskBytesOrNil(s.DiskDataTotalBytes)
+	// dind-data volume (issue #1759): the same per-field drop. diskBytesOrNil's
+	// non-negative int64 contract fits an inode count as well as a byte count.
+	out.DiskDindBytes = diskBytesOrNil(s.DiskDindBytes)
+	out.DiskDindTotalBytes = diskBytesOrNil(s.DiskDindTotalBytes)
+	out.DiskDindInodes = diskBytesOrNil(s.DiskDindInodes)
+	out.DiskDindTotalInodes = diskBytesOrNil(s.DiskDindTotalInodes)
 	return out
 }
 
