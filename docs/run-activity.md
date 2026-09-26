@@ -250,7 +250,7 @@ through one of these delivery states:
 | State | Meaning |
 |---|---|
 | Queued | Not yet picked up by the worker — including while the run is sitting at a plan-approval gate. |
-| Delivered | The worker has received it. Queued follow-ups are folded into the agent's next work turns one per turn, in order, so with several queued a later one can show Delivered a turn or more before the agent sees it. |
+| Delivered | The worker has received it. On a Claude run, queued follow-ups are folded into the agent's next work turns one per turn, in order, so with several queued a later one can show Delivered a turn or more before the agent sees it. |
 | Delivered — applies after approval | Fetched while the run was sitting at a plan-approval gate; it's buffered and takes effect once you approve. |
 | Not delivered — run finished | The run went terminal before the worker ever fetched it. |
 
@@ -260,9 +260,12 @@ following messages, not in the chip. Delivered can show with nothing
 happening: the worker crashes right after fetching it, a follow-up buffered
 at a plan gate is never applied because you **reject** the plan instead of
 approving it, or the run stops (it finishes, pauses, or hits its scope
-ceiling) before the follow-up's turn comes. A crash is not silent for
-long — a stalled agent trips the [`stalled` health flag](./run-health.md) —
-and the fix is to send it again (for a run that has finished, in a new run or an MR rework).
+ceiling) before the follow-up's turn comes. On a Codex run, follow-ups are
+received but not yet passed to the agent at all. A crash is not silent for
+long: a stalled agent trips the [`stalled` health flag](./run-health.md).
+
+In every case, send it again: on a run that is still live, from the steer
+queue; on a run that has ended, in a new run.
 
 The queue stays visible, read-only, after the run finishes — so a
 "Not delivered — run finished" input doesn't just vanish.
