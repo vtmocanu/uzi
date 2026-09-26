@@ -250,7 +250,7 @@ through one of these delivery states:
 | State | Meaning |
 |---|---|
 | Queued | Not yet picked up by the worker — including while the run is sitting at a plan-approval gate. |
-| Delivered | The worker has fetched it for its next turn. |
+| Delivered | The worker has received it. Queued follow-ups are folded into the agent's next work turns one per turn, in order, so with several queued a later one can show Delivered a turn or more before the agent sees it. |
 | Delivered — applies after approval | Fetched while the run was sitting at a plan-approval gate; it's buffered and takes effect once you approve. |
 | Not delivered — run finished | The run went terminal before the worker ever fetched it. |
 
