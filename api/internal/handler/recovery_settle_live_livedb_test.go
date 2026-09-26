@@ -347,6 +347,41 @@ func TestRecoveryLiveSettleFencedMidProofLiveDB(t *testing.T) {
 			t.Fatalf("discarded hold was overwritten: %+v", h)
 		}
 	})
+	// The successor generation's own open hold on the same worker is the durability backstop
+	// (settle_live.go): without it, releasing the predecessor could drop the only custody of
+	// checkpoint-only commits. Each way it can be missing retains.
+	for _, sc := range []struct {
+		name string
+		sql  string
+	}{
+		{"successor hold discarded mid-proof", `UPDATE recovery_custody_holds SET state = 'discarded', release_evidence = 'owner_discard',
+		      live_worker_id = NULL, live_run_id = NULL WHERE id = $1`},
+		{"successor hold deleted mid-proof", `DELETE FROM recovery_custody_holds WHERE id = $1`},
+		{"successor hold taken by another worker", `UPDATE recovery_custody_holds SET original_worker_id =
+		      (SELECT o.original_worker_id FROM recovery_custody_holds o WHERE o.run_id = recovery_custody_holds.run_id
+		         AND o.original_worker_id <> recovery_custody_holds.original_worker_id LIMIT 1) WHERE id = $1`},
+	} {
+		t.Run(sc.name, func(t *testing.T) {
+			e := newLiveEnv(t)
+			e.fake.beforeCompare = func() {
+				if _, err := e.pool.Exec(e.ctx, sc.sql, e.sibGen); err != nil {
+					t.Errorf("mutate successor hold: %v", err)
+				}
+			}
+			code, res, raw := e.settleLive(e.tokenA, e.run, e.pred, goodLiveBody(apitypes.RecoverySettleTargetCheckpoint))
+			e.assertRetained(code, res, raw, apitypes.RecoverySettleStateChanged)
+			e.assertOpen(e.pred)
+		})
+	}
+	t.Run("no successor hold at all", func(t *testing.T) {
+		e := newLiveEnv(t)
+		e.exec(`DELETE FROM recovery_custody_holds WHERE id = $1`, e.sibGen)
+		code, res, raw := e.settleLive(e.tokenA, e.run, e.pred, goodLiveBody(apitypes.RecoverySettleTargetCheckpoint))
+		if code == 200 && res.Outcome == apitypes.RecoverySettleReleased {
+			t.Fatalf("released without a successor hold: %s", raw)
+		}
+		e.assertOpen(e.pred)
+	})
 	t.Run("capture planted mid-proof with another source", func(t *testing.T) {
 		e := newLiveEnv(t)
 		e.fake.beforeCompare = func() { e.insertCapture(e.pred, settleOther) }
@@ -632,6 +667,13 @@ func TestRecoveryLiveAncestryChecksLiveDB(t *testing.T) {
 			}
 		})
 	}
+	t.Run("release_target with NULL evidence", func(t *testing.T) {
+		// A plain `release_evidence = 'live_ancestry'` is NULL here, which a CHECK accepts.
+		hold := e.insertHold(e.run, 1, e.workerA)
+		if err := set(`UPDATE recovery_custody_holds SET release_target = 'checkpoint' WHERE id = $1`, hold); err == nil {
+			t.Fatalf("release_target on an evidence-free row accepted, want a CHECK violation")
+		}
+	})
 	t.Run("live_ancestry missing an 00251 audit column", func(t *testing.T) {
 		hold := e.insertHold(e.run, 1, e.workerA)
 		err := set(`UPDATE recovery_custody_holds SET state = 'released', live_worker_id = NULL, live_run_id = NULL,

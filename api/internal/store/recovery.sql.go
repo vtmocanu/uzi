@@ -1401,6 +1401,14 @@ WHERE h.id = $8
             AND r.issue_iid IS NOT DISTINCT FROM $15::bigint
         ))
   )
+  AND EXISTS (
+      SELECT 1 FROM recovery_custody_holds s
+      WHERE s.run_id = h.run_id
+        AND s.user_id = $10::uuid
+        AND s.generation = $5::bigint
+        AND s.original_worker_id = $12::uuid
+        AND s.state = 'open'
+  )
   AND (
       NOT EXISTS (SELECT 1 FROM recovery_captures c, cutoff
                   WHERE c.hold_id = h.id AND c.created_at < cutoff.at)
@@ -1443,6 +1451,11 @@ type ReleasePredecessorCustodyHoldByLiveAncestryParams struct {
 //     on the SAME runs.branch the service captured before it asked the forge (NULL-safe: a
 //     live issue run has none yet) and, for a checkpoint target, the SAME kind and issue iid
 //     the checkpoint branch was derived from;
+//   - the successor generation's OWN hold exists, is still open, and was taken by the same
+//     worker: the durability backstop settle_live.go relies on (a checkpoint ref is deleted on
+//     terminal transitions, so the predecessor's work stays in custody only through that hold;
+//     claim-time hold creation is conditional on recovery capability, so a live claim alone
+//     does not prove it exists);
 //   - the same server-held capture binding as ReleasePredecessorCustodyHoldByAncestry.
 //
 // Stamps release_evidence='live_ancestry' with 00251's six audit columns plus release_target

@@ -49,7 +49,9 @@ ALTER TABLE recovery_custody_holds ADD CONSTRAINT recovery_custody_holds_live_an
             AND release_branch IS NOT NULL
             AND release_target IS NOT NULL
         ))
-        AND (release_target IS NULL OR release_evidence = 'live_ancestry')
+        -- NULL-safe: a plain `release_evidence = 'live_ancestry'` is NULL (so the CHECK passes)
+        -- when evidence is NULL, admitting a release_target on an evidence-free row.
+        AND (release_target IS NULL OR release_evidence IS NOT DISTINCT FROM 'live_ancestry')
     );
 
 -- +goose Down
