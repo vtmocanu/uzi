@@ -25,18 +25,33 @@ cat > "$WORK/bin/gh" <<'STUB'
 set -eu
 if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
   case "$*" in
-    *'--json headRefOid,state'*) echo '{"headRefOid":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"OPEN"}' ;;
+    *'--json headRefOid,state'*) echo '{"headRefOid":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"OPEN","baseRefName":"main"}' ;;
     *'-q .headRefOid'*) echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef ;;
     *'-q .baseRefName'*) echo main ;;
     *) echo "unexpected pr view: $*" >&2; exit 1 ;;
   esac
   exit 0
 fi
+# SEQ_DIR/<kind>.<n>: the reply to the n-th call of that kind (the last one repeats), so a
+# test can change checks or rules between polls.
+seq_reply() {
+  local n; n=$(( $(cat "$SEQ_DIR/$1.n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$SEQ_DIR/$1.n"
+  if [ -f "$SEQ_DIR/$1.$n" ]; then cat "$SEQ_DIR/$1.$n"; else cat "$(ls "$SEQ_DIR/$1".[0-9]* | sort -t. -k2 -n | tail -1)"; fi
+}
 if [ "${1:-}" = pr ] && [ "${2:-}" = checks ]; then
-  echo '[{"bucket":"pass"}]'
+  if [ -n "${SEQ_DIR:-}" ]; then seq_reply checks
+  elif [ -n "${CHECKS_JSON:-}" ]; then echo "$CHECKS_JSON"
+  else echo '[{"name":"ci","bucket":"pass"}]'; fi
   exit 0
 fi
 if [ "${1:-}" = api ]; then
+# The base branch's required contexts, as `gh api --paginate --slurp` returns them (pages).
+# RULES_JSON = one page; RULES_FAIL=1 = unreadable. Default: none required.
+case "$*" in *'/rules/branches/main'*)
+  [ "${RULES_FAIL:-0}" = 1 ] && exit 1
+  if [ -n "${SEQ_DIR:-}" ]; then seq_reply rules; else echo "[${RULES_JSON:-[]}]"; fi
+  exit 0 ;;
+esac
 # pushrace* modes: the PR #1698 race, shared with the other entrypoints' tests.
 case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; esac
   case "$*" in
@@ -466,4 +481,56 @@ wp pushrace_pending_first
 [ "$rc" -eq 2 ] || fail "pushrace_pending_first: an in-progress first review was not waited on, rc=$rc: $(cat "$WORK/pushrace_pending_first.out")"
 grep -q 'greptile=in_progress live=' "$WORK/pushrace_pending_first.out" || fail "pushrace_pending_first: $(cat "$WORK/pushrace_pending_first.out")"
 
-echo "PASS watch-pr: settled reviews, resolved-thread scope, earlier-verdict Greptile scope, change_assessment head marker, reviewer override, Greptile run on an older commit"
+# Required contexts not yet registered on the head are pending, not green: right after a push
+# `gh pr checks --required` lists only the fast checks that already passed.
+export RULES_JSON='[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci"},{"context":"slow"}]}}]'
+MODE="greptile_clean"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer greptile --reviewer-grace 0 > "$WORK/req-partial.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "an unregistered required check read as settled, rc=$rc: $(cat "$WORK/req-partial.out")"
+grep -q 'req_pend=1 req_missing=1 ' "$WORK/req-partial.out" || fail "missing required check not counted: $(cat "$WORK/req-partial.out")"
+
+export CHECKS_JSON='[{"name":"ci","bucket":"pass"},{"name":"slow","bucket":"pass"}]'
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer greptile --reviewer-grace 0 > "$WORK/req-complete.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "every required check reported and passed, yet rc=$rc: $(cat "$WORK/req-complete.out")"
+
+RULES_FAIL=1; export RULES_FAIL
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer greptile --reviewer-grace 0 > "$WORK/req-unreadable.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "unreadable required-check rules read as none required, rc=$rc: $(cat "$WORK/req-unreadable.out")"
+grep -q 'unknown=1' "$WORK/req-unreadable.out" || fail "unreadable rules not unknown: $(cat "$WORK/req-unreadable.out")"
+unset RULES_FAIL CHECKS_JSON
+
+# A rule with no required_status_checks list is malformed: unknown, never "none required".
+export RULES_JSON='[{"type":"required_status_checks","parameters":{}}]'
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer greptile --reviewer-grace 0 > "$WORK/req-malformed.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "a malformed required-check rule read as none required, rc=$rc: $(cat "$WORK/req-malformed.out")"
+grep -q 'unknown=1' "$WORK/req-malformed.out" || fail "malformed rule not unknown: $(cat "$WORK/req-malformed.out")"
+unset RULES_JSON
+
+# The rules are re-read every poll: a required check added between polls holds readiness even
+# though the checks that registered earlier all pass (a cached rule set would read ready).
+export SEQ_DIR="$WORK/seq"; mkdir -p "$SEQ_DIR"
+echo '[{"name":"ci","bucket":"pending"}]' > "$SEQ_DIR/checks.1"
+echo '[{"name":"ci","bucket":"pass"}]' > "$SEQ_DIR/checks.2"
+echo '[[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci"}]}}]]' > "$SEQ_DIR/rules.1"
+echo '[[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci"},{"context":"slow"}]}}]]' > "$SEQ_DIR/rules.2"
+set +e
+bash "$SCRIPT" test/repo 42 0 2 --reviewer greptile --reviewer-grace 0 > "$WORK/req-refresh.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "stale required-check rules let a new required check pass unseen, rc=$rc: $(cat "$WORK/req-refresh.out")"
+grep -q 'try 2: .*req_missing=1 ' "$WORK/req-refresh.out" || fail "rules not re-read on poll 2: $(cat "$WORK/req-refresh.out")"
+unset SEQ_DIR
+
+echo "PASS watch-pr: settled reviews, unregistered required checks, resolved-thread scope, earlier-verdict Greptile scope, change_assessment head marker, reviewer override, Greptile run on an older commit"
