@@ -35,6 +35,25 @@ func (q *Queries) ClearDefaultUserSecret(ctx context.Context, arg ClearDefaultUs
 	return result.RowsAffected(), nil
 }
 
+const countEnabledSecretSlot = `-- name: CountEnabledSecretSlot :one
+SELECT count(*) FROM user_secrets
+WHERE user_id = $1 AND disabled_at IS NULL
+  AND (kind = $2 OR ($2 IN ('codex_auth', 'openai_api_key')
+       AND kind IN ('codex_auth', 'openai_api_key')))
+`
+
+type CountEnabledSecretSlotParams struct {
+	UserID uuid.UUID `json:"user_id"`
+	Kind   string    `json:"kind"`
+}
+
+func (q *Queries) CountEnabledSecretSlot(ctx context.Context, arg CountEnabledSecretSlotParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countEnabledSecretSlot, arg.UserID, arg.Kind)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countMasterSealedSecrets = `-- name: CountMasterSealedSecrets :one
 SELECT count(*) FROM user_secrets WHERE sealed_with = 'master'
 `
@@ -91,6 +110,25 @@ func (q *Queries) DeleteUserSecret(ctx context.Context, arg DeleteUserSecretPara
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const getEnabledUserSecretForKind = `-- name: GetEnabledUserSecretForKind :one
+SELECT id FROM user_secrets
+WHERE user_id = $1 AND kind = $2 AND disabled_at IS NULL
+ORDER BY created_at, id LIMIT 1
+`
+
+type GetEnabledUserSecretForKindParams struct {
+	UserID uuid.UUID `json:"user_id"`
+	Kind   string    `json:"kind"`
+}
+
+// Pick an enabled row for compatibility PUT when the slot has no default.
+func (q *Queries) GetEnabledUserSecretForKind(ctx context.Context, arg GetEnabledUserSecretForKindParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, getEnabledUserSecretForKind, arg.UserID, arg.Kind)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const getDefaultUserSecretID = `-- name: GetDefaultUserSecretID :one
@@ -156,6 +194,112 @@ func (q *Queries) GetDefaultUserSecretMeta(ctx context.Context, arg GetDefaultUs
 	row := q.db.QueryRow(ctx, getDefaultUserSecretMeta, arg.UserID, arg.Kind)
 	var i GetDefaultUserSecretMetaRow
 	err := row.Scan(&i.ID, &i.Label)
+	return i, err
+}
+
+const getEnabledSecretReplacement = `-- name: GetEnabledSecretReplacement :one
+SELECT id, kind FROM user_secrets
+WHERE id = $1 AND user_id = $2 AND disabled_at IS NULL
+  AND (kind = $3 OR ($3 IN ('codex_auth', 'openai_api_key')
+       AND kind IN ('codex_auth', 'openai_api_key')))
+`
+
+type GetEnabledSecretReplacementParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Kind   string    `json:"kind"`
+}
+
+type GetEnabledSecretReplacementRow struct {
+	ID   uuid.UUID `json:"id"`
+	Kind string    `json:"kind"`
+}
+
+func (q *Queries) GetEnabledSecretReplacement(ctx context.Context, arg GetEnabledSecretReplacementParams) (GetEnabledSecretReplacementRow, error) {
+	row := q.db.QueryRow(ctx, getEnabledSecretReplacement, arg.ID, arg.UserID, arg.Kind)
+	var i GetEnabledSecretReplacementRow
+	err := row.Scan(&i.ID, &i.Kind)
+	return i, err
+}
+
+const getSecretDependents = `-- name: GetSecretDependents :one
+SELECT
+ (SELECT count(*) FROM workers w WHERE w.user_id = $1 AND w.anthropic_secret_id = $2::uuid)::bigint AS workers,
+ (SELECT count(*) FROM run_schedules sch WHERE sch.user_id = $1 AND sch.credential_override_secret_id = $2)::bigint AS schedules,
+ (SELECT count(*) FROM runs r WHERE r.user_id = $1
+    AND r.status NOT IN ('completed', 'failed', 'cancelled')
+    AND (r.anthropic_secret_id = $2 OR r.codex_secret_id = $2 OR r.credential_override_secret_id = $2))::bigint AS runs,
+ (SELECT count(*) FROM users u WHERE u.id = $1 AND u.judge_anthropic_secret_id = $2)::bigint AS judge,
+ (SELECT count(*) FROM codex_credential_state c
+    JOIN codex_credential_state sibling ON sibling.provider_account_id = c.provider_account_id
+    JOIN user_secrets s ON s.id = sibling.user_secret_id
+    WHERE c.user_secret_id = $2 AND c.user_id = $1
+      AND c.provider_account_id IS NOT NULL AND s.id <> $2 AND s.disabled_at IS NULL)::bigint AS enabled_siblings
+`
+
+type GetSecretDependentsParams struct {
+	UserID  uuid.UUID `json:"user_id"`
+	Column2 uuid.UUID `json:"column_2"`
+}
+
+type GetSecretDependentsRow struct {
+	Workers         int64 `json:"workers"`
+	Schedules       int64 `json:"schedules"`
+	Runs            int64 `json:"runs"`
+	Judge           int64 `json:"judge"`
+	EnabledSiblings int64 `json:"enabled_siblings"`
+}
+
+func (q *Queries) GetSecretDependents(ctx context.Context, arg GetSecretDependentsParams) (GetSecretDependentsRow, error) {
+	row := q.db.QueryRow(ctx, getSecretDependents, arg.UserID, arg.Column2)
+	var i GetSecretDependentsRow
+	err := row.Scan(
+		&i.Workers,
+		&i.Schedules,
+		&i.Runs,
+		&i.Judge,
+		&i.EnabledSiblings,
+	)
+	return i, err
+}
+
+const getSecretEnablement = `-- name: GetSecretEnablement :one
+SELECT id, kind, label, is_default, auto_eligible, created_at, updated_at,
+       disabled_at, enablement_rev
+FROM user_secrets WHERE id = $1 AND user_id = $2
+`
+
+type GetSecretEnablementParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type GetSecretEnablementRow struct {
+	ID            uuid.UUID          `json:"id"`
+	Kind          string             `json:"kind"`
+	Label         string             `json:"label"`
+	IsDefault     bool               `json:"is_default"`
+	AutoEligible  bool               `json:"auto_eligible"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	DisabledAt    pgtype.Timestamptz `json:"disabled_at"`
+	EnablementRev int64              `json:"enablement_rev"`
+}
+
+func (q *Queries) GetSecretEnablement(ctx context.Context, arg GetSecretEnablementParams) (GetSecretEnablementRow, error) {
+	row := q.db.QueryRow(ctx, getSecretEnablement, arg.ID, arg.UserID)
+	var i GetSecretEnablementRow
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Label,
+		&i.IsDefault,
+		&i.AutoEligible,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DisabledAt,
+		&i.EnablementRev,
+	)
 	return i, err
 }
 
@@ -231,7 +375,7 @@ func (q *Queries) GetUserSecretCiphertextByID(ctx context.Context, arg GetUserSe
 }
 
 const getUserSecretForUpdate = `-- name: GetUserSecretForUpdate :one
-SELECT id, kind, label, is_default, auto_eligible FROM user_secrets
+SELECT id, kind, label, is_default, auto_eligible, disabled_at, enablement_rev FROM user_secrets
 WHERE id = $1 AND user_id = $2
 FOR UPDATE
 `
@@ -242,11 +386,13 @@ type GetUserSecretForUpdateParams struct {
 }
 
 type GetUserSecretForUpdateRow struct {
-	ID           uuid.UUID `json:"id"`
-	Kind         string    `json:"kind"`
-	Label        string    `json:"label"`
-	IsDefault    bool      `json:"is_default"`
-	AutoEligible bool      `json:"auto_eligible"`
+	ID            uuid.UUID          `json:"id"`
+	Kind          string             `json:"kind"`
+	Label         string             `json:"label"`
+	IsDefault     bool               `json:"is_default"`
+	AutoEligible  bool               `json:"auto_eligible"`
+	DisabledAt    pgtype.Timestamptz `json:"disabled_at"`
+	EnablementRev int64              `json:"enablement_rev"`
 }
 
 // Lock and read ONE of the user's secrets inside a mutation transaction (PRD #104
@@ -263,6 +409,8 @@ func (q *Queries) GetUserSecretForUpdate(ctx context.Context, arg GetUserSecretF
 		&i.Label,
 		&i.IsDefault,
 		&i.AutoEligible,
+		&i.DisabledAt,
+		&i.EnablementRev,
 	)
 	return i, err
 }
@@ -368,6 +516,24 @@ func (q *Queries) GetUserSecretMetaByIDOfKind(ctx context.Context, arg GetUserSe
 	return i, err
 }
 
+const hasSecretDefaultSlot = `-- name: HasSecretDefaultSlot :one
+SELECT EXISTS (SELECT 1 FROM user_secrets WHERE user_id = $1 AND is_default
+ AND (kind = $2 OR ($2 IN ('codex_auth', 'openai_api_key')
+ AND kind IN ('codex_auth', 'openai_api_key'))))
+`
+
+type HasSecretDefaultSlotParams struct {
+	UserID uuid.UUID `json:"user_id"`
+	Kind   string    `json:"kind"`
+}
+
+func (q *Queries) HasSecretDefaultSlot(ctx context.Context, arg HasSecretDefaultSlotParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasSecretDefaultSlot, arg.UserID, arg.Kind)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const insertUserSecret = `-- name: InsertUserSecret :one
 INSERT INTO user_secrets (user_id, kind, label, is_default, auto_eligible, ciphertext, sealed_with)
 VALUES ($1, $2, $3,
@@ -377,7 +543,7 @@ VALUES ($1, $2, $3,
         -- token non-default merely because they hold an anthropic one — the exact
         -- invisible-token bug, one kind over.
         $4::boolean
-            OR NOT EXISTS (SELECT 1 FROM user_secrets WHERE user_id = $1 AND kind = $2),
+            OR NOT EXISTS (SELECT 1 FROM user_secrets WHERE user_id = $1 AND kind = $2 AND is_default),
         -- auto_eligible (PRD #111 D2 / issue #804): a user's FIRST/SOLE anthropic_token
         -- is born opted INTO the auto-select pool, so a single-token owner's auto-mode
         -- ephemeral workers have a non-empty pool to spend and never park in pool_wait.
@@ -506,6 +672,54 @@ func (q *Queries) ListMasterSealedSecrets(ctx context.Context, userID uuid.UUID)
 	return items, nil
 }
 
+const listSecretEnablement = `-- name: ListSecretEnablement :many
+SELECT id, kind, label, is_default, auto_eligible, created_at, updated_at,
+       disabled_at, enablement_rev FROM user_secrets
+WHERE user_id = $1 ORDER BY kind, is_default DESC, lower(label)
+`
+
+type ListSecretEnablementRow struct {
+	ID            uuid.UUID          `json:"id"`
+	Kind          string             `json:"kind"`
+	Label         string             `json:"label"`
+	IsDefault     bool               `json:"is_default"`
+	AutoEligible  bool               `json:"auto_eligible"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	DisabledAt    pgtype.Timestamptz `json:"disabled_at"`
+	EnablementRev int64              `json:"enablement_rev"`
+}
+
+func (q *Queries) ListSecretEnablement(ctx context.Context, userID uuid.UUID) ([]ListSecretEnablementRow, error) {
+	rows, err := q.db.Query(ctx, listSecretEnablement, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListSecretEnablementRow{}
+	for rows.Next() {
+		var i ListSecretEnablementRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Label,
+			&i.IsDefault,
+			&i.AutoEligible,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DisabledAt,
+			&i.EnablementRev,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUserSecretsForKind = `-- name: ListUserSecretsForKind :many
 SELECT id, kind, label, is_default, auto_eligible, created_at, updated_at
 FROM user_secrets
@@ -593,6 +807,181 @@ func (q *Queries) ListUserSecretsMeta(ctx context.Context, userID uuid.UUID) ([]
 	for rows.Next() {
 		var i ListUserSecretsMetaRow
 		if err := rows.Scan(&i.Kind, &i.CreatedAt, &i.UpdatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const pageSecretDependentRuns = `-- name: PageSecretDependentRuns :many
+SELECT r.id, r.status FROM runs r WHERE r.user_id = $1
+ AND r.status NOT IN ('completed', 'failed', 'cancelled')
+ AND (r.anthropic_secret_id = $2 OR r.codex_secret_id = $2 OR r.credential_override_secret_id = $2)
+ AND r.id > $3::uuid ORDER BY r.id LIMIT $4::int
+`
+
+type PageSecretDependentRunsParams struct {
+	UserID   uuid.UUID   `json:"user_id"`
+	SecretID pgtype.UUID `json:"secret_id"`
+	AfterID  uuid.UUID   `json:"after_id"`
+	PageSize int32       `json:"page_size"`
+}
+
+type PageSecretDependentRunsRow struct {
+	ID     uuid.UUID `json:"id"`
+	Status string    `json:"status"`
+}
+
+func (q *Queries) PageSecretDependentRuns(ctx context.Context, arg PageSecretDependentRunsParams) ([]PageSecretDependentRunsRow, error) {
+	rows, err := q.db.Query(ctx, pageSecretDependentRuns,
+		arg.UserID,
+		arg.SecretID,
+		arg.AfterID,
+		arg.PageSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PageSecretDependentRunsRow{}
+	for rows.Next() {
+		var i PageSecretDependentRunsRow
+		if err := rows.Scan(&i.ID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const pageSecretDependentSchedules = `-- name: PageSecretDependentSchedules :many
+SELECT sch.id, sch.target FROM run_schedules sch WHERE sch.user_id = $1
+ AND sch.credential_override_secret_id = $2
+ AND sch.id > $3::uuid ORDER BY sch.id LIMIT $4::int
+`
+
+type PageSecretDependentSchedulesParams struct {
+	UserID   uuid.UUID   `json:"user_id"`
+	SecretID pgtype.UUID `json:"secret_id"`
+	AfterID  uuid.UUID   `json:"after_id"`
+	PageSize int32       `json:"page_size"`
+}
+
+type PageSecretDependentSchedulesRow struct {
+	ID     uuid.UUID `json:"id"`
+	Target string    `json:"target"`
+}
+
+func (q *Queries) PageSecretDependentSchedules(ctx context.Context, arg PageSecretDependentSchedulesParams) ([]PageSecretDependentSchedulesRow, error) {
+	rows, err := q.db.Query(ctx, pageSecretDependentSchedules,
+		arg.UserID,
+		arg.SecretID,
+		arg.AfterID,
+		arg.PageSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PageSecretDependentSchedulesRow{}
+	for rows.Next() {
+		var i PageSecretDependentSchedulesRow
+		if err := rows.Scan(&i.ID, &i.Target); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const pageSecretDependentSiblings = `-- name: PageSecretDependentSiblings :many
+SELECT s.id, s.label FROM codex_credential_state c
+ JOIN codex_credential_state sibling ON sibling.provider_account_id = c.provider_account_id
+ JOIN user_secrets s ON s.id = sibling.user_secret_id
+ WHERE c.user_secret_id = $1 AND c.user_id = $2 AND c.provider_account_id IS NOT NULL
+ AND s.id <> $1 AND s.disabled_at IS NULL
+ AND s.id > $3::uuid ORDER BY s.id LIMIT $4::int
+`
+
+type PageSecretDependentSiblingsParams struct {
+	SecretID uuid.UUID `json:"secret_id"`
+	UserID   uuid.UUID `json:"user_id"`
+	AfterID  uuid.UUID `json:"after_id"`
+	PageSize int32     `json:"page_size"`
+}
+
+type PageSecretDependentSiblingsRow struct {
+	ID    uuid.UUID `json:"id"`
+	Label string    `json:"label"`
+}
+
+func (q *Queries) PageSecretDependentSiblings(ctx context.Context, arg PageSecretDependentSiblingsParams) ([]PageSecretDependentSiblingsRow, error) {
+	rows, err := q.db.Query(ctx, pageSecretDependentSiblings,
+		arg.SecretID,
+		arg.UserID,
+		arg.AfterID,
+		arg.PageSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PageSecretDependentSiblingsRow{}
+	for rows.Next() {
+		var i PageSecretDependentSiblingsRow
+		if err := rows.Scan(&i.ID, &i.Label); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const pageSecretDependentWorkers = `-- name: PageSecretDependentWorkers :many
+SELECT w.id, w.name FROM workers w WHERE w.user_id = $1 AND w.anthropic_secret_id = $2
+ AND w.id > $3::uuid ORDER BY w.id LIMIT $4::int
+`
+
+type PageSecretDependentWorkersParams struct {
+	UserID   uuid.UUID   `json:"user_id"`
+	SecretID pgtype.UUID `json:"secret_id"`
+	AfterID  uuid.UUID   `json:"after_id"`
+	PageSize int32       `json:"page_size"`
+}
+
+type PageSecretDependentWorkersRow struct {
+	ID   uuid.UUID `json:"id"`
+	Name string    `json:"name"`
+}
+
+func (q *Queries) PageSecretDependentWorkers(ctx context.Context, arg PageSecretDependentWorkersParams) ([]PageSecretDependentWorkersRow, error) {
+	rows, err := q.db.Query(ctx, pageSecretDependentWorkers,
+		arg.UserID,
+		arg.SecretID,
+		arg.AfterID,
+		arg.PageSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PageSecretDependentWorkersRow{}
+	for rows.Next() {
+		var i PageSecretDependentWorkersRow
+		if err := rows.Scan(&i.ID, &i.Name); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -728,6 +1117,51 @@ func (q *Queries) RotateUserSecret(ctx context.Context, arg RotateUserSecretPara
 	return i, err
 }
 
+const setSecretEnablement = `-- name: SetSecretEnablement :one
+UPDATE user_secrets
+SET disabled_at = CASE WHEN $1::boolean THEN NULL ELSE now() END,
+    enablement_rev = enablement_rev + 1, updated_at = now()
+WHERE id = $2 AND user_id = $3
+  AND (disabled_at IS NULL) <> $1::boolean
+RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at,
+          disabled_at, enablement_rev
+`
+
+type SetSecretEnablementParams struct {
+	Enabled bool      `json:"enabled"`
+	ID      uuid.UUID `json:"id"`
+	UserID  uuid.UUID `json:"user_id"`
+}
+
+type SetSecretEnablementRow struct {
+	ID            uuid.UUID          `json:"id"`
+	Kind          string             `json:"kind"`
+	Label         string             `json:"label"`
+	IsDefault     bool               `json:"is_default"`
+	AutoEligible  bool               `json:"auto_eligible"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	DisabledAt    pgtype.Timestamptz `json:"disabled_at"`
+	EnablementRev int64              `json:"enablement_rev"`
+}
+
+func (q *Queries) SetSecretEnablement(ctx context.Context, arg SetSecretEnablementParams) (SetSecretEnablementRow, error) {
+	row := q.db.QueryRow(ctx, setSecretEnablement, arg.Enabled, arg.ID, arg.UserID)
+	var i SetSecretEnablementRow
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Label,
+		&i.IsDefault,
+		&i.AutoEligible,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DisabledAt,
+		&i.EnablementRev,
+	)
+	return i, err
+}
+
 const setUserSecretAutoEligible = `-- name: SetUserSecretAutoEligible :one
 UPDATE user_secrets SET auto_eligible = $1, updated_at = now()
 WHERE id = $2 AND user_id = $3 AND kind = $4
@@ -794,7 +1228,7 @@ func (q *Queries) SetUserSecretAutoEligible(ctx context.Context, arg SetUserSecr
 
 const setUserSecretDefault = `-- name: SetUserSecretDefault :one
 UPDATE user_secrets SET is_default = true, updated_at = now()
-WHERE id = $1 AND user_id = $2
+WHERE id = $1 AND user_id = $2 AND disabled_at IS NULL
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at
 `
 
@@ -816,7 +1250,7 @@ type SetUserSecretDefaultRow struct {
 // Make ONE secret the user's default (PRD #104 M2). The second half of the swap,
 // after ClearDefaultUserSecret; owner-scoped. Returns metadata for the response.
 // The caller has already verified ownership via GetUserSecretForUpdate under the
-// lock, so this cannot promote a foreign row.
+// lock; the SQL guard also refuses a disabled target.
 func (q *Queries) SetUserSecretDefault(ctx context.Context, arg SetUserSecretDefaultParams) (SetUserSecretDefaultRow, error) {
 	row := q.db.QueryRow(ctx, setUserSecretDefault, arg.ID, arg.UserID)
 	var i SetUserSecretDefaultRow
@@ -834,24 +1268,24 @@ func (q *Queries) SetUserSecretDefault(ctx context.Context, arg SetUserSecretDef
 
 const upsertDefaultUserSecret = `-- name: UpsertDefaultUserSecret :one
 INSERT INTO user_secrets (user_id, kind, label, is_default, auto_eligible, ciphertext, sealed_with)
-VALUES ($1, $2, 'default', true,
+VALUES ($1, $2, CASE WHEN EXISTS (
+            SELECT 1 FROM user_secrets
+            WHERE user_id = $1 AND kind = $2 AND lower(label) = 'default'
+        ) THEN 'default-' || gen_random_uuid()::text ELSE 'default' END, true,
         -- auto_eligible (PRD #111 D2 / issue #804): born opted into the auto-select
         -- pool ONLY when this is the user's first token of the kind — the SAME
-        -- first-token guard InsertUserSecret uses. The NOT EXISTS is load-bearing, not
-        -- belt-and-braces: the INSERT branch of this upsert is REACHABLE in the D12
-        -- "tokens exist with no default" state (see the header comment), so an
-        -- unconditional true would pool a token for a user who already holds other,
-        -- possibly reserved, tokens — a reserved-key leak. The $2 = 'anthropic_token'
-        -- guard keeps 00087's kind CHECK satisfied even though kind is always
-        -- 'anthropic_token' on this path in practice.
+        -- first-token guard InsertUserSecret uses. The INSERT branch also handles
+        -- an empty slot containing only disabled rows; these existing credentials
+        -- must not make the new token automatically pool eligible. The kind guard
+        -- keeps 00087's CHECK satisfied.
         ($2 = 'anthropic_token' AND NOT EXISTS (SELECT 1 FROM user_secrets WHERE user_id = $1 AND kind = $2)),
         $3, $4)
 ON CONFLICT (user_id, kind) WHERE is_default DO UPDATE
     SET ciphertext = EXCLUDED.ciphertext,
         sealed_with = EXCLUDED.sealed_with,
         updated_at = now()
-        -- NOT auto_eligible: rotation must PRESERVE the existing opt-in/opt-out state
-        -- the owner chose. Only the value moves on conflict (issue #804).
+        -- Preserve the existing opt-in/opt-out state on rotation.
+    WHERE user_secrets.disabled_at IS NULL
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at
 `
 
@@ -872,40 +1306,9 @@ type UpsertDefaultUserSecretRow struct {
 	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
 }
 
-// The kind-path compatibility alias (PRD #104 D14): PUT /api/me/secrets/{kind}
-// rotates the user's DEFAULT secret of that kind, or creates their first one
-// labelled 'default'. Deliberately ONE statement rather than a resolve-then-write
-// pair: the old ON CONFLICT (user_id, kind) form made two concurrent saves safe,
-// and a read-then-write would turn that into a unique violation (500) on a path
-// that has never had one.
-//
-// The arbiter is the partial unique index from 00077 — (user_id, kind) WHERE
-// is_default — matched by repeating its predicate, so the conflict target is "this
-// user's default of this kind" whatever that row happens to be labelled. Only the
-// value moves on conflict; an existing default keeps its label.
-//
-// What does NOT happen, because it is the obvious guess and it is wrong: a user
-// holding a non-default row labelled 'default' PLUS a differently-labelled default
-// does not collide with the label index. Postgres resolves the arbiter first during
-// speculative insertion, finds the conflict, takes DO UPDATE, and never inserts a
-// tuple — so the label index is never consulted. Measured on Postgres 17 with
-// 00077's indexes: with (console-key, is_default) + (default, not default), this
-// statement returns label='console-key' carrying the new value and leaves the row
-// labelled 'default' untouched. Correct under D14 — console-key IS the default.
-//
-// What DOES raise is the mirror image: a row labelled 'default' exists and NOTHING
-// is is_default. There is no arbiter conflict, so the insert proceeds into the
-// label index and hits:
-//
-//	ERROR: duplicate key value violates unique constraint "user_secrets_user_kind_label_key"
-//
-// which surfaces as a 500 from PutAnthropicToken. That is D12's "tokens exist with
-// no default" state. It is UNREACHABLE in M1 — every create path forces the first
-// token default and nothing can clear the flag — and becomes reachable the moment
-// M2 ships set-default or delete-default. M2's FOR UPDATE transaction is what has
-// to make it unreachable again; until then this comment is the warning. (A
-// no-default user whose rows are all labelled something else is fine: the insert
-// simply creates a new default labelled 'default'.)
+// Compatibility PUT rotates an enabled default or inserts a new one. Its caller
+// holds the mutation lock and promotes an existing enabled row first when the
+// slot is empty. The SQL keeps a disabled row's material and preferences intact.
 func (q *Queries) UpsertDefaultUserSecret(ctx context.Context, arg UpsertDefaultUserSecretParams) (UpsertDefaultUserSecretRow, error) {
 	row := q.db.QueryRow(ctx, upsertDefaultUserSecret,
 		arg.UserID,

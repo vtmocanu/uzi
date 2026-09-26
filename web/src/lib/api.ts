@@ -91,7 +91,6 @@ import type {
   ScheduleInput,
   SchedulePauseDTO,
   SchedulePreviewInput,
-  SecretMeta,
   SelfUsage,
   SessionResponse,
   SettingsResponse,
@@ -113,6 +112,10 @@ import type {
   Worker,
 } from "./apiTypes";
 export type * from "./apiTypes";
+export type SecretMeta = import("./apiTypes").SecretMeta & {
+  enabled: boolean;
+  disabled_at: string | null;
+};
 export { DEFAULT_AUTOPILOT_LABEL, RATE_LIMIT_SOURCES } from "./apiTypes";
 
 // Board visibility of a linked GitHub Project v2 (PRD #557). `public` round-trips

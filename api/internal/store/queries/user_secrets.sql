@@ -41,7 +41,7 @@ VALUES (@user_id, @kind, @label,
         -- token non-default merely because they hold an anthropic one — the exact
         -- invisible-token bug, one kind over.
         @want_default::boolean
-            OR NOT EXISTS (SELECT 1 FROM user_secrets WHERE user_id = @user_id AND kind = @kind),
+            OR NOT EXISTS (SELECT 1 FROM user_secrets WHERE user_id = @user_id AND kind = @kind AND is_default),
         -- auto_eligible (PRD #111 D2 / issue #804): a user's FIRST/SOLE anthropic_token
         -- is born opted INTO the auto-select pool, so a single-token owner's auto-mode
         -- ephemeral workers have a non-empty pool to spend and never park in pool_wait.
@@ -65,59 +65,30 @@ WHERE id = $1 AND user_id = $2
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
 -- name: UpsertDefaultUserSecret :one
--- The kind-path compatibility alias (PRD #104 D14): PUT /api/me/secrets/{kind}
--- rotates the user's DEFAULT secret of that kind, or creates their first one
--- labelled 'default'. Deliberately ONE statement rather than a resolve-then-write
--- pair: the old ON CONFLICT (user_id, kind) form made two concurrent saves safe,
--- and a read-then-write would turn that into a unique violation (500) on a path
--- that has never had one.
---
--- The arbiter is the partial unique index from 00077 — (user_id, kind) WHERE
--- is_default — matched by repeating its predicate, so the conflict target is "this
--- user's default of this kind" whatever that row happens to be labelled. Only the
--- value moves on conflict; an existing default keeps its label.
---
--- What does NOT happen, because it is the obvious guess and it is wrong: a user
--- holding a non-default row labelled 'default' PLUS a differently-labelled default
--- does not collide with the label index. Postgres resolves the arbiter first during
--- speculative insertion, finds the conflict, takes DO UPDATE, and never inserts a
--- tuple — so the label index is never consulted. Measured on Postgres 17 with
--- 00077's indexes: with (console-key, is_default) + (default, not default), this
--- statement returns label='console-key' carrying the new value and leaves the row
--- labelled 'default' untouched. Correct under D14 — console-key IS the default.
---
--- What DOES raise is the mirror image: a row labelled 'default' exists and NOTHING
--- is is_default. There is no arbiter conflict, so the insert proceeds into the
--- label index and hits:
---
---   ERROR: duplicate key value violates unique constraint "user_secrets_user_kind_label_key"
---
--- which surfaces as a 500 from PutAnthropicToken. That is D12's "tokens exist with
--- no default" state. It is UNREACHABLE in M1 — every create path forces the first
--- token default and nothing can clear the flag — and becomes reachable the moment
--- M2 ships set-default or delete-default. M2's FOR UPDATE transaction is what has
--- to make it unreachable again; until then this comment is the warning. (A
--- no-default user whose rows are all labelled something else is fine: the insert
--- simply creates a new default labelled 'default'.)
+-- Compatibility PUT rotates an enabled default or inserts a new one. The caller
+-- holds the user mutation lock and first promotes an existing enabled row when
+-- the slot is empty. A disabled row labelled 'default' keeps its ciphertext and
+-- preferences; the new row receives a distinct label in that case. The conflict
+-- update refuses disabled defaults, even if a stale caller reaches this query.
 INSERT INTO user_secrets (user_id, kind, label, is_default, auto_eligible, ciphertext, sealed_with)
-VALUES ($1, $2, 'default', true,
+VALUES ($1, $2, CASE WHEN EXISTS (
+            SELECT 1 FROM user_secrets
+            WHERE user_id = $1 AND kind = $2 AND lower(label) = 'default'
+        ) THEN 'default-' || gen_random_uuid()::text ELSE 'default' END, true,
         -- auto_eligible (PRD #111 D2 / issue #804): born opted into the auto-select
         -- pool ONLY when this is the user's first token of the kind — the SAME
-        -- first-token guard InsertUserSecret uses. The NOT EXISTS is load-bearing, not
-        -- belt-and-braces: the INSERT branch of this upsert is REACHABLE in the D12
-        -- "tokens exist with no default" state (see the header comment), so an
-        -- unconditional true would pool a token for a user who already holds other,
-        -- possibly reserved, tokens — a reserved-key leak. The $2 = 'anthropic_token'
-        -- guard keeps 00087's kind CHECK satisfied even though kind is always
-        -- 'anthropic_token' on this path in practice.
+        -- first-token guard InsertUserSecret uses. The INSERT branch also handles
+        -- an empty slot containing only disabled rows; these existing credentials
+        -- must not make the new token automatically pool eligible. The kind guard
+        -- keeps 00087's CHECK satisfied.
         ($2 = 'anthropic_token' AND NOT EXISTS (SELECT 1 FROM user_secrets WHERE user_id = $1 AND kind = $2)),
         $3, $4)
 ON CONFLICT (user_id, kind) WHERE is_default DO UPDATE
     SET ciphertext = EXCLUDED.ciphertext,
         sealed_with = EXCLUDED.sealed_with,
         updated_at = now()
-        -- NOT auto_eligible: rotation must PRESERVE the existing opt-in/opt-out state
-        -- the owner chose. Only the value moves on conflict (issue #804).
+        -- Preserve the existing opt-in/opt-out state on rotation.
+    WHERE user_secrets.disabled_at IS NULL
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
 -- name: GetUserSecretCiphertext :one
@@ -147,6 +118,13 @@ WHERE user_id = $1 AND kind = $2 AND is_default;
 -- row's own kind, not one the caller guessed.
 SELECT user_id, kind, ciphertext, sealed_with FROM user_secrets
 WHERE id = $1 AND user_id = $2;
+
+-- name: GetEnabledUserSecretForKind :one
+-- Pick an enabled row for compatibility PUT when the slot has no default.
+-- The caller holds the mutation lock; selection and promotion share its transaction.
+SELECT id FROM user_secrets
+WHERE user_id = @user_id AND kind = @kind AND disabled_at IS NULL
+ORDER BY created_at, id LIMIT 1;
 
 -- name: GetDefaultUserSecretID :one
 -- Resolve "which row is this user's default secret of this kind". The by-kind write
@@ -263,7 +241,7 @@ ORDER BY is_default DESC, lower(label) ASC;
 -- per-(user,kind) advisory lock the mutation takes first, it is what lets
 -- set-default's clear-then-set and delete-default's guard read a stable picture.
 -- Owner-scoped, so a foreign id is pgx.ErrNoRows (a 404), never another user's row.
-SELECT id, kind, label, is_default, auto_eligible FROM user_secrets
+SELECT id, kind, label, is_default, auto_eligible, disabled_at, enablement_rev FROM user_secrets
 WHERE id = @id AND user_id = @user_id
 FOR UPDATE;
 
@@ -287,9 +265,9 @@ WHERE user_id = @user_id AND kind = @kind AND is_default;
 -- Make ONE secret the user's default (PRD #104 M2). The second half of the swap,
 -- after ClearDefaultUserSecret; owner-scoped. Returns metadata for the response.
 -- The caller has already verified ownership via GetUserSecretForUpdate under the
--- lock, so this cannot promote a foreign row.
+-- lock; the SQL guard also refuses a disabled target.
 UPDATE user_secrets SET is_default = true, updated_at = now()
-WHERE id = @id AND user_id = @user_id
+WHERE id = @id AND user_id = @user_id AND disabled_at IS NULL
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
 -- name: RenameUserSecret :one
@@ -386,3 +364,76 @@ SELECT EXISTS (
     SELECT 1 FROM user_secrets
     WHERE user_id = @user_id AND kind = 'anthropic_token' AND auto_eligible
 );
+
+-- name: ListSecretEnablement :many
+SELECT id, kind, label, is_default, auto_eligible, created_at, updated_at,
+       disabled_at, enablement_rev FROM user_secrets
+WHERE user_id = @user_id ORDER BY kind, is_default DESC, lower(label);
+
+-- name: GetSecretEnablement :one
+SELECT id, kind, label, is_default, auto_eligible, created_at, updated_at,
+       disabled_at, enablement_rev
+FROM user_secrets WHERE id = @id AND user_id = @user_id;
+
+-- name: SetSecretEnablement :one
+UPDATE user_secrets
+SET disabled_at = CASE WHEN @enabled::boolean THEN NULL ELSE now() END,
+    enablement_rev = enablement_rev + 1, updated_at = now()
+WHERE id = @id AND user_id = @user_id
+  AND (disabled_at IS NULL) <> @enabled::boolean
+RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at,
+          disabled_at, enablement_rev;
+
+-- name: CountEnabledSecretSlot :one
+SELECT count(*) FROM user_secrets
+WHERE user_id = @user_id AND disabled_at IS NULL
+  AND (kind = @kind OR (@kind IN ('codex_auth', 'openai_api_key')
+       AND kind IN ('codex_auth', 'openai_api_key')));
+
+-- name: GetEnabledSecretReplacement :one
+SELECT id, kind FROM user_secrets
+WHERE id = @id AND user_id = @user_id AND disabled_at IS NULL
+  AND (kind = @kind OR (@kind IN ('codex_auth', 'openai_api_key')
+       AND kind IN ('codex_auth', 'openai_api_key')));
+
+-- name: HasSecretDefaultSlot :one
+SELECT EXISTS (SELECT 1 FROM user_secrets WHERE user_id = @user_id AND is_default
+ AND (kind = @kind OR (@kind IN ('codex_auth', 'openai_api_key')
+ AND kind IN ('codex_auth', 'openai_api_key'))));
+
+-- name: PageSecretDependentWorkers :many
+SELECT w.id, w.name FROM workers w WHERE w.user_id = @user_id AND w.anthropic_secret_id = @secret_id
+ AND w.id > @after_id::uuid ORDER BY w.id LIMIT @page_size::int;
+
+-- name: PageSecretDependentSchedules :many
+SELECT sch.id, sch.target FROM run_schedules sch WHERE sch.user_id = @user_id
+ AND sch.credential_override_secret_id = @secret_id
+ AND sch.id > @after_id::uuid ORDER BY sch.id LIMIT @page_size::int;
+
+-- name: PageSecretDependentRuns :many
+SELECT r.id, r.status FROM runs r WHERE r.user_id = @user_id
+ AND r.status NOT IN ('completed', 'failed', 'cancelled')
+ AND (r.anthropic_secret_id = @secret_id OR r.codex_secret_id = @secret_id OR r.credential_override_secret_id = @secret_id)
+ AND r.id > @after_id::uuid ORDER BY r.id LIMIT @page_size::int;
+
+-- name: PageSecretDependentSiblings :many
+SELECT s.id, s.label FROM codex_credential_state c
+ JOIN codex_credential_state sibling ON sibling.provider_account_id = c.provider_account_id
+ JOIN user_secrets s ON s.id = sibling.user_secret_id
+ WHERE c.user_secret_id = @secret_id AND c.user_id = @user_id AND c.provider_account_id IS NOT NULL
+ AND s.id <> @secret_id AND s.disabled_at IS NULL
+ AND s.id > @after_id::uuid ORDER BY s.id LIMIT @page_size::int;
+
+-- name: GetSecretDependents :one
+SELECT
+ (SELECT count(*) FROM workers w WHERE w.user_id = $1 AND w.anthropic_secret_id = $2::uuid)::bigint AS workers,
+ (SELECT count(*) FROM run_schedules sch WHERE sch.user_id = $1 AND sch.credential_override_secret_id = $2)::bigint AS schedules,
+ (SELECT count(*) FROM runs r WHERE r.user_id = $1
+    AND r.status NOT IN ('completed', 'failed', 'cancelled')
+    AND (r.anthropic_secret_id = $2 OR r.codex_secret_id = $2 OR r.credential_override_secret_id = $2))::bigint AS runs,
+ (SELECT count(*) FROM users u WHERE u.id = $1 AND u.judge_anthropic_secret_id = $2)::bigint AS judge,
+ (SELECT count(*) FROM codex_credential_state c
+    JOIN codex_credential_state sibling ON sibling.provider_account_id = c.provider_account_id
+    JOIN user_secrets s ON s.id = sibling.user_secret_id
+    WHERE c.user_secret_id = $2 AND c.user_id = $1
+      AND c.provider_account_id IS NOT NULL AND s.id <> $2 AND s.disabled_at IS NULL)::bigint AS enabled_siblings;
