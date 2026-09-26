@@ -55,7 +55,8 @@ func (m tuiModel) renderSpend(usedRows int) string {
 	return strings.Join(lines, "\n")
 }
 
-// railRateMeters renders the stacked per-account rate-limit block for the crew rail, or ""
+// railRateMeters renders the run-bound account snapshot and Claude rate-limit entries
+// in the crew rail's ACCOUNTS block, or ""
 // when the selection is empty. It appends WHOLE account entries only while they fit within
 // the remaining rail height (transcriptViewport() minus usedRows minus the blank separator
 // the caller adds), because joinColumns clamps the rail to the transcript height by dropping
@@ -70,6 +71,7 @@ func (m tuiModel) renderSpend(usedRows int) string {
 // server change here.
 func (m tuiModel) railRateMeters(now time.Time, usedRows int) string {
 	shown, showLabel := m.selectedRateMeters()
+	codexSnapshot := m.detail.run.Harness == "codex" && m.detail.run.CodexSecretLabel != nil && *m.detail.run.CodexSecretLabel != ""
 
 	// PRD #623: force-show + highlight the account THIS run is spending, as the first
 	// ACCOUNTS entry, even when it is deselected in settings. This fold runs BEFORE the
@@ -114,7 +116,7 @@ func (m tuiModel) railRateMeters(now time.Time, usedRows int) string {
 		}
 	}
 
-	if len(shown) == 0 {
+	if len(shown) == 0 && !codexSnapshot {
 		return ""
 	}
 	// budget is the rail height left below the content already built; the -1 is the blank
@@ -126,6 +128,21 @@ func (m tuiModel) railRateMeters(now time.Time, usedRows int) string {
 	const headerRow = 1
 	var fitted []string
 	accumulated := 0
+	if codexSnapshot {
+		const deleted = " (deleted)"
+		width := laneRailWidth
+		suffix := ""
+		if m.detail.run.CodexSecretID == nil {
+			width -= len(deleted)
+			suffix = deleted
+		}
+		label := m.renderer.Plain(*m.detail.run.CodexSecretLabel, width) + suffix
+		if headerRow+1 > budget {
+			return ""
+		}
+		fitted = append(fitted, lipgloss.NewStyle().Foreground(m.pal.tungsten).Render(label))
+		accumulated++
+	}
 	for _, t := range shown {
 		var lines []string
 		// The run's account label renders UNCONDITIONALLY (even when showLabel is false —

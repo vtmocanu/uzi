@@ -294,6 +294,13 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if r.AnthropicSecretLabel != nil && *r.AnthropicSecretLabel != "" {
 		rows = append(rows, []string{"ANTHROPIC_TOKEN", credentialCell(r)})
 	}
+	if r.Harness == "codex" && r.CodexSecretLabel != nil && *r.CodexSecretLabel != "" {
+		label := cellText(*r.CodexSecretLabel)
+		if r.CodexSecretID == nil {
+			label += " (deleted)"
+		}
+		rows = append(rows, []string{"CODEX_ALIAS", label})
+	}
 	// The per-run token CHOICE and any in-flight switch (PRD #1247 M8), DISTINCT from the
 	// ANTHROPIC_TOKEN row above: that names the token the run SPENT, this names what the
 	// owner chose for this run and any held-state transition in flight. Emit-only-when-set,

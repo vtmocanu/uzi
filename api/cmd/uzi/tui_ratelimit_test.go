@@ -530,6 +530,45 @@ func TestRailRateMetersRunAccountHighlighted(t *testing.T) {
 	}
 }
 
+func TestRailCodexRunSnapshotWithoutMeter(t *testing.T) {
+	id := "alias-id"
+	for _, tc := range []struct {
+		name string
+		id   *string
+		want string
+	}{
+		{"bound", &id, "old-login"},
+		{"deleted", nil, "old-login (deleted)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := tuiTestModel(t, &uzicli.FakeClient{}, "codex-run")
+			m.width, m.height = 100, 40
+			label := "old-login"
+			m = applyDetail(m, apitypes.RunDTO{ID: "codex-run", Harness: "codex", Status: "completed",
+				CodexSecretID: tc.id, CodexSecretLabel: &label}, nil)
+			out := stripANSI(m.railRateMeters(time.Now(), 3))
+			if !strings.Contains(out, "ACCOUNTS") || !strings.Contains(out, tc.want) {
+				t.Fatalf("run snapshot missing without a meter: %q", out)
+			}
+			if strings.Contains(out, "5h") || strings.Contains(out, "7d") {
+				t.Fatalf("Codex snapshot invented Claude meter windows: %q", out)
+			}
+		})
+	}
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "codex-run")
+	m.width, m.height = 100, 40
+	hostile := "old\nlogin\x1b[31m\u202e"
+	m = applyDetail(m, apitypes.RunDTO{ID: "codex-run", Harness: "codex", Status: "running",
+		CodexSecretLabel: &hostile}, nil)
+	next, _ := m.Update(codexRateLimitsMsg{accounts: []apitypes.CodexAccountRateLimitDTO{{Aliases: []string{"current-alias"}}}})
+	m = next.(tuiModel)
+	block := m.railRateMeters(time.Now(), 3)
+	plain := stripANSI(block)
+	if !strings.Contains(plain, "(deleted)") || strings.Contains(plain, "current-alias") || strings.Contains(block, "\x1b[31m") || strings.Contains(block, "\u202e") || strings.Count(plain, "\n") != 1 {
+		t.Fatalf("ACCOUNTS must show only the sanitized run snapshot: %q", block)
+	}
+}
+
 // TestRailRateMetersRunAccountSynthesized — PRD #623 M1 step 3c. With NO rate-limit rows seeded,
 // the run's account still shows (force-show, single entry) from AnthropicSecretLabel with "-"
 // meters, and its label carries the tungsten highlight even though showLabel is false.
