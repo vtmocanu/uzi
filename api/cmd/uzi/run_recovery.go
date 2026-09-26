@@ -117,6 +117,18 @@ func holdsWithCaptures(holds []apitypes.RecoveryCustodyHoldDTO, archives []apity
 	return out
 }
 
+// unattributedCaptures counts archives with an empty hold_id: those holdsWithCaptures cannot
+// attach anywhere because the server predates the field.
+func unattributedCaptures(archives []apitypes.RecoveryArchiveDTO) int {
+	n := 0
+	for _, a := range archives {
+		if a.HoldID == "" {
+			n++
+		}
+	}
+	return n
+}
+
 // renderRunRecovery emits a run's custody holds. --json prints the filtered hold DTOs, each
 // with its captures joined from archives; the human form prints one table row per hold with
 // its exact id, generation, disposition and capture state, plus a one-line hint when a hold
@@ -127,6 +139,14 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 	if p.Format == uzicli.FormatJSON {
 		// Never emit a null slice: an empty result is [] so a consuming agent iterates it
 		// unconditionally.
+		if n := unattributedCaptures(archives); n > 0 {
+			// An older server sends no hold_id, so its captures join onto no hold and the
+			// JSON would read as "no captures" (#1417). Say so on stderr, leaving stdout's
+			// shape unchanged, and name the listing that still shows their ids.
+			_, _ = fmt.Fprintf(env.Stderr,
+				"uzi: %d capture(s) carry no hold id (server predates it) and are not listed; run 'uzi run export %s' to see their ids\n",
+				n, sanitizeTTY(runID))
+		}
 		return p.JSON(holdsWithCaptures(holds, archives))
 	}
 	if len(holds) == 0 {

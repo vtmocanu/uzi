@@ -123,6 +123,11 @@ func TestRunRecoveryJSONCaptures(t *testing.T) {
 	if caps[1].ByteSize != nil {
 		t.Errorf("cap-2 has no byte size, want byte_size omitted; got %d", *caps[1].ByteSize)
 	}
+	// cap-legacy (no hold_id) is attached nowhere, so the omission must be said on stderr,
+	// never silent; cap-other names a real (other) hold and is not counted.
+	if !strings.Contains(errb, "1 capture(s) carry no hold id") || !strings.Contains(errb, "uzi run export run1") {
+		t.Errorf("stderr = %q, want the unattributed-capture warning naming 1 capture and the export fallback", errb)
+	}
 }
 
 // TestRunRecoveryJSONNoCaptures proves a hold with no captures carries "captures": [] (never
