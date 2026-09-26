@@ -920,9 +920,9 @@ Tracked as GitHub issue vtmocanu/uzi#1732; PRD at `prds/1732-disable-account-cre
 
 Tracked as GitHub issue vtmocanu/uzi#1604; decision record `adr/1604-plan-gate-verdict-durability.md`.
 
-- An approve, reject or request-changes sent at the plan gate is never lost silently across a credential switch, worker restart or resumed run; it takes effect once its result is saved, and otherwise carries over to the resumed run. A carried-over verdict uzi cannot match to a plan, or a carried-over request-changes on a Codex run, is ignored with a feed note asking to re-send it. (AI-synced 2026-09-26)
+- An approve, reject or request-changes sent at the plan gate is never lost silently across a credential switch, worker restart or resumed run (an empty change request carries nothing); it takes effect once its result is saved, and otherwise carries over to the resumed run. A carried-over verdict uzi cannot match to a plan is ignored with a feed note asking to re-send it; on Codex runs every carried-over verdict (approve, reject or request-changes) is ignored that way, and a fresh plan is shown. (AI-synced 2026-09-26)
 - A verdict is never applied to a plan the owner did not see: one sent before the current plan was shown, or one uzi cannot match to a plan, is ignored, and an ignored approve never counts as approval. (AI-synced 2026-09-26)
-- A resumed run with an unapproved plan reads the owner's pending verdicts before it shows a plan; on Claude runs it acts on them first, making pending changes to the submitted plan rather than re-offering it; on Codex runs pending changes are ignored with a note asking to re-send them, and a fresh plan is shown. (AI-synced 2026-09-26)
+- A resumed run with an unapproved plan reads the owner's pending verdicts before it shows a plan. On Claude runs a pending cancel, reject or request-changes acts first (changes revise the submitted plan rather than re-offering it); a pending approve waits for the re-shown plan. On Codex runs every pending approve, reject or request-changes is ignored with a note asking to re-send it, and a fresh plan is shown. (AI-synced 2026-09-26)
 - Every ignored verdict is explained in the run feed, except an approve replaced by a newer verdict, a repeat approve after the plan was approved, and an empty change request. (AI-synced 2026-09-26)
 
 ## Startup admin seed

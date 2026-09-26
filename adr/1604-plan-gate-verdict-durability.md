@@ -37,8 +37,8 @@ plan the owner answered.
    executor (`resumesAtGate = true`, `agent/src/sdk-executor.ts`) a replayed revise re-runs the
    revision with the owner's original feedback and does not re-offer the superseded plan.
    Codex has no resume-at-gate: the runner puts the run in `gatedRuns`, so its first gate bumps
-   the epoch and a replayed revise is dropped as epoch-stale with a notice asking to re-send it
-   (see residuals).
+   the epoch and every replayed approve, reject or revise is disposed as epoch-stale with a
+   notice asking to re-send it; a fresh plan is shown (see residuals).
 2. **A claim says when its plan was shown.** A claim carrying an unapproved persisted plan
    carries `resume_plan_at` (`ResumePlanAt` in `api/internal/workersvc/claim.go`, filled in
    `claim_assembly.go` via `LatestPersistedPlanFrameAtForRun`). It is the `created_at` of the
@@ -49,8 +49,9 @@ plan the owner answered.
    treats every replayed approve or reject as stale until both of these hold: the replayed
    backlog is fully read (a GET page shorter than the server's LIMIT) and the claim's first
    gate is shown. On the SDK executor a replayed revise still acts, because its result is
-   gated for a human again; on Codex it goes epoch-stale as in point 1. The field is absent when the lookup failed, when the frame was tombstoned or
-   redacted, or when the api is older than this change.
+   gated for a human again; on Codex it goes epoch-stale as in point 1. The field is absent
+   when the lookup failed, when the frame was tombstoned or redacted, or when the api is older
+   than this change.
 4. **No gate before the backlog is read.** A resumed claim with an unapproved plan reads its
    whole replayed backlog before it offers any gate. This holds for every executor, SDK and
    Codex (the `gatePlan` closure and `takeResumedGateEvent` in `agent/src/runner.ts`). An SDK
@@ -68,7 +69,7 @@ plan the owner answered.
    replay list without ever reading as approval. The route accepts only `approve_plan` rows
    (any other kind is a 400). An APPLIED receipt for a discarded row is a 409. An older api
    returns 404 for the route; the worker then logs once and leaves those approves unapplied.
-6. **The feed names almost every ignored verdict.** A disposal emits one notice
+6. **The feed names almost every ignored verdict.** A disposal emits at most one notice
    (`staleNotice` in `agent/src/steering.ts`). The reasons are: the verdict was written
    against an older plan version of this claim ("Approval ignored — the plan changed; re-send
    if you still want it.", "Rejection ignored — the plan changed; re-send if you still want
@@ -77,9 +78,9 @@ plan the owner answered.
    plan is already approved (cancel to stop the run); the gate had already closed; an older
    server already recorded the approval, which could not be withdrawn; or a buffered reject
    was replaced by a newer verdict ("an earlier plan rejection was superseded by a newer
-   verdict"). Three disposals are silent: an approve replaced in the buffer by a newer
-   verdict, a repeat approve after an approve closed the gate, and an empty revise (only
-   logged).
+   verdict"). Two disposals are silent: an approve replaced in the buffer by a newer verdict,
+   and a repeat approve after an approve closed the gate. An empty revise is dropped (only
+   logged) when it is routed and never reaches a disposal.
 7. **A pending credential switch accepts only revise-only APPLIED batches.** A revise the
    worker settles while the switch is pending has a final disposition, so the server accepts
    it (`applyUnderSwitch` in `input_receipts.go`). A mixed batch, or one on a released or
@@ -155,9 +156,10 @@ plan the owner answered.
 - **Pre-existing, recorded as uzi incidental findings during the #1604 run:** an approve
   freezes milestones and budget at submit time; a stale reject's `stop_kind` handling.
 - **Codex does not resume at the gate** (out of #1604's scope). A resumed Codex claim always
-  gates a fresh plan, so a replayed revise is dropped as epoch-stale with "Feedback ignored —
-  it was written against an older plan version; re-send it." The feedback is not lost
-  silently, but the owner must re-send it.
+  gates a fresh plan, so every carried-over approve, reject or revise is disposed as
+  epoch-stale with its notice asking to re-send it ("Approval ignored …", "Rejection ignored
+  …", "Feedback ignored …"). None is lost silently, but the owner must re-send it: a reject
+  sent before the interruption does not stop a Codex run.
 - **An api from before this change** sends no `resume_plan_at` (every replayed approve or
   reject fails closed as unjudged) and has no discard route (404). Those approves stay
   unapplied and pending, and count toward the replay `LIMIT 1000` window until the api is
