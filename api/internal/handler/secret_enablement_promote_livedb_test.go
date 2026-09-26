@@ -22,7 +22,7 @@ import (
 func promotingSecretsHandler(t *testing.T) (*Handler, *pgxpool.Pool, *int) {
 	t.Helper()
 	h, pool := secretsCRUDHandler(t)
-	wsvc := workersvc.New(store.New(pool), h.box, workersvc.Params{RunTimeout: 2 * time.Hour})
+	wsvc := workersvc.New(store.New(pool), h.box, workersvc.Params{RunTimeout: 2 * time.Hour, WorkerHeartbeatStale: 45 * time.Second})
 	wsvc.SetTxBeginner(pool)
 	requests := new(int)
 	wsvc.SetBackground(func(fn func()) { *requests++; fn() })
@@ -109,13 +109,15 @@ func TestSecretEnablePromotesParkedRunLiveDB(t *testing.T) {
 		  VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, 'x')`, []any{connID, user}},
 		{`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
 		  VALUES ($1, $2, 1, $3, $4, 'main', true)`, []any{repoID, connID, "g/" + repoID.String(), "https://forge.e2e/g/" + repoID.String()}},
-		{`INSERT INTO workers (id, user_id, name, token_hash, status, anthropic_bind_mode, anthropic_secret_id)
-		  VALUES ($1, $2, $3, $4, 'online', 'pinned', $5)`, []any{workerID, user, "w-" + workerID.String(), workerID[:], pin}},
+		// A live worker (fresh heartbeat) keeps resume affinity, so its binding is the held
+		// run's requirement (credentialRequirementMet follows ClaimRun's affinity pin).
+		{`INSERT INTO workers (id, user_id, name, token_hash, status, anthropic_bind_mode, anthropic_secret_id, last_heartbeat_at)
+		  VALUES ($1, $2, $3, $4, 'online', 'pinned', $5, now())`, []any{workerID, user, "w-" + workerID.String(), workerID[:], pin}},
 		{`UPDATE user_secrets SET disabled_at = now(), enablement_rev = 1 WHERE id = $1`, []any{pin}},
 		{`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, status_since,
-		      hold_reason, worker_id, claim_released_at, credential_disable_released_worker_id, started_at, budget_wall_seconds)
+		      hold_reason, worker_id, claim_released_at, started_at, budget_wall_seconds)
 		  VALUES ($1, $2, $3, 'issue', 1, 't', 'd', 'paused', now() - interval '10 minutes', 'credential_disabled', $4,
-		      now() - interval '10 minutes', $4, now() - interval '15 minutes', 3600)`, []any{runID, user, repoID, workerID}},
+		      now() - interval '10 minutes', now() - interval '15 minutes', 3600)`, []any{runID, user, repoID, workerID}},
 	} {
 		if _, err := pool.Exec(ctx, stmt.sql, stmt.args...); err != nil {
 			t.Fatalf("seed %q: %v", stmt.sql, err)

@@ -41,10 +41,24 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 	if n := park(released, pgWorker, 7); n != 0 {
 		t.Fatalf("released claim parked %d rows", n)
 	}
-	mustExec(ctx, t, pool, `UPDATE runs SET claim_released_at=NULL, hold_reason='completion_blocked' WHERE id=$1`, released)
-	if n := park(released, pgWorker, 7); n != 0 {
-		t.Fatalf("existing hold parked %d rows", n)
+	// A resumed completion hold keeps its completion_blocked annotation on the claimed row
+	// until the first running report. The park supersedes it (the owner's decision already
+	// resumed the run) and keeps the captured head; refusing it would roll the finisher back
+	// and leak the claim's custody hold.
+	mustExec(ctx, t, pool, `UPDATE runs SET claim_released_at=NULL, hold_reason='completion_blocked',
+        hold_captured_head='cafe01' WHERE id=$1`, released)
+	if n := park(released, pgWorker, 7); n != 1 {
+		t.Fatalf("resumed completion_blocked claim parked %d rows, want 1", n)
 	}
+	var cbHold, cbHead pgtype.Text
+	if err := pool.QueryRow(ctx, `SELECT hold_reason, hold_captured_head FROM runs WHERE id=$1`, released).Scan(&cbHold, &cbHead); err != nil {
+		t.Fatal(err)
+	}
+	if cbHold.String != "credential_disabled" || cbHead.String != "cafe01" {
+		t.Fatalf("completion_blocked park: hold=%v head=%v", cbHold, cbHead)
+	}
+	// Out of the worklist below, which pages this test's main run alone.
+	mustExec(ctx, t, pool, `UPDATE runs SET status='queued', hold_reason=NULL WHERE id=$1`, released)
 	// A delivered flight is never parked (D3): only an undelivered 'claimed' claim is.
 	for i, flying := range []string{"running", "awaiting_approval", "awaiting_input", "awaiting_followup"} {
 		flight := insertCodexRun(ctx, t, pool, user, repo, worker, int64(910+i), flying, "flight")
@@ -87,13 +101,16 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 		}
 	}
 	read()
-	var releasedID uuid.UUID
-	var releasedNonce string
-	if err := pool.QueryRow(ctx, `SELECT released_worker_id, released_worker_nonce FROM runs WHERE id=$1`, run).Scan(&releasedID, &releasedNonce); err != nil {
+	// The payload was never delivered, so the park fences no incarnation: no D19 released pair
+	// and no credential-disable released worker, which would bar the parking worker itself.
+	var releasedID, cdReleased pgtype.UUID
+	var releasedNonce pgtype.Text
+	if err := pool.QueryRow(ctx, `SELECT released_worker_id, released_worker_nonce, credential_disable_released_worker_id
+        FROM runs WHERE id=$1`, run).Scan(&releasedID, &releasedNonce, &cdReleased); err != nil {
 		t.Fatalf("read released worker: %v", err)
 	}
-	if releasedID != worker || releasedNonce != "incarnation-a" {
-		t.Fatalf("released incarnation = %s/%q, want %s/incarnation-a", releasedID, releasedNonce, worker)
+	if releasedID.Valid || releasedNonce.Valid || cdReleased.Valid {
+		t.Fatalf("released incarnation = %v/%v/%v, want none", releasedID, releasedNonce, cdReleased)
 	}
 	if status != "paused" || (!hold.Valid || hold.String != "credential_disabled") || bank != 3 || epoch != 5 || cap != nil ||
 		!gotStarted.Equal(started) || session != "resume-session" || !ownerWorker.Valid || ownerWorker.Bytes != worker ||
@@ -169,8 +186,9 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 		t.Fatalf("promote: %v", err)
 	}
 	read()
+	// Resume affinity is kept: the promoted run prefers the worker that parked it.
 	if status != "queued" || hold.Valid || bank < 12 || bank > 15 || epoch != 6 || cap != nil ||
-		session != "resume-session" || ownerWorker.Valid || pauseMode != "now" || recoveryCount != 2 {
+		session != "resume-session" || !ownerWorker.Valid || ownerWorker.Bytes != worker || pauseMode != "now" || recoveryCount != 2 {
 		t.Fatalf("promotion state: status=%s hold=%v bank=%d epoch=%d session=%s worker=%s worker_valid=%t released=%t pause=%s recovery=%d", status, hold, bank, epoch, session, ownerWorker, ownerWorker.Valid, claimReleased.Valid, pauseMode, recoveryCount)
 	}
 	if err := promote(user); !errors.Is(err, pgx.ErrNoRows) {
@@ -178,32 +196,56 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 	}
 }
 
-func TestCredentialDisabledSameWorkerReclaimNeedsGenerationLiveDB(t *testing.T) {
+// TestCredentialDisabledSameWorkerReclaimLiveDB (B1): the parking worker's own live
+// incarnation, with or without generation-stamped reports, reclaims its promoted run. The
+// undelivered claim leaves nothing for ClaimRun's D19 or credential-disable fences to exclude,
+// so a single-worker deployment is never stranded. A run carrying a real D19 released pair (a
+// server wall park) still excludes that exact incarnation.
+func TestCredentialDisabledSameWorkerReclaimLiveDB(t *testing.T) {
 	fx := newWPFixture(t)
 	worker := fx.worker("reclaim", wpWorker{nonce: "incarnation-a"})
 	run := fx.run(wpRun{status: "claimed", worker: &worker, claimGen: 4, budgetWall: p32(36000)})
 	mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET claimed_worker_nonce='incarnation-a' WHERE id=$1`, run)
-	mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET snapshot_register_nonce='incarnation-b' WHERE id=$1`, worker)
 	if n, err := fx.q.ParkCredentialDisabledRun(fx.ctx, store.ParkCredentialDisabledRunParams{
 		ID: run, WorkerID: pgtype.UUID{Bytes: worker, Valid: true}, ClaimGeneration: 4,
 	}); err != nil || n != 1 {
-		t.Fatalf("park old incarnation: rows=%d err=%v", n, err)
+		t.Fatalf("park: rows=%d err=%v", n, err)
 	}
 	if _, err := fx.q.PromoteCredentialDisabledRun(fx.ctx, promoteParams(fx.ctx, t, fx.pool, run, fx.userID, 36000)); err != nil {
 		t.Fatalf("promote: %v", err)
 	}
-	if _, err := fx.claim(worker, "incarnation-b", false); !errors.Is(err, pgx.ErrNoRows) {
-		t.Fatalf("legacy same-ID reclaim = %v, want refused", err)
+	claimed, err := fx.claim(worker, "incarnation-a", false)
+	if err != nil || claimed.ID != run {
+		t.Fatalf("same live incarnation reclaim: run=%s err=%v, want %s", claimed.ID, err, run)
 	}
-	mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET protocol_capabilities=ARRAY['credential_switch_v1']::text[] WHERE id=$1`, worker)
-	claimed, err := fx.q.ClaimRun(fx.ctx, store.ClaimRunParams{
-		WorkerID: pgtype.UUID{Bytes: worker, Valid: true}, UserID: fx.userID,
-		HeartbeatCutoff: wpAgo(45 * time.Second), AffinityCutoff: wpAgo(2 * time.Minute),
-		SpreadCutoff: wpAgo(9 * time.Second), SnapshotFreshCutoff: wpAgo(45 * time.Second),
-		WorkerIdentity: "incarnation-b", WorkerProtocolCaps: []string{"credential_switch_v1"},
-	})
-	if err != nil || claimed.ID != run || claimed.ClaimedWorkerNonce.String != "incarnation-b" {
-		t.Fatalf("generation-capable reclaim: run=%s nonce=%v err=%v", claimed.ID, claimed.ClaimedWorkerNonce, err)
+
+	// Control: the D19 fence itself is intact for a run that records a released incarnation.
+	fx.run(wpRun{status: "queued", budgetWall: p32(36000), releasedWorker: &worker, releasedNonce: "incarnation-a"})
+	if _, err := fx.claim(worker, "incarnation-a", false); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("released incarnation reclaimed a D19-fenced run: %v", err)
+	}
+}
+
+// TestListAutoSelectCandidatesExcludesDisabledLiveDB (M): a disabled token is absent from the
+// auto-select candidates every auto lane reads, pooled or not, while an enabled one stays.
+func TestListAutoSelectCandidatesExcludesDisabledLiveDB(t *testing.T) {
+	ctx, pool, q, user := codexLiveDB(t)
+	enabled, disabled := uuid.New(), uuid.New()
+	for i, id := range []uuid.UUID{enabled, disabled} {
+		mustExec(ctx, t, pool, `INSERT INTO user_secrets (id, user_id, kind, label, auto_eligible, ciphertext, sealed_with)
+            VALUES ($1, $2, 'anthropic_token', $3, true, 'x', 'master')`, id, user, []string{"on", "off"}[i])
+	}
+	mustExec(ctx, t, pool, `UPDATE user_secrets SET disabled_at=now(), enablement_rev=1 WHERE id=$1`, disabled)
+	rows, err := q.ListAutoSelectCandidates(ctx, user)
+	if err != nil {
+		t.Fatalf("ListAutoSelectCandidates: %v", err)
+	}
+	if len(rows) != 1 || rows[0].UserSecretID != enabled {
+		ids := make([]uuid.UUID, 0, len(rows))
+		for _, r := range rows {
+			ids = append(ids, r.UserSecretID)
+		}
+		t.Fatalf("candidates = %v, want only the enabled token %s", ids, enabled)
 	}
 }
 

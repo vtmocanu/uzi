@@ -1,17 +1,29 @@
 -- Credential disablement parks an UNDELIVERED claim (status 'claimed', exact worker and
 -- generation) without consuming any pending owner pause or changing its session, phase,
 -- custody, or recovery state. A running flight is never parked (D3): its claim finishes.
+--
+-- The payload was never handed to the worker, so there is no flight to fence: the D19
+-- released-incarnation pair (released_worker_id / released_worker_nonce) and
+-- credential_disable_released_worker_id are deliberately NOT written. Writing them would
+-- bar the parking worker's own live incarnation from ever reclaiming the run after
+-- promotion (a single-worker deployment would strand it queued). worker_id is kept as
+-- resume affinity, exactly like RequeueClaimAssemblyExact; the claim capability is revoked
+-- (codex_cap_hash NULL, epoch + 1) and claim_released_at rejects any report at this
+-- generation until the next ClaimRun clears it.
+--
+-- hold_reason is overwritten whatever it was. The only annotation a 'claimed' row can carry
+-- is 'completion_blocked' from a completion decision that already resumed the run
+-- (ResumePausedRun keeps it until SetRunRunning): the owner's decision is already recorded
+-- (its follow_up input and audit row are durable), so the credential is now the actionable
+-- reason. hold_captured_head is kept for the later SetRunRunning clear. Guarding on
+-- hold_reason IS NULL instead would match 0 rows after the custody release, roll the
+-- finisher back and leak this claim's custody hold on every ClaimGrace requeue.
 -- name: ParkCredentialDisabledRun :execrows
 UPDATE runs SET
     status = 'paused',
     status_since = now(),
     hold_reason = 'credential_disabled',
     claim_released_at = now(),
-    released_worker_id = runs.worker_id,
-    credential_disable_released_worker_id = runs.worker_id,
-    released_worker_nonce = CASE WHEN runs.claimed_worker_nonce IS NOT NULL
-        THEN NULLIF(runs.claimed_worker_nonce, '')
-        ELSE (SELECT w.snapshot_register_nonce FROM workers w WHERE w.id = runs.worker_id) END,
     codex_cap_hash = NULL,
     codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
@@ -19,8 +31,7 @@ UPDATE runs SET
 WHERE runs.id = @id AND runs.worker_id = @worker_id
   AND runs.claim_generation = @claim_generation
   AND runs.claim_released_at IS NULL
-  AND runs.status = 'claimed'
-  AND runs.hold_reason IS NULL;
+  AND runs.status = 'claimed';
 
 -- The M1 partial index narrows this owner-scoped page to held runs. The caller
 -- re-evaluates the current credential requirement before promoting each row.
@@ -42,7 +53,9 @@ UPDATE runs SET
     budget_paused_seconds = budget_paused_seconds
         + GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int),
     hold_reason = NULL,
-    worker_id = CASE WHEN claim_released_at IS NOT NULL THEN NULL ELSE worker_id END,
+    -- Resume affinity is kept: the undelivered-claim park fences no incarnation. Only a row
+    -- that carries a D19 released incarnation drops its worker, as ResumePausedRun does.
+    worker_id = CASE WHEN released_worker_id IS NOT NULL THEN NULL ELSE worker_id END,
     codex_cap_hash = NULL,
     codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
@@ -76,7 +89,9 @@ UPDATE runs SET
     budget_paused_seconds = budget_paused_seconds
         + GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int),
     hold_reason = NULL,
-    worker_id = CASE WHEN claim_released_at IS NOT NULL THEN NULL ELSE worker_id END,
+    -- Resume affinity is kept: the undelivered-claim park fences no incarnation. Only a row
+    -- that carries a D19 released incarnation drops its worker, as ResumePausedRun does.
+    worker_id = CASE WHEN released_worker_id IS NOT NULL THEN NULL ELSE worker_id END,
     codex_cap_hash = NULL,
     codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
@@ -123,9 +138,15 @@ WHERE id = @id AND user_id = @user_id
 FOR UPDATE;
 
 -- Promoter step (3a): the recorded worker's Anthropic binding, the requirement source for an
--- ordinary Claude run without a per-run override. Owner-scoped.
+-- ordinary Claude run without a per-run override. Owner-scoped. holds_affinity mirrors
+-- ClaimRun's affinity pin on a queued run's own worker: the row exists and is draining or
+-- heartbeat-fresh at @heartbeat_cutoff (now - WORKER_HEARTBEAT_STALE). A worker that does
+-- not hold affinity will not be the next claimant, so its binding is not the requirement.
 -- name: LockWorkerBindingForShare :one
-SELECT anthropic_bind_mode, anthropic_secret_id
+SELECT anthropic_bind_mode, anthropic_secret_id,
+       (draining_since IS NOT NULL
+        OR (last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= @heartbeat_cutoff::timestamptz))::boolean
+           AS holds_affinity
 FROM workers
 WHERE id = @id AND user_id = @user_id
 FOR SHARE;
@@ -162,4 +183,16 @@ SELECT EXISTS (
     SELECT 1 FROM user_secrets
     WHERE user_id = @user_id AND kind = 'anthropic_token' AND disabled_at IS NULL
       AND (is_default OR auto_eligible)
+)::boolean AS available;
+
+-- Promoter step (4) for an ordinary auto lane (a worker bound auto, or a per-run auto
+-- override): the lane spends only pooled tokens (secretchoice's pooled-only promise), so it
+-- can serve the run only when an ENABLED auto-eligible token exists. The default is not a
+-- fallback here (that is the Judge/self-improve rule above). Read under the user's secret
+-- mutation lock, which every enablement and pool opt-in writer takes.
+-- name: HasEnabledPooledAnthropic :one
+SELECT EXISTS (
+    SELECT 1 FROM user_secrets
+    WHERE user_id = @user_id AND kind = 'anthropic_token' AND disabled_at IS NULL
+      AND auto_eligible
 )::boolean AS available;

@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -20,9 +21,11 @@ import (
 // lock order, requirement re-evaluation and triggers. Skipped unless UZI_TEST_DATABASE_URL is
 // set; run via ./e2e/run-store-it.sh.
 
-// cdFix is one owner with a repo, a worker pinned to pinTok, a second enabled token otherTok,
-// an enabled Anthropic default defTok, and a Service wired as main.go wires it with a
-// synchronous background dispatcher, so a requested promoter pass is observable on return.
+// cdFix is one owner with a repo, a live, registered, recovery-capable worker pinned to pinTok,
+// a second enabled token otherTok, an enabled Anthropic default defTok, and a Service wired as
+// main.go wires it with a synchronous background dispatcher, so a requested promoter pass is
+// observable on return. The worker's heartbeat is fresh (it holds resume affinity) and it has a
+// registration nonce, the incarnation ClaimRun's D19 fence compares.
 type cdFix struct {
 	env                      codexTestEnv
 	svc                      *Service
@@ -38,7 +41,10 @@ func newCDFix(t *testing.T) *cdFix {
 	env.sealBotPAT(t, o.userID)
 	fx := &cdFix{env: env, userID: o.userID, repoID: o.repoID, workerID: o.workerID, pinTok: o.deadTok, otherTok: o.altTok}
 	fx.defTok = env.seedAnthropicSecret(t, o.userID, "default-"+uuid.NewString(), true)
-	env.exec(`UPDATE workers SET anthropic_secret_id = $2 WHERE id = $1`, o.workerID, fx.pinTok)
+	env.exec(`UPDATE workers SET anthropic_secret_id = $2, last_heartbeat_at = now(),
+	    snapshot_register_nonce = $3, protocol_capabilities = $4 WHERE id = $1`,
+		o.workerID, fx.pinTok, "nonce-"+uuid.NewString(),
+		[]string{capability.RecoveryArchiveV1, capability.CredentialSwitchV1})
 	fx.svc = New(env.q, env.box, testParams())
 	fx.svc.SetTxBeginner(env.pool)
 	fx.svc.SetBackground(func(fn func()) { fx.requests++; fn() })
@@ -66,20 +72,33 @@ func (fx *cdFix) queuedRun(t *testing.T, kind string) uuid.UUID {
 }
 
 // parkedRun seeds a run already held on credential_disabled by the fixture's worker, parked
-// ten minutes ago after five active minutes.
+// ten minutes ago after five active minutes, in the shape ParkCredentialDisabledRun writes: the
+// claim released, worker_id kept as affinity, no D19 released incarnation.
 func (fx *cdFix) parkedRun(t *testing.T, kind string) uuid.UUID {
 	t.Helper()
 	id := fx.queuedRun(t, kind)
 	fx.env.exec(`UPDATE runs SET status = 'paused', hold_reason = 'credential_disabled',
-	    status_since = now() - interval '10 minutes', claim_released_at = now() - interval '10 minutes',
-	    released_worker_id = worker_id, credential_disable_released_worker_id = worker_id
+	    status_since = now() - interval '10 minutes', claim_released_at = now() - interval '10 minutes'
 	    WHERE id = $1`, id)
 	return id
 }
 
-func (fx *cdFix) worker() store.Worker {
-	return store.Worker{ID: fx.workerID, UserID: fx.userID, Name: "w-cd", Status: "online", AnthropicBindMode: BindModePinned,
-		AnthropicSecretID: pgconv.UUID(fx.pinTok)}
+// worker is the fixture worker as it registered: the stored row, with the protocol
+// capabilities it advertises on the claim request.
+func (fx *cdFix) worker(t *testing.T) store.Worker {
+	t.Helper()
+	return wkrRow(t, fx.env, fx.workerID)
+}
+
+// openCustodyHolds counts the run's unresolved custody holds.
+func openCustodyHolds(t *testing.T, env codexTestEnv, runID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM recovery_custody_holds
+	    WHERE run_id = $1 AND state = 'open'`, runID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 func assertHeld(t *testing.T, env codexTestEnv, runID uuid.UUID, want bool) store.Run {
@@ -108,7 +127,7 @@ func TestClaimCredentialDisabledParksClaudeLiveDB(t *testing.T) {
 		}
 		fx.setEnabled(fx.pinTok, false)
 	}}
-	payload, err := fx.svc.Claim(fx.env.ctx, fx.worker(), nil)
+	payload, err := fx.svc.Claim(fx.env.ctx, fx.worker(t), nil)
 	if err != nil || payload != nil {
 		t.Fatalf("Claim = (%v, %v), want an idle claim", payload != nil, err)
 	}
@@ -154,7 +173,7 @@ func TestClaimCredentialDisabledHeldSecretLockRetriesLiveDB(t *testing.T) {
 		}
 	}}
 	start := time.Now()
-	payload, err := fx.svc.Claim(fx.env.ctx, fx.worker(), nil)
+	payload, err := fx.svc.Claim(fx.env.ctx, fx.worker(t), nil)
 	if payload != nil || !isLockNotAvailable(err) {
 		t.Fatalf("Claim = (%v, %v), want (nil, 55P03)", payload != nil, err)
 	}
@@ -401,14 +420,22 @@ func TestCredentialPromoterTriggersLiveDB(t *testing.T) {
 	}
 }
 
-// waitForAdvisoryWaiter blocks until some backend is waiting on an advisory lock, i.e. the
-// goroutine under test reached lock-order step 1 and is queued behind the holder.
-func waitForAdvisoryWaiter(t *testing.T, env codexTestEnv) {
+// waitForAdvisoryWaiter blocks until some backend is waiting on THIS owner's secret mutation
+// advisory lock, i.e. the goroutine under test reached lock-order step 1 and is queued behind
+// the holder. The two-key advisory lock shows in pg_locks as classid = key 1, objid = key 2
+// (both oids, so the signed int32 keys are compared as their unsigned 32-bit values) and
+// objsubid = 2; any other advisory waiter on the shared test database is ignored.
+func waitForAdvisoryWaiter(t *testing.T, env codexTestEnv, userID uuid.UUID) {
 	t.Helper()
+	// Widen, then mask to the low 32 bits: the oid view of a signed int32 key.
+	classID := int64(store.SecretMutationLockClass) & 0xFFFFFFFF
+	objID := int64(store.SecretMutationLockObjID(userID)) & 0xFFFFFFFF
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		var n int
-		if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`).Scan(&n); err != nil {
+		if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM pg_locks
+		    WHERE locktype = 'advisory' AND NOT granted AND objsubid = 2
+		      AND classid::bigint = $1 AND objid::bigint = $2`, classID, objID).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		if n > 0 {
@@ -447,7 +474,7 @@ func TestCredentialPromoterLockOrderVsReassignmentLiveDB(t *testing.T) {
 		defer wg.Done()
 		promoted, promoteErr = fx.svc.promoteCredentialDisabledRun(fx.env.ctx, fx.userID, runID)
 	}()
-	waitForAdvisoryWaiter(t, fx.env)
+	waitForAdvisoryWaiter(t, fx.env, fx.userID)
 	ctx, cancel := context.WithTimeout(fx.env.ctx, 10*time.Second)
 	defer cancel()
 	if _, err := store.New(tx).ReassignCredentialDisabledRun(ctx, store.ReassignCredentialDisabledRunParams{
@@ -477,13 +504,14 @@ func TestCredentialPromoterWinsReassignmentLiveDB(t *testing.T) {
 	runID := fx.parkedRun(t, "issue")
 	var reassignErr error
 	var wg sync.WaitGroup
-	fx.svc.credPromoteHooks = &credentialPromoteTestHooks{beforePromote: func(context.Context, uuid.UUID) {
+	fx.svc.credPromoteHooks = &credentialPromoteTestHooks{beforePromote: func(context.Context, uuid.UUID) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			_, reassignErr = fx.svc.SetRunCredential(fx.env.ctx, fx.userID, runID, CredentialOverrideModePinned, &fx.otherTok)
 		}()
-		waitForAdvisoryWaiter(t, fx.env)
+		waitForAdvisoryWaiter(t, fx.env, fx.userID)
+		return nil
 	}}
 	promoted, err := fx.svc.promoteCredentialDisabledRun(fx.env.ctx, fx.userID, runID)
 	fx.svc.credPromoteHooks = nil
@@ -557,7 +585,7 @@ func TestCredentialPromoterConcurrentRequirementChangesLiveDB(t *testing.T) {
 				defer wg.Done()
 				promoted, promoteErr = fx.svc.promoteCredentialDisabledRun(fx.env.ctx, fx.userID, runID)
 			}()
-			waitForAdvisoryWaiter(t, fx.env)
+			waitForAdvisoryWaiter(t, fx.env, fx.userID)
 			if err := tx.Commit(fx.env.ctx); err != nil {
 				t.Fatal(err)
 			}

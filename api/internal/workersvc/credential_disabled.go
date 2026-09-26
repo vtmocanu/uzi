@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -28,9 +29,14 @@ import (
 //     row (Judge / self-improve binding);
 //  4. the credential row FOR SHARE.
 //
-// Enable/disable, default changes, worker and Judge rebinding and per-run reassignment all take
-// (1) first, so each promotion decision is serialized against them; the promotion UPDATE is
-// additionally guarded on the requirement columns it evaluated. The claim finisher never takes
+// Enable/disable, default changes, pool opt-in, worker and Judge rebinding (SetWorkerAnthropicToken,
+// SetUserJudgeBinding) and the per-run reassignment of a HELD run (SetRunCredential's
+// credential_disabled branch) take (1) first, so each promotion decision is serialized against
+// them. Other requirement writers do not take (1): the override of a run in any other state, and
+// the held-state credential switch (StampHeldCredentialSwitch / ReleaseCredentialSwitch), touch
+// runs that are not parked here and never race this hold. The promotion UPDATE is additionally
+// guarded on the requirement columns it evaluated, so a writer outside (1) that does reach a held
+// run matches 0 rows instead of promoting on a stale requirement. The claim finisher never takes
 // (1): it holds only its run row and uses NOWAIT for every further lock.
 
 // errCredentialDisabled is the claim-assembly outcome for a run whose resolved credential is
@@ -51,8 +57,9 @@ const (
 // credentialPromoteTestHooks are the promoter's LiveDB race seams (nil in production).
 type credentialPromoteTestHooks struct {
 	// beforePromote runs inside a candidate's transaction, after every lock is held and the
-	// requirement evaluated as met, before the guarded promote UPDATE.
-	beforePromote func(ctx context.Context, runID uuid.UUID)
+	// requirement evaluated as met, before the guarded promote UPDATE. A non-nil error aborts
+	// that candidate as a promotion error (rolled back).
+	beforePromote func(ctx context.Context, runID uuid.UUID) error
 }
 
 // credentialPromoteQueue coalesces requested promoter passes per owner. Its zero value is ready
@@ -92,12 +99,26 @@ func (s *Service) RequestCredentialDisabledPromotion(userID uuid.UUID) {
 	s.background(func() {
 		sem <- struct{}{}
 		defer func() { <-sem }()
-		for {
-			ctx, cancel := context.WithTimeout(context.Background(), credentialPromotePassTimeout)
-			if _, err := s.promoteCredentialDisabledRuns(ctx, userID); err != nil {
-				slog.Error("credential promoter: requested pass", "user", userID, "error", err)
+		// released is set when the loop hands the owner back under p.mu, in the SAME critical
+		// section as its last dirty check, so a request that lands after that check starts a
+		// fresh goroutine instead of being dropped. The deferred cleanup covers only a
+		// panicking pass: it releases the owner so later requests are not swallowed into a
+		// dirty flag no goroutine drains, and the panic is recovered and logged (a best-effort
+		// background pass must not take the process down; Sweep retries the owner).
+		released := false
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("credential promoter: requested pass panicked", "user", userID, "panic", r)
 			}
-			cancel()
+			if !released {
+				p.mu.Lock()
+				delete(p.running, userID)
+				delete(p.dirty, userID)
+				p.mu.Unlock()
+			}
+		}()
+		for {
+			s.runCredentialPromotePass(userID)
 			p.mu.Lock()
 			if p.dirty[userID] {
 				delete(p.dirty, userID)
@@ -105,10 +126,20 @@ func (s *Service) RequestCredentialDisabledPromotion(userID uuid.UUID) {
 				continue
 			}
 			delete(p.running, userID)
+			released = true
 			p.mu.Unlock()
 			return
 		}
 	})
+}
+
+// runCredentialPromotePass is one bounded requested pass for one owner.
+func (s *Service) runCredentialPromotePass(userID uuid.UUID) {
+	ctx, cancel := context.WithTimeout(context.Background(), credentialPromotePassTimeout)
+	defer cancel()
+	if _, err := s.promoteCredentialDisabledRuns(ctx, userID); err != nil {
+		slog.Error("credential promoter: requested pass", "user", userID, "error", err)
+	}
 }
 
 // promoteAllCredentialDisabledRuns is the Sweep fallback: it pages every owner with a held run
@@ -144,22 +175,29 @@ func (s *Service) promoteAllCredentialDisabledRuns(ctx context.Context) (int64, 
 
 // promoteCredentialDisabledRuns pages one owner's held runs oldest first and tries each in its
 // own transaction. A run that stays held (requirement still disabled, owner pause, spent
-// budget) is skipped by the keyset cursor, so one blocked run never starves the rest.
+// budget) is skipped by the keyset cursor, so one blocked run never starves the rest. A
+// candidate whose transaction errors is logged and skipped the same way; the pass carries on
+// with the owner's other runs and returns the joined candidate errors with the promoted count.
+// Only a worklist read error stops the pass.
 func (s *Service) promoteCredentialDisabledRuns(ctx context.Context, userID uuid.UUID) (int64, error) {
 	if s.txBeginner == nil {
 		return 0, nil
 	}
 	var promoted int64
+	var errs []error
 	params := store.ListCredentialDisabledRunsParams{UserID: userID, PageSize: credentialPromotePageSize}
 	for {
 		page, err := s.q.ListCredentialDisabledRuns(ctx, params)
 		if err != nil {
-			return promoted, fmt.Errorf("list credential-disabled runs: %w", err)
+			errs = append(errs, fmt.Errorf("list credential-disabled runs: %w", err))
+			return promoted, errors.Join(errs...)
 		}
 		for _, r := range page {
 			ok, err := s.promoteCredentialDisabledRun(ctx, userID, r.ID)
 			if err != nil {
-				return promoted, fmt.Errorf("promote credential-disabled run %s: %w", r.ID, err)
+				slog.Error("credential promoter: candidate", "user", userID, "run", r.ID, "error", err)
+				errs = append(errs, fmt.Errorf("promote credential-disabled run %s: %w", r.ID, err))
+				continue
 			}
 			if ok {
 				promoted++
@@ -167,7 +205,7 @@ func (s *Service) promoteCredentialDisabledRuns(ctx context.Context, userID uuid
 			}
 		}
 		if len(page) < credentialPromotePageSize {
-			return promoted, nil
+			return promoted, errors.Join(errs...)
 		}
 		last := page[len(page)-1]
 		params.AfterStatusSince, params.AfterID = last.StatusSince, pgtype.UUID{Bytes: last.ID, Valid: true}
@@ -200,12 +238,15 @@ func (s *Service) promoteCredentialDisabledRun(ctx context.Context, userID, runI
 		return false, nil // no longer this hold, or an owner pause keeps it paused
 	}
 	// (3) + (4) The requirement source and the requirement credential.
-	met, err := credentialRequirementMet(ctx, q, run)
+	heartbeatCutoff := pgconv.Time(s.now().Add(-s.p.WorkerHeartbeatStale))
+	met, err := credentialRequirementMet(ctx, q, run, heartbeatCutoff)
 	if err != nil || !met {
 		return false, err
 	}
 	if h := s.credPromoteHooks; h != nil && h.beforePromote != nil {
-		h.beforePromote(ctx, runID)
+		if err := h.beforePromote(ctx, runID); err != nil {
+			return false, err
+		}
 	}
 	_, err = q.PromoteCredentialDisabledRun(ctx, store.PromoteCredentialDisabledRunParams{
 		ID: runID, UserID: userID,
@@ -234,15 +275,26 @@ func (s *Service) promoteCredentialDisabledRun(ctx context.Context, userID, runI
 //
 //   - a Codex run needs its frozen alias;
 //   - judge and self_improve follow the owner's Judge binding (a pin needs that credential, the
-//     default mode needs an enabled default, auto needs an enabled pooled token or default);
+//     default mode needs an enabled default, auto needs an enabled pooled token or default, the
+//     #1140 fallback);
 //   - otherwise a per-run override decides (pinned id, default, or auto), and a nulled pin or
-//     no override inherits the recorded worker's binding.
+//     no override inherits the binding of the worker the next claim will use.
 //
-// A different default never satisfies an explicit pin. Lanes with no single credential (an
-// ordinary auto lane) and a requirement that can no longer be resolved (no recorded worker, a
-// deleted credential) are promoted, so the next claim decides with its own checks instead of
-// the run waiting forever on something that no longer exists.
-func credentialRequirementMet(ctx context.Context, q *store.Queries, run store.LockCredentialDisabledRunForPromotionRow) (bool, error) {
+// An ordinary auto lane (override or worker binding) needs an enabled pooled token: the lane
+// spends only pooled tokens, and ListAutoSelectCandidates never offers a disabled one, so with
+// none enabled the run stays held instead of cycling park -> promote -> park.
+//
+// The next claimant follows ClaimRun's affinity: the kept worker_id pins a queued run to its
+// worker while that worker is draining or heartbeat-fresh (holds_affinity, read against
+// heartbeatCutoff), and falls open to any of the owner's workers otherwise. A worker that does
+// not hold affinity is therefore not the requirement source, and the run is promoted so the
+// actual claimant decides with its own binding (and parks again, on its own worker, if that
+// binding is disabled too).
+//
+// A different default never satisfies an explicit pin. A requirement that can no longer be
+// resolved (no recorded worker, a deleted credential) is promoted, so the next claim decides
+// with its own checks instead of the run waiting forever on something that no longer exists.
+func credentialRequirementMet(ctx context.Context, q *store.Queries, run store.LockCredentialDisabledRunForPromotionRow, heartbeatCutoff pgtype.Timestamptz) (bool, error) {
 	if run.Harness == harnessCodex {
 		if !run.CodexSecretID.Valid {
 			return true, nil
@@ -271,30 +323,32 @@ func credentialRequirementMet(ctx context.Context, q *store.Queries, run store.L
 			}
 			// A nulled pin inherits the worker binding (D1 of PRD #1247).
 		case BindModeAuto:
-			return true, nil
+			return q.HasEnabledPooledAnthropic(ctx, run.UserID)
 		case BindModeDefault:
 			return defaultEnabledForPromotion(ctx, q, run.UserID)
 		}
 	}
 	worker := run.WorkerID
 	if !worker.Valid {
-		worker = run.CredentialDisableReleasedWorkerID
+		return true, nil // no affinity: any of the owner's workers may claim it
 	}
-	if !worker.Valid {
-		return true, nil
-	}
-	b, err := q.LockWorkerBindingForShare(ctx, store.LockWorkerBindingForShareParams{ID: uuid.UUID(worker.Bytes), UserID: run.UserID})
+	b, err := q.LockWorkerBindingForShare(ctx, store.LockWorkerBindingForShareParams{
+		ID: uuid.UUID(worker.Bytes), UserID: run.UserID, HeartbeatCutoff: heartbeatCutoff,
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return true, nil
+		return true, nil // the worker is gone: the run falls open to any worker
 	}
 	if err != nil {
 		return false, fmt.Errorf("lock worker binding: %w", err)
+	}
+	if !b.HoldsAffinity {
+		return true, nil // not the next claimant: the actual claimant's binding decides
 	}
 	switch {
 	case b.AnthropicBindMode == BindModePinned && b.AnthropicSecretID.Valid:
 		return secretEnabledForPromotion(ctx, q, run.UserID, b.AnthropicSecretID)
 	case b.AnthropicBindMode == BindModeAuto:
-		return true, nil
+		return q.HasEnabledPooledAnthropic(ctx, run.UserID)
 	default:
 		return defaultEnabledForPromotion(ctx, q, run.UserID)
 	}

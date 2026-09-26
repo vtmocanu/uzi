@@ -146,8 +146,19 @@ ORDER BY u.email ASC, s.is_default DESC NULLS LAST, lower(s.label) ASC;
 -- (autoselect.Classify, D21); filtering here would split it between SQL and Go, and
 -- the ranker could then no longer tell "the user pooled nothing" from "the user
 -- pooled tokens that are all stale" — different fallback reasons that send a user to
--- different places (settings vs. the poller). The WHERE clause is ownership and
--- kind, which are facts about which rows EXIST, never about which are pickable.
+-- different places (settings vs. the poller). The WHERE clause is ownership, kind
+-- and enablement, which are facts about which rows EXIST for selection, never about
+-- which are pickable.
+--
+-- 🔴 A DISABLED token (disabled_at IS NOT NULL, PRD #1732 D1/D8) is filtered HERE,
+-- the one exception, because it is not an eligibility nuance the ranker weighs: a
+-- disabled credential does not exist for any auto lane, pooled or not. Leaving it in
+-- let autoselect.Select pick a disabled pooled token, the claim finisher park the
+-- run on credential_disabled, the promoter resume it (another token IS enabled), and
+-- the next claim pick the same disabled token again, on every sweep. Every caller
+-- (claim-time autoChoice, pool_wait promotion, limit_wait re-evaluation, the
+-- set-token warning) must see the pool without it, so the filter lives in the one
+-- query they share. Its stored auto_eligible flag is kept (D8) and returns on Enable.
 --
 -- Both LEFT JOINs are load-bearing for the same reason. A token with no gauge row
 -- must appear and classify `no_reading` rather than vanish — that row IS R7's silent
@@ -223,6 +234,7 @@ LEFT JOIN (
 ) f ON f.sid = s.id
 WHERE s.user_id = @user_id
   AND s.kind = 'anthropic_token'
+  AND s.disabled_at IS NULL
 ORDER BY s.id;
 
 -- name: MarkFiveHourExhausted :execrows

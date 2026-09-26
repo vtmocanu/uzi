@@ -1169,7 +1169,10 @@ WITH target AS (
                 (SELECT ow.snapshot_register_nonce FROM workers ow WHERE ow.id = @worker_id))
       -- After a credential-disable release, the same worker ID can only reclaim
       -- with generation-stamped reports. A legacy report cannot distinguish its
-      -- old incarnation from a re-registered one sharing that ID.
+      -- old incarnation from a re-registered one sharing that ID. Only a row that
+      -- carries the marker is gated: the claim-time credential_disabled park
+      -- (ParkCredentialDisabledRun) parks an UNDELIVERED claim, has no flight to
+      -- fence and deliberately does not write it, so the parking worker reclaims.
       AND (r.credential_disable_released_worker_id IS DISTINCT FROM @worker_id
            OR ('credential_switch_v1' = ANY(@worker_protocol_caps::text[])
                AND EXISTS (SELECT 1 FROM workers cw WHERE cw.id = @worker_id
