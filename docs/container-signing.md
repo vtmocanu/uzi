@@ -22,12 +22,19 @@ On every `vX.Y.Z` tag, `.github/workflows/release.yml` signs, by digest, after p
 | web image | `ghcr.io/vtmocanu/uzi/web` |
 | controller image | `ghcr.io/vtmocanu/uzi/controller` |
 | agent worker images | `ghcr.io/vtmocanu/uzi/agent-base`, `ghcr.io/vtmocanu/uzi/agent-jvm` |
+| agent runtime bases (build inputs, signed when built) | `ghcr.io/vtmocanu/uzi/agent-runtime-base`, `ghcr.io/vtmocanu/uzi/agent-runtime-jvm` |
 | Helm chart (OCI) | `ghcr.io/vtmocanu/uzi/uzi` |
 
-A cosign signature is a separate OCI artifact (a `sha256-<digest>.sig` tag in the same
-repository), so signing does not change the image manifest and stays compatible with
+A cosign signature is a separate OCI artifact (cosign 3.x attaches it through the OCI
+referrers API rather than a `sha256-<digest>.sig` tag), so signing does not change the
+image manifest and stays compatible with
 the pipeline's `provenance: false` builds. Signing happens by digest, so the one
 signature covers both tags a release pushes (`:X.Y.Z` and `:<short-sha>`).
+
+The agent runtime bases are rebuilt only when their inputs change, so a release signs
+one only when it builds it; a release that reuses a base first verifies that base's
+signature and then builds on that exact digest. Every agent release image records the
+base it was built on in its `io.github.vtmocanu.uzi.runtime-base` label.
 
 ## Verifying manually
 

@@ -27,6 +27,10 @@
 #      resolves on GHCR for each worker template image. A stable chart may pin an RC
 #      worker (D11), but only a PUBLISHED one -- an unpublished pin ImagePullBackOffs
 #      every new hosted worker (the 0.83.0-rc.7 incident).
+#   6. The release.yml run's assert-agent-version job succeeded: every agent image
+#      reports exactly the version it is tagged with, on a signed runtime base (#1720;
+#      the #1682 re-tagged-RC mismatch). A release cut before #1720 has no such job and
+#      FAILs this check by design.
 #
 # Exit codes:
 #   0  every check passed
@@ -121,9 +125,9 @@ else
   # cosign prints "Pushing signature to: <ref>" once per signed artifact. Six
   # publish jobs sign (5 images + chart), so expect at least 6 lines.
   # Expected signatures = the signing steps that actually ran (success), NOT a hardcoded
-  # 6. On an app-only release the publish-agent jobs re-tag the prior signed digest and
-  # SKIP signing (release.yml gates the Sign step `if reuse != 'true'`), so a correct
-  # release can sign as few as 4 (api/web/controller/chart). Match the two signing-step
+  # count. Every release signs api/web/controller/chart and both agent release images (6);
+  # a publish-agent job ALSO signs a runtime base when its input key was absent (#1720), so
+  # a correct release signs 6 to 8. Match the two signing-step
   # names DIRECTLY ("Sign image (cosign keyless)" and "Package + push + sign chart").
   # Do NOT match on a bare "sign" and exclude "installer": the cosign install step is
   # named "Run ./.github/actions/install-cosign", which contains "cosign" (so it matches
@@ -196,6 +200,19 @@ else
       *) fail "chart pins workers.image.tag=${PIN} but ${REPO}/${img}:${PIN} NOT on GHCR (unpublished worker image -- new hosted workers would ImagePullBackOff)" ;;
     esac
   done
+fi
+
+# --- 6. agent image identity gate ran green (#1720) ----------------------------
+if [ -z "${RELRUN:-}" ]; then
+  fail "no release.yml run found for $TAG (cannot prove the agent identity check ran)"
+else
+  concl="$(gh api "repos/${OWNER}/${REPO}/actions/runs/${RELRUN}/jobs" \
+    --jq '[.jobs[] | select(.name == "assert-agent-version") | .conclusion] | first // empty' 2>/dev/null)"
+  case "$concl" in
+    success) pass "assert-agent-version green: agent images report the version they are tagged with (run $RELRUN)" ;;
+    '') fail "no assert-agent-version job in release.yml run $RELRUN (a release cut before #1720?)" ;;
+    *) fail "assert-agent-version concluded '$concl' in release.yml run $RELRUN -- an agent image does not report its tagged version" ;;
+  esac
 fi
 
 echo

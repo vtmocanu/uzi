@@ -1,0 +1,9 @@
+# actionlint configuration (read automatically from .github/).
+paths:
+  .github/workflows/release.yml:
+    ignore:
+      # `concurrency.queue` is a documented GitHub Actions key (job-level queue: max keeps
+      # more than one pending job in a group instead of cancelling it) that actionlint
+      # 1.7.12 does not know yet. publish-agent relies on it (#1720). Drop this entry once
+      # actionlint accepts the key.
+      - 'unexpected key "queue" for "concurrency" section'

@@ -172,7 +172,7 @@ func TestWorkflowMatricesMatchNames(t *testing.T) {
 //
 // The marker is the anchor: it singles these worker lists out from the OTHER bare-word
 // `for` loops in the same files (release-verify.sh's own `for img in api web controller
-// agent-base agent-jvm` images loop, release.yml's `for t in "${VERSION}" ...` re-tag
+// agent-base agent-jvm` images loop, release.yml's `for t in "${VERSION}" ...` tag-verify
 // loop — the latter's tokens are not bare words anyway), so a template rename that forgets
 // one of these lists reddens here, the guarantee TestWorkflowMatricesMatchNames gives the
 // build matrix. Bare-word body only (`[A-Za-z0-9 _-]`), so a `${...}` list never matches.

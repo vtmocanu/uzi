@@ -24,7 +24,9 @@
 # runs, which clone the TARGET repo fresh. So "the agent image changed in a way worth
 # rolling for" is the set of paths that change how a worker EXECUTES a run:
 #     agent/src  agent/package.json  agent/package-lock.json  agent/tsconfig.json
-#     agent/bin  agent/templates     agent/devbox-global
+#     agent/bin  agent/templates     agent/devbox-global     agent/codex
+# (agent/codex -- the pinned Codex package lock, its install/assert scripts and the Go
+# supervisor the runtime stage builds -- was missing until #1720.)
 # (A self-improve run DOES read /opt/uzi-src, but it is admin-only / off by default; if
 # that path ever needs a fresh per-release snapshot, widen AGENT_PATHS deliberately --
 # do not silently fold in the whole tree, which defeats the decoupling.)
@@ -64,7 +66,7 @@ ASSERT="scripts/assert-worker-tag-decoupled.sh"
 [ -f "$VALUES" ] || { echo "worker-tag-autobump: $VALUES not found (run from repo root)" >&2; exit 2; }
 
 # The agent runtime surface -- see the header. Space-separated, repo-relative.
-AGENT_PATHS="agent/src agent/package.json agent/package-lock.json agent/tsconfig.json agent/bin agent/templates agent/devbox-global"
+AGENT_PATHS="agent/src agent/package.json agent/package-lock.json agent/tsconfig.json agent/bin agent/templates agent/devbox-global agent/codex"
 
 # Read `workers.image.tag`: the `tag:` under the FIRST `image:` that is a direct (two-space)
 # child of the top-level `workers:` key. workers.docker.image / workers.controller.image

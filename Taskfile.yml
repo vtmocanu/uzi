@@ -373,6 +373,10 @@ tasks:
       # WITHOUT editing .github/workflows/** (which this branch must not touch). Ordered
       # before `scan:secrets`, which is deliberately last because it dominates.
       - task: test:migration-renumber
+      # #1720: the agent runtime-base input key must change for every runtime-stage input
+      # and refuse any form it cannot account for; a gap there makes a release silently
+      # reuse a stale base. Temp git repos, a few seconds.
+      - task: test:agent-runtime-key
       # PRD #1493 M3: the Codex command sandbox is a SEPARATE Go module
       # (agent/codex/supervisor, go 1.26.0, vendored/offline) whose tests NO CI job runs
       # today. Wiring test:codex-supervisor here makes the lint-repo job (which runs
@@ -967,6 +971,16 @@ tasks:
       # exits nonzero on any failure. Watch it fail on the unmodified scripts. See the
       # script header.
       - ./scripts/release-scripts-test.sh
+
+  test:agent-runtime-key:
+    desc: offline fixture test of scripts/agent-runtime-key.sh (builds temp git repos; issue 1720)
+    cmds:
+      # A gate:repo member. Drives the real key script against a two-stage fixture
+      # Dockerfile: stable per commit, changes with each runtime-stage input class (stage
+      # text, ARG default, parent digest, copied file content/mode/symlink, dockerignore,
+      # platform), unchanged by release-stage edits, and exits 2 on every unsupported form
+      # or input that differs from HEAD. Prints `N passed, N failed`.
+      - ./scripts/agent-runtime-key-test.sh
 
   test:migration-renumber:
     desc: offline fixture test of scripts/migration-renumber.sh (builds temp git repos; issue 1400)
