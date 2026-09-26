@@ -128,8 +128,9 @@ while [ "$i" -lt "$MAX" ]; do
     fi
   fi
 
-  pv=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,state 2>/dev/null || true)
+  pv=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,state,baseRefName 2>/dev/null || true)
   head=$(printf '%s' "$pv" | jq -r '.headRefOid // empty' 2>/dev/null || true)
+  req_base=$(printf '%s' "$pv" | jq -r '.baseRefName // empty' 2>/dev/null || true)
   pstate=$(printf '%s' "$pv" | jq -r '.state // empty' 2>/dev/null || true)
   if [ -z "$head" ]; then
     echo "try $i: head unresolved (retrying)"
@@ -151,11 +152,10 @@ while [ "$i" -lt "$MAX" ]; do
     fail=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="fail")]|length') || unknown=1
     pend=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length') || unknown=1
     cancel=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length') || unknown=1
-    if [ -z "${req_ctx:-}" ]; then
-      req_base=$(gh pr view "$PR" --repo "$REPO" --json baseRefName -q .baseRefName 2>/dev/null || true)
-      if [ -n "$req_base" ]; then req_ctx=$(required_contexts "$REPO" "$req_base") || req_ctx=""; fi
-    fi
-    if [ -n "${req_ctx:-}" ]; then
+    # Re-read every poll: a retargeted PR or a rules change must not be judged by stale rules.
+    req_ctx=""
+    if [ -n "$req_base" ]; then req_ctx=$(required_contexts "$REPO" "$req_base") || req_ctx=""; fi
+    if [ -n "$req_ctx" ]; then
       missing=$(missing_required "$req_ctx" "$cj") || unknown=1
       pend=$((pend + ${missing:-0}))
     else

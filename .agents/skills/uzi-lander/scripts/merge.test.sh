@@ -64,11 +64,12 @@ if [ "\${1:-}" = pr ] && [ "\${2:-}" = view ]; then
   esac
   exit 0
 fi
-# The base branch's required contexts (RULES_JSON; RULES_FAIL=1 = unreadable). Default: none.
+# The base branch's required contexts as `gh api --paginate --slurp` returns them (pages).
+# RULES_JSON = one page; RULES_FAIL=1 = unreadable. Default: none required.
 if [ "\${1:-}" = api ]; then
   case "\$*" in *'/rules/branches/main'*)
     [ "\${RULES_FAIL:-0}" = 1 ] && exit 1
-    if [ -n "\${RULES_JSON:-}" ]; then printf '%s\n' "\$RULES_JSON"; else echo '[]'; fi
+    if [ -n "\${RULES_JSON:-}" ]; then printf '[%s]\n' "\$RULES_JSON"; else echo '[[]]'; fi
     exit 0 ;;
   esac
 fi
@@ -241,6 +242,12 @@ merge_run rulesunreadable
 [ "$rc" -eq 2 ] || fail "unreadable required-check rules returned rc=$rc, want 2: $(cat "$WORK/m.rulesunreadable")"
 grep -q 'cannot read the required checks of main; not merging' "$WORK/m.rulesunreadable" || fail "unreadable rules not named: $(cat "$WORK/m.rulesunreadable")"
 [ ! -e "$WORK/merge.log" ] || fail "merged with unreadable required-check rules"
-unset CHECKS_JSON CHECKS_RC RULES_JSON RULES_FAIL
+unset RULES_FAIL
+# A required-check rule with no list is malformed: refuse, never read it as none required.
+export RULES_JSON='[{"type":"required_status_checks","parameters":{}}]'
+merge_run rulesmalformed
+[ "$rc" -eq 2 ] || fail "a malformed required-check rule returned rc=$rc, want 2: $(cat "$WORK/m.rulesmalformed")"
+[ ! -e "$WORK/merge.log" ] || fail "merged on a malformed required-check rule"
+unset CHECKS_JSON CHECKS_RC RULES_JSON
 
 echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse"
