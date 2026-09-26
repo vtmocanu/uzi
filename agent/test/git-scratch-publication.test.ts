@@ -7,6 +7,10 @@ import { GitCache, ScratchPublicationError } from "../src/git.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger } from "./helpers.js";
 
+// Every case creates a runner clone, whose scratch provisioning needs Linux procfs;
+// the unsupported-platform refusal itself is covered in git.test.ts.
+const linuxCloneSkip = process.platform === "linux" ? false : "runner clone scratch provisioning requires Linux procfs";
+
 let fx: Fixture;
 let cache: GitCache;
 const branch = "agent/issue-1719";
@@ -32,7 +36,7 @@ async function track(bare: string, clone: string): Promise<void> {
 beforeEach(() => { fx = makeFixture(); cache = new GitCache(fx.dataDir, nullLogger()); });
 afterEach(() => fx.cleanup());
 
-it("accepts clean history and pushes the pinned candidate", async () => {
+it("accepts clean history and pushes the pinned candidate", { skip: linuxCloneSkip }, async () => {
   const { bare, clone } = await setup();
   fs.writeFileSync(path.join(clone, "clean.txt"), "clean\n");
   const sha = commit(clone, "clean");
@@ -42,7 +46,7 @@ it("accepts clean history and pushes the pinned candidate", async () => {
   assert.equal(git(fx.originPath, "rev-parse", `refs/heads/${branch}`), sha);
 });
 
-it("packs the pinned WIP candidate after the tracking ref moves, including overlay path", async () => {
+it("packs the pinned WIP candidate after the tracking ref moves, including overlay path", { skip: linuxCloneSkip }, async () => {
   const { bare, clone } = await setup();
   const floor = git(bare, "rev-parse", "refs/remotes/origin/main");
   fs.writeFileSync(path.join(clone, "wip.txt"), "work in progress\n");
@@ -61,7 +65,7 @@ it("packs the pinned WIP candidate after the tracking ref moves, including overl
   }
 });
 
-it("packs unpinned candidate and floor OIDs even when refs move at pack time", async () => {
+it("packs unpinned candidate and floor OIDs even when refs move at pack time", { skip: linuxCloneSkip }, async () => {
   const { bare, clone } = await setup();
   const floor = git(bare, "rev-parse", "refs/remotes/origin/main");
   fs.writeFileSync(path.join(clone, "wip.txt"), "wip\n");
@@ -92,7 +96,7 @@ it("packs unpinned candidate and floor OIDs even when refs move at pack time", a
 type ScratchShape = "forced staged file" | "add then delete" | "symlink replacing directory" | "file replacing directory";
 
 for (const shape of ["forced staged file", "add then delete", "symlink replacing directory", "file replacing directory"] as const satisfies readonly ScratchShape[]) {
-  it(`checkpoint and final push refuse ${shape} without moving the confirmed or remote tip`, async () => {
+  it(`checkpoint and final push refuse ${shape} without moving the confirmed or remote tip`, { skip: linuxCloneSkip }, async () => {
     const { bare, clone } = await setup();
     fs.writeFileSync(path.join(clone, "clean.txt"), "clean\n");
     const confirmed = commit(clone, "clean confirmed tip");
@@ -128,7 +132,7 @@ for (const shape of ["forced staged file", "add then delete", "symlink replacing
   });
 }
 
-it("refuses a force staged scratch file and an add then delete", async () => {
+it("refuses a force staged scratch file and an add then delete", { skip: linuxCloneSkip }, async () => {
   const { bare, clone } = await setup();
   fs.mkdirSync(path.join(clone, ".uzi", "scratch"), { recursive: true });
   fs.writeFileSync(path.join(clone, ".uzi", "scratch", "secret"), "value\n");
@@ -142,7 +146,7 @@ it("refuses a force staged scratch file and an add then delete", async () => {
   assert.throws(() => git(fx.originPath, "rev-parse", `refs/heads/${branch}`));
 });
 
-it("finds scratch on a merged side branch even when merge result is clean", async () => {
+it("finds scratch on a merged side branch even when merge result is clean", { skip: linuxCloneSkip }, async () => {
   const { bare, clone } = await setup();
   git(clone, "checkout", "-b", "side");
   fs.mkdirSync(path.join(clone, ".uzi", "scratch"), { recursive: true });
@@ -157,7 +161,7 @@ it("finds scratch on a merged side branch even when merge result is clean", asyn
   await assert.rejects(cache.scratchPublicationPreflight(bare, branch), ScratchPublicationError);
 });
 
-it("refuses a scratch symlink and a file replacing its directory", async () => {
+it("refuses a scratch symlink and a file replacing its directory", { skip: linuxCloneSkip }, async () => {
   const { bare, clone } = await setup();
   fs.rmSync(path.join(clone, ".uzi", "scratch"), { recursive: true });
   fs.symlinkSync("../README.md", path.join(clone, ".uzi", "scratch"));
@@ -171,7 +175,7 @@ it("refuses a scratch symlink and a file replacing its directory", async () => {
   await assert.rejects(cache.scratchPublicationPreflight(bare, branch), ScratchPublicationError);
 });
 
-it("refuses a rewound remote floor before pushing", async () => {
+it("refuses a rewound remote floor before pushing", { skip: linuxCloneSkip }, async () => {
   const { bare, clone } = await setup();
   fs.writeFileSync(path.join(clone, "one"), "one");
   commit(clone, "one");
@@ -184,7 +188,7 @@ it("refuses a rewound remote floor before pushing", async () => {
   await assert.rejects(cache.pushBranch(bare, branch, "", fx.originPath), ScratchPublicationError);
 });
 
-it("cannot publish when the remote rewinds to scratch history after the floor refresh", async () => {
+it("cannot publish when the remote rewinds to scratch history after the floor refresh", { skip: linuxCloneSkip }, async () => {
   const { bare, clone } = await setup();
   fs.writeFileSync(path.join(clone, "clean.txt"), "clean\n");
   commit(clone, "clean");
@@ -217,7 +221,7 @@ it("cannot publish when the remote rewinds to scratch history after the floor re
   assert.notEqual(scratchTip, candidate);
 });
 
-it("refuses a candidate with a missing ancestor object", async () => {
+it("refuses a candidate with a missing ancestor object", { skip: linuxCloneSkip }, async () => {
   const { bare } = await setup();
   const tree = git(bare, "rev-parse", "refs/heads/main^{tree}");
   const missing = "a".repeat(40);
@@ -228,7 +232,7 @@ it("refuses a candidate with a missing ancestor object", async () => {
   await assert.rejects(cache.scratchPublicationPreflight(bare, branch, candidate), ScratchPublicationError);
 });
 
-it("refuses a candidate with a missing tree object", async () => {
+it("refuses a candidate with a missing tree object", { skip: linuxCloneSkip }, async () => {
   const { bare } = await setup();
   const missing = "b".repeat(40);
   const body = `tree ${missing}\nparent ${git(bare, "rev-parse", "refs/heads/main")}\nauthor Test <test@example.org> 1 +0000\ncommitter Test <test@example.org> 1 +0000\n\nbroken tree\n`;
@@ -238,7 +242,7 @@ it("refuses a candidate with a missing tree object", async () => {
   await assert.rejects(cache.scratchPublicationPreflight(bare, branch, candidate), ScratchPublicationError);
 });
 
-it("refuses timeout and output overflow from either bounded history walk", async () => {
+it("refuses timeout and output overflow from either bounded history walk", { skip: linuxCloneSkip }, async () => {
   const { bare, clone } = await setup();
   fs.writeFileSync(path.join(clone, "clean.txt"), "clean\n");
   commit(clone, "clean");
@@ -264,7 +268,7 @@ it("refuses timeout and output overflow from either bounded history walk", async
   seam.execScoped = original;
 });
 
-it("refuses unavailable and divergent checkpoint floors", async () => {
+it("refuses unavailable and divergent checkpoint floors", { skip: linuxCloneSkip }, async () => {
   const { bare, clone } = await setup();
   const floor = git(bare, "rev-parse", "refs/remotes/origin/main");
   fs.writeFileSync(path.join(clone, "wip.txt"), "wip\n");
@@ -282,7 +286,7 @@ it("refuses unavailable and divergent checkpoint floors", async () => {
   await assert.rejects(cache.checkpointPack(bare, branch), ScratchPublicationError);
 });
 
-it("refuses shallow or unresolved candidate history", async () => {
+it("refuses shallow or unresolved candidate history", { skip: linuxCloneSkip }, async () => {
   const { bare, clone } = await setup();
   fs.writeFileSync(path.join(clone, "one"), "one");
   const sha = commit(clone, "one");
@@ -291,4 +295,25 @@ it("refuses shallow or unresolved candidate history", async () => {
   await assert.rejects(cache.scratchPublicationPreflight(bare, branch), ScratchPublicationError);
   fs.rmSync(path.join(bare, "shallow"));
   await assert.rejects(cache.scratchPublicationPreflight(bare, branch, "a".repeat(40)), ScratchPublicationError);
+});
+
+it("refuses a checkpoint whose floor cannot be resolved with the typed reason", { skip: linuxCloneSkip }, async () => {
+  const { bare, clone } = await setup();
+  const floor = git(bare, "rev-parse", "refs/remotes/origin/main");
+  fs.writeFileSync(path.join(clone, "wip.txt"), "wip\n");
+  const candidate = commit(clone, "wip");
+  await track(bare, clone);
+  // A malformed pinned range is a range that cannot be established.
+  await assert.rejects(cache.checkpointPack(bare, branch, undefined, {
+    tipSha: "not-a-sha", excludeSha: floor,
+  }), ScratchPublicationError);
+  await assert.rejects(cache.checkpointPack(bare, branch, undefined, {
+    tipSha: candidate, excludeSha: "short",
+  }), ScratchPublicationError);
+  // No origin branch and a tracking tip disjoint from the default: merge-base exits
+  // non-zero, which must surface as the typed refusal, not a generic git error.
+  const orphan = git(bare, ...ident, "commit-tree", `${floor}^{tree}`, "-m", "disjoint root");
+  git(bare, "update-ref", `refs/uzi-runner/${branch}`, orphan);
+  assert.throws(() => git(bare, "rev-parse", "--verify", `refs/remotes/origin/${branch}`));
+  await assert.rejects(cache.checkpointPack(bare, branch), ScratchPublicationError);
 });

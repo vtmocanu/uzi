@@ -2138,7 +2138,7 @@ export class GitCache {
     // excluded floor remains pinned.
     if (pinned) {
       if (!SHA40_RE.test(pinned.tipSha) || !SHA40_RE.test(pinned.excludeSha)) {
-        throw new Error("checkpointPack: pinned range must be two 40-hex commit SHAs");
+        throw new ScratchPublicationError("pinned checkpoint range must be two 40-hex commit SHAs");
       }
       await this.scratchPublicationPreflight(barePath, branch, pinned.tipSha);
       let wanted = pinned.tipSha;
@@ -2157,8 +2157,16 @@ export class GitCache {
     const realTip = await this.trackingTip(barePath, branch);
     if (!realTip) return null;
     await this.scratchPublicationPreflight(barePath, branch, realTip);
-    const excludeRef = await this.checkpointExcludeRef(barePath, branch, realTip);
-    const excludeSha = await this.revParse(barePath, `${excludeRef}^{commit}`);
+    // An unresolvable floor (e.g. no origin branch and a tip disjoint from the default, where
+    // merge-base exits non-zero) is a range that cannot be established: refuse with the typed
+    // reason rather than letting a generic git error escape the publication seam.
+    let excludeSha: string | null;
+    try {
+      const excludeRef = await this.checkpointExcludeRef(barePath, branch, realTip);
+      excludeSha = await this.revParse(barePath, `${excludeRef}^{commit}`);
+    } catch (e) {
+      throw new ScratchPublicationError("checkpoint floor cannot be resolved", e);
+    }
 
     // PRD #1062 M2 (#1036) — the `.github/workflows` overlay. When an overlay context is
     // supplied (GitHub, agent already reaped — see runner.ts), attempt to build a genuine
