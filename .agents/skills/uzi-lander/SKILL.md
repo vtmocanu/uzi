@@ -217,7 +217,13 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    usual for a shared list), `git rebase --continue`, re-run with `--skip-rebase`. Exit 6 = the
    renumber helper reported references to fix by hand. Exit 7 = a gate failed (log path
    printed; a missing or lockfile-stale `node_modules` is reinstalled first with
-   `npm ci --ignore-scripts`). A base move sharing no branch file but `CHANGELOG.md` is
+   `npm ci --ignore-scripts`). On macOS, treat Codex session-store failures as platform limitations only
+   after reproducing the same named failures on the PR base with the same dependencies and
+   environment, and confirming they come from Linux-only `/proc/self/fd` operations; unchanged
+   imports alone are insufficient. Exit 7 stopped before the push: record both results,
+   complete the other required checks, push the reviewed head with an explicit lease, and
+   require green Linux CI and review of that exact SHA before merging. Any additional or
+   different failure blocks this exception. A base move sharing no branch file but `CHANGELOG.md` is
    rebased without re-gating (CI on the pushed head is the gate). Exit 8 = the branch
    moved, or the base moved into other branch files or conflicts: restart with `--fresh`; it resets to
    the remote, so cherry-pick back any commit it names under `FRESH_BACKUP=`, but never a
