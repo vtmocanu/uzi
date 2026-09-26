@@ -18,6 +18,7 @@ import { describe, expect, it } from "vitest";
 import type { SecretMeta } from "./api";
 import {
   anthropicTokenCount,
+  codexCredentialCount,
   hasAnthropicToken as hasToken,
   hasAnyCodexCredential,
   hasUsableCredential,
@@ -99,6 +100,17 @@ describe("anthropicTokenCount (Runs-list credential-badge gate)", () => {
         secret({ id: "sec-oai", kind: "openai_token" }),
       ]),
     ).toBe(1);
+  });
+});
+
+describe("codexCredentialCount", () => {
+  it("counts both Codex secret kinds independently of Anthropic tokens and usability", () => {
+    expect(codexCredentialCount([
+      secret({ kind: "anthropic_token" }),
+      secret({ kind: "codex_auth", id: "seat", codex_status: "unlinked" }),
+      secret({ kind: "openai_api_key", id: "key", is_default: false }),
+    ])).toBe(2);
+    expect(codexCredentialCount([secret()])).toBe(0);
   });
 });
 

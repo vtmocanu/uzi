@@ -21,8 +21,14 @@ function cred(over: {
   label?: string | null;
   reason?: string | null;
   headroom?: number | null;
+  harness?: "claude" | "codex";
+  codexId?: string | null;
+  codexLabel?: string | null;
 }) {
   return {
+    harness: over.harness ?? "claude",
+    codex_secret_id: over.codexId === undefined ? null : over.codexId,
+    codex_secret_label: over.codexLabel === undefined ? null : over.codexLabel,
     anthropic_secret_id: over.id === undefined ? "sec-1" : over.id,
     anthropic_secret_label: over.label === undefined ? "console-key" : over.label,
     anthropic_select_reason: over.reason ?? null,
@@ -309,6 +315,34 @@ describe("RunCredential compact variant (PRD #295)", () => {
     const { container } = render(
       <RunCredential run={cred({ id: null, label: null, reason: "auto" })} variant="compact" />,
     );
+    expect(container.textContent).toBe("");
+  });
+});
+
+describe("Codex run credential", () => {
+  it.each(["full", "compact"] as const)("renders the Codex snapshot in %s without Claude mode or headroom", (variant) => {
+    const { container } = render(<RunCredential run={cred({
+      harness: "codex", codexId: "codex-1", codexLabel: "codex-seat", reason: "auto", headroom: 62,
+    })} variant={variant} />);
+    expect(container.textContent).toContain("codex-seat");
+    expect(container.textContent).not.toContain("console-key");
+    expect(container.textContent).not.toMatch(/auto|headroom/);
+    expect(container.querySelector("a")).toBeNull();
+    expect(container.querySelector("[title]")?.getAttribute("title")).not.toMatch(/auto|headroom|spent|billed/);
+  });
+
+  it.each(["full", "compact"] as const)("keeps a deleted Codex snapshot and strips hostile formatting in %s", (variant) => {
+    const { container } = render(<RunCredential run={cred({
+      harness: "codex", codexId: null, codexLabel: "safe\u202edrowssap",
+    })} variant={variant} />);
+    expect(container.textContent).toContain("safe");
+    expect(container.textContent).toContain("(deleted)");
+    expect(container.textContent).not.toContain("\u202e");
+    expect(container.querySelector("[title]")?.getAttribute("title")).not.toContain("\u202e");
+  });
+
+  it("does not show a Claude snapshot on an unclaimed Codex run", () => {
+    const { container } = render(<RunCredential run={cred({ harness: "codex" })} />);
     expect(container.textContent).toBe("");
   });
 });

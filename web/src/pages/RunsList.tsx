@@ -51,7 +51,7 @@ import { RunCredential } from "../components/RunCredential";
 import { HarnessBadge } from "../components/HarnessBadge";
 import { stripUnsafeChars } from "../lib/safeText";
 import { formatUptimeSince } from "../lib/formatUptimeSince";
-import { anthropicTokenCount } from "../lib/hasToken";
+import { anthropicTokenCount, codexCredentialCount } from "../lib/hasToken";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { lanePaging } from "../lib/boardColumns";
 import { groupRuns, runMatchesQuery } from "../lib/runGroups";
@@ -121,7 +121,7 @@ interface RunsData {
   runs: RunListItem[];
   loading: boolean;
   error: string;
-  tokenCount: number;
+  credentialCounts: { claude: number; codex: number };
   // PRD #320 M6: re-run the layout's one runs fetch, so an Expedite/undo on a queued
   // row can refresh the priority pill + queue ordering the way RunView's refreshRun
   // does — on top of the 10s visibility-gated background poll (PRD #518) that keeps
@@ -146,7 +146,7 @@ export function RunsLayout() {
   const [loading, setLoading] = useState(true);
   // PRD #295: the ">1 Anthropic token" gate for the personal credential badge,
   // computed once from the viewer's secrets. A single-token user sees no badge.
-  const [tokenCount, setTokenCount] = useState(0);
+  const [credentialCounts, setCredentialCounts] = useState({ claude: 0, codex: 0 });
 
   // The one runs fetch, extracted so an Expedite/undo can re-run it (reload below). The
   // isAlive guard defaults to always-true for a reload (the component is mounted when the
@@ -163,7 +163,7 @@ export function RunsLayout() {
       ]);
       if (!isAlive()) return;
       setRuns(runs);
-      setTokenCount(anthropicTokenCount(secrets));
+      setCredentialCounts({ claude: anthropicTokenCount(secrets), codex: codexCredentialCount(secrets) });
     } catch (err) {
       if (isAlive()) setError(errorMessage(err, "Failed to load runs"));
     } finally {
@@ -185,7 +185,7 @@ export function RunsLayout() {
   // browser refresh — matching Board and Dashboard. A transient poll failure keeps
   // the last-good rows: unlike the first load, this swallows its error and never
   // routes through setError/setLoading, so a blip cannot re-flash the skeleton or
-  // pop an error banner. The credential-badge secrets/tokenCount stay mount-only
+  // pop an error banner. The credential-badge secrets/credentialCounts stay mount-only
   // (they change rarely), so the poll re-fetches api.listRuns() alone.
   const poll = useCallback(async () => {
     try {
@@ -224,7 +224,7 @@ export function RunsLayout() {
           </NavLink>
         ))}
       </div>
-      <Outlet context={{ runs, loading, error, tokenCount, reload: () => void load() } satisfies RunsData} />
+      <Outlet context={{ runs, loading, error, credentialCounts, reload: () => void load() } satisfies RunsData} />
     </div>
   );
 }
@@ -546,7 +546,7 @@ export function RunsList() {
   // fetches, so it would freeze without this finer clock.
   const now = useNow(1000);
 
-  const { runs, loading, error, tokenCount, reload } = useRunsData();
+  const { runs, loading, error, credentialCounts, reload } = useRunsData();
   const [adminRuns, setAdminRuns] = useState<RunListItem[]>([]);
   const [adminWorkers, setAdminWorkers] = useState<AdminWorker[]>([]);
   const [adminError, setAdminError] = useState("");
@@ -634,7 +634,7 @@ export function RunsList() {
                       run={r}
                       now={now}
                       waitingForVault={!vaultUnlocked && r.status === "queued"}
-                      showCredential={tokenCount > 1}
+                      showCredential={credentialCounts[r.harness] > 1}
                       // The personal Active list is all the viewer's own runs, so the
                       // Expedite/undo action is offered here (PRD #320 M6); reload
                       // refreshes the pill + ordering after the mutation.
@@ -779,7 +779,7 @@ export function RunsHistory() {
 
   // Runs, secrets gate, load/error state all come from the layout's one fetch —
   // this page owns only its search + reveal state.
-  const { runs, loading, error, tokenCount } = useRunsData();
+  const { runs, loading, error, credentialCounts } = useRunsData();
   const [searchParams, setSearchParams] = useSearchParams();
   const query = searchParams.get("q") ?? "";
   const failedOnly = searchParams.get("status") === "failed";
@@ -927,7 +927,7 @@ export function RunsHistory() {
               </h3>
               <ul className="space-y-2">
                 {g.runs.map((r) => (
-                  <RunRow key={r.id} run={r} now={now} showCredential={tokenCount > 1} />
+                  <RunRow key={r.id} run={r} now={now} showCredential={credentialCounts[r.harness] > 1} />
                 ))}
               </ul>
             </div>

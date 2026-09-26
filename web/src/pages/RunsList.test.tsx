@@ -1227,6 +1227,37 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
     }
   });
 
+  it.each(["/runs", "/runs/history"])("gates each harness independently on %s", async (path) => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [
+      aSecret({ id: "claude-1" }),
+      aSecret({ kind: "codex_auth", id: "codex-1" }),
+      aSecret({ kind: "openai_api_key", id: "codex-2", is_default: false }),
+    ] });
+    const status = path === "/runs" ? "running" : "completed";
+    mockApi.listRuns.mockResolvedValue({ runs: [
+      aCredentialedRun({ id: "claude", issue_title: "Claude row", status }),
+      aCredentialedRun({ id: "codex", issue_title: "Codex row", status, harness: "codex",
+        codex_secret_id: "codex-1", codex_secret_label: "codex-seat" }),
+    ] });
+    renderRuns(path);
+    await waitFor(() => expect(screen.getByText("Codex row")).toBeTruthy());
+    expect(screen.getByText("codex-seat")).toBeTruthy();
+    expect(screen.queryByText("console-key")).toBeNull();
+  });
+
+  it("does not let two Anthropic tokens reveal a single Codex credential", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [
+      aSecret({ id: "claude-1" }), aSecret({ id: "claude-2", is_default: false }),
+      aSecret({ kind: "codex_auth", id: "codex-1" }),
+    ] });
+    mockApi.listRuns.mockResolvedValue({ runs: [aCredentialedRun({ harness: "codex",
+      codex_secret_id: "codex-1", codex_secret_label: "codex-seat" })] });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Billed run")).toBeTruthy());
+    expect(screen.queryByText("codex-seat")).toBeNull();
+    expect(screen.queryByText("console-key")).toBeNull();
+  });
+
   // A run with no recorded credential label renders no badge, at any token count. The
   // compact badge wraps its label in a `max-w-[12rem]` span (the truncation clamp,
   // web-ux F20), which is unique to this badge — so its absence is the tell that
@@ -1299,6 +1330,10 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
           anthropic_select_reason: "pool_empty",
           anthropic_headroom_pct: null,
         }),
+        aCredentialedRun({
+          id: "other-codex", issue_title: "Other's Codex run", owner_email: "other@uzi.test",
+          harness: "codex", codex_secret_id: null, codex_secret_label: "retired-seat",
+        }),
       ],
     });
 
@@ -1307,6 +1342,8 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
     await waitFor(() => expect(screen.getByText("Other's run")).toBeTruthy());
     // The badge renders (admin still sees provenance despite holding zero tokens).
     expect(screen.getByText("their-key")).toBeTruthy();
+    expect(screen.getByText("retired-seat")).toBeTruthy();
+    expect(screen.getByText("(deleted)")).toBeTruthy();
     // …but its /settings link is stripped. The row's own /runs/:id link is unaffected.
     expect(container.querySelector('a[href="/settings"]')).toBeNull();
   });
