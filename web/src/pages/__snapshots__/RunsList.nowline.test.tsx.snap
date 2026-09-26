@@ -16,17 +16,17 @@ exports[`RunsList row now line (PRD #1064 M3) > D5: a null-milestone null-activi
       data-live=""
     >
       <div
-        class="flex w-full min-w-0 items-center gap-2 sm:w-auto sm:flex-1"
+        class="grid w-full min-w-0 sm:w-auto sm:flex-1 grid-cols-[1rem_minmax(0,1fr)] gap-x-1.5 sm:grid-cols-[1.75rem_minmax(0,1fr)] sm:gap-x-2"
       >
         <span
           aria-label="Claude"
-          class="inline-flex h-7 w-7 flex-none items-center justify-center text-fg"
+          class="inline-flex h-4 w-4 flex-none items-center justify-center self-center text-fg sm:row-span-4 sm:h-7 sm:w-7"
           role="img"
           title="Runs on Claude"
         >
           <svg
             aria-hidden="true"
-            class="text-brand-claude h-[22px] w-[22px]"
+            class="text-brand-claude h-4 w-4 sm:h-[22px] sm:w-[22px]"
             fill="currentColor"
             height="1em"
             viewBox="0 0 24 24"
@@ -37,74 +37,70 @@ exports[`RunsList row now line (PRD #1064 M3) > D5: a null-milestone null-activi
             />
           </svg>
         </span>
-        <div
-          class="min-w-0 flex-1"
+        <p
+          class="min-w-0 truncate text-sm font-medium text-fg col-start-2"
         >
-          <p
-            class="truncate text-sm font-medium text-fg"
+          A run
+        </p>
+        <p
+          class="mt-0.5 min-w-0 flex flex-wrap items-center gap-x-4 overflow-x-clip text-xs text-faint col-span-2 sm:col-span-1 sm:col-start-2"
+        >
+          <span
+            class="inline-flex min-w-0 max-w-full items-center gap-1"
           >
-            A run
-          </p>
-          <p
-            class="mt-0.5 flex flex-wrap items-center gap-x-4 overflow-x-clip text-xs text-faint"
+            <span
+              class="min-w-0 truncate"
+            >
+              grp/proj
+            </span>
+            <span
+              class="shrink-0"
+            >
+              <span
+                class="focus-visible:ring-inset focus-visible:ring-offset-0"
+              >
+                #
+                7
+              </span>
+            </span>
+          </span>
+          <span
+            class="inline-flex items-center"
           >
+             
             <span
-              class="inline-flex min-w-0 max-w-full items-center gap-1"
+              aria-hidden="true"
+              class="-ml-4 w-4 shrink-0 text-center"
             >
-              <span
-                class="min-w-0 truncate"
-              >
-                grp/proj
-              </span>
-              <span
-                class="shrink-0"
-              >
-                <span
-                  class="focus-visible:ring-inset focus-visible:ring-offset-0"
-                >
-                  #
-                  7
-                </span>
-              </span>
+              ·
             </span>
+            w1
+          </span>
+          <span
+            class="inline-flex items-center"
+          >
+             
             <span
-              class="inline-flex items-center"
+              aria-hidden="true"
+              class="-ml-4 w-4 shrink-0 text-center"
             >
-               
-              <span
-                aria-hidden="true"
-                class="-ml-4 w-4 shrink-0 text-center"
-              >
-                ·
-              </span>
-              w1
+              ·
             </span>
+            7/5/2026, 12:00:00 PM
+          </span>
+          <span
+            class="inline-flex items-center tabular-nums"
+          >
+             
             <span
-              class="inline-flex items-center"
+              aria-hidden="true"
+              class="-ml-4 w-4 shrink-0 text-center"
             >
-               
-              <span
-                aria-hidden="true"
-                class="-ml-4 w-4 shrink-0 text-center"
-              >
-                ·
-              </span>
-              7/5/2026, 12:00:00 PM
+              ·
             </span>
-            <span
-              class="inline-flex items-center tabular-nums"
-            >
-               
-              <span
-                aria-hidden="true"
-                class="-ml-4 w-4 shrink-0 text-center"
-              >
-                ·
-              </span>
-              running 40s
-            </span>
-          </p>
-        </div>
+            running 40s
+          </span>
+        </p>
       </div>
       <div
         class="relative z-10 flex flex-wrap items-center gap-2"

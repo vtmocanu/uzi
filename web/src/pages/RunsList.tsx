@@ -267,6 +267,7 @@ export function RunRow({
   onExpedited?: () => void;
 }) {
   const demo = useDemoMode();
+  const hasHarnessLogo = run.harness === "claude" || run.harness === "codex";
   // A deliberate human stop (cancelled, or failed carrying a server-stamped
   // stop_kind — PRD #33) reads "stopped" / neutral, never "failed" / danger. Fold
   // that into the pill's status so the shared StatusPill palette renders it calm.
@@ -365,26 +366,27 @@ export function RunRow({
         data-live={shadow === "live" ? "" : undefined}
         data-attention={shadow === "attention" ? "" : undefined}
       >
-        {/* The full-width leading group keeps the logo beside the title below sm while
-            the badge cluster stacks underneath. Its min-w-0 title column still
-            truncates long titles; above sm the groups share one row. */}
-        <div className="flex w-full min-w-0 items-center gap-2 sm:w-auto sm:flex-1">
-          <HarnessBadge harness={run.harness} variant="bare" />
-          <div className="min-w-0 flex-1">
+        {/* Below sm, the single logo shares the title line while every lower line
+            spans the row. Above sm it occupies its original 28px column, centered
+            beside the text block. Unknown harnesses have no logo track or gap. */}
+        <div className={`grid w-full min-w-0 sm:w-auto sm:flex-1 ${hasHarnessLogo
+          ? "grid-cols-[1rem_minmax(0,1fr)] gap-x-1.5 sm:grid-cols-[1.75rem_minmax(0,1fr)] sm:gap-x-2"
+          : "grid-cols-1"}`}>
+          {hasHarnessLogo && <HarnessBadge harness={run.harness} variant="bare" />}
             {/* Issue #124: the run title is the forge ISSUE title — writable by anyone who
                 can open an issue on the target repo, so it is untrusted free text on the same
                 footing as judge output. Display-only here; the raw value stays the identity. */}
-            <p className="truncate text-sm font-medium text-fg">{stripUnsafeChars(run.issue_title)}</p>
+            <p className={`min-w-0 truncate text-sm font-medium text-fg ${hasHarnessLogo ? "col-start-2" : ""}`}>{stripUnsafeChars(run.issue_title)}</p>
             {/* PRD #362 M4: a one-line intent preview ("what this run will implement"),
                 shown once the summary lands. UNTRUSTED model output over an
                 attacker-influenceable issue/PRD, so it goes through stripUnsafeChars and is
                 truncated to one line like the title — never <Markdown>. Absent until the
                 worker posts the intent summary, so a pre-feature/early run shows only the title. */}
             {run.summary_intent && run.summary_intent.trim() !== "" && (
-              <p className="mt-0.5 truncate text-xs text-muted">{stripUnsafeChars(run.summary_intent)}</p>
+              <p className={`mt-0.5 min-w-0 truncate text-xs text-muted ${hasHarnessLogo ? "col-span-2 sm:col-span-1 sm:col-start-2" : ""}`}>{stripUnsafeChars(run.summary_intent)}</p>
             )}
             {showNow && activity && (
-              <p className="mt-0.5 flex items-center gap-1.5 text-xs text-faint">
+              <p className={`mt-0.5 min-w-0 flex items-center gap-1.5 text-xs text-faint ${hasHarnessLogo ? "col-span-2 sm:col-span-1 sm:col-start-2" : ""}`}>
                 <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full bg-ok animate-pulse" />
                 <span className="shrink-0 font-medium text-ok">{stripUnsafeChars(activity.agent)}</span>
                 {nowMilestone && <span className="shrink-0 font-mono text-faint">{nowMilestone}</span>}
@@ -394,7 +396,7 @@ export function RunRow({
                 {age && <span className="shrink-0 whitespace-nowrap tabular-nums text-faint">· {age} ago</span>}
               </p>
             )}
-            <p className="mt-0.5 flex flex-wrap items-center gap-x-4 overflow-x-clip text-xs text-faint">
+            <p className={`mt-0.5 min-w-0 flex flex-wrap items-center gap-x-4 overflow-x-clip text-xs text-faint ${hasHarnessLogo ? "col-span-2 sm:col-span-1 sm:col-start-2" : ""}`}>
               <span className="inline-flex min-w-0 max-w-full items-center gap-1">
                 <span className="min-w-0 truncate">{maskRepoPath(run.repo_path, demo)}</span>
                 <span className="shrink-0">
@@ -457,7 +459,6 @@ export function RunRow({
                 </>
               )}
             </p>
-          </div>
         </div>
         {/* Issue #485 review FIX 1: raise the whole right-side badge cluster above the
             card's stretched-link overlay (relative z-10) so every badge's native `title`
