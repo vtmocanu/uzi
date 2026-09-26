@@ -50,10 +50,11 @@ func TestPatchWorkerRefusesDisabledToken(t *testing.T) {
 }
 
 // TestSetJudgeRefusesDisabledTokenAllOrNothing: a Judge PUT naming a disabled token is a 409
-// and writes NOTHING, neither the binding nor the opt-in flip that precedes it.
+// and writes NOTHING, neither the binding nor the opt-in flip.
 //
-// MUTATION: drop the handler's CheckCredentialEnabled pre-check; the opt-in is then flipped
-// before the binding writer refuses, and this test fails on the half-applied request.
+// MUTATION: write the opt-in before SetUserJudgeBinding's locked enablement check (or from the
+// handler, outside that transaction); the opt-in is then flipped before the binding writer
+// refuses, and this test fails on the half-applied request.
 func TestSetJudgeRefusesDisabledTokenAllOrNothing(t *testing.T) {
 	owner, secretID := uuid.New(), uuid.New()
 	st := &judgeBindStore{
@@ -66,8 +67,46 @@ func TestSetJudgeRefusesDisabledTokenAllOrNothing(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.SetJudgeEnabled(rec, judgeReq(owner, `{"enabled":true,"anthropic_token":"parked"}`))
 	assertSettings409(t, rec)
-	if db.called || st.setCalled {
-		t.Fatalf("writes on a refused request: opt-in=%t binding=%t, want neither", db.called, st.setCalled)
+	if db.called || st.enabledCalled || st.setCalled {
+		t.Fatalf("writes on a refused request: opt-in=%t/%t binding=%t, want neither", db.called, st.enabledCalled, st.setCalled)
+	}
+}
+
+// TestSetJudgeDisableRaceIsAllOrNothing (PRD #1732 D5): a disable that commits after any read
+// the handler makes outside the binding transaction must still leave the request whole. The
+// fake disables the token after its first ciphertext read, the window between a handler-side
+// pre-check and the locked check under the secret mutation lock. The request either succeeds
+// with both halves written, or is refused with NEITHER written: a 409 never leaves
+// judge_enabled flipped.
+//
+// MUTATION: restore the handler's unlocked CheckCredentialEnabled pre-check and its separate
+// SetUserJudgeEnabled write before SetUserJudgeBinding; the pre-check reads the token enabled,
+// the opt-in commits, the locked check then sees the disable, and the 409 leaves judge_enabled
+// flipped.
+func TestSetJudgeDisableRaceIsAllOrNothing(t *testing.T) {
+	owner, secretID := uuid.New(), uuid.New()
+	st := &judgeBindStore{
+		secrets:           map[uuid.UUID]uuid.UUID{secretID: owner},
+		labels:            map[string]uuid.UUID{owner.String() + "|racing": secretID},
+		disableAfterReads: 1,
+	}
+	db := &fakeUserDB{}
+	h := newJudgeBindHandler(t, db, st)
+	rec := httptest.NewRecorder()
+	h.SetJudgeEnabled(rec, judgeReq(owner, `{"enabled":true,"anthropic_token":"racing"}`))
+	optIn := db.called || st.enabledCalled
+	switch rec.Code {
+	case http.StatusOK:
+		if !st.enabledCalled || !st.enabledArg.JudgeEnabled || !st.setCalled || db.called {
+			t.Fatalf("200 with opt-in(service)=%t opt-in(handler)=%t binding=%t, want both halves in the binding transaction",
+				st.enabledCalled, db.called, st.setCalled)
+		}
+	case http.StatusConflict:
+		if optIn || st.setCalled {
+			t.Fatalf("409 left writes behind: opt-in=%t binding=%t, want neither", optIn, st.setCalled)
+		}
+	default:
+		t.Fatalf("code = %d, want 200 or 409; body=%s", rec.Code, rec.Body.String())
 	}
 }
 

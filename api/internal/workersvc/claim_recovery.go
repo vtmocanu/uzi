@@ -110,6 +110,8 @@ type claimTestHooks struct {
 	afterMint func(ctx context.Context, run store.Run)
 	// afterAssembly runs with assembleClaim's result, before finishRunClaim.
 	afterAssembly func(ctx context.Context, run store.Run, payload *ClaimPayload, err error)
+	// afterChatAssembly runs after a successful assembleChatClaim, before finishChatClaim.
+	afterChatAssembly func(ctx context.Context, run store.Run)
 }
 
 // This matches ClaimRun's hold CTE, using the boolean passed to that claim.

@@ -198,6 +198,10 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 		}
 		// PRD #1732 D15: a pinned harness whose credentials are all disabled skips the fire
 		// (benign, advancing) instead of the hard refusal a genuinely absent credential gets.
+		// A one-time row is held un-advanced instead (holdsOnceCredentialDisabled): transient.
+		if holdsOnceCredentialDisabled(sched, err) {
+			return FireOutcome{}, err
+		}
 		if reason, ok := skipReasonForErr(err); ok && reason == SkipCredentialDisabled {
 			e.logger.Info("scheduler: self_improve fire skipped", "schedule", sched.ID.String(), "reason", err)
 			return FireOutcome{Matched: 1, Skips: []Skip{{Reason: reason}}}, nil

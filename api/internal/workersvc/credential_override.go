@@ -79,32 +79,18 @@ var (
 )
 
 // ErrCredentialDisabled is the D5 refusal (PRD #1732): a NEW explicit assignment named a
-// credential the owner has disabled. Every explicit-assignment path returns it BEFORE any
-// write (per-run override at create, set-token and reassignment of a held run, schedule
-// create/edit pins, worker binding, Judge binding), and the handlers map it to 409 with this
-// message, which names where to fix it. Stored pins are never refused retroactively: the work
-// they drive waits on credential_disabled instead (D2). A schedule fire whose stored pin is
-// disabled records the credential_disabled skip from the same sentinel.
+// credential the owner has disabled. Every explicit-assignment path returns it BEFORE its
+// write, and the handlers map it to 409 with this message, which names where to fix it. Only
+// the worker binding and the Judge opt-in plus binding read the credential under the user's
+// secret mutation lock, in the transaction that writes, so a concurrent disable is serialized
+// against them. The per-run override at create, set-token and the reassignment of a held run,
+// and schedule create/edit pins read it OUTSIDE that lock: a disable committing between that
+// read and the write is not refused there, and the claim-time park (the run lane's
+// claimCredentialDisabled, the chat lane's re-check) or the schedule fire's own check stops
+// delivery instead. Stored pins are never refused retroactively: the work they drive waits on
+// credential_disabled instead (D2). A schedule fire whose stored pin is disabled records the
+// credential_disabled skip from the same sentinel.
 var ErrCredentialDisabled = errors.New("credential is disabled; enable it in Settings")
-
-// CheckCredentialEnabled is the D5 pre-write check for a handler that must refuse a disabled
-// credential before its FIRST write (PRD #1732): the Judge PUT flips the opt-in before the
-// binding, so the binding writer's own locked check would come too late to keep the request
-// all-or-nothing. It returns ErrCredentialDisabled for a disabled credential and nil for an
-// enabled or unknown one (the writer reports an unknown id itself). The binding writers still
-// check under the secret mutation lock, so a disable racing this read is refused there.
-func (s *Service) CheckCredentialEnabled(ctx context.Context, userID, secretID uuid.UUID) error {
-	row, err := s.q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{ID: secretID, UserID: userID})
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		return nil
-	case err != nil:
-		return fmt.Errorf("credential enablement lookup: %w", err)
-	case row.Disabled:
-		return ErrCredentialDisabled
-	}
-	return nil
-}
 
 // checkStoredOverrideEnabled is the fire-time check of a schedule's STORED pin (PRD #1732 D2):
 // the columns were validated at create/edit and are written as-is, but a pin disabled since

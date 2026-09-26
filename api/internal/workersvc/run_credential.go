@@ -121,25 +121,19 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 	switch run.Status {
 	case "paused":
 		if run.HoldReason.Valid && run.HoldReason.String == "credential_disabled" {
-			// PRD #1732 D14: the reassignment takes the promoter's lock order (the user's secret
-			// mutation lock, then the run row inside the fenced UPDATE), so it and a concurrent
-			// promotion serialize: exactly one moves the run out of the hold, and the loser
-			// matches 0 rows (ErrCredentialSwitchRaced) with nothing written.
-			if err := s.withSecretMutation(ctx, userID, func(q secretMutationQueries) error {
-				_, err := q.ReassignCredentialDisabledRun(ctx, store.ReassignCredentialDisabledRunParams{
-					ID: runID, UserID: userID,
-					Mode: pgOverrideMode(resolved), SecretID: pgOverrideSecretID(resolved),
-					GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
-				})
-				return err
-			}); err != nil {
-				if errors.Is(err, pgx.ErrNoRows) {
-					return SetRunCredentialResult{}, ErrCredentialSwitchRaced
-				}
-				return SetRunCredentialResult{}, fmt.Errorf("reassign credential-disabled run: %w", err)
+			// PRD #1732 D2/D14: the reassignment writes the override and leaves the hold in
+			// the promoter's lock order, so it and a concurrent promotion serialize: exactly
+			// one moves the run, and the loser is ErrCredentialSwitchRaced with nothing
+			// written. A run with a pending pause or a spent budget settles into that pause
+			// or budget_exhausted rather than being refused.
+			status, err := s.reassignCredentialDisabledRun(ctx, userID, runID, resolved)
+			if err != nil {
+				return SetRunCredentialResult{}, err
 			}
-			if _, err := s.q.CreateRunInput(ctx, store.CreateRunInputParams{RunID: runID, Kind: "resume", Body: pgtype.Text{}}); err != nil {
-				slog.Warn("set run credential: write resume audit row", "run", runID, "error", err)
+			if status == "queued" {
+				if _, err := s.q.CreateRunInput(ctx, store.CreateRunInputParams{RunID: runID, Kind: "resume", Body: pgtype.Text{}}); err != nil {
+					slog.Warn("set run credential: write resume audit row", "run", runID, "error", err)
+				}
 			}
 			break
 		}

@@ -3,6 +3,7 @@ package schedsvc
 import (
 	"errors"
 
+	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -88,8 +89,10 @@ const (
 	// is a credential the owner has disabled, or its pinned harness has no enabled credential.
 	// The fire starts no run and never substitutes another credential or harness; the stored
 	// pin is kept. Benign for a recurring row: the schedule advances and re-fires next cadence,
-	// once the owner enables the credential or changes the pin. An implicit-harness fire with no
-	// enabled credential anywhere records no_usable_credential instead (D15).
+	// once the owner enables the credential or changes the pin. A one-time row is held
+	// un-advanced instead (holdsOnceCredentialDisabled), so its pinned work waits rather than
+	// being consumed. An implicit-harness fire with no enabled credential anywhere records
+	// no_usable_credential instead (D15).
 	SkipCredentialDisabled SkipReason = "credential_disabled" //nolint:gosec // G101: a schedule-skip-reason VOCABULARY value, not a credential (see SkipNoUsableCredential).
 )
 
@@ -143,7 +146,8 @@ func skipReasonForErr(err error) (SkipReason, bool) {
 		// PRD #1732 D2/D15: a disabled stored pin, or a pinned harness with no enabled
 		// credential. Checked before any other credential arm: ErrHarnessCredentialDisabled
 		// wraps ErrNoCredentialForHarness, which otherwise stays a hard refusal. Benign,
-		// advancing, and never a substitution.
+		// advancing, and never a substitution. Exception: the fire paths return it as transient
+		// for a one-time schedule before reaching this helper (holdsOnceCredentialDisabled).
 		return SkipCredentialDisabled, true
 	case errors.Is(err, workersvc.ErrNoUsableCredential):
 		// Review fix (PRD #1429): D11 found neither harness usable for the owner. Checked with
@@ -156,4 +160,19 @@ func skipReasonForErr(err error) (SkipReason, bool) {
 	default:
 		return "", false
 	}
+}
+
+// holdsOnceCredentialDisabled reports whether a fire error is the credential_disabled refusal
+// (a disabled stored pin, or a pinned harness with no enabled credential) on a ONE-TIME
+// schedule. The fire paths return such an error as transient instead of the benign advancing
+// skip, mirroring the issue #1626 ErrBranchInUse exception: advancing a once row marks it fired
+// and its pinned work would never start, while PRD #1732 D2 says pinned work waits. The row is
+// then held un-advanced (advance's transient arm, retried every tick) until the owner enables
+// the credential or changes the pin. A recurring row keeps the benign skip and advances.
+func holdsOnceCredentialDisabled(sched store.RunSchedule, err error) bool {
+	if sched.Timing != "once" {
+		return false
+	}
+	reason, ok := skipReasonForErr(err)
+	return ok && reason == SkipCredentialDisabled
 }

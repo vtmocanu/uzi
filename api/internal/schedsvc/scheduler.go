@@ -367,8 +367,9 @@ func (e *Scheduler) process(ctx context.Context, sched store.RunSchedule, pc *pa
 // must not disturb the recurring cadence (next_fire_at stays where the tick left it) nor
 // terminate a once schedule. Errors ride up UNCHANGED — workersvc.ErrRepoNotFound (repo
 // gone / not owned), ErrBadConfig (malformed stored config), or a transient forge/DB
-// error — so the handler can map each to the right HTTP code. The one exception is
-// ErrBranchInUse on an issue target, which becomes an already_running skip (see below).
+// error — so the handler can map each to the right HTTP code. The exceptions are
+// ErrBranchInUse on an issue target, which becomes an already_running skip, and a one-time
+// schedule's credential_disabled hold, which becomes the credential_disabled skip (see below).
 func (e *Scheduler) RunNow(ctx context.Context, sched store.RunSchedule) (FireOutcome, error) {
 	out, err := e.fireOne(ctx, sched)
 	// Issue #1626: createIssueRun returns ErrBranchInUse as an error for a once issue
@@ -378,6 +379,16 @@ func (e *Scheduler) RunNow(ctx context.Context, sched store.RunSchedule) (FireOu
 	if errors.Is(err, workersvc.ErrBranchInUse) && sched.Target == "issue" {
 		iid := sched.IssueIid.Int64
 		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iid, Reason: SkipAlreadyRunning}}}, nil
+	}
+	// PRD #1732 D2: likewise the one-time credential_disabled hold. RunNow never advances, so
+	// answer with the benign skip the recurring path records.
+	if holdsOnceCredentialDisabled(sched, err) {
+		skip := Skip{Reason: SkipCredentialDisabled}
+		if sched.Target == "issue" {
+			iid := sched.IssueIid.Int64
+			skip.IssueIID = &iid
+		}
+		return FireOutcome{Matched: 1, Skips: []Skip{skip}}, nil
 	}
 	return out, err
 }
@@ -622,6 +633,11 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 			continue
 		}
 		res, err := e.createIssueRun(ctx, sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL)
+		if holdsOnceCredentialDisabled(sched, err) {
+			// PRD #1732 D2: the schedule-wide pin is disabled, so every candidate would be
+			// refused the same way; a one-time sweep is held un-advanced (transient) and waits.
+			return FireOutcome{}, err
+		}
 		if err != nil {
 			// A permanent/transient repo error mid-sweep is unexpected (the repo just
 			// resolved); record it as fetch_failed and keep going rather than aborting the
@@ -735,6 +751,10 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 		return FireOutcome{Matched: 1, Skips: []Skip{{Title: title, Reason: SkipAlreadyRunning}}}, nil
 	case errors.Is(err, workersvc.ErrRepoNotFound):
 		return FireOutcome{}, workersvc.ErrRepoNotFound // permanent
+	case holdsOnceCredentialDisabled(sched, err):
+		// PRD #1732 D2: a one-time prompt schedule whose pin (or pinned harness) is disabled is
+		// held un-advanced (transient) so its run starts once the credential is back.
+		return FireOutcome{}, err
 	default:
 		// Review fix (PRD #1429): route through the shared classifier so a benign seam
 		// sentinel (e.g. ErrNoUsableCredential — D11 found neither harness usable) advances
@@ -833,6 +853,12 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 	// createIssueRun and turns any error into fetch_failed, so a once sweep keeps the
 	// benign already_running skip.
 	if errors.Is(err, workersvc.ErrBranchInUse) && sched.Target == "issue" && sched.Timing == "once" {
+		return FireOutcome{}, err
+	}
+	// PRD #1732 D2: a one-time schedule whose pin (or pinned harness) is disabled waits, held
+	// un-advanced like the #1626 exception above, instead of being consumed by the skip. For a
+	// sweep the pin is schedule-wide, so fireSweep returns this error for the whole fire.
+	if holdsOnceCredentialDisabled(sched, err) {
 		return FireOutcome{}, err
 	}
 	if reason, ok := skipReasonForErr(err); ok {

@@ -94,8 +94,12 @@ WHERE id = @id AND user_id = @user_id
           - budget_paused_seconds) > 0)
 RETURNING id, user_id, status;
 
--- An owner reassignment of an existing credential hold is all-or-nothing. A
--- refused budget/state guard must not leave a new override behind after a 409.
+-- An owner reassignment of an existing credential hold that can go straight back to the queue
+-- (no pending pause, budget left): the override and the promotion in one statement. The caller
+-- holds the user lock and the run row. On a held row this matches 0 rows only for a pending
+-- pause or a spent budget; the caller then writes the override and settles the hold into that
+-- pause or budget_exhausted, as the promoter does. The whole reassignment is one transaction,
+-- so a refusal leaves no override behind.
 -- name: ReassignCredentialDisabledRun :one
 UPDATE runs SET
     credential_override_mode = @mode,
@@ -216,6 +220,15 @@ SELECT EXISTS (
 -- whole parked interval, credential hold included, exactly once. The pause's unapplied
 -- steering inputs are settled so a resumed flight is never handed a stale pause, and the
 -- same requirement guards as the promotion apply.
+--
+-- The owner arm clears claim_released_at, so the owner's later ResumePausedRun keeps worker_id
+-- as resume affinity exactly as it does for an ordinary owner pause (SetRunPaused never sets
+-- it; D14 keeps the existing affinity rules). ResumePausedRun reads a set claim_released_at as
+-- a server park and drops the worker. The undelivered claim ParkCredentialDisabledRun fenced
+-- was never handed to a worker and its capability is already revoked (codex_cap_hash NULL);
+-- the next ClaimRun bumps claim_generation, and a paused row takes no running report. The wall
+-- arm keeps it: budget_exhausted keeps the server-park semantics (extend drops the worker).
+-- The caller serializes this with every requirement writer (user lock, then run row).
 -- name: SettleCredentialDisabledPause :one
 WITH settled_inputs AS (
     UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
@@ -226,6 +239,7 @@ WITH settled_inputs AS (
 )
 UPDATE runs SET
     hold_reason = CASE WHEN runs.pause_mode = 'wall' THEN 'budget_exhausted' ELSE NULL END,
+    claim_released_at = CASE WHEN runs.pause_mode = 'wall' THEN runs.claim_released_at ELSE NULL END,
     pause_requested_at = NULL,
     pause_mode = NULL,
     pause_after_count = NULL,
@@ -239,3 +253,35 @@ WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.codex_secret_id IS NOT DISTINCT FROM sqlc.narg('expected_codex_secret_id')::uuid
   AND runs.worker_id IS NOT DISTINCT FROM sqlc.narg('expected_worker_id')::uuid
 RETURNING runs.id, runs.status, runs.hold_reason;
+
+-- A held TIMED run whose requirement is met but whose active budget is already spent (no
+-- pending pause: SettleCredentialDisabledPause owns that case) cannot be promoted, since
+-- PromoteCredentialDisabledRun's budget guard refuses it, and must not stay on
+-- credential_disabled with nothing left to wait for. It settles into the budget_exhausted hold
+-- the wall park writes, so the owner's Extend (ExtendAndResumeWallPark) resumes it, the same
+-- place SettleCredentialDisabledPause's wall arm lands (PRD #1732 D14: the promoter never
+-- bypasses budget exhaustion). The status stays 'paused' and status_since is kept, so Extend
+-- measures the active time at the park and banks the whole parked interval. claim_released_at
+-- is kept (server-park semantics, like the wall arm). A hold_captured_head a resumed
+-- completion hold left behind is not a wall capture, so it is cleared, as ParkRunsAtWall does.
+-- The exemptions and the budget expression are exactly PromoteCredentialDisabledRun's, negated,
+-- so the two never both match. The same requirement guards apply.
+-- name: SettleCredentialDisabledSpentBudget :one
+UPDATE runs SET
+    hold_reason = 'budget_exhausted',
+    hold_captured_head = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND user_id = @user_id
+  AND status = 'paused' AND hold_reason = 'credential_disabled'
+  AND pause_requested_at IS NULL
+  AND credential_override_mode IS NOT DISTINCT FROM sqlc.narg('expected_override_mode')::text
+  AND credential_override_secret_id IS NOT DISTINCT FROM sqlc.narg('expected_override_secret_id')::uuid
+  AND codex_secret_id IS NOT DISTINCT FROM sqlc.narg('expected_codex_secret_id')::uuid
+  AND worker_id IS NOT DISTINCT FROM sqlc.narg('expected_worker_id')::uuid
+  AND kind NOT IN ('chat', 'judge') AND NOT interactive AND started_at IS NOT NULL
+  AND (COALESCE(budget_wall_seconds, @global_timeout_seconds::int)
+         + budget_extension_seconds + budget_finalize_seconds)
+      - (GREATEST(0, EXTRACT(EPOCH FROM (status_since - started_at))::int)
+         - budget_paused_seconds) <= 0
+RETURNING id, user_id, status;

@@ -476,8 +476,12 @@ type ReassignCredentialDisabledRunRow struct {
 	Status string    `json:"status"`
 }
 
-// An owner reassignment of an existing credential hold is all-or-nothing. A
-// refused budget/state guard must not leave a new override behind after a 409.
+// An owner reassignment of an existing credential hold that can go straight back to the queue
+// (no pending pause, budget left): the override and the promotion in one statement. The caller
+// holds the user lock and the run row. On a held row this matches 0 rows only for a pending
+// pause or a spent budget; the caller then writes the override and settles the hold into that
+// pause or budget_exhausted, as the promoter does. The whole reassignment is one transaction,
+// so a refusal leaves no override behind.
 func (q *Queries) ReassignCredentialDisabledRun(ctx context.Context, arg ReassignCredentialDisabledRunParams) (ReassignCredentialDisabledRunRow, error) {
 	row := q.db.QueryRow(ctx, reassignCredentialDisabledRun,
 		arg.Mode,
@@ -501,6 +505,7 @@ WITH settled_inputs AS (
 )
 UPDATE runs SET
     hold_reason = CASE WHEN runs.pause_mode = 'wall' THEN 'budget_exhausted' ELSE NULL END,
+    claim_released_at = CASE WHEN runs.pause_mode = 'wall' THEN runs.claim_released_at ELSE NULL END,
     pause_requested_at = NULL,
     pause_mode = NULL,
     pause_after_count = NULL,
@@ -545,6 +550,15 @@ type SettleCredentialDisabledPauseRow struct {
 // whole parked interval, credential hold included, exactly once. The pause's unapplied
 // steering inputs are settled so a resumed flight is never handed a stale pause, and the
 // same requirement guards as the promotion apply.
+//
+// The owner arm clears claim_released_at, so the owner's later ResumePausedRun keeps worker_id
+// as resume affinity exactly as it does for an ordinary owner pause (SetRunPaused never sets
+// it; D14 keeps the existing affinity rules). ResumePausedRun reads a set claim_released_at as
+// a server park and drops the worker. The undelivered claim ParkCredentialDisabledRun fenced
+// was never handed to a worker and its capability is already revoked (codex_cap_hash NULL);
+// the next ClaimRun bumps claim_generation, and a paused row takes no running report. The wall
+// arm keeps it: budget_exhausted keeps the server-park semantics (extend drops the worker).
+// The caller serializes this with every requirement writer (user lock, then run row).
 func (q *Queries) SettleCredentialDisabledPause(ctx context.Context, arg SettleCredentialDisabledPauseParams) (SettleCredentialDisabledPauseRow, error) {
 	row := q.db.QueryRow(ctx, settleCredentialDisabledPause,
 		arg.ID,
@@ -556,5 +570,69 @@ func (q *Queries) SettleCredentialDisabledPause(ctx context.Context, arg SettleC
 	)
 	var i SettleCredentialDisabledPauseRow
 	err := row.Scan(&i.ID, &i.Status, &i.HoldReason)
+	return i, err
+}
+
+const settleCredentialDisabledSpentBudget = `-- name: SettleCredentialDisabledSpentBudget :one
+UPDATE runs SET
+    hold_reason = 'budget_exhausted',
+    hold_captured_head = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = $1 AND user_id = $2
+  AND status = 'paused' AND hold_reason = 'credential_disabled'
+  AND pause_requested_at IS NULL
+  AND credential_override_mode IS NOT DISTINCT FROM $3::text
+  AND credential_override_secret_id IS NOT DISTINCT FROM $4::uuid
+  AND codex_secret_id IS NOT DISTINCT FROM $5::uuid
+  AND worker_id IS NOT DISTINCT FROM $6::uuid
+  AND kind NOT IN ('chat', 'judge') AND NOT interactive AND started_at IS NOT NULL
+  AND (COALESCE(budget_wall_seconds, $7::int)
+         + budget_extension_seconds + budget_finalize_seconds)
+      - (GREATEST(0, EXTRACT(EPOCH FROM (status_since - started_at))::int)
+         - budget_paused_seconds) <= 0
+RETURNING id, user_id, status
+`
+
+type SettleCredentialDisabledSpentBudgetParams struct {
+	ID                       uuid.UUID   `json:"id"`
+	UserID                   uuid.UUID   `json:"user_id"`
+	ExpectedOverrideMode     pgtype.Text `json:"expected_override_mode"`
+	ExpectedOverrideSecretID pgtype.UUID `json:"expected_override_secret_id"`
+	ExpectedCodexSecretID    pgtype.UUID `json:"expected_codex_secret_id"`
+	ExpectedWorkerID         pgtype.UUID `json:"expected_worker_id"`
+	GlobalTimeoutSeconds     int32       `json:"global_timeout_seconds"`
+}
+
+type SettleCredentialDisabledSpentBudgetRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
+// A held TIMED run whose requirement is met but whose active budget is already spent (no
+// pending pause: SettleCredentialDisabledPause owns that case) cannot be promoted, since
+// PromoteCredentialDisabledRun's budget guard refuses it, and must not stay on
+// credential_disabled with nothing left to wait for. It settles into the budget_exhausted hold
+// the wall park writes, so the owner's Extend (ExtendAndResumeWallPark) resumes it, the same
+// place SettleCredentialDisabledPause's wall arm lands (PRD #1732 D14: the promoter never
+// bypasses budget exhaustion). The status stays 'paused' and status_since is kept, so Extend
+// measures the active time at the park and banks the whole parked interval. claim_released_at
+// is kept (server-park semantics, like the wall arm). A hold_captured_head a resumed
+// completion hold left behind is not a wall capture, so it is cleared, as ParkRunsAtWall does.
+// The exemptions and the budget expression are exactly PromoteCredentialDisabledRun's, negated,
+// so the two never both match. The same requirement guards apply.
+func (q *Queries) SettleCredentialDisabledSpentBudget(ctx context.Context, arg SettleCredentialDisabledSpentBudgetParams) (SettleCredentialDisabledSpentBudgetRow, error) {
+	row := q.db.QueryRow(ctx, settleCredentialDisabledSpentBudget,
+		arg.ID,
+		arg.UserID,
+		arg.ExpectedOverrideMode,
+		arg.ExpectedOverrideSecretID,
+		arg.ExpectedCodexSecretID,
+		arg.ExpectedWorkerID,
+		arg.GlobalTimeoutSeconds,
+	)
+	var i SettleCredentialDisabledSpentBudgetRow
+	err := row.Scan(&i.ID, &i.UserID, &i.Status)
 	return i, err
 }

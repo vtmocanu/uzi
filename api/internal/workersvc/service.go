@@ -806,6 +806,11 @@ type Store interface {
 	ListCredentialDisabledUsers(ctx context.Context, arg store.ListCredentialDisabledUsersParams) ([]uuid.UUID, error)
 	PromoteCredentialDisabledRun(ctx context.Context, arg store.PromoteCredentialDisabledRunParams) (store.PromoteCredentialDisabledRunRow, error)
 	ReassignCredentialDisabledRun(ctx context.Context, arg store.ReassignCredentialDisabledRunParams) (store.ReassignCredentialDisabledRunRow, error)
+	// The held-run reassignment's locked re-read and the two settles it shares with the promoter
+	// (a pending pause, a spent budget); see reassignCredentialDisabledRun.
+	LockCredentialDisabledRunForPromotion(ctx context.Context, arg store.LockCredentialDisabledRunForPromotionParams) (store.LockCredentialDisabledRunForPromotionRow, error)
+	SettleCredentialDisabledPause(ctx context.Context, arg store.SettleCredentialDisabledPauseParams) (store.SettleCredentialDisabledPauseRow, error)
+	SettleCredentialDisabledSpentBudget(ctx context.Context, arg store.SettleCredentialDisabledSpentBudgetParams) (store.SettleCredentialDisabledSpentBudgetRow, error)
 	// ReleaseCredentialSwitch is the held-state credential-switch RELEASE transition (PRD
 	// #1247 M5, D3/D4/D14): a worker's {status:"credential_switch", claim_generation} report
 	// requeues the held run in ONE fenced statement — generation- and release-gated, banking
@@ -1172,6 +1177,9 @@ type Store interface {
 	// at judge-claim time, written by PUT /api/me/judge in one statement (D6).
 	GetUserJudgeAnthropicBinding(ctx context.Context, id uuid.UUID) (store.GetUserJudgeAnthropicBindingRow, error)
 	SetUserJudgeAnthropicBinding(ctx context.Context, arg store.SetUserJudgeAnthropicBindingParams) (store.User, error)
+	// The Judge opt-in, written in the same secret-mutation transaction as the binding
+	// (SetUserJudgeBinding) so a PUT that names a token is all-or-nothing.
+	SetUserJudgeEnabled(ctx context.Context, arg store.SetUserJudgeEnabledParams) (store.User, error)
 	// Per-harness worker-model lanes (PRD #1551 M4, D4): read at issue- and chat-run
 	// claim assembly, keyed on the run owner. The lane matching the already-frozen run
 	// harness replaces the legacy shared default_model; each lane NULL ⇒ inherit.
@@ -5253,7 +5261,13 @@ func (s *Service) SetWorkerAnthropicToken(ctx context.Context, userID, workerID 
 // Ownership is checked here so the caller gets a 404 rather than a constraint
 // violation; 00079's composite FK refuses the same binding independently, and is
 // the layer that holds if this check is ever bypassed (D11).
-func (s *Service) SetUserJudgeBinding(ctx context.Context, userID uuid.UUID, mode string, secretID *uuid.UUID) (store.User, error) {
+//
+// optIn, when non-nil, is the Judge opt-in (users.judge_enabled) the same PUT carries. It is
+// written in the SAME transaction, under the user's secret mutation lock and after the
+// ownership and D5 enablement checks, so a request naming a disabled (or foreign) token writes
+// neither half: a disable that commits first is seen by the locked check and refuses the whole
+// request, and one that commits later waits for this transaction (PRD #1732 D5).
+func (s *Service) SetUserJudgeBinding(ctx context.Context, userID uuid.UUID, mode string, secretID *uuid.UUID, optIn *bool) (store.User, error) {
 	if !ValidBindMode(mode) {
 		return store.User{}, ErrInvalidBindMode
 	}
@@ -5284,6 +5298,11 @@ func (s *Service) SetUserJudgeBinding(ctx context.Context, userID uuid.UUID, mod
 				return ErrCredentialDisabled
 			}
 			bind = pgconv.UUID(*secretID)
+		}
+		if optIn != nil {
+			if _, err := q.SetUserJudgeEnabled(ctx, store.SetUserJudgeEnabledParams{ID: userID, JudgeEnabled: *optIn}); err != nil {
+				return err
+			}
 		}
 		var err error
 		user, err = q.SetUserJudgeAnthropicBinding(ctx, store.SetUserJudgeAnthropicBindingParams{

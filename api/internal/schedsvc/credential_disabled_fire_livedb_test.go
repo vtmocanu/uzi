@@ -90,3 +90,60 @@ func TestScheduleFireCredentialDisabledSkipsLiveDB(t *testing.T) {
 		})
 	}
 }
+
+// TestScheduleFireOnceCredentialDisabledHoldsLiveDB (PRD #1732 D2): a due ONE-TIME prompt
+// schedule whose stored pin is disabled is held through Boot's real tick: still active, still
+// due at the same next_fire_at, no last_fire and no run. Once the owner enables the pin, the
+// next tick fires it and marks it fired. A recurring row keeps the advancing skip (above).
+//
+// MUTATION: drop firePrompt's holdsOnceCredentialDisabled arm; the once row then records the
+// benign skip and is marked fired with no run, and this test fails.
+func TestScheduleFireOnceCredentialDisabledHoldsLiveDB(t *testing.T) {
+	ctx, pool, q, box := openScheduleFireLiveDB(t)
+	userID, repoID := scheduleFireUser(ctx, t, pool)
+	runs := workersvc.New(q, box, workersvc.Params{})
+	runs.SetTxBeginner(pool)
+	sched := New(q, runs, nil, nil, nil, nil, time.Minute, nil)
+	scID := uuid.New()
+	due := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	insertRecurringPromptSchedule(ctx, t, pool, scID, userID, repoID, due)
+	if _, err := pool.Exec(ctx, `INSERT INTO user_secrets (id, user_id, kind, label, is_default, ciphertext, sealed_with)
+	          VALUES ($1, $2, 'anthropic_token', 'def', true, $3, 'master')`, uuid.New(), userID, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	pin := seedDisabledAnthropicToken(ctx, t, pool, userID, false)
+	if _, err := pool.Exec(ctx, `UPDATE run_schedules SET timing = 'once', cron_expr = NULL, run_at = $2,
+	          credential_override_mode = 'pinned', credential_override_secret_id = $3 WHERE id = $1`, scID, due, pin); err != nil {
+		t.Fatal(err)
+	}
+
+	sched.Boot(ctx)
+
+	got, err := q.GetRunSchedule(ctx, scID)
+	if err != nil {
+		t.Fatalf("GetRunSchedule: %v", err)
+	}
+	if got.Status != "active" || !got.NextFireAt.Valid || !got.NextFireAt.Time.Equal(due) || len(got.LastFire) != 0 {
+		t.Fatalf("held once row: status=%q next_fire_at=%+v last_fire=%s, want active, still due at %v, no last_fire",
+			got.Status, got.NextFireAt, got.LastFire, due)
+	}
+	if n := countPromptRunsForSchedule(ctx, t, pool, scID); n != 0 {
+		t.Fatalf("runs created = %d, want 0 while the pin is disabled", n)
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE user_secrets SET disabled_at = NULL, enablement_rev = enablement_rev + 1 WHERE id = $1`, pin); err != nil {
+		t.Fatal(err)
+	}
+	sched.Boot(ctx)
+
+	got, err = q.GetRunSchedule(ctx, scID)
+	if err != nil {
+		t.Fatalf("GetRunSchedule: %v", err)
+	}
+	if got.Status != "fired" || got.NextFireAt.Valid {
+		t.Fatalf("after enable: status=%q next_fire_at=%+v, want fired with no next fire", got.Status, got.NextFireAt)
+	}
+	if n := countPromptRunsForSchedule(ctx, t, pool, scID); n != 1 {
+		t.Fatalf("runs created after enable = %d, want 1", n)
+	}
+}

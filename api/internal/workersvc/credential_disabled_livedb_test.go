@@ -213,11 +213,20 @@ func TestCodexClaimCredentialDisabledCustodyLiveDB(t *testing.T) {
 	env.exec(`UPDATE user_secrets SET disabled_at = NULL WHERE id = $1`, fx.aliasID)
 	fx.svc.SetBackground(func(fn func()) { fn() })
 	// The fixture's wall (started three hours ago, global two-hour budget) is spent: the
-	// promoter never bypasses budget exhaustion, even with the alias enabled again.
+	// promoter never bypasses budget exhaustion, even with the alias enabled again. It settles
+	// the hold into budget_exhausted instead of leaving it on credential_disabled.
 	fx.svc.RequestCredentialDisabledPromotion(fx.userID)
-	assertHeld(t, env, fx.runID, true)
-	env.exec(`UPDATE runs SET budget_wall_seconds = 36000 WHERE id = $1`, fx.runID)
-	fx.svc.RequestCredentialDisabledPromotion(fx.userID)
+	if r := mustRun(t, env, fx.runID); r.Status != "paused" || r.HoldReason.String != "budget_exhausted" {
+		t.Fatalf("spent budget: status=%s hold=%v, want paused on budget_exhausted", r.Status, r.HoldReason)
+	}
+	assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
+	// The owner's Extend resumes it; the earlier generation's retained custody survives.
+	if _, err := env.q.ExtendAndResumeWallPark(env.ctx, store.ExtendAndResumeWallParkParams{
+		Secs: 3600, GlobalTimeoutSeconds: int32(testParams().RunTimeout.Seconds()),
+		ID: fx.runID, UserID: fx.userID, Cap: 86400,
+	}); err != nil {
+		t.Fatalf("ExtendAndResumeWallPark: %v", err)
+	}
 	assertHeld(t, env, fx.runID, false)
 	assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
 }
@@ -404,7 +413,7 @@ func TestCredentialPromoterTriggersLiveDB(t *testing.T) {
 	fx.env.exec(`UPDATE users SET judge_anthropic_bind_mode = 'pinned', judge_anthropic_secret_id = $2 WHERE id = $1`, fx.userID, fx.pinTok)
 	judgeRun := fx.parkedRun(t, "self_improve")
 	before = fx.requests
-	if _, err := fx.svc.SetUserJudgeBinding(fx.env.ctx, fx.userID, BindModePinned, &fx.otherTok); err != nil {
+	if _, err := fx.svc.SetUserJudgeBinding(fx.env.ctx, fx.userID, BindModePinned, &fx.otherTok, nil); err != nil {
 		t.Fatalf("SetUserJudgeBinding: %v", err)
 	}
 	if fx.requests != before+1 {

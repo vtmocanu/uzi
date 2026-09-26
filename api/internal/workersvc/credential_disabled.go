@@ -174,8 +174,8 @@ func (s *Service) promoteAllCredentialDisabledRuns(ctx context.Context) (int64, 
 }
 
 // promoteCredentialDisabledRuns pages one owner's held runs oldest first and tries each in its
-// own transaction. A run that stays held (requirement still disabled, owner pause, spent
-// budget) is skipped by the keyset cursor, so one blocked run never starves the rest. A
+// own transaction. A run that stays held (requirement still disabled) is skipped by the keyset
+// cursor, so one blocked run never starves the rest. A
 // candidate whose transaction errors is logged and skipped the same way; the pass carries on
 // with the owner's other runs and returns the joined candidate errors with the promoted count.
 // Only a worklist read error stops the pass.
@@ -219,8 +219,8 @@ func (s *Service) promoteCredentialDisabledRuns(ctx context.Context, userID uuid
 
 // promoteCredentialDisabledRun is one candidate's transaction, in the fixed lock order above.
 // It returns the status the run left the hold in: "queued" when it was promoted, "paused" when
-// its requirement is met but a pending pause request settled it into that pause instead, or ""
-// when it stays held (or is no longer this hold).
+// its requirement is met but a pending pause request or a spent budget settled it into a pause
+// instead (releaseCredentialDisabledHold), or "" when it stays held (or is no longer this hold).
 func (s *Service) promoteCredentialDisabledRun(ctx context.Context, userID, runID uuid.UUID) (string, error) {
 	tx, err := s.txBeginner.Begin(ctx)
 	if err != nil {
@@ -254,38 +254,142 @@ func (s *Service) promoteCredentialDisabledRun(ctx context.Context, userID, runI
 			return "", err
 		}
 	}
-	status := "queued"
-	if run.PauseRequestedAt.Valid {
-		// A pending pause request rode the requeue into this claim (a worker that died after
-		// CreatePauseInput or RequestWallParks is requeued with the request intact, by design).
-		// The promoter never bypasses it (D14): the request is consumed into the pause it asked
-		// for, never promoted past and never left stranded on a hold nothing else releases.
-		_, err = q.SettleCredentialDisabledPause(ctx, store.SettleCredentialDisabledPauseParams{
-			ID: runID, UserID: userID,
-			ExpectedOverrideMode:     run.CredentialOverrideMode,
-			ExpectedOverrideSecretID: run.CredentialOverrideSecretID,
-			ExpectedCodexSecretID:    run.CodexSecretID,
-			ExpectedWorkerID:         run.WorkerID,
-		})
-		status = "paused"
-	} else {
-		_, err = q.PromoteCredentialDisabledRun(ctx, store.PromoteCredentialDisabledRunParams{
-			ID: runID, UserID: userID,
-			ExpectedOverrideMode:     run.CredentialOverrideMode,
-			ExpectedOverrideSecretID: run.CredentialOverrideSecretID,
-			ExpectedCodexSecretID:    run.CodexSecretID,
-			ExpectedWorkerID:         run.WorkerID,
-			GlobalTimeoutSeconds:     int32(s.p.RunTimeout.Seconds()),
-		})
-	}
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", nil // spent budget, or a guard saw a changed requirement
-	}
-	if err != nil {
+	status, err := releaseCredentialDisabledHold(ctx, q, run, int32(s.p.RunTimeout.Seconds()))
+	if err != nil || status == "" {
 		return "", err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return "", err
+	}
+	return status, nil
+}
+
+// credentialHoldReleaser is the statement surface that moves a locked, requirement-met held run
+// out of credential_disabled. Both the promoter's transaction and a held-run reassignment use it.
+type credentialHoldReleaser interface {
+	PromoteCredentialDisabledRun(ctx context.Context, arg store.PromoteCredentialDisabledRunParams) (store.PromoteCredentialDisabledRunRow, error)
+	SettleCredentialDisabledPause(ctx context.Context, arg store.SettleCredentialDisabledPauseParams) (store.SettleCredentialDisabledPauseRow, error)
+	SettleCredentialDisabledSpentBudget(ctx context.Context, arg store.SettleCredentialDisabledSpentBudgetParams) (store.SettleCredentialDisabledSpentBudgetRow, error)
+}
+
+// releaseCredentialDisabledHold moves a held run whose requirement is met out of the hold, in
+// the caller's transaction, after the caller took the user lock and the run row (run is that
+// locked read, with any override the caller just wrote). It never bypasses what else stands in
+// the run's way (D14):
+//
+//   - a pending pause request (a worker that died after CreatePauseInput or RequestWallParks is
+//     requeued with the request intact, by design) is consumed into the pause it asked for:
+//     an owner request into the ordinary owner pause, a wall request into budget_exhausted;
+//   - a timed run with budget left is promoted to queued;
+//   - a timed run whose budget is spent settles into budget_exhausted, which the owner's
+//     Extend resumes, instead of staying held with nothing left to wait for.
+//
+// It returns the status the run left the hold in ("queued" or "paused"), or "" when every
+// guarded statement matched 0 rows (the requirement columns changed under a writer outside
+// the caller's locks). An error means the caller must roll back.
+func releaseCredentialDisabledHold(ctx context.Context, q credentialHoldReleaser, run store.LockCredentialDisabledRunForPromotionRow, globalTimeoutSeconds int32) (string, error) {
+	status, err := "paused", error(nil)
+	if run.PauseRequestedAt.Valid {
+		_, err = q.SettleCredentialDisabledPause(ctx, store.SettleCredentialDisabledPauseParams{
+			ID: run.ID, UserID: run.UserID,
+			ExpectedOverrideMode:     run.CredentialOverrideMode,
+			ExpectedOverrideSecretID: run.CredentialOverrideSecretID,
+			ExpectedCodexSecretID:    run.CodexSecretID,
+			ExpectedWorkerID:         run.WorkerID,
+		})
+	} else {
+		_, err = q.PromoteCredentialDisabledRun(ctx, store.PromoteCredentialDisabledRunParams{
+			ID: run.ID, UserID: run.UserID,
+			ExpectedOverrideMode:     run.CredentialOverrideMode,
+			ExpectedOverrideSecretID: run.CredentialOverrideSecretID,
+			ExpectedCodexSecretID:    run.CodexSecretID,
+			ExpectedWorkerID:         run.WorkerID,
+			GlobalTimeoutSeconds:     globalTimeoutSeconds,
+		})
+		status = "queued"
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The promote's budget guard (or a changed requirement) refused it. A spent budget
+			// settles into budget_exhausted; a changed requirement matches 0 rows here too.
+			_, err = q.SettleCredentialDisabledSpentBudget(ctx, store.SettleCredentialDisabledSpentBudgetParams{
+				ID: run.ID, UserID: run.UserID,
+				ExpectedOverrideMode:     run.CredentialOverrideMode,
+				ExpectedOverrideSecretID: run.CredentialOverrideSecretID,
+				ExpectedCodexSecretID:    run.CodexSecretID,
+				ExpectedWorkerID:         run.WorkerID,
+				GlobalTimeoutSeconds:     globalTimeoutSeconds,
+			})
+			status = "paused"
+		}
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return status, nil
+}
+
+// reassignCredentialDisabledRun is `uzi run set-token` on a run held on credential_disabled
+// (PRD #1732 D2/D14): it writes the owner's new override and moves the run out of the hold in
+// one transaction, in the promoter's lock order (the user's secret mutation lock, then the run
+// row), so it and a concurrent promotion serialize and exactly one moves the run. A run with
+// budget left and no pending pause is queued; one with a pending pause lands in that pause, and
+// one whose budget is spent in budget_exhausted, as the promoter would settle it, with the new
+// override written either way. It returns the status the run left the hold in, or
+// ErrCredentialSwitchRaced (nothing written) when the run is no longer held.
+//
+// The new credential was validated before this transaction (validateCredentialOverride reads
+// outside the lock); a disable racing that read is caught by the claim-time park, which holds
+// the run again before any delivery.
+func (s *Service) reassignCredentialDisabledRun(ctx context.Context, userID, runID uuid.UUID, resolved *CredentialOverride) (string, error) {
+	var status string
+	err := s.withSecretMutation(ctx, userID, func(q secretMutationQueries) error {
+		run, err := q.LockCredentialDisabledRunForPromotion(ctx, store.LockCredentialDisabledRunForPromotionParams{ID: runID, UserID: userID})
+		if err != nil {
+			return err // pgx.ErrNoRows: gone
+		}
+		if run.Status != "paused" || !run.HoldReason.Valid || run.HoldReason.String != "credential_disabled" {
+			return pgx.ErrNoRows // no longer this hold
+		}
+		mode, secretID := pgOverrideMode(resolved), pgOverrideSecretID(resolved)
+		timeout := int32(s.p.RunTimeout.Seconds())
+		if !run.PauseRequestedAt.Valid {
+			_, err := q.ReassignCredentialDisabledRun(ctx, store.ReassignCredentialDisabledRunParams{
+				ID: runID, UserID: userID, Mode: mode, SecretID: secretID, GlobalTimeoutSeconds: timeout,
+			})
+			if err == nil {
+				status = "queued"
+				return nil
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+			// Held, locked, no pending pause: only the spent budget refused it. Settle below.
+		}
+		n, err := q.SetRunCredentialOverride(ctx, store.SetRunCredentialOverrideParams{
+			Mode: mode, SecretID: secretID, ID: runID, UserID: userID,
+		})
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return pgx.ErrNoRows
+		}
+		run.CredentialOverrideMode, run.CredentialOverrideSecretID = mode, secretID
+		if status, err = releaseCredentialDisabledHold(ctx, q, run, timeout); err != nil {
+			return err
+		}
+		if status == "" {
+			return pgx.ErrNoRows // rolls the override back
+		}
+		return nil
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrCredentialSwitchRaced
+	}
+	if err != nil {
+		return "", fmt.Errorf("reassign credential-disabled run: %w", err)
 	}
 	return status, nil
 }
@@ -433,13 +537,17 @@ func noAnthropicTokenAtAll(ctx context.Context, q *store.Queries, userID uuid.UU
 }
 
 // secretMutationQueries is the statement surface of the requirement writers that share the
-// promoter's lock order: the worker and Judge rebinds and the per-run reassignment of a held
-// run. Both the Store and a transaction-bound *store.Queries satisfy it.
+// promoter's lock order: the worker rebind, the Judge opt-in and rebind, and the per-run
+// reassignment of a held run. Both the Store and a transaction-bound *store.Queries satisfy it.
 type secretMutationQueries interface {
 	GetUserSecretCiphertextByID(ctx context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error)
 	SetWorkerAnthropicSecret(ctx context.Context, arg store.SetWorkerAnthropicSecretParams) (store.Worker, error)
 	SetUserJudgeAnthropicBinding(ctx context.Context, arg store.SetUserJudgeAnthropicBindingParams) (store.User, error)
+	SetUserJudgeEnabled(ctx context.Context, arg store.SetUserJudgeEnabledParams) (store.User, error)
+	LockCredentialDisabledRunForPromotion(ctx context.Context, arg store.LockCredentialDisabledRunForPromotionParams) (store.LockCredentialDisabledRunForPromotionRow, error)
+	SetRunCredentialOverride(ctx context.Context, arg store.SetRunCredentialOverrideParams) (int64, error)
 	ReassignCredentialDisabledRun(ctx context.Context, arg store.ReassignCredentialDisabledRunParams) (store.ReassignCredentialDisabledRunRow, error)
+	credentialHoldReleaser
 }
 
 // withSecretMutation runs fn in one transaction whose first statement is the user's secret

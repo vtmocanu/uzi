@@ -128,21 +128,24 @@ func TestSetRunCredentialParkedStatesPromoteLiveDB(t *testing.T) {
 }
 
 // TestSetRunCredentialDisabledHoldReassignmentLiveDB proves the owner-facing
-// transition is atomic: success promotes and a budget refusal writes no override.
+// transition is atomic: an available budget promotes to the queue, while a spent
+// budget or a pending owner pause settles the hold (budget_exhausted, or the owner
+// pause) exactly as the promoter would; every case writes the new override.
 func TestSetRunCredentialDisabledHoldReassignmentLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := New(env.q, env.box, testParams())
 	svc.SetTxBeginner(env.pool)
 	o := seedReevalOwner(t, env, BindModeAuto, false)
 	for i, tc := range []struct {
-		name        string
-		budget      int
-		ownerPause  bool
-		wantSuccess bool
+		name       string
+		budget     int
+		ownerPause bool
+		wantStatus string
+		wantHold   string
 	}{
-		{"available budget", 3600, false, true},
-		{"exhausted budget", 10, false, false},
-		{"pending owner pause", 3600, true, false},
+		{"available budget", 3600, false, "queued", ""},
+		{"exhausted budget", 10, false, "paused", "budget_exhausted"},
+		{"pending owner pause", 3600, true, "paused", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			runID := seedRunInStatus(t, env, o, int64(4450+i), "paused", time.Now().UTC())
@@ -152,25 +155,27 @@ func TestSetRunCredentialDisabledHoldReassignmentLiveDB(t *testing.T) {
 				env.exec(`UPDATE runs SET pause_requested_at=now(), pause_mode='now' WHERE id=$1`, runID)
 			}
 			res, err := svc.SetRunCredential(env.ctx, o.userID, runID, CredentialOverrideModePinned, &o.altTok)
-			if tc.wantSuccess {
-				if err != nil || res.Run.Status != "queued" ||
-					res.Run.CredentialOverrideMode.String != CredentialOverrideModePinned ||
-					!res.Run.CredentialOverrideSecretID.Valid ||
-					uuid.UUID(res.Run.CredentialOverrideSecretID.Bytes) != o.altTok {
-					t.Fatalf("reassignment: run=%+v err=%v", res.Run, err)
-				}
+			if err != nil {
+				t.Fatalf("reassignment: %v (want the hold promoted or settled, never ErrCredentialSwitchRaced)", err)
+			}
+			stored := mustRun(t, env, runID)
+			if res.Run.Status != stored.Status || stored.Status != tc.wantStatus || stored.HoldReason.String != tc.wantHold {
+				t.Fatalf("status=%s (result %s) hold=%q, want %s hold=%q",
+					stored.Status, res.Run.Status, stored.HoldReason.String, tc.wantStatus, tc.wantHold)
+			}
+			if stored.CredentialOverrideMode.String != CredentialOverrideModePinned ||
+				!stored.CredentialOverrideSecretID.Valid ||
+				uuid.UUID(stored.CredentialOverrideSecretID.Bytes) != o.altTok {
+				t.Fatalf("override = %v/%v, want pinned %s", stored.CredentialOverrideMode, stored.CredentialOverrideSecretID, o.altTok)
+			}
+			if stored.PauseRequestedAt.Valid || stored.PauseMode.Valid {
+				t.Fatalf("pending pause left behind: at=%v mode=%v", stored.PauseRequestedAt, stored.PauseMode)
+			}
+			if tc.wantStatus == "queued" {
 				var resumes int
 				if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind='resume'`, runID).Scan(&resumes); err != nil || resumes != 1 {
 					t.Fatalf("resume audit: count=%d err=%v", resumes, err)
 				}
-				return
-			}
-			if !errors.Is(err, ErrCredentialSwitchRaced) {
-				t.Fatalf("exhausted reassignment: err=%v, want refusal", err)
-			}
-			stored := mustRun(t, env, runID)
-			if stored.Status != "paused" || stored.CredentialOverrideMode.Valid || stored.CredentialOverrideSecretID.Valid {
-				t.Fatalf("refusal changed run: status=%s override=%v/%v", stored.Status, stored.CredentialOverrideMode, stored.CredentialOverrideSecretID)
 			}
 		})
 	}

@@ -270,6 +270,8 @@ func TestCredentialPromoterPanicDoesNotWedgeOwnerLiveDB(t *testing.T) {
 //
 // MUTATION: drop the promoter's SettleCredentialDisabledPause branch; the run then stays held on
 // credential_disabled forever (PromoteCredentialDisabledRun refuses a pending pause).
+// MUTATION: keep claim_released_at in SettleCredentialDisabledPause's owner arm; the owner's
+// resume then drops worker_id (a server-park resume) and this test fails.
 func TestCredentialDisabledPendingPauseConvergesLiveDB(t *testing.T) {
 	for _, tc := range []struct {
 		mode, wantHold string
@@ -333,8 +335,13 @@ func TestCredentialDisabledPendingPauseConvergesLiveDB(t *testing.T) {
 			}); err != nil {
 				t.Fatalf("ResumePausedRun: %v", err)
 			}
-			if r := mustRun(t, fx.env, runID); r.Status != "queued" || r.BudgetPausedSeconds < 600 {
-				t.Fatalf("resumed: status=%s banked=%ds, want queued with the held interval banked", r.Status, r.BudgetPausedSeconds)
+			// D14 keeps the existing affinity rules: like any owner pause, the resume keeps the
+			// worker (the settle cleared the undelivered claim's claim_released_at, which
+			// ResumePausedRun would otherwise read as a server park and drop the worker for).
+			if r := mustRun(t, fx.env, runID); r.Status != "queued" || r.BudgetPausedSeconds < 600 ||
+				r.WorkerID != pgconv.UUID(fx.workerID) {
+				t.Fatalf("resumed: status=%s banked=%ds worker=%v, want queued with the held interval banked on worker %s",
+					r.Status, r.BudgetPausedSeconds, r.WorkerID, fx.workerID)
 			}
 		})
 	}
