@@ -6,6 +6,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 
 import {
   CodexExecutor,
@@ -24,10 +25,13 @@ import {
   COMMAND_CAPTURE_KILLED_CODE,
   commandSandboxArgv,
   HeldRunCommandCache,
+  canonicalCheckoutPath,
+  withCommandGitTrust,
   type CodexExecutorDeps,
   type CodexCommittedGenerationCell,
 } from "../src/codex/codex-executor.js";
 import { WORKER_UID, RUNNER_UID } from "../src/runner-uid.js";
+import { gitEnv } from "../src/git.js";
 import { forgeToolNames } from "../src/forge-tools.js";
 import { memoryToolNames } from "../src/memory-tools.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
@@ -1473,8 +1477,22 @@ describe("CodexExecutor: credential bridge + isolation", () => {
     const env = spawn0.env;
     // No packages provisioned in this rig (the real provisionRunTools is a no-op with no
     // config.tool_packages), so the command env is exactly the fixed scrubbed keys — no
-    // folded nix vars, and the PATH is the fixed toolchain+system boundary (item 6).
-    assert.deepEqual(Object.keys(env).sort(), ["HOME", "LANG", "PATH", "TMPDIR"], "exactly the scrubbed keys");
+    // folded nix vars, and the PATH is the fixed toolchain+system boundary (item 6). Issue
+    // #1716 adds the worker's two-pair git trust: reset safe.directory, then trust only the
+    // checkout. WORKSPACE does not exist, so the canonical path is the ENOENT fallback.
+    assert.deepEqual(
+      Object.keys(env).sort(),
+      [
+        "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_VALUE_1",
+        "HOME", "LANG", "PATH", "TMPDIR",
+      ],
+      "exactly the scrubbed keys",
+    );
+    assert.equal(env.GIT_CONFIG_COUNT, "2");
+    assert.equal(env.GIT_CONFIG_KEY_0, "safe.directory");
+    assert.equal(env.GIT_CONFIG_VALUE_0, "", "pair 0 resets every inherited safe.directory entry");
+    assert.equal(env.GIT_CONFIG_KEY_1, "safe.directory");
+    assert.equal(env.GIT_CONFIG_VALUE_1, path.resolve(WORKSPACE), "pair 1 trusts only the run's checkout");
     assert.equal(env.PATH, "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/uzi-toolchain/bin");
     assert.equal(env.LANG, "C");
     assert.match(String(env.HOME), /^\/tmp\/uzi-codex-command-/);
@@ -4397,6 +4415,196 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
 // Issue #1495 m1 — Codex provisioning targets the SHARED worker-lifetime HOME (PRD #42
 // Decision 5), never the per-run codex home, and run() initializes a FRESH per-run HOME
 // before anything (a devbox/nix subprocess) can materialize it with the wrong gid.
+// Issue #1716: a Codex command runs as runner-cmd against the runner-owned checkout, so REAL git
+// takes its ownership branch. GIT_TEST_ASSUME_DIFFERENT_OWNER=1 is git's own knob that makes it
+// treat every repo as foreign-owned while still consulting safe.directory, so this tier proves
+// the git ownership branch plus the production env composition ONLY. It does NOT prove real UID
+// permissions or the supervisor/Landlock posture (the opt-in docker fixture does).
+describe("CodexExecutor: command git trust (issue #1716)", () => {
+  const DUBIOUS = /detected dubious ownership/;
+
+  const IDENTITY = {
+    GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid",
+    GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid",
+  };
+
+  async function resolveGit(): Promise<string> {
+    for (const dir of (process.env.PATH ?? "").split(":")) {
+      if (!dir) continue;
+      const candidate = path.join(dir, "git");
+      try {
+        await fs.access(candidate, fs.constants.X_OK);
+        return candidate;
+      } catch { /* next */ }
+    }
+    throw new Error("git is not on PATH");
+  }
+
+  /** A fresh repo with one commit, created with an isolated config so the host's never leaks in. */
+  async function initRepo(gitBin: string, dir: string, home: string): Promise<void> {
+    await fs.mkdir(path.join(dir, "sub"), { recursive: true });
+    await fs.writeFile(path.join(dir, "sub", "file.txt"), "one\n");
+    const env = {
+      PATH: path.dirname(gitBin), HOME: home, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
+      ...IDENTITY,
+    };
+    for (const args of [["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "init"]]) {
+      const r = spawnSync(gitBin, ["-C", dir, ...args], { env, encoding: "utf8" });
+      assert.equal(r.status, 0, `setup git ${args.join(" ")}: ${r.stderr}`);
+    }
+  }
+
+  /** The env a command root is launched with, captured from a real executor run whose
+   *  worktree is `worktreePath`: the fileop root's launch spec (commandEffectSpec over run()'s
+   *  commandEnv) and the env the command seam receives. */
+  async function productionEnvs(worktreePath: string, toolEnv: Record<string, string>): Promise<{ fileop: NodeJS.ProcessEnv; command: NodeJS.ProcessEnv }> {
+    const rig = makeRig();
+    rig.deps = { ...rig.deps, provisionRunTools: async () => ({ toolEnv }) };
+    rig.transport.push(threadStarted())
+      .push(toolCall(1, "Bash", { command: "git status" }, "th-1", "tn-1", "c-git"))
+      .push(signalDone()).push(turnCompleted("completed")).end();
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx({ worktreePath }).ctx), 3000, "trust capture run");
+    assert.equal(rig.fileopSpawns.length, 1);
+    assert.equal(rig.spawnCommandCalls.length, 1, "the Bash effect reached the command seam");
+    return {
+      fileop: rig.fileopSpawns[0]!.env,
+      command: (rig.spawnCommandCalls[0]!.opts as { env: NodeJS.ProcessEnv }).env,
+    };
+  }
+
+  const gitKeys = (env: NodeJS.ProcessEnv): Record<string, string | undefined> =>
+    Object.fromEntries(Object.entries(env).filter(([k]) => k.startsWith("GIT_CONFIG")));
+
+  /** Run as a command would: the launched env with HOME/TMPDIR pointed at a real private tmp
+   *  (commandEffectSpec's per-command private tmp), plus the ownership knob and an identity. */
+  function asCommand(env: NodeJS.ProcessEnv, home: string): NodeJS.ProcessEnv {
+    return { ...env, HOME: home, TMPDIR: home, GIT_TEST_ASSUME_DIFFERENT_OWNER: "1", ...IDENTITY };
+  }
+
+  function git(gitBin: string, env: NodeJS.ProcessEnv, args: string[], cwd?: string): { status: number | null; stderr: string } {
+    const r = spawnSync(gitBin, args, { env, cwd, encoding: "utf8" });
+    return { status: r.status, stderr: r.stderr };
+  }
+
+  it("trusts only the run's checkout: A works (incl. a nested child), B and a HOME `*` stay rejected, hostile toolEnv git config is dropped", async () => {
+    const gitBin = await resolveGit();
+    const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "uzi-1716-")));
+    try {
+      const home = path.join(base, "home");
+      await fs.mkdir(home);
+      const repoA = path.join(base, "A");
+      const repoB = path.join(base, "B");
+      await initRepo(gitBin, repoA, home);
+      await initRepo(gitBin, repoB, home);
+
+      // Defence in depth (unreachable today: provision.ts PROVISION_ENV_ALLOWLIST is only PATH,
+      // NIX_SSL_CERT_FILE, LOCALE_ARCHIVE): a provisioned toolEnv carrying git config is dropped.
+      const toolEnv = {
+        PATH: path.dirname(gitBin),
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "safe.directory",
+        GIT_CONFIG_VALUE_0: "*",
+        GIT_CONFIG_PARAMETERS: "'safe.directory'='*'",
+      };
+      const { fileop, command } = await productionEnvs(repoA, toolEnv);
+
+      // MANDATORY negative control: the base env (buildCommandEnv only, no trust) is rejected,
+      // so the knob really drives the ownership branch here. GIT_CONFIG_NOSYSTEM isolates the
+      // control from a host system config; the positive checks below do not need it.
+      const noTrust = { ...asCommand(buildCommandEnv("/unused", { PATH: path.dirname(gitBin) }), home), GIT_CONFIG_NOSYSTEM: "1" };
+      const control = git(gitBin, noTrust, ["-C", repoA, "status"]);
+      assert.notEqual(control.status, 0, "no trust: git refuses the foreign-owned checkout");
+      assert.match(control.stderr, DUBIOUS);
+
+      const env = asCommand(fileop, home);
+      for (const args of [["status"], ["log", "--oneline", "-1"], ["diff"]]) {
+        const r = git(gitBin, env, ["-C", repoA, ...args]);
+        assert.equal(r.status, 0, `git ${args.join(" ")} in A: ${r.stderr}`);
+      }
+      await fs.writeFile(path.join(repoA, "sub", "file.txt"), "two\n");
+      assert.equal(git(gitBin, env, ["-C", repoA, "add", "-A"]).status, 0, "git add in A");
+      const commit = git(gitBin, env, ["-C", repoA, "commit", "-q", "-m", "change"]);
+      assert.equal(commit.status, 0, `git commit in A: ${commit.stderr}`);
+
+      // A local subprocess of the command inherits the trust through its process env.
+      const nested = spawnSync("/bin/sh", ["-c", "git -C \"$1\" status --porcelain && git -C \"$1\" log --oneline -1", "sh", repoA], { env, encoding: "utf8" });
+      assert.equal(nested.status, 0, `nested git in A: ${nested.stderr}`);
+
+      const other = git(gitBin, env, ["-C", repoB, "status"]);
+      assert.notEqual(other.status, 0, "B is not trusted");
+      assert.match(other.stderr, DUBIOUS);
+
+      // A `*` in the command HOME's global config is reset by pair 0.
+      await fs.writeFile(path.join(home, ".gitconfig"), "[safe]\n\tdirectory = *\n");
+      const starControl = git(gitBin, noTrust, ["-C", repoB, "status"]);
+      assert.equal(starControl.status, 0, `the HOME \`*\` is effective without the reset: ${starControl.stderr}`);
+      const star = git(gitBin, env, ["-C", repoB, "status"]);
+      assert.notEqual(star.status, 0, "the reset clears the HOME `*`");
+      assert.match(star.stderr, DUBIOUS);
+      assert.equal(git(gitBin, env, ["-C", repoA, "status"]).status, 0, "A still works with a HOME `*` present");
+
+      // The exact composition (after the behavioural checks, so a missing trust reds on git).
+      const expected = {
+        GIT_CONFIG_COUNT: "2",
+        GIT_CONFIG_KEY_0: "safe.directory",
+        GIT_CONFIG_VALUE_0: "",
+        GIT_CONFIG_KEY_1: "safe.directory",
+        GIT_CONFIG_VALUE_1: repoA,
+      };
+      assert.deepEqual(gitKeys(fileop), expected, "the fileop root carries exactly the worker trust");
+      assert.deepEqual(gitKeys(command), expected, "the command seam carries exactly the worker trust");
+      // An incoming GIT_CONFIG_PARAMETERS on the env itself is also stripped by the composition.
+      assert.deepEqual(gitKeys(withCommandGitTrust({ ...command, GIT_CONFIG_PARAMETERS: "'safe.directory'='*'" }, repoA)), expected);
+    } finally {
+      await fs.rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("names the realpath of a checkout reached through a symlinked ancestor, and git accepts it via either spelling", async () => {
+    const gitBin = await resolveGit();
+    const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "uzi-1716-")));
+    try {
+      const home = path.join(base, "home");
+      await fs.mkdir(home);
+      const realA = path.join(base, "real", "A");
+      const repoB = path.join(base, "B");
+      await initRepo(gitBin, realA, home);
+      await initRepo(gitBin, repoB, home);
+      await fs.symlink(path.join(base, "real"), path.join(base, "link"));
+      const linkA = path.join(base, "link", "A");
+
+      assert.equal(await canonicalCheckoutPath(linkA), realA, "the production realpath step resolves the symlink");
+      const { fileop } = await productionEnvs(linkA, { PATH: path.dirname(gitBin) });
+
+      const env = asCommand(fileop, home);
+      for (const dir of [linkA, realA, path.join(linkA, "sub"), path.join(realA, "sub")]) {
+        const viaC = git(gitBin, env, ["-C", dir, "status"]);
+        assert.equal(viaC.status, 0, `git -C ${dir}: ${viaC.stderr}`);
+        const viaCwd = git(gitBin, env, ["status"], dir);
+        assert.equal(viaCwd.status, 0, `git from cwd ${dir}: ${viaCwd.stderr}`);
+      }
+      const other = git(gitBin, env, ["-C", repoB, "status"]);
+      assert.notEqual(other.status, 0, "B is not trusted");
+      assert.match(other.stderr, DUBIOUS);
+      assert.equal(fileop.GIT_CONFIG_VALUE_1, realA, "the trust names the canonical checkout, not the symlinked spelling");
+    } finally {
+      await fs.rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("canonicalCheckoutPath falls back to the resolved path only on ENOENT", async () => {
+    assert.equal(await canonicalCheckoutPath("/nonexistent-uzi-1716/x/../repo"), "/nonexistent-uzi-1716/repo");
+    const base = await fs.mkdtemp(path.join(os.tmpdir(), "uzi-1716-"));
+    try {
+      const file = path.join(base, "f");
+      await fs.writeFile(file, "");
+      await assert.rejects(canonicalCheckoutPath(path.join(file, "child")), /ENOTDIR/);
+    } finally {
+      await fs.rm(base, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME (issue #1495 m1)", () => {
   it("run() provisions against the SHARED provisioning HOME, never <sdkHomeRoot>/<runId>", async () => {
     const rig = makeRig();
@@ -5906,6 +6114,36 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
       if (!startFails) assert.equal(env.npm_config_cache, `${CACHE_DIR}/npm`);
       await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 500 });
     }
+  });
+
+  it("issue #1716: a command-identity boundary process keeps its own gitEnv() config; the command trust is composed only in run()", async () => {
+    const c = cacheRig({ defer: true });
+    pushBashTurn(c.rig, ["echo one"]);
+    const exec = makeExecutor(c.rig, bindingOf(SUBSCRIPTION));
+    await withTimeout(exec.run(makeCtx().ctx), 3000, "deferred run");
+    const sinkEnv = gitEnv();
+    await exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 500 }, async (permit) => {
+      const proc = await exec.safety!.spawnBoundaryProcess(permit, {
+        argv: ["/usr/bin/git", "status"],
+        cwd: WORKSPACE,
+        env: sinkEnv,
+        identity: "command",
+      });
+      await proc.completed;
+    });
+    await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 500 });
+    const inlinePairs = (env: NodeJS.ProcessEnv): [string, string][] =>
+      Array.from({ length: Number(env.GIT_CONFIG_COUNT ?? "0") }, (_, i) =>
+        [String(env[`GIT_CONFIG_KEY_${i}`]), String(env[`GIT_CONFIG_VALUE_${i}`])]);
+    const sink = c.specs.at(-1)!.env;
+    assert.deepEqual(inlinePairs(sink), inlinePairs(sinkEnv), "the sink's gitEnv() inline config is launched unchanged");
+    assert.ok(inlinePairs(sink).some(([k, v]) => k === "safe.directory" && v === "*"), "the sink keeps safe.directory=*");
+    assert.ok(inlinePairs(sink).some(([k]) => k === "core.hooksPath"), "the sink keeps core.hooksPath");
+    assert.ok(!inlinePairs(sink).some(([k, v]) => k === "safe.directory" && v === ""), "no command-trust reset leaked into the sink");
+    // The model-authorized Bash root of the same run DOES carry the command trust.
+    const command = c.specs[1]!;
+    assert.equal(command.args[command.args.indexOf("--") + 1], "/bin/sh");
+    assert.deepEqual(inlinePairs(command.env), [["safe.directory", ""], ["safe.directory", path.resolve(WORKSPACE)]]);
   });
 
   it("commandSandboxArgv refuses a cache outside the cache root", () => {
