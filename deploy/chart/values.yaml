@@ -888,14 +888,14 @@ workers:
       # READ BY A CONTROLLER TEST — see the restricted tier's `deployments` above.
       # TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes parses this value to
       # check a full fleet's ephemeral-storage requests against the node pool, and
-      # docker workers are the expensive half (6Gi each against the plain tier's
+      # docker workers are the expensive half (5Gi each against the plain tier's
       # 512Mi). Raising this to 20 makes a full fleet need 130 GiB against a 70.2 GiB
       # pool, and that test is what says so.
       deployments: "10"
     # The backstop, never the source (the controller renders explicit requests+limits
-    # on every container, sidecars included). `max` must stay >= the largest worker
-    # preset's limits PLUS the sidecar's, or the biggest docker worker stops being
-    # admissible.
+    # on every container, sidecars included). `max` is checked PER CONTAINER (type
+    # Container), so it must stay >= the largest worker preset's limits AND >= the
+    # sidecar's, each on its own, or the biggest docker worker stops being admissible.
     limitRange:
       enabled: true
       default:
@@ -973,16 +973,17 @@ workers:
     # #1598 every worker, plain or docker, also carries the worker-only codex-cmd-cache
     # emptyDir (a run's Codex command build cache), which counts toward this request too
     # regardless of tier. uzi's own repo is a ~170 MiB runner clone before a single
-    # dependency install; 6Gi covers roughly two concurrent heavy runs plus
-    # codex-cmd-cache.
+    # dependency install.
     #
-    # Issue #1757 raised it from 4Gi to 6Gi for the codex-cmd-cache emptyDir and a
-    # lower eviction rank under node disk pressure. The image cache stays off this
+    # Issue #1757 raised it from 4Gi to 5Gi as provisional, unmeasured headroom for the
+    # codex-cmd-cache emptyDir and a lower eviction rank under node disk pressure. 5Gi,
+    # not 6Gi, so three still pack onto a ~17.5 GiB node and this tier's 10 workers
+    # place on four such nodes; a cluster with larger node disks can raise it here. The image cache stays off this
     # budget (dindDataSize above moved it to a PVC; it was ~99% of the measured
     # footprint). A request only ranks and places the pod: it cannot stop an eviction
     # on a node whose root disk is itself too small. Re-derive what is left on
     # ephemeral storage before raising it again; see adr/1598-codex-command-storage.md.
-    ephemeralRequest: 6Gi
+    ephemeralRequest: 5Gi
   # The CNI-INDEPENDENT floor: default-deny both directions, plus the two in-cluster
   # destinations an FQDN rule structurally cannot express (AntreaProxy rewrites a
   # ClusterIP before policy enforcement, so FQDN cannot match a Service).

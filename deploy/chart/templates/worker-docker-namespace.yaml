@@ -70,7 +70,7 @@ metadata:
   daemon's image/build cache, which since issue #224 M-a is a THIRD PVC per worker
   rather than an emptyDir — so this tier is budgeted separately from the restricted
   default's. Sized for the 10 workers `count/deployments.apps` advertises:
-  10 x (20Gi data + 20Gi nix + 20Gi dind) = 600Gi across 30 claims.
+  10 x (25Gi data + 20Gi nix + 20Gi dind) = 650Gi across 30 claims.
 
   Same load-bearing side effect: a quota on requests.CPU or requests.MEMORY makes
   admission REJECT any pod with a container declaring no requests — initContainers

@@ -111,8 +111,8 @@ const (
 // nixSize's reasons: the size tracks the user's repo images, not the worker's
 // CPU/RAM preset, so a per-size table here would be one repeated number.
 //
-// 20Gi is the top of the chart's own documented dind band, AND it is the ceiling:
-// the worker namespaces' LimitRange caps a PVC at maxPVCStorage (20Gi), and the
+// 20Gi is the top of the chart's own documented dind band, and it must fit the ceiling:
+// the worker namespaces' LimitRange caps a PVC at maxPVCStorage (25Gi, set by `l`'s /data), and the
 // limitranger validates PVC creates, so a larger value is rejected at admission
 // rather than merely being expensive. Raising this means raising that too.
 //

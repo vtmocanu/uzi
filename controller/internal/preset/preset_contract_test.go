@@ -223,7 +223,7 @@ func TestNixSizeIsFlatAcrossEveryPresetAndTemplate(t *testing.T) {
 //
 // THE INVARIANT IS A PER-TIER MINIMUM, NOT AN EQUALITY. Each tier is its own namespace
 // with its own LimitRange, so every claimant is checked against THAT tier's ceiling.
-// The two carry the same 20Gi today and nothing requires that to continue; stating it
+// The two carry the same 25Gi today and nothing requires that to continue; stating it
 // per tier is what makes a future divergence legible instead of silently checking one
 // number against the wrong namespace. Where a single value ever serves both, the
 // invariant collapses to `claimant <= min(restricted, docker)` — the min is the

@@ -267,12 +267,14 @@ const (
 	// The daemon's image cache is NOT on this budget since M-a (it is a PVC). What is
 	// left is the working trees plus the codex-cmd-cache emptyDir, which the docker tier
 	// carries on top of run-workdir with the same per-run contents, cleanup and ranking
-	// effect as the plain tier. Issue #1757 raised this from 4Gi to 6Gi to cover ~2
-	// concurrent heavy runs plus that cache, and to rank a busy worker later under node
-	// disk pressure. It ranks and places; it never limits, and it cannot save a pod on a
-	// node whose root disk is too small. Re-derive what is actually left on ephemeral
-	// storage before raising it again.
-	workerDefaultDockerEphemeralRequest = "6Gi"
+	// effect as the plain tier. Issue #1757 raised this from 4Gi to 5Gi as provisional,
+	// unmeasured headroom for that cache and to rank a busy worker later under node disk
+	// pressure. 5Gi and not 6Gi is a PACKING bound: a 17.55 GiB node holds three at 5Gi
+	// but two at 6Gi, and the chart's 10-worker docker tier must place on four such
+	// nodes (TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes). It ranks and
+	// places; it never limits, and it cannot save a pod on a node whose root disk is too
+	// small. Re-derive what is actually left on ephemeral storage before raising it again.
+	workerDefaultDockerEphemeralRequest = "5Gi"
 )
 
 // ephemeralRequest is the worker container's requests.ephemeral-storage: the docker
@@ -382,7 +384,7 @@ type RenderConfig struct {
 	DinDLimitMemory   string
 	// EphemeralRequest / DockerEphemeralRequest override the WORKER container's
 	// requests.ephemeral-storage (issue #224 M-b). Docker REPLACES plain rather than
-	// adding to it. Empty ⇒ workerDefault{,Docker}EphemeralRequest ("512Mi" / "6Gi").
+	// adding to it. Empty ⇒ workerDefault{,Docker}EphemeralRequest ("512Mi" / "5Gi").
 	// Quantity strings, validated at the controller's boot so the render side can
 	// MustParse them. The right value is a property of the CLUSTER'S NODES rather than
 	// of the product, which is the same argument that made dindResources overridable.

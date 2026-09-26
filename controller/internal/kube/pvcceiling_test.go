@@ -15,7 +15,7 @@ import (
 func TestValidatePVCCeilings(t *testing.T) {
 	resolver := testResolver(t)
 	// The largest claims in the shipped tables, named so a failure below is readable:
-	// nixSize is 20Gi flat, `l`'s DataSize is 20Gi, the dind default is 20Gi.
+	// nixSize is 20Gi flat, `l`'s DataSize is 25Gi, the dind default is 20Gi.
 	for _, tc := range []struct {
 		name    string
 		cfg     RenderConfig
