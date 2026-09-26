@@ -3349,15 +3349,12 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	var rows int64
 	// PRD #634 M4: the disposition to settle the pending scope audit row(s) with, decided in
 	// the `completed` case and applied best-effort in the applied-transition block below.
-	// Empty means "no settle". The failed arm and the forge-park settle (below) also set it
-	// 'declined' for a scope-directed run; every other transition leaves it empty.
+	// Empty means "no settle". The failed arm also sets it 'declined' for a scope-directed run.
+	// Issue #1399: those arm decisions read `owned`, which for a legacy (nil-generation) report
+	// is the UNLOCKED pre-switch snapshot, so a scope directive can commit after it and before
+	// the terminal write. The applied-transition block therefore also settles 'declined' when it
+	// is still empty and the post-transition re-read is terminal and scope-directed.
 	var settleScopeDisposition string
-	// Issue #1399: set by the forge pre-clone park arm. That park can end TERMINAL (cap-fail,
-	// stamped cancel, or the nil-txBeginner fail-safe), and both the terminal outcome and the
-	// scope directive are read from the post-switch re-read in the applied-transition block
-	// below: the pre-switch `owned` read is unlocked, so a scope directive can commit before
-	// parkForgeUnreachable's FOR UPDATE reread.
-	var forgePark bool
 	switch req.State {
 	case "running":
 		// RC1 (issue #1197): an AUTOPILOT run auto-approves its own plan and NEVER reports
@@ -3689,12 +3686,10 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		if req.RecoveryCause != nil && *req.RecoveryCause == "forge_unreachable" {
 			// Issue #1399 (PRD #634 follow-up, as in the failed arm): a scope-directed run this
 			// park fails or cancels never applied its scope cap, so its pending audit row must
-			// settle 'declined'. Decided off the post-switch re-read, not frun or owned:
-			// parkForgeUnreachable returns the PRE-transition row for cancel/cap-fail,
-			// failForgeUnsettleable returns no row at all, and `owned` is unlocked, so a
-			// scope directive can commit after it. A normal park re-reads as recovery_wait
-			// and leaves the row pending.
-			forgePark = true
+			// settle 'declined'. The applied-transition block decides that off the post-switch
+			// re-read, not frun or owned: parkForgeUnreachable returns the PRE-transition row for
+			// cancel/cap-fail, failForgeUnsettleable returns no row at all, and `owned` is
+			// unlocked. A normal park re-reads as recovery_wait and leaves the row pending.
 			if s.txBeginner == nil {
 				rows, err = s.failForgeUnsettleable(ctx, wkr, runID, req, sessionID)
 				break
@@ -3880,10 +3875,16 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		s.notify(runID, run.Status)
 		// PRD #634 M4: settle the pending scope audit row's disposition on the committed
 		// completion transition. Best-effort: a failure here must NEVER fail the worker's
-		// terminal report. Idempotent (WHERE disposition IS NULL) and matches 0 rows on a run
-		// with no scope directive, so it is harmless when unset by a non-completed transition
-		// (settleScopeDisposition stays empty then and this is skipped).
-		if forgePark && run.ScopeCeiling.Valid && (run.Status == "failed" || run.Status == "cancelled") {
+		// terminal report. The SQL is idempotent (WHERE disposition IS NULL); a non-terminal
+		// transition, or a run with no scope directive, leaves settleScopeDisposition empty
+		// and skips it.
+		//
+		// Issue #1399: an arm's decision reads `owned`, which is unlocked for a legacy report
+		// (and the forge park arm decides nothing). A scope directive that committed after that
+		// read but before the terminal write shows up only in this post-transition re-read, so a
+		// terminal (completed/failed/cancelled) scope-directed run with no arm decision settles
+		// 'declined' here. An arm's own decision (e.g. scope_capped -> 'applied') is kept.
+		if settleScopeDisposition == "" && run.ScopeCeiling.Valid && (run.Status == "completed" || run.Status == "failed" || run.Status == "cancelled") {
 			settleScopeDisposition = "declined"
 		}
 		if settleScopeDisposition != "" {
