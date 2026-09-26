@@ -52,8 +52,14 @@ start_api() {
 new_pinned_network() {
   local attempt base
   NET="$RUN_ID-$1"
-  for attempt in 1 2 3 4 5 6 7 8; do
-    base="10.$((RANDOM % 200 + 20)).$((RANDOM % 256))"
+  for attempt in 1 2 3 4 5 6 7 8 9; do
+    # Rotate through all three RFC 1918 ranges, so one host network covering a whole
+    # range (e.g. 10.0.0.0/8) cannot exhaust every candidate.
+    case $((attempt % 3)) in
+      1) base="10.$((RANDOM % 200 + 20)).$((RANDOM % 256))" ;;
+      2) base="172.$((RANDOM % 16 + 16)).$((RANDOM % 256))" ;;
+      0) base="192.168.$((RANDOM % 256))" ;;
+    esac
     if docker network create --subnet "$base.0/24" "$NET" >/dev/null 2>"$SCRATCH/net.err"; then
       NETWORKS+=("$NET")
       API="$NET-api"
@@ -66,7 +72,7 @@ new_pinned_network() {
     grep -q -i 'overlap' "$SCRATCH/net.err" || fail "network create failed: $(cat "$SCRATCH/net.err")"
     note "subnet $base.0/24 overlaps an existing network (attempt $attempt); retrying"
   done
-  fail "no free /24 found for the pinned test network after 8 attempts"
+  fail "no free /24 found for the pinned test network after 9 attempts across 10/8, 172.16/12 and 192.168/16"
 }
 start_filler() {
   docker run -d --name "$FILLER" --network "$NET" \
