@@ -1388,6 +1388,8 @@ func TestCoordinatedCodexRefreshRecoverySlotSurvivesCtxCancelLiveDB(t *testing.T
 //
 // FAILS OLD: the prior vault-locked branch quarantined an EMPTY recovery slot and later
 // reconciliation marked the operation unrecoverable, so its "retained" claim was false.
+// Issue #1766: the error is also ErrCodexVaultLocked (the handler answers 409 vault_locked),
+// and after unlock the survivor sweep promotes the retained login with no second exchange.
 func TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	newAccess := codexToken("access-new")
@@ -1405,6 +1407,9 @@ func TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB(t *testing.T) {
 	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0)
 	if !errors.Is(err, ErrCodexRefreshQuarantined) {
 		t.Fatalf("err = %v, want ErrCodexRefreshQuarantined (retained)", err)
+	}
+	if !errors.Is(err, ErrCodexVaultLocked) {
+		t.Fatalf("err = %v, want ErrCodexVaultLocked beside ErrCodexRefreshQuarantined", err)
 	}
 	if errors.Is(err, ErrCodexRefreshUnrecoverable) {
 		t.Fatalf("err = %v, must NOT be unrecoverable on a transient vault-locked seal", err)
@@ -1433,13 +1438,22 @@ func TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB(t *testing.T) {
 		t.Fatalf("intent state = %q, want rotating (retained, not unrecoverable)", it.State)
 	}
 
-	// Once the user vault unlocks, reconciliation must re-seal the protected recovery under
-	// the DEK before making it live, then return the account to an idle usable generation.
+	// Once the user vault unlocks, the survivor sweep must re-seal the protected recovery
+	// under the DEK before making it live, then return the account to an idle usable
+	// generation. Only this account's recovery token is recognised by the fake; every other
+	// user's leftover recovery blob under the global sweep defers (neither promoted nor
+	// cleared), so the sweep changes nothing outside this test.
+	fake.identityByToken = map[string]codexauth.Identity{
+		newAccess: {ProviderUserID: f.providerUserID, WorkspaceAccountID: f.workspaceAcctID},
+	}
+	fake.discoverDefaultErr = codexauth.ErrIdentityIncomplete
 	if uerr := vlt.Unlock(env.ctx, f.userID, "vault-lock-recovery-password"); uerr != nil {
 		t.Fatalf("unlock vault: %v", uerr)
 	}
-	if _, rerr := f.svc.ReconcileUnresolvedCodexRefresh(env.ctx, f.userID, f.accountID); rerr != nil {
-		t.Fatalf("reconcile protected vault-lock recovery: %v", rerr)
+	if _, rerr := f.svc.SweepUnresolvedCodexRefresh(env.ctx); rerr != nil {
+		// Another package-mate's leftover account may fail its own pass; only this
+		// account's end state below is asserted.
+		t.Logf("survivor sweep reported another account's error: %v", rerr)
 	}
 	acct = env.mustAccount(t, f.userID, f.accountID)
 	if acct.CoordState != "idle" || acct.Generation != 1 {
@@ -1454,6 +1468,20 @@ func TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB(t *testing.T) {
 	}
 	if blob.AccessToken != newAccess {
 		t.Fatalf("promoted access token = %q, want retained %q", blob.AccessToken, newAccess)
+	}
+	// The retried op and a caller still at the old generation both reconcile to the
+	// promoted login with NO second provider exchange.
+	if it := mustIntent(t, env, op, f.userID); it.State != codexIntentReconciled {
+		t.Fatalf("intent state = %q, want reconciled after the sweep", it.State)
+	}
+	for _, retryOp := range []uuid.UUID{op, uuid.New()} {
+		again, aerr := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, retryOp, 0)
+		if aerr != nil || again.AccessToken != newAccess || again.Generation != 1 {
+			t.Fatalf("post-unlock retry = (%+v, %v), want the promoted token at generation 1", again, aerr)
+		}
+	}
+	if fake.calls != 1 {
+		t.Fatalf("provider calls = %d, want still 1 (reconcile must not re-exchange)", fake.calls)
 	}
 }
 

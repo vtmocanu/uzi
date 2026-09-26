@@ -328,31 +328,43 @@ func TestCodexHTTPErrorMapping(t *testing.T) {
 		err        error
 		wantStatus int
 		wantMsg    string
+		wantReason string
 	}{
-		{workersvc.ErrRunNotOwned, http.StatusNotFound, codexErrRunNotFound},
-		{workersvc.ErrCodexRunNotBound, http.StatusNotFound, codexErrRunNotFound},
-		{workersvc.ErrCodexWorkerMismatch, http.StatusNotFound, codexErrRunNotFound},
-		{workersvc.ErrCodexCapabilityMismatch, http.StatusForbidden, codexErrNotAuthorized},
-		{workersvc.ErrCodexCapabilityEpoch, http.StatusForbidden, codexErrNotAuthorized},
-		{workersvc.ErrCodexScopeNotApplicable, http.StatusForbidden, codexErrNotAuthorized},
-		{workersvc.ErrCodexKindModeMismatch, http.StatusForbidden, codexErrNotAuthorized},
-		{workersvc.ErrCodexRefreshContended, http.StatusConflict, codexErrRefreshContended},
-		{workersvc.ErrCodexRefreshQuarantined, http.StatusConflict, codexErrRefreshUnavailable},
-		{workersvc.ErrCodexRefreshUnrecoverable, http.StatusConflict, codexErrRefreshUnavailable},
-		{workersvc.ErrCodexRefreshNoToken, http.StatusConflict, codexErrRefreshUnavailable},
-		{workersvc.ErrCodexRefreshNoClient, http.StatusServiceUnavailable, codexErrRefreshNoClient},
-		{workersvc.ErrCodexRunNotActivelyClaimed, http.StatusConflict, codexErrCredUnavailable},
-		{workersvc.ErrCodexMaterialRevisionStale, http.StatusConflict, codexErrCredUnavailable},
-		{workersvc.ErrCodexAccountKeyUnfrozen, http.StatusConflict, codexErrCredUnavailable},
-		{workersvc.ErrCodexAccountTupleMismatch, http.StatusConflict, codexErrCredUnavailable},
-		{workersvc.ErrCodexAccountRevisionStale, http.StatusConflict, codexErrCredUnavailable},
-		{workersvc.ErrCodexAccountQuarantined, http.StatusConflict, codexErrCredUnavailable},
-		{workersvc.ErrCodexBindingConflict, http.StatusConflict, codexErrCredUnavailable},
+		{workersvc.ErrRunNotOwned, http.StatusNotFound, codexErrRunNotFound, ""},
+		{workersvc.ErrCodexRunNotBound, http.StatusNotFound, codexErrRunNotFound, ""},
+		{workersvc.ErrCodexWorkerMismatch, http.StatusNotFound, codexErrRunNotFound, ""},
+		{workersvc.ErrCodexCapabilityMismatch, http.StatusForbidden, codexErrNotAuthorized, ""},
+		{workersvc.ErrCodexCapabilityEpoch, http.StatusForbidden, codexErrNotAuthorized, ""},
+		{workersvc.ErrCodexScopeNotApplicable, http.StatusForbidden, codexErrNotAuthorized, ""},
+		{workersvc.ErrCodexKindModeMismatch, http.StatusForbidden, codexErrNotAuthorized, ""},
+		{workersvc.ErrCodexRefreshContended, http.StatusConflict, codexErrRefreshContended, ""},
+		{workersvc.ErrCodexRefreshQuarantined, http.StatusConflict, codexErrRefreshUnavailable, ""},
+		{workersvc.ErrCodexRefreshUnrecoverable, http.StatusConflict, codexErrRefreshUnavailable, ""},
+		{workersvc.ErrCodexRefreshNoToken, http.StatusConflict, codexErrRefreshUnavailable, ""},
+		{workersvc.ErrCodexRefreshNoClient, http.StatusServiceUnavailable, codexErrRefreshNoClient, ""},
+		{workersvc.ErrCodexRunNotActivelyClaimed, http.StatusConflict, codexErrCredUnavailable, ""},
+		{workersvc.ErrCodexMaterialRevisionStale, http.StatusConflict, codexErrCredUnavailable, ""},
+		{workersvc.ErrCodexAccountKeyUnfrozen, http.StatusConflict, codexErrCredUnavailable, ""},
+		{workersvc.ErrCodexAccountTupleMismatch, http.StatusConflict, codexErrCredUnavailable, ""},
+		{workersvc.ErrCodexAccountRevisionStale, http.StatusConflict, codexErrCredUnavailable, ""},
+		{workersvc.ErrCodexAccountQuarantined, http.StatusConflict, codexErrCredUnavailable, ""},
+		{workersvc.ErrCodexBindingConflict, http.StatusConflict, codexErrCredUnavailable, ""},
+		// A locked owner vault after authorization is a typed, transient 409 (issue #1766).
+		{workersvc.ErrCodexVaultLocked, http.StatusConflict, codexErrVaultLocked, codexReasonVaultLocked},
+		{fmt.Errorf("%w: %w", workersvc.ErrCodexVaultLocked, errors.New("vault locked during claim")),
+			http.StatusConflict, codexErrVaultLocked, codexReasonVaultLocked},
+		// The post-exchange vault-locked seal carries BOTH ErrCodexRefreshQuarantined and the
+		// vault-locked cause; the entry point adds ErrCodexVaultLocked, which must win.
+		{fmt.Errorf("%w: %w", workersvc.ErrCodexVaultLocked,
+			fmt.Errorf("%w: %w: refreshed login retained pending vault unlock",
+				workersvc.ErrCodexRefreshQuarantined, errors.New("vault locked during claim"))),
+			http.StatusConflict, codexErrVaultLocked, codexReasonVaultLocked},
 	}
 	for _, tc := range cases {
-		status, msg := codexHTTPError(tc.err)
-		if status != tc.wantStatus || msg != tc.wantMsg {
-			t.Errorf("codexHTTPError(%v) = (%d, %q), want (%d, %q)", tc.err, status, msg, tc.wantStatus, tc.wantMsg)
+		status, msg, reason := codexHTTPError(tc.err)
+		if status != tc.wantStatus || msg != tc.wantMsg || reason != tc.wantReason {
+			t.Errorf("codexHTTPError(%v) = (%d, %q, %q), want (%d, %q, %q)",
+				tc.err, status, msg, reason, tc.wantStatus, tc.wantMsg, tc.wantReason)
 		}
 	}
 
@@ -363,9 +375,9 @@ func TestCodexHTTPErrorMapping(t *testing.T) {
 	secretShaped := "sk-" + "super-secret-abc"
 	leaky := fmt.Errorf("codex refresh: provider exchange: %w",
 		errors.New("GET https://auth.openai.com/oauth/token returned 401: refresh_token="+secretShaped))
-	status, msg := codexHTTPError(leaky)
-	if status != http.StatusInternalServerError || msg != codexErrInternal {
-		t.Fatalf("generic mapping = (%d, %q), want (500, %q)", status, msg, codexErrInternal)
+	status, msg, reason := codexHTTPError(leaky)
+	if status != http.StatusInternalServerError || msg != codexErrInternal || reason != "" {
+		t.Fatalf("generic mapping = (%d, %q, %q), want (500, %q, \"\")", status, msg, reason, codexErrInternal)
 	}
 	for _, leak := range []string{"auth.openai.com", "oauth", "401", secretShaped, "refresh_token", "provider"} {
 		if strings.Contains(msg, leak) {
@@ -378,13 +390,55 @@ func TestCodexHTTPErrorMapping(t *testing.T) {
 	for _, m := range []string{
 		codexErrAuth, codexErrInvalid, codexErrRunNotFound, codexErrNotAuthorized,
 		codexErrCredUnavailable, codexErrRefreshContended, codexErrRefreshUnavailable,
-		codexErrRefreshNoClient, codexErrInternal,
+		codexErrRefreshNoClient, codexErrInternal, codexErrVaultLocked, codexReasonVaultLocked,
 	} {
 		for _, forbidden := range []string{"://", "token", "secret", "user_id", "account", "sk-"} {
 			if strings.Contains(m, forbidden) {
 				t.Errorf("fixed codex error %q contains a coordinate/secret substring %q", m, forbidden)
 			}
 		}
+	}
+}
+
+// TestWriteCodexErrorVaultLocked pins the wire body of the locked-vault answer (issue
+// #1766): exactly {"error", "reason"} with the two fixed strings, and nothing from the
+// wrapped error (no run/user/account id, no token), so a worker can branch on reason.
+func TestWriteCodexErrorVaultLocked(t *testing.T) {
+	runID, userID, accountID := uuid.New(), uuid.New(), uuid.New()
+	tokenShaped := "sk-" + "vault-locked-leak"
+	err := fmt.Errorf("%w: %w", workersvc.ErrCodexVaultLocked,
+		fmt.Errorf("run %s user %s account %s token %s: vault locked during claim",
+			runID, userID, accountID, tokenShaped))
+
+	rec := httptest.NewRecorder()
+	(&Handler{}).writeCodexError(rec, "refresh", err)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", rec.Code)
+	}
+	var body map[string]string
+	if derr := json.Unmarshal(rec.Body.Bytes(), &body); derr != nil {
+		t.Fatalf("decode body %q: %v", rec.Body.String(), derr)
+	}
+	want := map[string]string{
+		"error":  "codex credential vault is locked; retry after unlock",
+		"reason": "vault_locked",
+	}
+	if len(body) != len(want) || body["error"] != want["error"] || body["reason"] != want["reason"] {
+		t.Fatalf("body = %v, want exactly %v", body, want)
+	}
+	raw := rec.Body.String()
+	for _, leak := range []string{runID.String(), userID.String(), accountID.String(), tokenShaped, "claim"} {
+		if strings.Contains(raw, leak) {
+			t.Fatalf("locked-vault body %q leaks %q", raw, leak)
+		}
+	}
+
+	// Every other mapped case keeps the plain {"error"} envelope, byte-identical to before.
+	rec = httptest.NewRecorder()
+	(&Handler{}).writeCodexError(rec, "refresh", workersvc.ErrCodexRefreshQuarantined)
+	if got, wantBody := rec.Body.String(), `{"error":"codex refresh is unavailable"}`+"\n"; got != wantBody {
+		t.Fatalf("quarantined body = %q, want %q", got, wantBody)
 	}
 }
 
