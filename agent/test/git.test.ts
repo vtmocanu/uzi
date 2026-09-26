@@ -179,7 +179,23 @@ describe("ensureClone", () => {
   });
 });
 
-describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () => {
+const linuxCloneSkip = process.platform === "linux" ? false : "runner clone scratch provisioning requires Linux procfs";
+
+describe("scratch provisioning platform support", () => {
+  it("refuses an unsupported platform with a named failure before any path access", async () => {
+    const provision = (git as unknown as {
+      provisionRunnerScratch(path: string, platform: string): Promise<void>;
+    }).provisionRunnerScratch.bind(git);
+    await assert.rejects(provision(path.join(fx.dataDir, "missing-clone"), "darwin"), (err: unknown) => {
+      assert.ok(err instanceof ScratchProvisionError);
+      assert.match(err.message, /Linux no-follow descriptor-relative scratch provisioning is unavailable/);
+      return true;
+    });
+    assert.equal(fs.existsSync(path.join(fx.dataDir, "missing-clone")), false);
+  });
+});
+
+describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { skip: linuxCloneSkip }, () => {
   const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
   function refInBare(bare: string, ref: string): boolean {
     try {
@@ -915,7 +931,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
   });
 });
 
-describe("branchTip / trackingTip (PRD #122 M6)", () => {
+describe("branchTip / trackingTip (PRD #122 M6)", { skip: linuxCloneSkip }, () => {
   const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
 
   it("branchTip reads the runner clone's own head; trackingTip is null before a fetch-back and the tip after", async () => {
@@ -948,7 +964,7 @@ describe("branchTip / trackingTip (PRD #122 M6)", () => {
   });
 });
 
-describe("checkpoint reseed candidate (PRD #122 M8)", () => {
+describe("checkpoint reseed candidate (PRD #122 M8)", { skip: linuxCloneSkip }, () => {
   const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
 
   /** Commit `file` in the runner clone and return the new HEAD sha. */
@@ -1077,7 +1093,7 @@ describe("checkpoint reseed candidate (PRD #122 M8)", () => {
   });
 });
 
-describe("checkpointPack (PRD #122 M8)", () => {
+describe("checkpointPack (PRD #122 M8)", { skip: linuxCloneSkip }, () => {
   const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
 
   async function drain(r: Readable): Promise<Buffer> {
@@ -1488,7 +1504,7 @@ describe("issue #781 — disjoint-ref seed guard + fetch --prune", () => {
     }
   }
 
-  it("rejects a disjoint origin branch ref and seeds off the default tip instead", async () => {
+  it("rejects a disjoint origin branch ref and seeds off the default tip instead", { skip: linuxCloneSkip }, async () => {
     // Build a DISJOINT branch at origin matching the seed branch name for issue 55 — an
     // orphan root, so it shares no history (and no content) with main.
     gitIn(fx.originPath, ["checkout", "--orphan", "agent/issue-55"]);
@@ -1525,7 +1541,7 @@ describe("issue #781 — disjoint-ref seed guard + fetch --prune", () => {
     assert.notStrictEqual(rc.baseCommit, disjointTip, "…explicitly NOT the disjoint ref tip");
   });
 
-  it("keeps a far-ahead owned tracking ref that merely diverges from default (guard is not over-aggressive)", async () => {
+  it("keeps a far-ahead owned tracking ref that merely diverges from default (guard is not over-aggressive)", { skip: linuxCloneSkip }, async () => {
     const bare = await git.ensureClone(fx.originPath);
     // Seed a first runner clone off the initial default and build a tracking ref several
     // commits ahead, owned by run-far. It forks off main's initial commit — so it merely

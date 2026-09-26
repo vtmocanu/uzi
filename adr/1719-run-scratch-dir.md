@@ -1,6 +1,6 @@
 # ADR-1719: Run scratch lives inside the runner checkout
 
-**Status**: Accepted design; worker enforcement is planned in PRD #1719 M2–M5
+**Status**: Accepted design; worker provisioning is implemented, publication and guidance remain in PRD #1719 M3–M5
 **Date**: 2026-09-26
 **Related**: [PRD #1719](../prds/1719-run-scratch-dir-path-policy.md)
 

@@ -1497,7 +1497,7 @@ export class GitCache {
   }
 
   /** Provision the per-run artifact directory without following checkout symlinks. */
-  private async provisionRunnerScratch(clonePath: string): Promise<void> {
+  private async provisionRunnerScratch(clonePath: string, platform = process.platform): Promise<void> {
     const directoryFlags = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
     const fdPath = (fd: number, name: string): string => `/proc/self/fd/${fd}/${name}`;
     const required = 0o2070; // setgid and group rwx for runner-cmd
@@ -1508,6 +1508,14 @@ export class GitCache {
       return handle;
     };
     try {
+      // /proc/self/fd is the descriptor-relative pathname bridge used below. Refuse
+      // platforms without Linux procfs or no-follow directory opens before any write.
+      if (platform !== "linux" || !fsConstants.O_DIRECTORY || !fsConstants.O_NOFOLLOW) {
+        throw new Error("Linux no-follow descriptor-relative scratch provisioning is unavailable");
+      }
+      if ((await fs.statfs("/proc/self/fd")).type !== 0x9fa0) {
+        throw new Error("Linux procfs descriptor bridge is unavailable");
+      }
       // The index detects a tracked file, directory content, or symlink at the reserved path.
       if ((await this.runGitAsRunner(clonePath, ["ls-files", "--cached", "--", ".uzi/scratch"])).length > 0) {
         throw new Error("tracked .uzi/scratch path");

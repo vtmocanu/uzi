@@ -182,9 +182,9 @@ The same write-ahead journal covers a run-lane attempt's terminal outcome (an is
 
 ## Run artifacts and the sandbox
 
-The planned run scratch directory is `.uzi/scratch/` inside each runner
-checkout. Once worker support for [ADR-1719](../adr/1719-run-scratch-dir.md)
-lands, use it for gate logs, screenshots and plain exported review snapshots.
+The worker provisions `.uzi/scratch/` inside each runner checkout before the
+agent starts. [ADR-1719](../adr/1719-run-scratch-dir.md) records the path policy.
+Use it for gate logs, screenshots and plain exported review snapshots.
 For a gate log, create a unique file with
 `mktemp .uzi/scratch/gate-log.XXXXXX`. A snapshot exported with `git archive`
 has no git metadata or installed dependencies; run git-dependent gates in the
@@ -192,12 +192,12 @@ real checkout. Scratch survives parks and resumes on the same retained clone,
 but a fresh clone or another worker starts with an empty directory. Do not
 rely on it for durable recovery.
 
-The worker will locally exclude the scratch directory from ordinary staging
-and refuse checkpoint or final publication if scratch appears in any commit
-being sent or an index/WIP capture. An ignore rule does not prevent forced
+The worker locally excludes the scratch directory from ordinary staging.
+Publication refusal is planned for checkpoint and final sends if scratch appears
+in any commit being sent or an index/WIP capture. An ignore rule does not prevent forced
 staging. A repository collision at `.uzi/scratch/` will fail provisioning
-instead of replacing repository content. Until that worker support lands,
-create logs in an ignored path inside the checkout and check what is staged.
+instead of replacing repository content. Until publication refusal lands,
+check what is staged before committing.
 
 Direct file-tool paths are limited to the run worktree on Claude and Codex.
 This is a tool policy, not a promise that every shell command is filesystem
