@@ -55,7 +55,7 @@ import type { RunContext, EmittedMessage, Executor, WallParkOutcome } from "../s
 import { PauseNowSignal } from "../src/steering.js";
 import type { Logger } from "../src/log.js";
 import type { DockerWiring } from "../src/docker-wiring.js";
-import type { AgentTemplate } from "../src/protocol.js";
+import type { AgentTemplate, MilestoneProgress } from "../src/protocol.js";
 import type { BoundaryRequest } from "../src/harness.js";
 import type {
   CacheCleanupResult,
@@ -6877,6 +6877,98 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
     assert.equal(result.pausedAt, undefined);
     assert.equal(rig.providerLaunches(), 2, "the deferred recreation ran once a turn was due");
     assert.equal(rig.epochs[1]!.transport.turnStartCount, 1);
+  });
+
+  // T13 (issue #1764): a real pause -> resume lifecycle across TWO executor claims (flights). Both
+  // flights share one in-memory, credential-free session store keyed by storeDir (the executor
+  // derives it from its homeRoot, identical here), and the thread id travels between them the way
+  // the runner carries it: flight 1's ctx.onSessionId -> the server's session_id -> flight 2's
+  // ctx.sessionId. Flight 1 completes m1, checkpoints, and parks at the server-decided boundary;
+  // flight 2 is the pre-approved resume that adopts the stored session, resumes THAT thread, runs
+  // one implement turn, and parks again at the server's cumulative count. The executor does not
+  // carry milestones across a resume (the server does), so flight 2's model reports only m2: its
+  // local count is 1 while the ACK's cumulative count is 2, and the park must use the ACK's.
+  it("(T13) pause -> resume across two flights: the resume adopts the preserved thread and parks at the server's cumulative count, not its local count", async () => {
+    const frozen = [{ id: "m1", title: "one" }, { id: "m2", title: "two" }, { id: "m3", title: "three" }];
+    const generations = new Map<string, number>();
+    const storeLog: string[] = [];
+    const sharedStore: NonNullable<CodexExecutorDeps["sessionStore"]> = {
+      persist: async (_codexHome: string, storeDir: string) => {
+        generations.set(storeDir, (generations.get(storeDir) ?? 0) + 1);
+        storeLog.push(`persist:${storeDir}`);
+        return { files: 1, bytes: 1 };
+      },
+      adopt: async (storeDir: string) => {
+        storeLog.push(`adopt:${storeDir}`);
+        return { files: generations.has(storeDir) ? 1 : 0 };
+      },
+      inspect: async (storeDir: string) => (generations.has(storeDir) ? "present" : "absent") as never,
+      remove: async (storeDir: string) => { generations.delete(storeDir); },
+    };
+    const useSharedStore = (rig: MultiRig): void => {
+      (rig.deps as { sessionStore?: CodexExecutorDeps["sessionStore"] }).sessionStore = sharedStore;
+    };
+
+    // ---- Flight 1: m1 completes and checkpoints; the next boundary's ACK pauses and it parks.
+    const rig1 = makeMultiEpochRig([epochResponder("th-1", "tn-1", (t, th, tn) => {
+      t.push(toolCall(11, "report_progress", { completed: ["m1"], in_progress: [] }, th, tn, "c-prog-11"))
+        .push(toolCall(12, "checkpoint", {}, th, tn, "c-ckpt-1"))
+        .push(turnCompleted("completed", th, tn));
+    })]);
+    useSharedStore(rig1);
+    let preservedSessionId: string | undefined;
+    const parks1: At[] = [];
+    const flight1 = makeCtx({
+      frozenMilestones: frozen,
+      onSessionId: (id) => { preservedSessionId = id; },
+      reportProgress: async () => {},
+      reportIteration: async (n) => (n === 1 ? { pauseRequested: false } : { pauseRequested: true, completedCount: 1 }),
+      checkpoint: async () => undefined,
+      parkForPause: async (at) => { parks1.push(at); return true; },
+    });
+    const result1 = await withTimeout(makeExecutor(rig1, bindingOf(SUBSCRIPTION)).run(flight1.ctx), 5000, "T13 flight 1");
+    assert.deepEqual(parks1, [{ completedCount: 1, total: 3 }], "flight 1 parked once, after m1");
+    assert.deepEqual(result1.pausedAt, { completedCount: 1, total: 3 }, "flight 1 returns pausedAt so the runner skips finalize");
+    assert.equal(preservedSessionId, "th-1", "flight 1 surfaced its Codex thread id for the server to preserve");
+    const storeDirs = [...generations.keys()];
+    assert.equal(storeDirs.length, 1, `flight 1 persisted its session into one store; log=${storeLog.join(" -> ")}`);
+
+    // ---- Flight 2: the pre-approved resume on the preserved session id and frozen milestones.
+    const rig2 = makeMultiEpochRig([resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+      t.push(toolCall(21, "report_progress", { completed: ["m2"], in_progress: [] }, th, tn, "c-prog-21"))
+        .push(toolCall(22, "checkpoint", {}, th, tn, "c-ckpt-2"))
+        .push(turnCompleted("completed", th, tn));
+    })]);
+    useSharedStore(rig2);
+    const adoptsBefore = storeLog.filter((e) => e.startsWith("adopt:")).length;
+    const reported: MilestoneProgress[] = [];
+    const checkpointed: (MilestoneProgress | undefined)[] = [];
+    const parks2: At[] = [];
+    const flight2 = makeCtx({
+      sessionId: preservedSessionId,
+      frozenMilestones: frozen,
+      reportProgress: async (p) => { reported.push(p); },
+      reportIteration: async (n) => (n === 1 ? { pauseRequested: false } : { pauseRequested: true, completedCount: 2 }),
+      checkpoint: async (opts) => { checkpointed.push(opts.progress); },
+      parkForPause: async (at) => { parks2.push(at); return true; },
+    });
+    const result2 = await withTimeout(makeExecutor(rig2, bindingOf(SUBSCRIPTION)).run(flight2.ctx), 5000, "T13 flight 2");
+
+    const adopts2 = storeLog.filter((e) => e.startsWith("adopt:")).slice(adoptsBefore);
+    assert.deepEqual(adopts2, [`adopt:${storeDirs[0]}`], "flight 2 adopted the store flight 1 persisted");
+    const t2 = rig2.epochs[0]!.transport;
+    const resume = t2.requests.find((r) => r.method === "thread/resume");
+    assert.ok(resume, "flight 2 resumed a thread rather than starting a fresh one");
+    assert.equal(rec(resume.params).threadId, "th-1", "thread/resume received the preserved thread id");
+    assert.equal(t2.requests.some((r) => r.method === "thread/start"), false, "no fresh thread was started");
+    assert.equal(t2.turnStartCount, 1, "flight 2 ran exactly one implement turn before parking");
+    const turnStart = t2.requests.find((r) => r.method === "turn/start");
+    assert.equal(rec(turnStart!.params).threadId, "th-1", "the implement turn ran on the preserved thread");
+    assert.deepEqual(reported.map((p) => p.completed), [["m2"]], "the resumed progress report carries only this flight's m2");
+    assert.deepEqual(checkpointed.map((p) => p?.completed), [["m2"]], "the resumed checkpoint carries only m2 (local count 1)");
+    assert.deepEqual(parks2, [{ completedCount: 2, total: 3 }], "the later boundary parks at the server's cumulative count (2), not the local count (1) or 0");
+    assert.deepEqual(result2.pausedAt, { completedCount: 2, total: 3 });
+    assert.equal(rig2.providerLaunches(), 1, "the parked resume launched no second provider epoch");
   });
 
   it("(T8) a seeded `wall` pause on an un-aborted signal parks via parkForWall, never parkForPause, with zero turns", async () => {

@@ -8,6 +8,7 @@ import type { Readable } from "node:stream";
 
 import { type Executor, type RunContext, type ExecutorResult } from "../src/executor.js";
 import { LimitReachedError } from "../src/limit.js";
+import { PauseNowSignal } from "../src/steering.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import {
   createCodexExecutionSafety,
@@ -772,15 +773,20 @@ describe("RunRunner m4 — credential-free sinks mint NO permit", () => {
     try {
       const rig = codexRig({ authMode: "subscription" });
       let parkedResult: boolean | undefined;
+      const runHome = path.join(homeRoot, "h");
       const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+        // The per-run HOME holds the resumable session; a parked run must keep it.
+        fs.mkdirSync(runHome, { recursive: true });
+        fs.writeFileSync(path.join(runHome, "session.marker"), "resume me\n");
         commitInTree(ctx.worktreePath, "WORK.txt", "work before the pause\n");
         const at = { completedCount: 1, total: 2 };
         parkedResult = await ctx.parkForPause?.(at);
         return parkedResult ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
       });
       const claim = gitlabClaim(1222);
-      await runnerWith(() => ({ executor: exec, homeDir: path.join(homeRoot, "h") }), gitlab).execute(claim);
+      await runnerWith(() => ({ executor: exec, homeDir: runHome }), gitlab).execute(claim);
       assert.equal(parkedResult, true, "the pause parked");
+      assert.ok(fs.existsSync(path.join(runHome, "session.marker")), "the parked run's HOME (its resumable session) was retained");
       assert.deepEqual(rig.boundaries, [], `no finalize (or any) permit was minted; got ${JSON.stringify(rig.boundaries)}`);
       assert.equal(rig.refreshCalls(), 0, "no refreshCodex reconcile for a paused run");
       assert.equal(rig.releaseCalls(), 0, "no releaseCodex reconcile for a paused run");
@@ -791,6 +797,81 @@ describe("RunRunner m4 — credential-free sinks mint NO permit", () => {
       assert.deepEqual(rig.disposeBoundaries, ["terminal"], "the runner still disposed the Codex registry once");
     } finally {
       restore();
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  // T12 (issue #1764): a plan-phase `now` pause makes the Codex executor reject with a
+  // PauseNowSignal (the plan turn has no in-loop park seam). The runner's PauseNowSignal catch owns
+  // the park: handlePausePark publishes the checkpoint credential-free and parks on a `paused` ACK,
+  // or reports pause_failed and preserves the session for a requeue. Either way no finalize runs,
+  // so no permit is minted and no Codex credential reconcile fires, and the finally still disposes
+  // the Codex registry exactly once.
+  const planPhasePauseNow = (safety: CodexExecutionSafety, runHome: string): FakeCodexExecutor =>
+    new FakeCodexExecutor(safety, async (ctx) => {
+      fs.mkdirSync(runHome, { recursive: true });
+      fs.writeFileSync(path.join(runHome, "session.marker"), "plan session\n");
+      commitInTree(ctx.worktreePath, "PLAN-WORK.txt", "committed before the plan-phase pause\n");
+      throw new PauseNowSignal();
+    });
+
+  it("(T12 parked) a Codex plan-phase PauseNowSignal parks through the runner catch: paused, HOME kept, no terminal, no permit/reconcile, registry disposed", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const restore = spyPublishLands();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1764-plan-now-"));
+    try {
+      const rig = codexRig({ authMode: "subscription" });
+      const runHome = path.join(homeRoot, "h");
+      const exec = planPhasePauseNow(rig.safety, runHome);
+      const claim = gitlabClaim(1225);
+      await runnerWith(() => ({ executor: exec, homeDir: runHome }), gitlab).execute(claim);
+      const st = statuses(claim.run_id);
+      assert.ok(st.includes("paused"), `the run parked (paused ACK); got ${JSON.stringify(st)}`);
+      assert.ok(!st.includes("pause_failed"), "the checkpoint landed, so no pause_failed");
+      assert.ok(!st.includes("completed") && !st.includes("failed"), `no terminal report; got ${JSON.stringify(st)}`);
+      assert.ok(fs.existsSync(path.join(runHome, "session.marker")), "the parked run's HOME was retained for the resume");
+      assert.deepEqual(rig.boundaries, [], `no finalize (or any) permit was minted; got ${JSON.stringify(rig.boundaries)}`);
+      assert.equal(rig.refreshCalls(), 0, "no refreshCodex reconcile");
+      assert.equal(rig.releaseCalls(), 0, "no releaseCodex reconcile");
+      assert.equal(calls.length, 0, "no push/MR");
+      assert.deepEqual(rig.disposeBoundaries, ["terminal"], "the runner disposed the Codex registry once");
+      assert.equal(rig.registry.state(), "disposed", "the registry ends disposed");
+    } finally {
+      restore();
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(T12 declined) a Codex plan-phase PauseNowSignal whose checkpoint fails reports pause_failed, preserves the session for requeue, never fails, and disposes the registry", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const orig = client.publishCheckpoint.bind(client);
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
+      _runId: string,
+      _tipOid: string,
+      pack: Readable,
+    ) => {
+      await drain(pack);
+      return { ok: false, httpStatus: 500 };
+    };
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1764-plan-now-fail-"));
+    try {
+      const rig = codexRig({ authMode: "subscription" });
+      const runHome = path.join(homeRoot, "h");
+      const exec = planPhasePauseNow(rig.safety, runHome);
+      const claim = gitlabClaim(1226);
+      await runnerWith(() => ({ executor: exec, homeDir: runHome }), gitlab).execute(claim);
+      const st = statuses(claim.run_id);
+      assert.ok(st.includes("pause_failed"), `pause_failed was reported; got ${JSON.stringify(st)}`);
+      assert.ok(!st.includes("paused"), "the run did not park");
+      assert.ok(!st.includes("failed") && !st.includes("completed"), `no terminal report; got ${JSON.stringify(st)}`);
+      assert.ok(fs.existsSync(path.join(runHome, "session.marker")), "the session HOME was preserved for the requeue");
+      assert.deepEqual(rig.boundaries, [], `no finalize (or any) permit was minted; got ${JSON.stringify(rig.boundaries)}`);
+      assert.equal(rig.refreshCalls(), 0, "no refreshCodex reconcile");
+      assert.equal(rig.releaseCalls(), 0, "no releaseCodex reconcile");
+      assert.equal(calls.length, 0, "no push/MR");
+      assert.deepEqual(rig.disposeBoundaries, ["terminal"], "the runner still disposed the Codex registry once");
+    } finally {
+      (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = orig;
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
   });
