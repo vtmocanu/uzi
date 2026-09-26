@@ -1485,7 +1485,8 @@ func steerKindLabel(kind string) string {
 // PRD #1392 M5: recoveryCause is the optional RecoveryWaitCause of a recovery_wait run — a
 // variadic tail so the ~two dozen existing call sites that do not have it stay valid. When
 // it is "forge_unreachable" the recovery suffix names the forge instead of the transient
-// empty turn; "codex_account_unavailable" (PRD #1590) names the Codex account.
+// empty turn; "codex_account_unavailable" (PRD #1590) names the Codex account, and
+// "vault_locked" (issue #1766) names the vault unlock the run is waiting for.
 func steerState(kind string, consumedAt *time.Time, disposition *string, runStatus string, recoveryCause ...string) string {
 	// PRD #634: a scope directive's state IS its disposition — it is never consumed, so
 	// consumed_at/runStatus carry no delivery signal for it. A nil disposition means the
@@ -1526,6 +1527,11 @@ func steerState(kind string, consumedAt *time.Time, disposition *string, runStat
 	// interruption; the action detail lives on the run-get row and the TUI detail line.
 	if len(recoveryCause) > 0 && recoveryCause[0] == codexAccountUnavailableCause {
 		recoveringSuffix = " (run held on its Codex account)"
+	}
+	// Issue #1766: a run whose vault locked while saving its work waits for the owner to
+	// unlock it (the same "waiting for vault unlock" wording the web runs list uses).
+	if len(recoveryCause) > 0 && recoveryCause[0] == vaultLockedCause {
+		recoveringSuffix = " (run waiting for vault unlock)"
 	}
 	if consumedAt == nil {
 		if terminalRunStatuses[runStatus] {
@@ -1579,6 +1585,17 @@ const forgeUnreachableCause = "forge_unreachable"
 // unreachable (PRD #1392 M5) — the one cause that swaps in forge-specific surface wording.
 func isForgePark(r apitypes.RunDTO) bool {
 	return r.Status == statusRecoveryWait && strOr(r.RecoveryWaitCause, "") == forgeUnreachableCause
+}
+
+// vaultLockedCause is the RecoveryWaitCause of a run parked because its owner's vault locked
+// at a durability boundary (issue #1766). It resumes at its next timer-based retry once the
+// vault is unlocked (while it stays locked, a promoted run waits queued), so no surface
+// promises an instant resume on unlock.
+const vaultLockedCause = "vault_locked"
+
+// isVaultLockedPark reports whether a recovery_wait run is parked on a locked vault (issue #1766).
+func isVaultLockedPark(r apitypes.RunDTO) bool {
+	return r.Status == statusRecoveryWait && strOr(r.RecoveryWaitCause, "") == vaultLockedCause
 }
 
 // codexAccountUnavailableCause is the RecoveryWaitCause of a run held on its Codex

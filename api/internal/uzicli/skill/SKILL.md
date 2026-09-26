@@ -335,7 +335,10 @@ uzi version
   `pool_wait` (an `auto` run held because its token pool is empty — add a token
   to the pool and it resumes), `recovery_wait` (parked after an empty model turn, or
   because the forge was unreachable at clone — cause `forge_unreachable`, capped by
-  `RUN_FORGE_UNREACHABLE_MAX_PARKS`; the sweep retries it on a capped backoff), and `paused` (an owner-requested hold, `uzi
+  `RUN_FORGE_UNREACHABLE_MAX_PARKS`; the sweep retries it on a capped backoff; cause
+  `codex_account_unavailable` is held on its Codex account until that account is usable
+  again; cause `vault_locked` means the owner's vault locked while the run saved its work,
+  so unlock the vault and it resumes at its next retry), and `paused` (an owner-requested hold, `uzi
   run pause`, resumed on demand from the run page or `uzi run resume <id>`;
   it does not auto-resume). So to
   wait for a plan gate or a clarification park, use **`uzi run wait <id>`** (see

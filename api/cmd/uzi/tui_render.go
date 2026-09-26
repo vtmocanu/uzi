@@ -235,7 +235,8 @@ func displayHealth(health string) string {
 // it is still a wait-family hold). The retry/cap detail does not fit this fixed-width token;
 // it lives on the run-get notice and the web panel. PRD #1590: "codex_account_unavailable"
 // reads "codex wait" here, its action living on the board second line and the detail park line;
-// a relogin_required hold is re-tokened "⚿ codex login" by palette.runStateToken.
+// a relogin_required hold is re-tokened "⚿ codex login" by palette.runStateToken. Issue
+// #1766: "vault_locked" reads "vault wait" (the run is waiting for vault unlock).
 //
 // LANDING (issue #1418): landingState is the run's server-derived LandingState. A `failed` run
 // whose value is "needs_landing" reads the word "needs landing" instead of "failed" — its
@@ -292,6 +293,11 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 		// runStateToken draws it as the amber "codex login" attention token instead.
 		if len(cause) > 0 && cause[0] == codexAccountUnavailableCause {
 			return "~", "codex wait"
+		}
+		// Issue #1766: a run parked because its owner's vault locked while it saved its
+		// work. Same wait-family glyph; the word says what it waits on.
+		if len(cause) > 0 && cause[0] == vaultLockedCause {
+			return "~", "vault wait"
 		}
 		return "~", "recovery wait"
 	case statusPaused:
