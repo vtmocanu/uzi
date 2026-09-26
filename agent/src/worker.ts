@@ -277,7 +277,16 @@ export class Worker {
     // cap (even cap 0, where a non-empty subset would be rejected whole when cap < count). Built ONCE
     // before the retry loop so a re-register re-sends the same snapshot. Undefined for an ordinary
     // worker with no pending journals (or no registry) ⇒ the register wire stays byte-identical.
+    const pending = this.outbox?.listPendingTerminals() ?? [];
     const initialSnapshot = this.buildRegisterSnapshot();
+    this.log.info("register terminal snapshot", {
+      authenticated_pending: pending.length,
+      claim_generations_sample: pending.slice(0, 8).map((entry) => entry.claim_generation),
+      claim_generations_omitted: Math.max(0, pending.length - 8),
+      snapshot_epoch: initialSnapshot?.snapshot_epoch ?? null,
+      pending_overflow: initialSnapshot?.pending_overflow ?? false,
+      snapshot_present: initialSnapshot !== undefined,
+    });
     let attempt = 0;
     while (!signal.aborted) {
       try {
