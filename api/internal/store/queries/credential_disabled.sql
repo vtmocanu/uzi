@@ -1,0 +1,46 @@
+-- Credential disablement parks an existing worker flight without consuming any
+-- pending owner pause or changing its session, phase, custody, or recovery state.
+-- name: ParkCredentialDisabledRun :execrows
+UPDATE runs SET
+    status = 'paused',
+    status_since = now(),
+    hold_reason = 'credential_disabled',
+    codex_cap_hash = NULL,
+    codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND claim_generation = @claim_generation
+  AND claim_released_at IS NULL
+  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND hold_reason IS NULL;
+
+-- The M1 partial index narrows this owner-scoped page to held runs. The caller
+-- re-evaluates the current credential requirement before promoting each row.
+-- name: ListCredentialDisabledRuns :many
+SELECT id, user_id, status_since FROM runs
+WHERE user_id = @user_id AND status = 'paused' AND hold_reason = 'credential_disabled'
+ORDER BY status_since ASC, id ASC
+LIMIT @page_size::int;
+
+-- Promotion banks only the parked interval. The active time already spent before
+-- parking must still fit the frozen budget; the hold interval is excluded.
+-- name: PromoteCredentialDisabledRun :one
+UPDATE runs SET
+    status = 'queued',
+    status_since = now(),
+    budget_paused_seconds = budget_paused_seconds
+        + GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int),
+    hold_reason = NULL,
+    codex_cap_hash = NULL,
+    codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND user_id = @user_id
+  AND status = 'paused' AND hold_reason = 'credential_disabled'
+  AND (started_at IS NULL OR
+       (COALESCE(budget_wall_seconds, @global_timeout_seconds::int)
+          + budget_extension_seconds + budget_finalize_seconds)
+       - (GREATEST(0, EXTRACT(EPOCH FROM (status_since - started_at))::int)
+          - budget_paused_seconds) > 0)
+RETURNING id, user_id, status;
