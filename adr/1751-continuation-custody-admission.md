@@ -30,6 +30,8 @@ Rejected: subtracting the candidate's own holds from the owner count. It fixes t
 
 A worker that claims a run and never reports `running` has the run swept back to `queued` (`SweepClaimedNeverStarted`) without a requeue charge and without settling the new hold. Unbounded, the exemption would let that loop add one hold per sweep forever, where the owner cap used to stop it. So the exemption holds only while the run's own open-hold count is below `custodyHoldLimit`; once a single run holds the limit's worth, it faces the owner cap again and surfaces the custody-limit reason. The same bound is in all three predicates.
 
+Exact rule: a queued run with `claim_generation >= 1` bypasses owner-count admission only while it has 1 to 7 owner-scoped open holds of its own; at 8 or more it is admitted exactly like a fresh run. Remedy for a run blocked at its own bound: settle or recover its older holds where possible (the capture/publication release, #1582, or D4), or, after assessing the work each one protects, explicitly discard them through the owner-discard path (#1342 / #1318). No separate constant and no "started executing" distinction: the complexity is not worth a case this rare. Accepted 2026-09-26 by the maintainer's delegates (the landing session and its Codex peer), as a narrowing of the maintainer's original "always resume" decision.
+
 ### D3: No strict ceiling
 
 The owner hold count can now exceed the limit (by design, for continuations), and #1318 already records that concurrent claims can overshoot it. The limit is an admission gate for new work, not a transactional ceiling on holds.
