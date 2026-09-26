@@ -58,24 +58,31 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 	var bank int32
 	var epoch int64
 	var cap []byte
-	var ownerWorker uuid.UUID
+	var ownerWorker pgtype.UUID
 	var pauseAt time.Time
 	var recoveryCount int32
+	var claimReleased pgtype.Timestamptz
 	read := func() {
 		t.Helper()
 		err := pool.QueryRow(ctx, `SELECT status, hold_reason, session_id, started_at,
             budget_paused_seconds, codex_claim_epoch, codex_cap_hash, worker_id,
-            pause_requested_at, pause_mode, recovery_wait_count FROM runs WHERE id=$1`, run).
-			Scan(&status, &hold, &session, &gotStarted, &bank, &epoch, &cap, &ownerWorker, &pauseAt, &pauseMode, &recoveryCount)
+            pause_requested_at, pause_mode, recovery_wait_count, claim_released_at FROM runs WHERE id=$1`, run).
+			Scan(&status, &hold, &session, &gotStarted, &bank, &epoch, &cap, &ownerWorker, &pauseAt, &pauseMode, &recoveryCount, &claimReleased)
 		if err != nil {
 			t.Fatalf("read run: %v", err)
 		}
 	}
 	read()
 	if status != "paused" || (!hold.Valid || hold.String != "credential_disabled") || bank != 3 || epoch != 5 || cap != nil ||
-		!gotStarted.Equal(started) || session != "resume-session" || ownerWorker != worker ||
-		pauseMode != "now" || recoveryCount != 2 || pauseAt.IsZero() {
+		!gotStarted.Equal(started) || session != "resume-session" || !ownerWorker.Valid || ownerWorker.Bytes != worker ||
+		pauseMode != "now" || recoveryCount != 2 || pauseAt.IsZero() || !claimReleased.Valid {
 		t.Fatalf("park mutated protected state: status=%s hold=%v bank=%d epoch=%d cap=%x started=%v session=%s worker=%s pause=%s recovery=%d", status, hold, bank, epoch, cap, gotStarted, session, ownerWorker, pauseMode, recoveryCount)
+	}
+	if n, err := q.SetRunRunning(ctx, store.SetRunRunningParams{ID: run, WorkerID: pgWorker}); err != nil || n != 0 {
+		t.Fatalf("stale running report: rows=%d err=%v", n, err)
+	}
+	if _, err := q.ResumePausedRun(ctx, store.ResumePausedRunParams{ID: run, UserID: user, GlobalTimeoutSeconds: 60}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("generic resume bypassed credential hold: %v", err)
 	}
 	list, err := q.ListCredentialDisabledRuns(ctx, store.ListCredentialDisabledRunsParams{UserID: user, PageSize: 1})
 	if err != nil || len(list) != 1 || list[0].ID != run {
@@ -106,10 +113,46 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 	}
 	read()
 	if status != "queued" || hold.Valid || bank < 12 || bank > 15 || epoch != 6 || cap != nil ||
-		session != "resume-session" || ownerWorker != worker || pauseMode != "now" || recoveryCount != 2 {
+		session != "resume-session" || ownerWorker.Valid || pauseMode != "now" || recoveryCount != 2 {
 		t.Fatalf("promotion state: status=%s hold=%v bank=%d epoch=%d session=%s worker=%s pause=%s recovery=%d", status, hold, bank, epoch, session, ownerWorker, pauseMode, recoveryCount)
 	}
 	if err := promote(user); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("repeat promotion: %v", err)
+	}
+}
+
+func TestCredentialDisabledWorklistCursorLiveDB(t *testing.T) {
+	ctx, pool, q, user := codexLiveDB(t)
+	repo, worker := codexRunFixture(ctx, t, pool, user)
+	older := insertCodexRun(ctx, t, pool, user, repo, worker, 903, "running", "budget blocked")
+	newer := insertCodexRun(ctx, t, pool, user, repo, worker, 904, "running", "promotable")
+	for _, id := range []uuid.UUID{older, newer} {
+		mustExec(ctx, t, pool, `UPDATE runs SET status='paused', hold_reason='credential_disabled',
+            claim_released_at=now(), started_at=now()-interval '20 seconds',
+            budget_wall_seconds=60 WHERE id=$1`, id)
+	}
+	mustExec(ctx, t, pool, `UPDATE runs SET started_at=now()-interval '200 seconds',
+        status_since=now()-interval '120 seconds' WHERE id=$1`, older)
+	mustExec(ctx, t, pool, `UPDATE runs SET status_since=now()-interval '10 seconds' WHERE id=$1`, newer)
+	first, err := q.ListCredentialDisabledRuns(ctx, store.ListCredentialDisabledRunsParams{UserID: user, PageSize: 1})
+	if err != nil || len(first) != 1 || first[0].ID != older {
+		t.Fatalf("first page: %v, %v", first, err)
+	}
+	if _, err := q.PromoteCredentialDisabledRun(ctx, store.PromoteCredentialDisabledRunParams{
+		ID: older, UserID: user, GlobalTimeoutSeconds: 60,
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("budget-blocked oldest row: %v", err)
+	}
+	second, err := q.ListCredentialDisabledRuns(ctx, store.ListCredentialDisabledRunsParams{
+		UserID: user, PageSize: 1, AfterStatusSince: first[0].StatusSince,
+		AfterID: pgtype.UUID{Bytes: first[0].ID, Valid: true},
+	})
+	if err != nil || len(second) != 1 || second[0].ID != newer {
+		t.Fatalf("second page: %v, %v", second, err)
+	}
+	if _, err := q.PromoteCredentialDisabledRun(ctx, store.PromoteCredentialDisabledRunParams{
+		ID: newer, UserID: user, GlobalTimeoutSeconds: 60,
+	}); err != nil {
+		t.Fatalf("promote second page: %v", err)
 	}
 }

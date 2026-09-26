@@ -11016,6 +11016,7 @@ UPDATE runs SET
     updated_at            = now()
 WHERE id = $1 AND user_id = $2
   AND status = 'paused'
+  AND hold_reason IS DISTINCT FROM 'credential_disabled'
   -- D6: refuse a completion hold unless the completion decision endpoint opts in.
   AND (hold_reason IS DISTINCT FROM 'completion_blocked' OR $3::boolean)
   -- D7: refuse a budget_exhausted park with no remaining budget (extend is the way back).
