@@ -15,14 +15,23 @@
 -- repo Y (cross-repo, and since findings are owner-scoped, possibly cross-user). fd.repo_id is
 -- NOT NULL, so the equality carries no NULL-repo hazard the judge query must dodge.
 --
--- The other filters, each load-bearing:
---   * fd.status = 'filed' OR (fd.status = 'done' AND fd.set_via IS NULL) — SETTLED filed
---     coordinates (a mid-filing claim is not filed), PLUS a coordinate a human marked done while
---     it still carried its issue link (issue #1723). The human-done branch is here only so its
---     edge is CONSUMED (ApplyFindingIssueCloseEdge stamps close_synced_at without changing the
---     verdict): otherwise a human Undo back to filed would find the old close still unconsumed and
---     the next tick would auto-resolve over the Undo. A sync done (set_via = 'issue_close') always
---     has its edge stamped already, so the set_via IS NULL arm only ever adds human verdicts.
+-- Two arms, UNION ALL, so the hot arm keeps its index. An OR of both statuses in one WHERE no
+-- longer implies the partial index predicate of idx_finding_dispositions_close_pending
+-- (status = 'filed'), so the planner could not use that index even for filed rows. The arms are
+-- disjoint by status, so UNION ALL never duplicates a row.
+--   * FILED arm: fd.status = 'filed' exactly — SETTLED filed coordinates (a mid-filing claim is
+--     not filed). Its WHERE implies the partial index predicate, so it can use
+--     idx_finding_dispositions_close_pending (repo_id) and each per-repo tick touches only that
+--     repo's still-pending filed rows.
+--   * HUMAN-DONE arm: fd.status = 'done' AND fd.set_via IS NULL — a coordinate a human marked done
+--     while it still carried its issue link (issue #1723). It is here only so its edge is CONSUMED
+--     (ApplyFindingIssueCloseEdge stamps close_synced_at without changing the verdict): otherwise a
+--     human Undo back to filed would find the old close still unconsumed and the next tick would
+--     auto-resolve over the Undo. A sync done (set_via = 'issue_close') always has its edge stamped
+--     already, so the set_via IS NULL filter only ever adds human verdicts. This arm has NO
+--     repo-leading index (the table's only other index is UNIQUE (user_id, repo_id, location)), so
+--     it may scan finding_dispositions; accepted without a migration because such rows are rare.
+-- The shared filters, each load-bearing:
 --   * fd.filed_issue_iid IS NOT NULL — a settled row always has one; the guard keeps a NULL from
 --     matching some other row's iid and also keeps the partial index predicate exact.
 --   * fd.close_synced_at IS NULL — the EDGE. Without it the pass is level-triggered and re-fires
@@ -31,10 +40,7 @@
 --     close_synced_at stays stamped, so a flapping issue cannot ping-pong the backlog.
 --
 -- Projects the disposition id (what ApplyFindingIssueCloseEdge keys on) and filed_issue_iid
--- (logging only). Ordered by fd.id for a stable batch. The partial index idx_finding_dispositions_
--- close_pending (status = 'filed') covers the filed branch only, NOT the human-done branch: that
--- is accepted rather than migrated, since the table is small (per-user, per-coordinate) and the
--- scan stays bounded by fd.repo_id.
+-- (logging only). Ordered by id across both arms for a stable batch.
 SELECT
     fd.id              AS id,
     fd.filed_issue_iid AS filed_issue_iid
@@ -43,11 +49,25 @@ JOIN issues i
     ON i.repo_id = fd.repo_id
    AND i.forge_issue_iid = fd.filed_issue_iid
 WHERE fd.repo_id = @repo_id
-  AND (fd.status = 'filed' OR (fd.status = 'done' AND fd.set_via IS NULL))
+  AND fd.status = 'filed'
   AND fd.filed_issue_iid IS NOT NULL
   AND fd.close_synced_at IS NULL
   AND i.state = 'closed'
-ORDER BY fd.id ASC;
+UNION ALL
+SELECT
+    fd.id              AS id,
+    fd.filed_issue_iid AS filed_issue_iid
+FROM finding_dispositions fd
+JOIN issues i
+    ON i.repo_id = fd.repo_id
+   AND i.forge_issue_iid = fd.filed_issue_iid
+WHERE fd.repo_id = @repo_id
+  AND fd.status = 'done'
+  AND fd.set_via IS NULL
+  AND fd.filed_issue_iid IS NOT NULL
+  AND fd.close_synced_at IS NULL
+  AND i.state = 'closed'
+ORDER BY id ASC;
 
 -- name: ApplyFindingIssueCloseEdge :one
 -- Apply ONE close edge in a single guarded statement that ALWAYS consumes the edge

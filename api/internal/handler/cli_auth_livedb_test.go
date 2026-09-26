@@ -1059,6 +1059,12 @@ func TestCLITaskRunsBearerReachableLiveDB(t *testing.T) {
 // FileFinding accepts an empty {} body then 404s at GetIncidentalFinding; DismissFinding
 // decodes+validates the reason (so a VALID {"reason":"wont_do"} is required to reach the
 // clean 404) then 404s at GetIncidentalFinding.
+//
+// Issue #1723 adds the three human-Done routes to the same RequireUser mount, so they are
+// pinned here too: POST /api/findings/{id}/done 404s at the owner-scoped GetIncidentalFinding
+// (before any disposition write); DELETE /api/findings/{id}/disposition 404s because the
+// owner-scoped UndoFindingDisposition matches no row; POST /api/findings/done is a 200 with
+// updated 0, since the bulk query is owner-scoped and skips an unknown id silently.
 func TestCLIReachesFilingRoutesOverBearerLiveDB(t *testing.T) {
 	_, router, pool := cliLiveDB(t)
 	user := cliSeedUser(t, pool, false)
@@ -1070,44 +1076,70 @@ func TestCLIReachesFilingRoutesOverBearerLiveDB(t *testing.T) {
 	repoID := uuid.New()
 
 	cases := []struct {
-		name, path, body string
-		want             int
+		name, method, path, body string
+		want                     int
 	}{
 		{
 			// A valid reason is mandatory to reach the owner lookup: an empty/invalid body
 			// is a 400 (still not 401), but a valid one gives the cleaner owner-scoped 404.
-			name: "findings dismiss",
-			path: "/api/findings/" + findingID.String() + "/dismiss",
-			body: `{"reason":"wont_do"}`,
-			want: http.StatusNotFound,
+			name:   "findings dismiss",
+			method: http.MethodPost,
+			path:   "/api/findings/" + findingID.String() + "/dismiss",
+			body:   `{"reason":"wont_do"}`,
+			want:   http.StatusNotFound,
 		},
 		{
-			name: "findings file",
-			path: "/api/findings/" + findingID.String() + "/issue",
-			body: `{}`,
-			want: http.StatusNotFound,
+			name:   "findings file",
+			method: http.MethodPost,
+			path:   "/api/findings/" + findingID.String() + "/issue",
+			body:   `{}`,
+			want:   http.StatusNotFound,
 		},
 		{
-			name: "review file",
-			path: "/api/runs/" + runID.String() + "/review/recommendations/" + recID.String() + "/issue",
-			body: `{"repo_id":"` + repoID.String() + `","title":"t","description":"d"}`,
-			want: http.StatusNotFound,
+			name:   "review file",
+			method: http.MethodPost,
+			path:   "/api/runs/" + runID.String() + "/review/recommendations/" + recID.String() + "/issue",
+			body:   `{"repo_id":"` + repoID.String() + `","title":"t","description":"d"}`,
+			want:   http.StatusNotFound,
+		},
+		{
+			// Issue #1723: keyed on the evidence id, 404 at the owner-scoped lookup.
+			name:   "findings done",
+			method: http.MethodPost,
+			path:   "/api/findings/" + findingID.String() + "/done",
+			want:   http.StatusNotFound,
+		},
+		{
+			// Issue #1723: bulk, owner-scoped; an unknown disposition id is skipped, so 200
+			// with updated 0 (the reachability proof is "not 401").
+			name:   "findings bulk done",
+			method: http.MethodPost,
+			path:   "/api/findings/done",
+			body:   `{"ids":["` + findingID.String() + `"]}`,
+			want:   http.StatusOK,
+		},
+		{
+			// Issue #1723: undo keyed on the disposition id; nothing owned to undo, so 404.
+			name:   "findings undo disposition",
+			method: http.MethodDelete,
+			path:   "/api/findings/" + findingID.String() + "/disposition",
+			want:   http.StatusNotFound,
 		},
 	}
 	for _, tc := range cases {
-		rec := bearerReqBody(router, http.MethodPost, tc.path, uzc, tc.body)
+		rec := bearerReqBody(router, tc.method, tc.path, uzc, tc.body)
 		// The crux: RequireUser accepted the Bearer token. The pre-M1 cookie-only mount
 		// would have returned 401 here.
 		if rec.Code == http.StatusUnauthorized {
-			t.Errorf("PRD #365 M1: %s POST %s over Bearer = 401 — the route is still cookie-only; M1 must move it to RequireUser\nbody: %s",
-				tc.name, tc.path, rec.Body.String())
+			t.Errorf("PRD #365 M1: %s %s %s over Bearer = 401 — the route is still cookie-only; M1 must move it to RequireUser\nbody: %s",
+				tc.name, tc.method, tc.path, rec.Body.String())
 			continue
 		}
 		// And the exact deterministic code for a foreign/nonexistent coordinate: an
 		// owner-scoped clean 404, no existence oracle, proving owner-scoping over Bearer.
 		if rec.Code != tc.want {
-			t.Errorf("PRD #365 M1: %s POST %s over Bearer = %d, want %d (owner-scoped clean not-found, no forge call)\nbody: %s",
-				tc.name, tc.path, rec.Code, tc.want, rec.Body.String())
+			t.Errorf("PRD #365 M1: %s %s %s over Bearer = %d, want %d (owner-scoped: clean not-found, or an empty bulk result; no forge call)\nbody: %s",
+				tc.name, tc.method, tc.path, rec.Code, tc.want, rec.Body.String())
 		}
 	}
 }
