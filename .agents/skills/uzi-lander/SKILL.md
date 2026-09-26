@@ -13,7 +13,7 @@ that already happened. From there to "merged, `main` green" is this skill. This 
 recovery of a lost run; it hands off here the moment a run is past its plan gate.
 `uzi-release` only cuts a release, once this skill has landed what should ship. Landing the
 whole open-PR set is references/batch.md; Renovate and other dependency PRs are
-references/renovate.md. Load `uzi-cli` first (the Skill tool): every `uzi` verb, exit code
+references/renovate.md; a private security-advisory fix is references/advisory.md. Load `uzi-cli` first (the Skill tool): every `uzi` verb, exit code
 and `--json` envelope quirk lives there.
 
 Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` directory.
@@ -362,7 +362,8 @@ Branch on the poller's own `EXIT=`/`RESULT=` line, never on the harness's task s
   verifying and deciding findings; `references/mr-rework.md` coordinating with uzi's own
   rework; `references/merge-mechanics.md` ruleset, red `main`, post-merge CI;
   `references/batch.md` landing the whole open-PR set in order; `references/renovate.md`
-  Renovate, devbox and other dependency PRs.
+  Renovate, devbox and other dependency PRs; `references/advisory.md` landing and
+  publishing a private GHSA fix.
 
 ## Safety
 
