@@ -907,6 +907,15 @@ Tracked as GitHub issue vtmocanu/uzi#1695.
 
 - A top-level MR comment consisting solely of an allowlisted review-bot control command (CodeRabbit's `@coderabbitai review` family; Greptile's `@greptileai review` / `@greptile review`) is not actionable review feedback and never starts an mr_rework; any added prose, or an inline comment, still counts. (AI-synced 2026-09-25)
 
+## Feature #1732 — Disable and re-enable account credentials
+
+Tracked as GitHub issue vtmocanu/uzi#1732; PRD at `prds/1732-disable-account-credentials.md`.
+
+- A user can disable any Anthropic token or OpenAI/Codex credential and re-enable it on demand. Disabled means kept (value, name, preferences) but not polled, not refreshed in the background, not selectable, hidden from the sidebar and pickers, and absent from the admin Rate limits page (no row, no count). Past runs and spend stay in history. (AI-synced 2026-09-26)
+- Work pinned or bound to a disabled credential waits and resumes on re-enable; uzi never silently spends a different credential instead. A run already holding the credential finishes. (AI-synced 2026-09-26)
+- Every default is enabled: disabling the default requires choosing an enabled replacement; disabling the last credential of a kind leaves that kind with no default. The Judge keeps Feature #1140's empty-pool fallback to the (enabled) default. (AI-synced 2026-09-26)
+- Disabled credentials collapse into a "Disabled (n)" section, collapsed by default. Enable/disable is web-only; the CLI only shows the state. (AI-synced 2026-09-26)
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
