@@ -22,6 +22,8 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.85.0] - 2026-09-26
+
 ### Added
 
 - **The Helm chart can run on OpenShift and OKD ([#1755](https://github.com/vtmocanu/uzi/issues/1755)).**
@@ -49,7 +51,7 @@ through `[0.52.0]`.)
 - **A run that finishes while the api is briefly unreachable no longer fails.**
   A run with the completion check on asks the api for its completion permit at the very end, and a single network error there failed the whole run, even though its work was already pushed; after the api came back the run still showed as failed. The worker now retries that request until the api answers, for up to 10 minutes, and then completes normally. A real refusal is still handled as before.
 
-## [0.84.0] - 2026-09-20
+## [0.84.0] - 2026-09-26
 
 ### Added
 
@@ -4313,7 +4315,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.84.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.85.0...HEAD
+[0.85.0]: https://github.com/vtmocanu/uzi/compare/v0.84.0...v0.85.0
 [0.84.0]: https://github.com/vtmocanu/uzi/compare/v0.83.1...v0.84.0
 [0.83.1]: https://github.com/vtmocanu/uzi/compare/v0.83.0...v0.83.1
 [0.83.0]: https://github.com/vtmocanu/uzi/compare/v0.82.0...v0.83.0
