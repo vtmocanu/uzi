@@ -301,8 +301,8 @@ func TestWorkerRegisterSnapshotDropLogs(t *testing.T) {
 		body     string
 		message  string
 	}{
-		{"feature disabled", true, "{\"active_snapshot\":{\"active\":[]}}", "worker register active snapshot dropped: feature disabled"},
-		{"parse rejected", false, "{\"active_snapshot\":{\"snapshot_epoch\":\"invalid\"}}", "worker register active snapshot dropped: parse rejected"},
+		{"feature disabled", true, "{\"active_snapshot\":{\"active\":[],\"marker\":\"hidden-marker-1742\"}}", "worker register active snapshot dropped: feature disabled"},
+		{"parse rejected", false, "{\"active_snapshot\":{\"snapshot_epoch\":\"hidden-marker-1742\"}}", "worker register active snapshot dropped: parse rejected"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var logs bytes.Buffer
@@ -320,8 +320,8 @@ func TestWorkerRegisterSnapshotDropLogs(t *testing.T) {
 			if !strings.Contains(logs.String(), tc.message) {
 				t.Fatalf("register drop log missing %q: %s", tc.message, logs.String())
 			}
-			if strings.Contains(logs.String(), tc.body) {
-				t.Fatalf("register logged request body: %s", logs.String())
+			if strings.Contains(logs.String(), "hidden-marker-1742") {
+				t.Fatalf("register logged snapshot content: %s", logs.String())
 			}
 		})
 	}

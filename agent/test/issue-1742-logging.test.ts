@@ -28,11 +28,15 @@ it("reports physical terminals separately from authenticated terminals without f
     const original = make(recordingLogger().logger);
     await original.init();
     assert.equal((await original.journalTerminal(runId, 5, "running", 0, { status: "completed" })).journaled, true);
+    assert.equal((await original.journalTerminal(runId, 6, "running", 0, { status: "completed" })).journaled, true);
     const file = path.join(root, runId, "terminal-5.json");
     const body = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
     body.mac = "0".repeat(64);
     await fs.writeFile(file, JSON.stringify(body));
-    await fs.symlink(file, path.join(root, runId, "terminal-6.json"));
+    const symlinkPath = path.join(root, runId, "terminal-6.json");
+    const validTarget = path.join(parent, "valid-terminal-6.json");
+    await fs.rename(symlinkPath, validTarget);
+    await fs.symlink(validTarget, symlinkPath);
 
     const capture = recordingLogger();
     const restarted = make(capture.logger);
@@ -45,7 +49,7 @@ it("reports physical terminals separately from authenticated terminals without f
     assert.equal(load?.authenticated_pending, 0);
     assert.equal(load?.rejected_files, 2);
     assert.deepEqual(restarted.listPendingTerminals(), []);
-    assert.equal(await fs.readlink(path.join(root, runId, "terminal-6.json")), file);
+    assert.equal(await fs.readlink(symlinkPath), validTarget);
     assert.equal(JSON.stringify([inventory, load]).includes(runId), false);
   } finally {
     await fs.rm(parent, { recursive: true, force: true });
