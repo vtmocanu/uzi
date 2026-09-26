@@ -1585,6 +1585,11 @@ function codexHoldCopy(
  * PRD #1590 D6: when the cause is `codex_account_unavailable` the panel swaps in the
  * per-action Codex copy from codexHoldCopy instead, with no retry time or park count.
  *
+ * Issue #1766: when the cause is `vault_locked` (the owner's vault locked while the run was
+ * saving its work) the panel says it is waiting for a vault unlock. Unlocking happens through
+ * the global VaultLockedBanner, not here; the run resumes at its next timer-based retry once
+ * the vault is unlocked, so the copy never promises an instant resume.
+ *
  * A null/other cause keeps the generic transient-interruption copy (issue #1197, widened
  * by issue #1088). The wording is kept consistent with the TUI and `uzi run get`.
  *
@@ -1600,6 +1605,9 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
   // codex_account_unavailable hold gets the Codex copy below. Every other cause (including
   // the null/untyped transient-interruption park, issue #1197/#1088) keeps the generic copy.
   const forgePark = run.recovery_wait_cause === "forge_unreachable";
+  // Issue #1766: a vault_locked park waits for the owner to unlock the vault (through the
+  // page-level banner); it resumes at its next retry after that, not the instant of unlock.
+  const vaultPark = run.recovery_wait_cause === "vault_locked";
   // PRD #1590 D6: a Codex account hold has its own copy and, unlike the forge park, NO
   // retry time or park count — the hold has no timer, so nothing may count down.
   const codexHold =
@@ -1630,7 +1638,9 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
             ? codexHold.heading
             : forgePark
               ? "Waiting for the forge"
-              : "Recovering and resuming automatically"}
+              : vaultPark
+                ? "Paused — waiting for vault unlock"
+                : "Recovering and resuming automatically"}
         </p>
         {codexHold ? (
           <>
@@ -1659,6 +1669,11 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
               {retryAt ? `Retry at ${retryAt} (${parkLabel}).` : `Attempt ${parkLabel}.`}
             </p>
           </>
+        ) : vaultPark ? (
+          <p className="mt-0.5 text-xs text-muted">
+            This run's vault locked while it was saving its work. Unlock your vault (use the
+            banner at the top of the page) and it resumes automatically at its next retry.
+          </p>
         ) : (
           <>
             <p className="mt-0.5 text-xs text-muted">
@@ -1910,7 +1925,11 @@ export function RunView() {
               // (codexHoldCopy's `announce`), so each action change is re-announced.
               run.recovery_wait_cause === "codex_account_unavailable"
               ? `codex:${run.codex_account_action ?? ""}`
-              : "recovery_wait"
+              : // Issue #1766: a vault_locked park is not a transient interruption; it
+                // waits on the owner's unlock, so it gets its own stable key and sentence.
+                run.recovery_wait_cause === "vault_locked"
+                ? "vault_locked"
+                : "recovery_wait"
             : run?.status === "paused"
               ? "paused"
             : "";
@@ -1926,6 +1945,8 @@ export function RunView() {
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
           : parkKey === "recovery_wait"
             ? "This run paused to recover from a transient interruption and will resume automatically."
+            : parkKey === "vault_locked"
+              ? "This run is paused waiting for vault unlock. Unlock your vault and it resumes automatically at its next retry."
             : parkKey.startsWith("codex:")
               ? codexHoldCopy(parkKey.slice("codex:".length) || null, "").announce
             : parkKey === "paused"

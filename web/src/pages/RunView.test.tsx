@@ -4662,6 +4662,35 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     expect(container.textContent).toContain("transient interruption");
     expect(container.textContent).not.toContain("Waiting for the forge");
   });
+
+  // Issue #1766: a vault_locked park waits for the owner's vault unlock (done through the
+  // global banner) and resumes at its next retry, never "the instant you unlock".
+  it("renders the vault-unlock copy for a vault_locked park, with no forge count or countdown", () => {
+    const { container } = render(
+      <RecoveryWaitPanel
+        run={run({
+          status: "recovery_wait",
+          recovery_wait_cause: "vault_locked",
+          // A stale forge retry stamp must not leak a retry time or park count here.
+          recovery_retry_not_before: "2026-01-01T09:30:00Z",
+          forge_park_count: 2,
+          forge_park_max: 5,
+        })}
+      />,
+    );
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      "Paused — waiting for vault unlock",
+    );
+    expect(container.textContent).toContain(
+      "This run's vault locked while it was saving its work. Unlock your vault (use the banner at the top of the page) and it resumes automatically at its next retry.",
+    );
+    expect(container.textContent).not.toContain("transient interruption");
+    expect(container.textContent).not.toContain("Waiting for the forge");
+    expect(container.textContent).not.toContain("2 of 5");
+    expect(container.textContent).not.toMatch(/Retry at/);
+    // Unlock lives on the global banner: the panel offers no control of its own.
+    expect(container.querySelector("button")).toBeNull();
+  });
 });
 
 // PRD #1590 D6: a run held on an unusable Codex account. The copy is keyed on the
@@ -4973,6 +5002,22 @@ describe("RunView park announcement — recovery_wait (issue #1197, a11y)", () =
     // Mutation guard: it is the recovery copy, NOT the pool_wait or awaiting_input copy.
     expect(region.textContent).not.toContain("pooled Anthropic token");
     expect(region.textContent).not.toContain("asking you a question");
+  });
+
+  // Issue #1766: a vault_locked park announces the vault unlock it waits on, not the
+  // generic transient interruption.
+  it("announces a vault_locked park as waiting for vault unlock", async () => {
+    renderPage({ status: "recovery_wait", recovery_wait_cause: "vault_locked" });
+    const region = await waitFor(() => {
+      const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement | null;
+      if (!el || el.textContent === "") throw new Error("not announced yet");
+      return el;
+    });
+    expect(region.getAttribute("aria-live")).toBe("polite");
+    expect(region.textContent).toBe(
+      "This run is paused waiting for vault unlock. Unlock your vault and it resumes automatically at its next retry.",
+    );
+    expect(region.textContent).not.toContain("transient interruption");
   });
 
   // PRD #1590 D6: a Codex account hold announces its own action, never the transient park.

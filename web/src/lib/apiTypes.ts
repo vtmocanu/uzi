@@ -2541,9 +2541,12 @@ export interface Run {
   rate_limit_type: string | null;
   /** PRD #1392 M1: the TYPED cause of a `recovery_wait` park. Null is the LEGACY/untyped
    *  park — the empty-turn park (#1197) writes null, so render null as the generic
-   *  "waiting to recover" wording, NOT as any particular cause. Today the only non-null
-   *  value is "forge_unreachable" (the forge stayed unreachable at clone);
-   *  "empty_turn"/"provider_outage" are reserved. Render an unrecognised value honestly (a
+   *  "waiting to recover" wording, NOT as any particular cause. Known non-null values:
+   *  "forge_unreachable" (the forge stayed unreachable at clone), "codex_account_unavailable"
+   *  (PRD #1590: held on its Codex account) and "vault_locked" (issue #1766: the owner's
+   *  vault locked at a durability boundary; the run resumes at its next retry once the vault
+   *  is unlocked, and waits `queued` while it stays locked); "empty_turn"/"provider_outage"
+   *  are reserved. Render an unrecognised value honestly (a
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
   recovery_wait_cause: string | null;
