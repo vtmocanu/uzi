@@ -1546,18 +1546,39 @@ export class CodexExecutor implements Executor {
    * credential-free capture after a vault-locked deferral. Delegates to the live facade's
    * {@link CodexExecutionSafetyImpl.settleForCredentialFreeCapture} (serialized behind its
    * boundary queue; it poisons and drains the registry, never reconciles or mints a permit).
-   * With no Codex safety yet (the first epoch never started) there is nothing to drain, so it
-   * answers `observed_empty`. A facade of any other shape fails closed as `incomplete`.
+   * A facade of any other shape fails closed as `incomplete`.
+   *
+   * With no Codex safety yet (no epoch was ever handed to `this.safety`) it answers
+   * `observed_empty` ONLY when no epoch registry that could hold work is outstanding: none was
+   * ever created, or every one created was a half-built epoch whose teardown was verified
+   * clean. A registry still being built, or one whose half-built teardown failed, answers
+   * `incomplete` rather than trusting an unobserved drain.
    */
   async settleForCredentialFreeCapture(deadlineMs: number): Promise<CredentialFreeCaptureSettlement> {
     const safety = this.safety;
-    if (safety === undefined) return { kind: "observed_empty" };
+    if (safety === undefined) {
+      const outstanding = this.unverifiedEpochRegistries.size;
+      if (outstanding === 0) return { kind: "observed_empty" };
+      return {
+        kind: "incomplete",
+        errors: [{
+          category: "protocol",
+          message: `codex capture settle: ${outstanding} epoch registry(ies) created without a live safety facade or a clean teardown`,
+        }],
+      };
+    }
     if (safety instanceof CodexExecutionSafetyImpl) return safety.settleForCredentialFreeCapture(deadlineMs);
     return {
       kind: "incomplete",
       errors: [{ category: "protocol", message: "codex capture settle: unsupported safety facade" }],
     };
   }
+
+  /** Issue #1766: every epoch registry {@link startProviderEpoch} created, minus the half-built
+   *  ones whose teardown was verified clean. A registry that became a live epoch stays here, but
+   *  it is then reachable through `this.safety` (set once, never unset), so this set is consulted
+   *  only while `this.safety` is undefined. */
+  private readonly unverifiedEpochRegistries = new Set<ExecutionRegistry>();
 
   private readonly log: Logger;
   private readonly homeRoot: string;
@@ -2272,6 +2293,7 @@ export class CodexExecutor implements Executor {
     const ownedDataRoot = path.join(homeRoot, "codex-data", `epoch-${epochIndex}`);
     const codexHome = path.join(ownedDataRoot, "codex");
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(epochIndex));
+    this.unverifiedEpochRegistries.add(registry);
     // The safety facade is bound to THIS registry but carries the SHARED reconcile + eviction
     // closures (so credential/generation state is continuous across epochs). Only the FINAL
     // epoch's safety.dispose ever runs evictTokens (an abandoned epoch's dispose tears its
@@ -2469,7 +2491,10 @@ export class CodexExecutor implements Executor {
     } catch (error) {
       // Never leak a half-built epoch (especially a failed recreation, where run()'s `epoch` still
       // points at the PREVIOUS live epoch): best-effort tear down whatever this build produced.
-      await this.tearDownEpoch(registry, harness, fileopHandle, boundaryDeadlineMs, true).catch(() => undefined);
+      // Issue #1766: only a VERIFIED clean teardown clears the registry from the outstanding set,
+      // so a failed or rejected one leaves a later capture settle answering `incomplete`.
+      const clean = await this.tearDownEpoch(registry, harness, fileopHandle, boundaryDeadlineMs, true).catch(() => false);
+      if (clean) this.unverifiedEpochRegistries.delete(registry);
       throw error;
     }
   }
@@ -2489,7 +2514,10 @@ export class CodexExecutor implements Executor {
     fileopHandle: FileopHelperHandle | undefined,
     deadlineMs: number,
     disposeRegistry: boolean,
-  ): Promise<void> {
+  ): Promise<boolean> {
+    // Issue #1766: whether the registry teardown was observed clean: disposed and never
+    // poisoned. Callers that ignore it keep the prior best-effort behaviour.
+    let registryClean = !disposeRegistry || (registry.state() === "disposed" && !registry.isPoisoned());
     if (disposeRegistry && registry.state() !== "disposed") {
       try {
         const q = await registry.quiesceChildren(deadlineMs);
@@ -2498,13 +2526,16 @@ export class CodexExecutor implements Executor {
         /* best-effort terminal reap; the safety facade owns the poison bookkeeping */
       }
       try {
-        await registry.disposeTools(deadlineMs);
+        const disposal = await registry.disposeTools(deadlineMs);
+        registryClean = disposal.kind === "disposed" && !registry.isPoisoned();
       } catch {
         /* idempotent dispose */
+        registryClean = false;
       }
     }
     await harness?.close().catch(() => undefined);
     await fileopHandle?.dispose().catch(() => undefined);
+    return registryClean;
   }
 
   // ─── the per-turn drive (run-lane precedence, Codex-specific) ─────────────────

@@ -6875,6 +6875,9 @@ describe("CodexExecutor: vault_locked deferral (issue #1766)", () => {
     assert.ok(caught instanceof CodexCredentialDeferredError, `got ${String(caught)}`);
     assert.doesNotMatch(caught.message, new RegExp(FRESH_TOKEN));
     assert.ok(safetyAtCheckpoint !== undefined);
+    // Documentation, not a regression gate: the swap-after-successful-start ordering predates
+    // #1766, so this assertion also passes without the deferral change. It pins the invariant
+    // the deferral relies on.
     assert.equal(executor.safety, safetyAtCheckpoint, "the failed recreation never swapped this.safety");
     assert.equal(rig.providerLaunches(), 1, "the recreated provider root was never launched");
   });
@@ -6901,8 +6904,78 @@ describe("CodexExecutor: vault_locked deferral (issue #1766)", () => {
     let caught: unknown;
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "deferred post-approval").catch((e: unknown) => { caught = e; });
     assert.ok(caught instanceof CodexCredentialDeferredError, `got ${String(caught)}`);
+    // Documentation, not a regression gate: the executor reported no iteration before the
+    // post-approval recreation even before #1766, so this also passes on the old code. It pins
+    // B1 (the runner owns the running report) rather than proving the deferral change.
     assert.equal(iterations, 0, "the executor reported no iteration (the runner owns the running report)");
     assert.equal(rig.providerLaunches(), 1, "the plan epoch ran; the post-approval epoch never launched");
     assert.equal(rig.client.releaseCalls.length, 1, "exactly the plan epoch's release succeeded");
+  });
+
+  it("settleForCredentialFreeCapture delegates to a live CodexExecutionSafetyImpl: an empty registry → observed_empty", async () => {
+    const executor = makeExecutor(makeMultiEpochRig([]), bindingOf(SUBSCRIPTION));
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(7));
+    executor.safety = createCodexExecutionSafety(reg, async () => { throw new Error("unused"); });
+    assert.deepEqual(await executor.settleForCredentialFreeCapture(500), { kind: "observed_empty" });
+    assert.equal(reg.state(), "poisoned", "the live facade's registry was poisoned and drained");
+    assert.equal(reg.reserveLaunch("provider").kind, "denied");
+  });
+
+  it("settleForCredentialFreeCapture delegates to a live CodexExecutionSafetyImpl: an unsettled reservation → incomplete", async () => {
+    const executor = makeExecutor(makeMultiEpochRig([]), bindingOf(SUBSCRIPTION));
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(7));
+    assert.equal(reg.reserveLaunch("command").kind, "reserved");
+    executor.safety = createCodexExecutionSafety(reg, async () => { throw new Error("unused"); });
+    const result = await executor.settleForCredentialFreeCapture(60);
+    assert.equal(result.kind, "incomplete");
+    if (result.kind === "incomplete") {
+      assert.ok(result.errors.some((e) => /1 launch reservation\(s\) never settled/.test(e.message)), JSON.stringify(result.errors));
+    }
+    assert.equal(reg.state(), "poisoned");
+  });
+
+  it("settleForCredentialFreeCapture on a non-Impl safety facade → incomplete (fails closed)", async () => {
+    const executor = makeExecutor(makeMultiEpochRig([]), bindingOf(SUBSCRIPTION));
+    let touched = 0;
+    const facade = new Proxy({}, { get: () => { touched += 1; return async () => { throw new Error("unused"); }; } });
+    executor.safety = facade as NonNullable<CodexExecutor["safety"]>;
+    assert.deepEqual(await executor.settleForCredentialFreeCapture(500), {
+      kind: "incomplete",
+      errors: [{ category: "protocol", message: "codex capture settle: unsupported safety facade" }],
+    });
+    assert.equal(touched, 0, "the unknown facade was never called");
+  });
+
+  it("no safety, but the first epoch's half-built teardown FAILED → settle is incomplete, never observed_empty", async () => {
+    const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", () => {})]);
+    // The fileop root launches and registers, then wiring fails; its supervisor never confirms
+    // disposal, so the half-built epoch's registry teardown poisons and fails (and is swallowed).
+    const launchEffect = rig.deps.launchEffectRoot!;
+    rig.deps = {
+      ...rig.deps,
+      launchEffectRoot: async (spec, deadlineMs) => {
+        const handle = await launchEffect(spec, deadlineMs);
+        return { ...handle, dispose: async () => ({ clean: false, reason: "dispose unconfirmed" }) };
+      },
+      wireFileop: () => { throw new Error("fileop wiring failed"); },
+    };
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    await assert.rejects(withTimeout(executor.run(makeCtx().ctx), 5000, "half-built failure"), /fileop wiring failed/);
+    assert.equal(executor.safety, undefined);
+    const result = await executor.settleForCredentialFreeCapture(100);
+    assert.equal(result.kind, "incomplete");
+    if (result.kind === "incomplete") {
+      assert.ok(result.errors.some((e) => /1 epoch registry\(ies\) created without a live safety facade or a clean teardown/.test(e.message)), JSON.stringify(result.errors));
+    }
+  });
+
+  it("no safety, and the first epoch's half-built teardown was CLEAN → settle is observed_empty", async () => {
+    const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", () => {})]);
+    rig.deps = { ...rig.deps, wireFileop: () => { throw new Error("fileop wiring failed"); } };
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    await assert.rejects(withTimeout(executor.run(makeCtx().ctx), 5000, "half-built failure"), /fileop wiring failed/);
+    assert.equal(executor.safety, undefined);
+    assert.ok(rig.effectDisposes() >= 1, "the fileop root was launched and disposed");
+    assert.deepEqual(await executor.settleForCredentialFreeCapture(100), { kind: "observed_empty" });
   });
 });
