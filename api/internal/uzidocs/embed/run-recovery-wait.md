@@ -162,15 +162,61 @@ cancelled and re-created.
   stay in ON THE FLOOR and read `~ codex wait`, like any other
   self-resolving recovery park.
 
+## Vault locked
+
+A `recovery_wait` park can also come from your own vault: a Codex
+subscription or api\_key credential refresh or release reached a locked
+owner vault. The api only answers this after the request was authorized and
+a recheck still found the vault locked, so it is a typed refusal, not a
+generic failure.
+
+Rather than fail the run, uzi parks it. It confirms the run is still
+running, brings its Codex processes to a stop without touching the
+credential, then makes a verified capture of the work done so far,
+publishing it credential-free when it can. It keeps custody of your source
+and does not open the merge request while the vault stays locked.
+
+Unlike the Codex-account hold above, this park **does** resume on a timer:
+it takes the same capped backoff as an empty-turn park
+(`RUN_RECOVERY_PARK_BASE` up to `RUN_RECOVERY_MAX_PARK`), with no lifetime
+cap, rather than waiting on an external signal. Unlocking the vault does
+not promote the run early — it still waits for that timer. Once the timer
+promotes it back to `queued`, a still-locked vault means claiming it idles;
+you'll see it queued with **your vault is locked, so this run can't start**
+until the vault is actually unlocked. After that, it is re-claimed and
+resumes where it left off — the resume costs at least one model turn before
+finalize opens the merge request.
+
+One case is not covered by this park: a vault that locks **after** the
+provider exchange already landed, once the account is quarantined for it, is
+answered with a same-operation retry refusal instead, and the run still
+fails. This is tracked separately; see [issue
+#1770](https://github.com/vtmocanu/uzi/issues/1770).
+
+### Where you'll see it
+
+- The run page's recovery panel and the run list, both reading **waiting
+  for vault unlock**, with the next retry time.
+- `uzi run get <id>` — a `VAULT` row with the owner-neutral park sentence
+  and its next retry time.
+- `uzi run list` / `uzi admin runs` — the STATUS cell appends `(waiting for
+  vault unlock)`.
+- `uzi tui` — this park stays in ON THE FLOOR and reads `~ vault wait`, like
+  any other self-resolving recovery park; it also counts toward the board's
+  vault-locked indicator alongside runs that are queued and blocked on the
+  same lock.
+
 ## Other waiting states
 
 - `recovery_wait`: a positively-empty SDK turn or a transient provider error
   persisted through bounded retries, the forge was unreachable at clone/fetch
-  (see [Forge unreachable at clone](#forge-unreachable-at-clone) above), or
-  the Codex subscription account is unavailable (see
-  [Codex account unavailable](#codex-account-unavailable) above). The server
-  retries automatically after a backoff, except the Codex account hold,
-  which has no timer and instead resumes when the account does.
+  (see [Forge unreachable at clone](#forge-unreachable-at-clone) above), a
+  Codex credential refresh or release found the owner's vault locked (see
+  [Vault locked](#vault-locked) above), or the Codex subscription account is
+  unavailable (see [Codex account unavailable](#codex-account-unavailable)
+  above). The server retries automatically after a backoff, except the
+  Codex account hold, which has no timer and instead resumes when the
+  account does.
 - `limit_wait`: a usage-limit window must reset. See
   [Paused on a usage limit](run-limit-wait.md).
 - `pool_wait`: no token is available in the selected pool. It needs an

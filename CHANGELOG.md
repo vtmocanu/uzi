@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **A run no longer fails outright when its owner's vault is locked mid-flight ([#1766](https://github.com/vtmocanu/uzi/issues/1766)).**
+  A Codex credential refresh or release that hits a locked owner vault is now a typed 409, answered only after authorization and a recheck, instead of a plain failure. The worker parks the run as `recovery_wait` with cause `vault_locked`, settling its Codex processes without touching the credential and capturing its work so far, and keeps custody instead of losing it. The park resumes on the ordinary recovery timer once the vault is unlocked; while it stays locked the run shows queued with "your vault is locked, so this run can't start", and no merge request opens until it resumes. Web, CLI and the TUI all show a "waiting for vault unlock" state with the next retry time. One path still fails the run: a vault that locks after the credential exchange when the worker then loses the reply; that gap is tracked in [#1770](https://github.com/vtmocanu/uzi/issues/1770).
+
 ## [0.85.0] - 2026-09-26
 
 ### Added
