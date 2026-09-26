@@ -925,6 +925,9 @@ func clampInt(v, lo, hi int) int {
 // further) — pgInt4 nulls a 0 (which would read as "unbounded"), so the Int4 is built
 // directly here. The audit body is NUL-stripped to avoid Postgres 22021 aborting the CTE;
 // disposition is left NULL (the worker settles it in m4). No stop_kind is stamped.
+// The statement refuses a terminal run in SQL (issue #1399: the caller's status check is an
+// unlocked read, and a concurrent terminal transition can commit first); that 0-row refusal
+// surfaces as pgx.ErrNoRows and is mapped to ErrRunTerminal.
 func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling int, auditBody string) (SubmitInputResult, error) {
 	cleanBody, _ := stripNUL(auditBody)
 	// ceiling is clampInt'd into [len(completed), len(frozen)] by the caller, so it is a
@@ -941,6 +944,9 @@ func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling
 		ScopeCeiling: pgtype.Int4{Int32: ceil32, Valid: true},
 		Body:         pgconv.TextOrNull(cleanBody),
 	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return SubmitInputResult{}, ErrRunTerminal
+		}
 		return SubmitInputResult{}, err
 	}
 	c := ceiling

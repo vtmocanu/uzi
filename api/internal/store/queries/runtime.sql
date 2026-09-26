@@ -5462,17 +5462,31 @@ RETURNING *;
 -- the scope rows that existed before this statement ran, never the row the main INSERT
 -- adds. So after each submit: all prior scope rows = 'superseded', the newest = NULL
 -- (pending, settled to applied/declined at completion by SettleScopeInputDisposition).
-WITH superseded AS (
-    UPDATE run_user_inputs SET disposition = 'superseded'
-    WHERE run_id = @run_id AND kind = 'scope' AND disposition IS NULL
-),
-capped AS (
+--
+-- Issue #1399: the write is refused on a terminal run IN SQL, not only by the caller's
+-- unlocked status read. A submit that read `running` can block on the row lock of a
+-- concurrent terminal transition (forge park, SetState), which settles the run's pending
+-- scope rows after it commits; without a guard the blocked UPDATE then proceeded and left a
+-- fresh pending scope row on the failed/cancelled run. Under READ COMMITTED the blocked
+-- UPDATE re-checks its WHERE against the committed row version (EvalPlanQual), so the
+-- `status NOT IN (...)` predicate refuses it once the lock holder commits terminal. A refused
+-- write matches 0 rows in `capped`: `superseded` is gated on EXISTS (capped) so it settles
+-- nothing, and the INSERT selects from `capped` so it writes nothing and yields
+-- pgx.ErrNoRows (the CreateExtendInput shape), which the service maps to ErrRunTerminal.
+WITH capped AS (
     UPDATE runs SET scope_ceiling = @scope_ceiling, updated_at = now()
-    WHERE id = @run_id
-    RETURNING id
+    WHERE runs.id = @run_id
+      AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+    RETURNING runs.id
+),
+superseded AS (
+    UPDATE run_user_inputs SET disposition = 'superseded'
+    WHERE run_user_inputs.run_id = @run_id AND run_user_inputs.kind = 'scope'
+      AND run_user_inputs.disposition IS NULL
+      AND EXISTS (SELECT 1 FROM capped)
 )
 INSERT INTO run_user_inputs (run_id, kind, body)
-VALUES (@run_id, 'scope', @body)
+SELECT capped.id, 'scope', @body FROM capped
 RETURNING *;
 
 -- name: SettleScopeInputDisposition :execrows

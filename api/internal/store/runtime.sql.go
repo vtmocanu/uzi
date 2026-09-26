@@ -2968,24 +2968,27 @@ func (q *Queries) CreateRunReviseInputIfUnderCap(ctx context.Context, arg Create
 }
 
 const createScopeCeilingInput = `-- name: CreateScopeCeilingInput :one
-WITH superseded AS (
-    UPDATE run_user_inputs SET disposition = 'superseded'
-    WHERE run_id = $1 AND kind = 'scope' AND disposition IS NULL
+WITH capped AS (
+    UPDATE runs SET scope_ceiling = $2, updated_at = now()
+    WHERE runs.id = $3
+      AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+    RETURNING runs.id
 ),
-capped AS (
-    UPDATE runs SET scope_ceiling = $3, updated_at = now()
-    WHERE id = $1
-    RETURNING id
+superseded AS (
+    UPDATE run_user_inputs SET disposition = 'superseded'
+    WHERE run_user_inputs.run_id = $3 AND run_user_inputs.kind = 'scope'
+      AND run_user_inputs.disposition IS NULL
+      AND EXISTS (SELECT 1 FROM capped)
 )
 INSERT INTO run_user_inputs (run_id, kind, body)
-VALUES ($1, 'scope', $2)
+SELECT capped.id, 'scope', $1 FROM capped
 RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at
 `
 
 type CreateScopeCeilingInputParams struct {
-	RunID        uuid.UUID   `json:"run_id"`
 	Body         pgtype.Text `json:"body"`
 	ScopeCeiling pgtype.Int4 `json:"scope_ceiling"`
+	RunID        uuid.UUID   `json:"run_id"`
 }
 
 // PRD #634 M2: set runs.scope_ceiling AND write the kind='scope' audit row in ONE
@@ -3001,8 +3004,19 @@ type CreateScopeCeilingInputParams struct {
 // the scope rows that existed before this statement ran, never the row the main INSERT
 // adds. So after each submit: all prior scope rows = 'superseded', the newest = NULL
 // (pending, settled to applied/declined at completion by SettleScopeInputDisposition).
+//
+// Issue #1399: the write is refused on a terminal run IN SQL, not only by the caller's
+// unlocked status read. A submit that read `running` can block on the row lock of a
+// concurrent terminal transition (forge park, SetState), which settles the run's pending
+// scope rows after it commits; without a guard the blocked UPDATE then proceeded and left a
+// fresh pending scope row on the failed/cancelled run. Under READ COMMITTED the blocked
+// UPDATE re-checks its WHERE against the committed row version (EvalPlanQual), so the
+// `status NOT IN (...)` predicate refuses it once the lock holder commits terminal. A refused
+// write matches 0 rows in `capped`: `superseded` is gated on EXISTS (capped) so it settles
+// nothing, and the INSERT selects from `capped` so it writes nothing and yields
+// pgx.ErrNoRows (the CreateExtendInput shape), which the service maps to ErrRunTerminal.
 func (q *Queries) CreateScopeCeilingInput(ctx context.Context, arg CreateScopeCeilingInputParams) (RunUserInput, error) {
-	row := q.db.QueryRow(ctx, createScopeCeilingInput, arg.RunID, arg.Body, arg.ScopeCeiling)
+	row := q.db.QueryRow(ctx, createScopeCeilingInput, arg.Body, arg.ScopeCeiling, arg.RunID)
 	var i RunUserInput
 	err := row.Scan(
 		&i.ID,
