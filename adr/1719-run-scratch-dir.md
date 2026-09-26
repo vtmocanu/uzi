@@ -83,6 +83,6 @@ scratch directory is an artifact convention, not a new access-control boundary.
 Worker prompt guidance and out-of-worktree denials should point agents at the
 scratch directory on both harnesses. The path solves direct-tool access to
 run artifacts; it does not broaden shell confinement. Publication refusal is
-the guard even if an agent force-stages an ignored scratch file. Provisioning,
-publication, lifecycle and prompt changes remain implementation work in
-PRD #1719 M2–M5.
+the guard even if an agent force-stages an ignored scratch file. Publication,
+lifecycle verification and prompt changes remain implementation work in
+PRD #1719 M3–M5.

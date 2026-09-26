@@ -188,9 +188,10 @@ Use it for gate logs, screenshots and plain exported review snapshots.
 For a gate log, create a unique file with
 `mktemp .uzi/scratch/gate-log.XXXXXX`. A snapshot exported with `git archive`
 has no git metadata or installed dependencies; run git-dependent gates in the
-real checkout. Scratch survives parks and resumes on the same retained clone,
-but a fresh clone or another worker starts with an empty directory. Do not
-rely on it for durable recovery.
+real checkout. Scratch persists only while the identical runner clone is
+retained through a park and resume. A reseed, even on the same worker, and a
+cross-worker recovery create an empty scratch directory. Do not rely on it for
+durable recovery.
 
 The worker locally excludes the scratch directory from ordinary staging.
 Publication refusal is planned for checkpoint and final sends if scratch appears
