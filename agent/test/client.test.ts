@@ -4,7 +4,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { FakeApi } from "./fake-api.js";
 import { makeClaim, nullLogger } from "./helpers.js";
-import { WorkerClient, RequestError, isTransient } from "../src/client.js";
+import { WorkerClient, RequestError, isTransient, codexDeferralReason } from "../src/client.js";
 import { MessageBatcher } from "../src/batcher.js";
 
 const TOKEN = "worker-join-token-0123456789";
@@ -922,5 +922,28 @@ describe("completion permit + hold client calls (PRD #1226 M4)", () => {
     } finally {
       await srv.close();
     }
+  });
+});
+
+// Issue #1766: the typed 409 vault_locked reply on the Codex credential routes.
+describe("codexDeferralReason", () => {
+  const locked = JSON.stringify({ error: "codex credential vault is locked; retry after unlock", reason: "vault_locked" });
+  it("returns vault_locked for a 409 RequestError whose JSON body carries reason vault_locked", () => {
+    assert.equal(codexDeferralReason(new RequestError("POST", "/api/worker/runs/r/codex/refresh", 409, locked)), "vault_locked");
+  });
+  it("returns undefined for another 409 reason, a 500, a non-JSON body, a non-object body and a non-RequestError", () => {
+    const cases: unknown[] = [
+      new RequestError("POST", "/p", 409, JSON.stringify({ reason: "refresh_contended" })),
+      new RequestError("POST", "/p", 409, JSON.stringify({ error: "vault_locked" })),
+      new RequestError("POST", "/p", 500, locked),
+      new RequestError("POST", "/p", 409, "vault_locked"),
+      new RequestError("POST", "/p", 409, ""),
+      new RequestError("POST", "/p", 409, JSON.stringify(["vault_locked"])),
+      new RequestError("POST", "/p", 409, "null"),
+      new Error(`POST /p returned 409: ${locked}`),
+      { status: 409, body: locked },
+      undefined,
+    ];
+    for (const err of cases) assert.equal(codexDeferralReason(err), undefined, String(err));
   });
 });

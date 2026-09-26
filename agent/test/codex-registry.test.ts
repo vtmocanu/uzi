@@ -589,3 +589,131 @@ describe("ExecutionRegistry: disposal and poison stickiness", () => {
     assert.equal((await reg.reapProcesses(DEADLINE, 1)).kind, "incomplete");
   });
 });
+
+// Issue #1766 (M3a): settleForCapture, the repeat-until-settled drain a vault-locked deferral
+// runs before a credential-free capture. Every root is a FakeRoot whose reap outcome the test
+// controls; a dispose call is never counted as a reap.
+describe("ExecutionRegistry: settleForCapture (issue #1766)", () => {
+  const POLL = 10;
+  const cb = (callId: string) => ({ threadId: "t", turnId: "u", callId, fingerprint: `fp-${callId}` });
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+  it("(a) reaps a root a pre-poison reservation registers DURING the drain, then waits for the callback that settles after that reap → observed_empty", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const launch = reg.reserveLaunch("command");
+    assert.equal(launch.kind, "reserved");
+    const admitted = reg.reserveCallback(cb("c1"));
+    assert.equal(admitted.kind, "admitted");
+    const order: string[] = [];
+    const root = new FakeRoot("command", async () => {
+      order.push("reaped");
+      // The callback's reply is published only after its root reaped.
+      setTimeout(() => {
+        order.push("callback-settled");
+        if (admitted.kind === "admitted") reg.settleCallback(admitted.token, "ok");
+      }, 15);
+      return { ok: true };
+    });
+    let done = false;
+    const settle = reg.settleForCapture(2000, POLL).then((r) => {
+      done = true;
+      return r;
+    });
+    assert.equal(reg.state(), "poisoned", "poisoned synchronously on entry");
+    await sleep(30);
+    assert.equal(done, false, "an unregistered pre-poison reservation keeps it draining");
+    // registerRoot does not check state: the pre-poison reservation still lands a root.
+    if (launch.kind === "reserved") assert.deepEqual(reg.registerRoot(launch.reservation, root), { ok: true });
+    const result = await settle;
+    assert.deepEqual(result, { kind: "observed_empty" });
+    assert.deepEqual(order, ["reaped", "callback-settled"]);
+    assert.equal(root.reapCalls, 1);
+    assert.equal(root.disposeCalls, 0, "settle reaps; it never disposes");
+  });
+
+  it("(b) an unresolved reservation that never registers is incomplete at the deadline, never empty", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    assert.equal(reg.reserveLaunch("provider").kind, "reserved");
+    const result = await reg.settleForCapture(80, POLL);
+    assert.equal(result.kind, "incomplete");
+    if (result.kind === "incomplete") {
+      assert.ok(result.errors.some((e) => /1 launch reservation\(s\) never settled/.test(e.message)));
+    }
+  });
+
+  it("(c) a surviving writer whose root reap is unclean → incomplete; the root stays unreaped and is not retried", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const survivor = new FakeRoot("command", failReap);
+    const clean = new FakeRoot("provider");
+    registerRoot(reg, survivor);
+    registerRoot(reg, clean);
+    const result = await reg.settleForCapture(500, POLL);
+    assert.equal(result.kind, "incomplete");
+    if (result.kind === "incomplete") {
+      assert.ok(result.errors.some((e) => /1 root\(s\) not cleanly reaped/.test(e.message)));
+    }
+    assert.equal(survivor.reapCalls, 1);
+    assert.equal(clean.reapCalls, 1);
+    assert.equal(survivor.disposeCalls, 0);
+    assert.equal(reg.hasLiveCommandRoot(), true, "the unclean root is still counted as live");
+  });
+
+  it("(d) a callback that never settles → incomplete", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    assert.equal(reg.reserveCallback(cb("stuck")).kind, "admitted");
+    registerRoot(reg, new FakeRoot("provider"));
+    const result = await reg.settleForCapture(60, POLL);
+    assert.equal(result.kind, "incomplete");
+    if (result.kind === "incomplete") {
+      assert.ok(result.errors.some((e) => /1 callback\/child-turn reservation\(s\) unsettled/.test(e.message)));
+    }
+  });
+
+  it("(e) a disposed registry → incomplete (its cleared tables would read falsely empty)", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    assert.equal(reg.reserveCallback(cb("x")).kind, "admitted");
+    assert.equal(reg.reserveLaunch("provider").kind, "reserved");
+    assert.deepEqual(await reg.disposeTools(DEADLINE), { kind: "disposed" });
+    assert.equal(reg.pendingLaunchCount(), 0);
+    assert.equal(reg.inFlightCallbackCount(), 0);
+    const result = await reg.settleForCapture(500, POLL);
+    assert.equal(result.kind, "incomplete");
+  });
+
+  it("(f) an open registry is poisoned first; every further admission is denied", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    assert.equal(reg.state(), "open");
+    const result = await reg.settleForCapture(500, POLL);
+    assert.deepEqual(result, { kind: "observed_empty" });
+    assert.equal(reg.state(), "poisoned");
+    assert.ok(reg.poisonErrors().some((e) => e.message === "codex vault deferral: settling for capture"));
+    assert.deepEqual(reg.reserveLaunch("provider"), { kind: "denied", reason: "admission_closed" });
+    assert.deepEqual(reg.reserveLaunch("boundary_action"), { kind: "denied", reason: "admission_closed" });
+    assert.deepEqual(reg.reserveCallback(cb("late")), { kind: "denied", reason: "admission_closed" });
+    // A closed registry is poisoned too (no new state is introduced).
+    const closed = new ExecutionRegistry(newLocalExecutionEpoch(2));
+    assert.equal((await closed.quiesceChildren(DEADLINE)).kind, "quiescent");
+    assert.deepEqual(await closed.settleForCapture(500, POLL), { kind: "observed_empty" });
+    assert.equal(closed.state(), "poisoned");
+  });
+
+  it("(g) the whole loop respects ONE deadline, even across a hung root reap and polling", async () => {
+    const deadline = 120;
+    // A pending reservation keeps it polling until the deadline.
+    const polling = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    assert.equal(polling.reserveLaunch("command").kind, "reserved");
+    let started = Date.now();
+    assert.equal((await polling.settleForCapture(deadline, 50)).kind, "incomplete");
+    let elapsed = Date.now() - started;
+    assert.ok(elapsed >= deadline - 5, `returned early: ${elapsed}ms`);
+    assert.ok(elapsed <= deadline + 50 + 40, `overran the deadline by more than one poll: ${elapsed}ms`);
+
+    // A root whose reap never resolves cannot stretch it either.
+    const hung = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    registerRoot(hung, new FakeRoot("provider", () => new Promise<ReapOutcome>(() => {})));
+    started = Date.now();
+    assert.equal((await hung.settleForCapture(deadline, POLL)).kind, "incomplete");
+    elapsed = Date.now() - started;
+    assert.ok(elapsed <= deadline + POLL + 40, `a hung reap overran the deadline: ${elapsed}ms`);
+  });
+});

@@ -27,9 +27,11 @@ import {
   HeldRunCommandCache,
   canonicalCheckoutPath,
   withCommandGitTrust,
+  CodexCredentialDeferredError,
   type CodexExecutorDeps,
   type CodexCommittedGenerationCell,
 } from "../src/codex/codex-executor.js";
+import { RequestError } from "../src/client.js";
 import { WORKER_UID, RUNNER_UID } from "../src/runner-uid.js";
 import { gitEnv } from "../src/git.js";
 import { forgeToolNames } from "../src/forge-tools.js";
@@ -6744,5 +6746,163 @@ describe("CodexExecutor projection-to-server lane fixture (issue #1674 M3)", () 
     const fixture = JSON.parse(await fs.readFile(FIXTURE, "utf8")) as { frames: FixtureFrame[] };
     assert.deepEqual(frames, fixture.frames,
       `the real projection drifted from the fixture; re-record frames from:\n${JSON.stringify(frames, null, 2)}`);
+  });
+});
+
+// ================================================================================
+// Issue #1766 (M3a): a Codex credential route that hits a locked owner vault answers a typed
+// 409 {"reason":"vault_locked"}. The reconcile closure turns it into a blocked outcome carrying
+// the deferral; an epoch's initial release turns it into CodexCredentialDeferredError. The 409
+// body below deliberately smuggles the rig token so the tests prove nothing copies the body.
+function vaultLocked409(route: "refresh" | "release"): RequestError {
+  return new RequestError(
+    "POST",
+    `/api/worker/runs/run-1/codex/${route}`,
+    409,
+    JSON.stringify({ error: "codex credential vault is locked; retry after unlock", reason: "vault_locked", leak: FRESH_TOKEN }),
+  );
+}
+
+describe("CodexExecutor: vault_locked deferral (issue #1766)", () => {
+  it("buildRunLaneReconcile: a 409 vault_locked refresh → blocked + deferral, secret-free", async () => {
+    const client = {
+      refreshCodex: async (): Promise<never> => { throw vaultLocked409("refresh"); },
+      releaseCodex: async (): Promise<never> => { throw new Error("unused"); },
+    };
+    const out = await buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => {})(RECONCILE_REQ, RECONCILE_SIGNAL);
+    assert.deepEqual(out, {
+      kind: "blocked",
+      errors: [{ category: "authorization", message: "codex subscription boundary reconcile deferred: vault locked" }],
+      deferral: "vault_locked",
+    });
+    assert.doesNotMatch(JSON.stringify(out), new RegExp(FRESH_TOKEN));
+  });
+
+  it("buildRunLaneReconcile: a 409 vault_locked api_key release → blocked + deferral", async () => {
+    const client = {
+      refreshCodex: async (): Promise<never> => { throw new Error("unused"); },
+      releaseCodex: async (): Promise<never> => { throw vaultLocked409("release"); },
+    };
+    const out = await buildRunLaneReconcile("run-1", client as never, bindingOf(API_KEY), () => {})(RECONCILE_REQ, RECONCILE_SIGNAL);
+    assert.equal(out.kind, "blocked");
+    if (out.kind === "blocked") {
+      assert.equal(out.deferral, "vault_locked");
+      assert.equal(out.errors[0]!.message, "codex api_key boundary reconcile deferred: vault locked");
+    }
+  });
+
+  it("buildRunLaneReconcile: a generic 500 (and a 409 with another reason) → blocked WITHOUT a deferral, exact legacy message", async () => {
+    for (const err of [
+      new RequestError("POST", "/x", 500, JSON.stringify({ reason: "vault_locked" })),
+      new RequestError("POST", "/x", 409, JSON.stringify({ reason: "refresh_contended" })),
+    ]) {
+      const client = {
+        refreshCodex: async (): Promise<never> => { throw err; },
+        releaseCodex: async (): Promise<never> => { throw new Error("unused"); },
+      };
+      const out = await buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => {})(RECONCILE_REQ, RECONCILE_SIGNAL);
+      assert.deepEqual(out, {
+        kind: "blocked",
+        errors: [{ category: "authorization", message: "codex subscription boundary reconcile failed" }],
+      });
+    }
+  });
+
+  it("closure-level: a transport error, then a 409 deferral, then success reuse ONE operation_id; the next logical refresh mints a fresh one", async () => {
+    // Closure-level: drives buildRunLaneReconcile directly, not a whole run.
+    const calls: { operation_id: string; observed_generation: number }[] = [];
+    const script: (() => never | { access_token: string; generation: number })[] = [
+      () => { throw new Error("fetch failed"); },
+      () => { throw vaultLocked409("refresh"); },
+      () => ({ access_token: "tok-a", generation: 4 }),
+      () => ({ access_token: "tok-b", generation: 5 }),
+    ];
+    const client = {
+      refreshCodex: async (_runId: string, req: { operation_id: string; observed_generation: number }) => {
+        calls.push({ operation_id: req.operation_id, observed_generation: req.observed_generation });
+        return script[calls.length - 1]!();
+      },
+      releaseCodex: async (): Promise<never> => { throw new Error("unused"); },
+    };
+    const reconcile = buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => {});
+    const first = await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL);
+    assert.equal(first.kind === "blocked" && first.deferral, undefined, "a transport error is a plain block");
+    const second = await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL);
+    assert.equal(second.kind === "blocked" && second.deferral, "vault_locked");
+    assert.equal((await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL)).kind, "ready");
+    assert.equal(calls[0]!.operation_id, calls[1]!.operation_id);
+    assert.equal(calls[1]!.operation_id, calls[2]!.operation_id, "the deferral retained the operation id");
+    assert.deepEqual(calls.slice(0, 3).map((c) => c.observed_generation), [3, 3, 3], "the committed generation was retained");
+    assert.equal((await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL)).kind, "ready");
+    assert.notEqual(calls[3]!.operation_id, calls[0]!.operation_id, "the next logical refresh mints a fresh id");
+    assert.equal(calls[3]!.observed_generation, 4);
+  });
+
+  it("the first epoch's initial release 409 → run() rejects with CodexCredentialDeferredError; no safety, settle is observed_empty", async () => {
+    const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", () => {})]);
+    rig.client.releaseCodex = async () => { throw vaultLocked409("release"); };
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const { ctx } = makeCtx();
+    let caught: unknown;
+    await withTimeout(executor.run(ctx), 5000, "deferred first release").catch((e: unknown) => { caught = e; });
+    assert.ok(caught instanceof CodexCredentialDeferredError, `got ${String(caught)}`);
+    assert.equal(caught.deferral, "vault_locked");
+    assert.equal(caught.name, "CodexCredentialDeferredError");
+    assert.doesNotMatch(caught.message, new RegExp(FRESH_TOKEN));
+    assert.doesNotMatch(caught.message, /codex\/release|409/, "no request path or status text");
+    assert.equal(rig.providerLaunches(), 0, "no provider root was launched");
+    assert.equal(executor.safety, undefined);
+    assert.deepEqual(await executor.settleForCredentialFreeCapture(100), { kind: "observed_empty" });
+  });
+
+  it("a recreation release 409 (after a checkpoint) propagates unwrapped while executor.safety is still the OLD live epoch", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "checkpoint", {}, th, tn, "c-ckpt")).push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("th-1", "tn-2", () => {}),
+    ]);
+    const original = rig.client.releaseCodex.bind(rig.client);
+    rig.client.releaseCodex = async (runId, req) => {
+      if (rig.client.releaseCalls.length >= 1) throw vaultLocked409("release");
+      return original(runId, req);
+    };
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    let safetyAtCheckpoint: unknown;
+    const { ctx } = makeCtx({ checkpoint: async () => { safetyAtCheckpoint = executor.safety; } });
+    let caught: unknown;
+    await withTimeout(executor.run(ctx), 5000, "deferred recreation").catch((e: unknown) => { caught = e; });
+    assert.ok(caught instanceof CodexCredentialDeferredError, `got ${String(caught)}`);
+    assert.doesNotMatch(caught.message, new RegExp(FRESH_TOKEN));
+    assert.ok(safetyAtCheckpoint !== undefined);
+    assert.equal(executor.safety, safetyAtCheckpoint, "the failed recreation never swapped this.safety");
+    assert.equal(rig.providerLaunches(), 1, "the recreated provider root was never launched");
+  });
+
+  it("a post-approval recreation release 409 propagates out of run() as CodexCredentialDeferredError (B1: no running report here)", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-plan", "tn-plan", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "the plan" }, th, tn, "c-plan")).push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("th-plan", "tn-impl", () => {}),
+    ]);
+    const original = rig.client.releaseCodex.bind(rig.client);
+    rig.client.releaseCodex = async (runId, req) => {
+      if (rig.client.releaseCalls.length >= 1) throw vaultLocked409("release");
+      return original(runId, req);
+    };
+    let iterations = 0;
+    const { ctx } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "approve", selection: { status: "absent" } }),
+      reportIteration: async () => { iterations += 1; },
+    } as Partial<RunContext>);
+    let caught: unknown;
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "deferred post-approval").catch((e: unknown) => { caught = e; });
+    assert.ok(caught instanceof CodexCredentialDeferredError, `got ${String(caught)}`);
+    assert.equal(iterations, 0, "the executor reported no iteration (the runner owns the running report)");
+    assert.equal(rig.providerLaunches(), 1, "the plan epoch ran; the post-approval epoch never launched");
+    assert.equal(rig.client.releaseCalls.length, 1, "exactly the plan epoch's release succeeded");
   });
 });

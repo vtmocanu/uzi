@@ -44,7 +44,7 @@ import { constants as FS } from "node:fs";
 import type { Readable, Writable } from "node:stream";
 
 import type { Logger } from "../log.js";
-import type { WorkerClient } from "../client.js";
+import { codexDeferralReason, type WorkerClient } from "../client.js";
 import type { DockerWiring } from "../docker-wiring.js";
 import { PlanRejectedError, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import { PauseNowSignal } from "../steering.js";
@@ -87,7 +87,9 @@ import type { CommandSandboxMode } from "../config.js";
 
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "./registry.js";
 import {
+  CodexExecutionSafetyImpl,
   createCodexExecutionSafety,
+  type CredentialFreeCaptureSettlement,
   type ReconcileBeforeBoundary,
   type ReconcileOutcome,
   type SpawnRootSeam,
@@ -644,6 +646,21 @@ export function buildAppServerRefreshBridge(
 }
 
 /**
+ * Issue #1766: thrown when releasing a provider epoch's initial credential was deferred because
+ * the owner vault is locked (the api's typed 409 `vault_locked`). It is thrown from
+ * `startProviderEpoch` (which tears the half-built epoch down and rethrows it unwrapped) and
+ * propagates out of `run()`, so the runner can park the run for recovery rather than fail it.
+ * The message is fixed and secret-free: it never carries the request path, body or a token.
+ */
+export class CodexCredentialDeferredError extends Error {
+  readonly deferral = "vault_locked" as const;
+  constructor() {
+    super("codex credential release deferred: vault locked");
+    this.name = "CodexCredentialDeferredError";
+  }
+}
+
+/**
  * PRD #1171 m4 (part 4): the RUN-LANE per-sink auth-mode reconcile closure — the safety facade
  * runs it BEFORE every durability boundary. Mirrors {@link CodexAdviceCredentialBridge}: it
  * captures the runId, the client (release/refresh) and the immutable binding (authMode +
@@ -715,9 +732,18 @@ export function buildRunLaneReconcile(
       );
       registerToken(res.access_token);
       return { kind: "ready" };
-    } catch {
+    } catch (err) {
       // Fail CLOSED with a bounded, secret-free reason (authMode is safe to name). The op id and
       // observed generation are DELIBERATELY left intact so a retried boundary reuses them.
+      // Issue #1766: a typed 409 vault_locked reply is still a block (the boundary poisons and
+      // throws), but it carries the deferral so the runner parks instead of failing. Only the
+      // parsed reason crosses back; the error's own text never does.
+      if (codexDeferralReason(err) === "vault_locked") {
+        const errors: readonly HarnessError[] = [
+          { category: "authorization", message: `codex ${binding.authMode} boundary reconcile deferred: vault locked` },
+        ];
+        return { kind: "blocked", errors, deferral: "vault_locked" };
+      }
       const errors: readonly HarnessError[] = [
         { category: "authorization", message: `codex ${binding.authMode} boundary reconcile failed` },
       ];
@@ -1515,6 +1541,24 @@ export class CodexExecutor implements Executor {
    *  deliberately does NOT implement `killAgentTree`. */
   safety?: CodexExecutionSafety;
 
+  /**
+   * Issue #1766: the harness-agnostic entry the runner uses to settle the CURRENT epoch for a
+   * credential-free capture after a vault-locked deferral. Delegates to the live facade's
+   * {@link CodexExecutionSafetyImpl.settleForCredentialFreeCapture} (serialized behind its
+   * boundary queue; it poisons and drains the registry, never reconciles or mints a permit).
+   * With no Codex safety yet (the first epoch never started) there is nothing to drain, so it
+   * answers `observed_empty`. A facade of any other shape fails closed as `incomplete`.
+   */
+  async settleForCredentialFreeCapture(deadlineMs: number): Promise<CredentialFreeCaptureSettlement> {
+    const safety = this.safety;
+    if (safety === undefined) return { kind: "observed_empty" };
+    if (safety instanceof CodexExecutionSafetyImpl) return safety.settleForCredentialFreeCapture(deadlineMs);
+    return {
+      kind: "incomplete",
+      errors: [{ category: "protocol", message: "codex capture settle: unsupported safety facade" }],
+    };
+  }
+
   private readonly log: Logger;
   private readonly homeRoot: string;
   private readonly provisionHomeDir: string;
@@ -1944,6 +1988,12 @@ export class CodexExecutor implements Executor {
         if (planResult.sessionId) lastSessionId = planResult.sessionId;
         await epoch.persistSession();
         const old = epoch;
+        // Issue #1766 (B1): this recreation runs BEFORE the first reportIteration, i.e. before
+        // the awaiting_approval -> running transition is reported. A vault-locked release here
+        // throws CodexCredentialDeferredError; do NOT report running from this site. It
+        // propagates out of run() unchanged (startProviderEpoch rethrows it unwrapped and
+        // `this.safety` is still the OLD live epoch, since it is swapped only after a
+        // successful start), and the runner does the fenced positive running report itself.
         epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, ++epochIndex);
         this.safety = epoch.safety;
         await old.dispose();
@@ -2775,12 +2825,21 @@ export class CodexExecutor implements Executor {
           minimumGeneration: committed.value ?? binding.generation,
         }
       : { authMode: "api_key" as const };
-    const released = await this.opts.client.releaseCodex(
-      ctx.runId,
-      { capability: binding.capability },
-      expected,
-      ctx.signal,
-    );
+    let released: Awaited<ReturnType<WorkerClient["releaseCodex"]>>;
+    try {
+      released = await this.opts.client.releaseCodex(
+        ctx.runId,
+        { capability: binding.capability },
+        expected,
+        ctx.signal,
+      );
+    } catch (err) {
+      // Issue #1766: a locked owner vault is a recoverable deferral, not a capability loss.
+      // Surface it as the typed, secret-free error the runner parks on; anything else keeps
+      // failing closed with the original error.
+      if (codexDeferralReason(err) === "vault_locked") throw new CodexCredentialDeferredError();
+      throw err;
+    }
     registerToken(released.access_token); // BEFORE any use
     return released.access_token;
   }

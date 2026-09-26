@@ -805,3 +805,119 @@ describe("CodexExecutionSafety.withBoundary: boundary deadline trigger (issue #1
     assert.equal(cancels, 1);
   });
 });
+
+// Issue #1766 (M3a): the vault-locked reconcile deferral and the credential-free capture settle.
+describe("CodexExecutionSafety: vault_locked deferral (issue #1766)", () => {
+  function inertSeams(events: string[]): BoundarySeams {
+    return {
+      quiesce: async () => {
+        events.push("quiesce");
+        return { kind: "quiescent", epoch: 9 };
+      },
+      reap: async (_r, epoch) => {
+        events.push("reap");
+        return { kind: "observed_empty", evidence: "supervisor_echild", epoch };
+      },
+      dispose: async () => ({ kind: "disposed" }),
+      spawnRoot: async () => {
+        throw new Error("unused");
+      },
+    };
+  }
+
+  it("a blocked reconcile carrying a deferral throws CodexBoundaryError('reconcile') with .deferral, poisons, and never runs the action", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(9));
+    const events: string[] = [];
+    const reconcile: ReconcileBeforeBoundary = async () => ({
+      kind: "blocked",
+      errors: [{ category: "authorization", message: "codex subscription boundary reconcile deferred: vault locked" }],
+      deferral: "vault_locked",
+    });
+    const safety = new CodexExecutionSafetyImpl(reg, inertSeams(events), reconcile);
+    let actionRan = 0;
+    let caught: unknown;
+    await safety
+      .withBoundary(req("park"), async () => {
+        actionRan += 1;
+      })
+      .catch((e: unknown) => {
+        caught = e;
+      });
+    assert.ok(caught instanceof CodexBoundaryError);
+    assert.equal(caught.stage, "reconcile");
+    assert.equal(caught.deferral, "vault_locked");
+    assert.equal(actionRan, 0);
+    assert.deepEqual(events, []);
+    assert.equal(reg.state(), "poisoned");
+  });
+
+  it("a generic blocked reconcile carries no deferral", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(9));
+    const reconcile: ReconcileBeforeBoundary = async () => ({
+      kind: "blocked",
+      errors: [{ category: "authorization", message: "refresh contended" }],
+    });
+    const safety = new CodexExecutionSafetyImpl(reg, inertSeams([]), reconcile);
+    let caught: unknown;
+    await safety.withBoundary(req("park"), async () => undefined).catch((e: unknown) => {
+      caught = e;
+    });
+    assert.ok(caught instanceof CodexBoundaryError);
+    assert.equal(caught.deferral, undefined);
+  });
+
+  it("settleForCredentialFreeCapture waits behind an in-flight boundary, then poisons and drains without reconciling", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(4));
+    let reconciles = 0;
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, async () => {
+      reconciles += 1;
+      return { kind: "ready" };
+    });
+    const gate = defer<void>();
+    const order: string[] = [];
+    const boundary = safety.withBoundary(req("checkpoint"), async () => {
+      order.push("action-start");
+      await gate.promise;
+      order.push("action-end");
+    });
+    await tick();
+    const settle = safety.settleForCredentialFreeCapture(2000).then((r) => {
+      order.push("settled");
+      return r;
+    });
+    await tick();
+    assert.deepEqual(order, ["action-start"], "settle did not overtake the running boundary");
+    assert.equal(reg.state(), "closed", "the registry is untouched while settle is queued");
+    gate.resolve();
+    await boundary;
+    const result = await settle;
+    assert.deepEqual(result, { kind: "observed_empty" });
+    assert.deepEqual(order, ["action-start", "action-end", "settled"]);
+    assert.equal(reconciles, 1, "only the boundary reconciled; settle never does");
+    assert.equal(reg.state(), "poisoned");
+    assert.equal(reg.reserveLaunch("provider").kind, "denied");
+  });
+
+  it("settleForCredentialFreeCapture returns incomplete when its deadline passes in the queue, and keeps the queue ordered", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(4));
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam);
+    const gate = defer<void>();
+    const boundary = safety.withBoundary(req("checkpoint"), async () => {
+      await gate.promise;
+    });
+    await tick();
+    const result = await safety.settleForCredentialFreeCapture(20);
+    assert.equal(result.kind, "incomplete");
+    assert.equal(reg.state(), "closed", "a queued-out settle never touched the registry");
+    let laterRan = false;
+    const later = safety.withBoundary(req("checkpoint"), async () => {
+      laterRan = true;
+    });
+    await tick();
+    assert.equal(laterRan, false, "a later boundary still waits for the in-flight one");
+    gate.resolve();
+    await boundary;
+    await later;
+    assert.equal(laterRan, true);
+  });
+});
