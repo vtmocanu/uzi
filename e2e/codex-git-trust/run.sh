@@ -40,12 +40,19 @@ case "$action" in
         source_args+=(-v "$CODEX_GIT_TRUST_BIN_DIR/$bin:/usr/local/bin/$bin:ro")
       done
     fi
-    # CODEX_GIT_TRUST_REQUIRE_LANDLOCK (issue #1769 m3 acceptance guard): forwarded verbatim so
-    # the fixture can turn a missing Landlock ABI into a hard FAIL instead of a silent
-    # required-mode skip.
+    # CODEX_GIT_TRUST_REQUIRE_LANDLOCK (issue #1769 m3 acceptance guard): forwarded ONLY when
+    # it is exactly "1", so the fixture can turn a missing Landlock ABI into a hard FAIL
+    # instead of a silent required-mode skip. Any other non-empty value is a caller mistake
+    # (e.g. "true"/"yes"), which would otherwise silently forward and be ignored by the
+    # fixture's own strict "=== '1'" check (see fixture.ts) rather than doing what the caller
+    # meant; warn instead of forwarding it.
     landlock_args=()
     if [ -n "${CODEX_GIT_TRUST_REQUIRE_LANDLOCK:-}" ]; then
-      landlock_args=(-e "CODEX_GIT_TRUST_REQUIRE_LANDLOCK=$CODEX_GIT_TRUST_REQUIRE_LANDLOCK")
+      if [ "$CODEX_GIT_TRUST_REQUIRE_LANDLOCK" = "1" ]; then
+        landlock_args=(-e "CODEX_GIT_TRUST_REQUIRE_LANDLOCK=1")
+      else
+        echo "WARN: CODEX_GIT_TRUST_REQUIRE_LANDLOCK=$CODEX_GIT_TRUST_REQUIRE_LANDLOCK is not \"1\"; not forwarding it (required mode will silently skip on a kernel without Landlock)" >&2
+      fi
     fi
     set +e
     timeout --kill-after=10s "${CODEX_GIT_TRUST_TIMEOUT:-180}" docker run --rm --network none \

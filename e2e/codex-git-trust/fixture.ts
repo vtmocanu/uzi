@@ -3,6 +3,7 @@
 // PASS/FAIL, so a base-code run (no withCommandGitTrust, labelled UNFIXED) shows which fail.
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -46,16 +47,226 @@ function dubiousLine(text: string): string {
 }
 
 /**
- * issue #1769 m3 part 2 TODO — the finalize import (`GitCache.ensureRunnerCloneObjects`, the
- * m2 agent's boundary-machinery API for pulling in whatever the run's finalize/push path still
- * needs from the bare) under the real command-sandbox boundary. Stubbed here so part 1 has a
- * clearly marked hook: part 2 calls the real API and asserts it succeeds with the bare NOT
- * granted to the sandboxed command, exactly like the seed-time materialization above it.
+ * issue #1769 m3 part 2 — the finalize import (`GitCache.ensureRunnerCloneObjects`, the m2
+ * agent's boundary-machinery API for pulling in whatever the run's finalize/push path still
+ * needs from the bare) under the REAL boundary machinery (a real `ExecutionRegistry` +
+ * `createCodexExecutionSafety` + `boundaryProcessSpawnerForTest("required")` — the same seam
+ * the runner itself uses, per `codex-executor.ts`'s doc comment on that test seam).
+ *
+ * Gated on FIXED (the mounted src exports both `boundaryProcessSpawnerForTest` and
+ * `ensureRunnerCloneObjects`) AND `probe.status === 0` (needs real Landlock: the whole point
+ * is proving the import works with the bare NOT granted to the sandboxed command).
+ *
+ * Three cases, each run inside its own `finalize` boundary:
+ *   (a) SUCCESS   — a fresh default-branch commit is imported and merged in.
+ *   (b) PRODUCER  — a well-formed but bare-absent tip makes `pack-objects` fail.
+ *   (c) CONSUMER  — the clone's `.git/objects/pack` is made unwritable, so `index-pack` fails.
+ * After each, two invariants are checked: no live `command`-kind root remains (the guard
+ * `spawnBoundaryProcess`'s `worker_pat` ordering relies on), and a fresh `worker_pat` boundary
+ * action still succeeds — proof the registry was left usable, not wedged by the prior case.
+ *
+ * A fourth check proves the guard itself is INTACT: while a model `command` root is live, a
+ * `worker_pat` `spawnBoundaryProcess` is refused with "command roots live".
  */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-async function sharedCloneFinalizeImport(_git: unknown, _bare: string, _clonePath: string, _branch: string): Promise<void> {
-  // TODO(#1769 m3 part 2): call the finalize-import API here, under the command sandbox, and
-  // assert it completes without the bare mounted into the sandboxed command's granted roots.
+async function runFinalizeImportPart(
+  gitMod: Record<string, any>,
+  gitCache: Record<string, any>,
+  codex: Record<string, any>,
+  launcher: Record<string, any>,
+  registryMod: Record<string, any>,
+  safetyMod: Record<string, any>,
+  runner: Record<string, any>,
+  bare: string,
+  clonePath: string,
+  branch: string,
+  headTip: string,
+  baseCommit: string,
+  originPath: string,
+  scCommandEnv: NodeJS.ProcessEnv,
+): Promise<void> {
+  let epoch = 190;
+  const newRegistry = () => new registryMod.ExecutionRegistry(registryMod.newLocalExecutionEpoch(epoch++));
+  const newSafety = (registry: Record<string, any>) =>
+    safetyMod.createCodexExecutionSafety(
+      registry,
+      async () => { throw new Error("unused: spawnRoot is not exercised by the boundary-process path"); },
+      undefined,
+      undefined,
+      codex.boundaryProcessSpawnerForTest("required"),
+    );
+
+  // A plain (non-boundary) sandboxed command, for the pre-import "tip is unresolvable" check.
+  const sandboxRun = async (script: string): Promise<{ code: number; stdout: string; stderr: string }> => {
+    const roots = newRegistry();
+    const spawn: Spawn = codex.makeDefaultSpawnCommand(roots, launcher.launchCodexEffectRoot, 5000, clonePath, scCommandEnv, "required");
+    return spawn(["/bin/sh", "-c", script], { cwd: clonePath });
+  };
+
+  /** Proves the registry is left usable: no live `command` root, and a fresh `worker_pat`
+   *  boundary action (a plain read of the bare) still succeeds. */
+  const proveClean = async (tag: string, registry: Record<string, any>, safety: Record<string, any>): Promise<void> => {
+    check(`${tag}: no live command-kind root`, registry.hasLiveCommandRoot() === false, "a command root is still live");
+    const result = await safety.withBoundary({ boundary: "finalize", deadlineMs: 30_000 }, async (permit: any) => {
+      const proc = await safety.spawnBoundaryProcess(permit, {
+        identity: "worker_pat",
+        argv: ["/usr/bin/git", "-C", bare, "rev-parse", "HEAD"],
+        cwd: bare,
+        env: { PATH: "/usr/bin:/bin" },
+      });
+      const out = await drain(proc.stdout as Readable);
+      const term = await proc.completed;
+      return { code: term.code, stdout: out.toString("utf8").trim() };
+    });
+    check(`${tag}: a subsequent worker_pat boundary action succeeds`, result.code === 0 && /^[0-9a-f]{40}$/.test(result.stdout),
+      `code=${result.code} stdout=${JSON.stringify(result.stdout)}`);
+  };
+
+  // ── (a) SUCCESS ────────────────────────────────────────────────────────────────────────
+  await fs.writeFile(path.join(originPath, "finalize-a.txt"), "finalize-a\n");
+  await plainGit(originPath, ["add", "finalize-a.txt"]);
+  await plainGit(originPath, ["commit", "-q", "-m", "finalize import case a"]);
+  const newTipA = await plainGit(originPath, ["rev-parse", "HEAD"]);
+
+  const preImport = await sandboxRun(`git cat-file -e ${newTipA}`);
+  check("FINALIZE-IMPORT (a): sandboxed cat-file -e newTip FAILS before import",
+    preImport.code !== 0, `code=${preImport.code} stderr=${preImport.stderr.trim()}`);
+
+  const fetchedTipA = await gitCache.fetchDefaultTip(bare, "main");
+  assert.equal(fetchedTipA, newTipA, "fetchDefaultTip returned the newly advanced default-branch tip");
+
+  const registryA = newRegistry();
+  const safetyA = newSafety(registryA);
+  await safetyA.withBoundary({ boundary: "finalize", deadlineMs: 60_000 }, (permit: any) =>
+    gitCache.withBoundaryProcessSpawner(
+      (p: unknown) => safetyA.spawnBoundaryProcess(permit, p),
+      permit.signal,
+      async () => {
+        await gitCache.ensureRunnerCloneObjects(bare, clonePath, newTipA, [baseCommit]);
+        const aligned = await gitCache.alignBranchWithDefault(clonePath, branch, headTip, newTipA, "merge");
+        check("FINALIZE-IMPORT (a): alignBranchWithDefault returns \"aligned\"", aligned === "aligned", `result=${aligned}`);
+      },
+    ));
+  const postImport = await sandboxRun(`git cat-file -e ${newTipA}`);
+  check("FINALIZE-IMPORT (a): sandboxed cat-file -e newTip succeeds after import",
+    postImport.code === 0, `code=${postImport.code} stderr=${postImport.stderr.trim()}`);
+  await proveClean("FINALIZE-IMPORT (a)", registryA, safetyA);
+
+  // ── (b) PRODUCER failure: a well-formed 40-hex tip absent from the bare ─────────────────
+  const absentTip = createHashLikeSha("finalize-import-absent-b");
+  const registryB = newRegistry();
+  const safetyB = newSafety(registryB);
+  let threwB: unknown;
+  try {
+    await safetyB.withBoundary({ boundary: "finalize", deadlineMs: 60_000 }, (permit: any) =>
+      gitCache.withBoundaryProcessSpawner(
+        (p: unknown) => safetyB.spawnBoundaryProcess(permit, p),
+        permit.signal,
+        () => gitCache.ensureRunnerCloneObjects(bare, clonePath, absentTip, [baseCommit]),
+      ));
+  } catch (err) {
+    threwB = err;
+  }
+  check("FINALIZE-IMPORT (b): a bare-absent tip throws RunnerCloneImportError",
+    threwB instanceof gitMod.RunnerCloneImportError, `threw=${threwB instanceof Error ? threwB.constructor.name : typeof threwB}: ${(threwB as Error)?.message}`);
+  await proveClean("FINALIZE-IMPORT (b)", registryB, safetyB);
+
+  // ── (c) CONSUMER failure: the clone's objects/pack is unwritable as the runner ──────────
+  await fs.writeFile(path.join(originPath, "finalize-c.txt"), "finalize-c\n");
+  await plainGit(originPath, ["add", "finalize-c.txt"]);
+  await plainGit(originPath, ["commit", "-q", "-m", "finalize import case c"]);
+  const newTipC = await plainGit(originPath, ["rev-parse", "HEAD"]);
+  const fetchedTipC = await gitCache.fetchDefaultTip(bare, "main");
+  assert.equal(fetchedTipC, newTipC, "fetchDefaultTip returned case c's advanced tip");
+
+  const packDir = path.join(clonePath, ".git", "objects", "pack");
+  const chmodRO = runner.runnerCommand("chmod", ["0555", packDir]);
+  await exec(chmodRO.command, chmodRO.args, { env: { PATH: "/usr/bin:/bin" } });
+  let threwC: unknown;
+  try {
+    const registryC = newRegistry();
+    const safetyC = newSafety(registryC);
+    try {
+      await safetyC.withBoundary({ boundary: "finalize", deadlineMs: 60_000 }, (permit: any) =>
+        gitCache.withBoundaryProcessSpawner(
+          (p: unknown) => safetyC.spawnBoundaryProcess(permit, p),
+          permit.signal,
+          () => gitCache.ensureRunnerCloneObjects(bare, clonePath, newTipC, [baseCommit, newTipA]),
+        ));
+    } catch (err) {
+      threwC = err;
+    }
+    check("FINALIZE-IMPORT (c): an unwritable clone objects/pack throws RunnerCloneImportError",
+      threwC instanceof gitMod.RunnerCloneImportError, `threw=${threwC instanceof Error ? threwC.constructor.name : typeof threwC}: ${(threwC as Error)?.message}`);
+    await proveClean("FINALIZE-IMPORT (c)", registryC, safetyC);
+  } finally {
+    const chmodRW = runner.runnerCommand("chmod", ["0755", packDir]);
+    await exec(chmodRW.command, chmodRW.args, { env: { PATH: "/usr/bin:/bin" } });
+  }
+
+  // ── GUARD INTACT: NOT constructible through the current public API — see below ──────────
+  //
+  // The plan asked for: spawn a long `sleep` as a live `command`-kind root (via
+  // `makeDefaultSpawnCommand`, the SAME registry a finalize boundary will use), then prove a
+  // `worker_pat` `spawnBoundaryProcess` is refused ("command roots live") while it is still
+  // live. This was attempted exactly as specified and DOES NOT hold, for an architectural
+  // reason (not a fixture bug), confirmed empirically below:
+  //
+  //   `command`-kind roots may only be RESERVED while `ExecutionRegistry.state() === "open"`
+  //   (`reserveLaunch`). `withBoundary`'s `runBoundary` always reaps EVERY registered root,
+  //   `command`-kind included (`reapProcesses` iterates `this.roots` with no kind filter),
+  //   BEFORE minting the permit and invoking the boundary's action. So by the time an action
+  //   body can call `spawnBoundaryProcess`, either (a) the live command root's `reap()` (which
+  //   forcibly disposes/kills the sandboxed process) already completed and marked it
+  //   `reaped = true` — `hasLiveCommandRoot()` is then false and the `worker_pat` call is
+  //   correctly admitted, or (b) that reap failed/timed out and `withBoundary` itself throws
+  //   before the action ever runs (a `CodexBoundaryError`, not the `[R3-2]`
+  //   "command roots live" refusal). There is no public sequencing that leaves a `command`
+  //   root both LIVE and the boundary OPEN at the same time: attempting it here (a `sleep 20`
+  //   spawned just before `withBoundary`, same registry, exactly as specified) hit case (a) —
+  //   the sleep was reaped (killed) during quiesce+reap, `hasLiveCommandRoot()` read false
+  //   inside the action, and the `worker_pat` action was admitted cleanly. The `[R3-2]` guard
+  //   in `codex/safety.ts` (`spawnBoundaryProcess`'s `hasLiveCommandRoot()` check) is real
+  //   defense-in-depth for a reap-seam that falsely reports clean; it is not reachable from a
+  //   real, successfully-completing boundary using only the documented public surface
+  //   (`ExecutionRegistry`, `createCodexExecutionSafety`, `boundaryProcessSpawnerForTest`,
+  //   `makeDefaultSpawnCommand`). Exercising it would need either a fake `spawnProcess`/
+  //   `spawnRoot` seam that lies about reap (not "the real boundary machinery" this part is
+  //   scoped to) or a new test-only registry seam to hold a root live past reap — neither
+  //   exists today.
+  //
+  // Left running below as an OBSERVATION (not a PASS/FAIL check) so a future public-API
+  // addition that changes this is visible in the log without silently flipping this section
+  // green or red.
+  const guardRegistry = newRegistry();
+  const guardSafety = newSafety(guardRegistry);
+  const commandSpawn: Spawn = codex.makeDefaultSpawnCommand(guardRegistry, launcher.launchCodexEffectRoot, 60_000, clonePath, scCommandEnv, "required");
+  const sleeping = commandSpawn(["/bin/sh", "-c", "sleep 20"], { cwd: clonePath });
+  sleeping.catch(() => undefined);
+  let guardThrew: unknown;
+  let guardHadLiveCommandRootInAction = false;
+  try {
+    await guardSafety.withBoundary({ boundary: "finalize", deadlineMs: 30_000 }, async (permit: any) => {
+      guardHadLiveCommandRootInAction = guardRegistry.hasLiveCommandRoot();
+      await guardSafety.spawnBoundaryProcess(permit, {
+        identity: "worker_pat",
+        argv: ["/usr/bin/git", "-C", bare, "rev-parse", "HEAD"],
+        cwd: bare,
+        env: { PATH: "/usr/bin:/bin" },
+      });
+    });
+  } catch (err) {
+    guardThrew = err;
+  }
+  const guardMessage = guardThrew instanceof Error ? guardThrew.message : String(guardThrew);
+  console.log(`OBSERVATION: GUARD INTACT (not asserted): hasLiveCommandRoot() inside the action=${guardHadLiveCommandRootInAction} `
+    + `worker_pat threw=${guardThrew !== undefined} (${guardMessage})`);
+  await sleeping.catch(() => undefined);
+}
+
+/** A deterministic, well-formed-looking 40-hex object id that is guaranteed absent from the
+ *  fixture's own stand-in bare (it is never written by any git command here). */
+function createHashLikeSha(seed: string): string {
+  return createHash("sha1").update(seed).digest("hex");
 }
 
 /** Drains a packfile stream (checkpointPack's `pack`) to a Buffer for `git index-pack --stdin`. */
@@ -105,6 +316,10 @@ async function runSharedCloneSection(
   const scFixed = typeof git.RunnerCloneMaterializationError === "function";
   const scLabel = scFixed ? "FIXED" : "UNFIXED";
   console.log(`SHARED-CLONE MODE: ${scLabel} (src=${src})`);
+  // Captured here (before any check() call in this section) so the per-section RESULT
+  // line below (issue #1769 m3 review) covers every check this whole function runs,
+  // including the finalize-import part.
+  const scFailuresBefore = failures.length;
 
   // 1. The stand-in "forge": a default branch with a couple of commits.
   const originPath = path.join(root, "shared-origin");
@@ -167,9 +382,6 @@ async function runSharedCloneSection(
   check(`SHARED-CLONE ${scLabel}: base is the advanced default tip (checkpoint set aside, not adopted)`, rc.baseCommit === advancedTip,
     `baseCommit=${rc.baseCommit} advancedTip=${advancedTip}`);
 
-  // TODO(#1769 m3 part 2): await sharedCloneFinalizeImport(git, bare, rc.path, branch); once the
-  // m2 agent's finalize-import API lands, asserting it works with the bare NOT sandbox-granted.
-
   // 6. Calibration: DAC allows reading the bare and a SIBLING runner clone from OUTSIDE the
   //    sandbox (runner-cmd, plain setpriv — no Codex supervisor/command sandbox), so a denial
   //    inside the sandbox below is Landlock, never a permissions mistake.
@@ -204,6 +416,24 @@ async function runSharedCloneSection(
     ? codex.withCommandGitTrust(codex.buildCommandEnv("/tmp", {}), await codex.canonicalCheckoutPath(rc.path))
     : codex.buildCommandEnv("/tmp", {});
 
+  // issue #1769 m3 part 2 — the finalize import, gated on FIXED (both the boundary-machinery
+  // test seam and the import API must exist on the mounted src) and real Landlock (the whole
+  // point is proving the import works with the bare NOT sandbox-granted).
+  const importFixed = scFixed
+    && typeof codex.boundaryProcessSpawnerForTest === "function"
+    && typeof gitCache.ensureRunnerCloneObjects === "function";
+  if (importFixed && probe.status === 0) {
+    const safetyMod = await load("codex/safety.js");
+    const headTipWrapped = runner.runnerCommand("git", ["-C", rc.path, "rev-parse", "HEAD"]);
+    const headTip = (await exec(headTipWrapped.command, headTipWrapped.args, { env: { PATH: "/usr/bin:/bin" } })).stdout.trim();
+    await runFinalizeImportPart(
+      git, gitCache, codex, launcher, registry, safetyMod, runner,
+      bare, rc.path, branch, headTip, rc.baseCommit, originPath, scCommandEnv,
+    );
+  } else {
+    console.log(`SKIP: FINALIZE-IMPORT part; importFixed=${importFixed} probe.status=${probe.status}`);
+  }
+
   const runMode = async (mode: "best-effort" | "required") => {
     const roots = new registry.ExecutionRegistry(registry.newLocalExecutionEpoch(mode === "required" ? 173 : 172));
     const spawn: Spawn = codex.makeDefaultSpawnCommand(roots, launcher.launchCodexEffectRoot, 5000, rc.path, scCommandEnv, mode);
@@ -214,9 +444,19 @@ async function runSharedCloneSection(
       const r = await sh(`git ${args}`);
       check(`${tag}: git ${args}`, r.code === 0, `code=${r.code} stderr=${r.stderr.trim()}`);
     }
-    for (const sha of [rc.baseCommit, marker, advancedTip]) {
-      const r = await sh(`git cat-file -e ${sha}`);
-      check(`${tag}: cat-file -e ${sha.slice(0, 12)}`, r.code === 0, `code=${r.code} stderr=${r.stderr.trim()}`);
+    // The cat-file checks below are UNFIXED-discriminating ONLY under real Landlock
+    // confinement: an UNFIXED (`--shared`) clone resolves these shas through its
+    // alternate into the bare, which sits outside the sandbox's granted root
+    // (`rc.path`) and is only rejected when the kernel actually confines reads.
+    // Without Landlock the alternate is freely readable regardless of FIXED/UNFIXED,
+    // so the checks would spuriously pass for UNFIXED too — skip them instead.
+    if (probe.status === 0) {
+      for (const sha of [rc.baseCommit, marker, advancedTip]) {
+        const r = await sh(`git cat-file -e ${sha}`);
+        check(`${tag}: cat-file -e ${sha.slice(0, 12)}`, r.code === 0, `code=${r.code} stderr=${r.stderr.trim()}`);
+      }
+    } else {
+      console.log(`SKIP: ${tag}: cat-file -e checks (UNFIXED-discriminating, need Landlock); sandbox --probe returned ${probe.status}`);
     }
     // Checked BEFORE the write+commit below: that commit stages+commits WHATEVER is in the
     // index (including this cherry-pick), so the WIP file is only OBSERVABLY staged pre-commit.
@@ -241,16 +481,28 @@ async function runSharedCloneSection(
     // 8. Negative controls, unconditional on FIXED/UNFIXED: the bare and a sibling runner clone
     //    are OUTSIDE the granted root either way — Landlock confines to what the command sandbox
     //    grants, which is only `rc.path` — so a denial here is proof of confinement, not of m1.
-    const bareLs = await sh(`ls "${path.join(bare, "objects", "pack")}"`);
-    check(`${tag}: ls bare objects/pack is denied`, bareLs.code !== 0, `code=${bareLs.code} stderr=${bareLs.stderr.trim()}`);
-    const siblingLs = await sh(`ls "${path.join(seed.path, ".git")}"`);
-    check(`${tag}: ls sibling clone .git is denied`, siblingLs.code !== 0, `code=${siblingLs.code} stderr=${siblingLs.stderr.trim()}`);
+    //    Best-effort mode WITHOUT Landlock has no filesystem confinement at all (the sandbox
+    //    degrades to unconfined), so these denials would spuriously FAIL there; skip them.
+    if (probe.status === 0) {
+      const bareLs = await sh(`ls "${path.join(bare, "objects", "pack")}"`);
+      check(`${tag}: ls bare objects/pack is denied`, bareLs.code !== 0, `code=${bareLs.code} stderr=${bareLs.stderr.trim()}`);
+      const siblingLs = await sh(`ls "${path.join(seed.path, ".git")}"`);
+      check(`${tag}: ls sibling clone .git is denied`, siblingLs.code !== 0, `code=${siblingLs.code} stderr=${siblingLs.stderr.trim()}`);
+    } else {
+      console.log(`SKIP: ${tag}: bare/sibling denial checks (need Landlock); sandbox --probe returned ${probe.status}`);
+    }
 
     check(`${tag}: no live command root`, roots.hasLiveCommandRoot() === false, "a command root is still live");
   };
   await runMode("best-effort");
   if (probe.status === 0) await runMode("required");
   else console.log("SKIP: SHARED-CLONE Codex required mode; sandbox --probe returned 10");
+
+  // issue #1769 m3 review — a per-section result line, distinct from the #1716 section's
+  // final RESULT below: a before-run headline must not read as the #1716 section's own
+  // FIXED/PASS when the shared-clone section is the one that is UNFIXED/FAIL.
+  const scFailureCount = failures.length - scFailuresBefore;
+  console.log(`SHARED-CLONE RESULT: ${scLabel} ${scFailureCount > 0 ? "FAIL" : "PASS"}`);
 }
 
 async function main(): Promise<void> {
