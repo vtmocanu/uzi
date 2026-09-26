@@ -33,9 +33,12 @@ plan the owner answered.
      `SetState` in `api/internal/workersvc/service.go`). A declined transition settles no input;
    - an **approve** only when a gate takes it.
 
-   Until then the verdict stays unapplied and is replayed to the next claim. A replayed
-   revise re-runs the revision with the owner's original feedback. It does not re-offer the
-   superseded plan.
+   Until then the verdict stays unapplied and is replayed to the next claim. On the Claude SDK
+   executor (`resumesAtGate = true`, `agent/src/sdk-executor.ts`) a replayed revise re-runs the
+   revision with the owner's original feedback and does not re-offer the superseded plan.
+   Codex has no resume-at-gate: the runner puts the run in `gatedRuns`, so its first gate bumps
+   the epoch and a replayed revise is dropped as epoch-stale with a notice asking to re-send it
+   (see residuals).
 2. **A claim says when its plan was shown.** A claim carrying an unapproved persisted plan
    carries `resume_plan_at` (`ResumePlanAt` in `api/internal/workersvc/claim.go`, filled in
    `claim_assembly.go` via `LatestPersistedPlanFrameAtForRun`). It is the `created_at` of the
@@ -45,8 +48,8 @@ plan the owner answered.
 3. **Fail closed without it.** When `resume_plan_at` is absent or does not parse, the worker
    treats every replayed approve or reject as stale until both of these hold: the replayed
    backlog is fully read (a GET page shorter than the server's LIMIT) and the claim's first
-   gate is shown. A replayed revise still acts, because its result is gated for a human
-   again. The field is absent when the lookup failed, when the frame was tombstoned or
+   gate is shown. On the SDK executor a replayed revise still acts, because its result is
+   gated for a human again; on Codex it goes epoch-stale as in point 1. The field is absent when the lookup failed, when the frame was tombstoned or
    redacted, or when the api is older than this change.
 4. **No gate before the backlog is read.** A resumed claim with an unapproved plan reads its
    whole replayed backlog before it offers any gate. This holds for every executor, SDK and
@@ -65,11 +68,18 @@ plan the owner answered.
    replay list without ever reading as approval. The route accepts only `approve_plan` rows
    (any other kind is a 400). An APPLIED receipt for a discarded row is a 409. An older api
    returns 404 for the route; the worker then logs once and leaves those approves unapplied.
-6. **The feed names every ignored verdict.** Each disposal emits one notice
-   (`agent/src/steering.ts`). The reasons are: the verdict was sent before this plan was
-   shown; which plan it was for could not be confirmed; the plan is already approved (cancel
-   to stop the run); the gate had already closed; or an older server already recorded the
-   approval, which could not be withdrawn.
+6. **The feed names almost every ignored verdict.** A disposal emits one notice
+   (`staleNotice` in `agent/src/steering.ts`). The reasons are: the verdict was written
+   against an older plan version of this claim ("Approval ignored — the plan changed; re-send
+   if you still want it.", "Rejection ignored — the plan changed; re-send if you still want
+   it.", "Feedback ignored — it was written against an older plan version; re-send it.");
+   it was sent before this plan was shown; which plan it was for could not be confirmed; the
+   plan is already approved (cancel to stop the run); the gate had already closed; an older
+   server already recorded the approval, which could not be withdrawn; or a buffered reject
+   was replaced by a newer verdict ("an earlier plan rejection was superseded by a newer
+   verdict"). Three disposals are silent: an approve replaced in the buffer by a newer
+   verdict, a repeat approve after an approve closed the gate, and an empty revise (only
+   logged).
 7. **A pending credential switch accepts only revise-only APPLIED batches.** A revise the
    worker settles while the switch is pending has a final disposition, so the server accepts
    it (`applyUnderSwitch` in `input_receipts.go`). A mixed batch, or one on a released or
@@ -138,11 +148,20 @@ plan the owner answered.
   approve read that way already counts as approval. The worker ignores it and says on the
   feed that it could not be withdrawn and that cancelling stops the run.
 - **1000 or more pending revises.** A backlog that never yields a short page keeps the claim
-  from counting as delivered, so it cycles through the recovery park. Filed as a follow-up.
+  from counting as delivered, so it cycles through the recovery park. Recorded as a uzi
+  incidental finding during the #1604 run.
 - **A compromised worker holding the claim** can discard its own run's current approve. The
   impact is a stall (the owner re-approves), not an approval.
-- **Pre-existing, filed separately:** an approve freezes milestones and budget at submit
-  time; a stale reject's `stop_kind` handling.
+- **Pre-existing, recorded as uzi incidental findings during the #1604 run:** an approve
+  freezes milestones and budget at submit time; a stale reject's `stop_kind` handling.
+- **Codex does not resume at the gate** (out of #1604's scope). A resumed Codex claim always
+  gates a fresh plan, so a replayed revise is dropped as epoch-stale with "Feedback ignored —
+  it was written against an older plan version; re-send it." The feedback is not lost
+  silently, but the owner must re-send it.
+- **An api from before this change** sends no `resume_plan_at` (every replayed approve or
+  reject fails closed as unjudged) and has no discard route (404). Those approves stay
+  unapplied and pending, and count toward the replay `LIMIT 1000` window until the api is
+  upgraded.
 - **Resumed-claim cost.** A resumed claim with an unapproved plan waits for one full backlog
   read before its gate appears. A read that fails transiently parks the run instead of
   guessing.
