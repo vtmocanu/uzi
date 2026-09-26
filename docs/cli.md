@@ -1791,7 +1791,11 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
 - `recovery_wait` — parked to recover from a resumed turn that came back empty
   (no model activity) or hit a transient provider error; the sweep auto-resumes
   it on a capped backoff until it recovers or you cancel it — see [Recovering
-  from a transient interruption](run-recovery-wait.md). A Codex subscription
+  from a transient interruption](run-recovery-wait.md). A Codex credential
+  refresh or release that found the owner's vault locked also parks here
+  (cause `vault_locked`); it takes the same capped backoff and no lifetime
+  cap, and resumes once its timer promotes it and the vault is unlocked — see
+  [Vault locked](run-recovery-wait.md#vault-locked). A Codex subscription
   run can also park here because its account is quarantined or needs a fresh
   login (cause `codex_account_unavailable`); unlike the transient park it has
   no backoff or cap, and it resumes when the account is usable again, or fails
