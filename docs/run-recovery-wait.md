@@ -167,8 +167,8 @@ cancelled and re-created.
 A `recovery_wait` park can also come from your own vault: a Codex
 subscription or api\_key credential refresh or release reached a locked
 owner vault. The api only answers this after the request was authorized and
-a recheck still found the vault locked, so it is a typed refusal, not a
-generic failure.
+authority still held on a recheck, so it is a typed refusal, not a generic
+failure.
 
 Rather than fail the run, uzi parks it. It confirms the run is still
 running, brings its Codex processes to a stop without touching the
@@ -187,24 +187,31 @@ until the vault is actually unlocked. After that, it is re-claimed and
 resumes where it left off — the resume costs at least one model turn before
 finalize opens the merge request.
 
-One case is not covered by this park: a vault that locks **after** the
-provider exchange already landed, once the account is quarantined for it, is
-answered with a same-operation retry refusal instead, and the run still
-fails. This is tracked separately; see [issue
-#1770](https://github.com/vtmocanu/uzi/issues/1770).
+The direct case — the vault locks right after the provider exchange, and the
+worker gets the answer — is covered by this park too: it is still answered
+`vault_locked` and parked like any other case above. One narrower case is
+not covered: if the vault locks while resealing the credential material the
+exchange just landed, and the worker then **loses the reply** to that
+exchange (a crash or dropped connection between the api's answer and the
+worker learning it), a retry of the same operation is refused by
+authorization instead, and the run still fails. This is tracked separately;
+see [issue #1770](https://github.com/vtmocanu/uzi/issues/1770).
 
-### Where you'll see it
+### Where you'll see the vault park
 
-- The run page's recovery panel and the run list, both reading **waiting
-  for vault unlock**, with the next retry time.
+- The run page's recovery panel, reading **waiting for vault unlock** with
+  the next retry time. The web run list does not show this park.
 - `uzi run get <id>` — a `VAULT` row with the owner-neutral park sentence
   and its next retry time.
 - `uzi run list` / `uzi admin runs` — the STATUS cell appends `(waiting for
-  vault unlock)`.
+  vault unlock)`, with no retry time.
 - `uzi tui` — this park stays in ON THE FLOOR and reads `~ vault wait`, like
   any other self-resolving recovery park; it also counts toward the board's
   vault-locked indicator alongside runs that are queued and blocked on the
-  same lock.
+  same lock. Selecting the run shows the same park sentence and next retry
+  time as the run page and `uzi run get`, on the row's second line.
+- The repo board's run badge carries no vault-specific tooltip; check the
+  run page for the detail above.
 
 ## Other waiting states
 
