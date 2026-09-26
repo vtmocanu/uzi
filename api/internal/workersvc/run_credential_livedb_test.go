@@ -127,6 +127,46 @@ func TestSetRunCredentialParkedStatesPromoteLiveDB(t *testing.T) {
 	}
 }
 
+// TestSetRunCredentialDisabledHoldReassignmentLiveDB proves the owner-facing
+// transition is atomic: success promotes and a budget refusal writes no override.
+func TestSetRunCredentialDisabledHoldReassignmentLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	svc := New(env.q, env.box, testParams())
+	svc.SetTxBeginner(env.pool)
+	o := seedReevalOwner(t, env, BindModeAuto, false)
+	for i, tc := range []struct {
+		name        string
+		budget      int
+		wantSuccess bool
+	}{
+		{"available budget", 3600, true},
+		{"exhausted budget", 10, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runID := seedRunInStatus(t, env, o, int64(4450+i), "paused", time.Now().UTC())
+			env.exec(`UPDATE runs SET hold_reason='credential_disabled', budget_wall_seconds=$2,
+			    claim_released_at=now() WHERE id=$1`, runID, tc.budget)
+			res, err := svc.SetRunCredential(env.ctx, o.userID, runID, CredentialOverrideModePinned, &o.altTok)
+			if tc.wantSuccess {
+				if err != nil || res.Run.Status != "queued" ||
+					res.Run.CredentialOverrideMode.String != CredentialOverrideModePinned ||
+					!res.Run.CredentialOverrideSecretID.Valid ||
+					uuid.UUID(res.Run.CredentialOverrideSecretID.Bytes) != o.altTok {
+					t.Fatalf("reassignment: run=%+v err=%v", res.Run, err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrCredentialSwitchRaced) {
+				t.Fatalf("exhausted reassignment: err=%v, want refusal", err)
+			}
+			stored := mustRun(t, env, runID)
+			if stored.Status != "paused" || stored.CredentialOverrideMode.Valid || stored.CredentialOverrideSecretID.Valid {
+				t.Fatalf("refusal changed run: status=%s override=%v/%v", stored.Status, stored.CredentialOverrideMode, stored.CredentialOverrideSecretID)
+			}
+		})
+	}
+}
+
 // TestSetRunCredentialLimitWaitAutoClaimExcludesDeadTokenLiveDB is the M4 exclusion proof:
 // switching a limit_wait run to `auto` early-promotes it, and because the promote preserves
 // limit_dead_secret_id + the still-future retry_not_before, the ensuing auto claim EXCLUDES
