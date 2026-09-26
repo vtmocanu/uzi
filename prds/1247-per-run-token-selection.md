@@ -2,7 +2,7 @@
 
 **Issue**: #1247
 **Priority**: Medium
-**Status**: In progress; M1-M5 merged through PR #1397 (`e9d9dafa`). M0 and M6-M10 remain open.
+**Status**: In progress; M1-M5 merged through PR #1397 (`e9d9dafa`), M6-M10 through PR #1427 (`af507111`). Only M0 (maintainer dev-cluster evidence) remains open.
 **Builds on**: PRD #104 (named tokens, worker binding), PRD #111 (auto-select by headroom, `runs.anthropic_secret_id`), PRD #217 (do not re-pick the just-exhausted token, `limit_dead_secret_id`), PRD #754 (auto lane is pooled-only, `pool_wait`, one-owner-per-tick pool resume), PRD #1190 (owner pause), PRD #759 / #1062 (checkpoint + resume-in-place across a limit park), PRD #1079 (per-leg usage fold), PRD #1140 (auto bind mode default), PRD #1349 (recovery custody: `runs.claim_generation`, verified restore points).
 
 ## Problem
