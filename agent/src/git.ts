@@ -9,7 +9,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Readable } from "node:stream";
 import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
-import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
+import { RUNNER_UID, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { withForgeRetry } from "./forge-retry.js";
 
 import {
@@ -24,6 +24,29 @@ import {
 } from "./secret-scan-guard.js";
 
 const execFileAsync = promisify(execFile);
+
+export class ScratchPublicationError extends Error {
+  readonly code = "scratch_publication_refused";
+  constructor(reason: string, cause?: unknown) {
+    super(`scratch_publication_refused: ${reason}`, { cause });
+    this.name = "ScratchPublicationError";
+  }
+}
+
+class RemoteBranchAdvancedError extends Error {
+  constructor() {
+    super("non-fast-forward: remote branch advanced");
+    this.name = "RemoteBranchAdvancedError";
+  }
+}
+
+export class ScratchProvisionError extends Error {
+  readonly code = "scratch_provision_failed";
+  constructor(cause: unknown) {
+    super(`scratch_provision_failed: ${cause instanceof Error ? cause.message : "unknown filesystem error"}`, { cause });
+    this.name = "ScratchProvisionError";
+  }
+}
 
 // A ROOT-OWNED, non-writable (0555) empty dir BAKED into the worker image (see
 // agent/templates/base/Dockerfile, created as root; the image has no `USER` line —
@@ -177,6 +200,9 @@ export interface GitCacheOptions {
    *  absolute `/usr/local/bin/gitleaks` inside one via resolveBoundaryExecutable). A test injects an
    *  absolute path to a shim. */
   gitleaksBin?: string;
+  /** Test-only stand-in for runner-clone scratch provisioning, for the non-Linux dev loop.
+   *  Production never passes it, so the real provisioner runs and fails closed off Linux. */
+  scratchProvisioner?: (clonePath: string) => Promise<void>;
 }
 
 /** issue #1597 M2: the mid-turn checkpoint secret scan's hard deadline (all of its git + gitleaks
@@ -365,13 +391,14 @@ function runnerTrackingRef(branch: string): string {
 // `refs/uzi-runner` (issue #887) — it never carries the branch.
 const RECOVERY_PIN_PREFIX = "refs/uzi-recovery-pin/";
 // issue #1582 M2 — the settlement pins for an older-generation custody hold a same-worker successor
-// adopted: `refs/uzi-settle/<runId>/<holdId>/{source,adopted,pushed}`. They keep the three candidate
-// commits the settle request names reachable (a `--all` gc root, like refs/uzi-recovery-pin) until the
+// adopted: `refs/uzi-settle/<runId>/<holdId>/{source,adopted,pushed,published}`. They keep the candidate
+// commits a settle request names reachable (`published` is the live-publication tip a
+// `/settle-live` request names, issue #1751 M2) (a `--all` gc root, like refs/uzi-recovery-pin) until the
 // api releases the hold. Both ids are sanitized into SINGLE safe path components; an id that
 // sanitizes to empty yields no ref at all.
 const SETTLE_PIN_PREFIX = "refs/uzi-settle/";
-type SettlementPinKind = "source" | "adopted" | "pushed";
-const SETTLEMENT_PIN_KINDS: readonly SettlementPinKind[] = ["source", "adopted", "pushed"];
+export type SettlementPinKind = "source" | "adopted" | "pushed" | "published";
+const SETTLEMENT_PIN_KINDS: readonly SettlementPinKind[] = ["source", "adopted", "pushed", "published"];
 function settlementPinBase(runId: string, holdId: string): string | null {
   const rid = runId.replace(/[^A-Za-z0-9_-]/g, "-");
   const hid = holdId.replace(/[^A-Za-z0-9_-]/g, "-");
@@ -657,6 +684,8 @@ export class GitCache {
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
   /** issue #1597 M2: the gitleaks executable (see {@link GitCacheOptions.gitleaksBin}). */
   private readonly gitleaksBin: string;
+  /** See {@link GitCacheOptions.scratchProvisioner}; undefined in production. */
+  private readonly scratchProvisioner: ((clonePath: string) => Promise<void>) | undefined;
   /** issue #1597 M2: memoised `--remerge-diff` support probe. */
   private remergeProbe: Promise<boolean> | undefined;
 
@@ -669,6 +698,7 @@ export class GitCache {
     opts: GitCacheOptions = {},
   ) {
     this.gitleaksBin = opts.gitleaksBin ?? "gitleaks";
+    this.scratchProvisioner = opts.scratchProvisioner;
     this.reposRoot = path.join(dataDir, "repos");
     this.runnerRoot = path.join(dataDir, "runner");
     this.runnerHoldingRoot = path.join(dataDir, "runner-quarantine");
@@ -800,21 +830,99 @@ export class GitCache {
    *
    * Under (b) the agent's commit lives in the RUNNER clone, so the source is the
    * worker-side tracking ref `fetchAgentBranch` wrote (refs/uzi-runner/<branch>),
-   * NOT refs/heads/<branch> — the caller MUST fetchAgentBranch first. Pushing from
-   * the tracking ref keeps the runner's branch out of the bare's heads namespace
-   * (B2 invariant 2) while landing the agent's commits at origin's refs/heads.
+   * NOT refs/heads/<branch> — the caller MUST fetchAgentBranch first. The ref is
+   * resolved to a pinned commit before pushing, keeping the runner's branch out
+   * of the bare's heads namespace (B2 invariant 2).
    */
   async pushBranch(barePath: string, branch: string, pat: string, repoUrl: string, username?: string): Promise<void> {
     const scope = httpScopeForUrl(repoUrl);
-    const src = runnerTrackingRef(branch);
     await this.withLock(barePath, async () => {
-      if (!(await this.refExists(barePath, src))) {
-        // The tracking ref is written by fetchAgentBranch; its absence means the
-        // fetch-back was skipped — refuse rather than silently pushing nothing.
-        throw new Error(`cannot push ${branch}: ${src} not present (fetchAgentBranch must run first)`);
-      }
-      await this.runGit(barePath, ["push", "origin", `${src}:refs/heads/${branch}`], pat, scope, username);
+      const tip = await this.revParse(barePath, `${runnerTrackingRef(branch)}^{commit}`);
+      if (!tip) throw new ScratchPublicationError("candidate commit is unavailable");
+      const candidate = await this.scratchPublicationPreflight(barePath, branch, tip);
+      await this.refreshScratchPublicationFloor(barePath, branch, candidate, pat, scope, username);
+      // A literal OID keeps the candidate fixed even if the tracking ref moves.
+      await this.runGit(barePath, ["push", "origin", `${candidate}:refs/heads/${branch}`], pat, scope, username);
     });
+  }
+
+  /** Public bridge entry point: validate the exact commit before changing custody. */
+  async scratchPublicationPreflight(barePath: string, branch: string, candidateSha?: string): Promise<string> {
+    try {
+      const candidate = candidateSha ?? await this.trackingTip(barePath, branch);
+      if (!candidate || !SHA40_RE.test(candidate) ||
+          await this.revParse(barePath, `${candidate}^{commit}`) !== candidate) {
+        throw new Error("candidate commit is unavailable");
+      }
+      if ((await this.runGit(barePath, ["rev-parse", "--is-shallow-repository"])).trim() !== "false") {
+        throw new Error("history is shallow");
+      }
+      // Walk all reachable objects without collecting object names. Missing objects,
+      // a deadline, or output overflow must all refuse publication.
+      await this.execScoped("git", withDir(barePath, [
+        "rev-list", "--objects", "--missing=error", "--quiet", candidate,
+      ]), { env: gitEnv(), timeout: 10_000, maxBuffer: 4_096 });
+      // Full history preserves merged side branches and root commits. The pathspec
+      // matches both the exact file/symlink and everything below the directory.
+      const { stdout: touched } = await this.execScoped("git", withDir(barePath, [
+        "rev-list", "--full-history", "--max-count=1", candidate, "--", ".uzi/scratch",
+      ]), { env: gitEnv(), timeout: 10_000, maxBuffer: 4_096 });
+      if (touched.trim()) throw new Error(".uzi/scratch appears in candidate history");
+      return candidate;
+    } catch (cause) {
+      if (cause instanceof ScratchPublicationError) throw cause;
+      throw new ScratchPublicationError("cannot prove scratch-free candidate history", cause);
+    }
+  }
+
+  private async refreshScratchPublicationFloor(
+    barePath: string, branch: string, candidate: string, pat: string, scope: string | undefined, username?: string,
+  ): Promise<void> {
+    const remoteRef = `refs/heads/${branch}`;
+    const scratchRef = `refs/uzi-publication-floor/${branch}`;
+    let forwardAdvance = false;
+    try {
+      const listed = (await this.runGit(barePath, ["ls-remote", "origin", remoteRef], pat, scope, username)).trim();
+      if (!listed) {
+        if (await this.refExists(barePath, `refs/remotes/origin/${branch}`)) throw new Error("remote branch rewound away");
+        return;
+      }
+      const match = /^([0-9a-f]{40})\trefs\/heads\/.+$/.exec(listed);
+      if (!match || listed !== `${match[1]}\t${remoteRef}`) throw new Error("remote branch response is ambiguous");
+      await this.runGit(barePath, ["fetch", "--refmap=", "origin", `+${remoteRef}:${scratchRef}`], pat, scope, username);
+      const fresh = await this.revParse(barePath, `${scratchRef}^{commit}`);
+      if (fresh !== match[1]) throw new Error("remote branch changed during refresh");
+      const priorRef = `refs/remotes/origin/${branch}`;
+      const prior = await this.revParse(barePath, `${priorRef}^{commit}`);
+      if (prior) {
+        if ((await this.ancestry(barePath, prior, fresh)) !== "ancestor") {
+          throw new Error("remote branch floor is unavailable or rewound");
+        }
+      } else if (await this.tryGit(barePath, ["rev-parse", "--verify", "--quiet", priorRef]) === 0) {
+        // The tracking ref exists but names no commit: a broken floor, not an absent one.
+        throw new Error("remote branch floor is unavailable");
+      }
+      // With no prior (the branch appeared remotely after the last fetch) the rewind
+      // check has nothing to compare; the fast-forward below must still be proven.
+      const freshToCandidate = await this.ancestry(barePath, fresh, candidate);
+      if (freshToCandidate === "ancestor") return;
+      if (!prior) throw new Error("new remote branch is not an ancestor of candidate");
+      if (freshToCandidate !== "divergent") throw new Error("remote branch ancestry is unavailable");
+      // Only a strictly newer, scratch-free remote tip outside a candidate that
+      // still descends from the old floor is a concurrent forward advance.
+      if (prior === fresh || (await this.ancestry(barePath, prior, candidate)) !== "ancestor") {
+        throw new Error("remote branch and candidate diverged");
+      }
+      await this.scratchPublicationPreflight(barePath, branch, fresh);
+      forwardAdvance = true;
+    } catch (cause) {
+      if (cause instanceof ScratchPublicationError) throw cause;
+      throw new ScratchPublicationError("cannot verify fresh remote floor", cause);
+    } finally {
+      await this.runGit(barePath, ["update-ref", "-d", scratchRef]).catch(() => undefined);
+    }
+    // The caller verifies the moved branch before reporting branch_moved.
+    if (forwardAdvance) throw new RemoteBranchAdvancedError();
   }
 
   /** The default branch's short name (e.g. `main`), for an MR target. */
@@ -1479,12 +1587,118 @@ export class GitCache {
         if ((err as { code?: unknown }).code === 5) return;
         throw err;
       });
+      if (this.scratchProvisioner) await this.scratchProvisioner(clonePath);
+      else await this.provisionRunnerScratch(clonePath);
       // PRD #759 M2: baseCommit is the REAL fork point — effectiveBase, which is the
       // marker's parent when a wip(park) marker was reset --soft'd back to uncommitted, and
       // baseSha (byte-identical) on every other leg. wipRecovered surfaces the recovery to
       // M4/M5.
       return { path: clonePath, branch, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered };
     });
+  }
+
+  /** Provision the per-run artifact directory without following checkout symlinks. */
+  private async provisionRunnerScratch(clonePath: string, platform = process.platform): Promise<void> {
+    const directoryFlags = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
+    const fdPath = (fd: number, name: string): string => `/proc/self/fd/${fd}/${name}`;
+    const required = 0o2070; // setgid and group rwx for runner-cmd
+    const opened: import("node:fs/promises").FileHandle[] = [];
+    const openDirectory = async (name: string): Promise<import("node:fs/promises").FileHandle> => {
+      const handle = await fs.open(name, directoryFlags);
+      opened.push(handle);
+      return handle;
+    };
+    try {
+      // /proc/self/fd is the descriptor-relative pathname bridge used below. Refuse
+      // platforms without Linux procfs or no-follow directory opens before any write.
+      if (platform !== "linux" || !fsConstants.O_DIRECTORY || !fsConstants.O_NOFOLLOW) {
+        throw new Error("Linux no-follow descriptor-relative scratch provisioning is unavailable");
+      }
+      if ((await fs.statfs("/proc/self/fd")).type !== 0x9fa0) {
+        throw new Error("Linux procfs descriptor bridge is unavailable");
+      }
+      // The index detects a tracked file, directory content, or symlink at the reserved path.
+      if ((await this.runGitAsRunner(clonePath, ["ls-files", "--cached", "--", ".uzi/scratch"])).length > 0) {
+        throw new Error("tracked .uzi/scratch path");
+      }
+      const root = await openDirectory(clonePath);
+      const rootStat = await root.stat();
+      if (uidSplitActive() && (rootStat.gid !== RUNNER_UID || (rootStat.mode & required) !== required)) {
+        throw new Error("runner clone lacks runner-group write posture");
+      }
+      if (!uidSplitActive() && (rootStat.uid !== process.getuid?.() || (rootStat.mode & 0o700) !== 0o700)) {
+        throw new Error("runner clone lacks owner write posture");
+      }
+      const ensureDirectory = async (parent: import("node:fs/promises").FileHandle, name: string) => {
+        const childPath = fdPath(parent.fd, name);
+        let created = false;
+        try {
+          await fs.mkdir(childPath, { mode: 0o2770 });
+          created = true;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        }
+        const child = await openDirectory(childPath);
+        if (created) await child.chmod(0o2770);
+        const stat = await child.stat();
+        if (uidSplitActive() && (stat.gid !== RUNNER_UID || (stat.mode & required) !== required)) {
+          throw new Error(`${name} lacks runner-group write posture`);
+        }
+        if (!uidSplitActive() && (stat.uid !== process.getuid?.() || (stat.mode & 0o700) !== 0o700)) {
+          throw new Error(`${name} lacks owner write posture`);
+        }
+        return child;
+      };
+      const uzi = await ensureDirectory(root, ".uzi");
+      await ensureDirectory(uzi, "scratch");
+
+      // .git is created by the trusted local clone. Hold each directory while opening
+      // its child so an agent-writable checkout path cannot redirect the exclude write.
+      const git = await openDirectory(fdPath(root.fd, ".git"));
+      const info = await openDirectory(fdPath(git.fd, "info"));
+      const exclude = await fs.open(
+        fdPath(info.fd, "exclude"),
+        fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_APPEND | fsConstants.O_NOFOLLOW,
+        0o664,
+      );
+      try {
+        if (!(await exclude.stat()).isFile()) throw new Error("git exclude is not a regular file");
+        // The checkout can replace its exclude file before a resume. Bound the read
+        // even when the file grows after opening it; an oversized file is unsafe to
+        // inspect or append to, so provisioning fails closed.
+        const maxExcludeBytes = 64 * 1024;
+        const bytes = Buffer.alloc(maxExcludeBytes + 1);
+        let used = 0;
+        while (used < bytes.length) {
+          const { bytesRead } = await exclude.read(bytes, used, bytes.length - used, used);
+          if (bytesRead === 0) break;
+          used += bytesRead;
+        }
+        if (used > maxExcludeBytes) throw new Error("git exclude exceeds 64 KiB");
+        const existing = bytes.toString("utf8", 0, used);
+        const rule = "/.uzi/scratch/";
+        if (!existing.split("\n").includes(rule)) {
+          const addition = `${existing.length > 0 && !existing.endsWith("\n") ? "\n" : ""}${rule}\n`;
+          if (used + Buffer.byteLength(addition) > maxExcludeBytes) throw new Error("git exclude has no room for scratch rule");
+          await exclude.writeFile(addition);
+        }
+      } finally {
+        await exclude.close();
+      }
+      // Git will not descend into an ignored directory. Check the directory
+      // itself, rather than one filename a repository could specially ignore
+      // while leaving other artifacts stageable. Publication refusal remains
+      // necessary if an agent later changes the repository's ignore rules.
+      try {
+        await this.runGitAsRunner(clonePath, ["check-ignore", "-q", "--no-index", "--", ".uzi/scratch/"]);
+      } catch {
+        throw new Error("repository ignore rules expose .uzi/scratch to ordinary staging");
+      }
+    } catch (err) {
+      throw new ScratchProvisionError(err);
+    } finally {
+      for (const handle of opened.reverse()) await handle.close().catch(() => undefined);
+    }
   }
 
   /**
@@ -1877,8 +2091,16 @@ export class GitCache {
     }
   }
 
+  /** issue #1751 M2 — best-effort remove ONE settlement pin kind for ONE hold (a live-settle leg
+   *  cleared without a release drops only its `published` pin). Never throws. */
+  async deleteSettlementPin(barePath: string, runId: string, holdId: string, kind: SettlementPinKind): Promise<void> {
+    const base = settlementPinBase(runId, holdId);
+    if (base === null) return;
+    await this.tryGit(barePath, ["update-ref", "-d", `${base}${kind}`]);
+  }
+
   /** issue #1582 M2 — best-effort remove every settlement pin for ONE hold (after the api
-   *  released it). Never throws. */
+   *  released it), the issue #1751 `published` pin included. Never throws. */
   async deleteSettlementRefs(barePath: string, runId: string, holdId: string): Promise<void> {
     const base = settlementPinBase(runId, holdId);
     if (base === null) return;
@@ -1936,25 +2158,40 @@ export class GitCache {
     overlay?: CheckpointOverlayContext,
     pinned?: CheckpointRange,
   ): Promise<{ tipOid: string; pack: Readable } | null> {
-    // issue #1597 M2: a PINNED range (the exact SHAs the secret scan walked) packs exactly
-    // `tipSha ^excludeSha` — no ref is re-resolved, so a tracking/origin ref that moved between the
-    // scan and the pack can neither widen the range to an unscanned commit nor swap the tip. Only
-    // honoured WITHOUT an overlay (an overlay publish is not scanned and stays byte-unchanged).
-    if (pinned && !overlay) {
+    // A pinned range uses literal commit OIDs for the pack floor and candidate.
+    // If an overlay is requested, its wrapper becomes the wanted OID while the
+    // excluded floor remains pinned.
+    if (pinned) {
       if (!SHA40_RE.test(pinned.tipSha) || !SHA40_RE.test(pinned.excludeSha)) {
-        throw new Error("checkpointPack: pinned range must be two 40-hex commit SHAs");
+        throw new ScratchPublicationError("pinned checkpoint range must be two 40-hex commit SHAs");
       }
+      await this.scratchPublicationPreflight(barePath, branch, pinned.tipSha);
+      let wanted = pinned.tipSha;
+      if (overlay) {
+        wanted = await this.buildWorkflowOverlay(barePath, branch, pinned.tipSha, overlay) ?? wanted;
+        await this.scratchPublicationPreflight(barePath, branch, wanted);
+      }
+      await this.validateCheckpointFloor(barePath, pinned.excludeSha, wanted);
       const { stdout } = await this.spawnGit(
         barePath,
         ["pack-objects", "--revs", "--stdout"],
-        `${pinned.tipSha}\n^${pinned.excludeSha}\n`,
+        `${wanted}\n^${pinned.excludeSha}\n`,
       );
-      return { tipOid: pinned.tipSha, pack: stdout };
+      return { tipOid: wanted, pack: stdout };
     }
     const realTip = await this.trackingTip(barePath, branch);
     if (!realTip) return null;
-    const excludeRef = await this.checkpointExcludeRef(barePath, branch);
-    const trackingRef = runnerTrackingRef(branch);
+    await this.scratchPublicationPreflight(barePath, branch, realTip);
+    // An unresolvable floor (e.g. no origin branch and a tip disjoint from the default, where
+    // merge-base exits non-zero) is a range that cannot be established: refuse with the typed
+    // reason rather than letting a generic git error escape the publication seam.
+    let excludeSha: string | null;
+    try {
+      const excludeRef = await this.checkpointExcludeRef(barePath, branch, realTip);
+      excludeSha = await this.revParse(barePath, `${excludeRef}^{commit}`);
+    } catch (e) {
+      throw new ScratchPublicationError("checkpoint floor cannot be resolved", e);
+    }
 
     // PRD #1062 M2 (#1036) — the `.github/workflows` overlay. When an overlay context is
     // supplied (GitHub, agent already reaped — see runner.ts), attempt to build a genuine
@@ -1968,31 +2205,43 @@ export class GitCache {
     let wantRev = realTip;
     if (overlay) {
       const ov = await this.buildWorkflowOverlay(barePath, branch, realTip, overlay);
-      if (ov) wantRev = ov;
+      if (ov) {
+        wantRev = ov;
+        await this.scratchPublicationPreflight(barePath, branch, wantRev);
+      }
     }
 
-    // pack-objects reads the wanted/excluded revs on stdin (one ref per line, `^` excludes)
-    // and writes the packfile to stdout. The wanted rev is `realTip` on the no-overlay path
-    // (via `trackingRef`'s tip) and `O_ov` when an overlay was built; `^excludeRef` is the
-    // same floor either way, so the default's workflow blobs (reachable from the floor on the
-    // not-pushed leg) are not re-shipped.
-    const wanted = wantRev === realTip ? trackingRef : wantRev;
+    // Validate the actual commit to be packed; an earlier overlay floor can be
+    // reachable through the wrapper's first parent but not through realTip.
+    const wanted = wantRev;
+    await this.validateCheckpointFloor(barePath, excludeSha, wanted);
     const { stdout } = await this.spawnGit(
       barePath,
       ["pack-objects", "--revs", "--stdout"],
-      `${wanted}\n^${excludeRef}\n`,
+      `${wanted}\n^${excludeSha}\n`,
     );
     return { tipOid: wantRev, pack: stdout };
   }
 
-  /** issue #1597 M2 — the floor a checkpoint pack excludes: `refs/remotes/origin/<branch>` when
-   *  origin carries the branch, else the default branch (defaultBranchRef). The ONE choice shared by
-   *  {@link checkpointPack}'s unpinned path and {@link resolveCheckpointRange}. */
-  private async checkpointExcludeRef(barePath: string, branch: string): Promise<string> {
+  private async validateCheckpointFloor(barePath: string, floor: string | null, candidate: string): Promise<void> {
+    if (!floor || !SHA40_RE.test(floor) ||
+        await this.revParse(barePath, `${floor}^{commit}`) !== floor ||
+        !(await this.isAncestorRef(barePath, floor, candidate))) {
+      throw new ScratchPublicationError("checkpoint floor is unavailable or not an ancestor of candidate");
+    }
+  }
+
+  /** The pack floor is the origin branch when present; otherwise the common
+   *  ancestor of the pinned tip and default, so a default advance cannot exclude
+   *  an unreachable commit. Shared by checkpointPack and resolveCheckpointRange. */
+  private async checkpointExcludeRef(barePath: string, branch: string, tip: string): Promise<string> {
     const originRef = `refs/remotes/origin/${branch}`;
-    return (await this.refExists(barePath, originRef))
-      ? originRef
-      : await this.defaultBranchRef(barePath);
+    if (await this.refExists(barePath, originRef)) return originRef;
+    const defaultRef = await this.defaultBranchRef(barePath);
+    // A branch behind the default still needs an ancestor exclusion. The common
+    // base keeps the pack self-contained while the overlay aligns workflow trees.
+    const base = (await this.runGit(barePath, ["merge-base", defaultRef, tip])).trim();
+    return SHA40_RE.test(base) ? base : defaultRef;
   }
 
   /**
@@ -2011,7 +2260,7 @@ export class GitCache {
     try {
       const tipSha = await this.trackingTip(barePath, branch);
       if (!tipSha) return null;
-      const excludeRef = await this.checkpointExcludeRef(barePath, branch);
+      const excludeRef = await this.checkpointExcludeRef(barePath, branch, tipSha);
       const excludeSha = await this.revParse(barePath, `${excludeRef}^{commit}`);
       if (!excludeSha) return null;
       const scanFloorShas: string[] = [];
@@ -2402,7 +2651,6 @@ export class GitCache {
     realTip: string,
     overlay: CheckpointOverlayContext,
   ): Promise<string | null> {
-    const trackingRef = runnerTrackingRef(branch);
     // GATE 1 — the default tip must resolve (a fresh authenticated fetch). A failure ships
     // realTip: overlay durability is best-effort and never blocks the checkpoint.
     let defaultTip: string;
@@ -2423,12 +2671,12 @@ export class GitCache {
     }
     // GATE 2 — only a branch actually behind on `.github/workflows` needs an overlay (reuse
     // #627's exact trigger). Not behind ⇒ ship realTip (the broker accepts the raw tip).
-    if (!(await this.workflowTreeDiffers(barePath, trackingRef, defaultTip))) return null;
+    if (!(await this.workflowTreeDiffers(barePath, realTip, defaultTip))) return null;
     // GATE 3 — the branch must NOT itself have modified a workflow file. `changedFiles` returns
     // null when the diff can't be computed: FAIL-SAFE (cannot verify ⇒ ship realTip, never
     // synthesise a tree that might hide a branch's own workflow edit). A non-empty workflow hit
     // set means #377 owns this branch at finalize; ship realTip → the clean workflow-scope skip.
-    const changed = await this.changedFiles(barePath, trackingRef);
+    const changed = await this.changedFiles(barePath, realTip);
     if (changed === null) return null;
     if (changed.some((file) => file.startsWith(".github/workflows/"))) return null;
 
@@ -4281,7 +4529,9 @@ export class GitCache {
     }
     const cwd = options.cwd ?? (identity === "command" ? commandCwd(args) : "/");
     const executable = resolveBoundaryExecutable(command);
-    const process = await boundary.spawn({ argv: [executable, ...args], cwd, env: options.env, identity });
+    const process = await boundary.spawn({ argv: [executable, ...args], cwd, env: options.env, identity,
+      ...(options.timeout === undefined ? {} : { timeoutMs: options.timeout }),
+    });
     process.stdin?.on("error", () => undefined);
     process.stdin?.end(input);
     const cap = options.maxBuffer ?? GIT_MAX_BUFFER;

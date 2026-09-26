@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { recordingLogger } from "./helpers.js";
+import { recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache } from "../src/git.js";
 
 // PRD #1392 M3 (agent half) — RESUME warmth acceptance.
@@ -48,7 +48,7 @@ function gitIn(dir: string, args: string[]): string {
 describe("ensureClone resume warmth (PRD #1392 M3 agent)", () => {
   it("WARM resume: bare already present ⇒ ensureClone FETCHES (no re-clone), yielding a bare a runner clone checks out", async () => {
     const { logger, lines } = recordingLogger();
-    const git = new GitCache(fx.dataDir, logger);
+    const git = new GitCache(fx.dataDir, logger, undefined, testGitCacheOptions());
 
     // The FIRST claim has no bare yet, so it cold-clones one — this is the sibling/owner
     // that leaves a WARM bare behind for the resume.
@@ -88,7 +88,7 @@ describe("ensureClone resume warmth (PRD #1392 M3 agent)", () => {
 
   it("COLD resume: NO bare present ⇒ ensureClone CLONES, creates the bare, and a runner clone off it works", async () => {
     const { logger, lines } = recordingLogger();
-    const git = new GitCache(fx.dataDir, logger);
+    const git = new GitCache(fx.dataDir, logger, undefined, testGitCacheOptions());
     const barePath = git.barePathFor(fx.originPath);
 
     // The COLD resume precondition: no bare (the owner is cold after a failed first clone,
@@ -125,7 +125,7 @@ describe("ensureClone resume warmth (PRD #1392 M3 agent)", () => {
     // No sleeps: an invalid origin is classified permanent (fail-fast, one attempt), and an
     // empty schedule makes that explicit and instant regardless.
     const { logger, lines } = recordingLogger();
-    const git = new GitCache(fx.dataDir, logger, { schedule: [], sleep: async () => {} });
+    const git = new GitCache(fx.dataDir, logger, { schedule: [], sleep: async () => {} }, testGitCacheOptions());
     const barePath = git.barePathFor(fx.originPath);
 
     // Make the SAME repo URL temporarily unreachable by moving its origin aside — the

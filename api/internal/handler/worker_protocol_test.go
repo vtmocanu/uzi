@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -289,6 +291,39 @@ func TestWorkerRegisterToleratesCapabilities(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200 (capabilities must not 400 register) for %s, body %q", rec.Code, body, rec.Body.String())
 		}
+	}
+}
+
+func TestWorkerRegisterSnapshotDropLogs(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		disabled bool
+		body     string
+		message  string
+	}{
+		{"feature disabled", true, "{\"active_snapshot\":{\"active\":[],\"marker\":\"hidden-marker-1742\"}}", "worker register active snapshot dropped: feature disabled"},
+		{"parse rejected", false, "{\"active_snapshot\":{\"snapshot_epoch\":\"hidden-marker-1742\"}}", "worker register active snapshot dropped: parse rejected"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(previous) })
+
+			h := newProtocolHandler(t, &protocolStore{})
+			h.cfg.ActiveSnapshotDisabled = tc.disabled
+			rec := httptest.NewRecorder()
+			h.WorkerRegister(rec, workerReq(http.MethodPost, tc.body, uuid.Nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(logs.String(), tc.message) {
+				t.Fatalf("register drop log missing %q: %s", tc.message, logs.String())
+			}
+			if strings.Contains(logs.String(), "hidden-marker-1742") {
+				t.Fatalf("register logged snapshot content: %s", logs.String())
+			}
+		})
 	}
 }
 

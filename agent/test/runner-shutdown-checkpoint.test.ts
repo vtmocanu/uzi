@@ -7,6 +7,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { type ExecutorResult, type RunContext } from "../src/executor.js";
 import { CodexBoundaryError } from "../src/codex/safety.js";
+import { ScratchPublicationError } from "../src/git.js";
 import type { BoundaryPermit, CodexExecutionSafety, HarnessError } from "../src/harness.js";
 import { type ExecutorFactory, type RunnerOptions } from "../src/runner.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
@@ -615,6 +616,22 @@ describe("RunRunner — typed shutdown checkpoint outcome (issue #1597 M1)", () 
       assert.equal(loggedOutcome(lines), "timeout");
     } finally {
       await restore();
+    }
+  });
+
+  it("scratch preflight refusal names the shutdown class without leaking error text", async () => {
+    const originalPack = git.checkpointPack.bind(git);
+    git.checkpointPack = (async () => {
+      throw new ScratchPublicationError("remote credential text");
+    }) as typeof git.checkpointPack;
+    try {
+      const { feed, lines } = await shutdownOnce(1597_15);
+      assert.ok(feed.includes(notPublished("scratch_publication_refused")), JSON.stringify(feed));
+      assert.ok(feed.includes("checkpoint publish failed: scratch_publication_refused"));
+      assert.equal(loggedOutcome(lines), "scratch_publication_refused");
+      assert.ok(!feed.some((text) => text.includes("remote credential")));
+    } finally {
+      git.checkpointPack = originalPack;
     }
   });
 

@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import fs, { writeFileSync } from "node:fs";
 import path from "node:path";
 import { type SDKMessage, type SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 import { spawnDetached } from "../src/sdk-spawn.js";
@@ -27,11 +27,52 @@ import {
   runner,
   simulateCommittedWork,
   waitDead,
+  worktreeDirFor,
 } from "./runner-harness.js";
 
 installHarness();
 
 describe("RunRunner — plan gate + steering end to end", () => {
+  it("keeps scratch in the exact retained runner clone across an approval wait", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(1719);
+    const clone = worktreeDirFor(1719);
+    const scratch = path.join(clone, ".uzi", "scratch", "draft.txt");
+    let cloneIdentity: { dev: number; ino: number } | undefined;
+    const stub = new StubExecutor(nullLogger(), { planGate: true });
+    const executor: Executor = {
+      async run(ctx) {
+        assert.equal(ctx.worktreePath, clone);
+        fs.writeFileSync(scratch, "private draft\n");
+        const { dev, ino } = fs.statSync(clone);
+        cloneIdentity = { dev, ino };
+        const result = await stub.run(ctx);
+        assert.deepEqual(
+          { dev: fs.statSync(clone).dev, ino: fs.statSync(clone).ino },
+          cloneIdentity,
+          "approval continued in the retained clone",
+        );
+        assert.equal(fs.readFileSync(scratch, "utf8"), "private draft\n");
+        return result;
+      },
+    };
+    const execution = runner(executor, gitlab, undefined, { planApprovalTimeoutMs: 3000 }).execute(claim);
+    const deadline = Date.now() + 2500;
+    while (!api.states.some((s) => s.runId === claim.run_id && s.body.status === "awaiting_approval")) {
+      assert.ok(Date.now() < deadline, "run reached approval wait");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(cloneIdentity, "executor created scratch before approval");
+    assert.equal(fs.readFileSync(scratch, "utf8"), "private draft\n");
+    assert.deepEqual(
+      { dev: fs.statSync(clone).dev, ino: fs.statSync(clone).ino },
+      cloneIdentity,
+    );
+    api.setInputs(claim.run_id, [input("approve_plan")]);
+    await execution;
+    assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
+  });
+
   it("halts at awaiting_approval, resumes on approve, then completes with an MR", async () => {
     const { gitlab, calls } = fakeGitlab();
     // The fake SDK query commits nothing to the clone; model committed work so the

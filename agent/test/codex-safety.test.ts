@@ -455,6 +455,36 @@ describe("CodexExecutionSafety.spawnBoundaryAction: boundary-action lane", () =>
 });
 
 describe("CodexExecutionSafety.spawnBoundaryProcess: permit-owned subprocesses", () => {
+  it("caps a boundary child to its requested deadline", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(19));
+    let launchBudget = -1;
+    let waitBudget = -1;
+    const safety = createCodexExecutionSafety(
+      reg,
+      spawnCounter().seam,
+      undefined,
+      undefined,
+      async (_request, deadlineMs) => {
+        launchBudget = deadlineMs;
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+        return {
+          root: new FakeRoot("boundary_action"),
+          stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+          waitChild: async (deadline) => { waitBudget = deadline; return { code: 0 }; },
+        };
+      },
+    );
+    await safety.withBoundary({ boundary: "finalize", deadlineMs: 1_000 }, async (permit) => {
+      const child = await safety.spawnBoundaryProcess(permit, {
+        argv: ["/usr/bin/git", "status"], cwd: "/tmp", env: {}, identity: "worker_pat", timeoutMs: 250,
+      });
+      await child.completed;
+    });
+    assert.ok(launchBudget > 0 && launchBudget <= 250);
+    assert.ok(waitBudget > 0 && waitBudget <= launchBudget - 30,
+      "launch time must consume the same child deadline used for waiting");
+  });
+
   it("reserves before spawn, registers, and holds the permit until the whole root reaps", async () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(9));
     const exited = defer<{ code: number }>();

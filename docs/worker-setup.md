@@ -123,7 +123,7 @@ resources:
 
 **A [docker sidecar](#docker-sidecar) costs more** on top of either number above: budget roughly an extra **1-2 GiB memory / 1 CPU** for the `dind` daemon itself, plus its own storage for pulled images and build cache — a compose `dinddata` volume, or its k8s equivalent. `dinddata` only grows; reclaim it the same way as `agentnix` (`docker compose down -v`, or `docker volume rm <project>_dinddata`) once you don't need what's cached. On a hosted k8s worker the equivalent is a persistent per-worker PVC rather than an emptyDir, and it is just as unbounded: reclaim it with `docker system prune` inside the worker, or by deleting and reprovisioning the worker, which recreates the PVC empty. Expect a real workload — uzi's own e2e suite pulls `postgres:17` and builds `api`/`web`/`agent` through the sidecar — to land in the **5-20 GiB** range.
 
-**On a hosted k8s worker, a per-pod Codex command cache draws on the pod's ephemeral storage, separately from the dind budget above**: it exists only under the uid split. A worker-only emptyDir (`codex-cmd-cache`) holds one directory per run with that run's Codex command build cache (`GOMODCACHE`/`GOCACHE`/npm). It is removed at the end of any run whose command roots have all drained, and via `--remove-cache` after a cache-holder loss; otherwise it is kept on disk until the startup orphan reaper sweeps it. It counts toward `workers.ephemeralRequest`/`workers.docker.ephemeralRequest`, which are not yet raised to account for it pending a hosted measurement of a Go-heavy Codex run's peak usage.
+**On a hosted k8s worker, a per-pod Codex command cache draws on the pod's ephemeral storage, separately from the dind budget above**: it exists only under the uid split. A worker-only emptyDir (`codex-cmd-cache`) holds one directory per run with that run's Codex command build cache (`GOMODCACHE`/`GOCACHE`/npm). It is removed at the end of any run whose command roots have all drained, and via `--remove-cache` after a cache-holder loss; otherwise it is kept on disk until the startup orphan reaper sweeps it. It counts toward `workers.ephemeralRequest`/`workers.docker.ephemeralRequest`, the docker tier's 5Gi default adds provisional headroom for it (issue #1757), unmeasured; the plain tier's 512Mi does not yet, pending a hosted measurement of a Go-heavy Codex run's peak usage.
 
 What the gauges mean:
 
@@ -179,6 +179,34 @@ re-queued during the outage gets that charge refunded once it's back. See
 and the related knobs.
 
 The same write-ahead journal covers a run-lane attempt's terminal outcome (an issue run, a judge, or a review; chat is excluded — it never carries a claim generation to fence on). Before the worker ever sends a `completed`/`failed` report, it journals the outcome to the same durable outbox tree the message outbox above uses, keyed by the run and its claim generation. Once the api is back, replay sends the run's own messages first and the outcome only after they've caught up, so a run that finished during the outage still gets its MR and its final state exactly once — a journaled outcome is never re-attempted, and a duplicate claim on the same run is refused rather than executed. If the worker container restarts mid-outage, it resolves every pending journal from disk before its claim loops start, so the outcome lands even though the executor that produced it is gone. An outcome the api permanently refuses (most often because the run's messages can't be reconciled, or a completion permit no longer matches) is never discarded on a timer: it's surfaced on the run as a held outcome and cleared only by the owner explicitly cancelling with the discard bit set (`uzi run cancel --discard-pending-outcome`, or the same confirmation from the run page). Same-uid caveat as above: the outcome journal lives in the same worker-owned tree as the message outbox, so on the hosted single-uid runtime it protects against the outage, not against a hostile model.
+
+## Run artifacts and the sandbox
+
+The worker provisions `.uzi/scratch/` inside each runner checkout before the
+agent starts. [ADR-1719](../adr/1719-run-scratch-dir.md) records the path policy.
+Use it for gate logs, screenshots and plain exported review snapshots.
+For a gate log, create a unique file with
+`mktemp .uzi/scratch/gate-log.XXXXXX`. A snapshot exported with `git archive`
+has no git metadata or installed dependencies; run git-dependent gates in the
+real checkout. Scratch persists only while the identical runner clone is
+retained through a park and resume. A reseed, even on the same worker, and a
+cross-worker recovery create an empty scratch directory. Do not rely on it for
+durable recovery.
+
+The worker locally excludes the scratch directory from ordinary staging.
+Checkpoint and final publication refuse a scratch path in any commit being
+sent or an index/WIP capture. The check covers the branch's full history, so a
+branch that ever committed a scratch path stays refused even after a later
+commit deletes it. An ignore rule does not prevent forced staging;
+publication refusal guards that case. A repository collision at `.uzi/scratch/`
+fails provisioning instead of replacing repository content.
+
+Direct file-tool paths are limited to the run worktree on Claude and Codex.
+This is a tool policy, not a promise that every shell command is filesystem
+confined: Claude's Bash guardrail screens commands but does not jail paths;
+Codex also screens the shell working directory and uses Landlock where
+available. OS permissions and the worker/runner uid split still apply. The
+existing credential and `.git` restrictions also apply inside scratch.
 
 ## Concurrent runs
 

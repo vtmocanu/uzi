@@ -530,7 +530,9 @@ type Store interface {
 	// here so those parallel milestones never edit the interface. The custody hold itself
 	// is opened atomically inside ClaimRun's CTE (D2); everything below operates on the
 	// already-open hold and its immutable captures.
-	CountUnresolvedCustodyHoldsForOwner(ctx context.Context, userID uuid.UUID) (int64, error)
+	// GetCustodyAdmissionForRun (issue #1751) replaces the owner-only count for the health
+	// resolver: it also carries ClaimRun's continuation exemption for the run.
+	GetCustodyAdmissionForRun(ctx context.Context, arg store.GetCustodyAdmissionForRunParams) (store.GetCustodyAdmissionForRunRow, error)
 	BindCaptureManifest(ctx context.Context, arg store.BindCaptureManifestParams) (store.RecoveryCapture, error)
 	InsertCaptureChunk(ctx context.Context, arg store.InsertCaptureChunkParams) error
 	MarkCaptureReady(ctx context.Context, arg store.MarkCaptureReadyParams) (store.RecoveryCapture, error)
@@ -553,6 +555,11 @@ type Store interface {
 	// api's own forge proof, re-asserting every run/hold guard so a change mid-proof moves 0 rows.
 	GetCustodyHoldForSettle(ctx context.Context, arg store.GetCustodyHoldForSettleParams) (store.RecoveryCustodyHold, error)
 	ReleasePredecessorCustodyHoldByAncestry(ctx context.Context, arg store.ReleasePredecessorCustodyHoldByAncestryParams) (int64, error)
+	// Issue #1751 M2: the LIVE twin — releases that one older-generation hold with
+	// 'live_ancestry' evidence while the same-worker successor generation is still live,
+	// re-asserting every run/hold guard (live status, claim generation, unreleased claim, the
+	// captured branch and checkpoint derivation inputs) so a change mid-proof moves 0 rows.
+	ReleasePredecessorCustodyHoldByLiveAncestry(ctx context.Context, arg store.ReleasePredecessorCustodyHoldByLiveAncestryParams) (int64, error)
 	// Issue #1582 M1 rework: the server-held facts the settle candidates must match — the
 	// source_sha of every capture under the hold created before the successor generation
 	// claimed, and the head of the completion permit an interlocked run's completion consumed.
@@ -1980,8 +1987,10 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	// #1391's pending outcomes from the D11-predicated fail/requeue that follows. #1390's worker
 	// never sends one; the path exists for #1391. An invalid register snapshot is ignored, never
 	// fatal (register must not wedge on soft input).
+	snapshotApplied := false
 	if snapshot != nil {
-		if _, err := s.ReplaceWorkerActiveRuns(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister); err != nil {
+		snapshotApplied, err = s.ReplaceWorkerActiveRuns(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister)
+		if err != nil {
 			return store.Worker{}, "", err
 		}
 	}
@@ -1999,6 +2008,23 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 		return store.Worker{}, "", err
 	}
 	committed = true
+	if snapshot != nil {
+		pendingCount := 0
+		for _, entry := range snapshot.Active {
+			if entry.TerminalPending {
+				pendingCount++
+			}
+		}
+		slog.Info("worker register active snapshot committed",
+			"worker_id", wkr.ID.String(), "offered_entries", len(snapshot.Active),
+			"offered_pending_entries", pendingCount, "offered_pending_overflow", snapshot.PendingOverflow,
+			"applied", snapshotApplied, "overflow_lease_applied", snapshotApplied && snapshot.PendingOverflow,
+			"orphan_failed", len(orphanFailed), "orphan_requeued", len(requeued))
+	} else {
+		slog.Info("worker register orphan recovery committed",
+			"worker_id", wkr.ID.String(), "snapshot_offered", false,
+			"orphan_failed", len(orphanFailed), "orphan_requeued", len(requeued))
+	}
 	s.publishRegisterSweeps(ctx, orphanFailed, requeued)
 	return store.Worker(row), nonce, nil
 }
@@ -4774,7 +4800,7 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	if !ok {
 		return PublishResult{Published: false, Ref: "", Skipped: "unsupported"}, nil
 	}
-	ref := "refs/uzi-checkpoints/" + branch
+	ref := checkpointRefPrefix + branch
 
 	// 3. Repo + connection facts (clone URL, base URL, default branch, bot username,
 	// sealed PAT) come from the run claim context — the same INNER JOIN the claim

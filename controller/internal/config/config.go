@@ -122,6 +122,17 @@ type Config struct {
 	// worker, so it must be read even on an instance with the docker tier off. Its
 	// docker counterpart lives with the other docker knobs below.
 	WorkerEphemeralRequest string
+	// WorkerSecretMountPath overrides where the worker's join-token Secret mounts
+	// (UZI_WORKER_SECRET_MOUNT_PATH, issue #1761). Empty ⇒ /run/secrets, the render
+	// default. OpenShift/OKD sets it because CRI-O shadows a volume at /run/secrets. Its
+	// shape and overlap rules are checked at boot by kube.ValidateSecretMountPath, which
+	// knows the other mount paths; here it is only trimmed.
+	WorkerSecretMountPath string
+	// WorkerSecretMountAllowUnversionedImage (UZI_WORKER_SECRET_MOUNT_ALLOW_UNVERSIONED_IMAGE)
+	// lets a relocated secret mount pair with a worker image tag that is not semver (a
+	// digest, `dev`), which kube.ValidateSecretMountWorkerImage cannot compare against the
+	// minimum release. It never rescues an OLD semver tag.
+	WorkerSecretMountAllowUnversionedImage bool
 	// WorkerMaxPVCStorage is the RESTRICTED tier's LimitRange maxPVCStorage
 	// (UZI_WORKER_MAX_PVC_STORAGE, issue #224). It is not used to render anything: it
 	// is the admission ceiling every PVC this controller creates must fit, and it
@@ -400,6 +411,17 @@ func loadWorkerSettings(cfg *Config) error {
 	// silently skip it on an instance with the docker tier off, which is most of them.
 	if err := parseQuantityEnv("UZI_WORKER_EPHEMERAL_REQUEST", &cfg.WorkerEphemeralRequest); err != nil {
 		return err
+	}
+
+	// The join-token Secret mount override (issue #1761). Applies to every worker, so it
+	// is read here rather than with the docker-only knobs.
+	cfg.WorkerSecretMountPath = strings.TrimSpace(os.Getenv("UZI_WORKER_SECRET_MOUNT_PATH"))
+	if v := strings.TrimSpace(os.Getenv("UZI_WORKER_SECRET_MOUNT_ALLOW_UNVERSIONED_IMAGE")); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("UZI_WORKER_SECRET_MOUNT_ALLOW_UNVERSIONED_IMAGE=%q: want true or false", v)
+		}
+		cfg.WorkerSecretMountAllowUnversionedImage = b
 	}
 
 	// The restricted tier's PVC admission ceiling (issue #224). Read here, outside

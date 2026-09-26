@@ -135,7 +135,7 @@ var sizes = map[string]Size{
 		CPULimit:      resource.MustParse("4"),
 		MemoryRequest: resource.MustParse("8Gi"),
 		MemoryLimit:   resource.MustParse("12Gi"),
-		DataSize:      resource.MustParse("20Gi"),
+		DataSize:      resource.MustParse("25Gi"), // issue #1757: was 20Gi; bare clones + tracking refs outgrew it
 	},
 }
 

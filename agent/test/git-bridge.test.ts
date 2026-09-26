@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { GitCache } from "../src/git.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
 
 // PRD #1416 M3 — the ancestry BRIDGE (git.ts bridgeToFloors) and the structure-validated bridge
 // DETECTOR (git.ts rangeContainsBridge), exercised over REAL on-disk repos so the commit graph
@@ -61,7 +61,7 @@ beforeEach(() => {
   gitIn(repo, ["config", "maintenance.auto", "false"]);
   gitIn(repo, ["config", "gc.auto", "0"]);
   gitIn(repo, ["config", "core.fsmonitor", "false"]);
-  git = new GitCache(dataDir, nullLogger());
+  git = new GitCache(dataDir, nullLogger(), undefined, testGitCacheOptions());
 });
 
 afterEach(() => fs.rmSync(base, { recursive: true, force: true }));

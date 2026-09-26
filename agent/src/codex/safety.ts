@@ -340,6 +340,9 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
   ): Promise<BoundaryProcessHandle> {
     if (this.heldPermit !== permit) throw new Error("codex boundary process refused: stale permit");
     if (permit.signal.aborted) throw new Error("codex boundary process refused: boundary deadline exceeded");
+    if (request.timeoutMs !== undefined && (!Number.isFinite(request.timeoutMs) || request.timeoutMs <= 0)) {
+      throw new Error("codex boundary process timeout must be positive and finite");
+    }
     if (!request.argv[0]?.startsWith("/")) {
       const error: HarnessError = { category: "protocol", message: "boundary process executable must be absolute" };
       this.registry.poison(error);
@@ -356,9 +359,10 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       this.registry.poison(error);
       throw new Error(error.message);
     }
+    const childDeadlineAt = Date.now() + Math.min(request.timeoutMs ?? Infinity, remainingMs(this.currentDeadlineAt));
     let launched: SpawnedBoundaryProcess;
     try {
-      launched = await this.seams.spawnProcess(request, remainingMs(this.currentDeadlineAt));
+      launched = await this.seams.spawnProcess(request, Math.max(1, childDeadlineAt - Date.now()));
     } catch {
       this.registry.cancelReservation(reservation.reservation);
       const error: HarnessError = { category: "tool", message: "boundary process spawn failed" };
@@ -374,7 +378,12 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       let terminal: { readonly code: number } | undefined;
       let terminalError: unknown;
       try {
-        terminal = await this.waitChildOrAbort(launched, permit.signal, remainingMs(this.currentDeadlineAt));
+        if (Date.now() >= childDeadlineAt) throw new Error("boundary process child deadline exceeded during launch");
+        terminal = await this.waitChildOrAbort(
+          launched,
+          permit.signal,
+          Math.max(1, childDeadlineAt - Date.now()),
+        );
       } catch (error) {
         terminalError = error;
       }

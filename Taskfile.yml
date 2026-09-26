@@ -944,10 +944,11 @@ tasks:
       - ./.agents/skills/uzi-watcher/scripts/backup-loop.test.sh
 
   test:uzi-lander:
-    desc: hermetic tests of uzi-lander review routing, quota timing, CI discovery, stale-base push guards, base-move tolerance and CHANGELOG union
+    desc: hermetic tests of uzi-lander review routing, quota timing, CI discovery, required-check completeness, stale-base push guards, base-move tolerance and CHANGELOG union
     cmds:
       - ./.agents/skills/uzi-lander/scripts/lib/review-threads.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/greptile-verdict.test.sh
+      - ./.agents/skills/uzi-lander/scripts/lib/required-checks.test.sh
       - ./.agents/skills/uzi-lander/scripts/cr-rate-limit.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep-guards.test.sh
@@ -1121,6 +1122,14 @@ tasks:
     desc: assert the hosted-worker image tag is pinned independently of Chart.AppVersion (PRD 422 M1)
     cmds:
       - ./scripts/assert-worker-tag-decoupled.sh
+
+  render:openshift-check:
+    desc: assert the OpenShift/OKD chart knobs (HTTPRoute, nullable ids, DNS ports, OVN egress, SCC) render as documented
+    cmds:
+      # Offline (the CNPG subchart is stripped), needs helm + yq. Not in gate:repo (the
+      # lint job lacks helm); CI runs it in the helm-chart job. See the script header and
+      # docs/openshift.md.
+      - ./scripts/assert-openshift-render.sh
 
   render:drain-knobs-check:
     desc: assert the controller Deployment renders the drain-deadline + force-roll knobs (PRD 422 M5)

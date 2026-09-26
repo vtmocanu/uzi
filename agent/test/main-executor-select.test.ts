@@ -8,7 +8,8 @@ import { WorkerClient } from "../src/client.js";
 import { StubExecutor } from "../src/executor.js";
 import { SdkExecutor } from "../src/sdk-executor.js";
 import { CodexExecutor, FailClosedExecutor } from "../src/codex/codex-executor.js";
-import { buildRunExecutor, type BuildRunExecutorDeps } from "../src/main.js";
+import { buildChatExecutor, buildRunExecutor, type BuildRunExecutorDeps } from "../src/main.js";
+import { ChatExecutor } from "../src/chat-executor.js";
 import type { ClaimCodexSecrets } from "../src/protocol.js";
 
 // PRD #1429 M6 — the harness-neutral e2e stub seam (`agent/src/main.ts`).
@@ -101,5 +102,52 @@ describe("buildRunExecutor — the stub-before-codex reorder (PRD #1429 M6)", ()
         `a broken codex block must fail closed under executorKind=${executorKind}, never silently fall back`,
       );
     }
+  });
+});
+
+// Issue #1761: a relocated join-token Secret (OpenShift, where CRI-O shadows /run/secrets)
+// must reach BOTH harnesses' guards as the file AND its directory, and the default must stay
+// the file only. Reads the executors' private fields: the wiring, not a hand-built policy.
+describe("buildRunExecutor — worker secret deny paths (issue #1761)", () => {
+  const relocated = "/run/uzi-secrets/worker_token";
+
+  it("Claude runs deny the relocated token file and its Secret directory", () => {
+    const { executor } = buildRunExecutor("run-6", undefined, baseDeps({ workerTokenFile: relocated }));
+    assert.ok(executor instanceof SdkExecutor);
+    assert.deepEqual((executor as unknown as { secretPaths: readonly string[] }).secretPaths, [relocated, "/run/uzi-secrets"]);
+  });
+
+  it("Codex runs get the same deny set in their executor options", () => {
+    const { executor } = buildRunExecutor("run-7", VALID_SUBSCRIPTION_CODEX, baseDeps({ workerTokenFile: relocated }));
+    assert.ok(executor instanceof CodexExecutor);
+    assert.deepEqual((executor as unknown as { opts: { workerSecretPaths?: readonly string[] } }).opts.workerSecretPaths, [relocated, "/run/uzi-secrets"]);
+  });
+
+  it("the default /run/secrets token adds no directory (the built-in prefix covers it)", () => {
+    const { executor } = buildRunExecutor("run-8", undefined, baseDeps({ workerTokenFile: "/run/secrets/worker_token" }));
+    assert.deepEqual((executor as unknown as { secretPaths: readonly string[] }).secretPaths, ["/run/secrets/worker_token"]);
+  });
+});
+
+// Issue #1761 (should): the chat lane is a separate caller of workerSecretDenyPaths, so its
+// wiring gets its own regression: a chat session must deny a relocated token's directory too.
+describe("buildChatExecutor — worker secret deny paths (issue #1761)", () => {
+  const relocated = "/run/uzi-secrets/worker_token";
+  const read = (e: unknown) => (e as { secretPaths: readonly string[] }).secretPaths;
+
+  it("a chat session denies the relocated token file and its Secret directory", () => {
+    const e = buildChatExecutor({ log: nullLogger(), sdkHomeRoot: SDK_HOME_ROOT, executorKind: "sdk", workerTokenFile: relocated });
+    assert.ok(e instanceof ChatExecutor);
+    assert.deepEqual(read(e), [relocated, "/run/uzi-secrets"]);
+  });
+
+  it("the default /run/secrets token adds no directory", () => {
+    const e = buildChatExecutor({ log: nullLogger(), sdkHomeRoot: SDK_HOME_ROOT, executorKind: "sdk", workerTokenFile: "/run/secrets/worker_token" });
+    assert.deepEqual(read(e), ["/run/secrets/worker_token"]);
+  });
+
+  it("no configured token file means no extra deny paths (env-var delivery)", () => {
+    const e = buildChatExecutor({ log: nullLogger(), sdkHomeRoot: SDK_HOME_ROOT, executorKind: "sdk" });
+    assert.deepEqual(read(e), []);
   });
 });

@@ -554,7 +554,7 @@ type fakeStore struct {
 
 	// PRD #1296 M4 (D3/D4) custody. openCustodyHolds is the count both the DeleteWorker
 	// guard (CountOpenCustodyHoldsForWorker) and the queued-reason rung
-	// (CountUnresolvedCustodyHoldsForOwner) read; default 0 → no custody, so pre-#1296
+	// (GetCustodyAdmissionForRun open_holds) read; default 0 → no custody, so pre-#1296
 	// tests are unaffected. countCustodyWorkerParams captures the last DeleteWorker guard
 	// call so a test can prove it was owner-scoped. releasableHolds seeds the reconciler
 	// candidate list; releaseCustodyRows is what the release queries report.
@@ -1652,8 +1652,8 @@ func (f *fakeStore) CountOpenCustodyHoldsForWorker(_ context.Context, arg store.
 	f.countCustodyWorkerParams = &arg
 	return f.openCustodyHolds, nil
 }
-func (f *fakeStore) CountUnresolvedCustodyHoldsForOwner(_ context.Context, _ uuid.UUID) (int64, error) {
-	return f.openCustodyHolds, nil
+func (f *fakeStore) GetCustodyAdmissionForRun(_ context.Context, _ store.GetCustodyAdmissionForRunParams) (store.GetCustodyAdmissionForRunRow, error) {
+	return store.GetCustodyAdmissionForRunRow{OpenHolds: f.openCustodyHolds}, nil
 }
 func (f *fakeStore) ListReleasableCustodyHolds(_ context.Context) ([]store.ListReleasableCustodyHoldsRow, error) {
 	return f.releasableHolds, nil

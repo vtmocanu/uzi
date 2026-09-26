@@ -87,6 +87,11 @@ echo "OK: $(grep -c '^---$' "$RENDER") documents, one kind per document, no glue
 # is an exact string equality in awk too, so a host containing `*` (e.g.
 # `*.anthropic.com`) cannot be misread as a glob.
 #
+# ANTREA ONLY. With workers.fqdnEgress.provider: ovn the named egress is an OVN
+# EgressFirewall instead; scripts/assert-openshift-render.sh asserts that its allow set and
+# deny belt EQUAL the Antrea ones for the same values, so this check's completeness and
+# Codex-shape guarantees carry over to OVN without being restated here.
+#
 # EXIT CODES (the convention assert-drain-knobs-render.sh sets):
 #     2 = the instrument is broken (no crd.antrea.io policy in the render that was
 #         supposed to contain one, or the committed canary did not trip the detector)

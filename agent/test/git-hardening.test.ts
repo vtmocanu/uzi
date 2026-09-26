@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache, gitEnv } from "../src/git.js";
 
 // PRD #51 M0 — standalone shared-git hardening (the gitEnv belt), PLUS the M3 (b)
@@ -165,7 +165,7 @@ describe("gitEnv M0 hardening: code-exec keys neutralized in real git (functiona
   beforeEach(() => {
     if (!gitAvailable()) return;
     fx = makeFixture();
-    git = new GitCache(fx.dataDir, nullLogger());
+    git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
     markerDir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-m0-marker-"));
     marker = path.join(markerDir, "FIRED");
     evil = path.join(markerDir, "evil.sh");

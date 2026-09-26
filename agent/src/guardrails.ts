@@ -207,7 +207,7 @@ const REASON_DOCKER_NO_DAEMON = "denied by guardrail: docker requires a daemon s
 const REASON_DOCKER_REDIRECT = "denied by guardrail: redirecting the docker client to a different daemon is not permitted";
 const REASON_DEPTH = "denied by guardrail: command wrapping is nested too deeply to screen safely";
 const REASON_SCREEN_ERROR = "denied by guardrail: command screening failed; refusing to run Bash";
-const REASON_OUTSIDE_WORKTREE = "denied by guardrail: file access outside the run worktree is not permitted";
+const REASON_OUTSIDE_WORKTREE = "denied by guardrail: file access outside the run worktree is not permitted; use .uzi/scratch/ inside the run worktree for temporary files";
 const REASON_DOTGIT = "denied by guardrail: accessing the .git directory is not permitted";
 const REASON_UNKNOWN_SUBAGENT = "denied by guardrail: only the run's assembled subagents may be invoked";
 const REASON_CONSTRAINTS_UNATTACHABLE =
@@ -228,6 +228,28 @@ const MAX_DEPTH = 6;
 // split; see docs/proc-hardening.md). The specific UZI_WORKER_TOKEN_FILE path (if
 // outside this prefix) is added at the hook via `extraSecretPaths`.
 const SECRET_PATH_PREFIXES = ["/run/secrets/"];
+
+/**
+ * The worker-credential paths the guards deny for a configured UZI_WORKER_TOKEN_FILE,
+ * on top of the built-in `/run/secrets/` prefix (issue #1761).
+ *
+ * The file itself, AND its directory when that is not already covered: a relocated
+ * join-token Secret (OpenShift mounts it away from /run/secrets, because CRI-O shadows
+ * that path) is a kubelet atomic-writer volume, so the same bytes are also reachable as
+ * `<dir>/..data/worker_token` and `<dir>/..<timestamp>/worker_token`, neither of which
+ * contains the file path. The directory is added WITHOUT a trailing separator so a bare
+ * `-v <dir>:/x` bind reference is denied too (it over-denies a sibling such as
+ * `<dir>-foo`, which fails safe). Pure: the caller passes the configured path.
+ */
+export function workerSecretDenyPaths(tokenFile: string | undefined): string[] {
+  if (!tokenFile) return [];
+  const out = [tokenFile];
+  if (!path.isAbsolute(tokenFile)) return out;
+  const dir = path.dirname(path.normalize(tokenFile));
+  if (dir === "/" || dir + "/" === SECRET_PATH_PREFIXES[0]) return out;
+  out.push(dir);
+  return out;
+}
 
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "ash"]);
 // Wrappers that prefix a real command; skip the wrapper (and its options) and

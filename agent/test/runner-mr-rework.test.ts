@@ -248,8 +248,8 @@ describe("RunRunner — mr_rework kind (PRD #700 / issue #778)", () => {
     );
     assert.match(
       terminal!.body.failure_reason ?? "",
-      /non-fast-forward|fetch first|rejected|failed to push/i,
-      "the generic failure names the push rejection",
+      /scratch_publication_refused: cannot verify fresh remote floor/,
+      "the generic failure names the fresh remote floor refusal",
     );
   });
 });

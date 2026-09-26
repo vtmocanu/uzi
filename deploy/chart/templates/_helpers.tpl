@@ -107,6 +107,40 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{- /*
+  uzi.validateSecretMountPath (issue #1761): workers.secretMountPath is empty (the
+  /run/secrets default) or ONE lower-case directory directly under /run, the same rule
+  the controller enforces at boot (kube.ValidateSecretMountPath, which also refuses an
+  overlap with another worker mount). With openshift.enabled the default is refused:
+  CRI-O shadows a volume at /run/secrets, so every hosted worker would crash-loop on a
+  missing token. Renders nothing for a valid value.
+*/ -}}
+{{- define "uzi.validateSecretMountPath" -}}
+{{- $p := .Values.workers.secretMountPath | default "" -}}
+{{- if and $p (ne $p "/run/secrets") (not (regexMatch "^/run/[a-z0-9][a-z0-9._-]*$" $p)) -}}
+{{- fail (printf "workers.secretMountPath must be a single lower-case directory directly under /run (for example /run/uzi-secrets), got %q" $p) -}}
+{{- end -}}
+{{- /* A relocated Secret needs a worker image whose guardrails know the new directory
+  (issue #1761): an older image still starts (it reads UZI_WORKER_TOKEN_FILE) but screens
+  only /run/secrets/. Keep MIN in lockstep with kube.MinRelocatableMountWorkerTag; the
+  controller refuses the same pairing at boot. A non-semver tag cannot be compared and is
+  refused unless workers.secretMountPathAllowUnversionedImage says the image carries it. */ -}}
+{{- if and $p (ne $p "/run/secrets") .Values.workers.enabled -}}
+{{- $min := "0.85.0-rc.2" -}}
+{{- $tag := toString (.Values.workers.image.tag | default "") -}}
+{{- if regexMatch "^v?(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$" $tag -}}
+{{- if lt ((semver $tag).Compare (semver $min)) 0 -}}
+{{- fail (printf "workers.secretMountPath %q needs a worker image >= %s (its guardrails must know the relocated Secret directory), but workers.image.tag is %q" $p $min $tag) -}}
+{{- end -}}
+{{- else if not .Values.workers.secretMountPathAllowUnversionedImage -}}
+{{- fail (printf "workers.secretMountPath %q needs a worker image >= %s, but workers.image.tag %q is not a semver version; set workers.secretMountPathAllowUnversionedImage=true only if that image carries the relocated-Secret support" $p $min $tag) -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.workers.enabled .Values.openshift.enabled (or (not $p) (eq $p "/run/secrets")) -}}
+{{- fail "openshift.enabled requires workers.secretMountPath (for example /run/uzi-secrets): CRI-O on OpenShift shadows a volume mounted at /run/secrets, so hosted workers would find no join token. The worker image must carry the matching change; see docs/openshift.md." -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
   uzi.apiServiceName: the in-cluster name of the api Service. LOAD-BEARING: the web
   nginx reverse-proxies `/api/*` to this exact name (same-origin, no CORS), so it
   MUST resolve to the api pods in the release namespace. Defaults to "api" (what the
@@ -323,3 +357,52 @@ true
 {{- end -}}
 {{- mulf (float64 $num) (get $factors $suffix) -}}
 {{- end -}}
+
+{{- /*
+  uzi.forgeEgressHosts: the worker egress destinations DERIVED from forge.allowedBaseURLs
+  (PRD #808), as a JSON list of {"host": ..., "port": ...}. It is the ONE derivation every
+  FQDN-egress provider consumes (Antrea ANNP, OVN EgressFirewall), so a forge host is
+  declared once and cannot diverge between the api SSRF allowlist and any provider.
+
+  urlParse .hostname gives the bare host (no :port); the port is derived from the URL too
+  (default 443), so a non-standard forge port does NOT diverge from the api, which preserves
+  the port in NormalizeForgeBaseURL.
+
+  Validated fail-CLOSED to mirror the api: NormalizeForgeBaseURL refuses to boot on a
+  scheme-less / hostless entry, so a render that would emit an empty name (match-nothing at
+  best, match-anything at worst) is a hard render failure rather than a malformed rule.
+  Consumers: `fromJsonArray (include "uzi.forgeEgressHosts" .)`.
+*/}}
+{{- define "uzi.forgeEgressHosts" -}}
+{{- $out := list }}
+{{- range .Values.forge.allowedBaseURLs }}
+{{- $u := urlParse . }}
+{{- $host := $u.hostname }}
+{{- if or (not $host) (ne $u.scheme "https") }}
+{{- fail (printf "forge.allowedBaseURLs entry %q must be an absolute https URL with a host, e.g. https://github.com (it feeds both FORGE_ALLOWED_BASE_URLS and the worker egress FQDN list; the api's NormalizeForgeBaseURL rejects the same input at boot)." .) }}
+{{- end }}
+{{- if or (contains ":" $host) (regexMatch "^[0-9]+(\\.[0-9]+)+$" $host) }}
+{{- fail (printf "forge.allowedBaseURLs entry %q resolves to an IP-literal host (%s). FQDN egress rules cannot express an IP address, and the derived port parsing breaks on a bracketed IPv6 literal (splitting the host on ':' yields an invalid port). Configure a DNS hostname, or express an IP-literal forge with an ipBlock-based egress policy instead." . $host) }}
+{{- end }}
+{{- /* urlParse has no .port field; .host carries host[:port], so split it out (default 443). */}}
+{{- $port := "443" }}
+{{- if contains ":" $u.host }}{{- $port = last (splitList ":" $u.host) }}{{- end }}
+{{- $out = append $out (dict "host" $host "port" $port) }}
+{{- end }}
+{{- toJson $out }}
+{{- end }}
+
+{{- /*
+  uzi.validateFQDNEgress: the shared preconditions for every FQDN-egress provider.
+  An empty forge list would leave the api on its built-in default forge while the egress
+  policy allows none, silently blocking clone/fetch on the kube-native tier.
+*/}}
+{{- define "uzi.validateFQDNEgress" -}}
+{{- if not .Values.forge.allowedBaseURLs }}
+{{- fail "workers.fqdnEgress.enabled is true but forge.allowedBaseURLs is empty. The api falls back to its built-in default forge (https://github.com), which this egress policy would NOT allow, silently blocking git clone/fetch on the kube-native worker tier. Set forge.allowedBaseURLs to your forge base URL(s) — it single-sources both FORGE_ALLOWED_BASE_URLS and this egress list." }}
+{{- end }}
+{{- $p := .Values.workers.fqdnEgress.provider | default "antrea" }}
+{{- if not (has $p (list "antrea" "ovn")) }}
+{{- fail (printf "workers.fqdnEgress.provider %q is not supported; use \"antrea\" (crd.antrea.io NetworkPolicy) or \"ovn\" (k8s.ovn.org EgressFirewall + a NetworkPolicy external allow)." $p) }}
+{{- end }}
+{{- end }}

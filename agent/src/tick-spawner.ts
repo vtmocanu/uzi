@@ -321,7 +321,11 @@ export class TickSpawner {
     request: BoundaryProcessRequest,
     extraSignals: AbortSignal[],
   ): Promise<BoundaryProcessHandle> {
-    const signals = [this.opts.signal, ...extraSignals];
+    const deadline = request.timeoutMs === undefined ? undefined : new AbortController();
+    if (request.timeoutMs !== undefined && (!Number.isFinite(request.timeoutMs) || request.timeoutMs <= 0)) {
+      throw new Error("tick subprocess timeout must be positive and finite");
+    }
+    const signals = [this.opts.signal, ...extraSignals, ...(deadline ? [deadline.signal] : [])];
     if (signals.some((s) => s.aborted)) throw abortError();
     if (!path.isAbsolute(request.argv[0] ?? "")) {
       throw new Error("tick subprocess executable is not a trusted absolute path");
@@ -340,6 +344,8 @@ export class TickSpawner {
       detached: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    let timedOut = false;
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
     let exitedFlag = false;
     let resolveExit!: () => void;
     const exited = new Promise<void>((r) => (resolveExit = r));
@@ -390,7 +396,8 @@ export class TickSpawner {
       child.once("exit", (code, sig) => {
         exitedFlag = true;
         resolveExit();
-        resolve({ code: code ?? (sig ? 128 : 1) });
+        if (timedOut) reject(new Error("tick subprocess timed out"));
+        else resolve({ code: code ?? (sig ? 128 : 1) });
         startGroupWait();
       });
     });
@@ -401,6 +408,13 @@ export class TickSpawner {
     }
     this.live.add(tracked);
     this.all.push(tracked);
+    if (deadline) {
+      timeoutTimer = setTimeout(() => {
+        timedOut = true;
+        deadline.abort();
+      }, request.timeoutMs);
+      void groupGone.then(() => clearTimeout(timeoutTimer));
+    }
     this.opts.hooks?.onSpawn?.(child.pid, request.argv);
     for (const s of signals) {
       s.addEventListener("abort", () => void this.terminate(tracked), { once: true });

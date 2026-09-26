@@ -204,6 +204,21 @@ describe("CodexCallbackBroker: shell (screenBashCommand integration)", () => {
     assert.equal(h.spawn.calls.length, 0);
   });
 
+  it("allows shell access to a scratch artifact through the spawn seam", async () => {
+    const h = makeBroker();
+    const command = "cat .uzi/scratch/gate-log.test";
+    assert.equal((await h.broker.handleToolCall(rt(), "Bash", { command }, "root")).ok, true);
+    assert.deepEqual(h.spawn.calls[0]!.argv, ["/bin/sh", "-c", command]);
+  });
+
+  it("allows a scratch cwd and screens the command through the shell seam", async () => {
+    const h = makeBroker();
+    const r = await h.broker.handleToolCall(rt(), "Bash", { command: "pwd", cwd: ".uzi/scratch" }, "root");
+    assert.equal(r.ok, true);
+    assert.equal(h.spawn.calls[0]!.opts.cwd, `${WORKTREE}/.uzi/scratch`);
+    assert.deepEqual(h.spawn.calls[0]!.argv, ["/bin/sh", "-c", "pwd"]);
+  });
+
   it("denies a cwd outside the worktree", async () => {
     const h = makeBroker();
     const r = await h.broker.handleToolCall(rt(), "Bash", { command: "echo x", cwd: "../elsewhere" }, "root");
@@ -247,6 +262,15 @@ describe("CodexCallbackBroker: file effects through the fileop client", () => {
     assert.equal(fileop.calls[0]!.op, "read");
   });
 
+  it("routes direct scratch reads and writes through the fileop seam", async () => {
+    const h = makeBroker();
+    assert.equal((await h.broker.handleToolCall(rt(), "Read", { path: ".uzi/scratch/log" }, "root")).ok, true);
+    assert.equal((await h.broker.handleToolCall(rt(), "Write", { path: ".uzi/scratch/log", content: "x" }, "root")).ok, true);
+    assert.deepEqual(h.fileop.calls.map((call) => [call.op, call.path]), [
+      ["read", ".uzi/scratch/log"], ["write", ".uzi/scratch/log"],
+    ]);
+  });
+
   it("denies a .git path with the jail and never issues a fileop", async () => {
     const h = makeBroker();
     const r = await h.broker.handleToolCall(rt(), "Write", { path: ".git/config", content: "x" }, "root");
@@ -265,6 +289,7 @@ describe("CodexCallbackBroker: file effects through the fileop client", () => {
     const h = makeBroker();
     const r = await h.broker.handleToolCall(rt(), "Write", { path: "../../etc/passwd", content: "x" }, "root");
     assertDenied(r, "path_denied");
+    assert.match(r.message, /\.uzi\/scratch\//);
     assert.equal(h.fileop.calls.length, 0);
   });
 

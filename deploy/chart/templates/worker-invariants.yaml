@@ -115,8 +115,8 @@
 
   IT IS WRITTEN AGAINST THE `max`, NOT AGAINST ONE CLAIMANT, so a future PVC gains
   coverage by being added to the list rather than by someone remembering this file
-  exists. The default sits EXACTLY on the ceiling today (dindDataSize 20Gi ==
-  maxPVCStorage 20Gi), which is why `gt` and not `ge`: equal is the shipped, correct
+  exists. The default sits under the ceiling today (dindDataSize 20Gi <=
+  maxPVCStorage 25Gi); `gt` and not `ge` because equal is a valid
   configuration.
 
   🔴 THIS GUARD IS DOCKER-TIER ONLY, WHICH IS CORRECT AND READS BROADER THAN IT IS
@@ -128,8 +128,8 @@
 
   🔴 WHAT THIS CANNOT SEE, stated because a guard's blind spot is the thing that gets
   assumed away: the OTHER two claimants are compiled into the controller, not supplied
-  by the chart. `nixSize` (20Gi, also exactly on the ceiling, on BOTH tiers) and each
-  preset's DataSize (`l` = 20Gi, likewise) are Go constants, and a chart cannot read
+  by the chart. `nixSize` (20Gi, on BOTH tiers) and each
+  preset's DataSize (`l` = 25Gi, exactly on the ceiling) are Go constants, and a chart cannot read
   them. Duplicating them into values.yaml was rejected deliberately — it would make the
   chart a fourth place preset quantities appear and the only one with no golden gating
   it, which is the ungated-skew class preset.go's own header exists to prevent. They are

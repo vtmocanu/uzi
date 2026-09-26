@@ -89,9 +89,13 @@ const (
 	tokenKey  = "worker_token"
 	caCertKey = "ca.crt"
 
-	secretMountPath = "/run/secrets"
-	tokenPath       = secretMountPath + "/" + tokenKey
-	caCertPath      = secretMountPath + "/" + caCertKey
+	// defaultSecretMountPath is where the join-token Secret mounts unless
+	// RenderConfig.SecretMountPath overrides it (UZI_WORKER_SECRET_MOUNT_PATH). It is
+	// also the compose Docker-secret path, so the worker image's defaults match it.
+	// OpenShift/OKD needs the override: CRI-O's default mounts file injects its own
+	// /run/secrets into every container and SHADOWS a volume mounted there, so the
+	// worker would find no token and crash-loop (see ValidateSecretMountPath).
+	defaultSecretMountPath = "/run/secrets"
 
 	dataMountPath = "/data"
 	nixMountPath  = "/nix"
@@ -262,18 +266,19 @@ const (
 	// Docker worker: run-workdir IS an emptyDir, and it holds the run's entire
 	// working tree — one clone per run, multiplied by WORKER_MAX_CONCURRENT_RUNS,
 	// with $TMPDIR pointed at the same volume. This repo alone is a ~170 MiB runner
-	// clone before a single dependency install. 4Gi covers ~2 concurrent heavy runs.
+	// clone before a single dependency install.
 	//
-	// It is 4Gi and not the 6Gi an earlier draft carried BECAUSE of M-a: the daemon's
-	// image cache used to be an emptyDir on this same budget and is now a PVC. Do not
-	// raise this without re-deriving what is actually left on ephemeral storage.
-	//
-	// The docker tier carries the same codex-cmd-cache emptyDir on top of run-workdir,
-	// with the same per-run contents, cleanup and ranking effect as the plain tier.
-	// 4Gi was sized before it existed and is deliberately NOT raised in this change,
-	// pending the same #1598 measurement; concurrent Go-heavy Codex runs may push
-	// usage past it, which again only ranks and never limits.
-	workerDefaultDockerEphemeralRequest = "4Gi"
+	// The daemon's image cache is NOT on this budget since M-a (it is a PVC). What is
+	// left is the working trees plus the codex-cmd-cache emptyDir, which the docker tier
+	// carries on top of run-workdir with the same per-run contents, cleanup and ranking
+	// effect as the plain tier. Issue #1757 raised this from 4Gi to 5Gi as provisional,
+	// unmeasured headroom for that cache and to rank a busy worker later under node disk
+	// pressure. 5Gi and not 6Gi is a PACKING bound: a 17.55 GiB node holds three at 5Gi
+	// but two at 6Gi, and the chart's 10-worker docker tier must place on four such
+	// nodes (TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes). It ranks and
+	// places; it never limits, and it cannot save a pod on a node whose root disk is too
+	// small. Re-derive what is actually left on ephemeral storage before raising it again.
+	workerDefaultDockerEphemeralRequest = "5Gi"
 )
 
 // ephemeralRequest is the worker container's requests.ephemeral-storage: the docker
@@ -383,7 +388,7 @@ type RenderConfig struct {
 	DinDLimitMemory   string
 	// EphemeralRequest / DockerEphemeralRequest override the WORKER container's
 	// requests.ephemeral-storage (issue #224 M-b). Docker REPLACES plain rather than
-	// adding to it. Empty ⇒ workerDefault{,Docker}EphemeralRequest ("512Mi" / "4Gi").
+	// adding to it. Empty ⇒ workerDefault{,Docker}EphemeralRequest ("512Mi" / "5Gi").
 	// Quantity strings, validated at the controller's boot so the render side can
 	// MustParse them. The right value is a property of the CLUSTER'S NODES rather than
 	// of the product, which is the same argument that made dindResources overridable.
@@ -449,7 +454,28 @@ type RenderConfig struct {
 	// default install's pod carries no such env and stays byte-identical. Worker container
 	// only — the mode never comes off the wire and never touches the seed/dind containers.
 	CommandSandbox string
+	// SecretMountPath is where the worker's join-token Secret (worker_token + ca.crt)
+	// mounts, and so what UZI_WORKER_TOKEN_FILE and NODE_EXTRA_CA_CERTS point at (issue
+	// #1761). Empty means defaultSecretMountPath (/run/secrets), and then the rendered
+	// pod is byte-identical to before this field existed. OpenShift/OKD needs a
+	// non-default value, because CRI-O shadows a volume at /run/secrets. The worker
+	// IMAGE must carry the matching agent change: an OLDER image still starts (it reads
+	// UZI_WORKER_TOKEN_FILE) but its guardrails deny only /run/secrets/, so the new
+	// directory would be unguarded. The knob alone does not prevent that pairing;
+	// ValidateSecretMountWorkerImage refuses it at boot, next to ValidateSecretMountPath.
+	SecretMountPath string
 }
+
+// secretMountPath is the effective join-token Secret mount directory.
+func (c RenderConfig) secretMountPath() string {
+	if c.SecretMountPath == "" {
+		return defaultSecretMountPath
+	}
+	return c.SecretMountPath
+}
+
+func (c RenderConfig) tokenPath() string  { return c.secretMountPath() + "/" + tokenKey }
+func (c RenderConfig) caCertPath() string { return c.secretMountPath() + "/" + caCertKey }
 
 // names for one worker's objects.
 func deploymentName(id string) string { return NamePrefix + id }
@@ -723,7 +749,7 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 
 	env := []corev1.EnvVar{
 		{Name: "UZI_API_URL", Value: cfg.APIURL},
-		{Name: "UZI_WORKER_TOKEN_FILE", Value: tokenPath},
+		{Name: "UZI_WORKER_TOKEN_FILE", Value: cfg.tokenPath()},
 		{Name: "UZI_DATA_DIR", Value: dataMountPath},
 		{Name: "WORKER_MAX_CONCURRENT_RUNS", Value: strconv.Itoa(maxConcurrentRuns)},
 	}
@@ -731,7 +757,7 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// Node reads this path before startup and agent/src/client.ts uses plain fetch
 		// with no custom dispatcher, so trusting the cluster CA is pure pod spec —
 		// nothing in agent/ parses a CA today and nothing needs to.
-		env = append(env, corev1.EnvVar{Name: "NODE_EXTRA_CA_CERTS", Value: caCertPath})
+		env = append(env, corev1.EnvVar{Name: "NODE_EXTRA_CA_CERTS", Value: cfg.caCertPath()})
 	}
 	if w.Docker {
 		// The k8s branch of the keystone resolver (agent/src/docker-wiring.ts): set
@@ -880,7 +906,7 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		},
 	}}
 	workerMounts := []corev1.VolumeMount{
-		{Name: "token", MountPath: secretMountPath, ReadOnly: true},
+		{Name: "token", MountPath: cfg.secretMountPath(), ReadOnly: true},
 		{Name: "data", MountPath: dataMountPath},
 		{Name: "nix", MountPath: nixMountPath},
 		// Worker-only (issue #1598): see codexCmdCacheDir.

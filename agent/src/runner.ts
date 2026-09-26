@@ -39,6 +39,7 @@ import type {
   ClaimResponse,
   IterationBudget,
   Milestone,
+  RunKind,
   RunOrphanClassificationResponse,
   StateAck,
   StateRequest,
@@ -52,6 +53,7 @@ import {
   PredecessorSettler,
   SettlementJournal,
   isSafeSettlementId,
+  type LiveSettleTarget,
   type RecoverySettleClient,
   type SettlementRecord,
 } from "./recovery-settlement.js";
@@ -91,6 +93,7 @@ import {
   CapturePathMismatchError,
   ForeignCaptureBlockedError,
   PendingRecoveryCaptureError,
+  ScratchPublicationError,
 } from "./git.js";
 import {
   buildCheckEnv,
@@ -196,7 +199,7 @@ function publishSkipLabel(raw: unknown): PublishSkipLabel {
  *  was an AbortError even with no aborted signal (e.g. the client's own request timeout) — silent on
  *  the feed either way; the shutdown sink names the latter `publish_error`, since its permit did not
  *  expire — and `error` = any other throw. */
-type PublishFailClass = "no_local_tip" | "skipped" | "rejected" | "aborted" | "error";
+type PublishFailClass = "no_local_tip" | "skipped" | "rejected" | "aborted" | "scratch_publication_refused" | "error";
 
 /** issue #1597 M1: the typed result of {@link RunRunner.publishCheckpointOutcome}. Only the
  *  allowlisted skip label and the numeric HTTP status are carried — never an error message,
@@ -221,6 +224,7 @@ type ShutdownCheckpointOutcome =
   | "publish_rejected"
   | "publish_skipped"
   | "publish_error"
+  | "scratch_publication_refused"
   | "no_local_tip"
   | "bare_lock_retained"
   | "tick_process_survived";
@@ -243,6 +247,8 @@ function shutdownOutcomeOf(
       return "publish_rejected";
     case "aborted":
       return permitSignal?.aborted ? "timeout" : "publish_error";
+    case "scratch_publication_refused":
+      return "scratch_publication_refused";
     case "error":
       return "publish_error";
   }
@@ -885,6 +891,9 @@ interface RunFlight {
    *  0 (chat's legacy sentinel) is never sent, and a rolled-back api's strict-decode 400 strips it
    *  and retries ONCE. Server-side NOT NULL DEFAULT 0. */
   readonly claimGeneration: number;
+  /** issue #1751 M2: the resolved claim kind, gating which live-settle trigger (checkpoint publish
+   *  or finalize branch push) this run may fire. */
+  readonly runKind: RunKind;
   readonly reportState: (
     body: Parameters<WorkerClient["reportState"]>[1],
     signal?: AbortSignal,
@@ -1174,6 +1183,13 @@ export class RunRunner {
    *  and the settler that drives the api settle for them. Disabled without a worker token. */
   private readonly settlement: SettlementJournal;
   private readonly settler: PredecessorSettler;
+  /** issue #1751 M2 review — runs `fn` in the async context captured when this runner was
+   *  constructed (permit-free), not the caller's. A live settle is triggered from inside Codex
+   *  permits and the mid-turn tick, where GitCache's AsyncLocalStorage boundary scope is active;
+   *  a fire-and-forget promise would inherit that scope and, after the permit ends, run its git
+   *  reads (isAncestor, the published pin) through a stale, aborted boundary spawner. Same idea
+   *  as the tick's `armedFire`. */
+  private readonly detached: (fn: () => void) => void = AsyncResource.bind((fn: () => void) => fn());
   /** PRD #1391 M2 — the worker message outbox the batcher spills to, the shared re-arm
    *  registry, the spill trip window and the spill-buffer cap. All threaded into every
    *  run's MessageBatcher; `outbox`/`rearm` undefined ⇒ today's trip behaviour. */
@@ -1317,6 +1333,12 @@ export class RunRunner {
         deleteRecoveryPin: (bare, runId, gen) => gitCache.deleteRecoveryPin(bare, runId, gen),
         forgetGeneration: (runId, gen) => recovery.forgetGeneration(runId, gen),
       },
+      // issue #1751 M2: the live leg's local checks + `published` pin, in the trusted bare.
+      liveGit: {
+        isAncestor: (bare, ancestor, descendant) => gitCache.isAncestorRef(bare, ancestor, descendant),
+        pinPublished: (bare, runId, holdId, sha) => gitCache.pinSettlementRefs(bare, runId, holdId, { published: sha }),
+        unpinPublished: (bare, runId, holdId) => gitCache.deleteSettlementPin(bare, runId, holdId, "published"),
+      },
       log: this.log,
     });
     this.detect = opts.detectRepoAgents ?? detectRepoAgents;
@@ -1374,6 +1396,7 @@ export class RunRunner {
    * `pending_settle` only once its successor's completion ACK was OBSERVED
    * ({@link observeSettlementTerminalAck}); a pushed head persisted write-ahead of the report stays
    * `pushed` until then and is never sent, so no outbox pending-terminal check is needed here.
+   * The same sweep retries every DUE live-settle leg (issue #1751 M2), whatever its record's state.
    * Best-effort; never throws.
    */
   async settlePendingPredecessors(signal?: AbortSignal): Promise<void> {
@@ -2606,7 +2629,11 @@ export class RunRunner {
         ? err.reason
         : err instanceof TerminalReportError
           ? err.reason
-          : errMessage(err);
+          : err instanceof ScratchPublicationError
+            ? err.message === "scratch_publication_refused: cannot verify fresh remote floor"
+              ? "scratch_publication_refused: cannot verify fresh remote floor"
+              : "scratch_publication_refused: candidate history cannot be published"
+            : errMessage(err);
     const reason = redactText(rawReason);
     // PRD #69 M7a: derive the TRUSTED failure class from the RAW reason (before
     // redaction) so a fatal pre-start failure (provisioning / no token) carries a
@@ -3856,15 +3883,20 @@ export class RunRunner {
     const finalizeBarePath = barePath;
     const pushToOrigin = () =>
       withForgeRetry(
-        () =>
-          this.git.pushBranch(
+        async () => {
+          await this.git.pushBranch(
             finalizeBarePath,
             result.branch,
             claim.secrets.forge_pat,
             claim.repo.clone_url,
             claim.secrets.forge_username,
-          ),
-        { log: runLog, signal: boundarySignal },
+          );
+        },
+        {
+          log: runLog,
+          signal: boundarySignal,
+          classify: (error) => error instanceof ScratchPublicationError ? "permanent" : classifyForgeError(error),
+        },
       );
 
     // PRD #1416 (MR-rework, finding 1): a bridge NEWLY makes a rewritten branch pushable (a plain
@@ -3990,6 +4022,33 @@ export class RunRunner {
           "The MR branch was advanced by a concurrent writer, so this rework was superseded and not applied. The branch and the concurrent commits are intact.",
         branch_moved: true,
       });
+    };
+
+    // Verify a concurrent forward advance against the origin tip captured at clone.
+    // The remote fetch may fail, so only a proven descendant gets branch_moved.
+    const reportMovedBranchIfVerified = async (error: unknown): Promise<boolean> => {
+      if (claim.kind !== "mr_rework" || !isNonFastForwardRejection(error)) return false;
+      const originAtClone = await this.git
+        .originBranchTip(finalizeBarePath, result.branch)
+        .catch(() => null);
+      let remoteTip: string | null = null;
+      try {
+        remoteTip = await this.git.fetchDefaultTip(
+          finalizeBarePath,
+          result.branch,
+          claim.secrets.forge_pat,
+          claim.repo.clone_url,
+          claim.secrets.forge_username,
+        );
+      } catch {
+        return false;
+      }
+      if (
+        !originAtClone || !remoteTip || remoteTip === originAtClone ||
+        !(await this.git.isAncestorRef(finalizeBarePath, originAtClone, remoteTip))
+      ) return false;
+      await failBranchMoved();
+      return true;
     };
 
     // PRD #1416 M4: the typed terminal for a run whose branch was rewritten at/below the published
@@ -4223,6 +4282,8 @@ export class RunRunner {
                 await fetchAndPush();
                 return false;
               } catch (e) {
+                if (e instanceof ScratchPublicationError) throw e;
+                if (await reportMovedBranchIfVerified(e)) return true;
                 // PRD #974 M2: an aligned push rejected by GitHub Push Protection (GH013) is a
                 // secret the pre-push gitleaks scan missed — route it to the typed
                 // push_secret_blocked fail (NO preserved diff: it may carry the detected secret)
@@ -4314,6 +4375,7 @@ export class RunRunner {
                   // secret gitleaks missed — typed push_secret_blocked fail (NO preserved diff:
                   // it may carry the secret), not a fall-back to merge/rebase (which cannot clear
                   // a secret) nor the generic catch.
+                  if (await reportMovedBranchIfVerified(e)) return;
                   if (isPushProtectionRejection(e)) {
                     runLog.info(
                       "finalize base-align: workflow-subtree overlay push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
@@ -4345,6 +4407,7 @@ export class RunRunner {
                   // gitleaks missed — typed push_secret_blocked fail (NO preserved diff: it may
                   // carry the secret), not the rebase fallback (which cannot clear a secret) nor
                   // the generic catch.
+                  if (await reportMovedBranchIfVerified(e)) return;
                   if (isPushProtectionRejection(e)) {
                     runLog.info(
                       "finalize base-align: merge push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
@@ -4405,6 +4468,7 @@ export class RunRunner {
         }
       }
     } catch (e) {
+      if (e instanceof ScratchPublicationError) throw e;
       // PRD #1416 M4 (SC3): a bridge that could not be built/validated at a finalize push site was
       // thrown as HistoryRewrittenError; type it history_rewritten — never the generic catch
       // (agent_failure), never finalize_base_align_conflict (the align arms call failBaseAlignConflict
@@ -4477,6 +4541,7 @@ export class RunRunner {
       try {
         await pushToOrigin();
       } catch (e) {
+        if (e instanceof ScratchPublicationError) throw e;
         // PRD #974 M2 backstop: a GitHub Push Protection (GH013) rejection here means a secret
         // the pre-push gitleaks scan missed — route it to the typed push_secret_blocked fail
         // (NO preserved diff: it may carry the secret) rather than the generic catch. Any OTHER
@@ -4489,42 +4554,7 @@ export class RunRunner {
         // mr_rework rework rejected non-fast-forward can mean a concurrent same-branch writer
         // advanced the MR branch under the run; route that distinct case to the branch_moved
         // disposition instead of letting it rethrow into the generic agent_failure catch.
-        if (claim.kind === "mr_rework" && isNonFastForwardRejection(e)) {
-          // Capture O — the origin branch tip at clone — BEFORE the detection fetch overwrites
-          // refs/remotes/origin/<branch> with the fresh remote tip. The base is the ORIGIN tip
-          // at clone, NOT runnerClone.baseCommit: on a resume the reseed sets baseCommit to the
-          // tracking tip (ahead of origin), which would fail the ancestor check below and
-          // silently regress a resumed run back to agent_failure.
-          const originAtClone = await this.git
-            .originBranchTip(finalizeBarePath, result.branch)
-            .catch(() => null);
-          let remoteTip: string | null = null;
-          try {
-            remoteTip = await this.git.fetchDefaultTip(
-              finalizeBarePath,
-              result.branch,
-              claim.secrets.forge_pat,
-              claim.repo.clone_url,
-              claim.secrets.forge_username,
-            );
-          } catch {
-            // Fetch failed → fall through to the generic throw (fail-safe): never mislabel a
-            // real problem as benign.
-          }
-          // A genuine concurrent-writer advance: the remote tip changed since our clone AND
-          // strictly descends from it (advanced forward, not rewritten/rewound). Anything else
-          // (unchanged tip, fetch failure, divergent/rewound history) falls through to today's
-          // behavior — never a false positive.
-          if (
-            originAtClone &&
-            remoteTip &&
-            remoteTip !== originAtClone &&
-            (await this.git.isAncestorRef(finalizeBarePath, originAtClone, remoteTip))
-          ) {
-            await failBranchMoved();
-            return;
-          }
-        }
+        if (await reportMovedBranchIfVerified(e)) return;
         throw e;
       }
     }
@@ -4546,6 +4576,9 @@ export class RunRunner {
         );
       }
     }
+    // issue #1751 M2: the finalize push landed, so the pushed tracking tip is a confirmed publication
+    // on runs.branch (task runs only; see triggerBranchLiveSettle).
+    this.triggerBranchLiveSettle(flight, finalizeBarePath, result.branch);
     if (bridged) {
       // Worded GENERICALLY: the branch may have been bridged by THIS worker OR by the agent (the M2
       // steer's `git merge -s ours <P>`), so it never says "the worker bridged it".
@@ -5072,6 +5105,7 @@ export class RunRunner {
       cancel,
       steering,
       claimGeneration,
+      runKind: resolveRunKind(claim.kind),
       observedSessionId: undefined,
       latestContractRevision: undefined,
       reportState: async (body, signal) => {
@@ -6986,7 +7020,8 @@ export class RunRunner {
       else if (rel === "unknown") anyUnknown = true;
     }
     if (!anyDivergent) {
-      // All ancestor, OR a mix of ancestor+unknown (no divergent): a broken read must NEVER bridge.
+      // All ancestor, or a mix of ancestor and unknown: a broken read must never bridge.
+      // Publication checks the candidate at checkpointPack or pushBranch.
       return anyUnknown ? { kind: "unknown" } : { kind: "clean" };
     }
     // Build B over the floors (bridgeToFloors appends only the ones actually missing).
@@ -7049,6 +7084,10 @@ export class RunRunner {
       });
       return { kind: "unknown" };
     }
+    // Inspect both the source and candidate history before either custody mutation.
+    // B includes H and the floors, so this also covers every bridge parent.
+    await this.git.scratchPublicationPreflight(barePath, branch, H);
+    await this.git.scratchPublicationPreflight(barePath, branch, bridge);
     // Adopt B: advance the bare tracking ref (worker-uid) and the checkpoint floor C.
     try {
       await this.git.updateTrackingRef(barePath, branch, bridge);
@@ -7096,6 +7135,10 @@ export class RunRunner {
         });
       }
     } catch (e) {
+      if (e instanceof ScratchPublicationError) {
+        this.reportPublishOutcome(flight, "scratch_publication_refused", "checkpoint publish failed: scratch_publication_refused");
+        return;
+      }
       // Never let a bridge failure undo a park/shutdown/capture (D4).
       runLog.warn("PRD #1416 M3: park/capture bridge threw; continuing best-effort", {
         run_id: flight.runId,
@@ -7697,6 +7740,9 @@ export class RunRunner {
         // issue #1086 (F2): a confirmed publish reconciles the broker's ref, so clear any pending
         // attempted tip — the confirmed tip is now authoritative.
         flight.lastAttemptedCheckpointRefTip = undefined;
+        // issue #1751 M2: a CONFIRMED checkpoint publication may settle an older custody hold
+        // while this run is still live (fire-and-forget; never delays the publish or the run).
+        this.triggerLiveSettle(flight, packed.tipOid, "checkpoint");
         // issue #1597 M1: a failure/skip line is on the feed, so say it recovered — once — and
         // clear the dedupe set so a recurring failure is surfaced again rather than swallowed.
         if (flight.reportedPublishOutcomes.size > 0) {
@@ -7729,18 +7775,36 @@ export class RunRunner {
       );
       return { published: false, reason: "rejected", httpStatus: res.httpStatus };
     } catch (e) {
+      if (e instanceof ScratchPublicationError) {
+        this.reportPublishOutcome(flight, "scratch_publication_refused", "checkpoint publish failed: scratch_publication_refused");
+        return { published: false, reason: "scratch_publication_refused" };
+      }
       // issue #1086 (F2): a throw is AMBIGUOUS too, but only after the pack tip was obtained — a
       // throw DURING checkpointPack leaves packedTip undefined and records nothing.
       if (packedTip !== undefined) flight.lastAttemptedCheckpointRefTip = packedTip;
       // issue #1597 M1: a deadline/permit abort is an expected bounded stop, not a publish fault —
       // runLog only, never the feed (the shutdown sink names it as `timeout` itself).
       if (signal?.aborted || isAbortLikeError(e)) {
-        flight.runLog.info("checkpoint publish aborted", { run_id: flight.runId, error: errMessage(e) });
+        flight.runLog.info("checkpoint publish aborted", {
+          run_id: flight.runId,
+          phase: packedTip === undefined ? "packing" : "publish_request",
+          tip_produced: packedTip !== undefined,
+          error: errMessage(e),
+        });
         return { published: false, reason: "aborted" };
       }
+      // Keep the exception detail in the operator run log; the producer log records only
+      // bounded context so a credential-bearing error cannot escape through this channel.
+      this.log.warn("checkpoint publish exception", {
+        run_id: flight.runId,
+        phase: packedTip === undefined ? "packing" : "publish_request",
+        tip_produced: packedTip !== undefined,
+      });
       // issue #1597 M1: the feed line carries the CLASS only — a thrown message can embed remote
       // text or a credentialed URL; the runLog keeps it for operators.
       this.reportPublishOutcome(flight, "error", "checkpoint publish failed: error", {
+        phase: packedTip === undefined ? "packing" : "publish_request",
+        tip_produced: packedTip !== undefined,
         error: errMessage(e),
       });
       return { published: false, reason: "error" };
@@ -8029,7 +8093,7 @@ export class RunRunner {
           state: "adopted",
           attempts: 0,
         };
-        if (await this.settlement.put(record)) {
+        if (await this.settler.recordAdoption(record)) {
           flight.runLog.info("recovery settlement: adoption evidence recorded for a predecessor hold", {
             run_id: claim.run_id,
             hold_id: hold.hold_id,
@@ -8045,6 +8109,60 @@ export class RunRunner {
         error: errMessage(err),
       });
     }
+  }
+
+  /**
+   * issue #1751 M2 — a confirmed publication of this generation's work (`publishedSha`) may settle
+   * an older custody hold while the run is still live. Records the live leg on each still-`adopted`
+   * settlement record of this generation, then sends the due legs, FIRE-AND-FORGET: never awaited
+   * on the execution path, errors caught, and bounded by the flight's cancel signal (the worker
+   * sweep retries whatever is left). Kind-gated by what the api can prove against while the run is
+   * live:
+   *   - `checkpoint`: issue / self_improve runs (the checkpoint-publishing kinds; their runs.branch
+   *     is NULL while live, so `branch` would only answer not_eligible);
+   *   - `branch`: task runs ONLY — the one kind whose runs.branch is set at creation (task.sql).
+   *     prompt (CreatePromptRun), ci_fix and mr_rework runs leave runs.branch NULL, so the api
+   *     answers not_eligible for them while live; they fire nothing and settle on completion.
+   */
+  private triggerLiveSettle(flight: RunFlight, publishedSha: string, target: LiveSettleTarget): void {
+    if (!this.settlement.enabled) return;
+    const kind = flight.runKind;
+    if (kind === undefined) return;
+    const eligible = target === "checkpoint" ? kind === "issue" || kind === "self_improve" : kind === "task";
+    if (!eligible) return;
+    const generation = flight.claimGeneration;
+    if (!Number.isSafeInteger(generation) || generation <= 0) return;
+    const signal = flight.cancel.signal;
+    this.detached(() => {
+      void (async () => {
+        await this.settler.observeLivePublication(flight.runId, generation, publishedSha, target);
+        if (signal.aborted) return;
+        await this.settler.settleLive(flight.runId, signal);
+      })().catch((err: unknown) => {
+        flight.runLog.warn("recovery settlement: live settle trigger failed (the sweep retries)", {
+          run_id: flight.runId,
+          error: errMessage(err),
+        });
+      });
+    });
+  }
+
+  /**
+   * issue #1751 M2 — after a landed finalize push, a TASK run's pushed tracking tip is a confirmed
+   * publication on its creation-time runs.branch: fire the `branch` live settle for it. Every other
+   * kind returns before any git read (see {@link triggerLiveSettle} for why). The tip read is local
+   * and runs inside the fire-and-forget, never on the finalize path.
+   */
+  private triggerBranchLiveSettle(flight: RunFlight, barePath: string, branch: string): void {
+    if (flight.runKind !== "task" || !this.settlement.enabled) return;
+    this.detached(() => {
+      void this.git
+        .trackingTip(barePath, branch)
+        .then((tip) => {
+          if (tip) this.triggerLiveSettle(flight, tip, "branch");
+        })
+        .catch(() => undefined);
+    });
   }
 
   /**
@@ -8136,12 +8254,9 @@ export class RunRunner {
           await unrecorded(rec, "pushed pin failed", pinError);
           continue;
         }
-        await this.settlement.put({
-          ...rec,
-          pushedSha: pushed,
-          disposition: "publication",
-          state: "pushed",
-        });
+        // Under the hold's lock, re-read: only a still-`adopted` record of this generation moves
+        // `pushed`, carrying any live leg a concurrent live publication wrote (issue #1751 M2).
+        await this.settler.recordPushedHead(rec, pushed);
       }
     } catch (err) {
       flight.runLog.warn("recovery settlement: pushed head not persisted (predecessor holds retained)", {
