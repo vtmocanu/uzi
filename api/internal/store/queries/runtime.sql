@@ -596,6 +596,24 @@ FROM run_messages
 WHERE run_id = @run_id::uuid
   AND kind IN ('plan', 'plan_revising');
 
+-- name: LatestPersistedPlanFrameAtForRun :one
+-- The created_at of the run's latest `plan` frame whose payload plan_md EQUALS @plan_md, the
+-- persisted runs.plan_md the claim carries (issue #1604): when the persisted, unapproved plan was
+-- last shown. The worker emits and flushes the plan frame BEFORE the awaiting_approval report
+-- persists plan_md, so a declined report or a worker that died in between leaves a newer frame
+-- for a plan that was never persisted; matching on plan_md keeps that frame from moving this
+-- instant. kind = 'plan' only; a plan_revising frame is not a plan. NULL when no plan frame
+-- matches (the caller omits the field, never falling back to the latest frame). The comparison
+-- is exact and needs no NUL normalisation: neither side can hold a NUL (Postgres text rejects
+-- 0x00 and jsonb rejects \u0000; the worker's batcher and sanitizePayloadJSON strip it from the
+-- frame, stripNULParam from plan_md). The worker discards a replayed gate verdict created
+-- strictly before this instant (it was sent against an earlier plan).
+SELECT MAX(created_at)::timestamptz AS at
+FROM run_messages
+WHERE run_id = @run_id::uuid
+  AND kind = 'plan'
+  AND payload->>'plan_md' = @plan_md::text;
+
 -- name: LatestToolUseForRuns :many
 -- The newest tool_use frame per run for a page of runs (PRD #1064 D3, current_activity):
 -- DISTINCT ON (run_id) with ORDER BY run_id, seq DESC yields exactly one row per run —

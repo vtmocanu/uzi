@@ -652,6 +652,9 @@ type Store interface {
 	// awaiting_approval resume so the worker correlates a buffered approve_plan to the right plan
 	// revision. Off the hot path for every other claim.
 	LatestPlanSeqForRun(ctx context.Context, runID uuid.UUID) (int64, error)
+	// Issue #1604: when the claim's persisted, unapproved plan_md was last shown (its latest
+	// matching `plan` frame), queried only for a claim that carries such a plan.
+	LatestPersistedPlanFrameAtForRun(ctx context.Context, arg store.LatestPersistedPlanFrameAtForRunParams) (pgtype.Timestamptz, error)
 	// /runs + board + run-view current_activity (PRD #1064 M2): the newest tool_use frame
 	// per run for a page, folded into the "now" line in Go by runactivity.FromFrame.
 	LatestToolUseForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.LatestToolUseForRunsRow, error)

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -155,6 +156,20 @@ type ClaimPayload struct {
 	// the submitted plan's seq"), so the worker correlates a buffered approve_plan with the right plan
 	// revision on the reclaim. 0 (omitted) for every other phase.
 	ResumePlanSeq int64 `json:"resume_plan_seq,omitempty"`
+	// ResumePlanAt (issue #1604) is the created_at of the run's latest `plan` run_message (kind
+	// 'plan' only, NOT plan_revising) whose payload plan_md equals this claim's PlanMd, carried
+	// whenever the claim carries an UNAPPROVED persisted plan: plan_md non-blank and the plan not
+	// approved, i.e. both resume_phase "awaiting_approval" and resume_phase "" with a plan. The
+	// match matters because the worker emits the plan frame BEFORE the awaiting_approval report
+	// persists plan_md: a declined report, or a worker that died in between, leaves a newer frame
+	// for a plan that was never persisted, and that frame must not move this instant. The worker's
+	// per-flight gate epoch restarts at 0 on a new claim, so it cannot tell a replayed
+	// approve/reject/revise sent against an earlier plan from one sent against this plan; it
+	// discards a replayed gate verdict whose created_at is strictly before this instant. Absent
+	// when no plan frame matches PlanMd (never a fallback to the latest frame), the plan is
+	// approved, or the lookup failed (logged, never fails the claim). RFC 3339 with nanoseconds on
+	// the wire (time.Time's JSON encoding).
+	ResumePlanAt *time.Time `json:"resume_plan_at,omitempty"`
 	// PlanSource is where PlanMd came from (runs.plan_source, PRD #209): 'agent' for a
 	// worker-authored plan (or a pre-#209 run), 'seeded' for a plan supplied at create
 	// time over the API. The worker needs it to disambiguate the two plan_approved

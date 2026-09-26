@@ -392,10 +392,10 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 	}
 }
 
-// TestWorkerReviseAppliedUnderSwitchLiveDB pins issue #1604's receipt rule: a revise_plan the
-// worker already persisted can be marked APPLIED while its own claim has a credential switch
-// pending, so the resumed claim does not replay a revision the worker already acted on. Only
-// that case is widened: a mixed batch, a receipt this claim did not take, and a released or
+// TestWorkerReviseAppliedUnderSwitchLiveDB pins issue #1604's receipt rule: a revise-only
+// APPLIED from the claim that received those rows is accepted while that claim has a credential
+// switch pending (the worker sends it only once each revise is final), so the resumed claim does
+// not replay a settled revision. Only that case is widened: a mixed batch, a receipt this claim did not take, and a released or
 // stale claim are all still refused, and the row stays unapplied.
 func TestWorkerReviseAppliedUnderSwitchLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")

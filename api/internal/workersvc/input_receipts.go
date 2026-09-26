@@ -108,10 +108,11 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 	if len(rows) != len(ids) {
 		return InputReceiptResult{}, ErrInputReceiptInvalid
 	}
-	// Issue #1604: a revise_plan is APPLIED by the worker only after its revised plan was
-	// persisted, so marking it applied under a pending credential switch is truthful; refusing
-	// it would leave the row unapplied and the resumed claim would replay the revision the
-	// worker already acted on. Only a switch_pending claim qualifies (the claim is still this
+	// Issue #1604: the worker sends APPLIED for a revise_plan only once its disposition is
+	// final: after the plan answering it was persisted (or the budget-exhausted re-gate), or
+	// when it was stale or empty and never acted on. So marking it applied under a pending
+	// credential switch is truthful; refusing it would leave the row unapplied and the resumed
+	// claim would replay a revision that is already settled. Only a switch_pending claim qualifies (the claim is still this
 	// worker's, at this generation, not released), and only when every requested row is a
 	// revise_plan this claim itself received: a mixed batch or a released/stale claim is still
 	// refused. Persistence and APPLIED are separate transactions, so an interruption between

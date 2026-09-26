@@ -7,10 +7,12 @@ import (
 	"os"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -107,6 +109,21 @@ func TestResumeUnapprovedNoSessionClaimLiveDB(t *testing.T) {
 		t.Fatalf("insert revise: %v", err)
 	}
 
+	// The plan frame the gate showed (issue #1604), carrying the persisted plan_md; then a LATER
+	// plan frame whose plan_md was never persisted (the worker emits the frame before the
+	// awaiting_approval report, and that report was declined or never sent); then a LATER
+	// plan_revising frame from the revise generation 1 ACKed. resume_plan_at must name the frame
+	// that matches runs.plan_md, never the unpersisted plan or the revising frame.
+	var planAt time.Time
+	if err := pool.QueryRow(ctx, `INSERT INTO run_messages (run_id, seq, kind, payload, created_at)
+	      VALUES ($1, 4, 'plan', jsonb_build_object('plan_md', $2::text), now() - interval '10 minutes') RETURNING created_at`,
+		runID, planMd).Scan(&planAt); err != nil {
+		t.Fatalf("insert plan frame: %v", err)
+	}
+	exec(`INSERT INTO run_messages (run_id, seq, kind, payload, created_at)
+	      VALUES ($1, 5, 'plan', jsonb_build_object('plan_md', '# Unpersisted plan'::text), now() - interval '5 minutes')`, runID)
+	exec(`INSERT INTO run_messages (run_id, seq, kind, payload, created_at) VALUES ($1, 6, 'plan_revising', '{}', now())`, runID)
+
 	payload, err := svc.Claim(ctx, wkr, nil)
 	if err != nil {
 		t.Fatalf("svc.Claim: %v", err)
@@ -128,6 +145,9 @@ func TestResumeUnapprovedNoSessionClaimLiveDB(t *testing.T) {
 	if phase, present := claim["resume_phase"]; present {
 		t.Fatalf("resume_phase = %v, want absent: an unapproved plan without a session re-plans", phase)
 	}
+	// Issue #1604: the unapproved persisted plan's frame time rides the claim even though
+	// resume_phase is "" (time-dependent, so asserted here rather than in the fixture).
+	assertResumePlanAt(t, claim, planAt)
 	for key, want := range fixture {
 		if key == "_comment" {
 			continue
@@ -162,5 +182,142 @@ func TestResumeUnapprovedNoSessionClaimLiveDB(t *testing.T) {
 	}
 	if applied {
 		t.Fatal("the replay applied the revise; only the worker's APPLIED may")
+	}
+}
+
+// assertResumePlanAt checks the claim's wire resume_plan_at (issue #1604) is an RFC 3339 string
+// naming exactly want, the plan frame's created_at.
+func assertResumePlanAt(t *testing.T, claim map[string]any, want time.Time) {
+	t.Helper()
+	raw, present := claim["resume_plan_at"]
+	if !present {
+		t.Fatalf("claim lacks resume_plan_at; want the plan frame's created_at %s", want.Format(time.RFC3339Nano))
+	}
+	str, ok := raw.(string)
+	if !ok {
+		t.Fatalf("resume_plan_at = %#v, want an RFC 3339 string", raw)
+	}
+	got, err := time.Parse(time.RFC3339Nano, str)
+	if err != nil {
+		t.Fatalf("resume_plan_at %q does not parse as RFC 3339: %v", str, err)
+	}
+	if !got.Equal(want) {
+		t.Fatalf("resume_plan_at = %s, want the plan frame's created_at %s", got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+	}
+}
+
+// claimWire assembles runID's claim through the real assembleClaim and returns it as wire JSON.
+func claimWire(t *testing.T, env codexTestEnv, workerID, userID, runID uuid.UUID) map[string]any {
+	t.Helper()
+	svc := New(env.q, env.box, testParams())
+	payload, err := svc.assembleClaim(env.ctx, store.Worker{ID: workerID, UserID: userID}, mustRun(t, env, runID))
+	if err != nil {
+		t.Fatalf("assembleClaim: %v", err)
+	}
+	wire, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claim map[string]any
+	if err := json.Unmarshal(wire, &claim); err != nil {
+		t.Fatal(err)
+	}
+	return claim
+}
+
+// TestResumePlanAtAwaitingApprovalLiveDB pins resume_plan_at on the GATE resume (issue #1604):
+// a run parked at awaiting_approval by the authentic writer (session set, plan unapproved)
+// carries the created_at of its latest `plan` frame whose plan_md equals the persisted
+// runs.plan_md. An earlier matching frame, an earlier different plan, a LATER plan frame whose
+// plan_md was never persisted (its awaiting_approval report declined, or the worker died before
+// sending it), and a later plan_revising frame do not move it.
+func TestResumePlanAtAwaitingApprovalLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, workerID, repoID := seedResumeClaimInfra(t, env)
+	runID := env.seedCodexRun(t, userID, workerID, repoID)
+	rows, err := env.q.SetRunAwaitingApproval(env.ctx, store.SetRunAwaitingApprovalParams{
+		PlanMd:    pgconv.TextOrNull("# Plan B"),
+		SessionID: pgconv.TextOrNull("sess-1604"),
+		ID:        runID,
+		WorkerID:  pgconv.UUID(workerID),
+	})
+	if err != nil || rows != 1 {
+		t.Fatalf("SetRunAwaitingApproval = (%d, %v), want (1, nil)", rows, err)
+	}
+	insertPlanFrame := func(seq int, planMd, age string) {
+		t.Helper()
+		env.exec(`INSERT INTO run_messages (run_id, seq, kind, payload, created_at)
+		          VALUES ($1, $2, 'plan', jsonb_build_object('plan_md', $3::text), now() - $4::interval)`, runID, seq, planMd, age)
+	}
+	insertPlanFrame(2, "# Plan A", "2 hours")
+	insertPlanFrame(3, "# Plan B", "1 hour")
+	var planAt time.Time
+	if err := env.pool.QueryRow(env.ctx, `INSERT INTO run_messages (run_id, seq, kind, payload, created_at)
+	      VALUES ($1, 6, 'plan', jsonb_build_object('plan_md', '# Plan B'::text), now() - interval '10 minutes') RETURNING created_at`,
+		runID).Scan(&planAt); err != nil {
+		t.Fatalf("insert plan frame: %v", err)
+	}
+	// Plan C was emitted and flushed, but its awaiting_approval report never persisted it.
+	insertPlanFrame(7, "# Plan C", "5 minutes")
+	env.exec(`INSERT INTO run_messages (run_id, seq, kind, payload, created_at) VALUES ($1, 8, 'plan_revising', '{}', now())`, runID)
+
+	claim := claimWire(t, env, workerID, userID, runID)
+	if claim["resume_phase"] != "awaiting_approval" {
+		t.Fatalf("resume_phase = %v, want awaiting_approval", claim["resume_phase"])
+	}
+	assertResumePlanAt(t, claim, planAt)
+}
+
+// TestResumePlanAtAbsentLiveDB pins the three omissions (issue #1604): an APPROVED plan carries no
+// resume_plan_at even with a matching plan frame (no gate verdict can replay against it); an
+// unapproved plan with no `plan` frame (only plan_revising) carries none either; and an unapproved
+// plan whose `plan` frames all carry a DIFFERENT plan_md carries none, never falling back to the
+// latest (unpersisted) frame.
+func TestResumePlanAtAbsentLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, workerID, repoID := seedResumeClaimInfra(t, env)
+
+	approved := uuid.New()
+	env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description,
+	             status, worker_id, plan_md, session_id, auto_approve, plan_source)
+	          VALUES ($1, $2, $3, 'issue', 16041, 't', 'd', 'claimed', $4, '# Plan', 'sess-a', true, 'agent')`,
+		approved, userID, repoID, workerID)
+	env.exec(`INSERT INTO run_messages (run_id, seq, kind, payload) VALUES ($1, 1, 'plan', '{"plan_md": "# Plan"}')`, approved)
+	claim := claimWire(t, env, workerID, userID, approved)
+	if claim["resume_phase"] != "implementing" {
+		t.Fatalf("approved resume_phase = %v, want implementing", claim["resume_phase"])
+	}
+	if at, present := claim["resume_plan_at"]; present {
+		t.Fatalf("approved plan resume_plan_at = %v, want absent", at)
+	}
+
+	noFrame := uuid.New()
+	env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description,
+	             status, worker_id, plan_md, session_id, auto_approve, plan_source)
+	          VALUES ($1, $2, $3, 'issue', 16042, 't', 'd', 'claimed', $4, '# Plan', 'sess-b', false, 'agent')`,
+		noFrame, userID, repoID, workerID)
+	env.exec(`INSERT INTO run_messages (run_id, seq, kind, payload) VALUES ($1, 1, 'plan_revising', '{}')`, noFrame)
+	claim = claimWire(t, env, workerID, userID, noFrame)
+	if claim["resume_phase"] != "awaiting_approval" {
+		t.Fatalf("no-frame resume_phase = %v, want awaiting_approval", claim["resume_phase"])
+	}
+	if at, present := claim["resume_plan_at"]; present {
+		t.Fatalf("no plan frame resume_plan_at = %v, want absent", at)
+	}
+
+	noMatch := uuid.New()
+	env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description,
+	             status, worker_id, plan_md, session_id, auto_approve, plan_source)
+	          VALUES ($1, $2, $3, 'issue', 16043, 't', 'd', 'claimed', $4, '# Plan', 'sess-c', false, 'agent')`,
+		noMatch, userID, repoID, workerID)
+	env.exec(`INSERT INTO run_messages (run_id, seq, kind, payload, created_at)
+	          VALUES ($1, 1, 'plan', '{"plan_md": "# Plan, never persisted"}', now() - interval '1 minute')`, noMatch)
+	env.exec(`INSERT INTO run_messages (run_id, seq, kind, payload) VALUES ($1, 2, 'plan', '{}')`, noMatch)
+	claim = claimWire(t, env, workerID, userID, noMatch)
+	if claim["resume_phase"] != "awaiting_approval" {
+		t.Fatalf("no-match resume_phase = %v, want awaiting_approval", claim["resume_phase"])
+	}
+	if at, present := claim["resume_plan_at"]; present {
+		t.Fatalf("no matching plan frame resume_plan_at = %v, want absent", at)
 	}
 }
