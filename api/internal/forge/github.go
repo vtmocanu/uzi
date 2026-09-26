@@ -11,6 +11,8 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v92/github"
+
+	"github.com/vtmocanu/uzi/api/internal/redirectguard"
 )
 
 // githubPerPage is the pagination page size for every GitHub list call. 100 is
@@ -80,8 +82,16 @@ func newGitHub(baseURL, token string, timeout time.Duration) (*github, error) {
 	// Authorization and If-None-Match; every non-allowlisted request passes through
 	// untouched (the poller/worker lanes see no change). The cache is package-level
 	// because ForgeForConnection rebuilds the driver per request.
+	//
+	// Between the two sits an origin pin: go-github re-issues a 301 itself through a
+	// redirect-ignoring client (bareDoUntilFound, used by GetWorkflowJobLogs) and
+	// checks only Host, so timeoutClient's CheckRedirect never sees that hop and an
+	// https to http downgrade on the same host:port would carry the Bearer header.
+	// Below the auth transport, the pin refuses any request off the client's own
+	// base/upload origin, however go-github built it.
 	httpClient := timeoutClient(timeout)
-	httpClient.Transport = newETagTransport(httpClient.Transport, token)
+	pin := redirectguard.NewOriginPin(newETagTransport(httpClient.Transport, token))
+	httpClient.Transport = pin
 	opts := []gh.ClientOptionsFunc{
 		gh.WithHTTPClient(httpClient),
 		gh.WithAuthToken(token),
@@ -94,6 +104,9 @@ func newGitHub(baseURL, token string, timeout time.Duration) (*github, error) {
 	redact := newRedactor(token)
 	c, err := gh.NewClient(opts...)
 	if err != nil {
+		return nil, redact.error(fmt.Errorf("github: new client: %w", err))
+	}
+	if err := pin.Allow(c.BaseURL(), c.UploadURL()); err != nil {
 		return nil, redact.error(fmt.Errorf("github: new client: %w", err))
 	}
 	// The second-hop log client shares the per-call timeout but attaches no auth and

@@ -104,13 +104,13 @@ type CloneOptions struct {
 // commit SHA plus the file bytes for ParseSet.
 //
 // It is the SECOND place go-git is used (pushbroker is the first). Unlike pushbroker
-// (which pushes through go-git's default, process-global transport), the sync clones an
-// UNTRUSTED remote, so it drives the upload-pack session through a transport SCOPED to
-// this one operation — a per-fetch *http.Client carrying two guards go-git's global
-// client does not: an allowlist-checked CheckRedirect (FINDING 2) and a cumulative
-// wire-size cap (FINDING 1). Because the client is per-operation and never installed
-// into go-git's global protocol registry (client.InstallProtocol), pushbroker's push
-// pipeline is entirely unaffected. The URL is validated with go-git's own endpoint
+// (which pushes through the same-origin-redirect transport it installs once in go-git's
+// process-global registry), the sync clones an UNTRUSTED remote, so it drives the
+// upload-pack session through a transport SCOPED to this one operation — a per-fetch
+// *http.Client carrying two guards: an allowlist-checked CheckRedirect (FINDING 2) and a
+// cumulative wire-size cap (FINDING 1). Because the client is per-operation and never
+// installed into go-git's global protocol registry (client.InstallProtocol), the two
+// pipelines never affect each other. The URL is validated with go-git's own endpoint
 // parser; the ref is validated with go-git plumbing (git-check-ref-format via
 // ReferenceName.Validate, or a 40-hex SHA) and never string-interpolated into a
 // refspec (the fetch asks for a resolved object HASH, not a name). Every returned error
@@ -178,8 +178,8 @@ func FetchRoleFiles(ctx context.Context, opts CloneOptions) (sha string, files [
 // stock client for that protocol; the budget is nil.
 //
 // The http(s) client is NEVER installed into go-git's process-global protocol registry
-// (client.InstallProtocol), so it cannot alter pushbroker's push pipeline, which keeps
-// using go-git's default client.
+// (client.InstallProtocol), so it cannot alter pushbroker's push pipeline, which uses
+// the transport pushbroker installs there.
 func transportForEndpoint(ep *transport.Endpoint, redirectAllowed func(string) bool) (transport.Transport, *wireBudget, error) {
 	switch ep.Protocol {
 	case "http", "https":

@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/vtmocanu/uzi/api/internal/redirectguard"
 )
 
 // ErrTokenIntrospectionUnsupported is returned by TokenInfo when the forge does
@@ -922,10 +924,15 @@ func New(t Type, baseURL, token string, timeout time.Duration) (Forge, error) {
 
 // timeoutClient builds an *http.Client with a hard per-call timeout. Every
 // driver routes its transport through one of these, so no call can hang on an
-// untimeouted DefaultClient.
+// untimeouted DefaultClient. It follows a redirect only while it stays on the
+// original request's origin (redirectguard.SameOrigin): a driver's credential can
+// survive a redirect (net/http keeps Authorization on the same hostname and custom
+// headers such as GitLab's PRIVATE-TOKEN on any host) or be re-attached to it
+// (go-github's auth transport), so a redirect off the allowlisted origin must never
+// be followed.
 func timeoutClient(timeout time.Duration) *http.Client {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
-	return &http.Client{Timeout: timeout}
+	return &http.Client{Timeout: timeout, CheckRedirect: redirectguard.SameOrigin}
 }

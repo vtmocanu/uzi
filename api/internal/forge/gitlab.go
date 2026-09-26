@@ -9,6 +9,8 @@ import (
 	"time"
 
 	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
+
+	"github.com/vtmocanu/uzi/api/internal/redirectguard"
 )
 
 // developerAccessLevel is GitLab's Developer role access level. The privilege
@@ -60,6 +62,9 @@ type gitLab struct {
 // allowlist-checked by the caller.
 func newGitLab(baseURL, token string, timeout time.Duration) (*gitLab, error) {
 	hc := timeoutClient(timeout)
+	// Stop at an off-origin redirect instead of failing it: the SDK's retry policy
+	// re-sends a GET whose redirect check errored, five times with backoff.
+	hc.CheckRedirect = redirectguard.StopOffOrigin
 	client, err := gitlab.NewClient(token,
 		gitlab.WithBaseURL(baseURL),
 		gitlab.WithHTTPClient(hc),

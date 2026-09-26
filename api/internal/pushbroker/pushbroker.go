@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -37,6 +38,8 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport/client"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/go-git/go-git/v5/storage/memory"
+
+	"github.com/vtmocanu/uzi/api/internal/redirectguard"
 )
 
 // Options carries everything a publish needs. Every field is derived by the caller
@@ -506,7 +509,7 @@ func casDelete(ctx context.Context, remote *git.Remote, auth transport.AuthMetho
 	if err != nil {
 		return fmt.Errorf("pushbroker: endpoint: %w", err)
 	}
-	c, err := client.NewClient(ep)
+	c, err := transportFor(ep)
 	if err != nil {
 		return fmt.Errorf("pushbroker: transport client: %w", err)
 	}
@@ -566,7 +569,7 @@ func forwardPack(ctx context.Context, remote *git.Remote, auth transport.AuthMet
 	if err != nil {
 		return fmt.Errorf("pushbroker: endpoint: %w", err)
 	}
-	c, err := client.NewClient(ep)
+	c, err := transportFor(ep)
 	if err != nil {
 		return fmt.Errorf("pushbroker: transport client: %w", err)
 	}
@@ -829,6 +832,43 @@ func fetchBaseRefs(ctx context.Context, remote *git.Remote, auth transport.AuthM
 // so the never-forced intent stays pinned even though the push mechanism moved.
 func pushRefSpec(ref string) config.RefSpec {
 	return config.RefSpec(ref + ":" + ref)
+}
+
+// httpTransport is the go-git smart-HTTP transport every broker operation uses. Its
+// client follows a redirect only while it stays on the original request's scheme,
+// hostname and effective port (redirectguard.SameOrigin), composed after go-git's
+// own policy (redirects only on the initial discovery request). go-git alone admits
+// a same-host redirect that changes scheme or port, and net/http re-sends the
+// BasicAuth header to the same hostname, so without this the PAT could leave in
+// cleartext or reach another port before go-git's later endpoint check runs.
+var httpTransport = githttp.NewClient(&http.Client{
+	// Explicit, not nil: go-git type-asserts *http.Transport when an endpoint carries
+	// TLS or proxy options.
+	Transport:     http.DefaultTransport,
+	CheckRedirect: redirectguard.SameOrigin,
+})
+
+// init installs httpTransport for http and https in go-git's process-global
+// protocol registry, ONCE, before any goroutine can read it (the registry is an
+// unsynchronised map, so it is never written per request). remote.ListContext,
+// FetchContext and PushContext have no per-call transport option and resolve
+// through the registry; the manual receive-pack sessions select httpTransport
+// directly (transportFor). internal/agentsource never consults the registry for
+// http(s): its scoped client is unaffected.
+func init() {
+	client.InstallProtocol("http", httpTransport)
+	client.InstallProtocol("https", httpTransport)
+}
+
+// transportFor returns the transport for a manual session on ep: httpTransport for
+// http(s), go-git's stock client otherwise (the file:// test fixtures).
+func transportFor(ep *transport.Endpoint) (transport.Transport, error) {
+	switch ep.Protocol {
+	case "http", "https":
+		return httpTransport, nil
+	default:
+		return client.NewClient(ep)
+	}
 }
 
 // authFor returns BasicAuth only when a credential is present. A file:// fixture
