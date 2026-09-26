@@ -783,6 +783,7 @@ type Store interface {
 	// rows (guard fail) is the non-paused ack the worker's park order must retain the run on.
 	SetRunCompletionHold(ctx context.Context, arg store.SetRunCompletionHoldParams) (store.Run, error)
 	ResumePausedRun(ctx context.Context, arg store.ResumePausedRunParams) (store.ResumePausedRunRow, error)
+	PromoteCredentialDisabledRun(ctx context.Context, arg store.PromoteCredentialDisabledRunParams) (store.PromoteCredentialDisabledRunRow, error)
 	// ReleaseCredentialSwitch is the held-state credential-switch RELEASE transition (PRD
 	// #1247 M5, D3/D4/D14): a worker's {status:"credential_switch", claim_generation} report
 	// requeues the held run in ONE fenced statement — generation- and release-gated, banking

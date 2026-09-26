@@ -2884,6 +2884,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: ClearRunMilestonesCompleted :execrows
@@ -2989,6 +2990,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: SetRunCompleted :execrows
@@ -3321,6 +3323,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: SupersedeRunByWorker :execrows
@@ -3348,6 +3351,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: FailRunAutoStop :execrows
