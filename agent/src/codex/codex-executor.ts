@@ -268,7 +268,9 @@ const REASON_CANCEL = "run cancelled";
 // system-authored wall-clock park, getPauseMode()==='wall') reaches the capture-first wall park. An
 // owner now/milestone pause that dropped a live turn reaches ctx.parkForPause in the implement phase
 // and a thrown PauseNowSignal in the plan phase (issue #1764); a pause whose mode was withdrawn
-// re-drives the turn. Never a cancel. Secret-free static string, DISTINCT from REASON_CANCEL/REASON_WALL.
+// re-drives the turn. A pause never cancels on its own: a pending/sticky cancel still wins over it,
+// and a wall park answered `cancelled` ends the run as a cancel. Secret-free static string,
+// DISTINCT from REASON_CANCEL/REASON_WALL.
 const REASON_PAUSE = "codex run paused";
 
 /** Issue #1764: one handling path's snapshot of the pause-now state, taken before its first await. */
@@ -277,6 +279,16 @@ interface PauseNowToken {
   readonly seq: number;
   /** Whether the shared ctx.signal was already aborted with a PauseNowSignal at capture. */
   readonly sharedPauseAbort: boolean;
+}
+
+/**
+ * Issue #1764: a turn's first-wins trip, thrown with the reason as its message (unchanged for every
+ * caller that matches on it) plus the pause-now snapshot taken when the trip fired.
+ */
+class CodexTurnTripError extends Error {
+  constructor(reason: string, readonly pauseToken: PauseNowToken) {
+    super(reason);
+  }
 }
 
 /**
@@ -1675,7 +1687,10 @@ export class CodexExecutor implements Executor {
     // persisted just before the reap. The finally skips it.
     let reapedSinceLastPersist = false;
     // Issue #1764: the one "persist before a sink that may reap" step. Skipped when the flag is
-    // already set: the store then holds the latest pre-reap state and the home may be gone.
+    // already set, because the home may be gone. The store then holds the generation persisted
+    // before the first such sink. After a refused sink that did NOT reap, a re-drive's newer
+    // session state is captured only once a turn completes (which clears the flag); otherwise the
+    // store keeps that pre-park generation.
     const beforeReapingSink = async (): Promise<void> => {
       if (reapedSinceLastPersist || !epoch) return;
       await epoch.persistSession();
@@ -2680,9 +2695,15 @@ export class CodexExecutor implements Executor {
     const callbackCursor = registry.callbackAdmissionCursor();
     const turnAbort = new AbortController();
     let tripReason: string | undefined;
+    // Issue #1764: the pause-now state as it stood when the first trip fired. An own wall/idle
+    // timer trip is not caused by any interrupt generation, so its handler must consume only what
+    // was outstanding at THAT moment: an owner `now` that lands between the trip and the handler
+    // (its own trip is a first-wins no-op) stays pending and drops the re-driven turn.
+    let tripToken: PauseNowToken | undefined;
     const trip = (reason: string): void => {
       if (tripReason === undefined) {
         tripReason = reason;
+        tripToken = pauseNow.capture();
         turnAbort.abort();
       }
     };
@@ -2754,7 +2775,7 @@ export class CodexExecutor implements Executor {
     const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal);
     try {
       harness.useBroker(buildPhaseBroker(phase, turnAbort.signal));
-      if (tripReason) throw this.tripError(tripReason);
+      if (tripReason) throw this.tripError(tripReason, tripToken!);
       armIdle();
       let turn = harness.startTurn(request);
       let events = turn.events[Symbol.asyncIterator]();
@@ -2802,7 +2823,7 @@ export class CodexExecutor implements Executor {
         }
       }
       // (a) FIRST-WINS trip.
-      if (tripReason) throw this.tripError(tripReason);
+      if (tripReason) throw this.tripError(tripReason, tripToken!);
       // (c) a failed terminal is classified ONCE and materialized+thrown here.
       if (sawTerminal && terminal && terminal.outcome === "failed") {
         const thrown = terminal.failure
@@ -2821,7 +2842,7 @@ export class CodexExecutor implements Executor {
       return result;
     } catch (err) {
       // (a) again: a trip beats the raw aborted/protocol error the iterator threw.
-      if (tripReason) throw this.tripError(tripReason);
+      if (tripReason) throw this.tripError(tripReason, tripToken!);
       throw err instanceof Error ? err : new Error(errMessage(err));
     } finally {
       unsubscribeCallbacks();
@@ -2833,8 +2854,8 @@ export class CodexExecutor implements Executor {
     }
   }
 
-  private tripError(reason: string): Error {
-    return new Error(reason);
+  private tripError(reason: string, pauseToken: PauseNowToken): Error {
+    return new CodexTurnTripError(reason, pauseToken);
   }
 
   /**
@@ -2890,10 +2911,16 @@ export class CodexExecutor implements Executor {
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
         return { kind: "turn", result };
       } catch (err) {
+        const msg = err instanceof Error ? err.message : "";
         // Issue #1764: the interrupt generation this path handles, captured before any await; a
         // newer `now`/`wall` that lands during an await below stays pending for the re-drive.
-        const pauseToken = pauseNow.capture();
-        const msg = err instanceof Error ? err.message : "";
+        // A REASON_PAUSE trip is snapshotted here, not at the trip: steering aborts the shared
+        // signal BEFORE it fires the same pause's interrupt, so a trip-time snapshot would miss
+        // that pause's own generation. Any other trip (the own wall timer) uses the snapshot taken
+        // when it fired, so an owner `now` that landed after it is never consumed by its park.
+        const pauseToken = msg !== REASON_PAUSE && err instanceof CodexTurnTripError
+          ? err.pauseToken
+          : pauseNow.capture();
         const mode = ctx.pauseModeRequested?.();
         // A pending cancel wins over a pause of either kind.
         if (msg === REASON_PAUSE && ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
