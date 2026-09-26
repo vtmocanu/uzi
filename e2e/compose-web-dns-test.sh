@@ -46,19 +46,27 @@ start_api() {
 }
 # The address change must be deterministic, not left to Docker's IP allocator, which
 # may hand a restarted container its old address. `--ip` needs a user-configured
-# subnet, so pin the one Docker just chose for this network (free by construction)
-# and derive two fixed host addresses from it.
-pin_subnet() {
-  local subnet base prefix
-  subnet="$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "$NET")"
-  base="${subnet%/*}"
-  prefix="${subnet#*/}"
-  case "$base" in *.0) ;; *) fail "unexpected subnet $subnet" ;; esac
-  [ "$prefix" -le 24 ] || fail "subnet $subnet too small for fixed addresses"
-  docker network rm "$NET" >/dev/null
-  docker network create --subnet "$subnet" "$NET" >/dev/null
-  IP_BEFORE="${base%.0}.200"
-  IP_AFTER="${base%.0}.201"
+# subnet, so create this network with an explicit /24 from the start (no release and
+# re-acquire gap another network could claim), retrying a few random candidates when
+# one overlaps an existing network, and use two fixed host addresses inside it.
+new_pinned_network() {
+  local attempt base
+  NET="$RUN_ID-$1"
+  for attempt in 1 2 3 4 5 6 7 8; do
+    base="10.$((RANDOM % 200 + 20)).$((RANDOM % 256))"
+    if docker network create --subnet "$base.0/24" "$NET" >/dev/null 2>"$SCRATCH/net.err"; then
+      NETWORKS+=("$NET")
+      API="$NET-api"
+      FILLER="$NET-filler"
+      WEB="$NET-web"
+      IP_BEFORE="$base.200"
+      IP_AFTER="$base.201"
+      return 0
+    fi
+    grep -q -i 'overlap' "$SCRATCH/net.err" || fail "network create failed: $(cat "$SCRATCH/net.err")"
+    note "subnet $base.0/24 overlaps an existing network (attempt $attempt); retrying"
+  done
+  fail "no free /24 found for the pinned test network after 8 attempts"
 }
 start_filler() {
   docker run -d --name "$FILLER" --network "$NET" \
@@ -193,8 +201,7 @@ if [ "$MODE" = --green ]; then
   release_scenario
 fi
 
-new_network swap
-pin_subnet
+new_pinned_network swap
 start_api "$IP_BEFORE"
 start_filler
 start_web
