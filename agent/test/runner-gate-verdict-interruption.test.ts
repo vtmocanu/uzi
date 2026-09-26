@@ -65,6 +65,7 @@ const SUPERSEDED_REJECT_NOTICE = "an earlier plan rejection was superseded by a 
 const STALE_REVISE_NOTICE = "Feedback ignored — it was written against an older plan version; re-send it.";
 const REPLAY_STALE_VERDICT_NOTICE = "A plan verdict sent before this plan was shown was ignored — re-send it if you still want it.";
 const REPLAY_STALE_REVISE_NOTICE = "Plan feedback sent before this plan was shown was ignored — re-send it if you still want it.";
+const REPLAY_UNJUDGED_NOTICE = "Could not confirm which plan this verdict was for — it was ignored; re-send it if you still want it.";
 const APPROVED_REVISE_NOTICE = "The plan is already approved — this revision request was ignored; cancel the run to stop it.";
 const APPROVED_REJECT_NOTICE = "The plan is already approved — this rejection was ignored; cancel the run to stop it.";
 
@@ -473,6 +474,22 @@ function assertRevisedOnResume(s: Scenario, flight: Flight, feedback: string, se
   assert.ok(s.texts(flight).includes(STATUS_RESUME_WITH_REVISION), "the resume says it is revising instead of re-presenting");
   assert.ok(s.kinds(flight).includes("plan_feedback"), "the feedback is recorded on the feed");
   assert.ok(s.kinds(flight).includes("plan_revising"), "the revision round is announced on the feed");
+}
+
+/** Issue #1604 round 4: a disposed (stale or superseded) approve never reaches /inputs/applied and
+ *  never counts as the human approval. It is settled through /inputs/discarded (disposition
+ *  superseded) once the discard lane lands, which takes it out of the replay list. */
+async function assertDisposedApprove(s: Scenario, id: number, what = "the stale approve"): Promise<void> {
+  assert.ok(
+    !api.inputReceiptCalls.some((c) => c.runId === s.runId && c.kind === "applied" && c.ids.includes(id)),
+    `${what} is never sent to /inputs/applied`,
+  );
+  assert.ok(await until(() => api.isDiscarded(s.runId, id), 3_000), `${what} is discarded (disposition superseded)`);
+}
+
+/** The server counts no human approval for the run (a discarded approve is not one). */
+function assertNoApproval(s: Scenario): void {
+  assert.equal(api.humanPlanApproved(s.runId), false, "the server counts no human approval");
 }
 
 // --- tests ---------------------------------------------------------------------------------------
@@ -1115,9 +1132,9 @@ describe("#1604 — delivery on resume: no plan is offered before the inputs sen
       const [approve] = s.send(s.input("approve_plan"));
       await approveFirstGate(s, flight);
       // This claim carries no resume_plan_at, so it fails closed: an approve read before its first
-      // gate is stale, with the replay notice, and never applied.
-      assert.ok(s.texts(flight).includes(REPLAY_STALE_VERDICT_NOTICE), s.texts(flight).join(" | "));
-      assert.equal(api.isApplied(s.runId, approve!.id), false, "the stale approve is never applied");
+      // gate is stale, with the unjudged notice, and never applied as approval (discarded).
+      assert.ok(s.texts(flight).includes(REPLAY_UNJUDGED_NOTICE), s.texts(flight).join(" | "));
+      await assertDisposedApprove(s, approve!.id);
       assertRevisedOnResume(s, flight, FEEDBACK, "kept");
       assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
     }));
@@ -1189,7 +1206,8 @@ describe("#1604 review — a replayed verdict never applies to a plan no human s
       assert.equal(s.model.count("implement"), 0, "nothing is implemented before a verdict on the fresh plan");
       assert.ok(s.texts(flight).includes(STALE_APPROVE_NOTICE), s.texts(flight).join(" | "));
       assert.ok(api.isAcked(s.runId, row.id), "the replayed approve was read");
-      assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve is never applied");
+      await assertDisposedApprove(s, row.id);
+      assertNoApproval(s);
       s.send(s.input("approve_plan"));
       await s.finish(flight);
       assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
@@ -1209,7 +1227,8 @@ describe("#1604 review — a replayed verdict never applies to a plan no human s
         if (kind === "reject_plan") assert.ok(await until(() => api.isApplied(s.runId, row.id), 3_000), "the stale reject is applied");
         else {
           assert.ok(api.isAcked(s.runId, row.id), "the replayed approve was read");
-          assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve is never applied");
+          await assertDisposedApprove(s, row.id);
+          assertNoApproval(s);
         }
         s.send(s.input("approve_plan"));
         await s.finish(flight);
@@ -1242,18 +1261,24 @@ describe("#1604 review — a replayed verdict never applies to a plan no human s
       assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
     }));
 
-  it("a stub (Codex-shaped) executor never re-presents: a replayed approve goes stale at its first gate, and no waiting line (finding 6)", () =>
+  it("a stub (Codex-shaped) executor never re-presents: its first gate waits for the replayed backlog, and a replayed approve goes stale at it (finding 6; round 4 finding 1)", () =>
     scenario(async (s) => {
       const { row } = await releaseAtGate(s, () => s.send(s.input("approve_plan"))[0]!, "unacked");
       api.failInputGets(s.runId, 5, 503);
+      api.delayInputGets(s.runId, 1_000, 1, (api.inputGets.get(s.runId) ?? 0) + 5);
       const flight = s.start(s.resumeClaim("kept"), { executor: () => new StubExecutor(nullLogger(), { planGate: true }) });
       assert.ok(await until(() => s.gates(flight).length >= 1 || flight.finished), s.statuses(flight).join(","));
       assert.ok(await until(() => api.isAcked(s.runId, row.id), 3_000), "the approve was read");
       await tick(200);
-      assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve is never applied");
+      await assertDisposedApprove(s, row.id);
+      assertNoApproval(s);
       assert.equal(flight.finished, false, `the stub's plan waits at the gate: ${s.statuses(flight).join(",")}`);
       assert.ok(s.texts(flight).includes(STALE_APPROVE_NOTICE), s.texts(flight).join(" | "));
-      assert.ok(!s.texts(flight).includes(STATUS_WAITING_DELIVERY), "no waiting line: the stub offers its plan regardless");
+      // Round 4 (finding 1): every executor's first gate waits for the replayed backlog, so the
+      // transient read failures earn the one waiting line (the stub no longer offers its plan first).
+      assert.equal(s.texts(flight).filter((t) => t === STATUS_WAITING_DELIVERY).length, 1, s.texts(flight).join(" | "));
+      const ackAt = api.timeline.findIndex((e, i) => i >= flight.timelineFrom && e.type === "receipt_reply" && e.kind === "ack" && e.httpStatus === 200 && e.ids.includes(row.id));
+      assert.ok(ackAt >= 0 && s.stateAt("awaiting_approval", flight.timelineFrom) > ackAt, "the gate is reported only after the replayed approve was read");
       s.send(s.input("cancel"));
       await s.finish(flight);
     }));
@@ -1357,53 +1382,72 @@ describe("#1604 review — resumed-gate edges", () => {
 });
 
 describe("#1604 round 3 — a disposed approve is never applied, so no later claim reads it as approval (B1)", () => {
-  it("Path B, then a second interruption at the re-presented gate: the reclaim is not approved and gates B again", () =>
-    scenario(async (s) => {
-      const { flight, row } = await pathB(s, "approve_plan");
-      assert.equal(s.gates(flight)[0]?.plan_md, revisedPlan(1), "plan B is re-presented");
-      await s.shutdown(flight); // the second interruption, at B's gate
-      const claim = s.resumeClaim("kept");
-      assert.equal(claim.plan_approved, false, "the reclaim is not plan_approved");
-      assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve stayed unapplied");
-      assert.equal(api.humanPlanApproved(s.runId), false, "the server holds no human approval");
-      assert.equal(claim.resume_phase, "awaiting_approval", "the reclaim resumes at the gate, not implementing");
-      const third = s.start(claim);
-      assert.ok(await until(() => s.gates(third).length >= 1 || third.finished), s.statuses(third).join(","));
-      await tick(200);
-      assert.equal(s.gates(third)[0]?.plan_md, revisedPlan(1), "B is gated again");
-      assert.equal(third.finished, false, `B waits for its own verdict: ${s.statuses(third).join(",")}`);
-      assert.equal(s.model.count("implement"), 0, "nothing implemented without a verdict on B");
-      assert.ok(s.texts(third).includes(REPLAY_STALE_VERDICT_NOTICE), "the stale approve is disposed of again");
-      const [fresh] = s.send(s.input("approve_plan"));
-      await s.finish(third);
-      assert.ok(s.statuses(third).includes("completed"), s.statuses(third).join(","));
-      assert.ok(api.isApplied(s.runId, fresh!.id), "the approve the gate took is applied");
-      assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve never is");
-      assert.equal(s.model.count("implement"), 1);
-    }));
+  // Round 4 (finding 2): a disposed approve is settled through /inputs/discarded (disposition
+  // superseded), which the server never counts as approval and leaves out of the replay list, so the
+  // next claim does not read it again. Against an api without the route (404) it stays unapplied and
+  // every later claim disposes of it again (the round-3 behaviour, kept as the fallback).
+  for (const route of ["discarded", "404"] as const) {
+    const label = route === "404" ? " (an api without /inputs/discarded: left unapplied, disposed of again)" : " (discarded: never re-served)";
+    it(`Path B, then a second interruption at the re-presented gate: the reclaim is not approved and gates B again${label}`, () =>
+      scenario(async (s) => {
+        api.discardRouteMissing = route === "404";
+        const { flight, row } = await pathB(s, "approve_plan");
+        assert.equal(s.gates(flight)[0]?.plan_md, revisedPlan(1), "plan B is re-presented");
+        if (route === "discarded") await assertDisposedApprove(s, row.id);
+        await s.shutdown(flight); // the second interruption, at B's gate
+        const claim = s.resumeClaim("kept");
+        assert.equal(claim.plan_approved, false, "the reclaim is not plan_approved");
+        assert.equal(api.isApplied(s.runId, row.id), route === "discarded", route === "discarded" ? "the stale approve was discarded" : "the stale approve stayed unapplied");
+        assertNoApproval(s);
+        assert.equal(claim.resume_phase, "awaiting_approval", "the reclaim resumes at the gate, not implementing");
+        const third = s.start(claim);
+        assert.ok(await until(() => s.gates(third).length >= 1 || third.finished), s.statuses(third).join(","));
+        await tick(200);
+        assert.equal(s.gates(third)[0]?.plan_md, revisedPlan(1), "B is gated again");
+        assert.equal(third.finished, false, `B waits for its own verdict: ${s.statuses(third).join(",")}`);
+        assert.equal(s.model.count("implement"), 0, "nothing implemented without a verdict on B");
+        if (route === "discarded") {
+          assert.equal(s.acks(row.id, third), 0, "the discarded approve is not served to the next claim");
+          assert.ok(!s.texts(third).includes(REPLAY_STALE_VERDICT_NOTICE), s.texts(third).join(" | "));
+        } else assert.ok(s.texts(third).includes(REPLAY_STALE_VERDICT_NOTICE), "the stale approve is disposed of again");
+        const [fresh] = s.send(s.input("approve_plan"));
+        await s.finish(third);
+        assert.ok(s.statuses(third).includes("completed"), s.statuses(third).join(","));
+        assert.ok(api.isApplied(s.runId, fresh!.id), "the approve the gate took is applied");
+        assert.equal(api.isDiscarded(s.runId, fresh!.id), false, "the taken approve is applied as the approval");
+        assert.ok(!api.inputReceiptCalls.some((c) => c.kind === "applied" && c.ids.includes(row.id)), "the stale approve is never sent to /inputs/applied");
+        if (route === "404") assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve never is applied");
+        assert.equal(s.model.count("implement"), 1);
+      }));
 
-  it("Path A, then a second interruption at the fresh plan's gate: the reclaim is not approved and gates again", () =>
-    scenario(async (s) => {
-      const { row } = await releaseAtGate(s, () => s.send(s.input("approve_plan"))[0]!, "unacked");
-      const second = s.start(s.resumeClaim("none"));
-      assert.ok(await until(() => s.gates(second).length >= 1 || second.finished), s.statuses(second).join(","));
-      await tick(200);
-      assert.ok(s.texts(second).includes(STALE_APPROVE_NOTICE), s.texts(second).join(" | "));
-      await s.shutdown(second); // the second interruption, at the fresh plan's gate
-      const claim = s.resumeClaim("none");
-      assert.equal(claim.plan_approved, false, "the reclaim is not plan_approved");
-      assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve stayed unapplied");
-      assert.notEqual(claim.resume_phase, "implementing", "the reclaim is not implementing");
-      const third = s.start(claim);
-      assert.ok(await until(() => s.gates(third).length >= 1 || third.finished), s.statuses(third).join(","));
-      await tick(200);
-      assert.equal(third.finished, false, `the plan waits at the gate: ${s.statuses(third).join(",")}`);
-      assert.equal(s.model.count("implement"), 0, "nothing implemented without a verdict");
-      s.send(s.input("approve_plan"));
-      await s.finish(third);
-      assert.ok(s.statuses(third).includes("completed"), s.statuses(third).join(","));
-      assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve never is applied");
-    }));
+    it(`Path A, then a second interruption at the fresh plan's gate: the reclaim is not approved and gates again${label}`, () =>
+      scenario(async (s) => {
+        api.discardRouteMissing = route === "404";
+        const { row } = await releaseAtGate(s, () => s.send(s.input("approve_plan"))[0]!, "unacked");
+        const second = s.start(s.resumeClaim("none"));
+        assert.ok(await until(() => s.gates(second).length >= 1 || second.finished), s.statuses(second).join(","));
+        await tick(200);
+        assert.ok(s.texts(second).includes(STALE_APPROVE_NOTICE), s.texts(second).join(" | "));
+        if (route === "discarded") await assertDisposedApprove(s, row.id);
+        await s.shutdown(second); // the second interruption, at the fresh plan's gate
+        const claim = s.resumeClaim("none");
+        assert.equal(claim.plan_approved, false, "the reclaim is not plan_approved");
+        assertNoApproval(s);
+        if (route === "404") assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve stayed unapplied");
+        assert.notEqual(claim.resume_phase, "implementing", "the reclaim is not implementing");
+        const third = s.start(claim);
+        assert.ok(await until(() => s.gates(third).length >= 1 || third.finished), s.statuses(third).join(","));
+        await tick(200);
+        assert.equal(third.finished, false, `the plan waits at the gate: ${s.statuses(third).join(",")}`);
+        assert.equal(s.model.count("implement"), 0, "nothing implemented without a verdict");
+        assert.equal(s.acks(row.id, third) > 0, route === "404", route === "404" ? "the unapplied approve is read again" : "the discarded approve is not served again");
+        s.send(s.input("approve_plan"));
+        await s.finish(third);
+        assert.ok(s.statuses(third).includes("completed"), s.statuses(third).join(","));
+        assert.ok(!api.inputReceiptCalls.some((c) => c.kind === "applied" && c.ids.includes(row.id)), "the stale approve is never sent to /inputs/applied");
+        if (route === "404") assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve never is applied");
+      }));
+  }
 });
 
 describe("#1604 round 3 — a claim without resume_plan_at fails closed (B2)", () => {
@@ -1415,8 +1459,10 @@ describe("#1604 round 3 — a claim without resume_plan_at fails closed (B2)", (
         assert.equal(flight.finished, false, `B waits for its own verdict: ${s.statuses(flight).join(",")}`);
         assert.ok(!s.statuses(flight).includes("failed"), "the replayed reject did not fail the run");
         assert.equal(s.model.count("implement"), 0, "nothing implemented without a fresh approve");
-        assert.ok(s.texts(flight).includes(REPLAY_STALE_VERDICT_NOTICE), s.texts(flight).join(" | "));
-        if (kind === "approve_plan") assert.equal(api.isApplied(s.runId, row.id), false, "the replayed approve is never applied");
+        // Round 4 (finding 6): the unjudged mode's own notice, not "sent before this plan was shown".
+        assert.ok(s.texts(flight).includes(REPLAY_UNJUDGED_NOTICE), s.texts(flight).join(" | "));
+        assert.ok(!s.texts(flight).includes(REPLAY_STALE_VERDICT_NOTICE), s.texts(flight).join(" | "));
+        if (kind === "approve_plan") await assertDisposedApprove(s, row.id, "the replayed approve");
         const [fresh] = s.send(s.input("approve_plan"));
         await s.finish(flight);
         assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
@@ -1425,4 +1471,105 @@ describe("#1604 round 3 — a claim without resume_plan_at fails closed (B2)", (
         assert.equal(s.model.count("revise", flight.turnFrom), 0, "no second revision");
       }));
   }
+});
+
+describe("#1604 round 4 — no gate before the replayed backlog is drained (finding 1)", () => {
+  /** A persisted plan A whose approve (sent after A was shown) is left unread by a release, then a
+   *  reclaim whose claim cannot say when A was shown (resume_plan_at omitted). */
+  async function unjudgedAfterRelease(s: Scenario): Promise<{ row: UserInput; claim: ClaimResponse }> {
+    const { row } = await releaseAtGate(s, () => s.send(s.input("approve_plan"))[0]!, "unacked");
+    api.omitResumePlanAt = true;
+    const claim = s.resumeClaim("kept");
+    assert.equal(claim.resume_plan_at, undefined);
+    return { row, claim };
+  }
+
+  it("a Codex-shaped executor (no resumesAtGate), resume_plan_at absent, the approve's GET failing past the plan turn: the fresh plan is never approved by it", () =>
+    scenario(async (s) => {
+      const { row, claim } = await unjudgedAfterRelease(s);
+      // Five transient failures, then a read slow enough that the stub's plan is ready long before it.
+      api.failInputGets(s.runId, 5, 503);
+      api.delayInputGets(s.runId, 1_000, 1, (api.inputGets.get(s.runId) ?? 0) + 5);
+      const flight = s.start(claim, { executor: () => new StubExecutor(nullLogger(), { planGate: true }) });
+      assert.ok(await until(() => s.gates(flight).length >= 1 || flight.finished), s.statuses(flight).join(","));
+      assert.ok(await until(() => api.isAcked(s.runId, row.id), 3_000), "the replayed approve was read");
+      await tick(300);
+      assert.equal(flight.finished, false, `the plan waits for its own verdict: ${s.statuses(flight).join(",")}`);
+      assert.ok(!s.statuses(flight).includes("completed"), "the replayed approve did not approve the plan");
+      assert.ok(s.texts(flight).includes(REPLAY_UNJUDGED_NOTICE), s.texts(flight).join(" | "));
+      await assertDisposedApprove(s, row.id, "the replayed approve");
+      assertNoApproval(s);
+      const ackAt = api.timeline.findIndex((e, i) => i >= flight.timelineFrom && e.type === "receipt_reply" && e.kind === "ack" && e.httpStatus === 200 && e.ids.includes(row.id));
+      assert.ok(ackAt >= 0 && s.stateAt("awaiting_approval", flight.timelineFrom) > ackAt, "awaiting_approval is reported only after the replayed approve was read");
+      const [fresh] = s.send(s.input("approve_plan"));
+      await s.finish(flight);
+      assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
+      assert.ok(api.isApplied(s.runId, fresh!.id) && !api.isDiscarded(s.runId, fresh!.id), "the fresh approve is the approval");
+    }));
+
+  it("an SDK claim whose replayed approve lies past the first GET batch: judged replayed, the re-presented plan is not approved by it", () =>
+    scenario(async (s) => {
+      api.inputPageSize = 2;
+      s.send(s.input("follow_up", "one"), s.input("follow_up", "two"), s.input("follow_up", "three"));
+      const [approve] = s.send(s.input("approve_plan"));
+      // Hold this claim's second GET, so a gate offered after the first batch would be shown (and
+      // its epoch bumped) before the approve is read.
+      api.delayInputGets(s.runId, 400, 1, (api.inputGets.get(s.runId) ?? 0) + 1);
+      s.writeTranscript();
+      const flight = s.start(
+        s.claim({ resume_phase: "awaiting_approval", plan_md: PLAN_V1, milestones: V1_MILESTONES, plan_source: "agent", plan_approved: false, session_id: SID }),
+      );
+      assert.ok(await until(() => s.gates(flight).length >= 1 || flight.finished), s.statuses(flight).join(","));
+      await tick(300);
+      assert.equal(s.gates(flight)[0]?.plan_md, PLAN_V1, "the submitted plan is re-presented");
+      assert.equal(flight.finished, false, `the plan waits for its own verdict: ${s.statuses(flight).join(",")}`);
+      assert.equal(s.model.count("implement"), 0, "nothing implemented on the replayed approve");
+      assert.ok(s.texts(flight).includes(REPLAY_UNJUDGED_NOTICE), s.texts(flight).join(" | "));
+      await assertDisposedApprove(s, approve!.id, "the replayed approve");
+      const ackAt = api.timeline.findIndex((e, i) => i >= flight.timelineFrom && e.type === "receipt_reply" && e.kind === "ack" && e.httpStatus === 200 && e.ids.includes(approve!.id));
+      assert.ok(ackAt >= 0 && s.stateAt("awaiting_approval", flight.timelineFrom) > ackAt, "the plan is offered only after the approve past the first batch was read");
+      const [fresh] = s.send(s.input("approve_plan"));
+      await s.finish(flight);
+      assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
+      assert.ok(api.isApplied(s.runId, fresh!.id) && !api.isDiscarded(s.runId, fresh!.id));
+    }));
+
+  it("a Codex-shaped executor: a definitive read failure fails the run before any plan is offered", () =>
+    scenario(async (s) => {
+      const { claim } = await unjudgedAfterRelease(s);
+      api.rawInputGets(s.runId, { inputs: "not-a-list", receipts: true });
+      const flight = s.start(claim, { executor: () => new StubExecutor(nullLogger(), { planGate: true }) });
+      await until(() => s.statuses(flight).includes("failed") || s.gates(flight).length > 0, 20_000);
+      assert.equal(s.gates(flight).length, 0, "the plan was never offered");
+      assert.match(s.states(flight).find((b) => b.status === "failed")?.failure_reason ?? "", /^plan-gate input delivery failed: /);
+      api.rawInputGets(s.runId, undefined, 0);
+      await s.finish(flight, 2_000);
+    }));
+
+  it("a Codex-shaped executor: the bounded transient give-up parks in recovery_wait, never offering the plan", () =>
+    scenario(async (s) => {
+      const { row, claim } = await unjudgedAfterRelease(s);
+      api.recoveryWaitRequiresRunning = true;
+      api.failInputGets(s.runId, Infinity, 503);
+      const flight = s.start(claim, { executor: () => new StubExecutor(nullLogger(), { planGate: true }) });
+      await until(() => ["recovery_wait", "awaiting_approval", "failed"].some((st) => s.statuses(flight).includes(st)), 90_000);
+      assert.equal(s.gates(flight).length, 0, "the plan was never offered");
+      assert.ok(s.statuses(flight).includes("recovery_wait"), `parked for recovery: ${s.statuses(flight).join(",")}`);
+      assert.ok(!s.statuses(flight).includes("failed"), "non-terminal");
+      assert.equal(api.isApplied(s.runId, row.id), false, "the replayed approve is left for the next claim");
+      api.failInputGets(s.runId, 0);
+      s.send(s.input("cancel"));
+      await s.finish(flight, 3_000);
+    }));
+
+  it("a Codex-shaped executor: a fenced claim ends quietly before any plan is offered", () =>
+    scenario(async (s) => {
+      const { claim } = await unjudgedAfterRelease(s);
+      api.failInputGets(s.runId, 3, 503);
+      api.setInputClaimGeneration(s.runId, 99);
+      api.setInputFenceReason(s.runId, "released");
+      const flight = s.start(claim, { executor: () => new StubExecutor(nullLogger(), { planGate: true }) });
+      await s.finish(flight, 8_000);
+      assert.deepEqual(s.statuses(flight).filter((st) => ["awaiting_approval", "failed", "completed"].includes(st)), [], s.statuses(flight).join(","));
+    }));
 });

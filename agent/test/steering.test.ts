@@ -1939,7 +1939,12 @@ describe("SteeringChannel — plan-gate receipts, round 3 (issue #1604)", () => 
     assert.ok(await settled(() => acked.length >= 1));
     assert.ok(await settled(() => applied.has(6)), "the stale reject is final and applied on its own");
     assert.equal(ch.takeResumedGateEvent(), undefined, "nothing replayed settles the resumed gate");
-    assert.equal(notices.filter((n) => n.startsWith("A plan verdict sent before this plan was shown")).length, 2, notices.join(" | "));
+    // Issue #1604 round 4 (finding 6): the unjudged mode's own notice; "sent before this plan was
+    // shown" could be false when the claim cannot say when its plan was shown.
+    assert.equal(notices.filter((n) => n.startsWith("Could not confirm which plan this verdict was for")).length, 2, notices.join(" | "));
+    // Round 4 (finding 1): the fail-closed window ends only once the replayed backlog is drained AND
+    // the first gate is shown, so the runner's gate waits for delivery before it bumps.
+    await ch.awaitInitialDelivery();
     const epoch = ch.bumpEpoch(); // the runner bumps this claim's first gate
     rows.push({ id: 7, kind: "approve_plan", body: null });
     const v = await ch.awaitGateEvent(epoch);

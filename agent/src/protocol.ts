@@ -1230,10 +1230,13 @@ export interface ClaimResponse {
    *  carries an UNAPPROVED persisted plan (resume_phase "awaiting_approval", or "" with plan_md). The
    *  worker's gate epoch restarts at 0 on every claim, so it cannot tell a replayed
    *  approve/reject/revise written against an earlier plan from one written against this one; a
-   *  replayed gate verdict whose input created_at is strictly before this instant is stale. Absent
-   *  or unparseable on such a claim (an older server, a query error, a tombstoned or redacted plan
-   *  frame), the worker fails closed: every replayed approve/reject read before its first gate is
-   *  stale (SteeringChannel.setReplayCutoff). */
+   *  replayed gate verdict whose input created_at is strictly before this instant (or absent or
+   *  unparseable) is stale. Absent or unparseable on such a claim (an older server, a query error, a
+   *  tombstoned or redacted plan frame), the worker ignores every replayed approve/reject read before
+   *  its replayed backlog is drained and its first gate is shown (SteeringChannel.setReplayCutoff).
+   *  Residual: an api old enough to consume inputs on read (no receipts marker) has already applied
+   *  such an approve when it returned it, so the server still counts it as the human approval; the
+   *  worker only ignores it and posts a notice saying it could not be withdrawn. */
   resume_plan_at?: string;
 }
 

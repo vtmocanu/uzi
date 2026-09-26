@@ -464,7 +464,8 @@ describe("RunRunner — resume phase after a credential switch (PRD #1247 M5b D1
       // replayed approve is stale.
       resume_plan_at: "2026-01-01T00:00:00.000000Z",
     });
-    api.setInputs(claim.run_id, [input("approve_plan")]);
+    // Sent after that plan was shown (created_at past resume_plan_at), so it is judged current.
+    api.setInputs(claim.run_id, [{ ...input("approve_plan"), created_at: "2026-01-02T00:00:00.000000Z" }]);
     await runner(
       new SdkExecutor(nullLogger(), homeDir, { queryFn: doneOnlyQuery(counter) }),
       gitlab,

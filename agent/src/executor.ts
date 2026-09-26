@@ -769,10 +769,10 @@ export interface Executor {
   safety?: CodexExecutionSafety;
   /** Issue #1604: true when run() awaits a resumed claim's pending gate inputs
    * (ctx.takeResumedGateEvent) and may RE-PRESENT its persisted unapproved plan at the gate
-   * (resume_phase "awaiting_approval"). The runner then guards the channel's first read (the
-   * waiting status line) and lets the re-presented gate keep epoch 0. Absent (Codex, stub) ⇒ the
-   * executor never awaits that read and always gates a plan no human has seen on a resumed claim,
-   * so the runner bumps the epoch at its first gate. */
+   * (resume_phase "awaiting_approval"). The runner then lets the re-presented gate keep epoch 0.
+   * Absent (Codex, stub) ⇒ the executor always gates a plan no human has seen on a resumed claim,
+   * so the runner bumps the epoch at its first gate. Either way the runner's gatePlan reads the
+   * replayed backlog before it reports awaiting_approval. */
   readonly resumesAtGate?: boolean;
 }
 

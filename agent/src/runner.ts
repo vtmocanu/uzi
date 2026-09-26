@@ -5037,18 +5037,19 @@ export class RunRunner {
     if (claim.pause_pending) steering.seedPauseRequested(claim.pause_mode);
     // Issue #1604: a resumed claim with an unapproved persisted plan.
     if (claim.plan_approved !== true && !!claim.plan_md?.trim()) {
-      // (D3) An executor that reads the inputs sent before the release before it offers any plan
-      // gets that first read guarded from the start, since the poll begins long before the gate.
-      // One that never awaits it (Codex) gets no waiting line: it offers its plan regardless.
-      if (executor.resumesAtGate === true) steering.guardInitialDelivery();
-      // A replayed gate verdict created before the persisted plan was shown is stale on arrival.
-      // Fail closed when the claim cannot say when that was (the field absent or unparseable):
-      // every replayed approve/reject read before this claim's first gate is stale.
+      // (D3) Every executor reads the inputs sent before the release before any plan is offered
+      // (an SDK claim before it re-presents or revises, any executor at its first gatePlan), so
+      // the first read is guarded from the start: the poll begins long before the gate.
+      steering.guardInitialDelivery();
+      // A replayed gate verdict created before the persisted plan was shown (or with no comparable
+      // created_at) is stale on arrival. Fail closed when the claim cannot say when that was (the
+      // field absent or unparseable): every approve/reject read before the replayed backlog is
+      // drained and this claim's first gate is shown is stale.
       const replayJudged = steering.setReplayCutoff(claim.resume_plan_at);
       // When this claim will not RE-PRESENT the persisted plan (a "" re-plan, or an executor that
       // never re-presents), its first gate shows a plan no human has seen: it bumps the epoch like
       // a revision gate, so a replayed approve/reject still buffered goes stale. So does a claim
-      // whose replayed verdicts cannot be judged: nothing read before its first gate settles it.
+      // whose replayed verdicts cannot be judged: nothing replayed settles its first gate.
       if (!replayJudged || executor.resumesAtGate !== true || claim.resume_phase !== "awaiting_approval")
         this.gatedRuns.add(runId);
     }
@@ -6335,6 +6336,13 @@ export class RunRunner {
         // unchanged. Non-ci_fix and code-plan ci_fix runs keep today's behavior exactly.
         const forceGate = claim.kind === "ci_fix" && isCIConfigPlan(planMd);
         const effectiveAutoApprove = (claim.auto_approve ?? false) && !forceGate;
+        // Issue #1604 (D3): a resumed claim with an unapproved persisted plan reports no
+        // awaiting_approval before the inputs sent before the release are read (the replayed
+        // backlog drained), whatever the executor. A gate shown first would bump the epoch, and a
+        // replayed approve read after it would approve a plan no human saw. Resolves at once once
+        // delivered (an SDK claim already awaited it in takeResumedGateEvent).
+        if (claim.plan_approved !== true && !!claim.plan_md?.trim() && !effectiveAutoApprove)
+          await this.awaitResumedDelivery(runId, steering, batcher, runLog, cancel.signal);
         const verdict = await this.gatePlan(
           runId,
           planMd,
@@ -9530,6 +9538,26 @@ export class RunRunner {
     runLog: Logger,
     signal: AbortSignal | undefined,
   ): Promise<PlanVerdict | undefined> {
+    await this.awaitResumedDelivery(runId, steering, batcher, runLog, signal);
+    const verdict = steering.takeResumedGateEvent();
+    if (verdict?.kind === "revise") this.gatedRuns.add(runId);
+    return verdict;
+  }
+
+  /**
+   * Issue #1604 (D3): wait until a resumed, unapproved claim has read the inputs sent before its
+   * release (the replayed backlog drained). Shared by takeResumedGateEvent and the gatePlan closure,
+   * so no executor offers a plan first: the bounded transient give-up parks the run through the
+   * EXISTING recovery path (TransientRecoveryError), a definitive protocol failure fails it
+   * ("plan-gate input delivery failed: …"), and a fence, switch or cancel propagates as itself.
+   */
+  private async awaitResumedDelivery(
+    runId: string,
+    steering: SteeringChannel,
+    batcher: MessageBatcher,
+    runLog: Logger,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
     try {
       await steering.awaitInitialDelivery(signal);
     } catch (err) {
@@ -9546,9 +9574,6 @@ export class RunRunner {
       });
       throw new TransientRecoveryError(RESUMED_GATE_RECOVERY_REASON);
     }
-    const verdict = steering.takeResumedGateEvent();
-    if (verdict?.kind === "revise") this.gatedRuns.add(runId);
-    return verdict;
   }
 
   /** Post awaiting_approval with the plan and await the steering verdict, bounded.

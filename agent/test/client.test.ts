@@ -608,6 +608,44 @@ describe("input receipts", () => {
   });
 });
 
+// Issue #1604: POST /inputs/discarded settles a claim's own disposed approve_plan rows (disposition
+// superseded): never counted as the human approval, and out of the replay list.
+describe("discardInputs (issue #1604)", () => {
+  beforeEach(() => {
+    api.strictReceiptGenerations = true;
+  });
+
+  it("posts the ids and generation, and the discarded approve leaves the replay list without counting as approval", async () => {
+    const client = newClient();
+    api.setInputClaimGeneration("discard-run", 3);
+    api.setInputs("discard-run", [{ id: 5, kind: "approve_plan", body: null }]);
+    await client.ackInputs("discard-run", [5], 3);
+    const receipt = await client.discardInputs("discard-run", [5], 3);
+    assert.strictEqual(receipt.active, true);
+    assert.deepStrictEqual(receipt.inputs.map((r) => r.id), [5]);
+    assert.deepStrictEqual(api.inputReceiptCalls.at(-1), { runId: "discard-run", kind: "discarded", ids: [5], generation: 3 });
+    assert.deepStrictEqual((await client.getInputs("discard-run")).inputs, [], "out of the replay list");
+    assert.strictEqual(api.humanPlanApproved("discard-run"), false, "not the human approval");
+    assert.strictEqual((await client.discardInputs("discard-run", [5], 3)).active, true, "idempotent");
+  });
+
+  it("maps a non-approve row to 400, a fenced claim to a typed 409, and an api without the route to 404", async () => {
+    const client = newClient();
+    api.setInputClaimGeneration("discard-run", 3);
+    api.setInputs("discard-run", [{ id: 5, kind: "approve_plan", body: null }, { id: 6, kind: "reject_plan", body: "no" }]);
+    await client.ackInputs("discard-run", [5, 6], 3);
+    await assert.rejects(client.discardInputs("discard-run", [5, 6], 3), (err: unknown) => err instanceof RequestError && err.status === 400);
+    api.setInputClaimGeneration("discard-run", 4);
+    api.setInputFenceReason("discard-run", "released");
+    await assert.rejects(
+      client.discardInputs("discard-run", [5], 3),
+      (err: unknown) => err instanceof RequestError && err.status === 409 && JSON.parse(err.body).reason === "released",
+    );
+    api.discardRouteMissing = true;
+    await assert.rejects(client.discardInputs("discard-run", [5], 4), (err: unknown) => err instanceof RequestError && err.status === 404);
+  });
+});
+
 // Issue #1660: the worker rehydrates its operator constraints from the run's already-consumed
 // follow-ups on every claim; the read consumes nothing.
 describe("getConsumedFollowUps (issue #1660)", () => {
