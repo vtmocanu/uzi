@@ -250,6 +250,39 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
     await assert.rejects(git.createOrAttachRunnerClone(bare, 1719), ScratchProvisionError);
   });
 
+  it("accepts an unrelated repository unignore rule while scratch stays ignored", async () => {
+    fs.writeFileSync(path.join(fx.originPath, ".gitignore"), "!README.md\n");
+    gitIn(fx.originPath, ["add", ".gitignore"]);
+    gitIn(fx.originPath, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "unrelated unignore"]);
+    const bare = await git.ensureClone(fx.originPath);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    fs.writeFileSync(path.join(clone.path, ".uzi", "scratch", "artifact.txt"), "artifact");
+    gitIn(clone.path, ["add", "-A"]);
+    assert.equal(gitIn(clone.path, ["diff", "--cached", "--name-only"]), "");
+  });
+
+  it("rejects a crafted local exclude that hides one probe but exposes artifacts", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    const excludePath = path.join(clone.path, ".git", "info", "exclude");
+    fs.writeFileSync(excludePath, "/.uzi/scratch/\n!/.uzi/scratch/\n/.uzi/scratch/.uzi-ignore-probe\n");
+    await assert.rejects(
+      (git as unknown as { provisionRunnerScratch(path: string): Promise<void> }).provisionRunnerScratch(clone.path),
+      ScratchProvisionError,
+    );
+  });
+
+  it("rejects an unwritable scratch directory on single-uid adoption", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    const scratch = path.join(clone.path, ".uzi", "scratch");
+    fs.chmodSync(scratch, 0o500);
+    await assert.rejects(
+      (git as unknown as { provisionRunnerScratch(path: string): Promise<void> }).provisionRunnerScratch(clone.path),
+      ScratchProvisionError,
+    );
+  });
+
   it("rejects a symlinked scratch leaf on revalidation without following it", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const clone = await git.createOrAttachRunnerClone(bare, 1719);

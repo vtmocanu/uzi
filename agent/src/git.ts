@@ -1517,6 +1517,9 @@ export class GitCache {
       if (uidSplitActive() && (rootStat.gid !== RUNNER_UID || (rootStat.mode & required) !== required)) {
         throw new Error("runner clone lacks runner-group write posture");
       }
+      if (!uidSplitActive() && (rootStat.uid !== process.getuid?.() || (rootStat.mode & 0o700) !== 0o700)) {
+        throw new Error("runner clone lacks owner write posture");
+      }
       const ensureDirectory = async (parent: import("node:fs/promises").FileHandle, name: string) => {
         const childPath = fdPath(parent.fd, name);
         let created = false;
@@ -1532,42 +1535,13 @@ export class GitCache {
         if (uidSplitActive() && (stat.gid !== RUNNER_UID || (stat.mode & required) !== required)) {
           throw new Error(`${name} lacks runner-group write posture`);
         }
+        if (!uidSplitActive() && (stat.uid !== process.getuid?.() || (stat.mode & 0o700) !== 0o700)) {
+          throw new Error(`${name} lacks owner write posture`);
+        }
         return child;
       };
       const uzi = await ensureDirectory(root, ".uzi");
       await ensureDirectory(uzi, "scratch");
-
-      // A root or .uzi .gitignore negation can outrank info/exclude for an
-      // arbitrarily named artifact. No finite filename probe proves otherwise.
-      // Refuse such repositories conservatively before the first agent turn.
-      const rejectUnignore = async (parent: import("node:fs/promises").FileHandle): Promise<void> => {
-        let ignore: import("node:fs/promises").FileHandle;
-        try {
-          ignore = await fs.open(fdPath(parent.fd, ".gitignore"), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
-          throw err;
-        }
-        try {
-          if (!(await ignore.stat()).isFile()) throw new Error("gitignore is not a regular file");
-          const maxBytes = 64 * 1024;
-          const data = Buffer.alloc(maxBytes + 1);
-          let used = 0;
-          while (used < data.length) {
-            const { bytesRead } = await ignore.read(data, used, data.length - used, used);
-            if (bytesRead === 0) break;
-            used += bytesRead;
-          }
-          if (used > maxBytes) throw new Error("gitignore exceeds 64 KiB");
-          if (data.toString("utf8", 0, used).split("\n").some((line) => line.startsWith("!"))) {
-            throw new Error("repository unignore rules may expose .uzi/scratch to ordinary staging");
-          }
-        } finally {
-          await ignore.close();
-        }
-      };
-      await rejectUnignore(root);
-      await rejectUnignore(uzi);
 
       // .git is created by the trusted local clone. Hold each directory while opening
       // its child so an agent-writable checkout path cannot redirect the exclude write.
@@ -1602,11 +1576,12 @@ export class GitCache {
       } finally {
         await exclude.close();
       }
-      // Repository .gitignore rules outrank info/exclude. Refuse a checkout that
-      // negates this rule, so ordinary git add -A cannot stage scratch on day one.
-      // Publication refusal remains necessary if an agent later changes ignore rules.
+      // Git will not descend into an ignored directory. Check the directory
+      // itself, rather than one filename a repository could specially ignore
+      // while leaving other artifacts stageable. Publication refusal remains
+      // necessary if an agent later changes the repository's ignore rules.
       try {
-        await this.runGitAsRunner(clonePath, ["check-ignore", "-q", "--no-index", "--", ".uzi/scratch/.uzi-ignore-probe"]);
+        await this.runGitAsRunner(clonePath, ["check-ignore", "-q", "--no-index", "--", ".uzi/scratch/"]);
       } catch {
         throw new Error("repository ignore rules expose .uzi/scratch to ordinary staging");
       }
