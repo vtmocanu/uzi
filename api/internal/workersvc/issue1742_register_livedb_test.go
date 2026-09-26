@@ -9,7 +9,8 @@ import (
 )
 
 // These cases exercise the Register transaction at the requeue limit. They supply
-// snapshot and lease inputs directly; agent-side tests establish their journal provenance.
+// snapshot and lease inputs directly; agent-side tests establish the loaded-journal
+// overflow snapshot, while these seeded lease rows test SQL guards independently.
 // No heartbeat or boot replay can change the transaction result before assertion.
 func TestRegisterPendingOutcomeClassificationLiveDB(t *testing.T) {
 	for _, tc := range []struct {

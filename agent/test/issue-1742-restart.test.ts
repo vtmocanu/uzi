@@ -183,7 +183,10 @@ describe("issue #1742 M1 restart fault probes", () => {
     assert.equal(installed.journaled, true);
     const file = path.join(root, runId, "terminal-5.json");
     assert.deepEqual(await terminalFiles(root, runId), ["terminal-5.json"]);
-    await fsp.writeFile(file, "corrupt authenticated terminal", { mode: 0o600 });
+    const parsed = JSON.parse(await fsp.readFile(file, "utf8")) as Record<string, unknown>;
+    assert.equal(typeof parsed.mac, "string", "precondition: installed journal carries a MAC");
+    parsed.mac = "0".repeat(64);
+    await fsp.writeFile(file, JSON.stringify(parsed), { mode: 0o600 });
     const restarted = makeOutbox(root);
     await restarted.init();
     assert.deepEqual(await terminalFiles(root, runId), ["terminal-5.json"], "physical file survives the restart fault");
