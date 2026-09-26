@@ -148,21 +148,32 @@ describe("recoverable /inputs drain (issue #1673)", () => {
   it("ends the old flight and leaves an ACKed batch to the next claim when the ACK reply is lost across a reclaim", async () => {
     api.setInputClaimGeneration(RUN, 1);
     api.setInputs(RUN, [{ id: 7, kind: "cancel", body: null }]);
-    // Hold the old flight's ACK reply until the claim has moved to generation 2.
+    // The old flight's ACK commits and its reply is lost; the claim moves to generation 2 before
+    // the retry. Move it where the lost reply surfaces, not from a test poll: the steering loop
+    // retries within ~1 ms, so a poll could let the retry land on generation 1 and read active.
     api.loseNextInputReceiptReply("ack");
     const oldCancel = new AbortController();
     const oldClient = clientLosingGets(0);
     const ack = oldClient.ackInputs.bind(oldClient);
     const ackReplies: boolean[] = [];
+    let reclaimed = false;
     oldClient.ackInputs = async (...args: Parameters<WorkerClient["ackInputs"]>) => {
-      const reply = await ack(...args);
+      let reply;
+      try {
+        reply = await ack(...args);
+      } catch (err) {
+        if (!reclaimed) {
+          reclaimed = true;
+          api.setInputClaimGeneration(RUN, 2);
+        }
+        throw err;
+      }
       ackReplies.push(reply.active);
       return reply;
     };
     const old = channel(oldClient, 1, oldCancel);
-    await until(() => api.inputReceiptCalls.length >= 1);
-    api.setInputClaimGeneration(RUN, 2);
     await until(() => ackReplies.length >= 1);
+    assert.ok(reclaimed, "the first ACK reply was lost");
     assert.deepStrictEqual(ackReplies, [false], "the retried ACK reports the old claim inactive");
     await until(() => oldCancel.signal.aborted);
     assert.strictEqual((oldCancel.signal.reason as Error).name, "ClaimFencedSignal", "the superseded flight ends");
