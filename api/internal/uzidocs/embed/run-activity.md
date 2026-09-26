@@ -262,7 +262,7 @@ at a plan gate is never applied because you **reject** the plan instead of
 approving it, or the run stops (it finishes, pauses, or hits its scope
 ceiling) before the follow-up's turn comes. A crash is not silent for
 long — a stalled agent trips the [`stalled` health flag](./run-health.md) —
-and the fix in every case is the same: send it again.
+and the fix is to send it again (for a run that has finished, in a new run or an MR rework).
 
 The queue stays visible, read-only, after the run finishes — so a
 "Not delivered — run finished" input doesn't just vanish.
