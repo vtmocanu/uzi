@@ -93,14 +93,45 @@ export function LastRunOutcome({
   );
 }
 
+// ineligibleMatched is the count of selector-matching issues the fire could not run
+// because they are not eligible (issue #1543), or 0. Absent/null is UNKNOWN (an older
+// fire, or a non-label sweep), not zero, so only a positive count is reported. The one
+// predicate both the list cell's badge and the detail panel's note read (issue #1727).
+function ineligibleMatched(fire: LastFire): number {
+  return typeof fire.ineligible_matched === "number" && fire.ineligible_matched > 0
+    ? fire.ineligible_matched
+    : 0;
+}
+
 // OutcomeBadge is the one-line verdict shown in the list cell: green when a fire
-// started runs, amber when it fired but started nothing (skips only), neutral for
-// an empty-label sweep that matched nothing (a legitimate outcome, not an error).
+// started runs, amber when it fired but started nothing (starved or skipped), neutral
+// for an empty-label sweep that matched nothing (a legitimate outcome, not an error).
+//
+// Issue #1727: a sweep whose selector matched only ineligible issues started nothing
+// yet has no candidates to skip, so it used to read the neutral "matched 0", the same as
+// a sweep that matched nothing at all. When nothing started, the badge names every reason
+// it has: skips and ineligible matches can each need the owner (an ineligible issue never
+// runs until it is labelled or assigned; an amber skip such as no_usable_credential never
+// clears until a credential is repaired), so neither count may hide the other.
 function OutcomeBadge({ fire }: { fire: LastFire }) {
   if (fire.started.length > 0) {
     return (
       <Badge tone="ok" dot>
         {fire.started.length} started
+      </Badge>
+    );
+  }
+  const ineligible = ineligibleMatched(fire);
+  if (ineligible > 0) {
+    return (
+      <Badge
+        tone="warning"
+        dot
+        title={`${ineligible} open ${ineligible === 1 ? "issue matches" : "issues match"} the selector but ${ineligible === 1 ? "isn't" : "aren't"} eligible`}
+      >
+        {fire.skips.length > 0
+          ? `0 started · ${fire.skips.length} skipped · ${ineligible} not eligible`
+          : `0 started · ${ineligible} not eligible`}
       </Badge>
     );
   }
@@ -131,7 +162,6 @@ function OutcomeBadge({ fire }: { fire: LastFire }) {
 export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
   const { uziLabel } = useAuth();
   const good = fire.started.length > 0;
-  const skippedOnly = fire.started.length === 0 && fire.skips.length > 0;
   // A pause-all fire (PRD #1093): the owner's user-level switch was on when this fire came
   // due, so the fire matched but started nothing and its only skip(s) carry the
   // schedules_paused reason. It gets one explanatory row instead of a per-candidate list —
@@ -147,14 +177,13 @@ export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
   // how many runs one fire can start, so the copy no longer suggests it (issue #1543).
   // Rendered ONLY under exactly that condition.
   const showHint = fire.capped && fire.skips.length > 0 && fire.started.length === 0;
-  // Selector-matching issues that are not eligible (issue #1543). Absent/null is UNKNOWN
-  // (an older fire, or a non-label sweep), not zero, so only a positive count renders. It
-  // renders independently of the candidate list: a zero-candidate "matched 0" fire is
-  // exactly where it explains why nothing ran.
-  const ineligible =
-    typeof fire.ineligible_matched === "number" && fire.ineligible_matched > 0
-      ? fire.ineligible_matched
-      : 0;
+  // Selector-matching issues that are not eligible (issue #1543); see ineligibleMatched.
+  // It renders independently of the candidate list: a zero-candidate fire is exactly where
+  // it explains why nothing ran.
+  const ineligible = ineligibleMatched(fire);
+  // Nothing started although the fire had skipped candidates or ineligible matches: the
+  // header reads amber, not the neutral "matched 0" of a genuinely empty sweep (#1727).
+  const startedNothing = !good && (fire.skips.length > 0 || ineligible > 0);
   // Anything rendered between the tally and the note (candidate rows, the paused row, the
   // cap hint — all imply started or skips) earns the note a top margin.
   const hasBody = fire.started.length > 0 || fire.skips.length > 0;
@@ -175,7 +204,7 @@ export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
             <Badge tone="ok" dot>
               {fire.started.length} started
             </Badge>
-          ) : skippedOnly ? (
+          ) : startedNothing ? (
             <Badge tone="warning" dot>
               started nothing
             </Badge>

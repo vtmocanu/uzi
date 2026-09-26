@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Five run and schedule states now display correctly in the web UI and CLI ([#1727](https://github.com/vtmocanu/uzi/issues/1727)).**
+  A failed run start on the issue page keeps its error instead of clearing it on reload. A paused run's "Paused by you at" time and elapsed time, and the CLI's parked ages, come from when the run entered its status (the run now exposes `status_since`), so an extend no longer shifts them. Runs parked on a usage limit or an empty token pool show as waiting in the activity feed, not idle. Judge rationale loads again after collapsing a row mid-fetch. A sweep whose matches were all ineligible shows as starved instead of "matched 0".
+
 - **A run whose subagent is busy is no longer flagged stalled while its parent `Agent` call is still open ([#1394](https://github.com/vtmocanu/uzi/issues/1394)).**
   The stalled check's "a tool call is in flight" suppression now reads the lead's own tool calls instead of the newest call across every lane, so a subagent's completed calls no longer hide the lead's open dispatch; an unmatched lead call from an earlier claim or query leg no longer counts once a newer init or result marks that leg's boundary.
 

@@ -344,6 +344,8 @@ export const runsApi = {
       finished_at: null,
       created_at: now,
       updated_at: now,
+      // Issue #1727: a new run enters its first status at creation.
+      status_since: now,
     };
     state.runs.set(run.id, run);
     startNewRun(run.id);
@@ -422,6 +424,8 @@ export const runsApi = {
       finished_at: null,
       created_at: now,
       updated_at: now,
+      // Issue #1727: a new run enters its first status at creation.
+      status_since: now,
     };
     state.runs.set(run.id, run);
     startNewRun(run.id);
@@ -658,6 +662,8 @@ export const runsApi = {
       finished_at: null,
       created_at: now,
       updated_at: now,
+      // Issue #1727: a new run enters its first status at creation.
+      status_since: now,
     };
     state.runs.set(newRun.id, newRun);
     return delay({ run: { ...newRun } }, 80);

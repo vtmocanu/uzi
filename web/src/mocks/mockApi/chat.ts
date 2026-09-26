@@ -114,6 +114,8 @@ export const chatApi = {
       finished_at: null,
       created_at: now,
       updated_at: now,
+      // Issue #1727: a new run enters its first status at creation.
+      status_since: now,
     };
     state.runs.set(run.id, run);
     state.messages.set(run.id, []);
@@ -149,6 +151,8 @@ export const chatApi = {
       finished_at: null,
       created_at: now,
       updated_at: now,
+      // Issue #1727: a new run enters its first status at creation.
+      status_since: now,
     };
     state.runs.set(run.id, run);
     state.messages.set(run.id, []);

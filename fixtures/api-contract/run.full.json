@@ -141,6 +141,7 @@
   "finished_at": "2020-01-02T03:04:05Z",
   "created_at": "2020-01-02T03:04:05Z",
   "updated_at": "2020-01-02T03:04:05Z",
+  "status_since": "2020-01-02T03:04:05Z",
   "repo_agents": [
     {
       "name": "x",

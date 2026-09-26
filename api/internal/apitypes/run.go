@@ -511,6 +511,14 @@ type RunDTO struct {
 	FinishedAt        *time.Time `json:"finished_at"`
 	CreatedAt         time.Time  `json:"created_at"`
 	UpdatedAt         time.Time  `json:"updated_at"`
+	// StatusSince is when the run entered its CURRENT status (runs.status_since, stamped
+	// only by the statements that assign runs.status). The column is backfilled and NOT
+	// NULL (migration 00163_run_status_since.sql), so a current server always sends a
+	// timestamp; the pointer is null only defensively, and an older server omits the key.
+	// Clients fall back to updated_at when it is absent or null. updated_at keeps its
+	// "row changed at all" meaning, which drifts on unrelated writes. Distinct from
+	// pause_requested_at, which is a PENDING pause request, not the pause-entry instant.
+	StatusSince *time.Time `json:"status_since"`
 	// Per-run agent selection (PRD #37). RepoAgents is the roster the worker
 	// detected in the clone's .claude/agents/: null when no worker ever reported
 	// (a pre-feature run), `[]` when detection ran and found none. The plan gate

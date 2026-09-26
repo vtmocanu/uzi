@@ -469,16 +469,29 @@ func holdReasonLabel(reason string) string {
 	}
 }
 
-// holdParkedClause renders "parked HH:MM (dur)" from the run's status timestamp (updated_at,
-// stamped at the park), the hold-row twin of pauseSinceClause — same UTC derivation and the same
-// two-unit duration in parens (fmtUntil), worded "parked" for a hold rather than "since" for an
-// owner pause. A negative elapsed (clock skew) floors to 0s.
+// holdParkedClause renders "parked HH:MM (dur)" from the instant the run entered its current
+// status (statusEnteredAt: status_since, else updated_at), the hold-row twin of
+// pauseSinceClause — same UTC derivation and the same two-unit duration in parens
+// (fmtUntil), worded "parked" for a hold rather than "since" for an owner pause. A negative
+// elapsed (clock skew) floors to 0s.
 func holdParkedClause(r apitypes.RunDTO, now time.Time) string {
-	d := now.Sub(r.UpdatedAt)
+	at := statusEnteredAt(r)
+	d := now.Sub(at)
 	if d < 0 {
 		d = 0
 	}
-	return "parked " + r.UpdatedAt.UTC().Format("15:04") + " (" + fmtUntil(d) + ")"
+	return "parked " + at.UTC().Format("15:04") + " (" + fmtUntil(d) + ")"
+}
+
+// statusEnteredAt is when the run entered its current status: status_since when the server
+// sent it, else updated_at (an older server omits status_since). updated_at alone is the
+// wrong anchor on a current server because any unrelated write to the row moves it
+// (issue #1727), so a park would read as younger than it is.
+func statusEnteredAt(r apitypes.RunDTO) time.Time {
+	if r.StatusSince != nil {
+		return *r.StatusSince
+	}
+	return r.UpdatedAt
 }
 
 // limitWaitRows is the usage-limit park block of `uzi run get` (PRD #35), split out
@@ -560,17 +573,18 @@ func pausedSummary(r apitypes.RunDTO, now time.Time) string {
 	return strings.Join(clauses, " · ")
 }
 
-// pauseSinceClause renders "since <hh:mm> (<dur>)" from the run's status timestamp
-// (updated_at, stamped at the park by SetRunPaused). UTC, so the clock reads
+// pauseSinceClause renders "since <hh:mm> (<dur>)" from the instant the run entered its
+// current status (statusEnteredAt: status_since, else updated_at). UTC, so the clock reads
 // deterministically and matches the CLI's other timestamp rows; the duration in parens is
 // the load-bearing part and disambiguates a pause that spans a day. A negative elapsed
 // (clock skew) floors to 0s.
 func pauseSinceClause(r apitypes.RunDTO, now time.Time) string {
-	d := now.Sub(r.UpdatedAt)
+	at := statusEnteredAt(r)
+	d := now.Sub(at)
 	if d < 0 {
 		d = 0
 	}
-	return "since " + r.UpdatedAt.UTC().Format("15:04") + " (" + fmtUntil(d) + ")"
+	return "since " + at.UTC().Format("15:04") + " (" + fmtUntil(d) + ")"
 }
 
 // pauseCheckpointClause renders "checkpoint <age> ago" from checkpoint_tip_at, or "" when no

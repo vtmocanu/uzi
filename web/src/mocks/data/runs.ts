@@ -1890,7 +1890,10 @@ export const mockRuns: Run[] = [
     started_at: minsAgo(222),
     finished_at: null,
     created_at: minsAgo(223),
-    // Paused 2h40m ago — status_since on the wire, which the elapsed + panel heading read.
-    updated_at: minsAgo(160),
+    // Paused 2h40m ago: status_since, which the run-list elapsed and the panel heading read
+    // (issue #1727). updated_at is later on purpose: an unrelated write after the pause moved
+    // it, so reading updated_at as the pause instant would show "paused 20m" and the wrong time.
+    status_since: minsAgo(160),
+    updated_at: minsAgo(20),
   },
 ];

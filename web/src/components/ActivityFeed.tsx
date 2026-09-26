@@ -263,6 +263,11 @@ function crewStateFor(
     // stopped between turns awaiting the user's next follow-up and nothing else can
     // proceed — so it joins the gate arm rather than aging every lane to `idle`.
     run.status === "awaiting_followup" ||
+    // Issue #1727: a usage-limit park (limit_wait) and an auto-lane pool park (pool_wait)
+    // stop the whole crew until the limit resets or a credential frees up — no lane is
+    // working, and aging them to `idle` would read as a dead run rather than a parked one.
+    run.status === "limit_wait" ||
+    run.status === "pool_wait" ||
     run.health === "waiting_worker"
   )
     return "waiting";

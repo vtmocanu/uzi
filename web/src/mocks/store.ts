@@ -51,25 +51,32 @@ export interface MockState {
   vaultUnlocked: boolean;
 }
 
+// seedRun copies a fixture into the store with status_since defaulted to the fixture's own
+// value, else its updated_at: the same backfill the issue #1727 migration applied to existing
+// rows, so every stored run carries the field a current server always sends.
+function seedRun(r: Run): Run {
+  return { ...r, status_since: r.status_since ?? r.updated_at };
+}
+
 function seed(): MockState {
   const runs = new Map<string, Run>();
-  for (const r of mockRuns) runs.set(r.id, { ...r });
+  for (const r of mockRuns) runs.set(r.id, seedRun(r));
   // Chat conversations ride the same run + message maps (PRD #39).
-  for (const r of mockChatRuns) runs.set(r.id, { ...r });
+  for (const r of mockChatRuns) runs.set(r.id, seedRun(r));
   // Crew-roster demo runs (PRD #95 M2): health-varied so every crew state renders.
-  for (const r of mockCrewRuns) runs.set(r.id, { ...r });
+  for (const r of mockCrewRuns) runs.set(r.id, seedRun(r));
   // PRD #99 instance-lane demo runs: the only fixtures carrying a non-null
   // agent_instance, so they are the only ones that render the By-agent lane view as
   // anything other than legacy role lanes.
-  for (const r of mockLaneRuns) runs.set(r.id, { ...r });
+  for (const r of mockLaneRuns) runs.set(r.id, seedRun(r));
   // Generated terminal history (ux-tweaks item 3): what makes the runs page's date
   // grouping + "Show 50 more" reveal exhibitable. The distinct run-hist- prefix
   // cannot collide with a hand-written fixture id.
-  for (const r of mockHistoryRuns) runs.set(r.id, { ...r });
+  for (const r of mockHistoryRuns) runs.set(r.id, seedRun(r));
   // Other users' active runs (ux-tweaks amendment 2): in state.runs so an admin can
   // open them, but owned by other demo users — mockApi excludes them from the
   // caller-scoped listRuns/runsInProgressCount via mockOtherRunOwners.
-  for (const r of mockOtherUserRuns) runs.set(r.id, { ...r });
+  for (const r of mockOtherUserRuns) runs.set(r.id, seedRun(r));
   const messages = new Map<string, RunMessage[]>();
   messages.set("run-crew", mockCrewMessages.map((m) => ({ ...m })));
   messages.set("run-lanes", mockLaneMessages.map((m) => ({ ...m })));
@@ -299,7 +306,17 @@ const RUN_VIEW_REFRESH_FIELDS: readonly (keyof Run)[] = [
 export function patchRun(runId: string, patch: Partial<Run>): Run | undefined {
   const run = state.runs.get(runId);
   if (!run) return undefined;
-  const next = { ...run, ...patch, updated_at: new Date().toISOString() };
+  const now = new Date().toISOString();
+  // Issue #1727: status_since moves only on a real status transition, to the same instant as
+  // updated_at; any other write (an extend, a milestone freeze) keeps it, as the server does.
+  // An explicit status_since in the patch wins.
+  const statusChanged = "status" in patch && patch.status !== run.status;
+  const next: Run = {
+    ...run,
+    ...patch,
+    updated_at: now,
+    status_since: "status_since" in patch ? patch.status_since : statusChanged ? now : run.status_since,
+  };
   state.runs.set(runId, next);
   syncCards(runId, patch);
   // Broadcast a "state" frame when any refresh-worthy field actually changed. The frame

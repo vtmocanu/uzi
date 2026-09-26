@@ -55,6 +55,7 @@ import { activityAge, latestActivity } from "../lib/runActivity";
 import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
 import { useRunStream } from "../lib/useRunStream";
 import { deriveRunUsage } from "../lib/runUsage";
+import { statusSinceIso } from "../lib/statusSince";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
 import { RecoveryArchivesPanel } from "../components/RecoveryArchives";
 import { RunIssueRef } from "../components/RunIssueRef";
@@ -173,14 +174,15 @@ function RunBudgetElapsed({ run }: { run: Run }) {
 // PRD #1189/#1190: a paused run's elapsed. The clock is stopped, so it is a STATIC span, not a
 // ticker: the frozen used time over the budget, then how much of the budget remains when the run
 // resumes (the deadline itself is omitted — it moves with the pause). A run with no wall budget
-// keeps today's plain "· clock stopped" line.
+// keeps today's plain "· clock stopped" line, measured from started_at to when the pause landed
+// (status_since, issue #1727, with the updated_at fallback; the same instant PausedPanel shows).
 function PausedElapsed({ run }: { run: Run }) {
   if (!run.started_at) return null;
   const view = extendBudgetView(run, Date.now());
   if (!view) {
     return (
       <span className="text-xs tabular-nums text-faint">
-        {formatDuration(Date.parse(run.updated_at) - Date.parse(run.started_at))} · clock stopped
+        {formatDuration(Date.parse(statusSinceIso(run)) - Date.parse(run.started_at))} · clock stopped
       </span>
     );
   }
@@ -1110,9 +1112,10 @@ export function PausedPanel({
   // cover it.
   if (run.status !== "paused" || run.hold_reason === "completion_blocked") return null;
 
-  // The pause landed when the run entered the state; updated_at is status_since on the
-  // wire. Rendered as a local wall-clock time ("11:02"), matching the mock heading.
-  const pausedMs = Date.parse(run.updated_at);
+  // The pause landed when the run entered the state: status_since (issue #1727), falling back to
+  // updated_at only when it is absent/null/unparseable (updated_at moves on unrelated writes such
+  // as an extend). Rendered as a local wall-clock time ("11:02"), matching the mock heading.
+  const pausedMs = Date.parse(statusSinceIso(run));
   const pausedAt = Number.isFinite(pausedMs)
     ? new Date(pausedMs).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })
     : null;

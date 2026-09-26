@@ -491,6 +491,9 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		v := int(r.ScopeCeiling.Int32)
 		dto.ScopeCeiling = &v
 	}
+	// Issue #1727: when the run entered its current status (runs.status_since), so a client
+	// can age a park from the entry instant instead of updated_at, which drifts on any write.
+	dto.StatusSince = timePtr(r.StatusSince.Valid, r.StatusSince.Time)
 	// PRD #1190 M1: the pending-pause flag columns (owner intent) and the server-decided
 	// pause boundary the worker honors on the running-report ACK. checkpoint_tip_at is not
 	// owner-gated (just a timestamp). PauseRequested is computed by the ONE boundary rule
