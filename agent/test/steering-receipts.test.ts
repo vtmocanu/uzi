@@ -296,7 +296,8 @@ describe("plan-gate replay edges (issue #1604 round 4)", () => {
     api.setInputs(RUN, [{ id: 5, kind: "approve_plan", body: null }]);
     const first = gateChannel(1);
     first.ch.start();
-    await until(() => api.isAcked(RUN, 5));
+    // As the runner does: the replayed backlog is routed (at epoch 0) before any gate bumps.
+    await first.ch.awaitInitialDelivery();
     const epoch = first.ch.bumpEpoch(); // a re-gate: the approve is stale
     assert.equal(await settlesWithin(first.ch.awaitGateEvent(epoch), 50), false);
     await until(() => api.isDiscarded(RUN, 5));
