@@ -5225,6 +5225,46 @@ describe("SdkExecutor provider-transient error handling (issue #1088)", () => {
     );
   });
 
+  // issue #1401: a present api_error_status decides on its own, even with NO terminal_reason
+  // (matching materialize's `isApiError`); a status-less failure still needs api_error.
+  const noReasonResult = (status: number | null, text: string): SDKMessage =>
+    ({
+      type: "result",
+      subtype: "success",
+      is_error: true,
+      api_error_status: status,
+      result: text,
+      session_id: "s",
+    }) as unknown as SDKMessage;
+
+  it("parks (TransientRecoveryError) on a 529 carrying NO terminal_reason (issue #1401)", async () => {
+    const { queryFn } = fakeTurns([[noReasonResult(529, OVERLOADED_529)]]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 0)).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+  });
+
+  it("does NOT park a permanent 401 carrying NO terminal_reason — it fails, labelled 401 (issue #1401)", async () => {
+    const { queryFn } = fakeTurns([[noReasonResult(401, "API Error: 401 Unauthorized")]]);
+    const err = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 2)).run(makeCtx().ctx),
+    );
+    assert.ok(err instanceof Error, "a 401 is a genuine failure");
+    assert.ok(!(err instanceof TransientRecoveryError), "a permanent 401 is NEVER parked");
+    assert.ok(!(err instanceof ProviderTransientError), "a permanent 401 is not classified transient");
+    assert.match(err.message, /401/, "the failure names the status");
+  });
+
+  it("does NOT park a status-less failure carrying NO terminal_reason (issue #1401)", async () => {
+    const { queryFn } = fakeTurns([[noReasonResult(null, "")]]);
+    const err = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 2)).run(makeCtx().ctx),
+    );
+    assert.ok(!(err instanceof TransientRecoveryError), "a status-less non-api_error failure is never parked");
+    assert.ok(!(err instanceof ProviderTransientError), "nor classified provider-transient");
+  });
+
   it("pins limit-over-transient precedence: a limit-bearing transient 529 throws LimitReachedError, never a provider-transient park", async () => {
     // The `!limitFacts &&` guard in driveTurn is load-bearing HERE: this terminal is
     // SIMULTANEOUSLY a genuine provider-transient (terminal_reason:"api_error",

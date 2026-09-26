@@ -4,7 +4,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { FakeApi } from "./fake-api.js";
 import { makeClaim, nullLogger } from "./helpers.js";
-import { WorkerClient, RequestError, isTransient } from "../src/client.js";
+import { WorkerClient, RequestError, isTransient, isTransientStatus } from "../src/client.js";
 import { MessageBatcher } from "../src/batcher.js";
 
 const TOKEN = "worker-join-token-0123456789";
@@ -769,6 +769,17 @@ describe("isTransient", () => {
     assert.strictEqual(isTransient(new RequestError("POST", "/x", 404, "")), false);
     assert.strictEqual(isTransient(new Error("network down")), true);
   });
+});
+
+describe("isTransientStatus", () => {
+  for (const [status, want] of [
+    [500, true], [503, true], [529, true], [429, true], [408, true],
+    [400, false], [401, false], [403, false], [404, false], [413, false],
+  ] as const) {
+    it(`${status} → ${want}`, () => {
+      assert.strictEqual(isTransientStatus(status), want);
+    });
+  }
 });
 
 // Chat agent read surface (PRD #39 M3): the four worker-authenticated endpoints the

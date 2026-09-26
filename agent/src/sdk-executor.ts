@@ -87,7 +87,7 @@ import { PauseNowSignal, CredentialSwitchSignal, PLAN_APPROVAL_TIMEOUT_REASON, t
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { buildForgeToolsServer, FORGE_SERVER_NAME } from "./forge-tools.js";
 import { buildFindingsToolsServer, FINDINGS_SERVER_NAME } from "./findings-tools.js";
-import type { WorkerClient } from "./client.js";
+import { isTransientStatus, type WorkerClient } from "./client.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
@@ -304,11 +304,14 @@ function foreignCliTermination(err: Error): string | undefined {
  * issue #1088: whether a FAILED terminal is a TRANSIENT provider error that should be
  * retried and, on a sustained outage, PARKED (recovery_wait) rather than terminal-failed.
  *
- * A guarded AND, deliberately NOT an OR: it requires `terminal_reason === "api_error"`
- * AND a retryable status. Permanent api errors (401/403/400) are `api_error` too, so an
- * OR — or dropping the status guard — would park them forever in the uncapped recovery
- * park. Mirrors client.ts's `isTransient` (transport/network, 408, 429, ≥500 incl. 529);
- * a status-less api_error is a transport/network failure and is retryable.
+ * A present HTTP status decides on its own, whatever `terminal_reason` says (issue #1401):
+ * the SDK can report a 529 with no `terminal_reason`, and materialize already treats
+ * `terminal_reason === "api_error" || apiErrorStatus != null` as an api error. The status
+ * still goes through `isTransientStatus` (client.ts: 408, 429, >=500 incl. 529), so a
+ * permanent 401/403/400 is never parked forever in the uncapped recovery park. Only a
+ * status-less failure falls back to `terminal_reason === "api_error"`: that is a
+ * transport/network failure and retryable, while a status-less failure without it is not
+ * a provider error at all.
  *
  * Module-private (used only by driveTurn); the 529/401 behavior is proven end-to-end
  * through `run()` in the tests rather than by a direct predicate call.
@@ -316,11 +319,7 @@ function foreignCliTermination(err: Error): string | undefined {
 function isProviderTransient(t: HarnessTerminal): boolean {
   return (
     t.outcome === "failed" &&
-    t.terminalReason === "api_error" &&
-    (t.apiErrorStatus == null ||
-      t.apiErrorStatus === 408 ||
-      t.apiErrorStatus === 429 ||
-      t.apiErrorStatus >= 500)
+    (t.apiErrorStatus != null ? isTransientStatus(t.apiErrorStatus) : t.terminalReason === "api_error")
   );
 }
 
@@ -3582,7 +3581,7 @@ export class SdkExecutor implements Executor {
         // a status-less transport api_error) is thrown as a ProviderTransientError so the
         // recovery wrapper retries it and, on a sustained outage, PARKS via recovery_wait
         // instead of terminal-failing. Permanent api errors (401/403/400) fail through
-        // materialize as before (isProviderTransient's status guard excludes them).
+        // materialize as before (isProviderTransient's isTransientStatus check excludes them).
         if (!limitFacts && isProviderTransient(terminal)) {
           throw new ProviderTransientError(
             providerErrorMessage(terminal.apiErrorStatus, terminal.resultText),
