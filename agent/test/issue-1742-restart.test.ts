@@ -47,7 +47,7 @@ async function terminalFiles(root: string, runId: string): Promise<string[]> {
   return names.filter((name) => /^terminal-[0-9]+[.]json$/.test(name)).sort();
 }
 
-async function registerAfterRestart(outbox: Outbox): Promise<ActiveSnapshot | undefined> {
+async function registerAfterRestart(outbox: Outbox, withRegistry = true): Promise<ActiveSnapshot | undefined> {
   let sent: ActiveSnapshot | undefined;
   const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 0);
   const client = {
@@ -65,7 +65,7 @@ async function registerAfterRestart(outbox: Outbox): Promise<ActiveSnapshot | un
     () => ({ ok: true, missing: [] }),
     outbox,
     new Map(),
-    registry,
+    withRegistry ? registry : undefined,
   );
   await (worker as unknown as { registerWithRetry(signal: AbortSignal): Promise<void> })
     .registerWithRetry(new AbortController().signal);
@@ -110,7 +110,10 @@ describe("issue #1742 M1 restart fault probes", () => {
     }).execute(claim);
 
     try {
-      await entered;
+      await Promise.race([
+        entered,
+        new Promise<void>((_, reject) => setTimeout(() => reject(new Error("terminal write seam was not reached")), 5_000)),
+      ]);
       assert.equal(executorReturned, true, "the real executor returned before the terminal write");
       const disk = await terminalFiles(root, claim.run_id);
       const restarted = makeOutbox(root);
@@ -165,5 +168,26 @@ describe("issue #1742 M1 restart fault probes", () => {
     assert.deepEqual(heartbeat.active, [], "cap zero cannot list a pending entry");
     assert.equal(heartbeat.pending_overflow, true);
     assert.equal(registry.claimsPausedByPendingOverflow(), true);
+    assert.equal(await registerAfterRestart(restarted, false), undefined,
+      "an injected missing active registry loses register protection despite a loaded journal");
+  });
+
+  it("keeps a physical journal visible when restart authentication rejects it", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "issue-1742-unloaded-"));
+    roots.push(dir);
+    const root = path.join(dir, "outbox");
+    const outbox = makeOutbox(root);
+    await outbox.init();
+    const runId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const installed = await outbox.journalTerminal(runId, 5, "running", 0, { status: "completed" });
+    assert.equal(installed.journaled, true);
+    const file = path.join(root, runId, "terminal-5.json");
+    assert.deepEqual(await terminalFiles(root, runId), ["terminal-5.json"]);
+    await fsp.writeFile(file, "corrupt authenticated terminal", { mode: 0o600 });
+    const restarted = makeOutbox(root);
+    await restarted.init();
+    assert.deepEqual(await terminalFiles(root, runId), ["terminal-5.json"], "physical file survives the restart fault");
+    assert.deepEqual(restarted.listPendingTerminals(), [], "corrupt journal was not authenticated or loaded");
+    assert.equal(await registerAfterRestart(restarted), undefined, "unloaded journal gives Register no snapshot");
   });
 });
