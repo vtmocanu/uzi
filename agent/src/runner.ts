@@ -1698,25 +1698,36 @@ export class RunRunner {
       // registers the committed terminal callback, however, the pushed branch/open MR is the
       // authoritative outcome and must be reported after the boundary releases.
       let postFinalizeTerminal: (() => Promise<void>) | undefined;
-      try {
-        await this.withCodexBoundaryOnly(
-          executor,
-          { boundary: "finalize", deadlineMs: this.codexBoundaryDeadlineMs },
-          (permit) => this.phasePublish(
-            claim,
-            flight,
-            permit?.signal,
-            executor.safety
-              ? (report) => { postFinalizeTerminal = report; }
-              : undefined,
-          ),
-        );
-      } catch (err) {
-        if (!postFinalizeTerminal || !isCodexBoundaryError(err)) throw err;
-        runLog.warn(
-          "Codex finalize boundary failed after committed publish; reporting committed terminal outcome",
-          { error: errMessage(err) },
-        );
+      if (flight.result?.pausedAt) {
+        // Issue #1764: an owner-pause PARKED the run (handlePausePark reported `paused`), so
+        // phasePublish takes its pausedAt early return and finalizes nothing. Call it OUTSIDE the
+        // Codex finalize boundary: that boundary's per-sink credential reconcile
+        // (refreshCodex/releaseCodex) is refused by the server once the run is `paused` (not an
+        // actively-claimed status), which would fail a durably parked run. The finally's terminal
+        // safety.dispose still tears the Codex registry down. For Claude/stub the boundary wrapper
+        // is a plain call, so this path is unchanged for them.
+        await this.phasePublish(claim, flight, undefined, undefined);
+      } else {
+        try {
+          await this.withCodexBoundaryOnly(
+            executor,
+            { boundary: "finalize", deadlineMs: this.codexBoundaryDeadlineMs },
+            (permit) => this.phasePublish(
+              claim,
+              flight,
+              permit?.signal,
+              executor.safety
+                ? (report) => { postFinalizeTerminal = report; }
+                : undefined,
+            ),
+          );
+        } catch (err) {
+          if (!postFinalizeTerminal || !isCodexBoundaryError(err)) throw err;
+          runLog.warn(
+            "Codex finalize boundary failed after committed publish; reporting committed terminal outcome",
+            { error: errMessage(err) },
+          );
+        }
       }
       // Once a branch push or MR creation succeeds, its terminal record is irreversible
       // bookkeeping for an already-committed forge side effect. Deliver it only after the
@@ -3204,10 +3215,11 @@ export class RunRunner {
     // flushed it) and return. Keyed on the result the executor returned so a non-pause path can
     // never reach this branch.
     if (result.pausedAt) {
-      // PRD #1171 m4: needs NO own permit — for a Codex run this whole phasePublish already
-      // runs INSIDE the finalize withBoundary (executeClaim wraps the call), and this line is a
-      // no-op for Codex (its executor implements no killAgentTree and never sets pausedAt); for
-      // Claude it is the literal legacy reap, byte-unchanged.
+      // PRD #1171 m4: needs NO own permit. Issue #1764: a Codex executor now sets pausedAt, and
+      // executeClaim then calls phasePublish directly, BYPASSING the finalize withBoundary (its
+      // credential reconcile is refused once the run is `paused`); the runner's terminal
+      // safety.dispose tears the registry down. This line is a no-op for Codex (its executor
+      // implements no killAgentTree); for Claude it is the literal legacy reap, byte-unchanged.
       executor.killAgentTree?.();
       await closeBatcher().catch(() => undefined);
       runLog.info("run parked on an owner-requested pause; skipping finalization", {

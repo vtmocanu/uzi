@@ -761,6 +761,40 @@ describe("RunRunner m4 — credential-free sinks mint NO permit", () => {
     }
   });
 
+  // Issue #1764: a Codex run that PARKED on an owner pause returns pausedAt. phasePublish finalizes
+  // nothing for it, and it must run OUTSIDE the finalize boundary: that boundary's per-sink
+  // credential reconcile (refreshCodex/releaseCodex) is refused by the server once the run is
+  // `paused`, which would fail a durably parked run. The terminal registry dispose still runs.
+  it("(T11) a Codex run parked on an owner pause bypasses the finalize boundary: no permit, no reconcile, no push/MR, no terminal report; terminal dispose still runs", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const restore = spyPublishLands();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1764-pause-"));
+    try {
+      const rig = codexRig({ authMode: "subscription" });
+      let parkedResult: boolean | undefined;
+      const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+        commitInTree(ctx.worktreePath, "WORK.txt", "work before the pause\n");
+        const at = { completedCount: 1, total: 2 };
+        parkedResult = await ctx.parkForPause?.(at);
+        return parkedResult ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
+      });
+      const claim = gitlabClaim(1222);
+      await runnerWith(() => ({ executor: exec, homeDir: path.join(homeRoot, "h") }), gitlab).execute(claim);
+      assert.equal(parkedResult, true, "the pause parked");
+      assert.deepEqual(rig.boundaries, [], `no finalize (or any) permit was minted; got ${JSON.stringify(rig.boundaries)}`);
+      assert.equal(rig.refreshCalls(), 0, "no refreshCodex reconcile for a paused run");
+      assert.equal(rig.releaseCalls(), 0, "no releaseCodex reconcile for a paused run");
+      assert.equal(calls.length, 0, "no push/MR for a paused run");
+      const st = statuses(claim.run_id);
+      assert.ok(st.includes("paused"), "the run reported paused");
+      assert.ok(!st.includes("completed") && !st.includes("failed"), `no terminal report; got ${JSON.stringify(st)}`);
+      assert.deepEqual(rig.disposeBoundaries, ["terminal"], "the runner still disposed the Codex registry once");
+    } finally {
+      restore();
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("(5) a reap:false checkpoint mints NO permit — no withBoundary for the iteration-boundary publish", async () => {
     const { gitlab } = fakeGitlab();
     const rig = codexRig();
