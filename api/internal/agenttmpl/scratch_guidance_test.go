@@ -30,7 +30,7 @@ func TestBuiltinScratchGuidance(t *testing.T) {
 	}
 	for _, name := range []string{"reviewer", "auditor", "fact-checker", "tester"} {
 		def, _ := BuiltinByName(name)
-		for _, want := range []string{"mktemp -d .uzi/scratch/snap.XXXXXX", "set -o pipefail", "git archive \"$sha\" | tar -x -C \"$snap\""} {
+		for _, want := range []string{"mktemp -d .uzi/scratch/snap.XXXXXX", "set -o pipefail", "git archive \"$sha\" | tar -x -C \"$snap\"", "parent checkout; never run Git there"} {
 			if !strings.Contains(def.PromptBody, want) {
 				t.Errorf("%s: missing snapshot instruction %q", name, want)
 			}

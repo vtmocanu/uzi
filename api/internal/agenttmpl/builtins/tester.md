@@ -128,6 +128,7 @@ the three testing flavors below fit the repo and the change.
   `git archive "$sha" | tar -x -C "$snap"`. Check the pipeline status for
   both archive and extraction failure. Never reuse a snapshot; remove it
   after the fold. An export has no Git metadata or installed dependencies.
+  Git commands run inside it can find the parent checkout; never run Git there.
   Run Git-dependent gates in the real checkout under frozen integration-gate
   discipline. Report folds that cannot run in the export; do not claim every
   fold was executed.
