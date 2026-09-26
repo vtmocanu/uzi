@@ -7,7 +7,7 @@ import type { RunActivity, RunListItem } from "../lib/api";
 import { setDemoMode } from "../lib/demoMode";
 
 // PRD #1064 M3: the runs-list row's "now" line (read from the current_activity DTO), its
-// terminal-hiding, the ◐ badge suffix, and the D5 byte-compat guard. RunRow is rendered
+// terminal-hiding, the ◐ badge suffix, and the D5 no-now-line guard. RunRow is rendered
 // directly inside a Router (no layout fetch). `now` is passed in, so the age token is
 // deterministic without mocking a clock.
 
@@ -112,6 +112,40 @@ afterEach(() => {
 });
 
 describe("RunsList row now line (PRD #1064 M3)", () => {
+  it.each(["claude", "codex"] as const)("places one %s logo beside the mobile title and gives lower lines full width", (harness) => {
+    const title = "A long title ".repeat(12);
+    const { container } = renderRow(aRun({
+      harness,
+      issue_title: title,
+      summary_intent: "A summary",
+      current_activity: anActivity(),
+    }));
+    const leading = container.querySelector("li > div")?.firstElementChild as HTMLElement;
+    const logo = leading.querySelector(`[role="img"][aria-label="${harness === "claude" ? "Claude" : "Codex"}"]`) as HTMLElement;
+    expect(leading.className).toContain("grid-cols-[1rem_minmax(0,1fr)] gap-x-1.5");
+    expect(leading.className).toContain("sm:grid-cols-[1.75rem_minmax(0,1fr)] sm:gap-x-2");
+    expect(leading.querySelectorAll('[role="img"]')).toHaveLength(1);
+    expect(logo.querySelectorAll("svg")).toHaveLength(1);
+    expect(logo.className).toContain("h-4 w-4");
+    const titleLine = leading.querySelector("p")!;
+    expect(titleLine.textContent).toBe(title);
+    expect(titleLine.previousElementSibling).toBe(logo);
+    expect(titleLine.className).toContain("col-start-2");
+    expect(titleLine.className).toContain("truncate");
+    for (const line of [screen.getByText("A summary"), screen.getByText("coder").closest("p")!, leading.lastElementChild!]) {
+      expect(line.className).toContain("col-span-2 sm:col-span-1 sm:col-start-2");
+    }
+  });
+
+  it.each([null, undefined, "future-harness"])("removes the logo track for harness %s", (harness) => {
+    const { container } = renderRow(aRun({ harness: harness as RunListItem["harness"] }));
+    const leading = container.querySelector("li > div")?.firstElementChild as HTMLElement;
+    expect(leading.className).toContain("grid-cols-1");
+    expect(leading.className).not.toContain("gap-x");
+    expect(leading.querySelector('[role="img"]')).toBeNull();
+    expect(screen.getByText("A run").className).not.toContain("col-start-2");
+  });
+
   it("renders the now line for a non-terminal run carrying current_activity", () => {
     renderRow(
       aRun({
@@ -235,8 +269,8 @@ describe("RunsList row now line (PRD #1064 M3)", () => {
     expect(screen.getByText("taskone")).toBeTruthy();
   });
 
-  // D5 byte-compat: a null-milestone, null-activity run carries none of the new markers,
-  // so it renders exactly as a pre-#1064 row. The snapshot pins that no now line / ◐ crept in.
+  // D5: a null-milestone, null-activity run carries none of the now-line markers.
+  // The snapshot pins that no now line / ◐ crept in as the row layout evolves.
   it("D5: a null-milestone null-activity run renders with no now line and no ◐ (snapshot)", () => {
     const { container } = renderRow(
       aRun({ status: "running", milestones: null, milestones_in_progress: null, current_activity: null }),

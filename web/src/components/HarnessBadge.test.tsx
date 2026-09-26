@@ -39,14 +39,17 @@ describe("HarnessBadge", () => {
     expect(chip.querySelector("svg")?.getAttribute("class")).toContain("h-[13px] w-[13px]");
   });
 
-  it.each(["claude", "codex"] as const)("renders the bare %s logo with 28px square geometry", (harness) => {
+  it.each(["claude", "codex"] as const)("renders one responsive bare %s logo", (harness) => {
     render(<HarnessBadge harness={harness} variant="bare" />);
     const name = harness === "claude" ? "Claude" : "Codex";
     const logo = screen.getByRole("img", { name });
     expect(logo.getAttribute("title")).toBe(`Runs on ${name}`);
-    expect(logo.className).toBe("inline-flex h-7 w-7 flex-none items-center justify-center text-fg");
+    expect(logo.className).toContain("h-4 w-4");
+    expect(logo.className).toContain("sm:h-7 sm:w-7");
+    expect(logo.className).toContain("sm:row-span-4");
     expect(logo.className).not.toMatch(/border|rounded|bg-/);
-    expect(logo.querySelector("svg")?.getAttribute("class")).toContain("h-[22px] w-[22px]");
+    expect(logo.querySelectorAll("svg")).toHaveLength(1);
+    expect(logo.querySelector("svg")?.getAttribute("class")).toContain("h-4 w-4 sm:h-[22px] sm:w-[22px]");
     expect(logo.querySelector("svg")?.getAttribute("aria-hidden")).toBe("true");
   });
 

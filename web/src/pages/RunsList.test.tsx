@@ -430,12 +430,16 @@ describe("RunsList — harness logo (PRD #1429 M4a, PRD #1653 D-W5, issue #1681)
       const leading = chrome.children[0];
       expect(leading.className).toContain("w-full min-w-0");
       expect(leading.className).toContain("sm:w-auto sm:flex-1");
+      expect(leading.className).toContain("grid-cols-[1rem_minmax(0,1fr)] gap-x-1.5");
+      expect(leading.className).toContain("sm:grid-cols-[1.75rem_minmax(0,1fr)] sm:gap-x-2");
       expect(leading.firstElementChild).toBe(chip);
       expect(chip.className).not.toContain("z-10");
-      expect(chip.className).toContain("h-7 w-7");
-      expect(chip.querySelector("svg")?.getAttribute("class")).toContain("h-[22px] w-[22px]");
-      expect(leading.children[1].className).toContain("min-w-0 flex-1");
-      expect(leading.children[1].contains(screen.getByText(title))).toBe(true);
+      expect(chip.className).toContain("h-4 w-4");
+      expect(chip.className).toContain("sm:h-7 sm:w-7");
+      expect(chip.querySelectorAll("svg")).toHaveLength(1);
+      expect(chip.querySelector("svg")?.getAttribute("class")).toContain("h-4 w-4 sm:h-[22px] sm:w-[22px]");
+      expect(leading.children[1]).toBe(screen.getByText(title));
+      expect(leading.children[1].className).toContain("col-start-2");
       expect(chrome.children[1].contains(chip)).toBe(false);
     }
     expect(screen.getAllByRole("img", { name: "Codex" })).toHaveLength(1);

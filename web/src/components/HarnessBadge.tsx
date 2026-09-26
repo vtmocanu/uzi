@@ -1,7 +1,8 @@
 // HarnessBadge — provider logo for runs (PRD #1429 M4a, #1653 D-W5, issue #1681).
 //
 // Claude and Codex both have a logo. The default is a small round chip; the bare
-// variant is a 28px square logo beside a run-list title, including vault-waiting rows.
+// variant is a 16px inline logo on phones and a 28px logo beside the text block
+// from sm upward, including vault-waiting rows.
 //
 // The SVG is aria-hidden; its wrapper is role="img" named "Claude" / "Codex", and
 // its title ("Runs on Claude" / "Runs on Codex") explains it on hover. A null/undefined
@@ -24,13 +25,13 @@ export function HarnessBadge({ harness, variant = "chip" }: { harness: Harness |
       aria-label={name}
       title={`Runs on ${name}`}
       className={variant === "bare"
-        ? "inline-flex h-7 w-7 flex-none items-center justify-center text-fg"
+        ? "inline-flex h-4 w-4 flex-none items-center justify-center self-center text-fg sm:row-span-4 sm:h-7 sm:w-7"
         : "inline-flex h-5 w-5 flex-none items-center justify-center rounded-full border border-edge bg-ink text-fg"}
     >
       {name === "Claude" ? (
-        <ClaudeIcon className={variant === "bare" ? "h-[22px] w-[22px]" : "h-[13px] w-[13px]"} />
+        <ClaudeIcon className={variant === "bare" ? "h-4 w-4 sm:h-[22px] sm:w-[22px]" : "h-[13px] w-[13px]"} />
       ) : (
-        <OpenAIIcon className={variant === "bare" ? "h-[22px] w-[22px]" : "h-[13px] w-[13px]"} />
+        <OpenAIIcon className={variant === "bare" ? "h-4 w-4 sm:h-[22px] sm:w-[22px]" : "h-[13px] w-[13px]"} />
       )}
     </span>
   );
