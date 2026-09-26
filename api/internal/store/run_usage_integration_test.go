@@ -784,20 +784,10 @@ func TestRunOutcomesRollupsLiveDB(t *testing.T) {
 		t.Fatalf("A last7 invariant: finished %d != sum %d", selfA.Last7Finished, got)
 	}
 
-	// --- SelfRunOutcomeOrigins(userA): NULL buckets as "unknown"; sum == failed per window.
-	lifeOrigins, last7Origins := map[string]int64{}, map[string]int64{}
-	originRows, err := q.SelfRunOutcomeOrigins(ctx, userA)
-	if err != nil {
-		t.Fatalf("SelfRunOutcomeOrigins(A): %v", err)
-	}
-	for _, o := range originRows {
-		switch o.WindowTag {
-		case "lifetime":
-			lifeOrigins[o.Origin] = o.Cnt
-		case "last7":
-			last7Origins[o.Origin] = o.Cnt
-		}
-	}
+	// --- SelfRunOutcomes(userA) fail_origins (issue #1451: jsonb columns on the SAME row as
+	// the counts): NULL buckets as "unknown"; sum == failed per window.
+	lifeOrigins := decodeOutcomeOrigins(t, "A lifetime", selfA.LifetimeFailOrigins)
+	last7Origins := decodeOutcomeOrigins(t, "A last7", selfA.Last7FailOrigins)
 	if lifeOrigins["agent_failure"] != 1 || lifeOrigins["unknown"] != 1 {
 		t.Fatalf("A lifetime origins = %v, want agent_failure:1 unknown:1", lifeOrigins)
 	}
@@ -820,6 +810,21 @@ func TestRunOutcomesRollupsLiveDB(t *testing.T) {
 	if selfB.LifetimeFinished != 2 || selfB.LifetimeFailed != 1 || selfB.LifetimeCompleted != 1 {
 		t.Fatalf("B lifetime finished/failed/completed = %d/%d/%d, want 2/1/1",
 			selfB.LifetimeFinished, selfB.LifetimeFailed, selfB.LifetimeCompleted)
+	}
+	// B's origins are its own (userA's "unknown" never leaks in), and sum == failed.
+	if bo := decodeOutcomeOrigins(t, "B lifetime", selfB.LifetimeFailOrigins); len(bo) != 1 || bo["agent_failure"] != 1 {
+		t.Fatalf("B lifetime origins = %v, want exactly agent_failure:1", bo)
+	}
+
+	// --- A user with NO failures gets '{}' (the COALESCE), never NULL.
+	userC, repoC := seedUserRepo("c")
+	seedOutcomeRun(userC, repoC, "completed", "issue", nil, 0, nil)
+	selfC, err := q.SelfRunOutcomes(ctx, store.SelfRunOutcomesParams{UserID: userC, LandableOrigins: workersvc.AllHumanLandableFailOrigins()})
+	if err != nil {
+		t.Fatalf("SelfRunOutcomes(C): %v", err)
+	}
+	if string(selfC.LifetimeFailOrigins) != "{}" || string(selfC.Last7FailOrigins) != "{}" {
+		t.Fatalf("C (no failures) fail_origins = %q/%q, want {}/{}", selfC.LifetimeFailOrigins, selfC.Last7FailOrigins)
 	}
 
 	// --- Per-user aggregate == self, and the per-user rows sum to the factory (agreement).
@@ -863,20 +868,45 @@ func TestRunOutcomesRollupsLiveDB(t *testing.T) {
 		t.Fatalf("factory lifetime invariant: finished %d != sum %d", factory.LifetimeFinished, got)
 	}
 
-	// --- Per-user origins agree with the self origins for userA (NULL -> "unknown").
-	puOriginsA := map[string]int64{}
-	puOriginRows, err := q.AdminRunOutcomeOriginsPerUser(ctx)
-	if err != nil {
-		t.Fatalf("AdminRunOutcomeOriginsPerUser: %v", err)
-	}
-	for _, o := range puOriginRows {
-		if o.UserID == userA {
-			puOriginsA[o.Origin] = o.Cnt
+	// Factory origins sum to the factory failed count per window (same statement, issue #1451).
+	for _, w := range []struct {
+		name   string
+		raw    []byte
+		failed int64
+	}{
+		{"factory lifetime", factory.LifetimeFailOrigins, factory.LifetimeFailed},
+		{"factory last7", factory.Last7FailOrigins, factory.Last7Failed},
+	} {
+		var s int64
+		for _, c := range decodeOutcomeOrigins(t, w.name, w.raw) {
+			s += c
+		}
+		if s != w.failed {
+			t.Fatalf("%s sum(origins)=%d != failed=%d", w.name, s, w.failed)
 		}
 	}
+
+	// --- Per-user origins agree with the self origins for userA (NULL -> "unknown").
+	puOriginsA := decodeOutcomeOrigins(t, "per-user A", perUserByID[userA].FailOrigins)
 	if puOriginsA["agent_failure"] != 1 || puOriginsA["unknown"] != 1 {
 		t.Fatalf("per-user origins for A = %v, want agent_failure:1 unknown:1", puOriginsA)
 	}
+	if puOriginsB := decodeOutcomeOrigins(t, "per-user B", perUserByID[userB].FailOrigins); puOriginsB["agent_failure"] != 1 || len(puOriginsB) != 1 {
+		t.Fatalf("per-user origins for B = %v, want exactly agent_failure:1", puOriginsB)
+	}
+	if puC := perUserByID[userC]; string(puC.FailOrigins) != "{}" {
+		t.Fatalf("per-user origins for C (no failures) = %q, want {}", puC.FailOrigins)
+	}
+}
+
+// decodeOutcomeOrigins decodes a jsonb fail_origins column (issue #1451) into a count map.
+func decodeOutcomeOrigins(t *testing.T, what string, raw []byte) map[string]int64 {
+	t.Helper()
+	m := map[string]int64{}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("%s: decode fail_origins %q: %v", what, raw, err)
+	}
+	return m
 }
 
 // TestRunUsagePerLegFoldEndToEndLiveDB drives the PRODUCTION fold (workersvc.AppendMessages)

@@ -4919,7 +4919,13 @@ ORDER BY cost_usd DESC, output_tokens DESC, u.id;
 -- owner's decision, kept in the denominator and its own bar segment but out of the
 -- numerator. Every computed column carries an explicit ::bigint cast (the file's
 -- convention). Invariants the handler/live-DB tests assert:
--- finished == completed + cancelled + plan_rejected + failed.
+-- finished == completed + cancelled + plan_rejected + failed, and
+-- sum(fail_origins) == failed. The per-origin breakdown is a jsonb_object_agg scalar
+-- subquery INSIDE each outcome query (issue #1451), not a second query per scope: one
+-- statement reads one snapshot, so the breakdown and the `failed` count always describe
+-- the same rows. (It used to be a separate :many query folded in Go, which let a run
+-- turning terminal between the two reads skew the sum.) sqlc types the jsonb column as
+-- []byte; the handler json-decodes it into the fail_origins map.
 
 -- name: SelfRunOutcomes :one
 -- The requesting user's own run outcome counts for BOTH windows (PRD #1293 M1).
@@ -4957,7 +4963,27 @@ SELECT
                        WHERE c.run_id = runs.id AND c.user_id = runs.user_id AND c.state = 'available')
                OR preserved_patch IS NOT NULL)
           AND runs.created_at >= now() - interval '7 days'
-    )::bigint AS last7_needs_landing
+    )::bigint AS last7_needs_landing,
+    -- fail_origins (issue #1451): the per-origin breakdown of the `failed` count, in THIS
+    -- statement. One statement is one snapshot, so sum(fail_origins) == failed by
+    -- construction; a separate origins query could see a run that turned terminal `failed`
+    -- after the counts were read. NULL fail_origin buckets as 'unknown'; an empty group
+    -- yields '{}' (never NULL). Returned as a jsonb object, decoded in the handler.
+    (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
+        FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
+              FROM runs r2
+              WHERE r2.user_id = @user_id
+              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.kind NOT IN ('chat', 'judge')
+              GROUP BY 1) o) AS lifetime_fail_origins,
+    (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
+        FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
+              FROM runs r2
+              WHERE r2.user_id = @user_id
+              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.kind NOT IN ('chat', 'judge')
+              AND r2.created_at >= now() - interval '7 days'
+              GROUP BY 1) o) AS last7_fail_origins
 FROM runs
 WHERE runs.user_id = @user_id
   AND status IN ('completed', 'failed', 'cancelled')
@@ -4996,7 +5022,21 @@ SELECT
                        WHERE c.run_id = runs.id AND c.user_id = runs.user_id AND c.state = 'available')
                OR preserved_patch IS NOT NULL)
           AND runs.created_at >= now() - interval '7 days'
-    )::bigint AS last7_needs_landing
+    )::bigint AS last7_needs_landing,
+    -- fail_origins (issue #1451): same single-snapshot shape as SelfRunOutcomes, factory-wide.
+    (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
+        FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
+              FROM runs r2
+              WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.kind NOT IN ('chat', 'judge')
+              GROUP BY 1) o) AS lifetime_fail_origins,
+    (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
+        FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
+              FROM runs r2
+              WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.kind NOT IN ('chat', 'judge')
+              AND r2.created_at >= now() - interval '7 days'
+              GROUP BY 1) o) AS last7_fail_origins
 FROM runs
 WHERE status IN ('completed', 'failed', 'cancelled')
   AND kind NOT IN ('chat', 'judge');
@@ -5022,76 +5062,23 @@ SELECT u.id AS user_id, u.email,
           AND (EXISTS (SELECT 1 FROM recovery_captures c
                        WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state = 'available')
                OR r.preserved_patch IS NOT NULL)
-    )::bigint AS needs_landing
+    )::bigint AS needs_landing,
+    -- fail_origins (issue #1451): this user's LIFETIME per-origin breakdown of `failed`, in
+    -- this statement (one snapshot => sum(fail_origins) == failed by construction). Correlated
+    -- on u.id; an empty group yields '{}'. See SelfRunOutcomes for the shape.
+    (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
+        FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
+              FROM runs r2
+              WHERE r2.user_id = u.id
+              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.kind NOT IN ('chat', 'judge')
+              GROUP BY 1) o) AS fail_origins
 FROM runs r
 JOIN users u ON u.id = r.user_id
 WHERE r.status IN ('completed', 'failed', 'cancelled')
   AND r.kind NOT IN ('chat', 'judge')
 GROUP BY u.id, u.email
 ORDER BY u.id;
-
--- Per-origin failure causes (PRD #1293 M1). One :many per scope over the `failed` rows
--- only (status='failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'), grouped by
--- COALESCE(fail_origin,'unknown') so a pre-00126 NULL-origin failure buckets as
--- 'unknown'. Folded into RunOutcomesDTO.fail_origins in Go — the default, because
--- runtime.sql has no precedent for returning a jsonb aggregate to Go (jsonb reaches Go
--- only as a plain []byte table column). window_tag distinguishes the two windows
--- ('lifetime' / 'last7') via a UNION ALL of two grouped selects; sum over a window's
--- rows equals that window's `failed` count.
-
--- name: SelfRunOutcomeOrigins :many
--- The requesting user's per-origin failure causes for BOTH windows (PRD #1293 M1).
--- The `runs r` alias qualifies user_id so the @user_id param types unambiguously across
--- the UNION ALL branches (an unqualified user_id trips sqlc's cross-branch resolution).
-SELECT 'lifetime'::text AS window_tag,
-    COALESCE(r.fail_origin, 'unknown')::text AS origin,
-    count(*)::bigint AS cnt
-FROM runs r
-WHERE r.user_id = @user_id
-  AND r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected'
-  AND r.kind NOT IN ('chat', 'judge')
-GROUP BY COALESCE(r.fail_origin, 'unknown')
-UNION ALL
-SELECT 'last7'::text AS window_tag,
-    COALESCE(r.fail_origin, 'unknown')::text AS origin,
-    count(*)::bigint AS cnt
-FROM runs r
-WHERE r.user_id = @user_id
-  AND r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected'
-  AND r.kind NOT IN ('chat', 'judge')
-  AND r.created_at >= now() - interval '7 days'
-GROUP BY COALESCE(r.fail_origin, 'unknown');
-
--- name: AdminRunOutcomeOrigins :many
--- Factory-wide per-origin failure causes for BOTH windows (PRD #1293 M1).
-SELECT 'lifetime'::text AS window_tag,
-    COALESCE(fail_origin, 'unknown')::text AS origin,
-    count(*)::bigint AS cnt
-FROM runs
-WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
-  AND kind NOT IN ('chat', 'judge')
-GROUP BY COALESCE(fail_origin, 'unknown')
-UNION ALL
-SELECT 'last7'::text AS window_tag,
-    COALESCE(fail_origin, 'unknown')::text AS origin,
-    count(*)::bigint AS cnt
-FROM runs
-WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
-  AND kind NOT IN ('chat', 'judge')
-  AND created_at >= now() - interval '7 days'
-GROUP BY COALESCE(fail_origin, 'unknown');
-
--- name: AdminRunOutcomeOriginsPerUser :many
--- Per-user LIFETIME per-origin failure causes (PRD #1293 M1), grouped by user_id so the
--- handler can attach each user's causes by id. Lifetime-only, matching
--- AdminRunOutcomesPerUser.
-SELECT r.user_id,
-    COALESCE(r.fail_origin, 'unknown')::text AS origin,
-    count(*)::bigint AS cnt
-FROM runs r
-WHERE r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected'
-  AND r.kind NOT IN ('chat', 'judge')
-GROUP BY r.user_id, COALESCE(r.fail_origin, 'unknown');
 
 -- History usage refold (PRD #1079 M3) ---------------------------------------
 -- A boot one-shot re-folds every PRE-MIGRATION terminal non-chat run through the
