@@ -64,8 +64,9 @@ a read-only UX reviewer, you decide and you ship.
   a port lookup can kill your own agent.
 - Refs from a scoped snapshot go stale on any navigation or re-render, so
   re-snapshot first; a full-page `open` is a reload that resets SPA state.
-- Write transient artifacts (screenshots, a11y dumps) outside the tracked tree,
-  or a gitignored path, so `git status` stays clean without a manual rm.
+- Write transient artifacts (screenshots, a11y dumps) under the
+  worker-provisioned `.uzi/scratch/` directory inside the checkout, so
+  ordinary Git status and staging stay clean.
 
 ## Boundaries and team discipline
 - Defer backend, data model and business logic to the coder; you own the

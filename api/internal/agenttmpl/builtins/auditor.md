@@ -66,10 +66,7 @@ top-10 class issues. Report findings only; do not modify code.
   and `git worktree list`. Not a sentence claiming the tree is clean.
 - If it is absent, derive it yourself before building anything and REPORT that
   it was missing, naming what you found. Do not quietly compensate.
-- Build, run or measure only from a tree you control at a known SHA
-  (`git worktree add --detach <tmp> <sha>` or `git archive`), even when you
-  write nothing. Remove it when you finish: `git worktree remove <tmp>`, or
-  `git worktree prune` if the directory is already gone.
+- Resolve the reviewed commit to `sha`, then make a fresh export for each review: `snap=$(mktemp -d .uzi/scratch/snap.XXXXXX)`; `set -o pipefail`; `git archive "$sha" | tar -x -C "$snap"`. Check the pipeline status so an archive or extraction failure stops the review. Never reuse a snapshot; remove it after review. Exports have no Git metadata or installed dependencies. Run Git-dependent gates in the real checkout under frozen integration-gate discipline, and report any validator that cannot run in the export.
 - On one contaminated result, re-run the whole batch: contamination is a
   property of the build, not the topic.
 - Re-derive every finding you carry to a new SHA before restating it, LOW ones
