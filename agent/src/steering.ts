@@ -248,7 +248,8 @@ class InvalidInputResponse extends Error {
 const MAX_INPUT_BATCH = 1000;
 /** Issue #1604: the most rows one receipted GET /inputs returns, the LIMIT of
  *  api/internal/store/queries/runtime.sql ListReplayRunInputs. A page this full may have unread
- *  rows behind it, so only a shorter page can complete initial delivery. */
+ *  rows behind it, so only a shorter page can complete initial delivery. Pinned to the server by
+ *  api/internal/store/replay_page_limit_test.go. */
 const REPLAY_PAGE_LIMIT = 1000;
 /** Issue #1673: applied attempts a stopping channel makes for a routed batch before it leaves
  *  the batch to the next claim (which replays it: at-least-once across claims). */
