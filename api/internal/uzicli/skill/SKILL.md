@@ -111,8 +111,9 @@ authority, not your résumé. The `admin` subcommands need an admin-scoped
 (`uza_`) token. A `uza_` token is a **superset**, not a read-only token: it also
 acts as your own user exactly like `uzc_` (create, approve, cancel and extend your
 own runs, hand off tasks, edit your schedules), and additionally unlocks the
-read-only `admin` views. What stays read-only is the admin surface: there are no
-admin write verbs, and another user's resources stay refused. So an admin needs
+read-only `admin` views. What stays read-only is the admin surface: the CLI
+exposes no admin write verbs (API admin writes require a browser session), and
+writes to another user's resources stay refused. So an admin needs
 only one stored credential; keep a separate `uzc_` context when you want a token
 that cannot read factory-wide state.
 
