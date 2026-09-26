@@ -408,7 +408,7 @@ func TestSetStateFailedCancelledRoutesToCancel(t *testing.T) {
 
 // TestSetStateFailedPlanRejectedStampsPlanRejected (PRD #503 M1, REC A): a live plan-reject
 // arrives as `failed` with stop_kind='plan_rejected'; the failed arm must stamp
-// fail_origin='plan_rejected' via SetRunFailed (matching the server-side RejectRunServerSide
+// fail_origin='plan_rejected' via SetRunFailedPlanRejected (matching the server-side RejectRunServerSide
 // path) rather than defaulting to agent_failure, and must NOT route to CancelRunByWorker.
 func TestSetStateFailedPlanRejectedStampsPlanRejected(t *testing.T) {
 	run := runningRun(false)
@@ -421,10 +421,15 @@ func TestSetStateFailedPlanRejectedStampsPlanRejected(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("SetState: %v", err)
 	}
-	if fs.setFailed == nil {
-		t.Fatal("SetRunFailed was never called for a stop_kind='plan_rejected' failed report")
+	// Issue #1604: the plan_rejected arm fails the run through SetRunFailedPlanRejected, which
+	// also settles the run's unapplied reject_plan inputs in the same statement.
+	if fs.setFailedPlanRejected == nil {
+		t.Fatal("SetRunFailedPlanRejected was never called for a stop_kind='plan_rejected' failed report")
 	}
-	if got := fs.setFailed.FailOrigin; !got.Valid || got.String != "plan_rejected" {
+	if fs.setFailed != nil {
+		t.Fatalf("SetRunFailed was called for a plan_rejected stop_kind (want SetRunFailedPlanRejected): %+v", fs.setFailed)
+	}
+	if got := fs.setFailedPlanRejected.FailOrigin; !got.Valid || got.String != "plan_rejected" {
 		t.Fatalf("fail_origin = %+v, want plan_rejected", got)
 	}
 	if fs.cancelledByWorker != nil {

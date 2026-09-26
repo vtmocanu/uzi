@@ -15,6 +15,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -388,5 +389,281 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 		if out["reason"] != "stale" {
 			t.Fatalf("%s on an unknown run: %v", path, out)
 		}
+	}
+}
+
+// TestWorkerReviseAppliedUnderSwitchLiveDB pins issue #1604's receipt rule: a revise_plan the
+// worker already persisted can be marked APPLIED while its own claim has a credential switch
+// pending, so the resumed claim does not replay a revision the worker already acted on. Only
+// that case is widened: a mixed batch, a receipt this claim did not take, and a released or
+// stale claim are all still refused, and the row stays unapplied.
+func TestWorkerReviseAppliedUnderSwitchLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+	svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{})
+	svc.SetTxBeginner(pool)
+	h := &Handler{q: q, wsvc: svc}
+	router := h.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil))
+	exec := func(t *testing.T, sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	user, worker, other := uuid.New(), uuid.New(), uuid.New()
+	exec(t, `INSERT INTO users (id,email,password_hash) VALUES ($1,$2,'x')`, user, fmt.Sprintf("revise-%s@e2e", user))
+	tokens := make(map[uuid.UUID]string)
+	for _, id := range []uuid.UUID{worker, other} {
+		token, hash, err := jointoken.Generate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		tokens[id] = token
+		exec(t, `INSERT INTO workers (id,user_id,name,token_hash,protocol_capabilities) VALUES ($1,$2,$3,$4,$5)`,
+			id, user, "revise-"+id.String(), hash, []string{capability.InputReceiptsV1})
+	}
+	newRun := func(t *testing.T) uuid.UUID {
+		t.Helper()
+		id := uuid.New()
+		exec(t, `INSERT INTO runs (id,user_id,kind,issue_title,issue_description,status,worker_id,claim_generation) VALUES ($1,$2,'chat','t','d','running',$3,1)`, id, user, worker)
+		return id
+	}
+	addInput := func(t *testing.T, run uuid.UUID, kind string) int64 {
+		t.Helper()
+		var id int64
+		if err := pool.QueryRow(ctx, `INSERT INTO run_user_inputs (run_id,kind,body) VALUES ($1,$2,'x') RETURNING id`, run, kind).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	// post answers the status code and decoded body, never failing the test itself, so a
+	// goroutine can use it too.
+	post := func(run uuid.UUID, path string, who uuid.UUID, generation int64, ids ...int64) (int, map[string]any) {
+		parts := make([]string, len(ids))
+		for i, id := range ids {
+			parts[i] = fmt.Sprint(id)
+		}
+		body := fmt.Sprintf(`{"ids":[%s],"claim_generation":%d}`, strings.Join(parts, ","), generation)
+		req := httptest.NewRequest(http.MethodPost, "/api/worker/runs/"+run.String()+path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+tokens[who])
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		var out map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return rec.Code, out
+	}
+	expect := func(t *testing.T, stage string, want int, wantReason any, code int, out map[string]any) {
+		t.Helper()
+		if code != want || out["reason"] != wantReason {
+			t.Fatalf("%s: status %d reason %v, want %d reason %v (%v)", stage, code, out["reason"], want, wantReason, out)
+		}
+	}
+	ack := func(t *testing.T, run uuid.UUID, who uuid.UUID, generation int64, ids ...int64) {
+		t.Helper()
+		code, out := post(run, "/inputs/ack", who, generation, ids...)
+		expect(t, "ACK", http.StatusOK, nil, code, out)
+		if out["active"] != true {
+			t.Fatalf("ACK on an active claim answered inactive: %v", out)
+		}
+	}
+	appliedAt := func(t *testing.T, id int64) bool {
+		t.Helper()
+		var applied bool
+		if err := pool.QueryRow(ctx, `SELECT applied_at IS NOT NULL FROM run_user_inputs WHERE id=$1`, id).Scan(&applied); err != nil {
+			t.Fatal(err)
+		}
+		return applied
+	}
+	requireUnapplied := func(t *testing.T, stage string, ids ...int64) {
+		t.Helper()
+		for _, id := range ids {
+			if appliedAt(t, id) {
+				t.Fatalf("%s applied input %d", stage, id)
+			}
+		}
+	}
+	switchPending := func(t *testing.T, run uuid.UUID, generation int64) {
+		t.Helper()
+		exec(t, `UPDATE runs SET credential_switch_requested_at=now(),credential_switch_generation=$2 WHERE id=$1`, run, generation)
+	}
+
+	t.Run("revise-only APPLIED under switch_pending succeeds and applies", func(t *testing.T) {
+		run := newRun(t)
+		first, second := addInput(t, run, "revise_plan"), addInput(t, run, "revise_plan")
+		ack(t, run, worker, 1, first, second)
+		switchPending(t, run, 1)
+		code, out := post(run, "/inputs/applied", worker, 1, first, second)
+		expect(t, "APPLIED under switch", http.StatusOK, workersvc.ReceiptSwitchPending, code, out)
+		if out["active"] != false || len(out["inputs"].([]any)) != 2 {
+			t.Fatalf("APPLIED under switch body: %v", out)
+		}
+		if !appliedAt(t, first) || !appliedAt(t, second) {
+			t.Fatal("APPLIED under switch answered 200 but left a revise_plan unapplied")
+		}
+		// The first reply was lost: the retry of already-applied rows still succeeds.
+		code, out = post(run, "/inputs/applied", worker, 1, first, second)
+		expect(t, "APPLIED retry under switch", http.StatusOK, workersvc.ReceiptSwitchPending, code, out)
+	})
+
+	t.Run("mixed revise_plan and follow_up under switch_pending is refused", func(t *testing.T) {
+		run := newRun(t)
+		revise, follow := addInput(t, run, "revise_plan"), addInput(t, run, "follow_up")
+		ack(t, run, worker, 1, revise, follow)
+		switchPending(t, run, 1)
+		code, out := post(run, "/inputs/applied", worker, 1, revise, follow)
+		expect(t, "mixed APPLIED", http.StatusConflict, workersvc.ReceiptSwitchPending, code, out)
+		requireUnapplied(t, "mixed APPLIED", revise, follow)
+		code, out = post(run, "/inputs/applied", worker, 1, follow)
+		expect(t, "follow_up-only APPLIED", http.StatusConflict, workersvc.ReceiptSwitchPending, code, out)
+		requireUnapplied(t, "follow_up-only APPLIED", follow)
+	})
+
+	t.Run("a receipt this claim did not take is refused under switch_pending", func(t *testing.T) {
+		run := newRun(t)
+		revise := addInput(t, run, "revise_plan")
+		ack(t, run, worker, 1, revise)
+		// The same worker reclaims at generation 2 and a switch is requested there before the
+		// new claim ACKs the row: the receipt still belongs to generation 1.
+		exec(t, `UPDATE runs SET claim_generation=2 WHERE id=$1`, run)
+		switchPending(t, run, 2)
+		code, out := post(run, "/inputs/applied", worker, 2, revise)
+		expect(t, "non-owned APPLIED", http.StatusConflict, workersvc.ReceiptSwitchPending, code, out)
+		requireUnapplied(t, "non-owned APPLIED", revise)
+	})
+
+	t.Run("released and stale claims are refused even for revise-only", func(t *testing.T) {
+		for _, fence := range []struct{ sql, reason string }{
+			{`UPDATE runs SET claim_released_at=now() WHERE id=$1`, workersvc.ReceiptReleased},
+			{`UPDATE runs SET status='queued',claim_released_at=now() WHERE id=$1`, workersvc.ReceiptStale},
+			{`UPDATE runs SET status='failed' WHERE id=$1`, workersvc.ReceiptStale},
+			{`UPDATE runs SET claim_generation=2 WHERE id=$1`, workersvc.ReceiptStale},
+		} {
+			run := newRun(t)
+			revise := addInput(t, run, "revise_plan")
+			ack(t, run, worker, 1, revise)
+			switchPending(t, run, 1)
+			exec(t, fence.sql, run)
+			code, out := post(run, "/inputs/applied", worker, 1, revise)
+			expect(t, "APPLIED after "+fence.sql, http.StatusConflict, fence.reason, code, out)
+			requireUnapplied(t, "APPLIED after "+fence.sql, revise)
+		}
+	})
+
+	t.Run("same-worker successor generation", func(t *testing.T) {
+		run := newRun(t)
+		revise := addInput(t, run, "revise_plan")
+		ack(t, run, worker, 1, revise)
+		switchPending(t, run, 1)
+		// The switch released generation 1 and the same worker reclaimed at generation 2.
+		exec(t, `UPDATE runs SET claim_generation=2,claim_released_at=NULL,credential_switch_requested_at=NULL,credential_switch_generation=NULL WHERE id=$1`, run)
+		code, out := post(run, "/inputs/applied", worker, 1, revise)
+		expect(t, "generation-1 APPLIED after reclaim", http.StatusConflict, workersvc.ReceiptStale, code, out)
+		requireUnapplied(t, "generation-1 APPLIED after reclaim", revise)
+		ack(t, run, worker, 2, revise)
+		code, out = post(run, "/inputs/applied", worker, 2, revise)
+		expect(t, "generation-2 APPLIED", http.StatusOK, nil, code, out)
+		if !appliedAt(t, revise) {
+			t.Fatal("generation-2 APPLIED left the revise unapplied")
+		}
+	})
+
+	// Concurrent release against APPLIED, in both lock orders. A third transaction holds the
+	// run row lock while the two contenders queue behind it in a chosen order; Postgres grants
+	// the tuple lock to the first waiter. Whichever commits first, the outcome is serialized:
+	// released first refuses APPLIED and leaves the row unapplied; APPLIED first applies the
+	// row and the release then still succeeds.
+	lockWaiters := func(t *testing.T, want int) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			var n int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock'`).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			if n >= want {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("lock waiters = %d, want %d", n, want)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	for _, releaseFirst := range []bool{true, false} {
+		t.Run(fmt.Sprintf("concurrent release vs APPLIED, release first=%v", releaseFirst), func(t *testing.T) {
+			run := newRun(t)
+			revise := addInput(t, run, "revise_plan")
+			ack(t, run, worker, 1, revise)
+			switchPending(t, run, 1)
+			holder, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer holder.Rollback(ctx) //nolint:errcheck // committed below
+			if _, err := holder.Exec(ctx, `SELECT 1 FROM runs WHERE id=$1 FOR UPDATE`, run); err != nil {
+				t.Fatal(err)
+			}
+			type applyResult struct {
+				code int
+				out  map[string]any
+			}
+			applyDone := make(chan applyResult, 1)
+			releaseDone := make(chan error, 1)
+			var released int64
+			startApply := func() {
+				go func() {
+					code, out := post(run, "/inputs/applied", worker, 1, revise)
+					applyDone <- applyResult{code, out}
+				}()
+			}
+			startRelease := func() {
+				go func() {
+					var err error
+					released, err = q.ReleaseCredentialSwitch(ctx, store.ReleaseCredentialSwitchParams{ID: run, WorkerID: pgconv.UUID(worker), Generation: 1})
+					releaseDone <- err
+				}()
+			}
+			if releaseFirst {
+				startRelease()
+				lockWaiters(t, 1)
+				startApply()
+			} else {
+				startApply()
+				lockWaiters(t, 1)
+				startRelease()
+			}
+			lockWaiters(t, 2)
+			if err := holder.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-releaseDone; err != nil {
+				t.Fatal(err)
+			}
+			res := <-applyDone
+			if released != 1 {
+				t.Fatalf("release rows = %d, want 1 in either order", released)
+			}
+			if releaseFirst {
+				expect(t, "APPLIED after release", http.StatusConflict, workersvc.ReceiptStale, res.code, res.out)
+				requireUnapplied(t, "APPLIED after release", revise)
+			} else {
+				expect(t, "APPLIED before release", http.StatusOK, workersvc.ReceiptSwitchPending, res.code, res.out)
+				if !appliedAt(t, revise) {
+					t.Fatal("APPLIED before release answered 200 but left the revise unapplied")
+				}
+			}
+		})
 	}
 }

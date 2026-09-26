@@ -108,6 +108,16 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 	if len(rows) != len(ids) {
 		return InputReceiptResult{}, ErrInputReceiptInvalid
 	}
+	// Issue #1604: a revise_plan is APPLIED by the worker only after its revised plan was
+	// persisted, so marking it applied under a pending credential switch is truthful; refusing
+	// it would leave the row unapplied and the resumed claim would replay the revision the
+	// worker already acted on. Only a switch_pending claim qualifies (the claim is still this
+	// worker's, at this generation, not released), and only when every requested row is a
+	// revise_plan this claim itself received: a mixed batch or a released/stale claim is still
+	// refused. Persistence and APPLIED are separate transactions, so an interruption between
+	// them can still repeat a revision (at-least-once, never exactly-once).
+	applyUnderSwitch := applied && reason == ReceiptSwitchPending &&
+		!slices.ContainsFunc(rows, func(row store.ListInputReceiptRowsRow) bool { return row.Kind != "revise_plan" })
 	toAck := make([]int64, 0, len(ids))
 	out := make([]InputDTO, 0, len(ids))
 	followUp := false
@@ -118,7 +128,7 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 		case applied:
 			// A retried APPLIED for rows this claim already applied succeeds even after the
 			// claim released: the first reply was lost, and the worker already routed them.
-			if !ownReceipt || (!active && !row.AppliedAt.Valid) {
+			if !ownReceipt || (!active && !row.AppliedAt.Valid && !applyUnderSwitch) {
 				return InputReceiptResult{}, conflict
 			}
 		case !row.ConsumedAt.Valid:

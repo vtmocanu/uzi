@@ -3161,6 +3161,64 @@ WHERE id = @id AND worker_id = @worker_id
   AND (sqlc.narg('claim_generation')::bigint IS NULL
        OR claim_generation = sqlc.narg('claim_generation')::bigint);
 
+-- name: SetRunFailedPlanRejected :one
+-- Issue #1604: the worker's plan_rejected `failed` report. It fails the run exactly as
+-- SetRunFailed does AND settles the run's still-unapplied reject_plan inputs in the SAME
+-- statement, so a pool-bound (generation-less legacy) report is atomic too: a later claim
+-- can never replay a reject for a run that is already failed, and a declined transition
+-- leaves every input untouched. The `failed` CTE MUST stay in lockstep with SetRunFailed:
+-- every SET field and every WHERE guard is copied verbatim from it (only `runs.id` is
+-- table-qualified, which sqlc needs to resolve @id beside run_user_inputs.id). The result counts
+-- TRANSITIONED RUNS (0 or 1), never the settled inputs, so a run whose reject rows an older
+-- worker already APPLIED still reports 1.
+WITH failed AS (
+    UPDATE runs SET
+        status             = 'failed',
+        status_since       = now(),
+        failure_reason     = @failure_reason,
+        -- PRD #69 M7a: the TRUSTED failure class, always set from Go (the worker-reported
+        -- `failed` arm coerces req.fail_origin through the allowlist and defaults a
+        -- classless failure to 'agent_failure'; the limit-opt-out non-park path stamps
+        -- 'rate_limited'). Never derived from failure_reason, which is never parsed.
+        fail_origin        = @fail_origin,
+        -- PRD #377 M1: the agent's secret-scrubbed, size-capped branch diff, preserved on a
+        -- workflow_scope_missing failure so a human can apply the work the bot PAT could not
+        -- push. NULL on every other failed path (only that arm sends a non-nil value).
+        preserved_patch    = @preserved_patch,
+        session_id         = COALESCE(sqlc.narg('session_id'), session_id),
+        move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,
+        finished_at        = now(),
+        -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+        milestones_in_progress = NULL,
+        milestones_agents = NULL,
+        -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+        pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+        credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
+        -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+        health = 'ok', health_reason = NULL, health_since = NULL,
+        updated_at         = now()
+    WHERE runs.id = @id AND worker_id = @worker_id
+      AND status NOT IN ('completed', 'failed', 'cancelled')
+      -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
+      -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
+      -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
+      -- still-held run at that exact generation: a late gen-G report matches 0 rows against a run
+      -- released after G (claim_released_at set) or reclaimed to G+1 (generation moved on), so it
+      -- cannot clobber the reclaiming flight. nil = legacy/outer-lock-fenced callers, unchanged.
+      -- PRD #1497 M1 (D16): claim_released_at IS NULL is a STANDALONE conjunct, so a released claim is
+      -- rejected even for a generation-less (legacy) report; a live claim still honours a NULL generation.
+      AND claim_released_at IS NULL
+      AND (sqlc.narg('claim_generation')::bigint IS NULL
+           OR claim_generation = sqlc.narg('claim_generation')::bigint)
+    RETURNING runs.id AS failed_run_id
+),
+settled AS (
+    UPDATE run_user_inputs SET applied_at = now(), consumed_at = COALESCE(consumed_at, now())
+    WHERE run_id IN (SELECT failed_run_id FROM failed) AND kind = 'reject_plan' AND applied_at IS NULL
+    RETURNING id
+)
+SELECT count(*) FROM failed;
+
 -- name: MarkRunFailedByID :execrows
 -- Service-internal fail (e.g. a claim whose secrets are missing/undecryptable):
 -- the run was just claimed by this worker but cannot run. failed → origin

@@ -260,7 +260,9 @@ type fakeStore struct {
 	setFollowupRows int64
 	setCompleted    *store.SetRunCompletedParams
 	setFailed       *store.SetRunFailedParams
-	reconciledMR    *store.ReconcileRunMRParams
+	// Issue #1604: the plan_rejected failed arm's settle-and-fail query.
+	setFailedPlanRejected *store.SetRunFailedPlanRejectedParams
+	reconciledMR          *store.ReconcileRunMRParams
 	// PRD #1226 M2: completion-attempt + permit-issue capture for the fake-store denial/grant
 	// unit tests (the transactional completion path is covered by the LiveDB tests instead).
 	recordedAttempts   []store.RecordCompletionAttemptParams
@@ -1134,6 +1136,10 @@ func (f *fakeStore) SettleScopeInputDisposition(_ context.Context, arg store.Set
 }
 func (f *fakeStore) SetRunFailed(_ context.Context, arg store.SetRunFailedParams) (int64, error) {
 	f.setFailed = &arg
+	return 1, nil
+}
+func (f *fakeStore) SetRunFailedPlanRejected(_ context.Context, arg store.SetRunFailedPlanRejectedParams) (int64, error) {
+	f.setFailedPlanRejected = &arg
 	return 1, nil
 }
 func (f *fakeStore) ReconcileRunMR(_ context.Context, arg store.ReconcileRunMRParams) (int64, error) {

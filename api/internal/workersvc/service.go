@@ -732,6 +732,9 @@ type Store interface {
 	SetRunAwaitingFollowup(ctx context.Context, arg store.SetRunAwaitingFollowupParams) (int64, error)
 	SetRunCompleted(ctx context.Context, arg store.SetRunCompletedParams) (int64, error)
 	SetRunFailed(ctx context.Context, arg store.SetRunFailedParams) (int64, error)
+	// SetRunFailedPlanRejected is SetRunFailed for a plan_rejected report that also settles the
+	// run's unapplied reject_plan inputs in the same statement (issue #1604).
+	SetRunFailedPlanRejected(ctx context.Context, arg store.SetRunFailedPlanRejectedParams) (int64, error)
 	// SetRunCheckpointTip records runs.checkpoint_tip on every successful checkpoint
 	// publish (PRD #1042 M2); best-effort, never fails the publish.
 	SetRunCheckpointTip(ctx context.Context, arg store.SetRunCheckpointTipParams) (int64, error)
@@ -3769,7 +3772,12 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// A live plan-reject: stamp fail_origin='plan_rejected' (overriding the untrusted
 			// req.FailOrigin, which the worker cannot forge), matching the server-side
 			// RejectRunServerSide path rather than defaulting to agent_failure.
-			rows, err = q.SetRunFailed(ctx, store.SetRunFailedParams{
+			// Issue #1604: the same statement settles the run's still-unapplied reject_plan
+			// inputs, so no later claim replays a reject for a run that is already failed. It
+			// runs on whichever q this report uses: the fence tx for a fenced report, the pool
+			// for a generation-less one, where the single statement is what keeps the two
+			// writes together. rows counts transitioned runs, exactly as SetRunFailed's did.
+			rows, err = q.SetRunFailedPlanRejected(ctx, store.SetRunFailedPlanRejectedParams{
 				FailureReason:  limitAwareFailureReason(req),
 				FailOrigin:     pgconv.TextOrNull("plan_rejected"),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
