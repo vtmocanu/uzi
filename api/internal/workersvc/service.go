@@ -3352,11 +3352,12 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// Empty means "no settle". The failed arm and the forge-park settle (below) also set it
 	// 'declined' for a scope-directed run; every other transition leaves it empty.
 	var settleScopeDisposition string
-	// Issue #1399: set by the forge pre-clone park arm when the run carries a scope directive.
-	// That park can end TERMINAL (cap-fail, stamped cancel, or the nil-txBeginner fail-safe), and
-	// the terminal outcome is only known from the post-switch re-read, so the settle decision is
-	// deferred to the applied-transition block below.
-	var forgeScopeSettle bool
+	// Issue #1399: set by the forge pre-clone park arm. That park can end TERMINAL (cap-fail,
+	// stamped cancel, or the nil-txBeginner fail-safe), and both the terminal outcome and the
+	// scope directive are read from the post-switch re-read in the applied-transition block
+	// below: the pre-switch `owned` read is unlocked, so a scope directive can commit before
+	// parkForgeUnreachable's FOR UPDATE reread.
+	var forgePark bool
 	switch req.State {
 	case "running":
 		// RC1 (issue #1197): an AUTOPILOT run auto-approves its own plan and NEVER reports
@@ -3688,11 +3689,12 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		if req.RecoveryCause != nil && *req.RecoveryCause == "forge_unreachable" {
 			// Issue #1399 (PRD #634 follow-up, as in the failed arm): a scope-directed run this
 			// park fails or cancels never applied its scope cap, so its pending audit row must
-			// settle 'declined'. Decided off the post-switch re-read, not frun:
-			// parkForgeUnreachable returns the PRE-transition row for cancel/cap-fail, and
-			// failForgeUnsettleable returns no row at all. A normal park re-reads as
-			// recovery_wait and leaves the row pending.
-			forgeScopeSettle = owned.ScopeCeiling.Valid
+			// settle 'declined'. Decided off the post-switch re-read, not frun or owned:
+			// parkForgeUnreachable returns the PRE-transition row for cancel/cap-fail,
+			// failForgeUnsettleable returns no row at all, and `owned` is unlocked, so a
+			// scope directive can commit after it. A normal park re-reads as recovery_wait
+			// and leaves the row pending.
+			forgePark = true
 			if s.txBeginner == nil {
 				rows, err = s.failForgeUnsettleable(ctx, wkr, runID, req, sessionID)
 				break
@@ -3881,7 +3883,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// terminal report. Idempotent (WHERE disposition IS NULL) and matches 0 rows on a run
 		// with no scope directive, so it is harmless when unset by a non-completed transition
 		// (settleScopeDisposition stays empty then and this is skipped).
-		if forgeScopeSettle && (run.Status == "failed" || run.Status == "cancelled") {
+		if forgePark && run.ScopeCeiling.Valid && (run.Status == "failed" || run.Status == "cancelled") {
 			settleScopeDisposition = "declined"
 		}
 		if settleScopeDisposition != "" {

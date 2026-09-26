@@ -1,9 +1,11 @@
 package workersvc
 
 import (
+	"context"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -63,6 +65,53 @@ func TestForgeParkCapFailSettlesScopeDeclinedLiveDB(t *testing.T) {
 	}
 	if disp, settled := e.scopeDisposition(t, runID); !settled || disp != "declined" {
 		t.Fatalf("scope disposition = %q (settled=%v), want declined on the terminal cap-fail", disp, settled)
+	}
+}
+
+// fpDirectiveOnBegin is a TxBeginner whose FIRST Begin commits a scope directive on the pool
+// before delegating. On the recovery_wait forge path that first Begin is parkForgeUnreachable's:
+// after SetState's unlocked `owned` read, before the locked reread.
+type fpDirectiveOnBegin struct {
+	e     interlockLiveDB
+	t     *testing.T
+	runID uuid.UUID
+	fired bool
+}
+
+func (b *fpDirectiveOnBegin) Begin(ctx context.Context) (pgx.Tx, error) {
+	if !b.fired {
+		b.fired = true
+		b.e.fpSeedScopeDirected(b.t, b.runID)
+	}
+	return b.e.pool.Begin(ctx)
+}
+
+// TestForgeParkScopeDirectiveDuringParkSettlesDeclinedLiveDB: a scope directive that commits
+// between SetState's unlocked read and the forge park's FOR UPDATE reread is still settled
+// 'declined' by the terminal cap-fail (the settle reads the post-transition row, not `owned`).
+func TestForgeParkScopeDirectiveDuringParkSettlesDeclinedLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.forgeParkService(t, 2) // cap 2
+
+	w := e.seedWorker(t, nil)
+	runID := e.fpSeedRunning(t, w, 1)
+	e.exec(t, `UPDATE runs SET forge_park_count = 2 WHERE id = $1`, runID)
+	mhOpenHold(t, e, runID, 1, w)
+	hook := &fpDirectiveOnBegin{e: e, t: t, runID: runID}
+	svc.SetTxBeginner(hook)
+
+	run, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, runID, fpForgeParkReport())
+	if err != nil || !applied {
+		t.Fatalf("SetState(forge park past cap): applied=%v err=%v", applied, err)
+	}
+	if !hook.fired {
+		t.Fatal("Begin hook never fired: the scope directive was not injected mid-park")
+	}
+	if run.Status != "failed" {
+		t.Fatalf("run status = %q, want failed (past the forge cap)", run.Status)
+	}
+	if disp, settled := e.scopeDisposition(t, runID); !settled || disp != "declined" {
+		t.Fatalf("scope disposition = %q (settled=%v), want declined for a directive committed mid-park", disp, settled)
 	}
 }
 
