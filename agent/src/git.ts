@@ -25,6 +25,14 @@ import {
 
 const execFileAsync = promisify(execFile);
 
+export class ScratchPublicationError extends Error {
+  readonly code = "scratch_publication_refused";
+  constructor(reason: string, cause?: unknown) {
+    super(`scratch_publication_refused: ${reason}`, { cause });
+    this.name = "ScratchPublicationError";
+  }
+}
+
 export class ScratchProvisionError extends Error {
   readonly code = "scratch_provision_failed";
   constructor(cause: unknown) {
@@ -808,21 +816,74 @@ export class GitCache {
    *
    * Under (b) the agent's commit lives in the RUNNER clone, so the source is the
    * worker-side tracking ref `fetchAgentBranch` wrote (refs/uzi-runner/<branch>),
-   * NOT refs/heads/<branch> — the caller MUST fetchAgentBranch first. Pushing from
-   * the tracking ref keeps the runner's branch out of the bare's heads namespace
-   * (B2 invariant 2) while landing the agent's commits at origin's refs/heads.
+   * NOT refs/heads/<branch> — the caller MUST fetchAgentBranch first. The ref is
+   * resolved to a pinned commit before pushing, keeping the runner's branch out
+   * of the bare's heads namespace (B2 invariant 2).
    */
   async pushBranch(barePath: string, branch: string, pat: string, repoUrl: string, username?: string): Promise<void> {
     const scope = httpScopeForUrl(repoUrl);
-    const src = runnerTrackingRef(branch);
     await this.withLock(barePath, async () => {
-      if (!(await this.refExists(barePath, src))) {
-        // The tracking ref is written by fetchAgentBranch; its absence means the
-        // fetch-back was skipped — refuse rather than silently pushing nothing.
-        throw new Error(`cannot push ${branch}: ${src} not present (fetchAgentBranch must run first)`);
-      }
-      await this.runGit(barePath, ["push", "origin", `${src}:refs/heads/${branch}`], pat, scope, username);
+      const candidate = await this.scratchPublicationPreflight(barePath, branch);
+      await this.refreshScratchPublicationFloor(barePath, branch, candidate, pat, scope, username);
+      // A literal OID keeps the candidate fixed even if the tracking ref moves.
+      await this.runGit(barePath, ["push", "origin", `${candidate}:refs/heads/${branch}`], pat, scope, username);
     });
+  }
+
+  /** Public bridge entry point: validate the exact commit before changing custody. */
+  async scratchPublicationPreflight(barePath: string, branch: string, candidateSha?: string): Promise<string> {
+    try {
+      const candidate = candidateSha ?? await this.trackingTip(barePath, branch);
+      if (!candidate || !SHA40_RE.test(candidate) ||
+          await this.revParse(barePath, `${candidate}^{commit}`) !== candidate) {
+        throw new Error("candidate commit is unavailable");
+      }
+      if ((await this.runGit(barePath, ["rev-parse", "--is-shallow-repository"])).trim() !== "false") {
+        throw new Error("history is shallow");
+      }
+      // Walk all reachable objects without collecting object names. Missing objects,
+      // a deadline, or output overflow must all refuse publication.
+      await this.execScoped("git", withDir(barePath, [
+        "rev-list", "--objects", "--missing=error", "--quiet", candidate,
+      ]), { env: gitEnv(), timeout: 10_000, maxBuffer: 4_096 });
+      // Full history preserves merged side branches and root commits. The pathspec
+      // matches both the exact file/symlink and everything below the directory.
+      const { stdout: touched } = await this.execScoped("git", withDir(barePath, [
+        "rev-list", "--full-history", "--max-count=1", candidate, "--", ".uzi/scratch",
+      ]), { env: gitEnv(), timeout: 10_000, maxBuffer: 4_096 });
+      if (touched.trim()) throw new Error(".uzi/scratch appears in candidate history");
+      return candidate;
+    } catch (cause) {
+      if (cause instanceof ScratchPublicationError) throw cause;
+      throw new ScratchPublicationError("cannot prove scratch-free candidate history", cause);
+    }
+  }
+
+  private async refreshScratchPublicationFloor(
+    barePath: string, branch: string, candidate: string, pat: string, scope: string | undefined, username?: string,
+  ): Promise<void> {
+    const remoteRef = `refs/heads/${branch}`;
+    const scratchRef = `refs/uzi-publication-floor/${branch}`;
+    try {
+      const listed = (await this.runGit(barePath, ["ls-remote", "origin", remoteRef], pat, scope, username)).trim();
+      if (!listed) {
+        if (await this.refExists(barePath, `refs/remotes/origin/${branch}`)) throw new Error("remote branch rewound away");
+        return;
+      }
+      const match = /^([0-9a-f]{40})\trefs\/heads\/.+$/.exec(listed);
+      if (!match || listed !== `${match[1]}\t${remoteRef}`) throw new Error("remote branch response is ambiguous");
+      await this.runGit(barePath, ["fetch", "--refmap=", "origin", `+${remoteRef}:${scratchRef}`], pat, scope, username);
+      const fresh = await this.revParse(barePath, `${scratchRef}^{commit}`);
+      if (fresh !== match[1]) throw new Error("remote branch changed during refresh");
+      const prior = await this.revParse(barePath, `refs/remotes/origin/${branch}^{commit}`);
+      if (prior && !(await this.isAncestorRef(barePath, prior, fresh))) throw new Error("remote branch rewound");
+      if (!(await this.isAncestorRef(barePath, fresh, candidate))) throw new ScratchPublicationError("non-fast-forward remote floor");
+    } catch (cause) {
+      if (cause instanceof ScratchPublicationError) throw cause;
+      throw new ScratchPublicationError("cannot verify fresh remote floor", cause);
+    } finally {
+      await this.runGit(barePath, ["update-ref", "-d", scratchRef]).catch(() => undefined);
+    }
   }
 
   /** The default branch's short name (e.g. `main`), for an MR target. */
@@ -2049,25 +2110,33 @@ export class GitCache {
     overlay?: CheckpointOverlayContext,
     pinned?: CheckpointRange,
   ): Promise<{ tipOid: string; pack: Readable } | null> {
-    // issue #1597 M2: a PINNED range (the exact SHAs the secret scan walked) packs exactly
-    // `tipSha ^excludeSha` — no ref is re-resolved, so a tracking/origin ref that moved between the
-    // scan and the pack can neither widen the range to an unscanned commit nor swap the tip. Only
-    // honoured WITHOUT an overlay (an overlay publish is not scanned and stays byte-unchanged).
-    if (pinned && !overlay) {
+    // A pinned range uses literal commit OIDs for the pack floor and candidate.
+    // If an overlay is requested, its wrapper becomes the wanted OID while the
+    // excluded floor remains pinned.
+    if (pinned) {
       if (!SHA40_RE.test(pinned.tipSha) || !SHA40_RE.test(pinned.excludeSha)) {
         throw new Error("checkpointPack: pinned range must be two 40-hex commit SHAs");
+      }
+      await this.scratchPublicationPreflight(barePath, branch, pinned.tipSha);
+      await this.validateCheckpointFloor(barePath, pinned.excludeSha, pinned.tipSha);
+      let wanted = pinned.tipSha;
+      if (overlay) {
+        wanted = await this.buildWorkflowOverlay(barePath, branch, pinned.tipSha, overlay) ?? wanted;
+        await this.scratchPublicationPreflight(barePath, branch, wanted);
       }
       const { stdout } = await this.spawnGit(
         barePath,
         ["pack-objects", "--revs", "--stdout"],
-        `${pinned.tipSha}\n^${pinned.excludeSha}\n`,
+        `${wanted}\n^${pinned.excludeSha}\n`,
       );
-      return { tipOid: pinned.tipSha, pack: stdout };
+      return { tipOid: wanted, pack: stdout };
     }
     const realTip = await this.trackingTip(barePath, branch);
     if (!realTip) return null;
+    await this.scratchPublicationPreflight(barePath, branch, realTip);
     const excludeRef = await this.checkpointExcludeRef(barePath, branch);
-    const trackingRef = runnerTrackingRef(branch);
+    const excludeSha = await this.revParse(barePath, `${excludeRef}^{commit}`);
+    await this.validateCheckpointFloor(barePath, excludeSha, realTip);
 
     // PRD #1062 M2 (#1036) — the `.github/workflows` overlay. When an overlay context is
     // supplied (GitHub, agent already reaped — see runner.ts), attempt to build a genuine
@@ -2081,21 +2150,28 @@ export class GitCache {
     let wantRev = realTip;
     if (overlay) {
       const ov = await this.buildWorkflowOverlay(barePath, branch, realTip, overlay);
-      if (ov) wantRev = ov;
+      if (ov) {
+        wantRev = ov;
+        await this.scratchPublicationPreflight(barePath, branch, wantRev);
+      }
     }
 
-    // pack-objects reads the wanted/excluded revs on stdin (one ref per line, `^` excludes)
-    // and writes the packfile to stdout. The wanted rev is `realTip` on the no-overlay path
-    // (via `trackingRef`'s tip) and `O_ov` when an overlay was built; `^excludeRef` is the
-    // same floor either way, so the default's workflow blobs (reachable from the floor on the
-    // not-pushed leg) are not re-shipped.
-    const wanted = wantRev === realTip ? trackingRef : wantRev;
+    // Pack the same immutable candidate and floor that passed validation.
+    const wanted = wantRev;
     const { stdout } = await this.spawnGit(
       barePath,
       ["pack-objects", "--revs", "--stdout"],
-      `${wanted}\n^${excludeRef}\n`,
+      `${wanted}\n^${excludeSha}\n`,
     );
     return { tipOid: wantRev, pack: stdout };
+  }
+
+  private async validateCheckpointFloor(barePath: string, floor: string | null, candidate: string): Promise<void> {
+    if (!floor || !SHA40_RE.test(floor) ||
+        await this.revParse(barePath, `${floor}^{commit}`) !== floor ||
+        !(await this.isAncestorRef(barePath, floor, candidate))) {
+      throw new ScratchPublicationError("checkpoint floor is unavailable or not an ancestor of candidate");
+    }
   }
 
   /** issue #1597 M2 — the floor a checkpoint pack excludes: `refs/remotes/origin/<branch>` when
