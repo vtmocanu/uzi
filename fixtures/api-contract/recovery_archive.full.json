@@ -1,6 +1,7 @@
 {
   "id": "x",
   "run_id": "x",
+  "hold_id": "x",
   "state": "x",
   "source_sha": "x",
   "attempted_head_sha": "x",

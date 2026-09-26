@@ -1,6 +1,7 @@
 {
   "id": "",
   "run_id": "",
+  "hold_id": "",
   "state": "",
   "source_sha": "",
   "created_at": "0001-01-01T00:00:00Z"

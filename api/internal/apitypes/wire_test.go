@@ -1124,8 +1124,9 @@ func TestAdminBlockedReposDTOTags(t *testing.T) {
 // carries only the always-present keys; the populated pin asserts every optional key
 // surfaces when set (the finding.zero/full shape).
 func TestRecoveryArchiveDTOTags(t *testing.T) {
+	// hold_id (#1417) is always present: `uzi run recovery --json` joins captures on it.
 	assertTags(t, "RecoveryArchiveDTO", RecoveryArchiveDTO{},
-		"id", "run_id", "state", "source_sha", "created_at")
+		"id", "run_id", "hold_id", "state", "source_sha", "created_at")
 	h := "abc123"
 	sz := int64(42)
 	now := time.Unix(0, 0)
@@ -1134,7 +1135,7 @@ func TestRecoveryArchiveDTOTags(t *testing.T) {
 		PrerequisiteShas: []string{"deadbeef"}, ExpiresAt: &now,
 	}
 	assertTags(t, "RecoveryArchiveDTO(full)", full,
-		"id", "run_id", "state", "source_sha", "created_at",
+		"id", "run_id", "hold_id", "state", "source_sha", "created_at",
 		"attempted_head_sha", "byte_size", "checksum", "reason", "prerequisite_shas", "expires_at")
 }
 

@@ -3964,6 +3964,7 @@ export interface CIRunDetail extends CIRun {
 export interface RecoveryArchive {
   id: string;
   run_id: string;
+  hold_id: string;
   state: string;
   source_sha: string;
   attempted_head_sha?: string;

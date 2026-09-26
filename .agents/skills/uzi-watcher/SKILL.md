@@ -215,8 +215,9 @@ workflow-file pieces locally, because your own token has `workflow` scope (confi
 no kube access:
 
 - `uzi run export RUN --output FILE`: the #1296 recovery capture. Only an `available` capture
-  exports; with several, pass `--capture ID`, reading the ids from `GET /api/runs/RUN/archives`
-  until #1417 lands (the CLI listing truncates them).
+  exports; with several, pass `--capture ID`, reading the ids from `uzi run recovery RUN
+  --json` (each hold's `captures[].id`) or from `run export`'s own stderr listing when it
+  refuses to guess.
 - `uzi run get RUN --json | jq -r .preserved_patch`: the diff a typed push failure preserves.
 
 Fall back to the worker PVC only for a **persistent** hosted worker: the bare repository's
