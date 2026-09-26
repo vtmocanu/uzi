@@ -2,7 +2,7 @@
 
 **Issue:** [#1209](https://github.com/vtmocanu/uzi/issues/1209) · **Priority:** Medium · **Status:** Implemented; M1–M4 landed, reviewed and green on branch `agent/issue-1209` (2026-09-20); M5 docs/ADR landed. Live maintainer runtime acceptance (deploy + authorized test subscription) PENDING — feature readiness pending, PRD retained in `prds/`. (AI-synced 2026-09-20)
 **Dependency:** [#1171](https://github.com/vtmocanu/uzi/issues/1171) is closed and its production credential/refresh integration is merged. Planning must consume that landed contract without weakening worker authorization.
-**Related:** [#1106](1106-codex-harness-phase1.md), [credential foundation #1147](done/1147-codex-credentials-foundation.md), [production bridge #1171](done/1171-codex-production-adapter.md).
+**Related:** [#1106](done/1106-codex-harness-phase1.md), [credential foundation #1147](done/1147-codex-credentials-foundation.md), [production bridge #1171](done/1171-codex-production-adapter.md).
 **Evidence baseline:** `2ce64506b634a482974be97dbbd5b6f60e6ddf09`, checked 2026-09-08. Upstream Codex source is pinned below. No real credential, provider request or deployment was used to author this PRD.
 
 ## Problem and outcome

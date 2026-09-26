@@ -6,7 +6,7 @@
 
 **Priority:** Medium
 
-**Related:** [PRD #1106](1106-codex-harness-phase1.md), completed public activation [PRD #1429](done/1429-codex-public-activation.md), judge-model follow-up [#1454](https://github.com/vtmocanu/uzi/issues/1454).
+**Related:** [PRD #1106](done/1106-codex-harness-phase1.md), completed public activation [PRD #1429](done/1429-codex-public-activation.md), judge-model follow-up [#1454](https://github.com/vtmocanu/uzi/issues/1454).
 
 **Reviewed UI direction:** [interactive grouped-settings mock](mockups/1551-per-harness-model-defaults.html).
 

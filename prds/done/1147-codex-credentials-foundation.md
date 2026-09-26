@@ -6,7 +6,7 @@
 
 Users need to save named Codex subscription logins and OpenAI API keys, choose one Codex credential default and keep each run bound to its chosen credential. Implement credential management and the server/API foundation for later Codex execution. **M1 ships dark:** saving a credential does not enable provider execution. M3 owns the runtime bridge; M5 owns broad harness selection, schedules and routing.
 
-Start from current `main` with accepted [ADR-1106](../../adr/1106-codex-harness.md) and [parent decisions](../1106-codex-harness-phase1.md#decision-log). [M2 #1146](https://github.com/vtmocanu/uzi/issues/1146) runs independently in `agent/`; this child must not modify any production `agent/` file or the complete `agent/test/` tree. Work on a new branch, never `main`. Finish only this child and hand off its PR; Auto orchestration may rework and merge it. Do not implement, close or move the parent or start M3/M4/M5/M6/M7.
+Start from current `main` with accepted [ADR-1106](../../adr/1106-codex-harness.md) and [parent decisions](1106-codex-harness-phase1.md#decision-log). [M2 #1146](https://github.com/vtmocanu/uzi/issues/1146) runs independently in `agent/`; this child must not modify any production `agent/` file or the complete `agent/test/` tree. Work on a new branch, never `main`. Finish only this child and hand off its PR; Auto orchestration may rework and merge it. Do not implement, close or move the parent or start M3/M4/M5/M6/M7.
 
 ## Approved policies
 

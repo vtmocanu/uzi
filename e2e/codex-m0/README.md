@@ -1,6 +1,6 @@
 # Codex M0 characterization
 
-Opt-in, credential-free experiments for [PRD #1106](../../prds/1106-codex-harness-phase1.md).
+Opt-in, credential-free experiments for [PRD #1106](../../prds/done/1106-codex-harness-phase1.md).
 They run the real **Codex CLI 0.153.2** app-server against deterministic Responses
 fixtures served only on `127.0.0.1` at an ephemeral port. No model makes decisions:
 the fixture emits fixed harmless tools and checks their real effects in its own

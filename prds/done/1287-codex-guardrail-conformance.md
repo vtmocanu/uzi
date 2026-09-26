@@ -1,7 +1,7 @@
 # PRD #1287: Codex guardrail conformance
 
 **Issue**: [#1287](https://github.com/vtmocanu/uzi/issues/1287) · **Priority**: High
-**Parent**: [#1106](../1106-codex-harness-phase1.md), M4 only.
+**Parent**: [#1106](1106-codex-harness-phase1.md), M4 only.
 **Status**: Complete 2026-09-13. C1-C5 implementation, maintainer O evidence, strict macOS Linux-container acceptance and current-head CI passed in PR #1309; parent M4 is complete.
 **Evidence baseline**: `4c90cd97` (2026-09-12). Recheck named symbols against the implementation base; historical test totals are not acceptance evidence for this child.
 **Handoff**: Parent M5 is unblocked but remains a separate, undispatched milestone.
@@ -63,7 +63,7 @@ Calibrate the gate with restored one-at-a-time enforcement mutations or equivale
 
 ### D5: Preserve Claude and distinguish advice
 
-[Parent D0](../1106-codex-harness-phase1.md#decision-log) remains binding. Existing Claude options, hooks, in-process tools, event/reducer behavior, cleanup timing and advice fallback behavior do not change. Add tests rather than weakening, deleting or rewriting existing assertions to make parity green. Codex-specific wire concepts map to the equivalent invariant on Claude, not invented Claude protocol fields.
+[Parent D0](1106-codex-harness-phase1.md#decision-log) remains binding. Existing Claude options, hooks, in-process tools, event/reducer behavior, cleanup timing and advice fallback behavior do not change. Add tests rather than weakening, deleting or rewriting existing assertions to make parity green. Codex-specific wire concepts map to the equivalent invariant on Claude, not invented Claude protocol fields.
 
 Advice receives no run workspace or handler registry. Both adapters deny shell, filesystem, network tools, delegation, run/worker callbacks and credential access. Claude remains tool-less with its deny-all hook; Codex's existing isolated pure in-memory calculation may remain. Test allowed text/results as a positive control, and test the actual exposed calculation path only where one exists. Do not add a capability to manufacture symmetry.
 

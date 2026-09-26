@@ -2,7 +2,7 @@
 
 **Status**: Accepted (M0 design and feasibility; production implementation/conformance remain M3/M4)
 **Date**: 2026-09-05
-**PRD**: [PRD #1106](../prds/1106-codex-harness-phase1.md)
+**PRD**: [PRD #1106](../prds/done/1106-codex-harness-phase1.md)
 
 ## Context
 
@@ -242,7 +242,7 @@ re-login failures, so a replay experiment could revoke the token family and was
 not safe under the user's conditional approval. M0 therefore proves refresh and
 rotation, but does not claim the previous refresh token remains usable.
 
-**Policy superseded by the user, 2026-09-06:** [PRD #1106 D5](../prds/1106-codex-harness-phase1.md#decision-log)
+**Policy superseded by the user, 2026-09-06:** [PRD #1106 D5](../prds/done/1106-codex-harness-phase1.md#decision-log)
 now permits multiple concurrent runs on one Codex subscription. The earlier
 one-run-per-seat prescription is retired. Enforceable coordination of credential
 refresh operations and durable latest-state reconciliation remain production
@@ -485,7 +485,7 @@ The source inventory is pinned to `bc5a0a8b11f5c98a7067c1fc4202d37a0f27f92e`:
   app-server adapter must use actual runtime identity and observed content,
   without fabricating child messages or treating hook identity as attribution.
 - Both credential modes remain required. User-approved 2026-09-06
-  [D5](../prds/1106-codex-harness-phase1.md#decision-log) allows same-subscription
+  [D5](../prds/done/1106-codex-harness-phase1.md#decision-log) allows same-subscription
   concurrency and supersedes the earlier run-long seat lock. Coordinated refresh
   and durable latest-state recovery remain production requirements; prior-token
   reuse remains unproven.

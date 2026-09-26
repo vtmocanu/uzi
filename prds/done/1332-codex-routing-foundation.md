@@ -1,7 +1,7 @@
 # PRD #1332: Dark Codex routing foundation (#1106 M5A)
 
 **Issue**: [#1332](https://github.com/vtmocanu/uzi/issues/1332) · **Priority**: High (safety boundary before public routing)
-**Parent**: [#1106](../1106-codex-harness-phase1.md), M5A only.
+**Parent**: [#1106](1106-codex-harness-phase1.md), M5A only.
 **Status**: M5A implemented and reviewed on branch agent/issue-1332; all six milestones complete, all gates green (gate:api, gate:agent, gate:repo, gate:web, ./e2e/run-store-it.sh) and the D7 dark negative inventory verified — Codex unreachable from every public path. Unblocks authoring M5B (undispatched).
 **Depends on**: #1106 M1-M4, complete through PR #1309.
 **Blocks**: M5B atomic public activation, then parent M6-M7.

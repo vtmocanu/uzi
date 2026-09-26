@@ -1,7 +1,7 @@
 # PRD #1429: Atomic Codex public activation (#1106 M5B)
 
 **Issue**: [#1429](https://github.com/vtmocanu/uzi/issues/1429)  
-**Parent**: [#1106](../1106-codex-harness-phase1.md), M5B only  
+**Parent**: [#1106](1106-codex-harness-phase1.md), M5B only  
 **Depends on**: completed M5A [#1332](1332-codex-routing-foundation.md), plus the remaining #1247 work in PR #1427 merged and green before implementation starts  
 **Priority**: High  
 **Status**: Complete. M1-M6 are done. The joined offline e2e run (`./e2e/run-e2e.sh`, including phase 74) was observed green on the MR head on 2026-09-19, which was the pre-merge exit criterion (see Decision log 2026-09-19). This child is one atomic public-enablement change; it must not be split into separately mergeable backend and frontend PRs.  

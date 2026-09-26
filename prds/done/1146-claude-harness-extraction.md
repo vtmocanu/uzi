@@ -15,7 +15,7 @@ The contract's source inventory is pinned to `bc5a0a8b11f5c98a7067c1fc4202d37a0f
 
 ## Binding scope
 
-Preserve D0 from `prds/1106-codex-harness-phase1.md`: the default Claude path retains the same SDK options, prompts, in-process tools, hooks, environment, emitted messages, errors, accounting and lifecycle timing. **The complete `agent/test/` tree must remain byte-identical to the starting base: no edits, additions, deletions, renames or fixture rewrites.** Do not weaken another gate to accommodate the extraction.
+Preserve D0 from `prds/done/1106-codex-harness-phase1.md`: the default Claude path retains the same SDK options, prompts, in-process tools, hooks, environment, emitted messages, errors, accounting and lifecycle timing. **The complete `agent/test/` tree must remain byte-identical to the starting base: no edits, additions, deletions, renames or fixture rewrites.** Do not weaken another gate to accommodate the extraction.
 
 Use the accepted type surface and ownership rules in `e2e/codex-m0/harness-contract.md`, especially:
 
