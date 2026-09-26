@@ -38,9 +38,27 @@ new_network() {
   WEB="$NET-web"
 }
 start_api() {
-  docker run -d --name "$API" --network "$NET" --network-alias api \
+  local ip=()
+  [ -z "${1:-}" ] || ip=(--ip "$1")
+  docker run -d --name "$API" --network "$NET" --network-alias api "${ip[@]}" \
     -e MARKER=api "$API_IMAGE" >/dev/null
   CONTAINERS+=("$API")
+}
+# The address change must be deterministic, not left to Docker's IP allocator, which
+# may hand a restarted container its old address. `--ip` needs a user-configured
+# subnet, so pin the one Docker just chose for this network (free by construction)
+# and derive two fixed host addresses from it.
+pin_subnet() {
+  local subnet base prefix
+  subnet="$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "$NET")"
+  base="${subnet%/*}"
+  prefix="${subnet#*/}"
+  case "$base" in *.0) ;; *) fail "unexpected subnet $subnet" ;; esac
+  [ "$prefix" -le 24 ] || fail "subnet $subnet too small for fixed addresses"
+  docker network rm "$NET" >/dev/null
+  docker network create --subnet "$subnet" "$NET" >/dev/null
+  IP_BEFORE="${base%.0}.200"
+  IP_AFTER="${base%.0}.201"
 }
 start_filler() {
   docker run -d --name "$FILLER" --network "$NET" \
@@ -176,16 +194,23 @@ if [ "$MODE" = --green ]; then
 fi
 
 new_network swap
-start_api
+pin_subnet
+start_api "$IP_BEFORE"
 start_filler
 start_web
 record_identity
 poll_recovery || fail "could not prime both locations before swap"
 OLD_IP="$(api_ip)"
 [ -n "$OLD_IP" ] || fail "stand-in has no initial IP"
+[ "$OLD_IP" = "$IP_BEFORE" ] || fail "stand-in started at $OLD_IP, not the pinned $IP_BEFORE"
 docker stop "$API" >/dev/null
-docker restart "$FILLER" >/dev/null
+docker network disconnect "$NET" "$API" >/dev/null
+docker network connect --ip "$IP_AFTER" --alias api "$NET" "$API" >/dev/null
 docker start "$API" >/dev/null
+# Park the filler on the vacated address, so a stale proxy reaches a live, identifiable
+# container (marker "filler") instead of hanging on an empty address.
+docker network disconnect "$NET" "$FILLER" >/dev/null
+docker network connect --ip "$IP_BEFORE" "$NET" "$FILLER" >/dev/null
 NEW_IP="$(api_ip)"
 API_STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$API")"
 [ -n "$NEW_IP" ] && [ "$OLD_IP" != "$NEW_IP" ] ||
