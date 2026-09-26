@@ -914,10 +914,11 @@ type Store interface {
 	RequeueWorkerRuns(ctx context.Context, arg store.RequeueWorkerRunsParams) ([]uuid.UUID, error)
 
 	// Run-health detector (PRD #47): the per-tick active-run scan, the per-running-run
-	// tool window (loop + in-flight), the single health writer, and the queued-run
-	// worker-online count.
+	// tool window (loop) and lead-lane window (in-flight, issue #1394), the single
+	// health writer, and the queued-run worker-online count.
 	ListActiveRunsForHealth(ctx context.Context, codexCuratedModels []string) ([]store.ListActiveRunsForHealthRow, error)
 	ListRunToolWindow(ctx context.Context, arg store.ListRunToolWindowParams) ([]store.ListRunToolWindowRow, error)
+	ListRunLeadToolWindow(ctx context.Context, arg store.ListRunLeadToolWindowParams) ([]store.ListRunLeadToolWindowRow, error)
 	SetRunHealth(ctx context.Context, arg store.SetRunHealthParams) (int64, error)
 	CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUID) (int64, error)
 	CountOnlineWorkersWithFreeSlotForUser(ctx context.Context, userID uuid.UUID) (int64, error)

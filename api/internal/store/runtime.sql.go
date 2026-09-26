@@ -7002,6 +7002,58 @@ func (q *Queries) ListRunCredentialEpochs(ctx context.Context, arg ListRunCreden
 	return items, nil
 }
 
+const listRunLeadToolWindow = `-- name: ListRunLeadToolWindow :many
+SELECT seq, kind, payload
+FROM run_messages
+WHERE run_id = $1 AND agent_instance IS NULL
+  AND (kind IN ('tool_use', 'tool_result')
+       OR (kind IN ('status', 'error') AND payload->>'event' IN ('init', 'result')))
+ORDER BY seq DESC
+LIMIT $2
+`
+
+type ListRunLeadToolWindowParams struct {
+	RunID uuid.UUID `json:"run_id"`
+	Lim   int32     `json:"lim"`
+}
+
+type ListRunLeadToolWindowRow struct {
+	Seq     int32  `json:"seq"`
+	Kind    string `json:"kind"`
+	Payload []byte `json:"payload"`
+}
+
+// The tail of a running run's LEAD lane for in-flight detection only (Decision 9,
+// issue #1394). ListRunToolWindow above mixes the lead's rows with every nested
+// subagent's, so a subagent's completed calls hid the lead's still-open parent
+// `Agent` dispatch and a working run read as stalled. This query keeps
+// the lead lane alone (agent_instance IS NULL: nested frames carry the SDK's
+// parent_tool_use_id there, migration 00075) and adds the lead's lifecycle
+// boundaries, the `init` status and the `result` status/error, so the Go side can
+// stop its scan at the start of the current claim/query leg and never count an
+// orphaned call from an earlier leg as in flight. Loop detection keeps reading
+// ListRunToolWindow unchanged. The Go side re-checks kind and payload event
+// itself rather than trusting this filter alone.
+func (q *Queries) ListRunLeadToolWindow(ctx context.Context, arg ListRunLeadToolWindowParams) ([]ListRunLeadToolWindowRow, error) {
+	rows, err := q.db.Query(ctx, listRunLeadToolWindow, arg.RunID, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRunLeadToolWindowRow{}
+	for rows.Next() {
+		var i ListRunLeadToolWindowRow
+		if err := rows.Scan(&i.Seq, &i.Kind, &i.Payload); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunMessagesAfter = `-- name: ListRunMessagesAfter :many
 SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
 FROM run_messages

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sort"
 	"testing"
 	"time"
 
@@ -22,8 +23,15 @@ var t0 = time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
 // path reaches panics, keeping the tests honest about what the detector touches.
 type healthFakeStore struct {
 	Store
-	active        []store.ListActiveRunsForHealthRow
-	window        map[uuid.UUID][]store.ListRunToolWindowRow
+	active []store.ListActiveRunsForHealthRow
+	window map[uuid.UUID][]store.ListRunToolWindowRow
+	// messages is an optional per-run run_messages log (seq ascending or not; the
+	// fake orders it). When a run has one, BOTH tool-window reads derive from it with
+	// the real queries' filter + ORDER BY seq DESC + LIMIT semantics, so a test can
+	// model nested subagent rows (agentInstance set) crowding the mixed window (issue
+	// #1394). When unset, ListRunToolWindow returns window verbatim and
+	// ListRunLeadToolWindow falls back to window's rows as lead-lane rows.
+	messages      map[uuid.UUID][]fakeRunMessage
 	onlineWorkers int64
 	// freeSlotWorkers is the canned CountOnlineWorkersWithFreeSlotForUser answer (PRD
 	// #216): how many online workers still have room. 0 with onlineWorkers>0 is the
@@ -113,7 +121,75 @@ func (f *healthFakeStore) ListRunToolWindow(_ context.Context, arg store.ListRun
 		f.windowCalls = map[uuid.UUID]int{}
 	}
 	f.windowCalls[arg.RunID]++
-	return f.window[arg.RunID], nil
+	msgs, ok := f.messages[arg.RunID]
+	if !ok {
+		return f.window[arg.RunID], nil
+	}
+	var out []store.ListRunToolWindowRow
+	for _, m := range newestFirst(msgs) {
+		if m.kind != "tool_use" && m.kind != "tool_result" {
+			continue
+		}
+		if int32(len(out)) >= arg.Lim { //nolint:gosec // G115: test fixture sizes are tiny
+			break
+		}
+		out = append(out, store.ListRunToolWindowRow{Seq: m.seq, Kind: m.kind, Payload: m.payload})
+	}
+	return out, nil
+}
+
+// fakeRunMessage is one run_messages row for healthFakeStore.messages. agentInstance
+// "" models SQL NULL (the lead lane); a non-empty value is a nested subagent frame.
+type fakeRunMessage struct {
+	seq           int32
+	kind          string
+	agentInstance string
+	payload       []byte
+}
+
+// leadWindowKind mirrors ListRunLeadToolWindow's kind/event filter.
+func (m fakeRunMessage) leadWindowKind() bool {
+	switch m.kind {
+	case "tool_use", "tool_result":
+		return true
+	case "status", "error":
+		var p struct {
+			Event string `json:"event"`
+		}
+		if err := json.Unmarshal(m.payload, &p); err != nil {
+			return false
+		}
+		return p.Event == "init" || p.Event == "result"
+	}
+	return false
+}
+
+// newestFirst returns a copy of msgs ordered seq DESC, the queries' ORDER BY.
+func newestFirst(msgs []fakeRunMessage) []fakeRunMessage {
+	out := append([]fakeRunMessage(nil), msgs...)
+	sort.Slice(out, func(i, j int) bool { return out[i].seq > out[j].seq })
+	return out
+}
+func (f *healthFakeStore) ListRunLeadToolWindow(_ context.Context, arg store.ListRunLeadToolWindowParams) ([]store.ListRunLeadToolWindowRow, error) {
+	msgs, ok := f.messages[arg.RunID]
+	if !ok {
+		var out []store.ListRunLeadToolWindowRow
+		for _, r := range f.window[arg.RunID] {
+			out = append(out, store.ListRunLeadToolWindowRow(r))
+		}
+		return out, nil
+	}
+	var out []store.ListRunLeadToolWindowRow
+	for _, m := range newestFirst(msgs) {
+		if m.agentInstance != "" || !m.leadWindowKind() {
+			continue
+		}
+		if int32(len(out)) >= arg.Lim { //nolint:gosec // G115: test fixture sizes are tiny
+			break
+		}
+		out = append(out, store.ListRunLeadToolWindowRow{Seq: m.seq, Kind: m.kind, Payload: m.payload})
+	}
+	return out, nil
 }
 func (f *healthFakeStore) CountUnresolvedCustodyHoldsForOwner(_ context.Context, userID uuid.UUID) (int64, error) {
 	f.custodyCalls = append(f.custodyCalls, userID)

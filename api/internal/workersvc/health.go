@@ -240,6 +240,13 @@ const (
 // interleaved tool_results all fit (each tool_use has at most one result).
 const toolWindowFetch = 40
 
+// leadToolWindowFetch bounds the per-run LEAD-lane fetch that answers "is a lead
+// tool call in flight?" (Decision 9, issue #1394). Nested subagent rows are excluded
+// by the query, so this window is spent on the lead's own calls and lifecycle
+// boundaries only. When it fills before a boundary is reached, the rule applies to
+// the rows fetched.
+const leadToolWindowFetch = toolWindowFetch
+
 // healthThresholds are the per-tick resolved thresholds. A zero duration means the
 // signal is disabled (the admin set 0, or a read failed and defaulted to 0).
 // nearTimeoutPct is a percentage of the run's effective wall-clock budget (0 =
@@ -441,9 +448,11 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 		return healthLooping, reasonLooping
 	}
 
-	// stalled: silence past the threshold, suppressed while a tool call is in flight
-	// (Decision 9). A long build/test-suite emits one tool_use then nothing until its
-	// result — that is working, not stalled; the wall-clock slow signal still covers a
+	// stalled: silence past the threshold, suppressed while a LEAD tool call is in
+	// flight (Decision 9, lead lane only since issue #1394; see leadInFlight). A long
+	// build/test-suite emits one tool_use then nothing until its result — that is
+	// working, not stalled; the same holds for an open parent `Agent` dispatch whose
+	// subagent is still working. The wall-clock slow signal still covers a
 	// pathological single call.
 	if th.stall > 0 && !stats.inFlight {
 		if base := stallBaseline(r); !base.IsZero() && now.Sub(base) >= th.stall {
@@ -489,46 +498,106 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 
 // toolWindowStats are the run-health signals derivable from the tool-call window.
 type toolWindowStats struct {
-	// inFlight is true when the newest tool_use has no matching tool_result yet.
+	// inFlight is true when some LEAD-lane tool_use of the current claim/query leg
+	// has no matching tool_result yet (leadInFlight). Lead lane only: a nested
+	// subagent's rows (agent_instance set) never decide it, so completed nested
+	// calls cannot hide the lead's open parent `Agent` dispatch (issue #1394).
 	inFlight bool
 	// looping is true when some tool call recurs at least loopThreshold times among
 	// the newest loopWindow tool_use.
 	looping bool
 }
 
-// toolWindow fetches and analyzes a running run's recent tool activity. A fetch
-// error degrades to the zero value (not in flight), so a transient DB blip biases
-// toward the stalled/slow checks rather than crashing the pass.
+// toolWindow fetches and analyzes a running run's recent tool activity: looping
+// from the mixed-lane window (ListRunToolWindow), in-flight from the lead lane
+// (ListRunLeadToolWindow). Either fetch error degrades its signal to the zero value
+// (not looping / not in flight), so a transient DB blip biases toward the
+// stalled/slow checks rather than crashing the pass.
 func (s *Service) toolWindow(ctx context.Context, runID uuid.UUID) toolWindowStats {
+	var stats toolWindowStats
 	rows, err := s.q.ListRunToolWindow(ctx, store.ListRunToolWindowParams{
 		RunID: runID,
 		Lim:   toolWindowFetch,
 	})
 	if err != nil {
 		slog.Error("health: read tool window", "run_id", runID, "error", err)
-		return toolWindowStats{}
+	} else {
+		stats.looping = analyzeToolWindow(rows)
 	}
-	return analyzeToolWindow(rows)
+	leadRows, err := s.q.ListRunLeadToolWindow(ctx, store.ListRunLeadToolWindowParams{
+		RunID: runID,
+		Lim:   leadToolWindowFetch,
+	})
+	if err != nil {
+		slog.Error("health: read lead tool window", "run_id", runID, "error", err)
+	} else {
+		stats.inFlight = leadInFlight(leadRows)
+	}
+	return stats
 }
 
-// analyzeToolWindow computes the tool-window signals from rows ordered newest-first.
-//
-// In-flight (Decision 9): the newest tool_use has no matching tool_result. Because
-// rows are seq-desc and a completed call's result has a higher seq than its
-// tool_use, that result is seen before the tool_use here, so a lookup in the
-// collected result-id set answers the question with no extra query.
-//
-// Looping (Decision 4): hash each of the newest loopWindow tool_use as
+// analyzeToolWindow computes the looping signal from mixed-lane rows ordered
+// newest-first (Decision 4): hash each of the newest loopWindow tool_use as
 // sha256(name + canonical-JSON(input)) and flag when any hash count reaches
 // loopThreshold. The in-flight (possibly newest) call is included in the window.
 // The hash is compared transiently and NEVER surfaced — not in health_reason, logs,
-// or Slack.
-func analyzeToolWindow(rows []store.ListRunToolWindowRow) toolWindowStats {
-	resultIDs := make(map[string]bool)
+// or Slack. In-flight is NOT derived here (see leadInFlight).
+func analyzeToolWindow(rows []store.ListRunToolWindowRow) bool {
 	counts := make(map[string]int)
-	var newestUseID string
-	var haveUse bool
 	var hashed int
+	for _, row := range rows {
+		if row.Kind != "tool_use" {
+			continue
+		}
+		if hashed >= loopWindow {
+			break
+		}
+		counts[toolCallHash(row.Payload)]++
+		hashed++
+	}
+	for _, c := range counts {
+		if c >= loopThreshold {
+			return true
+		}
+	}
+	return false
+}
+
+// leadInFlight answers Decision 9's "is a tool call still in flight?" from the
+// LEAD lane alone, over rows ordered newest-first (ListRunLeadToolWindow).
+//
+// Lead lane only: agent_instance IS NULL is the lead (migration 00075); a nested
+// subagent frame carries the SDK's parent_tool_use_id there. Before issue #1394 the
+// check read the newest tool_use of the MIXED window, so a subagent's completed
+// calls hid the lead's still-open parent `Agent` dispatch and a working run was
+// flagged stalled.
+//
+// The rule: scan newest-first, collecting the id of EVERY lead tool_result (an
+// unrelated result does not end the scan), and stop only at a lifecycle boundary,
+// a lead row whose payload event is `init` (kind status) or `result` (kind status
+// or error). A boundary ends the scan even before any tool_use is seen. In flight =
+// some lead tool_use seen before the boundary has a non-empty id with no collected
+// result. Because a completed call's result has a higher seq than its tool_use,
+// that result is always seen first. When the fetch limit is hit without a
+// boundary, the rule applies to the rows fetched. Kind and payload event are
+// re-checked here, not trusted from the query's filter alone.
+//
+// Why ANY unmatched use, not only the newest (and no "same assistant batch" rule):
+// lead calls do not complete in dispatch order. Codex delegation callbacks run
+// concurrently (agent/src/codex/codex-harness.ts emits the lead dispatch tool_use
+// when each child binds and its completion when that child's callback settles), so
+// "use A, use B, result B, use C, result C" with A still running is a real order.
+//
+// The orphan bound: a lead call whose result never arrives would otherwise
+// suppress stalled forever. One from an EARLIER claim/query leg is excluded by the
+// init/result boundary. Within the current leg it suppresses stalled until its
+// result, the next boundary, a stale-heartbeat requeue, or, as the backstop, the
+// wall-clock limit (SweepRunningTimeout). Codex emits `init` once per claim leg,
+// not once per internal provider epoch, so the leg is the granularity here.
+func leadInFlight(rows []store.ListRunLeadToolWindowRow) bool {
+	resultIDs := make(map[string]bool)
+	var useIDs []string
+scan:
 	for _, row := range rows {
 		switch row.Kind {
 		case "tool_result":
@@ -536,26 +605,25 @@ func analyzeToolWindow(rows []store.ListRunToolWindowRow) toolWindowStats {
 				resultIDs[id] = true
 			}
 		case "tool_use":
-			if !haveUse {
-				newestUseID = toolUseID(row.Payload)
-				haveUse = true
+			if id := toolUseID(row.Payload); id != "" {
+				useIDs = append(useIDs, id)
 			}
-			if hashed < loopWindow {
-				counts[toolCallHash(row.Payload)]++
-				hashed++
+		case "status":
+			if ev := payloadEvent(row.Payload); ev == "init" || ev == "result" {
+				break scan
+			}
+		case "error":
+			if payloadEvent(row.Payload) == "result" {
+				break scan
 			}
 		}
 	}
-	maxRepeat := 0
-	for _, c := range counts {
-		if c > maxRepeat {
-			maxRepeat = c
+	for _, id := range useIDs {
+		if !resultIDs[id] {
+			return true
 		}
 	}
-	return toolWindowStats{
-		inFlight: haveUse && newestUseID != "" && !resultIDs[newestUseID],
-		looping:  maxRepeat >= loopThreshold,
-	}
+	return false
 }
 
 // toolCallHash is the loop-detection fingerprint of a tool_use payload:
@@ -1073,6 +1141,18 @@ func toolUseID(payload []byte) string {
 		return ""
 	}
 	return p.ID
+}
+
+// payloadEvent extracts a status/error run_message's `event` ("init", "result",
+// ...). A malformed payload yields "", which is never a lifecycle boundary.
+func payloadEvent(payload []byte) string {
+	var p struct {
+		Event string `json:"event"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return ""
+	}
+	return p.Event
 }
 
 func toolResultID(payload []byte) string {
