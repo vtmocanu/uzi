@@ -9,8 +9,9 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Readable } from "node:stream";
 import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
-import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
+import { RUNNER_UID, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { withForgeRetry } from "./forge-retry.js";
+import { REASON_PROVISION_FAILED } from "./provision-run.js";
 
 import {
   commitsScannedFromStderr,
@@ -24,6 +25,14 @@ import {
 } from "./secret-scan-guard.js";
 
 const execFileAsync = promisify(execFile);
+
+export class ScratchProvisionError extends Error {
+  readonly code = "scratch_provision_failed";
+  constructor(cause: unknown) {
+    super(`${REASON_PROVISION_FAILED}: scratch_provision_failed: ${cause instanceof Error ? cause.message : "unknown filesystem error"}`, { cause });
+    this.name = "ScratchProvisionError";
+  }
+}
 
 // A ROOT-OWNED, non-writable (0555) empty dir BAKED into the worker image (see
 // agent/templates/base/Dockerfile, created as root; the image has no `USER` line —
@@ -1479,12 +1488,80 @@ export class GitCache {
         if ((err as { code?: unknown }).code === 5) return;
         throw err;
       });
+      await this.provisionRunnerScratch(clonePath);
       // PRD #759 M2: baseCommit is the REAL fork point — effectiveBase, which is the
       // marker's parent when a wip(park) marker was reset --soft'd back to uncommitted, and
       // baseSha (byte-identical) on every other leg. wipRecovered surfaces the recovery to
       // M4/M5.
       return { path: clonePath, branch, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered };
     });
+  }
+
+  /** Provision the per-run artifact directory without following checkout symlinks. */
+  private async provisionRunnerScratch(clonePath: string): Promise<void> {
+    const directoryFlags = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
+    const fdPath = (fd: number, name: string): string => `/proc/self/fd/${fd}/${name}`;
+    const required = 0o2070; // setgid and group rwx for runner-cmd
+    const opened: import("node:fs/promises").FileHandle[] = [];
+    const openDirectory = async (name: string): Promise<import("node:fs/promises").FileHandle> => {
+      const handle = await fs.open(name, directoryFlags);
+      opened.push(handle);
+      return handle;
+    };
+    try {
+      // The index detects a tracked file, directory content, or symlink at the reserved path.
+      if ((await this.runGitAsRunner(clonePath, ["ls-files", "--cached", "--", ".uzi/scratch"])).length > 0) {
+        throw new Error("tracked .uzi/scratch path");
+      }
+      const root = await openDirectory(clonePath);
+      const rootStat = await root.stat();
+      if (uidSplitActive() && (rootStat.gid !== RUNNER_UID || (rootStat.mode & required) !== required)) {
+        throw new Error("runner clone lacks runner-group write posture");
+      }
+      const ensureDirectory = async (parent: import("node:fs/promises").FileHandle, name: string) => {
+        const childPath = fdPath(parent.fd, name);
+        let created = false;
+        try {
+          await fs.mkdir(childPath, { mode: 0o2770 });
+          created = true;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        }
+        const child = await openDirectory(childPath);
+        if (created) await child.chmod(0o2770);
+        const stat = await child.stat();
+        if (uidSplitActive() && (stat.gid !== RUNNER_UID || (stat.mode & required) !== required)) {
+          throw new Error(`${name} lacks runner-group write posture`);
+        }
+        return child;
+      };
+      const uzi = await ensureDirectory(root, ".uzi");
+      await ensureDirectory(uzi, "scratch");
+
+      // .git is created by the trusted local clone. Hold each directory while opening
+      // its child so an agent-writable checkout path cannot redirect the exclude write.
+      const git = await openDirectory(fdPath(root.fd, ".git"));
+      const info = await openDirectory(fdPath(git.fd, "info"));
+      const exclude = await fs.open(
+        fdPath(info.fd, "exclude"),
+        fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_APPEND | fsConstants.O_NOFOLLOW,
+        0o664,
+      );
+      try {
+        if (!(await exclude.stat()).isFile()) throw new Error("git exclude is not a regular file");
+        const existing = await exclude.readFile("utf8");
+        const rule = "/.uzi/scratch/";
+        if (!existing.split("\n").includes(rule)) {
+          await exclude.writeFile(`${existing.length > 0 && !existing.endsWith("\n") ? "\n" : ""}${rule}\n`);
+        }
+      } finally {
+        await exclude.close();
+      }
+    } catch (err) {
+      throw new ScratchProvisionError(err);
+    } finally {
+      for (const handle of opened.reverse()) await handle.close().catch(() => undefined);
+    }
   }
 
   /**

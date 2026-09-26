@@ -9,7 +9,7 @@ import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
-import { GitCache, bareDirName, gitEnv } from "../src/git.js";
+import { GitCache, ScratchProvisionError, bareDirName, gitEnv } from "../src/git.js";
 
 let fx: Fixture;
 let git: GitCache;
@@ -213,6 +213,40 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
     // On a FRESH branch the seed IS the default tip, so the two commits coincide — which
     // is what lets the prompt state one command instead of two.
     assert.strictEqual(rc.defaultBranchCommit, rc.baseCommit);
+  });
+
+  it("provisions ignored, group-writable scratch on fresh and reseeded clones", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const first = await git.createOrAttachRunnerClone(bare, 1719);
+    const scratch = path.join(first.path, ".uzi", "scratch");
+    const stat = fs.statSync(scratch);
+    assert.equal(stat.isDirectory(), true);
+    assert.equal(stat.mode & 0o2070, 0o2070);
+    assert.equal(fs.readFileSync(path.join(first.path, ".git", "info", "exclude"), "utf8")
+      .split("\n").filter((line) => line === "/.uzi/scratch/").length, 1);
+    fs.writeFileSync(path.join(scratch, "gate-log.test"), "output");
+    assert.equal(gitIn(first.path, ["status", "--porcelain"]), "");
+    gitIn(first.path, ["add", "-A"]);
+    assert.equal(gitIn(first.path, ["diff", "--cached", "--name-only"]), "");
+    const second = await git.createOrAttachRunnerClone(bare, 1719, "run", true);
+    assert.equal(fs.existsSync(path.join(second.path, ".uzi", "scratch", "gate-log.test")), false);
+    assert.equal(fs.statSync(path.join(second.path, ".uzi", "scratch")).isDirectory(), true);
+  });
+
+  it("refuses tracked scratch and symlinked .uzi with a named provisioning error", async () => {
+    fs.mkdirSync(path.join(fx.originPath, ".uzi", "scratch"), { recursive: true });
+    fs.writeFileSync(path.join(fx.originPath, ".uzi", "scratch", "tracked.txt"), "x");
+    gitIn(fx.originPath, ["add", ".uzi/scratch/tracked.txt"]);
+    gitIn(fx.originPath, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "tracked scratch"]);
+    const bare = await git.ensureClone(fx.originPath);
+    await assert.rejects(git.createOrAttachRunnerClone(bare, 1720), ScratchProvisionError);
+
+    fs.rmSync(path.join(fx.originPath, ".uzi"), { recursive: true });
+    fs.symlinkSync(".", path.join(fx.originPath, ".uzi"));
+    gitIn(fx.originPath, ["add", "-A"]);
+    gitIn(fx.originPath, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "symlinked ancestor"]);
+    await git.ensureClone(fx.originPath);
+    await assert.rejects(git.createOrAttachRunnerClone(bare, 1721), ScratchProvisionError);
   });
 
   it("round-trips: commit in the clone → worker fetch-back → bare tree-diff → push to origin", async () => {
