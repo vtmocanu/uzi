@@ -32,3 +32,26 @@ func TestStatusClausesUseStatusSince(t *testing.T) {
 		t.Errorf("holdParkedClause without status_since = %q, want %q (updated_at fallback)", got, want)
 	}
 }
+
+// TestRunAgeCellWaitingUsesStatusSince pins issue #1727 on `uzi run list`'s AGE column: a
+// waiting-bucket run ages from status_since, not from a later updated_at, and falls back to
+// updated_at when status_since is absent (an older server).
+func TestRunAgeCellWaitingUsesStatusSince(t *testing.T) {
+	now := time.Date(2026, 9, 7, 13, 42, 0, 0, time.UTC)
+	since := now.Add(-2*time.Hour - 40*time.Minute)
+	updated := now.Add(-5 * time.Minute)
+
+	for _, status := range []string{
+		"awaiting_approval", "awaiting_input", "awaiting_followup",
+		statusLimitWait, statusPoolWait, statusRecoveryWait,
+	} {
+		withSince := apitypes.RunDTO{Status: status, UpdatedAt: updated, StatusSince: &since}
+		if got, want := runAgeCell(withSince, now), "2h 40m"; got != want {
+			t.Errorf("runAgeCell(%s) with status_since = %q, want %q", status, got, want)
+		}
+		fallback := apitypes.RunDTO{Status: status, UpdatedAt: updated}
+		if got, want := runAgeCell(fallback, now), "5m"; got != want {
+			t.Errorf("runAgeCell(%s) without status_since = %q, want %q (updated_at fallback)", status, got, want)
+		}
+	}
+}

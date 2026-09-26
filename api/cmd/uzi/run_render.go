@@ -470,9 +470,10 @@ func holdReasonLabel(reason string) string {
 }
 
 // holdParkedClause renders "parked HH:MM (dur)" from the instant the run entered its current
-// status (statusEnteredAt: status_since, else updated_at), the hold-row twin of pauseSinceClause — same UTC derivation and the same
-// two-unit duration in parens (fmtUntil), worded "parked" for a hold rather than "since" for an
-// owner pause. A negative elapsed (clock skew) floors to 0s.
+// status (statusEnteredAt: status_since, else updated_at), the hold-row twin of
+// pauseSinceClause — same UTC derivation and the same two-unit duration in parens
+// (fmtUntil), worded "parked" for a hold rather than "since" for an owner pause. A negative
+// elapsed (clock skew) floors to 0s.
 func holdParkedClause(r apitypes.RunDTO, now time.Time) string {
 	at := statusEnteredAt(r)
 	d := now.Sub(at)
