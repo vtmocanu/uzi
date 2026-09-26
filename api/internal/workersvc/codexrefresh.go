@@ -163,8 +163,10 @@ var (
 	// token. Rides CodexRefreshQuarantined.
 	ErrCodexRefreshRejected = errors.New("codex refresh rejected by the provider; re-login required")
 	// ErrCodexVaultLocked: the run owner's vault is locked, so the codex credential could
-	// not be opened or sealed (issue #1766). Returned ONLY after AuthorizeCodexCredentialOp
-	// has passed for the calling worker and run, so it never answers an unauthorized caller.
+	// not be opened or sealed (issue #1766). Returned ONLY when AuthorizeCodexCredentialOp
+	// passed for the calling worker and run both before the operation and on a recheck after
+	// the locked vault was met, so it never answers a caller whose authority was lost, even
+	// one that lost it during the provider exchange (that caller gets the authorization error).
 	// Transient: the vault may unlock, and a retry of the same operation then proceeds or
 	// reconciles. It wraps the underlying cause, so it may ride together with another
 	// sentinel (the post-exchange vault-locked seal also carries ErrCodexRefreshQuarantined).
@@ -473,13 +475,31 @@ func (s *Service) CoordinatedCodexRefresh(ctx context.Context, wkr store.Worker,
 			return CodexRefreshResult{Outcome: CodexRefreshContended}, rerr
 		}
 	}
-	return res, codexVaultLockedErr(err)
+	// A locked vault is answered as ErrCodexVaultLocked (issue #1766) only to a run that
+	// STILL holds authority: the vault-locked seal after the exchange is reached with the
+	// same pre-network authorization as the token path above, so authority is re-verified
+	// here too. A lost recheck returns the authorization error alone (404/403 at the
+	// handler), keeping the outcome; the durable state the refresh left is not touched.
+	//
+	// ErrCodexAccountQuarantined alone does NOT count as lost authority here: the
+	// post-exchange vault-locked seal itself quarantines the account to retain the new
+	// login, so a full recheck would always fail on that. The quarantine check is the LAST
+	// step of evalCodexReleasePredicate, so reaching it means ownership, capability epoch,
+	// material and credential revision all still held.
+	if errors.Is(err, errVaultLocked) {
+		if _, rerr := s.AuthorizeCodexCredentialOp(operationCtx, wkr, runID, capability, ScopeStartRefresh); rerr != nil && !errors.Is(rerr, ErrCodexAccountQuarantined) {
+			return CodexRefreshResult{Outcome: res.Outcome}, rerr
+		}
+		return res, codexVaultLockedErr(err)
+	}
+	return res, err
 }
 
 // codexVaultLockedErr marks a package-private errVaultLocked from any inner vault open or
 // seal as the exported ErrCodexVaultLocked (issue #1766), keeping the original chain so
 // every other errors.Is match still holds. The codex credential entry points call it only
-// on errors produced after AuthorizeCodexCredentialOp passed.
+// after AuthorizeCodexCredentialOp has passed both before the operation and again after it
+// failed, so a caller whose authority lapsed mid-operation gets the authorization error.
 func codexVaultLockedErr(err error) error {
 	if errors.Is(err, errVaultLocked) && !errors.Is(err, ErrCodexVaultLocked) {
 		return fmt.Errorf("%w: %w", ErrCodexVaultLocked, err)
@@ -1024,15 +1044,20 @@ func (s *Service) ReleaseCodexCredential(ctx context.Context, wkr store.Worker, 
 	}
 
 	result, err := s.releaseCodexCredential(ctx, &authCtx)
-	if err != nil {
-		return CodexReleaseResult{}, codexVaultLockedErr(err)
+	if err != nil && !errors.Is(err, errVaultLocked) {
+		return CodexReleaseResult{}, err
 	}
 
-	// Re-verify authority immediately before returning the token — no provider round-trip
-	// separates the read above from this recheck, so a revoke/re-mint that landed in the
-	// interval refuses the release rather than leaking a token the run no longer owns.
-	if _, err := s.AuthorizeCodexCredentialOp(ctx, wkr, runID, capability, ScopeReleaseAccessToken); err != nil {
-		return CodexReleaseResult{}, err
+	// Re-verify authority immediately before returning the token, or before answering a
+	// locked vault (issue #1766): no provider round-trip separates the credential read in
+	// releaseCodexCredential from this recheck, so a revoke/re-mint that landed in the
+	// interval refuses the release (with the authorization error) rather than leaking a
+	// token, or the vault state, to a run that no longer owns the credential.
+	if _, aerr := s.AuthorizeCodexCredentialOp(ctx, wkr, runID, capability, ScopeReleaseAccessToken); aerr != nil {
+		return CodexReleaseResult{}, aerr
+	}
+	if err != nil {
+		return CodexReleaseResult{}, codexVaultLockedErr(err)
 	}
 	return result, nil
 }

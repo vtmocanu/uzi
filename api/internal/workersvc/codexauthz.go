@@ -451,6 +451,10 @@ func codexCheckAccountTuple(in codexReleaseInputs) error {
 //
 // api_key rows skip the account tuple/revision/quarantine checks — a static key has no
 // account behind it.
+//
+// Keep the quarantine check LAST: CoordinatedCodexRefresh's vault-locked recheck (issue
+// #1766) tolerates ErrCodexAccountQuarantined alone, which is sound only while reaching it
+// proves every earlier check held.
 func evalCodexReleasePredicate(in codexReleaseInputs) error {
 	if err := codexCheckKindMode(in.authMode, in.boundKind); err != nil {
 		return err

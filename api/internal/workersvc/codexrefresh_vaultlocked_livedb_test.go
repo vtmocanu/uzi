@@ -19,7 +19,7 @@ import (
 // drive the real vault against a real Postgres. Skipped unless UZI_TEST_DATABASE_URL is set;
 // run them through ./e2e/run-store-it.sh.
 
-const codexVaultLockedTestPassword = "codex-vault-locked-test-password"
+const codexVaultLockedTestPassword = "codex-vault-locked-test-password" //nolint:gosec // G101: synthetic vault password for a throwaway test user, never a real secret
 
 // dekSealAccountAndLock wires a real vault into f.svc, creates and unlocks the user's vault,
 // re-seals the account's committed login under the user DEK (sealed_with='dek'), and locks
@@ -32,7 +32,7 @@ func dekSealAccountAndLock(t *testing.T, env codexTestEnv, f refreshFixture) *va
 	if err := vlt.Unlock(env.ctx, f.userID, codexVaultLockedTestPassword); err != nil {
 		t.Fatalf("create+unlock vault: %v", err)
 	}
-	raw, err := json.Marshal(codexLoginBlob{AccessToken: f.accessToken, RefreshToken: f.prevRefreshToken})
+	raw, err := json.Marshal(codexLoginBlob{AccessToken: f.accessToken, RefreshToken: f.prevRefreshToken}) //nolint:gosec // G117: synthetic fixture login, DEK-sealed below
 	if err != nil {
 		t.Fatalf("encode login: %v", err)
 	}
@@ -248,5 +248,105 @@ func TestCodexCredentialVaultLockedAuthorizationFirstLiveDB(t *testing.T) {
 	}
 	if acct := env.mustAccount(t, f.userID, f.accountID); acct.CoordState != "idle" || acct.Generation != 0 {
 		t.Fatalf("account = (state=%q gen=%d), want (idle,0)", acct.CoordState, acct.Generation)
+	}
+}
+
+// TestCoordinatedCodexRefreshVaultLockedSealAuthorityLostLiveDB (case b, lost authority):
+// authority is lost DURING the provider exchange and the post-exchange seal then meets a
+// locked vault. The caller no longer holds authority, so the answer is the authorization
+// error alone, never ErrCodexVaultLocked: a bumped capability epoch is ErrCodexCapabilityEpoch
+// (handler 403) and an account-level revoke is ErrCodexAccountRevisionStale. The account
+// quarantine the locked seal itself sets must not mask either. The durable state is exactly
+// what a still-authorized caller leaves (retained recovery, intent rotating), so the recheck
+// changes only the answer.
+//
+// FAILS OLD: the post-exchange recheck ran only on a token-bearing success, so the locked
+// seal was answered ErrCodexVaultLocked (409 vault_locked) to a run that had lost authority.
+func TestCoordinatedCodexRefreshVaultLockedSealAuthorityLostLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	cases := []struct {
+		name    string
+		loseSQL string
+		want    error
+	}{
+		{"capability epoch bumped", `UPDATE runs SET codex_claim_epoch = codex_claim_epoch + 1, codex_cap_hash = NULL WHERE id = $1`, ErrCodexCapabilityEpoch},
+		{"account revoked", `UPDATE codex_provider_account SET credential_revision = credential_revision + 1 WHERE id = $1`, ErrCodexAccountRevisionStale},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			newAccess := codexToken("access-new")
+			fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
+			f := newRefreshFixture(t, env, fake)
+			capw := env.mintCap(t, f.runID, f.workerID)
+			op := uuid.New()
+			target := f.runID
+			if tc.want == ErrCodexAccountRevisionStale {
+				target = f.accountID
+			}
+
+			// A real vault that is locked for this user: the master-sealed login opens, but
+			// the post-rotation canonical seal takes the DEK path and meets the lock.
+			f.svc.SetVault(vault.New(env.box, env.q))
+			fake.onRefresh = func() { env.exec(tc.loseSQL, target) }
+
+			res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v from the post-exchange recheck", err, tc.want)
+			}
+			if errors.Is(err, ErrCodexVaultLocked) || errors.Is(err, ErrCodexRefreshQuarantined) {
+				t.Fatalf("err = %v must carry only the authorization error once authority is lost", err)
+			}
+			if res.AccessToken != "" || res.Outcome != CodexRefreshQuarantined {
+				t.Fatalf("result = %+v, want the quarantined outcome with NO token", res)
+			}
+			if fake.calls != 1 {
+				t.Fatalf("provider calls = %d, want exactly 1", fake.calls)
+			}
+			acct := env.mustAccount(t, f.userID, f.accountID)
+			if acct.Generation != 0 || acct.CoordState != codexCoordQuarantined {
+				t.Fatalf("account = (state=%q gen=%d), want (quarantined,0)", acct.CoordState, acct.Generation)
+			}
+			if len(acct.RecoverySealed) == 0 || !acct.RecoverySealedWith.Valid || acct.RecoverySealedWith.String != store.SealedWithMaster {
+				t.Fatalf("recovery not retained under master protection: sealed=%d with=%v", len(acct.RecoverySealed), acct.RecoverySealedWith)
+			}
+			if it := mustIntent(t, env, op, f.userID); it.State != codexIntentRotating {
+				t.Fatalf("intent state = %q, want rotating (retained)", it.State)
+			}
+		})
+	}
+}
+
+// TestReleaseCodexCredentialVaultLockedAuthorityLostLiveDB (case a, release, lost authority):
+// the capability epoch is bumped between the initial authorization and the locked-vault open,
+// so the release answers the recheck's ErrCodexCapabilityEpoch (handler 403), never
+// ErrCodexVaultLocked.
+//
+// FAILS OLD: release rechecked authority only before returning a token, so a locked vault
+// was answered ErrCodexVaultLocked to a run whose authority had already lapsed.
+func TestReleaseCodexCredentialVaultLockedAuthorityLostLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	fake := &fakeRefreshClient{}
+	f := newRefreshFixture(t, env, fake)
+	dekSealAccountAndLock(t, env, f)
+	capw := env.mintCap(t, f.runID, f.workerID)
+	f.svc.q = releaseHookStore{
+		Queries: env.q,
+		onAccountRead: func() {
+			env.exec(`UPDATE runs SET codex_claim_epoch = codex_claim_epoch + 1, codex_cap_hash = NULL WHERE id = $1`, f.runID)
+		},
+	}
+
+	released, err := f.svc.ReleaseCodexCredential(env.ctx, f.wkr, f.runID, capw)
+	if !errors.Is(err, ErrCodexCapabilityEpoch) {
+		t.Fatalf("err = %v, want ErrCodexCapabilityEpoch from the recheck", err)
+	}
+	if errors.Is(err, ErrCodexVaultLocked) {
+		t.Fatalf("err = %v must not be ErrCodexVaultLocked once authority is lost", err)
+	}
+	if released != (CodexReleaseResult{}) {
+		t.Fatalf("release = %+v, want empty", released)
+	}
+	if fake.calls != 0 {
+		t.Fatalf("provider calls = %d, want 0", fake.calls)
 	}
 }
