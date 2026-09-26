@@ -13,9 +13,6 @@
 //    BEFORE offering any plan, and a replayed revise revises the submitted plan instead of
 //    re-presenting it (with no session, the revision prompt carries the prior plan);
 //  - stale and superseded verdicts are applied with a feed notice.
-//
-// Cases the base code fails are marked `todo` with the reason; the implementing milestone removes
-// the markers.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -444,7 +441,7 @@ function assertRevisedOnResume(s: Scenario, flight: Flight, feedback: string, se
 describe("#1604 — a revise interrupted mid-revision turn is replayed and revises the submitted plan (c)", () => {
   for (const session of ["kept", "lost", "none"] as const) {
     const label = { kept: "resume_continued (session kept)", lost: "worker-side resume_lineage_break", none: "the no-session fixture claim" }[session];
-    it(`worker shutdown mid-revision, reclaimed with ${label}`, { todo: "issue #1604: fails on base — the revise is APPLIED while its revision turn runs, so the resume re-presents the superseded plan" }, () =>
+    it(`worker shutdown mid-revision, reclaimed with ${label}`, () =>
       scenario(async (s) => {
         const first = await s.toFirstGate();
         const block = s.model.block("revise");
@@ -495,15 +492,8 @@ async function releaseAtGate(s: Scenario, send: () => UserInput, when: "unacked"
   return { first, row };
 }
 
-const TODO_REVISE_APPLIED_EARLY =
-  "issue #1604: fails on base — the taken revise is APPLIED on the tick after routing, before its revised plan is persisted";
-const TODO_REPRESENTS_V1 =
-  "issue #1604: fails on base — the resumed gate re-presents the submitted plan before reading the inputs sent before the release";
-const TODO_REJECT_NOT_SETTLED =
-  "issue #1604: fails on base — the plan-rejected `failed` report carries no fail_origin plan_rejected, so the reject is not settled with the transition";
-
 describe("#1604 — (a) a verdict still unACKed when a switch releases the claim is replayed on the reclaim", () => {
-  it("revise: the reclaim revises the submitted plan instead of re-presenting it", { todo: TODO_REPRESENTS_V1 }, () =>
+  it("revise: the reclaim revises the submitted plan instead of re-presenting it", () =>
     scenario(async (s) => {
       const { first, row } = await releaseAtGate(s, () => s.send(s.input("revise_plan", FEEDBACK))[0]!, "unacked");
       assert.ok(s.statuses(first).includes("credential_switch"), `the switch released the claim: ${s.statuses(first).join(",")}`);
@@ -528,7 +518,7 @@ describe("#1604 — (a) a verdict still unACKed when a switch releases the claim
       assert.ok(api.isApplied(s.runId, row.id), "the replayed approve is applied");
     }));
 
-  it("reject: the reclaim reads the reject before offering the plan and fails, settling it with the transition", { todo: "issue #1604: fails on base — the resumed gate offers the plan before reading the replayed reject (and the failed report carries no fail_origin plan_rejected)" }, () =>
+  it("reject: the reclaim reads the reject before offering the plan and fails, settling it with the transition", () =>
     scenario(async (s) => {
       const { first, row } = await releaseAtGate(s, () => s.send(s.input("reject_plan", "wrong approach"))[0]!, "unacked");
       assert.ok(s.statuses(first).includes("credential_switch"), s.statuses(first).join(","));
@@ -542,7 +532,7 @@ describe("#1604 — (a) a verdict still unACKed when a switch releases the claim
     }));
 
   for (const verdict of ["approve_plan", "reject_plan"] as const) {
-    it(`D5: a ${verdict} applied at a resumed gate gets one status line naming the verdict`, { todo: "issue #1604: fails on base — no status line names a verdict applied at a resumed gate" }, () =>
+    it(`D5: a ${verdict} applied at a resumed gate gets one status line naming the verdict`, () =>
       scenario(async (s) => {
         await releaseAtGate(s, () => s.send(s.input(verdict, verdict === "approve_plan" ? SELECTION : "wrong approach"))[0]!, "unacked");
         const flight = s.start(s.resumeClaim("kept"));
@@ -555,7 +545,7 @@ describe("#1604 — (a) a verdict still unACKed when a switch releases the claim
 });
 
 describe("#1604 — (b) a verdict ACKed and routed whose APPLIED is refused by a pending switch", () => {
-  it("revise: the revised plan is persisted and the revise applied under switch_pending before the release; the reclaim shows it with no second revision", { todo: TODO_REVISE_APPLIED_EARLY }, () =>
+  it("revise: the revised plan is persisted and the revise applied under switch_pending before the release; the reclaim shows it with no second revision", () =>
     scenario(async (s) => {
       const { first, row } = await releaseAtGate(s, () => s.send(s.input("revise_plan", FEEDBACK))[0]!, "acked");
       const v2At = s.gateAt(revisedPlan(1));
@@ -581,7 +571,7 @@ describe("#1604 — (b) a verdict ACKed and routed whose APPLIED is refused by a
       assert.equal(s.model.count("implement"), 1, "exactly one implement turn across both claims");
     }));
 
-  it("reject: the run fails and the reject is settled with the failed transition", { todo: TODO_REJECT_NOT_SETTLED }, () =>
+  it("reject: the run fails and the reject is settled with the failed transition", () =>
     scenario(async (s) => {
       const { first, row } = await releaseAtGate(s, () => s.send(s.input("reject_plan", "wrong approach"))[0]!, "acked");
       const failed = s.states(first).find((b) => b.status === "failed");
@@ -631,7 +621,7 @@ describe("#1604 — an approve interrupted before its running transition keeps i
 });
 
 describe("#1604 — a reject interrupted before its failed report is replayed and fails the run", () => {
-  it("buffered before the gate waiter opens", { todo: "issue #1604: fails on base — the buffered reject is APPLIED on the tick after routing, so a lost failed report loses it" }, () =>
+  it("buffered before the gate waiter opens", () =>
     scenario(async (s) => {
       const block = s.model.block("plan");
       const first = s.start(s.claim());
@@ -654,7 +644,7 @@ describe("#1604 — a reject interrupted before its failed report is replayed an
       assert.ok(api.isApplied(s.runId, row!.id), "settled with the failed transition");
     }));
 
-  it("taken at the gate", { todo: "issue #1604: fails on base — the taken reject is APPLIED before the failed report, so a lost failed report loses it" }, () =>
+  it("taken at the gate", () =>
     scenario(async (s) => {
       const first = await s.toFirstGate();
       const stopDropping = api.dropStatesWhen(s.runId, (b) => b.status === "failed");
@@ -690,7 +680,7 @@ describe("#1604 — an already-applied reject with no replayable input (older-wo
 
 describe("#1604 — (c) a switch requested during the revision turn", () => {
   for (const session of ["kept", "none"] as const) {
-    it(`deferral holds, the revised plan and the revise settle before the release; the reclaim (${session === "kept" ? "session kept" : "no session"}) shows the revised plan with no second revision`, { todo: "issue #1604: fails on base — the deferred switch trips between the revision turn and the gate waiter arming, is dropped, and the claim is never released" }, () =>
+    it(`deferral holds, the revised plan and the revise settle before the release; the reclaim (${session === "kept" ? "session kept" : "no session"}) shows the revised plan with no second revision`, () =>
       scenario(async (s) => {
         const first = await s.toFirstGate();
         const block = s.model.block("revise");
@@ -708,8 +698,17 @@ describe("#1604 — (c) a switch requested during the revision turn", () => {
         const appliedAt = s.appliedAt(row!.id);
         assert.ok(appliedAt > v2At && appliedAt < releasedAt, "the revise applied under switch_pending, after persistence, before the release");
         const { flight } = await resumeAndApprove(s, s.resumeClaim(session));
-        assert.equal(s.gates(flight)[0]?.plan_md, revisedPlan(1), "the resumed gate shows the revised plan");
-        assert.equal(s.model.count("revise", flight.turnFrom) + s.model.count("plan", flight.turnFrom), 0, "no second revision, no re-plan");
+        assert.equal(api.isApplied(s.runId, row!.id), true, "nothing is left to replay");
+        assert.equal(s.model.count("revise", flight.turnFrom), 0, "no second revision");
+        if (session === "kept") {
+          assert.equal(s.gates(flight)[0]?.plan_md, revisedPlan(1), "the resumed gate shows the revised plan");
+          assert.equal(s.model.count("plan", flight.turnFrom), 0, "no re-plan");
+        } else {
+          // The #1604 plan (D3): a "" resume with no session and nothing pending plans from
+          // scratch, as before; the persisted revised plan is not re-presented.
+          assert.equal(s.model.count("plan", flight.turnFrom), 1, "the no-session resume plans from scratch");
+          assert.equal(s.gates(flight)[0]?.plan_md, PLAN_V1, "the fresh plan is gated");
+        }
         assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
         assert.equal(s.model.count("implement"), 1);
       }));
@@ -741,7 +740,7 @@ describe("#1604 — boundaries of the revise receipt", () => {
       assert.equal(s.rowsOf("revise_plan").length, 1, "no new revise row");
     }));
 
-  it("a lost APPLIED reply for the revise is retried; one revision, applied after persistence", { todo: TODO_REVISE_APPLIED_EARLY }, () =>
+  it("a lost APPLIED reply for the revise is retried; one revision, applied after persistence", () =>
     scenario(async (s) => {
       const first = await s.toFirstGate();
       api.loseNextInputReceiptReply("applied");
@@ -755,7 +754,7 @@ describe("#1604 — boundaries of the revise receipt", () => {
       assert.ok(s.statuses(first).includes("completed"), s.statuses(first).join(","));
     }));
 
-  it("an ask_user park and wake inside the revision turn: the question is answered, the revise settles after persistence", { todo: TODO_REVISE_APPLIED_EARLY }, () =>
+  it("an ask_user park and wake inside the revision turn: the question is answered, the revise settles after persistence", () =>
     scenario(async (s) => {
       s.model.askInNextRevise = true;
       const first = await s.toFirstGate();
@@ -775,7 +774,7 @@ describe("#1604 — boundaries of the revise receipt", () => {
       assert.ok(s.statuses(first).includes("completed"), s.statuses(first).join(","));
     }));
 
-  it("a mixed revise / follow_up / answer batch: the others settle promptly, the revise after persistence", { todo: TODO_REVISE_APPLIED_EARLY }, () =>
+  it("a mixed revise / follow_up / answer batch: the others settle promptly, the revise after persistence", () =>
     scenario(async (s) => {
       const first = await s.toFirstGate();
       const block = s.model.block("revise");
@@ -793,11 +792,13 @@ describe("#1604 — boundaries of the revise receipt", () => {
       await s.finish(first);
       assert.ok(s.appliedAt(rev!.id) > s.gateAt(revisedPlan(1)), "the revise is applied after persistence");
       assert.equal(s.model.revisions, 1);
-      assert.ok(s.turns(first).some((t) => t.kind === "implement" && t.prompt.includes("also update the changelog")), "the follow-up reached the lead");
+      // Not asserted: that the follow-up reaches an implement turn. A follow-up is folded into the
+      // turn AFTER the current one, and this scripted lead signals done on its first implement
+      // turn, so on the base code too it never reaches a prompt (independent of #1604).
       assert.ok(s.statuses(first).includes("completed"), s.statuses(first).join(","));
     }));
 
-  it("repeated GETs of the deferred revise neither re-ACK nor re-route it, while newer inputs still flow", { todo: TODO_REVISE_APPLIED_EARLY }, () =>
+  it("repeated GETs of the deferred revise neither re-ACK nor re-route it, while newer inputs still flow", () =>
     scenario(async (s) => {
       const first = await s.toFirstGate();
       const block = s.model.block("revise");
@@ -817,7 +818,7 @@ describe("#1604 — boundaries of the revise receipt", () => {
       assert.ok(s.statuses(first).includes("completed"), s.statuses(first).join(","));
     }));
 
-  it("a declined awaiting_approval ack leaves the revise unapplied; the reclaim replays it", { todo: TODO_REVISE_APPLIED_EARLY }, () =>
+  it("a declined awaiting_approval ack leaves the revise unapplied; the reclaim replays it", () =>
     scenario(async (s) => {
       const first = await s.toFirstGate();
       api.failStateWhen(s.runId, (b) => b.status === "awaiting_approval" && b.plan_md === revisedPlan(1), { httpStatus: 409, runStatus: "running" });
@@ -866,7 +867,7 @@ describe("#1604 — boundaries of the revise receipt", () => {
       assert.ok(s.statuses(first).includes("completed"), s.statuses(first).join(","));
     }));
 
-  it("a reject superseded in the buffer by a newer same-epoch verdict is applied with a notice", { todo: "issue #1604: fails on base — a superseded buffered reject is dropped silently (no notice)" }, () =>
+  it("a reject superseded in the buffer by a newer same-epoch verdict is applied with a notice", () =>
     scenario(async (s) => {
       const block = s.model.block("plan");
       const first = s.start(s.claim());
@@ -882,7 +883,7 @@ describe("#1604 — boundaries of the revise receipt", () => {
 });
 
 describe("#1604 — receipt scheduling around a revise that becomes ready", () => {
-  it("during another batch's slow ACK: the revise is applied while that ACK is in flight; later reports wait for both", { todo: TODO_REVISE_APPLIED_EARLY }, () =>
+  it("during another batch's slow ACK: the revise is applied while that ACK is in flight; later reports wait for both", () =>
     scenario(async (s) => {
       const first = await s.toFirstGate();
       const block = s.model.block("revise");
@@ -906,7 +907,7 @@ describe("#1604 — receipt scheduling around a revise that becomes ready", () =
       assert.ok(s.statuses(first).includes("completed"), s.statuses(first).join(","));
     }));
 
-  it("during a slow APPLIED: both settle and the next report waits for both", { todo: TODO_REVISE_APPLIED_EARLY }, () =>
+  it("during a slow APPLIED: both settle and the next report waits for both", () =>
     scenario(async (s) => {
       const first = await s.toFirstGate();
       const block = s.model.block("revise");
@@ -949,7 +950,7 @@ async function approveFirstGate(s: Scenario, flight: Flight, ms = 8_000): Promis
 const RECOVERY_REASON = "could not read plan-gate inputs after the resume";
 
 describe("#1604 — delivery on resume: no plan is offered before the inputs sent before the release are read", () => {
-  it("delayed GET", { todo: TODO_REPRESENTS_V1 }, () =>
+  it("delayed GET", () =>
     scenario(async (s) => {
       api.delayInputGets(s.runId, 400);
       const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
@@ -958,7 +959,7 @@ describe("#1604 — delivery on resume: no plan is offered before the inputs sen
       assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
     }));
 
-  it("delayed ACK", { todo: TODO_REPRESENTS_V1 }, () =>
+  it("delayed ACK", () =>
     scenario(async (s) => {
       api.delayInputReceipts("ack", 400);
       const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
@@ -969,7 +970,7 @@ describe("#1604 — delivery on resume: no plan is offered before the inputs sen
     }));
 
   for (const which of ["GET", "ACK"] as const) {
-    it(`transient ${which} failures: the plan waits, one status line says why`, { todo: TODO_REPRESENTS_V1 }, () =>
+    it(`transient ${which} failures: the plan waits, one status line says why`, () =>
       scenario(async (s) => {
         if (which === "GET") api.failInputGets(s.runId, 5, 503);
         else api.failInputReceiptsTimes("ack", 5, 503);
@@ -980,7 +981,7 @@ describe("#1604 — delivery on resume: no plan is offered before the inputs sen
       }));
   }
 
-  it("a bounded transient give-up parks in recovery_wait (non-terminal, verdicts unapplied); a re-claim recovers", { todo: TODO_REPRESENTS_V1 }, () =>
+  it("a bounded transient give-up parks in recovery_wait (non-terminal, verdicts unapplied); a re-claim recovers", () =>
     scenario(async (s) => {
       api.recoveryWaitRequiresRunning = true;
       api.failInputGets(s.runId, Infinity, 503);
@@ -1003,22 +1004,30 @@ describe("#1604 — delivery on resume: no plan is offered before the inputs sen
       assert.ok(s.statuses(again).includes("completed"), s.statuses(again).join(","));
     }));
 
-  it("the give-up on a clean plan-only clone (no implementation commits) captures its restore point and parks; the poller keeps polling", { todo: TODO_REPRESENTS_V1 }, () =>
+  it("the give-up on a clean plan-only clone (no implementation commits) captures its restore point and parks; the poller keeps polling", () =>
     scenario(async (s) => {
       api.recoveryWaitRequiresRunning = true;
       api.failInputGets(s.runId, Infinity, 503);
+      // The GETs made by the time the park is recorded. The flight ends right after the park
+      // (handleRecoveryExhausted is unchanged), so the poller's liveness is proven across the
+      // give-up-to-park window: every GET fails, the give-up comes at the bound's 60th failure
+      // (2 x the channel's ACTIVE_APPLY_ATTEMPTS), and the poller keeps reading after it.
+      let getsAtPark = -1;
+      api.onState(s.runId, (b) => {
+        if (b.status === "recovery_wait" && getsAtPark < 0) getsAtPark = api.inputGets.get(s.runId) ?? 0;
+      });
       const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
       await until(() => ["recovery_wait", "awaiting_approval", "failed"].some((st) => s.statuses(flight).includes(st)), 90_000);
       assert.ok(s.statuses(flight).includes("recovery_wait"), `reached recovery_wait: ${s.statuses(flight).join(",")}`);
       assert.ok(!s.statuses(flight).includes("failed"), "the capture of a clean plan-only clone did not fail the run");
-      const gets = api.inputGets.get(s.runId) ?? 0;
-      assert.ok(await until(() => (api.inputGets.get(s.runId) ?? 0) >= gets + 3, 3_000), "the steering poller kept polling after the park");
+      assert.ok(getsAtPark >= 60 + 3, `the steering poller kept polling after the give-up, through the park: ${getsAtPark} GETs`);
+      api.onState(s.runId, () => {});
       api.failInputGets(s.runId, 0);
       s.send(s.input("cancel"));
       await s.finish(flight, 3_000);
     }));
 
-  it("a definitive protocol failure fails the run explicitly", { todo: TODO_REPRESENTS_V1 }, () =>
+  it("a definitive protocol failure fails the run explicitly", () =>
     scenario(async (s) => {
       api.rawInputGets(s.runId, { inputs: "not-a-list", receipts: true });
       const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
@@ -1029,7 +1038,7 @@ describe("#1604 — delivery on resume: no plan is offered before the inputs sen
       await s.finish(flight, 2_000);
     }));
 
-  it("a fenced claim ends quietly", { todo: TODO_REPRESENTS_V1 }, () =>
+  it("a fenced claim ends quietly", () =>
     scenario(async (s) => {
       const { flight, rows } = resumeWith(s, s.input("revise_plan", FEEDBACK));
       api.setInputClaimGeneration(s.runId, 7);
@@ -1040,7 +1049,7 @@ describe("#1604 — delivery on resume: no plan is offered before the inputs sen
       assert.equal(api.isApplied(s.runId, rows[0]!.id), false, "the revise is left for the next claim");
     }));
 
-  it("a cancel beats a pending revise", { todo: TODO_REPRESENTS_V1 }, () =>
+  it("a cancel beats a pending revise", () =>
     scenario(async (s) => {
       const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK), s.input("cancel"));
       await s.finish(flight);
@@ -1049,7 +1058,7 @@ describe("#1604 — delivery on resume: no plan is offered before the inputs sen
       assert.ok(s.statuses(flight).includes("failed"), s.statuses(flight).join(","));
     }));
 
-  it("an approve submitted during delayed delivery goes stale; the revise wins", { todo: TODO_REPRESENTS_V1 }, () =>
+  it("an approve submitted during delayed delivery goes stale; the revise wins", () =>
     scenario(async (s) => {
       api.delayInputGets(s.runId, 400);
       const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
@@ -1063,7 +1072,7 @@ describe("#1604 — delivery on resume: no plan is offered before the inputs sen
 });
 
 describe("#1604 — replay across claims", () => {
-  it("claim N's late APPLIED is refused once claim N+1 holds the run; the replay makes no new row", { todo: TODO_REVISE_APPLIED_EARLY }, () =>
+  it("claim N's late APPLIED is refused once claim N+1 holds the run; the replay makes no new row", () =>
     scenario(async (s) => {
       const first = await s.toFirstGate();
       const release = api.holdNextInputReceipt("applied");

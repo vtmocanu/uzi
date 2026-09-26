@@ -324,12 +324,28 @@ export interface RunContext {
    * It is NEVER invoked on the autopilot short-circuit (which DOES persist plan_md via
    * its running report / SetRunAutopilotPlan, RC1 #1197, but never invokes this callback),
    * so an auto-approved run generates no plan summary. The gate swallows any throw.
+   *
+   * Issue #1604: `settles` is the input id of the revise this plan revises (the revise
+   * verdict's `inputId`). The runner marks that revise final only once this gate's
+   * awaiting_approval report is applied (the revised plan is persisted); a declined or failed
+   * report, or an absent id, leaves it unapplied, so an interruption replays it.
    */
   gatePlan?(
     planMd: string,
     milestones?: Milestone[],
     onAwaitingApproval?: (planMd: string) => Promise<void>,
+    settles?: number,
   ): Promise<PlanVerdict>;
+  /**
+   * Issue #1604 (D3): a resumed, unapproved claim with a persisted plan calls this before it
+   * offers any plan. It resolves once the inputs sent before the claim was released are read,
+   * then returns the gate event to act on first — a cancel, else a current-epoch revise (revise
+   * the submitted plan instead of re-presenting it), else a buffered reject — or undefined when
+   * nothing is pending (an approve stays buffered for the re-presented gate). It never falls back
+   * to the gate: a transient give-up throws the recovery park, a protocol failure fails the run,
+   * a fenced claim ends quietly. Absent on the stub/test executors ⇒ today's behaviour.
+   */
+  takeResumedGateEvent?(signal?: AbortSignal): Promise<PlanVerdict | undefined>;
   /**
    * PRD #88 M1 clarification park. Called by the executor after a turn that made an
    * ask_user call: the runner emits the `question` run-message, posts /state
@@ -533,10 +549,12 @@ export interface RunContext {
    * PRD #1247 M5b (MAJOR-6): run `fn` with credential-switch trips DEFERRED — a matching switch
    * signal is held (not tripped, the turn not aborted) for the duration, then honored at the next
    * trip point after `fn` returns. The executor wraps a plan-REVISION planning turn (whose new plan
-   * is not yet persisted) in this, so a switch never releases mid-revision — which would leave the
-   * run row on the OLD plan_md and re-present the superseded plan on a reclaim. The switch instead
-   * trips at the following gate wait, after gatePlan has persisted the revised plan. Balanced
-   * (begin/finally end) by the runner. Absent on the stub/test executors ⇒ `fn` runs undeferred.
+   * is not yet persisted) in this, so a switch never releases mid-revision. A release mid-revision
+   * is recoverable since issue #1604 (the revise stays unapplied until its revised plan is
+   * persisted, so the reclaim replays it and revises again), but deferring spends no revision turn
+   * twice. The switch instead trips at the following gate wait, after gatePlan has persisted the
+   * revised plan and the revise is applied. Balanced (begin/finally end) by the runner. Absent on
+   * the stub/test executors ⇒ `fn` runs undeferred.
    */
   deferCredentialSwitch?<T>(fn: () => Promise<T>): Promise<T>;
   /**
@@ -1277,7 +1295,8 @@ export class StubExecutor implements Executor {
             payload: { round },
           });
           revisedPlan = `${revisedPlan}\n\n(revision ${round}: applied feedback)`;
-          verdict = await ctx.gatePlan(revisedPlan);
+          // Issue #1604: the re-gate settles the revise once the revised plan is persisted.
+          verdict = await ctx.gatePlan(revisedPlan, undefined, undefined, verdict.inputId);
         }
         // Fail closed: only an approve may proceed to implement. revise exits the loop
         // above; reject/cancel throw here. `verdict` is now narrowed to `approve` — if a

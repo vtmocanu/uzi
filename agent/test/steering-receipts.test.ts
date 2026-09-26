@@ -100,6 +100,18 @@ describe("recoverable /inputs drain (issue #1673)", () => {
       const cancel = new AbortController();
       const ch = channel(clientLosingGets(1), 3, cancel);
       await c.delivered(ch, cancel);
+      if (c.kind === "reject_plan") {
+        // Issue #1604: a taken reject is never applied by the worker; the run's plan_rejected
+        // `failed` transition settles it server-side, so until then it stays replayable.
+        await new Promise((r) => setTimeout(r, 50));
+        assert.deepStrictEqual(
+          api.inputReceiptCalls.map((call) => [call.kind, call.ids, call.generation]),
+          [["ack", [11], 3], ["ack", [11], 3]],
+          "the lost ACK was retried with the same id; the reject awaits its failed transition",
+        );
+        assert.deepStrictEqual(await unapplied(), [11], "the reject stays replayable");
+        return;
+      }
       await until(() => api.inputReceiptCalls.some((call) => call.kind === "applied"));
       // Not awaitReceiptSettlement: after a routed cancel the aborted controller makes a waiting
       // report reject (it must not go out uncertain). Wait for the server to record the apply.
@@ -129,6 +141,8 @@ describe("recoverable /inputs drain (issue #1673)", () => {
     assert.deepStrictEqual(ch.operatorConstraints(), ["seven", "eight"]);
   });
 
+  // Issue #1604: the revise in the batch awaits its revised plan, so the batch's applied receipt
+  // carries only the follow-up; the revise stays unapplied (replayable) until it is settled.
   it("retries a lost applied reply with the same ids without routing again", async () => {
     api.setInputClaimGeneration(RUN, 1);
     api.setInputs(RUN, [{ id: 7, kind: "revise_plan", body: "tighten it" }, { id: 8, kind: "follow_up", body: "once" }]);
@@ -138,11 +152,11 @@ describe("recoverable /inputs drain (issue #1673)", () => {
     await ch.awaitReceiptSettlement();
     assert.deepStrictEqual(
       api.inputReceiptCalls.map((call) => [call.kind, call.ids]),
-      [["ack", [7, 8]], ["applied", [7, 8]], ["applied", [7, 8]]],
+      [["ack", [7, 8]], ["applied", [8]], ["applied", [8]]],
     );
     assert.strictEqual(ch.pullFollowUp(), "once");
     assert.strictEqual(ch.pullFollowUp(), undefined);
-    assert.deepStrictEqual(await unapplied(), []);
+    assert.deepStrictEqual(await unapplied(), [7], "the revise awaits its revised plan");
   });
 
   it("ends the old flight and leaves an ACKed batch to the next claim when the ACK reply is lost across a reclaim", async () => {

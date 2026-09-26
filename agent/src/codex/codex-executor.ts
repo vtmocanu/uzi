@@ -1906,6 +1906,8 @@ export class CodexExecutor implements Executor {
         let revisions = 0;
         while (verdict.kind === "revise") {
           const feedback = verdict.feedback;
+          // Issue #1604: the re-gate below settles this revise once the revised plan is persisted.
+          const settles = verdict.inputId;
           ctx.emit({ kind: "plan_feedback", agent: "worker", payload: { feedback } });
           if (revisions >= maxRevisions) {
             throw new Error("codex plan revision budget exhausted");
@@ -1920,7 +1922,7 @@ export class CodexExecutor implements Executor {
           if (planMd === undefined || planMd.trim().length === 0) {
             throw new Error("codex plan turn produced no plan on revision");
           }
-          verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones);
+          verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, undefined, settles);
         }
         if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason);
         if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);

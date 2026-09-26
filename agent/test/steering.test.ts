@@ -31,6 +31,13 @@ function fakeClient(batches: UserInput[][]): WorkerClient {
 let nextInputId = 1;
 const inp = (kind: UserInput["kind"], body?: string): UserInput => ({ id: nextInputId++, kind, body: body ?? null });
 const tick = (ms = 10): Promise<void> => new Promise((r) => setTimeout(r, ms));
+/** Issue #1604: a revise verdict carries its input id (the re-gate settles it); these cases
+ *  compare the rest of the verdict. */
+const withoutId = (v: PlanVerdict): PlanVerdict => {
+  if (v.kind !== "revise") return v;
+  const { inputId: _inputId, ...rest } = v;
+  return rest;
+};
 
 function makeChannel(batches: UserInput[][], cancel = new AbortController()): { ch: SteeringChannel; cancel: AbortController } {
   const ch = new SteeringChannel(fakeClient(batches), "run-1", 1, nullLogger(), cancel);
@@ -661,8 +668,8 @@ describe("SteeringChannel — plan revision (PRD #41)", () => {
     const { ch } = makeChannel([[inp("revise_plan", "first"), inp("revise_plan", "second")]]);
     const e = ch.bumpEpoch();
     ch.start();
-    assert.deepStrictEqual(await ch.awaitGateEvent(e), { kind: "revise", feedback: "first" } satisfies PlanVerdict);
-    assert.deepStrictEqual(await ch.awaitGateEvent(e), { kind: "revise", feedback: "second" });
+    assert.deepStrictEqual(withoutId(await ch.awaitGateEvent(e)), { kind: "revise", feedback: "first" } satisfies PlanVerdict);
+    assert.deepStrictEqual(withoutId(await ch.awaitGateEvent(e)), { kind: "revise", feedback: "second" });
     await ch.stop();
   });
 
@@ -671,7 +678,7 @@ describe("SteeringChannel — plan revision (PRD #41)", () => {
     const e = ch.bumpEpoch();
     ch.start();
     // awaitGateEvent parks first (nothing buffered), then the routed revise wakes it.
-    assert.deepStrictEqual(await ch.awaitGateEvent(e), { kind: "revise", feedback: "adjust the approach" });
+    assert.deepStrictEqual(withoutId(await ch.awaitGateEvent(e)), { kind: "revise", feedback: "adjust the approach" });
     await ch.stop();
   });
 
@@ -681,7 +688,7 @@ describe("SteeringChannel — plan revision (PRD #41)", () => {
     const { ch } = makeChannel([[inp("revise_plan", "please tweak"), inp("approve_plan")]]);
     const e = ch.bumpEpoch();
     ch.start();
-    assert.deepStrictEqual(await ch.awaitGateEvent(e), { kind: "revise", feedback: "please tweak" });
+    assert.deepStrictEqual(withoutId(await ch.awaitGateEvent(e)), { kind: "revise", feedback: "please tweak" });
     await ch.stop();
   });
 
@@ -696,7 +703,7 @@ describe("SteeringChannel — plan revision (PRD #41)", () => {
     const e = ch.bumpEpoch();
     ch.start();
     push([inp("approve_plan"), inp("revise_plan", "tweak it")]); // approve FIRST in the batch
-    assert.deepStrictEqual(await ch.awaitGateEvent(e), { kind: "revise", feedback: "tweak it" });
+    assert.deepStrictEqual(withoutId(await ch.awaitGateEvent(e)), { kind: "revise", feedback: "tweak it" });
     // The batched approve was buffered, not dropped: at the next epoch it is the stale
     // pre-feedback version and is discarded with a notice, and a fresh approve then lands.
     const e2 = ch.bumpEpoch();

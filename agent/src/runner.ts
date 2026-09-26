@@ -75,6 +75,7 @@ import {
   SteeringChannel,
   PauseNowSignal,
   CredentialSwitchSignal,
+  GateInputDeliveryError,
   type AnswerVerdict,
   type PlanVerdict,
 } from "./steering.js";
@@ -446,6 +447,10 @@ class CredentialSwitchRetainedStop extends Error {
     this.name = "CredentialSwitchRetainedStop";
   }
 }
+
+/** Issue #1604 (D3): why a resumed claim parks when the inputs sent before its release cannot be
+ *  read within the channel's bound. */
+const RESUMED_GATE_RECOVERY_REASON = "could not read plan-gate inputs after the resume";
 
 /**
  * PRD #1391 Run B M4: phaseClone's FIRST `running` report came back refused (applied:false) with a
@@ -2608,10 +2613,14 @@ export class RunRunner {
     // undefined and the server defaults it to 'agent_failure'. PRD #1077: a
     // TerminalReportError carries its own typed origin (push_secret_blocked) whose
     // terminal report threw after exhausting retries — honor it verbatim.
+    // Issue #1604: a plan rejection names its class, so the `failed` transition settles the run's
+    // unapplied reject_plan inputs with it (the server keys on its own stop_kind as well).
     const failOrigin =
       err instanceof TerminalReportError
         ? err.failOrigin
-        : failOriginForReason(rawReason);
+        : err instanceof PlanRejectedError
+          ? "plan_rejected"
+          : failOriginForReason(rawReason);
     runLog.error("run failed", { error: reason });
     // PRD #1391 Run B M3 (D5): if the permanent-failure hook tripped, AWAIT its settlement first — it
     // journals `failed` durably and aborts the attempt (which routed us here), so the journal must be
@@ -5025,6 +5034,10 @@ export class RunRunner {
     // running-report ACK's pauseRequested regressed. In the normal case the ACK also re-fires
     // pauseRequested, so the seed is a real safety net rather than the sole trigger.
     if (claim.pause_pending) steering.seedPauseRequested(claim.pause_mode);
+    // Issue #1604 (D3): a resumed claim with an unapproved persisted plan reads the inputs sent
+    // before the release before it offers any plan; guard that first read from the start, since
+    // the poll begins long before the executor reaches the gate.
+    if (claim.plan_approved !== true && !!claim.plan_md?.trim()) steering.guardInitialDelivery();
 
     // Last SDK session id the executor observed; carried on EVERY state report so
     // resume survives a lost report.
@@ -6283,7 +6296,10 @@ export class RunRunner {
       // verdict the steering channel resolves (bounded so an abandoned plan
       // fails rather than wedging the worker). An autopilot claim short-circuits
       // to an approve verdict (see gatePlan) — the run never parks at the gate.
-      gatePlan: async (planMd, milestones, onAwaitingApproval) => {
+      // Issue #1604 (D3): read the inputs sent before the release, then take the gate event a
+      // resumed claim acts on before offering any plan.
+      takeResumedGateEvent: (signal) => this.takeResumedGateEvent(runId, steering, batcher, runLog, signal),
+      gatePlan: async (planMd, milestones, onAwaitingApproval, settles) => {
         // PRD #71 M5: a CI-config-classified ci_fix plan must NOT take the auto-approve
         // short-circuit — it parks for human review even on an auto-triggered run. We
         // force the gate by passing autoApprove=false for that case; gatePlan is otherwise
@@ -6308,6 +6324,7 @@ export class RunRunner {
           // PRD #1416 M5: the published floor P for the warn-only plan-gate nudge.
           flight.publishedTip,
           onAwaitingApproval,
+          settles,
         );
         // Human-in-the-loop iff the plan reached an approve verdict via the PARK path
         // (not the auto short-circuit). Read by the pre-push guard below.
@@ -9464,6 +9481,47 @@ export class RunRunner {
     return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId, resume, expectedCheckpointTip);
   }
 
+  /**
+   * Issue #1604 (D3): a resumed, unapproved claim with a persisted plan reads the inputs sent
+   * before the claim was released BEFORE it offers any plan, then takes the gate event to act on:
+   * a sticky cancel, else a current-epoch revise, else a buffered current-epoch reject (an approve
+   * stays buffered for the re-presented gate). It never falls back to the gate:
+   *  - the bounded transient give-up parks the run through the EXISTING recovery path (a
+   *    TransientRecoveryError → handleRecoveryExhausted, reported from the run's actual phase,
+   *    `running`), leaving every verdict unapplied for the next claim;
+   *  - a definitive protocol failure fails the run explicitly;
+   *  - a fence, a credential switch or a cancel propagates as the signal it is.
+   * A taken revise marks the run gated, so the revised plan's re-report bumps the epoch and an
+   * approve sent against the submitted plan goes stale.
+   */
+  private async takeResumedGateEvent(
+    runId: string,
+    steering: SteeringChannel,
+    batcher: MessageBatcher,
+    runLog: Logger,
+    signal: AbortSignal | undefined,
+  ): Promise<PlanVerdict | undefined> {
+    try {
+      await steering.awaitInitialDelivery(signal);
+    } catch (err) {
+      if (!(err instanceof GateInputDeliveryError)) throw err;
+      if (err.definitive) throw new Error(`plan-gate input delivery failed: ${err.message}`);
+      runLog.warn("could not read plan-gate inputs after the resume; parking for recovery", {
+        run_id: runId,
+        error: err.message,
+      });
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: `${RESUMED_GATE_RECOVERY_REASON} — the plan is not offered; parking to retry` },
+      });
+      throw new TransientRecoveryError(RESUMED_GATE_RECOVERY_REASON);
+    }
+    const verdict = steering.takeResumedGateEvent();
+    if (verdict?.kind === "revise") this.gatedRuns.add(runId);
+    return verdict;
+  }
+
   /** Post awaiting_approval with the plan and await the steering verdict, bounded.
    *  For an autopilot run, the plan is still recorded but the gate resolves with an
    *  approve verdict immediately — no awaiting_approval report, no /inputs wait. It
@@ -9514,6 +9572,11 @@ export class RunRunner {
     // its running report / SetRunAutopilotPlan) but never invokes onAwaitingApproval, so
     // it still generates no plan summary.
     onAwaitingApproval?: (planMd: string) => Promise<void>,
+    // Issue #1604 (D2): the input id of the revise this plan revises. Settled (made due its
+    // APPLIED) only once the awaiting_approval report below is applied, i.e. the revised plan is
+    // persisted; a declined or failed report leaves the revise unapplied, so an interruption
+    // replays it instead of re-presenting the superseded plan.
+    settles?: number,
   ): Promise<PlanVerdict> {
     batcher.emit({ kind: "plan", agent: "lead", payload: { plan_md: planMd } });
     // Get the plan message onto the stream regardless of mode — it is the audit
@@ -9630,7 +9693,7 @@ export class RunRunner {
     // best-effort (planChangedFiles swallows errors → []), computed EVERY round so a
     // revision gate reflects that round's tree (a revert between rounds clears the list).
     const planChangedFiles = await this.git.planChangedFiles(worktreePath);
-    await reportState({
+    const ack = await reportState({
       status: "awaiting_approval",
       plan_md: planMd,
       ...(milestones?.length ? { milestones } : {}),
@@ -9643,6 +9706,9 @@ export class RunRunner {
       // empty), keeping a revision gate from showing a stale earlier round's writes.
       plan_changed_files: planChangedFiles,
     });
+    // Issue #1604 (D2): the revised plan is durable, so the revise it answers is final now.
+    if (settles !== undefined && ack.applied === true && ack.status === "awaiting_approval")
+      steering.settleRevision(settles);
     if (this.gatedRuns.has(runId)) steering.bumpEpoch();
     else this.gatedRuns.add(runId);
     const epoch = steering.currentEpoch();

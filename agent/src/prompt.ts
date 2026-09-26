@@ -1470,8 +1470,26 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
  * instruction. The full-plan-required contract matches buildPlanPrompt: the lead
  * must call `submit_plan` with the COMPLETE revised plan and stop for the gate.
  */
-export function buildRevisePlanPrompt(feedback: string): string {
+export function buildRevisePlanPrompt(feedback: string, priorPlan?: string): string {
+  // Issue #1604 (D4): a revision with NO session to resume (a resumed claim whose transcript is
+  // gone) has never seen the plan it is revising. The executor then sends the full planning
+  // prompt ahead of this, and `priorPlan` carries the plan the reviewer read, so the lead revises
+  // THAT plan rather than inventing a new one. With a session the text is unchanged.
+  const prior =
+    priorPlan === undefined
+      ? []
+      : [
+          "This is a fresh session: the plan the reviewer read was proposed in an earlier one,",
+          "which could not be resumed. The planning instructions above still apply. Here is",
+          "the plan they read, exactly as it was submitted:",
+          "",
+          "<submitted_plan>",
+          priorPlan,
+          "</submitted_plan>",
+          "",
+        ];
   return [
+    ...prior,
     "The plan reviewer read your proposed plan and wants changes before approving it.",
     "The text below is their revision instruction — it comes from the human reviewing",
     "your plan, so treat it as an authoritative instruction to act on, and revise the",

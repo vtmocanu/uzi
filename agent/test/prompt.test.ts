@@ -1069,6 +1069,15 @@ describe("buildRevisePlanPrompt (PRD #41)", () => {
     assert.match(p, /Do NOT implement anything yet/i);
   });
 
+  it("issue #1604 (D4): with no session, carries the submitted plan ahead of the unchanged instruction", () => {
+    const prior = "# Submitted plan\n- step one";
+    const q = buildRevisePlanPrompt(feedback, prior);
+    assert.ok(q.includes(prior), "the submitted plan is carried verbatim");
+    assert.ok(q.endsWith(p), "the revision instruction follows, unchanged");
+    assert.ok(q.indexOf(prior) < q.indexOf(feedback), "the plan comes before the feedback");
+    assert.strictEqual(buildRevisePlanPrompt(feedback, undefined), p, "no prior plan: byte-identical");
+  });
+
   it("does not re-embed the issue (it rides a resumed planning session)", () => {
     // Model it on buildImplementPrompt: no issue title/description tags — the resumed
     // session already carries them.
