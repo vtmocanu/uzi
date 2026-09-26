@@ -3349,11 +3349,15 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	var rows int64
 	// PRD #634 M4: the disposition to settle the pending scope audit row(s) with, decided in
 	// the `completed` case and applied best-effort in the applied-transition block below.
-	// Empty means "no settle". The failed arm also sets it 'declined' for a scope-directed run.
-	// Issue #1399: those arm decisions read `owned`, which for a legacy (nil-generation) report
-	// is the UNLOCKED pre-switch snapshot, so a scope directive can commit after it and before
-	// the terminal write. The applied-transition block therefore also settles 'declined' when it
-	// is still empty and the post-transition re-read is terminal and scope-directed.
+	// Empty means "no settle". The failed arm also sets it 'declined' for a scope-directed run;
+	// the limit_wait rate-limit opt-out settles inline in limitwait.go instead.
+	// Issue #1399: those arm decisions read `owned`, which for any report that skips the FOR
+	// UPDATE fence (a legacy nil-generation report, a chat run, an interlocked completion; see
+	// stateUsesGenerationFence / stateUsesForUpdateFence) is the UNLOCKED pre-switch snapshot, so
+	// a scope directive can commit after it and before the terminal write. The applied-transition
+	// block therefore also settles when it is still empty and the post-transition re-read is
+	// terminal and scope-directed: 'applied' if the re-read carries stop_kind scope_capped,
+	// 'declined' otherwise.
 	var settleScopeDisposition string
 	switch req.State {
 	case "running":
@@ -3879,13 +3883,25 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// transition, or a run with no scope directive, leaves settleScopeDisposition empty
 		// and skips it.
 		//
-		// Issue #1399: an arm's decision reads `owned`, which is unlocked for a legacy report
-		// (and the forge park arm decides nothing). A scope directive that committed after that
-		// read but before the terminal write shows up only in this post-transition re-read, so a
-		// terminal (completed/failed/cancelled) scope-directed run with no arm decision settles
-		// 'declined' here. An arm's own decision (e.g. scope_capped -> 'applied') is kept.
+		// Issue #1399: an arm's decision reads `owned`, which is unlocked for any report that
+		// skips the FOR UPDATE fence (legacy nil-generation, chat, interlocked completion; see
+		// stateUsesGenerationFence), and the forge park arm decides nothing. A scope directive
+		// that committed after that read but before the terminal write shows up only in this
+		// post-transition re-read, so a terminal (completed/failed/cancelled) scope-directed run
+		// with no arm decision settles here. An arm's own decision is kept.
+		//
+		// The re-read status is not necessarily THIS report's transition: a non-terminal report
+		// (e.g. `running`, rows>0) can re-read a run a concurrent completed+ScopeCapped report
+		// has just committed. Settling 'declined' there would win the idempotent
+		// (disposition IS NULL) settle over the completer's 'applied', so key the fallback on the
+		// re-read stop_kind: scope_capped is stamped only by a genuine completion of a run that
+		// carried a scope_ceiling, so it settles 'applied'; anything else settles 'declined'.
 		if settleScopeDisposition == "" && run.ScopeCeiling.Valid && (run.Status == "completed" || run.Status == "failed" || run.Status == "cancelled") {
-			settleScopeDisposition = "declined"
+			if run.StopKind.Valid && run.StopKind.String == "scope_capped" {
+				settleScopeDisposition = "applied"
+			} else {
+				settleScopeDisposition = "declined"
+			}
 		}
 		if settleScopeDisposition != "" {
 			if _, setErr := s.q.SettleScopeInputDisposition(ctx, store.SettleScopeInputDispositionParams{
