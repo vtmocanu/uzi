@@ -151,8 +151,8 @@ func (m tuiModel) effectiveRailFolded(now time.Time) bool {
 // railAutoFolded reports whether the EXPANDED rail's roster plus every PRESENT protected block
 // would overrun transcriptViewport(), so the rail must fold by itself (PRD #1257 D1/D2). The
 // protected set is: the whole MILESTONES list (no budget of its own — clamped by joinColumns), the
-// 3-line SPEND block, the PRD #623 floor of the run's OWN ACCOUNTS entry (3 rows under a 1-row
-// header), and — PRD #1209 M3 — the CODEX block's floor (its 1-row header + the first shown Codex
+// 3-line SPEND block, the run's OWN ACCOUNTS entry (three Claude rows or one Codex
+// snapshot row under a 1-row header), and — PRD #1209 M3 — the CODEX block's floor (its 1-row header + the first shown Codex
 // account, the analog of the Claude own-account floor; railCodexFloorRows). Sibling Claude/Codex
 // accounts stay best-effort and drop bottom-up as today, so only the first of each is counted (D2).
 // A run with no lanes has nothing to fold; a run with an empty required set (no milestone list, no
@@ -177,9 +177,18 @@ func (m tuiModel) railAutoFolded(now time.Time) bool {
 	}
 	block := m.renderMilestones()
 	spend := d.run.Usage != nil
-	ownAccount := d.run.AnthropicSecretID != nil
+	accountFloorRows := 0
+	if d.run.AnthropicSecretID != nil {
+		accountFloorRows += 3 // label and two Claude meter windows
+	}
+	if d.run.Harness == "codex" && d.run.CodexSecretLabel != nil && *d.run.CodexSecretLabel != "" {
+		accountFloorRows++ // run-bound snapshot, even with no current Codex meter
+	}
+	if accountFloorRows > 0 {
+		accountFloorRows++ // ACCOUNTS header
+	}
 	codexRows, hasCodex := m.railCodexFloorRows()
-	if block == "" && !spend && !ownAccount && !hasCodex {
+	if block == "" && !spend && accountFloorRows == 0 && !hasCodex {
 		return false // empty required set: nothing below the roster to protect (D2/D5)
 	}
 	vp := m.transcriptViewport()
@@ -195,11 +204,11 @@ func (m tuiModel) railAutoFolded(now time.Time) bool {
 		}
 		appendRailBlock(&sb, "x\nx\nx") // advance past SPEND's 3 rows so ACCOUNTS is measured below it
 	}
-	if ownAccount {
-		// railRateMeters draws the run's own entry (label + 5h + 7d = 3 rows) under a 1-row ACCOUNTS
-		// header, whole-block-or-nothing: header + 3 <= budget (vp - usedRows - 1).
+	if accountFloorRows > 0 {
+		// Protect the run-bound Codex snapshot even when its alias was deleted or
+		// no current Codex meter exists. Claude's own meter still needs three rows.
 		usedRows := strings.Count(sb.String(), "\n") + 1
-		if 1+3 > vp-usedRows-1 {
+		if accountFloorRows > vp-usedRows-1 {
 			return true
 		}
 	}

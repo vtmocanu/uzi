@@ -69,6 +69,41 @@ func TestRenderRunDetailForgeAwareMRColumn(t *testing.T) {
 	}
 }
 
+func TestRenderRunDetailCodexAlias(t *testing.T) {
+	render := func(label, id *string, held bool) string {
+		t.Helper()
+		var buf bytes.Buffer
+		p := uzicli.NewPrinter(&buf, false, false, true, false)
+		r := apitypes.RunDTO{ID: "run-codex", Kind: "issue", Harness: "codex", Status: "completed",
+			Health: "ok", CodexSecretLabel: label, CodexSecretID: id}
+		if held {
+			cause, action := "codex_account_unavailable", "relogin_required"
+			r.Status, r.RecoveryWaitCause, r.CodexAccountAction = "recovery_wait", &cause, &action
+		}
+		if err := renderRunDetail(p, r); err != nil {
+			t.Fatal(err)
+		}
+		return buf.String()
+	}
+	id, label := "alias-id", "work-login"
+	if out := render(&label, &id, false); !strings.Contains(out, "CODEX_ALIAS") || !strings.Contains(out, label) || strings.Contains(out, "(deleted)") {
+		t.Fatalf("bound Codex alias row missing or wrong: %s", out)
+	}
+	if out := render(&label, nil, false); !strings.Contains(out, "work-login (deleted)") {
+		t.Fatalf("deleted Codex alias must retain snapshot: %s", out)
+	}
+	if out := render(&label, &id, true); !strings.Contains(out, "CODEX_ALIAS") || !strings.Contains(out, "CODEX_ACCOUNT") || !strings.Contains(out, "re-log in Codex credential work-login to continue") {
+		t.Fatalf("held run must keep action and add alias row: %s", out)
+	}
+	hostile := "work\nlogin\x1b[31m"
+	if out := render(&hostile, &id, false); !strings.Contains(out, "work login") || strings.Contains(out, "\x1b") || strings.Contains(out, "work\nlogin") {
+		t.Fatalf("Codex alias was not folded by cellText: %q", out)
+	}
+	if out := render(nil, nil, false); strings.Contains(out, "CODEX_ALIAS") {
+		t.Fatalf("unbound Codex run invented alias row: %s", out)
+	}
+}
+
 // TestRenderRunDetailAnthropicToken pins `uzi run get`'s ANTHROPIC_TOKEN row
 // (PRD #111 M1) and, more importantly, the sanitization it goes through.
 //
