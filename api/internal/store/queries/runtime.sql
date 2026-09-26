@@ -2633,6 +2633,7 @@ UPDATE runs SET
     updated_at            = now()
 WHERE id = @id AND user_id = @user_id
   AND status = 'paused'
+  AND hold_reason IS DISTINCT FROM 'credential_disabled'
   -- D6: refuse a completion hold unless the completion decision endpoint opts in.
   AND (hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
   -- D7: refuse a budget_exhausted park with no remaining budget (extend is the way back).
@@ -2883,6 +2884,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: ClearRunMilestonesCompleted :execrows
@@ -2988,6 +2990,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: SetRunCompleted :execrows
@@ -3320,6 +3323,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: SupersedeRunByWorker :execrows
@@ -3347,6 +3351,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: FailRunAutoStop :execrows

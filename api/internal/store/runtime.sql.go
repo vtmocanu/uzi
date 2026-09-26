@@ -512,6 +512,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = $1 AND worker_id = $2
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
@@ -11016,6 +11017,7 @@ UPDATE runs SET
     updated_at            = now()
 WHERE id = $1 AND user_id = $2
   AND status = 'paused'
+  AND hold_reason IS DISTINCT FROM 'credential_disabled'
   -- D6: refuse a completion hold unless the completion decision endpoint opts in.
   AND (hold_reason IS DISTINCT FROM 'completion_blocked' OR $3::boolean)
   -- D7: refuse a budget_exhausted park with no remaining budget (extend is the way back).
@@ -11985,6 +11987,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = $3 AND worker_id = $4
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
@@ -12037,6 +12040,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = $4 AND worker_id = $5
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
@@ -14180,6 +14184,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = $1 AND worker_id = $2
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
