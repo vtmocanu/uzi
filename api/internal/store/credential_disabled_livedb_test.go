@@ -15,6 +15,7 @@ import (
 func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 	ctx, pool, q, user := codexLiveDB(t)
 	repo, worker := codexRunFixture(ctx, t, pool, user)
+	mustExec(ctx, t, pool, `UPDATE workers SET snapshot_register_nonce='incarnation-a' WHERE id=$1`, worker)
 	run := insertCodexRun(ctx, t, pool, user, repo, worker, 901, "running", "credential park")
 	started := time.Now().Add(-20 * time.Second).UTC().Truncate(time.Second)
 	mustExec(ctx, t, pool, `UPDATE runs SET started_at=$2, status_since=$2, claim_generation=7,
@@ -74,6 +75,14 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 		}
 	}
 	read()
+	var releasedID uuid.UUID
+	var releasedNonce string
+	if err := pool.QueryRow(ctx, `SELECT released_worker_id, released_worker_nonce FROM runs WHERE id=$1`, run).Scan(&releasedID, &releasedNonce); err != nil {
+		t.Fatalf("read released worker: %v", err)
+	}
+	if releasedID != worker || releasedNonce != "incarnation-a" {
+		t.Fatalf("released incarnation = %s/%q, want %s/incarnation-a", releasedID, releasedNonce, worker)
+	}
 	if status != "paused" || (!hold.Valid || hold.String != "credential_disabled") || bank != 3 || epoch != 5 || cap != nil ||
 		!gotStarted.Equal(started) || session != "resume-session" || !ownerWorker.Valid || ownerWorker.Bytes != worker ||
 		pauseMode != "now" || recoveryCount != 2 || pauseAt.IsZero() || !claimReleased.Valid {
