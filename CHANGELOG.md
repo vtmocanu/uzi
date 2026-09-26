@@ -35,6 +35,9 @@ through `[0.52.0]`.)
 - **A plan-gate verdict no longer gets lost or applied to the wrong plan when a run is interrupted ([#1604](https://github.com/vtmocanu/uzi/issues/1604)).**
   Approve, reject, and request-changes verdicts now survive a credential switch, a worker restart, or a resumed run; on Codex runs carried-over verdicts (approve, reject or request-changes) are ignored and the run feed asks you to re-send them, and a fresh plan is shown. A requested revision is kept until the revised plan is saved, so on Claude runs a resumed run revises with your original feedback instead of re-showing the old plan. A reject is recorded together with stopping the run; a verdict sent before the current plan was shown is ignored, with a note in the run feed explaining why. Upgrade the api and workers together: an api from 0.84.x still works with the new worker but sends no plan-shown time, so an approve or reject replayed on a resumed run is ignored with "Could not confirm which plan this verdict was for" and must be re-sent, and ignored approvals stay pending instead of being cleared.
 
+- **The TUI run view no longer picks up a stale live stream when you reopen the same run ([#1151](https://github.com/vtmocanu/uzi/issues/1151)).**
+  Leaving a run's detail view and quickly reopening it could let the previous session's late socket or run refresh land in the new one: the view could drop to 2s polling, run a second reader over the stream, leak a connection, or show older milestones. Late replies from an earlier session are now ignored and a stale socket is closed.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added

@@ -74,7 +74,7 @@ func TestTUIDetailMetaPollDerivesShortDeadline(t *testing.T) {
 	m := tuiTestModel(t, fake, runID)
 
 	before := time.Now()
-	msg := m.refreshRunMetaCmd(runID, 0)()
+	msg := m.refreshRunMetaCmd(runID, 0, m.detail.gen)()
 	if _, ok := msg.(detailMetaMsg); !ok {
 		t.Fatalf("refreshRunMetaCmd produced %T, want detailMetaMsg", msg)
 	}

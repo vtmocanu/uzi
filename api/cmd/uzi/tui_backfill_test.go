@@ -279,7 +279,7 @@ func TestTUIDetailBackfillInterleavesLiveFrame(t *testing.T) {
 	m = next.(tuiModel)
 
 	// A live frame (newest seq 6) arrives before the next backfill page.
-	next, _ = m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{
+	next, _ = m.Update(streamEventsMsg{gen: m.detail.gen, runID: runID, events: []apitypes.RunEventDTO{
 		msgEvent(6, "text", "lead", "live-6", now),
 	}})
 	m = next.(tuiModel)
@@ -298,7 +298,7 @@ func TestTUIDetailBackfillInterleavesLiveFrame(t *testing.T) {
 		}
 	}
 	// A duplicate live frame (seq 4, already held) is deduped: the length does not grow.
-	next, _ = m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{
+	next, _ = m.Update(streamEventsMsg{gen: m.detail.gen, runID: runID, events: []apitypes.RunEventDTO{
 		msgEvent(4, "text", "lead", "dup-4", now),
 	}})
 	m = next.(tuiModel)

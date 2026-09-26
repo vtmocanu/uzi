@@ -61,7 +61,7 @@ func TestTUIDetailPollFallbackIncrementalAndGuarded(t *testing.T) {
 		t.Fatalf("setup: highSeq=%d historyComplete=%v, want 3 / true", m.detail.highSeq, m.detail.historyComplete)
 	}
 	// The socket cannot open: fall back to polling.
-	next, _ := m.Update(streamReadyMsg{runID: runID, err: errFake("stream down")})
+	next, _ := m.Update(streamReadyMsg{gen: m.detail.gen, runID: runID, err: errFake("stream down")})
 	m = next.(tuiModel)
 	if !m.detail.polling {
 		t.Fatal("setup: a failed stream did not enter polling")
@@ -110,7 +110,7 @@ func TestTUIDetailMetaStatusAdoptWhilePolling(t *testing.T) {
 		m = applyDetail(m, apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: "meta"}, nil)
 		m.detail.polling = true
 		m.detail.metaWaitID = 1
-		next, _ := m.Update(detailMetaMsg{runID: runID, reqID: 1,
+		next, _ := m.Update(detailMetaMsg{gen: m.detail.gen, runID: runID, reqID: 1,
 			run: apitypes.RunDTO{ID: runID, Status: "completed", IssueTitle: "meta"}})
 		m = next.(tuiModel)
 		if m.detail.run.Status != "completed" {
@@ -123,7 +123,7 @@ func TestTUIDetailMetaStatusAdoptWhilePolling(t *testing.T) {
 		m = applyDetail(m, apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: "meta"}, nil)
 		m.detail.polling = false
 		m.detail.metaWaitID = 1
-		next, _ := m.Update(detailMetaMsg{runID: runID, reqID: 1,
+		next, _ := m.Update(detailMetaMsg{gen: m.detail.gen, runID: runID, reqID: 1,
 			run: apitypes.RunDTO{ID: runID, Status: "completed", IssueTitle: "meta refreshed"}})
 		m = next.(tuiModel)
 		if m.detail.run.Status != "running" {
@@ -215,7 +215,7 @@ func TestTUIDetailStreamReadyNotesTailFloor(t *testing.T) {
 	}
 	s := uzicli.NewRunStream(context.Background(), nil)
 	defer s.Close()
-	next, _ := m.Update(streamReadyMsg{runID: runID, stream: s})
+	next, _ := m.Update(streamReadyMsg{gen: m.detail.gen, runID: runID, stream: s})
 	m = next.(tuiModel)
 	if got := s.LastSeen(); got != 3 {
 		t.Errorf("streamReadyMsg after a tail page set the replay floor to %d, want highSeq 3", got)
@@ -303,7 +303,7 @@ func TestTUIDetailTailRetryAfterFailedInitialTail(t *testing.T) {
 	// The initial tail fails and the socket is down: the stuck state.
 	next, _ = m.Update(detailPageMsg{runID: runID, kind: pageTail, err: errFake("tail boom")})
 	m = next.(tuiModel)
-	next, _ = m.Update(streamReadyMsg{runID: runID, err: errFake("stream down")})
+	next, _ = m.Update(streamReadyMsg{gen: m.detail.gen, runID: runID, err: errFake("stream down")})
 	m = next.(tuiModel)
 	if m.detail.highSeq != 0 || m.detail.pageErr == nil || !m.detail.polling {
 		t.Fatalf("setup: want highSeq 0, pageErr set, polling; got highSeq=%d pageErr=%v polling=%v", m.detail.highSeq, m.detail.pageErr, m.detail.polling)
