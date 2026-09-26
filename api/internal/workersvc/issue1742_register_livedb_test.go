@@ -12,36 +12,37 @@ import (
 // outcome is represented by the register snapshot; no replay is run here.
 func TestRegisterPendingOutcomeClassificationLiveDB(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		snapshot     func(uuid.UUID) *ActiveSnapshot
-		wantStatus   string
-		wantOrigin   string
-		wantLease    bool
-		wantOverflow bool
-		preseedLease bool
+		name            string
+		snapshot        func(uuid.UUID) *ActiveSnapshot
+		wantStatus      string
+		wantOrigin      string
+		wantLease       bool
+		wantOverflow    bool
+		preseedLeaseGen int64
 	}{
 		{
 			name:       "no journal and no snapshot fails as worker lost",
 			wantStatus: "failed", wantOrigin: "worker_lost",
 		},
 		{
-			name: "loaded journal sends empty register snapshot with overflow and preserves run",
+			name: "valid worker register overflow snapshot preserves run",
 			snapshot: func(_ uuid.UUID) *ActiveSnapshot {
 				return &ActiveSnapshot{SnapshotEpoch: 0, PendingOverflow: true, Active: []ActiveRunEntry{}}
 			},
 			wantStatus: "running", wantOverflow: true,
 		},
 		{
-			name:         "prior exact-generation terminal lease protects a journal whose register snapshot is lost",
-			preseedLease: true,
-			wantStatus:   "running", wantLease: true,
+			name:            "prior exact-generation terminal lease protects run without register snapshot",
+			preseedLeaseGen: 1,
+			wantStatus:      "running", wantLease: true,
 		},
 		{
-			name:       "faulted journal load sends no snapshot and fails as worker lost",
-			wantStatus: "failed", wantOrigin: "worker_lost",
+			name:            "wrong-generation terminal lease cannot protect run without register snapshot",
+			preseedLeaseGen: 2,
+			wantStatus:      "failed", wantOrigin: "worker_lost", wantLease: true,
 		},
 		{
-			name: "faulted journal load sends invalid snapshot and fails as worker lost",
+			name: "invalid register snapshot is ignored and orphan pass fails worker lost",
 			snapshot: func(run uuid.UUID) *ActiveSnapshot {
 				return &ActiveSnapshot{SnapshotEpoch: 0, PendingOverflow: true,
 					Active: []ActiveRunEntry{entry(run, 1, "invalid_phase", true)}}
@@ -56,8 +57,8 @@ func TestRegisterPendingOutcomeClassificationLiveDB(t *testing.T) {
 			workerID := seedSnapshotWorker(t, env, userID, "old-nonce")
 			runID := seedOutageRun(t, env, userID, repoID, workerID, "running", "issue", 1, 1)
 			holdID := claimRecoveryHold(t, env, runID, workerID, 1)
-			if tc.preseedLease {
-				insertActiveLease(t, env, workerID, runID, 1, true, "1 hour")
+			if tc.preseedLeaseGen != 0 {
+				insertActiveLease(t, env, workerID, runID, tc.preseedLeaseGen, true, "1 hour")
 			}
 
 			var snap *ActiveSnapshot
@@ -88,8 +89,8 @@ func TestRegisterPendingOutcomeClassificationLiveDB(t *testing.T) {
 			if ok != tc.wantLease {
 				t.Fatalf("active lease present = %v, want %v", ok, tc.wantLease)
 			}
-			if tc.wantLease && (lease.gen != generation || !lease.terminalPending || !lease.untilFuture) {
-				t.Fatalf("active lease = %+v, want future terminal lease at generation %d", lease, generation)
+			if tc.wantLease && (lease.gen != tc.preseedLeaseGen || !lease.terminalPending || !lease.untilFuture) {
+				t.Fatalf("active lease = %+v, want future terminal lease at generation %d", lease, tc.preseedLeaseGen)
 			}
 			if flag, future := workerOverflow(t, env, workerID); flag != tc.wantOverflow || future != tc.wantOverflow {
 				t.Fatalf("overflow flag=%v future=%v, want both %v", flag, future, tc.wantOverflow)
