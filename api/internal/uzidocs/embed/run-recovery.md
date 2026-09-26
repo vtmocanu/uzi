@@ -193,7 +193,7 @@ archives**, and you can still resolve it yourself with `uzi run export` or
 The resumed run doesn't have to finish first. While it is still running on the
 same worker, each checkpoint the server confirms it published (or, for a task
 run, its pushed branch) lets the worker ask for the same proof early. The
-server checks the candidates against the checkpoint it derives for that run,
+server checks the candidates against the checkpoint or branch it derives for that run,
 not a ref the worker names, and releases the older hold only if the run is
 still live on that worker at that generation. A run that was cancelled,
 reclaimed, or moved in the meantime keeps the hold. An older generation taken

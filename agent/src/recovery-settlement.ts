@@ -683,7 +683,9 @@ export class PredecessorSettler {
    *  recovery pin and journal, then the settlement record LAST. A crash (or a failed step)
    *  mid-cleanup leaves the record, so the identical settle is re-sent, the api answers `released`
    *  again, and the cleanup re-runs. `sent` names the generations of the request that was answered
-   *  (a live leg's own snapshot, or the record for the completed path). */
+   *  (a live leg's own snapshot, or the record for the completed path). A hold's generation is
+   *  fixed, so `sent.predecessorGeneration` always equals `rec.predecessorGeneration`; only the
+   *  successor generation can differ between a live leg and the record. */
   private async releasedCleanupLocked(
     rec: SettlementRecord,
     sent: Pick<SettlementRecord, "predecessorGeneration" | "successorGeneration">,

@@ -964,7 +964,7 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
   }
 
   for (const kind of ["task", "ci_fix", "mr_rework", "prompt"]) {
-    it(`a confirmed CHECKPOINT publish of a ${kind} run fires nothing (its live settle proves against the branch)`, async () => {
+    it(`a confirmed CHECKPOINT publish of a ${kind} run fires nothing (checkpoint target is issue/self_improve only)`, async () => {
       const r = await liveRig();
       try {
         await r.settlement.put(adoptedRecord(r, HOLD_A));

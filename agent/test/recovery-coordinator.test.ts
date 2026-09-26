@@ -662,6 +662,36 @@ describe("RecoveryCoordinator — exact generation identity end to end (PRD #134
     assert.deepEqual(left.map((r) => [r.generation, r.sourceSha]), [[2, H_PRIME]], "the concurrent record survives");
   });
 
+  it("release() of the LAST generation sweeps the run dir recursively: tampered .json, orphan .bundle and .tmp go too (issue #1751 NB2)", async () => {
+    const coord = makeCoordinator();
+    const runId = "run-sweep";
+    await coord.pin({ runId, sourceSha: H, kind: "issue", branch: "b", generation: 7 });
+    const dir = path.join(root, runId);
+    // Leftovers the authenticated journal never lists: a MAC-mismatch record, an orphan bundle,
+    // and an interrupted atomic-write temp file.
+    const tampered = path.join(dir, "cap-tampered.json");
+    fs.writeFileSync(tampered, JSON.stringify({ runId, captureId: "cap-tampered", generation: 3, mac: "00" }));
+    const orphan = path.join(dir, "cap-orphan.bundle");
+    fs.writeFileSync(orphan, "bytes");
+    const tmp = path.join(dir, "cap-x.json.0f1e2d3c.tmp");
+    fs.writeFileSync(tmp, "partial");
+    assert.deepEqual((await coord.inspect(runId)).map((r) => r.generation), [7], "only gen 7 authenticates");
+    await coord.release(runId, 7);
+    assert.equal(fs.existsSync(dir), false, "the completed-run release removes the whole run dir");
+  });
+
+  it("release() of a generation while an authenticated sibling remains keeps unlisted leftovers (no recursive sweep)", async () => {
+    const coord = makeCoordinator();
+    const runId = "run-sweep-sibling";
+    await coord.pin({ runId, sourceSha: H, kind: "issue", branch: "b", generation: 1 });
+    await coord.pin({ runId, sourceSha: H_PRIME, kind: "issue", branch: "b", generation: 2 });
+    const orphan = path.join(root, runId, "cap-orphan.bundle");
+    fs.writeFileSync(orphan, "bytes");
+    await coord.release(runId, 2);
+    assert.deepEqual((await coord.inspect(runId)).map((r) => r.generation), [1]);
+    assert.ok(fs.existsSync(orphan), "the run dir is not swept while a sibling generation remains");
+  });
+
   it("a server-RETAINED release keeps the local journal (the source stays protected)", async () => {
     const client = new FakeClient();
     client.releaseRetained = true;
