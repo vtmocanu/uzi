@@ -11,7 +11,6 @@ import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
 import { RUNNER_UID, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { withForgeRetry } from "./forge-retry.js";
-import { REASON_PROVISION_FAILED } from "./provision-run.js";
 
 import {
   commitsScannedFromStderr,
@@ -29,7 +28,7 @@ const execFileAsync = promisify(execFile);
 export class ScratchProvisionError extends Error {
   readonly code = "scratch_provision_failed";
   constructor(cause: unknown) {
-    super(`${REASON_PROVISION_FAILED}: scratch_provision_failed: ${cause instanceof Error ? cause.message : "unknown filesystem error"}`, { cause });
+    super(`scratch_provision_failed: ${cause instanceof Error ? cause.message : "unknown filesystem error"}`, { cause });
     this.name = "ScratchProvisionError";
   }
 }
@@ -1538,6 +1537,38 @@ export class GitCache {
       const uzi = await ensureDirectory(root, ".uzi");
       await ensureDirectory(uzi, "scratch");
 
+      // A root or .uzi .gitignore negation can outrank info/exclude for an
+      // arbitrarily named artifact. No finite filename probe proves otherwise.
+      // Refuse such repositories conservatively before the first agent turn.
+      const rejectUnignore = async (parent: import("node:fs/promises").FileHandle): Promise<void> => {
+        let ignore: import("node:fs/promises").FileHandle;
+        try {
+          ignore = await fs.open(fdPath(parent.fd, ".gitignore"), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+          throw err;
+        }
+        try {
+          if (!(await ignore.stat()).isFile()) throw new Error("gitignore is not a regular file");
+          const maxBytes = 64 * 1024;
+          const data = Buffer.alloc(maxBytes + 1);
+          let used = 0;
+          while (used < data.length) {
+            const { bytesRead } = await ignore.read(data, used, data.length - used, used);
+            if (bytesRead === 0) break;
+            used += bytesRead;
+          }
+          if (used > maxBytes) throw new Error("gitignore exceeds 64 KiB");
+          if (data.toString("utf8", 0, used).split("\n").some((line) => line.startsWith("!"))) {
+            throw new Error("repository unignore rules may expose .uzi/scratch to ordinary staging");
+          }
+        } finally {
+          await ignore.close();
+        }
+      };
+      await rejectUnignore(root);
+      await rejectUnignore(uzi);
+
       // .git is created by the trusted local clone. Hold each directory while opening
       // its child so an agent-writable checkout path cannot redirect the exclude write.
       const git = await openDirectory(fdPath(root.fd, ".git"));
@@ -1564,7 +1595,9 @@ export class GitCache {
         const existing = bytes.toString("utf8", 0, used);
         const rule = "/.uzi/scratch/";
         if (!existing.split("\n").includes(rule)) {
-          await exclude.writeFile(`${existing.length > 0 && !existing.endsWith("\n") ? "\n" : ""}${rule}\n`);
+          const addition = `${existing.length > 0 && !existing.endsWith("\n") ? "\n" : ""}${rule}\n`;
+          if (used + Buffer.byteLength(addition) > maxExcludeBytes) throw new Error("git exclude has no room for scratch rule");
+          await exclude.writeFile(addition);
         }
       } finally {
         await exclude.close();

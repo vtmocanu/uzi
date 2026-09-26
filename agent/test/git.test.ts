@@ -282,6 +282,19 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
     assert.equal(fs.readFileSync(uzi, "utf8"), "not a directory");
   });
 
+  it("refuses a git exclude that would exceed the bound after appending the rule", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    const excludePath = path.join(clone.path, ".git", "info", "exclude");
+    const atLimit = "x".repeat(64 * 1024);
+    fs.writeFileSync(excludePath, atLimit);
+    await assert.rejects(
+      (git as unknown as { provisionRunnerScratch(path: string): Promise<void> }).provisionRunnerScratch(clone.path),
+      ScratchProvisionError,
+    );
+    assert.equal(fs.readFileSync(excludePath, "utf8"), atLimit);
+  });
+
   it("refuses an oversized git exclude without reading or appending the whole file", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const clone = await git.createOrAttachRunnerClone(bare, 1719);
