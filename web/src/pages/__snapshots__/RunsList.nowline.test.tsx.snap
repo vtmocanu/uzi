@@ -16,7 +16,7 @@ exports[`RunsList row now line (PRD #1064 M3) > D5: a null-milestone null-activi
       data-live=""
     >
       <div
-        class="flex w-full min-w-0 items-center gap-2 xl:w-auto xl:flex-1"
+        class="flex w-full min-w-0 items-center gap-2 sm:w-auto sm:flex-1"
       >
         <span
           aria-label="Claude"
@@ -107,7 +107,7 @@ exports[`RunsList row now line (PRD #1064 M3) > D5: a null-milestone null-activi
         </div>
       </div>
       <div
-        class="relative z-10 flex max-w-full flex-wrap items-center gap-2 xl:max-w-[50%]"
+        class="relative z-10 flex flex-wrap items-center gap-2"
       >
         <span
           class="inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium border-info/40 bg-info/10 text-info"
