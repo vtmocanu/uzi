@@ -292,17 +292,23 @@ func (h *Handler) DeleteAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		if gerr != nil {
 			return gerr
 		}
+		cur, gerr := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{
+			ID: secretID, UserID: user.ID,
+		})
+		if gerr != nil {
+			return gerr
+		}
 		n, cerr := q.CountEnabledSecretSlot(r.Context(), store.CountEnabledSecretSlotParams{
 			UserID: user.ID, Kind: store.KindAnthropicToken,
 		})
 		if cerr != nil {
 			return cerr
 		}
-		if n > 1 {
+		if n > 1 || (cur.DisabledAt.Valid && n > 0) {
 			multiToken = true // 409: another enabled token needs a default (D14)
 			return nil
 		}
-		// The last enabled token (which is the default). Its gauge row goes via the
+		// No other enabled token remains. Its gauge row goes via the
 		// ON DELETE CASCADE (M5); no DeleteRateLimits call needed.
 		if _, derr := q.DeleteUserSecret(r.Context(), store.DeleteUserSecretParams{
 			ID: secretID, UserID: user.ID,

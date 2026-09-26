@@ -112,25 +112,6 @@ func (q *Queries) DeleteUserSecret(ctx context.Context, arg DeleteUserSecretPara
 	return result.RowsAffected(), nil
 }
 
-const getEnabledUserSecretForKind = `-- name: GetEnabledUserSecretForKind :one
-SELECT id FROM user_secrets
-WHERE user_id = $1 AND kind = $2 AND disabled_at IS NULL
-ORDER BY created_at, id LIMIT 1
-`
-
-type GetEnabledUserSecretForKindParams struct {
-	UserID uuid.UUID `json:"user_id"`
-	Kind   string    `json:"kind"`
-}
-
-// Pick an enabled row for compatibility PUT when the slot has no default.
-func (q *Queries) GetEnabledUserSecretForKind(ctx context.Context, arg GetEnabledUserSecretForKindParams) (uuid.UUID, error) {
-	row := q.db.QueryRow(ctx, getEnabledUserSecretForKind, arg.UserID, arg.Kind)
-	var id uuid.UUID
-	err := row.Scan(&id)
-	return id, err
-}
-
 const getDefaultUserSecretID = `-- name: GetDefaultUserSecretID :one
 SELECT id FROM user_secrets
 WHERE user_id = $1 AND kind = $2 AND is_default
@@ -220,6 +201,26 @@ func (q *Queries) GetEnabledSecretReplacement(ctx context.Context, arg GetEnable
 	var i GetEnabledSecretReplacementRow
 	err := row.Scan(&i.ID, &i.Kind)
 	return i, err
+}
+
+const getEnabledUserSecretForKind = `-- name: GetEnabledUserSecretForKind :one
+SELECT id FROM user_secrets
+WHERE user_id = $1 AND kind = $2 AND disabled_at IS NULL
+ORDER BY created_at, id LIMIT 1
+`
+
+type GetEnabledUserSecretForKindParams struct {
+	UserID uuid.UUID `json:"user_id"`
+	Kind   string    `json:"kind"`
+}
+
+// Pick an enabled row for compatibility PUT when the slot has no default.
+// The caller holds the mutation lock; selection and promotion share its transaction.
+func (q *Queries) GetEnabledUserSecretForKind(ctx context.Context, arg GetEnabledUserSecretForKindParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, getEnabledUserSecretForKind, arg.UserID, arg.Kind)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const getSecretDependents = `-- name: GetSecretDependents :one
@@ -1306,9 +1307,11 @@ type UpsertDefaultUserSecretRow struct {
 	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
 }
 
-// Compatibility PUT rotates an enabled default or inserts a new one. Its caller
-// holds the mutation lock and promotes an existing enabled row first when the
-// slot is empty. The SQL keeps a disabled row's material and preferences intact.
+// Compatibility PUT rotates an enabled default or inserts a new one. The caller
+// holds the user mutation lock and first promotes an existing enabled row when
+// the slot is empty. A disabled row labelled 'default' keeps its ciphertext and
+// preferences; the new row receives a distinct label in that case. The conflict
+// update refuses disabled defaults, even if a stale caller reaches this query.
 func (q *Queries) UpsertDefaultUserSecret(ctx context.Context, arg UpsertDefaultUserSecretParams) (UpsertDefaultUserSecretRow, error) {
 	row := q.db.QueryRow(ctx, upsertDefaultUserSecret,
 		arg.UserID,
