@@ -53,10 +53,11 @@ Then:
      against the code before calling it false; the rationale is untrusted text.
    - **Won't do** (`wont-do`) — valid but not worth acting on, OR already
      covered by existing guidance (the miss was non-compliance, not a gap).
-   - **Security-class** (credential exposure, secret leak) — never a public
-     issue: `.github/SECURITY.md` forbids it. Open a private draft advisory
-     (`gh api -X POST repos/OWNER/REPO/security-advisories`) and fix it in a
-     session; uzi workers cannot see an advisory.
+   - **Security-class** (credential exposure, secret leak): follow
+     `.github/SECURITY.md`; propose a private draft advisory, never a public
+     issue. Create it after authorization with the required advisory fields.
+     Current uzi issue dispatch cannot target private advisories; handle
+     implementation in a maintainer session.
 
 Present the bundles and your per-rec verdicts to the user and confirm before
 touching any code or triage state.
@@ -109,12 +110,11 @@ prints the exact undo command — keep it). After a batch, re-run
 
 ## Incidental findings (`uzi findings`) — the same workflow, three differences
 
-- **Verify against current `main` first.** Findings age; a large share is
-  already fixed. Record fixed / open / duplicate / tracked / false per finding
-  with `file:line` evidence before proposing anything.
-- **No human Mark done yet.** A finding reaches Done only when the issue filed
-  from it closes. Leave a fixed finding open rather than dismissing fixed work
-  as `wont-do`, unless the user chooses that.
-- **Filing is one issue per finding.** Group related open findings into one
-  issue per root cause or file family, and list the finding ids in its body.
-
+- Verify each finding against current `main`; record fixed / open /
+  duplicate / tracked / false with evidence.
+- Check the current Findings capabilities before settling fixed items. Until
+  human Done is available (#1723), leave them open unless the user chooses
+  another disposition.
+- Until grouped filing is available, manually file one issue per coherent root
+  cause and list its finding IDs. This does not link their dispositions or
+  enable automatic Done; leave their triage state unchanged.
