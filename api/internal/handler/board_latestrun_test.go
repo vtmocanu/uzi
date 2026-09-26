@@ -1,7 +1,7 @@
 package handler
 
 import (
-	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -20,14 +20,16 @@ func tstamp(t time.Time) pgtype.Timestamptz {
 }
 
 func TestSharedBoardLatestRunExcludesCodexCredential(t *testing.T) {
-	for _, mine := range []bool{false, true} {
-		row := latestRunDTO{ID: uuid.NewString(), IsMine: mine}
-		body, err := json.Marshal(row)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if strings.Contains(string(body), "codex_secret_label") || strings.Contains(string(body), "codex_secret_id") {
-			t.Fatalf("shared board revealed a Codex credential: %s", body)
+	// The shared board reaches other users, so latestRunDTO must carry no credential
+	// identity at all (#1730). Check the json tags rather than a marshalled value: a
+	// future `codex_secret_label,omitempty` field would marshal to nothing while nil
+	// and pass a value check unnoticed.
+	typ := reflect.TypeOf(latestRunDTO{})
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		name := strings.Split(f.Tag.Get("json"), ",")[0]
+		if strings.Contains(name, "secret") || strings.Contains(strings.ToLower(f.Name), "secret") {
+			t.Fatalf("shared board DTO field %s (json %q) names a credential", f.Name, name)
 		}
 	}
 }
