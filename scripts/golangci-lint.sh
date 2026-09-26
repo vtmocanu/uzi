@@ -21,8 +21,9 @@
 #
 # The download RETRIES transient failures (issue #1144: a CDN connection reset
 # reddened lint jobs). curl needs --retry-all-errors because plain --retry does
-# not retry a connection reset. wget loops explicitly instead of --tries, which
-# stays portable to BusyBox and removes partial output between attempts. The
+# not retry a connection reset. wget loops explicitly (4 attempts, 3 retries)
+# instead of --tries, which stays portable to BusyBox and removes any partial
+# output before each attempt. The
 # tarball sha256 check still runs before extraction, so a retry cannot
 # substitute a different artifact.
 set -eu
@@ -154,7 +155,7 @@ if [ "$candidate_ready" -ne 1 ]; then
       if (ulimit -f "$MAX_ARCHIVE_BLOCKS"; wget -qO "$CANDIDATE" "$url"); then
         break
       fi
-      if [ "$attempt" -ge 3 ]; then
+      if [ "$attempt" -ge 4 ]; then
         echo "golangci-lint.sh: bounded download failed: $url" >&2
         exit 2
       fi
