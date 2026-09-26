@@ -6936,6 +6936,81 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
     assert.equal(rig.providerLaunches(), 1, "the held run launched no fresh epoch for its rework turn");
   });
 
+  // B1 (issue #1764): a reap:true checkpoint disposes the provider root and the launcher removes
+  // that epoch's owned data root (its codexHome), so a later persist of the SAME epoch would find
+  // no source and publish an EMPTY store generation over the session persisted before the reap.
+  // The spy records every persist's codexHome and every reap of the then-current epoch's home.
+  const persistSpy = (rig: MultiRig): { events: string[]; homeOf: (i: number) => string } => {
+    const events: string[] = [];
+    (rig.deps as { sessionStore?: CodexExecutorDeps["sessionStore"] }).sessionStore = {
+      ...rig.deps.sessionStore!,
+      persist: async (codexHome: string) => {
+        rig.sessionOps.persist += 1;
+        events.push(`persist:${codexHome}`);
+        return { files: 0, bytes: 0 };
+      },
+    };
+    return { events, homeOf: (i) => `/data/agent-home/run-1/codex-data/epoch-${i}/codex` };
+  };
+  const assertNoPersistAfterReap = (events: string[]): void => {
+    events.forEach((event, i) => {
+      if (!event.startsWith("reap:")) return;
+      const home = event.slice("reap:".length);
+      assert.equal(events.slice(i + 1).includes(`persist:${home}`), false,
+        `no persist of the reaped epoch's home after its reap: ${events.join(" -> ")}`);
+    });
+  };
+
+  it("(B1) checkpoint then a loop-top pause park never re-persists the reaped epoch's deleted home", async () => {
+    const rig = makeMultiEpochRig([checkpointEpoch()]);
+    const { events, homeOf } = persistSpy(rig);
+    const { ctx } = makeCtx({
+      reportIteration: async (iteration) => (iteration === 1 ? { pauseRequested: false } : { pauseRequested: true }),
+      checkpoint: async (opts) => { if (opts.reap) events.push(`reap:${homeOf(0)}`); },
+      parkForPause: async () => true,
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "B1 pause");
+    assert.ok(result.pausedAt, "the run parked at the loop top");
+    assert.deepEqual(events, [`persist:${homeOf(0)}`, `reap:${homeOf(0)}`],
+      "the session was persisted once, before the reap, and never again from the reaped home");
+    assertNoPersistAfterReap(events);
+  });
+
+  it("(B1) interlocked done then a max-iterations completion hold never re-persists the reaped epoch's deleted home", async () => {
+    const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", (t, th, tn) => {
+      t.push(toolCall(1, "signal_done", { milestones_completed: ["m1"] }, th, tn, "done-1")).push(turnCompleted("completed", th, tn));
+    })]);
+    const { events, homeOf } = persistSpy(rig);
+    const holds: string[] = [];
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 1 },
+      checkpoint: async (opts) => { if (opts.reap) events.push(`reap:${homeOf(0)}`); },
+      recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: 1 }),
+      enterCompletionHold: async (reason) => { holds.push(reason); return true; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "B1 done hold");
+    assert.ok(result.completionHeld, "the run entered the completion hold");
+    assert.equal(holds.length, 1);
+    assert.deepEqual(events, [`persist:${homeOf(0)}`, `reap:${homeOf(0)}`]);
+    assertNoPersistAfterReap(events);
+  });
+
+  it("(B1) a fresh epoch recreated after a reap is persisted normally at the terminal", async () => {
+    const rig = makeMultiEpochRig([checkpointEpoch(), resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+      t.push(toolCall(3, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
+    })]);
+    const { events, homeOf } = persistSpy(rig);
+    let reaps = 0;
+    const { ctx } = makeCtx({
+      checkpoint: async (opts) => { if (opts.reap) events.push(`reap:${homeOf(reaps++)}`); },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "B1 recreate");
+    assert.equal(rig.providerLaunches(), 2);
+    assert.deepEqual(events, [`persist:${homeOf(0)}`, `reap:${homeOf(0)}`, `persist:${homeOf(1)}`],
+      "the live recreated epoch's session is still captured by the terminal persist");
+    assertNoPersistAfterReap(events);
+  });
+
   it("a sticky cancel seen at the loop top rejects the run as cancelled before another turn or epoch", async () => {
     const rig = makeMultiEpochRig([checkpointEpoch()]);
     let cancelled = false;

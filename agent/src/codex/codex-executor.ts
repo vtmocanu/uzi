@@ -1608,6 +1608,12 @@ export class CodexExecutor implements Executor {
     // each epoch's local-execution epoch and its own owned HOME; `provisionDir` is the ONE per-run
     // provisioning dir the finally removes.
     let epoch: ProviderEpoch | undefined;
+    // Issue #1764: true once `epoch` was reaped by a `ctx.checkpoint({ reap: true })` AFTER its
+    // last persistSession, and cleared whenever a fresh epoch is installed. The reap disposes the
+    // provider root, whose owned data root (the epoch's codexHome, sessions included) the launcher
+    // then removes, so a later persist of that epoch would find no source and publish an EMPTY
+    // store generation over the session persisted just before the reap. The finally skips it.
+    let reapedSinceLastPersist = false;
     let epochIndex = 0;
     let provisionDir: string | undefined;
     // Issue #1598: the run's ONE command cache (a `--hold-cache` process as the command uid),
@@ -2023,8 +2029,11 @@ export class CodexExecutor implements Executor {
           completionHeld = { reason: REASON_COMPLETION_BUDGET_EXHAUSTED };
           break;
         }
-        // Issue #1764 (PRD #1190 M2 parity): the owner-requested pause boundary. The SERVER decides
-        // the boundary (pauseRequested on the running-report ACK: a `now` pause at once, a
+        // Issue #1764 (PRD #1190 M2 parity): the owner-requested pause boundary. Deliberate order
+        // deviation from sdk-executor, which checks the pause BEFORE the budget: here the
+        // post-attempt completion hold above is evaluated first, consistent with Codex's rule that
+        // a post-attempt wall routes to the completion hold first. Either order ends parked.
+        // The SERVER decides the boundary (pauseRequested on the running-report ACK: a `now` pause at once, a
         // `milestone` pause once the in-flight milestone completed); the worker honours it here,
         // before any implement turn. Not gated on run kind (task/prompt runs pause too).
         if (served?.pauseRequested || seedPauseFallback) {
@@ -2061,6 +2070,7 @@ export class CodexExecutor implements Executor {
           this.safety = epoch.safety;
           await old.dispose();
           epochNeedsRecreate = false;
+          reapedSinceLastPersist = false;
         }
         // PRD #1416 M2: drain the worker-authoritative safety steer at the loop top and, when
         // present, PREFIX it (framed as worker guidance, followed by a blank line) to THIS turn's
@@ -2113,6 +2123,7 @@ export class CodexExecutor implements Executor {
         if (result.checkpoint && !result.done) {
           await epoch.persistSession();
           await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+          reapedSinceLastPersist = true;
           // Issue #1674 (PRD #390 M3 / PRD #1224 parity): a milestone boundary re-arms enforcement
           // and drops only the checkpointed ids, keeping a concurrent sibling's in-progress state.
           progressMissedLastTurn = false;
@@ -2127,6 +2138,7 @@ export class CodexExecutor implements Executor {
           // Preserve the live thread before reaping the provider and reading Git state.
           await epoch.persistSession();
           await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+          reapedSinceLastPersist = true;
           const worktreeFingerprint = ctx.worktreeFingerprint ? await ctx.worktreeFingerprint() : null;
           const head = worktreeFingerprint === null ? null : (worktreeFingerprint.split("\n", 1)[0] ?? null);
           const { unmet } = await ctx.recordCompletionAttempt!({
@@ -2209,7 +2221,9 @@ export class CodexExecutor implements Executor {
       // already fully disposed at their recreation. `epoch` is undefined only if the FIRST
       // startProviderEpoch threw before building an epoch — the token eviction below still runs.
       if (epoch) {
-        await epoch.persistSession();
+        // Issue #1764: a reaped epoch's home is gone; its session was persisted right before the
+        // reap, so re-persisting would only overwrite that generation with an empty one.
+        if (!reapedSinceLastPersist) await epoch.persistSession();
         await this.tearDownEpoch(epoch.registry, epoch.harness, epoch.fileopHandle, boundaryDeadlineMs, !this.deps.deferRegistryTeardown);
       }
       // (C) Evict the DURING-run released tokens (every epoch's provider-root launches + refreshes)
