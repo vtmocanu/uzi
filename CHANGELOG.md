@@ -22,42 +22,6 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-### Changed
-
-- **Run list rows on a phone show the harness logo inline before the title ([#1714](https://github.com/vtmocanu/uzi/pull/1714)).**
-  The run list no longer reserves a separate logo column on narrow screens; the Claude or Codex logo sits at the start of the title line, so the title gets the width back.
-
-### Fixed
-
-- **A Codex account whose usage response names a different workspace than its token is no longer bound to that workspace ([#1239](https://github.com/vtmocanu/uzi/issues/1239)).**
-  On a multi-workspace ChatGPT seat, the usage endpoint can report another workspace's `account_id` than the one the access token was issued for, and uzi used to bind the token to it. uzi now refuses the identity when the two disagree: an import marks the account failed with its own reason, and a refresh keeps the stored credential rather than releasing it. Personal seats are unaffected.
-
-- **`uzi run export` shows every recovery capture you can choose from, and `uzi run recovery --json` lists capture ids ([#1417](https://github.com/vtmocanu/uzi/issues/1417)).**
-  With several captures, `run export` folded the choices into a one-line error that was cut at 200 characters, hiding the second id. It now prints the captures as a table on stderr (or the archives array on `--json` stdout), then the error with the same exit code. `run recovery --json` now carries each hold's captures (id, state, source commit, size, created time), so a `--capture` id can be picked by a script.
-
-- **A scope-narrowed run that ends while its forge was unreachable no longer shows its scope directive as still active ([#1399](https://github.com/vtmocanu/uzi/issues/1399)).**
-  When a run parked because the forge was unreachable before its clone ended terminally (the park cap was reached, or it was cancelled), the scope directive's audit row stayed pending and rendered "active" on a finished run. These paths now settle it as declined, deciding from the run's state after the transition, and a scope directive sent to an already-finished run is refused.
-
-- **Every release's agent image now reports the version it is tagged with ([#1682](https://github.com/vtmocanu/uzi/issues/1682), [#1720](https://github.com/vtmocanu/uzi/issues/1720)).**
-  A release whose agent code had not changed used to re-tag the previous release's worker image, so a stable promote shipped `agent-base:X.Y.Z` still reporting `X.Y.Z-rc.N`, and a self-managed worker showed `outdated` forever. Each agent template is now split into a runtime base, published as `agent-runtime-<template>:<input key>` and rebuilt only when one of its inputs changes, and a release stage that is built and stamped on every release. The release job checks that each published agent image reports exactly its tagged version and commit before the chart is published. Images already published keep their old stamps. Credit to @mauromorales for the report and the design.
-
-- **Codex commands on a uid-split worker can run git in the run's checkout ([#1716](https://github.com/vtmocanu/uzi/issues/1716)).**
-  A Codex command runs as a different user than the one that owns the run's checkout, so git refused it with "detected dubious ownership". By default the command environment now trusts only the checkout's canonical path; other repositories the command does not own, including one nested inside the checkout, remain rejected unless the command explicitly overrides Git's trust settings.
-
-- **The failure-cause breakdown on the usage cards always adds up to the failed count ([#1451](https://github.com/vtmocanu/uzi/issues/1451)).**
-  The failed-run count and its per-cause breakdown (`fail_origins`) on `GET /api/usage` and `GET /api/admin/usage` were read in two separate queries, so a run that failed between them could make the causes sum to one more than `failed` in the same response. Each scope (your own, factory-wide and per user) now computes both in one query, so they always describe the same runs. The response shape is unchanged.
-
-- **A cancel, stop, plan verdict or follow-up is no longer lost when the worker's reply from the server is lost, and follow-ups reach the lead in the order you sent them ([#1673](https://github.com/vtmocanu/uzi/issues/1673)).**
-  Before, the worker's input poll marked your inputs delivered as it returned them, so a reply lost to a network error or timeout dropped a cancel or plan verdict for good and could deliver an older follow-up after a newer one. A worker that advertises the new `input_receipts_v1` capability now reads inputs without consuming them, acknowledges them (`POST /api/worker/runs/{id}/inputs/ack`), and confirms them once acted on (`POST /api/worker/runs/{id}/inputs/applied`); it retries a lost reply with the same inputs, acts on each input once, in the order sent, and an input still unconfirmed when a claim ends goes to the run's next claim. A follow-up shows as delivered when the worker acknowledges it. Older worker images keep the previous behaviour until they are upgraded; a migration marks every input delivered before the upgrade as confirmed.
-
-### Security
-
-- **Forge credentials stay on the allowlisted origin when a host answers with a redirect (f36c29d5, 0a781bf3).**
-  Hardening: when a forge, a git remote or the agent-source host responds with a redirect, uzi no longer sends the credential to a different scheme, host or port. This covers all three forge drivers, checkpoint publishing and the agent-source clone.
-
-- **Agent- and diff-derived text is secret-scanned or scrubbed before it is stored, posted or displayed (166b2c0f).**
-  Hardening: preserved patches, findings, summaries, judge and task reviews, and MR-thread replies are scanned or scrubbed first; run-owned secrets split by invisible characters are redacted; and the secret-scan trust checks are stricter.
-
 ## [0.84.0] - 2026-09-20
 
 ### Added
@@ -218,6 +182,27 @@ through `[0.52.0]`.)
 - **Run-list rows align the harness logo with the badges and keep the activity age beside its step ([#1708](https://github.com/vtmocanu/uzi/pull/1708)).**
   The row's meta items now use consistent separators and typography, while long live-activity text still truncates cleanly and invalid activity timestamps show no age.
 
+- **A Codex account whose usage response names a different workspace than its token is no longer bound to that workspace ([#1239](https://github.com/vtmocanu/uzi/issues/1239)).**
+  On a multi-workspace ChatGPT seat, the usage endpoint can report another workspace's `account_id` than the one the access token was issued for, and uzi used to bind the token to it. uzi now refuses the identity when the two disagree: an import marks the account failed with its own reason, and a refresh keeps the stored credential rather than releasing it. Personal seats are unaffected.
+
+- **`uzi run export` shows every recovery capture you can choose from, and `uzi run recovery --json` lists capture ids ([#1417](https://github.com/vtmocanu/uzi/issues/1417)).**
+  With several captures, `run export` folded the choices into a one-line error that was cut at 200 characters, hiding the second id. It now prints the captures as a table on stderr (or the archives array on `--json` stdout), then the error with the same exit code. `run recovery --json` now carries each hold's captures (id, state, source commit, size, created time), so a `--capture` id can be picked by a script.
+
+- **A scope-narrowed run that ends while its forge was unreachable no longer shows its scope directive as still active ([#1399](https://github.com/vtmocanu/uzi/issues/1399)).**
+  When a run parked because the forge was unreachable before its clone ended terminally (the park cap was reached, or it was cancelled), the scope directive's audit row stayed pending and rendered "active" on a finished run. These paths now settle it as declined, deciding from the run's state after the transition, and a scope directive sent to an already-finished run is refused.
+
+- **Every release's agent image now reports the version it is tagged with ([#1682](https://github.com/vtmocanu/uzi/issues/1682), [#1720](https://github.com/vtmocanu/uzi/issues/1720)).**
+  A release whose agent code had not changed used to re-tag the previous release's worker image, so a stable promote shipped `agent-base:X.Y.Z` still reporting `X.Y.Z-rc.N`, and a self-managed worker showed `outdated` forever. Each agent template is now split into a runtime base, published as `agent-runtime-<template>:<input key>` and rebuilt only when one of its inputs changes, and a release stage that is built and stamped on every release. The release job checks that each published agent image reports exactly its tagged version and commit before the chart is published. Images already published keep their old stamps. Credit to @mauromorales for the report and the design.
+
+- **Codex commands on a uid-split worker can run git in the run's checkout ([#1716](https://github.com/vtmocanu/uzi/issues/1716)).**
+  A Codex command runs as a different user than the one that owns the run's checkout, so git refused it with "detected dubious ownership". By default the command environment now trusts only the checkout's canonical path; other repositories the command does not own, including one nested inside the checkout, remain rejected unless the command explicitly overrides Git's trust settings.
+
+- **The failure-cause breakdown on the usage cards always adds up to the failed count ([#1451](https://github.com/vtmocanu/uzi/issues/1451)).**
+  The failed-run count and its per-cause breakdown (`fail_origins`) on `GET /api/usage` and `GET /api/admin/usage` were read in two separate queries, so a run that failed between them could make the causes sum to one more than `failed` in the same response. Each scope (your own, factory-wide and per user) now computes both in one query, so they always describe the same runs. The response shape is unchanged.
+
+- **A cancel, stop, plan verdict or follow-up is no longer lost when the worker's reply from the server is lost, and follow-ups reach the lead in the order you sent them ([#1673](https://github.com/vtmocanu/uzi/issues/1673)).**
+  Before, the worker's input poll marked your inputs delivered as it returned them, so a reply lost to a network error or timeout dropped a cancel or plan verdict for good and could deliver an older follow-up after a newer one. A worker that advertises the new `input_receipts_v1` capability now reads inputs without consuming them, acknowledges them (`POST /api/worker/runs/{id}/inputs/ack`), and confirms them once acted on (`POST /api/worker/runs/{id}/inputs/applied`); it retries a lost reply with the same inputs, acts on each input once, in the order sent, and an input still unconfirmed when a claim ends goes to the run's next claim. A follow-up shows as delivered when the worker acknowledges it. Older worker images keep the previous behaviour until they are upgraded; a migration marks every input delivered before the upgrade as confirmed.
+
 ### Changed
 
 - **The worker toolchain uses a refreshed nixpkgs pin ([#1530](https://github.com/vtmocanu/uzi/pull/1530)).**
@@ -258,12 +243,21 @@ through `[0.52.0]`.)
   It replaces a sum over the last 200 visible runs. A trailing `+` marks that subscription or unreported costs are excluded; the figure refreshes every 60 seconds and on a manual refresh, is hidden on the admin board, and is hidden after a failed request until the next successful one.
 - **The bundled uzi-cli skill treats "issue not found on this repo's board" for a just-filed issue as poller sync lag and retries within 90 seconds ([#1692](https://github.com/vtmocanu/uzi/pull/1692)).**
 
+- **Run list rows on a phone show the harness logo inline before the title ([#1714](https://github.com/vtmocanu/uzi/pull/1714)).**
+  The run list no longer reserves a separate logo column on narrow screens; the Claude or Codex logo sits at the start of the title line, so the title gets the width back.
+
 ### Security
 
 - **Run-keyed forge token lookups are scoped to the run's owner ([#1688](https://github.com/vtmocanu/uzi/issues/1688)).**
   Defense in depth: the queries that load a run's forge connection for claim, move and worker use now also require the connection to belong to the run's owner, so a run pointing at another user's repo would find no token (treated as a benign skip) rather than use it. No reachable mismatch was found; the schema just did not enforce it.
 - **Docs: on hosted Kubernetes workers, Docker-in-Docker shares the whole run workdir ([#1689](https://github.com/vtmocanu/uzi/issues/1689)).**
   A Docker bind mount from one run can read or write a sibling run's clone on the same worker. Hosted workers only claim their owner's runs, so this is a same-owner residual accepted for the opt-in Docker tier; compose DinD does not share the workdir.
+
+- **Forge credentials stay on the allowlisted origin when a host answers with a redirect (f36c29d5, 0a781bf3).**
+  Hardening: when a forge, a git remote or the agent-source host responds with a redirect, uzi no longer sends the credential to a different scheme, host or port. This covers all three forge drivers, checkpoint publishing and the agent-source clone.
+
+- **Agent- and diff-derived text is secret-scanned or scrubbed before it is stored, posted or displayed (166b2c0f).**
+  Hardening: preserved patches, findings, summaries, judge and task reviews, and MR-thread replies are scanned or scrubbed first; run-owned secrets split by invisible characters are redacted; and the secret-scan trust checks are stricter.
 
 ## [0.83.1] - 2026-09-19
 
