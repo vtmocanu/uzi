@@ -36,8 +36,8 @@ plan the owner answered.
    Until then the verdict stays unapplied and is replayed to the next claim. On the Claude SDK
    executor (`resumesAtGate = true`, `agent/src/sdk-executor.ts`) a replayed revise re-runs the
    revision with the owner's original feedback and does not re-offer the superseded plan.
-   Codex has no resume-at-gate: every replayed approve, reject or revise is ignored with a
-   notice asking to re-send it, and a fresh plan is shown (see residuals).
+   Codex has no resume-at-gate: a replayed approve, reject or revise is ignored with a notice
+   (bar the superseded cases of point 6), and a fresh plan is shown (see residuals).
 2. **A claim says when its plan was shown.** A claim carrying an unapproved persisted plan
    carries `resume_plan_at` (`ResumePlanAt` in `api/internal/workersvc/claim.go`, filled in
    `claim_assembly.go` via `LatestPersistedPlanFrameAtForRun`). It is the `created_at` of the
@@ -48,9 +48,9 @@ plan the owner answered.
    treats every replayed approve or reject as stale until both of these hold: the replayed
    backlog is fully read (a GET page shorter than the server's LIMIT) and the claim's first
    gate is shown. On the SDK executor a replayed revise still acts, because its result is
-   gated for a human again; on Codex it goes epoch-stale as in point 1. The field is absent
-   when the lookup failed, when the frame was tombstoned or redacted, or when the api is older
-   than this change.
+   gated for a human again; on Codex it goes epoch-stale (see the Codex residual). The field
+   is absent when the lookup failed, when the frame was tombstoned or redacted, or when the api
+   is older than this change.
 4. **No gate before the backlog is read.** A resumed claim with an unapproved plan reads its
    whole replayed backlog before it offers any gate. This holds for every executor, SDK and
    Codex (the `gatePlan` closure and `takeResumedGateEvent` in `agent/src/runner.ts`). An SDK
@@ -157,12 +157,14 @@ plan the owner answered.
 - **Codex does not resume at the gate** (out of #1604's scope). A resumed Codex claim always
   gates a fresh plan (the runner puts the run in `gatedRuns`, so its first gate bumps the
   epoch). A carried-over approve, reject or revise is ignored with a notice asking to re-send
-  it: on arrival when it predates the shown plan ("… sent before this plan was shown …") or
+  it: on arrival when it predates the shown plan or has no comparable `created_at` ("… sent
+  before this plan was shown …") or
   the claim cannot say when the plan was shown ("Could not confirm which plan …", approve and
   reject only), otherwise as epoch-stale at that first gate ("Approval ignored …", "Rejection
   ignored …", "Feedback ignored …"). The owner must re-send it: a reject sent before the
-  interruption does not stop a Codex run. As in point 6, an approve superseded by a later
-  carried-over verdict is dropped silently.
+  interruption does not stop a Codex run. As in point 6, a verdict superseded by a later
+  carried-over approve or reject gets no re-send notice: an approve is dropped silently, a
+  reject gets "an earlier plan rejection was superseded by a newer verdict".
 - **An api from before this change** sends no `resume_plan_at` (every replayed approve or
   reject fails closed as unjudged) and has no discard route (404). Those approves stay
   unapplied and pending, and count toward the replay `LIMIT 1000` window until the api is
