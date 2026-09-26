@@ -20,6 +20,13 @@
 {{- if not .Values.workers.fqdnEgress.ovn.exceptCIDRs }}
 {{- fail "workers.fqdnEgress.provider is ovn but workers.fqdnEgress.ovn.exceptCIDRs is empty. The external-egress NetworkPolicy would then admit in-cluster pod, service and node addresses too, dissolving the worker floor's lateral isolation. List the pod, service, node and link-local CIDRs." }}
 {{- end }}
+{{- if not .Values.workers.fqdnEgress.ovn.allowWildcards }}
+{{- range .Values.workers.fqdnEgress.allowFQDNs }}
+{{- if contains "*" .fqdn }}
+{{- fail (printf "workers.fqdnEgress.allowFQDNs entry %q is a wildcard, and workers.fqdnEgress.ovn.allowWildcards is false. OVN enforces a wildcard dnsName only with the DNSNameResolver feature (a Technology Preview feature gate on OpenShift, off by default); without it the rule is accepted but matches nothing. List exact hostnames instead (e.g. api.anthropic.com), or set ovn.allowWildcards: true on a cluster with the feature enabled." .fqdn) }}
+{{- end }}
+{{- end }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

@@ -53,7 +53,10 @@ runAsUser:
   uidRangeMax: 10001
 {{- end }}
 defaultAddCapabilities: []
-requiredDropCapabilities: []
+# Every container must drop ALL; the uidSplit set above is then the only thing it may add
+# back (the same shape as OpenShift's own restricted-v2: drop ALL, allow NET_BIND_SERVICE).
+requiredDropCapabilities:
+  - ALL
 # fsGroup 10001 makes the RWO volumes writable and the join-token Secret readable
 # (root:<fsGroup> 0440) for the worker's gid.
 fsGroup:

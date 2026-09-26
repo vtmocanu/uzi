@@ -1125,9 +1125,9 @@ tasks:
   render:openshift-check:
     desc: assert the OpenShift/OKD chart knobs (HTTPRoute, nullable ids, DNS ports, OVN egress, SCC) render as documented
     cmds:
-      # Standalone like render:drain-knobs-check: offline (the CNPG subchart is stripped),
-      # needs helm + yq, not wired into gate:repo (the lint job lacks helm). See the script
-      # header and docs/openshift.md.
+      # Offline (the CNPG subchart is stripped), needs helm + yq. Not in gate:repo (the
+      # lint job lacks helm); CI runs it in the helm-chart job. See the script header and
+      # docs/openshift.md.
       - ./scripts/assert-openshift-render.sh
 
   render:drain-knobs-check:

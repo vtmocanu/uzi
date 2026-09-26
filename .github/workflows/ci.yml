@@ -564,6 +564,12 @@ jobs:
           helm template uzi deploy/chart -f deploy/values/ci-render.yaml --namespace uzi \
             --show-only templates/controller-deployment.yaml > /tmp/uzi-controller.yaml
           sh scripts/assert-controller-strategy.sh /tmp/uzi-controller.yaml
+      - uses: ./.github/actions/setup-task
+      - name: Render and assert the OpenShift/OKD knobs
+        # Offline (strips the CNPG subchart). Needs helm (above) and yq, which the
+        # ubuntu-latest runner provides, the same unpinned-reader reasoning as
+        # lint-actions-embedded.sh.
+        run: task render:openshift-check
       - name: Docker-tier fail-guards
         run: |
           # (1) docker on + NetworkPolicy off + no acknowledge -> MUST refuse to render.

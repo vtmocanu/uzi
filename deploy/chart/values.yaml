@@ -1033,11 +1033,17 @@ workers:
     #          traffic blocked while external traffic passes the floor), and (b) the
     #          namespace's k8s.ovn.org EgressFirewall `default`: Deny each denyCIDRs entry,
     #          Allow each derived forge host and allowFQDNs entry by dnsName on its ports,
-    #          then Deny 0.0.0.0/0. Wildcard dnsName entries (e.g. "*.anthropic.com") need
-    #          an OVN-Kubernetes release with wildcard DNS support (OpenShift 4.16 and
-    #          later); an older one rejects the object. OVN resolves dnsName entries itself
-    #          and refreshes them on the record's TTL, so a name whose addresses rotate
-    #          faster than its TTL can briefly miss.
+    #          then Deny 0.0.0.0/0. OVN resolves dnsName entries itself and refreshes them on
+    #          the record's TTL, so a name whose addresses rotate faster than its TTL can
+    #          briefly miss.
+    #          WILDCARDS ARE NOT A VERSION PREREQUISITE: a wildcard dnsName (e.g.
+    #          "*.anthropic.com") is enforced only on a cluster with the DNSNameResolver
+    #          feature (the `dnsnameresolvers.network.openshift.io` CRD), which OpenShift
+    #          ships as a Technology Preview feature gate, off by default. An API server
+    #          that ACCEPTS the object proves nothing about enforcement. So the render
+    #          REFUSES any `*` entry under provider ovn unless ovn.allowWildcards is true;
+    #          where the gate is off, list exact hostnames instead (e.g. api.anthropic.com
+    #          for *.anthropic.com) and verify reachability at runtime.
     # tier/priority below apply to antrea only.
     provider: antrea
     ovn:
@@ -1046,6 +1052,10 @@ workers:
       # network, the service network, the node network and link-local. Example:
       #   exceptCIDRs: [10.128.0.0/14, 172.30.0.0/16, 192.0.2.0/24, 169.254.0.0/16]
       exceptCIDRs: []
+      # Set true ONLY on a cluster with the DNSNameResolver feature enabled (see above).
+      # False (default) fails the render on any "*" entry in allowFQDNs, so a cluster
+      # without the feature cannot silently receive an allow rule that matches nothing.
+      allowWildcards: false
     tier: application
     priority: 5
     # DROPPED FIRST, and not redundant with the default-deny floor: an FQDN rule

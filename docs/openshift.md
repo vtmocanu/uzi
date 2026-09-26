@@ -122,11 +122,33 @@ objects in the kube-native worker namespace, and they work only together:
      on their ports;
    - a final `Deny 0.0.0.0/0`.
 
-Two caveats:
-- **Wildcards:** `*.anthropic.com` needs an OVN-Kubernetes release with wildcard DNS
-  support, which is OpenShift 4.16 or later. An older one rejects the object.
-- **Name resolution:** OVN resolves each `dnsName` itself and refreshes it on the record's
-  TTL. A name whose addresses rotate faster than its TTL can briefly miss.
+**Wildcards need a cluster feature, not just a version.** OVN enforces a wildcard
+`dnsName` such as `*.anthropic.com` only when the DNSNameResolver feature is enabled
+(the `dnsnameresolvers.network.openshift.io` CRD exists). OpenShift ships that as a
+Technology Preview feature gate, off by default. Without it, the API server still
+accepts the object, but the wildcard rule matches nothing. So the render refuses any
+`*` entry in `allowFQDNs` under `provider: ovn` unless you opt in:
+
+- **Feature off (the default):** replace each wildcard with the exact hosts you need,
+  for example:
+
+  ```yaml
+  workers:
+    fqdnEgress:
+      allowFQDNs:
+        - name: allow-anthropic
+          fqdn: api.anthropic.com
+          ports: [443]
+        # ...the rest of the list, restated (Helm replaces lists, it does not merge them)
+  ```
+
+- **Feature on:** set `workers.fqdnEgress.ovn.allowWildcards: true`.
+
+Either way, verify at runtime that a worker reaches each destination. An accepted
+object is not proof of enforcement.
+
+**Name resolution:** OVN resolves each `dnsName` itself and refreshes it on the record's
+TTL. A name whose addresses rotate faster than its TTL can briefly miss.
 
 The allow set and deny belt are the same as the Antrea policy's for the same values. The
 chart's render checks assert that equality.
@@ -148,9 +170,10 @@ This adds, for the hosted-worker namespaces only:
 - **Kube-native tier:** a minimal custom SCC named `<release>-worker`, plus a namespaced
   Role and RoleBinding granting the worker ServiceAccount `use` on it. It admits exactly
   what the controller renders:
-  - uid and fsGroup 10001, no added capabilities, no privilege escalation, the namespace's
-    SELinux label, the `RuntimeDefault` seccomp profile, and `secret`,
-    `persistentVolumeClaim` and `emptyDir` volumes only;
+  - every container must drop `ALL` (`requiredDropCapabilities`);
+  - uid and fsGroup 10001, no added capabilities, no privilege escalation, no host
+    access, the namespace's SELinux label, the `RuntimeDefault` seccomp profile, and
+    `secret`, `persistentVolumeClaim` and `emptyDir` volumes only;
   - with `workers.uidSplit.enabled`, root start with exactly `SETUID`, `SETGID`, `SETPCAP`,
     `CHOWN`, `DAC_OVERRIDE` and `FOWNER`. The worker and its nix-seed init container drop
     everything else.
@@ -167,8 +190,9 @@ rights, like the chart's PriorityClasses.
 
 ## What the render checks cover
 
-`task render:openshift-check` renders each knob offline and asserts:
-- the resulting objects;
+`task render:openshift-check` runs in CI's chart job. It renders each knob offline and
+asserts:
+- the resulting objects, including the full custom SCC in both postures;
 - the guards that must refuse to render;
 - that the defaults render none of it.
 

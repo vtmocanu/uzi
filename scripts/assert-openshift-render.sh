@@ -158,8 +158,18 @@ got=$(q "$WORK/dns.yaml" '[select(.kind == "NetworkPolicy" and .apiVersion == "n
 # --- (e) OVN provider ---------------------------------------------------------------------
 refuse "is not supported" -f "$WORK/workers.yaml" --set workers.fqdnEgress.enabled=true --set workers.fqdnEgress.provider=calico
 refuse "workers.fqdnEgress.ovn.exceptCIDRs is empty" -f "$WORK/workers.yaml" --set workers.fqdnEgress.enabled=true --set workers.fqdnEgress.provider=ovn
-render "$WORK/ovn.yaml" -f "$WORK/workers.yaml" --set workers.fqdnEgress.enabled=true --set workers.fqdnEgress.provider=ovn \
-  --set 'workers.fqdnEgress.ovn.exceptCIDRs={10.128.0.0/14,172.30.0.0/16,192.0.2.0/24,169.254.0.0/16}'
+OVNSET="--set workers.fqdnEgress.enabled=true --set workers.fqdnEgress.provider=ovn --set workers.fqdnEgress.ovn.exceptCIDRs={10.128.0.0/14,172.30.0.0/16,192.0.2.0/24,169.254.0.0/16}"
+# shellcheck disable=SC2086 # OVNSET is a deliberate word list of --set flags
+refuse "is a wildcard, and workers.fqdnEgress.ovn.allowWildcards is false" -f "$WORK/workers.yaml" $OVNSET
+# An exact-host list renders without the wildcard opt-in.
+# shellcheck disable=SC2086
+render "$WORK/ovn-exact.yaml" -f "$WORK/workers.yaml" $OVNSET \
+  --set 'workers.fqdnEgress.allowFQDNs[0].name=allow-anthropic' --set 'workers.fqdnEgress.allowFQDNs[0].fqdn=api.anthropic.com' \
+  --set 'workers.fqdnEgress.allowFQDNs[0].ports[0]=443'
+got=$(q "$WORK/ovn-exact.yaml" 'select(.kind == "EgressFirewall") | [.spec.egress[] | select(.type == "Allow") | .to.dnsName] | map(select(test("[*]"))) | length')
+[ "$got" = 0 ] && ok "exact-host allowFQDNs render under provider ovn without allowWildcards" || bad "exact-host render still carries $got wildcard entries"
+# shellcheck disable=SC2086
+render "$WORK/ovn.yaml" -f "$WORK/workers.yaml" $OVNSET --set workers.fqdnEgress.ovn.allowWildcards=true
 [ "$(count "$WORK/ovn.yaml" EgressFirewall default)" = 1 ] || { echo "BROKEN: EgressFirewall default absent under provider ovn" >&2; exit 2; }
 [ "$(q "$WORK/ovn.yaml" '[select(.apiVersion == "crd.antrea.io/v1beta1")] | length')" = 0 ] && ok "provider ovn renders no Antrea policy" || bad "provider ovn still renders an Antrea policy"
 ns=$(q "$WORK/ovn.yaml" 'select(.kind == "EgressFirewall") | .metadata.namespace')
@@ -187,21 +197,85 @@ exc=$(q "$WORK/ovn.yaml" 'select(.kind == "NetworkPolicy" and .metadata.name == 
 [ "$exc" = "0.0.0.0/0 except 10.128.0.0/14,172.30.0.0/16,192.0.2.0/24,169.254.0.0/16" ] && ok "external-egress NetworkPolicy excludes the in-cluster and host ranges" || bad "external-egress NetworkPolicy renders '$exc'"
 
 # --- (f) openshift.enabled -----------------------------------------------------------------
+# The FULL SCC envelope, in both postures. Any field here that loosens widens what a worker
+# pod may do; any that tightens (a missing volume type, a lost capability) stops the
+# controller-rendered pods from being admitted. Both directions are regressions.
+# scc_env <file>: one line per field, stable order, for an exact comparison.
+scc_env() {
+  # Extract the one SCC document first, then evaluate a single array expression on it:
+  # a comma list at the top of a multi-document `yq ea` fans out combinatorially.
+  q "$1" 'select(.kind == "SecurityContextConstraints" and .metadata.name == "uzi-worker")' > "$WORK/scc-one.yaml"
+  yq '[
+    "privileged=" + (.allowPrivilegedContainer | tostring),
+    "escalation=" + (.allowPrivilegeEscalation | tostring),
+    "hostDir=" + (.allowHostDirVolumePlugin | tostring),
+    "hostIPC=" + (.allowHostIPC | tostring),
+    "hostNetwork=" + (.allowHostNetwork | tostring),
+    "hostPID=" + (.allowHostPID | tostring),
+    "hostPorts=" + (.allowHostPorts | tostring),
+    "runAsUser=" + .runAsUser.type + ":" + ((.runAsUser.uidRangeMin // "") | tostring) + "-" + ((.runAsUser.uidRangeMax // "") | tostring),
+    "fsGroup=" + .fsGroup.type + ":" + ([.fsGroup.ranges[] | (.min | tostring) + "-" + (.max | tostring)] | join(",")),
+    "supplementalGroups=" + .supplementalGroups.type,
+    "seLinux=" + .seLinuxContext.type,
+    "seccomp=" + (.seccompProfiles | join(",")),
+    "volumes=" + (.volumes | sort | join(",")),
+    "allowedCaps=" + ((.allowedCapabilities // []) | sort | join(",")),
+    "defaultAddCaps=" + ((.defaultAddCapabilities // []) | join(",")),
+    "requiredDropCaps=" + ((.requiredDropCapabilities // []) | join(",")),
+    "users=" + ((.users // []) | length | tostring) + " groups=" + ((.groups // []) | length | tostring)
+  ] | .[]' "$WORK/scc-one.yaml"
+}
+COMMON="privileged=false
+escalation=false
+hostDir=false
+hostIPC=false
+hostNetwork=false
+hostPID=false
+hostPorts=false"
+TAIL="fsGroup=MustRunAs:10001-10001
+supplementalGroups=RunAsAny
+seLinux=MustRunAs
+seccomp=runtime/default
+volumes=emptyDir,persistentVolumeClaim,secret"
 render "$WORK/os.yaml" -f "$WORK/workers.yaml" --set openshift.enabled=true
 [ "$(count "$WORK/os.yaml" SecurityContextConstraints uzi-worker)" = 1 ] || { echo "BROKEN: SCC uzi-worker absent" >&2; exit 2; }
-got=$(q "$WORK/os.yaml" 'select(.kind == "SecurityContextConstraints") | [.runAsUser.type, (.runAsUser.uidRangeMin | tostring), (.allowedCapabilities | length | tostring), .fsGroup.type, (.fsGroup.ranges[0].min | tostring), (.allowPrivilegedContainer | tostring), (.allowPrivilegeEscalation | tostring)] | join(" ")')
-[ "$got" = "MustRunAsRange 10001 0 MustRunAs 10001 false false" ] && ok "single-uid SCC pins uid/fsGroup 10001, adds no capability" || bad "single-uid SCC renders '$got'"
+want="$COMMON
+runAsUser=MustRunAsRange:10001-10001
+$TAIL
+allowedCaps=
+defaultAddCaps=
+requiredDropCaps=ALL
+users=0 groups=0"
+got=$(scc_env "$WORK/os.yaml")
+[ "$got" = "$want" ] && ok "single-uid SCC envelope is exact (uid/fsGroup 10001, no caps, drop ALL, 3 volume types, no host access)" || bad "single-uid SCC envelope differs:
+--- want
+$want
+--- got
+$got"
 render "$WORK/os-split.yaml" -f "$WORK/workers.yaml" --set openshift.enabled=true --set workers.uidSplit.enabled=true
-got=$(q "$WORK/os-split.yaml" 'select(.kind == "SecurityContextConstraints") | .runAsUser.type + " " + (.allowedCapabilities | sort | join(","))')
-[ "$got" = "RunAsAny CHOWN,DAC_OVERRIDE,FOWNER,SETGID,SETPCAP,SETUID" ] && ok "uid-split SCC admits root with exactly the rendered capabilities" || bad "uid-split SCC renders '$got'"
+want="$COMMON
+runAsUser=RunAsAny:-
+$TAIL
+allowedCaps=CHOWN,DAC_OVERRIDE,FOWNER,SETGID,SETPCAP,SETUID
+defaultAddCaps=
+requiredDropCaps=ALL
+users=0 groups=0"
+got=$(scc_env "$WORK/os-split.yaml")
+[ "$got" = "$want" ] && ok "uid-split SCC envelope is exact (root allowed, exactly the rendered caps, drop ALL)" || bad "uid-split SCC envelope differs:
+--- want
+$want
+--- got
+$got"
 got=$(q "$WORK/os.yaml" '[select(.kind == "Role" and (.metadata.name == "uzi-worker-scc" or .metadata.name == "uzi-worker-docker-scc")) | .metadata.namespace + "=" + .rules[0].resourceNames[0] + "/" + .rules[0].verbs[0]] | sort | join(",")')
 [ "$got" = "uzi-workers-docker=privileged/use,uzi-workers=uzi-worker/use" ] && ok "SCC use grants: docker tier -> privileged, kube-native -> uzi-worker" || bad "SCC Roles render '$got'"
 got=$(q "$WORK/os.yaml" '[select(.kind == "RoleBinding" and (.metadata.name == "uzi-worker-scc" or .metadata.name == "uzi-worker-docker-scc")) | .subjects[0].namespace + ":" + .subjects[0].name] | sort | join(",")')
 [ "$got" = "uzi-workers-docker:uzi-hosted-worker,uzi-workers:uzi-hosted-worker" ] && ok "SCC grants bind only the worker ServiceAccounts" || bad "SCC RoleBindings render '$got'"
+n=$(q "$WORK/os.yaml" '[select(.kind == "ClusterRole" or .kind == "ClusterRoleBinding") | select(.metadata.name | test("scc"))] | length')
+[ "$n" = 0 ] && ok "SCC grants are namespaced (no ClusterRole/ClusterRoleBinding)" || bad "found $n cluster-scoped SCC grants"
 n=$(q "$WORK/os.yaml" '[select(.kind == "Namespace") | select(.metadata.labels."security.openshift.io/scc.podSecurityLabelSync" == "false")] | length')
 [ "$n" = 2 ] && ok "both worker namespaces opt out of OpenShift label sync" || bad "label-sync opt-out on $n namespaces, expected 2"
-rg_anyuid=$(q "$WORK/os.yaml" '[select(.kind == "Role") | .rules[]?.resourceNames[]? | select(. == "anyuid")] | length')
-[ "$rg_anyuid" = 0 ] && ok "no anyuid grant" || bad "a Role grants anyuid"
+n=$(q "$WORK/os.yaml" '[select(.kind == "Role") | .rules[]?.resourceNames[]? | select(. == "anyuid")] | length')
+[ "$n" = 0 ] && ok "no anyuid grant" || bad "a Role grants anyuid"
 
 if [ "$fail" -ne 0 ]; then
   echo "FAIL: the OpenShift/OKD chart knobs do not render as documented (docs/openshift.md)" >&2
