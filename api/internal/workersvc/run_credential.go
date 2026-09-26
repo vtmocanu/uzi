@@ -130,7 +130,7 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 		}); werr != nil {
 			return SetRunCredentialResult{}, fmt.Errorf("set run credential override: %w", werr)
 		}
-		if terr := s.applyCredentialTransition(ctx, userID, runID, run.Status); terr != nil {
+		if terr := s.applyCredentialTransition(ctx, userID, runID, run.Status, run.HoldReason.String); terr != nil {
 			return SetRunCredentialResult{}, terr
 		}
 	case "awaiting_approval", "awaiting_input", "awaiting_followup", "running":
@@ -243,7 +243,7 @@ func (s *Service) stampHeldStateSwitch(ctx context.Context, run store.Run, userI
 // the run_inputs kind CHECK, so a distinct audit kind would need a migration (out of M4's
 // scope), and 'resume' already means exactly "this run was moved back to queued". The
 // queued branch performs no transition, so it writes no audit row.
-func (s *Service) applyCredentialTransition(ctx context.Context, userID, runID uuid.UUID, status string) error {
+func (s *Service) applyCredentialTransition(ctx context.Context, userID, runID uuid.UUID, status, holdReason string) error {
 	switch status {
 	case "queued":
 		// The next claim honours the override; nothing else to do.
@@ -273,6 +273,17 @@ func (s *Service) applyCredentialTransition(ctx context.Context, userID, runID u
 			return ErrCredentialSwitchRaced
 		}
 	case "paused":
+		if holdReason == "credential_disabled" {
+			if _, err := s.q.PromoteCredentialDisabledRun(ctx, store.PromoteCredentialDisabledRunParams{
+				ID: runID, UserID: userID, GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
+			}); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return ErrCredentialSwitchRaced
+				}
+				return fmt.Errorf("promote credential-disabled run: %w", err)
+			}
+			break
+		}
 		// PRD #1497 M1: the set-token resume preserves its prior behaviour of resuming any paused run
 		// (AllowCompletionBlockedHold so a completion hold still resumes here as before). A
 		// budget_exhausted wall park with no remaining budget is refused by the budget guard (0 rows

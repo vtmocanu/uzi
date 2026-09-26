@@ -512,6 +512,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = $1 AND worker_id = $2
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
@@ -12221,6 +12222,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = $3 AND worker_id = $4
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
@@ -12273,6 +12275,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = $4 AND worker_id = $5
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
@@ -14517,6 +14520,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = $1 AND worker_id = $2
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 

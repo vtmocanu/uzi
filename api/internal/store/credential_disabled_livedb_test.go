@@ -64,6 +64,7 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 	var claimReleased pgtype.Timestamptz
 	read := func() {
 		t.Helper()
+		ownerWorker = pgtype.UUID{}
 		err := pool.QueryRow(ctx, `SELECT status, hold_reason, session_id, started_at,
             budget_paused_seconds, codex_claim_epoch, codex_cap_hash, worker_id,
             pause_requested_at, pause_mode, recovery_wait_count, claim_released_at FROM runs WHERE id=$1`, run).
@@ -80,6 +81,12 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 	}
 	if n, err := q.SetRunRunning(ctx, store.SetRunRunningParams{ID: run, WorkerID: pgWorker}); err != nil || n != 0 {
 		t.Fatalf("stale running report: rows=%d err=%v", n, err)
+	}
+	if n, err := q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{ID: run, WorkerID: pgWorker}); err != nil || n != 0 {
+		t.Fatalf("stale awaiting-input report: rows=%d err=%v", n, err)
+	}
+	if n, err := q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{ID: run, WorkerID: pgWorker}); err != nil || n != 0 {
+		t.Fatalf("stale cancel report: rows=%d err=%v", n, err)
 	}
 	if _, err := q.ResumePausedRun(ctx, store.ResumePausedRunParams{ID: run, UserID: user, GlobalTimeoutSeconds: 60}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("generic resume bypassed credential hold: %v", err)
@@ -114,7 +121,7 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 	read()
 	if status != "queued" || hold.Valid || bank < 12 || bank > 15 || epoch != 6 || cap != nil ||
 		session != "resume-session" || ownerWorker.Valid || pauseMode != "now" || recoveryCount != 2 {
-		t.Fatalf("promotion state: status=%s hold=%v bank=%d epoch=%d session=%s worker=%s pause=%s recovery=%d", status, hold, bank, epoch, session, ownerWorker, pauseMode, recoveryCount)
+		t.Fatalf("promotion state: status=%s hold=%v bank=%d epoch=%d session=%s worker=%s worker_valid=%t released=%t pause=%s recovery=%d", status, hold, bank, epoch, session, ownerWorker, ownerWorker.Valid, claimReleased.Valid, pauseMode, recoveryCount)
 	}
 	if err := promote(user); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("repeat promotion: %v", err)
