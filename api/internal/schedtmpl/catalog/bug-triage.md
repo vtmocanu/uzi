@@ -3,10 +3,10 @@ slug: bug-triage
 name: Bug triage sweep
 description: Daily sweep over open issues labelled "bug", starting a run for the oldest few.
 target: sweep
-cron: 0 2 * * *
+cron: 0 0 * * *
 timezone: UTC
 labels: bug
-max_issues: 3
+max_issues: 4
 ---
 
 Triage the sweep's bug issue. Review it critically against the current code before

@@ -3,7 +3,7 @@ slug: assigned-sweep
 name: Assigned-to-uzi sweep
 description: Daily sweep over open issues assigned to the uzi-bot account, starting a run for the oldest few.
 target: sweep
-cron: 0 2 * * *
+cron: 0 6 * * *
 timezone: UTC
 selector: assigned
 max_issues: 3
