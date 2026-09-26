@@ -7011,6 +7011,137 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
     assertNoPersistAfterReap(events);
   });
 
+  // N1/N2 (issue #1764, round 2): the reap can come from a checkpoint that then THROWS, or from a
+  // wall park / completion hold whose runner-side capture runs the Codex boundary (quiesce + reap)
+  // on the LIVE root. Each must persist BEFORE the reap and never re-persist the reaped home.
+  it("(N1) a checkpoint that reaps and then throws never re-persists the reaped epoch's deleted home", async () => {
+    const rig = makeMultiEpochRig([checkpointEpoch()]);
+    const { events, homeOf } = persistSpy(rig);
+    const { ctx } = makeCtx({
+      checkpoint: async (opts) => {
+        if (!opts.reap) return;
+        events.push(`reap:${homeOf(0)}`);
+        throw new Error("boundary deadline exceeded after the reap");
+      },
+    });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "N1 throw"), /boundary deadline/);
+    assert.deepEqual(events, [`persist:${homeOf(0)}`, `reap:${homeOf(0)}`]);
+    assertNoPersistAfterReap(events);
+  });
+
+  it("(N2 loop-top) a seeded `wall` park that reaps persists the live session first and never after", async () => {
+    const rig = makeMultiEpochRig([doneEpoch()]);
+    const { events, homeOf } = persistSpy(rig);
+    const { ctx } = makeCtx({
+      pauseModeRequested: () => "wall",
+      parkForWall: async () => { events.push(`reap:${homeOf(0)}`); return "parked"; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "N2 loop-top wall");
+    assert.deepEqual(result.walled, { reason: "codex run wall-clock timeout" });
+    assert.deepEqual(events, [`persist:${homeOf(0)}`, `reap:${homeOf(0)}`]);
+    assertNoPersistAfterReap(events);
+  });
+
+  it("(N2 in-turn) a live `wall` pause whose park reaps persists the live session first and never after", async () => {
+    const controller = new AbortController();
+    // The turn goes quiet (no terminal frame), so the wall pause aborts it mid-flight.
+    const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", () => undefined)]);
+    const { events, homeOf } = persistSpy(rig);
+    let mode: "wall" | null = null;
+    const { ctx } = makeCtx({
+      signal: controller.signal,
+      pauseModeRequested: () => mode,
+      parkForWall: async () => { events.push(`reap:${homeOf(0)}`); return "parked"; },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.epochs[0]?.transport.turnStartCount === 1, "implement turn started");
+    mode = "wall";
+    controller.abort(new PauseNowSignal());
+    const result = await withTimeout(running, 5000, "N2 in-turn wall");
+    assert.deepEqual(result.walled, { reason: "codex run wall-clock timeout" });
+    assert.deepEqual(events, [`persist:${homeOf(0)}`, `reap:${homeOf(0)}`]);
+    assertNoPersistAfterReap(events);
+  });
+
+  it("(N2 hold) a max-iterations completion hold on a live recreated epoch persists it first and never after", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "signal_done", { milestones_completed: ["m1"] }, th, tn, "done-1")).push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-1", "tn-2", (t, th, tn) => { t.push(turnCompleted("completed", th, tn)); }),
+    ]);
+    const { events, homeOf } = persistSpy(rig);
+    const current = (): string => homeOf(rig.providerLaunches() - 1);
+    const holds: string[] = [];
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 2 },
+      checkpoint: async (opts) => { if (opts.reap) events.push(`reap:${current()}`); },
+      recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: 1 }),
+      enterCompletionHold: async (reason) => { holds.push(reason); events.push(`reap:${current()}`); return true; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "N2 max-iterations hold");
+    assert.ok(result.completionHeld, "the run entered the completion hold");
+    assert.equal(holds.length, 1);
+    assert.equal(rig.providerLaunches(), 2, "the rework turn ran on a fresh epoch");
+    assert.deepEqual(events, [`persist:${homeOf(0)}`, `reap:${homeOf(0)}`, `persist:${homeOf(1)}`, `reap:${homeOf(1)}`]);
+    assertNoPersistAfterReap(events);
+  });
+
+  it("(N2 in-turn hold) a post-attempt `wall` pause that enters the hold persists the live epoch first and never after", async () => {
+    const controller = new AbortController();
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "signal_done", { milestones_completed: ["m1"] }, th, tn, "done-1")).push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-1", "tn-2", () => undefined), // the rework turn goes quiet
+    ]);
+    const { events, homeOf } = persistSpy(rig);
+    const current = (): string => homeOf(rig.providerLaunches() - 1);
+    let mode: "wall" | null = null;
+    let wallParks = 0;
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 3 },
+      signal: controller.signal,
+      pauseModeRequested: () => mode,
+      checkpoint: async (opts) => { if (opts.reap) events.push(`reap:${current()}`); },
+      recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: 1 }),
+      enterCompletionHold: async () => { events.push(`reap:${current()}`); return true; },
+      parkForWall: async () => { wallParks++; return "parked"; },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.epochs[1]?.transport.turnStartCount === 1, "rework turn started");
+    mode = "wall";
+    controller.abort(new PauseNowSignal());
+    const result = await withTimeout(running, 5000, "N2 in-turn hold");
+    assert.deepEqual(result.completionHeld, { reason: "codex run wall-clock timeout" });
+    assert.equal(wallParks, 0, "the post-attempt wall trip took the hold, not the wall park");
+    assert.deepEqual(events, [`persist:${homeOf(0)}`, `reap:${homeOf(0)}`, `persist:${homeOf(1)}`, `reap:${homeOf(1)}`]);
+    assertNoPersistAfterReap(events);
+  });
+
+  it("(N2 refused) a refused `wall` park re-mints a fresh epoch, and its completed turn is persisted at the terminal", async () => {
+    // The refused capture may already have reaped epoch-0's root (captureHoldContext reaps before the
+    // server decides), so the turn after the refusal runs on a freshly minted epoch-1, never on the
+    // possibly-reaped epoch-0, and the terminal persists epoch-1's live session.
+    const rig = makeMultiEpochRig([doneEpoch()]);
+    const { events, homeOf } = persistSpy(rig);
+    let mode: "wall" | null = "wall";
+    const { ctx } = makeCtx({
+      pauseModeRequested: () => mode,
+      clearWallMode: () => { mode = null; },
+      parkForWall: async () => { events.push(`reap:${homeOf(0)}`); return "refused"; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "N2 refused");
+    assert.equal(result.walled, undefined);
+    // The rig launches a provider root lazily at an epoch's first turn, so the single scripted
+    // transport serves the turn: it ran on the freshly minted epoch-1 (its codex home is the one
+    // persisted at the terminal), never on the possibly-reaped epoch-0.
+    assert.equal(rig.providerLaunches(), 1, "exactly one provider root ran a turn");
+    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1, "the turn after the refusal ran");
+    assert.deepEqual(events, [`persist:${homeOf(0)}`, `reap:${homeOf(0)}`, `persist:${homeOf(1)}`],
+      "the reaped epoch-0 is never re-persisted; the live epoch-1 is persisted at the terminal");
+  });
+
   it("a sticky cancel seen at the loop top rejects the run as cancelled before another turn or epoch", async () => {
     const rig = makeMultiEpochRig([checkpointEpoch()]);
     let cancelled = false;

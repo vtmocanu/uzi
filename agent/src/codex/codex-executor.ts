@@ -1608,12 +1608,30 @@ export class CodexExecutor implements Executor {
     // each epoch's local-execution epoch and its own owned HOME; `provisionDir` is the ONE per-run
     // provisioning dir the finally removes.
     let epoch: ProviderEpoch | undefined;
-    // Issue #1764: true once `epoch` was reaped by a `ctx.checkpoint({ reap: true })` AFTER its
-    // last persistSession, and cleared whenever a fresh epoch is installed. The reap disposes the
-    // provider root, whose owned data root (the epoch's codexHome, sessions included) the launcher
-    // then removes, so a later persist of that epoch would find no source and publish an EMPTY
-    // store generation over the session persisted just before the reap. The finally skips it.
+    // Issue #1764: true once `epoch`'s session was persisted ahead of a sink that may reap its
+    // provider root: a `ctx.checkpoint({ reap: true })`, or a wall park / completion hold, whose
+    // runner-side capture runs the Codex boundary (quiesce + reap) on the LIVE root. It is set
+    // BEFORE the sink is awaited, so a sink that reaps and then throws is covered too. Cleared
+    // whenever a fresh epoch is installed, and whenever a turn completes on the current epoch
+    // (a refused park or a declined hold continues the run there, and a completed turn holds
+    // newer session state). The reap disposes the provider root, whose owned data root (the
+    // epoch's codexHome, sessions included) the launcher then removes, so a later persist of
+    // that epoch would find no source and publish an EMPTY store generation over the session
+    // persisted just before the reap. The finally skips it.
     let reapedSinceLastPersist = false;
+    // Issue #1764: the one "persist before a sink that may reap" step. Skipped when the flag is
+    // already set: the store then holds the latest pre-reap state and the home may be gone.
+    const beforeReapingSink = async (): Promise<void> => {
+      if (reapedSinceLastPersist || !epoch) return;
+      await epoch.persistSession();
+      reapedSinceLastPersist = true;
+    };
+    // Issue #1764: route a completion hold, persisting first when the hold sink will be invoked
+    // (the same condition routeCompletionHold applies).
+    const routeHold = async (reason: string, attempted: boolean): Promise<boolean> => {
+      if (attempted && ctx.enterCompletionHold) await beforeReapingSink();
+      return routeCompletionHold(ctx, reason, attempted);
+    };
     let epochIndex = 0;
     let provisionDir: string | undefined;
     // Issue #1598: the run's ONE command cache (a `--hold-cache` process as the command uid),
@@ -1864,8 +1882,10 @@ export class CodexExecutor implements Executor {
         let fallbackUsed = false;
         // `round` counts clarification rounds only; the prose-only recovery below has its own budget.
         for (let round = 0; ; ) {
-          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, { completedCount: 0 }, shared.scrubProjected);
+          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink);
           if (turn.kind !== "turn") return turn;
+          // Issue #1764: a completed turn proves the home is live and holds newer session state.
+          reapedSinceLastPersist = false;
           const result = turn.result;
           if (result.plan?.trim()) {
             emitIgnoredQuestions(result);
@@ -1958,6 +1978,7 @@ export class CodexExecutor implements Executor {
         const old = epoch;
         epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, ++epochIndex);
         this.safety = epoch.safety;
+        reapedSinceLastPersist = false;
         await old.dispose();
       }
 
@@ -2025,7 +2046,7 @@ export class CodexExecutor implements Executor {
         const served: IterationBudget | void = await ctx.reportIteration?.(iteration, latestProgress);
         if (served) liftWall(wall, served.totalWallSeconds ?? served.wallSeconds);
         if (served?.budgetExhausted && interlockedIssue && completionAttempted &&
-            await routeCompletionHold(ctx, REASON_COMPLETION_BUDGET_EXHAUSTED, completionAttempted)) {
+            await routeHold(REASON_COMPLETION_BUDGET_EXHAUSTED, completionAttempted)) {
           completionHeld = { reason: REASON_COMPLETION_BUDGET_EXHAUSTED };
           break;
         }
@@ -2046,11 +2067,11 @@ export class CodexExecutor implements Executor {
             // PRD #1497 M2: a pending `wall` pause (the sweep's wall-clock park, or a re-claim seeded
             // with pause_mode='wall') takes the capture-first wall park, not parkForPause. A
             // post-attempt run tries the completion hold first, as the in-turn wall trip does.
-            if (completionAttempted && await routeCompletionHold(ctx, REASON_WALL, true)) {
+            if (completionAttempted && await routeHold(REASON_WALL, true)) {
               completionHeld = { reason: REASON_WALL };
               break;
             }
-            const outcome = await this.parkAtWall(ctx, at);
+            const outcome = await this.parkAtWall(ctx, at, beforeReapingSink);
             if (outcome === "parked") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
             // "refused" (the owner extended; wall mode cleared): re-arm the run-wide wall from the
             // refusal's budget and fall through to the turn. "unwired" (no seam): fall through.
@@ -2064,6 +2085,10 @@ export class CodexExecutor implements Executor {
         }
         // Issue #1764: an implement turn runs now, so mint the deferred fresh provider epoch (new
         // registry, freshly-released credential, adopted session) and fully dispose the reaped one.
+        // A loop-top wall park or completion hold that was refused/declined above may already have
+        // reaped the live root (captureHoldContext reaps before the server decides), and it persisted
+        // the session first (beforeReapingSink), so treat that epoch as reaped too.
+        if (reapedSinceLastPersist) epochNeedsRecreate = true;
         if (epochNeedsRecreate) {
           const old = epoch;
           epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, ++epochIndex);
@@ -2096,10 +2121,12 @@ export class CodexExecutor implements Executor {
           // Issue #1674 (PRD #1064 parity): each report_progress observation pushes at once and emits
           // its started / reported-complete frames exactly once, diffed from the last known progress.
           const onProgress = makeProgressObserver(ctx, latestProgress, milestones);
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, { completedCount: latestProgress?.completed?.length ?? 0 }, shared.scrubProjected, completionAttempted, onProgress);
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, { completedCount: latestProgress?.completed?.length ?? 0 }, shared.scrubProjected, beforeReapingSink, completionAttempted, onProgress);
           if (implTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
           if (implTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: implTurn.reason } };
           result = implTurn.result;
+          // Issue #1764: a completed turn proves the home is live and holds newer session state.
+          reapedSinceLastPersist = false;
           if (result.sessionId) lastSessionId = result.sessionId;
           // A quiet clarification turn does not erase milestone progress.
           if (result.progress) latestProgress = result.progress;
@@ -2122,8 +2149,10 @@ export class CodexExecutor implements Executor {
         // branch is skipped when done).
         if (result.checkpoint && !result.done) {
           await epoch.persistSession();
-          await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+          // Issue #1764: set BEFORE the await, so a checkpoint that reaps and then throws still
+          // keeps the finally from persisting the deleted home.
           reapedSinceLastPersist = true;
+          await ctx.checkpoint?.({ reap: true, progress: latestProgress });
           // Issue #1674 (PRD #390 M3 / PRD #1224 parity): a milestone boundary re-arms enforcement
           // and drops only the checkpointed ids, keeping a concurrent sibling's in-progress state.
           progressMissedLastTurn = false;
@@ -2137,8 +2166,10 @@ export class CodexExecutor implements Executor {
           if (!interlockedIssue) break;
           // Preserve the live thread before reaping the provider and reading Git state.
           await epoch.persistSession();
-          await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+          // Issue #1764: set BEFORE the await, so a checkpoint that reaps and then throws still
+          // keeps the finally from persisting the deleted home.
           reapedSinceLastPersist = true;
+          await ctx.checkpoint?.({ reap: true, progress: latestProgress });
           const worktreeFingerprint = ctx.worktreeFingerprint ? await ctx.worktreeFingerprint() : null;
           const head = worktreeFingerprint === null ? null : (worktreeFingerprint.split("\n", 1)[0] ?? null);
           const { unmet } = await ctx.recordCompletionAttempt!({
@@ -2157,7 +2188,7 @@ export class CodexExecutor implements Executor {
               lastCompletionFingerprint = undefined;
               completionStallStreak = 0;
             } else {
-              if (await routeCompletionHold(ctx, REASON_COMPLETION_NO_PROGRESS, completionAttempted)) {
+              if (await routeHold(REASON_COMPLETION_NO_PROGRESS, completionAttempted)) {
                 completionHeld = { reason: REASON_COMPLETION_NO_PROGRESS };
                 break;
               }
@@ -2167,7 +2198,7 @@ export class CodexExecutor implements Executor {
           completionFollowUp = buildCompletionReworkFollowUp(unmet, milestones, guidance);
         }
         if (iteration >= maxIterations) {
-          if (await routeCompletionHold(ctx, REASON_MAX_ITERATIONS, completionAttempted)) {
+          if (await routeHold(REASON_MAX_ITERATIONS, completionAttempted)) {
             completionHeld = { reason: REASON_MAX_ITERATIONS };
             break;
           }
@@ -2741,6 +2772,7 @@ export class CodexExecutor implements Executor {
     buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker,
     at: { completedCount: number; total?: number },
     scrubLeadText: (s: string) => string,
+    beforeReapingSink: () => Promise<void>,
     completionAttempted = false,
     onProgress: (progress: MilestoneProgress) => void = forwardProgress(ctx),
   ): Promise<{ kind: "turn"; result: ReducedTurnResult } | { kind: "walled" } | { kind: "held"; reason: string }> {
@@ -2762,9 +2794,11 @@ export class CodexExecutor implements Executor {
           (msg === REASON_PAUSE && ctx.pauseModeRequested?.() === "wall");
         if (completionAttempted && (wallTrip || msg === REASON_IDLE)) {
           const reason = wallTrip ? REASON_WALL : REASON_IDLE;
+          // Issue #1764: the hold's capture reaps the live provider root; persist first.
+          if (ctx.enterCompletionHold) await beforeReapingSink();
           if (await routeCompletionHold(ctx, reason, true)) return { kind: "held", reason };
         }
-        const outcome = await this.tryCodexWallPark(ctx, err, at);
+        const outcome = await this.tryCodexWallPark(ctx, err, at, beforeReapingSink);
         if (outcome === "parked") return { kind: "walled" };
         if (outcome === "refused") {
           // The owner extended: re-drive the turn. It skips reportIteration, so re-arm the run-wide
@@ -2791,6 +2825,7 @@ export class CodexExecutor implements Executor {
     ctx: RunContext,
     err: unknown,
     at: { completedCount: number; total?: number },
+    beforeReapingSink: () => Promise<void>,
   ): Promise<"parked" | "refused" | "rethrow"> {
     const msg = err instanceof Error ? err.message : "";
     const mode = ctx.pauseModeRequested?.();
@@ -2802,7 +2837,7 @@ export class CodexExecutor implements Executor {
       throw new Error(REASON_CANCEL);
     }
     if (!isWallTimer && !isWallPause) return "rethrow";
-    const outcome = await this.parkAtWall(ctx, at);
+    const outcome = await this.parkAtWall(ctx, at, beforeReapingSink);
     // "unwired": no seam wired (stub/test) — fall back to legacy propagation of the wall trip.
     return outcome === "unwired" ? "rethrow" : outcome;
   }
@@ -2818,8 +2853,13 @@ export class CodexExecutor implements Executor {
   private async parkAtWall(
     ctx: RunContext,
     at: { completedCount: number; total?: number },
+    beforeReapingSink: () => Promise<void>,
   ): Promise<"parked" | "refused" | "unwired"> {
-    const outcome: WallParkOutcome | undefined = ctx.parkForWall ? await ctx.parkForWall(at) : undefined;
+    if (!ctx.parkForWall) return "unwired";
+    // Issue #1764: the wall park's capture reaps the live provider root, so persist its session
+    // first (the run's finally will not re-persist a possibly-deleted home).
+    await beforeReapingSink();
+    const outcome: WallParkOutcome = await ctx.parkForWall(at);
     if (outcome === "parked" || outcome === "undeliverable") return "parked";
     if (outcome === "cancelled") throw new Error(REASON_CANCEL);
     if (outcome === "refused") {
