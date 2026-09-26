@@ -164,6 +164,22 @@ describe("RunsList row now line (PRD #1064 M3)", () => {
     expect(meta.textContent).toContain("subscription");
   });
 
+  it("keeps title and badges in separate rows until a wide viewport", () => {
+    const { container } = renderRow(aRun({ current_activity: anActivity() }));
+    const card = container.querySelector("li > div")!;
+    const leading = card.firstElementChild!;
+    const badges = card.lastElementChild!;
+    expect(leading.className).toContain("w-full");
+    expect(leading.className).toContain("xl:w-auto");
+    expect(leading.className).toContain("xl:flex-1");
+    expect(leading.className).not.toContain("sm:w-auto");
+    expect(badges.className).toContain("max-w-full");
+    expect(badges.className).toContain("xl:max-w-[50%]");
+    const activity = screen.getByText("coder");
+    expect(activity.className).toContain("min-w-0");
+    expect(activity.className).toContain("truncate");
+  });
+
   it("lets a long repo path truncate before the issue reference clips", () => {
     const path = "grp/" + "a".repeat(80);
     renderRow(aRun({ repo_path: path }));

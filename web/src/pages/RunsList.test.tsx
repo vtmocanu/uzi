@@ -429,7 +429,7 @@ describe("RunsList — harness logo (PRD #1429 M4a, PRD #1653 D-W5, issue #1681)
       expect(chrome.children).toHaveLength(2);
       const leading = chrome.children[0];
       expect(leading.className).toContain("w-full min-w-0");
-      expect(leading.className).toContain("sm:w-auto sm:flex-1");
+      expect(leading.className).toContain("xl:w-auto xl:flex-1");
       expect(leading.firstElementChild).toBe(chip);
       expect(chip.className).not.toContain("z-10");
       expect(chip.className).toContain("h-7 w-7");

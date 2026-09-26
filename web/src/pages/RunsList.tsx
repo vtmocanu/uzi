@@ -365,10 +365,9 @@ export function RunRow({
         data-live={shadow === "live" ? "" : undefined}
         data-attention={shadow === "attention" ? "" : undefined}
       >
-        {/* The full-width leading group keeps the logo beside the title below sm while
-            the badge cluster stacks underneath. Its min-w-0 title column still
-            truncates long titles; above sm the groups share one row. */}
-        <div className="flex w-full min-w-0 items-center gap-2 sm:w-auto sm:flex-1">
+        {/* Keep the title and badges on separate lines until the viewport is wide
+            enough for both. The title column can shrink and truncate at every width. */}
+        <div className="flex w-full min-w-0 items-center gap-2 xl:w-auto xl:flex-1">
           <HarnessBadge harness={run.harness} variant="bare" />
           <div className="min-w-0 flex-1">
             {/* Issue #124: the run title is the forge ISSUE title — writable by anyone who
@@ -386,7 +385,7 @@ export function RunRow({
             {showNow && activity && (
               <p className="mt-0.5 flex items-center gap-1.5 text-xs text-faint">
                 <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full bg-ok animate-pulse" />
-                <span className="shrink-0 font-medium text-ok">{stripUnsafeChars(activity.agent)}</span>
+                <span className="min-w-0 truncate font-medium text-ok">{stripUnsafeChars(activity.agent)}</span>
                 {nowMilestone && <span className="shrink-0 font-mono text-faint">{nowMilestone}</span>}
                 <span className="min-w-0 truncate italic text-muted">
                   {stripUnsafeChars(activity.agent_label || activity.detail || activity.tool)}
@@ -467,7 +466,7 @@ export function RunRow({
             title/body text stays under the overlay and still navigates. The Expedite
             button (already relative z-10, stopPropagation) is unaffected by a raised
             ancestor. */}
-        <div className="relative z-10 flex flex-wrap items-center gap-2">
+        <div className="relative z-10 flex max-w-full flex-wrap items-center gap-2 xl:max-w-[50%]">
           {run.auto_approve && (
             <Badge tone="brand" title="Autopilot: started from the label, plan auto-approved">
               autopilot
