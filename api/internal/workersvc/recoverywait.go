@@ -100,13 +100,13 @@ func recoveryParkJitter() time.Duration {
 // SetState maps to applied=false / 409 (idempotent, like the limit park). It returns the
 // row count SetState maps to `applied`.
 //
-// The StateRequest parameter carries ONLY the reported claim_generation today (threaded to the
-// per-query fence, PRD #1247 M5a-1 rework); recovery_wait has no other dedicated DTO fields (the
-// pool_wait precedent), and the param is kept for symmetry with the park family so a later
-// transient-recovery field lands here without changing the call shape.
+// The StateRequest parameter carries the reported claim_generation (threaded to the per-query
+// fence, PRD #1247 M5a-1 rework) and the already-validated recovery_cause, of which only
+// 'vault_locked' is persisted (recoveryCauseStored, issue #1766 M2).
 func (s *Service) setRecoveryWait(ctx context.Context, run store.Run, wkr store.Worker, req StateRequest, sessionID pgtype.Text) (int64, error) {
 	retryNotBefore := s.now().Add(s.recoveryParkFallbackFor(run.RecoveryWaitCount) + recoveryParkJitter())
 	return s.q.SetRunRecoveryWait(ctx, store.SetRunRecoveryWaitParams{
+		RecoveryCause:  recoveryCauseStored(req.RecoveryCause),
 		RetryNotBefore: pgconv.Time(retryNotBefore),
 		SessionID:      sessionID,
 		ID:             run.ID,
@@ -115,4 +115,15 @@ func (s *Service) setRecoveryWait(ctx context.Context, run store.Run, wkr store.
 		// SetRunRecoveryWait. A stale/reclaimed old flight's park matches 0 rows; nil parks unfenced.
 		ClaimGeneration: pgconv.Int8Ptr(req.ClaimGeneration),
 	})
+}
+
+// recoveryCauseStored is the recovery_wait_cause the ordinary park writes for a reported cause
+// (issue #1766 M2). Only 'vault_locked' is persisted; every other cause, and an absent one, is
+// stored NULL — empty_turn/provider_outage stay the untyped park (PRD #1392 D9), and
+// forge_unreachable never reaches this park (SetState routes it to parkForgeUnreachable).
+func recoveryCauseStored(cause *string) pgtype.Text {
+	if cause != nil && *cause == recoveryCauseVaultLocked {
+		return pgtype.Text{String: recoveryCauseVaultLocked, Valid: true}
+	}
+	return pgtype.Text{}
 }

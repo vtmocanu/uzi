@@ -13077,12 +13077,12 @@ UPDATE runs SET
     status                    = 'recovery_wait',
     status_since              = now(),
     recovery_wait_count       = recovery_wait_count + 1,
-    recovery_wait_cause       = NULL,
-    recovery_retry_not_before = $1,
-    session_id                = COALESCE($2, session_id),
+    recovery_wait_cause       = $1::text,
+    recovery_retry_not_before = $2,
+    session_id                = COALESCE($3, session_id),
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at                = now()
-WHERE id = $3 AND worker_id = $4
+WHERE id = $4 AND worker_id = $5
   AND status = 'running'
   AND kind <> 'judge'
   -- PRD #1247 M5a-1 rework (reviewer NB1): the per-query generation fence, identical to
@@ -13094,11 +13094,12 @@ WHERE id = $3 AND worker_id = $4
   -- PRD #1497 M1 (D16): claim_released_at IS NULL is a STANDALONE conjunct, so a released claim is
   -- rejected even for a generation-less (legacy) report; a live claim still honours a NULL generation.
   AND claim_released_at IS NULL
-  AND ($5::bigint IS NULL
-       OR claim_generation = $5::bigint)
+  AND ($6::bigint IS NULL
+       OR claim_generation = $6::bigint)
 `
 
 type SetRunRecoveryWaitParams struct {
+	RecoveryCause   pgtype.Text        `json:"recovery_cause"`
 	RetryNotBefore  pgtype.Timestamptz `json:"retry_not_before"`
 	SessionID       pgtype.Text        `json:"session_id"`
 	ID              uuid.UUID          `json:"id"`
@@ -13148,15 +13149,20 @@ type SetRunRecoveryWaitParams struct {
 // terminal transitions).
 //
 // PRD #1392 M1 (D9): this is the UNTYPED park (empty turn, and #1088's provider park once
-// it adopts recovery_wait). It CLEARS recovery_wait_cause to NULL — a later untyped park on
-// a run that forge-parked earlier must REPLACE the typed cause, not coalesce it, so its
-// surface reads the generic wording and its forge cap counter is not consulted. It does NOT
+// it adopts recovery_wait). It REPLACES recovery_wait_cause with @recovery_cause, never
+// coalescing it — a later untyped park on a run that forge-parked earlier must drop the typed
+// cause, so its surface reads the generic wording and its forge cap counter is not consulted.
+// Issue #1766 M2: the Go caller (setRecoveryWait) passes a non-NULL recovery_cause ONLY for
+// 'vault_locked' (the worker's codex refresh/release answered 409 vault_locked: the owner's
+// vault is locked, so the run waits for an unlock) and NULL for every other reported cause,
+// so empty_turn/provider_outage still store NULL (D9). The column CHECK is the backstop. It does NOT
 // touch forge_park_count: that lifetime counter belongs to the forge park alone (fact 7 /
 // D2), so an empty-turn park neither increments nor resets it (a run keeps its forge-park
 // lifetime count through a later empty-turn park). The forge park has its own writer,
 // ParkRunForgeUnreachable, which sets the cause and bumps forge_park_count.
 func (q *Queries) SetRunRecoveryWait(ctx context.Context, arg SetRunRecoveryWaitParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setRunRecoveryWait,
+		arg.RecoveryCause,
 		arg.RetryNotBefore,
 		arg.SessionID,
 		arg.ID,

@@ -3139,12 +3139,12 @@ type StateRequest struct {
 	SizeClass            *string   `json:"size_class"`
 	// RecoveryCause is the worker's TYPED cause for a 'recovery_wait' park (PRD #1392 M1).
 	// UNTRUSTED free text on arrival: SetState validates it against the server enum
-	// {forge_unreachable, empty_turn, provider_outage} BEFORE any state SQL and rejects an
-	// unknown non-nil value as ErrInvalidState (400), so a garbled cause can never reach the
-	// constrained column. Only recovery_cause == "forge_unreachable" triggers the dedicated
-	// custody-settling park transaction; the other causes take the ordinary untyped park (which
-	// writes cause NULL, D9). Absent (nil) on every non-recovery_wait report and on a legacy
-	// worker's empty-turn park. httpx.DecodeJSON rejects unknown fields, so this field MUST
+	// {forge_unreachable, empty_turn, provider_outage, vault_locked} BEFORE any state SQL and
+	// rejects an unknown non-nil value as ErrInvalidState (400), so a garbled cause can never
+	// reach the constrained column. Only recovery_cause == "forge_unreachable" triggers the
+	// dedicated custody-settling park transaction; the other causes take the ordinary park,
+	// which writes cause NULL (D9) except for vault_locked, which it persists (issue #1766 M2).
+	// Absent (nil) on every non-recovery_wait report and on a legacy worker's empty-turn park. httpx.DecodeJSON rejects unknown fields, so this field MUST
 	// exist here or a new worker's report 400s.
 	RecoveryCause *string `json:"recovery_cause"`
 }
@@ -3222,7 +3222,8 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// constraint violation at the park write. Absent (nil) is fine (an ordinary report or a
 	// legacy untyped park). Only forge_unreachable triggers the dedicated park transaction
 	// below; empty_turn/provider_outage are accepted here (reserved, D9) but take the ordinary
-	// untyped park, which writes cause NULL.
+	// untyped park, which writes cause NULL. vault_locked (issue #1766 M2) takes the same
+	// ordinary park, which persists that one cause.
 	if req.RecoveryCause != nil && serverRecoveryWaitCauses[*req.RecoveryCause] {
 		return store.Run{}, false, fmt.Errorf("%w: recovery_cause %q is server-only", ErrInvalidState, *req.RecoveryCause)
 	}
@@ -3728,7 +3729,9 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// worker's bounded in-process retries, so the run parks on a server-owned capped
 		// backoff and the sweeper auto-promotes it. This is the reusable transient-recovery
 		// park primitive (any transient cause reports it and reuses the park->promote
-		// lifecycle); it is NOT a usage limit — see setRecoveryWait / recoverywait.go.
+		// lifecycle); it is NOT a usage limit — see setRecoveryWait / recoverywait.go. Issue
+		// #1766 M2: a vault_locked report parks here too and is the one cause this park stores;
+		// the timer promoter re-queues it and Claim holds it idle while the vault stays locked.
 		rows, err = s.setRecoveryWait(ctx, owned, wkr, req, sessionID)
 	case "paused":
 		// PRD #1190 M1: the owner-requested park. SetRunPaused has the SAME positive-source-guard

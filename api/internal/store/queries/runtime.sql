@@ -2281,9 +2281,13 @@ WHERE id = @id AND user_id = @user_id AND status = 'limit_wait';
 -- terminal transitions).
 --
 -- PRD #1392 M1 (D9): this is the UNTYPED park (empty turn, and #1088's provider park once
--- it adopts recovery_wait). It CLEARS recovery_wait_cause to NULL — a later untyped park on
--- a run that forge-parked earlier must REPLACE the typed cause, not coalesce it, so its
--- surface reads the generic wording and its forge cap counter is not consulted. It does NOT
+-- it adopts recovery_wait). It REPLACES recovery_wait_cause with @recovery_cause, never
+-- coalescing it — a later untyped park on a run that forge-parked earlier must drop the typed
+-- cause, so its surface reads the generic wording and its forge cap counter is not consulted.
+-- Issue #1766 M2: the Go caller (setRecoveryWait) passes a non-NULL recovery_cause ONLY for
+-- 'vault_locked' (the worker's codex refresh/release answered 409 vault_locked: the owner's
+-- vault is locked, so the run waits for an unlock) and NULL for every other reported cause,
+-- so empty_turn/provider_outage still store NULL (D9). The column CHECK is the backstop. It does NOT
 -- touch forge_park_count: that lifetime counter belongs to the forge park alone (fact 7 /
 -- D2), so an empty-turn park neither increments nor resets it (a run keeps its forge-park
 -- lifetime count through a later empty-turn park). The forge park has its own writer,
@@ -2292,7 +2296,7 @@ UPDATE runs SET
     status                    = 'recovery_wait',
     status_since              = now(),
     recovery_wait_count       = recovery_wait_count + 1,
-    recovery_wait_cause       = NULL,
+    recovery_wait_cause       = sqlc.narg('recovery_cause')::text,
     recovery_retry_not_before = @retry_not_before,
     session_id                = COALESCE(sqlc.narg('session_id'), session_id),
     health = 'ok', health_reason = NULL, health_since = NULL,

@@ -679,7 +679,9 @@ type RunDTO struct {
 	// RecoveryWaitCause is the TYPED cause of a 'recovery_wait' park (PRD #1392 M1). Null is
 	// the LEGACY/untyped park — the empty-turn park writes NULL (D9), so a client must render
 	// null as the generic "waiting to retry" wording, NOT as any particular cause. Today the
-	// only non-null value is "forge_unreachable" (the forge stayed unreachable at clone);
+	// non-null values are "forge_unreachable" (the forge stayed unreachable at clone),
+	// "codex_account_unavailable" (PRD #1590, held on its Codex account) and "vault_locked"
+	// (issue #1766, the owner's vault is locked; the run resumes once it is unlocked);
 	// "empty_turn"/"provider_outage" are reserved. Clients render an unrecognised value
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.

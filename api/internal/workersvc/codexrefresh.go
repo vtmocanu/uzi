@@ -478,8 +478,11 @@ func (s *Service) CoordinatedCodexRefresh(ctx context.Context, wkr store.Worker,
 	// A locked vault is answered as ErrCodexVaultLocked (issue #1766) only to a run that
 	// STILL holds authority: the vault-locked seal after the exchange is reached with the
 	// same pre-network authorization as the token path above, so authority is re-verified
-	// here too. A lost recheck returns the authorization error alone (404/403 at the
-	// handler), keeping the outcome; the durable state the refresh left is not touched.
+	// here too. A lost recheck returns the recheck's own error, keeping the outcome: 404/403
+	// at the handler for an ownership/capability loss, 409 credential-unavailable for a
+	// stale-state loss such as a requeue or a revoke, and 500 for a transient store/deadline
+	// error on the recheck itself; never vault_locked. The durable state the refresh left is
+	// not touched.
 	//
 	// ErrCodexAccountQuarantined alone does NOT count as lost authority here: the
 	// post-exchange vault-locked seal itself quarantines the account to retain the new
