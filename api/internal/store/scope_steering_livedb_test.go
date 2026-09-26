@@ -2,12 +2,14 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -441,5 +443,133 @@ func TestListFollowUpInputsIncludesScopeLiveDB(t *testing.T) {
 	}
 	if !scopeDisposition.Valid || scopeDisposition.String != "applied" {
 		t.Errorf("scope row disposition in list = %+v, want applied", scopeDisposition)
+	}
+}
+
+// scopeCeilingValue reads runs.scope_ceiling back for the terminal-refusal assertions.
+func scopeCeilingValue(ctx context.Context, t *testing.T, q *store.Queries, runID uuid.UUID) pgtype.Int4 {
+	t.Helper()
+	run, err := q.GetRunByID(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunByID: %v", err)
+	}
+	return run.ScopeCeiling
+}
+
+// Issue #1399: CreateScopeCeilingInput refuses a terminal run IN SQL. On a failed or
+// cancelled run carrying a prior pending scope row, the statement matches 0 rows and yields
+// pgx.ErrNoRows: no new scope row, runs.scope_ceiling unchanged, and the prior row is NOT
+// superseded (it stays disposition NULL for the terminal transition's own settle).
+func TestScopeCeilingRefusedOnTerminalRunLiveDB(t *testing.T) {
+	ctx, pool, q := scopeSteeringDB(t)
+	userID, repoID := scopeSeedRepo(ctx, t, pool)
+	wkr := scopeSeedWorker(ctx, t, pool, userID, true)
+	for _, status := range []string{"failed", "cancelled"} {
+		t.Run(status, func(t *testing.T) {
+			runID := scopeSeedRun(ctx, t, pool, userID, repoID, &wkr, "running")
+			if _, err := q.CreateScopeCeilingInput(ctx, store.CreateScopeCeilingInputParams{
+				RunID: runID, Body: scopeBody("prior: cap to 4"), ScopeCeiling: scopeCeiling(4),
+			}); err != nil {
+				t.Fatalf("prior CreateScopeCeilingInput on the running run: %v", err)
+			}
+			mustExec(ctx, t, pool, `UPDATE runs SET status = $2 WHERE id = $1`, runID, status)
+
+			_, err := q.CreateScopeCeilingInput(ctx, store.CreateScopeCeilingInputParams{
+				RunID: runID, Body: scopeBody("late: cap to 5"), ScopeCeiling: scopeCeiling(5),
+			})
+			if !errors.Is(err, pgx.ErrNoRows) {
+				t.Fatalf("CreateScopeCeilingInput on a %s run: err = %v, want pgx.ErrNoRows", status, err)
+			}
+			if c := scopeCeilingValue(ctx, t, q, runID); !c.Valid || c.Int32 != 4 {
+				t.Errorf("scope_ceiling = %+v, want unchanged valid 4", c)
+			}
+			got := scopeRowsByAge(ctx, t, pool, runID)
+			if len(got) != 1 {
+				t.Fatalf("scope rows = %d, want 1 (the refused write must insert nothing)", len(got))
+			}
+			if got[0].disposition.Valid {
+				t.Errorf("prior scope row disposition = %q, want NULL (a refused write supersedes nothing)", got[0].disposition.String)
+			}
+		})
+	}
+}
+
+// Issue #1399, the race itself: a submit that read `running` issues CreateScopeCeilingInput
+// while a terminal transition holds the run's row lock. tx1 locks the running run and marks it
+// failed; the concurrent write blocks on that lock (confirmed via pg_stat_activity, so the
+// interleave is proven rather than hoped for); tx1 commits. Under READ COMMITTED the blocked
+// UPDATE re-checks its WHERE against the committed row (EvalPlanQual), so it must refuse:
+// pgx.ErrNoRows, no pending scope row on the now-failed run, and the ceiling untouched.
+func TestScopeCeilingBlockedByTerminalTransitionLiveDB(t *testing.T) {
+	ctx, pool, q := scopeSteeringDB(t)
+	userID, repoID := scopeSeedRepo(ctx, t, pool)
+	wkr := scopeSeedWorker(ctx, t, pool, userID, true)
+	runID := scopeSeedRun(ctx, t, pool, userID, repoID, &wkr, "running")
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var locked uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT id FROM runs WHERE id = $1 AND status = 'running' FOR UPDATE`, runID).Scan(&locked); err != nil {
+		t.Fatalf("lock running run: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE runs SET status = 'failed' WHERE id = $1`, runID); err != nil {
+		t.Fatalf("mark failed in tx1: %v", err)
+	}
+
+	errc := make(chan error, 1)
+	go func() {
+		_, err := q.CreateScopeCeilingInput(ctx, store.CreateScopeCeilingInputParams{
+			RunID: runID, Body: scopeBody("racing: cap to 3"), ScopeCeiling: scopeCeiling(3),
+		})
+		errc <- err
+	}()
+
+	// Wait (bounded) until the write is observably blocked on tx1's row lock. sqlc embeds the
+	// `-- name: CreateScopeCeilingInput` header, so pg_stat_activity.query identifies it.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		var n int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND state = 'active'
+			  AND wait_event_type = 'Lock'
+			  AND query LIKE '%CreateScopeCeilingInput%'`).Scan(&n); err != nil {
+			t.Fatalf("pg_stat_activity: %v", err)
+		}
+		if n > 0 {
+			break
+		}
+		select {
+		case err := <-errc:
+			t.Fatalf("CreateScopeCeilingInput returned (%v) before blocking on the terminal transition's lock", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("CreateScopeCeilingInput never blocked on the row lock within 15s; the interleave was not exercised")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit tx1: %v", err)
+	}
+	select {
+	case err := <-errc:
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("blocked CreateScopeCeilingInput: err = %v, want pgx.ErrNoRows (refused once the run committed failed)", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("CreateScopeCeilingInput did not return within 15s of tx1 committing")
+	}
+
+	if got := scopeRowsByAge(ctx, t, pool, runID); len(got) != 0 {
+		t.Fatalf("scope rows on the failed run = %d, want 0 (no pending audit row may land after the terminal transition)", len(got))
+	}
+	if c := scopeCeilingValue(ctx, t, q, runID); c.Valid {
+		t.Errorf("scope_ceiling = %+v, want NULL (the refused write must not cap a terminal run)", c)
 	}
 }

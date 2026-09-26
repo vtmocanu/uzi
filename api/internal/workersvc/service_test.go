@@ -416,6 +416,9 @@ type fakeStore struct {
 	// prove last-writer-wins across two directives.
 	createdScopeCeiling  *store.CreateScopeCeilingInputParams
 	createdScopeCeilings []store.CreateScopeCeilingInputParams
+	// scopeCeilingErr programs a refusal of CreateScopeCeilingInput — set it to pgx.ErrNoRows
+	// to simulate the 0-row CTE a run that went terminal under the submit produces (#1399).
+	scopeCeilingErr error
 	// PRD #1189 M1: capture the extend write submitInput's `extend` branch makes.
 	// createdExtend holds the LAST call (nil until reached); createdExtends records every
 	// call in order. extendReturn is the new total budget_extension_seconds the fake reports
@@ -1472,6 +1475,9 @@ func (f *fakeStore) CreateStopVerdictInput(_ context.Context, arg store.CreateSt
 func (f *fakeStore) CreateScopeCeilingInput(_ context.Context, arg store.CreateScopeCeilingInputParams) (store.RunUserInput, error) {
 	f.createdScopeCeiling = &arg
 	f.createdScopeCeilings = append(f.createdScopeCeilings, arg)
+	if f.scopeCeilingErr != nil {
+		return store.RunUserInput{}, f.scopeCeilingErr
+	}
 	return store.RunUserInput{ID: 1, RunID: arg.RunID, Kind: "scope", Body: arg.Body}, nil
 }
 

@@ -569,3 +569,28 @@ func TestSetStateRunningNeverSettlesScope(t *testing.T) {
 		t.Fatalf("a running transition must not settle a scope disposition, got %+v", fs.settledScope)
 	}
 }
+
+// TestSubmitInputScopeRefusedByTerminalRaceMapsToErrRunTerminal (issue #1399): the submit's
+// status check is an unlocked read, so a run can go terminal between it and the write. The
+// store statement then refuses in SQL (0 rows -> pgx.ErrNoRows); both the `scope` directive and
+// the milestone-run `stop` remap must surface that as ErrRunTerminal, not a raw no-rows error,
+// and report no ceiling.
+func TestSubmitInputScopeRefusedByTerminalRaceMapsToErrRunTerminal(t *testing.T) {
+	for _, tc := range []struct{ kind, body string }{{"scope", "4"}, {"stop", ""}} {
+		t.Run(tc.kind, func(t *testing.T) {
+			fs, svc, user, runID := scopeRunFixture(t)
+			fs.scopeCeilingErr = pgx.ErrNoRows
+
+			res, err := svc.SubmitInput(context.Background(), user, runID, tc.kind, tc.body, nil)
+			if !errors.Is(err, ErrRunTerminal) {
+				t.Fatalf("err = %v, want ErrRunTerminal", err)
+			}
+			if fs.createdScopeCeiling == nil {
+				t.Fatal("CreateScopeCeilingInput not called: the refusal must come from the store write")
+			}
+			if res.ScopeCeiling != nil {
+				t.Fatalf("a refused %s must return no ceiling, got %v", tc.kind, *res.ScopeCeiling)
+			}
+		})
+	}
+}

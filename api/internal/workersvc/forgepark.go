@@ -145,6 +145,14 @@ func (s *Service) parkForgeUnreachable(ctx context.Context, wkr store.Worker, ow
 	// leaves no open hold) and commit. An owner cancel is the realistic pre-clone verdict; a
 	// graceful 'stopped' converges to 'cancelled' the same way the failed arm does
 	// (CancelRunByWorker). Only a run with NO stamped verdict proceeds to park-or-fail.
+	//
+	// Issue #1399: the verdicts expected before the clone are an owner cancel ('cancelled') and a
+	// graceful stop ('stopped'); both converge to 'cancelled' here, as in SetState's failed arm,
+	// and SetState then settles a scope-directed run's audit row 'declined' off the re-read
+	// status. This branch cancels on ANY stamped stop_kind, and CreateStopVerdictInput stamps
+	// without a status guard, so a stamped 'plan_rejected' or 'auto_stopped' would be cancelled
+	// too. If 'plan_rejected' is ever stamped pre-clone, route it to SetRunFailed with
+	// fail_origin='plan_rejected', as the failed arm does, instead of cancelling it.
 	if run.StopKind.Valid && run.StopKind.String != "" {
 		n, cerr := qtx.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{ID: run.ID, WorkerID: workerID})
 		if cerr != nil {
