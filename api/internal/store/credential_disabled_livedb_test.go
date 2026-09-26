@@ -15,13 +15,16 @@ import (
 func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 	ctx, pool, q, user := codexLiveDB(t)
 	repo, worker := codexRunFixture(ctx, t, pool, user)
+	mustExec(ctx, t, pool, `UPDATE workers SET snapshot_register_nonce='incarnation-a' WHERE id=$1`, worker)
 	run := insertCodexRun(ctx, t, pool, user, repo, worker, 901, "running", "credential park")
 	started := time.Now().Add(-20 * time.Second).UTC().Truncate(time.Second)
 	mustExec(ctx, t, pool, `UPDATE runs SET started_at=$2, status_since=$2, claim_generation=7,
         session_id='resume-session', budget_wall_seconds=60, budget_paused_seconds=3,
         codex_cap_hash=decode('aabb','hex'), codex_claim_epoch=4,
-        pause_requested_at=now(), pause_mode='now', recovery_wait_count=2
+        pause_requested_at=now(), pause_mode='now', recovery_wait_count=2,
+        claimed_worker_nonce='incarnation-a'
         WHERE id=$1`, run, started)
+	mustExec(ctx, t, pool, `UPDATE workers SET snapshot_register_nonce='incarnation-b' WHERE id=$1`, worker)
 	pgWorker := pgtype.UUID{Bytes: worker, Valid: true}
 	park := func(id uuid.UUID, w pgtype.UUID, gen int64) int64 {
 		t.Helper()
@@ -59,7 +62,7 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 	var epoch int64
 	var cap []byte
 	var ownerWorker pgtype.UUID
-	var pauseAt time.Time
+	var pauseAt pgtype.Timestamptz
 	var recoveryCount int32
 	var claimReleased pgtype.Timestamptz
 	read := func() {
@@ -74,9 +77,17 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 		}
 	}
 	read()
+	var releasedID uuid.UUID
+	var releasedNonce string
+	if err := pool.QueryRow(ctx, `SELECT released_worker_id, released_worker_nonce FROM runs WHERE id=$1`, run).Scan(&releasedID, &releasedNonce); err != nil {
+		t.Fatalf("read released worker: %v", err)
+	}
+	if releasedID != worker || releasedNonce != "incarnation-a" {
+		t.Fatalf("released incarnation = %s/%q, want %s/incarnation-a", releasedID, releasedNonce, worker)
+	}
 	if status != "paused" || (!hold.Valid || hold.String != "credential_disabled") || bank != 3 || epoch != 5 || cap != nil ||
 		!gotStarted.Equal(started) || session != "resume-session" || !ownerWorker.Valid || ownerWorker.Bytes != worker ||
-		pauseMode != "now" || recoveryCount != 2 || pauseAt.IsZero() || !claimReleased.Valid {
+		pauseMode != "now" || recoveryCount != 2 || !pauseAt.Valid || !claimReleased.Valid {
 		t.Fatalf("park mutated protected state: status=%s hold=%v bank=%d epoch=%d cap=%x started=%v session=%s worker=%s pause=%s recovery=%d", status, hold, bank, epoch, cap, gotStarted, session, ownerWorker, pauseMode, recoveryCount)
 	}
 	if n, err := q.SetRunRunning(ctx, store.SetRunRunningParams{ID: run, WorkerID: pgWorker}); err != nil || n != 0 {
@@ -107,6 +118,10 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 	if err := promote(uuid.New()); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("foreign promotion: %v", err)
 	}
+	if err := promote(user); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("pending owner pause bypassed: %v", err)
+	}
+	mustExec(ctx, t, pool, `UPDATE runs SET pause_requested_at=NULL WHERE id=$1`, run)
 	// A spent active budget must block promotion, even after a long held interval.
 	mustExec(ctx, t, pool, `UPDATE runs SET started_at=now()-interval '120 seconds',
         status_since=now()-interval '10 seconds', budget_wall_seconds=60 WHERE id=$1`, run)
@@ -125,6 +140,37 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 	}
 	if err := promote(user); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("repeat promotion: %v", err)
+	}
+}
+
+func TestCredentialDisabledSameWorkerReclaimNeedsGenerationLiveDB(t *testing.T) {
+	fx := newWPFixture(t)
+	worker := fx.worker("reclaim", wpWorker{nonce: "incarnation-a"})
+	run := fx.run(wpRun{worker: &worker, claimGen: 4, budgetWall: p32(36000)})
+	mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET claimed_worker_nonce='incarnation-a' WHERE id=$1`, run)
+	mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET snapshot_register_nonce='incarnation-b' WHERE id=$1`, worker)
+	if n, err := fx.q.ParkCredentialDisabledRun(fx.ctx, store.ParkCredentialDisabledRunParams{
+		ID: run, WorkerID: pgtype.UUID{Bytes: worker, Valid: true}, ClaimGeneration: 4,
+	}); err != nil || n != 1 {
+		t.Fatalf("park old incarnation: rows=%d err=%v", n, err)
+	}
+	if _, err := fx.q.PromoteCredentialDisabledRun(fx.ctx, store.PromoteCredentialDisabledRunParams{
+		ID: run, UserID: fx.userID, GlobalTimeoutSeconds: 36000,
+	}); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	if _, err := fx.claim(worker, "incarnation-b", false); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("legacy same-ID reclaim = %v, want refused", err)
+	}
+	mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET protocol_capabilities=ARRAY['credential_switch_v1']::text[] WHERE id=$1`, worker)
+	claimed, err := fx.q.ClaimRun(fx.ctx, store.ClaimRunParams{
+		WorkerID: pgtype.UUID{Bytes: worker, Valid: true}, UserID: fx.userID,
+		HeartbeatCutoff: wpAgo(45 * time.Second), AffinityCutoff: wpAgo(2 * time.Minute),
+		SpreadCutoff: wpAgo(9 * time.Second), SnapshotFreshCutoff: wpAgo(45 * time.Second),
+		WorkerIdentity: "incarnation-b", WorkerProtocolCaps: []string{"credential_switch_v1"},
+	})
+	if err != nil || claimed.ID != run || claimed.ClaimedWorkerNonce.String != "incarnation-b" {
+		t.Fatalf("generation-capable reclaim: run=%s nonce=%v err=%v", claimed.ID, claimed.ClaimedWorkerNonce, err)
 	}
 }
 

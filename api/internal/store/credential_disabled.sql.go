@@ -68,15 +68,20 @@ UPDATE runs SET
     status_since = now(),
     hold_reason = 'credential_disabled',
     claim_released_at = now(),
+    released_worker_id = runs.worker_id,
+    credential_disable_released_worker_id = runs.worker_id,
+    released_worker_nonce = CASE WHEN runs.claimed_worker_nonce IS NOT NULL
+        THEN NULLIF(runs.claimed_worker_nonce, '')
+        ELSE (SELECT w.snapshot_register_nonce FROM workers w WHERE w.id = runs.worker_id) END,
     codex_cap_hash = NULL,
     codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE id = $1 AND worker_id = $2
-  AND claim_generation = $3
-  AND claim_released_at IS NULL
-  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND hold_reason IS NULL
+WHERE runs.id = $1 AND runs.worker_id = $2
+  AND runs.claim_generation = $3
+  AND runs.claim_released_at IS NULL
+  AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.hold_reason IS NULL
 `
 
 type ParkCredentialDisabledRunParams struct {
@@ -109,6 +114,7 @@ UPDATE runs SET
     updated_at = now()
 WHERE id = $1 AND user_id = $2
   AND status = 'paused' AND hold_reason = 'credential_disabled'
+  AND pause_requested_at IS NULL
   AND (started_at IS NULL OR
        (COALESCE(budget_wall_seconds, $3::int)
           + budget_extension_seconds + budget_finalize_seconds)
@@ -134,6 +140,60 @@ type PromoteCredentialDisabledRunRow struct {
 func (q *Queries) PromoteCredentialDisabledRun(ctx context.Context, arg PromoteCredentialDisabledRunParams) (PromoteCredentialDisabledRunRow, error) {
 	row := q.db.QueryRow(ctx, promoteCredentialDisabledRun, arg.ID, arg.UserID, arg.GlobalTimeoutSeconds)
 	var i PromoteCredentialDisabledRunRow
+	err := row.Scan(&i.ID, &i.UserID, &i.Status)
+	return i, err
+}
+
+const reassignCredentialDisabledRun = `-- name: ReassignCredentialDisabledRun :one
+UPDATE runs SET
+    credential_override_mode = $1,
+    credential_override_secret_id = $2,
+    status = 'queued',
+    status_since = now(),
+    budget_paused_seconds = budget_paused_seconds
+        + GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int),
+    hold_reason = NULL,
+    worker_id = CASE WHEN claim_released_at IS NOT NULL THEN NULL ELSE worker_id END,
+    codex_cap_hash = NULL,
+    codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = $3 AND user_id = $4
+  AND status = 'paused' AND hold_reason = 'credential_disabled'
+  AND pause_requested_at IS NULL
+  AND (started_at IS NULL OR
+       (COALESCE(budget_wall_seconds, $5::int)
+          + budget_extension_seconds + budget_finalize_seconds)
+       - (GREATEST(0, EXTRACT(EPOCH FROM (status_since - started_at))::int)
+          - budget_paused_seconds) > 0)
+RETURNING id, user_id, status
+`
+
+type ReassignCredentialDisabledRunParams struct {
+	Mode                 pgtype.Text `json:"mode"`
+	SecretID             pgtype.UUID `json:"secret_id"`
+	ID                   uuid.UUID   `json:"id"`
+	UserID               uuid.UUID   `json:"user_id"`
+	GlobalTimeoutSeconds int32       `json:"global_timeout_seconds"`
+}
+
+type ReassignCredentialDisabledRunRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
+// An owner reassignment of an existing credential hold is all-or-nothing. A
+// refused budget/state guard must not leave a new override behind after a 409.
+func (q *Queries) ReassignCredentialDisabledRun(ctx context.Context, arg ReassignCredentialDisabledRunParams) (ReassignCredentialDisabledRunRow, error) {
+	row := q.db.QueryRow(ctx, reassignCredentialDisabledRun,
+		arg.Mode,
+		arg.SecretID,
+		arg.ID,
+		arg.UserID,
+		arg.GlobalTimeoutSeconds,
+	)
+	var i ReassignCredentialDisabledRunRow
 	err := row.Scan(&i.ID, &i.UserID, &i.Status)
 	return i, err
 }

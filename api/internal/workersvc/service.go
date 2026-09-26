@@ -784,6 +784,7 @@ type Store interface {
 	SetRunCompletionHold(ctx context.Context, arg store.SetRunCompletionHoldParams) (store.Run, error)
 	ResumePausedRun(ctx context.Context, arg store.ResumePausedRunParams) (store.ResumePausedRunRow, error)
 	PromoteCredentialDisabledRun(ctx context.Context, arg store.PromoteCredentialDisabledRunParams) (store.PromoteCredentialDisabledRunRow, error)
+	ReassignCredentialDisabledRun(ctx context.Context, arg store.ReassignCredentialDisabledRunParams) (store.ReassignCredentialDisabledRunRow, error)
 	// ReleaseCredentialSwitch is the held-state credential-switch RELEASE transition (PRD
 	// #1247 M5, D3/D4/D14): a worker's {status:"credential_switch", claim_generation} report
 	// requeues the held run in ONE fenced statement — generation- and release-gated, banking
