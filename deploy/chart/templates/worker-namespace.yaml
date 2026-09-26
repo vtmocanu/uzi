@@ -85,13 +85,13 @@ metadata:
 
   CPU and memory track the DEFAULT `m` size (issue #1341 raised m's request to 4Gi):
   20 workers x 500m = 10 CPU and 20 x 4Gi = 80Gi requested. STORAGE tracks the WORST-CASE
-  `l` size instead — 20 x (20Gi data + 20Gi nix) = 800Gi of PVC — and is the binding
+  `l` size instead — 20 x (25Gi data + 20Gi nix) = 900Gi of PVC — and is the binding
   constraint, not CPU or memory. Raising m's memory request WITHOUT raising requests.memory
   caps the admissible fleet below `deployments` (a QUOTA refusal no repo test catches, issue
   #1341), so keep requests.memory = deployments x the m request. The cluster's real budget
   is M6's rollout conversation.
 
-  The data term is `l`'s 20Gi, not `m`'s 10Gi, and the nix term is 20Gi, not the 4Gi
+  The data term is `l`'s 25Gi, not `m`'s 10Gi, and the nix term is 20Gi, not the 4Gi
   this comment carried until issue #224. Nothing scopes a size to a tier, so any of
   these 20 workers may be an `l`; sizing on `m` capped the tier at 15 of the 20 it
   advertises, and PRD #87's nixSize bump was never followed here at all. The

@@ -349,7 +349,7 @@ func TestRenderedPriorityClassName(t *testing.T) {
 }
 
 func TestPVCsSizeFromThePresetAndNixIsFlat(t *testing.T) {
-	for _, tc := range []struct{ size, data string }{{"s", "5Gi"}, {"m", "10Gi"}, {"l", "20Gi"}} {
+	for _, tc := range []struct{ size, data string }{{"s", "5Gi"}, {"m", "10Gi"}, {"l", "25Gi"}} {
 		pvcs := RenderPVCs(testConfig(), desired("abc"), testSpec(t, "base", tc.size))
 		if len(pvcs) != 2 {
 			t.Fatalf("%d pvcs, want 2", len(pvcs))
@@ -440,8 +440,8 @@ func TestWorkerDeclaresTheWholeEphemeralBudgetAndNoOtherContainerDoes(t *testing
 		want string
 	}{
 		{"plain", testConfig(), desired("abc"), "512Mi"},
-		{"docker rootless", dockerTestConfig(), desiredDocker("abc"), "4Gi"},
-		{"docker non-rootless", dockerTestConfigNonRootless(), desiredDocker("abc"), "4Gi"},
+		{"docker rootless", dockerTestConfig(), desiredDocker("abc"), "5Gi"},
+		{"docker non-rootless", dockerTestConfigNonRootless(), desiredDocker("abc"), "5Gi"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := RenderDeployment(tc.cfg, tc.w, testSpec(t, "base", "m")).Spec.Template.Spec
@@ -566,8 +566,8 @@ func TestEphemeralRequestOverridesArePerTierAndRollOnlyThatTier(t *testing.T) {
 	// A partial override leaves the other tier on its default, in both directions.
 	plainOnly := dockerTestConfig()
 	plainOnly.EphemeralRequest = "1Gi"
-	if got := ephemeralOf(plainOnly, desiredDocker("abc")); got != "4Gi" {
-		t.Errorf("docker request with only the plain override set = %s, want the 4Gi default", got)
+	if got := ephemeralOf(plainOnly, desiredDocker("abc")); got != "5Gi" {
+		t.Errorf("docker request with only the plain override set = %s, want the 5Gi default", got)
 	}
 	dockerOnly := dockerTestConfig()
 	dockerOnly.DockerEphemeralRequest = "8Gi"
@@ -636,6 +636,30 @@ func TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes(t *testing.T) {
 		t.Errorf("the docker default (%s = %.2f GiB) exceeds 85%% of a node's allocatable (%.2f GiB): "+
 			"the pod would be permanently unschedulable, which presents as a worker that provisions and never appears",
 			workerDefaultDockerEphemeralRequest, docker, nodeAllocatable)
+	}
+
+	// Pods do not split across nodes, so the aggregate below is necessary but not
+	// sufficient: 10 x 6Gi + 20 x 512Mi = 70 GiB passes a 70.2 GiB pool while a 17.55 GiB
+	// node holds only two 6Gi pods, so four nodes place eight of the ten (issue #1757).
+	// Pack the docker tier first (the larger request), then fill the remainder with
+	// plain workers.
+	perNodeDocker := int(nodeAllocatable / docker)
+	if placed := perNodeDocker * workerNodes; placed < dockerWorkers {
+		t.Errorf("the docker tier's %d workers do not pack onto %d nodes: at %s each a %.2f GiB node holds %d, "+
+			"so only %d place and the rest stay Pending", dockerWorkers, workerNodes,
+			workerDefaultDockerEphemeralRequest, nodeAllocatable, perNodeDocker, placed)
+	} else {
+		plainSlots := 0
+		left := dockerWorkers
+		for n := 0; n < workerNodes; n++ {
+			d := min(left, perNodeDocker)
+			left -= d
+			plainSlots += int((nodeAllocatable - float64(d)*docker) / plain)
+		}
+		if plainSlots < plainWorkers {
+			t.Errorf("after packing %d docker workers, %d nodes hold only %d plain workers at %s, below the %d the "+
+				"restricted tier permits", dockerWorkers, workerNodes, plainSlots, workerDefaultEphemeralRequest, plainWorkers)
+		}
 	}
 
 	// And the whole fleet the quotas permit must fit across the pool. This is the
