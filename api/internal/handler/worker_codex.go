@@ -51,6 +51,11 @@ const (
 	codexErrRefreshUnavailable = "codex refresh is unavailable"
 	codexErrRefreshNoClient    = "codex refresh is not available"
 	codexErrInternal           = "codex operation failed"
+	codexErrVaultLocked        = "codex credential vault is locked; retry after unlock"
+
+	// codexReasonVaultLocked is the machine-readable reason beside codexErrVaultLocked
+	// (issue #1766), so the worker can tell a transient locked vault from a hard failure.
+	codexReasonVaultLocked = "vault_locked"
 )
 
 // codexWorkerOperationTimeout is the server-side slice of pinned app-server's fixed
@@ -247,52 +252,64 @@ func (h *Handler) WorkerCodexRefresh(w http.ResponseWriter, r *http.Request) {
 // an operator can diagnose; the response body is always one of the fixed strings, never
 // err.Error(), so provider text / URLs / statuses / secrets never leave the process.
 func (h *Handler) writeCodexError(w http.ResponseWriter, op string, err error) {
-	status, msg := codexHTTPError(err)
+	status, msg, reason := codexHTTPError(err)
 	if status == http.StatusInternalServerError {
 		// Only the internal bucket is noisy-logged: the mapped sentinels are expected,
 		// routine authority/state rejections. The real error stays server-side.
 		slog.Error("worker codex "+op, "error", err)
 	}
+	if reason != "" {
+		httpx.ErrorReason(w, status, msg, reason)
+		return
+	}
 	httpx.Error(w, status, msg)
 }
 
-// codexHTTPError is the PURE error→(status, message) mapping (PRD #1171 M1 §5), split out
-// so it is unit-testable without a DB and so the "leaks no provider text/secret" property
-// is a property of one small function. It branches ONLY on the EXPORTED workersvc
+// codexHTTPError is the PURE error→(status, message, reason) mapping (PRD #1171 M1 §5),
+// split out so it is unit-testable without a DB and so the "leaks no provider text/secret"
+// property is a property of one small function. It branches ONLY on the EXPORTED workersvc
 // sentinels; every other error (including the package-private transient errors, raw store
 // errors and the wrapped provider-exchange error) falls to the generic 500 bucket, whose
 // fixed body carries no detail. The authorization/ownership cases collapse to one 404 so
 // the mapping cannot be used as an oracle to tell "not owned" from "not bound" from "does
-// not exist".
-func codexHTTPError(err error) (int, string) {
+// not exist". reason is a fixed machine-readable code, "" for every case but the locked
+// vault (issue #1766), whose body is then {"error", "reason"}.
+func codexHTTPError(err error) (int, string, string) {
 	switch {
 	// Ownership / binding / existence → one indistinguishable 404 (non-oracular).
 	case errors.Is(err, workersvc.ErrRunNotOwned),
 		errors.Is(err, workersvc.ErrCodexRunNotBound),
 		errors.Is(err, workersvc.ErrCodexWorkerMismatch):
-		return http.StatusNotFound, codexErrRunNotFound
+		return http.StatusNotFound, codexErrRunNotFound, ""
 
 	// Capability / scope / kind rejections → 403 (authorized worker, unauthorized op).
 	case errors.Is(err, workersvc.ErrCodexCapabilityMismatch),
 		errors.Is(err, workersvc.ErrCodexCapabilityEpoch),
 		errors.Is(err, workersvc.ErrCodexScopeNotApplicable),
 		errors.Is(err, workersvc.ErrCodexKindModeMismatch):
-		return http.StatusForbidden, codexErrNotAuthorized
+		return http.StatusForbidden, codexErrNotAuthorized, ""
+
+	// The owner's vault is locked (issue #1766). Only reachable after authorization
+	// passed, so it sits below the 404/403 cases and never answers an unauthorized caller.
+	// Transient: the worker retries after unlock. Above the contended/quarantined cases, so
+	// the post-exchange vault-locked seal (also ErrCodexRefreshQuarantined) maps here.
+	case errors.Is(err, workersvc.ErrCodexVaultLocked):
+		return http.StatusConflict, codexErrVaultLocked, codexReasonVaultLocked
 
 	// Refresh outcome: contended is the retry-and-reconcile signal (same op id).
 	case errors.Is(err, workersvc.ErrCodexRefreshContended):
-		return http.StatusConflict, codexErrRefreshContended
+		return http.StatusConflict, codexErrRefreshContended, ""
 
 	// Refresh outcome: quarantined / unrecoverable / no-refresh-token — paused, no token.
 	case errors.Is(err, workersvc.ErrCodexRefreshQuarantined),
 		errors.Is(err, workersvc.ErrCodexRefreshUnrecoverable),
 		errors.Is(err, workersvc.ErrCodexRefreshNoToken):
-		return http.StatusConflict, codexErrRefreshUnavailable
+		return http.StatusConflict, codexErrRefreshUnavailable, ""
 
 	// The service was never wired with a refresh client — a deployment misconfiguration,
 	// not the worker's fault; fail closed with a distinct, retryable-later 503.
 	case errors.Is(err, workersvc.ErrCodexRefreshNoClient):
-		return http.StatusServiceUnavailable, codexErrRefreshNoClient
+		return http.StatusServiceUnavailable, codexErrRefreshNoClient, ""
 
 	// Stale/quarantined credential STATE that makes the run not-serviceable right now
 	// (a revoke, an alias replace, a not-yet-frozen identity, a park-state exclusion, a
@@ -304,14 +321,14 @@ func codexHTTPError(err error) (int, string) {
 		errors.Is(err, workersvc.ErrCodexAccountRevisionStale),
 		errors.Is(err, workersvc.ErrCodexAccountQuarantined),
 		errors.Is(err, workersvc.ErrCodexBindingConflict):
-		return http.StatusConflict, codexErrCredUnavailable
+		return http.StatusConflict, codexErrCredUnavailable, ""
 
 	default:
-		// Everything else — the package-private transient errors (vault-locked, run-vanished,
+		// Everything else — the package-private transient errors (run-vanished,
 		// credential-unavailable, store-unavailable), a raw store error, or the wrapped
 		// provider-exchange error whose text may name the provider host/status. NONE of that
 		// text reaches the body; it is the generic 500, logged server-side by writeCodexError.
-		return http.StatusInternalServerError, codexErrInternal
+		return http.StatusInternalServerError, codexErrInternal, ""
 	}
 }
 

@@ -162,6 +162,13 @@ var (
 	// caller that already maps the unrecoverable outcome keeps doing so. Never returns a
 	// token. Rides CodexRefreshQuarantined.
 	ErrCodexRefreshRejected = errors.New("codex refresh rejected by the provider; re-login required")
+	// ErrCodexVaultLocked: the run owner's vault is locked, so the codex credential could
+	// not be opened or sealed (issue #1766). Returned ONLY after AuthorizeCodexCredentialOp
+	// has passed for the calling worker and run, so it never answers an unauthorized caller.
+	// Transient: the vault may unlock, and a retry of the same operation then proceeds or
+	// reconciles. It wraps the underlying cause, so it may ride together with another
+	// sentinel (the post-exchange vault-locked seal also carries ErrCodexRefreshQuarantined).
+	ErrCodexVaultLocked = errors.New("codex credential vault is locked")
 	// errCodexObservedAhead: the caller's observed generation is HIGHER than the
 	// account's current generation, which cannot happen for an honest caller (the account
 	// is authoritative). Defensive; refuses to rotate on an impossible observation.
@@ -466,7 +473,18 @@ func (s *Service) CoordinatedCodexRefresh(ctx context.Context, wkr store.Worker,
 			return CodexRefreshResult{Outcome: CodexRefreshContended}, rerr
 		}
 	}
-	return res, err
+	return res, codexVaultLockedErr(err)
+}
+
+// codexVaultLockedErr marks a package-private errVaultLocked from any inner vault open or
+// seal as the exported ErrCodexVaultLocked (issue #1766), keeping the original chain so
+// every other errors.Is match still holds. The codex credential entry points call it only
+// on errors produced after AuthorizeCodexCredentialOp passed.
+func codexVaultLockedErr(err error) error {
+	if errors.Is(err, errVaultLocked) && !errors.Is(err, ErrCodexVaultLocked) {
+		return fmt.Errorf("%w: %w", ErrCodexVaultLocked, err)
+	}
+	return err
 }
 
 func codexRefreshOperationBudget(ctx context.Context) time.Duration {
@@ -676,7 +694,7 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 				s.markCodexIntentUnrecoverable(ctx, q, userID, operationID)
 				return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %v", ErrCodexRefreshUnrecoverable, perr)
 			}
-			return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: refreshed login retained pending vault unlock", ErrCodexRefreshQuarantined)
+			return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %w: refreshed login retained pending vault unlock", ErrCodexRefreshQuarantined, errVaultLocked)
 		}
 		_, _ = q.SetCodexRefreshIntentState(ctx, store.SetCodexRefreshIntentStateParams{State: codexIntentUnrecoverable, OperationID: operationID, UserID: userID})
 		_, _ = q.QuarantineCodexAccount(ctx, store.QuarantineCodexAccountParams{ID: accountID, UserID: userID, Op: operationID})
@@ -1005,6 +1023,23 @@ func (s *Service) ReleaseCodexCredential(ctx context.Context, wkr store.Worker, 
 		return CodexReleaseResult{}, err
 	}
 
+	result, err := s.releaseCodexCredential(ctx, &authCtx)
+	if err != nil {
+		return CodexReleaseResult{}, codexVaultLockedErr(err)
+	}
+
+	// Re-verify authority immediately before returning the token — no provider round-trip
+	// separates the read above from this recheck, so a revoke/re-mint that landed in the
+	// interval refuses the release rather than leaking a token the run no longer owns.
+	if _, err := s.AuthorizeCodexCredentialOp(ctx, wkr, runID, capability, ScopeReleaseAccessToken); err != nil {
+		return CodexReleaseResult{}, err
+	}
+	return result, nil
+}
+
+// releaseCodexCredential opens the run's currently usable access token for an already
+// authorized release (ReleaseCodexCredential authorizes before and rechecks after).
+func (s *Service) releaseCodexCredential(ctx context.Context, authCtx *CodexAuthContext) (CodexReleaseResult, error) {
 	result := CodexReleaseResult{AuthMode: authCtx.AuthMode}
 	switch authCtx.AuthMode {
 	case codexAuthModeSubscription:
@@ -1042,13 +1077,6 @@ func (s *Service) ReleaseCodexCredential(ctx context.Context, wkr store.Worker, 
 		}
 	default:
 		return CodexReleaseResult{}, ErrCodexRunNotBound
-	}
-
-	// Re-verify authority immediately before returning the token — no provider round-trip
-	// separates the read above from this recheck, so a revoke/re-mint that landed in the
-	// interval refuses the release rather than leaking a token the run no longer owns.
-	if _, err := s.AuthorizeCodexCredentialOp(ctx, wkr, runID, capability, ScopeReleaseAccessToken); err != nil {
-		return CodexReleaseResult{}, err
 	}
 	return result, nil
 }
