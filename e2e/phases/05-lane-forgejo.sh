@@ -204,9 +204,12 @@ pass "fix run $FJFIX completed on $FJFIXBR and opened a PR"
 
 # The fix branch's re-run FAILS again ("failure", a higher id than the failure that
 # spawned the run): the verdict must stamp fix_failed — the exact pipeline_sync
-# IsFailed("failure") path a bare == "failed" never reached. The fake's PR head.sha
-# for the fix branch == the run head_sha, so LatestMRPipeline resolves it.
-fake_post /_e2e/actions-runs "$(jq -nc --arg b "$FJFIXBR" --arg s "sha-$FJFIXBR" '{branch:$b,sha:$s,status:"failure",jobs:[{name:"build",status:"failure",log:"still broken\nFAIL"}]}')" >/dev/null
+# IsFailed("failure") path a bare == "failed" never reached. The run is seeded on the
+# head the fake reports for the fix PR (the pushed tip, synced from the bare), so
+# LatestMRPipeline's head_sha filter resolves it.
+FJFIXSHA="$(fake_state | jq -r --arg b "$FJFIXBR" '[.mrs[] | select(.source_branch==$b)] | last | .head_sha // empty')"
+[ -n "$FJFIXSHA" ] || fail "the fake reported no head for the fix PR on $FJFIXBR"
+fake_post /_e2e/actions-runs "$(jq -nc --arg b "$FJFIXBR" --arg s "$FJFIXSHA" '{branch:$b,sha:$s,status:"failure",jobs:[{name:"build",status:"failure",log:"still broken\nFAIL"}]}')" >/dev/null
 wait_verdict "$FJFIX" fix_failed 30
 pass "a re-'failure' fix pipeline stamped fix_failed (pipeline_sync IsFailed path) — the CI-fix loop works for Forgejo ✓"
 

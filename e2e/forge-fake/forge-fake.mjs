@@ -363,16 +363,49 @@ function forgejoPRState(mrState) {
   if (mrState === "opened") return { state: "open", merged: false };
   return { state: "closed", merged: false };
 }
-// mrHeadSha is the deterministic head commit the fake assigns a PR, so the harness
-// can drive Actions runs for the PR's head without reading it back. Real Forgejo
-// keys a PR's runs to its head SHA; LatestMRPipeline resolves the PR head then
-// filters runs by it, so the fake's PR head.sha and the run head_sha must agree.
+// mrHeadSha is the placeholder head a PR carries when its source branch is not on
+// the bare (a harness-seeded MR with no pushed branch). Real Forgejo keys a PR's runs
+// to its head SHA; LatestMRPipeline resolves the PR head then filters runs by it, so
+// a harness seeding a run for a PR must use the head the fake reports (fake_state).
 function mrHeadSha(sourceBranch) {
   return `sha-${sourceBranch}`;
 }
-// toForgejoPR maps a stored MR to a Forgejo pull request. head.sha is deterministic
-// (see mrHeadSha) so LatestMRPipeline can find the run.
+// bareHeadSha resolves a branch tip on the project's bare under GIT_ROOT — the SAME
+// host dir the worker pushes to (fakeremote/<repo>.git, lib.sh), so it is the commit a
+// real forge would report as the MR/PR head. null when the bare or branch is absent.
+function bareHeadSha(projectId, branch) {
+  const project = PROJECTS.find((p) => p.id === projectId) || PROJECT;
+  const bare = `${GIT_ROOT}/${project.path_with_namespace.split("/").pop()}.git`;
+  try {
+    const sha = execFileSync("git", ["--git-dir", bare, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}^{commit}`], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  } catch {
+    return null;
+  }
+}
+// syncHead refreshes a stored MR's head from the bare, as a real forge tracks pushes
+// to the source branch. The completion interlock (PRD #1226 M4) reads the MR/PR head
+// and requires it to equal the pushed tip, so a placeholder head fails every
+// interlocked run. GitLab carries it as `sha` + `diff_refs.head_sha`; Forgejo/GitHub
+// render it as head.sha. An unresolvable branch keeps the last known head; one never
+// resolved gets the placeholder and no GitLab sha, so the interlock reads it as unreadable.
+function syncHead(mr) {
+  const sha = bareHeadSha(mr.project_id, mr.source_branch);
+  if (sha) {
+    mr.head_sha = sha;
+    mr.sha = sha;
+    mr.diff_refs = { ...(mr.diff_refs || {}), head_sha: sha };
+  } else if (!mr.head_sha) {
+    mr.head_sha = mrHeadSha(mr.source_branch);
+  }
+  return mr;
+}
+// toForgejoPR maps a stored MR to a Forgejo pull request; head.sha is the synced head.
 function toForgejoPR(mr) {
+  syncHead(mr);
   const s = forgejoPRState(mr.state);
   return {
     id: mr.id,
@@ -492,9 +525,9 @@ function githubPRState(mrState) {
   if (mrState === "opened") return { state: "open", merged: false };
   return { state: "closed", merged: false };
 }
-// toGitHubPR maps a stored MR to a GitHub pull request. head.sha is deterministic
-// (mrHeadSha) so LatestMRPipeline can resolve the head then filter runs by it.
+// toGitHubPR maps a stored MR to a GitHub pull request; head.sha is the synced head.
 function toGitHubPR(mr) {
+  syncHead(mr);
   const s = githubPRState(mr.state);
   return {
     id: mr.id,
@@ -673,7 +706,7 @@ const server = https.createServer(
     if (method === "GET" && path === "/_e2e/state") {
       return send(res, 200, {
         issues: Object.values(state.issues),
-        mrs: state.mrs,
+        mrs: state.mrs.map(syncHead), // heads synced from the bare, as the forge API reports them
         notes: state.notes,
         labelEvents: state.labelEvents,
         githubRuns: state.githubRuns,  // PRD #238 M8: canned GitHub Actions runs
@@ -782,7 +815,7 @@ const server = https.createServer(
       mr.state = want;
       persist();
       log("MR", mr.iid, "state ->", want);
-      return send(res, 200, mr);
+      return send(res, 200, syncHead(mr));
     }
 
     // Append an MR review discussion note (PRD #966 M6). The mr_rework detector
@@ -1173,6 +1206,16 @@ const server = https.createServer(
         const mr = state.mrs.find((m) => m.iid === Number(fjPrGet[1]));
         return mr ? send(res, 200, toForgejoPR(mr)) : send(res, 404, { message: "pull request does not exist" });
       }
+      if (method === "PATCH" && fjPrGet) {
+        // EditPullRequest — the completion interlock's description reconcile (PATCH {body}).
+        const mr = state.mrs.find((m) => m.iid === Number(fjPrGet[1]));
+        if (!mr) return send(res, 404, { message: "pull request does not exist" });
+        const body = await readBody(req);
+        if (typeof body.body === "string") mr.description = body.body;
+        persist();
+        log("fj PR updated", mr.iid);
+        return send(res, 200, toForgejoPR(mr));
+      }
       const fjPrMerge = rest.match(/^\/pulls\/(\d+)\/merge$/);
       if (method === "POST" && fjPrMerge) {
         const mr = state.mrs.find((m) => m.iid === Number(fjPrMerge[1]));
@@ -1444,6 +1487,16 @@ const server = https.createServer(
           const mr = state.mrs.find((m) => m.iid === Number(ghPrGet[1]));
           return mr ? send(res, 200, toGitHubPR(mr)) : send(res, 404, { message: "Not Found" });
         }
+        if (method === "PATCH" && ghPrGet) {
+          // Update a pull request — the completion interlock's description reconcile (PATCH {body}).
+          const mr = state.mrs.find((m) => m.iid === Number(ghPrGet[1]));
+          if (!mr) return send(res, 404, { message: "Not Found" });
+          const body = await readBody(req);
+          if (typeof body.body === "string") mr.description = body.body;
+          persist();
+          log("gh PR updated", mr.iid);
+          return send(res, 200, toGitHubPR(mr));
+        }
 
         // Actions (CI-fix loop + pipeline badge). Runs come back id-DESC with the two
         // fields status+conclusion (D8). ListRepositoryWorkflowRuns honours branch,
@@ -1682,7 +1735,18 @@ const server = https.createServer(
         // ANY state (opened|closed|merged|locked), unlike the list route below which
         // the worker uses and filters to opened.
         const mr = state.mrs.find((m) => m.iid === Number(mrGet[1]));
-        return mr ? send(res, 200, mr) : send(res, 404, { message: "404 Not found" });
+        return mr ? send(res, 200, syncHead(mr)) : send(res, 404, { message: "404 Not found" });
+      }
+      if (method === "PUT" && mrGet) {
+        // UpdateMergeRequest — the completion interlock's description reconcile (strip or
+        // add `Closes #N`, the unverified banner). GitLab rewrites with PUT {description}.
+        const mr = state.mrs.find((m) => m.iid === Number(mrGet[1]));
+        if (!mr) return send(res, 404, { message: "404 Not found" });
+        const body = await readBody(req);
+        if (typeof body.description === "string") mr.description = body.description;
+        persist();
+        log("MR updated", mr.iid);
+        return send(res, 200, syncHead(mr));
       }
       if (method === "POST" && rest === "/merge_requests") {
         const body = await readBody(req);
@@ -1712,12 +1776,12 @@ const server = https.createServer(
         state.mrs.push(mr);
         persist();
         log("MR created", iid, mr.source_branch, "->", mr.target_branch, "in", project.path_with_namespace);
-        return send(res, 201, mr);
+        return send(res, 201, syncHead(mr));
       }
       if (method === "GET" && rest === "/merge_requests") {
         const src = url.searchParams.get("source_branch");
         const list = state.mrs.filter((m) => (src ? m.source_branch === src : true) && m.state === "opened");
-        return send(res, 200, list);
+        return send(res, 200, list.map(syncHead));
       }
     }
 
