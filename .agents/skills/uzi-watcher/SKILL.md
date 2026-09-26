@@ -139,6 +139,13 @@ message uzi received), is the `-m`-message entry in the `uzi-cli` skill's *Send 
 hazards. Single-quote the whole message so nothing is evaluated, and always re-read the
 revised plan at the next gate to confirm your instruction landed clean.
 
+**Check a byte-identical revised plan for a dropped revise** (#1604). If recorded
+`plan_feedback` and `plan_revising` are followed by a credential-switch resume
+that re-presents the stored plan, diff the `plan_md` payloads and verify the requested
+changes are missing. Capture the current plan seq, re-send the last `plan_feedback`
+payload's `feedback` text (`uzi run revise RUN < feedback.txt`), and pass that seq
+as the poller's fifth argument.
+
 ## Plan-trap checks (run before every approve)
 
 Check these traps before every approve:
