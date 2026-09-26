@@ -114,7 +114,7 @@ One verdict, one-line reason. Apply only after Step 5 confirmation.
 Do not trust issue line numbers.
 
 1. **Premise**: grep the target code. Already implemented → **Already done**.
-2. **Referenced PR/PRD**: confirm merged (`gh pr view NNN --json state,mergedAt`). Before deferring to, or folding scope into, another issue, confirm that issue is still open and unmerged; if it already landed, re-check what it actually changed.
+2. **Referenced PR/PRD**: confirm merged (`gh pr view NNN --json state,mergedAt`). Before deferring to, or folding scope into, another issue, confirm that issue is open and its implementation has not landed: inspect its linked PRs and the current code.
 3. **Anchors**: re-grep named symbols; record current locations and omitted/extra sites.
 4. **Design forks**: pin a direction with reason; verify any ADR/PRD conflict against code, not the issue's framing.
 5. **Workflow scope**: a fix that must touch `.github/workflows/**` cannot go to a sweep (worker PAT lacks `workflow` scope; the whole push is rejected). → **Do locally**, or split into a local-only issue. See `.claude/rules/prds.md`.

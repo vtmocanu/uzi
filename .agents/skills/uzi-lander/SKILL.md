@@ -284,11 +284,13 @@ and they precede every merge (step 6):
   milestone reframed and documented is not.
 - **The run's own validation report.** The uzi PR body is generic. Read the run's final
   `text` messages (`uzi run logs RUN --json`) for checks it marks NOT RUN or failed, and run
-  them on a capable host before merging, or state in the merge note why they cannot run.
+  them on a capable host before merging. Skipping one needs the user's explicit exception,
+  naming what stays unvalidated.
 - **Attribute a failing local check before blaming the PR.** Re-run the same selection on
-  unmodified `main` in its own pinned worktree. An identical failure there is a
-  pre-existing regression: file it (`bug`+`uzi`) with both results and do not hold the PR
-  on it without telling the user what stays unvalidated.
+  unmodified `main` in its own pinned worktree. Treat it as pre-existing only on matching
+  failure evidence (same step, same error, same logs), not a similar symptom. Checks that
+  failure blocks are still unvalidated for this PR: say which and get the user's call before
+  merging. File the regression with both results; add `uzi` only once it is sweep-ready.
 - **Pin every local review to the immutable head.** One focused local reviewer is the
   default for small/mechanical non-Renovate diffs. For Renovate-class work, record the
   explicit review-needed or CI-sufficient decision. Large/high-risk diffs use the stronger
