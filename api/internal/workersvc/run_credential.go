@@ -131,6 +131,9 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 				}
 				return SetRunCredentialResult{}, fmt.Errorf("reassign credential-disabled run: %w", err)
 			}
+			if _, err := s.q.CreateRunInput(ctx, store.CreateRunInputParams{RunID: runID, Kind: "resume", Body: pgtype.Text{}}); err != nil {
+				slog.Warn("set run credential: write resume audit row", "run", runID, "error", err)
+			}
 			break
 		}
 		fallthrough
