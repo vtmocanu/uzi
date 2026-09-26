@@ -1165,6 +1165,92 @@ describe("IssueView — an action outcome cannot land on the next issue (#1727)"
     expect(screen.queryByText("Issue A")).toBeNull();
     expect(screen.queryByTitle(/uzi will run it/)).toBeNull();
   });
+
+  // #1727 review (blocking). The reset effect used to leave A's `issue` in place until
+  // B's getIssue resolved, so A's header and its Promote/Start buttons stayed live while
+  // the route (and routeKeyRef) already read B: a click there acted on A, and a late
+  // promote success adopted A's header over B's. The reset now clears `issue` so nothing
+  // of A renders while B loads.
+  //
+  // Fail-before (HEAD 70aa9575): "Issue A" and "Promote to uzi" were still on screen after
+  // navigating to B with B's getIssue pending.
+  it("shows none of A's header or actions while B loads, and keeps B's header after A's late promote", async () => {
+    setAuth();
+    let resolveB!: (v: { issue: IssueDetail }) => void;
+    const pB = new Promise<{ issue: IssueDetail }>((r) => (resolveB = r));
+    mockApi.getIssue.mockImplementation((_repo: string, iid: number) =>
+      iid === 7
+        ? Promise.resolve({ issue: anIssue({ iid: 7, title: "Issue A", labels: ["documentation"] }) })
+        : pB,
+    );
+    let resolvePromoteA!: (v: { card: ReturnType<typeof aCard> }) => void;
+    mockApi.promoteIssue.mockReturnValueOnce(new Promise((res) => (resolvePromoteA = res)));
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/issues/7"]}>
+        <Routes>
+          <Route
+            path="/repos/:repoId/issues/:iid"
+            element={
+              <>
+                <NavToB />
+                <IssueView />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await screen.findByText("Issue A");
+    fireEvent.click(screen.getByRole("button", { name: /Promote to uzi/ }));
+    await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledWith("repo-1", 7));
+
+    fireEvent.click(screen.getByRole("button", { name: "go to B" }));
+    await waitFor(() => expect(mockApi.getIssue).toHaveBeenCalledWith("repo-1", 8));
+    // B is still loading: nothing of A is left to read or click.
+    expect(screen.queryByText("Issue A")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Promote to uzi|…/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /start run|starting/i })).toBeNull();
+    expect(screen.getByText("Loading issue…")).toBeTruthy();
+
+    await act(async () => {
+      resolveB({ issue: anIssue({ iid: 8, title: "Issue B", labels: ["documentation"] }) });
+    });
+    await screen.findByText("Issue B");
+    // B's own Promote is idle, not A's in-flight spinner.
+    expect(screen.getByRole("button", { name: /Promote to uzi/ })).toBeTruthy();
+
+    await act(async () => {
+      resolvePromoteA({ card: aCard(["uzi", "documentation"]) });
+    });
+    expect(screen.getByText("Issue B")).toBeTruthy();
+    expect(screen.queryByText("Issue A")).toBeNull();
+    expect(screen.queryByTitle(/uzi will run it/)).toBeNull();
+    expect(mockApi.promoteIssue).toHaveBeenCalledTimes(1);
+  });
+
+  // #1727 review (blocking), the Start half. `starting` was not reset on navigation, so
+  // B's Start button rendered "Starting…" (and disabled) for as long as A's attempt was
+  // in flight.
+  //
+  // Fail-before (HEAD 70aa9575): B's button read "Starting…" after B loaded.
+  it("does not leave B's Start button in A's Starting state", async () => {
+    setAuth();
+    mockApi.createRun.mockReturnValueOnce(new Promise(() => {}));
+    renderAB(["uzi"]);
+
+    const startBtn = () => screen.getByRole("button", { name: /start run|starting/i }) as HTMLButtonElement;
+    await screen.findByText("Issue A");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    fireEvent.click(startBtn());
+    await waitFor(() => expect(startBtn().textContent).toBe("Starting…"));
+
+    fireEvent.click(screen.getByRole("button", { name: "go to B" }));
+    await screen.findByText("Issue B");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    expect(startBtn().textContent).toBe("Start run");
+    expect(mockApi.createRun).toHaveBeenCalledTimes(1);
+  });
 });
 
 // PRD #1247 (CodeRabbit finding [5]). IssueView is REUSED across a route-param change

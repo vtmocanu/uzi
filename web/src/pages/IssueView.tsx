@@ -55,9 +55,9 @@ export function IssueView() {
   const navigate = useNavigate();
   const { uziLabel, autopilotLabel } = useAuth();
 
-  // `issue` is also written by the `promote` handler (setIssue at :promote), so it
-  // stays local and the fetcher sets it as a side effect rather than routing through
-  // the hook's read-only `data`.
+  // `issue` is also written by the `promote` handler and cleared by the route reset
+  // effect (both below), so it stays local and the fetcher sets it as a side effect
+  // rather than routing through the hook's read-only `data`.
   const [issue, setIssue] = useState<IssueDetail | null>(null);
   // `actionError` is a startRun/promote handler error, kept apart from the hook's load
   // error (`loadError`); the two share the one Alert slot below. It is deliberately NOT
@@ -66,10 +66,13 @@ export function IssueView() {
   // It clears at the start of the next attempt and on route navigation (below) instead.
   const [actionError, setActionError] = useState("");
   // The route identity the page currently shows. A start/promote handler captures it when
-  // its attempt begins and drops the outcome if it changed by the time the response lands:
-  // the component is reused across issues, so without this a late failure for issue A
-  // would surface on issue B after the reset effect below had already cleared (#1727).
-  // That reset effect is also what keeps the ref current.
+  // its attempt begins and, if it changed by the time the response lands, drops the
+  // attempt's error, a promote's label adoption, and the busy-flag clear (plus a start's
+  // run-history reload): the component is reused across issues, so without this a late
+  // failure for issue A would surface on issue B after the reset effect below had already
+  // cleared (#1727). A successful start still navigates to the new run on purpose: that
+  // run really was created, so the user is taken to it wherever they are. The reset effect
+  // below is also what keeps the ref current.
   const routeKeyRef = useRef(`${repoId}/${iidNum}`);
   const [starting, setStarting] = useState(false);
   const [promoting, setPromoting] = useState(false);
@@ -86,9 +89,15 @@ export function IssueView() {
   // data effect below keys on [repoId, iidNum] and refetches), so reset the picked
   // credential to inherit when the route identity changes (no-op at mount). Issue #961
   // item 4a: the same reset drops a start/promote error, so it cannot bleed onto the next
-  // issue — a route change, not every refetch, is what makes that error stale.
+  // issue — a route change, not every refetch, is what makes that error stale. Issue #1727
+  // review: it also drops the previous issue and its busy flags, so while the next issue
+  // loads neither the old header nor its Start/Promote buttons (which would act on the
+  // old issue) stay on screen, and the next issue does not inherit the old spinner.
   useEffect(() => {
     routeKeyRef.current = `${repoId}/${iidNum}`;
+    setIssue(null);
+    setStarting(false);
+    setPromoting(false);
     setCredential(INHERIT_SELECTION);
     setHarness(INHERIT_HARNESS);
     setActionError("");
@@ -122,7 +131,9 @@ export function IssueView() {
       };
     },
     [repoId, iidNum],
-    { fallback: "Failed to load the issue" },
+    // "deps": a route change re-arms the loading line, since the reset effect above has
+    // just cleared the previous issue and the page would otherwise sit blank.
+    { fallback: "Failed to load the issue", skeleton: "deps" },
   );
   const runs = data?.runs ?? [];
   const hasWorker = data?.hasWorker ?? false;
@@ -144,7 +155,11 @@ export function IssueView() {
 
   const startRun = async () => {
     if (!issue) return;
-    const attemptKey = routeKeyRef.current;
+    // Act only on the issue the route shows: this render's repoId paired with the issue
+    // it holds must be the current route identity, or the click would start a run on a
+    // repo/issue mix (#1727 review).
+    const attemptKey = `${repoId}/${issue.iid}`;
+    if (routeKeyRef.current !== attemptKey) return;
     setActionError("");
     setStarting(true);
     // The shared helper carries the chosen credential override AND harness, and
@@ -159,6 +174,7 @@ export function IssueView() {
         if (routeKeyRef.current === attemptKey) setActionError(msg);
       },
       onSettled: () => {
+        if (routeKeyRef.current !== attemptKey) return;
         setStarting(false);
         reload();
       },
@@ -175,22 +191,28 @@ export function IssueView() {
 
   // Promote (Decision 15; PRD #764): add the `uzi` label forge-first, then adopt the
   // returned card's labels — no optimistic update. Both outcomes are dropped when the
-  // user has navigated to another issue meanwhile: `issue` is the one captured here, so
-  // adopting it would replace the new issue's header with this one (#1727).
+  // user has navigated to another issue meanwhile: adopting the labels there would mark
+  // the new issue with this one's promotion (#1727).
   const promote = async () => {
     if (!issue) return;
-    const attemptKey = routeKeyRef.current;
+    const target = issue;
+    const attemptKey = `${repoId}/${target.iid}`;
+    if (routeKeyRef.current !== attemptKey) return;
     setActionError("");
     setPromoting(true);
     try {
-      const { card } = await api.promoteIssue(repoId, issue.iid);
-      if (routeKeyRef.current === attemptKey) setIssue({ ...issue, labels: card.labels });
+      const { card } = await api.promoteIssue(repoId, target.iid);
+      // Adopt the labels onto the issue currently shown, and only if it is still the
+      // one promoted (a same-route refetch may have replaced the object meanwhile).
+      if (routeKeyRef.current === attemptKey) {
+        setIssue((cur) => (cur && cur.iid === target.iid ? { ...cur, labels: card.labels } : cur));
+      }
     } catch (err) {
       if (routeKeyRef.current === attemptKey) {
         setActionError(errorMessage(err, "Could not promote the issue"));
       }
     } finally {
-      setPromoting(false);
+      if (routeKeyRef.current === attemptKey) setPromoting(false);
     }
   };
 
