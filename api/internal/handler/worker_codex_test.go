@@ -359,6 +359,12 @@ func TestCodexHTTPErrorMapping(t *testing.T) {
 			fmt.Errorf("%w: %w: refreshed login retained pending vault unlock",
 				workersvc.ErrCodexRefreshQuarantined, errors.New("vault locked during claim"))),
 			http.StatusConflict, codexErrVaultLocked, codexReasonVaultLocked},
+		// An authorization failure riding beside ErrCodexVaultLocked still wins: the vault
+		// state never answers a caller that is not owned (404) or holds a stale epoch (403).
+		{fmt.Errorf("%w: %w", workersvc.ErrCodexVaultLocked, workersvc.ErrRunNotOwned),
+			http.StatusNotFound, codexErrRunNotFound, ""},
+		{fmt.Errorf("%w: %w", workersvc.ErrCodexVaultLocked, workersvc.ErrCodexCapabilityEpoch),
+			http.StatusForbidden, codexErrNotAuthorized, ""},
 	}
 	for _, tc := range cases {
 		status, msg, reason := codexHTTPError(tc.err)

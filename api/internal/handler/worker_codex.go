@@ -289,8 +289,10 @@ func codexHTTPError(err error) (int, string, string) {
 		errors.Is(err, workersvc.ErrCodexKindModeMismatch):
 		return http.StatusForbidden, codexErrNotAuthorized, ""
 
-	// The owner's vault is locked (issue #1766). Only reachable after authorization
-	// passed, so it sits below the 404/403 cases and never answers an unauthorized caller.
+	// The owner's vault is locked (issue #1766). The service returns it only when
+	// authorization passed before the operation and again on a recheck after the locked
+	// vault was met, so a caller that lost authority gets the 404/403 error instead. It
+	// also sits below the 404/403 cases, so an error carrying both still maps to those.
 	// Transient: the worker retries after unlock. Above the contended/quarantined cases, so
 	// the post-exchange vault-locked seal (also ErrCodexRefreshQuarantined) maps here.
 	case errors.Is(err, workersvc.ErrCodexVaultLocked):
