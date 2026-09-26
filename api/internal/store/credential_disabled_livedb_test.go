@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -8,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -16,7 +18,7 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 	ctx, pool, q, user := codexLiveDB(t)
 	repo, worker := codexRunFixture(ctx, t, pool, user)
 	mustExec(ctx, t, pool, `UPDATE workers SET snapshot_register_nonce='incarnation-a' WHERE id=$1`, worker)
-	run := insertCodexRun(ctx, t, pool, user, repo, worker, 901, "running", "credential park")
+	run := insertCodexRun(ctx, t, pool, user, repo, worker, 901, "claimed", "credential park")
 	started := time.Now().Add(-20 * time.Second).UTC().Truncate(time.Second)
 	mustExec(ctx, t, pool, `UPDATE runs SET started_at=$2, status_since=$2, claim_generation=7,
         session_id='resume-session', budget_wall_seconds=60, budget_paused_seconds=3,
@@ -34,7 +36,7 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 		}
 		return n
 	}
-	released := insertCodexRun(ctx, t, pool, user, repo, worker, 902, "running", "released claim")
+	released := insertCodexRun(ctx, t, pool, user, repo, worker, 902, "claimed", "released claim")
 	mustExec(ctx, t, pool, `UPDATE runs SET claim_generation=7, claim_released_at=now() WHERE id=$1`, released)
 	if n := park(released, pgWorker, 7); n != 0 {
 		t.Fatalf("released claim parked %d rows", n)
@@ -42,6 +44,14 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 	mustExec(ctx, t, pool, `UPDATE runs SET claim_released_at=NULL, hold_reason='completion_blocked' WHERE id=$1`, released)
 	if n := park(released, pgWorker, 7); n != 0 {
 		t.Fatalf("existing hold parked %d rows", n)
+	}
+	// A delivered flight is never parked (D3): only an undelivered 'claimed' claim is.
+	for i, flying := range []string{"running", "awaiting_approval", "awaiting_input", "awaiting_followup"} {
+		flight := insertCodexRun(ctx, t, pool, user, repo, worker, int64(910+i), flying, "flight")
+		mustExec(ctx, t, pool, `UPDATE runs SET claim_generation=7 WHERE id=$1`, flight)
+		if n := park(flight, pgWorker, 7); n != 0 {
+			t.Fatalf("%s flight parked %d rows", flying, n)
+		}
 	}
 	if n := park(run, pgWorker, 6); n != 0 {
 		t.Fatalf("stale generation parked %d rows", n)
@@ -112,8 +122,33 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 	}
 	promote := func(owner uuid.UUID) error {
 		t.Helper()
-		_, err := q.PromoteCredentialDisabledRun(ctx, store.PromoteCredentialDisabledRunParams{ID: run, UserID: owner, GlobalTimeoutSeconds: 60})
+		_, err := q.PromoteCredentialDisabledRun(ctx, promoteParams(ctx, t, pool, run, owner, 60))
 		return err
+	}
+	// The requirement guards: a promotion evaluated against a requirement that has since
+	// changed (a different override, alias or recorded worker) matches no row.
+	for name, skew := range map[string]func(*store.PromoteCredentialDisabledRunParams){
+		"override mode": func(p *store.PromoteCredentialDisabledRunParams) {
+			p.ExpectedOverrideMode = pgtype.Text{String: "pinned", Valid: true}
+		},
+		"override secret": func(p *store.PromoteCredentialDisabledRunParams) {
+			p.ExpectedOverrideSecretID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+		},
+		"codex alias": func(p *store.PromoteCredentialDisabledRunParams) {
+			p.ExpectedCodexSecretID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+		},
+		"worker": func(p *store.PromoteCredentialDisabledRunParams) { p.ExpectedWorkerID = pgtype.UUID{} },
+		"released worker": func(p *store.PromoteCredentialDisabledRunParams) {
+			p.ExpectedReleasedWorkerID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+		},
+	} {
+		mustExec(ctx, t, pool, `UPDATE runs SET pause_requested_at=NULL WHERE id=$1`, run)
+		arg := promoteParams(ctx, t, pool, run, user, 60)
+		skew(&arg)
+		if _, err := q.PromoteCredentialDisabledRun(ctx, arg); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("stale %s requirement promoted: %v", name, err)
+		}
+		mustExec(ctx, t, pool, `UPDATE runs SET pause_requested_at=now() WHERE id=$1`, run)
 	}
 	if err := promote(uuid.New()); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("foreign promotion: %v", err)
@@ -146,7 +181,7 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 func TestCredentialDisabledSameWorkerReclaimNeedsGenerationLiveDB(t *testing.T) {
 	fx := newWPFixture(t)
 	worker := fx.worker("reclaim", wpWorker{nonce: "incarnation-a"})
-	run := fx.run(wpRun{worker: &worker, claimGen: 4, budgetWall: p32(36000)})
+	run := fx.run(wpRun{status: "claimed", worker: &worker, claimGen: 4, budgetWall: p32(36000)})
 	mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET claimed_worker_nonce='incarnation-a' WHERE id=$1`, run)
 	mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET snapshot_register_nonce='incarnation-b' WHERE id=$1`, worker)
 	if n, err := fx.q.ParkCredentialDisabledRun(fx.ctx, store.ParkCredentialDisabledRunParams{
@@ -154,9 +189,7 @@ func TestCredentialDisabledSameWorkerReclaimNeedsGenerationLiveDB(t *testing.T) 
 	}); err != nil || n != 1 {
 		t.Fatalf("park old incarnation: rows=%d err=%v", n, err)
 	}
-	if _, err := fx.q.PromoteCredentialDisabledRun(fx.ctx, store.PromoteCredentialDisabledRunParams{
-		ID: run, UserID: fx.userID, GlobalTimeoutSeconds: 36000,
-	}); err != nil {
+	if _, err := fx.q.PromoteCredentialDisabledRun(fx.ctx, promoteParams(fx.ctx, t, fx.pool, run, fx.userID, 36000)); err != nil {
 		t.Fatalf("promote: %v", err)
 	}
 	if _, err := fx.claim(worker, "incarnation-b", false); !errors.Is(err, pgx.ErrNoRows) {
@@ -191,9 +224,7 @@ func TestCredentialDisabledWorklistCursorLiveDB(t *testing.T) {
 	if err != nil || len(first) != 1 || first[0].ID != older {
 		t.Fatalf("first page: %v, %v", first, err)
 	}
-	if _, err := q.PromoteCredentialDisabledRun(ctx, store.PromoteCredentialDisabledRunParams{
-		ID: older, UserID: user, GlobalTimeoutSeconds: 60,
-	}); !errors.Is(err, pgx.ErrNoRows) {
+	if _, err := q.PromoteCredentialDisabledRun(ctx, promoteParams(ctx, t, pool, older, user, 60)); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("budget-blocked oldest row: %v", err)
 	}
 	second, err := q.ListCredentialDisabledRuns(ctx, store.ListCredentialDisabledRunsParams{
@@ -203,9 +234,67 @@ func TestCredentialDisabledWorklistCursorLiveDB(t *testing.T) {
 	if err != nil || len(second) != 1 || second[0].ID != newer {
 		t.Fatalf("second page: %v, %v", second, err)
 	}
-	if _, err := q.PromoteCredentialDisabledRun(ctx, store.PromoteCredentialDisabledRunParams{
-		ID: newer, UserID: user, GlobalTimeoutSeconds: 60,
-	}); err != nil {
+	if _, err := q.PromoteCredentialDisabledRun(ctx, promoteParams(ctx, t, pool, newer, user, 60)); err != nil {
 		t.Fatalf("promote second page: %v", err)
+	}
+}
+
+// promoteParams reads the run's current requirement columns as the promoter's locked re-read
+// would, so a promotion here is guarded on exactly the stored requirement.
+func promoteParams(ctx context.Context, t *testing.T, pool *pgxpool.Pool, run, owner uuid.UUID, global int32) store.PromoteCredentialDisabledRunParams {
+	t.Helper()
+	arg := store.PromoteCredentialDisabledRunParams{ID: run, UserID: owner, GlobalTimeoutSeconds: global}
+	if err := pool.QueryRow(ctx, `SELECT credential_override_mode, credential_override_secret_id, codex_secret_id,
+	    worker_id, credential_disable_released_worker_id FROM runs WHERE id=$1`, run).Scan(
+		&arg.ExpectedOverrideMode, &arg.ExpectedOverrideSecretID, &arg.ExpectedCodexSecretID,
+		&arg.ExpectedWorkerID, &arg.ExpectedReleasedWorkerID); err != nil {
+		t.Fatalf("read requirement columns: %v", err)
+	}
+	return arg
+}
+
+// TestCredentialDisabledUsersWorklistLiveDB: the Sweep fallback's owner worklist pages owners
+// with a held run in uuid order and omits owners whose runs are not held on this reason.
+func TestCredentialDisabledUsersWorklistLiveDB(t *testing.T) {
+	ctx, pool, q, user := codexLiveDB(t)
+	repo, worker := codexRunFixture(ctx, t, pool, user)
+	held := insertCodexRun(ctx, t, pool, user, repo, worker, 920, "running", "held")
+	mustExec(ctx, t, pool, `UPDATE runs SET status='paused', hold_reason='credential_disabled' WHERE id=$1`, held)
+	var all []uuid.UUID
+	var after pgtype.UUID
+	for {
+		page, err := q.ListCredentialDisabledUsers(ctx, store.ListCredentialDisabledUsersParams{AfterUserID: after, PageSize: 1})
+		if err != nil {
+			t.Fatalf("owners page: %v", err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		if after.Valid && uuid.UUID(after.Bytes).String() >= page[0].String() {
+			t.Fatalf("owner page not ascending: %s after %s", page[0], uuid.UUID(after.Bytes))
+		}
+		all = append(all, page...)
+		after = pgtype.UUID{Bytes: page[len(page)-1], Valid: true}
+	}
+	found := 0
+	for _, u := range all {
+		if u == user {
+			found++
+		}
+	}
+	if found != 1 {
+		t.Fatalf("owner %s listed %d times across pages %v, want once", user, found, all)
+	}
+	mustExec(ctx, t, pool, `UPDATE runs SET hold_reason='completion_blocked' WHERE id=$1`, held)
+	page, err := q.ListCredentialDisabledUsers(ctx, store.ListCredentialDisabledUsersParams{
+		AfterUserID: pgtype.UUID{Bytes: user, Valid: false}, PageSize: 1000,
+	})
+	if err != nil {
+		t.Fatalf("owners: %v", err)
+	}
+	for _, u := range page {
+		if u == user {
+			t.Fatal("an owner with no credential_disabled hold was listed")
+		}
 	}
 }

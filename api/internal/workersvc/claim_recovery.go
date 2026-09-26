@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -56,6 +57,8 @@ type claimFinishQueries interface {
 	LockOpenCustodyHoldsForRunWorkerGeneration(ctx context.Context, arg store.LockOpenCustodyHoldsForRunWorkerGenerationParams) ([]uuid.UUID, error)
 	ReleaseCustodyHoldExact(ctx context.Context, arg store.ReleaseCustodyHoldExactParams) (int64, error)
 	ParkRunCodexAccountUnavailable(ctx context.Context, arg store.ParkRunCodexAccountUnavailableParams) (store.Run, error)
+	LockSecretEnablementForShareNowait(ctx context.Context, arg store.LockSecretEnablementForShareNowaitParams) (bool, error)
+	ParkCredentialDisabledRun(ctx context.Context, arg store.ParkCredentialDisabledRunParams) (int64, error)
 	RequeueClaimAssemblyExact(ctx context.Context, arg store.RequeueClaimAssemblyExactParams) (int64, error)
 	FailClaimAssemblyExact(ctx context.Context, arg store.FailClaimAssemblyExactParams) (int64, error)
 }
@@ -148,7 +151,10 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 	}
 	transient := errors.Is(assemblyErr, errVaultLocked) || errors.Is(assemblyErr, errAutoPoolEmpty) ||
 		errors.Is(assemblyErr, errCustomModelCapabilityMissing)
-	if assemblyErr != nil && !transient && !claimAssemblyTerminal(assemblyErr) {
+	// errCredentialDisabled is its own non-terminal classification (PRD #1732 D14): neither
+	// transient nor terminal, so it must pass this early return to reach the fenced park.
+	if assemblyErr != nil && !transient && !claimAssemblyTerminal(assemblyErr) &&
+		!errors.Is(assemblyErr, errCredentialDisabled) {
 		return nil, assemblyErr
 	}
 	for attempt := 1; ; attempt++ {
@@ -233,6 +239,16 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			holdClass = true
 		}
 	}
+	// PRD #1732 D14: the credential this claim resolved is disabled. Either assembly said so,
+	// or the in-transaction re-check below sees a disable that committed after the credential
+	// was opened but before this decision. Checked AFTER the exact-claim and Codex
+	// capability-identity checks above, so a stale claim is idle before it is classified.
+	credDisabled := errors.Is(assemblyErr, errCredentialDisabled)
+	if !credDisabled && assemblyErr == nil && payload != nil {
+		if credDisabled, err = claimCredentialDisabled(ctx, q, locked, payload); err != nil {
+			return nil, false, err
+		}
+	}
 	origin := claimAssemblyOrigin(assemblyErr)
 	// Only credential authority faults may park, and only on a custody-holding kind: a judge
 	// stays terminal. Guardrail and provisioning failures remain terminal even if an account
@@ -240,7 +256,15 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	holdClass = holdClass && (assemblyErr == nil || origin == "credential_unavailable" || transient) &&
 		claimOpenedCustody(run.Kind, true)
 	decision := assemblyErr
-	if authorityErr != nil && origin != "provisioning_failed" && origin != "guardrail_blocked" {
+	if credDisabled {
+		// A distinct non-terminal outcome: never a transient requeue, never the account
+		// park, and never rewritten into a failure by the authority rewrite below. The owner
+		// re-enabling (or reassigning) the credential resumes it through the promoter.
+		if decision == nil {
+			decision = errCredentialDisabled
+		}
+		holdClass, transient = false, false
+	} else if authorityErr != nil && origin != "provisioning_failed" && origin != "guardrail_blocked" {
 		// Lock-time authority is the fresher truth. When it decides the outcome (a park it
 		// classified, or a terminal refusal that overrides a success, a transient requeue or
 		// an assembly-time hold), the recorded reason is the authority error that decided it.
@@ -285,6 +309,12 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	}
 	var n int64
 	switch {
+	case credDisabled:
+		// Status exactly 'claimed' at this generation and worker (the query's fence): the
+		// payload was never delivered, so no running flight is parked (D3).
+		n, err = q.ParkCredentialDisabledRun(ctx, store.ParkCredentialDisabledRunParams{
+			ID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
+		})
 	case holdClass:
 		_, err = q.ParkRunCodexAccountUnavailable(ctx, store.ParkRunCodexAccountUnavailableParams{
 			ID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
@@ -313,7 +343,38 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	if err := q.Commit(ctx); err != nil {
 		return nil, false, err
 	}
-	return nil, !holdClass && !transient, nil
+	return nil, !holdClass && !transient && !credDisabled, nil
+}
+
+// claimCredentialDisabled is finishRunClaimTx's in-transaction re-check of the credential a
+// successful payload actually resolved (PRD #1732 D14): the frozen alias for a Codex run, the
+// Anthropic credential assembly just recorded on the locked row for a Claude run. It runs
+// under the exact-claim run lock and after classifyLockedCodexClaim's alias/account locks,
+// and takes the credential row FOR SHARE NOWAIT: a concurrent disable either committed first
+// (seen here, the claim parks) or waits for this decision (the claim was issued first and
+// finishes, D3). A held row is 55P03, which rolls the transaction back for the bounded
+// retry instead of blocking under the run lock. A missing row is not this classification.
+func claimCredentialDisabled(ctx context.Context, q claimFinishQueries, locked store.Run, payload *ClaimPayload) (bool, error) {
+	var secretID pgtype.UUID
+	switch {
+	case locked.Harness == harnessCodex:
+		if payload.Secrets.Codex == nil {
+			return false, nil
+		}
+		secretID = locked.CodexSecretID
+	case payload.Secrets.AnthropicOAuthToken != "":
+		secretID = locked.AnthropicSecretID
+	}
+	if !secretID.Valid {
+		return false, nil
+	}
+	disabled, err := q.LockSecretEnablementForShareNowait(ctx, store.LockSecretEnablementForShareNowaitParams{
+		ID: uuid.UUID(secretID.Bytes), UserID: locked.UserID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return disabled, err
 }
 
 func claimAssemblyTerminal(err error) bool { return claimAssemblyOrigin(err) != "" }

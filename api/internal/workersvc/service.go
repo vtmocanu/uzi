@@ -796,6 +796,11 @@ type Store interface {
 	// rows (guard fail) is the non-paused ack the worker's park order must retain the run on.
 	SetRunCompletionHold(ctx context.Context, arg store.SetRunCompletionHoldParams) (store.Run, error)
 	ResumePausedRun(ctx context.Context, arg store.ResumePausedRunParams) (store.ResumePausedRunRow, error)
+	// PRD #1732 D14: the credential_disabled park writer (exact undelivered claim), and the
+	// promoter's two keyset worklists (one owner's held runs; owners with any held run).
+	ParkCredentialDisabledRun(ctx context.Context, arg store.ParkCredentialDisabledRunParams) (int64, error)
+	ListCredentialDisabledRuns(ctx context.Context, arg store.ListCredentialDisabledRunsParams) ([]store.ListCredentialDisabledRunsRow, error)
+	ListCredentialDisabledUsers(ctx context.Context, arg store.ListCredentialDisabledUsersParams) ([]uuid.UUID, error)
 	PromoteCredentialDisabledRun(ctx context.Context, arg store.PromoteCredentialDisabledRunParams) (store.PromoteCredentialDisabledRunRow, error)
 	ReassignCredentialDisabledRun(ctx context.Context, arg store.ReassignCredentialDisabledRunParams) (store.ReassignCredentialDisabledRunRow, error)
 	// ReleaseCredentialSwitch is the held-state credential-switch RELEASE transition (PRD
@@ -1693,6 +1698,12 @@ type Service struct {
 	codexPromote codexAccountPageCursor
 	// codexPromoteHooks are the promotion pass's LiveDB race seams (nil in production).
 	codexPromoteHooks *codexPromoteTestHooks
+	// credPromote coalesces requested credential_disabled promoter passes per owner (PRD
+	// #1732 D14). Zero value ready; see RequestCredentialDisabledPromotion.
+	credPromote credentialPromoteQueue
+	// credPromoteHooks are the credential_disabled promoter's LiveDB race seams (nil in
+	// production, so inert unless a test sets it; the codexPromoteHooks idiom above).
+	credPromoteHooks *credentialPromoteTestHooks
 	// readyAt is the moment the worker-facing listener(s) became ready (PRD #1390 M1, D1),
 	// stored as Unix nanoseconds (0 = not yet ready). main.go writes it via SetReadyAt after
 	// binding every enabled listener; the sweeper goroutine reads it each tick to anchor the
@@ -5181,33 +5192,42 @@ func (s *Service) SetWorkerAnthropicToken(ctx context.Context, userID, workerID 
 	if mode != BindModePinned {
 		secretID = nil
 	}
-	var bind pgtype.UUID
-	if secretID != nil {
-		// Confirm the secret is this user's before writing, so the caller gets a 404
-		// naming what was wrong instead of a 500 from the FK.
-		if _, err := s.q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
-			ID:     *secretID,
-			UserID: userID,
-		}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return store.Worker{}, ErrSecretNotOwned
+	// PRD #1732 D14: the rebind runs under the user's secret mutation lock, the lock order the
+	// credential_disabled promoter shares, and requests a promoter pass after commit (a worker
+	// rebound onto an enabled credential resumes the runs it parked).
+	var wkr store.Worker
+	err := s.withSecretMutation(ctx, userID, func(q secretMutationQueries) error {
+		var bind pgtype.UUID
+		if secretID != nil {
+			// Confirm the secret is this user's before writing, so the caller gets a 404
+			// naming what was wrong instead of a 500 from the FK.
+			if _, err := q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
+				ID:     *secretID,
+				UserID: userID,
+			}); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return ErrSecretNotOwned
+				}
+				return err
 			}
-			return store.Worker{}, err
+			bind = pgconv.UUID(*secretID)
 		}
-		bind = pgconv.UUID(*secretID)
-	}
-	wkr, err := s.q.SetWorkerAnthropicSecret(ctx, store.SetWorkerAnthropicSecretParams{
-		ID:                workerID,
-		UserID:            userID,
-		AnthropicSecretID: bind,
-		AnthropicBindMode: mode,
+		var err error
+		wkr, err = q.SetWorkerAnthropicSecret(ctx, store.SetWorkerAnthropicSecretParams{
+			ID:                workerID,
+			UserID:            userID,
+			AnthropicSecretID: bind,
+			AnthropicBindMode: mode,
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrWorkerNotFound
+		}
+		return err
 	})
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return store.Worker{}, ErrWorkerNotFound
-		}
 		return store.Worker{}, err
 	}
+	s.RequestCredentialDisabledPromotion(userID)
 	return wkr, nil
 }
 
@@ -5232,24 +5252,35 @@ func (s *Service) SetUserJudgeBinding(ctx context.Context, userID uuid.UUID, mod
 	if mode != BindModePinned {
 		secretID = nil
 	}
-	var bind pgtype.UUID
-	if secretID != nil {
-		if _, err := s.q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
-			ID:     *secretID,
-			UserID: userID,
-		}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return store.User{}, ErrSecretNotOwned
+	// PRD #1732 D14: same lock order and post-commit promoter request as the worker rebind.
+	var user store.User
+	err := s.withSecretMutation(ctx, userID, func(q secretMutationQueries) error {
+		var bind pgtype.UUID
+		if secretID != nil {
+			if _, err := q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
+				ID:     *secretID,
+				UserID: userID,
+			}); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return ErrSecretNotOwned
+				}
+				return err
 			}
-			return store.User{}, err
+			bind = pgconv.UUID(*secretID)
 		}
-		bind = pgconv.UUID(*secretID)
-	}
-	return s.q.SetUserJudgeAnthropicBinding(ctx, store.SetUserJudgeAnthropicBindingParams{
-		ID:                     userID,
-		JudgeAnthropicBindMode: mode,
-		JudgeAnthropicSecretID: bind,
+		var err error
+		user, err = q.SetUserJudgeAnthropicBinding(ctx, store.SetUserJudgeAnthropicBindingParams{
+			ID:                     userID,
+			JudgeAnthropicBindMode: mode,
+			JudgeAnthropicSecretID: bind,
+		})
+		return err
 	})
+	if err != nil {
+		return store.User{}, err
+	}
+	s.RequestCredentialDisabledPromotion(userID)
+	return user, nil
 }
 
 // ResolveTokenLabel exposes label → secret id for the handler's PATCH body, which
@@ -6242,6 +6273,10 @@ type SweepResult struct {
 	// ONE per distinct held-run owner per tick (the anti-stampede stagger), so on a
 	// busy resume it climbs one owner at a time across ticks. Normally 0.
 	PoolResumed int64
+	// CredentialPromoted is the number of runs this pass's credential_disabled promoter
+	// returned to queued because their exact credential requirement is enabled again (PRD
+	// #1732 D14, the restart-safe fallback to the post-commit pass). Normally 0.
+	CredentialPromoted int64
 	// LimitReevaluated is the number of still-parked limit_wait runs this pass LOWERED to
 	// retry_not_before = now() because their `auto` next claim now has a pooled
 	// alternative that is spendable sooner than their park (PRD #1247 M3, D8 — Decision

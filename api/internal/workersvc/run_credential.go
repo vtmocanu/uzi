@@ -121,10 +121,17 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 	switch run.Status {
 	case "paused":
 		if run.HoldReason.Valid && run.HoldReason.String == "credential_disabled" {
-			if _, err := s.q.ReassignCredentialDisabledRun(ctx, store.ReassignCredentialDisabledRunParams{
-				ID: runID, UserID: userID,
-				Mode: pgOverrideMode(resolved), SecretID: pgOverrideSecretID(resolved),
-				GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
+			// PRD #1732 D14: the reassignment takes the promoter's lock order (the user's secret
+			// mutation lock, then the run row inside the fenced UPDATE), so it and a concurrent
+			// promotion serialize: exactly one moves the run out of the hold, and the loser
+			// matches 0 rows (ErrCredentialSwitchRaced) with nothing written.
+			if err := s.withSecretMutation(ctx, userID, func(q secretMutationQueries) error {
+				_, err := q.ReassignCredentialDisabledRun(ctx, store.ReassignCredentialDisabledRunParams{
+					ID: runID, UserID: userID,
+					Mode: pgOverrideMode(resolved), SecretID: pgOverrideSecretID(resolved),
+					GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
+				})
+				return err
 			}); err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
 					return SetRunCredentialResult{}, ErrCredentialSwitchRaced
@@ -183,6 +190,10 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 	// pre-transition row carries them. A warning-computation read error is logged and
 	// dropped, never fails the verb.
 	warning := s.credentialSwitchWarning(ctx, run, resolved)
+
+	// A committed override can be the requirement a concurrently parked credential_disabled
+	// run now waits on, so request a promoter pass (post-commit, non-blocking; PRD #1732 D14).
+	s.RequestCredentialDisabledPromotion(userID)
 
 	updated, err := s.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: userID})
 	if err != nil {

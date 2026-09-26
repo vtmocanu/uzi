@@ -12,6 +12,24 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const hasEnabledAnthropicForJudgeAuto = `-- name: HasEnabledAnthropicForJudgeAuto :one
+SELECT EXISTS (
+    SELECT 1 FROM user_secrets
+    WHERE user_id = $1 AND kind = 'anthropic_token' AND disabled_at IS NULL
+      AND (is_default OR auto_eligible)
+)::boolean AS available
+`
+
+// Promoter step (4) for a Judge/self-improve auto lane: an enabled pooled token or an
+// enabled default can serve it (the #1140 fallback). Read under the user's secret
+// mutation lock, which every enablement and default writer takes.
+func (q *Queries) HasEnabledAnthropicForJudgeAuto(ctx context.Context, userID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasEnabledAnthropicForJudgeAuto, userID)
+	var available bool
+	err := row.Scan(&available)
+	return available, err
+}
+
 const listCredentialDisabledRuns = `-- name: ListCredentialDisabledRuns :many
 SELECT id, user_id, status_since FROM runs
 WHERE user_id = $1 AND status = 'paused' AND hold_reason = 'credential_disabled'
@@ -62,6 +80,206 @@ func (q *Queries) ListCredentialDisabledRuns(ctx context.Context, arg ListCreden
 	return items, nil
 }
 
+const listCredentialDisabledUsers = `-- name: ListCredentialDisabledUsers :many
+SELECT DISTINCT user_id FROM runs
+WHERE status = 'paused' AND hold_reason = 'credential_disabled'
+  AND ($1::uuid IS NULL OR user_id > $1::uuid)
+ORDER BY user_id
+LIMIT $2::int
+`
+
+type ListCredentialDisabledUsersParams struct {
+	AfterUserID pgtype.UUID `json:"after_user_id"`
+	PageSize    int32       `json:"page_size"`
+}
+
+// Sweep fallback worklist: one keyset page of owners with at least one run held on
+// credential_disabled. The partial promoter index serves the DISTINCT scan.
+func (q *Queries) ListCredentialDisabledUsers(ctx context.Context, arg ListCredentialDisabledUsersParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listCredentialDisabledUsers, arg.AfterUserID, arg.PageSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var user_id uuid.UUID
+		if err := rows.Scan(&user_id); err != nil {
+			return nil, err
+		}
+		items = append(items, user_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockCredentialDisabledRunForPromotion = `-- name: LockCredentialDisabledRunForPromotion :one
+SELECT id, user_id, kind, harness, status, hold_reason, pause_requested_at,
+       credential_override_mode, credential_override_secret_id, codex_secret_id,
+       worker_id, credential_disable_released_worker_id
+FROM runs
+WHERE id = $1 AND user_id = $2
+FOR UPDATE
+`
+
+type LockCredentialDisabledRunForPromotionParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type LockCredentialDisabledRunForPromotionRow struct {
+	ID                                uuid.UUID          `json:"id"`
+	UserID                            uuid.UUID          `json:"user_id"`
+	Kind                              string             `json:"kind"`
+	Harness                           string             `json:"harness"`
+	Status                            string             `json:"status"`
+	HoldReason                        pgtype.Text        `json:"hold_reason"`
+	PauseRequestedAt                  pgtype.Timestamptz `json:"pause_requested_at"`
+	CredentialOverrideMode            pgtype.Text        `json:"credential_override_mode"`
+	CredentialOverrideSecretID        pgtype.UUID        `json:"credential_override_secret_id"`
+	CodexSecretID                     pgtype.UUID        `json:"codex_secret_id"`
+	WorkerID                          pgtype.UUID        `json:"worker_id"`
+	CredentialDisableReleasedWorkerID pgtype.UUID        `json:"credential_disable_released_worker_id"`
+}
+
+// Promoter step (2): the candidate run row, locked AFTER the user's secret mutation
+// advisory lock and BEFORE any requirement source or credential row.
+func (q *Queries) LockCredentialDisabledRunForPromotion(ctx context.Context, arg LockCredentialDisabledRunForPromotionParams) (LockCredentialDisabledRunForPromotionRow, error) {
+	row := q.db.QueryRow(ctx, lockCredentialDisabledRunForPromotion, arg.ID, arg.UserID)
+	var i LockCredentialDisabledRunForPromotionRow
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Kind,
+		&i.Harness,
+		&i.Status,
+		&i.HoldReason,
+		&i.PauseRequestedAt,
+		&i.CredentialOverrideMode,
+		&i.CredentialOverrideSecretID,
+		&i.CodexSecretID,
+		&i.WorkerID,
+		&i.CredentialDisableReleasedWorkerID,
+	)
+	return i, err
+}
+
+const lockDefaultAnthropicSecretForShare = `-- name: LockDefaultAnthropicSecretForShare :one
+SELECT id, (disabled_at IS NULL)::boolean AS enabled
+FROM user_secrets
+WHERE user_id = $1 AND kind = 'anthropic_token' AND is_default
+FOR SHARE
+`
+
+type LockDefaultAnthropicSecretForShareRow struct {
+	ID      uuid.UUID `json:"id"`
+	Enabled bool      `json:"enabled"`
+}
+
+// Promoter step (4) for a default requirement: the owner's current Anthropic default.
+// pgx.ErrNoRows means the slot is empty (D4: every default is enabled, and the last
+// disable clears the slot).
+func (q *Queries) LockDefaultAnthropicSecretForShare(ctx context.Context, userID uuid.UUID) (LockDefaultAnthropicSecretForShareRow, error) {
+	row := q.db.QueryRow(ctx, lockDefaultAnthropicSecretForShare, userID)
+	var i LockDefaultAnthropicSecretForShareRow
+	err := row.Scan(&i.ID, &i.Enabled)
+	return i, err
+}
+
+const lockSecretEnablementForShareNowait = `-- name: LockSecretEnablementForShareNowait :one
+SELECT (disabled_at IS NOT NULL)::boolean AS disabled
+FROM user_secrets
+WHERE id = $1 AND user_id = $2
+FOR SHARE NOWAIT
+`
+
+type LockSecretEnablementForShareNowaitParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// The claim finisher's in-transaction enablement re-check of the credential the payload
+// resolved, taken under the exact-claim run lock and after the Codex alias/account locks.
+// FOR SHARE blocks a concurrent disable (which locks the row FOR UPDATE under the user's
+// secret mutation lock) until the claim decision commits; NOWAIT means the finisher never
+// waits on that writer: a held row returns 55P03 and finishRunClaim retries the whole
+// transaction. Owner-scoped; a missing row is pgx.ErrNoRows.
+func (q *Queries) LockSecretEnablementForShareNowait(ctx context.Context, arg LockSecretEnablementForShareNowaitParams) (bool, error) {
+	row := q.db.QueryRow(ctx, lockSecretEnablementForShareNowait, arg.ID, arg.UserID)
+	var disabled bool
+	err := row.Scan(&disabled)
+	return disabled, err
+}
+
+const lockSecretForPromotion = `-- name: LockSecretForPromotion :one
+SELECT (disabled_at IS NULL)::boolean AS enabled
+FROM user_secrets
+WHERE id = $1 AND user_id = $2
+FOR SHARE
+`
+
+type LockSecretForPromotionParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// Promoter step (4): the exact requirement credential. Owner-scoped.
+func (q *Queries) LockSecretForPromotion(ctx context.Context, arg LockSecretForPromotionParams) (bool, error) {
+	row := q.db.QueryRow(ctx, lockSecretForPromotion, arg.ID, arg.UserID)
+	var enabled bool
+	err := row.Scan(&enabled)
+	return enabled, err
+}
+
+const lockUserJudgeBindingForShare = `-- name: LockUserJudgeBindingForShare :one
+SELECT judge_anthropic_bind_mode, judge_anthropic_secret_id
+FROM users
+WHERE id = $1
+FOR SHARE
+`
+
+type LockUserJudgeBindingForShareRow struct {
+	JudgeAnthropicBindMode string      `json:"judge_anthropic_bind_mode"`
+	JudgeAnthropicSecretID pgtype.UUID `json:"judge_anthropic_secret_id"`
+}
+
+// Promoter step (3b): the owner's Judge binding, the requirement source for judge and
+// self_improve runs.
+func (q *Queries) LockUserJudgeBindingForShare(ctx context.Context, id uuid.UUID) (LockUserJudgeBindingForShareRow, error) {
+	row := q.db.QueryRow(ctx, lockUserJudgeBindingForShare, id)
+	var i LockUserJudgeBindingForShareRow
+	err := row.Scan(&i.JudgeAnthropicBindMode, &i.JudgeAnthropicSecretID)
+	return i, err
+}
+
+const lockWorkerBindingForShare = `-- name: LockWorkerBindingForShare :one
+SELECT anthropic_bind_mode, anthropic_secret_id
+FROM workers
+WHERE id = $1 AND user_id = $2
+FOR SHARE
+`
+
+type LockWorkerBindingForShareParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type LockWorkerBindingForShareRow struct {
+	AnthropicBindMode string      `json:"anthropic_bind_mode"`
+	AnthropicSecretID pgtype.UUID `json:"anthropic_secret_id"`
+}
+
+// Promoter step (3a): the recorded worker's Anthropic binding, the requirement source for an
+// ordinary Claude run without a per-run override. Owner-scoped.
+func (q *Queries) LockWorkerBindingForShare(ctx context.Context, arg LockWorkerBindingForShareParams) (LockWorkerBindingForShareRow, error) {
+	row := q.db.QueryRow(ctx, lockWorkerBindingForShare, arg.ID, arg.UserID)
+	var i LockWorkerBindingForShareRow
+	err := row.Scan(&i.AnthropicBindMode, &i.AnthropicSecretID)
+	return i, err
+}
+
 const parkCredentialDisabledRun = `-- name: ParkCredentialDisabledRun :execrows
 UPDATE runs SET
     status = 'paused',
@@ -80,7 +298,7 @@ UPDATE runs SET
 WHERE runs.id = $1 AND runs.worker_id = $2
   AND runs.claim_generation = $3
   AND runs.claim_released_at IS NULL
-  AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.status = 'claimed'
   AND runs.hold_reason IS NULL
 `
 
@@ -90,8 +308,9 @@ type ParkCredentialDisabledRunParams struct {
 	ClaimGeneration int64       `json:"claim_generation"`
 }
 
-// Credential disablement parks an existing worker flight without consuming any
-// pending owner pause or changing its session, phase, custody, or recovery state.
+// Credential disablement parks an UNDELIVERED claim (status 'claimed', exact worker and
+// generation) without consuming any pending owner pause or changing its session, phase,
+// custody, or recovery state. A running flight is never parked (D3): its claim finishes.
 func (q *Queries) ParkCredentialDisabledRun(ctx context.Context, arg ParkCredentialDisabledRunParams) (int64, error) {
 	result, err := q.db.Exec(ctx, parkCredentialDisabledRun, arg.ID, arg.WorkerID, arg.ClaimGeneration)
 	if err != nil {
@@ -115,8 +334,16 @@ UPDATE runs SET
 WHERE id = $1 AND user_id = $2
   AND status = 'paused' AND hold_reason = 'credential_disabled'
   AND pause_requested_at IS NULL
+  -- The requirement the promoter evaluated must still be the run's requirement: a
+  -- concurrent reassignment or rebind that is not serialized by the caller's locks
+  -- makes this match 0 rows instead of promoting on a stale requirement.
+  AND credential_override_mode IS NOT DISTINCT FROM $3::text
+  AND credential_override_secret_id IS NOT DISTINCT FROM $4::uuid
+  AND codex_secret_id IS NOT DISTINCT FROM $5::uuid
+  AND worker_id IS NOT DISTINCT FROM $6::uuid
+  AND credential_disable_released_worker_id IS NOT DISTINCT FROM $7::uuid
   AND (started_at IS NULL OR
-       (COALESCE(budget_wall_seconds, $3::int)
+       (COALESCE(budget_wall_seconds, $8::int)
           + budget_extension_seconds + budget_finalize_seconds)
        - (GREATEST(0, EXTRACT(EPOCH FROM (status_since - started_at))::int)
           - budget_paused_seconds) > 0)
@@ -124,9 +351,14 @@ RETURNING id, user_id, status
 `
 
 type PromoteCredentialDisabledRunParams struct {
-	ID                   uuid.UUID `json:"id"`
-	UserID               uuid.UUID `json:"user_id"`
-	GlobalTimeoutSeconds int32     `json:"global_timeout_seconds"`
+	ID                       uuid.UUID   `json:"id"`
+	UserID                   uuid.UUID   `json:"user_id"`
+	ExpectedOverrideMode     pgtype.Text `json:"expected_override_mode"`
+	ExpectedOverrideSecretID pgtype.UUID `json:"expected_override_secret_id"`
+	ExpectedCodexSecretID    pgtype.UUID `json:"expected_codex_secret_id"`
+	ExpectedWorkerID         pgtype.UUID `json:"expected_worker_id"`
+	ExpectedReleasedWorkerID pgtype.UUID `json:"expected_released_worker_id"`
+	GlobalTimeoutSeconds     int32       `json:"global_timeout_seconds"`
 }
 
 type PromoteCredentialDisabledRunRow struct {
@@ -138,7 +370,16 @@ type PromoteCredentialDisabledRunRow struct {
 // Promotion banks only the parked interval. The active time already spent before
 // parking must still fit the frozen budget; the hold interval is excluded.
 func (q *Queries) PromoteCredentialDisabledRun(ctx context.Context, arg PromoteCredentialDisabledRunParams) (PromoteCredentialDisabledRunRow, error) {
-	row := q.db.QueryRow(ctx, promoteCredentialDisabledRun, arg.ID, arg.UserID, arg.GlobalTimeoutSeconds)
+	row := q.db.QueryRow(ctx, promoteCredentialDisabledRun,
+		arg.ID,
+		arg.UserID,
+		arg.ExpectedOverrideMode,
+		arg.ExpectedOverrideSecretID,
+		arg.ExpectedCodexSecretID,
+		arg.ExpectedWorkerID,
+		arg.ExpectedReleasedWorkerID,
+		arg.GlobalTimeoutSeconds,
+	)
 	var i PromoteCredentialDisabledRunRow
 	err := row.Scan(&i.ID, &i.UserID, &i.Status)
 	return i, err

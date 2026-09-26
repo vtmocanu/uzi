@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -133,7 +132,11 @@ func (h *Handler) ListMySecrets(w http.ResponseWriter, r *http.Request) {
 // sealUserSecret's vault-nil fallback.
 func (h *Handler) withSecretLock(ctx context.Context, userID uuid.UUID, fn func(q *store.Queries) error) error {
 	if h.pool == nil {
-		return fn(h.q)
+		if err := fn(h.q); err != nil {
+			return err
+		}
+		h.requestCredentialPromotion(userID)
+		return nil
 	}
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
@@ -144,22 +147,28 @@ func (h *Handler) withSecretLock(ctx context.Context, userID uuid.UUID, fn func(
 	// rule as the hosted-provision quota lock). Serializes this user's token
 	// mutations until the transaction ends; XACT-scoped, so there is no unlock to
 	// forget.
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)",
-		store.SecretMutationLockClass, secretMutationLockObjID(userID)); err != nil {
+	if err := store.LockSecretMutation(ctx, tx, userID); err != nil {
 		return err
 	}
 	if err := fn(h.q.WithTx(tx)); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	h.requestCredentialPromotion(userID)
+	return nil
 }
 
-// secretMutationLockObjID derives the objid half of the per-user advisory lock from
-// a user's uuid, exactly as hostedProvisionLockObjID does: a uuid's leading bytes
-// are random, so two users can collide and serialize for a moment — a contention
-// non-event, never a correctness one.
-func secretMutationLockObjID(userID uuid.UUID) int32 {
-	return int32(binary.BigEndian.Uint32(userID[:4])) //nolint:gosec // wraparound is fine: a lock key, not a number
+// requestCredentialPromotion asks workersvc for a non-blocking credential_disabled promoter
+// pass for userID (PRD #1732 D14). It is called only AFTER a secret mutation committed, so
+// the advisory lock is already released: enable, default hand-off, default creation or
+// promotion, and delete can each make a parked run's requirement available again. The
+// request never blocks the handler and is nil-safe for handler tests without workersvc.
+func (h *Handler) requestCredentialPromotion(userID uuid.UUID) {
+	if h.wsvc != nil {
+		h.wsvc.RequestCredentialDisabledPromotion(userID)
+	}
 }
 
 // PutAnthropicToken stores (or rotates) the current user's DEFAULT Anthropic token,

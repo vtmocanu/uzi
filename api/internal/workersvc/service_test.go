@@ -184,6 +184,13 @@ type fakeStore struct {
 	// SQLSTATE errors to drive finishRunClaim's bounded 55P03 retry.
 	claimFinishLockErrs []error
 	claimFinishBegins   int
+	// PRD #1732 D14: claimSecretDisabled is what the finisher's enablement re-check reads for
+	// the resolved credential; claimSecretLockErrs is consumed one per re-check (55P03
+	// staging); claimCredParked records the COMMITTED credential_disabled park.
+	claimSecretDisabled bool
+	claimSecretLockErrs []error
+	claimSecretChecks   int
+	claimCredParked     *store.ParkCredentialDisabledRunParams
 	// hasActiveRunForIssue is what the CreateRun dedup pre-check returns (PRD #754 M4);
 	// hasActiveRunForIssueErr forces its error path.
 	hasActiveRunForIssue    bool
