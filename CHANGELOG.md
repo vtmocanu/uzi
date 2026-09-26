@@ -32,6 +32,9 @@ through `[0.52.0]`.)
 - **A run whose subagent is busy is no longer flagged stalled while its parent `Agent` call is still open ([#1394](https://github.com/vtmocanu/uzi/issues/1394)).**
   The stalled check's "a tool call is in flight" suppression now reads the lead's own tool calls instead of the newest call across every lane, so a subagent's completed calls no longer hide the lead's open dispatch; an unmatched lead call from an earlier claim or query leg no longer counts once a newer init or result marks that leg's boundary.
 
+- **A run that finishes while the api is briefly unreachable no longer fails.**
+  A run with the completion check on asks the api for its completion permit at the very end, and a single network error there failed the whole run, even though its work was already pushed; after the api came back the run still showed as failed. The worker now retries that request until the api answers, for up to 10 minutes, and then completes normally. A real refusal is still handled as before.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added

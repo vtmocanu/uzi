@@ -211,10 +211,11 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     assert.match(String(reconciled.description), /Completion unverified/, "the held MR body warns the completion is unverified");
   });
 
-  it("permit request THROWS (transport/HTTP error) → the run does not falsely complete", async () => {
+  it("permit request THROWS (permanent HTTP error) → the run does not falsely complete", async () => {
     const { gitlab, calls } = fakeGitlab({ head: H });
     const claim = interlockedClaim(1303);
-    api.setCompletionPermitResponse(false, { httpStatus: 500 }); // the client throws on a non-200
+    // A PERMANENT error (409) is thrown at once; a transient one is retried (next test).
+    api.setCompletionPermitResponse(false, { httpStatus: 409 });
     git.trackingTip = (async () => H) as typeof git.trackingTip;
 
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
@@ -222,9 +223,25 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     assert.strictEqual(api.completionPermitRequests.length, 1, "the permit was attempted");
     assert.strictEqual(calls.length, 0, "no MR is opened when the permit request errors");
     assert.ok(!statuses(claim.run_id).includes("completed"), "a permit-request error never completes");
-    // A transport error propagates to the generic terminal path; the run fails rather than completing.
-    assert.ok(statuses(claim.run_id).includes("failed"), "the run fails on a permit transport error");
+    // A permanent error propagates to the generic terminal path; the run fails rather than completing.
+    assert.ok(statuses(claim.run_id).includes("failed"), "the run fails on a permanent permit error");
     assert.strictEqual(api.completionHoldRequests.length, 0, "a thrown permit request does not enter the hold");
+  });
+
+  it("permit request hits an api OUTAGE (transient 5xx) → the run waits it out, then completes (e2e phase 52 regression)", async () => {
+    const { gitlab, calls } = fakeGitlab({ head: H });
+    const claim = interlockedClaim(1307);
+    // Three 503s (the api down at finalize), then the api answers and grants.
+    api.setCompletionPermitResponse(true, { httpStatus: 503, failTimes: 3 });
+    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
+    await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
+
+    assert.strictEqual(api.completionPermitRequests.length, 4, "three failed attempts, then the granted one");
+    assert.ok(calls.some((c) => c.method === "POST"), "the MR is opened once the permit is granted");
+    assert.ok(statuses(claim.run_id).includes("completed"), "the run completes after the outage");
+    assert.ok(!statuses(claim.run_id).includes("failed"), "an api outage at finalize never fails the run");
+    assert.strictEqual(api.completionHoldRequests.length, 0, "a transient outage is not a hold");
   });
 
   it("granted + head matches H but the add-Closes reconcile FAILS → MR holds (no Closes), never completes", async () => {

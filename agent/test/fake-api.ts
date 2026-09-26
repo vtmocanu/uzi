@@ -217,6 +217,9 @@ export class FakeApi {
   private completionPermitGranted = true;
   private completionPermitDenyReason: string | undefined;
   private completionPermitHttpStatus = 200;
+  /** Leading permit requests answered with completionPermitHttpStatus before the normal answer
+   *  (undefined = every request). Drives the outage-then-recovery retry path. */
+  private completionPermitFailTimes: number | undefined;
   // PRD #1392 M2 (D7): the RAW `protocol_features` the register endpoint returns beside
   // worker_id. Left `undefined` ⇒ the response OMITS the field entirely (an older api that
   // returns only {worker_id}). Set to an arbitrary value (an array, a non-array, or an array
@@ -512,11 +515,12 @@ export class FakeApi {
    *  DOES throw on. */
   setCompletionPermitResponse(
     granted: boolean,
-    opts: { denyReason?: string; httpStatus?: number } = {},
+    opts: { denyReason?: string; httpStatus?: number; failTimes?: number } = {},
   ): void {
     this.completionPermitGranted = granted;
     this.completionPermitDenyReason = opts.denyReason;
     this.completionPermitHttpStatus = opts.httpStatus ?? 200;
+    this.completionPermitFailTimes = opts.failTimes;
   }
 
   /** Observe each /state report as it lands, so a test can react to a value the
@@ -807,7 +811,10 @@ export class FakeApi {
     if (req.method === "POST" && permitMatch) {
       const runId = permitMatch[1] as string;
       this.completionPermitRequests.push({ runId, body: json });
-      if (this.completionPermitHttpStatus !== 200) {
+      const failing =
+        this.completionPermitFailTimes === undefined ||
+        this.completionPermitRequests.length <= this.completionPermitFailTimes;
+      if (this.completionPermitHttpStatus !== 200 && failing) {
         return send(res, this.completionPermitHttpStatus, { error: "injected permit failure" });
       }
       const body: Record<string, unknown> = { granted: this.completionPermitGranted };
