@@ -32,7 +32,13 @@ through `[0.52.0]`.)
 - **The default sweeps no longer all start at 02:00 UTC, and bug triage picks up 4 issues ([#1738](https://github.com/vtmocanu/uzi/pull/1738)).**
   Bug triage now starts at 00:00, the Planned sweep stays at 02:00, and the assigned-to-uzi sweep moves to 06:00, giving bug runs a two-hour head start before Planned work is queued. Sweeps you already enabled keep their schedule: Reset on the row adopts the new defaults (it also restores UTC and clears other customizations), or set the cron and max issues explicitly with `uzi schedule edit`.
 
+- **Codex runs show their account in the TUI, CLI and web, the way Claude runs show their token ([#1730](https://github.com/vtmocanu/uzi/issues/1730)).**
+  A Codex run names the account alias it was started with: in the web run credential, the TUI board column and rail, and a new `CODEX_ALIAS` row in `uzi run get` (`(deleted)` when the alias is gone). Run reads gain `codex_secret_id`, and the TUI's credential column now counts credentials per harness instead of every secret kind.
+
 ### Fixed
+
+- **Worker restarts log enough to diagnose a run lost across a restart ([#1742](https://github.com/vtmocanu/uzi/issues/1742)).**
+  The worker and api now log the restart window a run crosses (whether a terminal journal was reloaded and what register snapshot was sent), so a run that fails `worker_lost` after an eviction can be traced. Logging only: no behaviour change.
 
 - **Five run and schedule states now display correctly in the web UI and CLI ([#1727](https://github.com/vtmocanu/uzi/issues/1727)).**
   A failed run start on the issue page keeps its error instead of clearing it on reload. A paused run's "Paused by you at" time and elapsed time, and the CLI's parked ages, come from when the run entered its status (the run now exposes `status_since`), so an extend no longer shifts them. Runs parked on a usage limit or an empty token pool show as waiting in the activity feed, not idle. Judge rationale loads again after collapsing a row mid-fetch. A sweep whose matches were all ineligible shows as starved instead of "matched 0".
