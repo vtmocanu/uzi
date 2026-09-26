@@ -1191,6 +1191,41 @@ func TestDindContainersMountNoneOfTheWorkersVolumes(t *testing.T) {
 	}
 }
 
+// The dind-meter emptyDir is the one channel from the DinD side to the worker (the worker
+// mounts it read-only and parses its single line). The UNTRUSTED daemon side, dind and
+// dind-init, must mount it by neither name nor path in EITHER posture: a daemon that could
+// write it could forge the sample that gates the worker's docker prune, and a `docker run
+// -v` could reach it. Only the meter itself (rw) and the worker (ro) may.
+func TestDindDaemonSideNeverMountsTheMeterVolume(t *testing.T) {
+	underMeterDir := func(path string) bool {
+		return path == dindMeterDir || strings.HasPrefix(path, dindMeterDir+"/")
+	}
+	for _, p := range dindPostures() {
+		t.Run(p.name, func(t *testing.T) {
+			pod := RenderDeployment(p.cfg, desiredDocker("abc"), testSpec(t, "base", "m")).Spec.Template.Spec
+			seen := map[string]bool{}
+			for _, c := range append(append([]corev1.Container{}, pod.InitContainers...), pod.Containers...) {
+				if c.Name != dindContainerName && c.Name != dindInitContainerName {
+					continue
+				}
+				seen[c.Name] = true
+				for _, vm := range c.VolumeMounts {
+					if vm.Name == dindMeterVolume || underMeterDir(vm.MountPath) {
+						t.Errorf("untrusted daemon-side container %q mounts the meter channel (%+v); only "+
+							"dind-meter (rw) and the worker (ro) may", c.Name, vm)
+					}
+				}
+			}
+			if !seen[dindContainerName] {
+				t.Fatalf("no %q container rendered; the assertion checked nothing", dindContainerName)
+			}
+			if !p.nonRootless && !seen[dindInitContainerName] {
+				t.Fatalf("rootless posture rendered no %q container; the assertion checked nothing", dindInitContainerName)
+			}
+		})
+	}
+}
+
 // The Codex command-cache root (issue #1598) is a worker-only emptyDir with NO sizeLimit,
 // rendered for every worker pod (plain and both docker postures, uid split on or off): the
 // `worker` container mounts it exactly once at codexCmdCacheDir, and no init or sidecar
@@ -1608,7 +1643,8 @@ func TestDindMeterScriptWritesOneV1LineAtomically(t *testing.T) {
 	if out, err := exec.Command(sh, "-c", `stat -f -c '%S' /`).CombinedOutput(); err != nil {
 		t.Skipf("host stat has no -f -c support: %v %s", err, out)
 	}
-	run := func(t *testing.T, dataDir string) (string, bool) {
+	const failLine = "dind-meter: statfs sample failed\n"
+	run := func(t *testing.T, dataDir string) (string, bool, string) {
 		t.Helper()
 		outDir := t.TempDir()
 		script := strings.NewReplacer(
@@ -1616,23 +1652,32 @@ func TestDindMeterScriptWritesOneV1LineAtomically(t *testing.T) {
 			dindMeterDir, outDir,
 			"sleep 30", "exit 0",
 		).Replace(dindMeterScript())
-		if out, err := exec.Command(sh, "-c", script).CombinedOutput(); err != nil { //nolint:gosec // G204: runs the renderer's own meter script with test-controlled temp paths, not user input
-			t.Fatalf("meter script failed: %v\n%s", err, out)
+		cmd := exec.Command(sh, "-c", script) //nolint:gosec // G204: runs the renderer's own meter script with test-controlled temp paths, not user input
+		var stdout, stderr strings.Builder
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("meter script failed: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
+		}
+		if stdout.Len() != 0 {
+			t.Errorf("the meter must print nothing to stdout, got %q", stdout.String())
 		}
 		if _, err := os.Stat(filepath.Join(outDir, "statfs.tmp")); err == nil {
 			t.Error("statfs.tmp left behind; the write must be renamed into place")
 		}
 		b, err := os.ReadFile(filepath.Join(outDir, "statfs")) //nolint:gosec // G304: reads a file under t.TempDir()
 		if err != nil {
-			return "", false
+			return "", false, stderr.String()
 		}
-		return string(b), true
+		return string(b), true, stderr.String()
 	}
 
 	t.Run("sample", func(t *testing.T) {
-		line, ok := run(t, t.TempDir())
+		line, ok, stderr := run(t, t.TempDir())
 		if !ok {
 			t.Fatal("no statfs sample was written")
+		}
+		if stderr != "" {
+			t.Errorf("a successful sample must print nothing to stderr, got %q", stderr)
 		}
 		if !strings.HasSuffix(line, "\n") || strings.Count(line, "\n") != 1 {
 			t.Fatalf("sample must be exactly one newline-terminated line, got %q", line)
@@ -1647,9 +1692,14 @@ func TestDindMeterScriptWritesOneV1LineAtomically(t *testing.T) {
 			}
 		}
 	})
-	t.Run("stat failure writes nothing", func(t *testing.T) {
-		if _, ok := run(t, filepath.Join(t.TempDir(), "missing")); ok {
+	t.Run("stat failure writes nothing and logs one line", func(t *testing.T) {
+		_, ok, stderr := run(t, filepath.Join(t.TempDir(), "missing"))
+		if ok {
 			t.Error("a failed stat must write no sample")
+		}
+		// Exactly the fixed diagnostic: stat's own stderr stays discarded.
+		if stderr != failLine {
+			t.Errorf("a failed stat must print exactly %q to stderr, got %q", failLine, stderr)
 		}
 	})
 }

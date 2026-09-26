@@ -416,7 +416,7 @@ done
 // data root, so one script serves both postures) and writes its sample into a private
 // emptyDir that the worker mounts READ-ONLY at the same path.
 //
-// THE SAMPLE FILE IS A CONTRACT COUPLED TO agent/src/dind-prune.ts (the worker-side
+// THE SAMPLE FILE IS A CONTRACT COUPLED TO agent/src/dind-meter.ts (the worker-side
 // parser). dindMeterFile holds exactly one line:
 //
 //	v1 <epoch_s> <frsize> <blocks> <bfree> <files> <ffree>
@@ -459,12 +459,17 @@ var dindMeterResources = corev1.ResourceRequirements{
 // `set -e`: a failed stat or write must skip one sample, never end the loop (a dead
 // meter would restart under restartPolicy Always anyway, but a transient error should
 // not cost a restart). On a failed stat it writes NOTHING and leaves the previous file:
-// the worker's freshness bound turns a stale sample into "no sample".
+// the worker's freshness bound turns a stale sample into "no sample". A failed stat
+// prints one fixed line to the container's stderr (stat's own output stays discarded) so
+// a meter that can never sample is visible in `kubectl logs`, not silent.
 func dindMeterScript() string {
 	return fmt.Sprintf(`set -u
 while :; do
-  s=$(stat -f -c '%%S %%b %%f %%c %%d' %[1]s 2>/dev/null) && t=$(date +%%s) && \
-    printf 'v1 %%s %%s\n' "$t" "$s" > %[2]s.tmp && mv -f %[2]s.tmp %[2]s
+  if s=$(stat -f -c '%%S %%b %%f %%c %%d' %[1]s 2>/dev/null); then
+    t=$(date +%%s) && printf 'v1 %%s %%s\n' "$t" "$s" > %[2]s.tmp && mv -f %[2]s.tmp %[2]s
+  else
+    echo "dind-meter: statfs sample failed" >&2
+  fi
   sleep %[3]d
 done
 `, dindMeterDataDir, dindMeterFile, dindMeterIntervalSeconds)

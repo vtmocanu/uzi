@@ -2237,6 +2237,12 @@ func snapshotRunIDs(snap *ActiveSnapshot) []uuid.UUID {
 // worker DTO so a docker-tier worker can refuse a destructive docker prune while it still
 // keeps the only local copy of work a run could not publish. The error is returned
 // unwrapped; the caller decides the fail-closed default.
+//
+// INVARIANT the owner filter relies on: ClaimRun only hands a worker runs of its own
+// user (runtime.sql binds r.user_id = @user_id to the worker row's UserID), so a hold's
+// user_id always equals the holding worker's. If a worker could ever hold custody of
+// another user's run, this read would miss that hold and fail OPEN, and it gates a
+// destructive docker prune on the worker: revisit this filter together with any such change.
 func (s *Service) RetainingUnpublishedWork(ctx context.Context, wkr store.Worker) (bool, error) {
 	n, err := s.q.CountOpenCustodyHoldsForWorker(ctx, store.CountOpenCustodyHoldsForWorkerParams{
 		WorkerID: wkr.ID,
