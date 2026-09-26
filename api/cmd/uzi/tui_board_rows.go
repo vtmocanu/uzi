@@ -340,8 +340,9 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	return row
 }
 
-// boardCredSeg renders the run's snapshotted credential label. An unclaimed run
-// has no recorded credential and keeps an empty cell. Both labels are user supplied
+// boardCredSeg renders the run's snapshotted credential label. A run with no recorded
+// credential (a Claude run not yet claimed; a Codex run not yet bound to an alias) keeps
+// an empty cell; a queued Codex run already bound shows its alias. Both labels are user supplied
 // and pass through Plain before entering the fixed-width column.
 func (m tuiModel) boardCredSeg(r apitypes.RunListItemDTO, bg color.Color) string {
 	var label *string

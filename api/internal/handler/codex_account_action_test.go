@@ -95,6 +95,43 @@ func TestOverlayCodexAccountActions(t *testing.T) {
 	}
 }
 
+// TestOverlayCodexAccountActionsKeepsSnapshot (#1730): runToDTO now maps the run's own
+// label, so the overlay must never replace it with the lookup's label, and a failed lookup
+// must not erase it.
+func TestOverlayCodexAccountActionsKeepsSnapshot(t *testing.T) {
+	held := uuid.New()
+	st := &codexActionStore{rows: []store.ListCodexAccountActionInputsRow{{
+		ID:               held,
+		CodexSecretID:    pgtype.UUID{Bytes: uuid.New(), Valid: true},
+		AliasStatus:      pgtype.Text{String: "staging", Valid: true},
+		Status:           "recovery_wait",
+		CodexSecretLabel: pgtype.Text{String: "lookup-label", Valid: true},
+	}}}
+	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{})}
+
+	snap := "dto-snapshot"
+	a := heldDTO(held)
+	a.CodexSecretLabel = &snap
+	h.overlayCodexAccountActions(context.Background(), &a)
+	if a.CodexAccountAction == nil {
+		t.Fatalf("held run action = nil, want the derived action")
+	}
+	if a.CodexSecretLabel == nil || *a.CodexSecretLabel != "dto-snapshot" {
+		t.Fatalf("label = %v, want the DTO snapshot dto-snapshot to win over the lookup label", a.CodexSecretLabel)
+	}
+
+	st.err = errors.New("boom")
+	b := heldDTO(held)
+	b.CodexSecretLabel = &snap
+	h.overlayCodexAccountActions(context.Background(), &b)
+	if b.CodexAccountAction != nil {
+		t.Fatalf("action = %v, want null after a failed lookup", b.CodexAccountAction)
+	}
+	if b.CodexSecretLabel == nil || *b.CodexSecretLabel != "dto-snapshot" {
+		t.Fatalf("label = %v, want the snapshot to survive a failed lookup", b.CodexSecretLabel)
+	}
+}
+
 // heldRunsStore is the runsStore handler fake plus the D6 batched read, answering only for the
 // ids the handler actually asks about, as the real query does.
 type heldRunsStore struct {

@@ -144,8 +144,9 @@ export function RunsLayout() {
   const [runs, setRuns] = useState<RunListItem[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
-  // PRD #295: the ">1 Anthropic token" gate for the personal credential badge,
-  // computed once from the viewer's secrets. A single-token user sees no badge.
+  // PRD #295 / #1730: per-harness credential counts for the personal badge gate,
+  // computed once from the viewer's secrets. A run shows its badge only when the
+  // viewer holds more than one credential of that run's harness.
   const [credentialCounts, setCredentialCounts] = useState({ claude: 0, codex: 0 });
 
   // The one runs fetch, extracted so an Expedite/undo can re-run it (reload below). The
