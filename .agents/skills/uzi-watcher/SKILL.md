@@ -139,11 +139,12 @@ message uzi received), is the `-m`-message entry in the `uzi-cli` skill's *Send 
 hazards. Single-quote the whole message so nothing is evaluated, and always re-read the
 revised plan at the next gate to confirm your instruction landed clean.
 
-**A revised plan byte-identical to the old one means the revise was dropped** (#1604). If
-a "resuming at the plan gate after a credential switch" status precedes it, the resume
-re-presented the stored plan and discarded the revision. Diff the two `plan_md` payloads,
-re-send the same feedback (`uzi run revise RUN < feedback.txt`, the text from the last
-`plan_feedback` payload), and watch from the new plan seq.
+**Check a byte-identical revised plan for a dropped revise** (#1604). If recorded
+`plan_feedback` and `plan_revising` are followed by a credential-switch resume
+that re-presents the stored plan, diff the `plan_md` payloads and verify the requested
+changes are missing. Capture the current plan seq, re-send the last `plan_feedback`
+payload's `feedback` text (`uzi run revise RUN < feedback.txt`), and pass that seq
+as the poller's fifth argument.
 
 ## Plan-trap checks (run before every approve)
 
