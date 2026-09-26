@@ -993,6 +993,12 @@ workers:
       namespace: kube-system
       podSelector:
         k8s-app: kube-dns
+      # Destination ports on the DNS PODS (a NetworkPolicy matches the pod port, not the
+      # Service port). kube-dns/CoreDNS pods listen on 53; OpenShift's DNS pods listen on
+      # 5353 behind a port-53 Service, so an OpenShift cluster sets [5353] here (and the
+      # namespace/podSelector above to its DNS daemonset). Each port is allowed for UDP and
+      # TCP. Used by both worker namespaces' policies.
+      ports: [53]
     # Allow workers to reach uzi's OWN in-cluster web Service (PRD #87 §5 / M5). A
     # browser-capable worker running `web-ux` drives uzi's web UI, which this floor
     # otherwise denies (it allows only DNS + the api). Selector-based, NOT an FQDN
@@ -1015,6 +1021,41 @@ workers:
   # off (no Antrea there, and kindnet enforces no NetworkPolicy whatsoever).
   fqdnEgress:
     enabled: false
+    # Which datapath expresses the named egress (denyCIDRs, allowFQDNs, and the forge hosts
+    # derived from forge.allowedBaseURLs):
+    #   antrea (default): one crd.antrea.io NetworkPolicy (worker-fqdn-egress.yaml). An
+    #          Antrea Allow jumps past the k8s NetworkPolicy floor, so no floor change is
+    #          needed.
+    #   ovn:   OVN-Kubernetes (e.g. OpenShift/OKD), worker-ovn-egress.yaml. OVN has no
+    #          Allow that bypasses NetworkPolicy, so this renders a COMPOSED pair in the
+    #          kube-native worker namespace: (a) a NetworkPolicy allowing egress to
+    #          0.0.0.0/0 EXCEPT ovn.exceptCIDRs (keeps pod/service/node/link-local lateral
+    #          traffic blocked while external traffic passes the floor), and (b) the
+    #          namespace's k8s.ovn.org EgressFirewall `default`: Deny each denyCIDRs entry,
+    #          Allow each derived forge host and allowFQDNs entry by dnsName on its ports,
+    #          then Deny 0.0.0.0/0. OVN resolves dnsName entries itself and refreshes them on
+    #          the record's TTL, so a name whose addresses rotate faster than its TTL can
+    #          briefly miss.
+    #          WILDCARDS ARE NOT A VERSION PREREQUISITE: a wildcard dnsName (e.g.
+    #          "*.anthropic.com") is enforced only on a cluster with the DNSNameResolver
+    #          feature (the `dnsnameresolvers.network.openshift.io` CRD), which OpenShift
+    #          ships as a Technology Preview feature gate, off by default. An API server
+    #          that ACCEPTS the object proves nothing about enforcement. So the render
+    #          REFUSES any `*` entry under provider ovn unless ovn.allowWildcards is true;
+    #          where the gate is off, list exact hostnames instead (e.g. api.anthropic.com
+    #          for *.anthropic.com) and verify reachability at runtime.
+    # tier/priority below apply to antrea only.
+    provider: antrea
+    ovn:
+      # REQUIRED with provider: ovn (the render fails if empty): every in-cluster and
+      # host range a worker must NOT reach through the external allow, typically the pod
+      # network, the service network, the node network and link-local. Example:
+      #   exceptCIDRs: [10.128.0.0/14, 172.30.0.0/16, 192.0.2.0/24, 169.254.0.0/16]
+      exceptCIDRs: []
+      # Set true ONLY on a cluster with the DNSNameResolver feature enabled (see above).
+      # False (default) fails the render on any "*" entry in allowFQDNs, so a cluster
+      # without the feature cannot silently receive an allow rule that matches nothing.
+      allowWildcards: false
     tier: application
     priority: 5
     # DROPPED FIRST, and not redundant with the default-deny floor: an FQDN rule
@@ -1113,6 +1154,21 @@ workers:
         fqdn: "pkg-containers.githubusercontent.com"
         ports: [443]
 
+# --- OpenShift / OKD ---------------------------------------------------------------
+# OFF by default. When true, the chart adds what OpenShift admission needs for the
+# hosted-worker namespaces (see docs/openshift.md):
+#   * `security.openshift.io/scc.podSecurityLabelSync: "false"` on both worker namespaces,
+#     so OpenShift's label syncer does not overwrite the chart's PodSecurity labels;
+#   * SCC `use` grants for the worker ServiceAccounts: `privileged` in the docker tier
+#     (its DinD sidecar is privileged in both postures), and a chart-rendered minimal SCC
+#     `<fullname>-worker` in the kube-native tier, admitting exactly what the controller
+#     renders there (uid 10001, or root with a fixed capability set under uidSplit).
+# These are ADMISSION grants only: the worker ServiceAccounts still hold no API verbs and
+# mount no token. The api, web and controller need nothing beyond `restricted-v2` once
+# their pinned ids are nulled (above).
+openshift:
+  enabled: false
+
 # --- web: nginx serving the SPA + reverse-proxying /api/* to the api Service -----
 web:
   enabled: true
@@ -1175,6 +1231,20 @@ web:
     tls:
       enabled: false
       secretName: uzi-tls
+  # Gateway API alternative to the Ingress above (gateway.networking.k8s.io/v1 HTTPRoute),
+  # for clusters that expose apps through a shared Gateway (e.g. OpenShift with a Gateway
+  # API implementation). MUTUALLY EXCLUSIVE with web.ingress: enabling both fails the render,
+  # so set web.ingress.enabled: false when turning this on. TLS terminates wherever your
+  # Gateway (or the router in front of it) terminates it; nothing TLS-specific renders here.
+  # /api/ws is a long-lived WebSocket: raise the idle timeout on whatever sits in front of
+  # the Gateway, as the ingress-nginx annotations above do for Ingress.
+  httpRoute:
+    enabled: false
+    # e.g. [uzi.example.com]
+    hostnames: []
+    # e.g. [{name: shared, namespace: gateway-system}] (Gateway API parentRefs, verbatim)
+    parentRefs: []
+    annotations: {}
 
 # --- Runtime secrets via Infisical (opt-in; used only when secrets.mode: infisical) ---
 # When selected, the chart renders InfisicalSecret CRs (from infisicalList) so a cluster
@@ -1214,6 +1284,14 @@ infisicalList:
 
 # Restricted-PodSecurity contexts (satisfy the `restricted` standard everywhere;
 # harmless where it is not enforced).
+#
+# OpenShift/OKD: the default `restricted-v2` SCC assigns each pod a UID and fsGroup from
+# the namespace's range and REJECTS a pod that pins its own. Null the three pinned ids in
+# your values and the rendered pods omit them (Helm deletes a key whose override is null):
+#   api_podSecurityContext: {runAsUser: null, runAsGroup: null, fsGroup: null}
+# (same for controller_podSecurityContext, web_podSecurityContext and, in simple mode,
+# database.simple.podSecurityContext). runAsNonRoot, seccomp and the dropped capabilities
+# stay. See docs/openshift.md.
 #
 # api: distroless static-nonroot image (uid/gid 65532); the server writes nothing
 # to disk, so its root fs is read-only (a small emptyDir covers /tmp for TLS/temp).

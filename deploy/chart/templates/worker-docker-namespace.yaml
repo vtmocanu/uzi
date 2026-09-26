@@ -58,6 +58,11 @@ metadata:
     pod-security.kubernetes.io/audit-version: latest
     pod-security.kubernetes.io/warn: restricted
     pod-security.kubernetes.io/warn-version: latest
+    {{- if .Values.openshift.enabled }}
+    # OpenShift rewrites a namespace's pod-security labels to match the SCCs its
+    # ServiceAccounts can use unless this opts out; the labels above are the contract.
+    security.openshift.io/scc.podSecurityLabelSync: "false"
+    {{- end }}
 {{- if .Values.workers.docker.quota.enabled }}
 {{- /*
   The docker tier's own ResourceQuota (Decision 8's k8s floor, per-tier). Docker

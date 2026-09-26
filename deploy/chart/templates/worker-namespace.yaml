@@ -62,6 +62,11 @@ metadata:
     pod-security.kubernetes.io/audit-version: latest
     pod-security.kubernetes.io/warn: restricted
     pod-security.kubernetes.io/warn-version: latest
+    {{- if .Values.openshift.enabled }}
+    # OpenShift rewrites a namespace's pod-security labels to match the SCCs its
+    # ServiceAccounts can use unless this opts out; the labels above are the contract.
+    security.openshift.io/scc.podSecurityLabelSync: "false"
+    {{- end }}
 {{- if .Values.workers.quota.enabled }}
 {{- /*
   Defense in depth at the k8s layer (Decision 8): an app-level bug must not let
