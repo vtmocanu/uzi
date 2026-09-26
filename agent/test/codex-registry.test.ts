@@ -697,23 +697,74 @@ describe("ExecutionRegistry: settleForCapture (issue #1766)", () => {
     assert.equal(closed.state(), "poisoned");
   });
 
+  // Load-tolerant: the upper bounds are generous so a slow CI host cannot flake them, while
+  // pollMs (and, for the hung reap, the reap itself) is far LONGER than those bounds. A loop
+  // that waited a full poll interval, restarted its deadline per pass, or awaited a reap without
+  // the one absolute deadline would exceed them (or never return and trip the test timeout).
   it("(g) the whole loop respects ONE deadline, even across a hung root reap and polling", async () => {
     const deadline = 120;
-    // A pending reservation keeps it polling until the deadline.
+    const HUGE_POLL = 60_000;
+    const GENEROUS = 5_000;
+    // A pending reservation keeps it polling until the deadline; each wait is clamped to what
+    // remains of the single deadline, never a full HUGE_POLL.
     const polling = new ExecutionRegistry(newLocalExecutionEpoch(1));
     assert.equal(polling.reserveLaunch("command").kind, "reserved");
     let started = Date.now();
-    assert.equal((await polling.settleForCapture(deadline, 50)).kind, "incomplete");
+    assert.equal((await polling.settleForCapture(deadline, HUGE_POLL)).kind, "incomplete");
     let elapsed = Date.now() - started;
     assert.ok(elapsed >= deadline - 5, `returned early: ${elapsed}ms`);
-    assert.ok(elapsed <= deadline + 50 + 40, `overran the deadline by more than one poll: ${elapsed}ms`);
+    assert.ok(elapsed < GENEROUS, `a poll wait was not clamped to the one deadline: ${elapsed}ms`);
 
     // A root whose reap never resolves cannot stretch it either.
     const hung = new ExecutionRegistry(newLocalExecutionEpoch(1));
     registerRoot(hung, new FakeRoot("provider", () => new Promise<ReapOutcome>(() => {})));
     started = Date.now();
-    assert.equal((await hung.settleForCapture(deadline, POLL)).kind, "incomplete");
+    assert.equal((await hung.settleForCapture(deadline, HUGE_POLL)).kind, "incomplete");
     elapsed = Date.now() - started;
-    assert.ok(elapsed <= deadline + POLL + 40, `a hung reap overran the deadline: ${elapsed}ms`);
+    assert.ok(elapsed < GENEROUS, `a hung reap overran the one deadline: ${elapsed}ms`);
+  });
+
+  it("(h) after a FAILED disposeTools (state stays poisoned, tables cleared) → incomplete, never a false empty", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    // Its reap is clean, so only the cleared tables could make the settle read empty.
+    const root = new FakeRoot("command", async () => ({ ok: true }), async () => {
+      throw new Error("dispose failed");
+    });
+    registerRoot(reg, root);
+    assert.equal(reg.reserveCallback(cb("in-flight")).kind, "admitted");
+    assert.equal(reg.reserveLaunch("provider").kind, "reserved");
+    const disposal = await reg.disposeTools(DEADLINE);
+    assert.equal(disposal.kind, "incomplete");
+    assert.equal(reg.state(), "poisoned", "a failed disposal is not \"disposed\"");
+    assert.equal(reg.pendingLaunchCount(), 0, "the launch table was cleared");
+    assert.equal(reg.inFlightCallbackCount(), 0, "the callback table was cleared");
+    const result = await reg.settleForCapture(500, POLL);
+    assert.equal(result.kind, "incomplete");
+    if (result.kind === "incomplete") {
+      assert.ok(result.errors.some((e) => e.message === "settleForCapture: registry disposed"));
+    }
+  });
+
+  it("(i) a disposeTools that fails WHILE a settle is draining → the settle answers incomplete", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    let failDispose!: () => void;
+    const disposeGate = new Promise<void>((resolve) => { failDispose = resolve; });
+    registerRoot(reg, new FakeRoot("command", async () => ({ ok: true }), async () => {
+      await disposeGate;
+      throw new Error("dispose failed");
+    }));
+    // The pending reservation keeps the settle polling until disposeTools clears it.
+    assert.equal(reg.reserveLaunch("provider").kind, "reserved");
+    const settle = reg.settleForCapture(2000, POLL);
+    await sleep(30);
+    const disposal = reg.disposeTools(DEADLINE);
+    failDispose();
+    assert.equal((await disposal).kind, "incomplete");
+    assert.equal(reg.state(), "poisoned");
+    const result = await settle;
+    assert.equal(result.kind, "incomplete");
+    if (result.kind === "incomplete") {
+      assert.ok(result.errors.some((e) => e.message === "settleForCapture: registry disposed during settle"));
+    }
   });
 });
