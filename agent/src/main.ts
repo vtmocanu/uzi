@@ -25,6 +25,7 @@ import { resolveDockerWiring, dockerSidecarExpected, type DockerWiring } from ".
 import { probeCodexRuntime } from "./codex/codex-runtime-probe.js";
 import { probeLandlockAvailability, resolveCodexHarnessAvailability } from "./codex/codex-capability.js";
 import { reapCodexCommandOrphans, type ReapOrphansResult } from "./codex/launcher.js";
+import { workerSecretDenyPaths } from "./guardrails.js";
 import type { ClaimCodexSecrets } from "./protocol.js";
 import type { CommandSandboxMode } from "./config.js";
 
@@ -205,6 +206,8 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
         // per-run feed line.
         commandSandbox: codexCommandSandbox,
         commandSandboxDegraded: codexSandboxDegraded,
+        // Issue #1761: the same worker-credential deny set the Claude path gets.
+        workerSecretPaths: workerSecretDenyPaths(workerTokenFile),
       },
       {
         // PRD #1171 m4 (F1): the RUNNER owns the terminal registry teardown. Its post-run
@@ -222,8 +225,9 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
   const executor = new SdkExecutor(log, runHome, {
     // Deny a Bash `cat` of the join-token file (a read-only secret mount
     // persists it); the built-in /run/secrets/ prefix already covers the
-    // shipping default, this adds a non-default UZI_WORKER_TOKEN_FILE path.
-    secretPaths: workerTokenFile ? [workerTokenFile] : [],
+    // shipping default, this adds a non-default UZI_WORKER_TOKEN_FILE path AND its
+    // directory (a relocated kube Secret, issue #1761; see workerSecretDenyPaths).
+    secretPaths: workerSecretDenyPaths(workerTokenFile),
     // The nix/devbox provisioning HOME + root stay SHARED worker-lifetime paths
     // (Decision 5): only the SDK $HOME (runHome) is per-run, so warm-start state
     // doesn't fragment per run. The per-run provision DIR still isolates the
@@ -465,7 +469,7 @@ async function main(): Promise<void> {
     config.executor === "stub"
       ? new StubChatExecutor(log)
       : new ChatExecutor(log, sdkHomeRoot, {
-          secretPaths: config.workerTokenFile ? [config.workerTokenFile] : [],
+          secretPaths: workerSecretDenyPaths(config.workerTokenFile),
         });
   const chatRunner = new ChatRunner(client, makeChatExecutor, log, config.messageBatchMs, {
     maxTurns: config.chatMaxTurns,

@@ -27,6 +27,11 @@ through `[0.52.0]`.)
 - **Hosted workers: larger `l` data volume and a higher docker-tier ephemeral-storage request ([#1757](https://github.com/vtmocanu/uzi/issues/1757)).**
   The `l` preset's `/data` PVC grows from 20Gi to 25Gi, and a docker-tier worker now requests 5Gi of ephemeral storage instead of 4Gi (`workers.docker.ephemeralRequest`): provisional headroom for the Codex command cache that also ranks a busy worker later under node disk pressure. The chart raises the matching ceilings: `limitRange.maxPVCStorage` 20Gi to 25Gi on both tiers, and `quota.requestsStorage` to 900Gi (restricted) and 650Gi (docker). A cluster that overrides `maxPVCStorage` below 25Gi must raise it: the controller validates the ceilings at startup and refuses to start, which stops reconciliation of every hosted worker. A smaller storage quota or ephemeral request override stays valid; it only limits how many workers fit. Existing workers keep their current PVCs (grow them in place where the StorageClass allows volume expansion). Docker workers roll once for the new request. A request never stops an eviction on a node whose root disk is too small; size worker nodes' root disks for the fleet.
 
+### Fixed
+
+- **Hosted workers no longer crash on OpenShift and OKD ([#1761](https://github.com/vtmocanu/uzi/issues/1761)).**
+  CRI-O on OpenShift mounts its own `/run/secrets` into every container, which hid the worker's join-token Secret, so every hosted worker exited at startup. The new `workers.secretMountPath` moves the Secret (for example `/run/uzi-secrets`), and the render refuses `openshift.enabled` without it. The value must be one lower-case directory directly under `/run`, and the controller refuses to start on one that overlaps another worker mount. The worker follows the new path through `UZI_WORKER_TOKEN_FILE`: its entrypoint checks the token's ownership and mode there, and its guardrails deny agent commands that name the Secret directory for Claude, chat and Codex runs. The worker image is pinned separately from the chart, so it must be a release carrying this change before you set the knob. The default mount and every existing install are unchanged. The OpenShift DNS example now includes `k8s-app: null`: without it the chart's default DNS label survived Helm's map merge and worker DNS matched no pod.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added

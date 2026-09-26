@@ -1150,7 +1150,7 @@ func TestDindContainersMountNoneOfTheWorkersVolumes(t *testing.T) {
 	// never see the untrusted build caches uid 10003 writes there.
 	forbiddenNames := map[string]bool{"token": true, "data": true, "nix": true, codexCmdCacheVolume: true}
 	forbiddenPaths := map[string]bool{
-		secretMountPath: true, dataMountPath: true, nixMountPath: true, nixSeedMountPath: true,
+		defaultSecretMountPath: true, dataMountPath: true, nixMountPath: true, nixSeedMountPath: true,
 		codexCmdCacheDir: true,
 	}
 

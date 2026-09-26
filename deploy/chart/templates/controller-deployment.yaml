@@ -199,6 +199,13 @@ spec:
             - name: UZI_WORKER_EPHEMERAL_REQUEST
               value: {{ . | quote }}
             {{- end }}
+            {{- /* Where the worker's join-token Secret mounts (issue #1761). Rendered only
+            when set, so a default install renders byte-identically; OpenShift sets it
+            because CRI-O shadows /run/secrets (uzi.validateSecretMountPath). */}}
+            {{- with .Values.workers.secretMountPath }}
+            - name: UZI_WORKER_SECRET_MOUNT_PATH
+              value: {{ . | quote }}
+            {{- end }}
             # The RESTRICTED tier's PVC admission ceiling (issue #224). The controller
             # constructs every worker PVC and is the only place in the system where all
             # the claimants exist at once — nixSize, each preset's DataSize and the dind

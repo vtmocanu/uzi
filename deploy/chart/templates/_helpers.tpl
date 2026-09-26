@@ -107,6 +107,24 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{- /*
+  uzi.validateSecretMountPath (issue #1761): workers.secretMountPath is empty (the
+  /run/secrets default) or ONE lower-case directory directly under /run, the same rule
+  the controller enforces at boot (kube.ValidateSecretMountPath, which also refuses an
+  overlap with another worker mount). With openshift.enabled the default is refused:
+  CRI-O shadows a volume at /run/secrets, so every hosted worker would crash-loop on a
+  missing token. Renders nothing for a valid value.
+*/ -}}
+{{- define "uzi.validateSecretMountPath" -}}
+{{- $p := .Values.workers.secretMountPath | default "" -}}
+{{- if and $p (ne $p "/run/secrets") (not (regexMatch "^/run/[a-z0-9][a-z0-9._-]*$" $p)) -}}
+{{- fail (printf "workers.secretMountPath must be a single lower-case directory directly under /run (for example /run/uzi-secrets), got %q" $p) -}}
+{{- end -}}
+{{- if and .Values.workers.enabled .Values.openshift.enabled (or (not $p) (eq $p "/run/secrets")) -}}
+{{- fail "openshift.enabled requires workers.secretMountPath (for example /run/uzi-secrets): CRI-O on OpenShift shadows a volume mounted at /run/secrets, so hosted workers would find no join token. The worker image must carry the matching change; see docs/openshift.md." -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
   uzi.apiServiceName: the in-cluster name of the api Service. LOAD-BEARING: the web
   nginx reverse-proxies `/api/*` to this exact name (same-origin, no CORS), so it
   MUST resolve to the api pods in the release namespace. Defaults to "api" (what the

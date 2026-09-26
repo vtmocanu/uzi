@@ -122,6 +122,12 @@ type Config struct {
 	// worker, so it must be read even on an instance with the docker tier off. Its
 	// docker counterpart lives with the other docker knobs below.
 	WorkerEphemeralRequest string
+	// WorkerSecretMountPath overrides where the worker's join-token Secret mounts
+	// (UZI_WORKER_SECRET_MOUNT_PATH, issue #1761). Empty ⇒ /run/secrets, the render
+	// default. OpenShift/OKD sets it because CRI-O shadows a volume at /run/secrets. Its
+	// shape and overlap rules are checked at boot by kube.ValidateSecretMountPath, which
+	// knows the other mount paths; here it is only trimmed.
+	WorkerSecretMountPath string
 	// WorkerMaxPVCStorage is the RESTRICTED tier's LimitRange maxPVCStorage
 	// (UZI_WORKER_MAX_PVC_STORAGE, issue #224). It is not used to render anything: it
 	// is the admission ceiling every PVC this controller creates must fit, and it
@@ -401,6 +407,10 @@ func loadWorkerSettings(cfg *Config) error {
 	if err := parseQuantityEnv("UZI_WORKER_EPHEMERAL_REQUEST", &cfg.WorkerEphemeralRequest); err != nil {
 		return err
 	}
+
+	// The join-token Secret mount override (issue #1761). Applies to every worker, so it
+	// is read here rather than with the docker-only knobs.
+	cfg.WorkerSecretMountPath = strings.TrimSpace(os.Getenv("UZI_WORKER_SECRET_MOUNT_PATH"))
 
 	// The restricted tier's PVC admission ceiling (issue #224). Read here, outside
 	// validateDockerTier, for the same reason as the ephemeral request above: every

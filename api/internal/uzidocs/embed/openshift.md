@@ -7,7 +7,8 @@ audience: operator
 # OpenShift and OKD
 
 The Helm chart targets a plain Kubernetes cluster by default: ingress-nginx for the web
-frontend, fixed pod ids, kube-dns, and Antrea for the hosted workers' named egress.
+frontend, fixed pod ids, kube-dns, Antrea for the hosted workers' named egress, and a
+join-token Secret mounted at `/run/secrets`.
 OpenShift and OKD differ on each of these. The knobs below adapt the chart. All of them are
 off by default, so an existing install renders exactly as before.
 
@@ -79,8 +80,14 @@ workers:
       namespace: openshift-dns
       podSelector:
         dns.operator.openshift.io/daemonset-dns: default
+        k8s-app: null
       ports: [5353]
 ```
+
+`k8s-app: null` is required. Helm deep-merges maps, so without it the chart default
+`k8s-app: kube-dns` stays in the selector next to the OpenShift label. No OpenShift DNS pod
+carries both labels, so the policy then matches nothing and every worker DNS lookup times
+out.
 
 Each listed port is allowed for both UDP and TCP, in both worker namespaces.
 
@@ -156,12 +163,43 @@ chart's render checks assert that equality.
 The docker tier is unaffected: it keeps its own NetworkPolicy, which allows the internet
 and excludes the in-cluster ranges you configure under `workers.docker.networkPolicy`.
 
+## Where the worker's join token mounts
+
+A hosted worker reads its join token and the api's CA from a Secret the controller mounts,
+by default at `/run/secrets`. On OpenShift that path is taken: CRI-O's default mounts file
+injects its own `/run/secrets` (subscription data and the ServiceAccount directory) into
+every container, and it shadows a volume mounted there. The worker then finds no token and
+exits at startup. Move the mount:
+
+```yaml
+workers:
+  secretMountPath: /run/uzi-secrets
+```
+
+The value must be one lower-case directory directly under `/run`. The controller also
+refuses to start if it overlaps another worker mount (for example `/run/dind`). With
+`openshift.enabled` the render fails until it is set.
+
+The worker IMAGE must carry the same change. `workers.image.tag` is pinned separately from
+the chart, so a chart upgrade alone does not move it. Before setting `secretMountPath`,
+make sure the worker image is the release that added this knob or newer. An older worker
+cannot find the token at the new path and exits at startup. Its guardrails would also not
+know the new directory; the uid split still keeps the token unreadable to the agent's
+commands.
+
+The worker follows the new path through `UZI_WORKER_TOKEN_FILE`: its entrypoint checks the
+token's ownership and mode there, as it does at `/run/secrets`. Its guardrails deny agent
+commands that name the Secret directory, including the Secret volume's `..data` aliases.
+The built-in `/run/secrets` deny stays in place.
+
 ## Admission for hosted workers
 
 ```yaml
 openshift:
   enabled: true
 ```
+
+This also requires `workers.secretMountPath` (see above).
 
 This adds, for the hosted-worker namespaces only:
 
@@ -193,7 +231,9 @@ rights, like the chart's PriorityClasses.
 `task render:openshift-check` runs in CI's chart job. It renders each knob offline and
 asserts:
 - the resulting objects, including the full custom SCC in both postures;
-- the guards that must refuse to render;
+- the guards that must refuse to render, including `openshift.enabled` without
+  `workers.secretMountPath`;
+- that the documented DNS selector contains only the OpenShift label;
 - that the defaults render none of it.
 
 It cannot prove admission or packet behaviour. Verify those on your cluster:

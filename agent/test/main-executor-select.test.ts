@@ -103,3 +103,27 @@ describe("buildRunExecutor — the stub-before-codex reorder (PRD #1429 M6)", ()
     }
   });
 });
+
+// Issue #1761: a relocated join-token Secret (OpenShift, where CRI-O shadows /run/secrets)
+// must reach BOTH harnesses' guards as the file AND its directory, and the default must stay
+// the file only. Reads the executors' private fields: the wiring, not a hand-built policy.
+describe("buildRunExecutor — worker secret deny paths (issue #1761)", () => {
+  const relocated = "/run/uzi-secrets/worker_token";
+
+  it("Claude runs deny the relocated token file and its Secret directory", () => {
+    const { executor } = buildRunExecutor("run-6", undefined, baseDeps({ workerTokenFile: relocated }));
+    assert.ok(executor instanceof SdkExecutor);
+    assert.deepEqual((executor as unknown as { secretPaths: readonly string[] }).secretPaths, [relocated, "/run/uzi-secrets"]);
+  });
+
+  it("Codex runs get the same deny set in their executor options", () => {
+    const { executor } = buildRunExecutor("run-7", VALID_SUBSCRIPTION_CODEX, baseDeps({ workerTokenFile: relocated }));
+    assert.ok(executor instanceof CodexExecutor);
+    assert.deepEqual((executor as unknown as { opts: { workerSecretPaths?: readonly string[] } }).opts.workerSecretPaths, [relocated, "/run/uzi-secrets"]);
+  });
+
+  it("the default /run/secrets token adds no directory (the built-in prefix covers it)", () => {
+    const { executor } = buildRunExecutor("run-8", undefined, baseDeps({ workerTokenFile: "/run/secrets/worker_token" }));
+    assert.deepEqual((executor as unknown as { secretPaths: readonly string[] }).secretPaths, ["/run/secrets/worker_token"]);
+  });
+});
