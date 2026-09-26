@@ -459,9 +459,10 @@ type RenderConfig struct {
 	// #1761). Empty means defaultSecretMountPath (/run/secrets), and then the rendered
 	// pod is byte-identical to before this field existed. OpenShift/OKD needs a
 	// non-default value, because CRI-O shadows a volume at /run/secrets. The worker
-	// IMAGE must carry the matching agent change (its entrypoint and guardrails follow
-	// UZI_WORKER_TOKEN_FILE); an older image would fail closed at startup. Validated
-	// once at boot by ValidateSecretMountPath.
+	// IMAGE must carry the matching agent change: an OLDER image still starts (it reads
+	// UZI_WORKER_TOKEN_FILE) but its guardrails deny only /run/secrets/, so the new
+	// directory would be unguarded. The knob alone does not prevent that pairing;
+	// ValidateSecretMountWorkerImage refuses it at boot, next to ValidateSecretMountPath.
 	SecretMountPath string
 }
 

@@ -180,12 +180,18 @@ The value must be one lower-case directory directly under `/run`. The controller
 refuses to start if it overlaps another worker mount (for example `/run/dind`). With
 `openshift.enabled` the render fails until it is set.
 
-The worker IMAGE must carry the same change. `workers.image.tag` is pinned separately from
-the chart, so a chart upgrade alone does not move it. Before setting `secretMountPath`,
-make sure the worker image is the release that added this knob or newer. An older worker
-cannot find the token at the new path and exits at startup. Its guardrails would also not
-know the new directory; the uid split still keeps the token unreadable to the agent's
-commands.
+The worker IMAGE must carry the same change, and uzi enforces that: `workers.image.tag`
+must be `0.85.0-rc.2` or newer (semver precedence, release candidates included, so
+`0.85.0-rc.1` is too old and `0.85.0` and `0.86.0-rc.1` qualify). The tag is pinned
+separately from the chart, so a chart upgrade alone does not move it. An older worker
+image would still start with a relocated Secret, because it reads `UZI_WORKER_TOKEN_FILE`,
+but its guardrails deny only `/run/secrets`, so agent commands naming the new directory
+would not be screened. Requiring `secretMountPath` does not prevent that pairing, so both
+the chart render and the controller at startup refuse it.
+
+A tag that is not a semver version (an image digest, `dev`) cannot be compared and is
+refused too. If you know that image carries the change, set
+`workers.secretMountPathAllowUnversionedImage: true`. It never accepts an older semver tag.
 
 The worker follows the new path through `UZI_WORKER_TOKEN_FILE`: its entrypoint checks the
 token's ownership and mode there, as it does at `/run/secrets`. Its guardrails deny agent

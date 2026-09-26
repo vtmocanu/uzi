@@ -119,6 +119,22 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if and $p (ne $p "/run/secrets") (not (regexMatch "^/run/[a-z0-9][a-z0-9._-]*$" $p)) -}}
 {{- fail (printf "workers.secretMountPath must be a single lower-case directory directly under /run (for example /run/uzi-secrets), got %q" $p) -}}
 {{- end -}}
+{{- /* A relocated Secret needs a worker image whose guardrails know the new directory
+  (issue #1761): an older image still starts (it reads UZI_WORKER_TOKEN_FILE) but screens
+  only /run/secrets/. Keep MIN in lockstep with kube.MinRelocatableMountWorkerTag; the
+  controller refuses the same pairing at boot. A non-semver tag cannot be compared and is
+  refused unless workers.secretMountPathAllowUnversionedImage says the image carries it. */ -}}
+{{- if and $p (ne $p "/run/secrets") .Values.workers.enabled -}}
+{{- $min := "0.85.0-rc.2" -}}
+{{- $tag := toString (.Values.workers.image.tag | default "") -}}
+{{- if regexMatch "^v?(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$" $tag -}}
+{{- if lt ((semver $tag).Compare (semver $min)) 0 -}}
+{{- fail (printf "workers.secretMountPath %q needs a worker image >= %s (its guardrails must know the relocated Secret directory), but workers.image.tag is %q" $p $min $tag) -}}
+{{- end -}}
+{{- else if not .Values.workers.secretMountPathAllowUnversionedImage -}}
+{{- fail (printf "workers.secretMountPath %q needs a worker image >= %s, but workers.image.tag %q is not a semver version; set workers.secretMountPathAllowUnversionedImage=true only if that image carries the relocated-Secret support" $p $min $tag) -}}
+{{- end -}}
+{{- end -}}
 {{- if and .Values.workers.enabled .Values.openshift.enabled (or (not $p) (eq $p "/run/secrets")) -}}
 {{- fail "openshift.enabled requires workers.secretMountPath (for example /run/uzi-secrets): CRI-O on OpenShift shadows a volume mounted at /run/secrets, so hosted workers would find no join token. The worker image must carry the matching change; see docs/openshift.md." -}}
 {{- end -}}

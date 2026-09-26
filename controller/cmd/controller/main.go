@@ -137,6 +137,13 @@ func main() {
 		log.Error("hosted-worker secret mount path is invalid; refusing to start", "error", err)
 		os.Exit(1)
 	}
+	// A relocated Secret paired with a worker image older than the release that follows
+	// it would START (the old image reads UZI_WORKER_TOKEN_FILE) but screen only
+	// /run/secrets/, leaving the new directory unguarded. Refuse the pairing here.
+	if err := kube.ValidateSecretMountWorkerImage(materializerCfg, cfg.WorkerImageTag, cfg.WorkerSecretMountAllowUnversionedImage); err != nil {
+		log.Error("hosted-worker image is too old for the relocated secret mount; refusing to start", "error", err)
+		os.Exit(1)
+	}
 
 	if err := kube.ValidatePVCCeilings(materializerCfg, resolver); err != nil {
 		log.Error("hosted-worker PVC sizes do not fit their namespace's LimitRange; refusing to start", "error", err)

@@ -148,6 +148,24 @@ export interface BuildRunExecutorDeps {
  * message (routing through the runner's failed-run catch), NEVER a Claude fallback and
  * NEVER a crash of executeClaim itself.
  */
+/**
+ * Build one chat session's executor (PRD #39). Exported so the wiring is testable: the real
+ * ChatExecutor must get the SAME worker-credential deny set as a run, including a
+ * relocated join-token Secret's directory (issue #1761, workerSecretDenyPaths).
+ */
+export function buildChatExecutor(deps: {
+  log: Logger;
+  sdkHomeRoot: string;
+  executorKind: ExecutorKind;
+  workerTokenFile?: string;
+}): ChatExecutorLike {
+  return deps.executorKind === "stub"
+    ? new StubChatExecutor(deps.log)
+    : new ChatExecutor(deps.log, deps.sdkHomeRoot, {
+        secretPaths: workerSecretDenyPaths(deps.workerTokenFile),
+      });
+}
+
 export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undefined, deps: BuildRunExecutorDeps): RunExecution {
   const { log, client, sdkHomeRoot, executorKind, stubPlanGate, workerTokenFile, dockerWiring, codexCommandSandbox, codexSandboxDegraded } = deps;
   let selection;
@@ -466,11 +484,7 @@ async function main(): Promise<void> {
   // resume. Chat is read-only (no clone, no PAT, no Bash), so the process-global
   // $HOME/.claude races that per-run HOME closes for runs don't apply the same way.
   const makeChatExecutor = (): ChatExecutorLike =>
-    config.executor === "stub"
-      ? new StubChatExecutor(log)
-      : new ChatExecutor(log, sdkHomeRoot, {
-          secretPaths: workerSecretDenyPaths(config.workerTokenFile),
-        });
+    buildChatExecutor({ log, sdkHomeRoot, executorKind: config.executor, workerTokenFile: config.workerTokenFile });
   const chatRunner = new ChatRunner(client, makeChatExecutor, log, config.messageBatchMs, {
     maxTurns: config.chatMaxTurns,
     turnTimeoutMs: config.chatTurnTimeoutMs,

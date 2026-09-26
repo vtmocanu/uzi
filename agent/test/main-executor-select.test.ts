@@ -8,7 +8,8 @@ import { WorkerClient } from "../src/client.js";
 import { StubExecutor } from "../src/executor.js";
 import { SdkExecutor } from "../src/sdk-executor.js";
 import { CodexExecutor, FailClosedExecutor } from "../src/codex/codex-executor.js";
-import { buildRunExecutor, type BuildRunExecutorDeps } from "../src/main.js";
+import { buildChatExecutor, buildRunExecutor, type BuildRunExecutorDeps } from "../src/main.js";
+import { ChatExecutor } from "../src/chat-executor.js";
 import type { ClaimCodexSecrets } from "../src/protocol.js";
 
 // PRD #1429 M6 — the harness-neutral e2e stub seam (`agent/src/main.ts`).
@@ -125,5 +126,28 @@ describe("buildRunExecutor — worker secret deny paths (issue #1761)", () => {
   it("the default /run/secrets token adds no directory (the built-in prefix covers it)", () => {
     const { executor } = buildRunExecutor("run-8", undefined, baseDeps({ workerTokenFile: "/run/secrets/worker_token" }));
     assert.deepEqual((executor as unknown as { secretPaths: readonly string[] }).secretPaths, ["/run/secrets/worker_token"]);
+  });
+});
+
+// Issue #1761 (should): the chat lane is a separate caller of workerSecretDenyPaths, so its
+// wiring gets its own regression: a chat session must deny a relocated token's directory too.
+describe("buildChatExecutor — worker secret deny paths (issue #1761)", () => {
+  const relocated = "/run/uzi-secrets/worker_token";
+  const read = (e: unknown) => (e as { secretPaths: readonly string[] }).secretPaths;
+
+  it("a chat session denies the relocated token file and its Secret directory", () => {
+    const e = buildChatExecutor({ log: nullLogger(), sdkHomeRoot: SDK_HOME_ROOT, executorKind: "sdk", workerTokenFile: relocated });
+    assert.ok(e instanceof ChatExecutor);
+    assert.deepEqual(read(e), [relocated, "/run/uzi-secrets"]);
+  });
+
+  it("the default /run/secrets token adds no directory", () => {
+    const e = buildChatExecutor({ log: nullLogger(), sdkHomeRoot: SDK_HOME_ROOT, executorKind: "sdk", workerTokenFile: "/run/secrets/worker_token" });
+    assert.deepEqual(read(e), ["/run/secrets/worker_token"]);
+  });
+
+  it("no configured token file means no extra deny paths (env-var delivery)", () => {
+    const e = buildChatExecutor({ log: nullLogger(), sdkHomeRoot: SDK_HOME_ROOT, executorKind: "sdk" });
+    assert.deepEqual(read(e), []);
   });
 });

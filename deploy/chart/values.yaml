@@ -678,10 +678,16 @@ workers:
   # worker mount (for example /run/dind).
   #
   # ⚠️ The worker IMAGE must carry the same change (workers.image.tag is decoupled from
-  # the chart and does not move with it): its entrypoint and guardrails follow
-  # UZI_WORKER_TOKEN_FILE. An older image cannot read the token at a custom path and
-  # fails closed at startup. See docs/openshift.md for the minimum version.
+  # the chart and does not move with it). An OLDER image still starts with a relocated
+  # Secret, but its guardrails deny only /run/secrets/, leaving the new directory
+  # unguarded. So both the render and the controller REFUSE a relocated path unless
+  # workers.image.tag is >= 0.85.0-rc.2 (semver precedence, prereleases included).
   secretMountPath: ""
+  # Only for a workers.image.tag that is NOT semver (a digest, `dev`), which cannot be
+  # compared with the minimum: true states that the image carries the relocated-Secret
+  # support. It never rescues an old semver tag. Rendered as the controller's
+  # UZI_WORKER_SECRET_MOUNT_ALLOW_UNVERSIONED_IMAGE.
+  secretMountPathAllowUnversionedImage: false
   # Namespace ResourceQuota (Decision 8). Defense in depth under the api's per-user
   # quota: an app-level bug must not noisy-neighbour a shared cluster.
   #

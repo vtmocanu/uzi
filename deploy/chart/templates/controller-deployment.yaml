@@ -206,6 +206,10 @@ spec:
             - name: UZI_WORKER_SECRET_MOUNT_PATH
               value: {{ . | quote }}
             {{- end }}
+            {{- if .Values.workers.secretMountPathAllowUnversionedImage }}
+            - name: UZI_WORKER_SECRET_MOUNT_ALLOW_UNVERSIONED_IMAGE
+              value: "true"
+            {{- end }}
             # The RESTRICTED tier's PVC admission ceiling (issue #224). The controller
             # constructs every worker PVC and is the only place in the system where all
             # the claimants exist at once — nixSize, each preset's DataSize and the dind
