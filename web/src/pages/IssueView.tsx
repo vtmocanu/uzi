@@ -74,6 +74,11 @@ export function IssueView() {
   // run really was created, so the user is taken to it wherever they are. The reset effect
   // below is also what keeps the ref current.
   const routeKeyRef = useRef(`${repoId}/${iidNum}`);
+  // The route key alone cannot tell two visits to the same issue apart: after A -> B -> A
+  // a late outcome of the FIRST visit's attempt would match again, surface its stale error
+  // and clear the busy flag of an attempt started on the second visit (#1727 review). This
+  // generation advances on every route change and on unmount, and each attempt captures it.
+  const routeGenRef = useRef(0);
   const [starting, setStarting] = useState(false);
   const [promoting, setPromoting] = useState(false);
   // PRD #241: the "Schedule…" entry point, pre-pinned to this issue.
@@ -95,6 +100,7 @@ export function IssueView() {
   // old issue) stay on screen, and the next issue does not inherit the old spinner.
   useEffect(() => {
     routeKeyRef.current = `${repoId}/${iidNum}`;
+    routeGenRef.current += 1;
     setIssue(null);
     setStarting(false);
     setPromoting(false);
@@ -102,6 +108,13 @@ export function IssueView() {
     setHarness(INHERIT_HARNESS);
     setActionError("");
   }, [repoId, iidNum]);
+  // Unmount ends every attempt too, so a late outcome never triggers a reload.
+  useEffect(
+    () => () => {
+      routeGenRef.current += 1;
+    },
+    [],
+  );
 
   const { data, loading, error: loadError, reload } = useAsyncData(
     async ({ isCurrent }) => {
@@ -160,6 +173,8 @@ export function IssueView() {
     // repo/issue mix (#1727 review).
     const attemptKey = `${repoId}/${issue.iid}`;
     if (routeKeyRef.current !== attemptKey) return;
+    const attemptGen = routeGenRef.current;
+    const live = () => routeKeyRef.current === attemptKey && routeGenRef.current === attemptGen;
     setActionError("");
     setStarting(true);
     // The shared helper carries the chosen credential override AND harness, and
@@ -171,10 +186,10 @@ export function IssueView() {
       // safeNextPath in Login.tsx). A no-op for today's UUID ids.
       onCreated: (runId) => navigate(`/runs/${encodeURIComponent(runId)}`),
       onError: (msg) => {
-        if (routeKeyRef.current === attemptKey) setActionError(msg);
+        if (live()) setActionError(msg);
       },
       onSettled: () => {
-        if (routeKeyRef.current !== attemptKey) return;
+        if (!live()) return;
         setStarting(false);
         reload();
       },
@@ -198,21 +213,23 @@ export function IssueView() {
     const target = issue;
     const attemptKey = `${repoId}/${target.iid}`;
     if (routeKeyRef.current !== attemptKey) return;
+    const attemptGen = routeGenRef.current;
+    const live = () => routeKeyRef.current === attemptKey && routeGenRef.current === attemptGen;
     setActionError("");
     setPromoting(true);
     try {
       const { card } = await api.promoteIssue(repoId, target.iid);
       // Adopt the labels onto the issue currently shown, and only if it is still the
       // one promoted (a same-route refetch may have replaced the object meanwhile).
-      if (routeKeyRef.current === attemptKey) {
+      if (live()) {
         setIssue((cur) => (cur && cur.iid === target.iid ? { ...cur, labels: card.labels } : cur));
       }
     } catch (err) {
-      if (routeKeyRef.current === attemptKey) {
+      if (live()) {
         setActionError(errorMessage(err, "Could not promote the issue"));
       }
     } finally {
-      if (routeKeyRef.current === attemptKey) setPromoting(false);
+      if (live()) setPromoting(false);
     }
   };
 

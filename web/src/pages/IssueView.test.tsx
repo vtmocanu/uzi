@@ -1257,6 +1257,110 @@ describe("IssueView — an action outcome cannot land on the next issue (#1727)"
 // without remounting (the data effect keys on [repoId, iidNum] and refetches), so the
 // picked credential must reset to inherit when the route identity changes — otherwise a
 // token pinned for issue A silently carries to issue B's Start run.
+// #1727 review: the route key alone cannot tell two visits to the same issue apart. After
+// A -> B -> A, a late outcome of the FIRST visit's attempt matched the key again, surfaced
+// its stale error and cleared the busy flag of the attempt started on the second visit.
+describe("IssueView — a first-visit outcome cannot land on a return visit (#1727)", () => {
+  function Nav() {
+    const navigate = useNavigate();
+    return (
+      <>
+        <button type="button" onClick={() => navigate("/repos/repo-1/issues/8")}>
+          go to B
+        </button>
+        <button type="button" onClick={() => navigate("/repos/repo-1/issues/7")}>
+          go to A
+        </button>
+      </>
+    );
+  }
+
+  function renderABA(labels: string[]) {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
+    mockApi.getIssue.mockImplementation(async (_repo: string, iid: number) => ({
+      issue:
+        iid === 7
+          ? anIssue({ iid: 7, title: "Issue A", labels, has_prd_link: false })
+          : anIssue({ iid: 8, title: "Issue B", labels, has_prd_link: false }),
+    }));
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/issues/7"]}>
+        <Routes>
+          <Route
+            path="/repos/:repoId/issues/:iid"
+            element={
+              <>
+                <Nav />
+                <IssueView />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  async function goBToA() {
+    fireEvent.click(screen.getByRole("button", { name: "go to B" }));
+    await screen.findByText("Issue B");
+    fireEvent.click(screen.getByRole("button", { name: "go to A" }));
+    await screen.findByText("Issue A");
+  }
+
+  it("drops the first visit's start failure and keeps the second attempt busy", async () => {
+    setAuth();
+    let rejectA1!: (e: unknown) => void;
+    mockApi.createRun
+      .mockReturnValueOnce(new Promise((_, rej) => (rejectA1 = rej)))
+      .mockReturnValueOnce(new Promise(() => {}));
+    renderABA(["uzi"]);
+
+    const startBtn = () => screen.getByRole("button", { name: /start run|starting/i }) as HTMLButtonElement;
+    await screen.findByText("Issue A");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    fireEvent.click(startBtn());
+    await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledTimes(1));
+
+    await goBToA();
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    fireEvent.click(startBtn());
+    await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledTimes(2));
+    expect(startBtn().disabled).toBe(true);
+
+    await act(async () => {
+      rejectA1(new ApiError(500, "worker pool is full"));
+    });
+    expect(screen.queryByText("worker pool is full")).toBeNull();
+    expect(startBtn().disabled).toBe(true);
+  });
+
+  it("drops the first visit's promote failure and keeps the second promote busy", async () => {
+    setAuth();
+    let rejectA1!: (e: unknown) => void;
+    mockApi.promoteIssue
+      .mockReturnValueOnce(new Promise((_, rej) => (rejectA1 = rej)))
+      .mockReturnValueOnce(new Promise(() => {}));
+    renderABA(["documentation"]);
+
+    const promoteBtn = () => screen.getByTitle(/Add the uzi label/) as HTMLButtonElement;
+    await screen.findByText("Issue A");
+    fireEvent.click(promoteBtn());
+    await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledTimes(1));
+
+    await goBToA();
+    fireEvent.click(promoteBtn());
+    await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledTimes(2));
+    expect(promoteBtn().disabled).toBe(true);
+
+    await act(async () => {
+      rejectA1(new ApiError(500, "forge said no"));
+    });
+    expect(screen.queryByText("forge said no")).toBeNull();
+    expect(promoteBtn().disabled).toBe(true);
+  });
+});
+
 describe("IssueView — the picked credential resets on issue navigation (PRD #1247)", () => {
   const aWorker = (): Worker => ({
     id: "w1",
