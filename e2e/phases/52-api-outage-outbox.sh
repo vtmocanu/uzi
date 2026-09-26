@@ -229,22 +229,12 @@ wait_terminal_lost() {
   done
   return 1
 }
-# api_back — bring the api up after an outage and make the HARNESS's own HTTP path usable
-# again. `web` is restarted alongside it, which is NOT belt-and-braces: nginx resolves the
-# `api` upstream ONCE at startup and caches the address for the worker's life
-# (`web/nginx.conf` uses a literal `proxy_pass http://api:8080` with no `resolver`), while
-# every wait_*/apiget in this harness goes through that proxy on $BASE. A stopped api frees
-# its container address, and CASE 4 restarts the agent while the api is down — the only
-# `compose restart` in the whole suite — so that address can be handed to the agent and the
-# api comes back on a different one, leaving nginx proxying to the wrong container.
-# Measured 2026-09-19 with the shipped web image on an isolated network: stop api, restart a
-# second container, start api, and the two addresses SWAP while the proxy goes from 404
-# (upstream reached) to 502. The product-side question — whether nginx should re-resolve —
-# is deliberately left to the maintainer; restarting web here only keeps the harness's own
-# plumbing honest and asserts nothing about the proxy.
+# api_back — bring the api up after an outage and wait for the harness's HTTP path
+# through web to recover. Compose nginx now re-resolves the api address after its
+# five-second DNS cache expires; the standalone compose-web-dns phase proves the
+# address-swap behavior directly. Case 4 still exercises the real outage path.
 api_back() {
   "${COMPOSE[@]}" up -d --wait api >/dev/null
-  "${COMPOSE[@]}" restart web >/dev/null 2>&1
   wait_http
   login
 }
@@ -254,7 +244,7 @@ api_back() {
 # fixed-length: see wait_spilled for why a bare `sleep` cannot bound the spill. The
 # total stays well under the 90s heartbeat-stale window raised below (~21s worst-case
 # spill + 25s the longest hold). No `docker compose start` (no phase uses it): stop,
-# then api_back (the 15-happy-path-restart idiom plus this phase's proxy caveat).
+# then api_back, which waits for the existing web proxy to recover.
 outage() {
   local run="$1" secs="$2" spilled=0
   say "cutting the api (> WORKER_TRANSIENT_TRIP_MS=3s) so the batcher spills run $run, then holding it down ${secs}s past the spill"

@@ -183,6 +183,7 @@ headers, not the rows.
 | 73 | forge-unreachable-park | gitlab | no | PRD #1392: pre-clone forge park — recovery_wait(forge_unreachable), promote+complete, cap-fail no judge, cancel |
 | 74 | codex-activation | gitlab | no | PRD #1429 M6: the joined Codex public activation, proved offline (stub harness-neutral seam) |
 | 75 | codex-rate-limit-meters | gitlab | no | PRD #1209: per-account Codex rate-limit meters (seeded snapshot row -> /me) |
+| 76 | compose-web-dns | any | no | Compose web re-resolves API DNS for REST and WebSocket |
 
 <!-- registry:end -->
 
