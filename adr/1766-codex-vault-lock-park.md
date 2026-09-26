@@ -35,14 +35,14 @@ costs at least one model turn, then finalize opens the merge request.
 The direct post-exchange case is covered by this same park: a vault that locks while resealing
 credential material the exchange just landed is answered `vault_locked` and parked like any other
 case here (`api/internal/workersvc/codexrefresh.go`, the seal branch around lines 687-720, surfaced
-through the caller's recheck around lines 484-492), provided the worker receives that answer. That
+through the caller's recheck around lines 492-497), provided the worker receives that answer. That
 seal failure quarantines the account whether or not the reply arrives — it is how the refreshed
 login is held pending vault unlock. One narrower path is explicitly **not** covered and is waived
 rather than closed here: a vault that locks while sealing after the provider exchange, when the
-worker does not receive the reply — a crash or dropped connection between the api's answer and the
-worker learning it — still fails the run. The worker's own reconcile treats the lost reply as a
-plain block with no deferral, and a same-operation retry is then refused by authorization because
-the account is quarantined. This is issue #1770, tracked separately (see "The waived path" below).
+worker does not receive the reply — a dropped connection between the api's answer and the worker
+learning it — still fails the run. The worker's own reconcile treats the lost reply as a plain
+block with no deferral, so the run fails; a same-operation retry would not help anyway, because
+authorization refuses it while the account is quarantined. This is issue #1770, tracked separately (see "The waived path" below).
 
 ## Context
 

@@ -191,12 +191,13 @@ The direct case — the vault locks right after the provider exchange, and the
 worker gets the answer — is covered by this park too: it is still answered
 `vault_locked` and parked like any other case above. Sealing after the
 exchange quarantines the account either way, to hold the refreshed login
-until the vault unlocks, whether or not the worker ever hears back. That is
-why a vault that locks while sealing after the provider exchange, when the
-worker does not receive the reply, still fails the run: a crash or dropped
-connection between the api's answer and the worker learning it means a retry
-of the same operation is refused by authorization instead, while the account
-stays quarantined. This is tracked separately; see
+until the vault unlocks, whether or not the worker ever hears back. A vault
+that locks while sealing after the provider exchange, when the worker does
+not receive the reply (a dropped connection between the api's answer and the
+worker learning it), still fails the run: the worker sees a plain transport
+error, not a typed `vault_locked` answer, so it blocks the boundary and fails
+as before. A retry would not help either, because the quarantined account
+refuses the same operation at authorization. This is tracked separately; see
 [issue #1770](https://github.com/vtmocanu/uzi/issues/1770).
 
 Because the account is quarantined in the directly covered case too, a
@@ -216,9 +217,9 @@ resumes.
 - `uzi tui` — this park stays in ON THE FLOOR and reads `~ vault wait`, like
   any other self-resolving recovery park; it also counts toward the board's
   vault-locked indicator alongside runs that are queued and blocked on the
-  same lock. Selecting the run shows the same park sentence and next retry
-  time as the run page and `uzi run get`, on the row's second line and in
-  the run detail.
+  same lock. Selecting the run shows the park and its next retry time on
+  the row's second line and in the run detail, shortened to fit the
+  terminal width.
 - The repo board's run badge carries no vault-specific tooltip; check the
   run page for the detail above.
 
