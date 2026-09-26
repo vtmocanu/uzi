@@ -74,6 +74,16 @@ func validateLiveSettleRequest(req apitypes.RecoveryLiveSettleRequest) error {
 //
 // Steps a-f read only the server's own rows, so every not_eligible or candidate_mismatch
 // answer is given without any forge call.
+//
+// Durability backstop. A checkpoint proof is time-limited: the api deletes the run's checkpoint
+// ref best-effort on terminal transitions (deleteCheckpointBestEffort, PRD #1030 M4), so the
+// commits H covers may never reach a durable public ref. The release relies on two things
+// instead: (a) it is same-worker only (step d), so the predecessor's work is already in the
+// successor's clone on this worker; and (b) the successor generation's OWN claim-time hold is
+// not touched by this settle and stays open, and its recovery archive computes prerequisites
+// only against a FRESH, verified forge default-branch tip (agent/src/git.ts, the D5
+// prerequisite resolution), never against the checkpoint ref. Checkpoint-only commits are
+// therefore never treated as public and remain in the successor's custody.
 func (s *Service) SettlePredecessorHoldLive(ctx context.Context, wkr store.Worker, runID, holdID uuid.UUID, req apitypes.RecoveryLiveSettleRequest) (apitypes.RecoverySettleResponse, error) {
 	// a. Shape.
 	if err := validateLiveSettleRequest(req); err != nil {

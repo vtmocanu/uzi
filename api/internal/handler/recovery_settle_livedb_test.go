@@ -349,6 +349,47 @@ func TestRecoverySettleReleasesByAncestryLiveDB(t *testing.T) {
 	e.assertOpen(e.sibGen, e.sibWork)
 }
 
+// TestRecoverySettleAckSurvivesRunChangeLiveDB (issue #1751 M2): an 'ancestry' release whose
+// ACK was lost is acknowledged from the stored row BEFORE the completed-run identity check, so
+// the retry still answers released after the run's own row moved on: its worker_id nulled (an
+// ephemeral worker reaped once custody released) or its claim_generation bumped (a later
+// claim). The retry makes ZERO forge calls and writes nothing; a DIFFERENT identity is still
+// not_eligible.
+func TestRecoverySettleAckSurvivesRunChangeLiveDB(t *testing.T) {
+	for _, tc := range []struct{ name, mutate string }{
+		{"worker reaped", `UPDATE runs SET worker_id = NULL WHERE id = $1`},
+		{"claim generation bumped", `UPDATE runs SET claim_generation = claim_generation + 1 WHERE id = $1`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newSettleEnv(t)
+			code, res, raw := e.settle(e.tokenA, e.run, e.pred, goodBody())
+			if code != http.StatusOK || res.Outcome != apitypes.RecoverySettleReleased || res.FinalHeadSha != settleHead {
+				t.Fatalf("settle = %d %+v (%s), want 200 released", code, res, raw)
+			}
+			want := e.hold(e.pred)
+			e.exec(tc.mutate, e.run)
+			hc0, cc0 := e.fake.calls()
+
+			code, res, raw = e.settle(e.tokenA, e.run, e.pred, goodBody())
+			if code != http.StatusOK || res.Outcome != apitypes.RecoverySettleReleased || res.FinalHeadSha != settleHead ||
+				res.RunID != e.run.String() || res.HoldID != e.pred.String() || res.Reason != "" {
+				t.Fatalf("retry after the run changed = %d %+v (%s), want idempotent released", code, res, raw)
+			}
+			if hc, cc := e.fake.calls(); hc != hc0 || cc != cc0 {
+				t.Fatalf("retry made forge calls (BranchHead %d->%d, CompareAncestry %d->%d), want none", hc0, hc, cc0, cc)
+			}
+			if got := e.hold(e.pred); got != want {
+				t.Fatalf("hold after the retry = %+v, want unchanged %+v", got, want)
+			}
+
+			// A different identity is never acknowledged, run change or not.
+			code, res, raw = e.settle(e.tokenA, e.run, e.pred, settleBody(1, 2, settlePushed, settleOther, settleAdopted))
+			e.assertRetained(code, res, raw, apitypes.RecoverySettleNotEligible)
+			e.assertOpen(e.sibGen, e.sibWork)
+		})
+	}
+}
+
 // TestRecoverySettleRejectsWorkerClaimsLiveDB: a fabricated worker claim never releases. An
 // extra proof field is a strict-decode 400; malformed SHAs/generations are 400; a forge that
 // reports diverged, unknown, unsupported, a missing branch, or an error leaves the hold open.
@@ -817,6 +858,31 @@ func TestRecoverySettleIsRateLimitedLiveDB(t *testing.T) {
 	}
 	// Worker B has its own bucket: its call is admitted (and not_eligible on A's run).
 	code, res, raw := e.settle(e.tokenB, e.run, e.sibWork, goodBody())
+	e.assertRetained(code, res, raw, apitypes.RecoverySettleNotEligible)
+	e.assertOpen(e.pred, e.sibGen, e.sibWork)
+}
+
+// TestRecoveryLiveSettleIsRateLimitedLiveDB (issue #1751 M2): the LIVE settle route rides the
+// same per-worker limiter on the REAL worker router, in its own route bucket. With a budget of
+// 2 the third call is a 429 that never reaches the forge, while ANOTHER worker keeps its own
+// budget.
+func TestRecoveryLiveSettleIsRateLimitedLiveDB(t *testing.T) {
+	e := newLiveEnv(t)
+	e.lf.refErr = errors.New("transient") // each admitted call reaches the forge once
+	e.router = e.routerWithWorkerLimiter(mw.NewLimiter(2, time.Hour, nil))
+	body := goodLiveBody(apitypes.RecoverySettleTargetCheckpoint)
+	for i := 1; i <= 2; i++ {
+		code, res, raw := e.settleLive(e.tokenA, e.run, e.pred, body)
+		e.assertRetained(code, res, raw, apitypes.RecoverySettleAncestryUnknown)
+	}
+	if code, _, raw := e.settleLive(e.tokenA, e.run, e.pred, body); code != http.StatusTooManyRequests {
+		t.Fatalf("third live settle = %d (%s), want 429", code, raw)
+	}
+	if refs, _ := e.lf.asked(); len(refs) != 2 {
+		t.Fatalf("RefHead calls = %d (%v), want 2 (the limited call must not reach the forge)", len(refs), refs)
+	}
+	// Worker B has its own bucket: its call is admitted (and not_eligible on A's run).
+	code, res, raw := e.settleLive(e.tokenB, e.run, e.sibWork, body)
 	e.assertRetained(code, res, raw, apitypes.RecoverySettleNotEligible)
 	e.assertOpen(e.pred, e.sibGen, e.sibWork)
 }

@@ -4789,7 +4789,7 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	if !ok {
 		return PublishResult{Published: false, Ref: "", Skipped: "unsupported"}, nil
 	}
-	ref := "refs/uzi-checkpoints/" + branch
+	ref := checkpointRefPrefix + branch
 
 	// 3. Repo + connection facts (clone URL, base URL, default branch, bot username,
 	// sealed PAT) come from the run claim context — the same INNER JOIN the claim

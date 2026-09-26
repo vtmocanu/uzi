@@ -224,6 +224,11 @@ const (
 // alone, that each SHA is an ancestor of (or equal to) that head. Like RecoverySettleRequest
 // there is NO field for the worker's own verdict (strict decode: an extra field is a 400), and
 // every SHA must be a 40-char lowercase hex commit id. The answer is a RecoverySettleResponse.
+//
+// Choosing Target: RecoverySettleTargetBranch is for run kinds whose runs.branch is set at
+// creation (task, ci_fix, mr_rework, ...). An issue or self_improve run has no runs.branch
+// while it is live, so it must use RecoverySettleTargetCheckpoint; "branch" answers
+// retained/not_eligible for it.
 type RecoveryLiveSettleRequest struct {
 	PredecessorGeneration int64  `json:"predecessor_generation"`
 	SuccessorGeneration   int64  `json:"successor_generation"`

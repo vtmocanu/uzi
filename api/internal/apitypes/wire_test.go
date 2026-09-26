@@ -1218,11 +1218,22 @@ func TestRecoverySettleReasonValues(t *testing.T) {
 		RecoverySettleNotEligible:       "not_eligible",
 		RecoverySettleCandidateMismatch: "candidate_mismatch",
 		RecoverySettleBranchMissing:     "branch_missing",
-		RecoverySettleTargetCheckpoint:  "checkpoint",
-		RecoverySettleTargetBranch:      "branch",
 	} {
 		if got != want {
 			t.Errorf("settle wire value = %q, want %q", got, want)
+		}
+	}
+}
+
+// TestRecoverySettleTargetValues pins the live settle target STRINGS (issue #1751 M2): the
+// worker sends them and the api validates against them, so a renamed value is a protocol break.
+func TestRecoverySettleTargetValues(t *testing.T) {
+	for got, want := range map[string]string{
+		RecoverySettleTargetCheckpoint: "checkpoint",
+		RecoverySettleTargetBranch:     "branch",
+	} {
+		if got != want {
+			t.Errorf("settle target wire value = %q, want %q", got, want)
 		}
 	}
 }
