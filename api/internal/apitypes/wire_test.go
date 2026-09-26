@@ -228,8 +228,8 @@ var runDTOKeys = []string{
 	"recovery_wait_cause", "recovery_retry_not_before", "forge_park_count", "forge_park_max",
 	// PRD #1590 D6: the derived owner action for a codex_account_unavailable hold (null otherwise).
 	"codex_account_action",
-	// PRD #1590 D6: the run's own snapshotted alias label, set only alongside codex_account_action.
-	"codex_secret_label",
+	// Issue #1730: the run's bound alias id and its independent snapshotted label.
+	"codex_secret_id", "codex_secret_label",
 	// PRD #841 M1: the per-run MR-rework override, tri-state *bool (null = inherit the
 	// owner default, resolved live). NOT omitempty — always on the wire, so the web can
 	// tell "no per-run opinion" (null) from an explicit true/false and render the

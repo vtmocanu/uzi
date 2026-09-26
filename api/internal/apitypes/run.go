@@ -690,18 +690,16 @@ type RunDTO struct {
 	// value honestly, the same rule as RecoveryWaitCause. It is a closed enum and carries no
 	// account label or identity; the label travels only in CodexSecretLabel.
 	CodexAccountAction *string `json:"codex_account_action"`
-	// CodexSecretLabel is the run's OWN snapshotted Codex alias label (runs.codex_secret_label,
-	// frozen when the run bound its alias), shown next to CodexAccountAction so the owner knows
-	// which login to fix (PRD #1590 D6). It is non-null ONLY when CodexAccountAction is non-null,
-	// so a run that is not held on its Codex account never carries it. A held run carries it on
-	// every read that derives the action: the owner's GetRun and ListRuns, and the admin's
-	// AdminListRuns and GetRun, the same owner-or-admin scope AnthropicSecretLabel rides. It is
-	// never read from the alias row, so it can never name a different account. Null when the
-	// snapshot is empty.
+	// CodexSecretID is the run's bound alias ID. Deleting the alias nulls this FK while
+	// retaining the snapshotted label, so consumers can mark the alias as deleted.
+	CodexSecretID *string `json:"codex_secret_id"`
+	// CodexSecretLabel is the run's snapshotted Codex alias label, available on every
+	// owner-or-admin run read regardless of status or CodexAccountAction. It is never
+	// read from the current alias row. The shared board has a separate DTO and does not
+	// expose credential labels. Null when the snapshot is empty.
 	//
-	// The label is USER-SUPPLIED text, so any consumer writing it to a terminal must sanitize;
-	// the CLI and TUI route it through cellText (and renderer.Plain), the same obligation as
-	// AnthropicSecretLabel above.
+	// The label is USER-SUPPLIED text, so terminal consumers must sanitize it as they
+	// do AnthropicSecretLabel.
 	CodexSecretLabel *string `json:"codex_secret_label"`
 	// RecoveryRetryNotBefore is when the server will promote a 'recovery_wait' run back to
 	// queued — the retry stamp the forge-park surface counts down to ("retry at HH:MM"). It is
