@@ -108,10 +108,17 @@ URL is refused so the token is never sent in the clear.
 A token carries a **scope**. A default (`uzc_`) token acts as your own user and
 reports `is_admin:false` even if you are an admin — that is the token's effective
 authority, not your résumé. The `admin` subcommands need an admin-scoped
-(`uza_`) token.
+(`uza_`) token. A `uza_` token is a **superset**, not a read-only token: it also
+acts as your own user exactly like `uzc_` (create, approve, cancel and extend your
+own runs, hand off tasks, edit your schedules), and additionally unlocks the
+read-only `admin` views. What stays read-only is the admin surface: the CLI
+exposes no admin write verbs (API admin writes require a browser session), and
+writes to another user's resources stay refused. So an admin needs
+only one stored credential; keep a separate `uzc_` context when you want a token
+that cannot read factory-wide state.
 
 **Named contexts.** The CLI can hold several stored credentials at once — a
-`uzc_` owner token and a `uza_` admin-read token, say — instead of forcing you
+`uzc_` owner token and a `uza_` admin token, say — instead of forcing you
 to overwrite one or juggle `UZI_TOKEN=…` per invocation. Each is a **context**:
 a name for one stored `{URL, token}` pair. The active context is resolved by
 precedence — `--context`/`-c <name>` flag > `$UZI_CONTEXT` > the sticky current
@@ -1163,7 +1170,7 @@ Triage a recommendation with its short id from `show`:
 
 The short id is resolved against the run's **current** review; an ambiguous
 prefix asks for a longer id and an unknown id asks you to refresh. Triage
-mutations are owner-only: a read-only `uza_` token can `show`/`stats` across the
+mutations are owner-only: a `uza_` token can `show`/`stats` across the
 factory but is refused (exit 4) writing another user's review.
 
 ### The cross-run backlog (`uzi review backlog`)
