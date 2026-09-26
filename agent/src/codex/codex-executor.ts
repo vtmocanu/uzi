@@ -1377,6 +1377,14 @@ export interface CodexExecutorOptions {
    * model-visible warning). Absent/false is the normal (confined or required) case.
    */
   readonly commandSandboxDegraded?: boolean;
+  /**
+   * Issue #1761: the worker-credential paths the command screen denies on top of the
+   * built-in `/run/secrets/` prefix (guardrails.workerSecretDenyPaths of the configured
+   * UZI_WORKER_TOKEN_FILE: the file and, when relocated, its Secret directory). Without
+   * it a Codex run on a worker whose join-token Secret mounts away from /run/secrets
+   * would screen only codex-data/. Absent keeps today's set.
+   */
+  readonly workerSecretPaths?: readonly string[];
 }
 
 // ─── The per-epoch provider bundle + shared executor-claim context (m4) ─────────
@@ -1765,7 +1773,7 @@ export class CodexExecutor implements Executor {
         // it. The provision root (dirname(homeRoot)/provision) and codex-session-store are
         // deliberately NOT added, and no `$CODEX_HOME` literal is used (D6 forbids paths derived
         // from model arguments).
-        screenPolicy: { dockerWired: this.opts.dockerWiring?.dockerHost !== undefined, extraSecretPaths: [path.join(this.homeRoot, "codex-data") + path.sep] },
+        screenPolicy: { dockerWired: this.opts.dockerWiring?.dockerHost !== undefined, extraSecretPaths: [path.join(this.homeRoot, "codex-data") + path.sep, ...(this.opts.workerSecretPaths ?? [])] },
         toolHandlers,
         registerToken,
         // Issue #1583: BOTH secret sets are scrubbed before a projection is bounded — the claim

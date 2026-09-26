@@ -89,9 +89,13 @@ const (
 	tokenKey  = "worker_token"
 	caCertKey = "ca.crt"
 
-	secretMountPath = "/run/secrets"
-	tokenPath       = secretMountPath + "/" + tokenKey
-	caCertPath      = secretMountPath + "/" + caCertKey
+	// defaultSecretMountPath is where the join-token Secret mounts unless
+	// RenderConfig.SecretMountPath overrides it (UZI_WORKER_SECRET_MOUNT_PATH). It is
+	// also the compose Docker-secret path, so the worker image's defaults match it.
+	// OpenShift/OKD needs the override: CRI-O's default mounts file injects its own
+	// /run/secrets into every container and SHADOWS a volume mounted there, so the
+	// worker would find no token and crash-loop (see ValidateSecretMountPath).
+	defaultSecretMountPath = "/run/secrets"
 
 	dataMountPath = "/data"
 	nixMountPath  = "/nix"
@@ -450,7 +454,28 @@ type RenderConfig struct {
 	// default install's pod carries no such env and stays byte-identical. Worker container
 	// only — the mode never comes off the wire and never touches the seed/dind containers.
 	CommandSandbox string
+	// SecretMountPath is where the worker's join-token Secret (worker_token + ca.crt)
+	// mounts, and so what UZI_WORKER_TOKEN_FILE and NODE_EXTRA_CA_CERTS point at (issue
+	// #1761). Empty means defaultSecretMountPath (/run/secrets), and then the rendered
+	// pod is byte-identical to before this field existed. OpenShift/OKD needs a
+	// non-default value, because CRI-O shadows a volume at /run/secrets. The worker
+	// IMAGE must carry the matching agent change: an OLDER image still starts (it reads
+	// UZI_WORKER_TOKEN_FILE) but its guardrails deny only /run/secrets/, so the new
+	// directory would be unguarded. The knob alone does not prevent that pairing;
+	// ValidateSecretMountWorkerImage refuses it at boot, next to ValidateSecretMountPath.
+	SecretMountPath string
 }
+
+// secretMountPath is the effective join-token Secret mount directory.
+func (c RenderConfig) secretMountPath() string {
+	if c.SecretMountPath == "" {
+		return defaultSecretMountPath
+	}
+	return c.SecretMountPath
+}
+
+func (c RenderConfig) tokenPath() string  { return c.secretMountPath() + "/" + tokenKey }
+func (c RenderConfig) caCertPath() string { return c.secretMountPath() + "/" + caCertKey }
 
 // names for one worker's objects.
 func deploymentName(id string) string { return NamePrefix + id }
@@ -724,7 +749,7 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 
 	env := []corev1.EnvVar{
 		{Name: "UZI_API_URL", Value: cfg.APIURL},
-		{Name: "UZI_WORKER_TOKEN_FILE", Value: tokenPath},
+		{Name: "UZI_WORKER_TOKEN_FILE", Value: cfg.tokenPath()},
 		{Name: "UZI_DATA_DIR", Value: dataMountPath},
 		{Name: "WORKER_MAX_CONCURRENT_RUNS", Value: strconv.Itoa(maxConcurrentRuns)},
 	}
@@ -732,7 +757,7 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// Node reads this path before startup and agent/src/client.ts uses plain fetch
 		// with no custom dispatcher, so trusting the cluster CA is pure pod spec —
 		// nothing in agent/ parses a CA today and nothing needs to.
-		env = append(env, corev1.EnvVar{Name: "NODE_EXTRA_CA_CERTS", Value: caCertPath})
+		env = append(env, corev1.EnvVar{Name: "NODE_EXTRA_CA_CERTS", Value: cfg.caCertPath()})
 	}
 	if w.Docker {
 		// The k8s branch of the keystone resolver (agent/src/docker-wiring.ts): set
@@ -881,7 +906,7 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		},
 	}}
 	workerMounts := []corev1.VolumeMount{
-		{Name: "token", MountPath: secretMountPath, ReadOnly: true},
+		{Name: "token", MountPath: cfg.secretMountPath(), ReadOnly: true},
 		{Name: "data", MountPath: dataMountPath},
 		{Name: "nix", MountPath: nixMountPath},
 		// Worker-only (issue #1598): see codexCmdCacheDir.

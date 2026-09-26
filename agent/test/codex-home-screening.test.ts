@@ -54,6 +54,7 @@ import type { CodexEffectLaunchSpec, CodexRootHandle } from "../src/codex/launch
 // PRD #1287 C5: record executed-test evidence for the strict completeness gate. `t.name` is the
 // exact clause `tests` title; a no-op under a bare `npm test` (CODEX_M4_EVIDENCE unset).
 import { recordConformanceEvidence } from "./conformance-evidence.js";
+import { workerSecretDenyPaths } from "../src/guardrails.js";
 
 // The executor's homeRoot is KNOWN so the test can name the literal epoch-0 provider-HOME path.
 const HOME_ROOT = "/data/agent-home/run-1";
@@ -476,5 +477,46 @@ describe("PRD #1287 D6: provider-HOME screening through the REAL CodexExecutor s
     assert.equal(allowedReads.length, 1, "the allowed in-worktree read reached the fileop client exactly once");
     assert.equal(replySuccess(rig, 53), true, "the allowed in-worktree read succeeded");
     recordConformanceEvidence(t.name, "pass");
+  });
+});
+
+// ================================================================================
+// Issue #1761: on OpenShift the join-token Secret mounts away from /run/secrets (CRI-O
+// shadows that path), so the built-in /run/secrets/ prefix no longer covers it. The worker
+// passes workerSecretDenyPaths(UZI_WORKER_TOKEN_FILE) into the executor, and the executor must
+// add it to the SAME screenPolicy every broker uses. Calibrated both ways: without the option
+// the kubelet atomic-writer alias of the relocated token reaches the spawn seam.
+describe("issue #1761: a relocated join-token Secret is screened through the REAL CodexExecutor", () => {
+  const RELOCATED_ALIAS = "/run/uzi-secrets/..data/worker_token";
+
+  function runWith(workerSecretPaths: readonly string[] | undefined) {
+    const rig = makeRig(defaultResponder);
+    const exec = new CodexExecutor(
+      noopLog,
+      HOME_ROOT,
+      { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider, ...(workerSecretPaths ? { workerSecretPaths } : {}) },
+      rig.deps,
+    );
+    rig.transport
+      .push(threadStarted())
+      .push(toolCall(51, "Bash", { command: `cat ${RELOCATED_ALIAS}` }, "c-token"))
+      .push(signalDone())
+      .push(turnCompleted("completed"))
+      .end();
+    const { ctx } = makeCtx();
+    return { rig, done: withTimeout(exec.run(ctx), 5000, "relocated-secret run") };
+  }
+
+  it("denies the relocated Secret's atomic-writer alias before the spawn seam", async () => {
+    const { rig, done } = runWith(workerSecretDenyPaths("/run/uzi-secrets/worker_token"));
+    await done;
+    assert.equal(rig.spawnCommandCalls.some((s) => s.argv.some((a) => a.includes(RELOCATED_ALIAS))), false, "the token read never reached the spawn seam");
+    assert.equal(replySuccess(rig, 51), false, "the token-read Bash callback was DENIED");
+  });
+
+  it("calibration: WITHOUT workerSecretPaths the same read reaches the spawn seam (the option is load-bearing)", async () => {
+    const { rig, done } = runWith(undefined);
+    await done;
+    assert.equal(rig.spawnCommandCalls.some((s) => s.argv.some((a) => a.includes(RELOCATED_ALIAS))), true, "without the option the alias is not screened");
   });
 });

@@ -104,6 +104,8 @@ func main() {
 		UIDSplit:       cfg.WorkerUIDSplit,
 		CommandSandbox: cfg.WorkerCommandSandbox,
 		APICAPEM:       cfg.APICAPEM,
+		// Where the join-token Secret mounts (issue #1761); empty keeps /run/secrets.
+		SecretMountPath: cfg.WorkerSecretMountPath,
 	}
 	// The apiclient doubles as the cordon-write channel (PRD #422 M4): its RequestDrain
 	// satisfies kube.Cordoner, so a busy drifted worker is cordoned and drained rather
@@ -128,6 +130,21 @@ func main() {
 	// tick forever with the cause in one log line nobody reads. The worker provisions
 	// and never appears. A CrashLoopBackOff naming the two numbers is strictly louder
 	// than a fleet that silently never materialises.
+	// REFUSE TO BOOT on a malformed or overlapping join-token mount override (issue
+	// #1761): a bad value would otherwise surface only as every hosted worker
+	// crash-looping on a missing token, with the cause nowhere near this config.
+	if err := kube.ValidateSecretMountPath(materializerCfg); err != nil {
+		log.Error("hosted-worker secret mount path is invalid; refusing to start", "error", err)
+		os.Exit(1)
+	}
+	// A relocated Secret paired with a worker image older than the release that follows
+	// it would START (the old image reads UZI_WORKER_TOKEN_FILE) but screen only
+	// /run/secrets/, leaving the new directory unguarded. Refuse the pairing here.
+	if err := kube.ValidateSecretMountWorkerImage(materializerCfg, cfg.WorkerImageTag, cfg.WorkerSecretMountAllowUnversionedImage); err != nil {
+		log.Error("hosted-worker image is too old for the relocated secret mount; refusing to start", "error", err)
+		os.Exit(1)
+	}
+
 	if err := kube.ValidatePVCCeilings(materializerCfg, resolver); err != nil {
 		log.Error("hosted-worker PVC sizes do not fit their namespace's LimitRange; refusing to start", "error", err)
 		os.Exit(1)

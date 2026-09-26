@@ -149,11 +149,25 @@ for d in uzi-api uzi-web uzi-controller uzi-postgres; do
 done
 
 # --- (d) configurable DNS ports -----------------------------------------------------------
-render "$WORK/dns.yaml" -f "$WORK/workers.yaml" --set 'workers.networkPolicy.dns.ports={5353}' \
-  --set workers.networkPolicy.dns.namespace=openshift-dns
+# The documented OpenShift DNS peer (docs/openshift.md). `k8s-app: null` is load-bearing:
+# Helm DEEP-MERGES maps, so without it the chart default `k8s-app: kube-dns` survives next
+# to the OpenShift label and the selector matches no DNS pod (every lookup times out).
+cat > "$WORK/dns-values.yaml" <<'EOF'
+workers:
+  networkPolicy:
+    dns:
+      namespace: openshift-dns
+      podSelector:
+        dns.operator.openshift.io/daemonset-dns: default
+        k8s-app: null
+      ports: [5353]
+EOF
+render "$WORK/dns.yaml" -f "$WORK/workers.yaml" -f "$WORK/dns-values.yaml"
 got=$(q "$WORK/dns.yaml" '[select(.kind == "NetworkPolicy" and .apiVersion == "networking.k8s.io/v1") | .spec.egress[]? | select(.to[]?.namespaceSelector.matchLabels."kubernetes.io/metadata.name" == "openshift-dns") | .ports[] | .protocol + "/" + (.port | tostring)] | sort | join(",")')
 [ -n "$got" ] || { echo "BROKEN: no openshift-dns egress rule rendered" >&2; exit 2; }
 [ "$got" = "TCP/5353,TCP/5353,UDP/5353,UDP/5353" ] && ok "both worker policies allow DNS on UDP+TCP 5353 only" || bad "DNS egress renders '$got'"
+got=$(q "$WORK/dns.yaml" '[select(.kind == "NetworkPolicy" and .apiVersion == "networking.k8s.io/v1") | .spec.egress[]? | .to[]? | select(.namespaceSelector.matchLabels."kubernetes.io/metadata.name" == "openshift-dns") | .podSelector.matchLabels | to_entries | map(.key + "=" + .value) | join("+")] | unique | join(",")')
+[ "$got" = "dns.operator.openshift.io/daemonset-dns=default" ] && ok "the DNS peer selects ONLY the OpenShift DNS label (chart-default k8s-app removed)" || bad "DNS peer podSelector renders '$got' (a leftover k8s-app label matches no OpenShift DNS pod)"
 
 # --- (e) OVN provider ---------------------------------------------------------------------
 refuse "is not supported" -f "$WORK/workers.yaml" --set workers.fqdnEgress.enabled=true --set workers.fqdnEgress.provider=calico
@@ -237,7 +251,7 @@ supplementalGroups=RunAsAny
 seLinux=MustRunAs
 seccomp=runtime/default
 volumes=emptyDir,persistentVolumeClaim,secret"
-render "$WORK/os.yaml" -f "$WORK/workers.yaml" --set openshift.enabled=true
+render "$WORK/os.yaml" -f "$WORK/workers.yaml" --set openshift.enabled=true --set workers.secretMountPath=/run/uzi-secrets --set workers.image.tag=0.85.0-rc.2
 [ "$(count "$WORK/os.yaml" SecurityContextConstraints uzi-worker)" = 1 ] || { echo "BROKEN: SCC uzi-worker absent" >&2; exit 2; }
 want="$COMMON
 runAsUser=MustRunAsRange:10001-10001
@@ -252,7 +266,7 @@ got=$(scc_env "$WORK/os.yaml")
 $want
 --- got
 $got"
-render "$WORK/os-split.yaml" -f "$WORK/workers.yaml" --set openshift.enabled=true --set workers.uidSplit.enabled=true
+render "$WORK/os-split.yaml" -f "$WORK/workers.yaml" --set openshift.enabled=true --set workers.secretMountPath=/run/uzi-secrets --set workers.image.tag=0.85.0-rc.2 --set workers.uidSplit.enabled=true
 want="$COMMON
 runAsUser=RunAsAny:-
 $TAIL
@@ -276,6 +290,33 @@ n=$(q "$WORK/os.yaml" '[select(.kind == "Namespace") | select(.metadata.labels."
 [ "$n" = 2 ] && ok "both worker namespaces opt out of OpenShift label sync" || bad "label-sync opt-out on $n namespaces, expected 2"
 n=$(q "$WORK/os.yaml" '[select(.kind == "Role") | .rules[]?.resourceNames[]? | select(. == "anyuid")] | length')
 [ "$n" = 0 ] && ok "no anyuid grant" || bad "a Role grants anyuid"
+
+# --- (g) workers.secretMountPath (issue #1761) ------------------------------------------------
+# CRI-O on OpenShift shadows a volume at /run/secrets, so the join-token Secret mount must
+# move there, and openshift.enabled must not render without it.
+ctrl_env() { q "$1" '[select(.kind == "Deployment" and .metadata.name == "uzi-controller") | .spec.template.spec.containers[0].env[]? | select(.name == "UZI_WORKER_SECRET_MOUNT_PATH") | .value] | join(",")'; }
+render "$WORK/sm-default.yaml" -f "$WORK/workers.yaml"
+[ -z "$(ctrl_env "$WORK/sm-default.yaml")" ] && ok "default: the controller carries no UZI_WORKER_SECRET_MOUNT_PATH (worker pods unchanged)" || bad "default render sets UZI_WORKER_SECRET_MOUNT_PATH"
+render "$WORK/sm-custom.yaml" -f "$WORK/workers.yaml" --set workers.secretMountPath=/run/uzi-secrets --set workers.image.tag=0.85.0-rc.2
+[ "$(ctrl_env "$WORK/sm-custom.yaml")" = "/run/uzi-secrets" ] && ok "a custom secretMountPath reaches the controller env" || bad "custom secretMountPath renders '$(ctrl_env "$WORK/sm-custom.yaml")'"
+refuse "openshift.enabled requires workers.secretMountPath" -f "$WORK/workers.yaml" --set openshift.enabled=true
+refuse "openshift.enabled requires workers.secretMountPath" -f "$WORK/workers.yaml" --set openshift.enabled=true --set workers.secretMountPath=/run/secrets
+refuse "must be a single lower-case directory directly under /run" -f "$WORK/workers.yaml" --set workers.secretMountPath=/data/secrets
+refuse "must be a single lower-case directory directly under /run" -f "$WORK/workers.yaml" --set workers.secretMountPath=/run/uzi-secrets/
+# A relocated Secret needs a worker image whose guardrails know the new directory: an older
+# image STARTS (it reads UZI_WORKER_TOKEN_FILE) but screens only /run/secrets/.
+refuse "needs a worker image >= 0.85.0-rc.2" -f "$WORK/workers.yaml" --set workers.secretMountPath=/run/uzi-secrets --set workers.image.tag=0.85.0-rc.1
+refuse "needs a worker image >= 0.85.0-rc.2" -f "$WORK/workers.yaml" --set workers.secretMountPath=/run/uzi-secrets --set workers.image.tag=0.84.0
+refuse "is not a semver version" -f "$WORK/workers.yaml" --set workers.secretMountPath=/run/uzi-secrets --set workers.image.tag=dev
+refuse "needs a worker image >= 0.85.0-rc.2" -f "$WORK/workers.yaml" --set workers.secretMountPath=/run/uzi-secrets --set workers.image.tag=0.85.0-rc.1 --set workers.secretMountPathAllowUnversionedImage=true
+for tag in 0.85.0-rc.2 0.85.0-rc.10 0.85.0 0.86.0-rc.1; do
+  render "$WORK/sm-tag.yaml" -f "$WORK/workers.yaml" --set workers.secretMountPath=/run/uzi-secrets --set "workers.image.tag=$tag"
+  ok "a relocated Secret renders with worker image $tag"
+done
+render "$WORK/sm-unver.yaml" -f "$WORK/workers.yaml" --set workers.secretMountPath=/run/uzi-secrets --set workers.image.tag=dev --set workers.secretMountPathAllowUnversionedImage=true
+[ "$(q "$WORK/sm-unver.yaml" '[select(.kind == "Deployment" and .metadata.name == "uzi-controller") | .spec.template.spec.containers[0].env[]? | select(.name == "UZI_WORKER_SECRET_MOUNT_ALLOW_UNVERSIONED_IMAGE") | .value] | join(",")')" = "true" ] && ok "the unversioned-image escape hatch reaches the controller env" || bad "escape hatch not rendered"
+render "$WORK/sm-oldtag-default.yaml" -f "$WORK/workers.yaml" --set workers.image.tag=0.80.0
+ok "the default mount path is unaffected by an old worker image tag"
 
 if [ "$fail" -ne 0 ]; then
   echo "FAIL: the OpenShift/OKD chart knobs do not render as documented (docs/openshift.md)" >&2

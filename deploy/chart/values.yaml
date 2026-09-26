@@ -668,6 +668,26 @@ workers:
   # schedule instead of by luck. The controller's render.go states the three
   # mechanisms and a unit test enforces it.
   ephemeralRequest: 512Mi
+  # Where the hosted worker's join-token Secret (worker_token + ca.crt) mounts (issue
+  # #1761). Empty keeps the default /run/secrets, and then nothing about the worker pod
+  # changes. OpenShift/OKD MUST set it (the render fails otherwise when
+  # openshift.enabled): CRI-O's default mounts file injects its own /run/secrets into
+  # every container and SHADOWS a volume mounted there, so the worker finds no token and
+  # crash-loops. Must be ONE lower-case directory directly under /run, e.g.
+  # /run/uzi-secrets; the controller also refuses to boot on one that overlaps another
+  # worker mount (for example /run/dind).
+  #
+  # ⚠️ The worker IMAGE must carry the same change (workers.image.tag is decoupled from
+  # the chart and does not move with it). An OLDER image still starts with a relocated
+  # Secret, but its guardrails deny only /run/secrets/, leaving the new directory
+  # unguarded. So both the render and the controller REFUSE a relocated path unless
+  # workers.image.tag is >= 0.85.0-rc.2 (semver precedence, prereleases included).
+  secretMountPath: ""
+  # Only for a workers.image.tag that is NOT semver (a digest, `dev`), which cannot be
+  # compared with the minimum: true states that the image carries the relocated-Secret
+  # support. It never rescues an old semver tag. Rendered as the controller's
+  # UZI_WORKER_SECRET_MOUNT_ALLOW_UNVERSIONED_IMAGE.
+  secretMountPathAllowUnversionedImage: false
   # Namespace ResourceQuota (Decision 8). Defense in depth under the api's per-user
   # quota: an app-level bug must not noisy-neighbour a shared cluster.
   #
@@ -1166,6 +1186,8 @@ workers:
 #     (its DinD sidecar is privileged in both postures), and a chart-rendered minimal SCC
 #     `<fullname>-worker` in the kube-native tier, admitting exactly what the controller
 #     renders there (uid 10001, or root with a fixed capability set under uidSplit).
+# It also REQUIRES workers.secretMountPath (see there): CRI-O shadows /run/secrets on
+# OpenShift, so the render fails while it is left at the default.
 # These are ADMISSION grants only: the worker ServiceAccounts still hold no API verbs and
 # mount no token. The api, web and controller need nothing beyond `restricted-v2` once
 # their pinned ids are nulled (above).
