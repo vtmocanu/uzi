@@ -440,49 +440,52 @@ describe("IssueView autopilot badge (PRD #102 review M-1)", () => {
   });
 });
 
+// A worker and an Anthropic token, the facts a runnable Start needs (shared by the
+// Start gate suite and the #1727 navigation suite).
+const aWorker = (): Worker => ({
+  id: "w1",
+  name: "laptop",
+  status: "online",
+  busy: false,
+  kind: "external",
+  hosted_size: null,
+  active_runs: 0,
+  max_concurrent_runs: null,
+  template_declared: null,
+  template_reported: null,
+  version: null,
+  upgrade_status: "unknown",
+  upgrade_detail: null,
+  upgrade_target: "",
+  upgrade_blocking_container: null,
+  upgrade_blocking_reason: null,
+  upgrade_last_exit_code: null,
+  last_heartbeat_at: null,
+  created_at: "2026-01-01T00:00:00Z",
+  stats_cpu_pct: null,
+  stats_mem_bytes: null,
+  stats_mem_limit_bytes: null,
+  stats_source: null,
+  stats_disk_nix_bytes: null,
+  stats_disk_nix_total_bytes: null,
+  stats_disk_data_bytes: null,
+  stats_disk_data_total_bytes: null,
+  anthropic_secret_id: null,
+  anthropic_secret_label: null,
+  anthropic_bind_mode: "default",
+  draining_since: null,
+});
+const aToken = (): SecretMeta => ({
+  id: "sec-1",
+  label: "default",
+  is_default: true,
+  auto_eligible: false,
+  kind: "anthropic_token",
+  created_at: "2026-01-01T00:00:00Z",
+  updated_at: "2026-01-01T00:00:00Z",
+});
+
 describe("IssueView Start gate (PRD #764)", () => {
-  const aWorker = (): Worker => ({
-    id: "w1",
-    name: "laptop",
-    status: "online",
-    busy: false,
-    kind: "external",
-    hosted_size: null,
-    active_runs: 0,
-    max_concurrent_runs: null,
-    template_declared: null,
-    template_reported: null,
-    version: null,
-    upgrade_status: "unknown",
-    upgrade_detail: null,
-    upgrade_target: "",
-    upgrade_blocking_container: null,
-    upgrade_blocking_reason: null,
-    upgrade_last_exit_code: null,
-    last_heartbeat_at: null,
-    created_at: "2026-01-01T00:00:00Z",
-    stats_cpu_pct: null,
-    stats_mem_bytes: null,
-    stats_mem_limit_bytes: null,
-    stats_source: null,
-    stats_disk_nix_bytes: null,
-    stats_disk_nix_total_bytes: null,
-    stats_disk_data_bytes: null,
-    stats_disk_data_total_bytes: null,
-    anthropic_secret_id: null,
-    anthropic_secret_label: null,
-    anthropic_bind_mode: "default",
-    draining_since: null,
-  });
-  const aToken = (): SecretMeta => ({
-    id: "sec-1",
-    label: "default",
-    is_default: true,
-    auto_eligible: false,
-    kind: "anthropic_token",
-    created_at: "2026-01-01T00:00:00Z",
-    updated_at: "2026-01-01T00:00:00Z",
-  });
 
   it("enables Start on a uzi issue with NO PRD link once a worker + token exist (PRD #764)", async () => {
     setAuth();
@@ -1053,6 +1056,114 @@ describe("IssueView — a promote error clears on issue navigation (item 4a)", (
     fireEvent.click(screen.getByRole("button", { name: "go to B" }));
     await screen.findByText("Issue B");
     expect(screen.queryByText("forge said no")).toBeNull();
+  });
+});
+
+// Issue #1727 review. The action error no longer clears on settle, so an outcome that
+// arrives AFTER the user navigated A -> B (same IssueView instance; the route reset effect
+// has already run) would land on B. The handlers drop an outcome whose route identity
+// changed since the attempt began.
+//
+// Mutation-checked: removing the route-identity check from the start/promote handlers
+// shows A's error on B (observed red: "worker pool is full" / "forge said no" found), and
+// removing it from the promote success path replaces B's header with A's ("Issue A").
+describe("IssueView — an action outcome cannot land on the next issue (#1727)", () => {
+  function NavToB() {
+    const navigate = useNavigate();
+    return (
+      <button type="button" onClick={() => navigate("/repos/repo-1/issues/8")}>
+        go to B
+      </button>
+    );
+  }
+
+  function renderAB(labels: string[]) {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
+    mockApi.getIssue.mockImplementation(async (_repo: string, iid: number) => ({
+      issue:
+        iid === 7
+          ? anIssue({ iid: 7, title: "Issue A", labels, has_prd_link: false })
+          : anIssue({ iid: 8, title: "Issue B", labels, has_prd_link: false }),
+    }));
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/issues/7"]}>
+        <Routes>
+          <Route
+            path="/repos/:repoId/issues/:iid"
+            element={
+              <>
+                <NavToB />
+                <IssueView />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  it("drops a start failure for A that arrives after navigating to B", async () => {
+    setAuth();
+    let rejectA!: (e: unknown) => void;
+    mockApi.createRun.mockReturnValueOnce(new Promise((_, rej) => (rejectA = rej)));
+    renderAB(["uzi"]);
+
+    const startBtn = () => screen.getByRole("button", { name: /start run|starting/i }) as HTMLButtonElement;
+    await screen.findByText("Issue A");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    fireEvent.click(startBtn());
+    await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledWith("repo-1", 7, undefined));
+
+    fireEvent.click(screen.getByRole("button", { name: "go to B" }));
+    await screen.findByText("Issue B");
+    await act(async () => {
+      rejectA(new ApiError(500, "worker pool is full"));
+    });
+    // A's attempt still settles (B's Start is usable again), but its error is dropped.
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    expect(screen.queryByText("worker pool is full")).toBeNull();
+    expect(screen.getByText("Issue B")).toBeTruthy();
+  });
+
+  it("drops a promote failure for A that arrives after navigating to B", async () => {
+    setAuth();
+    let rejectA!: (e: unknown) => void;
+    mockApi.promoteIssue.mockReturnValueOnce(new Promise((_, rej) => (rejectA = rej)));
+    renderAB(["documentation"]);
+
+    await screen.findByText("Issue A");
+    fireEvent.click(screen.getByRole("button", { name: /Promote to uzi/ }));
+    await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledWith("repo-1", 7));
+
+    fireEvent.click(screen.getByRole("button", { name: "go to B" }));
+    await screen.findByText("Issue B");
+    await act(async () => {
+      rejectA(new ApiError(500, "forge said no"));
+    });
+    expect(screen.queryByText("forge said no")).toBeNull();
+    expect(screen.getByText("Issue B")).toBeTruthy();
+  });
+
+  it("drops a promote success for A that arrives after navigating to B", async () => {
+    setAuth();
+    let resolveA!: (v: { card: ReturnType<typeof aCard> }) => void;
+    mockApi.promoteIssue.mockReturnValueOnce(new Promise((res) => (resolveA = res)));
+    renderAB(["documentation"]);
+
+    await screen.findByText("Issue A");
+    fireEvent.click(screen.getByRole("button", { name: /Promote to uzi/ }));
+    await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledWith("repo-1", 7));
+
+    fireEvent.click(screen.getByRole("button", { name: "go to B" }));
+    await screen.findByText("Issue B");
+    await act(async () => {
+      resolveA({ card: aCard(["uzi", "documentation"]) });
+    });
+    // A's captured issue must not overwrite B's header, nor mark B runnable.
+    expect(screen.getByText("Issue B")).toBeTruthy();
+    expect(screen.queryByText("Issue A")).toBeNull();
+    expect(screen.queryByTitle(/uzi will run it/)).toBeNull();
   });
 });
 

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, isHttpsUrl, preferForgeUrl, type IssueDetail, type RunListItem, type SecretMeta } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
@@ -65,6 +65,12 @@ export function IssueView() {
   // reload's fetch start used to wipe the error it was reloading after (issue #1727).
   // It clears at the start of the next attempt and on route navigation (below) instead.
   const [actionError, setActionError] = useState("");
+  // The route identity the page currently shows. A start/promote handler captures it when
+  // its attempt begins and drops the outcome if it changed by the time the response lands:
+  // the component is reused across issues, so without this a late failure for issue A
+  // would surface on issue B after the reset effect below had already cleared (#1727).
+  // That reset effect is also what keeps the ref current.
+  const routeKeyRef = useRef(`${repoId}/${iidNum}`);
   const [starting, setStarting] = useState(false);
   const [promoting, setPromoting] = useState(false);
   // PRD #241: the "Schedule…" entry point, pre-pinned to this issue.
@@ -82,6 +88,7 @@ export function IssueView() {
   // item 4a: the same reset drops a start/promote error, so it cannot bleed onto the next
   // issue — a route change, not every refetch, is what makes that error stale.
   useEffect(() => {
+    routeKeyRef.current = `${repoId}/${iidNum}`;
     setCredential(INHERIT_SELECTION);
     setHarness(INHERIT_HARNESS);
     setActionError("");
@@ -137,6 +144,7 @@ export function IssueView() {
 
   const startRun = async () => {
     if (!issue) return;
+    const attemptKey = routeKeyRef.current;
     setActionError("");
     setStarting(true);
     // The shared helper carries the chosen credential override AND harness, and
@@ -147,7 +155,9 @@ export function IssueView() {
       // encodeURIComponent the id: per-call-site open-redirect hardening (see
       // safeNextPath in Login.tsx). A no-op for today's UUID ids.
       onCreated: (runId) => navigate(`/runs/${encodeURIComponent(runId)}`),
-      onError: (msg) => setActionError(msg),
+      onError: (msg) => {
+        if (routeKeyRef.current === attemptKey) setActionError(msg);
+      },
       onSettled: () => {
         setStarting(false);
         reload();
@@ -164,16 +174,21 @@ export function IssueView() {
   const promotable = !!issue && canPromote(issue, uziLabel, issue.bot_forge_user_id);
 
   // Promote (Decision 15; PRD #764): add the `uzi` label forge-first, then adopt the
-  // returned card's labels — no optimistic update.
+  // returned card's labels — no optimistic update. Both outcomes are dropped when the
+  // user has navigated to another issue meanwhile: `issue` is the one captured here, so
+  // adopting it would replace the new issue's header with this one (#1727).
   const promote = async () => {
     if (!issue) return;
+    const attemptKey = routeKeyRef.current;
     setActionError("");
     setPromoting(true);
     try {
       const { card } = await api.promoteIssue(repoId, issue.iid);
-      setIssue({ ...issue, labels: card.labels });
+      if (routeKeyRef.current === attemptKey) setIssue({ ...issue, labels: card.labels });
     } catch (err) {
-      setActionError(errorMessage(err, "Could not promote the issue"));
+      if (routeKeyRef.current === attemptKey) {
+        setActionError(errorMessage(err, "Could not promote the issue"));
+      }
     } finally {
       setPromoting(false);
     }

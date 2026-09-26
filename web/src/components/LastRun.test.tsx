@@ -158,6 +158,21 @@ describe("LastFireDetail — ineligible_matched note (issue #1543)", () => {
     expect(screen.getByRole("note").textContent).toMatch(/16 open issues match the selector/);
   });
 
+  // The genuine-zero control for the header above: a zero-candidate fire whose ineligible
+  // count is unknown or zero matched nothing at all, so its header stays neutral (#1727).
+  it.each([
+    ["absent", undefined],
+    ["null", null],
+    ["0", 0],
+  ])("keeps the neutral matched 0 header for a genuine zero match (ineligible %s)", (_, n) => {
+    renderDetail(n === undefined ? fire([]) : { ...fire([]), ineligible_matched: n });
+    panelRendered();
+    const badge = screen.getByText("matched 0");
+    expect(badge.className).not.toMatch(/warn/);
+    expect(screen.queryByText("started nothing")).toBeNull();
+    expect(screen.queryByRole("note")).toBeNull();
+  });
+
   it("pluralizes a single ineligible issue", () => {
     renderDetail({ ...fire([]), ineligible_matched: 1 });
     const text = screen.getByRole("note").textContent ?? "";
@@ -227,15 +242,39 @@ describe("LastRunOutcome — a starved sweep does not read matched 0 (#1727)", (
     );
   });
 
-  it("puts starvation ahead of skips when nothing started", () => {
+  it("shows both the skips and the ineligible count when nothing started", () => {
     renderOutcome({
       ...empty,
       matched: 1,
       skips: [{ issue_iid: 8, title: "busy one", reason: "already_running", web_url: null }],
       ineligible_matched: 3,
     });
-    expect(screen.getByText("0 started · 3 not eligible")).toBeTruthy();
-    expect(screen.queryByText(/skipped/)).toBeNull();
+    const badge = screen.getByText("0 started · 1 skipped · 3 not eligible");
+    expect(badge.className).toMatch(/warn/);
+  });
+
+  it("does not hide an owner-actionable skip behind the ineligible count", () => {
+    // no_usable_credential is an amber skip the cadence does NOT fix on its own: the owner
+    // must repair a credential, so the list cell must name the skips, not only starvation.
+    const noCred: LastFireSkip = { issue_iid: null, title: "", reason: "no_usable_credential", web_url: null };
+    renderOutcome({
+      ...empty,
+      matched: 3,
+      skips: [noCred, { ...noCred, issue_iid: 9 }, { ...noCred, issue_iid: 10 }],
+      ineligible_matched: 16,
+    });
+    const badge = screen.getByText("0 started · 3 skipped · 16 not eligible");
+    expect(badge.className).toMatch(/warn/);
+    expect(screen.queryByText("0 started · 16 not eligible")).toBeNull();
+  });
+
+  it("keeps the skips-only form when no issue is ineligible", () => {
+    renderOutcome({
+      ...empty,
+      matched: 1,
+      skips: [{ issue_iid: 8, title: "busy one", reason: "already_running", web_url: null }],
+    });
+    expect(screen.getByText("0 started · 1 skipped").className).toMatch(/warn/);
   });
 
   it("keeps the started badge when runs started, whatever the ineligible count", () => {

@@ -109,10 +109,10 @@ function ineligibleMatched(fire: LastFire): number {
 //
 // Issue #1727: a sweep whose selector matched only ineligible issues started nothing
 // yet has no candidates to skip, so it used to read the neutral "matched 0", the same as
-// a sweep that matched nothing at all. When nothing started, starvation outranks skips:
-// a skipped candidate is eligible and the cadence retries it (the skip count stays in
-// the detail panel's tally), while an ineligible issue never runs until the owner labels
-// or assigns it, so it is the fact the list cell must not hide.
+// a sweep that matched nothing at all. When nothing started, the badge names every reason
+// it has: skips and ineligible matches can each need the owner (an ineligible issue never
+// runs until it is labelled or assigned; an amber skip such as no_usable_credential never
+// clears until a credential is repaired), so neither count may hide the other.
 function OutcomeBadge({ fire }: { fire: LastFire }) {
   if (fire.started.length > 0) {
     return (
@@ -129,7 +129,9 @@ function OutcomeBadge({ fire }: { fire: LastFire }) {
         dot
         title={`${ineligible} open ${ineligible === 1 ? "issue matches" : "issues match"} the selector but ${ineligible === 1 ? "isn't" : "aren't"} eligible`}
       >
-        0 started · {ineligible} not eligible
+        {fire.skips.length > 0
+          ? `0 started · ${fire.skips.length} skipped · ${ineligible} not eligible`
+          : `0 started · ${ineligible} not eligible`}
       </Badge>
     );
   }
