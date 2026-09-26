@@ -84,4 +84,31 @@ describe("GitCache.pinSettlementRefs presence guard (issue #1582)", () => {
     assert.equal(await git.pinSettlementRefs(bare, RUN, HOLD, { source: tree }), false);
     assert.deepEqual(settleRefs(bare), []);
   });
+
+  it("issue #1751 M2: pins the live `published` kind; deleteSettlementPin drops ONLY it; deleteSettlementRefs drops every kind", async () => {
+    const { bare, mainTip, descTip } = await bareWithTwoCommits();
+    assert.equal(
+      await git.pinSettlementRefs(bare, RUN, HOLD, { source: mainTip, adopted: mainTip, published: descTip }),
+      true,
+    );
+    assert.deepEqual(settleRefs(bare), [
+      `refs/uzi-settle/${RUN}/${HOLD}/adopted ${mainTip}`,
+      `refs/uzi-settle/${RUN}/${HOLD}/published ${descTip}`,
+      `refs/uzi-settle/${RUN}/${HOLD}/source ${mainTip}`,
+    ]);
+    await git.deleteSettlementPin(bare, RUN, HOLD, "published");
+    assert.deepEqual(settleRefs(bare), [
+      `refs/uzi-settle/${RUN}/${HOLD}/adopted ${mainTip}`,
+      `refs/uzi-settle/${RUN}/${HOLD}/source ${mainTip}`,
+    ]);
+    assert.equal(await git.pinSettlementRefs(bare, RUN, HOLD, { published: descTip }), true);
+    await git.deleteSettlementRefs(bare, RUN, HOLD);
+    assert.deepEqual(settleRefs(bare), [], "the released cleanup drops the published pin too");
+  });
+
+  it("issue #1751 M2: an absent published SHA refuses the whole set", async () => {
+    const { bare, mainTip } = await bareWithTwoCommits();
+    assert.equal(await git.pinSettlementRefs(bare, RUN, HOLD, { source: mainTip, published: ABSENT }), false);
+    assert.deepEqual(settleRefs(bare), []);
+  });
 });

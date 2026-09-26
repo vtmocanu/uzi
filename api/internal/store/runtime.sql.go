@@ -700,7 +700,31 @@ WITH target AS (
       -- non-positive @custody_hold_limit DISABLES the gate (limit "<= 0" means unlimited),
       -- so it never blocks an ordinary claim; the production caller always passes the
       -- configured positive default (workersvc.custodyHoldLimit, 8).
+      --
+      -- Issue #1751 / ADR-1751: CONTINUATION EXEMPTION. A requeued run that was already
+      -- claimed before (claim_generation >= 1) AND still holds its OWN open custody hold
+      -- (same owner, same run_id) is exempt from the custody-count admission check: it is
+      -- continuing work the owner already has in custody, not new work. The continuation may
+      -- create another generation hold (the hold CTE below opens one per claim), but is exempt
+      -- from custody-count admission. A fresh run (generation 0), or one whose own holds are
+      -- all released/discarded, still faces the cap. The #1318 overshoot under concurrent
+      -- claims still stands: this is an admission gate, not a strict ceiling.
+      --
+      -- The exemption is BOUNDED PER RUN: it holds only while the run's OWN open-hold count
+      -- is below @custody_hold_limit (and at least one). Without the bound a claimed run that never
+      -- reports running is swept back to queued by SweepClaimedNeverStarted (no requeue_count
+      -- bump, no hold release), reclaims under the exemption, opens another generation hold,
+      -- and loops forever; the owner cap used to stop that loop. Once a single run holds
+      -- @custody_hold_limit open holds of its own, it faces the owner cap like new work. The
+      -- same exemption expression is mirrored by GetCustodyAdmissionForRun (health reason) and
+      -- GetCustodyAggregateForOwner.blocked_runs, so the pill, the aggregate and the claim
+      -- agree.
       AND ($10::int <= 0
+           OR (r.claim_generation >= 1
+               AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
+                             WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
+               AND (SELECT count(*) FROM recovery_custody_holds oh2
+                      WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < $10::int)
            OR (SELECT count(*) FROM recovery_custody_holds ch
                  WHERE ch.user_id = $2 AND ch.state = 'open') < $10::int)
       -- PRD #1226 M1 (D2): the NON-BYPASSABLE completion-protocol claim clause. An
@@ -2108,21 +2132,6 @@ SELECT COUNT(*) FROM runs WHERE NOT usage_refolded
 // zero) rather than stop when the terminal-only pending batch empties.
 func (q *Queries) CountRunsAwaitingUsageRefold(ctx context.Context) (int64, error) {
 	row := q.db.QueryRow(ctx, countRunsAwaitingUsageRefold)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
-
-const countUnresolvedCustodyHoldsForOwner = `-- name: CountUnresolvedCustodyHoldsForOwner :one
-SELECT count(*) FROM recovery_custody_holds WHERE user_id = $1 AND state = 'open'
-`
-
-// PRD #1296 M1 (D2/D4): the owner's UNRESOLVED (state='open') custody-hold count — the
-// same admission signal the ClaimRun predicate blocks on. A later milestone's health
-// resolver reads this to surface a distinct custody-limit queued reason against the SAME
-// decision the claim used, so the pill and the claim never disagree.
-func (q *Queries) CountUnresolvedCustodyHoldsForOwner(ctx context.Context, userID uuid.UUID) (int64, error) {
-	row := q.db.QueryRow(ctx, countUnresolvedCustodyHoldsForOwner, userID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -3904,6 +3913,46 @@ func (q *Queries) GetConsumedCompletionPermit(ctx context.Context, arg GetConsum
 		&i.IssuedAt,
 		&i.ConsumedAt,
 	)
+	return i, err
+}
+
+const getCustodyAdmissionForRun = `-- name: GetCustodyAdmissionForRun :one
+SELECT
+    (SELECT count(*) FROM recovery_custody_holds h
+        WHERE h.user_id = $1::uuid AND h.state = 'open')::bigint AS open_holds,
+    COALESCE((SELECT (r.claim_generation >= 1
+                      AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
+                                    WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
+                      AND (SELECT count(*) FROM recovery_custody_holds oh2
+                             WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < $2::int)
+                FROM runs r
+                WHERE r.id = $3::uuid AND r.user_id = $1::uuid), false)::boolean AS continuation_exempt
+`
+
+type GetCustodyAdmissionForRunParams struct {
+	UserID           uuid.UUID `json:"user_id"`
+	CustodyHoldLimit int32     `json:"custody_hold_limit"`
+	RunID            uuid.UUID `json:"run_id"`
+}
+
+type GetCustodyAdmissionForRunRow struct {
+	OpenHolds          int64 `json:"open_holds"`
+	ContinuationExempt bool  `json:"continuation_exempt"`
+}
+
+// Issue #1751 / ADR-1751: the per-run custody-admission facts the health resolver reads so
+// its reasonCustodyLimit pill agrees with ClaimRun. open_holds is the owner's UNRESOLVED
+// (state='open') hold count, the same count ClaimRun's custody clause compares against
+// @custody_hold_limit; continuation_exempt is ClaimRun's continuation exemption, byte-for-byte
+// the same expression: the run was claimed before (claim_generation >= 1) AND its OWN open
+// custody-hold count (owner-scoped) is at least 1 and below @custody_hold_limit. The upper bound
+// stops a run that the never-started sweep keeps requeueing from opening holds forever (see
+// ClaimRun). An exempt run is never blocked by the custody cap. A run that does not exist (or
+// belongs to another owner), or a non-positive limit, yields continuation_exempt = false.
+func (q *Queries) GetCustodyAdmissionForRun(ctx context.Context, arg GetCustodyAdmissionForRunParams) (GetCustodyAdmissionForRunRow, error) {
+	row := q.db.QueryRow(ctx, getCustodyAdmissionForRun, arg.UserID, arg.CustodyHoldLimit, arg.RunID)
+	var i GetCustodyAdmissionForRunRow
+	err := row.Scan(&i.OpenHolds, &i.ContinuationExempt)
 	return i, err
 }
 

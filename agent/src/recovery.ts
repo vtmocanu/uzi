@@ -532,9 +532,12 @@ export class RecoveryCoordinator {
    * affinity resume a retained sibling generation's record + bundle (possibly the last local copy of
    * that generation's unpublished committed work) coexists with this generation's record in the
    * SAME run dir. So a real release that names an exact generation removes ONLY that generation's
-   * record(s) + their bundle files, never the whole run dir — wiping the dir would take a sibling
-   * generation's work with it. Only the v1 fallback (generation omitted, at most one record) removes
-   * the whole run dir.
+   * record(s) + their bundle files while an authenticated sibling generation remains — wiping the
+   * dir would take a sibling generation's work with it. When NO authenticated sibling remains this
+   * is the completed-run boundary, so the whole run dir is removed RECURSIVELY, which also sweeps
+   * MAC-mismatch/tampered `.json` records, orphan `<captureId>.bundle` files and `*.tmp` leftovers
+   * (they would otherwise leak worker disk forever). The v1 fallback (generation omitted, at most
+   * one record) removes the whole run dir.
    */
   async release(runId: string, generation?: number, releaseEvidence?: string): Promise<void> {
     if (!this.enabled) return;
@@ -550,7 +553,7 @@ export class RecoveryCoordinator {
       });
       if (!res.retained) {
         if (generation !== undefined) {
-          await this.removeGenerationRecords(runId, generation);
+          await this.removeGenerationRecords(runId, generation, "sweep_if_last");
         } else {
           await this.removeRunDir(runId);
         }
@@ -632,12 +635,17 @@ export class RecoveryCoordinator {
   /**
    * issue #1582 M2 — drop the local journal record(s) + bundle files of ONE predecessor
    * generation whose custody hold the api RELEASED by ancestry settlement. Generation-scoped
-   * exactly like a real exact-generation {@link release}: every sibling generation's record stays.
-   * Local-only (no RPC); the caller invokes it only after a `released` settle outcome.
+   * like a real exact-generation {@link release}: every sibling generation's record stays. Unlike
+   * release() it NEVER removes the run dir recursively (issue #1751 M2): it can run while the
+   * successor generation is live and writing its own record/bundle/`*.tmp` into the same dir, so it
+   * removes only the named generation's files and then attempts a non-recursive rmdir, which leaves
+   * any non-empty dir in place. Unauthenticated/orphan leftovers are swept later by the
+   * completed-run release(). Local-only (no RPC); the caller invokes it only after a `released`
+   * settle outcome.
    */
   async forgetGeneration(runId: string, generation: number): Promise<void> {
     if (!this.enabled) return;
-    await this.removeGenerationRecords(runId, generation);
+    await this.removeGenerationRecords(runId, generation, "rmdir_if_empty");
   }
 
   /** All AUTHENTICATED records for a run (a tampered/unreadable record is omitted, never
@@ -755,26 +763,42 @@ export class RecoveryCoordinator {
   /**
    * PRD #1349 M2 (D1) — remove ONLY the released generation's record(s) + their bundle files,
    * leaving every sibling generation's record (and its possibly-last-local-copy bundle) intact.
-   * When this was the run's only generation the now-empty run dir is dropped, so a clean release of
-   * the sole hold still tidies the journal exactly as the v1 whole-dir removal did.
+   * What happens to the run dir afterwards depends on the caller:
+   *
+   * - `sweep_if_last` (exact-generation {@link release}, the completed-run boundary): when no
+   *   authenticated sibling generation remains, the whole run dir is removed RECURSIVELY, sweeping
+   *   tampered `.json` records, orphan bundles and `*.tmp` leftovers along with it.
+   * - `rmdir_if_empty` ({@link forgetGeneration}, issue #1751 M2 rework N5): runs while the
+   *   successor generation is live and may be writing into the same dir concurrently, so the dir
+   *   is never removed recursively from a count taken earlier; only a non-recursive rmdir is
+   *   attempted, and a non-empty (or already gone) dir is left as is.
    */
-  private async removeGenerationRecords(runId: string, generation: number): Promise<void> {
+  private async removeGenerationRecords(
+    runId: string,
+    generation: number,
+    dirMode: "sweep_if_last" | "rmdir_if_empty",
+  ): Promise<void> {
     const records = await this.listRecords(runId);
     let remaining = 0;
     for (const record of records) {
-      if (record.generation === generation) {
-        await fs.rm(this.recordPath(record), { force: true }).catch(() => undefined);
-        // The bundle lives at the canonical <captureId>.bundle path; remove any distinct
-        // journaled bundlePath too, so a released generation never leaks its bytes.
-        await fs.rm(this.bundlePath(record), { force: true }).catch(() => undefined);
-        if (record.bundlePath && record.bundlePath !== this.bundlePath(record)) {
-          await fs.rm(record.bundlePath, { force: true }).catch(() => undefined);
-        }
-      } else {
+      if (record.generation !== generation) {
         remaining++;
+        continue;
+      }
+      await fs.rm(this.recordPath(record), { force: true }).catch(() => undefined);
+      // The bundle lives at the canonical <captureId>.bundle path; remove any distinct
+      // journaled bundlePath too, so a released generation never leaks its bytes.
+      await fs.rm(this.bundlePath(record), { force: true }).catch(() => undefined);
+      if (record.bundlePath && record.bundlePath !== this.bundlePath(record)) {
+        await fs.rm(record.bundlePath, { force: true }).catch(() => undefined);
       }
     }
-    if (remaining === 0) await this.removeRunDir(runId);
+    if (dirMode === "sweep_if_last") {
+      if (remaining === 0) await this.removeRunDir(runId);
+      return;
+    }
+    // ENOTEMPTY / ENOENT (and any other failure) leave the dir: never a recursive removal here.
+    await fs.rmdir(this.runDir(runId)).catch(() => undefined);
   }
 }
 

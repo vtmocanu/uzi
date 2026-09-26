@@ -39,6 +39,7 @@ import type {
   ClaimResponse,
   IterationBudget,
   Milestone,
+  RunKind,
   RunOrphanClassificationResponse,
   StateAck,
   StateRequest,
@@ -52,6 +53,7 @@ import {
   PredecessorSettler,
   SettlementJournal,
   isSafeSettlementId,
+  type LiveSettleTarget,
   type RecoverySettleClient,
   type SettlementRecord,
 } from "./recovery-settlement.js";
@@ -879,6 +881,9 @@ interface RunFlight {
    *  0 (chat's legacy sentinel) is never sent, and a rolled-back api's strict-decode 400 strips it
    *  and retries ONCE. Server-side NOT NULL DEFAULT 0. */
   readonly claimGeneration: number;
+  /** issue #1751 M2: the resolved claim kind, gating which live-settle trigger (checkpoint publish
+   *  or finalize branch push) this run may fire. */
+  readonly runKind: RunKind;
   readonly reportState: (
     body: Parameters<WorkerClient["reportState"]>[1],
     signal?: AbortSignal,
@@ -1168,6 +1173,13 @@ export class RunRunner {
    *  and the settler that drives the api settle for them. Disabled without a worker token. */
   private readonly settlement: SettlementJournal;
   private readonly settler: PredecessorSettler;
+  /** issue #1751 M2 review — runs `fn` in the async context captured when this runner was
+   *  constructed (permit-free), not the caller's. A live settle is triggered from inside Codex
+   *  permits and the mid-turn tick, where GitCache's AsyncLocalStorage boundary scope is active;
+   *  a fire-and-forget promise would inherit that scope and, after the permit ends, run its git
+   *  reads (isAncestor, the published pin) through a stale, aborted boundary spawner. Same idea
+   *  as the tick's `armedFire`. */
+  private readonly detached: (fn: () => void) => void = AsyncResource.bind((fn: () => void) => fn());
   /** PRD #1391 M2 — the worker message outbox the batcher spills to, the shared re-arm
    *  registry, the spill trip window and the spill-buffer cap. All threaded into every
    *  run's MessageBatcher; `outbox`/`rearm` undefined ⇒ today's trip behaviour. */
@@ -1311,6 +1323,12 @@ export class RunRunner {
         deleteRecoveryPin: (bare, runId, gen) => gitCache.deleteRecoveryPin(bare, runId, gen),
         forgetGeneration: (runId, gen) => recovery.forgetGeneration(runId, gen),
       },
+      // issue #1751 M2: the live leg's local checks + `published` pin, in the trusted bare.
+      liveGit: {
+        isAncestor: (bare, ancestor, descendant) => gitCache.isAncestorRef(bare, ancestor, descendant),
+        pinPublished: (bare, runId, holdId, sha) => gitCache.pinSettlementRefs(bare, runId, holdId, { published: sha }),
+        unpinPublished: (bare, runId, holdId) => gitCache.deleteSettlementPin(bare, runId, holdId, "published"),
+      },
       log: this.log,
     });
     this.detect = opts.detectRepoAgents ?? detectRepoAgents;
@@ -1368,6 +1386,7 @@ export class RunRunner {
    * `pending_settle` only once its successor's completion ACK was OBSERVED
    * ({@link observeSettlementTerminalAck}); a pushed head persisted write-ahead of the report stays
    * `pushed` until then and is never sent, so no outbox pending-terminal check is needed here.
+   * The same sweep retries every DUE live-settle leg (issue #1751 M2), whatever its record's state.
    * Best-effort; never throws.
    */
   async settlePendingPredecessors(signal?: AbortSignal): Promise<void> {
@@ -4536,6 +4555,9 @@ export class RunRunner {
         );
       }
     }
+    // issue #1751 M2: the finalize push landed, so the pushed tracking tip is a confirmed publication
+    // on runs.branch (task runs only; see triggerBranchLiveSettle).
+    this.triggerBranchLiveSettle(flight, finalizeBarePath, result.branch);
     if (bridged) {
       // Worded GENERICALLY: the branch may have been bridged by THIS worker OR by the agent (the M2
       // steer's `git merge -s ours <P>`), so it never says "the worker bridged it".
@@ -5044,6 +5066,7 @@ export class RunRunner {
       cancel,
       steering,
       claimGeneration,
+      runKind: resolveRunKind(claim.kind),
       observedSessionId: undefined,
       latestContractRevision: undefined,
       reportState: async (body, signal) => {
@@ -7643,6 +7666,9 @@ export class RunRunner {
         // issue #1086 (F2): a confirmed publish reconciles the broker's ref, so clear any pending
         // attempted tip — the confirmed tip is now authoritative.
         flight.lastAttemptedCheckpointRefTip = undefined;
+        // issue #1751 M2: a CONFIRMED checkpoint publication may settle an older custody hold
+        // while this run is still live (fire-and-forget; never delays the publish or the run).
+        this.triggerLiveSettle(flight, packed.tipOid, "checkpoint");
         // issue #1597 M1: a failure/skip line is on the feed, so say it recovered — once — and
         // clear the dedupe set so a recurring failure is surfaced again rather than swallowed.
         if (flight.reportedPublishOutcomes.size > 0) {
@@ -7989,7 +8015,7 @@ export class RunRunner {
           state: "adopted",
           attempts: 0,
         };
-        if (await this.settlement.put(record)) {
+        if (await this.settler.recordAdoption(record)) {
           flight.runLog.info("recovery settlement: adoption evidence recorded for a predecessor hold", {
             run_id: claim.run_id,
             hold_id: hold.hold_id,
@@ -8005,6 +8031,60 @@ export class RunRunner {
         error: errMessage(err),
       });
     }
+  }
+
+  /**
+   * issue #1751 M2 — a confirmed publication of this generation's work (`publishedSha`) may settle
+   * an older custody hold while the run is still live. Records the live leg on each still-`adopted`
+   * settlement record of this generation, then sends the due legs, FIRE-AND-FORGET: never awaited
+   * on the execution path, errors caught, and bounded by the flight's cancel signal (the worker
+   * sweep retries whatever is left). Kind-gated by what the api can prove against while the run is
+   * live:
+   *   - `checkpoint`: issue / self_improve runs (the checkpoint-publishing kinds; their runs.branch
+   *     is NULL while live, so `branch` would only answer not_eligible);
+   *   - `branch`: task runs ONLY — the one kind whose runs.branch is set at creation (task.sql).
+   *     prompt (CreatePromptRun), ci_fix and mr_rework runs leave runs.branch NULL, so the api
+   *     answers not_eligible for them while live; they fire nothing and settle on completion.
+   */
+  private triggerLiveSettle(flight: RunFlight, publishedSha: string, target: LiveSettleTarget): void {
+    if (!this.settlement.enabled) return;
+    const kind = flight.runKind;
+    if (kind === undefined) return;
+    const eligible = target === "checkpoint" ? kind === "issue" || kind === "self_improve" : kind === "task";
+    if (!eligible) return;
+    const generation = flight.claimGeneration;
+    if (!Number.isSafeInteger(generation) || generation <= 0) return;
+    const signal = flight.cancel.signal;
+    this.detached(() => {
+      void (async () => {
+        await this.settler.observeLivePublication(flight.runId, generation, publishedSha, target);
+        if (signal.aborted) return;
+        await this.settler.settleLive(flight.runId, signal);
+      })().catch((err: unknown) => {
+        flight.runLog.warn("recovery settlement: live settle trigger failed (the sweep retries)", {
+          run_id: flight.runId,
+          error: errMessage(err),
+        });
+      });
+    });
+  }
+
+  /**
+   * issue #1751 M2 — after a landed finalize push, a TASK run's pushed tracking tip is a confirmed
+   * publication on its creation-time runs.branch: fire the `branch` live settle for it. Every other
+   * kind returns before any git read (see {@link triggerLiveSettle} for why). The tip read is local
+   * and runs inside the fire-and-forget, never on the finalize path.
+   */
+  private triggerBranchLiveSettle(flight: RunFlight, barePath: string, branch: string): void {
+    if (flight.runKind !== "task" || !this.settlement.enabled) return;
+    this.detached(() => {
+      void this.git
+        .trackingTip(barePath, branch)
+        .then((tip) => {
+          if (tip) this.triggerLiveSettle(flight, tip, "branch");
+        })
+        .catch(() => undefined);
+    });
   }
 
   /**
@@ -8096,12 +8176,9 @@ export class RunRunner {
           await unrecorded(rec, "pushed pin failed", pinError);
           continue;
         }
-        await this.settlement.put({
-          ...rec,
-          pushedSha: pushed,
-          disposition: "publication",
-          state: "pushed",
-        });
+        // Under the hold's lock, re-read: only a still-`adopted` record of this generation moves
+        // `pushed`, carrying any live leg a concurrent live publication wrote (issue #1751 M2).
+        await this.settler.recordPushedHead(rec, pushed);
       }
     } catch (err) {
       flight.runLog.warn("recovery settlement: pushed head not persisted (predecessor holds retained)", {

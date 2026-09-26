@@ -530,7 +530,9 @@ type Store interface {
 	// here so those parallel milestones never edit the interface. The custody hold itself
 	// is opened atomically inside ClaimRun's CTE (D2); everything below operates on the
 	// already-open hold and its immutable captures.
-	CountUnresolvedCustodyHoldsForOwner(ctx context.Context, userID uuid.UUID) (int64, error)
+	// GetCustodyAdmissionForRun (issue #1751) replaces the owner-only count for the health
+	// resolver: it also carries ClaimRun's continuation exemption for the run.
+	GetCustodyAdmissionForRun(ctx context.Context, arg store.GetCustodyAdmissionForRunParams) (store.GetCustodyAdmissionForRunRow, error)
 	BindCaptureManifest(ctx context.Context, arg store.BindCaptureManifestParams) (store.RecoveryCapture, error)
 	InsertCaptureChunk(ctx context.Context, arg store.InsertCaptureChunkParams) error
 	MarkCaptureReady(ctx context.Context, arg store.MarkCaptureReadyParams) (store.RecoveryCapture, error)
@@ -553,6 +555,11 @@ type Store interface {
 	// api's own forge proof, re-asserting every run/hold guard so a change mid-proof moves 0 rows.
 	GetCustodyHoldForSettle(ctx context.Context, arg store.GetCustodyHoldForSettleParams) (store.RecoveryCustodyHold, error)
 	ReleasePredecessorCustodyHoldByAncestry(ctx context.Context, arg store.ReleasePredecessorCustodyHoldByAncestryParams) (int64, error)
+	// Issue #1751 M2: the LIVE twin — releases that one older-generation hold with
+	// 'live_ancestry' evidence while the same-worker successor generation is still live,
+	// re-asserting every run/hold guard (live status, claim generation, unreleased claim, the
+	// captured branch and checkpoint derivation inputs) so a change mid-proof moves 0 rows.
+	ReleasePredecessorCustodyHoldByLiveAncestry(ctx context.Context, arg store.ReleasePredecessorCustodyHoldByLiveAncestryParams) (int64, error)
 	// Issue #1582 M1 rework: the server-held facts the settle candidates must match — the
 	// source_sha of every capture under the hold created before the successor generation
 	// claimed, and the head of the completion permit an interlocked run's completion consumed.
@@ -4782,7 +4789,7 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	if !ok {
 		return PublishResult{Published: false, Ref: "", Skipped: "unsupported"}, nil
 	}
-	ref := "refs/uzi-checkpoints/" + branch
+	ref := checkpointRefPrefix + branch
 
 	// 3. Repo + connection facts (clone URL, base URL, default branch, bot username,
 	// sealed PAT) come from the run claim context — the same INNER JOIN the claim
