@@ -59,9 +59,12 @@ export function IssueView() {
   // stays local and the fetcher sets it as a side effect rather than routing through
   // the hook's read-only `data`.
   const [issue, setIssue] = useState<IssueDetail | null>(null);
-  // `error` is the load error (from the hook, as `loadError`) OR a startRun/promote
-  // handler error kept here — the two share the one Alert slot below.
-  const [error, setError] = useState("");
+  // `actionError` is a startRun/promote handler error, kept apart from the hook's load
+  // error (`loadError`); the two share the one Alert slot below. It is deliberately NOT
+  // cleared by the hook's onFetchStart: a failed start reloads the run history, and that
+  // reload's fetch start used to wipe the error it was reloading after (issue #1727).
+  // It clears at the start of the next attempt and on route navigation (below) instead.
+  const [actionError, setActionError] = useState("");
   const [starting, setStarting] = useState(false);
   const [promoting, setPromoting] = useState(false);
   // PRD #241: the "Schedule…" entry point, pre-pinned to this issue.
@@ -75,10 +78,13 @@ export function IssueView() {
   const [harness, setHarness] = useState<HarnessSelection>(INHERIT_HARNESS);
   // PRD #1247: this component is reused across route-param changes without remounting (the
   // data effect below keys on [repoId, iidNum] and refetches), so reset the picked
-  // credential to inherit when the route identity changes (no-op at mount).
+  // credential to inherit when the route identity changes (no-op at mount). Issue #961
+  // item 4a: the same reset drops a start/promote error, so it cannot bleed onto the next
+  // issue — a route change, not every refetch, is what makes that error stale.
   useEffect(() => {
     setCredential(INHERIT_SELECTION);
     setHarness(INHERIT_HARNESS);
+    setActionError("");
   }, [repoId, iidNum]);
 
   const { data, loading, error: loadError, reload } = useAsyncData(
@@ -109,7 +115,7 @@ export function IssueView() {
       };
     },
     [repoId, iidNum],
-    { fallback: "Failed to load the issue", onFetchStart: () => setError("") },
+    { fallback: "Failed to load the issue" },
   );
   const runs = data?.runs ?? [];
   const hasWorker = data?.hasWorker ?? false;
@@ -131,20 +137,19 @@ export function IssueView() {
 
   const startRun = async () => {
     if (!issue) return;
-    setError("");
+    setActionError("");
     setStarting(true);
     // The shared helper carries the chosen credential override AND harness, and
-    // preserves both across the open-MR force retry (issue #856). onSettled keeps
-    // IssueView's pre-#1247 behaviour: clear the starting flag, clear the error, and
-    // reload.
+    // preserves both across the open-MR force retry (issue #856). onSettled clears the
+    // starting flag and reloads the run history, but leaves the error onError just set
+    // on screen (issue #1727): the next attempt clears it above.
     await startRunWithCredential(repoId, issue.iid, credential, {
       // encodeURIComponent the id: per-call-site open-redirect hardening (see
       // safeNextPath in Login.tsx). A no-op for today's UUID ids.
       onCreated: (runId) => navigate(`/runs/${encodeURIComponent(runId)}`),
-      onError: (msg) => setError(msg),
+      onError: (msg) => setActionError(msg),
       onSettled: () => {
         setStarting(false);
-        setError("");
         reload();
       },
     }, harness);
@@ -162,13 +167,13 @@ export function IssueView() {
   // returned card's labels — no optimistic update.
   const promote = async () => {
     if (!issue) return;
-    setError("");
+    setActionError("");
     setPromoting(true);
     try {
       const { card } = await api.promoteIssue(repoId, issue.iid);
       setIssue({ ...issue, labels: card.labels });
     } catch (err) {
-      setError(errorMessage(err, "Could not promote the issue"));
+      setActionError(errorMessage(err, "Could not promote the issue"));
     } finally {
       setPromoting(false);
     }
@@ -196,7 +201,7 @@ export function IssueView() {
         <span className="text-muted">#{iid}</span>
       </nav>
 
-      {(loadError || error) && <Alert message={loadError || error} />}
+      {(loadError || actionError) && <Alert message={loadError || actionError} />}
       {loading && <p className="text-faint">Loading issue…</p>}
 
       {issue && (

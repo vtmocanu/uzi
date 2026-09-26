@@ -239,6 +239,24 @@ describe("ActivityFeed crew roster", () => {
     expect(getByTitle("worker: waiting")).toBeTruthy();
   });
 
+  // Issue #1727: a run parked on a usage limit (limit_wait) or on the auto-lane credential
+  // pool (pool_wait) is blocked crew-wide like a gate. Without the gate arm the active
+  // speaker read a green `working` and every quiet lane aged to `idle`. leadWorkerLead's
+  // messages are long past STALE_MS, so `worker` is the stale non-active lane and `lead`
+  // (the newest speaker) the active one.
+  it.each(["limit_wait", "pool_wait"] as const)(
+    "every agent, active or stale, reads `waiting` while parked at %s",
+    (status) => {
+      const { getByTitle, queryByTitle, container } = renderFeed(leadWorkerLead(), { status, health: "ok" });
+      expect(getByTitle("lead: waiting")).toBeTruthy();
+      expect(getByTitle("worker: waiting")).toBeTruthy();
+      expect(queryByTitle("lead: working")).toBeNull();
+      expect(queryByTitle("worker: idle")).toBeNull();
+      // Nothing pulses: no lane is working.
+      expect(container.querySelector(".animate-pulse")).toBeNull();
+    },
+  );
+
   it("a non-active agent splits waiting↔idle by recency", () => {
     const now = Date.now();
     const old = new Date(now - 60_000).toISOString(); // ≥45s → idle

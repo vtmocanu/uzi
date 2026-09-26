@@ -223,6 +223,9 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  // clearAllMocks keeps queued mock*Once implementations, so a test that fails before
+  // consuming its queued createRun outcomes would leak them into the next test.
+  mockApi.createRun.mockReset();
 });
 
 // Issue #124, item 9. The issue TITLE and DESCRIPTION are both forge-supplied, and the
@@ -731,14 +734,93 @@ describe("IssueView Start gate (PRD #764)", () => {
 
     await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
     // Retried with force === true; that retry failed, and the starting state is
-    // cleared (button re-enabled). NOTE: unlike Board, IssueView's forced-retry
-    // failure toast does NOT persist — startRun's catch calls load(), whose first
-    // line is setError(""), which wipes the just-set message. This is existing
-    // control flow (the spec said keep it as-is), so this test asserts the real
-    // behavior; the Board/IssueView divergence is flagged back to the lead.
+    // cleared (button re-enabled). Like Board, the forced-retry failure now stays on
+    // screen (issue #1727): settlement and its reload no longer wipe it.
     await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledTimes(2));
     expect(mockApi.createRun.mock.calls[1]).toEqual(["repo-1", 7, true]);
     await waitFor(() => expect(startBtn().disabled).toBe(false));
+    expect(screen.getByText("boom while forcing")).toBeTruthy();
+    confirmSpy.mockRestore();
+  });
+
+  // Issue #1727 item 1. A failed start called onError then onSettled, and onSettled
+  // cleared the error it had just been handed; the reload it fires then ran the hook's
+  // onFetchStart, which cleared it a second time. Either wipe alone hides the failure.
+  //
+  // Mutation-checked: restoring setError("") in onSettled, or restoring the
+  // onFetchStart clear, each leaves no alert (observed red: "worker pool is full" not
+  // found).
+  it("keeps a failed start's error on screen through settlement and the reload (#1727)", async () => {
+    setAuth();
+    runnable();
+    mockApi.createRun.mockRejectedValueOnce(new ApiError(500, "worker pool is full"));
+    renderIssueView();
+
+    const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
+    await screen.findByText("A small typo fix");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    const loadsBefore = mockApi.listRuns.mock.calls.length;
+    fireEvent.click(startBtn());
+
+    // Settled (button re-enabled) and the reload has run and resolved...
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    await waitFor(() => expect(mockApi.listRuns.mock.calls.length).toBe(loadsBefore + 1));
+    await act(async () => {});
+    // ...and the error is still shown.
+    expect(screen.getByText("worker pool is full")).toBeTruthy();
+  });
+
+  it("clears a failed start's error when the next attempt starts (#1727)", async () => {
+    setAuth();
+    runnable();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    mockApi.createRun
+      .mockRejectedValueOnce(new ApiError(500, "worker pool is full"))
+      .mockRejectedValueOnce(openMRError());
+    renderIssueView();
+
+    const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
+    await screen.findByText("A small typo fix");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    fireEvent.click(startBtn());
+    await screen.findByText("worker pool is full");
+
+    // The second attempt is declined at the open-MR confirm (no error of its own), so
+    // the only thing that can remove the first error is the attempt-start clear.
+    fireEvent.click(startBtn());
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    expect(screen.queryByText("worker pool is full")).toBeNull();
+    confirmSpy.mockRestore();
+  });
+
+  it("a successful start still navigates to the run with no error shown (#1727)", async () => {
+    setAuth();
+    runnable();
+    mockApi.createRun.mockResolvedValueOnce({ run: { id: "run-9" } as unknown as Run });
+    renderWithRunRoute();
+
+    const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
+    await screen.findByText("A small typo fix");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    fireEvent.click(startBtn());
+    await screen.findByText("run page");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("a settled (declined) start still reloads the run history (#1727)", async () => {
+    setAuth();
+    runnable();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    mockApi.createRun.mockRejectedValueOnce(openMRError());
+    renderIssueView();
+
+    const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
+    await screen.findByText("A small typo fix");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    const loadsBefore = mockApi.listRuns.mock.calls.length;
+    fireEvent.click(startBtn());
+    await waitFor(() => expect(mockApi.listRuns.mock.calls.length).toBe(loadsBefore + 1));
     confirmSpy.mockRestore();
   });
 });
@@ -920,11 +1002,13 @@ describe("IssueView — a superseded fetch cannot seed a stale issue header (ite
 });
 
 // Issue #961 item 4a (m2). A promote failure sets the shared `error` slot. Navigating to
-// another issue is a deps refetch; onFetchStart wipes that error so a stale promote toast
-// does not bleed onto the next issue (matching the two startRun paths that already wipe it).
+// another issue is a route-identity change; the reset effect keyed on [repoId, iidNum]
+// wipes that error so a stale promote toast does not bleed onto the next issue. (Issue
+// #1727 moved this clear off the hook's onFetchStart, which also fired on the post-start
+// reload and wiped a fresh start error.)
 //
-// Mutation-checked: removing the onFetchStart opt leaves the promote error on screen after
-// navigation (observed red: "forge said no" still present, expected null).
+// Mutation-checked: removing setActionError("") from the reset effect leaves the promote
+// error on screen after navigation (observed red: "forge said no" still present).
 describe("IssueView — a promote error clears on issue navigation (item 4a)", () => {
   function NavToB() {
     const navigate = useNavigate();
@@ -965,7 +1049,7 @@ describe("IssueView — a promote error clears on issue navigation (item 4a)", (
     fireEvent.click(screen.getByRole("button", { name: /Promote to uzi/ }));
     await waitFor(() => expect(screen.getByText("forge said no")).toBeTruthy());
 
-    // Navigate to B: the deps refetch fires onFetchStart, wiping the promote error.
+    // Navigate to B: the route-identity reset effect wipes the promote error.
     fireEvent.click(screen.getByRole("button", { name: "go to B" }));
     await screen.findByText("Issue B");
     expect(screen.queryByText("forge said no")).toBeNull();
