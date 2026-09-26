@@ -6,7 +6,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
-import { GitCache, RunnerCloneMaterializationError, WIP_PARK_COMMIT_PREFIX, type RunnerClone } from "../src/git.js";
+import { GitCache, RunnerCloneMaterializationError, WIP_PARK_COMMIT_PREFIX, materializeEnv, type RunnerClone } from "../src/git.js";
 
 // issue #1769 m1 — a Codex (sandboxed) run's runner clone is made SELF-CONTAINED at seed:
 // the objects it borrowed from the worker bare through `objects/info/alternates` are copied
@@ -271,33 +271,69 @@ describe("runner clone materialization (issue #1769 m1)", () => {
     assert.strictEqual(refsUnder(clonePath, "refs/uzi-materialize/"), "", "anchors removed");
   });
 
-  it("the materialization env carries no alternate-object variables even when process.env sets them", async () => {
+  it("materializeEnv strips alternate-object variables from the base env and keeps the rest", () => {
+    const base: NodeJS.ProcessEnv = {
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: "/data/bare.git/objects",
+      GIT_OBJECT_DIRECTORY: "/data/bare.git/objects",
+      GIT_TERMINAL_PROMPT: "0",
+      HOME: "/nonexistent",
+    };
+    const env = materializeEnv(base);
+    assert.strictEqual("GIT_ALTERNATE_OBJECT_DIRECTORIES" in env, false);
+    assert.strictEqual("GIT_OBJECT_DIRECTORY" in env, false);
+    assert.strictEqual(env.GIT_TERMINAL_PROMPT, "0");
+    assert.strictEqual(env.HOME, "/nonexistent");
+    assert.ok(env.PATH, "the runner PATH is set");
+    assert.strictEqual(base.GIT_OBJECT_DIRECTORY, "/data/bare.git/objects", "the base env is not mutated");
+  });
+
+  it("an alternates probe error other than ENOENT fails closed without running git", async () => {
     const git = worker("w");
+    const clone = path.join(fx.dataDir, "probe-clone");
+    fs.mkdirSync(path.join(clone, ".git", "objects"), { recursive: true });
+    // objects/info is a FILE, so lstat(objects/info/alternates) fails with ENOTDIR, not ENOENT.
+    fs.writeFileSync(path.join(clone, ".git", "objects", "info"), "");
+    let spawned = 0;
+    wrapExec(git, async (orig, ...a) => {
+      spawned += 1;
+      return orig(...a);
+    });
+    const internals = git as unknown as { materializeRunnerClone(p: string, shas: string[]): Promise<void> };
+    await assert.rejects(
+      internals.materializeRunnerClone(clone, []),
+      (err: unknown) => err instanceof RunnerCloneMaterializationError && /ENOTDIR/.test(err.causeMessage),
+    );
+    assert.strictEqual(spawned, 0, "no subprocess after a failed probe");
+  });
+
+  it("a cleanup failure after verification is logged, not thrown: the seed is still self-contained", async () => {
+    const { logger, lines } = recordingLogger();
+    const git = worker("w", logger);
     const bare = await git.ensureClone(fx.originPath);
-    const seen: NodeJS.ProcessEnv[] = [];
     wrapExec(git, async (orig, command, args, options, identity) => {
-      if (args.includes("fsck") || args.includes("cat-file")) seen.push(options.env);
+      if (args.includes("/bin/rm") || command === "/bin/rm") {
+        throw Object.assign(new Error("exit 1"), { stderr: "injected rm failure" });
+      }
       return orig(command, args, options, identity);
     });
-    const saved = {
-      alt: process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES,
-      obj: process.env.GIT_OBJECT_DIRECTORY,
-    };
-    process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES = path.join(bare, "objects");
-    process.env.GIT_OBJECT_DIRECTORY = path.join(bare, "objects");
-    try {
-      await git.createOrAttachRunnerClone(bare, 22, "run-1", false, undefined, SELF);
-    } finally {
-      if (saved.alt === undefined) delete process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES;
-      else process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES = saved.alt;
-      if (saved.obj === undefined) delete process.env.GIT_OBJECT_DIRECTORY;
-      else process.env.GIT_OBJECT_DIRECTORY = saved.obj;
-    }
-    assert.ok(seen.length >= 2, "the verification ran fsck and cat-file");
-    for (const env of seen) {
-      assert.strictEqual("GIT_ALTERNATE_OBJECT_DIRECTORIES" in env, false);
-      assert.strictEqual("GIT_OBJECT_DIRECTORY" in env, false);
-    }
+    const rc = await git.createOrAttachRunnerClone(bare, 26, "run-1", false, undefined, SELF);
+    assert.strictEqual(fs.existsSync(alternatesPath(rc.path)), false, "alternates retired");
+    assert.strictEqual(fs.existsSync(parkedPath(rc.path)), true, "the parked file is left behind");
+    assert.ok(lines.some((l) => /could not remove the parked alternates file/.test(String((l as { msg?: string }).msg))));
+    assert.ok(lines.some((l) => (l as { msg?: string }).msg === "runner clone: materialized (self-contained)"));
+    hideBare(bare);
+    assert.ok(resolves(rc.path, rc.baseCommit), "the base resolves without the bare");
+  });
+
+  it("the worker fetch-back works from a materialized clone after the agent commits", async () => {
+    const git = worker("w");
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 27, "run-1", false, undefined, SELF);
+    assert.strictEqual(fs.existsSync(alternatesPath(rc.path)), false);
+    const work = commit(rc.path, "FETCHBACK.txt");
+    const dst = await git.fetchAgentBranch(bare, rc.path, "agent/issue-27", "run-1");
+    assert.strictEqual(gitIn(bare, ["rev-parse", dst]), work, "the bare tracking ref is the agent commit");
+    assert.ok(resolves(bare, work), "the agent commit landed in the bare");
   });
 
   it("the helper is a no-op on an already self-contained clone", async () => {

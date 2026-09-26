@@ -951,7 +951,8 @@ export class GitCache {
    * the untrusted direction (worker fetching BACK from the runner clone) is the one
    * forced onto the pack transport in fetchAgentBranch (B2 invariant 3).
    *
-   * issue #1769 — `opts.selfContained` (the runner passes `!!executor.safety`, i.e. Codex):
+   * issue #1769 — `opts.selfContained` (the runner passes `executor.sandboxesCommands === true`,
+   * i.e. Codex, whose command sandbox is fixed at executor construction):
    * after every ref/checkpoint step, still under this bare's lock, the clone is dissociated
    * from the bare (materializeRunnerClone), because the Codex command sandbox does not grant
    * the bare and git there cannot follow the alternate. Default false: the Claude path keeps
@@ -1557,14 +1558,17 @@ export class GitCache {
    * worker bare into its own object store, then retire `objects/info/alternates`. The Codex
    * command sandbox does not grant the bare, so a `--shared` clone is unreadable to git there.
    *
-   * Every git/mv/rm runs as the RUNNER uid (the clone is runner-owned); nothing touches the
-   * clone as worker. Called only by runnerCloneForBranch, inside withLock(barePath). Steps:
+   * Every git/mv/rm runs as the RUNNER uid (the clone is runner-owned); no git, mv or rm runs
+   * against the clone as worker (the worker only lstats the alternates paths). Called only
+   * by runnerCloneForBranch, inside withLock(barePath). Steps:
    * anchor each required SHA under a temporary `refs/uzi-materialize/<n>`; `repack -a -d`
    * (no `-l`, so borrowed objects are packed locally); rename the alternates file aside;
    * verify with every alternate source disabled (fsck connectivity + `cat-file -e` of HEAD
-   * and each required SHA); then drop the anchors and the renamed file. On any failure the
-   * renamed file is moved back and the anchors deleted (best-effort) and a
-   * RunnerCloneMaterializationError is thrown. A clone with no alternates file is left as is.
+   * and each required SHA); then drop the anchors and the renamed file (best-effort, logged:
+   * the clone is already self-contained by then). On any failure before that the renamed file
+   * is moved back and the anchors deleted (best-effort) and a RunnerCloneMaterializationError
+   * is thrown. A clone with no alternates file (lstat ENOENT) is left as is; any other lstat
+   * error fails closed.
    */
   private async materializeRunnerClone(clonePath: string, requiredShas: readonly string[]): Promise<void> {
     if (this.boundaryProcesses.getStore()) {
@@ -1573,19 +1577,18 @@ export class GitCache {
     const infoDir = path.join(clonePath, ".git", "objects", "info");
     const alternates = path.join(infoDir, "alternates");
     const parked = path.join(infoDir, "alternates.uzi-materialize");
-    if (!(await pathExists(alternates))) {
+    let hasAlternates: boolean;
+    try {
+      hasAlternates = await lstatPresent(alternates);
+    } catch (err) {
+      throw new RunnerCloneMaterializationError(clonePath, `cannot probe ${alternates}: ${gitErrorMessage(err)}`);
+    }
+    if (!hasAlternates) {
       this.log.info("runner clone: no alternates, already self-contained (materialization skipped)", { path: clonePath });
       return;
     }
     const started = Date.now();
-    // The same runner env runGitAsRunner builds, with the env-level alternate sources removed
-    // explicitly: gitEnv() is a replacement env, but the verification below must not be able to
-    // succeed through an alternate object directory whatever the caller's environment holds.
-    const env: NodeJS.ProcessEnv = { ...gitEnv(), PATH: runnerPath() };
-    const tmp = runnerTmpdir();
-    if (tmp) env.TMPDIR = tmp;
-    delete env.GIT_ALTERNATE_OBJECT_DIRECTORIES;
-    delete env.GIT_OBJECT_DIRECTORY;
+    const env = materializeEnv(gitEnv());
     const run = async (command: string, args: string[]): Promise<string> => {
       const wrapped = runnerCommand(command, args);
       this.log.debug("runner clone materialize (runner uid)", { command, args });
@@ -1612,11 +1615,14 @@ export class GitCache {
       await run("/bin/mv", ["-f", alternates, parked]);
       renamed = true;
       await git(["fsck", "--connectivity-only", "--no-dangling", "--no-progress"]);
-      for (const sha of ["HEAD", ...verified]) {
+      for (const sha of verified) {
         await git(["cat-file", "-e", `${sha}^{commit}`]);
       }
     } catch (err) {
-      if (renamed || (await pathExists(parked))) {
+      // Fail closed on the probe: only ENOENT means "not parked"; an unreadable path is
+      // treated as possibly parked so the restore is still attempted (and logged if it fails).
+      const parkedPresent = renamed || (await lstatPresent(parked).catch(() => true));
+      if (parkedPresent) {
         await run("/bin/mv", ["-f", parked, alternates]).catch((e: unknown) =>
           this.log.warn("runner clone: could not restore alternates after failed materialization", {
             path: clonePath,
@@ -1629,8 +1635,24 @@ export class GitCache {
       this.log.warn("runner clone: materialization failed (alternates restored)", { path: clonePath, error: cause });
       throw new RunnerCloneMaterializationError(clonePath, cause);
     }
-    for (const ref of anchors) await git(["update-ref", "-d", ref]);
-    await run("/bin/rm", ["-f", parked]);
+    // Verification passed: the clone no longer needs the bare. Leftover anchors or a leftover
+    // parked file are harmless (git never reads alternates.uzi-materialize), so cleanup is
+    // best-effort and a failure is logged rather than failing a usable seed.
+    for (const ref of anchors) {
+      await git(["update-ref", "-d", ref]).catch((e: unknown) =>
+        this.log.warn("runner clone: could not delete a materialization anchor", {
+          path: clonePath,
+          ref,
+          error: gitErrorMessage(e),
+        }),
+      );
+    }
+    await run("/bin/rm", ["-f", parked]).catch((e: unknown) =>
+      this.log.warn("runner clone: could not remove the parked alternates file", {
+        path: clonePath,
+        error: gitErrorMessage(e),
+      }),
+    );
     this.log.info("runner clone: materialized (self-contained)", {
       path: clonePath,
       duration_ms: Date.now() - started,
@@ -5060,6 +5082,31 @@ function gitErrorMessage(err: unknown): string {
   const stderr = typeof e.stderr === "string" ? e.stderr.trim() : "";
   if (stderr) return stderr;
   return typeof e.message === "string" ? e.message : String(err);
+}
+
+/** issue #1769: the env materializeRunnerClone runs its runner-uid git under — `base` (the
+ *  gitEnv() replacement env) with the runner PATH/TMPDIR, and with every env-level alternate
+ *  object source removed, so the verification cannot pass through an alternate object
+ *  directory whatever `base` holds. */
+export function materializeEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base, PATH: runnerPath() };
+  const tmp = runnerTmpdir();
+  if (tmp) env.TMPDIR = tmp;
+  delete env.GIT_ALTERNATE_OBJECT_DIRECTORIES;
+  delete env.GIT_OBJECT_DIRECTORY;
+  return env;
+}
+
+/** issue #1769: true when `p` exists (lstat, no symlink follow), false ONLY on ENOENT; every
+ *  other error (EACCES, EIO, ...) is rethrown so a caller can fail closed. */
+async function lstatPresent(p: string): Promise<boolean> {
+  try {
+    await fs.lstat(p);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
 }
 
 async function pathExists(p: string): Promise<boolean> {

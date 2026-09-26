@@ -749,6 +749,11 @@ export interface Executor {
   /** M3 (PRD #1171): a Codex-selected executor supplies this outer safety facade;
    * absence preserves Claude/stub callers (they take the literal legacy killAgentTree branch). */
   safety?: CodexExecutionSafety;
+  /** issue #1769: true when this executor runs model commands in the Codex command sandbox
+   * (Landlock rooted at the clone), known at construction. Unlike `safety` (populated only
+   * inside `run()`), this is readable before the runner clone is seeded, so the seed can make
+   * the clone self-contained. Every other executor leaves it unset. */
+  readonly sandboxesCommands?: boolean;
 }
 
 /**

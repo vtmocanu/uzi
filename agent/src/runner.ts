@@ -9456,9 +9456,10 @@ export class RunRunner {
     // wire's null (a never-published run) to the "do not adopt" sentinel the git layer reads.
     const expectedCheckpointTip = claim.checkpoint_tip ?? undefined;
     // issue #1769: a Codex (sandboxed) run's command sandbox does not grant the worker bare,
-    // so its clone is dissociated from the bare at seed. Harness-agnostic: keyed on
-    // `!!executor.safety`, like every other Codex branch; the Claude path passes false.
-    const cloneOpts = { selfContained: !!executor.safety };
+    // so its clone is dissociated from the bare at seed. Keyed on
+    // `executor.sandboxesCommands`, which the executor sets at construction: `executor.safety`
+    // is populated only inside run(), so it is still unset here. Claude/stub pass false.
+    const cloneOpts = { selfContained: executor.sandboxesCommands === true };
     // PRD #983 M4b: the per-kind branch derivations (ci_fix's default-branch vs run-branch
     // choice, self_improve/prompt's fresh-per-cycle run-id branch, task/mr_rework's
     // pre-seeded branch with its loud missing-branch guard) live in RUN_KIND_PROFILES. A

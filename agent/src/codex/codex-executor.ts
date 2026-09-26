@@ -1514,6 +1514,9 @@ export class CodexExecutor implements Executor {
    *  the runner never takes the legacy killAgentTree branch for a Codex run. This class
    *  deliberately does NOT implement `killAgentTree`. */
   safety?: CodexExecutionSafety;
+  /** issue #1769: set at construction (unlike `safety`), so the runner seeds a self-contained
+   *  clone the Codex command sandbox can read without the worker bare. */
+  readonly sandboxesCommands = true;
 
   private readonly log: Logger;
   private readonly homeRoot: string;

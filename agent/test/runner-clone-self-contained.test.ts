@@ -4,15 +4,17 @@ import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import { GitCache, type RunnerClone } from "../src/git.js";
 import type { Executor, ExecutorResult, RunContext } from "../src/executor.js";
 import type { CodexExecutionSafety } from "../src/harness.js";
+import { CodexExecutor, type CodexExecutorOptions } from "../src/codex/codex-executor.js";
 import { nullLogger } from "./helpers.js";
 import { api, client, fakeGitlab, fx, gitlabClaim, installHarness } from "./runner-harness.js";
 
 installHarness();
 
-// issue #1769 m1 — the runner asks for a SELF-CONTAINED runner clone iff the executor is
-// Codex-selected (`!!executor.safety`, the runner's harness-agnostic Codex branch). The git
-// double records the option and stops the run at the seed, so nothing past phaseClone (and
-// no Codex boundary) is exercised.
+// issue #1769 m1 — the runner asks for a SELF-CONTAINED runner clone iff the executor runs
+// model commands in the Codex command sandbox (`executor.sandboxesCommands === true`, known at
+// construction). NOT `executor.safety`: a real CodexExecutor populates that only inside run(),
+// so it is still unset at seed time. The git double records the option and stops the run at
+// the seed, so nothing past phaseClone (and no Codex boundary, no executor.run) is exercised.
 
 const STOP = "stop after recording the clone options (issue #1769 test)";
 
@@ -38,6 +40,11 @@ class RecordingGit extends GitCache {
 const neverRun = async (_ctx: RunContext): Promise<ExecutorResult> => {
   throw new Error("the executor must not run: the seed stopped the run");
 };
+
+/** A REAL CodexExecutor, never run: the constructor only stores its options, so inert ones do. */
+function realCodexExecutor(): CodexExecutor {
+  return new CodexExecutor(nullLogger(), "/nonexistent/agent-home", { binding: {}, client: {}, provider: {} } as unknown as CodexExecutorOptions);
+}
 
 function fakeSafety(): CodexExecutionSafety {
   return {
@@ -73,8 +80,16 @@ describe("RunRunner — self-contained runner clone for Codex (issue #1769 m1)",
     assert.deepStrictEqual(seen, [{ selfContained: false }]);
   });
 
-  it("a Codex executor (safety set) seeds with selfContained true", async () => {
-    const seen = await seedOptsFor({ run: neverRun, safety: fakeSafety() }, 1770);
+  it("a real CodexExecutor (safety still unset before run) seeds with selfContained true", async () => {
+    const executor = realCodexExecutor();
+    assert.strictEqual(executor.safety, undefined, "safety is populated only inside run()");
+    assert.strictEqual(executor.sandboxesCommands, true);
+    const seen = await seedOptsFor(executor, 1770);
     assert.deepStrictEqual(seen, [{ selfContained: true }]);
+  });
+
+  it("the signal is sandboxesCommands, not safety: a safety-only executor seeds with selfContained false", async () => {
+    const seen = await seedOptsFor({ run: neverRun, safety: fakeSafety() }, 1771);
+    assert.deepStrictEqual(seen, [{ selfContained: false }]);
   });
 });
