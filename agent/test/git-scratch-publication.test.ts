@@ -89,6 +89,45 @@ it("packs unpinned candidate and floor OIDs even when refs move at pack time", a
   assert.equal(Buffer.concat(chunks).subarray(0, 4).toString(), "PACK");
 });
 
+type ScratchShape = "forced staged file" | "add then delete" | "symlink replacing directory" | "file replacing directory";
+
+for (const shape of ["forced staged file", "add then delete", "symlink replacing directory", "file replacing directory"] as const satisfies readonly ScratchShape[]) {
+  it(`checkpoint and final push refuse ${shape} without moving the confirmed or remote tip`, async () => {
+    const { bare, clone } = await setup();
+    fs.writeFileSync(path.join(clone, "clean.txt"), "clean\n");
+    const confirmed = commit(clone, "clean confirmed tip");
+    await track(bare, clone);
+    await cache.pushBranch(bare, branch, "", fx.originPath);
+    const ref = `refs/heads/${branch}`;
+    const tracking = `refs/remotes/origin/${branch}`;
+    assert.equal(git(fx.originPath, "rev-parse", ref), confirmed);
+
+    const scratch = path.join(clone, ".uzi", "scratch");
+    if (shape === "forced staged file" || shape === "add then delete") {
+      fs.mkdirSync(scratch, { recursive: true });
+      fs.writeFileSync(path.join(scratch, "secret"), "value\n");
+      git(clone, "add", "-f", ".uzi/scratch/secret");
+      git(clone, ...ident, "commit", "-m", "scratch file");
+      if (shape === "add then delete") {
+        fs.rmSync(scratch, { recursive: true });
+        commit(clone, "delete scratch");
+      }
+    } else {
+      fs.rmSync(scratch, { recursive: true });
+      if (shape === "symlink replacing directory") fs.symlinkSync("../README.md", scratch);
+      else fs.writeFileSync(scratch, "file");
+      git(clone, "add", "-f", ".uzi/scratch");
+      git(clone, ...ident, "commit", "-m", shape);
+    }
+    await track(bare, clone);
+    assert.notEqual(git(bare, "rev-parse", `refs/uzi-runner/${branch}`), confirmed);
+    await assert.rejects(cache.checkpointPack(bare, branch), ScratchPublicationError);
+    await assert.rejects(cache.pushBranch(bare, branch, "", fx.originPath), ScratchPublicationError);
+    assert.equal(git(fx.originPath, "rev-parse", ref), confirmed);
+    assert.equal(git(bare, "rev-parse", tracking), confirmed);
+  });
+}
+
 it("refuses a force staged scratch file and an add then delete", async () => {
   const { bare, clone } = await setup();
   fs.mkdirSync(path.join(clone, ".uzi", "scratch"), { recursive: true });
