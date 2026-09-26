@@ -88,7 +88,7 @@ Last reviewed commit: [x](https://github.com/test/repo/commit/$RACE_HEAD)
         pushrace_stale_dup|pushrace_new_trigger|pushrace_pending_first) printf '{"check_runs":[%s]}\n' "$(race_run 4 in_progress 2026-09-25T16:24:51Z '' '')" ;;
         *) echo '{"check_runs":[]}' ;;
       esac ;;
-    *'/pulls/42/files'*|*'/contents/'*) echo '[]' ;;
+    *'/pulls/42/files'*|*'/contents/'*|*'/rules/branches/'*) echo '[]' ;;
     *) echo "unexpected gh api in race fixture: $*" >&2; return 1 ;;
   esac
 }

@@ -4,7 +4,8 @@
 #
 # It combines the signals a merge decision here actually needs, so a session stops
 # hand-rolling (and mis-writing) the same waiter each run:
-#   1. required CI is settled and green on the PR's *current* head;
+#   1. required CI is settled and green on the PR's *current* head, every context the base
+#      branch's rules require having reported;
 #   2. a reviewer bot (CodeRabbit and/or Greptile, per --reviewer) has reviewed that exact
 #      head and left no live (unresolved) inline findings;
 #   3. no in-flight uzi `mr_rework` run is reworking this MR (which would race a local
@@ -69,6 +70,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/review-threads.sh"
 # shellcheck source=lib/greptile-verdict.sh
 . "$HERE/lib/greptile-verdict.sh"
+# shellcheck source=lib/required-checks.sh
+. "$HERE/lib/required-checks.sh"
 
 usage() { echo "usage: watch-pr.sh OWNER/REPO PR [interval_secs] [max_polls] [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN]" >&2; exit 2; }
 
@@ -140,13 +143,24 @@ while [ "$i" -lt "$MAX" ]; do
   # by validity, NOT by gh's exit code — `gh pr checks` exits non-zero merely for pending.
   # The payload must be a NON-EMPTY array: `{}` or `[]` (a PR whose checks have not
   # registered yet, or a malformed reply) would count as zero failing / zero pending and
-  # forge a green, so both are unknown.
-  fail=0; pend=0; cancel=0
-  cj=$(gh pr checks "$PR" --repo "$REPO" --required --json bucket 2>/dev/null || true)
+  # forge a green, so both are unknown. A required context the base branch's rules name but
+  # the list lacks has not registered yet: it counts as pending (lib/required-checks.sh).
+  fail=0; pend=0; cancel=0; missing=0
+  cj=$(gh pr checks "$PR" --repo "$REPO" --required --json name,bucket 2>/dev/null || true)
   if printf '%s' "$cj" | jq -e 'type=="array" and length>0' >/dev/null 2>&1; then
     fail=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="fail")]|length') || unknown=1
     pend=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length') || unknown=1
     cancel=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length') || unknown=1
+    if [ -z "${req_ctx:-}" ]; then
+      req_base=$(gh pr view "$PR" --repo "$REPO" --json baseRefName -q .baseRefName 2>/dev/null || true)
+      if [ -n "$req_base" ]; then req_ctx=$(required_contexts "$REPO" "$req_base") || req_ctx=""; fi
+    fi
+    if [ -n "${req_ctx:-}" ]; then
+      missing=$(missing_required "$req_ctx" "$cj") || unknown=1
+      pend=$((pend + ${missing:-0}))
+    else
+      unknown=1
+    fi
   else
     unknown=1
   fi
@@ -523,7 +537,7 @@ while [ "$i" -lt "$MAX" ]; do
   [ "$equiv" -eq 1 ] && eqnote=" equiv=1"
   [ "$gr_reviewed" -eq 1 ] && grnote=" gr_scope=$gr_scoped_total+${god_head}od/${gr_added:-?}"
   [ -n "$gr_prior" ] && grnote=" gr_prior=$gr_prior"
-  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' cr_full_required=$cr_full_required greptile=$gr_state$gr_via${gr_summary:+ ($gr_summary)}${grnote} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${unknown:+ unknown=$unknown}"
+  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend${missing:+ req_missing=$missing} req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' cr_full_required=$cr_full_required greptile=$gr_state$gr_via${gr_summary:+ ($gr_summary)}${grnote} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${unknown:+ unknown=$unknown}"
 
   # A failed lookup this iteration: defer, do not decide on masked values.
   if [ "$unknown" -ne 0 ]; then sleep "$INTERVAL"; continue; fi

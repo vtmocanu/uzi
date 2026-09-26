@@ -57,12 +57,20 @@ if [ "\${1:-}" = pr ] && [ "\${2:-}" = view ]; then
     *'-q .state'*) printf '%s\n' "\$st" ;;
     *-q*)  printf '%s\n' "\$oid" ;;   # the retry: gh -q '.mergeCommit.oid // empty' prints the oid
     *)     if [ -n "\$oid" ]; then
-             echo '{"state":"'"\$st"'","headRefOid":"$HEAD","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","mergeCommit":{"oid":"'"\$oid"'"}}'
+             echo '{"state":"'"\$st"'","headRefOid":"$HEAD","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","mergeCommit":{"oid":"'"\$oid"'"},"baseRefName":"main"}'
            else
-             echo '{"state":"'"\$st"'","headRefOid":"$HEAD","mergeStateStatus":"BLOCKED","mergeable":"MERGEABLE","mergeCommit":null}'
+             echo '{"state":"'"\$st"'","headRefOid":"$HEAD","mergeStateStatus":"BLOCKED","mergeable":"MERGEABLE","mergeCommit":null,"baseRefName":"main"}'
            fi ;;
   esac
   exit 0
+fi
+# The base branch's required contexts (RULES_JSON; RULES_FAIL=1 = unreadable). Default: none.
+if [ "\${1:-}" = api ]; then
+  case "\$*" in *'/rules/branches/main'*)
+    [ "\${RULES_FAIL:-0}" = 1 ] && exit 1
+    if [ -n "\${RULES_JSON:-}" ]; then printf '%s\n' "\$RULES_JSON"; else echo '[]'; fi
+    exit 0 ;;
+  esac
 fi
 if [ "\${1:-}" = pr ] && [ "\${2:-}" = checks ]; then printf '%s\n' "\${CHECKS_JSON:-}"; exit "\${CHECKS_RC:-0}"; fi
 if [ "\${1:-}" = pr ] && [ "\${2:-}" = merge ]; then echo "\$*" >> "$WORK/merge.log"; exit 0; fi
@@ -217,6 +225,22 @@ grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "pass+ski
 CHECKS_JSON='[{"bucket":"pass"}]' CHECKS_RC=0
 merge_run green
 grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "a green required-checks list did not reach the merge: $(cat "$WORK/m.green")"
-unset CHECKS_JSON CHECKS_RC
+# A required context the base branch's rules name but the head has not reported is pending:
+# right after a push only the fast required checks have registered.
+export RULES_JSON='[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci"},{"context":"slow"}]}}]'
+CHECKS_JSON='[{"name":"ci","bucket":"pass"}]' CHECKS_RC=0
+merge_run unregistered
+[ "$rc" -eq 2 ] || fail "an unregistered required check returned rc=$rc, want 2: $(cat "$WORK/m.unregistered")"
+grep -q "1 required check(s) not yet reported on ${HEAD:0:8}; not merging" "$WORK/m.unregistered" || fail "unregistered check not named: $(cat "$WORK/m.unregistered")"
+[ ! -e "$WORK/merge.log" ] || fail "merged before every required check reported"
+CHECKS_JSON='[{"name":"ci","bucket":"pass"},{"name":"slow","bucket":"pass"}]'
+merge_run allreported
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "every required check passed yet no merge: $(cat "$WORK/m.allreported")"
+RULES_FAIL=1; export RULES_FAIL
+merge_run rulesunreadable
+[ "$rc" -eq 2 ] || fail "unreadable required-check rules returned rc=$rc, want 2: $(cat "$WORK/m.rulesunreadable")"
+grep -q 'cannot read the required checks of main; not merging' "$WORK/m.rulesunreadable" || fail "unreadable rules not named: $(cat "$WORK/m.rulesunreadable")"
+[ ! -e "$WORK/merge.log" ] || fail "merged with unreadable required-check rules"
+unset CHECKS_JSON CHECKS_RC RULES_JSON RULES_FAIL
 
-echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only required checks refuse"
+echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse"

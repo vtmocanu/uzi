@@ -33,10 +33,15 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
   exit 0
 fi
 if [ "${1:-}" = pr ] && [ "${2:-}" = checks ]; then
-  echo '[{"bucket":"pass"}]'
+  if [ -n "${CHECKS_JSON:-}" ]; then echo "$CHECKS_JSON"; else echo '[{"name":"ci","bucket":"pass"}]'; fi
   exit 0
 fi
 if [ "${1:-}" = api ]; then
+# The base branch's required contexts (RULES_JSON; RULES_FAIL=1 = unreadable). Default: none.
+case "$*" in *'/rules/branches/main'*)
+  [ "${RULES_FAIL:-0}" = 1 ] && exit 1
+  echo "${RULES_JSON:-[]}"; exit 0 ;;
+esac
 # pushrace* modes: the PR #1698 race, shared with the other entrypoints' tests.
 case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; esac
   case "$*" in
@@ -466,4 +471,31 @@ wp pushrace_pending_first
 [ "$rc" -eq 2 ] || fail "pushrace_pending_first: an in-progress first review was not waited on, rc=$rc: $(cat "$WORK/pushrace_pending_first.out")"
 grep -q 'greptile=in_progress live=' "$WORK/pushrace_pending_first.out" || fail "pushrace_pending_first: $(cat "$WORK/pushrace_pending_first.out")"
 
-echo "PASS watch-pr: settled reviews, resolved-thread scope, earlier-verdict Greptile scope, change_assessment head marker, reviewer override, Greptile run on an older commit"
+# Required contexts not yet registered on the head are pending, not green: right after a push
+# `gh pr checks --required` lists only the fast checks that already passed.
+export RULES_JSON='[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci"},{"context":"slow"}]}}]'
+MODE="greptile_clean"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer greptile --reviewer-grace 0 > "$WORK/req-partial.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "an unregistered required check read as settled, rc=$rc: $(cat "$WORK/req-partial.out")"
+grep -q 'req_pend=1 req_missing=1 ' "$WORK/req-partial.out" || fail "missing required check not counted: $(cat "$WORK/req-partial.out")"
+
+export CHECKS_JSON='[{"name":"ci","bucket":"pass"},{"name":"slow","bucket":"pass"}]'
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer greptile --reviewer-grace 0 > "$WORK/req-complete.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "every required check reported and passed, yet rc=$rc: $(cat "$WORK/req-complete.out")"
+
+RULES_FAIL=1; export RULES_FAIL
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer greptile --reviewer-grace 0 > "$WORK/req-unreadable.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "unreadable required-check rules read as none required, rc=$rc: $(cat "$WORK/req-unreadable.out")"
+grep -q 'unknown=1' "$WORK/req-unreadable.out" || fail "unreadable rules not unknown: $(cat "$WORK/req-unreadable.out")"
+unset RULES_JSON RULES_FAIL CHECKS_JSON
+
+echo "PASS watch-pr: settled reviews, unregistered required checks, resolved-thread scope, earlier-verdict Greptile scope, change_assessment head marker, reviewer override, Greptile run on an older commit"
