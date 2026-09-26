@@ -57,7 +57,8 @@ Then:
      `.github/SECURITY.md`; propose a private draft advisory, never a public
      issue. Create it after authorization with the required advisory fields.
      Current uzi issue dispatch cannot target private advisories; handle
-     implementation in a maintainer session.
+     implementation in a maintainer session and land it per the `uzi-lander`
+     skill's `references/advisory.md`.
 
 Present the bundles and your per-rec verdicts to the user and confirm before
 touching any code or triage state.
