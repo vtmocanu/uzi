@@ -947,6 +947,16 @@ export class WorkerClient {
       { ids, claim_generation: claimGeneration })) as InputReceipt;
   }
 
+  /** Issue #1604: settle this claim's own approve_plan rows that were disposed of without a gate
+   *  taking them (stale, superseded, or after the gate closed) as applied with disposition
+   *  'superseded' (POST /worker/runs/{id}/inputs/discarded). The server does not count such a row as
+   *  the human approval and leaves it out of the replay list. Same reply and status mapping as
+   *  applyInputs; an older api answers 404 for the route. */
+  async discardInputs(runId: string, ids: number[], claimGeneration: number): Promise<InputReceipt> {
+    return (await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs/discarded`,
+      { ids, claim_generation: claimGeneration })) as InputReceipt;
+  }
+
   /** Issue #1660: the run's ALREADY-CONSUMED follow_up inputs, oldest first (GET
    *  /worker/runs/{id}/follow-ups). READ ONLY: unlike getInputs it consumes nothing. The runner
    *  seeds them into the steering channel on every claim so a follow-up an earlier claim consumed

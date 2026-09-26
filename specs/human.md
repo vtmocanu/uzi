@@ -918,6 +918,15 @@ Tracked as GitHub issue vtmocanu/uzi#1732; PRD at `prds/1732-disable-account-cre
 - Every default is enabled: disabling the default requires choosing an enabled replacement; disabling the last credential of a kind leaves that kind with no default. The Judge keeps Feature #1140's empty-pool fallback to the (enabled) default. (AI-synced 2026-09-26)
 - Disabled credentials collapse into a "Disabled (n)" section, collapsed by default. Enable/disable is web-only; the CLI only shows the state. (AI-synced 2026-09-26)
 
+## Feature #1604 — Plan-gate verdicts survive interruptions
+
+Tracked as GitHub issue vtmocanu/uzi#1604; decision record `adr/1604-plan-gate-verdict-durability.md`.
+
+- An approve, reject or request-changes sent at the plan gate is never lost silently across a credential switch, worker restart or resumed run (an empty change request carries nothing); it takes effect once its result is saved, and otherwise carries over to the resumed run. A carried-over verdict uzi cannot match to a plan is ignored with a feed note asking to re-send it; on Codex runs every carried-over verdict (approve, reject or request-changes) is ignored that way, and a fresh plan is shown. (AI-synced 2026-09-26)
+- A verdict is never applied to a plan the owner did not see: one sent before the current plan was shown, or one uzi cannot match to a plan, is ignored, and an ignored approve never counts as approval. (AI-synced 2026-09-26)
+- A resumed run with an unapproved plan reads the owner's pending verdicts before it shows a plan. On Claude runs a pending cancel, reject or request-changes acts first (changes revise the submitted plan rather than re-offering it); a pending approve waits for the gate, where it is judged like any replayed verdict. On Codex runs every pending approve, reject or request-changes is ignored with a note asking to re-send it, and a fresh plan is shown. (AI-synced 2026-09-26)
+- Every ignored verdict is explained in the run feed, except an approve replaced by a newer verdict, a repeat approve after the plan was approved, and an empty change request. (AI-synced 2026-09-26)
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

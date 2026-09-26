@@ -30,6 +30,11 @@ through `[0.52.0]`.)
 - **The worker scratch path and sandbox guarantee are documented ([#1719](https://github.com/vtmocanu/uzi/issues/1719)).**
   ADR-1719 defines the `.uzi/scratch/` path for run artifacts and the limits of each harness's path policy. The worker provisions and locally excludes scratch, refuses checkpoint or final publication of forced-staged artifacts, and guides both harnesses to fresh review exports and gate logs inside the retained clone.
 
+### Fixed
+
+- **A plan-gate verdict no longer gets lost or applied to the wrong plan when a run is interrupted ([#1604](https://github.com/vtmocanu/uzi/issues/1604)).**
+  Approve, reject, and request-changes verdicts now survive a credential switch, a worker restart, or a resumed run; on Codex runs carried-over verdicts (approve, reject or request-changes) are ignored and the run feed asks you to re-send them, and a fresh plan is shown. A requested revision is kept until the revised plan is saved, so on Claude runs a resumed run revises with your original feedback instead of re-showing the old plan. A reject is recorded together with stopping the run; a verdict sent before the current plan was shown is ignored, with a note in the run feed explaining why. Upgrade the api and workers together: an api from 0.84.x still works with the new worker but sends no plan-shown time, so an approve or reject replayed on a resumed run is ignored with "Could not confirm which plan this verdict was for" and must be re-sent, and ignored approvals stay pending instead of being cleared.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added

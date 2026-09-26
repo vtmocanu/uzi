@@ -717,6 +717,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/recovery-holds/{holdID}/settle-live", noLimiter},
 	{"POST", "/api/worker/runs/{id}/inputs/ack", noLimiter},
 	{"POST", "/api/worker/runs/{id}/inputs/applied", noLimiter},
+	{"POST", "/api/worker/runs/{id}/inputs/discarded", noLimiter},
 	{"POST", "/api/worker/runs/{id}/memory", noLimiter},
 	{"POST", "/api/worker/runs/{id}/messages", noLimiter},
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},

@@ -1144,7 +1144,11 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, body)
 }
 
-func (h *Handler) workerInputReceipt(w http.ResponseWriter, r *http.Request, applied bool) {
+// inputReceiptFunc is one of the workersvc receipt entry points (ACK, APPLIED, DISCARDED),
+// which share a body, auth, capability requirement and status mapping.
+type inputReceiptFunc func(ctx context.Context, wkr store.Worker, runID uuid.UUID, generation int64, ids []int64) (workersvc.InputReceiptResult, error)
+
+func (h *Handler) workerInputReceipt(w http.ResponseWriter, r *http.Request, receipt inputReceiptFunc) {
 	wkr, ok := mw.WorkerFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
@@ -1162,13 +1166,7 @@ func (h *Handler) workerInputReceipt(w http.ResponseWriter, r *http.Request, app
 		httpx.Error(w, http.StatusBadRequest, "invalid input receipt body")
 		return
 	}
-	var res workersvc.InputReceiptResult
-	var err error
-	if applied {
-		res, err = h.wsvc.ApplyInputs(r.Context(), wkr, runID, *body.ClaimGeneration, body.IDs)
-	} else {
-		res, err = h.wsvc.AckInputs(r.Context(), wkr, runID, *body.ClaimGeneration, body.IDs)
-	}
+	res, err := receipt(r.Context(), wkr, runID, *body.ClaimGeneration, body.IDs)
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotOwned):
@@ -1196,11 +1194,19 @@ func (h *Handler) workerInputReceipt(w http.ResponseWriter, r *http.Request, app
 }
 
 func (h *Handler) WorkerRunInputsAck(w http.ResponseWriter, r *http.Request) {
-	h.workerInputReceipt(w, r, false)
+	h.workerInputReceipt(w, r, h.wsvc.AckInputs)
 }
 
 func (h *Handler) WorkerRunInputsApplied(w http.ResponseWriter, r *http.Request) {
-	h.workerInputReceipt(w, r, true)
+	h.workerInputReceipt(w, r, h.wsvc.ApplyInputs)
+}
+
+// WorkerRunInputsDiscarded settles approve_plan inputs the worker received and dropped as
+// stale (issue #1604): a discarded approve must leave the replay list, which is oldest-first
+// and capped, without counting as a human plan approval. Same body, auth, capability and
+// status mapping as APPLIED; a non-approve_plan id is a 400.
+func (h *Handler) WorkerRunInputsDiscarded(w http.ResponseWriter, r *http.Request) {
+	h.workerInputReceipt(w, r, h.wsvc.DiscardInputs)
 }
 
 // WorkerRunFollowUps returns the already-consumed follow_up inputs of a run this worker owns,

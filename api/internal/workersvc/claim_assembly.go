@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -457,6 +458,24 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			resumePlanSeq = seq
 		}
 	}
+	// Issue #1604: when the persisted plan is UNAPPROVED (both the awaiting_approval gate resume
+	// and the "" re-plan resume of a session-less run), carry when THAT plan was last shown: the
+	// latest `plan` frame whose plan_md equals the persisted run.PlanMd, so a newer frame for a
+	// plan whose awaiting_approval report never persisted cannot move it. The worker discards a
+	// replayed gate verdict written against an earlier plan. Same hasPlan test resumePhaseFor
+	// applies, same planApproved value. A query error or no matching plan frame omits the field
+	// (no fallback to the latest frame) and never fails the claim.
+	var resumePlanAt *time.Time
+	if run.PlanMd.Valid && strings.TrimSpace(run.PlanMd.String) != "" && !planApproved {
+		if at, err := s.q.LatestPersistedPlanFrameAtForRun(ctx, store.LatestPersistedPlanFrameAtForRunParams{
+			RunID: run.ID, PlanMd: run.PlanMd.String,
+		}); err != nil {
+			slog.Warn("workersvc: latest plan frame time for resume", "run_id", run.ID, "error", err)
+		} else if at.Valid {
+			t := at.Time
+			resumePlanAt = &t
+		}
+	}
 
 	payload := &ClaimPayload{
 		RunID:            run.ID.String(),
@@ -548,6 +567,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// submitted plan's seq rides ONLY the awaiting_approval phase (0/omitted otherwise).
 		ResumePhase:   resumePhase,
 		ResumePlanSeq: resumePlanSeq,
+		// Issue #1604: when the unapproved persisted plan was last shown (nil/omitted otherwise).
+		ResumePlanAt: resumePlanAt,
 		// PlanSource travels to the worker so it can tell D4 row 2 (seeded, no session ⇒
 		// implement) from row 3 (dropped session, not seeded ⇒ re-plan). Server writes
 		// it in M1; the worker consumes it in M2. Additive on the wire — an old worker

@@ -84,20 +84,21 @@ export function makeClaim(overrides: Partial<ClaimResponse> = {}): ClaimResponse
 /** Issue #1673: give a scripted getInputs fake the receipt endpoints. Every ACK and applied
  *  receipt succeeds on the active claim and echoes the rows of the latest GET. */
 export function withReceipts(client: WorkerClient): WorkerClient {
-  let latest: UserInput[] = [];
+  // Every row any GET returned, by id: an applied receipt names exactly its ids, which since
+  // issue #1604 need not be the last GET's batch (a revise or reject is applied on its own).
+  const seen = new Map<number, UserInput>();
+  const rowsFor = (ids: number[]): UserInput[] =>
+    ids.flatMap((id) => (seen.has(id) ? [seen.get(id)!] : [])).sort((a, b) => a.id - b.id);
   const getInputs = client.getInputs.bind(client);
   return {
     ...client,
     getInputs: async (runId: string) => {
       const result = await getInputs(runId);
-      latest = result.inputs;
+      for (const row of result.inputs) seen.set(row.id, row);
       return { ...result, receipts: true };
     },
-    ackInputs: async (_runId: string, ids: number[]) => ({
-      inputs: latest.filter((row) => ids.includes(row.id)).sort((a, b) => a.id - b.id),
-      active: true,
-    }),
-    applyInputs: async () => ({ inputs: latest, active: true }),
+    ackInputs: async (_runId: string, ids: number[]) => ({ inputs: rowsFor(ids), active: true }),
+    applyInputs: async (_runId: string, ids: number[]) => ({ inputs: rowsFor(ids), active: true }),
   } as unknown as WorkerClient;
 }
 

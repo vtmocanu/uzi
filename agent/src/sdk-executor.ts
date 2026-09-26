@@ -83,7 +83,7 @@ import {
   SIGNAL_SERVER_NAME,
 } from "./signals.js";
 import { classifyLimitEvidence, LimitReachedError } from "./limit.js";
-import { PauseNowSignal, CredentialSwitchSignal } from "./steering.js";
+import { PauseNowSignal, CredentialSwitchSignal, PLAN_APPROVAL_TIMEOUT_REASON, type PlanVerdict } from "./steering.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { buildForgeToolsServer, FORGE_SERVER_NAME } from "./forge-tools.js";
 import { buildFindingsToolsServer, FINDINGS_SERVER_NAME } from "./findings-tools.js";
@@ -625,6 +625,9 @@ interface DriveState {
 }
 
 export class SdkExecutor implements Executor {
+  /** Issue #1604: see Executor.resumesAtGate — the plan gate reads a resumed claim's pending
+   *  inputs (takeResumedGateEvent) and re-presents an awaiting_approval claim's plan. */
+  readonly resumesAtGate = true;
   private readonly queryFn: SdkQueryFn;
   private readonly spawn: (opts: SpawnOptions) => { pid?: number };
   private readonly kill: (pid: number | undefined) => boolean;
@@ -1665,7 +1668,45 @@ export class SdkExecutor implements Executor {
         // entries, so the server drops the candidate to NULL rather than reading "no milestones"
         // (or a narrowed list) as the completion contract.
         let gateMilestones: Milestone[] | undefined;
-        if (resumeAtGate) {
+        // Issue #1604 (D3): a resumed, unapproved claim with a persisted plan (resume_phase
+        // "awaiting_approval", with or without its session, or "" with none) first reads the inputs
+        // the owner sent before the claim was released, and acts on them BEFORE offering any plan:
+        // a cancel ends the run, a reject fails it (the failed transition settles the reject), and
+        // a revise revises the SUBMITTED plan instead of re-presenting it. An approve stays
+        // buffered for the re-presented gate below. The wait never falls back to the gate.
+        let pending: PlanVerdict | undefined;
+        // Only for an UNAPPROVED plan (the runner guards the same condition): a plan approved by the
+        // server but re-planned here (its session is gone) has no pending gate verdict to read.
+        if (ctx.planApproved !== true && ctx.approvedPlan?.trim() && ctx.takeResumedGateEvent) {
+          const step = await this.runThroughSwitch(ctx, state, () => ctx.takeResumedGateEvent!(ctx.signal));
+          if ("released" in step) return { branch: ctx.branch, switchReleased: true };
+          pending = step.value;
+        }
+        if (pending?.kind === "cancel") throw new Error(REASON_CANCELLED);
+        if (pending?.kind === "reject") {
+          ctx.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text: "the owner rejected the submitted plan before the claim was released — failing the run without offering it again",
+            },
+          });
+          throw new PlanRejectedError(pending.reason);
+        }
+        const resumedRevise = pending?.kind === "revise" ? pending : undefined;
+        if (resumedRevise) {
+          ctx.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text: "resuming at the plan gate with a revision the owner sent before the claim was released — revising the submitted plan instead of re-presenting it",
+            },
+          });
+          approvedPlan = ctx.approvedPlan!;
+          // The candidate breakdown the server delivered with the submitted plan (see below).
+          candidateMilestones = ctx.frozenMilestones ?? undefined;
+          gateMilestones = candidateMilestones;
+        } else if (resumeAtGate) {
           ctx.emit({
             kind: "status",
             agent: "worker",
@@ -1735,19 +1776,42 @@ export class SdkExecutor implements Executor {
         // PRD #1247 M5b (data-integrity fix): the plan gate is a HELD idle state — a credential
         // switch trips by rejecting the parked gate waiter with a CredentialSwitchSignal. Handle it
         // IN PLACE at EVERY gate wait via runThroughSwitch: "released" ends the flight (surface
-        // switchReleased; the reclaim resumes at resume_phase and re-presents this plan), "gave_up"
+        // switchReleased; the reclaim first reads the inputs sent before the release (issue #1604)
+        // and re-presents this plan only when none of them is a revise or reject), "gave_up"
         // re-presents the SAME gate on the OLD token (re-run ctx.gatePlan — keep waiting for a real
         // verdict). The gate already loops for revisions; this only adds switch-survival to each wait.
-        const g0 = await this.runThroughSwitch(ctx, state, () =>
-          ctx.gatePlan!(approvedPlan, gateMilestones, (planMd) =>
-            this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
-          ),
-        );
-        if ("released" in g0) return { branch: ctx.branch, switchReleased: true };
-        let verdict = g0.value;
+        // Issue #1604: a revise read on the resume skips this first gate: the submitted plan was
+        // already offered, and the revise enters the revision loop directly.
+        let verdict: PlanVerdict;
+        if (resumedRevise) verdict = resumedRevise;
+        else {
+          const g0 = await this.runThroughSwitch(ctx, state, () =>
+            ctx.gatePlan!(approvedPlan, gateMilestones, (planMd) =>
+              this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
+            ),
+          );
+          if ("released" in g0) return { branch: ctx.branch, switchReleased: true };
+          verdict = g0.value;
+          // Issue #1604 (D5): a verdict that settles a RE-PRESENTED gate gets one line naming it.
+          if (resumeAtGate && (verdict.kind === "approve" || verdict.kind === "reject"))
+            ctx.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: verdict.kind === "approve"
+                  ? "the re-presented plan was approved — implementing it"
+                  : verdict.reason === PLAN_APPROVAL_TIMEOUT_REASON
+                    ? "the re-presented plan timed out waiting for approval — failing the run"
+                    : "the re-presented plan was rejected — failing the run",
+              },
+            });
+        }
         let revisions = 0;
         while (verdict.kind === "revise") {
           const feedback = verdict.feedback;
+          // Issue #1604 (D2): the re-gate of the revised plan settles THIS revise, once the revised
+          // plan is confirmed persisted; until then an interruption replays it.
+          const settles = verdict.inputId;
           // Record the reviewer's feedback on the feed. Ordered BEFORE the revision turn
           // (and thus before the next gatePlan flushes the new plan), so the feed never
           // lags the awaiting_approval re-report.
@@ -1773,7 +1837,7 @@ export class SdkExecutor implements Executor {
               },
             });
             const gExhausted = await this.runThroughSwitch(ctx, state, () =>
-              ctx.gatePlan!(approvedPlan, gateMilestones),
+              ctx.gatePlan!(approvedPlan, gateMilestones, undefined, settles),
             );
             if ("released" in gExhausted) return { branch: ctx.branch, switchReleased: true };
             verdict = gExhausted.value;
@@ -1790,16 +1854,23 @@ export class SdkExecutor implements Executor {
           // selection only takes effect once a plan is APPROVED (PRD #37 Decision 5).
           // PRD #1247 M5b (MAJOR-6 rework): DEFER the credential switch across the revision planning
           // turn instead of releasing mid-turn. The turn's new plan is not persisted until the gate
-          // report below, so a mid-turn release would leave the run row on the OLD plan_md and a
-          // reclaim would re-present the SUPERSEDED plan (resume_phase 'awaiting_approval' re-emits
-          // run.plan_md verbatim). Deferring holds the switch — which rides every inputs poll — until
-          // the NEXT trip point, the gate wait just below, AFTER gatePlan has persisted the revised
-          // plan; the reclaim then resumes at the gate on the CORRECT plan. The defer window covers
-          // the turn's own ask_user sub-park and closes before the gate wait. A stub/test executor
-          // that does not wire the hook runs the turn undeferred (the switch signal then reaches the
-          // outer catch, byte-identical to the pre-rework behaviour).
+          // report below. Since issue #1604 a mid-turn release is recoverable (the revise stays
+          // unapplied until its revised plan is persisted, so the reclaim reads it again before
+          // offering any plan and revises the submitted plan), but it would spend the revision
+          // turn twice. Deferring holds the switch — which rides every inputs poll — until the NEXT
+          // trip point, the gate wait just below, AFTER gatePlan has persisted the revised plan and
+          // settled the revise; the reclaim then resumes at the gate on the revised plan. The defer
+          // window covers the turn's own ask_user sub-park and closes before the gate wait. A
+          // stub/test executor that does not wire the hook runs the turn undeferred (the switch
+          // signal then reaches the outer catch, byte-identical to the pre-rework behaviour).
+          // Issue #1604 (D4): with no session to resume, the turn has never seen the plan it is
+          // revising, so it gets the full planning prompt plus the submitted plan and the feedback.
+          const revisePrompt =
+            resumeId === undefined
+              ? `${planPrompt}\n\n${buildRevisePlanPrompt(feedback, approvedPlan)}`
+              : buildRevisePlanPrompt(feedback);
           const runRevisionTurn = () =>
-            this.drivePlanningTurn(ctx, baseConfig, resumeId, buildRevisePlanPrompt(feedback), state, idleMs, budget);
+            this.drivePlanningTurn(ctx, baseConfig, resumeId, revisePrompt, state, idleMs, budget);
           const turn = ctx.deferCredentialSwitch
             ? await ctx.deferCredentialSwitch(runRevisionTurn)
             : await runRevisionTurn();
@@ -1812,8 +1883,11 @@ export class SdkExecutor implements Executor {
           // the gate's onAwaitingApproval callback (after the re-report persists the NEW
           // plan_md) so its stale-write guard matches the new plan.
           const gRev = await this.runThroughSwitch(ctx, state, () =>
-            ctx.gatePlan!(approvedPlan, gateMilestones, (planMd) =>
-              this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
+            ctx.gatePlan!(
+              approvedPlan,
+              gateMilestones,
+              (planMd) => this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
+              settles,
             ),
           );
           if ("released" in gRev) return { branch: ctx.branch, switchReleased: true };
