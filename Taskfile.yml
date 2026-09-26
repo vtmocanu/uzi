@@ -2379,6 +2379,28 @@ tasks:
     cmds:
       - ./e2e/provision-path-split/run.sh fixture
 
+  test:codex-git-trust:
+    desc: Opt-in build and run the worker-image Codex command git trust fixture (#1716)
+    # Opt-in, requires Docker; NOT wired into gate or CI. Runs git in a runner-owned checkout
+    # as runner-cmd through the real supervisor + command sandbox, best-effort and (when the
+    # sandbox probe finds Landlock) required mode. Exit 77 is SKIP (no Docker/image/uid split),
+    # never a pass. Set CODEX_GIT_TRUST_MOUNT_SRC=1 to use this tree's agent/src,
+    # CODEX_GIT_TRUST_SRC_DIR for another source tree, and CODEX_GIT_TRUST_BIN_DIR to mount
+    # freshly built supervisor/fileop/sandbox binaries over an older image's.
+    cmds:
+      - task: test:codex-git-trust:build
+      - task: test:codex-git-trust:fixture
+
+  test:codex-git-trust:build:
+    desc: Opt-in build the real base worker image for the Codex command git trust fixture
+    cmds:
+      - ./e2e/codex-git-trust/run.sh build
+
+  test:codex-git-trust:fixture:
+    desc: Opt-in run the Codex command git trust fixture in the prebuilt worker image
+    cmds:
+      - ./e2e/codex-git-trust/run.sh fixture
+
   test:codex-m3a:matrix:
     desc: Opt-in real base and jvm package matrix for amd64 and arm64 with negative controls
     # Builds every actual template/architecture cell. Each Dockerfile executes the positive

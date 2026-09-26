@@ -1659,10 +1659,18 @@ export class CodexExecutor implements Executor {
       // toolEnv (PATH appended, NIX_SSL_CERT_FILE/LOCALE_ARCHIVE folded) rides in without ever
       // overwriting a boundary literal or a PROTECTED_ENV_KEYS member. Built ONCE and shared by
       // every epoch's command + fileop effect surfaces (the roots are per-epoch; the env is not).
-      const commandEnv: NodeJS.ProcessEnv = buildCommandEnv(
-        this.deps.commandTmpdir ?? "/tmp",
-        provisioned.toolEnv,
-        this.opts.dockerWiring?.dockerHost,
+      // Issue #1716: the command identity (runner-cmd) does not own the runner-owned checkout,
+      // so git refuses it as "dubious ownership" unless safe.directory trusts it. Trust ONLY this
+      // run's canonical checkout, via worker-set command-line-scope config (see
+      // withCommandGitTrust). Composed HERE, never in commandEffectSpec: the post-run
+      // boundary sink shares that function and must keep its own gitEnv() untouched.
+      const commandEnv: NodeJS.ProcessEnv = withCommandGitTrust(
+        buildCommandEnv(
+          this.deps.commandTmpdir ?? "/tmp",
+          provisioned.toolEnv,
+          this.opts.dockerWiring?.dockerHost,
+        ),
+        await canonicalCheckoutPath(worktreePath),
       );
 
       // Issue #1598: hold ONE per-run command cache BEFORE any command root can launch (the
@@ -3270,6 +3278,9 @@ export function commandSandboxArgv(
  *     PROTECTED_ENV_KEYS member — {@link COMMAND_ENV_PROTECTED_KEYS} unions both, because
  *     PROTECTED_ENV_KEYS alone omits PATH/TMPDIR/LANG. `commandEffectSpec` later overrides
  *     HOME/TMPDIR to the per-command private tmp, so those stay boundary-safe regardless.
+ *   - issue #1716: a `toolEnv` entry can NEVER inject git config (GIT_CONFIG_COUNT,
+ *     GIT_CONFIG_KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS); run() adds the worker's own
+ *     trust afterwards ({@link withCommandGitTrust}).
  */
 export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>, dockerHost?: string): NodeJS.ProcessEnv {
   const provisionedPath = toolEnv.PATH;
@@ -3282,10 +3293,84 @@ export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>,
   };
   for (const [k, v] of Object.entries(toolEnv)) {
     if (COMMAND_ENV_PROTECTED_KEYS.has(k)) continue; // never breach the boundary / reintroduce a credential key
+    // Issue #1716: inline git config is worker-owned (withCommandGitTrust); a provisioned
+    // toolEnv can never smuggle a safe.directory (or any other key) in through it.
+    if (isGitConfigEnvKey(k)) continue;
     env[k] = v;
   }
   if (dockerHost !== undefined) env.DOCKER_HOST = dockerHost;
   return env;
+}
+
+/** Issue #1716: whether `key` injects git config through the environment: the counted
+ *  GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n form, or the `git -c`
+ *  carrier GIT_CONFIG_PARAMETERS. */
+function isGitConfigEnvKey(key: string): boolean {
+  return key === "GIT_CONFIG_COUNT" || key === "GIT_CONFIG_PARAMETERS" || /^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key);
+}
+
+/** Issue #1716: a copy of `env` without any environment-injected git config
+ *  ({@link isGitConfigEnvKey}), so the command identity's inline git config is exactly
+ *  what {@link commandGitTrustEnv} sets and nothing inherited can extend or renumber it. */
+function stripGitConfigEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(env)) if (!isGitConfigEnvKey(k)) out[k] = v;
+  return out;
+}
+
+/**
+ * Issue #1716: the git ownership trust of a Codex command. A model-authorized command runs as
+ * the runner-cmd uid against the runner-owned checkout, so git's ownership check rejects it
+ * ("detected dubious ownership"), and each command's HOME is a fresh private tmp, so a
+ * global `safe.directory` could never persist. This is worker-controlled, PROTECTED
+ * (command-line scope) config that trusts ONLY the run's canonical checkout:
+ *
+ *   - pair 0 sets `safe.directory` to the empty value, which RESETS every safe.directory
+ *     entry read before it (system, global, including a `*` in the command HOME's
+ *     .gitconfig); pair 1 then trusts the checkout alone. No wildcard, ever.
+ *   - `checkoutPath` is the realpath of the worktree ({@link canonicalCheckoutPath}), which
+ *     matches the canonical checkout path Git computes on the tested worker version, so a
+ *     symlinked ancestor does not break the match.
+ *   - Do NOT reuse git.ts gitEnv() here: it carries `safe.directory=*` plus worker-only pins
+ *     (hooksPath, gc/maintenance, code-exec keys) meant for the worker's own git.
+ *   - Local subprocesses of a command (gitleaks, Taskfile gate steps) inherit this through
+ *     the process env; commands inside separately launched Docker containers do NOT.
+ *   - Codex advice roots need none: they are tool-less.
+ *   - It is not a worker-controlled boundary against the model: a command can still widen
+ *     trust for its own single invocation with `git -c safe.directory=...`
+ *     (GIT_CONFIG_PARAMETERS is read after GIT_CONFIG_COUNT).
+ */
+function commandGitTrustEnv(checkoutPath: string): NodeJS.ProcessEnv {
+  return {
+    GIT_CONFIG_COUNT: "2",
+    GIT_CONFIG_KEY_0: "safe.directory",
+    GIT_CONFIG_VALUE_0: "",
+    GIT_CONFIG_KEY_1: "safe.directory",
+    GIT_CONFIG_VALUE_1: checkoutPath,
+  };
+}
+
+/** Issue #1716: the command env run() hands every command + fileop root: `env` with any
+ *  environment-injected git config stripped, then {@link commandGitTrustEnv} applied LAST
+ *  so nothing in `env` can override or extend it. */
+export function withCommandGitTrust(env: NodeJS.ProcessEnv, canonicalCheckout: string): NodeJS.ProcessEnv {
+  return { ...stripGitConfigEnv(env), ...commandGitTrustEnv(canonicalCheckout) };
+}
+
+/** Issue #1716: the checkout path the command git trust names: the realpath of the
+ *  worktree, resolved ONCE at run start (git also resolves the configured value when it
+ *  compares). Only the command's Landlock root, which excludes the checkout's parent, stands
+ *  between a command and swapping that path: file modes do not (the clone parent is group
+ *  `runner` writable, see git.ts), and best-effort mode may run without Landlock. Only a
+ *  MISSING worktree (ENOENT, e.g. a unit-test rig's placeholder path) falls back to the
+ *  lexically resolved path; any other error propagates. */
+export async function canonicalCheckoutPath(worktreePath: string): Promise<string> {
+  try {
+    return await fs.realpath(worktreePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return path.resolve(worktreePath);
+    throw error;
+  }
 }
 
 function commandEffectSpec(
