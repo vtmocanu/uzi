@@ -2,9 +2,11 @@ package forgesvc
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -18,8 +20,10 @@ import (
 // SNAPSHOT of issue state, not a stream of transitions, so "write done while the linked issue is
 // closed" would be LEVEL-triggered and re-fire on every tick — silently re-applying after a human
 // Undo. The pass therefore acts only on the open→closed EDGE (cached state closed AND
-// close_synced_at IS NULL) and consumes it, so it fires EXACTLY ONCE per close and never
-// overwrites a human verdict (the apply is guarded status='filed').
+// close_synced_at IS NULL) and consumes it, so it fires EXACTLY ONCE per close. It consumes the
+// edge without changing a human verdict: a coordinate a human already marked done (issue #1723)
+// has its edge stamped but keeps its status, set_via NULL and resolved_at, so a later human Undo
+// back to filed is not auto-resolved over by the close this pass already observed.
 //
 // Errors are per-repo and non-fatal: an enumeration failure returns (the poller logs it and
 // carries on with the next repo), while a per-edge failure is logged and skipped WITHOUT stamping,
@@ -39,21 +43,29 @@ func (s *Service) SyncFindingIssueCloses(ctx context.Context, repoID uuid.UUID) 
 	return nil
 }
 
-// syncOneFindingIssueClose applies one close edge: the automatic Done and the edge stamp together,
-// in the single guarded statement ApplyFindingIssueCloseEdge runs. rows-affected is 1 on a real
-// apply and 0 when the guard already failed (the coordinate raced or a human superseded it) — both
-// are success; only a query error is logged and left for the next tick to retry.
+// syncOneFindingIssueClose applies one close edge in the single guarded statement
+// ApplyFindingIssueCloseEdge runs: the edge stamp always, and the automatic Done only on a still-
+// filed coordinate. The returned set_via separates the outcomes: 'issue_close' is a real
+// auto-resolve (logged), NULL is an edge consumed under a human done (verdict untouched), and
+// pgx.ErrNoRows means the guard already failed (raced, or the coordinate moved meanwhile). All
+// three are success; only a query error is logged and left for the next tick to retry.
 func (s *Service) syncOneFindingIssueClose(ctx context.Context, repoID uuid.UUID, e store.ListFindingIssueCloseEdgesRow) {
-	rows, err := s.q.ApplyFindingIssueCloseEdge(ctx, e.ID)
+	setVia, err := s.q.ApplyFindingIssueCloseEdge(ctx, e.ID)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return
+		}
 		// The statement is atomic, so nothing was applied and the edge is still open: the next
 		// tick retries it.
 		slog.Warn("forgesvc: finding-issue close edge failed",
 			"repo", repoID, "disposition", e.ID, "error", err)
 		return
 	}
-	if rows > 0 {
+	if setVia.Valid && setVia.String == "issue_close" {
 		slog.Info("forgesvc: finding auto-resolved by issue close",
 			"repo", repoID, "disposition", e.ID, "issue_iid", e.FiledIssueIid.Int64)
+		return
 	}
+	slog.Debug("forgesvc: finding close edge consumed under a human verdict",
+		"repo", repoID, "disposition", e.ID, "issue_iid", e.FiledIssueIid.Int64)
 }

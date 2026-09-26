@@ -140,7 +140,7 @@ type IssueStore interface {
 	// sync — the open→closed edge over the freshly-synced issue cache and its guarded apply
 	// (finding_issue_close.go).
 	ListFindingIssueCloseEdges(ctx context.Context, repoID uuid.UUID) ([]store.ListFindingIssueCloseEdgesRow, error)
-	ApplyFindingIssueCloseEdge(ctx context.Context, id uuid.UUID) (int64, error)
+	ApplyFindingIssueCloseEdge(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	// PRD-link patch (PRD #72 M5): the merged-MR edge over completed issue runs that
 	// declared a moved PRD path, and its settle (prd_link_patch.go).
 	ListPRDLinkPatchCandidates(ctx context.Context, arg store.ListPRDLinkPatchCandidatesParams) ([]store.ListPRDLinkPatchCandidatesRow, error)

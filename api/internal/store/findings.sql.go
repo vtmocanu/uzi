@@ -70,6 +70,65 @@ func (q *Queries) BulkDismissFindings(ctx context.Context, arg BulkDismissFindin
 	return items, nil
 }
 
+const bulkMarkFindingsDone = `-- name: BulkMarkFindingsDone :many
+UPDATE finding_dispositions
+SET status = 'done',
+    set_via = NULL,
+    dismiss_reason = NULL,
+    resolved_at = now()
+WHERE user_id = $1
+  AND id = ANY($2::uuid[])
+  AND status IN ('open', 'filed', 'dismissed', 'done')
+RETURNING id, user_id, repo_id, location, status, filed_issue_iid, filed_issue_url, filing_since, dismiss_reason, content_hash, last_title, created_at, resolved_at, set_via, close_synced_at
+`
+
+type BulkMarkFindingsDoneParams struct {
+	UserID uuid.UUID   `json:"user_id"`
+	Ids    []uuid.UUID `json:"ids"`
+}
+
+// Bulk human "Mark done" (issue #1723), keyed by disposition id like BulkDismissFindings (the
+// 100-id cap is enforced in the handler). Owner-scoped by user_id; a foreign, unknown or
+// mid-filing id is SKIPPED SILENTLY by the WHERE (the "settle what you can" shape). Re-asserting
+// done on a done row is an applied row (it is returned, and a sync done becomes a human done:
+// set_via -> NULL, close_synced_at preserved). id = ANY(...) matches each row once, so duplicate
+// ids in the request are deduped. Same column contract as MarkFindingDoneByCoordinate.
+func (q *Queries) BulkMarkFindingsDone(ctx context.Context, arg BulkMarkFindingsDoneParams) ([]FindingDisposition, error) {
+	rows, err := q.db.Query(ctx, bulkMarkFindingsDone, arg.UserID, arg.Ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []FindingDisposition{}
+	for rows.Next() {
+		var i FindingDisposition
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.RepoID,
+			&i.Location,
+			&i.Status,
+			&i.FiledIssueIid,
+			&i.FiledIssueUrl,
+			&i.FilingSince,
+			&i.DismissReason,
+			&i.ContentHash,
+			&i.LastTitle,
+			&i.CreatedAt,
+			&i.ResolvedAt,
+			&i.SetVia,
+			&i.CloseSyncedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const claimFindingForFiling = `-- name: ClaimFindingForFiling :execrows
 UPDATE finding_dispositions
 SET status = 'filing',
@@ -527,6 +586,73 @@ func (q *Queries) ListFindingsBacklog(ctx context.Context, arg ListFindingsBackl
 	return items, nil
 }
 
+const markFindingDoneByCoordinate = `-- name: MarkFindingDoneByCoordinate :one
+INSERT INTO finding_dispositions (user_id, repo_id, location, status, content_hash, last_title, resolved_at)
+VALUES ($1, $2, $3, 'done', $4, $5, now())
+ON CONFLICT (user_id, repo_id, location) DO UPDATE
+SET status = 'done',
+    set_via = NULL,
+    dismiss_reason = NULL,
+    resolved_at = now()
+WHERE finding_dispositions.status <> 'filing'
+RETURNING id, user_id, repo_id, location, status, filed_issue_iid, filed_issue_url, filing_since, dismiss_reason, content_hash, last_title, created_at, resolved_at, set_via, close_synced_at
+`
+
+type MarkFindingDoneByCoordinateParams struct {
+	UserID      uuid.UUID `json:"user_id"`
+	RepoID      uuid.UUID `json:"repo_id"`
+	Location    string    `json:"location"`
+	ContentHash string    `json:"content_hash"`
+	LastTitle   string    `json:"last_title"`
+}
+
+// A human "Mark done" on one coordinate (issue #1723), keyed by the evidence row's coordinate
+// (the handler resolves (user_id, repo_id, location) from an OWNER-SCOPED GetIncidentalFinding,
+// never from the request body). The judge's disposition semantics: done is reachable from every
+// settled status (open, filed, dismissed, done), and a hand-set done carries set_via = NULL so it
+// reads as a human verdict, never as an issue-close auto-done (mirrors UpsertRecommendationDisposition).
+//
+// ONE atomic statement. The INSERT arm is the absent-disposition fallback: an evidence row whose
+// coordinate has no disposition yet (UpsertOpenDisposition never ran or raced) gets a fresh done
+// row carrying the canonical content_hash and title, so a later identical re-report stays
+// suppressed (D6) and a changed one re-opens it (ReopenDispositionOnHashMismatch covers 'done').
+// On conflict the UPDATE touches ONLY the verdict columns: content_hash, last_title,
+// filed_issue_iid/url and close_synced_at are left exactly as they were, so a done on a filed
+// coordinate keeps its issue link (Undo returns it to filed) and its consumed close edge.
+// dismiss_reason is cleared so the CHECK ((status='dismissed')=(reason IS NOT NULL)) holds.
+//
+// The DO UPDATE ... WHERE status <> 'filing' guard: a coordinate mid-filing (a forge CreateIssue
+// in flight) is not overwritten. The conflict then updates nothing and RETURNING yields no row,
+// so the caller reads pgx.ErrNoRows as "being filed" (a 409).
+func (q *Queries) MarkFindingDoneByCoordinate(ctx context.Context, arg MarkFindingDoneByCoordinateParams) (FindingDisposition, error) {
+	row := q.db.QueryRow(ctx, markFindingDoneByCoordinate,
+		arg.UserID,
+		arg.RepoID,
+		arg.Location,
+		arg.ContentHash,
+		arg.LastTitle,
+	)
+	var i FindingDisposition
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.Location,
+		&i.Status,
+		&i.FiledIssueIid,
+		&i.FiledIssueUrl,
+		&i.FilingSince,
+		&i.DismissReason,
+		&i.ContentHash,
+		&i.LastTitle,
+		&i.CreatedAt,
+		&i.ResolvedAt,
+		&i.SetVia,
+		&i.CloseSyncedAt,
+	)
+	return i, err
+}
+
 const reopenDispositionOnHashMismatch = `-- name: ReopenDispositionOnHashMismatch :execrows
 UPDATE finding_dispositions
 SET status = 'open',
@@ -703,6 +829,60 @@ type UndoDismissFindingParams struct {
 // ((status='dismissed')=(reason IS NOT NULL)) holds for the reopened `open` row.
 func (q *Queries) UndoDismissFinding(ctx context.Context, arg UndoDismissFindingParams) (FindingDisposition, error) {
 	row := q.db.QueryRow(ctx, undoDismissFinding, arg.UserID, arg.ID)
+	var i FindingDisposition
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.Location,
+		&i.Status,
+		&i.FiledIssueIid,
+		&i.FiledIssueUrl,
+		&i.FilingSince,
+		&i.DismissReason,
+		&i.ContentHash,
+		&i.LastTitle,
+		&i.CreatedAt,
+		&i.ResolvedAt,
+		&i.SetVia,
+		&i.CloseSyncedAt,
+	)
+	return i, err
+}
+
+const undoFindingDisposition = `-- name: UndoFindingDisposition :one
+UPDATE finding_dispositions
+SET status = CASE WHEN status = 'done' AND filed_issue_iid IS NOT NULL THEN 'filed' ELSE 'open' END,
+    dismiss_reason = NULL,
+    set_via = NULL,
+    resolved_at = CASE WHEN status = 'done' AND filed_issue_iid IS NOT NULL THEN COALESCE(resolved_at, now()) ELSE NULL END
+WHERE user_id = $1
+  AND id = $2
+  AND status IN ('dismissed', 'done')
+RETURNING id, user_id, repo_id, location, status, filed_issue_iid, filed_issue_url, filing_since, dismiss_reason, content_hash, last_title, created_at, resolved_at, set_via, close_synced_at
+`
+
+type UndoFindingDispositionParams struct {
+	UserID uuid.UUID `json:"user_id"`
+	ID     uuid.UUID `json:"id"`
+}
+
+// Undo a human verdict (issue #1723), keyed by disposition id, owner-scoped, guarded to the two
+// undoable verdicts ('dismissed', 'done'); anything else (open, filed, filing, foreign, unknown)
+// matches zero rows -> pgx.ErrNoRows -> 404. The target mirrors the judge's Undo:
+//   - a done coordinate that still carries an issue link (filed_issue_iid) returns to 'filed',
+//     keeping its iid/url and a non-NULL resolved_at (the filing time is gone, so the done time
+//     stands in; COALESCE guards a NULL);
+//   - every other undo (done from open, a dismissal) returns to 'open' with resolved_at NULL.
+//
+// dismiss_reason and set_via are cleared; content_hash, last_title and close_synced_at are left
+// untouched. Preserving close_synced_at is what makes an Undo STICK: an issue close already
+// consumed by the sync is not re-applied on the next tick, while a filed coordinate whose close
+// was never observed still auto-resolves when it closes. The CASE arms read the OLD row values
+// (Postgres evaluates every SET expression against the pre-update row). UndoDismissFinding stays
+// the dismissed-only twin behind DELETE /findings/{id}/dismiss.
+func (q *Queries) UndoFindingDisposition(ctx context.Context, arg UndoFindingDispositionParams) (FindingDisposition, error) {
+	row := q.db.QueryRow(ctx, undoFindingDisposition, arg.UserID, arg.ID)
 	var i FindingDisposition
 	err := row.Scan(
 		&i.ID,

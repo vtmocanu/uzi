@@ -115,6 +115,31 @@ type BulkDismissFindingsResultDTO struct {
 	Findings []IncidentalFindingDTO `json:"findings"`
 }
 
+// MarkFindingDoneResultDTO is the POST /api/findings/{id}/done response (issue #1723). Status is
+// always "done" on the 200 path; DispositionID is the coordinate's finding_dispositions.id (the
+// id Undo — DELETE /findings/{id}/disposition — and the bulk route key on), returned because the
+// request was keyed on an EVIDENCE id and the done may have created the disposition row.
+type MarkFindingDoneResultDTO struct {
+	Status        string `json:"status"`
+	DispositionID string `json:"disposition_id"`
+}
+
+// BulkMarkFindingsDoneRequest is the body of POST /api/findings/done (issue #1723): a set of
+// disposition ids. The handler caps IDs at 100 (a 400 above it) and skips a foreign, unknown or
+// mid-filing id silently; the query is owner-scoped.
+type BulkMarkFindingsDoneRequest struct {
+	IDs []string `json:"ids"`
+}
+
+// BulkMarkFindingsDoneResultDTO is the POST /api/findings/done response (issue #1723), the twin
+// of BulkDismissFindingsResultDTO. Updated counts the coordinates the one statement moved to done
+// (re-asserting done on an already-done row counts; a skipped or duplicate id does not); Findings
+// re-reads exactly those rows. Findings is never nil on the wire (an empty result encodes []).
+type BulkMarkFindingsDoneResultDTO struct {
+	Updated  int                    `json:"updated"`
+	Findings []IncidentalFindingDTO `json:"findings"`
+}
+
 // IncidentalFindingBacklogDTO is GET /api/findings (PRD #333 M4, D7/D8): the caller's
 // owner-scoped Findings backlog, deduped by (repo, location).
 //

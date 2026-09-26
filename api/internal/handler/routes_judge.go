@@ -64,5 +64,13 @@ func (h *Handler) mountJudgeRoutes(r chi.Router, forgeLimiter *mw.Limiter) {
 		r.Post("/dismiss", h.BulkDismissFindings)
 		// Undo a dismissal (PRD #1183 M3): keyed on the disposition id, 404 when not dismissed.
 		r.Delete("/{id}/dismiss", h.UndoDismissFinding)
+		// Human "Mark done" (issue #1723): LOCAL writes like dismiss, no forge call, no limiter.
+		// /{id}/done keys on the EVIDENCE id (like /{id}/dismiss); the static /done bulk segment
+		// and DELETE /{id}/disposition key on the disposition id. Every query is scoped by the
+		// caller's user id, so an admin gets no cross-user bypass.
+		r.Post("/{id}/done", h.MarkFindingDone)
+		r.Post("/done", h.BulkMarkFindingsDone)
+		// Undo either human verdict (dismissed or done); UndoDismissFinding above stays as is.
+		r.Delete("/{id}/disposition", h.UndoFindingDisposition)
 	})
 }

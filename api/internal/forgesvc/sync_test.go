@@ -442,8 +442,8 @@ func (s *fakeStore) ApplyFiledIssueCloseEdge(_ context.Context, arg store.ApplyF
 func (s *fakeStore) ListFindingIssueCloseEdges(_ context.Context, _ uuid.UUID) ([]store.ListFindingIssueCloseEdgesRow, error) {
 	return nil, nil
 }
-func (s *fakeStore) ApplyFindingIssueCloseEdge(_ context.Context, _ uuid.UUID) (int64, error) {
-	return 0, nil
+func (s *fakeStore) ApplyFindingIssueCloseEdge(_ context.Context, _ uuid.UUID) (pgtype.Text, error) {
+	return pgtype.Text{}, nil
 }
 
 func (s *fakeStore) ListPRDLinkPatchCandidates(_ context.Context, arg store.ListPRDLinkPatchCandidatesParams) ([]store.ListPRDLinkPatchCandidatesRow, error) {

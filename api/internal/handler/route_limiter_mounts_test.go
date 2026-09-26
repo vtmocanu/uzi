@@ -562,6 +562,11 @@ var wantRouteMounts = []routeMount{
 	// spend — so neither carries a per-user limiter.
 	{"POST", "/api/findings/dismiss", noLimiter},
 	{"DELETE", "/api/findings/{id}/dismiss", noLimiter},
+	// Issue #1723: human Mark done (single, bulk) and undo of either verdict are LOCAL writes
+	// too — no forge call, no spend — so none carries a per-user limiter.
+	{"POST", "/api/findings/{id}/done", noLimiter},
+	{"POST", "/api/findings/done", noLimiter},
+	{"DELETE", "/api/findings/{id}/disposition", noLimiter},
 	{"POST", "/api/controller/status", noLimiter},
 	// Controller cordon control-write (PRD #422 M4): a fleet-scoped controller-only
 	// route behind RequireController, not a per-user credential, so no per-user

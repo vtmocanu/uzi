@@ -2,6 +2,8 @@
 -- repo's issue cache is refreshed, any finding coordinate whose filed issue has just been
 -- observed closed moves to Done, exactly once, on the open→closed edge. Mirrors
 -- judge_issue_close.sql (PRD #98 M6) — see that file for the edge-marker rationale.
+-- A coordinate a human already marked done (issue #1723) has its edge consumed too, but its
+-- verdict is never changed.
 
 -- name: ListFindingIssueCloseEdges :many
 -- The pass's working set for one repo: SETTLED filed coordinates whose cached issue is closed
@@ -14,7 +16,13 @@
 -- NOT NULL, so the equality carries no NULL-repo hazard the judge query must dodge.
 --
 -- The other filters, each load-bearing:
---   * fd.status = 'filed' — only SETTLED coordinates (a mid-filing claim is not filed).
+--   * fd.status = 'filed' OR (fd.status = 'done' AND fd.set_via IS NULL) — SETTLED filed
+--     coordinates (a mid-filing claim is not filed), PLUS a coordinate a human marked done while
+--     it still carried its issue link (issue #1723). The human-done branch is here only so its
+--     edge is CONSUMED (ApplyFindingIssueCloseEdge stamps close_synced_at without changing the
+--     verdict): otherwise a human Undo back to filed would find the old close still unconsumed and
+--     the next tick would auto-resolve over the Undo. A sync done (set_via = 'issue_close') always
+--     has its edge stamped already, so the set_via IS NULL arm only ever adds human verdicts.
 --   * fd.filed_issue_iid IS NOT NULL — a settled row always has one; the guard keeps a NULL from
 --     matching some other row's iid and also keeps the partial index predicate exact.
 --   * fd.close_synced_at IS NULL — the EDGE. Without it the pass is level-triggered and re-fires
@@ -23,8 +31,10 @@
 --     close_synced_at stays stamped, so a flapping issue cannot ping-pong the backlog.
 --
 -- Projects the disposition id (what ApplyFindingIssueCloseEdge keys on) and filed_issue_iid
--- (logging only). Ordered by fd.id for a stable batch; the partial index idx_finding_dispositions_
--- close_pending is exactly this working set.
+-- (logging only). Ordered by fd.id for a stable batch. The partial index idx_finding_dispositions_
+-- close_pending (status = 'filed') covers the filed branch only, NOT the human-done branch: that
+-- is accepted rather than migrated, since the table is small (per-user, per-coordinate) and the
+-- scan stays bounded by fd.repo_id.
 SELECT
     fd.id              AS id,
     fd.filed_issue_iid AS filed_issue_iid
@@ -33,25 +43,37 @@ JOIN issues i
     ON i.repo_id = fd.repo_id
    AND i.forge_issue_iid = fd.filed_issue_iid
 WHERE fd.repo_id = @repo_id
-  AND fd.status = 'filed'
+  AND (fd.status = 'filed' OR (fd.status = 'done' AND fd.set_via IS NULL))
   AND fd.filed_issue_iid IS NOT NULL
   AND fd.close_synced_at IS NULL
   AND i.state = 'closed'
 ORDER BY fd.id ASC;
 
--- name: ApplyFindingIssueCloseEdge :execrows
--- Apply ONE close edge: write the automatic Done and consume the edge in a single guarded
--- statement. The guard `status = 'filed' AND close_synced_at IS NULL` is the whole correctness
--- story — it never overwrites a coordinate a human already moved (a dismissed/open/done row is
--- not 'filed'), and two concurrent pollers cannot both consume one edge (the second sees
--- close_synced_at already stamped). Provenance is fixed in the query text — status 'done',
--- set_via 'issue_close' — so no call site can attribute a system action to a person. rows-affected
--- is 1 on a real apply, 0 when the guard already failed (raced or human-superseded).
+-- name: ApplyFindingIssueCloseEdge :one
+-- Apply ONE close edge in a single guarded statement that ALWAYS consumes the edge
+-- (close_synced_at = now()) and writes the automatic Done ONLY when the coordinate is still
+-- 'filed'. It consumes the edge without changing a human verdict: a coordinate a human already
+-- marked done (set_via NULL, issue #1723) keeps its status, set_via NULL and resolved_at; only the
+-- edge is stamped, so a later human Undo back to filed does not get auto-resolved over by this
+-- already-observed close (the judge's ApplyFiledIssueCloseEdge consumes its edge the same way).
+-- The CASE arms read the OLD row values (Postgres evaluates SET against the pre-update row).
+--
+-- The guard `close_synced_at IS NULL AND filed_issue_iid IS NOT NULL AND (status = 'filed' OR
+-- (status = 'done' AND set_via IS NULL))` mirrors ListFindingIssueCloseEdges exactly: a
+-- dismissed/open/filing row is never touched, and two concurrent pollers cannot both consume one
+-- edge (the second sees close_synced_at already stamped). Provenance is fixed in the query text
+-- — status 'done', set_via 'issue_close' — so no call site can attribute a system action to a
+-- person. RETURNING set_via tells the caller what happened: 'issue_close' is a real auto-resolve
+-- (a pre-existing human done has set_via NULL by the guard, so it can only read 'issue_close'
+-- when THIS statement wrote it), NULL is an edge consumed under a human done, and no row
+-- (pgx.ErrNoRows) means the guard already failed (raced, or the coordinate moved meanwhile).
 UPDATE finding_dispositions
-SET status = 'done',
-    set_via = 'issue_close',
-    resolved_at = now(),
+SET status = CASE WHEN status = 'filed' THEN 'done' ELSE status END,
+    set_via = CASE WHEN status = 'filed' THEN 'issue_close' ELSE set_via END,
+    resolved_at = CASE WHEN status = 'filed' THEN now() ELSE resolved_at END,
     close_synced_at = now()
 WHERE id = @id
-  AND status = 'filed'
-  AND close_synced_at IS NULL;
+  AND close_synced_at IS NULL
+  AND filed_issue_iid IS NOT NULL
+  AND (status = 'filed' OR (status = 'done' AND set_via IS NULL))
+RETURNING set_via;
