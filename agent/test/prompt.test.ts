@@ -1166,7 +1166,7 @@ describe("buildLeadSystemPrompt", () => {
 
   it("renders the scratch lifecycle and review recipe for the lead", () => {
     const append = buildLeadSystemPrompt(undefined, { kind: "ci_fix" }).append;
-    for (const phrase of [".uzi/scratch/", "mktemp -d .uzi/scratch/snap.XXXXXX", "git archive", "tar -x -C", "set -o pipefail", "mktemp .uzi/scratch/gate-log.XXXXXX", "git add -f", "fresh", "cross-worker", "retire"]) {
+    for (const phrase of [".uzi/scratch/", "mktemp -d .uzi/scratch/snap.XXXXXX", "git archive", "tar -x -C", "set -o pipefail", "mktemp .uzi/scratch/gate-log.XXXXXX", "git add -f", "Fresh", "cross-worker", "Retirement", "worker-only quarantine"]) {
       assert.ok(append.includes(phrase), `missing scratch guidance: ${phrase}`);
     }
   });
