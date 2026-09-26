@@ -64,6 +64,13 @@ const maxBodyBytes = 1 << 20
 // authenticated but we cannot yet name its account" without string-matching.
 var ErrIdentityIncomplete = errors.New("codexauth: provider identity incomplete")
 
+// ErrIdentityAccountMismatch is the ErrIdentityIncomplete case where the usage response's
+// account_id and the access token's chatgpt_account_id claim are both present but differ
+// (#1239). It wraps ErrIdentityIncomplete, so every caller that treats an incomplete
+// identity as undetermined handles it unchanged; it exists only so a caller can report
+// the precise reason.
+var ErrIdentityAccountMismatch = fmt.Errorf("%w: usage account_id differs from the token's account claim", ErrIdentityIncomplete)
+
 // ErrNoAccessToken is returned by Refresh when the provider replied 2xx but omitted
 // an access_token — a response that cannot be used, so it is an error rather than a
 // RefreshResult with an empty token.
@@ -287,7 +294,8 @@ type usageResponse struct {
 //     response omits it (a personal ChatGPT seat), it falls back to the token's
 //     chatgpt_account_id claim (see accountIDFromAccessToken). With both a user_id and
 //     an account_id from either source → Identity{user_id, account_id}.
-//   - 2xx with user_id absent, or with no account_id from either source →
+//   - 2xx with user_id absent, with no account_id from either source, or with a
+//     response account_id that differs from a non-empty token claim →
 //     ErrIdentityIncomplete (the login authenticated but its account is not yet fully named).
 //   - non-2xx (including 401) → *AuthError carrying the status (OAuthCode stays "").
 func (c *Client) DiscoverIdentity(ctx context.Context, accessToken string) (Identity, error) {
@@ -318,18 +326,27 @@ func (c *Client) DiscoverIdentity(ctx context.Context, accessToken string) (Iden
 	if body.UserID == "" {
 		return Identity{}, ErrIdentityIncomplete
 	}
+	// The JWT is the caller-supplied bearer token itself, parsed ONLY here and ONLY
+	// AFTER /wham/usage returned 2xx for that same bearer — i.e. OpenAI already
+	// authenticated the token, so its signed claims are authentic and no local
+	// signature verification is needed. This argument also relies on the usage
+	// endpoint being the FIXED OpenAI-over-TLS endpoint (see NewClient); a future
+	// configurable endpoint must revisit it. user_id is never derived from the token —
+	// it stays the sole provider-verified anchor.
+	claimAccountID := accountIDFromAccessToken(accessToken)
 	accountID := body.AccountID
+	if accountID != "" && claimAccountID != "" && accountID != claimAccountID {
+		// #1239: the response names a different workspace than the token was issued
+		// for (possible on a multi-workspace seat). The two sources disagree, so neither
+		// establishes an unambiguous account binding; the identity is treated as
+		// undetermined through the existing ErrIdentityIncomplete paths: import
+		// marks the alias failed and refresh recovery keeps retaining the material.
+		return Identity{}, ErrIdentityAccountMismatch
+	}
 	if accountID == "" {
 		// Fallback source for a personal ChatGPT seat, whose /wham/usage body omits
-		// account_id. The JWT is the caller-supplied bearer token itself, parsed ONLY
-		// here and ONLY AFTER /wham/usage returned 2xx for that same bearer — i.e.
-		// OpenAI already authenticated the token, so its signed claims are authentic
-		// and no local signature verification is needed. This argument also relies on
-		// the usage endpoint being the FIXED OpenAI-over-TLS endpoint (see NewClient);
-		// a future configurable endpoint, or the ChatGPT-Account-Id header hardening
-		// split to #1239, must revisit it. user_id is never derived from the token — it
-		// stays the sole provider-verified anchor.
-		accountID = accountIDFromAccessToken(accessToken)
+		// account_id.
+		accountID = claimAccountID
 	}
 	if accountID == "" {
 		return Identity{}, ErrIdentityIncomplete
@@ -365,8 +382,8 @@ func ParseFreshAccessTokenIdentityClaims(token string) FreshAccessTokenIdentityC
 }
 
 // accountIDFromAccessToken extracts chatgpt_account_id for DiscoverIdentity's
-// personal-seat fallback. It reuses the same JWT decoder as the fresh-token
-// differential parser. The lack of local signature verification is sound only
+// personal-seat fallback and its response/claim consistency check. It reuses the
+// same JWT decoder as the fresh-token differential parser. The lack of local signature verification is sound only
 // after the fixed /wham/usage endpoint accepted this same bearer token.
 func accountIDFromAccessToken(token string) string {
 	return ParseFreshAccessTokenIdentityClaims(token).ChatGPTAccountID
