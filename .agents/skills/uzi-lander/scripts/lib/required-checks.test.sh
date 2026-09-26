@@ -40,6 +40,7 @@ RULES_OUT="[[$(rule '[{"context":""}]')]]"; bad "empty context"
 RULES_OUT="[[$(rule '[{"context":7}]')]]"; bad "non-string context"
 RULES_OUT='[{"type":"deletion"}]'; bad "unslurped page"
 RULES_OUT='{"message":"Not Found"}'; bad "error object"
+RULES_OUT='[]'; bad "no pages"
 RULES_OUT="[[$(rule '[{"context":"a"}]')]]"; export RULES_RC=1; bad "gh page fetch failed"
 unset RULES_RC
 

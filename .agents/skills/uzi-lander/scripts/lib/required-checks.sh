@@ -17,7 +17,7 @@ required_contexts() {
   local out
   out=$(gh api --paginate --slurp "repos/$1/rules/branches/$2" 2>/dev/null) || return 1
   printf '%s' "$out" | jq -ce '
-    if type == "array" and all(.[]; type == "array") then add // [] else error("pages") end
+    if type == "array" and length > 0 and all(.[]; type == "array") then add // [] else error("pages") end
     | [ .[] | select(.type == "required_status_checks")
         | .parameters.required_status_checks
         | if type == "array"
