@@ -297,6 +297,33 @@ describe("GitCache.ensureRunnerCloneObjects (issue #1769 m2)", () => {
     assert.strictEqual(await git.alignBranchWithDefault(rc.path, "agent/issue-1", baseTip, defaultTip, "merge"), "aligned");
   });
 
+  it("inside a boundary: a producer that exits before the consumer has started loses no pack bytes", async () => {
+    // Under the real supervisor the command consumer's launch takes long enough that a small
+    // pack-objects can exit (and its root reap) first. Node resumes every readable stdio stream
+    // of a ChildProcess on its 'exit' (child_process flushStdio), so a producer stdout nobody
+    // was reading yet was drained into nothing and index-pack read an empty stdin ("early
+    // EOF"). Here the consumer spawn waits until the producer's 'exit' has fired and that
+    // flush has run, which makes the old loss deterministic.
+    const { bare, rc, defaultTip } = await setup(SELF);
+    let producerExited: Promise<void> | undefined;
+    const spawner: BoundaryProcessSpawner = async (request) => {
+      if (request.argv.includes("index-pack")) {
+        assert.ok(producerExited, "the producer spawned first");
+        await producerExited;
+        for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+      }
+      const { child, handle } = spawnReal(request);
+      if (request.argv.includes("pack-objects")) {
+        producerExited = new Promise((resolve) => child.once("exit", () => resolve()));
+      }
+      return handle;
+    };
+    await git.withBoundaryProcessSpawner(spawner, new AbortController().signal, () =>
+      git.ensureRunnerCloneObjects(bare, rc.path, defaultTip, [rc.baseCommit]),
+    );
+    assert.ok(resolves(rc.path, defaultTip), "the whole pack reached index-pack");
+  });
+
   // Teardown. The fixtures above end both processes naturally, so these stall one side on
   // purpose: each case settles only through the teardown path it names.
 

@@ -305,9 +305,14 @@ acknowledged. One SDK home was measured holding 167.3 MB of Go module cache
 (see `UZI_HOME_RECLAIM` below); this is an example, not an upper bound.
 
 Size storage for shared repositories plus active clones, all retained
-plugin/HOME directories, pending-capture clones and operating headroom.
-Measure the high-water size of those directories under your workloads and
-multiply by your chosen operational allowance for concurrent retained runs.
+plugin/HOME directories, pending-capture clones and operating headroom. A
+Codex run's clone is a full object copy, not a `--shared` borrow: it is
+dissociated from the worker bare at seed (see
+[Proc hardening](proc-hardening.md)), so it carries every branch the bare had
+already mirrored at first clone, not just the objects the run itself
+touches. Size for that when Codex runs are part of your workload mix. Measure the
+high-water size of those directories under your workloads and multiply by
+your chosen operational allowance for concurrent retained runs.
 Monitor both retained-run count and free bytes/inodes, and alert before that
 allowance or storage headroom is exhausted. Expand storage or explicitly
 cancel unwanted runs; do not delete nonterminal recovery state to reclaim space.

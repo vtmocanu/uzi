@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { pipeline } from "node:stream/promises";
-import type { Readable, Writable } from "node:stream";
+import { PassThrough, pipeline as pipelineCallback, type Readable, type Writable } from "node:stream";
 import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
@@ -632,6 +632,23 @@ export interface RunnerClone {
    *  WIP-snapshot recovery from committed-milestone recovery) and M4 (recovery-success signal
    *  for the re-gate decision). Absent/false on every other leg. */
   wipRecovered?: boolean;
+}
+
+/**
+ * issue #1769 — the stream {@link GitCache} hands back as a spawned git's stdout. Node resumes
+ * every readable stdio stream of a child process when that process exits (child_process
+ * `flushStdio`), so a stdout the caller has not started reading by then is drained into
+ * nothing and the caller later sees only EOF. A caller may await something first (the finalize
+ * import launches its `index-pack` consumer, under the real supervisor slower than a small
+ * `pack-objects` takes to exit and reap), so the child's stdout is piped at once into a
+ * PassThrough the caller owns. Backpressure and errors carry across: destroying the source
+ * with git's failure destroys the returned stream with that error, and destroying the returned
+ * stream destroys the source.
+ */
+function callerOwnedStdout(source: Readable): Readable {
+  const out = new PassThrough();
+  pipelineCallback(source, out, () => undefined);
+  return out;
 }
 
 /**
@@ -4796,7 +4813,7 @@ export class GitCache {
       process.stdin?.on("error", () => undefined);
       process.stdin?.end(stdin ?? "");
       const exited = process.completed.then(({ code }) => code, () => -1);
-      return { stdout: process.stdout, exited };
+      return { stdout: callerOwnedStdout(process.stdout), exited };
     }
     const child = spawn("git", withDir(cwd, args), { env });
     const exited = new Promise<number>((resolve) => {
@@ -4818,7 +4835,7 @@ export class GitCache {
       child.stdin.on("error", () => undefined); // see the scoped branch above
       child.stdin.end(stdin ?? "");
     }
-    return { child, stdout: child.stdout as Readable, exited };
+    return { child, stdout: callerOwnedStdout(child.stdout as Readable), exited };
   }
 
   /**

@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Codex runs no longer fail with "unable to open object pack directory … Permission denied" ([#1769](https://github.com/vtmocanu/uzi/issues/1769)).**
+  The runner clone was seeded with `git clone --shared`, borrowing objects from the worker's bare repo via `objects/info/alternates`, but the Codex command sandbox's Landlock allowlist only grants the clone, not the bare, so a git command reaching for a borrowed object failed. The seed now repacks those objects into the clone as a real copy under the bare lock, verifies the clone is self-contained with alternates disabled, and only then drops the alternates file, failing the run closed before Codex starts if verification fails; Claude runs are unchanged. See adr/1769-codex-self-contained-runner-clone.md.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added
