@@ -241,6 +241,15 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
     await assert.rejects(git.createOrAttachRunnerClone(bare, 1719), ScratchProvisionError);
   });
 
+  it("refuses ignore rules that hide only the scratch probe while exposing artifacts", async () => {
+    fs.writeFileSync(path.join(fx.originPath, ".gitignore"),
+      "!.uzi/scratch/\n.uzi/scratch/.uzi-ignore-probe\n");
+    gitIn(fx.originPath, ["add", ".gitignore"]);
+    gitIn(fx.originPath, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "hide probe only"]);
+    const bare = await git.ensureClone(fx.originPath);
+    await assert.rejects(git.createOrAttachRunnerClone(bare, 1719), ScratchProvisionError);
+  });
+
   it("rejects a symlinked scratch leaf on revalidation without following it", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const clone = await git.createOrAttachRunnerClone(bare, 1719);
