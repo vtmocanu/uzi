@@ -8731,16 +8731,25 @@ export class RunRunner {
    * `vault_locked` (a Codex credential deferral) differs in these ways:
    *   - it first confirms the run is `running` at this claim's generation
    *     ({@link confirmRunningForVaultPark}); a stale claim or another generation stops silently, a
-   *     server wall park retains everything, and a 404 keeps the clone and session;
-   *   - every exit that ends the flight on a terminal status or would clear the preserve flags (a
-   *     cancel, a terminal ack or ownership read, a given-up input receipt, a live non-running
-   *     status) first runs the credential-free exit capture: settle, WIP commit, fetch-back and
-   *     verify, with a best-effort credential-free publish. Only a VERIFIED capture clears the
-   *     preserve flags; otherwise the clone and session are kept, so executeClaim's finally never
-   *     discards the only copy of unfetched commits or uncommitted edits;
+   *     server wall park retains everything, and a 404 keeps the clone and session unless a
+   *     verified capture exists. An `unknown` confirm (a probe with no claim_generation, a live
+   *     non-running probe status, or a persistent probe failure) retries at the capped backoff
+   *     until a cancel, a worker shutdown or the server's wall park ends the loop;
+   *   - the exits that end the flight on this worker's own terminal or held outcome (a cancel, a
+   *     terminal ack or ownership read, a given-up input receipt, a live non-running ack or
+   *     ownership read) first run the credential-free exit capture: settle, WIP commit, fetch-back
+   *     and verify, with a best-effort credential-free publish (skipped when the run is already
+   *     known terminal). Only a VERIFIED capture clears the preserve flags; otherwise the clone and
+   *     session are kept, so executeClaim's finally never discards the only copy of unfetched
+   *     commits or uncommitted edits;
+   *   - the STOP arms deliberately do NOT capture: a `stop` confirm (a stale_claim ack or another
+   *     generation on the probe), the park loop's claim_generation mismatch, and a StaleClaimError
+   *     on the park report clear both preserve flags and discard the clone, per the #1247
+   *     stale-claim convention (the new claim has its own clone);
    *   - a terminal status then ends the flight, a live non-running status posts a feed line and
-   *     keeps the clone and session without parking, and a given-up input receipt reports the
-   *     generic failure without the credentialed pre-report reap or any custody settle;
+   *     keeps the clone and session without parking (even after a verified capture), and a given-up
+   *     input receipt reports the generic failure without the credentialed pre-report reap or any
+   *     custody settle;
    *   - it settles the executor credential-free before capture, and retries (no park) until the
    *     settle is observed empty;
    *   - the capture publishes with no overlay and no boundary (credentialFree);
@@ -8790,10 +8799,13 @@ export class RunRunner {
       const doublings = Math.min(retries++, VAULT_PARK_BACKOFF_MAX_DOUBLINGS);
       await this.waitRecoveryRetry(flight, cancelStopsWait, this.recoveryRetryMs * 2 ** doublings);
     };
-    // Issue #1766: the vault-lock EXIT capture. Every vault path that ends the flight on a terminal
-    // status or would clear the preserve flags runs it first, because executeClaim's finally
-    // DISCARDS the clone once preserveRecoveryClone is false: commits since the last fetch-back and
-    // uncommitted edits exist only there. Credential-free: settle the executor (never reconciling),
+    // Issue #1766: the vault-lock EXIT capture. The vault exits on a terminal or held outcome (a
+    // cancel, a terminal ack or ownership read, a given-up input receipt, a live non-running status)
+    // run it first, because executeClaim's finally DISCARDS the clone once preserveRecoveryClone is
+    // false: commits since the last fetch-back and uncommitted edits exist only there. The stop arms
+    // (a `stop` confirm, the loop's claim_generation mismatch, a StaleClaimError on the park report)
+    // deliberately discard WITHOUT a capture, per the #1247 stale-claim convention: the new claim
+    // has its own clone. Credential-free: settle the executor (never reconciling),
     // then WIP commit, fetch-back and verify, then a best-effort join-token publish (skipped for a
     // run already known terminal). True only for a VERIFIED capture; never throws.
     const captureForVaultExit = async (publish: boolean): Promise<boolean> => {
@@ -8971,7 +8983,12 @@ export class RunRunner {
               if (cancelReap) await this.settleRecoveryGeneration(claim, flight, runLog);
               return false;
             }
-            if (ack.status && ack.status !== "running") return false;
+            if (ack.status && ack.status !== "running") {
+              // Issue #1766: a live non-running cancel ack (paused, awaiting_approval, ...) is the
+              // held posture: say so on the feed and keep the clone and session.
+              if (vault) return await vaultHeld();
+              return false;
+            }
           } catch (cancelError) {
             runLog.warn("could not report recovery cancellation; retaining work and retrying", {
               error: errMessage(cancelError),
@@ -9082,7 +9099,12 @@ export class RunRunner {
             if (terminal.has(ack.status)) {
               flight.preserveRecoveryClone = false;
               flight.preserveSession = false;
+              return false;
             }
+            // Issue #1766: a live non-running park ack (paused, awaiting_approval, ...) is the held
+            // posture: the feed says so, and the clone and session are kept (the in-loop capture
+            // above had already released the clone) for whoever resumes the run.
+            if (vault) return await vaultHeld();
             return false;
           }
           // A statusless ACK (including HTTP204) proves neither a park nor a

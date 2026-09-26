@@ -1732,3 +1732,330 @@ describe("RunRunner #1766 — vault-lock exits capture before cleanup, and every
     assert.equal(parkReports(claim.run_id).length, 1);
   });
 });
+
+// ================================================================================
+// Issue #1766 M3b follow-up: the park LOOP's exits (after running is confirmed), a cancel whose
+// capture is unverified, the loop's 404, the journaled keepCustody arm, `publish: false` on a
+// terminal exit, and a live non-running park or cancel ack.
+
+const SESSION_KEPT = "run interrupted by worker shutdown; preserving its plugin dir and HOME for a same-worker resume";
+
+/** True when executeClaim's finally kept the run's plugin dir and HOME (preserveSession on an
+ *  unparked flight: the only branch that logs this line). */
+function sessionKept(lines: unknown[]): boolean {
+  return lines.some((l) => (l as { msg?: string }).msg === SESSION_KEPT);
+}
+
+/** Count client.publishCheckpoint calls made while `when()` holds; every call still lands. */
+function countPublishes(when: () => boolean): { count: () => number; restore: () => void } {
+  let n = 0;
+  const orig = client.publishCheckpoint.bind(client);
+  (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
+    _runId: string,
+    _tipOid: string,
+    pack: Readable,
+  ) => {
+    if (when()) n += 1;
+    await drain(pack);
+    return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-x" } };
+  };
+  return {
+    count: () => n,
+    restore: () => {
+      (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = orig;
+    },
+  };
+}
+
+/** A settle that reports incomplete ONCE (running `onFirst` then), and settles for real after. */
+function settleOnceIncomplete(rig: CodexRig, onFirst: () => void): (ms: number) => Promise<CredentialFreeSettleOutcome> {
+  let calls = 0;
+  return async (ms) => {
+    if (++calls === 1) {
+      onFirst();
+      return { kind: "incomplete", errors: [{ category: "timeout", message: "a writer survived" }] };
+    }
+    return rig.settle(ms);
+  };
+}
+
+describe("RunRunner #1766 — the park loop's exits after running is confirmed", () => {
+  it("a terminal ownership read in the loop (settle retried) captures the unfetched commit and the dirty file, unpublished", async () => {
+    const { gitlab } = fakeGitlab();
+    client.protocolFeatures = [VAULT_FEATURE];
+    const rig = codexRig({ vaultLocked: () => true });
+    const claim = gitlabClaim(1792);
+    const w = workThenDefer(rig, settleOnceIncomplete(rig, () => api.setOwnershipStatus(claim.run_id, "failed")));
+    const pubs = countPublishes(() => w.deferred());
+    try {
+      const { logger, lines } = recordingLogger();
+      const runner = runnerWith(() => ({ executor: w.exec }), gitlab, undefined, logger, { recoveryRetryMs: 5 });
+      const custody = spyCustodySettle(runner);
+      await runner.execute(claim);
+      assert.ok(
+        api.states.some((s) => s.runId === claim.run_id && s.body.status === "running"),
+        "running was confirmed before the loop",
+      );
+      assert.equal(parkReports(claim.run_id).length, 0, "a terminal run is never parked");
+      assert.ok(!statuses(claim.run_id).includes("failed"), "nothing re-reported over the terminal status");
+      assertCaptured(1792);
+      assert.equal(pubs.count(), 0, "a run already known terminal publishes no checkpoint");
+      assert.equal(sessionKept(lines), false, "a verified capture releases the session");
+      assert.equal(custody(), 0, "no custody settle");
+      assert.equal(rig.refreshCalls() + rig.releaseCalls(), 1, "no credential call after the deferral");
+    } finally {
+      pubs.restore();
+    }
+  });
+
+  it("a terminal ownership read in the loop whose exit capture cannot verify keeps the clone and session", async () => {
+    const { gitlab } = fakeGitlab();
+    client.protocolFeatures = [VAULT_FEATURE];
+    const rig = codexRig({ vaultLocked: () => true });
+    const claim = gitlabClaim(1793);
+    const w = workThenDefer(rig);
+    // The in-loop capture fails (unverified, retried); on that failure the run turns terminal.
+    git.commitWipMarker = async () => {
+      api.setOwnershipStatus(claim.run_id, "failed");
+      return false;
+    };
+    const { logger, lines } = recordingLogger();
+    await runnerWith(() => ({ executor: w.exec }), gitlab, undefined, logger, { recoveryRetryMs: 5 }).execute(claim);
+    assert.equal(parkReports(claim.run_id).length, 0);
+    assert.ok(feedTexts(claim.run_id).includes(VAULT_UNVERIFIED), "the loop retried an unverified capture first");
+    assert.equal(
+      fs.readFileSync(path.join(worktreeDirFor(1793), "DIRTY.txt"), "utf8"),
+      "uncommitted edit\n",
+      "an unverified exit capture keeps the clone and its uncommitted edit",
+    );
+    assert.ok(sessionKept(lines), "and keeps the session");
+  });
+
+  it("a paused ownership read in the loop after an in-loop capture posts the held line and keeps the clone and session", async () => {
+    const { gitlab } = fakeGitlab();
+    client.protocolFeatures = [VAULT_FEATURE];
+    const rig = codexRig({ vaultLocked: () => true });
+    const w = workThenDefer(rig);
+    const claim = gitlabClaim(1794);
+    // The capture verifies, then the park report is lost and the run is paused underneath it.
+    const report = client.reportState.bind(client);
+    client.reportState = async (runId, body, signal) => {
+      if (body.status === "recovery_wait") {
+        api.setOwnershipStatus(claim.run_id, "paused");
+        throw new Error("park report lost");
+      }
+      return report(runId, body, signal);
+    };
+    const { logger, lines } = recordingLogger();
+    await runnerWith(() => ({ executor: w.exec }), gitlab, undefined, logger, { recoveryRetryMs: 5 }).execute(claim);
+    assert.equal(parkReports(claim.run_id).length, 0, "never parked over a live status");
+    assert.ok(!statuses(claim.run_id).includes("failed"), "never failed");
+    assertCaptured(1794);
+    const feed = feedTexts(claim.run_id);
+    assert.ok(feed.includes(VAULT_HELD), `the held line is on the feed; feed=${JSON.stringify(feed)}`);
+    assert.ok(fs.existsSync(path.join(worktreeDirFor(1794), "DIRTY.txt")), "the clone is kept after the in-loop capture");
+    assert.ok(sessionKept(lines), "the session is kept");
+  });
+
+  it("a 404 in the loop with no verified capture keeps the clone and session", async () => {
+    const { gitlab } = fakeGitlab();
+    client.protocolFeatures = [VAULT_FEATURE];
+    const rig = codexRig({ vaultLocked: () => true });
+    const claim = gitlabClaim(1795);
+    const w = workThenDefer(rig, settleOnceIncomplete(rig, () => api.setOwnershipNotOwned(claim.run_id)));
+    const { logger, lines } = recordingLogger();
+    await runnerWith(() => ({ executor: w.exec }), gitlab, undefined, logger, { recoveryRetryMs: 5 }).execute(claim);
+    assert.equal(parkReports(claim.run_id).length, 0);
+    assert.ok(!statuses(claim.run_id).includes("failed"));
+    assert.equal(
+      fs.readFileSync(path.join(worktreeDirFor(1795), "DIRTY.txt"), "utf8"),
+      "uncommitted edit\n",
+      "the clone and its uncommitted edit are kept",
+    );
+    assert.ok(sessionKept(lines), "the session is kept");
+  });
+
+  it("a 404 in the loop after a verified capture releases the clone and session", async () => {
+    const { gitlab } = fakeGitlab();
+    client.protocolFeatures = [VAULT_FEATURE];
+    const rig = codexRig({ vaultLocked: () => true });
+    const w = workThenDefer(rig);
+    const claim = gitlabClaim(1796);
+    const report = client.reportState.bind(client);
+    client.reportState = async (runId, body, signal) => {
+      if (body.status === "recovery_wait") {
+        api.setOwnershipNotOwned(claim.run_id);
+        throw new Error("park report lost");
+      }
+      return report(runId, body, signal);
+    };
+    const { logger, lines } = recordingLogger();
+    await runnerWith(() => ({ executor: w.exec }), gitlab, undefined, logger, { recoveryRetryMs: 5 }).execute(claim);
+    assert.equal(parkReports(claim.run_id).length, 0);
+    assertCaptured(1796);
+    assert.equal(fs.existsSync(worktreeDirFor(1796)), false, "the verified capture lets the clone go");
+    assert.equal(sessionKept(lines), false, "and the session");
+  });
+
+  it("a cancel whose capture is not verified (fetch-back fails) keeps the clone and session after a terminal ack", async () => {
+    const { gitlab } = fakeGitlab();
+    client.protocolFeatures = [VAULT_FEATURE];
+    const rig = codexRig({ vaultLocked: () => true });
+    let waiting!: () => void;
+    const settleRetried = new Promise<void>((r) => (waiting = r));
+    let incomplete = 0;
+    let ctxRef: () => RunContext | undefined = () => undefined;
+    const settle = async (ms: number): Promise<CredentialFreeSettleOutcome> => {
+      if (!ctxRef()?.cancelRequested?.()) {
+        if (++incomplete === 2) waiting();
+        return { kind: "incomplete", errors: [{ category: "timeout", message: "a writer survived" }] };
+      }
+      return rig.settle(ms);
+    };
+    const w = workThenDefer(rig, settle);
+    ctxRef = w.ctx;
+    const fetch = git.fetchAgentBranch.bind(git);
+    git.fetchAgentBranch = async (...args) => {
+      if (w.deferred()) throw new Error("injected fetch-back failure");
+      return fetch(...args);
+    };
+    const claim = gitlabClaim(1797);
+    const { logger, lines } = recordingLogger();
+    const runner = runnerWith(() => ({ executor: w.exec }), gitlab, undefined, logger, { recoveryRetryMs: 5 });
+    const execution = runner.execute(claim);
+    try {
+      await Promise.race([
+        settleRetried,
+        execution.then(() => { throw new Error("the flight ended before the park loop retried"); }),
+      ]);
+      api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+      await execution;
+      assert.ok(
+        api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed" && s.body.failure_reason === "run cancelled"),
+        "the cancel was reported",
+      );
+      assert.equal(trackedFile(1797, "DIRTY.txt"), null, "the capture never reached the tracking ref");
+      assert.equal(
+        fs.readFileSync(path.join(worktreeDirFor(1797), "DIRTY.txt"), "utf8"),
+        "uncommitted edit\n",
+        "the clone (the only copy) is kept",
+      );
+      assert.ok(sessionKept(lines), "the session is kept");
+    } finally {
+      runner.shutdown();
+      await execution;
+    }
+  });
+
+  it("a cancel ack with a live non-running status posts the held line and keeps the clone and session", async () => {
+    const { gitlab } = fakeGitlab();
+    client.protocolFeatures = [VAULT_FEATURE];
+    const rig = codexRig({ vaultLocked: () => true });
+    let waiting!: () => void;
+    const settleRetried = new Promise<void>((r) => (waiting = r));
+    let incomplete = 0;
+    let ctxRef: () => RunContext | undefined = () => undefined;
+    const settle = async (ms: number): Promise<CredentialFreeSettleOutcome> => {
+      if (!ctxRef()?.cancelRequested?.()) {
+        if (++incomplete === 2) waiting();
+        return { kind: "incomplete", errors: [{ category: "timeout", message: "a writer survived" }] };
+      }
+      return rig.settle(ms);
+    };
+    const w = workThenDefer(rig, settle);
+    ctxRef = w.ctx;
+    const claim = gitlabClaim(1798);
+    api.failStateWhen(claim.run_id, (b) => b.status === "failed" && b.failure_reason === "run cancelled", {
+      runStatus: "paused",
+    });
+    const { logger, lines } = recordingLogger();
+    const runner = runnerWith(() => ({ executor: w.exec }), gitlab, undefined, logger, { recoveryRetryMs: 5 });
+    const execution = runner.execute(claim);
+    try {
+      await Promise.race([
+        settleRetried,
+        execution.then(() => { throw new Error("the flight ended before the park loop retried"); }),
+      ]);
+      api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+      await execution;
+      assertCaptured(1798);
+      const feed = feedTexts(claim.run_id);
+      assert.ok(feed.includes(VAULT_HELD), `the held line is on the feed; feed=${JSON.stringify(feed)}`);
+      assert.ok(fs.existsSync(path.join(worktreeDirFor(1798), "DIRTY.txt")), "the clone is kept");
+      assert.ok(sessionKept(lines), "the session is kept");
+    } finally {
+      runner.shutdown();
+      await execution;
+    }
+  });
+
+  it("a park ack with a live non-running status posts the held line and keeps the clone and session", async () => {
+    const { gitlab } = fakeGitlab();
+    client.protocolFeatures = [VAULT_FEATURE];
+    const rig = codexRig({ vaultLocked: () => true });
+    const w = workThenDefer(rig);
+    const claim = gitlabClaim(1799);
+    api.failStateWhen(claim.run_id, (b) => b.status === "recovery_wait", { runStatus: "awaiting_approval" });
+    const { logger, lines } = recordingLogger();
+    await runnerWith(() => ({ executor: w.exec }), gitlab, undefined, logger, { recoveryRetryMs: 5 }).execute(claim);
+    assert.ok(!statuses(claim.run_id).includes("failed"), "never failed");
+    assertCaptured(1799);
+    const feed = feedTexts(claim.run_id);
+    assert.ok(feed.includes(VAULT_HELD), `the held line is on the feed; feed=${JSON.stringify(feed)}`);
+    assert.ok(fs.existsSync(path.join(worktreeDirFor(1799), "DIRTY.txt")), "the clone is kept after the verified capture");
+    assert.ok(sessionKept(lines), "the session is kept");
+  });
+
+  it("a terminal ack on the confirming running report publishes no checkpoint (publish: false)", async () => {
+    const { gitlab } = fakeGitlab();
+    client.protocolFeatures = [VAULT_FEATURE];
+    const rig = codexRig({ vaultLocked: () => true });
+    const w = workThenDefer(rig);
+    const pubs = countPublishes(() => w.deferred());
+    try {
+      const claim = gitlabClaim(1800);
+      api.failStateWhen(claim.run_id, (b) => w.deferred() && b.status === "running", { runStatus: "cancelled" });
+      await runnerWith(() => ({ executor: w.exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 }).execute(claim);
+      assertCaptured(1800);
+      assert.equal(pubs.count(), 0, "a run already known terminal publishes no checkpoint");
+    } finally {
+      pubs.restore();
+    }
+  });
+
+  it("receipt_failed over an already-resolved terminal keeps custody: no credentialed reap, no settle", async () => {
+    // Reachable: a permanent message-failure trip (batcher.onPermanentFailureReport) can resolve
+    // this generation's `failed` terminal while the finalize reconcile is deferring, and the
+    // confirming running report then gives up its input receipt. The trip is modelled by latching
+    // flight.terminalResolved at the confirm, which is exactly what journalAndSendTerminal leaves.
+    const { gitlab } = fakeGitlab();
+    client.protocolFeatures = [VAULT_FEATURE];
+    const { coord, archive } = enabledRecovery();
+    const rig = codexRig({ vaultLocked: () => true });
+    const w = workThenDefer(rig);
+    const report = client.reportState.bind(client);
+    client.reportState = async (runId, body, signal) => {
+      if (w.deferred() && body.status === "running") throw receiptError();
+      return report(runId, body, signal);
+    };
+    const claim = gitlabClaim(1801);
+    const runner = runnerWith(() => ({ executor: w.exec }), gitlab, undefined, nullLogger(), {
+      recoveryRetryMs: 5,
+      recovery: coord,
+    });
+    const r = runner as unknown as { confirmRunningForVaultPark: (f: { terminalResolved?: boolean }, ...rest: unknown[]) => Promise<unknown> };
+    const confirm = r.confirmRunningForVaultPark.bind(runner);
+    r.confirmRunningForVaultPark = async (flight, ...rest) => {
+      flight.terminalResolved = true;
+      return confirm(flight, ...rest);
+    };
+    const custody = spyCustodySettle(runner);
+    await runner.execute(claim);
+    assert.ok(!statuses(claim.run_id).includes("failed"), "no second failed over the resolved terminal");
+    assertCaptured(1801);
+    assert.equal(custody(), 0, "no credentialed reap-then-settle");
+    assert.equal(rig.refreshCalls(), 1, "no refreshCodex after the deferral");
+    assert.deepEqual(rig.boundaries, ["finalize"], "no terminal boundary was opened for a reap");
+    assert.equal(archive.releaseCalls.length, 0, "the custody hold is never released");
+  });
+});
