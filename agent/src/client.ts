@@ -90,9 +90,22 @@ const sleepReal = (ms: number): Promise<void> =>
  */
 export const DEFAULT_TERMINAL_RETRY_SCHEDULE = [1_000, 2_000, 4_000, 8_000, 16_000];
 
+/** Completion-permit transport retry (e2e phase 52 regression). An interlocked run cannot report
+ *  `completed` without a permit, and a permit needs a live api, so an api outage at finalize must
+ *  WAIT for the api rather than fail the run. Capped exponential backoff, bounded by a total wait
+ *  budget sized to a realistic outage; past it the error propagates exactly as before. */
+const DEFAULT_PERMIT_RETRY_BUDGET_MS = 10 * 60_000;
+const PERMIT_RETRY_BASE_MS = 1_000;
+const PERMIT_RETRY_MAX_DELAY_MS = 30_000;
+
 export interface ClientOptions {
   sleep?: (ms: number) => Promise<void>;
   terminalRetrySchedule?: number[];
+  /** Total wall time (requests AND backoff) a completion-permit request may spend retrying
+   *  transport failures before it gives up. */
+  permitRetryBudgetMs?: number;
+  /** Monotonic clock in ms, for the permit retry deadline. Injected by tests. */
+  now?: () => number;
   httpTimeoutMs?: number;
   /** Codex external-auth worker→API slice. Kept below app-server's fixed 10s callback
    *  deadline; the API finishes within 7.5s, leaving response-delivery margin. */
@@ -261,6 +274,8 @@ export interface CompletionPermitResult {
 export class WorkerClient {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly terminalRetrySchedule: number[];
+  private readonly permitRetryBudgetMs: number;
+  private readonly now: () => number;
   private readonly httpTimeoutMs: number;
   private readonly codexHTTPTimeoutMs: number;
   /**
@@ -333,6 +348,8 @@ export class WorkerClient {
   ) {
     this.sleep = opts.sleep ?? sleepReal;
     this.terminalRetrySchedule = opts.terminalRetrySchedule ?? DEFAULT_TERMINAL_RETRY_SCHEDULE;
+    this.permitRetryBudgetMs = opts.permitRetryBudgetMs ?? DEFAULT_PERMIT_RETRY_BUDGET_MS;
+    this.now = opts.now ?? (() => performance.now());
     this.httpTimeoutMs = opts.httpTimeoutMs ?? 30_000;
     this.codexHTTPTimeoutMs = opts.codexHTTPTimeoutMs ?? 8_000;
   }
@@ -1104,11 +1121,21 @@ export class WorkerClient {
    *  predicates and, on a clean recompute, issues (idempotently) a permit bound to (run,
    *  contract_revision, branch, head). Every rejection is a NON-TERMINAL structured denial —
    *  `granted:false` with a `denyReason` (and `unmet` for missing_milestones) — so the caller
-   *  reworks/holds/stops rather than treating it as an error. Throws RequestError only on a
-   *  transport/HTTP error (the denial is a 200 body, not a 4xx). */
+   *  reworks/holds/stops rather than treating it as an error.
+   *
+   *  A TRANSIENT failure (network error, timeout, 5xx, 408, 429) is an api outage, not an answer:
+   *  the identical request is retried with capped exponential backoff until a monotonic deadline
+   *  `permitRetryBudgetMs` away (request time counts too: each request's timeout and each sleep is
+   *  capped to what remains). Issuance is idempotent server-side (upsert on run, revision, head), so
+   *  a request that landed but whose reply was lost re-issues nothing new. Before this, one
+   *  `fetch failed` at finalize failed an otherwise-finished run, and the outbox faithfully replayed
+   *  that `failed`. `signal` (the flight's cancel) reaches the request itself and is re-checked
+   *  after every response, so a cancelled flight never acts on a permit. A permanent error, a
+   *  cancel, or an exhausted budget throws as before (RequestError on HTTP). */
   async requestCompletionPermit(
     runId: string,
     args: { contractRevision: number; branch: string; head: string; claimGeneration?: number },
+    signal?: AbortSignal,
   ): Promise<CompletionPermitResult> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/permit`;
     // PRD #1247 fix round: stamp the claim-lane generation through the shared send-gate so a
@@ -1123,16 +1150,50 @@ export class WorkerClient {
     // once the api rolls forward); a non-capability worker clears them (sticky, as today). A
     // granted:false denial is a 200 body, not an error, so it never reaches the fallback; a
     // genuine transport/HTTP 400 that is NOT a strict-decode 400 propagates unchanged.
-    const included = this.includeClaimGeneration(args.claimGeneration);
-    const res = (await this.withGenerationFallback(included, (includeField) => {
-      const body: CompletionPermitRequest = {
-        contract_revision: args.contractRevision,
-        branch: args.branch,
-        head: args.head,
-      };
-      if (includeField) body.claim_generation = args.claimGeneration;
-      return this.postJSON(path, body);
-    })) as CompletionPermitResponse;
+    const deadline = this.now() + this.permitRetryBudgetMs;
+    // Every actual HTTP request (including withGenerationFallback's stripped retry) is budgeted from
+    // the time left at the moment it starts, as a whole number of ms (AbortSignal.timeout rejects a
+    // fractional delay); none starts once the deadline has passed.
+    const send = (): Promise<unknown> =>
+      this.withGenerationFallback(this.includeClaimGeneration(args.claimGeneration), (includeField) => {
+        const remainingMs = Math.floor(deadline - this.now());
+        if (remainingMs <= 0) return Promise.reject(new Error("completion permit retry budget exhausted"));
+        const timeoutMs = Math.min(this.httpTimeoutMs, remainingMs);
+        const body: CompletionPermitRequest = {
+          contract_revision: args.contractRevision,
+          branch: args.branch,
+          head: args.head,
+        };
+        if (includeField) body.claim_generation = args.claimGeneration;
+        return this.postJSON(path, body, timeoutMs, signal);
+      });
+    let res: CompletionPermitResponse;
+    for (let attempt = 0; ; attempt++) {
+      signal?.throwIfAborted();
+      try {
+        res = (await send()) as CompletionPermitResponse;
+      } catch (err) {
+        if (signal?.aborted || !isTransient(err)) throw err;
+        const remaining = deadline - this.now();
+        const delay = Math.min(PERMIT_RETRY_MAX_DELAY_MS, PERMIT_RETRY_BASE_MS * 2 ** attempt);
+        // Another attempt needs the backoff AND some time to make the request: give up once
+        // the backoff alone would reach the deadline.
+        if (delay >= remaining) throw err;
+        this.log.warn("completion permit request failed, retrying (api unreachable?)", {
+          run_id: runId,
+          attempt,
+          delay_ms: delay,
+          remaining_ms: Math.round(remaining),
+          error: err instanceof Error ? err.message : String(err),
+        });
+        await abortableSleep(this.sleep, delay, signal);
+        continue;
+      }
+      // A response that raced the flight's cancel is discarded: a cancelled flight must never go
+      // on to open an MR on a permit it asked for before the cancel.
+      signal?.throwIfAborted();
+      break;
+    }
     const result: CompletionPermitResult = { granted: res.granted ?? false };
     if (res.deny_reason !== undefined) result.denyReason = res.deny_reason;
     if (res.unmet !== undefined) result.unmet = res.unmet;
