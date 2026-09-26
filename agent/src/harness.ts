@@ -365,6 +365,8 @@ export interface BoundaryProcessRequest {
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
   readonly identity: "command" | "worker_pat";
+  /** Per-child wall clock deadline; the spawner terminates the whole owned process group. */
+  readonly timeoutMs?: number;
 }
 
 export interface BoundaryProcessHandle {

@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache, isWorkflowScopeRejection } from "../src/git.js";
 
 // PRD #456 M1 — the finalize base-align git helpers, exercised over REAL on-disk repos so a
@@ -47,7 +47,7 @@ beforeEach(() => {
     ".github/workflows/ci.yml": "name: ci\non: [push]\njobs: {}\n",
     "conflict.txt": "base\n",
   });
-  git = new GitCache(fx.dataDir, nullLogger());
+  git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
 });
 
 afterEach(() => fx.cleanup());

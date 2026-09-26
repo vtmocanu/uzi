@@ -27,6 +27,9 @@ through `[0.52.0]`.)
 - **A requeued run can resume its own held work even when you are at the recovery-hold limit ([#1751](https://github.com/vtmocanu/uzi/issues/1751)).**
   When several runs are interrupted at once, the ones that resume first no longer lock the rest out: a run that still holds its own unresolved work is admitted past the 8-hold limit (up to 8 holds of its own), while new runs still pause at the limit. The run's queued reason and the blocked-runs count on the alert match what is actually blocked. A same-worker resume can also release its older generation's hold while it is still running, once the server proves the older work is in the checkpoint (or, for a task run, the branch) the run published.
 
+- **The worker scratch path and sandbox guarantee are documented ([#1719](https://github.com/vtmocanu/uzi/issues/1719)).**
+  ADR-1719 defines the `.uzi/scratch/` path for run artifacts and the limits of each harness's path policy. The worker provisions and locally excludes scratch, refuses checkpoint or final publication of forced-staged artifacts, and guides both harnesses to fresh review exports and gate logs inside the retained clone.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added

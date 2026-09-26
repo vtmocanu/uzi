@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import {
   GitCache,
   RecoveryBundleTooLargeError,
@@ -154,7 +154,7 @@ let cache: GitCache;
 
 beforeEach(() => {
   topo = makeTopology();
-  cache = new GitCache(path.join(topo.base, "data"), nullLogger());
+  cache = new GitCache(path.join(topo.base, "data"), nullLogger(), undefined, testGitCacheOptions());
 });
 
 afterEach(() => {

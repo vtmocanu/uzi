@@ -68,9 +68,9 @@ real browser, not by reading code. Report findings only; never modify code.
 - A full-page `open` is a reload: it resets SPA state and may re-seed and
   re-authenticate a mock build, so navigate in-app to keep or observe a
   transient state.
-- Write transient artifacts (screenshots, a11y dumps, logs) outside the tracked
-  tree, or a gitignored path if the sandbox confines you to the worktree;
-  `git status --porcelain` must stay empty without a manual `rm`.
+- Write transient artifacts (screenshots, a11y dumps, logs) under the
+  worker-provisioned `.uzi/scratch/` directory inside the checkout;
+  `git status --porcelain` should stay clean under ordinary staging.
 - A browser-CLI launch failure is an environment finding, not a task to debug: spend at most three attempts (the bare command, its `--version`, one known workaround recorded in the repo's own guidance), then report it Blocking as `browser unavailable: <exact error>` and validate everything that needs no browser. Never spend the dispatch debugging the image.
 
 ## Review lenses, in priority order

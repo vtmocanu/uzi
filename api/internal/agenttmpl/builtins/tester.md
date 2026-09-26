@@ -55,7 +55,7 @@ the three testing flavors below fit the repo and the change.
   can flip a successful `grep -q` to exit 141.
 - When a shell gate matters, run it once against an input that should
   fail and confirm it exits nonzero.
-- Run the real gate once, to a log inside the worktree, then read the log: `log=$(mktemp ./gate-log.XXXXXX); rc=0; <gate command> > "$log" 2>&1 || rc=$?; echo "EXIT=$rc" >> "$log"; test "$rc" -eq 0`. `mktemp` gives every invocation its own file even inside one shell, and `|| rc=$?` records a failure under `set -e` instead of exiting before the status is written; keep the file on a path the repo ignores (add the pattern if it is not), so a shared worktree never shows another agent your artifact and it can never be staged; a sandbox may confine reads to the worktree, which is why it stays inside it. Never rerun it on the same tree to read its output differently; a second run is the same measurement paid twice, and under contention a flakier one. The positive-control probe above is a separate run against a mutated throwaway tree (a detached worktree or copy), never a rerun of the gate on the tree under test.
+- Run the real gate once, to a log inside the worktree, then read the log: `log=$(mktemp .uzi/scratch/gate-log.XXXXXX); rc=0; <gate command> > "$log" 2>&1 || rc=$?; echo "EXIT=$rc" >> "$log"; test "$rc" -eq 0`. `mktemp` gives every invocation its own file even inside one shell, and `|| rc=$?` records a failure under `set -e` instead of exiting before the status is written; keep the file in worker-provisioned `.uzi/scratch/` inside the checkout. Local Git exclusion keeps ordinary staging clean, but `git add -f` can stage it; publication refusal guards the send range. A sandbox may confine reads to the worktree. Never rerun it on the same tree to read its output differently; a second run is the same measurement paid twice, and under contention a flakier one. The positive-control probe above is a separate run against an isolated exported snapshot when its needed tooling is available, never a rerun of the gate on the tree under test. Git-dependent gates run in the real checkout under frozen integration-gate discipline.
 
 
 ## What a green does not mean
@@ -123,10 +123,15 @@ the three testing flavors below fit the repo and the change.
 
 - Never fold in a worktree you share; restoring afterwards says nothing
   about the interval another agent gated or read in.
-- Fold in a throwaway detached worktree at the SHA you were given (`git
-  worktree add --detach <tmp> <sha>`), then remove it (`git worktree
-  remove <tmp>`, or `git worktree prune` if the directory is already
-  gone, so no stale `git worktree list` entry reads as live).
+- Resolve the reviewed commit to `sha`. For each fold make a fresh export:
+  `snap=$(mktemp -d .uzi/scratch/snap.XXXXXX)`; `set -o pipefail`;
+  `git archive "$sha" | tar -x -C "$snap"`. Check the pipeline status for
+  both archive and extraction failure. Never reuse a snapshot; remove it
+  after the fold. An export has no Git metadata or installed dependencies.
+  Git commands run inside it can find the parent checkout; never run Git there.
+  Run Git-dependent gates in the real checkout under frozen integration-gate
+  discipline. Report folds that cannot run in the export; do not claim every
+  fold was executed.
 - Restore from a `cp` backup, never `git checkout --`, which reverts to
   HEAD and silently eats uncommitted work.
 - If you cannot get an isolated tree, say so before you start.

@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { FakeApi } from "./fake-api.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { makeClaim, nullLogger } from "./helpers.js";
+import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
 import { WorkerClient } from "../src/client.js";
 import { GitCache } from "../src/git.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
@@ -60,7 +60,7 @@ beforeEach(async () => {
   api = new FakeApi(TOKEN);
   const baseUrl = await api.listen();
   fx = makeFixture();
-  git = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: defaultGitleaksShim() });
+  git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
   client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), {
     sleep: async () => {},
     terminalRetrySchedule: [1, 1],

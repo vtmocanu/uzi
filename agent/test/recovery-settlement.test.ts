@@ -24,7 +24,7 @@ import {
 } from "../src/recovery-settlement.js";
 import type { RecoveryLiveSettleRequest, RecoverySettleRequest, RecoverySettleResponse } from "../src/protocol.js";
 import { FakeRecoveryClient, FakeRecoveryGit } from "./codex-reap-fixture.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
 
 // issue #1582 M2 — the worker-side ancestry-settlement journal + settle driver, unit level.
 
@@ -168,7 +168,7 @@ describe("SettlementJournal (issue #1582 M2)", () => {
 
   it("survives the successor's exact-generation release AND removal of recovery/<runId> (a sibling root)", async () => {
     const dataDir = tmp("uzi-settle-sibling-");
-    const gc = new GitCache(dataDir, nullLogger());
+    const gc = new GitCache(dataDir, nullLogger(), undefined, testGitCacheOptions());
     assert.equal(gc.recoverySettlementRoot, path.join(dataDir, "recovery-settlement"));
     assert.ok(!gc.recoverySettlementRoot.startsWith(gc.recoveryRoot + path.sep), "never inside recovery/");
     const coord = new RecoveryCoordinator({

@@ -6,6 +6,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { type Executor } from "../src/executor.js";
 import type { Logger } from "../src/log.js";
+import { ScratchPublicationError } from "../src/git.js";
 import type { PublishResult } from "../src/protocol.js";
 import {
   api,
@@ -1369,6 +1370,44 @@ describe("issue #1086: two-tip checkpoint reconciliation (F2)", () => {
       );
       assert.equal(flight.lastCheckpointRefTip, "OLD_CONFIRMED", "a throw during checkpointPack does not advance the confirmed tip");
     }
+  });
+
+  it("scratch preflight refusal names the class and keeps both reconciliation tips", async () => {
+    const { gitlab } = fakeGitlab();
+    const flight = makeFlight({
+      lastCheckpointRefTip: "CONFIRMED",
+      lastAttemptedCheckpointRefTip: "ATTEMPTED",
+    });
+    const emitted: string[] = [];
+    flight.batcher.emit = (message) => {
+      const status = message as { payload?: { text?: string } };
+      if (status.payload?.text) emitted.push(status.payload.text);
+    };
+    const originalPack = git.checkpointPack.bind(git);
+    const originalPublish = client.publishCheckpoint.bind(client);
+    let publishes = 0;
+    git.checkpointPack = (async () => {
+      throw new ScratchPublicationError("remote text with credential");
+    }) as typeof git.checkpointPack;
+    client.publishCheckpoint = (async (...args: Parameters<typeof client.publishCheckpoint>) => {
+      publishes++;
+      return originalPublish(...args);
+    }) as typeof client.publishCheckpoint;
+    try {
+      const subject = runner(noopExec, gitlab) as unknown as {
+        publishCheckpointOutcome: (flight: unknown, bare: string, branch: string) => Promise<unknown>;
+      };
+      assert.deepEqual(await subject.publishCheckpointOutcome(flight, "bare", "branch"), {
+        published: false, reason: "scratch_publication_refused",
+      });
+    } finally {
+      git.checkpointPack = originalPack;
+      client.publishCheckpoint = originalPublish;
+    }
+    assert.equal(publishes, 0);
+    assert.equal(flight.lastCheckpointRefTip, "CONFIRMED");
+    assert.equal(flight.lastAttemptedCheckpointRefTip, "ATTEMPTED");
+    assert.deepEqual(emitted, ["checkpoint publish failed: scratch_publication_refused"]);
   });
 
   it("(d) accepted-publish + lost-response + new-milestone: the next overlay chains from the ATTEMPTED tip, not the stale confirmed tip", async () => {

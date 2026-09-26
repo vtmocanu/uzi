@@ -1164,6 +1164,13 @@ describe("buildLeadSystemPrompt", () => {
     assert.match(REPO_SUBAGENT_UNTRUSTED_APPEND, /UNVERIFIED/);
   });
 
+  it("renders the scratch lifecycle and review recipe for the lead", () => {
+    const append = buildLeadSystemPrompt(undefined, { kind: "ci_fix" }).append;
+    for (const phrase of [".uzi/scratch/", "mktemp -d .uzi/scratch/snap.XXXXXX", "git archive", "tar -x -C", "set -o pipefail", "mktemp .uzi/scratch/gate-log.XXXXXX", "git add -f", "Fresh", "cross-worker", "Retirement", "worker-only quarantine"]) {
+      assert.ok(append.includes(phrase), `missing scratch guidance: ${phrase}`);
+    }
+  });
+
   it("the guardrail reminder forbids pushing and nested spawning, and teaches the two-phase flow", () => {
     assert.match(LEAD_GUARDRAIL_APPEND, /NEVER run `git push`/);
     assert.match(LEAD_GUARDRAIL_APPEND, /do not spawn any other agents/i);

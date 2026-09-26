@@ -91,6 +91,7 @@ import {
   CapturePathMismatchError,
   ForeignCaptureBlockedError,
   PendingRecoveryCaptureError,
+  ScratchPublicationError,
 } from "./git.js";
 import {
   buildCheckEnv,
@@ -196,7 +197,7 @@ function publishSkipLabel(raw: unknown): PublishSkipLabel {
  *  was an AbortError even with no aborted signal (e.g. the client's own request timeout) — silent on
  *  the feed either way; the shutdown sink names the latter `publish_error`, since its permit did not
  *  expire — and `error` = any other throw. */
-type PublishFailClass = "no_local_tip" | "skipped" | "rejected" | "aborted" | "error";
+type PublishFailClass = "no_local_tip" | "skipped" | "rejected" | "aborted" | "scratch_publication_refused" | "error";
 
 /** issue #1597 M1: the typed result of {@link RunRunner.publishCheckpointOutcome}. Only the
  *  allowlisted skip label and the numeric HTTP status are carried — never an error message,
@@ -221,6 +222,7 @@ type ShutdownCheckpointOutcome =
   | "publish_rejected"
   | "publish_skipped"
   | "publish_error"
+  | "scratch_publication_refused"
   | "no_local_tip"
   | "bare_lock_retained"
   | "tick_process_survived";
@@ -243,6 +245,8 @@ function shutdownOutcomeOf(
       return "publish_rejected";
     case "aborted":
       return permitSignal?.aborted ? "timeout" : "publish_error";
+    case "scratch_publication_refused":
+      return "scratch_publication_refused";
     case "error":
       return "publish_error";
   }
@@ -2619,7 +2623,11 @@ export class RunRunner {
         ? err.reason
         : err instanceof TerminalReportError
           ? err.reason
-          : errMessage(err);
+          : err instanceof ScratchPublicationError
+            ? err.message === "scratch_publication_refused: cannot verify fresh remote floor"
+              ? "scratch_publication_refused: cannot verify fresh remote floor"
+              : "scratch_publication_refused: candidate history cannot be published"
+            : errMessage(err);
     const reason = redactText(rawReason);
     // PRD #69 M7a: derive the TRUSTED failure class from the RAW reason (before
     // redaction) so a fatal pre-start failure (provisioning / no token) carries a
@@ -3865,15 +3873,20 @@ export class RunRunner {
     const finalizeBarePath = barePath;
     const pushToOrigin = () =>
       withForgeRetry(
-        () =>
-          this.git.pushBranch(
+        async () => {
+          await this.git.pushBranch(
             finalizeBarePath,
             result.branch,
             claim.secrets.forge_pat,
             claim.repo.clone_url,
             claim.secrets.forge_username,
-          ),
-        { log: runLog, signal: boundarySignal },
+          );
+        },
+        {
+          log: runLog,
+          signal: boundarySignal,
+          classify: (error) => error instanceof ScratchPublicationError ? "permanent" : classifyForgeError(error),
+        },
       );
 
     // PRD #1416 (MR-rework, finding 1): a bridge NEWLY makes a rewritten branch pushable (a plain
@@ -3999,6 +4012,33 @@ export class RunRunner {
           "The MR branch was advanced by a concurrent writer, so this rework was superseded and not applied. The branch and the concurrent commits are intact.",
         branch_moved: true,
       });
+    };
+
+    // Verify a concurrent forward advance against the origin tip captured at clone.
+    // The remote fetch may fail, so only a proven descendant gets branch_moved.
+    const reportMovedBranchIfVerified = async (error: unknown): Promise<boolean> => {
+      if (claim.kind !== "mr_rework" || !isNonFastForwardRejection(error)) return false;
+      const originAtClone = await this.git
+        .originBranchTip(finalizeBarePath, result.branch)
+        .catch(() => null);
+      let remoteTip: string | null = null;
+      try {
+        remoteTip = await this.git.fetchDefaultTip(
+          finalizeBarePath,
+          result.branch,
+          claim.secrets.forge_pat,
+          claim.repo.clone_url,
+          claim.secrets.forge_username,
+        );
+      } catch {
+        return false;
+      }
+      if (
+        !originAtClone || !remoteTip || remoteTip === originAtClone ||
+        !(await this.git.isAncestorRef(finalizeBarePath, originAtClone, remoteTip))
+      ) return false;
+      await failBranchMoved();
+      return true;
     };
 
     // PRD #1416 M4: the typed terminal for a run whose branch was rewritten at/below the published
@@ -4232,6 +4272,8 @@ export class RunRunner {
                 await fetchAndPush();
                 return false;
               } catch (e) {
+                if (e instanceof ScratchPublicationError) throw e;
+                if (await reportMovedBranchIfVerified(e)) return true;
                 // PRD #974 M2: an aligned push rejected by GitHub Push Protection (GH013) is a
                 // secret the pre-push gitleaks scan missed — route it to the typed
                 // push_secret_blocked fail (NO preserved diff: it may carry the detected secret)
@@ -4323,6 +4365,7 @@ export class RunRunner {
                   // secret gitleaks missed — typed push_secret_blocked fail (NO preserved diff:
                   // it may carry the secret), not a fall-back to merge/rebase (which cannot clear
                   // a secret) nor the generic catch.
+                  if (await reportMovedBranchIfVerified(e)) return;
                   if (isPushProtectionRejection(e)) {
                     runLog.info(
                       "finalize base-align: workflow-subtree overlay push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
@@ -4354,6 +4397,7 @@ export class RunRunner {
                   // gitleaks missed — typed push_secret_blocked fail (NO preserved diff: it may
                   // carry the secret), not the rebase fallback (which cannot clear a secret) nor
                   // the generic catch.
+                  if (await reportMovedBranchIfVerified(e)) return;
                   if (isPushProtectionRejection(e)) {
                     runLog.info(
                       "finalize base-align: merge push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
@@ -4414,6 +4458,7 @@ export class RunRunner {
         }
       }
     } catch (e) {
+      if (e instanceof ScratchPublicationError) throw e;
       // PRD #1416 M4 (SC3): a bridge that could not be built/validated at a finalize push site was
       // thrown as HistoryRewrittenError; type it history_rewritten — never the generic catch
       // (agent_failure), never finalize_base_align_conflict (the align arms call failBaseAlignConflict
@@ -4486,6 +4531,7 @@ export class RunRunner {
       try {
         await pushToOrigin();
       } catch (e) {
+        if (e instanceof ScratchPublicationError) throw e;
         // PRD #974 M2 backstop: a GitHub Push Protection (GH013) rejection here means a secret
         // the pre-push gitleaks scan missed — route it to the typed push_secret_blocked fail
         // (NO preserved diff: it may carry the secret) rather than the generic catch. Any OTHER
@@ -4498,42 +4544,7 @@ export class RunRunner {
         // mr_rework rework rejected non-fast-forward can mean a concurrent same-branch writer
         // advanced the MR branch under the run; route that distinct case to the branch_moved
         // disposition instead of letting it rethrow into the generic agent_failure catch.
-        if (claim.kind === "mr_rework" && isNonFastForwardRejection(e)) {
-          // Capture O — the origin branch tip at clone — BEFORE the detection fetch overwrites
-          // refs/remotes/origin/<branch> with the fresh remote tip. The base is the ORIGIN tip
-          // at clone, NOT runnerClone.baseCommit: on a resume the reseed sets baseCommit to the
-          // tracking tip (ahead of origin), which would fail the ancestor check below and
-          // silently regress a resumed run back to agent_failure.
-          const originAtClone = await this.git
-            .originBranchTip(finalizeBarePath, result.branch)
-            .catch(() => null);
-          let remoteTip: string | null = null;
-          try {
-            remoteTip = await this.git.fetchDefaultTip(
-              finalizeBarePath,
-              result.branch,
-              claim.secrets.forge_pat,
-              claim.repo.clone_url,
-              claim.secrets.forge_username,
-            );
-          } catch {
-            // Fetch failed → fall through to the generic throw (fail-safe): never mislabel a
-            // real problem as benign.
-          }
-          // A genuine concurrent-writer advance: the remote tip changed since our clone AND
-          // strictly descends from it (advanced forward, not rewritten/rewound). Anything else
-          // (unchanged tip, fetch failure, divergent/rewound history) falls through to today's
-          // behavior — never a false positive.
-          if (
-            originAtClone &&
-            remoteTip &&
-            remoteTip !== originAtClone &&
-            (await this.git.isAncestorRef(finalizeBarePath, originAtClone, remoteTip))
-          ) {
-            await failBranchMoved();
-            return;
-          }
-        }
+        if (await reportMovedBranchIfVerified(e)) return;
         throw e;
       }
     }
@@ -6955,7 +6966,8 @@ export class RunRunner {
       else if (rel === "unknown") anyUnknown = true;
     }
     if (!anyDivergent) {
-      // All ancestor, OR a mix of ancestor+unknown (no divergent): a broken read must NEVER bridge.
+      // All ancestor, or a mix of ancestor and unknown: a broken read must never bridge.
+      // Publication checks the candidate at checkpointPack or pushBranch.
       return anyUnknown ? { kind: "unknown" } : { kind: "clean" };
     }
     // Build B over the floors (bridgeToFloors appends only the ones actually missing).
@@ -7018,6 +7030,10 @@ export class RunRunner {
       });
       return { kind: "unknown" };
     }
+    // Inspect both the source and candidate history before either custody mutation.
+    // B includes H and the floors, so this also covers every bridge parent.
+    await this.git.scratchPublicationPreflight(barePath, branch, H);
+    await this.git.scratchPublicationPreflight(barePath, branch, bridge);
     // Adopt B: advance the bare tracking ref (worker-uid) and the checkpoint floor C.
     try {
       await this.git.updateTrackingRef(barePath, branch, bridge);
@@ -7065,6 +7081,10 @@ export class RunRunner {
         });
       }
     } catch (e) {
+      if (e instanceof ScratchPublicationError) {
+        this.reportPublishOutcome(flight, "scratch_publication_refused", "checkpoint publish failed: scratch_publication_refused");
+        return;
+      }
       // Never let a bridge failure undo a park/shutdown/capture (D4).
       runLog.warn("PRD #1416 M3: park/capture bridge threw; continuing best-effort", {
         run_id: flight.runId,
@@ -7701,6 +7721,10 @@ export class RunRunner {
       );
       return { published: false, reason: "rejected", httpStatus: res.httpStatus };
     } catch (e) {
+      if (e instanceof ScratchPublicationError) {
+        this.reportPublishOutcome(flight, "scratch_publication_refused", "checkpoint publish failed: scratch_publication_refused");
+        return { published: false, reason: "scratch_publication_refused" };
+      }
       // issue #1086 (F2): a throw is AMBIGUOUS too, but only after the pack tip was obtained — a
       // throw DURING checkpointPack leaves packedTip undefined and records nothing.
       if (packedTip !== undefined) flight.lastAttemptedCheckpointRefTip = packedTip;

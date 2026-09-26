@@ -100,6 +100,8 @@ const ALLOWED: string[] = [
   "grep -f patterns.txt src/*.ts", // non-git -f must still work
   "ls -la",
   "cat src/index.ts",
+  "cat .uzi/scratch/gate-log.test",
+  "mkdir -p .uzi/scratch",
   "git checkout -b feature/x", // create a branch, no force
   "git -C /repo status", // global option, benign subcommand
   "git config user.email dev@example.com", // config write to a non-sensitive key
@@ -865,6 +867,17 @@ describe("screenToolPath", () => {
     assert.strictEqual(screenToolPath("/work/wt-sibling/x", WT, WT).denied, true); // prefix-safe
     assert.strictEqual(screenToolPath(".git/config", WT, WT).denied, true);
     assert.strictEqual(screenToolPath("/work/wt/.git/hooks/pre-commit", WT, WT).denied, true);
+  });
+
+  it("allows direct scratch reads and writes while preserving secret and .git denials", async () => {
+    const hook = buildPathGuardHook(WT, nullLogger());
+    for (const tool of ["Read", "Write", "Edit"] as const) {
+      assert.deepStrictEqual(await hook(pathInput(tool, { file_path: ".uzi/scratch/gate-log.test" })), {});
+    }
+    const outside = await hook(pathInput("Write", { file_path: "/tmp/gate-log.test" }));
+    assert.match(JSON.stringify(outside), /\.uzi\/scratch\//);
+    assert.equal(screenToolPath(".uzi/scratch/secret", WT, WT, ["/work/wt/.uzi/scratch/secret"]).denied, true);
+    assert.equal(screenToolPath(".git/info/exclude", WT, WT).denied, true);
   });
 
   it("allows in-worktree paths (absolute and relative to cwd)", () => {

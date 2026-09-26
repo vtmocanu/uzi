@@ -28,7 +28,7 @@ import type {
 } from "../src/protocol.js";
 import { sleep } from "../src/util.js";
 import { FakeRecoveryClient } from "./codex-reap-fixture.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { api, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
@@ -410,7 +410,7 @@ async function bootAndSettle(
   onPromote?: (outbox: Outbox) => void,
 ): Promise<{ events: string[]; calls: FakeSettleClient["calls"]; s2: Stores }> {
   const events: string[] = [];
-  const git2 = new GitCache(fx.dataDir, nullLogger());
+  const git2 = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
   const s2 = stores(git2);
   const settleClient2 = new FakeSettleClient((rid, holdId) => {
     events.push(`settle:${holdId}`);
@@ -572,7 +572,7 @@ describe("settlement crash boundaries (issue #1582 M2)", () => {
       assert.equal(rec!.state, "pending_settle");
       assert.equal(rec!.attempts, 1);
       // Restart: fresh instances over the same dataDir, the clock past the backoff.
-      const git2 = new GitCache(fx.dataDir, nullLogger());
+      const git2 = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
       const later = () => Date.now() + 2 * 60 * 60_000;
       const s2 = stores(git2, later);
       const settle2 = new FakeSettleClient(released);

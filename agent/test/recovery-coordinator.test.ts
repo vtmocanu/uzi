@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { Readable } from "node:stream";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache, type RecoveryBundleResult } from "../src/git.js";
 import { RUN_KINDS, type RunKind } from "../src/protocol.js";
 import {
@@ -484,7 +484,7 @@ describe("RecoveryCoordinator — byte-identical restart re-upload with NO forge
     // The worker bare's own `origin` is the forge (as the runner clone's would resolve to).
     rawGit(worker, ["remote", "add", "origin", forge]);
 
-    const realGit = new GitCache(path.join(gitBase, "data"), nullLogger());
+    const realGit = new GitCache(path.join(gitBase, "data"), nullLogger(), undefined, testGitCacheOptions());
 
     // FIRST capture attempt: real producer builds+journals a REAL bundle, then the upload
     // fails, leaving a journaled bundle on disk (source retained).

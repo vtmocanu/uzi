@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger, recordingLogger } from "./helpers.js";
+import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
 
 // PRD #628 M3 — the cross-worker checkpoint recovery regression test (SC#2).
@@ -71,7 +71,7 @@ function commit(dir: string, file: string): string {
 function worker(name: string): GitCache {
   const dataDir = path.join(fx.dataDir, name);
   fs.mkdirSync(dataDir, { recursive: true });
-  return new GitCache(dataDir, nullLogger());
+  return new GitCache(dataDir, nullLogger(), undefined, testGitCacheOptions());
 }
 
 /** A worker whose GitCache captures every emitted log record into `lines`, so an
@@ -80,7 +80,7 @@ function loggingWorker(name: string): { git: GitCache; lines: unknown[] } {
   const dataDir = path.join(fx.dataDir, name);
   fs.mkdirSync(dataDir, { recursive: true });
   const { logger, lines } = recordingLogger();
-  return { git: new GitCache(dataDir, logger), lines };
+  return { git: new GitCache(dataDir, logger, undefined, testGitCacheOptions()), lines };
 }
 
 /** True when `lines` holds a level:"warn" record whose msg names the owner-anchor guard and
@@ -203,6 +203,7 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     const gitA = worker("workerA");
     const bareA = await gitA.ensureClone(fx.originPath);
     const seed = await gitA.createOrAttachRunnerClone(bareA, 628, "run-A");
+    fs.writeFileSync(path.join(seed.path, ".uzi", "scratch", "worker-A.log"), "private artifact");
     commit(seed.path, "M1.txt");
     const cpTip = commit(seed.path, "M2.txt"); // ≥1 commit strictly ahead of the floor
     await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
@@ -245,6 +246,8 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     // checkpoint tip (== the mirrored checkpoint's SHA), so the issue-#1059 owner anchor admits
     // the adopt. With no origin/<branch> this is the Path-A resume-adopt leg.
     const rc = await gitB.createOrAttachRunnerClone(bareB, 628, "run-B", true /*resume*/, cpTip /*matching own tip*/);
+    assert.equal(fs.statSync(path.join(rc.path, ".uzi", "scratch")).isDirectory(), true);
+    assert.deepEqual(fs.readdirSync(path.join(rc.path, ".uzi", "scratch")), [], "cross-worker recovery has no transferred scratch");
 
     // SC#2 NON-VACUITY GUARD — all of these must hold, else the assertion would pass on a
     // checkpoint that merely equals the floor and prove nothing.

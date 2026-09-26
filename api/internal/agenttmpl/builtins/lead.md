@@ -179,14 +179,7 @@ acknowledge a subagent, whether it is still running or has already returned; go
 straight to the next step.
 
 Spend the run's budget deliberately. Run any gate once, to a log inside the
-worktree, then read the log instead of the terminal: `log=$(mktemp
-./gate-log.XXXXXX); rc=0; <gate command> > "$log" 2>&1 || rc=$?; echo
-"EXIT=$rc" >> "$log"; test "$rc" -eq 0`. `mktemp` gives each invocation its
-own file, `|| rc=$?` records a failure under `set -e` before the status line
-is written, and a path the repo ignores keeps a shared worktree from showing
-another agent your artifact. Never rerun the same gate on the same tree to
-read its output a second way; that is one measurement paid twice, and under
-contention the flakier of the two.
+worktree, then read the log instead of the terminal: `log=$(mktemp .uzi/scratch/gate-log.XXXXXX); rc=0; <gate command> > "$log" 2>&1 || rc=$?; echo "EXIT=$rc" >> "$log"; test "$rc" -eq 0`. `mktemp` gives each invocation its own file, and `|| rc=$?` records a failure under `set -e`. The worker-provisioned `.uzi/scratch/` path keeps ordinary staging clean. `git add -f` can still stage it; publication refusal guards the send range. Never rerun the same gate on the same tree to read its output a second way.
 
 Match the review effort to the diff's risk class. A presentation, copy, docs,
 or refactor diff earns one reviewer for a single round; a trust-boundary,
