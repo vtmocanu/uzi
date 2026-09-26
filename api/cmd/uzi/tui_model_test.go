@@ -1035,7 +1035,6 @@ func TestTUIDetailLeftExitsAtBoundaryNotBefore(t *testing.T) {
 	}
 }
 
-// The credential column is GATED exactly as the web RunsList (PRD #295): the own board shows it
 // Credential counting uses secret kinds, never the Codex rate-limit account response.
 func TestTUIBoardCredentialCounts(t *testing.T) {
 	for _, tc := range []struct {
@@ -1072,7 +1071,8 @@ func TestTUIBoardCredentialCounts(t *testing.T) {
 	}
 }
 
-// only when the viewer holds more than one Anthropic token; the admin factory board always does.
+// The personal board reserves a credential column if either harness has multiple
+// credentials, and fills each row according to its own harness. Admin always shows it.
 func TestTUIBoardCredentialGate(t *testing.T) {
 	meta := "meta"
 	runs := []apitypes.RunListItemDTO{
