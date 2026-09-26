@@ -1786,10 +1786,16 @@ export function isStrictDecodeError(err: unknown): boolean {
   return err instanceof RequestError && err.status === 400 && /invalid request body/i.test(err.body);
 }
 
+/** Retryable HTTP status: any 5xx (incl. 529 overloaded), 408 or 429; permanent otherwise.
+ * Shared by `isTransient` and the executor's provider-transient classifier (issue #1401). */
+export function isTransientStatus(status: number): boolean {
+  return status >= 500 || status === 408 || status === 429;
+}
+
 /** Retryable: transport failures, 5xx, and 408/429; permanent otherwise. */
 export function isTransient(err: unknown): boolean {
   if (err instanceof RequestError) {
-    return err.status >= 500 || err.status === 408 || err.status === 429;
+    return isTransientStatus(err.status);
   }
   // Network error / timeout (AbortError) / non-HTTP failure.
   return true;
