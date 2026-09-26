@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **The default sweeps no longer all start at 02:00 UTC, and bug triage picks up 4 issues ([#1738](https://github.com/vtmocanu/uzi/pull/1738)).**
+  Bug triage now starts at 00:00, the Planned sweep stays at 02:00, and the assigned-to-uzi sweep moves to 06:00, so short bug runs finish before long planned work claims worker slots. Sweeps you already enabled keep their schedule; use Reset on the row to adopt the new defaults.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added
