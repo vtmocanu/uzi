@@ -34,6 +34,7 @@ import {
   derivePlanRevision,
 } from "./RunView";
 import { useRunStream } from "../lib/useRunStream";
+import { useAuth } from "../auth/AuthContext";
 // ?raw rather than node:fs — the web tsconfig has no node types, and this repo
 // already makes the same choice for the same reason in WorkerUpgradeBadge.test.tsx
 // and workerSizes.test.ts. Vite inlines it at build time, so the assertion runs
@@ -123,6 +124,18 @@ const mockApi = vi.mocked(api);
 // this mock does not touch the sub-component tests above.
 vi.mock("../lib/useRunStream", () => ({ useRunStream: vi.fn() }));
 const mockUseRunStream = vi.mocked(useRunStream);
+
+// Issue #1766: the vault_locked park body reads the VIEWER's vault state off useAuth (the
+// same signal VaultLockedBanner reads). These renders mount no AuthProvider, so the hook is
+// mocked; only the vault_locked cases below call it, and each sets the state it needs.
+vi.mock("../auth/AuthContext", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../auth/AuthContext")>();
+  return { ...actual, useAuth: vi.fn() };
+});
+const mockUseAuth = vi.mocked(useAuth);
+function viewerVault(unlocked: boolean) {
+  mockUseAuth.mockReturnValue({ vaultUnlocked: unlocked } as unknown as ReturnType<typeof useAuth>);
+}
 
 afterEach(() => {
   cleanup();
@@ -4663,33 +4676,79 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     expect(container.textContent).not.toContain("Waiting for the forge");
   });
 
-  // Issue #1766: a vault_locked park waits for the owner's vault unlock (done through the
-  // global banner) and resumes at its next retry, never "the instant you unlock".
-  it("renders the vault-unlock copy for a vault_locked park, with no forge count or countdown", () => {
-    const { container } = render(
-      <RecoveryWaitPanel
-        run={run({
-          status: "recovery_wait",
-          recovery_wait_cause: "vault_locked",
-          // A stale forge retry stamp must not leak a retry time or park count here.
-          recovery_retry_not_before: "2026-01-01T09:30:00Z",
-          forge_park_count: 2,
-          forge_park_max: 5,
-        })}
-      />,
-    );
-    expect(container.querySelector('[role="status"]')?.textContent).toContain(
-      "Paused — waiting for vault unlock",
-    );
+  // Issue #1766: a vault_locked park (a Codex credential refresh or release found the run
+  // owner's vault locked) waits for the vault unlock and resumes at its NEXT retry, whose
+  // time the DTO carries for this cause. The copy is owner-neutral: an admin may be reading
+  // another owner's run, and the Run DTO does not say whose it is.
+  const vaultPark = (over: Partial<Run> = {}) =>
+    run({
+      status: "recovery_wait",
+      recovery_wait_cause: "vault_locked",
+      recovery_retry_not_before: "2026-01-01T09:30:00Z",
+      // Forge counters set on purpose: this cause must never borrow the forge park count.
+      forge_park_count: 2,
+      forge_park_max: 5,
+      ...over,
+    });
+  // The same wall-clock HH:MM idiom the panel uses for every retry stamp.
+  const hhmm = (iso: string) =>
+    new Date(Date.parse(iso)).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+
+  it("vault_locked, viewer's vault LOCKED: owner-neutral copy, next retry time, and the banner hint", () => {
+    viewerVault(false);
+    const { container } = render(<RecoveryWaitPanel run={vaultPark()} />);
+    const heading = container.querySelector('[role="status"]')?.textContent ?? "";
+    expect(heading).toContain("Waiting for vault unlock");
+    // N2: `paused` is a different status; this park never calls itself paused.
+    expect(container.textContent).not.toMatch(/paused/i);
     expect(container.textContent).toContain(
-      "This run's vault locked while it was saving its work. Unlock your vault (use the banner at the top of the page) and it resumes automatically at its next retry.",
+      `The run owner's vault was locked when this Codex run needed its credential. Once the vault is unlocked, the run resumes at its next retry (${hhmm("2026-01-01T09:30:00Z")}).`,
     );
+    // The banner is on screen while the viewer's vault is locked; the hint is conditional on
+    // ownership, which the page cannot tell.
+    expect(container.textContent).toContain(
+      "If this is your run, unlock your vault with the banner at the top of the page.",
+    );
+    expect(container.textContent).toContain("the run's work was saved before it parked");
     expect(container.textContent).not.toContain("transient interruption");
     expect(container.textContent).not.toContain("Waiting for the forge");
     expect(container.textContent).not.toContain("2 of 5");
-    expect(container.textContent).not.toMatch(/Retry at/);
     // Unlock lives on the global banner: the panel offers no control of its own.
     expect(container.querySelector("button")).toBeNull();
+  });
+
+  it("vault_locked, viewer's vault UNLOCKED: no banner hint (the banner is gone), only when it resumes", () => {
+    viewerVault(true);
+    const { container } = render(<RecoveryWaitPanel run={vaultPark()} />);
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("Waiting for vault unlock");
+    expect(container.textContent).toContain(
+      `Once the vault is unlocked, the run resumes at its next retry (${hhmm("2026-01-01T09:30:00Z")}).`,
+    );
+    expect(container.textContent).not.toMatch(/banner/i);
+    expect(container.textContent).not.toMatch(/unlock your vault/i);
+  });
+
+  it("vault_locked copy is owner-neutral in both states and never promises an instant resume", () => {
+    for (const unlocked of [false, true]) {
+      cleanup();
+      viewerVault(unlocked);
+      const { container } = render(<RecoveryWaitPanel run={vaultPark()} />);
+      const text = container.textContent ?? "";
+      expect(text).toContain("The run owner's vault");
+      // Never asserts the vault is the viewer's ("your vault was locked", "This run's vault").
+      expect(text).not.toMatch(/your vault (was|is) locked/i);
+      expect(text).not.toContain("This run's vault");
+      expect(text).not.toMatch(/as soon as|the instant|immediately/i);
+    }
+  });
+
+  it("vault_locked with no retry stamp drops the time, not the sentence", () => {
+    viewerVault(true);
+    const { container } = render(
+      <RecoveryWaitPanel run={vaultPark({ recovery_retry_not_before: null })} />,
+    );
+    expect(container.textContent).toContain("the run resumes at its next retry.");
+    expect(container.textContent).not.toMatch(/retry \(/);
   });
 });
 
@@ -5005,8 +5064,9 @@ describe("RunView park announcement — recovery_wait (issue #1197, a11y)", () =
   });
 
   // Issue #1766: a vault_locked park announces the vault unlock it waits on, not the
-  // generic transient interruption.
+  // generic transient interruption, in owner-neutral words (an admin may be the viewer).
   it("announces a vault_locked park as waiting for vault unlock", async () => {
+    viewerVault(true);
     renderPage({ status: "recovery_wait", recovery_wait_cause: "vault_locked" });
     const region = await waitFor(() => {
       const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement | null;
@@ -5015,9 +5075,10 @@ describe("RunView park announcement — recovery_wait (issue #1197, a11y)", () =
     });
     expect(region.getAttribute("aria-live")).toBe("polite");
     expect(region.textContent).toBe(
-      "This run is paused waiting for vault unlock. Unlock your vault and it resumes automatically at its next retry.",
+      "This run is waiting for vault unlock. The run owner's vault was locked when this Codex run needed its credential. Once the vault is unlocked, the run resumes at its next retry.",
     );
     expect(region.textContent).not.toContain("transient interruption");
+    expect(region.textContent).not.toMatch(/paused|unlock your vault/i);
   });
 
   // PRD #1590 D6: a Codex account hold announces its own action, never the transient park.

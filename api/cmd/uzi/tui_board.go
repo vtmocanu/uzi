@@ -387,8 +387,9 @@ const vaultLockedReasonSubstr = "vault is locked"
 // the best-effort tier-2 escalation input (PRD #1251 M3, R3/R6). A run counts when its
 // HealthReason contains vaultLockedReasonSubstr (case-insensitive); the reason is only a
 // best-effort input (it is run-health-gated and collapses into the generic waiting_worker
-// status, D10), so a run-health-off board simply counts 0 and the indicator stays at the M2
-// tier-1 hint.
+// status, D10), so a run-health-off board simply counts 0 queued runs and the indicator stays
+// at the M2 tier-1 hint. Issue #1766: a run also counts when it is a recovery_wait park with
+// cause vault_locked (isVaultLockedPark), a typed signal that needs no run-health.
 //
 // It is computed over m.board.runs — the FULL loaded set, not the scrolled window — matching
 // boardSummary's run-source convention, so the count is stable while the board scrolls.
@@ -412,7 +413,10 @@ func (m tuiModel) ownParkedOnVaultCount() int {
 	}
 	n := 0
 	for _, r := range m.board.runs {
-		if r.HealthReason == nil || !strings.Contains(strings.ToLower(*r.HealthReason), vaultLockedReasonSubstr) {
+		// Issue #1766: a run already in flight when the vault locked parks as recovery_wait
+		// with cause vault_locked, whatever its health reason says; it is parked on the vault too.
+		queuedOnVault := r.HealthReason != nil && strings.Contains(strings.ToLower(*r.HealthReason), vaultLockedReasonSubstr)
+		if !queuedOnVault && !isVaultLockedPark(r.RunDTO) {
 			continue
 		}
 		if admin && (r.OwnerEmail == nil || !strings.EqualFold(*r.OwnerEmail, m.selfEmail)) {

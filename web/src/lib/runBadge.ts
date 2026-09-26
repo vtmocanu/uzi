@@ -474,7 +474,14 @@ function badgeTitle(reason: string | null | undefined): string | undefined {
 
 // runBadge maps a card's latest_run to its primary status pill. nowMs is passed in
 // (not read from Date.now) so the running elapsed is deterministic under test.
-export function runBadge(run: LatestRun, nowMs: number): RunBadge {
+//
+// recovery_wait_cause is optional because the board's LatestRun projection does not carry
+// it today; a caller holding a full Run (which does) passes it and gets the cause-specific
+// tooltip, and an absent cause reads as the generic transient-recovery park.
+export function runBadge(
+  run: LatestRun & { recovery_wait_cause?: string | null },
+  nowMs: number,
+): RunBadge {
   // The stopped signal wins over the raw status so a cancel-shaped `failed`
   // never renders as breakage.
   if (isStoppedRun(run.status, run.stop_kind)) {
@@ -611,6 +618,10 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
     // the pill says is THAT it is recovering. The label "recovery wait" reads fine
     // de-underscored, so StatusPill needs no RUN_STATUS_LABELS override to match it.
     // Warn-toned, never danger: it has not failed and it resumes on its own.
+    //
+    // Issue #1766: a vault_locked park is not a transient interruption; it waits for the run
+    // owner's vault to be unlocked and resumes at its next retry after that, so its tooltip
+    // says so (same label and tone: it is still a self-resuming recovery park).
     case "recovery_wait":
       return {
         kind: "badge",
@@ -618,7 +629,9 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         tone: "warning",
         pulse: false,
         title:
-          "Paused to recover from a transient interruption — it resumes automatically.",
+          run.recovery_wait_cause === "vault_locked"
+            ? "Waiting for vault unlock — resumes at its next retry once the vault is unlocked."
+            : "Paused to recover from a transient interruption — it resumes automatically.",
       };
     // PRD #1190: a run its owner paused. Info-toned and STATIC (no elapsed on the badge —
     // the per-card duration token carries `paused <elapsed>` via runDurationLabel). The

@@ -2543,9 +2543,10 @@ export interface Run {
    *  park — the empty-turn park (#1197) writes null, so render null as the generic
    *  "waiting to recover" wording, NOT as any particular cause. Known non-null values:
    *  "forge_unreachable" (the forge stayed unreachable at clone), "codex_account_unavailable"
-   *  (PRD #1590: held on its Codex account) and "vault_locked" (issue #1766: the owner's
-   *  vault locked at a durability boundary; the run resumes at its next retry once the vault
-   *  is unlocked, and waits `queued` while it stays locked); "empty_turn"/"provider_outage"
+   *  (PRD #1590: held on its Codex account) and "vault_locked" (issue #1766: a Codex
+   *  credential refresh or release found the run owner's vault locked; the run resumes at its
+   *  next retry, `recovery_retry_not_before`, once the vault is unlocked, and waits `queued`
+   *  while it stays locked); "empty_turn"/"provider_outage"
    *  are reserved. Render an unrecognised value honestly (a
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
@@ -2566,7 +2567,8 @@ export interface Run {
    * through sanitizeLabel, never as markup. */
   codex_secret_label: string | null;
   /** PRD #1392 M1: when the server will promote a `recovery_wait` run back to queued — the
-   *  retry stamp the forge-park surface counts down to ("retry at HH:MM"). The
+   *  retry stamp the forge-park surface counts down to ("retry at HH:MM"), and (issue #1766)
+   *  the next retry a `vault_locked` park resumes at once the vault is unlocked. The
    *  recovery-park analog of retry_not_before (the usage-limit park's stamp) and a SEPARATE
    *  field: a run parks on at most one of the two at a time. Null for a run that has never
    *  recovery-parked. ISO-8601 string, like every other timestamp on this type. */

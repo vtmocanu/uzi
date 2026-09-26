@@ -337,8 +337,9 @@ uzi version
   because the forge was unreachable at clone — cause `forge_unreachable`, capped by
   `RUN_FORGE_UNREACHABLE_MAX_PARKS`; the sweep retries it on a capped backoff; cause
   `codex_account_unavailable` is held on its Codex account until that account is usable
-  again; cause `vault_locked` means the owner's vault locked while the run saved its work,
-  so unlock the vault and it resumes at its next retry), and `paused` (an owner-requested hold, `uzi
+  again; cause `vault_locked` means a Codex credential refresh or release found the run
+  owner's vault locked: once that vault is unlocked, the run resumes at its next retry,
+  `recovery_retry_not_before`), and `paused` (an owner-requested hold, `uzi
   run pause`, resumed on demand from the run page or `uzi run resume <id>`;
   it does not auto-resume). So to
   wait for a plan gate or a clarification park, use **`uzi run wait <id>`** (see
@@ -370,7 +371,9 @@ uzi version
   bare wait stops there too), `completed`, `failed`, `cancelled` — and keeps
   waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/
   `recovery_wait`/`paused`: limit and recovery waits retry on a timer, pool waits
-  need an available pooled token, and owner pauses need `uzi run resume`.
+  need an available pooled token, and owner pauses need `uzi run resume`. A
+  `vault_locked` recovery park is no exception: a bare wait keeps waiting through it
+  until the run owner unlocks their vault and the next retry resumes the run.
   So a bare
   `uzi run wait <id>` is "wait for the plan gate, a clarification, an
   interactive park, OR the end". It **exits 0** the
