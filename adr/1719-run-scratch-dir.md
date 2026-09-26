@@ -62,7 +62,9 @@ scratch directory is an artifact convention, not a new access-control boundary.
    delete, rather than only the final tree or net diff. Refusal must not
    advance a confirmed checkpoint tip; preserve recovery custody and report
    a bounded, credential-free reason. Do not silently strip artifacts or
-   rewrite history.
+   rewrite history. The scan covers the candidate's full history, so a
+   branch whose history ever contained a scratch path stays refused even
+   after a later commit deletes it.
 6. **Keep scratch ephemeral.** Preserve it on the same retained runner clone
    across parks and resumes; do not delete it during execution or routine
    checkpoint publication. Fresh reseed and cross-worker recovery create an

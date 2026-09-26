@@ -195,7 +195,9 @@ durable recovery.
 
 The worker locally excludes the scratch directory from ordinary staging.
 Checkpoint and final publication refuse a scratch path in any commit being
-sent or an index/WIP capture. An ignore rule does not prevent forced staging;
+sent or an index/WIP capture. The check covers the branch's full history, so a
+branch that ever committed a scratch path stays refused even after a later
+commit deletes it. An ignore rule does not prevent forced staging;
 publication refusal guards that case. A repository collision at `.uzi/scratch/`
 fails provisioning instead of replacing repository content.
 

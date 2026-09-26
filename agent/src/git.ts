@@ -885,12 +885,21 @@ export class GitCache {
       await this.runGit(barePath, ["fetch", "--refmap=", "origin", `+${remoteRef}:${scratchRef}`], pat, scope, username);
       const fresh = await this.revParse(barePath, `${scratchRef}^{commit}`);
       if (fresh !== match[1]) throw new Error("remote branch changed during refresh");
-      const prior = await this.revParse(barePath, `refs/remotes/origin/${branch}^{commit}`);
-      if (!prior || (await this.ancestry(barePath, prior, fresh)) !== "ancestor") {
-        throw new Error("remote branch floor is unavailable or rewound");
+      const priorRef = `refs/remotes/origin/${branch}`;
+      const prior = await this.revParse(barePath, `${priorRef}^{commit}`);
+      if (prior) {
+        if ((await this.ancestry(barePath, prior, fresh)) !== "ancestor") {
+          throw new Error("remote branch floor is unavailable or rewound");
+        }
+      } else if (await this.tryGit(barePath, ["rev-parse", "--verify", "--quiet", priorRef]) === 0) {
+        // The tracking ref exists but names no commit: a broken floor, not an absent one.
+        throw new Error("remote branch floor is unavailable");
       }
+      // With no prior (the branch appeared remotely after the last fetch) the rewind
+      // check has nothing to compare; the fast-forward below must still be proven.
       const freshToCandidate = await this.ancestry(barePath, fresh, candidate);
       if (freshToCandidate === "ancestor") return;
+      if (!prior) throw new Error("new remote branch is not an ancestor of candidate");
       if (freshToCandidate !== "divergent") throw new Error("remote branch ancestry is unavailable");
       // Only a strictly newer, scratch-free remote tip outside a candidate that
       // still descends from the old floor is a concurrent forward advance.

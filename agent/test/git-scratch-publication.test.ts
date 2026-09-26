@@ -317,3 +317,91 @@ it("refuses a checkpoint whose floor cannot be resolved with the typed reason", 
   assert.throws(() => git(bare, "rev-parse", "--verify", `refs/remotes/origin/${branch}`));
   await assert.rejects(cache.checkpointPack(bare, branch), ScratchPublicationError);
 });
+
+// A branch created on the remote after the worker's last fetch: the bare has no
+// refs/remotes/origin/<branch>, so there is no prior floor to rewind-check.
+function seedRemoteBranch(sourceRepo: string, sha: string): void {
+  git(fx.originPath, "fetch", "--no-tags", sourceRepo, `${sha}:refs/heads/${branch}`);
+}
+function assertNoPriorFloor(bare: string): void {
+  assert.throws(() => git(bare, "rev-parse", "--verify", `refs/remotes/origin/${branch}`));
+}
+
+it("fast-forwards onto a remote branch created after the last fetch", { skip: linuxCloneSkip }, async () => {
+  const { bare, clone } = await setup();
+  fs.writeFileSync(path.join(clone, "one"), "one");
+  const base = commit(clone, "one");
+  seedRemoteBranch(clone, base);
+  fs.writeFileSync(path.join(clone, "two"), "two");
+  const candidate = commit(clone, "two");
+  await track(bare, clone);
+  assertNoPriorFloor(bare);
+  await cache.pushBranch(bare, branch, "", fx.originPath);
+  assert.equal(git(fx.originPath, "rev-parse", `refs/heads/${branch}`), candidate);
+});
+
+it("refuses a divergent remote branch created after the last fetch", { skip: linuxCloneSkip }, async () => {
+  const { bare, clone } = await setup();
+  git(fx.originPath, "checkout", "-q", "-b", "elsewhere");
+  fs.writeFileSync(path.join(fx.originPath, "remote-only"), "remote");
+  const remoteTip = commit(fx.originPath, "remote only");
+  git(fx.originPath, "checkout", "-q", "main");
+  git(fx.originPath, "update-ref", `refs/heads/${branch}`, remoteTip);
+  fs.writeFileSync(path.join(clone, "local"), "local");
+  commit(clone, "local");
+  await track(bare, clone);
+  assertNoPriorFloor(bare);
+  await assert.rejects(cache.pushBranch(bare, branch, "", fx.originPath), ScratchPublicationError);
+  assert.equal(git(fx.originPath, "rev-parse", `refs/heads/${branch}`), remoteTip);
+});
+
+it("refuses scratch history onto a remote branch created after the last fetch", { skip: linuxCloneSkip }, async () => {
+  const { bare, clone } = await setup();
+  fs.writeFileSync(path.join(clone, "one"), "one");
+  const base = commit(clone, "one");
+  seedRemoteBranch(clone, base);
+  fs.mkdirSync(path.join(clone, ".uzi", "scratch"), { recursive: true });
+  fs.writeFileSync(path.join(clone, ".uzi", "scratch", "secret"), "value\n");
+  git(clone, "add", "-f", ".uzi/scratch/secret");
+  git(clone, ...ident, "commit", "-m", "scratch");
+  await track(bare, clone);
+  assertNoPriorFloor(bare);
+  await assert.rejects(cache.pushBranch(bare, branch, "", fx.originPath), ScratchPublicationError);
+  assert.equal(git(fx.originPath, "rev-parse", `refs/heads/${branch}`), base);
+});
+
+it("refuses unproven ancestry onto a remote branch created after the last fetch", { skip: linuxCloneSkip }, async () => {
+  const { bare, clone } = await setup();
+  fs.writeFileSync(path.join(clone, "one"), "one");
+  const base = commit(clone, "one");
+  seedRemoteBranch(clone, base);
+  fs.writeFileSync(path.join(clone, "two"), "two");
+  commit(clone, "two");
+  await track(bare, clone);
+  assertNoPriorFloor(bare);
+  const seam = cache as unknown as { ancestry: (...args: unknown[]) => Promise<string> };
+  const original = seam.ancestry.bind(cache);
+  seam.ancestry = async () => "unknown";
+  try {
+    await assert.rejects(cache.pushBranch(bare, branch, "", fx.originPath), ScratchPublicationError);
+  } finally {
+    seam.ancestry = original;
+  }
+  assert.equal(git(fx.originPath, "rev-parse", `refs/heads/${branch}`), base);
+});
+
+it("refuses a tracking floor ref that names no commit", { skip: linuxCloneSkip }, async () => {
+  const { bare, clone } = await setup();
+  fs.writeFileSync(path.join(clone, "one"), "one");
+  const base = commit(clone, "one");
+  seedRemoteBranch(clone, base);
+  fs.writeFileSync(path.join(clone, "two"), "two");
+  commit(clone, "two");
+  await track(bare, clone);
+  // update-ref refuses a missing object, so write the dangling loose ref directly.
+  const loose = path.join(bare, "refs", "remotes", "origin", ...branch.split("/"));
+  fs.mkdirSync(path.dirname(loose), { recursive: true });
+  fs.writeFileSync(loose, `${"c".repeat(40)}\n`);
+  await assert.rejects(cache.pushBranch(bare, branch, "", fx.originPath), ScratchPublicationError);
+  assert.equal(git(fx.originPath, "rev-parse", `refs/heads/${branch}`), base);
+});
