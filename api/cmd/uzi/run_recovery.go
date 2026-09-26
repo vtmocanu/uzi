@@ -142,9 +142,10 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 		if n := unattributedCaptures(archives); n > 0 {
 			// An older server sends no hold_id, so its captures join onto no hold and the
 			// JSON would read as "no captures" (#1417). Say so on stderr, leaving stdout's
-			// shape unchanged, and name the listing that still shows their ids.
+			// shape unchanged (the plan degrades without failing), and name the listing that
+			// shows available ids without downloading; run export needs --output and fetches a sole capture.
 			_, _ = fmt.Fprintf(env.Stderr,
-				"uzi: %d capture(s) carry no hold id (server predates it) and are not listed; run 'uzi run export %s' to see their ids\n",
+				"uzi: %d capture(s) carry no hold id (server predates it) and are not listed; 'uzi run get %s' lists the available ones\n",
 				n, sanitizeTTY(runID))
 		}
 		return p.JSON(holdsWithCaptures(holds, archives))

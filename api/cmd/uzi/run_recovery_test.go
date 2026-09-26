@@ -125,8 +125,8 @@ func TestRunRecoveryJSONCaptures(t *testing.T) {
 	}
 	// cap-legacy (no hold_id) is attached nowhere, so the omission must be said on stderr,
 	// never silent; cap-other names a real (other) hold and is not counted.
-	if !strings.Contains(errb, "1 capture(s) carry no hold id") || !strings.Contains(errb, "uzi run export run1") {
-		t.Errorf("stderr = %q, want the unattributed-capture warning naming 1 capture and the export fallback", errb)
+	if !strings.Contains(errb, "1 capture(s) carry no hold id") || !strings.Contains(errb, "uzi run get run1") {
+		t.Errorf("stderr = %q, want the unattributed-capture warning naming 1 capture and the run get listing", errb)
 	}
 }
 
