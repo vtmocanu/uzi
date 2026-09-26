@@ -5,7 +5,7 @@
 // coordinate key (same category/target) — so the cache MUST drop the previous run's rationale
 // and refetch, never leave the old run's text on screen or skip the new fetch.
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { GroupRow } from "./GroupRow";
 import type { JudgeRecommendationGroup, RunReview } from "../../lib/api";
@@ -123,5 +123,108 @@ describe("GroupRow — the expander's rationale cache is keyed to the newest-ope
     rerender(row(group({ occurrences: [occ({ run_id: "run-A", rec_id: "rec-A" })] }), fetchReview));
     await waitFor(() => expect(screen.getByText("RATIONALE FROM RUN A")).toBeTruthy());
     expect(fetchReview).toHaveBeenCalledTimes(1);
+  });
+});
+
+// A promise the test settles by hand, so a fetch can be held in flight across a collapse or
+// a newest-run change.
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  let reject!: (e: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+// Issue #1727 item 3. The effect marked the run fetched BEFORE the fetch, so a collapse while
+// it was in flight dropped the response (the cleanup's alive=false) yet left the run marked,
+// and every later expand returned early: the full rationale never loaded for that row. The
+// run is now recorded only from a successful, still-current response.
+describe("GroupRow — a fetch that did not land stays retryable (#1727)", () => {
+  const toggle = () => fireEvent.click(screen.getByRole("button", { name: /(Expand|Collapse) occurrences/ }));
+
+  it("refetches and shows the rationale when re-expanded after a collapse mid-fetch", async () => {
+    const first = deferred<ReturnType<typeof reviewFor>>();
+    const fetchReview = vi
+      .fn()
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce(reviewFor("run-A", "RATIONALE FROM RUN A"));
+    render(row(group({ occurrences: [occ({ run_id: "run-A" })] }), fetchReview));
+
+    toggle(); // expand: fetch #1 in flight
+    await waitFor(() => expect(fetchReview).toHaveBeenCalledTimes(1));
+    toggle(); // collapse before it lands
+    await act(async () => {
+      first.resolve(reviewFor("run-A", "RATIONALE FROM RUN A"));
+    });
+
+    toggle(); // re-expand: must fetch again, not treat run-A as already loaded
+    await waitFor(() => expect(fetchReview).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("RATIONALE FROM RUN A")).toBeTruthy();
+  });
+
+  it("retries a rejected fetch on the next expand", async () => {
+    const fetchReview = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("judge unavailable"))
+      .mockResolvedValueOnce(reviewFor("run-A", "RATIONALE FROM RUN A"));
+    render(row(group({ occurrences: [occ({ run_id: "run-A" })] }), fetchReview));
+
+    toggle();
+    await waitFor(() => expect(fetchReview).toHaveBeenCalledTimes(1));
+    // The failure leaves the clamped preview in place.
+    expect(await screen.findAllByText("Clamped preview.")).toBeTruthy();
+    toggle();
+    toggle();
+    await waitFor(() => expect(fetchReview).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("RATIONALE FROM RUN A")).toBeTruthy();
+  });
+
+  it("discards an older run's late response once the newest-open run has changed", async () => {
+    const a = deferred<ReturnType<typeof reviewFor>>();
+    const b = deferred<ReturnType<typeof reviewFor>>();
+    const fetchReview = vi.fn((runId: string) => (runId === "run-A" ? a.promise : b.promise));
+    const { rerender } = render(row(group({ occurrences: [occ({ run_id: "run-A" })] }), fetchReview));
+
+    toggle();
+    await waitFor(() => expect(fetchReview).toHaveBeenCalledWith("run-A"));
+    // The newest open occurrence moves to run-B while run-A's fetch is still in flight.
+    rerender(row(group({ occurrences: [occ({ run_id: "run-B" })] }), fetchReview));
+    await waitFor(() => expect(fetchReview).toHaveBeenCalledWith("run-B"));
+
+    // run-A answers late: it is no longer the newest open run, so it must not render.
+    await act(async () => {
+      a.resolve(reviewFor("run-A", "RATIONALE FROM RUN A"));
+    });
+    expect(screen.queryByText("RATIONALE FROM RUN A")).toBeNull();
+
+    await act(async () => {
+      b.resolve(reviewFor("run-B", "RATIONALE FROM RUN B"));
+    });
+    expect(await screen.findByText("RATIONALE FROM RUN B")).toBeTruthy();
+    expect(screen.queryByText("RATIONALE FROM RUN A")).toBeNull();
+    // The late run-A answer did not disturb the run-B fetch into a refetch either.
+    expect(fetchReview).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops showing a loaded run's rationale as soon as a newer run is newest-open", async () => {
+    const b = deferred<ReturnType<typeof reviewFor>>();
+    const fetchReview = vi.fn((runId: string) =>
+      runId === "run-A" ? Promise.resolve(reviewFor("run-A", "RATIONALE FROM RUN A")) : b.promise,
+    );
+    const { rerender } = render(row(group({ occurrences: [occ({ run_id: "run-A" })] }), fetchReview));
+
+    toggle();
+    expect(await screen.findByText("RATIONALE FROM RUN A")).toBeTruthy();
+    // run-B becomes newest-open; until its fetch lands the clamped preview shows, never run-A's.
+    rerender(row(group({ occurrences: [occ({ run_id: "run-B" })] }), fetchReview));
+    await waitFor(() => expect(fetchReview).toHaveBeenCalledWith("run-B"));
+    expect(screen.queryByText("RATIONALE FROM RUN A")).toBeNull();
+    await act(async () => {
+      b.resolve(reviewFor("run-B", "RATIONALE FROM RUN B"));
+    });
+    expect(await screen.findByText("RATIONALE FROM RUN B")).toBeTruthy();
   });
 });

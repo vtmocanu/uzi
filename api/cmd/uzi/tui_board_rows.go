@@ -283,11 +283,15 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 		row += padSeg(m.milestoneMarker(r, terminal, bg), boardMileWidth, bg) + gap
 	}
 
-	// WHICH Anthropic credential this run spent (PRD #111 / #295), gated by boardShowCred:
+	// WHICH credential this run spent, gated by its own harness:
 	// drawn after the milestone micro-bar and before the COST column, so the row reads
 	// account → cost → title.
 	if showCred {
-		row += m.boardCredSeg(r, bg) + gap
+		if m.boardShowRunCred(r) {
+			row += m.boardCredSeg(r, bg) + gap
+		} else {
+			row += padSeg("", boardCredWidth, bg) + gap
+		}
 	}
 
 	// WHAT this run cost (PRD #650), gated by boardShowCost: a right-aligned whole-dollar cell,
@@ -336,19 +340,22 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	return row
 }
 
-// boardCredSeg renders WHICH Anthropic credential a run spent (PRD #111 / #295): just the token
-// LABEL, drawn muted (faint) — deliberately no dot and no select-reason colour, so the column is
-// a quiet "which account" scan rather than an attention signal (the reason/mode lives on the run
-// detail and in `uzi run <id>`). An empty cell is drawn when no credential was recorded (a run
-// claimed before PRD #111 M1, or one not yet claimed) — a guessed placeholder would assert
-// something nothing knows. The label is USER-AUTHORED and drawn through renderer.Plain (D7);
-// AnthropicSecretLabel is in d7UntrustedFields.
+// boardCredSeg renders the run's snapshotted credential label. A run with no recorded
+// credential (a Claude run not yet claimed; a Codex run not yet bound to an alias) keeps
+// an empty cell; a queued Codex run already bound shows its alias. Both labels are user supplied
+// and pass through Plain before entering the fixed-width column.
 func (m tuiModel) boardCredSeg(r apitypes.RunListItemDTO, bg color.Color) string {
-	if r.AnthropicSecretLabel == nil || *r.AnthropicSecretLabel == "" {
+	var label *string
+	switch r.Harness {
+	case "codex":
+		label = r.CodexSecretLabel
+	case "claude", "":
+		label = r.AnthropicSecretLabel
+	}
+	if label == nil || *label == "" {
 		return padSeg("", boardCredWidth, bg)
 	}
-	label := m.renderer.Plain(strOr(r.AnthropicSecretLabel, ""), boardCredWidth)
-	return paintSeg(m.pal.faintC, bg, false, padCell(label, boardCredWidth))
+	return paintSeg(m.pal.faintC, bg, false, padCell(m.renderer.Plain(*label, boardCredWidth), boardCredWidth))
 }
 
 // boardCostSeg renders WHAT a run cost (PRD #650), right-aligned in a fixed cell, branching on

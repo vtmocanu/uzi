@@ -2463,6 +2463,11 @@ export interface Run {
   finished_at: string | null;
   created_at: string;
   updated_at: string;
+  /** Issue #1727: when the run entered its CURRENT status (runs.status_since). The column
+   *  is backfilled and NOT NULL, so a current server always sends it; null only
+   *  defensively, and an older server omits the key. Read it through a fallback to
+   *  `updated_at`, which moves on unrelated writes (an extend, for example). */
+  status_since?: string | null;
   /** PRD #111 M1: which Anthropic credential this run's claim actually spent —
    *  what run_usage alone could never say. Both null for a run claimed before the
    *  feature landed, and for a run not yet claimed.
@@ -2551,10 +2556,11 @@ export interface Run {
    *  server's best-effort derivation failed. Render an unrecognised value honestly, the same
    *  rule as recovery_wait_cause. */
   codex_account_action: string | null;
-  /** PRD #1590 D6: the run's OWN snapshotted Codex alias label, shown beside
-   *  codex_account_action so the owner knows which login to fix. Non-null only when
-   *  codex_account_action is non-null. User-authored: render as text through sanitizeLabel,
-   *  never as markup. */
+  /** The run's bound Codex alias ID; null when the alias was deleted or never bound. */
+  codex_secret_id: string | null;
+  /** The run's OWN snapshotted Codex alias label, available independently of
+   * codex_account_action on owner/admin run reads. User-authored: render as text
+   * through sanitizeLabel, never as markup. */
   codex_secret_label: string | null;
   /** PRD #1392 M1: when the server will promote a `recovery_wait` run back to queued — the
    *  retry stamp the forge-park surface counts down to ("retry at HH:MM"). The

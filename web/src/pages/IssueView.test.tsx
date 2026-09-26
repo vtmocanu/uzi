@@ -145,6 +145,7 @@ function aRunItem(over: Partial<RunListItem> = {}): RunListItem {
     rate_limit_type: null,
     recovery_wait_cause: null,
     codex_account_action: null,
+    codex_secret_id: null,
     codex_secret_label: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
@@ -222,6 +223,9 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  // clearAllMocks keeps queued mock*Once implementations, so a test that fails before
+  // consuming its queued createRun outcomes would leak them into the next test.
+  mockApi.createRun.mockReset();
 });
 
 // Issue #124, item 9. The issue TITLE and DESCRIPTION are both forge-supplied, and the
@@ -436,49 +440,52 @@ describe("IssueView autopilot badge (PRD #102 review M-1)", () => {
   });
 });
 
+// A worker and an Anthropic token, the facts a runnable Start needs (shared by the
+// Start gate suite and the #1727 navigation suite).
+const aWorker = (): Worker => ({
+  id: "w1",
+  name: "laptop",
+  status: "online",
+  busy: false,
+  kind: "external",
+  hosted_size: null,
+  active_runs: 0,
+  max_concurrent_runs: null,
+  template_declared: null,
+  template_reported: null,
+  version: null,
+  upgrade_status: "unknown",
+  upgrade_detail: null,
+  upgrade_target: "",
+  upgrade_blocking_container: null,
+  upgrade_blocking_reason: null,
+  upgrade_last_exit_code: null,
+  last_heartbeat_at: null,
+  created_at: "2026-01-01T00:00:00Z",
+  stats_cpu_pct: null,
+  stats_mem_bytes: null,
+  stats_mem_limit_bytes: null,
+  stats_source: null,
+  stats_disk_nix_bytes: null,
+  stats_disk_nix_total_bytes: null,
+  stats_disk_data_bytes: null,
+  stats_disk_data_total_bytes: null,
+  anthropic_secret_id: null,
+  anthropic_secret_label: null,
+  anthropic_bind_mode: "default",
+  draining_since: null,
+});
+const aToken = (): SecretMeta => ({
+  id: "sec-1",
+  label: "default",
+  is_default: true,
+  auto_eligible: false,
+  kind: "anthropic_token",
+  created_at: "2026-01-01T00:00:00Z",
+  updated_at: "2026-01-01T00:00:00Z",
+});
+
 describe("IssueView Start gate (PRD #764)", () => {
-  const aWorker = (): Worker => ({
-    id: "w1",
-    name: "laptop",
-    status: "online",
-    busy: false,
-    kind: "external",
-    hosted_size: null,
-    active_runs: 0,
-    max_concurrent_runs: null,
-    template_declared: null,
-    template_reported: null,
-    version: null,
-    upgrade_status: "unknown",
-    upgrade_detail: null,
-    upgrade_target: "",
-    upgrade_blocking_container: null,
-    upgrade_blocking_reason: null,
-    upgrade_last_exit_code: null,
-    last_heartbeat_at: null,
-    created_at: "2026-01-01T00:00:00Z",
-    stats_cpu_pct: null,
-    stats_mem_bytes: null,
-    stats_mem_limit_bytes: null,
-    stats_source: null,
-    stats_disk_nix_bytes: null,
-    stats_disk_nix_total_bytes: null,
-    stats_disk_data_bytes: null,
-    stats_disk_data_total_bytes: null,
-    anthropic_secret_id: null,
-    anthropic_secret_label: null,
-    anthropic_bind_mode: "default",
-    draining_since: null,
-  });
-  const aToken = (): SecretMeta => ({
-    id: "sec-1",
-    label: "default",
-    is_default: true,
-    auto_eligible: false,
-    kind: "anthropic_token",
-    created_at: "2026-01-01T00:00:00Z",
-    updated_at: "2026-01-01T00:00:00Z",
-  });
 
   it("enables Start on a uzi issue with NO PRD link once a worker + token exist (PRD #764)", async () => {
     setAuth();
@@ -730,14 +737,93 @@ describe("IssueView Start gate (PRD #764)", () => {
 
     await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
     // Retried with force === true; that retry failed, and the starting state is
-    // cleared (button re-enabled). NOTE: unlike Board, IssueView's forced-retry
-    // failure toast does NOT persist — startRun's catch calls load(), whose first
-    // line is setError(""), which wipes the just-set message. This is existing
-    // control flow (the spec said keep it as-is), so this test asserts the real
-    // behavior; the Board/IssueView divergence is flagged back to the lead.
+    // cleared (button re-enabled). Like Board, the forced-retry failure now stays on
+    // screen (issue #1727): settlement and its reload no longer wipe it.
     await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledTimes(2));
     expect(mockApi.createRun.mock.calls[1]).toEqual(["repo-1", 7, true]);
     await waitFor(() => expect(startBtn().disabled).toBe(false));
+    expect(screen.getByText("boom while forcing")).toBeTruthy();
+    confirmSpy.mockRestore();
+  });
+
+  // Issue #1727 item 1. A failed start called onError then onSettled, and onSettled
+  // cleared the error it had just been handed; the reload it fires then ran the hook's
+  // onFetchStart, which cleared it a second time. Either wipe alone hides the failure.
+  //
+  // Mutation-checked: restoring setError("") in onSettled, or restoring the
+  // onFetchStart clear, each leaves no alert (observed red: "worker pool is full" not
+  // found).
+  it("keeps a failed start's error on screen through settlement and the reload (#1727)", async () => {
+    setAuth();
+    runnable();
+    mockApi.createRun.mockRejectedValueOnce(new ApiError(500, "worker pool is full"));
+    renderIssueView();
+
+    const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
+    await screen.findByText("A small typo fix");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    const loadsBefore = mockApi.listRuns.mock.calls.length;
+    fireEvent.click(startBtn());
+
+    // Settled (button re-enabled) and the reload has run and resolved...
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    await waitFor(() => expect(mockApi.listRuns.mock.calls.length).toBe(loadsBefore + 1));
+    await act(async () => {});
+    // ...and the error is still shown.
+    expect(screen.getByText("worker pool is full")).toBeTruthy();
+  });
+
+  it("clears a failed start's error when the next attempt starts (#1727)", async () => {
+    setAuth();
+    runnable();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    mockApi.createRun
+      .mockRejectedValueOnce(new ApiError(500, "worker pool is full"))
+      .mockRejectedValueOnce(openMRError());
+    renderIssueView();
+
+    const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
+    await screen.findByText("A small typo fix");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    fireEvent.click(startBtn());
+    await screen.findByText("worker pool is full");
+
+    // The second attempt is declined at the open-MR confirm (no error of its own), so
+    // the only thing that can remove the first error is the attempt-start clear.
+    fireEvent.click(startBtn());
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    expect(screen.queryByText("worker pool is full")).toBeNull();
+    confirmSpy.mockRestore();
+  });
+
+  it("a successful start still navigates to the run with no error shown (#1727)", async () => {
+    setAuth();
+    runnable();
+    mockApi.createRun.mockResolvedValueOnce({ run: { id: "run-9" } as unknown as Run });
+    renderWithRunRoute();
+
+    const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
+    await screen.findByText("A small typo fix");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    fireEvent.click(startBtn());
+    await screen.findByText("run page");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("a settled (declined) start still reloads the run history (#1727)", async () => {
+    setAuth();
+    runnable();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    mockApi.createRun.mockRejectedValueOnce(openMRError());
+    renderIssueView();
+
+    const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
+    await screen.findByText("A small typo fix");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    const loadsBefore = mockApi.listRuns.mock.calls.length;
+    fireEvent.click(startBtn());
+    await waitFor(() => expect(mockApi.listRuns.mock.calls.length).toBe(loadsBefore + 1));
     confirmSpy.mockRestore();
   });
 });
@@ -919,11 +1005,13 @@ describe("IssueView — a superseded fetch cannot seed a stale issue header (ite
 });
 
 // Issue #961 item 4a (m2). A promote failure sets the shared `error` slot. Navigating to
-// another issue is a deps refetch; onFetchStart wipes that error so a stale promote toast
-// does not bleed onto the next issue (matching the two startRun paths that already wipe it).
+// another issue is a route-identity change; the reset effect keyed on [repoId, iidNum]
+// wipes that error so a stale promote toast does not bleed onto the next issue. (Issue
+// #1727 moved this clear off the hook's onFetchStart, which also fired on the post-start
+// reload and wiped a fresh start error.)
 //
-// Mutation-checked: removing the onFetchStart opt leaves the promote error on screen after
-// navigation (observed red: "forge said no" still present, expected null).
+// Mutation-checked: removing setActionError("") from the reset effect leaves the promote
+// error on screen after navigation (observed red: "forge said no" still present).
 describe("IssueView — a promote error clears on issue navigation (item 4a)", () => {
   function NavToB() {
     const navigate = useNavigate();
@@ -964,10 +1052,204 @@ describe("IssueView — a promote error clears on issue navigation (item 4a)", (
     fireEvent.click(screen.getByRole("button", { name: /Promote to uzi/ }));
     await waitFor(() => expect(screen.getByText("forge said no")).toBeTruthy());
 
-    // Navigate to B: the deps refetch fires onFetchStart, wiping the promote error.
+    // Navigate to B: the route-identity reset effect wipes the promote error.
     fireEvent.click(screen.getByRole("button", { name: "go to B" }));
     await screen.findByText("Issue B");
     expect(screen.queryByText("forge said no")).toBeNull();
+  });
+});
+
+// Issue #1727 review. The action error no longer clears on settle, so an outcome that
+// arrives AFTER the user navigated A -> B (same IssueView instance; the route reset effect
+// has already run) would land on B. The handlers drop an outcome whose route identity
+// changed since the attempt began.
+//
+// Mutation-checked: removing the route-identity check from the start/promote handlers
+// shows A's error on B (observed red: "worker pool is full" / "forge said no" found), and
+// removing it from the promote success path replaces B's header with A's ("Issue A").
+describe("IssueView — an action outcome cannot land on the next issue (#1727)", () => {
+  function NavToB() {
+    const navigate = useNavigate();
+    return (
+      <button type="button" onClick={() => navigate("/repos/repo-1/issues/8")}>
+        go to B
+      </button>
+    );
+  }
+
+  function renderAB(labels: string[]) {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
+    mockApi.getIssue.mockImplementation(async (_repo: string, iid: number) => ({
+      issue:
+        iid === 7
+          ? anIssue({ iid: 7, title: "Issue A", labels, has_prd_link: false })
+          : anIssue({ iid: 8, title: "Issue B", labels, has_prd_link: false }),
+    }));
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/issues/7"]}>
+        <Routes>
+          <Route
+            path="/repos/:repoId/issues/:iid"
+            element={
+              <>
+                <NavToB />
+                <IssueView />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  it("drops a start failure for A that arrives after navigating to B", async () => {
+    setAuth();
+    let rejectA!: (e: unknown) => void;
+    mockApi.createRun.mockReturnValueOnce(new Promise((_, rej) => (rejectA = rej)));
+    renderAB(["uzi"]);
+
+    const startBtn = () => screen.getByRole("button", { name: /start run|starting/i }) as HTMLButtonElement;
+    await screen.findByText("Issue A");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    fireEvent.click(startBtn());
+    await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledWith("repo-1", 7, undefined));
+
+    fireEvent.click(screen.getByRole("button", { name: "go to B" }));
+    await screen.findByText("Issue B");
+    await act(async () => {
+      rejectA(new ApiError(500, "worker pool is full"));
+    });
+    // A's attempt still settles (B's Start is usable again), but its error is dropped.
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    expect(screen.queryByText("worker pool is full")).toBeNull();
+    expect(screen.getByText("Issue B")).toBeTruthy();
+  });
+
+  it("drops a promote failure for A that arrives after navigating to B", async () => {
+    setAuth();
+    let rejectA!: (e: unknown) => void;
+    mockApi.promoteIssue.mockReturnValueOnce(new Promise((_, rej) => (rejectA = rej)));
+    renderAB(["documentation"]);
+
+    await screen.findByText("Issue A");
+    fireEvent.click(screen.getByRole("button", { name: /Promote to uzi/ }));
+    await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledWith("repo-1", 7));
+
+    fireEvent.click(screen.getByRole("button", { name: "go to B" }));
+    await screen.findByText("Issue B");
+    await act(async () => {
+      rejectA(new ApiError(500, "forge said no"));
+    });
+    expect(screen.queryByText("forge said no")).toBeNull();
+    expect(screen.getByText("Issue B")).toBeTruthy();
+  });
+
+  it("drops a promote success for A that arrives after navigating to B", async () => {
+    setAuth();
+    let resolveA!: (v: { card: ReturnType<typeof aCard> }) => void;
+    mockApi.promoteIssue.mockReturnValueOnce(new Promise((res) => (resolveA = res)));
+    renderAB(["documentation"]);
+
+    await screen.findByText("Issue A");
+    fireEvent.click(screen.getByRole("button", { name: /Promote to uzi/ }));
+    await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledWith("repo-1", 7));
+
+    fireEvent.click(screen.getByRole("button", { name: "go to B" }));
+    await screen.findByText("Issue B");
+    await act(async () => {
+      resolveA({ card: aCard(["uzi", "documentation"]) });
+    });
+    // A's captured issue must not overwrite B's header, nor mark B runnable.
+    expect(screen.getByText("Issue B")).toBeTruthy();
+    expect(screen.queryByText("Issue A")).toBeNull();
+    expect(screen.queryByTitle(/uzi will run it/)).toBeNull();
+  });
+
+  // #1727 review (blocking). The reset effect used to leave A's `issue` in place until
+  // B's getIssue resolved, so A's header and its Promote/Start buttons stayed live while
+  // the route (and routeKeyRef) already read B: a click there acted on A, and a late
+  // promote success adopted A's header over B's. The reset now clears `issue` so nothing
+  // of A renders while B loads.
+  //
+  // Fail-before (HEAD 70aa9575): "Issue A" and "Promote to uzi" were still on screen after
+  // navigating to B with B's getIssue pending.
+  it("shows none of A's header or actions while B loads, and keeps B's header after A's late promote", async () => {
+    setAuth();
+    let resolveB!: (v: { issue: IssueDetail }) => void;
+    const pB = new Promise<{ issue: IssueDetail }>((r) => (resolveB = r));
+    mockApi.getIssue.mockImplementation((_repo: string, iid: number) =>
+      iid === 7
+        ? Promise.resolve({ issue: anIssue({ iid: 7, title: "Issue A", labels: ["documentation"] }) })
+        : pB,
+    );
+    let resolvePromoteA!: (v: { card: ReturnType<typeof aCard> }) => void;
+    mockApi.promoteIssue.mockReturnValueOnce(new Promise((res) => (resolvePromoteA = res)));
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/issues/7"]}>
+        <Routes>
+          <Route
+            path="/repos/:repoId/issues/:iid"
+            element={
+              <>
+                <NavToB />
+                <IssueView />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await screen.findByText("Issue A");
+    fireEvent.click(screen.getByRole("button", { name: /Promote to uzi/ }));
+    await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledWith("repo-1", 7));
+
+    fireEvent.click(screen.getByRole("button", { name: "go to B" }));
+    await waitFor(() => expect(mockApi.getIssue).toHaveBeenCalledWith("repo-1", 8));
+    // B is still loading: nothing of A is left to read or click.
+    expect(screen.queryByText("Issue A")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Promote to uzi|…/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /start run|starting/i })).toBeNull();
+    expect(screen.getByText("Loading issue…")).toBeTruthy();
+
+    await act(async () => {
+      resolveB({ issue: anIssue({ iid: 8, title: "Issue B", labels: ["documentation"] }) });
+    });
+    await screen.findByText("Issue B");
+    // B's own Promote is idle, not A's in-flight spinner.
+    expect(screen.getByRole("button", { name: /Promote to uzi/ })).toBeTruthy();
+
+    await act(async () => {
+      resolvePromoteA({ card: aCard(["uzi", "documentation"]) });
+    });
+    expect(screen.getByText("Issue B")).toBeTruthy();
+    expect(screen.queryByText("Issue A")).toBeNull();
+    expect(screen.queryByTitle(/uzi will run it/)).toBeNull();
+    expect(mockApi.promoteIssue).toHaveBeenCalledTimes(1);
+  });
+
+  // #1727 review (blocking), the Start half. `starting` was not reset on navigation, so
+  // B's Start button rendered "Starting…" (and disabled) for as long as A's attempt was
+  // in flight.
+  //
+  // Fail-before (HEAD 70aa9575): B's button read "Starting…" after B loaded.
+  it("does not leave B's Start button in A's Starting state", async () => {
+    setAuth();
+    mockApi.createRun.mockReturnValueOnce(new Promise(() => {}));
+    renderAB(["uzi"]);
+
+    const startBtn = () => screen.getByRole("button", { name: /start run|starting/i }) as HTMLButtonElement;
+    await screen.findByText("Issue A");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    fireEvent.click(startBtn());
+    await waitFor(() => expect(startBtn().textContent).toBe("Starting…"));
+
+    fireEvent.click(screen.getByRole("button", { name: "go to B" }));
+    await screen.findByText("Issue B");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    expect(startBtn().textContent).toBe("Start run");
+    expect(mockApi.createRun).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -975,6 +1257,110 @@ describe("IssueView — a promote error clears on issue navigation (item 4a)", (
 // without remounting (the data effect keys on [repoId, iidNum] and refetches), so the
 // picked credential must reset to inherit when the route identity changes — otherwise a
 // token pinned for issue A silently carries to issue B's Start run.
+// #1727 review: the route key alone cannot tell two visits to the same issue apart. After
+// A -> B -> A, a late outcome of the FIRST visit's attempt matched the key again, surfaced
+// its stale error and cleared the busy flag of the attempt started on the second visit.
+describe("IssueView — a first-visit outcome cannot land on a return visit (#1727)", () => {
+  function Nav() {
+    const navigate = useNavigate();
+    return (
+      <>
+        <button type="button" onClick={() => navigate("/repos/repo-1/issues/8")}>
+          go to B
+        </button>
+        <button type="button" onClick={() => navigate("/repos/repo-1/issues/7")}>
+          go to A
+        </button>
+      </>
+    );
+  }
+
+  function renderABA(labels: string[]) {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
+    mockApi.getIssue.mockImplementation(async (_repo: string, iid: number) => ({
+      issue:
+        iid === 7
+          ? anIssue({ iid: 7, title: "Issue A", labels, has_prd_link: false })
+          : anIssue({ iid: 8, title: "Issue B", labels, has_prd_link: false }),
+    }));
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/issues/7"]}>
+        <Routes>
+          <Route
+            path="/repos/:repoId/issues/:iid"
+            element={
+              <>
+                <Nav />
+                <IssueView />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  async function goBToA() {
+    fireEvent.click(screen.getByRole("button", { name: "go to B" }));
+    await screen.findByText("Issue B");
+    fireEvent.click(screen.getByRole("button", { name: "go to A" }));
+    await screen.findByText("Issue A");
+  }
+
+  it("drops the first visit's start failure and keeps the second attempt busy", async () => {
+    setAuth();
+    let rejectA1!: (e: unknown) => void;
+    mockApi.createRun
+      .mockReturnValueOnce(new Promise((_, rej) => (rejectA1 = rej)))
+      .mockReturnValueOnce(new Promise(() => {}));
+    renderABA(["uzi"]);
+
+    const startBtn = () => screen.getByRole("button", { name: /start run|starting/i }) as HTMLButtonElement;
+    await screen.findByText("Issue A");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    fireEvent.click(startBtn());
+    await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledTimes(1));
+
+    await goBToA();
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    fireEvent.click(startBtn());
+    await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledTimes(2));
+    expect(startBtn().disabled).toBe(true);
+
+    await act(async () => {
+      rejectA1(new ApiError(500, "worker pool is full"));
+    });
+    expect(screen.queryByText("worker pool is full")).toBeNull();
+    expect(startBtn().disabled).toBe(true);
+  });
+
+  it("drops the first visit's promote failure and keeps the second promote busy", async () => {
+    setAuth();
+    let rejectA1!: (e: unknown) => void;
+    mockApi.promoteIssue
+      .mockReturnValueOnce(new Promise((_, rej) => (rejectA1 = rej)))
+      .mockReturnValueOnce(new Promise(() => {}));
+    renderABA(["documentation"]);
+
+    const promoteBtn = () => screen.getByTitle(/Add the uzi label/) as HTMLButtonElement;
+    await screen.findByText("Issue A");
+    fireEvent.click(promoteBtn());
+    await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledTimes(1));
+
+    await goBToA();
+    fireEvent.click(promoteBtn());
+    await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledTimes(2));
+    expect(promoteBtn().disabled).toBe(true);
+
+    await act(async () => {
+      rejectA1(new ApiError(500, "forge said no"));
+    });
+    expect(screen.queryByText("forge said no")).toBeNull();
+    expect(promoteBtn().disabled).toBe(true);
+  });
+});
+
 describe("IssueView — the picked credential resets on issue navigation (PRD #1247)", () => {
   const aWorker = (): Worker => ({
     id: "w1",

@@ -9,6 +9,44 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+// TestRunToDTOCodexCredential keeps the alias snapshot independent of its nullable FK
+// and of the held-account action. A completed run still names its account.
+func TestRunToDTOCodexCredential(t *testing.T) {
+	secretID := uuid.New()
+	for _, tc := range []struct {
+		name              string
+		id                pgtype.UUID
+		label             pgtype.Text
+		wantID, wantLabel string
+	}{
+		{"bound completed run", pgtype.UUID{Bytes: secretID, Valid: true}, pgtype.Text{String: "work-laptop", Valid: true}, secretID.String(), "work-laptop"},
+		{"deleted alias retains snapshot", pgtype.UUID{}, pgtype.Text{String: "retired-login", Valid: true}, "", "retired-login"},
+		{"unbound run", pgtype.UUID{}, pgtype.Text{}, "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dto := runToDTO(store.Run{ID: uuid.New(), Harness: "codex", Status: "completed",
+				CodexSecretID: tc.id, CodexSecretLabel: tc.label}, "normal", 0, 0, 0, dtoTestNow)
+			if tc.wantID == "" {
+				if dto.CodexSecretID != nil {
+					t.Fatalf("id = %q, want null", *dto.CodexSecretID)
+				}
+			} else if dto.CodexSecretID == nil || *dto.CodexSecretID != tc.wantID {
+				t.Fatalf("id = %v, want %q", dto.CodexSecretID, tc.wantID)
+			}
+			if tc.wantLabel == "" {
+				if dto.CodexSecretLabel != nil {
+					t.Fatalf("label = %q, want null", *dto.CodexSecretLabel)
+				}
+			} else if dto.CodexSecretLabel == nil || *dto.CodexSecretLabel != tc.wantLabel {
+				t.Fatalf("label = %v, want %q", dto.CodexSecretLabel, tc.wantLabel)
+			}
+			if dto.CodexAccountAction != nil {
+				t.Fatalf("completed run action = %v, want null", dto.CodexAccountAction)
+			}
+		})
+	}
+}
+
 // TestRunToDTOAnthropicCredential pins how runToDTO maps PRD #111 M1's two columns:
 // INDEPENDENTLY, never as a pair.
 //

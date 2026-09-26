@@ -105,14 +105,59 @@ describe("runDurationLabel", () => {
 
   it("paused renders `paused <elapsed>` off updated_at, not the parks' `waiting` (PRD #1190)", () => {
     // A pause is a chosen hold, so it gets its OWN verb — mutation guard: rendering it as
-    // "waiting" (or falling to the default "") would redden this. The anchor is updated_at
-    // (status_since), the same as the involuntary parks.
+    // "waiting" (or falling to the default "") would redden this. With no status_since the
+    // anchor falls back to updated_at, the same as the involuntary parks.
     expect(
       runDurationLabel(
         { status: "paused", created_at: isoBefore(200), updated_at: isoBefore(160) },
         NOW,
       ),
     ).toBe("paused 2h 40m");
+  });
+
+  // Issue #1727: an extend (or any other unrelated write) moves updated_at while the run stays
+  // in the same status, so the park/pause anchor is status_since. Mutation guard: anchoring on
+  // updated_at again reddens both expectations below.
+  it("waiting and paused anchor on status_since when it is earlier than updated_at", () => {
+    for (const status of [
+      "awaiting_approval",
+      "awaiting_input",
+      "awaiting_followup",
+      "limit_wait",
+      "pool_wait",
+      "recovery_wait",
+    ]) {
+      expect(
+        runDurationLabel(
+          {
+            status,
+            created_at: isoBefore(300),
+            status_since: isoBefore(90),
+            updated_at: isoBefore(5),
+          },
+          NOW,
+        ),
+      ).toBe("waiting 1h 30m");
+    }
+    expect(
+      runDurationLabel(
+        {
+          status: "paused",
+          created_at: isoBefore(300),
+          status_since: isoBefore(160),
+          updated_at: isoBefore(5),
+        },
+        NOW,
+      ),
+    ).toBe("paused 2h 40m");
+  });
+
+  it("falls back to updated_at when status_since is absent, null or unparseable", () => {
+    for (const status_since of [undefined, null, "not-a-time"]) {
+      const base = { created_at: isoBefore(300), updated_at: isoBefore(7), status_since };
+      expect(runDurationLabel({ status: "limit_wait", ...base }, NOW)).toBe("waiting 7m");
+      expect(runDurationLabel({ status: "paused", ...base }, NOW)).toBe("paused 7m");
+    }
   });
 
   it("terminal completed reports the static ran-span", () => {

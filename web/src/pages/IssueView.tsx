@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, isHttpsUrl, preferForgeUrl, type IssueDetail, type RunListItem, type SecretMeta } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
@@ -55,13 +55,30 @@ export function IssueView() {
   const navigate = useNavigate();
   const { uziLabel, autopilotLabel } = useAuth();
 
-  // `issue` is also written by the `promote` handler (setIssue at :promote), so it
-  // stays local and the fetcher sets it as a side effect rather than routing through
-  // the hook's read-only `data`.
+  // `issue` is also written by the `promote` handler and cleared by the route reset
+  // effect (both below), so it stays local and the fetcher sets it as a side effect
+  // rather than routing through the hook's read-only `data`.
   const [issue, setIssue] = useState<IssueDetail | null>(null);
-  // `error` is the load error (from the hook, as `loadError`) OR a startRun/promote
-  // handler error kept here — the two share the one Alert slot below.
-  const [error, setError] = useState("");
+  // `actionError` is a startRun/promote handler error, kept apart from the hook's load
+  // error (`loadError`); the two share the one Alert slot below. It is deliberately NOT
+  // cleared by the hook's onFetchStart: a failed start reloads the run history, and that
+  // reload's fetch start used to wipe the error it was reloading after (issue #1727).
+  // It clears at the start of the next attempt and on route navigation (below) instead.
+  const [actionError, setActionError] = useState("");
+  // The route identity the page currently shows. A start/promote handler captures it when
+  // its attempt begins and, if it changed by the time the response lands, drops the
+  // attempt's error, a promote's label adoption, and the busy-flag clear (plus a start's
+  // run-history reload): the component is reused across issues, so without this a late
+  // failure for issue A would surface on issue B after the reset effect below had already
+  // cleared (#1727). A successful start still navigates to the new run on purpose: that
+  // run really was created, so the user is taken to it wherever they are. The reset effect
+  // below is also what keeps the ref current.
+  const routeKeyRef = useRef(`${repoId}/${iidNum}`);
+  // The route key alone cannot tell two visits to the same issue apart: after A -> B -> A
+  // a late outcome of the FIRST visit's attempt would match again, surface its stale error
+  // and clear the busy flag of an attempt started on the second visit (#1727 review). This
+  // generation advances on every route change and on unmount, and each attempt captures it.
+  const routeGenRef = useRef(0);
   const [starting, setStarting] = useState(false);
   const [promoting, setPromoting] = useState(false);
   // PRD #241: the "Schedule…" entry point, pre-pinned to this issue.
@@ -75,11 +92,29 @@ export function IssueView() {
   const [harness, setHarness] = useState<HarnessSelection>(INHERIT_HARNESS);
   // PRD #1247: this component is reused across route-param changes without remounting (the
   // data effect below keys on [repoId, iidNum] and refetches), so reset the picked
-  // credential to inherit when the route identity changes (no-op at mount).
+  // credential to inherit when the route identity changes (no-op at mount). Issue #961
+  // item 4a: the same reset drops a start/promote error, so it cannot bleed onto the next
+  // issue — a route change, not every refetch, is what makes that error stale. Issue #1727
+  // review: it also drops the previous issue and its busy flags, so while the next issue
+  // loads neither the old header nor its Start/Promote buttons (which would act on the
+  // old issue) stay on screen, and the next issue does not inherit the old spinner.
   useEffect(() => {
+    routeKeyRef.current = `${repoId}/${iidNum}`;
+    routeGenRef.current += 1;
+    setIssue(null);
+    setStarting(false);
+    setPromoting(false);
     setCredential(INHERIT_SELECTION);
     setHarness(INHERIT_HARNESS);
+    setActionError("");
   }, [repoId, iidNum]);
+  // Unmount ends every attempt too, so a late outcome never triggers a reload.
+  useEffect(
+    () => () => {
+      routeGenRef.current += 1;
+    },
+    [],
+  );
 
   const { data, loading, error: loadError, reload } = useAsyncData(
     async ({ isCurrent }) => {
@@ -109,7 +144,9 @@ export function IssueView() {
       };
     },
     [repoId, iidNum],
-    { fallback: "Failed to load the issue", onFetchStart: () => setError("") },
+    // "deps": a route change re-arms the loading line, since the reset effect above has
+    // just cleared the previous issue and the page would otherwise sit blank.
+    { fallback: "Failed to load the issue", skeleton: "deps" },
   );
   const runs = data?.runs ?? [];
   const hasWorker = data?.hasWorker ?? false;
@@ -131,20 +168,29 @@ export function IssueView() {
 
   const startRun = async () => {
     if (!issue) return;
-    setError("");
+    // Act only on the issue the route shows: this render's repoId paired with the issue
+    // it holds must be the current route identity, or the click would start a run on a
+    // repo/issue mix (#1727 review).
+    const attemptKey = `${repoId}/${issue.iid}`;
+    if (routeKeyRef.current !== attemptKey) return;
+    const attemptGen = routeGenRef.current;
+    const live = () => routeKeyRef.current === attemptKey && routeGenRef.current === attemptGen;
+    setActionError("");
     setStarting(true);
     // The shared helper carries the chosen credential override AND harness, and
-    // preserves both across the open-MR force retry (issue #856). onSettled keeps
-    // IssueView's pre-#1247 behaviour: clear the starting flag, clear the error, and
-    // reload.
+    // preserves both across the open-MR force retry (issue #856). onSettled clears the
+    // starting flag and reloads the run history, but leaves the error onError just set
+    // on screen (issue #1727): the next attempt clears it above.
     await startRunWithCredential(repoId, issue.iid, credential, {
       // encodeURIComponent the id: per-call-site open-redirect hardening (see
       // safeNextPath in Login.tsx). A no-op for today's UUID ids.
       onCreated: (runId) => navigate(`/runs/${encodeURIComponent(runId)}`),
-      onError: (msg) => setError(msg),
+      onError: (msg) => {
+        if (live()) setActionError(msg);
+      },
       onSettled: () => {
+        if (!live()) return;
         setStarting(false);
-        setError("");
         reload();
       },
     }, harness);
@@ -159,18 +205,31 @@ export function IssueView() {
   const promotable = !!issue && canPromote(issue, uziLabel, issue.bot_forge_user_id);
 
   // Promote (Decision 15; PRD #764): add the `uzi` label forge-first, then adopt the
-  // returned card's labels — no optimistic update.
+  // returned card's labels — no optimistic update. Both outcomes are dropped when the
+  // user has navigated to another issue meanwhile: adopting the labels there would mark
+  // the new issue with this one's promotion (#1727).
   const promote = async () => {
     if (!issue) return;
-    setError("");
+    const target = issue;
+    const attemptKey = `${repoId}/${target.iid}`;
+    if (routeKeyRef.current !== attemptKey) return;
+    const attemptGen = routeGenRef.current;
+    const live = () => routeKeyRef.current === attemptKey && routeGenRef.current === attemptGen;
+    setActionError("");
     setPromoting(true);
     try {
-      const { card } = await api.promoteIssue(repoId, issue.iid);
-      setIssue({ ...issue, labels: card.labels });
+      const { card } = await api.promoteIssue(repoId, target.iid);
+      // Adopt the labels onto the issue currently shown, and only if it is still the
+      // one promoted (a same-route refetch may have replaced the object meanwhile).
+      if (live()) {
+        setIssue((cur) => (cur && cur.iid === target.iid ? { ...cur, labels: card.labels } : cur));
+      }
     } catch (err) {
-      setError(errorMessage(err, "Could not promote the issue"));
+      if (live()) {
+        setActionError(errorMessage(err, "Could not promote the issue"));
+      }
     } finally {
-      setPromoting(false);
+      if (live()) setPromoting(false);
     }
   };
 
@@ -196,7 +255,7 @@ export function IssueView() {
         <span className="text-muted">#{iid}</span>
       </nav>
 
-      {(loadError || error) && <Alert message={loadError || error} />}
+      {(loadError || actionError) && <Alert message={loadError || actionError} />}
       {loading && <p className="text-faint">Loading issue…</p>}
 
       {issue && (

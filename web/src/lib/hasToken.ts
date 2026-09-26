@@ -29,6 +29,10 @@ export function anthropicTokenCount(secrets: SecretMeta[]): number {
   return secrets.filter((s) => s.kind === "anthropic_token").length;
 }
 
+export function codexCredentialCount(secrets: SecretMeta[]): number {
+  return secrets.filter((s) => s.kind === "codex_auth" || s.kind === "openai_api_key").length;
+}
+
 // isCodexUsable mirrors the server's D11 Codex-availability rule EXACTLY (PRD #1429
 // D3, api/internal/workersvc/harness_resolver.go resolveUsableCodexCredential): a
 // subscription (codex_auth) default is usable ONLY when linked (codex_status ===

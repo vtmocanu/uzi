@@ -1,18 +1,22 @@
 // Pure, framework-free per-state run-duration token (issue #256 M2), the web twin of
-// the CLI's runAgeCell (api/cmd/uzi/run.go). Derived entirely client-side from the
-// timestamps a run already carries, so no new API field is needed.
+// the CLI's runAgeCell (api/cmd/uzi/run.go). Derived client-side from the timestamps a run
+// carries; the waiting and paused buckets anchor on status_since (issue #1727), as the CLI
+// twin does, falling back to updated_at when a run shape does not carry it.
 
 import { formatElapsed } from "./runBadge";
+import { statusSinceIso } from "./statusSince";
 
 // RunDurationInput is the minimal run shape runDurationLabel reads. The three lifecycle
 // timestamps are BOTH optional and nullable (Decision 6) so a single type accepts the
 // full Run (where claimed/started/finished are `string | null`) AND the board's narrow
 // LatestRun (which carries only created_at/updated_at — the keys are simply absent) by
-// structural typing.
+// structural typing. status_since (issue #1727) is optional for the same reason: the full
+// Run carries it, LatestRun does not, and an older server omits it.
 export interface RunDurationInput {
   status: string;
   created_at: string;
   updated_at: string;
+  status_since?: string | null;
   claimed_at?: string | null;
   started_at?: string | null;
   finished_at?: string | null;
@@ -39,12 +43,18 @@ function parseTs(iso: string | null | undefined): number | null {
  *     awaiting_followup /
  *     limit_wait /
  *     pool_wait /
- *     recovery_wait        → `waiting <elapsed>` since updated_at (time parked in that state)
- *   - paused               → `paused <elapsed>`  since updated_at (PRD #1190, its own verb)
+ *     recovery_wait        → `waiting <elapsed>` since status_since ?? updated_at (time
+ *                            parked in that state)
+ *   - paused               → `paused <elapsed>`  since status_since ?? updated_at (PRD #1190,
+ *                            its own verb)
  *   - completed / failed /
  *     cancelled (terminal) → `ran <elapsed>`, the STATIC span finished_at − started_at, i.e.
  *                            how long it actually ran, independent of nowMs
  *   - anything else        → ""
+ *
+ * status_since, not updated_at, is the park/pause anchor (issue #1727): updated_at moves on
+ * unrelated writes such as an extend, so reading it would restart the elapsed. It falls back
+ * to updated_at only when status_since is absent, null or unparseable (statusSinceIso).
  *
  * The `""`-when-missing convention is deliberate: whenever the chosen anchor is
  * null/undefined or unparseable — including a terminal run that never started (cancelled
@@ -66,21 +76,21 @@ export function runDurationLabel(run: RunDurationInput, nowMs: number): string {
     case "awaiting_followup":
     case "limit_wait":
     // Issue #754: an auto-lane run parked on an empty token pool. It renders as a
-    // waiting elapsed since it entered the state (updated_at), NOT a countdown —
+    // waiting elapsed since it entered the state (status_since), NOT a countdown —
     // there is no reset window to count down to.
     case "pool_wait":
     // Issue #1197: a transient-recovery park. Same waiting-elapsed treatment as the
-    // sibling parks — since updated_at, never a countdown (the capped backoff instant
+    // sibling parks — since status_since, never a countdown (the capped backoff instant
     // carries no DTO field). Without this arm a recovery_wait run would fall to the
     // default "" and show no duration token at all.
     case "recovery_wait":
-      return liveToken("waiting", run.updated_at, nowMs);
+      return liveToken("waiting", statusSinceIso(run), nowMs);
     // PRD #1190: a run its owner paused. Its OWN verb — `paused <elapsed>` since it
-    // entered the state (updated_at) — deliberately NOT the parks' "waiting": a pause is
+    // entered the state (status_since) — deliberately NOT the parks' "waiting": a pause is
     // a chosen hold, not a wait on something outside the run, and the word carries the
     // difference the info tone also draws.
     case "paused":
-      return liveToken("paused", run.updated_at, nowMs);
+      return liveToken("paused", statusSinceIso(run), nowMs);
     case "completed":
     case "failed":
     case "cancelled": {

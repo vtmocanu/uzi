@@ -205,8 +205,9 @@ var (
 //   - claimed   → time since ClaimedAt (when a worker took it), or CreatedAt if unstamped.
 //   - queued    → time since CreatedAt (how long it has waited to be claimed).
 //   - awaiting_approval / awaiting_input / awaiting_followup / limit_wait / pool_wait /
-//     recovery_wait → time since UpdatedAt, i.e. how long it has been parked/held in that
-//     waiting state.
+//     recovery_wait → time since the run entered that status (statusEnteredAt:
+//     StatusSince, else UpdatedAt from an older server), i.e. how long it has been
+//     parked/held in that waiting state. UpdatedAt alone drifts on any row write (#1727).
 //   - completed / failed / cancelled → the STATIC span FinishedAt−StartedAt, how long it
 //     actually ran, independent of now. A terminal run with no StartedAt (cancelled or
 //     failed before it ever started) never ran, so it renders "-".
@@ -234,7 +235,8 @@ func runAgeCell(r apitypes.RunDTO, now time.Time) string {
 	case "queued":
 		anchor = &r.CreatedAt
 	case "awaiting_approval", "awaiting_input", "awaiting_followup", statusLimitWait, statusPoolWait, statusRecoveryWait:
-		anchor = &r.UpdatedAt
+		entered := statusEnteredAt(r)
+		anchor = &entered
 	case "completed", "failed", "cancelled":
 		// A static ran-span, not a live age: only meaningful when the run both started
 		// and finished. Missing either end (never started) → "-".

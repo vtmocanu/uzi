@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +17,21 @@ func nullTxt() pgtype.Text     { return pgtype.Text{} }
 func i8(v int64) pgtype.Int8   { return pgtype.Int8{Int64: v, Valid: true} }
 func tstamp(t time.Time) pgtype.Timestamptz {
 	return pgtype.Timestamptz{Time: t, Valid: true}
+}
+
+func TestSharedBoardLatestRunExcludesCodexCredential(t *testing.T) {
+	// The shared board reaches other users, so latestRunDTO must carry no credential
+	// identity at all (#1730). Check the json tags rather than a marshalled value: a
+	// future `codex_secret_label,omitempty` field would marshal to nothing while nil
+	// and pass a value check unnoticed.
+	typ := reflect.TypeOf(latestRunDTO{})
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		name := strings.Split(f.Tag.Get("json"), ",")[0]
+		if strings.Contains(name, "secret") || strings.Contains(strings.ToLower(f.Name), "secret") {
+			t.Fatalf("shared board DTO field %s (json %q) names a credential", f.Name, name)
+		}
+	}
 }
 
 func TestMapLatestRun(t *testing.T) {

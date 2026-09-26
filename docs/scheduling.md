@@ -369,8 +369,11 @@ reached. This is the diagnostic for the case above: it tells you a fire
 that started nothing (or fewer than expected) is being starved by
 `uzi`-less matches, and roughly how many there are, without waiting for
 [backfill](#sweep-cap) to walk past each one individually. It's shown in
-the Schedules page's **Last fire** panel, `uzi schedule get`'s **Last
-fire** block, `uzi schedule run-now`'s summary, and `--json` (`.last_fire.ineligible_matched` and `run-now`'s
+the Schedules list's **Last run** badge when the fire started nothing
+("0 started · N not eligible", with the skip count between them when the
+fire also skipped candidates), the Schedules page's **Last fire** panel,
+`uzi schedule get`'s **Last fire** block, `uzi schedule run-now`'s
+summary, and `--json` (`.last_fire.ineligible_matched` and `run-now`'s
 `ineligible_matched`). It's **absent, not zero, on a fire from before this
 count existed and on an assigned-selector sweep** (an assigned candidate is
 eligible by construction, so the count doesn't apply) — read a missing key

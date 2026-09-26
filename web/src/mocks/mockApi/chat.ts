@@ -104,6 +104,7 @@ export const chatApi = {
       rate_limit_type: null,
       recovery_wait_cause: null,
       codex_account_action: null,
+      codex_secret_id: null,
       codex_secret_label: null,
       recovery_retry_not_before: null,
       forge_park_count: 0,
@@ -113,6 +114,8 @@ export const chatApi = {
       finished_at: null,
       created_at: now,
       updated_at: now,
+      // Issue #1727: a new run enters its first status at creation.
+      status_since: now,
     };
     state.runs.set(run.id, run);
     state.messages.set(run.id, []);
@@ -148,6 +151,8 @@ export const chatApi = {
       finished_at: null,
       created_at: now,
       updated_at: now,
+      // Issue #1727: a new run enters its first status at creation.
+      status_since: now,
     };
     state.runs.set(run.id, run);
     state.messages.set(run.id, []);

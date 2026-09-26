@@ -8,7 +8,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { LastFireDetail } from "./LastRun";
+import { LastFireDetail, LastRunOutcome } from "./LastRun";
 import type { LastFire, LastFireSkip, Schedule } from "../lib/api";
 
 // LastFireDetail reads useAuth().uziLabel for the cap hint; a minimal stub keeps it out of
@@ -152,8 +152,25 @@ describe("LastFireDetail — ineligible_matched note (issue #1543)", () => {
       skips: [],
       ineligible_matched: 16,
     });
-    expect(screen.getByText("matched 0")).toBeTruthy();
+    // Issue #1727: nothing started, so the header reads amber, not the neutral "matched 0".
+    expect(screen.getByText("started nothing")).toBeTruthy();
+    expect(screen.queryByText("matched 0")).toBeNull();
     expect(screen.getByRole("note").textContent).toMatch(/16 open issues match the selector/);
+  });
+
+  // The genuine-zero control for the header above: a zero-candidate fire whose ineligible
+  // count is unknown or zero matched nothing at all, so its header stays neutral (#1727).
+  it.each([
+    ["absent", undefined],
+    ["null", null],
+    ["0", 0],
+  ])("keeps the neutral matched 0 header for a genuine zero match (ineligible %s)", (_, n) => {
+    renderDetail(n === undefined ? fire([]) : { ...fire([]), ineligible_matched: n });
+    panelRendered();
+    const badge = screen.getByText("matched 0");
+    expect(badge.className).not.toMatch(/warn/);
+    expect(screen.queryByText("started nothing")).toBeNull();
+    expect(screen.queryByRole("note")).toBeNull();
   });
 
   it("pluralizes a single ineligible issue", () => {
@@ -193,5 +210,92 @@ describe("LastFireDetail — the cap hint copy (issue #1543)", () => {
       capped: true,
     });
     expect(hintBox().textContent).toMatch(/The candidate ahead of the newer eligible issues was skipped\. See the reason above\./);
+  });
+});
+
+// Issue #1727 item 4. The list cell's outcome badge went started → skipped → neutral
+// "matched 0" without reading ineligible_matched, so a sweep whose selector matched only
+// ineligible issues looked exactly like one that matched nothing. It now shares the detail
+// note's predicate: when nothing started and the count is positive, the badge is amber.
+describe("LastRunOutcome — a starved sweep does not read matched 0 (#1727)", () => {
+  function renderOutcome(f: LastFire) {
+    return render(
+      <MemoryRouter>
+        <LastRunOutcome fire={f} expanded={false} onToggle={() => {}} panelId="p1" />
+      </MemoryRouter>,
+    );
+  }
+  const empty: LastFire = { fired_at: "2026-09-02T02:00:00Z", matched: 0, capped: false, started: [], skips: [] };
+
+  it("shows an amber starvation badge when nothing started and issues are ineligible", () => {
+    renderOutcome({ ...empty, ineligible_matched: 16 });
+    const badge = screen.getByText("0 started · 16 not eligible");
+    expect(badge.className).toMatch(/warn/);
+    expect(badge.getAttribute("title")).toBe("16 open issues match the selector but aren't eligible");
+    expect(screen.queryByText("matched 0")).toBeNull();
+  });
+
+  it("pluralizes a single ineligible issue in the badge title", () => {
+    renderOutcome({ ...empty, ineligible_matched: 1 });
+    expect(screen.getByText("0 started · 1 not eligible").getAttribute("title")).toBe(
+      "1 open issue matches the selector but isn't eligible",
+    );
+  });
+
+  it("shows both the skips and the ineligible count when nothing started", () => {
+    renderOutcome({
+      ...empty,
+      matched: 1,
+      skips: [{ issue_iid: 8, title: "busy one", reason: "already_running", web_url: null }],
+      ineligible_matched: 3,
+    });
+    const badge = screen.getByText("0 started · 1 skipped · 3 not eligible");
+    expect(badge.className).toMatch(/warn/);
+  });
+
+  it("does not hide an owner-actionable skip behind the ineligible count", () => {
+    // no_usable_credential is an amber skip the cadence does NOT fix on its own: the owner
+    // must repair a credential, so the list cell must name the skips, not only starvation.
+    const noCred: LastFireSkip = { issue_iid: null, title: "", reason: "no_usable_credential", web_url: null };
+    renderOutcome({
+      ...empty,
+      matched: 3,
+      skips: [noCred, { ...noCred, issue_iid: 9 }, { ...noCred, issue_iid: 10 }],
+      ineligible_matched: 16,
+    });
+    const badge = screen.getByText("0 started · 3 skipped · 16 not eligible");
+    expect(badge.className).toMatch(/warn/);
+    expect(screen.queryByText("0 started · 16 not eligible")).toBeNull();
+  });
+
+  it("keeps the skips-only form when no issue is ineligible", () => {
+    renderOutcome({
+      ...empty,
+      matched: 1,
+      skips: [{ issue_iid: 8, title: "busy one", reason: "already_running", web_url: null }],
+    });
+    expect(screen.getByText("0 started · 1 skipped").className).toMatch(/warn/);
+  });
+
+  it("keeps the started badge when runs started, whatever the ineligible count", () => {
+    renderOutcome({
+      ...empty,
+      matched: 1,
+      started: [{ issue_iid: 7, run_id: "77777777-0000-0000-0000-000000000000", title: "t", web_url: null }],
+      ineligible_matched: 16,
+    });
+    expect(screen.getByText("1 started")).toBeTruthy();
+    expect(screen.queryByText(/not eligible/)).toBeNull();
+  });
+
+  it.each([
+    ["absent", undefined],
+    ["null", null],
+    ["0", 0],
+  ])("keeps the neutral matched 0 for a genuine zero match (ineligible %s)", (_, n) => {
+    renderOutcome(n === undefined ? empty : { ...empty, ineligible_matched: n });
+    const badge = screen.getByText("matched 0");
+    expect(badge.className).not.toMatch(/warn/);
+    expect(screen.queryByText(/not eligible/)).toBeNull();
   });
 });

@@ -19,8 +19,8 @@ export interface StartRunHandlers {
   // Surface a start error on the page banner.
   onError: (message: string) => void;
   // Runs on every non-navigating outcome (declined confirm, forced-retry failure,
-  // plain failure). Each site clears its own `starting` flag and reloads here — and
-  // IssueView additionally clears the error, matching its pre-#1247 behaviour.
+  // plain failure). Each site clears its own `starting` flag and reloads here. It runs
+  // AFTER onError on a failure, so it must not clear the error just surfaced (#1727).
   onSettled: () => void;
 }
 

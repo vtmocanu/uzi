@@ -124,11 +124,12 @@ type skewTickMsg struct{}
 // while such a run remains — so an idle board wakes on nothing.
 type blinkTickMsg struct{}
 
-// secretsMsg carries the viewer's Anthropic token count (from ListSecrets), fetched once
-// at Init to gate the board credential column on PRD #295's more-than-one-token rule.
+// secretsMsg carries per-harness credential counts from ListSecrets, fetched once
+// at Init to gate each board row by the viewer's credentials for that harness.
 type secretsMsg struct {
-	count int
-	err   error
+	count      int // anthropic_token
+	codexCount int // codex_auth and openai_api_key
+	err        error
 }
 
 // rateLimitsMsg carries the viewer's own per-token rate-limit meters (from SelfRateLimits),
@@ -342,11 +343,13 @@ type tuiModel struct {
 	ctrlCSeen bool
 	showHelp  bool
 
-	// tokenCount is how many Anthropic tokens the viewer holds (from ListSecrets, fetched
-	// once at Init). It gates the board's credential column exactly as the web RunsList
-	// does (PRD #295): the own board shows WHICH token a run spent only when there is more
-	// than one to disambiguate. 0 until the probe returns, so the column stays hidden until
-	// then rather than flashing in.
+	// codexCredentialCount counts Codex credential secrets, independently of whether
+	// their provider account has a readable rate-limit meter.
+	codexCredentialCount int
+
+	// tokenCount is how many Anthropic tokens the viewer holds (from ListSecrets,
+	// fetched once at Init). Claude cells show their labels only when there is more
+	// than one token to disambiguate. It stays zero until the probe returns.
 	tokenCount int
 
 	// profile is the terminal's colour profile (tea.ColorProfileMsg, set at program
@@ -658,14 +661,25 @@ func (m *tuiModel) startDetailMetaReq() tea.Cmd {
 	return m.refreshRunMetaCmd(m.detail.runID, m.detail.metaWaitID)
 }
 
-// fetchSecretsCmd reads the viewer's Anthropic tokens once so the board can gate the
-// credential column on holding more than one (PRD #295). A failure is swallowed — the
-// column just stays hidden, and never blocks the board.
+// fetchSecretsCmd counts the viewer's credentials per harness once. A failure is
+// swallowed so the board stays usable with its credential column hidden.
 func (m tuiModel) fetchSecretsCmd() tea.Cmd {
 	c, ctx := m.client, m.ctx
 	return func() tea.Msg {
 		secrets, err := c.ListSecrets(ctx)
-		return secretsMsg{count: len(secrets), err: err}
+		msg := secretsMsg{err: err}
+		if err != nil {
+			return msg
+		}
+		for _, secret := range secrets {
+			switch secret.Kind {
+			case "anthropic_token":
+				msg.count++
+			case "codex_auth", "openai_api_key":
+				msg.codexCount++
+			}
+		}
+		return msg
 	}
 }
 
@@ -1169,6 +1183,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case secretsMsg:
 		if msg.err == nil {
 			m.tokenCount = msg.count
+			m.codexCredentialCount = msg.codexCount
 		}
 		return m, nil
 

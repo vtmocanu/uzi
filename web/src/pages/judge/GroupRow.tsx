@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   api,
@@ -127,41 +127,49 @@ export function GroupRow({
 
   // The newest open occurrence's FULL rationale, fetched ONCE per newest-open run on first
   // expand via fetchReview and cached here (this component's key is the coordinate, so the
-  // cache survives an onFiled reload). The cache is keyed to the newest-open RUN: when a
-  // backlog reload changes which run is newest-open, the stale rationale is dropped and the new
-  // run is fetched. Until it lands — and on error, or when fetchReview is omitted — the expander
-  // shows the clamped preview instead. null means "not loaded".
-  const [rationaleMd, setRationaleMd] = useState<string | null>(null);
-  const rationaleFetchedFor = useRef<string | null>(null);
+  // cache survives an onFiled reload). The cache records the run it was fetched FOR and only
+  // renders while that run is still the newest open one: when a backlog reload changes which
+  // run is newest-open, the stale rationale stops showing and the new run is fetched. Until it
+  // lands — and on error, or when fetchReview is omitted — the expander shows the clamped
+  // preview instead. `md` is null when the review carried no rec at this coordinate.
+  //
+  // Issue #1727: the run is recorded only on a SUCCESSFUL response that is still current (the
+  // effect has not been cleaned up by a collapse or a newest-run change). It used to be
+  // recorded before the fetch, so a collapse mid-flight dropped the response yet left the run
+  // marked fetched, and every later expand skipped the fetch and never showed the rationale.
+  // A failed or abandoned fetch now leaves the cache untouched, so the next expand retries.
+  const [rationale, setRationale] = useState<{ runId: string; md: string | null } | null>(null);
+  const cachedRunId = rationale?.runId;
+  const rationaleMd =
+    rationale !== null && rationale.runId === newestOpenRunId ? rationale.md : null;
 
   useEffect(() => {
     // Only after the user expands, and only when the capability and an open occurrence to fetch
     // it from are both present.
     if (!expanded || !fetchReview || !newestOpenRunId) return;
-    // Fetch once per newest-open run. When the run changes across a backlog reload, drop the
-    // previous run's rationale (so the clamped preview shows until the refetch lands) and fetch
-    // the new one; when it is unchanged, keep the cached rationale and skip.
-    if (rationaleFetchedFor.current === newestOpenRunId) return;
-    rationaleFetchedFor.current = newestOpenRunId;
-    setRationaleMd(null);
+    // Fetch once per newest-open run: a cache already holding this run's answer stands.
+    if (cachedRunId === newestOpenRunId) return;
+    // Cleared by the cleanup below on a collapse, a newest-run change, or an unmount, so a
+    // response for a superseded fetch can never overwrite a newer one.
     let alive = true;
     void (async () => {
       try {
         const { review } = await fetchReview(newestOpenRunId);
+        if (!alive) return;
         // Pull the recommendation at this group's coordinate; its rationale_md is the full
         // text the clamped preview was cut from.
         const rec = review?.recommendations.find(
           (r) => r.category === group.category && r.target === group.target,
         );
-        if (alive && rec) setRationaleMd(rec.rationale_md);
+        setRationale({ runId: newestOpenRunId, md: rec?.rationale_md ?? null });
       } catch {
-        // Leave rationaleMd null so the clamped preview stays.
+        // Leave the cache as it was so the clamped preview stays and the next expand retries.
       }
     })();
     return () => {
       alive = false;
     };
-  }, [expanded, fetchReview, newestOpenRunId, group.category, group.target]);
+  }, [expanded, fetchReview, newestOpenRunId, cachedRunId, group.category, group.target]);
 
   // Judge.tsx keys a row by coordKey alone, so this instance is REUSED across a scope switch.
   // Under `all` the fetch effect above no-ops (newestOpenRunId is undefined), which would leave a
@@ -169,10 +177,7 @@ export function GroupRow({
   // when entering the admin scope so `all` shows only the anonymized clamped preview (PRD #1184
   // M4, Finding [8]). The `mine`-scope behaviour is untouched.
   useEffect(() => {
-    if (isAdmin) {
-      setRationaleMd(null);
-      rationaleFetchedFor.current = null;
-    }
+    if (isAdmin) setRationale(null);
   }, [isAdmin]);
 
   return (
