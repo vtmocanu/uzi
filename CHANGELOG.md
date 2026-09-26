@@ -22,7 +22,21 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **Run list rows on a phone show the harness logo inline before the title ([#1714](https://github.com/vtmocanu/uzi/pull/1714)).**
+  The run list no longer reserves a separate logo column on narrow screens; the Claude or Codex logo sits at the start of the title line, so the title gets the width back.
+
 ### Fixed
+
+- **A Codex account whose usage response names a different workspace than its token is no longer bound to that workspace ([#1239](https://github.com/vtmocanu/uzi/issues/1239)).**
+  On a multi-workspace ChatGPT seat, the usage endpoint can report another workspace's `account_id` than the one the access token was issued for, and uzi used to bind the token to it. uzi now refuses the identity when the two disagree: an import marks the account failed with its own reason, and a refresh keeps the stored credential rather than releasing it. Personal seats are unaffected.
+
+- **`uzi run export` shows every recovery capture you can choose from, and `uzi run recovery --json` lists capture ids ([#1417](https://github.com/vtmocanu/uzi/issues/1417)).**
+  With several captures, `run export` folded the choices into a one-line error that was cut at 200 characters, hiding the second id. It now prints the captures as a table on stderr (or the archives array on `--json` stdout), then the error with the same exit code. `run recovery --json` now carries each hold's captures (id, state, source commit, size, created time), so a `--capture` id can be picked by a script.
+
+- **A scope-narrowed run that ends while its forge was unreachable no longer shows its scope directive as still active ([#1399](https://github.com/vtmocanu/uzi/issues/1399)).**
+  When a run parked because the forge was unreachable before its clone ended terminally (the park cap was reached, or it was cancelled), the scope directive's audit row stayed pending and rendered "active" on a finished run. These paths now settle it as declined, deciding from the run's state after the transition, and a scope directive sent to an already-finished run is refused.
 
 - **Every release's agent image now reports the version it is tagged with ([#1682](https://github.com/vtmocanu/uzi/issues/1682), [#1720](https://github.com/vtmocanu/uzi/issues/1720)).**
   A release whose agent code had not changed used to re-tag the previous release's worker image, so a stable promote shipped `agent-base:X.Y.Z` still reporting `X.Y.Z-rc.N`, and a self-managed worker showed `outdated` forever. Each agent template is now split into a runtime base, published as `agent-runtime-<template>:<input key>` and rebuilt only when one of its inputs changes, and a release stage that is built and stamped on every release. The release job checks that each published agent image reports exactly its tagged version and commit before the chart is published. Images already published keep their old stamps. Credit to @mauromorales for the report and the design.
