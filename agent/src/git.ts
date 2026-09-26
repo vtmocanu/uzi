@@ -6,7 +6,8 @@ import { constants as fsConstants, createReadStream } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import type { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import type { Readable, Writable } from "node:stream";
 import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
@@ -470,6 +471,25 @@ export class RunnerCloneMaterializationError extends Error {
   ) {
     super(`runner clone could not be made self-contained: ${causeMessage}`);
     this.name = "RunnerCloneMaterializationError";
+  }
+}
+
+/**
+ * issue #1769 — the fresh default tip `fetchDefaultTip` brought into the worker bare could not be
+ * imported into a SELF-CONTAINED (Codex) runner clone. Such a clone has no alternate into the
+ * bare, so the finalize base-align cannot reach the tip's objects until
+ * {@link GitCache.ensureRunnerCloneObjects} copies them in; when that copy fails (either side of
+ * the pack stream, or the post-import verification), this is thrown and no process of the
+ * import is left running.
+ */
+export class RunnerCloneImportError extends Error {
+  constructor(
+    readonly clonePath: string,
+    readonly tip: string,
+    readonly causeMessage: string,
+  ) {
+    super(`could not import ${tip} into the runner clone: ${causeMessage}`);
+    this.name = "RunnerCloneImportError";
   }
 }
 
@@ -3738,6 +3758,137 @@ export class GitCache {
   }
 
   /**
+   * issue #1769 — make `tip` (the fresh default `fetchDefaultTip` brought into the worker bare)
+   * resolvable in the runner clone, so {@link alignBranchWithDefault} can anchor and merge it.
+   *
+   * A `--shared` (Claude) clone already reaches it through its alternate: the first probe hits
+   * and nothing is spawned. A self-contained (Codex) clone has no alternate, and inside the
+   * Codex finalize boundary its runner git runs in the command sandbox rooted at the clone,
+   * which cannot read the bare. So the objects are STREAMED across instead: a worker-uid
+   * `pack-objects --revs --stdout` in the bare (via {@link spawnGit}: credential-free base
+   * gitEnv, NO PAT, and a full non-thin pack — no `--thin`) piped into a runner-uid
+   * `index-pack --stdin` in the clone. `haves` (commits the clone already holds, e.g. its base
+   * and default-branch commits) become `--not` exclusions, after filtering to the ones the bare
+   * actually has: `pack-objects --revs` exits 128 on an unknown `--not` object.
+   *
+   * Ordering inside a boundary: the `worker_pat` producer is spawned FIRST, while no command
+   * root is live — the safety facade's existing guard admits a `worker_pat` boundary process
+   * only while admission is closed and the registry reports no live `command`-kind root (every
+   * probe above has already completed and been reaped). The `command`-identity consumer is
+   * spawned second; the facade registers it as a `boundary_action` root, which that guard does
+   * not count and which is admitted like any other boundary process.
+   *
+   * Both exit statuses are awaited (inside a boundary each completion includes its root's
+   * reap). If either side fails, the pipe is torn down, the other side is ended/killed and
+   * awaited, and a {@link RunnerCloneImportError} is thrown; no process is left running. On
+   * success the clone is re-probed for `tip^{commit}`, and a miss is also an import error.
+   */
+  async ensureRunnerCloneObjects(barePath: string, clonePath: string, tip: string, haves: string[]): Promise<void> {
+    const fail = (cause: string): RunnerCloneImportError => {
+      this.log.warn("runner clone: could not import default-tip objects", { path: clonePath, tip, error: cause });
+      return new RunnerCloneImportError(clonePath, tip, cause);
+    };
+    const cloneHasTip = async (): Promise<boolean> => {
+      try {
+        await this.runGitAsRunner(clonePath, ["cat-file", "-e", `${tip}^{commit}`]);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    if (await cloneHasTip()) return;
+    // `tip` and every have are written to pack-objects' rev-list stdin one per line, so only a
+    // plain object id is accepted there (never an option-shaped or multi-line value).
+    if (!SHA40_RE.test(tip)) throw fail("tip is not a full object id");
+    const present: string[] = [];
+    for (const have of new Set(haves)) {
+      if (!have || !SHA40_RE.test(have)) continue;
+      if ((await this.tryGit(barePath, ["cat-file", "-e", `${have}^{commit}`])) === 0) present.push(have);
+    }
+    const revs = `${tip}\n${present.length > 0 ? `--not\n${present.map((h) => `${h}\n`).join("")}` : ""}`;
+    const started = Date.now();
+    let producer: Awaited<ReturnType<GitCache["spawnGit"]>>;
+    try {
+      producer = await this.spawnGit(barePath, ["pack-objects", "--revs", "--stdout", "-q"], revs);
+    } catch (err) {
+      throw fail(`pack-objects could not start: ${gitErrorMessage(err)}`);
+    }
+    // Which side we tore down because its peer failed, so the error names the side that failed
+    // first rather than the one we stopped.
+    let producerStopped = false;
+    let consumerStopped = false;
+    const killProducer = (): void => {
+      producer.stdout.destroy();
+      if (producer.child && producer.child.exitCode === null && producer.child.signalCode === null) {
+        producer.child.kill("SIGKILL");
+      }
+    };
+    const stopProducer = (): void => {
+      producerStopped = true;
+      killProducer();
+    };
+    // Keep a producer failure's message (spawnGit destroys stdout with the git stderr on a
+    // nonzero exit) without letting an unobserved stream error escape.
+    let producerError = "";
+    producer.stdout.on("error", (err: unknown) => {
+      producerError ||= gitErrorMessage(err);
+    });
+    let consumer: Awaited<ReturnType<GitCache["spawnGitAsRunnerWithStdin"]>>;
+    try {
+      consumer = await this.spawnGitAsRunnerWithStdin(clonePath, ["index-pack", "--stdin"]);
+    } catch (err) {
+      killProducer();
+      await producer.exited;
+      throw fail(`index-pack could not start: ${gitErrorMessage(err)}`);
+    }
+    // Either side exiting nonzero tears the pipe down at once, so the other side sees EOF /
+    // EPIPE (or is killed) instead of waiting on a peer that is gone.
+    const stopConsumer = (): void => {
+      consumerStopped = true;
+      consumer.abort();
+    };
+    const producerExit = producer.exited.then((code) => {
+      if (code !== 0 && !producerStopped) stopConsumer();
+      return code;
+    });
+    const consumerExit = consumer.exited.then((res) => {
+      if (res.code !== 0 && !consumerStopped) stopProducer();
+      return res;
+    });
+    const piped = pipeline(producer.stdout, consumer.stdin).then(
+      () => undefined,
+      (err: unknown) => {
+        // A broken pipe does not say which side failed; tear both down without attributing it.
+        killProducer();
+        consumer.abort();
+        return err;
+      },
+    );
+    const [pipeError, producerCode, consumerResult] = await Promise.all([piped, producerExit, consumerExit]);
+    const failures: string[] = [];
+    const producerFailure = producerCode !== 0
+      ? `pack-objects exited ${producerCode}${producerError ? `: ${producerError}` : ""}`
+      : undefined;
+    const consumerFailure = consumerResult.code !== 0
+      ? `index-pack exited ${consumerResult.code}${consumerResult.stderr ? `: ${consumerResult.stderr}` : ""}`
+      : undefined;
+    // The side that failed on its own first; the side we stopped after it, marked as such.
+    if (producerFailure && !producerStopped) failures.push(producerFailure);
+    if (consumerFailure && !consumerStopped) failures.push(consumerFailure);
+    if (producerFailure && producerStopped) failures.push(`${producerFailure} (stopped after its peer failed)`);
+    if (consumerFailure && consumerStopped) failures.push(`${consumerFailure} (stopped after its peer failed)`);
+    if (failures.length > 0) throw fail(failures.join("; "));
+    if (pipeError !== undefined) throw fail(`pack stream failed: ${gitErrorMessage(pipeError)}`);
+    if (!(await cloneHasTip())) throw fail("the imported pack did not make the tip resolvable in the clone");
+    this.log.info("runner clone: imported default-tip objects", {
+      path: clonePath,
+      tip,
+      haves: present.length,
+      duration_ms: Date.now() - started,
+    });
+  }
+
+  /**
    * PRD #456 M1 (B3) — align the run's branch with the fresh default IN THE RUNNER CLONE,
    * never the worker bare. The clone is the ONLY working tree at finalize, and it is
    * RUNNER-owned, so every git op here runs runner-uid (`runGitAsRunner`) — a worker-uid op
@@ -3752,8 +3903,10 @@ export class GitCache {
    * deviation from the spec's 4-arg signature; without it a merge→rebase fallback would rebase
    * the merge commit and the S3 commit-count assertion would spuriously fire.)
    *
-   * `defaultTip`'s objects are reachable in the clone via its `--shared` alternate (the worker
-   * bare received them in `fetchDefaultTip`), so we anchor them under a fixed LOCAL ref via
+   * `defaultTip`'s objects are in the worker bare (it received them in `fetchDefaultTip`). A
+   * `--shared` (Claude) clone reaches them via its alternate; in a self-contained (Codex) clone,
+   * which has no alternate (issue #1769), the caller first imports them with
+   * {@link ensureRunnerCloneObjects}. Either way we anchor them under a fixed LOCAL ref via
    * `update-ref` (no `file://` fetch, no PAT, no protocol.file.allow concern) and merge/rebase
    * against that ref, deleting it in a `finally`.
    *
@@ -3782,7 +3935,8 @@ export class GitCache {
     const targetRef = "refs/uzi-align/target";
     try {
       // Anchor the fresh default under a local ref (objects reachable via the --shared
-      // alternate). Not under refs/heads/* so it never pollutes the branch namespace.
+      // alternate, or, in a self-contained Codex clone, already imported by
+      // ensureRunnerCloneObjects). Not under refs/heads/* so it never pollutes the branch namespace.
       await this.runGitAsRunner(clonePath, ["update-ref", targetRef, defaultTip]);
       // Rewind to the pre-align committed agent tip: clears uncommitted scratch AND undoes a
       // prior merge's commit so each strategy starts from the original agent work.
@@ -4580,12 +4734,17 @@ export class GitCache {
    * On a nonzero exit (or a spawn error) the stdout stream is DESTROYED with an Error, so a
    * consumer streaming it (the publish upload) sees the failure and the caller's best-effort
    * `.catch` fires rather than a truncated pack landing silently.
+   *
+   * `exited` (issue #1769) settles with the exit code once the child has terminated — inside a
+   * boundary only after its supervisor root has reaped — and NEVER rejects: a spawn error, a
+   * signal death or a rejected completion resolves to -1, so a caller that ignores it cannot
+   * leak an unhandled rejection.
    */
   private async spawnGit(
     cwd: string,
     args: string[],
     stdin?: string,
-  ): Promise<{ child?: ChildProcess; stdout: Readable }> {
+  ): Promise<{ child?: ChildProcess; stdout: Readable; exited: Promise<number> }> {
     const env = gitEnv();
     this.log.debug("git (spawn)", { cwd, args });
     const boundary = this.boundaryProcesses.getStore();
@@ -4611,9 +4770,14 @@ export class GitCache {
       // uncaught EPIPE; the exit status already destroys stdout with the failure.
       process.stdin?.on("error", () => undefined);
       process.stdin?.end(stdin ?? "");
-      return { stdout: process.stdout };
+      const exited = process.completed.then(({ code }) => code, () => -1);
+      return { stdout: process.stdout, exited };
     }
     const child = spawn("git", withDir(cwd, args), { env });
+    const exited = new Promise<number>((resolve) => {
+      child.once("error", () => resolve(-1));
+      child.once("close", (code) => resolve(code ?? -1));
+    });
     const stderrChunks: Buffer[] = [];
     child.stderr?.on("data", (c: Buffer) => stderrChunks.push(c));
     child.on("error", (err) => child.stdout?.destroy(err));
@@ -4629,7 +4793,7 @@ export class GitCache {
       child.stdin.on("error", () => undefined); // see the scoped branch above
       child.stdin.end(stdin ?? "");
     }
-    return { child, stdout: child.stdout as Readable };
+    return { child, stdout: child.stdout as Readable, exited };
   }
 
   /**
@@ -4668,6 +4832,72 @@ export class GitCache {
       if (typeof code === "number") (failure as { code?: number }).code = code;
       throw failure;
     }
+  }
+
+  /**
+   * issue #1769 — spawn a RUNNER-uid git in `cwd` whose stdin the caller streams (the
+   * `index-pack --stdin` consumer of {@link ensureRunnerCloneObjects}). Same env as
+   * {@link runGitAsRunner} (credential-free gitEnv pins, runner PATH/TMPDIR). Inside a boundary
+   * the child is `boundary.spawn`ed with identity `command` (the command sandbox rooted at the
+   * clone; the safety facade registers it as a `boundary_action` root and its `completed`
+   * includes that root's reap); outside, `runnerCommand` + a plain spawn. stdout is drained and
+   * stderr kept (capped) for the failure message. `exited` never rejects (-1 on a spawn error,
+   * a signal death or a rejected completion); `abort` ends the child's input and, outside a
+   * boundary, kills it, so the caller can always await `exited` to a terminal state.
+   */
+  private async spawnGitAsRunnerWithStdin(
+    cwd: string,
+    args: string[],
+  ): Promise<{ stdin: Writable; exited: Promise<{ code: number; stderr: string }>; abort: () => void }> {
+    const base = gitEnv();
+    const env: NodeJS.ProcessEnv = { ...base, PATH: runnerPath() };
+    const tmp = runnerTmpdir();
+    if (tmp) env.TMPDIR = tmp;
+    this.log.debug("git (runner uid, stdin)", { cwd, args });
+    const stderrChunks: Buffer[] = [];
+    let stderrBytes = 0;
+    const keepStderr = (c: Buffer | string): void => {
+      if (stderrBytes >= GIT_MAX_BUFFER) return;
+      const chunk = (Buffer.isBuffer(c) ? c : Buffer.from(c)).subarray(0, GIT_MAX_BUFFER - stderrBytes);
+      stderrChunks.push(chunk);
+      stderrBytes += chunk.length;
+    };
+    const stderrText = (): string => Buffer.concat(stderrChunks).toString().trim();
+    const boundary = this.boundaryProcesses.getStore();
+    if (boundary) {
+      const process = await boundary.spawn({ argv: [GIT_BIN, ...withDir(cwd, args)], cwd, env, identity: "command" });
+      if (!process.stdin) {
+        // Nothing can be streamed; still settle the root before reporting.
+        await process.completed.catch(() => undefined);
+        throw new Error("supervised git process has no stdin");
+      }
+      const stdin = process.stdin;
+      stdin.on("error", () => undefined);
+      process.stdout?.resume();
+      process.stderr?.on("data", keepStderr);
+      const exited = process.completed.then(
+        ({ code }) => ({ code, stderr: stderrText() }),
+        (error: unknown) => ({ code: -1, stderr: stderrText() || gitErrorMessage(error) }),
+      );
+      return { stdin, exited, abort: () => stdin.destroy() };
+    }
+    const wrapped = runnerCommand("git", withDir(cwd, args));
+    const child = spawn(wrapped.command, wrapped.args, { env, stdio: ["pipe", "pipe", "pipe"] });
+    child.stdin.on("error", () => undefined);
+    child.stdout.resume();
+    child.stderr.on("data", keepStderr);
+    const exited = new Promise<{ code: number; stderr: string }>((resolve) => {
+      child.once("error", (error) => resolve({ code: -1, stderr: stderrText() || gitErrorMessage(error) }));
+      child.once("close", (code) => resolve({ code: code ?? -1, stderr: stderrText() }));
+    });
+    return {
+      stdin: child.stdin,
+      exited,
+      abort: () => {
+        child.stdin.destroy();
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      },
+    };
   }
 
   /** Run git, returning the exit code (0 on success) instead of throwing. */
