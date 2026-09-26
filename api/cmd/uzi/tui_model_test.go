@@ -972,6 +972,15 @@ func TestTUIBoardCredentialCell(t *testing.T) {
 		t.Errorf("credential cell: want the meta label, got %q", s)
 	}
 
+	// Codex selects its own label and folds user-authored terminal control text.
+	codexLabel := "codex\nother"
+	codexCell := stripANSI(m.boardCredSeg(apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{
+		Harness: "codex", AnthropicSecretLabel: &meta, CodexSecretLabel: &codexLabel,
+	}}, nil))
+	if !strings.Contains(codexCell, "codex") || strings.Contains(codexCell, "meta") || strings.Contains(codexCell, "\n") || strings.Contains(codexCell, "(deleted)") {
+		t.Errorf("Codex board cell must use its sanitized snapshot only: %q", codexCell)
+	}
+
 	// No recorded credential (pre-#111 or unclaimed): a blank cell, never a guessed placeholder.
 	if s := strings.TrimSpace(stripANSI(m.boardCredSeg(apitypes.RunListItemDTO{}, nil))); s != "" {
 		t.Errorf("no-credential cell must be blank, got %q", s)
@@ -1027,6 +1036,42 @@ func TestTUIDetailLeftExitsAtBoundaryNotBefore(t *testing.T) {
 }
 
 // The credential column is GATED exactly as the web RunsList (PRD #295): the own board shows it
+// Credential counting uses secret kinds, never the Codex rate-limit account response.
+func TestTUIBoardCredentialCounts(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		kinds         []string
+		claude, codex int
+	}{
+		{"two Claude one Codex", []string{"anthropic_token", "anthropic_token", "codex_auth"}, 2, 1},
+		{"one Claude two Codex kinds", []string{"anthropic_token", "codex_auth", "openai_api_key"}, 1, 2},
+		{"one each", []string{"anthropic_token", "openai_api_key"}, 1, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &uzicli.FakeClient{}
+			for _, kind := range tc.kinds {
+				fake.Secrets = append(fake.Secrets, apitypes.SecretDTO{Kind: kind})
+			}
+			m := tuiTestModel(t, fake, "")
+			msg := m.fetchSecretsCmd()().(secretsMsg)
+			if msg.err != nil || msg.count != tc.claude || msg.codexCount != tc.codex {
+				t.Fatalf("counts=%+v, want Claude=%d Codex=%d", msg, tc.claude, tc.codex)
+			}
+			next, _ := m.Update(msg)
+			m = next.(tuiModel)
+			if m.boardShowCred() != (tc.claude > 1 || tc.codex > 1) {
+				t.Fatalf("boardShowCred=%t for counts=%+v", m.boardShowCred(), msg)
+			}
+			// Meter refreshes cannot change the credential count.
+			next, _ = m.Update(codexRateLimitsMsg{accounts: []apitypes.CodexAccountRateLimitDTO{{Aliases: []string{"meter-alias"}}}})
+			m = next.(tuiModel)
+			if m.codexCredentialCount != tc.codex {
+				t.Fatalf("meter refresh changed Codex count to %d, want %d", m.codexCredentialCount, tc.codex)
+			}
+		})
+	}
+}
+
 // only when the viewer holds more than one Anthropic token; the admin factory board always does.
 func TestTUIBoardCredentialGate(t *testing.T) {
 	meta := "meta"
@@ -1057,6 +1102,53 @@ func TestTUIBoardCredentialGate(t *testing.T) {
 	adm = drive(adm, boardRunsMsg{reqID: adm.board.waitID, admin: true, runs: runs})
 	if out := stripANSI(adm.View().Content); !strings.Contains(out, "meta") {
 		t.Errorf("admin factory board must always show the credential\n%s", out)
+	}
+
+	// Each harness gates its own row from ListSecrets, independently of meters.
+	claudeLabel, codexLabel := "claude", "codex"
+	mixed := []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "cccccccc-1111", Kind: "issue", Status: "running", IssueTitle: "Claude row", Harness: "claude", AnthropicSecretLabel: &claudeLabel, CodexSecretLabel: &codexLabel}},
+		{RunDTO: apitypes.RunDTO{ID: "dddddddd-2222", Kind: "issue", Status: "running", IssueTitle: "Codex row", Harness: "codex", AnthropicSecretLabel: &claudeLabel, CodexSecretLabel: &codexLabel}},
+	}
+	for _, tc := range []struct {
+		name        string
+		claudeCount int
+		codexCount  int
+		wantClaude  bool
+		wantCodex   bool
+	}{
+		{"one each", 1, 1, false, false},
+		{"two codex", 1, 2, false, true},
+		{"two claude", 2, 1, true, false},
+		{"two each", 2, 2, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := tuiTestModel(t, &uzicli.FakeClient{Runs: mixed}, "")
+			m = drive(m, boardRunsMsg{reqID: m.board.waitID, runs: mixed})
+			m = drive(m, secretsMsg{count: tc.claudeCount, codexCount: tc.codexCount})
+			claudeRow := stripANSI(m.boardRow(mixed[0], false, boardMarkerCols{}))
+			codexRow := stripANSI(m.boardRow(mixed[1], false, boardMarkerCols{}))
+			if got := strings.Contains(claudeRow, claudeLabel); got != tc.wantClaude {
+				t.Errorf("Claude row credential visible = %t, want %t: %q", got, tc.wantClaude, claudeRow)
+			}
+			if got := strings.Contains(codexRow, codexLabel); got != tc.wantCodex {
+				t.Errorf("Codex row credential visible = %t, want %t: %q", got, tc.wantCodex, codexRow)
+			}
+			if strings.Contains(claudeRow, codexLabel) || strings.Contains(codexRow, claudeLabel) {
+				t.Errorf("row rendered the other harness's credential: %q / %q", claudeRow, codexRow)
+			}
+		})
+	}
+	admMixed := press(t, tuiTestModel(t, &uzicli.FakeClient{}, ""), keyAdmin)
+	admMixed = drive(admMixed, boardRunsMsg{reqID: admMixed.board.waitID, admin: true, runs: mixed})
+	for _, r := range mixed {
+		row := stripANSI(admMixed.boardRow(r, false, boardMarkerCols{}))
+		if r.Harness == "codex" && !strings.Contains(row, codexLabel) {
+			t.Errorf("admin Codex row missing alias: %q", row)
+		}
+		if r.Harness == "claude" && !strings.Contains(row, claudeLabel) {
+			t.Errorf("admin Claude row missing token: %q", row)
+		}
 	}
 }
 
