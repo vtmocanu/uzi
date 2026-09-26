@@ -89,6 +89,7 @@ import {
   CapturePathMismatchError,
   ForeignCaptureBlockedError,
   PendingRecoveryCaptureError,
+  ScratchPublicationError,
 } from "./git.js";
 import {
   buildCheckEnv,
@@ -194,7 +195,7 @@ function publishSkipLabel(raw: unknown): PublishSkipLabel {
  *  was an AbortError even with no aborted signal (e.g. the client's own request timeout) — silent on
  *  the feed either way; the shutdown sink names the latter `publish_error`, since its permit did not
  *  expire — and `error` = any other throw. */
-type PublishFailClass = "no_local_tip" | "skipped" | "rejected" | "aborted" | "error";
+type PublishFailClass = "no_local_tip" | "skipped" | "rejected" | "aborted" | "scratch_publication_refused" | "error";
 
 /** issue #1597 M1: the typed result of {@link RunRunner.publishCheckpointOutcome}. Only the
  *  allowlisted skip label and the numeric HTTP status are carried — never an error message,
@@ -219,6 +220,7 @@ type ShutdownCheckpointOutcome =
   | "publish_rejected"
   | "publish_skipped"
   | "publish_error"
+  | "scratch_publication_refused"
   | "no_local_tip"
   | "bare_lock_retained"
   | "tick_process_survived";
@@ -241,6 +243,8 @@ function shutdownOutcomeOf(
       return "publish_rejected";
     case "aborted":
       return permitSignal?.aborted ? "timeout" : "publish_error";
+    case "scratch_publication_refused":
+      return "scratch_publication_refused";
     case "error":
       return "publish_error";
   }
@@ -2600,7 +2604,11 @@ export class RunRunner {
         ? err.reason
         : err instanceof TerminalReportError
           ? err.reason
-          : errMessage(err);
+          : err instanceof ScratchPublicationError
+            ? err.message === "scratch_publication_refused: cannot verify fresh remote floor"
+              ? "scratch_publication_refused: cannot verify fresh remote floor"
+              : "scratch_publication_refused: candidate history cannot be published"
+            : errMessage(err);
     const reason = redactText(rawReason);
     // PRD #69 M7a: derive the TRUSTED failure class from the RAW reason (before
     // redaction) so a fatal pre-start failure (provisioning / no token) carries a
@@ -3846,15 +3854,21 @@ export class RunRunner {
     const finalizeBarePath = barePath;
     const pushToOrigin = () =>
       withForgeRetry(
-        () =>
-          this.git.pushBranch(
+        async () => {
+          await this.git.scratchPublicationPreflight(finalizeBarePath, result.branch);
+          await this.git.pushBranch(
             finalizeBarePath,
             result.branch,
             claim.secrets.forge_pat,
             claim.repo.clone_url,
             claim.secrets.forge_username,
-          ),
-        { log: runLog, signal: boundarySignal },
+          );
+        },
+        {
+          log: runLog,
+          signal: boundarySignal,
+          classify: (error) => error instanceof ScratchPublicationError ? "permanent" : classifyForgeError(error),
+        },
       );
 
     // PRD #1416 (MR-rework, finding 1): a bridge NEWLY makes a rewritten branch pushable (a plain
@@ -4213,6 +4227,7 @@ export class RunRunner {
                 await fetchAndPush();
                 return false;
               } catch (e) {
+                if (e instanceof ScratchPublicationError) throw e;
                 // PRD #974 M2: an aligned push rejected by GitHub Push Protection (GH013) is a
                 // secret the pre-push gitleaks scan missed — route it to the typed
                 // push_secret_blocked fail (NO preserved diff: it may carry the detected secret)
@@ -4395,6 +4410,7 @@ export class RunRunner {
         }
       }
     } catch (e) {
+      if (e instanceof ScratchPublicationError) throw e;
       // PRD #1416 M4 (SC3): a bridge that could not be built/validated at a finalize push site was
       // thrown as HistoryRewrittenError; type it history_rewritten — never the generic catch
       // (agent_failure), never finalize_base_align_conflict (the align arms call failBaseAlignConflict
@@ -4467,6 +4483,7 @@ export class RunRunner {
       try {
         await pushToOrigin();
       } catch (e) {
+        if (e instanceof ScratchPublicationError) throw e;
         // PRD #974 M2 backstop: a GitHub Push Protection (GH013) rejection here means a secret
         // the pre-push gitleaks scan missed — route it to the typed push_secret_blocked fail
         // (NO preserved diff: it may carry the secret) rather than the generic catch. Any OTHER
@@ -6995,6 +7012,10 @@ export class RunRunner {
       });
       return { kind: "unknown" };
     }
+    // Inspect both the source and candidate history before either custody mutation.
+    // B includes H and the floors, so this also covers every bridge parent.
+    await this.git.scratchPublicationPreflight(barePath, branch, H);
+    await this.git.scratchPublicationPreflight(barePath, branch, bridge);
     // Adopt B: advance the bare tracking ref (worker-uid) and the checkpoint floor C.
     try {
       await this.git.updateTrackingRef(barePath, branch, bridge);
@@ -7042,6 +7063,10 @@ export class RunRunner {
         });
       }
     } catch (e) {
+      if (e instanceof ScratchPublicationError) {
+        this.reportPublishOutcome(flight, "scratch_publication_refused", "checkpoint publish failed: scratch_publication_refused");
+        return;
+      }
       // Never let a bridge failure undo a park/shutdown/capture (D4).
       runLog.warn("PRD #1416 M3: park/capture bridge threw; continuing best-effort", {
         run_id: flight.runId,
@@ -7675,6 +7700,10 @@ export class RunRunner {
       );
       return { published: false, reason: "rejected", httpStatus: res.httpStatus };
     } catch (e) {
+      if (e instanceof ScratchPublicationError) {
+        this.reportPublishOutcome(flight, "scratch_publication_refused", "checkpoint publish failed: scratch_publication_refused");
+        return { published: false, reason: "scratch_publication_refused" };
+      }
       // issue #1086 (F2): a throw is AMBIGUOUS too, but only after the pack tip was obtained — a
       // throw DURING checkpointPack leaves packedTip undefined and records nothing.
       if (packedTip !== undefined) flight.lastAttemptedCheckpointRefTip = packedTip;

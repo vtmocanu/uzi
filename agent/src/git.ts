@@ -866,6 +866,7 @@ export class GitCache {
   ): Promise<void> {
     const remoteRef = `refs/heads/${branch}`;
     const scratchRef = `refs/uzi-publication-floor/${branch}`;
+    let forwardAdvance = false;
     try {
       const listed = (await this.runGit(barePath, ["ls-remote", "origin", remoteRef], pat, scope, username)).trim();
       if (!listed) {
@@ -878,14 +879,28 @@ export class GitCache {
       const fresh = await this.revParse(barePath, `${scratchRef}^{commit}`);
       if (fresh !== match[1]) throw new Error("remote branch changed during refresh");
       const prior = await this.revParse(barePath, `refs/remotes/origin/${branch}^{commit}`);
-      if (prior && !(await this.isAncestorRef(barePath, prior, fresh))) throw new Error("remote branch rewound");
-      if (!(await this.isAncestorRef(barePath, fresh, candidate))) throw new ScratchPublicationError("non-fast-forward remote floor");
+      if (!prior || (await this.ancestry(barePath, prior, fresh)) !== "ancestor") {
+        throw new Error("remote branch floor is unavailable or rewound");
+      }
+      const freshToCandidate = await this.ancestry(barePath, fresh, candidate);
+      if (freshToCandidate === "ancestor") return;
+      if (freshToCandidate !== "divergent") throw new Error("remote branch ancestry is unavailable");
+      // Only a strictly newer, scratch-free remote tip outside a candidate that
+      // still descends from the old floor is a concurrent forward advance.
+      if (prior === fresh || (await this.ancestry(barePath, prior, candidate)) !== "ancestor") {
+        throw new Error("remote branch and candidate diverged");
+      }
+      await this.scratchPublicationPreflight(barePath, branch, fresh);
+      forwardAdvance = true;
     } catch (cause) {
       if (cause instanceof ScratchPublicationError) throw cause;
       throw new ScratchPublicationError("cannot verify fresh remote floor", cause);
     } finally {
       await this.runGit(barePath, ["update-ref", "-d", scratchRef]).catch(() => undefined);
     }
+    // Let the existing mr_rework non-fast-forward handler verify the moved branch
+    // and report branch_moved; this is not a scratch/range refusal.
+    if (forwardAdvance) throw new Error("non-fast-forward: remote branch advanced");
   }
 
   /** The default branch's short name (e.g. `main`), for an MR target. */

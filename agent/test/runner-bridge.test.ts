@@ -19,6 +19,7 @@ import {
   runner,
 } from "./runner-harness.js";
 import { RunRunner } from "../src/runner.js";
+import { ScratchPublicationError } from "../src/git.js";
 
 installHarness();
 
@@ -143,6 +144,95 @@ const bridgeStatusLines = (runId: string): string[] =>
       (m) => m.kind === "status" && String(m.payload.text).includes("contains a history bridge"),
     )
     .map((m) => String(m.payload.text));
+
+describe("RunRunner — scratch publication refusal", () => {
+  for (const aligned of [false, true]) {
+    it(`${aligned ? "align" : "normal"} finalize refuses a scratch-bearing H before bridge custody or push`, async () => {
+      if (aligned) commitToOriginMain({ ".github/workflows/ci.yml": CI_V1 }, "seed workflows");
+      const branch = `feature/scratch-${aligned ? "align" : "plain"}`;
+      const P = publishBranch(branch);
+      const { gitlab } = fakeGitlab();
+      const { github } = fakeGitHub();
+      let moves = 0;
+      let pushes = 0;
+      const originalMove = git.updateTrackingRef.bind(git);
+      const originalPush = git.pushBranch.bind(git);
+      git.updateTrackingRef = (async (...args: Parameters<typeof git.updateTrackingRef>) => {
+        moves++;
+        return originalMove(...args);
+      }) as typeof git.updateTrackingRef;
+      git.pushBranch = (async (...args: Parameters<typeof git.pushBranch>) => {
+        pushes++;
+        return originalPush(...args);
+      }) as typeof git.pushBranch;
+      const executor: Executor = {
+        run: async (ctx) => {
+          fs.mkdirSync(path.join(ctx.worktreePath, ".uzi", "scratch"), { recursive: true });
+          fs.writeFileSync(path.join(ctx.worktreePath, ".uzi", "scratch", "note"), "local only\n");
+          gitIn(ctx.worktreePath, ["add", "-f", ".uzi/scratch/note"]);
+          gitIn(ctx.worktreePath, [...IDENT, "commit", "-m", "scratch in history"]);
+          if (aligned) commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "main advances");
+          return { branch: ctx.branch };
+        },
+      };
+      const claim = aligned ? githubTaskClaim(branch) : taskClaim(branch);
+      try {
+        await (aligned ? githubRunner(github, executor) : runner(executor, gitlab)).execute(claim);
+      } finally {
+        git.updateTrackingRef = originalMove;
+        git.pushBranch = originalPush;
+      }
+      assert.equal(gitIn(fx.originPath, ["rev-parse", branch]), P);
+      assert.equal(moves, 0, "bridge never moved custody");
+      assert.equal(pushes, 0, "no authenticated push attempted");
+      const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
+      assert.match(failed?.failure_reason ?? "", /^scratch_publication_refused:/);
+      assert.notEqual(failed?.fail_origin, "history_rewritten");
+      assert.notEqual(failed?.branch_moved, true);
+    });
+  }
+});
+
+describe("RunRunner — bridge candidate preflight", () => {
+  it("refuses B without advancing tracking custody or attempting a push", async () => {
+    const branch = "feature/scratch-bridge-candidate";
+    const P = publishBranch(branch);
+    const { gitlab } = fakeGitlab();
+    const obs: { H?: string } = {};
+    const originalPreflight = git.scratchPublicationPreflight.bind(git);
+    const originalMove = git.updateTrackingRef.bind(git);
+    const originalPush = git.pushBranch.bind(git);
+    let moves = 0;
+    let pushes = 0;
+    git.scratchPublicationPreflight = (async (bare, name, candidate) => {
+      if (candidate && obs.H && candidate !== obs.H) {
+        throw new ScratchPublicationError("candidate history contains scratch");
+      }
+      return originalPreflight(bare, name, candidate);
+    }) as typeof git.scratchPublicationPreflight;
+    git.updateTrackingRef = (async (...args: Parameters<typeof git.updateTrackingRef>) => {
+      moves++;
+      return originalMove(...args);
+    }) as typeof git.updateTrackingRef;
+    git.pushBranch = (async (...args: Parameters<typeof git.pushBranch>) => {
+      pushes++;
+      return originalPush(...args);
+    }) as typeof git.pushBranch;
+    const claim = taskClaim(branch);
+    try {
+      await runner(rewritingExecutor(obs), gitlab).execute(claim);
+    } finally {
+      git.scratchPublicationPreflight = originalPreflight;
+      git.updateTrackingRef = originalMove;
+      git.pushBranch = originalPush;
+    }
+    assert.equal(gitIn(fx.originPath, ["rev-parse", branch]), P);
+    assert.equal(moves, 0);
+    assert.equal(pushes, 0);
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
+    assert.match(failed?.failure_reason ?? "", /^scratch_publication_refused:/);
+  });
+});
 
 describe("RunRunner — finalize ancestry bridge (PRD #1416 M3)", () => {
   it("(plain path) a rewritten branch with no workflow drift is bridged, B is pushed, the run completes", async () => {
@@ -349,6 +439,33 @@ describe("RunRunner — a concurrent remote advance is not a rewrite (PRD #1416 
     );
     assert.ok(branchMoved, "the concurrent advance is reported branch_moved (never history_rewritten)");
     assert.deepStrictEqual(bridgeStatusLines(claim.run_id), [], "no bridge on a concurrent advance");
+  });
+
+  it("refuses a concurrent remote advance whose new history contains scratch", async () => {
+    const { gitlab } = fakeGitlab();
+    const branch = "agent/issue-778";
+    publishBranch(branch);
+    const exec: Executor = {
+      run: async (ctx) => {
+        fs.writeFileSync(path.join(ctx.worktreePath, "rework.ts"), "1\n");
+        gitIn(ctx.worktreePath, ["add", "rework.ts"]);
+        gitIn(ctx.worktreePath, [...IDENT, "commit", "-m", "rework"]);
+        gitIn(fx.originPath, ["checkout", branch]);
+        fs.mkdirSync(path.join(fx.originPath, ".uzi", "scratch"), { recursive: true });
+        fs.writeFileSync(path.join(fx.originPath, ".uzi", "scratch", "note"), "scratch\n");
+        gitIn(fx.originPath, ["add", "-f", ".uzi/scratch/note"]);
+        gitIn(fx.originPath, [...IDENT, "commit", "-m", "concurrent scratch writer"]);
+        gitIn(fx.originPath, ["checkout", "main"]);
+        return { branch: ctx.branch };
+      },
+    };
+    const claim = taskClaim(branch, { kind: "mr_rework", open_mr: true });
+    await runner(exec, gitlab).execute(claim);
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
+    assert.match(failed?.failure_reason ?? "", /^scratch_publication_refused:/);
+    assert.notEqual(failed?.branch_moved, true);
+    assert.equal(gitIn(fx.originPath, ["show", `${branch}:.uzi/scratch/note`]), "scratch");
+    assert.deepStrictEqual(bridgeStatusLines(claim.run_id), []);
   });
 });
 
