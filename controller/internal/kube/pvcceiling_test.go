@@ -26,8 +26,8 @@ func TestValidatePVCCeilings(t *testing.T) {
 			cfg:  RenderConfig{},
 		},
 		{
-			name: "shipped ceilings: everything fits exactly",
-			cfg:  RenderConfig{MaxPVCStorage: "20Gi", DockerMaxPVCStorage: "20Gi"},
+			name: "shipped ceilings: everything fits (l's 25Gi /data exactly)",
+			cfg:  RenderConfig{MaxPVCStorage: "25Gi", DockerMaxPVCStorage: "25Gi"},
 		},
 		{
 			name:    "restricted ceiling below nixSize",
@@ -35,8 +35,8 @@ func TestValidatePVCCeilings(t *testing.T) {
 			wantErr: []string{"restricted tier", "-nix", "20Gi", "UZI_WORKER_MAX_PVC_STORAGE", "10Gi"},
 		},
 		{
-			name:    "restricted ceiling below the largest preset's DataSize",
-			cfg:     RenderConfig{MaxPVCStorage: "15Gi"},
+			name:    "restricted ceiling below the largest preset's DataSize (the pre-#1757 20Gi)",
+			cfg:     RenderConfig{MaxPVCStorage: "20Gi"},
 			wantErr: []string{"restricted tier", "-data", `"l"`},
 		},
 		{
@@ -58,7 +58,7 @@ func TestValidatePVCCeilings(t *testing.T) {
 		},
 		{
 			name: "the two tiers are INDEPENDENT: a lowered docker ceiling does not implicate the restricted tier",
-			cfg:  RenderConfig{MaxPVCStorage: "20Gi", DockerMaxPVCStorage: "10Gi"},
+			cfg:  RenderConfig{MaxPVCStorage: "25Gi", DockerMaxPVCStorage: "10Gi"},
 			// dind-data is docker-only, but /nix and /data are claimed in BOTH tiers, so
 			// a 10Gi docker ceiling must implicate them for the DOCKER tier and leave the
 			// restricted tier alone.
@@ -89,7 +89,7 @@ func TestValidatePVCCeilings(t *testing.T) {
 // The independence claim above, asserted directly rather than inferred from a
 // substring: a lowered DOCKER ceiling must not produce a restricted-tier complaint.
 func TestValidatePVCCeilingsKeepsTheTiersSeparate(t *testing.T) {
-	err := ValidatePVCCeilings(RenderConfig{MaxPVCStorage: "20Gi", DockerMaxPVCStorage: "10Gi"}, testResolver(t))
+	err := ValidatePVCCeilings(RenderConfig{MaxPVCStorage: "25Gi", DockerMaxPVCStorage: "10Gi"}, testResolver(t))
 	if err == nil {
 		t.Fatal("a 10Gi docker ceiling must be rejected: /nix alone is 20Gi")
 	}

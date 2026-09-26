@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **Hosted workers: larger `l` data volume and a higher docker-tier ephemeral-storage request ([#1757](https://github.com/vtmocanu/uzi/issues/1757)).**
+  The `l` preset's `/data` PVC grows from 20Gi to 25Gi, and a docker-tier worker now requests 6Gi of ephemeral storage instead of 4Gi (`workers.docker.ephemeralRequest`), which covers the Codex command cache and ranks a busy worker later under node disk pressure. The chart raises the matching ceilings: `limitRange.maxPVCStorage` 20Gi to 25Gi on both tiers, and `quota.requestsStorage` to 900Gi (restricted) and 650Gi (docker). A cluster that overrides any of these keys must keep them at or above the new values, or new `l` workers are refused at admission. Existing workers keep their current PVCs (grow them in place where the StorageClass allows volume expansion). Docker workers roll once for the new request, and a 6Gi request can leave a worker Pending on a node with little free root disk. A request never stops an eviction on a node whose root disk is too small; size worker nodes' root disks for the fleet.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added

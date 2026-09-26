@@ -349,7 +349,7 @@ func TestRenderedPriorityClassName(t *testing.T) {
 }
 
 func TestPVCsSizeFromThePresetAndNixIsFlat(t *testing.T) {
-	for _, tc := range []struct{ size, data string }{{"s", "5Gi"}, {"m", "10Gi"}, {"l", "20Gi"}} {
+	for _, tc := range []struct{ size, data string }{{"s", "5Gi"}, {"m", "10Gi"}, {"l", "25Gi"}} {
 		pvcs := RenderPVCs(testConfig(), desired("abc"), testSpec(t, "base", tc.size))
 		if len(pvcs) != 2 {
 			t.Fatalf("%d pvcs, want 2", len(pvcs))
@@ -440,8 +440,8 @@ func TestWorkerDeclaresTheWholeEphemeralBudgetAndNoOtherContainerDoes(t *testing
 		want string
 	}{
 		{"plain", testConfig(), desired("abc"), "512Mi"},
-		{"docker rootless", dockerTestConfig(), desiredDocker("abc"), "4Gi"},
-		{"docker non-rootless", dockerTestConfigNonRootless(), desiredDocker("abc"), "4Gi"},
+		{"docker rootless", dockerTestConfig(), desiredDocker("abc"), "6Gi"},
+		{"docker non-rootless", dockerTestConfigNonRootless(), desiredDocker("abc"), "6Gi"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := RenderDeployment(tc.cfg, tc.w, testSpec(t, "base", "m")).Spec.Template.Spec
@@ -566,8 +566,8 @@ func TestEphemeralRequestOverridesArePerTierAndRollOnlyThatTier(t *testing.T) {
 	// A partial override leaves the other tier on its default, in both directions.
 	plainOnly := dockerTestConfig()
 	plainOnly.EphemeralRequest = "1Gi"
-	if got := ephemeralOf(plainOnly, desiredDocker("abc")); got != "4Gi" {
-		t.Errorf("docker request with only the plain override set = %s, want the 4Gi default", got)
+	if got := ephemeralOf(plainOnly, desiredDocker("abc")); got != "6Gi" {
+		t.Errorf("docker request with only the plain override set = %s, want the 6Gi default", got)
 	}
 	dockerOnly := dockerTestConfig()
 	dockerOnly.DockerEphemeralRequest = "8Gi"

@@ -673,7 +673,7 @@ workers:
   #
   # CPU and memory track the DEFAULT `m` size (issue #1341 raised m's request to 4Gi),
   # not the worst case: 20 workers x 500m = 10 CPU and 20 x 4Gi = 80Gi requested. STORAGE
-  # instead tracks the WORST-CASE `l` size — 20 x (20Gi data + 20Gi nix) = 800Gi of PVC —
+  # instead tracks the WORST-CASE `l` size — 20 x (25Gi data + 20Gi nix) = 900Gi of PVC —
   # and is the binding constraint, not CPU or memory. Raising m's memory request WITHOUT
   # raising this key caps the admissible fleet below `deployments`: the next worker is
   # QUOTA-refused at admission ("provisions and never appears"), a failure no repo test
@@ -683,8 +683,8 @@ workers:
   # WORST CASE MEANS `l`, NOT `m`, AND THAT IS THE WHOLE POINT OF THE NUMBER. Nothing
   # scopes a size to a tier — preset.SizeNames() is global and render.go feeds
   # spec.Size.DataSize to both tiers — so any of these 20 workers may be an `l` with a
-  # 20Gi /data. Sizing on `m` (10Gi) gave 600Gi, which caps at 15 `l` workers against
-  # a tier advertising 20: the 16th is refused with a QUOTA error rather than a
+  # 25Gi /data. Sizing on `m` (10Gi) gave 600Gi, which caps at 13 `l` workers against
+  # a tier advertising 20: the 14th is refused with a QUOTA error rather than a
   # scheduling one, and no test in this repo can see it. If `l` should not be
   # available here, the fix is to scope it off the tier, not to under-budget.
   #
@@ -713,7 +713,7 @@ workers:
     enabled: true
     requestsCPU: "10"
     requestsMemory: 80Gi
-    requestsStorage: 800Gi
+    requestsStorage: 900Gi
     persistentVolumeClaims: "40"
     # READ BY A CONTROLLER TEST, not merely documented here. This is the restricted
     # tier's fleet size, and TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes
@@ -727,16 +727,15 @@ workers:
   #
   # `max` MUST stay >= the LARGEST preset's limits (l = 4 CPU / 12Gi) or that preset
   # stops being admissible — which would surface as a worker that provisions and never
-  # appears. maxPVCStorage likewise >= l's /data (20Gi).
+  # appears. maxPVCStorage likewise >= l's /data (25Gi).
   #
-  # maxPVCStorage IS AT ITS CEILING ON EVERY CLAIMANT TODAY: nixSize is 20Gi and `l`'s
-  # DataSize is 20Gi, so LOWERING this value makes every worker's claim inadmissible and
+  # maxPVCStorage IS AT ITS CEILING TODAY: `l`'s DataSize is 25Gi (nixSize is 20Gi), so
+  # LOWERING this value makes `l` workers' claims inadmissible and
   # nothing renders red — the rejection happens at admission, in the cluster, and the
   # worker simply never appears. The two guards that catch it are
   # TestPresetPVCSizesFitTheChartsLimitRangeMax (controller/internal/preset, for the two
-  # sizes compiled into the controller, which carries this number as a constant and must
-  # be edited with it) and the chart's own worker-invariants.yaml (for chart-supplied
-  # PVC sizes). Raise quota.requestsStorage above whenever you raise this.
+  # sizes compiled into the controller; it reads this value out of this file) and the
+  # chart's own worker-invariants.yaml (for chart-supplied PVC sizes). Raise quota.requestsStorage above whenever you raise this.
   limitRange:
     enabled: true
     default:
@@ -748,7 +747,7 @@ workers:
     max:
       cpu: "4"
       memory: 12Gi
-    maxPVCStorage: 20Gi
+    maxPVCStorage: 25Gi
   # --- the docker-capable worker tier (PRD #83 M3, PRD #89) ---------------------
   #
   # A SECOND, DEDICATED namespace running `pod-security.kubernetes.io/enforce:
@@ -852,7 +851,7 @@ workers:
     # Sized for the 10 workers `deployments` advertises. MEMORY tracks the DEFAULT `m`
     # size plus the DinD sidecar (issue #1341 raised m's request to 4Gi): 10 x (4Gi worker
     # + ~256Mi sidecar request) ~= 42.5Gi, rounded up to 48Gi for headroom. STORAGE tracks
-    # THREE PVCs each: 10 x (20Gi data + 20Gi nix + 20Gi dind) = 600Gi, and 10 x 3 = 30
+    # THREE PVCs each: 10 x (25Gi data + 20Gi nix + 20Gi dind) = 650Gi, and 10 x 3 = 30
     # claims. The data term is `l`'s, the worst case. STORAGE is the binding constraint
     # here too — and it already was before M-a: at 140Gi / 20 claims this tier held 3 `l`
     # workers against the 10 it advertises, so the triple was never self-consistent. As on
@@ -864,7 +863,7 @@ workers:
       enabled: true
       requestsCPU: "8"
       requestsMemory: 48Gi
-      requestsStorage: 600Gi
+      requestsStorage: 650Gi
       # BOTH CLAUSES OF WHAT THIS COMMENT USED TO SAY WERE FALSE, and issue #224 M-a
       # falsified the first of them a second time over. It read: "emptyDir dind data
       # roots land on node ephemeral storage; bound it so a runaway image pull cannot
@@ -889,8 +888,8 @@ workers:
       # READ BY A CONTROLLER TEST — see the restricted tier's `deployments` above.
       # TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes parses this value to
       # check a full fleet's ephemeral-storage requests against the node pool, and
-      # docker workers are the expensive half (4Gi each against the plain tier's
-      # 512Mi). Raising this to 20 makes a full fleet need 90 GiB against a 70.2 GiB
+      # docker workers are the expensive half (6Gi each against the plain tier's
+      # 512Mi). Raising this to 20 makes a full fleet need 130 GiB against a 70.2 GiB
       # pool, and that test is what says so.
       deployments: "10"
     # The backstop, never the source (the controller renders explicit requests+limits
@@ -908,15 +907,16 @@ workers:
       max:
         cpu: "4"
         memory: 12Gi
-      # THREE claimants sit exactly on this ceiling: dindDataSize below, nixSize (20Gi)
-      # and `l`'s DataSize (20Gi). Raising any of them without raising this makes that
-      # claim inadmissible, and nothing renders red — the LimitRange rejects it at
-      # admission and the worker provisions and never appears. dindDataSize is guarded
-      # against this value in worker-invariants.yaml; the other two are Go constants a
-      # chart cannot read and are guarded by TestPresetPVCSizesFitTheChartsLimitRangeMax
-      # (controller/internal/preset), which carries this number as a constant and must be
-      # edited alongside it. Raise quota.requestsStorage above whenever you raise this.
-      maxPVCStorage: 20Gi
+      # THREE claimants sit at or under this ceiling: `l`'s DataSize (25Gi) exactly,
+      # dindDataSize below and nixSize (20Gi each). Raising any of them past it without
+      # raising this makes that claim inadmissible, and nothing renders red — the
+      # LimitRange rejects it at admission and the worker provisions and never appears.
+      # dindDataSize is guarded against this value in worker-invariants.yaml; the other
+      # two are Go constants a chart cannot read and are guarded by
+      # TestPresetPVCSizesFitTheChartsLimitRangeMax (controller/internal/preset), which
+      # reads this value out of this file. Raise quota.requestsStorage above whenever you
+      # raise this.
+      maxPVCStorage: 25Gi
     # The DinD sidecar's resource requests + limits (PRD #89 0.8.1). The controller renders
     # the sidecar with these (flattened to UZI_WORKER_DIND_{REQUEST,LIMIT}_{CPU,MEMORY}).
     # The default (250m/256Mi req, 2/2Gi lim) is enough for `docker`/compose that pulls
@@ -942,9 +942,9 @@ workers:
     # looking re-claim. On a PVC the daemon just runs out of room: the docker step
     # fails with ENOSPC, the pod lives, the tree lives.
     #
-    # 20Gi is also the CEILING, not just the default: limitRange.maxPVCStorage above
-    # is 20Gi and the limitranger validates PVC creates, so a larger value is rejected
-    # at admission. Raise both together, and raise quota.requestsStorage with them.
+    # The CEILING is limitRange.maxPVCStorage above (25Gi, set by `l`'s /data): the
+    # limitranger validates PVC creates, so a larger value is rejected at admission.
+    # Raise both together, and raise quota.requestsStorage with them.
     # worker-invariants.yaml refuses to render the mismatched pair, so this is a
     # `helm install` error rather than a worker that provisions and never appears.
     #
@@ -973,14 +973,16 @@ workers:
     # #1598 every worker, plain or docker, also carries the worker-only codex-cmd-cache
     # emptyDir (a run's Codex command build cache), which counts toward this request too
     # regardless of tier. uzi's own repo is a ~170 MiB runner clone before a single
-    # dependency install; 4Gi covers roughly two concurrent heavy runs.
+    # dependency install; 6Gi covers roughly two concurrent heavy runs plus
+    # codex-cmd-cache.
     #
-    # It is 4Gi rather than the larger figure an emptyDir-based design needed because
-    # dindDataSize above moved the daemon's image cache to a PVC, which was ~99% of
-    # the measured footprint. Re-derive what is left on ephemeral storage before
-    # raising it — that re-derivation must now also account for codex-cmd-cache; see
-    # adr/1598-codex-command-storage.md (the hosted-worker measurement is pending).
-    ephemeralRequest: 4Gi
+    # Issue #1757 raised it from 4Gi to 6Gi for the codex-cmd-cache emptyDir and a
+    # lower eviction rank under node disk pressure. The image cache stays off this
+    # budget (dindDataSize above moved it to a PVC; it was ~99% of the measured
+    # footprint). A request only ranks and places the pod: it cannot stop an eviction
+    # on a node whose root disk is itself too small. Re-derive what is left on
+    # ephemeral storage before raising it again; see adr/1598-codex-command-storage.md.
+    ephemeralRequest: 6Gi
   # The CNI-INDEPENDENT floor: default-deny both directions, plus the two in-cluster
   # destinations an FQDN rule structurally cannot express (AntreaProxy rewrites a
   # ClusterIP before policy enforcement, so FQDN cannot match a Service).
