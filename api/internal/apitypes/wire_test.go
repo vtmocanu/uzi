@@ -739,7 +739,7 @@ func TestSecretDTOTags(t *testing.T) {
 	// field — the pin is here so a future field addition that leaks the secret trips
 	// this test.
 	assertTags(t, "SecretDTO", SecretDTO{},
-		"id", "kind", "label", "is_default",
+		"id", "kind", "label", "is_default", "enabled", "disabled_at",
 		// PRD #111 M2: the auto-selection pool opt-in. A flag the owner set, not a
 		// value — it names no credential and reveals nothing about one.
 		"auto_eligible",

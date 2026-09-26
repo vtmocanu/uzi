@@ -268,11 +268,9 @@ func (h *Handler) PutAnthropicToken(w http.ResponseWriter, r *http.Request) {
 // DeleteAnthropicToken removes the current user's DEFAULT Anthropic token (PRD #104
 // D14 compatibility alias — deprecated in favor of the id-keyed DELETE below).
 //
-// It 409s for a MULTI-TOKEN user: with several tokens, "delete the default"
-// contradicts D6 (the default cannot be deleted while others exist), so a
-// multi-token user must delete by id. That breaks this route's former
-// unconditional-204 contract, deliberately (D14/R5). A single-token user's delete
-// returns them to the token-less state; a token-less user is the idempotent 204.
+// It 409s when another enabled token exists: deleting the default then
+// would leave an enabled token without a default. That breaks this route's former
+// unconditional-204 contract (D14/R5). A token-less user gets an idempotent 204.
 // Runs under the mutation lock so the count-then-delete cannot race a concurrent
 // create into deleting-the-default-while-a-second-token-lands.
 func (h *Handler) DeleteAnthropicToken(w http.ResponseWriter, r *http.Request) {
@@ -294,17 +292,17 @@ func (h *Handler) DeleteAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		if gerr != nil {
 			return gerr
 		}
-		n, cerr := q.CountUserSecretsForKind(r.Context(), store.CountUserSecretsForKindParams{
+		n, cerr := q.CountEnabledSecretSlot(r.Context(), store.CountEnabledSecretSlotParams{
 			UserID: user.ID, Kind: store.KindAnthropicToken,
 		})
 		if cerr != nil {
 			return cerr
 		}
 		if n > 1 {
-			multiToken = true // 409: a multi-token user deletes by id (D14)
+			multiToken = true // 409: another enabled token needs a default (D14)
 			return nil
 		}
-		// The sole token (which is the default). Its gauge row goes with it via the
+		// The last enabled token (which is the default). Its gauge row goes via the
 		// ON DELETE CASCADE (M5); no DeleteRateLimits call needed.
 		if _, derr := q.DeleteUserSecret(r.Context(), store.DeleteUserSecretParams{
 			ID: secretID, UserID: user.ID,
@@ -321,7 +319,7 @@ func (h *Handler) DeleteAnthropicToken(w http.ResponseWriter, r *http.Request) {
 	}
 	if multiToken {
 		httpx.Error(w, http.StatusConflict,
-			"you have multiple tokens; delete a specific one by id (DELETE /api/me/secrets/anthropic_token/{id})")
+			"another enabled token exists; delete a specific one by id (DELETE /api/me/secrets/anthropic_token/{id})")
 		return
 	}
 	if deleted && h.usagePoker != nil {
@@ -668,9 +666,9 @@ func (h *Handler) PatchAnthropicTokenAutoEligible(w http.ResponseWriter, r *http
 }
 
 // DeleteAnthropicTokenByID deletes ONE of the user's tokens by id (PRD #104 M2).
-// D6: the default may NOT be deleted while other tokens exist — promote another
-// first (409). Deleting the LAST token (even though it is the default) is allowed
-// and returns the user to the token-less state. D5: workers/judge bound to the
+// D6: the default may NOT be deleted while other enabled tokens exist — promote
+// another first (409). Deleting the last enabled token is allowed.
+// D5: workers/judge bound to the
 // deleted token fall back to their default automatically via the ON DELETE SET NULL
 // FKs, and the token's rate-limit gauge row is dropped by the ON DELETE CASCADE
 // (PRD #104 M5) — no app-level cleanup needed.
@@ -698,16 +696,15 @@ func (h *Handler) DeleteAnthropicTokenByID(w http.ResponseWriter, r *http.Reques
 		}
 		found = true
 		if cur.IsDefault {
-			n, cerr := q.CountUserSecretsForKind(r.Context(), store.CountUserSecretsForKindParams{
+			n, cerr := q.CountEnabledSecretSlot(r.Context(), store.CountEnabledSecretSlotParams{
 				UserID: user.ID, Kind: store.KindAnthropicToken,
 			})
 			if cerr != nil {
 				return cerr
 			}
-			// The default can be deleted only when it is the LAST token; otherwise the
-			// user would be left with tokens and no default. Under the lock this count is
-			// stable — no concurrent create can slip a second token in after it (D12).
-			if n > 1 {
+			// The default can be deleted only when no other enabled token remains.
+			// Under the lock this count is stable against concurrent creates (D12).
+			if n > 1 || (cur.DisabledAt.Valid && n > 0) {
 				refusedDefault = true
 				return nil
 			}
@@ -726,7 +723,7 @@ func (h *Handler) DeleteAnthropicTokenByID(w http.ResponseWriter, r *http.Reques
 	}
 	if refusedDefault {
 		httpx.Error(w, http.StatusConflict,
-			"cannot delete the default token while other tokens exist; set another token as default first")
+			"cannot delete the default token while other enabled tokens exist; set another token as default first")
 		return
 	}
 	if h.usagePoker != nil {

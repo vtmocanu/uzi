@@ -31,6 +31,7 @@ type codexSecretRow struct {
 	label        string
 	isDefault    bool
 	autoEligible bool
+	disabledAt   pgtype.Timestamptz
 	created      pgtype.Timestamptz
 	updated      pgtype.Timestamptz
 }
@@ -121,7 +122,7 @@ func scanSecretMeta(s *codexSecretRow) func(dest ...any) error {
 	}
 }
 
-// scanForUpdate fills GetUserSecretForUpdate's 5-column shape.
+// scanForUpdate fills GetUserSecretForUpdate's 7-column shape.
 func scanForUpdate(s *codexSecretRow) func(dest ...any) error {
 	return func(dest ...any) error {
 		*dest[0].(*uuid.UUID) = s.id
@@ -129,6 +130,8 @@ func scanForUpdate(s *codexSecretRow) func(dest ...any) error {
 		*dest[2].(*string) = s.label
 		*dest[3].(*bool) = s.isDefault
 		*dest[4].(*bool) = s.autoEligible
+		*dest[5].(*pgtype.Timestamptz) = s.disabledAt
+		*dest[6].(*int64) = 0
 		return nil
 	}
 }
@@ -180,7 +183,7 @@ func (f *fakeCodexDB) Exec(_ context.Context, sql string, args ...any) (pgconn.C
 func (f *fakeCodexDB) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
 	scans := []func(dest ...any) error{}
 	switch {
-	case strings.Contains(sql, "name: ListUserSecretsAll"):
+	case strings.Contains(sql, "name: ListSecretEnablement"):
 		for _, id := range f.order {
 			scans = append(scans, scanListAllRow(f.secrets[id]))
 		}
@@ -195,8 +198,17 @@ func (f *fakeCodexDB) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, 
 	return &fakeCodexRows{scans: scans}, nil
 }
 
-// scanListAllRow fills ListUserSecretsAll's 7-column shape.
-func scanListAllRow(s *codexSecretRow) func(dest ...any) error { return scanSecretMeta(s) }
+// scanListAllRow fills ListSecretEnablement's 9-column shape.
+func scanListAllRow(s *codexSecretRow) func(dest ...any) error {
+	return func(dest ...any) error {
+		if err := scanSecretMeta(s)(dest[:7]...); err != nil {
+			return err
+		}
+		*dest[7].(*pgtype.Timestamptz) = s.disabledAt
+		*dest[8].(*int64) = 0
+		return nil
+	}
+}
 
 // scanStatePair fills ListCodexCredentialStatesForUser's (user_secret_id, status).
 func scanStatePair(id uuid.UUID, status string) func(dest ...any) error {
@@ -209,6 +221,25 @@ func scanStatePair(id uuid.UUID, status string) func(dest ...any) error {
 
 func (f *fakeCodexDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
 	switch {
+	case strings.Contains(sql, "name: GetDefaultUserSecretID"):
+		for _, s := range f.secrets {
+			if s.kind == args[1].(string) && s.isDefault {
+				return fakeScanRow{func(dest ...any) error {
+					*dest[0].(*uuid.UUID) = s.id
+					return nil
+				}}
+			}
+		}
+		return errRow(pgx.ErrNoRows)
+	case strings.Contains(sql, "name: CountEnabledSecretSlot"):
+		kind := args[1].(string)
+		var n int64
+		for _, s := range f.secrets {
+			if !s.disabledAt.Valid && (s.kind == kind || isCodexKind(kind) && isCodexKind(s.kind)) {
+				n++
+			}
+		}
+		return fakeScanRow{scanInt64(n)}
 	case strings.Contains(sql, "name: CountCodexSecrets"):
 		var n int64
 		for _, s := range f.secrets {
@@ -628,6 +659,41 @@ func TestDeleteCodexForeignIdIs404(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDeleteAnthropicDefaultCountsEnabledSiblings(t *testing.T) {
+	for _, byID := range []bool{false, true} {
+		for _, disabledSibling := range []bool{false, true} {
+			t.Run(fmt.Sprintf("by_id=%t/disabled_sibling=%t", byID, disabledSibling), func(t *testing.T) {
+				db := newFakeCodexDB()
+				defaultID := db.seed(store.KindAnthropicToken, "default", true)
+				siblingID := db.seed(store.KindAnthropicToken, "sibling", false)
+				if disabledSibling {
+					db.secrets[siblingID].disabledAt = nowTS()
+				}
+				h := newCodexHandler(t, db)
+				rec := httptest.NewRecorder()
+				if byID {
+					h.DeleteAnthropicTokenByID(rec, codexReq(t, http.MethodDelete,
+						"/api/me/secrets/anthropic_token/"+defaultID.String(), "", uuid.New(), defaultID.String()))
+				} else {
+					h.DeleteAnthropicToken(rec, codexReq(t, http.MethodDelete,
+						"/api/me/secrets/anthropic_token", "", uuid.New(), ""))
+				}
+				want := http.StatusConflict
+				if disabledSibling {
+					want = http.StatusNoContent
+				}
+				if rec.Code != want {
+					t.Fatalf("status = %d, want %d; body=%s", rec.Code, want, rec.Body.String())
+				}
+				_, exists := db.secrets[defaultID]
+				if exists == disabledSibling {
+					t.Fatalf("default exists = %t, disabled sibling = %t", exists, disabledSibling)
+				}
+			})
+		}
 	}
 }
 
