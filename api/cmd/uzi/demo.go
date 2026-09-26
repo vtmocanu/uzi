@@ -126,8 +126,10 @@ func newDemoClient() *uzicli.FakeClient {
 		// Two Anthropic tokens so the own board clears the >1-token gate (PRD #295) and shows
 		// the credential column; the demo runs above carry meta/personal labels + reasons.
 		Secrets: []apitypes.SecretDTO{
-			{ID: "sec-personal", Kind: "anthropic", Label: "personal", IsDefault: true},
-			{ID: "sec-meta", Kind: "anthropic", Label: "meta"},
+			{ID: "sec-personal", Kind: "anthropic_token", Label: "personal", IsDefault: true},
+			{ID: "sec-meta", Kind: "anthropic_token", Label: "meta"},
+			{ID: "sec-codex-main", Kind: "codex_auth", Label: "codex-main", IsDefault: true},
+			{ID: "sec-codex-key", Kind: "openai_api_key", Label: "codex-key"},
 		},
 		// The viewer's own per-token meters drive the factory-floor rate-limit strip (PRD #519
 		// F2), mirroring the web sidebar's selection. The default token always shows; the
@@ -273,6 +275,14 @@ func demoRuns(now time.Time) []apitypes.RunListItemDTO {
 	vault.IssueIID = ip(477)
 	vault.IssueWebURL = sp("https://github.com/vtmocanu/uzi/issues/477")
 
+	codexLive := mk("c0de0001-1111-2222-3333-444444444444", "issue", "running", "Improve Codex account recovery", "", nil, 0, 11*time.Minute)
+	codexLive.Harness = "codex"
+	codexLive.CodexSecretID = sp("sec-codex-main")
+	codexLive.CodexSecretLabel = sp("codex-main")
+	codexPast := mk("c0de0002-1111-2222-3333-444444444444", "issue", "completed", "Archive the old Codex login", "", nil, 0, 4*time.Hour)
+	codexPast.Harness = "codex"
+	codexPast.CodexSecretLabel = sp("former-codex") // deleted alias: snapshot survives
+
 	return []apitypes.RunListItemDTO{
 		// The inline planning run carries an issue id but NO web URL — it exercises the
 		// "id shown but NOT clickable" path.
@@ -283,6 +293,8 @@ func demoRuns(now time.Time) []apitypes.RunListItemDTO {
 		sync,
 		oidc,
 		portJudge,
+		codexLive,
+		codexPast,
 		vault,
 	}
 }

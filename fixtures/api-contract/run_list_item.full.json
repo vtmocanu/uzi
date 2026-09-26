@@ -178,6 +178,7 @@
   "rate_limit_type": "x",
   "recovery_wait_cause": "x",
   "codex_account_action": "x",
+  "codex_secret_id": "x",
   "codex_secret_label": "x",
   "recovery_retry_not_before": "2020-01-02T03:04:05Z",
   "forge_park_count": 1,

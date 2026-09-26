@@ -1,6 +1,5 @@
-// RunCredential renders WHICH Anthropic credential a run's claim spent and WHY
-// (PRD #111 M1, extended by M5) — "which account paid for this run, and why that
-// one?", which the usage totals alone could never give.
+// RunCredential names the credential snapshot for the run's harness. Claude runs
+// also show the server-recorded selection reason and headroom (PRD #111 M1/M5).
 //
 // It keys off the LABEL, not the id, and that is the whole reason it is a component
 // rather than three lines inline. The fields go null INDEPENDENTLY: the label is a
@@ -40,14 +39,18 @@ export function RunCredential({
     | "anthropic_secret_label"
     | "anthropic_select_reason"
     | "anthropic_headroom_pct"
+    | "harness"
+    | "codex_secret_id"
+    | "codex_secret_label"
   >;
   // variant "compact" (PRD #295) is the Runs-list rendering: label + a tone dot
   // (non-neutral only) + `(deleted)`, with mode/hint moved into the title so the
   // row stays scannable. "full" is the run-detail sentence chip and stays the
-  // default so RunView (the only page that renders this component) is untouched.
+  // default for the run-detail page.
   variant?: "full" | "compact";
 }) {
-  const label = run.anthropic_secret_label;
+  const codex = run.harness === "codex";
+  const label = codex ? run.codex_secret_label : run.anthropic_secret_label;
   if (!label) return null;
   // The label is user-authored and reaches a renderer without necessarily having
   // passed the server validator — see lib/sanitizeLabel for the three routes. React
@@ -56,8 +59,19 @@ export function RunCredential({
   // web-ux F8 is `deleted`: a run whose credential was DELETED is otherwise
   // indistinguishable from one whose credential still exists. Saying so is the
   // difference between "go look at this token" and "this token is gone".
-  const { mode, hint, tone, linked, deleted } = describeCredential(run);
-  const hintId = `run-credential-hint-${run.anthropic_secret_id ?? "gone"}`;
+  const description = codex ? {
+    mode: "",
+    hint: "This run is bound to the recorded Codex credential.",
+    tone: "neutral" as const,
+    linked: false,
+    deleted: run.codex_secret_id === null,
+  } : describeCredential(run);
+  const { mode, hint, tone, linked, deleted } = description;
+  const hintId = `run-credential-hint-${codex ? "codex" : "claude"}-${(codex ? run.codex_secret_id : run.anthropic_secret_id) ?? "gone"}`;
+  const noun = codex ? "credential" : "token";
+  const deletedHint = codex
+    ? "The credential has since been deleted; the name is the one recorded for this run."
+    : "The credential has since been deleted; the name is the one recorded when the run was claimed.";
 
   const chip =
     variant === "compact" ? (
@@ -81,8 +95,8 @@ export function RunCredential({
         dot={tone !== "neutral"}
         title={
           deleted
-            ? `token “${safe}”${mode ? " — " + mode : ""} — ${hint} The credential has since been deleted; the name is the one recorded when the run was claimed.`
-            : `token “${safe}”${mode ? " — " + mode : ""} — ${hint}`
+            ? `${noun} “${safe}”${mode ? " — " + mode : ""} — ${hint} ${deletedHint}`
+            : `${noun} “${safe}”${mode ? " — " + mode : ""} — ${hint}`
         }
       >
         {/* web-ux F20 (compact): the server allows a 64-char label, and the Badge is
@@ -110,7 +124,7 @@ export function RunCredential({
         aria-describedby={hintId}
         title={
           deleted
-            ? `${hint} The credential has since been deleted; the name is the one recorded when the run was claimed.`
+            ? `${hint} ${deletedHint}`
             : hint
         }
       >
@@ -124,7 +138,7 @@ export function RunCredential({
           Quotes do the work at any size and any contrast, and they are unambiguous
           about WHICH token is a name. The weight stays because it costs nothing and
           helps where it is visible. */}
-        token “<span className="font-semibold">{safe}</span>”
+        {noun} “<span className="font-semibold">{safe}</span>”
         {deleted && " (deleted)"}
         {mode && ` — ${mode}`}
         <span id={hintId} className="sr-only">

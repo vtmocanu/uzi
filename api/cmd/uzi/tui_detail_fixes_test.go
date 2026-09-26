@@ -311,6 +311,31 @@ func autoFoldRun(withUsage, withAccount bool) (apitypes.RunDTO, []apitypes.Messa
 	return run, msgs
 }
 
+func TestRailCodexSnapshotProtectedByAutoFold(t *testing.T) {
+	base, messages := autoFoldRun(false, false)
+	with := base
+	with.Harness = "codex"
+	label := "historic-login"
+	with.CodexSecretLabel = &label // no current meter and deleted alias
+	for height := 16; height <= 60; height++ {
+		model := func(run apitypes.RunDTO) tuiModel {
+			m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+			m.width, m.height = 100, height
+			return applyDetail(m, run, messages)
+		}
+		plain := model(base)
+		codex := model(with)
+		if !plain.railAutoFolded(time.Now()) && codex.railAutoFolded(time.Now()) {
+			out := stripANSI(codex.renderLaneRail())
+			if !strings.Contains(out, "historic-login (deleted)") {
+				t.Fatalf("auto-fold at height %d failed to protect Codex snapshot: %s", height, out)
+			}
+			return
+		}
+	}
+	t.Fatal("no crowded height made the Codex snapshot trigger auto-fold")
+}
+
 // A tall terminal fits the whole expanded rail, so the same many-lane/milestone run that folds at
 // 100x20 opens EXPANDED at 100x60: the open caret, every lane, and MILESTONES + SPEND + ACCOUNTS
 // all present (PRD #1257 D1 — the roster stays when it fits).

@@ -190,6 +190,7 @@ function run(over: Partial<Run>): Run {
     rate_limit_type: null,
     recovery_wait_cause: null,
     codex_account_action: null,
+    codex_secret_id: null,
     codex_secret_label: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
@@ -4979,6 +4980,7 @@ describe("RunView park announcement — recovery_wait (issue #1197, a11y)", () =
     status: "recovery_wait",
     recovery_wait_cause: "codex_account_unavailable",
     codex_account_action: action,
+    codex_secret_id: null,
     codex_secret_label: "work",
   });
   const announced = () =>

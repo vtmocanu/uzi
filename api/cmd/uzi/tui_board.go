@@ -806,12 +806,26 @@ func (m tuiModel) boardShowCost() bool {
 	return m.width >= min
 }
 
-// boardShowCred gates the credential column exactly as the web RunsList does (PRD #295):
-// the admin factory board always shows it (naming which account a run billed is the point
-// of the factory view), the own board only when the viewer holds more than one Anthropic
-// token — a single token has nothing to disambiguate.
+// boardShowCred reserves one aligned credential column when either harness has
+// multiple credentials. The admin board always shows it.
 func (m tuiModel) boardShowCred() bool {
-	return m.board.admin || m.tokenCount > 1
+	return m.board.admin || m.tokenCount > 1 || m.codexCredentialCount > 1
+}
+
+// boardShowRunCred gates the cell by this run's harness, so a second Codex
+// credential never exposes the sole Claude credential (and vice versa).
+func (m tuiModel) boardShowRunCred(r apitypes.RunListItemDTO) bool {
+	if m.board.admin {
+		return true
+	}
+	switch r.Harness {
+	case "codex":
+		return m.codexCredentialCount > 1
+	case "claude", "":
+		return m.tokenCount > 1
+	default:
+		return false
+	}
 }
 
 // boardMeterLayout is the ONE per-frame snapshot of the header rate-limit meter line(s) (PRD 1519
