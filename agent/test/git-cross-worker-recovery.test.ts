@@ -203,6 +203,7 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     const gitA = worker("workerA");
     const bareA = await gitA.ensureClone(fx.originPath);
     const seed = await gitA.createOrAttachRunnerClone(bareA, 628, "run-A");
+    fs.writeFileSync(path.join(seed.path, ".uzi", "scratch", "worker-A.log"), "private artifact");
     commit(seed.path, "M1.txt");
     const cpTip = commit(seed.path, "M2.txt"); // ≥1 commit strictly ahead of the floor
     await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
@@ -245,6 +246,8 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     // checkpoint tip (== the mirrored checkpoint's SHA), so the issue-#1059 owner anchor admits
     // the adopt. With no origin/<branch> this is the Path-A resume-adopt leg.
     const rc = await gitB.createOrAttachRunnerClone(bareB, 628, "run-B", true /*resume*/, cpTip /*matching own tip*/);
+    assert.equal(fs.statSync(path.join(rc.path, ".uzi", "scratch")).isDirectory(), true);
+    assert.deepEqual(fs.readdirSync(path.join(rc.path, ".uzi", "scratch")), [], "cross-worker recovery has no transferred scratch");
 
     // SC#2 NON-VACUITY GUARD — all of these must hold, else the assertion would pass on a
     // checkpoint that merely equals the floor and prove nothing.

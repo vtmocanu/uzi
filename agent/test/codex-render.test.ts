@@ -411,6 +411,14 @@ describe("renderCodexRun — per-role resolution and root-ness", () => {
 });
 
 describe("renderCodexRun — prompts", () => {
+  it("renders scratch guidance in every subagent prompt", () => {
+    const rendered = renderCodexRun(runRequest({ agents: { a: agent(), b: agent() } }));
+    for (const prompt of rendered.perRolePrompts.values()) {
+      assert.match(prompt, /\.uzi\/scratch\//);
+      assert.match(prompt, /mktemp -d \.uzi\/scratch\/snap\.XXXXXX/);
+    }
+  });
+
   it("threads the lead system + user prompt verbatim", () => {
     const run = renderCodexRun(runRequest({ systemPrompt: "SYS", prompt: "USR" }));
     const lead: RenderedCodexPrompts = run.leadPrompt;

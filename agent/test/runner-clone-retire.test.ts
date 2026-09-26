@@ -547,7 +547,9 @@ describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", 
     const iid = 1440;
     const ownerRunId = "33333333-3333-4333-8333-333333333333";
     const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "Q.txt");
+    fs.writeFileSync(path.join(clonePath, ".uzi", "scratch", "gate-log.test"), "done");
     await git.retireRunnerClone(bare, clonePath, branch, ownerRunId, { discard: false });
+    assert.equal(fs.existsSync(path.join(clonePath, ".uzi", "scratch")), false, "quarantine removes scratch from the canonical clone path");
 
     const hRoot = holdingRoot();
     assert.equal(fs.existsSync(hRoot), true);
@@ -561,6 +563,17 @@ describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", 
     const dirs = fs.readdirSync(hRoot);
     assert.equal(dirs.length, 1, "the residue is retained (discard:false)");
     assert.equal(fs.existsSync(path.join(hRoot, dirs[0]!, "Q.txt")), true);
+    assert.equal(fs.readFileSync(path.join(hRoot, dirs[0]!, ".uzi", "scratch", "gate-log.test"), "utf8"), "done");
+  });
+
+  it("settled retirement removes scratch with the discarded runner clone", async () => {
+    const ownerRunId = "34343434-3434-4434-8434-343434343434";
+    const { bare, branch, clonePath } = await seedResidue(1441, ownerRunId, "Q.txt");
+    fs.writeFileSync(path.join(clonePath, ".uzi", "scratch", "gate-log.test"), "done");
+    await git.retireRunnerClone(bare, clonePath, branch, ownerRunId, { discard: true });
+    assert.equal(fs.existsSync(clonePath), false);
+    assert.equal(readJournal(bare, branch), undefined);
+    assert.deepEqual(fs.readdirSync(holdingRoot()), []);
   });
 
   it("T7a: a missing SOURCE is treated as already-free (journal cleared, no throw)", async () => {

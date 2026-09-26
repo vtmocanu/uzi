@@ -392,6 +392,7 @@ describe("RunRunner — durable park (PRD #218 M1/M2/M3)", () => {
       homeDir: path.join(homeRoot, runId),
       executor: {
         run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          fs.writeFileSync(path.join(ctx.worktreePath, ".uzi", "scratch", "park.log"), "park artifact");
           sha = commitInTree(ctx.worktreePath, file, "work before the park\n");
           fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
           throw new LimitReachedError({
@@ -488,6 +489,7 @@ describe("RunRunner — durable park (PRD #218 M1/M2/M3)", () => {
       // 2) Resume (a claim with a session id): the reseed must read the tracking ref
       //    and hand the executor a tree that still carries WORK.txt.
       let sawFile = false;
+      let scratchEmpty = false;
       let priorWork: unknown;
       let baseCommit: string | undefined;
       const resumeFactory: ExecutorFactory = (runId) => ({
@@ -495,6 +497,7 @@ describe("RunRunner — durable park (PRD #218 M1/M2/M3)", () => {
         executor: {
           run: async (ctx: RunContext): Promise<ExecutorResult> => {
             sawFile = fs.existsSync(path.join(ctx.worktreePath, "WORK.txt"));
+            scratchEmpty = fs.readdirSync(path.join(ctx.worktreePath, ".uzi", "scratch")).length === 0;
             priorWork = ctx.priorWork;
             baseCommit = ctx.baseCommit;
             return { branch: ctx.branch };
@@ -514,6 +517,7 @@ describe("RunRunner — durable park (PRD #218 M1/M2/M3)", () => {
 
       // The control the bug failed: the file the agent created before the park is
       // still there after it (Success Criterion 1).
+      assert.equal(scratchEmpty, true, "limit park reseed starts with empty scratch");
       assert.strictEqual(
         sawFile,
         true,

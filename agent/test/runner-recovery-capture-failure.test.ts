@@ -115,8 +115,11 @@ describe("recovery capture retry and restart safety (#1197)", () => {
     const first = runnerWith(fixture.factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 });
     const execution = first.execute(claim);
     await Promise.race([failed.promise, execution.then(() => { throw new Error("capture path not reached"); })]);
+    const scratchArtifact = path.join(fixture.clone(), ".uzi", "scratch", "capture.log");
+    fs.writeFileSync(scratchArtifact, "retained during capture\n");
     first.shutdown();
     await execution;
+    assert.equal(fs.readFileSync(scratchArtifact, "utf8"), "retained during capture\n");
     assert.equal(api.states.some((s) => s.body.status === "recovery_wait"), false);
     assert.equal(fs.readFileSync(path.join(fixture.clone(), "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
     assert.equal(fs.existsSync(path.join(fixture.runHome, "session")), true);
@@ -128,6 +131,7 @@ describe("recovery capture retry and restart safety (#1197)", () => {
       PendingRecoveryCaptureError,
       "the durable worker journal blocks same-run destructive reseeding",
     );
+    assert.equal(fs.readFileSync(scratchArtifact, "utf8"), "retained during capture\n", "the same retained clone keeps scratch until capture settles");
     // issue #1315: the same-path foreign case is now the RECLAIMABLE
     // ForeignCaptureBlockedError, carrying the exact owner/clone/branch the runner
     // needs for its authoritative owner probe. (Case B — matched canonical pair.)
