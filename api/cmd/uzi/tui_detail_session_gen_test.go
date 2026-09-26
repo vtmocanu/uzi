@@ -349,8 +349,12 @@ func TestTUIDetailStaleSessionStreamReadyRejectedViaPR(t *testing.T) {
 // session's gen, so a slip in readStreamCmd's returns or in a handler's re-read would go unseen.
 // A board-opened session has gen >= 1: there such a slip makes the live session discard its own
 // frames. Drives the model's own openStreamCmd over a fake stream with message frames, feeds every
-// read back through Update, then closes the socket so the chain's closed batch is exercised too,
-// and finally round-trips a meta poll from the same session.
+// read back through Update, then closes the socket so the chain's closed batch (readStreamCmd's
+// first return, a close with no frames queued) is exercised too, and finally round-trips a meta
+// poll from the same session. It covers only the handler's default re-read; the two steer re-reads
+// are covered by TestTUIDetailBoardOpenedSessionSteerReReadKeepsGen. NOT covered: readStreamCmd's
+// "closed while draining a batch" return (events plus closed: true), which needs the close to land
+// between two drained frames and cannot be hit deterministically with the fake stream.
 func TestTUIDetailBoardOpenedSessionOwnReadChainApplies(t *testing.T) {
 	runID := "cccccccc-8888-2222-3333-444444444444"
 	title := "run"
@@ -444,5 +448,117 @@ func TestTUIDetailBoardOpenedSessionOwnReadChainApplies(t *testing.T) {
 	m = next.(tuiModel)
 	if m.detail.metaWaitID != 0 || m.detail.run.IssueTitle != "own meta" {
 		t.Fatalf("the session's own meta reply was not applied: metaWaitID=%d IssueTitle=%q", m.detail.metaWaitID, m.detail.run.IssueTitle)
+	}
+}
+
+// (f) The streamEventsMsg handler's two steer re-reads (a state frame while the ownership probe is
+// unresolved, an input frame while the session may steer) return their own readStreamCmd alongside
+// fetchInputsCmd, and each must carry the session generation too. (e) only reaches the default
+// re-read, so a zero stamp in either steer branch would pass it; here, in a board-opened session
+// (gen >= 1), the batch is executed, its re-read must be stamped with the session's gen, and fed
+// back through Update it must be applied. Deterministic on the unbuffered fake stream: the re-read
+// runs only while a frame remains; if the trigger's read already drained the frame after it, the
+// socket is closed first so the re-read returns the chain's closed batch instead of blocking.
+func TestTUIDetailBoardOpenedSessionSteerReReadKeepsGen(t *testing.T) {
+	agent := "lead"
+	at := time.Now()
+	after := apitypes.RunEventDTO{
+		Type: uzicli.RunEventTypeMessage, Seq: 1, Kind: "text", Agent: &agent, CreatedAt: &at,
+		Payload: json.RawMessage(`{"text":"after the trigger"}`),
+	}
+	cases := []struct {
+		name    string
+		trigger apitypes.RunEventDTO
+		access  steerAccess
+	}{
+		{"state frame while access is unknown", apitypes.RunEventDTO{Type: uzicli.RunEventTypeState, Status: "running"}, steerUnknown},
+		{"input frame while access is allowed", apitypes.RunEventDTO{Type: uzicli.RunEventTypeInput}, steerAllowed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runID := "cccccccc-9999-2222-3333-444444444444"
+			title := "run"
+			fake := sessionGenFake(runID, &title)
+			fake.InputsByID = map[string][]apitypes.SteerInputDTO{runID: nil} // the caller's own run
+			fake.StreamEvents = []apitypes.RunEventDTO{tc.trigger, after}
+
+			m := tuiTestModel(t, fake, runID) // `--run` session, gen 0
+			m = reopenFromBoard(t, m, fake, runID)
+			if m.detail.gen == 0 {
+				t.Fatalf("the board-opened session has gen 0; this test needs a non-zero generation")
+			}
+			gen := m.detail.gen
+			next, _ := m.Update(m.loadRunCmd(runID)())
+			m = next.(tuiModel)
+			if m.detail.steer.access != steerUnknown {
+				t.Fatalf("fixture: steer access = %v before the probe answered, want steerUnknown", m.detail.steer.access)
+			}
+			m.detail.steer.access = tc.access
+
+			own := streamOf(t, m.openStreamCmd(runID))
+			next, read := m.Update(own)
+			m = next.(tuiModel)
+			if read == nil || m.detail.stream != own.stream {
+				t.Fatalf("the board-opened session did not adopt its own stream (cmd=%v)", read)
+			}
+
+			trig, ok := read().(streamEventsMsg)
+			if !ok || trig.closed || len(trig.events) == 0 || trig.events[0].Type != tc.trigger.Type || trig.gen != gen {
+				t.Fatalf("the first read = %#v, want an open %s batch for gen %d", trig, tc.trigger.Type, gen)
+			}
+			next, cmd := m.Update(trig)
+			m = next.(tuiModel)
+			if cmd == nil {
+				t.Fatalf("the %s batch returned no command", tc.trigger.Type)
+			}
+			batch, ok := cmd().(tea.BatchMsg)
+			if !ok || len(batch) != 2 {
+				t.Fatalf("the %s batch returned %#v, want a two-command tea.BatchMsg (re-read + inputs fetch)", tc.trigger.Type, batch)
+			}
+
+			drained := len(trig.events) == len(fake.StreamEvents)
+			if drained {
+				own.stream.Close() // nothing left to read: the re-read must return the closed batch, not block
+			}
+			var reread *streamEventsMsg
+			fetched := 0
+			for _, c := range batch {
+				switch r := c().(type) {
+				case streamEventsMsg:
+					reread = &r
+				case runInputsMsg:
+					if r.runID != runID || r.err != nil {
+						t.Fatalf("the inputs fetch = %#v, want the run's own queue", r)
+					}
+					fetched++
+				default:
+					t.Fatalf("the steer batch yielded an unexpected %T", r)
+				}
+			}
+			if reread == nil || fetched != 1 {
+				t.Fatalf("the steer batch yielded re-read=%v and %d inputs fetches, want one of each", reread != nil, fetched)
+			}
+			if reread.gen != gen {
+				t.Fatalf("the %s branch's re-read stamped gen %d, want the session's %d", tc.trigger.Type, reread.gen, gen)
+			}
+
+			next, cmd = m.Update(*reread)
+			m = next.(tuiModel)
+			if cmd == nil {
+				t.Fatalf("the session's own re-read was discarded (no command returned)")
+			}
+			if drained {
+				if !reread.closed || m.detail.stream != nil || !m.detail.polling {
+					t.Fatalf("the session's own closed re-read was not applied: closed=%v stream nil=%v polling=%v",
+						reread.closed, m.detail.stream == nil, m.detail.polling)
+				}
+			} else if reread.closed || m.detail.highSeq != 1 || m.detail.stream != own.stream {
+				t.Fatalf("the session's own re-read was not applied: closed=%v highSeq=%d stream kept=%v",
+					reread.closed, m.detail.highSeq, m.detail.stream == own.stream)
+			}
+			if len(m.detail.frames) != 1 {
+				t.Fatalf("frames = %d, want the one message frame after the trigger", len(m.detail.frames))
+			}
+		})
 	}
 }
