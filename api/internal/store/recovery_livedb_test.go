@@ -129,9 +129,9 @@ func TestRecoveryStoreLifecycleLiveDB(t *testing.T) {
 		t.Fatalf("released_at = %+v, want NULL on a fresh open hold", releasedAt)
 	}
 
-	if n, err := q.CountUnresolvedCustodyHoldsForOwner(ctx, userID); err != nil {
-		t.Fatalf("CountUnresolvedCustodyHoldsForOwner: %v", err)
-	} else if n != 1 {
+	if adm, err := q.GetCustodyAdmissionForRun(ctx, store.GetCustodyAdmissionForRunParams{UserID: userID, RunID: runID, CustodyHoldLimit: 8}); err != nil {
+		t.Fatalf("GetCustodyAdmissionForRun: %v", err)
+	} else if n := adm.OpenHolds; n != 1 {
 		t.Fatalf("unresolved holds = %d, want 1", n)
 	}
 
@@ -292,9 +292,9 @@ func TestRecoveryStoreLifecycleLiveDB(t *testing.T) {
 		t.Fatalf("cap1 state = %q after expiry sweep, want expired", c.State)
 	}
 	// The open hold is NOT touched by the expiry sweep.
-	if n, err := q.CountUnresolvedCustodyHoldsForOwner(ctx, userID); err != nil {
-		t.Fatalf("CountUnresolvedCustodyHoldsForOwner(after expiry): %v", err)
-	} else if n != 1 {
+	if adm, err := q.GetCustodyAdmissionForRun(ctx, store.GetCustodyAdmissionForRunParams{UserID: userID, RunID: runID, CustodyHoldLimit: 8}); err != nil {
+		t.Fatalf("GetCustodyAdmissionForRun(after expiry): %v", err)
+	} else if n := adm.OpenHolds; n != 1 {
 		t.Fatalf("open holds after expiry = %d, want 1 (expiry must not touch custody)", n)
 	}
 

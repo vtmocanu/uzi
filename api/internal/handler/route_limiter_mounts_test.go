@@ -67,7 +67,10 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 203 as of this commit. PRD #1650 M2 retired the notifications inbox read path (GET
+// 204 as of this commit. Issue #1751 M2 added POST
+// /api/worker/runs/{id}/recovery-holds/{holdID}/settle-live — the live twin of /settle below,
+// mounted on the same proposalLimiter.PerWorkerMiddleware (noLimiter to this per-USER probe).
+// It was 203 until then. PRD #1650 M2 retired the notifications inbox read path (GET
 // /api/notifications/, GET /api/notifications/unread_count and POST
 // /api/notifications/{id}/read were removed, all three noLimiter; the removal is pinned by
 // TestNotificationsInboxRoutesAreGone). Issue #1660 added GET /api/worker/runs/{id}/follow-ups,
@@ -710,6 +713,8 @@ var wantRouteMounts = []routeMount{
 	// per-USER probe reads as noLimiter, like /findings and /proposals.
 	// TestRecoverySettleIsRateLimitedLiveDB proves the mount through the real WorkerRoutes.
 	{"POST", "/api/worker/runs/{id}/recovery-holds/{holdID}/settle", noLimiter},
+	// Issue #1751 M2: the live predecessor-hold settle, mounted exactly like /settle above.
+	{"POST", "/api/worker/runs/{id}/recovery-holds/{holdID}/settle-live", noLimiter},
 	{"POST", "/api/worker/runs/{id}/inputs/ack", noLimiter},
 	{"POST", "/api/worker/runs/{id}/inputs/applied", noLimiter},
 	{"POST", "/api/worker/runs/{id}/memory", noLimiter},

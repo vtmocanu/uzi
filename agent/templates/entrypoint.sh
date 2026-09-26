@@ -595,7 +595,11 @@ require_real_carveout_root "$CODEX_CMD_CACHE_DIR"
 # `worker` primary group and 0440 is group-readable, so a token in that posture is readable
 # by the dropped worker and unreadable by `runner`/`runner-cmd` (whose --init-groups drops
 # the fsGroup) — the same containment the compose 0400 worker:worker gives.
-TOKEN=/run/secrets/worker_token
+# The token path FOLLOWS UZI_WORKER_TOKEN_FILE (issue #1761). The default is the compose
+# Docker-secret path and the k8s default mount; OpenShift relocates the Secret (CRI-O
+# shadows a volume at /run/secrets), and the controller then points UZI_WORKER_TOKEN_FILE
+# at the new directory. The posture checks below are identical wherever the file lives.
+TOKEN="${UZI_WORKER_TOKEN_FILE:-/run/secrets/worker_token}"
 if [ -e "$TOKEN" ] || [ -L "$TOKEN" ]; then
   if "$CHOWN" 0:0 "$TOKEN" 2>/dev/null; then
     "$CHMOD" 0400 "$TOKEN"

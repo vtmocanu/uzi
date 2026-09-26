@@ -2478,6 +2478,22 @@ export interface RecoverySettleRequest {
   adopted_sha: string;
 }
 
+/** RecoveryLiveSettleRequest asks the api to settle ONE older-generation custody hold while the
+ *  resumed run is still LIVE (issue #1751 M2, mirrors api/internal/apitypes/recovery.go):
+ *  POST /runs/{id}/recovery-holds/{holdID}/settle-live. published_sha is the successor
+ *  generation's PUBLISHED tip (a confirmed checkpoint publish, or the finalize branch push);
+ *  target names what the api proves it against: `checkpoint` (refs/uzi-checkpoints/<branch>) or
+ *  `branch` (runs.branch). Candidate SHAs only (40-char lowercase hex); no worker verdict field.
+ *  The answer is the same {@link RecoverySettleResponse}. */
+export interface RecoveryLiveSettleRequest {
+  predecessor_generation: number;
+  successor_generation: number;
+  published_sha: string;
+  source_sha: string;
+  adopted_sha: string;
+  target: "checkpoint" | "branch";
+}
+
 /** RecoverySettleResponse is the api's answer to a {@link RecoverySettleRequest} (issue #1582).
  *  outcome is "released" or "retained"; reason is the bounded retained reason
  *  (ancestry_unknown | state_changed | not_ancestor | not_eligible | candidate_mismatch |

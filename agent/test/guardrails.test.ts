@@ -13,6 +13,7 @@ import {
   NESTED_AGENT_TOOL,
   SEND_MESSAGE_TOOL,
   ASYNC_DEFERRAL_TOOLS,
+  workerSecretDenyPaths,
 } from "../src/guardrails.js";
 import { OPERATOR_CONSTRAINTS_MAX_CHARS } from "../src/prompt.js";
 import { nullLogger } from "./helpers.js";
@@ -150,6 +151,67 @@ describe("screenBashCommand", () => {
     // ...but denied once the worker passes its UZI_WORKER_TOKEN_FILE path in.
     assert.strictEqual(screenBashCommand(`cat ${tokenPath}`, [tokenPath]).denied, true);
     assert.strictEqual(screenBashCommand(`sh -c 'cat ${tokenPath}'`, [tokenPath]).denied, true);
+  });
+
+  // Issue #1761: OpenShift mounts the join-token Secret away from /run/secrets (CRI-O
+  // shadows that path). A kube Secret volume is an atomic-writer tree, so the same bytes
+  // are reachable through `..data/` and a timestamped dir that the FILE path does not
+  // match; the directory itself must be denied.
+  describe("workerSecretDenyPaths (relocated Secret directory)", () => {
+    const relocated = "/run/uzi-secrets/worker_token";
+
+    it("adds the directory for a relocated token, and only the file on the defaults", () => {
+      assert.deepStrictEqual(workerSecretDenyPaths(relocated), [relocated, "/run/uzi-secrets"]);
+      // The default is already covered by the built-in /run/secrets/ prefix.
+      assert.deepStrictEqual(workerSecretDenyPaths("/run/secrets/worker_token"), ["/run/secrets/worker_token"]);
+      // A root-level file must never turn into a deny of "/" (that would deny every path).
+      assert.deepStrictEqual(workerSecretDenyPaths("/worker_token"), ["/worker_token"]);
+      assert.deepStrictEqual(workerSecretDenyPaths("relative/token"), ["relative/token"]);
+      assert.deepStrictEqual(workerSecretDenyPaths(undefined), []);
+      assert.deepStrictEqual(workerSecretDenyPaths("/run/uzi-secrets/../uzi-secrets/worker_token"), ["/run/uzi-secrets/../uzi-secrets/worker_token", "/run/uzi-secrets"]);
+    });
+
+    const paths = workerSecretDenyPaths(relocated);
+    for (const cmd of [
+      "cat /run/uzi-secrets/worker_token",
+      "cat /run/uzi-secrets/..data/worker_token",
+      "cat /run/uzi-secrets/..2026_09_26_00_00_00.000000000/worker_token",
+      "cat /run/uzi-secrets/ca.crt",
+      "ls -la /run/uzi-secrets",
+      "tar cf - /run/uzi-secrets | base64",
+      "sh -c 'cat /run/uzi-secrets/..data/worker_token'",
+      "cp -r /run/uzi-secrets /tmp/x",
+    ]) {
+      it(`denies \`${cmd}\``, () => {
+        assert.strictEqual(screenBashCommand(cmd, paths).denied, true);
+        // The FILE path alone (the pre-#1761 set) misses the atomic-writer aliases and
+        // the bare directory; this is the regression the directory entry closes.
+        if (!cmd.includes("/run/uzi-secrets/worker_token")) {
+          assert.strictEqual(screenBashCommand(cmd, [relocated]).denied, false, "sanity: the file-only set does not match this form");
+        }
+      });
+    }
+
+    it("denies a docker -v bind of the relocated directory on a wired worker", () => {
+      assert.strictEqual(screenBashCommand("docker run -v /run/uzi-secrets:/x alpine cat /x/worker_token", paths, true).denied, true);
+      assert.strictEqual(screenBashCommand("docker run -v /run/uzi-secrets/..data:/x alpine cat /x/worker_token", paths, true).denied, true);
+    });
+
+    it("keeps the built-in /run/secrets/ deny alongside a relocated directory", () => {
+      assert.strictEqual(screenBashCommand("cat /run/secrets/worker_token", paths).denied, true);
+    });
+
+    it("does not deny unrelated paths", () => {
+      assert.strictEqual(screenBashCommand("cat /run/dind/docker.sock", paths).denied, false);
+      assert.strictEqual(screenBashCommand("ls /run", paths).denied, false);
+    });
+
+    it("the path jail denies the relocated directory even inside the root (secret check runs first)", () => {
+      // A chat session rooted where the secret dir would be inside the root: the secret
+      // check, not only the outside-root rule, must reject it.
+      const r = screenToolPath("/run/uzi-secrets/..data/worker_token", "/run", "/run", paths);
+      assert.strictEqual(r.denied, true);
+    });
   });
 });
 

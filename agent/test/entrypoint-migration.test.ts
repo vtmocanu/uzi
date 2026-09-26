@@ -66,7 +66,10 @@ interface Harness {
   script: string;
 }
 
-function makeHarness(opts: { mutate?: (patched: string) => string } = {}): Harness {
+// tokenViaEnv (issue #1761): leave the entrypoint's TOKEN line as shipped, so the token
+// path can only reach the script through UZI_WORKER_TOKEN_FILE (run() passes it). Proves
+// the posture checks follow the env rather than a /run/secrets literal.
+function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?: boolean } = {}): Harness {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-entrypoint-m2-"));
   const data = path.join(root, "data");
   const nix = path.join(root, "nix");
@@ -168,9 +171,9 @@ function makeHarness(opts: { mutate?: (patched: string) => string } = {}): Harne
     // Issue #1598: keep the Codex command-cache root inside the sandbox, never the host's
     // /var/cache. Its own behaviour is covered by entrypoint-codex-cache.test.ts.
     .replace("CODEX_CMD_CACHE_DIR=/var/cache/uzi-codex-cmd", `CODEX_CMD_CACHE_DIR=${codexCmdCache}`)
-    .replace("TOKEN=/run/secrets/worker_token", `TOKEN=${token}`);
+    .replace(opts.tokenViaEnv ? "\u0000no-match" : 'TOKEN="${UZI_WORKER_TOKEN_FILE:-/run/secrets/worker_token}"', `TOKEN=${token}`);
   // Every constant we depend on must actually have been rewritten.
-  for (const marker of [stubDir, data, nix, token, codexCmdCache]) {
+  for (const marker of [stubDir, data, nix, ...(opts.tokenViaEnv ? [] : [token]), codexCmdCache]) {
     assert.ok(patched.includes(marker), `entrypoint patch did not apply for ${marker}`);
   }
   const finalText = opts.mutate ? opts.mutate(patched) : patched;
@@ -276,6 +279,37 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
       assert.notEqual(r.status, 0, "lstat of the projected-Secret symlink must fail closed");
       assert.match(r.stderr, /refusing to start \(posture:/, "must log the fail-closed refusal");
       assert.ok(r.stderr.includes("0 10001 777"), "the observed symlink lstat posture proves -L is load-bearing");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("token (#1761): the posture check FOLLOWS UZI_WORKER_TOKEN_FILE to a relocated Secret", () => {
+    // OpenShift mounts the join-token Secret away from /run/secrets (CRI-O shadows that path)
+    // and the controller points UZI_WORKER_TOKEN_FILE at it. The TOKEN line is left as
+    // shipped, so only the env can lead the entrypoint to the chain.
+    const h = makeHarness({ tokenViaEnv: true });
+    try {
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(h.nix);
+      buildAtomicWriterChain(h);
+      const r = run(h, { STUB_NOOP: "1", STUB_ROFS_TOKEN: h.token, UZI_WORKER_TOKEN_FILE: h.token });
+      assert.equal(r.status, 0, `a valid relocated token must not abort (stderr: ${r.stderr})`);
+      assert.match(r.stderr, /read-only kube Secret .*worker-readable/, "the posture check must run on the env-named path");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("token (#1761): a relocated Secret with a WRONG posture still FAILS CLOSED", () => {
+    const h = makeHarness({ tokenViaEnv: true });
+    try {
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(h.nix);
+      buildAtomicWriterChain(h);
+      const r = run(h, { STUB_NOOP: "1", STUB_ROFS_TOKEN: h.token, UZI_WORKER_TOKEN_FILE: h.token, STUB_TOKEN_TARGET_POSTURE: "0 0 444" });
+      assert.notEqual(r.status, 0, "a world-readable relocated token must fail closed");
+      assert.match(r.stderr, /refusing to start \(posture:/, "must log the fail-closed refusal at the relocated path");
     } finally {
       fs.rmSync(h.root, { recursive: true, force: true });
     }

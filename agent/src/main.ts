@@ -25,6 +25,7 @@ import { resolveDockerWiring, dockerSidecarExpected, type DockerWiring } from ".
 import { probeCodexRuntime } from "./codex/codex-runtime-probe.js";
 import { probeLandlockAvailability, resolveCodexHarnessAvailability } from "./codex/codex-capability.js";
 import { reapCodexCommandOrphans, type ReapOrphansResult } from "./codex/launcher.js";
+import { workerSecretDenyPaths } from "./guardrails.js";
 import type { ClaimCodexSecrets } from "./protocol.js";
 import type { CommandSandboxMode } from "./config.js";
 
@@ -109,6 +110,8 @@ export function startupReapVerdict(result: ReapOrphansResult | undefined, aborte
 // Set once the logger exists so the last-resort fatal handler can scrub through
 // the SecretRegistry instead of writing a raw (unredacted) line.
 let fatalLog: Logger | undefined;
+let lifecyclePhase: "config" | "startup" | "reap" | "worker" | "stopped" = "config";
+let shutdownSignal: "SIGINT" | "SIGTERM" | undefined;
 
 /** Dependencies {@link buildRunExecutor} needs, factored out of `main()`'s closure so
  *  the seam is callable in isolation (PRD #1429 M6 test). Production always supplies
@@ -145,6 +148,24 @@ export interface BuildRunExecutorDeps {
  * message (routing through the runner's failed-run catch), NEVER a Claude fallback and
  * NEVER a crash of executeClaim itself.
  */
+/**
+ * Build one chat session's executor (PRD #39). Exported so the wiring is testable: the real
+ * ChatExecutor must get the SAME worker-credential deny set as a run, including a
+ * relocated join-token Secret's directory (issue #1761, workerSecretDenyPaths).
+ */
+export function buildChatExecutor(deps: {
+  log: Logger;
+  sdkHomeRoot: string;
+  executorKind: ExecutorKind;
+  workerTokenFile?: string;
+}): ChatExecutorLike {
+  return deps.executorKind === "stub"
+    ? new StubChatExecutor(deps.log)
+    : new ChatExecutor(deps.log, deps.sdkHomeRoot, {
+        secretPaths: workerSecretDenyPaths(deps.workerTokenFile),
+      });
+}
+
 export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undefined, deps: BuildRunExecutorDeps): RunExecution {
   const { log, client, sdkHomeRoot, executorKind, stubPlanGate, workerTokenFile, dockerWiring, codexCommandSandbox, codexSandboxDegraded } = deps;
   let selection;
@@ -203,6 +224,8 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
         // per-run feed line.
         commandSandbox: codexCommandSandbox,
         commandSandboxDegraded: codexSandboxDegraded,
+        // Issue #1761: the same worker-credential deny set the Claude path gets.
+        workerSecretPaths: workerSecretDenyPaths(workerTokenFile),
       },
       {
         // PRD #1171 m4 (F1): the RUNNER owns the terminal registry teardown. Its post-run
@@ -220,8 +243,9 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
   const executor = new SdkExecutor(log, runHome, {
     // Deny a Bash `cat` of the join-token file (a read-only secret mount
     // persists it); the built-in /run/secrets/ prefix already covers the
-    // shipping default, this adds a non-default UZI_WORKER_TOKEN_FILE path.
-    secretPaths: workerTokenFile ? [workerTokenFile] : [],
+    // shipping default, this adds a non-default UZI_WORKER_TOKEN_FILE path AND its
+    // directory (a relocated kube Secret, issue #1761; see workerSecretDenyPaths).
+    secretPaths: workerSecretDenyPaths(workerTokenFile),
     // The nix/devbox provisioning HOME + root stay SHARED worker-lifetime paths
     // (Decision 5): only the SDK $HOME (runHome) is per-run, so warm-start state
     // doesn't fragment per run. The per-run provision DIR still isolates the
@@ -252,6 +276,7 @@ async function main(): Promise<void> {
   // Scrub the join token from all output before it can appear anywhere.
   log.addSecret(config.workerToken);
   fatalLog = log;
+  lifecyclePhase = "startup";
 
   // Docker wiring keystone (PRD #83 M1): resolve ONCE at startup with a bounded liveness
   // probe (loadConfig can't — it's sync). The single result feeds the register capability
@@ -459,11 +484,7 @@ async function main(): Promise<void> {
   // resume. Chat is read-only (no clone, no PAT, no Bash), so the process-global
   // $HOME/.claude races that per-run HOME closes for runs don't apply the same way.
   const makeChatExecutor = (): ChatExecutorLike =>
-    config.executor === "stub"
-      ? new StubChatExecutor(log)
-      : new ChatExecutor(log, sdkHomeRoot, {
-          secretPaths: config.workerTokenFile ? [config.workerTokenFile] : [],
-        });
+    buildChatExecutor({ log, sdkHomeRoot, executorKind: config.executor, workerTokenFile: config.workerTokenFile });
   const chatRunner = new ChatRunner(client, makeChatExecutor, log, config.messageBatchMs, {
     maxTurns: config.chatMaxTurns,
     turnTimeoutMs: config.chatTurnTimeoutMs,
@@ -565,7 +586,8 @@ async function main(): Promise<void> {
   const controller = new AbortController();
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
     process.on(sig, () => {
-      log.info("shutting down", { signal: sig });
+      shutdownSignal = sig;
+      log.info("shutting down", { signal: sig, phase: lifecyclePhase, cause: "signal" });
       // PRD #218 M1: trigger the run lane's graceful shutdown FIRST — it marks every
       // in-flight run and aborts its controller so each fetches its committed work back
       // into the worker bare as it unwinds (the sweeper then requeues a run whose tree
@@ -615,6 +637,7 @@ async function main(): Promise<void> {
   // Issue #1598: reap Codex command orphans (tmps + per-run caches) from a previous
   // container. MUST run here, before worker.run(): nothing may launch a run (and so no
   // command-uid process may start) while the reaper's proof is being taken.
+  lifecyclePhase = "reap";
   const reap = await reapCodexOrphansAtStartup(log, { signal: controller.signal });
   const verdict = startupReapVerdict(reap, controller.signal.aborted);
   if (verdict === "exit") {
@@ -622,15 +645,25 @@ async function main(): Promise<void> {
     // container restarts (its PID namespace, and the reaper with it, goes away). The
     // error was logged above. An explicit exit, not exitCode: the reaper's still-open
     // child handle would otherwise keep the event loop alive.
+    log.error("uzi-agent exiting", { cause: "startup_reap_incomplete", phase: lifecyclePhase, exit_code: 1 });
     process.exit(1);
   }
   if (verdict === "shutdown") {
-    log.info("uzi-agent stopped during the startup reap; the worker was not started");
+    lifecyclePhase = "stopped";
+    log.info("uzi-agent stopped during the startup reap; the worker was not started", {
+      cause: "signal", signal: shutdownSignal ?? null, exit_code: 0,
+    });
     return;
   }
 
+  lifecyclePhase = "worker";
   await worker.run(controller.signal);
-  log.info("uzi-agent stopped");
+  lifecyclePhase = "stopped";
+  log.info("uzi-agent stopped", {
+    cause: shutdownSignal ? "signal" : "worker_returned",
+    signal: shutdownSignal ?? null,
+    exit_code: 0,
+  });
 }
 
 // PRD #1429 M6: only auto-run `main()` when this module is the process ENTRYPOINT
@@ -654,12 +687,13 @@ if (isEntrypoint) {
     const message = errMessage(err);
     if (fatalLog) {
       // Route through the logger so any registered secret is scrubbed.
-      fatalLog.error("fatal", { error: message });
+      fatalLog.error("fatal", { error: message, cause: "exception", phase: lifecyclePhase, exit_code: 1 });
     } else {
       // Logger not up yet — config load failed before any secret was registered
       // (loadConfig errors carry only env key names / duration values, never the
       // token), so a raw line is safe here.
-      process.stderr.write(JSON.stringify({ level: "error", msg: "fatal", error: message }) + "\n");
+      process.stderr.write(JSON.stringify({ level: "error", msg: "fatal", error: message,
+        cause: "exception", phase: lifecyclePhase, exit_code: 1 }) + "\n");
     }
     process.exitCode = 1;
   });

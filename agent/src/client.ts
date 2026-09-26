@@ -56,6 +56,7 @@ import {
   type RecoveryReleaseResponse,
   type RecoveryReleaseRequest,
   type RecoveryHoldsResponse,
+  type RecoveryLiveSettleRequest,
   type RecoverySettleRequest,
   type RecoverySettleResponse,
 } from "./protocol.js";
@@ -893,6 +894,34 @@ export class WorkerClient {
     };
     return (await this.postJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds/${encodeURIComponent(holdId)}/settle`,
+      body,
+      undefined,
+      signal,
+    )) as RecoverySettleResponse;
+  }
+
+  /** settleRecoveryHoldLive asks the api to settle ONE older-generation custody hold while the
+   *  resumed run is still live (issue #1751 M2): POST /runs/{id}/recovery-holds/{holdID}/settle-live
+   *  with the strict six-field body. Same answer shape and error contract as
+   *  {@link settleRecoveryHold}: throws RequestError on 4xx/5xx (a 404 is also an older api without
+   *  the route), bounded by the client's request timeout, and `signal` aborts an in-flight call. */
+  async settleRecoveryHoldLive(
+    runId: string,
+    holdId: string,
+    req: RecoveryLiveSettleRequest,
+    signal?: AbortSignal,
+  ): Promise<RecoverySettleResponse> {
+    // Build the body field-by-field so nothing beyond the six strict fields can ride along.
+    const body: RecoveryLiveSettleRequest = {
+      predecessor_generation: req.predecessor_generation,
+      successor_generation: req.successor_generation,
+      published_sha: req.published_sha,
+      source_sha: req.source_sha,
+      adopted_sha: req.adopted_sha,
+      target: req.target,
+    };
+    return (await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds/${encodeURIComponent(holdId)}/settle-live`,
       body,
       undefined,
       signal,

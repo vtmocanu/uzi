@@ -138,7 +138,7 @@ operator-configurable environment variable on the API:
 | Automatic upload-retry window | 24 hours | How long uzi keeps retrying a stalled upload before it needs your attention. |
 | Captures per claim | 16 | Distinct capture attempts one worker claim can accumulate. |
 | Retained captures per owner | 256 | Total captures you can have on file at once. |
-| Unresolved recovery holds per owner | 8 | At the limit, uzi pauses admitting **new** runs for you — existing runs are unaffected — until you resolve or discard some. Fixed today, not yet an environment variable. |
+| Unresolved recovery holds per owner | 8 | At the limit, uzi pauses admitting **new** runs for you until you resolve or discard some. A requeued run that still holds its own unresolved work is still admitted, even past the limit, until that one run alone holds 8. Fixed today, not yet an environment variable. |
 
 ## Custody: why a worker won't disappear
 
@@ -190,10 +190,22 @@ exactly like any other open hold: it still shows up under **Recovery
 archives**, and you can still resolve it yourself with `uzi run export` or
 `uzi run discard`.
 
+The resumed run doesn't have to finish first. While it is still running on the
+same worker, each checkpoint the server confirms it published (or, for a task
+run, its pushed branch) lets the worker ask for the same proof early. The
+server checks the candidates against the checkpoint or branch it derives for that run,
+not a ref the worker names, and releases the older hold only if the run is
+still live on that worker at that generation. A run that was cancelled,
+reclaimed, or moved in the meantime keeps the hold. An older generation taken
+by a *different* worker is never settled this way; it waits for you or for the
+completed-run check above.
+
 ## Reviewing and resolving held work
 
 At most **8 unresolved holds per owner** (the *Unresolved recovery holds*
 limit above) can accumulate before uzi pauses admitting **new** runs for you.
+A run that was interrupted and requeued while it still has its own unresolved
+hold keeps resuming, until that one run alone holds 8.
 When that happens, the dashboard shows a full-width alert beneath the page
 heading with your safety-slot use, how many held sources need a decision, how
 many runs are blocked, and a **Review held work** button; if you connected

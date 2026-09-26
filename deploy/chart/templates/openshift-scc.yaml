@@ -1,0 +1,145 @@
+{{- if and .Values.workers.enabled .Values.openshift.enabled }}
+{{- /*
+  OpenShift SecurityContextConstraints for the hosted workers (docs/openshift.md).
+
+  The controller renders worker pods with explicit ids and, under workers.uidSplit, a root
+  start with a fixed capability set (controller/internal/kube/render.go podTemplate).
+  OpenShift's default `restricted-v2` SCC rejects both: it assigns ids from the namespace
+  range and allows no added capabilities. So each worker ServiceAccount gets an SCC `use`
+  grant for exactly what its pods need, and nothing else:
+
+    kube-native tier -> <fullname>-worker, the minimal SCC below.
+    docker tier      -> the built-in `privileged` SCC: its DinD sidecar is privileged in
+                        both postures (render_dind.go), which no narrower SCC admits.
+
+  An SCC `use` grant is an ADMISSION permission, checked when the pod is created. It gives
+  the ServiceAccount no API verbs, and worker pods mount no token, so the "zero
+  permissions" property of the worker identity (worker-rbac.yaml) is unchanged.
+*/}}
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: {{ include "uzi.fullname" . }}-worker
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+allowPrivilegedContainer: false
+allowPrivilegeEscalation: false
+allowHostDirVolumePlugin: false
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPID: false
+allowHostPorts: false
+readOnlyRootFilesystem: false
+{{- if .Values.workers.uidSplit.enabled }}
+# uidSplit: the worker and seed-nix containers start as uid 0 to establish the
+# worker/runner/runner-cmd split, then drop. Worker: SETUID SETGID SETPCAP CHOWN
+# DAC_OVERRIDE; seed-nix: CHOWN DAC_OVERRIDE FOWNER. Every container drops ALL first.
+allowedCapabilities:
+  - SETUID
+  - SETGID
+  - SETPCAP
+  - CHOWN
+  - DAC_OVERRIDE
+  - FOWNER
+runAsUser:
+  type: RunAsAny
+{{- else }}
+# Single-uid posture: every container runs as uid 10001 and adds no capability.
+allowedCapabilities: []
+runAsUser:
+  type: MustRunAsRange
+  uidRangeMin: 10001
+  uidRangeMax: 10001
+{{- end }}
+defaultAddCapabilities: []
+# Every container must drop ALL; the uidSplit set above is then the only thing it may add
+# back (the same shape as OpenShift's own restricted-v2: drop ALL, allow NET_BIND_SERVICE).
+requiredDropCapabilities:
+  - ALL
+# fsGroup 10001 makes the RWO volumes writable and the join-token Secret readable
+# (root:<fsGroup> 0440) for the worker's gid.
+fsGroup:
+  type: MustRunAs
+  ranges:
+    - min: 10001
+      max: 10001
+supplementalGroups:
+  type: RunAsAny
+# The namespace's own MCS label, as restricted-v2 assigns it.
+seLinuxContext:
+  type: MustRunAs
+seccompProfiles:
+  - runtime/default
+# Exactly the volume types a kube-native worker pod mounts.
+volumes:
+  - secret
+  - persistentVolumeClaim
+  - emptyDir
+users: []
+groups: []
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "uzi.fullname" . }}-worker-scc
+  namespace: {{ .Values.workers.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+rules:
+  - apiGroups: ["security.openshift.io"]
+    resources: ["securitycontextconstraints"]
+    resourceNames: [{{ printf "%s-worker" (include "uzi.fullname" .) | quote }}]
+    verbs: ["use"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "uzi.fullname" . }}-worker-scc
+  namespace: {{ .Values.workers.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "uzi.fullname" . }}-worker-scc
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.workers.serviceAccountName }}
+    namespace: {{ .Values.workers.namespace }}
+{{- if .Values.workers.docker.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "uzi.fullname" . }}-worker-docker-scc
+  namespace: {{ .Values.workers.docker.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-docker
+rules:
+  - apiGroups: ["security.openshift.io"]
+    resources: ["securitycontextconstraints"]
+    resourceNames: ["privileged"]
+    verbs: ["use"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "uzi.fullname" . }}-worker-docker-scc
+  namespace: {{ .Values.workers.docker.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-docker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "uzi.fullname" . }}-worker-docker-scc
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.workers.serviceAccountName }}
+    namespace: {{ .Values.workers.docker.namespace }}
+{{- end }}
+{{- end }}

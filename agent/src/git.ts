@@ -391,13 +391,14 @@ function runnerTrackingRef(branch: string): string {
 // `refs/uzi-runner` (issue #887) — it never carries the branch.
 const RECOVERY_PIN_PREFIX = "refs/uzi-recovery-pin/";
 // issue #1582 M2 — the settlement pins for an older-generation custody hold a same-worker successor
-// adopted: `refs/uzi-settle/<runId>/<holdId>/{source,adopted,pushed}`. They keep the three candidate
-// commits the settle request names reachable (a `--all` gc root, like refs/uzi-recovery-pin) until the
+// adopted: `refs/uzi-settle/<runId>/<holdId>/{source,adopted,pushed,published}`. They keep the candidate
+// commits a settle request names reachable (`published` is the live-publication tip a
+// `/settle-live` request names, issue #1751 M2) (a `--all` gc root, like refs/uzi-recovery-pin) until the
 // api releases the hold. Both ids are sanitized into SINGLE safe path components; an id that
 // sanitizes to empty yields no ref at all.
 const SETTLE_PIN_PREFIX = "refs/uzi-settle/";
-type SettlementPinKind = "source" | "adopted" | "pushed";
-const SETTLEMENT_PIN_KINDS: readonly SettlementPinKind[] = ["source", "adopted", "pushed"];
+export type SettlementPinKind = "source" | "adopted" | "pushed" | "published";
+const SETTLEMENT_PIN_KINDS: readonly SettlementPinKind[] = ["source", "adopted", "pushed", "published"];
 function settlementPinBase(runId: string, holdId: string): string | null {
   const rid = runId.replace(/[^A-Za-z0-9_-]/g, "-");
   const hid = holdId.replace(/[^A-Za-z0-9_-]/g, "-");
@@ -2090,8 +2091,16 @@ export class GitCache {
     }
   }
 
+  /** issue #1751 M2 — best-effort remove ONE settlement pin kind for ONE hold (a live-settle leg
+   *  cleared without a release drops only its `published` pin). Never throws. */
+  async deleteSettlementPin(barePath: string, runId: string, holdId: string, kind: SettlementPinKind): Promise<void> {
+    const base = settlementPinBase(runId, holdId);
+    if (base === null) return;
+    await this.tryGit(barePath, ["update-ref", "-d", `${base}${kind}`]);
+  }
+
   /** issue #1582 M2 — best-effort remove every settlement pin for ONE hold (after the api
-   *  released it). Never throws. */
+   *  released it), the issue #1751 `published` pin included. Never throws. */
   async deleteSettlementRefs(barePath: string, runId: string, holdId: string): Promise<void> {
     const base = settlementPinBase(runId, holdId);
     if (base === null) return;

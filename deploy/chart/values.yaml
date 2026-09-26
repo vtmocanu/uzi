@@ -569,7 +569,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.84.0-rc.15"
+    tag: "0.85.0-rc.2"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
@@ -668,12 +668,32 @@ workers:
   # schedule instead of by luck. The controller's render.go states the three
   # mechanisms and a unit test enforces it.
   ephemeralRequest: 512Mi
+  # Where the hosted worker's join-token Secret (worker_token + ca.crt) mounts (issue
+  # #1761). Empty keeps the default /run/secrets, and then nothing about the worker pod
+  # changes. OpenShift/OKD MUST set it (the render fails otherwise when
+  # openshift.enabled): CRI-O's default mounts file injects its own /run/secrets into
+  # every container and SHADOWS a volume mounted there, so the worker finds no token and
+  # crash-loops. Must be ONE lower-case directory directly under /run, e.g.
+  # /run/uzi-secrets; the controller also refuses to boot on one that overlaps another
+  # worker mount (for example /run/dind).
+  #
+  # ⚠️ The worker IMAGE must carry the same change (workers.image.tag is decoupled from
+  # the chart and does not move with it). An OLDER image still starts with a relocated
+  # Secret, but its guardrails deny only /run/secrets/, leaving the new directory
+  # unguarded. So both the render and the controller REFUSE a relocated path unless
+  # workers.image.tag is >= 0.85.0-rc.2 (semver precedence, prereleases included).
+  secretMountPath: ""
+  # Only for a workers.image.tag that is NOT semver (a digest, `dev`), which cannot be
+  # compared with the minimum: true states that the image carries the relocated-Secret
+  # support. It never rescues an old semver tag. Rendered as the controller's
+  # UZI_WORKER_SECRET_MOUNT_ALLOW_UNVERSIONED_IMAGE.
+  secretMountPathAllowUnversionedImage: false
   # Namespace ResourceQuota (Decision 8). Defense in depth under the api's per-user
   # quota: an app-level bug must not noisy-neighbour a shared cluster.
   #
   # CPU and memory track the DEFAULT `m` size (issue #1341 raised m's request to 4Gi),
   # not the worst case: 20 workers x 500m = 10 CPU and 20 x 4Gi = 80Gi requested. STORAGE
-  # instead tracks the WORST-CASE `l` size — 20 x (20Gi data + 20Gi nix) = 800Gi of PVC —
+  # instead tracks the WORST-CASE `l` size — 20 x (25Gi data + 20Gi nix) = 900Gi of PVC —
   # and is the binding constraint, not CPU or memory. Raising m's memory request WITHOUT
   # raising this key caps the admissible fleet below `deployments`: the next worker is
   # QUOTA-refused at admission ("provisions and never appears"), a failure no repo test
@@ -683,8 +703,8 @@ workers:
   # WORST CASE MEANS `l`, NOT `m`, AND THAT IS THE WHOLE POINT OF THE NUMBER. Nothing
   # scopes a size to a tier — preset.SizeNames() is global and render.go feeds
   # spec.Size.DataSize to both tiers — so any of these 20 workers may be an `l` with a
-  # 20Gi /data. Sizing on `m` (10Gi) gave 600Gi, which caps at 15 `l` workers against
-  # a tier advertising 20: the 16th is refused with a QUOTA error rather than a
+  # 25Gi /data. Sizing on `m` (10Gi) gave 600Gi, which caps at 13 `l` workers against
+  # a tier advertising 20: the 14th is refused with a QUOTA error rather than a
   # scheduling one, and no test in this repo can see it. If `l` should not be
   # available here, the fix is to scope it off the tier, not to under-budget.
   #
@@ -713,7 +733,7 @@ workers:
     enabled: true
     requestsCPU: "10"
     requestsMemory: 80Gi
-    requestsStorage: 800Gi
+    requestsStorage: 900Gi
     persistentVolumeClaims: "40"
     # READ BY A CONTROLLER TEST, not merely documented here. This is the restricted
     # tier's fleet size, and TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes
@@ -727,16 +747,15 @@ workers:
   #
   # `max` MUST stay >= the LARGEST preset's limits (l = 4 CPU / 12Gi) or that preset
   # stops being admissible — which would surface as a worker that provisions and never
-  # appears. maxPVCStorage likewise >= l's /data (20Gi).
+  # appears. maxPVCStorage likewise >= l's /data (25Gi).
   #
-  # maxPVCStorage IS AT ITS CEILING ON EVERY CLAIMANT TODAY: nixSize is 20Gi and `l`'s
-  # DataSize is 20Gi, so LOWERING this value makes every worker's claim inadmissible and
+  # maxPVCStorage IS AT ITS CEILING TODAY: `l`'s DataSize is 25Gi (nixSize is 20Gi), so
+  # LOWERING this value makes `l` workers' claims inadmissible and
   # nothing renders red — the rejection happens at admission, in the cluster, and the
   # worker simply never appears. The two guards that catch it are
   # TestPresetPVCSizesFitTheChartsLimitRangeMax (controller/internal/preset, for the two
-  # sizes compiled into the controller, which carries this number as a constant and must
-  # be edited with it) and the chart's own worker-invariants.yaml (for chart-supplied
-  # PVC sizes). Raise quota.requestsStorage above whenever you raise this.
+  # sizes compiled into the controller; it reads this value out of this file) and the
+  # chart's own worker-invariants.yaml (for chart-supplied PVC sizes). Raise quota.requestsStorage above whenever you raise this.
   limitRange:
     enabled: true
     default:
@@ -748,7 +767,7 @@ workers:
     max:
       cpu: "4"
       memory: 12Gi
-    maxPVCStorage: 20Gi
+    maxPVCStorage: 25Gi
   # --- the docker-capable worker tier (PRD #83 M3, PRD #89) ---------------------
   #
   # A SECOND, DEDICATED namespace running `pod-security.kubernetes.io/enforce:
@@ -852,7 +871,7 @@ workers:
     # Sized for the 10 workers `deployments` advertises. MEMORY tracks the DEFAULT `m`
     # size plus the DinD sidecar (issue #1341 raised m's request to 4Gi): 10 x (4Gi worker
     # + ~256Mi sidecar request) ~= 42.5Gi, rounded up to 48Gi for headroom. STORAGE tracks
-    # THREE PVCs each: 10 x (20Gi data + 20Gi nix + 20Gi dind) = 600Gi, and 10 x 3 = 30
+    # THREE PVCs each: 10 x (25Gi data + 20Gi nix + 20Gi dind) = 650Gi, and 10 x 3 = 30
     # claims. The data term is `l`'s, the worst case. STORAGE is the binding constraint
     # here too — and it already was before M-a: at 140Gi / 20 claims this tier held 3 `l`
     # workers against the 10 it advertises, so the triple was never self-consistent. As on
@@ -864,7 +883,7 @@ workers:
       enabled: true
       requestsCPU: "8"
       requestsMemory: 48Gi
-      requestsStorage: 600Gi
+      requestsStorage: 650Gi
       # BOTH CLAUSES OF WHAT THIS COMMENT USED TO SAY WERE FALSE, and issue #224 M-a
       # falsified the first of them a second time over. It read: "emptyDir dind data
       # roots land on node ephemeral storage; bound it so a runaway image pull cannot
@@ -889,14 +908,14 @@ workers:
       # READ BY A CONTROLLER TEST — see the restricted tier's `deployments` above.
       # TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes parses this value to
       # check a full fleet's ephemeral-storage requests against the node pool, and
-      # docker workers are the expensive half (4Gi each against the plain tier's
-      # 512Mi). Raising this to 20 makes a full fleet need 90 GiB against a 70.2 GiB
+      # docker workers are the expensive half (5Gi each against the plain tier's
+      # 512Mi). Raising this to 20 makes a full fleet need 130 GiB against a 70.2 GiB
       # pool, and that test is what says so.
       deployments: "10"
     # The backstop, never the source (the controller renders explicit requests+limits
-    # on every container, sidecars included). `max` must stay >= the largest worker
-    # preset's limits PLUS the sidecar's, or the biggest docker worker stops being
-    # admissible.
+    # on every container, sidecars included). `max` is checked PER CONTAINER (type
+    # Container), so it must stay >= the largest worker preset's limits AND >= the
+    # sidecar's, each on its own, or the biggest docker worker stops being admissible.
     limitRange:
       enabled: true
       default:
@@ -908,15 +927,16 @@ workers:
       max:
         cpu: "4"
         memory: 12Gi
-      # THREE claimants sit exactly on this ceiling: dindDataSize below, nixSize (20Gi)
-      # and `l`'s DataSize (20Gi). Raising any of them without raising this makes that
-      # claim inadmissible, and nothing renders red — the LimitRange rejects it at
-      # admission and the worker provisions and never appears. dindDataSize is guarded
-      # against this value in worker-invariants.yaml; the other two are Go constants a
-      # chart cannot read and are guarded by TestPresetPVCSizesFitTheChartsLimitRangeMax
-      # (controller/internal/preset), which carries this number as a constant and must be
-      # edited alongside it. Raise quota.requestsStorage above whenever you raise this.
-      maxPVCStorage: 20Gi
+      # THREE claimants sit at or under this ceiling: `l`'s DataSize (25Gi) exactly,
+      # dindDataSize below and nixSize (20Gi each). Raising any of them past it without
+      # raising this makes that claim inadmissible, and nothing renders red — the
+      # LimitRange rejects it at admission and the worker provisions and never appears.
+      # dindDataSize is guarded against this value in worker-invariants.yaml; the other
+      # two are Go constants a chart cannot read and are guarded by
+      # TestPresetPVCSizesFitTheChartsLimitRangeMax (controller/internal/preset), which
+      # reads this value out of this file. Raise quota.requestsStorage above whenever you
+      # raise this.
+      maxPVCStorage: 25Gi
     # The DinD sidecar's resource requests + limits (PRD #89 0.8.1). The controller renders
     # the sidecar with these (flattened to UZI_WORKER_DIND_{REQUEST,LIMIT}_{CPU,MEMORY}).
     # The default (250m/256Mi req, 2/2Gi lim) is enough for `docker`/compose that pulls
@@ -942,9 +962,9 @@ workers:
     # looking re-claim. On a PVC the daemon just runs out of room: the docker step
     # fails with ENOSPC, the pod lives, the tree lives.
     #
-    # 20Gi is also the CEILING, not just the default: limitRange.maxPVCStorage above
-    # is 20Gi and the limitranger validates PVC creates, so a larger value is rejected
-    # at admission. Raise both together, and raise quota.requestsStorage with them.
+    # The CEILING is limitRange.maxPVCStorage above (25Gi, set by `l`'s /data): the
+    # limitranger validates PVC creates, so a larger value is rejected at admission.
+    # Raise both together, and raise quota.requestsStorage with them.
     # worker-invariants.yaml refuses to render the mismatched pair, so this is a
     # `helm install` error rather than a worker that provisions and never appears.
     #
@@ -973,14 +993,17 @@ workers:
     # #1598 every worker, plain or docker, also carries the worker-only codex-cmd-cache
     # emptyDir (a run's Codex command build cache), which counts toward this request too
     # regardless of tier. uzi's own repo is a ~170 MiB runner clone before a single
-    # dependency install; 4Gi covers roughly two concurrent heavy runs.
+    # dependency install.
     #
-    # It is 4Gi rather than the larger figure an emptyDir-based design needed because
-    # dindDataSize above moved the daemon's image cache to a PVC, which was ~99% of
-    # the measured footprint. Re-derive what is left on ephemeral storage before
-    # raising it — that re-derivation must now also account for codex-cmd-cache; see
-    # adr/1598-codex-command-storage.md (the hosted-worker measurement is pending).
-    ephemeralRequest: 4Gi
+    # Issue #1757 raised it from 4Gi to 5Gi as provisional, unmeasured headroom for the
+    # codex-cmd-cache emptyDir and a lower eviction rank under node disk pressure. 5Gi,
+    # not 6Gi, so three still pack onto a ~17.5 GiB node and this tier's 10 workers
+    # place on four such nodes; a cluster with larger node disks can raise it here. The image cache stays off this
+    # budget (dindDataSize above moved it to a PVC; it was ~99% of the measured
+    # footprint). A request only ranks and places the pod: it cannot stop an eviction
+    # on a node whose root disk is itself too small. Re-derive what is left on
+    # ephemeral storage before raising it again; see adr/1598-codex-command-storage.md.
+    ephemeralRequest: 5Gi
   # The CNI-INDEPENDENT floor: default-deny both directions, plus the two in-cluster
   # destinations an FQDN rule structurally cannot express (AntreaProxy rewrites a
   # ClusterIP before policy enforcement, so FQDN cannot match a Service).
@@ -993,6 +1016,12 @@ workers:
       namespace: kube-system
       podSelector:
         k8s-app: kube-dns
+      # Destination ports on the DNS PODS (a NetworkPolicy matches the pod port, not the
+      # Service port). kube-dns/CoreDNS pods listen on 53; OpenShift's DNS pods listen on
+      # 5353 behind a port-53 Service, so an OpenShift cluster sets [5353] here (and the
+      # namespace/podSelector above to its DNS daemonset). Each port is allowed for UDP and
+      # TCP. Used by both worker namespaces' policies.
+      ports: [53]
     # Allow workers to reach uzi's OWN in-cluster web Service (PRD #87 §5 / M5). A
     # browser-capable worker running `web-ux` drives uzi's web UI, which this floor
     # otherwise denies (it allows only DNS + the api). Selector-based, NOT an FQDN
@@ -1015,6 +1044,41 @@ workers:
   # off (no Antrea there, and kindnet enforces no NetworkPolicy whatsoever).
   fqdnEgress:
     enabled: false
+    # Which datapath expresses the named egress (denyCIDRs, allowFQDNs, and the forge hosts
+    # derived from forge.allowedBaseURLs):
+    #   antrea (default): one crd.antrea.io NetworkPolicy (worker-fqdn-egress.yaml). An
+    #          Antrea Allow jumps past the k8s NetworkPolicy floor, so no floor change is
+    #          needed.
+    #   ovn:   OVN-Kubernetes (e.g. OpenShift/OKD), worker-ovn-egress.yaml. OVN has no
+    #          Allow that bypasses NetworkPolicy, so this renders a COMPOSED pair in the
+    #          kube-native worker namespace: (a) a NetworkPolicy allowing egress to
+    #          0.0.0.0/0 EXCEPT ovn.exceptCIDRs (keeps pod/service/node/link-local lateral
+    #          traffic blocked while external traffic passes the floor), and (b) the
+    #          namespace's k8s.ovn.org EgressFirewall `default`: Deny each denyCIDRs entry,
+    #          Allow each derived forge host and allowFQDNs entry by dnsName on its ports,
+    #          then Deny 0.0.0.0/0. OVN resolves dnsName entries itself and refreshes them on
+    #          the record's TTL, so a name whose addresses rotate faster than its TTL can
+    #          briefly miss.
+    #          WILDCARDS ARE NOT A VERSION PREREQUISITE: a wildcard dnsName (e.g.
+    #          "*.anthropic.com") is enforced only on a cluster with the DNSNameResolver
+    #          feature (the `dnsnameresolvers.network.openshift.io` CRD), which OpenShift
+    #          ships as a Technology Preview feature gate, off by default. An API server
+    #          that ACCEPTS the object proves nothing about enforcement. So the render
+    #          REFUSES any `*` entry under provider ovn unless ovn.allowWildcards is true;
+    #          where the gate is off, list exact hostnames instead (e.g. api.anthropic.com
+    #          for *.anthropic.com) and verify reachability at runtime.
+    # tier/priority below apply to antrea only.
+    provider: antrea
+    ovn:
+      # REQUIRED with provider: ovn (the render fails if empty): every in-cluster and
+      # host range a worker must NOT reach through the external allow, typically the pod
+      # network, the service network, the node network and link-local. Example:
+      #   exceptCIDRs: [10.128.0.0/14, 172.30.0.0/16, 192.0.2.0/24, 169.254.0.0/16]
+      exceptCIDRs: []
+      # Set true ONLY on a cluster with the DNSNameResolver feature enabled (see above).
+      # False (default) fails the render on any "*" entry in allowFQDNs, so a cluster
+      # without the feature cannot silently receive an allow rule that matches nothing.
+      allowWildcards: false
     tier: application
     priority: 5
     # DROPPED FIRST, and not redundant with the default-deny floor: an FQDN rule
@@ -1113,6 +1177,23 @@ workers:
         fqdn: "pkg-containers.githubusercontent.com"
         ports: [443]
 
+# --- OpenShift / OKD ---------------------------------------------------------------
+# OFF by default. When true, the chart adds what OpenShift admission needs for the
+# hosted-worker namespaces (see docs/openshift.md):
+#   * `security.openshift.io/scc.podSecurityLabelSync: "false"` on both worker namespaces,
+#     so OpenShift's label syncer does not overwrite the chart's PodSecurity labels;
+#   * SCC `use` grants for the worker ServiceAccounts: `privileged` in the docker tier
+#     (its DinD sidecar is privileged in both postures), and a chart-rendered minimal SCC
+#     `<fullname>-worker` in the kube-native tier, admitting exactly what the controller
+#     renders there (uid 10001, or root with a fixed capability set under uidSplit).
+# It also REQUIRES workers.secretMountPath (see there): CRI-O shadows /run/secrets on
+# OpenShift, so the render fails while it is left at the default.
+# These are ADMISSION grants only: the worker ServiceAccounts still hold no API verbs and
+# mount no token. The api, web and controller need nothing beyond `restricted-v2` once
+# their pinned ids are nulled (above).
+openshift:
+  enabled: false
+
 # --- web: nginx serving the SPA + reverse-proxying /api/* to the api Service -----
 web:
   enabled: true
@@ -1175,6 +1256,20 @@ web:
     tls:
       enabled: false
       secretName: uzi-tls
+  # Gateway API alternative to the Ingress above (gateway.networking.k8s.io/v1 HTTPRoute),
+  # for clusters that expose apps through a shared Gateway (e.g. OpenShift with a Gateway
+  # API implementation). MUTUALLY EXCLUSIVE with web.ingress: enabling both fails the render,
+  # so set web.ingress.enabled: false when turning this on. TLS terminates wherever your
+  # Gateway (or the router in front of it) terminates it; nothing TLS-specific renders here.
+  # /api/ws is a long-lived WebSocket: raise the idle timeout on whatever sits in front of
+  # the Gateway, as the ingress-nginx annotations above do for Ingress.
+  httpRoute:
+    enabled: false
+    # e.g. [uzi.example.com]
+    hostnames: []
+    # e.g. [{name: shared, namespace: gateway-system}] (Gateway API parentRefs, verbatim)
+    parentRefs: []
+    annotations: {}
 
 # --- Runtime secrets via Infisical (opt-in; used only when secrets.mode: infisical) ---
 # When selected, the chart renders InfisicalSecret CRs (from infisicalList) so a cluster
@@ -1214,6 +1309,14 @@ infisicalList:
 
 # Restricted-PodSecurity contexts (satisfy the `restricted` standard everywhere;
 # harmless where it is not enforced).
+#
+# OpenShift/OKD: the default `restricted-v2` SCC assigns each pod a UID and fsGroup from
+# the namespace's range and REJECTS a pod that pins its own. Null the three pinned ids in
+# your values and the rendered pods omit them (Helm deletes a key whose override is null):
+#   api_podSecurityContext: {runAsUser: null, runAsGroup: null, fsGroup: null}
+# (same for controller_podSecurityContext, web_podSecurityContext and, in simple mode,
+# database.simple.podSecurityContext). runAsNonRoot, seccomp and the dropped capabilities
+# stay. See docs/openshift.md.
 #
 # api: distroless static-nonroot image (uid/gid 65532); the server writes nothing
 # to disk, so its root fs is read-only (a small emptyDir covers /tmp for TLS/temp).
