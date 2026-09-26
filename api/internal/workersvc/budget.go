@@ -55,8 +55,11 @@ const (
 	// Issue #1751 / ADR-1751 continuation exemption: a requeued run that was claimed before
 	// (claim_generation >= 1) and still holds its OWN open custody hold is exempt from this
 	// cap — it continues work already in custody, so it re-claims even at/above the limit
-	// (and may open another generation hold). Only fresh runs, or runs whose own holds are
-	// all released/discarded, are blocked. Concurrent claims can still overshoot the cap
+	// (and may open another generation hold). The exemption is bounded per run: it holds
+	// only while the run's own open-hold count is below this limit, so a run the
+	// never-started sweep keeps requeueing (no hold release) cannot open holds forever.
+	// Fresh runs, runs whose own holds are all released/discarded, and runs already holding
+	// this many of their own are blocked. Concurrent claims can still overshoot the cap
 	// (#1318): it is an admission gate, not a strict ceiling.
 	custodyHoldLimit = 8
 )

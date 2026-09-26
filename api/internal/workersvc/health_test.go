@@ -115,6 +115,9 @@ type healthFakeStore struct {
 	custodyCalls []uuid.UUID
 	// custodyRunCalls records every lookup's run id (issue #1751: the exemption is per run).
 	custodyRunCalls []uuid.UUID
+	// custodyLimitCalls records every lookup's custody_hold_limit (issue #1751: the per-run
+	// exemption bound is the same limit ClaimRun is passed).
+	custodyLimitCalls []int32
 }
 
 func (f *healthFakeStore) ListActiveRunsForHealth(context.Context, []string) ([]store.ListActiveRunsForHealthRow, error) {
@@ -198,6 +201,7 @@ func (f *healthFakeStore) ListRunLeadToolWindow(_ context.Context, arg store.Lis
 func (f *healthFakeStore) GetCustodyAdmissionForRun(_ context.Context, arg store.GetCustodyAdmissionForRunParams) (store.GetCustodyAdmissionForRunRow, error) {
 	f.custodyCalls = append(f.custodyCalls, arg.UserID)
 	f.custodyRunCalls = append(f.custodyRunCalls, arg.RunID)
+	f.custodyLimitCalls = append(f.custodyLimitCalls, arg.CustodyHoldLimit)
 	if f.custodyErr != nil {
 		return store.GetCustodyAdmissionForRunRow{}, f.custodyErr
 	}
@@ -772,6 +776,9 @@ func TestHealthQueuedCustodyLimit(t *testing.T) {
 			}
 			if len(fs.custodyRunCalls) != 1 || fs.custodyRunCalls[0] != r.ID {
 				t.Fatalf("custody run lookups = %v, want exactly [%s] (this run)", fs.custodyRunCalls, r.ID)
+			}
+			if len(fs.custodyLimitCalls) != 1 || fs.custodyLimitCalls[0] != custodyHoldLimit {
+				t.Fatalf("custody limit args = %v, want exactly [%d] (the claim's limit)", fs.custodyLimitCalls, custodyHoldLimit)
 			}
 		})
 	}

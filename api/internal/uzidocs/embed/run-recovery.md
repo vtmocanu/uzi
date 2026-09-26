@@ -138,7 +138,7 @@ operator-configurable environment variable on the API:
 | Automatic upload-retry window | 24 hours | How long uzi keeps retrying a stalled upload before it needs your attention. |
 | Captures per claim | 16 | Distinct capture attempts one worker claim can accumulate. |
 | Retained captures per owner | 256 | Total captures you can have on file at once. |
-| Unresolved recovery holds per owner | 8 | At the limit, uzi pauses admitting **new** runs for you — existing runs are unaffected — until you resolve or discard some. A run resuming work it already holds is still admitted, even past the limit. Fixed today, not yet an environment variable. |
+| Unresolved recovery holds per owner | 8 | At the limit, uzi pauses admitting **new** runs for you until you resolve or discard some. A requeued run that still holds its own unresolved work is still admitted, even past the limit, until that one run alone holds 8. Fixed today, not yet an environment variable. |
 
 ## Custody: why a worker won't disappear
 
@@ -194,8 +194,8 @@ archives**, and you can still resolve it yourself with `uzi run export` or
 
 At most **8 unresolved holds per owner** (the *Unresolved recovery holds*
 limit above) can accumulate before uzi pauses admitting **new** runs for you.
-A run that was interrupted and requeued while holding its own work still
-resumes; only runs with nothing held are paused.
+A run that was interrupted and requeued while it still has its own unresolved
+hold keeps resuming, until that one run alone holds 8.
 When that happens, the dashboard shows a full-width alert beneath the page
 heading with your safety-slot use, how many held sources need a decision, how
 many runs are blocked, and a **Review held work** button; if you connected

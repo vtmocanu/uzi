@@ -164,7 +164,7 @@ not an implicit consequence of either existing one.
   documented boundary in [docs/vault-threat-model.md](../docs/vault-threat-model.md) and
   is not a new or different guarantee.
 - **A cross-generation orphaned hold is a visible, actionable cost, not a silent one.** It
-  counts against `CountUnresolvedCustodyHoldsForOwner`'s per-owner ceiling (default 8) and
+  counts against the per-owner open-hold ceiling (default 8; see ADR-1751 for the continuation exemption) and
   keeps its worker undeleteable, surfaced as the `retaining_unpublished_work` worker flag
   and the `reasonCustodyLimit` queued-run reason. The cost clears when the hold's work is
   durably captured (which releases the hold via the reconciler) — there is no automatic

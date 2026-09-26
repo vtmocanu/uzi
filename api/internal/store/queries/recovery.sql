@@ -521,7 +521,8 @@ ORDER BY h.created_at ASC;
 -- non-positive @custody_hold_limit DISABLES the gate exactly like the claim path, yielding 0).
 -- The code-publishing kinds match ClaimRun's custody-hold CTE (issue/ci_fix/self_improve/prompt/
 -- task/mr_rework). Issue #1751 / ADR-1751: a CONTINUATION-EXEMPT queued run (claim_generation >= 1
--- AND its own open custody hold, owner-scoped) is NOT blocked — ClaimRun admits it at/over the
+-- AND its own owner-scoped open-hold count at least 1 and below @custody_hold_limit, the per-run
+-- bound that stops a never-started sweep loop) is NOT blocked — ClaimRun admits it at/over the
 -- cap — so blocked_runs excludes it with the SAME expression ClaimRun and
 -- GetCustodyAdmissionForRun use (parity: the aggregate, the pill and the claim agree).
 -- Both columns are cast ::bigint so sqlc types them as int64, never interface{}.
@@ -542,7 +543,9 @@ SELECT
                   AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
                   AND NOT (r.claim_generation >= 1
                            AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
-                                         WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')))
+                                         WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
+                           AND (SELECT count(*) FROM recovery_custody_holds oh2
+                                  WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < @custody_hold_limit::int))
         ELSE 0
      END)::bigint AS blocked_runs;
 
