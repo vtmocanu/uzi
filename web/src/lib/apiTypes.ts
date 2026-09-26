@@ -1919,6 +1919,15 @@ export interface Worker {
   stats_disk_nix_total_bytes: number | null;
   stats_disk_data_bytes: number | null;
   stats_disk_data_total_bytes: number | null;
+  // Docker-tier DinD data root (issue #1759): the `dind-data` volume the sidecar docker
+  // daemon writes images/layers/containers to, as used/total bytes AND used/total inodes
+  // (overlay layers exhaust inodes before bytes). All null until a docker-tier worker
+  // reports a sample; a plain worker never does. Display-only: the UI adds a "Disk dind"
+  // bar filled to the fuller of the two ratios.
+  stats_disk_dind_bytes: number | null;
+  stats_disk_dind_total_bytes: number | null;
+  stats_disk_dind_inodes: number | null;
+  stats_disk_dind_total_inodes: number | null;
   // Which Anthropic credential this worker's RUN-lane claims spend (PRD #104 M3).
   // Both null means unbound: the worker spends its owner's default token, which is
   // every worker's state until someone binds one. The label rides alongside the id

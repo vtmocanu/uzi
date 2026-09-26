@@ -35,6 +35,10 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     stats_disk_nix_total_bytes: null,
     stats_disk_data_bytes: null,
     stats_disk_data_total_bytes: null,
+    stats_disk_dind_bytes: null,
+    stats_disk_dind_total_bytes: null,
+    stats_disk_dind_inodes: null,
+    stats_disk_dind_total_inodes: null,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
@@ -202,6 +206,89 @@ describe("WorkerStatGauges", () => {
   });
 });
 
+describe("WorkerStatGauges: docker-tier dind volume (issue #1759)", () => {
+  const GIB20 = 21474836480;
+  const sampled = { stats_mem_bytes: 1, stats_source: "cgroup" } as const;
+
+  it("renders no dind bar while the dind fields are null, alongside a reported /data bar", () => {
+    render(
+      <WorkerStatGauges
+        worker={aWorker({ ...sampled, stats_disk_data_bytes: 5368709120, stats_disk_data_total_bytes: 10737418240 })}
+      />,
+    );
+    // Control: the sibling disk bar IS rendered, so the dind absence is not vacuous.
+    expect(screen.getByRole("progressbar", { name: "Disk /data" })).toBeTruthy();
+    expect(screen.queryByRole("progressbar", { name: "Disk dind" })).toBeNull();
+  });
+
+  it("renders no dind bar when only one side of the byte pair is reported", () => {
+    render(<WorkerStatGauges worker={aWorker({ ...sampled, stats_disk_dind_bytes: 1, stats_disk_dind_total_bytes: null })} />);
+    expect(screen.getByRole("progressbar", { name: "CPU" })).toBeTruthy();
+    expect(screen.queryByRole("progressbar", { name: "Disk dind" })).toBeNull();
+  });
+
+  it("fills the dind bar by the bytes ratio when bytes are the fuller dimension", () => {
+    render(
+      <WorkerStatGauges
+        worker={aWorker({
+          ...sampled,
+          stats_disk_dind_bytes: 16750372454, // ~15.6 GiB → 78% (warn)
+          stats_disk_dind_total_bytes: GIB20,
+          stats_disk_dind_inodes: 412000, // ~31%
+          stats_disk_dind_total_inodes: 1310720,
+        })}
+      />,
+    );
+    const dind = screen.getByRole("progressbar", { name: "Disk dind" });
+    expect(dind.getAttribute("aria-valuenow")).toBe("78");
+    expect((dind.firstChild as HTMLElement).className).toMatch(/bg-warn/);
+    expect(dind.getAttribute("aria-valuetext")).toBe("15.6/20 GiB, 78%");
+    expect(screen.getByText("15.6/20 GiB · 78%")).toBeTruthy();
+    // The label explains what "dind" is.
+    expect(screen.getByText("Disk dind").getAttribute("title")).toMatch(/docker daemon data/);
+  });
+
+  it("fills the dind bar by the inode ratio and says so when inodes dominate", () => {
+    render(
+      <WorkerStatGauges
+        worker={aWorker({
+          ...sampled,
+          stats_disk_dind_bytes: 8589934592, // 8 GiB → 40%
+          stats_disk_dind_total_bytes: GIB20,
+          stats_disk_dind_inodes: 1284506, // → 98%
+          stats_disk_dind_total_inodes: 1310720,
+        })}
+      />,
+    );
+    const dind = screen.getByRole("progressbar", { name: "Disk dind" });
+    expect(dind.getAttribute("aria-valuenow")).toBe("98");
+    expect((dind.firstChild as HTMLElement).style.width).toBe("98%");
+    expect((dind.firstChild as HTMLElement).className).toMatch(/bg-danger/);
+    expect(screen.getByText("8/20 GiB · 40% · inodes 98%")).toBeTruthy();
+    expect(dind.getAttribute("aria-valuetext")).toBe("8/20 GiB, 40%, inodes 98%");
+  });
+
+  it("ignores a malformed zero-total inode pair: bytes drive the bar, no inode text, no crash", () => {
+    render(
+      <WorkerStatGauges
+        worker={aWorker({
+          ...sampled,
+          stats_disk_dind_bytes: 8589934592, // 40%
+          stats_disk_dind_total_bytes: GIB20,
+          stats_disk_dind_inodes: 5000,
+          stats_disk_dind_total_inodes: 0,
+        })}
+      />,
+    );
+    const dind = screen.getByRole("progressbar", { name: "Disk dind" });
+    expect(dind.getAttribute("aria-valuenow")).toBe("40");
+    expect(dind.getAttribute("aria-valuetext")).toBe("8/20 GiB, 40%");
+    // Paired with the positive above: the value text rendered, and it carries no inode note.
+    expect(screen.getByText("8/20 GiB · 40%")).toBeTruthy();
+    expect(screen.queryByText(/inodes/)).toBeNull();
+  });
+});
+
 describe("WorkerStatLine", () => {
   it("renders a compact 'cpu X% · mem used/limit' line", () => {
     render(
@@ -244,5 +331,25 @@ describe("WorkerStatLine", () => {
     );
     expect(container.textContent).toContain("cpu 34% · mem 2.1/4 GiB");
     expect(container.textContent).not.toContain("disk");
+  });
+
+  it("names inodes on the disk segment when the inode-dominant dind volume is the fullest", () => {
+    const { container } = render(
+      <WorkerStatLine
+        worker={aWorker({
+          stats_cpu_pct: 34,
+          stats_mem_bytes: 2254857830,
+          stats_mem_limit_bytes: 4294967296,
+          stats_source: "cgroup",
+          stats_disk_data_bytes: 5368709120, // 50% — fuller than dind's bytes, emptier than its inodes
+          stats_disk_data_total_bytes: 10737418240,
+          stats_disk_dind_bytes: 8589934592, // 40% bytes
+          stats_disk_dind_total_bytes: 21474836480,
+          stats_disk_dind_inodes: 1284506, // 98% inodes → the fullest volume
+          stats_disk_dind_total_inodes: 1310720,
+        })}
+      />,
+    );
+    expect(container.textContent).toContain("cpu 34% · mem 2.1/4 GiB · disk 8/20 GiB (inodes 98%)");
   });
 });

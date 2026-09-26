@@ -39,6 +39,10 @@ export const mockWorkers: Worker[] = [
     stats_disk_nix_total_bytes: 21474836480, // 20 GiB → ~35%
     stats_disk_data_bytes: 3221225472, // 3 GiB
     stats_disk_data_total_bytes: 10737418240, // 10 GiB → 30%
+    stats_disk_dind_bytes: null,
+    stats_disk_dind_total_bytes: null,
+    stats_disk_dind_inodes: null,
+    stats_disk_dind_total_inodes: null,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
@@ -76,6 +80,10 @@ export const mockWorkers: Worker[] = [
     stats_disk_nix_total_bytes: 21474836480, // 20 GiB → 90% (danger)
     stats_disk_data_bytes: 4294967296, // 4 GiB
     stats_disk_data_total_bytes: 10737418240, // 10 GiB → 40% (warn)
+    stats_disk_dind_bytes: null,
+    stats_disk_dind_total_bytes: null,
+    stats_disk_dind_inodes: null,
+    stats_disk_dind_total_inodes: null,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
@@ -129,6 +137,10 @@ export const mockWorkers: Worker[] = [
     stats_disk_nix_total_bytes: null,
     stats_disk_data_bytes: null,
     stats_disk_data_total_bytes: null,
+    stats_disk_dind_bytes: null,
+    stats_disk_dind_total_bytes: null,
+    stats_disk_dind_inodes: null,
+    stats_disk_dind_total_inodes: null,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
@@ -167,6 +179,10 @@ export const mockWorkers: Worker[] = [
     stats_disk_nix_total_bytes: null,
     stats_disk_data_bytes: 6442450944, // 6 GiB
     stats_disk_data_total_bytes: 17179869184, // 16 GiB → ~37%
+    stats_disk_dind_bytes: null,
+    stats_disk_dind_total_bytes: null,
+    stats_disk_dind_inodes: null,
+    stats_disk_dind_total_inodes: null,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
@@ -212,6 +228,11 @@ export const mockWorkers: Worker[] = [
     stats_disk_nix_total_bytes: 21474836480, // 20 GiB → 60%
     stats_disk_data_bytes: 2147483648, // 2 GiB
     stats_disk_data_total_bytes: 10737418240, // 10 GiB → 20%
+    // Docker-tier (issue #1759): the dind-data volume, bytes dominate.
+    stats_disk_dind_bytes: 16750372454, // ~15.6 GiB
+    stats_disk_dind_total_bytes: 21474836480, // 20 GiB → 78% (warn)
+    stats_disk_dind_inodes: 412000,
+    stats_disk_dind_total_inodes: 1310720,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
@@ -253,6 +274,11 @@ export const mockWorkers: Worker[] = [
     stats_disk_nix_total_bytes: 21474836480, // 20 GiB → 45%
     stats_disk_data_bytes: 5368709120, // 5 GiB
     stats_disk_data_total_bytes: 10737418240, // 10 GiB → 50%
+    // Docker-tier (issue #1759): inodes dominate, so the dind bar fills to ~98%.
+    stats_disk_dind_bytes: 8589934592, // 8 GiB
+    stats_disk_dind_total_bytes: 21474836480, // 20 GiB → 40% bytes
+    stats_disk_dind_inodes: 1284506, // ~98% of inodes: many tiny layer files
+    stats_disk_dind_total_inodes: 1310720,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
@@ -290,6 +316,10 @@ export const mockWorkers: Worker[] = [
     stats_disk_nix_total_bytes: 17179869184, // 16 GiB → ~31%
     stats_disk_data_bytes: 3221225472, // 3 GiB
     stats_disk_data_total_bytes: 10737418240, // 10 GiB → 30%
+    stats_disk_dind_bytes: null,
+    stats_disk_dind_total_bytes: null,
+    stats_disk_dind_inodes: null,
+    stats_disk_dind_total_inodes: null,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
@@ -334,6 +364,10 @@ export const mockAdminWorkers: AdminWorker[] = [
     stats_disk_nix_total_bytes: 21474836480, // 20 GiB → ~93% (danger)
     stats_disk_data_bytes: 8589934592, // 8 GiB
     stats_disk_data_total_bytes: 10737418240, // 10 GiB → 80% (warn)
+    stats_disk_dind_bytes: null,
+    stats_disk_dind_total_bytes: null,
+    stats_disk_dind_inodes: null,
+    stats_disk_dind_total_inodes: null,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
