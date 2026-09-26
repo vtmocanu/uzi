@@ -189,18 +189,26 @@ finalize opens the merge request.
 
 The direct case — the vault locks right after the provider exchange, and the
 worker gets the answer — is covered by this park too: it is still answered
-`vault_locked` and parked like any other case above. One narrower case is
-not covered: if the vault locks while resealing the credential material the
-exchange just landed, and the worker then **loses the reply** to that
-exchange (a crash or dropped connection between the api's answer and the
-worker learning it), a retry of the same operation is refused by
-authorization instead, and the run still fails. This is tracked separately;
-see [issue #1770](https://github.com/vtmocanu/uzi/issues/1770).
+`vault_locked` and parked like any other case above. Sealing after the
+exchange quarantines the account either way, to hold the refreshed login
+until the vault unlocks, whether or not the worker ever hears back. That is
+why a vault that locks while sealing after the provider exchange, when the
+worker does not receive the reply, still fails the run: a crash or dropped
+connection between the api's answer and the worker learning it means a retry
+of the same operation is refused by authorization instead, while the account
+stays quarantined. This is tracked separately; see
+[issue #1770](https://github.com/vtmocanu/uzi/issues/1770).
+
+Because the account is quarantined in the directly covered case too, a
+resumed claim that arrives before the recovery sweep promotes the refreshed
+login may briefly show the Codex-account hold ("reconciling") before it
+resumes.
 
 ### Where you'll see the vault park
 
 - The run page's recovery panel, reading **waiting for vault unlock** with
-  the next retry time. The web run list does not show this park.
+  the next retry time. The web run list shows only a generic recovery wait
+  status.
 - `uzi run get <id>` — a `VAULT` row with the owner-neutral park sentence
   and its next retry time.
 - `uzi run list` / `uzi admin runs` — the STATUS cell appends `(waiting for

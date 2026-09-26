@@ -8,17 +8,19 @@ verified capture, custody kept, report `recovery_wait`/`vault_locked`) and the w
 **Related**: issue #1766; ADR-1590 (`adr/1590-codex-binding-same-identity-readmission.md`, the
 sibling Codex-hold decision this one follows in shape: hold in `recovery_wait` rather than fail,
 one typed cause, no ad-hoc new run status); issue #1770 (the waived path this ADR carves out,
-below); PRD #1147 (`evalCodexReleasePredicate`, the single release-authority gate this decision
-extends by exactly one outcome).
+below); PRD #1147 (`evalCodexReleasePredicate`, the single release-authority gate this decision's
+recheck relies on unchanged, adding `vault_locked` as a new outcome of the refresh/release routes
+that call it, not of the predicate itself).
 
 ## Decision (summary)
 
 A Codex subscription or api_key credential refresh or release (`/worker/runs/{id}/codex/refresh`,
 `/worker/runs/{id}/codex/release`) that reaches a locked owner vault is answered **409
 `{"reason":"vault_locked"}`** — a typed, secret-free refusal — but only after the request was
-**authorized** and authority still held on a **recheck**. This is not a new bypass of the
-release predicate; it is the predicate's existing refusal, distinguished from every other refusal
-so the caller can act on it differently.
+**authorized** and authority still held on a **recheck**. This is not a bypass of the
+release predicate; `vault_locked` is a new outcome of the refresh/release routes' own later
+open/seal calls, returned only after the predicate has passed both before the network call and on
+that recheck, distinguished from every other refusal so the caller can act on it differently.
 
 Rather than fail the run, the worker **parks** it: it confirms the run is still `running`, brings
 its Codex processes to a stop without touching the credential (a **credential-free settle**), then
@@ -32,21 +34,29 @@ costs at least one model turn, then finalize opens the merge request.
 
 The direct post-exchange case is covered by this same park: a vault that locks while resealing
 credential material the exchange just landed is answered `vault_locked` and parked like any other
-case here (`api/internal/workersvc/codexrefresh.go` around lines 492-497), provided the worker
-receives that answer. One narrower path is explicitly **not** covered and is waived rather than
-closed here: if the worker then **loses the reply** to that exchange — a crash or dropped
-connection between the api's answer and the worker learning it — the account is quarantined, a
-same-operation retry answers a refusal from authorization instead, and the run still fails. This is
-issue #1770, tracked separately (see "The waived path" below).
+case here (`api/internal/workersvc/codexrefresh.go`, the seal branch around lines 687-720, surfaced
+through the caller's recheck around lines 484-492), provided the worker receives that answer. That
+seal failure quarantines the account whether or not the reply arrives — it is how the refreshed
+login is held pending vault unlock. One narrower path is explicitly **not** covered and is waived
+rather than closed here: a vault that locks while sealing after the provider exchange, when the
+worker does not receive the reply — a crash or dropped connection between the api's answer and the
+worker learning it — still fails the run. The worker's own reconcile treats the lost reply as a
+plain block with no deferral, and a same-operation retry is then refused by authorization because
+the account is quarantined. This is issue #1770, tracked separately (see "The waived path" below).
 
 ## Context
 
-Before this issue, a Codex credential call that hit a locked vault had no typed signal: the api's
-seal/open layer surfaced a plain `secretopen.ErrVaultLocked`, and the route answered it as a
-generic 500 (`codexErrInternal`, `"codex operation failed"`, `api/internal/handler/worker_codex.go`)
-indistinguishable from any other internal error. The worker's boundary reconcile treats any error
-outcome the same way — it blocks and does not proceed — so this generic failure ran the same path
-as a genuine defect: the run failed terminally, throwing away completed work and the custody hold,
+Before this issue, a Codex credential call that hit a locked vault had no typed signal, and the two
+call sites did not even fail the same way. The pre-exchange open (the ordinary refresh/release
+path, before any provider call) surfaced a plain `secretopen.ErrVaultLocked`, and the route answered
+it as a generic 500 (`codexErrInternal`, `"codex operation failed"`,
+`api/internal/handler/worker_codex.go`), indistinguishable from any other internal error. The
+post-exchange seal — a vault lock hit while resealing credential material a completed exchange had
+just landed — instead quarantined the account and surfaced `ErrCodexRefreshQuarantined`, which the
+route already answered as a typed 409 `"codex refresh is unavailable"`. Either way, the worker's
+boundary reconcile treats any error outcome the same way — it blocks and does not proceed — so
+either failure ran the same path as a genuine defect: the run failed terminally, throwing away
+completed work and the custody hold,
 for a cause that is the owner's current state, not a defect in the run's binding, and that clears
 on its own (the owner unlocks it) without the run's credential binding changing at all — the same
 reason a quarantined Codex account was wrong before ADR-1590. No caller ever proceeded through the
@@ -55,8 +65,10 @@ what happened before this issue.
 
 `evalCodexReleasePredicate` (`api/internal/workersvc/codexauthz.go`) is the single source of truth
 for "may this run act on its credential right now" — the same predicate ADR-1590 relies on for the
-Codex-account hold. This decision asks it one more question in exactly one place, after every other
-check has already passed, described in the next section.
+Codex-account hold. `vault_locked` is a new outcome of the refresh/release routes themselves, not of
+that predicate: the predicate is unchanged (it gains a comment, not a new check), and the outcome is
+returned only from the later open/seal calls, and only after the predicate passed both before the
+network call and on a recheck afterward, described in the next section.
 
 ## D1: the vault check happens after authorization, and it is the LAST check
 
@@ -104,7 +116,8 @@ run does not re-park); stop the run's Codex processes without any credential ope
 **credential-free settle** — nothing in this path may attempt another refresh or release, since that
 would just re-hit the same lock); make a **verified capture** of the work completed so far,
 published credential-free when the publish path allows it; report `recovery_wait` with cause
-`vault_locked`; keep the custody hold. The run does not open its merge request while parked this
+`vault_locked` when the api advertises the `recovery_cause_vault_locked` protocol feature, else an
+untyped `recovery_wait`; keep the custody hold. The run does not open its merge request while parked this
 way — finalize, and the completion authority that would open the MR, run only after a successful
 resume past the lock.
 
@@ -115,37 +128,41 @@ even to clean up.
 ## D4: promotion is the ordinary recovery timer, not an unlock signal
 
 Unlike the Codex-account hold (ADR-1590), which has no timer and resumes only when the account
-itself clears, a `vault_locked` park is not held on an external readiness signal at all — the api
-has no channel that tells it the moment a vault unlocks. It is promoted back to `queued` by the
-same capped-backoff recovery timer an empty-turn park uses (`RUN_RECOVERY_PARK_BASE` up to
+itself clears, a `vault_locked` park is not held on an unlock signal at all — an unlock event is
+readable (see the rejected alternative below), but nothing wires a parked run's promotion to it. It
+is promoted back to `queued` by the same capped-backoff recovery timer an empty-turn park uses
+(`RUN_RECOVERY_PARK_BASE` up to
 `RUN_RECOVERY_MAX_PARK`), with no lifetime cap. Unlocking the vault does not promote the run early.
 If the timer promotes the run while the vault is still locked, claiming it idles: the run shows
 `queued` with the health reason "your vault is locked, so this run can't start" until an unlocked
 claim attempt actually succeeds.
 
 **Rejected alternative: an unlock-triggered promotion**, mirrored on the Codex-account hold's
-account-availability signal. Rejected for this cause specifically: a vault lock is a client-side
-owner action with no server-side event to hook (the Codex-account hold's four states are derived
-at read time from the account's own stored fields, `api/internal/workersvc/codex_account_action.go`;
-the vault has no equivalent readable state to derive from here), so building one would add a new
-subsystem to save, at most, one recovery-timer interval per park. The ordinary timer is simpler and
-already exists.
+account-availability signal. The api is not blind to an unlock — `VaultUnlock`
+(`api/internal/handler/vault.go`) already pokes the Codex usage poker on a successful unlock, and
+`s.vlt.Unlocked(userID)` is read at claim time (`Claim`, `api/internal/workersvc/service.go`) and by
+the health reasoner (`api/internal/workersvc/health.go`), so a readable unlock signal exists. The
+alternative is rejected anyway, for this cause specifically: the ordinary recovery timer already
+exists and already bounds the delay to at most one backoff interval, so an unlock-triggered promote
+of parked runs would only shave that bound — a UX-latency improvement, not something correctness
+needs. It stays a possible follow-up rather than part of this decision.
 
 ## The waived path (issue #1770)
 
-**A vault that locks right after the provider exchange, followed by the worker losing the reply
-to that exchange, is waived and tracked separately as issue #1770.** If the vault locks **after**
-the provider exchange has already landed with the account — the credential material was minted,
-but resealing it durably failed because the vault was locked at that moment — the recheck this ADR
-adds (D1) still answers `vault_locked` and parks the run, exactly like the pre-exchange case, as
-long as the worker receives that answer. The gap is narrower: if the worker then **loses the
-reply** to that exchange — a crash or dropped connection between the api's answer and the worker
-learning it — the account is quarantined (the existing safety response to an ambiguous
-post-exchange outcome, unchanged by this issue), and a same-operation retry is refused by
-authorization rather than retried transparently. The run still fails in this case. This ADR does
-not close that gap: the fix needs its own investigation into safely retrying (or reconciling) a
-post-exchange seal failure without risking a double-mint, and is deliberately left to #1770 rather
-than folded in here.
+**A vault that locks while sealing after the provider exchange, when the worker does not receive
+the reply, still fails the run — waived and tracked separately as issue #1770.** If the vault
+locks **after** the provider exchange has already landed with the account — the credential
+material was minted, but resealing it durably failed because the vault was locked at that moment —
+the recheck this ADR adds (D1) still answers `vault_locked` and parks the run, exactly like the
+pre-exchange case, as long as the worker receives that answer. Either way the seal failure
+quarantines the account, to hold the refreshed login until the vault unlocks. The gap is narrower:
+if the worker then **loses the reply** to that exchange — a transport error between the api's
+answer and the worker learning it — the worker's reconcile treats it as a plain block with no
+deferral, so the run fails with no park. A same-operation retry would then be refused by
+authorization anyway, because the account is already quarantined. This ADR does not close that
+gap: the fix needs its own investigation into safely retrying (or reconciling) a post-exchange seal
+failure without risking a double-mint, and is deliberately left to #1770 rather than folded in
+here.
 
 Two related paths also still fail the run, and are noted as follow-ups rather than covered by this
 decision:
