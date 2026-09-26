@@ -368,8 +368,8 @@ export interface RunContext {
    * REASON_PLAN_MISSING, as it does when this is absent. Does not count against question_max.
    */
   askPlanMissing?: () => Promise<{ kind: "answer"; answers: string[] } | { kind: "cancel" } | { kind: "unattended" }>;
-  /** M4: dequeue the next queued follow-up to inject into the next loop turn. Called at every
-   *  work-turn boundary, a cooperative checkpoint included (#1152): one per turn, FIFO. The
+  /** M4: dequeue the next queued follow-up to inject into the next loop turn. Called at the end of
+   *  every ordinary work turn and at a cooperative checkpoint (#1152): one per turn, FIFO. The
    *  server's consumed_at ("Delivered") records only the worker's receipt via the steering poll,
    *  not this dequeue into a prompt nor that the model acted on it. */
   pullFollowUp?(): string | undefined;
