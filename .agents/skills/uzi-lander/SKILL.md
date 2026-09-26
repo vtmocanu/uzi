@@ -46,7 +46,8 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   rework vs skip, whether to wait for a re-review, resolving a conflict, and the merge
   decision itself. When a step turns out to be mechanical, put it in a script.
 - **Scale the reviewer before waiting.** Small/mechanical non-Renovate PRs get one local
-  reviewer pinned to the head, then `watch-pr.sh --reviewer none`. For a `renovate/*` PR
+  reviewer pinned to the head for initial review, then `watch-pr.sh --reviewer none`; small
+  fixes made after findings need step 4's two reviews. For a `renovate/*` PR
   or our replacement for a red Renovate PR, decide whether an independent review adds
   value from the effective diff and risk. Exact version pins plus generated lockfile churn
   may rely on green CI; code/config semantics, install scripts, native binaries, security or
@@ -171,15 +172,18 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    unreviewed head). Verify each against the current code and label it **real / inherited
    / deliberate / mock-only** (references/coderabbit-triage.md). Before touching the branch,
    check for an `mr_rework` run and defer if one is coming (references/mr-rework.md; on a
-   run created with `--mr-rework=false` none will). When you choose the local-fix path and
-   no rework is needed, DISABLE auto-rework for this PR's run first — `uzi run mr-rework RUN
-   --enabled=false` — so a local push and an auto-triggered rework do not fix the same
+   run created with `--mr-rework=false` none will). Before editing locally or replying to
+   skip a finding, DISABLE auto-rework for this PR's run (a finding-thread reply can trigger
+   another rework): `uzi run mr-rework RUN --enabled=false`, so a local push and an auto-triggered rework do not fix the same
    findings twice (uzi's poller can enqueue one on the same review comments; the lander is
    the only side that knows a local fix is already in flight). Re-enable (`--enabled`) if you
    later hand a finding back to rework. Then decide, per finding set:
    - **small / quick** (localized, no design change): fix locally by default, one push per
      PR via `S/land-prep.sh OWNER/REPO PR` (it re-checks the rework lane and pushes with a
-     lease), trail `fix local → pushed`;
+     lease), trail `fix local → pushed`. Before merging, require two clean reviews of that
+     exact SHA: a live Codex lander peer found via session-peers (`peers.py list`), plus
+     CodeRabbit (Greptile when CR is rate-limited). Skill-maintenance `[skip-cr]` PRs keep
+     their own rule below;
    - **big** (design-level, many files, needs the plan's context): `uzi run rework RUN -m
      'GUIDANCE'` (single-quoted), `SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)` captured first,
      `S/wait-mrrework.sh OWNER/REPO PR 45 60 "$SINCE"`, review its commit, trail `fix rework`.
@@ -190,7 +194,8 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    Decide, then report the decisions in one message (finding, label, choice, why) and
    execute; do not wait for answers. Several PRs with findings → assess all, report once,
    execute unattended.
-   **After a push, the re-review is your call:** wait for it when the fix changed logic or
+   **For pushes outside the small-fix rule above, re-review is your call** (a rework's
+   commit is still reviewed, references/mr-rework.md): wait for it when the fix changed logic or
    a trust boundary; merge on green CI alone when it did not (docs, comments, renames:
    `watch-pr.sh --reviewer none`, which scopes Greptile's comments to its last verdict);
    ask when unsure and the user is present. Say which in the merge note. Greptile does not
@@ -286,7 +291,7 @@ session-peers registry, so a Codex thread with a shim is a peer like any Claude 
 - **Order: reserve bot quota for big PRs.** Priority defaults to the PR's file count. A
   large or trust-boundary PR can justify CodeRabbit/Greptile; a small non-Renovate PR uses
   a local reviewer, while a Renovate-class PR may use CI alone after the agent's explicit
-  risk decision. Neither consumes bot quota. The sessions decide among themselves
+  risk decision. These initial-review lanes consume no bot quota. The sessions decide among themselves
   (SendMessage, one line: what you hold, what you are about to consume, what you propose);
   the user overrides with `--priority`.
 - **Dependencies.** `S/claims.sh claim '#B' --depends-on '#A'` when B must land after A;
@@ -324,8 +329,8 @@ a user reply that arrives first wins.
 - A skill-maintenance PR is titled with `[skip-cr]` (no bot review), reviewed by a local
   agent or a peer session, and by the user. Re-run `agnix` on `SKILL.md` after editing;
   `task check:skill-size` gates the size. A Codex peer's shim delivers at most three
-  consecutive replies per 30 minutes; before a fourth review round run
-  `peers.py budget reset <peer>` (session-peers skill) or its verdict is dropped silently
+  consecutive replies per 30 minutes; before a fourth consecutive review reply run
+  `peers.py budget reset <peer>` (session-peers skill), otherwise the verdict is held
   (the shim log names it).
 
 ## Files
