@@ -4573,6 +4573,9 @@ describe("CodexExecutor: command git trust (issue #1716)", () => {
       await fs.symlink(path.join(base, "real"), path.join(base, "link"));
       const linkA = path.join(base, "link", "A");
 
+      // git >= 2.46 (2.54 on the tested worker) normalizes safe.directory values itself, so the
+      // git spawns below would pass even without the realpath step. The path-equality assertions
+      // (this one and GIT_CONFIG_VALUE_1 === realA) are the load-bearing ones: do not remove them.
       assert.equal(await canonicalCheckoutPath(linkA), realA, "the production realpath step resolves the symlink");
       const { fileop } = await productionEnvs(linkA, { PATH: path.dirname(gitBin) });
 
@@ -4590,6 +4593,19 @@ describe("CodexExecutor: command git trust (issue #1716)", () => {
     } finally {
       await fs.rm(base, { recursive: true, force: true });
     }
+  });
+
+  it("buildCommandEnv itself drops toolEnv git config (defence in depth)", () => {
+    // Defence in depth, unreachable via provisioning today (provision.ts PROVISION_ENV_ALLOWLIST
+    // is PATH, NIX_SSL_CERT_FILE, LOCALE_ARCHIVE): buildCommandEnv must drop inline git config on
+    // its own, not only because withCommandGitTrust strips it again in run().
+    const env = buildCommandEnv("/t", {
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "safe.directory",
+      GIT_CONFIG_VALUE_0: "*",
+      GIT_CONFIG_PARAMETERS: "'safe.directory'='*'",
+    });
+    assert.deepEqual(Object.keys(env).filter((k) => k.startsWith("GIT_CONFIG")), []);
   });
 
   it("canonicalCheckoutPath falls back to the resolved path only on ENOENT", async () => {
@@ -6135,14 +6151,20 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     const inlinePairs = (env: NodeJS.ProcessEnv): [string, string][] =>
       Array.from({ length: Number(env.GIT_CONFIG_COUNT ?? "0") }, (_, i) =>
         [String(env[`GIT_CONFIG_KEY_${i}`]), String(env[`GIT_CONFIG_VALUE_${i}`])]);
-    const sink = c.specs.at(-1)!.env;
+    // Select the launched roots by their sandboxed argv[0], not by launch order.
+    const launchedArgv0 = (spec: CodexEffectLaunchSpec): string | undefined => spec.args[spec.args.indexOf("--") + 1];
+    const onlySpec = (argv0: string): CodexEffectLaunchSpec => {
+      const matches = c.specs.filter((spec) => launchedArgv0(spec) === argv0);
+      assert.equal(matches.length, 1, `exactly one launched root runs ${argv0}`);
+      return matches[0]!;
+    };
+    const sink = onlySpec("/usr/bin/git").env;
     assert.deepEqual(inlinePairs(sink), inlinePairs(sinkEnv), "the sink's gitEnv() inline config is launched unchanged");
     assert.ok(inlinePairs(sink).some(([k, v]) => k === "safe.directory" && v === "*"), "the sink keeps safe.directory=*");
     assert.ok(inlinePairs(sink).some(([k]) => k === "core.hooksPath"), "the sink keeps core.hooksPath");
     assert.ok(!inlinePairs(sink).some(([k, v]) => k === "safe.directory" && v === ""), "no command-trust reset leaked into the sink");
     // The model-authorized Bash root of the same run DOES carry the command trust.
-    const command = c.specs[1]!;
-    assert.equal(command.args[command.args.indexOf("--") + 1], "/bin/sh");
+    const command = onlySpec("/bin/sh");
     assert.deepEqual(inlinePairs(command.env), [["safe.directory", ""], ["safe.directory", path.resolve(WORKSPACE)]]);
   });
 

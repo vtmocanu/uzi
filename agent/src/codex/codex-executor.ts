@@ -3358,8 +3358,12 @@ export function withCommandGitTrust(env: NodeJS.ProcessEnv, canonicalCheckout: s
 }
 
 /** Issue #1716: the checkout path the command git trust names: the realpath of the
- *  worktree. Only a MISSING worktree (ENOENT, e.g. a unit-test rig's placeholder path)
- *  falls back to the lexically resolved path; any other error propagates. */
+ *  worktree, resolved ONCE at run start (git also resolves the configured value when it
+ *  compares). Only the command's Landlock root, which excludes the checkout's parent, stands
+ *  between a command and swapping that path: file modes do not (the clone parent is group
+ *  `runner` writable, see git.ts), and best-effort mode may run without Landlock. Only a
+ *  MISSING worktree (ENOENT, e.g. a unit-test rig's placeholder path) falls back to the
+ *  lexically resolved path; any other error propagates. */
 export async function canonicalCheckoutPath(worktreePath: string): Promise<string> {
   try {
     return await fs.realpath(worktreePath);
