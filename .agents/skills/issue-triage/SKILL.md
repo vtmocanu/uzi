@@ -50,7 +50,7 @@ A successful empty result = maintainer-only backlog. If it looks wrong, compare 
 
 ## Step 1: Pick
 
-Order: user-named issue → lowest-numbered `external` from 0B → lowest-numbered issue in the highest non-empty tier.
+Order: user-named issue → lowest-numbered `external` from 0B → lowest-numbered issue in the highest non-empty tier. When the user asks for newest first, take the highest number instead, at each step.
 
 A sweep fires an issue only with BOTH a selector (`Planned`, or `bug`) AND eligibility (`uzi` label OR assigned to the uzi-bot account). Missing either half = looks queued, never runs.
 
@@ -114,7 +114,7 @@ One verdict, one-line reason. Apply only after Step 5 confirmation.
 Do not trust issue line numbers.
 
 1. **Premise**: grep the target code. Already implemented → **Already done**.
-2. **Referenced PR/PRD**: confirm merged (`gh pr view NNN --json state,mergedAt`).
+2. **Referenced PR/PRD**: confirm merged (`gh pr view NNN --json state,mergedAt`). Before deferring to, or folding scope into, another issue, confirm that issue is open and its implementation has not landed: inspect its linked PRs and the current code.
 3. **Anchors**: re-grep named symbols; record current locations and omitted/extra sites.
 4. **Design forks**: pin a direction with reason; verify any ADR/PRD conflict against code, not the issue's framing.
 5. **Workflow scope**: a fix that must touch `.github/workflows/**` cannot go to a sweep (worker PAT lacks `workflow` scope; the whole push is rejected). → **Do locally**, or split into a local-only issue. See `.claude/rules/prds.md`.
@@ -134,4 +134,5 @@ EOF
 
 - Bot-assignment path: replace `--add-label "uzi"` with `--add-assignee BOT_LOGIN` (from `CLAUDE.local.md`; never invent it).
 - Comment carries Step 4 findings; mirror #525/#509.
+- A body note like "Needs re-review before dispatch" is stale once Step 4 is that re-review: remove it from the body (`gh issue edit NNN --body-file`) when queuing.
 - Remind the user: auto-approve runs past the plan gate; a human still merges. For plan review first, use **uzi-watcher** (Auto mode).

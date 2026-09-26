@@ -63,6 +63,9 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   at `NEXT=claimed_by_other`: talk to them (SendMessage), do not take it.
 - **Never in the `main` worktree.** Every local edit happens in a sibling worktree
   (`land-prep.sh` makes one); auto-clean worktrees you created once the PR merges.
+- **Run long local checks from a pinned worktree.** An e2e or Docker check runs in a
+  detached worktree at the exact head it certifies, never in the `land-prep.sh` worktree:
+  land-prep rebases that tree in place, so a check still running there tests a mixed tree.
 
 ## Entry: the snapshot
 
@@ -279,6 +282,15 @@ and they precede every merge (step 6):
   `plan` message) against `gh pr diff PR --name-only`: did the run do what the plan said,
   no more, no less? A dropped milestone or an unplanned surface is a finding (step 4); a
   milestone reframed and documented is not.
+- **The run's own validation report.** The uzi PR body is generic. Read the run's final
+  `text` messages (`uzi run logs RUN --json`) for checks it marks NOT RUN or failed, and run
+  them on a capable host before merging. Skipping one needs the user's explicit exception,
+  naming what stays unvalidated.
+- **Attribute a failing local check before blaming the PR.** Re-run the same selection on
+  unmodified `main` in its own pinned worktree. Treat it as pre-existing only on matching
+  failure evidence (same step, same error, same logs), not a similar symptom. Checks that
+  failure blocks are still unvalidated for this PR: say which and get the user's call before
+  merging. File the regression with both results; add `uzi` only once it is sweep-ready.
 - **Pin every local review to the immutable head.** One focused local reviewer is the
   default for small/mechanical non-Renovate diffs. For Renovate-class work, record the
   explicit review-needed or CI-sufficient decision. Large/high-risk diffs use the stronger
