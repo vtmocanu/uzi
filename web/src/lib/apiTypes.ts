@@ -2551,10 +2551,11 @@ export interface Run {
    *  server's best-effort derivation failed. Render an unrecognised value honestly, the same
    *  rule as recovery_wait_cause. */
   codex_account_action: string | null;
-  /** PRD #1590 D6: the run's OWN snapshotted Codex alias label, shown beside
-   *  codex_account_action so the owner knows which login to fix. Non-null only when
-   *  codex_account_action is non-null. User-authored: render as text through sanitizeLabel,
-   *  never as markup. */
+  /** The run's bound Codex alias ID; null when the alias was deleted or never bound. */
+  codex_secret_id: string | null;
+  /** The run's OWN snapshotted Codex alias label, available independently of
+   * codex_account_action on owner/admin run reads. User-authored: render as text
+   * through sanitizeLabel, never as markup. */
   codex_secret_label: string | null;
   /** PRD #1392 M1: when the server will promote a `recovery_wait` run back to queued — the
    *  retry stamp the forge-park surface counts down to ("retry at HH:MM"). The

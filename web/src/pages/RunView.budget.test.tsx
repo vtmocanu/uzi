@@ -109,6 +109,7 @@ function run(over: Partial<Run>): Run {
     rate_limit_type: null,
     recovery_wait_cause: null,
     codex_account_action: null,
+    codex_secret_id: null,
     codex_secret_label: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,

@@ -166,8 +166,9 @@ jobs:
   # (…/release.yml@refs/tags/vX.Y.Z), which is what a verifier pins with
   # `cosign verify --certificate-identity-regexp … --certificate-oidc-issuer
   # https://token.actions.githubusercontent.com`. A cosign signature is a SEPARATE
-  # OCI artifact (a `sha256-<digest>.sig` tag pushed to the same repo under the
-  # existing packages:write), so it does NOT change the image manifest and stays
+  # OCI artifact (cosign 3.x attaches it through the OCI referrers API, not a
+  # `sha256-<digest>.sig` tag, under the existing packages:write), so it does NOT
+  # change the image manifest and stays
   # compatible with provenance:false. Signing by digest (not tag) is deliberate: the
   # two tags a job pushes (:version and :short_sha) share one digest, so one signature
   # covers both and there is no tag->digest TOCTOU window.
@@ -318,32 +319,27 @@ jobs:
   # "/agent-<template>:<tag>" resolve to a real GHCR repo. Keep the matrix equal to
   # api/internal/workertmpl.Names.
   #
-  # COST CONTROL. The agent image is by far the most expensive to build: ~2.6 GiB of
-  # pinned nix + devbox-global + Chromium closures realize before any of uzi's own code
-  # is copied (agent/templates/base/Dockerfile), and it builds twice (base + jvm). Two
-  # mechanisms keep a release from paying that in full every time:
+  # TWO STAGES, ONE ALWAYS BUILT (#1720, ADR-1720). Each agent/templates/<t>/Dockerfile has
+  # a `runtime` stage (the ~2.6 GiB of pinned nix + devbox + Chromium + npm deps + Codex +
+  # supervisor) and a thin `release` stage (uzi's source, BUILD_INFO, version stamp,
+  # labels, entrypoint).
+  #   * The runtime stage is published as agent-runtime-<t>:<input key>
+  #     (scripts/agent-runtime-key.sh: a hash of the stage's Dockerfile text and every file
+  #     it copies). It is built ONLY when the registry confirms that key is absent; an
+  #     existing base is reused only after its signature and key labels verify
+  #     (scripts/agent-runtime-resolve.sh), and it is consumed by that verified DIGEST.
+  #   * The release stage is built on EVERY tag, on top of that digest via
+  #     `--build-context runtime=docker-image://...`, so a release image never aliases
+  #     another release. (It used to be re-tagged from the previous release when the agent
+  #     surface was unchanged, which made every stable promote report its RC's version to
+  #     self-managed workers: #1682.)
+  # The cost control is therefore structural: a release whose runtime inputs did not change
+  # pays only the thin stage, whether or not the registry layer cache hits.
   #
-  #   1. REGISTRY LAYER CACHE (cache-from/cache-to below). The Dockerfile is already
-  #      ordered for it -- UZI_SRC_SHA / UZI_AGENT_VERSION are pinned at the very bottom
-  #      on purpose so a release-only value change never invalidates the nix/Chromium
-  #      layers. Those layers are content-pinned (installer version, DEVBOX_VERSION,
-  #      committed devbox.lock), so a rebuild that does not bump those pins is a cache
-  #      hit and only the cheap trailing layers (COPY . /opt/uzi-src, version stamps)
-  #      re-run. Registry cache (not type=gha) because mode=max caches the intermediate
-  #      nix layers, which blow past GHA's 10 GB per-repo cache cap at 2.6 GiB x 2
-  #      templates; GHCR -- where the images already push -- has no such cap.
-  #
-  #   2. SKIP + RE-TAG when the runtime surface is unchanged (the `decide` step). Even a
-  #      warm-cache build re-runs the trailing layers, re-pushes, and re-signs on EVERY
-  #      release tag -- there is no "did the agent change?" guard on the tag trigger. But
-  #      when nothing that affects how a worker EXECUTES a run changed since the previous
-  #      release, the image is content-identical modulo the baked /opt/uzi-src snapshot
-  #      and the version stamp -- neither of which any hosted worker consumes on such a
-  #      release, because PRD #422's autobump leaves workers.image.tag pinned at the old
-  #      version, so the fleet keeps pulling the old tag. So we re-tag the previous
-  #      release's image to the new version instead of rebuilding. The predicate is the
-  #      SAME AGENT_PATHS set scripts/worker-tag-autobump.sh uses to decide a fleet roll,
-  #      so "did we build a new agent image" and "did the fleet roll" stay one decision.
+  # SERIALIZED PER TEMPLATE. Two release runs (a promote pushes a stable and an RC tag)
+  # could otherwise both find a key absent and build it. Job concurrency makes
+  # resolve -> build -> sign atomic per template. Should two outputs for one key ever exist
+  # anyway, that is acceptable by design: each release consumes the digest it verified.
   publish-agent:
     runs-on: ubuntu-latest
     needs: [prep, assert-version, assert-changelog]
@@ -356,16 +352,175 @@ jobs:
       fail-fast: false
       matrix:
         template: [base, jvm]
+    # queue: max -- without it a third concurrent release would CANCEL the pending second
+    # one (a group keeps a single pending job by default, even with cancel-in-progress off).
+    # actionlint does not know the key yet; .github/actionlint.yaml ignores exactly that.
+    concurrency:
+      group: agent-runtime-${{ matrix.template }}
+      cancel-in-progress: false
+      queue: max
     steps:
-      # Full history + tags: the decide step diffs the agent surface against the
-      # previous v* tag.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-        with:
-          fetch-depth: 0
-          fetch-tags: true
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4
       # Retrying, checksum-pinned cosign install (issue #945; rationale in the action
       # header). Needs the repo checked out first (actions/checkout runs above).
+      - uses: ./.github/actions/install-cosign
+        with:
+          cosign-release: 'v3.1.3'
+      # Logged in BEFORE resolving: an authenticated lookup answers `not found` for a
+      # missing tag or a not-yet-created repository, whereas an anonymous one answers 403,
+      # which the resolver must (and does) treat as a failure.
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # ${{ }} values go through `env:` (never interpolated into the script body) so a
+      # crafted value cannot become shell -- zizmor template-injection.
+      - id: key
+        name: Compute the runtime base input key
+        env:
+          TEMPLATE: ${{ matrix.template }}
+        run: |
+          set -euo pipefail
+          KEY="$(scripts/agent-runtime-key.sh "$TEMPLATE" linux/amd64)"
+          echo "agent/${TEMPLATE}: runtime input key ${KEY}"
+          echo "key=${KEY}" >> "$GITHUB_OUTPUT"
+      - id: resolve
+        name: Reuse the runtime base if a signed one exists for this key
+        env:
+          TEMPLATE: ${{ matrix.template }}
+          KEY: ${{ steps.key.outputs.key }}
+        run: scripts/agent-runtime-resolve.sh "$TEMPLATE" "$KEY" linux/amd64 >> "$GITHUB_OUTPUT"
+      # Only on a confirmed absence. The registry cache (agent-<t>:buildcache) carries the
+      # runtime layers, so a base rebuild after a small input change reuses the untouched
+      # nix/Chromium layers; PR CI reads the same cache (read-only) for its full builds.
+      - id: base
+        name: Build the runtime base (key absent)
+        if: steps.resolve.outputs.found == 'false'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7
+        with:
+          context: .
+          file: agent/templates/${{ matrix.template }}/Dockerfile
+          target: runtime
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          cache-from: type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache
+          # ignore-error: a cache EXPORT failure must not fail the release or block
+          # signing -- the cache is an optimization, not a gate (#739).
+          cache-to: type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache,mode=max,ignore-error=true
+          tags: ghcr.io/vtmocanu/uzi/agent-runtime-${{ matrix.template }}:${{ steps.key.outputs.key }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/vtmocanu/uzi
+            io.github.vtmocanu.uzi.runtime-key=${{ steps.key.outputs.key }}
+            io.github.vtmocanu.uzi.runtime-template=${{ matrix.template }}
+            io.github.vtmocanu.uzi.runtime-platform=linux/amd64
+      # Named "Sign image" so release-verify.sh counts it among the expected signatures.
+      - name: Sign image (cosign keyless) -- runtime base
+        if: steps.resolve.outputs.found == 'false'
+        env:
+          TEMPLATE: ${{ matrix.template }}
+          DIGEST: ${{ steps.base.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/vtmocanu/uzi/agent-runtime-${TEMPLATE}@${DIGEST}"
+      - id: runtime
+        name: Pin the runtime base digest this release builds on
+        env:
+          TEMPLATE: ${{ matrix.template }}
+          FOUND: ${{ steps.resolve.outputs.found }}
+          REUSED: ${{ steps.resolve.outputs.digest }}
+          BUILT: ${{ steps.base.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [ "$FOUND" = true ]; then DIGEST="$REUSED"; else DIGEST="$BUILT"; fi
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "no runtime base digest (found=$FOUND)" >&2; exit 1; }
+          REF="ghcr.io/vtmocanu/uzi/agent-runtime-${TEMPLATE}@${DIGEST}"
+          echo "agent/${TEMPLATE}: release builds on ${REF} ($([ "$FOUND" = true ] && echo reused || echo built))"
+          echo "ref=${REF}" >> "$GITHUB_OUTPUT"
+      # The release stage, ALWAYS built. The `runtime` build context replaces the
+      # Dockerfile's runtime stage with the pinned digest, so nothing above the stage
+      # boundary is rebuilt here. UZI_AGENT_VERSION keeps the leading v (the Dockerfile
+      # strips it) and carries +g<short-sha> build metadata; SemVer excludes build metadata
+      # from precedence, so the reported version still classifies as the release.
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7
+        with:
+          context: .
+          file: agent/templates/${{ matrix.template }}/Dockerfile
+          target: release
+          build-contexts: runtime=docker-image://${{ steps.runtime.outputs.ref }}
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          # The release stage's own cache (COPY . /opt/uzi-src and the chown are worth
+          # reusing on a fresh runner). A separate ref, so it never overwrites the runtime
+          # layers in :buildcache. Export failure is non-fatal (#739).
+          cache-from: |
+            type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache-release
+            type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache-release,mode=max,ignore-error=true
+          tags: |
+            ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:${{ needs.prep.outputs.version }}
+            ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:${{ needs.prep.outputs.short_sha }}
+          build-args: |
+            UZI_SRC_SHA=${{ github.sha }}
+            UZI_AGENT_VERSION=${{ github.ref_name }}+g${{ needs.prep.outputs.short_sha }}
+            RUNTIME_BASE_REF=${{ steps.runtime.outputs.ref }}
+      - name: Sign image (cosign keyless)
+        env:
+          TEMPLATE: ${{ matrix.template }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/vtmocanu/uzi/agent-${TEMPLATE}@${DIGEST}"
+      # Filesystem half of the identity check (assert-agent-version reads only the image
+      # config): export JUST /opt/uzi-src/BUILD_INFO from the digest this job pushed and
+      # require it to name this commit. The builder already holds those layers, so this
+      # does not re-pull the image. Also proves both tags resolve to that digest.
+      - name: Verify the pushed release image (BUILD_INFO, tags)
+        env:
+          TEMPLATE: ${{ matrix.template }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ needs.prep.outputs.version }}
+          SHORT_SHA: ${{ needs.prep.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          REPO="ghcr.io/vtmocanu/uzi/agent-${TEMPLATE}"
+          out="$(mktemp -d)"
+          ctx="$(mktemp -d)"
+          printf 'FROM scratch\nCOPY --from=rel /opt/uzi-src/BUILD_INFO /BUILD_INFO\n' > "${ctx}/Dockerfile"
+          docker buildx build --build-context "rel=docker-image://${REPO}@${DIGEST}" \
+            --output "type=local,dest=${out}" "$ctx"
+          cat "${out}/BUILD_INFO"
+          grep -qxF "commit: ${GITHUB_SHA}" "${out}/BUILD_INFO" \
+            || { echo "BUILD_INFO does not name ${GITHUB_SHA}" >&2; exit 1; }
+          # GHCR's tag read-after-write can lag a push by a moment (issue #1102): poll briefly.
+          for t in "${VERSION}" "${SHORT_SHA}"; do
+            got=""
+            for i in 1 2 3 4 5; do
+              if got="$(docker buildx imagetools inspect "${REPO}:${t}" --format '{{.Manifest.Digest}}' 2>/dev/null)" \
+                 && [ "$got" = "$DIGEST" ]; then
+                break
+              fi
+              sleep "$((i * 2))"
+            done
+            [ "$got" = "$DIGEST" ] || { echo "${REPO}:${t} resolves to '${got:-<not found>}', want ${DIGEST}" >&2; exit 1; }
+          done
+          echo "agent/${TEMPLATE}: :${VERSION} and :${SHORT_SHA} -> ${DIGEST}, BUILD_INFO names ${GITHUB_SHA}"
+
+  # ------------------------------------------------- agent identity check ----
+  # Every published agent image must BE the release it is tagged as (#1682, #1720): exact
+  # UZI_AGENT_VERSION stamp (+g<sha> included), matching version/revision labels, both tags
+  # on one signed digest, built on a signed runtime base of its own template. Read from the
+  # registry config, no pull. Gates publish-chart via `needs`, so a mismatched image can
+  # exist on GHCR but no chart or Release ever points at it.
+  assert-agent-version:
+    runs-on: ubuntu-latest
+    needs: [prep, publish-agent]
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4
       - uses: ./.github/actions/install-cosign
         with:
           cosign-release: 'v3.1.3'
@@ -374,138 +529,17 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # Decide build-vs-reuse (see mechanism 2 in the job header). Runs after login so
-      # the imagetools digest resolution is authenticated; the agent-<t> packages are
-      # public today (gh api .../packages/container/uzi%2Fagent-base -> public), but
-      # keeping this after login costs nothing and survives a future flip to private.
-      # ${{ }} values go through `env:` (never interpolated into the script body) so a
-      # crafted value cannot become shell -- zizmor template-injection.
-      - id: decide
-        name: Reuse previous agent image if the runtime surface is unchanged
+      - name: Assert each agent image reports the version it is tagged with
         env:
-          TEMPLATE: ${{ matrix.template }}
-          VERSION: ${{ needs.prep.outputs.version }}
-        run: |
-          set -euo pipefail
-          REPO="ghcr.io/vtmocanu/uzi/agent-${TEMPLATE}"
-          # The agent RUNTIME surface -- the exact path set worker-tag-autobump.sh diffs.
-          # Anything outside it (api/web/docs, or the /opt/uzi-src snapshot the Dockerfile
-          # bakes) changes the image bytes but not how a worker executes a run, so it must
-          # NOT force a costly rebuild. Word-split intentionally (bash on the runner).
-          AGENT_PATHS="agent/src agent/package.json agent/package-lock.json agent/tsconfig.json agent/bin agent/templates agent/devbox-global"
-          # Previous release tag = newest v* tag that is not the one we are building.
-          PREV="$(git tag --list 'v*' --sort=-version:refname | grep -vxF "${GITHUB_REF_NAME}" | head -1 || true)"
-          reuse=false
-          digest=
-          # shellcheck disable=SC2086  # AGENT_PATHS is an intentional pathspec word list
-          if [ -n "$PREV" ] && git diff --quiet "${PREV}..HEAD" -- $AGENT_PATHS; then
-            # Surface unchanged since $PREV -- reuse that release's image, but ONLY if it
-            # is really in the registry. Resolve the mutable tag to its MANIFEST DIGEST
-            # once, here: the reuse step pins to that digest so a tag moved between now
-            # and the re-tag cannot smuggle in a different (unsigned) image, and the
-            # digest is exactly what $PREV's release signed. Empty (tag absent, e.g. a
-            # PREV predating agent images or a failed prior push) => fall back to a full
-            # build rather than re-tag a phantom.
-            digest="$(docker buildx imagetools inspect "${REPO}:${PREV#v}" --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
-            [ -n "$digest" ] && reuse=true
-          fi
-          {
-            echo "reuse=$reuse"
-            echo "prev=${PREV#v}"
-            echo "digest=$digest"
-          } >> "$GITHUB_OUTPUT"
-          if [ "$reuse" = true ]; then
-            echo "agent/${TEMPLATE}: runtime surface unchanged since $PREV -- re-tagging ${REPO}@${digest} as :$VERSION (no rebuild)."
-          else
-            echo "agent/${TEMPLATE}: building (surface changed since ${PREV:-<no previous tag>}, or previous image absent)."
-          fi
-      # Context is the repo ROOT (the image bakes uzi's source at /opt/uzi-src);
-      # buildx honours agent/templates/<t>/Dockerfile.dockerignore. UZI_AGENT_VERSION
-      # keeps the leading v (the Dockerfile strips it) and carries +g<short-sha> build
-      # metadata; SemVer excludes build metadata from precedence, so the reported
-      # version still classifies as the release. Skipped on the reuse path.
-      - id: build
-        if: steps.decide.outputs.reuse != 'true'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7
-        with:
-          context: .
-          file: agent/templates/${{ matrix.template }}/Dockerfile
-          push: true
-          platforms: linux/amd64
-          provenance: false
-          # Per-template cache ref; base/jvm never collide. First release has no
-          # :buildcache yet -- build-push-action tolerates the cache-from miss.
-          cache-from: type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache
-          # ignore-error: a cache EXPORT failure must not fail the release or block
-          # signing -- the cache is an optimization, not a gate (#739).
-          cache-to: type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache,mode=max,ignore-error=true
-          tags: |
-            ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:${{ needs.prep.outputs.version }}
-            ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:${{ needs.prep.outputs.short_sha }}
-          build-args: |
-            UZI_SRC_SHA=${{ github.sha }}
-            UZI_AGENT_VERSION=${{ github.ref_name }}+g${{ needs.prep.outputs.short_sha }}
-      # Reuse path: add the new :version and :short_sha tags to the previous release's
-      # SIGNED MANIFEST DIGEST (resolved in `decide`), without pulling or rebuilding a
-      # layer. --prefer-index=false is load-bearing: these images are single-platform
-      # (platforms: linux/amd64, provenance:false), and imagetools create defaults to
-      # --prefer-index=true, which would WRAP the lone manifest in a NEW image index with
-      # a NEW digest -- one $PREV's release never signed, so the reused tag would verify
-      # as unsigned. false preserves the manifest, keeping the digest (and its signature)
-      # intact. The post-check asserts exactly that for both tags, failing closed if a
-      # future buildx default ever rewraps anyway. ${{ }} via env: (zizmor).
-      - name: Re-tag previous agent image (runtime surface unchanged)
-        if: steps.decide.outputs.reuse == 'true'
-        env:
-          TEMPLATE: ${{ matrix.template }}
           VERSION: ${{ needs.prep.outputs.version }}
           SHORT_SHA: ${{ needs.prep.outputs.short_sha }}
-          SRC_DIGEST: ${{ steps.decide.outputs.digest }}
         run: |
           set -euo pipefail
-          REPO="ghcr.io/vtmocanu/uzi/agent-${TEMPLATE}"
-          docker buildx imagetools create --prefer-index=false \
-            --tag "${REPO}:${VERSION}" \
-            --tag "${REPO}:${SHORT_SHA}" \
-            "${REPO}@${SRC_DIGEST}"
-          # Prove the new tags point at the signed source digest (not a rewrapped index).
-          # The verify races GHCR's tag read-after-write: right after a successful create the
-          # tag is briefly 'not found' (inspect exits non-zero) or resolves to no digest, so a
-          # single immediate inspect intermittently reddens an otherwise-good publish (issue
-          # #1102). Poll with bounded backoff, treating an inspect failure / empty read /
-          # digest-mismatch as retryable and failing closed only after the window elapses. The
-          # anti-unsigned-rewrap assertion is UNCHANGED (the digest must still equal SRC_DIGEST);
-          # this only stops it racing the registry. The assignment sits in the `if` condition so
-          # `set -e` does not abort on a transient inspect failure during the poll.
-          attempts=5
-          for t in "${VERSION}" "${SHORT_SHA}"; do
-            got=""
-            for ((i=1; i<=attempts; i++)); do
-              if got="$(docker buildx imagetools inspect "${REPO}:${t}" --format '{{.Manifest.Digest}}' 2>/dev/null)" \
-                 && [ "$got" = "${SRC_DIGEST}" ]; then
-                break
-              fi
-              if [ "$i" -lt "$attempts" ]; then
-                echo "verify ${REPO}:${t} attempt ${i}/${attempts}: got '${got:-<inspect failed>}', want ${SRC_DIGEST} -- retrying in $((i * 2))s" >&2
-                sleep "$((i * 2))"
-              fi
-            done
-            if [ "$got" != "${SRC_DIGEST}" ]; then
-              echo "reuse produced ${REPO}:${t}@${got:-<not found>}, expected ${SRC_DIGEST} (unsigned rewrap, or the registry never converged after ${attempts} attempts) -- failing." >&2
-              exit 1
-            fi
+          fail=0
+          for t in base jvm; do  # worker templates; workertmpl.Names (pinned by template_sources_test.go)
+            scripts/agent-image-assert.sh "$t" "$VERSION" "$SHORT_SHA" "$GITHUB_SHA" || fail=1
           done
-          echo "agent/${TEMPLATE}: :${VERSION} and :${SHORT_SHA} now point at the signed ${SRC_DIGEST}."
-      # Sign only the freshly built digest. The reuse path adds tags to $PREV's manifest
-      # digest, which that release already signed (cosign keys the sig artifact by digest,
-      # and the re-tag step asserted the new tags resolve to that same digest), so it is
-      # already signed -- no re-sign needed. ${{ }} via env: (zizmor).
-      - name: Sign image (cosign keyless)
-        if: steps.decide.outputs.reuse != 'true'
-        env:
-          TEMPLATE: ${{ matrix.template }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "ghcr.io/vtmocanu/uzi/agent-${TEMPLATE}@${DIGEST}"
+          [ "$fail" -eq 0 ]
 
   # --------------------------------------------------- worker pin check ----
   # The chart's decoupled worker pin (workers.image.tag, PRD #422) must name an agent
@@ -513,9 +547,9 @@ jobs:
   # legitimately pin an RC worker (PRD #1265 D11), but only a PUBLISHED one: an RC cut
   # at tip whose tag was kept local-only leaves release.yml never building that image,
   # and shipping the chart then ImagePullBackOffs every new hosted worker (the
-  # 0.83.0-rc.7 incident, 2026-09-19). publish-agent has a skip-and-reuse path (its job
-  # header, mechanism 2), so this tests EXISTENCE of the pinned tag, not "pin == this
-  # release" -- the pin may point at an older, already-published tag. It runs after
+  # 0.83.0-rc.7 incident, 2026-09-19). The pin moves only when the agent runtime surface
+  # changes (scripts/worker-tag-autobump.sh), so this tests EXISTENCE of the pinned tag,
+  # not "pin == this release" -- the pin may point at an older, already-published tag. It runs after
   # publish-agent (the images are live by then) and gates publish-chart via `needs`, so
   # a bad pin blocks the chart push before ArgoCD can ever see it.
   assert-worker-pin:
@@ -577,7 +611,7 @@ jobs:
   # oci://ghcr.io/vtmocanu/uzi/uzi:<Chart.version>.
   publish-chart:
     runs-on: ubuntu-latest
-    needs: [assert-version, assert-changelog, publish-api, publish-web, publish-controller, publish-agent, assert-worker-pin]
+    needs: [assert-version, assert-changelog, publish-api, publish-web, publish-controller, publish-agent, assert-worker-pin, assert-agent-version]
     environment: release
     permissions:
       contents: read

@@ -717,7 +717,11 @@ jobs:
           file: agent/templates/${{ matrix.template }}/Dockerfile
           push: false
           platforms: linux/amd64
-          cache-from: type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache
+          # :buildcache holds the runtime-stage layers, :buildcache-release the release
+          # stage's (release.yml writes both since #1720); read-only here, as above.
+          cache-from: |
+            type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache
+            type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache-release
           build-args: |
             UZI_SRC_SHA=${{ github.sha }}
           tags: uzi-agent-${{ matrix.template }}:pr
