@@ -1974,8 +1974,10 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	// #1391's pending outcomes from the D11-predicated fail/requeue that follows. #1390's worker
 	// never sends one; the path exists for #1391. An invalid register snapshot is ignored, never
 	// fatal (register must not wedge on soft input).
+	snapshotApplied := false
 	if snapshot != nil {
-		if _, err := s.ReplaceWorkerActiveRuns(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister); err != nil {
+		snapshotApplied, err = s.ReplaceWorkerActiveRuns(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister)
+		if err != nil {
 			return store.Worker{}, "", err
 		}
 	}
@@ -1993,6 +1995,23 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 		return store.Worker{}, "", err
 	}
 	committed = true
+	if snapshot != nil {
+		pendingCount := 0
+		for _, entry := range snapshot.Active {
+			if entry.TerminalPending {
+				pendingCount++
+			}
+		}
+		slog.Info("worker register active snapshot committed",
+			"worker_id", wkr.ID.String(), "offered_entries", len(snapshot.Active),
+			"offered_pending_entries", pendingCount, "offered_pending_overflow", snapshot.PendingOverflow,
+			"applied", snapshotApplied, "overflow_lease_applied", snapshotApplied && snapshot.PendingOverflow,
+			"orphan_failed", len(orphanFailed), "orphan_requeued", len(requeued))
+	} else {
+		slog.Info("worker register orphan recovery committed",
+			"worker_id", wkr.ID.String(), "snapshot_offered", false,
+			"orphan_failed", len(orphanFailed), "orphan_requeued", len(requeued))
+	}
 	s.publishRegisterSweeps(ctx, orphanFailed, requeued)
 	return store.Worker(row), nonce, nil
 }
