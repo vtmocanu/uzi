@@ -350,3 +350,38 @@ func TestReleaseCodexCredentialVaultLockedAuthorityLostLiveDB(t *testing.T) {
 		t.Fatalf("provider calls = %d, want 0", fake.calls)
 	}
 }
+
+// TestCoordinatedCodexRefreshVaultLockedBeforeExchangeAuthorityLostLiveDB (case a, refresh,
+// lost authority): the capability epoch is bumped between the initial authorization and the
+// pre-exchange open of the DEK-sealed login, which then meets the locked vault. The refresh
+// answers the recheck's ErrCodexCapabilityEpoch (handler 403), never ErrCodexVaultLocked, and
+// nothing reached the provider or left a durable intent.
+func TestCoordinatedCodexRefreshVaultLockedBeforeExchangeAuthorityLostLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: codexToken("access-new")}}
+	f := newRefreshFixture(t, env, fake)
+	dekSealAccountAndLock(t, env, f)
+	capw := env.mintCap(t, f.runID, f.workerID)
+	op := uuid.New()
+	f.svc.q = releaseHookStore{
+		Queries: env.q,
+		onAccountRead: func() {
+			env.exec(`UPDATE runs SET codex_claim_epoch = codex_claim_epoch + 1, codex_cap_hash = NULL WHERE id = $1`, f.runID)
+		},
+	}
+
+	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0)
+	if !errors.Is(err, ErrCodexCapabilityEpoch) {
+		t.Fatalf("err = %v, want ErrCodexCapabilityEpoch from the recheck", err)
+	}
+	if errors.Is(err, ErrCodexVaultLocked) {
+		t.Fatalf("err = %v must not be ErrCodexVaultLocked once authority is lost", err)
+	}
+	if res.AccessToken != "" {
+		t.Fatalf("result = %+v, want no token", res)
+	}
+	if fake.calls != 0 {
+		t.Fatalf("provider calls = %d, want 0", fake.calls)
+	}
+	assertNoIntent(t, env, op, f.userID)
+}

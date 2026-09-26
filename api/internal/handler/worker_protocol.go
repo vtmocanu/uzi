@@ -396,6 +396,10 @@ func protocolFeatures(activeSnapshotEnabled bool) []string {
 		{"heartbeat_outbox"},       // PRD #1391 M5, Run A
 		{"claim_generation_fence"}, // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker
 		{"terminal_fence"},         // PRD #1391 Run B M3c: this api fences a terminal transition on messages_through_seq contiguity
+		// Issue #1766 M2: this api accepts {status:"recovery_wait", recovery_cause:"vault_locked"}
+		// and stores the cause. Advertised UNCONDITIONALLY (no config gates the park): a worker
+		// must see it before sending the cause, because an older api 400s an unknown recovery_cause.
+		{"recovery_cause_vault_locked"},
 	}
 	if activeSnapshotEnabled {
 		groups = append(groups, []string{"active_run_snapshot"}) // PRD #1390 M2a
