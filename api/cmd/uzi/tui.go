@@ -342,11 +342,14 @@ type tuiModel struct {
 	ctrlCSeen bool
 	showHelp  bool
 
-	// tokenCount is how many Anthropic tokens the viewer holds (from ListSecrets, fetched
-	// once at Init). It gates the board's credential column exactly as the web RunsList
-	// does (PRD #295): the own board shows WHICH token a run spent only when there is more
-	// than one to disambiguate. 0 until the probe returns, so the column stays hidden until
-	// then rather than flashing in.
+	// codexCredentialCount counts linked Codex aliases in the account response, including
+	// accounts without a readable rate-limit meter. It gates Codex board cells independently
+	// of the Anthropic token count.
+	codexCredentialCount int
+
+	// tokenCount is how many Anthropic tokens the viewer holds (from ListSecrets,
+	// fetched once at Init). Claude cells show their labels only when there is more
+	// than one token to disambiguate. It stays zero until the probe returns.
 	tokenCount int
 
 	// profile is the terminal's colour profile (tea.ColorProfileMsg, set at program
@@ -1189,6 +1192,10 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case codexRateLimitsMsg:
 		if msg.err == nil {
+			m.codexCredentialCount = 0
+			for _, account := range msg.accounts {
+				m.codexCredentialCount += len(account.Aliases)
+			}
 			m.codexRateLimits = msg.accounts
 		}
 		return m, nil
