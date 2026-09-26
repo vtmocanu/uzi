@@ -1549,13 +1549,33 @@ export class GitCache {
       );
       try {
         if (!(await exclude.stat()).isFile()) throw new Error("git exclude is not a regular file");
-        const existing = await exclude.readFile("utf8");
+        // The checkout can replace its exclude file before a resume. Bound the read
+        // even when the file grows after opening it; an oversized file is unsafe to
+        // inspect or append to, so provisioning fails closed.
+        const maxExcludeBytes = 64 * 1024;
+        const bytes = Buffer.alloc(maxExcludeBytes + 1);
+        let used = 0;
+        while (used < bytes.length) {
+          const { bytesRead } = await exclude.read(bytes, used, bytes.length - used, used);
+          if (bytesRead === 0) break;
+          used += bytesRead;
+        }
+        if (used > maxExcludeBytes) throw new Error("git exclude exceeds 64 KiB");
+        const existing = bytes.toString("utf8", 0, used);
         const rule = "/.uzi/scratch/";
         if (!existing.split("\n").includes(rule)) {
           await exclude.writeFile(`${existing.length > 0 && !existing.endsWith("\n") ? "\n" : ""}${rule}\n`);
         }
       } finally {
         await exclude.close();
+      }
+      // Repository .gitignore rules outrank info/exclude. Refuse a checkout that
+      // negates this rule, so ordinary git add -A cannot stage scratch on day one.
+      // Publication refusal remains necessary if an agent later changes ignore rules.
+      try {
+        await this.runGitAsRunner(clonePath, ["check-ignore", "-q", "--no-index", "--", ".uzi/scratch/.uzi-ignore-probe"]);
+      } catch {
+        throw new Error("repository ignore rules expose .uzi/scratch to ordinary staging");
       }
     } catch (err) {
       throw new ScratchProvisionError(err);

@@ -233,6 +233,59 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
     assert.equal(fs.statSync(path.join(second.path, ".uzi", "scratch")).isDirectory(), true);
   });
 
+  it("refuses repository ignore rules that expose scratch to git add -A", async () => {
+    fs.writeFileSync(path.join(fx.originPath, ".gitignore"), "!.uzi/scratch/\n");
+    gitIn(fx.originPath, ["add", ".gitignore"]);
+    gitIn(fx.originPath, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "expose scratch"]);
+    const bare = await git.ensureClone(fx.originPath);
+    await assert.rejects(git.createOrAttachRunnerClone(bare, 1719), ScratchProvisionError);
+  });
+
+  it("rejects a symlinked scratch leaf on revalidation without following it", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    const scratch = path.join(clone.path, ".uzi", "scratch");
+    fs.rmSync(scratch, { recursive: true });
+    fs.symlinkSync(fx.originPath, scratch);
+    await assert.rejects(
+      (git as unknown as { provisionRunnerScratch(path: string): Promise<void> }).provisionRunnerScratch(clone.path),
+      ScratchProvisionError,
+    );
+    assert.equal(fs.lstatSync(scratch).isSymbolicLink(), true);
+  });
+
+  it("preserves unrelated tracked .uzi content and rejects a non-directory .uzi ancestor", async () => {
+    fs.mkdirSync(path.join(fx.originPath, ".uzi"));
+    fs.writeFileSync(path.join(fx.originPath, ".uzi", "keep.txt"), "keep");
+    gitIn(fx.originPath, ["add", ".uzi/keep.txt"]);
+    gitIn(fx.originPath, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "unrelated uzi"]);
+    const bare = await git.ensureClone(fx.originPath);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    assert.equal(fs.readFileSync(path.join(clone.path, ".uzi", "keep.txt"), "utf8"), "keep");
+    assert.equal(fs.statSync(path.join(clone.path, ".uzi", "scratch")).gid, fs.statSync(clone.path).gid);
+    const uzi = path.join(clone.path, ".uzi");
+    fs.rmSync(uzi, { recursive: true });
+    fs.writeFileSync(uzi, "not a directory");
+    await assert.rejects(
+      (git as unknown as { provisionRunnerScratch(path: string): Promise<void> }).provisionRunnerScratch(clone.path),
+      ScratchProvisionError,
+    );
+    assert.equal(fs.readFileSync(uzi, "utf8"), "not a directory");
+  });
+
+  it("refuses an oversized git exclude without reading or appending the whole file", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    const excludePath = path.join(clone.path, ".git", "info", "exclude");
+    const oversized = "x".repeat(64 * 1024 + 1);
+    fs.writeFileSync(excludePath, oversized);
+    await assert.rejects(
+      (git as unknown as { provisionRunnerScratch(path: string): Promise<void> }).provisionRunnerScratch(clone.path),
+      ScratchProvisionError,
+    );
+    assert.equal(fs.readFileSync(excludePath, "utf8"), oversized);
+  });
+
   it("refuses tracked scratch and symlinked .uzi with a named provisioning error", async () => {
     fs.mkdirSync(path.join(fx.originPath, ".uzi", "scratch"), { recursive: true });
     fs.writeFileSync(path.join(fx.originPath, ".uzi", "scratch", "tracked.txt"), "x");
