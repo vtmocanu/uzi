@@ -1,0 +1,129 @@
+# PRD #1732: Disable and re-enable account credentials
+
+**Issue**: [#1732](https://github.com/vtmocanu/uzi/issues/1732)
+**Status**: Planned
+**Priority**: Medium
+**Owner**: uzi run (Codex harness), plan steered by the maintainer's session and a Codex peer
+
+## Problem
+
+A user accumulates Anthropic tokens and OpenAI/Codex credentials (all rows in `user_secrets`, kinds `anthropic_token | openai_api_key | codex_auth`, migration `00198`) and stops using some. Today each one stays live:
+
+- Anthropic tokens are polled for rate limits (`ListAnthropicTokensToPoll`, `api/internal/store/queries/anthropic_rate_limits.sql:1`, one row per token). Codex logins are polled per linked account (`ListLinkedCodexAccountsToPoll`, `codex_rate_limits.sql:169`). OpenAI API keys have no subscription meters and are not polled.
+- Readable, selected meters appear in the sidebar (`web/src/components/SidebarUsageLimits.tsx:113`), and every user's meters appear on the admin **Rate limits** page (`web/src/pages/AdminRateLimits.tsx`, backed by `GET /api/admin/rate-limits` `api/internal/handler/ratelimits.go:104` and `GET /api/admin/codex-rate-limits` `codex_ratelimits.go:98`).
+- All are selectable for runs, schedules, worker bindings and the Judge.
+
+The only way to silence one is Delete, which destroys the sealed value and nulls pins (a deleted run pin resolves as inherit, `api/internal/workersvc/secretchoice.go:636-640`). `user_secrets` has no enabled/disabled/archived column.
+
+## Solution
+
+A reversible, per-credential **Disable / Enable** action on the Settings page. Disable is suspension, not revocation or deletion: the sealed value, label, default flag, auto-select (`auto_eligible`) and sidebar preferences are kept and come back unchanged on Enable.
+
+## Decisions (agreed 2026-09-26, maintainer session plus two Codex peer reviews)
+
+- **D1. Scope of "disabled".** A disabled credential is unavailable for: new claims, explicit per-run picks (PRD #1247 override), default resolution, worker bindings, the Judge and self-improve binding, the auto-select pool, scheduled runs, background rate-limit polling (tick, boot and `Poke`), background Codex refresh, sidebar meters, owner and admin rate-limit views, and credential-specific Slack alerts. The one exception is D3.
+- **D2. No silent substitution.** Bindings and pins are **kept**, not cleared. Work that needs one specific disabled credential **waits** (D14) with the typed reason `credential_disabled` and resumes on re-enable or on explicit reassignment by the owner. uzi never falls back to a different credential or a different harness, because that changes which account pays. This deliberately differs from Delete. It extends the pooled-only promise (`secretchoice.go:791-800`: an auto lane never spends a non-pooled credential). **Scope limit:** an auto lane whose enabled pool becomes empty keeps ordinary `pool_wait`; it has no single disabled pin to wait for.
+- **D3. An already-issued claim finishes.** Disable stops future use. A flight that already holds a claim keeps its credential until that claim is released or the run terminates. For Codex this includes the worker-mediated access-token refresh an existing flight needs to finish (`api/internal/workersvc/codexauthz.go:642`, claim secrets assembled at `:837`). The exception is fenced by the live claim authority (claim generation / epoch), not by "run is non-terminal": a worker that loses its claim (offline, released, requeued) loses the exception, and its next claim obeys the disable. Background polling and new claims stay blocked. The dialog says this before disabling.
+- **D4. The default can be disabled.** It stays the remembered default, shown as **"default, disabled"**. New default-based requests (run create, schedule fire, unbound workers) produce **held work** (D14), not a refusal and not a fallback. In the same disable dialog the owner may instead hand the default to another **enabled** credential of the same default slot (Anthropic tokens; the shared Codex slot across `codex_auth` and `openai_api_key`), applied atomically with the disable. uzi never promotes one automatically. Disabling the last enabled credential is allowed; the dialog shows the consequences.
+- **D5. New explicit assignments reject disabled credentials.** Make-default, worker bind, per-run override (`--token <label>`), schedule create/edit `--token <label>`, Judge binding and pool opt-in (the `auto-eligible` PATCH) refuse a disabled credential with a clear 409/422 whose message names Settings. Existing stored pins stay (D2).
+- **D6. Codex: disable is per alias, liveness is per account.** Several `codex_auth` aliases can share one canonical `codex_provider_account` (`00199`), and polling is deduplicated per account. Rules:
+  - **reconcile** an alias that is `staging` only while that alias is enabled (a new alias is `staging` precisely because it is not linked yet, so reconciliation must not require a linked alias);
+  - **poll and background-refresh** an account only while at least one **enabled linked** alias resolves to it;
+  - account recovery keeps its own existing rule, gated the same way (no enabled alias, no background recovery).
+
+  Disabling one alias while an enabled sibling remains keeps the account live, and the UI says so on that row. Account labels in meters use enabled aliases only. Claim-time checks inspect the **frozen alias** a Codex run was created with (`codexauthz.go:680`), not whichever alias is the default now.
+- **D7. Re-enabling a Codex login.** A refresh already in progress completes and persists its result: never interrupt durable reconciliation after a single-use refresh token was spent (`codexrefresh.go:648`). On Enable, run the normal coordinated recovery/refresh first and ask for a new login paste only if that fails (`reauth_required`). How long an unused login survives upstream is unknown, and this PRD makes no claim about it.
+- **D8. Three concepts, two checkboxes.** Enablement (availability), `auto_eligible` (pool membership) and the sidebar selection (`users.sidebar_token_ids` / `sidebar_codex_account_ids`, `00123` / `00239`) stay separate. Effective pool membership and effective sidebar visibility both require enabled. Disabled overrides the rule that the default is always shown in the sidebar (`web/src/components/AnthropicTokens.tsx:312`, `:356`). Stored preferences are not rewritten on disable.
+- **D9. Admins see nothing live.** The admin rate-limit endpoints and page show **no row and no count** for a disabled credential. Historical run usage and cost (`/api/admin/usage`, run records, `runs.anthropic_secret_label` / `codex_secret_label`) are unchanged: hiding past spend would falsify accounting.
+- **D10. Data model.** `user_secrets.disabled_at timestamptz NULL` (NULL = enabled) plus `user_secrets.enablement_rev bigint NOT NULL DEFAULT 0`, incremented on every enable/disable transition. The DTO exposes `enabled` (derived from `disabled_at IS NULL`) and `disabled_at`. A repeated disable is a no-op that keeps the original `disabled_at` and does not bump the revision. Independent of the Codex `codex_credential_state.status` (`staging|linked|failed|static`, `00200`). The sealed ciphertext and vault wrapping are untouched.
+- **D11. API.** `PATCH /api/me/secrets/{kind}/{id}/enabled` with `{"enabled": false|true}` (plus, when disabling the default, an optional `{"new_default_id": "<id>"}` applied in the same transaction), idempotent, owner-scoped, returning the updated DTO. It is **cookie-only** (`RequireAuth`, beside the other credential writes in `api/internal/handler/routes_me.go:21-66`) and takes the existing secret mutation lock (`api/internal/handler/secrets.go:129`) so it cannot race make-default or delete. A read endpoint `GET /api/me/secrets/{kind}/{id}/dependents` (RequireAuth, owner-scoped) returns what currently relies on the credential: bound workers, pinned schedules, non-terminal runs pinned to it or holding a claim on it, the Judge binding, whether it is the default, and for Codex the enabled sibling aliases on the same account. The disable dialog renders that list.
+- **D12. No CLI verbs (maintainer decision).** Enabling and disabling stay web-only; the CLI gets no new command. Its read views inherit the server's filtering (`uzi rate-limits`, `uzi admin rate-limits`, the TUI meters). Read-only parity: `uzi token list` gains a `STATE` column and `--json` carries `enabled` / `disabled_at`; `uzi run get` and the TUI render the `credential_disabled` hold reason; `uzi schedule get` renders the `credential_disabled` skip. Server refusals carry a message naming Settings.
+- **D13. Late-write fence.** A poll or refresh that started before a transition must not write, and must not notify, after it. Every poll captures `enablement_rev` when it starts, and the reading upsert is conditional on the credential still being enabled **at the same revision** (a poll started before disable and finished after re-enable is rejected too). Notification requires that fenced write to have succeeded, and the notifier is re-checked against the credential's identity and revision before delivery (today it receives only user and timestamps, `api/internal/usagepoller/engine.go:385-399`, so it needs the secret id). A Slack message already handed to Slack cannot be recalled and is exempt. On re-enable, readings from before the disable are not shown as current and are not consumed by auto-selection until a fresh reading lands.
+- **D14. The wait is a server-owned `paused` park with `hold_reason = 'credential_disabled'`.** Reusing the other parks was rejected:
+  - `pool_wait` has the wrong eligibility test, resets the timeout budget, and its claim-assembly transition excludes the Judge (`api/internal/store/queries/runtime.sql:3730`, `:3755`);
+  - a queued-but-unclaimable run stays in the queue-health machinery and has no paused-budget accounting;
+  - the owner-pause writer requires an owner request and a running source (`SetRunPaused`, `runtime.sql:2437`; resume `:2581`), so it cannot be reused unchanged.
+
+  Requirements:
+  - a new, exact-claim-fenced writer parks the run, preserving elapsed budget, resume phase, custody and recovery metadata, and revokes any undelivered claim capability;
+  - an automatic promoter handles only this reason. It re-evaluates the run's actual credential requirement, banks the held interval so the wait never burns wall-clock budget, and clears the reason atomically;
+  - wake-up is server-driven. Enable requests an immediate promoter pass, and a periodic pass is the restart-safe fallback, so resuming never depends on the bound worker reconnecting or on a browser action;
+  - the promoter never bypasses `recovery_wait`, an owner pause, the completion hold or budget exhaustion, and keeps the existing affinity rules.
+- **D15. Harness resolution distinguishes disabled from absent.** The creation-time resolver currently skips a default harness whose credential is unusable and falls through to the other harness (`api/internal/workersvc/harness_resolver.go:108-112`). A **disabled** configured credential must not trigger that fallback: the resolver pins the harness the user configured and the run is created held (D4, D14). Absent or genuinely unusable credentials keep today's behaviour.
+- **D16. Reassignment only where the lane supports it.** "Run with another token" appears only for lanes that accept a per-run override. Chat, Judge and self-improve do not: self-improve explicitly excludes overrides (`secretchoice.go:585`). For those, the only actions are Enable or changing the default or binding in Settings.
+- **D17. Record.** D1 to D16 are durable invariants, so they get an ADR numbered 1732, written in the implementing run.
+
+## Out of scope
+
+- Any change to `.github/workflows/**` (the worker PAT cannot push workflow files).
+- Revoking a credential upstream (Anthropic / OpenAI). Disable is local suspension only.
+- Anonymising historical run attribution (D9 keeps it).
+- New CLI commands (D12).
+- Cancelling in-flight runs on disable (D3).
+- Recalling a Slack message already delivered (D13).
+
+## User journey
+
+1. Settings → Anthropic tokens and OpenAI / Codex credentials: each card has **Disable** beside Rename / Make default / Delete.
+2. Disable opens a dialog: what disabling does (no background checks or refreshes, hidden from sidebar, pickers, auto-select and the admin view, history kept, a run already holding it finishes first) and a **Uses right now** list from the dependents endpoint (e.g. "worker W is bound to it: it will wait", "schedule S is pinned to it: its next fire is skipped", "1 run in flight keeps it until it finishes"). For a Codex alias it says whether an enabled sibling keeps the shared account live. For the default, a radio group: keep it as default (default-based work waits) or make one of the enabled credentials the default instead.
+3. The card moves into a **Disabled (n)** section at the bottom of its provider card, **collapsed by default**. The expanded state is remembered per browser, with `localStorage` reads and writes wrapped in try/catch. Each row shows the name, the kind badge, a "default, disabled" badge when relevant, **"Disabled since <date>"** (for a Codex alias whose account stays live through an enabled sibling, that fact instead), **Enable** and **Delete**. Auto-select and sidebar checkboxes are hidden, not cleared.
+4. When a default is disabled, a banner at the top of that provider card says default-based work is waiting, with an **Enable it** action. The banner shows even when the Disabled section is collapsed.
+5. The sidebar drops the credential at once, and the "+N more accounts in Settings" count excludes disabled ones.
+6. Enable restores the card and shows "checking usage…" until a fresh reading arrives; a reading from before the disable is never displayed as current.
+7. Token pickers (`TokenPicker.tsx` in `ScheduleModal.tsx`, `RunCredentialOverride.tsx`, `IssueView.tsx`, `IssueCard.tsx`, `PlanPanel.tsx`) omit disabled credentials and show "N disabled not listed · Manage tokens".
+8. A schedule whose pin is disabled shows its last fire as skipped with reason `credential_disabled`. A held run shows `waiting: credential disabled` with **Enable <label>**, plus **Run with another token** where the lane supports it (D16).
+
+## Technical scope (resolved facts)
+
+- **Anthropic selection** is `claimSecretID` (`secretchoice.go:584`): the run override first (`runOverrideChoice` `:631`), then the worker's mode, either auto (`autoChoice` `:819`, `autoselect.Select`) or pinned/default (`workerSecretID` `:918`). `openAnthropic` (`:208`) falls back to the default when no id. Judge and self-improve resolve separately (`secretchoice.go:676-690`, `users.judge_anthropic_secret_id` `00079`). Every rung follows D2; an empty auto pool keeps `pool_wait`.
+- **Codex selection** freezes an alias at creation (`codexauthz.go:680`), resolved from the user's default Codex credential (`harness_resolver.go:333` `resolveUsableCodexCredential`). Claim-time checks use the frozen alias (D6). Creation-time fallback is governed by D15.
+- **Anthropic polling**: `usagepoller/engine.go` `tickAll` (`:198`) plus `pokeUser` (`:236`), which resolves and polls the default independently of the bulk query, so filtering only `ListAnthropicTokensToPoll` misses it. `Poke` runs after a token save (`api/internal/handler/secrets.go:226`) and at login/unlock (the Anthropic branches just above the Codex branches at `api/internal/handler/auth.go:174` and `:309`).
+- **Codex polling**: `codexusagepoller/engine.go` keeps separate staged-reconcile and linked-poll worklists (`:163`); D6 applies a different rule to each.
+- **Schedules** pass the stored override into run creation (`api/internal/schedsvc/scheduler.go:724`, `:1205`). A pinned-disabled fire records a skip reason `credential_disabled` in `last_fire.skips`, visible via `uzi schedule get`. A default-based fire whose default is disabled creates held work (D4).
+- **Owner reads**: `GET /api/me/rate-limits` (`ratelimits.go:46`) and `GET /api/me/codex-rate-limits` (`codex_ratelimits.go:58`) omit disabled credentials; `GET /api/me/secrets` (`secrets.go:82`) keeps listing them with `enabled:false`.
+- **Sidebar settings validation** (`user_settings.go:663`, `:724`) keeps accepting disabled ids in the stored arrays (D8); effective display filters them.
+- **Web mock mode** (`.claude/rules/web.md`) needs fixtures for a disabled token, a disabled default, a disabled Codex alias with an enabled sibling, and a run held on `credential_disabled`.
+- **Migration**: draft number `00255` (renumbered at merge time per CLAUDE.md). It adds `disabled_at` and `enablement_rev` to `user_secrets`, the `credential_disabled` hold reason (extend the `hold_reason` check constraint if one exists), and an index serving the promoter's worklist. Park, promote and fenced-upsert queries are new sqlc queries.
+
+Implementation and validation need no external documentation or network access beyond the repository; every fact above comes from the codebase.
+
+## Execution plan
+
+| Phase | Milestones | Dependency / shared files |
+|---|---|---|
+| 1 | M1 | Schema, DTO, routes, ADR: everything else reads `disabled_at` / `enablement_rev` |
+| 2, sequential | M2a → M2b → M3a → M3b → M4 | Shared `workersvc`, `store/queries/runtime.sql`, pollers |
+| 3 | M5 | Web consumes M1 to M4 |
+| 4 | M6 | CLI read parity, docs, final integration |
+
+One gated run; the milestones are sequential, never parallel writers. Each milestone ships its own regression tests, each demonstrated red on the unfixed seam and green with the fix.
+
+## Milestones
+
+- [ ] **M1. Model, routes, ADR.** Migration (`disabled_at`, `enablement_rev`, hold reason, promoter index); sqlc regenerate; `enabled` / `disabled_at` on `SecretDTO` (`api/internal/apitypes/secret.go`) and the web type; `PATCH …/enabled` (D11, including the atomic default hand-off, idempotent repeat keeping the original timestamp and revision) and `GET …/dependents`, both cookie-only and owner-scoped, under the secret mutation lock. ADR (file name adr/1732-disable-credentials.md, created in this milestone) stating D1 to D16. Tests: router-level auth (a `uzc_` Bearer is refused on both routes, a cookie session succeeds, another user's id is 404); disable/enable idempotency; atomic hand-off. `task gate:api`.
+- [ ] **M2a. Park and promote.** The `credential_disabled` park writer and the automatic promoter (D14): exact-claim fence, budget banking, preserved resume phase, custody and recovery metadata, immediate pass on Enable plus the periodic fallback, no bypass of `recovery_wait` / owner pause / completion hold / budget exhaustion. Tests: park then enable resumes without a manual action; held time does not consume the wall-clock budget; a restart between park and enable still promotes; a run also under an owner pause stays paused. `task gate:api` plus `./e2e/run-store-it.sh` for the new queries.
+- [ ] **M2b. Selection, assignment, schedules, harness.** Every Anthropic rung, the Judge, self-improve and chat follow D2 (park, never substitute); an empty auto pool keeps `pool_wait`; D5 refusals on every explicit-assignment path; schedules record the `credential_disabled` skip for a pin and create held work for a disabled default; D15 harness resolution; D3 claim-fenced exception. Tests: a pinned run, a bound worker, the default, the Judge and self-improve each park and never spend another credential; auto-pool exhaustion stays `pool_wait`; a disabled default Codex credential yields a held Codex run rather than a Claude run; a default hand-off after a Codex run's creation still checks the frozen alias; a disable between selection and credential delivery parks the run; a worker that loses its claim loses the exception. `task gate:api` plus `./e2e/run-store-it.sh`.
+- [ ] **M3a. Polling fences.** Anthropic tick and `pokeUser` skip disabled tokens; the D13 revision fence on reading upserts; notifications only after a fenced write, with the notifier carrying the secret id and re-checking identity and revision; stale readings hidden and ignored by auto-selection after re-enable; re-enable pokes an immediate poll. Tests: disabled token polled on neither tick nor poke; a poll started before disable and finished after re-enable writes nothing and alerts nothing; auto-selection ignores a pre-disable reading. `task gate:api`.
+- [ ] **M3b. Codex liveness, flights and recovery.** D6 worklists (enabled staged aliases reconcile, accounts with an enabled linked alias poll and background-refresh, recovery gated the same way); D3 in-flight refresh exception fenced by claim authority; D7 re-enable recovery. Tests: a newly saved enabled alias links while its sibling is disabled; an account with a disabled alias and an enabled sibling keeps polling; with no enabled alias it is neither polled nor background-refreshed; an active flight on the last disabled alias can still refresh until its claim ends; an in-progress refresh completes and persists. `task gate:api`.
+- [ ] **M4. Read surfaces.** Owner and admin rate-limit endpoints omit disabled credentials (admin: no row, no count, D9); Codex account labels use enabled aliases only; `ListMySecrets` includes them with `enabled:false`; usage and cost history unchanged. Tests: owner and admin responses exclude disabled credentials; history totals identical before and after a disable. `task gate:api`.
+- [ ] **M5. Web.** Settings cards (Anthropic and Codex): Disable action, the dialog with the dependents list, the default choice and the Codex sibling note; the collapsed-by-default Disabled (n) section with remembered expansion; "Disabled since"; the default-disabled banner; Enable with "checking usage…". Sidebar and "+N more" exclude disabled. Pickers omit them with the "N disabled not listed" footer. Run and schedule views show `credential_disabled` with Enable, plus change-token only where D16 allows. Admin Rate limits needs no UI change beyond the API filter; verify it. Mock-mode fixtures. Real `<button>`s, focusable, `aria-expanded` on the section toggle. Tests: section collapsed by default; a disabled card leaves the sidebar; the banner renders with the section collapsed; pickers omit disabled entries; no reassignment action on chat/Judge/self-improve. `task gate:web`.
+- [ ] **M6. CLI read parity, docs, integration.** D12 read-only parity (`token list` STATE and JSON fields, `run get` / TUI hold reason, `schedule get` skip reason); refusal messages name Settings. Update the user doc covering tokens and credentials (find it with `git grep -n -i 'anthropic token' docs/`) and run `task docs:sync`; CHANGELOG `[Unreleased]` line. Run the full suite. `task gate:api`, `task gate:web` and `task gate:repo` green.
+
+## Success criteria
+
+- Disabling a credential removes it from the owner's sidebar and every picker immediately and from the admin Rate limits page on the next fetch. It triggers no further **background** upstream calls (polls, refreshes, reconciliations; verified by poller tests and `synced_at` not advancing). The only calls afterwards come from a flight that already held its claim (D3).
+- No run, schedule, worker or Judge pass ever spends a different credential, or switches harness, because one was disabled.
+- Held work resumes by itself on Enable, with its wall-clock budget intact.
+- Enable restores the credential with its previous preferences and a fresh reading.
+
+## Risks
+
+- **A missed selection or poll path** silently keeps spending or polling. Mitigation: D1 lists every path; M2b and M3a/M3b test each rung; the check lives on the server, not in the UI.
+- **The new park interacts badly with existing holds.** Mitigation: D14's no-bypass rule and M2a's combined-hold tests.
+- **A Codex login lapses while disabled.** Mitigation: D7 tries a normal refresh on Enable and falls back to the existing re-paste flow.
+- **Held work goes unnoticed.** Mitigation: the typed reason on run, schedule and Settings surfaces, and the default-disabled banner.
+
+## Decision Log
+
+- 2026-09-26: D1 to D13 agreed with the maintainer after a Claude and Codex brainstorm and a clickable mock. The maintainer chose both options for disabling the default (D4), no live admin trace (D9) and no CLI verbs (D12).
+- 2026-09-26: A second Codex review of the draft added the claim-fenced flight exception (D3), the staged-versus-linked Codex rule (D6), the revision fence (D13), the `paused` + `credential_disabled` park (D14), harness resolution for disabled credentials (D15) and lane-limited reassignment (D16); milestones M2 and M3 were split and tests moved beside their milestones.
