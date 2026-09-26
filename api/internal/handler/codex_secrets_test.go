@@ -231,6 +231,20 @@ func (f *fakeCodexDB) QueryRow(_ context.Context, sql string, args ...any) pgx.R
 			}
 		}
 		return errRow(pgx.ErrNoRows)
+	case strings.Contains(sql, "name: HasSecretDefaultSlot"):
+		kind := args[1].(string)
+		for _, s := range f.secrets {
+			if s.isDefault && (s.kind == kind || isCodexKind(kind) && isCodexKind(s.kind)) {
+				return fakeScanRow{func(dest ...any) error {
+					*dest[0].(*bool) = true
+					return nil
+				}}
+			}
+		}
+		return fakeScanRow{func(dest ...any) error {
+			*dest[0].(*bool) = false
+			return nil
+		}}
 	case strings.Contains(sql, "name: CountEnabledSecretSlot"):
 		kind := args[1].(string)
 		var n int64
@@ -664,35 +678,40 @@ func TestDeleteCodexForeignIdIs404(t *testing.T) {
 
 func TestDeleteAnthropicDefaultCountsEnabledSiblings(t *testing.T) {
 	for _, byID := range []bool{false, true} {
-		for _, disabledSibling := range []bool{false, true} {
-			t.Run(fmt.Sprintf("by_id=%t/disabled_sibling=%t", byID, disabledSibling), func(t *testing.T) {
-				db := newFakeCodexDB()
-				defaultID := db.seed(store.KindAnthropicToken, "default", true)
-				siblingID := db.seed(store.KindAnthropicToken, "sibling", false)
-				if disabledSibling {
-					db.secrets[siblingID].disabledAt = nowTS()
-				}
-				h := newCodexHandler(t, db)
-				rec := httptest.NewRecorder()
-				if byID {
-					h.DeleteAnthropicTokenByID(rec, codexReq(t, http.MethodDelete,
-						"/api/me/secrets/anthropic_token/"+defaultID.String(), "", uuid.New(), defaultID.String()))
-				} else {
-					h.DeleteAnthropicToken(rec, codexReq(t, http.MethodDelete,
-						"/api/me/secrets/anthropic_token", "", uuid.New(), ""))
-				}
-				want := http.StatusConflict
-				if disabledSibling {
-					want = http.StatusNoContent
-				}
-				if rec.Code != want {
-					t.Fatalf("status = %d, want %d; body=%s", rec.Code, want, rec.Body.String())
-				}
-				_, exists := db.secrets[defaultID]
-				if exists == disabledSibling {
-					t.Fatalf("default exists = %t, disabled sibling = %t", exists, disabledSibling)
-				}
-			})
+		for _, disabledDefault := range []bool{false, true} {
+			for _, disabledSibling := range []bool{false, true} {
+				t.Run(fmt.Sprintf("by_id=%t/disabled_default=%t/disabled_sibling=%t", byID, disabledDefault, disabledSibling), func(t *testing.T) {
+					db := newFakeCodexDB()
+					defaultID := db.seed(store.KindAnthropicToken, "default", true)
+					siblingID := db.seed(store.KindAnthropicToken, "sibling", false)
+					if disabledDefault {
+						db.secrets[defaultID].disabledAt = nowTS()
+					}
+					if disabledSibling {
+						db.secrets[siblingID].disabledAt = nowTS()
+					}
+					h := newCodexHandler(t, db)
+					rec := httptest.NewRecorder()
+					if byID {
+						h.DeleteAnthropicTokenByID(rec, codexReq(t, http.MethodDelete,
+							"/api/me/secrets/anthropic_token/"+defaultID.String(), "", uuid.New(), defaultID.String()))
+					} else {
+						h.DeleteAnthropicToken(rec, codexReq(t, http.MethodDelete,
+							"/api/me/secrets/anthropic_token", "", uuid.New(), ""))
+					}
+					want := http.StatusConflict
+					if disabledSibling {
+						want = http.StatusNoContent
+					}
+					if rec.Code != want {
+						t.Fatalf("status = %d, want %d; body=%s", rec.Code, want, rec.Body.String())
+					}
+					_, exists := db.secrets[defaultID]
+					if exists != (want == http.StatusConflict) {
+						t.Fatalf("default exists = %t, want %t", exists, want == http.StatusConflict)
+					}
+				})
+			}
 		}
 	}
 }

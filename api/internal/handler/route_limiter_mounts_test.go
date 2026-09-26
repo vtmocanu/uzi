@@ -388,6 +388,7 @@ var wantRouteMounts = []routeMount{
 	// store read, RequireUser, no limiter, like /me/rate-limits beside it.
 	{"GET", "/api/me/codex-rate-limits", noLimiter},
 	{"GET", "/api/me/secrets/", noLimiter},
+	{"GET", "/api/me/secrets/{kind}/{id}/dependents", noLimiter},
 	{"GET", "/api/me/settings/", noLimiter},
 	{"GET", "/api/me/slack/", noLimiter},
 	// PRD #1349 M5: the owner-wide custody hold list + aggregate. Owner-scoped RequireUser read,
@@ -462,6 +463,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/ws", noLimiter},
 	{"PATCH", "/api/admin/users/{id}", noLimiter},
 	{"PATCH", "/api/me/secrets/anthropic_token/{id}", noLimiter},
+	{"PATCH", "/api/me/secrets/{kind}/{id}/enabled", noLimiter},
 	// PRD #1147 M1 codex credential patches (rename / set-default / replace): owner-scoped
 	// DB writes, no forge call, no spendable mint → noLimiter, like the anthropic PATCH above.
 	{"PATCH", "/api/me/secrets/codex_auth/{id}", noLimiter},
