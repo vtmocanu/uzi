@@ -25,7 +25,7 @@ through `[0.52.0]`.)
 ### Changed
 
 - **The worker scratch path and sandbox guarantee are documented ([#1719](https://github.com/vtmocanu/uzi/issues/1719)).**
-  ADR-1719 defines the `.uzi/scratch/` path for run artifacts, its ephemeral lifecycle and publication refusal; the worker now provisions and locally excludes scratch, while publication and guidance work remains in progress.
+  ADR-1719 defines the `.uzi/scratch/` path for run artifacts and the limits of each harness's path policy. The worker provisions and locally excludes scratch, refuses checkpoint or final publication of forced-staged artifacts, and guides both harnesses to fresh review exports and gate logs inside the retained clone.
 
 - **The default sweeps no longer all start at 02:00 UTC, and bug triage picks up 4 issues ([#1738](https://github.com/vtmocanu/uzi/pull/1738)).**
   Bug triage now starts at 00:00, the Planned sweep stays at 02:00, and the assigned-to-uzi sweep moves to 06:00, giving bug runs a two-hour head start before Planned work is queued. Sweeps you already enabled keep their schedule: Reset on the row adopts the new defaults (it also restores UTC and clears other customizations), or set the cron and max issues explicitly with `uzi schedule edit`.

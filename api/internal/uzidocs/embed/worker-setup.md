@@ -194,11 +194,10 @@ cross-worker recovery create an empty scratch directory. Do not rely on it for
 durable recovery.
 
 The worker locally excludes the scratch directory from ordinary staging.
-Publication refusal is planned for checkpoint and final sends if scratch appears
-in any commit being sent or an index/WIP capture. An ignore rule does not prevent forced
-staging. A repository collision at `.uzi/scratch/` will fail provisioning
-instead of replacing repository content. Until publication refusal lands,
-check what is staged before committing.
+Checkpoint and final publication refuse a scratch path in any commit being
+sent or an index/WIP capture. An ignore rule does not prevent forced staging;
+publication refusal guards that case. A repository collision at `.uzi/scratch/`
+fails provisioning instead of replacing repository content.
 
 Direct file-tool paths are limited to the run worktree on Claude and Codex.
 This is a tool policy, not a promise that every shell command is filesystem
