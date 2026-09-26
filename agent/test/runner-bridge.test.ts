@@ -147,24 +147,18 @@ const bridgeStatusLines = (runId: string): string[] =>
 
 describe("RunRunner — scratch publication refusal", () => {
   for (const aligned of [false, true]) {
-    it(`${aligned ? "align" : "normal"} finalize refuses a scratch-bearing H before bridge custody or push`, async () => {
+    it(`${aligned ? "align" : "normal"} finalize refuses a scratch-bearing H before bridge custody or remote push`, async () => {
       if (aligned) commitToOriginMain({ ".github/workflows/ci.yml": CI_V1 }, "seed workflows");
       const branch = `feature/scratch-${aligned ? "align" : "plain"}`;
       const P = publishBranch(branch);
       const { gitlab } = fakeGitlab();
       const { github } = fakeGitHub();
       let moves = 0;
-      let pushes = 0;
       const originalMove = git.updateTrackingRef.bind(git);
-      const originalPush = git.pushBranch.bind(git);
       git.updateTrackingRef = (async (...args: Parameters<typeof git.updateTrackingRef>) => {
         moves++;
         return originalMove(...args);
       }) as typeof git.updateTrackingRef;
-      git.pushBranch = (async (...args: Parameters<typeof git.pushBranch>) => {
-        pushes++;
-        return originalPush(...args);
-      }) as typeof git.pushBranch;
       const executor: Executor = {
         run: async (ctx) => {
           fs.mkdirSync(path.join(ctx.worktreePath, ".uzi", "scratch"), { recursive: true });
@@ -180,11 +174,9 @@ describe("RunRunner — scratch publication refusal", () => {
         await (aligned ? githubRunner(github, executor) : runner(executor, gitlab)).execute(claim);
       } finally {
         git.updateTrackingRef = originalMove;
-        git.pushBranch = originalPush;
       }
-      assert.equal(gitIn(fx.originPath, ["rev-parse", branch]), P);
+      assert.equal(gitIn(fx.originPath, ["rev-parse", branch]), P, "no remote push changed the branch");
       assert.equal(moves, 0, "bridge never moved custody");
-      assert.equal(pushes, 0, "no authenticated push attempted");
       const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
       assert.match(failed?.failure_reason ?? "", /^scratch_publication_refused:/);
       assert.notEqual(failed?.fail_origin, "history_rewritten");
@@ -565,6 +557,44 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     const outcome = await callBridge(r, bare, branch, flight);
     assert.strictEqual(outcome.kind, "clean");
     assert.strictEqual(await git.trackingTip(bare, branch), tipBefore, "the ref was not advanced");
+  });
+
+  it("leaves scratch-bearing clean checkpoint custody to the best-effort publish outcome", async () => {
+    const { gitlab } = fakeGitlab();
+    const branch = "feature/helper-clean-scratch";
+    const P = publishBranch(branch);
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.runnerCloneForBranch(bare, branch, "feature-hcs", "R1");
+    fs.mkdirSync(path.join(rc.path, ".uzi", "scratch"), { recursive: true });
+    fs.writeFileSync(path.join(rc.path, ".uzi", "scratch", "note"), "local only\n");
+    gitIn(rc.path, ["add", "-f", ".uzi/scratch/note"]);
+    gitIn(rc.path, [...IDENT, "commit", "-m", "scratch checkpoint"]);
+    await git.fetchAgentBranch(bare, rc.path, branch, "R1");
+    const H = await git.trackingTip(bare, branch);
+    const lines: string[] = [];
+    const flight = {
+      runId: "R1",
+      publishedTip: P,
+      checkpointFloor: P,
+      lastCheckpointRefTip: "CONFIRMED",
+      lastAttemptedCheckpointRefTip: "ATTEMPTED",
+      reportedPublishOutcomes: new Set<string>(),
+      runLog: nullLogger(),
+      batcher: { emit(message: { payload?: { text?: string } }) {
+        if (message.payload?.text) lines.push(message.payload.text);
+      } },
+    };
+    const r = runner({ run: async (c) => ({ branch: c.branch }) }, gitlab);
+    assert.deepEqual(await callBridge(r, bare, branch, flight), { kind: "clean" });
+    const outcome = await (r as unknown as {
+      publishCheckpointOutcome: (f: unknown, b: string, name: string) => Promise<unknown>;
+    }).publishCheckpointOutcome(flight, bare, branch);
+    assert.deepEqual(outcome, { published: false, reason: "scratch_publication_refused" });
+    assert.equal(await git.trackingTip(bare, branch), H);
+    assert.equal(flight.checkpointFloor, P);
+    assert.equal(flight.lastCheckpointRefTip, "CONFIRMED");
+    assert.equal(flight.lastAttemptedCheckpointRefTip, "ATTEMPTED");
+    assert.deepEqual(lines, ["checkpoint publish failed: scratch_publication_refused"]);
   });
 
   it("returns 'unknown' (never bridges) when ancestry cannot be determined", async () => {

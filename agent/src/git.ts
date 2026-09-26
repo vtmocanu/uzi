@@ -33,7 +33,7 @@ export class ScratchPublicationError extends Error {
   }
 }
 
-export class RemoteBranchAdvancedError extends Error {
+class RemoteBranchAdvancedError extends Error {
   constructor() {
     super("non-fast-forward: remote branch advanced");
     this.name = "RemoteBranchAdvancedError";

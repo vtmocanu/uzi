@@ -6943,11 +6943,9 @@ export class RunRunner {
       else if (rel === "unknown") anyUnknown = true;
     }
     if (!anyDivergent) {
-      // A broken read must never bridge. A proven clean published tip is checked
-      // before the runner attempts a push; unpublished tips use pushBranch's check.
-      if (anyUnknown) return { kind: "unknown" };
-      await this.git.scratchPublicationPreflight(barePath, branch, H);
-      return { kind: "clean" };
+      // All ancestor, or a mix of ancestor and unknown: a broken read must never bridge.
+      // Publication checks the candidate at checkpointPack or pushBranch.
+      return anyUnknown ? { kind: "unknown" } : { kind: "clean" };
     }
     // Build B over the floors (bridgeToFloors appends only the ones actually missing).
     const bridgeResult = await this.git.bridgeToFloors(barePath, H, floors);
