@@ -230,14 +230,17 @@ func TestVaultBandCountsOwnVaultLockedParks(t *testing.T) {
 	}
 }
 
-// TestVaultParkBoardSecondLine: the selected vault_locked row draws the vault park sentence as
-// its second line, clamped to m.width, and boardShowSecondLine reserves that physical line in
-// boardCapacity, so a board with more runs than fit keeps its frame within m.height at 60 and
-// 80 columns. Reddening mutations: drop the vaultParkLine branch in boardSecondLine (the line
-// is missing), drop its clampVisual (a row overflows m.width), or drop the vaultParkLine term in
-// boardShowSecondLine (the capacity is not reserved and the frame overflows by one row).
+// TestVaultParkBoardSecondLine: the selected vault_locked row draws the vault park line as its
+// second line, shed to m.width so the retry HH:MM survives at 60 and 80 columns and the full
+// sentence shows at 200, and boardShowSecondLine reserves that physical line in boardCapacity,
+// so a board with more runs than fit keeps its frame within m.height. Reddening mutations:
+// drop the vaultParkLine branch in boardSecondLine (the line is missing), draw the unshed
+// vaultParkLine (the HH:MM is clamped away at 60/80), drop the "  ▸ " prefix allowance (the
+// shorter form is clamped past its HH:MM at 80), cap Plain below the sentence (the full
+// sentence is cut at 200), or drop the vaultParkLine term in boardShowSecondLine (the
+// capacity is not reserved and the frame overflows by one row).
 func TestVaultParkBoardSecondLine(t *testing.T) {
-	for _, width := range []int{60, 80} {
+	for _, width := range []int{60, 80, 200} {
 		runs := []apitypes.RunListItemDTO{{RunDTO: vaultParkRun("00000000-vault")}}
 		for i := 0; i < 40; i++ {
 			id := "1" + strings.Repeat("0", 6) + string(rune('a'+i%26)) + "-run"
@@ -256,6 +259,7 @@ func TestVaultParkBoardSecondLine(t *testing.T) {
 		if !strings.Contains(out, "▸ waiting for vault unlock") {
 			t.Fatalf("width %d: board lacks the vault park second line:\n%s", width, out)
 		}
+		assertVaultRetryShown(t, "board", width, runs[0].RunDTO, lineWith(t, out, "▸ waiting for vault unlock"))
 		rows := strings.Split(out, "\n")
 		for i, row := range rows {
 			if w := visualWidth(row); w > width {
@@ -273,14 +277,16 @@ func TestVaultParkBoardSecondLine(t *testing.T) {
 	}
 }
 
-// TestVaultParkDetailFitsTerminal: the TUI run detail draws the vault park sentence below the
-// header, clamped to m.width, and the frame is exactly m.height rows at 60 and 80 columns.
-// Reddening mutations: drop the vaultParkLine branch in renderDetail (the line is missing), drop
-// its clampVisual (a row overflows m.width), or drop the vaultParkLine term in
-// transcriptViewport (the frame comes to m.height+1 rows).
+// TestVaultParkDetailFitsTerminal: the TUI run detail draws the vault park line below the
+// header, shed to m.width so the retry HH:MM survives at 60 and 80 columns and the full
+// sentence shows at 200, and the frame is exactly m.height rows. Reddening mutations: drop the
+// vaultParkLine branch in renderDetail (the line is missing), draw the unshed vaultParkLine (the
+// HH:MM is clamped away at 60/80), cap Plain below the sentence (the full sentence is cut at
+// 200), or drop the vaultParkLine term in transcriptViewport (the frame comes to m.height+1
+// rows).
 func TestVaultParkDetailFitsTerminal(t *testing.T) {
 	now := time.Now()
-	for _, width := range []int{60, 80} {
+	for _, width := range []int{60, 80, 200} {
 		run := vaultParkRun("77777777-vault")
 		m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
 		m = applyDetail(m, run, []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "one short line", now)})
@@ -289,6 +295,7 @@ func TestVaultParkDetailFitsTerminal(t *testing.T) {
 		if !strings.Contains(out, "waiting for vault unlock") {
 			t.Fatalf("width %d: the vault park line is missing:\n%s", width, out)
 		}
+		assertVaultRetryShown(t, "detail", width, run, lineWith(t, out, "waiting for vault unlock"))
 		rows := strings.Split(out, "\n")
 		for i, row := range rows {
 			if w := visualWidth(row); w > width {
@@ -317,5 +324,55 @@ func TestVaultParkDetailViewportReservesRow(t *testing.T) {
 	}
 	if p, u := vp(parked), vp(plain); p != u-1 {
 		t.Errorf("transcriptViewport(vault park) = %d, want %d (one row fewer than the unparked run's %d for the vault line)", p, u-1, u)
+	}
+}
+
+// assertVaultRetryShown checks a rendered TUI vault park row: it carries the fixture's retry
+// HH:MM at every width, and at a width wide enough for the whole sentence it carries the full
+// vaultParkLine uncut (which also pins the Plain cap above the sentence's length).
+func assertVaultRetryShown(t *testing.T, surface string, width int, r apitypes.RunDTO, row string) {
+	t.Helper()
+	if hhmm := r.RecoveryRetryNotBefore.Local().Format("15:04"); !strings.Contains(row, hhmm) {
+		t.Errorf("%s width %d: vault park row lacks the retry time %s: %q", surface, width, hhmm, row)
+	}
+	if width >= 200 {
+		if full := vaultParkLine(r); !strings.Contains(row, full) {
+			t.Errorf("%s width %d: vault park row lacks the full sentence %q: %q", surface, width, full, row)
+		}
+	}
+}
+
+// TestFitVaultParkLine pins the shedding order: the full sentence when it fits, then the
+// explanation shed to "... once unlocked it resumes at its next retry (HH:MM)", then the floor
+// "waiting for vault unlock · retry HH:MM"; never over width while the floor fits, the floor
+// is never cut, and a run without a stamp or without the cause behaves. Reddening mutations:
+// return vaultParkLine unshed (over width), or drop the HH:MM from the floor.
+func TestFitVaultParkLine(t *testing.T) {
+	r := vaultParkRun("r1")
+	hhmm := r.RecoveryRetryNotBefore.Local().Format("15:04")
+	full := vaultParkLine(r)
+	short := "waiting for vault unlock — once unlocked it resumes at its next retry (" + hhmm + ")"
+	floor := "waiting for vault unlock · retry " + hhmm
+	for _, tc := range []struct {
+		width int
+		want  string
+	}{
+		{visualWidth(full), full},
+		{visualWidth(full) - 1, short},
+		{visualWidth(short), short},
+		{visualWidth(short) - 1, floor},
+		{visualWidth(floor), floor},
+		{10, floor}, // the floor is never cut; the caller's clampVisual is the backstop
+	} {
+		if got := fitVaultParkLine(r, tc.width); got != tc.want {
+			t.Errorf("fitVaultParkLine(width %d) = %q, want %q", tc.width, got, tc.want)
+		}
+	}
+	r.RecoveryRetryNotBefore = nil
+	if got := fitVaultParkLine(r, 30); got != "waiting for vault unlock" {
+		t.Errorf("fitVaultParkLine(no stamp, 30) = %q, want the bare lead", got)
+	}
+	if got := fitVaultParkLine(apitypes.RunDTO{Status: statusRecoveryWait}, 200); got != "" {
+		t.Errorf("fitVaultParkLine(untyped park) = %q, want \"\"", got)
 	}
 }

@@ -529,9 +529,13 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 		return padSeg(clampVisual(out, m.width), m.width, bg)
 	}
 	// Issue #1766: a vault_locked park likewise has no live activity; its second line is the
-	// owner-neutral vault park sentence (vaultParkLine), in the same wait ink and slot. The
-	// sentence outruns any normal terminal, so clampVisual holds it to one physical row.
-	if line := vaultParkLine(r.RunDTO); line != "" {
+	// owner-neutral vault park sentence, in the same wait ink and slot. The full sentence
+	// outruns most terminals and ends in the retry time, so fitVaultParkLine sheds the
+	// explanation to the width left after the 4-column "  ▸ " prefix, keeping "waiting for
+	// vault unlock" and the HH:MM; clampVisual is only the backstop for a pathologically
+	// narrow terminal. The 240-rune Plain cap (D7 sanitize backstop) sits above the full
+	// sentence's length so the wide form is never cut.
+	if line := fitVaultParkLine(r.RunDTO, m.width-4); line != "" {
 		out := paintSeg(m.pal.tungsten, bg, false, "  ▸ ") + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 240))
 		return padSeg(clampVisual(out, m.width), m.width, bg)
 	}
