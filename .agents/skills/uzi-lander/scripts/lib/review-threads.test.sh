@@ -30,4 +30,10 @@ if fetch_review_threads test/repo 42 > "$WORK/partial.out"; then
   fail "GraphQL partial data with errors was accepted: $(cat "$WORK/partial.out")"
 fi
 
-echo "PASS review-threads: GraphQL errors fail closed"
+# drop_resolved_comments: a comment in a resolved thread is dropped, others are kept.
+nodes='[{"isResolved":true,"comments":{"nodes":[{"databaseId":5}]}},{"isResolved":false,"comments":{"nodes":[{"databaseId":6}]}}]'
+got=$(printf '%s' '[{"id":5},{"id":6},{"id":7}]' | drop_resolved_comments "$nodes" | jq -c '[.[].id]')
+[ "$got" = '[6,7]' ] || fail "drop_resolved_comments kept the wrong comments: $got"
+if printf '%s' '{"id":5}' | drop_resolved_comments "$nodes" >/dev/null; then fail "non-array comments accepted"; fi
+
+echo "PASS review-threads: GraphQL errors fail closed; resolved comments dropped"

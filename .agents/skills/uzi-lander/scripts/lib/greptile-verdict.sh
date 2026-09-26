@@ -227,7 +227,7 @@ greptile_prior_verdict() {
   return 0
 }
 
-# greptile_scope_live REPO PR HEAD HEAD_STATE HEAD_REVIEW_ID RAW_LIVE COMMENTS ISSUE_COMMENTS
+# greptile_scope_live REPO PR HEAD HEAD_STATE HEAD_REVIEW_ID RAW_LIVE COMMENTS ISSUE_COMMENTS [ANCHORED]
 #   The ONE liveness decision for a head Greptile has not reviewed, shared by watch-pr.sh,
 #   pr-findings.sh and takeover.sh so they decide the same way about the same PR.
 #     HEAD_STATE      the head's Greptile check-run status; `absent` ONLY when the listing was
@@ -237,6 +237,9 @@ greptile_prior_verdict() {
 #     RAW_LIVE        how many Greptile comments are still anchored (`line != null`)
 #     COMMENTS        `pulls/N/comments` as ONE flat JSON array
 #     ISSUE_COMMENTS  `issues/N/comments` as ONE flat JSON array
+#     ANCHORED        anchored Greptile comments BEFORE resolved threads were dropped (default
+#                     RAW_LIVE). It alone decides whether to look further, so resolved threads
+#                     never skip the pending-review check (rc 2).
 #   Sets GRL_LIVE and GRL_NOTE (`<sha8>/<added>` when an earlier verdict scoped the count).
 #   The earlier verdict applies ONLY when the head carries no Greptile evidence at all: no
 #   check-run in any state and no review object. Anything Greptile said or is saying about
@@ -249,9 +252,9 @@ greptile_prior_verdict() {
 # shellcheck disable=SC2034  # GRL_LIVE / GRL_NOTE are this function's outputs: the scripts that source this file read them, which shellcheck cannot see when linting the lib alone.
 greptile_scope_live() {
   local repo="$1" pr="$2" head="$3" state="$4" head_rid="$5" raw="$6" comments="$7" issue_comments="$8"
-  local rc=0 requested grace="${GREPTILE_TRIGGER_GRACE:-600}"
+  local anchored="${9:-$6}" rc=0 requested grace="${GREPTILE_TRIGGER_GRACE:-600}"
   GRL_LIVE="$raw"; GRL_NOTE=""
-  [ "$raw" -gt 0 ] || return 0
+  [ "$anchored" -gt 0 ] || return 0
   if [ "$state" != "absent" ] || [ -n "$head_rid" ]; then return 0; fi
   greptile_prior_verdict "$repo" "$pr" "$head" || rc=$?
   [ "$rc" -eq 0 ] || return "$rc"
