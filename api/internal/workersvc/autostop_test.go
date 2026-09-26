@@ -1131,6 +1131,9 @@ func (f *autoStopSweepStore) ListActiveRunsForHealth(context.Context, []string) 
 func (f *autoStopSweepStore) ListRunToolWindow(context.Context, store.ListRunToolWindowParams) ([]store.ListRunToolWindowRow, error) {
 	return nil, nil
 }
+func (f *autoStopSweepStore) ListRunLeadToolWindow(context.Context, store.ListRunLeadToolWindowParams) ([]store.ListRunLeadToolWindowRow, error) {
+	return nil, nil
+}
 func (f *autoStopSweepStore) SetRunHealth(_ context.Context, arg store.SetRunHealthParams) (int64, error) {
 	f.healthWrites = append(f.healthWrites, arg)
 	return 1, nil

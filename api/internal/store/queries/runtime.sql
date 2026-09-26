@@ -6076,6 +6076,26 @@ WHERE run_id = @run_id AND kind IN ('tool_use', 'tool_result')
 ORDER BY seq DESC
 LIMIT @lim;
 
+-- name: ListRunLeadToolWindow :many
+-- The tail of a running run's LEAD lane for in-flight detection only (Decision 9,
+-- issue #1394). ListRunToolWindow above mixes the lead's rows with every nested
+-- subagent's, so a subagent's completed calls hid the lead's still-open parent
+-- `Agent` dispatch and a working run read as stalled. This query keeps
+-- the lead lane alone (agent_instance IS NULL: nested frames carry the SDK's
+-- parent_tool_use_id there, migration 00075) and adds the lead's lifecycle
+-- boundaries, the `init` status and the `result` status/error, so the Go side can
+-- stop its scan at the start of the current claim/query leg and never count an
+-- orphaned call from an earlier leg as in flight. Loop detection keeps reading
+-- ListRunToolWindow unchanged. The Go side re-checks kind and payload event
+-- itself rather than trusting this filter alone.
+SELECT seq, kind, payload
+FROM run_messages
+WHERE run_id = @run_id AND agent_instance IS NULL
+  AND (kind IN ('tool_use', 'tool_result')
+       OR (kind IN ('status', 'error') AND payload->>'event' IN ('init', 'result')))
+ORDER BY seq DESC
+LIMIT @lim;
+
 -- name: SetRunHealth :execrows
 -- The detector's single writer of the health columns (Decision 3). Status-scoped
 -- (@status is the status the detector read) so it no-ops if the run left that

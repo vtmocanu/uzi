@@ -27,6 +27,11 @@ through `[0.52.0]`.)
 - **The default sweeps no longer all start at 02:00 UTC, and bug triage picks up 4 issues ([#1738](https://github.com/vtmocanu/uzi/pull/1738)).**
   Bug triage now starts at 00:00, the Planned sweep stays at 02:00, and the assigned-to-uzi sweep moves to 06:00, giving bug runs a two-hour head start before Planned work is queued. Sweeps you already enabled keep their schedule: Reset on the row adopts the new defaults (it also restores UTC and clears other customizations), or set the cron and max issues explicitly with `uzi schedule edit`.
 
+### Fixed
+
+- **A run whose subagent is busy is no longer flagged stalled while its parent `Agent` call is still open ([#1394](https://github.com/vtmocanu/uzi/issues/1394)).**
+  The stalled check's "a tool call is in flight" suppression now reads the lead's own tool calls instead of the newest call across every lane, so a subagent's completed calls no longer hide the lead's open dispatch; an unmatched lead call from an earlier claim or query leg no longer counts once a newer init or result marks that leg's boundary.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added
