@@ -124,11 +124,12 @@ type skewTickMsg struct{}
 // while such a run remains — so an idle board wakes on nothing.
 type blinkTickMsg struct{}
 
-// secretsMsg carries the viewer's Anthropic token count (from ListSecrets), fetched once
-// at Init to gate the board credential column on PRD #295's more-than-one-token rule.
+// secretsMsg carries per-harness credential counts from ListSecrets, fetched once
+// at Init to gate each board row by the viewer's credentials for that harness.
 type secretsMsg struct {
-	count int
-	err   error
+	count      int // anthropic_token
+	codexCount int // codex_auth and openai_api_key
+	err        error
 }
 
 // rateLimitsMsg carries the viewer's own per-token rate-limit meters (from SelfRateLimits),
@@ -342,9 +343,8 @@ type tuiModel struct {
 	ctrlCSeen bool
 	showHelp  bool
 
-	// codexCredentialCount counts linked Codex aliases in the account response, including
-	// accounts without a readable rate-limit meter. It gates Codex board cells independently
-	// of the Anthropic token count.
+	// codexCredentialCount counts Codex credential secrets, independently of whether
+	// their provider account has a readable rate-limit meter.
 	codexCredentialCount int
 
 	// tokenCount is how many Anthropic tokens the viewer holds (from ListSecrets,
@@ -661,14 +661,25 @@ func (m *tuiModel) startDetailMetaReq() tea.Cmd {
 	return m.refreshRunMetaCmd(m.detail.runID, m.detail.metaWaitID)
 }
 
-// fetchSecretsCmd reads the viewer's Anthropic tokens once so the board can gate the
-// credential column on holding more than one (PRD #295). A failure is swallowed — the
-// column just stays hidden, and never blocks the board.
+// fetchSecretsCmd counts the viewer's credentials per harness once. A failure is
+// swallowed so the board stays usable with its credential column hidden.
 func (m tuiModel) fetchSecretsCmd() tea.Cmd {
 	c, ctx := m.client, m.ctx
 	return func() tea.Msg {
 		secrets, err := c.ListSecrets(ctx)
-		return secretsMsg{count: len(secrets), err: err}
+		msg := secretsMsg{err: err}
+		if err != nil {
+			return msg
+		}
+		for _, secret := range secrets {
+			switch secret.Kind {
+			case "anthropic_token":
+				msg.count++
+			case "codex_auth", "openai_api_key":
+				msg.codexCount++
+			}
+		}
+		return msg
 	}
 }
 
@@ -1172,6 +1183,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case secretsMsg:
 		if msg.err == nil {
 			m.tokenCount = msg.count
+			m.codexCredentialCount = msg.codexCount
 		}
 		return m, nil
 
@@ -1192,10 +1204,6 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case codexRateLimitsMsg:
 		if msg.err == nil {
-			m.codexCredentialCount = 0
-			for _, account := range msg.accounts {
-				m.codexCredentialCount += len(account.Aliases)
-			}
 			m.codexRateLimits = msg.accounts
 		}
 		return m, nil
