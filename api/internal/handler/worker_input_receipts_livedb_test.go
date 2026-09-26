@@ -584,12 +584,35 @@ func TestWorkerReviseAppliedUnderSwitchLiveDB(t *testing.T) {
 	// the tuple lock to the first waiter. Whichever commits first, the outcome is serialized:
 	// released first refuses APPLIED and leaves the row unapplied; APPLIED first applies the
 	// row and the release then still succeeds.
-	lockWaiters := func(t *testing.T, want int) {
+	// lockWaiters counts only sessions actually blocked (directly or transitively) behind
+	// holderPid's row lock, not every lock-waiting session in the database: a concurrent test
+	// in another package sharing this instrumented database, or the pool's own housekeeping,
+	// would otherwise inflate the count and either race the deadline or pass too early.
+	// Postgres queues concurrent row-lock waiters FIFO: the SECOND waiter here reports
+	// pg_blocking_pids() = {first waiter's pid}, not holderPid, because it waits on the tuple's
+	// "next in line" lock rather than directly on the holder's transaction id (measured live:
+	// with a single FOR UPDATE holder and two concurrent contenders, the release path blocks
+	// on the holder's pid while the apply path blocks on the release path's pid). A bare
+	// `$1 = ANY(pg_blocking_pids(pid))` therefore undercounts; walk the blocking chain
+	// transitively from holderPid instead.
+	lockWaiters := func(t *testing.T, holderPid int32, want int) {
 		t.Helper()
 		deadline := time.Now().Add(10 * time.Second)
+		const q = `
+WITH RECURSIVE waiters AS (
+	SELECT pid, pg_blocking_pids(pid) AS blockers
+	FROM pg_stat_activity
+	WHERE datname = current_database() AND wait_event_type = 'Lock'
+),
+blocked AS (
+	SELECT pid FROM waiters WHERE $1 = ANY(blockers)
+	UNION
+	SELECT w.pid FROM waiters w JOIN blocked b ON b.pid = ANY(w.blockers)
+)
+SELECT count(DISTINCT pid) FROM blocked`
 		for {
 			var n int
-			if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock'`).Scan(&n); err != nil {
+			if err := pool.QueryRow(ctx, q, holderPid).Scan(&n); err != nil {
 				t.Fatal(err)
 			}
 			if n >= want {
@@ -612,6 +635,10 @@ func TestWorkerReviseAppliedUnderSwitchLiveDB(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer holder.Rollback(ctx) //nolint:errcheck // committed below
+			var holderPid int32
+			if err := holder.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&holderPid); err != nil {
+				t.Fatal(err)
+			}
 			if _, err := holder.Exec(ctx, `SELECT 1 FROM runs WHERE id=$1 FOR UPDATE`, run); err != nil {
 				t.Fatal(err)
 			}
@@ -637,14 +664,14 @@ func TestWorkerReviseAppliedUnderSwitchLiveDB(t *testing.T) {
 			}
 			if releaseFirst {
 				startRelease()
-				lockWaiters(t, 1)
+				lockWaiters(t, holderPid, 1)
 				startApply()
 			} else {
 				startApply()
-				lockWaiters(t, 1)
+				lockWaiters(t, holderPid, 1)
 				startRelease()
 			}
-			lockWaiters(t, 2)
+			lockWaiters(t, holderPid, 2)
 			if err := holder.Commit(ctx); err != nil {
 				t.Fatal(err)
 			}

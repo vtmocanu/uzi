@@ -177,6 +177,12 @@ func TestSetStatePlanRejectedSettlesRejectInputsLiveDB(t *testing.T) {
 		run := seedRun(t)
 		in := seedInputs(t, run)
 		before := snapshot(t, in)
+		// A sibling live run, unrelated to the one being failed here, with its own unapplied
+		// reject_plan input: the settled CTE must scope to the failed run alone, never every
+		// run with a pending reject.
+		sibling := seedRun(t)
+		siblingIn := seedInputs(t, sibling)
+		siblingBefore := snapshot(t, siblingIn)
 		_, applied, err := svc.SetState(ctx, wkr, run, failedReport(gen(1)))
 		if err != nil || !applied {
 			t.Fatalf("SetState = (applied=%v, %v), want (true, nil)", applied, err)
@@ -186,6 +192,8 @@ func TestSetStatePlanRejectedSettlesRejectInputsLiveDB(t *testing.T) {
 			t.Fatalf("fail_origin = %+v, want plan_rejected", r.FailOrigin)
 		}
 		requireSettled(t, "fenced report", in, before)
+		requireStatus(t, sibling, "running")
+		requireUntouched(t, "fenced report (sibling run)", siblingIn, siblingBefore)
 	})
 
 	t.Run("a duplicate terminal report changes nothing", func(t *testing.T) {
