@@ -12,9 +12,12 @@
 //  - a resumed, unapproved claim with a persisted plan reads the inputs sent before the release
 //    BEFORE offering any plan, and a replayed revise revises the submitted plan instead of
 //    re-presenting it (with no session, the revision prompt carries the prior plan);
-//  - stale and superseded verdicts are applied with a feed notice; on a resumed claim a replayed
-//    verdict created before the persisted plan was shown (claim.resume_plan_at) is stale, and a
-//    claim that does not re-present the persisted plan bumps the epoch at its first gate.
+//  - stale and superseded rejects and revises are applied with a feed notice; a stale or superseded
+//    approve is NEVER applied (the server reads any applied approve_plan as the human approval), so
+//    only an approve a gate took is applied; on a resumed claim a replayed verdict created before the
+//    persisted plan was shown (claim.resume_plan_at) is stale with its own notice, a claim without
+//    that field fails closed (every replayed approve/reject is stale), and a claim that does not
+//    re-present the persisted plan bumps the epoch at its first gate.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -60,6 +63,10 @@ const STALE_APPROVE_NOTICE = "Approval ignored — the plan changed; re-send if 
 const STALE_REJECT_NOTICE = "Rejection ignored — the plan changed; re-send if you still want it.";
 const SUPERSEDED_REJECT_NOTICE = "an earlier plan rejection was superseded by a newer verdict";
 const STALE_REVISE_NOTICE = "Feedback ignored — it was written against an older plan version; re-send it.";
+const REPLAY_STALE_VERDICT_NOTICE = "A plan verdict sent before this plan was shown was ignored — re-send it if you still want it.";
+const REPLAY_STALE_REVISE_NOTICE = "Plan feedback sent before this plan was shown was ignored — re-send it if you still want it.";
+const APPROVED_REVISE_NOTICE = "The plan is already approved — this revision request was ignored; cancel the run to stop it.";
+const APPROVED_REJECT_NOTICE = "The plan is already approved — this rejection was ignored; cancel the run to stop it.";
 
 const revisedPlan = (n: number): string => `# REVISED PLAN r${n}\n- the owner's feedback, applied`;
 const revisedMilestones = (n: number) => [{ id: `rm${n}`, title: `revised milestone ${n}` }];
@@ -220,11 +227,25 @@ class Scenario {
     return { ...this.base, claim_generation: this.generation, last_seq: lastSeq, ...overrides };
   }
 
-  /** The claim the server assembles for a resumed, unapproved run at the gate: the last persisted
-   *  plan (and its candidate milestones), the session kept unless `session` says otherwise. */
+  /** The claim the server assembles for a resumed run at the gate: the last persisted plan (and its
+   *  candidate milestones), the session kept unless `session` says otherwise. Like the server, any
+   *  applied approve_plan makes the claim plan_approved with resume_phase "implementing" (its
+   *  human_plan_approved), whichever plan that approve was sent against. */
   resumeClaim(session: "kept" | "lost" | "none", overrides: Partial<ClaimResponse> = {}): ClaimResponse {
     const gate = this.persistedGate();
     assert.ok(gate, "a plan was persisted before the interruption");
+    if (api.humanPlanApproved(this.runId)) {
+      if (session === "kept") this.writeTranscript();
+      return this.claim({
+        plan_md: gate.plan_md,
+        plan_source: "agent",
+        plan_approved: true,
+        milestones: gate.milestones ?? null,
+        resume_phase: "implementing",
+        session_id: session === "none" ? null : SID,
+        ...overrides,
+      });
+    }
     // resume_plan_at: when the persisted, unapproved plan was last shown (the server's claim field).
     const shownAt = api.resumePlanAt(this.runId);
     const common: Partial<ClaimResponse> = {
@@ -660,7 +681,7 @@ describe("#1604 — a reject interrupted before its failed report is replayed an
       assert.equal(api.isApplied(s.runId, row!.id), false, "the reject stays unapplied without its failed transition");
       const { flight } = await resumeAndApprove(s, s.resumeClaim("kept"));
       assert.ok(!s.statuses(flight).includes("failed"), `the stale reject did not fail the run: ${s.statuses(flight).join(",")}`);
-      assert.ok(s.texts(flight).includes(STALE_REJECT_NOTICE), s.texts(flight).join(" | "));
+      assert.ok(s.texts(flight).includes(REPLAY_STALE_VERDICT_NOTICE), s.texts(flight).join(" | "));
       assert.equal(s.gates(flight)[0]?.plan_md, PLAN_V1, "the submitted plan is re-presented");
       assert.ok(api.isApplied(s.runId, row!.id), "the stale reject is applied on its own");
       assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
@@ -1091,9 +1112,12 @@ describe("#1604 — delivery on resume: no plan is offered before the inputs sen
       api.delayInputGets(s.runId, 400);
       const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
       await tick(100);
-      s.send(s.input("approve_plan"));
+      const [approve] = s.send(s.input("approve_plan"));
       await approveFirstGate(s, flight);
-      assert.ok(s.texts(flight).includes(STALE_APPROVE_NOTICE), s.texts(flight).join(" | "));
+      // This claim carries no resume_plan_at, so it fails closed: an approve read before its first
+      // gate is stale, with the replay notice, and never applied.
+      assert.ok(s.texts(flight).includes(REPLAY_STALE_VERDICT_NOTICE), s.texts(flight).join(" | "));
+      assert.equal(api.isApplied(s.runId, approve!.id), false, "the stale approve is never applied");
       assertRevisedOnResume(s, flight, FEEDBACK, "kept");
       assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
     }));
@@ -1121,6 +1145,37 @@ describe("#1604 — replay across claims", () => {
     }));
 });
 
+/** Path B: the owner sends `kind` against plan A during the revision turn while a switch is pending
+ *  (the fenced GET never drains it); B is persisted and the claim released; the reclaim re-presents
+ *  B with the verdict replayed. */
+async function pathB(
+  s: Scenario,
+  kind: "approve_plan" | "reject_plan",
+  opts: { omitResumePlanAt?: boolean } = {},
+): Promise<{ flight: Flight; row: UserInput }> {
+  const first = await s.toFirstGate();
+  const block = s.model.block("revise");
+  s.send(s.input("revise_plan", FEEDBACK));
+  await block.entered;
+  api.requestCredentialSwitch(s.runId, 1);
+  await tick(30);
+  const [row] = s.send(s.input(kind, kind === "approve_plan" ? SELECTION : "wrong approach"));
+  await tick(60);
+  assert.equal(api.isAcked(s.runId, row!.id), false, "the pending switch left the verdict unread");
+  block.release();
+  await s.finish(first);
+  assert.ok(s.statuses(first).includes("credential_switch"), s.statuses(first).join(","));
+  assert.equal(s.persistedGate()?.plan_md, revisedPlan(1), "plan B is persisted");
+  // The server omits resume_plan_at when it cannot name the persisted plan's frame.
+  api.omitResumePlanAt = opts.omitResumePlanAt === true;
+  const claim = s.resumeClaim("kept");
+  assert.equal(claim.resume_plan_at === undefined, opts.omitResumePlanAt === true, "the claim carries resume_plan_at unless omitted");
+  const flight = s.start(claim);
+  assert.ok(await until(() => s.gates(flight).length >= 1 || flight.finished), s.statuses(flight).join(","));
+  await tick(200);
+  return { flight, row: row! };
+}
+
 describe("#1604 review — a replayed verdict never applies to a plan no human saw (finding 1)", () => {
   it("Path A: a replayed approve does not approve the fresh plan of a no-session re-plan", () =>
     scenario(async (s) => {
@@ -1133,34 +1188,12 @@ describe("#1604 review — a replayed verdict never applies to a plan no human s
       assert.equal(s.model.count("plan", flight.turnFrom), 1, "the no-session claim planned afresh");
       assert.equal(s.model.count("implement"), 0, "nothing is implemented before a verdict on the fresh plan");
       assert.ok(s.texts(flight).includes(STALE_APPROVE_NOTICE), s.texts(flight).join(" | "));
-      assert.ok(api.isApplied(s.runId, row.id), "the stale approve is applied");
+      assert.ok(api.isAcked(s.runId, row.id), "the replayed approve was read");
+      assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve is never applied");
       s.send(s.input("approve_plan"));
       await s.finish(flight);
       assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
     }));
-
-  /** Path B: the owner sends `kind` against plan A during the revision turn while a switch is pending
-   *  (the fenced GET never drains it); B is persisted and the claim released; the reclaim re-presents
-   *  B with the verdict replayed. */
-  async function pathB(s: Scenario, kind: "approve_plan" | "reject_plan"): Promise<{ flight: Flight; row: UserInput }> {
-    const first = await s.toFirstGate();
-    const block = s.model.block("revise");
-    s.send(s.input("revise_plan", FEEDBACK));
-    await block.entered;
-    api.requestCredentialSwitch(s.runId, 1);
-    await tick(30);
-    const [row] = s.send(s.input(kind, kind === "approve_plan" ? SELECTION : "wrong approach"));
-    await tick(60);
-    assert.equal(api.isAcked(s.runId, row!.id), false, "the pending switch left the verdict unread");
-    block.release();
-    await s.finish(first);
-    assert.ok(s.statuses(first).includes("credential_switch"), s.statuses(first).join(","));
-    assert.equal(s.persistedGate()?.plan_md, revisedPlan(1), "plan B is persisted");
-    const flight = s.start(s.resumeClaim("kept"));
-    assert.ok(await until(() => s.gates(flight).length >= 1 || flight.finished), s.statuses(flight).join(","));
-    await tick(200);
-    return { flight, row: row! };
-  }
 
   for (const kind of ["approve_plan", "reject_plan"] as const) {
     it(`Path B (${kind}): a verdict sent against plan A does not settle the re-presented plan B`, () =>
@@ -1170,9 +1203,14 @@ describe("#1604 review — a replayed verdict never applies to a plan no human s
         assert.equal(flight.finished, false, `B waits for its own verdict: ${s.statuses(flight).join(",")}`);
         assert.ok(!s.statuses(flight).includes("failed"), "the run is not failed");
         assert.equal(s.model.count("implement"), 0, "nothing implemented");
-        assert.ok(s.texts(flight).includes(kind === "approve_plan" ? STALE_APPROVE_NOTICE : STALE_REJECT_NOTICE), s.texts(flight).join(" | "));
+        assert.ok(s.texts(flight).includes(REPLAY_STALE_VERDICT_NOTICE), s.texts(flight).join(" | "));
+        assert.ok(!s.texts(flight).includes(STALE_APPROVE_NOTICE) && !s.texts(flight).includes(STALE_REJECT_NOTICE), "never the plan-changed notice");
         assert.ok(!s.texts(flight).some((t) => t.startsWith("the re-presented plan was")), "no status line claims B was settled");
-        assert.ok(await until(() => api.isApplied(s.runId, row.id), 3_000), "the stale verdict is applied");
+        if (kind === "reject_plan") assert.ok(await until(() => api.isApplied(s.runId, row.id), 3_000), "the stale reject is applied");
+        else {
+          assert.ok(api.isAcked(s.runId, row.id), "the replayed approve was read");
+          assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve is never applied");
+        }
         s.send(s.input("approve_plan"));
         await s.finish(flight);
         assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
@@ -1199,7 +1237,7 @@ describe("#1604 review — a replayed verdict never applies to a plan no human s
       const { flight } = await resumeAndApprove(s, s.resumeClaim("kept"));
       assert.equal(s.gates(flight)[0]?.plan_md, revisedPlan(1), "the persisted revised plan is re-presented");
       assert.equal(s.model.count("revise", flight.turnFrom), 0, "no second revision");
-      assert.ok(s.texts(flight).includes(STALE_REVISE_NOTICE), s.texts(flight).join(" | "));
+      assert.ok(s.texts(flight).includes(REPLAY_STALE_REVISE_NOTICE), s.texts(flight).join(" | "));
       assert.ok(api.isApplied(s.runId, row!.id), "the stale revise is applied");
       assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
     }));
@@ -1210,8 +1248,9 @@ describe("#1604 review — a replayed verdict never applies to a plan no human s
       api.failInputGets(s.runId, 5, 503);
       const flight = s.start(s.resumeClaim("kept"), { executor: () => new StubExecutor(nullLogger(), { planGate: true }) });
       assert.ok(await until(() => s.gates(flight).length >= 1 || flight.finished), s.statuses(flight).join(","));
-      assert.ok(await until(() => api.isApplied(s.runId, row.id), 3_000), "the approve was read and applied");
+      assert.ok(await until(() => api.isAcked(s.runId, row.id), 3_000), "the approve was read");
       await tick(200);
+      assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve is never applied");
       assert.equal(flight.finished, false, `the stub's plan waits at the gate: ${s.statuses(flight).join(",")}`);
       assert.ok(s.texts(flight).includes(STALE_APPROVE_NOTICE), s.texts(flight).join(" | "));
       assert.ok(!s.texts(flight).includes(STATUS_WAITING_DELIVERY), "no waiting line: the stub offers its plan regardless");
@@ -1244,7 +1283,7 @@ describe("#1604 review — the ready lane never mixes kinds under a pending swit
       assert.equal(s.model.revisions, 1);
       const { flight } = await resumeAndApprove(s, s.resumeClaim("kept"));
       assert.ok(!s.statuses(flight).includes("failed"), `the stale reject did not fail the run: ${s.statuses(flight).join(",")}`);
-      assert.ok(s.texts(flight).includes(STALE_REJECT_NOTICE), s.texts(flight).join(" | "));
+      assert.ok(s.texts(flight).includes(REPLAY_STALE_VERDICT_NOTICE), s.texts(flight).join(" | "));
       assert.ok(api.isApplied(s.runId, rej!.id), "the reject is re-disposed and applied");
       assert.equal(s.model.count("revise", flight.turnFrom), 0, "no double revision");
       assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
@@ -1273,8 +1312,10 @@ describe("#1604 review — resumed-gate edges", () => {
       assert.ok(await until(() => api.isApplied(s.runId, rev!.id) && api.isApplied(s.runId, rej!.id), 3_000), "both are applied while implementing");
       block.release();
       await s.finish(first);
-      assert.ok(s.texts(first).includes(STALE_REVISE_NOTICE), s.texts(first).join(" | "));
-      assert.ok(s.texts(first).includes(STALE_REJECT_NOTICE), s.texts(first).join(" | "));
+      // L2: never the re-send notices (re-sending would be ignored the same way).
+      assert.ok(s.texts(first).includes(APPROVED_REVISE_NOTICE), s.texts(first).join(" | "));
+      assert.ok(s.texts(first).includes(APPROVED_REJECT_NOTICE), s.texts(first).join(" | "));
+      assert.ok(!s.texts(first).includes(STALE_REVISE_NOTICE) && !s.texts(first).includes(STALE_REJECT_NOTICE), s.texts(first).join(" | "));
       assert.ok(s.statuses(first).includes("completed"), s.statuses(first).join(","));
       assert.equal(s.model.revisions, 0);
     }));
@@ -1313,4 +1354,75 @@ describe("#1604 review — resumed-gate edges", () => {
       const lines = s.texts(flight).filter((t) => t.startsWith("the re-presented plan"));
       assert.deepEqual(lines, ["the re-presented plan timed out waiting for approval — failing the run"]);
     }));
+});
+
+describe("#1604 round 3 — a disposed approve is never applied, so no later claim reads it as approval (B1)", () => {
+  it("Path B, then a second interruption at the re-presented gate: the reclaim is not approved and gates B again", () =>
+    scenario(async (s) => {
+      const { flight, row } = await pathB(s, "approve_plan");
+      assert.equal(s.gates(flight)[0]?.plan_md, revisedPlan(1), "plan B is re-presented");
+      await s.shutdown(flight); // the second interruption, at B's gate
+      const claim = s.resumeClaim("kept");
+      assert.equal(claim.plan_approved, false, "the reclaim is not plan_approved");
+      assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve stayed unapplied");
+      assert.equal(api.humanPlanApproved(s.runId), false, "the server holds no human approval");
+      assert.equal(claim.resume_phase, "awaiting_approval", "the reclaim resumes at the gate, not implementing");
+      const third = s.start(claim);
+      assert.ok(await until(() => s.gates(third).length >= 1 || third.finished), s.statuses(third).join(","));
+      await tick(200);
+      assert.equal(s.gates(third)[0]?.plan_md, revisedPlan(1), "B is gated again");
+      assert.equal(third.finished, false, `B waits for its own verdict: ${s.statuses(third).join(",")}`);
+      assert.equal(s.model.count("implement"), 0, "nothing implemented without a verdict on B");
+      assert.ok(s.texts(third).includes(REPLAY_STALE_VERDICT_NOTICE), "the stale approve is disposed of again");
+      const [fresh] = s.send(s.input("approve_plan"));
+      await s.finish(third);
+      assert.ok(s.statuses(third).includes("completed"), s.statuses(third).join(","));
+      assert.ok(api.isApplied(s.runId, fresh!.id), "the approve the gate took is applied");
+      assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve never is");
+      assert.equal(s.model.count("implement"), 1);
+    }));
+
+  it("Path A, then a second interruption at the fresh plan's gate: the reclaim is not approved and gates again", () =>
+    scenario(async (s) => {
+      const { row } = await releaseAtGate(s, () => s.send(s.input("approve_plan"))[0]!, "unacked");
+      const second = s.start(s.resumeClaim("none"));
+      assert.ok(await until(() => s.gates(second).length >= 1 || second.finished), s.statuses(second).join(","));
+      await tick(200);
+      assert.ok(s.texts(second).includes(STALE_APPROVE_NOTICE), s.texts(second).join(" | "));
+      await s.shutdown(second); // the second interruption, at the fresh plan's gate
+      const claim = s.resumeClaim("none");
+      assert.equal(claim.plan_approved, false, "the reclaim is not plan_approved");
+      assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve stayed unapplied");
+      assert.notEqual(claim.resume_phase, "implementing", "the reclaim is not implementing");
+      const third = s.start(claim);
+      assert.ok(await until(() => s.gates(third).length >= 1 || third.finished), s.statuses(third).join(","));
+      await tick(200);
+      assert.equal(third.finished, false, `the plan waits at the gate: ${s.statuses(third).join(",")}`);
+      assert.equal(s.model.count("implement"), 0, "nothing implemented without a verdict");
+      s.send(s.input("approve_plan"));
+      await s.finish(third);
+      assert.ok(s.statuses(third).includes("completed"), s.statuses(third).join(","));
+      assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve never is applied");
+    }));
+});
+
+describe("#1604 round 3 — a claim without resume_plan_at fails closed (B2)", () => {
+  for (const kind of ["approve_plan", "reject_plan"] as const) {
+    it(`Path B (${kind}) with resume_plan_at absent: the replayed verdict is stale; only a fresh approve after the re-present acts`, () =>
+      scenario(async (s) => {
+        const { flight, row } = await pathB(s, kind, { omitResumePlanAt: true });
+        assert.equal(s.gates(flight)[0]?.plan_md, revisedPlan(1), "plan B is re-presented");
+        assert.equal(flight.finished, false, `B waits for its own verdict: ${s.statuses(flight).join(",")}`);
+        assert.ok(!s.statuses(flight).includes("failed"), "the replayed reject did not fail the run");
+        assert.equal(s.model.count("implement"), 0, "nothing implemented without a fresh approve");
+        assert.ok(s.texts(flight).includes(REPLAY_STALE_VERDICT_NOTICE), s.texts(flight).join(" | "));
+        if (kind === "approve_plan") assert.equal(api.isApplied(s.runId, row.id), false, "the replayed approve is never applied");
+        const [fresh] = s.send(s.input("approve_plan"));
+        await s.finish(flight);
+        assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
+        assert.ok(api.isApplied(s.runId, fresh!.id), "the fresh approve sent after the re-present applies");
+        assert.equal(s.model.count("implement"), 1);
+        assert.equal(s.model.count("revise", flight.turnFrom), 0, "no second revision");
+      }));
+  }
 });

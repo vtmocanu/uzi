@@ -1224,13 +1224,16 @@ export interface ClaimResponse {
    *  approve_plan with the right plan revision (workersvc.ClaimPayload.ResumePlanSeq). 0/absent for
    *  every other phase. Additive + optional. */
   resume_plan_seq?: number;
-  /** Issue #1604: the created_at (RFC 3339) of the run's latest `plan` run_message whose plan_md
-   *  equals the claim's plan_md (a frame emitted for a plan that was never persisted does not
-   *  count; with no match the field is absent), carried whenever the claim carries an UNAPPROVED persisted plan (resume_phase
-   *  "awaiting_approval", or "" with plan_md). The worker's gate epoch restarts at 0 on every claim,
-   *  so it cannot tell a replayed approve/reject/revise written against an earlier plan from one
-   *  written against this one; a replayed gate verdict whose input created_at is strictly before
-   *  this instant is stale. Absent on an older server (the epoch rule alone then applies). */
+  /** Issue #1604: the created_at (RFC 3339, microsecond precision from Postgres) of the run's latest
+   *  `plan` run_message whose plan_md equals the claim's plan_md (a frame emitted for a plan that was
+   *  never persisted does not count; with no match the field is absent), carried whenever the claim
+   *  carries an UNAPPROVED persisted plan (resume_phase "awaiting_approval", or "" with plan_md). The
+   *  worker's gate epoch restarts at 0 on every claim, so it cannot tell a replayed
+   *  approve/reject/revise written against an earlier plan from one written against this one; a
+   *  replayed gate verdict whose input created_at is strictly before this instant is stale. Absent
+   *  or unparseable on such a claim (an older server, a query error, a tombstoned or redacted plan
+   *  frame), the worker fails closed: every replayed approve/reject read before its first gate is
+   *  stale (SteeringChannel.setReplayCutoff). */
   resume_plan_at?: string;
 }
 

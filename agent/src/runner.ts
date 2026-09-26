@@ -5042,11 +5042,15 @@ export class RunRunner {
       // One that never awaits it (Codex) gets no waiting line: it offers its plan regardless.
       if (executor.resumesAtGate === true) steering.guardInitialDelivery();
       // A replayed gate verdict created before the persisted plan was shown is stale on arrival.
-      steering.setReplayCutoff(claim.resume_plan_at);
+      // Fail closed when the claim cannot say when that was (the field absent or unparseable):
+      // every replayed approve/reject read before this claim's first gate is stale.
+      const replayJudged = steering.setReplayCutoff(claim.resume_plan_at);
       // When this claim will not RE-PRESENT the persisted plan (a "" re-plan, or an executor that
       // never re-presents), its first gate shows a plan no human has seen: it bumps the epoch like
-      // a revision gate, so a replayed approve/reject still buffered goes stale.
-      if (executor.resumesAtGate !== true || claim.resume_phase !== "awaiting_approval") this.gatedRuns.add(runId);
+      // a revision gate, so a replayed approve/reject still buffered goes stale. So does a claim
+      // whose replayed verdicts cannot be judged: nothing read before its first gate settles it.
+      if (!replayJudged || executor.resumesAtGate !== true || claim.resume_phase !== "awaiting_approval")
+        this.gatedRuns.add(runId);
     }
 
     // Last SDK session id the executor observed; carried on EVERY state report so
@@ -5074,7 +5078,18 @@ export class RunRunner {
         // uncertain. Keep the report behind that receipt so the server's resume guards see it;
         // the wait throws once the receipt is given up, so neither a resume nor a completion goes
         // out as if the input were applied. Only `failed` never waits: it must land to end the run.
-        if (body.status !== "failed") await steering.awaitReceiptSettlement(signal);
+        if (body.status !== "failed") {
+          // Issue #1604: a pending switch refused the APPLIED of the approve the gate took, so the
+          // server would not see the run approved. Every report but the switch's own takes the
+          // credential-switch path instead of going out.
+          if (
+            body.status !== "credential_switch" &&
+            body.status !== "credential_switch_failed" &&
+            steering.approveRefusedBySwitchPending()
+          )
+            throw new CredentialSwitchSignal();
+          await steering.awaitReceiptSettlement(signal);
+        }
         // PRD #1390 M2a: this same choke point is where the run announces every phase
         // transition, so reflect the four snapshot phases (running / awaiting_approval /
         // awaiting_input / awaiting_followup) into the active-run registry BEFORE the report
@@ -9756,8 +9771,8 @@ export class RunRunner {
       if (v.kind !== "revise") {
         this.gateDeadlines.delete(runId);
         this.gatedRuns.delete(runId);
-        // Issue #1604: no later revise or reject can act; each is final on arrival.
-        steering.closeGate();
+        // Issue #1604: no later verdict can act; each is final on arrival.
+        steering.closeGate(v.kind);
       }
       return v; // NOTE: no bump here — the awaiting_approval re-report bumps.
     };

@@ -4,8 +4,10 @@
 // ACK, routing and applied receipt settle, then reads again. It routes by kind:
 //
 //   approve_plan / reject_plan  → resolves the plan-gate verdict the executor awaits
-//                                 (issue #1604: a reject is applied only with the run's
-//                                 plan_rejected `failed` transition, server-side)
+//                                 (issue #1604: an approve is applied only once a gate takes
+//                                 it, never when disposed of as stale or superseded; a reject
+//                                 is applied only with the run's plan_rejected `failed`
+//                                 transition, server-side)
 //   revise_plan                 → (PRD #41) enqueues the user's feedback for a plan
 //                                 revision round and wakes the gate; the executor runs
 //                                 a fresh plan turn and gates again (issue #1604: the
@@ -83,6 +85,21 @@ const STALE_REJECT_NOTICE =
   "Rejection ignored — the plan changed; re-send if you still want it.";
 const STALE_REVISE_NOTICE =
   "Feedback ignored — it was written against an older plan version; re-send it.";
+/** Issue #1604: a replayed gate verdict created before the plan this claim offers was shown (the
+ *  claim's resume_plan_at, or, when the claim cannot say, this claim's first gate). The plan may
+ *  not have changed at all (it can be re-presented unchanged), so the epoch notices would be false. */
+const REPLAY_STALE_VERDICT_NOTICE =
+  "A plan verdict sent before this plan was shown was ignored — re-send it if you still want it.";
+const REPLAY_STALE_REVISE_NOTICE =
+  "Plan feedback sent before this plan was shown was ignored — re-send it if you still want it.";
+/** Issue #1604: a revise or reject that arrives once an approve was taken can never act; re-sending
+ *  it would be ignored the same way, so the notice names the one input that still stops the run. */
+const APPROVED_REVISE_NOTICE =
+  "The plan is already approved — this revision request was ignored; cancel the run to stop it.";
+const APPROVED_REJECT_NOTICE =
+  "The plan is already approved — this rejection was ignored; cancel the run to stop it.";
+/** Issue #1604: a gate verdict that arrives after the gate closed on a reject, a timeout or a cancel. */
+const GATE_CLOSED_NOTICE = "The plan gate has already closed — this plan verdict was ignored.";
 /** PRD #88: an answer naming a question that is no longer the open one. The common
  *  cause is benign — a Slack reply to question N arriving after the lead asked N+1. */
 const STALE_ANSWER_NOTICE =
@@ -161,6 +178,11 @@ export class CredentialSwitchSignal extends Error {
     this.name = "CredentialSwitchSignal";
   }
 }
+
+/** Issue #1604: why a gate verdict is disposed of: written against an earlier gate epoch of this
+ *  claim; created before the plan this resumed claim offers was shown; arrived after the gate
+ *  closed; or replaced in the buffer by a newer verdict at the same epoch. */
+type StaleWhy = "epoch" | "replay" | "closed" | "superseded";
 
 /** Issue #1604: a notice for a buffered reject replaced by a newer verdict at the same gate epoch. */
 const SUPERSEDED_REJECT_NOTICE = "an earlier plan rejection was superseded by a newer verdict";
@@ -341,17 +363,33 @@ export class SteeringChannel {
   private requestStage: "get" | "ack" | "applied" = "get";
 
   // --- Issue #1604: plan-gate input receipts --------------------------------------------------
-  // A revise_plan or reject_plan input id is in exactly one of three states, tracked apart from
-  // the generic `held` batch (whose applied request never carries them):
-  //  (i)   awaitingGateIds: awaiting its result. A revise queued or taken whose revised plan is not
-  //        yet confirmed persisted; every actionable reject, buffered or taken (a taken reject is
-  //        settled by the server with the plan_rejected `failed` transition, never by the worker).
-  //        Does NOT hold any state report: the report persisting the revised plan waits on nothing.
-  //  (ii)  ready: final, due an APPLIED of its own (settleRevision after persistence, a stale or
-  //        superseded verdict, an empty revise). Holds every state report until it lands.
+  // A receipted approve_plan, reject_plan or revise_plan input id is tracked apart from the generic
+  // `held` batch (whose applied request never carries it), in exactly one of these states:
+  //  (i)   awaitingGateIds: awaiting its result. A buffered approve not yet taken by a gate; a revise
+  //        queued or taken whose revised plan is not yet confirmed persisted; every actionable
+  //        reject, buffered or taken (a taken reject is settled by the server with the
+  //        plan_rejected `failed` transition, never by the worker). Holds no state report.
+  //  (ii)  ready: final, due an APPLIED of its own (an approve a gate TOOK, settleRevision after
+  //        persistence, a stale or superseded reject or revise, an empty revise). Holds every state
+  //        report until it lands.
   //  (iii) readyInFlight: that APPLIED request is out.
-  // An interruption while an id is in (i) leaves it unapplied, so the next claim replays it.
+  //  (iv)  disposedApproves: an approve disposed of without being taken (stale, superseded, or
+  //        after the gate closed). NEVER applied: the server reads ANY applied approve_plan as the
+  //        human approval of the persisted plan (GetRunClaimContext's human_plan_approved), so an
+  //        applied stale approve would let a later claim implement a plan no human approved. It
+  //        stays unapplied server-side and a later claim disposes of it again by the same rules.
+  //  (v)   parkedReady: final ids whose APPLIED a pending credential switch refused; back to (ii)
+  //        when the switch gives up (rearmCredentialSwitch), else left for the next claim.
+  // An interruption while an id is in (i), (iv) or (v) leaves it unapplied, so the next claim
+  // replays it.
   private readonly awaitingGateIds = new Set<number>();
+  private readonly disposedApproves = new Set<number>();
+  private readonly parkedReady: number[] = [];
+  /** The approve ids a gate took as its verdict: the report that follows (running) needs them
+   *  applied, so a pending switch refusing their APPLIED releases the claim instead. */
+  private readonly takenApproveIds = new Set<number>();
+  /** Set while a taken approve's APPLIED is parked under a pending switch (see takenApproveIds). */
+  private approveRefusedBySwitch = false;
   private ready: { ids: number[]; readyAt: number } | undefined;
   private readyInFlight = false;
   /** The ready lane's own loop: one APPLIED in flight at a time, on its own cadence, so a slow
@@ -359,14 +397,19 @@ export class SteeringChannel {
   private readyLane: Promise<void> | undefined;
   private readyFailures = 0;
   private readyStopAttempts = 0;
-  /** The revise_plan ids among the gate receipts. The server accepts an APPLIED under a pending
-   *  switch only for a batch of the claim's own revises, so the ready lane never mixes kinds. */
+  /** The kind of every receipted input this claim routed as revise_plan (queued, empty, or disposed
+   *  on arrival alike). The server accepts an APPLIED under a pending switch only for a batch whose
+   *  rows are all revise_plan (by kind), so the ready lane never mixes a revise with another kind. */
   private readonly reviseIds = new Set<number>();
   /** Set on a resumed claim with an unapproved persisted plan (claim.resume_plan_at): a gate verdict
    *  created strictly before it was written against an earlier plan, so it is stale on arrival. */
   private replayCutoff: bigint | undefined;
-  /** Set once the gate resolved terminally (closeGate): no later revise or reject can act. */
-  private gateClosed = false;
+  /** Set on a resumed claim with an unapproved persisted plan whose resume_plan_at is absent or
+   *  unparseable: no replayed approve or reject can be judged, so each is stale on arrival until
+   *  this claim shows its first gate (bumpEpoch clears it). Fail closed. */
+  private replayUnjudged = false;
+  /** The terminal verdict kind that closed the gate (closeGate): no later verdict can act. */
+  private closedBy: PlanVerdict["kind"] | undefined;
 
   // --- Issue #1604: the first read of a resumed claim's inputs ---------------------------------
   /** Set once a GET succeeded and its batch (if any) was ACKed on the active claim and routed. */
@@ -561,7 +604,8 @@ export class SteeringChannel {
   /** An id this channel tracks as a plan-gate input receipt (awaiting, ready or in flight). Such an
    *  id is never ACKed again, re-routed, or applied with a held batch. */
   private isGateReceiptId(id: number): boolean {
-    return this.awaitingGateIds.has(id) || (this.ready?.ids.includes(id) ?? false);
+    return this.awaitingGateIds.has(id) || (this.ready?.ids.includes(id) ?? false) ||
+      this.disposedApproves.has(id) || this.parkedReady.includes(id);
   }
 
   /** Move ids to the ready lane (state ii) and make sure the lane is running. */
@@ -588,56 +632,94 @@ export class SteeringChannel {
    * Issue #1604: a resumed claim with an unapproved persisted plan carries when that plan was last
    * shown (claim.resume_plan_at). The gate epoch restarts at 0 on every claim, so a replayed
    * approve, reject or revise written against an EARLIER plan would otherwise match this claim's
-   * gate. Every gate verdict created strictly before `at` is stale: it is disposed of with its
-   * kind's notice and never acts (a reject or revise is applied on its own). An unparseable value
-   * leaves the epoch rule alone in force. Call before start().
+   * gate. Every gate verdict created strictly before `at` is stale: it is disposed of with the replay
+   * notice and never acts (a reject or revise is applied on its own; an approve never is).
+   *
+   * Fail closed: the server omits the field when it cannot name the frame (a query error, a plan
+   * frame tombstoned above the batcher cap, a redaction mismatch), and an unparseable value is no
+   * better. Then no replayed approve or reject can be judged, so every one this claim reads before
+   * its first gate is stale; a replayed revise is still taken (at worst a repeated revision). Returns
+   * whether the cutoff is known: the runner bumps this claim's first gate when it is not, so an
+   * approve or reject read before that gate cannot settle it either. Call before start().
    */
-  setReplayCutoff(at: string | undefined): void {
-    if (at === undefined) return;
-    const cutoff = rfc3339Nanos(at);
+  setReplayCutoff(at: string | undefined): boolean {
+    const cutoff = at === undefined ? undefined : rfc3339Nanos(at);
     if (cutoff === undefined) {
-      this.log.warn("steering: ignoring an unparseable resume_plan_at", { run_id: this.runId, resume_plan_at: at });
-      return;
+      this.log.warn("steering: the claim does not say when its plan was shown; replayed plan verdicts are stale", {
+        run_id: this.runId,
+        resume_plan_at: at ?? null,
+      });
+      this.replayUnjudged = true;
+      return false;
     }
     this.replayCutoff = cutoff;
+    return true;
   }
 
   /**
-   * Issue #1604: the gate resolved terminally (an approve, a reject, the approval timeout or a
-   * cancel). A revise still queued or a reject still buffered can no longer act, and one routed
-   * later never will: each is final at once, disposed of with its kind's stale notice and applied
-   * on its own, so none waits forever for a result that cannot come.
+   * Issue #1604: the gate resolved terminally with `kind` (an approve, a reject, the approval
+   * timeout or a cancel). A revise still queued or a verdict still buffered can no longer act, and
+   * one routed later never will: each is final at once, disposed of with the closed-gate notice (a
+   * reject or revise applied on its own, an approve never), so none waits forever for a result that
+   * cannot come.
    */
-  closeGate(): void {
-    if (this.gateClosed) return;
-    this.gateClosed = true;
-    for (const r of this.reviseQueue.splice(0)) this.disposeStale("revise_plan", r.id);
+  closeGate(kind: PlanVerdict["kind"]): void {
+    if (this.closedBy !== undefined) return;
+    this.closedBy = kind;
+    for (const r of this.reviseQueue.splice(0)) this.disposeStale("revise_plan", r.id, "closed");
     const buffered = this.bufferedVerdict;
-    if (buffered?.verdict.kind === "reject") {
+    if (buffered) {
       this.bufferedVerdict = undefined;
-      this.disposeStale("reject_plan", buffered.id);
+      this.disposeStale(buffered.verdict.kind === "reject" ? "reject_plan" : "approve_plan", buffered.id, "closed");
     }
   }
 
-  /** A gate verdict that can no longer act: its kind's notice, and a receipted reject or revise is
-   *  final (applied on its own). An approve is applied with its batch. */
-  private disposeStale(kind: "approve_plan" | "reject_plan" | "revise_plan", id: number | undefined): void {
-    this.notify?.(kind === "approve_plan" ? STALE_APPROVE_NOTICE : kind === "reject_plan" ? STALE_REJECT_NOTICE : STALE_REVISE_NOTICE);
-    if (kind !== "approve_plan" && id !== undefined) this.markReady([id]);
+  /** The notice for a gate verdict disposed of for `why`, or undefined for none. */
+  private staleNotice(kind: "approve_plan" | "reject_plan" | "revise_plan", why: StaleWhy): string | undefined {
+    switch (why) {
+      case "epoch":
+        return kind === "approve_plan" ? STALE_APPROVE_NOTICE : kind === "reject_plan" ? STALE_REJECT_NOTICE : STALE_REVISE_NOTICE;
+      case "replay":
+        return kind === "revise_plan" ? REPLAY_STALE_REVISE_NOTICE : REPLAY_STALE_VERDICT_NOTICE;
+      case "closed":
+        if (this.closedBy !== "approve") return GATE_CLOSED_NOTICE;
+        // A second approve after the approve that closed the gate changes nothing worth a line.
+        return kind === "revise_plan" ? APPROVED_REVISE_NOTICE : kind === "reject_plan" ? APPROVED_REJECT_NOTICE : undefined;
+      case "superseded":
+        return kind === "reject_plan" ? SUPERSEDED_REJECT_NOTICE : undefined;
+    }
   }
 
-  /** True when a routed gate verdict is final on arrival (it was disposed of): created before the
-   *  resumed claim's plan was shown, or a revise/reject after the gate closed. */
+  /** A gate verdict that can no longer act: its notice, then a receipted reject or revise is final
+   *  (applied on its own) and a receipted approve is disposed of, never applied (state iv). */
+  private disposeStale(kind: "approve_plan" | "reject_plan" | "revise_plan", id: number | undefined, why: StaleWhy): void {
+    const notice = this.staleNotice(kind, why);
+    if (notice) this.notify?.(notice);
+    if (id === undefined) return;
+    if (kind === "approve_plan") {
+      this.awaitingGateIds.delete(id);
+      this.disposedApproves.add(id);
+    } else this.markReady([id]);
+  }
+
+  /** True when a routed gate verdict is final on arrival (it was disposed of): any verdict after the
+   *  gate closed; one created before the resumed claim's plan was shown; or, when the claim cannot
+   *  say when that was, an approve or reject read before this claim's first gate. */
   private disposedOnArrival(
     kind: "approve_plan" | "reject_plan" | "revise_plan",
     id: number,
     receipted: boolean,
     createdAt: string | undefined,
   ): boolean {
-    const at = this.replayCutoff === undefined ? undefined : rfc3339Nanos(createdAt);
-    const stale = at !== undefined && at < this.replayCutoff!;
-    if (!stale && !(this.gateClosed && kind !== "approve_plan")) return false;
-    this.disposeStale(kind, receipted ? id : undefined);
+    let why: StaleWhy | undefined;
+    if (this.closedBy !== undefined) why = "closed";
+    else if (this.replayUnjudged && kind !== "revise_plan") why = "replay";
+    else if (this.replayCutoff !== undefined) {
+      const at = rfc3339Nanos(createdAt);
+      if (at !== undefined && at < this.replayCutoff) why = "replay";
+    }
+    if (why === undefined) return false;
+    this.disposeStale(kind, receipted ? id : undefined, why);
     return true;
   }
 
@@ -707,32 +789,37 @@ export class SteeringChannel {
       return "stop";
     }
     if (reason === "switch_pending" && !reviseBatch) {
-      // Only a revise batch is accepted under a pending switch. A stale or superseded verdict is
-      // final but not urgent: leave it unapplied for the next claim (which disposes of it again)
-      // and let the reports waiting on it go, so the switch's own release report is not held or
-      // failed by it. The switch itself trips from its signal on the GET.
-      this.log.warn("steering: a switch is pending; leaving final plan-gate inputs to the next claim", {
+      // Only a revise batch is accepted under a pending switch. Park these ids (state v): a switch
+      // that gives up (rearmCredentialSwitch) moves them back to the ready lane, a release leaves
+      // them unapplied for the next claim (which disposes of or replays them again). A stale or
+      // superseded verdict is final but not urgent: the reports waiting on it go, so the switch's
+      // own release report is not held or failed by it. A TAKEN approve is urgent: the report after
+      // it needs it applied, so that report takes the credential-switch path, as on the held path.
+      this.log.warn("steering: a switch is pending; parking final plan-gate inputs until it resolves", {
         run_id: this.runId,
         count,
       });
-      if (this.ready) {
-        this.ready.ids = this.ready.ids.filter((id) => !ids.includes(id));
-        if (this.ready.ids.length === 0) this.ready = undefined;
-      }
-      this.settleWaiters();
+      this.parkReady(ids);
+      if (ids.some((id) => this.takenApproveIds.has(id))) {
+        this.approveRefusedBySwitch = true;
+        for (const w of this.receiptWaiters.splice(0)) w.reject(new CredentialSwitchSignal());
+        this.maybeTripCredentialSwitch(this.claimGeneration);
+      } else this.settleWaiters();
       return "continue";
     }
     if (reason === "switch_pending") {
-      // As on the held path: the reports waiting reject with the switch signal, the ids are left
-      // for the next claim to replay, and the switch trips.
-      this.ready = undefined;
+      // As on the held path: the reports waiting reject with the switch signal, the ids are parked
+      // (for the next claim to replay, or the ready lane again if the switch gives up), and the
+      // switch trips.
+      if (this.ready) this.parkReady([...this.ready.ids]);
+      if (this.parkedReady.some((id) => this.takenApproveIds.has(id))) this.approveRefusedBySwitch = true;
       for (const w of this.receiptWaiters.splice(0)) w.reject(new CredentialSwitchSignal());
       this.maybeTripCredentialSwitch(this.claimGeneration);
       return "stop";
     }
     if (reason !== undefined || definitiveReceiptError(err)) {
       this.failReceipts(new InputReceiptError(
-        `the applied receipt for ${count} plan-gate input(s) was refused: ${errMessage(err)}`,
+        `the applied receipt for ${count} operator input(s) (plan-gate) was refused: ${errMessage(err)}`,
       ));
       return "stop";
     }
@@ -740,11 +827,27 @@ export class SteeringChannel {
     const attempts = ++this.readyFailures;
     if (attempts >= ACTIVE_APPLY_ATTEMPTS || this.now() - (this.ready?.readyAt ?? this.now()) >= this.receiptDeadlineMs) {
       this.failReceipts(new InputReceiptError(
-        `could not confirm ${count} applied plan-gate input(s) after ${attempts} attempts: ${errMessage(err)}`,
+        `could not confirm ${count} applied operator input(s) (plan-gate) after ${attempts} attempts: ${errMessage(err)}`,
       ));
       return "stop";
     }
     return "retry";
+  }
+
+  /** Move ready ids to the parked set (state v). */
+  private parkReady(ids: number[]): void {
+    if (this.ready) {
+      this.ready.ids = this.ready.ids.filter((id) => !ids.includes(id));
+      if (this.ready.ids.length === 0) this.ready = undefined;
+    }
+    for (const id of ids) if (!this.parkedReady.includes(id)) this.parkedReady.push(id);
+  }
+
+  /** Issue #1604: a taken approve's APPLIED was refused by a pending switch and not yet re-armed. The
+   *  runner refuses every report but the switch's own (and `failed`) with the switch signal while
+   *  this holds: the server would not see the run approved. */
+  approveRefusedBySwitchPending(): boolean {
+    return this.approveRefusedBySwitch;
   }
 
   /** A routed batch moves to its applied receipt without the plan-gate inputs this channel tracks
@@ -1109,6 +1212,10 @@ export class SteeringChannel {
    *  retain-and-stop (where the server stamp may still be pending). */
   rearmCredentialSwitch(): void {
     this.pendingSwitchGeneration = undefined;
+    // Issue #1604: the claim stays active and the switch is cleared, so the plan-gate inputs a
+    // pending switch refused are due their APPLIED again.
+    this.approveRefusedBySwitch = false;
+    if (this.parkedReady.length > 0) this.markReady(this.parkedReady.splice(0));
   }
 
   /** PRD #1247 M5b (MINOR-7): the PUBLIC entry the runner's reportState closure calls to feed the
@@ -1171,7 +1278,8 @@ export class SteeringChannel {
    * The FIRST round is not bumped (epoch 0), so a verdict already sitting in the consume-
    * on-read /inputs queue when the gate opens still applies to the initial plan. Issue #1604:
    * except on a resumed claim that does not re-present its persisted plan (a "" re-plan, a
-   * resumed revise, an executor that never re-presents): the runner marks the run gated up front,
+   * resumed revise, an executor that never re-presents) or whose replayed verdicts cannot be judged
+   * (no usable resume_plan_at): the runner marks the run gated up front,
    * so that first gate bumps too and a replayed verdict aimed at the persisted plan goes stale. The
    * executor drives the revision loop through ctx.gatePlan:
    *
@@ -1182,6 +1290,9 @@ export class SteeringChannel {
    *   }
    */
   bumpEpoch(): number {
+    // Issue #1604: this claim's first gate is shown, so a verdict read from now on was sent against
+    // a plan this claim offered (see setReplayCutoff's fail-closed mode).
+    this.replayUnjudged = false;
     return ++this.gateEpoch;
   }
 
@@ -1460,14 +1571,19 @@ export class SteeringChannel {
     if (this.bufferedVerdict) {
       const { verdict, epoch: e, id } = this.bufferedVerdict;
       this.bufferedVerdict = undefined;
-      // A taken reject stays awaiting its result: the server settles it with the failed transition.
-      if (e === epoch) return verdict;
-      // Verdict-specific notice so the feed reads correctly for either kind.
-      this.notify?.(
-        verdict.kind === "reject" ? STALE_REJECT_NOTICE : STALE_APPROVE_NOTICE,
-      );
-      // Issue #1604: a stale reject is final; it is applied on its own.
-      if (verdict.kind === "reject" && id !== undefined) this.markReady([id]);
+      if (e === epoch) {
+        // A taken reject stays awaiting its result: the server settles it with the failed
+        // transition. A taken approve is final: it is applied on its own, and the report after it
+        // waits for that (issue #1604: the only approve ever applied is one a gate took).
+        if (verdict.kind === "approve" && id !== undefined) {
+          this.takenApproveIds.add(id);
+          this.markReady([id]);
+        }
+        return verdict;
+      }
+      // Verdict-specific notice so the feed reads correctly for either kind. Issue #1604: a stale
+      // reject is final and applied on its own; a stale approve is never applied.
+      this.disposeStale(verdict.kind === "reject" ? "reject_plan" : "approve_plan", id, "epoch");
     }
     return undefined;
   }
@@ -1478,20 +1594,24 @@ export class SteeringChannel {
   private takeRevise(epoch: number): PlanVerdict | undefined {
     while (this.reviseQueue.length && this.reviseQueue[0]!.epoch !== epoch) {
       const stale = this.reviseQueue.shift()!;
-      this.notify?.(STALE_REVISE_NOTICE);
-      if (stale.id !== undefined) this.markReady([stale.id]);
+      this.disposeStale("revise_plan", stale.id, "epoch");
     }
     const r = this.reviseQueue.shift();
     if (!r) return undefined;
     return r.id === undefined ? { kind: "revise", feedback: r.feedback } : { kind: "revise", feedback: r.feedback, inputId: r.id };
   }
 
-  /** Issue #1604: a buffered reject replaced by a newer verdict is final; applied with a notice. */
-  private supersedeBufferedReject(): void {
+  /** Issue #1604: a buffered verdict replaced by a newer one is final: a reject is applied with a
+   *  notice, an approve is disposed of silently (the newer verdict speaks) and never applied. */
+  private supersedeBuffered(): void {
     const buffered = this.bufferedVerdict;
-    if (buffered?.verdict.kind !== "reject" || buffered.id === undefined) return;
-    this.notify?.(buffered.epoch === this.gateEpoch ? SUPERSEDED_REJECT_NOTICE : STALE_REJECT_NOTICE);
-    this.markReady([buffered.id]);
+    if (!buffered) return;
+    this.bufferedVerdict = undefined;
+    this.disposeStale(
+      buffered.verdict.kind === "reject" ? "reject_plan" : "approve_plan",
+      buffered.id,
+      buffered.epoch === this.gateEpoch ? "superseded" : "epoch",
+    );
   }
 
   /** After routing an input, deliver to a parked gate waiter if one is now due. */
@@ -1568,8 +1688,10 @@ export class SteeringChannel {
   /** Route one input. `receipted` is false for an older api pod's consume-on-read reply, whose
    *  rows are already applied server-side: no plan-gate receipt is tracked for them. */
   private route(kind: string, body: string | null | undefined, id: number, receipted: boolean, createdAt: string | undefined): void {
-    // Issue #1604: a gate verdict written against an earlier plan than the resumed claim's, or a
-    // revise/reject after the gate closed, is disposed of on arrival and never acts.
+    // Issue #1604: every receipted revise_plan by kind, whatever becomes of it (see reviseIds).
+    if (receipted && kind === "revise_plan") this.reviseIds.add(id);
+    // Issue #1604: a gate verdict written against an earlier plan than the resumed claim's, or any
+    // verdict after the gate closed, is disposed of on arrival and never acts.
     if (
       (kind === "approve_plan" || kind === "reject_plan" || (kind === "revise_plan" && !!body?.trim())) &&
       this.disposedOnArrival(kind, id, receipted, createdAt)
@@ -1580,16 +1702,19 @@ export class SteeringChannel {
         // The body carries the JSON-encoded agent selection (PRD #37). Parse it
         // here; the executor resolves it against the detected roster. A malformed
         // body parses to `invalid`, which the executor sends to `own`, never repo.
-        this.supersedeBufferedReject();
+        // Issue #1604: it awaits a gate (state i) and is applied only if a gate takes it.
+        this.supersedeBuffered();
         this.bufferedVerdict = {
           verdict: { kind: "approve", selection: parseAgentSelection(body) },
           epoch: this.gateEpoch,
+          ...(receipted ? { id } : {}),
         };
+        if (receipted) this.awaitingGateIds.add(id);
         break;
       case "reject_plan":
         // Issue #1604: an actionable reject awaits its result (the plan_rejected `failed`
         // transition, which settles it server-side); it is never applied with its batch.
-        this.supersedeBufferedReject();
+        this.supersedeBuffered();
         this.bufferedVerdict = {
           verdict: { kind: "reject", reason: body?.trim() || "plan rejected" },
           epoch: this.gateEpoch,
@@ -1611,10 +1736,7 @@ export class SteeringChannel {
             epoch: this.gateEpoch,
             ...(receipted ? { id } : {}),
           });
-          if (receipted) {
-            this.awaitingGateIds.add(id);
-            this.reviseIds.add(id);
-          }
+          if (receipted) this.awaitingGateIds.add(id);
         } else {
           this.log.warn("steering: ignoring an empty revise_plan", { run_id: this.runId });
           if (receipted) this.markReady([id]);

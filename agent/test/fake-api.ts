@@ -82,7 +82,12 @@ export class FakeApi {
    *  wire-shape tests that deep-compare rows keep their exact fixtures; the #1604 interruption
    *  suite turns it on (resume_plan_at is compared against it). */
   stampInputCreatedAt = false;
-  /** Issue #1604: the last issued timestamp, in nanoseconds; every stamp is strictly later. */
+  /** Issue #1604: omit the claim's resume_plan_at, as the server does when it cannot name the
+   *  persisted plan's frame (a query error, a frame tombstoned above the batcher cap, a redaction
+   *  mismatch between the frame and plan_md). */
+  omitResumePlanAt = false;
+  /** Issue #1604: the last issued timestamp, in nanoseconds (always a whole microsecond); every
+   *  stamp is strictly later. */
   private lastStampNs = 0n;
   /** Issue #1604: the last recorded /state status per run, the fake's view of the run row. */
   private readonly lastRecordedStatus = new Map<string, string>();
@@ -443,20 +448,21 @@ export class FakeApi {
     this.inputsByRun.set(runId, inputs);
   }
 
-  /** Issue #1604: a server timestamp (RFC 3339, nanoseconds, UTC), strictly increasing across the
-   *  fake, like Postgres' created_at on rows written in order. */
+  /** Issue #1604: a server timestamp (RFC 3339, microsecond precision like Postgres' timestamptz,
+   *  UTC), strictly increasing across the fake, like created_at on rows written in order. */
   private stamp(): string {
     let ns = BigInt(Date.now()) * 1_000_000n;
     if (ns <= this.lastStampNs) ns = this.lastStampNs + 1_000n;
     this.lastStampNs = ns;
     const iso = new Date(Number(ns / 1_000_000n)).toISOString();
-    return `${iso.slice(0, 19)}.${(ns % 1_000_000_000n).toString().padStart(9, "0")}Z`;
+    return `${iso.slice(0, 19)}.${((ns % 1_000_000_000n) / 1_000n).toString().padStart(6, "0")}Z`;
   }
 
   /** Issue #1604: the claim's resume_plan_at for this run: the created_at of the latest `plan`
    *  run_message that carries the persisted plan (the last applied awaiting_approval report's
-   *  plan_md), else of the latest `plan` message; undefined with none. */
+   *  plan_md); undefined with none, or while omitResumePlanAt is set. */
   resumePlanAt(runId: string): string | undefined {
+    if (this.omitResumePlanAt) return undefined;
     const frames = this.planFramesByRun.get(runId) ?? [];
     const persisted = this.states.filter((s) => s.runId === runId && s.body.status === "awaiting_approval").at(-1)?.body.plan_md;
     const matching = persisted === undefined ? [] : frames.filter((f) => f.plan_md === persisted);
@@ -548,6 +554,14 @@ export class FakeApi {
 
   isApplied(runId: string, id: number): boolean {
     return this.appliedByRun.get(runId)?.has(id) ?? false;
+  }
+
+  /** Issue #1604: GetRunClaimContext's human_plan_approved: ANY applied approve_plan row of the run,
+   *  whichever plan it was sent against. The claim's plan_approved is true when it is (the service
+   *  ORs it with auto_approve), and resumePhaseFor then answers "implementing". */
+  humanPlanApproved(runId: string): boolean {
+    const applied = this.appliedByRun.get(runId);
+    return (this.inputsByRun.get(runId) ?? []).some((row) => row.kind === "approve_plan" && (applied?.has(row.id) ?? false));
   }
 
   /** Issue #1604: answer the next `times` `kind` receipts with `status`, then normally. */

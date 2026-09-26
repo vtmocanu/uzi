@@ -460,6 +460,9 @@ describe("RunRunner — resume phase after a credential switch (PRD #1247 M5b D1
     const claim = gitlabClaim(1270, {
       resume_phase: "awaiting_approval",
       plan_md: resumedPlan,
+      // Issue #1604: the persisted plan's frame instant; without it the worker fails closed and a
+      // replayed approve is stale.
+      resume_plan_at: "2026-01-01T00:00:00.000000Z",
     });
     api.setInputs(claim.run_id, [input("approve_plan")]);
     await runner(

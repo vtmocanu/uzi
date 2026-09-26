@@ -1804,7 +1804,8 @@ describe("input receipts", () => {
   });
 
   it("gives up a routed receipt after a bounded number of applied attempts at stop", async () => {
-    const row: UserInput = { id: 7, kind: "approve_plan", body: null };
+    // A follow_up: since issue #1604 an approve_plan is applied only once a gate takes it.
+    const row: UserInput = { id: 7, kind: "follow_up", body: "seven" };
     let attempts = 0;
     const client = {
       getInputs: async () => ({ receipts: true, inputs: [row] }),
@@ -1847,5 +1848,154 @@ describe("input receipts", () => {
       release();
       await ch.stop();
     }
+  });
+});
+
+describe("SteeringChannel — plan-gate receipts, round 3 (issue #1604)", () => {
+  const settled = async (ready: () => boolean, ms = 1_000): Promise<boolean> => {
+    const end = Date.now() + ms;
+    while (!ready()) {
+      if (Date.now() > end) return false;
+      await tick(2);
+    }
+    return true;
+  };
+  const switchPending = (): RequestError =>
+    new RequestError("POST", "/inputs/applied", 409, JSON.stringify({ error: "conflict", reason: "switch_pending" }));
+
+  /** A receipt client over `rows`: the first GET returns them, later GETs return whatever is still
+   *  unapplied (like the server), every ACK is active, and APPLIED answers through `apply`. */
+  function receiptClient(rows: UserInput[], apply: (ids: number[]) => Promise<void> | void) {
+    const applied = new Set<number>();
+    const appliedCalls: number[][] = [];
+    const acked: number[][] = [];
+    const pick = (ids: number[]) => rows.filter((r) => ids.includes(r.id));
+    const client = {
+      getInputs: async () => ({ receipts: true, inputs: rows.filter((r) => !applied.has(r.id)) }),
+      ackInputs: async (_run: string, ids: number[]) => { acked.push([...ids]); return { inputs: pick(ids), active: true }; },
+      applyInputs: async (_run: string, ids: number[]) => {
+        appliedCalls.push([...ids]);
+        await apply(ids);
+        for (const id of ids) applied.add(id);
+        return { inputs: pick(ids), active: true };
+      },
+    } as unknown as WorkerClient;
+    return { client, applied, appliedCalls, acked };
+  }
+
+  it("B1: an approve disposed of as stale is never applied, and a later GET neither re-ACKs nor re-notices it", async () => {
+    const approve: UserInput = { id: 5, kind: "approve_plan", body: null };
+    const { client, applied, appliedCalls, acked } = receiptClient([approve], () => undefined);
+    const notices: string[] = [];
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
+    ch.start();
+    assert.ok(await settled(() => acked.length === 1), "the approve was read");
+    await tick(20);
+    const epoch = ch.bumpEpoch(); // a re-gate: the approve was sent against the previous plan version
+    const verdict = ch.awaitGateEvent(epoch);
+    let resolved = false;
+    void verdict.then(() => { resolved = true; }, () => { resolved = true; });
+    await tick(40);
+    assert.equal(resolved, false, "the stale approve does not settle the new gate");
+    assert.equal(notices.filter((n) => n.startsWith("Approval ignored")).length, 1, notices.join(" | "));
+    assert.equal(acked.length, 1, "later GETs return the unapplied row but it is not ACKed again");
+    await ch.stop();
+    assert.equal(applied.has(5), false, "never applied, not even at stop");
+    assert.ok(!appliedCalls.some((ids) => ids.includes(5)), "no APPLIED ever carried it");
+  });
+
+  it("B1: only an approve a gate TOOK is applied, and the report after it waits for that", async () => {
+    const approve: UserInput = { id: 5, kind: "approve_plan", body: null };
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const { client, applied } = receiptClient([approve], () => gate);
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      assert.equal((await ch.awaitGateEvent(0)).kind, "approve");
+      let reported = false;
+      const report = ch.awaitReceiptSettlement().then(() => { reported = true; });
+      await tick(20);
+      assert.equal(reported, false, "the running report waits for the taken approve's APPLIED");
+      release();
+      await report;
+      assert.ok(applied.has(5));
+    } finally {
+      release();
+    }
+  });
+
+  it("B2: without a judgeable resume_plan_at every replayed approve/reject before the first gate is stale; a fresh one after it acts", async () => {
+    const replayed: UserInput[] = [
+      { id: 5, kind: "approve_plan", body: null },
+      { id: 6, kind: "reject_plan", body: "no" },
+    ];
+    const rows = [...replayed];
+    const { client, applied, acked } = receiptClient(rows, () => undefined);
+    const notices: string[] = [];
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
+    assert.equal(ch.setReplayCutoff("not-a-timestamp"), false, "an unparseable value is not a cutoff");
+    ch.start();
+    assert.ok(await settled(() => acked.length >= 1));
+    assert.ok(await settled(() => applied.has(6)), "the stale reject is final and applied on its own");
+    assert.equal(ch.takeResumedGateEvent(), undefined, "nothing replayed settles the resumed gate");
+    assert.equal(notices.filter((n) => n.startsWith("A plan verdict sent before this plan was shown")).length, 2, notices.join(" | "));
+    const epoch = ch.bumpEpoch(); // the runner bumps this claim's first gate
+    rows.push({ id: 7, kind: "approve_plan", body: null });
+    const v = await ch.awaitGateEvent(epoch);
+    assert.equal(v.kind, "approve", "an approve read after the first gate is shown settles it");
+    assert.ok(await settled(() => applied.has(7)), "the taken approve is applied");
+    await ch.stop();
+    assert.equal(applied.has(5), false, "the replayed approve is never applied");
+  });
+
+  it("B2: an absent resume_plan_at still lets a replayed revise act (at-least-once)", async () => {
+    const { client } = receiptClient([{ id: 5, kind: "revise_plan", body: "split it" }], () => undefined);
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    assert.equal(ch.setReplayCutoff(undefined), false);
+    ch.start();
+    await ch.awaitInitialDelivery();
+    assert.deepEqual(ch.takeResumedGateEvent(), { kind: "revise", feedback: "split it", inputId: 5 });
+  });
+
+  it("N3: a non-revise ready batch refused by a pending switch is parked and applied once the switch gives up", async () => {
+    let refuse = true;
+    const { client, applied, appliedCalls, acked } = receiptClient([{ id: 5, kind: "reject_plan", body: "late" }], () => {
+      if (refuse) throw switchPending();
+    });
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { claimGeneration: 3 });
+    ch.closeGate("approve"); // the reject arrives after the approve: final at once
+    ch.start();
+    assert.ok(await settled(() => appliedCalls.length >= 1), "the ready lane tried the reject");
+    await ch.awaitReceiptSettlement(); // parked, not holding reports (the switch's release goes out)
+    await tick(30);
+    assert.equal(appliedCalls.length, 1, "parked: no retry while the switch is pending");
+    refuse = false;
+    ch.rearmCredentialSwitch(); // the switch gave up and the claim stays active
+    assert.ok(await settled(() => applied.has(5)), "the parked reject is applied after the give-up");
+    assert.deepEqual(appliedCalls.at(-1), [5], "by the ready lane, on its own");
+    assert.equal(acked.length, 1, "parked rows are neither re-read nor re-ACKed while the switch is pending or after");
+  });
+
+  it("N3: every revise_plan id (empty, or disposed of on arrival) rides a revise-only APPLIED batch", async () => {
+    let first = true;
+    const rows: UserInput[] = [
+      { id: 5, kind: "reject_plan", body: "late" },
+      { id: 6, kind: "revise_plan", body: "  " },
+      { id: 7, kind: "revise_plan", body: "too late" },
+    ];
+    const { client, applied, appliedCalls } = receiptClient(rows, () => {
+      if (first) {
+        first = false;
+        throw new Error("api down"); // the lane retries after the poll interval, with all three ready
+      }
+    });
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    ch.closeGate("approve");
+    ch.start();
+    assert.ok(await settled(() => [5, 6, 7].every((id) => applied.has(id))), JSON.stringify(appliedCalls));
+    const revises = new Set([6, 7]);
+    for (const ids of appliedCalls)
+      assert.ok(ids.every((id) => revises.has(id)) || ids.every((id) => !revises.has(id)), `a mixed batch: ${JSON.stringify(appliedCalls)}`);
   });
 });
