@@ -15,13 +15,18 @@ import (
 const listCredentialDisabledRuns = `-- name: ListCredentialDisabledRuns :many
 SELECT id, user_id, status_since FROM runs
 WHERE user_id = $1 AND status = 'paused' AND hold_reason = 'credential_disabled'
+  AND ($2::timestamptz IS NULL
+       OR (status_since, id) > ($2::timestamptz,
+                                $3::uuid))
 ORDER BY status_since ASC, id ASC
-LIMIT $2::int
+LIMIT $4::int
 `
 
 type ListCredentialDisabledRunsParams struct {
-	UserID   uuid.UUID `json:"user_id"`
-	PageSize int32     `json:"page_size"`
+	UserID           uuid.UUID          `json:"user_id"`
+	AfterStatusSince pgtype.Timestamptz `json:"after_status_since"`
+	AfterID          pgtype.UUID        `json:"after_id"`
+	PageSize         int32              `json:"page_size"`
 }
 
 type ListCredentialDisabledRunsRow struct {
@@ -33,7 +38,12 @@ type ListCredentialDisabledRunsRow struct {
 // The M1 partial index narrows this owner-scoped page to held runs. The caller
 // re-evaluates the current credential requirement before promoting each row.
 func (q *Queries) ListCredentialDisabledRuns(ctx context.Context, arg ListCredentialDisabledRunsParams) ([]ListCredentialDisabledRunsRow, error) {
-	rows, err := q.db.Query(ctx, listCredentialDisabledRuns, arg.UserID, arg.PageSize)
+	rows, err := q.db.Query(ctx, listCredentialDisabledRuns,
+		arg.UserID,
+		arg.AfterStatusSince,
+		arg.AfterID,
+		arg.PageSize,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -57,6 +67,7 @@ UPDATE runs SET
     status = 'paused',
     status_since = now(),
     hold_reason = 'credential_disabled',
+    claim_released_at = now(),
     codex_cap_hash = NULL,
     codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
@@ -91,6 +102,7 @@ UPDATE runs SET
     budget_paused_seconds = budget_paused_seconds
         + GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int),
     hold_reason = NULL,
+    worker_id = CASE WHEN claim_released_at IS NOT NULL THEN NULL ELSE worker_id END,
     codex_cap_hash = NULL,
     codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
