@@ -2317,9 +2317,10 @@ export class SdkExecutor implements Executor {
         });
         // PRD #1416 M2: drain the worker-authoritative safety steer BEFORE building the implement
         // prompt, so an M2-armed steer reaches the next turn and an M5-armed steer reaches
-        // iteration 1. Every iteration (including the first), and AHEAD of the end-of-iteration
-        // follow-up drain at ~2672 — it survives the paths that `continue` before that drain, and
-        // is rendered as worker guidance OUTSIDE the <follow_up> fence (see buildImplementPrompt).
+        // iteration 1. Every iteration (including the first), and AHEAD of the follow-up drains
+        // (end of iteration and cooperative checkpoint) — it survives the park paths that `continue`
+        // before those drains, and is rendered as worker guidance OUTSIDE the <follow_up> fence (see
+        // buildImplementPrompt).
         const safetySteer = ctx.pullSafetySteer?.();
         // PRD #1064 M1 (Decisions 1/2): a per-turn progress observer. It owns the diff base
         // (seeded from the loop-scope latestProgress, the previous turn's final snapshot, so
@@ -2616,6 +2617,10 @@ export class SdkExecutor implements Executor {
             latestProgress = undefined;
           }
           resetStallState(); // a cooperative checkpoint is progress → breaks any refusal streak
+          // Issue #1152: drain the follow-up queue at the checkpoint boundary too (FIFO, one per
+          // turn, like the end-of-iteration drain below). Assigning also clears the follow-up this
+          // turn already carried, so it is not replayed into the next prompt.
+          followUp = ctx.pullFollowUp?.();
           continue;
         }
         if (turn.done) {
@@ -2937,7 +2942,8 @@ export class SdkExecutor implements Executor {
         followUp = ctx.pullFollowUp?.();
 
         // PRD #390 M3 (D2/D4): enforcement evaluation. Only normal work turns reach here — the
-        // checkpoint and park paths `continue` above, and done/max-iter exit above. On a
+        // checkpoint and park paths `continue` above (the checkpoint path drains its own follow-up
+        // first, #1152), and done/max-iter exit above. On a
         // milestone-bearing run (≥1 frozen milestone) where the tracker shows NO milestone in
         // progress, escalate the next turn's prompt and count the miss; after K consecutive misses
         // emit a feed-only status so a silently-non-reporting lead is observable. A lead that
