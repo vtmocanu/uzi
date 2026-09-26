@@ -1224,6 +1224,14 @@ export interface ClaimResponse {
    *  approve_plan with the right plan revision (workersvc.ClaimPayload.ResumePlanSeq). 0/absent for
    *  every other phase. Additive + optional. */
   resume_plan_seq?: number;
+  /** Issue #1604: the created_at (RFC 3339) of the run's latest `plan` run_message whose plan_md
+   *  equals the claim's plan_md (a frame emitted for a plan that was never persisted does not
+   *  count; with no match the field is absent), carried whenever the claim carries an UNAPPROVED persisted plan (resume_phase
+   *  "awaiting_approval", or "" with plan_md). The worker's gate epoch restarts at 0 on every claim,
+   *  so it cannot tell a replayed approve/reject/revise written against an earlier plan from one
+   *  written against this one; a replayed gate verdict whose input created_at is strictly before
+   *  this instant is stale. Absent on an older server (the epoch rule alone then applies). */
+  resume_plan_at?: string;
 }
 
 /** One deterministic missing-executable hit (PRD #46 Decision 4). */

@@ -70,6 +70,20 @@ export class FakeApi {
   readonly inputGets = new Map<string, number>();
   /** Issue #1604: /state reports this run drops (connection destroyed, nothing recorded). */
   private readonly droppedStates = new Map<string, (body: StateRequest) => boolean>();
+  /** Issue #1604: the created_at of each recorded `plan` run_message, with its plan_md, per run. */
+  private readonly planFramesByRun = new Map<string, Array<{ at: string; plan_md: unknown }>>();
+  /** Issue #1604: runs.stop_kind as CreateStopVerdictInput stamps it (last write wins): a
+   *  reject_plan input stamps 'plan_rejected', a cancel 'cancelled'. */
+  private readonly stopKindByRun = new Map<string, string>();
+  /** Issue #1604: a credential_switch signal for another claim generation that rides every GET
+   *  WITHOUT fencing it (the rows still drain): a superseded claim's switch. */
+  private readonly foreignSwitchSignal = new Map<string, number>();
+  /** Issue #1604: stamp created_at on input rows as the real server does. Off by default so the
+   *  wire-shape tests that deep-compare rows keep their exact fixtures; the #1604 interruption
+   *  suite turns it on (resume_plan_at is compared against it). */
+  stampInputCreatedAt = false;
+  /** Issue #1604: the last issued timestamp, in nanoseconds; every stamp is strictly later. */
+  private lastStampNs = 0n;
   /** Issue #1604: the last recorded /state status per run, the fake's view of the run row. */
   private readonly lastRecordedStatus = new Map<string, string>();
   /** Issue #1604: mirror SetRunRecoveryWait's guard: a recovery_wait report applies only while the
@@ -419,10 +433,43 @@ export class FakeApi {
     inputs = inputs.map((row) => {
       const fresh = seen.has(row.id) ? { ...row, id: this.nextSyntheticInputId++ } : row;
       seen.add(fresh.id);
-      return fresh;
+      // Issue #1604: the server stamps created_at on insert, and CreateStopVerdictInput stamps
+      // runs.stop_kind for a reject_plan or cancel in the same statement.
+      if (fresh.kind === "reject_plan") this.stopKindByRun.set(runId, "plan_rejected");
+      if (fresh.kind === "cancel") this.stopKindByRun.set(runId, "cancelled");
+      return this.stampInputCreatedAt && fresh.created_at === undefined ? { ...fresh, created_at: this.stamp() } : fresh;
     });
     this.seenInputIds.set(runId, seen);
     this.inputsByRun.set(runId, inputs);
+  }
+
+  /** Issue #1604: a server timestamp (RFC 3339, nanoseconds, UTC), strictly increasing across the
+   *  fake, like Postgres' created_at on rows written in order. */
+  private stamp(): string {
+    let ns = BigInt(Date.now()) * 1_000_000n;
+    if (ns <= this.lastStampNs) ns = this.lastStampNs + 1_000n;
+    this.lastStampNs = ns;
+    const iso = new Date(Number(ns / 1_000_000n)).toISOString();
+    return `${iso.slice(0, 19)}.${(ns % 1_000_000_000n).toString().padStart(9, "0")}Z`;
+  }
+
+  /** Issue #1604: the claim's resume_plan_at for this run: the created_at of the latest `plan`
+   *  run_message that carries the persisted plan (the last applied awaiting_approval report's
+   *  plan_md), else of the latest `plan` message; undefined with none. */
+  resumePlanAt(runId: string): string | undefined {
+    const frames = this.planFramesByRun.get(runId) ?? [];
+    const persisted = this.states.filter((s) => s.runId === runId && s.body.status === "awaiting_approval").at(-1)?.body.plan_md;
+    const matching = persisted === undefined ? [] : frames.filter((f) => f.plan_md === persisted);
+    // Like the server (LatestPersistedPlanFrameAtForRun): only a frame matching the persisted
+    // plan counts; with none the field is omitted, never the latest frame.
+    return matching.at(-1)?.at;
+  }
+
+  /** Issue #1604: a credential_switch signal for `generation` rides every GET without fencing it
+   *  (undefined withdraws it). */
+  signalForeignCredentialSwitch(runId: string, generation: number | undefined): void {
+    if (generation === undefined) this.foreignSwitchSignal.delete(runId);
+    else this.foreignSwitchSignal.set(runId, generation);
   }
 
   setInputClaimGeneration(runId: string, generation: number): void {
@@ -912,7 +959,7 @@ export class FakeApi {
           this.appliedByRun.set(runId, applied);
           return send(res, 200, { inputs: pending });
         }
-        const signal = switchPending ? this.switchSignalGeneration.get(runId) : undefined;
+        const signal = switchPending ? this.switchSignalGeneration.get(runId) : this.foreignSwitchSignal.get(runId);
         return send(res, 200, {
           inputs: pending,
           receipts: true,
@@ -1040,6 +1087,11 @@ export class FakeApi {
       if (seen.has(m.seq)) continue; // server is idempotent on (run_id, seq)
       seen.add(m.seq);
       list.push(m);
+      if (m.kind === "plan") {
+        const frames = this.planFramesByRun.get(runId) ?? [];
+        frames.push({ at: this.stamp(), plan_md: (m.payload as { plan_md?: unknown } | undefined)?.plan_md });
+        this.planFramesByRun.set(runId, frames);
+      }
     }
     this.messagesByRun.set(runId, list);
     this.seenSeqByRun.set(runId, seen);
@@ -1149,9 +1201,11 @@ export class FakeApi {
       if (gen !== undefined) this.receiptGeneration.set(runId, gen + 1);
       this.receiptFenceReason.set(runId, "released");
     }
-    // Issue #1604 (D1b): the plan_rejected `failed` transition settles the run's unapplied
-    // reject_plan rows atomically with the transition (only when the transition applies).
-    if (body.status === "failed" && body.fail_origin === "plan_rejected") {
+    // Issue #1604 (D1b): like SetRunFailedPlanRejected, a `failed` transition on a run whose
+    // stop_kind is 'plan_rejected' (stamped when a reject_plan input was enqueued) settles the
+    // run's unapplied reject_plan rows with the transition. The worker's fail_origin plays no part:
+    // the server ignores it there. Reached only when the report is recorded (it applies).
+    if (body.status === "failed" && this.stopKindByRun.get(runId) === "plan_rejected") {
       const applied = this.appliedByRun.get(runId) ?? new Set<number>();
       for (const row of this.inputsByRun.get(runId) ?? []) if (row.kind === "reject_plan") applied.add(row.id);
       this.appliedByRun.set(runId, applied);

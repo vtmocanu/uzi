@@ -83,7 +83,7 @@ import {
   SIGNAL_SERVER_NAME,
 } from "./signals.js";
 import { classifyLimitEvidence, LimitReachedError } from "./limit.js";
-import { PauseNowSignal, CredentialSwitchSignal, type PlanVerdict } from "./steering.js";
+import { PauseNowSignal, CredentialSwitchSignal, PLAN_APPROVAL_TIMEOUT_REASON, type PlanVerdict } from "./steering.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { buildForgeToolsServer, FORGE_SERVER_NAME } from "./forge-tools.js";
 import { buildFindingsToolsServer, FINDINGS_SERVER_NAME } from "./findings-tools.js";
@@ -625,6 +625,9 @@ interface DriveState {
 }
 
 export class SdkExecutor implements Executor {
+  /** Issue #1604: see Executor.resumesAtGate — the plan gate reads a resumed claim's pending
+   *  inputs (takeResumedGateEvent) and re-presents an awaiting_approval claim's plan. */
+  readonly resumesAtGate = true;
   private readonly queryFn: SdkQueryFn;
   private readonly spawn: (opts: SpawnOptions) => { pid?: number };
   private readonly kill: (pid: number | undefined) => boolean;
@@ -1672,7 +1675,9 @@ export class SdkExecutor implements Executor {
         // a revise revises the SUBMITTED plan instead of re-presenting it. An approve stays
         // buffered for the re-presented gate below. The wait never falls back to the gate.
         let pending: PlanVerdict | undefined;
-        if (ctx.approvedPlan?.trim() && ctx.takeResumedGateEvent) {
+        // Only for an UNAPPROVED plan (the runner guards the same condition): a plan approved by the
+        // server but re-planned here (its session is gone) has no pending gate verdict to read.
+        if (ctx.planApproved !== true && ctx.approvedPlan?.trim() && ctx.takeResumedGateEvent) {
           const step = await this.runThroughSwitch(ctx, state, () => ctx.takeResumedGateEvent!(ctx.signal));
           if ("released" in step) return { branch: ctx.branch, switchReleased: true };
           pending = step.value;
@@ -1795,7 +1800,9 @@ export class SdkExecutor implements Executor {
               payload: {
                 text: verdict.kind === "approve"
                   ? "the re-presented plan was approved — implementing it"
-                  : "the re-presented plan was rejected — failing the run",
+                  : verdict.reason === PLAN_APPROVAL_TIMEOUT_REASON
+                    ? "the re-presented plan timed out waiting for approval — failing the run"
+                    : "the re-presented plan was rejected — failing the run",
               },
             });
         }
