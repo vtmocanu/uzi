@@ -7,7 +7,10 @@ UPDATE runs SET
     hold_reason = 'credential_disabled',
     claim_released_at = now(),
     released_worker_id = runs.worker_id,
-    released_worker_nonce = (SELECT w.snapshot_register_nonce FROM workers w WHERE w.id = runs.worker_id),
+    credential_disable_released_worker_id = runs.worker_id,
+    released_worker_nonce = CASE WHEN runs.claimed_worker_nonce IS NOT NULL
+        THEN NULLIF(runs.claimed_worker_nonce, '')
+        ELSE (SELECT w.snapshot_register_nonce FROM workers w WHERE w.id = runs.worker_id) END,
     codex_cap_hash = NULL,
     codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
@@ -45,6 +48,7 @@ UPDATE runs SET
     updated_at = now()
 WHERE id = @id AND user_id = @user_id
   AND status = 'paused' AND hold_reason = 'credential_disabled'
+  AND pause_requested_at IS NULL
   AND (started_at IS NULL OR
        (COALESCE(budget_wall_seconds, @global_timeout_seconds::int)
           + budget_extension_seconds + budget_finalize_seconds)
@@ -70,6 +74,7 @@ UPDATE runs SET
     updated_at = now()
 WHERE id = @id AND user_id = @user_id
   AND status = 'paused' AND hold_reason = 'credential_disabled'
+  AND pause_requested_at IS NULL
   AND (started_at IS NULL OR
        (COALESCE(budget_wall_seconds, @global_timeout_seconds::int)
           + budget_extension_seconds + budget_finalize_seconds)

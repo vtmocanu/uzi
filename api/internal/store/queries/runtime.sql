@@ -1117,6 +1117,13 @@ WITH target AS (
            OR r.released_worker_id <> @worker_id
            OR r.released_worker_nonce IS DISTINCT FROM
                 (SELECT ow.snapshot_register_nonce FROM workers ow WHERE ow.id = @worker_id))
+      -- After a credential-disable release, the same worker ID can only reclaim
+      -- with generation-stamped reports. A legacy report cannot distinguish its
+      -- old incarnation from a re-registered one sharing that ID.
+      AND (r.credential_disable_released_worker_id IS DISTINCT FROM @worker_id
+           OR ('credential_switch_v1' = ANY(@worker_protocol_caps::text[])
+               AND EXISTS (SELECT 1 FROM workers cw WHERE cw.id = @worker_id
+                           AND 'credential_switch_v1' = ANY(cw.protocol_capabilities))))
     -- Three-level sort (PRD #320 D3): (1) resume affinity — a re-queued run
     -- prefers its prior worker, exactly as before; (2) priority rank —
     -- fn_run_priority slots BETWEEN affinity and FIFO, so an interactive run
@@ -1157,6 +1164,7 @@ UPDATE runs SET
     status_since = now(),
     worker_id  = @worker_id,
     claimed_at = now(),
+    claimed_worker_nonce = COALESCE((SELECT ow.snapshot_register_nonce FROM workers ow WHERE ow.id = @worker_id), ''),
     updated_at = now(),
     -- PRD #1296 M1 (D2): the general claim-lane counter, incremented once per successful
     -- claim. Returned in the claim payload; the hold above binds the identical value.

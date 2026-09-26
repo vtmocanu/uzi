@@ -137,15 +137,20 @@ func TestSetRunCredentialDisabledHoldReassignmentLiveDB(t *testing.T) {
 	for i, tc := range []struct {
 		name        string
 		budget      int
+		ownerPause  bool
 		wantSuccess bool
 	}{
-		{"available budget", 3600, true},
-		{"exhausted budget", 10, false},
+		{"available budget", 3600, false, true},
+		{"exhausted budget", 10, false, false},
+		{"pending owner pause", 3600, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			runID := seedRunInStatus(t, env, o, int64(4450+i), "paused", time.Now().UTC())
 			env.exec(`UPDATE runs SET hold_reason='credential_disabled', budget_wall_seconds=$2,
 			    claim_released_at=now() WHERE id=$1`, runID, tc.budget)
+			if tc.ownerPause {
+				env.exec(`UPDATE runs SET pause_requested_at=now(), pause_mode='now' WHERE id=$1`, runID)
+			}
 			res, err := svc.SetRunCredential(env.ctx, o.userID, runID, CredentialOverrideModePinned, &o.altTok)
 			if tc.wantSuccess {
 				if err != nil || res.Run.Status != "queued" ||
@@ -153,6 +158,10 @@ func TestSetRunCredentialDisabledHoldReassignmentLiveDB(t *testing.T) {
 					!res.Run.CredentialOverrideSecretID.Valid ||
 					uuid.UUID(res.Run.CredentialOverrideSecretID.Bytes) != o.altTok {
 					t.Fatalf("reassignment: run=%+v err=%v", res.Run, err)
+				}
+				var resumes int
+				if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind='resume'`, runID).Scan(&resumes); err != nil || resumes != 1 {
+					t.Fatalf("resume audit: count=%d err=%v", resumes, err)
 				}
 				return
 			}
