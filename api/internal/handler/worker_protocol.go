@@ -286,8 +286,15 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	// never sends one, so this is nil in practice (the path is #1391's). An unparseable body
 	// yields nil (dropped, logged) — never a register failure.
 	var regSnapshot *workersvc.ActiveSnapshot
-	if !h.cfg.ActiveSnapshotDisabled {
+	if h.cfg.ActiveSnapshotDisabled {
+		if req.ActiveSnapshot != nil {
+			slog.Warn("worker register active snapshot dropped: feature disabled", "worker_id", wkr.ID.String())
+		}
+	} else {
 		regSnapshot = parseActiveSnapshot(req.ActiveSnapshot, wkr.ID)
+		if req.ActiveSnapshot != nil && string(req.ActiveSnapshot) != "null" && regSnapshot == nil {
+			slog.Warn("worker register active snapshot dropped: parse rejected", "worker_id", wkr.ID.String())
+		}
 	}
 	updated, registerNonce, err := h.wsvc.Register(r.Context(), wkr, version, reported, advertisedCap, req.Capabilities, req.ProtocolCapabilities, regSnapshot)
 	if err != nil {

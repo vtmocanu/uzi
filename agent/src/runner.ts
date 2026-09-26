@@ -7681,12 +7681,26 @@ export class RunRunner {
       // issue #1597 M1: a deadline/permit abort is an expected bounded stop, not a publish fault —
       // runLog only, never the feed (the shutdown sink names it as `timeout` itself).
       if (signal?.aborted || isAbortLikeError(e)) {
-        flight.runLog.info("checkpoint publish aborted", { run_id: flight.runId, error: errMessage(e) });
+        flight.runLog.info("checkpoint publish aborted", {
+          run_id: flight.runId,
+          phase: packedTip === undefined ? "packing" : "publish_request",
+          tip_produced: packedTip !== undefined,
+          error: errMessage(e),
+        });
         return { published: false, reason: "aborted" };
       }
+      // Keep the exception detail in the operator run log; the producer log records only
+      // bounded context so a credential-bearing error cannot escape through this channel.
+      this.log.warn("checkpoint publish exception", {
+        run_id: flight.runId,
+        phase: packedTip === undefined ? "packing" : "publish_request",
+        tip_produced: packedTip !== undefined,
+      });
       // issue #1597 M1: the feed line carries the CLASS only — a thrown message can embed remote
       // text or a credentialed URL; the runLog keeps it for operators.
       this.reportPublishOutcome(flight, "error", "checkpoint publish failed: error", {
+        phase: packedTip === undefined ? "packing" : "publish_request",
+        tip_produced: packedTip !== undefined,
         error: errMessage(e),
       });
       return { published: false, reason: "error" };

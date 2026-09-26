@@ -430,15 +430,56 @@ export class Outbox {
       }
     }
 
-    if (!(await this.loadOrMintKey(hasRecords))) return; // disabled + logged inside
+    // Physical inventory is independent of authentication. Dirents classify entries without
+    // following symlinks; only aggregate counts leave this method.
+    let physicalJournals = 0;
+    let symlinkJournals = 0;
+    let otherJournalEntries = 0;
+    let unreadableRunDirectories = 0;
+    for (const runId of runDirs) {
+      try {
+        for (const entry of await fs.readdir(this.runDir(runId), { withFileTypes: true })) {
+          if (parseTerminalFileName(entry.name) === undefined) continue;
+          if (entry.isSymbolicLink()) symlinkJournals++;
+          else if (entry.isFile()) physicalJournals++;
+          else otherJournalEntries++;
+        }
+      } catch {
+        unreadableRunDirectories++;
+      }
+    }
+    this.log.info("outbox terminal journal inventory", {
+      physical_files: physicalJournals,
+      symlink_entries: symlinkJournals,
+      other_entries: otherJournalEntries,
+      run_directories: runDirs.length,
+      unreadable_run_directories: unreadableRunDirectories,
+    });
+
+    if (!(await this.loadOrMintKey(hasRecords))) {
+      this.log.warn("outbox terminal journal load", { outcome: "key_unavailable", authenticated_pending: 0 });
+      return;
+    }
 
     // Load every run's manifest (authenticated) and stat its files for accounting,
     // then adopt any pending terminal journals (Run B / M3) — a run can carry a
     // terminal journal with no message manifest, so this loads them independently.
+    let authenticated = 0;
+    let rejected = 0;
     for (const runId of runDirs) {
       await this.loadRun(runId);
-      await this.loadTerminals(runId);
+      const result = await this.loadTerminals(runId);
+      authenticated += result.authenticated;
+      rejected += result.rejected;
     }
+
+    this.log.info("outbox terminal journal load", {
+      outcome: "complete",
+      authenticated_pending: this.listPendingTerminals().length,
+      authenticated_files: authenticated,
+      rejected_files: rejected,
+      physical_files: physicalJournals,
+    });
 
     // A best-effort preallocated reserve so a range record — and, with a terminal-sized
     // reserve, the next few terminal journals — can still be written on a full volume
@@ -513,28 +554,35 @@ export class Outbox {
    *  filename generation (the file names the generation, so a copied journal cannot masquerade
    *  as another generation). A run may carry a terminal journal with NO message manifest, so this
    *  creates the in-memory run entry when loadRun did not. */
-  private async loadTerminals(runId: string): Promise<void> {
-    if (!this.validRunId(runId)) return;
+  private async loadTerminals(runId: string): Promise<{ authenticated: number; rejected: number }> {
+    const result = { authenticated: 0, rejected: 0 };
+    if (!this.validRunId(runId)) return result;
     const dir = this.runDir(runId);
     let names: string[];
     try {
       names = await fs.readdir(dir);
     } catch {
-      return;
+      return result;
     }
     for (const name of names) {
       const gen = parseTerminalFileName(name);
       if (gen === undefined) continue;
       const parsed = await this.readAuthed(path.join(dir, name), MAC_DOMAIN_TERMINAL);
-      if (!parsed) continue; // absent/symlink/unparseable/MAC-bad (readAuthed logged)
+      if (!parsed) {
+        result.rejected++;
+        continue; // absent/symlink/unparseable/MAC-bad (readAuthed logged)
+      }
       const meta = coerceTerminal(parsed, runId, gen);
       if (!meta) {
         this.log.warn("outbox: malformed or misfiled terminal journal; skipping", { run_id: runId, file: name });
+        result.rejected++;
         continue;
       }
       const rs = this.ensureInMemoryRun(runId, meta.since);
       rs.terminals.set(meta.claimGeneration, meta);
+      result.authenticated++;
     }
+    return result;
   }
 
   // ── writes ──────────────────────────────────────────────────────────────────
