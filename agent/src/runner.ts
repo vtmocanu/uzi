@@ -13,7 +13,7 @@ import {
   isWorkflowScopeRejection,
 } from "./git.js";
 import type { SecretFinding } from "./secret-scan-guard.js";
-import type { Executor, ExecutorResult, RunContext, WallParkOutcome, WallParkRefresh } from "./executor.js";
+import type { CredentialFreeSettleOutcome, Executor, ExecutorResult, RunContext, WallParkOutcome, WallParkRefresh } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import type { BoundaryPermit, BoundaryRequest } from "./harness.js";
 import { SinkGate } from "./sink-gate.js";
@@ -40,6 +40,7 @@ import type {
   IterationBudget,
   Milestone,
   RunOrphanClassificationResponse,
+  RunOwnershipResponse,
   StateAck,
   StateRequest,
 } from "./protocol.js";
@@ -161,6 +162,50 @@ const COMPLETION_INTERLOCK_UNHELD_REASON =
 function isCodexBoundaryError(err: unknown): boolean {
   return err instanceof Error && err.name === "CodexBoundaryError";
 }
+
+/** Issue #1766: the harness-agnostic probe for a Codex credential DEFERRAL. A locked owner vault
+ *  answers a Codex refresh/release with a typed 409 `vault_locked`; the Codex side surfaces it as a
+ *  boundary-reconcile block (`CodexBoundaryError`, finalize/checkpoint sinks) or as a failed epoch
+ *  credential release (`CodexCredentialDeferredError`, epoch recreation). Like
+ *  {@link isCodexBoundaryError} it reads only the error's `name` and its `deferral` field (never
+ *  `instanceof`, never the message text), so the runner never imports agent/src/codex/**. Returns
+ *  "vault_locked" only for those two names carrying that exact deferral; undefined otherwise. */
+function codexDeferralOf(err: unknown): "vault_locked" | undefined {
+  if (!(err instanceof Error)) return undefined;
+  if (err.name !== "CodexBoundaryError" && err.name !== "CodexCredentialDeferredError") return undefined;
+  return (err as { deferral?: unknown }).deferral === "vault_locked" ? "vault_locked" : undefined;
+}
+
+/** Issue #1766: the steering channel gave up on an operator input's applied receipt
+ *  (steering.ts InputReceiptError, not exported). Recognised by name, like the Codex probes. */
+function isInputReceiptError(err: unknown): boolean {
+  return err instanceof Error && err.name === "InputReceiptError";
+}
+
+/** Issue #1766: the typed cause a recovery park is taken for. `transient` is the #1197 empty-turn
+ *  recovery (unchanged); `vault_locked` is a Codex credential deferral by a locked owner vault,
+ *  which parks credential-free (see RunRunner.handleRecoveryExhausted). */
+type RecoveryParkCause = { kind: "transient" } | { kind: "vault_locked" };
+
+/** Issue #1766: how many doublings a vault-lock park's retry wait may grow by before it is capped
+ *  (base recoveryRetryMs x 16). */
+const VAULT_PARK_BACKOFF_MAX_DOUBLINGS = 4;
+
+/** Issue #1766 (R6): the secret-free feed lines of a vault-lock deferral park. */
+const VAULT_PARK_FEED = {
+  published:
+    "Paused: your vault is locked. The recovery checkpoint is published; this run resumes automatically at its next retry once your vault is unlocked.",
+  local:
+    "Paused: your vault is locked. The recovery checkpoint is saved only on this worker; this run resumes automatically at its next retry once your vault is unlocked.",
+  unverified:
+    "Recovery checkpoint could not be verified. Keeping the local work and session and retrying before pausing.",
+  settleIncomplete:
+    "Waiting for this run's processes to stop before saving its work; keeping the local work and session and retrying.",
+  confirmUnknown:
+    "Your vault is locked. Could not confirm this run is still running; keeping the local work and session and retrying before pausing.",
+  reportFailed:
+    "Your vault is locked. Could not record the pause yet; keeping the local work and session and retrying.",
+} as const;
 
 /** issue #1597 M1: whether a CodexBoundaryError failed because its boundary DEADLINE elapsed (a
  *  `timeout`-category HarnessError among its `errors`). The runner stays harness-agnostic (no
@@ -1665,7 +1710,8 @@ export class RunRunner {
       // held permit — its per-sink reconcile + quiesce+reap close admission and tear down the
       // provider root before any PAT git op. For Claude/stub this is a plain call (the legacy
       // reap already happened at the untouched security boundary). A CodexBoundaryError before
-      // a committed publish still propagates to the failed-run report below. Once phasePublish
+      // a committed publish still propagates to the failed-run report below, unless it carries a
+      // vault-locked deferral (issue #1766), which the catch chain parks instead. Once phasePublish
       // registers the committed terminal callback, however, the pushed branch/open MR is the
       // authoritative outcome and must be reported after the boundary releases.
       let postFinalizeTerminal: (() => Promise<void>) | undefined;
@@ -2163,6 +2209,13 @@ export class RunRunner {
           "e2e drop-execution seam: ending flight with no terminal report (run left running for the missing-run requeue)",
         );
         await batcher.close().catch(() => undefined);
+      } else if (codexDeferralOf(err) === "vault_locked") {
+        // Issue #1766: a Codex credential refresh/release was deferred because the owner vault is
+        // locked (finalize or checkpoint boundary reconcile, or an epoch recreation's release). That
+        // is recoverable, never a failed run: park it for recovery, credential-free. Placed AFTER the
+        // claim-fence, stale-claim, running-ack-terminal and credential-switch arms, so a released or
+        // superseded claim is never parked.
+        await this.handleVaultLockDeferral(err as Error, claim, flight, executor, runLog);
       } else {
         await this.reportGenericFailure(claim, flight, err);
       }
@@ -6068,7 +6121,9 @@ export class RunRunner {
         // Codex run always sets it, so the per-sink auth-mode reconcile runs and the reap is credentialed
         // (the executor then recreates the reaped provider epoch — see startProviderEpoch). A blocked
         // reconcile (e.g. a transient refresh failure) surfaces a CodexBoundaryError that propagates and
-        // fails the run — the intended fail-closed behavior for a credentialed durability boundary.
+        // fails the run — the intended fail-closed behavior for a credentialed durability boundary —
+        // EXCEPT a vault-locked deferral (issue #1766): that error still propagates, but executeClaim's
+        // catch chain parks the run for recovery credential-free instead of failing it.
         await this.reapForSink(
           executor,
           { boundary: "checkpoint", deadlineMs: this.codexBoundaryDeadlineMs },
@@ -8382,6 +8437,105 @@ export class RunRunner {
   }
 
   /**
+   * Issue #1766: park a run whose Codex credential refresh/release was deferred by a locked owner
+   * vault. A separate helper (one catch clause in executeClaim) so the vault park stays textually
+   * apart from the finalize site. Delegates to {@link handleRecoveryExhausted} with the
+   * `vault_locked` cause: confirm the run is `running` at this claim's generation, settle the
+   * executor credential-free, capture the restore point credential-free, then report the park.
+   */
+  private async handleVaultLockDeferral(
+    err: Error,
+    claim: ClaimResponse,
+    flight: RunFlight,
+    executor: Executor,
+    runLog: Logger,
+  ): Promise<void> {
+    runLog.warn("codex credential deferred: the owner vault is locked; parking the run for recovery", {
+      run_id: flight.runId,
+    });
+    flight.parked = await this.handleRecoveryExhausted(
+      err,
+      claim,
+      flight,
+      executor,
+      flight.batcher,
+      flight.reportState,
+      runLog,
+      { kind: "vault_locked" },
+    );
+  }
+
+  /**
+   * Issue #1766 (R4): before a vault-lock park, positively confirm this flight still owns a
+   * `running` row. `ctx.reportIteration` swallows its errors, so nothing earlier proves the
+   * awaiting_approval -> running transition landed (a post-approval epoch recreation defers before
+   * the first iteration report). Sends a fenced `running` report through the flight choke point
+   * (which stamps claim_generation); a statusless ack or a transport failure falls back to the
+   * ownership probe, which confirms only on `running` AT this claim's generation.
+   */
+  private async confirmRunningForVaultPark(
+    flight: RunFlight,
+    reportState: (body: StateRequest) => Promise<StateAck>,
+    runLog: Logger,
+  ): Promise<
+    | { kind: "confirmed" | "unknown" | "stop" | "terminal" | "held" | "wall_parked" }
+    | { kind: "receipt_failed"; error: unknown }
+  > {
+    let ack: StateAck | undefined;
+    try {
+      ack = await reportState({ status: "running" });
+    } catch (e) {
+      if (e instanceof StaleClaimError) return { kind: "stop" };
+      if (e instanceof ServerWallParkedError) return { kind: "wall_parked" };
+      if (isInputReceiptError(e)) return { kind: "receipt_failed", error: e };
+      runLog.warn("vault-lock park: could not confirm the running state; probing ownership", {
+        run_id: flight.runId,
+        error: errMessage(e),
+      });
+    }
+    if (ack?.status === "running") return { kind: "confirmed" };
+    if (ack?.status && TERMINAL_RUN_STATUSES.has(ack.status)) return { kind: "terminal" };
+    // The server answered our running report with another live status (paused, held,
+    // awaiting_approval, ...): it is not resolvable to running, so never park over it.
+    if (ack?.status) return { kind: "held" };
+    let own: RunOwnershipResponse;
+    try {
+      own = await this.client.getRunOwnership(flight.runId);
+    } catch (probeError) {
+      if (probeError instanceof RequestError && probeError.status === 404) return { kind: "stop" };
+      return { kind: "unknown" };
+    }
+    if (own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration) {
+      return { kind: "stop" };
+    }
+    if (TERMINAL_RUN_STATUSES.has(own.status)) return { kind: "terminal" };
+    if (own.status === "running" && own.claim_generation === flight.claimGeneration) {
+      return { kind: "confirmed" };
+    }
+    // Running with no generation on the probe, or a live non-running status our report may still
+    // resolve: not proven either way. Retry.
+    return { kind: "unknown" };
+  }
+
+  /** Issue #1766 (R2): settle the executor for a credential-free capture. A Codex executor settles
+   *  its live registry (never reconciling or minting a permit); a legacy executor was already
+   *  reaped by the handler's `killAgentTree`; a `safety`-bearing executor without the method fails
+   *  closed. Never throws. */
+  private async settleForVaultCapture(executor: Executor): Promise<CredentialFreeSettleOutcome> {
+    if (executor.settleForCredentialFreeCapture) {
+      try {
+        return await executor.settleForCredentialFreeCapture(this.codexBoundaryDeadlineMs);
+      } catch {
+        return { kind: "incomplete", errors: [{ category: "protocol", message: "capture settle threw" }] };
+      }
+    }
+    if (executor.safety) {
+      return { kind: "incomplete", errors: [{ category: "protocol", message: "capture settle unsupported" }] };
+    }
+    return { kind: "observed_empty" };
+  }
+
+  /**
    * #1197, verified 2026-09-08: keep the execution and steering poller active
    * while retrying local capture, and report a promotable recovery_wait ONLY
    * after current HEAD is verified in the worker-owned tracking ref. A failed
@@ -8393,16 +8547,34 @@ export class RunRunner {
    * clone-retention flag guards only the clone removal, never secret eviction,
    * registry cleanup or poller shutdown. Park acceptance uses the returned
    * recovery_wait status, including an idempotent 409 after a lost success ACK.
+   *
+   * Issue #1766: `cause` selects the park. `transient` (the default) is the path above, unchanged.
+   * `vault_locked` (a Codex credential deferral) differs in these ways:
+   *   - it first confirms the run is `running` at this claim's generation
+   *     ({@link confirmRunningForVaultPark}); a stale claim or another generation stops silently, a
+   *     server wall park retains everything, a terminal ack cleans up, a live non-running status
+   *     retains and ends non-terminal, and a given-up input receipt takes the generic failure;
+   *   - it settles the executor credential-free before capture, and retries (no park) until the
+   *     settle is observed empty;
+   *   - the capture publishes with no overlay and no boundary (credentialFree);
+   *   - the park is typed `recovery_cause: "vault_locked"` when the api advertises
+   *     `recovery_cause_vault_locked`, else untyped;
+   *   - it never runs the credentialed reap-then-settle (which would refresh against the locked
+   *     vault and could release custody), so the custody hold is kept;
+   *   - a cancel reports `run cancelled` without the credentialed pre-report reap;
+   *   - every retry is visible on the feed (deduplicated) and backs off, capped.
    */
   private async handleRecoveryExhausted(
-    err: TransientRecoveryError,
+    err: Error,
     claim: ClaimResponse,
     flight: RunFlight,
     executor: Executor,
     batcher: MessageBatcher,
     reportState: (body: StateRequest) => Promise<StateAck>,
     runLog: Logger,
+    cause: RecoveryParkCause = { kind: "transient" },
   ): Promise<boolean> {
+    const vault = cause.kind === "vault_locked";
     executor.killAgentTree?.();
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
@@ -8413,18 +8585,82 @@ export class RunRunner {
     // terminal report); false = a blocked/failed reap (RETAIN the hold, still report the cancel).
     let cancelReap: boolean | undefined;
     const terminal = TERMINAL_RUN_STATUSES;
+    // Issue #1766: vault-lock park progress. A transient park starts with both latched.
+    let confirmedRunning = !vault;
+    let settled = !vault;
+    let retries = 0;
+    const shown = new Set<string>();
+    const note = async (text: string): Promise<void> => {
+      if (shown.has(text)) return;
+      shown.add(text);
+      batcher.emit({ kind: "status", agent: "worker", payload: { text } });
+      await batcher.flush().catch(() => undefined);
+    };
+    const retryWait = async (cancelStopsWait = true): Promise<void> => {
+      if (!vault) return this.waitRecoveryRetry(flight, cancelStopsWait);
+      const doublings = Math.min(retries++, VAULT_PARK_BACKOFF_MAX_DOUBLINGS);
+      await this.waitRecoveryRetry(flight, cancelStopsWait, this.recoveryRetryMs * 2 ** doublings);
+    };
     try {
       for (;;) {
         if (flight.active?.shuttingDown) return false;
+        if (!confirmedRunning && !flight.steering.isCancelled()) {
+          const confirm = await this.confirmRunningForVaultPark(flight, reportState, runLog);
+          switch (confirm.kind) {
+            case "confirmed":
+              confirmedRunning = true;
+              retries = 0;
+              break;
+            case "unknown":
+              await note(VAULT_PARK_FEED.confirmUnknown);
+              await retryWait();
+              continue;
+            case "stop":
+              // #1247: the run moved on under this worker. Stop silently: no report, normal teardown.
+              runLog.info("vault-lock park: the claim moved on under this worker; stopping silently", {
+                run_id: flight.runId,
+              });
+              flight.preserveRecoveryClone = false;
+              flight.preserveSession = false;
+              return false;
+            case "terminal":
+              flight.preserveRecoveryClone = false;
+              flight.preserveSession = false;
+              return false;
+            case "held":
+              runLog.info("vault-lock park: the run is not running and cannot resume here; retaining work, not parking", {
+                run_id: flight.runId,
+              });
+              return false;
+            case "wall_parked":
+              // The ServerWallParkedError arm's posture: retain everything, report nothing.
+              runLog.info(
+                "run parked server-side at its wall-clock limit; retaining clone + HOME and leaving it non-terminal for a resume",
+                { run_id: flight.runId },
+              );
+              return true;
+            case "receipt_failed":
+              flight.preserveRecoveryClone = false;
+              flight.preserveSession = false;
+              await this.reportGenericFailure(claim, flight, confirm.error);
+              return false;
+          }
+        }
         // A live heartbeat cannot requeue an abandoned running row. Keep this
         // execution and its steering poller active while retrying, and stop once
         // ownership or a real terminal state changes underneath it.
         let status: string;
         try {
-          status = (await this.client.getRunOwnership(flight.runId)).status;
+          const own = await this.client.getRunOwnership(flight.runId);
+          status = own.status;
+          if (vault && own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration) {
+            flight.preserveRecoveryClone = false;
+            flight.preserveSession = false;
+            return false;
+          }
         } catch (probeError) {
           if (probeError instanceof RequestError && probeError.status === 404) return false;
-          await this.waitRecoveryRetry(flight);
+          await retryWait();
           continue;
         }
         if (status !== "running") {
@@ -8452,8 +8688,12 @@ export class RunRunner {
           // top of this handler reaps Claude/stub but is a NO-OP for Codex, so this reap is what
           // closes Codex admission. The credentialed settle runs AFTER the terminal report below (on
           // the ack, or on a later terminal ownership read via the early return above).
+          // Issue #1766: a vault-lock park skips this credentialed reap (it would refresh against
+          // the locked vault); cancelReap stays false, so the hold is retained for the reconciler.
           if (cancelReap === undefined)
-            cancelReap = await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
+            cancelReap = vault
+              ? false
+              : await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
           try {
             // Consuming cancel only stamps stop_kind. This existing terminal
             // report is what makes Service route it to CancelRunByWorker.
@@ -8477,15 +8717,34 @@ export class RunRunner {
           }
           // Do not busy-loop on the sticky cancel or its spent abort signal.
           // Shutdown can still stop the retry with clone and session retained.
-          await this.waitRecoveryRetry(flight, false);
+          await retryWait(false);
           continue;
+        }
+        if (!settled) {
+          // Issue #1766 (R2): nothing of the run may still write to the clone while it is captured.
+          // An incomplete settle retains everything and retries; it never parks and never fails.
+          const settlement = await this.settleForVaultCapture(executor);
+          if (settlement.kind !== "observed_empty") {
+            runLog.warn("vault-lock park: the execution did not settle; retaining work and retrying", {
+              run_id: flight.runId,
+              errors: settlement.errors.map((e) => e.category),
+            });
+            await note(VAULT_PARK_FEED.settleIncomplete);
+            await retryWait();
+            continue;
+          }
+          settled = true;
+          retries = 0;
         }
         if (!capture) {
           try {
-            const attempt = await this.captureRecoveryRestorePoint(claim, flight, runLog);
+            const attempt = await this.captureRecoveryRestorePoint(claim, flight, runLog, {
+              credentialFree: vault,
+            });
             if (attempt.verified) {
               capture = attempt;
               flight.preserveRecoveryClone = false;
+              retries = 0;
             }
           } catch (captureError) {
             runLog.warn("recovery capture failed; retaining work for retry", {
@@ -8493,7 +8752,9 @@ export class RunRunner {
             });
           }
           if (!capture) {
-            if (!notified) {
+            if (vault) {
+              await note(VAULT_PARK_FEED.unverified);
+            } else if (!notified) {
               batcher.emit({
                 kind: "status",
                 agent: "worker",
@@ -8504,15 +8765,34 @@ export class RunRunner {
               await batcher.flush().catch(() => undefined);
               notified = true;
             }
-            await this.waitRecoveryRetry(flight);
+            await retryWait();
             continue;
           }
         }
         // Cancellation/shutdown may have arrived during local git or publish.
         if (flight.active?.shuttingDown || flight.steering.isCancelled()) continue;
         try {
-          const ack = await reportState({ status: "recovery_wait" });
+          const parkBody: StateRequest =
+            vault && this.client.protocolFeatures.includes("recovery_cause_vault_locked")
+              ? { status: "recovery_wait", recovery_cause: "vault_locked" }
+              : { status: "recovery_wait" };
+          const ack = await reportState(parkBody);
           if (ack.status === "recovery_wait") {
+            if (vault) {
+              // Issue #1766: NO reapThenSettleRecoveryGeneration — its credentialed reap would
+              // refresh against the locked vault and could release custody. The hold is kept.
+              runLog.info("run parked for recovery: the owner vault is locked", {
+                run_id: flight.runId,
+                published: capture.published,
+                typed: parkBody.recovery_cause !== undefined,
+              });
+              batcher.emit({
+                kind: "status",
+                agent: "worker",
+                payload: { text: capture.published ? VAULT_PARK_FEED.published : VAULT_PARK_FEED.local },
+              });
+              return true;
+            }
             runLog.info("run parked for transient recovery", { detail: err.message });
             batcher.emit({
               kind: "status",
@@ -8547,23 +8827,38 @@ export class RunRunner {
           // ownership: returning while it is still running would strand the row
           // because this healthy worker's heartbeats prevent stale-worker requeue.
         } catch (reportError) {
+          if (vault && reportError instanceof StaleClaimError) {
+            // #1247: the run moved on under this worker. Stop silently, normal teardown.
+            flight.preserveRecoveryClone = false;
+            flight.preserveSession = false;
+            return false;
+          }
+          if (vault && reportError instanceof ServerWallParkedError) {
+            flight.preserveRecoveryClone = true;
+            return true;
+          }
           // Bounded HTTP retries can fail while this worker keeps heartbeating.
           // Retain ownership and retry the idempotent park until its ACK is known.
           runLog.warn("could not report recovery park; retaining session and retrying", {
             error: errMessage(reportError),
           });
+          if (vault) await note(VAULT_PARK_FEED.reportFailed);
         }
-        await this.waitRecoveryRetry(flight);
+        await retryWait();
       }
     } finally {
       await batcher.close().catch(() => undefined);
     }
   }
 
-  private async waitRecoveryRetry(flight: RunFlight, cancelStopsWait = true): Promise<void> {
+  private async waitRecoveryRetry(
+    flight: RunFlight,
+    cancelStopsWait = true,
+    waitMs: number = this.recoveryRetryMs,
+  ): Promise<void> {
     // Short slices also observe sticky cancellation after a pause consumed the
     // shared AbortController. An already-aborted pause signal must not busy-loop.
-    let remaining = this.recoveryRetryMs;
+    let remaining = waitMs;
     while (remaining > 0 && !flight.active?.shuttingDown
       && (!cancelStopsWait || !flight.steering.isCancelled())) {
       const slice = Math.min(250, remaining);
@@ -8782,6 +9077,7 @@ export class RunRunner {
     claim: ClaimResponse,
     flight: RunFlight,
     runLog: Logger,
+    opts: { credentialFree?: boolean } = {},
   ): Promise<{ verified: boolean; published: boolean }> {
     const barePath = flight.barePath;
     const worktreePath = flight.worktreePath;
@@ -8848,8 +9144,17 @@ export class RunRunner {
     // emptiness and a re-reap re-invokes each RegisteredRoot.reap (idempotent). A blocked Codex
     // boundary is a best-effort recovery path: it leaves `published` false (the restore point is
     // still VERIFIED locally, so the caller's "saved on this worker" notice fires) and must NOT
-    // fail the capture. (Codex never actually reaches recovery in m4 — its executor throws no
+    // fail the capture. (Codex never reaches the TRANSIENT recovery — its executor throws no
     // TransientRecoveryError — so this is defensive wiring.)
+    //
+    // Issue #1766: the vault-lock park captures `credentialFree`. Everything above is unchanged, but
+    // the publish opens NO Codex boundary (its reconcile would refresh against the locked vault) and
+    // builds NO overlay (the overlay's default-fetch is PAT-bearing): it is the pause-park sink's
+    // credential-free join-token publish. The caller settled the execution before this capture.
+    if (opts.credentialFree) {
+      const freePublished = await this.publishCheckpointBestEffort(flight, barePath, branch, undefined);
+      return { verified, published: freePublished };
+    }
     let published = false;
     try {
       await this.withCodexBoundaryOnly(

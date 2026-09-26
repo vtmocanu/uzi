@@ -2131,9 +2131,12 @@ export interface StateRequest {
    *  non-completed report — an old worker omits it and a non-interlocked completion has no
    *  permit to match. */
   head?: string;
-  /** PRD #1392 M2 (D9/D10): the typed cause of a `recovery_wait` park. Today the worker only
-   *  ever sends "forge_unreachable" (the pre-clone transient-forge park); the api validates it
-   *  against its own enum (forge_unreachable|empty_turn|provider_outage) before any SQL and a
+  /** PRD #1392 M2 (D9/D10): the typed cause of a `recovery_wait` park. The worker sends
+   *  "forge_unreachable" (the pre-clone transient-forge park, gated on `recovery_park_cause`) and,
+   *  issue #1766, "vault_locked" (a Codex credential refresh/release deferred by a locked owner
+   *  vault, gated on `recovery_cause_vault_locked`; an api without that feature gets the untyped
+   *  park). The api validates it against its own enum
+   *  (forge_unreachable|empty_turn|provider_outage|vault_locked) before any SQL and a
    *  legacy/untyped park omits it (NULL). Additive + optional and OMITTED ENTIRELY on every
    *  other report so a pre-#1392 worker's payload and an ordinary (empty-turn) recovery park
    *  stay byte-identical on the wire; an api that predates the field 400s a report carrying it,

@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
-import type { CodexExecutionSafety } from "./harness.js";
+import type { CodexExecutionSafety, HarnessError } from "./harness.js";
 import type {
   AgentSelection,
   AgentSource,
@@ -749,7 +749,21 @@ export interface Executor {
   /** M3 (PRD #1171): a Codex-selected executor supplies this outer safety facade;
    * absence preserves Claude/stub callers (they take the literal legacy killAgentTree branch). */
   safety?: CodexExecutionSafety;
+  /**
+   * Issue #1766: settle the executor's live execution registry for a CREDENTIAL-FREE capture
+   * after a vault-locked credential deferral: refuse new launches, reap every root and drain
+   * launches and callbacks under one deadline, without reconciling a credential or minting a
+   * permit. `observed_empty` means nothing of the run can still write to the clone. Optional:
+   * only a Codex-selected executor supplies it (the runner fails closed when a `safety`-bearing
+   * executor lacks it, and treats a legacy executor's `killAgentTree` reap as settled).
+   */
+  settleForCredentialFreeCapture?(deadlineMs: number): Promise<CredentialFreeSettleOutcome>;
 }
+
+/** Issue #1766: the result of {@link Executor.settleForCredentialFreeCapture}. */
+export type CredentialFreeSettleOutcome =
+  | { kind: "observed_empty" }
+  | { kind: "incomplete"; errors: readonly HarnessError[] };
 
 /**
  * Sentinel in an issue's title/description that makes the stub executor throw
