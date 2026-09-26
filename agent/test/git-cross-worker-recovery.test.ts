@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger, recordingLogger } from "./helpers.js";
+import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
 
 // PRD #628 M3 — the cross-worker checkpoint recovery regression test (SC#2).
@@ -71,7 +71,7 @@ function commit(dir: string, file: string): string {
 function worker(name: string): GitCache {
   const dataDir = path.join(fx.dataDir, name);
   fs.mkdirSync(dataDir, { recursive: true });
-  return new GitCache(dataDir, nullLogger());
+  return new GitCache(dataDir, nullLogger(), undefined, testGitCacheOptions());
 }
 
 /** A worker whose GitCache captures every emitted log record into `lines`, so an
@@ -80,7 +80,7 @@ function loggingWorker(name: string): { git: GitCache; lines: unknown[] } {
   const dataDir = path.join(fx.dataDir, name);
   fs.mkdirSync(dataDir, { recursive: true });
   const { logger, lines } = recordingLogger();
-  return { git: new GitCache(dataDir, logger), lines };
+  return { git: new GitCache(dataDir, logger, undefined, testGitCacheOptions()), lines };
 }
 
 /** True when `lines` holds a level:"warn" record whose msg names the owner-anchor guard and

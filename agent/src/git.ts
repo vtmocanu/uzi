@@ -200,6 +200,9 @@ export interface GitCacheOptions {
    *  absolute `/usr/local/bin/gitleaks` inside one via resolveBoundaryExecutable). A test injects an
    *  absolute path to a shim. */
   gitleaksBin?: string;
+  /** Test-only stand-in for runner-clone scratch provisioning, for the non-Linux dev loop.
+   *  Production never passes it, so the real provisioner runs and fails closed off Linux. */
+  scratchProvisioner?: (clonePath: string) => Promise<void>;
 }
 
 /** issue #1597 M2: the mid-turn checkpoint secret scan's hard deadline (all of its git + gitleaks
@@ -680,6 +683,8 @@ export class GitCache {
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
   /** issue #1597 M2: the gitleaks executable (see {@link GitCacheOptions.gitleaksBin}). */
   private readonly gitleaksBin: string;
+  /** See {@link GitCacheOptions.scratchProvisioner}; undefined in production. */
+  private readonly scratchProvisioner: ((clonePath: string) => Promise<void>) | undefined;
   /** issue #1597 M2: memoised `--remerge-diff` support probe. */
   private remergeProbe: Promise<boolean> | undefined;
 
@@ -692,6 +697,7 @@ export class GitCache {
     opts: GitCacheOptions = {},
   ) {
     this.gitleaksBin = opts.gitleaksBin ?? "gitleaks";
+    this.scratchProvisioner = opts.scratchProvisioner;
     this.reposRoot = path.join(dataDir, "repos");
     this.runnerRoot = path.join(dataDir, "runner");
     this.runnerHoldingRoot = path.join(dataDir, "runner-quarantine");
@@ -1580,7 +1586,8 @@ export class GitCache {
         if ((err as { code?: unknown }).code === 5) return;
         throw err;
       });
-      await this.provisionRunnerScratch(clonePath);
+      if (this.scratchProvisioner) await this.scratchProvisioner(clonePath);
+      else await this.provisionRunnerScratch(clonePath);
       // PRD #759 M2: baseCommit is the REAL fork point — effectiveBase, which is the
       // marker's parent when a wip(park) marker was reset --soft'd back to uncommitted, and
       // baseSha (byte-identical) on every other leg. wipRecovered surfaces the recovery to

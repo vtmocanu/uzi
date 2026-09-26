@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache } from "../src/git.js";
 
 // issue #1582 — GitCache.pinSettlementRefs against a REAL bare. The runner's containment
@@ -45,7 +45,7 @@ async function bareWithTwoCommits(): Promise<{ bare: string; mainTip: string; de
 
 beforeEach(() => {
   fx = makeFixture();
-  git = new GitCache(fx.dataDir, nullLogger());
+  git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
 });
 
 afterEach(() => fx.cleanup());

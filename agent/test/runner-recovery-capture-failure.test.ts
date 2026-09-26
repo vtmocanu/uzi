@@ -8,7 +8,7 @@ import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith, worktreeDirFor } from "./runner-harness.js";
 
 installHarness();
@@ -124,7 +124,7 @@ describe("recovery capture retry and restart safety (#1197)", () => {
     assert.equal(fs.readFileSync(path.join(fixture.clone(), "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
     assert.equal(fs.existsSync(path.join(fixture.runHome, "session")), true);
 
-    const restartedGit = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: defaultGitleaksShim() });
+    const restartedGit = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
     const bare = restartedGit.barePathFor(fx.originPath);
     await assert.rejects(
       restartedGit.createOrAttachRunnerClone(bare, iid, claim.run_id),

@@ -1,8 +1,28 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import type { GitCacheOptions } from "../src/git.js";
 import type { Logger } from "../src/log.js";
 import type { WorkerClient } from "../src/client.js";
 import { ChatSteering, SteeringChannel } from "../src/steering.js";
 import type { ClaimResponse, UserInput } from "../src/protocol.js";
+
+/** GitCache options for suites that create runner clones. Off Linux the real scratch
+ *  provisioner fails closed, so this adds a plain-fs stand-in for the dev loop; on Linux
+ *  it adds nothing and every suite exercises the real provisioner. Scratch-security
+ *  suites construct GitCache without it. */
+export function testGitCacheOptions(opts: GitCacheOptions = {}): GitCacheOptions {
+  return process.platform === "linux" ? opts : { ...opts, scratchProvisioner: plainScratchProvisioner };
+}
+
+async function plainScratchProvisioner(clonePath: string): Promise<void> {
+  fs.mkdirSync(path.join(clonePath, ".uzi", "scratch"), { recursive: true });
+  const exclude = path.join(clonePath, ".git", "info", "exclude");
+  fs.mkdirSync(path.dirname(exclude), { recursive: true });
+  const existing = fs.existsSync(exclude) ? fs.readFileSync(exclude, "utf8") : "";
+  if (existing.split("\n").includes("/.uzi/scratch/")) return;
+  fs.appendFileSync(exclude, `${existing.length > 0 && !existing.endsWith("\n") ? "\n" : ""}/.uzi/scratch/\n`);
+}
 
 /** A no-op logger so tests don't spray JSON lines into the reporter. */
 export function nullLogger(): Logger {

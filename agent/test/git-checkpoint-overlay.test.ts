@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import {
   GitCache,
   OVERLAY_COMMIT_PREFIX,
@@ -53,7 +53,7 @@ function gitIn(dir: string, args: string[]): string {
 function worker(fx: Fixture, name: string): GitCache {
   const dataDir = path.join(fx.dataDir, name);
   fs.mkdirSync(dataDir, { recursive: true });
-  return new GitCache(dataDir, nullLogger());
+  return new GitCache(dataDir, nullLogger(), undefined, testGitCacheOptions());
 }
 
 /** Commit `file` (default a non-workflow file) in the runner clone; return the new HEAD. */

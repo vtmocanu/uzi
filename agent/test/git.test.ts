@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger, recordingLogger } from "./helpers.js";
+import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache, ScratchProvisionError, bareDirName, gitEnv } from "../src/git.js";
 import { TickSpawner } from "../src/tick-spawner.js";
 
@@ -211,6 +211,15 @@ describe("scratch provisioning platform support", () => {
       return true;
     });
     assert.equal(fs.existsSync(path.join(fx.dataDir, "missing-clone")), false);
+  });
+
+  it("keeps the test scratch provisioner out of every production call site", () => {
+    const srcDir = path.join(import.meta.dirname, "..", "src");
+    const users = (fs.readdirSync(srcDir, { recursive: true }) as string[])
+      .filter((f) => f.endsWith(".ts"))
+      .filter((f) => fs.readFileSync(path.join(srcDir, f), "utf8").includes("scratchProvisioner"));
+    // Only its definition in git.ts names it; no caller, env var or config key selects it.
+    assert.deepEqual(users, ["git.ts"]);
   });
 });
 
@@ -1651,6 +1660,8 @@ describe("issue #781 — disjoint-ref seed guard + fetch --prune", () => {
 // fetchAgentBranch must clear the conflicting ancestor first (archiving its tip), land the
 // agent commit, and leave unrelated sibling tracking refs untouched.
 describe("issue #887 — fetchAgentBranch clears a D/F-conflicting legacy ancestor tracking ref", () => {
+  // Not a scratch suite: off Linux it runs on the test provisioner (a no-op on Linux).
+  beforeEach(() => { git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions()); });
   const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
   function refInBare(bare: string, ref: string): boolean {
     try {
@@ -1729,6 +1740,8 @@ describe("issue #887 — fetchAgentBranch clears a D/F-conflicting legacy ancest
 });
 
 describe("issue #909 — the owner-stamp reader falls back to the pre-#887 flattened key, collision-guarded", () => {
+  // Not a scratch suite: off Linux it runs on the test provisioner (a no-op on Linux).
+  beforeEach(() => { git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions()); });
   const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
   function refInBare(bare: string, ref: string): boolean {
     try {

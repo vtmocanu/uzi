@@ -14,7 +14,7 @@ import type { RunContext } from "../src/executor.js";
 import type { BoundaryPermit, BoundaryProcessRequest, CodexExecutionSafety } from "../src/harness.js";
 import { CodexBoundaryError } from "../src/codex/safety.js";
 import { GitCache } from "../src/git.js";
-import { nullLogger, recordingLogger } from "./helpers.js";
+import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { defaultGitleaksShim, shimCalls, writeGitleaksShim as writeShim } from "./gitleaks-shim.js";
 import type { Logger } from "../src/log.js";
 import {
@@ -265,7 +265,7 @@ async function hangUntilAborted(pack: Readable, signal?: AbortSignal): Promise<n
 
 function mkGit(dataDir: string, gitleaksBin?: string, log: Logger = nullLogger()): GitCache {
   fs.mkdirSync(dataDir, { recursive: true });
-  return new GitCache(dataDir, log, undefined, { gitleaksBin: gitleaksBin ?? defaultGitleaksShim() });
+  return new GitCache(dataDir, log, undefined, testGitCacheOptions({ gitleaksBin: gitleaksBin ?? defaultGitleaksShim() }));
 }
 
 function mkRunner(
@@ -1519,7 +1519,7 @@ describe("GitCache mid-turn primitives (issue #1597 M2)", () => {
     const tmp = scratchDir("unitscan");
     try {
       const shim = writeShim(tmp, "fail");
-      const g = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: shim });
+      const g = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: shim }));
       const { bare, base } = bareWithBranch();
       assert.deepEqual(await g.secretScanCheckpointRange(bare, { tipSha: base, excludeSha: base }), {
         trusted: true,
@@ -1815,7 +1815,7 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
     try {
       const shim = writeShim(tmp, "detect");
       const { logger, lines } = recordingLogger();
-      const g = new GitCache(fx.dataDir, logger, undefined, { gitleaksBin: shim });
+      const g = new GitCache(fx.dataDir, logger, undefined, testGitCacheOptions({ gitleaksBin: shim }));
       const bare = path.join(fx.dataDir, "big.git");
       execFileSync("git", ["clone", "-q", "--bare", fx.originPath, bare], { env: GIT_ENV });
       const base = gitIn(bare, ["rev-parse", "main"]);
@@ -2260,7 +2260,7 @@ describe("mid-turn checkpoint round 3 (issue #1597 M2)", () => {
       w.git(["rm", "-q", "README.md"]);
       w.git(["commit", "-q", "-m", "delete a text file"]);
       const tip = w.git(["rev-parse", "HEAD"]);
-      const g = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: bin });
+      const g = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: bin }));
       assert.deepEqual(
         await g.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: w.base }),
         { trusted: true, findings: [] },
@@ -2281,7 +2281,7 @@ describe("mid-turn checkpoint round 3 (issue #1597 M2)", () => {
       w.git(["rm", "-q", "big.txt"]);
       w.git(["commit", "-q", "-m", "delete big"]);
       const tip = w.git(["rev-parse", "HEAD"]);
-      const g = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: shim });
+      const g = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: shim }));
       assert.deepEqual(await g.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: floor }), {
         trusted: false,
         findings: [],
@@ -2313,7 +2313,7 @@ describe("mid-turn checkpoint round 3 (issue #1597 M2)", () => {
       w.git(["commit", "-q", "-m", "octopus evil"]);
       const octo = w.git(["rev-parse", "HEAD"]);
       assert.equal(w.git(["rev-list", "--parents", "-n", "1", octo]).split(" ").length, 4, "a real octopus");
-      const g = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: bin });
+      const g = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: bin }));
       const r = await g.secretScanCheckpointRange(w.dir, { tipSha: octo, excludeSha: w.base });
       assert.equal(r.findings.length > 0, true, `${label}: ${JSON.stringify(r)}`);
       assert.equal(r.findings[0]!.commit, octo);
@@ -2481,7 +2481,7 @@ describe("mid-turn checkpoint round 3 (issue #1597 M2)", () => {
       t.skip("local git < 2.36 has no --remerge-diff");
       return;
     }
-    const g = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: defaultGitleaksShim() });
+    const g = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
     type ExecScoped = (command: string, args: string[], ...rest: unknown[]) => Promise<{ stdout: string; stderr: string }>;
     const priv = g as unknown as { execScoped: ExecScoped; remergeDiffSupported: () => Promise<boolean> };
     const original = priv.execScoped.bind(g);
@@ -2654,12 +2654,12 @@ describe("mid-turn checkpoint round 4 (issue #1597 M2)", () => {
       w.git(["add", "-A"]);
       w.git(["commit", "-q", "-m", "merge with its own (clean) content"]);
       const tip = w.git(["rev-parse", "HEAD"]);
-      const honest = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: writeShim(tmp, "detect") });
+      const honest = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: writeShim(tmp, "detect") }));
       assert.deepEqual(await honest.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: w.base }), {
         trusted: true,
         findings: [],
       });
-      const liar = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: writeShim(tmp, "stdinlie") });
+      const liar = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: writeShim(tmp, "stdinlie") }));
       assert.deepEqual(await liar.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: w.base }), {
         trusted: false,
         findings: [],
@@ -2694,7 +2694,7 @@ describe("mid-turn checkpoint round 4 (issue #1597 M2)", () => {
         w.git(["diff", "--no-color", `${tip}^1`, tip]).includes(`+++ b/${name}`),
         "the merge diff carries the secret-shaped `+++ b/` header",
       );
-      const g = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: bin });
+      const g = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: bin }));
       assert.deepEqual(
         await g.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: w.base }),
         { trusted: true, findings: [] },

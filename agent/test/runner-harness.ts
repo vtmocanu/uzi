@@ -5,7 +5,7 @@ import path from "node:path";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { FakeApi } from "./fake-api.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { makeClaim, nullLogger } from "./helpers.js";
+import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
 import { WorkerClient } from "../src/client.js";
 import { GitCache } from "../src/git.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
@@ -50,7 +50,7 @@ export function installHarness(): void {
     api = new FakeApi(TOKEN);
     baseUrl = await api.listen();
     fx = makeFixture();
-    git = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: defaultGitleaksShim() });
+    git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
     homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-runnerhome-"));
     client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), {
       sleep: async () => {},

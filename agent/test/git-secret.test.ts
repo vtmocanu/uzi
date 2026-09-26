@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { recordingLogger } from "./helpers.js";
+import { recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache, gitEnv, gitBasicCredential, httpScopeForUrl } from "../src/git.js";
 
 // Primary directive (auditor): the bot PAT must never be readable in the git
@@ -94,7 +94,7 @@ describe("pushBranch secret flow", () => {
     fs.chmodSync(shim, 0o755);
 
     const { logger, lines } = recordingLogger();
-    const git = new GitCache(fx.dataDir, logger);
+    const git = new GitCache(fx.dataDir, logger, undefined, testGitCacheOptions());
     // Seed the runner clone + fetch the branch back (without the shim, to keep the log
     // focused on push). Under (b) pushBranch pushes FROM the worker-side tracking ref
     // that fetchAgentBranch writes, so the fetch-back must run first.
@@ -140,7 +140,7 @@ describe("secret flow through real git spawns", () => {
     fs.chmodSync(shim, 0o755);
 
     const { logger, lines } = recordingLogger();
-    const git = new GitCache(fx.dataDir, logger);
+    const git = new GitCache(fx.dataDir, logger, undefined, testGitCacheOptions());
 
     const oldPath = process.env.PATH ?? "";
     process.env.PATH = shimDir + path.delimiter + oldPath;

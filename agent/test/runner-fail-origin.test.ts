@@ -6,7 +6,7 @@ import { REASON_NO_TOKEN } from "../src/sdk-executor.js";
 import { REASON_PLAN_MISSING } from "../src/plan-missing.js";
 import { FakeApi } from "./fake-api.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { makeClaim, nullLogger } from "./helpers.js";
+import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
 import { WorkerClient } from "../src/client.js";
 import { GitCache } from "../src/git.js";
 import type { Executor } from "../src/executor.js";
@@ -63,7 +63,7 @@ describe("a run failing REASON_PLAN_MISSING", () => {
     api = new FakeApi(TOKEN);
     const baseUrl = await api.listen();
     fx = makeFixture();
-    git = new GitCache(fx.dataDir, nullLogger());
+    git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
     client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
   });
   afterEach(async () => {
