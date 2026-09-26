@@ -899,9 +899,11 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
     const controller = new AbortController();
     const rig = makeRig();
     let shellObservedAbort = false;
+    let shellStarted = false;
     rig.deps = {
       ...rig.deps,
       spawnCommand: async (_argv, opts) => new Promise((resolve) => {
+        shellStarted = true;
         const settle = (): void => {
           shellObservedAbort = true;
           resolve({ code: 137, stdout: "", stderr: "" });
@@ -914,7 +916,9 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
       .push(threadStarted())
       .push(toolCall(92, "Bash", { command: "sleep 60" }, "th-1", "tn-1", "trip-cancel"));
     const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx({ signal: controller.signal }).ctx);
-    await tick();
+    // Abort only once the shell effect is running: a single tick raced the spawn under a loaded
+    // suite, so the abort landed before the effect existed and the assertion below flaked.
+    await waitFor(() => shellStarted, "shell effect start");
     controller.abort();
     await assert.rejects(withTimeout(running, 3000, "cancel shell trip"), /run cancelled/);
     assert.equal(shellObservedAbort, true);
