@@ -91,15 +91,21 @@ func validateSettleRequest(req apitypes.RecoverySettleRequest) error {
 // terminal report); source_sha, the PREDECESSOR generation's journaled source; and
 // adopted_sha, the tip the successor adopted. The api:
 //
+//  0. reads the run (ownership only: a run of another owner is ErrRunNotOwned, 404) and the
+//     hold by id on that run (none is retained/not_eligible). A hold this caller already
+//     released for EXACTLY this identity answers released from the stored row BEFORE any
+//     run-state check, with no forge call and no write (issue #1751 M2): an 'ancestry'
+//     release on the run's current branch (settledByAncestry), or a 'live_ancestry' release
+//     taken while the run was live whose ACK was lost before it completed
+//     (settledByLiveAncestryForCompleted).
 //  1. reads the run from its own row: it must be 'completed', at claim_generation ==
 //     successor_generation, held by the caller (runs.worker_id), on a branch that is a valid
 //     git branch name (isSettleBranchName). It captures that completion identity (branch,
 //     status_since). A run of another owner is ErrRunNotOwned (404); any other mismatch is
 //     retained/not_eligible.
-//  2. reads the hold by id on that run: generation == predecessor_generation <
-//     successor_generation and original_worker_id == caller. A hold already released with
-//     'ancestry' evidence and the SAME stored identity is an idempotent released; any other
-//     settled hold is retained/not_eligible. Otherwise it must be open.
+//  2. checks the hold: generation == predecessor_generation < successor_generation,
+//     original_worker_id == caller, and still open (any settled hold step 0 did not
+//     recognise is retained/not_eligible).
 //  3. binds the candidates to the facts the server already holds, where they exist: when any
 //     recovery capture registered under the hold was created BEFORE the successor generation
 //     claimed (its hold's created_at, else runs.claimed_at; a later capture is ignored
@@ -125,20 +131,12 @@ func (s *Service) SettlePredecessorHold(ctx context.Context, wkr store.Worker, r
 	if err := validateSettleRequest(req); err != nil {
 		return apitypes.RecoverySettleResponse{}, err
 	}
-	retained := func(reason string) apitypes.RecoverySettleResponse {
-		return apitypes.RecoverySettleResponse{
-			RunID: runID.String(), HoldID: holdID.String(),
-			Outcome: apitypes.RecoverySettleRetained, Reason: reason,
-		}
-	}
+	retained := func(reason string) apitypes.RecoverySettleResponse { return settleRetained(runID, holdID, reason) }
 	released := func(finalHead string) apitypes.RecoverySettleResponse {
-		return apitypes.RecoverySettleResponse{
-			RunID: runID.String(), HoldID: holdID.String(),
-			Outcome: apitypes.RecoverySettleReleased, FinalHeadSha: finalHead,
-		}
+		return settleReleased(runID, holdID, finalHead)
 	}
 
-	// 1. The run, from the server's own row only.
+	// The run (ownership only, for the 404) and the exact hold, from the server's own rows.
 	run, err := s.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: wkr.UserID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -146,6 +144,25 @@ func (s *Service) SettlePredecessorHold(ctx context.Context, wkr store.Worker, r
 		}
 		return apitypes.RecoverySettleResponse{}, err
 	}
+	hold, err := s.q.GetCustodyHoldForSettle(ctx, store.GetCustodyHoldForSettleParams{HoldID: holdID, RunID: runID})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return retained(apitypes.RecoverySettleNotEligible), nil
+		}
+		return apitypes.RecoverySettleResponse{}, err
+	}
+
+	// Idempotent acknowledgement FIRST (issue #1751 M2): a hold this caller already settled for
+	// this exact identity answers released from the stored row, with no forge call and no
+	// write, whatever the run did since. That covers an 'ancestry' settle whose ACK was lost
+	// (on the run's current branch, as before) and a 'live_ancestry' settle whose ACK was lost
+	// before the run completed (settledByLiveAncestryForCompleted).
+	if hold.State == "released" && hold.Generation == req.PredecessorGeneration && hold.OriginalWorkerID == wkr.ID &&
+		((run.Branch.Valid && settledByAncestry(hold, req, run.Branch.String)) || settledByLiveAncestryForCompleted(hold, req, wkr)) {
+		return released(hold.ReleaseFinalHeadSha.String), nil
+	}
+
+	// 1. The run's completion identity.
 	if run.Status != "completed" ||
 		run.ClaimGeneration != req.SuccessorGeneration ||
 		!run.WorkerID.Valid || uuid.UUID(run.WorkerID.Bytes) != wkr.ID ||
@@ -156,35 +173,20 @@ func (s *Service) SettlePredecessorHold(ctx context.Context, wkr store.Worker, r
 	branch := run.Branch.String
 	completedSince := run.StatusSince
 
-	// 2. The exact hold.
-	hold, err := s.q.GetCustodyHoldForSettle(ctx, store.GetCustodyHoldForSettleParams{HoldID: holdID, RunID: runID})
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return retained(apitypes.RecoverySettleNotEligible), nil
-		}
-		return apitypes.RecoverySettleResponse{}, err
-	}
+	// 2. The exact hold. An already-settled hold was answered above when its identity matched.
 	if hold.Generation != req.PredecessorGeneration ||
 		req.PredecessorGeneration >= req.SuccessorGeneration ||
-		hold.OriginalWorkerID != wkr.ID {
-		return retained(apitypes.RecoverySettleNotEligible), nil
-	}
-	if hold.State != "open" {
-		if settledByAncestry(hold, req, branch) {
-			return released(hold.ReleaseFinalHeadSha.String), nil
-		}
+		hold.OriginalWorkerID != wkr.ID ||
+		hold.State != "open" {
 		return retained(apitypes.RecoverySettleNotEligible), nil
 	}
 
 	// 3. The server-held candidate binding.
-	sources, err := s.q.ListCaptureSourceShasForHold(ctx, store.ListCaptureSourceShasForHoldParams{
-		HoldID: holdID, RunID: runID, SuccessorGeneration: req.SuccessorGeneration,
-	})
-	if err != nil {
-		return apitypes.RecoverySettleResponse{}, err
-	}
-	if len(sources) > 0 && !slices.Contains(sources, req.SourceSha) {
-		return retained(apitypes.RecoverySettleCandidateMismatch), nil
+	if reason, err := s.settleCaptureBinding(ctx, runID, holdID, req.SuccessorGeneration, req.SourceSha); err != nil || reason != "" {
+		if err != nil {
+			return apitypes.RecoverySettleResponse{}, err
+		}
+		return retained(reason), nil
 	}
 	if run.CompletionContractVersion.Valid {
 		if !run.ContractRevision.Valid {
@@ -210,65 +212,20 @@ func (s *Service) SettlePredecessorHold(ctx context.Context, wkr store.Worker, r
 	}
 
 	// 4. The api's own proof, via the forge compare API.
-	if s.forges == nil {
-		return apitypes.RecoverySettleResponse{}, ErrForgesUnavailable
-	}
-	rc, err := s.q.GetRunClaimContext(ctx, runID)
+	logUnknown := settleLogUnknown(runID, holdID)
+	f, projectID, reason, err := s.settleForge(ctx, runID, logUnknown)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			// No repo/connection behind the run: nothing to prove against.
-			return retained(apitypes.RecoverySettleNotEligible), nil
-		}
 		return apitypes.RecoverySettleResponse{}, err
 	}
-	logUnknown := func(step string, err error) {
-		slog.Warn("recovery settle: ancestry unproven", "run", runID.String(), "hold", holdID.String(),
-			"step", step, "error", secretscrub.Scrub(err.Error()))
+	if reason != "" {
+		return retained(reason), nil
 	}
-	f, err := s.forges.ForgeForConnection(rc.ForgeType, rc.BaseUrl, rc.TokenCiphertext)
-	if err != nil {
-		logUnknown("build forge", err)
-		return retained(apitypes.RecoverySettleAncestryUnknown), nil
+	head, err := f.BranchHead(ctx, projectID, branch)
+	if reason := settleHeadReason(head, err, "branch head", logUnknown); reason != "" {
+		return retained(reason), nil
 	}
-	head, err := f.BranchHead(ctx, rc.ForgeProjectID, branch)
-	if errors.Is(err, forge.ErrRefNotFound) {
-		return retained(apitypes.RecoverySettleBranchMissing), nil
-	}
-	if err != nil {
-		logUnknown("branch head", err)
-		return retained(apitypes.RecoverySettleAncestryUnknown), nil
-	}
-	if !isSettleSHA(head) {
-		logUnknown("branch head", fmt.Errorf("forge returned a malformed branch head"))
-		return retained(apitypes.RecoverySettleAncestryUnknown), nil
-	}
-	notAncestor, unknown := false, false
-	asked := map[string]bool{}
-	for _, c := range []string{req.PushedSha, req.SourceSha, req.AdoptedSha} {
-		if asked[c] {
-			continue // one question per distinct candidate
-		}
-		asked[c] = true
-		a, err := f.CompareAncestry(ctx, rc.ForgeProjectID, head, c)
-		if err != nil {
-			// Any error is unknown, whatever verdict accompanied it: only an explicit
-			// error-free positive answer is proof.
-			logUnknown("compare ancestry", err)
-			a = forge.AncestryUnknown
-		}
-		switch a {
-		case forge.AncestryAncestor:
-		case forge.AncestryNotAncestor:
-			notAncestor = true
-		default:
-			unknown = true
-		}
-	}
-	if notAncestor {
-		return retained(apitypes.RecoverySettleNotAncestor), nil
-	}
-	if unknown {
-		return retained(apitypes.RecoverySettleAncestryUnknown), nil
+	if reason := proveSettleCandidates(ctx, f, projectID, head, []string{req.PushedSha, req.SourceSha, req.AdoptedSha}, logUnknown); reason != "" {
+		return retained(reason), nil
 	}
 
 	// 5. The single guarded release.
@@ -308,6 +265,125 @@ func (s *Service) SettlePredecessorHold(ctx context.Context, wkr store.Worker, r
 	return retained(apitypes.RecoverySettleStateChanged), nil
 }
 
+// settleRetained / settleReleased build the two settle answers (issue #1582 M1), shared by
+// the completed-run and live settle paths.
+func settleRetained(runID, holdID uuid.UUID, reason string) apitypes.RecoverySettleResponse {
+	return apitypes.RecoverySettleResponse{
+		RunID: runID.String(), HoldID: holdID.String(),
+		Outcome: apitypes.RecoverySettleRetained, Reason: reason,
+	}
+}
+
+func settleReleased(runID, holdID uuid.UUID, finalHead string) apitypes.RecoverySettleResponse {
+	return apitypes.RecoverySettleResponse{
+		RunID: runID.String(), HoldID: holdID.String(),
+		Outcome: apitypes.RecoverySettleReleased, FinalHeadSha: finalHead,
+	}
+}
+
+// settleLogUnknown returns the logger both settle paths use for a proof step that could not
+// be completed; the error is secret-scrubbed.
+func settleLogUnknown(runID, holdID uuid.UUID) func(step string, err error) {
+	return func(step string, err error) {
+		slog.Warn("recovery settle: ancestry unproven", "run", runID.String(), "hold", holdID.String(),
+			"step", step, "error", secretscrub.Scrub(err.Error()))
+	}
+}
+
+// settleCaptureBinding is the server-held source binding both settle paths apply (issue #1582
+// M1 rework): when any capture registered under the hold before the successor generation
+// claimed exists, source must equal one of their source_sha values, else candidate_mismatch.
+// It returns "" when the binding holds (or there is nothing to bind to).
+func (s *Service) settleCaptureBinding(ctx context.Context, runID, holdID uuid.UUID, successor int64, source string) (string, error) {
+	sources, err := s.q.ListCaptureSourceShasForHold(ctx, store.ListCaptureSourceShasForHoldParams{
+		HoldID: holdID, RunID: runID, SuccessorGeneration: successor,
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(sources) > 0 && !slices.Contains(sources, source) {
+		return apitypes.RecoverySettleCandidateMismatch, nil
+	}
+	return "", nil
+}
+
+// settleForge resolves the forge a settle proof asks, from the run's claim context. A nil
+// forge seam is ErrForgesUnavailable; a run with no repo/connection behind it is not_eligible
+// (nothing to prove against); a forge that cannot be built is ancestry_unknown. A non-empty
+// reason is the retained answer.
+func (s *Service) settleForge(ctx context.Context, runID uuid.UUID, logUnknown func(string, error)) (forge.Forge, int64, string, error) {
+	if s.forges == nil {
+		return nil, 0, "", ErrForgesUnavailable
+	}
+	rc, err := s.q.GetRunClaimContext(ctx, runID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, 0, apitypes.RecoverySettleNotEligible, nil
+		}
+		return nil, 0, "", err
+	}
+	f, err := s.forges.ForgeForConnection(rc.ForgeType, rc.BaseUrl, rc.TokenCiphertext)
+	if err != nil {
+		logUnknown("build forge", err)
+		return nil, 0, apitypes.RecoverySettleAncestryUnknown, nil
+	}
+	return f, rc.ForgeProjectID, "", nil
+}
+
+// settleHeadReason classifies the target-head read both settle paths make: a 404
+// (forge.ErrRefNotFound) is branch_missing; any other error, or a head that is not a 40-char
+// lowercase hex commit id, is ancestry_unknown. "" means head is usable.
+func settleHeadReason(head string, err error, step string, logUnknown func(string, error)) string {
+	if errors.Is(err, forge.ErrRefNotFound) {
+		return apitypes.RecoverySettleBranchMissing
+	}
+	if err != nil {
+		logUnknown(step, err)
+		return apitypes.RecoverySettleAncestryUnknown
+	}
+	if !isSettleSHA(head) {
+		logUnknown(step, fmt.Errorf("forge returned a malformed %s", step))
+		return apitypes.RecoverySettleAncestryUnknown
+	}
+	return ""
+}
+
+// proveSettleCandidates asks the forge, once per DISTINCT candidate, whether it is an ancestor
+// of (or equal to) head. Any explicit not_ancestor wins (not_ancestor); otherwise any error or
+// inconclusive answer is ancestry_unknown — only an error-free positive answer is proof. ""
+// means every candidate is proven.
+func proveSettleCandidates(ctx context.Context, f forge.Forge, projectID int64, head string, candidates []string, logUnknown func(string, error)) string {
+	notAncestor, unknown := false, false
+	asked := map[string]bool{}
+	for _, c := range candidates {
+		if asked[c] {
+			continue // one question per distinct candidate
+		}
+		asked[c] = true
+		a, err := f.CompareAncestry(ctx, projectID, head, c)
+		if err != nil {
+			// Any error is unknown, whatever verdict accompanied it: only an explicit
+			// error-free positive answer is proof.
+			logUnknown("compare ancestry", err)
+			a = forge.AncestryUnknown
+		}
+		switch a {
+		case forge.AncestryAncestor:
+		case forge.AncestryNotAncestor:
+			notAncestor = true
+		default:
+			unknown = true
+		}
+	}
+	if notAncestor {
+		return apitypes.RecoverySettleNotAncestor
+	}
+	if unknown {
+		return apitypes.RecoverySettleAncestryUnknown
+	}
+	return ""
+}
+
 // settledByAncestry reports whether hold is already released with 'ancestry' evidence under
 // EXACTLY the identity req names (candidate SHAs + successor generation) on branch — the
 // idempotent-acknowledgement test. Any difference (another class, another candidate, another
@@ -321,4 +397,24 @@ func settledByAncestry(hold store.RecoveryCustodyHold, req apitypes.RecoverySett
 		hold.ReleaseSuccessorGeneration.Valid && hold.ReleaseSuccessorGeneration.Int64 == req.SuccessorGeneration &&
 		hold.ReleaseBranch.Valid && hold.ReleaseBranch.String == branch &&
 		hold.ReleaseFinalHeadSha.Valid
+}
+
+// settledByLiveAncestryForCompleted reports whether hold was already released by a LIVE settle
+// (issue #1751 M2, 'live_ancestry') for the identity a COMPLETED-path request names: the
+// same predecessor generation, the same successor generation, the caller as the hold's
+// original worker, and the same source and adopted SHAs. It is the completed path's
+// idempotent acknowledgement for a live settle whose ACK was lost before the run completed.
+// pushed_sha is deliberately NOT compared: the live settle stamped the head the successor had
+// PUBLISHED to its checkpoint ref or branch at settle time, while the completed request's
+// pushed_sha is the successor's FINAL pushed head, which legitimately moved on since. The
+// predecessor's work (source, adopted) is what the hold protects, and that is what must match.
+func settledByLiveAncestryForCompleted(hold store.RecoveryCustodyHold, req apitypes.RecoverySettleRequest, wkr store.Worker) bool {
+	return hold.State == "released" &&
+		hold.ReleaseEvidence.Valid && hold.ReleaseEvidence.String == "live_ancestry" &&
+		hold.Generation == req.PredecessorGeneration &&
+		hold.OriginalWorkerID == wkr.ID &&
+		hold.ReleaseSuccessorGeneration.Valid && hold.ReleaseSuccessorGeneration.Int64 == req.SuccessorGeneration &&
+		hold.ReleaseSourceSha.Valid && hold.ReleaseSourceSha.String == req.SourceSha &&
+		hold.ReleaseAdoptedSha.Valid && hold.ReleaseAdoptedSha.String == req.AdoptedSha &&
+		hold.ReleaseFinalHeadSha.Valid && isSettleSHA(hold.ReleaseFinalHeadSha.String)
 }

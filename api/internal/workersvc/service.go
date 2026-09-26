@@ -555,6 +555,11 @@ type Store interface {
 	// api's own forge proof, re-asserting every run/hold guard so a change mid-proof moves 0 rows.
 	GetCustodyHoldForSettle(ctx context.Context, arg store.GetCustodyHoldForSettleParams) (store.RecoveryCustodyHold, error)
 	ReleasePredecessorCustodyHoldByAncestry(ctx context.Context, arg store.ReleasePredecessorCustodyHoldByAncestryParams) (int64, error)
+	// Issue #1751 M2: the LIVE twin — releases that one older-generation hold with
+	// 'live_ancestry' evidence while the same-worker successor generation is still live,
+	// re-asserting every run/hold guard (live status, claim generation, unreleased claim, the
+	// captured branch and checkpoint derivation inputs) so a change mid-proof moves 0 rows.
+	ReleasePredecessorCustodyHoldByLiveAncestry(ctx context.Context, arg store.ReleasePredecessorCustodyHoldByLiveAncestryParams) (int64, error)
 	// Issue #1582 M1 rework: the server-held facts the settle candidates must match — the
 	// source_sha of every capture under the hold created before the successor generation
 	// claimed, and the head of the completion permit an interlocked run's completion consumed.

@@ -108,3 +108,30 @@ func (g *gitLab) CompareAncestry(ctx context.Context, projectID int64, head, can
 	}
 	return AncestryNotAncestor, nil
 }
+
+// RefHead implements Forge (issue #1751 M2). GET /projects/:id/repository/commits/{ref} → id,
+// with the FULL ref sent as a single URL-encoded path segment (every "/" is %2F), through the
+// same redirect-refusing, bounded, never-retrying read as BranchHead. A 404 (no such ref) is
+// ErrRefNotFound. GitLab's commit object does not echo the ref it resolved, so the answer is
+// bound only by the exact full ref name the request carried.
+func (g *gitLab) RefHead(ctx context.Context, projectID int64, ref string) (string, error) {
+	if err := validateFullRef("gitlab", ref); err != nil {
+		return "", err
+	}
+	path := "/projects/" + strconv.FormatInt(projectID, 10) + "/repository/commits/" + url.PathEscape(ref)
+	status, body, err := g.gitlabGetBounded(ctx, "ref head", path, ancestryBodyLimit)
+	if err != nil {
+		if status == http.StatusNotFound {
+			return "", ErrRefNotFound
+		}
+		return "", err
+	}
+	var c gitlabCommitRef
+	if err := json.Unmarshal(body, &c); err != nil {
+		return "", g.wrapErr("ref head: decode", err)
+	}
+	if c.ID == nil || !isCommitSHA(*c.ID) {
+		return "", errors.New("gitlab: ref head: response carries no 40-hex commit id")
+	}
+	return *c.ID, nil
+}

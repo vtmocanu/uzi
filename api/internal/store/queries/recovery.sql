@@ -404,6 +404,77 @@ WHERE h.id = @hold_id
                  WHERE c.hold_id = h.id AND c.created_at < cutoff.at AND c.source_sha = @source_sha::text)
   );
 
+-- name: ReleasePredecessorCustodyHoldByLiveAncestry :execrows
+-- Issue #1751 M2: release ONE older-generation hold while the successor generation of the SAME
+-- run is still LIVE on the SAME worker, once the api has PROVEN (via the forge, never the
+-- worker's opinion) that the published target the successor pushed, the predecessor's
+-- journaled source and the tip the successor adopted are each an ancestor of (or equal to) the
+-- target's head. The target is the run's forge checkpoint ref (refs/uzi-checkpoints/<branch
+-- derived from kind + run id + issue iid>) or the run branch; release_target names which and
+-- release_branch the branch name the proof resolved. Every guard is re-asserted in this one
+-- statement so a change between the proof and the write moves ZERO rows (the caller then
+-- re-reads and answers state_changed):
+--   * the hold: exact id + run + predecessor generation + owner, taken by the caller worker,
+--     still open, and strictly older than the successor generation;
+--   * the run: same owner, still in a LIVE status (the allowlist below), still at the
+--     successor claim generation, still held by the caller worker with its claim unreleased,
+--     on the SAME runs.branch the service captured before it asked the forge (NULL-safe: a
+--     live issue run has none yet) and, for a checkpoint target, the SAME kind and issue iid
+--     the checkpoint branch was derived from;
+--   * the same server-held capture binding as ReleasePredecessorCustodyHoldByAncestry.
+-- Stamps release_evidence='live_ancestry' with 00251's six audit columns plus release_target
+-- (migration 00255's CHECK refuses a 'live_ancestry' row missing any of them). Nulls both live
+-- FKs like every release. Never touches a sibling hold: the WHERE names exactly one id.
+WITH cutoff AS (
+    SELECT COALESCE(
+        (SELECT min(s.created_at) FROM recovery_custody_holds s
+         WHERE s.run_id = @run_id AND s.generation = @successor_generation::bigint),
+        (SELECT r.claimed_at FROM runs r WHERE r.id = @run_id),
+        'infinity'::timestamptz
+    ) AS at
+)
+UPDATE recovery_custody_holds h
+SET state = 'released',
+    live_worker_id = NULL,
+    live_run_id = NULL,
+    release_evidence = 'live_ancestry',
+    released_at = now(),
+    updated_at = now(),
+    release_pushed_sha = @published_sha::text,
+    release_source_sha = @source_sha::text,
+    release_adopted_sha = @adopted_sha::text,
+    release_final_head_sha = @final_head_sha::text,
+    release_successor_generation = @successor_generation::bigint,
+    release_branch = @proven_branch::text,
+    release_target = @target::text
+WHERE h.id = @hold_id
+  AND h.run_id = @run_id
+  AND h.user_id = @user_id::uuid
+  AND h.generation = @predecessor_generation::bigint
+  AND h.original_worker_id = @worker_id::uuid
+  AND h.state = 'open'
+  AND h.generation < @successor_generation::bigint
+  AND EXISTS (
+      SELECT 1 FROM runs r
+      WHERE r.id = h.run_id
+        AND r.user_id = @user_id::uuid
+        AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+        AND r.claim_generation = @successor_generation::bigint
+        AND r.worker_id = @worker_id::uuid
+        AND r.claim_released_at IS NULL
+        AND r.branch IS NOT DISTINCT FROM sqlc.narg('captured_branch')::text
+        AND (@target::text <> 'checkpoint' OR (
+            r.kind = @kind::text
+            AND r.issue_iid IS NOT DISTINCT FROM sqlc.narg('issue_iid')::bigint
+        ))
+  )
+  AND (
+      NOT EXISTS (SELECT 1 FROM recovery_captures c, cutoff
+                  WHERE c.hold_id = h.id AND c.created_at < cutoff.at)
+      OR EXISTS (SELECT 1 FROM recovery_captures c, cutoff
+                 WHERE c.hold_id = h.id AND c.created_at < cutoff.at AND c.source_sha = @source_sha::text)
+  );
+
 -- name: ListCaptureSourceShasForHold :many
 -- Issue #1582 M1 rework: the source_sha values of the BINDING recovery captures under ONE
 -- hold — the server-held facts the predecessor-settle request's source_sha must match (a

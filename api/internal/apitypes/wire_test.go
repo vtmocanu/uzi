@@ -1195,6 +1195,9 @@ func TestRecoveryWorkerRPCTags(t *testing.T) {
 	// ancestry verdict), every field always on the wire.
 	assertTags(t, "RecoverySettleRequest", RecoverySettleRequest{},
 		"predecessor_generation", "successor_generation", "pushed_sha", "source_sha", "adopted_sha")
+	// Issue #1751 M2: the live settle names the published target too; every field on the wire.
+	assertTags(t, "RecoveryLiveSettleRequest", RecoveryLiveSettleRequest{},
+		"predecessor_generation", "successor_generation", "published_sha", "source_sha", "adopted_sha", "target")
 	// reason (retained only) and final_head_sha (released only) are omitempty.
 	assertTags(t, "RecoverySettleResponse", RecoverySettleResponse{}, "run_id", "hold_id", "outcome")
 	assertTags(t, "RecoverySettleResponse(full)",
@@ -1215,6 +1218,8 @@ func TestRecoverySettleReasonValues(t *testing.T) {
 		RecoverySettleNotEligible:       "not_eligible",
 		RecoverySettleCandidateMismatch: "candidate_mismatch",
 		RecoverySettleBranchMissing:     "branch_missing",
+		RecoverySettleTargetCheckpoint:  "checkpoint",
+		RecoverySettleTargetBranch:      "branch",
 	} {
 		if got != want {
 			t.Errorf("settle wire value = %q, want %q", got, want)

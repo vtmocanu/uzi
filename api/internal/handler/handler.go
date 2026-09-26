@@ -1238,6 +1238,11 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// PROPOSAL_RATE_LIMIT_WINDOW settings: a looping worker cannot burn the owner's forge
 		// budget.
 		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/recovery-holds/{holdID}/settle", h.WorkerSettleRecoveryHold)
+		// Issue #1751 M2: the LIVE twin — settle ONE older-generation hold while the same-worker
+		// successor is still live, proven against the target it published (checkpoint ref or run
+		// branch). Same forge cost per call (one ref/branch-head read plus up to three compares),
+		// so it rides the same per-worker proposal limiter instance, in its own route bucket.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/recovery-holds/{holdID}/settle-live", h.WorkerSettleRecoveryHoldLive)
 	})
 }
 
