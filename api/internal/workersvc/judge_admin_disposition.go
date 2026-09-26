@@ -72,7 +72,8 @@ func (s *Service) AdminMarkDone(ctx context.Context, adminUserID uuid.UUID, item
 	//     COMMITTED (see migrate.go's lock-class docs): at REPEATABLE READ or SERIALIZABLE the tx
 	//     snapshot would be fixed at the lock statement — before the winner commits — and the race
 	//     would reopen.
-	// Residual, deliberately not serialized (the filed==settled design; tracked in #1314): a
+	// Accepted residual, deliberately not serialized (the filed==settled design; #1314 closed not
+	// planned, a two-actor seconds-long window with a recoverable outcome): a
 	// CLAIMED-but-not-yet-SETTLED filing (filed_at still NULL, in the claim→forge→settle window) is
 	// not covered, and an admin 'done' on a genuinely-`todo` coordinate that is filed AFTERWARDS is
 	// not covered either. Every value below comes off the RESOLVED row.
