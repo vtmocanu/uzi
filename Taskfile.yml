@@ -1122,6 +1122,14 @@ tasks:
     cmds:
       - ./scripts/assert-worker-tag-decoupled.sh
 
+  render:openshift-check:
+    desc: assert the OpenShift/OKD chart knobs (HTTPRoute, nullable ids, DNS ports, OVN egress, SCC) render as documented
+    cmds:
+      # Standalone like render:drain-knobs-check: offline (the CNPG subchart is stripped),
+      # needs helm + yq, not wired into gate:repo (the lint job lacks helm). See the script
+      # header and docs/openshift.md.
+      - ./scripts/assert-openshift-render.sh
+
   render:drain-knobs-check:
     desc: assert the controller Deployment renders the drain-deadline + force-roll knobs (PRD 422 M5)
     cmds:

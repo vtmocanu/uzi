@@ -323,3 +323,52 @@ true
 {{- end -}}
 {{- mulf (float64 $num) (get $factors $suffix) -}}
 {{- end -}}
+
+{{- /*
+  uzi.forgeEgressHosts: the worker egress destinations DERIVED from forge.allowedBaseURLs
+  (PRD #808), as a JSON list of {"host": ..., "port": ...}. It is the ONE derivation every
+  FQDN-egress provider consumes (Antrea ANNP, OVN EgressFirewall), so a forge host is
+  declared once and cannot diverge between the api SSRF allowlist and any provider.
+
+  urlParse .hostname gives the bare host (no :port); the port is derived from the URL too
+  (default 443), so a non-standard forge port does NOT diverge from the api, which preserves
+  the port in NormalizeForgeBaseURL.
+
+  Validated fail-CLOSED to mirror the api: NormalizeForgeBaseURL refuses to boot on a
+  scheme-less / hostless entry, so a render that would emit an empty name (match-nothing at
+  best, match-anything at worst) is a hard render failure rather than a malformed rule.
+  Consumers: `fromJsonArray (include "uzi.forgeEgressHosts" .)`.
+*/}}
+{{- define "uzi.forgeEgressHosts" -}}
+{{- $out := list }}
+{{- range .Values.forge.allowedBaseURLs }}
+{{- $u := urlParse . }}
+{{- $host := $u.hostname }}
+{{- if or (not $host) (ne $u.scheme "https") }}
+{{- fail (printf "forge.allowedBaseURLs entry %q must be an absolute https URL with a host, e.g. https://github.com (it feeds both FORGE_ALLOWED_BASE_URLS and the worker egress FQDN list; the api's NormalizeForgeBaseURL rejects the same input at boot)." .) }}
+{{- end }}
+{{- if or (contains ":" $host) (regexMatch "^[0-9]+(\\.[0-9]+)+$" $host) }}
+{{- fail (printf "forge.allowedBaseURLs entry %q resolves to an IP-literal host (%s). FQDN egress rules cannot express an IP address, and the derived port parsing breaks on a bracketed IPv6 literal (splitting the host on ':' yields an invalid port). Configure a DNS hostname, or express an IP-literal forge with an ipBlock-based egress policy instead." . $host) }}
+{{- end }}
+{{- /* urlParse has no .port field; .host carries host[:port], so split it out (default 443). */}}
+{{- $port := "443" }}
+{{- if contains ":" $u.host }}{{- $port = last (splitList ":" $u.host) }}{{- end }}
+{{- $out = append $out (dict "host" $host "port" $port) }}
+{{- end }}
+{{- toJson $out }}
+{{- end }}
+
+{{- /*
+  uzi.validateFQDNEgress: the shared preconditions for every FQDN-egress provider.
+  An empty forge list would leave the api on its built-in default forge while the egress
+  policy allows none, silently blocking clone/fetch on the kube-native tier.
+*/}}
+{{- define "uzi.validateFQDNEgress" -}}
+{{- if not .Values.forge.allowedBaseURLs }}
+{{- fail "workers.fqdnEgress.enabled is true but forge.allowedBaseURLs is empty. The api falls back to its built-in default forge (https://github.com), which this egress policy would NOT allow, silently blocking git clone/fetch on the kube-native worker tier. Set forge.allowedBaseURLs to your forge base URL(s) — it single-sources both FORGE_ALLOWED_BASE_URLS and this egress list." }}
+{{- end }}
+{{- $p := .Values.workers.fqdnEgress.provider | default "antrea" }}
+{{- if not (has $p (list "antrea" "ovn")) }}
+{{- fail (printf "workers.fqdnEgress.provider %q is not supported; use \"antrea\" (crd.antrea.io NetworkPolicy) or \"ovn\" (k8s.ovn.org EgressFirewall + a NetworkPolicy external allow)." $p) }}
+{{- end }}
+{{- end }}

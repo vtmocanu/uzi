@@ -55,10 +55,12 @@ spec:
             matchLabels:
               {{- toYaml .Values.workers.networkPolicy.dns.podSelector | nindent 14 }}
       ports:
+        {{- range .Values.workers.networkPolicy.dns.ports }}
         - protocol: UDP
-          port: 53
+          port: {{ . }}
         - protocol: TCP
-          port: 53
+          port: {{ . }}
+        {{- end }}
     # The api. Also selector-based, and NOT because it is more convenient: an FQDN
     # rule CANNOT work for an in-cluster Service. Antrea's own docs say FQDN policies
     # do not work for Service DNS names created by Kubernetes (except headless ones),

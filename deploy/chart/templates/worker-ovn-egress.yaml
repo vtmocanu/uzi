@@ -1,0 +1,86 @@
+{{- if and .Values.workers.enabled .Values.workers.fqdnEgress.enabled (eq (.Values.workers.fqdnEgress.provider | default "antrea") "ovn") }}
+{{- include "uzi.validateFQDNEgress" . }}
+{{- /*
+  Named egress for the kube-native hosted workers on OVN-Kubernetes (OpenShift/OKD).
+
+  WHY A PAIR, NOT ONE OBJECT. On Antrea the FQDN Allow jumps past the vanilla
+  NetworkPolicy floor (worker-networkpolicy.yaml), so one policy is enough. OVN has no such
+  bypass: an EgressFirewall only FILTERS traffic that NetworkPolicy already admitted, and the
+  floor admits nothing external. So:
+
+    (a) the NetworkPolicy below opens the floor to external addresses ONLY
+        (0.0.0.0/0 minus ovn.exceptCIDRs), so lateral in-cluster, node and link-local
+        traffic stays denied exactly as before, and
+    (b) the EgressFirewall narrows that external set to the named destinations, with a
+        final Deny 0.0.0.0/0.
+
+  Either half alone is wrong: (b) alone blocks every external name (the floor drops the
+  packet first); (a) alone opens the whole internet. They ship together or not at all.
+*/}}
+{{- if not .Values.workers.fqdnEgress.ovn.exceptCIDRs }}
+{{- fail "workers.fqdnEgress.provider is ovn but workers.fqdnEgress.ovn.exceptCIDRs is empty. The external-egress NetworkPolicy would then admit in-cluster pod, service and node addresses too, dissolving the worker floor's lateral isolation. List the pod, service, node and link-local CIDRs." }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "uzi.fullname" . }}-worker-external-egress
+  namespace: {{ .Values.workers.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: uzi-hosted-worker
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- range .Values.workers.fqdnEgress.ovn.exceptCIDRs }}
+              - {{ . }}
+              {{- end }}
+---
+apiVersion: k8s.ovn.org/v1
+kind: EgressFirewall
+metadata:
+  # OVN allows exactly one EgressFirewall per namespace, and it must be named `default`.
+  name: default
+  namespace: {{ .Values.workers.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  # Rules evaluate top to bottom, first match wins. The deny belt goes FIRST for the same
+  # reason as on Antrea: a dnsName Allow admits whatever addresses the name resolved to, so
+  # a hostile answer mapping an allowed name to the metadata address would otherwise open it.
+  egress:
+    {{- range .Values.workers.fqdnEgress.denyCIDRs }}
+    - type: Deny
+      to:
+        cidrSelector: {{ .cidr }}
+    {{- end }}
+    {{- range .Values.workers.fqdnEgress.allowFQDNs }}
+    - type: Allow
+      to:
+        dnsName: {{ .fqdn | quote }}
+      ports:
+        {{- range .ports }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- end }}
+    {{- range fromJsonArray (include "uzi.forgeEgressHosts" .) }}
+    - type: Allow
+      to:
+        dnsName: {{ .host | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ .port }}
+    {{- end }}
+    - type: Deny
+      to:
+        cidrSelector: 0.0.0.0/0
+{{- end }}

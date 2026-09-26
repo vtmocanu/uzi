@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **The Helm chart can run on OpenShift and OKD ([#1755](https://github.com/vtmocanu/uzi/issues/1755)).**
+  New opt-in knobs, all off by default: `web.httpRoute` exposes the web frontend through a Gateway API HTTPRoute instead of the nginx Ingress; pod ids can be nulled so OpenShift assigns them; `workers.networkPolicy.dns.ports` sets the worker DNS port (OpenShift DNS pods use 5353); `workers.fqdnEgress.provider: ovn` renders named worker egress as an OVN EgressFirewall plus an external-only NetworkPolicy; and `openshift.enabled` adds SCC grants for the hosted workers and keeps their PodSecurity labels. See the OpenShift and OKD operator page.
+
 ### Changed
 
 - **The default sweeps no longer all start at 02:00 UTC, and bug triage picks up 4 issues ([#1738](https://github.com/vtmocanu/uzi/pull/1738)).**

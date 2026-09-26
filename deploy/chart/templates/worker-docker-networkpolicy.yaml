@@ -60,10 +60,12 @@ spec:
             matchLabels:
               {{- toYaml .Values.workers.networkPolicy.dns.podSelector | nindent 14 }}
       ports:
+        {{- range .Values.workers.networkPolicy.dns.ports }}
         - protocol: UDP
-          port: 53
+          port: {{ . }}
         - protocol: TCP
-          port: 53
+          port: {{ . }}
+        {{- end }}
     # The api's TLS port, selector-based (an in-cluster Service — the internet rule
     # excludes it). A claim response carries the user's decrypted forge PAT + Anthropic
     # token, so this is the ONE in-cluster service a worker legitimately dials.
