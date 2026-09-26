@@ -40,13 +40,20 @@ case "$action" in
         source_args+=(-v "$CODEX_GIT_TRUST_BIN_DIR/$bin:/usr/local/bin/$bin:ro")
       done
     fi
+    # CODEX_GIT_TRUST_REQUIRE_LANDLOCK (issue #1769 m3 acceptance guard): forwarded verbatim so
+    # the fixture can turn a missing Landlock ABI into a hard FAIL instead of a silent
+    # required-mode skip.
+    landlock_args=()
+    if [ -n "${CODEX_GIT_TRUST_REQUIRE_LANDLOCK:-}" ]; then
+      landlock_args=(-e "CODEX_GIT_TRUST_REQUIRE_LANDLOCK=$CODEX_GIT_TRUST_REQUIRE_LANDLOCK")
+    fi
     set +e
     timeout --kill-after=10s "${CODEX_GIT_TRUST_TIMEOUT:-180}" docker run --rm --network none \
       --cap-drop ALL \
       --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
       --security-opt no-new-privileges --tmpfs /data \
       --entrypoint /usr/local/sbin/uzi-entrypoint \
-      -v "$here:/work/codex-git-trust:ro" "${source_args[@]}" \
+      -v "$here:/work/codex-git-trust:ro" "${source_args[@]}" "${landlock_args[@]}" \
       --name "$name" "$image" /bin/sh -c \
       'cd /app && exec /usr/local/bin/node --import tsx /work/codex-git-trust/fixture.ts'
     rc=$?
