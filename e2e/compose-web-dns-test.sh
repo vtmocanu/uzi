@@ -70,8 +70,8 @@ REST_HOST=127.0.0.1
 REST_TARGET='/api/encoded%2Fpath?key=a%2Fb&twice=1&twice=2'
 WS_TARGET='/api/ws?key=a%2Fb&twice=1'
 FORGED_XFF=203.0.113.99
-WS_KEY='dGhlIHNhbXBsZSBub25jZQ'
-WS_KEY="${WS_KEY}=="
+WS_KEY='dGhlIHNh'
+WS_KEY="${WS_KEY}bXBsZSBub25jZQ=="
 WS_ACCEPT='s3pPLMBiTxaQ9kYGzzhZRbK+xOo='
 b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
 header_value() {
@@ -171,35 +171,44 @@ docker stop "$API" >/dev/null
 docker restart "$FILLER" >/dev/null
 docker start "$API" >/dev/null
 NEW_IP="$(api_ip)"
+API_STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$API")"
 [ -n "$NEW_IP" ] && [ "$OLD_IP" != "$NEW_IP" ] ||
   fail "api address did not change ($OLD_IP -> $NEW_IP); no stale-address proof"
 assert_identity
 # Prove the replacement is serving at its NEW address before a 502 can count as
 # stale proxy routing. Run the probe from the already-owned filler container.
-api_live=0
-live_deadline=$((SECONDS + 10))
-while [ "$SECONDS" -lt "$live_deadline" ]; do
-  if docker exec -e TARGET_IP="$NEW_IP" "$FILLER" node -e '
+api_probe() {
+  [ "$(docker inspect -f '{{.State.Running}} {{.State.StartedAt}}' "$API")" = "true $API_STARTED" ] || return 1
+  docker exec -e TARGET_IP="$NEW_IP" "$FILLER" node -e '
     fetch(`http://${process.env.TARGET_IP}:8080/api/health`, {
       signal: AbortSignal.timeout(4000),
     }).then(r => r.json()).then(body => {
       if (body.marker !== "api") process.exit(1);
     }).catch(() => process.exit(1));
-  ' >/dev/null 2>&1; then api_live=1; break; fi
+  ' >/dev/null 2>&1
+}
+api_live=0
+live_deadline=$((SECONDS + 10))
+while [ "$SECONDS" -lt "$live_deadline" ]; do
+  if api_probe; then api_live=1; break; fi
   sleep 1
 done
 [ "$api_live" = 1 ] || fail "replacement api is not healthy at $NEW_IP"
 
 if [ "$MODE" = --expect-stale ]; then
   sleep 6
+  api_probe || fail "replacement api died before stale REST probe"
   request_rest || fail "red control request timed out in the harness"
+  api_probe || fail "replacement api died during stale REST probe"
   case "$REST_CODE" in
     502) ;;
     200) jq -e '.marker == "filler"' "$SCRATCH/rest.json" >/dev/null ||
       fail "red control reached an unexpected upstream" ;;
     *) fail "red control received unexpected HTTP $REST_CODE" ;;
   esac
+  api_probe || fail "replacement api died before stale WebSocket probe"
   request_ws || fail "red control WebSocket request timed out in the harness"
+  api_probe || fail "replacement api died during stale WebSocket probe"
   if grep -q '^HTTP/1.1 101 ' "$SCRATCH/ws.headers"; then
     [ "$(header_value "$SCRATCH/ws.headers" X-Echo-Marker)" = filler ] ||
       fail "red control WebSocket reached unexpected upstream"
