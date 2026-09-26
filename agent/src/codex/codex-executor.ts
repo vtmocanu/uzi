@@ -24,8 +24,10 @@
 // plan/intent summary hooks, health/interleave sentinels, interactive OWNER park).
 // Issue #1764: the owner pause of PRD #1190 is honoured at the implement loop's TOP (the
 // server-decided boundary: `served.pauseRequested`, or a seeded pause mode at the first
-// boundary) through ctx.parkForPause, as SdkExecutor does. The in-turn `now` path (a
-// PauseNowSignal that aborted a live turn with a non-`wall` mode) still cancels the run.
+// boundary) through ctx.parkForPause, as SdkExecutor does. An owner `now` pause that drops a
+// live turn (a PauseNowSignal abort, or the re-armable ctx.onPauseNow interrupt) is honoured
+// too: in the implement phase through ctx.parkForPause (a declined park re-drives the turn), in
+// the plan phase by throwing a PauseNowSignal the runner parks.
 // It reuses `ctx.gatePlan` for the plan→approval gate exactly like SdkExecutor, but drives
 // turns Codex-specific.
 //
@@ -264,10 +266,59 @@ const REASON_CANCEL = "run cancelled";
 // PRD #1497 M2: a PauseNowSignal abort on ctx.signal trips THIS (not REASON_CANCEL), so the run-lane
 // can tell a pause apart from a cancel. Routed by the wall-park handler: a `wall` pause (the sweep's
 // system-authored wall-clock park, getPauseMode()==='wall') reaches the capture-first wall park. An
-// owner pause is honoured at the implement loop's top boundary (issue #1764); an owner now/milestone
-// pause that ABORTED a live turn still maps to the run cancelling on this in-turn path.
-// Secret-free static string, DISTINCT from REASON_CANCEL/REASON_WALL.
+// owner now/milestone pause that dropped a live turn reaches ctx.parkForPause in the implement phase
+// and a thrown PauseNowSignal in the plan phase (issue #1764); a pause whose mode was withdrawn
+// re-drives the turn. Never a cancel. Secret-free static string, DISTINCT from REASON_CANCEL/REASON_WALL.
 const REASON_PAUSE = "codex run paused";
+
+/** Issue #1764: one handling path's snapshot of the pause-now state, taken before its first await. */
+interface PauseNowToken {
+  /** The interrupt generation the path handles; a newer one stays pending. */
+  readonly seq: number;
+  /** Whether the shared ctx.signal was already aborted with a PauseNowSignal at capture. */
+  readonly sharedPauseAbort: boolean;
+}
+
+/**
+ * Issue #1764: run-scoped state of the owner/wall pause-now interrupt (PRD #1190 rework N2 parity
+ * with sdk-executor's re-armable trip). The shared ctx.signal aborts only once, so every `now`/`wall`
+ * pause after the first reaches this executor only through ctx.onPauseNow, which bumps `seq` and
+ * trips the live turn. A handling path that does not park consumes exactly the generation it
+ * captured; one that arrived during its awaits stays pending and trips the next turn at its start.
+ */
+class CodexPauseNowState {
+  /** Bumped by every ctx.onPauseNow interrupt (steering fires it for `now` and `wall`). */
+  private seq = 0;
+  /** The newest generation a handling path consumed without parking. */
+  private handledSeq = 0;
+  /** True once a PauseNowSignal abort of the shared ctx.signal was handled without parking. */
+  sharedAbortHandled = false;
+  /** The live turn's trip, set by driveCodexTurn for the turn's duration. */
+  activeTurnTrip: ((reason: string) => void) | undefined;
+
+  constructor(private readonly signal: AbortSignal | undefined) {}
+
+  /** The ctx.onPauseNow callback: record a new generation and drop the live turn, if any. */
+  interrupt(): void {
+    this.seq++;
+    this.activeTurnTrip?.(REASON_PAUSE);
+  }
+
+  /** True when an interrupt generation no handling path has consumed is outstanding. */
+  get pending(): boolean {
+    return this.seq > this.handledSeq;
+  }
+
+  capture(): PauseNowToken {
+    return { seq: this.seq, sharedPauseAbort: this.signal?.reason instanceof PauseNowSignal };
+  }
+
+  /** Consume the captured generation (and latch the shared abort it saw) after a non-park outcome. */
+  consume(token: PauseNowToken): void {
+    this.handledSeq = Math.max(this.handledSeq, token.seq);
+    if (token.sharedPauseAbort) this.sharedAbortHandled = true;
+  }
+}
 // The bounded implement/review loop's fail-closed exhaustion reason (secret-free static string),
 // mirroring sdk-executor's REASON_MAX_ITERATIONS: the loop reached its iteration budget without
 // the lead signalling done.
@@ -1436,6 +1487,10 @@ interface EpochSharedContext {
    *  emits a new init lineage, so its resumed-thread delta is summed rather than GREATEST-folded into
    *  this leg. */
   readonly accountant: CodexUsageAccountant;
+  /** Issue #1764: the run's lifecycle signal for epoch startup (the fresh credential release).
+   *  It follows ctx.signal for a genuine cancel/shutdown only: a PauseNowSignal abort spends the
+   *  shared signal permanently, and a declined or refused pause must still mint fresh epochs. */
+  readonly lifecycleSignal: AbortSignal;
 }
 
 /**
@@ -1632,6 +1687,18 @@ export class CodexExecutor implements Executor {
       if (attempted && ctx.enterCompletionHold) await beforeReapingSink();
       return routeCompletionHold(ctx, reason, attempted);
     };
+    // Issue #1764: the re-armable pause-now interrupt, registered ONCE for the whole run (steering's
+    // onPauseNow is last-wins and fires on every `now`/`wall` pause). Each turn installs its own trip.
+    const pauseNow = new CodexPauseNowState(ctx.signal);
+    ctx.onPauseNow?.(() => pauseNow.interrupt());
+    // Issue #1764: the lifecycle signal for epoch startup. It forwards only a genuine (non-pause)
+    // abort of ctx.signal; the listener is removed in the finally below.
+    const lifecycleAbort = new AbortController();
+    const forwardLifecycleAbort = (): void => {
+      if (!(ctx.signal?.reason instanceof PauseNowSignal)) lifecycleAbort.abort(ctx.signal?.reason);
+    };
+    if (ctx.signal?.aborted) forwardLifecycleAbort();
+    else ctx.signal?.addEventListener("abort", forwardLifecycleAbort, { once: true });
     let epochIndex = 0;
     let provisionDir: string | undefined;
     // Issue #1598: the run's ONE command cache (a `--hold-cache` process as the command uid),
@@ -1817,6 +1884,7 @@ export class CodexExecutor implements Executor {
         // One accountant for this executor claim leg. Internal provider epochs share its cumulative;
         // a later worker claim gets a new accountant and a new explicit init lineage.
         accountant: new CodexUsageAccountant(),
+        lifecycleSignal: lifecycleAbort.signal,
       };
 
       // Build the FIRST provider epoch (epoch 0): eager fresh credential release (fail-closed),
@@ -1882,7 +1950,10 @@ export class CodexExecutor implements Executor {
         let fallbackUsed = false;
         // `round` counts clarification rounds only; the prose-only recovery below has its own budget.
         for (let round = 0; ; ) {
-          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink);
+          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow);
+          // Issue #1764: an owner `now` pause dropped the plan turn. The runner's plan-phase catch
+          // parks it (handlePausePark); the finally persists the live plan epoch and tears it down.
+          if (turn.kind === "paused") throw new PauseNowSignal();
           if (turn.kind !== "turn") return turn;
           // Issue #1764: a completed turn proves the home is live and holds newer session state.
           reapedSinceLastPersist = false;
@@ -2033,6 +2104,14 @@ export class CodexExecutor implements Executor {
       // will actually run, so a pause, wall park or completion hold decided at that boundary never
       // launches (and releases a credential for) a provider root it would immediately abandon.
       let epochNeedsRecreate = false;
+      const loopResult = (): ExecutorResult => ({
+        branch: ctx.branch,
+        ...(completionHeld ? { completionHeld } : {}),
+        ...(pausedAt ? { pausedAt } : {}),
+        // Issue #1674 (PRD #265 M1 parity): forward the declared finished-milestone ids on issue
+        // runs only, OMITTED when nothing was declared, as sdk-executor does; runner.ts reads it.
+        ...(isIssueRun && declaredMilestonesCompleted !== undefined ? { milestonesCompleted: declaredMilestonesCompleted } : {}),
+      });
       for (;;) {
         iteration++;
         // Issue #1764 (PRD #1190 rework N2 parity): a cancel that arrived after the shared abort
@@ -2063,6 +2142,8 @@ export class CodexExecutor implements Executor {
             completedCount: served?.completedCount ?? latestProgress?.completed.length ?? 0,
             total: milestones?.length,
           };
+          // Issue #1764: the interrupt generation this boundary handles, captured before any await.
+          const pauseToken = pauseNow.capture();
           if (ctx.pauseModeRequested?.() === "wall") {
             // PRD #1497 M2: a pending `wall` pause (the sweep's wall-clock park, or a re-claim seeded
             // with pause_mode='wall') takes the capture-first wall park, not parkForPause. A
@@ -2071,16 +2152,21 @@ export class CodexExecutor implements Executor {
               completionHeld = { reason: REASON_WALL };
               break;
             }
-            const outcome = await this.parkAtWall(ctx, at, beforeReapingSink);
+            const outcome = await this.parkAtWall(ctx, at, beforeReapingSink, pauseNow, pauseToken);
             if (outcome === "parked") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
             // "refused" (the owner extended; wall mode cleared): re-arm the run-wide wall from the
             // refusal's budget and fall through to the turn. "unwired" (no seam): fall through.
             if (outcome === "refused") {
               refreshWallAfterRefusal(wall, ctx.takeWallParkRefresh?.(), this.deps.redriveAllowanceMs ?? REDRIVE_RACE_ALLOWANCE_MS);
             }
+            pauseNow.consume(pauseToken);
           } else if (await this.requestPause(ctx, at)) {
             pausedAt = at;
             break;
+          } else {
+            // Declined: the run continues. Only the generation seen here is consumed; a `now`
+            // that arrived during the park stays pending and drops the next turn at its start.
+            pauseNow.consume(pauseToken);
           }
         }
         // Issue #1764: an implement turn runs now, so mint the deferred fresh provider epoch (new
@@ -2121,9 +2207,16 @@ export class CodexExecutor implements Executor {
           // Issue #1674 (PRD #1064 parity): each report_progress observation pushes at once and emits
           // its started / reported-complete frames exactly once, diffed from the last known progress.
           const onProgress = makeProgressObserver(ctx, latestProgress, milestones);
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, { completedCount: latestProgress?.completed?.length ?? 0 }, shared.scrubProjected, beforeReapingSink, completionAttempted, onProgress);
+          // Issue #1764: an in-turn owner park reports the server's cumulative count when it served one.
+          const turnAt = { completedCount: served?.completedCount ?? latestProgress?.completed?.length ?? 0, total: milestones?.length };
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, completionAttempted, onProgress);
           if (implTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
           if (implTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: implTurn.reason } };
+          // Issue #1764: an owner `now` pause dropped the turn and ctx.parkForPause parked the run.
+          if (implTurn.kind === "paused") {
+            pausedAt = implTurn.at;
+            return loopResult();
+          }
           result = implTurn.result;
           // Issue #1764: a completed turn proves the home is live and holds newer session state.
           reapedSinceLastPersist = false;
@@ -2234,15 +2327,9 @@ export class CodexExecutor implements Executor {
         await ctx.checkpoint?.({ reap: false, progress: latestProgress });
       }
 
-      return {
-        branch: ctx.branch,
-        ...(completionHeld ? { completionHeld } : {}),
-        ...(pausedAt ? { pausedAt } : {}),
-        // Issue #1674 (PRD #265 M1 parity): forward the declared finished-milestone ids on issue
-        // runs only, OMITTED when nothing was declared, as sdk-executor does; runner.ts reads it.
-        ...(isIssueRun && declaredMilestonesCompleted !== undefined ? { milestonesCompleted: declaredMilestonesCompleted } : {}),
-      };
+      return loopResult();
     } finally {
+      ctx.signal?.removeEventListener("abort", forwardLifecycleAbort);
       // Terminal (m4 F1). Capture the FINAL epoch's credential-free session into the store so a
       // park/preserve resume can adopt it (the runner's runHome lifecycle — preserve on park,
       // remove on terminal — now OWNS store removal; the executor only ever persists, NEVER
@@ -2306,7 +2393,7 @@ export class CodexExecutor implements Executor {
       provider, binding, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
       commandEnv, commandSandbox, screenPolicy, toolHandlers, registerToken, committedGeneration, launchEffectRoot,
       spawnBoundaryRoot, boundaryProcessSpawner, reconcile, onTerminalDispose, accountant, scrubProjected,
-      commandCache,
+      commandCache, lifecycleSignal,
     } = shared;
 
     // Per-epoch trust-boundary REVALIDATION: re-verify the run HOME + codex-data parent's
@@ -2348,7 +2435,7 @@ export class CodexExecutor implements Executor {
       // capability/ownership loss rejects, never degrades to an un-credentialed root). Registered
       // with the redactor + tracked for terminal eviction BEFORE any use; it seeds the app-server
       // login (the token flows over `account/login/start`, NEVER the launcher env).
-      const initialToken = await this.releaseInitialCredential(ctx, registerToken, committedGeneration);
+      const initialToken = await this.releaseInitialCredential(ctx, registerToken, committedGeneration, lifecycleSignal);
 
       // The pinned app-server auth owner is built per epoch on the fresh token (it binds to ONE
       // transport and cannot move — see appserver-auth.ts). Subscription carries the SHARED-cell
@@ -2588,6 +2675,7 @@ export class CodexExecutor implements Executor {
     buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker,
     scrubLeadText: (s: string) => string,
     onProgress: (progress: MilestoneProgress) => void,
+    pauseNow: CodexPauseNowState,
   ): Promise<ReducedTurnResult> {
     const callbackCursor = registry.callbackAdmissionCursor();
     const turnAbort = new AbortController();
@@ -2610,26 +2698,26 @@ export class CodexExecutor implements Executor {
     const onCancel = (): void => trip(reasonFor(ctx.signal));
     if (ctx.signal) {
       if (ctx.signal.aborted) {
-        // PRD #1497 M2 (Fix): ctx.signal is a run-lifetime, once-only controller — a `wall`
-        // PauseNowSignal aborts it PERMANENTLY. Mirror the SDK executor, which reads ctx.signal
-        // ONCE at run start and drives each turn off a FRESH per-turn abort keyed on a CLEARABLE
-        // trip state (sdk-executor.ts: `currentAbort` + `state.tripReason = undefined` on a
-        // refused park). Here each driveCodexTurn already gets a fresh `turnAbort`, but this
-        // synchronous re-read of the already-fired shared signal is the one place a restart
-        // re-trips: after a REFUSED wall park (the owner extended in the request-then-park
-        // window) the loop clears the sticky wall mode (clearWallMode) and RE-DRIVES this turn,
-        // yet ctx.signal stays aborted with its PauseNowSignal reason. That abort has already
-        // been HANDLED, so re-tripping it would cancel a run the owner just kept alive
-        // (REASON_PAUSE with a now-null mode → tryCodexWallPark throws REASON_CANCEL). Suppress
-        // it in exactly that case: a PauseNowSignal abort whose sticky pause mode is gone. A
-        // genuine cancel/shutdown (reason is not a PauseNowSignal) and a still-pending pause
-        // (mode is non-null — an unhandled `wall` request, or an ordinary now/milestone that on
-        // Codex still routes to REASON_CANCEL) both keep tripping, unchanged.
-        const handledWallPause =
-          ctx.signal.reason instanceof PauseNowSignal && ctx.pauseModeRequested?.() == null;
-        if (!handledWallPause) trip(reasonFor(ctx.signal));
+        // PRD #1497 M2 (Fix) / issue #1764: ctx.signal is a run-lifetime, once-only controller — the
+        // first `now`/`wall` PauseNowSignal aborts it PERMANENTLY. Each driveCodexTurn gets a fresh
+        // `turnAbort`, but this synchronous re-read of the already-fired shared signal would re-trip
+        // every restart after the pause was handled without parking (a refused wall park, a declined
+        // owner park, a withdrawn pause). Suppress the stale PauseNowSignal when its mode is gone
+        // (null), or when a PauseNowSignal abort was already handled and the mode is not `wall` (the
+        // sticky `now` a declined park leaves behind). A pending `wall` still re-trips, a genuine
+        // cancel/shutdown (reason is not a PauseNowSignal) always trips, and a NEWER owner/wall
+        // pause arrives as a fresh generation below, never through this spent signal.
+        const mode = ctx.pauseModeRequested?.();
+        const stalePause = ctx.signal.reason instanceof PauseNowSignal &&
+          (mode == null || (pauseNow.sharedAbortHandled && mode !== "wall"));
+        if (!stalePause) trip(reasonFor(ctx.signal));
       } else ctx.signal.addEventListener("abort", onCancel, { once: true });
     }
+    // Issue #1764: a `now`/`wall` interrupt no handling path has consumed yet (one that landed
+    // between turns, or during a park's await) drops this turn at once; the catch routes it by mode.
+    if (pauseNow.pending) trip(REASON_PAUSE);
+    // Issue #1764: every later interrupt trips THIS turn (first-wins), until the finally uninstalls it.
+    pauseNow.activeTurnTrip = trip;
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
     let currentTurnCallbacks = registry.inFlightCallbackCountSince(callbackCursor);
     const armIdle = (): void => {
@@ -2741,6 +2829,7 @@ export class CodexExecutor implements Executor {
       if (wallTimer) clearTimeout(wallTimer);
       wall.remainingMs -= Date.now() - wallArmedAt;
       if (ctx.signal) ctx.signal.removeEventListener("abort", onCancel);
+      if (pauseNow.activeTurnTrip === trip) pauseNow.activeTurnTrip = undefined;
     }
   }
 
@@ -2753,11 +2842,17 @@ export class CodexExecutor implements Executor {
    * The own wall timer's REASON_WALL and a `wall` PauseNowSignal (REASON_PAUSE with
    * getPauseMode()==='wall') route post-attempt to a completion hold first. Before an attempt,
    * or when that hold is refused, they route to ctx.parkForWall through the runner's
-   * captureHoldContext path. Returns the turn's result, a completion hold, or a `walled`
-   * sentinel so phasePublish skips finalize. A REFUSED park (owner extended) re-drives the
-   * SAME turn; an owner pause that aborted the live turn and a cancel throw REASON_CANCEL (the
-   * loop-top boundary, not this in-turn path, honours an owner pause; issue #1764). Idle trips hold after an attempt and otherwise rethrow; other errors
-   * propagate unchanged.
+   * captureHoldContext path. Returns the turn's result, a completion hold, a `walled` sentinel so
+   * phasePublish skips finalize, or `paused`. A REFUSED wall park (owner extended) re-drives the
+   * SAME turn. Idle trips hold after an attempt and otherwise rethrow; other errors propagate
+   * unchanged.
+   *
+   * Issue #1764: an owner now/milestone pause that dropped the turn (REASON_PAUSE, mode not `wall`)
+   * is honoured, never cancelled. In the implement phase it parks through ctx.parkForPause
+   * (`paused` with `at`); a declined park re-drives the same turn. In the plan phase it returns
+   * `paused` at once and the plan loop throws a PauseNowSignal for the runner to park. A pause whose
+   * mode was withdrawn (null) re-drives the turn. A pending cancel wins over every pause. Each
+   * handling path consumes only the interrupt generation it captured before its first await.
    */
   private async driveTurnWithWallPark(
     ctx: RunContext,
@@ -2773,13 +2868,19 @@ export class CodexExecutor implements Executor {
     at: { completedCount: number; total?: number },
     scrubLeadText: (s: string) => string,
     beforeReapingSink: () => Promise<void>,
+    pauseNow: CodexPauseNowState,
     completionAttempted = false,
     onProgress: (progress: MilestoneProgress) => void = forwardProgress(ctx),
-  ): Promise<{ kind: "turn"; result: ReducedTurnResult } | { kind: "walled" } | { kind: "held"; reason: string }> {
+  ): Promise<
+    | { kind: "turn"; result: ReducedTurnResult }
+    | { kind: "walled" }
+    | { kind: "held"; reason: string }
+    | { kind: "paused"; at: { completedCount: number; total?: number } }
+  > {
     for (;;) {
       try {
         const result = await this.driveCodexTurn(
-          ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, scrubLeadText, onProgress,
+          ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, scrubLeadText, onProgress, pauseNow,
         );
         // PRD #1497 M2 (CodeRabbit !1504): honor a sticky owner cancel that RACED a REFUSED
         // wall-park re-drive in EVERY phase. The wall PauseNowSignal permanently spent the shared
@@ -2789,16 +2890,40 @@ export class CodexExecutor implements Executor {
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
         return { kind: "turn", result };
       } catch (err) {
+        // Issue #1764: the interrupt generation this path handles, captured before any await; a
+        // newer `now`/`wall` that lands during an await below stays pending for the re-drive.
+        const pauseToken = pauseNow.capture();
         const msg = err instanceof Error ? err.message : "";
-        const wallTrip = msg === REASON_WALL ||
-          (msg === REASON_PAUSE && ctx.pauseModeRequested?.() === "wall");
+        const mode = ctx.pauseModeRequested?.();
+        // A pending cancel wins over a pause of either kind.
+        if (msg === REASON_PAUSE && ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+        if (msg === REASON_PAUSE && mode == null) {
+          // Issue #1764: the pause was withdrawn (pause_cancel) before it was handled: never park,
+          // never cancel. Consume it and re-drive the turn.
+          pauseNow.consume(pauseToken);
+          continue;
+        }
+        if (msg === REASON_PAUSE && mode !== "wall") {
+          // Issue #1764: an owner now/milestone pause dropped the live turn. The plan phase has no
+          // in-executor park: the plan loop hands it to the runner as a PauseNowSignal.
+          if (phase === "plan") return { kind: "paused", at };
+          // parkForPause does not reap the provider root (handlePausePark), so no persist first.
+          if (await this.requestPause(ctx, at)) return { kind: "paused", at };
+          // Declined (the checkpoint could not be published): the run continues on the same turn.
+          pauseNow.consume(pauseToken);
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+          continue;
+        }
+        const wallTrip = msg === REASON_WALL || msg === REASON_PAUSE;
         if (completionAttempted && (wallTrip || msg === REASON_IDLE)) {
           const reason = wallTrip ? REASON_WALL : REASON_IDLE;
           // Issue #1764: the hold's capture reaps the live provider root; persist first.
           if (ctx.enterCompletionHold) await beforeReapingSink();
           if (await routeCompletionHold(ctx, reason, true)) return { kind: "held", reason };
         }
-        const outcome = await this.tryCodexWallPark(ctx, err, at, beforeReapingSink);
+        // Not a wall trip: legacy propagation.
+        if (!wallTrip) throw err;
+        const outcome = await this.parkAtWall(ctx, at, beforeReapingSink, pauseNow, pauseToken);
         if (outcome === "parked") return { kind: "walled" };
         if (outcome === "refused") {
           // The owner extended: re-drive the turn. It skips reportIteration, so re-arm the run-wide
@@ -2806,54 +2931,25 @@ export class CodexExecutor implements Executor {
           refreshWallAfterRefusal(wall, ctx.takeWallParkRefresh?.(), this.deps.redriveAllowanceMs ?? REDRIVE_RACE_ALLOWANCE_MS);
           continue;
         }
-        throw err; // "rethrow": not a wall trip (or no seam wired) — legacy propagation
+        throw err; // "unwired": no seam wired (stub/test) — legacy propagation of the wall trip
       }
     }
   }
 
   /**
-   * PRD #1497 M2: classify a Codex turn error against the wall park. Returns "parked" when the run
-   * parked at its wall-clock limit (a verified or degraded capture the server ACKed `paused`, or an
-   * undeliverable report that ends the flight non-terminal keeping the work, D17), "refused" when the
-   * owner extended in the window (the caller re-drives the turn), or "rethrow" when the error is not a
-   * wall trip (or no parkForWall seam is wired — the stub/test executors fall back to legacy
-   * propagation). Throws REASON_CANCEL for a cancelled run and for an owner now/milestone pause
-   * that aborted the live turn (the in-turn path keeps today's behaviour: the run cancels; the
-   * loop-top boundary is where an owner pause is honoured, issue #1764).
-   */
-  private async tryCodexWallPark(
-    ctx: RunContext,
-    err: unknown,
-    at: { completedCount: number; total?: number },
-    beforeReapingSink: () => Promise<void>,
-  ): Promise<"parked" | "refused" | "rethrow"> {
-    const msg = err instanceof Error ? err.message : "";
-    const mode = ctx.pauseModeRequested?.();
-    const isWallTimer = msg === REASON_WALL;
-    const isWallPause = msg === REASON_PAUSE && mode === "wall";
-    if (msg === REASON_PAUSE && mode !== "wall") {
-      // An owner now/milestone pause aborted the live turn on a Codex run. This in-turn path keeps
-      // today's behaviour (the run cancels); the loop-top boundary honours an owner pause (#1764).
-      throw new Error(REASON_CANCEL);
-    }
-    if (!isWallTimer && !isWallPause) return "rethrow";
-    const outcome = await this.parkAtWall(ctx, at, beforeReapingSink);
-    // "unwired": no seam wired (stub/test) — fall back to legacy propagation of the wall trip.
-    return outcome === "unwired" ? "rethrow" : outcome;
-  }
-
-  /**
    * PRD #1497 M2: request the capture-first wall park through ctx.parkForWall and classify its
-   * outcome. Shared by the in-turn wall trip ({@link tryCodexWallPark}) and the loop-top pending
+   * outcome. Shared by the in-turn wall trip ({@link driveTurnWithWallPark}) and the loop-top pending
    * `wall` pause (issue #1764). Returns "parked" for a durable or undeliverable park (D17),
-   * "refused" when the owner extended (the sticky wall mode is cleared; the caller continues), or
-   * "unwired" when no seam is wired. Throws REASON_CANCEL for a cancelled park and for a sticky
-   * cancel that raced a refused park.
+   * "refused" when the owner extended (the sticky wall mode is cleared and `pauseToken`'s interrupt
+   * generation consumed; the caller continues), or "unwired" when no seam is wired. Throws
+   * REASON_CANCEL for a cancelled park and for a sticky cancel that raced a refused park.
    */
   private async parkAtWall(
     ctx: RunContext,
     at: { completedCount: number; total?: number },
     beforeReapingSink: () => Promise<void>,
+    pauseNow: CodexPauseNowState,
+    pauseToken: PauseNowToken,
   ): Promise<"parked" | "refused" | "unwired"> {
     if (!ctx.parkForWall) return "unwired";
     // Issue #1764: the wall park's capture reaps the live provider root, so persist its session
@@ -2867,7 +2963,7 @@ export class CodexExecutor implements Executor {
       // park BEFORE re-driving the turn. A `wall` PauseNowSignal aborted the SHARED, once-only
       // ctx.signal permanently; a `cancel` that arrives during parkForWall's round-trip therefore
       // finds the signal already aborted, so route('cancel')'s abort() is a no-op and it only sets the
-      // sticky `cancelled` flag (steering). Without this re-check the refused re-drive's handledWallPause
+      // sticky `cancelled` flag (steering). Without this re-check the refused re-drive's stale-pause
       // suppression (driveCodexTurn) would CONTINUE the turn and the sticky cancel would be silently
       // dropped — the run completing instead of cancelling. Mirror the SDK executor's loop-top
       // ctx.cancelRequested re-check (sdk-executor.ts, the "cancel after a declined park" case): a
@@ -2875,7 +2971,11 @@ export class CodexExecutor implements Executor {
       // refusal (no cancel pending ⇒ ctx.cancelRequested?.() is falsy/undefined) still continues,
       // preserving the c4c4c1f6 refused-restart fix and never over-cancelling.
       if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+      // Issue #1764: clear the wall mode and consume the handled wall generation together, so it
+      // can never trip the re-driven turn with a null mode. A newer owner `now` that landed during
+      // the park keeps its mode (clearWallMode clears only `wall`) and its pending generation.
       ctx.clearWallMode?.();
+      pauseNow.consume(pauseToken);
       return "refused";
     }
     return "unwired";
@@ -2916,12 +3016,15 @@ export class CodexExecutor implements Executor {
    * registered with the redactor (via `registerToken`) before it is used to seed the app-server
    * login credential. For subscription the minimum-generation floor is the SHARED committed cell
    * (a during-run refresh may have advanced it past the binding's initial generation), falling back
-   * to the binding's generation when the cell is unset.
+   * to the binding's generation when the cell is unset. `signal` is the run's lifecycle signal
+   * (issue #1764), not ctx.signal: a PauseNowSignal spends ctx.signal for the rest of the run, and a
+   * declined/refused pause still needs fresh epochs.
    */
   private async releaseInitialCredential(
     ctx: RunContext,
     registerToken: (token: string) => void,
     committed: CodexCommittedGenerationCell,
+    signal: AbortSignal,
   ): Promise<string> {
     const binding = this.opts.binding;
     const expected = binding.authMode === "subscription"
@@ -2935,7 +3038,7 @@ export class CodexExecutor implements Executor {
       ctx.runId,
       { capability: binding.capability },
       expected,
-      ctx.signal,
+      signal,
     );
     registerToken(released.access_token); // BEFORE any use
     return released.access_token;

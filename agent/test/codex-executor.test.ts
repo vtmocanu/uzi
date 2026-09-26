@@ -923,8 +923,8 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
 // PRD #1497 M2 — the Codex harness parks at the wall (D2). onCancel reads ctx.signal.reason: a
 // PauseNowSignal trips REASON_PAUSE (not REASON_CANCEL). A `wall` PauseNowSignal (getPauseMode()
 // === 'wall') and the own wall timer's REASON_WALL both route to the capture-first wall park
-// (ctx.parkForWall). An ordinary owner now/milestone pause on a Codex run keeps today's behaviour
-// (the run cancels — Codex owner-pause is out of scope, PRD #1190). Before a recorded
+// (ctx.parkForWall). An ordinary owner now/milestone pause parks through ctx.parkForPause instead
+// (issue #1764, PRD #1190 parity), never the wall seam. Before a recorded
 // completion attempt wall trips park; afterward they first route to the completion hold.
 // Tests cover both wall trips in the plan and implement turns.
 describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
@@ -971,17 +971,27 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
     assert.equal(spies.parkForWallCalls, 1, "the `wall` pause reached the wall park");
   });
 
-  it("(implement) an ordinary `now` pause does NOT route to the wall seam (Codex owner-pause is out of scope — the run cancels)", async () => {
+  it("(implement, T3) an ordinary `now` pause parks through parkForPause, never the wall seam, and never cancels", async () => {
     const controller = new AbortController();
     const rig = makeRig();
-    rig.transport.push(threadStarted());
-    const { ctx, spies } = wallCtx({ signal: controller.signal });
-    spies.mode = "now"; // an ordinary owner pause, NOT a wall park
+    rig.transport.push(threadStarted()); // the turn is in progress; the `now` pause drops it
+    const parks: { completedCount: number; total?: number }[] = [];
+    const { ctx, spies } = wallCtx({
+      signal: controller.signal,
+      parkForPause: async (at) => { parks.push(at); return true; },
+    });
     const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
-    await tick();
+    await waitFor(() => rig.transport.turnStartCount >= 1, "implement turn started");
+    // Issue #1764: the owner `now` lands WITH the abort (a mode pending before the loop top would
+    // park there instead, before any turn).
+    spies.mode = "now";
     controller.abort(new PauseNowSignal());
-    await assert.rejects(withTimeout(running, 3000, "codex now pause"), /run cancelled/);
+    const result = await withTimeout(running, 3000, "codex now pause");
+    assert.ok(result.pausedAt, "the run parked, so the runner skips finalize");
+    assert.equal(result.pausedAt?.completedCount, 0);
+    assert.equal(parks.length, 1, "the in-turn `now` reached parkForPause once");
     assert.equal(spies.parkForWallCalls, 0, "an ordinary now pause NEVER reaches the wall seam on a Codex run");
+    assert.equal(result.walled, undefined);
   });
 
   it("(implement) a local REASON_WALL (the own wall timer) reaches the wall park", async () => {
@@ -1112,10 +1122,10 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
   // round-trip, route('cancel') finds the signal already aborted so its abort() is a no-op and only
   // the sticky `cancelled` flag is set (steering.isCancelled → ctx.cancelRequested). Before the fix,
   // parkForWall answering "refused" cleared the sticky wall mode and RE-DROVE the turn; the re-drive's
-  // handledWallPause suppression continued it and NEVER re-checked the sticky cancel, so the run
+  // stale-pause suppression continued it and NEVER re-checked the sticky cancel, so the run
   // completed normally instead of cancelling. The SDK executor handles the analogous "cancel after a
   // declined park" with a loop-top ctx.cancelRequested re-check (sdk-executor.ts); Codex now mirrors
-  // it with a pre-redrive re-check in tryCodexWallPark's refused branch. Cancel WINS over the extend.
+  // it with a pre-redrive re-check in parkAtWall's refused branch. Cancel WINS over the extend.
   // Verified this REDDENS without the fix: removing the `if (ctx.cancelRequested?.()) throw` re-check
   // makes the run re-drive turn 2 to a normal `signal_done` completion (branch agent/issue-42) and
   // this assertion.rejects(/run cancelled/) fails.
@@ -1159,10 +1169,10 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
   });
 
   // PRD #1497 M2 (CodeRabbit !1504) — the SIBLING race: a genuine owner `cancel` that lands DURING the
-  // refused RE-DRIVE (after the pre-redrive check already passed), not before it. tryCodexWallPark's
+  // refused RE-DRIVE (after the pre-redrive check already passed), not before it. parkAtWall's
   // refused branch re-checks the sticky cancel only BEFORE re-driving; the `wall` pause already aborted
   // the SHARED, once-only ctx.signal PERMANENTLY, so a cancel arriving while turn 2 runs cannot abort it
-  // (driveCodexTurn's handledWallPause suppression continues it). If turn 2 then returns `done`, the
+  // (driveCodexTurn's stale-pause suppression continues it). If turn 2 then returns `done`, the
   // implement loop's `if (result.done) break` would complete the run and DROP the cancel. The implement
   // loop's post-redrive ctx.cancelRequested re-check honors it — cancel WINS over the completed re-drive.
   // Verified this REDDENS without the fix: turn 2 re-drives to a normal signal_done completion (branch
@@ -1194,7 +1204,7 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
         spies.clearWallModeCalls++;
         spies.mode = null;
       },
-      // REFUSED with NO cancel pending yet, so the pre-redrive check in tryCodexWallPark passes and the
+      // REFUSED with NO cancel pending yet, so the pre-redrive check in parkAtWall passes and the
       // turn re-drives — the cancel only lands once turn 2 is running (see the responder above).
       parkForWall: async () => {
         spies.parkForWallCalls++;
@@ -7152,5 +7162,350 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
     await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "loop-top cancel"), /run cancelled/);
     assert.equal(rig.providerLaunches(), 1, "no fresh epoch was launched for a cancelled run");
     assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+  });
+});
+
+// ================================================================================
+// Issue #1764 M2 — `uzi run pause --now` on Codex. An owner `now` pause that drops a live turn
+// parks through ctx.parkForPause (implement) or rejects with a PauseNowSignal the runner parks
+// (plan), never cancels. The interrupt is generation-counted and re-armable (ctx.onPauseNow), a
+// stale shared PauseNowSignal abort never re-trips a restarted turn, and epoch startup releases
+// its credential on a lifecycle signal a pause cannot spend.
+describe("CodexExecutor: in-turn pause-now (issue #1764 M2)", () => {
+  type At = { completedCount: number; total?: number };
+  type Mode = "milestone" | "now" | "wall" | null;
+
+  // A steering fake mirroring steering.route: `pause` sets the sticky mode, aborts the shared
+  // controller once with a PauseNowSignal, then fires the (last-wins) onPauseNow interrupt; `cancel`
+  // aborts it only if still live and sets the sticky flag; clearWallMode clears only `wall`.
+  function pauseSteering(overrides: Partial<RunContext> = {}): {
+    ctx: RunContext;
+    emitted: EmittedMessage[];
+    st: { mode: Mode; cancelled: boolean; cb: (() => void) | undefined };
+    controller: AbortController;
+    pause: (mode: "now" | "wall", opts?: { abort?: boolean }) => void;
+  } {
+    const controller = new AbortController();
+    const st = { mode: null as Mode, cancelled: false, cb: undefined as (() => void) | undefined };
+    const pause = (mode: "now" | "wall", opts: { abort?: boolean } = {}): void => {
+      st.mode = mode;
+      if (opts.abort !== false && !controller.signal.aborted) controller.abort(new PauseNowSignal());
+      st.cb?.();
+    };
+    const { ctx, emitted } = makeCtx({
+      signal: controller.signal,
+      pauseModeRequested: () => st.mode,
+      cancelRequested: () => st.cancelled,
+      onPauseNow: (cb) => { st.cb = cb; },
+      clearWallMode: () => { if (st.mode === "wall") st.mode = null; },
+      ...overrides,
+    });
+    return { ctx, emitted, st, controller, pause };
+  }
+
+  // A single-epoch responder: the first `quiet` turns go quiet (a pause drops them); every later
+  // turn completes with signal_done. All turns reuse turn id tn-1 so the frames route to it.
+  function quietThenDone(quiet: number): Responder {
+    return (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount <= quiet) c.transport.push(threadStarted());
+        else c.transport.push(signalDone()).push(turnCompleted("completed"));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    };
+  }
+
+  function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
+    let resolve!: (v: T) => void;
+    const promise = new Promise<T>((r) => { resolve = r; });
+    return { promise, resolve };
+  }
+
+  it("(T4) a declined `now` re-drives without a stale re-trip; a later onPauseNow drops the restarted turn and parks", async () => {
+    const rig = makeRig({ responder: quietThenDone(Number.MAX_SAFE_INTEGER) });
+    const parks: At[] = [];
+    const { ctx, pause } = pauseSteering({
+      parkForPause: async (at) => { parks.push(at); return parks.length > 1; },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount >= 1, "turn 1 started");
+    pause("now");
+    await waitFor(() => rig.transport.turnStartCount >= 2, "the declined park re-drove the turn");
+    await tick();
+    assert.equal(parks.length, 1, "the re-driven turn was NOT re-tripped by the spent shared signal");
+    pause("now"); // a second `--now`: the shared signal is spent, only the interrupt reaches the turn
+    const result = await withTimeout(running, 3000, "second now parks");
+    assert.equal(parks.length, 2, "the second `now` dropped the restarted turn and parked");
+    assert.ok(result.pausedAt, "the run parked");
+    assert.equal(rig.transport.turnStartCount, 2);
+  });
+
+  it("(T5) a second `now` that lands while the first park is awaiting trips the restarted turn at its start", async () => {
+    const rig = makeRig({ responder: quietThenDone(Number.MAX_SAFE_INTEGER) });
+    const first = deferred<boolean>();
+    const parks: At[] = [];
+    const { ctx, pause } = pauseSteering({
+      parkForPause: async (at) => {
+        parks.push(at);
+        return parks.length === 1 ? first.promise : true;
+      },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount >= 1, "turn 1 started");
+    pause("now");
+    await waitFor(() => parks.length === 1, "the first park is awaiting");
+    pause("now"); // no live turn: the interrupt only records a new generation
+    first.resolve(false);
+    const result = await withTimeout(running, 3000, "pending second now parks");
+    assert.equal(parks.length, 2, "the pending generation dropped the restarted turn and parked again");
+    assert.ok(result.pausedAt);
+    assert.equal(rig.transport.turnStartCount, 1, "the restarted turn tripped at its start, before any turn/start");
+  });
+
+  it("(T9) after a declined `now`, a checkpoint mints a fresh epoch on an un-aborted lifecycle signal and the run completes", async () => {
+    const rig = makeMultiEpochRig([
+      (c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          c.transport.push(threadStarted("th-1"));
+          // Turn 1 goes quiet (the `now` drops it); the re-drive checkpoints cooperatively.
+          if (c.turnStartCount > 1) c.transport.push(toolCall(1, "checkpoint", {}, "th-1", "tn-1", "c-ckpt")).push(turnCompleted("completed"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      },
+      resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push(toolCall(3, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const signals: (AbortSignal | undefined)[] = [];
+    (rig.client as unknown as { releaseCodex: unknown }).releaseCodex = async (_runId: string, _req: unknown, _exp: unknown, signal?: AbortSignal) => {
+      signals.push(signal);
+      return { access_token: FRESH_TOKEN };
+    };
+    const parks: At[] = [];
+    const { ctx, pause, controller } = pauseSteering({
+      checkpoint: async () => undefined,
+      parkForPause: async (at) => { parks.push(at); return false; },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.epochs[0]!.transport.turnStartCount >= 1, "turn 1 started");
+    pause("now");
+    const result = await withTimeout(running, 3000, "declined now then checkpoint");
+    assert.equal(parks.length, 1);
+    assert.equal(result.pausedAt, undefined);
+    assert.equal(result.branch, "agent/issue-42");
+    assert.equal(controller.signal.aborted, true, "the shared signal stays spent by the PauseNowSignal");
+    assert.equal(rig.providerLaunches(), 2, "the checkpoint minted a fresh epoch");
+    assert.equal(signals.length, 2, "each epoch released a fresh credential");
+    assert.equal(signals[1]?.aborted, false, "the fresh epoch's release signal is not the spent shared signal");
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 1, "a further implement turn ran on the fresh epoch");
+  });
+
+  it("(T9 cancel) a genuine cancel after a declined `now` and a fresh epoch still ends the run as cancelled", async () => {
+    let cancelNow = (): void => undefined;
+    const rig = makeMultiEpochRig([
+      (c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          c.transport.push(threadStarted("th-1"));
+          if (c.turnStartCount > 1) c.transport.push(toolCall(1, "checkpoint", {}, "th-1", "tn-1", "c-ckpt")).push(turnCompleted("completed"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      },
+      (c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          cancelNow(); // the owner cancels while the fresh epoch's turn runs
+          c.transport.push(toolCall(3, "signal_done", {}, "th-1", "tn-2", "c-done")).push(turnCompleted("completed", "th-1", "tn-2"));
+          return { turn: { id: "tn-2" } };
+        }
+        return {};
+      },
+    ]);
+    const { ctx, pause, st, controller } = pauseSteering({
+      checkpoint: async () => undefined,
+      parkForPause: async () => false,
+    });
+    cancelNow = () => {
+      if (!controller.signal.aborted) controller.abort();
+      st.cancelled = true;
+    };
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.epochs[0]!.transport.turnStartCount >= 1, "turn 1 started");
+    pause("now");
+    await assert.rejects(withTimeout(running, 3000, "cancel after fresh epoch"), /run cancelled/);
+    assert.equal(rig.providerLaunches(), 2, "the cancel landed on the fresh epoch's turn");
+  });
+
+  it("(T9 lifecycle) a ctx.signal already aborted by a genuine cancel aborts the release signal; a PauseNowSignal does not", async () => {
+    for (const [reason, expectAborted] of [[new Error("shutdown"), true], [new PauseNowSignal(), false]] as const) {
+      const rig = makeRig();
+      rig.transport.push(threadStarted());
+      const signals: (AbortSignal | undefined)[] = [];
+      (rig.client as unknown as { releaseCodex: unknown }).releaseCodex = async (_runId: string, _req: unknown, _exp: unknown, signal?: AbortSignal) => {
+        signals.push(signal);
+        return { access_token: FRESH_TOKEN };
+      };
+      const controller = new AbortController();
+      controller.abort(reason);
+      const { ctx } = makeCtx({
+        signal: controller.signal,
+        // A pause mode withdrawn before the run: the stale PauseNowSignal is suppressed at turn start.
+        pauseModeRequested: () => null,
+      });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      if (expectAborted) {
+        await assert.rejects(withTimeout(running, 3000, "pre-aborted cancel"), /run cancelled/);
+      } else {
+        await waitFor(() => rig.transport.turnStartCount >= 1, "the turn started despite the stale pause abort");
+        rig.transport.push(signalDone()).push(turnCompleted("completed"));
+        await withTimeout(running, 3000, "pre-aborted pause");
+      }
+      assert.equal(signals.length, 1);
+      assert.equal(signals[0]?.aborted, expectAborted, `release signal for a pre-aborted ${reason.name}`);
+    }
+  });
+
+  it("(T10) a plan-phase `now` rejects with a PauseNowSignal for the runner to park; the plan epoch is persisted and torn down", async () => {
+    const rig = makeRig({ responder: quietThenDone(Number.MAX_SAFE_INTEGER) });
+    let pauseParks = 0;
+    let gates = 0;
+    const { ctx, pause } = pauseSteering({
+      planApproved: false,
+      approvedPlan: undefined,
+      gatePlan: async () => { gates++; return { kind: "approve", selection: { status: "absent" } }; },
+      parkForPause: async () => { pauseParks++; return true; },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount >= 1, "plan turn started");
+    pause("now");
+    const err = await withTimeout(running.then(() => undefined, (e: unknown) => e), 3000, "plan now");
+    assert.ok(err instanceof PauseNowSignal, `run() rejects with a PauseNowSignal, got ${String(err)}`);
+    assert.equal(pauseParks, 0, "the plan phase leaves the park to the runner's PauseNowSignal catch");
+    assert.equal(gates, 0);
+    assert.equal(rig.sessionOps.persist, 1, "the live plan epoch's session was persisted by the finally");
+    assert.ok(rig.disposed() >= 1, "the plan epoch was torn down");
+  });
+
+  it("(T14) an in-turn `wall` pause still reaches parkForWall and never parkForPause", async () => {
+    const rig = makeRig({ responder: quietThenDone(Number.MAX_SAFE_INTEGER) });
+    let wallParks = 0;
+    let pauseParks = 0;
+    const { ctx, pause } = pauseSteering({
+      parkForWall: async () => { wallParks++; return "parked"; },
+      parkForPause: async () => { pauseParks++; return true; },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount >= 1, "turn started");
+    pause("wall");
+    const result = await withTimeout(running, 3000, "in-turn wall");
+    assert.deepEqual(result.walled, { reason: "codex run wall-clock timeout" });
+    assert.equal(wallParks, 1);
+    assert.equal(pauseParks, 0);
+  });
+
+  it("(T14) a post-attempt in-turn `wall` pause still routes to the completion hold first", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "signal_done", { milestones_completed: ["m1"] }, th, tn, "done-1")).push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-1", "tn-2", () => undefined), // the rework turn goes quiet
+    ]);
+    let wallParks = 0;
+    let pauseParks = 0;
+    const holds: string[] = [];
+    const { ctx, pause } = pauseSteering({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 3 },
+      checkpoint: async () => undefined,
+      recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: 1 }),
+      enterCompletionHold: async (reason) => { holds.push(reason); return true; },
+      parkForWall: async () => { wallParks++; return "parked"; },
+      parkForPause: async () => { pauseParks++; return true; },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.epochs[1]?.transport.turnStartCount === 1, "rework turn started");
+    pause("wall");
+    const result = await withTimeout(running, 3000, "post-attempt wall hold");
+    assert.deepEqual(result.completionHeld, { reason: "codex run wall-clock timeout" });
+    assert.deepEqual(holds, ["codex run wall-clock timeout"]);
+    assert.equal(wallParks, 0);
+    assert.equal(pauseParks, 0);
+  });
+
+  it("(T14) a cancel that lands during a declined `now` park ends the run as cancelled", async () => {
+    const rig = makeRig({ responder: quietThenDone(Number.MAX_SAFE_INTEGER) });
+    const { ctx, pause, st } = pauseSteering({
+      // The shared signal is spent by the `now`, so the cancel only sets the sticky flag.
+      parkForPause: async () => { st.cancelled = true; return false; },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount >= 1, "turn started");
+    pause("now");
+    await assert.rejects(withTimeout(running, 3000, "cancel after declined now"), /run cancelled/);
+    assert.equal(rig.transport.turnStartCount, 1, "the turn was not re-driven");
+  });
+
+  it("(T15) a callback-driven `wall` pause whose park is refused re-drives the turn to completion, never parkForPause", async () => {
+    const rig = makeRig({ responder: quietThenDone(1) });
+    let wallParks = 0;
+    let pauseParks = 0;
+    const { ctx, pause, st } = pauseSteering({
+      parkForWall: async () => { wallParks++; return "refused"; },
+      parkForPause: async () => { pauseParks++; return true; },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount >= 1, "turn 1 started");
+    pause("wall", { abort: false }); // only the re-armable interrupt reaches the turn
+    const result = await withTimeout(running, 3000, "refused callback wall");
+    assert.equal(result.walled, undefined);
+    assert.equal(result.pausedAt, undefined);
+    assert.equal(result.branch, "agent/issue-42");
+    assert.equal(wallParks, 1);
+    assert.equal(pauseParks, 0, "the consumed wall generation never misroutes to parkForPause");
+    assert.equal(st.mode, null, "the refused park cleared the wall mode");
+    assert.equal(rig.transport.turnStartCount, 2, "the turn re-drove once and completed");
+  });
+
+  it("(T16) an owner `now` that lands during a refused `wall` park is routed to parkForPause and parks", async () => {
+    const rig = makeRig({ responder: quietThenDone(Number.MAX_SAFE_INTEGER) });
+    const wallPark = deferred<WallParkOutcome>();
+    let wallParks = 0;
+    const parks: At[] = [];
+    const { ctx, pause } = pauseSteering({
+      parkForWall: async () => { wallParks++; return wallPark.promise; },
+      parkForPause: async (at) => { parks.push(at); return true; },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount >= 1, "turn started");
+    pause("wall");
+    await waitFor(() => wallParks === 1, "the wall park is awaiting");
+    pause("now"); // a newer owner `--now` during the wall park's await
+    wallPark.resolve("refused");
+    const result = await withTimeout(running, 3000, "now during refused wall");
+    assert.equal(parks.length, 1, "the pending owner generation reached parkForPause");
+    assert.ok(result.pausedAt, "the run parked");
+    assert.equal(result.walled, undefined);
+    assert.equal(rig.transport.turnStartCount, 1, "the re-drive tripped at its start");
+  });
+
+  it("a `now` trip whose mode was withdrawn re-drives the turn: no park, no cancel", async () => {
+    const rig = makeRig({ responder: quietThenDone(1) });
+    let pauseParks = 0;
+    const { ctx, pause, st } = pauseSteering({
+      parkForPause: async () => { pauseParks++; return true; },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount >= 1, "turn 1 started");
+    pause("now");
+    st.mode = null; // a pause_cancel withdraws it before the dropped turn is handled
+    const result = await withTimeout(running, 3000, "withdrawn now");
+    assert.equal(pauseParks, 0);
+    assert.equal(result.pausedAt, undefined);
+    assert.equal(result.branch, "agent/issue-42");
+    assert.equal(rig.transport.turnStartCount, 2, "the turn re-drove and completed");
   });
 });
