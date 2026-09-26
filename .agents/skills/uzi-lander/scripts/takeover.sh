@@ -32,6 +32,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/greptile-verdict.sh
 . "$HERE/lib/greptile-verdict.sh"
+# shellcheck source=lib/review-threads.sh
+. "$HERE/lib/review-threads.sh"
 TARGET=""; REPO=""; CLAIM=1
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -205,7 +207,13 @@ echo "GREPTILE=$gr_state${gr_concl:+/$gr_concl}"; [ -n "$gr_via" ] && echo "GREP
 pull_c=$(gh api --paginate "repos/$REPO/pulls/$PR/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null || echo 'x')
 arr_or_unknown "$pull_c"; printf '%s' "$pull_c" | jq -e 'type=="array"' >/dev/null 2>&1 || pull_c='[]'
 cr_live=$(printf '%s' "$pull_c" | jq '[.[]|select(.user.login=="coderabbitai[bot]" and .line!=null and ((.body|contains("Addressed in commit"))|not))]|length' 2>/dev/null || echo 0)
-gr_live=$(printf '%s' "$pull_c" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
+# Greptile comments in a resolved thread are settled (lib/review-threads.sh); an unreadable
+# thread listing keeps them all, a superset.
+gr_pull_c="$pull_c"
+if thread_nodes=$(fetch_review_threads "$REPO" "$PR"); then
+  gr_pull_c=$(printf '%s' "$pull_c" | drop_resolved_comments "$thread_nodes") || gr_pull_c="$pull_c"
+fi
+gr_live=$(printf '%s' "$gr_pull_c" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
 # Every push re-anchors Greptile's older comments onto the new head, so the raw anchored
 # count above over-reports. An explicit clean pass on THIS head clears them; a head with no
 # Greptile evidence at all is scoped to Greptile's newest EARLIER verdict by the same
@@ -217,7 +225,7 @@ if [ "$gr_reviewed" -eq 1 ]; then
 else
   gr_head_rid=$(printf '%s' "$rev_raw" | jq -r --arg h "$head" '[.[]|select(.user.login=="greptile-apps[bot]" and .commit_id==$h)]|last|.id // empty' 2>/dev/null || echo unreadable)
   gr_rc=0
-  greptile_scope_live "$REPO" "$PR" "$head" "$gr_state" "$gr_head_rid" "$gr_live" "$pull_c" "$issue_c" || gr_rc=$?
+  greptile_scope_live "$REPO" "$PR" "$head" "$gr_state" "$gr_head_rid" "$gr_live" "$gr_pull_c" "$issue_c" || gr_rc=$?
   if [ "$gr_rc" -eq 0 ]; then
     gr_live="$GRL_LIVE"
     [ -n "$GRL_NOTE" ] && echo "GREPTILE_PRIOR_VERDICT=$GRL_NOTE"

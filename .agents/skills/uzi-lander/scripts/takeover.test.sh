@@ -34,6 +34,9 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = checks ]; then echo '[{"bucket":"pass"}]'; 
 case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; esac
 case "$*" in
   *"/commits/$HEAD/status"*) echo '{"statuses":[]}' ;;
+  *'graphql'*)
+    [ "$MODE" = prior_resolved ] || { echo "unexpected gh api: $*" >&2; exit 1; }
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"comments":{"nodes":[{"databaseId":991,"author":{"login":"greptile-apps"},"body":"P1 finding","path":"x.go","line":8,"originalLine":8}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}' ;;
   *'/pulls/42/reviews'*)
     case "$MODE" in
       head_review_object) printf '[{"id":77,"user":{"login":"greptile-apps[bot]"},"commit_id":"%s","state":"COMMENTED","body":""}]\n' "$HEAD" ;;
@@ -57,7 +60,7 @@ case "$*" in
     esac ;;
   *'/pulls/42/comments'*)
     if [ "$MODE" = outside_diff ]; then echo '[]'
-    else echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> finding","pull_request_review_id":99}]'; fi ;;
+    else echo '[{"id":991,"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> finding","pull_request_review_id":99}]'; fi ;;
   *'/pulls/42/commits'*)
     [ "$MODE" = prior_unreadable ] && exit 1
     printf '[{"sha":"%s"},{"sha":"%s"}]\n' "$PREV" "$HEAD" ;;
@@ -110,6 +113,11 @@ has prior_clean 'NEXT=no_review'
 snap prior_none
 hasnt prior_none 'GREPTILE_PRIOR_VERDICT='
 has prior_none 'LIVE_FINDINGS=1 (cr=0 gr=1 '
+
+# The same comment in a resolved thread is settled, as in watch-pr.sh and pr-findings.sh
+# (#1710, 2026-09-26).
+snap prior_resolved
+has prior_resolved 'LIVE_FINDINGS=0 (cr=0 gr=0 '
 
 # A Greptile review object already on the head outranks an older clean verdict, exactly as
 # in watch-pr.sh and pr-findings.sh.

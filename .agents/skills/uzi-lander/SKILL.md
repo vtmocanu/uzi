@@ -181,7 +181,8 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    - **small / quick** (localized, no design change): fix locally by default, one push per
      PR via `S/land-prep.sh OWNER/REPO PR` (it re-checks the rework lane and pushes with a
      lease), trail `fix local → pushed`. Before merging, require two clean reviews of that
-     exact SHA: a live Codex lander peer found via session-peers (`peers.py list`), plus
+     exact SHA: a live Codex lander peer found via session-peers (`peers.py list`; a peer
+     listed `not registered` needs `peers.py up <uuid>` or its reply cannot route back), plus
      CodeRabbit (Greptile when CR is rate-limited). Skill-maintenance `[skip-cr]` PRs keep
      their own rule below;
    - **big** (design-level, many files, needs the plan's context): `uzi run rework RUN -m
@@ -311,6 +312,8 @@ Every long wait (a CR reset, a laggy `mr_rework`, a re-review, CI) is a backgrou
 whose exit re-invokes you, never a foreground `--watch` or a long `sleep`; the harness reaps
 long processes, and a killed short poll simply re-fires. The patient path is the default;
 a user reply that arrives first wins.
+Branch on the poller's own `EXIT=`/`RESULT=` line, never on the harness's task status: a
+`script > log; echo "EXIT=$?"` wrapper always completes with 0.
 
 ## Keep this skill and its scripts current
 

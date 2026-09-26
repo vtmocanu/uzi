@@ -20,6 +20,8 @@ case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; e
     *'graphql'*)
       if [ "$MODE" = cr_resolved ]; then
         echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"comments":{"nodes":[{"databaseId":12,"author":{"login":"coderabbitai"},"body":"🟡 **resolved finding**","path":"resolved.go","line":8,"originalLine":8}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
+      elif [ "$MODE" = prior_resolved ]; then
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"comments":{"nodes":[{"databaseId":990,"author":{"login":"greptile-apps"},"body":"P1 old finding","path":"old.go","line":8,"originalLine":8}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
       elif [ "$MODE" = cr_ca_findings ]; then
         echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":false,"comments":{"nodes":[{"databaseId":31,"author":{"login":"coderabbitai"},"body":"🟠 **carried finding**","path":"ca.go","line":4,"originalLine":4}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
       else
@@ -69,6 +71,7 @@ case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; e
         od_mixed) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"in.go","line":3,"body":"<img alt=\"P2\"> inline finding","pull_request_review_id":7},{"user":{"login":"greptile-apps[bot]"},"path":"old.go","line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
         in_progress) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"partial.go","line":9,"body":"<img alt=\"P1\"> partial finding","pull_request_review_id":101}]' ;;
         head_two_runs) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"retrigger.go","line":8,"body":"<img alt=\"P1\"> found by the re-trigger","pull_request_review_id":77}]' ;;
+        prior_resolved) echo '[{"id":990,"user":{"login":"greptile-apps[bot]"},"path":"old.go","line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
         cr_resolved) echo '[{"user":{"login":"coderabbitai[bot]"},"path":"resolved.go","line":8,"body":"🟡 **resolved finding**","pull_request_review_id":9}]' ;;
         *) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"old.go","line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
       esac ;;
@@ -195,6 +198,16 @@ rc=$?
 set -e
 [ "$rc" -eq 3 ] || fail "unreviewed head exited rc=$rc, want 3: $(cat "$WORK/prior-none.out")"
 grep -q '^  GR  old.go:8' "$WORK/prior-none.out" || fail "an unsuperseded Greptile comment was dropped: $(cat "$WORK/prior-none.out")"
+
+# The same comment in a resolved thread is settled: not listed (#1710, 2026-09-26). The head
+# is still unreviewed, so rc stays 3.
+MODE="prior_resolved"; export MODE
+set +e
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/prior-resolved.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "unreviewed head exited rc=$rc, want 3: $(cat "$WORK/prior-resolved.out")"
+if grep -q '^  GR  old.go:8' "$WORK/prior-resolved.out"; then fail "a resolved Greptile thread was listed: $(cat "$WORK/prior-resolved.out")"; fi
 
 # An unreadable history is never "clean": it is surfaced and the comment stays listed.
 MODE="prior_unreadable"; export MODE

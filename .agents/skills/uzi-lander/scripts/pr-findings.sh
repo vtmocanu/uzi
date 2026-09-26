@@ -254,6 +254,12 @@ for n in "$@"; do
     unconfirmed="${unconfirmed} #${n}"
     inline_raw='[]'
   fi
+  # Greptile liveness drops comments in a resolved thread (lib/review-threads.sh); the
+  # completeness tally below keeps reading inline_raw. Unreadable threads keep them all.
+  gr_inline="$inline_raw"
+  if [ -n "$thread_nodes" ] && [ "$thread_nodes" != "[]" ]; then
+    gr_inline=$(printf '%s' "$inline_raw" | drop_resolved_comments "$thread_nodes") || gr_inline="$inline_raw"
+  fi
   if [ "$gr_ok" -eq 1 ] && [ "$gr_added" != "0" ] && [ "${gr_inline_added:-0}" -gt 0 ] && [ -n "$gr_review_id" ]; then
     gr_scoped_total=$(printf '%s' "$inline_raw" | jq --argjson rid "$gr_review_id" \
       '[.[]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid)]|length' 2>/dev/null || echo -1)
@@ -289,9 +295,9 @@ for n in "$@"; do
   # applies only when the head carries no Greptile evidence at all, and it is liveness
   # only: the gate above already recorded this head as unreviewed, and that stands.
   if [ "$gr_ok" -eq 0 ] && [ -n "$head" ]; then
-    gr_anchored=$(printf '%s' "$inline_raw" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
+    gr_anchored=$(printf '%s' "$gr_inline" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
     gr_rc=0
-    greptile_scope_live "$repo" "$n" "$head" "$gr_status" "$gr_review_id" "$gr_anchored" "$inline_raw" "$gr_issue" || gr_rc=$?
+    greptile_scope_live "$repo" "$n" "$head" "$gr_status" "$gr_review_id" "$gr_anchored" "$gr_inline" "$gr_issue" || gr_rc=$?
     if [ "$gr_rc" -eq 2 ]; then
       echo "  ⏳ a Greptile review is running, or was just requested, after its last verdict; findings deferred"
       unconfirmed="${unconfirmed} #${n}"
@@ -330,7 +336,7 @@ for n in "$@"; do
     fi
   fi
   # shellcheck disable=SC2016
-  printf '%s' "$inline_raw" | jq -r --argjson grclean "$gr_clean" --arg grid "$gr_review_id" '.[]
+  printf '%s' "$gr_inline" | jq -r --argjson grclean "$gr_clean" --arg grid "$gr_review_id" '.[]
       | select(.user.login=="greptile-apps[bot]" and .line!=null)
       | if $grclean==1 or ($grid!="" and ((.pull_request_review_id|tostring)!=$grid)) then empty
         else ((.body|match("alt=\"(P[0-9])\"").captures[0].string)? // "?") as $p

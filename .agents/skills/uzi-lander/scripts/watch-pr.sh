@@ -312,8 +312,9 @@ while [ "$i" -lt "$MAX" ]; do
   # CodeRabbit liveness comes from GraphQL reviewThreads: REST line anchors survive a human
   # resolving the thread and therefore over-count settled findings. Fail closed when the
   # thread listing is unreadable or paginated beyond the bounded query.
-  cr_live=0; gr_live=0; gr_scoped_total=0
+  cr_live=0; gr_live=0; gr_scoped_total=0; threads_ok=0
   if thread_nodes=$(fetch_review_threads "$REPO" "$PR"); then
+    threads_ok=1
     cr_live=$(printf '%s' "$thread_nodes" | jq \
       '[.[]|select(.isResolved==false and .isOutdated==false)
             |select(any(.comments.nodes[]?; ((.author.login // "")|startswith("coderabbitai"))))]|length' 2>/dev/null) || unknown=1
@@ -321,16 +322,22 @@ while [ "$i" -lt "$MAX" ]; do
     unknown=1
   fi
   # Greptile liveness is scoped to its current-head review id; the check-run tally below
-  # proves whether GitHub has exposed the complete set.
+  # proves whether GitHub has exposed the complete set. Liveness also drops comments whose
+  # thread is resolved (gr_live_c), as CodeRabbit's does; the tally check keeps them all.
+  gr_live_c='[]'
   if pull_c=$(gh api --paginate "repos/$REPO/pulls/$PR/comments" 2>/dev/null) && pages_are_arrays "$pull_c"; then
+    gr_live_c=$(printf '%s' "$pull_c" | jq -s 'add // []' 2>/dev/null) || { gr_live_c='[]'; unknown=1; }
+    if [ "$threads_ok" -eq 1 ]; then
+      gr_live_c=$(printf '%s' "$gr_live_c" | drop_resolved_comments "$thread_nodes") || { gr_live_c='[]'; unknown=1; }
+    fi
     if [ -n "$gr_review_id" ]; then
       gr_scoped_total=$(printf '%s' "$pull_c" | jq -rs --argjson rid "$gr_review_id" \
         '[.[][]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid)]|length' 2>/dev/null) || unknown=1
-      gr_live=$(printf '%s' "$pull_c" | jq -rs --argjson rid "$gr_review_id" \
-        '[.[][]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid and .line!=null)]|length' 2>/dev/null) || unknown=1
+      gr_live=$(printf '%s' "$gr_live_c" | jq -r --argjson rid "$gr_review_id" \
+        '[.[]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid and .line!=null)]|length' 2>/dev/null) || unknown=1
     else
-      gr_live=$(printf '%s' "$pull_c" | jq -rs \
-        '[.[][]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null) || unknown=1
+      gr_live=$(printf '%s' "$gr_live_c" | jq -r \
+        '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null) || unknown=1
     fi
   else
     unknown=1
@@ -419,7 +426,7 @@ while [ "$i" -lt "$MAX" ]; do
   # gate. A newer Greptile review still running (rc 2) defers like an in-progress head.
   gr_prior=""
   if [ "$gr_reviewed" -eq 0 ] && [ "$gr_live" -gt 0 ]; then
-    gr_flat=$(printf '%s' "$pull_c" | jq -s 'add // []' 2>/dev/null) || gr_flat='x'
+    gr_flat="$gr_live_c"
     gr_rc=0
     gr_issue_flat=$(printf '%s' "${issue_c:-}" | jq -s 'add // []' 2>/dev/null) || gr_issue_flat='x'
     greptile_scope_live "$REPO" "$PR" "$head" "$gr_state" "$gr_review_id" "$gr_live" "$gr_flat" "$gr_issue_flat" || gr_rc=$?
