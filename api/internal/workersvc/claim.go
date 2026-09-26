@@ -165,11 +165,12 @@ type ClaimPayload struct {
 	// for a plan that was never persisted, and that frame must not move this instant. The worker's
 	// per-flight gate epoch restarts at 0 on a new claim, so it cannot tell a replayed
 	// approve/reject/revise sent against an earlier plan from one sent against this plan; it
-	// discards a replayed gate verdict whose created_at is strictly before this instant. Absent
-	// when no plan frame matches PlanMd (never a fallback to the latest frame), the plan is
-	// approved, or the lookup failed (logged, never fails the claim); the worker then fails closed,
-	// treating every replayed approve/reject as stale. RFC 3339 on the wire (time.Time's JSON
-	// encoding; microsecond precision from Postgres).
+	// discards a replayed gate verdict whose created_at is before this instant or absent or
+	// unparseable. Absent when no plan frame matches PlanMd (never a fallback to the latest frame),
+	// the plan is approved, or the lookup failed (logged, never fails the claim); the worker then
+	// treats as stale every replayed approve/reject it reads before its backlog is drained and its
+	// first gate is shown, while a replayed revise still acts. RFC 3339 on the wire (time.Time's
+	// JSON encoding; microsecond precision from Postgres).
 	ResumePlanAt *time.Time `json:"resume_plan_at,omitempty"`
 	// PlanSource is where PlanMd came from (runs.plan_source, PRD #209): 'agent' for a
 	// worker-authored plan (or a pre-#209 run), 'seeded' for a plan supplied at create

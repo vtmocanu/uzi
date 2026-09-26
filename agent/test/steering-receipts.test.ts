@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { FakeApi } from "./fake-api.js";
 import { nullLogger } from "./helpers.js";
 import { WorkerClient } from "../src/client.js";
-import { SteeringChannel } from "../src/steering.js";
+import { GateInputDeliveryError, SteeringChannel } from "../src/steering.js";
 import type { UserInput } from "../src/protocol.js";
 
 const TOKEN = "worker-join-token-0123456789";
@@ -220,13 +220,18 @@ describe("plan-gate replay edges (issue #1604 round 4)", () => {
   const UNJUDGED = "Could not confirm which plan this verdict was for — it was ignored; re-send it if you still want it.";
   const REPLAY = "A plan verdict sent before this plan was shown was ignored — re-send it if you still want it.";
   const LEGACY =
-    "An approval sent before this plan was shown was already recorded by the server and could not be withdrawn — cancel the run if it should not proceed.";
+    "A plan approval was already recorded by the server and could not be withdrawn — cancel the run if it should not proceed.";
 
-  function gateChannel(generation: number, opts: { cutoff?: string | "absent"; client?: WorkerClient } = {}) {
+  function gateChannel(
+    generation: number,
+    opts: { cutoff?: string | "absent"; client?: WorkerClient; replayPageLimit?: number; receiptDeadlineMs?: number } = {},
+  ) {
     const notices: string[] = [];
     const ch = new SteeringChannel(opts.client ?? clientLosingGets(0), RUN, 1, nullLogger(), new AbortController(), {
       claimGeneration: generation,
       notify: (t) => notices.push(t),
+      ...(opts.replayPageLimit !== undefined ? { replayPageLimit: opts.replayPageLimit } : {}),
+      ...(opts.receiptDeadlineMs !== undefined ? { receiptDeadlineMs: opts.receiptDeadlineMs } : {}),
     });
     if (opts.cutoff !== undefined) ch.setReplayCutoff(opts.cutoff === "absent" ? undefined : opts.cutoff);
     channels.push(ch);
@@ -275,6 +280,51 @@ describe("plan-gate replay edges (issue #1604 round 4)", () => {
     assert.equal(ch.takeResumedGateEvent(), undefined);
     const epoch = ch.bumpEpoch();
     assert.equal(await settlesWithin(ch.awaitGateEvent(epoch), 100), false, "no approve settles the gate");
+  });
+
+  it("round 5: a full page of this claim's own undiscarded approves does not complete delivery; the approve behind it is judged replayed", async () => {
+    api.setInputClaimGeneration(RUN, 1);
+    api.inputPageSize = 2;
+    api.setInputs(RUN, [
+      { id: 1, kind: "approve_plan", body: null },
+      { id: 2, kind: "approve_plan", body: null },
+      { id: 3, kind: "approve_plan", body: null }, // past the page
+    ]);
+    // The discard of 1 and 2 fails transiently for a while, so later GETs serve the same full page.
+    api.failInputReceiptsTimes("discarded", 8, 503);
+    const { ch, notices } = gateChannel(1, { cutoff: "absent", replayPageLimit: 2 });
+    ch.guardInitialDelivery();
+    ch.start();
+    await ch.awaitInitialDelivery();
+    assert.ok(api.isAcked(RUN, 3), "the approve behind the full page was read before delivery completed");
+    assert.deepEqual(notices, [UNJUDGED, UNJUDGED, UNJUDGED], "every replayed approve was judged unjudged");
+    const epoch = ch.bumpEpoch();
+    assert.equal(await settlesWithin(ch.awaitGateEvent(epoch), 100), false, "no replayed approve settles the gate");
+    await until(() => api.isDiscarded(RUN, 3));
+    assert.equal(api.humanPlanApproved(RUN), false, "no approval recorded");
+  });
+
+  it("round 5: a full page that can never be discarded (no route) ends delivery with the bounded transient give-up, not a hang", async () => {
+    api.setInputClaimGeneration(RUN, 1);
+    api.inputPageSize = 2;
+    api.discardRouteMissing = true;
+    api.setInputs(RUN, [
+      { id: 1, kind: "approve_plan", body: null },
+      { id: 2, kind: "approve_plan", body: null },
+      { id: 3, kind: "approve_plan", body: null },
+    ]);
+    const { ch } = gateChannel(1, { cutoff: "absent", replayPageLimit: 2, receiptDeadlineMs: 200 });
+    ch.guardInitialDelivery();
+    ch.start();
+    const outcome = await Promise.race([
+      ch.awaitInitialDelivery().then(() => "delivered", (err: unknown) => err),
+      new Promise((r) => setTimeout(() => r("hung"), 5_000)),
+    ]);
+    assert.ok(outcome instanceof GateInputDeliveryError, `the read gave up: ${String(outcome)}`);
+    assert.equal(outcome.definitive, false, "transient: the runner parks for recovery");
+    assert.equal(api.isAcked(RUN, 3), false, "the approve behind the page was never read");
+    assert.ok(![1, 2, 3].some((id) => api.isApplied(RUN, id)), "all stay unapplied for the next claim");
+    assert.equal(api.humanPlanApproved(RUN), false);
   });
 
   it("finding 4: with a known cutoff, a verdict with no comparable created_at is stale", async () => {

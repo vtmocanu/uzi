@@ -80,6 +80,9 @@ export interface SteeringOptions {
   /** Issue #1673: how long a routed batch may wait for its applied receipt on the active claim
    *  before the channel gives up (default ACTIVE_APPLY_DEADLINE_MS). Injectable for tests. */
   receiptDeadlineMs?: number;
+  /** Issue #1604: the server's GET /inputs page size (default REPLAY_PAGE_LIMIT). Injectable so a
+   *  test can match a FakeApi inputPageSize. */
+  replayPageLimit?: number;
 }
 
 /** Feed notices for events discarded because they were written against a plan version
@@ -103,9 +106,10 @@ const REPLAY_STALE_REVISE_NOTICE =
 const REPLAY_UNJUDGED_NOTICE =
   "Could not confirm which plan this verdict was for — it was ignored; re-send it if you still want it.";
 /** Issue #1604: a stale approve an older api consumed on read (no receipts). The server applied it
- *  when it returned it, so it already counts as the human approval and cannot be withdrawn. */
+ *  when it returned it, so it already counts as the human approval and cannot be withdrawn. No
+ *  timing is claimed: on an unjudged claim (the usual legacy case) when it was sent is unknown. */
 const LEGACY_RECORDED_APPROVE_NOTICE =
-  "An approval sent before this plan was shown was already recorded by the server and could not be withdrawn — cancel the run if it should not proceed.";
+  "A plan approval was already recorded by the server and could not be withdrawn — cancel the run if it should not proceed.";
 /** Issue #1604: a revise or reject that arrives once an approve was taken can never act; re-sending
  *  it would be ignored the same way, so the notice names the one input that still stops the run. */
 const APPROVED_REVISE_NOTICE =
@@ -242,6 +246,10 @@ class InvalidInputResponse extends Error {
 
 /** Issue #1673: the most ids one /inputs/ack or /inputs/applied accepts (validInputIDs). */
 const MAX_INPUT_BATCH = 1000;
+/** Issue #1604: the most rows one receipted GET /inputs returns, the LIMIT of
+ *  api/internal/store/queries/runtime.sql ListReplayRunInputs. A page this full may have unread
+ *  rows behind it, so only a shorter page can complete initial delivery. */
+const REPLAY_PAGE_LIMIT = 1000;
 /** Issue #1673: applied attempts a stopping channel makes for a routed batch before it leaves
  *  the batch to the next claim (which replays it: at-least-once across claims). */
 const STOP_APPLY_ATTEMPTS = 3;
@@ -438,9 +446,6 @@ export class SteeringChannel {
    *  the replayed backlog is drained (initial delivery complete) AND this claim has shown its first
    *  gate (bumpEpoch). Fail closed. */
   private replayUnjudged = false;
-  /** Sticky: this claim started in the unjudged mode above. A verdict routed before initial
-   *  delivery completed is then judged as replayed when a gate takes it, too. */
-  private unjudgedClaim = false;
   /** This claim has shown a gate (bumpEpoch ran at least once). */
   private firstGateShown = false;
   /** The terminal verdict kind that closed the gate (closeGate): no later verdict can act. */
@@ -448,10 +453,17 @@ export class SteeringChannel {
 
   // --- Issue #1604: the first read of a resumed claim's inputs ---------------------------------
   /** Set once the replayed backlog is drained: a GET succeeded (not fenced by a switch pending for
-   *  this claim) that returned no row beyond the ids this claim already routed or tracks. One
-   *  successful batch is not enough: the server's replay read is capped, so a verdict can lie past
-   *  the first batch. */
+   *  this claim) that returned a page shorter than the server's cap and no row beyond the ids this
+   *  claim already routed or tracks. One successful batch is not enough: the server's replay read
+   *  is capped, so a verdict can lie past the first batch, and a full page of rows this claim
+   *  tracks but cannot settle (disposed approves whose discard has not landed) hides the rows
+   *  behind it. */
   private delivered = false;
+  private readonly replayPageLimit: number;
+  /** Consecutive reads of a full page with nothing new while no lane can clear it, and when the
+   *  first was: bounded like a failed read (deliveryFailures), then initial delivery gives up. */
+  private deliveryStalls = 0;
+  private deliveryFirstStallAt: number | undefined;
   /** The runner guards this claim's first read (a resumed, unapproved claim with a plan). */
   private deliveryGuarded = false;
   private deliveryFailures = 0;
@@ -693,7 +705,6 @@ export class SteeringChannel {
         resume_plan_at: at ?? null,
       });
       this.replayUnjudged = true;
-      this.unjudgedClaim = true;
       return false;
     }
     this.replayCutoff = cutoff;
@@ -1030,10 +1041,28 @@ export class SteeringChannel {
     if (this.delivered && this.firstGateShown) this.replayUnjudged = false;
   }
 
-  /** A buffered verdict routed before initial delivery completed on an unjudged claim: judged as
-   *  replayed when taken, whatever epoch it carries (defence in depth beside the arrival check). */
-  private unjudgedReplay(entry: { preDelivery: boolean }): boolean {
-    return this.unjudgedClaim && entry.preDelivery;
+  /** A full page with nothing new before delivery: the rows behind it stay unread until this
+   *  claim's own tracked rows leave the replay list. While a discard or APPLIED can still clear
+   *  them, wait. Once none can (the discard gave up or the api lacks the route), the stall is
+   *  bounded like a failed read, then the read gives up (transient): the runner parks the run for
+   *  recovery, and the next claim reads the list afresh. */
+  private noteDeliveryStall(rows: number): void {
+    if (this.delivered || this.deliveryOutcome) return;
+    if ((this.discardQueue.length > 0 && !this.discardUnsupported) || this.ready) {
+      this.deliveryStalls = 0;
+      this.deliveryFirstStallAt = undefined;
+      return;
+    }
+    this.deliveryStalls++;
+    this.deliveryFirstStallAt ??= this.now();
+    if (
+      this.deliveryStalls >= 2 * ACTIVE_APPLY_ATTEMPTS ||
+      this.now() - this.deliveryFirstStallAt >= 2 * this.receiptDeadlineMs
+    )
+      this.endDelivery(new GateInputDeliveryError(
+        false,
+        `the first ${rows} replayed input(s) are plan-gate inputs this claim could not settle; the inputs behind them cannot be read`,
+      ));
   }
 
   private endDelivery(err: GateInputDeliveryError): void {
@@ -1133,10 +1162,6 @@ export class SteeringChannel {
     const buffered = this.bufferedVerdict;
     if (buffered?.verdict.kind === "reject" && buffered.epoch === epoch) {
       this.bufferedVerdict = undefined;
-      if (this.unjudgedReplay(buffered)) {
-        this.disposeStale("reject_plan", buffered.id, "unjudged");
-        return undefined;
-      }
       return buffered.verdict;
     }
     return undefined;
@@ -1167,7 +1192,7 @@ export class SteeringChannel {
   private gateEpoch = 0;
   /** An approve/reject that arrived before the executor asked for one (no lost wakeup),
    *  stamped with the epoch it landed under. Latest-wins if several land before a read. */
-  private bufferedVerdict: { verdict: PlanVerdict; epoch: number; id?: number; preDelivery: boolean } | undefined;
+  private bufferedVerdict: { verdict: PlanVerdict; epoch: number; id?: number } | undefined;
   /** Cancel is sticky and epoch-exempt: once seen it always wins, at any epoch. Also read by the
    *  executor's loop-top cancel re-check (PRD #1190 rework, via ctx.cancelRequested → isCancelled):
    *  a cancel that arrives AFTER the shared abort controller was already spent by a declined
@@ -1284,6 +1309,7 @@ export class SteeringChannel {
     this.now = opts.now ?? Date.now;
     this.claimGeneration = opts.claimGeneration ?? 0;
     this.receiptDeadlineMs = opts.receiptDeadlineMs ?? ACTIVE_APPLY_DEADLINE_MS;
+    this.replayPageLimit = opts.replayPageLimit ?? REPLAY_PAGE_LIMIT;
   }
 
   /** Seed the sticky `stop` state at construction time (issue #552 M3), before the poll
@@ -1740,13 +1766,8 @@ export class SteeringChannel {
     if (revise) return revise;
     // A buffered approve/reject: apply it at its own epoch, else discard as stale.
     if (this.bufferedVerdict) {
-      const buffered = this.bufferedVerdict;
-      const { verdict, epoch: e, id } = buffered;
+      const { verdict, epoch: e, id } = this.bufferedVerdict;
       this.bufferedVerdict = undefined;
-      if (e === epoch && this.unjudgedReplay(buffered)) {
-        this.disposeStale(verdict.kind === "reject" ? "reject_plan" : "approve_plan", id, "unjudged");
-        return undefined;
-      }
       if (e === epoch) {
         // A taken reject stays awaiting its result: the server settles it with the failed
         // transition. A taken approve is final: it is applied on its own, and the report after it
@@ -1883,7 +1904,6 @@ export class SteeringChannel {
         this.bufferedVerdict = {
           verdict: { kind: "approve", selection: parseAgentSelection(body) },
           epoch: this.gateEpoch,
-          preDelivery: !this.delivered,
           ...(receipted ? { id } : {}),
         };
         if (receipted) this.awaitingGateIds.add(id);
@@ -1895,7 +1915,6 @@ export class SteeringChannel {
         this.bufferedVerdict = {
           verdict: { kind: "reject", reason: body?.trim() || "plan rejected" },
           epoch: this.gateEpoch,
-          preDelivery: !this.delivered,
           ...(receipted ? { id } : {}),
         };
         if (receipted) this.awaitingGateIds.add(id);
@@ -2108,12 +2127,20 @@ export class SteeringChannel {
           // empty one). It is not an input row — it is the server's "a switch is pending for the
           // current claim" fact — and acting on it releases the claim.
           if (credentialSwitch) this.maybeTripCredentialSwitch(credentialSwitch.generation);
-          // Issue #1604: a read that returns nothing this claim has not already routed completes
-          // initial delivery (the replayed backlog is drained; a capped read's later rows come on
-          // the following GETs). Not under a switch pending for THIS claim, whose fenced GET drains
-          // nothing: those rows belong to the next claim. A signal for another generation (a
-          // superseded claim) fences nothing here.
-          if (fresh === 0 && credentialSwitch?.generation !== this.claimGeneration) this.markDelivered();
+          // Issue #1604: a short read (under the server's cap) that returns nothing this claim has
+          // not already routed completes initial delivery: the replayed backlog is drained. A full
+          // page may hide rows behind it, even when every row on it is one this claim tracks, so
+          // it never does (see noteDeliveryStall). Not under a switch pending for THIS claim, whose
+          // fenced GET drains nothing: those rows belong to the next claim. A signal for another
+          // generation (a superseded claim) fences nothing here.
+          const pageFull = read.length >= this.replayPageLimit;
+          if (fresh === 0 && credentialSwitch?.generation !== this.claimGeneration) {
+            if (!pageFull) this.markDelivered();
+            else this.noteDeliveryStall(read.length);
+          } else {
+            this.deliveryStalls = 0;
+            this.deliveryFirstStallAt = undefined;
+          }
         }
         if (this.held) await this.advanceHeld();
       } catch (err) {
