@@ -412,7 +412,7 @@ func TestTUIDetailBuildsLanesFromReplayThenLiveFrames(t *testing.T) {
 	// A live frame for a NEW invocation opens a third lane.
 	inst, agent := "toolu_bbb222", "tester"
 	at := now
-	next, _ := m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{{
+	next, _ := m.Update(streamEventsMsg{gen: m.detail.gen, runID: runID, events: []apitypes.RunEventDTO{{
 		Type: uzicli.RunEventTypeMessage, Seq: 3, Kind: "text",
 		Agent: &agent, AgentInstance: &inst, CreatedAt: &at,
 		Payload: json.RawMessage(`{"text":"testing"}`),
@@ -435,7 +435,7 @@ func TestTUIDetailDedupesBySeqAcrossTransports(t *testing.T) {
 		[]apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "hello", now)})
 
 	agent, at := "lead", now
-	next, _ := m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{{
+	next, _ := m.Update(streamEventsMsg{gen: m.detail.gen, runID: runID, events: []apitypes.RunEventDTO{{
 		Type: uzicli.RunEventTypeMessage, Seq: 1, Kind: "text", Agent: &agent, CreatedAt: &at,
 		Payload: json.RawMessage(`{"text":"hello"}`),
 	}}})
@@ -453,7 +453,7 @@ func TestTUIDetailAppliesStateFrames(t *testing.T) {
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
 	m = applyDetail(m, apitypes.RunDTO{ID: runID, Status: "running"}, nil)
 
-	next, _ := m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{
+	next, _ := m.Update(streamEventsMsg{gen: m.detail.gen, runID: runID, events: []apitypes.RunEventDTO{
 		{Type: uzicli.RunEventTypeState, Status: "completed"},
 	}})
 	m = next.(tuiModel)
@@ -477,7 +477,7 @@ func TestTUIDetailDegradesWhenTheStreamCannotOpen(t *testing.T) {
 	m := tuiTestModel(t, fake, runID)
 	m = applyDetail(m, apitypes.RunDTO{ID: runID, Status: "running"}, nil)
 
-	next, cmd := m.Update(streamReadyMsg{runID: runID, err: fake.StreamErr})
+	next, cmd := m.Update(streamReadyMsg{gen: m.detail.gen, runID: runID, err: fake.StreamErr})
 	m = next.(tuiModel)
 	if !m.detail.polling {
 		t.Fatal("a failed stream did not fall back to polling")
@@ -498,7 +498,7 @@ func TestTUIDetailIgnoresRepliesForAnotherRun(t *testing.T) {
 	m = applyDetail(m, apitypes.RunDTO{ID: "run-current", Status: "running"}, nil)
 
 	agent, at := "coder", time.Now()
-	next, _ := m.Update(streamEventsMsg{runID: "run-OTHER", events: []apitypes.RunEventDTO{{
+	next, _ := m.Update(streamEventsMsg{gen: m.detail.gen, runID: "run-OTHER", events: []apitypes.RunEventDTO{{
 		Type: uzicli.RunEventTypeMessage, Seq: 9, Kind: "text", Agent: &agent, CreatedAt: &at,
 		Payload: json.RawMessage(`{"text":"from another run"}`),
 	}}})
@@ -631,7 +631,7 @@ func TestTUIDetailFollowLive(t *testing.T) {
 
 	// A new frame while following auto-tails to the newest.
 	agent, at := "lead", now
-	next, _ := m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{{
+	next, _ := m.Update(streamEventsMsg{gen: m.detail.gen, runID: runID, events: []apitypes.RunEventDTO{{
 		Type: uzicli.RunEventTypeMessage, Seq: 9, Kind: "text", Agent: &agent, CreatedAt: &at,
 		Payload: json.RawMessage(`{"text":"frame 9 body"}`),
 	}}})
@@ -1876,7 +1876,7 @@ func TestReadStreamCmdBatchesQueuedEvents(t *testing.T) {
 			t.Fatalf("only %d of %d events arrived: %v", len(got), len(events), got)
 		default:
 		}
-		msg, ok := readStreamCmd("r", s)().(streamEventsMsg)
+		msg, ok := readStreamCmd("r", 0, s)().(streamEventsMsg)
 		if !ok {
 			t.Fatal("readStreamCmd returned the wrong message type")
 		}

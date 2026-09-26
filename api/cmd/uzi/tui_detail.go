@@ -122,8 +122,9 @@ type detailState struct {
 	// metaWaitID == 0 meaning idle — a boardTickMsg issues a new meta refresh only while idle.
 	// A detailMetaMsg is honoured only when its reqID == metaWaitID (and its runID matches),
 	// and a failed poll clears metaWaitID so the next tick retries (the D2 anti-wedge property).
-	// metaSeq restarts per run (newDetailState), which is safe because the detailMetaMsg case
-	// checks runID BEFORE comparing the id, so a reply for an old run can never match.
+	// metaSeq restarts per detail session (newDetailState), which is safe because the
+	// detailMetaMsg case checks runID and the session gen BEFORE comparing the id, so a reply
+	// for an old run, or an earlier session on the same run, can never match (#1151).
 	metaSeq    uint64
 	metaWaitID uint64
 
