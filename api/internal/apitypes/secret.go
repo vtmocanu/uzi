@@ -7,10 +7,12 @@ import "time"
 // (`uzi token list`) decodes. The secret VALUE appears in no field — there is no
 // reveal endpoint; a token is rotated by re-pasting, never read back.
 type SecretDTO struct {
-	ID        string `json:"id"`
-	Kind      string `json:"kind"`
-	Label     string `json:"label"`
-	IsDefault bool   `json:"is_default"`
+	ID         string     `json:"id"`
+	Kind       string     `json:"kind"`
+	Label      string     `json:"label"`
+	IsDefault  bool       `json:"is_default"`
+	Enabled    bool       `json:"enabled"`
+	DisabledAt *time.Time `json:"disabled_at"`
 	// AutoEligible is the owner's opt-in to the auto-selection pool (PRD #111 M2,
 	// D2): an `auto` worker's claim spends only tokens flagged here. Default false —
 	// opting a token in is a deliberate act, because a pool that helps itself to

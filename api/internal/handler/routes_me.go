@@ -44,6 +44,8 @@ func (h *Handler) mountMeRoutes(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
 			// PRD #104 M2 id-keyed CRUD. POST creates a named token, PATCH
 			// renames/set-defaults/rotates one, DELETE /{id} removes one (D5/D6).
+			r.Patch("/{kind}/{id}/enabled", h.PatchSecretEnabled)
+			r.Get("/{kind}/{id}/dependents", h.GetSecretDependents)
 			r.Post("/anthropic_token", h.CreateAnthropicToken)
 			r.Patch("/anthropic_token/{id}", h.PatchAnthropicToken)
 			r.Delete("/anthropic_token/{id}", h.DeleteAnthropicTokenByID)

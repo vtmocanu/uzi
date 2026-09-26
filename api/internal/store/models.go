@@ -900,16 +900,18 @@ type User struct {
 }
 
 type UserSecret struct {
-	ID           uuid.UUID          `json:"id"`
-	UserID       uuid.UUID          `json:"user_id"`
-	Kind         string             `json:"kind"`
-	Ciphertext   []byte             `json:"ciphertext"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
-	SealedWith   string             `json:"sealed_with"`
-	Label        string             `json:"label"`
-	IsDefault    bool               `json:"is_default"`
-	AutoEligible bool               `json:"auto_eligible"`
+	ID            uuid.UUID          `json:"id"`
+	UserID        uuid.UUID          `json:"user_id"`
+	Kind          string             `json:"kind"`
+	Ciphertext    []byte             `json:"ciphertext"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	SealedWith    string             `json:"sealed_with"`
+	Label         string             `json:"label"`
+	IsDefault     bool               `json:"is_default"`
+	AutoEligible  bool               `json:"auto_eligible"`
+	DisabledAt    pgtype.Timestamptz `json:"disabled_at"`
+	EnablementRev int64              `json:"enablement_rev"`
 }
 
 type UserVault struct {
