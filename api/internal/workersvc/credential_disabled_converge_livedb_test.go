@@ -149,11 +149,15 @@ func TestCredentialDisabledAutoLaneDoesNotCycleLiveDB(t *testing.T) {
 	}
 }
 
-// TestCredentialPromoterAutoLaneNeedsEnabledPooledTokenLiveDB (M): a held run on an ordinary
-// auto lane (a worker bound auto, or a per-run auto override) stays held while no pooled token
-// is enabled, even with an enabled non-pooled default, and resumes once one is. A Judge-lane
-// auto run keeps the #1140 fallback: the enabled default serves it.
-func TestCredentialPromoterAutoLaneNeedsEnabledPooledTokenLiveDB(t *testing.T) {
+// TestCredentialPromoterAutoLaneFallsToPoolWaitLiveDB (PRD #1732 D2): a held run on an ordinary
+// auto lane (a worker bound auto, or a per-run auto override) has no single disabled pin to wait
+// for, so the promoter always returns it to queued; with no enabled pooled token its next claim
+// holds it in pool_wait (errAutoPoolEmpty), never on the non-pooled default. A Judge-lane auto
+// run keeps the #1140 fallback and spends the enabled default.
+//
+// MUTATION: make the promoter's ordinary auto branches require an enabled pooled token again;
+// the two auto runs then stay held on credential_disabled and this test fails.
+func TestCredentialPromoterAutoLaneFallsToPoolWaitLiveDB(t *testing.T) {
 	fx := newCDFix(t)
 	fx.env.exec(`UPDATE workers SET anthropic_bind_mode = 'auto', anthropic_secret_id = NULL WHERE id = $1`, fx.workerID)
 	fx.env.exec(`UPDATE users SET judge_anthropic_bind_mode = 'auto', judge_anthropic_secret_id = NULL WHERE id = $1`, fx.userID)
@@ -166,14 +170,23 @@ func TestCredentialPromoterAutoLaneNeedsEnabledPooledTokenLiveDB(t *testing.T) {
 	judgeAuto := fx.parkedRun(t, "self_improve")
 
 	fx.svc.RequestCredentialDisabledPromotion(fx.userID)
-	assertHeld(t, fx.env, workerAuto, true)
-	assertHeld(t, fx.env, overrideAuto, true)
-	assertHeld(t, fx.env, judgeAuto, false)
-
-	fx.setEnabled(fx.otherTok, true)
-	fx.svc.RequestCredentialDisabledPromotion(fx.userID)
-	assertHeld(t, fx.env, workerAuto, false)
-	assertHeld(t, fx.env, overrideAuto, false)
+	for _, id := range []uuid.UUID{workerAuto, overrideAuto, judgeAuto} {
+		assertHeld(t, fx.env, id, false)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := fx.svc.Claim(fx.env.ctx, fx.worker(t), nil); err != nil {
+			t.Fatalf("Claim %d: %v", i, err)
+		}
+	}
+	for _, id := range []uuid.UUID{workerAuto, overrideAuto} {
+		if r := mustRun(t, fx.env, id); r.Status != "pool_wait" || r.AnthropicSecretID.Valid {
+			t.Fatalf("auto run %s: status=%s hold=%v spent=%v, want pool_wait with nothing spent", id, r.Status, r.HoldReason, r.AnthropicSecretID)
+		}
+	}
+	if r := mustRun(t, fx.env, judgeAuto); uuid.UUID(r.AnthropicSecretID.Bytes) != fx.defTok || r.AnthropicSelectReason.String != "pool_empty" {
+		t.Fatalf("judge-lane auto run: status=%s spent=%v (%q), want the enabled default (pool_empty)",
+			r.Status, r.AnthropicSecretID, r.AnthropicSelectReason.String)
+	}
 }
 
 // TestCredentialPromoterFollowsAffinityLiveDB (B1): the worker binding is the requirement only
@@ -244,4 +257,85 @@ func TestCredentialPromoterPanicDoesNotWedgeOwnerLiveDB(t *testing.T) {
 
 	fx.svc.RequestCredentialDisabledPromotion(fx.userID)
 	assertHeld(t, fx.env, runID, false)
+}
+
+// TestCredentialDisabledPendingPauseConvergesLiveDB (PRD #1732 D14, item 0c): a claimed row CAN
+// carry a pending pause in production. CreatePauseInput sets it only on a running run, and the
+// worker-death requeues (RequeueWorkerRuns, RequeueRunsOfStaleWorkers,
+// RequeueRunsMissingFromSnapshot) deliberately keep it so the next claim re-arms it. When that
+// next claim parks on credential_disabled, re-enabling the credential must neither promote past
+// the pause nor strand the run on a hold ResumePausedRun refuses: an owner request settles into
+// the ordinary owner pause (resumable by the owner, with the held interval banked), and a
+// system 'wall' request into the budget_exhausted hold (resumed by extend).
+//
+// MUTATION: drop the promoter's SettleCredentialDisabledPause branch; the run then stays held on
+// credential_disabled forever (PromoteCredentialDisabledRun refuses a pending pause).
+func TestCredentialDisabledPendingPauseConvergesLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		mode, wantHold string
+	}{
+		{"now", ""},
+		{"milestone", ""},
+		{"wall", "budget_exhausted"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			fx := newCDFix(t)
+			runID := fx.queuedRun(t, "issue")
+			if payload, err := fx.svc.Claim(fx.env.ctx, fx.worker(t), nil); err != nil || payload == nil {
+				t.Fatalf("Claim = (%v, %v), want the payload", payload != nil, err)
+			}
+			fx.env.exec(`UPDATE runs SET status = 'running', status_since = now() WHERE id = $1`, runID)
+			if tc.mode == "wall" {
+				// RequestWallParks' shape: the system request plus its steering input.
+				fx.env.exec(`UPDATE runs SET pause_requested_at = now(), pause_mode = 'wall' WHERE id = $1`, runID)
+				fx.env.exec(`INSERT INTO run_user_inputs (run_id, kind, body) VALUES ($1, 'pause', 'wall')`, runID)
+			} else if _, err := fx.env.q.CreatePauseInput(fx.env.ctx, store.CreatePauseInputParams{
+				ID: runID, Mode: pgconv.TextOrNull(tc.mode),
+			}); err != nil {
+				t.Fatalf("CreatePauseInput: %v", err)
+			}
+			// The worker dies: the re-register requeue keeps the pending pause by design.
+			if _, err := fx.env.q.RequeueWorkerRuns(fx.env.ctx, store.RequeueWorkerRunsParams{
+				WorkerID: pgconv.UUID(fx.workerID), MaxRequeues: 5,
+			}); err != nil {
+				t.Fatalf("RequeueWorkerRuns: %v", err)
+			}
+			fx.setEnabled(fx.pinTok, false)
+			if payload, err := fx.svc.Claim(fx.env.ctx, fx.worker(t), nil); err != nil || payload != nil {
+				t.Fatalf("re-claim = (%v, %v), want an idle park", payload != nil, err)
+			}
+			if r := assertHeld(t, fx.env, runID, true); !r.PauseRequestedAt.Valid {
+				t.Fatal("the park consumed the pending pause")
+			}
+			fx.env.exec(`UPDATE runs SET status_since = now() - interval '10 minutes' WHERE id = $1`, runID)
+
+			fx.setEnabled(fx.pinTok, true)
+			fx.svc.RequestCredentialDisabledPromotion(fx.userID)
+			r := mustRun(t, fx.env, runID)
+			if r.Status != "paused" || r.HoldReason.String != tc.wantHold || r.PauseRequestedAt.Valid || r.PauseMode.Valid {
+				t.Fatalf("settled: status=%s hold=%q pending=%v mode=%v, want paused hold=%q with the request consumed",
+					r.Status, r.HoldReason.String, r.PauseRequestedAt.Valid, r.PauseMode, tc.wantHold)
+			}
+			var unapplied int
+			if err := fx.env.pool.QueryRow(fx.env.ctx, `SELECT count(*) FROM run_user_inputs
+			    WHERE run_id = $1 AND kind = 'pause' AND applied_at IS NULL`, runID).Scan(&unapplied); err != nil {
+				t.Fatal(err)
+			}
+			if unapplied != 0 {
+				t.Fatalf("unapplied pause inputs = %d, want 0", unapplied)
+			}
+			if tc.mode == "wall" {
+				return // budget_exhausted is resumed by extend, not ResumePausedRun
+			}
+			// The owner resumes it like any owner pause, banking the whole held interval.
+			if _, err := fx.env.q.ResumePausedRun(fx.env.ctx, store.ResumePausedRunParams{
+				ID: runID, UserID: fx.userID, GlobalTimeoutSeconds: int32(testParams().RunTimeout.Seconds()),
+			}); err != nil {
+				t.Fatalf("ResumePausedRun: %v", err)
+			}
+			if r := mustRun(t, fx.env, runID); r.Status != "queued" || r.BudgetPausedSeconds < 600 {
+				t.Fatalf("resumed: status=%s banked=%ds, want queued with the held interval banked", r.Status, r.BudgetPausedSeconds)
+			}
+		})
+	}
 }

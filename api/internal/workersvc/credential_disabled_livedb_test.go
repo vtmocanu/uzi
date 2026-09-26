@@ -318,7 +318,8 @@ func TestFinishRunClaimCredentialDisabledRollbackLiveDB(t *testing.T) {
 
 // TestCredentialPromoterRequirementLiveDB is the requirement table: each parked run resumes
 // only when the exact credential its next claim needs is enabled. A different default never
-// wakes an explicit pin, and an owner pause keeps the run paused.
+// wakes an explicit pin, and a pending owner pause is never promoted past: once the requirement
+// is met the run settles into that owner pause (TestCredentialDisabledPendingPauseConvergesLiveDB).
 //
 // MUTATION: make credentialRequirementMet return true unconditionally; the pinned rows are
 // then promoted while their pin is disabled and this test fails.
@@ -340,12 +341,13 @@ func TestCredentialPromoterRequirementLiveDB(t *testing.T) {
 	fx.env.exec(`UPDATE user_secrets SET is_default = false WHERE id = $1`, fx.defTok)
 	fx.env.exec(`UPDATE user_secrets SET is_default = true WHERE id = $1`, fx.otherTok)
 	fx.svc.RequestCredentialDisabledPromotion(fx.userID)
-	for _, id := range []uuid.UUID{workerPin, overridePin, ownerPaused, judgePin} {
+	for _, id := range []uuid.UUID{workerPin, overridePin, judgePin} {
 		assertHeld(t, fx.env, id, true)
 	}
 	assertHeld(t, fx.env, overrideDefault, false)
-	if r := mustRun(t, fx.env, ownerPaused); !r.PauseRequestedAt.Valid {
-		t.Fatal("the owner pause was consumed")
+	if r := mustRun(t, fx.env, ownerPaused); r.Status != "paused" || r.HoldReason.Valid || r.PauseRequestedAt.Valid {
+		t.Fatalf("pending owner pause: status=%s hold=%v pending=%v, want settled into the owner pause",
+			r.Status, r.HoldReason, r.PauseRequestedAt.Valid)
 	}
 
 	fx.setEnabled(fx.pinTok, true)
@@ -353,7 +355,9 @@ func TestCredentialPromoterRequirementLiveDB(t *testing.T) {
 	for _, id := range []uuid.UUID{workerPin, overridePin, judgePin} {
 		assertHeld(t, fx.env, id, false)
 	}
-	assertHeld(t, fx.env, ownerPaused, true)
+	if r := mustRun(t, fx.env, ownerPaused); r.Status != "paused" || r.HoldReason.Valid {
+		t.Fatalf("owner pause: status=%s hold=%v, want still paused by the owner", r.Status, r.HoldReason)
+	}
 }
 
 // TestCredentialPromoterSweepAfterRestartLiveDB: a credential enabled while no pass was
@@ -467,7 +471,7 @@ func TestCredentialPromoterLockOrderVsReassignmentLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
-	var promoted bool
+	var promoted string
 	var promoteErr error
 	wg.Add(1)
 	go func() {
@@ -487,8 +491,8 @@ func TestCredentialPromoterLockOrderVsReassignmentLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	wg.Wait()
-	if promoteErr != nil || promoted {
-		t.Fatalf("promoter = (%t, %v), want (false, nil) after losing to the reassignment", promoted, promoteErr)
+	if promoteErr != nil || promoted != "" {
+		t.Fatalf("promoter = (%q, %v), want (\"\", nil) after losing to the reassignment", promoted, promoteErr)
 	}
 	r := assertHeld(t, fx.env, runID, false)
 	if uuid.UUID(r.CredentialOverrideSecretID.Bytes) != fx.otherTok {
@@ -516,8 +520,8 @@ func TestCredentialPromoterWinsReassignmentLiveDB(t *testing.T) {
 	promoted, err := fx.svc.promoteCredentialDisabledRun(fx.env.ctx, fx.userID, runID)
 	fx.svc.credPromoteHooks = nil
 	wg.Wait()
-	if err != nil || !promoted {
-		t.Fatalf("promoter = (%t, %v), want it to win", promoted, err)
+	if err != nil || promoted != "queued" {
+		t.Fatalf("promoter = (%q, %v), want it to win", promoted, err)
 	}
 	if !errors.Is(reassignErr, ErrCredentialSwitchRaced) {
 		t.Fatalf("reassignment err = %v, want ErrCredentialSwitchRaced", reassignErr)
@@ -578,7 +582,7 @@ func TestCredentialPromoterConcurrentRequirementChangesLiveDB(t *testing.T) {
 				t.Fatalf("requirement write: %v", err)
 			}
 			var wg sync.WaitGroup
-			var promoted bool
+			var promoted string
 			var promoteErr error
 			wg.Add(1)
 			go func() {
@@ -590,8 +594,8 @@ func TestCredentialPromoterConcurrentRequirementChangesLiveDB(t *testing.T) {
 				t.Fatal(err)
 			}
 			wg.Wait()
-			if promoteErr != nil || promoted {
-				t.Fatalf("promoter = (%t, %v), want the run kept held on the new requirement", promoted, promoteErr)
+			if promoteErr != nil || promoted != "" {
+				t.Fatalf("promoter = (%q, %v), want the run kept held on the new requirement", promoted, promoteErr)
 			}
 			assertHeld(t, fx.env, runID, true)
 		})
@@ -602,12 +606,12 @@ func TestCredentialPromoterConcurrentRequirementChangesLiveDB(t *testing.T) {
 // owner is skipped without error.
 func TestCredentialPromoterMissingRunLiveDB(t *testing.T) {
 	fx := newCDFix(t)
-	if ok, err := fx.svc.promoteCredentialDisabledRun(fx.env.ctx, fx.userID, uuid.New()); ok || err != nil {
-		t.Fatalf("missing run = (%t, %v)", ok, err)
+	if st, err := fx.svc.promoteCredentialDisabledRun(fx.env.ctx, fx.userID, uuid.New()); st != "" || err != nil {
+		t.Fatalf("missing run = (%q, %v)", st, err)
 	}
 	runID := fx.parkedRun(t, "issue")
-	if ok, err := fx.svc.promoteCredentialDisabledRun(fx.env.ctx, uuid.New(), runID); ok || err != nil {
-		t.Fatalf("foreign owner = (%t, %v)", ok, err)
+	if st, err := fx.svc.promoteCredentialDisabledRun(fx.env.ctx, uuid.New(), runID); st != "" || err != nil {
+		t.Fatalf("foreign owner = (%q, %v)", st, err)
 	}
 	if _, err := fx.env.q.GetRunByID(fx.env.ctx, runID); errors.Is(err, pgx.ErrNoRows) {
 		t.Fatal("run vanished")

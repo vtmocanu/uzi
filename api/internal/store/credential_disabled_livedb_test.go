@@ -23,8 +23,7 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 	mustExec(ctx, t, pool, `UPDATE runs SET started_at=$2, status_since=$2, claim_generation=7,
         session_id='resume-session', budget_wall_seconds=60, budget_paused_seconds=3,
         codex_cap_hash=decode('aabb','hex'), codex_claim_epoch=4,
-        pause_requested_at=now(), pause_mode='now', recovery_wait_count=2,
-        claimed_worker_nonce='incarnation-a'
+        pause_requested_at=now(), pause_mode='now', recovery_wait_count=2
         WHERE id=$1`, run, started)
 	mustExec(ctx, t, pool, `UPDATE workers SET snapshot_register_nonce='incarnation-b' WHERE id=$1`, worker)
 	pgWorker := pgtype.UUID{Bytes: worker, Valid: true}
@@ -101,16 +100,16 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 		}
 	}
 	read()
-	// The payload was never delivered, so the park fences no incarnation: no D19 released pair
-	// and no credential-disable released worker, which would bar the parking worker itself.
-	var releasedID, cdReleased pgtype.UUID
+	// The payload was never delivered, so the park fences no incarnation: no D19 released pair,
+	// which would bar the parking worker itself.
+	var releasedID pgtype.UUID
 	var releasedNonce pgtype.Text
-	if err := pool.QueryRow(ctx, `SELECT released_worker_id, released_worker_nonce, credential_disable_released_worker_id
-        FROM runs WHERE id=$1`, run).Scan(&releasedID, &releasedNonce, &cdReleased); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT released_worker_id, released_worker_nonce
+        FROM runs WHERE id=$1`, run).Scan(&releasedID, &releasedNonce); err != nil {
 		t.Fatalf("read released worker: %v", err)
 	}
-	if releasedID.Valid || releasedNonce.Valid || cdReleased.Valid {
-		t.Fatalf("released incarnation = %v/%v/%v, want none", releasedID, releasedNonce, cdReleased)
+	if releasedID.Valid || releasedNonce.Valid {
+		t.Fatalf("released incarnation = %v/%v, want none", releasedID, releasedNonce)
 	}
 	if status != "paused" || (!hold.Valid || hold.String != "credential_disabled") || bank != 3 || epoch != 5 || cap != nil ||
 		!gotStarted.Equal(started) || session != "resume-session" || !ownerWorker.Valid || ownerWorker.Bytes != worker ||
@@ -155,9 +154,6 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 			p.ExpectedCodexSecretID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
 		},
 		"worker": func(p *store.PromoteCredentialDisabledRunParams) { p.ExpectedWorkerID = pgtype.UUID{} },
-		"released worker": func(p *store.PromoteCredentialDisabledRunParams) {
-			p.ExpectedReleasedWorkerID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
-		},
 	} {
 		mustExec(ctx, t, pool, `UPDATE runs SET pause_requested_at=NULL WHERE id=$1`, run)
 		arg := promoteParams(ctx, t, pool, run, user, 60)
@@ -205,7 +201,6 @@ func TestCredentialDisabledSameWorkerReclaimLiveDB(t *testing.T) {
 	fx := newWPFixture(t)
 	worker := fx.worker("reclaim", wpWorker{nonce: "incarnation-a"})
 	run := fx.run(wpRun{status: "claimed", worker: &worker, claimGen: 4, budgetWall: p32(36000)})
-	mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET claimed_worker_nonce='incarnation-a' WHERE id=$1`, run)
 	if n, err := fx.q.ParkCredentialDisabledRun(fx.ctx, store.ParkCredentialDisabledRunParams{
 		ID: run, WorkerID: pgtype.UUID{Bytes: worker, Valid: true}, ClaimGeneration: 4,
 	}); err != nil || n != 1 {
@@ -287,9 +282,9 @@ func promoteParams(ctx context.Context, t *testing.T, pool *pgxpool.Pool, run, o
 	t.Helper()
 	arg := store.PromoteCredentialDisabledRunParams{ID: run, UserID: owner, GlobalTimeoutSeconds: global}
 	if err := pool.QueryRow(ctx, `SELECT credential_override_mode, credential_override_secret_id, codex_secret_id,
-	    worker_id, credential_disable_released_worker_id FROM runs WHERE id=$1`, run).Scan(
+	    worker_id FROM runs WHERE id=$1`, run).Scan(
 		&arg.ExpectedOverrideMode, &arg.ExpectedOverrideSecretID, &arg.ExpectedCodexSecretID,
-		&arg.ExpectedWorkerID, &arg.ExpectedReleasedWorkerID); err != nil {
+		&arg.ExpectedWorkerID); err != nil {
 		t.Fatalf("read requirement columns: %v", err)
 	}
 	return arg

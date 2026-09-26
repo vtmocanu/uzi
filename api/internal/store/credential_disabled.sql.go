@@ -30,26 +30,6 @@ func (q *Queries) HasEnabledAnthropicForJudgeAuto(ctx context.Context, userID uu
 	return available, err
 }
 
-const hasEnabledPooledAnthropic = `-- name: HasEnabledPooledAnthropic :one
-SELECT EXISTS (
-    SELECT 1 FROM user_secrets
-    WHERE user_id = $1 AND kind = 'anthropic_token' AND disabled_at IS NULL
-      AND auto_eligible
-)::boolean AS available
-`
-
-// Promoter step (4) for an ordinary auto lane (a worker bound auto, or a per-run auto
-// override): the lane spends only pooled tokens (secretchoice's pooled-only promise), so it
-// can serve the run only when an ENABLED auto-eligible token exists. The default is not a
-// fallback here (that is the Judge/self-improve rule above). Read under the user's secret
-// mutation lock, which every enablement and pool opt-in writer takes.
-func (q *Queries) HasEnabledPooledAnthropic(ctx context.Context, userID uuid.UUID) (bool, error) {
-	row := q.db.QueryRow(ctx, hasEnabledPooledAnthropic, userID)
-	var available bool
-	err := row.Scan(&available)
-	return available, err
-}
-
 const listCredentialDisabledRuns = `-- name: ListCredentialDisabledRuns :many
 SELECT id, user_id, status_since FROM runs
 WHERE user_id = $1 AND status = 'paused' AND hold_reason = 'credential_disabled'
@@ -136,9 +116,8 @@ func (q *Queries) ListCredentialDisabledUsers(ctx context.Context, arg ListCrede
 }
 
 const lockCredentialDisabledRunForPromotion = `-- name: LockCredentialDisabledRunForPromotion :one
-SELECT id, user_id, kind, harness, status, hold_reason, pause_requested_at,
-       credential_override_mode, credential_override_secret_id, codex_secret_id,
-       worker_id, credential_disable_released_worker_id
+SELECT id, user_id, kind, harness, status, hold_reason, pause_requested_at, pause_mode,
+       credential_override_mode, credential_override_secret_id, codex_secret_id, worker_id
 FROM runs
 WHERE id = $1 AND user_id = $2
 FOR UPDATE
@@ -150,18 +129,18 @@ type LockCredentialDisabledRunForPromotionParams struct {
 }
 
 type LockCredentialDisabledRunForPromotionRow struct {
-	ID                                uuid.UUID          `json:"id"`
-	UserID                            uuid.UUID          `json:"user_id"`
-	Kind                              string             `json:"kind"`
-	Harness                           string             `json:"harness"`
-	Status                            string             `json:"status"`
-	HoldReason                        pgtype.Text        `json:"hold_reason"`
-	PauseRequestedAt                  pgtype.Timestamptz `json:"pause_requested_at"`
-	CredentialOverrideMode            pgtype.Text        `json:"credential_override_mode"`
-	CredentialOverrideSecretID        pgtype.UUID        `json:"credential_override_secret_id"`
-	CodexSecretID                     pgtype.UUID        `json:"codex_secret_id"`
-	WorkerID                          pgtype.UUID        `json:"worker_id"`
-	CredentialDisableReleasedWorkerID pgtype.UUID        `json:"credential_disable_released_worker_id"`
+	ID                         uuid.UUID          `json:"id"`
+	UserID                     uuid.UUID          `json:"user_id"`
+	Kind                       string             `json:"kind"`
+	Harness                    string             `json:"harness"`
+	Status                     string             `json:"status"`
+	HoldReason                 pgtype.Text        `json:"hold_reason"`
+	PauseRequestedAt           pgtype.Timestamptz `json:"pause_requested_at"`
+	PauseMode                  pgtype.Text        `json:"pause_mode"`
+	CredentialOverrideMode     pgtype.Text        `json:"credential_override_mode"`
+	CredentialOverrideSecretID pgtype.UUID        `json:"credential_override_secret_id"`
+	CodexSecretID              pgtype.UUID        `json:"codex_secret_id"`
+	WorkerID                   pgtype.UUID        `json:"worker_id"`
 }
 
 // Promoter step (2): the candidate run row, locked AFTER the user's secret mutation
@@ -177,11 +156,11 @@ func (q *Queries) LockCredentialDisabledRunForPromotion(ctx context.Context, arg
 		&i.Status,
 		&i.HoldReason,
 		&i.PauseRequestedAt,
+		&i.PauseMode,
 		&i.CredentialOverrideMode,
 		&i.CredentialOverrideSecretID,
 		&i.CodexSecretID,
 		&i.WorkerID,
-		&i.CredentialDisableReleasedWorkerID,
 	)
 	return i, err
 }
@@ -308,6 +287,36 @@ func (q *Queries) LockWorkerBindingForShare(ctx context.Context, arg LockWorkerB
 	return i, err
 }
 
+const parkCredentialDisabledChatRun = `-- name: ParkCredentialDisabledChatRun :execrows
+UPDATE runs SET
+    status = 'paused',
+    status_since = now(),
+    hold_reason = 'credential_disabled',
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.id = $1 AND runs.worker_id = $2
+  AND runs.kind = 'chat'
+  AND runs.status = 'claimed'
+`
+
+type ParkCredentialDisabledChatRunParams struct {
+	ID       uuid.UUID   `json:"id"`
+	WorkerID pgtype.UUID `json:"worker_id"`
+}
+
+// The chat lane's twin of ParkCredentialDisabledRun (PRD #1732 D2/D14). ClaimChatRun has no
+// claim generation, capability or custody hold, so the fence is the claimed chat row this
+// worker just claimed. Chat is not bindable: it parks only when the owner's default resolves to
+// a disabled row or every Anthropic token is disabled (no default), and the promoter queues it
+// again once the slot has an enabled default. worker_id is kept as resume affinity.
+func (q *Queries) ParkCredentialDisabledChatRun(ctx context.Context, arg ParkCredentialDisabledChatRunParams) (int64, error) {
+	result, err := q.db.Exec(ctx, parkCredentialDisabledChatRun, arg.ID, arg.WorkerID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const parkCredentialDisabledRun = `-- name: ParkCredentialDisabledRun :execrows
 UPDATE runs SET
     status = 'paused',
@@ -335,10 +344,9 @@ type ParkCredentialDisabledRunParams struct {
 // custody, or recovery state. A running flight is never parked (D3): its claim finishes.
 //
 // The payload was never handed to the worker, so there is no flight to fence: the D19
-// released-incarnation pair (released_worker_id / released_worker_nonce) and
-// credential_disable_released_worker_id are deliberately NOT written. Writing them would
-// bar the parking worker's own live incarnation from ever reclaiming the run after
-// promotion (a single-worker deployment would strand it queued). worker_id is kept as
+// released-incarnation pair (released_worker_id / released_worker_nonce) is deliberately
+// NOT written. Writing it would bar the parking worker's own live incarnation from ever
+// reclaiming the run after promotion (a single-worker deployment would strand it queued). worker_id is kept as
 // resume affinity, exactly like RequeueClaimAssemblyExact; the claim capability is revoked
 // (codex_cap_hash NULL, epoch + 1) and claim_released_at rejects any report at this
 // generation until the next ClaimRun clears it.
@@ -382,9 +390,10 @@ WHERE id = $1 AND user_id = $2
   AND credential_override_secret_id IS NOT DISTINCT FROM $4::uuid
   AND codex_secret_id IS NOT DISTINCT FROM $5::uuid
   AND worker_id IS NOT DISTINCT FROM $6::uuid
-  AND credential_disable_released_worker_id IS NOT DISTINCT FROM $7::uuid
-  AND (started_at IS NULL OR
-       (COALESCE(budget_wall_seconds, $8::int)
+  -- Untimed runs (chat, judge, interactive) have no wall (RequestWallParks' own exclusions),
+  -- so the spent-budget guard applies only to a timed run.
+  AND (kind IN ('chat', 'judge') OR interactive OR started_at IS NULL OR
+       (COALESCE(budget_wall_seconds, $7::int)
           + budget_extension_seconds + budget_finalize_seconds)
        - (GREATEST(0, EXTRACT(EPOCH FROM (status_since - started_at))::int)
           - budget_paused_seconds) > 0)
@@ -398,7 +407,6 @@ type PromoteCredentialDisabledRunParams struct {
 	ExpectedOverrideSecretID pgtype.UUID `json:"expected_override_secret_id"`
 	ExpectedCodexSecretID    pgtype.UUID `json:"expected_codex_secret_id"`
 	ExpectedWorkerID         pgtype.UUID `json:"expected_worker_id"`
-	ExpectedReleasedWorkerID pgtype.UUID `json:"expected_released_worker_id"`
 	GlobalTimeoutSeconds     int32       `json:"global_timeout_seconds"`
 }
 
@@ -418,7 +426,6 @@ func (q *Queries) PromoteCredentialDisabledRun(ctx context.Context, arg PromoteC
 		arg.ExpectedOverrideSecretID,
 		arg.ExpectedCodexSecretID,
 		arg.ExpectedWorkerID,
-		arg.ExpectedReleasedWorkerID,
 		arg.GlobalTimeoutSeconds,
 	)
 	var i PromoteCredentialDisabledRunRow
@@ -445,7 +452,9 @@ UPDATE runs SET
 WHERE id = $3 AND user_id = $4
   AND status = 'paused' AND hold_reason = 'credential_disabled'
   AND pause_requested_at IS NULL
-  AND (started_at IS NULL OR
+  -- Untimed runs (chat, judge, interactive) have no wall (RequestWallParks' own exclusions),
+  -- so the spent-budget guard applies only to a timed run.
+  AND (kind IN ('chat', 'judge') OR interactive OR started_at IS NULL OR
        (COALESCE(budget_wall_seconds, $5::int)
           + budget_extension_seconds + budget_finalize_seconds)
        - (GREATEST(0, EXTRACT(EPOCH FROM (status_since - started_at))::int)
@@ -479,5 +488,73 @@ func (q *Queries) ReassignCredentialDisabledRun(ctx context.Context, arg Reassig
 	)
 	var i ReassignCredentialDisabledRunRow
 	err := row.Scan(&i.ID, &i.UserID, &i.Status)
+	return i, err
+}
+
+const settleCredentialDisabledPause = `-- name: SettleCredentialDisabledPause :one
+WITH settled_inputs AS (
+    UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
+    WHERE u.run_id = $1 AND u.kind = 'pause' AND u.applied_at IS NULL
+      AND EXISTS (SELECT 1 FROM runs r WHERE r.id = $1 AND r.user_id = $2
+                  AND r.status = 'paused' AND r.hold_reason = 'credential_disabled'
+                  AND r.pause_requested_at IS NOT NULL)
+)
+UPDATE runs SET
+    hold_reason = CASE WHEN runs.pause_mode = 'wall' THEN 'budget_exhausted' ELSE NULL END,
+    pause_requested_at = NULL,
+    pause_mode = NULL,
+    pause_after_count = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.id = $1 AND runs.user_id = $2
+  AND runs.status = 'paused' AND runs.hold_reason = 'credential_disabled'
+  AND runs.pause_requested_at IS NOT NULL
+  AND runs.credential_override_mode IS NOT DISTINCT FROM $3::text
+  AND runs.credential_override_secret_id IS NOT DISTINCT FROM $4::uuid
+  AND runs.codex_secret_id IS NOT DISTINCT FROM $5::uuid
+  AND runs.worker_id IS NOT DISTINCT FROM $6::uuid
+RETURNING runs.id, runs.status, runs.hold_reason
+`
+
+type SettleCredentialDisabledPauseParams struct {
+	ID                       uuid.UUID   `json:"id"`
+	UserID                   uuid.UUID   `json:"user_id"`
+	ExpectedOverrideMode     pgtype.Text `json:"expected_override_mode"`
+	ExpectedOverrideSecretID pgtype.UUID `json:"expected_override_secret_id"`
+	ExpectedCodexSecretID    pgtype.UUID `json:"expected_codex_secret_id"`
+	ExpectedWorkerID         pgtype.UUID `json:"expected_worker_id"`
+}
+
+type SettleCredentialDisabledPauseRow struct {
+	ID         uuid.UUID   `json:"id"`
+	Status     string      `json:"status"`
+	HoldReason pgtype.Text `json:"hold_reason"`
+}
+
+// A held run that also carries a PENDING pause request converges into that pause once its
+// credential requirement is met (PRD #1732 D14: the promoter never bypasses an owner pause).
+// A pending request survives the involuntary parks by design (SetRunPaused's comment), so a
+// run whose worker died after CreatePauseInput is requeued, reclaimed and parked here still
+// carrying it. Promoting it to queued would run it past the pause the owner asked for, and
+// leaving it held would strand it: ResumePausedRun refuses this hold and CancelPauseInput
+// only matches a running row. So the request is CONSUMED exactly as the park it asked for
+// would consume it: an owner 'milestone'/'now' request lands in the ordinary owner pause
+// (hold_reason NULL, resumed by the owner through ResumePausedRun); a system 'wall' request
+// lands in the budget_exhausted hold the wall park writes (resumed by extend). The status
+// stays 'paused', so status_since is kept: the resume that later leaves the pause banks the
+// whole parked interval, credential hold included, exactly once. The pause's unapplied
+// steering inputs are settled so a resumed flight is never handed a stale pause, and the
+// same requirement guards as the promotion apply.
+func (q *Queries) SettleCredentialDisabledPause(ctx context.Context, arg SettleCredentialDisabledPauseParams) (SettleCredentialDisabledPauseRow, error) {
+	row := q.db.QueryRow(ctx, settleCredentialDisabledPause,
+		arg.ID,
+		arg.UserID,
+		arg.ExpectedOverrideMode,
+		arg.ExpectedOverrideSecretID,
+		arg.ExpectedCodexSecretID,
+		arg.ExpectedWorkerID,
+	)
+	var i SettleCredentialDisabledPauseRow
+	err := row.Scan(&i.ID, &i.Status, &i.HoldReason)
 	return i, err
 }

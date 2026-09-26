@@ -52,6 +52,11 @@ func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleI
 	// the schedule's pinned run_schedules.harness (nil ⇒ implicit D11); the fire-time codex+override
 	// conflict is gated by the scheduler's firePrompt (D5).
 	run, err := s.createRunResolved(ctx, userID, explicit, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		// PRD #1732 D2: a stored pin disabled since the schedule was saved starts no run on
+		// it (ErrCredentialDisabled -> the credential_disabled skip), inside the create tx.
+		if err := checkStoredOverrideEnabled(ctx, q, userID, credOverride); err != nil {
+			return store.Run{}, err
+		}
 		return q.CreatePromptRun(ctx, store.CreatePromptRunParams{
 			UserID:           userID,
 			RepoID:           repoID,

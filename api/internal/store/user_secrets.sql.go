@@ -35,6 +35,21 @@ func (q *Queries) ClearDefaultUserSecret(ctx context.Context, arg ClearDefaultUs
 	return result.RowsAffected(), nil
 }
 
+const countEnabledCodexSecrets = `-- name: CountEnabledCodexSecrets :one
+SELECT count(*) FROM user_secrets
+WHERE user_id = $1 AND kind IN ('openai_api_key', 'codex_auth') AND disabled_at IS NULL
+`
+
+// How many ENABLED codex-kind credentials the user holds across both kinds (PRD #1732
+// D15): the harness resolver's "is Codex configured" guard. A slot whose credentials are
+// all disabled has no default (D4) and counts as unavailable for a new implicit request.
+func (q *Queries) CountEnabledCodexSecrets(ctx context.Context, userID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countEnabledCodexSecrets, userID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countEnabledSecretSlot = `-- name: CountEnabledSecretSlot :one
 SELECT count(*) FROM user_secrets
 WHERE user_id = $1 AND disabled_at IS NULL
@@ -134,7 +149,7 @@ func (q *Queries) GetDefaultUserSecretID(ctx context.Context, arg GetDefaultUser
 }
 
 const getDefaultUserSecretMeta = `-- name: GetDefaultUserSecretMeta :one
-SELECT id, label FROM user_secrets
+SELECT id, label, (disabled_at IS NOT NULL)::boolean AS disabled FROM user_secrets
 WHERE user_id = $1 AND kind = $2 AND is_default
 `
 
@@ -144,8 +159,9 @@ type GetDefaultUserSecretMetaParams struct {
 }
 
 type GetDefaultUserSecretMetaRow struct {
-	ID    uuid.UUID `json:"id"`
-	Label string    `json:"label"`
+	ID       uuid.UUID `json:"id"`
+	Label    string    `json:"label"`
+	Disabled bool      `json:"disabled"`
 }
 
 // Resolve the user's default secret of a kind to its id AND its label, in one
@@ -171,10 +187,14 @@ type GetDefaultUserSecretMetaRow struct {
 // this user" credential failure — a token-less user's run has always failed that
 // way, and leaking a different error from here would silently rewrite
 // runs.failure_reason for a case that has not changed.
+//
+// disabled (PRD #1732 D2/D15) rides along so the claim path and the harness resolver
+// can refuse a disabled row without a second read. Every default is enabled by D4, so
+// it is false in steady state; it is read defensively, never trusted to be.
 func (q *Queries) GetDefaultUserSecretMeta(ctx context.Context, arg GetDefaultUserSecretMetaParams) (GetDefaultUserSecretMetaRow, error) {
 	row := q.db.QueryRow(ctx, getDefaultUserSecretMeta, arg.UserID, arg.Kind)
 	var i GetDefaultUserSecretMetaRow
-	err := row.Scan(&i.ID, &i.Label)
+	err := row.Scan(&i.ID, &i.Label, &i.Disabled)
 	return i, err
 }
 
@@ -336,7 +356,7 @@ func (q *Queries) GetUserSecretCiphertext(ctx context.Context, arg GetUserSecret
 }
 
 const getUserSecretCiphertextByID = `-- name: GetUserSecretCiphertextByID :one
-SELECT user_id, kind, ciphertext, sealed_with FROM user_secrets
+SELECT user_id, kind, ciphertext, sealed_with, (disabled_at IS NOT NULL)::boolean AS disabled FROM user_secrets
 WHERE id = $1 AND user_id = $2
 `
 
@@ -350,6 +370,7 @@ type GetUserSecretCiphertextByIDRow struct {
 	Kind       string    `json:"kind"`
 	Ciphertext []byte    `json:"ciphertext"`
 	SealedWith string    `json:"sealed_with"`
+	Disabled   bool      `json:"disabled"`
 }
 
 // Fetch one specific secret by identity, for the bound-credential resolution M3
@@ -363,6 +384,9 @@ type GetUserSecretCiphertextByIDRow struct {
 //
 // kind rides along because the DEK AAD is user_id||kind — the opener needs the
 // row's own kind, not one the caller guessed.
+//
+// disabled (PRD #1732 D5) rides along for the binding writers, which confirm ownership
+// through this read and must refuse a disabled credential from the same row.
 func (q *Queries) GetUserSecretCiphertextByID(ctx context.Context, arg GetUserSecretCiphertextByIDParams) (GetUserSecretCiphertextByIDRow, error) {
 	row := q.db.QueryRow(ctx, getUserSecretCiphertextByID, arg.ID, arg.UserID)
 	var i GetUserSecretCiphertextByIDRow
@@ -371,6 +395,7 @@ func (q *Queries) GetUserSecretCiphertextByID(ctx context.Context, arg GetUserSe
 		&i.Kind,
 		&i.Ciphertext,
 		&i.SealedWith,
+		&i.Disabled,
 	)
 	return i, err
 }
@@ -440,7 +465,7 @@ func (q *Queries) GetUserSecretIDByLabel(ctx context.Context, arg GetUserSecretI
 }
 
 const getUserSecretMetaByID = `-- name: GetUserSecretMetaByID :one
-SELECT id, label, kind FROM user_secrets
+SELECT id, label, kind, (disabled_at IS NOT NULL)::boolean AS disabled FROM user_secrets
 WHERE id = $1 AND user_id = $2
 `
 
@@ -450,9 +475,10 @@ type GetUserSecretMetaByIDParams struct {
 }
 
 type GetUserSecretMetaByIDRow struct {
-	ID    uuid.UUID `json:"id"`
-	Label string    `json:"label"`
-	Kind  string    `json:"kind"`
+	ID       uuid.UUID `json:"id"`
+	Label    string    `json:"label"`
+	Kind     string    `json:"kind"`
+	Disabled bool      `json:"disabled"`
 }
 
 // The by-id counterpart of GetDefaultUserSecretMeta (PRD #111 M1): the label of
@@ -478,15 +504,23 @@ type GetUserSecretMetaByIDRow struct {
 // the binding was frozen with (a codex_auth alias bound as an api_key, or an
 // openai_api_key bound as a subscription, is a contradiction the audit found unchecked).
 // The predicate stays unfiltered on kind for the reason above; only the SELECT list grows.
+//
+// disabled (PRD #1732 D2/D5) rides along the same way: the claim path parks a run whose
+// named credential is disabled, and the binding writers refuse one, from this one read.
 func (q *Queries) GetUserSecretMetaByID(ctx context.Context, arg GetUserSecretMetaByIDParams) (GetUserSecretMetaByIDRow, error) {
 	row := q.db.QueryRow(ctx, getUserSecretMetaByID, arg.ID, arg.UserID)
 	var i GetUserSecretMetaByIDRow
-	err := row.Scan(&i.ID, &i.Label, &i.Kind)
+	err := row.Scan(
+		&i.ID,
+		&i.Label,
+		&i.Kind,
+		&i.Disabled,
+	)
 	return i, err
 }
 
 const getUserSecretMetaByIDOfKind = `-- name: GetUserSecretMetaByIDOfKind :one
-SELECT id, label, kind FROM user_secrets
+SELECT id, label, kind, (disabled_at IS NOT NULL)::boolean AS disabled FROM user_secrets
 WHERE id = $1 AND user_id = $2 AND kind = $3
 `
 
@@ -497,9 +531,10 @@ type GetUserSecretMetaByIDOfKindParams struct {
 }
 
 type GetUserSecretMetaByIDOfKindRow struct {
-	ID    uuid.UUID `json:"id"`
-	Label string    `json:"label"`
-	Kind  string    `json:"kind"`
+	ID       uuid.UUID `json:"id"`
+	Label    string    `json:"label"`
+	Kind     string    `json:"kind"`
+	Disabled bool      `json:"disabled"`
 }
 
 // The kind-SCOPED by-id meta lookup (PRD #1247 M1): the per-run credential override
@@ -510,10 +545,17 @@ type GetUserSecretMetaByIDOfKindRow struct {
 // by the override open path in claimSecretID and by validateCredentialOverride as
 // defense in depth; a wrong-kind or foreign id returns pgx.ErrNoRows, which the caller
 // maps to the same "unavailable" credential failure a foreign id already produces (D9).
+// disabled (PRD #1732 D5) lets the validator refuse a disabled pin and the claim path
+// park on one, from the same owner- and kind-scoped read.
 func (q *Queries) GetUserSecretMetaByIDOfKind(ctx context.Context, arg GetUserSecretMetaByIDOfKindParams) (GetUserSecretMetaByIDOfKindRow, error) {
 	row := q.db.QueryRow(ctx, getUserSecretMetaByIDOfKind, arg.ID, arg.UserID, arg.Kind)
 	var i GetUserSecretMetaByIDOfKindRow
-	err := row.Scan(&i.ID, &i.Label, &i.Kind)
+	err := row.Scan(
+		&i.ID,
+		&i.Label,
+		&i.Kind,
+		&i.Disabled,
+	)
 	return i, err
 }
 
@@ -1348,4 +1390,22 @@ func (q *Queries) UserHasAutoEligibleAnthropicToken(ctx context.Context, userID 
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
+}
+
+const userHasEnabledAnthropicToken = `-- name: UserHasEnabledAnthropicToken :one
+SELECT EXISTS (
+    SELECT 1 FROM user_secrets
+    WHERE user_id = $1 AND kind = 'anthropic_token' AND disabled_at IS NULL
+)::boolean AS has_enabled
+`
+
+// Whether the user holds an ENABLED anthropic_token (PRD #1732 D15): the harness
+// resolver's Claude usability and the automatic MR-rework door check. It is the enabled
+// variant of UserHasAnthropicToken, which keeps answering "any credential at all" for
+// the rate-limit meters' no_token. By D4 an enabled token implies an enabled default.
+func (q *Queries) UserHasEnabledAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, userHasEnabledAnthropicToken, userID)
+	var has_enabled bool
+	err := row.Scan(&has_enabled)
+	return has_enabled, err
 }

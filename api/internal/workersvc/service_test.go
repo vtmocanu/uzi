@@ -765,6 +765,9 @@ func (f *fakeStore) ClaimChatRun(_ context.Context, arg store.ClaimChatRunParams
 	f.callOrder = append(f.callOrder, "claim_chat")
 	return f.chatClaimRun, f.chatClaimErr
 }
+func (f *fakeStore) ParkCredentialDisabledChatRun(context.Context, store.ParkCredentialDisabledChatRunParams) (int64, error) {
+	return 1, nil
+}
 func (f *fakeStore) GetChatRunClaimContext(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.resumeSession, nil
 }
@@ -1585,6 +1588,9 @@ func (f *fakeStore) CreateManualMRReworkRunAndAdvance(_ context.Context, arg sto
 	return f.mrReworkRunResult, f.mrReworkRunErr
 }
 func (f *fakeStore) UserHasAnthropicToken(context.Context, uuid.UUID) (bool, error) {
+	return f.hasAnthropicToken, f.hasAnthropicTokenErr
+}
+func (f *fakeStore) UserHasEnabledAnthropicToken(context.Context, uuid.UUID) (bool, error) {
 	return f.hasAnthropicToken, f.hasAnthropicTokenErr
 }
 func (f *fakeStore) CreatePromptRun(_ context.Context, arg store.CreatePromptRunParams) (store.Run, error) {

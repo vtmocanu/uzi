@@ -219,8 +219,11 @@ func parseHarnessParam(raw string) (*workersvc.Harness, bool) {
 //   - ErrCredentialOverrideHarnessUnsupported → 422 (codex effective harness, D9)
 //   - ErrCredentialOverridePinnedNeedsSecret  → 400 (pinned with no id)
 //   - ErrCredentialOverrideInvalidMode        → 400 (mode outside the closed set)
+//   - ErrCredentialDisabled                   → 409 (a disabled token, PRD #1732 D5)
 func (h *Handler) writeCredentialOverrideError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, workersvc.ErrCredentialDisabled):
+		httpx.Error(w, http.StatusConflict, workersvc.ErrCredentialDisabled.Error())
 	case errors.Is(err, workersvc.ErrCredentialOverrideSecretNotFound):
 		httpx.Error(w, http.StatusNotFound, "credential override token not found")
 	case errors.Is(err, workersvc.ErrCredentialOverrideLaneNotSwitchable):
@@ -395,6 +398,13 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 	case errors.Is(err, workersvc.ErrBranchInUse):
 		// Issue #1626: an active ci_fix OR mr_rework on agent/issue-<iid> holds the branch.
 		httpx.Error(w, http.StatusConflict, "a CI-fix or MR-rework run is already working this issue's branch; cancel it before starting an issue run")
+	case errors.Is(err, workersvc.ErrHarnessCredentialDisabled):
+		// PRD #1732 D15: an explicit harness whose credentials are all disabled. Still the
+		// stable no_credential_for_harness refusal (no run, no fallback), naming Settings.
+		httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"error": "the selected harness's credentials are all disabled; enable one in Settings",
+			"code":  "no_credential_for_harness",
+		})
 	case errors.Is(err, workersvc.ErrNoCredentialForHarness):
 		// PRD #1429 M2 (D2): an EXPLICIT harness (request or pin) whose credential is unusable —
 		// 422 with the stable no_credential_for_harness classification. Never falls back.
@@ -409,7 +419,8 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 		errors.Is(err, workersvc.ErrCredentialOverrideLaneNotSwitchable),
 		errors.Is(err, workersvc.ErrCredentialOverrideHarnessUnsupported),
 		errors.Is(err, workersvc.ErrCredentialOverridePinnedNeedsSecret),
-		errors.Is(err, workersvc.ErrCredentialOverrideInvalidMode):
+		errors.Is(err, workersvc.ErrCredentialOverrideInvalidMode),
+		errors.Is(err, workersvc.ErrCredentialDisabled):
 		// PRD #1429 M2 (D5): the #1247 credential override is now validated INSIDE the create
 		// transaction (StartRunForUser → createRunAtomic), so its typed refusals surface here.
 		// Reuse the one mapping so the four override write surfaces stay consistent (422 for a

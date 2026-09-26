@@ -3,10 +3,9 @@
 -- custody, or recovery state. A running flight is never parked (D3): its claim finishes.
 --
 -- The payload was never handed to the worker, so there is no flight to fence: the D19
--- released-incarnation pair (released_worker_id / released_worker_nonce) and
--- credential_disable_released_worker_id are deliberately NOT written. Writing them would
--- bar the parking worker's own live incarnation from ever reclaiming the run after
--- promotion (a single-worker deployment would strand it queued). worker_id is kept as
+-- released-incarnation pair (released_worker_id / released_worker_nonce) is deliberately
+-- NOT written. Writing it would bar the parking worker's own live incarnation from ever
+-- reclaiming the run after promotion (a single-worker deployment would strand it queued). worker_id is kept as
 -- resume affinity, exactly like RequeueClaimAssemblyExact; the claim capability is revoked
 -- (codex_cap_hash NULL, epoch + 1) and claim_released_at rejects any report at this
 -- generation until the next ClaimRun clears it.
@@ -31,6 +30,22 @@ UPDATE runs SET
 WHERE runs.id = @id AND runs.worker_id = @worker_id
   AND runs.claim_generation = @claim_generation
   AND runs.claim_released_at IS NULL
+  AND runs.status = 'claimed';
+
+-- The chat lane's twin of ParkCredentialDisabledRun (PRD #1732 D2/D14). ClaimChatRun has no
+-- claim generation, capability or custody hold, so the fence is the claimed chat row this
+-- worker just claimed. Chat is not bindable: it parks only when the owner's default resolves to
+-- a disabled row or every Anthropic token is disabled (no default), and the promoter queues it
+-- again once the slot has an enabled default. worker_id is kept as resume affinity.
+-- name: ParkCredentialDisabledChatRun :execrows
+UPDATE runs SET
+    status = 'paused',
+    status_since = now(),
+    hold_reason = 'credential_disabled',
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND runs.kind = 'chat'
   AND runs.status = 'claimed';
 
 -- The M1 partial index narrows this owner-scoped page to held runs. The caller
@@ -70,8 +85,9 @@ WHERE id = @id AND user_id = @user_id
   AND credential_override_secret_id IS NOT DISTINCT FROM sqlc.narg('expected_override_secret_id')::uuid
   AND codex_secret_id IS NOT DISTINCT FROM sqlc.narg('expected_codex_secret_id')::uuid
   AND worker_id IS NOT DISTINCT FROM sqlc.narg('expected_worker_id')::uuid
-  AND credential_disable_released_worker_id IS NOT DISTINCT FROM sqlc.narg('expected_released_worker_id')::uuid
-  AND (started_at IS NULL OR
+  -- Untimed runs (chat, judge, interactive) have no wall (RequestWallParks' own exclusions),
+  -- so the spent-budget guard applies only to a timed run.
+  AND (kind IN ('chat', 'judge') OR interactive OR started_at IS NULL OR
        (COALESCE(budget_wall_seconds, @global_timeout_seconds::int)
           + budget_extension_seconds + budget_finalize_seconds)
        - (GREATEST(0, EXTRACT(EPOCH FROM (status_since - started_at))::int)
@@ -99,7 +115,9 @@ UPDATE runs SET
 WHERE id = @id AND user_id = @user_id
   AND status = 'paused' AND hold_reason = 'credential_disabled'
   AND pause_requested_at IS NULL
-  AND (started_at IS NULL OR
+  -- Untimed runs (chat, judge, interactive) have no wall (RequestWallParks' own exclusions),
+  -- so the spent-budget guard applies only to a timed run.
+  AND (kind IN ('chat', 'judge') OR interactive OR started_at IS NULL OR
        (COALESCE(budget_wall_seconds, @global_timeout_seconds::int)
           + budget_extension_seconds + budget_finalize_seconds)
        - (GREATEST(0, EXTRACT(EPOCH FROM (status_since - started_at))::int)
@@ -130,9 +148,8 @@ LIMIT @page_size::int;
 -- Promoter step (2): the candidate run row, locked AFTER the user's secret mutation
 -- advisory lock and BEFORE any requirement source or credential row.
 -- name: LockCredentialDisabledRunForPromotion :one
-SELECT id, user_id, kind, harness, status, hold_reason, pause_requested_at,
-       credential_override_mode, credential_override_secret_id, codex_secret_id,
-       worker_id, credential_disable_released_worker_id
+SELECT id, user_id, kind, harness, status, hold_reason, pause_requested_at, pause_mode,
+       credential_override_mode, credential_override_secret_id, codex_secret_id, worker_id
 FROM runs
 WHERE id = @id AND user_id = @user_id
 FOR UPDATE;
@@ -185,14 +202,40 @@ SELECT EXISTS (
       AND (is_default OR auto_eligible)
 )::boolean AS available;
 
--- Promoter step (4) for an ordinary auto lane (a worker bound auto, or a per-run auto
--- override): the lane spends only pooled tokens (secretchoice's pooled-only promise), so it
--- can serve the run only when an ENABLED auto-eligible token exists. The default is not a
--- fallback here (that is the Judge/self-improve rule above). Read under the user's secret
--- mutation lock, which every enablement and pool opt-in writer takes.
--- name: HasEnabledPooledAnthropic :one
-SELECT EXISTS (
-    SELECT 1 FROM user_secrets
-    WHERE user_id = @user_id AND kind = 'anthropic_token' AND disabled_at IS NULL
-      AND auto_eligible
-)::boolean AS available;
+-- A held run that also carries a PENDING pause request converges into that pause once its
+-- credential requirement is met (PRD #1732 D14: the promoter never bypasses an owner pause).
+-- A pending request survives the involuntary parks by design (SetRunPaused's comment), so a
+-- run whose worker died after CreatePauseInput is requeued, reclaimed and parked here still
+-- carrying it. Promoting it to queued would run it past the pause the owner asked for, and
+-- leaving it held would strand it: ResumePausedRun refuses this hold and CancelPauseInput
+-- only matches a running row. So the request is CONSUMED exactly as the park it asked for
+-- would consume it: an owner 'milestone'/'now' request lands in the ordinary owner pause
+-- (hold_reason NULL, resumed by the owner through ResumePausedRun); a system 'wall' request
+-- lands in the budget_exhausted hold the wall park writes (resumed by extend). The status
+-- stays 'paused', so status_since is kept: the resume that later leaves the pause banks the
+-- whole parked interval, credential hold included, exactly once. The pause's unapplied
+-- steering inputs are settled so a resumed flight is never handed a stale pause, and the
+-- same requirement guards as the promotion apply.
+-- name: SettleCredentialDisabledPause :one
+WITH settled_inputs AS (
+    UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
+    WHERE u.run_id = @id AND u.kind = 'pause' AND u.applied_at IS NULL
+      AND EXISTS (SELECT 1 FROM runs r WHERE r.id = @id AND r.user_id = @user_id
+                  AND r.status = 'paused' AND r.hold_reason = 'credential_disabled'
+                  AND r.pause_requested_at IS NOT NULL)
+)
+UPDATE runs SET
+    hold_reason = CASE WHEN runs.pause_mode = 'wall' THEN 'budget_exhausted' ELSE NULL END,
+    pause_requested_at = NULL,
+    pause_mode = NULL,
+    pause_after_count = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.id = @id AND runs.user_id = @user_id
+  AND runs.status = 'paused' AND runs.hold_reason = 'credential_disabled'
+  AND runs.pause_requested_at IS NOT NULL
+  AND runs.credential_override_mode IS NOT DISTINCT FROM sqlc.narg('expected_override_mode')::text
+  AND runs.credential_override_secret_id IS NOT DISTINCT FROM sqlc.narg('expected_override_secret_id')::uuid
+  AND runs.codex_secret_id IS NOT DISTINCT FROM sqlc.narg('expected_codex_secret_id')::uuid
+  AND runs.worker_id IS NOT DISTINCT FROM sqlc.narg('expected_worker_id')::uuid
+RETURNING runs.id, runs.status, runs.hold_reason;

@@ -1490,7 +1490,8 @@ export type ScheduleSkipReason =
   | "open_mr_exists"
   | "codex_override_conflict"
   | "schedules_paused"
-  | "no_usable_credential";
+  | "no_usable_credential"
+  | "credential_disabled";
 
 // One run a persisted fire actually created; issue_iid is null for a prompt schedule.
 export interface LastFireStarted {

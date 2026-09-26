@@ -470,6 +470,9 @@ type Store interface {
 	// lets the automatic watcher re-fire on the same comments.
 	CreateManualMRReworkRunAndAdvance(ctx context.Context, arg store.CreateManualMRReworkRunAndAdvanceParams) (store.Run, error)
 	UserHasAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
+	// UserHasEnabledAnthropicToken is the door-check's ENABLED variant (PRD #1732 D15): a
+	// Claude rework is mintable only when the owner holds an enabled token.
+	UserHasEnabledAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
 	// Self-improvement runs (PRD #46 Decision 10).
 	CreateSelfImproveRun(ctx context.Context, arg store.CreateSelfImproveRunParams) (store.Run, error)
 	// Scheduled prompt runs (PRD #241).
@@ -1088,6 +1091,8 @@ type Store interface {
 	ListChatRunsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListChatRunsForUserRow, error)
 	GetLiveChatForUser(ctx context.Context, userID uuid.UUID) (store.Run, error)
 	ClaimChatRun(ctx context.Context, arg store.ClaimChatRunParams) (store.Run, error)
+	// ParkCredentialDisabledChatRun holds a claimed chat on credential_disabled (PRD #1732 D2).
+	ParkCredentialDisabledChatRun(ctx context.Context, arg store.ParkCredentialDisabledChatRunParams) (int64, error)
 	GetChatRunClaimContext(ctx context.Context, runID uuid.UUID) (pgtype.Text, error)
 	CountChatFollowUps(ctx context.Context, runID uuid.UUID) (int64, error)
 	SweepIdleChatRuns(ctx context.Context, cutoff pgtype.Timestamptz) ([]store.SweepIdleChatRunsRow, error)
@@ -5201,14 +5206,20 @@ func (s *Service) SetWorkerAnthropicToken(ctx context.Context, userID, workerID 
 		if secretID != nil {
 			// Confirm the secret is this user's before writing, so the caller gets a 404
 			// naming what was wrong instead of a 500 from the FK.
-			if _, err := q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
+			row, err := q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
 				ID:     *secretID,
 				UserID: userID,
-			}); err != nil {
+			})
+			if err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
 					return ErrSecretNotOwned
 				}
 				return err
+			}
+			// PRD #1732 D5: a new binding onto a disabled credential is refused, not stored.
+			// Read under the secret mutation lock, so a concurrent disable is serialized.
+			if row.Disabled {
+				return ErrCredentialDisabled
 			}
 			bind = pgconv.UUID(*secretID)
 		}
@@ -5257,14 +5268,20 @@ func (s *Service) SetUserJudgeBinding(ctx context.Context, userID uuid.UUID, mod
 	err := s.withSecretMutation(ctx, userID, func(q secretMutationQueries) error {
 		var bind pgtype.UUID
 		if secretID != nil {
-			if _, err := q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
+			row, err := q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
 				ID:     *secretID,
 				UserID: userID,
-			}); err != nil {
+			})
+			if err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
 					return ErrSecretNotOwned
 				}
 				return err
+			}
+			// PRD #1732 D5: a new binding onto a disabled credential is refused, not stored.
+			// Read under the secret mutation lock, so a concurrent disable is serialized.
+			if row.Disabled {
+				return ErrCredentialDisabled
 			}
 			bind = pgconv.UUID(*secretID)
 		}
@@ -5729,6 +5746,10 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 				return store.Run{}, verr
 			}
 			effOverride = ov
+		} else if err := checkStoredOverrideEnabled(ctx, q, userID, credOverride); err != nil {
+			// PRD #1732 D2: a schedule's stored pin that has since been disabled starts no
+			// run on it; the scheduler records the credential_disabled skip.
+			return store.Run{}, err
 		}
 		// Stamp unseeded issue runs for either resolved harness when the switch is on.
 		var completionContractVersion pgtype.Int4

@@ -44,6 +44,9 @@ const SKIP_REASON_TONES: Record<ScheduleSkipReason, BadgeTone> = {
   // PRD #1429 (D5): the owner has no usable credential for either harness at fire time, so
   // D11 cannot resolve one. Actionable — the owner adds/repairs a credential — so it reads amber.
   no_usable_credential: "warning",
+  // PRD #1732 (D2): the schedule's pinned credential is disabled, or its pinned harness has no
+  // enabled credential. Actionable — the owner enables it in Settings — so it reads amber.
+  credential_disabled: "warning",
 };
 
 // LastRunOutcome is the enriched "Last run" cell for a schedule that has a

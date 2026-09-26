@@ -82,6 +82,15 @@ const (
 	// ErrNoCredentialForHarness (an EXPLICIT/inherited harness that is unusable), which stays a
 	// hard, non-advancing refusal — only the implicit "neither harness usable" case is benign.
 	SkipNoUsableCredential SkipReason = "no_usable_credential" //nolint:gosec // G101: a schedule-skip-reason VOCABULARY value, not a credential — mirrors the same-shaped exclusion already granted the "credential"-named vocabulary constants elsewhere (e.g. store.KindAnthropicToken, capability.CredentialSwitchV1).
+
+	// SkipCredentialDisabled ← workersvc.ErrCredentialDisabled or
+	// workersvc.ErrHarnessCredentialDisabled (PRD #1732 D2/D15): the schedule's stored token pin
+	// is a credential the owner has disabled, or its pinned harness has no enabled credential.
+	// The fire starts no run and never substitutes another credential or harness; the stored
+	// pin is kept. Benign for a recurring row: the schedule advances and re-fires next cadence,
+	// once the owner enables the credential or changes the pin. An implicit-harness fire with no
+	// enabled credential anywhere records no_usable_credential instead (D15).
+	SkipCredentialDisabled SkipReason = "credential_disabled" //nolint:gosec // G101: a schedule-skip-reason VOCABULARY value, not a credential (see SkipNoUsableCredential).
 )
 
 // AllSkipReasons lists every SkipReason in the closed set. The cross-language contract
@@ -97,6 +106,7 @@ var AllSkipReasons = []SkipReason{
 	SkipCodexOverrideConflict,
 	SkipSchedulesPaused,
 	SkipNoUsableCredential,
+	SkipCredentialDisabled,
 }
 
 // skipReasonForErr maps the benign run-creation seam sentinels to their SkipReason.
@@ -129,6 +139,12 @@ func skipReasonForErr(err error) (SkipReason, bool) {
 		// resolving to Codex. The scheduler's fire-time gate normally catches this first, but the
 		// mapping keeps the classification stable if a fire ever surfaces it via the seam.
 		return SkipCodexOverrideConflict, true
+	case errors.Is(err, workersvc.ErrCredentialDisabled), errors.Is(err, workersvc.ErrHarnessCredentialDisabled):
+		// PRD #1732 D2/D15: a disabled stored pin, or a pinned harness with no enabled
+		// credential. Checked before any other credential arm: ErrHarnessCredentialDisabled
+		// wraps ErrNoCredentialForHarness, which otherwise stays a hard refusal. Benign,
+		// advancing, and never a substitution.
+		return SkipCredentialDisabled, true
 	case errors.Is(err, workersvc.ErrNoUsableCredential):
 		// Review fix (PRD #1429): D11 found neither harness usable for the owner. Checked with
 		// errors.Is (not ==) because ErrNoUsableCredential wraps errCredentialUnavailable. Benign,

@@ -29,6 +29,7 @@ const ALL_SCHEDULE_SKIP_REASONS: ScheduleSkipReason[] = [
   "codex_override_conflict",
   "schedules_paused",
   "no_usable_credential",
+  "credential_disabled",
 ];
 
 function reasonsFromGo(): string[] {

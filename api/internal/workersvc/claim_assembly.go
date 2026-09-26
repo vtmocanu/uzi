@@ -59,6 +59,11 @@ import (
 func (s *Service) openWithAutoRetry(ctx context.Context, run store.Run, choice secretChoice) (claimCred, secretChoice, error) {
 	cred, err := s.openAnthropic(ctx, run.UserID, choice.secretID)
 	if err != nil {
+		if choice.parkOnEmptyDefault {
+			if perr := s.parkIfDefaultSlotDisabled(ctx, run.UserID, err); perr != nil {
+				return claimCred{}, secretChoice{}, perr
+			}
+		}
 		if !choice.autoLaneRetryable() || !errors.Is(err, errCredentialUnavailable) {
 			return claimCred{}, secretChoice{}, err
 		}
@@ -74,6 +79,44 @@ func (s *Service) openWithAutoRetry(ctx context.Context, run store.Run, choice s
 		}
 	}
 	return cred, choice, nil
+}
+
+// parkIfDefaultSlotDisabled turns a default-only lane's (Judge, self-improve, chat) "no default
+// token" open failure into the credential_disabled park when the owner does hold Anthropic
+// tokens and every one of them is disabled (PRD #1732 D2/D4: disabling the slot's last token
+// cleared its default). An owner with no token at all, or with an enabled token but no default
+// (not reachable under D4), keeps today's terminal failure. It returns nil when openErr is not
+// the no-default case or the slot is not all-disabled, so the caller keeps openErr.
+func (s *Service) parkIfDefaultSlotDisabled(ctx context.Context, userID uuid.UUID, openErr error) error {
+	var noDefault noAnthropicDefaultError
+	if !errors.As(openErr, &noDefault) {
+		return nil
+	}
+	allDisabled, err := s.anthropicSlotAllDisabled(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if !allDisabled {
+		return nil
+	}
+	return fmt.Errorf("%w: every Anthropic token is disabled, so there is no default; enable one in Settings", errCredentialDisabled)
+}
+
+// anthropicSlotAllDisabled reports whether the owner holds Anthropic tokens and none of them is
+// enabled (PRD #1732 D4: the slot then has no default).
+func (s *Service) anthropicSlotAllDisabled(ctx context.Context, userID uuid.UUID) (bool, error) {
+	has, err := s.q.UserHasAnthropicToken(ctx, userID)
+	if err != nil {
+		return false, fmt.Errorf("anthropic token presence check: %w", err)
+	}
+	if !has {
+		return false, nil
+	}
+	enabled, err := s.q.UserHasEnabledAnthropicToken(ctx, userID)
+	if err != nil {
+		return false, fmt.Errorf("enabled anthropic token check: %w", err)
+	}
+	return !enabled, nil
 }
 
 // workerIdentity is the immutable, non-secret provenance label recorded on a custody
@@ -699,7 +742,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// same-alias re-login in flight parks the run in recovery_wait, and the other
 			// credential failures (kind/mode mismatch, login blob, revoked revision, identity
 			// change, a store defect) stay terminal.
-			if errors.Is(err, errVaultLocked) || errors.Is(err, errRunVanished) || errors.Is(err, errCodexMintAmbiguous) {
+			// errCredentialDisabled (the frozen alias is disabled, refused before any mint) passes
+			// through too: finishRunClaim parks it on credential_disabled (PRD #1732 D14).
+			if errors.Is(err, errVaultLocked) || errors.Is(err, errRunVanished) || errors.Is(err, errCodexMintAmbiguous) ||
+				errors.Is(err, errCredentialDisabled) {
 				return nil, err
 			}
 			return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, err)

@@ -193,15 +193,20 @@ func (s *Service) promoteCredentialDisabledRuns(ctx context.Context, userID uuid
 			return promoted, errors.Join(errs...)
 		}
 		for _, r := range page {
-			ok, err := s.promoteCredentialDisabledRun(ctx, userID, r.ID)
+			status, err := s.promoteCredentialDisabledRun(ctx, userID, r.ID)
 			if err != nil {
 				slog.Error("credential promoter: candidate", "user", userID, "run", r.ID, "error", err)
 				errs = append(errs, fmt.Errorf("promote credential-disabled run %s: %w", r.ID, err))
 				continue
 			}
-			if ok {
+			switch status {
+			case "queued":
 				promoted++
 				s.publishSwept(r.ID, "queued")
+			case "paused":
+				// Settled into the pending pause (owner pause or wall hold): still paused, but
+				// its hold changed, so clients re-render it.
+				s.publishSwept(r.ID, "paused")
 			}
 		}
 		if len(page) < credentialPromotePageSize {
@@ -213,60 +218,76 @@ func (s *Service) promoteCredentialDisabledRuns(ctx context.Context, userID uuid
 }
 
 // promoteCredentialDisabledRun is one candidate's transaction, in the fixed lock order above.
-// It reports whether the run was returned to queued.
-func (s *Service) promoteCredentialDisabledRun(ctx context.Context, userID, runID uuid.UUID) (bool, error) {
+// It returns the status the run left the hold in: "queued" when it was promoted, "paused" when
+// its requirement is met but a pending pause request settled it into that pause instead, or ""
+// when it stays held (or is no longer this hold).
+func (s *Service) promoteCredentialDisabledRun(ctx context.Context, userID, runID uuid.UUID) (string, error) {
 	tx, err := s.txBeginner.Begin(ctx)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	// (1) The user lock, before any run lock.
 	if err := store.LockSecretMutation(ctx, tx, userID); err != nil {
-		return false, err
+		return "", err
 	}
 	q := store.New(tx)
 	// (2) The run row, re-read under its lock.
 	run, err := q.LockCredentialDisabledRunForPromotion(ctx, store.LockCredentialDisabledRunForPromotionParams{ID: runID, UserID: userID})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
+		return "", nil
 	}
 	if err != nil {
-		return false, err
+		return "", err
 	}
-	if run.Status != "paused" || !run.HoldReason.Valid || run.HoldReason.String != "credential_disabled" ||
-		run.PauseRequestedAt.Valid {
-		return false, nil // no longer this hold, or an owner pause keeps it paused
+	if run.Status != "paused" || !run.HoldReason.Valid || run.HoldReason.String != "credential_disabled" {
+		return "", nil // no longer this hold
 	}
 	// (3) + (4) The requirement source and the requirement credential.
 	heartbeatCutoff := pgconv.Time(s.now().Add(-s.p.WorkerHeartbeatStale))
 	met, err := credentialRequirementMet(ctx, q, run, heartbeatCutoff)
 	if err != nil || !met {
-		return false, err
+		return "", err
 	}
 	if h := s.credPromoteHooks; h != nil && h.beforePromote != nil {
 		if err := h.beforePromote(ctx, runID); err != nil {
-			return false, err
+			return "", err
 		}
 	}
-	_, err = q.PromoteCredentialDisabledRun(ctx, store.PromoteCredentialDisabledRunParams{
-		ID: runID, UserID: userID,
-		ExpectedOverrideMode:     run.CredentialOverrideMode,
-		ExpectedOverrideSecretID: run.CredentialOverrideSecretID,
-		ExpectedCodexSecretID:    run.CodexSecretID,
-		ExpectedWorkerID:         run.WorkerID,
-		ExpectedReleasedWorkerID: run.CredentialDisableReleasedWorkerID,
-		GlobalTimeoutSeconds:     int32(s.p.RunTimeout.Seconds()),
-	})
+	status := "queued"
+	if run.PauseRequestedAt.Valid {
+		// A pending pause request rode the requeue into this claim (a worker that died after
+		// CreatePauseInput or RequestWallParks is requeued with the request intact, by design).
+		// The promoter never bypasses it (D14): the request is consumed into the pause it asked
+		// for, never promoted past and never left stranded on a hold nothing else releases.
+		_, err = q.SettleCredentialDisabledPause(ctx, store.SettleCredentialDisabledPauseParams{
+			ID: runID, UserID: userID,
+			ExpectedOverrideMode:     run.CredentialOverrideMode,
+			ExpectedOverrideSecretID: run.CredentialOverrideSecretID,
+			ExpectedCodexSecretID:    run.CodexSecretID,
+			ExpectedWorkerID:         run.WorkerID,
+		})
+		status = "paused"
+	} else {
+		_, err = q.PromoteCredentialDisabledRun(ctx, store.PromoteCredentialDisabledRunParams{
+			ID: runID, UserID: userID,
+			ExpectedOverrideMode:     run.CredentialOverrideMode,
+			ExpectedOverrideSecretID: run.CredentialOverrideSecretID,
+			ExpectedCodexSecretID:    run.CodexSecretID,
+			ExpectedWorkerID:         run.WorkerID,
+			GlobalTimeoutSeconds:     int32(s.p.RunTimeout.Seconds()),
+		})
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil // spent budget, or a guard saw a changed requirement
+		return "", nil // spent budget, or a guard saw a changed requirement
 	}
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return false, err
+		return "", err
 	}
-	return true, nil
+	return status, nil
 }
 
 // credentialRequirementMet re-evaluates the credential the run's NEXT claim will need, from
@@ -276,13 +297,21 @@ func (s *Service) promoteCredentialDisabledRun(ctx context.Context, userID, runI
 //   - a Codex run needs its frozen alias;
 //   - judge and self_improve follow the owner's Judge binding (a pin needs that credential, the
 //     default mode needs an enabled default, auto needs an enabled pooled token or default, the
-//     #1140 fallback);
+//     #1140 fallback); chat always needs the enabled default (it is not bindable);
 //   - otherwise a per-run override decides (pinned id, default, or auto), and a nulled pin or
 //     no override inherits the binding of the worker the next claim will use.
 //
-// An ordinary auto lane (override or worker binding) needs an enabled pooled token: the lane
-// spends only pooled tokens, and ListAutoSelectCandidates never offers a disabled one, so with
-// none enabled the run stays held instead of cycling park -> promote -> park.
+// An ordinary auto lane (override or worker binding) is always promoted (PRD #1732 D2): it has
+// no single disabled pin to wait for. ListAutoSelectCandidates never offers a disabled token,
+// so the next claim either spends an enabled pooled token or, with none, holds the run in
+// pool_wait (errAutoPoolEmpty). It cannot cycle park -> promote -> park.
+//
+// A default requirement with no default at all (the slot's last credential was disabled, D4)
+// keeps a Judge/self-improve/chat run held (D2: it parks rather than fabricating a fallback)
+// while the owner still holds (disabled) tokens, while an ordinary run is promoted so its next
+// claim behaves as it does today for a user with no token (D15). An owner who has since deleted
+// every token has nothing left to enable, so a held default-only run is promoted too and its
+// next claim fails exactly as a token-less owner's always has.
 //
 // The next claimant follows ClaimRun's affinity: the kept worker_id pins a queued run to its
 // worker while that worker is draining or heartbeat-fresh (holds_affinity, read against
@@ -301,6 +330,10 @@ func credentialRequirementMet(ctx context.Context, q *store.Queries, run store.L
 		}
 		return secretEnabledForPromotion(ctx, q, run.UserID, run.CodexSecretID)
 	}
+	if run.Kind == runkind.Chat {
+		// Chat is not bindable and takes no override: it always spends the owner default.
+		return defaultEnabledForPromotion(ctx, q, run.UserID, false)
+	}
 	if run.Kind == runkind.Judge || run.Kind == runkind.SelfImprove {
 		b, err := q.LockUserJudgeBindingForShare(ctx, run.UserID)
 		if err != nil {
@@ -310,9 +343,13 @@ func credentialRequirementMet(ctx context.Context, q *store.Queries, run store.L
 		case b.JudgeAnthropicBindMode == BindModePinned && b.JudgeAnthropicSecretID.Valid:
 			return secretEnabledForPromotion(ctx, q, run.UserID, b.JudgeAnthropicSecretID)
 		case b.JudgeAnthropicBindMode == BindModeAuto:
-			return q.HasEnabledAnthropicForJudgeAuto(ctx, run.UserID)
+			available, err := q.HasEnabledAnthropicForJudgeAuto(ctx, run.UserID)
+			if err != nil || available {
+				return available, err
+			}
+			return noAnthropicTokenAtAll(ctx, q, run.UserID)
 		default:
-			return defaultEnabledForPromotion(ctx, q, run.UserID)
+			return defaultEnabledForPromotion(ctx, q, run.UserID, false)
 		}
 	}
 	if run.CredentialOverrideMode.Valid {
@@ -323,9 +360,9 @@ func credentialRequirementMet(ctx context.Context, q *store.Queries, run store.L
 			}
 			// A nulled pin inherits the worker binding (D1 of PRD #1247).
 		case BindModeAuto:
-			return q.HasEnabledPooledAnthropic(ctx, run.UserID)
+			return true, nil // the next claim spends an enabled pooled token or holds in pool_wait
 		case BindModeDefault:
-			return defaultEnabledForPromotion(ctx, q, run.UserID)
+			return defaultEnabledForPromotion(ctx, q, run.UserID, true)
 		}
 	}
 	worker := run.WorkerID
@@ -348,9 +385,9 @@ func credentialRequirementMet(ctx context.Context, q *store.Queries, run store.L
 	case b.AnthropicBindMode == BindModePinned && b.AnthropicSecretID.Valid:
 		return secretEnabledForPromotion(ctx, q, run.UserID, b.AnthropicSecretID)
 	case b.AnthropicBindMode == BindModeAuto:
-		return q.HasEnabledPooledAnthropic(ctx, run.UserID)
+		return true, nil // the next claim spends an enabled pooled token or holds in pool_wait
 	default:
-		return defaultEnabledForPromotion(ctx, q, run.UserID)
+		return defaultEnabledForPromotion(ctx, q, run.UserID, true)
 	}
 }
 
@@ -365,15 +402,34 @@ func secretEnabledForPromotion(ctx context.Context, q *store.Queries, userID uui
 	return enabled, nil
 }
 
-func defaultEnabledForPromotion(ctx context.Context, q *store.Queries, userID uuid.UUID) (bool, error) {
+// defaultEnabledForPromotion reports whether a default requirement is met. emptySlotMet is the
+// answer when the slot has no default at all: true for an ordinary run (its next claim fails
+// as a token-less user's always has, D15), false for a Judge/self-improve run (it waits for a
+// default, D2).
+func defaultEnabledForPromotion(ctx context.Context, q *store.Queries, userID uuid.UUID, emptySlotMet bool) (bool, error) {
 	row, err := q.LockDefaultAnthropicSecretForShare(ctx, userID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil // the slot is empty (D4): wait for a default
+		if emptySlotMet {
+			return true, nil
+		}
+		return noAnthropicTokenAtAll(ctx, q, userID)
 	}
 	if err != nil {
 		return false, fmt.Errorf("lock default credential: %w", err)
 	}
 	return row.Enabled, nil
+}
+
+// noAnthropicTokenAtAll reports whether the owner holds no Anthropic token, disabled or not:
+// a default-only lane held with nothing left to enable is released to its next claim, which
+// fails as a token-less owner's run does. Read under the user's secret mutation lock, which
+// token create, delete and enablement take.
+func noAnthropicTokenAtAll(ctx context.Context, q *store.Queries, userID uuid.UUID) (bool, error) {
+	has, err := q.UserHasAnthropicToken(ctx, userID)
+	if err != nil {
+		return false, fmt.Errorf("anthropic token presence: %w", err)
+	}
+	return !has, nil
 }
 
 // secretMutationQueries is the statement surface of the requirement writers that share the

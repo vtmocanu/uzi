@@ -122,6 +122,17 @@ func (h *Handler) SetJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			secretID = &resolved
+			// PRD #1732 D5: refuse a disabled token BEFORE the opt-in write below, so the
+			// request stays all-or-nothing. SetUserJudgeBinding re-checks under the lock.
+			if cerr := h.wsvc.CheckCredentialEnabled(r.Context(), user.ID, resolved); cerr != nil {
+				if errors.Is(cerr, workersvc.ErrCredentialDisabled) {
+					httpx.Error(w, http.StatusConflict, workersvc.ErrCredentialDisabled.Error())
+					return
+				}
+				slog.Error("check judge token enablement", "error", cerr)
+				httpx.Error(w, http.StatusInternalServerError, "internal error")
+				return
+			}
 		}
 	}
 
@@ -138,6 +149,11 @@ func (h *Handler) SetJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 	if bindRequested {
 		bound, berr := h.wsvc.SetUserJudgeBinding(r.Context(), user.ID, mode, secretID)
 		if berr != nil {
+			if errors.Is(berr, workersvc.ErrCredentialDisabled) {
+				// A disable that raced the pre-check above, refused under the secret lock.
+				httpx.Error(w, http.StatusConflict, workersvc.ErrCredentialDisabled.Error())
+				return
+			}
 			if errors.Is(berr, workersvc.ErrSecretNotOwned) {
 				// 404, not 403: a 403 would confirm the id names a real credential
 				// belonging to someone else.

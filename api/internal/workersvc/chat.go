@@ -167,10 +167,30 @@ func (s *Service) ClaimChat(ctx context.Context, wkr store.Worker) (*ChatClaimPa
 		return nil, err
 	}
 	payload, err := s.assembleChatClaim(ctx, run)
+	if errors.Is(err, errCredentialDisabled) {
+		return nil, s.parkChatCredentialDisabled(ctx, wkr, run)
+	}
 	if err != nil {
 		return nil, s.recoverClaimAssembly(ctx, run, err)
 	}
 	return payload, nil
+}
+
+// parkChatCredentialDisabled holds an undelivered chat claim on credential_disabled (PRD #1732
+// D2/D14) instead of failing it or spending another token: chat is not bindable and takes no
+// per-run override (D16), so it waits for the owner to enable a token (the promoter then
+// queues it again). The claim is idle either way; a 0-row park means another transition won.
+func (s *Service) parkChatCredentialDisabled(ctx context.Context, wkr store.Worker, run store.Run) error {
+	n, err := s.q.ParkCredentialDisabledChatRun(ctx, store.ParkCredentialDisabledChatRunParams{
+		ID: run.ID, WorkerID: pgconv.UUID(wkr.ID),
+	})
+	if err != nil {
+		return fmt.Errorf("park chat on credential_disabled: %w", err)
+	}
+	if n == 1 {
+		s.publishSwept(run.ID, "paused")
+	}
+	return nil
 }
 
 // assembleChatClaim builds the chat claim payload for an already-claimed chat run.
@@ -203,8 +223,14 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 
 	// nil, and it stays nil: chat is deliberately NOT bindable (PRD #104 D1), so a
 	// bound worker's chat runs still spend the owner's default token.
+	// PRD #1732 D2: openAnthropic refuses a disabled row (errCredentialDisabled), and a slot
+	// whose tokens are all disabled has no default: both hold the chat on credential_disabled
+	// (ClaimChat) rather than failing it; a token-less owner keeps today's failure.
 	cred, err := s.openAnthropic(ctx, run.UserID, nil)
 	if err != nil {
+		if perr := s.parkIfDefaultSlotDisabled(ctx, run.UserID, err); perr != nil {
+			return nil, perr
+		}
 		return nil, err
 	}
 	// Chat records its credential too (PRD #111 M1). Its reason is always "default"

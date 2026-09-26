@@ -28,6 +28,8 @@ type judgeBindStore struct {
 
 	secrets map[uuid.UUID]uuid.UUID // secret id → owner
 	labels  map[string]uuid.UUID    // "owner|label" → secret id
+	// disabled marks a secret the owner has disabled (PRD #1732 D5).
+	disabled map[uuid.UUID]bool
 
 	setCalled bool
 	setArg    store.SetUserJudgeAnthropicBindingParams
@@ -52,7 +54,7 @@ func (j *judgeBindStore) GetUserSecretCiphertextByID(_ context.Context, arg stor
 	if !ok || owner != arg.UserID {
 		return store.GetUserSecretCiphertextByIDRow{}, pgx.ErrNoRows
 	}
-	return store.GetUserSecretCiphertextByIDRow{UserID: owner, Kind: store.KindAnthropicToken}, nil
+	return store.GetUserSecretCiphertextByIDRow{UserID: owner, Kind: store.KindAnthropicToken, Disabled: j.disabled[arg.ID]}, nil
 }
 
 func (j *judgeBindStore) SetUserJudgeAnthropicBinding(_ context.Context, arg store.SetUserJudgeAnthropicBindingParams) (store.User, error) {

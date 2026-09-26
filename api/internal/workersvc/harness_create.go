@@ -33,6 +33,11 @@ var (
 	// harness has a usable credential and no explicit selection forces one. It wraps
 	// errCredentialUnavailable, so a consumer keying on that keeps the existing refusal behaviour.
 	ErrNoUsableCredential = errNoUsableCredential
+	// ErrHarnessCredentialDisabled is the exported alias of errHarnessCredentialDisabled (PRD
+	// #1732 D15): an explicit harness whose credentials are all disabled. It wraps
+	// ErrNoCredentialForHarness (still refused, never a fallback); the scheduler maps it to the
+	// credential_disabled skip and the handler names Settings in the refusal.
+	ErrHarnessCredentialDisabled = errHarnessCredentialDisabled
 )
 
 // RawCredentialOverride is an UNVALIDATED create-time credential-override request threaded from
