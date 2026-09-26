@@ -423,6 +423,17 @@ export interface WorkerStats {
   disk_data_bytes?: number;
   /** Total bytes on the data volume. Paired with disk_data_bytes. */
   disk_data_total_bytes?: number;
+  /** Used bytes on a docker worker's DinD data root (the `dind-data` volume), from
+   *  the dind-meter sidecar's statfs sample: `(blocks − bfree) × frsize` (issue #1759).
+   *  The four disk_dind_* fields are all present or all absent: absent when there is
+   *  no sidecar (a non-docker worker) or no valid, fresh (≤ 90s) sample. */
+  disk_dind_bytes?: number;
+  /** Total bytes on the DinD data root (`blocks × frsize`). */
+  disk_dind_total_bytes?: number;
+  /** Used inodes on the DinD data root (`files − ffree`). */
+  disk_dind_inodes?: number;
+  /** Total inodes on the DinD data root (`files`). */
+  disk_dind_total_inodes?: number;
 }
 
 /**

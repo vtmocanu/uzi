@@ -438,7 +438,7 @@ export class WorkerClient {
     stats?: WorkerStats,
     outbox?: OutboxHeartbeatEntry[],
     activeSnapshot?: ActiveSnapshot,
-  ): Promise<void> {
+  ): Promise<boolean | undefined> {
     const body: HeartbeatRequest = { version: this.version };
     // Only attach stats when the collector produced a sample (PRD #49): an absent
     // field is the same wire shape as today, so a pre-#49 server ignores the extra
@@ -457,7 +457,7 @@ export class WorkerClient {
     if (includeSnapshot) body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
     const includeExtension = includeOutbox || includeSnapshot;
     try {
-      await this.postJSON(`${WORKER_API_PREFIX}/heartbeat`, body);
+      return await this.postHeartbeat(body);
     } catch (err) {
       // Rollback fallback (PRD #1391 M5, extended by #1390 M2a): a rolled-back api that no
       // longer knows a negotiated heartbeat extension strict-decodes it as an unknown field
@@ -472,13 +472,40 @@ export class WorkerClient {
       if (!includeExtension || !isStrictDecodeError(err)) throw err;
       const stripped: HeartbeatRequest = { version: this.version };
       if (stats) stripped.stats = stats;
-      await this.postJSON(`${WORKER_API_PREFIX}/heartbeat`, stripped);
+      const retaining = await this.postHeartbeat(stripped);
       this.clearFeatures();
       this.log.warn(
         "heartbeat extension rejected by a rolled-back api; retried stripped and cleared the negotiated feature set",
         {},
       );
+      return retaining;
     }
+  }
+
+  /**
+   * POST one heartbeat and decode the custody flag from its response (issue #1759):
+   * `{"worker": {"retaining_unpublished_work": bool, ...}}`. Returns the flag only when
+   * the body decodes and the field is a boolean, else undefined, which the DinD prune
+   * treats as "may be retaining" (fail-closed). A non-2xx still throws exactly like
+   * postJSON, so the strict-decode fallback above is unchanged; an accepted heartbeat
+   * whose body does not parse is still a successful heartbeat.
+   */
+  private async postHeartbeat(body: HeartbeatRequest): Promise<boolean | undefined> {
+    const path = `${WORKER_API_PREFIX}/heartbeat`;
+    const res = await this.fetchRaw("POST", path, body);
+    if (res.status >= 400) throw await this.toError("POST", path, res);
+    if (res.status === 204) return undefined;
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(await res.text());
+    } catch {
+      return undefined;
+    }
+    if (typeof decoded !== "object" || decoded === null) return undefined;
+    const worker = (decoded as { worker?: unknown }).worker;
+    if (typeof worker !== "object" || worker === null) return undefined;
+    const retaining = (worker as { retaining_unpublished_work?: unknown }).retaining_unpublished_work;
+    return typeof retaining === "boolean" ? retaining : undefined;
   }
 
   /** Claim the oldest queued run for this worker's user (the RUN lane — no lane
