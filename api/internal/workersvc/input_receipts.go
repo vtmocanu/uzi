@@ -78,7 +78,25 @@ func validInputIDs(ids []int64) bool {
 	return true
 }
 
-func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid.UUID, generation int64, ids []int64, applied bool) (InputReceiptResult, error) {
+// receiptMode is which receipt a worker sends: ACK (received), APPLIED (acted on), or
+// DISCARDED (issue #1604: an approve_plan the worker received but dropped as stale, sent
+// against an earlier plan).
+type receiptMode int
+
+const (
+	receiptAck receiptMode = iota
+	receiptApplied
+	receiptDiscarded
+)
+
+// dispositionSuperseded marks an approve_plan settled by a DISCARDED receipt (issue #1604):
+// applied_at is set so the row leaves the replay list, and the approval readers
+// (GetRunClaimContext, SetRunRunning) skip it, so it never counts as a human approval.
+const dispositionSuperseded = "superseded"
+
+func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid.UUID, generation int64, ids []int64, mode receiptMode) (InputReceiptResult, error) {
+	applied := mode == receiptApplied
+	discarded := mode == receiptDiscarded
 	if !slices.Contains(wkr.ProtocolCapabilities, capability.InputReceiptsV1) || !validInputIDs(ids) {
 		return InputReceiptResult{}, ErrInputReceiptInvalid
 	}
@@ -108,6 +126,11 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 	if len(rows) != len(ids) {
 		return InputReceiptResult{}, ErrInputReceiptInvalid
 	}
+	// Issue #1604: only an approve_plan can be discarded. Every other kind is either acted on
+	// (APPLIED) or replayed to the next claim; settling it without acting would drop it.
+	if discarded && slices.ContainsFunc(rows, func(row store.ListInputReceiptRowsRow) bool { return row.Kind != "approve_plan" }) {
+		return InputReceiptResult{}, ErrInputReceiptInvalid
+	}
 	// Issue #1604: the worker sends APPLIED for a revise_plan only once its disposition is
 	// final: after the plan answering it was persisted (or the budget-exhausted re-gate), or
 	// when it was stale or empty and never acted on. So marking it applied under a pending
@@ -122,10 +145,35 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 	toAck := make([]int64, 0, len(ids))
 	out := make([]InputDTO, 0, len(ids))
 	followUp := false
+	toDiscard := 0
 	for _, row := range rows {
 		ownReceipt := row.ConsumedAt.Valid && row.ConsumedClaimGeneration.Valid && row.ConsumedClaimGeneration.Int64 == generation &&
 			row.ConsumedWorkerID.Valid && uuid.UUID(row.ConsumedWorkerID.Bytes) == wkr.ID
+		superseded := row.Disposition.Valid && row.Disposition.String == dispositionSuperseded
 		switch {
+		case discarded:
+			// Issue #1604: the same fences as APPLIED, with the switch_pending allowance a
+			// revise-only APPLIED has: a discard is truthful while the claim is still this
+			// worker's (the rows are all approve_plan, checked above). A retry of rows this
+			// claim already discarded succeeds even after the claim ended (the first reply was
+			// lost). A row already applied as a REAL approval is a conflict: the worker acted
+			// on it, and a discard must not rewrite that.
+			switch {
+			case !ownReceipt:
+				return InputReceiptResult{}, conflict
+			case row.AppliedAt.Valid:
+				if !superseded {
+					return InputReceiptResult{}, conflict
+				}
+			case !active && reason != ReceiptSwitchPending:
+				return InputReceiptResult{}, conflict
+			default:
+				toDiscard++
+			}
+		case applied && superseded:
+			// A row this claim discarded is not an approval; answering APPLIED 200 for it would
+			// tell the worker the approve counted when the server never will.
+			return InputReceiptResult{}, conflict
 		case applied:
 			// A retried APPLIED for rows this claim already applied succeeds even after the
 			// claim released: the first reply was lost, and the worker already routed them.
@@ -158,6 +206,15 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 			return InputReceiptResult{}, fmt.Errorf("input ACK changed concurrently")
 		}
 	}
+	if discarded && toDiscard > 0 {
+		settled, err := q.DiscardRunInputRows(ctx, store.DiscardRunInputRowsParams{RunID: runID, Ids: ids, ClaimGeneration: pgtype.Int8{Int64: generation, Valid: true}, WorkerID: pgconv.UUID(wkr.ID)})
+		if err != nil {
+			return InputReceiptResult{}, err
+		}
+		if settled != int64(toDiscard) {
+			return InputReceiptResult{}, fmt.Errorf("input discard changed concurrently")
+		}
+	}
 	if applied {
 		_, err = q.ApplyRunInputRows(ctx, store.ApplyRunInputRowsParams{RunID: runID, Ids: ids, ClaimGeneration: pgtype.Int8{Int64: generation, Valid: true}, WorkerID: pgconv.UUID(wkr.ID)})
 		if err != nil {
@@ -174,9 +231,16 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 }
 
 func (s *Service) AckInputs(ctx context.Context, wkr store.Worker, runID uuid.UUID, generation int64, ids []int64) (InputReceiptResult, error) {
-	return s.inputReceipt(ctx, wkr, runID, generation, ids, false)
+	return s.inputReceipt(ctx, wkr, runID, generation, ids, receiptAck)
 }
 
 func (s *Service) ApplyInputs(ctx context.Context, wkr store.Worker, runID uuid.UUID, generation int64, ids []int64) (InputReceiptResult, error) {
-	return s.inputReceipt(ctx, wkr, runID, generation, ids, true)
+	return s.inputReceipt(ctx, wkr, runID, generation, ids, receiptApplied)
+}
+
+// DiscardInputs settles approve_plan rows the worker received and dropped as stale (issue
+// #1604): applied_at is set so they leave the replay list, which is oldest-first and capped,
+// and disposition 'superseded' keeps them from counting as a human plan approval.
+func (s *Service) DiscardInputs(ctx context.Context, wkr store.Worker, runID uuid.UUID, generation int64, ids []int64) (InputReceiptResult, error) {
+	return s.inputReceipt(ctx, wkr, runID, generation, ids, receiptDiscarded)
 }

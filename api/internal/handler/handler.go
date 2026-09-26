@@ -1080,6 +1080,9 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Get("/runs/{id}/inputs", h.WorkerRunInputs)
 		r.Post("/runs/{id}/inputs/ack", h.WorkerRunInputsAck)
 		r.Post("/runs/{id}/inputs/applied", h.WorkerRunInputsApplied)
+		// Issue #1604: settles approve_plan rows the worker discarded as stale, so they leave
+		// the replay list without counting as approval (disposition 'superseded').
+		r.Post("/runs/{id}/inputs/discarded", h.WorkerRunInputsDiscarded)
 		// Issue #1660: the run's already-consumed follow-ups, READ ONLY, run-scoped via
 		// GetRunOwnedByWorker. The worker rehydrates its operator constraints from it on
 		// every claim so a follow-up survives into the subagents of a later claim.

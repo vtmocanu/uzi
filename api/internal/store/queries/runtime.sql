@@ -1237,7 +1237,8 @@ SELECT count(*) FROM recovery_custody_holds WHERE user_id = @user_id AND state =
 -- property of the QUERY PAIR and not of the worker's loop:
 --   * a park is running-only (SetRunLimitWait's positive source guard), and
 --   * a revise round sits at awaiting_approval, which SetRunRunning refuses to
---     leave for 'running' unless a consumed approve_plan exists.
+--     leave for 'running' unless a consumed approve_plan exists (applied, and not
+--     settled as discarded with disposition 'superseded', issue #1604).
 -- So the ordinary multi-round revise flow cannot reach a park at all. The one
 -- surviving residual is the stale round-2 pre-gate report SetRunRunning's comment
 -- already names: if that admits a run to 'running' and it then parks, the resume
@@ -1280,7 +1281,10 @@ SELECT r.checkpoint_tip,
        (EXISTS (SELECT 1 FROM run_user_inputs i
                 WHERE i.run_id = r.id
                   AND i.kind = 'approve_plan'
-                  AND i.applied_at IS NOT NULL))::boolean AS human_plan_approved
+                  AND i.applied_at IS NOT NULL
+                  -- Issue #1604: a discarded (stale) approve is settled with applied_at AND
+                  -- disposition 'superseded' (DiscardRunInputRows); it is not an approval.
+                  AND i.disposition IS DISTINCT FROM 'superseded'))::boolean AS human_plan_approved
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id -- #1688: owner-scoped token
@@ -1424,6 +1428,9 @@ WHERE id = @id AND user_id = @user_id;
 -- consumed approve_plan input exists — i.e. the legitimate post-approval resume
 -- report, which by construction is sent after the worker consumed the verdict. A
 -- stale pre-gate report (no consumed approve_plan yet) leaves the gate intact.
+-- "Consumed" here means APPLIED and not discarded (issue #1604): an approve the worker
+-- discarded as stale is settled by DiscardRunInputRows with disposition 'superseded', and
+-- that row never opens the gate.
 -- claimed→running and running→running are unaffected (the guard only narrows the
 -- awaiting_approval source status); autopilot never enters awaiting_approval.
 -- Accepted residual (out of scope, see specs/ai.md): in a multi-round re-gate a
@@ -1686,7 +1693,11 @@ WHERE runs.id = @id AND worker_id = @worker_id
         SELECT 1 FROM run_user_inputs
         WHERE run_user_inputs.run_id = @id
           AND run_user_inputs.kind = 'approve_plan'
-          AND run_user_inputs.applied_at IS NOT NULL))
+          AND run_user_inputs.applied_at IS NOT NULL
+          -- Issue #1604: an approve the worker discarded as stale is settled (applied_at set,
+          -- disposition 'superseded', DiscardRunInputRows) but never applied, so it must not
+          -- open the plan gate.
+          AND run_user_inputs.disposition IS DISTINCT FROM 'superseded'))
   -- awaiting_input → running is guarded the same way and for the same reason
   -- (PRD #88 M1), as a SECOND, INDEPENDENT clause. Never merge the two into
   -- `status NOT IN (...) OR kind IN (...)`: that would let a consumed `answer`
@@ -5855,7 +5866,8 @@ SELECT id, status, worker_id, claim_generation, claim_released_at, credential_sw
 FROM runs WHERE id = @run_id FOR UPDATE;
 
 -- name: ListInputReceiptRows :many
-SELECT id, kind, body, created_at, consumed_at, consumed_claim_generation, consumed_worker_id, applied_at
+SELECT id, kind, body, created_at, consumed_at, consumed_claim_generation, consumed_worker_id, applied_at,
+       disposition
 FROM run_user_inputs WHERE run_id = @run_id AND id = ANY(@ids::bigint[])
   AND kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
 ORDER BY id ASC;
@@ -5869,6 +5881,21 @@ RETURNING id, kind, body, created_at;
 -- name: ApplyRunInputRows :execrows
 UPDATE run_user_inputs SET applied_at = now()
 WHERE run_id = @run_id AND id = ANY(@ids::bigint[])
+  AND consumed_claim_generation = @claim_generation AND consumed_worker_id = @worker_id
+  AND consumed_at IS NOT NULL AND applied_at IS NULL;
+
+-- name: DiscardRunInputRows :execrows
+-- Issue #1604: settle approve_plan rows the worker DISCARDED as stale (a replayed verdict sent
+-- against an earlier plan) without counting them as approval. A discarded approve is never
+-- APPLIED, so without this it stayed applied_at IS NULL forever, and ListReplayRunInputs'
+-- LIMIT 1000 oldest-first window would fill with them and starve every later cancel,
+-- follow_up, answer or pause. applied_at takes the row off the replay list; disposition
+-- 'superseded' (00162's CHECK already allows it) is what the approval readers
+-- (GetRunClaimContext's human_plan_approved, SetRunRunning's awaiting_approval clause) exclude.
+-- Same claim fence as ApplyRunInputRows, plus kind = 'approve_plan' so no other kind can be
+-- settled this way even if the service check were bypassed.
+UPDATE run_user_inputs SET applied_at = now(), disposition = 'superseded'
+WHERE run_id = @run_id AND id = ANY(@ids::bigint[]) AND kind = 'approve_plan'
   AND consumed_claim_generation = @claim_generation AND consumed_worker_id = @worker_id
   AND consumed_at IS NOT NULL AND applied_at IS NULL;
 
