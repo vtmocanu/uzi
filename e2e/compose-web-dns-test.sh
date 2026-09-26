@@ -125,7 +125,23 @@ identity() {
   docker exec "$WEB" sh -c \
     "ps -o pid,args | awk '/nginx: (master|worker) process/ && !/awk/ {print \$1 \":\" \$0}' | sort"
 }
+# `docker run -d` returns before nginx has forked its workers or bound the port, so
+# wait (bounded) until both processes exist and the port answers with ANY status: the
+# web-before-api scenario must still see its 502, so readiness cannot require a 200.
+wait_web_ready() {
+  local deadline=$((SECONDS + 20)) code
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if identity 2>/dev/null | grep -q 'master process' &&
+      identity 2>/dev/null | grep -q 'worker process'; then
+      code="$(curl --max-time 2 -s -o /dev/null -w '%{http_code}' "http://$HOSTPORT/" || true)"
+      [ -n "$code" ] && [ "$code" != 000 ] && return 0
+    fi
+    sleep 0.5
+  done
+  fail "web did not become ready within 20s"
+}
 record_identity() {
+  wait_web_ready
   BEFORE_IDENTITY="$(identity)"
   printf '%s\n' "$BEFORE_IDENTITY" | grep -q 'master process' || fail "nginx master PID absent"
   printf '%s\n' "$BEFORE_IDENTITY" | grep -q 'worker process' || fail "nginx worker PID absent"
