@@ -479,6 +479,10 @@ export function failOriginForReason(rawReason: string): string | undefined {
   return undefined;
 }
 
+const PATCH_PRESERVED_TAIL = " Your diff is preserved below.";
+const PATCH_WITHHELD_TAIL =
+  " The committed work is on the run's branch and is recoverable (export it with `uzi run export`).";
+
 /**
  * PRD #377 M1 — compose the actionable `failure_reason` for a GitHub run whose branch
  * touches `.github/workflows/**`, a path the bot's repo-only PAT cannot push. It names the
@@ -489,15 +493,18 @@ export function failOriginForReason(rawReason: string): string | undefined {
  * truncation math is done BEFORE assembly (against the budget left after the fixed prefix +
  * suffix), not by blindly slicing the whole string at the end. Exported for a direct
  * truncation unit test. The caller still applies `.slice(0, MAX_FAILURE_REASON_LEN)` as a
- * belt-and-braces net after the doc link is guaranteed to fit.
+ * belt-and-braces net after the doc link is guaranteed to fit. `patchPreserved` false (the diff
+ * was withheld by the preserved-patch secret gate) swaps the "preserved below" pointer for one
+ * that points at the run branch, so the reason never promises a patch that is not attached.
  */
-export function composeWorkflowScopeReason(paths: string[]): string {
+export function composeWorkflowScopeReason(paths: string[], patchPreserved = true): string {
   const prefix =
     "This run's branch changes workflow files that uzi's GitHub bot token cannot push " +
     "(its scope is exactly `repo`, without `workflow`, by design): ";
   const suffix =
     ". The change is valid; land it as a human PR (commit the file yourself with a " +
-    "workflow-scoped token). See docs/github-bot-setup.md. Your diff is preserved below.";
+    "workflow-scoped token). See docs/github-bot-setup.md." +
+    (patchPreserved ? PATCH_PRESERVED_TAIL : PATCH_WITHHELD_TAIL);
   const budget = MAX_FAILURE_REASON_LEN - prefix.length - suffix.length;
   let list = paths.join(", ");
   if (list.length > budget) {
@@ -606,7 +613,7 @@ export function composePushSecretBlockedReason(
  * "Your diff is preserved below." pointer — always fits MAX_FAILURE_REASON_LEN and is never
  * truncated. Exported for a direct length-cap unit test.
  */
-export function composeBaseAlignConflictReason(defaultBranch: string): string {
+export function composeBaseAlignConflictReason(defaultBranch: string, patchPreserved = true): string {
   const db = defaultBranch || "the default branch";
   const prefix = "This run's branch is behind the default branch (";
   const suffix =
@@ -614,7 +621,8 @@ export function composeBaseAlignConflictReason(defaultBranch: string): string {
     "differ from the default (its scope is `repo`, without `workflow`, by design). uzi tried " +
     "to merge then rebase the current default into the branch to realign those files, but could " +
     "not realign and safely push it, so the run failed without pushing. The work is valid; a " +
-    "human can rebase and land it. See docs/github-bot-setup.md. Your diff is preserved below.";
+    "human can rebase and land it. See docs/github-bot-setup.md." +
+    (patchPreserved ? PATCH_PRESERVED_TAIL : PATCH_WITHHELD_TAIL);
   // Clamp the branch name (the only variable part) against the budget left after the fixed
   // prefix + suffix, so the doc link + preserved-diff pointer in `suffix` always survive.
   const budget = MAX_FAILURE_REASON_LEN - prefix.length - suffix.length;
@@ -3658,6 +3666,24 @@ export class RunRunner {
     // Serves every forge-pushing kind (the failed path is not issue-gated).
     // The precheck uses branch-only commits; the overlay keeps its separate conservative
     // changedFiles guard below.
+    // Every preserved_patch is stored and rendered on the run page, and redactText knows only the
+    // run's OWN secrets, so a foreign credential in the diff would persist verbatim. Attach a patch
+    // only when a trusted gitleaks scan of the EXACT redacted text reports zero findings; on a finding
+    // or an untrustworthy scan the typed failure still lands, without the patch. A trusted range scan
+    // is not enough on its own: it can be trustworthy AND carry findings.
+    const scanGatedPatch = async (rawPatch: string | null, site: string): Promise<string | undefined> => {
+      if (rawPatch === null) return undefined;
+      const patch = redactText(rawPatch);
+      const scan = await this.git.scanPatchForSecrets(patch);
+      if (scan.trusted && scan.findings.length === 0) return patch;
+      runLog.warn("preserved patch withheld: its secret scan was not trusted and clean", {
+        run_id: runId,
+        site,
+        trusted: scan.trusted,
+        findings: scan.findings.length,
+      });
+      return undefined;
+    };
     let changedForWf: string[] | null = null;
     let freshDefaultTip: string | undefined;
     if (claim.repo.forge_type === "github") {
@@ -3684,21 +3710,24 @@ export class RunRunner {
         ? null
         : changedForWf.filter((file) => file.startsWith(".github/workflows/"));
       if (wfHits && wfHits.length > 0) {
+        // Preserve the agent's diff so a human can land it without re-deriving it from the
+        // transcript, behind scanGatedPatch (redacted, then secret-scanned as stored); a null diff
+        // (best-effort failure) or a withheld one just omits the patch — the typed failure still lands.
+        const patch = await scanGatedPatch(
+          await this.git.workflowScopeDiff(wfBarePath, trackingRef),
+          "workflow_scope_missing",
+        );
         // Compose an actionable, capped failure_reason that names the offending path(s)
         // (truncating the path LIST if needed, never the doc link) and points at
-        // docs/github-bot-setup.md.
-        const reason = composeWorkflowScopeReason(wfHits);
-        // Preserve the agent's diff so a human can land it without re-deriving it from the
-        // transcript. redactText scrubs the run's secrets before it reaches the api; a null
-        // diff (best-effort failure) just omits the patch — the typed failure still lands.
-        const rawPatch = await this.git.workflowScopeDiff(wfBarePath, trackingRef);
-        const patch = rawPatch === null ? undefined : redactText(rawPatch);
+        // docs/github-bot-setup.md; it promises the diff only when one is attached.
+        const reason = composeWorkflowScopeReason(wfHits, patch !== undefined);
         batcher.emit({
           kind: "status",
           agent: "worker",
           payload: {
-            text:
-              "branch changes .github/workflows, which the bot token cannot push; failing early and preserving the diff for a human to land",
+            text: patch !== undefined
+              ? "branch changes .github/workflows, which the bot token cannot push; failing early and preserving the diff for a human to land"
+              : "branch changes .github/workflows, which the bot token cannot push; failing early (the diff is withheld: it could not be preserved or did not scan clean)",
           },
         });
         runLog.info(
@@ -3745,6 +3774,9 @@ export class RunRunner {
     // diff. Defaults false, so a non-github forge (no scan at all) also omits the patch — the
     // conservative, safe default. Set only inside the github scan block below.
     let scanRangeTrusted = false;
+    // The tracking tip that trusted top-of-finalize scan walked. The align path re-fetches a
+    // different tip afterwards, so trust carries over to a later push only while the tip matches.
+    let scannedTip: string | null = null;
     // PRD #974 M2 (load-bearing security): a GitHub run's committed range is scanned for secrets
     // with the pinned gitleaks (default ruleset, all three silencers GitHub Push Protection
     // ignores DISABLED — see git.secretScanRange) BEFORE the doomed push, mirroring the #377
@@ -3762,6 +3794,7 @@ export class RunRunner {
         username: claim.secrets.forge_username,
       });
       scanRangeTrusted = scan.trusted;
+      if (scan.trusted) scannedTip = await this.git.trackingTip(scanBarePath, result.branch);
       if (scan.trusted && scan.findings.length > 0) {
         const reason = composePushSecretBlockedReason(scan.findings);
         // Do NOT preserve the diff on a secret block. redactText only scrubs the run's OWN
@@ -3876,6 +3909,19 @@ export class RunRunner {
       return "ok";
     };
 
+    // Whether the push must take the post-bridge scan: finalize bridged just now, OR the pushed
+    // history already carries a bridge adopted earlier (the agent's `merge -s ours <P>` steer, or a
+    // worker bridge carried in by a resume reseed), which leaves the tracking tip descending P so
+    // finalize builds none of its own. A tip the top-of-finalize scan already walked TRUSTED is
+    // not re-scanned (same floor, same range); an align re-fetch moves the tip, so it is.
+    const needsBridgeScan = async (kind: string, scanBare: string): Promise<boolean> => {
+      if (kind === "bridged") return true;
+      if (!flight.publishedTip) return false;
+      const tip = await this.git.trackingTip(scanBare, result.branch);
+      if (tip === null || (scanRangeTrusted && tip === scannedTip)) return false;
+      return this.git.rangeContainsBridge(scanBare, flight.publishedTip, tip);
+    };
+
     // PRD #974 M2 — the GH013 remote backstop. When a finalize push (the normal path OR an
     // align-path push) is rejected by GitHub Push Protection for a secret the pre-push gitleaks
     // scan missed (GitHub's pattern set is broader than gitleaks', and the two are not
@@ -3956,9 +4002,11 @@ export class RunRunner {
     const failHistoryRewritten = async (publishedTip: string) => {
       let patch: string | undefined;
       if (scanRangeTrusted) {
-        // Reuse the same diff helper failBaseAlignConflict uses, redacting the run's own secrets.
-        const rawPatch = await this.git.workflowScopeDiff(finalizeBarePath, trackingRef);
-        patch = rawPatch === null ? undefined : redactText(rawPatch);
+        // Reuse the same diff helper failBaseAlignConflict uses, behind the same exact-text gate.
+        patch = await scanGatedPatch(
+          await this.git.workflowScopeDiff(finalizeBarePath, trackingRef),
+          "history_rewritten",
+        );
       }
       batcher.emit({
         kind: "status",
@@ -4058,13 +4106,17 @@ export class RunRunner {
             // edited a workflow) originalAgentTip carries that edit, so it is still preserved.
             const defTip = defaultTip;
             const failBaseAlignConflict = async () => {
-              const rawPatch = await this.git.workflowScopeDiff(alignBarePath, originalAgentTip);
-              const patch = rawPatch === null ? undefined : redactText(rawPatch);
+              const patch = await scanGatedPatch(
+                await this.git.workflowScopeDiff(alignBarePath, originalAgentTip),
+                "finalize_base_align_conflict",
+              );
               batcher.emit({
                 kind: "status",
                 agent: "worker",
                 payload: {
-                  text: "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded); failing and preserving the diff for a human to land",
+                  text: patch !== undefined
+                    ? "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded); failing and preserving the diff for a human to land"
+                    : "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded); failing (the diff is withheld: it could not be preserved or did not scan clean)",
                 },
               });
               runLog.info("run failed: finalize base-align conflict; preserving diff", {
@@ -4077,7 +4129,7 @@ export class RunRunner {
               // diff a human needs to land.
               await journalTerminalReport({
                 status: "failed",
-                failure_reason: composeBaseAlignConflictReason(alignDefaultBranch),
+                failure_reason: composeBaseAlignConflictReason(alignDefaultBranch, patch !== undefined),
                 fail_origin: "finalize_base_align_conflict",
                 preserved_patch: patch,
               });
@@ -4136,7 +4188,10 @@ export class RunRunner {
               // terminally reported push_secret_blocked, so throw the data-free unwind sentinel — the
               // enclosing align try/catch and the outer finalize catch propagate it without pushing or
               // re-reporting (mirroring how HistoryRewrittenError unwinds this same nested closure).
-              if (o.kind === "bridged" && (await scanBridgedRangeAndBlock(alignBarePath)) === "blocked") {
+              if (
+                (await needsBridgeScan(o.kind, alignBarePath)) &&
+                (await scanBridgedRangeAndBlock(alignBarePath)) === "blocked"
+              ) {
                 throw new PushSecretBlockedSignal();
               }
               await pushToOrigin();
@@ -4403,7 +4458,10 @@ export class RunRunner {
       // re-scan the now-trusted P..B delta on EVERY forge before pushing. A trusted finding reports
       // push_secret_blocked and STOPS (a direct return unwinds the whole finalize, like the
       // failHistoryRewritten site above).
-      if (o.kind === "bridged" && (await scanBridgedRangeAndBlock(finalizeBarePath)) === "blocked") {
+      if (
+        (await needsBridgeScan(o.kind, finalizeBarePath)) &&
+        (await scanBridgedRangeAndBlock(finalizeBarePath)) === "blocked"
+      ) {
         return;
       }
       try {

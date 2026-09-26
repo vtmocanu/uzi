@@ -414,10 +414,32 @@ func reviewDeepLink(baseURL string, targetID uuid.UUID) string {
 	return baseURL + "/judge?run=" + targetID.String()
 }
 
+// uncutBound is a byte bound the sanitizers can never reach, so normalizing with it
+// never truncates. It is 3 bytes per input byte, not len(s)+1: an invalid UTF-8 byte is
+// rewritten as the 3-byte U+FFFD, so normalized text can be longer than its input.
+func uncutBound(s string) int { return 3*len(s) + 1 }
+
+// scrubThenBoundMarkdown renders one untrusted multi-line field (markdown: \n and \t
+// kept) inert: strip control/bidi runes over the WHOLE value, secret-scrub the whole
+// normalized value, and ONLY THEN apply the byte cap rune-safely. Capping first would
+// cut a credential straddling the cap below the scrubber's match length and persist its
+// prefix (GHSA-2722; the same order as workersvc's scrubThenBound).
+func scrubThenBoundMarkdown(s string, max int) string {
+	return termsafe.SanitizeBounded(slacksvc.ScrubSecrets(termsafe.SanitizeBounded(s, uncutBound(s))), max)
+}
+
+// scrubThenBoundSelfReported is scrubThenBoundMarkdown for a single-line self-reported
+// identifier (sanitizeSelfReported, which also drops \n and \t): strip without
+// truncation, scrub, then apply the same bound.
+func scrubThenBoundSelfReported(s string, max int) string {
+	return sanitizeSelfReported(slacksvc.ScrubSecrets(sanitizeSelfReported(s, uncutBound(s))), max)
+}
+
 // validateAndScrubReview is the review ingest gate (Decision 5, audit C1/L4): reject a
-// bad verdict/status/category/confidence enum, cap the free text and strip control
-// chars (preserving markdown newlines in the multi-line fields), and scrub every free
-// field through the secret-family redactor before it is persisted or ever rendered.
+// bad verdict/status/category/confidence enum, strip control chars (preserving markdown
+// newlines in the multi-line fields), scrub every free field through the secret-family
+// redactor, and only then cap the free text (scrubThenBound*), before it is persisted or
+// ever rendered.
 func validateAndScrubReview(req workerReviewRequest) (workersvc.ReviewSubmission, error) {
 	if !workersvc.ReviewVerdicts[req.Verdict] {
 		return workersvc.ReviewSubmission{}, errors.New("verdict must be one of ideal|ok|issues")
@@ -435,8 +457,8 @@ func validateAndScrubReview(req workerReviewRequest) (workersvc.ReviewSubmission
 	sub := workersvc.ReviewSubmission{
 		Verdict:    req.Verdict,
 		Status:     status,
-		SummaryMd:  slacksvc.ScrubSecrets(termsafe.SanitizeBounded(req.Summary, workersvc.ReviewSummaryMaxBytes)),
-		JudgeModel: slacksvc.ScrubSecrets(sanitizeSelfReported(req.Model, workersvc.ReviewModelMaxBytes)),
+		SummaryMd:  scrubThenBoundMarkdown(req.Summary, workersvc.ReviewSummaryMaxBytes),
+		JudgeModel: scrubThenBoundSelfReported(req.Model, workersvc.ReviewModelMaxBytes),
 	}
 	for _, rec := range req.Recommendations {
 		if !workersvc.RecommendationCategories[rec.Category] {
@@ -447,15 +469,15 @@ func validateAndScrubReview(req workerReviewRequest) (workersvc.ReviewSubmission
 		}
 		sub.Recommendations = append(sub.Recommendations, workersvc.ReviewRecommendation{
 			Category: rec.Category,
-			// canonicalizeTarget runs LAST, AFTER control/Cf stripping (sanitizeSelfReported)
-			// and secret scrubbing (ScrubSecrets), so those still see the raw bytes and this
+			// canonicalizeTarget runs LAST, AFTER control/Cf stripping, secret scrubbing and
+			// the byte cap (scrubThenBoundSelfReported), so those still see the raw bytes and this
 			// only folds the already-clean result's cosmetic casing/whitespace/punctuation
 			// drift (issue #232). Re-bounded to the same ReviewTargetMaxBytes — the ASCII-only
 			// fold never grows a string (it only lowercases 1:1 and shortens runs/edges), so
 			// the cap is a formality here, but keeping it makes the byte bound hold no matter
 			// which order a future edit reshuffles these into.
-			Target:      canonicalizeTarget(slacksvc.ScrubSecrets(sanitizeSelfReported(rec.Target, workersvc.ReviewTargetMaxBytes)), workersvc.ReviewTargetMaxBytes),
-			RationaleMd: slacksvc.ScrubSecrets(termsafe.SanitizeBounded(rec.Rationale, workersvc.ReviewRationaleMaxBytes)),
+			Target:      canonicalizeTarget(scrubThenBoundSelfReported(rec.Target, workersvc.ReviewTargetMaxBytes), workersvc.ReviewTargetMaxBytes),
+			RationaleMd: scrubThenBoundMarkdown(rec.Rationale, workersvc.ReviewRationaleMaxBytes),
 			Confidence:  rec.Confidence,
 		})
 	}

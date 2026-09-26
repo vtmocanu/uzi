@@ -9,9 +9,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/schedtmpl"
-	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
 
 // Proposal filing caps and the never-sweepable label invariant (PRD #929 M2/D3).
@@ -84,18 +82,6 @@ func clampWireProposal(run store.Run, p *ProposalPayload) *ProposalPayload {
 	}
 	body := scrubThenBound(p.Body, ProposalBodyMaxBytes)
 	return &ProposalPayload{Title: title, Body: body}
-}
-
-// scrubThenBound sanitizes the FULL untrusted field, secret-scrubs the whole value, and
-// ONLY THEN applies the byte cap. The order is a security property: secretscrub.Scrub
-// matches a credential only when it sees the WHOLE token, so truncating first can leave a
-// sub-match-length prefix that Scrub misses, leaking it into the filed forge issue (a
-// public artifact). The first SanitizeBounded is effectively unbounded — a cap past the
-// input length never truncates, since sanitizing only removes runes — so no cut happens
-// before Scrub; the second applies the real, rune-safe cap to the already-scrubbed text.
-func scrubThenBound(s string, max int) string {
-	sanitized := termsafe.SanitizeBounded(s, len(s)+1)
-	return termsafe.SanitizeBounded(secretscrub.Scrub(sanitized), max)
 }
 
 // maybeFileProposal files a scheduled issues-mode prompt run's proposal as a forge

@@ -14,9 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
 
 // MaxFindingsPerRun caps how many incidental findings a single run may capture (PRD
@@ -107,8 +105,9 @@ func (s *Service) CreateFinding(ctx context.Context, wkr store.Worker, runID uui
 	}
 
 	// (3) Ingest hygiene (D4): sanitise the untrusted self-reported text to INERT form
-	// (control/Cf/ANSI/bidi strip + secret scrub + byte cap) BEFORE storing — the same
-	// ingest sanitiser the judge worker / report_only path use. The issue-template FIELD
+	// (control/Cf/ANSI/bidi strip, then secret scrub, then byte cap; see
+	// sanitizeFindingText) BEFORE storing, in the report_only / proposal order
+	// (scrubThenBound). The issue-template FIELD
 	// sanitisers (SanitizeTitle/FenceBlock/SafeInlineCode) are applied later at file-time
 	// (M5), never here.
 	title := sanitizeFindingText(req.Title, MaxFindingTitleBytes)
@@ -220,8 +219,8 @@ func (s *Service) CreateFinding(ctx context.Context, wkr store.Worker, runID uui
 
 // marshalFindingLabels sanitises each label to INERT form and JSON-encodes the set for
 // the evidence row, normalising to the empty array (matching the proposal path). Each
-// label runs through sanitizeFindingText (the same control/bidi strip + secret scrub +
-// byte cap the four free-text fields use) so the store holds no bidi/control/secret
+// label runs through sanitizeFindingText (the same control/bidi strip, secret scrub and
+// then byte cap the four free-text fields use) so the store holds no bidi/control/secret
 // bytes at rest before M5/M7 consume them (M2 review, D4). A label that is empty after
 // sanitisation is dropped rather than stored blank. The handler has already bounded the
 // label count.
@@ -236,14 +235,15 @@ func marshalFindingLabels(labels []string) ([]byte, error) {
 }
 
 // sanitizeFindingText renders one untrusted, agent-authored string INERT for storage
-// (D4): strip terminal-control / bidi-override runes, bound the byte length rune-safely,
-// then scrub secret shapes. Order matches judge_worker.go / report_only.go
-// (ScrubSecrets(SanitizeBounded(...))): sanitise+cap the structural text FIRST so the
-// scrubber sees whole runes and the cap applies before redaction rewrites. It is the
-// write-side hygiene the store relies on; the field-level issue-template sanitisers run
-// later at file-time (M5).
+// (D4): strip terminal-control / bidi-override runes over the whole value, scrub secret
+// shapes over the whole normalized value, and ONLY THEN bound the byte length
+// rune-safely (scrubThenBound, the report_md / proposal order). Capping first would cut
+// a credential straddling the cap below the scrubber's match length and persist its
+// prefix, and a finding can be filed as an issue on a public repo. It is the write-side
+// hygiene the store relies on; the field-level issue-template sanitisers run later at
+// file-time (M5).
 func sanitizeFindingText(s string, max int) string {
-	return secretscrub.Scrub(termsafe.SanitizeBounded(s, max))
+	return scrubThenBound(s, max)
 }
 
 // findingContentHash is the D3 re-open discriminator: the sha256 (hex) of a

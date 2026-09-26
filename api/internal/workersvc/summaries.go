@@ -10,9 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
-	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
 
 // Summary field caps (PRD #362 M1). The summary text bound is generous — a plain-English
@@ -201,10 +199,11 @@ func DecodeSummaryDeltas(raw []byte) ([]apitypes.RunSummaryDelta, error) {
 }
 
 // sanitizeSummaryText renders one untrusted, model-authored summary string INERT for
-// storage: strip terminal-control / bidi-override runes and bound the byte length
-// rune-safely, then scrub secret shapes. Order matches the findings/judge ingest
-// (ScrubSecrets(SanitizeBounded(...))): sanitise+cap FIRST so the scrubber sees whole
-// runes and the cap applies before redaction rewrites.
+// storage: strip terminal-control / bidi-override runes over the whole value, scrub
+// secret shapes over the whole normalized value, and ONLY THEN bound the byte length
+// rune-safely (scrubThenBound, the same order as the findings ingest). Capping first
+// would cut a credential straddling the cap below the scrubber's match length and
+// persist its prefix.
 func sanitizeSummaryText(s string, max int) string {
-	return secretscrub.Scrub(termsafe.SanitizeBounded(s, max))
+	return scrubThenBound(s, max)
 }

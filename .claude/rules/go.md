@@ -38,6 +38,7 @@ cd api && go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate
 |---|---|
 | `fixtures/judge-fidelity/{cases,expected}.json` | `api/internal/workersvc/judge_backlog_fidelity_test.go` |
 | `fixtures/run-usage/` | `api/internal/workersvc/run_usage_contract_test.go`, `web/src/lib/runUsageContract.test.ts` |
+| `fixtures/split-secret-redaction/cases.json` | `api/internal/termsafe/split_secret_fixture_test.go`, `agent/test/redact.test.ts` |
 | `fixtures/api-contract/` | `api/internal/apitypes/contract_test.go`, `api/internal/handler/contract_test.go`, `web/src/lib/apiContract.test.ts` |
 | `api/internal/hostedsvc/testdata/` | the controller's contract goldens, the other way |
 

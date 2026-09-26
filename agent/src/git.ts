@@ -15,9 +15,11 @@ import { withForgeRetry } from "./forge-retry.js";
 import {
   commitsScannedFromStderr,
   gitleaksArgs,
+  gitleaksReportWellFormed,
   gitleaksStdinArgs,
   parseGitleaksReport,
   scanIsTrustworthy,
+  stripAnsiSgr,
   type SecretFinding,
 } from "./secret-scan-guard.js";
 
@@ -132,6 +134,9 @@ const GIT_CODE_EXEC_KEY_PINS: ReadonlyArray<readonly [key: string, value: string
 
 const GIT_TIMEOUT_MS = 10 * 60_000; // 10m — clones can be large on cold caches.
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
+/** Wall-clock ceiling on the preserved_patch scan (the patch is already byte-capped by
+ *  REVIEW_DIFF_MAX_BYTES, so gitleaks stdin finishes in well under a second in practice). */
+const PATCH_SCAN_TIMEOUT_MS = 2 * 60_000;
 
 export type BoundaryProcessSpawner = (request: BoundaryProcessRequest) => Promise<BoundaryProcessHandle>;
 
@@ -2357,13 +2362,15 @@ export class GitCache {
     if (Date.now() - startedAt >= left - GITLEAKS_DEADLINE_MARGIN_MS) return { kind: "deadline" };
     // gitleaks colours its log lines even when stderr is a pipe (`\x1b[31mERR\x1b[0m`,
     // `\x1b[1mscanned …`), which defeats a word-boundary token match: strip ANSI SGR sequences
-    // before any liveness check reads the text.
-    // eslint-disable-next-line no-control-regex -- the ESC byte is exactly what is being matched
-    stderr = stderr.replace(/\x1b\[[0-9;]*m/g, "");
+    // before any liveness check reads the text (scanIsTrustworthy also strips its own input).
+    stderr = stripAnsiSgr(stderr);
     try {
       const st = await fs.stat(ctx.reportPath);
       if (st.size > SECRET_SCAN_REPORT_MAX_BYTES) return { kind: "unreadable", why: "report_over_cap" };
-      return { kind: "ran", execOk, stderr, findings: parseGitleaksReport(await fs.readFile(ctx.reportPath, "utf8")) };
+      const raw = await fs.readFile(ctx.reportPath, "utf8");
+      // A malformed report parses to [] ("clean"); it is an unreadable scan, never a clean one.
+      if (!gitleaksReportWellFormed(raw)) return { kind: "unreadable", why: "report_malformed" };
+      return { kind: "ran", execOk, stderr, findings: parseGitleaksReport(raw) };
     } catch {
       return { kind: "unreadable", why: execOk ? "report_unreadable" : "exec_failed" };
     }
@@ -3056,6 +3063,47 @@ export class GitCache {
   }
 
   /**
+   * Scan the EXACT text a run is about to persist as its preserved_patch (the redacted
+   * {@link workflowScopeDiff} output) through `gitleaks stdin`, with the finalize scan's discipline:
+   * an explicit default-ruleset config (no repo `.gitleaks.toml`), inline allows ignored, `--redact`,
+   * a neutral scratch cwd. The whole patch is scanned, context and removed lines included, because
+   * all of it is stored and displayed. Liveness: a clean exit, no error token, and gitleaks'
+   * `scanned ~N bytes` equal to the bytes fed. The caller may attach the patch only when this is
+   * trusted AND clean; it never throws (any failure is untrusted).
+   */
+  async scanPatchForSecrets(patch: string): Promise<{ trusted: boolean; findings: SecretFinding[] }> {
+    if (patch.length === 0) return { trusted: true, findings: [] };
+    let scratch: string | undefined;
+    try {
+      scratch = await fs.mkdtemp(path.join(os.tmpdir(), "uzi-gl-patch-"));
+      const configPath = path.join(scratch, "config.toml");
+      const reportPath = path.join(scratch, "report.json");
+      await fs.writeFile(configPath, "[extend]\nuseDefault = true\n", "utf8");
+      const deadline = Date.now() + PATCH_SCAN_TIMEOUT_MS;
+      const run = await this.runCheckpointGitleaks(gitleaksStdinArgs({ configPath, reportPath }), {
+        cwd: scratch,
+        reportPath,
+        remaining: () => deadline - Date.now(),
+        input: patch,
+        selfTimeout: true,
+      });
+      if (run.kind !== "ran") return { trusted: false, findings: [] };
+      const scanned = /\bscanned ~(\d+) bytes/i.exec(run.stderr);
+      const trusted =
+        run.execOk &&
+        !/\b(err|error|fatal)\b/i.test(run.stderr) &&
+        scanned !== null &&
+        Number(scanned[1]) === Buffer.byteLength(patch) &&
+        !/\bskipp/i.test(run.stderr);
+      return { trusted, findings: run.findings };
+    } catch {
+      return { trusted: false, findings: [] };
+    } finally {
+      if (scratch) await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /**
    * issue #1398 — resolve the FLOOR the finalize secret scan should treat as
    * already-published, so `floor..trackingRef` is the REAL push delta and no
    * already-pushed history is re-scanned. Returns a 40-hex SHA or a ref string, or
@@ -3288,6 +3336,7 @@ export class GitCache {
           return { trusted: false, findings: [] };
         }
         const raw = await fs.readFile(reportPath, "utf8");
+        if (!gitleaksReportWellFormed(raw)) throw new Error("malformed gitleaks report");
         findings = parseGitleaksReport(raw);
       } catch {
         this.log.warn(`${opts.label}: could not read the gitleaks report; ${opts.onUntrusted}`, {

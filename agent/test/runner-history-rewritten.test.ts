@@ -423,6 +423,153 @@ describe("RunRunner — post-bridge secret scan (PRD #1416 MR-rework)", () => {
   });
 });
 
+// A bridge adopted BEFORE finalize (the agent's `git merge -s ours <P>` steer mid-run, or a worker
+// bridge carried in by a resume reseed) leaves the tracking tip already descending P, so finalize
+// builds no bridge of its own (kind "clean") and, before the fix, only a finalize-built bridge was
+// re-scanned. On a non-GitHub forge that pushed the rewritten history unscanned: nothing else
+// scans a GitLab/Forgejo push. The bridged range, and every commit made after the bridge, must be
+// scanned whenever the pushed history carries a bridge.
+describe("RunRunner — a bridge adopted before finalize is still secret-scanned", () => {
+  const leak = () => ({
+    trusted: true as const,
+    findings: [{ commit: "deadbeef", file: "leaked.env", startLine: 1, ruleId: "generic-api-key" }],
+  });
+  /** Rewrite below P, restore P as an ancestor the agent's way (`merge -s ours`), then keep
+   *  working: the tracking tip descends P before finalize ever looks. */
+  const bridgedEarlyExecutor = (P: string, mainFiles?: Record<string, string>): Executor => ({
+    run: async (ctx: RunContext): Promise<ExecutorResult> => {
+      fs.writeFileSync(path.join(ctx.worktreePath, "REWRITE.md"), `rewrite ${randomUUID()}\n`);
+      gitIn(ctx.worktreePath, ["add", "."]);
+      gitIn(ctx.worktreePath, [...IDENT, "commit", "--amend", "--no-edit"]);
+      gitIn(ctx.worktreePath, [...IDENT, "merge", "-s", "ours", P, "-m", "restore published tip"]);
+      fs.writeFileSync(path.join(ctx.worktreePath, "AFTER.md"), "work after the bridge\n");
+      gitIn(ctx.worktreePath, ["add", "."]);
+      gitIn(ctx.worktreePath, [...IDENT, "commit", "-m", "work after the bridge"]);
+      if (mainFiles) commitToOriginMain(mainFiles, "main advances");
+      return { branch: ctx.branch };
+    },
+  });
+
+  it("(GitHub, align path) a trusted top scan does not cover the re-fetched aligned tip", async () => {
+    // The top-of-finalize scan walked the pre-align tip TRUSTED and clean. The align merge then
+    // moves the tip, and the early bridge is carried into the pushed history, so that trust must
+    // not carry over: the aligned tip is scanned, and its finding blocks the push.
+    commitToOriginMain({ ".github/workflows/ci.yml": CI_V1 }, "seed workflows");
+    const branch = "feature/early-bridge-align";
+    const P = publishBranch(branch);
+    const { github } = fakeGitHub();
+    let scans = 0;
+    git.secretScanRange = (async () => {
+      scans++;
+      return scans === 1 ? { trusted: true as const, findings: [] } : leak();
+    }) as typeof git.secretScanRange;
+    const claim = githubTaskClaim(branch, { open_mr: false });
+    await githubRunner(github, bridgedEarlyExecutor(P, { ".github/workflows/ci.yml": CI_V2 })).execute(claim);
+
+    assert.ok(scans >= 2, "the aligned tip was scanned after the trusted top scan");
+    assert.strictEqual(failedBody(claim.run_id).fail_origin, "push_secret_blocked");
+    assert.strictEqual(gitIn(fx.originPath, ["rev-parse", branch]), P, "nothing was pushed");
+  });
+
+  it("(GitLab) a trusted finding in an early-bridged branch blocks the push", async () => {
+    const { gitlab } = fakeGitlab();
+    const branch = "feature/early-bridge-gitlab";
+    const P = publishBranch(branch);
+    let scans = 0;
+    git.secretScanRange = (async () => {
+      scans++;
+      return leak();
+    }) as typeof git.secretScanRange;
+    const claim = taskClaim(branch, {
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath, forge_type: "gitlab" },
+    });
+    await runner(bridgedEarlyExecutor(P), gitlab).execute(claim);
+
+    assert.strictEqual(scans, 1, "the early-bridged range was scanned once");
+    assert.ok(!statusesFor(claim.run_id).includes("completed"), "blocked before the push");
+    assert.strictEqual(gitIn(fx.originPath, ["rev-parse", branch]), P, "nothing was pushed (origin tip still P)");
+    const failed = failedBody(claim.run_id);
+    assert.strictEqual(failed.fail_origin, "push_secret_blocked");
+    assert.strictEqual(failed.preserved_patch, undefined);
+  });
+
+  it("(GitLab) a clean scan of an early-bridged branch pushes and completes", async () => {
+    const { gitlab } = fakeGitlab();
+    const branch = "feature/early-bridge-clean";
+    const P = publishBranch(branch);
+    git.secretScanRange = (async () => ({ trusted: true, findings: [] })) as typeof git.secretScanRange;
+    const claim = taskClaim(branch, {
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath, forge_type: "gitlab" },
+    });
+    await runner(bridgedEarlyExecutor(P), gitlab).execute(claim);
+    assert.ok(statusesFor(claim.run_id).includes("completed"));
+    assert.notStrictEqual(gitIn(fx.originPath, ["rev-parse", branch]), P, "the bridged branch was pushed");
+  });
+
+  // history_rewritten preserves a patch only from a trusted range scan AND a clean exact-text scan.
+  const tokenExecutor = (): Executor => ({
+    run: async (ctx: RunContext): Promise<ExecutorResult> => {
+      const t = ["gh", "p_", "x7Rq".repeat(9)].join("");
+      fs.writeFileSync(path.join(ctx.worktreePath, "REWRITE.md"), `rewrite ${t}\n`);
+      gitIn(ctx.worktreePath, ["add", "."]);
+      gitIn(ctx.worktreePath, [...IDENT, "commit", "--amend", "--no-edit"]);
+      return { branch: ctx.branch };
+    },
+  });
+
+  it("(history_rewritten) a foreign secret in the diff withholds the patch despite a trusted range scan", async () => {
+    const { github } = fakeGitHub();
+    const branch = "feature/hr-patch-secret";
+    publishBranch(branch);
+    git.secretScanRange = (async () => ({ trusted: true, findings: [] })) as typeof git.secretScanRange;
+    stubBridgeUnbuildable();
+    const claim = githubTaskClaim(branch, { open_mr: false });
+    await githubRunner(github, tokenExecutor()).execute(claim);
+    const failed = failedBody(claim.run_id);
+    assert.strictEqual(failed.fail_origin, "history_rewritten");
+    assert.strictEqual(failed.preserved_patch, undefined);
+  });
+
+  it("(history_rewritten) an untrustworthy patch scan withholds the patch despite a trusted range scan", async () => {
+    const { github } = fakeGitHub();
+    const branch = "feature/hr-patch-untrusted";
+    publishBranch(branch);
+    git.secretScanRange = (async () => ({ trusted: true, findings: [] })) as typeof git.secretScanRange;
+    git.scanPatchForSecrets = (async () => ({ trusted: false, findings: [] })) as typeof git.scanPatchForSecrets;
+    stubBridgeUnbuildable();
+    const claim = githubTaskClaim(branch, { open_mr: false });
+    await githubRunner(github, rewritingExecutor({})).execute(claim);
+    const failed = failedBody(claim.run_id);
+    assert.strictEqual(failed.fail_origin, "history_rewritten");
+    assert.strictEqual(failed.preserved_patch, undefined);
+  });
+
+  it("(GitLab) an ordinary branch with no bridge is not scanned (unchanged)", async () => {
+    const { gitlab } = fakeGitlab();
+    const branch = "feature/no-bridge";
+    publishBranch(branch);
+    let scans = 0;
+    git.secretScanRange = (async () => {
+      scans++;
+      return leak();
+    }) as typeof git.secretScanRange;
+    const claim = taskClaim(branch, {
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath, forge_type: "gitlab" },
+    });
+    const plain: Executor = {
+      run: async (ctx: RunContext): Promise<ExecutorResult> => {
+        fs.writeFileSync(path.join(ctx.worktreePath, "MORE.md"), "more\n");
+        gitIn(ctx.worktreePath, ["add", "."]);
+        gitIn(ctx.worktreePath, [...IDENT, "commit", "-m", "more work"]);
+        return { branch: ctx.branch };
+      },
+    };
+    await runner(plain, gitlab).execute(claim);
+    assert.strictEqual(scans, 0);
+    assert.ok(statusesFor(claim.run_id).includes("completed"));
+  });
+});
+
 describe("composeHistoryRewrittenReason (PRD #1416 M4)", () => {
   it("names the published tip, points at the doc, and fits MAX_FAILURE_REASON_LEN", () => {
     const P = "0123456789abcdef0123456789abcdef01234567";

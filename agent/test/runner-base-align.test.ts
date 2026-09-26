@@ -1048,3 +1048,91 @@ describe("composeBaseAlignConflictReason", () => {
     assert.match(sixtyFour, /\.github\/workflows/);
   });
 });
+
+// Every preserved_patch is stored and rendered on the run page, and redactText knows only the run's
+// OWN secrets. So a patch is attached only after a trusted gitleaks scan of the exact redacted text
+// finds nothing: a foreign credential in the diff, or a scanner that cannot vouch for the text,
+// keeps the typed failure and omits the patch. Scan findings and scanner failure are separate
+// mechanisms, so each gets its own case per preserve site.
+describe("RunRunner — preserved_patch is attached only after a clean exact-text secret scan", () => {
+  // GitHub-PAT-shaped (what the test gitleaks shim detects), assembled at runtime so no complete
+  // token literal is committed (check:token-literals).
+  const foreignToken = () => ["gh", "p_", "x7Rq".repeat(9)].join("");
+  const failedFor = (runId: string) =>
+    api.states.find((s) => s.runId === runId && s.body.status === "failed")?.body;
+  const untrustedScanner = () => {
+    let calls = 0;
+    git.scanPatchForSecrets = (async () => {
+      calls++;
+      return { trusted: false, findings: [] };
+    }) as typeof git.scanPatchForSecrets;
+    return () => calls;
+  };
+
+  it("workflow_scope_missing: a foreign secret in the diff withholds the patch", async () => {
+    seedWorkflowsOnOrigin();
+    const { github, calls } = fakeGitHub();
+    const claim = githubClaim(1701);
+    await githubRunner(github, committingExecutor(
+      { ".github/workflows/ci.yml": "name: ci\non: [branch-edit]\njobs: {}\n", "leak.ts": `export const k = "${foreignToken()}";\n` },
+      { ".github/workflows/ci.yml": CI_V2 },
+    )).execute(claim);
+    const failed = failedFor(claim.run_id);
+    assert.strictEqual(failed?.fail_origin, "workflow_scope_missing", "the typed failure still lands");
+    assert.strictEqual(failed?.preserved_patch, undefined, "the patch carrying the secret is not persisted");
+    assert.doesNotMatch(failed?.failure_reason ?? "", /preserved below/, "the reason does not promise a withheld patch");
+    assert.doesNotMatch(JSON.stringify(api.states.filter((s) => s.runId === claim.run_id)), new RegExp(foreignToken()));
+    assert.strictEqual(calls.length, 0);
+  });
+
+  it("workflow_scope_missing: an untrustworthy scan withholds the patch", async () => {
+    seedWorkflowsOnOrigin();
+    const scans = untrustedScanner();
+    const { github } = fakeGitHub();
+    const claim = githubClaim(1702);
+    await githubRunner(github, committingExecutor(
+      { ".github/workflows/ci.yml": "name: ci\non: [branch-edit]\njobs: {}\n" },
+      { ".github/workflows/ci.yml": CI_V2 },
+    )).execute(claim);
+    const failed = failedFor(claim.run_id);
+    assert.strictEqual(failed?.fail_origin, "workflow_scope_missing");
+    assert.strictEqual(failed?.preserved_patch, undefined);
+    assert.strictEqual(scans(), 1, "the exact patch was offered to the scanner once");
+  });
+
+  it("finalize_base_align_conflict: the patch gate itself withholds a foreign secret the range scan missed", async () => {
+    seedWorkflowsOnOrigin({ "conflict.txt": "base\n" });
+    git.changedFiles = (async () => null) as typeof git.changedFiles;
+    // The range scan reports trusted-and-clean (it missed the secret); only the exact-text patch
+    // scan stands between the diff and runs.preserved_patch.
+    git.secretScanRange = (async () => ({ trusted: true, findings: [] })) as typeof git.secretScanRange;
+    const { github } = fakeGitHub();
+    git.pushBranch = (async () => undefined) as typeof git.pushBranch;
+    const claim = githubClaim(1704);
+    await githubRunner(github, committingExecutor(
+      { "conflict.txt": `branch side ${foreignToken()}\n` },
+      { "conflict.txt": "main side\n", ".github/workflows/ci.yml": CI_V2 },
+    )).execute(claim);
+    const failed = failedFor(claim.run_id)!;
+    assert.strictEqual(failed.fail_origin, "finalize_base_align_conflict");
+    assert.strictEqual(failed.preserved_patch, undefined);
+    assert.doesNotMatch(failed.failure_reason ?? "", /preserved below/);
+  });
+
+  it("finalize_base_align_conflict: an untrustworthy scan withholds the patch", async () => {
+    seedWorkflowsOnOrigin({ "conflict.txt": "base\n" });
+    git.changedFiles = (async () => null) as typeof git.changedFiles;
+    const scans = untrustedScanner();
+    const { github } = fakeGitHub();
+    git.pushBranch = (async () => undefined) as typeof git.pushBranch;
+    const claim = githubClaim(1705);
+    await githubRunner(github, committingExecutor(
+      { "conflict.txt": "branch side\n" },
+      { "conflict.txt": "main side\n", ".github/workflows/ci.yml": CI_V2 },
+    )).execute(claim);
+    const failed = failedFor(claim.run_id)!;
+    assert.strictEqual(failed.fail_origin, "finalize_base_align_conflict");
+    assert.strictEqual(failed.preserved_patch, undefined);
+    assert.strictEqual(scans(), 1);
+  });
+});

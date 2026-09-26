@@ -535,7 +535,13 @@ func (h *Handler) WorkerForgeReplyMRThread(w http.ResponseWriter, r *http.Reques
 		httpx.Error(w, http.StatusBadRequest, forgeErrInvalid)
 		return
 	}
-	if strings.TrimSpace(req.ReplyID) == "" || strings.TrimSpace(req.Body) == "" {
+	// The body is agent-authored and lands as a forge comment (possibly on a public
+	// repo), so it gets the same hygiene as the other agent-to-forge sinks (findings,
+	// proposals): terminal-control / bidi strip and secret scrub over the WHOLE value.
+	// No byte bound applies here, so nothing is truncated. Emptiness is judged on the
+	// cleaned body, so a body of only unsafe runes is rejected rather than posted blank.
+	body := workersvc.ScrubUntrustedText(req.Body)
+	if strings.TrimSpace(req.ReplyID) == "" || body == "" {
 		httpx.Error(w, http.StatusBadRequest, forgeErrInvalid)
 		return
 	}
@@ -547,7 +553,7 @@ func (h *Handler) WorkerForgeReplyMRThread(w http.ResponseWriter, r *http.Reques
 		httpx.Error(w, http.StatusForbidden, forgeErrMRThreadScope)
 		return
 	}
-	if err := f.ReplyMergeRequestComment(r.Context(), conn.ForgeProjectID, mrIID, req.ReplyID, req.Body); err != nil {
+	if err := f.ReplyMergeRequestComment(r.Context(), conn.ForgeProjectID, mrIID, req.ReplyID, body); err != nil {
 		h.forgeDriverError(w, err)
 		return
 	}

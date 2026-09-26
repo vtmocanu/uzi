@@ -14,8 +14,10 @@
 // Modes: `detect` (the above), `fail` (exits nonzero: an instrument failure), `slowclean` (sleeps
 // `sleepMs` IGNORING `--timeout` — as git mode does — then exits 0 with a clean report and a
 // matching "N commits scanned": a silent partial scan our deadline must catch), `stdinlie` (as
-// `detect`, but stdin mode reports one byte fewer than it was fed). Every call is
-// appended to `<shim>.calls` as "<mode> <log-opts>".
+// `detect`, but stdin mode reports one byte fewer than it was fed), `colorerr` (as `detect`, but git
+// mode also logs a scan error with gitleaks' ANSI-coloured level token, ESC[31mERR ESC[0m, and still
+// exits 0 with a matching count), `badreport` (as `detect`, but writes a truncated, malformed JSON
+// report). Every call is appended to `<shim>.calls` as "<mode> <log-opts>".
 
 import fs from "node:fs";
 import os from "node:os";
@@ -23,7 +25,7 @@ import path from "node:path";
 
 export function writeGitleaksShim(
   dir: string,
-  mode: "detect" | "fail" | "slowclean" | "stdinlie",
+  mode: "detect" | "fail" | "slowclean" | "stdinlie" | "colorerr" | "badreport",
   opts: { sleepMs?: number } = {},
 ): string {
   const shim = path.join(dir, `gitleaks-shim-${mode}-${opts.sleepMs ?? 0}`);
@@ -55,7 +57,7 @@ if (a[0] === "stdin") {
   for (const line of text.toString("utf8").split("\\n")) {
     if (re.test(line)) findings.push({ File: "", StartLine: 1, Commit: "", RuleID: "github-pat", Secret: "REDACTED" });
   }
-  fs.writeFileSync(report, JSON.stringify(findings));
+  fs.writeFileSync(report, mode === "badreport" ? "[broken" : JSON.stringify(findings));
   const n = mode === "stdinlie" ? text.length - 1 : text.length;
   process.stderr.write("INF scanned ~" + n + " bytes (" + n + " bytes) in 1ms\\n");
   return;
@@ -68,12 +70,13 @@ const counted = numstat.split("\\0").slice(1).filter((b) =>
   b.split("\\n").slice(1).some((l) => { const m = /^(\\d+)\\t(\\d+)\\t/.exec(l); return m && Number(m[1]) + Number(m[2]) > 0; }),
 ).length;
 const finish = () => {
-  if (mode === "detect" || mode === "stdinlie") {
+  if (mode === "detect" || mode === "stdinlie" || mode === "colorerr" || mode === "badreport") {
     for (const c of git(["rev-list", "--no-merges", ...revs]).split("\\n").filter(Boolean)) {
       scanDiff(git(["show", "--format=", "--unified=0", c]), c);
     }
   }
-  fs.writeFileSync(report, JSON.stringify(findings));
+  fs.writeFileSync(report, mode === "badreport" ? "[broken" : JSON.stringify(findings));
+  if (mode === "colorerr") process.stderr.write("\\x1b[90m8:15AM\\x1b[0m \\x1b[31mERR\\x1b[0m failed to scan commit\\n");
   process.stderr.write("INF " + counted + " commits scanned.\\n");
   process.exit(0);
 };

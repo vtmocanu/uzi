@@ -24,6 +24,25 @@ export interface SecretFinding {
 const MAX_PARSED_FINDINGS = 500;
 
 /**
+ * Whether a gitleaks JSON report is well-formed: `null` (gitleaks' "nothing found") or an array.
+ * parseGitleaksReport deliberately maps anything else to [], which reads as CLEAN, so every
+ * caller that turns a report into a trust decision must check this first and treat a malformed
+ * report (truncated, garbage, an object, an array holding non-objects) as an untrustworthy scan, never as "no findings".
+ */
+export function gitleaksReportWellFormed(json: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(json);
+    if (parsed === null) return true;
+    // Every entry must be a finding object: the parser silently drops anything else, so an
+    // unexpected shape would otherwise shrink to a clean-looking verdict.
+    return Array.isArray(parsed) && parsed.every((el) => el !== null && typeof el === "object" && !Array.isArray(el));
+  } catch {
+    return false;
+  }
+}
+
+
+/**
  * Parse gitleaks' JSON report (an array of finding objects) into SecretFinding[].
  *
  * Tolerant by design: returns [] — never throws — for an empty string, the literal
@@ -35,7 +54,8 @@ const MAX_PARSED_FINDINGS = 500;
  * but the caller still treats a failed report READ (fs error) or any thrown state as
  * UNTRUSTED — it returns trusted:false rather than a clean verdict. Parsing to [] here is
  * "the report said no findings"; it is NOT "the scan was trustworthy" — that is
- * scanIsTrustworthy's separate job.
+ * scanIsTrustworthy's separate job, and a malformed report must be rejected first with
+ * gitleaksReportWellFormed (which this parser's [] would otherwise read as clean).
  */
 export function parseGitleaksReport(json: string): SecretFinding[] {
   let parsed: unknown;
@@ -65,6 +85,12 @@ export function parseGitleaksReport(json: string): SecretFinding[] {
   return out;
 }
 
+/** Remove ANSI SGR colour sequences (ESC [ params m) from scanner output before any token match. */
+export function stripAnsiSgr(text: string): string {
+  // eslint-disable-next-line no-control-regex -- the ESC byte is exactly what is being matched
+  return text.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
 /**
  * Extract N from gitleaks' `INF N commits scanned` line on stderr (it prints e.g.
  * `8:15AM INF 1 commits scanned.`). Case-insensitive and tolerant of surrounding text /
@@ -74,7 +100,7 @@ export function parseGitleaksReport(json: string): SecretFinding[] {
  * that the scan walked commits at all rather than no-opping on an unresolved range.
  */
 export function commitsScannedFromStderr(stderr: string): number | null {
-  const m = stderr.match(/(\d+)\s+commits?\s+scanned/i);
+  const m = stripAnsiSgr(stderr).match(/(\d+)\s+commits?\s+scanned/i);
   if (!m) return null;
   const n = Number.parseInt(m[1]!, 10);
   return Number.isNaN(n) ? null : n;
@@ -104,12 +130,16 @@ export function scanIsTrustworthy(opts: {
   execOk: boolean;
 }): boolean {
   if (!opts.execOk) return false;
+  // gitleaks colours its level tokens even when stderr is a pipe (ESC[31mERR ESC[0m), and there is
+  // no word boundary between an SGR's final "m" and "ERR". Normalise HERE, not per caller, so no
+  // scanner that forgets to strip can read an errored walk as trustworthy.
+  const stderr = stripAnsiSgr(opts.stderr);
   // WORD-BOUNDARY match, not a bare substring: gitleaks/git surface a scan error as the
   // zerolog level `ERR` or the words `error`/`fatal` (git also emits `unknown revision`), all
   // standalone tokens. A substring `includes("err")` would also fire on a benign path or word
   // that merely CONTAINS "err" (e.g. a filename), silently flipping every scan to untrusted and
   // degrading the block to backstop-only. The tokens below are the real error signals only.
-  if (/\b(err|error|fatal)\b/i.test(opts.stderr) || /unknown revision/i.test(opts.stderr)) {
+  if (/\b(err|error|fatal)\b/i.test(stderr) || /unknown revision/i.test(stderr)) {
     return false;
   }
   if (opts.scannedCommits === null) return false;

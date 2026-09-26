@@ -1,0 +1,13 @@
+{
+  "secret": "run-owned-Secret-9f3k2",
+  "cases": [
+    {"name": "zero-width space", "rejoins_on_tty": true, "input": "before run-o\u200bwned-S\u200becret-9f3k2 after", "redacted": "before ***REDACTED*** after"},
+    {"name": "soft hyphen", "rejoins_on_tty": true, "input": "before run-o\u00adwned-S\u00adecret-9f3k2 after", "redacted": "before ***REDACTED*** after"},
+    {"name": "carriage return", "rejoins_on_tty": true, "input": "before run-o\rwned-S\recret-9f3k2 after", "redacted": "before ***REDACTED*** after"},
+    {"name": "backspace", "rejoins_on_tty": true, "input": "before run-o\bwned-S\becret-9f3k2 after", "redacted": "before ***REDACTED*** after"},
+    {"name": "right-to-left mark", "rejoins_on_tty": true, "input": "before run-o\u200fwned-S\u200fecret-9f3k2 after", "redacted": "before ***REDACTED*** after"},
+    {"name": "ANSI SGR escape", "rejoins_on_tty": false, "input": "before run-o\u001b[0mwned-S\u001b[0mecret-9f3k2 after", "redacted": "before ***REDACTED*** after"},
+    {"name": "newline", "rejoins_on_tty": false, "input": "before run-o\nwned-S\necret-9f3k2 after", "redacted": "before ***REDACTED*** after"},
+    {"name": "tab", "rejoins_on_tty": false, "input": "before run-o\twned-S\tecret-9f3k2 after", "redacted": "before ***REDACTED*** after"}
+  ]
+}

@@ -11,8 +11,6 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
-	"github.com/vtmocanu/uzi/api/internal/slacksvc"
-	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -77,11 +75,11 @@ func (h *Handler) WorkerTaskReview(w http.ResponseWriter, r *http.Request) {
 }
 
 // validateAndScrubTaskReview is the task-review ingest gate (PRD #400 M4a, mirrors
-// validateAndScrubReview): reject a bad status/severity enum, cap the free text and strip
-// control chars (preserving markdown newlines in the multi-line fields via
-// termsafe.SanitizeBounded), bound line to a sane non-negative int, cap the findings
-// count, and scrub every free field through the secret-family redactor before it is
-// persisted or ever rendered.
+// validateAndScrubReview): reject a bad status/severity enum, strip control chars
+// (preserving markdown newlines in the multi-line fields via termsafe.SanitizeBounded),
+// scrub every free field through the secret-family redactor and only then cap it
+// (scrubThenBound*), bound line to a sane non-negative int, and cap the findings count,
+// before anything is persisted or ever rendered.
 func validateAndScrubTaskReview(req workerTaskReviewRequest) (workersvc.TaskReviewSubmission, error) {
 	status := req.Status
 	if status == "" {
@@ -95,22 +93,22 @@ func validateAndScrubTaskReview(req workerTaskReviewRequest) (workersvc.TaskRevi
 	}
 	sub := workersvc.TaskReviewSubmission{
 		Status:    status,
-		SummaryMd: slacksvc.ScrubSecrets(termsafe.SanitizeBounded(req.Summary, workersvc.TaskReviewSummaryMaxBytes)),
+		SummaryMd: scrubThenBoundMarkdown(req.Summary, workersvc.TaskReviewSummaryMaxBytes),
 	}
 	for _, f := range req.Findings {
 		if !workersvc.TaskReviewSeverities[f.Severity] {
 			return workersvc.TaskReviewSubmission{}, fmt.Errorf("invalid finding severity: %q", f.Severity)
 		}
 		sub.Findings = append(sub.Findings, workersvc.TaskReviewFinding{
-			// file/symbol are single-line self-reported identifiers: control/Cf-strip + cap
-			// via sanitizeSelfReported, then secret-scrub. summary/rationale keep markdown
-			// newlines via termsafe.SanitizeBounded.
-			File:        slacksvc.ScrubSecrets(sanitizeSelfReported(f.File, workersvc.TaskReviewFileMaxBytes)),
-			Symbol:      slacksvc.ScrubSecrets(sanitizeSelfReported(f.Symbol, workersvc.TaskReviewSymbolMaxBytes)),
+			// file/symbol are single-line self-reported identifiers (sanitizeSelfReported);
+			// summary/rationale keep markdown newlines (termsafe.SanitizeBounded). Every field
+			// is stripped uncut, secret-scrubbed, and only then capped (scrubThenBound*).
+			File:        scrubThenBoundSelfReported(f.File, workersvc.TaskReviewFileMaxBytes),
+			Symbol:      scrubThenBoundSelfReported(f.Symbol, workersvc.TaskReviewSymbolMaxBytes),
 			Line:        boundTaskReviewLine(f.Line),
 			Severity:    f.Severity,
-			SummaryMd:   slacksvc.ScrubSecrets(termsafe.SanitizeBounded(f.Summary, workersvc.TaskReviewFindingSummaryMax)),
-			RationaleMd: slacksvc.ScrubSecrets(termsafe.SanitizeBounded(f.Rationale, workersvc.TaskReviewRationaleMaxBytes)),
+			SummaryMd:   scrubThenBoundMarkdown(f.Summary, workersvc.TaskReviewFindingSummaryMax),
+			RationaleMd: scrubThenBoundMarkdown(f.Rationale, workersvc.TaskReviewRationaleMaxBytes),
 		})
 	}
 	return sub, nil
