@@ -174,6 +174,21 @@ NEW_IP="$(api_ip)"
 [ -n "$NEW_IP" ] && [ "$OLD_IP" != "$NEW_IP" ] ||
   fail "api address did not change ($OLD_IP -> $NEW_IP); no stale-address proof"
 assert_identity
+# Prove the replacement is serving at its NEW address before a 502 can count as
+# stale proxy routing. Run the probe from the already-owned filler container.
+api_live=0
+live_deadline=$((SECONDS + 10))
+while [ "$SECONDS" -lt "$live_deadline" ]; do
+  if docker exec -e TARGET_IP="$NEW_IP" "$FILLER" node -e '
+    fetch(`http://${process.env.TARGET_IP}:8080/api/health`, {
+      signal: AbortSignal.timeout(4000),
+    }).then(r => r.json()).then(body => {
+      if (body.marker !== "api") process.exit(1);
+    }).catch(() => process.exit(1));
+  ' >/dev/null 2>&1; then api_live=1; break; fi
+  sleep 1
+done
+[ "$api_live" = 1 ] || fail "replacement api is not healthy at $NEW_IP"
 
 if [ "$MODE" = --expect-stale ]; then
   sleep 6
