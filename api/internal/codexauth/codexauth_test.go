@@ -347,9 +347,9 @@ func TestDiscoverIdentityAccountIDFromTokenClaim(t *testing.T) {
 }
 
 // Lazy parse: when the usage response carries account_id, a deliberately malformed
-// bearer is tolerated (never required to be a valid JWT) — the token is consulted only
-// on the empty-account_id fallback path. This pins tolerance, not precedence order; the
-// discriminating precedence assertion is TestDiscoverIdentityResponseAccountIDBeatsTokenClaim.
+// bearer is tolerated (never required to be a valid JWT). The token is parsed after the
+// 2xx for the fallback and the response/claim consistency check (#1239), but a token
+// with no parseable claim leaves nothing to compare, so the response account_id stands.
 func TestDiscoverIdentityResponseAccountIDToleratesMalformedToken(t *testing.T) {
 	tr := newCountingTransport(func(key string, _ *http.Request) (*http.Response, error) {
 		if key != usageKey {
@@ -371,12 +371,13 @@ func TestDiscoverIdentityResponseAccountIDToleratesMalformedToken(t *testing.T) 
 	}
 }
 
-// Precedence order (security-relevant): the provider-verified /wham/usage account_id must
-// win over the caller-supplied JWT claim. A VALID token carrying a DIFFERENT account id
-// discriminates this from "token wins" — the response value must be the one returned, so a
-// future flip to trusting the claim over the provider read is caught here.
-func TestDiscoverIdentityResponseAccountIDBeatsTokenClaim(t *testing.T) {
-	token := jwtWithAccountID(t, "acct-from-token-should-lose")
+// #1239: a valid token whose account claim DIFFERS from the usage response's account_id
+// names two workspaces; neither may be bound. DiscoverIdentity fails closed with the
+// mismatch sentinel, which still satisfies errors.Is(ErrIdentityIncomplete) so every
+// existing incomplete-identity path handles it. Replaces the #1237 "response beats claim"
+// precedence, which silently bound the response's workspace.
+func TestDiscoverIdentityAccountMismatchFailsClosed(t *testing.T) {
+	token := jwtWithAccountID(t, "acct-from-token")
 	tr := newCountingTransport(func(key string, _ *http.Request) (*http.Response, error) {
 		if key != usageKey {
 			t.Errorf("unexpected endpoint hit: %s", key)
@@ -386,11 +387,35 @@ func TestDiscoverIdentityResponseAccountIDBeatsTokenClaim(t *testing.T) {
 	c := newTestClient(tr)
 
 	id, err := c.DiscoverIdentity(context.Background(), token)
+	if !errors.Is(err, ErrIdentityAccountMismatch) {
+		t.Fatalf("err = %v, want ErrIdentityAccountMismatch", err)
+	}
+	if !errors.Is(err, ErrIdentityIncomplete) {
+		t.Fatalf("err = %v, want it to also match ErrIdentityIncomplete", err)
+	}
+	if id != (Identity{}) {
+		t.Fatalf("identity = %+v, want zero value on a mismatch", id)
+	}
+	if tr.counts[oauthKey] != 0 {
+		t.Fatalf("oauth endpoint hit %d times, want 0 (discovery must be nonrotating)", tr.counts[oauthKey])
+	}
+}
+
+// #1239 companion: when the response and the token claim name the SAME account, the
+// consistency check passes and that account is bound.
+func TestDiscoverIdentityAccountMatchesTokenClaim(t *testing.T) {
+	token := jwtWithAccountID(t, "acct-same")
+	tr := newCountingTransport(func(string, *http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusOK, `{"user_id":"user-abc","account_id":"acct-same"}`), nil
+	})
+	c := newTestClient(tr)
+
+	id, err := c.DiscoverIdentity(context.Background(), token)
 	if err != nil {
 		t.Fatalf("DiscoverIdentity: %v", err)
 	}
-	if id.WorkspaceAccountID != "acct-from-usage" {
-		t.Fatalf("WorkspaceAccountID = %q, want acct-from-usage (provider-verified response must beat the JWT claim)", id.WorkspaceAccountID)
+	if id.ProviderUserID != "user-abc" || id.WorkspaceAccountID != "acct-same" {
+		t.Fatalf("identity = %+v, want {user-abc acct-same}", id)
 	}
 }
 

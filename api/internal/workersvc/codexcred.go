@@ -474,8 +474,12 @@ func (r *CodexReconciler) sealLogin(userID uuid.UUID, plaintext []byte) (sealed 
 // linking on a temporary outage (issue #1209 review). reason is the short, secret-free
 // last_error text and is written only on the terminal path; it never echoes any token or
 // response body. "Identity incomplete" means neither the usage response nor the access-token
-// JWT claim yielded an account id (or user_id was absent).
+// JWT claim yielded an account id (or user_id was absent); the account-mismatch variant means
+// both named an account and they differ (#1239).
 func classifyDiscoveryFailure(err error) (reason string, terminal bool) {
+	if errors.Is(err, codexauth.ErrIdentityAccountMismatch) {
+		return "provider reported a different account than the login token names (multi-workspace seat?)", true
+	}
 	if errors.Is(err, codexauth.ErrIdentityIncomplete) {
 		return "provider did not return a complete identity (missing user or account id)", true
 	}
