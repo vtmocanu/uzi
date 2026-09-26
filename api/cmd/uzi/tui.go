@@ -231,6 +231,10 @@ type streamReadyMsg struct {
 	runID  string
 	stream *uzicli.RunStream
 	err    error
+	// gen is the detail SESSION generation (detailState.gen) the stream was opened under.
+	// Reopening the same run passes the runID guard, so a socket opened for a session the user
+	// has since left is closed on gen instead of replacing the new session's stream (#1151).
+	gen uint64
 }
 
 // streamEventsMsg carries a BATCH. The stream reader drains everything already queued
@@ -242,6 +246,10 @@ type streamEventsMsg struct {
 	events []apitypes.RunEventDTO
 	closed bool
 	err    error
+	// gen is the detail SESSION generation (detailState.gen) of the stream this batch was read
+	// from. exitToBoard closes the old stream, whose read chain then delivers a closed batch
+	// for the same runID; gen keeps it from nil-ing a reopened session's stream (#1151).
+	gen uint64
 }
 
 // pollFallbackMsg drives the D8 degradation: when the socket is unreachable the detail
@@ -260,8 +268,12 @@ type detailMetaMsg struct {
 	// reqID is the per-run request-generation id this reply belongs to (PRD #1130 M1 D2). The
 	// detail honours it only when reqID == m.detail.metaWaitID AND runID matches the current
 	// run, so a stale/superseded meta poll cannot clear a newer poll's guard. metaSeq restarts
-	// per run (newDetailState), which is safe because the case checks runID first.
+	// per detail session (newDetailState), so the case checks runID and gen BEFORE reqID: a
+	// reply from an earlier session on the same run would otherwise collide with the new
+	// session's id.
 	reqID uint64
+	// gen is the detail SESSION generation (detailState.gen) the poll was issued under (#1151).
+	gen uint64
 }
 
 // ---- model ----------------------------------------------------------------
@@ -658,7 +670,7 @@ func (m *tuiModel) startBoardReq() tea.Cmd {
 func (m *tuiModel) startDetailMetaReq() tea.Cmd {
 	m.detail.metaSeq++
 	m.detail.metaWaitID = m.detail.metaSeq
-	return m.refreshRunMetaCmd(m.detail.runID, m.detail.metaWaitID)
+	return m.refreshRunMetaCmd(m.detail.runID, m.detail.metaWaitID, m.detail.gen)
 }
 
 // fetchSecretsCmd counts the viewer's credentials per harness once. A failure is
@@ -815,7 +827,7 @@ func (m *tuiModel) startDetailCatchupReq() tea.Cmd {
 // refreshRunMetaCmd re-reads only the run DTO (no transcript replay), so the periodic
 // detail refresh is cheap: the socket already carries the frames, this just refreshes the
 // milestone / health / duration fields the stream does not send.
-func (m tuiModel) refreshRunMetaCmd(runID string, reqID uint64) tea.Cmd {
+func (m tuiModel) refreshRunMetaCmd(runID string, reqID, gen uint64) tea.Cmd {
 	c, parent := m.client, m.ctx
 	return func() tea.Msg {
 		// Per-poll deadline (PRD #1130 D3): same short bound as the board poll, derived
@@ -823,32 +835,32 @@ func (m tuiModel) refreshRunMetaCmd(runID string, reqID uint64) tea.Cmd {
 		ctx, cancel := context.WithTimeout(parent, boardPollTimeout)
 		defer cancel()
 		run, err := c.GetRun(ctx, runID)
-		return detailMetaMsg{runID: runID, run: run, err: err, reqID: reqID}
+		return detailMetaMsg{runID: runID, run: run, err: err, reqID: reqID, gen: gen}
 	}
 }
 
 func (m tuiModel) openStreamCmd(runID string) tea.Cmd {
-	c, ctx := m.client, m.ctx
+	c, ctx, gen := m.client, m.ctx, m.detail.gen
 	return func() tea.Msg {
 		s, err := c.StreamRun(ctx, runID)
-		return streamReadyMsg{runID: runID, stream: s, err: err}
+		return streamReadyMsg{runID: runID, stream: s, err: err, gen: gen}
 	}
 }
 
 // readStreamCmd blocks for one event then DRAINS whatever else is already queued, so
 // a burst costs a single re-render.
-func readStreamCmd(runID string, s *uzicli.RunStream) tea.Cmd {
+func readStreamCmd(runID string, gen uint64, s *uzicli.RunStream) tea.Cmd {
 	return func() tea.Msg {
 		ev, ok := <-s.Events()
 		if !ok {
-			return streamEventsMsg{runID: runID, closed: true, err: s.Err()}
+			return streamEventsMsg{runID: runID, closed: true, err: s.Err(), gen: gen}
 		}
 		batch := []apitypes.RunEventDTO{ev}
 		for {
 			select {
 			case next, ok := <-s.Events():
 				if !ok {
-					return streamEventsMsg{runID: runID, events: batch, closed: true, err: s.Err()}
+					return streamEventsMsg{runID: runID, events: batch, closed: true, err: s.Err(), gen: gen}
 				}
 				batch = append(batch, next)
 				continue
@@ -856,7 +868,7 @@ func readStreamCmd(runID string, s *uzicli.RunStream) tea.Cmd {
 			}
 			break
 		}
-		return streamEventsMsg{runID: runID, events: batch}
+		return streamEventsMsg{runID: runID, events: batch, gen: gen}
 	}
 }
 
@@ -1337,11 +1349,15 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case detailMetaMsg:
-		// runID is checked FIRST (PRD #1130 M1 D2): metaSeq restarts per run (newDetailState),
-		// so a reply for a run we have navigated away from could otherwise collide with the new
-		// run's id. A run-mismatched reply must never touch the current run's guard.
+		// runID and gen are checked FIRST (PRD #1130 M1 D2, #1151): metaSeq restarts per detail
+		// session (newDetailState), so a reply for a run we have navigated away from, or from an
+		// earlier session on the same run, could otherwise collide with the new session's id.
+		// Such a reply must never touch the current session's guard.
 		if msg.runID != m.detail.runID {
 			return m, nil // a reply for a run we've navigated away from — never touches the current guard
+		}
+		if msg.gen != m.detail.gen {
+			return m, nil // a reply from an earlier session on this run (esc → reopen)
 		}
 		if msg.reqID != m.detail.metaWaitID {
 			return m, nil // a stale/superseded poll for this run
@@ -1398,7 +1414,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.loadReviewCmd(m.detail.runID)
 
 	case streamReadyMsg:
-		if msg.runID != m.detail.runID {
+		// A socket for another run, or for an earlier session on this run (esc → reopen), is
+		// closed rather than adopted: the current session opens its own (#1151).
+		if msg.runID != m.detail.runID || msg.gen != m.detail.gen {
 			if msg.stream != nil {
 				msg.stream.Close()
 			}
@@ -1418,10 +1436,16 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// landed before the socket opened), so this stream's first reconnect replays only newer
 		// frames rather than the whole history (PRD #1137 M7).
 		m.detail.stream.NoteSeen(m.detail.highSeq)
-		return m, readStreamCmd(msg.runID, msg.stream)
+		return m, readStreamCmd(msg.runID, msg.gen, msg.stream)
 
 	case streamEventsMsg:
 		if msg.runID != m.detail.runID {
+			return m, nil
+		}
+		if msg.gen != m.detail.gen {
+			// A batch from an earlier session's stream (exitToBoard closed it, so this is
+			// typically its closed batch): end that chain without touching the reopened
+			// session's stream, polling state or transcript (#1151).
 			return m, nil
 		}
 		inputChanged := m.detail.applyEvents(msg.events)
@@ -1429,13 +1453,13 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// first probe failed for a reason that was not a 404, access is steerUnknown
 		// and nothing else would ever ask again.
 		if m.detail.steer.access == steerUnknown && hasStateFrame(msg.events) {
-			return m, tea.Batch(readStreamCmd(msg.runID, m.detail.stream), m.fetchInputsCmd(m.detail.runID))
+			return m, tea.Batch(readStreamCmd(msg.runID, msg.gen, m.detail.stream), m.fetchInputsCmd(m.detail.runID))
 		}
 		if inputChanged && m.detail.steer.access == steerAllowed {
 			// PRD #95: an `input` frame says the steer queue changed (a follow-up was
 			// consumed). It carries no data — it is a prompt to re-read — so the
 			// indicator refreshes off it rather than guessing.
-			return m, tea.Batch(readStreamCmd(msg.runID, m.detail.stream), m.fetchInputsCmd(m.detail.runID))
+			return m, tea.Batch(readStreamCmd(msg.runID, msg.gen, m.detail.stream), m.fetchInputsCmd(m.detail.runID))
 		}
 		if msg.closed {
 			m.detail.stream = nil
@@ -1443,7 +1467,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.detail.polling = true
 			return m, pollFallbackCmd()
 		}
-		return m, readStreamCmd(msg.runID, m.detail.stream)
+		return m, readStreamCmd(msg.runID, msg.gen, m.detail.stream)
 
 	case pollFallbackMsg:
 		if m.view != viewDetail || !m.detail.polling {

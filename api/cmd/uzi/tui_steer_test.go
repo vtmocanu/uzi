@@ -370,7 +370,7 @@ func TestInputFrameTriggersAQueueReRead(t *testing.T) {
 	m.detail.stream = uzicli.NewRunStream(context.Background(), nil)
 	defer m.detail.stream.Close()
 
-	_, cmd := m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{
+	_, cmd := m.Update(streamEventsMsg{gen: m.detail.gen, runID: runID, events: []apitypes.RunEventDTO{
 		{Type: uzicli.RunEventTypeInput},
 	}})
 	if cmd == nil {
@@ -474,7 +474,7 @@ func TestSteerUnknownIsRetriedOnAStateFrame(t *testing.T) {
 	// promise the model cannot keep.
 	m.detail.stream = uzicli.NewRunStream(context.Background(), nil)
 	defer m.detail.stream.Close()
-	_, cmd := m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{
+	_, cmd := m.Update(streamEventsMsg{gen: m.detail.gen, runID: runID, events: []apitypes.RunEventDTO{
 		{Type: uzicli.RunEventTypeState, Status: "running"},
 	}})
 	if cmd == nil {
