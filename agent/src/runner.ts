@@ -196,20 +196,26 @@ type RecoveryParkCause = { kind: "transient" } | { kind: "vault_locked" };
  *  (base recoveryRetryMs x 16). */
 const VAULT_PARK_BACKOFF_MAX_DOUBLINGS = 4;
 
-/** Issue #1766 (R6): the secret-free feed lines of a vault-lock deferral park. */
+/** Issue #1766 (R6): the secret-free feed lines of a vault-lock deferral park. Owner-neutral: the
+ *  feed is shown to any viewer of the run (an admin may view another owner's run), so a line names
+ *  "the run owner's vault", never "your vault". */
 const VAULT_PARK_FEED = {
   published:
-    "Paused: your vault is locked. The recovery checkpoint is published; this run resumes automatically at its next retry once your vault is unlocked.",
+    "Paused: the run owner's vault is locked. The recovery checkpoint is published; this run resumes automatically at its next retry once the vault is unlocked.",
   local:
-    "Paused: your vault is locked. The recovery checkpoint is saved only on this worker; this run resumes automatically at its next retry once your vault is unlocked.",
+    "Paused: the run owner's vault is locked. The recovery checkpoint is saved only on this worker; this run resumes automatically at its next retry once the vault is unlocked.",
   unverified:
     "Recovery checkpoint could not be verified. Keeping the local work and session and retrying before pausing.",
   settleIncomplete:
     "Waiting for this run's processes to stop before saving its work; keeping the local work and session and retrying.",
   confirmUnknown:
-    "Your vault is locked. Could not confirm this run is still running; keeping the local work and session and retrying before pausing.",
+    "The run owner's vault is locked. Could not confirm this run is still running; keeping the local work and session and retrying before pausing.",
   reportFailed:
-    "Your vault is locked. Could not record the pause yet; keeping the local work and session and retrying.",
+    "The run owner's vault is locked. Could not record the pause yet; keeping the local work and session and retrying.",
+  cancelReportFailed:
+    "Could not record the cancellation yet; keeping the local work and session and retrying.",
+  held:
+    "The run owner's vault is locked and this run is not running, so it was not paused for recovery; its local work and session are kept on this worker.",
 } as const;
 
 /** issue #1597 M1: whether a CodexBoundaryError failed because its boundary DEADLINE elapsed (a
@@ -2686,6 +2692,10 @@ export class RunRunner {
     claim: ClaimResponse,
     flight: RunFlight,
     err: unknown,
+    /** Issue #1766: `keepCustody` (a vault-lock park's given-up input receipt) skips the
+     *  credentialed pre-report reap (its Codex reconcile would refresh against the locked vault)
+     *  and every custody settle, so the exact-generation hold stays open for the reconciler. */
+    opts: { keepCustody?: boolean } = {},
   ): Promise<void> {
     const { batcher, redactText, runLog } = flight;
     const rawReason =
@@ -2735,6 +2745,7 @@ export class RunRunner {
         claim_generation: flight.claimGeneration,
       });
       await batcher.close().catch(() => undefined);
+      if (opts.keepCustody) return;
       // #1539: when the permanent-failure hook handled this terminal it ALREADY reaped the
       // provider between the install and the send (while still actively-claimed), so there is no
       // second reap here — settle custody ONCE, gated by the stale-epoch guard. Any OTHER writer that
@@ -2766,8 +2777,9 @@ export class RunRunner {
     // #1539: this fall-through is reached under the hook when its UNJOURNALED send threw (no latch,
     // no journal) — the hook already reaped, so reuse that outcome under the stale-epoch guard rather
     // than reap a second time (a second reap would be refused if the lost-ack send had actually landed).
-    const reaped =
-      flight.permanentFailureReap !== undefined
+    const reaped = opts.keepCustody
+      ? false
+      : flight.permanentFailureReap !== undefined
         ? this.permanentFailureReapValid(flight)
         : await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
     // Cap what lands in the run row (matches the GitLab error-body cap). Journal it WRITE-AHEAD then
@@ -8645,7 +8657,7 @@ export class RunRunner {
     reportState: (body: StateRequest) => Promise<StateAck>,
     runLog: Logger,
   ): Promise<
-    | { kind: "confirmed" | "unknown" | "stop" | "terminal" | "held" | "wall_parked" }
+    | { kind: "confirmed" | "unknown" | "stop" | "gone" | "terminal" | "held" | "wall_parked" }
     | { kind: "receipt_failed"; error: unknown }
   > {
     let ack: StateAck | undefined;
@@ -8669,7 +8681,7 @@ export class RunRunner {
     try {
       own = await this.client.getRunOwnership(flight.runId);
     } catch (probeError) {
-      if (probeError instanceof RequestError && probeError.status === 404) return { kind: "stop" };
+      if (probeError instanceof RequestError && probeError.status === 404) return { kind: "gone" };
       return { kind: "unknown" };
     }
     if (own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration) {
@@ -8719,8 +8731,16 @@ export class RunRunner {
    * `vault_locked` (a Codex credential deferral) differs in these ways:
    *   - it first confirms the run is `running` at this claim's generation
    *     ({@link confirmRunningForVaultPark}); a stale claim or another generation stops silently, a
-   *     server wall park retains everything, a terminal ack cleans up, a live non-running status
-   *     retains and ends non-terminal, and a given-up input receipt takes the generic failure;
+   *     server wall park retains everything, and a 404 keeps the clone and session;
+   *   - every exit that ends the flight on a terminal status or would clear the preserve flags (a
+   *     cancel, a terminal ack or ownership read, a given-up input receipt, a live non-running
+   *     status) first runs the credential-free exit capture: settle, WIP commit, fetch-back and
+   *     verify, with a best-effort credential-free publish. Only a VERIFIED capture clears the
+   *     preserve flags; otherwise the clone and session are kept, so executeClaim's finally never
+   *     discards the only copy of unfetched commits or uncommitted edits;
+   *   - a terminal status then ends the flight, a live non-running status posts a feed line and
+   *     keeps the clone and session without parking, and a given-up input receipt reports the
+   *     generic failure without the credentialed pre-report reap or any custody settle;
    *   - it settles the executor credential-free before capture, and retries (no park) until the
    *     settle is observed empty;
    *   - the capture publishes with no overlay and no boundary (credentialFree);
@@ -8728,8 +8748,10 @@ export class RunRunner {
    *     `recovery_cause_vault_locked`, else untyped;
    *   - it never runs the credentialed reap-then-settle (which would refresh against the locked
    *     vault and could release custody), so the custody hold is kept;
-   *   - a cancel reports `run cancelled` without the credentialed pre-report reap;
-   *   - every retry is visible on the feed (deduplicated) and backs off, capped.
+   *   - a cancel captures, then reports `run cancelled` without the credentialed pre-report reap;
+   *   - each retry (the running confirmation, the ownership probe, the settle, the capture, the
+   *     park report and the cancel report) posts a deduplicated feed line and backs off from
+   *     recoveryRetryMs, doubling up to a cap of 16x.
    */
   private async handleRecoveryExhausted(
     err: Error,
@@ -8768,6 +8790,59 @@ export class RunRunner {
       const doublings = Math.min(retries++, VAULT_PARK_BACKOFF_MAX_DOUBLINGS);
       await this.waitRecoveryRetry(flight, cancelStopsWait, this.recoveryRetryMs * 2 ** doublings);
     };
+    // Issue #1766: the vault-lock EXIT capture. Every vault path that ends the flight on a terminal
+    // status or would clear the preserve flags runs it first, because executeClaim's finally
+    // DISCARDS the clone once preserveRecoveryClone is false: commits since the last fetch-back and
+    // uncommitted edits exist only there. Credential-free: settle the executor (never reconciling),
+    // then WIP commit, fetch-back and verify, then a best-effort join-token publish (skipped for a
+    // run already known terminal). True only for a VERIFIED capture; never throws.
+    const captureForVaultExit = async (publish: boolean): Promise<boolean> => {
+      if (capture) return true;
+      if (!settled) {
+        const settlement = await this.settleForVaultCapture(executor);
+        if (settlement.kind !== "observed_empty") {
+          runLog.warn("vault-lock park: the execution did not settle before exit; keeping the clone and session", {
+            run_id: flight.runId,
+            errors: settlement.errors.map((e) => e.category),
+          });
+          return false;
+        }
+        settled = true;
+      }
+      try {
+        const attempt = await this.captureRecoveryRestorePoint(claim, flight, runLog, {
+          credentialFree: true,
+          publish,
+        });
+        if (attempt.verified) {
+          capture = attempt;
+          return true;
+        }
+      } catch (captureError) {
+        runLog.warn("vault-lock park: exit capture failed; keeping the clone and session", {
+          run_id: flight.runId,
+          error: errMessage(captureError),
+        });
+      }
+      return false;
+    };
+    // Only a verified capture may release the clone and session to executeClaim's finally.
+    const keepUnlessCaptured = (captured: boolean): void => {
+      flight.preserveRecoveryClone = !captured;
+      flight.preserveSession = !captured;
+    };
+    // A live non-running status (paused, awaiting_approval, ...): never park over it and never fail
+    // it. Capture, say so on the feed, and keep the clone and session for whoever resumes it.
+    const vaultHeld = async (): Promise<false> => {
+      await captureForVaultExit(true);
+      runLog.info("vault-lock park: the run is not running and cannot resume here; retaining work, not parking", {
+        run_id: flight.runId,
+      });
+      await note(VAULT_PARK_FEED.held);
+      flight.preserveRecoveryClone = true;
+      flight.preserveSession = true;
+      return false;
+    };
     try {
       for (;;) {
         if (flight.active?.shuttingDown) return false;
@@ -8790,15 +8865,19 @@ export class RunRunner {
               flight.preserveRecoveryClone = false;
               flight.preserveSession = false;
               return false;
-            case "terminal":
-              flight.preserveRecoveryClone = false;
-              flight.preserveSession = false;
-              return false;
-            case "held":
-              runLog.info("vault-lock park: the run is not running and cannot resume here; retaining work, not parking", {
+            case "gone":
+              // A 404: this worker no longer owns the run. Keep the clone and session unless a
+              // verified capture exists, exactly as the loop's 404 does.
+              runLog.info("vault-lock park: the run is not found for this worker; keeping the clone and session", {
                 run_id: flight.runId,
               });
+              keepUnlessCaptured(capture !== undefined);
               return false;
+            case "terminal":
+              keepUnlessCaptured(await captureForVaultExit(false));
+              return false;
+            case "held":
+              return await vaultHeld();
             case "wall_parked":
               // The ServerWallParkedError arm's posture: retain everything, report nothing.
               runLog.info(
@@ -8807,9 +8886,10 @@ export class RunRunner {
               );
               return true;
             case "receipt_failed":
-              flight.preserveRecoveryClone = false;
-              flight.preserveSession = false;
-              await this.reportGenericFailure(claim, flight, confirm.error);
+              // The run fails, so capture first. keepCustody: no credentialed pre-report reap (it
+              // would refresh against the locked vault) and no custody settle; the hold stays open.
+              keepUnlessCaptured(await captureForVaultExit(true));
+              await this.reportGenericFailure(claim, flight, confirm.error, { keepCustody: true });
               return false;
           }
         }
@@ -8826,11 +8906,22 @@ export class RunRunner {
             return false;
           }
         } catch (probeError) {
-          if (probeError instanceof RequestError && probeError.status === 404) return false;
+          if (probeError instanceof RequestError && probeError.status === 404) {
+            if (vault) keepUnlessCaptured(capture !== undefined);
+            return false;
+          }
+          if (vault) await note(VAULT_PARK_FEED.confirmUnknown);
           await retryWait();
           continue;
         }
         if (status !== "running") {
+          if (vault && status !== "recovery_wait") {
+            if (terminal.has(status)) {
+              keepUnlessCaptured(await captureForVaultExit(false));
+              return false;
+            }
+            return await vaultHeld();
+          }
           if (terminal.has(status)) {
             flight.preserveRecoveryClone = false;
             flight.preserveSession = false;
@@ -8861,13 +8952,17 @@ export class RunRunner {
             cancelReap = vault
               ? false
               : await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
+          // Issue #1766: capture BEFORE the cancel report, credential-free. Mirrors the transient
+          // settle's guarantee (committed work is archived, or the clone kept when it is the only
+          // source) without a credentialed call: an unverified capture keeps the clone and session.
+          const cancelCaptured = vault ? await captureForVaultExit(true) : false;
           try {
             // Consuming cancel only stamps stop_kind. This existing terminal
             // report is what makes Service route it to CancelRunByWorker.
             const ack = await reportState({ status: "failed", failure_reason: "run cancelled" });
             if (ack.status && terminal.has(ack.status)) {
-              flight.preserveRecoveryClone = false;
-              flight.preserveSession = false;
+              flight.preserveRecoveryClone = vault && !cancelCaptured;
+              flight.preserveSession = vault && !cancelCaptured;
               // PRD #1349 M2 (D4.5) / #1539: the provider was reaped above while actively-claimed;
               // now the terminal report has landed, so run the non-status-gated custody settle. A
               // verified-empty run RELEASES its exact hold, committed work CAPTURES it, and a
@@ -8882,6 +8977,7 @@ export class RunRunner {
               error: errMessage(cancelError),
             });
           }
+          if (vault) await note(VAULT_PARK_FEED.cancelReportFailed);
           // Do not busy-loop on the sticky cancel or its spent abort signal.
           // Shutdown can still stop the retry with clone and session retained.
           await retryWait(false);
@@ -9009,8 +9105,9 @@ export class RunRunner {
           runLog.warn("could not report recovery park; retaining session and retrying", {
             error: errMessage(reportError),
           });
-          if (vault) await note(VAULT_PARK_FEED.reportFailed);
         }
+        // Issue #1766: a thrown park report and a statusless ACK both retry; both are visible.
+        if (vault) await note(VAULT_PARK_FEED.reportFailed);
         await retryWait();
       }
     } finally {
@@ -9244,7 +9341,7 @@ export class RunRunner {
     claim: ClaimResponse,
     flight: RunFlight,
     runLog: Logger,
-    opts: { credentialFree?: boolean } = {},
+    opts: { credentialFree?: boolean; publish?: boolean } = {},
   ): Promise<{ verified: boolean; published: boolean }> {
     const barePath = flight.barePath;
     const worktreePath = flight.worktreePath;
@@ -9318,7 +9415,10 @@ export class RunRunner {
     // the publish opens NO Codex boundary (its reconcile would refresh against the locked vault) and
     // builds NO overlay (the overlay's default-fetch is PAT-bearing): it is the pause-park sink's
     // credential-free join-token publish. The caller settled the execution before this capture.
+    // `publish: false` (a run already known terminal) keeps the verified local capture and skips
+    // the publish: a terminal run is never resumed from a checkpoint.
     if (opts.credentialFree) {
+      if (opts.publish === false) return { verified, published: false };
       const freePublished = await this.publishCheckpointBestEffort(flight, barePath, branch, undefined);
       return { verified, published: freePublished };
     }
