@@ -45,6 +45,8 @@ case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; e
         echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":false,"comments":{"nodes":[{"databaseId":11,"author":{"login":"coderabbitai"},"body":"🟡 **partial finding**","path":"partial.go","line":7,"originalLine":7}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
       elif [ "$MODE" = cr_ca_findings ]; then
         echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":false,"comments":{"nodes":[{"databaseId":21,"author":{"login":"coderabbitai"},"body":"🟠 **carried finding**","path":"ca.go","line":3,"originalLine":3}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
+      elif [ "$MODE" = prior_pending_resolved ]; then
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"comments":{"nodes":[{"databaseId":556,"author":{"login":"greptile-apps"},"body":"P1 finding","path":"old.go","line":8,"originalLine":8}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
       elif [ "$MODE" = prior_resolved ]; then
         echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"comments":{"nodes":[{"databaseId":555,"author":{"login":"greptile-apps"},"body":"P1 resolved finding","path":"x.go","line":9,"originalLine":9}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
       elif [ "$MODE" = cr_resolved ]; then
@@ -76,6 +78,7 @@ case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; e
         prior_clean|prior_none|prior_unreadable|prior_pending|prior_unparseable|head_unreadable) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
         prior_findings) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> superseded finding","pull_request_review_id":44},{"user":{"login":"greptile-apps[bot]"},"line":9,"body":"<img alt=\"P1\"> still open finding","pull_request_review_id":55}]' ;;
         greptile_clean) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
+        prior_pending_resolved) echo '[{"id":556,"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
         prior_resolved) echo '[{"id":555,"user":{"login":"greptile-apps[bot]"},"line":9,"body":"<img alt=\"P1\"> resolved finding","pull_request_review_id":55}]' ;;
         greptile_mixed) echo '[{"user":{"login":"greptile-apps[bot]"},"line":3,"body":"<img alt=\"P2\"> inline finding","pull_request_review_id":7}]' ;;
         cr_resolved) echo '[{"user":{"login":"coderabbitai[bot]"},"line":8,"body":"🟡 **resolved finding**","pull_request_review_id":9}]' ;;
@@ -87,7 +90,7 @@ case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; e
     *'/commits/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/check-runs'*)
       case "$MODE" in
         prior_clean|prior_headreview|prior_unparseable|head_unreadable) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
-        prior_pending) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"in_progress","conclusion":null,"output":{"summary":""}}]}' ;;
+        prior_pending|prior_pending_resolved) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"in_progress","conclusion":null,"output":{"summary":""}}]}' ;;
         prior_findings|prior_resolved) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 1 comments added"}}]}' ;;
         *) echo '{"check_runs":[{"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","output":{"summary":""}}]}' ;;
       esac ;;
@@ -310,6 +313,16 @@ rc=$?
 set -e
 [ "$rc" -eq 2 ] || fail "an in-flight newer Greptile review was stepped over, rc=$rc: $(cat "$WORK/prior-pending.out")"
 grep -q 'gr_prior=pending.*unknown=1' "$WORK/prior-pending.out" || fail "pending newer review was not visible: $(cat "$WORK/prior-pending.out")"
+
+# Every anchored comment is in a resolved thread, but a newer Greptile review is still running:
+# it may add findings, so the head is not ready (codex review of #1734).
+MODE="prior_pending_resolved"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer none > "$WORK/prior-pending-resolved.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "resolved threads hid an in-flight Greptile review, rc=$rc: $(cat "$WORK/prior-pending-resolved.out")"
+grep -q 'gr_prior=pending.*unknown=1' "$WORK/prior-pending-resolved.out" || fail "pending review not visible under resolved threads: $(cat "$WORK/prior-pending-resolved.out")"
 
 # A Greptile review object already ON the head, its check-run not exposed yet: what Greptile
 # said about this head stands, an older clean verdict does not speak over it.

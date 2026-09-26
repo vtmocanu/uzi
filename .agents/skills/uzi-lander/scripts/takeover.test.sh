@@ -35,7 +35,7 @@ case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; e
 case "$*" in
   *"/commits/$HEAD/status"*) echo '{"statuses":[]}' ;;
   *'graphql'*)
-    [ "$MODE" = prior_resolved ] || { echo "unexpected gh api: $*" >&2; exit 1; }
+    case "$MODE" in prior_resolved|prior_pending_resolved) ;; *) echo "unexpected gh api: $*" >&2; exit 1 ;; esac
     echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"comments":{"nodes":[{"databaseId":991,"author":{"login":"greptile-apps"},"body":"P1 finding","path":"x.go","line":8,"originalLine":8}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}' ;;
   *'/pulls/42/reviews'*)
     case "$MODE" in
@@ -67,7 +67,7 @@ case "$*" in
   *"/commits/$PREV/check-runs"*)
     case "$MODE" in
       prior_clean|head_review_object|head_failed|head_unreadable|prior_requested) greptile completed '"success"' '90 files reviewed, 0 comments added' ;;
-      prior_pending) greptile in_progress null '' ;;
+      prior_pending|prior_pending_resolved) greptile in_progress null '' ;;
       *) none ;;
     esac ;;
   *'/pulls/42/files'*) echo '[]' ;;
@@ -118,6 +118,11 @@ has prior_none 'LIVE_FINDINGS=1 (cr=0 gr=1 '
 # (#1710, 2026-09-26).
 snap prior_resolved
 has prior_resolved 'LIVE_FINDINGS=0 (cr=0 gr=0 '
+
+# Resolved threads never hide a newer Greptile review still running.
+snap prior_pending_resolved
+has prior_pending_resolved 'GREPTILE_PRIOR_VERDICT=pending'
+has prior_pending_resolved 'NEXT=unknown'
 
 # A Greptile review object already on the head outranks an older clean verdict, exactly as
 # in watch-pr.sh and pr-findings.sh.

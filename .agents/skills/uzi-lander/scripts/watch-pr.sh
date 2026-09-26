@@ -324,9 +324,10 @@ while [ "$i" -lt "$MAX" ]; do
   # Greptile liveness is scoped to its current-head review id; the check-run tally below
   # proves whether GitHub has exposed the complete set. Liveness also drops comments whose
   # thread is resolved (gr_live_c), as CodeRabbit's does; the tally check keeps them all.
-  gr_live_c='[]'
+  gr_live_c='[]'; gr_anchored=0
   if pull_c=$(gh api --paginate "repos/$REPO/pulls/$PR/comments" 2>/dev/null) && pages_are_arrays "$pull_c"; then
     gr_live_c=$(printf '%s' "$pull_c" | jq -s 'add // []' 2>/dev/null) || { gr_live_c='[]'; unknown=1; }
+    gr_anchored=$(printf '%s' "$gr_live_c" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null) || unknown=1
     if [ "$threads_ok" -eq 1 ]; then
       gr_live_c=$(printf '%s' "$gr_live_c" | drop_resolved_comments "$thread_nodes") || { gr_live_c='[]'; unknown=1; }
     fi
@@ -425,11 +426,11 @@ while [ "$i" -lt "$MAX" ]; do
   # only: gr_reviewed stays the exact-head answer, so this never satisfies the reviewer
   # gate. A newer Greptile review still running (rc 2) defers like an in-progress head.
   gr_prior=""
-  if [ "$gr_reviewed" -eq 0 ] && [ "$gr_live" -gt 0 ]; then
+  if [ "$gr_reviewed" -eq 0 ] && [ "${gr_anchored:-0}" -gt 0 ]; then
     gr_flat="$gr_live_c"
     gr_rc=0
     gr_issue_flat=$(printf '%s' "${issue_c:-}" | jq -s 'add // []' 2>/dev/null) || gr_issue_flat='x'
-    greptile_scope_live "$REPO" "$PR" "$head" "$gr_state" "$gr_review_id" "$gr_live" "$gr_flat" "$gr_issue_flat" || gr_rc=$?
+    greptile_scope_live "$REPO" "$PR" "$head" "$gr_state" "$gr_review_id" "$gr_live" "$gr_flat" "$gr_issue_flat" "$gr_anchored" || gr_rc=$?
     if [ "$gr_rc" -eq 0 ]; then
       gr_live="$GRL_LIVE"; gr_prior="$GRL_NOTE"
     else

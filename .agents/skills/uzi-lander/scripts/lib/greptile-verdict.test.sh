@@ -186,6 +186,12 @@ scope 0 2 "" absent "" 2
 # ...and it fails closed, keeping the raw count, when it cannot.
 MODE=pending_newer; export MODE
 scope 2 2 "" absent "" 2
+# Every anchored comment resolved (RAW_LIVE 0) yet ANCHORED 2: the pending check still runs.
+# shellcheck disable=SC2034  # read by the sourced lib: clearing it forces a cold (unmemoised) call.
+GRV_CACHE_KEY=""
+rc=0
+greptile_scope_live test/repo 42 "$HEAD_SHA" absent "" 0 "$COMMENTS" '[]' 2 || rc=$?
+[ "$rc" -eq 2 ] || fail "resolved comments skipped the pending check: rc=$rc"
 MODE=commits_fail; export MODE
 scope 1 2 "" absent "" 2
 

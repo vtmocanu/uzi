@@ -210,6 +210,7 @@ cr_live=$(printf '%s' "$pull_c" | jq '[.[]|select(.user.login=="coderabbitai[bot
 # Greptile comments in a resolved thread are settled (lib/review-threads.sh); an unreadable
 # thread listing keeps them all, a superset.
 gr_pull_c="$pull_c"
+gr_anchored=$(printf '%s' "$pull_c" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
 if thread_nodes=$(fetch_review_threads "$REPO" "$PR"); then
   gr_pull_c=$(printf '%s' "$pull_c" | drop_resolved_comments "$thread_nodes") || gr_pull_c="$pull_c"
 fi
@@ -225,7 +226,7 @@ if [ "$gr_reviewed" -eq 1 ]; then
 else
   gr_head_rid=$(printf '%s' "$rev_raw" | jq -r --arg h "$head" '[.[]|select(.user.login=="greptile-apps[bot]" and .commit_id==$h)]|last|.id // empty' 2>/dev/null || echo unreadable)
   gr_rc=0
-  greptile_scope_live "$REPO" "$PR" "$head" "$gr_state" "$gr_head_rid" "$gr_live" "$gr_pull_c" "$issue_c" || gr_rc=$?
+  greptile_scope_live "$REPO" "$PR" "$head" "$gr_state" "$gr_head_rid" "$gr_live" "$gr_pull_c" "$issue_c" "$gr_anchored" || gr_rc=$?
   if [ "$gr_rc" -eq 0 ]; then
     gr_live="$GRL_LIVE"
     [ -n "$GRL_NOTE" ] && echo "GREPTILE_PRIOR_VERDICT=$GRL_NOTE"

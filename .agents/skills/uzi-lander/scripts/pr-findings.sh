@@ -295,9 +295,10 @@ for n in "$@"; do
   # applies only when the head carries no Greptile evidence at all, and it is liveness
   # only: the gate above already recorded this head as unreviewed, and that stands.
   if [ "$gr_ok" -eq 0 ] && [ -n "$head" ]; then
+    gr_anchored_all=$(printf '%s' "$inline_raw" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
     gr_anchored=$(printf '%s' "$gr_inline" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
     gr_rc=0
-    greptile_scope_live "$repo" "$n" "$head" "$gr_status" "$gr_review_id" "$gr_anchored" "$gr_inline" "$gr_issue" || gr_rc=$?
+    greptile_scope_live "$repo" "$n" "$head" "$gr_status" "$gr_review_id" "$gr_anchored" "$gr_inline" "$gr_issue" "$gr_anchored_all" || gr_rc=$?
     if [ "$gr_rc" -eq 2 ]; then
       echo "  ⏳ a Greptile review is running, or was just requested, after its last verdict; findings deferred"
       unconfirmed="${unconfirmed} #${n}"
