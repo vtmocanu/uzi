@@ -2,6 +2,7 @@ package kube
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1161,7 +1162,7 @@ func TestDindContainersMountNoneOfTheWorkersVolumes(t *testing.T) {
 
 			var checked int
 			for _, c := range pod.InitContainers {
-				if c.Name != dindContainerName && c.Name != dindInitContainerName {
+				if c.Name != dindContainerName && c.Name != dindInitContainerName && c.Name != dindMeterContainerName {
 					continue
 				}
 				checked++
@@ -1177,10 +1178,11 @@ func TestDindContainersMountNoneOfTheWorkersVolumes(t *testing.T) {
 					}
 				}
 			}
-			// Rootless renders dind + dind-init (2); non-rootless drops dind-init (1).
-			wantChecked := 2
+			// Rootless renders dind + dind-init + dind-meter (3); non-rootless drops
+			// dind-init (2). dind-meter (issue #1759) shares dind-data, never a worker volume.
+			wantChecked := 3
 			if p.nonRootless {
-				wantChecked = 1
+				wantChecked = 2
 			}
 			if checked != wantChecked {
 				t.Fatalf("expected to check %d dind container(s), checked %d", wantChecked, checked)
@@ -1274,11 +1276,12 @@ func TestDockerWorkerRendersNativeSidecarsInOrder(t *testing.T) {
 			dep := RenderDeployment(p.cfg, desiredDocker("abc"), testSpec(t, "base", "m"))
 			inits := dep.Spec.Template.Spec.InitContainers
 
-			// Rootless: [seed-nix, dind-init, dind]. Non-rootless: [seed-nix, dind] — no
-			// dind-init, since there is no shared socket dir to chown (loopback transport).
-			wantOrder := []string{seedContainerName, dindInitContainerName, dindContainerName}
+			// Rootless: [seed-nix, dind-init, dind, dind-meter]. Non-rootless: [seed-nix, dind,
+			// dind-meter] — no dind-init, since there is no shared socket dir to chown
+			// (loopback transport). dind-meter (issue #1759) is last in both.
+			wantOrder := []string{seedContainerName, dindInitContainerName, dindContainerName, dindMeterContainerName}
 			if p.nonRootless {
-				wantOrder = []string{seedContainerName, dindContainerName}
+				wantOrder = []string{seedContainerName, dindContainerName, dindMeterContainerName}
 			}
 			if len(inits) != len(wantOrder) {
 				t.Fatalf("init containers = %v, want %v", initNames(inits), wantOrder)
@@ -1289,8 +1292,10 @@ func TestDockerWorkerRendersNativeSidecarsInOrder(t *testing.T) {
 				}
 			}
 			// Every dind sidecar (dind, and rootless' dind-init) is native + carries a probe.
+			// dind-meter is native too but deliberately probe-less (it must never gate the
+			// worker); TestDindMeterSidecarIsAnUnprivilegedReadOnlyStatfsSampler pins it.
 			for _, c := range inits {
-				if c.Name == seedContainerName {
+				if c.Name == seedContainerName || c.Name == dindMeterContainerName {
 					continue
 				}
 				if c.RestartPolicy == nil || *c.RestartPolicy != corev1.ContainerRestartPolicyAlways {
@@ -1499,6 +1504,242 @@ func TestDockerFlagRollsThePodButAbsentDockerIsInert(t *testing.T) {
 	}
 }
 
+// --- dind-meter sidecar + prune gate (issue #1759) --------------------------
+
+// The dind-meter sidecar, BOTH postures: a native sidecar with no startupProbe (it must
+// never gate the worker), running as the worker's non-root uid with no privileges, a
+// read-only root fs and ALL caps dropped, mounting EXACTLY dind-data read-only at its own
+// path plus its own sample dir, and sampling statfs with an atomic write.
+func TestDindMeterSidecarIsAnUnprivilegedReadOnlyStatfsSampler(t *testing.T) {
+	for _, p := range dindPostures() {
+		t.Run(p.name, func(t *testing.T) {
+			pod := RenderDeployment(p.cfg, desiredDocker("abc"), testSpec(t, "base", "m")).Spec.Template.Spec
+			meter := containerByName(t, pod.InitContainers, dindMeterContainerName)
+
+			if meter.Image != p.cfg.DinDImage {
+				t.Errorf("dind-meter image = %q, want the pinned DinD image %q", meter.Image, p.cfg.DinDImage)
+			}
+			if meter.RestartPolicy == nil || *meter.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+				t.Error("dind-meter must be a native sidecar (restartPolicy: Always)")
+			}
+			if meter.StartupProbe != nil {
+				t.Error("dind-meter must carry NO startupProbe: a probe would let a meter fault gate the worker's start")
+			}
+
+			wantMounts := []corev1.VolumeMount{
+				{Name: dindDataVolume, MountPath: "/dind-data", ReadOnly: true},
+				{Name: dindMeterVolume, MountPath: "/run/uzi-dind-meter"},
+			}
+			if !reflect.DeepEqual(meter.VolumeMounts, wantMounts) {
+				t.Errorf("dind-meter mounts = %+v, want exactly %+v", meter.VolumeMounts, wantMounts)
+			}
+
+			sc := meter.SecurityContext
+			if sc == nil {
+				t.Fatal("dind-meter declares no securityContext")
+			}
+			if sc.Privileged != nil && *sc.Privileged {
+				t.Error("dind-meter must NOT be privileged")
+			}
+			if sc.RunAsNonRoot == nil || !*sc.RunAsNonRoot {
+				t.Error("dind-meter must set runAsNonRoot: true")
+			}
+			if sc.RunAsUser == nil || *sc.RunAsUser != workerUID || sc.RunAsGroup == nil || *sc.RunAsGroup != workerGID {
+				t.Errorf("dind-meter must run as the worker uid/gid %d/%d", workerUID, workerGID)
+			}
+			if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+				t.Error("dind-meter must set allowPrivilegeEscalation: false")
+			}
+			if sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem {
+				t.Error("dind-meter must set readOnlyRootFilesystem: true")
+			}
+			if sc.Capabilities == nil || len(sc.Capabilities.Drop) != 1 || sc.Capabilities.Drop[0] != "ALL" || len(sc.Capabilities.Add) != 0 {
+				t.Errorf("dind-meter must drop ALL and add nothing, got %+v", sc.Capabilities)
+			}
+			if sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+				t.Error("dind-meter must use RuntimeDefault seccomp")
+			}
+
+			wantRes := corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10m"), corev1.ResourceMemory: resource.MustParse("16Mi")},
+				Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("50m"), corev1.ResourceMemory: resource.MustParse("32Mi")},
+			}
+			if !reflect.DeepEqual(meter.Resources, wantRes) {
+				t.Errorf("dind-meter resources = %+v, want %+v", meter.Resources, wantRes)
+			}
+
+			if len(meter.Command) != 3 || meter.Command[0] != "/bin/sh" || meter.Command[1] != "-c" {
+				t.Fatalf("dind-meter command = %q, want [/bin/sh -c <script>]", meter.Command)
+			}
+			script := meter.Command[2]
+			for _, want := range []string{
+				`stat -f -c '%S %b %f %c %d' /dind-data`,
+				`date +%s`,
+				`'v1 %s %s\n'`,
+				"> /run/uzi-dind-meter/statfs.tmp",
+				"mv -f /run/uzi-dind-meter/statfs.tmp /run/uzi-dind-meter/statfs",
+				"sleep 30",
+			} {
+				if !strings.Contains(script, want) {
+					t.Errorf("dind-meter script is missing %q:\n%s", want, script)
+				}
+			}
+			if strings.Contains(script, "set -e") {
+				t.Errorf("dind-meter script must not `set -e`: a failed sample must skip, not end the loop:\n%s", script)
+			}
+
+			// Its sample dir is an emptyDir (torn down with the pod, no persistence surface).
+			if v := volumeByName(t, pod.Volumes, dindMeterVolume); v.EmptyDir == nil {
+				t.Errorf("the %q volume must be an emptyDir, got %+v", dindMeterVolume, v.VolumeSource)
+			}
+		})
+	}
+}
+
+// The meter script runs for real under /bin/sh against a scratch dir (the only part of the
+// sidecar a unit test can execute): one loop iteration writes exactly one v1 line of six
+// integers, and a stat failure writes nothing and keeps looping. The paths are rewritten to
+// scratch dirs and `sleep` is replaced so the loop ends after the sampled iteration.
+func TestDindMeterScriptWritesOneV1LineAtomically(t *testing.T) {
+	const sh = "/bin/sh"
+	if _, err := os.Stat(sh); err != nil {
+		t.Skip("no /bin/sh")
+	}
+	if out, err := exec.Command(sh, "-c", `stat -f -c '%S' /`).CombinedOutput(); err != nil {
+		t.Skipf("host stat has no -f -c support: %v %s", err, out)
+	}
+	run := func(t *testing.T, dataDir string) (string, bool) {
+		t.Helper()
+		outDir := t.TempDir()
+		script := strings.NewReplacer(
+			dindMeterDataDir, dataDir,
+			dindMeterDir, outDir,
+			"sleep 30", "exit 0",
+		).Replace(dindMeterScript())
+		if out, err := exec.Command(sh, "-c", script).CombinedOutput(); err != nil { //nolint:gosec // G204: runs the renderer's own meter script with test-controlled temp paths, not user input
+			t.Fatalf("meter script failed: %v\n%s", err, out)
+		}
+		if _, err := os.Stat(filepath.Join(outDir, "statfs.tmp")); err == nil {
+			t.Error("statfs.tmp left behind; the write must be renamed into place")
+		}
+		b, err := os.ReadFile(filepath.Join(outDir, "statfs")) //nolint:gosec // G304: reads a file under t.TempDir()
+		if err != nil {
+			return "", false
+		}
+		return string(b), true
+	}
+
+	t.Run("sample", func(t *testing.T) {
+		line, ok := run(t, t.TempDir())
+		if !ok {
+			t.Fatal("no statfs sample was written")
+		}
+		if !strings.HasSuffix(line, "\n") || strings.Count(line, "\n") != 1 {
+			t.Fatalf("sample must be exactly one newline-terminated line, got %q", line)
+		}
+		fields := strings.Split(strings.TrimSuffix(line, "\n"), " ")
+		if len(fields) != 7 || fields[0] != "v1" {
+			t.Fatalf("sample = %q, want `v1 <epoch_s> <frsize> <blocks> <bfree> <files> <ffree>`", line)
+		}
+		for _, f := range fields[1:] {
+			if _, err := strconv.ParseUint(f, 10, 64); err != nil {
+				t.Errorf("sample field %q is not a base-10 non-negative integer (line %q)", f, line)
+			}
+		}
+	})
+	t.Run("stat failure writes nothing", func(t *testing.T) {
+		if _, ok := run(t, filepath.Join(t.TempDir(), "missing")); ok {
+			t.Error("a failed stat must write no sample")
+		}
+	})
+}
+
+// The worker mounts the meter's sample dir READ-ONLY and still mounts NO dind-data, in
+// both postures (Decision 3: only the daemon and the read-only meter see that claim).
+func TestDockerWorkerReadsTheMeterButNeverMountsDinDData(t *testing.T) {
+	for _, p := range dindPostures() {
+		t.Run(p.name, func(t *testing.T) {
+			pod := RenderDeployment(p.cfg, desiredDocker("abc"), testSpec(t, "base", "m")).Spec.Template.Spec
+			worker := containerByName(t, pod.Containers, workerContainerName)
+			var meterMounts []corev1.VolumeMount
+			for _, vm := range worker.VolumeMounts {
+				if vm.Name == dindDataVolume || vm.MountPath == dindMeterDataDir {
+					t.Errorf("the worker mounts dind-data (%+v); only dind and the read-only meter may", vm)
+				}
+				if vm.Name == dindMeterVolume {
+					meterMounts = append(meterMounts, vm)
+				}
+			}
+			want := corev1.VolumeMount{Name: dindMeterVolume, MountPath: "/run/uzi-dind-meter", ReadOnly: true}
+			if len(meterMounts) != 1 || !reflect.DeepEqual(meterMounts[0], want) {
+				t.Errorf("worker meter mounts = %+v, want exactly [%+v]", meterMounts, want)
+			}
+		})
+	}
+}
+
+// UZI_DIND_PRUNE_ENABLED: docker workers only, always explicit, "true" iff the prune knob
+// is on AND the worker is not ephemeral. A plain worker carries no such env, no meter
+// container and no meter volume, and the knob never moves its spec hash.
+func TestDindPruneEnvIsDockerOnlyAndGatedOnKnobAndEphemeral(t *testing.T) {
+	envOf := func(c corev1.Container) (string, bool) {
+		for _, e := range c.Env {
+			if e.Name == "UZI_DIND_PRUNE_ENABLED" {
+				return e.Value, true
+			}
+		}
+		return "", false
+	}
+	for _, p := range dindPostures() {
+		for _, tc := range []struct {
+			enabled, ephemeral bool
+			want               string
+		}{
+			{true, false, "true"},
+			{true, true, "false"},
+			{false, false, "false"},
+			{false, true, "false"},
+		} {
+			t.Run(fmt.Sprintf("%s/enabled=%v/ephemeral=%v", p.name, tc.enabled, tc.ephemeral), func(t *testing.T) {
+				cfg := p.cfg
+				cfg.DinDPruneEnabled = tc.enabled
+				w := desiredDocker("abc")
+				w.Ephemeral = tc.ephemeral
+				pod := RenderDeployment(cfg, w, testSpec(t, "base", "m")).Spec.Template.Spec
+				got, ok := envOf(containerByName(t, pod.Containers, workerContainerName))
+				if !ok || got != tc.want {
+					t.Errorf("UZI_DIND_PRUNE_ENABLED = %q (present=%v), want %q", got, ok, tc.want)
+				}
+			})
+		}
+	}
+
+	t.Run("plain worker", func(t *testing.T) {
+		for _, enabled := range []bool{false, true} {
+			cfg := dockerTestConfig()
+			cfg.DinDPruneEnabled = enabled
+			pod := RenderDeployment(cfg, desired("abc"), testSpec(t, "base", "m")).Spec.Template.Spec
+			if v, ok := envOf(containerByName(t, pod.Containers, workerContainerName)); ok {
+				t.Errorf("a plain worker must carry no UZI_DIND_PRUNE_ENABLED, got %q", v)
+			}
+			if _, ok := findContainer(pod.InitContainers, dindMeterContainerName); ok {
+				t.Error("a plain worker must render no dind-meter container")
+			}
+			for _, v := range pod.Volumes {
+				if v.Name == dindMeterVolume {
+					t.Error("a plain worker must render no dind-meter volume")
+				}
+			}
+		}
+		off := testConfig()
+		on := testConfig()
+		on.DinDPruneEnabled = true
+		if SpecHashOf(off, desired("abc"), testSpec(t, "base", "m")) != SpecHashOf(on, desired("abc"), testSpec(t, "base", "m")) {
+			t.Error("the prune knob moved a plain worker's spec hash; it must be docker-only")
+		}
+	})
+}
+
 // --- Codex uid-split profile (PRD #1493 M1) --------------------------------
 
 // findContainer is the non-fatal sibling of containerByName: it reports presence rather
@@ -1654,7 +1895,7 @@ func TestUIDSplitLeavesDinDContainersUnchanged(t *testing.T) {
 			offPod := RenderDeployment(p.cfg, desiredDocker("abc"), testSpec(t, "base", "m")).Spec.Template.Spec
 			onPod := RenderDeployment(on, desiredDocker("abc"), testSpec(t, "base", "m")).Spec.Template.Spec
 
-			for _, name := range []string{dindContainerName, dindInitContainerName} {
+			for _, name := range []string{dindContainerName, dindInitContainerName, dindMeterContainerName} {
 				offC, offOK := findContainer(offPod.InitContainers, name)
 				onC, onOK := findContainer(onPod.InitContainers, name)
 				if offOK != onOK {

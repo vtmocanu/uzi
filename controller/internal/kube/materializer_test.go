@@ -1585,6 +1585,55 @@ func TestDiskPressureRecyclesBothVolumes(t *testing.T) {
 	assertNoSecretReads(t, client)
 }
 
+// Issue #1759: a DOCKER worker under disk pressure (recycle on, not ephemeral, not
+// custody-held, outside the cooldown) has its /nix and /data recycled exactly like a plain
+// one, and its dind-data claim is LEFT IN PLACE. The dind data root is reclaimed only by
+// the worker's gated prune; the pressure recycle never deletes it. This pins the existing
+// recycleVolumes{Nix, Data} behaviour, it does not change it.
+func TestDiskPressureRecycleOfADockerWorkerKeepsTheDinDDataPVC(t *testing.T) {
+	ctx := context.Background()
+	cfg := dockerTestConfig()
+	ns := cfg.DockerNamespace
+	w := protocol.DesiredWorker{ID: "d1", Template: "base", Size: "m", Generation: 0, Docker: true, DiskPressure: true}
+	spec, err := testResolver(t).Resolve(w.Template, w.Size)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	nix := pvcNix("d1", "20Gi")
+	nix.Namespace = ns
+	client := fake.NewSimpleClientset(
+		deployedWorkerNS("d1", ns, 0, SpecHashOf(cfg, w, spec)),
+		nix, pvcForNS("d1", "data", ns), pvcForNS("d1", "dind-data", ns),
+	)
+	m := New(client, cfg, testResolver(t), &fakeCordoner{}, DrainPolicy{Deadline: 24 * time.Hour},
+		RecyclePolicy{Enabled: true, Cooldown: time.Hour}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m.now = func() time.Time { return m5Now }
+
+	observed, err := m.Observe(ctx)
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if len(observed) != 1 || !observed[0].HasDinDDataPVC || !observed[0].DataPVCLive || observed[0].NixPVCSize == nil {
+		t.Fatalf("observed = %+v; want one docker worker with live nix/data and a dind-data claim", observed)
+	}
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	del := deletedSet(client)
+	for _, want := range []string{"deployments/uzi-hw-d1", "persistentvolumeclaims/uzi-hw-d1-nix", "persistentvolumeclaims/uzi-hw-d1-data"} {
+		if !del[want] {
+			t.Errorf("the disk-pressure recycle must delete %s; got %v", want, keysOf(del))
+		}
+	}
+	if del["persistentvolumeclaims/uzi-hw-d1-dind-data"] {
+		t.Errorf("the disk-pressure recycle deleted the dind-data PVC; it must recycle only nix + data. deletes: %v", keysOf(del))
+	}
+	if _, err := client.CoreV1().PersistentVolumeClaims(ns).Get(ctx, "uzi-hw-d1-dind-data", metav1.GetOptions{}); err != nil {
+		t.Errorf("the dind-data PVC must still exist after the recycle: %v", err)
+	}
+	assertNoSecretReads(t, client)
+}
+
 // M4-T2: a worker back at disk pressure whose volumes were minted WITHIN the cooldown was
 // just recycled — recycling again would thrash, so it is a CAPACITY signal instead:
 // nothing is deleted, and the fixed token `disk-recycle-skipped-cooldown worker=<id>` is

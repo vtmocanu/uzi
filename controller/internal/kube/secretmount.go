@@ -29,6 +29,8 @@ var knownWorkerMountPaths = []string{
 	dindSocketDir,
 	dindDataDir,
 	dindDataDirRoot,
+	dindMeterDir,
+	dindMeterDataDir,
 }
 
 // ValidateSecretMountPath refuses a SecretMountPath override that is malformed or
