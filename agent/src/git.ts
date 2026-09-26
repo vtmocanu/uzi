@@ -823,7 +823,9 @@ export class GitCache {
   async pushBranch(barePath: string, branch: string, pat: string, repoUrl: string, username?: string): Promise<void> {
     const scope = httpScopeForUrl(repoUrl);
     await this.withLock(barePath, async () => {
-      const candidate = await this.scratchPublicationPreflight(barePath, branch);
+      const tip = await this.revParse(barePath, `${runnerTrackingRef(branch)}^{commit}`);
+      if (!tip) throw new ScratchPublicationError("candidate commit is unavailable");
+      const candidate = await this.scratchPublicationPreflight(barePath, branch, tip);
       await this.refreshScratchPublicationFloor(barePath, branch, candidate, pat, scope, username);
       // A literal OID keeps the candidate fixed even if the tracking ref moves.
       await this.runGit(barePath, ["push", "origin", `${candidate}:refs/heads/${branch}`], pat, scope, username);
@@ -2118,12 +2120,12 @@ export class GitCache {
         throw new Error("checkpointPack: pinned range must be two 40-hex commit SHAs");
       }
       await this.scratchPublicationPreflight(barePath, branch, pinned.tipSha);
-      await this.validateCheckpointFloor(barePath, pinned.excludeSha, pinned.tipSha);
       let wanted = pinned.tipSha;
       if (overlay) {
         wanted = await this.buildWorkflowOverlay(barePath, branch, pinned.tipSha, overlay) ?? wanted;
         await this.scratchPublicationPreflight(barePath, branch, wanted);
       }
+      await this.validateCheckpointFloor(barePath, pinned.excludeSha, wanted);
       const { stdout } = await this.spawnGit(
         barePath,
         ["pack-objects", "--revs", "--stdout"],
@@ -2134,9 +2136,8 @@ export class GitCache {
     const realTip = await this.trackingTip(barePath, branch);
     if (!realTip) return null;
     await this.scratchPublicationPreflight(barePath, branch, realTip);
-    const excludeRef = await this.checkpointExcludeRef(barePath, branch);
+    const excludeRef = await this.checkpointExcludeRef(barePath, branch, realTip);
     const excludeSha = await this.revParse(barePath, `${excludeRef}^{commit}`);
-    await this.validateCheckpointFloor(barePath, excludeSha, realTip);
 
     // PRD #1062 M2 (#1036) — the `.github/workflows` overlay. When an overlay context is
     // supplied (GitHub, agent already reaped — see runner.ts), attempt to build a genuine
@@ -2156,8 +2157,10 @@ export class GitCache {
       }
     }
 
-    // Pack the same immutable candidate and floor that passed validation.
+    // Validate the actual commit to be packed; an earlier overlay floor can be
+    // reachable through the wrapper's first parent but not through realTip.
     const wanted = wantRev;
+    await this.validateCheckpointFloor(barePath, excludeSha, wanted);
     const { stdout } = await this.spawnGit(
       barePath,
       ["pack-objects", "--revs", "--stdout"],
@@ -2174,14 +2177,17 @@ export class GitCache {
     }
   }
 
-  /** issue #1597 M2 — the floor a checkpoint pack excludes: `refs/remotes/origin/<branch>` when
-   *  origin carries the branch, else the default branch (defaultBranchRef). The ONE choice shared by
-   *  {@link checkpointPack}'s unpinned path and {@link resolveCheckpointRange}. */
-  private async checkpointExcludeRef(barePath: string, branch: string): Promise<string> {
+  /** The pack floor is the origin branch when present; otherwise the common
+   *  ancestor of the pinned tip and default, so a default advance cannot exclude
+   *  an unreachable commit. Shared by checkpointPack and resolveCheckpointRange. */
+  private async checkpointExcludeRef(barePath: string, branch: string, tip: string): Promise<string> {
     const originRef = `refs/remotes/origin/${branch}`;
-    return (await this.refExists(barePath, originRef))
-      ? originRef
-      : await this.defaultBranchRef(barePath);
+    if (await this.refExists(barePath, originRef)) return originRef;
+    const defaultRef = await this.defaultBranchRef(barePath);
+    // A branch behind the default still needs an ancestor exclusion. The common
+    // base keeps the pack self-contained while the overlay aligns workflow trees.
+    const base = (await this.runGit(barePath, ["merge-base", defaultRef, tip])).trim();
+    return SHA40_RE.test(base) ? base : defaultRef;
   }
 
   /**
@@ -2200,7 +2206,7 @@ export class GitCache {
     try {
       const tipSha = await this.trackingTip(barePath, branch);
       if (!tipSha) return null;
-      const excludeRef = await this.checkpointExcludeRef(barePath, branch);
+      const excludeRef = await this.checkpointExcludeRef(barePath, branch, tipSha);
       const excludeSha = await this.revParse(barePath, `${excludeRef}^{commit}`);
       if (!excludeSha) return null;
       const scanFloorShas: string[] = [];
@@ -2591,7 +2597,6 @@ export class GitCache {
     realTip: string,
     overlay: CheckpointOverlayContext,
   ): Promise<string | null> {
-    const trackingRef = runnerTrackingRef(branch);
     // GATE 1 — the default tip must resolve (a fresh authenticated fetch). A failure ships
     // realTip: overlay durability is best-effort and never blocks the checkpoint.
     let defaultTip: string;
@@ -2612,12 +2617,12 @@ export class GitCache {
     }
     // GATE 2 — only a branch actually behind on `.github/workflows` needs an overlay (reuse
     // #627's exact trigger). Not behind ⇒ ship realTip (the broker accepts the raw tip).
-    if (!(await this.workflowTreeDiffers(barePath, trackingRef, defaultTip))) return null;
+    if (!(await this.workflowTreeDiffers(barePath, realTip, defaultTip))) return null;
     // GATE 3 — the branch must NOT itself have modified a workflow file. `changedFiles` returns
     // null when the diff can't be computed: FAIL-SAFE (cannot verify ⇒ ship realTip, never
     // synthesise a tree that might hide a branch's own workflow edit). A non-empty workflow hit
     // set means #377 owns this branch at finalize; ship realTip → the clean workflow-scope skip.
-    const changed = await this.changedFiles(barePath, trackingRef);
+    const changed = await this.changedFiles(barePath, realTip);
     if (changed === null) return null;
     if (changed.some((file) => file.startsWith(".github/workflows/"))) return null;
 
@@ -4470,7 +4475,9 @@ export class GitCache {
     }
     const cwd = options.cwd ?? (identity === "command" ? commandCwd(args) : "/");
     const executable = resolveBoundaryExecutable(command);
-    const process = await boundary.spawn({ argv: [executable, ...args], cwd, env: options.env, identity });
+    const process = await boundary.spawn({ argv: [executable, ...args], cwd, env: options.env, identity,
+      ...(options.timeout === undefined ? {} : { timeoutMs: options.timeout }),
+    });
     process.stdin?.on("error", () => undefined);
     process.stdin?.end(input);
     const cap = options.maxBuffer ?? GIT_MAX_BUFFER;

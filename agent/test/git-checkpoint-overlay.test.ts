@@ -261,6 +261,25 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     );
   });
 
+  it("pinned overlay gates inspect the pinned real tip after tracking advances", async () => {
+    const fx = mk();
+    const branch = "agent/issue-1036";
+    const gitA = worker(fx, "A");
+    const bare = await gitA.ensureClone(fx.originPath);
+    const seed = await gitA.createOrAttachRunnerClone(bare, 1036, "run-A");
+    const floor = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+    const pinnedTip = commit(seed.path, "M1.txt");
+    advanceOriginWorkflow(fx, "name: ci\non: push\njobs: {}\n# v2\n");
+    await gitA.fetchAgentBranch(bare, seed.path, branch, "run-A");
+    commit(seed.path, WF, "name: ci\non: push\njobs: {}\n# branch edit\n");
+    await gitA.fetchAgentBranch(bare, seed.path, branch, "run-A");
+
+    const packed = await gitA.checkpointPack(bare, branch, ctx(), { tipSha: pinnedTip, excludeSha: floor });
+    assert.ok(packed);
+    assert.ok(subjectOf(bare, packed.tipOid).startsWith(OVERLAY_COMMIT_PREFIX));
+    assert.equal(parentsOf(bare, packed.tipOid).at(-1), pinnedTip);
+  });
+
   it("second sequential overlay: parent[0]=prev, last parent=realTip2, and prev is its ancestor", async () => {
     const fx = mk();
     const branch = "agent/issue-1036";

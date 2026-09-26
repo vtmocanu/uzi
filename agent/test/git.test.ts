@@ -10,6 +10,7 @@ import { PassThrough, Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 import { GitCache, ScratchProvisionError, bareDirName, gitEnv } from "../src/git.js";
+import { TickSpawner } from "../src/tick-spawner.js";
 
 let fx: Fixture;
 let git: GitCache;
@@ -124,6 +125,24 @@ describe("permit-scoped git output collection", () => {
       /subprocess output exceeded 4 bytes/,
     );
     assert.equal(getEventListeners(abort.signal, "abort").length, 0);
+  });
+});
+
+describe("supervised execScoped timeout", () => {
+  it("terminates and reaps the owned child at its wall clock deadline", async () => {
+    const ac = new AbortController();
+    const spawner = new TickSpawner({ signal: ac.signal, killGraceMs: 100 });
+    const internals = git as unknown as { execScoped: (
+      command: string, args: string[], options: { env: NodeJS.ProcessEnv; timeout: number },
+    ) => Promise<unknown> };
+    const start = Date.now();
+    await assert.rejects(git.withBoundaryProcessSpawner(spawner.spawn, ac.signal, () =>
+      internals.execScoped(process.execPath, ["-e", "setInterval(() => {}, 1000)"],
+        { env: process.env, timeout: 150 })), /timed out/);
+    await spawner.settled();
+    assert.ok(Date.now() - start < 3000, "the supervised child finished within the deadline and reap grace");
+    assert.equal(spawner.pids().length, 1);
+    assert.throws(() => process.kill(spawner.pids()[0]!, 0), { code: "ESRCH" });
   });
 });
 

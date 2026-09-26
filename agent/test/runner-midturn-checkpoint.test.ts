@@ -1485,28 +1485,27 @@ describe("GitCache mid-turn primitives (issue #1597 M2)", () => {
 
   it("checkpointPack with `pinned` writes the SHAs (not ref names) to pack-objects stdin and declares the pinned tip", async () => {
     const { g, bare, branch, tip, base } = bareWithBranch();
-    const stdins: string[] = [];
-    const argvs: string[][] = [];
-    const ac = new AbortController();
-    const out = await g.withBoundaryProcessSpawner(
-      async (req) => {
-        argvs.push([...req.argv]);
-        const stdin = new PassThrough();
-        let buf = "";
-        stdin.on("data", (c: Buffer) => (buf += String(c)));
-        stdin.on("end", () => stdins.push(buf));
-        const stdout = new PassThrough();
-        stdout.end();
-        return { stdin, stdout, stderr: new PassThrough().end() as unknown as PassThrough, completed: Promise.resolve({ code: 0 }) };
-      },
-      ac.signal,
-      () => g.checkpointPack(bare, branch, undefined, { tipSha: tip, excludeSha: base }),
-    );
-    await new Promise((r) => setImmediate(r)); // let the stdin 'end' event land
+    const calls: Array<{ args: string[]; stdin?: string }> = [];
+    const seam = g as unknown as { spawnGit: (
+      cwd: string, args: string[], stdin?: string,
+    ) => Promise<{ stdout: Readable }> };
+    const original = seam.spawnGit.bind(g);
+    seam.spawnGit = async (cwd, args, stdin) => {
+      assert.equal(cwd, bare);
+      calls.push({ args, stdin });
+      const stdout = new PassThrough();
+      stdout.end();
+      return { stdout };
+    };
+    let out;
+    try {
+      out = await g.checkpointPack(bare, branch, undefined, { tipSha: tip, excludeSha: base });
+    } finally {
+      seam.spawnGit = original;
+    }
     assert.equal(out?.tipOid, tip);
-    assert.deepEqual(stdins, [`${tip}\n^${base}\n`], "exactly the pinned SHAs, no ref names");
-    assert.equal(argvs.length, 1, "no ref was re-resolved (a single pack-objects child)");
-    assert.ok(argvs[0]!.includes("pack-objects"));
+    assert.deepEqual(calls, [{ args: ["pack-objects", "--revs", "--stdout"], stdin: `${tip}\n^${base}\n` }],
+      "the real commit and floor passed validation before the pinned pack call");
     await assert.rejects(g.checkpointPack(bare, branch, undefined, { tipSha: "main", excludeSha: base }), /40-hex/);
   });
 

@@ -145,6 +145,39 @@ it("refuses a rewound remote floor before pushing", async () => {
   await assert.rejects(cache.pushBranch(bare, branch, "", fx.originPath), ScratchPublicationError);
 });
 
+it("cannot publish when the remote rewinds to scratch history after the floor refresh", async () => {
+  const { bare, clone } = await setup();
+  fs.writeFileSync(path.join(clone, "clean.txt"), "clean\n");
+  commit(clone, "clean");
+  await track(bare, clone);
+  await cache.pushBranch(bare, branch, "", fx.originPath);
+  fs.writeFileSync(path.join(clone, "next.txt"), "next\n");
+  const candidate = commit(clone, "next");
+  await track(bare, clone);
+
+  const scratch = path.join(fx.originPath, ".uzi", "scratch");
+  fs.mkdirSync(scratch, { recursive: true });
+  fs.writeFileSync(path.join(scratch, "private.txt"), "private\n");
+  git(fx.originPath, "add", "-f", ".uzi/scratch/private.txt");
+  const scratchTip = commit(fx.originPath, "remote scratch history");
+  const seam = cache as unknown as { runGit: (...args: unknown[]) => Promise<string> };
+  const original = seam.runGit.bind(cache);
+  seam.runGit = async (...args) => {
+    const argv = args[1];
+    if (Array.isArray(argv) && argv[0] === "push") {
+      git(fx.originPath, "update-ref", `refs/heads/${branch}`, scratchTip);
+    }
+    return original(...args);
+  };
+  try {
+    await assert.rejects(cache.pushBranch(bare, branch, "", fx.originPath));
+  } finally {
+    seam.runGit = original;
+  }
+  assert.equal(git(fx.originPath, "rev-parse", `refs/heads/${branch}`), scratchTip);
+  assert.notEqual(scratchTip, candidate);
+});
+
 it("refuses a candidate with a missing ancestor object", async () => {
   const { bare } = await setup();
   const tree = git(bare, "rev-parse", "refs/heads/main^{tree}");
