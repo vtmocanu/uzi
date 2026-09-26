@@ -466,6 +466,7 @@ describe("CodexExecutionSafety.spawnBoundaryProcess: permit-owned subprocesses",
       undefined,
       async (_request, deadlineMs) => {
         launchBudget = deadlineMs;
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
         return {
           root: new FakeRoot("boundary_action"),
           stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
@@ -480,7 +481,8 @@ describe("CodexExecutionSafety.spawnBoundaryProcess: permit-owned subprocesses",
       await child.completed;
     });
     assert.ok(launchBudget > 0 && launchBudget <= 250);
-    assert.ok(waitBudget > 0 && waitBudget <= 250);
+    assert.ok(waitBudget > 0 && waitBudget <= launchBudget - 30,
+      "launch time must consume the same child deadline used for waiting");
   });
 
   it("reserves before spawn, registers, and holds the permit until the whole root reaps", async () => {

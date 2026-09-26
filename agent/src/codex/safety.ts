@@ -359,12 +359,10 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       this.registry.poison(error);
       throw new Error(error.message);
     }
+    const childDeadlineAt = Date.now() + Math.min(request.timeoutMs ?? Infinity, remainingMs(this.currentDeadlineAt));
     let launched: SpawnedBoundaryProcess;
     try {
-      launched = await this.seams.spawnProcess(
-        request,
-        Math.min(request.timeoutMs ?? Infinity, remainingMs(this.currentDeadlineAt)),
-      );
+      launched = await this.seams.spawnProcess(request, Math.max(1, childDeadlineAt - Date.now()));
     } catch {
       this.registry.cancelReservation(reservation.reservation);
       const error: HarnessError = { category: "tool", message: "boundary process spawn failed" };
@@ -380,10 +378,11 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       let terminal: { readonly code: number } | undefined;
       let terminalError: unknown;
       try {
+        if (Date.now() >= childDeadlineAt) throw new Error("boundary process child deadline exceeded during launch");
         terminal = await this.waitChildOrAbort(
           launched,
           permit.signal,
-          Math.min(request.timeoutMs ?? Infinity, remainingMs(this.currentDeadlineAt)),
+          Math.max(1, childDeadlineAt - Date.now()),
         );
       } catch (error) {
         terminalError = error;
