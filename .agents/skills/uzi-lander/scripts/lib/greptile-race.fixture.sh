@@ -89,6 +89,7 @@ Last reviewed commit: [x](https://github.com/test/repo/commit/$RACE_HEAD)
         *) echo '{"check_runs":[]}' ;;
       esac ;;
     *'/pulls/42/files'*|*'/contents/'*) echo '[]' ;;
+    *'/rules/branches/'*) echo '[[]]' ;;
     *) echo "unexpected gh api in race fixture: $*" >&2; return 1 ;;
   esac
 }

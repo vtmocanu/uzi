@@ -28,8 +28,9 @@
 # Exit codes:
 #   0  merged — prints MERGE_SHA=<sha>; next: watch-run-ci.sh --sha <sha>
 #   1  a required check is failing on the head — not merged
-#   2  usage, or required checks still pending, unreadable, none reported, none passed,
-#      or gh failed without a failing/pending check explaining it — not merged
+#   2  usage, or required checks still pending, not yet all reported, unreadable, none
+#      reported, none passed, or gh failed without a failing/pending check explaining it —
+#      not merged
 #   3  gh error, or the merge command was refused (classifier block, ruleset, conflict):
 #      the exact command is printed for the user to run via a `!` line
 #   4  an mr_rework run is active on this MR — defer
@@ -42,6 +43,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/state.sh
 . "$HERE/lib/state.sh"
+# shellcheck source=lib/required-checks.sh
+. "$HERE/lib/required-checks.sh"
 
 REPO=""; PR=""; EXPECT=""; METHOD="squash"; ADMIN=1; DELETE=1; REWORK_CHECK=1; CONFIRM_ONLY=0
 while [ $# -gt 0 ]; do
@@ -60,9 +63,10 @@ done
 [ -n "$REPO" ] && [ -n "$PR" ] || { echo "usage: merge.sh OWNER/REPO PR [--expect-head SHA] [--method squash|merge] [--no-admin]" >&2; exit 2; }
 case "$METHOD" in squash|merge) ;; *) echo "bad --method" >&2; exit 2;; esac
 
-pj=$(gh pr view "$PR" --repo "$REPO" --json state,headRefOid,mergeStateStatus,mergeable,mergeCommit 2>/dev/null) || { echo "gh pr view failed" >&2; exit 3; }
+pj=$(gh pr view "$PR" --repo "$REPO" --json state,headRefOid,mergeStateStatus,mergeable,mergeCommit,baseRefName 2>/dev/null) || { echo "gh pr view failed" >&2; exit 3; }
 state=$(printf '%s' "$pj" | jq -r .state); head=$(printf '%s' "$pj" | jq -r .headRefOid)
 ms=$(printf '%s' "$pj" | jq -r .mergeStateStatus); mg=$(printf '%s' "$pj" | jq -r .mergeable)
+base=$(printf '%s' "$pj" | jq -r '.baseRefName // empty')
 
 # The terminal evidence contract, from the ONE place that knows the true merge SHA: print
 # MERGED + MERGE_SHA, append the trail's merge line (trail.sh dedupes an identical last line),
@@ -132,7 +136,7 @@ fi
 # is not green. gh exits non-zero while still printing the array when a check is failing or
 # pending, so its status only matters when no array came back.
 cj_rc=0
-cj=$(gh pr checks "$PR" --repo "$REPO" --required --json bucket 2>/dev/null) || cj_rc=$?
+cj=$(gh pr checks "$PR" --repo "$REPO" --required --json name,bucket 2>/dev/null) || cj_rc=$?
 if ! printf '%s' "$cj" | jq -e 'type=="array"' >/dev/null 2>&1; then
   echo "cannot read the required checks for #$PR (gh exit $cj_rc); not merging"; exit 2
 fi
@@ -144,6 +148,11 @@ p=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length')
 c=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length')
 [ "$f" -gt 0 ] && { echo "required check failing on ${head:0:8}; not merging"; exit 1; }
 [ "$p" -gt 0 ] && { echo "required checks still pending on ${head:0:8}; not merging"; exit 2; }
+# A required context that has not registered yet is pending too (lib/required-checks.sh).
+req=""; [ -n "$base" ] && req=$(required_contexts "$REPO" "$base")
+[ -n "$req" ] || { echo "cannot read the required checks of ${base:-the base branch}; not merging"; exit 2; }
+miss=$(missing_required "$req" "$cj") || { echo "cannot compare the required checks on ${head:0:8}; not merging"; exit 2; }
+[ "$miss" -gt 0 ] && { echo "$miss required check(s) not yet reported on ${head:0:8}; not merging"; exit 2; }
 [ "$c" -gt 0 ] && { echo "a required check on ${head:0:8} was cancelled (superseded?); not merging"; exit 2; }
 # A non-zero gh exit that no failing or pending check explains is a partial read (an API
 # failure mid-listing), not a verdict. And at least one required check must have PASSED:
