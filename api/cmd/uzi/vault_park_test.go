@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
+
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
@@ -268,5 +270,52 @@ func TestVaultParkBoardSecondLine(t *testing.T) {
 		if plain := m.boardCapacity(); held != plain-1 {
 			t.Errorf("width %d: boardCapacity(vault park selected) = %d, want %d (one fewer than %d)", width, held, plain-1, plain)
 		}
+	}
+}
+
+// TestVaultParkDetailFitsTerminal: the TUI run detail draws the vault park sentence below the
+// header, clamped to m.width, and the frame is exactly m.height rows at 60 and 80 columns.
+// Reddening mutations: drop the vaultParkLine branch in renderDetail (the line is missing), drop
+// its clampVisual (a row overflows m.width), or drop the vaultParkLine term in
+// transcriptViewport (the frame comes to m.height+1 rows).
+func TestVaultParkDetailFitsTerminal(t *testing.T) {
+	now := time.Now()
+	for _, width := range []int{60, 80} {
+		run := vaultParkRun("77777777-vault")
+		m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+		m = applyDetail(m, run, []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "one short line", now)})
+		m = step(m, tea.WindowSizeMsg{Width: width, Height: 30})
+		out := stripANSI(m.View().Content)
+		if !strings.Contains(out, "waiting for vault unlock") {
+			t.Fatalf("width %d: the vault park line is missing:\n%s", width, out)
+		}
+		rows := strings.Split(out, "\n")
+		for i, row := range rows {
+			if w := visualWidth(row); w > width {
+				t.Errorf("width %d: row %d is %d columns wide, overflowing the terminal: %q", width, i, w, row)
+			}
+		}
+		if len(rows) != m.height {
+			t.Errorf("width %d: detail frame is %d rows, want exactly m.height %d\n%s", width, len(rows), m.height, out)
+		}
+	}
+}
+
+// TestVaultParkDetailViewportReservesRow: transcriptViewport charges the vault park line one
+// row, so a parked run's viewport is exactly one row shorter than the same run unparked.
+// Reddening mutation: drop `vaultParkLine(m.detail.run) != ""` from transcriptViewport.
+func TestVaultParkDetailViewportReservesRow(t *testing.T) {
+	parked := vaultParkRun("77777777-vault")
+	plain := parked
+	plain.Status = "running"
+	plain.RecoveryWaitCause = nil
+	plain.RecoveryRetryNotBefore = nil
+	vp := func(r apitypes.RunDTO) int {
+		m := tuiTestModel(t, &uzicli.FakeClient{}, r.ID)
+		m.width, m.height = 100, 30
+		return applyDetail(m, r, nil).transcriptViewport()
+	}
+	if p, u := vp(parked), vp(plain); p != u-1 {
+		t.Errorf("transcriptViewport(vault park) = %d, want %d (one row fewer than the unparked run's %d for the vault line)", p, u-1, u)
 	}
 }
