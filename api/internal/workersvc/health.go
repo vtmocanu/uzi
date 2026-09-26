@@ -179,8 +179,9 @@ const (
 	// custody holds, so ClaimRun's owner-scoped custody-admission clause matches no row and
 	// the run stays queued until the owner resolves or discards some unpublished-work
 	// archives. Resolved against the SAME predicate the claim gates on
-	// (CountUnresolvedCustodyHoldsForOwner vs the same custodyHoldLimit constant), so the
-	// pill and the claim can never disagree. Maps to the SAME healthWaitingWorker enum (no
+	// (GetCustodyAdmissionForRun's owner open-hold count vs the same custodyHoldLimit
+	// constant, plus ClaimRun's continuation exemption, issue #1751), so the pill and the
+	// claim can never disagree. Maps to the SAME healthWaitingWorker enum (no
 	// migration — runs.health_reason is free text). A NEW const, never a reuse of the
 	// pool_wait/recovery_wait park reasons (D4): this is an owner-admission block, not a
 	// credential-pool or transient-recovery hold, and its fix is archive retry/discard.
@@ -719,18 +720,20 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// after the vault-lock (the only other owner-account-state block) and AHEAD of every
 	// worker-availability reason: bringing a worker online cannot clear it, and naming a
 	// worker reason would point at the wrong cause. Read against the SAME predicate the
-	// claim gates on (the same CountUnresolvedCustodyHoldsForOwner count and the same
-	// custodyHoldLimit constant), so the pill and the claim never disagree. A non-positive
-	// limit DISABLES the gate on the claim side too, so this rung stays silent then. The
-	// per-run Count sits behind the queued-threshold guard in healthTargetFor, so it runs
-	// for ~0 runs/tick; a read error falls through to the generic reasons below rather than
-	// inventing a reason on a failed lookup (the conservative degrade the sibling per-run
-	// lookups use).
+	// claim gates on (GetCustodyAdmissionForRun: the owner's open-hold count and the same
+	// custodyHoldLimit constant), so the pill and the claim never disagree. Issue #1751 /
+	// ADR-1751: a CONTINUATION-EXEMPT run (claim_generation >= 1 and its own open hold,
+	// the SAME expression ClaimRun's custody clause uses) is admitted at/over the cap, so it
+	// never gets the custody reason. A non-positive limit DISABLES the gate on the claim
+	// side too, so this rung stays silent then. The per-run read sits behind the
+	// queued-threshold guard in healthTargetFor, so it runs for ~0 runs/tick; a read error
+	// falls through to the generic reasons below rather than inventing a reason on a failed
+	// lookup (the conservative degrade the sibling per-run lookups use).
 	if custodyHoldLimit > 0 {
-		held, cerr := s.q.CountUnresolvedCustodyHoldsForOwner(ctx, r.UserID)
+		adm, cerr := s.q.GetCustodyAdmissionForRun(ctx, store.GetCustodyAdmissionForRunParams{UserID: r.UserID, RunID: r.ID})
 		if cerr != nil {
-			slog.Error("health: count unresolved custody holds", "run_id", r.ID, "error", cerr)
-		} else if held >= int64(custodyHoldLimit) {
+			slog.Error("health: read custody admission", "run_id", r.ID, "error", cerr)
+		} else if !adm.ContinuationExempt && adm.OpenHolds >= int64(custodyHoldLimit) {
 			return reasonCustodyLimit
 		}
 	}

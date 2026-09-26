@@ -812,6 +812,7 @@ Tracked as GitHub issue vtmocanu/uzi#1349; PRD at `prds/1349-recovery-custody-ha
 
 - An owner can see retained unpublished committed work, recover an available archive, and explicitly discard one exact held source only after a warning distinguishes recoverable work from a possible only copy. [AI-synced 2026-09-14, #1349]
 - An older generation's custody hold adopted by a same-worker resume is released automatically on server-proven ancestry of its candidate commits against the completed run's published branch head (or, as before, once its own capture is durably archived); otherwise it is retained. [AI-synced 2026-09-24, #1582]
+- At the per-owner unresolved-hold limit, new runs are not admitted, but a requeued run that still holds its own open custody is re-admitted to resume it, even past the limit. [AI-synced 2026-09-26, #1751]
 
 ## Feature #1390 — Api outage does not disturb a run on a still-live worker
 

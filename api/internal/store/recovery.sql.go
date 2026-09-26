@@ -367,7 +367,10 @@ SELECT
         THEN (SELECT count(*) FROM runs r
                 WHERE r.user_id = $1::uuid
                   AND r.status = 'queued'
-                  AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework'))
+                  AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+                  AND NOT (r.claim_generation >= 1
+                           AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
+                                         WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')))
         ELSE 0
      END)::bigint AS blocked_runs
 `
@@ -390,7 +393,11 @@ type GetCustodyAggregateForOwnerRow struct {
 // the owner is AT/OVER the limit — so it is 0 unless open_holds >= @custody_hold_limit (and a
 // non-positive @custody_hold_limit DISABLES the gate exactly like the claim path, yielding 0).
 // The code-publishing kinds match ClaimRun's custody-hold CTE (issue/ci_fix/self_improve/prompt/
-// task/mr_rework). Both columns are cast ::bigint so sqlc types them as int64, never interface{}.
+// task/mr_rework). Issue #1751 / ADR-1751: a CONTINUATION-EXEMPT queued run (claim_generation >= 1
+// AND its own open custody hold, owner-scoped) is NOT blocked — ClaimRun admits it at/over the
+// cap — so blocked_runs excludes it with the SAME expression ClaimRun and
+// GetCustodyAdmissionForRun use (parity: the aggregate, the pill and the claim agree).
+// Both columns are cast ::bigint so sqlc types them as int64, never interface{}.
 // Every column is table-qualified and @user_id carries an explicit ::uuid cast: this is a
 // top-level SELECT with no FROM, so sqlc's param-type inference cannot pick a single relation
 // for an untyped @user_id when both recovery_custody_holds and runs expose a user_id column

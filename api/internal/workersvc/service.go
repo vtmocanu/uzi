@@ -530,7 +530,9 @@ type Store interface {
 	// here so those parallel milestones never edit the interface. The custody hold itself
 	// is opened atomically inside ClaimRun's CTE (D2); everything below operates on the
 	// already-open hold and its immutable captures.
-	CountUnresolvedCustodyHoldsForOwner(ctx context.Context, userID uuid.UUID) (int64, error)
+	// GetCustodyAdmissionForRun (issue #1751) replaces the owner-only count for the health
+	// resolver: it also carries ClaimRun's continuation exemption for the run.
+	GetCustodyAdmissionForRun(ctx context.Context, arg store.GetCustodyAdmissionForRunParams) (store.GetCustodyAdmissionForRunRow, error)
 	BindCaptureManifest(ctx context.Context, arg store.BindCaptureManifestParams) (store.RecoveryCapture, error)
 	InsertCaptureChunk(ctx context.Context, arg store.InsertCaptureChunkParams) error
 	MarkCaptureReady(ctx context.Context, arg store.MarkCaptureReadyParams) (store.RecoveryCapture, error)
