@@ -202,7 +202,9 @@ var runDTOKeys = []string{
 	// until the patch edge is consumed.
 	"prd_done_path", "prd_patch_settled_at",
 	"claimed_at", "started_at",
-	"finished_at", "created_at", "updated_at", "repo_agents", "agent_source",
+	"finished_at", "created_at", "updated_at",
+	// issue #1727: when the run entered its current status; null only defensively.
+	"status_since", "repo_agents", "agent_source",
 	"agent_exclusions", "own_agents",
 	// PRD #111 M1: which Anthropic credential the claim spent. The label is a
 	// snapshot and outlives the id, so both keys are always on the wire.

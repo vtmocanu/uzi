@@ -496,6 +496,9 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	// owner-gated (just a timestamp). PauseRequested is computed by the ONE boundary rule
 	// (pauseRequestedRule), reusing the frozen/completed lists decoded above so the count
 	// comparison and the DTO cannot disagree.
+	// Issue #1727: when the run entered its current status (runs.status_since), so a client
+	// can age a park from the entry instant instead of updated_at, which drifts on any write.
+	dto.StatusSince = timePtr(r.StatusSince.Valid, r.StatusSince.Time)
 	dto.PauseRequestedAt = timePtr(r.PauseRequestedAt.Valid, r.PauseRequestedAt.Time)
 	dto.PauseMode = textPtrValue(r.PauseMode.Valid, r.PauseMode.String)
 	if r.PauseAfterCount.Valid {

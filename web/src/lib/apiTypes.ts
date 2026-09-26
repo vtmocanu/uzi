@@ -2463,6 +2463,11 @@ export interface Run {
   finished_at: string | null;
   created_at: string;
   updated_at: string;
+  /** Issue #1727: when the run entered its CURRENT status (runs.status_since). The column
+   *  is backfilled and NOT NULL, so a current server always sends it; null only
+   *  defensively, and an older server omits the key. Read it through a fallback to
+   *  `updated_at`, which moves on unrelated writes (an extend, for example). */
+  status_since?: string | null;
   /** PRD #111 M1: which Anthropic credential this run's claim actually spent —
    *  what run_usage alone could never say. Both null for a run claimed before the
    *  feature landed, and for a run not yet claimed.
