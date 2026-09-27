@@ -181,10 +181,12 @@ reaches `docker run` and `docker build` and exits 130 promptly.
 Recorded on the uzi worker host (kernel 6.12). Landlock is available there:
 the fixture's `uzi-codex-command-sandbox --probe` printed `LANDLOCK: probe=0`,
 and the sandbox returns 0 only for Landlock ABI >= 1 (10 means the kernel has
-no Landlock; 11 means ABI < 1 or another probe error). Every recorded run set
-`CODEX_GIT_TRUST_REQUIRE_LANDLOCK=1`, which turns any probe other than 0 into
-a FAIL rather than a skip, and used the run.sh default outer timeout (420s).
-Each run log at the final tree opens with its command line and the staged HEAD.
+no Landlock; 11 means ABI < 1 or another probe error). Each run at the final
+tree `0b8eef5f` set `CODEX_GIT_TRUST_REQUIRE_LANDLOCK=1`, which turns any
+probe other than 0 into a FAIL rather than a skip, used the run.sh default
+outer timeout (420s), and its log opens with its command line and the staged
+HEAD. The three earlier control runs at `f9e9c551` are described separately
+below.
 
 - **Tree and image.** Fixture tree `0b8eef5fb3fda459f99dcd658bbe8242bf1744a2`
   (the runs bind-mount its `e2e/codex-git-trust/`). Image
@@ -199,7 +201,8 @@ Each run log at the final tree opens with its command line and the staged HEAD.
   and entrypoint are the final tree's.
 - **How the gate ran.** `task test:codex-git-trust` is `build` then
   `fixture`. At the final tree the two ran as separate subtasks. A one-shot
-  run at `b6c2c548` timed out inside the build (a new `UZI_SRC_SHA` re-runs
+  run at `b6c2c548` timed out inside the build, as did a standalone rebuild
+  there, (a new `UZI_SRC_SHA` re-runs
   the image's `chmod -R a+rX /nix` layer, about 260s, then a 3–4 minute
   export), and a standalone rebuild at that commit then failed with `no
   space left on device` unpacking the image on the shared daemon's volume.
@@ -256,8 +259,10 @@ Each run log at the final tree opens with its command line and the staged HEAD.
     case (a) passes because `index-pack` stops at the pack trailer without
     needing EOF.
 - **Controls that did not discriminate at this layer** (fixture `f9e9c551`,
-  earlier than `0b8eef5f` by the case bounds, the post-`main()` exit and the
-  per-case attribution; 64 PASS, 0 FAIL each): reverting all of
+  which predates `0b8eef5f`'s finalize bounds, post-`main()` exit, per-case
+  attribution and timeout default; run with `CODEX_GIT_TRUST_REQUIRE_LANDLOCK=1`
+  and an explicit `CODEX_GIT_TRUST_TIMEOUT` of 500s or 260s, per the lead's
+  shell commands, which those logs do not echo; 64 PASS, 0 FAIL each): reverting all of
   `1c3be1a3`'s `agent/src/git.ts` change (tip validation before the probe,
   side attribution, teardown), removing the peer teardown alone, and
   reverting `callerOwnedStdout`. In these three real cases git ends on
