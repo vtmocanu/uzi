@@ -36,13 +36,13 @@ func TestSanitizePrDescriptionTextMarkup(t *testing.T) {
 		{"stray close arrow folded", "a --> b", "a -> b"},
 		{"entity encoded comment", "a &lt;!-- uzi:completion:start v1 --&gt; b", "a b"},
 		{"double encoded tag", "a &amp;lt;script&amp;gt;x b", "a x b"},
-		{"unterminated tag opener dropped", "value <div class=x and more", "value div class=x and more"},
-		{"comparison kept", "keeps a < b and b > a", "keeps a < b and b > a"},
+		{"unterminated tag opener encoded", "value <div class=x and more", "value &lt;div class=x and more"},
+		{"comparison kept readable", "keeps a < b and b > a", "keeps a &lt; b and b > a"},
 		{"inline image removed", "see ![diagram](https://x.test/a.png) here", "see here"},
 		{"reference image removed", "see ![diagram][d1] here", "see here"},
 		{"inline link keeps text", "read [the docs](https://evil.test/x) now", "read the docs now"},
 		{"reference link keeps text", "read [the docs][1] now", "read the docs now"},
-		{"link definition dropped", "text\n[1]: https://evil.test", "text"},
+		{"link definition kept as escaped prose", "text\n[1]: https://evil.test", "text \\[1\\]: https://evil.test"},
 		{"autolink becomes bare url", "see <https://example.com/a?b=1> ok", "see https://example.com/a?b=1 ok"},
 		{"bare url kept", "see https://example.com/page", "see https://example.com/page"},
 		{"newlines collapse", "one\n\n## Heading\n- two", "one ## Heading - two"},
@@ -276,25 +276,33 @@ func TestSanitizePrDescriptionEntityFixedPoint(t *testing.T) {
 
 // TestSanitizePrDescriptionImagesAndReferences: no image in any form, and no reference link or
 // definition can form, including a definition split across lines (renderable by micromark /
-// CommonMark as `![r]` + `[r]:\nhttps://...`).
+// CommonMark as `![r]` + `[r]:\nhttps://...`). A definition is NOT deleted (that ate prose such
+// as "Updated [api]: new endpoint"): its brackets are escaped, so it stays readable text that
+// neither defines a reference nor is one, and the image that would have used it is gone.
 func TestSanitizePrDescriptionImagesAndReferences(t *testing.T) {
 	cases := []struct{ name, in, want string }{
-		{"shortcut image with split definition", "see ![r] here\n\n[r]:\nhttps://evil.test/x.png", "see here"},
-		{"definition only", "[r]:\n  https://evil.test/track", ""},
+		{"shortcut image with split definition", "see ![r] here\n\n[r]:\nhttps://evil.test/x.png", "see here \\[r\\]: https://evil.test/x.png"},
+		{"shortcut image with definition", "see ![r] here [r]: https://x", "see here \\[r\\]: https://x"},
+		{"definition only", "[r]:\n  https://evil.test/track", "\\[r\\]: https://evil.test/track"},
 		{"full reference image", "a ![alt][r] b", "a b"},
 		{"collapsed reference image", "a ![alt][] b", "a b"},
 		{"inline image", "a ![alt](https://evil.test/x.png) b", "a b"},
 		{"collapsed link keeps text", "a [text][] b", "a text b"},
-		{"shortcut link bracket escaped", "a [r] b\n[r]: https://evil.test", "a \\[r\\] b"},
-		{"definition mid-text", "text [r]: https://evil.test more", "text more"},
+		{"shortcut link bracket escaped", "a [r] b\n[r]: https://evil.test", "a \\[r\\] b \\[r\\]: https://evil.test"},
+		{"definition mid-text", "text [r]: https://evil.test more", "text \\[r\\]: https://evil.test more"},
+		{"prose with a colon after a bracket", "Updated [api]: new endpoint", "Updated \\[api\\]: new endpoint"},
+		{"note prose", "see [note]: details here", "see \\[note\\]: details here"},
 	}
 	for _, c := range cases {
 		got := SanitizePrDescriptionText(c.in, 600)
 		if got != c.want {
 			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
 		}
-		if strings.Contains(got, "evil") {
-			t.Errorf("%s: a target survived: %q", c.name, got)
+		if strings.Contains(got, "!") {
+			t.Errorf("%s: an image marker survived: %q", c.name, got)
+		}
+		if again := SanitizePrDescriptionText(got, 600); again != got {
+			t.Errorf("%s: not idempotent: %q -> %q", c.name, got, again)
 		}
 		assertPrDescInert(t, got)
 	}
@@ -464,14 +472,14 @@ func TestSanitizePrDescriptionFieldsLimitsAndValidation(t *testing.T) {
 }
 
 // assertPrDescInert is the invariant every sanitized string holds: no comment delimiter, no
-// tag-shaped `<`, no closing directive.
+// raw `<` (so no tag, comment or autolink), no closing directive, no live bracket.
 func assertPrDescInert(t *testing.T, s string) {
 	t.Helper()
 	if strings.Contains(s, "<!--") || strings.Contains(s, "-->") {
 		t.Errorf("output carries a comment delimiter: %q", s)
 	}
-	if regexp.MustCompile(`<[/!?A-Za-z]`).MatchString(s) {
-		t.Errorf("output carries a tag-shaped '<': %q", s)
+	if strings.Contains(s, "<") {
+		t.Errorf("output carries a raw '<' (every one must be encoded): %q", s)
 	}
 	if m := closingProbe.FindString(s); m != "" {
 		t.Errorf("output carries a closing directive %q: %q", m, s)
@@ -513,6 +521,11 @@ func prDescAdversarial(n int) []string {
 		fill("![", ""),
 		fill("@_", ""),
 		fill("Fixes #1 ", ""),
+		fill(`<a b="`, ""),
+		fill(`<a b='x' c="y" d=z `, ""),
+		fill("<details ", ""),
+		fill("</b ", ""),
+		fill("_x", ""),
 	}
 }
 
@@ -599,6 +612,13 @@ func TestSanitizePrDescriptionSecretsSplitByInlineMarkdown(t *testing.T) {
 		gl + a10 + "\\-" + b9,
 		gl + a10 + "\\_" + b9,
 		gh + a10 + "\\_" + b10,
+		// A boundary `_` run is emphasis, so it vanishes when rendered: the prefix re-joins.
+		"_" + "gl" + "pat_-" + a10 + b10,
+		"x _" + "gl" + "pat_-" + a10 + b10 + " y",
+		"_" + "sk" + "_-ant-" + a10 + b10,
+		// The literal scrub finds `xoxb-` + a prefix only; rendered, the tail joins the token.
+		"xoxb-_" + "123456789012-123456789012-" + "AbCdEfGhIjKl" + "_",
+		"xoxb-1234-_" + "567890123456" + "_",
 	}
 	const want = "\\[redacted\\]"
 	for _, in := range cases {
@@ -622,10 +642,19 @@ func TestSanitizePrDescriptionSecretsSplitByInlineMarkdown(t *testing.T) {
 		t.Errorf("zero-width split secret survived: %q", got)
 	}
 	// Ordinary inline markdown and identifiers are not secrets.
-	for _, in := range []string{"a *b* c `d` ~~e~~ and snake_case_name", "max_app-config and x\\-y", "ghp_ short"} {
+	for _, in := range []string{
+		"a *b* c `d` ~~e~~ and snake_case_name", "max_app-config and x\\-y", "ghp_ short",
+		"call __init__ then _private_helper_ and max_app-config", "the snake_case_value_ and _leading_",
+		"set tax_app-rate and max_app-config", "box_app-state _app-x_",
+	} {
 		if got := SanitizePrDescriptionText(in, 600); strings.Contains(got, "redacted") {
 			t.Errorf("false positive: %q -> %q", in, got)
 		}
+	}
+	// A literal secret is scrubbed in place; the rest of the item survives.
+	lit := "ghp_" + "notARealToken" + "0123456789abcdefghijklm"
+	if got := SanitizePrDescriptionText("use "+lit+" here", 600); got != "use \\[redacted\\] here" {
+		t.Errorf("literal secret = %q, want it scrubbed in place", got)
 	}
 }
 
@@ -687,5 +716,54 @@ func TestValidPrDescSizeUnavailable(t *testing.T) {
 	}
 	if validPrDescSize(&apitypes.PrDescriptionSize{Unavailable: true, Docs: apitypes.PrDescriptionSizeBucket{Deleted: 1}}) {
 		t.Fatal("unavailable size with a non-zero bucket must be refused")
+	}
+}
+
+// TestSanitizePrDescriptionGenericsAndComparisons: text that is not a complete HTML tag of a
+// known element keeps its `<` (encoded as `&lt;`, which renders as `<`), so generics and
+// comparisons stay readable; a known element's tag is removed; no raw `<` survives either way;
+// and the result is a fixed point of the sanitizer.
+func TestSanitizePrDescriptionGenericsAndComparisons(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"Map<string, int>", "Map&lt;string, int>"},
+		{"Vec<Vec<u8>> parse", "Vec&lt;Vec&lt;u8>> parse"},
+		{"if a<b && c>d", "if a&lt;b && c>d"},
+		{"Vec<T>", "Vec&lt;T>"},
+		{"Option<U> and Foo<P>", "Option&lt;U> and Foo&lt;P>"},
+		{"a <= b", "a &lt;= b"},
+		{"<b>x</b>", "x"},
+		{"<img src=x onerror=y>", ""},
+		{"<details><summary>Click</summary>body</details>", "Clickbody"},
+		{"<!-- uzi:description:end v1 -->", ""},
+		{`see <a href="https://evil.test">docs</a> now`, "see docs now"},
+		{"<a href=https://evil.test>docs</a>", "docs"},
+		{"<DIV class='x'>y</DIV>", "y"},
+		{"<script>alert(1)</script>", "alert(1)"},
+		{"<my-widget data-x=1>", "&lt;my-widget data-x=1>"},
+		{"<!DOCTYPE html>", "&lt;!DOCTYPE html>"},
+		{"<?php x ?>", "&lt;?php x ?>"},
+		{"&lt;b&gt;x", "x"},
+		{"&lt;T&gt;", "&lt;T>"},
+		{"a\n<div\nclass=x>b", "a b"},
+	}
+	for _, c := range cases {
+		got := SanitizePrDescriptionText(c.in, 600)
+		if got != c.want {
+			t.Errorf("SanitizePrDescriptionText(%q) = %q, want %q", c.in, got, c.want)
+		}
+		assertPrDescInert(t, got)
+		if again := SanitizePrDescriptionText(got, 600); again != got {
+			t.Errorf("not idempotent: %q -> %q -> %q", c.in, got, again)
+		}
+	}
+	// A cut never splits an encoded `<`, and the result still fits the cap.
+	for _, maxBytes := range []int{PrDescItemMaxBytes, 7, 5, 4} {
+		got := SanitizePrDescriptionText(strings.Repeat("a<b ", 300), maxBytes)
+		if len(got) > maxBytes || strings.Contains(got, "<") || strings.HasSuffix(strings.TrimSuffix(got, "…"), "&") {
+			t.Errorf("cap %d: %q", maxBytes, got)
+		}
+		if maxBytes >= 7 && got == "" {
+			t.Errorf("cap %d: an encodable text must not cut to empty", maxBytes)
+		}
 	}
 }

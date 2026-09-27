@@ -6,10 +6,12 @@ import (
 	"html"
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/secretscrub"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
 
 // PR-description field limits (PRD #1798 D7 / target layout). Two kinds of bound:
@@ -69,22 +71,20 @@ var (
 	prDescImage = regexp.MustCompile(`!\[[^\]]*\](?:\([^)]*\)|\[[^\]]*\])?`)
 	// Markdown links keep their text and lose their target (inline, full and collapsed).
 	// A label holding a backslash is left for the bracket escape (it neutralises it either way),
-	// so an already-escaped `\[x\](y)` is not re-read as a link on a second pass.
+	// so an already-escaped `\[x\](y)` is not re-read as a link on a second pass. A reference
+	// DEFINITION (`[label]: target`) is left as prose: every remaining `[` / `]` is escaped in
+	// step 3, so neither a definition nor a reference to one can form in the output.
 	prDescLinkInline = regexp.MustCompile(`\[([^\]\\]*)\]\([^)]*\)`)
 	prDescLinkRef    = regexp.MustCompile(`\[([^\]\\]*)\]\[[^\]]*\]`)
-	// A reference definition `[label]: target`, ANYWHERE and with any whitespace (newlines
-	// included) between the colon and the target, so a definition split across lines goes too.
-	// Remaining brackets are escaped later, so no definition or shortcut reference can form in
-	// the output either way.
-	prDescLinkDef = regexp.MustCompile(`\[[^\]\\]+\]:[\s\p{Z}]*\S*`)
 	// Angle-bracket autolinks become the bare URL text.
 	prDescAutolink = regexp.MustCompile(`<((?i:https?|ftp)://[^\s<>]+)>`)
-	// Anything tag-shaped: an element, a closing tag, a declaration or a processing instruction.
-	prDescTag = regexp.MustCompile(`<[/!?]?[A-Za-z][^<>]*>`)
-	// A `<` that could still open markup once a later `>` arrives (the renderer's own markers
-	// follow the region), so it is dropped: a whole run of `<` in one match, so `<<<<a` costs
-	// one pass, not one per `<`. A `<` before a space, digit or `=` is not tag-like and stays.
-	prDescOpenAngle = regexp.MustCompile(`<+([/!?A-Za-z])`)
+	// A complete, well-formed HTML open or closing tag whose name is a known HTML element, in
+	// CommonMark's raw-HTML attribute grammar. Removing it is only for readability (`<b>x</b>`
+	// reads `x`): every `<` left after this is encoded as `&lt;` in step 3, so no tag, comment,
+	// declaration or processing instruction of any name can survive. Text that is not such a tag
+	// (`Map<string, int>`, `Vec<T>`, `a<b && c>d`) keeps its `<` and so stays readable.
+	prDescHTMLTag = regexp.MustCompile(`<(?:` + prDescHTMLNames + `)(?:` + prDescHTMLAttr + `)*[\s\p{Z}]*/?>` +
+		`|</(?:` + prDescHTMLNames + `)[\s\p{Z}]*>`)
 	// Comment delimiters that survived everything above (`a ----> b`, `--!>`) fold to `->`.
 	prDescCommentClose = regexp.MustCompile(`-{2,}!?>`)
 	prDescCommentOpen  = regexp.MustCompile(`<!-{2,}`)
@@ -108,6 +108,23 @@ var (
 		`(?:#\d+|gh-\d+|[\w.-]+(?:/[\w.-]+)*#\d+|[A-Za-z][A-Za-z0-9_]+-\d+|https?://[^\s<>()]*?/(?:issues|work_items)/\d+)`)
 )
 
+// prDescHTMLNames are the HTML element names prDescHTMLTag removes: multi-letter names in any
+// case, single-letter ones (`b`, `i`, `a`, ...) lowercase only, so a generic type parameter
+// (`Vec<U>`, `Foo<P>`) is not read as an element. A name outside the list is not removed, only
+// encoded, which is equally inert.
+const prDescHTMLNames = `(?i:abbr|address|area|article|aside|audio|base|bdi|bdo|big|blockquote|body|br|button|` +
+	`canvas|caption|center|cite|code|col|colgroup|data|datalist|dd|del|details|dfn|dialog|dir|div|dl|dt|em|` +
+	`embed|fieldset|figcaption|figure|font|footer|form|frame|frameset|h[1-6]|head|header|hgroup|hr|html|` +
+	`iframe|img|input|ins|kbd|label|legend|li|link|main|map|mark|marquee|math|menu|meta|meter|nav|noscript|` +
+	`object|ol|optgroup|option|output|param|picture|pre|progress|rp|rt|ruby|samp|script|section|select|` +
+	`slot|small|source|span|strike|strong|style|sub|summary|sup|svg|table|tbody|td|template|textarea|` +
+	`tfoot|th|thead|time|title|tr|track|tt|ul|var|video|wbr)|[abipqsu]`
+
+// prDescHTMLAttr is one CommonMark raw-HTML attribute: whitespace, a name, and an optional
+// unquoted, single-quoted or double-quoted value.
+const prDescHTMLAttr = `[\s\p{Z}]+[A-Za-z_:][A-Za-z0-9_.:-]*` +
+	"(?:[\\s\\p{Z}]*=[\\s\\p{Z}]*(?:[^\\s\\p{Z}\"'=<>`]+|'[^']*'|\"[^\"]*\"))?"
+
 // prDescClosingMarkers are the characters a closing-directive VIEW removes or blanks: markdown
 // emphasis/strikethrough/code markers, brackets, and the backslash escapes this sanitizer adds.
 const prDescClosingMarkers = "*_~`[]\\"
@@ -117,24 +134,26 @@ const prDescClosingMarkers = "*_~`[]\\"
 // bytes. The api's result is the ONLY text the renderer may publish. Steps, in order:
 //
 //  1. To a fixed point (loop until nothing changes, at most prDescMaxPasses passes, each linear;
-//     if that bound is hit the result is "", fail closed): HTML entities are decoded
-//     to their own fixed point, control / bidi / format runes are stripped and secret shapes
-//     scrubbed (ScrubUntrustedText), markup is removed (stripPrDescMarkup), and whitespace
-//     (newlines included) collapses to single spaces. Running the scrub on every pass means a
-//     token split by markup (`glpat-AAAA<b></b>BBBB`) is scrubbed once the markup is gone, and
-//     running the decode on every pass means an entity re-formed by a removal
-//     (`&<b></b>#64;`) is decoded and then handled like the character it renders as. The loop
-//     only ends on a pass that changed nothing, so its result has no entity left that
-//     html.UnescapeString would decode. Then the RENDERED view is checked for secrets
+//     if that bound is hit the result is "", fail closed): HTML entities are decoded to their
+//     own fixed point, control / bidi / format runes are stripped, markup is removed
+//     (stripPrDescMarkup), and whitespace (newlines included) collapses to single spaces.
+//     Running the decode on every pass means an entity re-formed by a removal (`&<b></b>#64;`)
+//     is decoded and then handled like the character it renders as. The loop only ends on a
+//     pass that changed nothing, so its result has no entity left that html.UnescapeString
+//     would decode. Then, on that converged text, the RENDERED views are checked for secrets
 //     (prDescRenderedSecret): a token split by inline markdown (`*`, `~`, a code span, a
-//     backslash escape) re-joins when rendered, so if that view carries a secret the whole
-//     field becomes "[redacted]".
-//  2. The text is cut to fit maxBytes (rune-safe, "…" marks a cut), with headroom re-measured
-//     after step 3 until the final text fits.
+//     boundary `_`, a backslash escape) re-joins when rendered, so if a view shows a secret the
+//     literal scrub would not fully hide, the whole field becomes "[redacted]". Otherwise the
+//     literal secret shapes are scrubbed (secretscrub.Scrub). The scrub runs after the markup
+//     is gone, so a token split by markup (`glpat-AAAA<b></b>BBBB`) is scrubbed whole.
+//  2. The text is cut to fit maxBytes (rune-safe, "…" marks a cut): the largest cut whose
+//     step-3 result fits maxBytes is kept (a binary search, since step 3 grows the text).
 //  3. Markdown block syntax is neutralised with backslash escapes: a leading `#`, `>`, `|`,
 //     `=`, fence, list or ordered-list marker, every code-fence run of three or more backticks
 //     or tildes, every `[` / `]` (no link, image, reference or definition can form), and a
-//     trailing odd backslash, and a leading `/` (a GitLab quick action). Closing directives are
+//     trailing odd backslash, and a leading `/` (a GitLab quick action). Every `<` is encoded
+//     as `&lt;`, so no HTML tag, comment, declaration or autolink can form (the renderer
+//     publishes the text as markdown, which shows `&lt;` as `<`). Closing directives are
 //     neutralised by a zero-width space after the keyword's first letter, and mentions by one
 //     after the `@` (breakMentions). These run on the CUT text, so a breaker is never cut off a
 //     keyword that still has its reference.
@@ -142,8 +161,8 @@ const prDescClosingMarkers = "*_~`[]\\"
 // Each field is meant to be one paragraph or one list item, so model text is kept from adding
 // headings, quotes, lists, code blocks or sections of its own. The tests
 // (pr_description_sanitize_test.go, assertPrDescInert) check every output for `<!--`, `-->`, a
-// tag-shaped `<`, a live bracket and a closing directive, and check that output which was not
-// cut is returned unchanged by a second pass.
+// raw `<`, a live bracket and a closing directive, and check that output which was not cut is
+// returned unchanged by a second pass.
 func SanitizePrDescriptionText(s string, maxBytes int) string {
 	s, ok := prDescNormalize(s)
 	if !ok || maxBytes <= 0 {
@@ -151,25 +170,33 @@ func SanitizePrDescriptionText(s string, maxBytes int) string {
 	}
 	if prDescRenderedSecret(s) {
 		s = prDescRedacted
+	} else {
+		s = secretscrub.Scrub(s)
 	}
-	budget := maxBytes
-	for budget > 0 {
-		out := finalizePrDescText(cutPrDescBytes(s, budget))
-		if len(out) <= maxBytes {
-			return out
+	if out := finalizePrDescText(cutPrDescBytes(s, maxBytes)); len(out) <= maxBytes {
+		return out
+	}
+	// Step 3 grows the text (escapes, breakers, `&lt;`), so find the largest cut that still fits.
+	// A zero budget cuts to "", which always fits.
+	best := ""
+	for lo, hi := 1, maxBytes-1; lo <= hi; {
+		mid := lo + (hi-lo)/2
+		if out := finalizePrDescText(cutPrDescBytes(s, mid)); len(out) <= maxBytes {
+			best, lo = out, mid+1
+		} else {
+			hi = mid - 1
 		}
-		budget -= len(out) - maxBytes
 	}
-	return ""
+	return best
 }
 
-// prDescNormalize runs step 1 of SanitizePrDescriptionText to its fixed point. It reports false
-// when prDescMaxPasses passes did not converge.
+// prDescNormalize runs the fixed-point loop of step 1 of SanitizePrDescriptionText (everything
+// but the secret checks). It reports false when prDescMaxPasses passes did not converge.
 func prDescNormalize(s string) (string, bool) {
 	for i := 0; i < prDescMaxPasses; i++ {
 		prev := s
 		s = decodePrDescEntities(s)
-		s = ScrubUntrustedText(s)
+		s = termsafe.SanitizeBounded(s, 3*len(s)+1)
 		s = stripPrDescMarkup(s)
 		s = strings.TrimSpace(prDescSpaces.ReplaceAllString(s, " "))
 		if s == prev {
@@ -217,12 +244,10 @@ func stripPrDescMarkup(s string) string {
 		s = prDescImage.ReplaceAllString(s, "")
 		s = prDescLinkInline.ReplaceAllString(s, "$1")
 		s = prDescLinkRef.ReplaceAllString(s, "$1")
-		s = prDescLinkDef.ReplaceAllString(s, "")
 	}
 	if strings.Contains(s, "<") {
 		s = prDescAutolink.ReplaceAllString(s, "$1")
-		s = prDescTag.ReplaceAllString(s, "")
-		s = prDescOpenAngle.ReplaceAllString(s, "$1")
+		s = prDescHTMLTag.ReplaceAllString(s, "")
 		s = prDescCommentOpen.ReplaceAllString(s, "")
 	}
 	if strings.Contains(s, "--") {
@@ -231,34 +256,86 @@ func stripPrDescMarkup(s string) string {
 	return s
 }
 
-// prDescRenderedSecret reports whether a secret appears in the text as a markdown renderer shows
-// it, where the literal scrub (already applied) did not see one. s has no format rune left (the
-// scrub's termsafe pass strips Cf, U+200B included). Two views: backslash escapes resolved
-// (`\_` renders `_`, `\-` renders `-`), and additionally the inline emphasis, strikethrough and
-// code-span markers `*`, `~` and a backtick removed (`A*B*C` renders the letters ABC side by
-// side). `_` is kept in the second view: CommonMark never reads an intraword `_` as emphasis, and removing it would join
-// unrelated identifiers into false secret shapes.
+// prDescRenderedSecret reports whether a markdown renderer would show secret material the
+// literal scrub does not hide. s is the converged step-1 text, NOT yet scrubbed, with no format
+// rune left (U+200B included). Three rendered views:
+//
+//   - backslash escapes resolved (`\_` renders `_`, `\-` renders `-`);
+//   - additionally the emphasis, strikethrough and code-span markers `*`, `~` and a backtick
+//     removed (`A*B*C` renders the letters ABC side by side);
+//   - additionally every run of `_` that is NOT intraword removed (`_glpat_-x` renders
+//     `glpat-x` with an emphasised `glpat`). An intraword run (a letter or digit on both sides)
+//     is kept: CommonMark never reads it as emphasis, and removing it would join ordinary
+//     identifiers (`max_app-config`) into false secret shapes. The second view keeps every `_`,
+//     so the families whose prefix holds one (`ghp_`, `github_pat_`) are matched there.
+//
+// A view reveals a secret when scrubbing the view differs from the view of the scrubbed text:
+// either the view forms a secret s does not hold literally (`_glpat_-…`), or the literal scrub
+// hides only part of one the view shows whole (`xoxb-1234-_5678_` scrubs to `[redacted]_5678_`,
+// which renders the token's tail). The check can also fire on an item that already holds a
+// literal secret next to a marker; the whole item is then redacted, which only hides more.
 func prDescRenderedSecret(s string) bool {
-	view := func(drop string) string {
-		return strings.Map(func(r rune) rune {
-			if strings.ContainsRune(drop, r) {
-				return -1
-			}
-			return r
-		}, s)
-	}
-	for _, v := range []string{view("\\"), view("\\*~`")} {
-		if secretscrub.Scrub(v) != v {
+	scrubbed := secretscrub.Scrub(s)
+	for _, view := range []func(string) string{
+		func(t string) string { return prDescDropRunes(t, "\\") },
+		func(t string) string { return prDescDropRunes(t, "\\*~`") },
+		func(t string) string { return prDescDropBoundaryUnderscores(prDescDropRunes(t, "\\*~`")) },
+	} {
+		vs := view(scrubbed)
+		if secretscrub.Scrub(vs) != vs || secretscrub.Scrub(view(s)) != vs {
 			return true
 		}
 	}
 	return false
 }
 
-// finalizePrDescText applies step 3: block-syntax escapes, then closing-directive and mention
-// breakers.
+// prDescDropRunes returns s without any rune in drop.
+func prDescDropRunes(s, drop string) string {
+	return strings.Map(func(r rune) rune {
+		if strings.ContainsRune(drop, r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// prDescDropBoundaryUnderscores removes every run of `_` that does not have a letter or digit
+// on both sides (the runs CommonMark may read as emphasis).
+func prDescDropBoundaryUnderscores(s string) string {
+	if !strings.Contains(s, "_") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] != '_' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		j := i
+		for j < len(s) && s[j] == '_' {
+			j++
+		}
+		before, _ := utf8.DecodeLastRuneInString(s[:i])
+		after, _ := utf8.DecodeRuneInString(s[j:])
+		if i > 0 && j < len(s) && prDescWordRune(before) && prDescWordRune(after) {
+			b.WriteString(s[i:j])
+		}
+		i = j
+	}
+	return b.String()
+}
+
+func prDescWordRune(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
+
+// finalizePrDescText applies step 3: block-syntax escapes, `<` encoded as `&lt;`, then
+// closing-directive and mention breakers. The encoding is idempotent under re-sanitization:
+// step 1 decodes `&lt;` back to the same `<`, which is removed or kept exactly as it was the
+// first time and then encoded again.
 func finalizePrDescText(s string) string {
-	return breakMentions(neutralizeClosingDirectives(escapePrDescMarkdown(s)))
+	s = strings.ReplaceAll(escapePrDescMarkdown(s), "<", "&lt;")
+	return breakMentions(neutralizeClosingDirectives(s))
 }
 
 // cutPrDescBytes bounds s to maxBytes bytes at a rune boundary, ending a cut with "…" inside

@@ -28,7 +28,11 @@ import (
 // workersvc.MaxPrDescPendingVersionsPerRun pending versions in the live claim generation, or
 // workersvc.MaxPrDescVersionsPerRun versions in all), run_terminal, repo_required. The service
 // checks the claim fence and the caps before it sanitizes, so a stale or capped stage is 409
-// even when its body would be 400.
+// even when its fields would be rejected by the sanitizer (an unknown scope kind, a bad
+// verification result or sha). The request-shape checks run first and stay 400 whatever the
+// fence would say: a missing claim_generation, an over-cap raw field (prDescRawCapOK), an
+// unknown source, a bad size, sha or target branch. A deterministic_only stage ignores its raw
+// fields entirely (they are discarded, not validated), so they never make it a 400.
 // Stage also rides the per-worker proposal limiter (429 when exhausted).
 
 // prDescWorker resolves the authenticated worker and the {id} run param, answering the
@@ -88,7 +92,7 @@ func (h *Handler) WorkerStagePrDescription(w http.ResponseWriter, r *http.Reques
 		httpx.Error(w, http.StatusBadRequest, "claim_generation is required")
 		return
 	}
-	if !prDescRawCapOK(req.Fields) {
+	if req.Source != workersvc.PrDescSourceDeterministic && !prDescRawCapOK(req.Fields) {
 		httpx.Error(w, http.StatusBadRequest, "pr description fields must be bounded")
 		return
 	}

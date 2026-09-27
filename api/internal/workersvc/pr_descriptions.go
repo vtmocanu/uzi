@@ -38,7 +38,9 @@ const (
 	prDescMatchPending   = "pending"
 	prDescMatchNone      = "none"
 
-	prDescSourceDeterministic = "deterministic_only"
+	// PrDescSourceDeterministic is the D8 rung-3 source: the version carries no model or lead
+	// text, so its raw fields are ignored (never validated, never a 400) and stored empty.
+	PrDescSourceDeterministic = "deterministic_only"
 
 	maxPrDescTargetBranchBytes = 255
 	maxPrDescSizeLines         = int64(1) << 40
@@ -54,7 +56,7 @@ const (
 	MaxPrDescVersionsPerRun = 200
 )
 
-var validPrDescSources = map[string]bool{"generated": true, "lead_only": true, prDescSourceDeterministic: true}
+var validPrDescSources = map[string]bool{"generated": true, "lead_only": true, PrDescSourceDeterministic: true}
 
 var validPrDescOutcomes = map[string]bool{
 	PrDescOutcomePublished: true, "skipped_human_edit": true, "skipped_no_region": true,
@@ -308,8 +310,9 @@ func (s *Service) StagePrDescription(ctx context.Context, wkr store.Worker, runI
 	}
 
 	raw := req.Fields
-	if req.Source == prDescSourceDeterministic {
-		// D8 rung 3: no model or lead text at all, whatever the worker sent.
+	if req.Source == PrDescSourceDeterministic {
+		// D8 rung 3: no model or lead text at all, whatever the worker sent. The raw fields are
+		// not validated either (an over-cap or malformed one is not a 400): they are discarded.
 		raw = apitypes.PrDescriptionFields{}
 	}
 	fields, err := SanitizePrDescriptionFields(ctx, raw)

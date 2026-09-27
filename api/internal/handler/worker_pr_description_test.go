@@ -33,6 +33,10 @@ type prDescFakeStore struct {
 	versions map[uuid.UUID]store.PrDescriptionVersion
 	prs      map[prDescFakeKey]store.PrDescription
 	seq      int
+	// begins counts BeginPrDescTx calls; onBegin, when set, runs at each one with that count, so
+	// a test can change the tables between the stage's pre-sanitize fence and its write tx.
+	begins  int
+	onBegin func(n int)
 }
 
 type prDescFakeKey struct {
@@ -260,6 +264,10 @@ func (f *prDescFakeStore) RecoverPrDescriptionLostAck(_ context.Context, a store
 
 // BeginPrDescTx opens a snapshot transaction: Rollback without Commit restores the tables.
 func (f *prDescFakeStore) BeginPrDescTx(context.Context) (workersvc.PrDescTx, error) {
+	f.begins++
+	if f.onBegin != nil {
+		f.onBegin(f.begins)
+	}
 	snapV := make(map[uuid.UUID]store.PrDescriptionVersion, len(f.versions))
 	for k, v := range f.versions {
 		snapV[k] = v
@@ -958,5 +966,94 @@ func TestWorkerPrDescriptionStageCapPerGeneration(t *testing.T) {
 	rec := prDescPost(t, router, runID, "stage", prDescStageBody(r.ClaimGeneration, "x"), nil)
 	if rec.Code != http.StatusConflict || prDescReason(t, rec) != "too_many_versions" {
 		t.Fatalf("stage at the per-run backstop = %d %s, want 409 too_many_versions", rec.Code, rec.Body.String())
+	}
+}
+
+// TestWorkerPrDescriptionStageRefencesInWriteTx: the stage's write transaction re-applies the
+// whole fence under the run row lock, so a claim that moved, a cap that filled or a run that
+// ended while the fields were being sanitized (between the first and the second transaction)
+// is refused, and nothing is written.
+func TestWorkerPrDescriptionStageRefencesInWriteTx(t *testing.T) {
+	cases := []struct {
+		name, reason string
+		mutate       func(st *prDescFakeStore, runID uuid.UUID)
+	}{
+		{"claim generation bumped", "stale_claim", func(st *prDescFakeStore, runID uuid.UUID) {
+			r := st.runs[runID]
+			r.ClaimGeneration++
+			st.runs[runID] = r
+		}},
+		{"pending cap filled", "too_many_versions", func(st *prDescFakeStore, runID uuid.UUID) {
+			r := st.runs[runID]
+			for i := 0; i < workersvc.MaxPrDescPendingVersionsPerRun; i++ {
+				if _, err := st.InsertPrDescriptionVersion(context.Background(), store.InsertPrDescriptionVersionParams{
+					RunID: runID, ClaimGeneration: r.ClaimGeneration, RepoID: uuid.UUID(r.RepoID.Bytes), Source: "generated",
+				}); err != nil {
+					t.Fatalf("seed version: %v", err)
+				}
+			}
+		}},
+		{"run became terminal", "run_terminal", func(st *prDescFakeStore, runID uuid.UUID) {
+			r := st.runs[runID]
+			r.Status = "completed"
+			st.runs[runID] = r
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			wkr := store.Worker{ID: uuid.New(), UserID: uuid.New()}
+			st := newPrDescFakeStore()
+			runID := prDescSeedRun(st, wkr, uuid.New(), 1)
+			router := prDescTestRouter(st, wkr)
+			var before int
+			st.onBegin = func(n int) {
+				if n == 2 {
+					c.mutate(st, runID)
+					before = len(st.versions)
+				}
+			}
+			rec := prDescPost(t, router, runID, "stage", prDescStageBody(1, "x"), nil)
+			if rec.Code != http.StatusConflict || prDescReason(t, rec) != c.reason {
+				t.Fatalf("stage = %d %s, want 409 %s", rec.Code, rec.Body.String(), c.reason)
+			}
+			if st.begins != 2 {
+				t.Fatalf("transactions = %d, want 2 (pre-sanitize fence, write)", st.begins)
+			}
+			if len(st.versions) != before {
+				t.Fatalf("versions = %d, want %d: a refused stage must write nothing", len(st.versions), before)
+			}
+		})
+	}
+}
+
+// TestWorkerPrDescriptionStageDeterministicIgnoresFields: a deterministic_only stage stores no
+// model or lead text, so its raw fields are ignored, never validated: an over-cap summary, too
+// many entries, an unknown scope kind or a bad verification result is not a 400, and the stored
+// fields are empty.
+func TestWorkerPrDescriptionStageDeterministicIgnoresFields(t *testing.T) {
+	wkr := store.Worker{ID: uuid.New(), UserID: uuid.New()}
+	st := newPrDescFakeStore()
+	runID := prDescSeedRun(st, wkr, uuid.New(), 1)
+	router := prDescTestRouter(st, wkr)
+	body := prDescStageBody(1, strings.Repeat("s", workersvc.MaxPrDescSummaryRawBytes+1))
+	body.Source = "deterministic_only"
+	body.Fields.Changes = make([]string, workersvc.MaxPrDescListRawEntries+1)
+	body.Fields.Changes[0] = strings.Repeat("c", workersvc.MaxPrDescItemRawBytes+1)
+	body.Fields.ScopeNotes = []apitypes.PrDescriptionScopeNote{{Kind: "risk", Text: "t"}}
+	body.Fields.Verification[0].Result = "ok"
+	var staged apitypes.PrDescriptionStageResponse
+	rec := prDescPost(t, router, runID, "stage", body, &staged)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("deterministic_only stage with invalid raw fields = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+	f := staged.Version.Fields
+	if staged.Version.Source != "deterministic_only" || f.Summary != "" || len(f.Changes) != 0 || len(f.ScopeNotes) != 0 ||
+		len(f.ReviewPointers) != 0 || len(f.Verification) != 0 {
+		t.Fatalf("deterministic_only version must carry no text: %+v", staged.Version)
+	}
+	// The same body as a generated stage is refused.
+	body.Source = "generated"
+	if rec := prDescPost(t, router, runID, "stage", body, nil); rec.Code != http.StatusBadRequest {
+		t.Fatalf("generated stage with the same fields = %d, want 400", rec.Code)
 	}
 }
