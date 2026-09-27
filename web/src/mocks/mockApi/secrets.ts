@@ -235,6 +235,22 @@ function createCodexCredential(kind: CodexKind, label: string, isDefault: boolea
   return delay({ secret: { ...created } });
 }
 
+// PRD #1732: the server refuses to promote a disabled credential (make it the default, or
+// opt it into the auto-select pool) with workersvc.ErrCredentialDisabled as a 409, before
+// any other field of the same PATCH is written.
+const CREDENTIAL_DISABLED = "credential is disabled; enable it in Settings";
+function refuseIfDisabled(row: SecretMeta) {
+  if (row.enabled === false) throw new ApiError(409, CREDENTIAL_DISABLED);
+}
+
+// refusesDefaultDelete mirrors the delete handlers' `n > 1 || (disabled && n > 0)` over
+// CountEnabledSecretSlot: n counts the slot's ENABLED rows (the default itself included
+// when it is enabled), so a disabled default is refused while any enabled row remains.
+function refusesDefaultDelete(row: SecretMeta, slot: SecretMeta[]): boolean {
+  const n = slot.filter((s) => s.enabled !== false).length;
+  return n > 1 || (row.enabled === false && n > 0);
+}
+
 function patchCodexCredential(
   kind: CodexKind,
   id: string,
@@ -248,6 +264,7 @@ function patchCodexCredential(
   if (body.default === false) {
     throw new ApiError(400, "cannot clear the default; set another credential as default instead");
   }
+  if (body.default === true) refuseIfDisabled(row);
   if (body.label !== undefined) {
     const trimmed = body.label.trim();
     if (trimmed === "") throw new ApiError(400, "label must not be empty");
@@ -275,6 +292,14 @@ function deleteCodexCredential(kind: CodexKind, id: string) {
   // The real route is kind-scoped (DELETE /me/secrets/{kind}/{id}), so an id of the
   // wrong kind (e.g. an anthropic_token or the sibling codex kind) is a 404, not a hit.
   if (!row || row.kind !== kind) throw new ApiError(404, "credential not found");
+  // D12, as deleteCodexSecretByID: the default may not go while another ENABLED credential
+  // in the shared Codex slot remains (CountEnabledSecretSlot spans both codex kinds).
+  if (row.is_default && refusesDefaultDelete(row, secrets.filter((s) => isCodexKind(s.kind)))) {
+    throw new ApiError(
+      409,
+      "cannot delete the default credential while other enabled credentials exist; set another credential as default first",
+    );
+  }
   secrets = secrets.filter((s) => s.id !== id);
   return delay(null);
 }
@@ -368,6 +393,7 @@ export const secretsApi = {
     if (body.default === false) {
       throw new ApiError(400, "cannot clear the default; set another token as default instead");
     }
+    if (body.default === true) refuseIfDisabled(row);
     if (body.label !== undefined) {
       const trimmed = body.label.trim();
       if (trimmed === "") throw new ApiError(400, "label must not be empty");
@@ -395,6 +421,7 @@ export const secretsApi = {
   setTokenAutoEligible: async (id: string, autoEligible: boolean) => {
     const row = secrets.find((s) => s.id === id);
     if (!row) throw new ApiError(404, "token not found");
+    if (autoEligible) refuseIfDisabled(row);
     row.auto_eligible = autoEligible;
     row.updated_at = new Date().toISOString();
     const meter = mockMyTokenRateLimits.find((t) => t.secret_id === id);
@@ -417,12 +444,12 @@ export const secretsApi = {
   deleteAnthropicTokenById: async (id: string) => {
     const row = secrets.find((s) => s.id === id);
     if (!row) throw new ApiError(404, "token not found");
-    const siblings = secrets.filter((s) => s.kind === row.kind);
-    // D6: the default may not be deleted while others exist — promote first.
-    if (row.is_default && siblings.length > 1) {
+    // D6/D12: the default may not be deleted while another ENABLED token exists — promote
+    // first. Disabled siblings do not count (DeleteAnthropicTokenByID's enabled-slot count).
+    if (row.is_default && refusesDefaultDelete(row, secrets.filter((s) => s.kind === row.kind))) {
       throw new ApiError(
         409,
-        "cannot delete the default token while other tokens exist; set another token as default first",
+        "cannot delete the default token while other enabled tokens exist; set another token as default first",
       );
     }
     secrets = secrets.filter((s) => s.id !== id);

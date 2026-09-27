@@ -50,7 +50,7 @@ const VAULT_LOCKED =
 // D6's reason, in one place: rendered as a tooltip AND as the screen-reader
 // description the disabled-looking Delete points at, so the two cannot drift.
 const D6_HINT =
-  "Make another credential the default first; every account needs one default while any credential exists.";
+  "Make another credential the default first; every account needs one default while any other enabled credential exists.";
 
 // What happens to a `staging` login next, in one place: the badge hint and the status
 // legend both say it, so the two cannot drift. uzi's Codex usage poller is the only

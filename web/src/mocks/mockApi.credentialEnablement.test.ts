@@ -118,3 +118,51 @@ describe("mock read filters (PRD #1732 D1, D9, D13)", () => {
     expect(run.hold_reason).toBeNull();
   });
 });
+
+// PRD #1732: the server refuses to promote a disabled credential (default or auto-select
+// pool) with ErrCredentialDisabled, and the delete-default guard counts ENABLED rows only.
+describe("mock promotion and delete-default guards (PRD #1732 D5, D12)", () => {
+  const DISABLED = "credential is disabled; enable it in Settings";
+
+  it("refuses to make a disabled token the default or pool it, and writes nothing", async () => {
+    const api = await fresh();
+    await expect(
+      api.patchAnthropicToken("sec-old-laptop", { label: "renamed", default: true }),
+    ).rejects.toMatchObject({ status: 409, message: DISABLED });
+    await expect(api.setTokenAutoEligible("sec-old-laptop", true)).rejects.toMatchObject({
+      status: 409,
+      message: DISABLED,
+    });
+    const row = (await api.listSecrets()).secrets.find((s) => s.id === "sec-old-laptop");
+    expect(row?.label).not.toBe("renamed");
+    expect(row?.is_default).toBe(false);
+    // Opting OUT of the pool, and a plain rename, stay allowed on a disabled row.
+    await expect(api.setTokenAutoEligible("sec-old-laptop", false)).resolves.toBeTruthy();
+    await expect(api.patchAnthropicToken("sec-old-laptop", { label: "renamed" })).resolves.toBeTruthy();
+  });
+
+  it("refuses to make a disabled Codex credential the shared default", async () => {
+    const api = await fresh();
+    await expect(api.patchCodexAuth("sec-codex-team-laptop", { default: true })).rejects.toMatchObject({
+      status: 409,
+      message: DISABLED,
+    });
+  });
+
+  it("deletes the default when every other token is disabled", async () => {
+    const api = await fresh();
+    const { secrets } = await api.listSecrets();
+    for (const s of secrets.filter((s) => s.kind === "anthropic_token" && s.enabled && !s.is_default)) {
+      await api.setSecretEnabled("anthropic_token", s.id, false);
+    }
+    await expect(api.deleteAnthropicTokenById("sec-default")).resolves.toBeNull();
+  });
+
+  it("refuses to delete the default while another enabled token exists, with the server's text", async () => {
+    const api = await fresh();
+    await expect(api.deleteAnthropicTokenById("sec-default")).rejects.toMatchObject({
+      status: 409,
+      message: "cannot delete the default token while other enabled tokens exist; set another token as default first",
+    });
+  });
+});

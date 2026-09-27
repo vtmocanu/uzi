@@ -229,6 +229,9 @@ const CARD_MIRRORED_FIELDS = [
   "health_reason",
   "health_since",
   "deadline_at",
+  // PRD #1732 D14: the board projection sends hold_reason on every card, so a run parked
+  // on (or released from) credential_disabled flips the card's badge along with its status.
+  "hold_reason",
 ] as const;
 
 // The other half of the partition: fields a card carries that a RUN PATCH must never

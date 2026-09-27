@@ -111,11 +111,7 @@ describe("StatusPill", () => {
     // ("running 4m") that a clockless pill could not match — but since issue #256 M4 the
     // elapsed moved to the meta-line duration token and the badge is a bare "running",
     // so the word now agrees with StatusPill and is asserted here rather than skipped.
-    //   credential_disabled (PRD #1732) — the same shape as needs_landing: StatusPill-only.
-    //               RunView/RunsList overlay it from a paused run's hold_reason, which
-    //               LatestRun does not carry, so the board badge never meets this key (its
-    //               dead runBadge arm was removed rather than kept "agreeing" with nothing).
-    const OVERLAY_ONLY = new Set(["cancelled", "needs_landing", "credential_disabled"]);
+    const OVERLAY_ONLY = new Set(["cancelled", "needs_landing"]);
     const checked: string[] = [];
     for (const status of Object.keys(RUN_STATUS_TONES)) {
       if (OVERLAY_ONLY.has(status)) continue;

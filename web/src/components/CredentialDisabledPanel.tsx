@@ -58,7 +58,6 @@ type HeldRun = Pick<
   | "codex_secret_id"
   | "credential_override"
   | "anthropic_secret_id"
-  | "anthropic_select_reason"
 >;
 
 // heldCredential picks the disabled credential this run waits on, or null when none of
@@ -90,17 +89,14 @@ export function heldCredential(run: HeldRun, secrets: SecretMeta[], bindings: He
 
   const override = run.credential_override;
   switch (override?.mode) {
-    case "pinned": {
-      // Match by id when the run's last claim spent the pin (the label is a snapshot and
-      // can be renamed or reused); fall back to the snapshot label otherwise. A pin with
-      // no label is a deleted token: the server resolves it as inherit, so fall through.
-      if (run.anthropic_select_reason === "run_pinned") {
-        const spent = pinnedTo(byId(run.anthropic_secret_id));
-        if (spent) return spent;
-      }
+    case "pinned":
+      // GetRun resolves the override's label LIVE from the override's secret id
+      // (runs_lifecycle.go), so the label always names the token the run is pinned to now
+      // (a rename follows it; labels are unique per kind). Match on it among the Anthropic
+      // tokens. A pin with no label is a deleted token: the server resolves it as inherit,
+      // so fall through.
       if (override.label) return pinnedTo(anthropic.find((s) => s.label === override.label));
       break;
-    }
     case "default":
     case "auto":
       // The override decides; the worker binding never applies (runOverrideChoice).

@@ -1251,3 +1251,26 @@ describe("effectiveRunStatus — credential_disabled hold (PRD #1732)", () => {
     expect(effectiveRunStatus({ status: "queued", hold_reason: "credential_disabled" })).toBe("queued");
   });
 });
+
+// PRD #1732 D14, board shape: the board projection sends hold_reason on every card
+// (latestRunDTO.HoldReason), so a card whose latest run is parked on a disabled credential
+// arrives as a LatestRun with status "paused" + hold_reason "credential_disabled" and must
+// render the warn "waiting: credential disabled" badge, not the owner "paused" pill.
+describe("runBadge — board card held on a disabled credential (PRD #1732)", () => {
+  it("renders the warn credential-disabled badge from a board-shaped LatestRun", () => {
+    expect(runBadge(run({ status: "paused", hold_reason: "credential_disabled" }), NOW)).toEqual({
+      kind: "badge",
+      label: "waiting: credential disabled",
+      tone: "warning",
+      pulse: false,
+      title: "A credential this run needs is disabled. It resumes by itself when you enable it.",
+    });
+  });
+
+  it("keeps an owner pause (null hold_reason) off the credential badge", () => {
+    expect(runBadge(run({ status: "paused", hold_reason: null }), NOW)).toMatchObject({
+      kind: "badge",
+      label: "‖ paused",
+    });
+  });
+});

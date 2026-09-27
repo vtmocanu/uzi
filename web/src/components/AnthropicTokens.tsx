@@ -39,7 +39,7 @@ const VAULT_LOCKED = "Your vault is locked — unlock it with the banner above, 
 // D6's reason, in one place: it is rendered as a tooltip AND as the screen-reader
 // description the disabled-looking Delete points at, and those two must not drift.
 const D6_HINT =
-  "Make another token the default first — every account needs one default while any token exists.";
+  "Make another token the default first — every account needs one default while any other enabled token exists.";
 
 function errText(err: unknown, fallback: string): string {
   if (isVaultLocked(err)) return VAULT_LOCKED;

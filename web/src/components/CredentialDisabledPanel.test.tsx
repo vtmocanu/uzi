@@ -228,20 +228,22 @@ describe("heldCredential", () => {
     expect(heldCredential(run, allOff, NO_BINDINGS)).toEqual({ secret: laptop, viaDefault: true });
   });
 
-  // The override's label is a SNAPSHOT: a rename, or a label reused by another token, must
-  // not redirect Enable. The run's own pinned claim carries the id.
-  it("matches a pinned override by id when the run's last claim spent the pin", () => {
-    const renamed = { ...laptop, label: "renamed-laptop" };
-    const reused = secret({ id: "sec-other", label: "old-laptop", is_default: false, enabled: false });
+  // GetRun resolves credential_override.label LIVE from the override's secret id, so the
+  // label names the CURRENT pin. A run re-pinned from A to B whose last claim spent A must
+  // offer B (the token it will claim next), even when both are disabled.
+  it("offers the current pin, not the last-spent token, after a re-pin A to B", () => {
+    const a = secret({ id: "sec-a", label: "token-a", is_default: false, enabled: false });
+    const b = secret({ id: "sec-b", label: "token-b", is_default: false, enabled: false });
     const run = heldRun({
-      credential_override: { mode: "pinned", label: "old-laptop" },
-      anthropic_secret_id: "sec-laptop",
+      credential_override: { mode: "pinned", label: "token-b" },
+      anthropic_secret_id: "sec-a",
       anthropic_select_reason: "run_pinned",
     });
-    expect(heldCredential(run, [secret(), renamed, reused], NO_BINDINGS)?.secret.id).toBe("sec-laptop");
-    // Without an id to go on, the snapshot label is the fallback.
-    expect(
-      heldCredential({ ...run, anthropic_select_reason: "pinned" }, [secret(), renamed, reused], NO_BINDINGS)?.secret.id,
-    ).toBe("sec-other");
+    expect(heldCredential(run, [secret(), a, b], NO_BINDINGS)).toEqual({ secret: b, viaDefault: false });
+  });
+
+  it("matches a pinned override's label among Anthropic tokens only", () => {
+    const codexTwin = secret({ id: "cdx-laptop", kind: "codex_auth", label: "old-laptop", is_default: false, enabled: false });
+    expect(heldCredential(heldRun(), [codexTwin, secret(), laptop], NO_BINDINGS)?.secret.id).toBe("sec-laptop");
   });
 });

@@ -451,7 +451,12 @@ export function DisableCredentialDialog({
             {slot === "anthropic" ? (
               <li>It leaves your sidebar, the token pickers, auto-select and the admin Rate limits view.</li>
             ) : (
-              <li>It leaves your sidebar, and new Codex runs cannot start on it.</li>
+              // The sidebar meter is per ChatGPT ACCOUNT, not per login: it stays while
+              // another enabled login of the same account exists (enabled_siblings below).
+              <li>
+                New Codex runs cannot start on it. Your sidebar keeps the ChatGPT account’s meter while another
+                enabled login of the same account exists.
+              </li>
             )}
             <li>Its name, value and settings are kept, and past run history is unchanged.</li>
             <li>A run already working on it finishes first.</li>

@@ -723,6 +723,12 @@ export interface LatestRun {
   // null for a non-running/chat/judge/interactive run. Optional for the same api/web
   // rollout skew as is_planning: a pre-feature api pod omits the key.
   deadline_at?: string | null;
+  // hold_reason (PRD #1226/#1497/#1732): why a `paused` run is server-held, null for an owner
+  // pause or a non-paused run. Non-sensitive, so the board projection sends it on every card
+  // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
+  // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused".
+  // Optional for api/web rollout skew: an absent key reads as no hold.
+  hold_reason?: string | null;
   owner_name: string;
   worker_name: string | null;
   is_mine: boolean;
