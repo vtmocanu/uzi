@@ -6,10 +6,13 @@ import { mockAdmin } from "./users";
 // status, the "seen in N runs" count, the actionable evidence id, and — for a filed/dismissed/done
 // coordinate — the resolution. `run_ids` models the evidence rows (which runs saw it) so the mock
 // can honour the ?run= deep-link semi-join; `finding_id` null models a coordinate whose evidence
-// cascaded away with a deleted run (D12): display-only, non-actionable. `disposition_id` is the
-// always-present coordinate id the bulk-dismiss and undo endpoints key on. `evidence_preview` and
-// `occurrences` (newest-first) are the M3 evidence additions. All free-text (last_title, location,
-// evidence_preview, occurrence run_title) is agent-authored and rendered inert by every surface.
+// cascaded away with a deleted run (D12): it cannot be filed or dismissed, but it can still be
+// marked done (issue #1723 keys Mark done on the disposition). `disposition_id` is the
+// always-present coordinate id the bulk-dismiss, bulk Mark done and undo endpoints key on. A done
+// row's `set_via` is "issue_close" when the sync closed it, absent when a human marked it done.
+// `evidence_preview` and `occurrences` (newest-first) are the M3 evidence additions. All free-text
+// (last_title, location, evidence_preview, occurrence run_title) is agent-authored and rendered
+// inert by every surface.
 export interface MockFindingOccurrence {
   run_id: string;
   run_title: string;
@@ -162,9 +165,29 @@ export const mockFindings: MockFinding[] = [
     run_ids: ["run-done"],
   },
   {
+    // A HUMAN done (issue #1723): the user pressed Mark done on an open coordinate, so status=done
+    // with NO set_via (only the issue-close sync stamps one) — the chip reads the plain "✓ Done",
+    // and Undo returns it to open (it has no issue link to fall back to).
+    finding_id: "find-8",
+    disposition_id: "disp-8",
+    user_id: mockAdmin.id,
+    location: "internal/jobs/backoff.go#nextDelay",
+    repo_id: "repo-atlas",
+    repo_path: "vtmocanu/atlas-api",
+    status: "done",
+    last_title: "nextDelay overflows after 62 retries and returns a negative duration",
+    description_md: "The exponential backoff shifts a 1s base left by the attempt count, which overflows int64 past attempt 62.",
+    labels: ["bug"],
+    seen_in_runs: 1,
+    filed_issue_iid: null,
+    filed_issue_url: null,
+    resolved_at: minsAgo(90),
+    run_ids: ["run-done"],
+  },
+  {
     // A filed coordinate whose evidence cascaded away with a deleted run (D12): finding_id null,
-    // so it is display-only — the backlog still shows it (disposition-driven), last_title keeps it
-    // legible, but there is nothing to act on.
+    // so it cannot be filed or dismissed — the backlog still shows it (disposition-driven), last_title
+    // keeps it legible, and Mark done (keyed on the disposition, issue #1723) is its only action.
     finding_id: null,
     disposition_id: "disp-7",
     user_id: mockAdmin.id,

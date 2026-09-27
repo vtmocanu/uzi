@@ -175,9 +175,22 @@ describe("TriageStateChip — fed by findingState (the to_file wire)", () => {
     expect(screen.getByRole("link", { name: /Filed #5/ })).toBeTruthy();
   });
 
-  it("maps a done finding to 'Done via #N' (a finding's done is always the issue-close sync)", () => {
-    render(<TriageStateChip {...findingState({ status: "done", filed_issue_iid: 5, filed_issue_url: "https://f/5" })} />);
+  it("maps a sync-done finding (set_via issue_close) to 'Done via #N'", () => {
+    render(
+      <TriageStateChip
+        {...findingState({ status: "done", set_via: "issue_close", filed_issue_iid: 5, filed_issue_url: "https://f/5" })}
+      />,
+    );
     expect(screen.getByText("Done via #5")).toBeTruthy();
+  });
+
+  it("maps a human-done finding (no set_via) to the plain '✓ Done', even when it carries an issue link", () => {
+    // Issue #1723: a human Mark done on a filed coordinate keeps its link, but the sync did not
+    // close it, so the chip must not claim "Done via #N".
+    render(<TriageStateChip {...findingState({ status: "done", filed_issue_iid: 5, filed_issue_url: "https://f/5" })} />);
+    expect(screen.getByText("Done")).toBeTruthy();
+    expect(screen.queryByText(/Done via/)).toBeNull();
+    expect(screen.queryByTitle(/Marked done automatically/)).toBeNull();
   });
 
   it("maps a dismissed finding to its reason", () => {

@@ -16,7 +16,7 @@ import { delay, requireSession } from "./shared";
 import { repos } from "./forge";
 import { reviews } from "./judge";
 
-// Incidental-findings coordinates (PRD #333 M7). Mutable copy so file/dismiss persist in a
+// Incidental-findings coordinates (PRD #333 M7). Mutable copy so file/dismiss/done persist in a
 // demo session; the seed stays pristine so a module reload re-seeds a clean backlog.
 const findings: MockFinding[] = mockFindings.map((f) => ({
   ...f,
@@ -46,6 +46,15 @@ function findingDTO(f: MockFinding): IncidentalFinding {
     ...(f.filed_issue_url ? { filed_issue_url: f.filed_issue_url } : {}),
     ...(f.resolved_at ? { resolved_at: f.resolved_at } : {}),
   };
+}
+
+// markDone applies a human Mark done in place (issue #1723): status done, no set_via (a sync done
+// becomes a human done), no dismiss reason, a fresh resolved_at; the issue link is left untouched.
+function markDone(f: MockFinding) {
+  f.status = "done";
+  f.set_via = undefined;
+  f.dismiss_reason = undefined;
+  f.resolved_at = new Date().toISOString();
 }
 
 // matchFindingBucket maps a disposition status to the ?bucket= filter (D7; PRD #1183 M4 added
@@ -205,7 +214,7 @@ export const findingsApi = {
     return delay({ status: "dismissed", reason }, 80);
   },
 
-  // ── Findings stats, bulk dismiss + undo (PRD #1183 M3) ───────────────────────
+  // ── Findings stats + bulk dismiss (PRD #1183 M3) ─────────────────────────────
   // getFindingsStats is the canonical per-status tally (the finding twin of getJudgeStats): the six
   // TriageCounts computed from the seed, repo-scoped, and IGNORING ?run= entirely (the run anchor
   // narrows the list, never the counts), so the badge, the tabs and the strip are one number per
@@ -244,18 +253,53 @@ export const findingsApi = {
     }
     return delay({ updated: moved.length, findings: moved.map(findingDTO) }, 80);
   },
-  // undoDismissFinding reopens a dismissed coordinate (dismissed → open), keyed on disposition_id.
-  // Only a currently-dismissed owned row can be undone; anything else is a 404. Returns the reopened
-  // row so the caller can reconcile in place.
-  undoDismissFinding: async (dispositionId: string) => {
+  // ── Human Mark done + neutral Undo (issue #1723) ────────────────────────────
+  // markFindingDone marks ONE coordinate done, keyed on the EVIDENCE id (finding_id) like
+  // fileFinding. The judge's disposition semantics: reachable from open, filed, dismissed and done;
+  // a mid-filing coordinate is the 409. A human done carries no set_via (only the issue-close sync
+  // stamps one) and clears any dismiss reason; the issue link is kept so Undo can return to filed.
+  markFindingDone: async (findingId: string) => {
+    const me = requireSession();
+    const f = findings.find((x) => x.finding_id === findingId && x.user_id === me.id);
+    if (!f) throw new ApiError(404, "finding not found");
+    if (f.status === "filing") throw new ApiError(409, "cannot mark done (finding is being filed)");
+    markDone(f);
+    return delay({ status: "done", disposition_id: f.disposition_id }, 80);
+  },
+  // markFindingsDone is the BULK Mark done, keyed on disposition_id like dismissFindings. Owner-scoped,
+  // capped at 100, deduped, and — like the server — it SKIPS a mid-filing, foreign or unknown id
+  // silently, returning only the rows actually applied.
+  markFindingsDone: async (ids: string[]) => {
+    const me = requireSession();
+    if (ids.length > 100) throw new ApiError(400, "too many ids (max 100)");
+    const moved: MockFinding[] = [];
+    for (const id of new Set(ids)) {
+      const f = findings.find((x) => x.disposition_id === id && x.user_id === me.id);
+      if (!f || f.status === "filing") continue; // skip mid-filing / foreign / unknown silently
+      markDone(f);
+      moved.push(f);
+    }
+    return delay({ updated: moved.length, findings: moved.map(findingDTO) }, 80);
+  },
+  // undoFinding reverts a human verdict (done or dismissed), keyed on disposition_id. A done with an
+  // issue link returns to filed (keeping the link and a resolved_at); every other undo returns to
+  // open. It never restores an earlier dismissal. Anything not done/dismissed is a 404.
+  undoFinding: async (dispositionId: string) => {
     const me = requireSession();
     const f = findings.find(
-      (x) => x.disposition_id === dispositionId && x.user_id === me.id && x.status === "dismissed",
+      (x) =>
+        x.disposition_id === dispositionId && x.user_id === me.id && (x.status === "dismissed" || x.status === "done"),
     );
-    if (!f) throw new ApiError(404, "no dismissed finding to undo");
-    f.status = "open";
+    if (!f) throw new ApiError(404, "no dismissed or done finding to undo");
+    if (f.status === "done" && f.filed_issue_iid != null) {
+      f.status = "filed";
+      f.resolved_at = f.resolved_at ?? new Date().toISOString();
+    } else {
+      f.status = "open";
+      f.resolved_at = null;
+    }
     f.dismiss_reason = undefined;
-    f.resolved_at = null;
+    f.set_via = undefined;
     return delay(findingDTO(f), 60);
   },
 

@@ -3536,17 +3536,19 @@ export interface FindingOccurrence {
 // deduped across every run it recurs in (mirrors apitypes.IncidentalFindingDTO, D7).
 //
 // `disposition_id` is the coordinate's finding_dispositions.id — the ALWAYS-PRESENT id the
-// bulk-dismiss (POST /findings/dismiss {ids}) and undo (DELETE /findings/{id}/dismiss) endpoints
-// key on (PRD #1183 M3). It is distinct from `finding_id`: a dismissed/done coordinate always has
-// a disposition_id even when its evidence is gone, which is exactly why undo keys on it.
+// bulk-dismiss (POST /findings/dismiss {ids}, PRD #1183 M3), bulk Mark done (POST /findings/done
+// {ids}) and undo (DELETE /findings/{id}/disposition) endpoints key on (issue #1723). It is
+// distinct from `finding_id`: a dismissed/done coordinate always has a disposition_id even when
+// its evidence is gone, which is exactly why Mark done and undo key on it.
 //
 // `finding_id` is the latest evidence row's id — the id the file/dismiss actions drive on
 // (M5). It is UNDEFINED (omitempty) on a filed/dismissed coordinate whose evidence rows were
 // cascaded away with a deleted run (D12): the coordinate still appears (the read is
-// disposition-driven) and `last_title` keeps it legible, but there is no evidence row to act
-// on, so a nil finding_id means "not actionable from here".
+// disposition-driven) and `last_title` keeps it legible, but there is no evidence row to file
+// or dismiss, so a nil finding_id means "no File/Dismiss from here" (Mark done still applies).
 //
-// `dismiss_reason` (wont_do | not_an_issue), `set_via` (issue_close), `evidence_preview` (the
+// `dismiss_reason` (wont_do | not_an_issue), `set_via` (issue_close on the sync's done; absent on
+// a human Mark done, issue #1723), `evidence_preview` (the
 // newest evidence row's description_md, plain text, capped) and `occurrences` (newest-first,
 // capped at 20) are the PRD #1183 M3 additions — all OPTIONAL for api/web rollout skew. Like the
 // judge's rationale_preview, `evidence_preview` and every occurrence's `run_title` MUST be

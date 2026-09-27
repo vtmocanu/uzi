@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, ApiError, type IncidentalFindingFiledIssue } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { Badge } from "./ui";
@@ -7,26 +7,30 @@ import { stripUnsafeChars } from "../lib/safeText";
 import { TriageActions } from "./triage/TriageActions";
 import { IssueDraftCard, type IssueDraftSeed, type IssueDraftValues } from "./triage/IssueDraftCard";
 import { TriageStateChip } from "./triage/TriageStateChip";
+import { TriageDisposedRow } from "./triage/TriageDisposedRow";
 import { findingState } from "./triage/triageCopy";
 
 // FindingCard renders an incidental-finding card in the run stream (PRD #333 M7, rebuilt on the
 // shared triage row in PRD #1183 M2).
 //
 // It is the headless equivalent of Claude Code's "want me to file these?" prompt: a worker
-// mid-run flagged an OFF-TASK bug, and this card lets the human file it or dismiss it — on their
-// own schedule, on their own forge connection. The write happens only on the human's click; the
-// card holds no forge tool of its own. It drives the SINGLE-finding endpoints only
-// (findingIssueDraft / fileFinding / dismissFinding), never the Findings-page backlog fields.
+// mid-run flagged an OFF-TASK bug, and this card lets the human file it, mark it done or dismiss it
+// — on their own schedule, on their own forge connection. The write happens only on the human's
+// click; the card holds no forge tool of its own. It drives the SINGLE-finding endpoints
+// (findingIssueDraft / fileFinding / dismissFinding / markFindingDone) plus undoFinding on the
+// disposition id markFindingDone returns, never the Findings-page backlog fields.
 //
 // It now composes the shared triage set instead of its own controls:
-//   * TriageActions — File issue · Dismiss ▾ ONLY (no Mark done: a finding's done comes only from
-//     its filed issue closing, which this run-stream card never observes). dismissCopy="finding"
-//     gives the worker-voiced dismiss sublines.
+//   * TriageActions — File issue · Mark done · Dismiss ▾ (issue #1723 added the human Mark done).
+//     dismissCopy="finding" gives the worker-voiced dismiss sublines. Mark done is the OWNED mode:
+//     the card swaps the action row for TriageDisposedRow (resolved Xh ago · Undo), hosts its own
+//     persistent live region (callerHostsLiveRegion) so the "Marked done" / "Undone" announcement
+//     survives that swap, and moves focus onto the control that just mounted.
 //   * IssueDraftCard — the shared "Draft issue" card in fixed-repo / no-selector mode (the finding
 //     draft carries no repo; the server resolves the coordinate's repo at file time). Replaces the
 //     old inline editor, the one-click "File" button and the green "Issue filed." box.
-//   * TriageStateChip — the one triage ladder (To triage → Filed #N ↗ → Dismissed · <reason>),
-//     fed the normalised findingState() adapter.
+//   * TriageStateChip — the one triage ladder (To triage → Filed #N ↗ → ✓ Done → Dismissed ·
+//     <reason>), fed the normalised findingState() adapter.
 //
 // TWO load-bearing rules survive the rebuild:
 //   1. INFO/BLUE accent (D10), distinct from the amber gate cards (question/plan, which park the
@@ -38,13 +42,17 @@ import { findingState } from "./triage/triageCopy";
 //
 // BEST-EFFORT / ADVISORY (the backlog is the source of truth): this persisted card is a historical
 // record, so an OLD card may still offer File/Dismiss for a coordinate already filed or dismissed
-// from the /findings backlog. Acting then gets the 409, which this card renders as its own
-// friendly "already filed or resolved" advisory — outside the 4-state chip, never a crash.
+// from the /findings backlog. File/Dismiss then get the 409, which this card renders as its own
+// friendly "already filed or resolved" advisory — outside the 4-state chip, never a crash. Mark
+// done is reachable from every settled state (the judge's semantics), so on an old card it simply
+// applies; only a coordinate mid-filing 409s it into the same advisory.
 type FindingCardState =
   | { kind: "open" }
   | { kind: "drafting" }
   | { kind: "filed"; issue: IncidentalFindingFiledIssue; warning: string }
   | { kind: "dismissed"; reason: "wont_do" | "not_an_issue" }
+  // A human Mark done: the disposition id is what Undo keys on; resolvedAt feeds "resolved Xh ago".
+  | { kind: "done"; dispositionId: string; resolvedAt: string }
   | { kind: "resolved" };
 
 export function FindingCard({
@@ -63,6 +71,21 @@ export function FindingCard({
   const [state, setState] = useState<FindingCardState>({ kind: "open" });
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  // The owned-mode live region's message ("Marked done" / "Undone"), hosted on the card so it
+  // survives the TriageActions ⇄ TriageDisposedRow swap.
+  const [announce, setAnnounce] = useState("");
+  // Armed by a Mark done / Undo so the effect below moves focus onto the control that just mounted
+  // (the disposed row's Undo, or the action row's first button after an Undo) — and never on mount.
+  const focusAfterMutation = useRef(false);
+  const actionsRef = useRef<HTMLDivElement>(null);
+
+  // Deferred until busy drops: the successor is `disabled={busy}`, and a disabled element ignores
+  // .focus(). Both successors are the first <button> in the actions wrapper.
+  useEffect(() => {
+    if (!focusAfterMutation.current || busy) return;
+    focusAfterMutation.current = false;
+    actionsRef.current?.querySelector<HTMLElement>("button")?.focus();
+  }, [state, busy]);
 
   // loadDraft maps the deterministic, owner-scoped finding draft (D4) onto the shared card's seed.
   // The draft carries no repo (the coordinate fixes it server-side), so no defaultRepoId/note is
@@ -119,6 +142,56 @@ export function FindingCard({
     }
   };
 
+  // markDone is the owned-mode human Mark done (issue #1723), keyed on the evidence id. The response
+  // carries the disposition id Undo needs. A 409 (the coordinate is mid-filing) is the same advisory
+  // story as File/Dismiss: the backlog is the source of truth.
+  const markDone = async () => {
+    setErr("");
+    setBusy(true);
+    try {
+      const res = await api.markFindingDone(id);
+      focusAfterMutation.current = true;
+      setAnnounce("Marked done");
+      setState({ kind: "done", dispositionId: res.disposition_id, resolvedAt: new Date().toISOString() });
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        setState({ kind: "resolved" });
+      } else {
+        setErr(errorMessage(e, "Could not mark the finding done"));
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // undoDone reverts the Mark done on its disposition id. The server decides where the coordinate
+  // lands — back to filed when it still carries an issue link (it was filed from the backlog before
+  // this card's Mark done), else open — so the card follows the RETURNED row.
+  const undoDone = async (dispositionId: string) => {
+    setErr("");
+    setBusy(true);
+    try {
+      const row = await api.undoFinding(dispositionId);
+      focusAfterMutation.current = true;
+      setAnnounce("Undone");
+      if (row.status === "open") {
+        setState({ kind: "open" });
+      } else if (row.status === "filed" && row.filed_issue_iid != null) {
+        setState({
+          kind: "filed",
+          issue: { iid: row.filed_issue_iid, web_url: row.filed_issue_url ?? "", title: row.last_title },
+          warning: "",
+        });
+      } else {
+        setState({ kind: "resolved" });
+      }
+    } catch (e) {
+      setErr(errorMessage(e, "Could not undo"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="overflow-hidden rounded-xl border border-info/40 bg-info/[0.06]">
       <div className="flex items-center justify-between gap-2 border-b border-info/20 bg-info/10 px-3 py-2">
@@ -158,19 +231,36 @@ export function FindingCard({
 
         {err && <p className="text-xs text-danger">{err}</p>}
 
-        {state.kind === "open" && (
-          <div className="pt-0.5">
-            <TriageActions
-              onFile={() => {
-                setErr("");
-                setState({ kind: "drafting" });
-              }}
-              onDismiss={dismiss}
-              dismissCopy="finding"
+        {/* The owned-mode live region and the swap target share one wrapper, so the announcement
+            outlives the TriageActions ⇄ TriageDisposedRow swap and the focus move can find the
+            first button of whichever branch just mounted. */}
+        <div ref={actionsRef}>
+          <span className="sr-only" role="status" aria-live="polite">
+            {announce}
+          </span>
+          {state.kind === "open" && (
+            <div className="pt-0.5">
+              <TriageActions
+                onFile={() => {
+                  setErr("");
+                  setState({ kind: "drafting" });
+                }}
+                onMarkDone={markDone}
+                onDismiss={dismiss}
+                dismissCopy="finding"
+                busy={busy}
+                callerHostsLiveRegion
+              />
+            </div>
+          )}
+          {state.kind === "done" && (
+            <TriageDisposedRow
+              resolvedAt={state.resolvedAt}
               busy={busy}
+              onUndo={() => undoDone(state.dispositionId)}
             />
-          </div>
-        )}
+          )}
+        </div>
 
         {state.kind === "drafting" && (
           <IssueDraftCard loadDraft={loadDraft} onCreate={onCreate} onCancel={() => setState({ kind: "open" })} />
@@ -195,8 +285,8 @@ export function FindingCard({
   );
 }
 
-// FindingStateSlot renders the shared TriageStateChip for the three ladder states this card
-// reaches (To triage / Filed / Dismissed), fed through the findingState adapter so the wording
+// FindingStateSlot renders the shared TriageStateChip for the four ladder states this card
+// reaches (To triage / Filed / ✓ Done / Dismissed), fed through the findingState adapter so the wording
 // matches every other triage surface. The 409 "resolved" advisory is FindingCard's own concern,
 // outside the four-state ladder, so it renders a plain neutral badge here and its explanation in
 // the body.
@@ -210,6 +300,9 @@ function FindingStateSlot({ state }: { state: FindingCardState }) {
       );
     case "dismissed":
       return <TriageStateChip {...findingState({ status: "dismissed", dismiss_reason: state.reason })} />;
+    case "done":
+      // A human done carries no set_via, so the chip reads the plain "✓ Done".
+      return <TriageStateChip {...findingState({ status: "done" })} />;
     case "resolved":
       return <Badge tone="neutral">resolved</Badge>;
     default:
