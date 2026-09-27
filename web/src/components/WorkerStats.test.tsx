@@ -227,6 +227,34 @@ describe("WorkerStatGauges: docker-tier dind volume (issue #1759)", () => {
     expect(screen.queryByRole("progressbar", { name: "Disk dind" })).toBeNull();
   });
 
+  it("renders no dind bar when bytes used is null but the total is reported", () => {
+    // Mirror of the case above: pins the `used == null` half of the present-guard.
+    render(<WorkerStatGauges worker={aWorker({ ...sampled, stats_disk_dind_bytes: null, stats_disk_dind_total_bytes: GIB20 })} />);
+    // Positive control: the gauge block rendered, so the dind absence is not vacuous.
+    expect(screen.getByRole("progressbar", { name: "CPU" })).toBeTruthy();
+    expect(screen.queryByRole("progressbar", { name: "Disk dind" })).toBeNull();
+  });
+
+  it("does not name inodes when they only out-fill bytes below the displayed whole percent", () => {
+    render(
+      <WorkerStatGauges
+        worker={aWorker({
+          ...sampled,
+          stats_disk_dind_bytes: 16793322127, // 78.2%
+          stats_disk_dind_total_bytes: GIB20,
+          stats_disk_dind_inodes: 1027604, // 78.4%: raw-fuller, but both read "78%"
+          stats_disk_dind_total_inodes: 1310720,
+        })}
+      />,
+    );
+    const dind = screen.getByRole("progressbar", { name: "Disk dind" });
+    expect(dind.getAttribute("aria-valuenow")).toBe("78");
+    expect(dind.getAttribute("aria-valuetext")).toBe("15.6/20 GiB, 78%");
+    // Positive: the value text rendered; negative: no "inodes 78%" beside it.
+    expect(screen.getByText("15.6/20 GiB · 78%")).toBeTruthy();
+    expect(screen.queryByText(/inodes/)).toBeNull();
+  });
+
   it("fills the dind bar by the bytes ratio when bytes are the fuller dimension", () => {
     render(
       <WorkerStatGauges
@@ -246,6 +274,12 @@ describe("WorkerStatGauges: docker-tier dind volume (issue #1759)", () => {
     expect(screen.getByText("15.6/20 GiB · 78%")).toBeTruthy();
     // The label explains what "dind" is.
     expect(screen.getByText("Disk dind").getAttribute("title")).toMatch(/docker daemon data/);
+    // ...and assistive tech gets the same explanation as the bar's description.
+    const describedBy = dind.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    expect(document.getElementById(describedBy!)?.textContent).toMatch(/docker daemon data/);
+    // Only hinted bars carry a description.
+    expect(screen.getByRole("progressbar", { name: "CPU" }).hasAttribute("aria-describedby")).toBe(false);
   });
 
   it("fills the dind bar by the inode ratio and says so when inodes dominate", () => {

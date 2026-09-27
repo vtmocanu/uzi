@@ -493,8 +493,9 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	h.overlayOutbox(&dto, updated.ID)
 	// Custody flag (issue #1759): whether this worker still holds an OPEN durable-recovery
 	// custody hold, i.e. keeps the only local copy of work a run could not publish. The
-	// docker-tier worker reads it off this response to decide whether a destructive
-	// `docker system prune` of its dind-data volume is allowed. FAIL CLOSED: on a query
+	// docker-tier worker reads it off this response to decide whether its allowlisted
+	// image/build-cache prune of the dind-data volume is allowed (never a volume or system
+	// prune). FAIL CLOSED: on a query
 	// error we log and report TRUE, so a transient DB fault can only make the worker skip
 	// a prune (recoverable: the next heartbeat retries), never let it destroy retained
 	// work. The owner is the authenticated worker row's own user_id.

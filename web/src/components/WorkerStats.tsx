@@ -8,6 +8,7 @@
 // to 100% regardless of the stored value (the server accepts up to 6400% cpu_pct),
 // and label a process-source sample "worker process only".
 
+import { useId } from "react";
 import { cx } from "./ui";
 import { MeterTrack } from "./Meter";
 import type { Worker } from "../lib/api";
@@ -51,7 +52,8 @@ function pctOf(used: number, limit: number | null): number | null {
 
 /** One reported disk volume. `pct` is the bar fill: the bytes ratio, or the inode ratio
  *  when that is fuller (only the dind volume reports inodes). `inodePct` is set only when
- *  the inode ratio exceeds the bytes ratio, i.e. exactly when it explains the fill. */
+ *  the ROUNDED inode percent exceeds the rounded bytes percent, i.e. exactly when it
+ *  explains the displayed fill (78.2% bytes / 78.4% inodes is not "78% · inodes 78%"). */
 interface DiskVolume {
   label: string;
   hint?: string;
@@ -65,9 +67,10 @@ interface DiskVolume {
 /** The disk volumes a worker reports: /nix and /data (PRD #837), plus the docker-tier
  *  DinD data root (issue #1759). A volume is "present" only when BOTH its used and total
  *  bytes are non-null — they arrive as a pair — so a worker can report any subset
- *  independently of the mem sample. total is positive when present, so pctOf never
- *  falls back to null here. The dind volume also carries an inode pair; a malformed one
- *  (either side null, or a zero total) is ignored rather than skewing the bar. */
+ *  independently of the mem sample. A present volume with a zero (or negative) total has
+ *  no meaningful ratio, so pctOf returns null and the volume is skipped rather than drawn
+ *  as an empty bar. The dind volume also carries an inode pair; a malformed one (either
+ *  side null, or a zero total) is ignored rather than skewing the bar. */
 function diskVolumes(w: Worker): DiskVolume[] {
   const out: DiskVolume[] = [];
   const vols: { label: string; hint?: string; used: number | null; total: number | null; inodes?: number | null; totalInodes?: number | null }[] = [
@@ -87,7 +90,9 @@ function diskVolumes(w: Worker): DiskVolume[] {
     const bytesPct = pctOf(used, total);
     if (bytesPct == null) continue;
     const rawInodePct = inodes == null ? null : pctOf(inodes, totalInodes ?? null);
-    const inodePct = rawInodePct != null && rawInodePct > bytesPct ? rawInodePct : null;
+    // Compare what is displayed, not the raw ratios: inodes "dominate" only when they
+    // would read as a higher whole percent than the bytes beside them.
+    const inodePct = rawInodePct != null && Math.round(rawInodePct) > Math.round(bytesPct) ? rawInodePct : null;
     out.push({ label, hint, used, total, bytesPct, inodePct, pct: inodePct ?? bytesPct });
   }
   return out;
@@ -110,7 +115,10 @@ function Bar({ label, hint, value, valueText, fillPct }: { label: string; hint?:
   // The label row; MeterTrack (shared with the PRD #53 rate-limit meters) is the
   // accessible bar itself, keying tone/width/aria-valuenow off one clamped, rounded
   // integer. valueText is read by a screen reader instead of the bare "N percent":
-  // the byte figures for memory, and "no reading yet" for a first-tick CPU.
+  // the byte figures for memory, and "no reading yet" for a first-tick CPU. A hint is a
+  // hover title for sighted users and, via aria-describedby on the bar, a description for
+  // assistive tech (the accessible name stays the bare label).
+  const hintId = useId();
   return (
     <div>
       <div className="flex items-center justify-between text-xs">
@@ -121,7 +129,18 @@ function Bar({ label, hint, value, valueText, fillPct }: { label: string; hint?:
         </span>
         <span className="tabular-nums text-muted">{value}</span>
       </div>
-      <MeterTrack className="mt-1 h-1.5" label={label} fillPct={fillPct} valueText={valueText} />
+      <MeterTrack
+        className="mt-1 h-1.5"
+        label={label}
+        fillPct={fillPct}
+        valueText={valueText}
+        describedBy={hint ? hintId : undefined}
+      />
+      {hint && (
+        <span id={hintId} className="sr-only">
+          {hint}
+        </span>
+      )}
     </div>
   );
 }
