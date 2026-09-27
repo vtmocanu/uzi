@@ -539,6 +539,9 @@ workers:
   #   reviewer dissent; the drain-first + cooldown + ephemeral-exclusion guards make it
   #   safe). Set false to observe pressure without any automated teardown. Always sent
   #   explicitly (it is not `with`-gated), so an explicit false is honoured.
+  #   Also gates the docker-tier DinD build-cache prune (issue #1759, ADR-1759): the
+  #   same flag renders UZI_DIND_PRUNE_ENABLED into docker workers, so flipping it
+  #   rolls every non-ephemeral docker worker's pod, not only the /nix+/data recycle.
   diskRecycleEnabled: true
   # diskRecycleCooldown: the PVC-age thrash guard (Decision D6). A worker back at pressure
   #   within this window is a CAPACITY problem (working set exceeds nixSize) — it is

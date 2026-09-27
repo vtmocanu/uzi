@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **A docker-capable hosted worker now shows how full its DinD build cache is, and prunes it on its own ([#1759](https://github.com/vtmocanu/uzi/issues/1759)).**
+  A new unprivileged `dind-meter` sidecar samples the `dind-data` volume's used/total bytes and inodes and reports them as a "Disk dind" gauge next to the existing disk bars; the worker itself still never mounts that volume. When the sample stays under pressure while the worker is provably idle and the api confirms it holds no unpublished work, the worker runs a short allowlisted `docker image`/`builder prune` sequence against its own daemon — never touching volumes or containers, and never feeding the existing `/nix`+`/data` disk-pressure recycle. The gate rides the same `UZI_WORKER_DISK_RECYCLE_ENABLED` toggle as that recycle, so upgrading to this release, or flipping the toggle, rolls every non-ephemeral docker worker's pod once for the new sidecar. See [ADR-1759](adr/1759-dind-data-metering-and-prune.md).
+
 ### Changed
 
 - **A requeued run can resume its own held work even when you are at the recovery-hold limit ([#1751](https://github.com/vtmocanu/uzi/issues/1751)).**

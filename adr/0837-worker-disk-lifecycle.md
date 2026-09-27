@@ -66,6 +66,8 @@ The multi-phase machine deletes the old PVC **before** the new one is re-minted.
 
 The docker-tier `dind-data` PVC (the build/image cache on a docker-capable hosted worker) is neither metered nor recycled in v1 — M1 samples only `/nix` and `/data`. It is the volume most likely to fill on a docker-tier worker, and `disk_pressure` can never fire on it. Documented as a deliberate v1 boundary and fast-follow (meter it in a later pass, then the existing M4 arm can act on it without further design work), not a regression.
 
+**Update (issue #1759):** the metering half of this gap is closed — a `dind-meter` sidecar now samples `dind-data` and the worker runs a gated, allowlisted cache prune under pressure — but `disk_pressure` still never sees this volume and there is still no recycle of the PVC itself; see [ADR-1759](1759-dind-data-metering-and-prune.md).
+
 ## Consequences
 
 - Disk joins CPU/memory as a first-class, display-only worker metric; the `stats_disk_*` columns must stay out of every scheduling/claim/assignment/sweeper query, exactly like the existing `stats_*` columns.

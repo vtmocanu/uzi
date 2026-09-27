@@ -516,6 +516,7 @@ Tracked as GitLab issue vtmocanu/uzi#83; PRD at `prds/done/83-docker-capable-wor
 - Trust model: trust the USER who owns the worker, not the repo code the agent runs (prompt-injectable). Security compromises allowed to cut complexity; agent-facing defenses stay load-bearing. [user]
 - k8s is the first-class test/runtime environment (not the deferred track). [user]
 - k8s docker posture: a dedicated privileged-tier namespace running the rootless-DinD sidecar. [user, Q-B owner decision]
+- dind-data is metered and cache-pruned automatically under an exclusion gate; never volumes; never feeds the /nix+/data recycle. (AI-synced 2026-09-27)
 
 ## Feature #95 — Run activity pane v2: crew roster, opt-in follow, steer-queue delivery
 
