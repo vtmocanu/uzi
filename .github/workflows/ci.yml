@@ -366,6 +366,27 @@ jobs:
       - name: test:web (vitest --coverage)
         run: task test:web
 
+  # Layout tests in real headless Chromium (vitest browser mode); jsdom in test-web cannot
+  # see wrapping or overflow. The browser version is pinned by web's `playwright` devDependency.
+  test-web-browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: ./.github/actions/setup-task
+      - name: npm ci
+        working-directory: web
+        run: npm ci
+      - name: install headless Chromium
+        working-directory: web
+        run: npx playwright install --with-deps --only-shell chromium
+      - name: test:web-browser (vitest browser mode)
+        run: task test:web-browser
+
   # -------------------------------------------------------------- Node agent ----
   validate-agent:
     runs-on: ubuntu-latest
@@ -641,7 +662,7 @@ jobs:
   # Context is the repo ROOT: web/Dockerfile COPYs both web/ and docs/.
   build-web:
     runs-on: ubuntu-latest
-    needs: [changes, validate-web, test-web]
+    needs: [changes, validate-web, test-web, test-web-browser]
     if: needs.changes.outputs.web == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -658,7 +679,7 @@ jobs:
   # inputs as build-web; validation-only, never published.
   build-web-mock:
     runs-on: ubuntu-latest
-    needs: [changes, validate-web, test-web]
+    needs: [changes, validate-web, test-web, test-web-browser]
     if: needs.changes.outputs.web == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
