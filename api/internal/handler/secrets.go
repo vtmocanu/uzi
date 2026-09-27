@@ -1179,7 +1179,10 @@ func (h *Handler) deleteCodexSecretByID(w http.ResponseWriter, r *http.Request, 
 	})
 	if err != nil {
 		if errors.Is(err, errSecretTransitionConflict) {
-			httpx.Error(w, http.StatusConflict, err.Error())
+			// PRD #1732 D12: deleting the default is fixed by picking a new default, which is
+			// the advice the Anthropic twin (DeleteAnthropicTokenByID) gives.
+			httpx.Error(w, http.StatusConflict,
+				"cannot delete the default credential while other enabled credentials exist; set another credential as default first")
 			return
 		}
 		slog.Error("delete codex secret by id", "error", err)

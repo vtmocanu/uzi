@@ -12,6 +12,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // ResumeRunNow manually resumes ONE run the owner holds: a pool_wait hold (PRD #754 M5) or a
@@ -77,6 +78,12 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 			if errors.Is(err, pgx.ErrNoRows) {
 				if run.HoldReason.Valid && run.HoldReason.String == "budget_exhausted" {
 					httpx.Error(w, http.StatusConflict, fmt.Sprintf("this run is out of time; extend it to resume: uzi run extend %s --by 2h", runID))
+					return
+				}
+				// PRD #1732 D12: ResumePausedRun refuses every credential_disabled hold
+				// (hold_reason IS DISTINCT FROM 'credential_disabled'), so name the fix, not the race text.
+				if run.HoldReason.Valid && run.HoldReason.String == "credential_disabled" {
+					httpx.Error(w, http.StatusConflict, workersvc.ErrCredentialDisabled.Error())
 					return
 				}
 				httpx.Error(w, http.StatusConflict, "run is no longer paused")

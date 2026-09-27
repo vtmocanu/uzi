@@ -676,6 +676,37 @@ func TestDeleteCodexForeignIdIs404(t *testing.T) {
 	}
 }
 
+// TestDeleteCodexDefaultWithEnabledSiblingNamesNewDefault (PRD #1732 D12): deleting the Codex
+// default while another enabled Codex credential exists is a 409 whose advice is to set another
+// credential as default, mirroring the Anthropic twin; the default survives.
+func TestDeleteCodexDefaultWithEnabledSiblingNamesNewDefault(t *testing.T) {
+	db := newFakeCodexDB()
+	defaultID := db.seed(store.KindCodexAuth, "default", true)
+	db.seed(store.KindCodexAuth, "sibling", false)
+	h := newCodexHandler(t, db)
+
+	rec := httptest.NewRecorder()
+	h.DeleteCodexAuthByID(rec, codexReq(t, http.MethodDelete,
+		"/api/me/secrets/codex_auth/"+defaultID.String(), "", uuid.New(), defaultID.String()))
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := "cannot delete the default credential while other enabled credentials exist; set another credential as default first"
+	if body.Error != want {
+		t.Fatalf("409 message = %q, want %q", body.Error, want)
+	}
+	if _, ok := db.secrets[defaultID]; !ok {
+		t.Fatal("a refused delete must keep the default")
+	}
+}
+
 func TestDeleteAnthropicDefaultCountsEnabledSiblings(t *testing.T) {
 	for _, byID := range []bool{false, true} {
 		for _, disabledDefault := range []bool{false, true} {
