@@ -15,6 +15,7 @@ import {
   type StandaloneModeDeps,
   type StandaloneModeProcess,
 } from "../src/codex/launcher.js";
+import { workerSpawnEnv } from "../src/worker-spawn-mark.js";
 
 // Issue #1598 M5 — the worker side of the three standalone supervisor modes
 // (--reap-orphans, --hold-cache, --remove-cache). NO real supervisor: a fake process
@@ -125,7 +126,8 @@ describe("reapCodexCommandOrphans", () => {
     const call = f.calls[0]!;
     assert.equal(call.command, SUPERVISOR_BIN);
     assert.deepEqual(call.args, ["--reap-orphans", "--expect-uid", String(COMMAND_UID), "--cache-root", CODEX_COMMAND_CACHE_ROOT]);
-    assert.deepEqual(call.env, { PATH: "/usr/bin:/bin", LANG: "C" }, "nothing from the worker env crosses");
+    // issue #1783 (R4): the worker spawn mark is the one added key.
+    assert.deepEqual(call.env, workerSpawnEnv({ PATH: "/usr/bin:/bin", LANG: "C" }), "nothing from the worker env crosses");
     assert.deepEqual(call.stdio, ["ignore", "pipe", "ignore"]);
   });
 

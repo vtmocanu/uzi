@@ -916,9 +916,11 @@ describe("RunRunner m4 — Claude/stub legacy path is byte-unchanged", () => {
     await runnerWith(() => ({ executor: legacy }), gitlab).execute(claim);
     assert.equal(calls.length, 1, "the MR opened exactly as before (finalize wrapper is a plain call)");
     assert.ok(statuses(claim.run_id).includes("completed"), "the run completed");
-    // The security-boundary reap fired EXACTLY once (per the untouched killAgentTree at the
-    // boundary). `=== 1` — not `>= 1` — guards the double-reap hazard: if withCodexBoundaryOnly's
-    // legacy branch erroneously re-reaped, this would be 2.
-    assert.equal(kills.length, 1, "the legacy killAgentTree reap fired exactly once at the security boundary");
+    // The security-boundary reap fired once (per the untouched killAgentTree at the boundary),
+    // plus exactly one more per issue #1783 quiescence proof, whose first step is the same literal
+    // killAgentTree: the finalize boundary and the terminal retire. `=== 3` — not `>= 3` — still
+    // guards the double-reap hazard: if withCodexBoundaryOnly's legacy branch erroneously
+    // re-reaped, this would be 4.
+    assert.equal(kills.length, 3, "security boundary + finalize quiescence + terminal-retire quiescence");
   });
 });

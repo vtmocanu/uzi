@@ -2368,6 +2368,18 @@ tasks:
     cmds:
       - ./e2e/home-uid-split/run.sh
 
+  test:clone-quiescence:
+    desc: Opt-in run the run-quiescence reaper suite as the worker uid under the real uid split (#1783)
+    # Builds the base worker image and runs e2e/clone-quiescence/fixture.test.ts through its
+    # root entrypoint under compose's hardened cap set, so the reaper's scan and kills run in
+    # the runner-uid helper via the real setpriv wrapper, next to real worker, root and
+    # runner-cmd processes. A host or single-uid run cannot manufacture that uid split, which
+    # is why this is not a unit test. Requires a working docker daemon. NOT wired into gate.
+    # Set CQ_SKIP_BUILD=1 CQ_IMAGE=<tag> to reuse an image, CQ_MOUNT_SRC=1 to test this
+    # tree's agent/src against it, and CQ_BUILD_ARGS="--network host" where the build needs it.
+    cmds:
+      - ./e2e/clone-quiescence/run.sh
+
   test:provision-path-split:
     desc: Opt-in build and run the worker-image provision PATH and Codex command fixture (#1685)
     # Separate build and fixture targets permit reusing an existing image after source edits.

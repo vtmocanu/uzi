@@ -769,6 +769,11 @@ export class SdkExecutor implements Executor {
     this.deadCliPids.clear();
   }
 
+  /** issue #1783 (R0): the CLI process-group roots not yet reaped (see Executor.recordedRootPids). */
+  recordedRootPids(): number[] {
+    return [...this.spawnedPids];
+  }
+
   /**
    * Log every dropped skill as a run message (PRD #16): the server's assembly
    * drops that rode the claim (ctx.skillsDropped — shadowed / over-limit) plus the
@@ -990,7 +995,9 @@ export class SdkExecutor implements Executor {
     // the prompt's consumer is the agent that will actually run the gates.
     let depsTruncated = false;
 
-    const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost);
+    // issue #1783 (R2): the runner's attempt marker rides the CLI env, so every process the
+    // agent starts is positively attributable to this attempt by the quiescence reaper.
+    const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt);
     // PRD #122 M2: `let`, not `const` — the implement loop raises it to the server's
     // milestone-scaled ceiling when the state-report ACK serves one (Decisions 5/5b). The
     // claim config already carries the scaled value on a RESUME (the run is frozen); the

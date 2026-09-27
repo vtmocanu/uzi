@@ -10,6 +10,7 @@ import type { Readable } from "node:stream";
 import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
 import { RUNNER_UID, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
+import { workerSpawnEnv } from "./worker-spawn-mark.js";
 import { withForgeRetry } from "./forge-retry.js";
 
 import {
@@ -4719,7 +4720,8 @@ export class GitCache {
    */
   private async runGitAsRunner(cwd: string | undefined, args: string[]): Promise<string> {
     const base = gitEnv();
-    const env: NodeJS.ProcessEnv = { ...base, PATH: runnerPath() };
+    // issue #1783 (R4): worker-marked, so a concurrent reap never kills the worker's own git.
+    const env: NodeJS.ProcessEnv = workerSpawnEnv({ ...base, PATH: runnerPath() });
     const tmp = runnerTmpdir();
     if (tmp) env.TMPDIR = tmp;
     // A permit-scoped subprocess is already launched as the isolated command uid

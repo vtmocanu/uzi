@@ -27,6 +27,7 @@
 // single-uid, and the #51 containment does not apply there (the #58 accepted posture).
 
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { workerSpawnEnv } from "./worker-spawn-mark.js";
 
 /** The OS user the untrusted execution surfaces run as under the split. */
 const RUNNER_USER = "runner";
@@ -231,7 +232,7 @@ export function killRunnerGroup(pid: number | undefined): boolean {
     }
   }
   // Fall back to the single pid (a non-group-leader child) as `runner`.
-  const r2 = spawnSync(SETPRIV, [...setprivRunnerArgs(), "kill", "-KILL", `${pid}`], { stdio: "ignore" });
+  const r2 = spawnSync(SETPRIV, [...setprivRunnerArgs(), "kill", "-KILL", `${pid}`], { env: workerSpawnEnv(), stdio: "ignore" });
   return r2.status === 0;
 }
 
@@ -254,6 +255,6 @@ export function killRunnerGroupOnly(pgid: number): boolean {
     }
   }
   // Split: reap as `runner` via setpriv. `kill -KILL -<pgid>` targets the process group.
-  const r = spawnSync(SETPRIV, [...setprivRunnerArgs(), "kill", "-KILL", `-${pgid}`], { stdio: "ignore" });
+  const r = spawnSync(SETPRIV, [...setprivRunnerArgs(), "kill", "-KILL", `-${pgid}`], { env: workerSpawnEnv(), stdio: "ignore" });
   return r.status === 0;
 }

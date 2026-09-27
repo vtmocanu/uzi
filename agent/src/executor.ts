@@ -33,6 +33,8 @@ import { provisionRunTools } from "./provision-run.js";
 import type { provisionTools } from "./provision.js";
 import { AGENT_GIT_IDENTITY, gitEnv } from "./git.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
+import type { SdkAttemptEnv } from "./sdk-env.js";
+import { workerSpawnEnv } from "./worker-spawn-mark.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -125,6 +127,10 @@ export interface RunContext {
   pipeline?: ClaimPipeline | null;
   /** Checked-out worktree the executor edits and commits in (local only). */
   worktreePath: string;
+  /** issue #1783 (R2): this execution attempt's marker, which the SDK executor emits into
+   *  the agent CLI's env (buildSdkEnv) so the run-quiescence reaper can attribute every
+   *  process the agent starts. Absent ⇒ no marker (the stub and Codex executors ignore it). */
+  runAttempt?: SdkAttemptEnv;
   branch: string;
   /** The commit `branch` was cut from in the runner clone (git.ts `RunnerClone.baseCommit`).
    *  The executor states it in the lead's prompts so the lead does not have to infer the
@@ -764,6 +770,11 @@ export interface Executor {
    * it; the SDK executor also self-reaps in its own run() finally.
    */
   killAgentTree?(): void;
+  /** issue #1783 (R0): the root pids of the agent processes this executor has spawned and not
+   *  yet reaped (the CLI process groups). The run-quiescence reaper attributes an unreadable
+   *  runner-uid process to ANOTHER live attempt by ancestry to one of these. Optional: an
+   *  executor without it contributes no roots. */
+  recordedRootPids?(): number[];
   /** M3 (PRD #1171): a Codex-selected executor supplies this outer safety facade;
    * absence preserves Claude/stub callers (they take the literal legacy killAgentTree branch). */
   safety?: CodexExecutionSafety;
@@ -1642,7 +1653,13 @@ export class StubExecutor implements Executor {
     // Commit identity rides the caller's `-c` flags, which survive the setpriv `--`
     // passthrough. Single-uid (#58 / no split): runnerCommand is a passthrough and
     // runnerPath/runnerTmpdir fall back to the ambient PATH/TMPDIR — a plain git.
-    const env: NodeJS.ProcessEnv = { ...gitEnv(), PATH: runnerPath() };
+    //
+    // issue #1783 (R4): worker-marked. This git runs inside the stub's own run() body (the
+    // stub's stand-in for the agent turn), awaited to completion before run() returns, so it
+    // is neither pre-turn nor in a gated sink; it can never overlap the post-run quiescence
+    // scan, which starts only after run() returned. The mark keeps it out of the reaper's
+    // attribution regardless.
+    const env: NodeJS.ProcessEnv = workerSpawnEnv({ ...gitEnv(), PATH: runnerPath() });
     const tmp = runnerTmpdir();
     if (tmp) env.TMPDIR = tmp;
     const wrapped = runnerCommand("git", ["-C", cwd, ...args]);

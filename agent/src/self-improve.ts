@@ -14,6 +14,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { killRunnerGroup, runnerCommand } from "./runner-uid.js";
+import { workerSpawnEnv } from "./worker-spawn-mark.js";
 import { buildCheckEnv } from "./sdk-env.js";
 
 // Re-exported so the existing importers (runner.ts, the tests) keep one obvious home for
@@ -236,7 +237,8 @@ export function defaultCheckRunner(env: NodeJS.ProcessEnv, timeoutMs = 15 * 60 *
       // `stdio: "ignore"` keeps the no-output-capture property STRUCTURAL rather than
       // disciplinary — stronger than execFile's buffer-then-discard, and it also retires a
       // `maxBuffer` that would have killed a merely-verbose passing suite.
-      const child = spawn(wc.command, wc.args, { cwd, env, detached: true, stdio: "ignore" });
+      // issue #1783 (R4): worker-marked — the check is the worker's own finalize-time op.
+      const child = spawn(wc.command, wc.args, { cwd, env: workerSpawnEnv(env), detached: true, stdio: "ignore" });
       const timer = setTimeout(() => {
         timedOut = true;
         killRunnerGroup(child.pid);

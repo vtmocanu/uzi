@@ -30,14 +30,14 @@ case "$action" in
     src_dir="${CODEX_GIT_TRUST_SRC_DIR:-$repo/agent/src}"
     source_args=()
     if [ "${CODEX_GIT_TRUST_MOUNT_SRC:-0}" = 1 ] || [ -n "${CODEX_GIT_TRUST_SRC_DIR:-}" ]; then
-      source_args=(-v "$src_dir:/app/src:ro" -e CODEX_GIT_TRUST_SRC=/app/src)
+      source_args=(--mount "type=bind,src=$src_dir,dst=/app/src,readonly" -e CODEX_GIT_TRUST_SRC=/app/src)
     fi
     # CODEX_GIT_TRUST_BIN_DIR mounts this tree's statically built uzi-codex-supervisor,
     # uzi-codex-fileop and uzi-codex-command-sandbox over an OLDER image's copies, whose launch
     # protocol can lag a mounted agent/src. The image's base layers (git, node) stay the image's.
     if [ -n "${CODEX_GIT_TRUST_BIN_DIR:-}" ]; then
       for bin in uzi-codex-supervisor uzi-codex-fileop uzi-codex-command-sandbox; do
-        source_args+=(-v "$CODEX_GIT_TRUST_BIN_DIR/$bin:/usr/local/bin/$bin:ro")
+        source_args+=(--mount "type=bind,src=$CODEX_GIT_TRUST_BIN_DIR/$bin,dst=/usr/local/bin/$bin,readonly")
       done
     fi
     set +e
@@ -46,7 +46,7 @@ case "$action" in
       --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
       --security-opt no-new-privileges --tmpfs /data \
       --entrypoint /usr/local/sbin/uzi-entrypoint \
-      -v "$here:/work/codex-git-trust:ro" "${source_args[@]}" \
+      --mount "type=bind,src=$here,dst=/work/codex-git-trust,readonly" "${source_args[@]}" \
       --name "$name" "$image" /bin/sh -c \
       'cd /app && exec /usr/local/bin/node --import tsx /work/codex-git-trust/fixture.ts'
     rc=$?

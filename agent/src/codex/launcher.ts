@@ -46,6 +46,7 @@ import {
   uidSplitActive,
   workerBoundaryCommand,
 } from "../runner-uid.js";
+import { workerSpawnEnv } from "../worker-spawn-mark.js";
 import {
   assertNoUnexpectedSystemConfig as defaultAssertNoUnexpectedSystemConfig,
   buildCodexConfigToml,
@@ -340,7 +341,8 @@ function defaultMakeRunnerTrees(request: RunnerTreeRequest): void {
   // The helper itself runs as the shared runner uid, so it must not inherit the worker
   // process environment: another concurrent runner can read a normal helper process via
   // /proc/<pid>/environ. Only inert locale/path values cross this short provisioning step.
-  const provisionEnv: NodeJS.ProcessEnv = { PATH: "/usr/bin:/bin", LANG: "C" };
+  // issue #1783 (R4): plus the worker spawn mark (inert, never an attempt marker).
+  const provisionEnv: NodeJS.ProcessEnv = workerSpawnEnv({ PATH: "/usr/bin:/bin", LANG: "C" });
   const wrap = request.kind === "command" ? commandRootCommand : runnerCommand;
   const mk = wrap("/bin/sh", [
     "-ceu",
@@ -372,12 +374,12 @@ function defaultMakeRunnerTrees(request: RunnerTreeRequest): void {
         shared.sessionDir,
       ]);
       const seeded = spawnSync(seed.command, seed.args, {
-        env: {
+        env: workerSpawnEnv({
           PATH: "/usr/local/bin:/usr/bin:/bin",
           LANG: "C",
           HOME: join(request.root, "home"),
           TMPDIR: join(request.root, "tmp"),
-        },
+        }),
         stdio: ["ignore", "ignore", "pipe"],
       });
       if (seeded.status !== 0) {
@@ -411,7 +413,7 @@ function defaultRemoveRunnerTree(request: Pick<RunnerTreeRequest, "uid" | "kind"
   }
   const wrap = request.kind === "command" ? commandRootCommand : runnerCommand;
   const rm = wrap("/bin/rm", ["-rf", "--", request.root]);
-  const cleanupEnv: NodeJS.ProcessEnv = { PATH: "/usr/bin:/bin", LANG: "C" };
+  const cleanupEnv: NodeJS.ProcessEnv = workerSpawnEnv({ PATH: "/usr/bin:/bin", LANG: "C" }); // issue #1783 (R4)
   const result = spawnSync(rm.command, rm.args, { env: cleanupEnv, stdio: ["ignore", "ignore", "pipe"] });
   if (result.status !== 0) {
     throw new Error(`runner-owned tree removal failed (exit ${String(result.status)}): ${String(result.stderr)}`);
@@ -660,9 +662,10 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   const wrapped = spec.kind === "command"
     ? commandRootCommand(spec.supervisorBin, supervisorArgv)
     : runnerCommand(spec.supervisorBin, supervisorArgv);
+  // issue #1783 (R4): every launcher spawn carries the worker mark (never an attempt marker).
   const child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
     cwd: spec.cwd,
-    env: replacedEnv,
+    env: workerSpawnEnv(replacedEnv),
     stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
   });
 
@@ -728,7 +731,7 @@ export async function launchCodexEffectRoot(
     : workerBoundaryCommand(spec.supervisorBin, supervisorArgv);
   const child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
     cwd: spec.cwd,
-    env: { ...spec.env },
+    env: workerSpawnEnv(spec.env), // issue #1783 (R4): worker mark
     stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
   });
   return createHandle(child, expectedUid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, "command");
@@ -1075,7 +1078,7 @@ function defaultKillAsCommandUid(pid: number, runKill: NonNullable<StandaloneMod
 }
 
 const defaultRunKill: NonNullable<StandaloneModeDeps["runKill"]> = (command, args) =>
-  spawnSync(command, [...args], { env: STANDALONE_MODE_ENV, stdio: "ignore", timeout: 10_000 });
+  spawnSync(command, [...args], { env: workerSpawnEnv(STANDALONE_MODE_ENV), stdio: "ignore", timeout: 10_000 });
 
 function spawnStandaloneMode(
   mode: "--reap-orphans" | "--hold-cache" | "--remove-cache",
@@ -1092,7 +1095,7 @@ function spawnStandaloneMode(
   const wrapped = commandRootCommand(SUPERVISOR_BIN, args);
   return (deps.spawn ?? defaultSpawnStandaloneMode)(wrapped.command, wrapped.args, {
     cwd: "/",
-    env: { ...STANDALONE_MODE_ENV },
+    env: workerSpawnEnv(STANDALONE_MODE_ENV), // issue #1783 (R4): worker mark
     stdio: [stdin, "pipe", "ignore"],
   });
 }

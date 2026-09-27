@@ -25,7 +25,7 @@ case "$action" in
     fi
     source_args=()
     if [ "${PROVISION_SPLIT_MOUNT_SRC:-0}" = 1 ]; then
-      source_args=(-v "$repo/agent/src:/app/src:ro" -e PROVISION_SPLIT_SRC=/app/src)
+      source_args=(--mount "type=bind,src=$repo/agent/src,dst=/app/src,readonly" -e PROVISION_SPLIT_SRC=/app/src)
     fi
     set +e
     timeout --kill-after=10s "${PROVISION_SPLIT_TIMEOUT:-120}" docker run --rm --network none \
@@ -33,7 +33,7 @@ case "$action" in
       --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
       --security-opt no-new-privileges --tmpfs /data \
       --entrypoint /usr/local/sbin/uzi-entrypoint \
-      -v "$here:/work/provision-path-split:ro" "${source_args[@]}" \
+      --mount "type=bind,src=$here,dst=/work/provision-path-split,readonly" "${source_args[@]}" \
       --name "$name" "$image" /bin/sh -c \
       'cd /app && exec /usr/local/bin/node --import tsx /work/provision-path-split/fixture.ts'
     rc=$?

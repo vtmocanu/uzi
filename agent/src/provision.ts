@@ -46,6 +46,7 @@ import { promisify } from "node:util";
 import type { Logger } from "./log.js";
 import { errMessage } from "./util.js";
 import { commandRootCommand, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
+import { workerSpawnEnv } from "./worker-spawn-mark.js";
 import { withRetry, classifyDevboxError, DEVBOX_RETRY_SCHEDULE } from "./forge-retry.js";
 
 const execFileAsync = promisify(execFile);
@@ -109,7 +110,8 @@ const defaultRun = async (
   const wrapped = runnerCommand(cmd, args);
   const { stdout, stderr } = await execFileAsync(wrapped.command, wrapped.args, {
     cwd: opts.cwd,
-    env: opts.env,
+    // issue #1783 (R4): worker-marked (a pre-turn provisioning op, never run-owned).
+    env: workerSpawnEnv(opts.env),
     // Provisioning can be slow on a cold nix store; bounded so a hung fetch fails
     // the run rather than wedging the worker.
     timeout: 10 * 60_000,
@@ -200,8 +202,9 @@ async function defaultPathProbe(
   args: string[],
   opts: { cwd: string; env: NodeJS.ProcessEnv },
 ): Promise<RunResult> {
+  // issue #1783 (R4): worker-marked (a pre-turn PATH probe, never run-owned).
   const { stdout, stderr } = await execFileAsync(cmd, args, {
-    cwd: opts.cwd, env: opts.env, timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
+    cwd: opts.cwd, env: workerSpawnEnv(opts.env), timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
   });
   return { stdout, stderr };
 }

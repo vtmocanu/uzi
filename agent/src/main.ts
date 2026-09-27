@@ -466,6 +466,8 @@ async function main(): Promise<void> {
     gapFillMax: config.gapFillMax,
     // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
     activeRuns,
+    // issue #1783: the Docker endpoint the run-quiescence teardown removes clone-bound containers on.
+    dockerHost: config.dockerWiring.dockerHost,
   });
 
   // The chat lane (PRD #39). Per-session executor factory (PRD #42 Decision 4): each

@@ -229,6 +229,11 @@ const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   "AGENT_BROWSER_ARGS",
+  // issue #1783: the run-attempt marker and worker spawn mark sdk-env.ts protects too.
+  "UZI_RUN_ATTEMPT",
+  "UZI_RUN_CLONE",
+  "UZI_RUN_CLONE_KEY",
+  "UZI_WORKER_SPAWN",
 ]);
 
 /** Issue #1598: whether `key` is a cache variable commandEffectSpec alone owns (set to the

@@ -17,6 +17,17 @@ import type { Executor, ExecutorResult, RunContext, WallParkOutcome, WallParkRef
 import { PlanRejectedError } from "./executor.js";
 import type { BoundaryPermit, BoundaryRequest } from "./harness.js";
 import { SinkGate } from "./sink-gate.js";
+import { cloneKeyOf } from "./attempt-path.js";
+import {
+  LiveAttemptRegistry,
+  describeProcesses,
+  newRunAttempt,
+  quiesceRunAttempt,
+  type QuiesceMode,
+  type QuiesceRunOutcome,
+  type QuiesceRunRequest,
+  type RunAttempt,
+} from "./run-quiescence.js";
 import {
   TickSpawner,
   processGroupAlive,
@@ -475,6 +486,23 @@ class RunningAckTerminalError extends Error {
   }
 }
 
+/** issue #1783: the failure-reason prefix of a run whose finalize boundary could not prove the
+ *  clone quiescent (a run-owned process survived the reap, or its attribution was unverifiable).
+ *  failOriginForReason maps it to the fail_origin `worker_residue_blocked`. */
+export const REASON_WORKER_RESIDUE_BLOCKED = "worker_residue_blocked";
+
+/**
+ * issue #1783: the run's clone is not provably quiescent at a boundary that must not proceed
+ * without it. At finalize it fails the run (fail_origin `worker_residue_blocked`, the clone kept);
+ * at a park it means the credentialed sink body was skipped (nothing published, the park stands).
+ */
+class RunResidueBlockedError extends Error {
+  constructor(readonly detail: string) {
+    super(`${REASON_WORKER_RESIDUE_BLOCKED}: the run's clone could not be proven quiescent (${detail}); the clone is kept for inspection`);
+    this.name = "RunResidueBlockedError";
+  }
+}
+
 /** Map a known failure-reason CONSTANT to the server's fail_origin enum (PRD #69
  *  M7a). Authored WORKER-SIDE from the reason constant the throw site used — it never
  *  parses free text: it matches only the fixed prefixes the two fatal pre-start
@@ -488,6 +516,7 @@ export function failOriginForReason(rawReason: string): string | undefined {
   if (rawReason.startsWith(REASON_PROVISION_FAILED)) return "provisioning_failed";
   if (rawReason.startsWith(REASON_NO_TOKEN)) return "credential_unavailable";
   if (rawReason === REASON_PLAN_MISSING) return "plan_missing";
+  if (rawReason.startsWith(`${REASON_WORKER_RESIDUE_BLOCKED}: `)) return "worker_residue_blocked";
   return undefined;
 }
 
@@ -942,6 +971,9 @@ interface RunFlight {
   preClonePark: boolean;
   /** Retain the only copy of unverified recovery work; never guard non-filesystem cleanup. */
   preserveRecoveryClone: boolean;
+  /** issue #1783 (R2): this flight's execution attempt (its marker rides the agent CLI env), in
+   *  the runner's live-attempt set from before the CLI spawns until the terminal finally. */
+  attempt: RunAttempt | undefined;
   /** Issue #1600: the budget off the latest REFUSED wall park's 409, held until the executor
    *  takes it (RunContext.takeWallParkRefresh). */
   wallParkRefresh?: WallParkRefresh;
@@ -1053,6 +1085,13 @@ export interface CheckpointTestHooks {
 export interface RunnerOptions {
   /** How often the steering channel polls /inputs (default 3s). */
   pollMs?: number;
+  /** issue #1783: the resolved Docker endpoint (DockerWiring.dockerHost) the run-quiescence
+   *  Docker teardown talks to. Undefined ⇒ the teardown reports `not_wired`. */
+  dockerHost?: string;
+  /** issue #1783: injected for tests; default is the real process reaper + Docker teardown. */
+  quiesceRun?: (req: QuiesceRunRequest) => Promise<QuiesceRunOutcome>;
+  /** issue #1783: the worker's live-attempt set; injected for tests (default: one per runner). */
+  liveAttempts?: LiveAttemptRegistry;
   /** Plan-approval gate cap; 0 disables (default 24h). */
   planApprovalTimeoutMs?: number;
   /** PRD #88: fallback answer deadline in ms. The claim's question_timeout_seconds
@@ -1280,6 +1319,12 @@ export class RunRunner {
    *  DURING the shutdown drain (a late claim) is aborted immediately rather than running
    *  to completion past the grace window. */
   private shuttingDownGlobal = false;
+  /** issue #1783: the live execution attempts on this worker (see run-quiescence.ts). */
+  private readonly liveAttempts: LiveAttemptRegistry;
+  /** issue #1783: the quiescence primitive (process reap + Docker teardown). */
+  private readonly quiesceImpl: (req: QuiesceRunRequest) => Promise<QuiesceRunOutcome>;
+  /** issue #1783: the Docker endpoint the teardown half talks to (undefined ⇒ not wired). */
+  private readonly dockerHost: string | undefined;
 
   constructor(
     private readonly client: WorkerClient,
@@ -1295,6 +1340,9 @@ export class RunRunner {
     opts: RunnerOptions = {},
   ) {
     this.pollMs = opts.pollMs ?? 3_000;
+    this.liveAttempts = opts.liveAttempts ?? new LiveAttemptRegistry();
+    this.quiesceImpl = opts.quiesceRun ?? ((req) => quiesceRunAttempt(req));
+    this.dockerHost = opts.dockerHost;
     this.planApprovalTimeoutMs = opts.planApprovalTimeoutMs ?? 24 * 60 * 60_000;
     this.questionTimeoutMs = opts.questionTimeoutMs ?? 24 * 60 * 60_000;
     this.gitlab = opts.gitlab ?? new GitLabClient();
@@ -1774,17 +1822,20 @@ export class RunRunner {
         // existed to fetch from. Best-effort: a park that fails is worse than a park
         // that loses work (D4), so a failed fetch-back must not undo the park.
         if (flight.parked) {
+          // issue #1783: set when the park sink could not prove the clone quiescent.
+          let parkResidueBlocked = false;
           if (flight.barePath && flight.worktreePath && flight.branch) {
           const barePath = flight.barePath;
           const worktreePath = flight.worktreePath;
           const branch = flight.branch;
           // PRD #1171 m4: route the park durability publish through the Codex reap facade.
-          // For a Claude/stub run this is the LITERAL legacy `killAgentTree` reap (belt-and-
-          // braces before we read the runner-owned clone — safe today since the executor's
-          // run() finally reaps first — kept consistent with the done/shutdown fetch-back
-          // sites) followed by the publish body, byte-for-byte. For a Codex run the facade
-          // quiesces+reaps the provider root (after its per-sink auth-mode reconcile) and holds
-          // the permit across the whole publish body.
+          // For a Claude/stub run the reap is the legacy `killAgentTree` (belt-and-braces before
+          // we read the runner-owned clone — safe today since the executor's run() finally reaps
+          // first — kept consistent with the done/shutdown fetch-back sites), now followed by the
+          // issue #1783 quiescence proof (process reap + Docker teardown) because `flight` is
+          // passed, and then the publish body, byte-for-byte. For a Codex run the facade
+          // quiesces+reaps the provider root (after its per-sink auth-mode reconcile), runs the
+          // Docker teardown, and holds the permit across the whole publish body.
           let parkPublished = false;
           try {
             await this.reapForSink(
@@ -1820,13 +1871,20 @@ export class RunRunner {
                   await this.buildCheckpointOverlay(claim, flight, barePath),
                 );
               },
+              flight,
             );
           } catch (err) {
             // A NON-boundary throw propagates exactly as before. A CodexBoundaryError means the
             // Codex boundary could not reap/publish — nothing landed on origin, the same
             // durability consequence as a publish failure (parkPublished stays false); it must
-            // NOT undo the park.
-            if (!isCodexBoundaryError(err)) throw err;
+            // NOT undo the park. issue #1783: a RunResidueBlockedError (the clone could not be
+            // proven quiescent, so the sink body never ran) is handled the same way, and it also
+            // skips the credentialed settle below: a surviving process must not see a PAT git.
+            if (err instanceof RunResidueBlockedError) {
+              parkResidueBlocked = true;
+            } else if (!isCodexBoundaryError(err)) {
+              throw err;
+            }
             runLog.warn("park checkpoint boundary blocked; nothing published to origin", {
               run_id: runId,
               error: errMessage(err),
@@ -1858,7 +1916,7 @@ export class RunRunner {
           // comparison is safe: a verified-empty limit park releases its exact hold, work-bearing
           // committed history is promoted into the generation-bound archive, and a failed
           // comparison or upload retains. Best-effort; runs after the park report landed.
-          await this.settleRecoveryGeneration(claim, flight, runLog);
+          if (!parkResidueBlocked) await this.settleRecoveryGeneration(claim, flight, runLog);
         } else {
           // PRD #1349 M2 (F4) / #1539: EVERY non-parked limit outcome, not just the opt-out.
           // handleLimitReached returns parked=false on THREE distinct paths: the usage-limit
@@ -2313,7 +2371,22 @@ export class RunRunner {
       //     CLAUDE.md before concluding flake — `node --test` prints `ℹ fail 0`
       //     for a timeout, so the tally will say everything passed while the exit
       //     code says otherwise. A hang here is this bug until proven otherwise.
+      // issue #1783: prove the clone quiescent BEFORE retiring it. A surviving or unattributable
+      // run-owned process (process half `survivors`/`unverified`) keeps the clone AND its recovery
+      // journal — retiring a tree a live process still writes would hand the next attempt a
+      // half-removed clone. The Docker half never blocks the retire; it is logged.
+      let retireBlocked = false;
       if (flight.worktreePath && !flight.preserveRecoveryClone) {
+        const q = await this.quiesceRun(flight, executor, { mode: "own", site: "terminal_retire" });
+        if (q.blocked) {
+          retireBlocked = true;
+          runLog.warn("runner clone kept: not provably quiescent", {
+            clone: flight.worktreePath,
+            state: q.outcome.process?.state,
+          });
+        }
+      }
+      if (flight.worktreePath && !flight.preserveRecoveryClone && !retireBlocked) {
         try {
           if (flight.barePath && flight.branch) {
             // issue #1315: retire the clone ATOMICALLY (rename-to-holding, THEN clear the
@@ -2337,6 +2410,8 @@ export class RunRunner {
           runLog.warn("runner clone cleanup failed", { error: errMessage(e) });
         }
       }
+      // issue #1783 (R2): this attempt's final reap is done; it is no longer live.
+      if (flight.attempt) this.liveAttempts.remove(flight.attempt.marker);
       // PRD #1392 M2: whether to KEEP the two resume artifacts (the sibling skills plugin dir
       // and the per-run HOME). Every park/shutdown that has on-disk state to resume keeps them on
       // `parked` OR `preserveSession` as before — EXCEPT a pre-clone forge-unreachable park, which
@@ -2713,10 +2788,14 @@ export class RunRunner {
     // #1539: this fall-through is reached under the hook when its UNJOURNALED send threw (no latch,
     // no journal) — the hook already reaped, so reuse that outcome under the stale-epoch guard rather
     // than reap a second time (a second reap would be refused if the lost-ack send had actually landed).
+    // issue #1783: a residue-blocked finalize never runs the credentialed settle: a run-owned
+    // process survived the reap, so no PAT-bearing git may start while it lives.
     const reaped =
-      flight.permanentFailureReap !== undefined
-        ? this.permanentFailureReapValid(flight)
-        : await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
+      err instanceof RunResidueBlockedError
+        ? false
+        : flight.permanentFailureReap !== undefined
+          ? this.permanentFailureReapValid(flight)
+          : await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
     // Cap what lands in the run row (matches the GitLab error-body cap). Journal it WRITE-AHEAD then
     // resolve it (D3): on reserve_exhausted it degrades to today's direct send, whose throw the
     // .catch below still logs; on the journaled path journalAndSendTerminal never throws (a send that
@@ -3208,6 +3287,17 @@ export class RunRunner {
     };
     const runId = claim.run_id;
     const result = flight.result!;
+    // issue #1783: the finalize boundary. Before ANY branch below (the pause/hold/wall/switch parks,
+    // the not_code and report-only completions, the fetch-back + push), prove the clone quiescent:
+    // quiesceRun's first step is the literal killAgentTree, then the process reaper, then the
+    // Docker teardown. A process result of `survivors` or `unverified` fails the run with the typed
+    // fail_origin `worker_residue_blocked` and keeps the clone. The branch-local killAgentTree calls
+    // below stay as they were; they are now idempotent re-reaps of an already-reaped tree.
+    const finalizeQuiescence = await this.quiesceRun(flight, executor, { mode: "own", site: "finalize" });
+    if (finalizeQuiescence.blocked) {
+      flight.preserveRecoveryClone = true;
+      throw new RunResidueBlockedError(finalizeQuiescence.outcome.process?.detail ?? "not quiescent");
+    }
     // PRD #1190 M2: an owner-requested pause PARKED the run mid-loop (handlePausePark reported
     // `paused` and set flight.parked). The run is non-terminal and already reported — there is
     // nothing to finalize (no push, no MR, no completion report), and the finally preserves its
@@ -5250,6 +5340,7 @@ export class RunRunner {
       // else, so no other path's HOME preservation semantics change.
       preClonePark: false,
       preserveRecoveryClone: false,
+      attempt: undefined,
       ciFixHumanApproved: false,
       runnerClone: undefined,
       result: undefined,
@@ -6185,6 +6276,17 @@ export class RunRunner {
       return bodyOutcome;
     };
 
+    // issue #1783 (R2): mint this execution attempt and put it in the live-attempt set BEFORE the
+    // agent CLI spawns (executor.run below). Its marker rides the CLI env (ctx.runAttempt →
+    // buildSdkEnv), so every process the agent starts is attributable to it; its recorded roots
+    // let a concurrent sibling's reaper attribute our unreadable processes by ancestry. Removed in
+    // executeClaim's terminal finally, after the attempt's final reap.
+    if (flight.attempt) this.liveAttempts.remove(flight.attempt.marker);
+    const attempt = newRunAttempt(runId, claim.claim_generation, runnerClone.path, () =>
+      executor.recordedRootPids?.() ?? [],
+    );
+    flight.attempt = attempt;
+    this.liveAttempts.add(attempt);
     const ctx: RunContext = {
       runId,
       kind: resolveRunKind(claim.kind),
@@ -6202,6 +6304,7 @@ export class RunRunner {
       reviewComments: claim.review_comments,
       pipeline: claim.pipeline,
       worktreePath: runnerClone.path,
+      runAttempt: { marker: attempt.marker, clonePath: attempt.clonePath, cloneKey: attempt.cloneKey },
       branch: runnerClone.branch,
       // PRD #501 REC B: thread the autopilot flag to plan-build time so the plan
       // builders render the no-human-in-the-loop note. Absent ⇒ false.
@@ -6837,7 +6940,10 @@ export class RunRunner {
   /**
    * Route a durability/publication sink through the Codex `withBoundary` reap facade when the
    * executor is Codex-selected (`executor.safety`), else take the LITERAL legacy
-   * `killAgentTree` reap branch (Claude/stub — unchanged ordering, cleanup and errors).
+   * `killAgentTree` reap branch (Claude/stub — unchanged ordering, cleanup and errors). Exception
+   * (issue #1783): a `park` boundary called WITH its flight first runs {@link quiesceRun} (whose
+   * first step is that same killAgentTree) and skips the body with a RunResidueBlockedError when
+   * the clone is not provably quiescent.
    *
    * The runner is HARNESS-AGNOSTIC: it branches ONLY on `!!executor.safety`, never reads
    * authMode/credentials and never imports agent/src/codex/**. Inside a Codex permit it scopes
@@ -6852,20 +6958,112 @@ export class RunRunner {
     executor: Executor,
     req: BoundaryRequest,
     action: (permit?: BoundaryPermit) => Promise<void>,
+    flight?: RunFlight,
   ): Promise<void> {
+    // issue #1783: a PARK sink first proves the clone quiescent (quiesceRun). The legacy branch's
+    // literal killAgentTree is now the first step of quiesceRun; for Codex the quiescence (its
+    // Docker half only) runs inside the held permit, before the sink body. A non-quiescent process
+    // result skips the credentialed body entirely (RunResidueBlockedError, handled by the caller
+    // like a blocked Codex boundary: nothing published, the park stands) and keeps the clone.
+    const quiescePark = req.boundary === "park" && flight !== undefined;
     const safety = executor.safety;
     if (safety) {
       await safety.withBoundary(req, async (permit) => {
+        if (quiescePark) await this.quiesceOrBlockPark(flight, executor);
         await this.git.withBoundaryProcessSpawner(
           (process) => safety.spawnBoundaryProcess(permit, process),
           permit.signal,
           () => action(permit),
         );
       });
+    } else if (quiescePark) {
+      await this.quiesceOrBlockPark(flight, executor);
+      await action(undefined);
     } else {
       executor.killAgentTree?.();
       await action(undefined);
     }
+  }
+
+  /** issue #1783: a park sink's quiescence gate (see {@link reapForSink}). */
+  private async quiesceOrBlockPark(flight: RunFlight, executor: Executor): Promise<void> {
+    const q = await this.quiesceRun(flight, executor, { mode: "own", site: "park" });
+    if (!q.blocked) return;
+    // Keep the clone and its recovery journal: the terminal finally must not retire a tree a
+    // surviving process may still be writing. The bare tracking ref is untouched (no fetch-back).
+    flight.preserveRecoveryClone = true;
+    throw new RunResidueBlockedError(q.outcome.process?.detail ?? "not quiescent");
+  }
+
+  /**
+   * issue #1783 — quiesce this flight's clone, INSIDE the flight's sink gate: the literal
+   * `killAgentTree` reap, then the process reaper (Claude/stub only: a Codex run, `executor.safety`
+   * set, has its supervisor prove process drain), then the Docker teardown (every executor).
+   * `blocked` is true when the process half is `survivors` or `unverified`; every caller fails
+   * closed on both identically. The Docker result never blocks; it is logged. Never throws.
+   *
+   * The process half runs only on Linux, the one platform a worker runs on (it reads procfs); on
+   * any other platform (a developer's unit-test host) it is skipped, never faked quiescent.
+   * Exposed for M2/M3's `seed`/`capture` sweeps, which pass their own `targetPaths`.
+   */
+  private async quiesceRun(
+    flight: RunFlight,
+    executor: Executor,
+    opts: { mode: QuiesceMode; site: string; targetPaths?: string[] },
+  ): Promise<{ outcome: QuiesceRunOutcome; blocked: boolean }> {
+    return flight.sinkGate.run(async () => {
+      executor.killAgentTree?.();
+      const clonePath = flight.attempt?.clonePath ?? flight.worktreePath;
+      if (!clonePath) {
+        return {
+          outcome: { process: undefined, docker: { state: "not_wired", removed: [], detail: "no clone to quiesce" } },
+          blocked: false,
+        };
+      }
+      const { cloneKey, canonicalPath } = cloneKeyOf(clonePath);
+      const targetPaths = opts.targetPaths ?? [...new Set([clonePath, canonicalPath])];
+      let outcome: QuiesceRunOutcome;
+      try {
+        outcome = await this.quiesceImpl({
+          mode: opts.mode,
+          attempt: flight.attempt,
+          cloneKey,
+          targetPaths,
+          processes: !executor.safety && process.platform === "linux",
+          dockerHost: this.dockerHost,
+          registry: this.liveAttempts,
+        });
+      } catch (err) {
+        outcome = {
+          process: { state: "unverified", processes: [], killed: [], detail: `quiescence failed: ${errMessage(err)}` },
+          docker: { state: "docker_error", removed: [], detail: errMessage(err) },
+        };
+      }
+      const blocked = outcome.process !== undefined && outcome.process.state !== "quiescent";
+      if (blocked) {
+        flight.runLog.warn("run clone is not quiescent", {
+          site: opts.site,
+          state: outcome.process?.state,
+          detail: outcome.process?.detail,
+          processes: describeProcesses(outcome.process),
+        });
+      } else if (outcome.process && outcome.process.killed.length > 0) {
+        flight.runLog.info("run quiescence reaped residual processes", {
+          site: opts.site,
+          killed: outcome.process.killed,
+        });
+      }
+      if (outcome.docker.state === "docker_error") {
+        flight.runLog.warn("run docker teardown failed", { site: opts.site, detail: outcome.docker.detail });
+      } else if (outcome.docker.removed.length > 0) {
+        flight.runLog.info("run docker teardown removed containers", {
+          site: opts.site,
+          state: outcome.docker.state,
+          removed: outcome.docker.removed,
+        });
+      }
+      return { outcome, blocked };
+    });
   }
 
   /**

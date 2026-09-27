@@ -82,7 +82,7 @@ start_filler() {
 start_web() {
   local mount=()
   if [ "$MODE" = --expect-stale ]; then
-    mount=(-v "$ROOT/e2e/compose-web-dns-fixture/nginx-old.conf:/etc/nginx/conf.d/default.conf:ro")
+    mount=(--mount "type=bind,src=$ROOT/e2e/compose-web-dns-fixture/nginx-old.conf,dst=/etc/nginx/conf.d/default.conf,readonly")
   fi
   docker run -d --name "$WEB" --network "$NET" \
     -p 127.0.0.1::8080 "${mount[@]}" "$WEB_IMAGE" >/dev/null

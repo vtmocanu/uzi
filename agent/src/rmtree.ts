@@ -4,6 +4,7 @@ import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
 import { commandRootCommand, runnerCommand, uidSplitActive } from "./runner-uid.js";
+import { workerSpawnEnv } from "./worker-spawn-mark.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -255,7 +256,8 @@ async function purgeChildrenAsAgents(target: string): Promise<void> {
   for (const wrap of [runnerCommand, commandRootCommand, runnerCommand]) {
     const wrapped = wrap(process.execPath, ["-e", PURGE_CHILDREN_SCRIPT, target]);
     await execFileAsync(wrapped.command, wrapped.args, {
-      env: { PATH: "/usr/local/bin:/usr/bin:/bin" },
+      // issue #1783 (R4): worker-marked; still minimal and explicit (no credential).
+      env: workerSpawnEnv({ PATH: "/usr/local/bin:/usr/bin:/bin" }),
       timeout: PURGE_TIMEOUT_MS,
       maxBuffer: 64 * 1024,
     }).catch((e: NodeJS.ErrnoException & { code?: unknown }) => {

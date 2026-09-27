@@ -17,6 +17,7 @@ import {
   type SupervisorProcess,
 } from "../src/codex/launcher.js";
 import { runLaunchCli, type LaunchCliDeps } from "../src/codex/launch-cli.js";
+import { workerSpawnEnv } from "../src/worker-spawn-mark.js";
 
 // PRD #1156 (M3a) — the isolated per-root launcher. NO real Go binary, NO network,
 // NO setpriv/root: the supervisor is a FAKE process, every privileged/uid-resolving
@@ -200,6 +201,8 @@ describe("launchCodexRoot: env allowlist, trees, argv", () => {
       [
         "CODEX_HOME", "CODEX_PROVIDER_KEY", "HOME", "LANG", "PATH", "SHELL", "TERM", "TMPDIR",
         "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+        // issue #1783 (R4): the worker spawn mark rides every launcher spawn.
+        "UZI_WORKER_SPAWN",
       ].sort(),
     );
     assert.equal(env.CODEX_PROVIDER_KEY, "dummy-key");
@@ -295,6 +298,7 @@ describe("launchCodexRoot: app-server auth (production config, no env credential
       [
         "CODEX_HOME", "HOME", "LANG", "PATH", "SHELL", "TERM", "TMPDIR",
         "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+        "UZI_WORKER_SPAWN", // issue #1783 (R4): the worker spawn mark
       ].sort(),
     );
     // The config is buildCodexProductionConfigToml: native-disabled lines + the built-in
@@ -453,7 +457,7 @@ describe("launchCodexEffectRoot: supervised command identity", () => {
       "--cleanup-token", cleanupToken,
       "--", "/bin/sh", "-c", "exit 7",
     ]);
-    assert.deepEqual(call.options.env, env);
+    assert.deepEqual(call.options.env, workerSpawnEnv(env));
     fake.emitChildExit(7);
     assert.deepEqual(await handle.waitChild(), { event: "child_exit", code: 7 });
   });
@@ -479,7 +483,7 @@ describe("launchCodexEffectRoot: supervised command identity", () => {
       ...setprivArgsForUid(WORKER_UID), SUPERVISOR_BIN,
       "--expect-uid", String(WORKER_UID), "--drop-controller-caps", "--", "/usr/bin/git", "status",
     ]);
-    assert.deepEqual(call.options.env, env);
+    assert.deepEqual(call.options.env, workerSpawnEnv(env));
   });
 });
 

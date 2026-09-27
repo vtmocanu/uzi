@@ -36,7 +36,7 @@ fi
 
 src_args=()
 if [ "${HOME_SPLIT_MOUNT_SRC:-}" = "1" ]; then
-  src_args=(-v "$REPO/agent/src":/work/agent/src:ro -e HOME_SPLIT_SRC=/work/agent/src)
+  src_args=(--mount "type=bind,src=$REPO/agent/src,dst=/work/agent/src,readonly" -e HOME_SPLIT_SRC=/work/agent/src)
   log "testing the mounted agent/src, not the image's /app/src"
 fi
 
@@ -48,7 +48,7 @@ timeout --kill-after=30s "$TIMEOUT" docker run --rm --network none \
   --security-opt no-new-privileges \
   --tmpfs /data \
   --entrypoint /usr/local/sbin/uzi-entrypoint \
-  -v "$REPO/e2e":/work/e2e:ro \
+  --mount "type=bind,src=$REPO/e2e,dst=/work/e2e,readonly" \
   "${src_args[@]}" \
   --name "$NAME" \
   "$IMAGE" /bin/sh -c 'cd /app && exec /usr/local/bin/node --import tsx --test --test-concurrency=1 --test-timeout=120000 \

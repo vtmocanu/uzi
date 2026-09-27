@@ -34,6 +34,7 @@ import path from "node:path";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
 import type { Logger } from "./log.js";
 import { runnerCommand, uidSplitActive } from "./runner-uid.js";
+import { workerSpawnEnv } from "./worker-spawn-mark.js";
 
 /** A tick child's process group that was still alive after its SIGKILL and the bounded wait. */
 export interface SurvivingGroup {
@@ -53,7 +54,7 @@ export interface SurvivingGroup {
 export function processGroupAlive(pgid: number, identity: BoundaryProcessRequest["identity"]): boolean {
   if (identity === "command" && uidSplitActive()) {
     const w = runnerCommand("kill", ["-0", `-${pgid}`]);
-    const r = spawnSync(w.command, w.args, { stdio: ["ignore", "ignore", "pipe"], encoding: "utf8" });
+    const r = spawnSync(w.command, w.args, { env: workerSpawnEnv(), stdio: ["ignore", "ignore", "pipe"], encoding: "utf8" });
     return !killProbeSaysGone(r.status, String(r.stderr ?? ""));
   }
   try {
@@ -77,7 +78,7 @@ export function signalProcessGroup(
 ): boolean {
   if (identity === "command" && uidSplitActive()) {
     const w = runnerCommand("kill", [sig === "SIGTERM" ? "-TERM" : "-KILL", `-${pgid}`]);
-    const r = spawnSync(w.command, w.args, { stdio: ["ignore", "ignore", "pipe"], encoding: "utf8" });
+    const r = spawnSync(w.command, w.args, { env: workerSpawnEnv(), stdio: ["ignore", "ignore", "pipe"], encoding: "utf8" });
     return r.status === 0 || killProbeSaysGone(r.status, String(r.stderr ?? ""));
   }
   try {
@@ -340,7 +341,9 @@ export class TickSpawner {
     const wrapped = req.identity === "command" ? runnerCommand(exe!, args) : { command: exe!, args };
     const child: ChildProcess = spawn(wrapped.command, wrapped.args, {
       cwd: req.cwd,
-      env: req.env,
+      // issue #1783 (R4): a tick child is the worker's own op (it runs only while holding the
+      // sink gate); the mark keeps a concurrent quiescence reap from attributing it to the run.
+      env: workerSpawnEnv(req.env),
       detached: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
