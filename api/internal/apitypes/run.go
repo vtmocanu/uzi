@@ -318,8 +318,10 @@ type RunDTO struct {
 	// free text), but a consumer writing them to a terminal still sanitizes at render — the same
 	// obligation Milestones carries.
 	CompletionUnmet []string `json:"completion_unmet"`
-	// HoldReason is why the run is HELD (mapped from run.HoldReason): 'completion_blocked' when
-	// it parked in a completion hold, null when not held. Read-only surfacing of the column.
+	// HoldReason is why a paused run is HELD (mapped from run.HoldReason): 'completion_blocked'
+	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
+	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14), and
+	// null otherwise (not held, or an owner pause). Read-only surfacing of the column.
 	HoldReason *string `json:"hold_reason"`
 	// HoldContext is the D8 provider-context string a completion hold states: the constant
 	// "unavailable(same_worker_only)" when the run is in a completion hold (HoldReason ==

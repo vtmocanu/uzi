@@ -258,7 +258,7 @@ func (h *Handler) PutAnthropicToken(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			httpx.Error(w, http.StatusConflict, "default credential is disabled")
+			httpx.Error(w, http.StatusConflict, errSecretDisabled.Error())
 			return
 		}
 		slog.Error("store anthropic token", "error", err)
@@ -503,7 +503,7 @@ func (h *Handler) PatchAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		found = true
 		disabledAt = cur.DisabledAt
 		if cur.DisabledAt.Valid && req.Default != nil && *req.Default {
-			return errSecretTransitionConflict
+			return errSecretDisabled
 		}
 		// AutoEligible is carried from the CURRENT row, not left zero: this handler
 		// never changes the pool flag (that is its own route, D13), so the response
@@ -552,7 +552,7 @@ func (h *Handler) PatchAnthropicToken(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, "a token with that label already exists")
 			return
 		}
-		if errors.Is(err, errSecretTransitionConflict) {
+		if errors.Is(err, errSecretDisabled) {
 			httpx.Error(w, http.StatusConflict, err.Error())
 			return
 		}
@@ -644,7 +644,7 @@ func (h *Handler) PatchAnthropicTokenAutoEligible(w http.ResponseWriter, r *http
 		found = true
 		disabledAt = cur.DisabledAt
 		if cur.DisabledAt.Valid && *req.AutoEligible {
-			return errSecretTransitionConflict
+			return errSecretDisabled
 		}
 		row, serr := q.SetUserSecretAutoEligible(r.Context(), store.SetUserSecretAutoEligibleParams{
 			ID: secretID, UserID: user.ID, Kind: store.KindAnthropicToken,
@@ -657,7 +657,7 @@ func (h *Handler) PatchAnthropicTokenAutoEligible(w http.ResponseWriter, r *http
 		return nil
 	})
 	if err != nil {
-		if errors.Is(err, errSecretTransitionConflict) {
+		if errors.Is(err, errSecretDisabled) {
 			httpx.Error(w, http.StatusConflict, err.Error())
 			return
 		}
@@ -1023,7 +1023,7 @@ func (h *Handler) patchCodexSecret(w http.ResponseWriter, r *http.Request, kind 
 		found = true
 		disabledAt = cur.DisabledAt
 		if cur.DisabledAt.Valid && req.Default != nil && *req.Default {
-			return errSecretTransitionConflict
+			return errSecretDisabled
 		}
 		out = store.RenameUserSecretRow{
 			ID: cur.ID, Kind: cur.Kind, Label: cur.Label,
@@ -1090,7 +1090,7 @@ func (h *Handler) patchCodexSecret(w http.ResponseWriter, r *http.Request, kind 
 			httpx.Error(w, http.StatusConflict, "a credential with that label already exists")
 			return
 		}
-		if errors.Is(err, errSecretTransitionConflict) {
+		if errors.Is(err, errSecretDisabled) {
 			httpx.Error(w, http.StatusConflict, err.Error())
 			return
 		}

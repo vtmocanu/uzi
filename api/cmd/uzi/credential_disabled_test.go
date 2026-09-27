@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -307,5 +308,118 @@ func TestRunWaitCredentialDisabledLine(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "paused → completed") {
 		t.Errorf("wait must keep going through the hold, stderr = %q", stderr)
+	}
+}
+
+// followLogs runs `uzi run logs r1 --follow` over a scripted GetRun sequence and returns its
+// stderr, failing the test if it does not exit 0 on the sequence's terminal run.
+func followLogs(t *testing.T, seq ...apitypes.RunDTO) string {
+	t.Helper()
+	t.Setenv("UZI_URL", "")
+	t.Setenv("UZI_TOKEN", "")
+	old := logsPollInterval
+	logsPollInterval = time.Millisecond
+	t.Cleanup(func() { logsPollInterval = old })
+	pf := &codexParkFake{
+		FakeClient: &uzicli.FakeClient{LogsByID: map[string][]apitypes.MessageDTO{
+			"r1": {{Seq: 1, Kind: "assistant", Payload: []byte(`{"text":"hi"}`)}},
+		}},
+		seq: seq,
+	}
+	var out, errBuf bytes.Buffer
+	env := fakeEnv(pf)
+	env.Stdout, env.Stderr = &out, &errBuf
+	done := make(chan int, 1)
+	go func() { done <- Main(env, []string{"run", "logs", "r1", "--follow"}) }()
+	select {
+	case code := <-done:
+		if code != uzicli.ExitOK {
+			t.Fatalf("--follow exit = %d, want 0 (stderr: %s)", code, errBuf.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run logs --follow hung")
+	}
+	if strings.Contains(out.String(), "held") || strings.Contains(out.String(), "resumed") {
+		t.Errorf("a hold notice reached STDOUT:\n%s", out.String())
+	}
+	return errBuf.String()
+}
+
+func pausedWithHold(hold string) apitypes.RunDTO {
+	r := apitypes.RunDTO{ID: "r1", Kind: "issue", Status: statusPaused}
+	if hold != "" {
+		r.HoldReason = &hold
+	}
+	return r
+}
+
+// TestRunLogsFollowCredentialDisabledNotice: `run logs --follow` prints the credential_disabled
+// notice once while the hold lasts, then "resumed" when the run is promoted to queued.
+func TestRunLogsFollowCredentialDisabledNotice(t *testing.T) {
+	held := pausedWithHold(holdCredentialDisabled)
+	stderr := followLogs(t,
+		apitypes.RunDTO{ID: "r1", Status: "running"},
+		held, held, held,
+		apitypes.RunDTO{ID: "r1", Status: "queued"},
+		apitypes.RunDTO{ID: "r1", Status: "completed"},
+	)
+	want := "run r1 held — a credential it needs is disabled; enable it in Settings, or switch token: uzi run set-token r1 <label>; still following"
+	if n := strings.Count(stderr, want); n != 1 {
+		t.Errorf("credential_disabled notice appeared %d times, want exactly 1:\n%s", n, stderr)
+	}
+	if !strings.Contains(stderr, "run r1 resumed (queued)") {
+		t.Errorf("missing the resume line:\n%s", stderr)
+	}
+}
+
+// TestRunLogsFollowCredentialDisabledIntoPause: a run the promoter settles from the
+// credential_disabled hold straight into an owner pause or budget_exhausted did not resume;
+// --follow names the new pause instead, and prints "resumed" only once the run leaves paused.
+// Reddening mutation: drop the paused branch in run_get.go (it prints "resumed (paused)").
+func TestRunLogsFollowCredentialDisabledIntoPause(t *testing.T) {
+	for _, tc := range []struct {
+		hold, want string
+	}{
+		{"", "run r1 paused by its owner; resume with uzi run resume r1; still following"},
+		{holdBudgetExhausted, "run r1 parked at its time limit; extend: uzi run extend r1 --by 2h; still following"},
+	} {
+		t.Run("hold="+tc.hold, func(t *testing.T) {
+			held, next := pausedWithHold(holdCredentialDisabled), pausedWithHold(tc.hold)
+			stderr := followLogs(t,
+				apitypes.RunDTO{ID: "r1", Status: "running"},
+				held, held, next, next,
+				apitypes.RunDTO{ID: "r1", Status: "queued"},
+				apitypes.RunDTO{ID: "r1", Status: "completed"},
+			)
+			if strings.Contains(stderr, "resumed (paused)") {
+				t.Errorf("a move into another pause was reported as a resume:\n%s", stderr)
+			}
+			if n := strings.Count(stderr, tc.want); n != 1 {
+				t.Errorf("new-pause notice %q appeared %d times, want 1:\n%s", tc.want, n, stderr)
+			}
+			if n := strings.Count(stderr, "run r1 resumed (queued)"); n != 1 {
+				t.Errorf("resume line appeared %d times, want 1:\n%s", n, stderr)
+			}
+		})
+	}
+}
+
+// TestRunWaitCredentialDisabledIntoPause: `run wait` names a hold-to-hold move that keeps the
+// status at paused (credential_disabled settled into an owner pause), which the status
+// transition line alone cannot show. Reddening mutation: drop the hold-change branch in
+// run_wait.go.
+func TestRunWaitCredentialDisabledIntoPause(t *testing.T) {
+	held, owner := pausedWithHold(holdCredentialDisabled), pausedWithHold("")
+	fc := &uzicli.FakeClient{GetRunHook: scriptHook(okStep("running"), waitStep{run: held}, waitStep{run: owner}, okStep("completed"))}
+
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "wait", "r1", "--interval", "1ms")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if n := strings.Count(stderr, "run r1: now paused by its owner; resume with uzi run resume r1"); n != 1 {
+		t.Errorf("hold-change line appeared %d times, want 1:\n%s", n, stderr)
+	}
+	if !strings.Contains(stderr, "paused → completed") {
+		t.Errorf("wait must keep going through the pause, stderr = %q", stderr)
 	}
 }

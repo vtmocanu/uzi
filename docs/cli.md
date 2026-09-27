@@ -1597,8 +1597,11 @@ The last column, `STATE`, is `enabled` or `disabled since <date>` for a
 credential you have [disabled](./anthropic-token.md#disabling-a-token) in
 Settings; `--json` carries it as `enabled` (true/false) and `disabled_at`
 (null while enabled). A disabled token keeps its `POOL` opt-in but reads `-`
-under `ELIGIBLE`, since nothing picks it while it is disabled, and
-`uzi token pool <name> --on` refuses it. Disabling and enabling are
+under `ELIGIBLE`, since nothing picks it while it is disabled; under `--json`
+its `auto_status` is `null`, because uzi reads no usage for it, so a script
+checks `enabled` first and treats a `null` `auto_status` as "unknown" only for
+an enabled token. `uzi token pool <name> --on` refuses a disabled token.
+Disabling and enabling are
 web-only; the CLI has no command for them.
 
 `uzi worker list` carries a `TOKEN` column showing how each worker chooses:

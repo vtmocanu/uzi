@@ -79,7 +79,9 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 				// UNKNOWN (the meters read failed, or did not mention it) must not look
 				// like one that is fine. null, "" and absent must not collapse — so the
 				// field is always present, and it is null exactly when the answer is not
-				// known.
+				// known. A disabled token is omitted from the meters read (PRD #1732), so
+				// its auto_status is null too: a script reads `enabled` first, and treats
+				// null as "unknown" only for an enabled token (docs/cli.md).
 				out := make([]tokenListItem, 0, len(secrets))
 				for _, s := range secrets {
 					item := tokenListItem{SecretDTO: s}
@@ -231,8 +233,9 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 				return uzicli.Exitf(uzicli.ExitUsage, "no Anthropic token labelled %q; `uzi token list` shows yours", args[0])
 			}
 			// PRD #1732 D5: a disabled token cannot join the pool. Refuse before the write
-			// with the same pointer to Settings the server's refusal carries; enabling is a
-			// web-only action (D12). Opting a disabled token OUT stays allowed.
+			// with the same advice the server's 409 gives ("credential is disabled; enable
+			// it in Settings", workersvc.ErrCredentialDisabled); enabling is a web-only
+			// action (D12). Opting a disabled token OUT stays allowed.
 			if on && secretDisabled(target) {
 				return uzicli.Exitf(uzicli.ExitConflict,
 					"token %q is disabled; enable it in Settings before adding it to the pool", cellText(target.Label))

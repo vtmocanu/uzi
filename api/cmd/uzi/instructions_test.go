@@ -323,6 +323,19 @@ var knownInstructions = []knownInstruction{
 			"path-resolution check is the complete bar.",
 	},
 	{
+		command:  "uzi run extend",
+		evidence: evidenceHelpOnly,
+		// ARRIVED WITH PRD #1732 (M6 rework). `uzi run wait`'s Long help (run_wait.go) now
+		// names the three kinds of paused run it does not stop on, and cross-links
+		// `uzi run extend` as the way out of a time-limit park. classifyKind reads a cobra
+		// Long field as documentation, so the kind derives HELP; the complete bar for a help
+		// reference is that the path RESOLVES, and `uzi run extend` is a real subcommand,
+		// pinned by TestCommandTree.
+		note: "HELP: `uzi run wait`'s Long help cross-links `uzi run extend` as the way to " +
+			"resume a time-limit park (run_wait.go). Never emitted as a lifted runtime " +
+			"candidate; the path-resolution check is the complete bar.",
+	},
+	{
 		command:  "uzi run resume-now",
 		evidence: evidenceHelpOnly,
 		// ARRIVED WITH PRD #1190 M4. The span sits inside `uzi run resume`'s Long help

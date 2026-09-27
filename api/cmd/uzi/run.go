@@ -106,8 +106,8 @@ const statusPaused = "paused"
 //
 // holdCredentialDisabled (PRD #1732 D14) is the server-owned park of a run that needs one
 // specific credential its owner has disabled. It resumes by itself once that credential is
-// enabled again (or, where the lane accepts a per-run override, once the owner points the
-// run at another token); uzi never substitutes a credential on its own (D2).
+// enabled again (or, where the CLI and web offer a per-run override, once the owner points
+// the run at another token); uzi never substitutes a credential on its own (D2).
 const (
 	holdBudgetExhausted    = "budget_exhausted"
 	holdCompletionBlocked  = "completion_blocked"

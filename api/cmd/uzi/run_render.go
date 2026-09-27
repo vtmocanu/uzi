@@ -486,10 +486,12 @@ func isCredentialDisabledHold(r apitypes.RunDTO) bool {
 	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdCredentialDisabled
 }
 
-// credentialSwitchableLane reports whether r's lane accepts a per-run token switch
-// (`uzi run set-token`), the D16 rule the web's isCredentialSwitchRefusedLane applies: never
-// a Codex run (the override is Anthropic-only), a task review, a chat, the Judge or
-// self-improve. The server refuses the switch on those lanes, so the CLI must not offer it.
+// credentialSwitchableLane reports whether the CLI offers a per-run token switch (`uzi run
+// set-token`) for r, the D16 rule the web's isCredentialSwitchRefusedLane applies: never a
+// Codex run (the override is Anthropic-only), a task review, a chat, the Judge or
+// self-improve. The server refuses Codex, chat, Judge and self-improve runs; it does accept
+// a switch on a task review, but neither the CLI nor the web offers one there, so a held
+// review is pointed at Settings only.
 func credentialSwitchableLane(r apitypes.RunDTO) bool {
 	if r.Harness == "codex" || r.TriggerSource == "task_review" {
 		return false
@@ -507,9 +509,30 @@ func credentialSwitchableLane(r apitypes.RunDTO) bool {
 func credentialDisabledAction(r apitypes.RunDTO) string {
 	action := "enable it in Settings"
 	if credentialSwitchableLane(r) {
-		action += ", or switch token: uzi run set-token " + r.ID + " <label>"
+		// cellText: r.ID is server text headed for a terminal (stderr notices, table cells).
+		action += ", or switch token: uzi run set-token " + cellText(r.ID) + " <label>"
 	}
 	return action
+}
+
+// pausedHoldNotice names a paused run's hold and the owner's next step, for the one-line
+// notices `run logs --follow` and `run wait` print when a run moves from the
+// credential_disabled hold straight into another pause. The credential_disabled promoter
+// does that (PRD #1732 D14): a held run with a pending owner pause settles into that pause
+// (hold_reason null), and one whose wall budget is spent into budget_exhausted, so "resumed"
+// would be false there.
+func pausedHoldNotice(r apitypes.RunDTO) string {
+	id := cellText(r.ID)
+	switch reason := strOr(r.HoldReason, ""); reason {
+	case "":
+		return "paused by its owner; resume with uzi run resume " + id
+	case holdBudgetExhausted:
+		return "parked at its time limit; extend: uzi run extend " + id + " --by 2h"
+	case holdCredentialDisabled:
+		return "held, a credential it needs is disabled; " + credentialDisabledAction(r)
+	default:
+		return "paused (" + holdReasonLabel(reason) + ")"
+	}
 }
 
 // credentialDisabledLine is the one-line held-run sentence the TUI detail and `run logs

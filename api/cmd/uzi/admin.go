@@ -221,9 +221,9 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 				return p.JSON(rls)
 			}
 			// One table row per (user, token) since #104 M5: the table gains a TOKEN
-			// column, and a token-less user is a single row with an empty token cell and
-			// a no_token status — so every user still appears exactly once when they hold
-			// no token, and once per token when they hold several.
+			// column, and a user with no enabled token is a single row with an empty token
+			// cell and a no_enabled_token status — so every user still appears exactly once
+			// when they hold no enabled token, and once per token when they hold several.
 			//
 			// PRD #1732 D9: the server omits disabled tokens (no row, no count), so an empty
 			// token list means "no ENABLED token", not "no token". The cell says exactly that

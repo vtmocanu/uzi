@@ -32,11 +32,15 @@ token, you see one meter and nothing has changed.
 In the sidebar and on the Settings card every token is named by its own label,
 even when you hold only one, so adding a second token never renames the first.
 
-A [disabled](./anthropic-token.md#disabling-a-token) token or Codex login has
-no meter anywhere: uzi stops checking its usage, and it drops out of the
+A [disabled](./anthropic-token.md#disabling-a-token) Anthropic token has no
+meter anywhere: uzi stops checking its usage, and it drops out of the
 sidebar, **Admin → Rate limits** and `uzi rate-limits` (which says "no
-enabled Anthropic token" when that leaves nothing to show). When you enable it
-again its meter reads "checking usage…" until a fresh reading arrives.
+enabled Anthropic token" when that leaves nothing to show). A Codex meter
+belongs to the account, not to one login, so disabling one login of an
+account leaves the meter in place while another login of the same account is
+still enabled; the meter drops out once every login of that account is
+disabled. When you enable a token or login again its meter reads "checking
+usage…" until a fresh reading arrives.
 
 The Settings card stays hidden until you've saved a token. While uzi is
 waiting on a token's first reading, that token stays out of the sidebar (no

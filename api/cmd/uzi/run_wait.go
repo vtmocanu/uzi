@@ -46,6 +46,7 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 
 	consecutiveUnreachable := 0
 	lastStatus := ""
+	lastHold := ""
 	sawStatus := false
 	warnedUnknown := map[string]bool{}
 	warnedPlanSeqErr := false
@@ -76,13 +77,14 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 		// A transition line on every status change, including the first observation, so a
 		// human watching stderr sees the run move. cellText folds a newline a rotted
 		// "server-controlled" status could carry, keeping one status per line.
+		hold := strOr(run.HoldReason, "")
 		if run.Status != lastStatus {
 			if sawStatus {
 				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s → %s\n", runID, cellText(lastStatus), cellText(run.Status))
 			} else {
 				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", runID, cellText(run.Status))
 			}
-			lastStatus = run.Status
+			lastStatus, lastHold = run.Status, hold
 			sawStatus = true
 			// PRD #1497 M3: a run parked at its wall-clock limit (paused with
 			// hold_reason=budget_exhausted) is NOT a target — it waits for the owner exactly like
@@ -100,6 +102,13 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 				_, _ = fmt.Fprintf(env.Stderr,
 					"run %s: held, a credential it needs is disabled; %s\n", runID, credentialDisabledAction(run))
 			}
+		} else if run.Status == statusPaused && hold != lastHold {
+			// A move between holds keeps the status at paused, so the status line above
+			// never fires: the credential_disabled promoter settles a held run straight into
+			// an owner pause or budget_exhausted (PRD #1732 D14), and a later claim can hold
+			// it again. Name the new hold once; the wait keeps going, paused is non-terminal.
+			lastHold = hold
+			_, _ = fmt.Fprintf(env.Stderr, "run %s: now %s\n", runID, pausedHoldNotice(run))
 		}
 		// A status outside the twelve-value enum means the server is newer than this
 		// binary. Surface it once and keep waiting (it can never be a target — `--until`
@@ -213,7 +222,9 @@ func newRunWaitCmd(env Env, gf *globalFlags) *cobra.Command {
 			strings.Join(defaultWaitStates, ", ") + ". It does NOT stop " +
 			"on queued/claimed/running (still working), limit_wait (auto-resumes), pool_wait " +
 			"(an auto run held on an empty token pool; resumes when a token is pooled), or paused " +
-			"(an owner park; resumes on demand with `uzi run resume`), so a bare " +
+			"(an owner park, resumed on demand with `uzi run resume`; a time-limit park, resumed " +
+			"with `uzi run extend`; or a hold on a disabled credential, which resumes by itself when " +
+			"the credential is enabled in Settings and which `uzi run resume` refuses), so a bare " +
 			"`uzi run wait <id>` waits for the plan gate OR the end.\n\n" +
 			"Transitions print to stderr; `--json` prints the final run object (same shape as " +
 			"`run get --json`) to stdout. Exit codes: 0 a target state was reached (including if " +

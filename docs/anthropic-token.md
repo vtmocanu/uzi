@@ -386,9 +386,9 @@ instead:
 
 A waiting run shows **waiting: credential disabled** on the run page, with
 an **Enable** button for the token, plus **Run with another token** when
-the run accepts a per-run token switch (chats, judge and self-improvement
-runs, task reviews and Codex runs do not; for those, enable the token or
-change the default or the binding in Settings). The run resumes on its own
+the page offers a per-run token switch (it does not for chats, judge and
+self-improvement runs, task reviews or Codex runs; for those, enable the
+token or change the default or the binding in Settings). The run resumes on its own
 as soon as you enable the token, and the time it spends waiting does not
 count against its time limit. In the CLI the run's status is `paused`, and
 `uzi run get` prints a `HOLD` row reading `credential disabled` with the

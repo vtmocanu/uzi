@@ -14,9 +14,16 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 var errSecretTransitionConflict = errors.New("choose an enabled replacement in Settings")
+
+// errSecretDisabled refuses a write that would promote a disabled credential (make it the
+// default, or opt it into the auto-select pool). It is workersvc.ErrCredentialDisabled, so
+// these refusals give the same advice as a run or schedule that names a disabled
+// credential (PRD #1732 D12).
+var errSecretDisabled = workersvc.ErrCredentialDisabled
 
 func secretRoute(r *http.Request) (uuid.UUID, bool) {
 	kind := chi.URLParam(r, "kind")
