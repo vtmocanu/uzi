@@ -972,6 +972,58 @@ describe("GitCache spawnGit exit-gated stdout, finalize import (issue #1769)", (
     assert.strictEqual(await settleWithin(res.exited, 10_000, () => []), 1);
   });
 
+  // A source that CLOSES without 'end' or 'error' (a premature close) under a clean exit: the
+  // returned stream must error, not wait forever for an end that never comes.
+
+  it("inside a boundary: a source that closes before its end errors the returned stream", async () => {
+    const source = new PassThrough();
+    const done = deferred<{ code: number }>();
+    const spawner: BoundaryProcessSpawner = async () => ({ stdin: openSink(), stdout: source, stderr: null, completed: done.promise });
+    const res = await git.withBoundaryProcessSpawner(spawner, new AbortController().signal, () =>
+      (git as unknown as Internals).spawnGit(fx.dataDir, PACK_ARGS, ""));
+    source.write("partial");
+    const errored = once(res.stdout, "error");
+    source.destroy();
+    done.resolve({ code: 0 });
+    assert.strictEqual(await settleWithin(res.exited, 10_000, () => []), 0);
+    const [err] = await settleWithin(errored, 10_000, () => []);
+    assert.match(String(err), /premature close/);
+    assert.ok(res.stdout.destroyed, "the returned stream is destroyed, never ended cleanly");
+    assert.strictEqual(res.stdout.readableEnded, false);
+  });
+
+  it("inside a boundary: a source that closes before its end fails the import instead of hanging", async () => {
+    const { bare, rc, defaultTip } = await setup(SELF);
+    const source = new PassThrough();
+    const done = deferred<{ code: number }>();
+    let consumer: ChildProcess | undefined;
+    const spawner: BoundaryProcessSpawner = async (request) => {
+      if (request.argv.includes("pack-objects")) {
+        return { stdin: openSink(), stdout: source, stderr: null, completed: done.promise };
+      }
+      const { child, handle } = spawnReal(request);
+      track(child);
+      if (request.argv.includes("index-pack")) {
+        consumer = child;
+        // Once the pipe is wired: the source closes with no end and no error, the exit is clean.
+        setImmediate(() => {
+          source.destroy();
+          done.resolve({ code: 0 });
+        });
+      }
+      return handle;
+    };
+    const err = await settleWithin(
+      importError(git.withBoundaryProcessSpawner(spawner, new AbortController().signal, () =>
+        git.ensureRunnerCloneObjects(bare, rc.path, defaultTip, [rc.baseCommit]))),
+      10_000,
+      () => [consumer],
+    );
+    assert.match(err.causeMessage, /^index-pack exited \d+.* \(stopped after its peer failed\)$/s);
+    assert.ok(consumer && childGone(consumer), "the consumer process has exited");
+    assert.strictEqual(resolves(rc.path, defaultTip), false, "nothing was imported");
+  });
+
   it("inside a boundary: destroying the returned stream destroys the source", async () => {
     const { bare, revs } = await setupBig();
     const real = realSpawner();

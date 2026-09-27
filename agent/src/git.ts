@@ -72,6 +72,16 @@ function exitGatedStream(
     onAbandon?.();
   });
   source.on("error", (err) => out.destroy(err));
+  // A source that CLOSES without 'end' or 'error' (a premature close: destroyed with no error)
+  // would otherwise leave a clean exit waiting on `sourceEnded` forever, so `out` never ends
+  // and a consumer's pipeline never settles. Error `out` instead, as the stream.pipeline this
+  // replaced did. Skipped after a normal 'end', after an error already destroyed `out`, and on
+  // the abandon path (`out` is destroyed before its 'close' destroys the source). `finished`
+  // stays false, like the 'error' path, so `out`'s 'close' still tears down a live child.
+  source.on("close", () => {
+    if (sourceEnded || finished || out.destroyed) return;
+    out.destroy(new Error("git stdout closed before end (premature close)"));
+  });
   source.on("end", () => {
     sourceEnded = true;
     settle();
@@ -4090,8 +4100,10 @@ export class GitCache {
    * reap). If either side fails or the pipe breaks, the side that failed first is named in the
    * error, the other side is torn down and awaited, and a {@link RunnerCloneImportError} is
    * thrown. How a torn-down side actually ends depends on where it runs:
-   *  - outside a boundary, the producer's stdout is destroyed and its child SIGKILLed; the
-   *    consumer's stdin is destroyed and its child SIGKILLed;
+   *  - outside a boundary, the producer's stdout is destroyed and its child SIGKILLed (the
+   *    destroyed stdout's abandon hook in spawnGit may also send it a SIGTERM, before or after
+   *    the SIGKILL, while it is still live); the consumer's stdin is destroyed and its child
+   *    SIGKILLed;
    *  - inside a boundary, the handle exposes no way to signal the root, so the producer's stdout
    *    is only DESTROYED: `pack-objects` ends at its next write (EPIPE), and a producer that
    *    writes nothing more (still counting objects under `-q`) keeps running until the boundary
@@ -5067,10 +5079,12 @@ export class GitCache {
    * returns the child and its stdout so the caller can pipe/drain it.
    *
    * The returned stdout is {@link exitGatedStream}'s: it is piped from the child at once, and
-   * it ENDS only once the source has ended AND the child exited 0. A nonzero exit, a spawn
-   * error, or (inside a boundary) a rejected completion DESTROYS it with an Error carrying git's
-   * stderr instead, so a consumer streaming it (the checkpoint pack upload, the finalize import's
-   * `index-pack`) sees the failure rather than a truncated or empty pack ending cleanly. A
+   * it ENDS only once the source has ended AND the child exited 0. A nonzero exit DESTROYS it
+   * with an Error carrying git's stderr instead; a spawn error, or (inside a boundary) a rejected
+   * completion, destroys it with that error itself; a source that closes before its end (a
+   * premature close) destroys it too. So a consumer streaming it (the checkpoint pack upload,
+   * the finalize import's `index-pack`) sees the failure rather than a truncated or empty pack
+   * ending cleanly. A
    * consumer that abandons the stream (destroys it, or its pipeline fails) tears the producer
    * down: the source is unpiped and destroyed, and outside a boundary a still-live child is
    * killed.

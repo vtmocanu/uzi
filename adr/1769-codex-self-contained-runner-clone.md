@@ -99,10 +99,17 @@ supervised `boundary.spawn` and the plain `spawn`) now return
 upload and the finalize import alike: it pipes the child's stdout into the
 returned stream at once (Node's child_process `flushStdio` resumes an unread
 stdout when the child exits, so a reader that starts later would see only
-EOF), ends it only after a clean exit, destroys it with git's stderr on a
-nonzero exit, a spawn error or a rejected completion, and tears the producer
-down when a consumer abandons it (outside a boundary it also kills a
-still-live child).
+EOF), ends it only after a clean exit, destroys it with an error carrying
+git's stderr on a nonzero exit (and with the error itself on a spawn error or
+a rejected completion), and tears the producer down when a consumer abandons
+it (outside a boundary it also kills a still-live child). It also errors the
+returned stream when the source closes without `end` or `error` (a premature
+close), the guarantee `callerOwnedStdout` had from `stream.pipeline`: without
+it a clean exit would wait for an `end` that never comes and the import's
+pipe would never settle. The boundary tests "inside a boundary: a source that
+closes before its end errors the returned stream" and "inside a boundary: a
+source that closes before its end fails the import instead of hanging" pin
+it.
 
 Two parts of the branch's design stay. `spawnGit` still returns an `exited`
 promise that never rejects: inside a boundary it settles only after the

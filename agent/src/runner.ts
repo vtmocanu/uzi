@@ -673,8 +673,12 @@ export function composePushSecretBlockedReason(
  * Names the default branch once and points at docs/github-bot-setup.md. The branch name is
  * the only variable part and is clamped against a computed budget (MAX_FAILURE_REASON_LEN
  * minus the fixed prefix + suffix lengths), so the fixed suffix — the doc link and the
- * "Your diff is preserved below." pointer — always fits MAX_FAILURE_REASON_LEN and is never
- * truncated. Exported for a direct length-cap unit test.
+ * "Your diff is preserved below." pointer, or, when the diff was withheld, the "recoverable
+ * (export it with `uzi run export`)" tail — always fits MAX_FAILURE_REASON_LEN and is never
+ * truncated. The withheld align variant omits the token-scope parenthetical (the doc link
+ * covers it) to make that tail fit; its branch-name budget is then 13 characters, so a longer
+ * name is clamped with "…" rather than cutting the tail. Exported for a direct length-cap
+ * unit test.
  *
  * `stage` (issue #1769) names where the realign stopped. `"align"` (the default, byte-identical
  * to the pre-#1769 text) is the merge/rebase path above. `"import"` means uzi could not even
@@ -696,9 +700,12 @@ export function composeBaseAlignConflictReason(
       "differ from the default. uzi could not import the default branch's new objects into " +
       "the runner clone, so the run failed without pushing. "
     : ") on .github/workflows files, which uzi's GitHub bot token cannot push while they " +
-      "differ from the default (its scope is `repo`, without `workflow`, by design). uzi tried " +
-      "to merge then rebase the current default into the branch to realign those files, but could " +
-      "not realign and safely push it, so the run failed without pushing. ";
+      // The withheld align variant drops the same parenthetical, for the same reason: with it,
+      // `why` plus the withheld tail alone exceed the cap, so the branch name collapsed to "…"
+      // and the final slice cut the recovery instruction off the end.
+      (patchPreserved ? "differ from the default (its scope is `repo`, without `workflow`, by design). " : "differ from the default. ") +
+      "uzi tried to merge then rebase the current default into the branch to realign those files, " +
+      "but could not realign and safely push it, so the run failed without pushing. ";
   const suffix =
     why +
     "The work is valid; a human can rebase and land it. See docs/github-bot-setup.md." +

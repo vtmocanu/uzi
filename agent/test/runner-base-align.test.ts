@@ -1264,9 +1264,20 @@ describe("RunRunner — finalize base-align in a self-contained clone (issue #17
     const withheldTail = " The committed work is on the run's branch and is recoverable (export it with `uzi run export`).";
     assert.strictEqual(composeBaseAlignConflictReason("main"), legacy(preservedTail));
     assert.strictEqual(composeBaseAlignConflictReason("main", true, "align"), legacy(preservedTail));
-    // The align withheld text already overflows the cap: its clamp collapses the branch to "…"
-    // and the final slice cuts the tail. Pinned as-is (byte-identical), not fixed here.
-    assert.strictEqual(composeBaseAlignConflictReason("main", false, "align"), legacy(withheldTail, "…").slice(0, 512));
+    // The align withheld variant drops the token-scope parenthetical so its recovery tail fits
+    // the cap with the branch name intact (it used to overflow: the branch collapsed to "…" and
+    // the final slice cut the tail).
+    const withheld = composeBaseAlignConflictReason("main", false, "align");
+    assert.ok(withheld.length <= 512, `capped at 512 (got ${withheld.length})`);
+    assert.ok(withheld.includes("(main)"), withheld);
+    assert.ok(withheld.endsWith(withheldTail), withheld);
+    assert.ok(withheld.endsWith("`uzi run export`)."), withheld);
+    assert.ok(!withheld.includes("its scope is `repo`"), withheld);
+    assert.match(withheld, /docs\/github-bot-setup\.md/);
+    const longWithheld = composeBaseAlignConflictReason("y".repeat(600), false, "align");
+    assert.ok(longWithheld.length <= 512, `capped at 512 (got ${longWithheld.length})`);
+    assert.match(longWithheld, /\(y+…\) on \.github\/workflows/);
+    assert.ok(longWithheld.endsWith(withheldTail), longWithheld);
 
     // A real align conflict (test (c)'s fixture) keeps its status text.
     seedWorkflowsOnOrigin({ "conflict.txt": "base\n" });
