@@ -8,7 +8,7 @@
 # provides: env:E2E_FORGE_POLL_INTERVAL=2s
 # handoff:  -
 # mutates:  api:E2E_FORGE_POLL_INTERVAL=2s,FORGE_RECONCILE_EVERY=2
-# restores: -
+# restores: mr_rework off for MR_IID's source issue run (per-run override), so the still-open MR is never reworked by a later phase
 # =============================================================================
 # PRD #966 M6 — the `mr_rework` run kind had zero wire coverage. The MR review-watcher
 # (poller/mr_review_watch.go, wired unconditionally via engine.SetMRReviewWatch) queues
@@ -157,4 +157,24 @@ pass "gate control (b): a note above the high-water fired a second run $RUN_MRR2
 # --- 8/9) cleanup: every mr_rework run on MR_IID is terminal (quarantine-clean) ---
 [ "$(uzi_cli run list --json | active_mrr)" = 0 ] \
   || fail "an mr_rework run on MR !$MR_IID is still non-terminal at phase end"
-pass "all mr_rework runs on MR !$MR_IID are terminal (quarantine-clean; mr_rework_enabled left on, harmless)"
+pass "all mr_rework runs on MR !$MR_IID are terminal (quarantine-clean)"
+
+# --- 10) stop the watcher from reworking MR !$MR_IID after this phase -----------------
+# Leaving the watcher live on this still-open MR is NOT harmless: any later loss of the
+# run's rework eligibility (phase 74 deletes the owner's last Anthropic token) evicts the MR's
+# review ledger, and when eligibility returns the already-handled note reads as new, so a
+# third mr_rework starts during a later phase and the quarantine logs a LEAK (seen in CI).
+# Turn rework off for the source issue run (a per-run override, so later phases keep the
+# admin default) and let anything in flight settle.
+SRC_RUN="$(uzi_cli run list --json | jq -r --argjson mr "$MR_IID" \
+  '[.[] | select(.kind=="issue" and .mr_iid==$mr)] | first | .id // empty')"
+[ -n "$SRC_RUN" ] || fail "cleanup: could not find the issue run that owns MR !$MR_IID"
+uzi_cli run mr-rework "$SRC_RUN" --enabled=false >/dev/null \
+  || fail "cleanup: could not turn mr_rework off for run $SRC_RUN"
+[ "$(uzi_cli run get "$SRC_RUN" --json | jq -r '.mr_rework_enabled')" = false ] \
+  || fail "cleanup: run $SRC_RUN still has mr_rework enabled"
+# A poll tick already in flight when the override landed may still have dispatched a rework:
+# recheck AFTER the override and wait for any such run to finish.
+active_mrr_now() { uzi_cli run list --json | active_mrr; }
+wait_eq 0 "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}" "active mr_rework runs on MR !$MR_IID after the override" active_mrr_now
+pass "mr_rework turned off for MR !$MR_IID's source run $SRC_RUN (no later rework can start)"

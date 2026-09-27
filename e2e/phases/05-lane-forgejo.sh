@@ -7,8 +7,8 @@
 # requires: -
 # provides: -
 # handoff:  -
-# mutates:  forge_connections.forge_type gitlab->forgejo (test DB); +1 forgejo connection row via connect POST; $ENVFILE+=E2E_FORGE_POLL_INTERVAL=2s,FORGE_RECONCILE_EVERY=2 (recreates api); fake forgejo-version pinned 15.0.4 in both <16 legs
-# restores: fake forgejo-version->16.0.0 (explicit restores + EXIT-trap fail-safe)
+# mutates:  forge_connections.forge_type gitlab->forgejo (test DB); +1 forgejo connection row via connect POST; $ENVFILE+=E2E_FORGE_POLL_INTERVAL=2s,FORGE_RECONCILE_EVERY=2 (recreates api); fake forgejo-version pinned 15.0.4 in both <16 legs; admin ci_autofix_enabled->false for the Fix-CI loop
+# restores: fake forgejo-version->16.0.0; admin ci_autofix_enabled->true around the Fix-CI loop (explicit restores + EXIT-trap fail-safes)
 # PRD #65 M9 — the Forgejo lane (UZI_E2E_FORGE=forgejo). A FOCUSED lifecycle
 # against the same fake's /api/v1 table, run INSTEAD of the GitLab suite. Skipped
 # entirely when FORGE=gitlab, so the GitLab lane below is byte-identical.
@@ -183,6 +183,13 @@ pass "board cached the NEWEST run (failure) over the older success — id-DESC [
 #    here — an empty snapshot does not error and the fix run is created regardless,
 #    so this lane cannot see its content — its "failure"-job inclusion is
 #    unit-covered (handler.TestSnapshotFailedPipelineIncludesForgejoFailureJobs).
+# The admin setting ci_autofix_enabled defaults ON (#1109), and the CIAutoFix poller treats a
+# ci_fix run's own fix branch like an agent branch: the re-failure posted on it below makes
+# the poller open a SECOND ci_fix of its own just as this phase ends, which the quarantine
+# logs as a LEAK (seen in CI). This phase drives the MANUAL Fix-CI path, so disable the
+# poller for the loop; the trap restores the shipped default even if an assertion fails.
+apiput /api/admin/settings '{"settings":{"ci_autofix_enabled":"false"}}' >/dev/null
+trap 'apiput /api/admin/settings '\''{"settings":{"ci_autofix_enabled":"true"}}'\'' >/dev/null 2>&1 || true' EXIT
 say "forgejo Fix-CI loop: a 'failure' pipeline drives Fix CI → fix run → fix_failed verdict"
 FJFIX="$(apipost "/api/repos/$REPO_ID/ci-fix-runs" '{"ref":"main"}' | jq -r '.run.id')"
 { [ -n "$FJFIX" ] && [ "$FJFIX" != null ]; } \
@@ -212,6 +219,15 @@ FJFIXSHA="$(fake_state | jq -r --arg b "$FJFIXBR" '[.mrs[] | select(.source_bran
 fake_post /_e2e/actions-runs "$(jq -nc --arg b "$FJFIXBR" --arg s "$FJFIXSHA" '{branch:$b,sha:$s,status:"failure",jobs:[{name:"build",status:"failure",log:"still broken\nFAIL"}]}')" >/dev/null
 wait_verdict "$FJFIX" fix_failed 30
 pass "a re-'failure' fix pipeline stamped fix_failed (pipeline_sync IsFailed path) — the CI-fix loop works for Forgejo ✓"
+# Before autofix comes back on, take the fix branch out of its reach: the detector has no
+# MR-state gate and keys on the branch's newest cached pipeline, so a still-red fix branch
+# would only postpone the background ci_fix to the next tick. Post a green run and wait for
+# the poller to cache it.
+fake_post /_e2e/actions-runs "$(jq -nc --arg b "$FJFIXBR" --arg s "$FJFIXSHA" '{branch:$b,sha:$s,status:"success",jobs:[{name:"build",status:"success",log:"ok"}]}')" >/dev/null
+fix_branch_cached_status() { db_psql "SELECT status FROM pipeline_statuses WHERE repo_id = '$REPO_ID' AND ref = '$FJFIXBR'"; }
+wait_eq success 30 "fix branch cached pipeline" fix_branch_cached_status
+apiput /api/admin/settings '{"settings":{"ci_autofix_enabled":"true"}}' >/dev/null
+trap - EXIT  # explicit restore done; drop the fail-safe
 
 # ---------------------------------------------------------------------------
 # OPT-IN LIVE PASS (D10) — documented TODO, deliberately not wired.
