@@ -185,17 +185,32 @@ async function runFinalizeImportPart(
   const registryA = newRegistry();
   const safetyA = newSafety(registryA);
   let settledA = false;
-  await safetyA.withBoundary({ boundary: "finalize", deadlineMs: 60_000 }, (permit: any) =>
-    gitCache.withBoundaryProcessSpawner(
-      (p: unknown) => safetyA.spawnBoundaryProcess(permit, p),
-      permit.signal,
-      async () => {
-        await gitCache.ensureRunnerCloneObjects(bare, clonePath, newTipA, [baseCommit]);
-        settledA = true;
-        const aligned = await gitCache.alignBranchWithDefault(clonePath, branch, headTip, newTipA, "merge");
-        check("FINALIZE-IMPORT (a): alignBranchWithDefault returns \"aligned\"", aligned === "aligned", `result=${aligned}`);
-      },
-    ));
+  // An exception inside the boundary (e.g. align reading an object the import never brought in)
+  // is recorded as this case's align FAIL and the part continues, so every case still emits its
+  // named lines: a crash must never stand in for a red, nor skip the cases after it.
+  let alignChecked = false;
+  try {
+    await safetyA.withBoundary({ boundary: "finalize", deadlineMs: 60_000 }, (permit: any) =>
+      gitCache.withBoundaryProcessSpawner(
+        (p: unknown) => safetyA.spawnBoundaryProcess(permit, p),
+        permit.signal,
+        async () => {
+          try {
+            await gitCache.ensureRunnerCloneObjects(bare, clonePath, newTipA, [baseCommit]);
+          } finally {
+            settledA = true;
+          }
+          const aligned = await gitCache.alignBranchWithDefault(clonePath, branch, headTip, newTipA, "merge");
+          alignChecked = true;
+          check("FINALIZE-IMPORT (a): alignBranchWithDefault returns \"aligned\"", aligned === "aligned", `result=${aligned}`);
+        },
+      ));
+  } catch (err) {
+    if (!alignChecked) {
+      check("FINALIZE-IMPORT (a): alignBranchWithDefault returns \"aligned\"", false,
+        `threw ${err instanceof Error ? `${err.constructor.name}: ${err.message}` : String(err)}`);
+    }
+  }
   const postImport = await sandboxRun(`git cat-file -e ${newTipA}`);
   check("FINALIZE-IMPORT (a): sandboxed cat-file -e newTip succeeds after import",
     postImport.code === 0, `code=${postImport.code} stderr=${postImport.stderr.trim()}`);
