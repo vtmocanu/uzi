@@ -9,7 +9,7 @@
 // constraint); it is imported here, not moved.
 
 import { type RunKind, type ClaimResponse } from "./protocol.js";
-import { codeSpan } from "./pr-description.js";
+import { codeSpan, urlOrCodeSpan } from "./pr-description.js";
 import { selfImproveBranch } from "./self-improve.js";
 
 /**
@@ -145,10 +145,11 @@ export const RUN_KIND_PROFILES: Record<RunKind, RunKindProfile> = {
       claim.pipeline
         ? `Fix CI: pipeline #${claim.pipeline.id} on ${claim.pipeline.ref}`
         : undefined,
-    // The failing pipeline ref and URL (D14), rendered here by the renderer, never by the model.
+    // The failing pipeline ref and URL (D14), rendered here by the renderer, never by the model. The
+    // URL is a bare autolink only when it is plainly an http(s) URL (urlOrCodeSpan), else a code span.
     completionLine: (claim) =>
       claim.pipeline
-        ? `CI fix for the failing pipeline on ${codeSpan(claim.pipeline.ref)}: ${pipelineUrl(claim.pipeline.web_url)}`
+        ? `CI fix for the failing pipeline on ${codeSpan(claim.pipeline.ref)}: ${urlOrCodeSpan(claim.pipeline.web_url)}`
         : undefined,
   },
 
@@ -200,10 +201,3 @@ export const RUN_KIND_PROFILES: Record<RunKind, RunKindProfile> = {
       `Automated MR rework (PRD #700) addressing review feedback on ${codeSpan(ctx.branch)}. There is no tracking issue, so this PR closes nothing.`,
   },
 };
-
-/** The ci_fix pipeline URL as the api sent it when it is a plain http(s) URL (a forge autolinks
- *  it), else as a code span, so an odd value can never inject markup into the completion block. */
-function pipelineUrl(url: string): string {
-  const t = url.trim();
-  return /^https?:\/\/[^\s<>()[\]`*~\\]+$/iu.test(t) ? t : codeSpan(t);
-}

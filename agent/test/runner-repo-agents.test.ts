@@ -341,7 +341,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
     );
   });
 
-  it("the MR description carries the repo-agents marker only when the run used repo agents", async () => {
+  it("the MR description carries the repo-agents note only when the run used repo agents", async () => {
     // A fake executor that reports which roster the implement phase ran with — the
     // stub does not, so the marker is driven directly here (the SDK executor sets it).
     // These inline executors commit nothing; model committed work so both runs reach the
@@ -363,15 +363,17 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
     const repoGl = fakeGitlab();
     await runner(repoExec, repoGl.gitlab).execute(gitlabClaim(34));
     const repoBody = JSON.parse(repoGl.calls[0]!.body ?? "{}");
-    assert.match(
-      repoBody.description,
-      /repository's own `\.claude\/agents\/`/,
-      "repo-source MR carries the marker",
+    // PRD #1798 (user decision): one short agents line in the completion block, no agent list.
+    assert.ok(
+      repoBody.description.includes(
+        "Internally reviewed by the repository's own agents, not uzi's built-in reviewer.",
+      ),
+      "repo-source MR carries the one-line agents note",
     );
-    assert.match(
+    assert.doesNotMatch(
       repoBody.description,
-      /coder, auditor/,
-      "the marker names the roster",
+      /coder|auditor/,
+      "the note does not list the roster",
     );
 
     const ownGl = fakeGitlab();
@@ -379,7 +381,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
     const ownBody = JSON.parse(ownGl.calls[0]!.body ?? "{}");
     assert.ok(
       !/repository's own/.test(ownBody.description),
-      "an own-source MR has no repo marker",
+      "an own-source MR has no repo-agents note",
     );
   });
 });

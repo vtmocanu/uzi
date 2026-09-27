@@ -726,6 +726,53 @@ func TestSanitizePrDescriptionQuickActions(t *testing.T) {
 	}
 }
 
+// TestSanitizePrDescriptionForgejoBangRefs (H2): Forgejo reads `!N` and `owner/repo!N` after a
+// close keyword, and its issues and pull requests share one numbering, so `Fixes !7` closes issue
+// 7. Every such form is broken in place; a bang reference with no keyword is left as written.
+func TestSanitizePrDescriptionForgejoBangRefs(t *testing.T) {
+	bangProbe := regexp.MustCompile(`(?i)\b(clos(e[sd]?|ing)|fix(e[sd]|ing)?|resolv(e[sd]?|ing)|implement(s|ed|ing)?)\b[\s\p{Z}]*:?[\s\p{Z}]*(issues?[\s\p{Z}]*)?([\w.-]+(/[\w.-]+)*)?!\d+`)
+	for _, in := range []string{
+		"Fixes !7",
+		"closes !12 today",
+		"Resolves: !7",
+		"Fixes:!7",
+		"Fixes issue !7",
+		"Fixes owner/repo!7",
+		"Fixes group/sub/project!7",
+		"Implements o/r!7",
+		"Fix**es** !7",
+		"_Fixes_ !7",
+		"Fixes\u00A0!7",
+	} {
+		got := SanitizePrDescriptionText(in, 600)
+		if !strings.Contains(got, zw) {
+			t.Errorf("no breaker inserted: in=%q out=%q", in, got)
+		}
+		if m := bangProbe.FindString(closingViewStrip(got)); m != "" {
+			t.Errorf("bang closing reference survived: in=%q out=%q match=%q", in, got, m)
+		}
+		if again := SanitizePrDescriptionText(got, 600); again != got {
+			t.Errorf("not idempotent: %q -> %q", got, again)
+		}
+	}
+	// No keyword, or a keyword with no bang reference right after it: left exactly as written.
+	for _, in := range []string{"See !7 for context.", "Fixes it! 7 times", "Merged in !7."} {
+		if got := SanitizePrDescriptionText(in, 600); got != in {
+			t.Errorf("non-directive text changed: in=%q out=%q", in, got)
+		}
+	}
+}
+
+// closingViewStrip removes the markdown markers a forge drops when rendering (the widest reading).
+func closingViewStrip(s string) string {
+	return strings.Map(func(r rune) rune {
+		if strings.ContainsRune("*_~`[]\\", r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 // TestValidPrDescSizeUnavailable (N5): an unavailable size with all-zero buckets (exactly what
 // the worker sends when the size cannot be computed) is accepted; a non-zero bucket is not.
 func TestValidPrDescSizeUnavailable(t *testing.T) {

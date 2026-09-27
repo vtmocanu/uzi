@@ -15,7 +15,7 @@
 // (parseOwnedBlocks / composeBody). No I/O happens here: the publisher (next unit) reads the forge,
 // stages / binds / acks through the api and writes.
 //
-// Two kinds of text reach a block, and they are escaped differently:
+// Three kinds of text reach a block, and they are escaped differently:
 //
 //   - API-SANITIZED fields (summary, changes, scope notes, review pointers, verification commands):
 //     already escaped by the api's sanitizer (D7: markdown block syntax, `<`, links, mentions,
@@ -23,14 +23,21 @@
 //     Cf-stripped (stripping the U+200B breakers would re-form the directives). The renderer accepts
 //     them only as a real SanitizedPrDescriptionFields instance (checked at runtime with `is()`).
 //   - DETERMINISTIC interpolations (branch names, milestone ids / titles / reasons, accepted criteria,
-//     gate directories, the ci_fix pipeline ref): run data the api never sanitized, some of it
-//     attacker- or owner-typed. They go through escapeInline (markdown escaping, `@` and closing-
-//     keyword neutralisation with U+200B like the api, a leading `/`) or codeSpan (a code span whose
-//     closing keywords are broken the same way).
+//     gate directories, the ci_fix pipeline ref, the changed paths a kind section lists): run data the
+//     api never sanitized, some of it attacker- or owner-typed. They go through escapeInline
+//     (markdown escaping, `@` and closing-keyword neutralisation with U+200B like the api, a leading
+//     `/`) or codeSpan (a code span whose closing keywords, mentions and `<!--` are broken the same
+//     way). A kind section (KindSection) carries them in typed slots that this module escapes; its
+//     fixed lines are the worker's own wording, and are still neutralised line by line.
+//   - FIXED wording of this module and its callers (the footer, the agents line, the partial
+//     warnings, the unverified banner).
 //
-// closingDirectiveFor is the whole-body interlock scan (D10 rule 1): it ports the api sanitizer's
-// prDescClosing pattern and its marker-stripped views, so every form the sanitizer would neutralise
-// is caught, and extends it to GitLab's reference lists (`Closes #1, #2 and #3`).
+// closingDirectiveFor is the whole-body interlock scan (D10 rule 1): the api sanitizer's
+// prDescClosing pattern (with Forgejo's `!N` references) over the raw text and over a RENDERED view
+// that mirrors the api's prDescNormalize (entities decoded to a fixed point, format characters but
+// U+200B dropped, HTML comments, tags, images and link targets removed), each in the api's three
+// marker views, and extended to GitLab's reference lists (`Closes #1, #2 and #3`). It is a detector
+// for text a forge may read as closing, so where the two could disagree it errs towards "closing".
 
 import { createHash } from "node:crypto";
 import { SanitizedPrDescriptionFields } from "./client.js";
@@ -57,17 +64,31 @@ const ZWSP = "\u200B";
 
 // ── Closing directives (port of api/internal/workersvc/pr_description_sanitize.go) ──────────
 
+/** The largest description a forge accepts (GitLab's 1,048,576-character limit, the largest of the
+ *  three forges), in UTF-16 code units. Longer text cannot be a forge body: closingDirectiveFor
+ *  reports it as closing and parseOwnedBlocks as malformed, so no scan runs over it (fail closed). */
+export const FORGE_BODY_MAX_CHARS = 1_048_576;
+
 // The keyword half of prDescClosing, verbatim (group 1 of the Go pattern). `\b` on both sides.
 const KEYWORD_SRC = String.raw`\b(clos(?:e[sd]?|ing)|fix(?:e[sd]|ing)?|resolv(?:e[sd]?|ing)|implement(?:s|ed|ing)?)\b`;
 // One reference, the alternatives of prDescClosing's last group, each capturing what resolution
-// needs: 1 = `#N`, 2 = `gh-N`, 3/4 = `path#N`, 5 = an external-tracker key's number, 6/7 = an
-// issue or work-item URL (the part before `/issues|work_items/`, and N).
+// needs (refResolves): 1 = `#N` / `!N`, 2 = `gh-N`, 3/6 = `path#N` / `path!N`, 7 = an external-
+// tracker key's number, 8/9 = an issue or work-item URL (the part before `/issues|work_items/`, and
+// N); 4 and 5 are internal. Forgejo reads `!N` after a close keyword and numbers issues and pull
+// requests together, so `Fixes !7` closes issue 7. Bounds keep every scan linear in V8's
+// backtracking engine (the api's RE2 is linear without them): a path segment is at most 255
+// characters (no forge allows a longer namespace or project name) and is matched atomically (the
+// `(?=(x))\N` idiom: a segment is always followed by `/`, `#` or `!`, none of which it can hold,
+// so no shorter segment could match), and a URL's part before `/issues/` is at most 300 characters
+// (GitLab's own bound). Groups are numbered absolutely: no pattern embedding REF_SRC captures before it.
 const REF_SRC =
-  String.raw`(?:#(\d+)|gh-(\d+)|([\w.-]+(?:\/[\w.-]+)*)#(\d+)|[A-Za-z][A-Za-z0-9_]+-(\d+)|(https?:\/\/[^\s<>()]*?)\/(?:issues|work_items)\/(\d+))`;
+  String.raw`(?:[#!](\d+)|gh-(\d+)|((?=([\w.-]{1,255}))\4(?:\/(?=([\w.-]{1,255}))\5)*)[#!](\d+)|[A-Za-z][A-Za-z0-9_]+-(\d+)|(https?:\/\/[^\s<>()]{0,300}?)\/(?:issues|work_items)\/(\d+))`;
 const SP = String.raw`[\s\p{Z}]`;
 const KEYWORD_RE = new RegExp(KEYWORD_SRC, "giu");
-/** The first reference after a keyword, exactly prDescClosing's tail (sticky at the keyword end). */
-const FIRST_REF_RE = new RegExp(`${SP}*:?${SP}*(?:issues?${SP}*)?${REF_SRC}`, "iuy");
+/** The first reference after a keyword, prDescClosing's tail (sticky at the keyword end). The Go
+ *  `SP*:?SP*` is spelled `SP*(?::SP*)?` (the same language): two adjacent stars over one class
+ *  backtrack quadratically on a long space run in V8. */
+const FIRST_REF_RE = new RegExp(`${SP}*(?::${SP}*)?(?:issues?${SP}*)?${REF_SRC}`, "iuy");
 /** A further reference of a GitLab reference list (`#1, #2 and issue #3`): a comma and/or `and`
  *  separator, or plain whitespace, then an optional `issue(s)`. */
 const NEXT_REF_RE = new RegExp(`(?:${SP}*,${SP}*(?:and${SP}+)?|${SP}+and${SP}+|${SP}+)(?:issues?${SP}*)?${REF_SRC}`, "iuy");
@@ -100,10 +121,204 @@ function closingViews(s: string): View[] {
   return [{ text: s }, { text: removed, map }, { text: blanked }];
 }
 
-// The entity spellings of `#` a human could type so the raw text hides the reference from a scan
-// while the rendered text shows it. The api decodes every entity before it neutralises; here a
-// fourth view decodes these (the only character a reference cannot do without).
-const HASH_ENTITY_RE = /&(?:#0*35|#x0*23|num);/giu;
+// ── The rendered view (a mirror of the api's prDescNormalize) ──
+
+/** prDescMaxPasses: every fixed-point loop is bounded; input that has not converged by then is
+ *  treated as closing (the api sanitizes it to ""). */
+const MAX_PASSES = 8;
+
+// The named entities whose character can matter to a closing directive or to the markup the view
+// removes: spaces, `#` / `!`, path and URL punctuation, the view's marker characters, `<` / `>` /
+// `&`, and the invisible format characters (U+200B among them; it stays, see below). A name not
+// here is left as written, which only keeps text the forge would show differently (letters and
+// digits have no named entity).
+const NAMED_ENTITIES: Readonly<Record<string, string>> = {
+  amp: "&", AMP: "&", lt: "<", LT: "<", gt: ">", GT: ">", quot: '"', QUOT: '"', apos: "'",
+  num: "#", excl: "!", sol: "/", colon: ":", period: ".", comma: ",", semi: ";", lowbar: "_", UnderBar: "_",
+  ast: "*", midast: "*", grave: "`", DiacriticalGrave: "`", lsqb: "[", lbrack: "[", rsqb: "]", rbrack: "]",
+  bsol: "\\", commat: "@", lpar: "(", rpar: ")", equals: "=", plus: "+", verbar: "|", vert: "|", VerticalLine: "|",
+  lcub: "{", lbrace: "{", rcub: "}", rbrace: "}", dollar: "$", percnt: "%", quest: "?", Hat: "^",
+  nbsp: "\u00A0", NonBreakingSpace: "\u00A0", ensp: "\u2002", emsp: "\u2003", emsp13: "\u2004", emsp14: "\u2005",
+  numsp: "\u2007", puncsp: "\u2008", thinsp: "\u2009", ThinSpace: "\u2009", hairsp: "\u200A", VeryThinSpace: "\u200A",
+  MediumSpace: "\u205F", NewLine: "\n", Tab: "\t",
+  shy: "\u00AD", zwnj: "\u200C", zwj: "\u200D", lrm: "\u200E", rlm: "\u200F", NoBreak: "\u2060",
+  ApplyFunction: "\u2061", af: "\u2061", InvisibleTimes: "\u2062", it: "\u2062", InvisibleComma: "\u2063", ic: "\u2063",
+  ZeroWidthSpace: "\u200B", NegativeVeryThinSpace: "\u200B", NegativeThinSpace: "\u200B",
+  NegativeMediumSpace: "\u200B", NegativeThickSpace: "\u200B",
+};
+// The legacy names HTML (and Go's html.UnescapeString) also decode with no `;`.
+const LEGACY_ENTITIES = ["amp", "AMP", "lt", "LT", "gt", "GT", "quot", "QUOT", "nbsp", "shy"];
+const ENTITY_RE = /&(?:#([0-9]+)|#[xX]([0-9A-Fa-f]+)|([A-Za-z][A-Za-z0-9]{0,31}))(;?)/gu;
+
+function codePointText(cp: number): string {
+  if (!Number.isFinite(cp) || cp === 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return "\uFFFD";
+  return String.fromCodePoint(cp);
+}
+
+function decodeEntitiesOnce(s: string): string {
+  return s.replace(ENTITY_RE, (all, dec: string | undefined, hex: string | undefined, name: string | undefined, semi: string) => {
+    if (dec !== undefined) {
+      const d = dec.replace(/^0+/u, "");
+      return codePointText(d.length > 8 ? Infinity : Number(d || "0")) ;
+    }
+    if (hex !== undefined) {
+      const h = hex.replace(/^0+/u, "");
+      return codePointText(h.length > 7 ? Infinity : Number.parseInt(h || "0", 16));
+    }
+    const n = name!;
+    if (semi && Object.hasOwn(NAMED_ENTITIES, n)) return NAMED_ENTITIES[n]!;
+    // No `;` (or an unknown name): the longest legacy name that prefixes it, as HTML decodes.
+    let best = "";
+    for (const l of LEGACY_ENTITIES) if (n.startsWith(l) && l.length > best.length) best = l;
+    return best ? NAMED_ENTITIES[best]! + all.slice(1 + best.length) : all;
+  });
+}
+
+/** decodePrDescEntities: decode until the text stops changing, within MAX_PASSES passes. */
+function decodeEntities(s: string): string {
+  for (let i = 0; i < MAX_PASSES && s.includes("&"); i++) {
+    const u = decodeEntitiesOnce(s);
+    if (u === s) return s;
+    s = u;
+  }
+  return s;
+}
+
+/** termsafe.SanitizeBounded's strip (controls but `\n` / `\t`, and every format character), EXCEPT
+ *  U+200B: the api inserts it as its closing-keyword breaker and every forge reads it as breaking
+ *  the keyword, so keeping it is what lets a sanitized field read as non-closing here. */
+function stripFormat(s: string): string {
+  return s.replace(/[\p{Cc}\p{Cf}]/gu, (c) => (c === "\n" || c === "\t" || c === ZWSP ? c : ""));
+}
+
+/** The index of the next `ch` at or after each position (length n + 2, `n` when there is none), so
+ *  a scanner can ask "where does this bracket close" in O(1) instead of rescanning. */
+function nextIndex(s: string, ch: string): Int32Array {
+  const n = s.length;
+  const out = new Int32Array(n + 2).fill(n);
+  for (let i = n - 1; i >= 0; i--) out[i] = s[i] === ch ? i : out[i + 1]!;
+  return out;
+}
+
+/** HTML comments, terminated or not, left to right in one linear pass: a terminated comment goes;
+ *  an unterminated opener goes with everything after it (prDescHTMLComment, then
+ *  prDescUnterminatedCmnt; the caller's loop removes a comment one removal exposes). */
+function stripComments(s: string): string {
+  let out = "";
+  let i = 0;
+  for (;;) {
+    const open = s.indexOf("<!--", i);
+    if (open < 0) return out + s.slice(i);
+    out += s.slice(i, open);
+    const close = s.indexOf("-->", open + 4);
+    if (close < 0) return out;
+    i = close + 3;
+  }
+}
+
+/** prDescImage (`![alt](t)`, `![alt][r]`, `![alt][]`, `![alt]`), removed whole, in one linear pass. */
+function stripImages(s: string): string {
+  if (!s.includes("![")) return s;
+  const n = s.length;
+  const rb = nextIndex(s, "]");
+  const rp = nextIndex(s, ")");
+  let out = "";
+  let i = 0;
+  for (;;) {
+    const at = s.indexOf("![", i);
+    if (at < 0) break;
+    const j = rb[at + 2]!;
+    if (j >= n) break; // no `]` after it, so none after any later `![` either
+    let end = j + 1;
+    if (s[end] === "(" && rp[end + 1]! < n) end = rp[end + 1]! + 1;
+    else if (s[end] === "[" && rb[end + 1]! < n) end = rb[end + 1]! + 1;
+    out += s.slice(i, at);
+    i = end;
+  }
+  return out + s.slice(i);
+}
+
+/** prDescLinkInline (`[text](target)`) and prDescLinkRef (`[text][ref]`): the text is kept, the
+ *  target dropped; a label holding a backslash is not a link here (as in the api). Linear. */
+function stripLinks(s: string, kind: "inline" | "ref"): string {
+  if (!s.includes("[")) return s;
+  const n = s.length;
+  const rb = nextIndex(s, "]");
+  const bs = nextIndex(s, "\\");
+  const rp = nextIndex(s, ")");
+  let out = "";
+  let i = 0;
+  let from = 0;
+  for (;;) {
+    const at = s.indexOf("[", from);
+    if (at < 0) break;
+    const j = rb[at + 1]!;
+    if (j >= n) break;
+    const closeAt = kind === "inline" ? (s[j + 1] === "(" ? rp[j + 2]! : n) : s[j + 1] === "[" ? rb[j + 2]! : n;
+    if (bs[at + 1]! < j || closeAt >= n) {
+      from = at + 1;
+      continue;
+    }
+    out += s.slice(i, at) + s.slice(at + 1, j);
+    i = from = closeAt + 1;
+  }
+  return out + s.slice(i);
+}
+
+// prDescHTMLNames / prDescHTMLAttr / prDescHTMLTag, verbatim: a known lowercase element name, so a
+// PascalCase generic (`Promise<Data>`) is not read as an element.
+const HTML_NAMES =
+  String.raw`(?:abbr|address|area|article|aside|audio|base|bdi|bdo|big|blockquote|body|br|button|` +
+  String.raw`canvas|caption|center|cite|code|col|colgroup|data|datalist|dd|del|details|dfn|dialog|dir|div|dl|dt|em|` +
+  String.raw`embed|fieldset|figcaption|figure|font|footer|form|frame|frameset|h[1-6]|head|header|hgroup|hr|html|` +
+  String.raw`iframe|img|input|ins|kbd|label|legend|li|link|main|map|mark|marquee|math|menu|meta|meter|nav|noscript|` +
+  String.raw`object|ol|optgroup|option|output|param|picture|pre|progress|rp|rt|ruby|samp|script|section|select|` +
+  String.raw`slot|small|source|span|strike|strong|style|sub|summary|sup|svg|table|tbody|td|template|textarea|` +
+  String.raw`tfoot|th|thead|time|title|tr|track|tt|ul|var|video|wbr)|[abipqsu]`;
+const HTML_ATTR = String.raw`${SP}+[A-Za-z_:][A-Za-z0-9_.:-]*(?:${SP}*=${SP}*(?:[^\s\p{Z}"'=<>\x60]+|'[^']*'|"[^"]*"))?`;
+const HTML_TAG_RE = new RegExp(`<(?:${HTML_NAMES})(?:${HTML_ATTR})*${SP}*\\/?>|<\\/(?:${HTML_NAMES})${SP}*>`, "gu");
+const AUTOLINK_RE = /<((?:[Hh][Tt][Tt][Pp][Ss]?|[Ff][Tt][Pp]):\/\/[^\s<>]+)>/gu;
+const COMMENT_OPEN_RE = /<!-{2,}/gu;
+// prDescCommentClose (`-{2,}!?>`), anchored at the start of a dash run by the lookbehind: the same
+// matches (a leftmost match always starts a run), without V8 re-scanning a long run at every dash.
+const COMMENT_CLOSE_RE = /(?<!-)-{2,}!?>/gu;
+
+/** stripPrDescMarkup: one pass of each rule, in the api's order. */
+function stripMarkup(s: string): string {
+  if (s.includes("<!--")) s = stripComments(s);
+  if (s.includes("[")) s = stripLinks(stripLinks(stripImages(s), "inline"), "ref");
+  if (s.includes("<")) s = s.replace(AUTOLINK_RE, "$1").replace(HTML_TAG_RE, "").replace(COMMENT_OPEN_RE, "");
+  if (s.includes("--")) s = s.replace(COMMENT_CLOSE_RE, "->");
+  return s;
+}
+
+/**
+ * The text as a forge renders it, for the closing scan: prDescNormalize's fixed-point loop
+ * (entities decoded to their own fixed point, controls and format characters stripped, HTML
+ * comments, known tags, images and link targets removed) with two differences: U+200B is kept
+ * (see stripFormat), and whitespace is not collapsed (the closing pattern reads any space run).
+ * undefined when MAX_PASSES passes did not converge (the caller fails closed).
+ */
+function renderedView(s: string): string | undefined {
+  for (let i = 0; i < MAX_PASSES; i++) {
+    const prev = s;
+    s = stripMarkup(stripFormat(decodeEntities(s)));
+    if (s === prev) return s;
+  }
+  return undefined;
+}
+
+/** For each index, the end of the run of ASCII path characters (`[A-Za-z0-9_.-]`) starting there. */
+function pathRunEnds(text: string): Int32Array {
+  const n = text.length;
+  const out = new Int32Array(n + 1).fill(n);
+  for (let i = n - 1; i >= 0; i--) {
+    const c = text.charCodeAt(i);
+    const path = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 46 || c === 45;
+    out[i] = path ? out[i + 1]! : i;
+  }
+  return out;
+}
 
 function sameNumber(digits: string | undefined, iid: number): boolean {
   return digits !== undefined && /^\d+$/.test(digits) && Number(digits) === iid;
@@ -139,33 +354,49 @@ function urlCouldBe(prefix: string, repoPath: string | undefined): boolean {
 
 function refResolves(m: RegExpExecArray, iid: number, repoPath: string | undefined): boolean {
   if (sameNumber(m[1], iid) || sameNumber(m[2], iid)) return true;
-  if (m[3] !== undefined && sameNumber(m[4], iid)) return pathCouldBe(m[3], repoPath);
+  if (m[3] !== undefined && sameNumber(m[6], iid)) return pathCouldBe(m[3], repoPath);
   // An external-tracker key (`ABC-12`): GitLab reads it only with an external tracker, which a uzi
   // issue run never uses, but a matching number is still treated as closing (fail closed).
-  if (sameNumber(m[5], iid)) return true;
-  if (m[6] !== undefined && sameNumber(m[7], iid)) return urlCouldBe(m[6], repoPath);
+  if (sameNumber(m[7], iid)) return true;
+  if (m[8] !== undefined && sameNumber(m[9], iid)) return urlCouldBe(m[8], repoPath);
   return false;
 }
 
 /**
  * True when `body` carries a closing directive that could close issue `issueIid` of the repo at
  * `repoPath` (`owner/repo` or `group/sub/project`; omit it to treat every qualified reference as
- * possibly this repo's). The scan is the api sanitizer's prDescClosing pattern over the same three
- * views (raw, markers removed, markers blanked) plus a view with `#` entities decoded, and each
- * keyword's GitLab reference list is followed, so `Resolves #7, #8 and #9` closes #9 here too.
+ * possibly this repo's). The scan is the api sanitizer's prDescClosing pattern, over the raw text
+ * and over its rendered view (renderedView: `Fi&#120;es #7`, `Fix<b></b>es #7`, `Clo<!-- -->ses #5`
+ * and `Fixes <span>o/r#7</span>` all read as closing), each in the api's three marker views (raw,
+ * markers removed, markers blanked), and each keyword's GitLab reference list is followed, so
+ * `Resolves #7, #8 and #9` closes #9 here too.
+ *
+ * Fails closed (true): an issueIid that is not a non-negative safe integer, a body over
+ * FORGE_BODY_MAX_CHARS, or a rendered view that does not converge.
  *
  * The U+200B breaker the api inserts after a keyword's first letter is NOT removed: a forge does not
  * remove it either, so a sanitized field is correctly read as non-closing.
  */
 export function closingDirectiveFor(body: string, issueIid: number, repoPath?: string): boolean {
-  if (!Number.isSafeInteger(issueIid) || issueIid < 0) return false;
-  const decoded = body.replace(HASH_ENTITY_RE, "#");
-  const views = closingViews(body).map((v) => v.text);
-  if (decoded !== body) views.push(...closingViews(decoded).map((v) => v.text));
+  if (!Number.isSafeInteger(issueIid) || issueIid < 0) return true;
+  if (body.length > FORGE_BODY_MAX_CHARS) return true;
+  const rendered = renderedView(body);
+  if (rendered === undefined) return true;
+  const views = new Set(closingViews(body).map((v) => v.text));
+  if (rendered !== body) for (const v of closingViews(rendered)) views.add(v.text);
   for (const text of views) {
+    let runs: Int32Array | undefined;
     for (const kw of text.matchAll(KEYWORD_RE)) {
+      const end = kw.index + kw[0].length;
+      // A keyword glued to `.` / `-` (`fix-fix-…`) can only be followed by a path reference that
+      // starts right there; when that run of path characters is over 255 long no reference can
+      // match, so skip the regex, which would otherwise pay up to 255 steps per such keyword.
+      if (text[end] === "." || text[end] === "-") {
+        runs ??= pathRunEnds(text);
+        if (runs[end]! - end > 255) continue;
+      }
       let re = FIRST_REF_RE;
-      re.lastIndex = kw.index + kw[0].length;
+      re.lastIndex = end;
       let m = re.exec(text);
       while (m) {
         if (refResolves(m, issueIid, repoPath)) return true;
@@ -235,6 +466,12 @@ const INLINE_SPECIAL_RE = /[\\`*_[\]<>|~$&{}!]/gu;
 // marker, escaped when the text is the first thing on a line.
 const LEADING_ORDERED_RE = /^(\d{1,9})([.)])/u;
 
+/** One line of plain text: every whitespace run (newlines included, so no block can open) becomes
+ *  one space, invisible runes are dropped, and the ends are trimmed. */
+function flatten(s: string): string {
+  return s.replace(/[\s\p{Z}]+/gu, " ").replace(INVISIBLE_RE, "").replace(/ {2,}/gu, " ").trim();
+}
+
 /**
  * Escape one deterministic string for inline markdown (D7): control and format runes dropped,
  * whitespace collapsed to single spaces (a newline could open a block), markdown / HTML / GitLab
@@ -242,7 +479,7 @@ const LEADING_ORDERED_RE = /^(\d{1,9})([.)])/u;
  * and `@mention` broken with U+200B exactly as the api's sanitizer does.
  */
 export function escapeInline(s: string): string {
-  let t = s.replace(/[\s\p{Z}]+/gu, " ").replace(INVISIBLE_RE, "").trim();
+  let t = flatten(s);
   t = t.replace(INLINE_SPECIAL_RE, (c) => `\\${c}`);
   const ordered = LEADING_ORDERED_RE.exec(t);
   if (ordered) t = `${ordered[1]}\\${ordered[2]}${t.slice(ordered[0].length)}`;
@@ -250,20 +487,39 @@ export function escapeInline(s: string): string {
   return breakMentions(breakClosingKeywords(t, "all"));
 }
 
+/** What codeSpan renders for a string that is empty once flattened (an empty span renders as two
+ *  literal backticks). */
+const EMPTY_CODE = "(empty)";
+
 /**
- * Render one deterministic string as an inline code span (branch names, ids, directories): the
- * backtick fence is one longer than the longest backtick run inside, padded with a space when the
- * text starts or ends with a backtick, and a closing keyword that forms a directive (or ends the
- * text) is broken with U+200B, because a closing-directive scan that drops code markers (the api's
- * own removed view) reads straight through a code span. An `@mention` is broken as in escapeInline
- * (a forge does not link one inside code, but the breaker is invisible and costs nothing). Controls and format runes are dropped and whitespace collapsed.
+ * Render one deterministic string as an inline code span (branch names, ids, directories, changed
+ * paths): the backtick fence is one longer than the longest backtick run inside, padded with a
+ * space when the text starts or ends with a backtick, and a closing keyword that forms a directive
+ * (or ends the text) is broken with U+200B, because a closing-directive scan that drops code markers
+ * (the api's own removed view) reads straight through a code span. An `@mention` is broken as in
+ * escapeInline (a forge does not link one inside code, but the breaker is invisible and costs
+ * nothing), and so is every `<!--`, so a marker-shaped path can never be read as one of uzi's block
+ * markers. Controls and format runes are dropped and whitespace collapsed (so a newline in a path
+ * cannot start a line, a quick action included). An empty string renders as "(empty)".
  */
 export function codeSpan(s: string): string {
-  const t = breakMentions(breakClosingKeywords(s.replace(/[\s\p{Z}]+/gu, " ").replace(INVISIBLE_RE, "").trim(), "directives"));
-  const longest = Math.max(0, ...[...t.matchAll(/`+/gu)].map((m) => m[0].length));
+  const flat = flatten(s);
+  if (flat === "") return EMPTY_CODE;
+  const t = breakMentions(breakClosingKeywords(flat, "directives")).replace(/<!--/gu, `<${ZWSP}!--`);
+  let longest = 0;
+  for (const m of t.matchAll(/`+/gu)) longest = Math.max(longest, m[0].length);
   const fence = "`".repeat(longest + 1);
   const pad = t.startsWith("`") || t.endsWith("`") ? " " : "";
   return `${fence}${pad}${t}${pad}${fence}`;
+}
+
+/** A URL the api sent (the ci_fix pipeline URL), as a bare http(s) URL a forge autolinks when it is
+ *  plainly one (no whitespace, no markdown or HTML syntax, no closing directive), else as a code
+ *  span, so an odd value can never inject markup, a link or a directive into the completion block. */
+export function urlOrCodeSpan(url: string): string {
+  const t = url.trim();
+  const plain = /^https?:\/\/[^\s<>()[\]`*~\\"'{}|$!@]+$/iu.test(t) && breakClosingKeywords(t, "directives") === t;
+  return plain ? t : codeSpan(t);
 }
 
 /** The first 7 characters of a hex SHA, lowercased; anything else is shown escaped in a code span. */
@@ -307,7 +563,7 @@ export interface RenderedRegion {
   fallback?: RegionFallback;
 }
 
-const RUNG2_NOTE = "Summary written by the agent, not checked against the diff.";
+const RUNG2_NOTE = "_Summary written by the agent, not checked against the diff._";
 
 const SCOPE_LABEL: Record<SanitizedPrDescriptionFields["scope_notes"][number]["kind"], string> = {
   added: "Added",
@@ -332,6 +588,14 @@ function wrapRegion(parts: string[]): string {
   return [REGION_START, ...parts, REGION_END].join("\n");
 }
 
+/**
+ * The region with no fields: the size line and the provenance line, each only when known. When the
+ * caller passes no head or target (mrDescription at MR creation today) the region is the size line
+ * ALONE, with no provenance line: bodies created now carry exactly
+ * `REGION_START + "\n" + sizeLine + "\n" + REGION_END`. That shape is uzi's own deterministic region
+ * (no model text, nothing to verify against a head), and the publisher (next unit) must treat it as
+ * such, not as a human-edited or foreign region.
+ */
 function deterministicRegion(input: RegionInput): string {
   const parts: string[] = [];
   const size = sizeLineOf(input);
@@ -361,7 +625,6 @@ function verificationLines(fields: SanitizedPrDescriptionFields, input: RegionIn
       ...g.lines,
     );
   }
-  if (input.source === "lead_only") out.push(...(out.length ? [""] : []), RUNG2_NOTE);
   return out;
 }
 
@@ -369,6 +632,9 @@ function fieldsRegion(fields: SanitizedPrDescriptionFields, input: RegionInput):
   const blocks: string[][] = [];
   const summary = fields.summary.trim();
   if (summary) blocks.push([summary]);
+  // D8 rung 2: the note qualifies the summary, so it follows it, never under "### Verification"
+  // (which a lead_only version with no reported checks would otherwise render with only the note).
+  if (input.source === "lead_only") blocks.push([RUNG2_NOTE]);
   const size = sizeLineOf(input);
   if (size) blocks.push([size]);
   if (fields.changes.length) blocks.push(["### What changed", ...fields.changes.map((c) => `- ${c}`)]);
@@ -427,6 +693,58 @@ const REPO_AGENTS_LINE = "Internally reviewed by the repository's own agents, no
 const BRIDGE_SENTENCE =
   "This branch contains a history bridge: a published commit was restored as an ancestor so the branch fast-forwards without a force-push, and `git log --first-parent` still reads as the intended history.";
 
+/**
+ * One line of a kind section (D14: the self_improve evidence, the prompt run's guard-critical
+ * paths), as structured data, so this renderer escapes every run-derived value itself rather than
+ * trusting a pre-rendered string:
+ *
+ *   - `fixed`: the caller's own constant wording (a heading, a warning sentence, "" for a blank
+ *     line). Still neutralised line by line (renderFixedLine), so a fixed line can never open a
+ *     quick action, a mention, a closing directive or raw HTML even if run data leaks into one.
+ *   - `path`: a changed file path (from `git diff --name-only -z`, so agent-chosen: newlines,
+ *     backticks and `<` survive). Rendered as a quoted list item holding a codeSpan.
+ *   - `check`: one self_improve check result; the name and detail are escaped with escapeInline.
+ */
+export type KindSectionLine =
+  | { fixed: string }
+  | { path: string }
+  | { check: { name: string; status: "passed" | "failed" | "skipped"; detail: string } };
+
+/** A kind section: its lines in order. An empty section renders nothing. */
+export type KindSection = readonly KindSectionLine[];
+
+function checkEmoji(status: "passed" | "failed" | "skipped"): string {
+  return status === "passed" ? "✅" : status === "failed" ? "❌" : "⚠️";
+}
+
+/** A fixed line, defensively: flattened to one line, `<` encoded (no raw HTML or comment, so no
+ *  forged block marker), a leading `/` escaped (no GitLab quick action), and closing keywords that
+ *  form a directive and `@mentions` broken with U+200B. Markdown emphasis, code and a leading `>`,
+ *  `#` or `-` are the wording's own and are kept. */
+function renderFixedLine(s: string): string {
+  let t = flatten(s).replace(/</gu, "&lt;");
+  if (t.startsWith("/")) t = `\${t}`;
+  return breakMentions(breakClosingKeywords(t, "directives"));
+}
+
+function renderKindSectionLine(line: KindSectionLine): string {
+  if ("path" in line) return `> - ${codeSpan(line.path)}`;
+  if ("check" in line) {
+    const c = line.check;
+    const status = c.status === "passed" || c.status === "failed" ? c.status : "skipped";
+    return `- ${checkEmoji(status)} ${escapeInline(c.name)} — ${status} (${escapeInline(c.detail)})`;
+  }
+  return renderFixedLine(line.fixed);
+}
+
+/** A kind section as markdown, leading and trailing blank lines dropped; "" when it has no text. */
+function renderKindSection(section: KindSection): string {
+  const lines = section.map(renderKindSectionLine);
+  while (lines.length && lines[0] === "") lines.shift();
+  while (lines.length && lines[lines.length - 1] === "") lines.pop();
+  return lines.join("\n");
+}
+
 export interface CompletionBlockInput {
   /** The run's issue, for `Related to #N.` / `Closes #N` / the partial lines (issue arm only). */
   issueIid?: number | null;
@@ -435,9 +753,9 @@ export interface CompletionBlockInput {
   /** D14: a kind's one-line completion sentence. When set, the issue arm (Related/Closes, partial,
    *  accepted, gates) is NOT rendered, exactly as a per-kind body replaced it before. */
   kindLine?: string;
-  /** Deterministic sections a kind carries verbatim after its line (the self_improve evidence, the
-   *  prompt guard-critical paths). Worker-generated, not escaped. */
-  kindSections?: readonly (string | undefined)[];
+  /** Sections a kind carries after its line (the self_improve evidence, the prompt run's
+   *  guard-critical paths), as structured KindSection data that this renderer escapes. */
+  kindSections?: readonly (KindSection | undefined)[];
   /** Render `Closes #N`. An owner partial or a scope-capped run never closes, whatever this says. */
   closes: boolean;
   completionScope?: ClaimConfig["completion_scope"];
@@ -546,8 +864,8 @@ export function renderCompletionBlock(input: CompletionBlockInput): string {
   }
   if (input.repoAgents) paras.push(REPO_AGENTS_LINE);
   if (input.kindLine !== undefined) {
-    for (const s of input.kindSections ?? []) {
-      const t = s?.replace(/^\n+|\n+$/gu, "");
+    for (const section of input.kindSections ?? []) {
+      const t = section ? renderKindSection(section) : "";
       if (t) paras.push(t);
     }
   }
@@ -575,25 +893,212 @@ export interface OwnedBlocks {
 export type ParsedBody =
   | { kind: "none" }
   | ({ kind: "ok" } & OwnedBlocks)
-  | { kind: "malformed"; reason: "duplicate" | "unbalanced" | "unknown_version" };
+  | { kind: "malformed"; reason: "duplicate" | "unbalanced" | "unknown_version" | "oversize" };
 
-// Any uzi block marker, however spelled: detection is lenient so a mangled marker is reported
-// malformed rather than silently ignored; only the exact forms above are accepted.
-const ANY_MARKER_RE = /<!--[\s\p{Z}]*uzi:(description|completion):(start|end)\b[^>]*?-->/giu;
+// The head of any uzi block marker, however spelled: detection is lenient so a mangled marker is
+// reported malformed rather than silently ignored; only the exact forms above are accepted. The
+// marker then runs to the first `>` after this head, which must close it as `-->` (the former
+// `[^>]*?-->` tail, found with one forward pointer instead of a rescan per candidate).
+const MARKER_HEAD_RE = /<!--[\s\p{Z}]*uzi:(description|completion):(start|end)\b/iuy;
+
+// A fence line (CommonMark: up to 3 spaces of indent, optionally inside `>` quotes, then 3+
+// backticks or tildes). An opener's info string may not hold a backtick when its fence is backticks.
+const FENCE_OPEN_RE = /^((?:[ \t]{0,3}>)*)[ \t]{0,3}(`{3,}|~{3,})([^\n]*)$/u;
+const FENCE_CLOSE_RE = /^(?:[ \t]{0,3}>)*[ \t]{0,3}(`{3,}|~{3,})[ \t]*$/u;
+const QUOTE_PREFIX_RE = /^(?:[ \t]{0,3}>)*/u;
+// A line that ends a paragraph for inline-code purposes: blank (inside quotes too), or the start of
+// an HTML comment block (every uzi marker line is one).
+const PARA_BREAK_RE = /^(?:[ \t]{0,3}>)*(?:[ \t]*$|[ \t]{0,3}<!--)/u;
+
+interface Line {
+  start: number;
+  /** The line's text without its `\n` (and without a trailing `\r`). */
+  text: string;
+  /** The offset just past the line's `\n` (or the body's end). */
+  next: number;
+}
+
+function linesOf(body: string): Line[] {
+  const out: Line[] = [];
+  let start = 0;
+  while (start <= body.length) {
+    const nl = body.indexOf("\n", start);
+    const end = nl < 0 ? body.length : nl;
+    const text = body.slice(start, end).replace(/\r$/u, "");
+    out.push({ start, text, next: nl < 0 ? body.length : nl + 1 });
+    if (nl < 0) break;
+    start = nl + 1;
+  }
+  return out;
+}
+
+function quoteDepth(text: string): number {
+  const m = QUOTE_PREFIX_RE.exec(text)![0];
+  let d = 0;
+  for (const c of m) if (c === ">") d++;
+  return d;
+}
+
+/**
+ * The spans of `body` that are code, where a marker-shaped string is text, not a marker (L2): fenced
+ * code blocks (``` or ~~~, inside block quotes too) and inline code spans (a backtick run closed by
+ * the next run of the same length within one paragraph). Sorted, disjoint, [start, end).
+ *
+ * One deliberate difference from CommonMark: a fence with no closing fence (and not ended by its
+ * block quote ending) is NOT treated as code. CommonMark runs it to the end of the document, which
+ * would let one stray fence in human text above uzi's blocks hide them, and uzi would then lose its
+ * own blocks; here the opener is ordinary text. Linear: fence closure is decided from suffix tables.
+ */
+function codeRanges(body: string): Array<[number, number]> {
+  const lines = linesOf(body);
+  const n = lines.length;
+  // For each line index i: the longest closing fence of each kind strictly after i, and the lowest
+  // quote depth strictly after i, so "does this opener ever close" is O(1).
+  const maxTick = new Int32Array(n + 1);
+  const maxTilde = new Int32Array(n + 1);
+  const minDepth = new Int32Array(n + 1).fill(2 ** 30);
+  const depth = lines.map((l) => quoteDepth(l.text));
+  for (let i = n - 1; i >= 0; i--) {
+    const c = FENCE_CLOSE_RE.exec(lines[i]!.text);
+    const len = c ? c[1]!.length : 0;
+    maxTick[i] = Math.max(maxTick[i + 1]!, c && c[1]![0] === "`" ? len : 0);
+    maxTilde[i] = Math.max(maxTilde[i + 1]!, c && c[1]![0] === "~" ? len : 0);
+    minDepth[i] = Math.min(minDepth[i + 1]!, depth[i]!);
+  }
+  const ranges: Array<[number, number]> = [];
+  const tick = nextIndex(body, "`");
+  let para: { from: number; to: number } | undefined;
+  const flushPara = () => {
+    if (para && tick[para.from]! < para.to) for (const r of inlineCodeRanges(body, tick, para.from, para.to)) ranges.push(r);
+    para = undefined;
+  };
+  for (let i = 0; i < n; i++) {
+    const line = lines[i]!;
+    const open = FENCE_OPEN_RE.exec(line.text);
+    if (open && !(open[2]![0] === "`" && open[3]!.includes("`"))) {
+      const ch = open[2]![0]!;
+      const len = open[2]!.length;
+      const d = depth[i]!;
+      const closes = (ch === "`" ? maxTick[i + 1]! : maxTilde[i + 1]!) >= len || (d > 0 && minDepth[i + 1]! < d);
+      if (closes) {
+        flushPara();
+        let j = i + 1;
+        let end = body.length;
+        for (; j < n; j++) {
+          const l = lines[j]!;
+          if (d > 0 && depth[j]! < d) {
+            end = l.start; // the quote ended, and the fence with it; line j is ordinary text
+            j--;
+            break;
+          }
+          const c = FENCE_CLOSE_RE.exec(l.text);
+          if (c && c[1]![0] === ch && c[1]!.length >= len) {
+            end = l.next;
+            break;
+          }
+        }
+        ranges.push([line.start, end]);
+        i = j;
+        continue;
+      }
+    }
+    if (PARA_BREAK_RE.test(line.text)) {
+      flushPara();
+      continue;
+    }
+    para = para ? { from: para.from, to: line.next } : { from: line.start, to: line.next };
+  }
+  flushPara();
+  return ranges;
+}
+
+/** The inline code spans in body[from, to) (one paragraph): an opening backtick run is closed by the
+ *  next run of exactly its length; one with no such run is literal. A run preceded by an odd number
+ *  of backslashes opens one backtick shorter. Linear: `tick` (nextIndex of a backtick) finds the
+ *  runs without rescanning the body, and one forward pointer per run length finds each closer. */
+function inlineCodeRanges(body: string, tick: Int32Array, from: number, to: number): Array<[number, number]> {
+  const runs: Array<{ start: number; len: number }> = [];
+  for (let i = tick[from]!; i < to; i = tick[i]!) {
+    let j = i;
+    while (j < to && body[j] === "`") j++;
+    runs.push({ start: i, len: j - i });
+    i = j;
+  }
+  const byLen = new Map<number, number[]>();
+  runs.forEach((r, k) => {
+    const list = byLen.get(r.len);
+    if (list) list.push(k);
+    else byLen.set(r.len, [k]);
+  });
+  const ptr = new Map<number, number>();
+  const out: Array<[number, number]> = [];
+  for (let k = 0; k < runs.length; k++) {
+    const r = runs[k]!;
+    let start = r.start;
+    let len = r.len;
+    let slashes = 0;
+    while (start - slashes - 1 >= from && body[start - slashes - 1] === "\\") slashes++;
+    if (slashes % 2 === 1) {
+      start++;
+      len--;
+    }
+    if (len === 0) continue;
+    const list = byLen.get(len);
+    if (!list) continue;
+    let p = ptr.get(len) ?? 0;
+    while (p < list.length && list[p]! <= k) p++;
+    ptr.set(len, p);
+    if (p >= list.length) continue;
+    const close = runs[list[p]!]!;
+    out.push([start, close.start + close.len]);
+    k = list[p]!;
+  }
+  return out;
+}
+
+interface FoundMarker {
+  block: "description" | "completion";
+  edge: "start" | "end";
+  at: number;
+  text: string;
+}
+
+/** Every uzi block marker outside code, in order. Linear: each `<!--` is tested once, and the
+ *  closing `>` is found with a pointer that only moves forward. */
+function findMarkers(body: string): FoundMarker[] {
+  const code = codeRanges(body);
+  const found: FoundMarker[] = [];
+  let r = 0;
+  let gt = -1;
+  for (let at = body.indexOf("<!--"); at >= 0; at = body.indexOf("<!--", at + 1)) {
+    while (r < code.length && code[r]![1] <= at) r++;
+    if (r < code.length && code[r]![0] <= at) continue;
+    MARKER_HEAD_RE.lastIndex = at;
+    const head = MARKER_HEAD_RE.exec(body);
+    if (!head) continue;
+    const headEnd = at + head[0].length;
+    if (gt < headEnd) gt = body.indexOf(">", headEnd);
+    if (gt < 0) break; // no `>` left: no later marker can close either
+    if (gt - 2 < headEnd || body.slice(gt - 2, gt) !== "--") continue;
+    found.push({
+      block: head[1]!.toLowerCase() as "description" | "completion",
+      edge: head[2]!.toLowerCase() as "start" | "end",
+      at,
+      text: body.slice(at, gt + 1),
+    });
+  }
+  return found;
+}
 
 /** Split `body` around uzi's two owned blocks. `none`: no uzi block marker at all (a legacy PR).
  *  `malformed`: a duplicate marker, an unbalanced or nested pair, a region after the completion
- *  block, or a start marker of an unknown version / an inexact spelling. */
+ *  block, a start marker of an unknown version / an inexact spelling, or a body over
+ *  FORGE_BODY_MAX_CHARS (`oversize`: no forge returns one, so it is not scanned). Marker-shaped text
+ *  inside a fenced code block or an inline code span is text, not a marker (a quoted copy of uzi's
+ *  markers in human text neither breaks the parse nor moves the blocks). */
 export function parseOwnedBlocks(body: string): ParsedBody {
-  const found: { block: "description" | "completion"; edge: "start" | "end"; at: number; text: string }[] = [];
-  for (const m of body.matchAll(ANY_MARKER_RE)) {
-    found.push({
-      block: m[1]!.toLowerCase() as "description" | "completion",
-      edge: m[2]!.toLowerCase() as "start" | "end",
-      at: m.index,
-      text: m[0],
-    });
-  }
+  if (body.length > FORGE_BODY_MAX_CHARS) return { kind: "malformed", reason: "oversize" };
+  const found = findMarkers(body);
   if (found.length === 0) return { kind: "none" };
   const exact = { description: { start: REGION_START, end: REGION_END }, completion: { start: COMPLETION_START, end: COMPLETION_END } };
   const spans: Partial<Record<"description" | "completion", { start: number; end: number }>> = {};

@@ -111,7 +111,7 @@ import { detectToolchain, type ToolchainDetection } from "./toolchain-detect.js"
 import { isCIConfigPlan } from "./prompt.js";
 import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
 import { computeSizeLine, SIZE_UNAVAILABLE } from "./pr-size.js";
-import { renderBody, renderCompletionBlock, renderRegion } from "./pr-description.js";
+import { renderBody, renderCompletionBlock, renderRegion, type KindSection } from "./pr-description.js";
 import type { SummaryRunner } from "./summary-runner.js";
 import { REASON_PROVISION_FAILED } from "./provision-run.js";
 import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
@@ -3735,7 +3735,7 @@ export class RunRunner {
     // path the change touched, folding both into the MR description. Best-effort —
     // gathered before the push so the MR opens with its evidence, and a suite that
     // can't run is reported "skipped", never failing the run.
-    let selfImproveSection: string | undefined;
+    let selfImproveSection: KindSection | undefined;
     // PRD #686 M4: uzi's SELF_IMPROVE_CHECKS (go test ./..., web/agent npm test,
     // web build) are hardcoded to uzi's OWN layout and are meaningless against an
     // arbitrary target repo, so this evidence block runs ONLY in dogfood mode. In
@@ -3817,7 +3817,7 @@ export class RunRunner {
     // SELF_IMPROVE_CHECKS here — those are uzi's own gate suite and are meaningless
     // against an arbitrary repo. Best-effort, gathered before the push like the
     // self_improve evidence above.
-    let promptGuardSection: string | undefined;
+    let promptGuardSection: KindSection | undefined;
     if (claim.kind === "prompt") {
       // null (diff failed) → fail CLOSED with a loud "guard-path check unavailable"
       // note, exactly as the self_improve path does above (M5 audit).
@@ -11126,7 +11126,9 @@ export interface MrDescriptionOptions {
 }
 
 /** MR body (PRD #1798 D10): the size-line-only description region (when a size line is given; no
- *  model text is published from here) followed by the completion block, which carries every
+ *  model text is published from here, and with no provenance line unless `opts` names the head and
+ *  target, which no caller does today: see pr-description.ts deterministicRegion for the shape the
+ *  publisher must treat as uzi's own) followed by the completion block, which carries every
  *  deterministic line this function has always owned: `Related to #N.` and `Closes #N` (issue arm),
  *  the partial and accepted warnings (PRD #1227), the gates-unverified section, the history-bridge
  *  sentence (PRD #1416), the completion-unverified banner (PRD #1225), the agents line (PRD #37
@@ -11136,8 +11138,8 @@ export function mrDescription(
   claim: ClaimResponse,
   branch: string,
   agentSelection?: { source: AgentSource; agents: string[] },
-  selfImproveSection?: string,
-  promptGuardSection?: string,
+  selfImproveSection?: KindSection,
+  promptGuardSection?: KindSection,
   gatesUnverified?: string[],
   gatesDiscoveryTruncated?: boolean,
   scopeCapped?: { completedCount: number; total?: number },

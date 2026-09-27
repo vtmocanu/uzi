@@ -132,7 +132,10 @@ describe("renderRegion (D5, D8, D12)", () => {
   it("rung 2 (lead_only) says the summary was not checked against the diff (D8)", async () => {
     const f = await mint({ summary: "The lead's summary." });
     const r = renderRegion({ sizeLine: SIZE, source: "lead_only" }, f);
-    assert.match(r.text, /### Verification\nSummary written by the agent, not checked against the diff\./);
+    // The note follows the summary as its own paragraph, never under "### Verification" (which a
+    // lead_only version with no reported checks does not render at all).
+    assert.match(r.text, /^The lead's summary\.\n\n_Summary written by the agent, not checked against the diff\._\n\n\*\*Size/m);
+    assert.doesNotMatch(r.text, /### Verification/);
     const gen = renderRegion({ sizeLine: SIZE, source: "generated" }, f);
     assert.doesNotMatch(gen.text, /not checked against the diff/);
   });
@@ -385,12 +388,13 @@ describe("mrDescription over the renderer: every PR-producing kind renders", () 
     });
   }
 
-  it("the agents line is one short line without the agent list; kind sections render verbatim", () => {
+  it("the agents line is one short line without the agent list; kind sections render after it", () => {
     const claim = makeClaim({ kind: "self_improve", issue_iid: 77 });
-    const body = mrDescription(claim, "b", { source: "repo", agents: ["lead", "coder"] }, "\n---\n### Self-improvement run\n\nevidence");
+    const section = [{ fixed: "" }, { fixed: "---" }, { fixed: "### Self-improvement run" }, { fixed: "" }, { fixed: "evidence" }];
+    const body = mrDescription(claim, "b", { source: "repo", agents: ["lead", "coder"] }, section);
     assert.ok(body.includes("Internally reviewed by the repository's own agents, not uzi's built-in reviewer."));
     assert.ok(!body.includes("coder"));
-    assert.ok(body.includes("---\n### Self-improvement run\n\nevidence"));
+    assert.ok(body.includes("reviewer.\n\n---\n### Self-improvement run\n\nevidence\n\n---\nOpened by uzi"), body);
   });
 
   it("the banner passed through opts renders inside the completion block", () => {

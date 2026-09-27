@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { buildSelfImprovePlanPrompt } from "../src/prompt.js";
+import { renderCompletionBlock, type KindSection } from "../src/pr-description.js";
 import {
   buildCheckEnv,
   defaultCheckRunner,
@@ -75,6 +76,14 @@ describe("flagGuardPaths", () => {
   });
 });
 
+// PRD #1798 (H1): the sections are structured data the completion-block renderer escapes; this
+// renders one the way the MR body does and returns only the section's text ("" when it renders none).
+function md_(section: KindSection): string {
+  const block = renderCompletionBlock({ branch: "b", closes: false, kindLine: "K", kindSections: [section] });
+  const from = block.indexOf("\nK\n\n") + 4;
+  return block.slice(from, block.lastIndexOf("---\nOpened by uzi")).replace(/\n+$/u, "");
+}
+
 describe("selfImproveMrSection", () => {
   const checks: CheckResult[] = [
     { name: "api: go test ./...", status: "passed", detail: "exit 0" },
@@ -83,7 +92,7 @@ describe("selfImproveMrSection", () => {
   ];
 
   it("carries the test evidence and the human-merge note", () => {
-    const md = selfImproveMrSection([], checks);
+    const md = md_(selfImproveMrSection([], checks));
     assert.ok(md.includes("Test evidence"));
     assert.ok(md.includes("api: go test ./... — passed"));
     assert.ok(md.includes("web: npm test — failed"));
@@ -94,7 +103,7 @@ describe("selfImproveMrSection", () => {
   });
 
   it("raises a loud guard-critical flag listing the touched paths", () => {
-    const md = selfImproveMrSection(["agent/src/guardrails.ts", "api/internal/vault/vault.go"], checks);
+    const md = md_(selfImproveMrSection(["agent/src/guardrails.ts", "api/internal/vault/vault.go"], checks));
     assert.ok(md.includes("Guard-critical paths touched"));
     assert.ok(md.includes("`agent/src/guardrails.ts`"));
     assert.ok(md.includes("`api/internal/vault/vault.go`"));
@@ -103,7 +112,7 @@ describe("selfImproveMrSection", () => {
   it("fails CLOSED when the diff is unavailable (null), not silently clean", () => {
     // null guardHits means the changed-file diff could not be computed — the section
     // must surface that loudly, NOT read as "no guard paths touched" (M5 audit).
-    const md = selfImproveMrSection(null, checks);
+    const md = md_(selfImproveMrSection(null, checks));
     assert.ok(md.includes("Guard-path check: UNAVAILABLE"));
     assert.ok(md.includes("MANUALLY"));
     // Test evidence still renders.
@@ -115,14 +124,14 @@ describe("guardCriticalMrSection (PRD #241 prompt-run flag)", () => {
   it("is empty for an all-clear change (no guard path, no boilerplate)", () => {
     // A prompt run carries no test evidence, so with nothing flagged the section
     // must be "" — a clean prompt MR gets no self-improvement-style block.
-    assert.equal(guardCriticalMrSection([]), "");
+    assert.equal(md_(guardCriticalMrSection([])), "");
   });
 
   it("raises the same guard-critical flag self_improve uses, listing the paths", () => {
-    const md = guardCriticalMrSection([
+    const md = md_(guardCriticalMrSection([
       "agent/src/guardrails.ts",
       "api/internal/vault/vault.go",
-    ]);
+    ]));
     assert.ok(md.includes("Guard-critical paths"));
     assert.ok(md.includes("Guard-critical paths touched"));
     assert.ok(md.includes("`agent/src/guardrails.ts`"));
@@ -130,7 +139,7 @@ describe("guardCriticalMrSection (PRD #241 prompt-run flag)", () => {
   });
 
   it("fails CLOSED when the diff is unavailable (null)", () => {
-    const md = guardCriticalMrSection(null);
+    const md = md_(guardCriticalMrSection(null));
     assert.ok(md.includes("Guard-path check: UNAVAILABLE"));
     assert.ok(md.includes("MANUALLY"));
   });
@@ -139,8 +148,8 @@ describe("guardCriticalMrSection (PRD #241 prompt-run flag)", () => {
     // The guard warning wording must be identical in both surfaces — it is factored
     // through guardCriticalWarningLines, and this pins that they don't drift apart.
     const hits = ["agent/src/git.ts"];
-    const promptMd = guardCriticalMrSection(hits);
-    const selfMd = selfImproveMrSection(hits, []);
+    const promptMd = md_(guardCriticalMrSection(hits));
+    const selfMd = md_(selfImproveMrSection(hits, []));
     assert.ok(promptMd.includes("Guard-critical paths touched — review with extra care."));
     assert.ok(selfMd.includes("Guard-critical paths touched — review with extra care."));
   });
@@ -439,7 +448,7 @@ describe("selfImproveMrSection skip disclosure (M8)", () => {
       { name: "web: npm test", status: "skipped", detail: "dependencies not installed in the worker" },
       { name: "agent: npm test", status: "passed", detail: "exit 0" },
     ];
-    const body = selfImproveMrSection([], checks);
+    const body = md_(selfImproveMrSection([], checks));
     assert.match(body, /2 of 3 checks were SKIPPED/);
     assert.match(body, /skipped is NOT passed/i);
     assert.match(body, /carries NO evidence for them/i);
@@ -447,7 +456,7 @@ describe("selfImproveMrSection skip disclosure (M8)", () => {
 
   it("adds no skip warning when everything actually ran", () => {
     const checks: CheckResult[] = [{ name: "agent: npm test", status: "passed", detail: "exit 0" }];
-    const body = selfImproveMrSection([], checks);
+    const body = md_(selfImproveMrSection([], checks));
     assert.ok(!/SKIPPED/.test(body), "a fully-run suite needs no skip disclaimer");
   });
 });
