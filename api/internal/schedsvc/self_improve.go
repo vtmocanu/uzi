@@ -198,7 +198,7 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 		}
 		// PRD #1732 D15: a pinned harness whose credentials are all disabled skips the fire
 		// (benign, advancing) instead of the hard refusal a genuinely absent credential gets.
-		// A one-time row is held un-advanced instead (holdsOnceCredentialDisabled): transient.
+		// A one-time row is held un-advanced instead (process's quiet hold).
 		if holdsOnceCredentialDisabled(sched, err) {
 			return FireOutcome{}, err
 		}

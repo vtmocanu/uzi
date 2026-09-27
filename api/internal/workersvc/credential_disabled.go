@@ -377,13 +377,13 @@ func (s *Service) reassignCredentialDisabledRun(ctx context.Context, userID, run
 			return pgx.ErrNoRows
 		}
 		run.CredentialOverrideMode, run.CredentialOverrideSecretID = mode, secretID
-		if status, err = releaseCredentialDisabledHold(ctx, q, run, timeout); err != nil {
-			return err
-		}
-		if status == "" {
-			return pgx.ErrNoRows // rolls the override back
-		}
-		return nil
+		// The settle always matches here, so status is never "": the row is locked and held,
+		// its expected columns are the ones just read and written, a pending pause meets
+		// SettleCredentialDisabledPause's guards, and a refused reassignment (no pending pause)
+		// was refused only by the spent-budget guard, whose negation (over NOT NULL columns) is
+		// SettleCredentialDisabledSpentBudget's.
+		status, err = releaseCredentialDisabledHold(ctx, q, run, timeout)
+		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrCredentialSwitchRaced

@@ -108,6 +108,9 @@ type Store interface {
 	// #1093), RAW: expiry is computed in Go against e.now() at fire time, not by SQL.
 	// ErrNoRows resolves to not paused (fail-open).
 	GetUserSchedulePause(ctx context.Context, userID uuid.UUID) (store.GetUserSchedulePauseRow, error)
+	// RecordScheduleHeldFire writes only last_fire on a still-active one-time row (PRD #1732
+	// D2): the credential_disabled hold records why the row waits without advancing it.
+	RecordScheduleHeldFire(ctx context.Context, arg store.RecordScheduleHeldFireParams) (int64, error)
 }
 
 // RunCreator is the shared run-creation seam the scheduler fires through — the SAME
@@ -140,6 +143,12 @@ type RunCreator interface {
 	// credential override (D10-excluded, see scheduleCredentialOverride), but it is NOT
 	// exempt from an explicit harness pin — every fire seam threads scheduleHarness(sched).
 	CreateSelfImproveRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, title, description string, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, explicit *workersvc.Harness) (store.Run, error)
+	// ScheduleCredentialDisabled is the read-only pre-fire check of a schedule's stored pin and
+	// pinned harness (PRD #1732 D2/D15): workersvc.ErrCredentialDisabled or
+	// workersvc.ErrHarnessCredentialDisabled when one is disabled, else nil (a lookup error is nil
+	// too; the fire's own checks decide it). process() runs it for a one-time row before any forge
+	// call, so a held row spends no forge call per tick.
+	ScheduleCredentialDisabled(ctx context.Context, userID uuid.UUID, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) error
 }
 
 // ForgeBuilder builds a forge driver from a stored (encrypted) connection — the same
@@ -352,11 +361,86 @@ func (e *Scheduler) process(ctx context.Context, sched store.RunSchedule, pc *pa
 		e.advance(ctx, sched, FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipSchedulesPaused}}}, nil)
 		return
 	}
+	// PRD #1732 D2: a one-time row whose stored pin or pinned harness is disabled waits. The
+	// pre-check runs before fireOne, so a held row makes no forge call; the in-fire refusal
+	// (a disable landing after the pre-check) is held the same way below.
+	if sched.Timing == "once" {
+		if err := e.runs.ScheduleCredentialDisabled(ctx, sched.UserID, fireCredentialOverride(sched), scheduleHarness(sched)); holdsOnceCredentialDisabled(sched, err) {
+			e.holdOnceCredentialDisabled(ctx, sched)
+			return
+		}
+	}
 	// The tick path threads the FireOutcome into advance, which persists it into
 	// last_fire on the success/benign path (PRD #308 M2). RunNow does NOT reach here, so
 	// a manual fire never persists a last_fire (Decision 3).
 	out, fireErr := e.fireOne(ctx, sched)
+	if holdsOnceCredentialDisabled(sched, fireErr) {
+		e.holdOnceCredentialDisabled(ctx, sched)
+		return
+	}
 	e.advance(ctx, sched, out, fireErr)
+}
+
+// holdOnceCredentialDisabled holds a one-time row whose stored pin or pinned harness is
+// disabled (PRD #1732 D2): not advanced, not parked and not logged as a transient fire error, so
+// it stays due and fires on the first tick after the owner enables the credential or changes the
+// pin, like the paused-once hold above. It records the credential_disabled skip in last_fire so
+// the owner sees why (journey 8), writing only when the stored last_fire is not already that
+// skip, so a long hold does not rewrite the row every tick.
+func (e *Scheduler) holdOnceCredentialDisabled(ctx context.Context, sched store.RunSchedule) {
+	e.logger.Debug("scheduler: credential disabled, holding once schedule", "schedule", sched.ID.String())
+	out := credentialDisabledHoldOutcome(sched)
+	if lastFireIsHold(sched.LastFire, out) {
+		return
+	}
+	lastFireJSON, err := marshalLastFire(out, e.now())
+	if err != nil {
+		e.logger.Error("scheduler: marshal held last_fire", "schedule", sched.ID.String(), "error", err)
+		return
+	}
+	if _, err := e.store.RecordScheduleHeldFire(ctx, store.RecordScheduleHeldFireParams{ID: sched.ID, LastFire: lastFireJSON}); err != nil {
+		e.logger.Error("scheduler: record held last_fire", "schedule", sched.ID.String(), "error", err)
+	}
+}
+
+// credentialDisabledHoldOutcome is the fire outcome a credential_disabled hold records: one
+// schedule-wide skip, carrying the pinned issue for an issue target (RunNow answers the same).
+func credentialDisabledHoldOutcome(sched store.RunSchedule) FireOutcome {
+	skip := Skip{Reason: SkipCredentialDisabled}
+	if sched.Target == "issue" {
+		iid := sched.IssueIid.Int64
+		skip.IssueIID = &iid
+	}
+	return FireOutcome{Matched: 1, Skips: []Skip{skip}}
+}
+
+// lastFireIsHold reports whether the stored last_fire already records exactly the hold outcome
+// (its fired_at aside), so the hold skips a redundant write.
+func lastFireIsHold(stored []byte, hold FireOutcome) bool {
+	if len(stored) == 0 {
+		return false
+	}
+	var rec lastFireRecord
+	if err := json.Unmarshal(stored, &rec); err != nil {
+		return false
+	}
+	if rec.Matched != hold.Matched || len(rec.Started) != 0 || len(rec.Skips) != 1 {
+		return false
+	}
+	got, want := rec.Skips[0], hold.Skips[0]
+	if got.Reason != string(want.Reason) || (got.IssueIID == nil) != (want.IssueIID == nil) {
+		return false
+	}
+	return got.IssueIID == nil || *got.IssueIID == *want.IssueIID
+}
+
+// fireCredentialOverride is the stored override a fire of sched threads: the schedule's own,
+// except for self_improve, whose run follows its own ladder and never carries one.
+func fireCredentialOverride(sched store.RunSchedule) *workersvc.CredentialOverride {
+	if sched.Target == "self_improve" {
+		return nil
+	}
+	return scheduleCredentialOverride(sched)
 }
 
 // RunNow fires a schedule ONCE, manually, and returns the FireOutcome (matched/started/
@@ -635,8 +719,17 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 		res, err := e.createIssueRun(ctx, sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL)
 		if holdsOnceCredentialDisabled(sched, err) {
 			// PRD #1732 D2: the schedule-wide pin is disabled, so every candidate would be
-			// refused the same way; a one-time sweep is held un-advanced (transient) and waits.
-			return FireOutcome{}, err
+			// refused the same way. A one-time sweep that has started nothing yet is held
+			// un-advanced and waits (process records the hold). One that already started a run
+			// this fire is not: holding it would re-fire the whole sweep after re-enable and
+			// start up to max_issues more on top of the runs already started, so it records the
+			// skip, stops the fan-out and advances normally.
+			if len(out.Started) == 0 {
+				return FireOutcome{}, err
+			}
+			e.logger.Info("scheduler: sweep stopped, credential disabled mid-fire", "schedule", sched.ID.String(), "issue", iid, "reason", err)
+			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Title: issue.Title, Reason: SkipCredentialDisabled, WebURL: issue.WebURL})
+			break
 		}
 		if err != nil {
 			// A permanent/transient repo error mid-sweep is unexpected (the repo just
@@ -753,7 +846,7 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 		return FireOutcome{}, workersvc.ErrRepoNotFound // permanent
 	case holdsOnceCredentialDisabled(sched, err):
 		// PRD #1732 D2: a one-time prompt schedule whose pin (or pinned harness) is disabled is
-		// held un-advanced (transient) so its run starts once the credential is back.
+		// held un-advanced (process's quiet hold) so its run starts once the credential is back.
 		return FireOutcome{}, err
 	default:
 		// Review fix (PRD #1429): route through the shared classifier so a benign seam
@@ -856,8 +949,9 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		return FireOutcome{}, err
 	}
 	// PRD #1732 D2: a one-time schedule whose pin (or pinned harness) is disabled waits, held
-	// un-advanced like the #1626 exception above, instead of being consumed by the skip. For a
-	// sweep the pin is schedule-wide, so fireSweep returns this error for the whole fire.
+	// un-advanced (process's quiet hold, not advance's transient arm) instead of being consumed
+	// by the skip. For a sweep the pin is schedule-wide, so fireSweep returns this error for the
+	// whole fire unless the fire already started a run.
 	if holdsOnceCredentialDisabled(sched, err) {
 		return FireOutcome{}, err
 	}

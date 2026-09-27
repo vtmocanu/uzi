@@ -115,6 +115,25 @@ func checkStoredOverrideEnabled(ctx context.Context, q credentialSecretMetaReade
 	return nil
 }
 
+// ScheduleCredentialDisabled is the scheduler's read-only pre-fire check of a schedule's stored
+// choices (PRD #1732 D2/D15), made before the fire touches the forge. It returns
+// ErrCredentialDisabled when the stored pin o names a disabled token, ErrHarnessCredentialDisabled
+// when the pinned harness explicit has credentials but none enabled, and nil otherwise. A lookup
+// error, or any other harness refusal, also answers nil: the fire's own in-transaction checks
+// still decide those, so this check never refuses on a fact it could not read.
+func (s *Service) ScheduleCredentialDisabled(ctx context.Context, userID uuid.UUID, o *CredentialOverride, explicit *Harness) error {
+	if err := checkStoredOverrideEnabled(ctx, s.q, userID, o); errors.Is(err, ErrCredentialDisabled) {
+		return err
+	}
+	if explicit == nil {
+		return nil
+	}
+	if _, err := s.resolveRunHarness(ctx, userID, explicit); errors.Is(err, errHarnessCredentialDisabled) {
+		return err
+	}
+	return nil
+}
+
 // ResolveCredentialOverride is the EXPORTED entry point every override write outside this
 // package runs through (PRD #1247 M2): the handler (a different package) has no access to
 // the unexported validateCredentialOverride, so this thin wrapper is its door. It performs

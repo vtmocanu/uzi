@@ -90,8 +90,8 @@ const (
 	// The fire starts no run and never substitutes another credential or harness; the stored
 	// pin is kept. Benign for a recurring row: the schedule advances and re-fires next cadence,
 	// once the owner enables the credential or changes the pin. A one-time row is held
-	// un-advanced instead (holdsOnceCredentialDisabled), so its pinned work waits rather than
-	// being consumed. An implicit-harness fire with no enabled credential anywhere records
+	// un-advanced instead, with this skip recorded in last_fire (holdsOnceCredentialDisabled), so
+	// its pinned work waits rather than being consumed. An implicit-harness fire with no enabled credential anywhere records
 	// no_usable_credential instead (D15).
 	SkipCredentialDisabled SkipReason = "credential_disabled" //nolint:gosec // G101: a schedule-skip-reason VOCABULARY value, not a credential (see SkipNoUsableCredential).
 )
@@ -164,11 +164,13 @@ func skipReasonForErr(err error) (SkipReason, bool) {
 
 // holdsOnceCredentialDisabled reports whether a fire error is the credential_disabled refusal
 // (a disabled stored pin, or a pinned harness with no enabled credential) on a ONE-TIME
-// schedule. The fire paths return such an error as transient instead of the benign advancing
-// skip, mirroring the issue #1626 ErrBranchInUse exception: advancing a once row marks it fired
-// and its pinned work would never start, while PRD #1732 D2 says pinned work waits. The row is
-// then held un-advanced (advance's transient arm, retried every tick) until the owner enables
-// the credential or changes the pin. A recurring row keeps the benign skip and advances.
+// schedule. The fire paths return such an error instead of the benign advancing skip: advancing
+// a once row marks it fired and its pinned work would never start, while PRD #1732 D2 says
+// pinned work waits. process() then holds the row quietly (holdOnceCredentialDisabled): not
+// advanced, the credential_disabled skip recorded in last_fire, and no transient-error warning,
+// until the owner enables the credential or changes the pin. process() also runs the same check
+// before firing (RunCreator.ScheduleCredentialDisabled), so a held row spends no forge call per
+// tick. A recurring row keeps the benign skip and advances.
 func holdsOnceCredentialDisabled(sched store.RunSchedule, err error) bool {
 	if sched.Timing != "once" {
 		return false

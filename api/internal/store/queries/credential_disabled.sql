@@ -221,13 +221,14 @@ SELECT EXISTS (
 -- steering inputs are settled so a resumed flight is never handed a stale pause, and the
 -- same requirement guards as the promotion apply.
 --
--- The owner arm clears claim_released_at, so the owner's later ResumePausedRun keeps worker_id
--- as resume affinity exactly as it does for an ordinary owner pause (SetRunPaused never sets
--- it; D14 keeps the existing affinity rules). ResumePausedRun reads a set claim_released_at as
--- a server park and drops the worker. The undelivered claim ParkCredentialDisabledRun fenced
--- was never handed to a worker and its capability is already revoked (codex_cap_hash NULL);
--- the next ClaimRun bumps claim_generation, and a paused row takes no running report. The wall
--- arm keeps it: budget_exhausted keeps the server-park semantics (extend drops the worker).
+-- Both arms clear claim_released_at, so the owner's later ResumePausedRun (owner arm) or
+-- ExtendAndResumeWallPark (wall arm) keeps worker_id as resume affinity exactly as it does for
+-- an ordinary owner pause (SetRunPaused never sets it) or a worker-side wall park (SetRunWallPark
+-- never sets it either); D14 keeps the existing affinity rules. Both resumes read a set
+-- claim_released_at as a server park and drop the worker, which would be wrong here: the
+-- undelivered claim ParkCredentialDisabledRun fenced was never handed to a worker and its
+-- capability is already revoked (codex_cap_hash NULL); the next ClaimRun bumps
+-- claim_generation, and a paused row takes no running report.
 -- The caller serializes this with every requirement writer (user lock, then run row).
 -- name: SettleCredentialDisabledPause :one
 WITH settled_inputs AS (
@@ -239,7 +240,7 @@ WITH settled_inputs AS (
 )
 UPDATE runs SET
     hold_reason = CASE WHEN runs.pause_mode = 'wall' THEN 'budget_exhausted' ELSE NULL END,
-    claim_released_at = CASE WHEN runs.pause_mode = 'wall' THEN runs.claim_released_at ELSE NULL END,
+    claim_released_at = NULL,
     pause_requested_at = NULL,
     pause_mode = NULL,
     pause_after_count = NULL,
@@ -262,7 +263,8 @@ RETURNING runs.id, runs.status, runs.hold_reason;
 -- place SettleCredentialDisabledPause's wall arm lands (PRD #1732 D14: the promoter never
 -- bypasses budget exhaustion). The status stays 'paused' and status_since is kept, so Extend
 -- measures the active time at the park and banks the whole parked interval. claim_released_at
--- is kept (server-park semantics, like the wall arm). A hold_captured_head a resumed
+-- is cleared, like SettleCredentialDisabledPause's arms, so Extend keeps worker_id as resume
+-- affinity (the fenced claim was never delivered). A hold_captured_head a resumed
 -- completion hold left behind is not a wall capture, so it is cleared, as ParkRunsAtWall does.
 -- The exemptions and the budget expression are exactly PromoteCredentialDisabledRun's, negated,
 -- so the two never both match. The same requirement guards apply.
@@ -270,6 +272,7 @@ RETURNING runs.id, runs.status, runs.hold_reason;
 UPDATE runs SET
     hold_reason = 'budget_exhausted',
     hold_captured_head = NULL,
+    claim_released_at = NULL,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND user_id = @user_id
@@ -285,3 +288,12 @@ WHERE id = @id AND user_id = @user_id
       - (GREATEST(0, EXTRACT(EPOCH FROM (status_since - started_at))::int)
          - budget_paused_seconds) <= 0
 RETURNING id, user_id, status;
+
+-- A one-time schedule held on credential_disabled (PRD #1732 D2) records why it waits: only
+-- last_fire is written. next_fire_at, status and last_fired_at are untouched, so the row stays
+-- due and fires once the credential is enabled. Guarded to a still-active one-time row so a
+-- concurrent edit, disable or fire is never overwritten with a stale hold.
+-- name: RecordScheduleHeldFire :execrows
+UPDATE run_schedules
+SET last_fire = @last_fire, updated_at = now()
+WHERE id = @id AND timing = 'once' AND status = 'active';

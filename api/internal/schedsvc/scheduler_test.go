@@ -29,6 +29,8 @@ type fakeStore struct {
 
 	advanceCalls []store.AdvanceScheduleParams
 	statusCalls  []store.SetRunScheduleStatusParams
+	// heldFireCalls records every RecordScheduleHeldFire (PRD #1732 D2 credential_disabled hold).
+	heldFireCalls []store.RecordScheduleHeldFireParams
 
 	repoErr error
 	repoRow store.GetRepoForUserRow
@@ -166,6 +168,19 @@ func (f *fakeStore) GetUserSchedulePause(_ context.Context, userID uuid.UUID) (s
 
 func (f *fakeStore) ClaimDueSchedules(context.Context) ([]store.RunSchedule, error) {
 	return f.due, nil
+}
+
+// RecordScheduleHeldFire records the credential_disabled hold's last_fire write (PRD #1732 D2)
+// and, like the real row, persists it onto the matching due schedule so the next tick's claim
+// carries it (the no-churn check reads the claimed row's last_fire).
+func (f *fakeStore) RecordScheduleHeldFire(_ context.Context, arg store.RecordScheduleHeldFireParams) (int64, error) {
+	f.heldFireCalls = append(f.heldFireCalls, arg)
+	for i := range f.due {
+		if f.due[i].ID == arg.ID {
+			f.due[i].LastFire = arg.LastFire
+		}
+	}
+	return 1, nil
 }
 func (f *fakeStore) AdvanceSchedule(_ context.Context, arg store.AdvanceScheduleParams) (store.RunSchedule, error) {
 	f.advanceCalls = append(f.advanceCalls, arg)
@@ -338,6 +353,16 @@ type fakeRuns struct {
 	// schedule owner. Defaults to HarnessClaude (no conflict) when unset.
 	resolvedHarness workersvc.Harness
 	resolveErr      error
+	// credDisabledErr backs ScheduleCredentialDisabled (PRD #1732 D2), the pre-fire check of a
+	// one-time row's stored pin and pinned harness; credDisabledCalls counts the checks.
+	credDisabledErr   error
+	credDisabledCalls int
+}
+
+// ScheduleCredentialDisabled fakes the pre-fire stored-pin check (PRD #1732 D2).
+func (f *fakeRuns) ScheduleCredentialDisabled(_ context.Context, _ uuid.UUID, _ *workersvc.CredentialOverride, _ *workersvc.Harness) error {
+	f.credDisabledCalls++
+	return f.credDisabledErr
 }
 
 // ResolveHarnessForUser fakes the D11 read the scheduler's fire-time codex+override conflict

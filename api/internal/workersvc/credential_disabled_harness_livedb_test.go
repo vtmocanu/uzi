@@ -169,3 +169,40 @@ func TestScheduledRunDisabledStoredPinStartsNoRunLiveDB(t *testing.T) {
 		t.Fatalf("enabled pin fire = (%v, %v), want a run pinned to %s", run.CredentialOverrideSecretID, err, pin)
 	}
 }
+
+// TestScheduleCredentialDisabledPrecheckLiveDB (D2/D15): the scheduler's pre-fire check reads the
+// same facts the fire seams refuse on, with no run and no write. A disabled stored pin answers
+// ErrCredentialDisabled; a pinned harness whose credentials are all disabled answers
+// ErrHarnessCredentialDisabled; an enabled pin, an unpinned schedule, and a pinned harness with
+// no credential at all (the fire's own hard refusal, not a hold) answer nil.
+//
+// MUTATION: drop either arm of ScheduleCredentialDisabled; the matching case then answers nil
+// and this test fails.
+func TestScheduleCredentialDisabledPrecheckLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	svc := New(env.q, env.box, testParams())
+	claude, codex := HarnessClaude, HarnessCodex
+	userID, _, _ := env.seedCodexInfra(t)
+	tok := env.seedAnthropicSecret(t, userID, "a-"+uuid.NewString(), true)
+	pin := &CredentialOverride{Mode: CredentialOverrideModePinned, SecretID: &tok}
+
+	if err := svc.ScheduleCredentialDisabled(env.ctx, userID, pin, &claude); err != nil {
+		t.Fatalf("enabled pin and harness: err = %v, want nil", err)
+	}
+	if err := svc.ScheduleCredentialDisabled(env.ctx, userID, nil, &codex); err != nil {
+		t.Fatalf("pinned Codex with no Codex credential: err = %v, want nil (the fire refuses it, no hold)", err)
+	}
+	disableSecret(env, tok, true)
+	if err := svc.ScheduleCredentialDisabled(env.ctx, userID, pin, nil); !errors.Is(err, ErrCredentialDisabled) {
+		t.Fatalf("disabled pin: err = %v, want ErrCredentialDisabled", err)
+	}
+	if err := svc.ScheduleCredentialDisabled(env.ctx, userID, nil, &claude); !errors.Is(err, ErrHarnessCredentialDisabled) {
+		t.Fatalf("pinned Claude, every token disabled: err = %v, want ErrHarnessCredentialDisabled", err)
+	}
+	if err := svc.ScheduleCredentialDisabled(env.ctx, userID, nil, nil); err != nil {
+		t.Fatalf("unpinned schedule: err = %v, want nil", err)
+	}
+	if n := runCountForUser(t, env, userID); n != 0 {
+		t.Fatalf("runs = %d, want 0 (the check writes nothing)", n)
+	}
+}

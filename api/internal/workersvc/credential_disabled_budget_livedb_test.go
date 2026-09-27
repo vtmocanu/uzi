@@ -65,10 +65,14 @@ func (fx *cdFix) interactiveTask(t *testing.T) uuid.UUID {
 // strand them. A timed issue row with the same started_at does NOT reach the queue: it settles
 // into budget_exhausted, and the owner's Extend then resumes it (item 3).
 //
+// The settle clears claim_released_at, so Extend keeps the parking worker as resume affinity.
+//
 // MUTATION: drop "kind IN ('chat', 'judge') OR interactive OR" from PromoteCredentialDisabledRun;
 // the three untimed runs then stay held (or, with the settle, land in budget_exhausted) and this
 // test fails. MUTATION: drop the SettleCredentialDisabledSpentBudget fallback in
 // releaseCredentialDisabledHold; the timed issue then stays held on credential_disabled forever.
+// MUTATION: keep claim_released_at in SettleCredentialDisabledSpentBudget; Extend then drops the
+// worker and this test fails.
 func TestCredentialPromoterUntimedRunsIgnoreSpentBudgetLiveDB(t *testing.T) {
 	fx := newCDFix(t)
 	stale := staleStart()
@@ -98,8 +102,8 @@ func TestCredentialPromoterUntimedRunsIgnoreSpentBudgetLiveDB(t *testing.T) {
 	if r.Status != "paused" || r.HoldReason.String != "budget_exhausted" {
 		t.Fatalf("timed issue: status=%s hold=%v, want paused on budget_exhausted", r.Status, r.HoldReason)
 	}
-	if !r.ClaimReleasedAt.Valid || r.WorkerID != pgconv.UUID(fx.workerID) {
-		t.Fatalf("timed issue: claim_released=%v worker=%v, want the server-park shape kept", r.ClaimReleasedAt, r.WorkerID)
+	if r.ClaimReleasedAt.Valid || r.WorkerID != pgconv.UUID(fx.workerID) {
+		t.Fatalf("timed issue: claim_released=%v worker=%v, want the worker-side park shape (claim_released_at cleared, worker kept)", r.ClaimReleasedAt, r.WorkerID)
 	}
 	// A second pass leaves it alone: it is no longer this hold.
 	fx.svc.RequestCredentialDisabledPromotion(fx.userID)
@@ -113,8 +117,9 @@ func TestCredentialPromoterUntimedRunsIgnoreSpentBudgetLiveDB(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("ExtendAndResumeWallPark: %v", err)
 	}
-	if r := mustRun(t, fx.env, timed); r.Status != "queued" || r.HoldReason.Valid {
-		t.Fatalf("extended: status=%s hold=%v, want queued", r.Status, r.HoldReason)
+	if r := mustRun(t, fx.env, timed); r.Status != "queued" || r.HoldReason.Valid || r.WorkerID != pgconv.UUID(fx.workerID) {
+		t.Fatalf("extended: status=%s hold=%v worker=%v, want queued on the parking worker %s (the fenced claim was never delivered)",
+			r.Status, r.HoldReason, r.WorkerID, fx.workerID)
 	}
 }
 
@@ -125,9 +130,14 @@ func TestCredentialPromoterUntimedRunsIgnoreSpentBudgetLiveDB(t *testing.T) {
 // in that pause (an owner request: the ordinary owner pause; a wall request: budget_exhausted),
 // each with the new override written, exactly as the promoter would settle it.
 //
+// Every settle clears claim_released_at and writes no resume row, so the owner's later
+// Extend or resume keeps the parking worker as resume affinity.
+//
 // MUTATION: restore the single-statement reassignment (ReassignCredentialDisabledRun alone, 0
 // rows mapped to ErrCredentialSwitchRaced); every settle case then returns
-// ErrCredentialSwitchRaced with nothing written and this test fails.
+// ErrCredentialSwitchRaced with nothing written and this test fails. MUTATION: keep
+// claim_released_at in either budget_exhausted settle (SettleCredentialDisabledSpentBudget, or
+// SettleCredentialDisabledPause's wall arm); that case then fails.
 func TestReassignHeldRunSettlesLiveDB(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -183,6 +193,32 @@ func TestReassignHeldRunSettlesLiveDB(t *testing.T) {
 			}
 			if unapplied != 0 {
 				t.Fatalf("unapplied pause inputs = %d, want 0", unapplied)
+			}
+			if tc.wantStatus == "paused" {
+				// A settle leaves the run paused: it resumes nothing, so no resume row is written.
+				var resumes int
+				if err := fx.env.pool.QueryRow(fx.env.ctx, `SELECT count(*) FROM run_user_inputs
+				    WHERE run_id = $1 AND kind = 'resume'`, id).Scan(&resumes); err != nil {
+					t.Fatal(err)
+				}
+				if resumes != 0 {
+					t.Fatalf("resume inputs after a settle = %d, want 0", resumes)
+				}
+				if r.ClaimReleasedAt.Valid {
+					t.Fatalf("claim_released_at = %v, want cleared by the settle (the fenced claim was never delivered)", r.ClaimReleasedAt)
+				}
+			}
+			if tc.wantHold == "budget_exhausted" {
+				// The owner's Extend keeps worker affinity, as for a worker-side wall park.
+				if _, err := fx.env.q.ExtendAndResumeWallPark(fx.env.ctx, store.ExtendAndResumeWallParkParams{
+					Secs: 3600, GlobalTimeoutSeconds: int32(testParams().RunTimeout.Seconds()),
+					ID: id, UserID: fx.userID, Cap: 86400,
+				}); err != nil {
+					t.Fatalf("ExtendAndResumeWallPark: %v", err)
+				}
+				if r := mustRun(t, fx.env, id); r.Status != "queued" || r.WorkerID != pgconv.UUID(fx.workerID) {
+					t.Fatalf("extended: status=%s worker=%v, want queued on the parking worker %s", r.Status, r.WorkerID, fx.workerID)
+				}
 			}
 			if tc.name == "pending owner pause" {
 				// The owner's later resume keeps worker affinity, as for any owner pause.
@@ -267,8 +303,8 @@ func TestChatDisableBetweenOpenAndDeliveryParksLiveDB(t *testing.T) {
 // are one transaction under the secret mutation lock. A binding onto a disabled token is refused
 // with judge_enabled unchanged in the database; onto an enabled token both halves commit.
 //
-// MUTATION: write the opt-in before the locked enablement check (or commit it separately); the
-// refused request then leaves judge_enabled flipped and this test fails.
+// MUTATION: commit the opt-in outside the binding transaction (write it through the pool before
+// withSecretMutation); the refused request then leaves judge_enabled flipped and this test fails.
 func TestJudgeOptInAndBindingAllOrNothingLiveDB(t *testing.T) {
 	fx := newCDFix(t)
 	judgeEnabled := func() bool {

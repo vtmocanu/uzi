@@ -52,9 +52,9 @@ func TestPatchWorkerRefusesDisabledToken(t *testing.T) {
 // TestSetJudgeRefusesDisabledTokenAllOrNothing: a Judge PUT naming a disabled token is a 409
 // and writes NOTHING, neither the binding nor the opt-in flip.
 //
-// MUTATION: write the opt-in before SetUserJudgeBinding's locked enablement check (or from the
-// handler, outside that transaction); the opt-in is then flipped before the binding writer
-// refuses, and this test fails on the half-applied request.
+// MUTATION: commit the opt-in outside the binding transaction (the handler's own
+// SetUserJudgeEnabled before SetUserJudgeBinding); the opt-in is then written before the binding
+// writer refuses, and this test fails on the half-applied request.
 func TestSetJudgeRefusesDisabledTokenAllOrNothing(t *testing.T) {
 	owner, secretID := uuid.New(), uuid.New()
 	st := &judgeBindStore{
