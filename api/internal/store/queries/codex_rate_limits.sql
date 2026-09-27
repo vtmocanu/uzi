@@ -119,7 +119,8 @@ ON CONFLICT (user_id, provider_account_id) DO UPDATE SET
 --
 -- One exception to "leaves the reading intact" (PRD #1732 D13, M4): when the stored reading
 -- is no longer current (an enabled linked alias is missing from its enablement_sig, or at
--- another revision: the reading predates a disable and re-enable), the readers already hide
+-- another revision: the reading predates a disable and re-enable, a sibling's re-enable,
+-- or a newly linked enabled alias), the readers already hide
 -- the whole row, so a failure would stay invisible behind it (the meter reads "pending"
 -- forever while every poll fails). Such a reading is dropped instead (buckets, observed
 -- counters and last_success_at NULLed) and the row is re-stamped with the poll's

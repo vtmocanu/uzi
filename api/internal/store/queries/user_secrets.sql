@@ -463,9 +463,11 @@ SELECT
 
 -- name: UserHasEnabledAnthropicToken :one
 -- Whether the user holds an ENABLED anthropic_token (PRD #1732 D15): the harness
--- resolver's Claude usability and the automatic MR-rework door check. It is the enabled
--- variant of UserHasAnthropicToken, which keeps answering "any credential at all" for
--- the rate-limit meters' no_token. By D4 an enabled token implies an enabled default.
+-- resolver's Claude usability and the on-demand MR-rework door check. It is the enabled
+-- variant of UserHasAnthropicToken, which keeps answering "any credential at all" for the
+-- workersvc callers that tell "all disabled" apart from "none" (anthropicSlotAllDisabled,
+-- noAnthropicTokenAtAll, explicitHarnessRefusal). By D4 an enabled token implies an enabled
+-- default.
 SELECT EXISTS (
     SELECT 1 FROM user_secrets
     WHERE user_id = @user_id AND kind = 'anthropic_token' AND disabled_at IS NULL

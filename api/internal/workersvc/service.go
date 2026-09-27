@@ -461,8 +461,8 @@ type Store interface {
 	CreateAutoMRReworkRun(ctx context.Context, arg store.CreateAutoMRReworkRunParams) (store.Run, error)
 	// On-demand mr_rework (PRD #1202): StartMRReworkForRun reads the loop-guard ledger
 	// (what is new since the last cycle) and advances the consumed high-water WITHOUT
-	// spending an automatic cycle; UserHasAnthropicToken is the door-check that the owner
-	// can pay for the run the endpoint would mint.
+	// spending an automatic cycle; UserHasEnabledAnthropicToken is the door-check that the
+	// owner can pay for the run the endpoint would mint.
 	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.MrReworkLedger, error)
 	// CreateManualMRReworkRunAndAdvance folds the on-demand run INSERT and the non-counting
 	// high-water advance into ONE atomic statement (PRD #1202, review-finding hardening):

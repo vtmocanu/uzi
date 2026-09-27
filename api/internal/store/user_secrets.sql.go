@@ -1411,9 +1411,11 @@ SELECT EXISTS (
 `
 
 // Whether the user holds an ENABLED anthropic_token (PRD #1732 D15): the harness
-// resolver's Claude usability and the automatic MR-rework door check. It is the enabled
-// variant of UserHasAnthropicToken, which keeps answering "any credential at all" for
-// the rate-limit meters' no_token. By D4 an enabled token implies an enabled default.
+// resolver's Claude usability and the on-demand MR-rework door check. It is the enabled
+// variant of UserHasAnthropicToken, which keeps answering "any credential at all" for the
+// workersvc callers that tell "all disabled" apart from "none" (anthropicSlotAllDisabled,
+// noAnthropicTokenAtAll, explicitHarnessRefusal). By D4 an enabled token implies an enabled
+// default.
 func (q *Queries) UserHasEnabledAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error) {
 	row := q.db.QueryRow(ctx, userHasEnabledAnthropicToken, userID)
 	var has_enabled bool
