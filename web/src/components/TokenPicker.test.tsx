@@ -113,19 +113,35 @@ describe("TokenPicker — disabled tokens (PRD #1732)", () => {
     );
   }
 
-  it("omits a disabled token and shows the 'N disabled not listed' footer with a Settings link", () => {
+  it("omits a disabled token and shows the 'N disabled not offered' footer with a Settings link", () => {
     renderRouted({ mode: "inherit" }, [token(), off()]);
     expect(screen.queryByRole("option", { name: /old-laptop/ })).toBeNull();
     // 3 base states + the one enabled token.
     expect(screen.getAllByRole("option")).toHaveLength(4);
     const footer = screen.getByTestId("token-picker-disabled-footer");
-    expect(footer.textContent).toContain("1 disabled not listed");
-    expect(screen.getByRole("link", { name: "Manage tokens" }).getAttribute("href")).toBe("/settings");
+    expect(footer.textContent).toContain("1 disabled token not offered.");
+    expect(footer.textContent).not.toMatch(/not listed/);
+    // The footer describes the select, so a screen reader hears it on the control.
+    const select = screen.getByLabelText("Anthropic token");
+    expect(footer.id).not.toBe("");
+    expect(select.getAttribute("aria-describedby")).toBe(footer.id);
   });
 
-  it("renders no footer when nothing is disabled", () => {
+  // The picker sits in unsaved forms (start run, schedule, plan gate): an in-place
+  // navigation to Settings would drop the owner's edits, so the link opens a new tab and
+  // says so to a screen reader.
+  it("opens Manage tokens in a new tab, announced as such", () => {
+    renderRouted({ mode: "inherit" }, [token(), off()]);
+    const link = screen.getByRole("link", { name: "Manage tokens (opens in new tab)" });
+    expect(link.getAttribute("href")).toBe("/settings");
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toMatch(/noopener/);
+  });
+
+  it("renders no footer and no description when nothing is disabled", () => {
     renderRouted({ mode: "inherit" }, [token()]);
     expect(screen.queryByTestId("token-picker-disabled-footer")).toBeNull();
+    expect(screen.getByLabelText("Anthropic token").getAttribute("aria-describedby")).toBeNull();
   });
 
   it("names an existing pin to a disabled token as '(disabled)', never as another option", () => {

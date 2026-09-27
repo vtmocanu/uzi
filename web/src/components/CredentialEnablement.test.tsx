@@ -148,6 +148,8 @@ describe("No-default notice", () => {
     // The notice opens the shelf, where every row reads "Enable and make default".
     fireEvent.click(within(notice).getByRole("button", { name: "Show disabled tokens" }));
     expect(screen.getAllByRole("button", { name: /^Enable and make default/ })).toHaveLength(2);
+    // Focus follows into the shelf: its first row's action, not the vanished notice button.
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Enable and make default: a" }));
   });
 
   it("is absent while the slot has an enabled default, where rows read plain 'Enable'", () => {
@@ -158,12 +160,57 @@ describe("No-default notice", () => {
   });
 });
 
+// PRD #1732: the server refuses to delete the default only while ANOTHER ENABLED token
+// remains (DeleteAnthropicTokenByID / the Codex twin count enabled rows). Tokens on the
+// Disabled shelf do not block it, so neither may the card.
+describe("Delete of the default counts enabled rows only", () => {
+  it("lets the Anthropic default be deleted when only disabled tokens remain", () => {
+    renderTokens([tok(), off()]);
+    const del = within(screen.getByTestId("token-sec-1")).getByRole("button", { name: "Delete" });
+    expect(del.getAttribute("aria-disabled")).toBeNull();
+    expect(del.getAttribute("aria-describedby")).toBeNull();
+  });
+
+  it("still blocks it while another enabled token exists", () => {
+    renderTokens([tok(), tok({ id: "sec-2", label: "spare", is_default: false }), off()]);
+    const del = within(screen.getByTestId("token-sec-1")).getByRole("button", { name: "Delete" });
+    expect(del.getAttribute("aria-disabled")).toBe("true");
+  });
+
+  it("names the no-default consequence, not a disconnect, when disabled tokens stay behind", () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    renderTokens([tok(), off()]);
+    fireEvent.click(within(screen.getByTestId("token-sec-1")).getByRole("button", { name: "Delete" }));
+    expect(confirm).toHaveBeenCalledWith(expect.stringMatching(/last enabled token, so you will have no default/));
+  });
+
+  it("lets the Codex default be deleted when only disabled credentials remain", () => {
+    render(
+      <MemoryRouter>
+        <CodexCredentials
+          secrets={[
+            tok({ id: "c1", kind: "codex_auth", codex_status: "linked", label: "personal" }),
+            tok({ id: "c2", kind: "openai_api_key", codex_status: "static", label: "key", is_default: false, enabled: false }),
+          ]}
+          loading={false}
+          busy={false}
+          reload={async () => {}}
+          onError={() => {}}
+          onNotice={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    const del = within(screen.getByTestId("codex-c1")).getByRole("button", { name: "Delete" });
+    expect(del.getAttribute("aria-disabled")).toBeNull();
+  });
+});
+
 describe("Disable dialog", () => {
   it("cannot confirm disabling the default until a replacement is chosen, then sends it", async () => {
     const { reload } = renderTokens([tok(), tok({ id: "sec-2", label: "spare", is_default: false })]);
     mockApi.setSecretEnabled.mockResolvedValue({ secret: tok({ enabled: false, is_default: false }) });
     const row = screen.getByTestId("token-sec-1");
-    fireEvent.click(within(row).getByRole("button", { name: "Disable" }));
+    fireEvent.click(within(row).getByRole("button", { name: "Disable main" }));
 
     const dialog = await screen.findByRole("dialog", { name: "Disable main" });
     const confirm = within(dialog).getByRole("button", { name: "Disable token" });
@@ -181,10 +228,30 @@ describe("Disable dialog", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
+  it("hands focus to the Disabled shelf toggle once the row has moved there", async () => {
+    render(<ReloadingCard initial={[tok(), tok({ id: "sec-2", label: "spare", is_default: false })]} after={(rows) =>
+      rows.map((r) => (r.id === "sec-2" ? { ...r, enabled: false, disabled_at: "2026-09-27T00:00:00Z" } : r))
+    } />);
+    mockApi.setSecretEnabled.mockResolvedValue({ secret: tok({ id: "sec-2", enabled: false, is_default: false }) });
+    fireEvent.click(within(screen.getByTestId("token-sec-2")).getByRole("button", { name: "Disable spare" }));
+    const dialog = await screen.findByRole("dialog");
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Disable token" }));
+    });
+    const toggle = await screen.findByRole("button", { name: "Disabled (1)" });
+    await waitFor(() => expect(document.activeElement).toBe(toggle));
+  });
+
+  it("names each live row's Disable button after its credential", () => {
+    renderTokens([tok(), tok({ id: "sec-2", label: "spare", is_default: false })]);
+    expect(within(screen.getByTestId("token-sec-1")).getByRole("button", { name: "Disable main" })).toBeTruthy();
+    expect(within(screen.getByTestId("token-sec-2")).getByRole("button", { name: "Disable spare" })).toBeTruthy();
+  });
+
   it("states the no-default consequence for the last enabled token and confirms without a choice", async () => {
     renderTokens([tok(), off()]);
     mockApi.setSecretEnabled.mockResolvedValue({ secret: tok({ enabled: false, is_default: false }) });
-    fireEvent.click(within(screen.getByTestId("token-sec-1")).getByRole("button", { name: "Disable" }));
+    fireEvent.click(within(screen.getByTestId("token-sec-1")).getByRole("button", { name: "Disable main" }));
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByTestId("no-default-consequence").textContent).toMatch(/no default Anthropic token/);
     expect(within(dialog).queryByRole("radio")).toBeNull();
@@ -204,7 +271,7 @@ describe("Disable dialog", () => {
       }),
     );
     renderTokens([tok(), tok({ id: "sec-2", label: "spare", is_default: false })]);
-    fireEvent.click(within(screen.getByTestId("token-sec-2")).getByRole("button", { name: "Disable" }));
+    fireEvent.click(within(screen.getByTestId("token-sec-2")).getByRole("button", { name: "Disable spare" }));
     const uses = await screen.findByRole("region", { name: "Uses right now" });
     await waitFor(() => expect(uses.textContent).toMatch(/Worker alpha is bound to it: it waits/));
     expect(uses.textContent).toMatch(/1 schedule is pinned to it: its next fire is skipped/);
@@ -216,7 +283,7 @@ describe("Disable dialog", () => {
   it("shows the server's refusal inline and keeps the dialog open", async () => {
     mockApi.setSecretEnabled.mockRejectedValue(new ApiError(409, "choose an enabled replacement in Settings"));
     renderTokens([tok(), tok({ id: "sec-2", label: "spare", is_default: false })]);
-    fireEvent.click(within(screen.getByTestId("token-sec-2")).getByRole("button", { name: "Disable" }));
+    fireEvent.click(within(screen.getByTestId("token-sec-2")).getByRole("button", { name: "Disable spare" }));
     const dialog = await screen.findByRole("dialog");
     await act(async () => {
       fireEvent.click(within(dialog).getByRole("button", { name: "Disable token" }));
@@ -269,19 +336,79 @@ describe("Enable", () => {
       vi.useRealTimers();
     }
   });
+
+  it("puts focus on the restored row's Disable button after Enable", async () => {
+    window.localStorage.setItem(SHELF_KEY, "true");
+    mockApi.setSecretEnabled.mockResolvedValue({ secret: tok({ id: "sec-off", label: "old-laptop", is_default: false }) });
+    render(<ReloadingCard />);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Enable: old-laptop" }));
+    });
+    const row = await screen.findByTestId("token-sec-off");
+    await waitFor(() => expect(document.activeElement).toBe(within(row).getByRole("button", { name: "Disable old-laptop" })));
+  });
+
+  // Each credential gets its own give-up clock: enabling a second one must not restart the
+  // first one's probes, or "checking usage…" could outlive CHECK_MAX_PROBES indefinitely.
+  it("gives up on each credential after its own probe budget, whatever else was enabled later", async () => {
+    window.localStorage.setItem(SHELF_KEY, "true");
+    const enableRow = (rows: SecretMeta[], id: string) =>
+      rows.map((r) => (r.id === id ? { ...r, enabled: true, disabled_at: null } : r));
+    let enabling = "a";
+    // Step the clock so React commits (and the hook re-arms its timer) between probes.
+    const advance = async (ms: number) => {
+      for (let t = 0; t < ms; t += 500) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(500);
+        });
+      }
+    };
+    mockApi.setSecretEnabled.mockImplementation(async (_k, id) => ({ secret: tok({ id, is_default: false }) }));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      render(
+        <ReloadingCard
+          initial={[tok(), off({ id: "a", label: "a" }), off({ id: "b", label: "b" })]}
+          after={(rows) => enableRow(rows, enabling)}
+        />,
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Enable: a" }));
+      });
+      // ~20 of a's 24 probes (1.5 s, then every 5 s), never a fresh reading.
+      await advance(100_000);
+      expect(within(screen.getByTestId("token-a")).getByText("checking usage…")).toBeTruthy();
+      enabling = "b";
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Enable: b" }));
+      });
+      await advance(30_000);
+      // a has spent its budget and fell back; b is still inside its own.
+      expect(within(screen.getByTestId("token-a")).queryByText("checking usage…")).toBeNull();
+      expect(within(screen.getByTestId("token-b")).getByText("checking usage…")).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 // ReloadingCard owns the list the way Settings does: its reload swaps in the post-Enable
 // state (the token live again).
-function ReloadingCard() {
-  const [secrets, setSecrets] = useState<SecretMeta[]>([tok(), off()]);
+function ReloadingCard({
+  initial = [tok(), off()],
+  after = () => [tok(), tok({ id: "sec-off", label: "old-laptop", is_default: false })],
+}: {
+  initial?: SecretMeta[];
+  after?: (rows: SecretMeta[]) => SecretMeta[];
+}) {
+  const [secrets, setSecrets] = useState<SecretMeta[]>(initial);
   return (
     <MemoryRouter>
       <AnthropicTokens
         secrets={secrets}
         loading={false}
         busy={false}
-        reload={async () => setSecrets([tok(), tok({ id: "sec-off", label: "old-laptop", is_default: false })])}
+        reload={async () => setSecrets((rows) => after(rows))}
         onError={() => {}}
         onNotice={() => {}}
         judgeSecretId={null}
@@ -316,7 +443,7 @@ describe("Codex card", () => {
       deps({ enabled_siblings: { items: [{ id: "c2", label: "team-codex" }], total: 1 } }),
     );
     renderCodex([codex({ id: "c1", label: "personal" }), codex({ id: "c2", label: "team-codex", is_default: false })]);
-    fireEvent.click(within(screen.getByTestId("codex-c2")).getByRole("button", { name: "Disable" }));
+    fireEvent.click(within(screen.getByTestId("codex-c2")).getByRole("button", { name: "Disable team-codex" }));
     expect((await screen.findByTestId("codex-sibling-note")).textContent).toMatch(
       /stays live through “team-codex”/,
     );
@@ -335,6 +462,43 @@ describe("Codex card", () => {
     const row = screen.getByTestId("codex-c2");
     await waitFor(() => expect(row.textContent).toMatch(/account stays live through “team-codex”/));
     expect(row.textContent).not.toMatch(/Disabled since/);
+  });
+
+  it("drops a stale sibling note when a re-read finds no enabled sibling", async () => {
+    window.localStorage.setItem("uzi.settings.disabledCodexOpen", "true");
+    mockApi.getSecretDependents.mockResolvedValueOnce(
+      deps({ enabled_siblings: { items: [{ id: "c1", label: "team-codex" }], total: 1 } }),
+    );
+    renderCodex([
+      codex({ id: "c1", label: "team-codex" }),
+      codex({ id: "c2", label: "laptop", is_default: false, enabled: false, disabled_at: "2026-09-20T00:00:00Z" }),
+    ]);
+    await waitFor(() => expect(screen.getByTestId("codex-c2").textContent).toMatch(/stays live through/));
+    // The sibling was disabled meanwhile: the next read (shelf re-opened) reports none.
+    mockApi.getSecretDependents.mockResolvedValue(deps());
+    const toggle = screen.getByRole("button", { name: "Disabled (1)" });
+    fireEvent.click(toggle);
+    fireEvent.click(toggle);
+    await waitFor(() => expect(screen.getByTestId("codex-c2").textContent).toMatch(/Disabled since/));
+    expect(screen.getByTestId("codex-c2").textContent).not.toMatch(/stays live through/);
+  });
+
+  it("offers replacement defaults with their kind and status, failed logins last, and no auto-select talk", async () => {
+    renderCodex([
+      codex({ id: "c1", label: "personal" }),
+      codex({ id: "c2", label: "broken", is_default: false, codex_status: "failed" }),
+      tok({ id: "c3", kind: "openai_api_key", codex_status: "static", label: "api", is_default: false }),
+      codex({ id: "c4", label: "team", is_default: false }),
+    ]);
+    fireEvent.click(within(screen.getByTestId("codex-c1")).getByRole("button", { name: "Disable personal" }));
+    const dialog = await screen.findByRole("dialog");
+    const radios = within(dialog).getAllByRole("radio");
+    const labels = radios.map((r) => r.closest("label")?.textContent ?? "");
+    expect(labels).toHaveLength(3);
+    expect(labels[labels.length - 1]).toMatch(/broken.*Codex login.*failed/);
+    expect(labels.find((l) => l.includes("api"))).toMatch(/OpenAI API key.*static/);
+    expect(labels.find((l) => l.includes("team"))).toMatch(/Codex login.*linked/);
+    expect(dialog.textContent).not.toMatch(/auto-select/i);
   });
 
   it("renders the no-default notice for an all-disabled Codex slot with the shelf collapsed", () => {

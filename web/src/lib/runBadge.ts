@@ -544,16 +544,6 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         tone: "warning",
         pulse: false,
       };
-    // PRD #1732 D14: held because a credential it needs is disabled. Static warn, like the
-    // other holds; the label is StatusPill's RUN_STATUS_LABELS word.
-    case "credential_disabled":
-      return {
-        kind: "badge",
-        label: "waiting: credential disabled",
-        tone: "warning",
-        pulse: false,
-        title: "A credential this run needs is disabled. It resumes by itself when you enable it.",
-      };
     case "running":
       // The running elapsed moved OUT of the badge to the uniform per-card duration
       // token (issue #256 M4, Decision 4) — the board now renders `running <elapsed>`

@@ -6,7 +6,7 @@
 // after saving — rotation is a re-paste, which is why "Replace value" is a form
 // and not an edit-in-place field.
 
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { api, type AutoStatus, type SecretMeta } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { isVaultLocked } from "../lib/api";
@@ -20,10 +20,13 @@ import {
   DisabledCredentialRow,
   DisabledSection,
   NoDefaultNotice,
+  disableButtonId,
   disabledSince,
+  enableButtonId,
   slotHasDefault,
   splitByEnablement,
   useCheckingUsage,
+  usePendingFocus,
   useRememberedExpansion,
 } from "./CredentialEnablement";
 import { DocLink } from "./DocLink";
@@ -72,10 +75,17 @@ function deleteWarning(
   // argument is that a silent fallback is acceptable BEHAVIOUR and unacceptable
   // SURPRISE — and "nothing is bound to it" was becoming the surprise.
   autoEligible = false,
+  // PRD #1732: disabled tokens that stay behind. Deleting the last ENABLED token is
+  // allowed while disabled ones remain; it leaves the slot with no default, not with no
+  // Anthropic account.
+  disabledLeft = 0,
 ): string {
   if (isDefault) {
-    // Reachable only as the LAST token (D6 blocks deleting a default while others
-    // exist), so this is the disconnect-my-account case, not a fallback case.
+    // Reachable only as the last ENABLED token (D6 blocks deleting a default while other
+    // enabled tokens exist), so this is the disconnect case, not a fallback case.
+    if (disabledLeft > 0) {
+      return `Delete “${label}”? This is your last enabled token, so you will have no default Anthropic token until you enable one of your disabled tokens.`;
+    }
     return `Delete “${label}”? This is your last token — uzi will no longer be connected to your Anthropic account.`;
   }
   const affected: string[] = [];
@@ -107,6 +117,7 @@ function TokenRow({
   secret,
   busy,
   soleToken,
+  disabledLeft,
   judgeBound,
   autoStatus,
   autoFetchState,
@@ -120,7 +131,11 @@ function TokenRow({
 }: {
   secret: SecretMeta;
   busy: boolean;
+  // The only ENABLED token (PRD #1732): the server lets the default go only when no
+  // other enabled token remains, whatever sits on the Disabled shelf.
   soleToken: boolean;
+  // Disabled tokens that stay behind, for the last-token delete warning.
+  disabledLeft: number;
   judgeBound: boolean;
   // The SERVER's live eligibility answer for this token (PRD #111 M2), or
   // undefined while the meters have not loaded (or failed to). Never re-derived
@@ -252,7 +267,14 @@ function TokenRow({
               </Button>
             )}
             {/* PRD #1732: reversible suspension, beside Rename / Make default / Delete. */}
-            <Button variant="ghost" size="sm" disabled={disabled} onClick={onDisable}>
+            <Button
+              id={disableButtonId(secret.id)}
+              variant="ghost"
+              size="sm"
+              disabled={disabled}
+              onClick={onDisable}
+              aria-label={`Disable ${sanitizeLabel(secret.label)}`}
+            >
               Disable
             </Button>
             <Button
@@ -311,6 +333,7 @@ function TokenRow({
                       boundWorkers,
                       judgeBound,
                       secret.auto_eligible,
+                      disabledLeft,
                     ),
                   )
                 )
@@ -508,6 +531,8 @@ export function AnthropicTokens({
   const [shelfOpen, setShelfOpen] = useRememberedExpansion("uzi.settings.disabledTokensOpen");
   const [disabling, setDisabling] = useState<SecretMeta | null>(null);
   const [shelfBusy, setShelfBusy] = useState(false);
+  const shelfToggleId = useId();
+  const focusLater = usePendingFocus();
   // "checking usage…" after Enable, until the token's meter carries a fresh reading.
   const { checking, start: startChecking } = useCheckingUsage(async (ids) => {
     const { tokens } = await api.getMyRateLimits();
@@ -528,6 +553,8 @@ export function AnthropicTokens({
         : `Disabled “${sanitizeLabel(target.label)}”. Enable it again from the Disabled section.`,
     );
     emitSidebarTokensChanged();
+    // The row now sits behind the shelf toggle; focus goes there, not to <body>.
+    focusLater(shelfToggleId);
     await reload();
   };
 
@@ -544,6 +571,8 @@ export function AnthropicTokens({
           : `Enabled “${sanitizeLabel(s.label)}”.`,
       );
       emitSidebarTokensChanged();
+      // Back in the live list: focus its Disable, the control that undoes this.
+      focusLater(disableButtonId(s.id));
       await reload();
     } catch (err) {
       onError(errText(err, "Failed to enable the token"));
@@ -652,7 +681,14 @@ export function AnthropicTokens({
       {/* PRD #1732 D4: a slot whose tokens are all disabled has no default. Said at the
           top of the card, whether or not the Disabled shelf is open. */}
       {!loading && !first && !hasDefault && (
-        <NoDefaultNotice slot="anthropic" expanded={shelfOpen} onShow={() => setShelfOpen(true)} />
+        <NoDefaultNotice
+          slot="anthropic"
+          expanded={shelfOpen}
+          onShow={() => {
+            setShelfOpen(true);
+            if (disabled[0]) focusLater(enableButtonId(disabled[0].id));
+          }}
+        />
       )}
 
       {loading ? (
@@ -668,7 +704,8 @@ export function AnthropicTokens({
               key={s.id}
               secret={s}
               busy={anyBusy || shelfBusy}
-              soleToken={secrets.length === 1}
+              soleToken={active.length === 1}
+              disabledLeft={disabled.length}
               judgeBound={judgeSecretId === s.id}
               autoStatus={autoStatuses[s.id]}
               autoFetchState={autoFetchState}
@@ -681,7 +718,12 @@ export function AnthropicTokens({
               onNotice={onNotice}
             />
           ))}
-          <DisabledSection count={disabled.length} expanded={shelfOpen} onToggle={setShelfOpen}>
+          <DisabledSection
+            count={disabled.length}
+            expanded={shelfOpen}
+            onToggle={setShelfOpen}
+            toggleId={shelfToggleId}
+          >
             {disabled.map((s) => (
               <DisabledCredentialRow
                 key={s.id}

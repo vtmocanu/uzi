@@ -70,6 +70,21 @@ describe("hasToken (Dashboard / Board / IssueView gates)", () => {
   it("ignores secrets of another kind", () => {
     expect(hasToken([secret({ kind: "openai_token" })])).toBe(false);
   });
+
+  // PRD #1732 D15: a stored-but-disabled token can run nothing, so a user whose tokens
+  // are all disabled reads as having none (the start gates then offer Codex or the
+  // add/enable path instead of a Claude start that would only wait).
+  it("counts only ENABLED tokens (D15)", () => {
+    const disabled = secret({ id: "sec-off", is_default: false, enabled: false, disabled_at: "2026-09-18T00:00:00Z" });
+    expect(hasToken([disabled])).toBe(false);
+    expect(hasToken([disabled, secret()])).toBe(true);
+  });
+
+  it("treats a row with no `enabled` key as enabled (a pre-#1732 api pod)", () => {
+    const legacy = secret();
+    delete (legacy as Partial<SecretMeta>).enabled;
+    expect(hasToken([legacy])).toBe(true);
+  });
 });
 
 // PRD #295: the Runs-list credential badge gates on ">1 Anthropic token", so the

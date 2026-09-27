@@ -2692,7 +2692,10 @@ export interface Run {
    *  server-validated milestone keys (not free text), but still sanitize before writing to a
    *  terminal (same rule as milestones).
    *
-   *  `hold_reason` is 'completion_blocked' when the run parked in a completion hold, else null.
+   *  `hold_reason` names why a `paused` run is server-held, else null: 'completion_blocked' for
+   *  a completion hold, 'credential_disabled' for a run waiting on a disabled credential
+   *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'budget_exhausted' for a
+   *  wall-clock park (PRD #1497). Render an unrecognised value honestly.
    *  `hold_context` is the constant "unavailable(same_worker_only)" ONLY while held, else null:
    *  the UI/CLI state the hold's durability HONESTLY from it — the hold is same-worker-only and
    *  must NOT be shown as cross-worker durable.

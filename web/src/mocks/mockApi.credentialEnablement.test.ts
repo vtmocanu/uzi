@@ -52,6 +52,33 @@ describe("mock setSecretEnabled (PRD #1732 D4, D11)", () => {
   });
 });
 
+// The server forces a NEW credential to be the default while its slot has no default row
+// (every credential disabled): InsertUserSecret's NOT EXISTS for Anthropic, and
+// `req.Default || n == 0 || !hasDefault` for the shared Codex slot.
+describe("mock create into a slot with no default (PRD #1732 D4)", () => {
+  async function disableSlot(api: Awaited<ReturnType<typeof fresh>>, kinds: string[]) {
+    const { secrets } = await api.listSecrets();
+    const live = secrets.filter((s) => kinds.includes(s.kind) && s.enabled);
+    for (const s of live.filter((s) => !s.is_default)) await api.setSecretEnabled(s.kind, s.id, false);
+    for (const s of live.filter((s) => s.is_default)) await api.setSecretEnabled(s.kind, s.id, false);
+  }
+
+  it("makes a new Anthropic token the default, but does not pool it (not the first row)", async () => {
+    const api = await fresh();
+    await disableSlot(api, ["anthropic_token"]);
+    const { secret } = await api.createAnthropicToken("sk-ant-x", "fresh-key", false);
+    expect(secret.is_default).toBe(true);
+    expect(secret.auto_eligible).toBe(false);
+  });
+
+  it("makes a new Codex credential the shared default", async () => {
+    const api = await fresh();
+    await disableSlot(api, ["codex_auth", "openai_api_key"]);
+    const { secret } = await api.createOpenAIApiKey("sk-x", "fresh-openai", false);
+    expect(secret.is_default).toBe(true);
+  });
+});
+
 describe("mock read filters (PRD #1732 D1, D9, D13)", () => {
   it("omits a disabled token from the owner and admin meters, and shows it again after a fresh reading", async () => {
     const api = await fresh();

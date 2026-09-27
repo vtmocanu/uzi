@@ -1926,6 +1926,14 @@ export function RunView() {
   // worst kind of accessibility bug: the markup looks right". Putting role="status" on
   // the QuestionPanel itself — which mounts with the park — would have been exactly that.
   const [parkAnnounce, setParkAnnounce] = useState("");
+  // PRD #1732: "Enabled X. The run resumes in a moment." after an Enable in the
+  // credential_disabled panel. It rides this same always-mounted region because the panel
+  // unmounts the moment the refetched run is no longer held, taking any region of its own
+  // with it. It outlives the hold's own park key (which clears as the run resumes) and is
+  // dropped when the run parks again.
+  const [resumeAnnounce, setResumeAnnounce] = useState("");
+  // Where focus goes after that Enable: the run's status, which is what just changed.
+  const statusRef = useRef<HTMLSpanElement>(null);
   // PRD #517: BOTH needs-you parks announce, not just awaiting_input — awaiting_followup is
   // classified identically by needsHumanAttention and shows the same loud ring, so a
   // screen-reader user parking into it must get a signal too. A single stable KEY drives
@@ -1981,6 +1989,7 @@ export function RunView() {
       setParkAnnounce("");
       return;
     }
+    setResumeAnnounce("");
     setParkAnnounce(
       parkKey === "followup"
         ? "The run is waiting for your next follow-up."
@@ -2092,7 +2101,11 @@ export function RunView() {
               {/* A stopped run (cancel or stop-shaped failure) reads as a neutral
                   "stopped" pill — StatusPill's default tone — so it stays calm and
                   agrees with the board/RunsList. */}
-              <StatusPill status={pillStatus} />
+              {/* Focus target after a credential Enable (PRD #1732): the held panel that
+                  had focus unmounts, and the status is what changed. */}
+              <span ref={statusRef} tabIndex={-1} className="rounded-md focus-visible:ring-2 focus-visible:ring-brand/60 focus:outline-none">
+                <StatusPill status={pillStatus} />
+              </span>
               {/* PRD #320 M6: the queue-priority pill + the owner's Expedite/undo action.
                   Both are QUEUED-ONLY (the pill self-hides on any other status; the action
                   is wrapped in the status guard) — the server is queued-only too (409). */}
@@ -2354,7 +2367,7 @@ export function RunView() {
           effect fires after mount, so the region exists before its content changes even
           on a page load that arrives at an already-parked run. */}
       <div className="sr-only" role="status" aria-live="polite">
-        {parkAnnounce}
+        {resumeAnnounce || parkAnnounce}
       </div>
 
       {error && <Alert message={error} />}
@@ -2422,7 +2435,15 @@ export function RunView() {
           hits the widened /resume-now (api.resumeRun) then refetches; Stop mirrors the
           limit-wait panel's own Stop (a cancel input). */}
       {/* PRD #1732 D14: the credential_disabled hold. Self-hides on every other state. */}
-      <CredentialDisabledPanel run={run} canSteer={canSteer} onChanged={refreshRun} />
+      <CredentialDisabledPanel
+        run={run}
+        canSteer={canSteer}
+        onChanged={refreshRun}
+        onEnabled={(label) => {
+          setResumeAnnounce(`Enabled “${label}”. The run resumes in a moment.`);
+          statusRef.current?.focus();
+        }}
+      />
 
       <PausedPanel
         run={run}

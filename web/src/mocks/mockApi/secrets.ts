@@ -210,9 +210,11 @@ function createCodexCredential(kind: CodexKind, label: string, isDefault: boolea
     throw new ApiError(409, "a credential with that label already exists");
   }
   const codex = () => secrets.filter((s) => isCodexKind(s.kind));
-  // FIRST codex credential across BOTH kinds is force-defaulted server-side.
+  // FIRST codex credential across BOTH kinds is force-defaulted server-side, and so is a
+  // new one while the shared slot has NO default (every credential disabled, PRD #1732
+  // D4): the server's `req.Default || n == 0 || !hasDefault`.
   const first = codex().length === 0;
-  const wantDefault = isDefault || first;
+  const wantDefault = isDefault || first || !codex().some((s) => s.is_default);
   if (wantDefault) codex().forEach((s) => (s.is_default = false));
   const now = new Date().toISOString();
   const created: SecretMeta = {
@@ -333,7 +335,10 @@ export const secretsApi = {
     // asks (the invisible-token hazard); mirror that here or the mock teaches the
     // wrong lesson.
     const first = anthropic().length === 0;
-    const wantDefault = isDefault || first;
+    // ...and the same query forces it while the slot has NO default row (every token
+    // disabled, PRD #1732 D4): InsertUserSecret's `NOT EXISTS (… AND is_default)`. The
+    // pool opt-in below stays first-token-only, as on the server.
+    const wantDefault = isDefault || !anthropic().some((s) => s.is_default);
     if (wantDefault) anthropic().forEach((s) => (s.is_default = false));
     const now = new Date().toISOString();
     const created: SecretMeta = {

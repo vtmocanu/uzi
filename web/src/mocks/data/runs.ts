@@ -1917,7 +1917,8 @@ mockRuns.push(
     credential_override: { mode: "pinned", label: "old-laptop" },
     anthropic_secret_id: "sec-old-laptop",
     anthropic_secret_label: "old-laptop",
-    anthropic_select_reason: "override_pinned",
+    // The server's reason for a per-run pin is run_pinned (selectReasonRunPinned).
+    anthropic_select_reason: "run_pinned",
     anthropic_headroom_pct: null,
     milestones_completed: ["tr-1"],
     checkpoint_tip_at: minsAgo(41),

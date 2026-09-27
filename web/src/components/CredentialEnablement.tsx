@@ -18,7 +18,9 @@
 //   - NoDefaultNotice: the top-of-card notice for a slot whose credentials are all
 //     disabled, visible even while the shelf is collapsed;
 //   - useCheckingUsage: the "checking usage…" state after Enable, held until a FRESH
-//     reading lands (a pre-disable reading is never shown as current, D13).
+//     reading lands (a pre-disable reading is never shown as current, D13);
+//   - usePendingFocus + the id helpers: where keyboard focus lands after a row moves
+//     between the live list and the shelf (the control it came from has unmounted).
 
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { api, type SecretDependents, type SecretMeta } from "../lib/api";
@@ -76,17 +78,58 @@ export function useRememberedExpansion(key: string): [boolean, (open: boolean) =
   return [open, set];
 }
 
+// ── Focus after a row moves ─────────────────────────────────────────────────
+
+// A Disable or Enable moves the row between the live list and the shelf, so the button
+// that was clicked unmounts and focus would fall to <body>. These ids name where it goes
+// instead: after Disable the shelf toggle (the row is behind it now), after Enable the
+// restored row's own Disable button, after "Show disabled" the first shelf row's action.
+export const disableButtonId = (id: string) => `cred-disable-${id}`;
+export const enableButtonId = (id: string) => `cred-enable-${id}`;
+
+// How long a focus request waits for its target to render (a reload is one round trip).
+const FOCUS_WAIT_MS = 4_000;
+
+// usePendingFocus returns request(id): focus the element with that id as soon as it is
+// in the DOM. The target usually appears only after the card's reload re-renders, so the
+// request is retried after every render until it lands or FOCUS_WAIT_MS passes; a request
+// that never lands is dropped rather than stealing focus later.
+export function usePendingFocus(): (id: string) => void {
+  const pending = useRef<{ id: string; until: number } | null>(null);
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const want = pending.current;
+    if (!want) return;
+    if (Date.now() > want.until) {
+      pending.current = null;
+      return;
+    }
+    const el = document.getElementById(want.id);
+    if (el) {
+      pending.current = null;
+      el.focus();
+    }
+  });
+  return useCallback((id: string) => {
+    pending.current = { id, until: Date.now() + FOCUS_WAIT_MS };
+    setTick((t) => t + 1);
+  }, []);
+}
+
 // ── The shelf ───────────────────────────────────────────────────────────────
 
 export function DisabledSection({
   count,
   expanded,
   onToggle,
+  toggleId,
   children,
 }: {
   count: number;
   expanded: boolean;
   onToggle: (open: boolean) => void;
+  // The toggle's id, so a Disable can hand focus to it.
+  toggleId?: string;
   children: ReactNode;
 }) {
   const panelId = useId();
@@ -94,6 +137,7 @@ export function DisabledSection({
   return (
     <div className="border-t border-dashed border-edge pt-3">
       <button
+        id={toggleId}
         type="button"
         aria-expanded={expanded}
         // Only point at the panel while it is mounted (LastRun's disclosure rule).
@@ -154,7 +198,14 @@ export function DisabledCredentialRow({
         <p className="mt-0.5 text-xs text-faint">{note}</p>
       </div>
       <div className="flex items-center gap-2">
-        <Button variant="secondary" size="sm" disabled={busy} onClick={onEnable} aria-label={`${enableLabel}: ${safe}`}>
+        <Button
+          id={enableButtonId(secret.id)}
+          variant="secondary"
+          size="sm"
+          disabled={busy}
+          onClick={onEnable}
+          aria-label={`${enableLabel}: ${safe}`}
+        >
           {enableLabel}
         </Button>
         <Button variant="danger" size="sm" disabled={busy} onClick={onDelete} aria-label={`Delete ${safe}`}>
@@ -226,34 +277,42 @@ export function useCheckingUsage(probe: (ids: string[]) => Promise<string[]>): {
   useEffect(() => {
     probeRef.current = probe;
   });
-  const attempts = useRef(0);
+  // Probes spent PER credential: enabling a second one must not restart the first one's
+  // give-up clock (or it could say "checking" far past CHECK_MAX_PROBES).
+  const attempts = useRef(new Map<string, number>());
 
   const start = useCallback((id: string) => {
-    attempts.current = 0;
+    attempts.current.set(id, 0);
     setChecking((prev) => new Set(prev).add(id));
   }, []);
 
   useEffect(() => {
     if (checking.size === 0) return;
     let cancelled = false;
+    const ids = [...checking];
+    // A just-started credential gets its first probe soon; the rest keep the interval.
+    const firstProbe = ids.some((id) => (attempts.current.get(id) ?? 0) === 0);
     const timer = window.setTimeout(async () => {
-      attempts.current += 1;
+      for (const id of ids) attempts.current.set(id, (attempts.current.get(id) ?? 0) + 1);
       let fresh: string[] = [];
       try {
-        fresh = await probeRef.current([...checking]);
+        fresh = await probeRef.current(ids);
       } catch {
         // a failed probe is retried on the next tick
       }
       if (cancelled) return;
-      const giveUp = attempts.current >= CHECK_MAX_PROBES;
+      const done = new Set(fresh);
+      for (const id of ids) {
+        if ((attempts.current.get(id) ?? 0) >= CHECK_MAX_PROBES) done.add(id);
+      }
+      done.forEach((id) => attempts.current.delete(id));
       setChecking((prev) => {
-        if (giveUp) return new Set();
         const next = new Set(prev);
-        fresh.forEach((id) => next.delete(id));
+        done.forEach((id) => next.delete(id));
         return next.size === prev.size ? prev : next;
       });
       setTick((t) => t + 1);
-    }, attempts.current === 0 ? 1_500 : CHECK_INTERVAL_MS);
+    }, firstProbe ? 1_500 : CHECK_INTERVAL_MS);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
@@ -319,13 +378,18 @@ export function DisableCredentialDialog({
   secret,
   slot,
   replacements,
+  replacementBadges,
   onClose,
   onConfirm,
 }: {
   secret: SecretMeta;
   slot: CredentialSlot;
-  // The slot's OTHER enabled credentials: the candidates for the new default.
+  // The slot's OTHER enabled credentials: the candidates for the new default, in the
+  // order to offer them (the Codex card puts failed logins last).
   replacements: SecretMeta[];
+  // Badges beside a candidate's name (the Codex card: its kind and verification status),
+  // so the choice is made knowing whether the new default can actually run.
+  replacementBadges?: (s: SecretMeta) => ReactNode;
   onClose: () => void;
   // Resolves when the disable landed; rejects with the server's error to show inline.
   onConfirm: (newDefaultId: string | undefined) => Promise<void>;
@@ -384,7 +448,11 @@ export function DisableCredentialDialog({
           {error && <Alert message={error} />}
           <ul className="list-disc space-y-1 pl-5 text-muted">
             <li>uzi stops checking its usage and refreshing it.</li>
-            <li>It leaves your sidebar, the token pickers, auto-select and the admin Rate limits view.</li>
+            {slot === "anthropic" ? (
+              <li>It leaves your sidebar, the token pickers, auto-select and the admin Rate limits view.</li>
+            ) : (
+              <li>It leaves your sidebar, and new Codex runs cannot start on it.</li>
+            )}
             <li>Its name, value and settings are kept, and past run history is unchanged.</li>
             <li>A run already working on it finishes first.</li>
           </ul>
@@ -442,6 +510,9 @@ export function DisableCredentialDialog({
                       className="h-4 w-4 accent-brand"
                     />
                     <span className="text-fg">Make “{sanitizeLabel(r.label)}” the default</span>
+                    {replacementBadges && (
+                      <span className="ml-auto flex shrink-0 flex-wrap items-center gap-1.5">{replacementBadges(r)}</span>
+                    )}
                   </label>
                 ))}
               </div>
