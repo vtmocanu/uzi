@@ -144,6 +144,8 @@ describe("No-default notice", () => {
     renderTokens([off({ id: "a", label: "a" }), off({ id: "b", label: "b" })]);
     const notice = screen.getByTestId("no-default-anthropic");
     expect(notice.textContent).toMatch(/No default Anthropic token/);
+    expect(notice.textContent).toMatch(/Runs that spend your default token fail/);
+    expect(notice.textContent).not.toMatch(/default token waits/);
     expect(screen.getByRole("button", { name: "Disabled (2)" }).getAttribute("aria-expanded")).toBe("false");
     // The notice opens the shelf, where every row reads "Enable and make default".
     fireEvent.click(within(notice).getByRole("button", { name: "Show disabled tokens" }));
@@ -253,7 +255,11 @@ describe("Disable dialog", () => {
     mockApi.setSecretEnabled.mockResolvedValue({ secret: tok({ enabled: false, is_default: false }) });
     fireEvent.click(within(screen.getByTestId("token-sec-1")).getByRole("button", { name: "Disable main" }));
     const dialog = await screen.findByRole("dialog");
-    expect(within(dialog).getByTestId("no-default-consequence").textContent).toMatch(/no default Anthropic token/);
+    const consequence = within(dialog).getByTestId("no-default-consequence").textContent;
+    expect(consequence).toMatch(/no default Anthropic token/);
+    // Default-based ordinary runs fail (D15); only chat, the judge and self-improvement wait.
+    expect(consequence).toMatch(/Runs that spend your default fail/);
+    expect(consequence).not.toMatch(/Work that spends your default waits/);
     expect(within(dialog).queryByRole("radio")).toBeNull();
     await act(async () => {
       fireEvent.click(within(dialog).getByRole("button", { name: "Disable token" }));

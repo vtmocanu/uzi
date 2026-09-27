@@ -357,9 +357,10 @@ If the token is your **default**, the dialog asks you to pick which of your
 other enabled tokens becomes the default, and applies both changes
 together. uzi never picks a replacement for you. If it is your **last**
 enabled token, there is nothing to pick: the dialog tells you that you will
-be left with no default token, and that work which relies on the default
-will wait (or, for a new run that doesn't name a harness, may start on
-Codex instead if you have a usable Codex credential).
+be left with no default token. Runs that rely on the default then fail, as
+they would with no token at all, while chat, the judge and self-improvement
+wait until you enable a token (a new run that doesn't name a harness may
+start on Codex instead if you have a usable Codex credential).
 
 ### Where it goes
 

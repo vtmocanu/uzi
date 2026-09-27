@@ -106,7 +106,8 @@ export interface SecretMeta {
    *  and stateless UI (a badge read straight off this — never a second fetch). */
   codex_status?: string;
   /** PRD #1732 D10: whether the credential is available. A disabled credential keeps its
-   *  value, label, default flag, pool opt-in and sidebar preference; it is only suspended.
+   *  value, label, pool opt-in and sidebar preference; it is only suspended. It never keeps
+   *  the default flag (D4: a disabled credential is never the default).
    *  `enabled` is derived server-side from `disabled_at IS NULL`. */
   enabled: boolean;
   /** When the credential was disabled (ISO-8601), null while enabled. A repeated disable

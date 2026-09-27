@@ -1,8 +1,11 @@
 // Disable / Enable for account credentials (PRD #1732 M5), shared by the Anthropic
 // token card and the OpenAI / Codex credential card.
 //
-// Disable is SUSPENSION, not deletion: the sealed value, label, default flag, pool
-// opt-in and sidebar preference all survive, and Enable brings them back. The visual
+// Disable is SUSPENSION, not deletion: the sealed value, label, pool opt-in and sidebar
+// preference all survive, and Enable brings them back. The default flag does not (D4):
+// disabling the default hands it to the replacement the owner picks, or clears the slot
+// when it was the last enabled credential, and Enable makes a credential the default only
+// when the slot is empty. The visual
 // language says so: a disabled credential keeps its row, drawn as a dashed OUTLINE of
 // the live card (no fill, muted name) in a "Disabled (n)" shelf at the bottom of its
 // provider card. The shelf is collapsed by default and its expansion is remembered per
@@ -239,7 +242,7 @@ export function NoDefaultNotice({
       </p>
       <p className="mt-1 text-fg">
         {slot === "anthropic"
-          ? "Every token is disabled, so work that spends your default token waits, and new runs that don't name a harness start on Codex if you have a Codex credential."
+          ? "Every token is disabled. Runs that spend your default token fail, as they would with no token at all, while chat, the run judge and self-improvement wait until you enable one. New runs that don't name a harness start on Codex if you have a Codex credential."
           : "Every Codex credential is disabled, so new runs that don't name a harness start on Claude if you have a Claude token. Runs already on a disabled login wait."}{" "}
         Enabling one makes it the default.
       </p>
@@ -527,7 +530,7 @@ export function DisableCredentialDialog({
           {lastOfSlot && (
             <p className="rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-fg" data-testid="no-default-consequence">
               {slot === "anthropic"
-                ? `This is your last enabled token, so you will have no default Anthropic token. Work that spends your default waits until you enable a token, and new runs that don't name a harness start on Codex if you have a Codex credential.`
+                ? `This is your last enabled token, so you will have no default Anthropic token. Runs that spend your default fail, as they would with no token at all, while chat, the run judge and self-improvement wait until you enable a token. New runs that don't name a harness start on Codex if you have a Codex credential.`
                 : `This is your last enabled Codex credential, so you will have no default. New runs that don't name a harness start on Claude if you have a Claude token; runs already on this ${noun} wait until you enable it.`}
             </p>
           )}
