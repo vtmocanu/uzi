@@ -6,8 +6,8 @@ import { playwright } from "@vitest/browser-playwright";
 // Which Chromium runs the tests. CI and contributors use Playwright's pinned download
 // (`npx playwright install chromium`). A uzi worker has none, but bakes its own Chromium at
 // the stable /opt/uzi-toolchain/bin handle (agent/templates/base/Dockerfile), and gate:web runs
-// there. The worker's AGENT_BROWSER_* env does NOT reach the agent's shell (the SDK env is
-// sparse, agent/src/sdk-env.ts), so the path is detected on disk rather than read from env.
+// there. AGENT_BROWSER_EXECUTABLE_PATH does NOT reach the agent's shell (the SDK env is sparse,
+// agent/src/sdk-env.ts passes AGENT_BROWSER_ARGS only), so the path is detected on disk.
 // UZI_WEB_BROWSER_CHROMIUM overrides both.
 //
 // A non-Playwright Chromium needs the worker's launch flags: --no-sandbox (the hardened,

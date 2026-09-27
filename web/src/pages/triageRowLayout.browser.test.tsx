@@ -37,6 +37,8 @@ function judgeGroup(): JudgeRecommendationGroup {
 
 function finding(): IncidentalFinding {
   return {
+    // disposition_id makes Mark done render, so the row carries the full three-button group.
+    disposition_id: "d-1",
     finding_id: "f-1",
     location: LONG_LOCATION,
     repo_id: "repo-1",
@@ -68,6 +70,10 @@ function renderRows() {
   );
   const rows = [...document.querySelectorAll("li")].filter((li) => li.parentElement?.tagName === "UL");
   const fileButtons = screen.getAllByRole("button", { name: "File issue" });
+  // Both rows must carry the full action group, or the layout under test is the easy case.
+  expect(fileButtons).toHaveLength(2);
+  expect(screen.getAllByRole("button", { name: "Mark done" })).toHaveLength(2);
+  expect(screen.getAllByRole("button", { name: /^Dismiss/ })).toHaveLength(2);
   return {
     judge: {
       row: rows[0],
