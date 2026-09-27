@@ -70,6 +70,22 @@ moment it was posted, not a live view) — clicking **File** on a card for a
 coordinate someone already filed or dismissed just shows "already filed or
 resolved," never an error.
 
+## Marking a finding done yourself
+
+Findings gets the same **Mark done** a person can already put on a judge
+recommendation. Click **Mark done** from an open row (To triage), from a
+filed row, or from a dismissed row — a done from Dismissed replaces the
+dismissal, and marking done again just re-asserts it. The chip reads **"✓
+Done"** for a done you set yourself, distinct from **"Done via #N"** below.
+The one thing you can't do is mark done a finding whose issue is currently
+being filed — try that and it comes back as a conflict, same as any other
+action mid-filing.
+
+**Undo** — from the toast, the row, or the multi-select bar — clears a human
+done and exposes whatever is underneath: **Filed** if the finding has a
+filed issue, otherwise **To triage**. It does not bring back a previous
+dismissal; a dismissal that a done replaced is gone for good.
+
 ## Closing a filed issue marks it done
 
 When the issue you filed from a finding is **closed** on the forge, uzi moves
@@ -77,6 +93,12 @@ that coordinate to **Done** by itself, labelled **"Done via #N"** so it reads
 differently from a finding you never filed at all. It fires **once**, on the
 close, and never overwrites you — a coordinate you already dismissed keeps
 your verdict — and reopening the *filed issue* on the forge does not undo it.
+
+If you'd already marked that same coordinate done yourself, the close is
+recorded without changing your verdict: it still reads "✓ Done" for the
+human done, not "Done via #N", and if you later Undo back to Filed, that
+same close won't re-mark it done behind you. A close seen *after* your Undo
+still marks it Done via #N, same as any other filed finding.
 
 If the same bug **reappears** in a later run — a materially different report
 at that same spot — the coordinate goes back to **To triage**, even one
@@ -105,13 +127,15 @@ Everything here is also available from the [uzi CLI](./cli.md#incidental-finding
 uzi findings list                                       # what still needs triage
 uzi findings file <finding-id>                           # file it
 uzi findings dismiss <finding-id> --reason wont-do       # or not-an-issue
-uzi findings undo <disposition-id>                       # undo a dismissal
+uzi findings resolve <finding-id>                        # mark it done yourself
+uzi findings undo <disposition-id>                       # undo a done or a dismissal
 uzi findings stats                                       # your triage totals, across all repos
 ```
 
-`--bucket done` lists the coordinates the issue-close sync settled. `undo`
-takes the coordinate's `disposition_id`, not the `finding_id` the human `list`
-view prints — read it off `--json`.
+`--bucket done` lists the coordinates a done settled, yours and the
+issue-close sync's alike. `resolve` takes the `finding-id`, same as `file`
+and `dismiss`; `undo` takes the coordinate's `disposition_id` instead, not
+the `finding_id` the human `list` view prints — read it off `--json`.
 
 ## Good to know
 
