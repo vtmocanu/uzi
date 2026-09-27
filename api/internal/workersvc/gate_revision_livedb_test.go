@@ -548,6 +548,91 @@ func TestGateRevisionSameGateReclaimLiveDB(t *testing.T) {
 			t.Fatalf("claim = rev %d id %v presented %v, want 1/nil/set", claim.ResumeGateRevision, claim.ResumeGatePresentationID, claim.ResumeGatePresented)
 		}
 	})
+
+	// TestGateRevisionSameGateReclaimLiveDB's sibling below (kept in this func's spirit but split
+	// out for its own name) closes the M6 known gap: a gate published WITH milestones, claimed
+	// through the REAL claim assembly, and re-presented using exactly what agent/src/runner.ts
+	// sends back on a reclaim (presentedReportFields from resume_gate_presented for the
+	// requirements, and claim.milestones -- Issue #1626's candidate-on-resume -- for the
+	// milestone list, runner.ts ~L6379 frozenMilestones / ~L5220 presented reuse). It must be a
+	// RETAINED presentation at the same revision, never a conflict.
+	t.Run("a reclaimed worker's milestones round-trip through the real claim without a spurious conflict", func(t *testing.T) {
+		run := f.newRun("issue")
+		f.exec(`UPDATE runs SET completion_contract_version = 1 WHERE id = $1`, run)
+
+		a := uid()
+		ms := []Milestone{{ID: "m1", Title: "First milestone"}, {ID: "m2", Title: "Second milestone"}}
+		req := gateReq(i64(1), a)
+		req.Milestones = &ms
+		f.mustPublish(run, req, 1)
+		before := f.row(run)
+		if len(before.candidate) == 0 {
+			t.Fatalf("milestones_candidate not populated after publish: %+v", before)
+		}
+
+		// The worker holding the claim dies before consuming anything; the run is requeued and
+		// reclaimed through the real ClaimRun + claim assembly path (not a hand-built fixture).
+		f.exec(`UPDATE runs SET status = 'queued' WHERE id = $1`, run)
+		// PRD #1226 M1 D2: an INTERLOCKED run (completion_contract_version set) is claimable
+		// only by a worker whose SELF-REPORTED protocol_capabilities include
+		// completion_interlock_v1; the claim clause reads this from the Go caller's argument,
+		// not a fresh DB read, so extend the fixture worker's capabilities for this claim only.
+		interlocked := f.wkr
+		interlocked.ProtocolCapabilities = append(append([]string{}, f.wkr.ProtocolCapabilities...), capability.CompletionInterlockV1)
+		claim, err := f.svc.Claim(f.ctx, interlocked, nil)
+		if err != nil {
+			t.Fatalf("svc.Claim: %v", err)
+		}
+		if claim == nil || claim.RunID != run.String() {
+			t.Fatalf("svc.Claim = %+v, want run %s", claim, run)
+		}
+		if claim.ResumePhase != "awaiting_approval" || claim.ResumeGateRevision != 1 ||
+			claim.ResumeGatePresentationID == nil || *claim.ResumeGatePresentationID != *a || claim.ResumeGatePresented == nil {
+			t.Fatalf("claim resume gate = phase %q rev %d id %v presented %v, want awaiting_approval/1/%s/set",
+				claim.ResumePhase, claim.ResumeGateRevision, claim.ResumeGatePresentationID, claim.ResumeGatePresented, a)
+		}
+		if !slices.Equal(claim.Milestones, ms) {
+			t.Fatalf("claim.Milestones = %+v, want the presented candidate %+v", claim.Milestones, ms)
+		}
+		if claim.PlanMd == nil || *claim.PlanMd != gatePlanA {
+			t.Fatalf("claim.PlanMd = %v, want %q", claim.PlanMd, gatePlanA)
+		}
+
+		// Rebuild the re-presentation exactly as the reclaimed worker would: plan_md and
+		// milestones from the claim (what the agent SDK replays), requirements from
+		// resume_gate_presented (never a fresh detection or the live run columns), the
+		// claim's own generation, and the reused presentation id.
+		p := claim.ResumeGatePresented
+		gen := claim.ClaimGeneration
+		rereport := StateRequest{
+			State:                "awaiting_approval",
+			ClaimGeneration:      &gen,
+			PlanMd:               claim.PlanMd,
+			SessionID:            claim.SessionID,
+			PresentationID:       claim.ResumeGatePresentationID,
+			Milestones:           &claim.Milestones,
+			RequiredCapabilities: &p.RequiredCapabilities,
+			SizeClass:            p.SizeClass,
+			PlanChangedFiles:     &[]string{" M a.go", "?? d.go"}, // advisory only, not part of identity
+		}
+		if len(p.RequiredTools) > 0 {
+			rereport.RequiredTools = &p.RequiredTools
+		}
+		got, applied, rev, err := f.report(run, rereport)
+		if err != nil || !applied || rev != 1 {
+			t.Fatalf("re-presentation from the real claim = (applied %v, rev %d, err %v), want RETAINED at revision 1, not a conflict", applied, rev, err)
+		}
+		if got.Status != "awaiting_approval" {
+			t.Fatalf("returned run status %q, want awaiting_approval", got.Status)
+		}
+		after := f.row(run)
+		if string(after.digest) != string(before.digest) || after.presentation == nil || *after.presentation != *a || after.revision != 1 {
+			t.Fatalf("re-presentation moved or changed the gate: before %+v after %+v", before, after)
+		}
+		if got := f.presentations(run); len(got) != 1 {
+			t.Fatalf("re-presentation minted a new presentation row: %v, want exactly one", got)
+		}
+	})
 }
 
 func TestGateRevisionSnapshotInitializationLiveDB(t *testing.T) {
