@@ -566,11 +566,14 @@ type secretEnablementLocker interface {
 
 // lockPinnedOverrideEnabled is the in-transaction D5 check of a per-run pin (PRD #1732): it
 // share-locks the pinned credential's row in the caller's transaction and refuses a disabled
-// one with ErrCredentialDisabled, and a missing one with missing (nil lets it through). Called
-// after the caller's run row write or lock, it follows the lock order (user lock, run,
-// user_secrets FOR SHARE). The share lock conflicts with the disable's row update, so a
-// disable that committed first is seen here and refuses the write, and one that commits later
-// waits for this transaction and meets a stored pin (D2). A non-pinned override passes.
+// one with ErrCredentialDisabled, and a missing one with missing (nil lets it through). Its
+// place in the lock order depends on the caller. set-token runs it under the user's secret
+// mutation lock, after the run row write or lock (user lock, run, user_secrets FOR SHARE). Run
+// creation (createRun, CreatePromptRun) takes no secret mutation lock and runs it BEFORE the
+// INSERT, so there is no run row yet; there the fence is the share lock alone. Either way the
+// share lock conflicts with the disable's row update, so a disable that committed first is seen
+// here and refuses the write, and one that commits later waits for this transaction and meets a
+// stored pin (D2). A non-pinned override passes.
 func lockPinnedOverrideEnabled(ctx context.Context, q secretEnablementLocker, userID uuid.UUID, o *CredentialOverride, missing error) error {
 	if o == nil || o.Mode != CredentialOverrideModePinned || o.SecretID == nil {
 		return nil

@@ -57,6 +57,12 @@ func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleI
 		if err := checkStoredOverrideEnabled(ctx, q, userID, credOverride); err != nil {
 			return store.Run{}, err
 		}
+		// That read is plain, so the pin is share-locked and re-read in this transaction, as
+		// createRun does: a disable committed since is refused, and one committing later waits
+		// for this create and meets a stored pin. A pin whose credential vanished inherits.
+		if err := lockPinnedOverrideEnabled(ctx, q, userID, credOverride, nil); err != nil {
+			return store.Run{}, err
+		}
 		return q.CreatePromptRun(ctx, store.CreatePromptRunParams{
 			UserID:           userID,
 			RepoID:           repoID,

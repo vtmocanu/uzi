@@ -158,3 +158,30 @@ func TestCreateRunPinConcurrentDisableRefusedLiveDB(t *testing.T) {
 		t.Fatalf("%d run(s) created on the disabled pin, want none", n)
 	}
 }
+
+// TestPromptFirePinConcurrentDisableRefusedLiveDB: a scheduled prompt fire whose stored pin is
+// disabled while the fire is in flight (the plain pre-check read it enabled) is refused with
+// ErrCredentialDisabled, which the scheduler records as the credential_disabled skip, and
+// creates no run.
+//
+// MUTATION: drop the lockPinnedOverrideEnabled call in CreatePromptRun (prompt.go); the fire
+// then returns nil and a prompt run pinned to the disabled token exists.
+func TestPromptFirePinConcurrentDisableRefusedLiveDB(t *testing.T) {
+	fx := newCDFix(t)
+	schedule := seedPromptScheduleRow(t, fx.env, fx.userID, fx.repoID)
+	pin := &CredentialOverride{Mode: CredentialOverrideModePinned, SecretID: &fx.otherTok}
+	err := fx.raceDisable(t, fx.otherTok, func() error {
+		_, err := fx.svc.CreatePromptRun(fx.env.ctx, fx.userID, fx.repoID, schedule, "review", "review prompt", false, false, nil, nil, false, pin, nil)
+		return err
+	})
+	if !errors.Is(err, ErrCredentialDisabled) {
+		t.Fatalf("CreatePromptRun racing a disable: err = %v, want ErrCredentialDisabled", err)
+	}
+	var n int
+	if err := fx.env.pool.QueryRow(fx.env.ctx, `SELECT count(*) FROM runs WHERE schedule_id = $1`, schedule).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("%d prompt run(s) created on the disabled pin, want none", n)
+	}
+}
