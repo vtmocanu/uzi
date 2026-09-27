@@ -59,7 +59,12 @@ var ErrGateRevisionMismatch = errors.New("slack: plan gate revision changed")
 
 // gateSupersededText answers a click or reply on a gate card that is no longer the live gate:
 // the anchor moved to a newer card, or the server refused the card's revision.
-const gateSupersededText = "This gate was superseded — scroll down to the latest plan message."
+const gateSupersededText = "This gate was superseded. Scroll down to the latest plan message."
+
+// gateRecardSupersededText retires the prior gate card when a fresh one is posted below it.
+// The re-card also fires on a same-plan re-presentation (the gate revision advanced with no
+// new plan), so the copy points at the new card without claiming the plan changed.
+const gateRecardSupersededText = "Superseded by the gate card below."
 
 // gateNoLongerOpenText retires a gate card whose verdict the server refused for a changed
 // revision (PRD #1795 M5). The refusal cannot tell a newer plan from a run that left the gate,

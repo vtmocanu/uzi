@@ -6237,4 +6237,152 @@ describe("RunView — plan-gate verdicts bound to the gate revision (PRD #1795 M
     await screen.findByText("Your plan decision was not applied: the run is no longer waiting for plan approval.");
     expect(screen.queryByRole("button", { name: /Approve plan/ })).toBeNull();
   });
+
+  const LEFT_GATE = "Your plan decision was not applied: the run is no longer waiting for plan approval.";
+  const tree = () => (
+    <MemoryRouter initialEntries={["/runs/r1"]}>
+      <RunView />
+    </MemoryRouter>
+  );
+
+  // The page-level notice is for a run that LEFT the gate. A refetch that keeps the run at the
+  // gate leaves the wording to the panel; the page must not also claim it stopped waiting.
+  it("a mismatch whose refetch keeps the run at the gate gets no page-level notice", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(3);
+    });
+    const refreshRun = vi.fn(async () => {
+      streamWith(run({ status: "awaiting_approval", gate_revision: 3, plan_md: "# Plan three" }), submit, refreshRun);
+    });
+    renderGate(submit, refreshRun);
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    await act(async () => {
+      fireEvent.click(approve);
+    });
+    // Paired with the positive panel notice, so the negative cannot pass on an empty render.
+    await screen.findByText("Your decision was not applied: the run now shows plan revision 3. Review it and decide again.");
+    expect(screen.queryByText(LEFT_GATE)).toBeNull();
+  });
+
+  // The refetch already shows a later gate (4) than the one the refusal named (3): the notice
+  // about revision 3 is stale on arrival and must not greet plan four.
+  it("a mismatch at 3 whose run is at revision 4 clears the panel notice", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(3);
+    });
+    const refreshRun = vi.fn(async () => {
+      streamWith(run({ status: "awaiting_approval", gate_revision: 4, plan_md: "# Plan four" }), submit, refreshRun);
+    });
+    renderGate(submit, refreshRun);
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    await act(async () => {
+      fireEvent.click(approve);
+    });
+    await waitFor(() => expect(refreshRun).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: /Approve plan/ }) as HTMLButtonElement).disabled).toBe(false),
+    );
+    expect(screen.getByText("Plan four")).toBeTruthy();
+    expect(screen.queryByText(/was not applied/)).toBeNull();
+  });
+
+  it("a mismatch notice clears when a later gate revision arrives after the refetch", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(3);
+    });
+    const refreshRun = vi.fn(async () => {
+      streamWith(run({ status: "awaiting_approval", gate_revision: 3, plan_md: "# Plan three" }), submit, refreshRun);
+    });
+    const { rerender } = renderGate(submit, refreshRun);
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    await act(async () => {
+      fireEvent.click(approve);
+    });
+    await screen.findByText("Your decision was not applied: the run now shows plan revision 3. Review it and decide again.");
+
+    streamWith(run({ status: "awaiting_approval", gate_revision: 4, plan_md: "# Plan four" }), submit, refreshRun);
+    rerender(tree());
+    await screen.findByText("Plan four");
+    await waitFor(() => expect(screen.queryByText(/was not applied/)).toBeNull());
+  });
+
+  // The page-level notice describes the run as the refetch showed it. Once the run moves on
+  // (running -> completed), the notice is history and is retired.
+  it("the page-level notice clears when the run's status changes after the refetch", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(2);
+    });
+    const refreshRun = vi.fn(async () => {
+      streamWith(run({ status: "running", gate_revision: 2, plan_md: "# Plan two" }), submit, refreshRun);
+    });
+    const { rerender } = renderGate(submit, refreshRun);
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    await act(async () => {
+      fireEvent.click(approve);
+    });
+    await screen.findByText(LEFT_GATE);
+
+    // A re-render with the same status keeps it (the notice is not retired by any render).
+    rerender(tree());
+    expect(screen.getByText(LEFT_GATE)).toBeTruthy();
+
+    streamWith(run({ status: "completed", gate_revision: 2, plan_md: "# Plan two" }), submit, refreshRun);
+    rerender(tree());
+    await waitFor(() => expect(screen.queryByText(LEFT_GATE)).toBeNull());
+  });
+
+  // A current-0 refusal names no revision, so the revision rule cannot retire it: the next
+  // gate revision the run shows does.
+  it("a current-0 refusal clears when the run shows a new gate revision", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(0);
+    });
+    const refreshRun = vi.fn().mockResolvedValue(undefined);
+    const { rerender } = renderGate(submit, refreshRun);
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    await act(async () => {
+      fireEvent.click(approve);
+    });
+    await screen.findByText("Your decision was not applied because the plan gate changed. Check the plan and try again.");
+
+    streamWith(run({ status: "awaiting_approval", gate_revision: 3, plan_md: "# Plan three" }), submit, refreshRun);
+    rerender(tree());
+    await screen.findByText("Plan three");
+    await waitFor(() => expect(screen.queryByText(/was not applied/)).toBeNull());
+  });
+
+  // A hung refetch cannot hold the gate busy: the wait is bounded, after which the page is
+  // usable again with the notice still showing.
+  it("a hung refetch after a mismatch releases busy after the bounded wait", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(3);
+    });
+    const refreshRun = vi.fn(() => new Promise<void>(() => {}));
+    renderGate(submit, refreshRun);
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    vi.useFakeTimers();
+    try {
+      await act(async () => {
+        fireEvent.click(approve);
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(refreshRun).toHaveBeenCalledTimes(1);
+      expect((screen.getByRole("button", { name: /Approve plan/ }) as HTMLButtonElement).disabled).toBe(true);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4900);
+      });
+      expect((screen.getByRole("button", { name: /Approve plan/ }) as HTMLButtonElement).disabled).toBe(true);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      expect((screen.getByRole("button", { name: /Approve plan/ }) as HTMLButtonElement).disabled).toBe(false);
+      expect(
+        screen.getByText("Your decision was not applied: the run now shows plan revision 3. Review it and decide again."),
+      ).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

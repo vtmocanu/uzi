@@ -2161,7 +2161,7 @@ func TestNotifierRecardsWhenRevisionAdvancesAtSameGeneration(t *testing.T) {
 		t.Fatalf("want the v2 plan in the thread plus a fresh gate card: %+v", fresh)
 	}
 	superseded, ok := findUpdateBlock(fp.updateBlocks, staleTs)
-	if !ok || len(superseded.actionIDs) != 0 || !strings.Contains(strings.ToLower(superseded.sectionText), "superseded") {
+	if !ok || len(superseded.actionIDs) != 0 || !strings.Contains(superseded.sectionText, gateRecardSupersededText) {
 		t.Fatalf("the stale revision-1 card must be superseded button-free: %+v", fp.updateBlocks)
 	}
 

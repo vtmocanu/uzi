@@ -486,6 +486,25 @@ describe("PlanPanel — verdicts bound to the gate revision (PRD #1795 M4)", () 
     expect(h.onRequestChanges).toHaveBeenLastCalledWith("tighten M3", 3);
   });
 
+  // Blocking regression (#1795 round-2 review): the revising reset belongs to the request-changes
+  // composer only. An open REJECT composer keeps the revision it was opened on through a revising
+  // round, so a rejection typed against plan N is refused (409) rather than applied to plan N+1.
+  it("an open reject composer keeps its frozen revision through a revising round", async () => {
+    const h = handlers();
+    const plan2 = [msg(1, "plan", { plan_md: "plan two" })];
+    const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h, null, plan2));
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+
+    const revising = [...plan2, msg(2, "plan_feedback", { feedback: "split M2" }), msg(3, "plan_revising", {})];
+    rerender(panel(run({ gate_revision: 2, plan_md: "plan two" }), h, null, revising));
+    expect(screen.getByText("Revising the plan")).toBeTruthy();
+
+    const plan3 = [...revising, msg(4, "plan", { plan_md: "plan three" })];
+    rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h, null, plan3));
+    fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+    expect(h.onReject).toHaveBeenCalledWith("", 2);
+  });
+
   // The same reset fires on a send the caller reports accepted, for a feed that never delivers
   // the plan_revising frame (a dropped frame; the next plan arrives by refetch).
   it("an accepted revise closes the composer even without a plan_revising frame", async () => {

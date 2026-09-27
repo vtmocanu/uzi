@@ -238,13 +238,19 @@ export function PlanPanel({
   // run stays awaiting_approval) and reopened on plan N+1 still frozen at N, so every second
   // round was refused. closeRequestComposer also runs on a send the caller reports accepted,
   // for a feed that never delivers the plan_revising frame.
+  // The reset is the request-changes composer's alone: an open REJECT composer keeps the
+  // revision it was opened on through a revising round (a revise from another surface), so a
+  // rejection typed against plan N is refused (409) instead of applied to plan N+1. The
+  // reject flag is read through a ref so opening or closing it does not fire this effect.
   const closeRequestComposer = useCallback(() => {
     setRequesting(false);
     setFeedback("");
     setFrozenRevision(null);
   }, []);
+  const rejectingRef = useRef(false);
+  rejectingRef.current = rejecting;
   useEffect(() => {
-    if (rev.revising) closeRequestComposer();
+    if (rev.revising && !rejectingRef.current) closeRequestComposer();
   }, [rev.revising, closeRequestComposer]);
   const sendRevise = async () => {
     const accepted =

@@ -428,8 +428,8 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 		// no stale card lingers (the pure-Slack revise flow already cleared gate_ts, so
 		// this fires mainly for a web-UI-driven or timed-out revise).
 		if gateOpen {
-			if err := n.poster.UpdateBlocks(ctx, anchor.ChannelID, anchor.GateTs.String, "Plan superseded by a newer version",
-				gateResolvedBlocks("Superseded by a newer plan version below.")); err != nil {
+			if err := n.poster.UpdateBlocks(ctx, anchor.ChannelID, anchor.GateTs.String, "Plan gate superseded",
+				gateResolvedBlocks(gateRecardSupersededText)); err != nil {
 				n.logf("supersede prior gate", err)
 			}
 		}
