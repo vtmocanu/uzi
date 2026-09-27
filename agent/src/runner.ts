@@ -5579,7 +5579,8 @@ export class RunRunner {
         // same-key attempt's path. A live-owner conflict or survivors (positively in scope) block
         // the seed (worker_residue_blocked) with nothing moved; so does any other unverified verdict.
         // It runs even when no non-live path is left on disk (nonLivePaths is empty): the scan's
-        // scope is also every process whose UZI_RUN_CLONE_KEY is this key, so a live same-key
+        // scope also takes in every process carrying this key's UZI_RUN_CLONE_KEY together with a
+        // well-formed UZI_RUN_ATTEMPT marker (the key alone scopes nothing), so a live same-key
         // attempt's process still reads back as a live-owner conflict.
         const proof = await this.quiesceRun(flight, flight.executor, {
           mode: "seed",
@@ -7419,9 +7420,12 @@ export class RunRunner {
       // issue #1783 M2: an attempt clone's own PATH footprint is its attempt path alone: the key's
       // canonical path (and every sibling attempt) may hold a RETAINED predecessor, which only a
       // seed/capture sweep scoped to it may ever touch. The scan's scope is not the paths alone,
-      // though: scanOnce also puts in scope every process whose UZI_RUN_CLONE_KEY equals this key,
-      // wherever its cwd; in mode `own` only this attempt's marker and unmarked processes are
-      // killed there, and another live attempt's is a reported conflict, never signalled.
+      // though: scanOnce also puts in scope, wherever its cwd, a process that carries BOTH a
+      // UZI_RUN_CLONE_KEY equal to this key AND a well-formed UZI_RUN_ATTEMPT marker (the key
+      // alone scopes nothing). Such a process is killed when the marker is this attempt's or a
+      // terminal attempt's, and is a reported conflict, never signalled, when it is another live
+      // attempt's; an unmarked process is in scope only by its cwd within a target path (killed
+      // in mode `own`).
       const ownFootprint = clonePath !== canonicalPath ? [clonePath] : [clonePath, canonicalPath];
       const targetPaths = pinnedTargets ?? [...new Set(this.attemptPaths ? ownFootprint : [clonePath, canonicalPath])];
       let outcome: QuiesceRunOutcome;

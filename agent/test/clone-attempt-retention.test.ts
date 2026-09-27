@@ -474,9 +474,11 @@ describe("issue #1783 final: a timed-out retention rm is waited out, and an unse
     git = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim(), retentionDelete }));
   }
 
-  it("the group kill fails: the sweep stops, no further delete starts, the artifact is kept", async () => {
+  it("the group kill fails and 'close' never arrives: the sweep stops, no further delete starts, the artifact is kept", async () => {
     const events: string[] = [];
-    withRm(fakeRm(events, () => false));
+    const rm = fakeRm(events, () => false);
+    rm.closeWaitMs = 50;
+    withRm(rm);
     const { s, planted, residue } = await sweepFixture();
     await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
     assert.deepEqual(events, [`spawn ${path.basename(planted[0]!.skills)}`, "kill"], "no delete after the unsettled one");
@@ -485,7 +487,24 @@ describe("issue #1783 final: a timed-out retention rm is waited out, and an unse
     assert.equal(fs.existsSync(residue[0]!), true);
     assert.equal(ledgerState(s, idAt(0)), "abandoned");
     const warn = lines.find((l) => (l as { msg?: string }).msg?.includes("retention sweep failed"));
-    assert.match(String((warn as { error?: string } | undefined)?.error), /may still be running/);
+    assert.match(String((warn as { error?: string } | undefined)?.error), /may still be running: group kill of pid \d+ failed after 20ms; no close within 50ms/);
+  });
+
+  it("N2: the group kill fails but 'close' arrives within the wait: the sweep goes on", async () => {
+    const events: string[] = [];
+    withRm(
+      fakeRm(events, (child) => {
+        setImmediate(() => {
+          events.push("close");
+          child.emit("close", 0, null);
+        });
+        return false;
+      }),
+    );
+    const { s, planted, residue } = await sweepFixture();
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
+    assert.deepEqual(events.slice(0, 4), [`spawn ${path.basename(planted[0]!.skills)}`, "kill", "close", `spawn ${path.basename(residue[0]!)}`]);
+    assert.equal(fs.existsSync(residue[0]!), false, "the sweep went on after the ordinary timeout");
   });
 
   it("the kill lands but 'close' never arrives: the sweep stops, no further delete starts", async () => {
@@ -499,6 +518,7 @@ describe("issue #1783 final: a timed-out retention rm is waited out, and an unse
     assert.equal(fs.existsSync(residue[0]!), true);
     const warn = lines.find((l) => (l as { msg?: string }).msg?.includes("retention sweep failed"));
     assert.match(String((warn as { error?: string } | undefined)?.error), /no exit within 50ms/);
+    assert.doesNotMatch(String((warn as { error?: string } | undefined)?.error), /group kill of pid .* failed/);
   });
 
   it("'close' arrives after the kill: the next delete starts only after it, and the timed-out artifact is kept", async () => {

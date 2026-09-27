@@ -763,7 +763,7 @@ describe("issue #1783 final: a timed-out canonical rm is waited out before any q
     fs.writeFileSync(path.join(canonical, "old", "f.txt"), "x");
   }
 
-  it("the group kill fails: typed CloneResidueBlockedError, nothing renamed, nothing reseeded", async () => {
+  it("the group kill fails and 'close' never arrives: typed CloneResidueBlockedError, nothing renamed, nothing reseeded", async () => {
     const iid = 3601;
     const canonical = canonicalFor(iid);
     plantPlainTree(canonical);
@@ -775,7 +775,7 @@ describe("issue #1783 final: a timed-out canonical rm is waited out before any q
     const b = await g.ensureClone(fx.originPath);
     await assert.rejects(g.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID()), (err: unknown) => {
       assert.ok(err instanceof CloneResidueBlockedError, String(err));
-      assert.match(err.detail, /may still be running: the runner group kill of pid 910001 failed/);
+      assert.match(err.detail, /may still be running: group kill of pid 910001 failed after 20ms; no close within 50ms/);
       assert.match(err.detail, /nothing quarantined or reseeded/);
       return true;
     });
@@ -794,6 +794,7 @@ describe("issue #1783 final: a timed-out canonical rm is waited out before any q
     await assert.rejects(g.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID()), (err: unknown) => {
       assert.ok(err instanceof CloneResidueBlockedError, String(err));
       assert.match(err.detail, /may still be running: no exit within 50ms of the runner group kill/);
+      assert.doesNotMatch(err.detail, /group kill of pid .* failed/);
       return true;
     });
     assert.equal(treeHash(canonical), hash, "the canonical tree is untouched: no rename, no seed");
@@ -835,6 +836,94 @@ describe("issue #1783 final: a timed-out canonical rm is waited out before any q
     const names = residueNames();
     assert.equal(names.length, 1);
     assert.equal(fs.readFileSync(path.join(runnerRepoDir(), names[0]!, "old", "f.txt"), "utf8"), "x", "the tree was moved, whole");
+  });
+
+  it("N2: the group kill fails but 'close' arrives within the wait (the group had already exited): the reseed proceeds", async () => {
+    const iid = 3604;
+    const canonical = canonicalFor(iid);
+    plantPlainTree(canonical);
+    const events: string[] = [];
+    let child: ChildProcess | undefined;
+    const g = seamed({
+      retentionDelete: {
+        split: true,
+        spawn: () => (child = hangingChild(910004)),
+        kill: () => {
+          events.push("kill failed");
+          setImmediate(() => {
+            events.push("close");
+            child!.emit("close", 0, null);
+          });
+          return false;
+        },
+        timeoutMs: 20,
+        closeWaitMs: 5_000,
+      },
+      canonicalFree: {
+        rename: async (from, to) => {
+          events.push("rename");
+          await fs.promises.rename(from, to);
+        },
+      },
+    });
+    const b = await g.ensureClone(fx.originPath);
+    const clone = await g.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID());
+    assert.equal(clone.path, canonical);
+    assert.deepEqual(events, ["kill failed", "close", "rename"], "an ordinary timeout: the leftover tree is quarantined, then reseeded");
+    assert.equal(residueNames().length, 1);
+  });
+
+  it("N1: an unsettled rm blocks every later claim of the same path until its 'close' arrives", async () => {
+    const iid = 3605;
+    const canonical = canonicalFor(iid);
+    plantPlainTree(canonical);
+    const hash = treeHash(canonical);
+    const spawned: string[] = [];
+    let first: ChildProcess | undefined;
+    const g = seamed({
+      retentionDelete: {
+        split: true,
+        spawn: (_command, args) => {
+          const target = args.at(-1)!;
+          spawned.push(target);
+          if (first === undefined) return (first = hangingChild(910005));
+          // A later rm deletes its target and exits 0.
+          const c = hangingChild(910006);
+          setImmediate(() => {
+            fs.rmSync(target, { recursive: true, force: true });
+            c.emit("close", 0, null);
+          });
+          return c;
+        },
+        kill: () => false,
+        timeoutMs: 20,
+        closeWaitMs: 50,
+      },
+    });
+    const b = await g.ensureClone(fx.originPath);
+    await assert.rejects(g.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID()), (err: unknown) => {
+      assert.ok(err instanceof CloneResidueBlockedError, String(err));
+      assert.match(err.detail, /group kill of pid 910005 failed/);
+      return true;
+    });
+    let proofs = 0;
+    const counting: CanonicalReseedOptions = { beforeFree: async () => void proofs++ };
+    await assert.rejects(g.createOrAttachRunnerClone(b, iid, counting, randomUUID()), (err: unknown) => {
+      assert.ok(err instanceof CloneResidueBlockedError, String(err));
+      assert.match(err.detail, /an earlier runner-uid delete of this path may still be running/);
+      return true;
+    });
+    assert.equal(spawned.length, 1, "the second claim started no rm beside the first");
+    assert.equal(proofs, 0, "and touched nothing");
+    assert.equal(treeHash(canonical), hash, "the canonical tree is untouched: no rename, no seed");
+    assert.deepEqual(residueNames(), []);
+
+    first!.emit("close", null, "SIGKILL");
+    const clone = await g.createOrAttachRunnerClone(b, iid, counting, randomUUID());
+    assert.equal(clone.path, canonical);
+    assert.equal(proofs, 1);
+    assert.deepEqual(spawned, [canonical, canonical], "the third claim ran its own rm, then reseeded");
+    assert.deepEqual(residueNames(), []);
   });
 });
 

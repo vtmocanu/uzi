@@ -666,9 +666,10 @@ const RETENTION_RM_TIMEOUT_MS = 120_000;
 const RETENTION_RM_CLOSE_WAIT_MS = 10_000;
 
 /**
- * issue #1783 — the runner-uid delete timed out and its rm could NOT be shown gone: the group
- * kill failed, or the child's 'close' did not arrive within {@link RETENTION_RM_CLOSE_WAIT_MS}
- * after it. busybox rm walks by PATH, so a surviving rm deletes whatever is later created at
+ * issue #1783 — the runner-uid delete timed out and its rm could NOT be shown gone: the child's
+ * 'close' did not arrive within {@link RETENTION_RM_CLOSE_WAIT_MS} after the group kill, whether
+ * the kill reported success or failure (a failed kill may be ESRCH from a group already gone, so
+ * it waits for 'close' too). The GitCache remembers the path until that 'close' arrives. busybox rm walks by PATH, so a surviving rm deletes whatever is later created at
  * that path (a fresh clone reseeded there). A caller must neither quarantine nor reseed at, nor
  * keep deleting beside, a path such an rm may still be walking.
  */
@@ -926,6 +927,11 @@ export class GitCache {
   private readonly retentionDeleteSeam: GitCacheOptions["retentionDelete"];
   /** See {@link GitCacheOptions.canonicalFree}; undefined in production. */
   private readonly canonicalFreeSeam: GitCacheOptions["canonicalFree"];
+  /** issue #1783 (N1): the targets (resolved) of every runner-uid delete that settled as a
+   *  {@link RunnerDeleteUnsettledError}, each counted until its child's 'close' arrives. In-process
+   *  only: the rm walks by path, so a canonical free or reseed at such a path is refused
+   *  ({@link assertNoUnsettledDelete}) for as long as that rm may still be running. */
+  private readonly unsettledDeletes = new Map<string, number>();
   /** issue #1597 M2: memoised `--remerge-diff` support probe. */
   private remergeProbe: Promise<boolean> | undefined;
 
@@ -1329,6 +1335,7 @@ export class GitCache {
       }
       // issue #1783 M3: the journal cases above ran first and threw with the path untouched.
       await this.freeCanonicalClonePath(clonePath, key, reseed);
+      this.assertNoUnsettledDelete(clonePath);
       return this.seedRunnerClone(barePath, branch, clonePath, runId, resume, expectedCheckpointTip);
     });
   }
@@ -1352,9 +1359,11 @@ export class GitCache {
    *      the WORKER follows a directory swapped for a symlink mid-walk into worker-owned data, while
    *      the runner uid can reach only what it could already delete. Single-uid (#58) has no second
    *      uid and so no boundary: the delete stays the in-process `fs.rm` there. Done when the path
-   *      is then gone. A timeout settles only once the killed rm's 'close' arrives; when the
-   *      group kill fails or 'close' stays absent past a bounded wait, the rm may still be walking
-   *      the path, so this BLOCKS right here, before any rename or reseed.
+   *      is then gone. A timeout settles only once the killed rm's 'close' arrives; when 'close'
+   *      stays absent past a bounded wait after the group kill (whether the kill succeeded or
+   *      failed), the rm may still be walking the path, so this BLOCKS right here, before any
+   *      rename or reseed, and every later free or reseed of the same path on this GitCache
+   *      blocks too until that rm's 'close' arrives.
    *   5. Otherwise (the delete failed, timed out, or left the path present: a root-owned or read-only
    *      directory in the tree, e.g. left by a Docker bind) re-inspect (step 1's checks again), then
    *      rename what is left to `<runnerRoot>/<repoDir>/<formatResidueName(key, uuid)>` in the SAME
@@ -1371,6 +1380,8 @@ export class GitCache {
    * failure of steps 1, 3, 5 or 6 is a {@link CloneResidueBlockedError}.
    */
   private async freeCanonicalClonePath(canonical: string, key: string, reseed: CanonicalReseedOptions): Promise<void> {
+    // An earlier claim's rm on this path may still be walking it: touch nothing (N1).
+    this.assertNoUnsettledDelete(canonical);
     const found = await this.inspectCanonical(canonical);
     if (found === "absent") return;
     if (found === "other") {
@@ -1406,6 +1417,15 @@ export class GitCache {
       rm_error: (deleteErr as NodeJS.ErrnoException | undefined)?.code,
       detail: deleteErr === undefined ? "the delete left the path present" : sanitizeForLog(gitErrorMessage(deleteErr)),
     });
+  }
+
+  /** issue #1783 (N1) — refuse a path an earlier runner-uid delete may still be walking: its
+   *  child settled as a {@link RunnerDeleteUnsettledError} and has not closed since. Throws
+   *  {@link CloneResidueBlockedError}. */
+  private assertNoUnsettledDelete(target: string): void {
+    if (this.unsettledDeletes.has(path.resolve(target))) {
+      throw new CloneResidueBlockedError("an earlier runner-uid delete of this path may still be running; nothing freed or reseeded until it exits");
+    }
   }
 
   /** issue #1783 M3 — the same-parent quarantine rename of whatever is at `canonical` (any type:
@@ -1762,8 +1782,8 @@ export class GitCache {
    * cannot delete (a root-owned subtree) fails the rm and is KEPT, with a log line.
    * Single-uid (#58): there is no second uid and so no boundary to route through (the worker IS the
    * agent's uid there, the #58 accepted posture): the delete stays the in-process fs.rm.
-   * A timed-out rm that cannot be shown gone (the group kill failed, or no 'close' within the
-   * bounded wait after it) is rethrown, which stops the whole sweep.
+   * A timed-out rm that cannot be shown gone (no 'close' within the bounded wait after the group
+   * kill, whether or not the kill succeeded) is rethrown, which stops the whole sweep.
    * Returns true when the target is gone.
    */
   private async deleteRetainedArtifact(
@@ -1841,35 +1861,46 @@ export class GitCache {
       });
       let settled = false;
       let timedOut = false;
+      let closed = false;
       let closeTimer: NodeJS.Timeout | undefined;
       const settle = (err?: Error): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         clearTimeout(closeTimer);
+        if (err instanceof RunnerDeleteUnsettledError && !closed) {
+          // N1: remember the path until this child's 'close' (the listener below stays attached
+          // after settle), so no later claim frees or reseeds where this rm may still walk.
+          const key = path.resolve(target);
+          this.unsettledDeletes.set(key, (this.unsettledDeletes.get(key) ?? 0) + 1);
+          child.once("close", () => {
+            const n = (this.unsettledDeletes.get(key) ?? 1) - 1;
+            if (n > 0) this.unsettledDeletes.set(key, n);
+            else this.unsettledDeletes.delete(key);
+          });
+        }
         if (err) reject(err);
         else resolve();
       };
       // The timeout never settles on its own: busybox rm walks by path, so an rm that outlives
       // this call deletes from whatever is next created at the target. It settles only once the
-      // child's 'close' proves the group gone, or as a RunnerDeleteUnsettledError when the kill
-      // failed or 'close' stays absent past the bounded wait.
+      // child's 'close' proves the group gone, or as a RunnerDeleteUnsettledError when 'close'
+      // stays absent past the bounded wait. A failed kill waits too (N2): ESRCH, a group that
+      // already exited, reads the same as a kill that failed, and only 'close' tells them apart.
       const timer = setTimeout(() => {
         timedOut = true;
-        if (!kill(child.pid)) {
-          settle(new RunnerDeleteUnsettledError(`the runner group kill of pid ${child.pid ?? "?"} failed after ${timeoutMs}ms`));
-          return;
-        }
-        closeTimer = setTimeout(
-          () => settle(new RunnerDeleteUnsettledError(`no exit within ${closeWaitMs}ms of the runner group kill after ${timeoutMs}ms`)),
-          closeWaitMs,
-        );
+        const killed = kill(child.pid);
+        const unsettled = killed
+          ? `no exit within ${closeWaitMs}ms of the runner group kill after ${timeoutMs}ms`
+          : `group kill of pid ${child.pid ?? "?"} failed after ${timeoutMs}ms; no close within ${closeWaitMs}ms`;
+        closeTimer = setTimeout(() => settle(new RunnerDeleteUnsettledError(unsettled)), closeWaitMs);
       }, timeoutMs);
       child.once("error", (err) => {
         // A spawn failure ran nothing. After the timeout, 'error' proves nothing about the rm.
         if (!timedOut) settle(err);
       });
       child.once("close", (code, signal) => {
+        closed = true;
         if (timedOut) settle(new Error(`runner-uid delete timed out after ${timeoutMs}ms (killed; exited ${code ?? signal ?? "abnormally"})`));
         else if (code === 0) settle();
         else settle(new Error(`runner-uid delete exited ${code ?? signal ?? "abnormally"}: ${stripAnsiSgr(stderr).slice(0, 512)}`));
