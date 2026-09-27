@@ -31,12 +31,56 @@ const DEFAULT_DATA_PATH = "/data";
 
 /** The subset of fs.StatFsBase this collector needs. Injected in tests as a fake so
  *  the disk math is exercised without a real filesystem, mirroring the now/cpuCount
- *  seams. `blocks`/`bfree`/`bavail` are in units of `bsize` bytes. */
+ *  seams. `blocks`/`bfree`/`bavail` are in units of `bsize` bytes. `files`/`ffree` are the
+ *  inode total and free count (PRD #1809 D6); `fs.statfsSync` always returns them, and a
+ *  filesystem without inode accounting reports `files` 0. Optional so a fake that models
+ *  bytes only still type-checks: an absent `files` reads as "no inode accounting". */
 export interface StatfsSample {
   bsize: number;
   blocks: number;
   bfree: number;
   bavail: number;
+  files?: number;
+  ffree?: number;
+}
+
+/** PRD #1809 D6: one filesystem's space and inode counts, as the disk-full classifier needs
+ *  them. `inodesTotal` 0 means the filesystem keeps no inode accounting. */
+export interface VolumeSample {
+  /** Bytes available to an unprivileged writer (bavail x bsize). */
+  bytesAvailable: number;
+  /** The filesystem's size in bytes (blocks x bsize). */
+  bytesTotal: number;
+  inodesTotal: number;
+  inodesFree: number;
+}
+
+/** The default statfs seam: `fs.statfsSync`, which returns the inode counts too. */
+export const defaultStatfs = (p: string): StatfsSample => fs.statfsSync(p);
+
+/**
+ * PRD #1809 D6: sample the filesystem holding `path` (bytes and inodes) for the disk-full
+ * classifier. Undefined when statfs throws or returns a non-finite or negative count: the
+ * caller treats that as "unknown". `statfs` is the seam (default {@link defaultStatfs}).
+ * A missing `files`/`ffree` (a bytes-only fake) reads as no inode accounting (0).
+ */
+export function sampleVolume(path: string, statfs: (p: string) => StatfsSample = defaultStatfs): VolumeSample | undefined {
+  let s: StatfsSample;
+  try {
+    s = statfs(path);
+  } catch {
+    return undefined;
+  }
+  const sample: VolumeSample = {
+    bytesAvailable: s.bavail * s.bsize,
+    bytesTotal: s.blocks * s.bsize,
+    inodesTotal: s.files ?? 0,
+    inodesFree: s.ffree ?? 0,
+  };
+  for (const v of Object.values(sample)) {
+    if (!Number.isFinite(v) || v < 0) return undefined;
+  }
+  return sample;
 }
 
 export interface StatsCollectorOptions {
@@ -105,7 +149,7 @@ export class StatsCollector {
     this.cpuCount = opts.cpuCount ?? (() => os.cpus().length);
     this.processCpuUsage = opts.processCpuUsage ?? (() => process.cpuUsage());
     this.processRss = opts.processRss ?? (() => process.memoryUsage().rss);
-    this.statfs = opts.statfs ?? ((p) => fs.statfsSync(p));
+    this.statfs = opts.statfs ?? defaultStatfs;
     this.nixPath = opts.nixPath ?? DEFAULT_NIX_PATH;
     this.dataDir = opts.dataDir ?? DEFAULT_DATA_PATH;
     this.dindMeter = opts.dindMeter ?? (() => readDindMeterSample());

@@ -593,6 +593,16 @@ export class WorkerClient {
   }
 
   /**
+   * PRD #1809 D6: whether a /state report for a run at `generation` would carry
+   * `claim_generation` on the wire (the send-gate above). The data-volume-full park is fenced
+   * on it server-side and 400s without it, so the runner takes that park only when this is true
+   * (never for a chat claim, whose generation is the legacy 0).
+   */
+  stampsClaimGeneration(generation?: number): boolean {
+    return this.includeClaimGeneration(generation);
+  }
+
+  /**
    * Run `send(includeField)` with the shared skew-safe fallback (PRD #1247 fix round).
    * REUSABLE: a later milestone drives the completion RPCs through it too. When `included`
    * is true and the api answers the EXACT strict-decode 400 (a rolled-back api that

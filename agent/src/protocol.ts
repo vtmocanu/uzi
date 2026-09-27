@@ -2157,17 +2157,27 @@ export interface StateRequest {
    *  permit to match. */
   head?: string;
   /** PRD #1392 M2 (D9/D10): the typed cause of a `recovery_wait` park. The worker sends
-   *  "forge_unreachable" (the pre-clone transient-forge park, gated on `recovery_park_cause`) and,
+   *  "forge_unreachable" (the pre-clone transient-forge park, gated on `recovery_park_cause`),
    *  issue #1766, "vault_locked" (a Codex credential refresh/release deferred by a locked owner
    *  vault, gated on `recovery_cause_vault_locked`; an api without that feature gets the untyped
-   *  park). The api validates it against its own enum
-   *  (forge_unreachable|empty_turn|provider_outage|vault_locked) before any SQL and a
-   *  legacy/untyped park omits it (NULL). Additive + optional and OMITTED ENTIRELY on every
+   *  park) and, PRD #1809 D6, "data_volume_full" (a write to the worker's data volume stayed
+   *  disk-full after a reclaim and one retry, or the claim preflight found the volume full; gated
+   *  on `recovery_cause_data_volume_full`, an api without it gets the untyped park; the api 400s
+   *  this cause without `claim_generation`, so it is never sent for a chat claim). The api
+   *  validates it against its own enum
+   *  (forge_unreachable|empty_turn|provider_outage|vault_locked|data_volume_full) before any SQL
+   *  and a legacy/untyped park omits it (NULL). Additive + optional and OMITTED ENTIRELY on every
    *  other report so a pre-#1392 worker's payload and an ordinary (empty-turn) recovery park
    *  stay byte-identical on the wire; an api that predates the field 400s a report carrying it,
    *  which the worker's capability-aware fallback avoids by only sending it when the api
    *  advertised `recovery_park_cause` at register (D7). */
   recovery_cause?: string;
+  /** PRD #1809 D6: qualifies a `recovery_cause: "data_volume_full"` park. `true` parks WITHOUT
+   *  counting toward the api's lifetime cap (UZI_RUN_DISK_PARK_MAX), for M4's soft cache-cap park;
+   *  absent or false is a counted park, and past the cap the api fails the run itself (fail_origin
+   *  data_volume_full). The api 400s it with any other cause, and only accepts it once it
+   *  advertises `recovery_cause_data_volume_full`. The disk-full handling (M5) never sends it. */
+  disk_park_preventive?: boolean;
   /** PRD #1391 Run B M3 (D3): the worker's DURABLE message fence on a run-lane TERMINAL
    *  (completed/failed) report — the run's last emitted seq after the final batcher flush. The api
    *  refuses the transition with a typed 409 `messages_pending` while `runs.last_seq` is below it OR

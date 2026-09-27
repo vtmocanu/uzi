@@ -21,6 +21,7 @@ import { Worker } from "./worker.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
 import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js";
 import { CachesDroppedMemo, DiskPressureController, modelPassMinAgeMs, runDiskReclaimPass } from "./disk-reclaim.js";
+import { DataVolumeGuard } from "./disk-full.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import { errMessage } from "./util.js";
 import { uidSplitActive } from "./runner-uid.js";
@@ -383,6 +384,18 @@ async function main(): Promise<void> {
   });
   const git = new GitCache(config.dataDir, log);
 
+  // PRD #1809 D6: the data-volume guard. It classifies a failed write as data-volume disk-full
+  // (the bare clone/fetch, the fetch-back, the outbox reserve), preflights the volume at claim and
+  // resume, and runs one D7 reclaim before the one retry. The reclaim is the DiskPressureController
+  // built further down (after the runner it needs); bound late through `reclaimNow`, which stays
+  // undefined when the reclaim is off (UZI_DISK_RECLAIM=0): the retry then runs without a pass.
+  let reclaimNow: (() => Promise<void>) | undefined;
+  const dataVolume = new DataVolumeGuard({
+    dataDir: config.dataDir,
+    reclaim: () => reclaimNow?.() ?? Promise.resolve(),
+    log,
+  });
+
   // PRD #1391 M2: the worker-owned message outbox and the shared re-arm registry,
   // built + initialised BEFORE the runners/worker so a boot backlog is already
   // loadable and every batcher can spill into the same store. `init()` mints/loads the
@@ -393,6 +406,9 @@ async function main(): Promise<void> {
   const outbox = new Outbox({
     root: config.outboxDataDir,
     log,
+    // PRD #1809 D6: say when a reserve that cannot be (re)written failed because the data volume
+    // is full. The outbox keeps its custody; a park still goes through the claim-fenced state call.
+    classifyWriteFailure: (err, destination) => dataVolume.classify(err, destination),
     runMaxBytes: config.outboxRunMaxBytes,
     maxBytes: config.outboxMaxBytes,
     retentionMs: config.outboxRetentionMs,
@@ -476,6 +492,7 @@ async function main(): Promise<void> {
     activeRuns,
     diskLocks,
     cachesDropped,
+    dataVolume,
   });
 
   // The chat lane (PRD #39). Per-session executor factory (PRD #42 Decision 4): each
@@ -649,6 +666,7 @@ async function main(): Promise<void> {
             : {}),
         })
       : undefined;
+  if (diskPressure && config.diskReclaimEnabled) reclaimNow = () => diskPressure.reclaimNow();
   worker = new Worker(
     config,
     client,

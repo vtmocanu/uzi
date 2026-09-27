@@ -891,7 +891,7 @@ export class DiskPressureController {
    * is off, or, for a pressure trigger, the last pressure-triggered pass started less than
    * the spacing ago (then undefined). The returned promise never rejects.
    */
-  requestReclaim(reason: "periodic" | "pressure"): Promise<void> | undefined {
+  requestReclaim(reason: "periodic" | "pressure" | "disk_full"): Promise<void> | undefined {
     const reclaim = this.opts.reclaim;
     if (!reclaim) return undefined;
     if (this.inFlight) return this.inFlight;
@@ -915,6 +915,19 @@ export class DiskPressureController {
       });
     this.inFlight = pass;
     return pass;
+  }
+
+  /**
+   * PRD #1809 D6: a write to the data volume failed disk-full, so run one reclaim pass now and
+   * wait for it, before the caller retries its operation once. A pass already in flight may have
+   * listed the volume before the failure, so it is awaited first and then a fresh pass runs (or
+   * joins one another caller started meanwhile). Not spaced like a pressure pass: every caller is
+   * a failed operation about to retry. Resolves at once when the reclaim is off. Never rejects.
+   */
+  async reclaimNow(): Promise<void> {
+    if (!this.opts.reclaim) return;
+    if (this.inFlight) await this.inFlight;
+    await this.requestReclaim("disk_full");
   }
 
   /** The periodic pass, every `intervalMs` until `signal` aborts. Never throws. */

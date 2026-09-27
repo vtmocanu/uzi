@@ -77,6 +77,7 @@ import { rmHomeTree } from "./rmtree.js";
 import { dropRunCaches } from "./run-caches.js";
 import type { RunDiskLocks } from "./run-disk-locks.js";
 import type { CachesDroppedMemo } from "./disk-reclaim.js";
+import { DataVolumeFullError, type DataVolumeGuard } from "./disk-full.js";
 import {
   SteeringChannel,
   PauseNowSignal,
@@ -192,8 +193,10 @@ function isInputReceiptError(err: unknown): boolean {
 
 /** Issue #1766: the typed cause a recovery park is taken for. `transient` is the #1197 empty-turn
  *  recovery (unchanged); `vault_locked` is a Codex credential deferral by a locked owner vault,
- *  which parks credential-free (see RunRunner.handleRecoveryExhausted). */
-type RecoveryParkCause = { kind: "transient" } | { kind: "vault_locked" };
+ *  which parks credential-free (see RunRunner.handleRecoveryExhausted). `data_volume_full` (PRD
+ *  #1809 D6) is a write to the worker's data volume that stayed disk-full after a reclaim and one
+ *  retry; it parks through the claim-fenced pre-clone park flow (RunRunner.handleDataVolumeFull). */
+type RecoveryParkCause = { kind: "transient" } | { kind: "vault_locked" } | { kind: "data_volume_full" };
 
 /** Issue #1766: how many doublings a vault-lock park's retry wait may grow by before it is capped
  *  (base recoveryRetryMs x 16). */
@@ -432,6 +435,18 @@ export class ForgeUnreachableAtCloneError extends Error {
     this.name = "ForgeUnreachableAtCloneError";
   }
 }
+
+/** PRD #1809 D6: the wording a pre-clone park uses on the feed and in its logs. The forge park
+ *  and the data-volume-full park share one report/dispatch/reconcile flow and differ only here. */
+interface PreCloneParkCopy {
+  reason: string;
+}
+const FORGE_PARK_COPY: PreCloneParkCopy = { reason: "forge unreachable at clone" };
+const DATA_VOLUME_PARK_COPY: PreCloneParkCopy = { reason: "the worker's data volume is full" };
+
+/** PRD #1809 D6: the api feature that accepts `recovery_cause: "data_volume_full"`. An api without
+ *  it 400s the cause, so the worker sends the untyped `recovery_wait` park instead. */
+const DATA_VOLUME_FULL_FEATURE = "recovery_cause_data_volume_full";
 
 /**
  * PRD #1247 M5b: a /state report came back with the top-level `stale_claim` disposition
@@ -994,6 +1009,9 @@ interface RunFlight {
    *  (`preserveSession`), never on `parked` alone (D4). The finally reads it to gate exactly the
    *  two resume-artifact removals; false is the safe default for every other path. */
   preClonePark: boolean;
+  /** PRD #1809 D6: what a pre-clone park was taken for (its feed/log wording), set with
+   *  `preClonePark`. Undefined reads as the forge-unreachable park. */
+  preCloneParkReason?: string;
   /** Retain the only copy of unverified recovery work; never guard non-filesystem cleanup. */
   preserveRecoveryClone: boolean;
   /** Issue #1600: the budget off the latest REFUSED wall park's 409, held until the executor
@@ -1206,6 +1224,10 @@ export interface RunnerOptions {
    *  forgets its run there while holding `diskLocks`, since the run may rebuild its caches
    *  before it parks again. Undefined ⇒ nothing to forget. */
   cachesDropped?: CachesDroppedMemo;
+  /** PRD #1809 D6 — the data-volume guard: classifies a failed write as data-volume disk-full,
+   *  preflights the volume at claim and resume, and runs the D7 reclaim before the one retry.
+   *  Undefined ⇒ no disk-full handling (today's behaviour; tests that do not exercise it). */
+  dataVolume?: DataVolumeGuard;
   /** PRD #1391 Run B M4 — the wall-clock budget for the queued-duplicate ownership-probe retry: a
    *  TRANSIENT probe failure retries with backoff up to this bound (the api's claim grace minus a
    *  margin), a held/queued row is re-probed until it, then the attempt ends without executing.
@@ -1274,6 +1296,8 @@ export class RunRunner {
   private readonly diskLocks: RunDiskLocks | undefined;
   /** PRD #1809 D7 — see RunnerOptions.cachesDropped. */
   private readonly cachesDropped: CachesDroppedMemo | undefined;
+  /** PRD #1809 D6 — see RunnerOptions.dataVolume. */
+  private readonly dataVolume: DataVolumeGuard | undefined;
   private readonly detect: (
     worktreePath: string,
   ) => Promise<DetectedRepoAgents>;
@@ -1429,6 +1453,7 @@ export class RunRunner {
     this.snapshotRegistry = opts.activeRuns;
     this.diskLocks = opts.diskLocks;
     this.cachesDropped = opts.cachesDropped;
+    this.dataVolume = opts.dataVolume;
     this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
     this.checkpointTickIntervalMs = opts.checkpointTickIntervalMs ?? 5 * 60_000;
     this.checkpointTestHooks = opts.checkpointTestHooks;
@@ -2145,10 +2170,12 @@ export class RunRunner {
             claim,
             flight,
             await this.currentRestorePointHead(flight),
-          ).catch((e) =>
+          ).catch(async (e) =>
             runLog.warn("recovery: shutdown generation-evidence pin failed (custody retained)", {
               run_id: runId,
               error: errMessage(e),
+              // PRD #1809 D6: name a pin that failed because the data volume is full.
+              ...(await this.diskFullCauseOf(e, this.git.recoveryRoot)),
             }),
           );
         }
@@ -2196,6 +2223,16 @@ export class RunRunner {
           runLog,
           runHome,
         );
+        if (outcome === "fail") {
+          await this.reportGenericFailure(claim, flight, err);
+        }
+      } else if (err instanceof DataVolumeFullError) {
+        // PRD #1809 D6: a write to the data volume stayed disk-full after the D7 reclaim and one
+        // retry (or the claim preflight found the volume full). Caught BEFORE the generic terminal
+        // path so a full volume parks the run rather than failing it. The park goes through the
+        // claim-fenced pre-clone park flow; `fail` (no claim generation to fence the park with, a
+        // 400, an unrecognised ack) takes today's failed path with the batcher still open.
+        const outcome = await this.handleDataVolumeFull(err, claim, flight, reportState, runLog, runHome);
         if (outcome === "fail") {
           await this.reportGenericFailure(claim, flight, err);
         }
@@ -2490,10 +2527,11 @@ export class RunRunner {
         // PRD #1392 M2: a pre-clone forge-unreachable park. It preserves HOME/session only when a
         // resume transcript is resolvable (D4); say which, so an operator reading disk pressure
         // (or the absence of it) can connect it to the park rather than to a leak.
+        const reason = flight.preCloneParkReason ?? FORGE_PARK_COPY.reason;
         runLog.info(
           flight.preserveSession
-            ? "run parked (forge unreachable at clone); preserving its plugin dir and HOME for a same-worker resume"
-            : "run parked (forge unreachable at clone); no clone or session to preserve",
+            ? `run parked (${reason}); preserving its plugin dir and HOME for a same-worker resume`
+            : `run parked (${reason}); no clone or session to preserve`,
           {
             run_home: runHome,
           },
@@ -2954,6 +2992,125 @@ export class RunRunner {
   }
 
   /**
+   * PRD #1809 D6 — run `op`, a write whose destination is `destination`; when it fails and the
+   * data-volume guard classifies the failure as data-volume disk-full, run the D7 reclaim once and
+   * retry `op` once. A retry that is still classified full throws {@link DataVolumeFullError}
+   * (executeClaim parks the run on it); any other failure, and an "unknown" or "not_disk_full"
+   * verdict, rethrows the error unchanged, so the caller keeps today's handling. With no guard
+   * wired this is just `op()`.
+   */
+  private async withDataVolumeRetry<T>(
+    flight: RunFlight,
+    operation: string,
+    destination: string,
+    op: () => Promise<T>,
+  ): Promise<T> {
+    const guard = this.dataVolume;
+    try {
+      return await op();
+    } catch (err) {
+      if (!guard) throw err;
+      const verdict = await guard.classify(err, destination);
+      if (verdict !== "data_volume_full") {
+        // "unknown" is only returned for an error that carries a disk-full signal.
+        if (verdict === "unknown") {
+          flight.runLog.warn("a write failed with a disk-full signal but the data volume could not be sampled; keeping today's handling", {
+            run_id: flight.runId,
+            operation,
+          });
+        }
+        throw err;
+      }
+      flight.runLog.warn("data volume full; running a reclaim pass and retrying once", {
+        run_id: flight.runId,
+        operation,
+        cause: "data_volume_full",
+        error: errMessage(err),
+      });
+      await guard.reclaim();
+      try {
+        return await op();
+      } catch (retryErr) {
+        if ((await guard.classify(retryErr, destination)) === "data_volume_full") {
+          throw new DataVolumeFullError(operation, retryErr);
+        }
+        throw retryErr;
+      }
+    }
+  }
+
+  /**
+   * PRD #1809 D6 — the claim/resume preflight. When the api can take the typed park and the run
+   * can be fenced for it, sample the data volume before the clone/fetch; below its floor, run the
+   * D7 reclaim and re-sample, and still below → {@link DataVolumeFullError}, parked like the typed
+   * handling. Gated on the feature: against an older api the untyped park carries no cap, so a
+   * preflight there would only add parks the typed handling does not need; the retry around the
+   * clone still guards it. An unknown sample never parks.
+   */
+  private async preflightDataVolume(claim: ClaimResponse, flight: RunFlight): Promise<void> {
+    const guard = this.dataVolume;
+    if (!guard || !this.dataVolumeParkable(claim)) return;
+    if (!this.client.protocolFeatures.includes(DATA_VOLUME_FULL_FEATURE)) return;
+    if (guard.preflight() !== "data_volume_full") return;
+    flight.runLog.warn("data volume below its floor at claim; running a reclaim pass before the clone", {
+      run_id: flight.runId,
+      cause: "data_volume_full",
+    });
+    await guard.reclaim();
+    if (guard.preflight() === "data_volume_full") throw new DataVolumeFullError("preflight");
+  }
+
+  /**
+   * PRD #1809 D6 — whether this claim may take the data-volume-full park at all. The api fences
+   * the park on the claim generation and 400s it without one, so a claim whose reports carry no
+   * generation (a chat claim, a pre-#1247 claim with generation 0, or a client that would strip
+   * it) keeps today's handling instead.
+   */
+  private dataVolumeParkable(claim: ClaimResponse): boolean {
+    return this.client.stampsClaimGeneration(claim.claim_generation);
+  }
+
+  /**
+   * PRD #1809 D6 — park a run whose data-volume write stayed disk-full. Reuses the pre-clone forge
+   * park's claim-fenced report and ack dispatch (D10): the TYPED report
+   * `{recovery_wait, recovery_cause: data_volume_full}` when the api advertises
+   * `recovery_cause_data_volume_full` (a counted park; `disk_park_preventive` is M4's and is never
+   * sent here), else the untyped `{recovery_wait}`, exactly like the vault_locked precedent. The
+   * reportState closure stamps claim_generation. Worker custody is kept: the api's disk park settles
+   * no hold, and the worker keeps its local state until the ack confirms the park. A claim that
+   * cannot be fenced returns "fail" (today's failed path).
+   */
+  private async handleDataVolumeFull(
+    err: DataVolumeFullError,
+    claim: ClaimResponse,
+    flight: RunFlight,
+    reportState: RunFlight["reportState"],
+    runLog: Logger,
+    runHome: string | undefined,
+  ): Promise<"parked" | "stop" | "fail"> {
+    if (!this.dataVolumeParkable(claim)) {
+      runLog.warn("data volume full, but this claim carries no claim generation to fence a park; taking today's failed path", {
+        run_id: flight.runId,
+        operation: err.operation,
+        cause: "data_volume_full",
+      });
+      return "fail";
+    }
+    const typed = this.client.protocolFeatures.includes(DATA_VOLUME_FULL_FEATURE);
+    runLog.warn("data volume full after a reclaim and a retry; parking the run for recovery", {
+      run_id: flight.runId,
+      operation: err.operation,
+      cause: "data_volume_full",
+      typed,
+      detail: err.message,
+    });
+    const body: StateRequest = typed
+      ? { status: "recovery_wait", recovery_cause: "data_volume_full", claim_generation: claim.claim_generation }
+      : { status: "recovery_wait" };
+    return await this.reportForgeParkAndDispatch(body, claim, flight, reportState, runLog, runHome, DATA_VOLUME_PARK_COPY);
+  }
+
+  /**
    * PRD #1392 M2 — send the forge park report ONCE and dispatch on the ack (D10). A generic 400
    * (an api that rejects the fields) → today's failed path, never park. A transport failure AFTER
    * the send is an UNKNOWN outcome, never a failure: reconcile via the ownership probe.
@@ -2965,6 +3122,7 @@ export class RunRunner {
     reportState: RunFlight["reportState"],
     runLog: Logger,
     runHome: string | undefined,
+    copy: PreCloneParkCopy = FORGE_PARK_COPY,
   ): Promise<"parked" | "stop" | "fail"> {
     let ack: StateAck;
     try {
@@ -2984,9 +3142,9 @@ export class RunRunner {
         run_id: flight.runId,
         error: errMessage(reportErr),
       });
-      return await this.reconcileForgeParkByProbe(body, claim, flight, reportState, runLog, runHome);
+      return await this.reconcileForgeParkByProbe(body, claim, flight, reportState, runLog, runHome, copy);
     }
-    return await this.dispatchForgeParkAck(ack, claim, flight, runLog, runHome);
+    return await this.dispatchForgeParkAck(ack, claim, flight, runLog, runHome, copy);
   }
 
   /**
@@ -3002,6 +3160,7 @@ export class RunRunner {
     flight: RunFlight,
     runLog: Logger,
     runHome: string | undefined,
+    copy: PreCloneParkCopy = FORGE_PARK_COPY,
   ): Promise<"parked" | "stop" | "fail"> {
     const { batcher } = flight;
     if (ack.reason === "stale_claim") {
@@ -3016,7 +3175,7 @@ export class RunRunner {
       return "fail";
     }
     if (ack.status === "recovery_wait") {
-      await this.finishForgePark(ack.recoveryRetryNotBefore, claim, flight, runLog, runHome);
+      await this.finishForgePark(ack.recoveryRetryNotBefore, claim, flight, runLog, runHome, copy);
       return "parked";
     }
     if (ack.status && TERMINAL_RUN_STATUSES.has(ack.status)) {
@@ -3078,20 +3237,22 @@ export class RunRunner {
     flight: RunFlight,
     runLog: Logger,
     runHome: string | undefined,
+    copy: PreCloneParkCopy = FORGE_PARK_COPY,
   ): Promise<void> {
     const { batcher } = flight;
     const when = retryAt ? `retry at ${retryAt}` : "retry after backoff";
     batcher.emit({
       kind: "status",
       agent: "worker",
-      payload: { text: `forge unreachable at clone; parked, ${when}` },
+      payload: { text: `${copy.reason}; parked, ${when}` },
     });
     await batcher.flush().catch(() => undefined);
     await batcher.close().catch(() => undefined);
     await this.preserveForgeParkSessionIfResolvable(claim, flight, runLog, runHome);
     flight.parked = true;
     flight.preClonePark = true;
-    runLog.info("run parked: forge unreachable at clone", {
+    flight.preCloneParkReason = copy.reason;
+    runLog.info(`run parked: ${copy.reason}`, {
       run_id: flight.runId,
       preserve_session: flight.preserveSession,
       retry_not_before: retryAt ?? null,
@@ -3114,6 +3275,7 @@ export class RunRunner {
     reportState: RunFlight["reportState"],
     runLog: Logger,
     runHome: string | undefined,
+    copy: PreCloneParkCopy = FORGE_PARK_COPY,
   ): Promise<"parked" | "stop" | "fail"> {
     const { batcher } = flight;
     for (;;) {
@@ -3155,7 +3317,7 @@ export class RunRunner {
       }
       const status = probe.status;
       if (status === "recovery_wait") {
-        await this.finishForgePark(probe.recovery_retry_not_before, claim, flight, runLog, runHome);
+        await this.finishForgePark(probe.recovery_retry_not_before, claim, flight, runLog, runHome, copy);
         return "parked";
       }
       if (TERMINAL_RUN_STATUSES.has(status)) {
@@ -3170,7 +3332,7 @@ export class RunRunner {
         // The transaction did not land; resend the SAME report (idempotent) and dispatch its ack.
         try {
           const ack = await reportState(body);
-          return await this.dispatchForgeParkAck(ack, claim, flight, runLog, runHome);
+          return await this.dispatchForgeParkAck(ack, claim, flight, runLog, runHome, copy);
         } catch (reportErr) {
           if (reportErr instanceof RequestError && reportErr.status === 400) {
             runLog.warn("forge park reconcile: resend rejected 400; taking the failed path (no park)", {
@@ -5533,14 +5695,29 @@ export class RunRunner {
     // PARK the run instead of failing it; a PERMANENT verdict (401/403/404) is rethrown unchanged
     // and still fails immediately. `flight.barePath` is assigned ONLY on success, so a park leaves
     // it undefined (no clone, no worktree, no plugin dir exist pre-clone).
+    // PRD #1809 D6: preflight the data volume at claim and at resume (every claim runs this
+    // phase), before the clone/fetch writes to it. An optimisation only: free-space checks cannot
+    // remove races, so the typed handling around ensureClone below is the guarantee.
+    await this.preflightDataVolume(claim, flight);
     let barePath: string;
     try {
-      barePath = flight.barePath = await this.git.ensureClone(
-        claim.repo.clone_url,
-        claim.secrets.forge_pat,
-        claim.secrets.forge_username,
+      // PRD #1809 D6: a clone/fetch that fails because the data volume is full runs the D7
+      // reclaim and retries once; still full → DataVolumeFullError, which executeClaim parks
+      // (recovery_wait, cause data_volume_full). Classified BEFORE the forge verdict below: a
+      // disk-full git error reads "permanent" to classifyForgeError and would fail the run (#1798).
+      barePath = flight.barePath = await this.withDataVolumeRetry(
+        flight,
+        "clone/fetch",
+        this.git.barePathFor(claim.repo.clone_url),
+        () =>
+          this.git.ensureClone(
+            claim.repo.clone_url,
+            claim.secrets.forge_pat,
+            claim.secrets.forge_username,
+          ),
       );
     } catch (err) {
+      if (err instanceof DataVolumeFullError) throw err;
       if (classifyForgeError(err) === "transient") {
         throw new ForgeUnreachableAtCloneError(errMessage(err), err);
       }
@@ -7037,6 +7214,12 @@ export class RunRunner {
     }
   }
 
+  /** PRD #1809 D6: `{cause: "data_volume_full"}` for a log line when the data-volume guard
+   *  attributes `err` (a write to `destination`) to a full data volume, else nothing. */
+  private async diskFullCauseOf(err: unknown, destination: string): Promise<{ cause?: "data_volume_full" }> {
+    return (await this.dataVolume?.classify(err, destination)) === "data_volume_full" ? { cause: "data_volume_full" } : {};
+  }
+
   private async fetchBackBestEffort(
     barePath: string,
     worktreePath: string,
@@ -7044,11 +7227,20 @@ export class RunRunner {
     runId: string,
     runLog: Logger,
   ): Promise<void> {
-    await this.git.fetchAgentBranch(barePath, worktreePath, branch, runId).catch((e) =>
+    try {
+      await this.git.fetchAgentBranch(barePath, worktreePath, branch, runId);
+    } catch (e) {
+      // PRD #1809 D6: name a fetch-back that failed because the data volume (where the worker
+      // bare lives) is full, and start a reclaim pass so the resume has room. Not awaited and not
+      // retried here: this runs inside park/shutdown boundaries with their own deadlines, and a
+      // reclaim pass can take minutes. The run is never failed for it (best-effort, as before).
+      const full = (await this.dataVolume?.classify(e, barePath)) === "data_volume_full";
       runLog.warn("fetch-back on interruption failed; work may not be recoverable", {
         error: errMessage(e),
-      }),
-    );
+        ...(full ? { cause: "data_volume_full" } : {}),
+      });
+      if (full) void this.dataVolume?.reclaim();
+    }
   }
 
   /**
@@ -9398,10 +9590,12 @@ export class RunRunner {
       claim,
       flight,
       await this.currentRestorePointHead(flight),
-    ).catch((e) =>
+    ).catch(async (e) =>
       runLog.warn("recovery: pause generation-evidence pin failed (custody retained)", {
         run_id: flight.runId,
         error: errMessage(e),
+        // PRD #1809 D6: name a pin that failed because the data volume is full.
+        ...(await this.diskFullCauseOf(e, this.git.recoveryRoot)),
       }),
     );
     return true;

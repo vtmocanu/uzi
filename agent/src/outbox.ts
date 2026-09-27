@@ -34,6 +34,7 @@ import path from "node:path";
 
 import type { Logger } from "./log.js";
 import type { OutgoingMessage } from "./protocol.js";
+import type { DiskFullVerdict } from "./disk-full.js";
 
 /** The worker-local HMAC secret is exactly this many random bytes. */
 const OUTBOX_KEY_BYTES = 32;
@@ -260,6 +261,13 @@ export interface OutboxOptions {
   now?: () => number;
   /** Optional raw-write seam to simulate `ENOSPC` (tests). */
   rawWrite?: RawWriteSeam;
+  /**
+   * PRD #1809 D6: classify a failed `.reserve` (re)write as data-volume disk-full (production:
+   * DataVolumeGuard.classify, passed the outbox root as the destination). On a full verdict the
+   * warning carries `cause: "data_volume_full"`. Only the log changes: the outbox keeps its
+   * custody, and a park goes through the claim-fenced state call, never through the outbox.
+   */
+  classifyWriteFailure?: (err: unknown, destination: string) => Promise<DiskFullVerdict>;
 }
 
 /**
@@ -340,6 +348,7 @@ export class Outbox {
   private readonly reserveBytes: number;
   private readonly now: () => number;
   private readonly rawWrite: RawWriteSeam;
+  private readonly classifyWriteFailure: OutboxOptions["classifyWriteFailure"];
 
   private readonly runs = new Map<string, RunState>();
   private readonly uncleanAtInit: string[] = [];
@@ -367,6 +376,7 @@ export class Outbox {
         : OUTBOX_RANGE_RESERVE_BYTES;
     this.now = opts.now ?? (() => Date.now());
     this.rawWrite = opts.rawWrite ?? ((write) => write());
+    this.classifyWriteFailure = opts.classifyWriteFailure;
   }
 
   // ── lifecycle ───────────────────────────────────────────────────────────────
@@ -1685,6 +1695,7 @@ export class Outbox {
     } catch (err) {
       this.log.warn("outbox: could not (pre)allocate reserve (range/terminal writes may fail on a full volume)", {
         error: errText(err),
+        ...(await this.diskFullCause(err)),
       });
     }
   }
@@ -1736,7 +1747,18 @@ export class Outbox {
         await fh.close();
       }
     } catch (err) {
-      this.log.warn("outbox: could not replenish reserve", { error: errText(err) });
+      this.log.warn("outbox: could not replenish reserve", { error: errText(err), ...(await this.diskFullCause(err)) });
+    }
+  }
+
+  /** PRD #1809 D6: `{cause: "data_volume_full"}` when the classifier attributes `err` to a full
+   *  data volume, else nothing. Never throws. */
+  private async diskFullCause(err: unknown): Promise<{ cause?: "data_volume_full" }> {
+    if (!this.classifyWriteFailure) return {};
+    try {
+      return (await this.classifyWriteFailure(err, this.root)) === "data_volume_full" ? { cause: "data_volume_full" } : {};
+    } catch {
+      return {};
     }
   }
 
