@@ -22,8 +22,11 @@ const ceilingProbeID = "ceiling-probe"
 // larger than the LimitRange ceiling of the namespace it lands in (issue #224).
 //
 // WHY THIS LIVES HERE AND NOT IN THE CHART, since it looks at first like a chart
-// concern. Three things claim a PVC per worker — `nixSize`, each preset's `DataSize`
-// and the dind data root — and only ONE of them comes from the chart. The other two
+// concern. Four things size a PVC per worker — `nixSize`, each preset's `DataSize`,
+// the dind data root, and (issue #1815) a RUN-BOUND worker's /data, which replaces the
+// preset's DataSize when protocol.DesiredWorker.Ephemeral ("ephemeral" = run-bound, not
+// ephemeral-storage) — and only the chart-overridable ones (dind data, run-bound data)
+// come from the chart, each with a Go default. The preset sizes and nixSize
 // are Go constants a Helm template cannot read, and putting them into values.yaml was
 // rejected deliberately: it would make the chart a fourth place preset quantities
 // appear and the only one with no golden gating it, which is the ungated-skew class
@@ -128,12 +131,33 @@ func ValidatePVCCeilings(cfg RenderConfig, resolver preset.Resolver) error {
 				if err != nil {
 					return fmt.Errorf("resolving preset %q/%q to check PVC ceilings: %w", template, size, err)
 				}
-				w := protocol.DesiredWorker{ID: ceilingProbeID, Template: template, Size: size, Docker: tier.docker}
-				for _, pvc := range RenderPVCs(cfg, w, spec) {
-					got := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-					name := strings.TrimPrefix(pvc.Name, NamePrefix+ceilingProbeID)
-					if cur, seen := largest[name]; !seen || got.Cmp(cur.size) > 0 {
-						largest[name] = worst{size: got, preset: size}
+				// Render each preset TWICE: as a persistent worker and as a run-bound
+				// (Ephemeral) one, whose /data is the flat EphemeralDataSize instead of
+				// the preset's DataSize (issue #1815). A run-bound claim identical in
+				// size to its persistent twin adds nothing and is not recorded again, so
+				// only the claims the run-bound shape actually changes get their own line.
+				persistent := map[string]resource.Quantity{}
+				for _, ephemeral := range []bool{false, true} {
+					w := protocol.DesiredWorker{
+						ID: ceilingProbeID, Template: template, Size: size,
+						Docker: tier.docker, Ephemeral: ephemeral,
+					}
+					for _, pvc := range RenderPVCs(cfg, w, spec) {
+						got := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+						name := strings.TrimPrefix(pvc.Name, NamePrefix+ceilingProbeID)
+						label := size
+						if !ephemeral {
+							persistent[name] = got
+						} else {
+							if twin, ok := persistent[name]; ok && twin.Cmp(got) == 0 {
+								continue
+							}
+							label = "ephemeral (" + size + ")"
+							name += " (ephemeral, run-bound worker)"
+						}
+						if cur, seen := largest[name]; !seen || got.Cmp(cur.size) > 0 {
+							largest[name] = worst{size: got, preset: label}
+						}
 					}
 				}
 			}
@@ -168,6 +192,8 @@ func ValidatePVCCeilings(cfg RenderConfig, resolver preset.Resolver) error {
 		"Raise the tier's limitRange.maxPVCStorage in deploy/chart/values.yaml — and its quota.requestsStorage with "+
 		"it, or the tier runs out of storage budget instead — or lower the offending size (-data and -nix come from "+
 		"the preset table in controller/internal/preset; -dind-data from workers.docker.dindDataSize, or the "+
-		"controller's built-in default when that is unset)",
+		"controller's built-in default when that is unset; an ephemeral (run-bound) worker's -data from "+
+		"UZI_WORKER_EPHEMERAL_DATA_SIZE, chart key workers.ephemeralWorkerDataSize, or the controller's "+
+		"built-in default when that is unset)",
 		strings.Join(problems, "\n  "))
 }

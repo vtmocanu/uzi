@@ -57,6 +57,22 @@ func TestValidatePVCCeilings(t *testing.T) {
 			cfg:  RenderConfig{MaxPVCStorage: "40Gi", DockerMaxPVCStorage: "40Gi", DinDDataSize: "40Gi"},
 		},
 		{
+			name: "run-bound /data default (20Gi) fits the shipped 25Gi ceilings",
+			cfg:  RenderConfig{MaxPVCStorage: "25Gi", DockerMaxPVCStorage: "25Gi", EphemeralDataSize: ""},
+		},
+		{
+			// Issue #1815: an ephemeral (run-bound) worker's /data override above a
+			// tier's ceiling must be refused, naming the ephemeral case and its knob.
+			name:    "restricted ceiling below the run-bound /data override",
+			cfg:     RenderConfig{MaxPVCStorage: "25Gi", EphemeralDataSize: "30Gi"},
+			wantErr: []string{"restricted tier", "ephemeral", "30Gi", "UZI_WORKER_EPHEMERAL_DATA_SIZE", "workers.ephemeralWorkerDataSize"},
+		},
+		{
+			name:    "docker ceiling below the run-bound /data override",
+			cfg:     RenderConfig{DockerMaxPVCStorage: "25Gi", EphemeralDataSize: "30Gi"},
+			wantErr: []string{"docker tier", "ephemeral", "30Gi"},
+		},
+		{
 			name: "the two tiers are INDEPENDENT: a lowered docker ceiling does not implicate the restricted tier",
 			cfg:  RenderConfig{MaxPVCStorage: "25Gi", DockerMaxPVCStorage: "10Gi"},
 			// dind-data is docker-only, but /nix and /data are claimed in BOTH tiers, so

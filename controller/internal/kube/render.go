@@ -412,6 +412,15 @@ type RenderConfig struct {
 	// touches a plain worker's spec/hash. See dindDataDefaultSize for the 20Gi
 	// admission ceiling and the no-GC residual.
 	DinDDataSize string
+	// EphemeralDataSize is the /data PVC size for a RUN-BOUND worker
+	// (protocol.DesiredWorker.Ephemeral, issue #1815; UZI_WORKER_EPHEMERAL_DATA_SIZE).
+	// "Ephemeral" here means run-bound, NOT ephemeral-storage: this is unrelated to
+	// EphemeralRequest above. Empty ⇒ ephemeralDataDefaultSize ("20Gi"). For a
+	// run-bound worker it REPLACES the preset's Size.DataSize (it is not a max of the
+	// two); a persistent worker's /data is untouched at every preset. A quantity
+	// string, validated (and required positive) at the controller's boot so the render
+	// side can MustParse it.
+	EphemeralDataSize string
 	// DinDPruneEnabled lets a docker worker run its gated, allowlisted DinD prune when
 	// the dind-meter sample shows the dind-data PVC filling (issue #1759). Rendered as
 	// UZI_DIND_PRUNE_ENABLED on docker workers only — "true" iff this is set AND the
@@ -552,7 +561,9 @@ func RenderSecret(cfg RenderConfig, w protocol.DesiredWorker, token string) *cor
 // the DinD daemon's data root.
 //
 // The first two point opposite ways for opposite reasons. /data is the clone
-// cache + per-run workspaces and varies by size. /nix is FLAT (20Gi, PRD #87 bump
+// cache + per-run workspaces and varies by size for a persistent worker; a run-bound
+// (Ephemeral) worker's /data is instead the flat cfg.dataSize override (issue #1815,
+// see ephemeralDataDefaultSize). /nix is FLAT (20Gi, PRD #87 bump
 // for the prebaked Chromium closure) and persists because the store is an expensive
 // INTERNET fetch (measured: 209 MB baked pre-#87 -> ~2.6 GiB baked with Chromium),
 // and Decision 9 rolls every worker on every release —
@@ -569,13 +580,46 @@ func RenderSecret(cfg RenderConfig, w protocol.DesiredWorker, token string) *cor
 func RenderPVCs(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) []*corev1.PersistentVolumeClaim {
 	ns := cfg.namespaceFor(w)
 	pvcs := []*corev1.PersistentVolumeClaim{
-		renderPVC(cfg, ns, w.ID, dataPVCName(w.ID), spec.Size.DataSize),
+		renderPVC(cfg, ns, w.ID, dataPVCName(w.ID), cfg.dataSize(w, spec)),
 		renderPVC(cfg, ns, w.ID, nixPVCName(w.ID), spec.NixSize),
 	}
 	if w.Docker {
 		pvcs = append(pvcs, renderPVC(cfg, ns, w.ID, dindDataPVCName(w.ID), cfg.dindDataSize()))
 	}
 	return pvcs
+}
+
+// ephemeralDataDefaultSize is the /data PVC of a RUN-BOUND worker
+// (protocol.DesiredWorker.Ephemeral; issue #1815) when UZI_WORKER_EPHEMERAL_DATA_SIZE
+// is unset. "Ephemeral" means run-bound (the worker, PVCs included, is removed once
+// its run is terminal), NOT ephemeral-storage — UZI_WORKER_EPHEMERAL_REQUEST is an
+// unrelated knob.
+//
+// Decoupled from the CPU/memory preset because a run-bound worker holds exactly one
+// clone for one run, so its disk need tracks the repository rather than the size it
+// was asked to run at: a small preset's 5Gi /data can be too small for a big repo, and
+// the preset table is shared with persistent workers whose /data must not move. It
+// REPLACES Size.DataSize for such a worker (not max(DataSize, this)).
+//
+// It must fit BOTH tiers' LimitRange maxPVCStorage (25Gi today) —
+// TestEphemeralDataDefaultFitsTheChartsLimitRangeMax reads them out of values.yaml —
+// and the tiers' quota.requestsStorage budget, which the fleet-storage test checks.
+// ValidatePVCCeilings checks an override against the live ceilings at boot.
+const ephemeralDataDefaultSize = "20Gi"
+
+// dataSize is the /data PVC size for w: the run-bound size (the cluster's
+// EphemeralDataSize override, else ephemeralDataDefaultSize) for an Ephemeral worker,
+// the preset's Size.DataSize for a persistent one. Config validated any override as a
+// positive k8s quantity at boot, so MustParse here is safe — the same contract
+// dindDataSize relies on.
+func (cfg RenderConfig) dataSize(w protocol.DesiredWorker, spec preset.Spec) resource.Quantity {
+	if !w.Ephemeral {
+		return spec.Size.DataSize
+	}
+	if cfg.EphemeralDataSize != "" {
+		return resource.MustParse(cfg.EphemeralDataSize)
+	}
+	return resource.MustParse(ephemeralDataDefaultSize)
 }
 
 func renderPVC(cfg RenderConfig, ns, id, name string, size resource.Quantity) *corev1.PersistentVolumeClaim {

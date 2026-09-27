@@ -887,6 +887,54 @@ func TestLoadWorkerEphemeralRequestsPerTier(t *testing.T) {
 	})
 }
 
+// UZI_WORKER_EPHEMERAL_DATA_SIZE (issue #1815) is a RUN-BOUND worker's /data PVC size
+// ("ephemeral" = run-bound, not ephemeral-storage). Read with the docker tier off,
+// unset stays empty so the render side supplies its 20Gi, and a typo, a zero or a
+// negative value is a boot refusal naming the key: each would otherwise be a PVC the
+// apiserver rejects, i.e. a run-bound worker that provisions and never appears.
+func TestLoadWorkerEphemeralDataSize(t *testing.T) {
+	base := func(t *testing.T) {
+		t.Helper()
+		setWorkerEnv(t)
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_API_URL", "https://api.uzi.svc.cluster.local:8443")
+	}
+
+	t.Run("a valid value is kept", func(t *testing.T) {
+		base(t)
+		t.Setenv("UZI_WORKER_EPHEMERAL_DATA_SIZE", "30Gi")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerEphemeralDataSize != "30Gi" {
+			t.Fatalf("WorkerEphemeralDataSize = %q, want 30Gi", cfg.WorkerEphemeralDataSize)
+		}
+	})
+
+	t.Run("unset stays empty", func(t *testing.T) {
+		base(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerEphemeralDataSize != "" {
+			t.Fatalf("unset UZI_WORKER_EPHEMERAL_DATA_SIZE must stay empty (render default applies), got %q",
+				cfg.WorkerEphemeralDataSize)
+		}
+	})
+
+	for _, bad := range []string{"20GB!", "0", "-1Gi"} {
+		t.Run("refuses "+bad, func(t *testing.T) {
+			base(t)
+			t.Setenv("UZI_WORKER_EPHEMERAL_DATA_SIZE", bad)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_EPHEMERAL_DATA_SIZE") {
+				t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_EPHEMERAL_DATA_SIZE", err)
+			}
+		})
+	}
+}
+
 // --- Codex uid-split profile (PRD #1493 M1) --------------------------------
 
 // UZI_WORKER_UID_SPLIT defaults false, honours an explicit true, and treats a

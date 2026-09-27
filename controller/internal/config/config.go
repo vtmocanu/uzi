@@ -122,6 +122,13 @@ type Config struct {
 	// worker, so it must be read even on an instance with the docker tier off. Its
 	// docker counterpart lives with the other docker knobs below.
 	WorkerEphemeralRequest string
+	// WorkerEphemeralDataSize is the /data PVC size for a RUN-BOUND worker
+	// (protocol.DesiredWorker.Ephemeral, issue #1815; UZI_WORKER_EPHEMERAL_DATA_SIZE,
+	// chart key workers.ephemeralWorkerDataSize). "Ephemeral" here means run-bound, NOT
+	// ephemeral-storage: it is unrelated to WorkerEphemeralRequest above. Empty ⇒ the
+	// render side's built-in 20Gi. It REPLACES the preset's DataSize for a run-bound
+	// worker; persistent workers keep the preset's. Must be a positive quantity.
+	WorkerEphemeralDataSize string
 	// WorkerSecretMountPath overrides where the worker's join-token Secret mounts
 	// (UZI_WORKER_SECRET_MOUNT_PATH, issue #1761). Empty ⇒ /run/secrets, the render
 	// default. OpenShift/OKD sets it because CRI-O shadows a volume at /run/secrets. Its
@@ -417,6 +424,14 @@ func loadWorkerSettings(cfg *Config) error {
 		return err
 	}
 
+	// A run-bound worker's /data PVC size (issue #1815). Run-bound, not
+	// ephemeral-storage. Applies to either tier, so it is read here. A zero or negative
+	// size is refused at boot: it would otherwise surface as a PVC the apiserver
+	// rejects, i.e. a run-bound worker that provisions and never appears.
+	if err := parsePositiveQuantityEnv("UZI_WORKER_EPHEMERAL_DATA_SIZE", &cfg.WorkerEphemeralDataSize); err != nil {
+		return err
+	}
+
 	// The join-token Secret mount override (issue #1761). Applies to every worker, so it
 	// is read here rather than with the docker-only knobs.
 	cfg.WorkerSecretMountPath = strings.TrimSpace(os.Getenv("UZI_WORKER_SECRET_MOUNT_PATH"))
@@ -558,6 +573,24 @@ func parseQuantityEnv(key string, dst *string) error {
 	}
 	if _, err := resource.ParseQuantity(v); err != nil {
 		return fmt.Errorf("%s=%q is not a valid resource quantity (e.g. \"4\" or \"6Gi\"): %w", key, v, err)
+	}
+	*dst = v
+	return nil
+}
+
+// parsePositiveQuantityEnv is parseQuantityEnv plus a refusal of a zero or negative
+// value, naming the key. For sizes where zero is never a meaningful setting (a PVC
+// request of 0 is rejected at admission), so it must fail at boot instead.
+func parsePositiveQuantityEnv(key string, dst *string) error {
+	var v string
+	if err := parseQuantityEnv(key, &v); err != nil {
+		return err
+	}
+	if v == "" {
+		return nil
+	}
+	if q := resource.MustParse(v); q.Sign() <= 0 {
+		return fmt.Errorf("%s=%q must be a positive resource quantity (e.g. \"20Gi\")", key, v)
 	}
 	*dst = v
 	return nil
