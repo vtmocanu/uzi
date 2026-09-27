@@ -351,6 +351,10 @@ type fakeEpisodeStore struct {
 	claimErr  error
 	claims    []store.ClaimHealthEpisodeNoticeParams // every claim attempted, in order
 	claimed   map[string]bool                        // (episode|user) keys already claimed (first claim inserts, repeats no-op)
+
+	// Release after a failed Notify (issue #1499).
+	releases   []store.ReleaseHealthEpisodeNoticeParams // every release attempted, in order
+	releaseErr error
 }
 
 func (f *fakeEpisodeStore) GetOpenHealthEpisode(context.Context) (store.GetOpenHealthEpisodeRow, error) {
@@ -402,15 +406,37 @@ func (f *fakeEpisodeStore) ClaimHealthEpisodeNotice(_ context.Context, arg store
 	return 1, nil
 }
 
-// fakeEpisodeNotifier records every notice Notify is asked to send (and can inject an error).
+// ReleaseHealthEpisodeNotice models the real DELETE: it records the attempt and, unless
+// releaseErr is injected, frees the (episode, user) slot so the next claim inserts again.
+func (f *fakeEpisodeStore) ReleaseHealthEpisodeNotice(_ context.Context, arg store.ReleaseHealthEpisodeNoticeParams) error {
+	f.releases = append(f.releases, arg)
+	if f.releaseErr != nil {
+		return f.releaseErr
+	}
+	delete(f.claimed, arg.EpisodeID.String()+"|"+arg.UserID.String())
+	return nil
+}
+
+// fakeEpisodeNotifier records every notice Notify is asked to send (sent, including failed
+// attempts) and every one that succeeded (delivered). err fails every send; errFor fails only
+// the sends to the listed users.
 type fakeEpisodeNotifier struct {
-	sent []notifysvc.Notification
-	err  error
+	sent      []notifysvc.Notification
+	delivered []notifysvc.Notification
+	err       error
+	errFor    map[uuid.UUID]error
 }
 
 func (f *fakeEpisodeNotifier) Notify(_ context.Context, n notifysvc.Notification) (store.Notification, error) {
 	f.sent = append(f.sent, n)
-	return store.Notification{}, f.err
+	if f.err != nil {
+		return store.Notification{}, f.err
+	}
+	if err := f.errFor[n.UserID]; err != nil {
+		return store.Notification{}, err
+	}
+	f.delivered = append(f.delivered, n)
+	return store.Notification{}, nil
 }
 
 // fakeEpisodeSettings is the reconciler's enablement gate + base-URL seam.
