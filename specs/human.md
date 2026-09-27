@@ -927,6 +927,15 @@ Tracked as GitHub issue vtmocanu/uzi#1604; decision record `adr/1604-plan-gate-v
 - A resumed run with an unapproved plan reads the owner's pending verdicts before it shows a plan. On Claude runs a pending cancel, reject or request-changes acts first (changes revise the submitted plan rather than re-offering it); a pending approve waits for the gate, where it is judged like any replayed verdict. On Codex runs every pending approve, reject or request-changes is ignored with a note asking to re-send it, and a fresh plan is shown. (AI-synced 2026-09-26)
 - Every ignored verdict is explained in the run feed, except an approve replaced by a newer verdict, a repeat approve after the plan was approved, and an empty change request. (AI-synced 2026-09-26)
 
+## Feature #1783 — Confirmed run quiescence and attempt-unique clone paths
+
+Tracked as GitHub issue vtmocanu/uzi#1783; decision record `adr/1783-run-quiescence-and-attempt-clone-paths.md`.
+
+- Destructive clone cleanup and any credentialed sink (checkpoint publish, finalize, pause, retire, graceful shutdown) require confirmed quiescence of the run's clone first; an unproven state fails closed rather than proceeding. (AI-synced 2026-09-27)
+- On a Docker-wired worker, a run's clone path is never reused by a later execution attempt of the same run; each attempt seeds its own path. (AI-synced 2026-09-27)
+- Foreign residue found at a clone path is quarantined beside it rather than left to wedge the worker; a run that cannot prove its clone path clear fails with the `worker_residue_blocked` fail origin. (AI-synced 2026-09-27)
+- A resume or re-claim on a Docker-wired worker starts a fresh model session (Claude session or Codex thread); its earlier committed work still carries forward through the branch, tracking ref and checkpoints, but the conversation itself is not resumed. Unwired workers keep full same-path resume. (AI-synced 2026-09-27)
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

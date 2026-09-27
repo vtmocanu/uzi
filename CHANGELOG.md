@@ -30,6 +30,9 @@ through `[0.52.0]`.)
 - **The worker scratch path and sandbox guarantee are documented ([#1719](https://github.com/vtmocanu/uzi/issues/1719)).**
   ADR-1719 defines the `.uzi/scratch/` path for run artifacts and the limits of each harness's path policy. The worker provisions and locally excludes scratch, refuses checkpoint or final publication of forced-staged artifacts, and guides both harnesses to fresh review exports and gate logs inside the retained clone.
 
+- **A run's clone is proven quiescent before it is parked, retired or finalized, closing a background-process and container escape ([#1783](https://github.com/vtmocanu/uzi/issues/1783)).**
+  A detached shell or backgrounded job could outlive a run's park and keep writing into its clone, or keep a bind-mounted Docker container alive there; one such incident recreated a clone path as root:root and bricked later runs on that worker with EACCES. A uid-scoped runner process reaper and a Docker Engine API teardown now confirm the clone is clear before every park, pause, retirement, checkpoint or finalize; an unproven state fails closed rather than proceeding. On Docker-wired workers each execution attempt now seeds its own clone path and never reuses an earlier attempt's, so a resume there starts a fresh model session (Claude session or Codex thread) instead of resuming the prior conversation — work still carries forward through the branch, tracking ref and checkpoints, only the session's own memory of the conversation is lost. Unwired workers are unaffected and keep full same-path resume. Residue the worker still cannot remove is quarantined beside the clone rather than left to wedge the worker; a run blocked this way fails with the new `worker_residue_blocked` fail origin. See ADR-1783.
+
 ### Fixed
 
 - **A plan-gate verdict no longer gets lost or applied to the wrong plan when a run is interrupted ([#1604](https://github.com/vtmocanu/uzi/issues/1604)).**
