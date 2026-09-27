@@ -680,8 +680,8 @@ export function composePushSecretBlockedReason(
  * name is clamped with "…" rather than cutting the tail. Exported for a direct length-cap
  * unit test.
  *
- * `stage` (issue #1769) names where the realign stopped. `"align"` (the default, byte-identical
- * to the pre-#1769 text) is the merge/rebase path above. `"import"` means uzi could not even
+ * `stage` (issue #1769) names where the realign stopped. `"align"` (the default; byte-identical
+ * to the pre-#1769 text when the patch is preserved) is the merge/rebase path above. `"import"` means uzi could not even
  * import the default branch's new objects into the runner clone (a self-contained Codex clone, or
  * the probe that runs for every executor), so no merge or rebase was attempted and the reason
  * must not claim one was. Its wording is executor-neutral for that reason.
@@ -4278,7 +4278,8 @@ export class RunRunner {
             // issue #1769: `stage` "import" is the runner clone's object import
             // (ensureRunnerCloneObjects, run for every executor) failing BEFORE any merge/rebase,
             // so its status and reason never claim one ran;
-            // "align" (the default) keeps the merge/rebase texts byte-identical.
+            // "align" (the default) keeps the merge/rebase status texts, and the patch-preserved
+            // reason, byte-identical.
             const failBaseAlignConflict = async (stage: "align" | "import" = "align") => {
               const patch = await scanGatedPatch(
                 await this.git.workflowScopeDiff(alignBarePath, originalAgentTip),
