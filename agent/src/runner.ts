@@ -25,6 +25,7 @@ import {
   newRunAttempt,
   quiesceRunAttempt,
   sanitizeForLog,
+  unverifiedOnlyByUnattributedUnreadable,
   type QuiesceMode,
   type QuiesceRunOutcome,
   type QuiesceRunRequest,
@@ -102,6 +103,7 @@ import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { CodexSessionStore } from "./codex/session-state.js";
 import { errMessage, RUN_ID_RE, sleep } from "./util.js";
 import {
+  AttemptReleaseError,
   CHECKPOINT_SCAN_TIMEOUT_MS,
   CapturePathMismatchError,
   ForeignCaptureBlockedError,
@@ -2438,9 +2440,18 @@ export class RunRunner {
       let ownAttemptRetired = false;
       if (flight.predecessorCapture && flight.worktreePath && !flight.preserveRecoveryClone) {
         if (flight.barePath && flight.branch && flight.predecessorCaptureVerified) {
+          // The release appends the ledger BEFORE it clears the journal, so every failure it can
+          // throw leaves the journal in place; the warning names the step that failed.
           await this.git
-            .releaseAttemptInPlace(flight.barePath, flight.worktreePath, flight.branch, runId)
-            .catch((e) => runLog.warn("predecessor attempt release failed; journal kept", { error: errMessage(e) }));
+            .releaseAttemptInPlace(flight.barePath, flight.worktreePath, flight.branch, runId, "abandoned")
+            .catch((e: unknown) =>
+              runLog.warn(
+                e instanceof AttemptReleaseError
+                  ? `predecessor attempt release failed at the ${e.stage === "ledger" ? "ledger append" : "journal clear"}; journal kept`
+                  : "predecessor attempt release refused (the journal no longer names this attempt); nothing released",
+                { error: errMessage(e) },
+              ),
+            );
         }
       } else if (flight.worktreePath && !flight.preserveRecoveryClone) {
         const q = await this.quiesceRun(flight, executor, { mode: "own", site: "terminal_retire" });
@@ -5529,8 +5540,10 @@ export class RunRunner {
     }
     try {
       if (this.attemptPaths && shape === "attempt") {
-        // The foreign owner's work is retained IN PLACE (never moved): the ledger says abandoned.
-        await this.git.releaseAttemptInPlace(barePath, journaledPath, branch, ownerRunId);
+        // The foreign owner's work is retained IN PLACE (never moved) and was NOT captured, so it
+        // may be the only copy: the ledger says `reclaimed`, which the retention sweep never counts
+        // or deletes — the attempt-path twin of the foreign quarantine below (discard:false).
+        await this.git.releaseAttemptInPlace(barePath, journaledPath, branch, ownerRunId, "reclaimed");
       } else {
         await this.git.retireRunnerClone(barePath, journaledPath, branch, ownerRunId, { discard: false });
       }
@@ -5544,6 +5557,9 @@ export class RunRunner {
   private attemptSeedOptions(claim: ClaimResponse, flight: RunFlight): AttemptSeedOptions | undefined {
     const attemptId = flight.attemptId;
     if (!this.attemptPaths || attemptId === undefined) return undefined;
+    // Set when this seed's sweep could not attribute an unreadable process (below): every retention
+    // deletion of the same seed is then vetoed, whatever its own re-scan says.
+    let retentionVetoed = false;
     return {
       attemptId,
       isLive: (p) => this.liveAttempts.isLivePath(p),
@@ -5551,16 +5567,34 @@ export class RunRunner {
         // issue #1783 M2 (seed-time sweep): the process scan (mode `seed`: a terminal attempt's
         // residue is killed, an unattributed in-scope process survives) over this key's NON-LIVE
         // paths, plus the Docker teardown of containers bound within them — never within a live
-        // same-key attempt's path. A live-owner conflict, survivors or unverified block the seed
-        // (worker_residue_blocked) with nothing moved. Seeding a fresh path frees no old path.
-        if (nonLivePaths.length === 0) return;
+        // same-key attempt's path. A live-owner conflict or survivors (positively in scope) block
+        // the seed (worker_residue_blocked) with nothing moved; so does any other unverified verdict.
+        // It runs even when no non-live path is left on disk (nonLivePaths is empty): the scan's
+        // scope is also every process whose UZI_RUN_CLONE_KEY is this key, so a live same-key
+        // attempt's process still reads back as a live-owner conflict.
         const proof = await this.quiesceRun(flight, flight.executor, {
           mode: "seed",
           site: "attempt_seed",
           targetPaths: nonLivePaths,
           clonePath: canonical,
         });
-        if (proof.blocked) throw new RunResidueBlockedError(proof.outcome.process?.detail ?? "not quiescent");
+        if (!proof.blocked) return;
+        // issue #1783 M2 review (N6): a non-dumpable runner-uid process ANYWHERE on the worker reads
+        // back unattributable, so failing the seed on it would fail every wired seed while one
+        // exists. This honours the plan's "move nothing when unverified" rule rather than bending
+        // it: seeding a FRESH attempt path moves, frees and deletes nothing (no predecessor path is
+        // touched), so it is allowed; every step that WOULD move or free something still requires
+        // a quiescent proof, and the retention deletions of this same sweep are vetoed outright.
+        // Only this seed mode relaxes it; capture and own proofs keep failing closed on unverified.
+        if (unverifiedOnlyByUnattributedUnreadable(proof.outcome.process)) {
+          retentionVetoed = true;
+          flight.runLog.warn("attempt seed: unattributable unreadable runner-uid process(es); seeding the fresh path, no retention deletion this seed", {
+            site: "attempt_seed",
+            processes: describeProcesses(proof.outcome.process),
+          });
+          return;
+        }
+        throw new RunResidueBlockedError(proof.outcome.process?.detail ?? "not quiescent");
       },
       onSeeded: (clonePath) => {
         // Live from the seed on (inside the bare lock), so a concurrent same-key seed's sweep
@@ -5577,6 +5611,7 @@ export class RunRunner {
         this.liveAttempts.add(attempt);
       },
       quiescent: async (paths, canonical) => {
+        if (retentionVetoed) return false;
         const proof = await this.quiesceRun(flight, flight.executor, {
           mode: "seed",
           site: "attempt_retention",
@@ -5768,6 +5803,10 @@ export class RunRunner {
 
     // Journal ownership before any model can write. The worker-owned bare config
     // survives failed captures, process restarts, and runner-owned clone tampering.
+    // issue #1783 M2: the retention sweep relies on this ordering (see attemptCloneForBranch): no
+    // executor or agent starts in a seeded attempt path before this write, so a ledger `live`
+    // entry that no journal names, is not live here and holds no custody is a seed interrupted
+    // before this line, with no agent work in it.
     await this.git.markRecoveryCapture(barePath, flight.worktreePath!, flight.branch!, runId, flight.runnerClone?.attemptId);
     batcher.emit({
       kind: "status",
@@ -7338,9 +7377,12 @@ export class RunRunner {
         };
       }
       const { cloneKey, canonicalPath } = cloneKeyOf(clonePath);
-      // issue #1783 M2: an attempt clone's own footprint is its attempt path alone. The key's
+      // issue #1783 M2: an attempt clone's own PATH footprint is its attempt path alone: the key's
       // canonical path (and every sibling attempt) may hold a RETAINED predecessor, which only a
-      // seed/capture sweep scoped to it may ever touch.
+      // seed/capture sweep scoped to it may ever touch. The scan's scope is not the paths alone,
+      // though: scanOnce also puts in scope every process whose UZI_RUN_CLONE_KEY equals this key,
+      // wherever its cwd; in mode `own` only this attempt's marker and unmarked processes are
+      // killed there, and another live attempt's is a reported conflict, never signalled.
       const ownFootprint = clonePath !== canonicalPath ? [clonePath] : [clonePath, canonicalPath];
       const targetPaths = pinnedTargets ?? [...new Set(this.attemptPaths ? ownFootprint : [clonePath, canonicalPath])];
       let outcome: QuiesceRunOutcome;

@@ -3,13 +3,15 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   compareAttemptIds,
   formatAttemptId,
+  formatResidueName,
   isRetainedArtifactName,
   parseRetainedArtifactName,
 } from "../src/attempt-path.js";
-import { GitCache, PendingRecoveryCaptureError, gitEnv, type AttemptSeedOptions } from "../src/git.js";
+import { AttemptReleaseError, GitCache, PendingRecoveryCaptureError, gitEnv, type AttemptLedgerState, type AttemptSeedOptions } from "../src/git.js";
 import { screenToolPath } from "../src/guardrails.js";
 import { deriveCloneKey } from "../src/run-kind.js";
 import { mintAttemptId } from "../src/run-quiescence.js";
@@ -87,7 +89,7 @@ async function keyFixture(key = "issue-3001", branch = "agent/issue-3001"): Prom
 }
 
 /** A retained attempt dir + its skills sibling + a ledger value. */
-function plantAttempt(s: Seeded, attemptId: string, runId: string, state: "live" | "abandoned" | "retired"): { dir: string; skills: string } {
+function plantAttempt(s: Seeded, attemptId: string, runId: string, state: AttemptLedgerState): { dir: string; skills: string } {
   const dir = `${s.canonical}.attempt-${attemptId}`;
   const skills = path.join(s.parent, `.uzi-skills-${path.basename(dir)}`);
   fs.mkdirSync(dir, { recursive: true });
@@ -184,31 +186,126 @@ describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
     for (const p of planted.slice(5)) assert.equal(fs.existsSync(p.dir), true);
   });
 
-  it("never counts a live or retired attempt, nor one without a ledger identity", async () => {
+  it("never counts an attempt live on this worker, a retired or reclaimed one, nor one without a ledger identity", async () => {
     const s = await keyFixture();
     const liveOnes = [0, 1, 2, 3, 4].map((i) => plantAttempt(s, idAt(i), `run-${i}`, "live"));
+    const reclaimed = [5, 6, 7, 8].map((i) => plantAttempt(s, idAt(i), `owner-${i}`, "reclaimed"));
+    const retired = [9, 10, 11, 12].map((i) => plantAttempt(s, idAt(i), `run-${i}`, "retired"));
     const unknown = `${s.canonical}.attempt-${idAt(20)}`;
     fs.mkdirSync(unknown);
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, seedOpts());
-    for (const p of liveOnes) assert.equal(fs.existsSync(p.dir), true);
+    const live = new Set(liveOnes.map((p) => p.dir));
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, seedOpts({ isLive: (p) => live.has(p) }));
+    for (const p of [...liveOnes, ...reclaimed, ...retired]) assert.equal(fs.existsSync(p.dir), true, p.dir);
     assert.equal(fs.existsSync(unknown), true);
   });
 
-  it("keeps at most 5 .uzi-residue-* per key, oldest first, and only for its own key", async () => {
+  it("keeps at most 5 .uzi-residue-<key>.residue-<uuid> per key, oldest mtime first, only its own key's, only the pinned grammar", async () => {
     const s = await keyFixture();
+    const t0 = Date.UTC(2026, 0, 1) / 1000;
     const residue = [0, 1, 2, 3, 4, 5, 6].map((i) => {
-      const id = idAt(i);
-      const p = path.join(s.parent, `.uzi-residue-${s.key}.attempt-${id}`);
+      const p = path.join(s.parent, formatResidueName(s.key, randomUUID()));
       fs.mkdirSync(p);
-      cfg(s.bare, "--add", `uzi-attempts.${s.branch}.entry`, JSON.stringify({ attemptId: id, runId: `run-${i}`, clonePath: `${s.canonical}.attempt-${id}`, state: "abandoned" }));
+      fs.writeFileSync(path.join(p, "LEFTOVER"), "x");
+      fs.utimesSync(p, t0 + i * 60, t0 + i * 60);
       return p;
     });
-    const otherId = idAt(0, 2);
-    const other = path.join(s.parent, `.uzi-residue-${s.key}1.attempt-${otherId}`);
+    const other = path.join(s.parent, formatResidueName(`${s.key}1`, randomUUID()));
     fs.mkdirSync(other);
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, seedOpts());
+    fs.utimesSync(other, t0 - 60, t0 - 60);
+    // An older, non-pinned residue shape is never counted or deleted.
+    const legacy = path.join(s.parent, `.uzi-residue-${s.key}.attempt-${idAt(1)}`);
+    fs.mkdirSync(legacy);
+    fs.utimesSync(legacy, t0 - 120, t0 - 120);
+    const opts = seedOpts();
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, opts);
     assert.deepEqual(residue.map((p) => fs.existsSync(p)), [false, false, true, true, true, true, true]);
     assert.equal(fs.existsSync(other), true, "issue-30011's residue is not issue-3001's");
+    assert.equal(fs.existsSync(legacy), true, "a name outside the pinned grammar is never deleted");
+    assert.deepEqual(opts.quiescentCalls, [[residue[0]], [residue[1]]], "each deletion is behind its own scoped scan");
+  });
+
+  it("residue: a journaled, live or not-quiescent residue is kept, and so is one the delete cannot remove (logged)", async () => {
+    const s = await keyFixture();
+    const t0 = Date.UTC(2026, 0, 1) / 1000;
+    const residue = [0, 1, 2, 3, 4, 5, 6, 7, 8].map((i) => {
+      const p = path.join(s.parent, formatResidueName(s.key, randomUUID()));
+      fs.mkdirSync(p);
+      fs.utimesSync(p, t0 + i * 60, t0 + i * 60);
+      return p;
+    });
+    const [journaled, live, busy, locked] = residue;
+    cfg(s.bare, "uzi-recovery.agent/other.clone", JSON.stringify({ runId: "someone", clonePath: path.join(journaled!, "inner") }));
+    const ro = path.join(locked!, "root-owned");
+    fs.mkdirSync(ro);
+    fs.writeFileSync(path.join(ro, "file"), "x");
+    fs.chmodSync(ro, 0o500);
+    unlock.push(ro);
+    // Planting inside `locked` bumped its mtime: put it back in the oldest four.
+    fs.utimesSync(locked!, t0 + 3 * 60, t0 + 3 * 60);
+    await git.runnerCloneForBranch(
+      s.bare,
+      s.branch,
+      s.key,
+      "run-new",
+      false,
+      undefined,
+      seedOpts({ isLive: (p) => p === live, quiescent: async (paths) => paths[0] !== busy }),
+    );
+    assert.deepEqual(residue.map((p) => fs.existsSync(p)), [true, true, true, true, true, true, true, true, true]);
+    assert.equal(fs.existsSync(path.join(ro, "file")), true);
+    assert.ok(
+      lines.some((l) => (l as { msg?: string }).msg?.includes("could not delete") && (l as { path?: string }).path === locked),
+      "the failed deletion is logged",
+    );
+  });
+
+  it("the residue grammar: formatResidueName round-trips through parseRetainedArtifactName; ambiguous and control-char names are refused", () => {
+    const uuid = randomUUID();
+    for (const key of ["issue-1", "fix.residue-x", "a.b", "task-6f1c2c1a-0000-4000-8000-000000000000", `k.residue-${randomUUID()}`]) {
+      const name = formatResidueName(key, uuid);
+      assert.equal(name, `.uzi-residue-${key}.residue-${uuid}`);
+      assert.deepEqual(parseRetainedArtifactName(name), { kind: "residue", key, uuid }, name);
+      assert.equal(isRetainedArtifactName(name), true);
+    }
+    const v4 = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    const refused = [
+      ".uzi-residue-",
+      ".uzi-residue-issue-1",
+      `.uzi-residue-issue-1.residue-${v4.toUpperCase()}`,
+      ".uzi-residue-issue-1.residue-0f8fad5b-d9cb-169f-a165-70867728950e", // v1
+      ".uzi-residue-issue-1.residue-0f8fad5b-d9cb-469f-c165-70867728950e", // bad variant
+      `.uzi-residue-issue-1.residue-${v4}x`,
+      `.uzi-residue-issue-1.residue-${v4}\n`,
+      `.uzi-residue-.residue-${v4}`,
+      `.uzi-residue-..residue-${v4}`,
+      `.uzi-residue-...residue-${v4}`,
+      `.uzi-residue-a/b.residue-${v4}`,
+      `.uzi-residue-iss\nue-1.residue-${v4}`,
+      `.uzi-residue-iss\u0007ue-1.residue-${v4}`,
+      `.uzi-residue-iss\u009bue-1.residue-${v4}`,
+      `.uzi-residue-iss\u2028ue-1.residue-${v4}`,
+      `.uzi-residue-issue-1.attempt-${idAt(1)}.residue-${v4}`,
+      `.uzi-residue-issue-1.attempt-${idAt(1)}`,
+    ];
+    for (const name of refused) {
+      assert.equal(parseRetainedArtifactName(name), undefined, JSON.stringify(name));
+      assert.equal(isRetainedArtifactName(name), true, "still never a clone");
+    }
+    for (const [key, u] of [
+      ["", v4],
+      [".", v4],
+      ["..", v4],
+      [".hidden", v4],
+      ["a/b", v4],
+      ["a\nb", v4],
+      ["a\u0000b", v4],
+      [`issue-1.attempt-${idAt(1)}`, v4],
+      ["issue-1", v4.toUpperCase()],
+      ["issue-1", "not-a-uuid"],
+      ["issue-1", `${v4}\n`],
+    ] as const) {
+      assert.throws(() => formatResidueName(key, u), JSON.stringify([key, u]));
+    }
   });
 
   it("isRetainedArtifactName: skills and residue siblings, never a clone", () => {
@@ -218,6 +315,7 @@ describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
     assert.equal(isRetainedArtifactName(`issue-1.attempt-${idAt(1)}`), false);
     assert.deepEqual(parseRetainedArtifactName(`.uzi-skills-issue-1.attempt-${idAt(1)}`), { kind: "skills", cloneBasename: `issue-1.attempt-${idAt(1)}` });
     assert.equal(parseRetainedArtifactName(".uzi-residue-"), undefined);
+    assert.equal(parseRetainedArtifactName(".uzi-skills-"), undefined);
   });
 
   it("no key derivation or attempt formatter can produce a .uzi-residue-* or .uzi-skills-* name", async () => {
@@ -257,6 +355,164 @@ describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
   });
 });
 
+// ─── review round (N1–N5) ──────────────────────────────────────────────────────────────────
+
+describe("issue #1783 M2 review: retention deletions are re-validated and run as the runner uid", () => {
+  it("under the uid split every deletion is the setpriv-wrapped /bin/rm -rf -- <target>, never an in-process rm", async () => {
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const rec = recordingLogger();
+    git = new GitCache(
+      fx.dataDir,
+      rec.logger,
+      undefined,
+      testGitCacheOptions({
+        gitleaksBin: defaultGitleaksShim(),
+        retentionDelete: {
+          split: true,
+          run: async (command, args) => {
+            calls.push({ command, args });
+            fs.rmSync(args.at(-1)!, { recursive: true, force: true }); // stands in for the runner-uid rm
+          },
+        },
+      }),
+    );
+    const s = await keyFixture();
+    const planted = [0, 1, 2, 3].map((i) => plantAttempt(s, idAt(i), `run-${i}`, "abandoned"));
+    const residue = [0, 1, 2, 3, 4, 5].map((i) => {
+      const p = path.join(s.parent, formatResidueName(s.key, randomUUID()));
+      fs.mkdirSync(p);
+      fs.utimesSync(p, 1_700_000_000 + i, 1_700_000_000 + i);
+      return p;
+    });
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, seedOpts());
+    assert.deepEqual(calls.map((c) => c.args.at(-1)), [planted[0]!.dir, planted[0]!.skills, residue[0]]);
+    for (const c of calls) {
+      assert.equal(c.command, "/bin/setpriv", "wrapped by runnerCommand");
+      assert.deepEqual(c.args.slice(-4), ["/bin/rm", "-rf", "--", c.args.at(-1)], "the fixed rm argv, target last");
+      assert.ok(c.args.includes("--reuid"), "as the runner uid");
+    }
+    assert.equal(ledgerState(s, idAt(0)), "retired");
+  });
+
+  it("refuses a symlinked top-level target (and its target is untouched)", async () => {
+    const s = await keyFixture();
+    const victim = path.join(fx.dataDir, "victim");
+    fs.mkdirSync(victim);
+    fs.writeFileSync(path.join(victim, "PRECIOUS"), "x");
+    const oldest = `${s.canonical}.attempt-${idAt(0)}`;
+    fs.symlinkSync(victim, oldest);
+    cfg(s.bare, "--add", `uzi-attempts.${s.branch}.entry`, JSON.stringify({ attemptId: idAt(0), runId: "run-0", clonePath: oldest, state: "abandoned" }));
+    for (const i of [1, 2, 3]) plantAttempt(s, idAt(i), `run-${i}`, "abandoned");
+    const residueLink = path.join(s.parent, formatResidueName(s.key, randomUUID()));
+    fs.symlinkSync(victim, residueLink);
+    fs.lutimesSync(residueLink, 1_600_000_000, 1_600_000_000);
+    for (let i = 0; i < 5; i++) fs.mkdirSync(path.join(s.parent, formatResidueName(s.key, randomUUID())));
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, seedOpts());
+    assert.equal(fs.lstatSync(oldest).isSymbolicLink(), true, "the symlinked attempt is kept");
+    assert.equal(fs.lstatSync(residueLink).isSymbolicLink(), true, "the symlinked residue is kept");
+    assert.equal(fs.readFileSync(path.join(victim, "PRECIOUS"), "utf8"), "x");
+    assert.equal(ledgerState(s, idAt(0)), "abandoned", "not marked retired");
+    const refusals = lines.filter((l) => (l as { msg?: string }).msg?.includes("refusing to delete")).map((l) => (l as { path?: string }).path);
+    assert.deepEqual(refusals.sort(), [oldest, residueLink].sort());
+  });
+});
+
+describe("issue #1783 M2 review: attempt-journal guards (A′ id mismatch, release re-validation)", () => {
+  it("A′: a journal whose attemptId disagrees with its path's id is a path mismatch, even for the same run", async () => {
+    const s = await keyFixture("issue-3301", "agent/issue-3301");
+    const dir = plantAttempt(s, idAt(1), "run-a", "live").dir;
+    cfg(s.bare, `uzi-recovery.${s.branch}.clone`, JSON.stringify({ runId: "run-a", clonePath: dir, attemptId: idAt(2) }));
+    await assert.rejects(
+      git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-a", false, undefined, seedOpts()),
+      (err: unknown) => (err as Error).name === "CapturePathMismatchError",
+    );
+    assert.equal(fs.readFileSync(path.join(dir, "WORK.txt"), "utf8"), idAt(1));
+  });
+
+  it("releaseAttemptInPlace refuses unless the journal names exactly (runId, clonePath): nothing written", async () => {
+    const s = await keyFixture("issue-3302", "agent/issue-3302");
+    const attemptId = mintAttemptId(2);
+    const seeded = await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-b", false, undefined, seedOpts({ attemptId }));
+    await git.markRecoveryCapture(s.bare, seeded.path, s.branch, "run-b", attemptId);
+    const journal = cfgAll(s.bare, `uzi-recovery.${s.branch}.clone`);
+    const ledger = cfgAll(s.bare, `uzi-attempts.${s.branch}.entry`);
+    for (const [clonePath, runId] of [
+      [seeded.path, "someone-else"],
+      [`${s.canonical}.attempt-${idAt(9)}`, "run-b"],
+    ] as const) {
+      for (const state of ["abandoned", "reclaimed"] as const) {
+        await assert.rejects(git.releaseAttemptInPlace(s.bare, clonePath, s.branch, runId, state), (e: unknown) => (e as Error).name === "CapturePathMismatchError");
+      }
+    }
+    assert.deepEqual(cfgAll(s.bare, `uzi-recovery.${s.branch}.clone`), journal, "the journal is kept");
+    assert.deepEqual(cfgAll(s.bare, `uzi-attempts.${s.branch}.entry`), ledger, "no ledger value appended");
+  });
+
+  it("a journal-clear failure after the ledger append is typed stage journal, and the journal is kept", async () => {
+    const s = await keyFixture("issue-3303", "agent/issue-3303");
+    const attemptId = mintAttemptId(2);
+    const seeded = await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-c", false, undefined, seedOpts({ attemptId }));
+    await git.markRecoveryCapture(s.bare, seeded.path, s.branch, "run-c", attemptId);
+    const seam = git as unknown as { runGit: (cwd: string | undefined, args: string[], ...rest: unknown[]) => Promise<string> };
+    const real = seam.runGit.bind(git);
+    seam.runGit = async (cwd, args, ...rest) => {
+      if (args[0] === "config" && args.at(-2) === `uzi-recovery.${s.branch}.clone` && args.at(-1) === "") throw new Error("injected");
+      return real(cwd, args, ...rest);
+    };
+    await assert.rejects(git.releaseAttemptInPlace(s.bare, seeded.path, s.branch, "run-c", "abandoned"), (e: unknown) => (e as AttemptReleaseError).stage === "journal");
+    assert.equal((JSON.parse(cfgAll(s.bare, `uzi-recovery.${s.branch}.clone`).at(-1)!) as { clonePath: string }).clonePath, seeded.path);
+    assert.equal(ledgerState(s, attemptId), "abandoned", "the ledger went first");
+  });
+});
+
+describe("issue #1783 M2 review: the ledger stays bounded (N4)", () => {
+  it("each seed compacts to the last value per attemptId and drops retired entries whose path is gone", async () => {
+    const s = await keyFixture();
+    const key = `uzi-attempts.${s.branch}.entry`;
+    const kept = plantAttempt(s, idAt(1), "run-1", "live");
+    cfg(s.bare, "--add", key, JSON.stringify({ attemptId: idAt(1), runId: "run-1", clonePath: kept.dir, state: "abandoned" }));
+    const goneRetired = `${s.canonical}.attempt-${idAt(2)}`;
+    cfg(s.bare, "--add", key, JSON.stringify({ attemptId: idAt(2), runId: "run-2", clonePath: goneRetired, state: "live" }));
+    cfg(s.bare, "--add", key, JSON.stringify({ attemptId: idAt(2), runId: "run-2", clonePath: goneRetired, state: "retired" }));
+    const presentRetired = plantAttempt(s, idAt(3), "run-3", "retired");
+    const goneAbandoned = `${s.canonical}.attempt-${idAt(4)}`;
+    cfg(s.bare, "--add", key, JSON.stringify({ attemptId: idAt(4), runId: "run-4", clonePath: goneAbandoned, state: "abandoned" }));
+    cfg(s.bare, "--add", key, "not json");
+    let nonLive: string[] = [];
+    const attemptId = mintAttemptId(5);
+    const seeded = await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, seedOpts({
+      attemptId,
+      beforeSeed: async (paths) => {
+        nonLive = paths;
+      },
+    }));
+    assert.deepEqual(
+      cfgAll(s.bare, key).map((v) => JSON.parse(v) as { attemptId: string; state: string }).map((e) => `${e.attemptId}:${e.state}`),
+      [`${idAt(1)}:abandoned`, `${idAt(3)}:retired`, `${idAt(4)}:abandoned`, `${attemptId}:live`],
+    );
+    assert.deepEqual(nonLive, [kept.dir, presentRetired.dir].sort(), "only paths that still exist are swept");
+    assert.ok(fs.existsSync(seeded.path));
+  });
+});
+
+describe("issue #1783 M2 review: crash-window orphans (N5)", () => {
+  it("a live entry that is not live here, unjournaled and without custody is disposable under the cap; the others are not", async () => {
+    const s = await keyFixture();
+    const orphans = [0, 1, 2, 3].map((i) => plantAttempt(s, idAt(i), `run-${i}`, "live"));
+    const journaledLive = plantAttempt(s, idAt(4), "run-4", "live");
+    const custodyLive = plantAttempt(s, idAt(5), "run-5", "live");
+    const liveHere = plantAttempt(s, idAt(6), "run-6", "live");
+    cfg(s.bare, "uzi-recovery.agent/elsewhere.clone", JSON.stringify({ runId: "run-4", clonePath: journaledLive.dir }));
+    fs.mkdirSync(path.join(fx.dataDir, "recovery", "run-5"), { recursive: true });
+    fs.writeFileSync(path.join(fx.dataDir, "recovery", "run-5", "capture.json"), "{}");
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, seedOpts({ isLive: (p) => p === liveHere.dir }));
+    assert.equal(fs.existsSync(orphans[0]!.dir), false, "the oldest crash-window orphan is deleted");
+    assert.equal(fs.existsSync(orphans[0]!.skills), false);
+    assert.equal(ledgerState(s, idAt(0)), "retired");
+    for (const p of [...orphans.slice(1), journaledLive, custodyLive, liveHere]) assert.equal(fs.existsSync(p.dir), true, p.dir);
+  });
+});
+
 // ─── P-ledger-contract ─────────────────────────────────────────────────────────────────────
 
 describe("issue #1783 M2 P-ledger-contract: the keys and JSON shapes backup-runs.sh reads", () => {
@@ -282,7 +538,7 @@ describe("issue #1783 M2 P-ledger-contract: the keys and JSON shapes backup-runs
     // Run the script's own ledger filter (last value per attemptId wins) over what we wrote.
     const m = /"\$JQ" -rRn --arg rid "\$rid" '([\s\S]*?)' 2>\/dev\/null\)"/.exec(script);
     assert.ok(m, "the script's ledger jq filter");
-    await git.releaseAttemptInPlace(s.bare, seeded.path, s.branch, "run-3101");
+    await git.releaseAttemptInPlace(s.bare, seeded.path, s.branch, "run-3101", "abandoned");
     // The same jq the script runs: its `JQ="${UZI_JQ:-jq}"` default, read from the script itself.
     const jqBin = process.env.UZI_JQ ?? /^JQ="\$\{UZI_JQ:-([^}]+)\}"$/m.exec(script)?.[1];
     assert.ok(jqBin, "the script names its jq");

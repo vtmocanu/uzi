@@ -5,8 +5,9 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import type { ExecutorResult, RunContext } from "../src/executor.js";
+import type { BoundaryPermit, CodexExecutionSafety } from "../src/harness.js";
 import { GitCache, type AttemptSeedOptions } from "../src/git.js";
 import { LimitReachedError } from "../src/limit.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
@@ -251,6 +252,38 @@ function readLedger(iid: number): Map<string, LedgerEntry> {
     out.set(e.attemptId, e);
   }
   return out;
+}
+
+/** An abandoned, unjournaled attempt dir of `issue-<iid>` with its ledger value (as a verified
+ *  capture leaves it). */
+async function plantAbandoned(iid: number, attemptId: string): Promise<string> {
+  await git.ensureClone(fx.originPath);
+  const dir = `${canonicalFor(iid)}.attempt-${attemptId}`;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "WORK.txt"), attemptId);
+  execFileSync(
+    "git",
+    ["-C", bare(), "config", "--local", "--add", `uzi-attempts.agent/issue-${iid}.entry`, JSON.stringify({ attemptId, runId: randomUUID(), clonePath: dir, state: "abandoned" })],
+    { env: GIT_ENV, stdio: "pipe" },
+  );
+  return dir;
+}
+
+/** Run `claim` to its end, bounded: past `ms` the run is cancelled server-side (its recovery loop
+ *  then stops), so a regression that loops fails by assertion instead of the file's 120 s timeout.
+ *  Returns true when the bound fired. */
+async function boundedExecute(runner: RunRunner, claim: ReturnType<typeof gitlabClaim>, ms = 30_000): Promise<boolean> {
+  let fired = false;
+  const timer = setTimeout(() => {
+    fired = true;
+    api.setOwnershipStatus(claim.run_id, "cancelled");
+  }, ms);
+  try {
+    await runner.execute(claim);
+  } finally {
+    clearTimeout(timer);
+  }
+  return fired;
 }
 
 function trackingHas(iid: number, file: string): boolean {
@@ -584,7 +617,10 @@ describe("issue #1783 M2 P-capture-blocked", { skip: !HAS_PROCFS }, () => {
     const ledgerBefore = [...readLedger(iid).values()];
     const pid = orphanIn(pred.clonePath);
     const { factory, started } = transientFactory();
-    await wired(factory).execute(gitlabClaim(iid, { run_id: runId }));
+    const { calls, quiesceRun } = recorded(fastQuiesce);
+    const timedOut = await boundedExecute(wired(factory, { quiesceRun }), gitlabClaim(iid, { run_id: runId }));
+    assert.equal(timedOut, false, "the capture is refused up front, never retried to the bound");
+    assert.equal(calls[0]?.site, "predecessor_capture", "the first proof is the up-front capture proof");
     const failed = api.states.filter((s) => s.body.status === "failed").at(-1)?.body;
     assert.equal(failed?.fail_origin, "worker_residue_blocked");
     assert.equal(started(), 0);
@@ -603,7 +639,10 @@ describe("issue #1783 M2 P-capture-blocked", { skip: !HAS_PROCFS }, () => {
     const journalBefore = readJournal(iid);
     const ledgerBefore = [...readLedger(iid).values()];
     const { factory, started } = transientFactory();
-    await wired(factory, { quiesceRun: captureAnswers("unverified") }).execute(gitlabClaim(iid, { run_id: runId }));
+    const { calls, quiesceRun } = recorded(captureAnswers("unverified"));
+    const timedOut = await boundedExecute(wired(factory, { quiesceRun }), gitlabClaim(iid, { run_id: runId }));
+    assert.equal(timedOut, false, "the capture is refused up front, never retried to the bound");
+    assert.equal(calls[0]?.site, "predecessor_capture");
     assert.equal(api.states.filter((s) => s.body.status === "failed").at(-1)?.body.fail_origin, "worker_residue_blocked");
     assert.equal(started(), 0);
     assert.deepEqual(readJournal(iid), journalBefore);
@@ -646,7 +685,47 @@ describe("issue #1783 M2 P-worker-restart / P-foreign: the terminal-orphan recla
     await restartedWorker(factory).runner.execute(gitlabClaim(iid, { run_id: claimant }));
     assert.ok(fresh && fresh !== pred.clonePath, "the claimant runs at its own fresh attempt path");
     assert.equal(fs.readFileSync(path.join(pred.clonePath, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n", "foreign work retained in place, not moved");
-    assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "abandoned");
+    assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "reclaimed", "uncaptured: reclaimed, never abandoned");
+    assert.equal(readJournal(iid)?.runId === owner, false, "the owner's journal is released");
+  });
+
+  it("B′ regression (review probe): a reclaimed foreign attempt survives later seeds past the abandoned cap", async () => {
+    const iid = 2044;
+    const owner = randomUUID();
+    const pred = await seedPredecessor(iid, owner, { attempt: true });
+    terminalOwner(owner, iid);
+    await restartedWorker(transientFactory().factory).runner.execute(gitlabClaim(iid));
+    assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "reclaimed");
+    // Three NEWER abandoned attempts of the same key, then another seed: were the reclaimed
+    // attempt counted as abandoned it would be the oldest of four and deleted (the probe printed
+    // OWNER_DIR_EXISTS=false STATE=retired).
+    for (let i = 1; i <= 3; i++) await plantAbandoned(iid, formatAttemptId(new Date(Date.now() + i * 60_000), 1, `00000000000000${i}${i}`));
+    const next = transientFactory();
+    await wired(next.factory).execute(gitlabClaim(iid));
+    assert.equal(next.started(), 1, "the later seed ran");
+    assert.equal(fs.existsSync(pred.clonePath), true, "OWNER_DIR_EXISTS");
+    assert.equal(fs.readFileSync(path.join(pred.clonePath, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
+    assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "reclaimed", "STATE stays reclaimed");
+  });
+
+  it("orphan_reclaim: a survivor in the owner's attempt path blocks the reclaim; nothing released (worker_residue_blocked)", async () => {
+    const iid = 2045;
+    const owner = randomUUID();
+    const pred = await seedPredecessor(iid, owner, { attempt: true });
+    terminalOwner(owner, iid);
+    const journalBefore = readJournal(iid);
+    const pid = orphanIn(pred.clonePath);
+    const { calls, quiesceRun } = recorded(fastQuiesce);
+    const { factory, started } = transientFactory();
+    const claim = gitlabClaim(iid);
+    await wired(factory, { quiesceRun }).execute(claim);
+    assert.equal(started(), 0);
+    assert.ok(calls.some((c) => c.site === "orphan_reclaim" && c.mode === "capture" && c.targetPaths.join() === pred.clonePath), "the predecessor-scoped proof ran");
+    assert.equal(api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed").at(-1)?.body.fail_origin, "worker_residue_blocked");
+    assert.equal(alive(pid), true, "never killed on attribution-by-cwd alone");
+    assert.deepEqual(readJournal(iid), journalBefore, "the owner's journal is kept");
+    assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "live", "no release was recorded");
+    assert.equal(fs.readFileSync(path.join(pred.clonePath, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
   });
 
   it("rejects an id the ledger does not record for the owner: fail closed, the path untouched", async () => {
@@ -797,7 +876,7 @@ describe("issue #1783 M2: the seed-time sweep over the key's NON-LIVE paths", { 
   async function abandonedPredecessor(iid: number): Promise<string> {
     const runId = randomUUID();
     const pred = await seedPredecessor(iid, runId, { attempt: true });
-    await git.releaseAttemptInPlace(bare(), pred.clonePath, `agent/issue-${iid}`, runId);
+    await git.releaseAttemptInPlace(bare(), pred.clonePath, `agent/issue-${iid}`, runId, "abandoned");
     return pred.clonePath;
   }
 
@@ -875,4 +954,185 @@ describe("issue #1783 M2: the seed-time sweep over the key's NON-LIVE paths", { 
     assert.equal(daemon.containers.has(liveContainer), true, "a live same-key attempt's container is kept");
     assert.equal(daemon.containers.has(siblingContainer), true, "a sibling key's container is kept");
   });
+});
+
+// ─── review round: Codex sweeps, the release warning, seed availability, checkpoint adoption ──
+
+/** A Codex-shaped executor (it carries `safety`) that stops after the seed. */
+function codexFactory(onRun: (ctx: RunContext) => void = () => {}): { factory: ExecutorFactory; started: () => number } {
+  let started = 0;
+  const safety: CodexExecutionSafety = {
+    kind: "codex",
+    withBoundary: async (req, action) => action({ epoch: 1, boundary: req.boundary, signal: new AbortController().signal } as unknown as BoundaryPermit),
+    spawnBoundaryProcess: async (_permit, request) => {
+      const [command, ...args] = request.argv;
+      const child = spawn(command!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
+      const completed = new Promise<{ code: number }>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("exit", (code, sig) => resolve({ code: code ?? (sig ? 128 : 1) }));
+      });
+      return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed };
+    },
+    dispose: async () => ({ kind: "disposed" }),
+  };
+  const factory: ExecutorFactory = (runId) => ({
+    homeDir: path.join(homeDir, runId),
+    executor: {
+      safety,
+      run: async (ctx: RunContext): Promise<ExecutorResult> => {
+        started++;
+        onRun(ctx);
+        throw new Error("stop after the seed");
+      },
+    },
+  });
+  return { factory, started: () => started };
+}
+
+describe("issue #1783 M2 review: a Codex run's seed and capture sweeps scan processes", { skip: !HAS_PROCFS }, () => {
+  it("seed: a survivor in a non-live path blocks a Codex run's seed exactly as a Claude run's", async () => {
+    const iid = 2081;
+    const runId = randomUUID();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    await git.releaseAttemptInPlace(bare(), pred.clonePath, `agent/issue-${iid}`, runId, "abandoned");
+    const pid = orphanIn(pred.clonePath);
+    const { calls, quiesceRun } = recorded(fastQuiesce);
+    const { factory, started } = codexFactory();
+    await wired(factory, { quiesceRun }).execute(gitlabClaim(iid));
+    const seed = calls.filter((c) => c.mode === "seed");
+    assert.ok(seed.length > 0 && seed.every((c) => c.processes === true), "every seed sweep scans processes");
+    assert.equal(started(), 0, "the seed is blocked");
+    assert.equal(api.states.filter((s) => s.body.status === "failed").at(-1)?.body.fail_origin, "worker_residue_blocked");
+    assert.equal(alive(pid), true);
+  });
+
+  it("capture: a survivor in the journaled predecessor blocks a Codex run's capture", async () => {
+    const iid = 2082;
+    const runId = randomUUID();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    const journalBefore = readJournal(iid);
+    orphanIn(pred.clonePath);
+    const { calls, quiesceRun } = recorded(fastQuiesce);
+    const { factory, started } = codexFactory();
+    const timedOut = await boundedExecute(wired(factory, { quiesceRun }), gitlabClaim(iid, { run_id: runId }));
+    assert.equal(timedOut, false);
+    const capture = calls.filter((c) => c.mode === "capture");
+    assert.ok(capture.length > 0 && capture.every((c) => c.processes === true), "every capture sweep scans processes");
+    assert.equal(started(), 0);
+    assert.equal(api.states.filter((s) => s.body.status === "failed").at(-1)?.body.fail_origin, "worker_residue_blocked");
+    assert.deepEqual(readJournal(iid), journalBefore);
+    assert.equal(trackingHas(iid, "ONLY_COPY.txt"), false, "no fetch-back ran");
+  });
+});
+
+describe("issue #1783 M2 review: the predecessor release warning names what actually happened", { skip: !HAS_PROCFS }, () => {
+  it("a failed ledger append keeps the journal, and the warning says so", async () => {
+    const iid = 2091;
+    const runId = randomUUID();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    const { logger, lines } = recordingLogger();
+    const { runner, git: rg } = restartedWorker(transientFactory().factory, {}, logger);
+    const seam = rg as unknown as { runGit: (cwd: string | undefined, args: string[], ...rest: unknown[]) => Promise<string> };
+    const realRunGit = seam.runGit.bind(rg);
+    seam.runGit = async (cwd, args, ...rest) => {
+      if (args[0] === "config" && args.includes("--add") && args.some((a) => a.startsWith("uzi-attempts.")) && args.some((a) => a.includes('"abandoned"'))) {
+        throw new Error("injected ledger append failure");
+      }
+      return realRunGit(cwd, args, ...rest);
+    };
+    await runner.execute(gitlabClaim(iid, { run_id: runId, session_id: randomUUID() }));
+    assert.ok(trackingHas(iid, "ONLY_COPY.txt"), "the capture itself verified");
+    const warn = lines.find((l) => ((l as { msg?: string }).msg ?? "").startsWith("predecessor attempt release"));
+    assert.equal((warn as { msg?: string } | undefined)?.msg, "predecessor attempt release failed at the ledger append; journal kept");
+    assert.equal(readJournal(iid)?.clonePath, pred.clonePath, "the journal IS kept, as the warning says");
+    assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "live", "no release recorded");
+  });
+});
+
+describe("issue #1783 M2 review (N6): seed availability under an unattributable unreadable process", { skip: !HAS_PROCFS }, () => {
+  const unreadable = { pid: 4242, uid: 10002, comm: "nondumpable", cwd: "unreadable", reason: "unreadable_unattributed" };
+
+  /** Scripted proofs: `site` answers `unverified` with `processes`; every other proof is quiescent. */
+  function scriptedAt(site: string, processes: Array<typeof unreadable>) {
+    return async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> =>
+      req.site === site
+        ? { process: { state: "unverified", processes, killed: [], detail: "scripted" }, docker: { state: "not_wired", removed: [], detail: "" } }
+        : { process: { state: "quiescent", processes: [], killed: [], detail: "scripted" }, docker: { state: "not_wired", removed: [], detail: "" } };
+  }
+
+  it("seed: seeds the fresh path, logs, and vetoes every retention deletion of that seed", async () => {
+    const iid = 2101;
+    const planted: string[] = [];
+    for (const i of [1, 2, 3, 4, 5]) planted.push(await plantAbandoned(iid, formatAttemptId(new Date(Date.UTC(2026, 0, 1, 0, 0, i)), 1, `000000000000000${i}`)));
+    const { logger, lines } = recordingLogger();
+    const { factory, started } = transientFactory();
+    await wired(factory, { quiesceRun: scriptedAt("attempt_seed", [unreadable]) }, logger).execute(gitlabClaim(iid));
+    assert.equal(started(), 1, "the fresh seed is not blocked");
+    assert.ok(lines.some((l) => ((l as { msg?: string }).msg ?? "").includes("unattributable unreadable")), "logged");
+    for (const p of planted) assert.equal(fs.existsSync(p), true, `retention deletion vetoed: ${p}`);
+  });
+
+  it("seed: a positively in-scope survivor alongside it still blocks", async () => {
+    const iid = 2102;
+    await plantAbandoned(iid, formatAttemptId(new Date(Date.UTC(2026, 0, 1)), 1, "0000000000000001"));
+    const { factory, started } = transientFactory();
+    await wired(factory, { quiesceRun: scriptedAt("attempt_seed", [unreadable, { ...unreadable, pid: 7, reason: "unattributed_in_scope" }]) }).execute(gitlabClaim(iid));
+    assert.equal(started(), 0);
+    assert.equal(api.states.filter((s) => s.body.status === "failed").at(-1)?.body.fail_origin, "worker_residue_blocked");
+  });
+
+  it("capture: the same unattributable unreadable process still fails closed", async () => {
+    const iid = 2103;
+    const runId = randomUUID();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    const { factory, started } = transientFactory();
+    const timedOut = await boundedExecute(wired(factory, { quiesceRun: scriptedAt("predecessor_capture", [unreadable]) }), gitlabClaim(iid, { run_id: runId }));
+    assert.equal(timedOut, false);
+    assert.equal(started(), 0);
+    assert.equal(api.states.filter((s) => s.body.status === "failed").at(-1)?.body.fail_origin, "worker_residue_blocked");
+    assert.equal(readJournal(iid)?.clonePath, pred.clonePath);
+    assert.equal(trackingHas(iid, "ONLY_COPY.txt"), false);
+  });
+});
+
+describe("issue #1783 M2 review: checkpoint adoption on a wired resume that seeds a fresh attempt path", () => {
+  /** Publish a checkpoint commit (main + M1.txt) at origin's refs/uzi-checkpoints/agent/issue-<iid>. */
+  function publishOriginCheckpoint(iid: number): string {
+    const o = fx.originPath;
+    const run = (args: string[], env: NodeJS.ProcessEnv = GIT_ENV, input?: string) =>
+      execFileSync("git", ["-C", o, ...args], { env, encoding: "utf8", stdio: "pipe", input }).trim();
+    const blob = run(["hash-object", "-w", "--stdin"], GIT_ENV, "milestone one\n");
+    const index = path.join(daemonDir, `ckpt-index-${iid}`);
+    const ienv = { ...GIT_ENV, GIT_INDEX_FILE: index };
+    run(["read-tree", "main"], ienv);
+    run(["update-index", "--add", "--cacheinfo", `100644,${blob},M1.txt`], ienv);
+    const tree = run(["write-tree"], ienv);
+    const tip = run([...IDENT, "commit-tree", tree, "-p", "main", "-m", "M1"]);
+    run(["update-ref", `refs/uzi-checkpoints/agent/issue-${iid}`, tip]);
+    return tip;
+  }
+
+  for (const own of [true, false]) {
+    it(`${own ? "adopts" : "(control) does not adopt"} the run's own checkpoint ${own ? "when checkpoint_tip matches" : "without checkpoint_tip"}`, async () => {
+      const iid = own ? 2111 : 2112;
+      const tip = publishOriginCheckpoint(iid);
+      // A predecessor attempt of the same key is retained, so the resume must seed a FRESH path.
+      const pred = await plantAbandoned(iid, formatAttemptId(new Date(Date.UTC(2026, 0, 1)), 1, "00000000000000aa"));
+      let seen: { worktree: string; head: string; m1: boolean } | undefined;
+      const { factory } = transientFactory((ctx) => {
+        seen = {
+          worktree: ctx.worktreePath,
+          head: execFileSync("git", ["-C", ctx.worktreePath, "rev-parse", "HEAD"], { env: GIT_ENV, encoding: "utf8" }).trim(),
+          m1: fs.existsSync(path.join(ctx.worktreePath, "M1.txt")),
+        };
+      });
+      const claim = gitlabClaim(iid, { session_id: randomUUID(), claim_generation: 3, ...(own ? { checkpoint_tip: tip } : {}) });
+      await restartedWorker(factory).runner.execute(claim);
+      assert.ok(seen, "the model started");
+      assert.notEqual(seen.worktree, pred);
+      assert.match(parseAttemptPath(seen.worktree, path.join(fx.dataDir, "runner"))?.attemptId ?? "", /-g3-/, "a fresh attempt path");
+      assert.equal(seen.m1, own, own ? "the checkpoint's milestone is in the fresh attempt" : "a foreign/unowned checkpoint is not adopted");
+      if (own) assert.equal(seen.head, tip, "seeded at the checkpoint tip");
+    });
+  }
 });

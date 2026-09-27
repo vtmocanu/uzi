@@ -146,27 +146,73 @@ export function isRetainedArtifactName(name: string): boolean {
   return name.startsWith(SKILLS_ARTIFACT_PREFIX) || name.startsWith(RESIDUE_ARTIFACT_PREFIX);
 }
 
-/** A retained artifact's kind and the clone basename it belongs to (`<key>` or
- *  `<key>.attempt-<id>`), or undefined for any other name. */
-export function parseRetainedArtifactName(
-  name: string,
-): { kind: "skills" | "residue"; cloneBasename: string } | undefined {
-  for (const [kind, prefix] of [
-    ["skills", SKILLS_ARTIFACT_PREFIX],
-    ["residue", RESIDUE_ARTIFACT_PREFIX],
-  ] as const) {
-    if (!name.startsWith(prefix)) continue;
-    const rest = name.slice(prefix.length);
-    if (rest === "" || rest === "." || rest === ".." || rest.includes(path.sep)) return undefined;
-    return { kind, cloneBasename: rest };
+/** issue #1783 — the residue uuid: a lowercase RFC 4122 version-4 uuid (the only form
+ *  `crypto.randomUUID()` mints), hex and hyphen only. */
+const RESIDUE_UUID_SOURCE = "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+const RESIDUE_UUID_RE = new RegExp(`^${RESIDUE_UUID_SOURCE}$`);
+/** The whole residue name, anchored at BOTH ends: `.uzi-residue-<key>.residue-<uuid>`. The key is
+ *  greedy, so the LAST `.residue-` followed by a complete uuid that ends the name is the separator
+ *  (a uuid cannot contain `.residue-`, so formatting then parsing always round-trips). */
+const RESIDUE_NAME_RE = new RegExp(`^\\.uzi-residue-(?<key>.+)\\.residue-(?<uuid>${RESIDUE_UUID_SOURCE})$`);
+
+/** True when `s` holds a character no residue name may carry: a C0 or C1 control (newline
+ *  included), DEL, or the U+2028/U+2029 line/paragraph separators. */
+function hasControlChar(s: string): boolean {
+  for (const ch of s) {
+    const c = ch.codePointAt(0)!;
+    if (c < 0x20 || (c >= 0x7f && c <= 0x9f) || c === 0x2028 || c === 0x2029) return true;
   }
-  return undefined;
+  return false;
 }
 
-/** The clone key and attempt id (when any) a clone BASENAME names: `<key>.attempt-<id>` parses
- *  to both; anything else is taken as a canonical key with no attempt. */
-export function parseCloneBasename(base: string): { key: string; attemptId: string | undefined } {
-  const m = ATTEMPT_BASENAME_RE.exec(base);
-  if (m?.groups) return { key: m.groups.key!, attemptId: m.groups.id! };
-  return { key: base, attemptId: undefined };
+/** A clone key a residue name may carry: non-empty, no path separator, not `.`/`..`, not
+ *  dot-leading (a key never is: a git branch component cannot be), no control character, and
+ *  not itself an attempt basename (residue belongs to a KEY, never to one attempt of it). */
+function validResidueKey(key: string): boolean {
+  return (
+    key !== "" &&
+    !key.startsWith(".") &&
+    !key.includes("/") &&
+    !key.includes(path.sep) &&
+    !hasControlChar(key) &&
+    !ATTEMPT_BASENAME_RE.test(key)
+  );
+}
+
+/**
+ * issue #1783 — the ONE quarantined-residue name, pinned here for M3 to produce:
+ * `.uzi-residue-<key>.residue-<uuid>`, `<uuid>` a lowercase v4 uuid (see {@link RESIDUE_UUID_SOURCE}).
+ * Residue is un-journaled by definition and carries no run id; the retention sweep keeps at most a
+ * fixed number per key, oldest first by the residue directory's own mtime (see git.ts). Throws on a
+ * key or uuid the parser would refuse, so no caller can mint a name {@link parseRetainedArtifactName}
+ * does not read back as exactly `(key, uuid)`.
+ */
+export function formatResidueName(key: string, uuid: string): string {
+  if (!validResidueKey(key)) throw new Error("refusing an unsafe residue key");
+  if (!RESIDUE_UUID_RE.test(uuid)) throw new Error("residue uuid must be a lowercase v4 uuid");
+  return `${RESIDUE_ARTIFACT_PREFIX}${key}.residue-${uuid}`;
+}
+
+/** A parsed retained artifact: a skills sibling names the clone basename it belongs to (`<key>` or
+ *  `<key>.attempt-<id>`); residue names its key and uuid. */
+export type RetainedArtifact =
+  | { kind: "skills"; cloneBasename: string }
+  | { kind: "residue"; key: string; uuid: string };
+
+/** A retained artifact's parse, or undefined for any other name — including every `.uzi-residue-*`
+ *  name that is not EXACTLY the pinned grammar (an older or foreign shape, an uppercase or non-v4
+ *  uuid, trailing text, a control character or newline anywhere, an unsafe key). Such a name is
+ *  still never a clone ({@link isRetainedArtifactName}); the sweep just never counts or deletes it. */
+export function parseRetainedArtifactName(name: string): RetainedArtifact | undefined {
+  if (name.startsWith(SKILLS_ARTIFACT_PREFIX)) {
+    const rest = name.slice(SKILLS_ARTIFACT_PREFIX.length);
+    if (rest === "" || rest === "." || rest === ".." || rest.includes(path.sep)) return undefined;
+    return { kind: "skills", cloneBasename: rest };
+  }
+  if (!name.startsWith(RESIDUE_ARTIFACT_PREFIX) || hasControlChar(name)) return undefined;
+  const m = RESIDUE_NAME_RE.exec(name);
+  if (!m?.groups) return undefined;
+  const key = m.groups.key!;
+  if (!validResidueKey(key)) return undefined;
+  return { kind: "residue", key, uuid: m.groups.uuid! };
 }

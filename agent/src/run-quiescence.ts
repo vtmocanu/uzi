@@ -539,6 +539,23 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
   return { state: "quiescent", processes: [], killed, detail: `reaped ${killed.length} process(es)` };
 }
 
+/**
+ * issue #1783 M2 review (N6) — true when a non-quiescent verdict is `unverified` SOLELY because of
+ * runner-uid processes whose env and cwd could not be read and that ancestry attributes to nothing
+ * (`unreadable_unattributed`, a non-dumpable process that may be anywhere on the worker): no
+ * positively in-scope survivor, no live-owner conflict, no unconfirmed kill, no unreadable status,
+ * no process-table error (an empty process list never qualifies). Only a SEED-mode caller may act on
+ * it, and only to seed a FRESH path, which moves or frees nothing; see the runner's attempt seed.
+ */
+export function unverifiedOnlyByUnattributedUnreadable(q: ProcessQuiescence | undefined): boolean {
+  return (
+    q !== undefined &&
+    q.state === "unverified" &&
+    q.processes.length > 0 &&
+    q.processes.every((p) => p.reason === "unreadable_unattributed")
+  );
+}
+
 // ─── Runner-uid helper ─────────────────────────────────────────────────────────────────────
 
 const HELPER_FLAG = "--uzi-quiesce-helper";

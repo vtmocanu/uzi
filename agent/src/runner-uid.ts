@@ -149,9 +149,14 @@ export function setprivRunnerArgs(): string[] {
   return setprivArgsForUid(RUNNER_UID);
 }
 
-/** Wrap a command so it runs as `runner` under the split, or unchanged single-uid. */
-export function runnerCommand(command: string, args: readonly string[]): { command: string; args: string[] } {
-  if (!uidSplitActive()) return { command, args: [...args] };
+/** Wrap a command so it runs as `runner` under the split, or unchanged single-uid. `split`
+ *  defaults to {@link uidSplitActive}; only a test seam passes it explicitly. */
+export function runnerCommand(
+  command: string,
+  args: readonly string[],
+  split: boolean = uidSplitActive(),
+): { command: string; args: string[] } {
+  if (!split) return { command, args: [...args] };
   return { command: SETPRIV, args: [...setprivRunnerArgs(), command, ...args] };
 }
 

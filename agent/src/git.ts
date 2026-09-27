@@ -9,7 +9,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Readable } from "node:stream";
 import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
-import { RUNNER_UID, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
+import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { withForgeRetry } from "./forge-retry.js";
 import {
@@ -17,8 +17,8 @@ import {
   attemptClonePath,
   compareAttemptIds,
   isRetainedArtifactName,
+  isWithinPath,
   parseAttemptPath,
-  parseCloneBasename,
   parseRetainedArtifactName,
 } from "./attempt-path.js";
 
@@ -47,6 +47,19 @@ class RemoteBranchAdvancedError extends Error {
   constructor() {
     super("non-fast-forward: remote branch advanced");
     this.name = "RemoteBranchAdvancedError";
+  }
+}
+
+/** issue #1783 M2 — {@link GitCache.releaseAttemptInPlace} failed at `stage` (the ledger append,
+ *  or the journal clear that follows it). The journal is KEPT in both cases (the clear is the last
+ *  step), so the path stays protected. */
+export class AttemptReleaseError extends Error {
+  constructor(
+    readonly stage: "ledger" | "journal",
+    cause: unknown,
+  ) {
+    super(`attempt release failed at the ${stage === "ledger" ? "ledger append" : "journal clear"}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = "AttemptReleaseError";
   }
 }
 
@@ -225,6 +238,10 @@ export interface GitCacheOptions {
   /** Test-only stand-in for runner-clone scratch provisioning, for the non-Linux dev loop.
    *  Production never passes it, so the real provisioner runs and fails closed off Linux. */
   scratchProvisioner?: (clonePath: string) => Promise<void>;
+  /** issue #1783 M2 — test-only seam for the retention sweep's deletions. `split` overrides
+   *  {@link uidSplitActive} for these deletions alone; `run` executes the ALREADY runner-wrapped
+   *  delete argv in place of the real spawn. Production never passes it. */
+  retentionDelete?: { split?: boolean; run?: (command: string, args: string[]) => Promise<void> };
 }
 
 /** issue #1597 M2: the mid-turn checkpoint secret scan's hard deadline (all of its git + gitleaks
@@ -522,15 +539,22 @@ export interface RecoveryJournalEntry {
 // JSON `{"attemptId","runId","clonePath","state"}`, appended with `git config --add`; for one
 // attemptId the LAST value wins. `live` is written when an attempt is seeded, `retired` when the
 // owner's terminal retire disposed of its clone (or the retention sweep deleted it), `abandoned`
-// when a capture released it IN PLACE (the clone stays on disk, unreachable by any successor).
+// when a VERIFIED capture released it IN PLACE (the clone stays on disk, unreachable by any
+// successor; its work is in the tracking ref, so the retention sweep may dispose of it), and
+// `reclaimed` when the terminal-orphan reclaim released a FOREIGN owner's attempt in place WITHOUT
+// capturing it: the clone may be the only copy of that run's work, so it is retained FOREVER (the
+// attempt-path twin of the unwired worker's foreign quarantine, `discard:false`) — never counted
+// toward the abandoned cap and never deleted. Each seed compacts the key to its last value per
+// attemptId (see compactAttemptLedger).
 // The watcher's backup script (.agents/skills/uzi-watcher/scripts/backup-runs.sh) reads exactly
-// this key and these field names: keep them byte-for-byte.
+// this key and these field names: keep them byte-for-byte. (It never reads `state`, so a new state
+// value is invisible to it.)
 function attemptLedgerKey(branch: string): string {
   return `uzi-attempts.${branch}.entry`;
 }
 
 /** One attempt ledger state (see {@link attemptLedgerKey}). */
-export type AttemptLedgerState = "live" | "abandoned" | "retired";
+export type AttemptLedgerState = "live" | "abandoned" | "retired" | "reclaimed";
 
 /** One attempt ledger value. */
 export interface AttemptLedgerEntry {
@@ -566,14 +590,28 @@ function parseAttemptLedgerEntry(value: string): AttemptLedgerEntry | undefined 
   const o = parsed as Record<string, unknown>;
   if (typeof o.attemptId !== "string" || !ATTEMPT_ID_RE.test(o.attemptId)) return undefined;
   if (typeof o.runId !== "string" || typeof o.clonePath !== "string") return undefined;
-  if (o.state !== "live" && o.state !== "abandoned" && o.state !== "retired") return undefined;
+  if (o.state !== "live" && o.state !== "abandoned" && o.state !== "retired" && o.state !== "reclaimed") return undefined;
   return { attemptId: o.attemptId, runId: o.runId, clonePath: o.clonePath, state: o.state };
+}
+
+/** One ledger value, in the documented field order (the backup script's contract). */
+function attemptLedgerValue(entry: AttemptLedgerEntry): string {
+  return JSON.stringify({
+    attemptId: entry.attemptId,
+    runId: entry.runId,
+    clonePath: entry.clonePath,
+    state: entry.state,
+  });
 }
 
 /** How many abandoned attempts (each with its skills sibling) the retention sweep keeps per key. */
 const RETAINED_ABANDONED_PER_KEY = 3;
 /** How many `.uzi-residue-*` entries the retention sweep keeps per clone key. */
 const RETAINED_RESIDUE_PER_KEY = 5;
+/** The retention sweep's runner-uid delete: the image's root-owned busybox rm (absolute, so it
+ *  never resolves from a runner-writable PATH), and its deadline. */
+const RETENTION_RM_BIN = "/bin/rm";
+const RETENTION_RM_TIMEOUT_MS = 120_000;
 
 /**
  * issue #1783 M2 — what a Docker-wired worker hands {@link GitCache.runnerCloneForBranch} to seed
@@ -802,6 +840,8 @@ export class GitCache {
   private readonly gitleaksBin: string;
   /** See {@link GitCacheOptions.scratchProvisioner}; undefined in production. */
   private readonly scratchProvisioner: ((clonePath: string) => Promise<void>) | undefined;
+  /** See {@link GitCacheOptions.retentionDelete}; undefined in production. */
+  private readonly retentionDeleteSeam: GitCacheOptions["retentionDelete"];
   /** issue #1597 M2: memoised `--remerge-diff` support probe. */
   private remergeProbe: Promise<boolean> | undefined;
 
@@ -815,6 +855,7 @@ export class GitCache {
   ) {
     this.gitleaksBin = opts.gitleaksBin ?? "gitleaks";
     this.scratchProvisioner = opts.scratchProvisioner;
+    this.retentionDeleteSeam = opts.retentionDelete;
     this.reposRoot = path.join(dataDir, "repos");
     this.runnerRoot = path.join(dataDir, "runner");
     this.runnerHoldingRoot = path.join(dataDir, "runner-quarantine");
@@ -1263,11 +1304,23 @@ export class GitCache {
       // The attempt id carries 64 random bits: an existing path is not a collision to paper
       // over, it is something planted. Fail closed and touch nothing.
       if (await this.pathPresent(clonePath)) throw new Error("the fresh attempt clone path already exists");
+      // Bound the ledger before reading it: the last value per attemptId, gone `retired` paths dropped.
+      await this.compactAttemptLedger(barePath, branch);
       // The seed-time recovery sweep over every NON-LIVE path of this key. It throws to block.
       const ledger = await this.readAttemptLedger(barePath, branch);
       await attempt.beforeSeed(await this.nonLiveKeyPaths(canonical, ledger, attempt.isLive), canonical);
       await fs.mkdir(path.dirname(clonePath), { recursive: true });
       // `live` BEFORE the clone: every attempt dir on disk then has a ledger identity.
+      //
+      // Crash-window orphans (issue #1783 M2 review, N5). Verified ordering in runner.ts phaseClone:
+      // runnerCloneForClaim returns this seed, and the runner writes the recovery journal naming this
+      // path (markRecoveryCapture) before any executor or agent starts in it. Between this append
+      // and that write the path only ever sees the seed itself (the worker-driven runner-uid clone,
+      // checkout and scratch provisioning), the retention sweep below, and a worker-side read of the
+      // bare (the runner's originBranchTip). So a
+      // `live` entry that no journal names, that is not live on this worker and whose run holds no
+      // custody record was interrupted between this append and that journal write: it holds a seed
+      // and no agent work, and the retention sweep treats it as disposable under the abandoned cap.
       await this.appendAttemptLedger(barePath, branch, {
         attemptId: attempt.attemptId,
         runId: runId ?? "",
@@ -1288,7 +1341,7 @@ export class GitCache {
         throw err;
       }
       attempt.onSeeded?.(clonePath);
-      await this.sweepRetainedArtifacts(barePath, canonical, attempt).catch((err: unknown) =>
+      await this.sweepRetainedArtifacts(barePath, canonical, clonePath, attempt).catch((err: unknown) =>
         this.log.warn("runner clone retention sweep failed; nothing further removed", {
           key,
           error: gitErrorMessage(err),
@@ -1309,16 +1362,18 @@ export class GitCache {
     return { attemptId: parsed.attemptId };
   }
 
-  /** Every path of the key `canonical` names that is NOT live on this worker: the canonical path
-   *  and each `<key>.attempt-<id>` sibling on disk, plus every path the ledger records for it
-   *  (a container can still bind a path that is gone). */
+  /** Every path of the key `canonical` names that is NOT live on this worker and still exists
+   *  (lstat): the canonical path and each `<key>.attempt-<id>` sibling on disk, plus every path the
+   *  ledger records for it, so the set stays bounded by what is on disk however long the ledger's
+   *  history. A gone path is not swept: nothing is left there to kill or tear down by path. */
   private async nonLiveKeyPaths(
     canonical: string,
     ledger: Map<string, AttemptLedgerEntry>,
     isLive: (p: string) => boolean,
   ): Promise<string[]> {
     const parent = path.dirname(canonical);
-    const out = new Set<string>([canonical]);
+    const out = new Set<string>();
+    if (await this.pathPresent(canonical)) out.add(canonical);
     let names: string[] = [];
     try {
       names = await fs.readdir(parent);
@@ -1330,95 +1385,193 @@ export class GitCache {
       if (this.clonePathShape(p, canonical)?.attemptId !== undefined) out.add(p);
     }
     for (const e of ledger.values()) {
-      if (this.clonePathShape(e.clonePath, canonical)) out.add(e.clonePath);
+      if (this.clonePathShape(e.clonePath, canonical) && (await this.pathPresent(e.clonePath))) out.add(e.clonePath);
     }
     return [...out].filter((p) => !isLive(p)).sort();
   }
 
   /**
-   * issue #1783 M2 — the retention sweep, run at each attempt seed under the bare lock. Keeps at
-   * most {@link RETAINED_ABANDONED_PER_KEY} ABANDONED attempts per key (each with its
-   * `.uzi-skills-*` sibling, deleted as a pair) and at most {@link RETAINED_RESIDUE_PER_KEY}
-   * `.uzi-residue-*` entries, deleting OLDEST first beyond that. An entry is deleted only when
-   * it is confirmed disposable: no recovery journal names it, no custody/capture record under
-   * the recovery stores belongs to its run, it is not live (in the live set, or by the ledger),
-   * and the scoped process scan over it is quiescent. A deletion that fails (e.g. a root-owned
-   * dir) is logged and the entry is kept.
+   * issue #1783 M2 — the retention sweep, run at each attempt seed under the bare lock.
+   *
+   * Attempts: keeps at most {@link RETAINED_ABANDONED_PER_KEY} DISPOSABLE-KIND attempts per key and
+   * deletes the oldest beyond that (attempt-id order), each with its `.uzi-skills-*` sibling as a
+   * pair. The disposable kinds are `abandoned` (a verified capture released it in place) and a
+   * crash-window orphan: a `live` entry not live on this worker, named by no journal and whose run
+   * holds no custody record (see the ordering note in attemptCloneForBranch). `reclaimed` (an
+   * uncaptured foreign owner's attempt), `retired`, a live attempt and a dir with no ledger identity
+   * are never counted and never deleted.
+   *
+   * Residue: keeps at most {@link RETAINED_RESIDUE_PER_KEY} `.uzi-residue-<key>.residue-<uuid>`
+   * entries of this key (the one grammar, see formatResidueName) and deletes the oldest beyond that,
+   * OLDEST by the residue directory's own lstat mtime, the name as the tie-break. A uuid is not
+   * sortable, and mtime is what the producer's rename leaves; a runner-uid process that touches a
+   * residue can only reorder which disposable residue goes first. Residue is un-journaled by
+   * definition and carries no run id: it is disposable when no journal names it (or a path inside
+   * it), it is not live, and the scoped scan over it is quiescent.
+   *
+   * `seeding` (the attempt path this seed just made) is never a candidate.
+   * Every deletion goes through {@link deleteRetainedArtifact} (re-validated, runner-uid). A deletion
+   * that fails or is refused (e.g. a root-owned dir, a symlink) is logged and the entry is kept.
    */
-  private async sweepRetainedArtifacts(barePath: string, canonical: string, attempt: AttemptSeedOptions): Promise<void> {
+  private async sweepRetainedArtifacts(
+    barePath: string,
+    canonical: string,
+    seeding: string,
+    attempt: AttemptSeedOptions,
+  ): Promise<void> {
     const parent = path.dirname(canonical);
     const key = path.basename(canonical);
     const names = await fs.readdir(parent);
-    const journaled = await this.journaledClonePaths(barePath);
+    const journaled = [...(await this.journaledClonePaths(barePath))];
     const ledgers = await this.readAllAttemptLedgers(barePath);
+    const namedByJournal = (p: string): boolean => journaled.some((j) => isWithinPath(j, p));
     const entryFor = (attemptId: string, p: string): (AttemptLedgerEntry & { branch: string }) | undefined => {
       const e = ledgers.get(attemptId);
       return e && e.clonePath === p ? e : undefined;
     };
-    const disposable = async (p: string, siblings: string[], runId: string | undefined): Promise<boolean> => {
-      if (journaled.has(p)) return false;
-      if (attempt.isLive(p)) return false;
-      if (runId === undefined || runId === "" || (await this.custodyHeld(runId))) return false;
+    const quiescent = async (paths: string[]): Promise<boolean> => {
       try {
-        return await attempt.quiescent([p, ...siblings], canonical);
+        return await attempt.quiescent(paths, canonical);
       } catch {
         return false;
       }
     };
-    const remove = async (paths: string[]): Promise<boolean> => {
-      for (const p of paths) {
-        try {
-          await fs.rm(p, { recursive: true, force: true });
-        } catch (err) {
-          this.log.warn("runner clone retention: could not delete; keeping it", { path: p, error: gitErrorMessage(err) });
-          return false;
-        }
-      }
-      return true;
-    };
 
-    // 1. Abandoned attempts, oldest first beyond the cap.
-    const abandoned: Array<{ p: string; attemptId: string; entry: AttemptLedgerEntry & { branch: string } }> = [];
+    // 1. Disposable-kind attempts, oldest first beyond the cap.
+    const candidates: Array<{ p: string; attemptId: string; entry: AttemptLedgerEntry & { branch: string } }> = [];
     for (const name of names) {
       const p = path.join(parent, name);
       const id = this.clonePathShape(p, canonical)?.attemptId;
-      if (id === undefined) continue;
+      // The attempt this seed just made is `live` and not yet journaled: never a candidate, whether
+      // or not the caller has registered it live yet.
+      if (id === undefined || p === seeding) continue;
       const entry = entryFor(id, p);
-      if (entry?.state === "abandoned") abandoned.push({ p, attemptId: id, entry });
+      if (entry === undefined || entry.runId === "") continue;
+      if (entry.state === "abandoned") {
+        candidates.push({ p, attemptId: id, entry });
+      } else if (entry.state === "live" && !attempt.isLive(p) && !namedByJournal(p) && !(await this.custodyHeld(entry.runId))) {
+        candidates.push({ p, attemptId: id, entry });
+      }
     }
-    abandoned.sort((a, b) => compareAttemptIds(a.attemptId, b.attemptId));
-    for (const a of abandoned.slice(0, Math.max(0, abandoned.length - RETAINED_ABANDONED_PER_KEY))) {
-      const skills = path.join(parent, `.uzi-skills-${path.basename(a.p)}`);
-      if (!(await disposable(a.p, [skills], a.entry.runId))) continue;
-      if (!(await remove([a.p, skills]))) continue;
+    candidates.sort((a, b) => compareAttemptIds(a.attemptId, b.attemptId));
+    for (const a of candidates.slice(0, Math.max(0, candidates.length - RETAINED_ABANDONED_PER_KEY))) {
+      const skillsName = `.uzi-skills-${path.basename(a.p)}`;
+      const skills = path.join(parent, skillsName);
+      if (namedByJournal(a.p) || attempt.isLive(a.p) || (await this.custodyHeld(a.entry.runId))) continue;
+      if (!(await quiescent([a.p, skills]))) continue;
+      if (!(await this.deleteRetainedArtifact(parent, a.p, (n) => this.clonePathShape(path.join(parent, n), canonical)?.attemptId === a.attemptId))) continue;
+      if (!(await this.deleteRetainedArtifact(parent, skills, (n) => n === skillsName))) continue;
       const { branch: entryBranch, ...entry } = a.entry;
       await this.appendAttemptLedger(barePath, entryBranch, { ...entry, state: "retired" }).catch(() => undefined);
-      this.log.info("runner clone retention: deleted an abandoned attempt", { path: a.p });
+      this.log.info("runner clone retention: deleted a retained attempt", { path: a.p, state: a.entry.state });
     }
 
-    // 2. Quarantined residue for this key, oldest first beyond the cap.
-    const residue: Array<{ p: string; order: string; runId: string | undefined; source: string }> = [];
+    // 2. This key's residue, oldest (mtime) first beyond the cap.
+    const isOwnResidue = (n: string): boolean => {
+      const art = parseRetainedArtifactName(n);
+      return art?.kind === "residue" && art.key === key;
+    };
+    const residue: Array<{ p: string; name: string; mtimeMs: number }> = [];
     for (const name of names) {
-      const art = parseRetainedArtifactName(name);
-      if (art?.kind !== "residue") continue;
-      const { key: rkey, attemptId } = parseCloneBasename(art.cloneBasename);
-      if (rkey !== key) continue;
-      const source = path.join(parent, art.cloneBasename);
+      if (!isOwnResidue(name)) continue;
       const p = path.join(parent, name);
-      let order = attemptId ?? "";
-      if (attemptId === undefined) {
-        const st = await fs.lstat(p).catch(() => undefined);
-        order = st ? `00000000T000000Z-${String(Math.floor(st.mtimeMs)).padStart(16, "0")}` : "";
-      }
-      const runId = attemptId !== undefined ? ledgers.get(attemptId)?.runId : undefined;
-      residue.push({ p, order, runId, source });
+      const st = await fs.lstat(p).catch(() => undefined);
+      if (st) residue.push({ p, name, mtimeMs: st.mtimeMs });
     }
-    residue.sort((a, b) => (a.order < b.order ? -1 : a.order > b.order ? 1 : 0));
+    residue.sort((a, b) => a.mtimeMs - b.mtimeMs || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     for (const r of residue.slice(0, Math.max(0, residue.length - RETAINED_RESIDUE_PER_KEY))) {
-      if (journaled.has(r.p) || journaled.has(r.source) || attempt.isLive(r.source)) continue;
-      if (!(await disposable(r.p, [], r.runId))) continue;
-      if (await remove([r.p])) this.log.info("runner clone retention: deleted quarantined residue", { path: r.p });
+      if (namedByJournal(r.p) || attempt.isLive(r.p)) continue;
+      if (!(await quiescent([r.p]))) continue;
+      if (await this.deleteRetainedArtifact(parent, r.p, isOwnResidue)) {
+        this.log.info("runner clone retention: deleted quarantined residue", { path: r.p });
+      }
     }
+  }
+
+  /**
+   * issue #1783 M2 — delete ONE retained artifact of the retention sweep. `target` lives in the
+   * runner-writable `<runnerRoot>/<repoDir>` tree, so its interior is agent-controlled: a recursive
+   * delete run as the WORKER could be steered by a directory swapped for a symlink mid-walk into
+   * anything the worker can delete (the bare repo, `recovery/`). So, re-validated immediately before
+   * the delete:
+   *   - `target` is directly under `parent`, `parent` directly under runnerRoot and a real directory,
+   *     and the basename parses as the expected artifact of this key (`isExpected`);
+   *   - `target` lstat's as a REAL directory, never a symlink (absent ⇒ nothing to delete).
+   * Then, under the uid split, the delete runs AS THE RUNNER UID through the runnerCommand/setpriv
+   * wrapper (`/bin/rm -rf -- <target>`, bounded by a timeout that kills the runner group), so a
+   * swapped symlink can reach only what the runner uid could already delete. The image's `/bin/rm`
+   * is busybox, which has no `--one-file-system`: the uid is the containment. A tree the runner
+   * cannot delete (a root-owned subtree) fails the rm and is KEPT, with a log line.
+   * Single-uid (#58): there is no second uid and so no boundary to route through (the worker IS the
+   * agent's uid there, the #58 accepted posture): the delete stays the in-process fs.rm.
+   * Returns true when the target is gone.
+   */
+  private async deleteRetainedArtifact(parent: string, target: string, isExpected: (name: string) => boolean): Promise<boolean> {
+    const refuse = (why: string): false => {
+      this.log.warn("runner clone retention: refusing to delete; keeping it", { path: target, reason: why });
+      return false;
+    };
+    const root = path.resolve(this.runnerRoot);
+    if (path.dirname(parent) !== root || path.dirname(target) !== parent) return refuse("not a direct child of a runner repo dir");
+    if (!isExpected(path.basename(target))) return refuse("not the expected retained artifact of this key");
+    try {
+      const pst = await fs.lstat(parent);
+      if (pst.isSymbolicLink() || !pst.isDirectory()) return refuse("the runner repo dir is not a real directory");
+      const st = await fs.lstat(target);
+      if (st.isSymbolicLink() || !st.isDirectory()) return refuse("not a real directory");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
+      return refuse(gitErrorMessage(err));
+    }
+    try {
+      await this.runRetentionDelete(target);
+    } catch (err) {
+      this.log.warn("runner clone retention: could not delete; keeping it", { path: target, error: gitErrorMessage(err) });
+      return false;
+    }
+    return true;
+  }
+
+  /** The delete itself (see {@link deleteRetainedArtifact}): runner-uid under the split, in-process
+   *  single-uid. */
+  private async runRetentionDelete(target: string): Promise<void> {
+    const split = this.retentionDeleteSeam?.split ?? uidSplitActive();
+    if (!split) {
+      await fs.rm(target, { recursive: true, force: true });
+      return;
+    }
+    const wrapped = runnerCommand(RETENTION_RM_BIN, ["-rf", "--", target], true);
+    if (this.retentionDeleteSeam?.run) {
+      await this.retentionDeleteSeam.run(wrapped.command, wrapped.args);
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      // cwd "/" and a fixed root-owned PATH: nothing resolves from a runner-writable dir. Detached,
+      // so the setpriv'd rm leads its own group and a timeout can kill it as the runner uid.
+      const child = spawn(wrapped.command, wrapped.args, {
+        cwd: "/",
+        env: workerSpawnEnv({ PATH: "/usr/bin:/bin" }),
+        detached: true,
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      let stderr = "";
+      child.stderr?.on("data", (c: Buffer) => {
+        if (stderr.length < 4096) stderr += c.toString("utf8");
+      });
+      const timer = setTimeout(() => {
+        killRunnerGroup(child.pid);
+        reject(new Error(`runner-uid delete timed out after ${RETENTION_RM_TIMEOUT_MS}ms`));
+      }, RETENTION_RM_TIMEOUT_MS);
+      child.once("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+      child.once("close", (code, signal) => {
+        clearTimeout(timer);
+        if (code === 0) resolve();
+        else reject(new Error(`runner-uid delete exited ${code ?? signal ?? "abnormally"}: ${stripAnsiSgr(stderr).slice(0, 512)}`));
+      });
+    });
   }
 
   /** The seed itself (base resolution, the local `clone --shared`, checkout, WIP recovery, the
@@ -2529,13 +2682,45 @@ export class GitCache {
   /** issue #1783 M2: append one attempt-ledger value (see {@link attemptLedgerKey}). Lock-free:
    *  every caller already holds the bare lock. The field order is the documented contract. */
   private async appendAttemptLedger(barePath: string, branch: string, entry: AttemptLedgerEntry): Promise<void> {
-    const value = JSON.stringify({
-      attemptId: entry.attemptId,
-      runId: entry.runId,
-      clonePath: entry.clonePath,
-      state: entry.state,
-    });
-    await this.runGit(barePath, ["config", "--local", "--add", attemptLedgerKey(branch), value]);
+    await this.runGit(barePath, ["config", "--local", "--add", attemptLedgerKey(branch), attemptLedgerValue(entry)]);
+  }
+
+  /**
+   * issue #1783 M2 review (N4) — bound one branch's attempt ledger, under the caller's bare lock (the
+   * attempt seed). Rewrites `uzi-attempts.<branch>.entry` to the LAST value per attemptId (in
+   * last-write order), dropping every unparseable value and every `retired` entry whose path is gone
+   * (lstat ENOENT): a retired attempt that is gone has nothing left for any reader to find. Every
+   * other state is kept whatever its path, and nothing is rewritten when nothing would change.
+   * The rewrite is a `--replace-all` then one `--add` per further value; a crash between them loses
+   * ledger values, which fails SAFE (an attempt dir with no ledger identity is never counted or
+   * deleted by the retention sweep, only kept). Best-effort: a failure is logged and the seed goes on.
+   */
+  private async compactAttemptLedger(barePath: string, branch: string): Promise<void> {
+    try {
+      const key = attemptLedgerKey(branch);
+      const raw = (await this.readAllAttemptLedgerRaw(barePath)).filter(([b]) => b === branch).map(([, v]) => v);
+      const last = new Map<string, AttemptLedgerEntry>();
+      for (const v of raw) {
+        const e = parseAttemptLedgerEntry(v);
+        if (!e) continue;
+        last.delete(e.attemptId);
+        last.set(e.attemptId, e);
+      }
+      const kept: string[] = [];
+      for (const e of last.values()) {
+        if (e.state === "retired" && path.isAbsolute(e.clonePath) && !(await this.pathPresent(e.clonePath))) continue;
+        kept.push(attemptLedgerValue(e));
+      }
+      if (kept.length === raw.length && kept.every((v, i) => v === raw[i])) return;
+      if (kept.length === 0) {
+        await this.runGit(barePath, ["config", "--local", "--unset-all", key]);
+        return;
+      }
+      await this.runGit(barePath, ["config", "--local", "--replace-all", key, kept[0]!]);
+      for (const v of kept.slice(1)) await this.runGit(barePath, ["config", "--local", "--add", key, v]);
+    } catch (err) {
+      this.log.warn("attempt ledger compaction failed; the ledger is left as it was", { branch, error: gitErrorMessage(err) });
+    }
   }
 
   /** issue #1783 M2: one branch's attempt ledger, the LAST value per attemptId winning.
@@ -2559,13 +2744,21 @@ export class GitCache {
 
   private async readAllAttemptLedgerValues(barePath: string): Promise<Array<[string, AttemptLedgerEntry]>> {
     const out: Array<[string, AttemptLedgerEntry]> = [];
+    for (const [branch, v] of await this.readAllAttemptLedgerRaw(barePath)) {
+      const e = parseAttemptLedgerEntry(v);
+      if (e) out.push([branch, e]);
+    }
+    return out;
+  }
+
+  /** Every raw attempt-ledger value, in config order, with its branch. Throws on an unreadable config. */
+  private async readAllAttemptLedgerRaw(barePath: string): Promise<Array<[string, string]>> {
+    const out: Array<[string, string]> = [];
     for (const item of (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0")) {
       const nl = item.indexOf("\n");
       if (nl < 0) continue;
       const m = /^uzi-attempts\.(.+)\.entry$/.exec(item.slice(0, nl));
-      if (!m) continue;
-      const e = parseAttemptLedgerEntry(item.slice(nl + 1));
-      if (e) out.push([m[1]!, e]);
+      if (m) out.push([m[1]!, item.slice(nl + 1)]);
     }
     return out;
   }
@@ -2587,28 +2780,48 @@ export class GitCache {
   }
 
   /**
-   * issue #1783 M2 — release a CAPTURED predecessor attempt IN PLACE (a Docker-wired worker's
-   * replacement for retireRunnerClone after a verified capture, and for a terminal foreign
-   * owner's attempt in the orphan reclaim). Under the bare lock it re-validates that the journal
-   * still names this exact (runId, clonePath), clears the journal (the caller calls this only
-   * once the capture is verified — the #1197 rule), and appends ledger state `abandoned`. It
-   * performs NO filesystem operation on the path: a successor never moves or deletes a
-   * predecessor's path; the retention sweep alone disposes of it later.
+   * issue #1783 M2 — release a predecessor attempt IN PLACE: a Docker-wired worker's replacement for
+   * retireRunnerClone after a VERIFIED capture (`state` `abandoned`: its work is in the tracking ref,
+   * so the retention sweep may later dispose of it), and for a terminal FOREIGN owner's attempt in
+   * the orphan reclaim, which captures nothing (`state` `reclaimed`: retained forever, never
+   * disposable — see attemptLedgerKey). Under the bare lock it re-validates that the journal still
+   * names this exact (runId, clonePath) and refuses otherwise (nothing written), appends the ledger
+   * state, and only THEN clears the journal (the caller calls this only once any capture is
+   * verified — the #1197 rule). The ledger goes first so the journal never stops protecting a path
+   * whose release the ledger does not yet record: a path left `live`, unjournaled and not live here
+   * is a crash-window orphan the retention sweep may delete, which an uncaptured `reclaimed` attempt
+   * must never become. A failure after the re-validation throws {@link AttemptReleaseError} with the
+   * journal kept. It performs NO filesystem operation on the path: a successor never
+   * moves or deletes a predecessor's path; only the retention sweep disposes of an `abandoned` one.
    */
-  async releaseAttemptInPlace(barePath: string, clonePath: string, branch: string, runId: string): Promise<void> {
+  async releaseAttemptInPlace(
+    barePath: string,
+    clonePath: string,
+    branch: string,
+    runId: string,
+    state: "abandoned" | "reclaimed",
+  ): Promise<void> {
     await this.withLock(barePath, async () => {
       const pending = await this.readRecoveryCapture(barePath, branch);
       if (pending?.runId !== runId || pending.clonePath !== clonePath) {
         throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, runId);
       }
-      await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       const attemptId = pending.attemptId ?? parseAttemptPath(clonePath, path.resolve(this.runnerRoot))?.attemptId;
-      if (attemptId === undefined) {
+      if (attemptId !== undefined) {
+        try {
+          await this.appendAttemptLedger(barePath, branch, { attemptId, runId, clonePath, state });
+        } catch (err) {
+          throw new AttemptReleaseError("ledger", err);
+        }
+      } else {
         // A legacy canonical path has no attempt identity; it is never reseeded on a wired worker.
-        this.log.info("released a legacy canonical clone in place (no attempt ledger entry)", { clone: clonePath });
-        return;
+        this.log.info("releasing a legacy canonical clone in place (no attempt ledger entry)", { clone: clonePath, state });
       }
-      await this.appendAttemptLedger(barePath, branch, { attemptId, runId, clonePath, state: "abandoned" });
+      try {
+        await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+      } catch (err) {
+        throw new AttemptReleaseError("journal", err);
+      }
     });
   }
 
