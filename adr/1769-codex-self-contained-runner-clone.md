@@ -353,5 +353,5 @@ probe other than 0 into a FAIL rather than a skip.
   backgrounded shell job, with no retry or polling loop); containers were named `codex-git-trust-<pid>` by
   `run.sh`, removed and verified absent by exact name by `run.sh`.
   Afterwards `docker ps -a` showed no `codex-git-trust` or `cgt-1769`
-  container. Any file changed after this image build (`37683d72`) is
-  limited to this ADR.
+  container. Every file changed after this image build (`37683d72`) is
+  documentation: this ADR and `CHANGELOG.md`.
