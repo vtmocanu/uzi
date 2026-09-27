@@ -940,6 +940,17 @@ func (f *fakeStore) GetUserSecretMetaByIDOfKind(_ context.Context, arg store.Get
 	return store.GetUserSecretMetaByIDOfKindRow{ID: arg.ID, Label: label, Kind: arg.Kind}, nil
 }
 
+// LockSecretForPromotion mirrors the owner-scoped share-locked enablement read (PRD #1732)
+// over the same byIDSecrets fixtures: a missing or foreign id is pgx.ErrNoRows, and a staged
+// token reads enabled (the fake stages no disabled state; the live-DB tests own that).
+func (f *fakeStore) LockSecretForPromotion(_ context.Context, arg store.LockSecretForPromotionParams) (bool, error) {
+	row, ok := f.byIDSecrets[arg.ID]
+	if !ok || (row.UserID != uuid.Nil && row.UserID != arg.UserID) {
+		return false, pgx.ErrNoRows
+	}
+	return true, nil
+}
+
 // RecordRunCredentialEpoch records the per-claim attribution-journal write (PRD #1247
 // M1), so a claim test can assert the epoch was appended (and, via recordEpochErr, that
 // a journal failure fails the claim).

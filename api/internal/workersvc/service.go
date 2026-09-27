@@ -811,6 +811,10 @@ type Store interface {
 	LockCredentialDisabledRunForPromotion(ctx context.Context, arg store.LockCredentialDisabledRunForPromotionParams) (store.LockCredentialDisabledRunForPromotionRow, error)
 	SettleCredentialDisabledPause(ctx context.Context, arg store.SettleCredentialDisabledPauseParams) (store.SettleCredentialDisabledPauseRow, error)
 	SettleCredentialDisabledSpentBudget(ctx context.Context, arg store.SettleCredentialDisabledSpentBudgetParams) (store.SettleCredentialDisabledSpentBudgetRow, error)
+	// LockSecretForPromotion share-locks one of the owner's credentials and reports whether it
+	// is enabled: the promoter's requirement check, and the in-transaction D5 re-check of a new
+	// per-run pin (lockPinnedOverrideEnabled). pgx.ErrNoRows: missing or another owner's.
+	LockSecretForPromotion(ctx context.Context, arg store.LockSecretForPromotionParams) (bool, error)
 	// ReleaseCredentialSwitch is the held-state credential-switch RELEASE transition (PRD
 	// #1247 M5, D3/D4/D14): a worker's {status:"credential_switch", claim_generation} report
 	// requeues the held run in ONE fenced statement — generation- and release-gated, banking
@@ -5768,6 +5772,17 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		} else if err := checkStoredOverrideEnabled(ctx, q, userID, credOverride); err != nil {
 			// PRD #1732 D2: a schedule's stored pin that has since been disabled starts no
 			// run on it; the scheduler records the credential_disabled skip.
+			return store.Run{}, err
+		}
+		// PRD #1732 D5/D2: both reads above are plain, so the pin is share-locked and re-read in
+		// this transaction; a disable committed since is refused (the same sentinel), and one
+		// committing later waits for this create and meets a stored pin. A requested pin that
+		// vanished is the validator's 404; a stored one inherits, as checkStoredOverrideEnabled.
+		pinMissing := error(nil)
+		if rawOverride != nil {
+			pinMissing = ErrCredentialOverrideSecretNotFound
+		}
+		if err := lockPinnedOverrideEnabled(ctx, q, userID, effOverride, pinMissing); err != nil {
 			return store.Run{}, err
 		}
 		// Stamp unseeded issue runs for either resolved harness when the switch is on.

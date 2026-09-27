@@ -80,16 +80,17 @@ var (
 
 // ErrCredentialDisabled is the D5 refusal (PRD #1732): a NEW explicit assignment named a
 // credential the owner has disabled. Every explicit-assignment path returns it BEFORE its
-// write, and the handlers map it to 409 with this message, which names where to fix it. Only
-// the worker binding and the Judge opt-in plus binding read the credential under the user's
-// secret mutation lock, in the transaction that writes, so a concurrent disable is serialized
-// against them. The per-run override at create, set-token and the reassignment of a held run,
-// and schedule create/edit pins read it OUTSIDE that lock: a disable committing between that
-// read and the write is not refused there, and the claim-time park (the run lane's
-// claimCredentialDisabled, the chat lane's re-check) or the schedule fire's own check stops
-// delivery instead. Stored pins are never refused retroactively: the work they drive waits on
-// credential_disabled instead (D2). A schedule fire whose stored pin is disabled records the
-// credential_disabled skip from the same sentinel.
+// write, and the handlers map it to 409 with this message, which names where to fix it. The
+// worker binding and the Judge opt-in plus binding read the credential under the user's secret
+// mutation lock, in the transaction that writes. The per-run override at create, set-token
+// (every writing arm, the reassignment of a held run included) and a schedule fire's stored pin
+// are validated by a plain read, then re-read under a share lock in the writing transaction
+// (lockPinnedOverrideEnabled), so a disable committing between the two is refused too.
+// Schedule create/edit pins are validated by the plain read only: a disable racing that write
+// leaves a stored pin, which the fire's own check turns into the credential_disabled skip.
+// Stored pins are never refused retroactively: the work they drive waits on credential_disabled
+// instead (D2). A schedule fire whose stored pin is disabled records the credential_disabled
+// skip from the same sentinel.
 var ErrCredentialDisabled = errors.New("credential is disabled; enable it in Settings")
 
 // checkStoredOverrideEnabled is the fire-time check of a schedule's STORED pin (PRD #1732 D2):

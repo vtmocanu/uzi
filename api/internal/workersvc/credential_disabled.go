@@ -340,8 +340,9 @@ func releaseCredentialDisabledHold(ctx context.Context, q credentialHoldReleaser
 // ErrCredentialSwitchRaced (nothing written) when the run is no longer held.
 //
 // The new credential was validated before this transaction (validateCredentialOverride reads
-// outside the lock); a disable racing that read is caught by the claim-time park, which holds
-// the run again before any delivery.
+// outside the lock), so it is checked again here, after the run row is locked and before any
+// write (lockPinnedOverrideEnabled): a disable that committed while this call waited for the
+// user lock is refused with ErrCredentialDisabled and nothing is written.
 func (s *Service) reassignCredentialDisabledRun(ctx context.Context, userID, runID uuid.UUID, resolved *CredentialOverride) (string, error) {
 	var status string
 	err := s.withSecretMutation(ctx, userID, func(q secretMutationQueries) error {
@@ -351,6 +352,9 @@ func (s *Service) reassignCredentialDisabledRun(ctx context.Context, userID, run
 		}
 		if run.Status != "paused" || !run.HoldReason.Valid || run.HoldReason.String != "credential_disabled" {
 			return pgx.ErrNoRows // no longer this hold
+		}
+		if err := lockPinnedOverrideEnabled(ctx, q, userID, resolved, ErrCredentialOverrideSecretNotFound); err != nil {
+			return err
 		}
 		mode, secretID := pgOverrideMode(resolved), pgOverrideSecretID(resolved)
 		timeout := int32(s.p.RunTimeout.Seconds())
@@ -387,6 +391,9 @@ func (s *Service) reassignCredentialDisabledRun(ctx context.Context, userID, run
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrCredentialSwitchRaced
+	}
+	if errors.Is(err, ErrCredentialDisabled) || errors.Is(err, ErrCredentialOverrideSecretNotFound) {
+		return "", err
 	}
 	if err != nil {
 		return "", fmt.Errorf("reassign credential-disabled run: %w", err)
@@ -547,7 +554,37 @@ type secretMutationQueries interface {
 	LockCredentialDisabledRunForPromotion(ctx context.Context, arg store.LockCredentialDisabledRunForPromotionParams) (store.LockCredentialDisabledRunForPromotionRow, error)
 	SetRunCredentialOverride(ctx context.Context, arg store.SetRunCredentialOverrideParams) (int64, error)
 	ReassignCredentialDisabledRun(ctx context.Context, arg store.ReassignCredentialDisabledRunParams) (store.ReassignCredentialDisabledRunRow, error)
+	StampHeldCredentialSwitch(ctx context.Context, arg store.StampHeldCredentialSwitchParams) (int64, error)
+	secretEnablementLocker
 	credentialHoldReleaser
+}
+
+// secretEnablementLocker is the share-locked enablement read lockPinnedOverrideEnabled makes.
+type secretEnablementLocker interface {
+	LockSecretForPromotion(ctx context.Context, arg store.LockSecretForPromotionParams) (bool, error)
+}
+
+// lockPinnedOverrideEnabled is the in-transaction D5 check of a per-run pin (PRD #1732): it
+// share-locks the pinned credential's row in the caller's transaction and refuses a disabled
+// one with ErrCredentialDisabled, and a missing one with missing (nil lets it through). Called
+// after the caller's run row write or lock, it follows the lock order (user lock, run,
+// user_secrets FOR SHARE). The share lock conflicts with the disable's row update, so a
+// disable that committed first is seen here and refuses the write, and one that commits later
+// waits for this transaction and meets a stored pin (D2). A non-pinned override passes.
+func lockPinnedOverrideEnabled(ctx context.Context, q secretEnablementLocker, userID uuid.UUID, o *CredentialOverride, missing error) error {
+	if o == nil || o.Mode != CredentialOverrideModePinned || o.SecretID == nil {
+		return nil
+	}
+	enabled, err := q.LockSecretForPromotion(ctx, store.LockSecretForPromotionParams{ID: *o.SecretID, UserID: userID})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return missing
+	case err != nil:
+		return fmt.Errorf("lock override credential: %w", err)
+	case !enabled:
+		return ErrCredentialDisabled
+	}
+	return nil
 }
 
 // withSecretMutation runs fn in one transaction whose first statement is the user's secret
