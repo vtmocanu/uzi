@@ -75,6 +75,26 @@ function dubiousLine(text: string): string {
  * "command roots live"), and logs what happened. The boundary reaps that root before the
  * action runs, so the refusal is not reachable through the public API (see the body).
  */
+/** How long one finalize-import boundary may take before the case records a FAIL and the part
+ *  moves on. Well past the 60s boundary deadline: a boundary that outlives it is itself the
+ *  defect (a stalled import the deadline did not free), and must read as a named FAIL — never
+ *  as a fixture hang that only the outer `timeout` ends. */
+const CASE_BOUND_MS = 120_000;
+
+/** Races `p` against a timer; on expiry rejects naming `what`. The timer is cleared on settle
+ *  and deliberately not unref()'d (it is what keeps the event loop alive while waiting). */
+async function bounded<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} did not settle within ${ms}ms`)), ms); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function runFinalizeImportPart(
   gitMod: Record<string, any>,
   gitCache: Record<string, any>,
@@ -113,17 +133,22 @@ async function runFinalizeImportPart(
    *  boundary action (a plain read of the bare) still succeeds. */
   const proveClean = async (tag: string, registry: Record<string, any>, safety: Record<string, any>): Promise<void> => {
     check(`${tag}: no live command-kind root`, registry.hasLiveCommandRoot() === false, "a command root is still live");
-    const result = await safety.withBoundary({ boundary: "finalize", deadlineMs: 30_000 }, async (permit: any) => {
-      const proc = await safety.spawnBoundaryProcess(permit, {
-        identity: "worker_pat",
-        argv: ["/usr/bin/git", "-C", bare, "rev-parse", "HEAD"],
-        cwd: bare,
-        env: { PATH: "/usr/bin:/bin" },
-      });
-      const out = await drain(proc.stdout as Readable);
-      const term = await proc.completed;
-      return { code: term.code, stdout: out.toString("utf8").trim() };
-    });
+    let result: { code: number | null; stdout: string };
+    try {
+      result = await bounded(safety.withBoundary({ boundary: "finalize", deadlineMs: 30_000 }, async (permit: any) => {
+        const proc = await safety.spawnBoundaryProcess(permit, {
+          identity: "worker_pat",
+          argv: ["/usr/bin/git", "-C", bare, "rev-parse", "HEAD"],
+          cwd: bare,
+          env: { PATH: "/usr/bin:/bin" },
+        });
+        const out = await drain(proc.stdout as Readable);
+        const term = await proc.completed;
+        return { code: term.code, stdout: out.toString("utf8").trim() };
+      }), 45_000, `${tag}: the worker_pat boundary action`);
+    } catch (err) {
+      result = { code: null, stdout: `threw ${err instanceof Error ? err.message : String(err)}` };
+    }
     check(`${tag}: a subsequent worker_pat boundary action succeeds`, result.code === 0 && /^[0-9a-f]{40}$/.test(result.stdout),
       `code=${result.code} stdout=${JSON.stringify(result.stdout)}`);
   };
@@ -190,7 +215,7 @@ async function runFinalizeImportPart(
   // named lines: a crash must never stand in for a red, nor skip the cases after it.
   let alignChecked = false;
   try {
-    await safetyA.withBoundary({ boundary: "finalize", deadlineMs: 60_000 }, (permit: any) =>
+    await bounded(safetyA.withBoundary({ boundary: "finalize", deadlineMs: 60_000 }, (permit: any) =>
       gitCache.withBoundaryProcessSpawner(
         (p: unknown) => safetyA.spawnBoundaryProcess(permit, p),
         permit.signal,
@@ -204,7 +229,7 @@ async function runFinalizeImportPart(
           alignChecked = true;
           check("FINALIZE-IMPORT (a): alignBranchWithDefault returns \"aligned\"", aligned === "aligned", `result=${aligned}`);
         },
-      ));
+      )), CASE_BOUND_MS, "FINALIZE-IMPORT (a): the import boundary");
   } catch (err) {
     if (!alignChecked) {
       check("FINALIZE-IMPORT (a): alignBranchWithDefault returns \"aligned\"", false,
@@ -224,7 +249,7 @@ async function runFinalizeImportPart(
   let threwB: unknown;
   let settledB = false;
   try {
-    await safetyB.withBoundary({ boundary: "finalize", deadlineMs: 60_000 }, (permit: any) =>
+    await bounded(safetyB.withBoundary({ boundary: "finalize", deadlineMs: 60_000 }, (permit: any) =>
       gitCache.withBoundaryProcessSpawner(
         (p: unknown) => safetyB.spawnBoundaryProcess(permit, p),
         permit.signal,
@@ -235,7 +260,7 @@ async function runFinalizeImportPart(
             settledB = true;
           }
         },
-      ));
+      )), CASE_BOUND_MS, "FINALIZE-IMPORT (b): the import boundary");
   } catch (err) {
     threwB = err;
   }
@@ -261,7 +286,7 @@ async function runFinalizeImportPart(
     const safetyC = newSafety(registryC);
     let settledC = false;
     try {
-      await safetyC.withBoundary({ boundary: "finalize", deadlineMs: 60_000 }, (permit: any) =>
+      await bounded(safetyC.withBoundary({ boundary: "finalize", deadlineMs: 60_000 }, (permit: any) =>
         gitCache.withBoundaryProcessSpawner(
           (p: unknown) => safetyC.spawnBoundaryProcess(permit, p),
           permit.signal,
@@ -272,7 +297,7 @@ async function runFinalizeImportPart(
               settledC = true;
             }
           },
-        ));
+        )), CASE_BOUND_MS, "FINALIZE-IMPORT (c): the import boundary");
     } catch (err) {
       threwC = err;
     }
@@ -834,4 +859,7 @@ process.on("exit", () => {
     process.exitCode = 1;
   }
 });
-main().then(() => { mainCompleted = true; }, (error: unknown) => { console.error(error); process.exitCode = 1; mainCompleted = true; });
+// Exit explicitly once main() settles: a stalled boundary case leaves live handles (a stuck git
+// child) that would otherwise keep node, and the container, running until the outer timeout.
+main().then(() => { mainCompleted = true; }, (error: unknown) => { console.error(error); process.exitCode = 1; mainCompleted = true; })
+  .finally(() => process.exit());
