@@ -33,23 +33,27 @@ func validateDiskParkPreventive(req StateRequest) error {
 // server-derived fail_origin 'data_volume_full'. It returns (run, rows, err) in the
 // parkForgeUnreachable shape:
 //
-//   - rows == 1, err == nil: an APPLIED transition (park or cap-fail). SetState re-reads the run
-//     and runs the shared post-switch fan-out (broadcast; the judge skips the cap-fail origin).
-//   - rows == 0, err == nil: a NO-OP the caller maps to 409 {run}: the idempotent duplicate of an
-//     already-applied disk park (status recovery_wait, cause data_volume_full — never counted
-//     twice), or a stale report onto a run that is no longer 'running'.
+//   - rows == 1, err == nil: an APPLIED transition (park, cap-fail, or cancel). SetState re-reads
+//     the run and runs the shared post-switch fan-out (broadcast; the judge skips the cap-fail
+//     origin and never judges a cancel).
+//   - rows == 0, err == nil: a NO-OP the caller maps to 409 {run}: any report onto a run that is
+//     no longer 'running', which covers the idempotent duplicate of an already-applied disk park
+//     (status recovery_wait, cause data_volume_full — never counted twice).
 //   - err == ErrStaleClaim: the report's generation is not the locked run's, or the claim was
 //     released. Nothing is mutated; the returned run is the locked row, and the handler answers
 //     the generic 409 {run, disposition: stale_claim}.
 //
 // Fencing is the forge park's: the claim generation is REQUIRED (absent is a 400, since a
 // mismatch needs a value to compare), the run row is locked FOR UPDATE and the generation
-// checked FIRST, then the idempotent already-parked case, then the park-or-fail. Unlike the
-// pre-clone forge park it settles NO custody hold: a disk park can land mid-run with committed
-// work only this worker holds, so the generation's hold stays open and the worker keeps its
-// local custody (D6, "a data_volume_full park still holds custody"). It has no stamped-stop
-// branch either: like the ordinary recovery park (SetRunRecoveryWait) it parks whatever
-// stop_kind the row carries.
+// checked FIRST, then the not-running no-op, then a stamped stop, then the park-or-fail. Unlike
+// the pre-clone forge park it settles NO custody hold: a disk park can land mid-run with
+// committed work only this worker holds, so the generation's hold stays open and the worker keeps
+// its local custody (D6, "a data_volume_full park still holds custody").
+//
+// A stop verdict stamped on the row (an owner cancel, a graceful stop, an auto-stop) wins over
+// the park, exactly as in parkForgeUnreachable: the run ends 'cancelled' through
+// CancelRunByWorker, is never parked and never failed 'data_volume_full', so neither a later
+// promotion nor the cap turns a deliberate wind-down into a retry or a disk failure.
 //
 // A PREVENTIVE park (req.DiskParkPreventive == true) parks WITHOUT bumping disk_park_count and
 // is never capped, so a run the worker keeps stopping before the volume fills cannot be failed
@@ -91,14 +95,35 @@ func (s *Service) parkDataVolumeFull(ctx context.Context, wkr store.Worker, owne
 		return run, 0, ErrStaleClaim
 	}
 
-	// Precedence 2 — the idempotent duplicate of an applied disk park (a lost ack): answer the
-	// parked run as a no-op, never counting it twice.
-	if run.Status == "recovery_wait" && run.RecoveryWaitCause.Valid && run.RecoveryWaitCause.String == recoveryCauseDataVolumeFull {
-		return run, 0, nil
-	}
-	// A stale report onto a run that is no longer 'running' is a plain no-op → 409 {run}.
+	// Precedence 2 — a report onto a run that is no longer 'running' is a plain no-op → 409 {run}
+	// with the run's real status. This includes the idempotent duplicate of an applied disk park
+	// (a lost ack: recovery_wait / data_volume_full at the same, still-unreleased generation),
+	// which therefore is never counted twice; it needs no branch of its own because its answer
+	// is the same no-op.
 	if run.Status != "running" {
 		return run, 0, nil
+	}
+
+	// Precedence 3 — a stamped stop verdict is a deliberate wind-down, not a disk park: cancel
+	// the run (status 'cancelled', fail_origin NULL, not judged) rather than park or cap-fail it.
+	// Mirrors parkForgeUnreachable's stamped-stop branch, including its caveat: this cancels on
+	// ANY stamped stop_kind, and a mid-run report can only meet 'cancelled', 'stopped' or
+	// 'auto_stopped' ('plan_rejected' is stamped at the plan gate, 'scope_capped' at completion).
+	// No custody hold is settled here: the hold is left exactly as SetState's failed arm leaves
+	// it when that arm routes a stamped cancel to CancelRunByWorker.
+	if run.StopKind.Valid && run.StopKind.String != "" {
+		n, cerr := qtx.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{ID: run.ID, WorkerID: workerID})
+		if cerr != nil {
+			return store.Run{}, 0, cerr
+		}
+		if n != 1 {
+			// The status='running' guard did not match under the lock; commit nothing.
+			return run, 0, nil
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return store.Run{}, 0, err
+		}
+		return run, 1, nil
 	}
 
 	// Park-or-fail. disk_park_count is read from the LOCKED row (the value BEFORE this park); a
@@ -106,7 +131,9 @@ func (s *Service) parkDataVolumeFull(ctx context.Context, wkr store.Worker, owne
 	// unlimited. A preventive park never reaches the cap branch.
 	maxParks := s.p.RunDiskParkMax
 	if counted && maxParks != 0 && int(run.DiskParkCount)+1 > maxParks {
-		reason := fmt.Sprintf("the worker's data volume stayed full across %d parks", run.DiskParkCount+1)
+		// Names the parks actually taken (disk_park_count, which this failing report does not
+		// bump) and the cap, so the reason agrees with the run's disk_park_count.
+		reason := fmt.Sprintf("the worker's data volume stayed full after %d parks (cap %d)", run.DiskParkCount, maxParks)
 		n, ferr := qtx.SetRunFailed(ctx, store.SetRunFailedParams{
 			FailureReason: pgconv.TextOrNull(reason),
 			// SERVER-DERIVED, set directly — NOT through CoerceFailOrigin's worker-reportable gate

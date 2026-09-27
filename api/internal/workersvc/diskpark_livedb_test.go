@@ -50,8 +50,10 @@ func (e interlockLiveDB) dpRun(t *testing.T, runID uuid.UUID) (status string, ca
 }
 
 // dpResume promotes a parked run to queued through the real promoter, then re-claims it back to
-// running on the same worker at the same generation, the resume a real claim performs.
-func (e interlockLiveDB) dpResume(t *testing.T, runID, workerID uuid.UUID) {
+// running on the same worker the way a real claim does: a fresh claim generation
+// (claim_generation + 1) with the released-claim fence cleared. It returns the new generation,
+// which the next report must carry (the previous one is now stale).
+func (e interlockLiveDB) dpResume(t *testing.T, runID, workerID uuid.UUID) int64 {
 	t.Helper()
 	e.exec(t, `UPDATE runs SET recovery_retry_not_before = now() - interval '1 minute' WHERE id = $1`, runID)
 	if _, err := e.q.PromoteRecoveryWaitRuns(e.ctx, pgconv.Time(time.Now())); err != nil {
@@ -60,7 +62,13 @@ func (e interlockLiveDB) dpResume(t *testing.T, runID, workerID uuid.UUID) {
 	if status, _, _, _, _ := e.dpRun(t, runID); status != "queued" {
 		t.Fatalf("status after promote = %q, want queued", status)
 	}
-	e.exec(t, `UPDATE runs SET status = 'running', worker_id = $2 WHERE id = $1`, runID, workerID)
+	var gen int64
+	if err := e.pool.QueryRow(e.ctx,
+		`UPDATE runs SET status = 'running', worker_id = $2, claim_generation = claim_generation + 1, claim_released_at = NULL
+		 WHERE id = $1 RETURNING claim_generation`, runID, workerID).Scan(&gen); err != nil {
+		t.Fatalf("re-claim: %v", err)
+	}
+	return gen
 }
 
 func dataVolumeFullReport(gen int64, preventive *bool) StateRequest {
@@ -127,6 +135,68 @@ func TestDiskParkStaleGenerationRefusedLiveDB(t *testing.T) {
 	}
 }
 
+// TestDiskParkReleasedClaimRefusedLiveDB: a report at the CURRENT generation whose claim was
+// released (claim_released_at set, e.g. by a credential-switch requeue) is the same stale_claim
+// refusal as a generation mismatch, with nothing mutated.
+func TestDiskParkReleasedClaimRefusedLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.diskParkService(t, 3)
+
+	w := e.seedWorker(t, nil)
+	runID := e.fpSeedRunning(t, w, 1)
+	e.exec(t, `UPDATE runs SET claim_released_at = now() WHERE id = $1`, runID)
+
+	_, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, runID, dataVolumeFullReport(1, nil))
+	if !errors.Is(err, ErrStaleClaim) || applied {
+		t.Fatalf("released-claim disk park: applied=%v err=%v, want ErrStaleClaim", applied, err)
+	}
+	if status, cause, disk, _, origin := e.dpRun(t, runID); status != "running" || cause.Valid || disk != 0 || origin.Valid {
+		t.Fatalf("released-claim report mutated the run: status=%q cause=%v disk_park_count=%d fail_origin=%v", status, cause, disk, origin)
+	}
+}
+
+// TestDiskParkStampedStopCancelsLiveDB: a stop verdict stamped on the run wins over the disk
+// park, as in the forge park. Both at the cap (where a plain report would fail the run
+// 'data_volume_full') and below it (where it would park), a stamped owner cancel ends the run
+// 'cancelled' with fail_origin NULL: never parked, never failed, disk_park_count untouched, no
+// judge enqueued (enableJudge makes judges==0 a real assertion).
+func TestDiskParkStampedStopCancelsLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		priorDisk int
+	}{
+		{"below the cap", 0},
+		{"at the cap", 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := setupInterlockLiveDB(t)
+			svc := e.diskParkService(t, 3)
+			e.enableJudge(t, svc)
+
+			w := e.seedWorker(t, nil)
+			runID := e.fpSeedRunning(t, w, 1)
+			e.exec(t, `UPDATE runs SET disk_park_count = $2, stop_kind = 'cancelled' WHERE id = $1`, runID, tc.priorDisk)
+
+			run, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, runID, dataVolumeFullReport(1, nil))
+			if err != nil || !applied || run.Status != "cancelled" {
+				t.Fatalf("stamped-cancel disk report: applied=%v status=%q err=%v, want applied cancelled", applied, run.Status, err)
+			}
+			status, cause, disk, _, origin := e.dpRun(t, runID)
+			if status != "cancelled" || cause.Valid || origin.Valid || int(disk) != tc.priorDisk {
+				t.Fatalf("after the stamped cancel: status=%q cause=%v fail_origin=%v disk_park_count=%d, want cancelled/NULL/NULL/%d",
+					status, cause, origin, disk, tc.priorDisk)
+			}
+			var judges int
+			if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM runs WHERE kind = 'judge' AND target_run_id = $1`, runID).Scan(&judges); err != nil {
+				t.Fatalf("count judge runs: %v", err)
+			}
+			if judges != 0 {
+				t.Fatalf("judge runs targeting the cancelled run = %d, want 0", judges)
+			}
+		})
+	}
+}
+
 // TestDiskParkCapFailsRunLiveDB: with the cap at 3, the fourth counted park fails the run with
 // the server-derived fail_origin data_volume_full and the fixed count-naming reason, and enqueues
 // no judge (enableJudge makes the judge path reachable, so judges==0 is a real assertion).
@@ -137,17 +207,22 @@ func TestDiskParkCapFailsRunLiveDB(t *testing.T) {
 
 	w := e.seedWorker(t, nil)
 	runID := e.fpSeedRunning(t, w, 1)
+	gen := int64(1)
 	for i := 1; i <= 3; i++ {
-		if _, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, runID, dataVolumeFullReport(1, nil)); err != nil || !applied {
+		if _, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, runID, dataVolumeFullReport(gen, nil)); err != nil || !applied {
 			t.Fatalf("counted park %d: applied=%v err=%v", i, applied, err)
 		}
 		if _, _, disk, _, _ := e.dpRun(t, runID); int(disk) != i {
 			t.Fatalf("disk_park_count after park %d = %d", i, disk)
 		}
-		e.dpResume(t, runID, w)
+		prev := gen
+		gen = e.dpResume(t, runID, w)
+		if gen != prev+1 {
+			t.Fatalf("re-claim generation = %d, want %d", gen, prev+1)
+		}
 	}
 
-	run, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, runID, dataVolumeFullReport(1, nil))
+	run, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, runID, dataVolumeFullReport(gen, nil))
 	if err != nil || !applied {
 		t.Fatalf("cap-exceeding park: applied=%v err=%v", applied, err)
 	}
@@ -165,8 +240,8 @@ func TestDiskParkCapFailsRunLiveDB(t *testing.T) {
 	if err := e.pool.QueryRow(e.ctx, `SELECT failure_reason FROM runs WHERE id = $1`, runID).Scan(&reason); err != nil {
 		t.Fatalf("read failure_reason: %v", err)
 	}
-	if !reason.Valid || reason.String != "the worker's data volume stayed full across 4 parks" {
-		t.Fatalf("failure_reason = %q, want the count-naming reason", reason.String)
+	if !reason.Valid || reason.String != "the worker's data volume stayed full after 3 parks (cap 3)" {
+		t.Fatalf("failure_reason = %q, want the reason naming disk_park_count and the cap", reason.String)
 	}
 	var judges int
 	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM runs WHERE kind = 'judge' AND target_run_id = $1`, runID).Scan(&judges); err != nil {
@@ -188,8 +263,9 @@ func TestDiskParkPreventiveNeverFailsLiveDB(t *testing.T) {
 
 	w := e.seedWorker(t, nil)
 	runID := e.fpSeedRunning(t, w, 1)
+	gen := int64(1)
 	for i := 1; i <= maxParks+2; i++ {
-		run, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, runID, dataVolumeFullReport(1, boolPtr(true)))
+		run, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, runID, dataVolumeFullReport(gen, boolPtr(true)))
 		if err != nil || !applied || run.Status != "recovery_wait" {
 			t.Fatalf("preventive park %d: applied=%v status=%q err=%v, want applied recovery_wait", i, applied, run.Status, err)
 		}
@@ -198,10 +274,10 @@ func TestDiskParkPreventiveNeverFailsLiveDB(t *testing.T) {
 			t.Fatalf("after preventive park %d: status=%q cause=%v disk_park_count=%d fail_origin=%v, want recovery_wait/data_volume_full/0/NULL",
 				i, status, cause, disk, origin)
 		}
-		e.dpResume(t, runID, w)
+		gen = e.dpResume(t, runID, w)
 	}
 
-	run, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, runID, dataVolumeFullReport(1, boolPtr(false)))
+	run, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, runID, dataVolumeFullReport(gen, boolPtr(false)))
 	if err != nil || !applied || run.Status != "recovery_wait" {
 		t.Fatalf("counted park after preventive ones: applied=%v status=%q err=%v, want applied recovery_wait", applied, run.Status, err)
 	}
