@@ -1337,6 +1337,43 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
       assert.ok(!haystack.includes(secret), `no ${secret} in any state body, feed line, log line or boundary error`);
     }
   });
+
+  // Composition of #1764 and #1766: an ACKed owner pause (parkForPause answered `paused`, so the
+  // executor returns pausedAt) must bypass the finalize boundary even with the vault locked. Were
+  // it to enter the boundary, the per-sink reconcile would hit the 409 vault_locked and the
+  // vault-deferral arm would park a durably paused run as recovery_wait. So: zero credential
+  // calls, no permit, no recovery park, no vault feed line, and the run stays paused.
+  it("(T11 x vault) an owner pause ACKed as paused makes no refreshCodex/releaseCodex call and mints no finalize permit while the vault is locked; it never becomes a vault park", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const restore = spyPublishLands();
+    try {
+      client.protocolFeatures = [VAULT_FEATURE];
+      const rig = codexRig({ authMode: "subscription", vaultLocked: () => true });
+      let parkedResult: boolean | undefined;
+      const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+        commitInTree(ctx.worktreePath, "PAUSE.txt", "work before the owner pause\n");
+        const at = { completedCount: 1, total: 2 };
+        parkedResult = await ctx.parkForPause?.(at);
+        return parkedResult ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
+      }, rig.settle);
+      const claim = gitlabClaim(1764);
+      await runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 }).execute(claim);
+      assert.equal(parkedResult, true, "the owner pause was ACKed as paused");
+      assert.deepEqual(rig.boundaries, [], `no finalize (or any) permit was minted; got ${JSON.stringify(rig.boundaries)}`);
+      assert.equal(rig.refreshCalls(), 0, "no refreshCodex for an owner-paused run");
+      assert.equal(rig.releaseCalls(), 0, "no releaseCodex for an owner-paused run");
+      assert.equal(parkReports(claim.run_id).length, 0, "the owner pause never became a recovery_wait park");
+      const feed = feedTexts(claim.run_id);
+      assert.ok(!feed.some((t) => /vault/i.test(t)), `no vault park line on the feed; feed=${JSON.stringify(feed)}`);
+      assert.equal(calls.length, 0, "no push/MR for a paused run");
+      const st = statuses(claim.run_id);
+      assert.ok(st.includes("paused"), "the run reported paused");
+      assert.ok(!st.includes("completed") && !st.includes("failed"), `no terminal report; got ${JSON.stringify(st)}`);
+      assert.deepEqual(rig.disposeBoundaries, ["terminal"], "the runner still disposed the Codex registry once");
+    } finally {
+      restore();
+    }
+  });
 });
 
 // ================================================================================
