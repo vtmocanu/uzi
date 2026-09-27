@@ -304,7 +304,8 @@ export interface SizeLineGit {
 
 /**
  * PRD #1798 M1 — the size line for the landed `headSha` against `targetBranch`. Returns null only for
- * an empty diff; any failure (merge-base, numstat, attribute lookup) is logged at warn and renders
+ * an empty diff; any failure (merge-base, numstat, attribute lookup, or a numstat path absent from the
+ * attribute lookup's result) is logged at warn and renders
  * {@link SIZE_UNAVAILABLE}. Never throws: the size line never fails a run.
  */
 export async function computeSizeLine(
@@ -319,7 +320,14 @@ export async function computeSizeLine(
     const base = await git.sizeMergeBase(barePath, targetBranch, headSha);
     const entries = parseNumstatZ(await git.diffNumstatZ(barePath, base, headSha));
     if (entries.length === 0) return null;
-    const attrs = await git.checkAttrZ(barePath, headSha, [...new Set(entries.map((e) => e.path))]);
+    const paths = [...new Set(entries.map((e) => e.path))];
+    const attrs = await git.checkAttrZ(barePath, headSha, paths);
+    // A path git did not report attributes for would otherwise be classified by path rules alone:
+    // never publish buckets computed without attributes (D3, reviewer revision 1).
+    const missing = paths.filter((p) => !attrs.has(p));
+    if (missing.length > 0) {
+      throw new Error(`check-attr reported no attributes for ${missing.length} of ${paths.length} path(s), e.g. ${JSON.stringify(missing[0])}`);
+    }
     return renderSizeLine(entries, attrs);
   } catch (err) {
     log?.warn("PR size line unavailable", { error: err instanceof Error ? err.message : String(err) });

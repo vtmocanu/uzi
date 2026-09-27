@@ -22,7 +22,7 @@ import {
 import { StubExecutor } from "../src/executor.js";
 import { mrDescription } from "../src/runner.js";
 import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
-import { api, fakeGitlab, gitlabClaim, installHarness, runner } from "./runner-harness.js";
+import { api, fakeGitlab, git as harnessGit, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 
 // PRD #1798 M1 (D3) — the deterministic size line. The classifier is table-tested per ecosystem path
 // rule and per attribute state; the attribute states come from REAL `git check-attr` runs against a
@@ -330,6 +330,50 @@ describe("attribute lookup on a real bare clone (PRD #1798 M1)", () => {
     }
   });
 
+  it("GitCache's real runner takes the temp-index fallback: identical buckets, bare index never written", async () => {
+    // Drives the PRODUCTION runner (GitCache.sizeAttrGit → execScoped → real git). Only the
+    // `--source` invocation is made to fail the way a git < 2.40 does; read-tree and
+    // check-attr --cached then run for real against the bare, so the GIT_INDEX_FILE plumbing of
+    // sizeAttrGit is what keeps git off the bare repo's own index.
+    const fx = makeRepo(base, change);
+    try {
+      const paths = table.map(([p]) => p);
+      const viaSource = await newGitCache(fx.root).checkAttrZ(fx.bare, fx.head, paths);
+
+      const gc = newGitCache(fx.root);
+      type ExecScoped = (command: string, args: string[], options: { env: NodeJS.ProcessEnv; input?: string }) => Promise<{ stdout: string; stderr: string }>;
+      const seam = gc as unknown as { execScoped: ExecScoped };
+      const realExec = seam.execScoped.bind(gc);
+      const seen: { args: string[]; indexFile: string | undefined }[] = [];
+      seam.execScoped = async (command, args, options) => {
+        seen.push({ args, indexFile: options.env.GIT_INDEX_FILE });
+        const source = args.find((a) => a.startsWith("--source="));
+        if (source) {
+          throw Object.assign(new Error("Command failed: git check-attr (exit 129)"), {
+            code: 129,
+            stderr:
+              `error: unknown option \`${source.slice(2)}'\n` +
+              "usage: git check-attr [-a | --all | <attr>...] [--] <pathname>...\n" +
+              "   or: git check-attr --stdin [-z] [-a | --all | <attr>...]\n",
+          });
+        }
+        return realExec(command, args, options);
+      };
+      const viaIndex = await gc.checkAttrZ(fx.bare, fx.head, paths);
+
+      const shape = seen.map((c) => (c.args.includes("read-tree") ? "read-tree" : c.args.includes("--cached") ? "check-attr --cached" : "check-attr"));
+      assert.deepStrictEqual(shape, ["check-attr", "read-tree", "check-attr --cached"], "the fallback ran through GitCache's runner");
+      assert.ok(!fs.existsSync(path.join(fx.bare, "index")), "the bare repo's own index is never written");
+      assert.deepStrictEqual(viaIndex, viaSource, "identical attribute states on both paths");
+      for (const [p, bucket] of table) {
+        assert.strictEqual(classifyPath(p, viaIndex.get(p)), bucket, p);
+        assert.strictEqual(classifyPath(p, viaIndex.get(p)), classifyPath(p, viaSource.get(p)), p);
+      }
+    } finally {
+      fx.cleanup();
+    }
+  });
+
   it("a failing temp-index step throws (unavailable) and still removes the temp index", async () => {
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-prsize-tmp-"));
     try {
@@ -473,7 +517,7 @@ describe("computeSizeLine end to end on a real bare clone (PRD #1798 M1)", () =>
     const ok: SizeLineGit = {
       sizeMergeBase: async () => "d".repeat(40),
       diffNumstatZ: async () => "1\t0\tsrc/a.ts\0",
-      checkAttrZ: async () => new Map(),
+      checkAttrZ: async (_bare, _head, paths) => new Map(paths.map((p) => [p, { "linguist-generated": "unspecified" }])),
     };
     assert.strictEqual(await computeSizeLine(ok, "/bare", "main", head, log), `**Size:** code +1 ${MINUS}0 · 1 file`);
     const failures: SizeLineGit[] = [
@@ -485,6 +529,25 @@ describe("computeSizeLine end to end on a real bare clone (PRD #1798 M1)", () =>
     for (const g of failures) assert.strictEqual(await computeSizeLine(g, "/bare", "main", head, log), SIZE_UNAVAILABLE);
     assert.strictEqual(await computeSizeLine(ok, "/bare", "main", null, log), SIZE_UNAVAILABLE);
     assert.strictEqual(warns.length, 5);
+  });
+
+  it("a numstat path absent from the check-attr result renders unavailable, never path-rule buckets", async () => {
+    const warns: { msg: string; meta: unknown }[] = [];
+    const log = { warn: (msg: string, meta?: unknown) => void warns.push({ msg, meta }) };
+    const head = "c".repeat(40);
+    // Two paths in the diff; the lookup answers for only one of them (e.g. git echoed a differently
+    // quoted path back). The missing one must not silently fall back to the path rules.
+    const partial: SizeLineGit = {
+      sizeMergeBase: async () => "d".repeat(40),
+      diffNumstatZ: async () => "1\t0\tsrc/a.ts\0" + "4\t0\tstore/q.sql.go\0",
+      checkAttrZ: async () => new Map([["src/a.ts", { "linguist-generated": "unspecified" }]]),
+    };
+    assert.strictEqual(await computeSizeLine(partial, "/bare", "main", head, log), SIZE_UNAVAILABLE);
+    assert.strictEqual(warns.length, 1);
+    assert.strictEqual(warns[0]!.msg, "PR size line unavailable");
+    assert.match(JSON.stringify(warns[0]!.meta), /store\/q\.sql\.go/);
+    // An entirely empty map (every path missing) is unavailable too.
+    assert.strictEqual(await computeSizeLine({ ...partial, checkAttrZ: async () => new Map() }, "/bare", "main", head, log), SIZE_UNAVAILABLE);
   });
 });
 
@@ -516,5 +579,33 @@ describe("RunRunner puts the size line in the opened MR body (PRD #1798 M1)", ()
     // StubExecutor commits one markdown file; the line is computed from the landed tracking tip
     // against the merge-base with main, and sits before the `---` footer.
     assert.match(body.description, /\n\n\*\*Size:\*\* docs \+\d+ −0 · 1 file\n\n---\n/);
+  });
+});
+
+describe("RunRunner keeps the size line in the verified-head reconcile (PRD #1798 M1)", () => {
+  installHarness();
+  it("INTERLOCKED run: the post-verify description rewrite (PUT) still carries the **Size:** line", async () => {
+    // The completion interlock (PRD #1226 M4) opens the MR, verifies head H, then REWRITES the body
+    // via updateMergeRequestDescription to add Closes. That rewrite must keep the size line.
+    const H = "1111111111111111111111111111111111111111";
+    const SIZE = `**Size:** code +3 ${MINUS}1 · tests +2 ${MINUS}0 · 2 files`;
+    const { gitlab, calls } = fakeGitlab({ head: H });
+    const claim = gitlabClaim(1798, { config: { completion_contract_version: 1, contract_revision: 1 } });
+    api.setCompletionPermitResponse(true);
+    harnessGit.trackingTip = (async () => H) as typeof harnessGit.trackingTip;
+    // H is a synthetic landed head, so the size reads are pinned to a deterministic diff.
+    harnessGit.sizeMergeBase = async () => "d".repeat(40);
+    harnessGit.diffNumstatZ = async () => "3\t1\tsrc/a.ts\0" + "2\t0\tsrc/a.test.ts\0";
+    harnessGit.checkAttrZ = async (_bare, _head, paths) => new Map(paths.map((p) => [p, {}]));
+
+    await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
+
+    assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
+    assert.deepStrictEqual(calls.map((c) => c.method), ["POST", "GET", "PUT", "GET"]);
+    const post = JSON.parse(calls.find((c) => c.method === "POST")!.body ?? "{}") as { description: string };
+    const put = JSON.parse(calls.find((c) => c.method === "PUT")!.body ?? "{}") as { description: string };
+    assert.ok(post.description.includes(`\n\n${SIZE}\n\n---\n`), post.description);
+    assert.match(put.description, /Closes #1798/, "the PUT is the verified-head reconcile");
+    assert.ok(put.description.includes(`\n\n${SIZE}\n\n---\n`), `the reconcile body lost the size line:\n${put.description}`);
   });
 });
