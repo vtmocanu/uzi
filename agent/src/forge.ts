@@ -19,6 +19,16 @@
 
 import { errMessage } from "./util.js";
 
+/** What the transport answers: the subset of the fetch `Response` the drivers read. `body` is the
+ *  streaming body a real `Response` carries; it is OPTIONAL so a fake transport may answer with
+ *  `text()` alone (every existing fake does). A bounded read streams `body` when it is present and
+ *  stops at its cap; without it, it falls back to `text()` and checks the cap afterwards. */
+export interface FetchResponse {
+  status: number;
+  text(): Promise<string>;
+  body?: ReadableStream<Uint8Array> | null;
+}
+
 /** Injectable transport (default = global fetch). */
 export type FetchFn = (
   url: string,
@@ -30,7 +40,15 @@ export type FetchFn = (
     /** Pinned to "error" so a 3xx cannot replay the PAT header cross-origin. */
     redirect?: "error" | "follow" | "manual";
   },
-) => Promise<{ status: number; text(): Promise<string> }>;
+) => Promise<FetchResponse>;
+
+/** PRD #1798 M6 (H1): the byte cap on a single-MR/PR detail read. A forge caps a description at
+ *  about 1,048,576 characters (FORGE_BODY_MAX_CHARS), up to 4 UTF-8 bytes each, plus 64 KiB of
+ *  headroom for JSON escaping and the rest of the object. */
+export const MR_DETAIL_MAX_BYTES = 4 * 1_048_576 + 64 * 1024;
+
+/** The bytes an error body is read to before it is cut (the message keeps 512 characters). */
+const ERROR_BODY_MAX_BYTES = 4096;
 
 export interface CreateMrParams {
   /** The forge WEB url of the repo. Each driver derives its own API base + project
@@ -76,6 +94,16 @@ export class ForgeError extends Error {
   ) {
     super(`forge API returned ${status}: ${detail}`);
     this.name = "ForgeError";
+  }
+}
+
+/** A response body over its byte cap (status 0: no forge status is at fault). It is a
+ *  deterministic answer, not a transport blip, so a caller's retry should treat it as permanent
+ *  (the runner's PR-description retry does); every caller treats it as an unreadable MR/PR. */
+export class ForgeResponseTooLarge extends ForgeError {
+  constructor(readonly maxBytes: number) {
+    super(0, `response too large (over ${maxBytes} bytes)`);
+    this.name = "ForgeResponseTooLarge";
   }
 }
 
@@ -191,7 +219,8 @@ abstract class HttpForgeClient implements ForgeClient {
   async getMergeRequest(repoUrl: string, pat: string, iid: number, signal?: AbortSignal): Promise<MergeRequestDetail> {
     const res = await this.request("GET", this.headUrl(repoUrl, iid), pat, undefined, signal);
     if (res.status !== 200) throw new ForgeError(res.status, (await safeText(res)).slice(0, 512));
-    return this.parseMrDetail(await res.text());
+    // H1: a hostile or broken forge must not make the worker buffer an unbounded body.
+    return this.parseMrDetail(await readCapped(res, MR_DETAIL_MAX_BYTES));
   }
 
   /**
@@ -215,14 +244,14 @@ abstract class HttpForgeClient implements ForgeClient {
     pat: string,
     body?: unknown,
     signal?: AbortSignal,
-  ): Promise<{ status: number; text(): Promise<string> }> {
+  ): Promise<FetchResponse> {
     // Guard 1: never send the PAT over a non-https URL. The credential rides a
     // header, and only TLS keeps it off the wire — a plaintext (or malformed) URL
     // is a hard error, never a best-effort send.
     if (!isHttps(url)) throw new ForgeError(0, "refusing to send the PAT to a non-https forge URL");
     const headers: Record<string, string> = { ...this.authHeaders(pat) };
     if (body !== undefined) headers["Content-Type"] = "application/json";
-    let res: { status: number; text(): Promise<string> };
+    let res: FetchResponse;
     try {
       res = await this.fetchFn(url, {
         method,
@@ -677,10 +706,56 @@ function safeJson(text: string): unknown {
   }
 }
 
-async function safeText(res: { text(): Promise<string> }): Promise<string> {
+/** An error body for a message: at most ERROR_BODY_MAX_BYTES are read (a streaming body is
+ *  cancelled past that), and a read failure is "". */
+async function safeText(res: FetchResponse): Promise<string> {
   try {
-    return (await res.text()).trim();
+    return (await readPrefix(res, ERROR_BODY_MAX_BYTES)).text.trim();
   } catch {
     return "";
   }
+}
+
+/**
+ * The body as UTF-8 text, read to at most `maxBytes` bytes. A streaming body stops being read at the
+ * first chunk that crosses the cap and is cancelled (the rest is never buffered); a transport
+ * without `body` (a test fake) is read with text() and its UTF-8 length checked against the cap.
+ * `over` reports that the body was longer than `maxBytes` (then `text` is the decoded prefix).
+ */
+async function readPrefix(res: FetchResponse, maxBytes: number): Promise<{ text: string; over: boolean }> {
+  const stream = res.body;
+  if (!stream) {
+    const text = await res.text();
+    if (Buffer.byteLength(text, "utf8") <= maxBytes) return { text, over: false };
+    return { text: Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8"), over: true };
+  }
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let over = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (total + value.byteLength > maxBytes) {
+        chunks.push(value.subarray(0, maxBytes - total));
+        total = maxBytes;
+        over = true;
+        break;
+      }
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    if (over) await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+  return { text: Buffer.concat(chunks, total).toString("utf8"), over };
+}
+
+/** The whole body, or a ForgeResponseTooLarge once it passes `maxBytes`. */
+async function readCapped(res: FetchResponse, maxBytes: number): Promise<string> {
+  const { text, over } = await readPrefix(res, maxBytes);
+  if (over) throw new ForgeResponseTooLarge(maxBytes);
+  return text;
 }

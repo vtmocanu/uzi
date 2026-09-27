@@ -1,8 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { nullLogger, makeClaim } from "./helpers.js";
-import { StubExecutor } from "../src/executor.js";
+import { StubExecutor, type ExecutorResult, type RunContext } from "../src/executor.js";
+import { computeSize } from "../src/pr-size.js";
 import {
   COMPLETION_END,
   COMPLETION_START,
@@ -13,7 +15,7 @@ import {
 } from "../src/pr-description.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import { FakePrDescApi } from "./fake-pr-desc-api.js";
-import { api, fakeGitlab, fx, git, gitlabClaim, installHarness, runner, runnerWith } from "./runner-harness.js";
+import { api, fakeGitlab, fx, git, gitlabClaim, installHarness, runner, runnerWith, type FakeForgeOpts } from "./runner-harness.js";
 
 installHarness();
 
@@ -120,7 +122,7 @@ describe("RunRunner — completion interlock over a preserved body (PRD #1798 M6
     assert.match(parsed.kind === "ok" ? (parsed.completion ?? "") : "", /Closes #1824/, "a completed run's PR carries Closes");
   });
 
-  it("verified head: when the Closes write cannot be confirmed, the run never reports completed", async () => {
+  it("verified head: when the Closes write cannot be confirmed (nor the strip), the run fails closed and never reports completed", async () => {
     const { gitlab } = fakeGitlab({ head: H, putStatus: 403, existing: "Legacy body with no markers." });
     const claim = interlockedClaim(1825);
     api.setCompletionPermitResponse(true);
@@ -131,7 +133,10 @@ describe("RunRunner — completion interlock over a preserved body (PRD #1798 M6
     }).execute(claim);
 
     assert.ok(!statuses(claim.run_id).includes("completed"));
-    assert.equal(api.completionHoldRequests.length, 1, "it holds");
+    // ADR 1225: a Closes add that may have landed is stripped before any hold; the strip is refused
+    // too (403), so the MR cannot be proven non-closing and the run fails closed.
+    assert.equal(api.completionHoldRequests.length, 0, "never holds a possibly-closing MR");
+    assert.ok(statuses(claim.run_id).includes("failed"));
   });
 });
 
@@ -206,5 +211,187 @@ describe("RunRunner — refresh runs (PRD #1798 D17)", () => {
     assert.notEqual(parsed.kind === "ok" && parsed.region, SIZE_REGION, "the region was refreshed");
     assert.match(parsed.kind === "ok" ? (parsed.region ?? "") : "", /Describes `1111111` against `main`\./);
     assert.ok(pr.description.startsWith("Intro.\n\n") && pr.description.endsWith("\n\nBot text."));
+  });
+});
+
+describe("RunRunner — the verified-head Closes add is bound to what was written (ADR 1225, PRD #1798 M6)", () => {
+  /** The fake PR answers the REAL landed head, so the publisher stages, binds and acks a version and
+   *  the completion block carries a described SHA: the production configuration. */
+  function followLandedHead(pr: { head: string }): void {
+    const tip = git.trackingTip.bind(git);
+    git.trackingTip = (async (bare: string, branch: string) => {
+      const h = await tip(bare, branch);
+      if (h && pr.head !== OTHER) pr.head = h;
+      return h;
+    }) as typeof git.trackingTip;
+  }
+
+  it("PROBE-A: the head moves when `Closes #1901` is written → Closes is stripped and the run holds", async () => {
+    api.prDescription = new FakePrDescApi();
+    const { gitlab, pr } = fakeGitlab({
+      onWrite: (p, description) => {
+        if (/Closes #1901/.test(description)) p.head = OTHER;
+      },
+    });
+    followLandedHead(pr);
+    const claim = interlockedClaim(1901);
+    api.setCompletionPermitResponse(true);
+
+    await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
+      recoveryRetryMs: 1,
+    }).execute(claim);
+
+    assert.ok(!statuses(claim.run_id).includes("completed"), "never completes on a moved head");
+    assert.doesNotMatch(pr.description, /Closes #1901/, "no Closes is left on the MR");
+    assert.equal(closingDirectiveFor(pr.description, 1901, "org/repo"), false);
+    const held = api.completionHoldRequests.length === 1;
+    const failed = statuses(claim.run_id).includes("failed");
+    assert.ok(held || failed, "it holds (or fails closed)");
+    if (held) assert.match(pr.description, /Completion unverified/);
+  });
+
+  it("PROBE-B: the MR becomes unreadable (404) after the Closes write → Closes is stripped and the run holds or fails closed", async () => {
+    api.prDescription = new FakePrDescApi();
+    const opts: FakeForgeOpts = {};
+    opts.onWrite = (_p, description) => {
+      if (/Closes #1902/.test(description)) opts.headStatus = 404;
+    };
+    const { gitlab, pr } = fakeGitlab(opts);
+    followLandedHead(pr);
+    const claim = interlockedClaim(1902);
+    api.setCompletionPermitResponse(true);
+
+    await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
+      recoveryRetryMs: 1,
+    }).execute(claim);
+
+    assert.ok(!statuses(claim.run_id).includes("completed"), "never completes on an unreadable MR");
+    assert.doesNotMatch(pr.description, /Closes #1902/, "no Closes is left on the MR");
+    assert.equal(closingDirectiveFor(pr.description, 1902, "org/repo"), false);
+    assert.ok(api.completionHoldRequests.length === 1 || statuses(claim.run_id).includes("failed"), "it holds (or fails closed)");
+  });
+});
+
+/** The fake PR follows the REAL landed head (the publisher then stages real snapshots). Returns the
+ *  landed head once the run read it. */
+function followHead(pr: { head: string }): () => string {
+  let landed = "";
+  const tip = git.trackingTip.bind(git);
+  git.trackingTip = (async (bare: string, branch: string) => {
+    const h = await tip(bare, branch);
+    if (h) {
+      landed = h;
+      pr.head = h;
+    }
+    return h;
+  }) as typeof git.trackingTip;
+  return () => landed;
+}
+
+/** A StubExecutor run stopped by an operator scope directive after committing work (PRD #634). */
+class ScopeCappedStub extends StubExecutor {
+  override async run(ctx: RunContext): Promise<ExecutorResult> {
+    return { ...(await super.run(ctx)), scopeCapped: { completedCount: 1, total: 2 } };
+  }
+}
+
+describe("RunRunner — a legacy non-closing run whose PR still closes fails closed (PRD #1798 M6, amended D10, M1)", () => {
+  const closingCompletion = (iid: number) =>
+    [COMPLETION_START, `Related to #${iid}.`, "", `Closes #${iid}`, "", "---", "Opened by uzi.", COMPLETION_END].join("\n");
+
+  it("an adopted body with `Closes #N` and a failing forge write: the scope-capped legacy run fails, never completes", async () => {
+    const { gitlab, pr } = fakeGitlab({ putStatus: 403, existing: `${SIZE_REGION}\n\n${closingCompletion(1840)}` });
+    followHead(pr);
+    const claim = gitlabClaim(1840); // no config: a legacy (non-interlocked) run
+
+    await runner(new ScopeCappedStub(nullLogger()), gitlab).execute(claim);
+
+    assert.ok(!statuses(claim.run_id).includes("completed"), "a partial never completes with a closing PR");
+    assert.ok(statuses(claim.run_id).includes("failed"), "it fails closed");
+    const failed = api.states.find((st) => st.runId === claim.run_id && st.body.status === "failed")!.body;
+    assert.equal(failed.failure_reason, "completion interlock: a closing directive could not be removed from a non-closing merge request");
+    assert.match(pr.description, /Closes #1840/, "the write really failed (the directive is still there)");
+  });
+
+  it("control: the same adopted body with a working forge is rewritten non-closing and the run completes", async () => {
+    const { gitlab, pr } = fakeGitlab({ existing: `Closes #1841 too\n\n${SIZE_REGION}\n\n${closingCompletion(1841)}` });
+    followHead(pr);
+    const claim = gitlabClaim(1841);
+
+    await runner(new ScopeCappedStub(nullLogger()), gitlab).execute(claim);
+
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.equal(closingDirectiveFor(pr.description, 1841, "org/repo"), false);
+  });
+});
+
+describe("RunRunner — the publication and the interlock are independent (PRD #1798 M6, L1)", () => {
+  it("a stale_claim at staging stops the publisher's writes; the interlock still adds Closes on the verified head", async () => {
+    const prApi = new FakePrDescApi();
+    prApi.failNext("stage", 409, "stale_claim");
+    api.prDescription = prApi;
+    const { gitlab, pr, all } = fakeGitlab();
+    followHead(pr);
+    const claim = interlockedClaim(1850);
+    api.setCompletionPermitResponse(true);
+
+    await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
+
+    assert.deepEqual(prApi.calls.map((c) => c.op), ["stage"], "no api call after the 409");
+    const puts = all.filter((c) => c.method === "PUT");
+    assert.equal(puts.length, 1, "the only body write is the interlock's");
+    assert.match(String(JSON.parse(puts[0]!.body ?? "{}").description), /Closes #1850/);
+    assert.ok(statuses(claim.run_id).includes("completed"));
+  });
+});
+
+describe("RunRunner — an over-cap MR read (PRD #1798 M6, H1)", () => {
+  it("the publisher skips the region, the read is not retried, and a legacy run still completes", async () => {
+    const { gitlab, pr, reads, calls } = fakeGitlab({ existing: "x".repeat(5 * 1_048_576) });
+    followHead(pr);
+    const claim = gitlabClaim(1860);
+
+    await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
+
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.equal(reads.length, 1, "a response-too-large read is permanent: one GET, no retry");
+    assert.ok(!calls.some((c) => c.method === "PUT"), "nothing is written over an unreadable PR");
+  });
+});
+
+describe("RunRunner — the size line counts the PR's actual target, not the repo default (Greptile #1813)", () => {
+  it("an adopted PR targeting `release` gets the size of the branch against `release`", async () => {
+    // origin: `release` at the first commit; main gains a commit the agent branch inherits. Against
+    // main the branch changes the stub's file only; against release it also carries main's commit.
+    const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+    const og = (args: string[]) => execFileSync("git", ["-C", fx.originPath, ...args], { env, stdio: "pipe" });
+    og(["branch", "release"]);
+    execFileSync("sh", ["-c", 'printf "one\\ntwo\\nthree\\n" > docs-extra.md'], { cwd: fx.originPath });
+    og(["add", "docs-extra.md"]);
+    og(["commit", "-m", "main moves on"]);
+
+    const prApi = new FakePrDescApi();
+    api.prDescription = prApi;
+    const { gitlab, pr } = fakeGitlab({ target: "release" });
+    const landed = followHead(pr);
+    const claim = gitlabClaim(1870, {
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath, default_branch: "main" },
+    });
+
+    await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
+
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    const bare = git.barePathFor(fx.originPath);
+    const vsRelease = (await computeSize(git, bare, "release", landed())).line;
+    const vsMain = (await computeSize(git, bare, "main", landed())).line;
+    assert.ok(vsRelease && vsMain && vsRelease !== vsMain, `${vsRelease} / ${vsMain}`);
+    const parsed = parseOwnedBlocks(pr.description);
+    const region = parsed.kind === "ok" ? (parsed.region ?? "") : "";
+    assert.ok(region.includes(vsRelease!), `the size line is against the PR's target:\n${region}`);
+    assert.ok(!region.includes(vsMain!), region);
+    assert.match(region, /against `release`\./);
+    const stages = prApi.calls.filter((c) => c.op === "stage").map((c) => c.body.target_branch);
+    assert.equal(stages.at(-1), "release", "the version the PR carries was staged for its real target");
+    assert.deepEqual(prApi.acks().at(-1), "published");
   });
 });

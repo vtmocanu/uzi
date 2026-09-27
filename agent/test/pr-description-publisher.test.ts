@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { WorkerClient } from "../src/client.js";
-import { ForgeError, type MergeRequestDetail } from "../src/forge.js";
+import { ForgeError, ForgeResponseTooLarge, MR_DETAIL_MAX_BYTES, type MergeRequestDetail } from "../src/forge.js";
 import type { DeliveryContext } from "../src/pr-description-context.js";
 import {
   PrDescriptionPublisher,
@@ -84,7 +84,7 @@ class FakeForge implements PublisherForge {
   /** Runs after a write lands, so a test can model a concurrent edit the confirm read sees. */
   afterWrite?: (pr: FakeForge["pr"]) => void;
 
-  async getMergeRequest(): Promise<MergeRequestDetail> {
+  async getMergeRequest(_url?: string, _pat?: string, _iid?: number, _signal?: AbortSignal): Promise<MergeRequestDetail> {
     this.reads++;
     this.beforeRead?.(this.reads, this.pr);
     if (this.failRead?.(this.reads)) throw new ForgeError(503, "down");
@@ -711,11 +711,11 @@ describe("reconcileCompletion (the interlock's read-replace-write)", () => {
     assert.equal(await reconcileCompletion(args(f, false)), "closing");
   });
 
-  it("non-closing: a failed read falls back to the blind whole-body rewrite", async () => {
+  it("non-closing: a failed read falls back to the blind whole-body rewrite, reported as `blind` (L3)", async () => {
     const f = new FakeForge();
     f.pr.description = `Closes #7`;
     f.failRead = () => true;
-    assert.equal(await reconcileCompletion(args(f, false)), "confirmed");
+    assert.equal(await reconcileCompletion(args(f, false)), "blind", "a write nothing re-read is never `confirmed`");
     assert.equal(f.pr.description, renderBody(region, completion(false)));
   });
 
@@ -724,6 +724,214 @@ describe("reconcileCompletion (the interlock's read-replace-write)", () => {
     f.failRead = () => true;
     assert.equal(await reconcileCompletion(args(f, true)), "unconfirmed");
     assert.equal(f.writes.length, 0);
+  });
+});
+
+// ── The reconcile confirms what it wrote (ADR 1225, PRD #1798 M6) ─────────────────────────────
+
+describe("reconcileCompletion confirms against the block it WROTE, not one re-rendered for the re-read head", () => {
+  const region = renderRegion({ sizeLine: SIZE_LINE, headSha: H1, targetBranch: "main" }).text;
+  // The runner's completion: the D12 staleness line for the head the read reports.
+  const staleArgs = (forge: FakeForge, closes: boolean) => ({
+    forge,
+    repoUrl: "https://gitlab.example.test/o/r",
+    pat: "pat",
+    mrIid: MR,
+    completion: (head?: string) => completion(closes, head ? { describedSha: H1, headSha: head } : undefined),
+    ownRegion: region,
+    nonClosing: closes ? undefined : { issueIid: IID, repoPath: "o/r" },
+    log: nullLogger(),
+  });
+
+  it("closing: a head that moves between the write and the re-read is still `confirmed` (the caller's head re-verify then decides)", async () => {
+    const f = new FakeForge();
+    f.pr.description = `${region}\n\n${completion(false)}`;
+    f.afterWrite = (pr) => {
+      pr.head = H2;
+    };
+    assert.equal(await reconcileCompletion(staleArgs(f, true)), "confirmed");
+    assert.equal(f.writes.length, 1);
+    assert.equal(parseOwnedBlocks(f.pr.description).kind, "ok");
+    assert.ok(f.pr.description.endsWith(completion(true)), "the block written for the head the read reported");
+  });
+
+  it("hold path: a head move between the write and the re-read causes no needless whole-body rewrite", async () => {
+    const f = new FakeForge();
+    f.pr.description = `Human notes.\n\n${region}\n\n${completion(true)}\n\nBot text.`;
+    f.afterWrite = (pr) => {
+      pr.head = H2;
+    };
+    assert.equal(await reconcileCompletion(staleArgs(f, false)), "confirmed");
+    assert.equal(f.writes.length, 1, "one write: the completion block alone");
+    assert.equal(f.pr.description, `Human notes.\n\n${region}\n\n${completion(false)}\n\nBot text.`);
+  });
+
+  it("closing: a re-read that fails after the write is `unconfirmed` (the runner strips Closes, then holds or fails closed)", async () => {
+    const f = new FakeForge();
+    f.pr.description = `${region}\n\n${completion(false)}`;
+    f.failRead = (n) => n === 2;
+    assert.equal(await reconcileCompletion(staleArgs(f, true)), "unconfirmed");
+  });
+
+  it("an over-cap detail read (ForgeResponseTooLarge) takes the unreadable path: blind when non-closing, unconfirmed when closing", async () => {
+    const tooLarge = new FakeForge();
+    tooLarge.getMergeRequest = async () => {
+      throw new ForgeResponseTooLarge(MR_DETAIL_MAX_BYTES);
+    };
+    assert.equal(await reconcileCompletion(staleArgs(tooLarge, false)), "blind");
+    assert.equal(tooLarge.pr.description, renderBody(region, completion(false)));
+    const closing = new FakeForge();
+    closing.getMergeRequest = tooLarge.getMergeRequest;
+    assert.equal(await reconcileCompletion(staleArgs(closing, true)), "unconfirmed");
+    assert.equal(closing.writes.length, 0);
+  });
+});
+
+// ── closingRemains (amended D10, M1) ──────────────────────────────────────────────────────────
+
+describe("publisher: closingRemains on a non-closing issue publication", () => {
+  const nonClosing = (over: Partial<PublicationSpec> = {}) =>
+    makeSpec({ interlockIssueIid: IID, completionCloses: false, completion: (st) => completion(false, st), ...over });
+
+  it("an adopted closing body whose rewrite fails: closingRemains", async () => {
+    const r = rig();
+    r.forge.pr.description = `${[REGION_START, SIZE_LINE, REGION_END].join("\n")}\n\n${completion(true)}`;
+    r.forge.failWrite = true;
+    const pub = await r.publisher.prepare(nonClosing(), { headSha: H1, targetBranch: "main" });
+    const out = await pub.publish(MR);
+    assert.equal(out.wrote, false);
+    assert.equal(out.closingRemains, true);
+  });
+
+  it("a human `Closes #7` whose rewrite is written but cannot be re-read: closingRemains (unconfirmed)", async () => {
+    const r = rig();
+    r.forge.pr.description = `Closes #7\n\n${[REGION_START, SIZE_LINE, REGION_END].join("\n")}\n\n${completion(false)}`;
+    r.forge.failRead = (n) => n === 3;
+    const pub = await r.publisher.prepare(nonClosing(), { headSha: H1, targetBranch: "main" });
+    const out = await pub.publish(MR);
+    assert.equal(out.wrote, true);
+    assert.equal(out.closingRemains, true);
+  });
+
+  it("a confirmed rewrite clears it; a closing publication never reports it", async () => {
+    const r = rig();
+    r.forge.pr.description = `Closes #7\n\n${completion(true)}`;
+    const pub = await r.publisher.prepare(nonClosing(), { headSha: H1, targetBranch: "main" });
+    assert.equal((await pub.publish(MR)).closingRemains, false);
+    const c = rig();
+    c.forge.pr.description = `Closes #7\n\n${completion(true)}`;
+    c.forge.failWrite = true;
+    const closing = await c.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    assert.equal((await closing.publish(MR)).closingRemains, false);
+  });
+
+  it("an over-cap read (ForgeResponseTooLarge) is an unreadable PR: nothing is written, nothing observed", async () => {
+    const r = rig();
+    r.forge.getMergeRequest = async () => {
+      throw new ForgeResponseTooLarge(MR_DETAIL_MAX_BYTES);
+    };
+    const pub = await r.publisher.prepare(nonClosing(), { headSha: H1, targetBranch: "main" });
+    const out = await pub.publish(MR);
+    assert.equal(out.wrote, false);
+    assert.equal(r.forge.writes.length, 0);
+    assert.equal(out.closingRemains, false);
+    assert.deepEqual(api.acks(), []);
+  });
+});
+
+// ── A stale claim stops the publication (Low L1) ──────────────────────────────────────────────
+
+describe("publisher: a stale_claim / run_terminal 409 stops every further region write", () => {
+  for (const [op, reason] of [
+    ["stage", "stale_claim"],
+    ["stage", "run_terminal"],
+    ["bind", "stale_claim"],
+    ["bind", "run_terminal"],
+    ["lookup", "run_terminal"],
+  ] as const) {
+    it(`${op} answers 409 ${reason}: nothing is written and no further api call is made`, async () => {
+      const r = rig();
+      // A body the publication would otherwise rewrite (a legacy body is rewritten whole; deciding
+      // that reaches the lookup route).
+      r.forge.pr.description = "Legacy body";
+      api.failNext(op, 409, reason);
+      const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+      const before = api.calls.length;
+      const out = await pub.publish(MR);
+      assert.equal(r.forge.writes.length, 0, "no forge write");
+      assert.equal(out.wrote, false);
+      const after = api.calls.slice(before).map((c) => c.op);
+      const stoppedAt = api.calls.findIndex((c) => c.op === op);
+      assert.equal(api.calls.length - 1, stoppedAt, `no api call after the 409 (${after.join(",")})`);
+      assert.deepEqual(api.acks(), []);
+    });
+  }
+
+  it("an ack answered 409 stale_claim stops too: no restage, no later ack, no write", async () => {
+    const r = rig();
+    r.forge.pr.description = "Legacy body";
+    // The head moves between read 1 and read 2: the bound version is acked skipped_snapshot_moved,
+    // which the api refuses as stale; without the stop, the publication would restage and write.
+    r.forge.beforeRead = (n, pr) => {
+      if (n === 2) pr.head = H2;
+    };
+    api.failNext("ack", 409, "stale_claim");
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    await pub.publish(MR);
+    assert.deepEqual(api.acks(), ["skipped_snapshot_moved"]);
+    assert.equal(stages().length, 1, "no restage after the stop");
+    assert.equal(r.forge.writes.length, 0);
+  });
+});
+
+// ── One time budget (Timing) ──────────────────────────────────────────────────────────────────
+
+describe("publisher: one overall time budget", () => {
+  it("the head-lag wait honours the abort signal", async () => {
+    const forge = new FakeForge();
+    forge.pr.head = H2; // read 1 lags the landed head, so the publisher waits before re-reading
+    const publisher = new PrDescriptionPublisher({ forge, api: client, pass: null, log: nullLogger(), emit: () => {}, headLagRetryMs: 60_000 });
+    const abort = new AbortController();
+    const pub = await publisher.prepare(makeSpec({ signal: abort.signal }), { headSha: H1, targetBranch: "main" });
+    const started = Date.now();
+    setTimeout(() => abort.abort(), 20);
+    const out = await pub.publish(MR);
+    assert.ok(Date.now() - started < 5_000, "the 60 s wait ended with the signal");
+    assert.equal(out.wrote, false);
+    assert.equal(forge.reads, 1, "no re-read after the abort");
+  });
+
+  it("the forge share of the budget bounds a publication whose forge never answers", async () => {
+    const forge = new FakeForge();
+    forge.getMergeRequest = (_u?: string, _p?: string, _i?: number, signal?: AbortSignal) =>
+      new Promise<MergeRequestDetail>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new ForgeError(0, "aborted")), { once: true });
+      });
+    const publisher = new PrDescriptionPublisher({ forge, api: client, pass: null, log: nullLogger(), emit: () => {}, forgeBudgetMs: 50 });
+    const pub = await publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    const started = Date.now();
+    const out = await pub.publish(MR);
+    assert.ok(Date.now() - started < 5_000, "the budget ended the hung read");
+    assert.equal(out.wrote, false);
+  });
+
+  it("the budget covers the editor pass's deadline plus the forge share", async () => {
+    let seen: AbortSignal | undefined;
+    const forge = new FakeForge();
+    const inner = forge.getMergeRequest.bind(forge);
+    forge.getMergeRequest = (_u?: string, _p?: string, _i?: number, signal?: AbortSignal) => {
+      seen = signal;
+      return inner();
+    };
+    const pass = new FakePass(SUMMARY);
+    pass.deliverySummaryDeadline = () => Date.now() + 200;
+    const publisher = new PrDescriptionPublisher({ forge, api: client, pass, log: nullLogger(), emit: () => {}, sleep: async () => {}, headLagRetryMs: 0, forgeBudgetMs: 100 });
+    const pub = await publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    forge.pr.description = pub.initialBody(completion(true));
+    await pub.publish(MR);
+    assert.ok(seen && !seen.aborted, "the forge calls ride the budgeted signal");
+    await new Promise((r) => setTimeout(r, 450));
+    assert.ok(seen.aborted, "the budget (pass 200 ms + forge 100 ms) has expired");
   });
 });
 

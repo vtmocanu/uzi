@@ -23,11 +23,11 @@ import {
   type OwnedBlocks,
 } from "../src/pr-description.js";
 import type { ClaimConfig, ClaimResponse, PrDescriptionStageRequest, RawPrDescriptionFields, RunKind } from "../src/protocol.js";
-import { mrDescription } from "../src/runner.js";
+import { mrCompletionBlock } from "../src/runner.js";
 import { makeClaim, nullLogger } from "./helpers.js";
 
 // PRD #1798 M6a: the pure renderer of uzi's two owned PR-description blocks (pr-description.ts) and
-// mrDescription on top of it.
+// mrCompletionBlock on top of it (a new PR's body is renderBody(region, mrCompletionBlock(...))).
 
 const ZW = "\u200B";
 const HEAD = "e4020cc0123456789abcdef0123456789abcdef0";
@@ -388,7 +388,7 @@ describe("renderCompletionBlock (D10, D12, D14)", () => {
   });
 });
 
-describe("mrDescription over the renderer: every PR-producing kind renders", () => {
+describe("mrCompletionBlock over the renderer: every PR-producing kind renders", () => {
   const kinds: Array<[RunKind, Partial<ClaimResponse>, RegExp]> = [
     ["issue", { issue_iid: 7 }, /Related to #7\.\n\nCloses #7/],
     [
@@ -404,10 +404,10 @@ describe("mrDescription over the renderer: every PR-producing kind renders", () 
   for (const [kind, over, line] of kinds) {
     it(kind, () => {
       const claim = makeClaim({ kind, issue_title: "T", ...over } as Partial<ClaimResponse>);
-      const body = mrDescription(claim, "the/branch", undefined, undefined, undefined, undefined, undefined, undefined, true, undefined, false, SIZE, {
-        headSha: HEAD,
-        targetBranch: "main",
-      });
+      const body = renderBody(
+        renderRegion({ sizeLine: SIZE, headSha: HEAD, targetBranch: "main" }).text,
+        mrCompletionBlock(claim, "the/branch"),
+      );
       const p = parseOwnedBlocks(body);
       assert.equal(p.kind, "ok", body);
       const b = p as OwnedBlocks;
@@ -427,7 +427,7 @@ describe("mrDescription over the renderer: every PR-producing kind renders", () 
   it("the agents line is one short line without the agent list; kind sections render after it", () => {
     const claim = makeClaim({ kind: "self_improve", issue_iid: 77 });
     const section = [{ fixed: "" }, { fixed: "---" }, { fixed: "### Self-improvement run" }, { fixed: "" }, { fixed: "evidence" }];
-    const body = mrDescription(claim, "b", { source: "repo", agents: ["lead", "coder"] }, section);
+    const body = mrCompletionBlock(claim, "b", { source: "repo", agents: ["lead", "coder"] }, section);
     assert.ok(body.includes("Internally reviewed by the repository's own agents, not uzi's built-in reviewer."));
     assert.ok(!body.includes("coder"));
     assert.ok(body.includes("reviewer.\n\n---\n### Self-improvement run\n\nevidence\n\n---\nOpened by uzi"), body);
@@ -435,7 +435,7 @@ describe("mrDescription over the renderer: every PR-producing kind renders", () 
 
   it("the banner passed through opts renders inside the completion block", () => {
     const claim = makeClaim({ issue_iid: 7 });
-    const body = mrDescription(claim, "b", undefined, undefined, undefined, undefined, undefined, undefined, false, undefined, false, undefined, { banner: "> ⚠️ **Completion unverified.** x" });
+    const body = mrCompletionBlock(claim, "b", undefined, undefined, undefined, undefined, undefined, undefined, false, undefined, false, { banner: "> ⚠️ **Completion unverified.** x" });
     assert.ok(body.startsWith(`${COMPLETION_START}\n> ⚠️ **Completion unverified.** x\n\nRelated to #7.`), body);
   });
 });

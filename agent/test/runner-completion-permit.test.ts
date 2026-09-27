@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { nullLogger } from "./helpers.js";
 import { parseOwnedBlocks } from "../src/pr-description.js";
+import { FakePrDescApi } from "./fake-pr-desc-api.js";
 import { StubExecutor } from "../src/executor.js";
 import type { StateRequest } from "../src/protocol.js";
 import {
@@ -250,7 +251,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     assert.strictEqual(api.completionHoldRequests.length, 0, "a transient outage is not a hold");
   });
 
-  it("granted + head matches H but the add-Closes reconcile FAILS → MR holds (no Closes), never completes", async () => {
+  it("granted + head matches H but the add-Closes reconcile FAILS → strips Closes first; the strip fails too, so it fails CLOSED, never completes (ADR 1225)", async () => {
     const { gitlab, calls, all } = fakeGitlab({ head: H, putStatus: 404 });
     const claim = interlockedClaim(1306);
     api.setCompletionPermitResponse(true);
@@ -265,23 +266,36 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     assert.ok(all.some((c) => c.method === "GET"), "the PR head was read to verify it");
     assert.ok(calls.some((c) => c.method === "PUT"), "the add-Closes reconcile was attempted");
     assert.ok(!statuses(claim.run_id).includes("completed"), "a failed add-Closes never completes");
-    assert.ok(!statuses(claim.run_id).includes("failed"), "it holds rather than fails");
-    assert.strictEqual(api.completionHoldRequests.length, 1, "it enters the completion hold");
+    // PRD #1798 M6 (ADR 1225): an add that may have landed is never held as-is: the hold strips
+    // Closes first, and a strip that cannot be written (the same 404) cannot prove the MR is
+    // non-closing, so the run fails closed instead of holding.
+    assert.ok(calls.filter((c) => c.method === "PUT").length >= 2, "the strip was attempted after the failed add");
+    assert.strictEqual(api.completionHoldRequests.length, 0, "never holds a possibly-closing MR");
+    assert.ok(statuses(claim.run_id).includes("failed"), "fails closed");
   });
 
   it("head matches at verify but CHANGES before the post-add re-verify → strips Closes and holds (bind to verified head, CodeRabbit !1254)", async () => {
     // The verify read answers H so the add proceeds; the add-Closes write moves the head to OTHER, so the
     // post-add re-verify reads OTHER, modelling a head change in the read→add window. Closes must not be
     // left on the changed head.
-    const { gitlab, calls, all } = fakeGitlab({
-      head: H,
-      onWrite: (pr, description) => {
-        if (/Closes #1307/.test(description)) pr.head = OTHER;
+    // PRD #1798 M6: run WITH the description api (the production configuration), on the REAL landed
+    // head, so the publisher stages, binds and publishes a version and the completion block carries a
+    // described SHA (the staleness line a moved head changes).
+    const prApi = new FakePrDescApi();
+    api.prDescription = prApi;
+    const { gitlab, calls, all, pr } = fakeGitlab({
+      onWrite: (p, description) => {
+        if (/Closes #1307/.test(description)) p.head = OTHER;
       },
     });
+    const tip = git.trackingTip.bind(git);
+    git.trackingTip = (async (bare: string, branch: string) => {
+      const h = await tip(bare, branch);
+      if (h && pr.head !== OTHER) pr.head = h;
+      return h;
+    }) as typeof git.trackingTip;
     const claim = interlockedClaim(1307);
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
 
     await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
       recoveryRetryMs: 1,
@@ -301,6 +315,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     const reconciled = mrPutBody(calls);
     assert.doesNotMatch(String(reconciled.description), /Closes #/, "the held MR no longer carries Closes after the head change");
     assert.match(String(reconciled.description), /Completion unverified/, "the held MR body warns the completion is unverified");
+    assert.deepStrictEqual(prApi.acks(), ["published"], "the publisher really published a version");
   });
 
   it("PR head != H AND the non-closing strip write FAILS → fails CLOSED (never holds a possibly-closing MR, CodeRabbit !1254)", async () => {

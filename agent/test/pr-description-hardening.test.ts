@@ -20,7 +20,7 @@ import {
 } from "../src/pr-description.js";
 import { RUN_KINDS, type ClaimConfig, type ClaimResponse, type RawPrDescriptionFields, type RunKind } from "../src/protocol.js";
 import { RUN_KIND_PROFILES, resolveRunKind } from "../src/run-kind.js";
-import { mrDescription } from "../src/runner.js";
+import { mrCompletionBlock } from "../src/runner.js";
 import { guardCriticalMrSection, selfImproveMrSection } from "../src/self-improve.js";
 import { makeClaim, nullLogger } from "./helpers.js";
 
@@ -54,8 +54,8 @@ function rawHtml(body: string): RegExpMatchArray | null {
 }
 
 /**
- * The completion block mrDescription writes for `claim` on `branch`, built from the render path
- * (renderCompletionBlock with mrDescription's own inputs and defaults), never parsed out of a body.
+ * The completion block mrCompletionBlock writes for `claim` on `branch`, built from the render path
+ * (renderCompletionBlock with mrCompletionBlock's own inputs and defaults), never parsed out of a body.
  *
  * WARNING: closingDirectiveOutsideCompletion's `expectedCompletion` must always come from a render
  * like this one. Never pass parseOwnedBlocks(body).completion (text read back from the body under
@@ -102,10 +102,11 @@ describe("kind sections: agent-chosen paths are inert (H1)", () => {
         const sec = section(["agent/src/guardrails.ts", payload]);
         const claim = makeClaim({ issue_title: "T", ...over } as Partial<ClaimResponse>);
         const args = [claim, "the/branch", undefined] as const;
-        const body =
+        const completion =
           kind === "prompt"
-            ? mrDescription(...args, undefined, sec, undefined, undefined, undefined, true, undefined, false, SIZE)
-            : mrDescription(...args, sec, undefined, undefined, undefined, undefined, true, undefined, false, SIZE);
+            ? mrCompletionBlock(...args, undefined, sec, undefined, undefined, undefined, true, undefined, false)
+            : mrCompletionBlock(...args, sec, undefined, undefined, undefined, undefined, true, undefined, false);
+        const body = renderBody(renderRegion({ sizeLine: SIZE }).text, completion);
         assert.deepEqual(quickActions(body), [], body);
         for (const iid of [7, 77]) assert.equal(closingDirectiveFor(body, iid), false, body);
         assert.doesNotMatch(body, LIVE_MENTION, body);
@@ -229,7 +230,7 @@ describe("closingDirectiveFor decodes entities in code spans too; the interlock 
     const human = `Some notes.\n\n${block}\n\nMore notes.`;
     assert.equal(closingDirectiveOutsideCompletion(human, 7, block, "o/r"), false, human);
     const taskClaim = makeClaim({ kind: "task", issue_iid: null, branch: "uzi/task/x", base_branch: HIDDEN_BRANCH } as Partial<ClaimResponse>);
-    const task = mrDescription(taskClaim, HIDDEN_BRANCH);
+    const task = mrCompletionBlock(taskClaim, HIDDEN_BRANCH);
     const taskBlock = renderedCompletion(taskClaim, HIDDEN_BRANCH);
     assert.equal((parseOwnedBlocks(task) as OwnedBlocks).completion, taskBlock, task);
     assert.equal(closingDirectiveOutsideCompletion(task, 7, taskBlock, "o/r"), false, task);
@@ -296,13 +297,13 @@ describe("closingDirectiveFor decodes entities in code spans too; the interlock 
       issue_title: "T",
       pipeline: { id: 5, ref: "main", sha: "a".repeat(40), web_url: HIDDEN_URL, failed_jobs: [] },
     } as Partial<ClaimResponse>);
-    const body = mrDescription(ciClaim, "ci-fix/pipeline-5");
+    const body = mrCompletionBlock(ciClaim, "ci-fix/pipeline-5");
     assert.ok(body.includes(`: \`${HIDDEN_URL}\`\n`), body);
     const ciBlock = renderedCompletion(ciClaim, "ci-fix/pipeline-5");
     assert.equal((parseOwnedBlocks(body) as OwnedBlocks).completion, ciBlock, body);
     assert.equal(closingDirectiveOutsideCompletion(body, 7, ciBlock, "o/r"), false, body);
     const line = (url: string) =>
-      mrDescription(makeClaim({ kind: "ci_fix", pipeline: { id: 5, ref: "main", sha: "a".repeat(40), web_url: url, failed_jobs: [] } } as Partial<ClaimResponse>), "b");
+      mrCompletionBlock(makeClaim({ kind: "ci_fix", pipeline: { id: 5, ref: "main", sha: "a".repeat(40), web_url: url, failed_jobs: [] } } as Partial<ClaimResponse>), "b");
     for (const url of ["https://x/a?b=1&amp;c=2", "https://x/&lt;", "https://x/a&num;7", "https://x/a&ampx"]) {
       assert.ok(line(url).includes(`: \`${url}\`\n`), url);
     }
@@ -1020,24 +1021,26 @@ describe("round trip: the renderer's own output always parses ok", () => {
                   `render ${label} iid=${issueIid}`,
                 );
               }
-              const body = mrDescription(
-                claim,
-                hostile,
-                closes ? { source: "repo", agents: ["a"] } : undefined,
-                section,
-                section,
-                scopeCapped ? [hostile] : undefined,
-                !!scopeCapped,
-                scopeCapped,
-                closes,
-                completionScope,
-                !closes,
-                SIZE,
-                banner ? { headSha: HEAD, targetBranch: hostile, banner, staleness: { describedSha: "1".repeat(40), headSha: HEAD } } : undefined,
+              const body = renderBody(
+                renderRegion({ sizeLine: SIZE, headSha: banner ? HEAD : undefined, targetBranch: banner ? hostile : undefined }).text,
+                mrCompletionBlock(
+                  claim,
+                  hostile,
+                  closes ? { source: "repo", agents: ["a"] } : undefined,
+                  section,
+                  section,
+                  scopeCapped ? [hostile] : undefined,
+                  !!scopeCapped,
+                  scopeCapped,
+                  closes,
+                  completionScope,
+                  !closes,
+                  banner ? { banner, staleness: { describedSha: "1".repeat(40), headSha: HEAD } } : undefined,
+                ),
               );
               const p = parseOwnedBlocks(body);
               assert.equal(p.kind, "ok", body);
-              check((p as OwnedBlocks).completion!, `mrDescription ${label}`);
+              check((p as OwnedBlocks).completion!, `mrCompletionBlock ${label}`);
             }
           }
         }
@@ -1087,25 +1090,25 @@ describe("round trip: the renderer's own output always parses ok", () => {
           });
           const bodies = [
             renderBody(region, completion),
-            mrDescription(
-              claim,
-              hostile,
-              { source: "repo", agents: ["a"] },
-              section,
-              section,
-              [hostile],
-              true,
-              undefined,
-              true,
-              completionScope,
-              true,
-              SIZE,
-              {
-                headSha: HEAD,
-                targetBranch: hostile,
-                banner: "> ⚠️ **Completion unverified.** x",
-                staleness: { describedSha: "1".repeat(40), headSha: HEAD },
-              },
+            renderBody(
+              renderRegion({ sizeLine: SIZE, headSha: HEAD, targetBranch: hostile }).text,
+              mrCompletionBlock(
+                claim,
+                hostile,
+                { source: "repo", agents: ["a"] },
+                section,
+                section,
+                [hostile],
+                true,
+                undefined,
+                true,
+                completionScope,
+                true,
+                {
+                  banner: "> ⚠️ **Completion unverified.** x",
+                  staleness: { describedSha: "1".repeat(40), headSha: HEAD },
+                },
+              ),
             ),
           ];
           for (const body of bodies) {
@@ -1150,7 +1153,7 @@ describe("round trip: the renderer's own output always parses ok", () => {
 
 describe("ci_fix pipeline URL (NB-2)", () => {
   const bodyFor = (url: string) =>
-    mrDescription(
+    mrCompletionBlock(
       makeClaim({
         kind: "ci_fix",
         issue_title: "T",

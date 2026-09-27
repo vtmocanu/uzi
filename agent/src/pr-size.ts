@@ -340,25 +340,11 @@ export interface ComputedSize {
 }
 
 /**
- * PRD #1798 M1 — the size line for the landed `headSha` against `targetBranch`. Returns null only for
- * an empty diff; any failure (merge-base, numstat, attribute lookup, or a numstat path absent from the
- * attribute lookup's result) is logged at warn and renders
- * {@link SIZE_UNAVAILABLE}. Never throws: the size line never fails a run.
- */
-export async function computeSizeLine(
-  git: SizeLineGit,
-  barePath: string,
-  targetBranch: string,
-  headSha: string | null,
-  log?: Pick<Logger, "warn">,
-): Promise<string | null> {
-  return (await computeSize(git, barePath, targetBranch, headSha, log)).line;
-}
-
-/**
- * PRD #1798 D9 — {@link computeSizeLine}'s line plus the structured size the stage request carries,
- * both from one git read and one bucketing. Same failure contract: never throws; any failure is
- * logged at warn and yields `{ line: SIZE_UNAVAILABLE, size: unavailable }`.
+ * PRD #1798 M1 / D9 — the size line for the landed `headSha` against `targetBranch` (null only for an
+ * empty diff) plus the structured size the stage request carries, both from one git read and one
+ * bucketing. Never throws: any failure (merge-base, numstat, attribute lookup, or a numstat path
+ * absent from the attribute lookup's result) is logged at warn and yields
+ * `{ line: SIZE_UNAVAILABLE, size: unavailable }`, so the size line never fails a run.
  */
 export async function computeSize(
   git: SizeLineGit,

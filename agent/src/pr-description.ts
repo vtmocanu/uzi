@@ -811,9 +811,17 @@ export function closingDirectiveFor(body: string, issueIid: number, repoPath?: s
  * (an HTML block) ends the paragraph; the joined scan reads a construct that spans the removal. The
  * joined scan may join a keyword before the block to a reference after it, which the forge would not
  * read as one directive: a conservative false positive, and acceptable.
+ *
+ * `parsed`, when given, MUST be parseOwnedBlocks(body) (a caller that already parsed this exact body
+ * passes it so the body is parsed once); it is never a parse of another text.
  */
-export function closingDirectiveOutsideCompletion(body: string, issueIid: number, expectedCompletion: string, repoPath?: string): boolean {
-  const parsed = parseOwnedBlocks(body);
+export function closingDirectiveOutsideCompletion(
+  body: string,
+  issueIid: number,
+  expectedCompletion: string,
+  repoPath?: string,
+  parsed: ParsedBody = parseOwnedBlocks(body),
+): boolean {
   if (parsed.kind !== "ok" || parsed.completion === undefined || toLf(parsed.completion) !== toLf(expectedCompletion)) {
     return closingDirectiveFor(body, issueIid, repoPath);
   }
@@ -1015,11 +1023,10 @@ function wrapRegion(parts: string[]): string {
 
 /**
  * The region with no fields: the size line and the provenance line, each only when known. When the
- * caller passes no head or target (mrDescription at MR creation today) the region is the size line
- * ALONE, with no provenance line: bodies created now carry exactly
- * `REGION_START + "\n" + sizeLine + "\n" + REGION_END`. That shape is uzi's own deterministic region
- * (no model text, nothing to verify against a head), and the publisher (next unit) must treat it as
- * such, not as a human-edited or foreign region.
+ * caller passes no head or target the region is the size line ALONE, with no provenance line
+ * (`REGION_START + "\n" + sizeLine + "\n" + REGION_END`), the shape bodies created before the
+ * publisher carry. That shape is uzi's own deterministic region (no model text, nothing to verify
+ * against a head), and the publisher treats it as such, not as a human-edited or foreign region.
  */
 function deterministicRegion(input: RegionInput): string {
   const parts: string[] = [];
@@ -1290,8 +1297,8 @@ function neutraliseMarkers(s: string): string {
 }
 
 /**
- * Render the completion block. Its content keeps today's wording and meaning (mrDescription before
- * PRD #1798), inside the markers: the banner, then either the kind's one-liner (D14) with its
+ * Render the completion block. Its content keeps the MR body's wording and meaning from before
+ * PRD #1798 (runner.ts mrCompletionBlock is its caller), inside the markers: the banner, then either the kind's one-liner (D14) with its
  * sections or the issue arm (Related / Closes / partial / accepted / gates), then the agents line,
  * the bridge sentence, the staleness line and the footer.
  */

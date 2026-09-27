@@ -112,10 +112,6 @@ export interface FakePr {
 export interface FakeForgeOpts {
   head?: string;
   headStatus?: number;
-  /** PRD #1225 (CodeRabbit !1254): per-GET head sequence. When set, the Nth single-item GET answers
-   *  `heads[N]` (falling back to `head` once exhausted). Absent ⇒ every GET answers the PR's head.
-   *  The publisher reads the PR too, so prefer `onWrite` to model a head change at a given write. */
-  heads?: string[];
   /** Status for the body-rewrite PUT/PATCH (default 200); a non-2xx makes updateMergeRequestDescription throw a ForgeError (the add-Closes reconcile failure). */
   putStatus?: number;
   /** PRD #1798 M6: the PR's target branch (default "main"). */
@@ -124,7 +120,8 @@ export interface FakeForgeOpts {
    *  (which a real forge answers with the existing PR) leaves it unchanged. */
   existing?: string;
   /** PRD #1798 M6: called after each successful body write with the fake PR (already updated), so a
-   *  test can move the head or edit the description at a given write. */
+   *  test can move the head or edit the description at a given write (or, by changing `headStatus`
+   *  on the options object it passed, make later reads fail). */
   onWrite?: (pr: FakePr, description: string) => void;
 }
 
@@ -137,13 +134,6 @@ export interface FakeForge {
   reads: MrCall[];
   all: MrCall[];
   pr: FakePr;
-}
-
-/** The SHA the Nth single-item GET answers: `heads[n]` when a sequence is set and in range, else the
- *  PR's current head. Shared by the three driver fakes so the head-change model is identical. */
-function headForGet(opts: FakeForgeOpts, pr: FakePr, n: number): string {
-  if (opts.heads && n < opts.heads.length) return opts.heads[n]!;
-  return pr.head;
 }
 
 /** The shared transport of the three driver fakes: `detail` renders the GET body, `created` the
@@ -164,7 +154,7 @@ function fakeTransport(
     if (init.method === "GET") {
       reads.push(call);
       const status = opts.headStatus ?? 200;
-      return { status, text: async () => JSON.stringify(detail(pr, headForGet(opts, pr, reads.length - 1))) };
+      return { status, text: async () => JSON.stringify(detail(pr, pr.head)) };
     }
     calls.push(call);
     // PRD #1225 (CodeRabbit !1254): the interlock reconcile rewrites the MR body (GitLab PUT,

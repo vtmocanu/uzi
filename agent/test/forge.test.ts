@@ -5,6 +5,8 @@ import {
   ForgejoClient,
   GitHubClient,
   ForgeError,
+  ForgeResponseTooLarge,
+  MR_DETAIL_MAX_BYTES,
   forgeClientFor,
   gitlabBaseUrl,
   gitlabProjectPath,
@@ -806,6 +808,81 @@ for (const d of drivers) {
     });
   });
 }
+
+// PRD #1798 M6 (H1): the detail read is byte-capped. A real fetch Response streams its `body`; the
+// read stops at the cap and cancels the stream, so a hostile 64 MiB answer is never buffered.
+describe("getMergeRequest — the byte-capped detail read (H1)", () => {
+  const MiB = 1_048_576;
+  /** A 64 MiB body served lazily in 1 MiB chunks, counting what the reader actually pulled. */
+  function huge(): { body: ReadableStream<Uint8Array>; pulled: () => number; cancelled: () => boolean } {
+    let pulled = 0;
+    let cancelled = false;
+    const chunk = new Uint8Array(MiB).fill(0x61);
+    const body = new ReadableStream<Uint8Array>({
+      pull(ctl) {
+        if (pulled >= 64 * MiB) return ctl.close();
+        pulled += chunk.byteLength;
+        ctl.enqueue(chunk);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    return { body, pulled: () => pulled, cancelled: () => cancelled };
+  }
+
+  it("a 64 MiB streamed answer is refused with ForgeResponseTooLarge after reading about the cap, and the stream is cancelled", async () => {
+    const h = huge();
+    let textCalled = false;
+    const fetchFn: FetchFn = async () => ({
+      status: 200,
+      body: h.body,
+      text: async () => {
+        textCalled = true;
+        return "";
+      },
+    });
+    await assert.rejects(new GitLabClient({ fetchFn }).getMergeRequest(base.repoUrl, PAT, 42), (err: unknown) => {
+      assert.ok(err instanceof ForgeResponseTooLarge, String(err));
+      assert.ok(err instanceof ForgeError);
+      assert.strictEqual(err.status, 0);
+      assert.match(err.message, /response too large/);
+      return true;
+    });
+    assert.strictEqual(textCalled, false, "the whole body is never buffered through text()");
+    assert.ok(h.pulled() <= MR_DETAIL_MAX_BYTES + 2 * MiB, `pulled ${h.pulled()} bytes`);
+    assert.ok(h.cancelled(), "the rest of the stream is cancelled");
+    assert.strictEqual(MR_DETAIL_MAX_BYTES, 4 * MiB + 64 * 1024);
+  });
+
+  it("a streamed answer under the cap parses exactly as text() does (a real Response)", async () => {
+    const fixture = { sha: MR_HEAD, target_branch: "release/2.x", description: "Ünïcödé 🎉 body", state: "opened" };
+    const fetchFn: FetchFn = async () => new Response(JSON.stringify(fixture), { status: 200 });
+    const mr = await new GitLabClient({ fetchFn }).getMergeRequest(base.repoUrl, PAT, 42);
+    assert.deepStrictEqual(mr, { headSha: MR_HEAD, targetBranch: "release/2.x", description: "Ünïcödé 🎉 body", state: "open" });
+  });
+
+  it("a transport without a streaming body (text() only) is still refused over the cap", async () => {
+    const big = JSON.stringify({ sha: MR_HEAD, target_branch: "main", description: "x".repeat(MR_DETAIL_MAX_BYTES), state: "opened" });
+    const fetchFn: FetchFn = async () => ({ status: 200, text: async () => big });
+    await assert.rejects(new GitLabClient({ fetchFn }).getMergeRequest(base.repoUrl, PAT, 42), (err: unknown) => err instanceof ForgeResponseTooLarge);
+  });
+
+  it("an error answer's body is read only to a small cap before the message is cut", async () => {
+    for (const status of [404, 503]) {
+      const h = huge();
+      const fetchFn: FetchFn = async () => ({ status, body: h.body, text: async () => "" });
+      await assert.rejects(new GitLabClient({ fetchFn }).getMergeRequest(base.repoUrl, PAT, 42), (err: unknown) => {
+        assert.ok(err instanceof ForgeError && !(err instanceof ForgeResponseTooLarge), String(err));
+        assert.strictEqual(err.status, status);
+        assert.ok(err.detail.length <= 512);
+        return true;
+      });
+      assert.ok(h.pulled() <= 2 * MiB, `pulled ${h.pulled()} bytes for a ${status}`);
+      assert.ok(h.cancelled());
+    }
+  });
+});
 
 describe("getMergeRequest state mapping (recorded closed/merged/locked shapes)", () => {
   const read = async (client: (f: FetchFn) => GitLabClient | ForgejoClient | GitHubClient, repoUrl: string, payload: unknown) => {
