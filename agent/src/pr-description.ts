@@ -386,6 +386,15 @@ export function closingDirectiveFor(body: string, issueIid: number, repoPath?: s
   if (rendered !== body) for (const v of closingViews(rendered)) views.add(v.text);
   for (const text of views) {
     let runs: Int32Array | undefined;
+    // The positions a reference-list continuation (NEXT_REF_RE) has already been tried at in this
+    // view. A continuation's outcome depends only on where it starts, and a walk that found a
+    // resolving reference has already returned, so a walk that reaches a visited position would only
+    // repeat a walk that found nothing and stops there. Without this, a list built of keyword+
+    // reference items (`Fixes fix#1 fix#1 …`) is re-walked from every inner keyword: quadratic.
+    // Skipping a keyword that starts inside an already-walked list would NOT be equivalent: `fix#7`
+    // is a path reference (`fix`, which may not be this repo) to the outer walk, but its own keyword
+    // then reads a bare `#7`; here that inner keyword's first reference is still tried.
+    const tried = new Uint8Array(text.length + 1);
     for (const kw of text.matchAll(KEYWORD_RE)) {
       const end = kw.index + kw[0].length;
       // A keyword glued to `.` / `-` (`fix-fix-…`) can only be followed by a path reference that
@@ -401,7 +410,10 @@ export function closingDirectiveFor(body: string, issueIid: number, repoPath?: s
       while (m) {
         if (refResolves(m, issueIid, repoPath)) return true;
         // Follow a GitLab reference list from where this reference ended (sticky regexes).
-        NEXT_REF_RE.lastIndex = re.lastIndex;
+        const next = re.lastIndex;
+        if (tried[next]) break;
+        tried[next] = 1;
+        NEXT_REF_RE.lastIndex = next;
         re = NEXT_REF_RE;
         m = re.exec(text);
       }
@@ -708,12 +720,15 @@ const BRIDGE_SENTENCE =
 export type KindSectionLine =
   | { fixed: string }
   | { path: string }
-  | { check: { name: string; status: "passed" | "failed" | "skipped"; detail: string } };
+  | { check: { name: string; status: CheckStatus; detail: string } };
+
+/** A self_improve check's outcome (self-improve.ts's CheckResult uses this one definition). */
+export type CheckStatus = "passed" | "failed" | "skipped";
 
 /** A kind section: its lines in order. An empty section renders nothing. */
 export type KindSection = readonly KindSectionLine[];
 
-function checkEmoji(status: "passed" | "failed" | "skipped"): string {
+function checkEmoji(status: CheckStatus): string {
   return status === "passed" ? "✅" : status === "failed" ? "❌" : "⚠️";
 }
 
@@ -723,7 +738,7 @@ function checkEmoji(status: "passed" | "failed" | "skipped"): string {
  *  `#` or `-` are the wording's own and are kept. */
 function renderFixedLine(s: string): string {
   let t = flatten(s).replace(/</gu, "&lt;");
-  if (t.startsWith("/")) t = `\${t}`;
+  if (t.startsWith("/")) t = `\\${t}`;
   return breakMentions(breakClosingKeywords(t, "directives"));
 }
 
@@ -893,7 +908,7 @@ export interface OwnedBlocks {
 export type ParsedBody =
   | { kind: "none" }
   | ({ kind: "ok" } & OwnedBlocks)
-  | { kind: "malformed"; reason: "duplicate" | "unbalanced" | "unknown_version" | "oversize" };
+  | { kind: "malformed"; reason: "duplicate" | "unbalanced" | "unknown_version" | "oversize" | "marker_in_code" };
 
 // The head of any uzi block marker, however spelled: detection is lenient so a mangled marker is
 // reported malformed rather than silently ignored; only the exact forms above are accepted. The
@@ -901,14 +916,17 @@ export type ParsedBody =
 // `[^>]*?-->` tail, found with one forward pointer instead of a rescan per candidate).
 const MARKER_HEAD_RE = /<!--[\s\p{Z}]*uzi:(description|completion):(start|end)\b/iuy;
 
-// A fence line (CommonMark: up to 3 spaces of indent, optionally inside `>` quotes, then 3+
-// backticks or tildes). An opener's info string may not hold a backtick when its fence is backticks.
-const FENCE_OPEN_RE = /^((?:[ \t]{0,3}>)*)[ \t]{0,3}(`{3,}|~{3,})([^\n]*)$/u;
-const FENCE_CLOSE_RE = /^(?:[ \t]{0,3}>)*[ \t]{0,3}(`{3,}|~{3,})[ \t]*$/u;
-const QUOTE_PREFIX_RE = /^(?:[ \t]{0,3}>)*/u;
+// A fence line (CommonMark: up to 3 SPACES of indent, optionally inside `>` quotes, then 3+
+// backticks or tildes). A tab is never fence indentation here: CommonMark expands a leading tab to
+// a 4-column stop, so a top-level tab-indented ``` is indented code or paragraph text, not a fence
+// (a fail-closed whole-line marker check in findMarkers covers what this model gets wrong). An opener's info
+// string may not hold a backtick when its fence is backticks.
+const FENCE_OPEN_RE = /^((?: {0,3}>)*) {0,3}(`{3,}|~{3,})([^\n]*)$/u;
+const FENCE_CLOSE_RE = /^(?: {0,3}>)* {0,3}(`{3,}|~{3,})[ \t]*$/u;
+const QUOTE_PREFIX_RE = /^(?: {0,3}>)*/u;
 // A line that ends a paragraph for inline-code purposes: blank (inside quotes too), or the start of
 // an HTML comment block (every uzi marker line is one).
-const PARA_BREAK_RE = /^(?:[ \t]{0,3}>)*(?:[ \t]*$|[ \t]{0,3}<!--)/u;
+const PARA_BREAK_RE = /^(?: {0,3}>)*(?:[ \t]*$| {0,3}<!--)/u;
 
 interface Line {
   start: number;
@@ -1063,16 +1081,44 @@ interface FoundMarker {
   text: string;
 }
 
-/** Every uzi block marker outside code, in order. Linear: each `<!--` is tested once, and the
+const EXACT_MARKERS = [REGION_START, REGION_END, COMPLETION_START, COMPLETION_END];
+
+/** Whether the line at `at` is exactly one of uzi's block markers, as uzi writes it: at column 0,
+ *  alone on its line (a trailing `\r` allowed). */
+function wholeLineMarkerAt(body: string, at: number): boolean {
+  if (at > 0 && body[at - 1] !== "\n") return false;
+  for (const m of EXACT_MARKERS) {
+    if (!body.startsWith(m, at)) continue;
+    const after = at + m.length;
+    if (after === body.length || body[after] === "\n" || body.startsWith("\r\n", after) || (body[after] === "\r" && after + 1 === body.length)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Every uzi block marker outside code, in order, or "marker_in_code" when a detected code range
+ *  holds a whole-line marker (wholeLineMarkerAt). Linear: each `<!--` is tested once, and the
  *  closing `>` is found with a pointer that only moves forward. */
-function findMarkers(body: string): FoundMarker[] {
+function findMarkers(body: string): FoundMarker[] | "marker_in_code" {
   const code = codeRanges(body);
   const found: FoundMarker[] = [];
   let r = 0;
   let gt = -1;
   for (let at = body.indexOf("<!--"); at >= 0; at = body.indexOf("<!--", at + 1)) {
     while (r < code.length && code[r]![1] <= at) r++;
-    if (r < code.length && code[r]![0] <= at) continue;
+    if (r < code.length && code[r]![0] <= at) {
+      // Fail closed. codeRanges approximates CommonMark (no HTML blocks, no lazy continuation, no
+      // list or indented-code context), so it can see code where a forge renders none: `<details>`
+      // then ``` is raw HTML to a forge, not a fence. Human text could then hide uzi's REAL blocks
+      // inside a "fence" here and promote a forged pair written after it. uzi never writes a marker
+      // inside code, so a whole-line marker in a detected code range makes the whole parse
+      // malformed, which the publisher (next unit) is to treat as skipped_malformed: the region is
+      // skipped and the completion block falls back per D10. A marker quoted mid-line (inline code, an indented or `>`-quoted line
+      // in a fence) is still text and still ignored (L2).
+      if (wholeLineMarkerAt(body, at)) return "marker_in_code";
+      continue;
+    }
     MARKER_HEAD_RE.lastIndex = at;
     const head = MARKER_HEAD_RE.exec(body);
     if (!head) continue;
@@ -1093,12 +1139,15 @@ function findMarkers(body: string): FoundMarker[] {
 /** Split `body` around uzi's two owned blocks. `none`: no uzi block marker at all (a legacy PR).
  *  `malformed`: a duplicate marker, an unbalanced or nested pair, a region after the completion
  *  block, a start marker of an unknown version / an inexact spelling, or a body over
- *  FORGE_BODY_MAX_CHARS (`oversize`: no forge returns one, so it is not scanned). Marker-shaped text
- *  inside a fenced code block or an inline code span is text, not a marker (a quoted copy of uzi's
- *  markers in human text neither breaks the parse nor moves the blocks). */
+ *  FORGE_BODY_MAX_CHARS (`oversize`: no forge returns one, so it is not scanned), or one of uzi's
+ *  exact markers alone on a line at column 0 inside a detected code range (`marker_in_code`, fail
+ *  closed: see findMarkers). Other marker-shaped text inside a fenced code block or an inline code
+ *  span is text, not a marker (a copy quoted mid-line or indented neither breaks the parse nor
+ *  moves the blocks). */
 export function parseOwnedBlocks(body: string): ParsedBody {
   if (body.length > FORGE_BODY_MAX_CHARS) return { kind: "malformed", reason: "oversize" };
   const found = findMarkers(body);
+  if (found === "marker_in_code") return { kind: "malformed", reason: "marker_in_code" };
   if (found.length === 0) return { kind: "none" };
   const exact = { description: { start: REGION_START, end: REGION_END }, completion: { start: COMPLETION_START, end: COMPLETION_END } };
   const spans: Partial<Record<"description" | "completion", { start: number; end: number }>> = {};

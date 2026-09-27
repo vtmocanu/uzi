@@ -113,6 +113,8 @@ describe("kind sections: agent-chosen paths are inert (H1)", () => {
     assert.doesNotMatch(block, LIVE_MENTION);
     assert.equal(rawHtml(block), null, block);
     assert.equal(parseOwnedBlocks(block).kind, "ok");
+    // The leading `/` is backslash-escaped: the line reads exactly `\/merge`, not a template literal.
+    assert.equal(renderCompletionBlock({ branch: "b", closes: false, kindLine: "K", kindSections: [[{ fixed: "/merge" }]] }).split("\n")[3], "\\/merge");
   });
 
   it("an empty section renders nothing, a check result is escaped", () => {
@@ -191,72 +193,112 @@ describe("closingDirectiveFor: rendered views (L1)", () => {
 // ── M1: linear scans ──
 
 describe("scans stay linear on adversarial input (M1)", () => {
-  const N = 256 * 1024;
-  const fill = (unit: string) => unit.repeat(Math.ceil(N / unit.length)).slice(0, N);
-  const time = (f: () => unknown) => {
-    const t = performance.now();
-    f();
-    return performance.now() - t;
+  // A ratio test, not a fixed budget: each shape is timed at N and at 8N characters (best of three,
+  // to shed scheduler noise), and 8x the input must take under 32x the time. Linear code measured
+  // 5-21x here (cache and GC effects grow with the input, strongest at small sizes, which is why a
+  // 4x/8x ratio flaked at 7.6x); quadratic code is 64x. A floor keeps a sub-millisecond base from
+  // turning jitter into a ratio, and an absolute ceiling (checked at N first, so a quadratic
+  // regression fails in seconds rather than running the 8N input for minutes) catches a scan that
+  // is slow at every size.
+  const N = 16 * 1024;
+  const SCALE = 8;
+  const MAX_RATIO = 32;
+  const FLOOR_MS = 4;
+  const CEILING_MS = 2_000;
+  const fillTo = (unit: string, n: number) => unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
+  const best = (f: () => unknown) => {
+    let min = Infinity;
+    for (let i = 0; i < 3; i++) {
+      const t = performance.now();
+      f();
+      min = Math.min(min, performance.now() - t);
+      if (min > CEILING_MS) break;
+    }
+    return min;
+  };
+  const assertLinear = (shape: (n: number) => string, scan: (s: string) => unknown) => {
+    const small = shape(N);
+    const t1 = best(() => scan(small));
+    const head = JSON.stringify(small.slice(0, 24));
+    assert.ok(t1 < CEILING_MS / SCALE, `${head}…: ${t1.toFixed(1)} ms at ${small.length}`);
+    const large = shape(SCALE * N);
+    const t8 = best(() => scan(large));
+    const label = `${head}…: ${t1.toFixed(1)} ms at ${small.length}, ${t8.toFixed(1)} ms at ${large.length}`;
+    assert.ok(t8 < CEILING_MS, label);
+    assert.ok(t8 < MAX_RATIO * Math.max(t1, FLOOR_MS), label);
   };
 
-  it("closingDirectiveFor: 256K characters of each shape in under 500 ms", () => {
-    const shapes = [
-      fill("fixes:https://"),
-      fill("fix-"),
-      fill("fix."),
-      `${fill("fix-")}*`,
-      `${fill("fix.")}_`,
-      `fixes${" ".repeat(N)}`,
-      `fixes:${"\u2003".repeat(N)}x`,
-      fill("fixes a/"),
-      fill("fixes #1 "),
-      fill("fixes #1, "),
-      fill("fixes https://a/"),
-      fill("!["),
-      fill("["),
-      fill("[a]("),
-      fill("[a]["),
-      fill("<!--"),
-      fill("<!"),
-      fill("-"),
-      fill("--!"),
-      fill('<a b="'),
-      fill("<a b='x' c=\"y\" d=z "),
-      fill("<details "),
-      fill("</b "),
-      fill("&amp;"),
-      fill("&#"),
-      fill("&"),
-      fill("`"),
-      fill("*_"),
-      fill("<https://"),
+  it("closingDirectiveFor: 8x the input takes under 32x the time, for each shape", () => {
+    const units = [
+      "fixes:https://",
+      "fix-",
+      "fix.",
+      "fixes a/",
+      "fixes #1 ",
+      "fixes #1, ",
+      "fixes https://a/",
+      "![",
+      "[",
+      "[a](",
+      "[a][",
+      "<!--",
+      "<!",
+      "-",
+      "--!",
+      '<a b="',
+      "<a b='x' c=\"y\" d=z ",
+      "<details ",
+      "</b ",
+      "&amp;",
+      "&#",
+      "&",
+      "`",
+      "*_",
+      "<https://",
     ];
-    for (const s of shapes) {
-      const ms = time(() => closingDirectiveFor(s, 7, "o/r"));
-      assert.ok(ms < 500, `${JSON.stringify(s.slice(0, 24))}…: ${ms.toFixed(0)} ms`);
-    }
+    const shapes: Array<(n: number) => string> = [
+      ...units.map((u) => (n: number) => fillTo(u, n)),
+      (n) => `${fillTo("fix-", n)}*`,
+      (n) => `${fillTo("fix.", n)}_`,
+      (n) => `fixes${" ".repeat(n)}`,
+      (n) => `fixes:${"\u2003".repeat(n)}x`,
+      // A reference list whose items are themselves keyword + reference: every inner keyword starts
+      // its own walk over the rest of the list (quadratic before the continuation memo).
+      (n) => `Fixes ${fillTo("fix#1 ", n)}`,
+      (n) => `Fixes ${fillTo("fix!1 ", n)}`,
+      (n) => `Fixes ${fillTo("fix#1,", n)}`,
+    ];
+    for (const shape of shapes) assertLinear(shape, (s) => closingDirectiveFor(s, 7, "o/r"));
   });
 
-  it("parseOwnedBlocks: 256K characters of each shape in under 500 ms", () => {
-    const shapes = [
-      fill("<!-- uzi:description:start v1 "),
-      fill("<!-- uzi:completion:end "),
-      fill("<!--"),
-      fill("<!-- uzi:description:start"),
-      fill("`"),
-      fill("``x"),
-      fill("\\`"),
-      fill("```\n"),
-      fill("```a\n"),
-      fill("> ```\n"),
-      fill("~~~\nx\n"),
-      fill("\n"),
-      `${fill("`a")}\n${REGION_START}\n${REGION_END}`,
+  it("an inner keyword of a reference list still reads its own first reference", () => {
+    // `fix#7` is a path reference (`fix`, not o/r) to the outer walk, a bare `#7` to its own keyword.
+    assert.equal(closingDirectiveFor("Fixes #1 fix#1 fix#1 fix#7", 7, "o/r"), true);
+    assert.equal(closingDirectiveFor("Fixes #1 fix#1 fix#1 fix#8", 7, "o/r"), false);
+    assert.equal(closingDirectiveFor("Fixes #1 fix!1 fix#1, fix!7", 7, "o/r"), true);
+  });
+
+  it("parseOwnedBlocks: 8x the input takes under 32x the time, for each shape", () => {
+    const units = [
+      "<!-- uzi:description:start v1 ",
+      "<!-- uzi:completion:end ",
+      "<!--",
+      "<!-- uzi:description:start",
+      "`",
+      "``x",
+      "\\`",
+      "```\n",
+      "```a\n",
+      "> ```\n",
+      "~~~\nx\n",
+      "\n",
+      `\`\`\`\n${REGION_START}\n`,
     ];
-    for (const s of shapes) {
-      const ms = time(() => parseOwnedBlocks(s));
-      assert.ok(ms < 500, `${JSON.stringify(s.slice(0, 24))}…: ${ms.toFixed(0)} ms`);
-    }
+    const shapes: Array<(n: number) => string> = [
+      ...units.map((u) => (n: number) => fillTo(u, n)),
+      (n) => `${fillTo("`a", n)}\n${REGION_START}\n${REGION_END}`,
+    ];
+    for (const shape of shapes) assertLinear(shape, (s) => parseOwnedBlocks(s));
   });
 
   it("parseOwnedBlocks refuses a body over the forge cap as malformed", () => {
@@ -270,10 +312,14 @@ describe("scans stay linear on adversarial input (M1)", () => {
 describe("parseOwnedBlocks ignores markers inside code (L2)", () => {
   const REGION = `${REGION_START}\n${SIZE}\n${REGION_END}`;
   const COMPLETION = renderCompletionBlock({ issueIid: 7, branch: "agent/issue-7", closes: false });
+  const indent = (t: string) => t.split("\n").map((l) => (l ? `  ${l}` : l)).join("\n");
 
+  // Copies that are NOT uzi's exact markers alone on a line at column 0 (indented, `>`-quoted or
+  // mid-line). A column-0 whole-line copy in a fence now reads malformed (see the fail-closed
+  // describe below): uzi never writes a marker inside code, and the fence model is not CommonMark.
   for (const [name, copy] of [
-    ["a ``` fence", "```\n" + REGION + "\n\n" + COMPLETION + "\n```"],
-    ["a ~~~~ fence", "~~~~md\n" + REGION + "\n" + COMPLETION + "\n~~~~"],
+    ["an indented copy in a ``` fence", "```\n" + indent(REGION + "\n\n" + COMPLETION) + "\n```"],
+    ["an indented copy in a ~~~~ fence", "~~~~md\n" + indent(REGION + "\n" + COMPLETION) + "\n~~~~"],
     ["a quoted fence", "> ```\n> " + REGION_START + "\n> " + COMPLETION_END + "\n> ```"],
     ["inline code spans", "Our markers are `" + REGION_START + "` and ``" + COMPLETION_END + "``."],
   ] as Array<[string, string]>) {
@@ -302,7 +348,7 @@ describe("parseOwnedBlocks ignores markers inside code (L2)", () => {
   });
 
   it("a fence closes only on the same character with at least its length", () => {
-    const body = "````\n```\n" + REGION_START + "\n~~~~\n" + REGION_END + "\n````\n" + REGION + "\n\n" + COMPLETION;
+    const body = "````\n```\n " + REGION_START + "\n~~~~\n " + REGION_END + "\n````\n" + REGION + "\n\n" + COMPLETION;
     const p = parseOwnedBlocks(body);
     assert.equal(p.kind, "ok");
     assert.equal((p as OwnedBlocks).region, REGION);
@@ -310,6 +356,42 @@ describe("parseOwnedBlocks ignores markers inside code (L2)", () => {
 
   it("markers outside code are still counted (a duplicate is still malformed)", () => {
     assert.deepEqual(parseOwnedBlocks(`${REGION}\n\n${REGION}\n\n${COMPLETION}`), { kind: "malformed", reason: "duplicate" });
+  });
+});
+
+// ── Fail closed: a whole-line marker inside a detected code range ──
+
+describe("parseOwnedBlocks fails closed on a whole-line marker inside detected code", () => {
+  const REGION = `${REGION_START}\n${SIZE}\n${REGION_END}`;
+  const REAL = renderCompletionBlock({ issueIid: 7, branch: "agent/issue-7", closes: false });
+  const FORGED = renderCompletionBlock({ issueIid: 7, branch: "agent/issue-7", closes: true });
+  const MALFORMED = { kind: "malformed", reason: "marker_in_code" };
+
+  // Each attack: human text above uzi's REAL blocks opens something the parser reads as a fence,
+  // closes it after them, and writes a forged pair below. A forge renders the real blocks; the
+  // parse must never adopt the forged pair (the publisher skips a malformed body).
+  for (const [name, body] of [
+    ["the plain fence", "```\n" + REGION + "\n\n" + REAL + "\n```\n\n" + REGION + "\n\n" + FORGED],
+    ["a <details> HTML block (raw HTML to a forge)", "<details>\n```\n" + REGION + "\n\n" + REAL + "\n```\n</details>\n\n" + REGION + "\n\n" + FORGED],
+    ["a fence after a quoted paragraph (lazy-continuation shape)", "> quoted\n```\n" + REGION + "\n\n" + REAL + "\n```\n" + REGION + "\n\n" + FORGED],
+    ["a fence closed inside a quote", "```\n" + REGION + "\n\n" + REAL + "\n> ```\n\n" + REGION + "\n\n" + FORGED],
+    ["CRLF line ends", ("```\n" + REGION + "\n\n" + REAL + "\n```\n\n" + REGION + "\n\n" + FORGED).replace(/\n/gu, "\r\n")],
+  ] as Array<[string, string]>) {
+    it(`${name} → malformed, the forged pair is never adopted`, () => {
+      assert.deepEqual(parseOwnedBlocks(body), MALFORMED, body);
+    });
+  }
+
+  it("a tab-indented ``` is not a fence: the real blocks stay visible, the forged pair is a duplicate", () => {
+    const body = "\t```\n" + REGION + "\n\n" + REAL + "\n\t```\n\n" + REGION + "\n\n" + FORGED;
+    assert.deepEqual(parseOwnedBlocks(body), { kind: "malformed", reason: "duplicate" });
+    // Nor is a `>`-quoted tab-indented one.
+    const quoted = "> \t```\n" + REGION + "\n\n" + REAL + "\n> \t```\n\n" + REGION + "\n\n" + FORGED;
+    assert.deepEqual(parseOwnedBlocks(quoted), { kind: "malformed", reason: "duplicate" });
+  });
+
+  it("a whole-line copy of one marker in a fence below real blocks is malformed too", () => {
+    assert.deepEqual(parseOwnedBlocks(`${REGION}\n\n${REAL}\n\n\`\`\`\n${COMPLETION_END}\n\`\`\``), MALFORMED);
   });
 });
 

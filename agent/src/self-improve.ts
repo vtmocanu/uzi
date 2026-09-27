@@ -15,7 +15,7 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { killRunnerGroup, runnerCommand } from "./runner-uid.js";
 import { buildCheckEnv } from "./sdk-env.js";
-import type { KindSection, KindSectionLine } from "./pr-description.js";
+import type { CheckStatus, KindSection, KindSectionLine } from "./pr-description.js";
 
 // Re-exported so the existing importers (runner.ts, the tests) keep one obvious home for
 // the self-improve check vocabulary; sdk-env.ts is the definition.
@@ -116,8 +116,6 @@ export const SELF_IMPROVE_CHECKS: SelfImproveCheck[] = [
   { name: "agent: npm run typecheck", cwd: "agent", command: "npm", args: ["run", "typecheck"], requires: "node_modules" },
   { name: "agent: npm test", cwd: "agent", command: "npm", args: ["test"], requires: "node_modules" },
 ];
-
-export type CheckStatus = "passed" | "failed" | "skipped";
 
 export interface CheckResult {
   name: string;
