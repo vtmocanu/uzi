@@ -421,6 +421,12 @@ func (s *Service) BindPrDescription(ctx context.Context, wkr store.Worker, runID
 		if v.State != prDescStatePending || (v.MrIid.Valid && v.MrIid.Int64 != req.MrIid) {
 			return ErrPrDescriptionVersionConflict
 		}
+		// The recorded hash is immutable: the region it names may already be on the forge with
+		// only its ack lost, and lost-ack recovery and human-edit protection both key on it. An
+		// identical rebind is an idempotent retry; a different region needs a new staged version.
+		if v.RenderedRegionSha256.Valid && v.RenderedRegionSha256.String != req.RenderedRegionSha256 {
+			return ErrPrDescriptionVersionConflict
+		}
 		bound, err := q.BindPrDescriptionVersion(ctx, store.BindPrDescriptionVersionParams{
 			ID: v.ID, RunID: run.ID, MrIid: req.MrIid, RenderedRegionSha256: req.RenderedRegionSha256,
 		})
@@ -493,7 +499,7 @@ func (s *Service) AckPrDescription(ctx context.Context, wkr store.Worker, runID 
 			return ErrPrDescriptionStaleClaim
 		}
 		if v.State != prDescStatePending {
-			if prDescAckAlreadyApplied(v, pr, req) {
+			if prDescAckAlreadyApplied(v, pr, req) || prDescOwnRecoveryAlreadyApplied(v, pr, req) {
 				state, err := prDescState(ctx, q, pr)
 				resp = apitypes.PrDescriptionAckResponse{PR: state}
 				return err
@@ -515,8 +521,26 @@ func (s *Service) AckPrDescription(ctx context.Context, wkr store.Worker, runID 
 			resp.RecoveredVersionID = recovered
 		}
 
+		// The forge already shows THIS version's own region although the worker reports a
+		// non-published outcome (e.g. a write that timed out but landed): the record must name
+		// what is on the forge, so the version is published instead of abandoned, unless a newer
+		// publication supersedes it.
+		outcome := req.Outcome
+		if outcome != PrDescOutcomePublished && req.ObservedRegionSha256 != nil && v.RenderedRegionSha256.Valid &&
+			v.RenderedRegionSha256.String == *req.ObservedRegionSha256 && resp.RecoveredVersionID == nil {
+			own, err := prDescOwnRegionOnForge(ctx, q, pr, v)
+			if err != nil {
+				return err
+			}
+			if own {
+				outcome = PrDescOutcomePublished
+				id := v.ID.String()
+				resp.RecoveredVersionID = &id
+			}
+		}
+
 		var rows int64
-		if req.Outcome == PrDescOutcomePublished {
+		if outcome == PrDescOutcomePublished {
 			if _, err := q.MarkPrDescriptionVersionPublished(ctx, v.ID); err != nil {
 				return err
 			}
@@ -577,8 +601,9 @@ func recoverPrDescLostAck(ctx context.Context, q PrDescQueries, pr store.PrDescr
 		return nil, err
 	}
 	if m.ID == acking.ID {
-		// The forge already shows the acking version's own region (a retried write): the ack
-		// that follows publishes it; there is no other version to recover.
+		// The forge already shows the acking version's own region: there is no OTHER version to
+		// recover. AckPrDescription publishes the acking version itself, even on a non-published
+		// outcome (a write that timed out but landed), so its record matches the forge.
 		return nil, nil
 	}
 	if published != nil && !m.CreatedAt.Time.After(published.CreatedAt.Time) {
@@ -594,6 +619,34 @@ func recoverPrDescLostAck(ctx context.Context, q PrDescQueries, pr store.PrDescr
 	}
 	id := m.ID.String()
 	return &id, nil
+}
+
+// prDescOwnRegionOnForge reports whether the acking version, whose own rendered region the forge
+// shows, should be recorded as published: not when the currently published version already
+// rendered the same region (the record is already accurate) or is newer than it (a later
+// publication superseded this text; the forge showing it again is a human restore or a
+// duplicate rendering).
+func prDescOwnRegionOnForge(ctx context.Context, q PrDescQueries, pr store.PrDescription, v store.PrDescriptionVersion) (bool, error) {
+	if !pr.PublishedVersionID.Valid {
+		return true, nil
+	}
+	pv, err := q.GetPrDescriptionVersionByID(ctx, uuid.UUID(pr.PublishedVersionID.Bytes))
+	if err != nil {
+		return false, err
+	}
+	if pv.RenderedRegionSha256.Valid && pv.RenderedRegionSha256.String == v.RenderedRegionSha256.String {
+		return false, nil
+	}
+	return v.CreatedAt.Time.After(pv.CreatedAt.Time), nil
+}
+
+// prDescOwnRecoveryAlreadyApplied reports whether a non-published ack is a retry of one that
+// published its own version because the forge showed that version's region (see AckPrDescription).
+func prDescOwnRecoveryAlreadyApplied(v store.PrDescriptionVersion, pr store.PrDescription, req apitypes.PrDescriptionAckRequest) bool {
+	return req.Outcome != PrDescOutcomePublished && req.ObservedRegionSha256 != nil &&
+		v.RenderedRegionSha256.Valid && v.RenderedRegionSha256.String == *req.ObservedRegionSha256 &&
+		pr.LockVersion == req.ExpectedLockVersion+1 && v.State == prDescStatePublished &&
+		pr.PublishedVersionID.Valid && uuid.UUID(pr.PublishedVersionID.Bytes) == v.ID
 }
 
 // prDescAckAlreadyApplied reports whether an ack for a non-pending version is a retry of the ack

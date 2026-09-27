@@ -552,3 +552,78 @@ func TestPrDescriptionStageCapAcrossGenerationsLiveDB(t *testing.T) {
 		t.Fatalf("stage at the per-run backstop err = %v", err)
 	}
 }
+
+// TestPrDescriptionBoundHashImmutableLiveDB: once bound, a version's rendered hash may already be
+// on the forge with only its ack lost, so a rebind with the same hash is an idempotent retry and a
+// rebind with a different hash is refused (a different region needs a new staged version).
+func TestPrDescriptionBoundHashImmutableLiveDB(t *testing.T) {
+	p := setupPrDescLive(t)
+	v := p.stage(t, 1, "Bound once.", nil)
+	p.bind(t, 1, v.ID, 9, prDescLiveHashA)
+	if r := p.bind(t, 1, v.ID, 9, prDescLiveHashA); r.Version.RenderedRegionSha256 == nil || *r.Version.RenderedRegionSha256 != prDescLiveHashA {
+		t.Fatalf("identical rebind = %+v", r.Version)
+	}
+	_, err := p.svc.BindPrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionBindRequest{
+		ClaimGeneration: gen(1), VersionID: v.ID, MrIid: 9, RenderedRegionSha256: prDescLiveHashB,
+	})
+	if !errors.Is(err, ErrPrDescriptionVersionConflict) {
+		t.Fatalf("rebind with a different hash: err = %v, want version conflict", err)
+	}
+	var hash string
+	if err := p.env.pool.QueryRow(p.env.ctx, `SELECT rendered_region_sha256 FROM pr_description_versions WHERE id = $1`, v.ID).Scan(&hash); err != nil || hash != prDescLiveHashA {
+		t.Fatalf("stored hash = %q, %v; want the original", hash, err)
+	}
+	// The lost-ack path still finds it by the original hash.
+	look, err := p.svc.LookupPrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionLookupRequest{
+		ClaimGeneration: gen(1), MrIid: 9, RegionSha256: prDescLiveHashA,
+	})
+	if err != nil || look.Match != "pending" || look.MatchedVersionID == nil || *look.MatchedVersionID != v.ID {
+		t.Fatalf("lookup by original hash = %+v, %v", look, err)
+	}
+}
+
+// TestPrDescriptionOwnRegionOnForgePublishesLiveDB: an ack reporting a non-published outcome while
+// the forge shows the acking version's OWN region (a write that timed out but landed) publishes
+// that version instead of abandoning it, so the record names what is on the forge; a retry of
+// that ack is idempotent. An own region older than the current publication is not resurrected.
+func TestPrDescriptionOwnRegionOnForgePublishesLiveDB(t *testing.T) {
+	p := setupPrDescLive(t)
+	v := p.stage(t, 1, "Write timed out but landed.", nil)
+	p.bind(t, 1, v.ID, 11, prDescLiveHashA)
+	observed := prDescLiveHashA
+	a, err := p.ack(1, v.ID, "write_failed", 0, &observed)
+	if err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	if a.RecoveredVersionID == nil || *a.RecoveredVersionID != v.ID ||
+		a.PR.PublishedVersion == nil || a.PR.PublishedVersion.ID != v.ID || a.PR.LockVersion != 1 {
+		t.Fatalf("own-region ack = %+v", a)
+	}
+	if st := p.dbVersionState(t, v.ID); st != "published" {
+		t.Fatalf("version state = %q, want published", st)
+	}
+	if pub, lock, outcome := p.dbPR(t, 11); pub == nil || pub.String() != v.ID || lock != 1 || outcome == nil || *outcome != "published" {
+		t.Fatalf("pr row = %v %d %v", pub, lock, outcome)
+	}
+	// A retry of the same ack (lost response) is idempotent.
+	if r, err := p.ack(1, v.ID, "write_failed", 0, &observed); err != nil || r.PR.PublishedVersion == nil || r.PR.PublishedVersion.ID != v.ID || r.PR.LockVersion != 1 {
+		t.Fatalf("retry = %+v, %v", r, err)
+	}
+
+	// A newer version publishes; an OLDER pending version whose region reappears is not resurrected.
+	old := p.stage(t, 1, "Older, never acked.", gen(11))
+	p.bind(t, 1, old.ID, 11, prDescLiveHashB)
+	newer := p.stage(t, 1, "Newer.", gen(11))
+	p.bind(t, 1, newer.ID, 11, prDescLiveHashC)
+	if _, err := p.ack(1, newer.ID, "published", 1, nil); err != nil {
+		t.Fatalf("publish newer: %v", err)
+	}
+	observed = prDescLiveHashB
+	a, err = p.ack(1, old.ID, "skipped_human_edit", 2, &observed)
+	if err != nil || a.RecoveredVersionID != nil || a.PR.PublishedVersion == nil || a.PR.PublishedVersion.ID != newer.ID {
+		t.Fatalf("older own region = %+v, %v", a, err)
+	}
+	if st := p.dbVersionState(t, old.ID); st != "abandoned" {
+		t.Fatalf("older version state = %q, want abandoned", st)
+	}
+}

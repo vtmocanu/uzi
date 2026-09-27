@@ -41,6 +41,7 @@ UPDATE pr_description_versions
 SET mr_iid = $1::bigint, rendered_region_sha256 = $2::text
 WHERE id = $3 AND run_id = $4 AND state = 'pending'
   AND (mr_iid IS NULL OR mr_iid = $1::bigint)
+  AND (rendered_region_sha256 IS NULL OR rendered_region_sha256 = $2::text)
 RETURNING id, run_id, claim_generation, repo_id, mr_iid, fields, size, base_sha, head_sha, target_branch, source, rendered_region_sha256, state, created_at, published_at
 `
 
@@ -52,8 +53,10 @@ type BindPrDescriptionVersionParams struct {
 }
 
 // Bind a pending version to its PR and record the hash of the exact region text the renderer
-// will write. Only a pending version binds; an mr_iid already set must match (the service
-// checks that before calling, this guard is the backstop).
+// will write. Only a pending version binds; an mr_iid already set must match, and a hash
+// already recorded is immutable (an identical rebind is an idempotent retry; a different region
+// needs a new staged version, since the recorded hash may already be on the forge with only its
+// ack lost). The service checks both before calling; these guards are the backstop.
 func (q *Queries) BindPrDescriptionVersion(ctx context.Context, arg BindPrDescriptionVersionParams) (PrDescriptionVersion, error) {
 	row := q.db.QueryRow(ctx, bindPrDescriptionVersion,
 		arg.MrIid,

@@ -21,12 +21,15 @@ SELECT * FROM pr_description_versions WHERE id = @id AND run_id = @run_id FOR UP
 
 -- name: BindPrDescriptionVersion :one
 -- Bind a pending version to its PR and record the hash of the exact region text the renderer
--- will write. Only a pending version binds; an mr_iid already set must match (the service
--- checks that before calling, this guard is the backstop).
+-- will write. Only a pending version binds; an mr_iid already set must match, and a hash
+-- already recorded is immutable (an identical rebind is an idempotent retry; a different region
+-- needs a new staged version, since the recorded hash may already be on the forge with only its
+-- ack lost). The service checks both before calling; these guards are the backstop.
 UPDATE pr_description_versions
 SET mr_iid = @mr_iid::bigint, rendered_region_sha256 = @rendered_region_sha256::text
 WHERE id = @id AND run_id = @run_id AND state = 'pending'
   AND (mr_iid IS NULL OR mr_iid = @mr_iid::bigint)
+  AND (rendered_region_sha256 IS NULL OR rendered_region_sha256 = @rendered_region_sha256::text)
 RETURNING *;
 
 -- name: EnsurePrDescription :exec
