@@ -65,8 +65,10 @@ function dubiousLine(text: string): string {
  * `spawnBoundaryProcess`'s `worker_pat` ordering relies on), and a fresh `worker_pat` boundary
  * action still succeeds — proof the registry was left usable, not wedged by the prior case.
  *
- * A fourth check proves the guard itself is INTACT: while a model `command` root is live, a
- * `worker_pat` `spawnBoundaryProcess` is refused with "command roots live".
+ * A fourth section is an OBSERVATION, not an assertion: it tries to hold a model `command`
+ * root live while a `worker_pat` `spawnBoundaryProcess` runs (which the guard would refuse with
+ * "command roots live"), and logs what happened. The boundary reaps that root before the
+ * action runs, so the refusal is not reachable through the public API (see the body).
  */
 async function runFinalizeImportPart(
   gitMod: Record<string, any>,

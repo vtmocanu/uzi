@@ -4782,9 +4782,11 @@ export class GitCache {
    * returns the child and its stdout so the caller can pipe/drain it.
    *
    * On a nonzero exit (or a spawn error) the RETURNED stdout stream is DESTROYED with an Error
-   * (issue #1769: the caller-owned stream, see {@link callerOwnedStdout}), so a consumer streaming
-   * it (the publish upload) sees the failure and the caller's best-effort
-   * `.catch` fires rather than a truncated pack landing silently.
+   * (issue #1769: the caller-owned stream, see {@link callerOwnedStdout}). That error reaches a
+   * reader that has not yet consumed the stream to EOF; a reader that already saw 'end' before
+   * the exit was observed does not see it, and must also check `exited` to know the output was
+   * complete. {@link ensureRunnerCloneObjects} does; `checkpointPack`'s upload path does not, and
+   * relies instead on the server validating the pack it receives.
    *
    * `exited` (issue #1769) settles with the exit code once the child has terminated — inside a
    * boundary only after its supervisor root has reaped — and NEVER rejects: a spawn error, a

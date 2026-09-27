@@ -133,6 +133,10 @@ case "$action" in
       fi
     fi
     # INT/TERM: exit with the matching status; the EXIT trap then removes the container.
+    # bash runs these traps only after the foreground `timeout ... docker run` returns, so a
+    # signal sent to this script's PID alone waits up to CODEX_GIT_TRUST_TIMEOUT plus the
+    # kill grace before cleanup starts. A process-group signal (Ctrl-C) also reaches
+    # docker run directly, which then returns promptly.
     trap on_exit EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM

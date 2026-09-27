@@ -615,8 +615,9 @@ export function composePushSecretBlockedReason(
  *
  * `stage` (issue #1769) names where the realign stopped. `"align"` (the default, byte-identical
  * to the pre-#1769 text) is the merge/rebase path above. `"import"` means uzi could not even
- * import the updated default branch's objects into a self-contained (Codex) runner clone, so no
- * merge or rebase was attempted and the reason must not claim one was.
+ * import the default branch's new objects into the runner clone (a self-contained Codex clone, or
+ * the probe that runs for every executor), so no merge or rebase was attempted and the reason
+ * must not claim one was. Its wording is executor-neutral for that reason.
  */
 export function composeBaseAlignConflictReason(
   defaultBranch: string,
@@ -629,8 +630,8 @@ export function composeBaseAlignConflictReason(
   // even the longer withheld tail fits the cap with room for the branch name.
   const why = stage === "import"
     ? ") on .github/workflows files, which uzi's GitHub bot token cannot push while they " +
-      "differ from the default. uzi could not import the updated default branch objects into " +
-      "the self-contained Codex clone, so the run failed without pushing. "
+      "differ from the default. uzi could not import the default branch's new objects into " +
+      "the runner clone, so the run failed without pushing. "
     : ") on .github/workflows files, which uzi's GitHub bot token cannot push while they " +
       "differ from the default (its scope is `repo`, without `workflow`, by design). uzi tried " +
       "to merge then rebase the current default into the branch to realign those files, but could " +
@@ -4121,8 +4122,9 @@ export class RunRunner {
             // trackingRef, so those are unchanged; in the clobber-safety path (a branch that
             // edited a workflow) originalAgentTip carries that edit, so it is still preserved.
             const defTip = defaultTip;
-            // issue #1769: `stage` "import" is the self-contained (Codex) clone's object import
-            // failing BEFORE any merge/rebase, so its status and reason never claim one ran;
+            // issue #1769: `stage` "import" is the runner clone's object import
+            // (ensureRunnerCloneObjects, run for every executor) failing BEFORE any merge/rebase,
+            // so its status and reason never claim one ran;
             // "align" (the default) keeps the merge/rebase texts byte-identical.
             const failBaseAlignConflict = async (stage: "align" | "import" = "align") => {
               const patch = await scanGatedPatch(
@@ -4130,7 +4132,7 @@ export class RunRunner {
                 "finalize_base_align_conflict",
               );
               const what = stage === "import"
-                ? "could not import the updated default branch objects into the self-contained Codex clone, so the branch was not realigned"
+                ? "could not import the default branch's new objects into the runner clone, so the branch was not realigned"
                 : "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded)";
               batcher.emit({
                 kind: "status",

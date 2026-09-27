@@ -1142,7 +1142,7 @@ describe("RunRunner — preserved_patch is attached only after a clean exact-tex
 // (ensureRunnerCloneObjects) before any align strategy anchors it. An import failure happens
 // BEFORE any merge/rebase, so it fails typed with an import-stage reason that never claims one ran.
 describe("RunRunner — finalize base-align in a self-contained clone (issue #1769 m2)", () => {
-  const IMPORT_TEXT = /could not import the updated default branch objects into the self-contained Codex clone/;
+  const IMPORT_TEXT = /could not import the default branch's new objects into the runner clone/;
   const failedFor = (runId: string) =>
     api.states.find((s) => s.runId === runId && s.body.status === "failed")?.body;
   const statusTexts = (runId: string): string[] =>

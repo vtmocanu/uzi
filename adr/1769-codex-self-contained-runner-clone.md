@@ -19,10 +19,11 @@ whose allowlist grants system directories, `/dev`, and the run root (the
 clone) — never the bare the clone was seeded from. A `git` invocation inside
 that sandbox that needs an object the clone only *borrows* fails with
 `unable to open object pack directory … Permission denied`, because the
-alternates path point outside the sandbox's grant. Every Codex run doing any
-non-trivial git operation (log, blame, a diff against an older commit) could
-hit this once its working set touched an object the initial checkout had not
-already copied.
+alternates path point outside the sandbox's grant. A checkout never copies
+borrowed objects into the clone: a `--shared --no-checkout` clone followed by
+a checkout has zero local objects, so every git command in the sandbox that
+reads history or the object store (status, diff, log, commit) fails this way,
+not only an operation that reaches an older commit.
 
 ## Decision
 
@@ -73,8 +74,12 @@ seed's repack did, and the producer side never needs sandbox access to
 anything. The producer (`worker_pat`) is spawned first; the existing guards
 are unchanged under this ordering (worker-PAT admission in
 `codex/safety.ts` already refuses while a model `command` root is live, and
-the consumer registers as a `boundary_action` root, the same class of root
-the seed-time materialization used).
+the consumer registers as a `boundary_action` root of the finalize
+boundary). The two sides are not the same kind of operation: the seed-time
+materialization (`materializeRunnerClone`) refuses to run inside a
+permit-held boundary at all and runs as plain runner-uid git
+(`execScoped`), registering no boundary root, while the finalize import runs
+inside the boundary under its permit.
 
 An import failure fails the run with `fail_origin:
 finalize_base_align_conflict`, with a reason that names the import as what
@@ -123,7 +128,8 @@ sandbox rule to leak.
   relies on the worker-PAT admission guard and the `boundary_action` root
   registration already in place for other finalize operations; this issue
   does not change either guard, only adds a new consumer that must run after
-  the producer under them.
+  the producer under them. The seed-time materialization is outside both: it
+  runs before any boundary, as the runner uid, and registers no root.
 - **Unchanged.** The worker's fetch-back of the agent branch (`file://`+pack,
   the CVE-2022-39253-class boundary already documented in
   `docs/proc-hardening.md`) and the command git-trust restrictions are not
@@ -147,7 +153,11 @@ missing `-v` source on the host, as root. Each bind source is checked to
 exist first, and a missing one is a named usage error (exit 2), never a
 skip (77). The fixture container is removed by a time-bounded
 `docker rm -f` on every exit path (normal, INT, TERM), and its absence is
-then verified by exact name. A removal that cannot be verified turns a pass
+then verified by exact name. An INT or TERM sent only to the script's PID
+does not interrupt the foreground `timeout … docker run`: bash runs the trap
+after that command returns, so cleanup can wait up to
+`CODEX_GIT_TRUST_TIMEOUT` plus the kill grace. A process-group signal (Ctrl-C
+in a terminal) also reaches `docker run` directly, so it returns promptly. A removal that cannot be verified turns a pass
 or a skip into a failure (exit 3), because a backgrounded container that
 outlived an earlier run left root-owned directories in a clone. The image
 build opts in to `--network host` only when
