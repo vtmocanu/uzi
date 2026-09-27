@@ -270,9 +270,16 @@ and namespace from your own kubeconfig; they are deployment-specific, do not har
    committed tip, when its pod still lives. For
    a run still claimed on the worker holding the clone, `scripts/backup-runs.sh RUN` is easiest
    and also saves the uncommitted patch + untracked files separately. By hand (committed
-   history only; add `git -C CLONE diff HEAD` and an untracked tar for WIP):
-   `git --git-dir=/data/runner/SLUG/issue-N/.git bundle create /tmp/r.bundle BRANCH --not
-   origin/main`. `backup-runs.sh` emits a `BARE` capture automatically when the current
+   history only; add `git -C CLONE diff HEAD` and an untracked tar for WIP), pick
+   `CLONE` by IDENTITY: a Docker worker seeds `/data/runner/SLUG/issue-N.attempt-ID`
+   per attempt beside the canonical `issue-N`, keeps older ones, and can leave a
+   newer, empty one. Read `uzi-recovery.BRANCH.clone` and every
+   `uzi-attempts.BRANCH.entry` (last value per `attemptId` wins) from BARE with
+   `git config --get` / `--get-all`; take the dir whose entry has this run's `runId`
+   (journal first, else newest ledger `attemptId`), then confirm it has a `.git` and
+   `git -C CLONE rev-parse --abbrev-ref HEAD` prints BRANCH. Never pick by newest name
+   alone, never a `.uzi-residue-*` or `.uzi-skills-*` dir. Then `git -C CLONE bundle
+   create /tmp/r.bundle BRANCH --not origin/main`. `backup-runs.sh` emits a `BARE` capture automatically when the current
    worker has no clone (cold-reassignment) or the clone is gone. Such a capture preserves
    committed checkpoints only and states that uncommitted WIP is unavailable. By hand, use:
    `git --git-dir=BARE bundle create /tmp/r.bundle
@@ -374,7 +381,8 @@ and falling back to the durable bare tracking ref when no clone survives:
   `$UZI_BACKUP_DIR` (default `/tmp/uzi-backups/<ts>/`): `issue-N.tgz` (git **bundle** of
   commits not on `origin/main` + `uncommitted.patch` + `untracked.tar.gz` + `meta.txt`),
   plus a self-describing status set (`run.json`, `plan.md`, `progress.txt` with milestones
-  DONE vs LEFT, `log-tail.ndjson`). It resolves worker→pod FRESH each call, searches all
+  DONE vs LEFT, `log-tail.ndjson`). It picks the clone (canonical or `.attempt-*`) by
+  the bare's journal/ledger identity plus branch, resolves worker→pod FRESH each call, searches all
   persistent workers when the current pod lost the clone, and falls back to the durable
   runner tracking ref. The result vocabulary is `OK` (live clone + bundle), `PART` (live
   clone, uncommitted/status only), `BARE` (committed history only; no live WIP), and `FAIL`.
