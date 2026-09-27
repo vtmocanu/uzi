@@ -62,9 +62,11 @@ function dubiousLine(text: string): string {
  *   (a) SUCCESS   — a fresh default-branch commit is imported and merged in.
  *   (b) PRODUCER  — a well-formed but bare-absent tip makes `pack-objects` fail.
  *   (c) CONSUMER  — the clone's `.git/objects/pack` is made unwritable, so `index-pack` fails.
- * After each, `producer and consumer reaped` is checked (the import call settled, no live
- * `command`-kind root, and no `pack-objects`/`index-pack` process left in the container; see
- * `proveReaped`), then two invariants: no live `command`-kind root remains (the guard
+ * Before (a), a calibration check proves the process scan can see a sandboxed command-identity
+ * process at all. After each case, `producer and consumer reaped` is a backstop: an OS-level
+ * observation that no git pack process (zombies included) survives the boundary's reap (see
+ * `proveReaped`; git.ts's own teardown is pinned by agent/test/git-import.test.ts), then two
+ * invariants: no live `command`-kind root remains (the guard
  * `spawnBoundaryProcess`'s `worker_pat` ordering relies on), and a fresh `worker_pat` boundary
  * action still succeeds — proof the registry was left usable, not wedged by the prior case.
  *
@@ -126,23 +128,45 @@ async function runFinalizeImportPart(
       `code=${result.code} stdout=${JSON.stringify(result.stdout)}`);
   };
 
-  /** `${tag}: producer and consumer reaped`, asserted from three facts:
-   *  (1) `importSettled`: the `ensureRunnerCloneObjects` call itself returned or threw. That
-   *      method awaits both sides' exit statuses (`Promise.all([piped, producerExit,
-   *      consumerExit])` in agent/src/git.ts, doc comment: "this method returns only once both
-   *      exit statuses have settled"), and inside a boundary each completion includes its
-   *      root's reap.
-   *  (2) the registry reports no live `command`-kind root. `ExecutionRegistry` has no public
-   *      accessor for live roots of EVERY kind (`rootCount()` counts registered roots, reaped
-   *      ones included), so the `boundary_action` roots the import registers are covered by
-   *      (3) instead; no production API was added for this fixture.
-   *  (3) no process whose cmdline names `pack-objects` or `index-pack` is left in the
-   *      container, polled for up to 2s before failing. */
+  // ── CALIBRATION: the process scan can see a command-identity process ────────────────────
+  // The reaped checks below pass on an EMPTY scan, so an empty scan must first be shown to
+  // mean something: a scanner that cannot see runner-cmd's (uid 10003) processes from the
+  // fixture's uid would pass them vacuously. Spawn a uniquely-named sleep through the same
+  // sandboxed command path `sandboxRun` uses, and require the scanner to see it as uid 10003.
+  const calibrationArg = "3.1769";
+  const isCalibrationSleep = (e: ProcEntry): boolean => e.comm === "sleep" && e.cmdline.includes(`sleep ${calibrationArg}`);
+  const calibrationSpawn: Spawn = codex.makeDefaultSpawnCommand(newRegistry(), launcher.launchCodexEffectRoot, 5000, clonePath, scCommandEnv, "required");
+  const calibrationRun = calibrationSpawn(["/bin/sleep", calibrationArg], { cwd: clonePath });
+  calibrationRun.catch(() => undefined); // awaited below; this only keeps a rejection from going unhandled while polling
+  const seenAsCommand = (s: ProcScan): boolean => s.found.some((e) => e.uid === COMMAND_UID);
+  const calibrationScan = await pollProcesses(isCalibrationSleep, 2000, seenAsCommand);
+  const calibrationResult = await calibrationRun.then(
+    (r) => `code=${r.code} stderr=${r.stderr.trim() || "(empty)"}`,
+    (err: unknown) => `threw ${err instanceof Error ? err.message : String(err)}`,
+  );
+  const calibrated = seenAsCommand(calibrationScan);
+  check("FINALIZE-IMPORT: process scan sees a sandboxed command-identity process (calibration)", calibrated,
+    `wanted comm=(sleep) cmdline~"sleep ${calibrationArg}" uid=${COMMAND_UID}; `
+    + `found=${calibrationScan.found.map(formatProc).join("; ") || "(none)"} `
+    + `unreadable=${calibrationScan.unreadable.join("; ") || "(none)"} spawn: ${calibrationResult}`);
+
+  /** `${tag}: producer and consumer reaped` is a BACKSTOP: an OS-level observation, independent
+   *  of the execution registry, that no git pack process (`pack-objects` / `index-pack`, zombies
+   *  included, see {@link isGitPackProcess}) survives the boundary's reap. It is only as good as
+   *  the scan, which is why the calibration check above must pass first, and why an unreadable
+   *  pid fails it instead of counting as gone. git.ts's own teardown (both exit statuses awaited
+   *  before `ensureRunnerCloneObjects` settles) is pinned by agent/test/git-import.test.ts, not
+   *  here. `importSettled` and `hasLiveCommandRoot()` are also required but are corroborating,
+   *  not independent: both are the machinery under test reporting on itself. */
   const proveReaped = async (tag: string, registry: Record<string, any>, importSettled: boolean): Promise<void> => {
     const liveCommand = registry.hasLiveCommandRoot() as boolean;
-    const leftovers = await pollNoGitPackProcesses(2000);
-    check(`${tag}: producer and consumer reaped`, importSettled && !liveCommand && leftovers.length === 0,
-      `importSettled=${importSettled} hasLiveCommandRoot=${liveCommand} leftover=${leftovers.join("; ") || "(none)"}`);
+    const scan = await pollNoGitPackProcesses(2000);
+    check(`${tag}: producer and consumer reaped`,
+      importSettled && !liveCommand && scan.found.length === 0 && scan.unreadable.length === 0,
+      `${calibrated ? "" : "calibration FAILED, so an empty scan proves nothing; "}`
+      + `leftover=${scan.found.map(formatProc).join("; ") || "(none)"} `
+      + `unreadable=${scan.unreadable.join("; ") || "(none)"} `
+      + `(corroborating: importSettled=${importSettled} hasLiveCommandRoot=${liveCommand})`);
   };
 
   // ── (a) SUCCESS ────────────────────────────────────────────────────────────────────────
@@ -312,37 +336,102 @@ function createHashLikeSha(seed: string): string {
   return createHash("sha1").update(seed).digest("hex");
 }
 
-/** Every process in the container (other than this fixture) whose cmdline names `pack-objects`
- *  or `index-pack`, as `pid: cmdline` (NUL separators shown as spaces). A pid that exits
- *  between the readdir and the read (ENOENT, ESRCH) or is unreadable (EACCES) is skipped. */
-async function gitPackProcesses(): Promise<string[]> {
-  const procRoot = "/proc";
-  const found: string[] = [];
-  for (const entry of await fs.readdir(procRoot)) {
-    if (!/^[0-9]+$/.test(entry) || Number(entry) === process.pid) continue;
-    let cmdline: string;
-    try {
-      cmdline = (await fs.readFile(path.join(procRoot, entry, "cmdline"))).toString("utf8").split("\0").join(" ").trim();
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" || code === "ESRCH" || code === "EACCES") continue;
-      throw err;
-    }
-    if (cmdline.includes("pack-objects") || cmdline.includes("index-pack")) found.push(`${entry}: ${cmdline}`);
-  }
-  return found;
+/** One process seen by {@link scanProcesses}: its pid, `comm` (from `stat`, without the
+ *  parentheses), state letter (`Z` = zombie), cmdline (NUL separators shown as spaces; empty for a
+ *  zombie or kernel thread) and real uid (from `status`; `?` when it could not be read). */
+interface ProcEntry { pid: string; comm: string; state: string; cmdline: string; uid: string }
+
+/** A scan's result: the matching processes, plus every pid whose `cmdline` or `stat` could not
+ *  be read for a reason other than the pid having exited. */
+interface ProcScan { found: ProcEntry[]; unreadable: string[] }
+
+const PROC_ROOT = "/proc";
+/** The Codex command identity's uid (runner-cmd). */
+const COMMAND_UID = "10003";
+
+function formatProc(e: ProcEntry): string {
+  return `${e.pid}: state=${e.state} comm=(${e.comm}) uid=${e.uid} cmdline=${e.cmdline || "(empty)"}`;
 }
 
-/** Polls {@link gitPackProcesses} every 100ms until it is empty or `budgetMs` has elapsed, and
- *  returns the last scan (empty on success, the leftover `pid: cmdline` list otherwise). The
- *  poll gives a just-killed process time to be reaped before the check fails. */
-async function pollNoGitPackProcesses(budgetMs: number): Promise<string[]> {
+/** Reads `<procfs>/<pid>/<file>`. Returns `"gone"` when the pid exited between the readdir and
+ *  the read (ENOENT, ESRCH), and `{ error }` for any other failure (EACCES included): an
+ *  unreadable pid is NOT evidence that it is gone, so the caller reports it instead of skipping. */
+async function readProcFile(pid: string, file: string): Promise<string | "gone" | { error: string }> {
+  try {
+    return (await fs.readFile(path.join(PROC_ROOT, pid, file))).toString("utf8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ESRCH") return "gone";
+    return { error: `${pid}: ${file}: ${code ?? String(err)}` };
+  }
+}
+
+/** Every process in the container (other than this fixture) for which `match` holds. Each pid's
+ *  `cmdline` AND `stat` are read, so a zombie (empty cmdline, still in the process table) is seen
+ *  by its `comm` and state. A pid that exited mid-scan (ENOENT, ESRCH) is skipped; one that is
+ *  unreadable (EACCES or any other error) lands in `unreadable`, which callers treat as a failed
+ *  scan rather than as "gone". */
+async function scanProcesses(match: (e: ProcEntry) => boolean): Promise<ProcScan> {
+  const found: ProcEntry[] = [];
+  const unreadable: string[] = [];
+  for (const pid of await fs.readdir(PROC_ROOT)) {
+    if (!/^[0-9]+$/.test(pid) || Number(pid) === process.pid) continue;
+    const cmdlineRaw = await readProcFile(pid, "cmdline");
+    if (cmdlineRaw === "gone") continue;
+    const statRaw = await readProcFile(pid, "stat");
+    if (statRaw === "gone") continue;
+    if (typeof cmdlineRaw !== "string" || typeof statRaw !== "string") {
+      for (const r of [cmdlineRaw, statRaw]) if (typeof r !== "string") unreadable.push(r.error);
+      continue;
+    }
+    // stat is `pid (comm) state ...`; comm may itself contain parentheses, so split on the LAST ")".
+    const open = statRaw.indexOf("(");
+    const close = statRaw.lastIndexOf(")");
+    if (open < 0 || close < open) {
+      unreadable.push(`${pid}: stat: unparseable ${JSON.stringify(statRaw.slice(0, 80))}`);
+      continue;
+    }
+    const entry: ProcEntry = {
+      pid,
+      comm: statRaw.slice(open + 1, close),
+      state: statRaw.slice(close + 1).trim().split(/\s+/)[0] || "?",
+      cmdline: cmdlineRaw.split("\0").join(" ").trim(),
+      uid: "?",
+    };
+    if (!match(entry)) continue;
+    const status = await readProcFile(pid, "status");
+    if (typeof status === "string") entry.uid = /^Uid:\s+(\d+)/m.exec(status)?.[1] ?? "?";
+    found.push(entry);
+  }
+  return { found, unreadable };
+}
+
+/** A git pack process: `comm` is `git` (how `git pack-objects` / `git index-pack` appear, and the
+ *  only trace a zombie leaves, its cmdline being empty) or a dashed `git-*` helper, or the cmdline
+ *  names `pack-objects` / `index-pack`. Present regardless of state: a zombie counts. */
+function isGitPackProcess(e: ProcEntry): boolean {
+  return e.comm === "git" || e.comm.startsWith("git-") || /pack-objects|index-pack/.test(e.cmdline);
+}
+
+/** Polls {@link scanProcesses} every 100ms until `done(scan)` holds or `budgetMs` has elapsed,
+ *  and returns the last scan. */
+async function pollProcesses(
+  match: (e: ProcEntry) => boolean,
+  budgetMs: number,
+  done: (s: ProcScan) => boolean,
+): Promise<ProcScan> {
   const deadline = Date.now() + budgetMs;
   for (;;) {
-    const found = await gitPackProcesses();
-    if (found.length === 0 || Date.now() >= deadline) return found;
+    const scan = await scanProcesses(match);
+    if (done(scan) || Date.now() >= deadline) return scan;
     await sleep(100);
   }
+}
+
+/** Polls until no git pack process (zombies included) AND no unreadable pid remain, for up to
+ *  `budgetMs`, giving a just-killed process time to be reaped before the check fails. */
+async function pollNoGitPackProcesses(budgetMs: number): Promise<ProcScan> {
+  return pollProcesses(isGitPackProcess, budgetMs, (s) => s.found.length === 0 && s.unreadable.length === 0);
 }
 
 /** Drains a packfile stream (checkpointPack's `pack`) to a Buffer for `git index-pack --stdin`. */

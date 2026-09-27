@@ -29,6 +29,8 @@ MIN_CASES=43
 [ -f "$SCRIPT" ] || { echo "run.sh not found at $SCRIPT" >&2; exit 2; }
 [ -r /proc/self/stat ] || { echo "ERROR: needs /proc (Linux only)" >&2; exit 2; }
 timeout --foreground 5s true 2>/dev/null || { echo "ERROR: needs GNU timeout --foreground" >&2; exit 2; }
+env --default-signal=INT,TERM true 2>/dev/null \
+  || { echo "ERROR: needs GNU env --default-signal (coreutils >= 8.31) to reset inherited INT/TERM ignores" >&2; exit 2; }
 
 # Hermetic: no inherited knob may steer run.sh.
 for v in ${!CODEX_GIT_TRUST_@} ${!STUB_@}; do unset "$v"; done
