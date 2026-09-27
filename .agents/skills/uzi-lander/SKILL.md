@@ -72,6 +72,9 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
 A buddy is the peer bound with the `session-peers` skill (`buddy: @NAME`). It is
 this lander's second pair of eyes.
 
+- **Requires the session-peers `buddy` command** (vtmocanu/skills#73 or later,
+  installed). If `peers.py buddy` is an unknown command, say the CLI lacks buddy
+  support, which is not the same as no buddy bound, and ask the user as below.
 - **On entry run `peers.py buddy`.** None bound → ask the user once: name a buddy
   or authorize solo. Without either, keep preparing (poll, review, fix, rebase) but
   stop before the merge and report the missing requirement once.
@@ -82,8 +85,13 @@ this lander's second pair of eyes.
   head; every other required review stays.
 - Prefer a cross-family buddy (Claude with Codex); name a same-family one in the trail.
 - **One request per pushed head.** The buddy reviews the exact head SHA; reuse its
-  verdict until the head moves. For a user-authorized multi-round loop run
-  `peers.py budget allow buddy --replies N` once, not a reset per round.
+  verdict until the head moves. Re-request on the same head only when the findings
+  or evidence change (a new bot finding, a disposition it should concur on).
+- **Longer loops.** With a Claude lander and a Codex buddy, a user-authorized
+  multi-round loop runs `peers.py budget allow buddy --replies N` once, not a reset
+  per round. A correlated `ask`/`dispatch` reply needs no allowance.
+- **Issues you file** (follow-ups, inherited or incidental findings): the buddy
+  reviews the final draft, then add the `reviewed` label. Solo: a local reviewer.
 - The buddy's `APPROVE` is required where this skill says so below. It never
   replaces a user approval.
 
@@ -91,9 +99,11 @@ this lander's second pair of eyes.
 |---|---|
 | Small/mechanical non-Renovate PR | the buddy (the initial local reviewer) |
 | After a local fix | the buddy plus CodeRabbit (Greptile when CR is rate-limited) |
-| Bot rate-limited, skipped or absent | the buddy |
+| CodeRabbit rate-limited | switch to Greptile (step 3); the buddy reviews too |
+| Bot skipped or absent | the buddy |
 | Skill or script maintenance (`[skip-cr]`) | the buddy plus the user |
-| Bot approved this head, no local fix since | none extra |
+| Rebase or renumber only | the buddy's `APPROVE` of the range-diff on the new head, plus green CI; a prior bot approval carries over only when the range-diff changes no reviewed semantics |
+| Bot approved this head, no local fix since | none extra, except large or trust-boundary PRs: the buddy too |
 | Renovate, assessed CI-sufficient | none extra; a Renovate PR assessed as needing review follows the rows above |
 
 ## Entry: the snapshot

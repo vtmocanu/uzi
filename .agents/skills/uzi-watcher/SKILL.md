@@ -32,23 +32,22 @@ Below, a run id is written `RUN` and a PR number `PR` in the example commands.
 
 ## Buddy
 
-A buddy is the peer bound with the `session-peers` skill (`buddy: @NAME`); plan
-steering is done with it.
+Plan steering is done with the buddy bound by `session-peers` (`buddy: @NAME`);
+`peers.py buddy` needs vtmocanu/skills#73+ (unknown command = no CLI support).
 
-- **On entry run `peers.py buddy`.** None bound → ask the user once: name a buddy
-  or authorize solo. Without either, keep dispatching and watching but stop before
-  any approve, revise or reject, and report the missing requirement once.
-- **Bound but unavailable** (not live, no route, or no verdict after two requests)
-  → ask for a replacement or solo authorization. Never downgrade silently.
-- **Solo** (user-authorized) skips the co-sign; the plan-trap checks still apply.
-- Prefer a cross-family buddy (Claude with Codex); name a same-family one to the user.
-- **The buddy co-signs the exact action**: run id, plan seq, the verb (approve,
-  revise or reject) and, for a revise or reject, the final message text. Ask it for
-  `APPROVE`, `REVISE: N items` or `BLOCK: REASON`. Do not re-request a verdict on
-  byte-identical material.
-- Act when both agree. Otherwise take both positions to the user.
-- A decision the user delegates to "you and your buddy" is still bounded by the
-  user's other instructions; the buddy's agreement is never user approval.
+- **None bound** → ask the user once for a buddy or solo authorization; until then
+  dispatch and watch, but stop before any approve, revise or reject. **Bound but
+  unavailable** (not live, no route, or no verdict after two requests) → ask for a
+  replacement or solo. Never downgrade silently. **Solo** skips only the co-sign.
+  Prefer a cross-family buddy (Claude with Codex).
+- **Co-sign the exact action**: run id, plan seq, verb and, for a revise or reject,
+  the final message text. Ask for `APPROVE`, `REVISE: N items` or `BLOCK: REASON`;
+  never re-ask on byte-identical material. Act when both agree; otherwise take both
+  positions to the user. The buddy's agreement is never user approval.
+- **Conditional approve**: on `APPROVE` with exact mechanical deltas, approve, send
+  the deltas verbatim with `uzi run follow-up`, and confirm delivery (`uzi run
+  inputs`) before dependent work. An unresolved `REVISE` still blocks.
+- **Issues you file**: buddy-review the final draft, then label it `reviewed`.
 
 ## The loop, per run
 
