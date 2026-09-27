@@ -3962,7 +3962,7 @@ describe("CodexExecutor — in-process approved plan drives implement (#1586)", 
     const texts = turnTexts(rig.epochs[0]!.transport);
     assert.equal(texts.length, 1);
     // PRD #1798 M2: the raw persisted plan, followed only by the shared pr_summary ask.
-    assert.equal(texts[0], `the approved plan\n\n${PR_SUMMARY_GUIDANCE}`, "the implement prompt is exactly the raw persisted plan");
+    assert.equal(texts[0], `the approved plan\n\n${PR_SUMMARY_GUIDANCE}`, "the implement prompt is the raw persisted plan, unframed, then the pr_summary ask");
     assert.ok(!texts[0]!.includes(APPROVAL_FRAMING), "no approval framing on the pre-approved path");
     assert.ok(!texts[0]!.includes("<approved_plan>"), "no plan fence on the pre-approved path");
   });
@@ -4926,8 +4926,8 @@ describe("CodexExecutor prompts — published-tip note (PRD #1416 M1)", () => {
       assert.ok(!out.includes("Your plan was approved at the gate"), "no framing without a gated plan");
     }
     // PRD #1798 M2: each body is followed only by the shared pr_summary ask.
-    assert.equal(implementPrompt(makeCtx().ctx), `the approved plan\n\n${PR_SUMMARY_GUIDANCE}`, "pre-approved: the raw persisted plan");
-    assert.equal(implementPrompt(makeCtx({ approvedPlan: undefined }).ctx), `Issue #42: do a thing\n\nthe description\n\n${PR_SUMMARY_GUIDANCE}`, "no plan: the issue fallback");
+    assert.equal(implementPrompt(makeCtx().ctx), `the approved plan\n\n${PR_SUMMARY_GUIDANCE}`, "pre-approved: the raw persisted plan, then the pr_summary ask");
+    assert.equal(implementPrompt(makeCtx({ approvedPlan: undefined }).ctx), `Issue #42: do a thing\n\nthe description\n\n${PR_SUMMARY_GUIDANCE}`, "no plan: the issue fallback, then the pr_summary ask");
   });
 });
 
@@ -6727,6 +6727,46 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
       const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1798 omit");
       if (expected === undefined) assert.ok(!("prSummary" in result), JSON.stringify(args));
       else assert.deepEqual(result.prSummary, expected);
+    }
+  });
+
+  it("a later bare signal_done keeps the earlier claims and their original verifiedAtSha", async () => {
+    // The first done declares the claims (stamped at HEAD); the completion interlock sends the lead
+    // back for m2, HEAD moves, and the rework turn ends on a signal_done carrying NO pr_summary.
+    // The claims must survive with the sha they were made at, not be dropped or re-stamped.
+    // Mutation: dropping the `if (result.prSummary !== undefined)` guard re-stamps undefined on the
+    // bare done turn, so the result carries no prSummary and this reddens.
+    const { dir, head } = makeGitRepo();
+    try {
+      const rig = makeMultiEpochRig([
+        script("th-1", [(th, tn) => [done(21, th, tn, { milestones_completed: ["m1"], pr_summary: PR_SUMMARY_INPUT })]]),
+        script("th-1", [(th, tn) => [done(31, th, tn, { milestones_completed: ["m1", "m2"] })]]),
+      ]);
+      let attempts = 0;
+      let moved: string | undefined;
+      const { ctx } = makeCtx({
+        kind: "issue",
+        worktreePath: dir,
+        completionInterlock: true,
+        config: { max_iterations: 5 },
+        frozenMilestones: [{ id: "m1", title: "Alpha" }, { id: "m2", title: "Beta" }],
+        checkpoint: async () => {},
+        recordCompletionAttempt: async () => {
+          if (attempts === 0) {
+            const git = (...args: string[]) =>
+              spawnSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", ...args], { encoding: "utf8" }).stdout;
+            git("commit", "-q", "--allow-empty", "-m", "later");
+            moved = git("rev-parse", "HEAD").trim();
+          }
+          return { unmet: attempts++ === 0 ? ["m2"] : [], attemptCount: attempts };
+        },
+      });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1798 bare later done");
+      assert.equal(attempts, 2, "the rework turn ran and ended on a second done");
+      assert.ok(moved !== undefined && moved !== head, "HEAD moved between the two done turns");
+      assert.deepEqual(result.prSummary, { ...PR_SUMMARY_EXPECTED, verifiedAtSha: head });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
     }
   });
 

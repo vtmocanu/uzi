@@ -91,6 +91,10 @@ describe("displayPrText", () => {
     expect(displayPrText("&#39;q&#39; &quot;d&quot;")).toBe("'q' \"d\"");
     // One pass only: an encoded entity decodes to its literal text, never on to `<`.
     expect(displayPrText("&amp;lt;")).toBe("&lt;");
+    // Left to right, as a CommonMark forge reads it: the lead's `a \< b` is stored as
+    // `a \&lt; b`; the escaped `&` consumes the ampersand, so it reads `a &lt; b`, not `a \< b`.
+    expect(displayPrText("a \\&lt; b")).toBe("a &lt; b");
+    expect(displayPrText("\\&amp;")).toBe("&amp;");
     // A backslash before a non-punctuation character is literal in CommonMark: kept.
     expect(displayPrText("C:\\path")).toBe("C:\\path");
   });
@@ -204,6 +208,42 @@ describe("DeliveredCard", () => {
   });
 });
 
+describe("DeliveredCard with nothing published", () => {
+  const emptyFields = { summary: "", changes: [], scope_notes: [], review_pointers: [], verification: [] };
+
+  it("renders the outcome note alone when the first write failed (no description)", () => {
+    const { container } = render(
+      <DeliveredCard run={run({ pr_description: null, pr_description_outcome: "write_failed" })} />,
+    );
+    expect(container.textContent).toBe("Last PR update failed: the forge did not accept the new description.");
+    expect(screen.queryByRole("region", { name: "Delivered" })).toBeNull();
+    expect(container.querySelector("h3")).toBeNull();
+  });
+
+  it("renders the note alone for an empty description with a skipped outcome", () => {
+    const { container } = render(
+      <DeliveredCard run={run({ pr_description: desc(emptyFields, { size: null }), pr_description_outcome: "skipped_no_region" })} />,
+    );
+    expect(container.textContent).toBe("Last PR update skipped: the description no longer has a uzi section.");
+    expect(container.querySelector("h3")).toBeNull();
+  });
+
+  it("renders nothing, not a bare heading, for an empty description and no note", () => {
+    for (const outcome of [null, "published"]) {
+      const { container } = render(
+        <DeliveredCard run={run({ pr_description: desc(emptyFields, { size: null }), pr_description_outcome: outcome })} />,
+      );
+      expect(container.innerHTML).toBe("");
+      cleanup();
+    }
+  });
+
+  it("renders nothing with no description and no note", () => {
+    const { container } = render(<DeliveredCard run={run({ pr_description: null, pr_description_outcome: null })} />);
+    expect(container.innerHTML).toBe("");
+  });
+});
+
 describe("RunSummary hosts the Delivered section", () => {
   it("shows Delivered even with no intent or plan summary, and collapses with the card", () => {
     render(<RunSummary run={run({ pr_description: desc() })} />);
@@ -217,5 +257,17 @@ describe("RunSummary hosts the Delivered section", () => {
   it("still renders nothing with no summary and no description", () => {
     const { container } = render(<RunSummary run={run({ pr_description: null })} />);
     expect(container.innerHTML).toBe("");
+  });
+
+  it("renders nothing for an empty description with no note (no bare Delivered heading)", () => {
+    const empty = desc({ summary: "", changes: [], scope_notes: [], review_pointers: [], verification: [] }, { size: null });
+    const { container } = render(<RunSummary run={run({ pr_description: empty })} />);
+    expect(container.innerHTML).toBe("");
+  });
+
+  it("shows the outcome note when nothing was ever published", () => {
+    render(<RunSummary run={run({ pr_description: null, pr_description_outcome: "write_failed" })} />);
+    expect(screen.getByText("Last PR update failed: the forge did not accept the new description.")).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Delivered" })).toBeNull();
   });
 });

@@ -62,6 +62,10 @@ func TestDisplayPrText(t *testing.T) {
 		"&amp;lt;":                   "&lt;", // one pass: never on to `<`
 		`C:\path`:                    `C:\path`,
 		`trailing \\`:                `trailing \`,
+		// Left to right, as a CommonMark forge reads it: the lead's `a \< b` is stored as
+		// `a \&lt; b`, whose escaped `&` consumes the ampersand, so it reads `a &lt; b`.
+		`a \&lt; b`: "a &lt; b",
+		`\&amp;`:    "&amp;",
 	} {
 		if got := displayPrText(in); got != want {
 			t.Errorf("displayPrText(%q) = %q, want %q", in, got, want)
@@ -128,11 +132,25 @@ func TestRenderRunDetailPrDescription(t *testing.T) {
 		t.Errorf("a skipped outcome must print its note, got:\n%s", out)
 	}
 
-	// No description: none of the rows, even with an outcome recorded.
-	bare := renderDetail(t, prDescRun(nil, &skipped))
-	for _, unwanted := range []string{"DELIVERED", "SIZE", "PR_UPDATE"} {
+	// Nothing ever published (the first write failed or was skipped): the PR_UPDATE row alone.
+	failed := "write_failed"
+	bare := renderDetail(t, prDescRun(nil, &failed))
+	if !strings.Contains(bare, "PR_UPDATE") || !strings.Contains(bare, "Last PR update failed: the forge did not accept the new description.") {
+		t.Errorf("a run whose first description write failed must print the PR_UPDATE note, got:\n%s", bare)
+	}
+	for _, unwanted := range []string{"DELIVERED", "SIZE"} {
 		if strings.Contains(bare, unwanted) {
 			t.Errorf("a run with no published description must not render %q, got:\n%s", unwanted, bare)
+		}
+	}
+
+	// No description and no outcome (or a published one): none of the rows.
+	for _, o := range []*string{nil, &published} {
+		none := renderDetail(t, prDescRun(nil, o))
+		for _, unwanted := range []string{"DELIVERED", "SIZE", "PR_UPDATE"} {
+			if strings.Contains(none, unwanted) {
+				t.Errorf("a run with no description and no note must not render %q, got:\n%s", unwanted, none)
+			}
 		}
 	}
 

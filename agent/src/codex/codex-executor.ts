@@ -2319,13 +2319,13 @@ export class CodexExecutor implements Executor {
           // A quiet clarification turn does not erase milestone progress.
           if (result.progress) latestProgress = result.progress;
           if (result.milestonesCompleted !== undefined) declaredMilestonesCompleted = result.milestonesCompleted;
-          // PRD #1798 M2: last-wins, and stamped with the worktree HEAD only on the done turn that
+          // PRD #1798 M2: last-wins, and stamped with the worktree HEAD only on the turn that
           // carried the claims, so a later bare signal_done keeps the earlier claims with the sha
-          // they were made at. A HEAD read failure leaves verifiedAtSha absent and never throws.
+          // they were made at. A turn carrying claims is always a done turn: scanSignals (via the
+          // broker) extracts pr_summary only inside the signal_done branch that latches `done`. A
+          // HEAD read failure leaves verifiedAtSha absent and never throws.
           if (result.prSummary !== undefined) {
-            declaredPrSummary = result.done
-              ? await stampPrSummaryHead(result.prSummary, ctx.worktreePath)
-              : result.prSummary;
+            declaredPrSummary = await stampPrSummaryHead(result.prSummary, ctx.worktreePath);
           }
           if (result.done || result.checkpoint) {
             emitIgnoredQuestions(result);
@@ -3341,7 +3341,9 @@ export class CodexExecutor implements Executor {
   /** `gatedPlan` is the plan this run's in-process gate approved (#1586). When present it is
    *  the implementation instruction, framed as approved, and the queue-time issue text is left
    *  out so it cannot compete. Absent ⇒ the pre-approved resume (the raw persisted
-   *  ctx.approvedPlan) or the issue fallback, byte-identical to before. */
+   *  ctx.approvedPlan, unframed) or the issue fallback. Every body is then followed by the shared
+   *  PR_SUMMARY_GUIDANCE paragraph (PRD #1798 M2), preceded by the published-floor note when
+   *  there is one and followed by the milestone tracker note when there is one. */
   private implementPrompt(ctx: RunContext, gatedPlan?: string, milestoneNote = ""): string {
     const approved = ctx.approvedPlan?.trim();
     const head = ctx.issueIid != null ? `Issue #${ctx.issueIid}: ${ctx.issueTitle}` : ctx.issueTitle;

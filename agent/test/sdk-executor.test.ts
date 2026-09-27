@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -5364,6 +5365,48 @@ describe("SdkExecutor signal_done pr_summary (PRD #1798 M2)", () => {
     for (const input of [{}, { pr_summary: "not an object" }, { pr_summary: { what: " " } }]) {
       const result = await runDeclaring(input);
       assert.ok(!("prSummary" in result), JSON.stringify(input));
+    }
+  });
+
+  it("a later bare signal_done keeps the earlier claims and their original verifiedAtSha", async () => {
+    // An interactive run parks on its first done (claims declared, stamped at HEAD), HEAD moves
+    // while it is parked, and the resumed follow-up ends on a signal_done carrying NO pr_summary.
+    // The claims must survive with the sha they were made at, not be dropped or re-stamped.
+    // Mutation: dropping the `if (turn.prSummary !== undefined)` guard re-stamps undefined on the
+    // bare done turn, so the result carries no prSummary and this reddens.
+    const { dir, head } = makeGitRepo();
+    try {
+      const { queryFn, turns } = fakeTurns([
+        [submitPlan("plan"), resultSuccess()],
+        [signalDone("sess-1", { pr_summary: PR_SUMMARY_INPUT }), resultSuccess()],
+        [signalDone("sess-1", {}), resultSuccess()],
+      ]);
+      const outcomes = [
+        { kind: "followup" as const, body: "one more thing" },
+        { kind: "ended" as const, reason: "idle" as const },
+      ];
+      let moved: string | undefined;
+      const probe = makeCtx({
+        agents: [lead, coder],
+        worktreePath: dir,
+        interactive: true,
+        checkpoint: async () => {},
+        awaitFollowUp: async () => {
+          if (moved === undefined) {
+            const git = (...args: string[]) =>
+              execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", ...args], { encoding: "utf8" });
+            git("commit", "-q", "--allow-empty", "-m", "later");
+            moved = git("rev-parse", "HEAD").trim();
+          }
+          return outcomes.shift()!;
+        },
+      });
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.strictEqual(turns.length, 3, "the resumed follow-up turn ran");
+      assert.ok(moved !== undefined && moved !== head, "HEAD moved between the two done turns");
+      assert.deepStrictEqual(result.prSummary, { ...PR_SUMMARY_EXPECTED, verifiedAtSha: head });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 

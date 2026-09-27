@@ -10,14 +10,21 @@
 // and the result is rendered ONLY as React text nodes. Never <Markdown>, never
 // dangerouslySetInnerHTML: once unescaped the text is exactly as hostile as the lead wrote it.
 
+import { useId } from "react";
 import { Badge, type BadgeTone } from "../../components/ui";
 import type { PrDescriptionSize, PrDescriptionSizeBucket, Run, RunPrDescription } from "../../lib/api";
 
-// The five entities an HTML-escaping pass can emit. The sanitizer itself only emits `&lt;`
-// (it decodes every entity to a fixed point before encoding `<`), the rest are decoded so a
-// stored value from any HTML-escaping writer still reads as its characters. One pass, so an
-// `&amp;lt;` decodes to the literal text `&lt;` and never on to `<`.
-const ENTITY = /&(lt|gt|amp|quot|#39|#x27|apos);/g;
+// ONE left-to-right pass over the two encodings the sanitizer applies, as a CommonMark forge
+// reads them:
+//  - a backslash escape (a backslash before an ASCII punctuation character renders as that
+//    character; a backslash before anything else, `C:\path`, is literal and kept), and
+//  - the five entities an HTML-escaping pass can emit. The sanitizer itself only emits `&lt;`
+//    (it decodes every entity to a fixed point before encoding `<`); the rest are decoded so a
+//    stored value from any HTML-escaping writer still reads as its characters.
+// One alternation, not two passes: whatever a match produces is never rescanned, so `&amp;lt;`
+// reads `&lt;` (never `<`), and the sanitizer's `\&lt;` (from the lead's `\<`) reads `&lt;`,
+// the escaped `&` consuming the ampersand exactly as the forge renders it.
+const PR_ENCODING = /\\([!-/:-@[-`{-~])|&(lt|gt|amp|quot|#39|#x27|apos);/g;
 const ENTITY_CHAR: Record<string, string> = {
   lt: "<",
   gt: ">",
@@ -27,12 +34,6 @@ const ENTITY_CHAR: Record<string, string> = {
   "#x27": "'",
   apos: "'",
 };
-
-// A CommonMark backslash escape: a backslash before an ASCII punctuation character renders as
-// that character. The sanitizer's escapes are all of this form (and a trailing odd backslash
-// doubled to `\\`), so resolving them the CommonMark way reads exactly what the forge shows. A
-// backslash before anything else (`C:\path`) is literal in CommonMark too and is kept.
-const MD_ESCAPE = /\\([!-/:-@[-`{-~])/g;
 
 // Cc + Cf except `\n`, `\t` (the safeText rule) AND U+200B: the zero-width space is the
 // sanitizer's own breaker after `@` and inside closing keywords. It is invisible and harmless
@@ -44,8 +45,9 @@ const UNSAFE_EXCEPT_ZWSP = /(?![\n\t\u200B])[\p{Cc}\p{Cf}]/gu;
 export function displayPrText(s: unknown): string {
   if (typeof s !== "string") return "";
   return s
-    .replace(MD_ESCAPE, "$1")
-    .replace(ENTITY, (_, name: string) => ENTITY_CHAR[name] ?? "")
+    .replace(PR_ENCODING, (_, escaped: string | undefined, entity: string | undefined) =>
+      escaped !== undefined ? escaped : (ENTITY_CHAR[entity ?? ""] ?? ""),
+    )
     .replace(UNSAFE_EXCEPT_ZWSP, "")
     .trim();
 }
@@ -111,16 +113,29 @@ function strings(list: unknown): string[] {
 }
 
 const HEADING = "text-xs font-semibold uppercase tracking-wider text-faint";
+const NOTE = "text-xs italic text-faint";
 
-/**
- * The "Delivered" section. Renders nothing when the run has no published description, so a
- * run without a PR (or a server predating the field) is unchanged. Lives inside RunSummary and
- * so shares its per-run collapse.
- */
-export function DeliveredCard({ run }: { run: Run }) {
-  const desc: RunPrDescription | null | undefined = run.pr_description;
-  if (!desc || typeof desc !== "object") return null;
-  const fields = desc.fields ?? ({} as Partial<RunPrDescription["fields"]>);
+interface Delivered {
+  summary: string;
+  changes: string[];
+  pointers: string[];
+  scopeNotes: { kind: string; text: string }[];
+  verification: { command: string; result: string; sha: string }[];
+  sizeLine: string | null;
+  /** The last-write outcome note, or null when there is nothing to say. */
+  note: string | null;
+  /** True when the published description has anything to show under the heading. */
+  hasBody: boolean;
+}
+
+// The display model of the run's Delivered section, or null when it would render nothing: no
+// published description with anything in it AND no outcome note. The api returns
+// `pr_description: null` with a non-published outcome when the FIRST write failed or was
+// skipped (nothing was ever published), which still gets its note.
+function delivered(run: Run): Delivered | null {
+  const desc: RunPrDescription | null | undefined =
+    run.pr_description && typeof run.pr_description === "object" ? run.pr_description : null;
+  const fields: Partial<RunPrDescription["fields"]> = desc?.fields ?? {};
   const summary = displayPrText(fields.summary);
   const changes = strings(fields.changes);
   const pointers = strings(fields.review_pointers);
@@ -134,12 +149,43 @@ export function DeliveredCard({ run }: { run: Run }) {
       sha: displayPrText(v?.verified_at_sha).slice(0, 7),
     }))
     .filter((v) => v.command !== "");
-  const sizeLine = prSizeLine(desc.size);
+  const sizeLine = prSizeLine(desc?.size);
   const note = prDescriptionOutcomeNote(run.pr_description_outcome);
+  const hasBody =
+    summary !== "" ||
+    sizeLine !== null ||
+    changes.length > 0 ||
+    pointers.length > 0 ||
+    scopeNotes.length > 0 ||
+    verification.length > 0;
+  if (!hasBody && note === null) return null;
+  return { summary, changes, pointers, scopeNotes, verification, sizeLine, note, hasBody };
+}
+
+/** Whether the run has a Delivered section to show (RunSummary's gate for rendering at all). */
+export function hasDeliveredSection(run: Run): boolean {
+  return delivered(run) !== null;
+}
+
+/**
+ * The "Delivered" section. Renders nothing when there is neither a published description with
+ * content nor a last-write outcome note, so a run without a PR (or a server predating the field)
+ * is unchanged. When nothing was ever published but the write was skipped or failed, it renders
+ * the outcome note alone, with no heading over an empty section. Lives inside RunSummary and so
+ * shares its per-run collapse.
+ */
+export function DeliveredCard({ run }: { run: Run }) {
+  const headingId = useId();
+  const d = delivered(run);
+  if (!d) return null;
+  if (!d.hasBody) return <p className={NOTE}>{d.note}</p>;
+  const { summary, changes, pointers, scopeNotes, verification, sizeLine, note } = d;
 
   return (
-    <section className="space-y-3" aria-label="Delivered">
-      <h3 className={HEADING}>Delivered</h3>
+    <section className="space-y-3" aria-labelledby={headingId}>
+      <h3 id={headingId} className={HEADING}>
+        Delivered
+      </h3>
       {summary !== "" && <p className="whitespace-pre-wrap text-sm text-fg">{summary}</p>}
       {sizeLine && <p className="font-mono text-xs text-muted">{sizeLine}</p>}
 
@@ -196,7 +242,7 @@ export function DeliveredCard({ run }: { run: Run }) {
         </div>
       )}
 
-      {note && <p className="text-xs italic text-faint">{note}</p>}
+      {note && <p className={NOTE}>{note}</p>}
     </section>
   );
 }

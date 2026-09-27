@@ -2586,14 +2586,14 @@ export class SdkExecutor implements Executor {
         // PRD #929 M2: take the last-wins proposal (like summary), so a proposal declared on
         // the terminating turn reaches the final ExecutorResult after the break below.
         if (turn.proposal !== undefined) declaredProposal = turn.proposal;
-        // PRD #1798 M2: last-wins like proposal. Stamped with the worktree HEAD only on the done
-        // turn that CARRIED the claims, so a later bare signal_done (an interlock rework, an
-        // interactive follow-up) keeps the earlier claims with the sha they were made at. A HEAD
-        // read failure leaves verifiedAtSha absent and never throws.
+        // PRD #1798 M2: last-wins like proposal. Stamped with the worktree HEAD only on the turn
+        // that CARRIED the claims, so a later bare signal_done (an interlock rework, an interactive
+        // follow-up) keeps the earlier claims with the sha they were made at. A turn carrying
+        // claims is always a done turn: scanSignals extracts pr_summary only inside the
+        // signal_done branch that latches `done`. A HEAD read failure leaves verifiedAtSha absent
+        // and never throws.
         if (turn.prSummary !== undefined) {
-          declaredPrSummary = turn.done
-            ? await stampPrSummaryHead(turn.prSummary, ctx.worktreePath)
-            : turn.prSummary;
+          declaredPrSummary = await stampPrSummaryHead(turn.prSummary, ctx.worktreePath);
         }
         // PRD #122 M2: carry this turn's reported progress into the NEXT iteration's
         // `running` report. Only overwrite when the turn reported something, so a quiet

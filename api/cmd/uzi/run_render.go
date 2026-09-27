@@ -1182,18 +1182,18 @@ func summaryRows(r apitypes.RunDTO) [][]string {
 // cellText, the same untrusted-text path as the PRD #362 summary rows: control, bidi and format
 // runes stripped (the sanitizer's U+200B breakers included; a terminal forms no mention or
 // closing directive), newlines and tabs folded, length capped. Nothing is emitted when the run
-// has no published description, so such a run's detail is unchanged.
+// has neither a published description nor a non-published outcome, so such a run's detail is
+// unchanged. When nothing was ever published but the write was skipped or failed (the api
+// returns a nil description with that outcome), the PR_UPDATE row is emitted alone.
 func prDescriptionRows(r apitypes.RunDTO) [][]string {
-	d := r.PrDescription
-	if d == nil {
-		return nil
-	}
 	var rows [][]string
-	if s := cellText(displayPrText(d.Fields.Summary)); s != "" {
-		rows = append(rows, []string{"DELIVERED", s})
-	}
-	if body := prSizeBody(d.Size); body != "" {
-		rows = append(rows, []string{"SIZE", body})
+	if d := r.PrDescription; d != nil {
+		if s := cellText(displayPrText(d.Fields.Summary)); s != "" {
+			rows = append(rows, []string{"DELIVERED", s})
+		}
+		if body := prSizeBody(d.Size); body != "" {
+			rows = append(rows, []string{"SIZE", body})
+		}
 	}
 	if note := prDescriptionOutcomeNote(r.PrDescriptionOutcome); note != "" {
 		rows = append(rows, []string{"PR_UPDATE", cellText(note)})
@@ -1201,21 +1201,27 @@ func prDescriptionRows(r apitypes.RunDTO) [][]string {
 	return rows
 }
 
-// prDescMarkdownEscape is a CommonMark backslash escape (a backslash before ASCII punctuation):
-// every escape the api sanitizer adds has this form, and a backslash before anything else is
-// literal in CommonMark, so it is kept.
-var prDescMarkdownEscape = regexp.MustCompile("\\\\([!-/:-@\\[-`{-~])")
+// prDescEncoding matches, in ONE left-to-right alternation, the two encodings the api sanitizer
+// applies as a CommonMark forge reads them: a backslash escape (a backslash before ASCII
+// punctuation; a backslash before anything else is literal in CommonMark and is kept) or one of
+// the entities an HTML-escaping writer emits (the sanitizer itself only emits `&lt;`). Replaced
+// output is never rescanned, so `&amp;lt;` reads as the literal text `&lt;` (never `<`), and the
+// sanitizer's `\&lt;` (from the lead's `\<`) reads `&lt;`: the escaped `&` consumes the ampersand.
+var prDescEncoding = regexp.MustCompile("\\\\([!-/:-@\\[-`{-~])|&(lt|gt|amp|quot|#39|#x27|apos);")
 
-// prDescEntities decodes, in ONE pass, the entities an HTML-escaping writer emits (the sanitizer
-// itself only emits `&lt;`), so `&amp;lt;` reads as the literal text `&lt;`, never `<`.
-var prDescEntities = strings.NewReplacer("&lt;", "<", "&gt;", ">", "&amp;", "&", "&quot;", `"`, "&#39;", "'", "&#x27;", "'", "&apos;", "'")
+var prDescEntity = map[string]string{"lt": "<", "gt": ">", "amp": "&", "quot": `"`, "#39": "'", "#x27": "'", "apos": "'"}
 
 // displayPrText undoes the forge-markdown encoding the api sanitizer applied to a PR
-// description field (api/internal/workersvc/pr_description_sanitize.go, step 3): backslash
-// escapes resolved, then entities decoded. The result is display text, as hostile as the lead
-// wrote it, and must still go through the untrusted-text path (cellText).
+// description field (api/internal/workersvc/pr_description_sanitize.go, step 3) in one pass. The
+// result is display text, as hostile as the lead wrote it, and must still go through the
+// untrusted-text path (cellText).
 func displayPrText(s string) string {
-	return prDescEntities.Replace(prDescMarkdownEscape.ReplaceAllString(s, "$1"))
+	return prDescEncoding.ReplaceAllStringFunc(s, func(m string) string {
+		if m[0] == '\\' {
+			return m[1:]
+		}
+		return prDescEntity[m[1:len(m)-1]]
+	})
 }
 
 // prSizeBuckets is the size line's bucket order (D3), matching agent/src/pr-size.ts.

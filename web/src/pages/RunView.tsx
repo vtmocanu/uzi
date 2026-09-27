@@ -84,7 +84,7 @@ import { ExternalLinkIcon } from "../components/icons";
 import { gateMismatchMessage, PlanPanel, SeededPlanPanel, type GateMismatch } from "./runView/PlanPanel";
 import { JudgePanel } from "./runView/JudgePanel";
 import { CompletionDecisionPanel } from "./runView/CompletionDecisionPanel";
-import { DeliveredCard } from "./runView/DeliveredCard";
+import { DeliveredCard, hasDeliveredSection } from "./runView/DeliveredCard";
 
 // The Plan cluster moved to ./runView/PlanPanel; re-exported so external importers
 // and tests stay byte-identical.
@@ -733,10 +733,12 @@ const DELTA_KIND: Record<string, { tone: BadgeTone; glyph: string; label: string
  * run will implement"), the plan summary (labelled proposed/approved from run status,
  * Decision 2 — never regenerated), and the plan's deltas from the original ask (Decision 6).
  * PRD #1798 M7 adds the "Delivered" section (runView/DeliveredCard): the run's published PR
- * description, rendered as plain text only, under the same collapse.
+ * description, rendered as plain text only, under the same collapse, or just the last
+ * description-write outcome note when nothing was ever published.
  *
- * Rendered ONLY once a summary exists; until then this returns null and the issue-title
- * header (RunHeading) stands as the fallback (Decision 1's accepted consequence, and the
+ * Rendered ONLY once there is something to show: an intent or plan summary, or a Delivered
+ * section (hasDeliveredSection). Until then this returns null and the issue-title header
+ * (RunHeading) stands as the fallback (Decision 1's accepted consequence, and the
  * seeded/pre-approved intent-only shape of Decision 5). Live update rides the existing
  * useRunStream: M1 emits a run-updated WS frame on summary persist, so refreshRun re-reads
  * the DTO and this re-renders with no code here.
@@ -770,7 +772,8 @@ export function RunSummary({ run }: { run: Run }) {
   const hasIntent = intent !== "";
   const hasPlan = plan !== "";
   // PRD #1798 M7: the published PR description ("Delivered") rides the same card and collapse.
-  const hasDelivered = run.pr_description != null && typeof run.pr_description === "object";
+  // False for a description with nothing in it and no outcome note, so no bare heading shows.
+  const hasDelivered = hasDeliveredSection(run);
 
   // Nothing to show yet — the issue-title header stands (Decision 1/5).
   if (!hasIntent && !hasPlan && !hasDelivered) return null;
