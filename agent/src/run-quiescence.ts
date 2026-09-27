@@ -55,7 +55,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { cloneKeyOf, formatAttemptId, isWithinPath } from "./attempt-path.js";
+import { ATTEMPT_ID_RE, cloneKeyOf, formatAttemptId, isWithinPath } from "./attempt-path.js";
 import { parseDockerTarget } from "./docker-wiring.js";
 import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import type { SdkAttemptEnv } from "./sdk-env.js";
@@ -117,15 +117,23 @@ export interface RunAttempt extends SdkAttemptEnv {
   recordedRootPids: () => RecordedRoot[];
 }
 
-/** Mint a fresh attempt for `runId` running in `clonePath`. */
+/** Mint a fresh attempt id: the attempt's start time, its claim generation, 64 random bits. */
+export function mintAttemptId(claimGeneration: number | undefined, now: Date = new Date()): string {
+  return formatAttemptId(now, claimGeneration, randomBytes(8).toString("hex"));
+}
+
+/** Mint a fresh attempt for `runId` running in `clonePath`. `attemptId` (issue #1783 M2) reuses
+ *  the id a Docker-wired worker already minted to name the attempt's clone path, so the marker,
+ *  the path and the recovery journal all carry one id. */
 export function newRunAttempt(
   runId: string,
   claimGeneration: number | undefined,
   clonePath: string,
   recordedRootPids: () => RecordedRoot[],
   now: Date = new Date(),
+  attemptId: string = mintAttemptId(claimGeneration, now),
 ): RunAttempt {
-  const attemptId = formatAttemptId(now, claimGeneration, randomBytes(8).toString("hex"));
+  if (!ATTEMPT_ID_RE.test(attemptId)) throw new Error("malformed attempt id");
   return {
     runId,
     attemptId,
@@ -147,6 +155,12 @@ export class LiveAttemptRegistry {
 
   remove(marker: string): void {
     this.attempts.delete(marker);
+  }
+
+  /** True when `clonePath` is the clone path of a live attempt (compared resolved). */
+  isLivePath(clonePath: string): boolean {
+    const p = path.resolve(clonePath);
+    return [...this.attempts.values()].some((a) => a.clonePath === p);
   }
 
   /** Every live attempt except the one with `marker`. */

@@ -493,10 +493,14 @@ describe("issue #1783: finalize re-proves after its runner-clone steps, before t
       pushes += 1;
       return origPush(...a);
     }) as typeof git.pushBranch;
+    // A Docker-wired worker (dockerHost set) seeds a per-attempt clone path (issue #1783 M2), so
+    // the kept clone is the one the executor actually ran in, not the canonical path.
+    let clonePath = "";
     const factory: ExecutorFactory = (runId) => ({
       homeDir: path.join(homeDir, runId),
       executor: {
         run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          clonePath = ctx.worktreePath;
           commitWork(ctx.worktreePath);
           // main moves ahead on .github/workflows, so finalize aligns the branch before its push.
           commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "main advances");
@@ -520,7 +524,8 @@ describe("issue #1783: finalize re-proves after its runner-clone steps, before t
     assert.equal(pushes, 0, "no PAT push");
     assert.equal(prCalls.length, 0, "no PR");
     assert.equal(originHasBranch(`agent/issue-${iid}`), false, "nothing reached origin");
-    assert.equal(fs.existsSync(path.join(worktreeDirFor(iid), "WORK.txt")), true, "the clone is kept");
+    assert.notEqual(clonePath, worktreeDirFor(iid), "the wired worker ran in an attempt path");
+    assert.equal(fs.existsSync(path.join(clonePath, "WORK.txt")), true, "the clone is kept");
     const reproof = q.calls.find((c) => c.site === "finalize_align:after_runner_git");
     assert.equal(reproof?.dockerHost, undefined, "the re-proof after the align's plain runner git is process-only");
   });

@@ -2,7 +2,7 @@ import { AsyncResource } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
-import { join } from "node:path";
+import { join, resolve as resolvePath } from "node:path";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
 import type { GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange } from "./git.js";
@@ -21,6 +21,7 @@ import { cloneKeyOf } from "./attempt-path.js";
 import {
   LiveAttemptRegistry,
   describeProcesses,
+  mintAttemptId,
   newRunAttempt,
   quiesceRunAttempt,
   sanitizeForLog,
@@ -105,6 +106,7 @@ import {
   CapturePathMismatchError,
   ForeignCaptureBlockedError,
   PendingRecoveryCaptureError,
+  type AttemptSeedOptions,
   ScratchPublicationError,
 } from "./git.js";
 import {
@@ -986,6 +988,19 @@ interface RunFlight {
   /** issue #1783 (R2): this flight's execution attempt (its marker rides the agent CLI env), in
    *  the runner's live-attempt set from before the CLI spawns until the terminal finally. */
   attempt: RunAttempt | undefined;
+  /** issue #1783 M2: on a Docker-wired worker, the id minted for this execution attempt BEFORE
+   *  its clone is seeded: it names the attempt clone path, the recovery journal entry, the
+   *  attempt ledger entry and the attempt marker alike. Undefined on an unwired worker. */
+  attemptId: string | undefined;
+  /** issue #1783 M2: this flight is capturing a PREDECESSOR attempt's retained clone (the C′
+   *  journal case on a Docker-wired worker): `worktreePath` is the predecessor's path, every
+   *  quiescence proof is a `capture`-mode scan scoped to it, and a verified capture releases it
+   *  IN PLACE (never retired, moved or reused). */
+  predecessorCapture: boolean;
+  /** issue #1783 M2: the predecessor capture VERIFIED (the tracking ref covers its HEAD). Only
+   *  then may the terminal finally release it in place and clear its journal (#1197); a flight
+   *  that ends otherwise (a cancel, a terminal status) leaves journal, ledger and path as found. */
+  predecessorCaptureVerified: boolean;
   /** Issue #1600: the budget off the latest REFUSED wall park's 409, held until the executor
    *  takes it (RunContext.takeWallParkRefresh). */
   wallParkRefresh?: WallParkRefresh;
@@ -1337,6 +1352,11 @@ export class RunRunner {
   private readonly quiesceImpl: (req: QuiesceRunRequest) => Promise<QuiesceRunOutcome>;
   /** issue #1783: the Docker endpoint the teardown half talks to (undefined ⇒ not wired). */
   private readonly dockerHost: string | undefined;
+  /** issue #1783 M2: a Docker-wired worker (the resolved DockerWiring carries a dockerHost) seeds
+   *  every execution attempt at a FRESH `<key>.attempt-<attemptId>` clone path, so a late Docker
+   *  create binding a predecessor's path can never land in the successor's tree. Unwired workers
+   *  keep the canonical `<key>` path, byte-for-byte. */
+  private readonly attemptPaths: boolean;
 
   constructor(
     private readonly client: WorkerClient,
@@ -1355,6 +1375,7 @@ export class RunRunner {
     this.liveAttempts = opts.liveAttempts ?? new LiveAttemptRegistry();
     this.quiesceImpl = opts.quiesceRun ?? ((req) => quiesceRunAttempt(req));
     this.dockerHost = opts.dockerHost;
+    this.attemptPaths = !!opts.dockerHost;
     this.planApprovalTimeoutMs = opts.planApprovalTimeoutMs ?? 24 * 60 * 60_000;
     this.questionTimeoutMs = opts.questionTimeoutMs ?? 24 * 60 * 60_000;
     this.gitlab = opts.gitlab ?? new GitLabClient();
@@ -2410,7 +2431,18 @@ export class RunRunner {
       // journal — retiring a tree a live process still writes would hand the next attempt a
       // half-removed clone. The Docker half never blocks the retire; it is logged.
       let retireBlocked = false;
-      if (flight.worktreePath && !flight.preserveRecoveryClone) {
+      // issue #1783 M2: a CAPTURED predecessor attempt (the C′ flight on a Docker-wired worker) is
+      // released IN PLACE — journal cleared (only now that its capture is verified), ledger
+      // `abandoned`, NO filesystem operation on its path — and never retired or reused. Its
+      // capture already ran behind the predecessor-scoped capture-mode proof.
+      let ownAttemptRetired = false;
+      if (flight.predecessorCapture && flight.worktreePath && !flight.preserveRecoveryClone) {
+        if (flight.barePath && flight.branch && flight.predecessorCaptureVerified) {
+          await this.git
+            .releaseAttemptInPlace(flight.barePath, flight.worktreePath, flight.branch, runId)
+            .catch((e) => runLog.warn("predecessor attempt release failed; journal kept", { error: errMessage(e) }));
+        }
+      } else if (flight.worktreePath && !flight.preserveRecoveryClone) {
         const q = await this.quiesceRun(flight, executor, { mode: "own", site: "terminal_retire" });
         if (q.blocked) {
           retireBlocked = true;
@@ -2420,7 +2452,7 @@ export class RunRunner {
           });
         }
       }
-      if (flight.worktreePath && !flight.preserveRecoveryClone && !retireBlocked) {
+      if (flight.worktreePath && !flight.predecessorCapture && !flight.preserveRecoveryClone && !retireBlocked) {
         try {
           if (flight.barePath && flight.branch) {
             // issue #1315: retire the clone ATOMICALLY (rename-to-holding, THEN clear the
@@ -2428,13 +2460,16 @@ export class RunRunner {
             // A daemon racing a recursive rm could throw ENOTEMPTY between the two and
             // leave the journal pointing at partial residue, wedging the branch forever.
             // discard: this is the owner's own terminal trash, so dispose the holding dir.
+            // The path retired is the one actually seeded (flight.worktreePath), never a
+            // recomputed canonical path. issue #1783 M2: an attempt clone is ledger-`retired`.
             await this.git.retireRunnerClone(
               flight.barePath,
               flight.worktreePath,
               flight.branch,
               runId,
-              { discard: true },
+              { discard: true, attemptId: flight.runnerClone?.attemptId },
             );
+            ownAttemptRetired = flight.runnerClone?.attemptId !== undefined;
           } else {
             // No bare/branch to key the journal on (a run that never journaled): fall
             // back to the bare recursive remove.
@@ -2458,7 +2493,12 @@ export class RunRunner {
       // Tear down the sibling skills plugin dir the executor synthesized (PRD #16
       // M4). It is OUTSIDE the runner clone, so removeRunnerClone does not reach it;
       // leave it and each run leaks a dir. Best-effort, like the clone cleanup.
-      if (flight.worktreePath && !preserveResumeArtifacts) {
+      // issue #1783 M2: on a Docker-wired worker the next attempt runs at a NEW path with its own
+      // plugin dir (rebuilt from the claim every claim), so a RETIRED attempt's sibling is
+      // removed with it even on a park; a retained predecessor keeps its pair until the retention
+      // sweep deletes both.
+      const removeSkills = flight.predecessorCapture ? false : ownAttemptRetired || !preserveResumeArtifacts;
+      if (flight.worktreePath && removeSkills) {
         await fs
           .rm(skillsPluginDir(flight.worktreePath), { recursive: true, force: true })
           .catch((e) =>
@@ -5394,6 +5434,9 @@ export class RunRunner {
       preClonePark: false,
       preserveRecoveryClone: false,
       attempt: undefined,
+      attemptId: undefined,
+      predecessorCapture: false,
+      predecessorCaptureVerified: false,
       ciFixHumanApproved: false,
       runnerClone: undefined,
       result: undefined,
@@ -5433,6 +5476,7 @@ export class RunRunner {
   private async reclaimTerminalOrphan(
     barePath: string,
     claim: ClaimResponse,
+    flight: RunFlight,
     journaledPath: string,
     branch: string,
     ownerRunId: string,
@@ -5462,12 +5506,87 @@ export class RunRunner {
     });
     if (!owner) throw original;                                          // malformed identity
     if (owner.branch !== branch) throw original;                         // (c) owner-derived branch
-    if (this.git.runnerClonePath(barePath, owner.slug) !== journaledPath) throw original; // (d)
+    // (d′) issue #1783 M2: the journaled path is the owner's canonical path, OR it parses as
+    // `<that canonical>.attempt-<id>` AND the ledger records that attemptId for the owner. A
+    // different key, a traversal or an unrecorded id fails closed with the path untouched.
+    let shape: "canonical" | "attempt" | undefined;
     try {
-      await this.git.retireRunnerClone(barePath, journaledPath, branch, ownerRunId, { discard: false });
+      shape = await this.git.classifyOwnerClonePath(barePath, branch, owner.slug, ownerRunId, journaledPath);
+    } catch {
+      throw original;
+    }
+    if (!shape) throw original;                                           // (d′)
+    if (this.attemptPaths) {
+      // The same predecessor-scoped capture-mode proof the C′ capture runs, and the same blocking
+      // rule: survivors or unverified leave journal, ledger and path untouched.
+      const proof = await this.quiesceRun(flight, flight.executor, {
+        mode: "capture",
+        site: "orphan_reclaim",
+        targetPaths: [journaledPath],
+        clonePath: journaledPath,
+      });
+      if (proof.blocked) throw new RunResidueBlockedError(proof.outcome.process?.detail ?? "not quiescent");
+    }
+    try {
+      if (this.attemptPaths && shape === "attempt") {
+        // The foreign owner's work is retained IN PLACE (never moved): the ledger says abandoned.
+        await this.git.releaseAttemptInPlace(barePath, journaledPath, branch, ownerRunId);
+      } else {
+        await this.git.retireRunnerClone(barePath, journaledPath, branch, ownerRunId, { discard: false });
+      }
     } catch {
       throw original; // journal moved under us / containment failure -> fail closed
     }
+  }
+
+  /** issue #1783 M2: the attempt-seed options a Docker-wired worker hands the git layer (see
+   *  AttemptSeedOptions); undefined on an unwired worker (today's canonical seed). */
+  private attemptSeedOptions(claim: ClaimResponse, flight: RunFlight): AttemptSeedOptions | undefined {
+    const attemptId = flight.attemptId;
+    if (!this.attemptPaths || attemptId === undefined) return undefined;
+    return {
+      attemptId,
+      isLive: (p) => this.liveAttempts.isLivePath(p),
+      beforeSeed: async (nonLivePaths, canonical) => {
+        // issue #1783 M2 (seed-time sweep): the process scan (mode `seed`: a terminal attempt's
+        // residue is killed, an unattributed in-scope process survives) over this key's NON-LIVE
+        // paths, plus the Docker teardown of containers bound within them — never within a live
+        // same-key attempt's path. A live-owner conflict, survivors or unverified block the seed
+        // (worker_residue_blocked) with nothing moved. Seeding a fresh path frees no old path.
+        if (nonLivePaths.length === 0) return;
+        const proof = await this.quiesceRun(flight, flight.executor, {
+          mode: "seed",
+          site: "attempt_seed",
+          targetPaths: nonLivePaths,
+          clonePath: canonical,
+        });
+        if (proof.blocked) throw new RunResidueBlockedError(proof.outcome.process?.detail ?? "not quiescent");
+      },
+      onSeeded: (clonePath) => {
+        // Live from the seed on (inside the bare lock), so a concurrent same-key seed's sweep
+        // never treats this attempt's fresh path as residue.
+        const attempt = newRunAttempt(
+          claim.run_id,
+          claim.claim_generation,
+          clonePath,
+          () => flight.executor.recordedRootPids?.() ?? [],
+          new Date(this.now()),
+          attemptId,
+        );
+        flight.attempt = attempt;
+        this.liveAttempts.add(attempt);
+      },
+      quiescent: async (paths, canonical) => {
+        const proof = await this.quiesceRun(flight, flight.executor, {
+          mode: "seed",
+          site: "attempt_retention",
+          targetPaths: paths,
+          clonePath: canonical,
+          processOnly: true,
+        });
+        return !proof.blocked;
+      },
+    };
   }
 
   /**
@@ -5572,9 +5691,13 @@ export class RunRunner {
       }
       throw err;
     }
+    // issue #1783 M2: a Docker-wired worker mints this attempt's id BEFORE the seed: it names the
+    // fresh attempt clone path, and the journal, the ledger and the attempt marker reuse it.
+    if (this.attemptPaths) flight.attemptId = mintAttemptId(claim.claim_generation, new Date(this.now()));
+    const attemptSeed = this.attemptSeedOptions(claim, flight);
     let retained = false;
     try {
-      const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
+      const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, attemptSeed));
       flight.worktreePath = runnerClone.path;
       flight.branch = runnerClone.branch;
     } catch (err) {
@@ -5586,6 +5709,21 @@ export class RunRunner {
         flight.preserveRecoveryClone = true;
         flight.preserveSession = true;
         retained = true;
+        if (this.attemptPaths) {
+          // issue #1783 M2 (C′): the journaled path is a PREDECESSOR attempt's (or a legacy
+          // canonical) clone. Before any credentialed fetch-back from it, prove it quiescent with a
+          // capture-mode sweep scoped to that path alone: env-scrubbed processes whose cwd is inside
+          // it are survivors (never killed on attribution-by-cwd alone), plus the Docker teardown
+          // of containers bound within it. Survivors or unverified block the capture: journal,
+          // ledger and path stay untouched and the run fails typed worker_residue_blocked.
+          flight.predecessorCapture = true;
+          const proof = await this.quiesceRun(flight, flight.executor, {
+            mode: "capture",
+            site: "predecessor_capture",
+            targetPaths: [err.clonePath],
+          });
+          if (proof.blocked) throw new RunResidueBlockedError(proof.outcome.process?.detail ?? "not quiescent");
+        }
       } else if (err instanceof ForeignCaptureBlockedError) {
         // issue #1315/#1319 Case B: the canonical clone is journaled to ANOTHER run's
         // retained capture (a matched canonical pair). The authoritative owner-derived
@@ -5593,16 +5731,16 @@ export class RunRunner {
         // canonical path match the journal is reclaimed (residue quarantined, RETAINED),
         // else fail closed. Replaces the old worker-scoped getRunOwnership probe, which
         // 404'd on a worker move (Gap 2).
-        await this.reclaimTerminalOrphan(barePath, claim, err.clonePath, err.branch, err.ownerRunId, err);
-        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
+        await this.reclaimTerminalOrphan(barePath, claim, flight, err.clonePath, err.branch, err.ownerRunId, err);
+        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, attemptSeed));
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;
       } else if (err instanceof CapturePathMismatchError) {
         // issue #1319 Case A: a claimant-relative clone-path mismatch (the cross-kind slug
         // divergence, e.g. an issue owner's `issue-N` vs this mr_rework's `agent-issue-N`).
         // The SAME owner-derived validation decides; any unmet predicate fails closed.
-        await this.reclaimTerminalOrphan(barePath, claim, err.journaledPath, err.branch, err.ownerRunId, err);
-        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
+        await this.reclaimTerminalOrphan(barePath, claim, flight, err.journaledPath, err.branch, err.ownerRunId, err);
+        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, attemptSeed));
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;
       } else {
@@ -5630,7 +5768,7 @@ export class RunRunner {
 
     // Journal ownership before any model can write. The worker-owned bare config
     // survives failed captures, process restarts, and runner-owned clone tampering.
-    await this.git.markRecoveryCapture(barePath, flight.worktreePath!, flight.branch!, runId);
+    await this.git.markRecoveryCapture(barePath, flight.worktreePath!, flight.branch!, runId, flight.runnerClone?.attemptId);
     batcher.emit({
       kind: "status",
       agent: "worker",
@@ -5795,6 +5933,30 @@ export class RunRunner {
       this.openQuestionIds.set(runId, claim.open_question_id);
 
     let sessionId = claim.session_id ?? undefined;
+    // issue #1783 M2: on a Docker-wired worker every attempt runs at a FRESH clone path, and a
+    // session is keyed by HOME *and* cwd, so the earlier session can never resolve from here. Drop
+    // it BEFORE either transcript check (so neither can report it resumable, even when the old
+    // transcript is still under HOME): Claude starts a fresh session and Codex a fresh thread.
+    // The earlier work arrives through the branch, the tracking ref, checkpoint adoption and the
+    // journal/capture, never through the old cwd.
+    if (sessionId && this.attemptPaths) {
+      sessionId = undefined;
+      runLog.info("resume session dropped: this attempt runs in a fresh clone path", {
+        reason: "cwd_changed_attempt_path",
+        event: RESUME_LINEAGE_BREAK_EVENT,
+      });
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text:
+            "this run was picked up again in a fresh working directory, so its earlier session is not resumed — " +
+            "continuing WITHOUT its earlier context; its committed and captured work is on the branch",
+          event: RESUME_LINEAGE_BREAK_EVENT,
+          reason: "cwd_changed_attempt_path",
+        },
+      });
+    }
     if (
       sessionId &&
       runHome &&
@@ -6351,12 +6513,19 @@ export class RunRunner {
     // buildSdkEnv), so every process the agent starts is attributable to it; its recorded roots
     // let a concurrent sibling's reaper attribute our unreadable processes by ancestry. Removed in
     // executeClaim's terminal finally, after the attempt's final reap.
-    if (flight.attempt) this.liveAttempts.remove(flight.attempt.marker);
-    const attempt = newRunAttempt(runId, claim.claim_generation, runnerClone.path, () =>
-      executor.recordedRootPids?.() ?? [],
-    );
-    flight.attempt = attempt;
-    this.liveAttempts.add(attempt);
+    // issue #1783 M2: a Docker-wired seed already registered this attempt live (inside the bare
+    // lock, under the id that names its clone path); reuse it so marker, path and journal agree.
+    let attempt: RunAttempt;
+    if (flight.attempt && flight.attempt.clonePath === resolvePath(runnerClone.path)) {
+      attempt = flight.attempt;
+    } else {
+      if (flight.attempt) this.liveAttempts.remove(flight.attempt.marker);
+      attempt = newRunAttempt(runId, claim.claim_generation, runnerClone.path, () =>
+        executor.recordedRootPids?.() ?? [],
+      );
+      flight.attempt = attempt;
+      this.liveAttempts.add(attempt);
+    }
     const ctx: RunContext = {
       runId,
       kind: resolveRunKind(claim.kind),
@@ -6425,7 +6594,8 @@ export class RunRunner {
       sessionId,
       priorWork,
       // issue #222: this run executed before (it reported a session), so this claim's
-      // reseed wiped whatever an earlier attempt left in the tree. Read the RAW
+      // reseed rebuilt the tree (wiped it, or on a Docker-wired worker seeded a fresh attempt
+      // path), so whatever an earlier attempt left uncaptured is not in it. Read the RAW
       // claim.session_id, not the `sessionId` var cleared above on a dropped transcript —
       // a dropped-session resume still had its tree destroyed. Same discriminator the
       // reseed feed-status uses (this.emit "starting from the default branch" above).
@@ -7147,11 +7317,20 @@ export class RunRunner {
   private async quiesceRun(
     flight: RunFlight,
     executor: Executor,
-    opts: { mode: QuiesceMode; site: string; targetPaths?: string[]; processOnly?: boolean },
+    opts: { mode: QuiesceMode; site: string; targetPaths?: string[]; processOnly?: boolean; clonePath?: string },
   ): Promise<{ outcome: QuiesceRunOutcome; blocked: boolean }> {
     return flight.sinkGate.run(async () => {
       executor.killAgentTree?.();
-      const clonePath = flight.attempt?.clonePath ?? flight.worktreePath;
+      // issue #1783 M2: a flight capturing a PREDECESSOR attempt's clone never quiesces it as its
+      // own: every proof there (the capture, its re-proofs, the pre-settle reap) is a
+      // capture-mode scan scoped to the predecessor path alone.
+      let mode = opts.mode;
+      let pinnedTargets = opts.targetPaths;
+      if (flight.predecessorCapture && flight.worktreePath && pinnedTargets === undefined) {
+        mode = "capture";
+        pinnedTargets = [flight.worktreePath];
+      }
+      const clonePath = opts.clonePath ?? (flight.predecessorCapture ? flight.worktreePath : undefined) ?? flight.attempt?.clonePath ?? flight.worktreePath;
       if (!clonePath) {
         return {
           outcome: { process: undefined, docker: { state: "not_wired", removed: [], detail: "no clone to quiesce" } },
@@ -7159,15 +7338,21 @@ export class RunRunner {
         };
       }
       const { cloneKey, canonicalPath } = cloneKeyOf(clonePath);
-      const targetPaths = opts.targetPaths ?? [...new Set([clonePath, canonicalPath])];
+      // issue #1783 M2: an attempt clone's own footprint is its attempt path alone. The key's
+      // canonical path (and every sibling attempt) may hold a RETAINED predecessor, which only a
+      // seed/capture sweep scoped to it may ever touch.
+      const ownFootprint = clonePath !== canonicalPath ? [clonePath] : [clonePath, canonicalPath];
+      const targetPaths = pinnedTargets ?? [...new Set(this.attemptPaths ? ownFootprint : [clonePath, canonicalPath])];
       let outcome: QuiesceRunOutcome;
       try {
         outcome = await this.quiesceImpl({
-          mode: opts.mode,
+          mode,
           attempt: flight.attempt,
           cloneKey,
           targetPaths,
-          processes: !executor.safety && process.platform === "linux",
+          // A Codex run's supervisor proves its OWN attempt's process drain; a seed/capture sweep
+          // over OTHER attempts' paths has no supervisor behind it, so it always scans (issue #1783 M2).
+          processes: (!executor.safety || mode !== "own") && process.platform === "linux",
           // A re-proof after a runner-clone git (processOnly) repeats only the process half: the
           // Docker teardown already ran at the sink's first proof, and never blocks anyway.
           dockerHost: opts.processOnly ? undefined : this.dockerHost,
@@ -9007,6 +9192,7 @@ export class RunRunner {
             if (attempt.verified) {
               capture = attempt;
               flight.preserveRecoveryClone = false;
+              flight.predecessorCaptureVerified = flight.predecessorCapture;
             }
           } catch (captureError) {
             runLog.warn("recovery capture failed; retaining work for retry", {
@@ -10077,7 +10263,7 @@ export class RunRunner {
    * vs the repo's default branch. The working tree lives ONLY in this clone; the
    * worker fetches the agent branch back from it before pushing (fetchAgentBranch).
    */
-  private async runnerCloneForClaim(barePath: string, claim: ClaimResponse) {
+  private async runnerCloneForClaim(barePath: string, claim: ClaimResponse, attempt?: AttemptSeedOptions) {
     // PRD #218 M2: thread the run id as the tracking-ref OWNERSHIP anchor. The git layer
     // stays claim-agnostic — it consults the tracking ref only when its stamp matches
     // this run id, so neither a fresh run nor a different run on the same issue can
@@ -10117,10 +10303,11 @@ export class RunRunner {
         runId,
         resume,
         expectedCheckpointTip,
+        attempt,
       );
     if (claim.issue_iid == null)
       throw new Error("issue run claim is missing issue_iid");
-    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId, resume, expectedCheckpointTip);
+    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId, resume, expectedCheckpointTip, attempt);
   }
 
   /**

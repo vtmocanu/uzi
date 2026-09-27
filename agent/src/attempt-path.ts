@@ -101,3 +101,72 @@ export function cloneKeyOf(clonePath: string): { cloneKey: string; canonicalPath
   const key = m?.groups?.key ?? base;
   return { cloneKey: `${path.basename(parent)}/${key}`, canonicalPath: path.join(parent, key) };
 }
+
+/** `<canonicalPath>.attempt-<attemptId>`: the clone path of one execution attempt of a key
+ *  (issue #1783 M2). Throws on a malformed id, so no caller can mint a path the parser would
+ *  refuse. */
+export function attemptClonePath(canonicalPath: string, attemptId: string): string {
+  if (!ATTEMPT_ID_RE.test(attemptId)) throw new Error("malformed attempt id");
+  return `${canonicalPath}${ATTEMPT_SEPARATOR}${attemptId}`;
+}
+
+/** The generation of an attempt id as a number (`gx`, an unknown generation, is -1). */
+function attemptGeneration(attemptId: string): number {
+  const g = /-(g[0-9]+|gx)-/.exec(attemptId)?.[1] ?? "gx";
+  return g === "gx" ? -1 : Number(g.slice(1));
+}
+
+/**
+ * Order two attempt ids oldest first: by start timestamp (fixed width, so lexical), then by
+ * claim generation NUMERICALLY (g10 after g9; `gx` lowest), then the whole id lexically as a
+ * deterministic tie-break. The same order the watcher's backup script (`aid_newer`) uses.
+ */
+export function compareAttemptIds(a: string, b: string): number {
+  const ta = a.slice(0, a.indexOf("-"));
+  const tb = b.slice(0, b.indexOf("-"));
+  if (ta !== tb) return ta < tb ? -1 : 1;
+  const ga = attemptGeneration(a);
+  const gb = attemptGeneration(b);
+  if (ga !== gb) return ga - gb;
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** The two worker-owned sibling prefixes a runner repo dir may hold beside its clones: the
+ *  skills plugin dir (skills-plugin.ts) and quarantined residue. */
+const SKILLS_ARTIFACT_PREFIX = ".uzi-skills-";
+const RESIDUE_ARTIFACT_PREFIX = ".uzi-residue-";
+
+/**
+ * True for a retained worker artifact beside the clones in a runner repo dir: a skills plugin
+ * sibling (`.uzi-skills-<clone basename>`) or quarantined residue (`.uzi-residue-*`). Neither is
+ * ever a clone: a clone key never starts with `.` (a git branch component cannot), and the git
+ * layer refuses such a key before it seeds an attempt, so no key or attempt basename can collide.
+ */
+export function isRetainedArtifactName(name: string): boolean {
+  return name.startsWith(SKILLS_ARTIFACT_PREFIX) || name.startsWith(RESIDUE_ARTIFACT_PREFIX);
+}
+
+/** A retained artifact's kind and the clone basename it belongs to (`<key>` or
+ *  `<key>.attempt-<id>`), or undefined for any other name. */
+export function parseRetainedArtifactName(
+  name: string,
+): { kind: "skills" | "residue"; cloneBasename: string } | undefined {
+  for (const [kind, prefix] of [
+    ["skills", SKILLS_ARTIFACT_PREFIX],
+    ["residue", RESIDUE_ARTIFACT_PREFIX],
+  ] as const) {
+    if (!name.startsWith(prefix)) continue;
+    const rest = name.slice(prefix.length);
+    if (rest === "" || rest === "." || rest === ".." || rest.includes(path.sep)) return undefined;
+    return { kind, cloneBasename: rest };
+  }
+  return undefined;
+}
+
+/** The clone key and attempt id (when any) a clone BASENAME names: `<key>.attempt-<id>` parses
+ *  to both; anything else is taken as a canonical key with no attempt. */
+export function parseCloneBasename(base: string): { key: string; attemptId: string | undefined } {
+  const m = ATTEMPT_BASENAME_RE.exec(base);
+  if (m?.groups) return { key: m.groups.key!, attemptId: m.groups.id! };
+  return { key: base, attemptId: undefined };
+}
