@@ -59,6 +59,27 @@ export interface User {
   last_login: string | null;
 }
 
+// SecretDependentPage is one paged list in the dependents read (PRD #1732 D11): the first
+// page of items, the TOTAL count (which can exceed the page), and a cursor for the next page.
+export interface SecretDependentPage<T> {
+  items: T[];
+  total: number;
+  next_cursor?: string;
+}
+
+// SecretDependents is GET /api/me/secrets/{kind}/{id}/dependents (PRD #1732 D11): what relies
+// on one credential right now, read by the Disable dialog. `default` says whether it is its
+// slot's default; `judge` whether the run judge is pinned to it; `enabled_siblings` are the
+// other ENABLED Codex aliases on the same provider account (always empty for Anthropic).
+export interface SecretDependents {
+  default: boolean;
+  judge: boolean;
+  workers: SecretDependentPage<{ id: string; name: string }>;
+  schedules: SecretDependentPage<{ id: string; target: string }>;
+  runs: SecretDependentPage<{ id: string; status: string }>;
+  enabled_siblings: SecretDependentPage<{ id: string; label: string }>;
+}
+
 // SecretMeta is the metadata-only view of ONE stored per-user secret. The secret
 // value is never returned by the API, so it never appears here.
 //
@@ -84,6 +105,13 @@ export interface SecretMeta {
    *  moves a codex_auth row to "linked" or "failed". Optional, matching the omitempty,
    *  and stateless UI (a badge read straight off this — never a second fetch). */
   codex_status?: string;
+  /** PRD #1732 D10: whether the credential is available. A disabled credential keeps its
+   *  value, label, default flag, pool opt-in and sidebar preference; it is only suspended.
+   *  `enabled` is derived server-side from `disabled_at IS NULL`. */
+  enabled: boolean;
+  /** When the credential was disabled (ISO-8601), null while enabled. A repeated disable
+   *  keeps the original timestamp, so this is the "Disabled since" date. */
+  disabled_at: string | null;
   created_at: string;
   updated_at: string;
 }

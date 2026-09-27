@@ -1,7 +1,15 @@
-import type { AutoStatus, SecretMeta } from "../../lib/api";
+import type {
+  AutoStatus,
+  CodexAccountRateLimit,
+  SecretDependents,
+  SecretMeta,
+  TokenRateLimits,
+} from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
-import { mockMyTokenRateLimits, mockSecrets } from "../data";
-import { state } from "../store";
+import { isTerminalRun } from "../../lib/runStatus";
+import { mockCodexAliasAccounts, mockMyTokenRateLimits, mockSecrets } from "../data";
+import { patchRun, state } from "../store";
+import { schedulesPinnedTo } from "./schedules";
 import { delay, mockScenario, users } from "./shared";
 // secrets ↔ workers is the one accepted import cycle (PRD #991 D4): deleteAnthropicTokenById
 // unbinds workers pinned to the deleted token, and workers' setWorkerBindMode resolves a
@@ -9,8 +17,84 @@ import { delay, mockScenario, users } from "./shared";
 // initializer crosses the modules, so the cycle cannot throw at import.
 import { workers } from "./workers";
 
-export let secrets: SecretMeta[] = mockSecrets.map((s) => ({ ...s }));
+export let secrets: SecretMeta[] = noDefaultScenario(mockSecrets.map((s) => ({ ...s })));
 
+// PRD #1732 D4: the "no-default" demo scenario (?mock=no-default). Every Anthropic token
+// is disabled, so the slot has NO default: the Settings card leads with the no-default
+// notice (shown even with the Disabled shelf collapsed) and each shelf row offers
+// "Enable and make default". Applied once at load, so enabling a token in the demo
+// really fills the slot.
+function noDefaultScenario(rows: SecretMeta[]): SecretMeta[] {
+  if (mockScenario() !== "no-default") return rows;
+  const at = new Date(Date.now() - 2 * 86_400_000).toISOString();
+  return rows.map((s) =>
+    s.kind === "anthropic_token"
+      ? { ...s, is_default: false, enabled: false, disabled_at: s.disabled_at ?? at }
+      : s,
+  );
+}
+
+// ── Enablement read filters (PRD #1732 D1/D9/D13) ──────────────────────────────
+// The server omits a disabled credential from every rate-limit read, owner and admin.
+// The mock keeps each stored reading in its fixture and hides it here, so Enable can
+// bring it back. A just-enabled token reads `unavailable` for a few seconds first: its
+// pre-disable reading is never current (D13), and the delay is what lets the Settings
+// row show "checking usage…" in the demo.
+const FRESH_READING_DELAY_MS = 4_000;
+const enabledAt = new Map<string, number>();
+
+function isDisabledId(id: string): boolean {
+  return secrets.some((s) => s.id === id && s.enabled === false);
+}
+
+// `own` marks the signed-in user's list: only there does the meter follow the owner's
+// live default flag (a default hand-off on disable moves it). Admin rows only filter.
+export function visibleTokenMeters(tokens: TokenRateLimits[], own = false): TokenRateLimits[] {
+  const now = Date.now();
+  return tokens
+    .filter((t) => !isDisabledId(t.secret_id))
+    .map((t) => {
+      const since = enabledAt.get(t.secret_id);
+      const row = own ? secrets.find((s) => s.id === t.secret_id) : undefined;
+      const withDefault = row ? { ...t, is_default: row.is_default } : { ...t };
+      if (since !== undefined && now - since < FRESH_READING_DELAY_MS) {
+        return { ...withDefault, limits: { status: "unavailable" as const } };
+      }
+      return withDefault;
+    });
+}
+
+// A Codex account's aliases drop disabled labels; an account left with no alias (every
+// alias that named it is disabled) is not polled, so it is not listed at all (D6).
+// promoteCredentialDisabledRuns is the mock's promoter (D14): a run held on
+// credential_disabled goes back to the queue once the credential it names is enabled, or,
+// for work that spends the default (it names none), once its slot has a default again.
+function promoteCredentialDisabledRuns(): void {
+  for (const r of state.runs.values()) {
+    if (r.status !== "paused" || r.hold_reason !== "credential_disabled") continue;
+    const pinnedLabel = r.credential_override?.mode === "pinned" ? r.credential_override.label : null;
+    const needed =
+      r.harness === "codex"
+        ? secrets.find((s) => s.id === r.codex_secret_id)
+        : pinnedLabel
+          ? secrets.find((s) => s.kind === "anthropic_token" && s.label === pinnedLabel)
+          : secrets.find((s) => s.id === r.anthropic_secret_id);
+    const ready = needed
+      ? needed.enabled !== false
+      : secrets.some((s) => s.kind === "anthropic_token" && s.is_default && s.enabled !== false);
+    if (ready) patchRun(r.id, { status: "queued", hold_reason: null, status_since: new Date().toISOString() });
+  }
+}
+
+export function visibleCodexAccounts(accounts: CodexAccountRateLimit[]): CodexAccountRateLimit[] {
+  const disabledLabels = new Set(
+    secrets.filter((s) => s.kind === "codex_auth" && s.enabled === false).map((s) => s.label),
+  );
+  if (disabledLabels.size === 0) return accounts;
+  return accounts
+    .map((a) => ({ ...a, aliases: a.aliases.filter((l) => !disabledLabels.has(l)) }))
+    .filter((a) => a.aliases.length > 0);
+}
 // requireUnlockedVault mirrors the real API: sealing a token needs the vault
 // unlocked (PRD #32), so every create/rotate path throws the same 409 the SPA
 // turns into an unlock prompt.
@@ -106,6 +190,8 @@ function codexOnlySecrets(rows: SecretMeta[]): SecretMeta[] {
       kind: "codex_auth",
       label: "codex-demo",
       is_default: true,
+      enabled: true,
+      disabled_at: null,
       auto_eligible: false,
       codex_status: "linked",
       created_at: now,
@@ -134,6 +220,8 @@ function createCodexCredential(kind: CodexKind, label: string, isDefault: boolea
     kind,
     label: trimmed,
     is_default: wantDefault,
+    enabled: true,
+    disabled_at: null,
     // No Codex auto-selection pool.
     auto_eligible: false,
     // The resolver-observed lifecycle state at birth: a login stages, a key is static.
@@ -217,6 +305,8 @@ export const secretsApi = {
       kind: "anthropic_token",
       label: "default",
       is_default: true,
+      enabled: true,
+      disabled_at: null,
       // The user's FIRST/SOLE anthropic_token is born pooled (issue #804) so a
       // single-token user has a non-empty auto-select pool; token #2+ stays
       // opt-in. Compute it faithfully off the "no existing anthropic_token" rule,
@@ -251,6 +341,8 @@ export const secretsApi = {
       kind: "anthropic_token",
       label: trimmed,
       is_default: wantDefault,
+      enabled: true,
+      disabled_at: null,
       // The user's FIRST/SOLE anthropic_token is born pooled (issue #804); token
       // #2+ stays opt-in (auto_eligible false). Mirror the server or the mock
       // teaches the wrong lesson.
@@ -360,6 +452,84 @@ export const secretsApi = {
     body: { label?: string; default?: boolean; token?: string },
   ) => patchCodexCredential("openai_api_key", id, body),
   deleteOpenAIApiKeyById: async (id: string) => deleteCodexCredential("openai_api_key", id),
+
+  // ── Disable / Enable (PRD #1732 D4, D11) ─────────────────────────────────────
+  // Mirrors PatchSecretEnabled: kind-scoped 404, idempotent repeat (the original
+  // disabled_at is kept), the REQUIRED enabled replacement when disabling a default while
+  // another enabled credential exists (409), the atomic default clear on the slot's last
+  // enabled credential, and Enable filling an empty slot's default.
+  setSecretEnabled: async (kind: string, id: string, enabled: boolean, newDefaultId?: string) => {
+    const row = secrets.find((s) => s.id === id);
+    if (!row || row.kind !== kind) throw new ApiError(404, "secret not found");
+    const inSlot = (s: SecretMeta) =>
+      isCodexKind(row.kind) ? isCodexKind(s.kind) : s.kind === row.kind;
+    const slot = secrets.filter(inSlot);
+    if ((row.enabled !== false) === enabled) return delay({ secret: { ...row } });
+    if (!enabled) {
+      if (row.is_default) {
+        const enabledCount = slot.filter((s) => s.enabled !== false).length;
+        if (enabledCount > 1) {
+          const replacement = slot.find(
+            (s) => s.id === newDefaultId && s.id !== id && s.enabled !== false,
+          );
+          if (!replacement) throw new ApiError(409, "choose an enabled replacement in Settings");
+          slot.forEach((s) => (s.is_default = false));
+          replacement.is_default = true;
+        } else {
+          row.is_default = false;
+        }
+      }
+      row.enabled = false;
+      row.disabled_at = new Date().toISOString();
+      enabledAt.delete(id);
+    } else {
+      row.enabled = true;
+      row.disabled_at = null;
+      if (!slot.some((s) => s.is_default && s.enabled !== false)) {
+        slot.forEach((s) => (s.is_default = false));
+        row.is_default = true;
+      }
+      enabledAt.set(id, Date.now());
+      // A held run waiting on this credential resumes by itself (D14): the mock promotes it.
+      promoteCredentialDisabledRuns();
+    }
+    row.updated_at = new Date().toISOString();
+    return delay({ secret: { ...row } });
+  },
+  getSecretDependents: async (kind: string, id: string): Promise<SecretDependents> => {
+    const row = secrets.find((s) => s.id === id);
+    if (!row || row.kind !== kind) throw new ApiError(404, "secret not found");
+    const page = <T,>(items: T[]) => ({ items: items.slice(0, 20), total: items.length });
+    const boundWorkers = workers
+      .filter((w) => w.anthropic_secret_id === id)
+      .map((w) => ({ id: w.id, name: w.name }));
+    const pinnedSchedules = row.kind === "anthropic_token" ? schedulesPinnedTo(row.label) : [];
+    const liveRuns = [...state.runs.values()]
+      .filter(
+        (r) =>
+          !isTerminalRun(r.status) &&
+          (r.anthropic_secret_id === id ||
+            r.codex_secret_id === id ||
+            (r.credential_override?.mode === "pinned" &&
+              row.kind === "anthropic_token" &&
+              r.credential_override.label === row.label)),
+      )
+      .map((r) => ({ id: r.id, status: r.status }));
+    const account = mockCodexAliasAccounts[id];
+    const siblings = account
+      ? secrets
+          .filter((s) => s.id !== id && s.enabled !== false && mockCodexAliasAccounts[s.id] === account)
+          .map((s) => ({ id: s.id, label: s.label }))
+      : [];
+    return delay({
+      default: row.is_default,
+      judge: state.session?.judge_anthropic_secret_id === id,
+      workers: page(boundWorkers),
+      schedules: page(pinnedSchedules),
+      runs: page(liveRuns),
+      enabled_siblings: page(siblings),
+    });
+  },
 
   // ── Vault (PRD #32) ───────────────────────────────────────────────────────────
   // Any non-empty password unlocks in the demo (there is no real crypto); an empty

@@ -91,7 +91,8 @@ export function WorkersSettings() {
   // worker with ZERO pooled tokens HOLDS every claim in pool_wait (spending nothing,
   // #754) rather than falling back to the owner's default, so the page must not say it
   // auto-selects. Derived rather than fetched: auto_eligible already rides SecretMeta.
-  const pooledCount = tokens.filter((t) => t.auto_eligible).length;
+  // PRD #1732 D8: effective pool membership requires enabled.
+  const pooledCount = tokens.filter((t) => t.auto_eligible && t.enabled !== false).length;
   // Which worker's rebind is in flight, so only that row's picker disables.
   const [tokenBusy, setTokenBusy] = useState("");
   const [name, setName] = useState("");
@@ -831,12 +832,19 @@ export function WorkersSettings() {
                           <option value="">Use my default token</option>
                           <option value={AUTO_OPTION}>Auto-select from the pool</option>
                           <optgroup label="Pin to a token">
-                            {tokens.map((t) => (
-                              <option key={t.id} value={t.label}>
-                                {t.label}
-                                {t.is_default ? " (your default)" : ""}
-                              </option>
-                            ))}
+                            {/* PRD #1732 D5: a disabled token cannot be newly bound, so it
+                                is not offered. The one this worker is ALREADY bound to
+                                stays visible, marked, so the select never snaps to
+                                another option and hides the binding (D2 keeps it). */}
+                            {tokens
+                              .filter((t) => t.enabled !== false || t.id === w.anthropic_secret_id)
+                              .map((t) => (
+                                <option key={t.id} value={t.label} disabled={t.enabled === false}>
+                                  {t.label}
+                                  {t.is_default ? " (your default)" : ""}
+                                  {t.enabled === false ? " (disabled)" : ""}
+                                </option>
+                              ))}
                           </optgroup>
                         </Select>
                       )}

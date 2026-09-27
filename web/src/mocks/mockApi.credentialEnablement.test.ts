@@ -1,0 +1,93 @@
+// @vitest-environment jsdom
+//
+// PRD #1732: the mock's Disable / Enable is a second implementation of PatchSecretEnabled
+// and of the read filters (D4, D9, D11, D14), so the demo cannot teach a rule the server
+// does not have. Each test reloads the module so the in-memory store re-seeds.
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+async function fresh() {
+  vi.resetModules();
+  return (await import("./mockApi")).mockApi;
+}
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe("mock setSecretEnabled (PRD #1732 D4, D11)", () => {
+  it("refuses to disable the default without an enabled replacement while one exists (409)", async () => {
+    const api = await fresh();
+    await expect(api.setSecretEnabled("anthropic_token", "sec-default", false)).rejects.toMatchObject({ status: 409 });
+    // A disabled replacement is refused too.
+    await expect(
+      api.setSecretEnabled("anthropic_token", "sec-default", false, "sec-old-laptop"),
+    ).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("hands the default over atomically, keeps disabled_at on a repeat, and 404s a wrong kind", async () => {
+    const api = await fresh();
+    const { secret } = await api.setSecretEnabled("anthropic_token", "sec-default", false, "sec-console");
+    expect(secret.enabled).toBe(false);
+    expect(secret.is_default).toBe(false);
+    const { secrets } = await api.listSecrets();
+    expect(secrets.find((s) => s.id === "sec-console")?.is_default).toBe(true);
+    const again = await api.setSecretEnabled("anthropic_token", "sec-default", false);
+    expect(again.secret.disabled_at).toBe(secret.disabled_at);
+    await expect(api.setSecretEnabled("codex_auth", "sec-default", false)).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("clears the default on the slot's last enabled credential, and Enable makes it default again", async () => {
+    const api = await fresh();
+    const { secrets } = await api.listSecrets();
+    const anthropic = secrets.filter((s) => s.kind === "anthropic_token" && s.enabled);
+    for (const s of anthropic.filter((s) => !s.is_default)) {
+      await api.setSecretEnabled("anthropic_token", s.id, false);
+    }
+    const last = await api.setSecretEnabled("anthropic_token", "sec-default", false);
+    expect(last.secret.is_default).toBe(false);
+    const after = (await api.listSecrets()).secrets.filter((s) => s.kind === "anthropic_token");
+    expect(after.some((s) => s.is_default)).toBe(false);
+    const back = await api.setSecretEnabled("anthropic_token", "sec-console", true);
+    expect(back.secret.is_default).toBe(true);
+  });
+});
+
+describe("mock read filters (PRD #1732 D1, D9, D13)", () => {
+  it("omits a disabled token from the owner and admin meters, and shows it again after a fresh reading", async () => {
+    const api = await fresh();
+    const mine = await api.getMyRateLimits();
+    expect(mine.tokens.some((t) => t.secret_id === "sec-old-laptop")).toBe(false);
+    const admin = await api.getAdminRateLimits();
+    expect(admin.users.flatMap((u) => u.tokens).some((t) => t.secret_id === "sec-old-laptop")).toBe(false);
+
+    await api.setSecretEnabled("anthropic_token", "sec-console", false);
+    expect((await api.getMyRateLimits()).tokens.some((t) => t.secret_id === "sec-console")).toBe(false);
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    await api.setSecretEnabled("anthropic_token", "sec-console", true);
+    const checking = (await api.getMyRateLimits()).tokens.find((t) => t.secret_id === "sec-console");
+    // Back, but its pre-disable reading is not current yet.
+    expect(checking?.limits.status).toBe("unavailable");
+    vi.advanceTimersByTime(5_000);
+    const fresh2 = (await api.getMyRateLimits()).tokens.find((t) => t.secret_id === "sec-console");
+    expect(fresh2?.limits.status).toBe("ok");
+  });
+
+  it("drops a disabled Codex alias from its account, keeping the account live through its sibling", async () => {
+    const api = await fresh();
+    const { accounts } = await api.getMyCodexRateLimits();
+    const team = accounts.find((a) => a.account_id === "cdx-acct-team");
+    expect(team?.aliases).toContain("team-codex");
+    const deps = await api.getSecretDependents("codex_auth", "sec-codex-team-laptop");
+    expect(deps.enabled_siblings.items.map((s) => s.label)).toEqual(["team-codex"]);
+  });
+
+  it("promotes a held run when the credential it waits on is enabled (D14)", async () => {
+    const api = await fresh();
+    expect((await api.getRun("run-cred-disabled")).run.status).toBe("paused");
+    await api.setSecretEnabled("anthropic_token", "sec-old-laptop", true);
+    const { run } = await api.getRun("run-cred-disabled");
+    expect(run.status).toBe("queued");
+    expect(run.hold_reason).toBeNull();
+  });
+});

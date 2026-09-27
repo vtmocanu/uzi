@@ -91,6 +91,8 @@ import type {
   ScheduleInput,
   SchedulePauseDTO,
   SchedulePreviewInput,
+  SecretDependents,
+  SecretMeta,
   SelfUsage,
   SessionResponse,
   SettingsResponse,
@@ -112,10 +114,6 @@ import type {
   Worker,
 } from "./apiTypes";
 export type * from "./apiTypes";
-export type SecretMeta = import("./apiTypes").SecretMeta & {
-  enabled: boolean;
-  disabled_at: string | null;
-};
 export { DEFAULT_AUTOPILOT_LABEL, RATE_LIMIT_SOURCES } from "./apiTypes";
 
 // Board visibility of a linked GitHub Project v2 (PRD #557). `public` round-trips
@@ -565,6 +563,21 @@ const realApi = {
     }),
   deleteAnthropicToken: () =>
     request<null>("DELETE", "/me/secrets/anthropic_token"),
+
+  // PRD #1732 D11: disable / enable one credential of any kind. Cookie-only like the other
+  // credential writes. Disabling a slot's default while another enabled credential exists
+  // REQUIRES `newDefaultId` (409 otherwise), applied atomically with the disable; disabling
+  // the last enabled credential clears the default; enabling into a slot with no default
+  // makes it the default. Idempotent: a repeat keeps the original disabled_at.
+  setSecretEnabled: (kind: string, id: string, enabled: boolean, newDefaultId?: string) =>
+    request<{ secret: SecretMeta }>(
+      "PATCH",
+      `/me/secrets/${kind}/${id}/enabled`,
+      newDefaultId ? { enabled, new_default_id: newDefaultId } : { enabled },
+    ),
+  // What currently relies on a credential (the Disable dialog's "Uses right now" list).
+  getSecretDependents: (kind: string, id: string) =>
+    request<SecretDependents>("GET", `/me/secrets/${kind}/${id}/dependents`),
 
   // PRD #1147 M3 Codex/OpenAI credential CRUD. Body shapes mirror Anthropic exactly
   // (create {token,label,default} → {secret}; patch {label?,default?,token?} → {secret};

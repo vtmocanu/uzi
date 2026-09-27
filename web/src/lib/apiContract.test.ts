@@ -972,7 +972,8 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // All-scalar / no nullable Go field: their zero.json legitimately carries no null,
   // so the null-presence guard is declared off (per the PRD, like RunUsage).
   { stem: "agent_memory", nullable: false },
-  { stem: "secret", nullable: false },
+  // PRD #1732 D10: disabled_at is a present-as-null pointer while the credential is enabled.
+  { stem: "secret", nullable: true },
   { stem: "usage", nullable: false },
   { stem: "user_settings", nullable: true },
   { stem: "catalog_entry", nullable: true },

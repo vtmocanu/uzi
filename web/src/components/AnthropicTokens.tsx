@@ -12,8 +12,20 @@ import { errorMessage } from "../lib/apiError";
 import { isVaultLocked } from "../lib/api";
 import { autoChipFor } from "../lib/rateLimits";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
-import { isShownInSidebar } from "../lib/sidebarTokens";
+import { emitSidebarTokensChanged, isShownInSidebar } from "../lib/sidebarTokens";
 import { Badge, Button, Card, Field, Input, SectionTitle, Skeleton } from "./ui";
+import {
+  CheckingUsageBadge,
+  DisableCredentialDialog,
+  DisabledCredentialRow,
+  DisabledSection,
+  NoDefaultNotice,
+  disabledSince,
+  slotHasDefault,
+  splitByEnablement,
+  useCheckingUsage,
+  useRememberedExpansion,
+} from "./CredentialEnablement";
 import { DocLink } from "./DocLink";
 import { DOC_ANTHROPIC_TOKEN } from "../lib/doclinks";
 
@@ -100,6 +112,8 @@ function TokenRow({
   autoFetchState,
   sidebarShown,
   onToggleSidebar,
+  checkingUsage,
+  onDisable,
   onChanged,
   onError,
   onNotice,
@@ -123,6 +137,10 @@ function TokenRow({
   // hottest-token pick).
   sidebarShown: boolean;
   onToggleSidebar: (id: string, shown: boolean) => Promise<void>;
+  // PRD #1732: just enabled, and no fresh reading has landed yet.
+  checkingUsage: boolean;
+  // Opens the Disable dialog for this token (owned by the card, which knows the slot).
+  onDisable: () => void;
   onChanged: () => Promise<void>;
   onError: (m: string) => void;
   onNotice: (m: string) => void;
@@ -209,10 +227,11 @@ function TokenRow({
                 touch a bidi override — see lib/sanitizeLabel. */}
             <span className="truncate font-medium text-fg">{sanitizeLabel(secret.label)}</span>
             {secret.is_default && <Badge tone="ok">default</Badge>}
+            {checkingUsage && <CheckingUsageBadge />}
           </div>
         )}
         {!renaming && (
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <Button variant="ghost" size="sm" disabled={disabled} onClick={() => setRenaming(true)}>
               Rename
             </Button>
@@ -232,6 +251,10 @@ function TokenRow({
                 Make default
               </Button>
             )}
+            {/* PRD #1732: reversible suspension, beside Rename / Make default / Delete. */}
+            <Button variant="ghost" size="sm" disabled={disabled} onClick={onDisable}>
+              Disable
+            </Button>
             <Button
               variant="danger"
               size="sm"
@@ -479,6 +502,86 @@ export function AnthropicTokens({
   }, [secrets]);
 
   const first = secrets.length === 0;
+  // PRD #1732: live tokens above, suspended ones on the Disabled shelf below.
+  const { active, disabled } = splitByEnablement(secrets);
+  const hasDefault = slotHasDefault(secrets);
+  const [shelfOpen, setShelfOpen] = useRememberedExpansion("uzi.settings.disabledTokensOpen");
+  const [disabling, setDisabling] = useState<SecretMeta | null>(null);
+  const [shelfBusy, setShelfBusy] = useState(false);
+  // "checking usage…" after Enable, until the token's meter carries a fresh reading.
+  const { checking, start: startChecking } = useCheckingUsage(async (ids) => {
+    const { tokens } = await api.getMyRateLimits();
+    return tokens.filter((t) => ids.includes(t.secret_id) && t.limits.status === "ok").map((t) => t.secret_id);
+  });
+
+  const confirmDisable = async (newDefaultId: string | undefined) => {
+    const target = disabling;
+    if (!target) return;
+    onError("");
+    onNotice("");
+    await api.setSecretEnabled(target.kind, target.id, false, newDefaultId);
+    setDisabling(null);
+    const promoted = newDefaultId ? secrets.find((s) => s.id === newDefaultId) : undefined;
+    onNotice(
+      promoted
+        ? `Disabled “${sanitizeLabel(target.label)}”. “${sanitizeLabel(promoted.label)}” is now your default token.`
+        : `Disabled “${sanitizeLabel(target.label)}”. Enable it again from the Disabled section.`,
+    );
+    emitSidebarTokensChanged();
+    await reload();
+  };
+
+  const enable = async (s: SecretMeta) => {
+    onError("");
+    onNotice("");
+    setShelfBusy(true);
+    try {
+      const { secret: updated } = await api.setSecretEnabled(s.kind, s.id, true);
+      startChecking(s.id);
+      onNotice(
+        updated.is_default
+          ? `Enabled “${sanitizeLabel(s.label)}”. It is now your default token.`
+          : `Enabled “${sanitizeLabel(s.label)}”.`,
+      );
+      emitSidebarTokensChanged();
+      await reload();
+    } catch (err) {
+      onError(errText(err, "Failed to enable the token"));
+    } finally {
+      setShelfBusy(false);
+    }
+  };
+
+  // Deleting a disabled token keeps D5's promise: the confirmation names the workers
+  // bound to it, read fresh at the click. A disabled token is never the default (D4).
+  const removeDisabled = async (s: SecretMeta) => {
+    onError("");
+    onNotice("");
+    setShelfBusy(true);
+    try {
+      let boundWorkers: string[];
+      try {
+        const { workers } = await api.listWorkers();
+        boundWorkers = workers.filter((w) => w.anthropic_secret_id === s.id).map((w) => w.name);
+      } catch (err) {
+        onError(errText(err, "Could not check which workers use this token, so it was not deleted"));
+        return;
+      }
+      if (
+        !window.confirm(
+          deleteWarning(sanitizeLabel(s.label), false, boundWorkers, judgeSecretId === s.id, s.auto_eligible),
+        )
+      )
+        return;
+      await api.deleteAnthropicTokenById(s.id);
+      onNotice(`Deleted “${s.label}”.`);
+      await reload();
+    } catch (err) {
+      onError(errText(err, "Failed to delete the token"));
+    } finally {
+      setShelfBusy(false);
+    }
+  };
 
   // The add form collapses to first-token mode when the last token goes away, and
   // the Name input UNMOUNTS while keeping its state — so a label typed and never
@@ -546,6 +649,12 @@ export function AnthropicTokens({
         </p>
       </div>
 
+      {/* PRD #1732 D4: a slot whose tokens are all disabled has no default. Said at the
+          top of the card, whether or not the Disabled shelf is open. */}
+      {!loading && !first && !hasDefault && (
+        <NoDefaultNotice slot="anthropic" expanded={shelfOpen} onShow={() => setShelfOpen(true)} />
+      )}
+
       {loading ? (
         <Skeleton className="h-16 w-full" />
       ) : first ? (
@@ -554,23 +663,49 @@ export function AnthropicTokens({
         </div>
       ) : (
         <div className="space-y-2">
-          {secrets.map((s) => (
+          {active.map((s) => (
             <TokenRow
               key={s.id}
               secret={s}
-              busy={anyBusy}
+              busy={anyBusy || shelfBusy}
               soleToken={secrets.length === 1}
               judgeBound={judgeSecretId === s.id}
               autoStatus={autoStatuses[s.id]}
               autoFetchState={autoFetchState}
               sidebarShown={isShownInSidebar(s, sidebarTokenIds)}
               onToggleSidebar={onToggleSidebarToken}
+              checkingUsage={checking.has(s.id)}
+              onDisable={() => setDisabling(s)}
               onChanged={reload}
               onError={onError}
               onNotice={onNotice}
             />
           ))}
+          <DisabledSection count={disabled.length} expanded={shelfOpen} onToggle={setShelfOpen}>
+            {disabled.map((s) => (
+              <DisabledCredentialRow
+                key={s.id}
+                testId={`token-${s.id}`}
+                secret={s}
+                note={disabledSince(s.disabled_at)}
+                enableLabel={hasDefault ? "Enable" : "Enable and make default"}
+                busy={anyBusy || shelfBusy}
+                onEnable={() => void enable(s)}
+                onDelete={() => void removeDisabled(s)}
+              />
+            ))}
+          </DisabledSection>
         </div>
+      )}
+
+      {disabling && (
+        <DisableCredentialDialog
+          secret={disabling}
+          slot="anthropic"
+          replacements={active.filter((s) => s.id !== disabling.id)}
+          onClose={() => setDisabling(null)}
+          onConfirm={confirmDisable}
+        />
       )}
 
       {/* Rotating a value is a separate form because the value is pasted, never
@@ -589,6 +724,7 @@ export function AnthropicTokens({
                 <option key={s.id} value={s.id}>
                   {s.label}
                   {s.is_default ? " (default)" : ""}
+                  {s.enabled === false ? " (disabled)" : ""}
                 </option>
               ))}
             </select>

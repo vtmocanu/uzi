@@ -352,8 +352,14 @@ function SkipRow({ skip }: { skip: LastFireSkip }) {
       <div className="min-w-0 flex-1">
         {skip.title && <div className="text-[12.5px] text-muted">{skip.title}</div>}
       </div>
-      <span className="shrink-0">
+      <span className="flex shrink-0 flex-col items-end gap-1">
         <Badge tone={SKIP_REASON_TONES[skip.reason]}>{scheduleSkipReasonLabel(skip.reason)}</Badge>
+        {/* PRD #1732: the pin is kept and the fire waits on it; the fix is in Settings. */}
+        {skip.reason === "credential_disabled" && (
+          <Link to="/settings" className="text-[11px] font-medium text-brand hover:text-brand-hover">
+            Enable it in Settings
+          </Link>
+        )}
       </span>
     </div>
   );

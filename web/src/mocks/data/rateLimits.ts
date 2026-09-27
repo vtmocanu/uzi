@@ -47,6 +47,18 @@ const mockMyRateLimits: MyRateLimits = okReading(8, 1 * H + 23 * MIN, 27, 2 * D 
 // is a backstop, not a licence to let these drift.
 export const mockMyTokenRateLimits: TokenRateLimits[] = [
   {
+    // PRD #1732: the DISABLED token (mockSecrets sec-old-laptop). Its stored reading is
+    // kept here so the fixture lists stay token-for-token, but the mock read hides it
+    // while the token is disabled (visibleTokenMeters), exactly as the server omits it;
+    // after Enable it reappears once a "fresh" reading lands.
+    secret_id: "sec-old-laptop",
+    label: "old-laptop",
+    is_default: false,
+    auto_eligible: true,
+    auto_status: "eligible" as const,
+    limits: okReading(12, 3 * H, 8, 5 * D, 2),
+  },
+  {
     secret_id: "sec-default",
     label: "default",
     is_default: true,

@@ -59,6 +59,20 @@ export const mockSecrets: SecretMeta[] = [
     created_at: daysAgo(12),
     updated_at: daysAgo(1),
   },
+  // PRD #1732: a DISABLED token. It keeps its pool opt-in (hidden while disabled, D8),
+  // sits on the Settings "Disabled (n)" shelf, and the held-run fixture
+  // run-cred-disabled and the schedule sch-cr3d are pinned to it.
+  {
+    id: "sec-old-laptop",
+    kind: "anthropic_token",
+    label: "old-laptop",
+    is_default: false,
+    enabled: false,
+    disabled_at: daysAgo(9),
+    auto_eligible: true,
+    created_at: daysAgo(60),
+    updated_at: daysAgo(9),
+  },
   // PRD #217 M3: the token whose reading carries source `limit_report` (see
   // mockMyTokenRateLimits). Its auto_eligible MUST match its meter fixture
   // token-for-token (data.test.ts) — both false, so it stays out of the pool.
@@ -116,6 +130,33 @@ export const mockSecrets: SecretMeta[] = [
     created_at: daysAgo(11),
     updated_at: daysAgo(1),
   },
+  // PRD #1732 D6: two Codex aliases on ONE ChatGPT account (the mock's cdx-acct-team):
+  // `team-codex` is enabled and keeps the account live, `team-codex-laptop` is disabled,
+  // so its shelf row says the account stays live instead of "Disabled since".
+  {
+    id: "sec-codex-team",
+    kind: "codex_auth",
+    label: "team-codex",
+    is_default: false,
+    enabled: true,
+    disabled_at: null,
+    auto_eligible: false,
+    codex_status: "linked",
+    created_at: daysAgo(40),
+    updated_at: daysAgo(3),
+  },
+  {
+    id: "sec-codex-team-laptop",
+    kind: "codex_auth",
+    label: "team-codex-laptop",
+    is_default: false,
+    enabled: false,
+    disabled_at: daysAgo(4),
+    auto_eligible: false,
+    codex_status: "linked",
+    created_at: daysAgo(38),
+    updated_at: daysAgo(4),
+  },
   {
     id: "sec-openai-static",
     kind: "openai_api_key",
@@ -129,3 +170,12 @@ export const mockSecrets: SecretMeta[] = [
     updated_at: daysAgo(15),
   },
 ];
+
+// PRD #1732 D6: which provider account each LINKED Codex alias resolves to, so the mock
+// dependents read can list a disabled alias's enabled siblings. Aliases absent here have
+// no linked account.
+export const mockCodexAliasAccounts: Record<string, string> = {
+  "sec-codex-linked": "cdx-acct-default",
+  "sec-codex-team": "cdx-acct-team",
+  "sec-codex-team-laptop": "cdx-acct-team",
+};

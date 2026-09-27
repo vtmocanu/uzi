@@ -134,9 +134,13 @@ export function SwitchTokenAction({
   canSteer,
   tokens,
   onSwitched,
+  triggerLabel = "Switch token",
 }: {
   run: Run;
   canSteer: boolean;
+  // The trigger's text. The credential_disabled hold panel (PRD #1732) calls it "Run with
+  // another token"; the run header keeps "Switch token".
+  triggerLabel?: string;
   // Injected token list for the picker; omitted → the picker self-fetches.
   tokens?: SecretMeta[];
   // Called with the updated run after a successful switch, so the page can refresh.
@@ -174,10 +178,15 @@ export function SwitchTokenAction({
   // A held or running run has a live claim, so switching interrupts it (losing at most
   // the in-flight step); a queued run has no claim yet, so the choice just applies to
   // its first claim.
-  const willInterrupt = run.status !== "queued";
+  // A run held on credential_disabled (PRD #1732) holds no claim either: its claim was
+  // never delivered, so switching interrupts nothing.
+  const willInterrupt = run.status !== "queued" && run.hold_reason !== "credential_disabled";
   // A pinned choice with no resolved id cannot be sent (the server 400s it), so block
-  // the confirm until the user picks a real token.
-  const pinnedUnresolved = selection.mode === "pinned" && !selection.secret_id;
+  // the confirm until the user picks a real token. A pin to a DISABLED token is refused
+  // server-side (PRD #1732 D5), so it blocks too.
+  const pinnedUnresolved =
+    selection.mode === "pinned" &&
+    (!selection.secret_id || pickerTokens.some((t) => t.id === selection.secret_id && t.enabled === false));
 
   const submit = async () => {
     setBusy(true);
@@ -197,8 +206,14 @@ export function SwitchTokenAction({
 
   return (
     <span className="inline-flex flex-col gap-1.5">
-      <Button variant="secondary" size="sm" disabled={busy} onClick={() => setOpen((v) => !v)}>
-        Switch token
+      <Button
+        variant="secondary"
+        size="sm"
+        disabled={busy}
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        {triggerLabel}
       </Button>
       {open && (
         <div className="w-72 space-y-2 rounded-lg border border-edge bg-surface p-3">

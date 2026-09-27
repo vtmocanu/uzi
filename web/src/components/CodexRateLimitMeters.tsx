@@ -11,6 +11,7 @@
 // hardcoded 5h/7d — and a 3-hour bucket renders a "3h" chip and a 3-hour projection. See
 // lib/codexRateLimits.ts (codexWindowForecast / formatCodexWindowLabel).
 
+import { useEffect } from "react";
 import {
   api,
   type CodexAccountRateLimit,
@@ -20,6 +21,7 @@ import {
 import { MICRO_METER_GRID_COLS } from "../lib/rateLimitLayout";
 import { useAsyncData } from "../lib/useAsyncData";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
+import { onSidebarTokensChanged } from "../lib/sidebarTokens";
 import { formatAgo, formatCountdown, formatResetLabel, useNow, type PaceForecast } from "../lib/rateLimits";
 import {
   codexAccountLabel,
@@ -51,6 +53,8 @@ export function useMyCodexRateLimits(intervalMs: number): {
     [],
   );
   usePollWhileVisible(reload, intervalMs);
+  // Refetch at once on a Settings credential change (PRD #1732: Enable / Disable too).
+  useEffect(() => onSidebarTokensChanged(() => void reload()), [reload]);
   return { accounts: data, loading };
 }
 

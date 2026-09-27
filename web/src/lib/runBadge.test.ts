@@ -1235,3 +1235,19 @@ describe("runBadge title — format characters (#124)", () => {
     expect(titleOf("\u202E\u200B")).toBeUndefined();
   });
 });
+
+// PRD #1732 D14: a run the server parked on a disabled credential shares raw status
+// "paused" with the owner pause; hold_reason is what tells them apart, and it must render
+// as the warn-toned "waiting: credential disabled", never the info "‖ paused".
+describe("effectiveRunStatus — credential_disabled hold (PRD #1732)", () => {
+  it("overlays a paused run held on credential_disabled", () => {
+    expect(effectiveRunStatus({ status: "paused", hold_reason: "credential_disabled" })).toBe("credential_disabled");
+    expect(runStatusTone("credential_disabled", null)).toBe("warning");
+  });
+
+  it("leaves an owner pause (no hold reason) and other holds alone", () => {
+    expect(effectiveRunStatus({ status: "paused", hold_reason: null })).toBe("paused");
+    expect(effectiveRunStatus({ status: "paused" })).toBe("paused");
+    expect(effectiveRunStatus({ status: "queued", hold_reason: "credential_disabled" })).toBe("queued");
+  });
+});

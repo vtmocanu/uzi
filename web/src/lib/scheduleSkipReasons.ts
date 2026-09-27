@@ -19,7 +19,7 @@ export const SCHEDULE_SKIP_REASON_LABELS: Record<ScheduleSkipReason, string> = {
   codex_override_conflict: "Codex harness cannot use an Anthropic credential override",
   schedules_paused: "all schedules paused",
   no_usable_credential: "no usable credential for either harness",
-  credential_disabled: "pinned credential is disabled (enable it in Settings)",
+  credential_disabled: "pinned credential is disabled",
 };
 
 export function scheduleSkipReasonLabel(reason: ScheduleSkipReason): string {

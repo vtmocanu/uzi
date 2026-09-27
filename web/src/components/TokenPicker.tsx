@@ -13,8 +13,14 @@
 //
 // A token label is USER-AUTHORED text rendered through sanitizeLabel (React escaping
 // does not neutralise a bidi override), the same rule RunCredential follows.
+//
+// PRD #1732: a DISABLED token is never offered (the server refuses a new pin to one, D5).
+// The picker says how many it left out, with the way to Settings ("N disabled not listed ·
+// Manage tokens"), and a selection already pinned to a disabled token renders as that
+// token "(disabled)" with a note, never as a silent snap to another option.
 
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 
 import { api, type SecretMeta } from "../lib/api";
 import type { CredentialSelection } from "../lib/credentialOverride";
@@ -109,13 +115,22 @@ export function TokenPicker({
   }, [injected]);
 
   // Only Anthropic tokens are pinnable — a Codex credential is never spent by a run's
-  // Anthropic selection (matching the Workers rebind's kind filter).
-  const list = (injected ? tokens : fetched).filter((t) => t.kind === "anthropic_token");
+  // Anthropic selection (matching the Workers rebind's kind filter). A disabled token is
+  // left out and counted (PRD #1732).
+  const anthropic = (injected ? tokens : fetched).filter((t) => t.kind === "anthropic_token");
+  const list = anthropic.filter((t) => t.enabled !== false);
+  const disabledCount = anthropic.length - list.length;
   const current = selectionToValue(value, list);
   // Render the unavailable placeholder only when the selection actually needs it.
   const showUnavailable = current === PINNED_UNAVAILABLE;
+  // A pin to a token that exists but is disabled: named as such, not "(unavailable)".
+  const pinnedDisabled =
+    showUnavailable && value.mode === "pinned"
+      ? anthropic.find((t) => t.enabled === false && (t.id === value.secret_id || t.label === value.label))
+      : undefined;
+  const placeholderLabel = sanitizeLabel(pinnedDisabled?.label ?? value.label ?? "pinned token");
 
-  return (
+  const select = (
     <Select
       id={id}
       aria-label={label}
@@ -148,10 +163,27 @@ export function TokenPicker({
         })}
       </optgroup>
       {showUnavailable && (
-        <option value={PINNED_UNAVAILABLE} disabled title={sanitizeLabel(value.label ?? "")}>
-          {sanitizeLabel(value.label ?? "pinned token")} (unavailable)
+        <option value={PINNED_UNAVAILABLE} disabled title={placeholderLabel}>
+          {placeholderLabel} ({pinnedDisabled ? "disabled" : "unavailable"})
         </option>
       )}
     </Select>
+  );
+  if (disabledCount === 0) return select;
+  return (
+    <>
+      {select}
+      <p className="mt-1 text-[11px] text-faint" data-testid="token-picker-disabled-footer">
+        {pinnedDisabled && (
+          <span className="block text-warn">
+            “{placeholderLabel}” is disabled. Pick another token, or enable it in Settings.
+          </span>
+        )}
+        {disabledCount} disabled not listed ·{" "}
+        <Link to="/settings" className="font-medium text-muted underline-offset-2 hover:text-fg hover:underline">
+          Manage tokens
+        </Link>
+      </p>
+    </>
   );
 }

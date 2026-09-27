@@ -112,6 +112,10 @@ function seed(): MockState {
   // usage-limit feed rows (it is not a usage-limit park), and an empty log opens the
   // run view without a 404 (getRunMessages 404s an unseeded id).
   messages.set("run-pool-wait", []);
+  // PRD #1732: the runs held on credential_disabled. Empty logs, like the pool hold: the
+  // hold carries no feed rows of its own, and an empty log opens the run view.
+  messages.set("run-cred-disabled", []);
+  messages.set("run-cred-disabled-codex", []);
   // PRD #1064 M3: run-live opens on an in-progress milestone (milestones_in_progress:
   // ["hb-2"]); seed ONE tool_use frame so the run view's client-side latestActivity is
   // non-null and the "now" strip renders at open, not just the board/list current_activity

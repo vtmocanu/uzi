@@ -207,6 +207,36 @@ const userSchedules: Omit<
     updated_at: daysFromNow(-1, 20), next_fires: [], last_fire: null,
   },
   {
+    // PRD #1732 D2: a schedule pinned to the DISABLED token old-laptop. Its pin is kept,
+    // and its last fire was skipped with `credential_disabled` (never spent another
+    // token): the amber skip row with the way to Settings.
+    id: "sch-cr3d", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi",
+    target: "issue", issue_iid: 187, labels: null, prompt: "",
+    timing: "recurring", cron_expr: "0 4 * * *", run_at: null,
+    timezone: "Europe/Bucharest", next_fire_at: null,
+    last_fired_at: daysFromNow(0, 4), auto_approve: false, wait_on_limit: true,
+    max_issues: null,
+    guidance: null,
+    model: null,
+    output_mode: null,
+    override_subagent_model: false,
+    credential_override: { mode: "pinned", label: "old-laptop" },
+    enabled: true, status: "active", created_at: daysFromNow(-20, 10),
+    updated_at: daysFromNow(0, 4), next_fires: [],
+    last_fire: {
+      fired_at: daysFromNow(0, 4), matched: 1, capped: false,
+      started: [],
+      skips: [
+        {
+          issue_iid: 187,
+          title: "Nightly dependency audit for the worker image",
+          reason: "credential_disabled",
+          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/187",
+        },
+      ],
+    },
+  },
+  {
     id: "sch-pr0m", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi",
     target: "prompt", issue_iid: null, labels: null,
     prompt: "hunt for flaky tests and open an MR",
@@ -533,6 +563,14 @@ let schedules: Schedule[] = [
   ),
   ...seededDefaults,
 ];
+
+// PRD #1732 D11: the schedules whose stored credential override pins the Anthropic token
+// `label`, for the dependents read behind the Disable dialog.
+export function schedulesPinnedTo(label: string): { id: string; target: string }[] {
+  return schedules
+    .filter((s) => s.credential_override?.mode === "pinned" && s.credential_override.label === label)
+    .map((s) => ({ id: s.id, target: s.target }));
+}
 
 // The forge labels that already exist on each repo (PRD #589 M4, sweep-label WARN).
 // repo-atlas is deliberately missing "bug" and "Planned" so enabling bug-triage /
