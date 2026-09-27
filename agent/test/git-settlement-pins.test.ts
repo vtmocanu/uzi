@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { nullLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import { GitCache } from "../src/git.js";
 
 // issue #1582 — GitCache.pinSettlementRefs against a REAL bare. The runner's containment
@@ -33,7 +33,7 @@ function settleRefs(bare: string): string[] {
 async function bareWithTwoCommits(): Promise<{ bare: string; mainTip: string; descTip: string }> {
   const bare = await git.ensureClone(fx.originPath);
   const mainTip = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
-  const rc = await git.createOrAttachRunnerClone(bare, 1);
+  const rc = await git.createOrAttachRunnerClone(bare, 1, noProofReseed);
   fs.writeFileSync(path.join(rc.path, "impl.ts"), "export const x = 1;\n");
   gitIn(rc.path, ["add", "impl.ts"]);
   gitIn(rc.path, [...IDENT, "commit", "-m", "impl"]);

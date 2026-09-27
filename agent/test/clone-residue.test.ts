@@ -13,6 +13,7 @@ import {
   PendingRecoveryCaptureError,
   type AttemptSeedOptions,
   type CanonicalReseedOptions,
+  type GitCacheOptions,
 } from "../src/git.js";
 import { failOriginForReason, RunRunner, type ExecutorFactory } from "../src/runner.js";
 import { formatResidueName, parseRetainedArtifactName } from "../src/attempt-path.js";
@@ -26,7 +27,7 @@ import {
 } from "../src/run-quiescence.js";
 import { RUN_ATTEMPT_ENV, RUN_CLONE_KEY_ENV } from "../src/worker-spawn-mark.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
-import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
+import { noProofReseed, nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
 // issue #1783 M3 — the CANONICAL reseed (an unwired worker's `<runnerRoot>/<repoDir>/<key>`) frees
@@ -296,7 +297,7 @@ describe("issue #1783 M3: journal classification runs before any free; a journal
     const { b, canonical, hash } = await primedCanonical(iid);
     await git.markRecoveryCapture(b, canonical, branch(iid), runId);
     const { reseed, calls } = recordingReseed();
-    await assert.rejects(git.createOrAttachRunnerClone(b, iid, runId, false, undefined, undefined, reseed), PendingRecoveryCaptureError);
+    await assert.rejects(git.createOrAttachRunnerClone(b, iid, reseed, runId), PendingRecoveryCaptureError);
     assertUntouched(canonical, hash, calls);
   });
 
@@ -305,7 +306,7 @@ describe("issue #1783 M3: journal classification runs before any free; a journal
     const { b, canonical, hash } = await primedCanonical(iid);
     await git.markRecoveryCapture(b, canonical, branch(iid), randomUUID());
     const { reseed, calls } = recordingReseed();
-    await assert.rejects(git.createOrAttachRunnerClone(b, iid, randomUUID(), false, undefined, undefined, reseed), ForeignCaptureBlockedError);
+    await assert.rejects(git.createOrAttachRunnerClone(b, iid, reseed, randomUUID()), ForeignCaptureBlockedError);
     assertUntouched(canonical, hash, calls);
   });
 
@@ -316,7 +317,7 @@ describe("issue #1783 M3: journal classification runs before any free; a journal
     fs.mkdirSync(other, { recursive: true });
     await git.markRecoveryCapture(b, other, branch(iid), randomUUID());
     const { reseed, calls } = recordingReseed();
-    await assert.rejects(git.createOrAttachRunnerClone(b, iid, randomUUID(), false, undefined, undefined, reseed), CapturePathMismatchError);
+    await assert.rejects(git.createOrAttachRunnerClone(b, iid, reseed, randomUUID()), CapturePathMismatchError);
     assertUntouched(canonical, hash, calls);
   });
 
@@ -336,7 +337,7 @@ describe("issue #1783 M3: journal classification runs before any free; a journal
       await git.markRecoveryCapture(b, canonical, branch(iid), runId);
       const { reseed, calls } = recordingReseed();
       const { opts, seeds } = attemptOpts();
-      await assert.rejects(git.createOrAttachRunnerClone(b, iid, runId, false, undefined, opts, reseed), PendingRecoveryCaptureError);
+      await assert.rejects(git.createOrAttachRunnerClone(b, iid, reseed, runId, false, undefined, opts), PendingRecoveryCaptureError);
       assert.deepEqual(seeds, [], "the attempt sweep never ran");
       assertUntouched(canonical, hash, calls);
     });
@@ -347,7 +348,7 @@ describe("issue #1783 M3: journal classification runs before any free; a journal
       await git.markRecoveryCapture(b, canonical, branch(iid), randomUUID());
       const { reseed, calls } = recordingReseed();
       const { opts, seeds } = attemptOpts();
-      await assert.rejects(git.createOrAttachRunnerClone(b, iid, randomUUID(), false, undefined, opts, reseed), ForeignCaptureBlockedError);
+      await assert.rejects(git.createOrAttachRunnerClone(b, iid, reseed, randomUUID(), false, undefined, opts), ForeignCaptureBlockedError);
       assert.deepEqual(seeds, []);
       assertUntouched(canonical, hash, calls);
     });
@@ -360,7 +361,7 @@ describe("issue #1783 M3: journal classification runs before any free; a journal
       await git.markRecoveryCapture(b, other, branch(iid), randomUUID());
       const { reseed, calls } = recordingReseed();
       const { opts, seeds } = attemptOpts();
-      await assert.rejects(git.createOrAttachRunnerClone(b, iid, randomUUID(), false, undefined, opts, reseed), CapturePathMismatchError);
+      await assert.rejects(git.createOrAttachRunnerClone(b, iid, reseed, randomUUID(), false, undefined, opts), CapturePathMismatchError);
       assert.deepEqual(seeds, []);
       assertUntouched(canonical, hash, calls);
     });
@@ -370,7 +371,7 @@ describe("issue #1783 M3: journal classification runs before any free; a journal
       const { b, canonical, hash } = await primedCanonical(iid);
       const { reseed, calls } = recordingReseed();
       const { opts } = attemptOpts();
-      const clone = await git.createOrAttachRunnerClone(b, iid, randomUUID(), false, undefined, opts, reseed);
+      const clone = await git.createOrAttachRunnerClone(b, iid, reseed, randomUUID(), false, undefined, opts);
       assert.notEqual(clone.path, canonical);
       assertUntouched(canonical, hash, calls);
     });
@@ -444,26 +445,54 @@ describe("issue #1783 M3: a blocked canonical free moves nothing and fails worke
     assert.deepEqual(residueNames(), [], "nothing was moved");
   });
 
-  it("a symlinked canonical path is refused, not followed: the link and its target stay, no proof, no residue", async () => {
+  it("a symlinked canonical path is quarantined, never followed: the link is renamed to residue, its target untouched, and the reseed succeeds", async () => {
     const iid = 3203;
     const canonical = canonicalFor(iid);
     const target = path.join(fx.dataDir, "elsewhere");
     fs.mkdirSync(target, { recursive: true });
     fs.writeFileSync(path.join(target, "KEEP.txt"), "not the runner's\n");
+    const targetHash = treeHash(target);
     fs.mkdirSync(path.dirname(canonical), { recursive: true });
     fs.symlinkSync(target, canonical);
+    const { logger, lines } = recordingLogger();
+    const recordingGit = new GitCache(fx.dataDir, logger, undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
     const { calls, quiesceRun } = recordedQuiescent();
-    const { factory, started } = transientFactory();
+    let worktree = "";
+    const { factory, started } = transientFactory((ctx) => {
+      worktree = ctx.worktreePath;
+    });
     const claim = gitlabClaim(iid);
-    await unwired(factory, { quiesceRun }).execute(claim);
-    assert.equal(started(), 0);
-    const failed = lastFailed(claim.run_id);
-    assert.equal(failed?.fail_origin, "worker_residue_blocked");
-    assert.match(String(failed?.failure_reason), /symlink/);
-    assert.equal(fs.lstatSync(canonical).isSymbolicLink(), true, "the link itself is left in place");
-    assert.equal(fs.readFileSync(path.join(target, "KEEP.txt"), "utf8"), "not the runner's\n", "its target is untouched");
+    await unwired(factory, { quiesceRun }, recordingGit).execute(claim);
+    assert.equal(started(), 1, "the reseed succeeded: a planted link no longer wedges the key");
+    assert.equal(worktree, canonical);
+    assert.equal(lastFailed(claim.run_id)?.fail_origin, undefined, "not a residue block");
+    const names = residueNames();
+    assert.equal(names.length, 1, `one residue entry: ${names.join(",")}`);
+    const residue = path.join(runnerRepoDir(), names[0]!);
+    assert.equal(fs.lstatSync(residue).isSymbolicLink(), true, "the LINK itself was moved, not what it points at");
+    assert.equal(fs.readlinkSync(residue), target);
+    assert.equal(treeHash(target), targetHash, "its target is untouched");
     assert.equal(calls.filter((c) => c.site === "canonical_reseed").length, 0, "no proof over a path that is not a real directory");
-    assert.deepEqual(residueNames(), []);
+    const warn = lines.find((l) => (l as { msg?: string }).msg?.includes("not a real directory"));
+    assert.equal((warn as { residue?: string } | undefined)?.residue, residue, "the quarantine is logged with the residue path");
+  });
+
+  it("a plain file at the canonical path is quarantined too, and the reseed succeeds", async () => {
+    const iid = 3205;
+    const canonical = canonicalFor(iid);
+    fs.mkdirSync(path.dirname(canonical), { recursive: true });
+    fs.writeFileSync(canonical, "planted by another run\n");
+    const { quiesceRun } = recordedQuiescent();
+    let worktree = "";
+    const { factory, started } = transientFactory((ctx) => {
+      worktree = ctx.worktreePath;
+    });
+    await unwired(factory, { quiesceRun }).execute(gitlabClaim(iid));
+    assert.equal(started(), 1);
+    assert.equal(worktree, canonical);
+    const names = residueNames();
+    assert.equal(names.length, 1);
+    assert.equal(fs.readFileSync(path.join(runnerRepoDir(), names[0]!), "utf8"), "planted by another run\n", "the file is kept as residue");
   });
 
   it(
@@ -505,7 +534,7 @@ describe("issue #1783 M3: a quarantined residue is never mistaken for a clone", 
       beforeSeed: async (p) => void seeds.push(p),
       quiescent: async () => true,
     };
-    await git.createOrAttachRunnerClone(b, iid, randomUUID(), false, undefined, opts);
+    await git.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID(), false, undefined, opts);
     assert.equal(seeds.length, 1);
     assert.deepEqual(
       seeds[0]!.filter((p) => path.basename(p).startsWith(".uzi-")),
@@ -514,9 +543,202 @@ describe("issue #1783 M3: a quarantined residue is never mistaken for a clone", 
     );
     assert.equal(fs.existsSync(path.join(residue, "agent", "src")), true, "one residue (under the cap) is kept");
     // A later canonical reseed of the same key leaves it alone too.
-    const again = await git.createOrAttachRunnerClone(b, iid, randomUUID(), false, undefined, undefined, { beforeFree: async () => {} });
+    const again = await git.createOrAttachRunnerClone(b, iid, { beforeFree: async () => {} }, randomUUID());
     assert.equal(again.path, canonicalFor(iid));
     assert.equal(fs.existsSync(residue), true);
     assert.equal(fs.readdirSync(runnerRepoDir()).filter((n) => n.startsWith(".uzi-residue-")).length, 1);
+  });
+});
+
+// ─── the delete runs as the runner uid; the defensive branches ─────────────────────────────
+
+describe("issue #1783 M3 rework: the canonical delete runs as the runner uid, and every defensive branch holds", () => {
+  type Seams = Pick<GitCacheOptions, "retentionDelete" | "canonicalFree">;
+  const recorded: Array<{ command: string; args: string[] }> = [];
+
+  function seamed(seams: Seams): { g: GitCache; lines: unknown[] } {
+    const { logger, lines } = recordingLogger();
+    return { g: new GitCache(fx.dataDir, logger, undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim(), ...seams })), lines };
+  }
+
+  /** A forced uid split whose runner-uid rm is recorded, then `effect` stands in for it. */
+  function splitRm(effect: (target: string) => void): Seams["retentionDelete"] {
+    recorded.length = 0;
+    return {
+      split: true,
+      run: async (command, args) => {
+        recorded.push({ command, args });
+        effect(args.at(-1)!);
+      },
+    };
+  }
+
+  const failingRm = (): Seams["retentionDelete"] =>
+    splitRm(() => {
+      throw new Error("runner-uid delete exited 1: rm: can't remove 'agent': Permission denied");
+    });
+
+  /** A removable canonical tree (no read-only part). */
+  function plantPlainTree(canonical: string): void {
+    fs.mkdirSync(path.join(canonical, "old"), { recursive: true });
+    fs.writeFileSync(path.join(canonical, "old", "f.txt"), "x");
+  }
+
+  it("under a forced uid split the canonical delete is the setpriv-wrapped /bin/rm -rf -- <canonical>, never an in-process rm", async () => {
+    const iid = 3401;
+    const canonical = canonicalFor(iid);
+    plantPlainTree(canonical);
+    const { g } = seamed({ retentionDelete: splitRm((t) => fs.rmSync(t, { recursive: true, force: true })) });
+    const b = await g.ensureClone(fx.originPath);
+    const clone = await g.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID());
+    assert.equal(clone.path, canonical);
+    assert.deepEqual(recorded.map((c) => c.args.at(-1)), [canonical], "exactly one runner-uid delete, of the canonical path");
+    const c = recorded[0]!;
+    assert.equal(c.command, "/bin/setpriv", "wrapped by runnerCommand");
+    assert.deepEqual(c.args.slice(-4), ["/bin/rm", "-rf", "--", canonical], "the fixed rm argv, target last");
+    assert.ok(c.args.includes("--reuid"), "as the runner uid");
+    assert.deepEqual(residueNames(), []);
+  });
+
+  it("a failed runner-uid delete that leaves the path present (a root-owned tree, a timeout) falls through to the same-parent quarantine", async () => {
+    const iid = 3402;
+    const canonical = canonicalFor(iid);
+    plantPlainTree(canonical);
+    const { g, lines } = seamed({ retentionDelete: failingRm() });
+    const b = await g.ensureClone(fx.originPath);
+    const clone = await g.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID());
+    assert.equal(clone.path, canonical);
+    assert.equal(recorded.length, 1);
+    const names = residueNames();
+    assert.equal(names.length, 1);
+    assert.equal(fs.readFileSync(path.join(runnerRepoDir(), names[0]!, "old", "f.txt"), "utf8"), "x", "the tree was moved, whole");
+    const warn = lines.find((l) => (l as { msg?: string }).msg?.includes("quarantined it as residue"));
+    assert.match(String((warn as { detail?: string }).detail), /Permission denied/);
+  });
+
+  it("a failed runner-uid delete that leaves NOTHING to quarantine has an unknown outcome: typed CloneResidueBlockedError", async () => {
+    const iid = 3403;
+    const canonical = canonicalFor(iid);
+    plantPlainTree(canonical);
+    const { g } = seamed({
+      retentionDelete: splitRm((t) => {
+        fs.rmSync(t, { recursive: true, force: true });
+        throw new Error("runner-uid delete timed out after 120000ms");
+      }),
+    });
+    const b = await g.ensureClone(fx.originPath);
+    await assert.rejects(g.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID()), (err: unknown) => {
+      assert.ok(err instanceof CloneResidueBlockedError);
+      assert.match(err.detail, /left nothing to quarantine: runner-uid delete timed out/);
+      return true;
+    });
+    assert.equal(fs.existsSync(canonical), false, "nothing was seeded");
+  });
+
+  it("the re-validation after a failed delete blocks when the repo dir no longer reads as a real directory; nothing is renamed", async () => {
+    const iid = 3404;
+    const canonical = canonicalFor(iid);
+    plantPlainTree(canonical);
+    const hash = treeHash(canonical);
+    const repoDir = runnerRepoDir();
+    const { g } = seamed({
+      retentionDelete: failingRm(),
+      canonicalFree: {
+        // After the delete ran, the repo dir reads as a symlink.
+        lstat: async (p) => (recorded.length > 0 && p === repoDir ? ({ isSymbolicLink: () => true, isDirectory: () => false } as fs.Stats) : fs.promises.lstat(p)),
+      },
+    });
+    const b = await g.ensureClone(fx.originPath);
+    await assert.rejects(g.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID()), (err: unknown) => {
+      assert.ok(err instanceof CloneResidueBlockedError);
+      assert.match(err.detail, /runner repo dir is not a real directory/);
+      return true;
+    });
+    assert.equal(recorded.length, 1, "the delete ran first");
+    assert.equal(treeHash(canonical), hash, "nothing was renamed");
+    assert.deepEqual(residueNames(), []);
+  });
+
+  it("an existing residue path blocks the rename (rename(2) would silently replace an empty directory)", async () => {
+    const iid = 3405;
+    const canonical = canonicalFor(iid);
+    plantPlainTree(canonical);
+    const hash = treeHash(canonical);
+    const uuid = randomUUID();
+    const taken = path.join(runnerRepoDir(), formatResidueName(`issue-${iid}`, uuid));
+    fs.mkdirSync(taken);
+    const { g } = seamed({ retentionDelete: failingRm(), canonicalFree: { residueUuid: () => uuid } });
+    const b = await g.ensureClone(fx.originPath);
+    await assert.rejects(g.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID()), (err: unknown) => {
+      assert.ok(err instanceof CloneResidueBlockedError);
+      assert.match(err.detail, /the residue path already exists/);
+      return true;
+    });
+    assert.equal(treeHash(canonical), hash, "the canonical tree was not moved");
+    assert.deepEqual(fs.readdirSync(taken), [], "the existing entry was not replaced");
+  });
+
+  it("a canonical path still present after the rename blocks, and the detail names the residue it moved", async () => {
+    const iid = 3406;
+    const canonical = canonicalFor(iid);
+    plantPlainTree(canonical);
+    const uuid = randomUUID();
+    const residueName = formatResidueName(`issue-${iid}`, uuid);
+    const { g } = seamed({
+      retentionDelete: failingRm(),
+      canonicalFree: {
+        residueUuid: () => uuid,
+        // The rename lands, then something re-creates the canonical path.
+        rename: async (from, to) => {
+          await fs.promises.rename(from, to);
+          fs.mkdirSync(from);
+        },
+      },
+    });
+    const b = await g.ensureClone(fx.originPath);
+    await assert.rejects(g.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID()), (err: unknown) => {
+      assert.ok(err instanceof CloneResidueBlockedError);
+      assert.match(err.detail, /still present after the quarantine moved it to /);
+      assert.ok(err.detail.includes(residueName), `the detail names the residue: ${err.detail}`);
+      return true;
+    });
+    assert.equal(fs.readFileSync(path.join(runnerRepoDir(), residueName, "old", "f.txt"), "utf8"), "x", "the moved tree is kept");
+    assert.equal(fs.existsSync(path.join(canonical, ".git")), false, "nothing was seeded");
+  });
+
+  it("a symlinked repo dir is refused before anything runs: nothing behind it is deleted or moved", async () => {
+    const iid = 3407;
+    const b = await git.ensureClone(fx.originPath);
+    const repoDir = runnerRepoDir();
+    const elsewhere = path.join(fx.dataDir, "elsewhere-repo");
+    fs.mkdirSync(path.join(elsewhere, `issue-${iid}`, "old"), { recursive: true });
+    fs.writeFileSync(path.join(elsewhere, `issue-${iid}`, "old", "f.txt"), "not the runner's\n");
+    const hash = treeHash(elsewhere);
+    fs.mkdirSync(path.dirname(repoDir), { recursive: true });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.symlinkSync(elsewhere, repoDir);
+    const proofs: string[] = [];
+    await assert.rejects(git.createOrAttachRunnerClone(b, iid, { beforeFree: async (p) => void proofs.push(p) }, randomUUID()), (err: unknown) => {
+      assert.ok(err instanceof CloneResidueBlockedError);
+      assert.match(err.detail, /runner repo dir is not a real directory/);
+      return true;
+    });
+    assert.deepEqual(proofs, [], "no proof, no delete");
+    assert.equal(treeHash(elsewhere), hash, "nothing behind the link was touched");
+    fs.unlinkSync(repoDir);
+  });
+});
+
+describe("issue #1783 M3 rework (N5): there is no unproven plain-rm fallback", () => {
+  it("a caller that omits the reseed options (only possible past the type) fails before anything is deleted", async () => {
+    const iid = 3501;
+    const b = await git.ensureClone(fx.originPath);
+    const canonical = canonicalFor(iid);
+    fs.mkdirSync(path.join(canonical, "old"), { recursive: true });
+    fs.writeFileSync(path.join(canonical, "old", "f.txt"), "x");
+    const hash = treeHash(canonical);
+    await assert.rejects(git.createOrAttachRunnerClone(b, iid, undefined as unknown as CanonicalReseedOptions, randomUUID()));
+    assert.equal(treeHash(canonical), hash, "the canonical tree was not deleted");
+    assert.deepEqual(residueNames(), []);
   });
 });

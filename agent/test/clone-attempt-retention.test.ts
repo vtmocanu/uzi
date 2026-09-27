@@ -25,7 +25,7 @@ import {
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
-import { recordingLogger, testGitCacheOptions } from "./helpers.js";
+import { recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 
 // issue #1783 M2 — the git-layer half of per-attempt clone paths: the retention sweep that bounds
 // what retained attempts cost, the attempt ledger / recovery journal contract the watcher's backup
@@ -131,7 +131,7 @@ describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
     const s = await keyFixture();
     const planted = [0, 1, 2, 3, 4, 5].map((i) => ({ id: idAt(i), ...plantAttempt(s, idAt(i), `run-${i}`, "abandoned") }));
     const opts = seedOpts();
-    const seeded = await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, opts);
+    const seeded = await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, opts);
     for (const p of planted.slice(0, 3)) {
       assert.equal(fs.existsSync(p.dir), false, `oldest ${p.id} deleted`);
       assert.equal(fs.existsSync(p.skills), false, "with its skills sibling");
@@ -171,7 +171,7 @@ describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
       isLive: (p) => p === live!.dir,
       quiescent: async (paths) => paths[0] !== busy!.dir,
     });
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, opts);
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, opts);
     for (const p of [journaled, custody, live, busy]) {
       assert.equal(fs.existsSync(p!.dir), true, `${p!.id} kept`);
       assert.equal(fs.existsSync(p!.skills), true, `${p!.id} skills kept`);
@@ -194,7 +194,7 @@ describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
     const unknown = `${s.canonical}.attempt-${idAt(20)}`;
     fs.mkdirSync(unknown);
     const live = new Set(liveOnes.map((p) => p.dir));
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, seedOpts({ isLive: (p) => live.has(p) }));
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts({ isLive: (p) => live.has(p) }));
     for (const p of [...liveOnes, ...reclaimed, ...retired]) assert.equal(fs.existsSync(p.dir), true, p.dir);
     assert.equal(fs.existsSync(unknown), true);
   });
@@ -217,7 +217,7 @@ describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
     fs.mkdirSync(legacy);
     fs.utimesSync(legacy, t0 - 120, t0 - 120);
     const opts = seedOpts();
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, opts);
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, opts);
     assert.deepEqual(residue.map((p) => fs.existsSync(p)), [false, false, true, true, true, true, true]);
     assert.equal(fs.existsSync(other), true, "issue-30011's residue is not issue-3001's");
     assert.equal(fs.existsSync(legacy), true, "a name outside the pinned grammar is never deleted");
@@ -246,6 +246,7 @@ describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
       s.bare,
       s.branch,
       s.key,
+      noProofReseed,
       "run-new",
       false,
       undefined,
@@ -349,7 +350,7 @@ describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
     // And the git layer refuses such a key outright before seeding an attempt.
     const s = await keyFixture();
     await assert.rejects(
-      git.runnerCloneForBranch(s.bare, "agent/x", ".uzi-skills-evil", "r", false, undefined, seedOpts()),
+      git.runnerCloneForBranch(s.bare, "agent/x", ".uzi-skills-evil", noProofReseed, "r", false, undefined, seedOpts()),
       /unsafe runner clone key/,
     );
   });
@@ -384,7 +385,7 @@ describe("issue #1783 M2 review: retention deletions are re-validated and run as
       fs.utimesSync(p, 1_700_000_000 + i, 1_700_000_000 + i);
       return p;
     });
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, seedOpts());
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
     assert.deepEqual(calls.map((c) => c.args.at(-1)), [planted[0]!.skills, planted[0]!.dir, residue[0]], "the skills sibling first (NB1)");
     for (const c of calls) {
       assert.equal(c.command, "/bin/setpriv", "wrapped by runnerCommand");
@@ -394,7 +395,7 @@ describe("issue #1783 M2 review: retention deletions are re-validated and run as
     assert.equal(ledgerState(s, idAt(0)), "retired");
   });
 
-  it("refuses a symlinked top-level target (and its target is untouched)", async () => {
+  it("refuses a symlinked attempt; unlinks a symlinked or plain-file residue entry without following it (targets untouched)", async () => {
     const s = await keyFixture();
     const victim = path.join(fx.dataDir, "victim");
     fs.mkdirSync(victim);
@@ -406,14 +407,20 @@ describe("issue #1783 M2 review: retention deletions are re-validated and run as
     const residueLink = path.join(s.parent, formatResidueName(s.key, randomUUID()));
     fs.symlinkSync(victim, residueLink);
     fs.lutimesSync(residueLink, 1_600_000_000, 1_600_000_000);
+    // issue #1783 M3: the canonical free quarantines a planted symlink or file AS residue.
+    const residueFile = path.join(s.parent, formatResidueName(s.key, randomUUID()));
+    fs.writeFileSync(residueFile, "planted\n");
+    fs.utimesSync(residueFile, 1_600_000_001, 1_600_000_001);
     for (let i = 0; i < 5; i++) fs.mkdirSync(path.join(s.parent, formatResidueName(s.key, randomUUID())));
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, seedOpts());
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
     assert.equal(fs.lstatSync(oldest).isSymbolicLink(), true, "the symlinked attempt is kept");
-    assert.equal(fs.lstatSync(residueLink).isSymbolicLink(), true, "the symlinked residue is kept");
+    assert.equal(fs.lstatSync(residueLink, { throwIfNoEntry: false }), undefined, "the symlinked residue entry is unlinked, never kept forever");
+    assert.equal(fs.existsSync(residueFile), false, "the plain-file residue entry is unlinked");
+    assert.deepEqual(fs.readdirSync(victim), ["PRECIOUS"], "the link's target directory is untouched");
     assert.equal(fs.readFileSync(path.join(victim, "PRECIOUS"), "utf8"), "x");
     assert.equal(ledgerState(s, idAt(0)), "abandoned", "not marked retired");
     const refusals = lines.filter((l) => (l as { msg?: string }).msg?.includes("refusing to delete")).map((l) => (l as { path?: string }).path);
-    assert.deepEqual(refusals.sort(), [oldest, residueLink].sort());
+    assert.deepEqual(refusals, [oldest], "only the symlinked attempt is refused");
   });
 });
 
@@ -423,7 +430,7 @@ describe("issue #1783 M2 review: attempt-journal guards (A′ id mismatch, relea
     const dir = plantAttempt(s, idAt(1), "run-a", "live").dir;
     cfg(s.bare, `uzi-recovery.${s.branch}.clone`, JSON.stringify({ runId: "run-a", clonePath: dir, attemptId: idAt(2) }));
     await assert.rejects(
-      git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-a", false, undefined, seedOpts()),
+      git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-a", false, undefined, seedOpts()),
       (err: unknown) => (err as Error).name === "CapturePathMismatchError",
     );
     assert.equal(fs.readFileSync(path.join(dir, "WORK.txt"), "utf8"), idAt(1));
@@ -432,7 +439,7 @@ describe("issue #1783 M2 review: attempt-journal guards (A′ id mismatch, relea
   it("releaseAttemptInPlace refuses unless the journal names exactly (runId, clonePath): nothing written", async () => {
     const s = await keyFixture("issue-3302", "agent/issue-3302");
     const attemptId = mintAttemptId(2);
-    const seeded = await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-b", false, undefined, seedOpts({ attemptId }));
+    const seeded = await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-b", false, undefined, seedOpts({ attemptId }));
     await git.markRecoveryCapture(s.bare, seeded.path, s.branch, "run-b", attemptId);
     const journal = cfgAll(s.bare, `uzi-recovery.${s.branch}.clone`);
     const ledger = cfgAll(s.bare, `uzi-attempts.${s.branch}.entry`);
@@ -451,7 +458,7 @@ describe("issue #1783 M2 review: attempt-journal guards (A′ id mismatch, relea
   it("a journal-clear failure after the ledger append is typed stage journal, and the journal is kept", async () => {
     const s = await keyFixture("issue-3303", "agent/issue-3303");
     const attemptId = mintAttemptId(2);
-    const seeded = await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-c", false, undefined, seedOpts({ attemptId }));
+    const seeded = await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-c", false, undefined, seedOpts({ attemptId }));
     await git.markRecoveryCapture(s.bare, seeded.path, s.branch, "run-c", attemptId);
     const seam = git as unknown as { runGit: (cwd: string | undefined, args: string[], ...rest: unknown[]) => Promise<string> };
     const real = seam.runGit.bind(git);
@@ -480,7 +487,7 @@ describe("issue #1783 M2 review: the ledger stays bounded (N4)", () => {
     cfg(s.bare, "--add", key, "not json");
     let nonLive: string[] = [];
     const attemptId = mintAttemptId(5);
-    const seeded = await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, seedOpts({
+    const seeded = await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts({
       attemptId,
       beforeSeed: async (paths) => {
         nonLive = paths;
@@ -617,7 +624,7 @@ describe("issue #1783 M2 final review (NB1): no orphaned .uzi-skills sibling", (
     failingOn((t) => path.basename(t).startsWith(".uzi-skills-"));
     const s = await keyFixture();
     const planted = [0, 1, 2, 3].map((i) => plantAttempt(s, idAt(i), `run-${i}`, "abandoned"));
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, seedOpts());
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
     assert.equal(fs.existsSync(planted[0]!.skills), true);
     assert.equal(fs.existsSync(planted[0]!.dir), true, "the attempt dir is kept with its skills sibling");
     assert.equal(ledgerState(s, idAt(0)), "abandoned");
@@ -628,14 +635,14 @@ describe("issue #1783 M2 final review (NB1): no orphaned .uzi-skills sibling", (
     failingOn((t) => failAttempt && !path.basename(t).startsWith("."));
     const s = await keyFixture();
     const planted = [0, 1, 2, 3].map((i) => plantAttempt(s, idAt(i), `run-${i}`, "abandoned"));
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, seedOpts());
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
     assert.equal(fs.existsSync(planted[0]!.skills), false, "the skills sibling went first");
     assert.equal(fs.existsSync(planted[0]!.dir), true, "the attempt is kept");
     assert.equal(ledgerState(s, idAt(0)), "abandoned", "still disposable, not retired");
     const orphans = fs.readdirSync(s.parent).filter((n) => n.startsWith(".uzi-skills-") && !fs.existsSync(path.join(s.parent, n.slice(".uzi-skills-".length))));
     assert.deepEqual(orphans, [], "no skills dir without its attempt");
     failAttempt = false;
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new-2", false, undefined, seedOpts({ attemptId: mintAttemptId(10) }));
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new-2", false, undefined, seedOpts({ attemptId: mintAttemptId(10) }));
     assert.equal(fs.existsSync(planted[0]!.dir), false, "retried and deleted");
     assert.equal(ledgerState(s, idAt(0)), "retired");
   });
@@ -674,7 +681,7 @@ describe("issue #1783 M2 final review (NB1): no orphaned .uzi-skills sibling", (
         return paths[0] !== busy;
       },
     });
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, opts);
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, opts);
     assert.equal(fs.existsSync(noEntry), false, "no ledger entry: swept");
     assert.equal(fs.existsSync(retiredOne), false, "retired: swept");
     for (const p of [reclaimedOne, liveOne, journaledOne, otherKey, busy, withAttempt.skills]) assert.equal(fs.existsSync(p), true, p);
@@ -747,7 +754,7 @@ describe("issue #1783 M2 review: crash-window orphans (N5)", () => {
     cfg(s.bare, "uzi-recovery.agent/elsewhere.clone", JSON.stringify({ runId: "run-4", clonePath: journaledLive.dir }));
     fs.mkdirSync(path.join(fx.dataDir, "recovery", "run-5"), { recursive: true });
     fs.writeFileSync(path.join(fx.dataDir, "recovery", "run-5", "capture.json"), "{}");
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, seedOpts({ isLive: (p) => p === liveHere.dir }));
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts({ isLive: (p) => p === liveHere.dir }));
     assert.equal(fs.existsSync(orphans[0]!.dir), false, "the oldest crash-window orphan is deleted");
     assert.equal(fs.existsSync(orphans[0]!.skills), false);
     assert.equal(ledgerState(s, idAt(0)), "retired");
@@ -769,7 +776,7 @@ describe("issue #1783 M2 P-ledger-contract: the keys and JSON shapes backup-runs
   it("the worker writes exactly those keys and JSON field names, and the script's own jq filter reads them", async () => {
     const s = await keyFixture("issue-3101", "agent/issue-3101");
     const attemptId = mintAttemptId(4);
-    const seeded = await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-3101", false, undefined, seedOpts({ attemptId }));
+    const seeded = await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-3101", false, undefined, seedOpts({ attemptId }));
     await git.markRecoveryCapture(s.bare, seeded.path, s.branch, "run-3101", seeded.attemptId);
     const ledger = cfgAll(s.bare, `uzi-attempts.${s.branch}.entry`);
     assert.deepEqual(ledger, [JSON.stringify({ attemptId, runId: "run-3101", clonePath: seeded.path, state: "live" })]);
@@ -798,11 +805,11 @@ describe("issue #1783 M2 P-ledger-contract: the keys and JSON shapes backup-runs
 
   it("an older worker's journal without attemptId is still read", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const clone = await git.createOrAttachRunnerClone(bare, 3102, "run-old");
+    const clone = await git.createOrAttachRunnerClone(bare, 3102, noProofReseed, "run-old");
     cfg(bare, "uzi-recovery.agent/issue-3102.clone", JSON.stringify({ runId: "run-old", clonePath: clone.path }));
-    await assert.rejects(git.createOrAttachRunnerClone(bare, 3102, "run-old"), PendingRecoveryCaptureError);
+    await assert.rejects(git.createOrAttachRunnerClone(bare, 3102, noProofReseed, "run-old"), PendingRecoveryCaptureError);
     await assert.rejects(
-      git.createOrAttachRunnerClone(bare, 3102, "run-old", false, undefined, seedOpts()),
+      git.createOrAttachRunnerClone(bare, 3102, noProofReseed, "run-old", false, undefined, seedOpts()),
       (err: unknown) => err instanceof PendingRecoveryCaptureError && err.clonePath === clone.path,
     );
   });
@@ -833,7 +840,7 @@ describe("issue #1783 M2 P-foreign: classifyOwnerClonePath (d′)", () => {
 describe("issue #1783 M2 P-separator: an attempt path is an ordinary working tree", () => {
   it("passes screenToolPath, git status under the pinned gitEnv, the Codex broker's path check and require.resolve", async () => {
     const s = await keyFixture("issue-3201", "agent/issue-3201");
-    const seeded = await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-3201", false, undefined, seedOpts());
+    const seeded = await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-3201", false, undefined, seedOpts());
     const p = seeded.path;
     assert.match(path.basename(p), /^issue-3201\.attempt-/);
 

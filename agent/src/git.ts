@@ -2,7 +2,7 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
-import { constants as fsConstants, createReadStream } from "node:fs";
+import { constants as fsConstants, createReadStream, type Stats } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -240,10 +240,19 @@ export interface GitCacheOptions {
   /** Test-only stand-in for runner-clone scratch provisioning, for the non-Linux dev loop.
    *  Production never passes it, so the real provisioner runs and fails closed off Linux. */
   scratchProvisioner?: (clonePath: string) => Promise<void>;
-  /** issue #1783 M2 — test-only seam for the retention sweep's deletions. `split` overrides
-   *  {@link uidSplitActive} for these deletions alone; `run` executes the ALREADY runner-wrapped
-   *  delete argv in place of the real spawn. Production never passes it. */
+  /** issue #1783 M2 — test-only seam for the runner-uid deletions (the retention sweep's, and M3's
+   *  canonical-path free). `split` overrides {@link uidSplitActive} for these deletions alone; `run`
+   *  executes the ALREADY runner-wrapped delete argv in place of the real spawn. Production never
+   *  passes it. */
   retentionDelete?: { split?: boolean; run?: (command: string, args: string[]) => Promise<void> };
+  /** issue #1783 M3 — test-only fs seam for the canonical-path free (freeCanonicalClonePath):
+   *  `lstat` replaces the validation lstat of the repo dir and the canonical path, `rename` the
+   *  quarantine rename, `residueUuid` the residue name's uuid. Production never passes it. */
+  canonicalFree?: {
+    lstat?: (p: string) => Promise<Stats>;
+    rename?: (from: string, to: string) => Promise<void>;
+    residueUuid?: () => string;
+  };
 }
 
 /** issue #1597 M2: the mid-turn checkpoint secret scan's hard deadline (all of its git + gitleaks
@@ -530,10 +539,11 @@ export const REASON_WORKER_RESIDUE_BLOCKED = "worker_residue_blocked";
 
 /**
  * issue #1783 M3 — the canonical runner clone path could not be freed for a reseed: the scoped
- * process scan found survivors, an unverified process or a live same-key owner, the path is not a
- * real directory under runnerRoot (e.g. a symlink), or the same-parent quarantine rename itself
- * failed. Nothing further is moved or deleted. The run fails typed `worker_residue_blocked`, never
- * the generic agent_failure.
+ * process scan found survivors, an unverified process or a live same-key owner, the path or its
+ * repo dir failed validation (not `<runnerRoot>/<repoDir>/<key>`, or the repo dir not a real
+ * directory), the delete failed with nothing left to quarantine, or the same-parent quarantine
+ * rename (or its confirm) failed. Nothing further is moved or deleted. The run fails typed
+ * `worker_residue_blocked`, never the generic agent_failure.
  */
 export class CloneResidueBlockedError extends Error {
   readonly detail: string;
@@ -545,11 +555,6 @@ export class CloneResidueBlockedError extends Error {
     this.name = "CloneResidueBlockedError";
   }
 }
-
-/** issue #1783 M3 — the rm errors that mean "something in the tree is not ours to delete" (a
- *  root-owned or read-only directory, or a file a process re-created mid-walk), after which the
- *  canonical path is quarantined by a same-parent rename instead. Anything else propagates. */
-const QUARANTINE_RM_CODES: ReadonlySet<string> = new Set(["EACCES", "EPERM", "ENOTEMPTY"]);
 
 function recoveryCaptureKey(branch: string): string {
   return `uzi-recovery.${branch}.clone`;
@@ -649,13 +654,15 @@ const RETENTION_RM_TIMEOUT_MS = 120_000;
  * issue #1783 M3 — what the runner hands {@link GitCache.runnerCloneForBranch} so a CANONICAL
  * reseed (an unwired worker, or any canonical-path seed) frees `<runnerRoot>/<repoDir>/<key>`
  * only after a scoped process proof, and quarantines what it cannot delete instead of failing on
- * it. Absent ⇒ today's plain `fs.rm`, byte-for-byte. A Docker-wired attempt seed never frees the
- * canonical path, so it never calls this.
+ * it. REQUIRED on every entry point (N5): there is no unproven plain-`fs.rm` fallback. A
+ * Docker-wired attempt seed never frees the canonical path, so it never calls this.
  */
 export interface CanonicalReseedOptions {
   /** The process proof over the canonical path, called under the bare lock AFTER the journal
    *  classification and only when the canonical path exists and is a real directory under
-   *  runnerRoot. Throws (a {@link CloneResidueBlockedError}) to block: nothing is removed or moved. */
+   *  runnerRoot (a symlink or other non-directory there is quarantined without it: renaming the
+   *  entry moves nothing a process can be inside). Throws (a {@link CloneResidueBlockedError}) to
+   *  block: nothing is removed or moved. */
   beforeFree: (canonicalPath: string) => Promise<void>;
 }
 
@@ -888,6 +895,8 @@ export class GitCache {
   private readonly scratchProvisioner: ((clonePath: string) => Promise<void>) | undefined;
   /** See {@link GitCacheOptions.retentionDelete}; undefined in production. */
   private readonly retentionDeleteSeam: GitCacheOptions["retentionDelete"];
+  /** See {@link GitCacheOptions.canonicalFree}; undefined in production. */
+  private readonly canonicalFreeSeam: GitCacheOptions["canonicalFree"];
   /** issue #1597 M2: memoised `--remerge-diff` support probe. */
   private remergeProbe: Promise<boolean> | undefined;
 
@@ -902,6 +911,7 @@ export class GitCache {
     this.gitleaksBin = opts.gitleaksBin ?? "gitleaks";
     this.scratchProvisioner = opts.scratchProvisioner;
     this.retentionDeleteSeam = opts.retentionDelete;
+    this.canonicalFreeSeam = opts.canonicalFree;
     this.reposRoot = path.join(dataDir, "repos");
     this.runnerRoot = path.join(dataDir, "runner");
     this.runnerHoldingRoot = path.join(dataDir, "runner-quarantine");
@@ -1145,13 +1155,13 @@ export class GitCache {
   async createOrAttachRunnerClone(
     barePath: string,
     issueIid: number,
+    reseed: CanonicalReseedOptions,
     runId?: string,
     resume = false,
     expectedCheckpointTip?: string,
     attempt?: AttemptSeedOptions,
-    reseed?: CanonicalReseedOptions,
   ): Promise<RunnerClone> {
-    return this.runnerCloneForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`, runId, resume, expectedCheckpointTip, attempt, reseed);
+    return this.runnerCloneForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`, reseed, runId, resume, expectedCheckpointTip, attempt);
   }
 
   /** The canonical runner-clone path for a clone key under a bare's repo dir: the single
@@ -1246,20 +1256,20 @@ export class GitCache {
    * instead of this canonical one and classifies the journal by identity; see
    * {@link attemptCloneForBranch}. Absent ⇒ everything above, byte-for-byte.
    *
-   * issue #1783 M3 — `reseed` (the runner passes it on every claim) makes the canonical reseed
-   * free the canonical path through {@link freeCanonicalClonePath}: a scoped process proof first,
-   * then the delete, and a same-parent quarantine of whatever the delete could not remove. Absent
-   * ⇒ the plain `fs.rm`.
+   * issue #1783 M3 — `reseed` (REQUIRED: the runner passes it on every claim, and there is no
+   * unproven plain-`fs.rm` fallback) makes the canonical reseed free the canonical path through
+   * {@link freeCanonicalClonePath}: a scoped process proof first, then the runner-uid delete, and a
+   * same-parent quarantine of whatever the delete could not remove. An attempt seed never uses it.
    */
   async runnerCloneForBranch(
     barePath: string,
     branch: string,
     key: string,
+    reseed: CanonicalReseedOptions,
     runId?: string,
     resume = false,
     expectedCheckpointTip?: string,
     attempt?: AttemptSeedOptions,
-    reseed?: CanonicalReseedOptions,
   ): Promise<RunnerClone> {
     if (attempt) return this.attemptCloneForBranch(barePath, branch, key, runId, resume, expectedCheckpointTip, attempt);
     return this.withLock(barePath, async () => {
@@ -1289,8 +1299,7 @@ export class GitCache {
         throw new PendingRecoveryCaptureError(clonePath, branch);
       }
       // issue #1783 M3: the journal cases above ran first and threw with the path untouched.
-      if (reseed) await this.freeCanonicalClonePath(clonePath, key, reseed);
-      else await fs.rm(clonePath, { recursive: true, force: true });
+      await this.freeCanonicalClonePath(clonePath, key, reseed);
       return this.seedRunnerClone(barePath, branch, clonePath, runId, resume, expectedCheckpointTip);
     });
   }
@@ -1299,77 +1308,123 @@ export class GitCache {
    * issue #1783 M3 — free the canonical clone path `<runnerRoot>/<repoDir>/<key>` for a reseed,
    * under the caller's bare lock, after the journal classification:
    *
-   *   0. Nothing there (lstat ENOENT) ⇒ nothing to free, no proof needed.
-   *   1. Validate: the path lies under runnerRoot, its parent IS `<runnerRoot>/<repoDir>`, and lstat
-   *      shows a real directory. A symlink (or any other type) is refused, never followed, and
-   *      nothing is removed.
-   *   2. The scoped process proof (`reseed.beforeFree`); it throws to block with nothing moved.
-   *   3. `fs.rm` (recursive, force). Done when it succeeds.
-   *   4. On EACCES / EPERM / ENOTEMPTY (a root-owned or read-only directory in the tree, e.g. left
-   *      by a Docker bind), rename what is left to `<runnerRoot>/<repoDir>/<formatResidueName(key,
-   *      uuid)>` in the SAME parent. Same parent is load-bearing: `<repoDir>` is worker-owned 2775
-   *      and not sticky (see seedRunnerClone), so the worker may rename any entry within it, while a
-   *      cross-parent move (like createRetireScratchParent's `.retire-*`) must also rewrite the moved
-   *      directory's `..`, which needs write on the moved directory itself: EACCES on a root-owned one.
-   *   5. Confirm the canonical path is free (lstat ENOENT).
+   *   1. Inspect ({@link inspectCanonical}): the path lies under runnerRoot, its parent IS
+   *      `<runnerRoot>/<repoDir>` and lstat's as a real directory. Nothing there (ENOENT) ⇒ nothing
+   *      to free, no proof needed.
+   *   2. A symlink, plain file or any other non-directory AT the canonical path (a runner-uid agent
+   *      of another run can plant one: the repo dir is 2775 and not sticky) is never followed and
+   *      never deleted through: the entry itself is quarantined by the same-parent rename (step 5;
+   *      rename(2) never follows its final component), logged, and the reseed continues.
+   *   3. A real directory: the scoped process proof (`reseed.beforeFree`); it throws to block with
+   *      nothing moved.
+   *   4. The delete, AS THE RUNNER UID under the uid split ({@link runRunnerUidDelete}: the
+   *      setpriv-wrapped `/bin/rm -rf -- <canonical>`, bounded by its timeout). The tree is
+   *      runner-writable, so its interior is agent-controlled: a path-based recursive delete run as
+   *      the WORKER follows a directory swapped for a symlink mid-walk into worker-owned data, while
+   *      the runner uid can reach only what it could already delete. Single-uid (#58) has no second
+   *      uid and so no boundary: the delete stays the in-process `fs.rm` there. Done when the path
+   *      is then gone.
+   *   5. Otherwise (the delete failed, timed out, or left the path present: a root-owned or read-only
+   *      directory in the tree, e.g. left by a Docker bind) re-inspect (step 1's checks again), then
+   *      rename what is left to `<runnerRoot>/<repoDir>/<formatResidueName(key, uuid)>` in the SAME
+   *      parent, as the worker: a rename is non-recursive and never follows. Same parent is
+   *      load-bearing: `<repoDir>` is worker-owned 2775 and not sticky (see seedRunnerClone), so the
+   *      worker may rename any entry within it, while a cross-parent move (like
+   *      createRetireScratchParent's `.retire-*`) must also rewrite the moved directory's `..`,
+   *      which needs write on the moved directory itself: EACCES on a root-owned one. A delete that
+   *      FAILED yet left nothing to rename has an unknown outcome and blocks.
+   *   6. Confirm the canonical path is free (lstat ENOENT).
    *
    * The residue is KEPT: nothing here deletes it. Only the retention sweep may, later, as the runner
    * uid and under the per-key cap (a root-owned residue then fails that delete and stays). Any
-   * failure of steps 1, 2, 4 or 5 is a {@link CloneResidueBlockedError}.
+   * failure of steps 1, 3, 5 or 6 is a {@link CloneResidueBlockedError}.
    */
   private async freeCanonicalClonePath(canonical: string, key: string, reseed: CanonicalReseedOptions): Promise<void> {
-    if (!(await this.pathPresent(canonical))) return;
-    await this.assertCanonicalDirectory(canonical);
-    await reseed.beforeFree(canonical);
-    let rmErr: NodeJS.ErrnoException;
-    try {
-      await fs.rm(canonical, { recursive: true, force: true });
+    const found = await this.inspectCanonical(canonical);
+    if (found === "absent") return;
+    if (found === "other") {
+      const residue = await this.quarantineCanonical(canonical, key);
+      this.log.warn("runner clone: the canonical path was not a real directory (a symlink or a file); quarantined the entry itself as residue in the same parent, never followed (kept)", {
+        canonical,
+        residue,
+      });
       return;
-    } catch (err) {
-      rmErr = err as NodeJS.ErrnoException;
-      if (!QUARANTINE_RM_CODES.has(rmErr.code ?? "")) throw err;
     }
-    // Re-validate: the partial delete must not have changed what the canonical path IS.
-    await this.assertCanonicalDirectory(canonical);
+    await reseed.beforeFree(canonical);
+    let deleteErr: unknown;
+    try {
+      await this.runRunnerUidDelete(canonical);
+    } catch (err) {
+      deleteErr = err;
+    }
+    // Re-validate: whatever the delete did, what is at the canonical path is inspected afresh.
+    const after = await this.inspectCanonical(canonical);
+    if (after === "absent") {
+      if (deleteErr === undefined) return;
+      throw new CloneResidueBlockedError(`the delete failed and left nothing to quarantine: ${gitErrorMessage(deleteErr)}`);
+    }
+    const residue = await this.quarantineCanonical(canonical, key);
+    this.log.warn("runner clone: the canonical path could not be deleted; quarantined it as residue in the same parent (kept)", {
+      canonical,
+      residue,
+      rm_error: (deleteErr as NodeJS.ErrnoException | undefined)?.code,
+      detail: deleteErr === undefined ? "the delete left the path present" : sanitizeForLog(gitErrorMessage(deleteErr)),
+    });
+  }
+
+  /** issue #1783 M3 — the same-parent quarantine rename of whatever is at `canonical` (any type:
+   *  rename(2) moves the entry itself, never what a symlink points at) to
+   *  `formatResidueName(key, uuid)`, then the confirm that the canonical path is free. Returns the
+   *  residue path. Throws {@link CloneResidueBlockedError}. */
+  private async quarantineCanonical(canonical: string, key: string): Promise<string> {
     let residue: string;
     try {
-      residue = path.join(path.dirname(canonical), formatResidueName(key, randomUUID()));
+      residue = path.join(path.dirname(canonical), formatResidueName(key, this.canonicalFreeSeam?.residueUuid?.() ?? randomUUID()));
     } catch (err) {
       throw new CloneResidueBlockedError(`no residue name for the key: ${gitErrorMessage(err)}`);
     }
     if (path.dirname(residue) !== path.dirname(canonical)) throw new CloneResidueBlockedError("the residue name leaves the canonical parent");
     // rename(2) silently replaces an EMPTY directory at the destination: never let it.
-    if (await this.pathPresent(residue)) throw new CloneResidueBlockedError("the residue path already exists");
+    if (await this.pathPresent(residue)) throw new CloneResidueBlockedError(`the residue path already exists: ${path.basename(residue)}`);
     try {
-      await fs.rename(canonical, residue);
+      await (this.canonicalFreeSeam?.rename ?? fs.rename)(canonical, residue);
     } catch (err) {
       throw new CloneResidueBlockedError(`quarantine rename failed: ${gitErrorMessage(err)}`);
     }
-    if (await this.pathPresent(canonical)) throw new CloneResidueBlockedError("the canonical path is still present after the quarantine");
-    this.log.warn("runner clone: the canonical path could not be deleted; quarantined it as residue in the same parent (kept)", {
-      canonical,
-      residue,
-      rm_error: rmErr.code,
-      detail: sanitizeForLog(gitErrorMessage(rmErr)),
-    });
+    if (await this.pathPresent(canonical)) {
+      throw new CloneResidueBlockedError(`the canonical path is still present after the quarantine moved it to ${path.basename(residue)}`);
+    }
+    return residue;
   }
 
-  /** issue #1783 M3 — the canonical path must be a REAL directory (lstat: a symlink is refused, not
-   *  followed) directly under `<runnerRoot>/<repoDir>`. Throws {@link CloneResidueBlockedError}. */
-  private async assertCanonicalDirectory(canonical: string): Promise<void> {
+  /** issue #1783 M3 — what is at the canonical path, validated: it must be
+   *  `<runnerRoot>/<repoDir>/<key>`, and `<repoDir>` must lstat as a REAL directory (a symlink is
+   *  never followed). `"absent"` when the repo dir or the canonical path does not exist,
+   *  `"directory"` for a real directory, `"other"` for a symlink, file or anything else (lstat,
+   *  never followed). Throws {@link CloneResidueBlockedError}. */
+  private async inspectCanonical(canonical: string): Promise<"absent" | "directory" | "other"> {
     const root = path.resolve(this.runnerRoot);
     const resolved = path.resolve(canonical);
     if (!isWithinPath(resolved, root) || path.dirname(path.dirname(resolved)) !== root) {
       throw new CloneResidueBlockedError("the canonical path is not <runnerRoot>/<repoDir>/<key>");
     }
-    let st;
+    const lstat = this.canonicalFreeSeam?.lstat ?? ((p: string) => fs.lstat(p));
+    let pst: Stats;
     try {
-      st = await fs.lstat(canonical);
+      pst = await lstat(path.dirname(resolved));
     } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return "absent";
+      throw new CloneResidueBlockedError(`the runner repo dir cannot be inspected: ${gitErrorMessage(err)}`);
+    }
+    if (pst.isSymbolicLink() || !pst.isDirectory()) throw new CloneResidueBlockedError("the runner repo dir is not a real directory");
+    let st: Stats;
+    try {
+      st = await lstat(resolved);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return "absent";
       throw new CloneResidueBlockedError(`the canonical path cannot be inspected: ${gitErrorMessage(err)}`);
     }
-    if (st.isSymbolicLink()) throw new CloneResidueBlockedError("the canonical path is a symlink; refusing to follow or free it");
-    if (!st.isDirectory()) throw new CloneResidueBlockedError("the canonical path is not a directory");
+    return st.isDirectory() && !st.isSymbolicLink() ? "directory" : "other";
   }
 
   /** issue #1783 M2 — lstat reconciliation: true when `p` exists (any type), false on ENOENT;
@@ -1548,7 +1603,8 @@ export class GitCache {
    *
    * `seeding` (the attempt path this seed just made) is never a candidate.
    * Every deletion goes through {@link deleteRetainedArtifact} (re-validated, runner-uid). A deletion
-   * that fails or is refused (e.g. a root-owned dir, a symlink) is logged and the entry is kept.
+   * that fails or is refused (e.g. a root-owned dir, a symlinked attempt) is logged and the entry is
+   * kept. A residue entry that is a symlink or file is unlinked (the entry itself, never followed).
    */
   private async sweepRetainedArtifacts(
     barePath: string,
@@ -1645,7 +1701,7 @@ export class GitCache {
     for (const r of residue.slice(0, Math.max(0, residue.length - RETAINED_RESIDUE_PER_KEY))) {
       if (namedByJournal(r.p) || attempt.isLive(r.p)) continue;
       if (!(await quiescent([r.p]))) continue;
-      if (await this.deleteRetainedArtifact(parent, r.p, isOwnResidue)) {
+      if (await this.deleteRetainedArtifact(parent, r.p, isOwnResidue, { unlinkNonDirectory: true })) {
         this.log.info("runner clone retention: deleted quarantined residue", { path: r.p });
       }
     }
@@ -1659,7 +1715,10 @@ export class GitCache {
    * the delete:
    *   - `target` is directly under `parent`, `parent` directly under runnerRoot and a real directory,
    *     and the basename parses as the expected artifact of this key (`isExpected`);
-   *   - `target` lstat's as a REAL directory, never a symlink (absent ⇒ nothing to delete).
+   *   - `target` lstat's as a REAL directory, never a symlink (absent ⇒ nothing to delete). With
+   *     `unlinkNonDirectory` (the residue sweep only, issue #1783 M3: a symlink or file quarantined
+   *     off the canonical path is residue too) a non-directory is instead removed by a plain
+   *     unlink(2) of the entry, as the worker: it never follows, and never recurses.
    * Then, under the uid split, the delete runs AS THE RUNNER UID through the runnerCommand/setpriv
    * wrapper (`/bin/rm -rf -- <target>`, bounded by a timeout that kills the runner group), so a
    * swapped symlink can reach only what the runner uid could already delete. The image's `/bin/rm`
@@ -1669,7 +1728,12 @@ export class GitCache {
    * agent's uid there, the #58 accepted posture): the delete stays the in-process fs.rm.
    * Returns true when the target is gone.
    */
-  private async deleteRetainedArtifact(parent: string, target: string, isExpected: (name: string) => boolean): Promise<boolean> {
+  private async deleteRetainedArtifact(
+    parent: string,
+    target: string,
+    isExpected: (name: string) => boolean,
+    opts: { unlinkNonDirectory?: boolean } = {},
+  ): Promise<boolean> {
     const refuse = (why: string): false => {
       this.log.warn("runner clone retention: refusing to delete; keeping it", { path: target, reason: why });
       return false;
@@ -1681,13 +1745,19 @@ export class GitCache {
       const pst = await fs.lstat(parent);
       if (pst.isSymbolicLink() || !pst.isDirectory()) return refuse("the runner repo dir is not a real directory");
       const st = await fs.lstat(target);
-      if (st.isSymbolicLink() || !st.isDirectory()) return refuse("not a real directory");
+      if (st.isSymbolicLink() || !st.isDirectory()) {
+        if (!opts.unlinkNonDirectory) return refuse("not a real directory");
+        // issue #1783 M3: a symlink or file quarantined off the canonical path. unlink(2) removes
+        // the entry itself and never follows it; a directory swapped in meanwhile fails it (kept).
+        await fs.unlink(target);
+        return true;
+      }
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
       return refuse(gitErrorMessage(err));
     }
     try {
-      await this.runRetentionDelete(target);
+      await this.runRunnerUidDelete(target);
     } catch (err) {
       this.log.warn("runner clone retention: could not delete; keeping it", { path: target, error: gitErrorMessage(err) });
       return false;
@@ -1695,9 +1765,9 @@ export class GitCache {
     return true;
   }
 
-  /** The delete itself (see {@link deleteRetainedArtifact}): runner-uid under the split, in-process
-   *  single-uid. */
-  private async runRetentionDelete(target: string): Promise<void> {
+  /** The recursive delete itself (see {@link deleteRetainedArtifact}, and M3's
+   *  {@link freeCanonicalClonePath}): runner-uid under the split, in-process single-uid. */
+  private async runRunnerUidDelete(target: string): Promise<void> {
     const split = this.retentionDeleteSeam?.split ?? uidSplitActive();
     if (!split) {
       await fs.rm(target, { recursive: true, force: true });

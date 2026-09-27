@@ -5771,7 +5771,7 @@ export class RunRunner {
     const reseed = this.canonicalReseedOptions(flight);
     let retained = false;
     try {
-      const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, attemptSeed, reseed));
+      const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, attemptSeed));
       flight.worktreePath = runnerClone.path;
       flight.branch = runnerClone.branch;
     } catch (err) {
@@ -5806,7 +5806,7 @@ export class RunRunner {
         // else fail closed. Replaces the old worker-scoped getRunOwnership probe, which
         // 404'd on a worker move (Gap 2).
         await this.reclaimTerminalOrphan(barePath, claim, flight, err.clonePath, err.branch, err.ownerRunId, err);
-        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, attemptSeed, reseed));
+        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, attemptSeed));
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;
       } else if (err instanceof CapturePathMismatchError) {
@@ -5814,7 +5814,7 @@ export class RunRunner {
         // divergence, e.g. an issue owner's `issue-N` vs this mr_rework's `agent-issue-N`).
         // The SAME owner-derived validation decides; any unmet predicate fails closed.
         await this.reclaimTerminalOrphan(barePath, claim, flight, err.journaledPath, err.branch, err.ownerRunId, err);
-        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, attemptSeed, reseed));
+        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, attemptSeed));
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;
       } else {
@@ -10347,8 +10347,8 @@ export class RunRunner {
   private async runnerCloneForClaim(
     barePath: string,
     claim: ClaimResponse,
+    reseed: CanonicalReseedOptions,
     attempt?: AttemptSeedOptions,
-    reseed?: CanonicalReseedOptions,
   ) {
     // PRD #218 M2: thread the run id as the tracking-ref OWNERSHIP anchor. The git layer
     // stays claim-agnostic — it consults the tracking ref only when its stamp matches
@@ -10386,15 +10386,15 @@ export class RunRunner {
         barePath,
         cloneBranch.branch,
         cloneBranch.slug,
+        reseed,
         runId,
         resume,
         expectedCheckpointTip,
         attempt,
-        reseed,
       );
     if (claim.issue_iid == null)
       throw new Error("issue run claim is missing issue_iid");
-    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId, resume, expectedCheckpointTip, attempt, reseed);
+    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, reseed, runId, resume, expectedCheckpointTip, attempt);
   }
 
   /**

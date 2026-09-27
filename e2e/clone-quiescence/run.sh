@@ -19,7 +19,13 @@
 #                   the helper still resolves the image's tsx) instead of the image's /app/src
 #   CQ_BUILD_ARGS   extra `docker build` arguments, e.g. "--network host"
 #   CQ_TIMEOUT      outer watchdog seconds            (default: 300)
+#
+# The suite always runs with CQ_REQUIRE_RESIDUE=1 (exported below and passed into the container):
+# the M3 root-owned-residue cases then FAIL, never skip, when plant-residue.sh's residue is missing
+# or not root-owned.
 set -euo pipefail
+
+export CQ_REQUIRE_RESIDUE=1
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
@@ -61,6 +67,7 @@ timeout --kill-after=30s "$TIMEOUT" docker run --rm --init --network none \
   --entrypoint /bin/sh \
   --mount "type=bind,src=$REPO/e2e,dst=/work/e2e,readonly" \
   "${src_args[@]}" \
+  -e CQ_REQUIRE_RESIDUE \
   --name "$NAME" \
   "$IMAGE" /work/e2e/clone-quiescence/plant-residue.sh /bin/sh -c 'cd /app && exec /usr/local/bin/node --import tsx --test --test-concurrency=1 --test-timeout=120000 \
     /work/e2e/clone-quiescence/fixture.test.ts'

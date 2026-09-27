@@ -15,7 +15,7 @@ import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { LimitReachedError } from "../src/limit.js";
-import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { nullLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import {
   api,
   barrier,
@@ -1275,7 +1275,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
   it("first park + MOVED default branch: the tracking ref wins, with no ancestry test", async () => {
     const bare = await git.ensureClone(fx.originPath);
     // Commit locally off the fork point and fetch it back (a first park — never pushed).
-    const rc = await git.createOrAttachRunnerClone(bare, 210, RUN);
+    const rc = await git.createOrAttachRunnerClone(bare, 210, noProofReseed, RUN);
     const local = commitInTree(rc.path, "LOCAL.txt", "local\n");
     await git.fetchAgentBranch(bare, rc.path, "agent/issue-210", RUN);
     await git.removeRunnerClone(rc.path);
@@ -1288,6 +1288,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
       bare,
       "agent/issue-210",
       "issue-210",
+      noProofReseed,
       RUN,
     );
     assert.strictEqual(resumed.seededFrom, "tracking");
@@ -1314,7 +1315,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
   it("resume with a pushed branch that DIVERGED: origin wins (never drop a published commit)", async () => {
     const bare = await git.ensureClone(fx.originPath);
     // Push O1 to origin's agent/issue-211 (this fetch-back stamps the owner = RUN).
-    const first = await git.createOrAttachRunnerClone(bare, 211, RUN);
+    const first = await git.createOrAttachRunnerClone(bare, 211, noProofReseed, RUN);
     const o1 = commitInTree(first.path, "ORIGIN.txt", "origin\n");
     await git.fetchAgentBranch(bare, first.path, "agent/issue-211", RUN);
     await git.pushBranch(bare, "agent/issue-211", "", fx.originPath);
@@ -1325,7 +1326,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
     // l1 into the bare via a throwaway branch, then repoint issue-211's ref at it; the
     // owner stamp for issue-211 stays RUN (a different branch's fetch-back does not touch
     // it), so RUN still owns the (now diverged) ref.
-    const tmp = await git.createOrAttachRunnerClone(bare, 2110, "run-tmp");
+    const tmp = await git.createOrAttachRunnerClone(bare, 2110, noProofReseed, "run-tmp");
     const l1 = commitInTree(tmp.path, "LOCAL.txt", "local\n");
     await git.fetchAgentBranch(bare, tmp.path, "agent/issue-2110", "run-tmp");
     await git.removeRunnerClone(tmp.path);
@@ -1335,6 +1336,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
       bare,
       "agent/issue-211",
       "issue-211",
+      noProofReseed,
       RUN,
     );
     assert.strictEqual(resumed.seededFrom, "origin");
@@ -1347,7 +1349,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
 
   it("resume where the tracking ref DESCENDS from origin: tracking wins and the base moves past origin (Success Criterion 4)", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 212, RUN);
+    const rc = await git.createOrAttachRunnerClone(bare, 212, noProofReseed, RUN);
     const o1 = commitInTree(rc.path, "O.txt", "o\n");
     await git.fetchAgentBranch(bare, rc.path, "agent/issue-212", RUN);
     await git.pushBranch(bare, "agent/issue-212", "", fx.originPath);
@@ -1361,6 +1363,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
       bare,
       "agent/issue-212",
       "issue-212",
+      noProofReseed,
       RUN,
     );
     assert.strictEqual(resumed.seededFrom, "tracking");
@@ -1380,7 +1383,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
   it("a DIFFERENT run does NOT own a stale tracking ref, so the reseed ignores it (issue #105 reintroduction guard)", async () => {
     const bare = await git.ensureClone(fx.originPath);
     // A tracking ref a permanently-dead run (run-dead) left behind, no origin branch.
-    const tmp = await git.createOrAttachRunnerClone(bare, 213, "run-dead");
+    const tmp = await git.createOrAttachRunnerClone(bare, 213, noProofReseed, "run-dead");
     commitInTree(tmp.path, "STALE.txt", "stale\n");
     await git.fetchAgentBranch(bare, tmp.path, "agent/issue-213", "run-dead");
     await git.removeRunnerClone(tmp.path);
@@ -1391,6 +1394,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
       bare,
       "agent/issue-213",
       "issue-213",
+      noProofReseed,
       "run-fresh",
     );
     assert.strictEqual(
@@ -1406,7 +1410,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
     const noOwner = await git.runnerCloneForBranch(
       bare,
       "agent/issue-213",
-      "issue-213",
+      "issue-213", noProofReseed,
     );
     assert.strictEqual(noOwner.seededFrom, "default");
   });
@@ -1797,7 +1801,7 @@ describe("RunRunner — limit-park ancestry bridge (PRD #1416 M3, FIX 2)", () =>
 
       // A same-run reseed adopts B off the tracking ref (ownedHere leg: B strictly descends P), so
       // the resume continues on the rewritten work rather than setting it aside for origin.
-      const reseed = await git.runnerCloneForBranch(bare, `agent/issue-${iid}`, `issue-${iid}`, runId, true);
+      const reseed = await git.runnerCloneForBranch(bare, `agent/issue-${iid}`, `issue-${iid}`, noProofReseed, runId, true);
       assert.strictEqual(reseed.seededFrom, "tracking", "the bridged tip descends from P → adopted");
       assert.strictEqual(
         execFileSync("git", ["-C", reseed.path, "rev-parse", "HEAD"], { env: GIT_ENV, encoding: "utf8" }).trim(),

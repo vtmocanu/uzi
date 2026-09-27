@@ -17,7 +17,9 @@
 // path before the drop. The worker can neither delete it nor move it to another parent (EACCES:
 // a cross-parent directory rename rewrites `..`, which needs write on the moved directory), but it
 // can rename it within its own worker-owned 2775 repo dir, which is how the canonical reseed frees
-// the path. Those cases SKIP, naming why, wherever the residue is not root-owned.
+// the path. Under run.sh (which exports CQ_REQUIRE_RESIDUE=1) those cases FAIL when the residue is
+// missing or not root-owned, so a broken plant can never pass as a skip; anywhere else they SKIP,
+// naming why.
 
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -56,16 +58,23 @@ const RESIDUE_DATA = "/tmp/cq-residue";
 const RESIDUE_ORIGIN = "/tmp/cq-origin";
 const RESIDUE_IID = 42;
 const RESIDUE_CANON = path.join(RESIDUE_DATA, "runner", "tmp+cq-origin", `issue-${RESIDUE_IID}`);
-/** Evaluated at load, before any test moves it: the planted residue must be root-owned. */
-const RESIDUE_SKIP: string | false = (() => {
+/** Evaluated at load, before any test moves it: why the planted residue is unusable (it must be a
+ *  root-owned real directory), or undefined when it is. */
+const RESIDUE_PROBLEM: string | undefined = (() => {
+  let st: fs.Stats;
   try {
-    const st = fs.lstatSync(RESIDUE_CANON);
-    if (st.isDirectory() && !st.isSymbolicLink() && st.uid === 0) return false;
-  } catch {
-    // absent: not planted by run.sh
+    st = fs.lstatSync(RESIDUE_CANON);
+  } catch (err) {
+    return `no residue at ${RESIDUE_CANON} (${(err as NodeJS.ErrnoException).code ?? String(err)})`;
   }
-  return "requires a root-planted residue; run task test:clone-quiescence";
+  if (st.isSymbolicLink() || !st.isDirectory()) return `the residue at ${RESIDUE_CANON} is not a real directory`;
+  if (st.uid !== 0) return `the residue at ${RESIDUE_CANON} is owned by uid ${st.uid}, not root`;
+  return undefined;
 })();
+/** run.sh sets CQ_REQUIRE_RESIDUE=1: there the M3 cases never skip, and an unusable residue FAILS. */
+const RESIDUE_REQUIRED = process.env.CQ_REQUIRE_RESIDUE === "1";
+const RESIDUE_SKIP: string | false =
+  RESIDUE_REQUIRED || RESIDUE_PROBLEM === undefined ? false : `requires a root-planted residue (${RESIDUE_PROBLEM}); run task test:clone-quiescence`;
 
 /** Start a detached `sleep` as `runner` (via the production wrapper) with `env`, in `cwd`, and
  *  return its pid. The shell backgrounds it through `setsid`, so it outlives the wrapper. */
@@ -218,6 +227,7 @@ describe("clone quiescence under the real uid split (issue #1783)", () => {
   // Kept in this describe block so they run under the same worker-uid / uid-split precondition.
 
   it("M3: the planted residue is root:root drwxr-sr-x with agent/src and gate-log.loop, and the worker cannot delete it", { skip: RESIDUE_SKIP }, async () => {
+    assert.equal(RESIDUE_PROBLEM, undefined, `CQ_REQUIRE_RESIDUE=1, but the planted residue is unusable: ${RESIDUE_PROBLEM}`);
     const st = fs.lstatSync(RESIDUE_CANON);
     assert.equal(st.uid, 0);
     assert.equal(st.gid, 0);
@@ -266,7 +276,7 @@ describe("clone quiescence under the real uid split (issue #1783)", () => {
     assert.equal(git.runnerClonePath(bare, `issue-${RESIDUE_IID}`), RESIDUE_CANON, "plant-residue.sh planted at GitCache's canonical path");
 
     const proofs: string[] = [];
-    const clone = await git.createOrAttachRunnerClone(bare, RESIDUE_IID, "run-cq-residue", false, undefined, undefined, {
+    const clone = await git.createOrAttachRunnerClone(bare, RESIDUE_IID, {
       // The runner's canonical-reseed proof: a seed-mode scan scoped to the canonical path,
       // through the real runner-uid helper. Anything but quiescent blocks with nothing moved.
       beforeFree: async (p) => {
@@ -283,7 +293,7 @@ describe("clone quiescence under the real uid split (issue #1783)", () => {
         });
         if (out.process?.state !== "quiescent") throw new gitMod.CloneResidueBlockedError(out.process?.detail ?? "not quiescent");
       },
-    });
+    }, "run-cq-residue");
     assert.deepEqual(proofs, [RESIDUE_CANON], "the proof ran over the canonical path");
     assert.equal(clone.path, RESIDUE_CANON, "the reseed completed at the canonical path");
     assert.equal(fs.existsSync(path.join(RESIDUE_CANON, ".git")), true);
@@ -301,7 +311,10 @@ describe("clone quiescence under the real uid split (issue #1783)", () => {
     assert.equal(st.mode & 0o7777, 0o2755);
     assert.equal(fs.existsSync(path.join(residue, "agent", "src")), true);
     assert.equal(fs.existsSync(path.join(residue, "gate-log.loop")), true);
-    assert.equal(lines.find((l) => String(l.msg).includes("quarantined it as residue"))?.residue, residue, "the log names the residue");
+    const warn = lines.find((l) => String(l.msg).includes("quarantined it as residue"));
+    assert.equal(warn?.residue, residue, "the log names the residue");
+    // The delete ran as the runner uid (the setpriv-wrapped /bin/rm), never an in-process worker rm.
+    assert.match(String(warn?.detail), /^runner-uid delete exited /, `the delete's failure: ${String(warn?.detail)}`);
 
     // Kept: a runner-uid delete (what the retention sweep runs) cannot remove a root-owned residue.
     const rm = runnerUid.runnerCommand("/bin/rm", ["-rf", "--", residue]);

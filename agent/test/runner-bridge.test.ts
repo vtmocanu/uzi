@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { makeClaim, nullLogger } from "./helpers.js";
+import { makeClaim, nullLogger, noProofReseed } from "./helpers.js";
 import { type Executor, type ExecutorResult, type RunContext } from "../src/executor.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import { GitHubClient } from "../src/forge.js";
@@ -339,7 +339,7 @@ describe("RunRunner — the reseed after a bridge adopts B (PRD #1416 M3, SC2)",
     const P = publishBranch(branch);
     const bare = await git.ensureClone(fx.originPath);
     // A run owns the branch: seed from origin (P), then the agent rewrites below P → H.
-    const rc = await git.runnerCloneForBranch(bare, branch, "feature-reseed", "R1");
+    const rc = await git.runnerCloneForBranch(bare, branch, "feature-reseed", noProofReseed, "R1");
     assert.strictEqual(rc.seededFrom, "origin");
     fs.writeFileSync(path.join(rc.path, "REWRITE.md"), "rewrite\n");
     gitIn(rc.path, ["add", "."]);
@@ -349,7 +349,7 @@ describe("RunRunner — the reseed after a bridge adopts B (PRD #1416 M3, SC2)",
 
     // CONTROL — today's behaviour: with the tracking ref left at the divergent H, a reseed sets it
     // aside and seeds from origin, losing the rewritten work.
-    const before = await git.runnerCloneForBranch(bare, branch, "feature-reseed", "R1");
+    const before = await git.runnerCloneForBranch(bare, branch, "feature-reseed", noProofReseed, "R1");
     assert.strictEqual(before.seededFrom, "origin", "an un-bridged divergent tip is set aside (origin wins)");
 
     // BRIDGE the tracking ref to B (what bridgeBareTrackingRefIfDivergent does at the park sink).
@@ -359,7 +359,7 @@ describe("RunRunner — the reseed after a bridge adopts B (PRD #1416 M3, SC2)",
     await git.updateTrackingRef(bare, branch, B);
 
     // Now the reseed adopts B — the run resumes on its rewritten work.
-    const after = await git.runnerCloneForBranch(bare, branch, "feature-reseed", "R1");
+    const after = await git.runnerCloneForBranch(bare, branch, "feature-reseed", noProofReseed, "R1");
     assert.strictEqual(after.seededFrom, "tracking", "the bridged tip descends from P → adopted");
     const head = gitIn(after.path, ["rev-parse", "HEAD"]);
     assert.strictEqual(head, B, "the clone HEAD is the bridge B");
@@ -521,7 +521,7 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     const branch = "feature/helper-divergent";
     const P = publishBranch(branch);
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.runnerCloneForBranch(bare, branch, "feature-h", "R1");
+    const rc = await git.runnerCloneForBranch(bare, branch, "feature-h", noProofReseed, "R1");
     gitIn(rc.path, ["add", "."]);
     fs.writeFileSync(path.join(rc.path, "REWRITE.md"), "rewrite\n");
     gitIn(rc.path, ["add", "."]);
@@ -545,7 +545,7 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     const branch = "feature/helper-clean";
     const P = publishBranch(branch);
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.runnerCloneForBranch(bare, branch, "feature-hc", "R1");
+    const rc = await git.runnerCloneForBranch(bare, branch, "feature-hc", noProofReseed, "R1");
     fs.writeFileSync(path.join(rc.path, "ontop.ts"), "1\n");
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "clean work on top of P"]);
@@ -564,7 +564,7 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     const branch = "feature/helper-clean-scratch";
     const P = publishBranch(branch);
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.runnerCloneForBranch(bare, branch, "feature-hcs", "R1");
+    const rc = await git.runnerCloneForBranch(bare, branch, "feature-hcs", noProofReseed, "R1");
     fs.mkdirSync(path.join(rc.path, ".uzi", "scratch"), { recursive: true });
     fs.writeFileSync(path.join(rc.path, ".uzi", "scratch", "note"), "local only\n");
     gitIn(rc.path, ["add", "-f", ".uzi/scratch/note"]);
@@ -602,7 +602,7 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     const branch = "feature/helper-unknown";
     const P = publishBranch(branch);
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.runnerCloneForBranch(bare, branch, "feature-hu", "R1");
+    const rc = await git.runnerCloneForBranch(bare, branch, "feature-hu", noProofReseed, "R1");
     fs.writeFileSync(path.join(rc.path, "REWRITE.md"), "rewrite\n");
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "--amend", "--no-edit"]);
@@ -627,7 +627,7 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     const branch = "feature/helper-validate-fail";
     const P = publishBranch(branch);
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.runnerCloneForBranch(bare, branch, "feature-hvf", "R1");
+    const rc = await git.runnerCloneForBranch(bare, branch, "feature-hvf", noProofReseed, "R1");
     fs.writeFileSync(path.join(rc.path, "REWRITE.md"), "rewrite\n");
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "--amend", "--no-edit"]);
@@ -661,7 +661,7 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     const branch = "feature/helper-validate-unknown";
     const P = publishBranch(branch);
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.runnerCloneForBranch(bare, branch, "feature-hvu", "R1");
+    const rc = await git.runnerCloneForBranch(bare, branch, "feature-hvu", noProofReseed, "R1");
     fs.writeFileSync(path.join(rc.path, "REWRITE.md"), "rewrite\n");
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "--amend", "--no-edit"]);

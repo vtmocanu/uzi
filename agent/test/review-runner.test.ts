@@ -103,7 +103,7 @@ function fakeGit(diff: string) {
       calls.ensureClone++;
       return "/bare/repo.git";
     },
-    runnerCloneForBranch: async (_bare: string, branch: string, key: string, runId?: string) => {
+    runnerCloneForBranch: async (_bare: string, branch: string, key: string, _reseed: unknown, runId?: string) => {
       calls.runnerCloneForBranch.push({ branch, key, runId });
       return { path: `/clones/${key}`, branch, priorCommits: 0, baseCommit: "0".repeat(40), defaultBranchCommit: "0".repeat(40), seededFrom: "origin" as const, checkpointSetAside: false };
     },

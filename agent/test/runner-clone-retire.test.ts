@@ -7,7 +7,7 @@ import net from "node:net";
 import { execFileSync } from "node:child_process";
 import { ForeignCaptureBlockedError, CapturePathMismatchError } from "../src/git.js";
 import { type ExecutorFactory } from "../src/runner.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, noProofReseed } from "./helpers.js";
 import {
   api,
   fakeGitlab,
@@ -66,7 +66,7 @@ async function seedResidue(
 ): Promise<{ bare: string; branch: string; clonePath: string }> {
   const bare = await git.ensureClone(fx.originPath);
   const branch = `agent/issue-${iid}`;
-  const clone = await git.createOrAttachRunnerClone(bare, iid, ownerRunId);
+  const clone = await git.createOrAttachRunnerClone(bare, iid, noProofReseed, ownerRunId);
   fs.writeFileSync(path.join(clone.path, marker), "owner-only bytes\n");
   await git.markRecoveryCapture(bare, clone.path, branch, ownerRunId);
   return { bare, branch, clonePath: clone.path };
@@ -82,7 +82,7 @@ async function seedResidueForBranch(
   marker: string,
 ): Promise<{ bare: string; branch: string; clonePath: string }> {
   const bare = await git.ensureClone(fx.originPath);
-  const clone = await git.runnerCloneForBranch(bare, branch, key, ownerRunId);
+  const clone = await git.runnerCloneForBranch(bare, branch, key, noProofReseed, ownerRunId);
   fs.writeFileSync(path.join(clone.path, marker), "owner-only bytes\n");
   await git.markRecoveryCapture(bare, clone.path, branch, ownerRunId);
   return { bare, branch, clonePath: clone.path };
@@ -317,7 +317,7 @@ describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", 
         const branch = `agent/issue-${iid}`;
         // A DIFFERENT in-tree clone; journal THIS branch to point at it → Case A. (c) passes
         // (owner branch `agent/issue-N`), (d) fails (owner slug `issue-N` ≠ `.../issue-9470`).
-        const other = await git.createOrAttachRunnerClone(bare, 9470, ownerRunId);
+        const other = await git.createOrAttachRunnerClone(bare, 9470, noProofReseed, ownerRunId);
         fs.writeFileSync(path.join(other.path, "FOREIGN.txt"), "owner-only bytes\n");
         await git.markRecoveryCapture(bare, other.path, branch, ownerRunId);
         api.setOrphanClassification(ownerRunId, {
@@ -517,7 +517,7 @@ describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", 
     assert.equal(dirs.length, 1, "the failed delete leaves exactly the one isolated trash dir");
     assert.equal(fs.readFileSync(path.join(hRoot, dirs[0]!, "TRASH_ME.txt"), "utf8"), "owner-only bytes\n");
     // A subsequent run seeds cleanly on the now-free branch.
-    const reseeded = await git.createOrAttachRunnerClone(bare, iid, "ffffffff-ffff-4fff-8fff-ffffffffffff");
+    const reseeded = await git.createOrAttachRunnerClone(bare, iid, noProofReseed, "ffffffff-ffff-4fff-8fff-ffffffffffff");
     assert.equal(reseeded.path, clonePath);
     assert.equal(fs.existsSync(clonePath), true);
   });
@@ -640,7 +640,7 @@ describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", 
 
     // Case C — same run: PendingRecoveryCaptureError.
     await assert.rejects(
-      git.createOrAttachRunnerClone(bare, iid, ownerRunId),
+      git.createOrAttachRunnerClone(bare, iid, noProofReseed, ownerRunId),
       (err: unknown) => {
         assert.equal((err as Error).name, "PendingRecoveryCaptureError");
         return true;
@@ -649,7 +649,7 @@ describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", 
     );
     // Case B — same canonical path, foreign owner: ForeignCaptureBlockedError with fields.
     await assert.rejects(
-      git.createOrAttachRunnerClone(bare, iid, foreignRunId),
+      git.createOrAttachRunnerClone(bare, iid, noProofReseed, foreignRunId),
       (err: unknown) => {
         assert.ok(err instanceof ForeignCaptureBlockedError);
         assert.equal(err.ownerRunId, ownerRunId);
@@ -661,7 +661,7 @@ describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", 
     );
     // Case A — a different clone key computes a different path: CapturePathMismatchError.
     await assert.rejects(
-      git.runnerCloneForBranch(bare, branch, "different-kind-clone", foreignRunId),
+      git.runnerCloneForBranch(bare, branch, "different-kind-clone", noProofReseed, foreignRunId),
       (err: unknown) => {
         assert.ok(err instanceof CapturePathMismatchError);
         assert.equal(err.journaledPath, clonePath);
@@ -855,7 +855,7 @@ describe("retireRunnerClone EXDEV fallback (#1354)", () => {
 
     // The negative, broadened: the subsequent claim throws NONE of the capture-guard errors.
     const reseeded = await git
-      .createOrAttachRunnerClone(bare, o.iid, o.claimantRunId)
+      .createOrAttachRunnerClone(bare, o.iid, noProofReseed, o.claimantRunId)
       .catch((err: unknown) => assert.fail(`the subsequent claim wedged: ${(err as Error).name}: ${(err as Error).message}`));
     assert.equal(reseeded.path, clonePath, "the reseed lands cleanly at the now-free canonical");
     assert.equal(fs.existsSync(clonePath), true, "the reseed recreated the canonical clone");
@@ -916,7 +916,7 @@ describe("retireRunnerClone EXDEV fallback (#1354)", () => {
       }
       // The stale journal does NOT wedge the next claim: the guard's lstat→ENOENT (canonical
       // gone via the rename) lets it reseed despite the uncleared journal.
-      const reseeded = await git.createOrAttachRunnerClone(bare, iid, ownerRunId);
+      const reseeded = await git.createOrAttachRunnerClone(bare, iid, noProofReseed, ownerRunId);
       assert.equal(reseeded.path, clonePath);
       assert.equal(fs.existsSync(clonePath), true);
     });

@@ -8,7 +8,7 @@ import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
-import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { nullLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith, worktreeDirFor } from "./runner-harness.js";
 
 installHarness();
@@ -127,7 +127,7 @@ describe("recovery capture retry and restart safety (#1197)", () => {
     const restartedGit = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
     const bare = restartedGit.barePathFor(fx.originPath);
     await assert.rejects(
-      restartedGit.createOrAttachRunnerClone(bare, iid, claim.run_id),
+      restartedGit.createOrAttachRunnerClone(bare, iid, noProofReseed, claim.run_id),
       PendingRecoveryCaptureError,
       "the durable worker journal blocks same-run destructive reseeding",
     );
@@ -137,7 +137,7 @@ describe("recovery capture retry and restart safety (#1197)", () => {
     // needs for its authoritative owner probe. (Case B — matched canonical pair.)
     const foreign = "99999999-9999-4999-8999-999999999999";
     await assert.rejects(
-      restartedGit.createOrAttachRunnerClone(bare, iid, foreign),
+      restartedGit.createOrAttachRunnerClone(bare, iid, noProofReseed, foreign),
       (err: unknown) => {
         assert.ok(err instanceof ForeignCaptureBlockedError, "same-path foreign owner -> ForeignCaptureBlockedError");
         assert.equal(err.ownerRunId, claim.run_id);
@@ -152,7 +152,7 @@ describe("recovery capture retry and restart safety (#1197)", () => {
     // owner status here — reclaimability is now decided by the runner's owner validation
     // (issue #1319), not the git layer.
     await assert.rejects(
-      restartedGit.runnerCloneForBranch(bare, `agent/issue-${iid}`, "different-kind-clone", foreign),
+      restartedGit.runnerCloneForBranch(bare, `agent/issue-${iid}`, "different-kind-clone", noProofReseed, foreign),
       (err: unknown) => {
         assert.ok(err instanceof CapturePathMismatchError, "different clone key -> CapturePathMismatchError");
         assert.equal(err.journaledPath, worktreeDirFor(iid));
@@ -169,7 +169,7 @@ describe("recovery capture retry and restart safety (#1197)", () => {
     await restarted.execute(claim);
     assert.equal(modelStarted, false, "the retained source is captured before any new SDK run");
     assert.equal(api.states.filter((s) => s.body.status === "recovery_wait").length, 1);
-    const reseeded = await restartedGit.createOrAttachRunnerClone(bare, iid, claim.run_id);
+    const reseeded = await restartedGit.createOrAttachRunnerClone(bare, iid, noProofReseed, claim.run_id);
     assert.equal(fs.readFileSync(path.join(reseeded.path, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
     assert.equal(reseeded.wipRecovered, true);
   });
@@ -369,7 +369,7 @@ describe("recovery capture retry and restart safety (#1197)", () => {
       assert.equal(fs.readFileSync(path.join(fixture.clone(), "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
       assert.equal(fs.existsSync(path.join(fixture.runHome, "session")), true);
       assert.equal(api.states.some((s) => s.body.status === "recovery_wait"), false);
-      await assert.rejects(git.createOrAttachRunnerClone(git.barePathFor(fx.originPath), 1309, claim.run_id), PendingRecoveryCaptureError);
+      await assert.rejects(git.createOrAttachRunnerClone(git.barePathFor(fx.originPath), 1309, noProofReseed, claim.run_id), PendingRecoveryCaptureError);
     } finally {
       runner.shutdown();
       await execution;

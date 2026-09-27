@@ -25,7 +25,7 @@ import {
 import { RUN_ATTEMPT_ENV, RUN_CLONE_KEY_ENV } from "../src/worker-spawn-mark.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
-import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
+import { nullLogger, recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import {
   api,
   client,
@@ -321,7 +321,7 @@ function fixtureSeed(attemptId: string): AttemptSeedOptions {
 async function seedPredecessor(iid: number, runId: string, opts: { attempt: boolean }) {
   const b = await git.ensureClone(fx.originPath);
   const attemptId = opts.attempt ? mintAttemptId(1) : undefined;
-  const clone = await git.createOrAttachRunnerClone(b, iid, runId, false, undefined, attemptId ? fixtureSeed(attemptId) : undefined);
+  const clone = await git.createOrAttachRunnerClone(b, iid, noProofReseed, runId, false, undefined, attemptId ? fixtureSeed(attemptId) : undefined);
   fs.writeFileSync(path.join(clone.path, "ONLY_COPY.txt"), "must survive recovery\n");
   await git.markRecoveryCapture(b, clone.path, `agent/issue-${iid}`, runId, clone.attemptId);
   return { clonePath: clone.path, attemptId };

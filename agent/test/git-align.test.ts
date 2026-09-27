@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { nullLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import { GitCache, isWorkflowScopeRejection } from "../src/git.js";
 
 // PRD #456 M1 — the finalize base-align git helpers, exercised over REAL on-disk repos so a
@@ -100,7 +100,7 @@ describe("branchWorkflowFiles", () => {
   it("preserves unicode and newline workflow paths in both diff consumers", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const base = await git.fetchDefaultTip(bare, "main");
-    const rc = await git.createOrAttachRunnerClone(bare, 104);
+    const rc = await git.createOrAttachRunnerClone(bare, 104, noProofReseed);
     const paths = [".github/workflows/café.yml", ".github/workflows/line\nfeed.yml"];
     for (const rel of paths) {
       fs.writeFileSync(path.join(rc.path, rel), "name: branch\n");
@@ -115,7 +115,7 @@ describe("branchWorkflowFiles", () => {
   it("reads unicode workflow paths from a root commit", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const base = await git.fetchDefaultTip(bare, "main");
-    const rc = await git.createOrAttachRunnerClone(bare, 105);
+    const rc = await git.createOrAttachRunnerClone(bare, 105, noProofReseed);
     gitIn(rc.path, ["checkout", "--orphan", "root-path"]);
     gitIn(rc.path, ["rm", "-r", "--cached", "."]);
     const workflow = ".github/workflows/café.yml";
@@ -152,7 +152,7 @@ describe("branchWorkflowFiles", () => {
     const bare = await git.ensureClone(fx.originPath);
     advanceOriginMain(fx.originPath, { ".github/workflows/ci.yml": "name: base\n" }, "branch base");
     const base = await git.fetchDefaultTip(bare, "main");
-    const rc = await git.createOrAttachRunnerClone(bare, 101);
+    const rc = await git.createOrAttachRunnerClone(bare, 101, noProofReseed);
     fs.writeFileSync(path.join(rc.path, "impl.ts"), "agent work\n");
     gitIn(rc.path, ["add", "impl.ts"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "agent work"]);
@@ -168,7 +168,7 @@ describe("branchWorkflowFiles", () => {
     const oldBlob = gitIn(fx.originPath, ["show", "HEAD:.github/workflows/ci.yml"]);
     advanceOriginMain(fx.originPath, { ".github/workflows/ci.yml": "name: branch base\n" }, "branch base");
     await git.fetchDefaultTip(bare, "main");
-    const rc = await git.createOrAttachRunnerClone(bare, 102);
+    const rc = await git.createOrAttachRunnerClone(bare, 102, noProofReseed);
     advanceOriginMain(fx.originPath, { ".github/workflows/ci.yml": "name: new default\n" }, "new default");
     const fresh = await git.fetchDefaultTip(bare, "main");
     fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), `${oldBlob}\n`);
@@ -180,7 +180,7 @@ describe("branchWorkflowFiles", () => {
 
   it("exempts a verified align when default removed the entire workflow directory", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 103);
+    const rc = await git.createOrAttachRunnerClone(bare, 103, noProofReseed);
     deleteOnOriginMain(fx.originPath, [".github/workflows/ci.yml"], "default removes workflows");
     const fresh = await git.fetchDefaultTip(bare, "main");
     gitIn(rc.path, ["rm", ".github/workflows/ci.yml"]);
@@ -191,7 +191,7 @@ describe("branchWorkflowFiles", () => {
 
   it("exempts a verified older align, but detects a later workflow edit against fresh main", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 1);
+    const rc = await git.createOrAttachRunnerClone(bare, 1, noProofReseed);
     advanceOriginMain(fx.originPath, { ".github/workflows/ci.yml": "name: older\n" }, "older default");
     const older = await git.fetchDefaultTip(bare, "main");
     fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), "name: older\n");
@@ -210,7 +210,7 @@ describe("branchWorkflowFiles", () => {
 
   it("exempts a current single-parent workflow-only align", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 4);
+    const rc = await git.createOrAttachRunnerClone(bare, 4, noProofReseed);
     advanceOriginMain(fx.originPath, { ".github/workflows/ci.yml": "name: current\n" }, "default advances");
     const fresh = await git.fetchDefaultTip(bare, "main");
     fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), "name: current\n");
@@ -222,7 +222,7 @@ describe("branchWorkflowFiles", () => {
 
   it("fails open when a plausible align names a missing commit", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 106);
+    const rc = await git.createOrAttachRunnerClone(bare, 106, noProofReseed);
     advanceOriginMain(fx.originPath, { ".github/workflows/ci.yml": "name: current\n" }, "default advances");
     const fresh = await git.fetchDefaultTip(bare, "main");
     const missing = "f".repeat(40);
@@ -239,7 +239,7 @@ describe("branchWorkflowFiles", () => {
 
   it("does not exempt a mixed align commit or a default already in its parent", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 3);
+    const rc = await git.createOrAttachRunnerClone(bare, 3, noProofReseed);
     advanceOriginMain(fx.originPath, { ".github/workflows/ci.yml": "name: aligned\n" }, "default advances");
     const fresh = await git.fetchDefaultTip(bare, "main");
     fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), "name: aligned\n");
@@ -261,7 +261,7 @@ describe("branchWorkflowFiles", () => {
 
   it("ignores a clean merge carrying default workflows and an empty align commit", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 5);
+    const rc = await git.createOrAttachRunnerClone(bare, 5, noProofReseed);
     const initial = await git.fetchDefaultTip(bare, "main");
     gitIn(rc.path, [...IDENT, "commit", "--allow-empty", "-m", `chore: align .github/workflows with ${initial}`]);
     let ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-5", "run-empty");
@@ -276,7 +276,7 @@ describe("branchWorkflowFiles", () => {
 
   it("detects a merge resolution that changes workflows against every parent", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 6);
+    const rc = await git.createOrAttachRunnerClone(bare, 6, noProofReseed);
     const base = await git.fetchDefaultTip(bare, "main");
     fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), "name: branch\n");
     gitIn(rc.path, ["add", ".github/workflows/ci.yml"]);
@@ -299,7 +299,7 @@ describe("branchWorkflowFiles", () => {
 
   it("rejects a forged align subject with a workflow tree that differs from its named default", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 2);
+    const rc = await git.createOrAttachRunnerClone(bare, 2, noProofReseed);
     const fresh = await git.fetchDefaultTip(bare, "main");
     fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), "name: forged\n");
     gitIn(rc.path, ["add", ".github/workflows/ci.yml"]);
@@ -312,7 +312,7 @@ describe("branchWorkflowFiles", () => {
 describe("workflowTreeDiffers", () => {
   it("is true when the branch's workflow tree differs from the fresh default, false when equal", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 1);
+    const rc = await git.createOrAttachRunnerClone(bare, 1, noProofReseed);
     // Agent commits a NON-workflow change (the branch never touches workflows).
     fs.writeFileSync(path.join(rc.path, "impl.ts"), "export const x = 1;\n");
     gitIn(rc.path, ["add", "impl.ts"]);
@@ -338,7 +338,7 @@ describe("alignBranchWithDefault", () => {
     mainFiles: Record<string, string>,
   ): Promise<{ bare: string; clonePath: string; baseTip: string; defaultTip: string }> {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 1);
+    const rc = await git.createOrAttachRunnerClone(bare, 1, noProofReseed);
     for (const [rel, content] of Object.entries(branchFiles)) {
       fs.writeFileSync(path.join(rc.path, rel), content);
     }
@@ -443,7 +443,7 @@ describe("alignBranchWithDefault — workflow-subtree", () => {
     branchFiles: Record<string, string>,
   ): Promise<{ bare: string; clonePath: string; baseTip: string }> {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 1);
+    const rc = await git.createOrAttachRunnerClone(bare, 1, noProofReseed);
     for (const [rel, content] of Object.entries(branchFiles)) {
       const target = path.join(rc.path, rel);
       fs.mkdirSync(path.dirname(target), { recursive: true });

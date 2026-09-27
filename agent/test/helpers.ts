@@ -1,11 +1,17 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import type { GitCacheOptions } from "../src/git.js";
+import type { CanonicalReseedOptions, GitCacheOptions } from "../src/git.js";
 import type { Logger } from "../src/log.js";
 import type { WorkerClient } from "../src/client.js";
 import { ChatSteering, SteeringChannel } from "../src/steering.js";
 import type { ClaimResponse, UserInput } from "../src/protocol.js";
+
+/** issue #1783 M3 (N5): the canonical-reseed options for suites whose subject is not the canonical
+ *  free. The git layer requires them on every entry point (there is no unproven plain-`fs.rm`
+ *  fallback); this one answers the process proof "quiescent" without scanning, so the free still
+ *  runs its validation, the delete and the quarantine. */
+export const noProofReseed: CanonicalReseedOptions = { beforeFree: async () => {} };
 
 /** GitCache options for suites that create runner clones. Off Linux the real scratch
  *  provisioner fails closed, so this adds a plain-fs stand-in for the dev loop; on Linux
