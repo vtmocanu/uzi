@@ -50,7 +50,9 @@ publish must not destroy the older generation's only off-worker copy either.
 
 ### Retention (M1)
 
-At every terminal transition the api inserts a `checkpoint_retentions` row
+At each of the three terminal writers that used to delete the ref (and
+later, through the sweeper backfill, for every other terminal writer) the
+api inserts a `checkpoint_retentions` row
 (one per run, migration 00259) recording the run's checkpoint branch, the
 published tip, and the ref that currently carries it. A run with an open
 custody hold gets state `retained` and no forge call. A run with no open

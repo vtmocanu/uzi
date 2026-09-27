@@ -820,7 +820,7 @@ chain in the diagram above, with no intervening `running`.
   [ADR-628](adr/0628-cross-worker-resume-durability.md)'s #1030 amendment.
   The best-effort terminal-transition delete this amendment first added was
   superseded by [PRD #1810](prds/1810-retain-failed-run-checkpoint-ref.md): the
-  ref is no longer deleted at any terminal transition while a custody hold
+  ref is not deleted at any terminal transition while a custody hold
   stays open on the run (any writer, sweeper-driven included), and a new run
   needing the same branch slot moves the old tip to a per-run
   `refs/uzi-recovery/<run-id>` ref rather than deleting or overwriting it. See

@@ -856,7 +856,7 @@ uzi run recovery <run-id> [--json]
   a newer run on the same branch superseded it, `refs/uzi-recovery/<run-id>`. `--json` carries
   the same information as `checkpoint_ref`, `checkpoint_tip`, and `checkpoint_state` on each
   hold. A hold with no retained checkpoint ref omits the line (and the `--json` fields are
-  empty).
+  absent).
 
 When a capture-less hold is genuinely not worth keeping, discard that one exact held
 source:
