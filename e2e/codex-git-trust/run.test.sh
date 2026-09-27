@@ -17,7 +17,9 @@
 # Linux only (reads /proc/<pid>/stat; needs GNU timeout --foreground): the Task target is
 # `platforms: [linux]`. Prints PASS:/FAIL: per check and a MANDATORY `cases=N passed=N` tally, and
 # exits nonzero unless every check passed and at least MIN_CASES ran, so a gutted run cannot read
-# green. The test process group is started with `set -m`, so INT is not ignored in the child.
+# green. run.sh is started with `set -m` (its own process group) under GNU
+# `env --default-signal=INT,TERM`, so an INT/TERM ignore inherited from a backgrounded caller
+# (`task gate:repo &`) is reset in the child rather than reddening the signal cases.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,7 +31,7 @@ MIN_CASES=43
 timeout --foreground 5s true 2>/dev/null || { echo "ERROR: needs GNU timeout --foreground" >&2; exit 2; }
 
 # Hermetic: no inherited knob may steer run.sh.
-for v in ${!CODEX_GIT_TRUST_@}; do unset "$v"; done
+for v in ${!CODEX_GIT_TRUST_@} ${!STUB_@}; do unset "$v"; done
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -120,11 +122,11 @@ signal_case() {
   shift 6
   reset_state
   set -m
-  env STUB_STATE="$ST" STUB_BLOCK="$stub" "$@" bash "$SCRIPT" "$action" > "$ST/out" 2>&1 &
+  env --default-signal=INT,TERM STUB_STATE="$ST" STUB_BLOCK="$stub" "$@" bash "$SCRIPT" "$action" > "$ST/out" 2>&1 &
   local pid=$!
   set +m
   local i=0
-  while [ ! -f "$ST/$stub.pid" ] && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i + 1)); done
+  while [ ! -f "$ST/$stub.pid" ] && [ "$i" -lt 300 ]; do sleep 0.05; i=$((i + 1)); done
   if [ ! -f "$ST/$stub.pid" ]; then
     check "$label: stub docker $stub started" 1 "no pid file; output: $(tr '\n' '|' < "$ST/out")"
     kill -KILL "$pid" 2>/dev/null || true
