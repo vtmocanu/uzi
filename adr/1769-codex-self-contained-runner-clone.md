@@ -1,6 +1,6 @@
 # ADR-1769: the Codex runner clone is dissociated from the worker bare, not granted read access to it
 
-**Status**: Partially implemented (seed landed; finalize import in progress, issue #1769)
+**Status**: Implemented; acceptance evidence pending (issue #1769)
 **Date**: 2026-09-26
 **Deciders**: architect (design), coder (implementation), reviewer.
 **Related**: issue #1769, PRD #51 (uid split), adr/1598-codex-command-storage.md.
@@ -60,7 +60,7 @@ setup step has picked its SHAs:
 Claude runs are unchanged: still a plain `--shared` clone, since their
 commands do not run inside the Codex command sandbox.
 
-### At finalize: stream the fresh default tip in as a copy, not a borrow (in progress)
+### At finalize: stream the fresh default tip in as a copy, not a borrow
 
 Finalize's base-align step needs the bare's current default-branch tip,
 which can arrive in the bare after the seed already ran and already dropped
@@ -135,4 +135,23 @@ sandbox rule to leak.
 case exercising this path; see that recipe for what it currently covers.
 Unit coverage for the seed-time path lives in
 `agent/test/git-materialize.test.ts` and
-`agent/test/runner-clone-self-contained.test.ts`.
+`agent/test/runner-clone-self-contained.test.ts` (including the fail-closed
+case: a materialization failure fails the run before the executor runs);
+the finalize import, and the caller-owned producer stream it reads, are
+covered on both spawn paths (plain and boundary) in
+`agent/test/git-import.test.ts`.
+
+Fixture hygiene. `e2e/codex-git-trust/run.sh` binds every host path with a
+read-only `--mount type=bind`, never `-v`: dockerd silently creates a
+missing `-v` source on the host, as root. Each bind source is checked to
+exist first, and a missing one is a named usage error (exit 2), never a
+skip (77). The fixture container is removed by a time-bounded
+`docker rm -f` on every exit path (normal, INT, TERM), and its absence is
+then verified by exact name. A removal that cannot be verified turns a pass
+or a skip into a failure (exit 3), because a backgrounded container that
+outlived an earlier run left root-owned directories in a clone. The image
+build opts in to `--network host` only when
+`CODEX_GIT_TRUST_BUILD_NETWORK=host` (bridge egress hangs on some hosts).
+Acceptance runs of `task test:codex-git-trust` pass it on every full
+invocation because that recipe rebuilds the image. The fixture container
+itself always runs with `--network none`.

@@ -2395,7 +2395,11 @@ tasks:
     # sandbox probe finds Landlock) required mode. Exit 77 is SKIP (no Docker/image/uid split),
     # never a pass. Set CODEX_GIT_TRUST_MOUNT_SRC=1 to use this tree's agent/src,
     # CODEX_GIT_TRUST_SRC_DIR for another source tree, and CODEX_GIT_TRUST_BIN_DIR to mount
-    # freshly built supervisor/fileop/sandbox binaries over an older image's.
+    # freshly built supervisor/fileop/sandbox binaries over an older image's. Every bind is a
+    # read-only `--mount type=bind` whose source must exist (a missing one exits 2, never 77);
+    # the container is removed and verified gone by exact name on every exit (exit 3 if not).
+    # Set CODEX_GIT_TRUST_BUILD_NETWORK=host to build with `--network host` where bridge
+    # egress hangs (build only; the fixture container always runs with --network none).
     cmds:
       - task: test:codex-git-trust:build
       - task: test:codex-git-trust:fixture

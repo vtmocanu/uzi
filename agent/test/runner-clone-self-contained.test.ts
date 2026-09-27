@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
-import { GitCache, type RunnerClone } from "../src/git.js";
+import { GitCache, RunnerCloneMaterializationError, type RunnerClone } from "../src/git.js";
 import type { Executor, ExecutorResult, RunContext } from "../src/executor.js";
 import type { CodexExecutionSafety } from "../src/harness.js";
 import { CodexExecutor, type CodexExecutorOptions } from "../src/codex/codex-executor.js";
@@ -91,5 +91,51 @@ describe("RunRunner — self-contained runner clone for Codex (issue #1769 m1)",
   it("the signal is sandboxesCommands, not safety: a safety-only executor seeds with selfContained false", async () => {
     const seen = await seedOptsFor({ run: neverRun, safety: fakeSafety() }, 1771);
     assert.deepStrictEqual(seen, [{ selfContained: false }]);
+  });
+});
+
+// issue #1769 — fail closed: when a Codex clone cannot be made self-contained, the git layer throws
+// RunnerCloneMaterializationError at seed. The run must fail there and never hand the executor a
+// clone that still borrows objects from a bare the command sandbox cannot read.
+
+const MATERIALIZE_CAUSE = "repack of the borrowed objects failed (issue #1769 test)";
+
+class MaterializationFailingGit extends GitCache {
+  seeds = 0;
+  constructor(dataDir: string) {
+    super(dataDir, nullLogger());
+  }
+  override async runnerCloneForBranch(): Promise<RunnerClone> {
+    this.seeds++;
+    throw new RunnerCloneMaterializationError(`${fx.dataDir}/runner/clone`, MATERIALIZE_CAUSE);
+  }
+}
+
+describe("RunRunner — a clone that cannot be made self-contained fails closed (issue #1769)", () => {
+  it("a real CodexExecutor's run fails at seed and the executor never runs", async () => {
+    const executor = realCodexExecutor();
+    let runs = 0;
+    executor.run = async () => {
+      runs++;
+      throw new Error("the executor must not run: the clone was never made self-contained");
+    };
+    const failing = new MaterializationFailingGit(fx.dataDir);
+    const { gitlab } = fakeGitlab();
+    const factory: ExecutorFactory = () => ({ executor });
+    const runner = new RunRunner(client, failing, factory, nullLogger(), 20, undefined, {
+      pollMs: 5,
+      planApprovalTimeoutMs: 0,
+      questionTimeoutMs: 600,
+      gitlab,
+    });
+    const claim = gitlabClaim(1772);
+    await runner.execute(claim);
+    assert.strictEqual(failing.seeds, 1, "the seed was attempted once, not retried");
+    assert.strictEqual(runs, 0, "the executor never ran");
+    const failed = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed");
+    assert.strictEqual(failed.length, 1, "the run is reported failed exactly once");
+    const reason = failed[0]!.body.failure_reason ?? "";
+    assert.match(reason, /runner clone could not be made self-contained/, "the reason names the materialization");
+    assert.ok(reason.includes(MATERIALIZE_CAUSE), "the reason carries the git layer's cause");
   });
 });

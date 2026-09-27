@@ -641,12 +641,20 @@ export interface RunnerClone {
  * nothing and the caller later sees only EOF. A caller may await something first (the finalize
  * import launches its `index-pack` consumer, under the real supervisor slower than a small
  * `pack-objects` takes to exit and reap), so the child's stdout is piped at once into a
- * PassThrough the caller owns. Backpressure and errors carry across: destroying the source
- * with git's failure destroys the returned stream with that error, and destroying the returned
- * stream destroys the source.
+ * PassThrough the caller owns. Backpressure and errors carry across: a source error destroys
+ * the returned stream with that error, and destroying the returned stream destroys the source.
+ *
+ * git's own failure (a nonzero exit) is reported on the RETURNED stream by spawnGit, not on the
+ * source: the pipe drains the source to EOF as soon as git closes it, so by the time the exit
+ * status arrives the source is usually ended and destroying it reaches nobody. Once the pipe has
+ * finished, `pipeline` removes its listeners from the returned stream, so a no-op 'error'
+ * listener keeps a failure that lands before the caller starts reading from being thrown as
+ * uncaught; the stream still holds the error (`errored`), so a later consumer
+ * (pipeline, for-await) sees it.
  */
-function callerOwnedStdout(source: Readable): Readable {
+function callerOwnedStdout(source: Readable): PassThrough {
   const out = new PassThrough();
+  out.on("error", () => undefined);
   pipelineCallback(source, out, () => undefined);
   return out;
 }
@@ -4773,8 +4781,9 @@ export class GitCache {
    * there is no runner-uid switch and no PAT. Writes the optional `stdin` and ends it, then
    * returns the child and its stdout so the caller can pipe/drain it.
    *
-   * On a nonzero exit (or a spawn error) the stdout stream is DESTROYED with an Error, so a
-   * consumer streaming it (the publish upload) sees the failure and the caller's best-effort
+   * On a nonzero exit (or a spawn error) the RETURNED stdout stream is DESTROYED with an Error
+   * (issue #1769: the caller-owned stream, see {@link callerOwnedStdout}), so a consumer streaming
+   * it (the publish upload) sees the failure and the caller's best-effort
    * `.catch` fires rather than a truncated pack landing silently.
    *
    * `exited` (issue #1769) settles with the exit code once the child has terminated — inside a
@@ -4802,31 +4811,33 @@ export class GitCache {
         stderrChunks.push(kept);
         stderrBytes += kept.length;
       });
+      const stdout = callerOwnedStdout(process.stdout);
       process.completed.then(({ code }) => {
         if (code !== 0) {
           const detail = Buffer.concat(stderrChunks).subarray(0, GIT_MAX_BUFFER).toString().trim();
-          process.stdout?.destroy(new Error(`git ${args.join(" ")} exited ${code}${detail ? `: ${detail}` : ""}`));
+          stdout.destroy(new Error(`git ${args.join(" ")} exited ${code}${detail ? `: ${detail}` : ""}`));
         }
-      }, (error: unknown) => process.stdout?.destroy(error instanceof Error ? error : new Error(String(error))));
+      }, (error: unknown) => stdout.destroy(error instanceof Error ? error : new Error(String(error))));
       // A child that exits before reading its stdin (e.g. its repo vanished) must not surface an
       // uncaught EPIPE; the exit status already destroys stdout with the failure.
       process.stdin?.on("error", () => undefined);
       process.stdin?.end(stdin ?? "");
       const exited = process.completed.then(({ code }) => code, () => -1);
-      return { stdout: callerOwnedStdout(process.stdout), exited };
+      return { stdout, exited };
     }
     const child = spawn("git", withDir(cwd, args), { env });
     const exited = new Promise<number>((resolve) => {
       child.once("error", () => resolve(-1));
       child.once("close", (code) => resolve(code ?? -1));
     });
+    const stdout = callerOwnedStdout(child.stdout as Readable);
     const stderrChunks: Buffer[] = [];
     child.stderr?.on("data", (c: Buffer) => stderrChunks.push(c));
-    child.on("error", (err) => child.stdout?.destroy(err));
+    child.on("error", (err) => stdout.destroy(err));
     child.on("close", (code) => {
       if (code !== 0) {
         const detail = Buffer.concat(stderrChunks).toString().trim();
-        child.stdout?.destroy(
+        stdout.destroy(
           new Error(`git ${args.join(" ")} exited ${code ?? "signal"}${detail ? `: ${detail}` : ""}`),
         );
       }
@@ -4835,7 +4846,7 @@ export class GitCache {
       child.stdin.on("error", () => undefined); // see the scoped branch above
       child.stdin.end(stdin ?? "");
     }
-    return { child, stdout: callerOwnedStdout(child.stdout as Readable), exited };
+    return { child, stdout, exited };
   }
 
   /**

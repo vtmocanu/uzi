@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import crypto from "node:crypto";
+import { once } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
 import { PassThrough, Readable, Writable } from "node:stream";
@@ -555,5 +557,452 @@ describe("GitCache.ensureRunnerCloneObjects (issue #1769 m2)", () => {
     );
     assert.match(err.causeMessage, /^pack-objects exited 1/);
     assert.ok(resolves(rc.path, defaultTip), "the pack did land: only the producer's status fails the import");
+  });
+});
+
+// issue #1769 — spawnGit hands back a caller-owned PassThrough piped from the child's stdout
+// (callerOwnedStdout), on BOTH spawn paths: the boundary branch (a supervised handle) and the
+// plain `spawn` branch. These cases pin its contract: bytes are never lost to a late consumer,
+// backpressure holds with no reader, errors cross in both directions, and the import settles
+// with every child gone. Each case runs on both paths.
+describe("GitCache spawnGit caller-owned stdout (issue #1769)", () => {
+  const BIG_MIB = 8;
+  const PACK_ARGS = ["pack-objects", "--revs", "--stdout", "-q"];
+  const faults: string[] = [];
+  const onRejection = (reason: unknown): void => {
+    faults.push(`unhandledRejection: ${String(reason)}`);
+  };
+  const onException = (err: unknown): void => {
+    faults.push(`uncaughtException: ${String(err)}`);
+  };
+
+  beforeEach(() => {
+    faults.length = 0;
+    process.on("unhandledRejection", onRejection);
+    process.on("uncaughtException", onException);
+  });
+
+  // Every real child a case starts, so a failed assertion cannot leave one blocked on a full
+  // pipe (which would hold the test process open instead of failing it).
+  const live = new Set<ChildProcess>();
+  const track = <T extends ChildProcess | undefined>(child: T): T => {
+    if (child) live.add(child);
+    return child;
+  };
+
+  afterEach(async () => {
+    const leftover = [...live].filter((c) => !childGone(c));
+    for (const c of leftover) c.kill("SIGKILL");
+    live.clear();
+    // One more turn so a late 'error' emitted on nextTick after the test body still lands here.
+    await new Promise((r) => setImmediate(r));
+    process.off("unhandledRejection", onRejection);
+    process.off("uncaughtException", onException);
+    assert.deepStrictEqual(faults, [], "no unhandled rejection or uncaught exception");
+    assert.strictEqual(leftover.length, 0, "no child was left running");
+  });
+
+  /** A self-contained clone plus a fresh default tip carrying BIG_MIB of incompressible blobs,
+   *  so the pack is far larger than any stream buffer (64 KiB highWaterMark, 64 KiB pipe). */
+  async function setupBig(): Promise<{ bare: string; rc: RunnerClone; defaultTip: string; revs: string }> {
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 1, "run-1", false, undefined, SELF);
+    for (let i = 0; i < BIG_MIB; i++) fs.writeFileSync(path.join(fx.originPath, `blob-${i}.bin`), crypto.randomBytes(1 << 20));
+    gitIn(fx.originPath, ["add", "."]);
+    gitIn(fx.originPath, [...IDENT, "commit", "-m", "main gains big blobs"]);
+    const defaultTip = await git.fetchDefaultTip(bare, "main");
+    return { bare, rc, defaultTip, revs: `${defaultTip}\n--not\n${rc.baseCommit}\n` };
+  }
+
+  /** A whole pack: the "PACK" magic and a trailer that is the SHA-1 of every preceding byte. */
+  function assertWholePack(buf: Buffer): void {
+    assert.ok(buf.length > BIG_MIB << 20, `the pack carries the blobs (${buf.length} bytes)`);
+    assert.strictEqual(buf.subarray(0, 4).toString(), "PACK");
+    const body = buf.subarray(0, buf.length - 20);
+    assert.deepStrictEqual(crypto.createHash("sha1").update(body).digest(), buf.subarray(buf.length - 20));
+  }
+
+  async function drain(stream: Readable): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    for await (const c of stream) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c as string));
+    return Buffer.concat(chunks);
+  }
+
+  /** Poll until the pipe is full with nobody reading: the source paused by backpressure and the
+   *  returned stream holding bytes. Fails (not hangs) after `ms`. */
+  async function untilBlocked(source: () => Readable | undefined, out: () => Readable | undefined, ms = 10_000): Promise<void> {
+    const deadline = Date.now() + ms;
+    for (;;) {
+      const s = source();
+      const o = out();
+      if (s && o && s.readableFlowing === false && o.readableLength > 0) break;
+      if (Date.now() > deadline) assert.fail("the producer never blocked on a full pipe");
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    // Let anything in flight land, so the bound below is measured at rest.
+    await new Promise((r) => setTimeout(r, 200));
+  }
+
+  /** Bytes held by the returned PassThrough (readable plus writable side). With nobody reading it
+   *  is bounded by its highWaterMarks plus the few pipe chunks already read in the same turn the
+   *  source was paused (measured: up to 4 x 64 KiB on the plain path), however large the pack.
+   *  The bound, 512 KiB, is a sixteenth of the pack. Returns the held count. */
+  function assertBounded(out: Readable): number {
+    const pt = out as PassThrough;
+    const held = pt.readableLength + pt.writableLength;
+    const bound = 512 * 1024;
+    assert.ok(held <= bound, `the returned stream holds ${held} bytes; bound ${bound}`);
+    return held;
+  }
+
+  /** A boundary spawner running every request for real, recording the pack-objects child and
+   *  the source stream the handle exposes. `beforeConsumer` delays the index-pack spawn. */
+  function realSpawner(beforeConsumer?: () => Promise<void>): {
+    spawner: BoundaryProcessSpawner;
+    producer: () => ChildProcess | undefined;
+    source: () => Readable | undefined;
+  } {
+    let producer: ChildProcess | undefined;
+    const spawner: BoundaryProcessSpawner = async (request) => {
+      if (request.argv.includes("index-pack") && beforeConsumer) await beforeConsumer();
+      const { child, handle } = spawnReal(request);
+      track(child);
+      if (request.argv.includes("pack-objects")) producer = child;
+      return handle;
+    };
+    return { spawner, producer: () => producer, source: () => producer?.stdout ?? undefined };
+  }
+
+  /** Plain path: delay the consumer spawn until `gate(producer)` resolves. */
+  function delayPlainConsumer(cache: GitCache, gate: (p: SpawnGitResult) => Promise<void>): { producer: () => SpawnGitResult | undefined } {
+    const internals = cache as unknown as Internals;
+    let producer: SpawnGitResult | undefined;
+    const origProducer = internals.spawnGit.bind(cache);
+    const origConsumer = internals.spawnGitAsRunnerWithStdin.bind(cache);
+    internals.spawnGit = async (cwd, args, stdin) => {
+      producer = await origProducer(cwd, args, stdin);
+      track(producer.child);
+      return producer;
+    };
+    internals.spawnGitAsRunnerWithStdin = async (cwd, args) => {
+      assert.ok(producer, "the producer spawned first");
+      await gate(producer);
+      return origConsumer(cwd, args);
+    };
+    return { producer: () => producer };
+  }
+
+  async function turns(n: number): Promise<void> {
+    for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r));
+  }
+
+  // (a) A late consumer loses no bytes.
+
+  it("plain spawn: a producer that exits before the consumer has started loses no pack bytes", async () => {
+    // The plain-path twin of the boundary case in the m2 block: ChildProcess flushStdio drains an
+    // unread stdout on 'exit' whichever branch spawned it.
+    const { bare, rc, defaultTip } = await setup(SELF);
+    const delayed = delayPlainConsumer(git, async (p) => {
+      await p.exited;
+      await turns(3);
+    });
+    await settleWithin(git.ensureRunnerCloneObjects(bare, rc.path, defaultTip, [rc.baseCommit]), 30_000, () => [delayed.producer()?.child]);
+    assert.ok(resolves(rc.path, defaultTip), "the whole pack reached index-pack");
+    assert.ok(childGone(delayed.producer()?.child));
+  });
+
+  it("plain spawn: a multi-MiB pack with the consumer started only once the producer blocked imports whole", async () => {
+    const { bare, rc, defaultTip } = await setupBig();
+    const spy = { out: undefined as Readable | undefined };
+    const delayed = delayPlainConsumer(git, async (p) => {
+      spy.out = p.stdout;
+      await untilBlocked(() => p.child?.stdout ?? undefined, () => p.stdout);
+      assert.strictEqual(await settled(p.exited), false, "the producer is blocked, not finished");
+      assertBounded(p.stdout);
+    });
+    await settleWithin(git.ensureRunnerCloneObjects(bare, rc.path, defaultTip, [rc.baseCommit]), 60_000, () => [delayed.producer()?.child]);
+    assert.ok(resolves(rc.path, defaultTip), "the tip resolves in the clone");
+    assert.strictEqual(await delayed.producer()!.exited, 0);
+    assert.ok(childGone(delayed.producer()?.child));
+  });
+
+  it("inside a boundary: a multi-MiB pack with the consumer started only once the producer blocked imports whole", async () => {
+    const { bare, rc, defaultTip } = await setupBig();
+    const spy = spyImport(git);
+    const real = realSpawner(async () => {
+      await untilBlocked(real.source, () => spy.producers[0]?.result.stdout);
+      assert.strictEqual(await settled(spy.producers[0]!.result.exited), false, "the producer is blocked, not finished");
+      assertBounded(spy.producers[0]!.result.stdout);
+    });
+    await settleWithin(
+      git.withBoundaryProcessSpawner(real.spawner, new AbortController().signal, () =>
+        git.ensureRunnerCloneObjects(bare, rc.path, defaultTip, [rc.baseCommit])),
+      60_000,
+      () => [real.producer()],
+    );
+    assert.ok(resolves(rc.path, defaultTip), "the tip resolves in the clone");
+    assert.strictEqual(await spy.producers[0]!.result.exited, 0);
+    assert.ok(childGone(real.producer()));
+  });
+
+  // (b) The producer fails before the consumer exists.
+
+  it("plain spawn: a producer that fails before the consumer starts is blamed on pack-objects", async () => {
+    const { bare, rc } = await setup(SELF);
+    const delayed = delayPlainConsumer(git, async (p) => {
+      assert.notStrictEqual(await p.exited, 0);
+      await turns(3);
+    });
+    const err = await settleWithin(
+      importError(git.ensureRunnerCloneObjects(bare, rc.path, UNKNOWN_SHA, [rc.baseCommit])),
+      30_000,
+      () => [delayed.producer()?.child],
+    );
+    // git's own stderr survives: the exit status is reported on the stream the import reads,
+    // even though the source had already ended before the consumer existed.
+    assert.match(err.causeMessage, /^pack-objects exited 128: git pack-objects .* exited 128: fatal: /s);
+    assert.ok(childGone(delayed.producer()?.child));
+  });
+
+  it("inside a boundary: a producer that fails before the consumer starts is blamed on pack-objects", async () => {
+    const { bare, rc } = await setup(SELF);
+    const spy = spyImport(git);
+    const real = realSpawner(async () => {
+      assert.notStrictEqual(await spy.producers[0]!.result.exited, 0);
+      await turns(3);
+    });
+    const err = await settleWithin(
+      importError(git.withBoundaryProcessSpawner(real.spawner, new AbortController().signal, () =>
+        git.ensureRunnerCloneObjects(bare, rc.path, UNKNOWN_SHA, [rc.baseCommit]))),
+      30_000,
+      () => [real.producer()],
+    );
+    // git's own stderr survives: the exit status is reported on the stream the import reads,
+    // even though the source had already ended before the consumer existed.
+    assert.match(err.causeMessage, /^pack-objects exited 128: git pack-objects .* exited 128: fatal: /s);
+    assert.ok(childGone(real.producer()));
+    assert.ok(await settled(spy.consumers[0]!.exited), "the consumer's exited has settled");
+  });
+
+  // (c) The consumer cannot start, or fails at once, while a real producer is blocked mid-pack.
+
+  it("plain spawn: a consumer that cannot start tears down a producer blocked mid-pack", async () => {
+    const { bare, rc, defaultTip } = await setupBig();
+    const internals = git as unknown as Internals;
+    let producer: SpawnGitResult | undefined;
+    const orig = internals.spawnGit.bind(git);
+    internals.spawnGit = async (cwd, args, stdin) => {
+      producer = await orig(cwd, args, stdin);
+      track(producer.child);
+      return producer;
+    };
+    internals.spawnGitAsRunnerWithStdin = async () => {
+      await untilBlocked(() => producer?.child?.stdout ?? undefined, () => producer?.stdout);
+      throw new Error("runner spawn refused");
+    };
+    const err = await settleWithin(
+      importError(git.ensureRunnerCloneObjects(bare, rc.path, defaultTip, [rc.baseCommit])),
+      30_000,
+      () => [producer?.child],
+    );
+    assert.match(err.causeMessage, /^index-pack could not start: .*runner spawn refused/);
+    assert.ok(childGone(producer?.child), "the producer has exited");
+    assert.ok(await settled(producer!.exited));
+    assert.strictEqual(resolves(rc.path, defaultTip), false, "nothing was imported");
+  });
+
+  it("inside a boundary: a consumer that cannot start tears down a producer blocked mid-pack", async () => {
+    // A boundary handle cannot be signalled: only destroying the returned stream, which must
+    // reach the child's real stdout, makes pack-objects hit EPIPE and exit.
+    const { bare, rc, defaultTip } = await setupBig();
+    const spy = spyImport(git);
+    let producer: ChildProcess | undefined;
+    const spawner: BoundaryProcessSpawner = async (request) => {
+      if (request.argv.includes("index-pack")) {
+        await untilBlocked(() => producer?.stdout ?? undefined, () => spy.producers[0]?.result.stdout);
+        throw new Error("supervisor refused the command root");
+      }
+      const { child, handle } = spawnReal(request);
+      track(child);
+      if (request.argv.includes("pack-objects")) producer = child;
+      return handle;
+    };
+    const err = await settleWithin(
+      importError(git.withBoundaryProcessSpawner(spawner, new AbortController().signal, () =>
+        git.ensureRunnerCloneObjects(bare, rc.path, defaultTip, [rc.baseCommit]))),
+      30_000,
+      () => [producer],
+    );
+    assert.match(err.causeMessage, /^index-pack could not start: .*supervisor refused the command root/);
+    assert.ok(childGone(producer), "the producer process has exited");
+    assert.ok(producer!.stdout!.destroyed, "the child's real stdout was destroyed through the returned stream");
+    assert.ok(await settled(spy.producers[0]!.result.exited));
+  });
+
+  it("plain spawn: a consumer that exits at once tears down a producer blocked mid-pack", async () => {
+    const { bare, rc, defaultTip } = await setupBig();
+    const internals = git as unknown as Internals;
+    let producer: SpawnGitResult | undefined;
+    let consumer: ConsumerResult | undefined;
+    const origProducer = internals.spawnGit.bind(git);
+    const origConsumer = internals.spawnGitAsRunnerWithStdin.bind(git);
+    internals.spawnGit = async (cwd, args, stdin) => {
+      producer = await origProducer(cwd, args, stdin);
+      track(producer.child);
+      return producer;
+    };
+    internals.spawnGitAsRunnerWithStdin = async (_cwd, args) => {
+      await untilBlocked(() => producer?.child?.stdout ?? undefined, () => producer?.stdout);
+      // The real index-pack, pointed at a directory that does not exist: it exits 128 at once.
+      consumer = await origConsumer(path.join(fx.dataDir, "no-such-clone"), args);
+      return consumer;
+    };
+    const err = await settleWithin(
+      importError(git.ensureRunnerCloneObjects(bare, rc.path, defaultTip, [rc.baseCommit])),
+      30_000,
+      () => [producer?.child],
+    );
+    assert.match(err.causeMessage, /^index-pack exited 128: .*; pack-objects exited -?\d+ \(stopped after its peer failed\)$/s);
+    assert.ok(childGone(producer?.child), "the producer has exited");
+    assert.ok(await settled(consumer!.exited));
+  });
+
+  it("inside a boundary: a consumer that exits at once tears down a producer blocked mid-pack", async () => {
+    const { bare, rc, defaultTip } = await setupBig();
+    const spy = spyImport(git);
+    let producer: ChildProcess | undefined;
+    const missing = path.join(fx.dataDir, "no-such-clone");
+    const spawner: BoundaryProcessSpawner = async (request) => {
+      if (request.argv.includes("index-pack")) {
+        await untilBlocked(() => producer?.stdout ?? undefined, () => spy.producers[0]?.result.stdout);
+        const argv = request.argv.map((a) => (a === rc.path ? missing : a));
+        const real = spawnReal({ ...request, argv });
+        track(real.child);
+        return real.handle;
+      }
+      const { child, handle } = spawnReal(request);
+      track(child);
+      if (request.argv.includes("pack-objects")) producer = child;
+      return handle;
+    };
+    const err = await settleWithin(
+      importError(git.withBoundaryProcessSpawner(spawner, new AbortController().signal, () =>
+        git.ensureRunnerCloneObjects(bare, rc.path, defaultTip, [rc.baseCommit]))),
+      30_000,
+      () => [producer],
+    );
+    assert.match(err.causeMessage, /^index-pack exited 128: .*; pack-objects exited -?\d+ \(stopped after its peer failed\)$/s);
+    assert.ok(childGone(producer), "the producer process has exited");
+    assert.ok(await settled(spy.producers[0]!.result.exited));
+    assert.ok(await settled(spy.consumers[0]!.exited));
+  });
+
+  // (d) Backpressure with no reader, then a full drain.
+
+  it("plain spawn: with no reader the returned stream stays bounded, then drains a whole pack", async () => {
+    const { bare, revs } = await setupBig();
+    const res = await (git as unknown as Internals).spawnGit(bare, PACK_ARGS, revs);
+    track(res.child);
+    await untilBlocked(() => res.child?.stdout ?? undefined, () => res.stdout);
+    assert.strictEqual(await settled(res.exited), false, "the producer is blocked on the full pipe");
+    const held = assertBounded(res.stdout);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.strictEqual(assertBounded(res.stdout), held, "nothing more was buffered while nobody read");
+    assertWholePack(await settleWithin(drain(res.stdout), 30_000, () => [res.child]));
+    assert.strictEqual(await res.exited, 0);
+    assert.ok(childGone(res.child));
+  });
+
+  it("inside a boundary: with no reader the returned stream stays bounded, then drains a whole pack", async () => {
+    const { bare, revs } = await setupBig();
+    const real = realSpawner();
+    const res = await git.withBoundaryProcessSpawner(real.spawner, new AbortController().signal, () =>
+      (git as unknown as Internals).spawnGit(bare, PACK_ARGS, revs));
+    await untilBlocked(real.source, () => res.stdout);
+    assert.strictEqual(await settled(res.exited), false, "the producer is blocked on the full pipe");
+    const held = assertBounded(res.stdout);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.strictEqual(assertBounded(res.stdout), held, "nothing more was buffered while nobody read");
+    assertWholePack(await settleWithin(drain(res.stdout), 30_000, () => [real.producer()]));
+    assert.strictEqual(await res.exited, 0);
+    assert.ok(childGone(real.producer()));
+  });
+
+  // (e) Errors cross in both directions.
+
+  it("plain spawn: a source error errors the returned stream with that error", async () => {
+    const { bare, revs } = await setupBig();
+    const res = await (git as unknown as Internals).spawnGit(bare, PACK_ARGS, revs);
+    track(res.child);
+    await untilBlocked(() => res.child?.stdout ?? undefined, () => res.stdout);
+    const boom = new Error("source broke");
+    const errored = once(res.stdout, "error");
+    res.child!.stdout!.destroy(boom);
+    const [err] = await settleWithin(errored, 10_000, () => [res.child]);
+    assert.strictEqual(err, boom);
+    assert.notStrictEqual(await settleWithin(res.exited, 10_000, () => [res.child]), 0, "pack-objects died on the lost pipe");
+    assert.ok(childGone(res.child));
+  });
+
+  it("plain spawn: destroying the returned stream destroys the source and ends the producer", async () => {
+    const { bare, revs } = await setupBig();
+    const res = await (git as unknown as Internals).spawnGit(bare, PACK_ARGS, revs);
+    track(res.child);
+    await untilBlocked(() => res.child?.stdout ?? undefined, () => res.stdout);
+    res.stdout.destroy();
+    assert.notStrictEqual(await settleWithin(res.exited, 10_000, () => [res.child]), 0);
+    assert.ok(res.child!.stdout!.destroyed, "the child's stdout was destroyed");
+    assert.ok(childGone(res.child));
+  });
+
+  it("inside a boundary: a source error errors the returned stream with that error", async () => {
+    const source = new PassThrough();
+    const done = deferred<{ code: number }>();
+    const spawner: BoundaryProcessSpawner = async () => ({ stdin: openSink(), stdout: source, stderr: null, completed: done.promise });
+    const res = await git.withBoundaryProcessSpawner(spawner, new AbortController().signal, () =>
+      (git as unknown as Internals).spawnGit(fx.dataDir, PACK_ARGS, ""));
+    source.write("partial");
+    const boom = new Error("transport broke");
+    const errored = once(res.stdout, "error");
+    source.destroy(boom);
+    const [err] = await settleWithin(errored, 10_000, () => []);
+    assert.strictEqual(err, boom);
+    done.resolve({ code: 1 });
+    assert.strictEqual(await settleWithin(res.exited, 10_000, () => []), 1);
+  });
+
+  it("inside a boundary: destroying the returned stream destroys the source", async () => {
+    const { bare, revs } = await setupBig();
+    const real = realSpawner();
+    const res = await git.withBoundaryProcessSpawner(real.spawner, new AbortController().signal, () =>
+      (git as unknown as Internals).spawnGit(bare, PACK_ARGS, revs));
+    await untilBlocked(real.source, () => res.stdout);
+    res.stdout.destroy();
+    // No kill is available through a boundary handle: the destroyed source is what ends it.
+    assert.notStrictEqual(await settleWithin(res.exited, 10_000, () => [real.producer()]), 0);
+    assert.ok(real.source()!.destroyed, "the child's stdout was destroyed");
+    assert.ok(childGone(real.producer()));
+  });
+
+  // A nonzero exit that lands after the source's EOF, before anybody reads (the checkpoint
+  // publish upload's shape too): the reader still sees git's failure, never a clean end.
+
+  it("plain spawn: a nonzero exit reaches a reader that starts after the producer is gone", async () => {
+    const { bare } = await setup(SELF);
+    const res = await (git as unknown as Internals).spawnGit(bare, PACK_ARGS, `${UNKNOWN_SHA}\n`);
+    track(res.child);
+    assert.strictEqual(await res.exited, 128);
+    await turns(3);
+    await assert.rejects(settleWithin(drain(res.stdout), 10_000, () => [res.child]), /pack-objects .*exited 128: fatal: /s);
+  });
+
+  it("inside a boundary: a nonzero exit reaches a reader that starts after the producer is gone", async () => {
+    const { bare } = await setup(SELF);
+    const real = realSpawner();
+    const res = await git.withBoundaryProcessSpawner(real.spawner, new AbortController().signal, () =>
+      (git as unknown as Internals).spawnGit(bare, PACK_ARGS, `${UNKNOWN_SHA}\n`));
+    assert.strictEqual(await res.exited, 128);
+    await turns(3);
+    await assert.rejects(settleWithin(drain(res.stdout), 10_000, () => [real.producer()]), /pack-objects .*exited 128: fatal: /s);
   });
 });
