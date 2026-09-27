@@ -10617,29 +10617,37 @@ export class RunRunner {
    *      required, clean→clean proof, unreadable status→NOT verified; origin publish best-effort),
    *      bounded retry with waitRecoveryRetry between attempts — enterCompletionHold steps 3-5, but
    *      using captureRecoveryRestorePoint (the PRD's named capture) rather than captureHoldContext.
-   *   6a. GIVE UP (never verified): report `credential_switch_failed` (best-effort; the server clears
-   *      the switch STAMP but leaves the standing override), KEEP both preserve flags (NO committed
-   *      work is lost), and return "gave_up". The caller leaves the run NON-TERMINAL for requeue,
-   *      exactly like the worker-shutdown-interrupt arm; the standing override still points at the
-   *      new token, so a same-worker reclaim resumes on it.
+   *   6a. GIVE UP (never verified): report `credential_switch_failed` and READ the ack; KEEP both
+   *      preserve flags on either outcome (NO committed work is lost). Only a POSITIVE clear
+   *      confirmation (ack.applied === true: the server cleared the switch STAMP, leaving the standing
+   *      override) re-arms the steering channel and returns "gave_up". A not-applied ack or a throw
+   *      (incl. a stale_claim from the reportState closure) means the stamp may still be pending, so
+   *      return "retained_stop" instead — never continue on an unconfirmed clear.
    *   6b. VERIFIED capture: DRAIN the batcher FIRST (the server's fenced append only persists while
-   *      claim_released_at IS NULL, so pending messages MUST land before the release moves the run
-   *      to `queued`), THEN report `credential_switch` and REQUIRE ack.status === "queued" — the
-   *      positive-ack contract, exactly as enterCompletionHold requires "paused". A non-"queued" ack
-   *      or a throw (incl. a stale_claim from the reportState closure) is a GIVE-UP: keep the flags,
-   *      return "gave_up" — never assume released.
-   *   7. Only after the queued ack: preserveRecoveryClone=false (the finally RETIRES the clone — a
-   *      cross-worker reclaim re-clones and recovers from the durable tracking ref + best-effort
-   *      origin; work is safe) and parked=true (preserve HOME + plugin dir for a same-worker
-   *      resume); return "released".
+   *      claim_released_at IS NULL, so pending messages MUST land before the release requeues the
+   *      run), THEN report `credential_switch` and REQUIRE ack.credentialSwitchReleased === true —
+   *      the server's RELEASED disposition, set on both a fresh requeue (status 'queued') and an
+   *      idempotent release after a reclaim (applied, status 'running'); the positive-ack contract,
+   *      as enterCompletionHold requires "paused". An unconfirmed release or a throw (incl. a
+   *      stale_claim) keeps the flags and returns "retained_stop" — never assume released.
+   *   7. Only after the confirmed release: preserveRecoveryClone=false (the finally RETIRES the
+   *      clone — a cross-worker reclaim re-clones and recovers from the durable tracking ref +
+   *      best-effort origin; work is safe) and parked=true (preserve HOME + plugin dir for a
+   *      same-worker resume); return "released".
    *
-   * DELIBERATE INTERPRETATION vs the PRD's "continue on the old token in place": the SDK executor
-   * has no primitive to re-drive an aborted turn IN PLACE, so this realizes the switch at the
-   * RECLAIM boundary instead of mid-flight. The verified-capture gate plus the preserved clone/HOME
-   * keep committed work safe on both outcomes, and the standing override makes the reclaim spend the
-   * newly-chosen token — the codebase-idiomatic equivalent of "continue on the old token", with no
-   * committed work lost. Strict continue-in-place would require resuming an aborted SDK session the
-   * executor cannot resume in place.
+   * Callers. The in-place ctx.attemptCredentialSwitch (the executor's turn catch and idle held-state
+   * waiters) CONTINUES the run on the old token on "gave_up" (it clears both preserve flags and
+   * undoes any wip marker), and on "retained_stop" throws CredentialSwitchRetainedStop, which
+   * executeClaim's catch turns into a non-terminal stop with the flags kept, for requeue.
+   * executeClaim's CredentialSwitchSignal safety-net arm cannot continue in place, so it leaves the
+   * run non-terminal for requeue (flags kept) on any outcome other than "released".
+   *
+   * DELIBERATE INTERPRETATION vs the PRD: the SDK executor has no primitive to re-drive an aborted
+   * turn IN PLACE on a new token, so a completed switch ("released") is realized at the RECLAIM
+   * boundary, where the standing override makes the reclaim spend the newly-chosen token. The PRD's
+   * "continue on the old token in place" is honoured by the in-place caller on a confirmed give-up;
+   * any unconfirmed outcome retains the clone/HOME and stops for requeue instead. The verified-capture
+   * gate plus the retained clone/HOME keep committed work safe on every outcome.
    */
   private async enterCredentialSwitch(
     claim: ClaimResponse,
