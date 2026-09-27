@@ -34,8 +34,9 @@ import { errMessage, RUN_ID_RE, sleep } from "./util.js";
  * run can plant names there. A listed entry is examined only if it is a real directory owned
  * by the worker (see `isWorkerOwnedDir` in {@link runDiskReclaimPass}); anything else is
  * counted and skipped before it can take a status lookup or a slot in the run budget, and
- * each root's listing rotates across passes (DEFAULT_DIR_CURSORS) so a flood of names cannot
- * hide a real entry behind the read cap for good.
+ * each root's listing rotates across passes (DEFAULT_DIR_CURSORS, which also says where that
+ * rotation stops guaranteeing anything) so a flood of names smaller than the read budget
+ * cannot hide a real entry behind the read cap.
  *
  * **Never a live run.** A run this worker is executing is skipped before its status is even
  * asked for, and the check is repeated under the run's {@link RunDiskLocks} lock right
@@ -141,6 +142,11 @@ export interface DiskReclaimDeps {
    */
   dirCursors?: Map<string, number>;
   /**
+   * The run cursor (see "Run budget" in {@link runDiskReclaimPass}), keyed by HOME root.
+   * Absent, the module's own map, which outlives a pass.
+   */
+  runCursors?: Map<string, string>;
+  /**
    * The uid that owns every directory the reclaim may examine: the worker's own
    * (`process.getuid()`, the default). Absent and without `process.getuid`, nothing is
    * filtered by owner.
@@ -157,6 +163,11 @@ export interface DiskReclaimSummary {
   runsExamined: number;
   terminalHomesRemoved: number;
   provisionDirsRemoved: number;
+  /**
+   * An admitted run's provision dir the worker does not own (a legacy pre-split dir the
+   * entrypoint re-owned to `runner`, or a planted one): never removed, see the pass.
+   */
+  provisionDirsNotOwned: number;
   /** A parked run whose drop freed at least one cache subtree. */
   cachesDropped: number;
   /** A parked run whose caches were already gone (remembered from an earlier pass, or a no-op drop). */
@@ -181,7 +192,10 @@ export interface DiskReclaimSummary {
   modelPassHomesNotOwned: number;
   /** Dirents read from the two roots, kept or not (a resumed listing's skipped prefix included). */
   dirEntriesRead: number;
-  /** "budget": the run cap, or a root's listing hit its read cap (then only what was read is examined). */
+  /**
+   * "budget": the run cap, or a root's listing hit its read cap or read budget (then only
+   * what was read is examined). "deadline": the pass deadline, in a listing or after it.
+   */
   stoppedEarly?: "budget" | "api_unreachable" | "deadline";
 }
 
@@ -231,9 +245,15 @@ interface RunDirs {
  * listing cost the worker ~120 MB, ~3M would OOM-kill it. Streamed reads charged here bound
  * what a pass holds to this many names per root, far above any real fleet's run and
  * model-pass HOMEs. A listing that resumes past a skipped prefix (below) reads that prefix
- * and discards it, holding none of it.
+ * and discards it, holding none of it; the prefix is charged to {@link PASS_READ_BUDGET_FACTOR}.
  */
 const DEFAULT_PASS_MAX_DIR_READS = 50_000;
+
+/**
+ * Each root's listing reads at most this many times its keep cap in one pass, the skipped
+ * prefix of a resumed listing included, so no pass reads a flooded root to its end.
+ */
+const PASS_READ_BUDGET_FACTOR = 4;
 
 /**
  * Where each root's next listing resumes: the number of leading dirents to read past and
@@ -243,24 +263,36 @@ const DEFAULT_PASS_MAX_DIR_READS = 50_000;
  * **Why it rotates.** Without it a capped listing reads the same leading window every pass,
  * so more than a cap's worth of planted names ahead of a real HOME (in readdir order) hide
  * it from every pass. With it, a pass that stops at the cap resumes the next pass where it
- * stopped, and a listing that reaches the directory's end starts the next pass from 0.
+ * stopped, and a listing that reaches the directory's end, or whose window ends at the
+ * root's read budget (cap x {@link PASS_READ_BUDGET_FACTOR}), starts the next pass from 0.
  *
- * **The guarantee.** Given a readdir order that does not change between passes except by
- * this reclaim's own removals (which the cursor subtracts), a root of N entries is read
- * whole across at most ceil(N / cap) + 1 consecutive passes, so every entry in it is
- * reached within that many passes however many names a persistent flood plants: a flood
- * only lengthens the cycle. It is not a guarantee against a writer that keeps inserting
- * more than a cap's worth of new names ahead of an entry between every two passes, nor
- * across a worker restart (the cursor starts at 0 again).
+ * **What it guarantees, and what it does not.** A root whose readdir order does not change
+ * between passes except by this reclaim's own removals (which the cursor subtracts), and
+ * whose size N is within the read budget, is read whole across at most ceil(N / cap) + 1
+ * consecutive passes. Beyond that it guarantees nothing:
+ *  - entries past the read budget in readdir order are not reached while the root stays
+ *    that large (a flood that big hides them; the budget is what keeps a pass bounded);
+ *  - a live writer that inserts OR deletes names adaptively around the cursor between two
+ *    passes shifts the positions the cursor counts, and can keep an entry out of every
+ *    window;
+ *  - a worker restart starts every cursor at 0 again.
  */
 const DEFAULT_DIR_CURSORS = new Map<string, number>();
+
+/**
+ * The last run id a pass examined when it stopped at its run budget, keyed by HOME root
+ * (see {@link DiskReclaimDeps.runCursors}). Module-level for the reason DEFAULT_DIR_CURSORS is.
+ */
+const DEFAULT_RUN_CURSORS = new Map<string, string>();
 
 interface DirListing {
   lists: Array<Map<string, string>>;
   /** Dirents read, the skipped prefix included. */
   read: number;
-  /** The listing stopped at the read cap. */
+  /** The listing stopped at its keep cap or its read budget. */
   capped: boolean;
+  /** The listing stopped at the pass deadline. */
+  deadline: boolean;
   /** Where the next pass's listing of this root starts, before this pass's own removals. */
   next: number;
   /** The whole directory was read from its first entry (absent counts; a cap, a skipped prefix or an error does not). */
@@ -269,22 +301,31 @@ interface DirListing {
 
 /**
  * Stream `root`'s entries (never a whole listing): read past the first `skip` of them, then
- * charge every further dirent to `maxReads` and sort the directories among them into one map
- * per filter (first match wins). Empty when `root` is absent; stops at the cap with `capped`
- * set.
+ * keep at most `maxReads` further dirents, sorting the directories among them into one map
+ * per filter (first match wins). Every dirent, skipped or kept, is charged to `budget`, and
+ * the `deadline` (on `now`) is checked before each read. Empty when `root` is absent.
+ *
+ * A skip that exhausts the budget stops the listing as capped with the cursor back at 0; a
+ * window that ends at the budget also wraps the next pass to 0. A deadline stop keeps the
+ * position reached (the skip itself when it was still skipping).
  */
 async function listDirs(
   root: string,
   filters: ReadonlyArray<(name: string) => boolean>,
   skip: number,
   maxReads: number,
+  budget: number,
+  deadline: number,
+  now: () => number,
   log: Logger,
 ): Promise<DirListing> {
   const lists = filters.map(() => new Map<string, string>());
   let skipped = 0;
   let read = 0;
   let capped = false;
+  let pastDeadline = false;
   let atEnd = false;
+  let next = skip;
   let dir;
   try {
     dir = await fs.opendir(root);
@@ -292,19 +333,33 @@ async function listDirs(
     const absent = (err as NodeJS.ErrnoException).code === "ENOENT";
     if (!absent) log.warn("disk reclaim could not read a directory", { dir: root, error: errMessage(err) });
     // An unreadable root keeps its cursor: the next pass retries the same window.
-    return { lists, read: 0, capped, next: absent ? 0 : skip, whole: absent };
+    return { lists, read: 0, capped, deadline: false, next: absent ? 0 : skip, whole: absent };
   }
   try {
     while (skipped < skip) {
+      if (skipped >= budget) {
+        capped = true;
+        next = 0; // the resume point is past what one pass may read: start over
+        break;
+      }
+      if (now() >= deadline) {
+        pastDeadline = true;
+        break; // next stays at skip: retry the same window
+      }
       if ((await dir.read()) === null) {
         atEnd = true;
         break;
       }
       skipped += 1;
     }
-    while (!atEnd) {
-      if (read >= maxReads) {
+    const keep = Math.min(maxReads, budget - skipped);
+    while (!atEnd && !capped && !pastDeadline) {
+      if (read >= keep) {
         capped = true;
+        break;
+      }
+      if (now() >= deadline) {
+        pastDeadline = true;
         break;
       }
       const e = await dir.read();
@@ -316,17 +371,19 @@ async function listDirs(
       // Dirent types come from the directory entry, never a stat that follows it: a symlink
       // is never a directory here and is never followed out of the data volume.
       if (!e.isDirectory()) continue;
-      const i = filters.findIndex((keep) => keep(e.name));
+      const i = filters.findIndex((keepName) => keepName(e.name));
       if (i >= 0) lists[i]?.set(e.name, path.join(root, e.name));
     }
+    if (atEnd) next = 0;
+    else if (capped || read > 0) next = skipped + read >= budget ? 0 : skipped + read;
   } catch (err) {
     log.warn("disk reclaim could not read a directory", { dir: root, error: errMessage(err) });
     await dir.close().catch(() => undefined);
-    return { lists, read: skipped + read, capped: false, next: skip, whole: false };
+    return { lists, read: skipped + read, capped: false, deadline: false, next: skip, whole: false };
   }
   await dir.close().catch(() => undefined);
-  if (capped) log.warn("disk reclaim stopped listing a directory at its read cap", { dir: root, max_reads: maxReads, skipped });
-  return { lists, read: skipped + read, capped, next: atEnd ? 0 : skipped + read, whole: atEnd && skip === 0 };
+  if (capped) log.warn("disk reclaim stopped listing a directory at its read cap", { dir: root, max_reads: maxReads, budget, skipped });
+  return { lists, read: skipped + read, capped, deadline: pastDeadline, next, whole: atEnd && skip === 0 };
 }
 
 /**
@@ -343,6 +400,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
   const maxEntries = deps.maxEntries ?? DEFAULT_PASS_MAX_ENTRIES;
   const maxDirReads = deps.maxDirReads ?? DEFAULT_PASS_MAX_DIR_READS;
   const cursors = deps.dirCursors ?? DEFAULT_DIR_CURSORS;
+  const runCursors = deps.runCursors ?? DEFAULT_RUN_CURSORS;
   const workerUid = "workerUid" in deps ? deps.workerUid : process.getuid?.();
   const lstat = deps.lstat ?? ((p: string) => fs.lstat(p));
   const maxConsecutiveFailures = deps.maxConsecutiveFailures ?? DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES;
@@ -353,6 +411,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
     runsExamined: 0,
     terminalHomesRemoved: 0,
     provisionDirsRemoved: 0,
+    provisionDirsNotOwned: 0,
     cachesDropped: 0,
     cachesAlreadyClear: 0,
     skippedLive: 0,
@@ -392,57 +451,80 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
   const noteRemoved = (root: string) => removedFrom.set(root, (removedFrom.get(root) ?? 0) + 1);
 
   const isRunId = (name: string) => RUN_ID_RE.test(name);
+  const passDeadline = startedAt + deadlineMs;
+  const readBudget = maxDirReads * PASS_READ_BUDGET_FACTOR;
+  const homeSkip = cursors.get(deps.homeRoot) ?? 0;
+  const provisionSkip = cursors.get(deps.provisionRoot) ?? 0;
   // agent-home is listed once: its run HOMEs and its model-pass HOMEs come from one stream.
   const homeList = await listDirs(
     deps.homeRoot,
     [isRunId, (name) => MODEL_PASS_HOME_RE.test(name)],
-    cursors.get(deps.homeRoot) ?? 0,
+    homeSkip,
     maxDirReads,
+    readBudget,
+    passDeadline,
+    now,
     log,
   );
-  const provisionList = await listDirs(deps.provisionRoot, [isRunId], cursors.get(deps.provisionRoot) ?? 0, maxDirReads, log);
+  const provisionList = await listDirs(deps.provisionRoot, [isRunId], provisionSkip, maxDirReads, readBudget, passDeadline, now, log);
   const [homes = new Map<string, string>(), passHomes = new Map<string, string>()] = homeList.lists;
   const [provisions = new Map<string, string>()] = provisionList.lists;
   summary.dirEntriesRead = homeList.read + provisionList.read;
   // A capped root was listed only in part: the pass still examines what it read (bounded),
-  // and reports the stop.
-  const listingCapped = homeList.capped || provisionList.capped;
-  if (listingCapped) summary.stoppedEarly = "budget";
-  const runs = new Map<string, RunDirs>();
-  for (const [id, dir] of homes) runs.set(id, { home: dir });
-  for (const [id, dir] of provisions) runs.set(id, { ...runs.get(id), provision: dir });
-  const passDeadline = startedAt + deadlineMs;
+  // and reports the stop. A deadline stop outranks a cap.
+  if (homeList.capped || provisionList.capped) summary.stoppedEarly = "budget";
+  if (homeList.deadline || provisionList.deadline) summary.stoppedEarly = "deadline";
+  const listed = new Map<string, RunDirs>();
+  for (const [id, dir] of homes) listed.set(id, { home: dir });
+  for (const [id, dir] of provisions) listed.set(id, { ...listed.get(id), provision: dir });
+  // Run budget: the runs are examined in id order starting after the run cursor (the last
+  // run a pass examined before it stopped at maxEntries), wrapping round. Without it every
+  // pass over the same window would examine the same first maxEntries worker-owned runs, so
+  // enough runs that are never removed (e.g. HOMEs of runs the api no longer knows, 404)
+  // would starve every terminal HOME behind them. Id order, not listing order, so the cursor
+  // means the same thing whatever order the next listing returns.
+  const runCursor = runCursors.get(deps.homeRoot);
+  const ids = [...listed.keys()].sort();
+  const from = runCursor === undefined ? 0 : ids.findIndex((id) => id > runCursor);
+  const order = from <= 0 ? ids : [...ids.slice(from), ...ids.slice(0, from)];
+  const runs = new Map<string, RunDirs>(order.map((id) => [id, listed.get(id) as RunDirs]));
   // Forget runs whose HOME is gone, so the memo stays bounded by what is on the volume. Only
   // from a whole listing: a HOME outside a capped, resumed (or failed) listing's window is not
   // known to be gone.
   if (homeList.whole) memo?.retainOnly((id) => homes.has(id));
 
   let consecutiveFailures = 0;
+  let lastExamined: string | undefined;
+  let runBudgetStop = false;
   for (const [runId, listed] of runs) {
     if (now() - startedAt >= deadlineMs) {
       summary.stoppedEarly = "deadline";
       break;
     }
-    // Ownership first, before the run budget and any status lookup. A HOME that is not the
-    // worker's is never acted on. A worker-owned HOME admits the run with its provision dir
-    // whoever owns that: the entrypoint's one-time legacy migration re-owns pre-split
-    // provision dirs to `runner`, and that is a real run's dir. A run with no worker-owned
-    // HOME is admitted only by a worker-owned provision dir.
-    const dirs: RunDirs = {};
-    if (listed.home && (await isWorkerOwnedDir(listed.home))) {
-      dirs.home = listed.home;
-      if (listed.provision) dirs.provision = listed.provision;
-    } else if (listed.provision && (await isWorkerOwnedDir(listed.provision))) {
-      dirs.provision = listed.provision;
-    } else {
+    // Ownership first, before the run budget and any status lookup: the pass acts only on
+    // directories the worker owns, the same check rmTreePinned makes on the leaf (it refuses
+    // any other owner with EPERM). A run is admitted by either of its dirs being the
+    // worker's; a dir of an admitted run that is not the worker's is left alone and counted.
+    // That includes a legacy pre-split provision dir the entrypoint's one-time migration
+    // re-owned to `runner`: it is out of this reclaim's reach, and needs the agent-uid purge
+    // (#1607), which in turn requires a worker-owned root.
+    const homeOwned = listed.home !== undefined && (await isWorkerOwnedDir(listed.home));
+    const provisionOwned = listed.provision !== undefined && (await isWorkerOwnedDir(listed.provision));
+    if (!homeOwned && !provisionOwned) {
       summary.skippedNotOwned += 1;
       continue;
     }
+    const dirs: RunDirs = {};
+    if (homeOwned) dirs.home = listed.home;
+    if (provisionOwned) dirs.provision = listed.provision;
+    else if (listed.provision) summary.provisionDirsNotOwned += 1;
     if (summary.runsExamined >= maxEntries) {
       summary.stoppedEarly = "budget";
+      runBudgetStop = true;
       break;
     }
     summary.runsExamined += 1;
+    lastExamined = runId;
     if (deps.isRunLive(runId)) {
       memo?.forget(runId); // executing again: its caches may be refilled by the next park
       summary.skippedLive += 1;
@@ -557,22 +639,32 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
     }
   }
 
-  // Advance each root's cursor past this pass's window, less the entries this pass removed
-  // from inside it (each was ahead of the cursor, so the next listing is that much shorter).
-  // A listing that reached the end restarts from 0.
-  for (const [root, listing] of [
-    [deps.homeRoot, homeList],
-    [deps.provisionRoot, provisionList],
-  ] as const) {
-    const next = listing.next > 0 ? Math.max(0, listing.next - (removedFrom.get(root) ?? 0)) : 0;
-    if (next > 0) cursors.set(root, next);
-    else cursors.delete(root);
+  // A pass that stopped at its run budget keeps both roots on the same window next pass and
+  // resumes the runs after the last one it examined, so every worker-owned run in a window is
+  // examined before the listing moves on. Its removals were all inside the window, at or past
+  // the skip, so the skip stays as it was.
+  if (runBudgetStop && lastExamined !== undefined) {
+    runCursors.set(deps.homeRoot, lastExamined);
+  } else {
+    runCursors.delete(deps.homeRoot);
+    // Advance each root's cursor past this pass's window, less the entries this pass removed
+    // from inside it (each was ahead of the cursor, so the next listing is that much shorter).
+    // A listing that reached the end (or its read budget) restarts from 0.
+    for (const [root, listing] of [
+      [deps.homeRoot, homeList],
+      [deps.provisionRoot, provisionList],
+    ] as const) {
+      const next = listing.next > 0 ? Math.max(0, listing.next - (removedFrom.get(root) ?? 0)) : 0;
+      if (next > 0) cursors.set(root, next);
+      else cursors.delete(root);
+    }
   }
 
   log.info("disk reclaim pass complete", {
     runs_examined: summary.runsExamined,
     terminal_homes_removed: summary.terminalHomesRemoved,
     provision_dirs_removed: summary.provisionDirsRemoved,
+    provision_dirs_not_owned: summary.provisionDirsNotOwned,
     caches_dropped: summary.cachesDropped,
     caches_already_clear: summary.cachesAlreadyClear,
     skipped_live: summary.skippedLive,

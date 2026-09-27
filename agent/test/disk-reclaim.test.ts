@@ -423,9 +423,11 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     assert.equal(s.stoppedEarly, undefined);
   });
 
-  it("a worker-owned HOME admits its run's provision dir whoever owns it (the legacy migration re-owns it to runner)", async () => {
+  it("a provision dir the worker does not own is skipped and counted, and its run's HOME is still removed", async () => {
     const d = dataDir();
     const workerUid = 4242;
+    // A legacy pre-split provision dir the entrypoint re-owned to runner: rmTreePinned would
+    // refuse it (EPERM), so the pass never tries.
     const run = plainHome(d.home);
     const legacyProvision = path.join(d.provision, run.id);
     fs.mkdirSync(legacyProvision);
@@ -436,20 +438,32 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     const ownedProvision = path.join(d.provision, other);
     fs.mkdirSync(plantedHome);
     fs.mkdirSync(ownedProvision);
+    const removed: string[] = [];
+    const { logger, lines } = recordingLogger();
     const s = await runDiskReclaimPass(
       deps(d, {
         workerUid,
+        log: logger,
         lstat: lstatAs(new Set([legacyProvision, plantedHome]), workerUid),
         statusOf: async () => "completed",
+        removeTree: async (parent, name) => {
+          removed.push(path.join(parent, name));
+          fs.rmSync(path.join(parent, name), { recursive: true, force: true });
+        },
       }),
     );
-    assert.equal(exists(run.home), false);
-    assert.equal(exists(legacyProvision), false, "the runner-owned provision dir of a worker-owned run is removed with it");
+    assert.equal(exists(run.home), false, "the worker-owned HOME is removed");
+    assert.ok(exists(legacyProvision), "the runner-owned provision dir is left alone");
+    assert.ok(!removed.includes(legacyProvision), "and its removal is never attempted");
     assert.ok(exists(plantedHome), "a HOME the worker does not own is never removed");
     assert.equal(exists(ownedProvision), false, "the worker-owned provision dir beside it is");
     assert.equal(s.runsExamined, 2);
     assert.equal(s.terminalHomesRemoved, 1);
-    assert.equal(s.provisionDirsRemoved, 2);
+    assert.equal(s.provisionDirsRemoved, 1);
+    assert.equal(s.provisionDirsNotOwned, 1);
+    assert.equal(s.failed, 0);
+    const warns = lines.filter((l) => (l as { level?: string; msg: string }).msg === "disk reclaim could not remove a terminal run's directory");
+    assert.equal(warns.length, 0, "no warning for a dir it never tried");
   });
 
   it("never touches a model-pass-named dir the worker does not own, whatever its age", async () => {
@@ -465,7 +479,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     assert.equal(s.modelPassHomesRemoved, 0);
   });
 
-  it("flood B: a capped listing rotates, so real HOMEs behind a flood of names are reached within ceil(N/cap)+1 passes", async () => {
+  it("flood B: a capped listing rotates, so real HOMEs behind a flood of names (within the read budget) are reached within ceil(N/cap)+1 passes", async () => {
     const d = dataDir();
     // Real HOMEs on both sides of the flood in creation order, so some sit past the first
     // window whichever order this filesystem lists in.
@@ -475,7 +489,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
       else fs.mkdirSync(path.join(d.home, `junk-${i}`));
     }
     real.push(...Array.from({ length: 10 }, () => plainHome(d.home)));
-    const cap = 25;
+    const cap = 60; // read budget 4 x 60 = 240 covers the root's 220 entries
     const bound = Math.ceil(220 / cap) + 1;
     const cursors = new Map<string, number>();
     const removedPerPass: number[] = [];
@@ -505,6 +519,75 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     assert.equal(second.dirEntriesRead, 30, "20 skipped then the last 10 read");
     assert.equal(second.stoppedEarly, undefined);
     assert.equal(cursors.has(d.home), false, "reached the end: the next listing starts from 0");
+  });
+
+  it("a resumed listing charges its skipped prefix to the read budget and starts over past it", async () => {
+    const d = dataDir();
+    for (let i = 0; i < 200; i++) fs.writeFileSync(path.join(d.home, `junk-${i}`), "");
+    // A cursor far past what one pass may read (budget 4 x 10 = 40 per root).
+    const cursors = new Map<string, number>([[d.home, 150]]);
+    const s = await runDiskReclaimPass(deps(d, { maxDirReads: 10, dirCursors: cursors }));
+    assert.equal(s.dirEntriesRead, 40, "the skip stopped at the budget, not at the 150-entry cursor");
+    assert.equal(s.stoppedEarly, "budget");
+    assert.equal(cursors.has(d.home), false, "the cursor is back at 0");
+    const again = await runDiskReclaimPass(deps(d, { maxDirReads: 10, dirCursors: cursors }));
+    assert.equal(again.dirEntriesRead, 10, "the next pass reads its first window");
+    assert.equal(cursors.get(d.home), 10);
+
+    // Rotation wraps at the budget, so no pass skips past it.
+    const seen: number[] = [];
+    for (let i = 0; i < 4; i++) {
+      await runDiskReclaimPass(deps(d, { maxDirReads: 10, dirCursors: cursors }));
+      seen.push(cursors.get(d.home) ?? 0);
+    }
+    assert.deepEqual(seen, [20, 30, 0, 10], "a window ending at the 40-entry budget wraps to 0");
+  });
+
+  it("stops a listing at the pass deadline, in the skipped prefix and in the kept window", async () => {
+    const d = dataDir();
+    for (let i = 0; i < 500; i++) fs.writeFileSync(path.join(d.home, `junk-${i}`), "");
+    for (const skip of [300, 0]) {
+      let t = 0;
+      const cursors = new Map<string, number>(skip ? [[d.home, skip]] : []);
+      const s = await runDiskReclaimPass(
+        deps(d, { maxDirReads: 1_000, dirCursors: cursors, deadlineMs: 100, now: () => t++ }),
+      );
+      assert.equal(s.stoppedEarly, "deadline", `skip ${skip}: reported as the deadline, not the budget`);
+      assert.ok(s.dirEntriesRead < 110, `skip ${skip}: stopped near the deadline, not after ${s.dirEntriesRead} reads`);
+      if (skip) assert.equal(cursors.get(d.home), skip, "a deadline mid-skip retries the same window");
+      else assert.ok((cursors.get(d.home) ?? 0) > 0, "a deadline mid-window resumes where it stopped");
+    }
+  });
+
+  it("the run budget resumes after the last examined run, so never-removed runs cannot starve terminal HOMEs", async () => {
+    const d = dataDir();
+    const gone = Array.from({ length: 60 }, () => plainHome(d.home)); // HOMEs of runs the api no longer knows
+    const terminal = Array.from({ length: 20 }, () => plainHome(d.home));
+    const status = new Map(terminal.map((r) => [r.id, "completed"]));
+    const dirCursors = new Map<string, number>();
+    const runCursors = new Map<string, string>();
+    const asked = new Map<string, number>();
+    const pass = () =>
+      runDiskReclaimPass(
+        deps(d, {
+          maxEntries: 50,
+          dirCursors,
+          runCursors,
+          statusOf: async (id) => {
+            asked.set(id, (asked.get(id) ?? 0) + 1);
+            return status.get(id);
+          },
+        }),
+      );
+    const first = await pass();
+    assert.equal(first.stoppedEarly, "budget");
+    assert.equal(first.runsExamined, 50);
+    const second = await pass();
+    assert.equal(second.runsExamined, 50);
+    for (const r of terminal) assert.equal(exists(r.home), false, "every terminal HOME is removed within two passes");
+    for (const r of gone) assert.ok(exists(r.home), "a 404 HOME is never removed");
+    for (const r of [...gone, ...terminal]) assert.ok((asked.get(r.id) ?? 0) >= 1, "every run was examined");
+    assert.equal(first.terminalHomesRemoved + second.terminalHomesRemoved, 20);
   });
 
   it("a drop that found nothing is not counted as a drop and logs nothing of its own", { skip: SKIP_ROOT }, async () => {
