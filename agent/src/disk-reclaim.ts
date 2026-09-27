@@ -108,12 +108,10 @@ export interface DiskReclaimDeps {
   locks: RunDiskLocks;
   log: Logger;
   /**
-   * The runs whose caches a pass found all gone (dropped or absent), so later passes skip
-   * them. An entry is dropped when a pass sees the run executing here or reads a status
-   * other than a process-ended park (it was resumed), or when its HOME is gone. Owned by the
-   * caller so it outlives one pass; absent, nothing is remembered.
+   * The runs whose caches a pass found all gone, shared with the runner (see
+   * {@link CachesDroppedMemo}); absent, nothing is remembered.
    */
-  cachesDropped?: Set<string>;
+  cachesDropped?: CachesDroppedMemo;
   /** Seams, injected by tests. */
   removeTree?: (parent: string, name: string, deadline: number) => Promise<unknown>;
   dropCaches?: (home: string, log: Logger, opts: DropRunCachesOptions) => Promise<RunCacheDropResult>;
@@ -121,6 +119,8 @@ export interface DiskReclaimDeps {
   now?: () => number;
   modelPassMinAgeMs?: number;
   maxEntries?: number;
+  /** Dirents one pass may read from each root (default {@link DEFAULT_PASS_MAX_DIR_READS}). */
+  maxDirReads?: number;
   maxConsecutiveFailures?: number;
   deadlineMs?: number;
 }
@@ -145,7 +145,44 @@ export interface DiskReclaimSummary {
   modelPassHomesLive: number;
   modelPassHomesTooRecent: number;
   modelPassHomesFailed: number;
+  /** Dirents read from the two roots, kept or not. */
+  dirEntriesRead: number;
+  /** "budget": the run cap, or a root's listing hit its read cap (then only what was read is examined). */
   stoppedEarly?: "budget" | "api_unreachable" | "deadline";
+}
+
+/**
+ * The runs whose caches a reclaim pass found all gone (dropped or absent), so later passes
+ * skip them instead of walking their HOME again. Owned by main.ts so it outlives one pass,
+ * and shared with the runner: a run that executes again may rebuild its caches, so its
+ * entry is forgotten
+ *
+ *  - when the runner starts executing it ({@link forget}, called while the runner holds the
+ *    run's {@link RunDiskLocks} lock, so it is ordered after any drop that was in progress
+ *    and whose {@link add} ran under the same lock). A run that resumes here, rebuilds its
+ *    caches and parks again entirely between two passes is still dropped by the next one;
+ *  - when a pass sees the run executing, or reads a status other than a process-ended park;
+ *  - when a pass's complete listing no longer has the run's HOME.
+ */
+export class CachesDroppedMemo {
+  private readonly ids = new Set<string>();
+
+  has(runId: string): boolean {
+    return this.ids.has(runId);
+  }
+
+  add(runId: string): void {
+    this.ids.add(runId);
+  }
+
+  forget(runId: string): void {
+    this.ids.delete(runId);
+  }
+
+  /** Forget every run `keep` rejects. */
+  retainOnly(keep: (runId: string) => boolean): void {
+    for (const id of this.ids) if (!keep(id)) this.ids.delete(id);
+  }
 }
 
 interface RunDirs {
@@ -153,22 +190,62 @@ interface RunDirs {
   provision?: string;
 }
 
-/** Directory entries of `root` whose names pass `keep`, name -> absolute path; empty when absent. */
-async function listDirs(root: string, keep: (name: string) => boolean, log: Logger): Promise<Map<string, string>> {
-  const out = new Map<string, string>();
-  let entries;
+/**
+ * Cap on the directory entries one pass reads from each root (`agent-home`, `provision`),
+ * charged for EVERY dirent read, kept or not. Both roots are writable by live runs' agent
+ * uids, so a run can plant names there: an audit planted 300k and the whole listing cost the
+ * worker ~120 MB, ~3M would OOM-kill it. Streamed reads charged here bound what a pass holds
+ * to this many names per root, far above any real fleet's run and model-pass HOMEs.
+ */
+const DEFAULT_PASS_MAX_DIR_READS = 50_000;
+
+/**
+ * Stream `root`'s entries (never a whole listing), charging every dirent read to `maxReads`,
+ * and sort the directories among them into one map per filter (first match wins). Empty
+ * when `root` is absent; stops at the cap with `capped` set. `complete` says the whole
+ * directory was read (absent counts as complete; a cap or a read error does not).
+ */
+async function listDirs(
+  root: string,
+  filters: ReadonlyArray<(name: string) => boolean>,
+  maxReads: number,
+  log: Logger,
+): Promise<{ lists: Array<Map<string, string>>; read: number; capped: boolean; complete: boolean }> {
+  const lists = filters.map(() => new Map<string, string>());
+  let read = 0;
+  let capped = false;
+  let failed = false;
+  let dir;
   try {
-    entries = await fs.readdir(root, { withFileTypes: true });
+    dir = await fs.opendir(root);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      log.warn("disk reclaim could not read a directory", { dir: root, error: errMessage(err) });
-    }
-    return out;
+    const absent = (err as NodeJS.ErrnoException).code === "ENOENT";
+    if (!absent) log.warn("disk reclaim could not read a directory", { dir: root, error: errMessage(err) });
+    return { lists, read, capped, complete: absent };
   }
-  // readdir types entries from lstat, so a symlink is never a directory here and is never
-  // followed out of the data volume.
-  for (const e of entries) if (e.isDirectory() && keep(e.name)) out.set(e.name, path.join(root, e.name));
-  return out;
+  try {
+    for (;;) {
+      if (read >= maxReads) {
+        capped = true;
+        break;
+      }
+      const e = await dir.read();
+      if (e === null) break;
+      read += 1;
+      // Dirent types come from the directory entry, never a stat that follows it: a symlink
+      // is never a directory here and is never followed out of the data volume.
+      if (!e.isDirectory()) continue;
+      const i = filters.findIndex((keep) => keep(e.name));
+      if (i >= 0) lists[i]?.set(e.name, path.join(root, e.name));
+    }
+  } catch (err) {
+    failed = true;
+    log.warn("disk reclaim could not read a directory", { dir: root, error: errMessage(err) });
+  } finally {
+    await dir.close().catch(() => undefined);
+  }
+  if (capped) log.warn("disk reclaim stopped listing a directory at its read cap", { dir: root, max_reads: maxReads });
+  return { lists, read, capped, complete: !capped && !failed };
 }
 
 /**
@@ -183,6 +260,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
   const now = deps.now ?? Date.now;
   const modelPassMinAgeMs = deps.modelPassMinAgeMs ?? DEFAULT_MODEL_PASS_MIN_AGE_MS;
   const maxEntries = deps.maxEntries ?? DEFAULT_PASS_MAX_ENTRIES;
+  const maxDirReads = deps.maxDirReads ?? DEFAULT_PASS_MAX_DIR_READS;
   const maxConsecutiveFailures = deps.maxConsecutiveFailures ?? DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES;
   const deadlineMs = deps.deadlineMs ?? DEFAULT_PASS_DEADLINE_MS;
   const log = deps.log;
@@ -202,17 +280,27 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
     modelPassHomesLive: 0,
     modelPassHomesTooRecent: 0,
     modelPassHomesFailed: 0,
+    dirEntriesRead: 0,
   };
 
   const isRunId = (name: string) => RUN_ID_RE.test(name);
-  const homes = await listDirs(deps.homeRoot, isRunId, log);
-  const provisions = await listDirs(deps.provisionRoot, isRunId, log);
+  // agent-home is listed once: its run HOMEs and its model-pass HOMEs come from one stream.
+  const homeList = await listDirs(deps.homeRoot, [isRunId, (name) => MODEL_PASS_HOME_RE.test(name)], maxDirReads, log);
+  const provisionList = await listDirs(deps.provisionRoot, [isRunId], maxDirReads, log);
+  const [homes = new Map<string, string>(), passHomes = new Map<string, string>()] = homeList.lists;
+  const [provisions = new Map<string, string>()] = provisionList.lists;
+  summary.dirEntriesRead = homeList.read + provisionList.read;
+  // A capped root was listed only in part: the pass still examines what it read (bounded),
+  // and reports the stop.
+  const listingCapped = homeList.capped || provisionList.capped;
+  if (listingCapped) summary.stoppedEarly = "budget";
   const runs = new Map<string, RunDirs>();
   for (const [id, dir] of homes) runs.set(id, { home: dir });
   for (const [id, dir] of provisions) runs.set(id, { ...runs.get(id), provision: dir });
   const passDeadline = startedAt + deadlineMs;
-  // Forget runs whose HOME is gone, so the memo stays bounded by what is on the volume.
-  if (memo) for (const id of memo) if (!homes.has(id)) memo.delete(id);
+  // Forget runs whose HOME is gone, so the memo stays bounded by what is on the volume. Only
+  // from a complete listing: a HOME past a capped (or failed) listing's end is not known to be gone.
+  if (homeList.complete) memo?.retainOnly((id) => homes.has(id));
 
   let consecutiveFailures = 0;
   for (const [runId, dirs] of runs) {
@@ -226,7 +314,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
     }
     summary.runsExamined += 1;
     if (deps.isRunLive(runId)) {
-      memo?.delete(runId); // executing again: its caches may be refilled by the next park
+      memo?.forget(runId); // executing again: its caches may be refilled by the next park
       summary.skippedLive += 1;
       continue;
     }
@@ -252,7 +340,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
     const terminal = TERMINAL_RUN_STATUSES.has(status);
     const parked = PROCESS_ENDED_PARK_STATUSES.has(status);
     // Any other status means the run moved on (resumed, or ended): forget its drop.
-    if (!parked) memo?.delete(runId);
+    if (!parked) memo?.forget(runId);
     if (!terminal && !(parked && dirs.home)) {
       summary.skippedNotEligible += 1;
       continue;
@@ -282,7 +370,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
         else if (isNoop(r)) summary.cachesAlreadyClear += 1;
         return;
       }
-      memo?.delete(runId);
+      memo?.forget(runId);
       let failed = false;
       for (const [root, dir, key] of [
         [deps.homeRoot, dirs.home, "terminalHomesRemoved"],
@@ -304,7 +392,6 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
 
   // (c) model-pass HOMEs. No lock: a pass always creates a fresh mkdtemp name, so nothing
   // ever resumes into an old one; the registry and the age bound are the whole guard.
-  const passHomes = await listDirs(deps.homeRoot, (name) => MODEL_PASS_HOME_RE.test(name), log);
   for (const [name, dir] of passHomes) {
     if (now() - startedAt >= deadlineMs) {
       summary.stoppedEarly ??= "deadline";
@@ -348,6 +435,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
     model_pass_homes_live: summary.modelPassHomesLive,
     model_pass_homes_too_recent: summary.modelPassHomesTooRecent,
     model_pass_homes_failed: summary.modelPassHomesFailed,
+    dir_entries_read: summary.dirEntriesRead,
     stopped_early: summary.stoppedEarly,
     took_ms: now() - startedAt,
   });
@@ -406,8 +494,10 @@ export interface DiskPressureOptions {
 export class DiskPressureController {
   private readonly now: () => number;
   private readonly pressureSpacingMs: number;
-  /** The latest sample is at or over the soft threshold. */
+  /** The latest KNOWN sample is at or over the soft threshold. */
   private over = false;
+  /** The latest sample is unknown (a statfs failure): claims are not blocked meanwhile. */
+  private unknown = false;
   /** When the current stretch over the soft threshold began. */
   private overSince = 0;
   /** A reclaim pass that started during the current stretch has finished (or none can run). */
@@ -436,21 +526,29 @@ export class DiskPressureController {
 
   /**
    * Whether the run lane must take no new claim: the admission stop is on, the latest sample
-   * is at or over the soft threshold, and this stretch has not outlived its bounded wait.
+   * is known and at or over the soft threshold, and this stretch has not outlived its bounded
+   * wait.
    */
   claimsBlocked(): boolean {
-    return this.opts.admission && this.over && !this.reopened;
+    return this.opts.admission && !this.unknown && this.over && !this.reopened;
   }
 
   /**
    * Record the latest data-volume used fraction. Logs once per transition across the soft
    * threshold, and at or over it requests a (rate-limited) reclaim pass. Never throws and
    * never waits for the pass.
+   *
+   * An unknown sample (`undefined`) is not a reading: it leaves the stretch state (over,
+   * since when, reopened) as it was, so a statfs blip neither ends a stretch (which would
+   * restart its bounded wait at the next known sample) nor starts one. Only claimsBlocked
+   * fails open while the latest sample is unknown.
    */
   observe(usedFraction: number | undefined): void {
+    this.unknown = usedFraction === undefined;
+    if (usedFraction === undefined) return;
     const soft = this.softThreshold();
-    const over = usedFraction !== undefined && usedFraction >= soft;
-    const fields = { used_fraction: usedFraction ?? null, soft_threshold: soft };
+    const over = usedFraction >= soft;
+    const fields = { used_fraction: usedFraction, soft_threshold: soft };
     if (over !== this.over) {
       this.over = over;
       this.reopened = false;

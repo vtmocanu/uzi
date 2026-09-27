@@ -76,6 +76,7 @@ import {
 import { rmHomeTree } from "./rmtree.js";
 import { dropRunCaches } from "./run-caches.js";
 import type { RunDiskLocks } from "./run-disk-locks.js";
+import type { CachesDroppedMemo } from "./disk-reclaim.js";
 import {
   SteeringChannel,
   PauseNowSignal,
@@ -1201,6 +1202,10 @@ export interface RunnerOptions {
    *  resume never starts while the reclaim is deleting that run's files. Undefined ⇒ no
    *  reclaim runs in this process (tests). */
   diskLocks?: RunDiskLocks;
+  /** PRD #1809 D7 — the disk reclaim's memo of runs whose caches it found gone. Each execution
+   *  forgets its run there while holding `diskLocks`, since the run may rebuild its caches
+   *  before it parks again. Undefined ⇒ nothing to forget. */
+  cachesDropped?: CachesDroppedMemo;
   /** PRD #1391 Run B M4 — the wall-clock budget for the queued-duplicate ownership-probe retry: a
    *  TRANSIENT probe failure retries with backoff up to this bound (the api's claim grace minus a
    *  margin), a held/queued row is re-probed until it, then the attempt ends without executing.
@@ -1267,6 +1272,8 @@ export class RunRunner {
   private readonly snapshotRegistry: ActiveRunRegistry | undefined;
   /** PRD #1809 D7 — see RunnerOptions.diskLocks. */
   private readonly diskLocks: RunDiskLocks | undefined;
+  /** PRD #1809 D7 — see RunnerOptions.cachesDropped. */
+  private readonly cachesDropped: CachesDroppedMemo | undefined;
   private readonly detect: (
     worktreePath: string,
   ) => Promise<DetectedRepoAgents>;
@@ -1421,6 +1428,7 @@ export class RunRunner {
     // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
     this.snapshotRegistry = opts.activeRuns;
     this.diskLocks = opts.diskLocks;
+    this.cachesDropped = opts.cachesDropped;
     this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
     this.checkpointTickIntervalMs = opts.checkpointTickIntervalMs ?? 5 * 60_000;
     this.checkpointTestHooks = opts.checkpointTestHooks;
@@ -1519,7 +1527,16 @@ export class RunRunner {
       // executionTails entry installed above already makes every later reclaim see the run as
       // executing (isExecuting) and skip it, so the only deletion that can overlap this
       // execution is one that checked before that entry existed, and that one holds the lock.
-      if (this.diskLocks) (await this.diskLocks.acquire(runId))();
+      // Forgetting the reclaim's cache-drop memo entry under the same lock orders it after any
+      // drop in progress (whose memo add runs under that lock), so the entry cannot outlive
+      // this execution's rebuilt caches.
+      if (this.diskLocks) {
+        const releaseDisk = await this.diskLocks.acquire(runId);
+        this.cachesDropped?.forget(runId);
+        releaseDisk();
+      } else {
+        this.cachesDropped?.forget(runId);
+      }
       if (previous) {
         await previous;
         // PRD #1391 Run B M4 — the generation-aware queued-duplicate router. A SECOND (or later) claim

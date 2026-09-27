@@ -351,9 +351,10 @@ function positiveInt(env: NodeJS.ProcessEnv, key: string, fallback: number): num
   return Number.isInteger(n) && n > 0 ? n : fallback;
 }
 
-/** SUMMARY_MODEL_TIMEOUT_MS exactly as summary-runner.ts reads it: a positive finite number
- *  of ms (floored), else the 60 s default. */
-function summaryModelTimeoutMs(env: NodeJS.ProcessEnv): number {
+/** SUMMARY_MODEL_TIMEOUT_MS, the one parser (summary-runner.ts reads it through this too): a
+ *  positive finite number of ms (floored), else the 60 s default, so a typo falls back
+ *  rather than giving a 0/NaN timeout that would fire instantly. */
+export function summaryModelTimeoutMs(env: NodeJS.ProcessEnv): number {
   const raw = env.SUMMARY_MODEL_TIMEOUT_MS;
   if (!raw) return 60_000;
   const n = Number(raw);

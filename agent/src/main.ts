@@ -20,7 +20,7 @@ import { stubJudgeQueryFn } from "./judge-runner-stub.js";
 import { Worker } from "./worker.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
 import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js";
-import { DiskPressureController, modelPassMinAgeMs, runDiskReclaimPass } from "./disk-reclaim.js";
+import { CachesDroppedMemo, DiskPressureController, modelPassMinAgeMs, runDiskReclaimPass } from "./disk-reclaim.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import { errMessage } from "./util.js";
 import { uidSplitActive } from "./runner-uid.js";
@@ -455,6 +455,9 @@ async function main(): Promise<void> {
     });
   // PRD #1809 D7: the per-run lock the runner and the disk reclaim share (run-disk-locks.ts).
   const diskLocks = new RunDiskLocks();
+  // The reclaim's memo of runs whose caches it found gone; the runner forgets a run there
+  // each time it starts executing it (disk-reclaim.ts CachesDroppedMemo).
+  const cachesDropped = new CachesDroppedMemo();
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
     pollMs: config.pollIntervalMs,
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
@@ -472,6 +475,7 @@ async function main(): Promise<void> {
     // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
     activeRuns,
     diskLocks,
+    cachesDropped,
   });
 
   // The chat lane (PRD #39). Per-session executor factory (PRD #42 Decision 4): each
@@ -612,7 +616,6 @@ async function main(): Promise<void> {
   // PRD #1809 D5/D7: the running disk reclaim (off with UZI_DISK_RECLAIM=0) and the admission
   // stop (off with UZI_DISK_ADMISSION=0), independently. The startup sweep below is separate
   // and stays.
-  const cachesDropped = new Set<string>();
   // A stranded model-pass HOME is collected only once it is older than the longest pass
   // can live (disk-reclaim.ts modelPassMinAgeMs), derived from the configured caps.
   const passMinAgeMs = modelPassMinAgeMs([

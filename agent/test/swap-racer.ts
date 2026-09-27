@@ -11,7 +11,8 @@ import { spawn } from "node:child_process";
  * then unlinks `x/<name>` through the symlink, i.e. inside the victim.
  *
  * {@link seedRacedTree} builds the matching tree and victim; `start` resolves once the
- * racer is running, and `stop` ends it (it also ends by itself after 8 s).
+ * racer is running, and `stop` ends it (it also ends by itself after 8 s) and resolves with
+ * the number of directories it swapped, so a test can prove the race actually happened.
  */
 const RACER = `
 const fs = require("node:fs");
@@ -30,6 +31,7 @@ while (!fs.existsSync(stop) && Date.now() < until && swapped.size < Number(n)) {
     }
   }
 }
+process.stdout.write("swapped " + swapped.size + "\\n");
 `;
 
 /** A host without `/proc/self/fd` (macOS): every pinned walk refuses there by design. */
@@ -49,17 +51,34 @@ export async function seedRacedTree(root: string, victim: string): Promise<void>
 }
 
 /** Start the racer on `root` (stop file under `scratch`); resolves once it is running. */
-export async function startSwapRacer(root: string, victim: string, scratch: string): Promise<{ stop: () => Promise<void> }> {
+export async function startSwapRacer(root: string, victim: string, scratch: string): Promise<{ stop: () => Promise<number> }> {
   const stopFile = path.join(scratch, "racer.stop");
   const racer = spawn(process.execPath, ["-e", RACER, root, victim, stopFile, String(RACED_DIRS), String(RACED_FILES)], {
     stdio: ["ignore", "pipe", "inherit"],
   });
-  const exited = new Promise<void>((r) => racer.on("exit", () => r()));
-  await new Promise<void>((r) => racer.stdout.once("data", () => r()));
+  let out = "";
+  let onReady!: () => void;
+  const ready = new Promise<void>((r) => (onReady = r));
+  racer.stdout.setEncoding("utf8");
+  racer.stdout.on("data", (chunk: string) => {
+    out += chunk;
+    if (out.includes("ready\n")) onReady();
+  });
+  const exited = new Promise<void>((r) => racer.on("close", () => r()));
+  // A racer that dies before it is ready fails the test instead of hanging it.
+  await Promise.race([
+    ready,
+    exited.then(() => {
+      throw new Error(`the swap racer exited before it was ready: ${JSON.stringify(out)}`);
+    }),
+  ]);
   return {
     stop: async () => {
       await fs.writeFile(stopFile, "");
       await exited;
+      const m = /swapped (\d+)/.exec(out);
+      if (!m) throw new Error(`the swap racer reported no swap count: ${JSON.stringify(out)}`);
+      return Number(m[1]);
     },
   };
 }

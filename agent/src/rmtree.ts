@@ -371,7 +371,8 @@ function readSome(dirFd, limit, skip, spend) {
  * `<sync>.<phase>` and waits up to 10 s for `<sync>.go`, so a test can swap a path
  * between verification and removal. Phase `pinned` (the default) pauses once the leaf is
  * pinned; phase `listed` pauses after the leaf's first batch of names was read and before
- * any child in it is pinned.
+ * any child in it is pinned; phase `emptied` pauses after a child directory was emptied and
+ * before it is `rmdir`ed through its parent.
  */
 const PINNED_SUBTREE_SCRIPT = `${PINNED_PRELUDE}${STREAM_PRELUDE}
 const [home, rel, maxArg, budgetArg, mode = "remove", expect = "-", sync, phase = "pinned"] = process.argv.slice(1);
@@ -445,6 +446,7 @@ function removeEntry(dirFd, e) {
   try { childFd = openOwned(pin); } catch { return false; } finally { fs.closeSync(pin); }
   try { emptyDir(childFd, false); } finally { fs.closeSync(childFd); }
   if (exhausted) return false;
+  pause("emptied");
   try { fs.rmdirSync(p); return true; } catch (err) {
     // Swapped for a symlink or file while it was being emptied: unlink that entry itself.
     if (err.code === "ENOTDIR") {
@@ -711,6 +713,8 @@ export interface PinnedTreeRemovalOptions {
   deadline?: number;
   /** Whether the PRD #51 uid split is active (default: {@link uidSplitActive}). */
   splitActive?: boolean;
+  /** The worker's uid for the root's owner check (default: `process.getuid`); a test seam. */
+  getuid?: () => number | undefined;
 }
 
 /** `<dev>:<ino>` of a pinned descriptor: the identity the helper checks its own pin against. */
@@ -778,7 +782,7 @@ export async function rmTreePinned(
     }
     try {
       const st = await fs.stat(SELF_FD + leafPin.fd);
-      const uid = process.getuid?.();
+      const uid = opts.getuid ? opts.getuid() : process.getuid?.();
       if (uid !== undefined && st.uid !== uid) {
         throw Object.assign(new Error(`rmTreePinned: ${target} is not owned by this worker (uid ${st.uid})`), {
           code: "EPERM",

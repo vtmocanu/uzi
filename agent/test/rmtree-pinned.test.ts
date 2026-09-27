@@ -111,6 +111,74 @@ describe("rmTreePinned (PRD #1809 M3)", () => {
     }
   });
 
+  it("refuses a root owned by another uid before any chmod or helper (non-root, via the uid seam)", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const parent = await mktmp();
+    try {
+      const root = path.join(parent, "foreign");
+      await fs.mkdir(root, { mode: 0o700 });
+      await fs.chmod(root, 0o700);
+      await fs.writeFile(path.join(root, "f"), "x");
+      const self = process.getuid?.() ?? 0;
+      let helperRan = false;
+      await assert.rejects(
+        rmTreePinned(parent, "foreign", {
+          getuid: () => self + 1,
+          splitActive: true, // the path that chmods the root, had the owner check passed
+          wrappers: [
+            (c, a) => {
+              helperRan = true;
+              return { command: c, args: [...a] };
+            },
+          ],
+        }),
+        { code: "EPERM", message: /not owned by this worker/ },
+      );
+      assert.equal(helperRan, false, "no helper pass ran");
+      assert.equal((await fs.stat(root)).mode & 0o7777, 0o700, "the root was not chmodded");
+      assert.ok(await exists(path.join(root, "f")), "nothing was removed");
+    } finally {
+      await forceCleanup(parent);
+    }
+  });
+
+  it("a child dir swapped for a symlink after it was emptied is unlinked (ENOTDIR), never followed", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const parent = await mktmp();
+    const victim = await mktmp();
+    const syncDir = await mktmp();
+    try {
+      const root = path.join(parent, "run");
+      await fs.mkdir(path.join(root, "x"), { recursive: true });
+      await fs.writeFile(path.join(root, "x", "f"), "");
+      await seedVictim(victim, 5);
+      const sync = path.join(syncDir, "sync");
+      const pending = rmTreePinned(parent, "run", {
+        wrappers: [(c, a) => ({ command: c, args: [...a, sync, "emptied"] })],
+      }).then(
+        (v) => ({ v }),
+        (e: Error) => ({ e }),
+      );
+      const until = Date.now() + 10_000;
+      while (!(await exists(`${sync}.emptied`))) {
+        if (Date.now() > until) throw new Error("the script never reached its emptied pause");
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      // `x` is empty and about to be rmdir'ed by name: swap it for a symlink to the victim.
+      await fs.rename(path.join(root, "x"), path.join(root, "x.moved"));
+      await fs.symlink(victim, path.join(root, "x"), "dir");
+      await fs.writeFile(`${sync}.go`, "");
+      const out = await pending;
+      assert.equal(await countFiles(victim), 5, "the symlink's target is untouched");
+      assert.deepEqual(out, { v: "removed" }, "the symlink was unlinked and the moved dir removed on the re-read");
+      assert.equal(await exists(root), false);
+    } finally {
+      await forceCleanup(parent);
+      await forceCleanup(victim);
+      await forceCleanup(syncDir);
+    }
+  });
+
   it("refuses when the name is swapped for another directory between the worker's pin and the helper's", async (t) => {
     if (noProcFd) return t.skip(NO_PROC_FD);
     const parent = await mktmp();
@@ -206,12 +274,27 @@ describe("rmTreePinned (PRD #1809 M3)", () => {
     try {
       await seedRacedTree(path.join(parent, "run"), victim);
       const racer = await startSwapRacer(path.join(parent, "run"), victim, scratch);
+      let out: { v: string } | { e: NodeJS.ErrnoException };
+      let swaps: number;
       try {
-        await rmTreePinned(parent, "run").catch(() => undefined);
+        out = await rmTreePinned(parent, "run").then(
+          (v) => ({ v }),
+          (e: NodeJS.ErrnoException) => ({ e }),
+        );
       } finally {
-        await racer.stop();
+        swaps = await racer.stop();
       }
+      assert.ok(swaps > 0, "the racer swapped at least one directory mid-walk (the race happened)");
       assert.equal(await countFiles(victim), RACED_FILES, "no victim file outside the tree was deleted");
+      // Each swapped symlink is unlinked and each moved dir re-listed, so the tree goes; the
+      // only other acceptable outcome is the typed not-removed verdict (a swap landing after
+      // the final re-read), never a crash or a refusal of the root.
+      if ("v" in out) {
+        assert.equal(out.v, "removed");
+        assert.equal(await exists(path.join(parent, "run")), false);
+      } else {
+        assert.equal(out.e.code, "ENOTEMPTY", `unexpected failure: ${out.e.message}`);
+      }
     } finally {
       await forceCleanup(parent);
       await forceCleanup(victim);

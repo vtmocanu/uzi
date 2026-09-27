@@ -6,6 +6,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import {
+  CachesDroppedMemo,
   DEFAULT_DISK_PRESSURE_THRESHOLD,
   DiskPressureController,
   modelPassMinAgeMs,
@@ -227,7 +228,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
   it("remembers a parked run whose caches are gone and skips it until it is seen executing again", { skip: SKIP_ROOT }, async () => {
     const d = dataDir();
     const run = seedRun(d);
-    const memo = new Set<string>();
+    const memo = new CachesDroppedMemo();
     let live = false;
     let status = "limit_wait";
     const calls: Array<{ home: string; opts: DropRunCachesOptions }> = [];
@@ -272,6 +273,105 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     assert.equal(memo.has(run.id), false, "a non-park status forgets the drop too");
   });
 
+  it("a run that resumes here, rebuilds its caches and parks again between two passes is dropped again", { skip: SKIP_ROOT }, async () => {
+    const d = dataDir();
+    const locks = new RunDiskLocks();
+    const memo = new CachesDroppedMemo();
+    const claim = makeClaim({ run_id: randomUUID() });
+    const home = path.join(d.home, claim.run_id);
+    seedHome(home);
+    // The resume's executor factory stands in for the whole execution: it rebuilds the
+    // caches, and the run then ends (parks) before the next pass looks.
+    const factory: ExecutorFactory = () => {
+      seedHome(home);
+      throw new Error("stop after the factory");
+    };
+    const runner = new RunRunner({} as WorkerClient, {} as GitCache, factory, nullLogger(), 500, "tok", {
+      diskLocks: locks,
+      cachesDropped: memo,
+    });
+    let drops = 0;
+    const pass = () =>
+      runDiskReclaimPass(
+        deps(d, {
+          locks,
+          cachesDropped: memo,
+          isRunLive: (id) => runner.isExecuting(id),
+          statusOf: async () => "limit_wait",
+          dropCaches: async (h, log, opts) => {
+            drops++;
+            return dropRunCaches(h, log, opts);
+          },
+        }),
+      );
+
+    const first = await pass();
+    assert.equal(first.cachesDropped, 1);
+    assert.ok(memo.has(claim.run_id), "remembered as dropped");
+
+    // Resumed on this worker and parked again, all between two passes: no pass saw it live.
+    await runner.execute(claim).catch(() => undefined);
+    assert.equal(runner.isExecuting(claim.run_id), false, "the execution is over before the next pass");
+    assert.equal(memo.has(claim.run_id), false, "the runner forgot the drop when it started executing the run");
+    for (const rel of CACHES) assert.ok(exists(path.join(home, rel)), `${rel} rebuilt by the resume`);
+
+    const second = await pass();
+    assert.equal(drops, 2, "the next pass drops the rebuilt caches instead of trusting the stale memo");
+    assert.equal(second.cachesDropped, 1);
+    for (const rel of CACHES) assert.equal(exists(path.join(home, rel)), false, `${rel} dropped again`);
+  });
+
+  it("stops at its per-root read cap on a flooded root, reading a bounded number of names", async () => {
+    const d = dataDir();
+    // A live run's agent plants names in agent-home and provision: files and dirs, none a run.
+    for (let i = 0; i < 300; i++) {
+      fs.writeFileSync(path.join(d.home, `junk-${i}`), "");
+      fs.mkdirSync(path.join(d.provision, `junk-${i}`));
+    }
+    const { logger, lines } = recordingLogger();
+    let lookups = 0;
+    const s = await runDiskReclaimPass(
+      deps(d, {
+        maxDirReads: 50,
+        log: logger,
+        statusOf: async () => {
+          lookups++;
+          return undefined;
+        },
+      }),
+    );
+    assert.equal(s.stoppedEarly, "budget");
+    assert.equal(s.dirEntriesRead, 100, "exactly the cap per root, not the 600 names on disk");
+    assert.equal(lookups, 0);
+    const capLines = lines.filter((l) => (l as { msg: string }).msg === "disk reclaim stopped listing a directory at its read cap");
+    assert.equal(capLines.length, 2, "one warning per capped root");
+    const done = lines.find((l) => (l as { msg: string }).msg === "disk reclaim pass complete") as Record<string, unknown>;
+    assert.equal(done.stopped_early, "budget");
+    assert.equal(done.dir_entries_read, 100);
+
+    // Under the cap, the same pass reads everything and does not stop early.
+    const full = await runDiskReclaimPass(deps(d, { maxDirReads: 1_000 }));
+    assert.equal(full.stoppedEarly, undefined);
+    assert.equal(full.dirEntriesRead, 600);
+  });
+
+  it("a capped listing still examines what it read, and keeps the memo of runs it did not reach", { skip: SKIP_ROOT }, async () => {
+    const d = dataDir();
+    const run = seedRun(d);
+    const memo = new CachesDroppedMemo();
+    const unseen = randomUUID();
+    memo.add(unseen);
+    const s = await runDiskReclaimPass(
+      deps(d, { maxDirReads: 1, cachesDropped: memo, statusOf: async () => "completed" }),
+    );
+    assert.equal(s.stoppedEarly, "budget");
+    assert.equal(s.terminalHomesRemoved, 1, "the one run the capped listing read was examined");
+    assert.equal(exists(run.home), false);
+    assert.ok(memo.has(unseen), "a run past the cap is not known to be gone, so it is not forgotten");
+    await runDiskReclaimPass(deps(d, { cachesDropped: memo }));
+    assert.equal(memo.has(unseen), false, "a complete listing without its HOME forgets it");
+  });
+
   it("a drop that found nothing is not counted as a drop and logs nothing of its own", { skip: SKIP_ROOT }, async () => {
     const d = dataDir();
     const id = randomUUID();
@@ -287,7 +387,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
   it("a failed drop is counted as failed and not remembered", { skip: SKIP_ROOT }, async () => {
     const d = dataDir();
     const run = seedRun(d);
-    const memo = new Set<string>();
+    const memo = new CachesDroppedMemo();
     const s = await runDiskReclaimPass(
       deps(d, {
         cachesDropped: memo,
@@ -315,12 +415,17 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     const home = path.join(d.home, id);
     await seedRacedTree(home, victim);
     const racer = await startSwapRacer(home, victim, scratch);
+    let s;
+    let swaps: number;
     try {
-      await runDiskReclaimPass(deps(d, { statusOf: async () => "completed" }));
+      s = await runDiskReclaimPass(deps(d, { statusOf: async () => "completed" }));
     } finally {
-      await racer.stop();
+      swaps = await racer.stop();
     }
+    assert.ok(swaps > 0, "the racer swapped at least one directory mid-walk (the race happened)");
     assert.equal(fs.readdirSync(victim).length, RACED_FILES, "no victim file outside agent-home was deleted");
+    assert.equal(s.terminalHomesRemoved, 1, "the terminal HOME was removed despite the racer");
+    assert.equal(exists(home), false);
   });
 
   it("logs one summary line naming what it freed and what it skipped", { skip: SKIP_ROOT }, async () => {
@@ -653,6 +758,26 @@ describe("DiskPressureController (PRD #1809 D5)", () => {
     assert.equal(c.claimsBlocked(), true);
     c.observe(undefined);
     assert.equal(c.claimsBlocked(), false);
+  });
+
+  it("an unknown sample is not 'back under': the stretch, its start and its reopening survive it", async () => {
+    let now = 1_000;
+    const { c, lines } = controller({ now: () => now, admissionMaxWaitMs: 10 * 60_000, pressureSpacingMs: 0 });
+    c.observe(0.85); // crossing at t=1s
+    await new Promise((r) => setImmediate(r)); // its pass finishes
+    now += 6 * 60_000;
+    c.observe(undefined); // a statfs blip mid-stretch
+    assert.equal(c.claimsBlocked(), false, "fails open while the latest sample is unknown");
+    now += 5 * 60_000;
+    c.observe(0.85); // 11 min after the ORIGINAL crossing
+    assert.equal(c.claimsBlocked(), false, "the bounded wait still counts from the original crossing, so claims reopen");
+    const msgs = lines.map((l) => (l as { msg: string }).msg);
+    assert.ok(!msgs.some((m) => /back under/.test(m)), "an unknown sample never logs 'back under'");
+    assert.equal(msgs.filter((m) => /at or over the soft threshold/.test(m)).length, 1, "and the stretch is not re-entered");
+
+    c.observe(undefined);
+    c.observe(0.9);
+    assert.equal(c.claimsBlocked(), false, "a reopened stretch stays reopened across an unknown sample");
   });
 
   it("runs one pass at a time and spaces pressure passes", async () => {
