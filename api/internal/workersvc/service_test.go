@@ -406,6 +406,10 @@ type fakeStore struct {
 	workerByID    store.Worker
 	workerByIDErr error
 	createdInput  *store.CreateRunInputParams
+	// createdGateVerdict captures a selection-less approve_plan (PRD #1795 M2: it goes through
+	// CreateGateVerdictInput, never the plain CreateRunInput).
+	createdGateVerdict *store.CreateGateVerdictInputParams
+	gateVerdictRow     store.RunUserInput
 	// reviseCount is the number of persisted revise_plan rows the fake pretends the run
 	// already has (PRD #41 plan-revision cap); reviseCountRunID captures the run id the
 	// read-only cap query was asked about. reviseCapArg captures the atomic capped-enqueue
@@ -1483,6 +1487,10 @@ func (f *fakeStore) ClearRunRequiredCapabilities(_ context.Context, arg store.Cl
 func (f *fakeStore) CreateRunInput(_ context.Context, arg store.CreateRunInputParams) (store.RunUserInput, error) {
 	f.createdInput = &arg
 	return store.RunUserInput{}, nil
+}
+func (f *fakeStore) CreateGateVerdictInput(_ context.Context, arg store.CreateGateVerdictInputParams) (store.RunUserInput, error) {
+	f.createdGateVerdict = &arg
+	return f.gateVerdictRow, nil
 }
 func (f *fakeStore) CountRunReviseInputs(_ context.Context, runID uuid.UUID) (int64, error) {
 	f.reviseCountRunID = &runID

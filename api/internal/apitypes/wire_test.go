@@ -326,6 +326,11 @@ func TestRunInputTags(t *testing.T) {
 	assertTags(t, "RunInputRequest(false)", RunInputRequest{}, "kind", "body", "selection", "override_capabilities")
 	assertTags(t, "RunInputRequest(true)", RunInputRequest{DiscardPendingOutcome: true},
 		"kind", "body", "selection", "override_capabilities", "discard_pending_outcome")
+	// PRD #1795 M2: expected_gate_revision is omitted when absent (older-api compatibility) and
+	// present, even at 0, when the client names the revision it displayed.
+	zeroRev := int64(0)
+	assertTags(t, "RunInputRequest(expected revision)", RunInputRequest{ExpectedGateRevision: &zeroRev},
+		"kind", "body", "selection", "override_capabilities", "expected_gate_revision")
 	// id + created_at are omitempty (nil on approve/cancel/reject): the zero value is
 	// still just server_side (PRD #95 S2).
 	assertTags(t, "RunInputResponse", RunInputResponse{}, "server_side")

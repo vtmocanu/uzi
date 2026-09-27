@@ -855,9 +855,23 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 	res, err := h.wsvc.SubmitInputWithOptions(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection, workersvc.SubmitInputOptions{
 		OverrideCapabilities:  req.OverrideCapabilities,
 		DiscardPendingOutcome: req.DiscardPendingOutcome,
+		ExpectedGateRevision:  req.ExpectedGateRevision,
 	})
 	if err != nil {
+		var mismatch *workersvc.GateRevisionMismatchError
 		switch {
+		case errors.As(err, &mismatch):
+			// PRD #1795 M2 (D5): the verdict named a plan-gate revision the run no longer shows
+			// (a newer gate, or no gate at all). Nothing was written. The typed reason and the
+			// current revision let the web/CLI/Slack refetch and ask the owner to review the
+			// plan that is actually on screen now.
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"error":                 err.Error(),
+				"reason":                "gate_revision_mismatch",
+				"current_gate_revision": mismatch.Current,
+			})
+		case errors.Is(err, workersvc.ErrExpectedGateRevisionNotApplicable):
+			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrRunNotFound):
 			httpx.Error(w, http.StatusNotFound, "run not found")
 		case errors.Is(err, workersvc.ErrRunTerminal):

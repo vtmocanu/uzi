@@ -193,6 +193,9 @@ func (s *runsStore) ListActiveRunsAll(context.Context, pgtype.Timestamptz) ([]st
 func (s *runsStore) CreateRunInput(context.Context, store.CreateRunInputParams) (store.RunUserInput, error) {
 	return s.createInputRow, nil
 }
+func (s *runsStore) CreateGateVerdictInput(context.Context, store.CreateGateVerdictInputParams) (store.RunUserInput, error) {
+	return s.createInputRow, nil
+}
 func (s *runsStore) CreateApprovePlanInput(_ context.Context, arg store.CreateApprovePlanInputParams) (store.RunUserInput, error) {
 	s.createdApproval = &arg
 	return store.RunUserInput{}, nil

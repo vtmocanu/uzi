@@ -460,8 +460,9 @@ type RunDTO struct {
 	PlanSource string `json:"plan_source"`
 	// GateRevision is the run's current plan-gate revision (PRD #1795 M1): the monotonic
 	// per-run number the server allocated when it published the gate whose plan_md this DTO
-	// carries. A client that shows the plan sends it back as expected_gate_revision so a
-	// verdict can only act on the revision that was displayed. Omitted (0) for a run that
+	// carries. A client that shows the plan sends it back as expected_gate_revision; the
+	// server then writes the verdict only while the run still shows that revision and
+	// otherwise answers 409 gate_revision_mismatch (PRD #1795 M2). Omitted (0) for a run that
 	// never published a gate under an api that allocates (pre-migration gates, chat, judge).
 	GateRevision int64 `json:"gate_revision,omitempty"`
 	// Plain-English run summaries (PRD #362), all null until the worker generates and
@@ -952,6 +953,14 @@ type RunInputRequest struct {
 	// held outcome. Meaningful only for cancel — inert on every other kind and on a cancel of a run
 	// with no pending outcome. Nothing is ever discarded on a timer; only the owner, explicitly.
 	DiscardPendingOutcome bool `json:"discard_pending_outcome,omitempty"`
+	// ExpectedGateRevision is the PRD #1795 D5 expected plan-gate revision: the gate_revision of
+	// the run the client displayed when the owner acted. Legal only with approve_plan,
+	// reject_plan and revise_plan (400 otherwise). When present, the verdict is written only
+	// while the run is awaiting_approval at exactly this revision; otherwise nothing is written
+	// and the server answers 409 {"error", "reason": "gate_revision_mismatch",
+	// "current_gate_revision"}. Omitted when absent, so a newer client stays compatible with an
+	// older strict-decoding api.
+	ExpectedGateRevision *int64 `json:"expected_gate_revision,omitempty"`
 }
 
 // RunInputResponse is the POST /api/runs/{id}/inputs reply: server_side reports

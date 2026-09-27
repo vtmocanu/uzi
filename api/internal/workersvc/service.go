@@ -1046,6 +1046,10 @@ type Store interface {
 	AdminRunOutcomes(ctx context.Context, landableOrigins []string) (store.AdminRunOutcomesRow, error)
 	AdminRunOutcomesPerUser(ctx context.Context, landableOrigins []string) ([]store.AdminRunOutcomesPerUserRow, error)
 	CreateRunInput(ctx context.Context, arg store.CreateRunInputParams) (store.RunUserInput, error)
+	// CreateGateVerdictInput enqueues a selection-less approve_plan stamped with the plan-gate
+	// binding of the row it locks (PRD #1795 M2); with an expected revision that the run does
+	// not show it writes nothing and yields pgx.ErrNoRows.
+	CreateGateVerdictInput(ctx context.Context, arg store.CreateGateVerdictInputParams) (store.RunUserInput, error)
 	// CountRunReviseInputs is the read-only reporting view of the PRD #41 plan-revision
 	// cap: all revise_plan rows for the run (no consumed_at filter), so a consumed
 	// revise still counts. Enforcement itself rides CreateRunReviseInputIfUnderCap.

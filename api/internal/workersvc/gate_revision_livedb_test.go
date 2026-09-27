@@ -740,7 +740,12 @@ func TestGateRevisionRefusalFencingLiveDB(t *testing.T) {
 		}
 	})
 
-	t.Run("a stale claim's report after the current claim published neither counts nor fails", func(t *testing.T) {
+	// The two cases below are deliberately separate (operator clarification, 2026-09-27): a
+	// FENCED stale claim (superseded generation, released claim, or not the owning worker) is
+	// answered stale and neither counts nor fails; a historical id sent by the STILL-CURRENT
+	// claim is a legitimate refusal under the normal counting policy (once per claim
+	// generation, cap failure past RUN_GATE_REFUSAL_MAX).
+	t.Run("a FENCED stale claim's report (superseded generation, released claim, foreign worker) neither counts nor fails", func(t *testing.T) {
 		run := f.newRun("issue")
 		a := uid()
 		f.mustPublish(run, gateReq(i64(1), a), 1)
@@ -769,7 +774,7 @@ func TestGateRevisionRefusalFencingLiveDB(t *testing.T) {
 		}
 	})
 
-	t.Run("a historical id from the still-current claim is a counted refusal", func(t *testing.T) {
+	t.Run("a historical id from the STILL-CURRENT claim is a counted refusal under the normal policy", func(t *testing.T) {
 		run, a := historicalRun()
 		gen := f.row(run).generation
 		if _, _, _, err := f.report(run, gateReq(&gen, a)); !errors.Is(err, ErrGatePresentationHistorical) {
@@ -814,6 +819,51 @@ func TestGateRevisionRefusalFencingLiveDB(t *testing.T) {
 			t.Fatalf("two refusals in one claim = count %d status %s, want 1", r.refusals, r.status)
 		}
 	})
+}
+
+// TestGateRevisionRefusalOnParkedOrTerminalRunLiveDB pins gateReportAdmissible: a report that
+// WOULD be refused (a historical id, or a changed payload under the current id) onto a run that
+// SetRunAwaitingApproval would decline anyway (parked in limit_wait or recovery_wait, or terminal)
+// is declined before classification. It counts no refusal, cannot reach the cap failure, and
+// leaves the status unchanged. The fixture's cap is 1 and each report comes from a fresh claim
+// generation, so a counted refusal would also FAIL the run on the second report.
+func TestGateRevisionRefusalOnParkedOrTerminalRunLiveDB(t *testing.T) {
+	f := newGateFix(t, 1)
+
+	for _, status := range []string{"limit_wait", "recovery_wait", "failed"} {
+		for _, kind := range []string{"historical id", "current-id changed payload"} {
+			t.Run(status+"/"+kind, func(t *testing.T) {
+				run := f.newRun("issue")
+				a := uid()
+				f.mustPublish(run, gateReq(i64(1), a), 1)
+				req := gateReq(nil, a)
+				wantRev := int64(1)
+				if kind == "historical id" {
+					f.mustPublish(run, gateReq(i64(1), uid()), 2) // a is now historical
+					wantRev = 2
+				} else {
+					p := "# Plan B\n\nSomething else."
+					req.PlanMd = &p
+				}
+				before := f.row(run)
+				f.exec(`UPDATE runs SET status = $2 WHERE id = $1`, run, status)
+				for i := 0; i < 2; i++ {
+					gen := f.reclaim(run)
+					req.ClaimGeneration = &gen
+					_, applied, rev, err := f.report(run, req)
+					if err != nil || applied || rev != 0 {
+						t.Fatalf("report %d onto a %s run = (applied %v, rev %d, err %v), want declined (nil error, not applied)", i, status, applied, rev, err)
+					}
+				}
+				r := f.row(run)
+				if r.status != status || r.refusals != 0 || r.refusalGen != nil || r.failOrigin != nil ||
+					r.revision != wantRev || string(r.digest) != string(before.digest) {
+					t.Fatalf("declined refusal-class report changed the run: status %s (want %s) refusals %d gen %v origin %v revision %d",
+						r.status, status, r.refusals, r.refusalGen, r.failOrigin, r.revision)
+				}
+			})
+		}
+	}
 }
 
 // waitForLockWaiter blocks until some backend waits on a row lock (the report's FOR UPDATE).

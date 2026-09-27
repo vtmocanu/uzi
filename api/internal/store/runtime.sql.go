@@ -1538,11 +1538,13 @@ func (q *Queries) ClearRunMovePending(ctx context.Context, id uuid.UUID) (int64,
 const clearRunRequiredCapabilities = `-- name: ClearRunRequiredCapabilities :execrows
 UPDATE runs SET required_capabilities = '{}', updated_at = now()
 WHERE id = $1 AND user_id = $2 AND status = 'awaiting_approval'
+  AND gate_revision = $3::bigint
 `
 
 type ClearRunRequiredCapabilitiesParams struct {
-	ID     uuid.UUID `json:"id"`
-	UserID uuid.UUID `json:"user_id"`
+	ID           uuid.UUID `json:"id"`
+	UserID       uuid.UUID `json:"user_id"`
+	GateRevision int64     `json:"gate_revision"`
 }
 
 // PRD #84 M4 (unit 4c): the user override ("run without the capability", Decision 12).
@@ -1558,8 +1560,12 @@ type ClearRunRequiredCapabilitiesParams struct {
 // Owner-scoped (user_id) AND status-guarded (awaiting_approval only): the clear runs from
 // the owner-authenticated approve path, and a run outside the plan gate is a no-op
 // (0 rows), so a stray override on a running/terminal run changes nothing.
+//
+// PRD #1795 M2: additionally scoped to the plan-gate revision the approve was bound to
+// (@gate_revision; 0 for a legacy pre-migration gate), so an override clear that runs after a
+// new gate was published cannot clear the requirements of a plan the owner never saw.
 func (q *Queries) ClearRunRequiredCapabilities(ctx context.Context, arg ClearRunRequiredCapabilitiesParams) (int64, error) {
-	result, err := q.db.Exec(ctx, clearRunRequiredCapabilities, arg.ID, arg.UserID)
+	result, err := q.db.Exec(ctx, clearRunRequiredCapabilities, arg.ID, arg.UserID, arg.GateRevision)
 	if err != nil {
 		return 0, err
 	}
@@ -2239,8 +2245,8 @@ func (q *Queries) CountWorkerNonTerminalRuns(ctx context.Context, arg CountWorke
 const createApprovePlanInput = `-- name: CreateApprovePlanInput :one
 WITH selected AS (
     UPDATE runs SET
-        agent_source     = $3,
-        agent_exclusions = $4,
+        agent_source     = $2,
+        agent_exclusions = $3,
         -- PRD #122 M1: the SERVER-AUTHORITATIVE freeze for the human path. Copy the
         -- approved candidate into the immutable frozen list at approve time, IDEMPOTENTLY
         -- — COALESCE keeps an already-frozen value, so a double-approve (or a re-gate
@@ -2261,7 +2267,7 @@ WITH selected AS (
         completion_contract = CASE
             WHEN runs.completion_contract_version IS NOT NULL AND runs.completion_contract IS NULL
                  AND COALESCE(runs.milestones_frozen, runs.milestones_candidate) IS NOT NULL
-            THEN $5::jsonb
+            THEN $4::jsonb
             ELSE runs.completion_contract END,
         contract_revision = CASE
             WHEN runs.completion_contract_version IS NOT NULL AND runs.completion_contract IS NULL
@@ -2285,26 +2291,36 @@ WITH selected AS (
         budget_max_iterations = COALESCE(runs.budget_max_iterations,
             CASE WHEN COALESCE(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), 0) <= 1
                      THEN CASE runs.size_class
-                              WHEN 'l' THEN $6::int * $7::int
+                              WHEN 'l' THEN $5::int * $6::int
                               ELSE NULL END
-                 ELSE $6::int * LEAST(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), $8::int) END),
+                 ELSE $5::int * LEAST(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), $7::int) END),
         budget_wall_seconds = COALESCE(runs.budget_wall_seconds,
             CASE WHEN COALESCE(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), 0) <= 1
                      THEN CASE runs.size_class
-                              WHEN 'l' THEN LEAST($9::int * $7::int, $10::int)
+                              WHEN 'l' THEN LEAST($8::int * $6::int, $9::int)
                               ELSE NULL END
-                 ELSE LEAST($9::int * LEAST(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), $8::int), $10::int) END),
+                 ELSE LEAST($8::int * LEAST(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), $7::int), $9::int) END),
         updated_at       = now()
-    WHERE id = $1
-    RETURNING id
+    WHERE runs.id = $10
+      -- PRD #1795 M2 (D5): a verdict sent against a revision the run no longer shows writes
+      -- NOTHING — no selection, no milestone/contract/budget freeze, no input row.
+      AND ($11::bigint IS NULL
+           OR (runs.status = 'awaiting_approval' AND runs.gate_revision = $11::bigint))
+    RETURNING runs.id AS run_id, runs.status AS run_status, runs.gate_revision AS run_gate_revision, runs.kind AS run_kind
 )
-INSERT INTO run_user_inputs (run_id, kind, body)
-VALUES ($1, 'approve_plan', $2)
+INSERT INTO run_user_inputs (run_id, kind, body, gate_binding, gate_revision)
+SELECT selected.run_id, 'approve_plan', $1,
+       CASE WHEN selected.run_kind IN ('chat', 'judge') THEN NULL
+            WHEN selected.run_status = 'awaiting_approval' AND selected.run_gate_revision > 0 THEN 'bound'
+            WHEN selected.run_status = 'awaiting_approval' THEN NULL
+            ELSE 'unbound' END,
+       CASE WHEN selected.run_kind NOT IN ('chat', 'judge') AND selected.run_status = 'awaiting_approval' AND selected.run_gate_revision > 0
+            THEN selected.run_gate_revision END
+FROM selected
 RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision
 `
 
 type CreateApprovePlanInputParams struct {
-	RunID                    uuid.UUID   `json:"run_id"`
 	Body                     pgtype.Text `json:"body"`
 	AgentSource              pgtype.Text `json:"agent_source"`
 	AgentExclusions          []byte      `json:"agent_exclusions"`
@@ -2314,6 +2330,8 @@ type CreateApprovePlanInputParams struct {
 	MilestoneBudgetCap       int32       `json:"milestone_budget_cap"`
 	RunTimeoutSeconds        int32       `json:"run_timeout_seconds"`
 	BudgetWallCeilingSeconds int32       `json:"budget_wall_ceiling_seconds"`
+	RunID                    uuid.UUID   `json:"run_id"`
+	ExpectedGateRevision     pgtype.Int8 `json:"expected_gate_revision"`
 }
 
 // Enqueue an approve_plan verdict for the live worker AND record the agent
@@ -2327,9 +2345,11 @@ type CreateApprovePlanInputParams struct {
 // worker reads it from the input, not from the row. Both are written from the
 // server's re-validated value, never from the client's raw text. A resume that
 // re-enters the gate overwrites both columns with the latest approval (Decision 8b).
+// PRD #1795 M2: INSERT ... SELECT FROM the update CTE (not VALUES), so the row is stamped with
+// the binding of the row the UPDATE locked and exists only when the UPDATE matched. Binding
+// rules: see CreateGateVerdictInput.
 func (q *Queries) CreateApprovePlanInput(ctx context.Context, arg CreateApprovePlanInputParams) (RunUserInput, error) {
 	row := q.db.QueryRow(ctx, createApprovePlanInput,
-		arg.RunID,
 		arg.Body,
 		arg.AgentSource,
 		arg.AgentExclusions,
@@ -2339,6 +2359,8 @@ func (q *Queries) CreateApprovePlanInput(ctx context.Context, arg CreateApproveP
 		arg.MilestoneBudgetCap,
 		arg.RunTimeoutSeconds,
 		arg.BudgetWallCeilingSeconds,
+		arg.RunID,
+		arg.ExpectedGateRevision,
 	)
 	var i RunUserInput
 	err := row.Scan(
@@ -2427,6 +2449,72 @@ func (q *Queries) CreateExtendInput(ctx context.Context, arg CreateExtendInputPa
 	var budget_extension_seconds int32
 	err := row.Scan(&budget_extension_seconds)
 	return budget_extension_seconds, err
+}
+
+const createGateVerdictInput = `-- name: CreateGateVerdictInput :one
+WITH locked AS (
+    SELECT runs.id, runs.status, runs.gate_revision, runs.kind
+    FROM runs
+    WHERE runs.id = $2
+      AND ($3::bigint IS NULL
+           OR (runs.status = 'awaiting_approval' AND runs.gate_revision = $3::bigint))
+    FOR UPDATE
+)
+INSERT INTO run_user_inputs (run_id, kind, body, gate_binding, gate_revision)
+SELECT locked.id, 'approve_plan', $1,
+       CASE WHEN locked.kind IN ('chat', 'judge') THEN NULL
+            WHEN locked.status = 'awaiting_approval' AND locked.gate_revision > 0 THEN 'bound'
+            WHEN locked.status = 'awaiting_approval' THEN NULL
+            ELSE 'unbound' END,
+       CASE WHEN locked.kind NOT IN ('chat', 'judge') AND locked.status = 'awaiting_approval' AND locked.gate_revision > 0
+            THEN locked.gate_revision END
+FROM locked
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision
+`
+
+type CreateGateVerdictInputParams struct {
+	Body                 pgtype.Text `json:"body"`
+	RunID                uuid.UUID   `json:"run_id"`
+	ExpectedGateRevision pgtype.Int8 `json:"expected_gate_revision"`
+}
+
+// PRD #1795 M2: enqueue a selection-less approve_plan verdict STAMPED with the plan-gate
+// revision it was sent against. The leading CTE takes the run row FOR UPDATE, so the binding
+// is computed from the row as it stands after any in-flight gate publication (SetState's
+// awaiting_approval arm holds the same row lock while it allocates): a concurrent insert and
+// publication serialize, and the verdict binds to exactly one revision, in commit order. The
+// INSERT must SELECT FROM the CTE: an unreferenced SELECT ... FOR UPDATE CTE is never
+// executed, so it would lock nothing.
+//
+// Binding (decision 4; the run_user_inputs CHECK pins the shapes):
+//
+//	status='awaiting_approval' AND gate_revision>0 -> 'bound', gate_revision
+//	status='awaiting_approval' AND gate_revision=0 -> NULL (legacy: a pre-migration gate)
+//	any other status                              -> 'unbound'
+//	chat / judge run                              -> NULL always (never allocates)
+//
+// @expected_gate_revision (D5): when non-NULL the row is selected only while the run sits at
+// that exact revision of an awaiting_approval gate, so a mismatch writes nothing and returns
+// no row; the caller re-reads the run and answers gate_revision_mismatch.
+func (q *Queries) CreateGateVerdictInput(ctx context.Context, arg CreateGateVerdictInputParams) (RunUserInput, error) {
+	row := q.db.QueryRow(ctx, createGateVerdictInput, arg.Body, arg.RunID, arg.ExpectedGateRevision)
+	var i RunUserInput
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.Kind,
+		&i.Body,
+		&i.ConsumedAt,
+		&i.CreatedAt,
+		&i.QuestionID,
+		&i.Disposition,
+		&i.ConsumedClaimGeneration,
+		&i.ConsumedWorkerID,
+		&i.AppliedAt,
+		&i.GateBinding,
+		&i.GateRevision,
+	)
+	return i, err
 }
 
 const createPauseInput = `-- name: CreatePauseInput :one
@@ -2858,10 +2946,14 @@ type CreateRunInputParams struct {
 }
 
 // User inputs (steering) ---------------------------------------------------
-// Enqueue a plain steering input (approve_plan / follow_up) for the live worker to
-// consume. This path never touches the runs row — no stop signal, no lock — so a
+// Enqueue a plain steering input (follow_up, resume, completion_decision) for the live
+// worker to consume. This path never touches the runs row — no stop signal, no lock — so a
 // follow-up mid-run is a single cheap insert. Deliberate-stop verdicts go through
-// CreateStopVerdictInput instead (they must stamp runs.stop_kind atomically).
+// CreateStopVerdictInput instead (they must stamp runs.stop_kind atomically), and a
+// selection-less approve_plan goes through CreateGateVerdictInput (PRD #1795 M2: a plan-gate
+// verdict is stamped with the gate revision it was sent against, which needs the run row).
+// A plan-gate verdict (approve_plan / reject_plan / revise_plan) must never be written here:
+// it would carry no gate binding and read as legacy.
 func (q *Queries) CreateRunInput(ctx context.Context, arg CreateRunInputParams) (RunUserInput, error) {
 	row := q.db.QueryRow(ctx, createRunInput, arg.RunID, arg.Kind, arg.Body)
 	var i RunUserInput
@@ -2887,18 +2979,27 @@ const createRunReviseInputIfUnderCap = `-- name: CreateRunReviseInputIfUnderCap 
 WITH bumped AS (
     UPDATE runs SET revise_count = runs.revise_count + 1
     WHERE runs.id = $2 AND runs.revise_count < $3::int
-    RETURNING runs.id AS run_id
+      AND ($4::bigint IS NULL
+           OR (runs.status = 'awaiting_approval' AND runs.gate_revision = $4::bigint))
+    RETURNING runs.id AS run_id, runs.status AS run_status, runs.gate_revision AS run_gate_revision, runs.kind AS run_kind
 )
-INSERT INTO run_user_inputs (run_id, kind, body)
-SELECT bumped.run_id, 'revise_plan', $1
+INSERT INTO run_user_inputs (run_id, kind, body, gate_binding, gate_revision)
+SELECT bumped.run_id, 'revise_plan', $1,
+       CASE WHEN bumped.run_kind IN ('chat', 'judge') THEN NULL
+            WHEN bumped.run_status = 'awaiting_approval' AND bumped.run_gate_revision > 0 THEN 'bound'
+            WHEN bumped.run_status = 'awaiting_approval' THEN NULL
+            ELSE 'unbound' END,
+       CASE WHEN bumped.run_kind NOT IN ('chat', 'judge') AND bumped.run_status = 'awaiting_approval' AND bumped.run_gate_revision > 0
+            THEN bumped.run_gate_revision END
 FROM bumped
 RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision
 `
 
 type CreateRunReviseInputIfUnderCapParams struct {
-	Body         pgtype.Text `json:"body"`
-	RunID        uuid.UUID   `json:"run_id"`
-	MaxRevisions int32       `json:"max_revisions"`
+	Body                 pgtype.Text `json:"body"`
+	RunID                uuid.UUID   `json:"run_id"`
+	MaxRevisions         int32       `json:"max_revisions"`
+	ExpectedGateRevision pgtype.Int8 `json:"expected_gate_revision"`
 }
 
 // Atomic capped enqueue of a revise_plan (PRD #41): insert ONLY while the run is still
@@ -2967,8 +3068,20 @@ type CreateRunReviseInputIfUnderCapParams struct {
 // necessarily bare: Postgres rejects a qualified one outright (`UPDATE t SET t.n = ...`
 // gives `column "t" of relation "t" does not exist`), so "every reference in the UPDATE"
 // is not a rule anyone could follow — it was the wording here until it was measured.
+//
+// PRD #1795 M2: the row is STAMPED with the plan-gate binding computed from the bumped (and
+// therefore locked) run row, exactly as CreateGateVerdictInput documents, and
+// @expected_gate_revision joins the UPDATE's predicate (a runs-row column comparison, so it
+// honours the rule above): a mismatch bumps no revise_count and writes no row. A 0-row result
+// is then ambiguous between the cap and a mismatch; the caller re-reads the run to tell them
+// apart.
 func (q *Queries) CreateRunReviseInputIfUnderCap(ctx context.Context, arg CreateRunReviseInputIfUnderCapParams) (RunUserInput, error) {
-	row := q.db.QueryRow(ctx, createRunReviseInputIfUnderCap, arg.Body, arg.RunID, arg.MaxRevisions)
+	row := q.db.QueryRow(ctx, createRunReviseInputIfUnderCap,
+		arg.Body,
+		arg.RunID,
+		arg.MaxRevisions,
+		arg.ExpectedGateRevision,
+	)
 	var i RunUserInput
 	err := row.Scan(
 		&i.ID,
@@ -3059,21 +3172,32 @@ func (q *Queries) CreateScopeCeilingInput(ctx context.Context, arg CreateScopeCe
 
 const createStopVerdictInput = `-- name: CreateStopVerdictInput :one
 WITH stamped AS (
-    UPDATE runs SET stop_kind = $4, stop_reason = $5, updated_at = now()
-    WHERE id = $1
-    RETURNING id
+    UPDATE runs SET stop_kind = $3, stop_reason = $4, updated_at = now()
+    WHERE runs.id = $5
+      AND ($6::bigint IS NULL
+           OR (runs.status = 'awaiting_approval' AND runs.gate_revision = $6::bigint))
+    RETURNING runs.id AS run_id, runs.status AS run_status, runs.gate_revision AS run_gate_revision, runs.kind AS run_kind
 )
-INSERT INTO run_user_inputs (run_id, kind, body)
-VALUES ($1, $2, $3)
+INSERT INTO run_user_inputs (run_id, kind, body, gate_binding, gate_revision)
+SELECT stamped.run_id, $1, $2,
+       CASE WHEN $1::text <> 'reject_plan' OR stamped.run_kind IN ('chat', 'judge') THEN NULL
+            WHEN stamped.run_status = 'awaiting_approval' AND stamped.run_gate_revision > 0 THEN 'bound'
+            WHEN stamped.run_status = 'awaiting_approval' THEN NULL
+            ELSE 'unbound' END,
+       CASE WHEN $1::text = 'reject_plan' AND stamped.run_kind NOT IN ('chat', 'judge')
+                 AND stamped.run_status = 'awaiting_approval' AND stamped.run_gate_revision > 0
+            THEN stamped.run_gate_revision END
+FROM stamped
 RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision
 `
 
 type CreateStopVerdictInputParams struct {
-	RunID      uuid.UUID   `json:"run_id"`
-	Kind       string      `json:"kind"`
-	Body       pgtype.Text `json:"body"`
-	StopKind   pgtype.Text `json:"stop_kind"`
-	StopReason pgtype.Text `json:"stop_reason"`
+	Kind                 string      `json:"kind"`
+	Body                 pgtype.Text `json:"body"`
+	StopKind             pgtype.Text `json:"stop_kind"`
+	StopReason           pgtype.Text `json:"stop_reason"`
+	RunID                uuid.UUID   `json:"run_id"`
+	ExpectedGateRevision pgtype.Int8 `json:"expected_gate_revision"`
 }
 
 // Enqueue a deliberate-stop verdict (cancel / reject_plan / stop) for the live worker AND
@@ -3108,13 +3232,20 @@ type CreateStopVerdictInputParams struct {
 // would contradict that clean split; auto-stop passes NULL, its identity being
 // stop_kind='auto_stopped'. The stamp stays unconditional to avoid the
 // parameter-type-inference pitfall the comment above already warns about.
+//
+// PRD #1795 M2: INSERT ... SELECT FROM the update CTE, so a reject_plan row is STAMPED with the
+// plan-gate binding of the row the UPDATE locked (rules: see CreateGateVerdictInput); cancel
+// and stop rows stay legacy (NULL). @expected_gate_revision joins the UPDATE predicate: a
+// mismatch stamps no stop_kind and writes no row (the caller answers gate_revision_mismatch).
+// Only the reject_plan caller ever passes it.
 func (q *Queries) CreateStopVerdictInput(ctx context.Context, arg CreateStopVerdictInputParams) (RunUserInput, error) {
 	row := q.db.QueryRow(ctx, createStopVerdictInput,
-		arg.RunID,
 		arg.Kind,
 		arg.Body,
 		arg.StopKind,
 		arg.StopReason,
+		arg.RunID,
+		arg.ExpectedGateRevision,
 	)
 	var i RunUserInput
 	err := row.Scan(
@@ -10946,12 +11077,17 @@ UPDATE runs SET status = 'failed', status_since = now(), stop_kind = 'plan_rejec
     updated_at = now()
 WHERE id = $2 AND user_id = $3
   AND status NOT IN ('completed', 'failed', 'cancelled')
+  -- PRD #1795 M2 (D5): a reject sent against a revision the run no longer shows does not fail
+  -- the run (0 rows; the caller re-reads and answers gate_revision_mismatch).
+  AND ($4::bigint IS NULL
+       OR (status = 'awaiting_approval' AND gate_revision = $4::bigint))
 `
 
 type RejectRunServerSideParams struct {
-	FailureReason pgtype.Text `json:"failure_reason"`
-	ID            uuid.UUID   `json:"id"`
-	UserID        uuid.UUID   `json:"user_id"`
+	FailureReason        pgtype.Text `json:"failure_reason"`
+	ID                   uuid.UUID   `json:"id"`
+	UserID               uuid.UUID   `json:"user_id"`
+	ExpectedGateRevision pgtype.Int8 `json:"expected_gate_revision"`
 }
 
 // Server-side plan rejection → failed → origin restore → stamp. stop_kind is
@@ -10959,7 +11095,12 @@ type RejectRunServerSideParams struct {
 // (PRD #33 Decision 3), so this failed run is recognised as a deliberate stop
 // regardless of the failure_reason text.
 func (q *Queries) RejectRunServerSide(ctx context.Context, arg RejectRunServerSideParams) (int64, error) {
-	result, err := q.db.Exec(ctx, rejectRunServerSide, arg.FailureReason, arg.ID, arg.UserID)
+	result, err := q.db.Exec(ctx, rejectRunServerSide,
+		arg.FailureReason,
+		arg.ID,
+		arg.UserID,
+		arg.ExpectedGateRevision,
+	)
 	if err != nil {
 		return 0, err
 	}
