@@ -656,7 +656,8 @@ function forgejoPrFixture(over: Record<string, unknown> = {}): Record<string, un
     merged: false,
     merged_at: null,
     merge_commit_sha: null,
-    base: { label: "release/2.x", ref: "release/2.x", sha: "0000000000000000000000000000000000000abc", repo_id: 3 },
+    // label differs from ref so a parser reading `label` instead of `ref` would fail.
+    base: { label: "org:release/2.x", ref: "release/2.x", sha: "0000000000000000000000000000000000000abc", repo_id: 3 },
     head: { label: "agent/issue-5", ref: "agent/issue-5", sha: MR_HEAD, repo_id: 3 },
     closed_at: null,
     html_url: "https://example.com/git/org/repo/pulls/42",
@@ -744,6 +745,14 @@ for (const d of drivers) {
       assert.strictEqual(mr.description, "");
     });
 
+    it("rejects a non-string description/body with the parser's ForgeError (not coerced)", async () => {
+      const { fetchFn } = recorder([{ status: 200, body: d.fixture({ [d.bodyField]: 42 }) }]);
+      await assert.rejects(
+        d.make(fetchFn).getMergeRequest(d.repoUrl, PAT, 42),
+        (err: unknown) => err instanceof ForgeError && /non-string description/.test(err.message),
+      );
+    });
+
     it("throws ForgeError(404) for a missing MR/PR", async () => {
       const { fetchFn } = recorder([{ status: 404, body: { message: "404 Not Found" } }]);
       await assert.rejects(
@@ -818,7 +827,7 @@ describe("getMergeRequest state mapping (recorded closed/merged/locked shapes)",
     assert.strictEqual(await read(gl, base.repoUrl, gitlabMrFixture({ state: "locked" })), "locked");
   });
 
-  it("GitHub: open, closed-unmerged, closed+merged (flag), closed+merged_at only", async () => {
+  it("GitHub: open, closed-unmerged, closed+merged (flag), closed+merged_at only, closed+merged flag only", async () => {
     assert.strictEqual(await read(gh, ghBase.repoUrl, githubPrFixture()), "open");
     assert.strictEqual(await read(gh, ghBase.repoUrl, githubPrFixture({ state: "closed", closed_at: MERGED_AT })), "closed");
     assert.strictEqual(
@@ -828,13 +837,23 @@ describe("getMergeRequest state mapping (recorded closed/merged/locked shapes)",
     // The list endpoint omits `merged`; merged_at alone still reads as merged.
     const { merged: _drop, ...noFlag } = githubPrFixture({ state: "closed", merged_at: MERGED_AT });
     assert.strictEqual(await read(gh, ghBase.repoUrl, noFlag), "merged");
+    // The flag alone (merged_at null) still reads as merged.
+    assert.strictEqual(
+      await read(gh, ghBase.repoUrl, githubPrFixture({ state: "closed", merged: true, merged_at: null })),
+      "merged",
+    );
   });
 
-  it("Forgejo: open, closed-unmerged, closed+merged", async () => {
+  it("Forgejo: open, closed-unmerged, closed+merged, closed+merged flag only", async () => {
     assert.strictEqual(await read(fj, fjSubpathRepo, forgejoPrFixture()), "open");
     assert.strictEqual(await read(fj, fjSubpathRepo, forgejoPrFixture({ state: "closed", closed_at: MERGED_AT })), "closed");
     assert.strictEqual(
       await read(fj, fjSubpathRepo, forgejoPrFixture({ state: "closed", merged: true, merged_at: MERGED_AT })),
+      "merged",
+    );
+    // The flag alone (merged_at null) still reads as merged.
+    assert.strictEqual(
+      await read(fj, fjSubpathRepo, forgejoPrFixture({ state: "closed", merged: true, merged_at: null })),
       "merged",
     );
   });
