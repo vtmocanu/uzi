@@ -396,6 +396,15 @@ func protocolFeatures(activeSnapshotEnabled bool) []string {
 		{"heartbeat_outbox"},       // PRD #1391 M5, Run A
 		{"claim_generation_fence"}, // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker
 		{"terminal_fence"},         // PRD #1391 Run B M3c: this api fences a terminal transition on messages_through_seq contiguity
+		// Issue #1766 M2: this api accepts {status:"recovery_wait", recovery_cause:"vault_locked"}
+		// and stores the cause. Advertised UNCONDITIONALLY (no config gates the park): a worker
+		// must see it before sending the cause, because an older api 400s an unknown recovery_cause.
+		{"recovery_cause_vault_locked"},
+		// PRD #1795 M1: this api accepts presentation_id / adopt_gate_revision on the
+		// awaiting_approval report and answers the allocated gate_revision on its ACK. A worker
+		// sends the new fields ONLY when it sees this token, because an older api's strict
+		// decoder 400s an unknown field.
+		{"gate_revision_v1"},
 	}
 	if activeSnapshotEnabled {
 		groups = append(groups, []string{"active_run_snapshot"}) // PRD #1390 M2a
@@ -491,6 +500,21 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	dto := workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
 	h.overlayOutbox(&dto, updated.ID)
+	// Custody flag (issue #1759): whether this worker still holds an OPEN durable-recovery
+	// custody hold, i.e. keeps the only local copy of work a run could not publish. The
+	// docker-tier worker reads it off this response to decide whether its allowlisted
+	// image/build-cache prune of the dind-data volume is allowed (never a volume or system
+	// prune). FAIL CLOSED: on a query
+	// error we log and report TRUE, so a transient DB fault can only make the worker skip
+	// a prune (recoverable: the next heartbeat retries), never let it destroy retained
+	// work. The owner is the authenticated worker row's own user_id.
+	retaining, err := h.wsvc.RetainingUnpublishedWork(r.Context(), wkr)
+	if err != nil {
+		slog.Error("worker heartbeat: custody lookup failed; reporting retaining_unpublished_work=true",
+			"worker_id", wkr.ID.String(), "error", err)
+		retaining = true
+	}
+	dto.RetainingUnpublishedWork = retaining
 	httpx.JSON(w, http.StatusOK, map[string]any{"worker": dto})
 }
 
@@ -697,6 +721,12 @@ func parseWorkerStats(raw json.RawMessage, workerID uuid.UUID) *workersvc.Worker
 		DiskNixTotalBytes  *json.Number `json:"disk_nix_total_bytes"`
 		DiskDataBytes      *json.Number `json:"disk_data_bytes"`
 		DiskDataTotalBytes *json.Number `json:"disk_data_total_bytes"`
+		// Docker-in-docker volume (issue #1759): bytes AND inodes, same tolerant
+		// per-field *json.Number decode as the nix/data fields. Display-only.
+		DiskDindBytes       *json.Number `json:"disk_dind_bytes"`
+		DiskDindTotalBytes  *json.Number `json:"disk_dind_total_bytes"`
+		DiskDindInodes      *json.Number `json:"disk_dind_inodes"`
+		DiskDindTotalInodes *json.Number `json:"disk_dind_total_inodes"`
 	}
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return drop()
@@ -735,6 +765,12 @@ func parseWorkerStats(raw json.RawMessage, workerID uuid.UUID) *workersvc.Worker
 	out.DiskNixTotalBytes = diskBytesOrNil(s.DiskNixTotalBytes)
 	out.DiskDataBytes = diskBytesOrNil(s.DiskDataBytes)
 	out.DiskDataTotalBytes = diskBytesOrNil(s.DiskDataTotalBytes)
+	// dind-data volume (issue #1759): the same per-field drop. diskBytesOrNil's
+	// non-negative int64 contract fits an inode count as well as a byte count.
+	out.DiskDindBytes = diskBytesOrNil(s.DiskDindBytes)
+	out.DiskDindTotalBytes = diskBytesOrNil(s.DiskDindTotalBytes)
+	out.DiskDindInodes = diskBytesOrNil(s.DiskDindInodes)
+	out.DiskDindTotalInodes = diskBytesOrNil(s.DiskDindTotalInodes)
 	return out
 }
 
@@ -997,8 +1033,24 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	run, applied, err := h.wsvc.SetState(r.Context(), wkr, runID, req)
+	run, applied, gateRevision, err := h.wsvc.SetStateReport(r.Context(), wkr, runID, req)
 	if err != nil {
+		// PRD #1795 M1: a refused awaiting_approval report (historical presentation id, changed
+		// payload under the current id, stale adoption) published nothing. 409 with the same
+		// {run, reason} shape as the forge-park refusals; the worker parks through transient
+		// recovery and the next claim re-presents. The run may already be failed when the
+		// refusal cap was reached.
+		if reason, ok := workersvc.GatePresentationRefusalReason(err); ok {
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"run":    runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock()),
+				"reason": reason,
+			})
+			return
+		}
+		if errors.Is(err, workersvc.ErrClaimGenerationRequired) {
+			httpx.ErrorReason(w, http.StatusBadRequest, "presentation_id and adopt_gate_revision require claim_generation", "claim_generation_required")
+			return
+		}
 		// PRD #1392 M1: the two forge-park precedence refusals are 409 with a {run, reason}
 		// body — the worker dispatches on `reason` (stale_claim stops silently; custody_unsettled
 		// falls to today's failed path). recovery_retry_not_before rides on the run (RunDTO), not
@@ -1084,6 +1136,12 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// up on the idempotent-after-reclaim success (applied=true, status 'running'), leaving the
 		// old flight to continue on a claim the reclaim already owns.
 		ack["disposition"] = "released"
+	}
+	if req.State == "awaiting_approval" && gateRevision > 0 {
+		// PRD #1795 M1 (decision 5): the revision this report was answered with, allocated or
+		// returned inside the report's transaction and threaded back from SetStateReport, never
+		// re-read after commit. The worker confirms THIS revision for bound-verdict matching.
+		ack["gate_revision"] = gateRevision
 	}
 	httpx.JSON(w, http.StatusOK, ack)
 }

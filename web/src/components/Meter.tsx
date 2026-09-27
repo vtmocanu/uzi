@@ -47,12 +47,15 @@ export function MeterTrack({
   valueText,
   className = "",
   dim = false,
+  describedBy,
 }: {
   label: string;
   fillPct: number;
   valueText: string;
   className?: string;
   dim?: boolean;
+  /** id of an element describing the bar (aria-describedby); the name stays `label`. */
+  describedBy?: string;
 }) {
   const now = Math.round(clampPct(fillPct));
   const tone = toneFor(now);
@@ -64,6 +67,7 @@ export function MeterTrack({
       aria-valuemin={0}
       aria-valuemax={100}
       aria-valuetext={valueText}
+      aria-describedby={describedBy}
       className={cx("overflow-hidden rounded-full bg-raised", className)}
     >
       <div

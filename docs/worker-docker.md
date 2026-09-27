@@ -67,6 +67,45 @@ an instance whose admin has turned the docker tier on. The cluster runs the
 daemon as a native sidecar in a dedicated, isolated namespace; there's
 nothing to configure yourself.
 
+## dind-data metering and automatic pruning
+
+On a **hosted (k8s)** docker-capable worker, the daemon's images and build
+cache live on their own PVC (`dind-data`), which the worker itself never
+mounts — only the daemon and a small, unprivileged `dind-meter` sidecar can
+see it. `dind-meter` samples the volume's fill level (bytes and inodes) every
+30s and publishes it read-only for the worker to display as the **Disk
+dind** gauge (see [Worker setup](./worker-setup.md#resource-stats-and-sizing)).
+
+The worker also watches that sample and, when it stays at or above 85% of
+bytes or inodes across two fresh samples, runs a short, fixed sequence of
+cache prunes against the daemon: `docker image prune -f`, then
+`docker builder prune -f`, and — only if the volume is still over the
+threshold — `docker image prune -a -f --filter until=24h` (any unused image
+built more than a day ago). It only does this once the worker is provably
+idle: no active run, chat, or claim in flight, and the api has confirmed on a
+fresh heartbeat that the worker holds no unpublished work; any doubt skips
+the attempt rather than risking one. Look for `dind-prune-completed`,
+`dind-prune-failed`, `dind-prune-insufficient`, or `dind-prune-deferred` in
+the worker's logs to see what it did.
+
+**What this never touches**: docker volumes, running or stopped containers,
+and the `/nix`/`/data` disk-pressure recycle (which only ever deletes and
+re-provisions those two, never `dind-data`; see
+[ADR-837](../adr/0837-worker-disk-lifecycle.md)). If the cache is still over
+the threshold after a prune (`dind-prune-insufficient`), there is currently
+no automatic recycle of `dind-data` — the gauge stays elevated and the only
+way to reclaim the volume is the manual fallback below.
+
+**Manual fallback.** Delete the worker and reprovision it (the
+[Workers page](./hosted-workers.md), or `uzi worker rm <worker-id>` +
+re-provision): this tears down the pod and its `dind-data` PVC and re-creates
+it empty. That's a heavier lever than the automatic `/nix`/`/data` recycle
+([ADR-837](../adr/0837-worker-disk-lifecycle.md)), which reclaims those two
+volumes by deleting and re-creating the PVCs in place, without deleting the
+worker itself. A compose worker has no meter or automatic prune (`dind-meter`
+is a hosted-only sidecar); reclaim its `dinddata` volume the same way as
+`agentnix` — see [Worker setup](./worker-setup.md#resource-stats-and-sizing).
+
 ## Cost
 
 A docker sidecar budgets roughly **1-2 GiB memory and 1 CPU** on top of the

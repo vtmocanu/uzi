@@ -49,6 +49,28 @@ var ErrSelectionRejected = errors.New("slack: agent selection rejected by the se
 // adapter in main translates it, keeping slacksvc free of a workersvc import.
 var ErrReviseCapReached = errors.New("slack: plan revision limit reached")
 
+// ErrGateRevisionMismatch is the gatekeeper- and replier-facing translation of workersvc's
+// *GateRevisionMismatchError (PRD #1795 M5): the verdict carried the revision of the card it
+// came from, and the run is no longer awaiting approval at that revision (a newer plan was
+// presented, or the gate was resolved elsewhere). The server wrote nothing. Surfaced as the
+// superseded notice, never as success. The adapter in main translates it, keeping slacksvc
+// free of a workersvc import.
+var ErrGateRevisionMismatch = errors.New("slack: plan gate revision changed")
+
+// gateSupersededText answers a click or reply on a gate card that is no longer the live gate:
+// the anchor moved to a newer card, or the server refused the card's revision.
+const gateSupersededText = "This gate was superseded. Scroll down to the latest plan message."
+
+// gateRecardSupersededText retires the prior gate card when a fresh one is posted below it.
+// The re-card also fires on a same-plan re-presentation (the gate revision advanced with no
+// new plan), so the copy points at the new card without claiming the plan changed.
+const gateRecardSupersededText = "Superseded by the gate card below."
+
+// gateNoLongerOpenText retires a gate card whose verdict the server refused for a changed
+// revision (PRD #1795 M5). The refusal cannot tell a newer plan from a run that left the gate,
+// so the copy claims neither: it only says this card is closed and where to look instead.
+const gateNoLongerOpenText = "This plan gate is no longer open. Check the latest message in this thread, or open the run in uzi."
+
 // ErrAnswerStale and ErrNotAwaitingInput are the replier-facing translations of
 // workersvc's ErrStaleAnswer / ErrRunNotAwaitingInput (PRD #88 M3). Both mean the run
 // left the question the reply was written against, between the replier reading its

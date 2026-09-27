@@ -10,6 +10,7 @@ import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
 import type { ActiveSnapshot, OutboxHeartbeatEntry, StateAck, StateRequest, WorkerStats } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
+import type { DindPruneController } from "./dind-prune.js";
 import { makeTerminalOutboxDeps, resolvePendingTerminal, type SendTerminalState } from "./terminal-resolve.js";
 import { StatsCollector } from "./stats.js";
 import { errMessage, sleep } from "./util.js";
@@ -65,7 +66,25 @@ export class Worker {
     // issue #1582 M2: the interval (ms) of the ancestry-settlement re-sweep. Test seam; production
     // uses the 5-minute default.
     private readonly settlementSweepMs: number = SETTLEMENT_SWEEP_MS,
+    // issue #1759 M3: the DinD prune controller, present only on a docker worker with
+    // UZI_DIND_PRUNE_ENABLED=true (createDindPrune). Its gate pauses BOTH claim loops while
+    // a prune holds it; the heartbeat feeds it the custody flag; run() starts its loop.
+    private readonly dindPrune?: DindPruneController,
   ) {}
+
+  /** The run lane's in-flight executions (issue #1759: a field so {@link isIdle} can read it). */
+  private readonly runActive = new Set<Promise<void>>();
+  /** The chat lane's in-flight sessions (same reason). */
+  private readonly chatActive = new Set<Promise<void>>();
+
+  /**
+   * issue #1759 M3: true only when this worker executes nothing: no run-lane execution
+   * (issue/ci_fix/judge/review), no chat session, and no entry in the active-run
+   * registry (when wired). The DinD prune requires it while holding the claim gate.
+   */
+  isIdle(): boolean {
+    return this.runActive.size === 0 && this.chatActive.size === 0 && (this.activeRuns?.size ?? 0) === 0;
+  }
 
   /** PRD #1391 M2: single-flight guard — never two outbox drains at once (a heartbeat
    *  tick must not start a drain while the boot drain, or a prior tick's drain, is
@@ -133,7 +152,10 @@ export class Worker {
     // `pending_settle` record, then a re-sweep on a timer until abort. No forge credential needed.
     const settlement = this.settlementLoop(signal);
     // The run lane and the chat lane join the already-running heartbeat until abort.
-    await Promise.all([heartbeat, settlement, this.claimLoop(signal), this.chatClaimLoop(signal)]);
+    // issue #1759 M3: the DinD prune loop, only when enabled (createDindPrune returned a
+    // controller). Its loop never throws.
+    const dindPrune = this.dindPrune ? this.dindPrune.loop(signal) : Promise.resolve();
+    await Promise.all([heartbeat, settlement, dindPrune, this.claimLoop(signal), this.chatClaimLoop(signal)]);
   }
 
   /** issue #1582 M2: sweep the settlement journal now, then every `settlementSweepMs` until the
@@ -329,6 +351,11 @@ export class Worker {
           // server-side at once (never failed), so advertising it is negotiation, not a toggle.
           "wall_park_v1",
           "input_receipts_v1",
+          // PRD #1795 M3: this image binds plan-gate verdicts to the gate revision (it matches a
+          // bound verdict by exact revision and mints/reuses presentation ids). Advertised
+          // UNCONDITIONALLY: the new report fields themselves are sent only when the api's register
+          // response advertises the gate_revision_v1 feature, so an older api never sees them.
+          "gate_revision_v1",
         ];
         // PRD #1332 D3 (M5A / C2), refined by PRD #1493 M3: advertise the Codex harness
         // PROTOCOL capability ONLY on an HONEST availability result. The old gate was the
@@ -367,6 +394,7 @@ export class Worker {
           protocol_capabilities: protocolCapabilities,
           worker_id: res.worker_id ?? null,
         });
+        this.dindPrune?.setWorkerId(res.worker_id);
         return;
       } catch (err) {
         // A 401/403 is a PERMANENT auth rejection of the worker join token (rotated or
@@ -406,8 +434,19 @@ export class Worker {
         // the first recovered heartbeat carries the depth ahead of that tick's drain.
         // PRD #1390 M2a: the active-run snapshot rides the same send (built here so its
         // epoch is drawn from the ONE monotonic counter the claim loop also draws from).
-        await this.client.heartbeat(this.collectStats(stats), this.outboxEntries(), this.buildActiveSnapshot());
+        const sentAtMs = Date.now();
+        const retaining = await this.client.heartbeat(
+          this.collectStats(stats),
+          this.outboxEntries(),
+          this.buildActiveSnapshot(),
+        );
         ok = true;
+        // issue #1759 M3: the api's custody flag, stamped here with this heartbeat's SEND
+        // time (the flag reflects the api's view as of the request, so a heartbeat sent
+        // before a claim and returning after that run ended must not look newer than the
+        // run end). The controller ages the stamp out, so a run of failed heartbeats makes
+        // the prune fail closed on a stale flag.
+        this.dindPrune?.recordCustody(retaining, sentAtMs);
       } catch (err) {
         this.log.warn("heartbeat failed", { error: errMessage(err) });
       }
@@ -554,7 +593,8 @@ export class Worker {
    */
   private async claimLoop(signal: AbortSignal): Promise<void> {
     const cap = this.config.maxConcurrentRuns;
-    const active = new Set<Promise<void>>();
+    const active = this.runActive;
+    const gate = this.dindPrune?.gate;
     let loggedAtCapacity = false;
     while (!signal.aborted) {
       // PRD #1390 M4 (e2e ONLY): the env-gated drop-execution seam pauses claiming (via the
@@ -593,6 +633,14 @@ export class Worker {
         continue;
       }
       loggedAtCapacity = false;
+      // issue #1759 M3: while the DinD prune holds the claim gate, take no claim (same
+      // sleep-and-continue shape as the overflow gate above). Otherwise count this claim as
+      // in flight until its run is in `active` (or it returned nothing / failed), so the
+      // prune's idle check can never miss a run this claim is about to start.
+      if (gate?.claimsClosed() || (gate && !gate.tryEnterClaim())) {
+        await sleep(this.config.pollIntervalMs, signal);
+        continue;
+      }
       let claimed = false;
       try {
         // PRD #1390 M2a: carry the active-run snapshot on the claim (built from the SAME
@@ -633,10 +681,16 @@ export class Worker {
             this.log.warn("claim/execute cycle failed", { error: errMessage(err) }),
           );
           active.add(run);
-          void run.finally(() => active.delete(run));
+          // issue #1759: the ending is activity the DinD prune's custody check orders against.
+          void run.finally(() => {
+            active.delete(run);
+            this.dindPrune?.noteActivityEnded();
+          });
         }
       } catch (err) {
         this.log.warn("claim/execute cycle failed", { error: errMessage(err) });
+      } finally {
+        gate?.exitClaim();
       }
       // A claim yielded a run: immediately loop to fill the next free slot (up to
       // cap). Otherwise wait a poll before asking again.
@@ -676,11 +730,17 @@ export class Worker {
    * and executor instance, so nothing run-scoped is shared between concurrent chats.
    */
   private async chatClaimLoop(signal: AbortSignal): Promise<void> {
-    const active = new Set<Promise<void>>();
+    const active = this.chatActive;
+    const gate = this.dindPrune?.gate;
     while (!signal.aborted) {
       if (active.size >= this.config.chatSessions) {
         // All chat slots busy: wake when one frees or after a poll, then re-check.
         await Promise.race([...active, sleep(this.config.chatPollMs, signal)]);
+        continue;
+      }
+      // issue #1759 M3: the same claim gate as the run lane (see claimLoop).
+      if (gate?.claimsClosed() || (gate && !gate.tryEnterClaim())) {
+        await sleep(this.config.chatPollMs, signal);
         continue;
       }
       let claimed = false;
@@ -694,10 +754,16 @@ export class Worker {
             .execute(claim, signal)
             .catch((err) => this.log.warn("chat execute failed", { error: errMessage(err) }));
           active.add(run);
-          void run.finally(() => active.delete(run));
+          // issue #1759: the ending is activity the DinD prune's custody check orders against.
+          void run.finally(() => {
+            active.delete(run);
+            this.dindPrune?.noteActivityEnded();
+          });
         }
       } catch (err) {
         this.log.warn("chat claim/execute cycle failed", { error: errMessage(err) });
+      } finally {
+        gate?.exitClaim();
       }
       if (!claimed) await sleep(this.config.chatPollMs, signal);
     }

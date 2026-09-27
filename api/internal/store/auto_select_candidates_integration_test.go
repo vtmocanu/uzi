@@ -114,7 +114,7 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 
 	synced := time.Now().UTC().Add(-time.Minute)
 	mkGauge := func(secret uuid.UUID, user uuid.UUID, five, seven int16) {
-		if uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+		if _, uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 			UserSecretID:     secret,
 			UserID:           user,
 			FiveHourPct:      pgtype.Int2{Int16: five, Valid: true},
@@ -136,7 +136,7 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 	// query that COALESCEs a NULL pct to 0, which would silently turn "we know
 	// nothing" into "this token is completely free" — the single worst direction for
 	// this bug, since an unmeasured token would then win every ranking.
-	if uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+	if _, uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 		UserSecretID: halfnul, UserID: owner,
 		FiveHourPct: pgtype.Int2{}, // NULL
 		SevenDayPct: pgtype.Int2{Int16: 30, Valid: true},
@@ -149,7 +149,7 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 	// Case 4: a complete reading that aged out. Catches a query that omits synced_at
 	// entirely — every other case would still pass, because Classify's other gates
 	// would answer first.
-	if uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+	if _, uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 		UserSecretID: aged, UserID: owner,
 		FiveHourPct: pgtype.Int2{Int16: 10, Valid: true},
 		SevenDayPct: pgtype.Int2{Int16: 10, Valid: true},
@@ -163,7 +163,7 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 	// window (00080 makes both nullable). +inf must survive the round trip as NULL
 	// rather than arriving as a zero time, which would sort BEFORE every real reset
 	// and make this token win every tie — the exact inversion of the rule.
-	if uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+	if _, uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 		UserSecretID: noreset, UserID: owner,
 		FiveHourPct: pgtype.Int2{Int16: 20, Valid: true},
 		SevenDayPct: pgtype.Int2{Int16: 20, Valid: true},
@@ -423,7 +423,7 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 	} {
 		id := mkSecret(abcOwner, tc.label, false, true)
 		abc[tc.label] = id
-		if uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+		if _, uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 			UserSecretID: id, UserID: abcOwner,
 			FiveHourPct:      pgtype.Int2{Int16: tc.pct, Valid: true},
 			SevenDayPct:      pgtype.Int2{Int16: 0, Valid: true},

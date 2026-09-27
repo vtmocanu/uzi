@@ -127,6 +127,69 @@ func TestSetRunCredentialParkedStatesPromoteLiveDB(t *testing.T) {
 	}
 }
 
+// TestSetRunCredentialDisabledHoldReassignmentLiveDB proves the owner-facing
+// transition is atomic: an available budget promotes to the queue, while a spent
+// budget or a pending owner pause settles the hold (budget_exhausted, or the owner
+// pause) exactly as the promoter would; every case writes the new override.
+//
+// The subtests share one owner, and SetRunCredential requests a promoter pass for that owner
+// after it commits. With the default `go fn()` dispatcher that pass ran concurrently with the
+// NEXT subtest's seeding and settled or promoted the freshly seeded held run before
+// SetRunCredential reached it (ErrCredentialSwitchRaced, or a pending pause seeded after the
+// promotion so the run read back queued). The dispatcher is therefore synchronous, as in
+// newCDFix: the requested pass finishes before SetRunCredential returns, and each held run is
+// seeded in one statement so no reader ever sees a half-seeded hold.
+func TestSetRunCredentialDisabledHoldReassignmentLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	svc := New(env.q, env.box, testParams())
+	svc.SetTxBeginner(env.pool)
+	svc.SetBackground(func(fn func()) { fn() })
+	o := seedReevalOwner(t, env, BindModeAuto, false)
+	for i, tc := range []struct {
+		name       string
+		budget     int
+		ownerPause bool
+		wantStatus string
+		wantHold   string
+	}{
+		{"available budget", 3600, false, "queued", ""},
+		{"exhausted budget", 10, false, "paused", "budget_exhausted"},
+		{"pending owner pause", 3600, true, "paused", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runID := seedRunInStatus(t, env, o, int64(4450+i), "paused", time.Now().UTC())
+			env.exec(`UPDATE runs SET hold_reason='credential_disabled', budget_wall_seconds=$2,
+			    claim_released_at=now(),
+			    pause_requested_at=CASE WHEN $3::bool THEN now() END,
+			    pause_mode=CASE WHEN $3::bool THEN 'now' END
+			    WHERE id=$1`, runID, tc.budget, tc.ownerPause)
+			res, err := svc.SetRunCredential(env.ctx, o.userID, runID, CredentialOverrideModePinned, &o.altTok)
+			if err != nil {
+				t.Fatalf("reassignment: %v (want the hold promoted or settled, never ErrCredentialSwitchRaced)", err)
+			}
+			stored := mustRun(t, env, runID)
+			if res.Run.Status != stored.Status || stored.Status != tc.wantStatus || stored.HoldReason.String != tc.wantHold {
+				t.Fatalf("status=%s (result %s) hold=%q, want %s hold=%q",
+					stored.Status, res.Run.Status, stored.HoldReason.String, tc.wantStatus, tc.wantHold)
+			}
+			if stored.CredentialOverrideMode.String != CredentialOverrideModePinned ||
+				!stored.CredentialOverrideSecretID.Valid ||
+				uuid.UUID(stored.CredentialOverrideSecretID.Bytes) != o.altTok {
+				t.Fatalf("override = %v/%v, want pinned %s", stored.CredentialOverrideMode, stored.CredentialOverrideSecretID, o.altTok)
+			}
+			if stored.PauseRequestedAt.Valid || stored.PauseMode.Valid {
+				t.Fatalf("pending pause left behind: at=%v mode=%v", stored.PauseRequestedAt, stored.PauseMode)
+			}
+			if tc.wantStatus == "queued" {
+				var resumes int
+				if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind='resume'`, runID).Scan(&resumes); err != nil || resumes != 1 {
+					t.Fatalf("resume audit: count=%d err=%v", resumes, err)
+				}
+			}
+		})
+	}
+}
+
 // TestSetRunCredentialLimitWaitAutoClaimExcludesDeadTokenLiveDB is the M4 exclusion proof:
 // switching a limit_wait run to `auto` early-promotes it, and because the promote preserves
 // limit_dead_secret_id + the still-future retry_not_before, the ensuing auto claim EXCLUDES

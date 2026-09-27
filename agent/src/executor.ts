@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
-import type { CodexExecutionSafety } from "./harness.js";
+import type { CodexExecutionSafety, HarnessError } from "./harness.js";
 import type {
   AgentSelection,
   AgentSource,
@@ -375,7 +375,11 @@ export interface RunContext {
    * REASON_PLAN_MISSING, as it does when this is absent. Does not count against question_max.
    */
   askPlanMissing?: () => Promise<{ kind: "answer"; answers: string[] } | { kind: "cancel" } | { kind: "unattended" }>;
-  /** M4: dequeue the next queued follow-up to inject into the next loop turn. */
+  /** M4: dequeue the next queued follow-up to inject into the next loop turn. The SDK
+   *  executor calls this at the end of every ordinary work turn and at a cooperative
+   *  checkpoint (#1152): one per turn, FIFO. The server's consumed_at ("Delivered") records
+   *  only the worker's receipt via the steering poll, not this dequeue into a prompt nor that
+   *  the model acted on it. */
   pullFollowUp?(): string | undefined;
   /** PRD #1416 M2: drain the WORKER-AUTHORITATIVE safety steer armed in-process by the runner's
    *  divergence detection, if any. Consumed with PRIORITY at each executor loop top — ahead of
@@ -780,6 +784,11 @@ export interface Executor {
   /** M3 (PRD #1171): a Codex-selected executor supplies this outer safety facade;
    * absence preserves Claude/stub callers (they take the literal legacy killAgentTree branch). */
   safety?: CodexExecutionSafety;
+  /** issue #1769: true when this executor runs model commands in the Codex command sandbox
+   * (Landlock rooted at the clone), known at construction. Unlike `safety` (populated only
+   * inside `run()`), this is readable before the runner clone is seeded, so the seed can make
+   * the clone self-contained. Every other executor leaves it unset. */
+  readonly sandboxesCommands?: boolean;
   /** Issue #1604: true when run() awaits a resumed claim's pending gate inputs
    * (ctx.takeResumedGateEvent) and may RE-PRESENT its persisted unapproved plan at the gate
    * (resume_phase "awaiting_approval"). The runner then lets the re-presented gate keep epoch 0.
@@ -787,7 +796,21 @@ export interface Executor {
    * so the runner bumps the epoch at its first gate. Either way the runner's gatePlan reads the
    * replayed backlog before it reports awaiting_approval. */
   readonly resumesAtGate?: boolean;
+  /**
+   * Issue #1766: settle the executor's live execution registry for a CREDENTIAL-FREE capture
+   * after a vault-locked credential deferral: refuse new launches, reap every root and drain
+   * launches and callbacks under one deadline, without reconciling a credential or minting a
+   * permit. `observed_empty` means nothing of the run can still write to the clone. Optional:
+   * only a Codex-selected executor supplies it (the runner fails closed when a `safety`-bearing
+   * executor lacks it, and treats a legacy executor's `killAgentTree` reap as settled).
+   */
+  settleForCredentialFreeCapture?(deadlineMs: number): Promise<CredentialFreeSettleOutcome>;
 }
+
+/** Issue #1766: the result of {@link Executor.settleForCredentialFreeCapture}. */
+export type CredentialFreeSettleOutcome =
+  | { kind: "observed_empty" }
+  | { kind: "incomplete"; errors: readonly HarnessError[] };
 
 /**
  * Sentinel in an issue's title/description that makes the stub executor throw

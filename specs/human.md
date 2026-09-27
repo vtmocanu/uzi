@@ -385,7 +385,7 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/done/46-run-judge-self-imp
   correctness, verification depth, or code quality. [user 2026-08-15]
 - `cost_efficiency` is triage-only: it does NOT feed the self-improvement job.
   [user 2026-08-15]
-- **Judge and Findings share one triage row and one vocabulary** (File issue · Mark done · Dismiss ▾ at equal weight; the open state is "To triage" everywhere; filed is "Filed #N"); Findings shows each coordinate's evidence and the runs it was seen in, counted tabs, multi-select with undo, and a filed finding becomes Done when its issue closes on the forge. [user 2026-09-07]
+- **Judge and Findings share one triage row and one vocabulary** (File issue · Mark done · Dismiss ▾ at equal weight; the open state is "To triage" everywhere; filed is "Filed #N"); Findings shows each coordinate's evidence and the runs it was seen in, counted tabs, multi-select with undo, and a filed finding becomes Done when its issue closes on the forge; a person can also mark a finding done (from To triage, Filed or Dismissed) with the judge's disposition semantics, and Undo exposes Filed or To triage. [user 2026-09-07] (AI-synced 2026-09-26)
 
 ## Feature #45 — OIDC SSO login (Keycloak / Pocket ID)
 
@@ -516,6 +516,7 @@ Tracked as GitLab issue vtmocanu/uzi#83; PRD at `prds/done/83-docker-capable-wor
 - Trust model: trust the USER who owns the worker, not the repo code the agent runs (prompt-injectable). Security compromises allowed to cut complexity; agent-facing defenses stay load-bearing. [user]
 - k8s is the first-class test/runtime environment (not the deferred track). [user]
 - k8s docker posture: a dedicated privileged-tier namespace running the rootless-DinD sidecar. [user, Q-B owner decision]
+- dind-data is metered and cache-pruned automatically under an exclusion gate; never volumes; never feeds the /nix+/data recycle. (AI-synced 2026-09-27)
 
 ## Feature #95 — Run activity pane v2: crew roster, opt-in follow, steer-queue delivery
 
@@ -911,7 +912,7 @@ Tracked as GitHub issue vtmocanu/uzi#1695.
 
 ## Feature #1732 — Disable and re-enable account credentials
 
-Tracked as GitHub issue vtmocanu/uzi#1732; PRD at `prds/1732-disable-account-credentials.md`.
+Tracked as GitHub issue vtmocanu/uzi#1732; PRD at `prds/done/1732-disable-account-credentials.md`.
 
 - A user can disable any Anthropic token or OpenAI/Codex credential and re-enable it on demand. Disabled means kept (value, name, preferences) but not polled, not refreshed in the background, not selectable, hidden from the sidebar and pickers, and absent from the admin Rate limits page (no row, no count). Past runs and spend stay in history. (AI-synced 2026-09-26)
 - Work pinned or bound to a disabled credential waits and resumes on re-enable; uzi never silently spends a different credential instead. A run already holding the credential finishes. (AI-synced 2026-09-26)
@@ -935,6 +936,12 @@ Tracked as GitHub issue vtmocanu/uzi#1783; decision record `adr/1783-run-quiesce
 - On a Docker-wired worker, a run's clone path is never reused by a later execution attempt of the same run; each attempt seeds its own path. (AI-synced 2026-09-27)
 - Foreign residue found at the CANONICAL clone path is quarantined beside it rather than left to wedge the worker; a run that cannot prove its canonical clone path clear fails with the `worker_residue_blocked` fail origin. This holds at the canonical path only: a Docker-wired worker's per-attempt path is never reused by a later attempt, and a pre-existing fresh attempt path (one that should not yet exist) fails the run closed instead of being quarantined. (AI-synced 2026-09-27)
 - A resume or re-claim on a Docker-wired worker starts a fresh model session (Claude session or Codex thread); its earlier committed work still carries forward through the branch, tracking ref and checkpoints, but the conversation itself is not resumed. Unwired workers keep full same-path resume. (AI-synced 2026-09-27)
+
+## Feature #1795 — Plan-gate verdicts bound to the gate revision they were sent against
+
+Tracked as GitHub issue vtmocanu/uzi#1795; decision record `adr/1795-gate-revision-bound-verdicts.md`.
+
+- A plan-gate approve, reject or request-changes applies only to the plan revision it was sent against; a client that shows a plan (web, CLI, Slack) sends back the revision it displayed, and a stale one is refused rather than applied to a different plan. (AI-synced 2026-09-27)
 
 ## Startup admin seed
 

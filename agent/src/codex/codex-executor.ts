@@ -50,7 +50,7 @@ import { constants as FS } from "node:fs";
 import type { Readable, Writable } from "node:stream";
 
 import type { Logger } from "../log.js";
-import type { WorkerClient } from "../client.js";
+import { codexDeferralReason, type WorkerClient } from "../client.js";
 import type { DockerWiring } from "../docker-wiring.js";
 import { PlanRejectedError, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import { PauseNowSignal } from "../steering.js";
@@ -93,7 +93,9 @@ import type { CommandSandboxMode } from "../config.js";
 
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "./registry.js";
 import {
+  CodexExecutionSafetyImpl,
   createCodexExecutionSafety,
+  type CredentialFreeCaptureSettlement,
   type ReconcileBeforeBoundary,
   type ReconcileOutcome,
   type SpawnRootSeam,
@@ -717,6 +719,21 @@ export function buildAppServerRefreshBridge(
 }
 
 /**
+ * Issue #1766: thrown when releasing a provider epoch's initial credential was deferred because
+ * the owner vault is locked (the api's typed 409 `vault_locked`). It is thrown from
+ * `startProviderEpoch` (which tears the half-built epoch down and rethrows it unwrapped) and
+ * propagates out of `run()`, so the runner can park the run for recovery rather than fail it.
+ * The message is fixed and secret-free: it never carries the request path, body or a token.
+ */
+export class CodexCredentialDeferredError extends Error {
+  readonly deferral = "vault_locked" as const;
+  constructor() {
+    super("codex credential release deferred: vault locked");
+    this.name = "CodexCredentialDeferredError";
+  }
+}
+
+/**
  * PRD #1171 m4 (part 4): the RUN-LANE per-sink auth-mode reconcile closure — the safety facade
  * runs it BEFORE every durability boundary. Mirrors {@link CodexAdviceCredentialBridge}: it
  * captures the runId, the client (release/refresh) and the immutable binding (authMode +
@@ -788,9 +805,18 @@ export function buildRunLaneReconcile(
       );
       registerToken(res.access_token);
       return { kind: "ready" };
-    } catch {
+    } catch (err) {
       // Fail CLOSED with a bounded, secret-free reason (authMode is safe to name). The op id and
       // observed generation are DELIBERATELY left intact so a retried boundary reuses them.
+      // Issue #1766: a typed 409 vault_locked reply is still a block (the boundary poisons and
+      // throws), but it carries the deferral so the runner parks instead of failing. Only the
+      // parsed reason crosses back; the error's own text never does.
+      if (codexDeferralReason(err) === "vault_locked") {
+        const errors: readonly HarnessError[] = [
+          { category: "authorization", message: `codex ${binding.authMode} boundary reconcile deferred: vault locked` },
+        ];
+        return { kind: "blocked", errors, deferral: "vault_locked" };
+      }
       const errors: readonly HarnessError[] = [
         { category: "authorization", message: `codex ${binding.authMode} boundary reconcile failed` },
       ];
@@ -1594,6 +1620,48 @@ export class CodexExecutor implements Executor {
    *  the runner never takes the legacy killAgentTree branch for a Codex run. This class
    *  deliberately does NOT implement `killAgentTree`. */
   safety?: CodexExecutionSafety;
+  /** issue #1769: set at construction (unlike `safety`), so the runner seeds a self-contained
+   *  clone the Codex command sandbox can read without the worker bare. */
+  readonly sandboxesCommands = true;
+
+  /**
+   * Issue #1766: the harness-agnostic entry the runner uses to settle the CURRENT epoch for a
+   * credential-free capture after a vault-locked deferral. Delegates to the live facade's
+   * {@link CodexExecutionSafetyImpl.settleForCredentialFreeCapture} (serialized behind its
+   * boundary queue; it poisons and drains the registry, never reconciles or mints a permit).
+   * A facade of any other shape fails closed as `incomplete`.
+   *
+   * With no Codex safety yet (no epoch was ever handed to `this.safety`) it answers
+   * `observed_empty` ONLY when no epoch registry that could hold work is outstanding: none was
+   * ever created, or every one created was a half-built epoch whose teardown was verified
+   * clean. A registry still being built, or one whose half-built teardown failed, answers
+   * `incomplete` rather than trusting an unobserved drain.
+   */
+  async settleForCredentialFreeCapture(deadlineMs: number): Promise<CredentialFreeCaptureSettlement> {
+    const safety = this.safety;
+    if (safety === undefined) {
+      const outstanding = this.unverifiedEpochRegistries.size;
+      if (outstanding === 0) return { kind: "observed_empty" };
+      return {
+        kind: "incomplete",
+        errors: [{
+          category: "protocol",
+          message: `codex capture settle: ${outstanding} epoch registry(ies) created without a live safety facade or a clean teardown`,
+        }],
+      };
+    }
+    if (safety instanceof CodexExecutionSafetyImpl) return safety.settleForCredentialFreeCapture(deadlineMs);
+    return {
+      kind: "incomplete",
+      errors: [{ category: "protocol", message: "codex capture settle: unsupported safety facade" }],
+    };
+  }
+
+  /** Issue #1766: every epoch registry {@link startProviderEpoch} created, minus the half-built
+   *  ones whose teardown was verified clean. A registry that became a live epoch stays here, but
+   *  it is then reachable through `this.safety` (set once, never unset), so this set is consulted
+   *  only while `this.safety` is undefined. */
+  private readonly unverifiedEpochRegistries = new Set<ExecutionRegistry>();
 
   private readonly log: Logger;
   private readonly homeRoot: string;
@@ -1874,8 +1942,7 @@ export class CodexExecutor implements Executor {
       // drives `spawnBoundaryProcess`); it stays a fail-closed reject stub. The reconcile + eviction
       // closures write the SHARED released-token set and committed-generation cell, so credential
       // state is continuous across a recreation.
-      const launchEffectRoot = this.deps.launchEffectRoot ?? ((spec: CodexEffectLaunchSpec, deadlineMs?: number) =>
-        launchCodexEffectRoot(spec, deadlineMs === undefined ? {} : { deadlines: { started: deadlineMs } }));
+      const launchEffectRoot = this.deps.launchEffectRoot ?? productionEffectLaunch;
       const spawnBoundaryRoot: SpawnRootSeam =
         this.deps.spawnBoundaryRoot ??
         ((): Promise<RegisteredRoot> =>
@@ -2109,6 +2176,12 @@ export class CodexExecutor implements Executor {
         if (planResult.sessionId) lastSessionId = planResult.sessionId;
         await epoch.persistSession();
         const old = epoch;
+        // Issue #1766 (B1): this recreation runs BEFORE the first reportIteration, i.e. before
+        // the awaiting_approval -> running transition is reported. A vault-locked release here
+        // throws CodexCredentialDeferredError; do NOT report running from this site. It
+        // propagates out of run() unchanged (startProviderEpoch rethrows it unwrapped and
+        // `this.safety` is still the OLD live epoch, since it is swapped only after a
+        // successful start), and the runner does the fenced positive running report itself.
         epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, ++epochIndex);
         this.safety = epoch.safety;
         reapedSinceLastPersist = false;
@@ -2475,6 +2548,7 @@ export class CodexExecutor implements Executor {
     const ownedDataRoot = path.join(homeRoot, "codex-data", `epoch-${epochIndex}`);
     const codexHome = path.join(ownedDataRoot, "codex");
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(epochIndex));
+    this.unverifiedEpochRegistries.add(registry);
     // The safety facade is bound to THIS registry but carries the SHARED reconcile + eviction
     // closures (so credential/generation state is continuous across epochs). Only the FINAL
     // epoch's safety.dispose ever runs evictTokens (an abandoned epoch's dispose tears its
@@ -2672,7 +2746,10 @@ export class CodexExecutor implements Executor {
     } catch (error) {
       // Never leak a half-built epoch (especially a failed recreation, where run()'s `epoch` still
       // points at the PREVIOUS live epoch): best-effort tear down whatever this build produced.
-      await this.tearDownEpoch(registry, harness, fileopHandle, boundaryDeadlineMs, true).catch(() => undefined);
+      // Issue #1766: only a VERIFIED clean teardown clears the registry from the outstanding set,
+      // so a failed or rejected one leaves a later capture settle answering `incomplete`.
+      const clean = await this.tearDownEpoch(registry, harness, fileopHandle, boundaryDeadlineMs, true).catch(() => false);
+      if (clean) this.unverifiedEpochRegistries.delete(registry);
       throw error;
     }
   }
@@ -2692,7 +2769,10 @@ export class CodexExecutor implements Executor {
     fileopHandle: FileopHelperHandle | undefined,
     deadlineMs: number,
     disposeRegistry: boolean,
-  ): Promise<void> {
+  ): Promise<boolean> {
+    // Issue #1766: whether the registry teardown was observed clean: disposed and never
+    // poisoned. Callers that ignore it keep the prior best-effort behaviour.
+    let registryClean = !disposeRegistry || (registry.state() === "disposed" && !registry.isPoisoned());
     if (disposeRegistry && registry.state() !== "disposed") {
       try {
         const q = await registry.quiesceChildren(deadlineMs);
@@ -2701,13 +2781,16 @@ export class CodexExecutor implements Executor {
         /* best-effort terminal reap; the safety facade owns the poison bookkeeping */
       }
       try {
-        await registry.disposeTools(deadlineMs);
+        const disposal = await registry.disposeTools(deadlineMs);
+        registryClean = disposal.kind === "disposed" && !registry.isPoisoned();
       } catch {
         /* idempotent dispose */
+        registryClean = false;
       }
     }
     await harness?.close().catch(() => undefined);
     await fileopHandle?.dispose().catch(() => undefined);
+    return registryClean;
   }
 
   // ─── the per-turn drive (run-lane precedence, Codex-specific) ─────────────────
@@ -3108,12 +3191,21 @@ export class CodexExecutor implements Executor {
           minimumGeneration: committed.value ?? binding.generation,
         }
       : { authMode: "api_key" as const };
-    const released = await this.opts.client.releaseCodex(
-      ctx.runId,
-      { capability: binding.capability },
-      expected,
-      signal,
-    );
+    let released: Awaited<ReturnType<WorkerClient["releaseCodex"]>>;
+    try {
+      released = await this.opts.client.releaseCodex(
+        ctx.runId,
+        { capability: binding.capability },
+        expected,
+        signal,
+      );
+    } catch (err) {
+      // Issue #1766: a locked owner vault is a recoverable deferral, not a capability loss.
+      // Surface it as the typed, secret-free error the runner parks on; anything else keeps
+      // failing closed with the original error.
+      if (codexDeferralReason(err) === "vault_locked") throw new CodexCredentialDeferredError();
+      throw err;
+    }
     registerToken(released.access_token); // BEFORE any use
     return released.access_token;
   }
@@ -3842,6 +3934,33 @@ export function makeDefaultSpawnCommand(
         stderr,
       };
   };
+}
+
+/** The production effect-root launcher: the real M3a supervisor via `launchCodexEffectRoot`,
+ *  with the caller's deadline as the `started` deadline. */
+const productionEffectLaunch: EffectLaunch = (spec, deadlineMs) =>
+  launchCodexEffectRoot(spec, deadlineMs === undefined ? {} : { deadlines: { started: deadlineMs } });
+
+/**
+ * TEST SEAM (issue #1769 m3) — NOT called by production code. Builds the same boundary-process
+ * spawner {@link CodexExecutor} wires into `createCodexExecutionSafety` (`makeBoundaryProcessSpawner`,
+ * without a run command cache), so a fixture can drive a REAL boundary scope: a `command`
+ * identity request launches `commandEffectSpec(request.cwd, request.cwd, …)` (the command
+ * sandbox rooted at the request's cwd, under the supervisor), a `worker_pat` one launches the
+ * plain supervised spec, and both register as `boundary_action` roots.
+ *
+ * `launch` defaults to the production launcher (the real supervisor + command sandbox); a unit
+ * test may inject a fake. A fixture passes the result as `createCodexExecutionSafety`'s
+ * `spawnProcess`, then scopes `GitCache.withBoundaryProcessSpawner` to
+ * `(p) => safety.spawnBoundaryProcess(permit, p)` inside `safety.withBoundary(...)`, exactly as
+ * the runner does.
+ */
+export function boundaryProcessSpawnerForTest(
+  mode: CommandSandboxMode,
+  launch: EffectLaunch = productionEffectLaunch,
+  log?: Pick<Logger, "warn">,
+): SpawnBoundaryProcessSeam {
+  return makeBoundaryProcessSpawner(launch, mode, log);
 }
 
 function makeBoundaryProcessSpawner(

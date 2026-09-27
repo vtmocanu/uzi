@@ -31,6 +31,7 @@ import { ensureLive, handleInput, startNewRun } from "../engine";
 import { getRun, nextRunId, patchRun, state } from "../store";
 import { delay, mockScenario, requireSession } from "./shared";
 import { LEAD_NAME_RE, templates } from "./agents";
+import { visibleCodexAccounts, visibleTokenMeters } from "./secrets";
 
 function listRunsFor(): Run[] {
   return [...state.runs.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
@@ -522,9 +523,13 @@ export const runsApi = {
     // PRD #1653: "codex-only" removes every Anthropic secret (codexOnlySecrets), so
     // there is no Claude token to meter either; the sidebar shows Codex accounts only.
     if (mockScenario() === "codex-only") return delay({ tokens: [] }, 60);
-    return delay({ tokens: mockMyRateLimitsByUser[me.id] ?? mockMyTokenRateLimits }, 60);
+    // PRD #1732: a disabled token is omitted (an all-disabled user gets []), and a
+    // just-enabled one reads `unavailable` until its fresh reading lands.
+    return delay({ tokens: visibleTokenMeters(mockMyRateLimitsByUser[me.id] ?? mockMyTokenRateLimits, true) }, 60);
   },
-  getAdminRateLimits: async () => delay({ users: mockAdminRateLimits.map((u) => ({ ...u })) }, 60),
+  // PRD #1732 D9: the admin view shows no row and no count for a disabled credential.
+  getAdminRateLimits: async () =>
+    delay({ users: mockAdminRateLimits.map((u) => ({ ...u, tokens: visibleTokenMeters(u.tokens) })) }, 60),
   // ── Codex per-account rate limits (PRD #1209 M3) ────────────────────────────
   // The caller's own Codex meters follow the persona (a demo login as a seeded
   // non-admin reaches pending / vault-locked / polling-off / no-subscription); the
@@ -532,10 +537,17 @@ export const runsApi = {
   // login blob or provider id ever appears here.
   getMyCodexRateLimits: async () => {
     const me = requireSession();
-    return delay({ accounts: mockMyCodexRateLimitsByUser[me.id] ?? mockMyCodexRateLimits }, 60);
+    return delay({ accounts: visibleCodexAccounts(mockMyCodexRateLimitsByUser[me.id] ?? mockMyCodexRateLimits) }, 60);
   },
   getAdminCodexRateLimits: async () =>
-    delay({ users: mockAdminCodexRateLimits.map((u) => ({ ...u })) }, 60),
+    delay(
+      {
+        users: mockAdminCodexRateLimits
+          .map((u) => ({ ...u, accounts: visibleCodexAccounts(u.accounts) }))
+          .filter((u) => u.accounts.length > 0),
+      },
+      60,
+    ),
   getRun: async (id: string) => {
     const run = getRun(id);
     if (!run) throw new ApiError(404, "run not found");
@@ -922,8 +934,29 @@ export const runsApi = {
     body = "",
     selection?: AgentSelectionInput,
     overrideCapabilities?: boolean,
+    _discardPendingOutcome?: boolean,
+    expectedGateRevision?: number,
   ) => {
-    if (!getRun(id)) throw new ApiError(404, "run not found");
+    const current = getRun(id);
+    if (!current) throw new ApiError(404, "run not found");
+    // PRD #1795 D5: mirror the server's expected-revision contract. A revision on any kind
+    // other than a plan verdict is a 400; a verdict bound to a revision the run no longer
+    // shows (a different gate_revision, or no open gate at all) is the typed 409 with the
+    // run's current revision, and nothing is applied.
+    if (expectedGateRevision !== undefined) {
+      if (kind !== "approve_plan" && kind !== "reject_plan" && kind !== "revise_plan") {
+        throw new ApiError(400, "expected_gate_revision applies only to approve_plan, reject_plan and revise_plan");
+      }
+      const currentRevision = current.gate_revision ?? 0;
+      if (current.status !== "awaiting_approval" || currentRevision !== expectedGateRevision) {
+        const message = `the plan gate changed: this verdict was sent for revision ${expectedGateRevision}, the run is at revision ${currentRevision}`;
+        throw new ApiError(409, message, {
+          error: message,
+          reason: "gate_revision_mismatch",
+          current_gate_revision: currentRevision,
+        });
+      }
+    }
     // PRD #88: the engine returns the refusals the real api answers with (a 409 for an
     // answer to a question that has moved on, a 400 for a malformed body) rather than
     // resolving 200 over a no-op. A mock that swallows a refusal is how a surface ends up

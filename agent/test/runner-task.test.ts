@@ -94,7 +94,7 @@ describe("RunRunner — handoff task kind (PRD #400 M2)", () => {
     assert.equal(completed.branch, `uzi/task/${claim.run_id}`);
     assert.equal(completed.mr_iid, 42, "an --mr task opens exactly one merge request");
 
-    // Exactly one MR was opened, sourced from the task branch — never `Resolve issue #null`.
+    // Exactly one MR was opened, sourced from the task branch — never `Work on issue #null`.
     assert.equal(calls.length, 1);
     const body = JSON.parse(calls[0]!.body ?? "{}");
     assert.equal(body.source_branch, `uzi/task/${claim.run_id}`);

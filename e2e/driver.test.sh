@@ -49,6 +49,8 @@ db_psql() {
       printf '%s\n' "$1" >> "${FAKE_DB_LOG:-/dev/null}" ;;
     *"from runs order by"*)
       printf 'FAKE_DB_RUNS r1 admin running issue\n' ;;
+    *"trigger_source"*)
+      printf %s "${FAKE_DB_WHAT:-}" ;;
     *"group by status"*)
       printf 'FAKE_DB_COUNTS running issue 1\n' ;;
   esac
@@ -65,6 +67,8 @@ db_psql_rows() {
       printf '%s\n' ${FAKE_DB_IDS:-} ;;
     *"from runs order by"*)
       printf 'FAKE_DB_RUNS r1 admin running issue\n' ;;
+    *"trigger_source"*)
+      printf %s "${FAKE_DB_WHAT:-}" ;;
     *"group by status"*)
       printf 'FAKE_DB_COUNTS running issue 1\n' ;;
   esac
@@ -136,7 +140,7 @@ begin() { cur="$1"; case_fail=0
   FAKE_API_LOG="$TMP/api-$2.log"; FAKE_DB_LOG="$TMP/db-$2.log"; TSV="$RUNROOT/results.tsv"
   rm -rf "$RUNROOT" "$PHASES_DIR"; mkdir -p "$RUNROOT" "$PHASES_DIR"
   : > "$ENVFILE"; : > "$FAKE_API_LOG"; : > "$FAKE_DB_LOG"
-  unset E2E_ONLY E2E_SKIP E2E_STRICT_LEAKS E2E_FAULT_PHASE FAKE_DB_IDS FAKE_CANCEL_CODE FAKE_DOCKER_SEQ 2>/dev/null || true
+  unset E2E_ONLY E2E_SKIP E2E_STRICT_LEAKS E2E_FAULT_PHASE FAKE_DB_IDS FAKE_DB_WHAT FAKE_CANCEL_CODE FAKE_DOCKER_SEQ 2>/dev/null || true
 }
 bad() { printf '  - %s\n' "$1"; case_fail=1; }
 contains() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
@@ -282,13 +286,14 @@ end
 # LEAK; a handoff-declared id is not; a refused API cancel falls back to DB.
 # Mutation: skip the cancel/record -> no LEAK row / no cancel logged.
 begin "case6a: undeclared run leaks and is cancelled" 6a
-export FAKE_DB_IDS="r-leak" FAKE_CANCEL_CODE=200
+export FAKE_DB_IDS="r-leak" FAKE_CANCEL_CODE=200 FAKE_DB_WHAT="mr_rework via poller, status queued, age 3s"
 mkphase "$PHASES_DIR/10-leaky.sh" "leaks a run" no "" "" "" <<'BODY'
 pass "left a run behind"
 BODY
 run_driver 6a
 has_row leaky LEAK || bad "no LEAK row for leaky"
 contains "$(row_msg leaky LEAK)" r-leak || bad "LEAK message does not name r-leak"
+contains "$(row_msg leaky LEAK)" "(mr_rework via poller, status queued, age 3s)" || bad "LEAK message does not say what the leaked run is"
 contains "$(cat "$FAKE_API_LOG")" "cancel /api/runs/r-leak/inputs" || bad "cancel was not attempted via the API"
 end
 

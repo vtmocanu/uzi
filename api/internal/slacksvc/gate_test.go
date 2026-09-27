@@ -225,3 +225,12 @@ func firstButton(blocks []slack.Block, actionID string) *slack.ButtonBlockElemen
 	}
 	return nil
 }
+
+// The gate notices are user-facing copy, which carries no em dash (house style for Slack text).
+func TestGateNoticeCopyHasNoEmDash(t *testing.T) {
+	for _, s := range []string{gateSupersededText, gateNoLongerOpenText, gateRecardSupersededText} {
+		if strings.ContainsRune(s, '—') {
+			t.Errorf("gate notice %q contains an em dash", s)
+		}
+	}
+}

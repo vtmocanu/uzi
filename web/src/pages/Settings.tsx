@@ -180,7 +180,7 @@ export function Settings() {
 
       {/* Claude rate-limit meters (PRD #53). Self-gates: hidden when no token is
           set, greyed on "unavailable", live meters once a reading lands. */}
-      <RateLimitCard />
+      <RateLimitCard allDisabled={secrets.length > 0 && secrets.every((s) => s.enabled === false)} />
 
       <Card className="space-y-4">
         <div>

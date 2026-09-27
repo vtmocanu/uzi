@@ -91,6 +91,7 @@ import type {
   ScheduleInput,
   SchedulePauseDTO,
   SchedulePreviewInput,
+  SecretDependents,
   SecretMeta,
   SelfUsage,
   SessionResponse,
@@ -270,6 +271,20 @@ export function isOutcomePendingConfirmation(err: unknown): boolean {
     (err.body as { reason?: string } | null)?.reason ===
       "outcome_pending_confirmation_required"
   );
+}
+
+// gateRevisionMismatchCurrent reads the 409 a plan-gate verdict gets when it named a gate
+// revision the run no longer shows (PRD #1795 D5): the owner acted on plan revision N but the
+// run has since re-presented (or left the gate). The typed body is {error, reason:
+// "gate_revision_mismatch", current_gate_revision}. Returns the run's current revision, or
+// null when the error is anything else, so the caller branches on this one reason and
+// surfaces every other failure as before. A non-numeric current revision reads as 0 (the
+// run shows no revision) rather than null, since the reason alone already identifies it.
+export function gateRevisionMismatchCurrent(err: unknown): number | null {
+  if (!(err instanceof ApiError) || err.status !== 409) return null;
+  const body = err.body as { reason?: string; current_gate_revision?: unknown } | null;
+  if (body?.reason !== "gate_revision_mismatch") return null;
+  return typeof body.current_gate_revision === "number" ? body.current_gate_revision : 0;
 }
 
 async function request<T>(
@@ -562,6 +577,21 @@ const realApi = {
     }),
   deleteAnthropicToken: () =>
     request<null>("DELETE", "/me/secrets/anthropic_token"),
+
+  // PRD #1732 D11: disable / enable one credential of any kind. Cookie-only like the other
+  // credential writes. Disabling a slot's default while another enabled credential exists
+  // REQUIRES `newDefaultId` (409 otherwise), applied atomically with the disable; disabling
+  // the last enabled credential clears the default; enabling into a slot with no default
+  // makes it the default. Idempotent: a repeat keeps the original disabled_at.
+  setSecretEnabled: (kind: string, id: string, enabled: boolean, newDefaultId?: string) =>
+    request<{ secret: SecretMeta }>(
+      "PATCH",
+      `/me/secrets/${kind}/${id}/enabled`,
+      newDefaultId ? { enabled, new_default_id: newDefaultId } : { enabled },
+    ),
+  // What currently relies on a credential (the Disable dialog's "Uses right now" list).
+  getSecretDependents: (kind: string, id: string) =>
+    request<SecretDependents>("GET", `/me/secrets/${kind}/${id}/dependents`),
 
   // PRD #1147 M3 Codex/OpenAI credential CRUD. Body shapes mirror Anthropic exactly
   // (create {token,label,default} → {secret}; patch {label?,default?,token?} → {secret};
@@ -1160,6 +1190,12 @@ const realApi = {
     // no-live-poller cancel branch and the held outcome is discarded. Sent only when truthy
     // so an ordinary cancel body is unchanged (default false server-side).
     discardPendingOutcome?: boolean,
+    // PRD #1795 D5: the plan-gate revision the owner is acting on (the gate_revision of the
+    // run whose plan_md is on screen). Meaningful only with approve_plan / reject_plan /
+    // revise_plan (the server answers 400 on any other kind). A stale value is refused with
+    // a typed 409 (see gateRevisionMismatchCurrent) and nothing is written. Sent only when
+    // defined, so a run with no revision (a legacy or pre-gate run) keeps today's body.
+    expectedGateRevision?: number,
   ) =>
     request<{ server_side: boolean; id?: number; created_at?: string }>(
       "POST",
@@ -1173,6 +1209,7 @@ const realApi = {
         ...(selection ? { selection } : {}),
         ...(overrideCapabilities ? { override_capabilities: true } : {}),
         ...(discardPendingOutcome ? { discard_pending_outcome: true } : {}),
+        ...(expectedGateRevision !== undefined ? { expected_gate_revision: expectedGateRevision } : {}),
       },
     ),
 
@@ -1622,17 +1659,32 @@ const realApi = {
   // dismissFindings is the BULK dismiss (PRD #1183 M3): it fans one reason across up to 100
   // owned OPEN coordinates in one statement, SKIPPING non-open/foreign ids silently (so `updated`
   // can be < ids.length). It keys on `disposition_id`, NOT the evidence id — a dismissed/done
-  // coordinate always has a disposition_id even when its evidence is gone, which is why undo keys
-  // on it too (the row-level single dismiss routes here as well, so undo stays symmetric). A LOCAL
+  // coordinate always has a disposition_id even when its evidence is gone, which is why undo
+  // (undoFinding) keys on it too (the row-level single dismiss routes here as well, so undo stays
+  // symmetric). A LOCAL
   // write — no forge call, no token spend. Returns {updated, findings} with the re-read rows.
   dismissFindings: (ids: string[], reason: "wont_do" | "not_an_issue") =>
     request<{ updated: number; findings: IncidentalFinding[] }>("POST", "/findings/dismiss", { ids, reason }),
-  // undoDismissFinding reopens a dismissed coordinate (dismissed → open, PRD #1183 M3), keyed on
-  // the `disposition_id` — the same key dismissFindings acts on, so a dismiss/undo pair is
-  // symmetric. Returns the reopened coordinate so the caller can reconcile the row in place; a 404
-  // means there was nothing dismissed to undo. A LOCAL write.
-  undoDismissFinding: (dispositionId: string) =>
-    request<IncidentalFinding>("DELETE", `/findings/${dispositionId}/dismiss`),
+  // markFindingDone is the human "Mark done" on ONE coordinate (issue #1723), keyed on the EVIDENCE
+  // id (finding_id) like fileFinding, for the run-stream card that knows only its evidence id. The
+  // judge's disposition semantics: reachable from open, filed, dismissed and done; a human done
+  // carries no set_via (a sync done reads set_via "issue_close"). 404 unknown/foreign, 409 while
+  // the coordinate is being filed. Returns the disposition_id the card's Undo keys on. A LOCAL write.
+  markFindingDone: (findingId: string) =>
+    request<{ status: string; disposition_id: string }>("POST", `/findings/${findingId}/done`),
+  // markFindingsDone is the BULK Mark done (issue #1723), keyed on `disposition_id` like
+  // dismissFindings (up to 100 ids). Owner-scoped; a mid-filing, foreign or unknown id is SKIPPED
+  // silently, so `findings` holds ONLY the rows actually applied (`updated` can be < ids.length).
+  // The Findings page routes both the single-row and the multi-select Mark done here. A LOCAL write.
+  markFindingsDone: (ids: string[]) =>
+    request<{ updated: number; findings: IncidentalFinding[] }>("POST", "/findings/done", { ids }),
+  // undoFinding reverts a human verdict (done or dismissed) on one coordinate, keyed on the
+  // `disposition_id` (issue #1723). A done returns to `filed` when an issue link remains, else to
+  // `open`; a dismissal returns to `open`; an undone done never restores an earlier dismissal.
+  // Returns the updated coordinate so the caller patches the row in place; a 404 means there was
+  // no done or dismissed verdict to undo. A LOCAL write.
+  undoFinding: (dispositionId: string) =>
+    request<IncidentalFinding>("DELETE", `/findings/${dispositionId}/disposition`),
 
   // ── Chat (PRD #39) — reconciled to M1's landed wire (Phase 3) ───────────────
   // The live view (messages, WS, replay) reuses getRun/getRunMessages/

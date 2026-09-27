@@ -189,6 +189,24 @@ func TestResumeRunNowDispatchLiveDB(t *testing.T) {
 		}
 	})
 
+	t.Run("a credential_disabled hold is a 409 naming Settings (PRD #1732 D12)", func(t *testing.T) {
+		// ResumePausedRun refuses a credential_disabled hold outright (only enabling the credential
+		// resumes it), so resume.go must name that fix rather than the "no longer paused" race text.
+		// Budget is ample, so the refusal is the hold itself, not the D7 remaining-budget guard.
+		id := newHold("credential_disabled", 3600, 3*3600)
+		rec := call(id, owner)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("code = %d, want 409; body=%s", rec.Code, rec.Body.String())
+		}
+		want := "credential is disabled; enable it in Settings"
+		if msg := errBody(rec); msg != want {
+			t.Fatalf("409 message = %q, want %q", msg, want)
+		}
+		if statusOf(id) != "paused" {
+			t.Fatal("a refused resume must not move the credential_disabled hold")
+		}
+	})
+
 	// Positive control: a budget_exhausted hold WITH remaining budget resumes 200/queued, so neither
 	// 409 above is vacuous — the endpoint genuinely resumes a budget_exhausted park when it can.
 	t.Run("a budget_exhausted hold with remaining budget resumes to queued", func(t *testing.T) {

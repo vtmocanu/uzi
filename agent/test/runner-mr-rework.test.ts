@@ -103,7 +103,7 @@ describe("RunRunner — mr_rework kind (PRD #700 / issue #778)", () => {
     // openMr is true for a non-task kind, so the finalize path runs createMergeRequest.
     // The fake returns a fresh 201 (not the 409-adopt path production usually takes), so
     // this exercises the description builder directly — the exact path where a missing
-    // mr_rework arm would render `Implements issue #null` / `Closes #null`.
+    // mr_rework arm would render `Related to #null` / `Closes #null`.
     const { gitlab, calls } = fakeGitlab();
     // Empty issue_title forces mrTitle past its trimmed-title branch to the empty-title
     // fallback, so the "#null" title assertion below actually exercises the mr_rework arm

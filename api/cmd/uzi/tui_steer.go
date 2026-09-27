@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -49,6 +50,10 @@ type steerState2 struct {
 	input  string
 	// pending is the verb awaiting confirmation (cancel / reject_plan).
 	pending string
+	// pendingRevision is the plan-gate revision captured when the reject confirmation opened
+	// (PRD #1795 D5), kept through the confirm so a plan re-presented while the prompt is up
+	// cannot re-point the reject at a plan the owner has not seen. nil when the run shows none.
+	pendingRevision *int64
 	// queue is the follow-up steer queue (PRD #95), refreshed off the `input` frame.
 	queue []apitypes.SteerInputDTO
 	// notice is the last outcome or error line.
@@ -220,13 +225,13 @@ func (m tuiModel) steerKey(k string) (tuiModel, tea.Cmd, bool) {
 	case steerConfirming:
 		switch k {
 		case keyConfirmY:
-			kind := s.pending
-			s.mode, s.pending = steerIdle, ""
-			return m, m.submitSteerCmd(kind, ""), true
+			kind, rev := s.pending, s.pendingRevision
+			s.mode, s.pending, s.pendingRevision = steerIdle, "", nil
+			return m, m.submitSteerCmd(kind, "", rev), true
 		default:
 			// ANY other key cancels. A destructive verb must require the affirmative
 			// key, never merely "not the escape key".
-			s.mode, s.pending = steerIdle, ""
+			s.mode, s.pending, s.pendingRevision = steerIdle, "", nil
 			return m, nil, true
 		}
 
@@ -241,7 +246,7 @@ func (m tuiModel) steerKey(k string) (tuiModel, tea.Cmd, bool) {
 			if body == "" {
 				return m, nil, true
 			}
-			return m, m.submitSteerCmd(kindFollowUp, body), true
+			return m, m.submitSteerCmd(kindFollowUp, body, nil), true
 		case "backspace":
 			if n := len([]rune(s.input)); n > 0 {
 				s.input = string([]rune(s.input)[:n-1])
@@ -272,11 +277,11 @@ func (m tuiModel) steerKey(k string) (tuiModel, tea.Cmd, bool) {
 		return m, nil, true
 	case keyConfirmY:
 		if atPlanGate(m.detail.run) {
-			return m, m.submitSteerCmd(kindApprovePlan, ""), true
+			return m, m.submitSteerCmd(kindApprovePlan, "", gateRevisionOf(m.detail.run)), true
 		}
 	case keyConfirmN:
 		if atPlanGate(m.detail.run) {
-			s.mode, s.pending = steerConfirming, kindRejectPlan
+			s.mode, s.pending, s.pendingRevision = steerConfirming, kindRejectPlan, gateRevisionOf(m.detail.run)
 			return m, nil, true
 		}
 	}
@@ -288,6 +293,9 @@ type steerResultMsg struct {
 	kind  string
 	res   apitypes.RunInputResponse
 	err   error
+	// expected is the plan-gate revision the verdict was sent against (PRD #1795 D5), nil
+	// when none was sent, so a refusal can tell a same-revision race from a newer plan.
+	expected *int64
 }
 
 type runInputsMsg struct {
@@ -296,11 +304,23 @@ type runInputsMsg struct {
 	err    error
 }
 
-func (m tuiModel) submitSteerCmd(kind, body string) tea.Cmd {
+// gateRevisionOf is the plan-gate revision a verdict on run is bound to (PRD #1795 D5): the
+// revision the detail view is showing, or nil when the run carries none (a legacy gate).
+func gateRevisionOf(run apitypes.RunDTO) *int64 {
+	if run.GateRevision <= 0 {
+		return nil
+	}
+	rev := run.GateRevision
+	return &rev
+}
+
+// submitSteerCmd posts one steering input. expectedGateRevision is the revision captured when
+// the verdict started (`y` pressed, or the reject confirmation opened); nil for other kinds.
+func (m tuiModel) submitSteerCmd(kind, body string, expectedGateRevision *int64) tea.Cmd {
 	c, ctx, runID := m.client, m.ctx, m.detail.runID
 	return func() tea.Msg {
-		res, err := c.SubmitRunInput(ctx, runID, kind, body, nil, false)
-		return steerResultMsg{runID: runID, kind: kind, res: res, err: err}
+		res, err := c.SubmitRunInput(ctx, runID, kind, body, nil, false, expectedGateRevision)
+		return steerResultMsg{runID: runID, kind: kind, res: res, err: err, expected: expectedGateRevision}
 	}
 }
 
@@ -313,7 +333,37 @@ func (m tuiModel) fetchInputsCmd(runID string) tea.Cmd {
 	}
 }
 
+// gateMismatch reports whether a steer error is the PRD #1795 D5 typed 409, and the run's
+// current revision it carries.
+func gateMismatch(err error) (int64, bool) {
+	var ee *uzicli.ExitError
+	if errors.As(err, &ee) && ee.Reason == uzicli.ReasonGateRevisionMismatch {
+		return ee.CurrentGateRevision, true
+	}
+	return 0, false
+}
+
+// gateMismatchNotice is the notice line for a verdict refused with the typed 409 (PRD #1795
+// D5). Nothing was written; the caller re-reads the run so the view catches up. The wording
+// claims only what the numbers support: current == expected means the write lost a race at
+// the same revision (the run may still be at that gate), so it asks for a re-check and retry
+// rather than saying the plan changed; current 0 means no plan gate with a revision is shown.
+func gateMismatchNotice(expected *int64, current int64) string {
+	switch {
+	case current <= 0:
+		return "the run shows no plan gate revision to act on (nothing was applied)"
+	case expected != nil && *expected == current:
+		return fmt.Sprintf("the verdict for plan revision %d was not applied: the gate changed while it was sent; re-check the run and retry", current)
+	default:
+		return fmt.Sprintf("the run now shows plan revision %d: review it before deciding (nothing was applied)", current)
+	}
+}
+
 func (m *tuiModel) applySteerResult(msg steerResultMsg) {
+	if cur, ok := gateMismatch(msg.err); ok {
+		m.detail.steer.notice = gateMismatchNotice(msg.expected, cur)
+		return
+	}
 	if msg.err != nil {
 		m.detail.steer.notice = "could not " + steerVerbLabel(msg.kind) + ": " + fmtErr(msg.err)
 		return

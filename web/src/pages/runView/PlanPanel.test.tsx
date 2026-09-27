@@ -9,7 +9,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { PlanPanel } from "./PlanPanel";
-import { api, ApiError, type Run, type SecretMeta } from "../../lib/api";
+import { act } from "react";
+import { api, ApiError, type AgentSelectionInput, type Run, type RunMessage, type SecretMeta } from "../../lib/api";
 
 vi.mock("../../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../lib/api")>();
@@ -32,6 +33,8 @@ function token(over: Partial<SecretMeta> = {}): SecretMeta {
     kind: "anthropic_token",
     label: "console-key",
     is_default: false,
+    enabled: true,
+    disabled_at: null,
     auto_eligible: true,
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-01T00:00:00Z",
@@ -277,5 +280,337 @@ describe("PlanPanel — gate credential path (PRD #1247 M7)", () => {
     mockApi.listSecrets.mockResolvedValue({ secrets: [token()] });
     renderPanel({ harness: "claude" });
     expect(await screen.findByLabelText("Anthropic token for the implementation phase")).toBeTruthy();
+  });
+});
+
+// PRD #1795 D5: every verdict is bound to the plan-gate revision of the plan the owner is
+// looking at, frozen when the action starts, so a refetch that re-presents a newer plan while
+// the owner is mid-action cannot silently re-point the verdict at a plan they have not read.
+describe("PlanPanel — verdicts bound to the gate revision (PRD #1795 M4)", () => {
+  type Handlers = {
+    onApprove: ReturnType<typeof vi.fn<(s: AgentSelectionInput, o?: boolean, r?: number) => void>>;
+    onReject: ReturnType<typeof vi.fn<(reason: string, r?: number) => void>>;
+    onRequestChanges: ReturnType<typeof vi.fn<(feedback: string, r?: number) => void | Promise<boolean>>>;
+  };
+  function panel(
+    r: Run,
+    h: Handlers,
+    revisionMismatch: { current: number; expected?: number } | null = null,
+    messages: RunMessage[] = [],
+  ) {
+    return (
+      <PlanPanel
+        run={r}
+        messages={messages}
+        busy={false}
+        canSteer
+        onApprove={h.onApprove}
+        onReject={h.onReject}
+        onRequestChanges={h.onRequestChanges}
+        revisionMismatch={revisionMismatch}
+      />
+    );
+  }
+  function handlers(): Handlers {
+    return {
+      onApprove: vi.fn<(s: AgentSelectionInput, o?: boolean, r?: number) => void>(),
+      onReject: vi.fn<(reason: string, r?: number) => void>(),
+      onRequestChanges: vi.fn<(feedback: string, r?: number) => void | Promise<boolean>>(),
+    };
+  }
+  function msg(seq: number, kind: string, payload: unknown): RunMessage {
+    return { seq, kind, agent: "lead", agent_instance: null, agent_label: null, payload, created_at: "2026-09-27T00:00:00Z" };
+  }
+
+  it("approve sends the displayed revision", async () => {
+    const h = handlers();
+    render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+    fireEvent.click(screen.getByRole("button", { name: /Approve plan/ }));
+    await waitFor(() => expect(h.onApprove).toHaveBeenCalledTimes(1));
+    expect(h.onApprove).toHaveBeenCalledWith({ source: "own", exclusions: [] }, undefined, 2);
+  });
+
+  it("the capability-override approve sends the displayed revision too", async () => {
+    const h = handlers();
+    render(panel(run({ gate_revision: 5, required_capabilities: ["docker"], worker_id: null }), h));
+    fireEvent.click(screen.getByRole("button", { name: /Run without docker/ }));
+    await waitFor(() => expect(h.onApprove).toHaveBeenCalledTimes(1));
+    expect(h.onApprove).toHaveBeenCalledWith({ source: "own", exclusions: [] }, true, 5);
+  });
+
+  // Behavioural, not a pin of one line: doApprove closes over the render that was clicked, so
+  // the value it sends is the clicked render's revision whether or not it is copied into a
+  // local first. This guards a refactor that reads a latest-run ref after the await.
+  it("approve binds the revision shown at the click even when a refetch lands during the credential await", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [token()] });
+    let resolveSet: (v: { run: Run }) => void = () => {};
+    mockApi.setRunCredential.mockReturnValue(
+      new Promise<{ run: Run }>((res) => {
+        resolveSet = res;
+      }),
+    );
+    const h = handlers();
+    const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+    const select = screen.getByLabelText("Anthropic token for the implementation phase") as HTMLSelectElement;
+    const opt = (await within(select).findByRole("option", { name: /console-key/ })) as HTMLOptionElement;
+    fireEvent.change(select, { target: { value: opt.value } });
+
+    fireEvent.click(screen.getByRole("button", { name: /Approve plan/ }));
+    // A refetch lands mid-await with a re-presented plan.
+    rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h));
+    resolveSet({ run: run() });
+
+    await waitFor(() => expect(h.onApprove).toHaveBeenCalledTimes(1));
+    expect(h.onApprove.mock.calls[0][2]).toBe(2);
+  });
+
+  it("the reject composer freezes the revision it was opened on through a refetch", async () => {
+    const h = handlers();
+    const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+
+    // While the owner types, a refetch re-presents revision 3.
+    rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h));
+    expect(screen.getByText("plan three")).toBeTruthy();
+    fireEvent.change(screen.getByPlaceholderText(/sent back to the agent/), { target: { value: "no" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+
+    expect(h.onReject).toHaveBeenCalledWith("no", 2);
+  });
+
+  it("the request-changes composer freezes the revision it was opened on through a refetch", async () => {
+    const h = handlers();
+    const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+    fireEvent.click(screen.getByRole("button", { name: "Request changes" }));
+
+    rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h));
+    fireEvent.change(screen.getByPlaceholderText(/sent to the planning session/), {
+      target: { value: "split M2" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Send & revise/ }));
+
+    expect(h.onRequestChanges).toHaveBeenCalledWith("split M2", 2);
+  });
+
+  it("cancelling a composer releases the freeze: the next action binds to the displayed revision", async () => {
+    const h = handlers();
+    const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+    expect(h.onReject).toHaveBeenCalledWith("", 3);
+  });
+
+  // PRD #1795 B6: a refusal never re-points an open composer. The caller's refetch is bounded and
+  // may not land (or may show a revision other than the one the 409 reported), so the retry still
+  // names the revision the composer was opened on and is refused again, instead of being applied to
+  // a plan the owner has not seen. Re-binding is explicit, to the DISPLAYED plan (below).
+  const RESTART = /Decide on the displayed plan/;
+  const composers = [
+    {
+      name: "reject",
+      open: "Reject",
+      box: /sent back to the agent/,
+      send: "Send rejection",
+      calls: (h: Handlers) => h.onReject,
+    },
+    {
+      name: "request-changes",
+      open: "Request changes",
+      box: /sent to the planning session/,
+      send: /Send & revise/,
+      calls: (h: Handlers) => h.onRequestChanges,
+    },
+  ] as const;
+
+  for (const c of composers) {
+    it(`a mismatch keeps the open ${c.name} composer frozen, with the notice, before and after the refetch`, async () => {
+      const h = handlers();
+      const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+      fireEvent.click(screen.getByRole("button", { name: c.open }));
+      fireEvent.change(screen.getByPlaceholderText(c.box), { target: { value: "draft" } });
+      fireEvent.click(screen.getByRole("button", { name: c.send }));
+      expect(c.calls(h)).toHaveBeenLastCalledWith("draft", 2);
+
+      // The refusal arrives (current 3) but the refetch has not landed: plan two is still shown.
+      rerender(panel(run({ gate_revision: 2, plan_md: "plan two" }), h, { current: 3, expected: 2 }));
+      expect(
+        screen.getByText("Your decision was not applied: the run now shows plan revision 3. Review it and decide again."),
+      ).toBeTruthy();
+      // Nothing to re-bind to yet: the plan shown is the one the composer is frozen on.
+      expect(screen.queryByRole("button", { name: RESTART })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: c.send }));
+      expect(c.calls(h)).toHaveBeenLastCalledWith("draft", 2);
+
+      // The refetch lands with plan three: the retry is still bound to 2 (refused again server-side).
+      rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h, { current: 3, expected: 2 }));
+      expect(screen.getByText("plan three")).toBeTruthy();
+      const send = screen.getByRole("button", { name: c.send }) as HTMLButtonElement;
+      expect(send.disabled).toBe(false);
+      fireEvent.click(send);
+      expect(c.calls(h)).toHaveBeenLastCalledWith("draft", 2);
+      expect(c.calls(h)).toHaveBeenCalledTimes(3);
+    });
+
+    it(`the ${c.name} composer offers the restart only once a newer plan is displayed, and it binds to it`, async () => {
+      const h = handlers();
+      const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+      fireEvent.click(screen.getByRole("button", { name: c.open }));
+      expect(screen.queryByRole("button", { name: RESTART })).toBeNull();
+      fireEvent.change(screen.getByPlaceholderText(c.box), { target: { value: "keep this" } });
+
+      rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h, { current: 3, expected: 2 }));
+      const restart = screen.getByRole("button", { name: "Decide on the displayed plan (revision 3)" });
+      expect(screen.getByText(/This draft is for plan revision 2; the plan shown is revision 3/)).toBeTruthy();
+      fireEvent.click(restart);
+
+      // Re-bound: the offer is gone and the draft survives.
+      expect(screen.queryByRole("button", { name: RESTART })).toBeNull();
+      expect((screen.getByPlaceholderText(c.box) as HTMLTextAreaElement).value).toBe("keep this");
+      fireEvent.click(screen.getByRole("button", { name: c.send }));
+      expect(c.calls(h)).toHaveBeenLastCalledWith("keep this", 3);
+    });
+
+    // N+2: the 409 reported 3 but the refetch already shows 4. The restart binds to what is on
+    // screen (4), never to the reported revision (3), which the owner never saw.
+    it(`the ${c.name} restart binds to the displayed revision, not the one the 409 reported`, async () => {
+      const h = handlers();
+      const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+      fireEvent.click(screen.getByRole("button", { name: c.open }));
+      fireEvent.change(screen.getByPlaceholderText(c.box), { target: { value: "n+2" } });
+      fireEvent.click(screen.getByRole("button", { name: c.send }));
+
+      rerender(panel(run({ gate_revision: 4, plan_md: "plan four" }), h, { current: 3, expected: 2 }));
+      expect(screen.queryByRole("button", { name: "Decide on the displayed plan (revision 3)" })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Decide on the displayed plan (revision 4)" }));
+      expect((screen.getByPlaceholderText(c.box) as HTMLTextAreaElement).value).toBe("n+2");
+      fireEvent.click(screen.getByRole("button", { name: c.send }));
+      expect(c.calls(h)).toHaveBeenLastCalledWith("n+2", 4);
+    });
+  }
+
+  // With no composer open at the refusal, the next composer opens on the plan displayed at that
+  // moment (nothing carries the refused or reported revision forward).
+  it("after a mismatch with no composer open, the next composer binds to the displayed revision", async () => {
+    const h = handlers();
+    const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h, { current: 3, expected: 2 }));
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    expect(screen.queryByRole("button", { name: RESTART })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+    expect(h.onReject).toHaveBeenLastCalledWith("", 3);
+  });
+
+  it("a same-revision refusal asks for a retry and does not claim the plan changed", async () => {
+    const h = handlers();
+    render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h, { current: 2, expected: 2 }));
+    const notice = screen.getByText(/Your decision on plan revision 2 was not applied/);
+    expect(notice.textContent).toMatch(/Check the plan and try again/);
+    expect(notice.textContent).not.toMatch(/plan changed|now shows|no longer waiting/);
+  });
+
+  it("a refusal at revision 0 names no revision", async () => {
+    const h = handlers();
+    render(panel(run({ plan_md: "legacy" }), h, { current: 0, expected: 4 }));
+    const notice = screen.getByText(/Your decision was not applied because the plan gate changed/);
+    expect(notice.textContent).not.toMatch(/revision 0/);
+  });
+
+  // Blocking regression (#1795 M4 review): the composer used to survive the revising state and
+  // reopen on plan N+1 still frozen at N, so every second revise round was refused with a 409.
+  it("a second request-changes round binds the new revision (revising resets the composer)", async () => {
+    const h = handlers();
+    const plan2 = [msg(1, "plan", { plan_md: "plan two" })];
+    const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h, null, plan2));
+    fireEvent.click(screen.getByRole("button", { name: "Request changes" }));
+    fireEvent.change(screen.getByPlaceholderText(/sent to the planning session/), { target: { value: "split M2" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send & revise/ }));
+    expect(h.onRequestChanges).toHaveBeenLastCalledWith("split M2", 2);
+
+    // The run stays awaiting_approval while the planner revises: the panel stays mounted.
+    const revising = [...plan2, msg(2, "plan_feedback", { feedback: "split M2" }), msg(3, "plan_revising", {})];
+    rerender(panel(run({ gate_revision: 2, plan_md: "plan two" }), h, null, revising));
+    expect(screen.getByText("Revising the plan")).toBeTruthy();
+
+    // Plan three arrives at gate revision 3.
+    const plan3 = [...revising, msg(4, "plan", { plan_md: "plan three" })];
+    rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h, null, plan3));
+    // The old composer is gone: the header actions are back and the feedback box is not open.
+    expect(screen.queryByPlaceholderText(/sent to the planning session/)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Request changes" }));
+    const box = screen.getByPlaceholderText(/sent to the planning session/) as HTMLTextAreaElement;
+    expect(box.value).toBe("");
+    fireEvent.change(box, { target: { value: "tighten M3" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send & revise/ }));
+    expect(h.onRequestChanges).toHaveBeenLastCalledWith("tighten M3", 3);
+  });
+
+  // Blocking regression (#1795 round-2 review): the revising reset belongs to the request-changes
+  // composer only. An open REJECT composer keeps the revision it was opened on through a revising
+  // round, so a rejection typed against plan N is refused (409) rather than applied to plan N+1.
+  it("an open reject composer keeps its frozen revision through a revising round", async () => {
+    const h = handlers();
+    const plan2 = [msg(1, "plan", { plan_md: "plan two" })];
+    const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h, null, plan2));
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+
+    const revising = [...plan2, msg(2, "plan_feedback", { feedback: "split M2" }), msg(3, "plan_revising", {})];
+    rerender(panel(run({ gate_revision: 2, plan_md: "plan two" }), h, null, revising));
+    expect(screen.getByText("Revising the plan")).toBeTruthy();
+
+    const plan3 = [...revising, msg(4, "plan", { plan_md: "plan three" })];
+    rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h, null, plan3));
+    fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+    expect(h.onReject).toHaveBeenCalledWith("", 2);
+  });
+
+  // The same reset fires on a send the caller reports accepted, for a feed that never delivers
+  // the plan_revising frame (a dropped frame; the next plan arrives by refetch).
+  it("an accepted revise closes the composer even without a plan_revising frame", async () => {
+    const h = handlers();
+    h.onRequestChanges.mockResolvedValue(true);
+    const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+    fireEvent.click(screen.getByRole("button", { name: "Request changes" }));
+    fireEvent.change(screen.getByPlaceholderText(/sent to the planning session/), { target: { value: "split M2" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Send & revise/ }));
+    });
+    expect(screen.queryByPlaceholderText(/sent to the planning session/)).toBeNull();
+
+    rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h));
+    fireEvent.click(screen.getByRole("button", { name: "Request changes" }));
+    fireEvent.change(screen.getByPlaceholderText(/sent to the planning session/), { target: { value: "again" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send & revise/ }));
+    expect(h.onRequestChanges).toHaveBeenLastCalledWith("again", 3);
+  });
+
+  it("a refused revise keeps the composer open with the owner's text", async () => {
+    const h = handlers();
+    h.onRequestChanges.mockResolvedValue(false);
+    render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+    fireEvent.click(screen.getByRole("button", { name: "Request changes" }));
+    fireEvent.change(screen.getByPlaceholderText(/sent to the planning session/), { target: { value: "split M2" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Send & revise/ }));
+    });
+    const box = screen.getByPlaceholderText(/sent to the planning session/) as HTMLTextAreaElement;
+    expect(box.value).toBe("split M2");
+  });
+
+  it("a run without a gate revision keeps the legacy arg counts (no revision sent)", async () => {
+    const h = handlers();
+    render(panel(run({ plan_md: "legacy" }), h));
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+    expect(h.onReject).toHaveBeenCalledTimes(1);
+    expect(h.onReject.mock.calls[0]).toHaveLength(1);
+    // No notice without a refusal (paired with the positive notice case above).
+    expect(screen.queryByText(/was not applied/)).toBeNull();
   });
 });

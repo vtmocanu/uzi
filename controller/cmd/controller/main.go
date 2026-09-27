@@ -106,6 +106,9 @@ func main() {
 		APICAPEM:       cfg.APICAPEM,
 		// Where the join-token Secret mounts (issue #1761); empty keeps /run/secrets.
 		SecretMountPath: cfg.WorkerSecretMountPath,
+		// The docker worker's gated DinD prune (issue #1759) rides the disk self-heal
+		// toggle: one knob governs every automatic reclaim.
+		DinDPruneEnabled: cfg.WorkerDiskRecycleEnabled,
 	}
 	// The apiclient doubles as the cordon-write channel (PRD #422 M4): its RequestDrain
 	// satisfies kube.Cordoner, so a busy drifted worker is cordoned and drained rather

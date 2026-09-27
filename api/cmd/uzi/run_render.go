@@ -123,6 +123,10 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if line := codexAccountActionLine(r); line != "" {
 		rows = append(rows, []string{"CODEX_ACCOUNT", line})
 	}
+	// VAULT (issue #1766): a vault_locked park, emit-only-when-parked, with its next retry.
+	if line := vaultParkLine(r); line != "" {
+		rows = append(rows, []string{"VAULT", line})
+	}
 	if r.HealthReason != nil && *r.HealthReason != "" {
 		rows = append(rows, []string{"HEALTH_REASON", sanitizeTTY(*r.HealthReason)})
 	}
@@ -431,6 +435,8 @@ func completionRows(r apitypes.RunDTO) [][]string {
 //   - budget_exhausted (a wall park): "time limit reached · parked HH:MM (dur) · C/N milestones ·
 //     extend: uzi run extend <id> --by 2h"
 //   - completion_blocked (the PRD #1226 hold): "completion blocked · parked HH:MM (dur) · C/N milestones"
+//   - credential_disabled (PRD #1732 D14): "credential disabled · parked HH:MM (dur) · C/N milestones ·
+//     enable it in Settings[, or switch token: uzi run set-token <id> <label>]"
 //
 // The milestone clause is dropped when the run carries no frozen milestones (a prompt-kind park),
 // and the extend clause rides ONLY the wall park (a completion hold resumes through its own
@@ -448,8 +454,11 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 	if done, total, _ := milestoneProgress(r); total > 0 {
 		clauses = append(clauses, fmt.Sprintf("%d/%d milestones", done, total))
 	}
-	if *r.HoldReason == holdBudgetExhausted {
+	switch *r.HoldReason {
+	case holdBudgetExhausted:
 		clauses = append(clauses, "extend: uzi run extend "+r.ID+" --by 2h")
+	case holdCredentialDisabled:
+		clauses = append(clauses, credentialDisabledAction(r))
 	}
 	return []string{"HOLD", strings.Join(clauses, " · ")}
 }
@@ -464,9 +473,77 @@ func holdReasonLabel(reason string) string {
 		return "time limit reached"
 	case holdCompletionBlocked:
 		return "completion blocked"
+	case holdCredentialDisabled:
+		return "credential disabled"
 	default:
 		return sanitizeTTY(reason)
 	}
+}
+
+// isCredentialDisabledHold reports whether r is parked because a credential it needs is
+// disabled (PRD #1732 D14: status paused, hold_reason credential_disabled).
+func isCredentialDisabledHold(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdCredentialDisabled
+}
+
+// credentialSwitchableLane reports whether the CLI offers a per-run token switch (`uzi run
+// set-token`) for r, the D16 rule the web's isCredentialSwitchRefusedLane applies: never a
+// Codex run (the override is Anthropic-only), a task review, a chat, the Judge or
+// self-improve. The server refuses Codex, chat, Judge and self-improve runs; it does accept
+// a switch on a task review, but neither the CLI nor the web offers one there, so a held
+// review is pointed at Settings only.
+func credentialSwitchableLane(r apitypes.RunDTO) bool {
+	if r.Harness == "codex" || r.TriggerSource == "task_review" {
+		return false
+	}
+	switch r.Kind {
+	case "chat", "judge", "self_improve":
+		return false
+	}
+	return true
+}
+
+// credentialDisabledAction is the owner's next step for a credential_disabled hold (PRD #1732
+// D12/D16). Enabling stays web-only (D12), so it always names Settings; the set-token switch
+// is appended only where the lane supports a per-run override.
+func credentialDisabledAction(r apitypes.RunDTO) string {
+	action := "enable it in Settings"
+	if credentialSwitchableLane(r) {
+		// cellText: r.ID is server text headed for a terminal (stderr notices, table cells).
+		action += ", or switch token: uzi run set-token " + cellText(r.ID) + " <label>"
+	}
+	return action
+}
+
+// pausedHoldNotice names a paused run's hold and the owner's next step, for the one-line
+// notices `run logs --follow` and `run wait` print when a run moves from the
+// credential_disabled hold straight into another pause. The credential_disabled promoter
+// does that (PRD #1732 D14): a held run with a pending owner pause settles into that pause
+// (hold_reason null), and one whose wall budget is spent into budget_exhausted, so "resumed"
+// would be false there.
+func pausedHoldNotice(r apitypes.RunDTO) string {
+	id := cellText(r.ID)
+	switch reason := strOr(r.HoldReason, ""); reason {
+	case "":
+		return "paused by its owner; resume with uzi run resume " + id
+	case holdBudgetExhausted:
+		return "parked at its time limit; extend: uzi run extend " + id + " --by 2h"
+	case holdCredentialDisabled:
+		return "held, a credential it needs is disabled; " + credentialDisabledAction(r)
+	default:
+		return "paused (" + holdReasonLabel(reason) + ")"
+	}
+}
+
+// credentialDisabledLine is the one-line held-run sentence the TUI detail and `run logs
+// --follow` print for a credential_disabled hold, or "" for any other run. It names no label:
+// which credential the run waits on depends on server-side resolution the DTO does not carry
+// (the run's CREDENTIAL row already names its Codex alias).
+func credentialDisabledLine(r apitypes.RunDTO) string {
+	if !isCredentialDisabledHold(r) {
+		return ""
+	}
+	return "waiting: credential disabled · " + credentialDisabledAction(r)
 }
 
 // holdParkedClause renders "parked HH:MM (dur)" from the instant the run entered its current
@@ -1485,7 +1562,8 @@ func steerKindLabel(kind string) string {
 // PRD #1392 M5: recoveryCause is the optional RecoveryWaitCause of a recovery_wait run — a
 // variadic tail so the ~two dozen existing call sites that do not have it stay valid. When
 // it is "forge_unreachable" the recovery suffix names the forge instead of the transient
-// empty turn; "codex_account_unavailable" (PRD #1590) names the Codex account.
+// empty turn; "codex_account_unavailable" (PRD #1590) names the Codex account, and
+// "vault_locked" (issue #1766) names the vault unlock the run is waiting for.
 func steerState(kind string, consumedAt *time.Time, disposition *string, runStatus string, recoveryCause ...string) string {
 	// PRD #634: a scope directive's state IS its disposition — it is never consumed, so
 	// consumed_at/runStatus carry no delivery signal for it. A nil disposition means the
@@ -1526,6 +1604,12 @@ func steerState(kind string, consumedAt *time.Time, disposition *string, runStat
 	// interruption; the action detail lives on the run-get row and the TUI detail line.
 	if len(recoveryCause) > 0 && recoveryCause[0] == codexAccountUnavailableCause {
 		recoveringSuffix = " (run held on its Codex account)"
+	}
+	// Issue #1766: a run parked because a Codex credential refresh or release found its
+	// owner's vault locked waits for the vault unlock (the words vaultParkLine and the web
+	// run page's "Waiting for vault unlock" heading use).
+	if len(recoveryCause) > 0 && recoveryCause[0] == vaultLockedCause {
+		recoveringSuffix = " (run waiting for vault unlock)"
 	}
 	if consumedAt == nil {
 		if terminalRunStatuses[runStatus] {
@@ -1579,6 +1663,67 @@ const forgeUnreachableCause = "forge_unreachable"
 // unreachable (PRD #1392 M5) — the one cause that swaps in forge-specific surface wording.
 func isForgePark(r apitypes.RunDTO) bool {
 	return r.Status == statusRecoveryWait && strOr(r.RecoveryWaitCause, "") == forgeUnreachableCause
+}
+
+// vaultLockedCause is the RecoveryWaitCause of a run parked because a Codex credential
+// refresh or release found its owner's vault locked (issue #1766). It resumes at its next
+// timer-based retry (RecoveryRetryNotBefore) once the vault is unlocked (while it stays
+// locked, a promoted run waits queued), so no surface promises an instant resume on unlock.
+const vaultLockedCause = "vault_locked"
+
+// isVaultLockedPark reports whether a recovery_wait run is parked on a locked vault (issue #1766).
+func isVaultLockedPark(r apitypes.RunDTO) bool {
+	return r.Status == statusRecoveryWait && strOr(r.RecoveryWaitCause, "") == vaultLockedCause
+}
+
+// vaultParkLine is the vault_locked park sentence (issue #1766) `uzi run get`'s VAULT row and
+// the `run logs --follow` notice share, "" for any other run. It is OWNER-NEUTRAL ("the run
+// owner's vault"), like codexAccountActionLine's "the run's": an admin reading another owner's
+// run sees the same words, and the CLI does not tell the reader to unlock anything. The retry
+// clause is HH:MM on the viewer's local wall clock, like forgeParkLine, and is dropped when
+// the server sent no retry stamp.
+func vaultParkLine(r apitypes.RunDTO) string {
+	if !isVaultLockedPark(r) {
+		return ""
+	}
+	return vaultParkLead + ": the run owner's vault was locked when this Codex run needed its credential; once the vault is unlocked it resumes at " + vaultRetryClause(r)
+}
+
+// vaultParkLead is the load-bearing opening every vault park rendering starts with.
+const vaultParkLead = "waiting for vault unlock"
+
+// vaultRetryClause is "its next retry (HH:MM)", or "its next retry" with no retry stamp.
+func vaultRetryClause(r apitypes.RunDTO) string {
+	if r.RecoveryRetryNotBefore == nil {
+		return "its next retry"
+	}
+	return "its next retry (" + r.RecoveryRetryNotBefore.Local().Format("15:04") + ")"
+}
+
+// fitVaultParkLine is vaultParkLine shed to fit a physical width, for the TUI's one-row slots
+// (the board's selected second line and the run detail line). The full sentence ends in the
+// retry time, so clamping it from the right would cut exactly the HH:MM; instead the
+// explanation sheds first: full sentence, then "waiting for vault unlock: once unlocked it
+// resumes at its next retry (HH:MM)", then the floor "waiting for vault unlock · retry HH:MM"
+// (just the lead without a retry stamp). The floor is never cut here, even when it alone
+// overflows; the caller's clampVisual handles that pathological narrow case. "" for any run
+// that is not a vault_locked park.
+func fitVaultParkLine(r apitypes.RunDTO, width int) string {
+	full := vaultParkLine(r)
+	if full == "" {
+		return ""
+	}
+	floor := vaultParkLead
+	if r.RecoveryRetryNotBefore != nil {
+		floor += " · retry " + r.RecoveryRetryNotBefore.Local().Format("15:04")
+	}
+	short := vaultParkLead + ": once unlocked it resumes at " + vaultRetryClause(r)
+	for _, cand := range []string{full, short} {
+		if visualWidth(cand) <= width {
+			return cand
+		}
+	}
+	return floor
 }
 
 // codexAccountUnavailableCause is the RecoveryWaitCause of a run held on its Codex
@@ -1660,10 +1805,18 @@ func codexAccountActionShort(r apitypes.RunDTO) string {
 // runStatusCell is the STATUS cell of the run tables (`uzi run list`, `uzi admin runs`):
 // displayRunStatus, plus the short Codex account action in parentheses for a run held on its
 // Codex account (PRD #1590), so the list says what the held run needs without a `run get`.
+// Issue #1766: a vault_locked park adds "(waiting for vault unlock)" the same way.
+// A run held on credential_disabled (PRD #1732 D14) gets "(credential disabled)" likewise.
 func runStatusCell(r apitypes.RunListItemDTO) string {
 	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState)
 	if short := codexAccountActionShort(r.RunDTO); short != "" {
 		s += " (" + short + ")"
+	} else if isVaultLockedPark(r.RunDTO) {
+		s += " (waiting for vault unlock)"
+	}
+	if isCredentialDisabledHold(r.RunDTO) {
+		// PRD #1732 D14: say why the run is paused, so it does not read as an owner pause.
+		s += " (credential disabled)"
 	}
 	return s
 }

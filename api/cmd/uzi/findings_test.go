@@ -18,7 +18,7 @@ import (
 // than referencing the constants; this file is where the two sides are pinned to each other.
 
 // findingsFake builds a FakeClient with a two-repo backlog: one repo carrying a coordinate seen
-// in two runs plus a display-only coordinate whose evidence cascaded away (nil finding_id), and
+// in two runs plus an evidence-less coordinate (evidence cascaded away) (nil finding_id), and
 // a second repo with one coordinate. open_count is deliberately not derivable from these rows —
 // it is the server's CountOpenFindingsForUser aggregate, so a CLI that recomputed it from the
 // screen would print a different number.
@@ -503,9 +503,12 @@ func TestFindingsStatsRepoForwarded(t *testing.T) {
 	}
 }
 
-// `findings undo <id>` forwards the disposition id and reports the reopen.
+// `findings undo <id>` forwards the disposition id and reports where the coordinate landed, read
+// from the server's reply (open after a dismissal or a plain done, filed after a done that kept
+// its issue link) rather than assumed.
 func TestFindingsUndoSuccess(t *testing.T) {
 	fc := findingsFake()
+	fc.UndoFindingResult = apitypes.IncidentalFindingDTO{Status: "open"}
 	out, _, code := runCLI(t, fakeEnv(fc), "findings", "undo", "disp-1")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
@@ -513,17 +516,27 @@ func TestFindingsUndoSuccess(t *testing.T) {
 	if fc.LastUndoFindingID != "disp-1" {
 		t.Errorf("undo forwarded id %q, want disp-1", fc.LastUndoFindingID)
 	}
-	if !strings.Contains(out, "reopened") {
+	if !strings.Contains(out, "undone (now open)") {
 		t.Errorf("undo output missing the outcome:\n%s", out)
+	}
+
+	fc2 := findingsFake()
+	fc2.UndoFindingResult = apitypes.IncidentalFindingDTO{Status: "filed"}
+	out2, _, code2 := runCLI(t, fakeEnv(fc2), "findings", "undo", "disp-2")
+	if code2 != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code2)
+	}
+	if !strings.Contains(out2, "undone (now filed)") {
+		t.Errorf("undoing a done that kept its issue must report filed:\n%s", out2)
 	}
 }
 
-// undo softens the not-dismissed sentinel (the endpoint's 404 for a non-dismissed/foreign id) to
-// a friendly line + exit 0 — treated as already-undone, never a crash. The write is still REACHED
-// with the right id before the softening.
+// undo softens the nothing-to-undo sentinel (the endpoint's 404 for a foreign id or one that is
+// neither dismissed nor done) to a friendly line + exit 0 — treated as already-undone, never a
+// crash. The write is still REACHED with the right id before the softening.
 func TestFindingsUndoAlreadyUndoneExit0(t *testing.T) {
 	fc := findingsFake()
-	fc.UndoDismissFindingErr = uzicli.ErrFindingNotDismissed
+	fc.UndoFindingErr = uzicli.ErrFindingNothingToUndo
 	out, _, code := runCLI(t, fakeEnv(fc), "findings", "undo", "disp-1")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0 (already undone)", code)
@@ -531,7 +544,7 @@ func TestFindingsUndoAlreadyUndoneExit0(t *testing.T) {
 	if fc.LastUndoFindingID != "disp-1" {
 		t.Errorf("the undo call was never reached (id=%q)", fc.LastUndoFindingID)
 	}
-	if !strings.Contains(out, "no dismissal to undo") {
+	if !strings.Contains(out, "nothing to undo") {
 		t.Errorf("want a friendly already-undone line, got:\n%s", out)
 	}
 }
@@ -540,7 +553,7 @@ func TestFindingsUndoAlreadyUndoneExit0(t *testing.T) {
 // invalid CLI token) keeps its exit code rather than being swallowed as already-undone.
 func TestFindingsUndoHardErrorPropagates(t *testing.T) {
 	fc := findingsFake()
-	fc.UndoDismissFindingErr = uzicli.Exitf(uzicli.ExitAuth, "invalid CLI token")
+	fc.UndoFindingErr = uzicli.Exitf(uzicli.ExitAuth, "invalid CLI token")
 	_, _, code := runCLI(t, fakeEnv(fc), "findings", "undo", "disp-1")
 	if code != uzicli.ExitAuth {
 		t.Fatalf("exit = %d, want %d (auth)", code, uzicli.ExitAuth)
@@ -551,25 +564,122 @@ func TestFindingsUndoHardErrorPropagates(t *testing.T) {
 }
 
 // undo --json emits a small envelope on both the success and the softened-sentinel paths, so a
-// --json consumer can tell reopened (undone:true) from already-undone (undone:false) without
-// parsing a human line.
+// --json consumer can tell undone (undone:true, with the landing status) from already-undone
+// (undone:false) without parsing a human line.
 func TestFindingsUndoJSON(t *testing.T) {
 	fc := findingsFake()
+	fc.UndoFindingResult = apitypes.IncidentalFindingDTO{Status: "filed"}
 	out, _, code := runCLI(t, fakeEnv(fc), "findings", "undo", "disp-1", "--json")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
-	if !strings.Contains(out, `"undone": true`) {
-		t.Errorf("undo --json success must carry undone:true:\n%s", out)
+	if !strings.Contains(out, `"undone": true`) || !strings.Contains(out, `"status": "filed"`) {
+		t.Errorf("undo --json success must carry undone:true and the landing status:\n%s", out)
 	}
 
 	fc2 := findingsFake()
-	fc2.UndoDismissFindingErr = uzicli.ErrFindingNotDismissed
+	fc2.UndoFindingErr = uzicli.ErrFindingNothingToUndo
 	out2, _, code2 := runCLI(t, fakeEnv(fc2), "findings", "undo", "disp-1", "--json")
 	if code2 != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0 (already undone)", code2)
 	}
 	if !strings.Contains(out2, `"undone": false`) {
 		t.Errorf("undo --json already-undone must carry undone:false:\n%s", out2)
+	}
+}
+
+// `findings resolve <finding-id>` forwards the EVIDENCE id and prints the disposition id the
+// server returned inside the exact undo command, since undo keys on that id, not the one typed.
+func TestFindingsResolveSuccess(t *testing.T) {
+	fc := findingsFake()
+	fc.MarkFindingDoneResult = apitypes.MarkFindingDoneResultDTO{Status: dispStatusDone, DispositionID: "disp-9"}
+	out, _, code := runCLI(t, fakeEnv(fc), "findings", "resolve", "f-aaaa")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastMarkDoneFindingID != "f-aaaa" {
+		t.Errorf("resolve forwarded id %q, want f-aaaa", fc.LastMarkDoneFindingID)
+	}
+	if !strings.Contains(out, "finding f-aaaa: resolved (done)") || !strings.Contains(out, "uzi findings undo disp-9") {
+		t.Errorf("resolve output missing the outcome or the undo hint:\n%s", out)
+	}
+}
+
+// resolve --json emits {finding, status, disposition_id}, the same small-envelope shape as dismiss.
+func TestFindingsResolveJSON(t *testing.T) {
+	fc := findingsFake()
+	fc.MarkFindingDoneResult = apitypes.MarkFindingDoneResultDTO{Status: dispStatusDone, DispositionID: "disp-9"}
+	out, _, code := runCLI(t, fakeEnv(fc), "findings", "resolve", "f-aaaa", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("resolve --json is not JSON: %v\n%s", err, out)
+	}
+	if got["finding"] != "f-aaaa" || got["status"] != dispStatusDone || got["disposition_id"] != "disp-9" {
+		t.Errorf("resolve --json = %v, want finding f-aaaa, status done, disposition_id disp-9", got)
+	}
+}
+
+// A 404 on resolve (unknown/foreign id) is exit 4; a 409 (being filed) is exit 5. The write is
+// reached with the right id in both cases.
+func TestFindingsResolveNotFoundAndConflict(t *testing.T) {
+	fc := findingsFake()
+	fc.MarkFindingDoneErr = uzicli.Exitf(uzicli.ExitNotFound, "finding not found")
+	if _, _, code := runCLI(t, fakeEnv(fc), "findings", "resolve", "nope"); code != uzicli.ExitNotFound {
+		t.Fatalf("resolve 404: exit = %d, want %d", code, uzicli.ExitNotFound)
+	}
+	if fc.LastMarkDoneFindingID != "nope" {
+		t.Errorf("the resolve call was never reached (id=%q)", fc.LastMarkDoneFindingID)
+	}
+	fc2 := findingsFake()
+	fc2.MarkFindingDoneErr = uzicli.Exitf(uzicli.ExitConflict, "cannot mark done (finding is being filed)")
+	if _, _, code := runCLI(t, fakeEnv(fc2), "findings", "resolve", "f-aaaa"); code != uzicli.ExitConflict {
+		t.Fatalf("resolve 409: exit = %d, want %d", code, uzicli.ExitConflict)
+	}
+}
+
+// resolve takes exactly one positional; a missing id is a usage error (exit 2) before any request.
+func TestFindingsResolveRequiresID(t *testing.T) {
+	fc := findingsFake()
+	if _, _, code := runCLI(t, fakeEnv(fc), "findings", "resolve"); code != uzicli.ExitUsage {
+		t.Fatalf("resolve with no id: exit = %d, want %d", code, uzicli.ExitUsage)
+	}
+	if fc.LastMarkDoneFindingID != "" {
+		t.Errorf("a usage error must not reach the network, but the write recorded id %q", fc.LastMarkDoneFindingID)
+	}
+}
+
+// The undo hint resolve prints is EXECUTED, not just read: the backticked command is lifted from
+// resolve's real output and run through the real parse, and it must reach the undo write with the
+// disposition id the server returned and report the done undone. This is the execution evidence
+// for the printed `uzi findings undo` instruction.
+func TestFindingsResolveUndoHintExecutes(t *testing.T) {
+	fc := findingsFake()
+	fc.MarkFindingDoneResult = apitypes.MarkFindingDoneResultDTO{Status: dispStatusDone, DispositionID: "disp-9"}
+	fc.UndoFindingResult = apitypes.IncidentalFindingDTO{Status: "open"}
+	out, _, code := runCLI(t, fakeEnv(fc), "findings", "resolve", "f-aaaa")
+	if code != uzicli.ExitOK {
+		t.Fatalf("resolve exit = %d, want 0", code)
+	}
+	start := strings.Index(out, "`")
+	end := strings.LastIndex(out, "`")
+	if start < 0 || end <= start {
+		t.Fatalf("resolve printed no backticked undo command:\n%s", out)
+	}
+	argv := strings.Fields(out[start+1 : end])
+	if len(argv) < 2 || argv[0] != "uzi" {
+		t.Fatalf("printed hint %q is not a uzi command", out[start+1:end])
+	}
+	undoOut, _, undoCode := runCLI(t, fakeEnv(fc), argv[1:]...)
+	if undoCode != uzicli.ExitOK {
+		t.Fatalf("running the printed hint %v: exit = %d, want 0", argv, undoCode)
+	}
+	if fc.LastUndoFindingID != "disp-9" {
+		t.Errorf("the printed hint undid id %q, want the returned disposition id disp-9", fc.LastUndoFindingID)
+	}
+	if !strings.Contains(undoOut, "undone (now open)") {
+		t.Errorf("the printed hint did not report the undo:\n%s", undoOut)
 	}
 }

@@ -78,7 +78,22 @@ type secretChoice struct {
 	secretID *uuid.UUID
 	reason   string
 	headroom *int16
+	// parkOnEmptyDefault marks a Judge/self-improve choice that resolves the owner default
+	// (secretID nil). When the Anthropic slot has no default because every token in it is
+	// disabled (PRD #1732 D4), that lane parks on credential_disabled rather than failing as
+	// a token-less user's run does (D2). Ordinary lanes leave it false and keep today's
+	// behaviour (D15).
+	parkOnEmptyDefault bool
 }
+
+// noAnthropicDefaultError is openAnthropic's "the owner has no default token" failure. It
+// renders and unwraps exactly as the errCredentialUnavailable it carries (the failure-reason
+// text is unchanged), and exists only so openWithAutoRetry can tell this case apart from an
+// undecryptable token for a parkOnEmptyDefault choice.
+type noAnthropicDefaultError struct{ err error }
+
+func (e noAnthropicDefaultError) Error() string { return e.err.Error() }
+func (e noAnthropicDefaultError) Unwrap() error { return e.err }
 
 // autoLaneRetryable reports whether a credential the AUTO lane resolved and then
 // failed to open earns ONE floor-retry onto ANOTHER pooled token (D14, reshaped by
@@ -142,9 +157,9 @@ func staticChoice(secretID *uuid.UUID, bound string) secretChoice {
 // another user's credential (D11).
 //
 // 🔴 IT NOW RESOLVES THE DEFAULT EXPLICITLY, AND THAT IS THE POINT (PRD #111 D8).
-// The nil case used to hand the whole job to secretopen.Open, which resolves
-// "the user's default of this kind" INSIDE its ciphertext query and returns only
-// plaintext — so there was no id for the caller to record, and a run could not name
+// The nil case used to hand the whole job to a default-resolving open (since
+// removed), which resolved "the user's default of this kind" INSIDE its ciphertext
+// query and returned only plaintext — so there was no id for the caller to record, and a run could not name
 // what it spent. Now the default is resolved to (id, label) first and the open
 // always goes by id, which makes the recorded id provably the opened one.
 //
@@ -207,8 +222,9 @@ func staticChoice(secretID *uuid.UUID, bound string) secretChoice {
 // the user, chose the credential.
 func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID, secretID *uuid.UUID) (claimCred, error) {
 	var meta struct {
-		ID    uuid.UUID
-		Label string
+		ID       uuid.UUID
+		Label    string
+		Disabled bool
 	}
 	var err error
 	if secretID != nil {
@@ -217,14 +233,14 @@ func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID, secretID 
 			ID:     *secretID,
 			UserID: userID,
 		})
-		meta.ID, meta.Label = row.ID, row.Label
+		meta.ID, meta.Label, meta.Disabled = row.ID, row.Label, row.Disabled
 	} else {
 		var row store.GetDefaultUserSecretMetaRow
 		row, err = s.q.GetDefaultUserSecretMeta(ctx, store.GetDefaultUserSecretMetaParams{
 			UserID: userID,
 			Kind:   store.KindAnthropicToken,
 		})
-		meta.ID, meta.Label = row.ID, row.Label
+		meta.ID, meta.Label, meta.Disabled = row.ID, row.Label, row.Disabled
 	}
 	if err != nil {
 		// pgx.ErrNoRows here is "no such credential for this user", which is the
@@ -233,9 +249,21 @@ func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID, secretID 
 		// failed with this string, and it is read by e2e and handler assertions.
 		// Anything else is a real lookup error, surfaced verbatim (no secret bytes).
 		if errors.Is(err, pgx.ErrNoRows) {
-			return claimCred{}, fmt.Errorf("%w: no Anthropic token configured for this user", errCredentialUnavailable)
+			unavailable := fmt.Errorf("%w: no Anthropic token configured for this user", errCredentialUnavailable)
+			if secretID == nil {
+				return claimCred{}, noAnthropicDefaultError{err: unavailable}
+			}
+			return claimCred{}, unavailable
 		}
 		return claimCred{}, fmt.Errorf("anthropic credential lookup: %w", err)
+	}
+	// PRD #1732 D2: a disabled credential is never opened. The row this function resolved,
+	// by id or as the default, is the one it would spend, so the check covers every lane
+	// that opens through here (pinned run override, worker pin, Judge pin, self-improve,
+	// chat, and a default read defensively: D4 keeps every default enabled). The caller
+	// parks the claim (run lane) or refuses it (chat); nothing substitutes another token.
+	if meta.Disabled {
+		return claimCred{}, fmt.Errorf("%w: Anthropic token %q is disabled; enable it in Settings", errCredentialDisabled, meta.Label)
 	}
 
 	tok, err := secretopen.OpenByID(ctx, s.q, s.vlt, s.box, userID, meta.ID)
@@ -644,15 +672,22 @@ func (s *Service) runOverrideChoice(ctx context.Context, run store.Run) (secretC
 		// anthropic_token. A foreign id, a deleted-but-not-nulled id, or a wrong-kind
 		// id all return pgx.ErrNoRows here → errCredentialUnavailable, never another
 		// lane's credential and never a silent inherit.
-		if _, err := s.q.GetUserSecretMetaByIDOfKind(ctx, store.GetUserSecretMetaByIDOfKindParams{
+		meta, err := s.q.GetUserSecretMetaByIDOfKind(ctx, store.GetUserSecretMetaByIDOfKindParams{
 			ID:     id,
 			UserID: run.UserID,
 			Kind:   store.KindAnthropicToken,
-		}); err != nil {
+		})
+		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return secretChoice{}, true, fmt.Errorf("%w: run credential override is not an available Anthropic token", errCredentialUnavailable)
 			}
 			return secretChoice{}, true, fmt.Errorf("run credential override lookup: %w", err)
+		}
+		// PRD #1732 D2: a disabled pin parks the run (never falls through to the worker
+		// binding, which would silently spend another account). openAnthropic re-checks the
+		// row it opens; this refuses before any other lookup.
+		if meta.Disabled {
+			return secretChoice{}, true, fmt.Errorf("%w: run credential override %q is disabled; enable it in Settings", errCredentialDisabled, meta.Label)
 		}
 		return staticChoice(&id, selectReasonRunPinned), true, nil
 	case BindModeAuto:

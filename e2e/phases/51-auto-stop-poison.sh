@@ -232,8 +232,19 @@ printf '%s' "$WL" | grep -qF '0.9.0-e2e' \
 pass "doc remedy proven: 'uzi worker list' shows the VERSION column and the worker's 0.9.0-e2e"
 
 # Best-effort cleanup so run B does not linger past the phase. A cleanup failure must
-# never redden a phase whose assertions already passed.
-apipost "/api/runs/$RUN_B/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
+# never redden a phase whose assertions already passed. Our synthetic worker is still a
+# LIVE poller for B, so the cancel is only enqueued (stop_kind='cancelled' stamped) and
+# waits for the worker; it never polls inputs, so B stayed `running` and the driver's
+# quarantine logged a LEAK. Do the worker's half the way a real one does after consuming
+# a cancel: report `failed`, which the api routes to CancelRunByWorker because
+# stop_kind is already 'cancelled' (workersvc SetState, "failed" arm).
+# Report `failed` only after the cancel was accepted: without the stamped stop_kind the
+# report would record an ordinary agent failure instead of a cancellation.
+if apipost "/api/runs/$RUN_B/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1; then
+  curl -sS -o /dev/null --max-time 10 -X POST "$BASE/api/worker/runs/$RUN_B/state" \
+    -H "Authorization: Bearer $WTOK" -H 'Content-Type: application/json' -d '{"status":"failed"}' 2>/dev/null || true
+  ( wait_status "$RUN_B" cancelled 15 ) >/dev/null 2>&1 || true
+fi
 
 # This line enumerates every phase the run covered, and it is the only place a reader
 # who did not watch the output learns what was in it — so a phase that lands without

@@ -318,8 +318,10 @@ type RunDTO struct {
 	// free text), but a consumer writing them to a terminal still sanitizes at render — the same
 	// obligation Milestones carries.
 	CompletionUnmet []string `json:"completion_unmet"`
-	// HoldReason is why the run is HELD (mapped from run.HoldReason): 'completion_blocked' when
-	// it parked in a completion hold, null when not held. Read-only surfacing of the column.
+	// HoldReason is why a paused run is HELD (mapped from run.HoldReason): 'completion_blocked'
+	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
+	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14), and
+	// null otherwise (not held, or an owner pause). Read-only surfacing of the column.
 	HoldReason *string `json:"hold_reason"`
 	// HoldContext is the D8 provider-context string a completion hold states: the constant
 	// "unavailable(same_worker_only)" when the run is in a completion hold (HoldReason ==
@@ -456,6 +458,13 @@ type RunDTO struct {
 	// pointer — a pre-feature run reads "agent". The SPA's SeededPlanPanel keys on it to
 	// surface a seeded run's plan, which the approval UI would otherwise never render.
 	PlanSource string `json:"plan_source"`
+	// GateRevision is the run's current plan-gate revision (PRD #1795 M1): the monotonic
+	// per-run number the server allocated when it published the gate whose plan_md this DTO
+	// carries. A client that shows the plan sends it back as expected_gate_revision; the
+	// server then writes the verdict only while the run still shows that revision and
+	// otherwise answers 409 gate_revision_mismatch (PRD #1795 M2). Omitted (0) for a run that
+	// never published a gate under an api that allocates (pre-migration gates, chat, judge).
+	GateRevision int64 `json:"gate_revision,omitempty"`
 	// Plain-English run summaries (PRD #362), all null until the worker generates and
 	// posts them (and null forever on any generation failure — summaries are advisory
 	// and never block a run). SummaryIntent ("what this run will implement") lands early
@@ -468,6 +477,13 @@ type RunDTO struct {
 	SummaryIntent *string           `json:"summary_intent"`
 	SummaryPlan   *string           `json:"summary_plan"`
 	SummaryDeltas []RunSummaryDelta `json:"summary_deltas"`
+	// PRD #1798: the published plain-English description of the run's PR (the version whose
+	// region is on the forge) and the PR's last description-write outcome. Set only by the
+	// GetRun detail read, best-effort (the list path and a lookup error leave both null); null
+	// for a run with no PR or no acknowledged write. The fields are api-sanitized, untrusted
+	// display text.
+	PrDescription        *RunPrDescriptionDTO `json:"pr_description"`
+	PrDescriptionOutcome *string              `json:"pr_description_outcome"`
 	// ci_fix context (PRD #6), all null for an issue run: the failing ref, the
 	// failing pipeline's web URL (from the frozen snapshot), and the fix verdict
 	// (verified|fix_failed|not_code|null-while-unverified).
@@ -679,7 +695,10 @@ type RunDTO struct {
 	// RecoveryWaitCause is the TYPED cause of a 'recovery_wait' park (PRD #1392 M1). Null is
 	// the LEGACY/untyped park — the empty-turn park writes NULL (D9), so a client must render
 	// null as the generic "waiting to retry" wording, NOT as any particular cause. Today the
-	// only non-null value is "forge_unreachable" (the forge stayed unreachable at clone);
+	// non-null values are "forge_unreachable" (the forge stayed unreachable at clone),
+	// "codex_account_unavailable" (PRD #1590, held on its Codex account) and "vault_locked"
+	// (issue #1766, the owner's vault is locked; the run resumes at its next retry once the
+	// vault is unlocked);
 	// "empty_turn"/"provider_outage" are reserved. Clients render an unrecognised value
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
@@ -934,6 +953,17 @@ type RunInputRequest struct {
 	// held outcome. Meaningful only for cancel — inert on every other kind and on a cancel of a run
 	// with no pending outcome. Nothing is ever discarded on a timer; only the owner, explicitly.
 	DiscardPendingOutcome bool `json:"discard_pending_outcome,omitempty"`
+	// ExpectedGateRevision is the PRD #1795 D5 expected plan-gate revision: the gate_revision of
+	// the run the client displayed when the owner acted. Legal only with approve_plan,
+	// reject_plan and revise_plan (400 otherwise). When present, the verdict is written only
+	// while the run is awaiting_approval at exactly this revision. In every other case (a newer
+	// revision, no gate yet, a run that has finished, or a verdict whose atomic write lost a race
+	// with a new publication) nothing is written and the server answers 409 {"error", "reason":
+	// "gate_revision_mismatch", "current_gate_revision"}; for a finished run this replaces the
+	// untyped "run has already finished" 409. A revise_plan at the revision cap whose revision
+	// still matches keeps the cap's own answer. Omitted when absent, so a newer client stays
+	// compatible with an older strict-decoding api.
+	ExpectedGateRevision *int64 `json:"expected_gate_revision,omitempty"`
 }
 
 // RunInputResponse is the POST /api/runs/{id}/inputs reply: server_side reports

@@ -161,6 +161,31 @@ export const MAX_CALLBACK_RESERVATIONS = 10000;
  *  rather than hard-coding a copy of it. */
 export const MAX_POISON_ERRORS = 64;
 
+/** Issue #1766: the poll interval {@link ExecutionRegistry.settleForCapture} uses between
+ *  drain passes. A poisoned registry has no wake signal, so it polls. */
+const CAPTURE_SETTLE_POLL_MS = 25;
+
+/** Issue #1766: the result of {@link ExecutionRegistry.settleForCapture}. */
+export type CaptureSettlement =
+  | { kind: "observed_empty" }
+  | { kind: "incomplete"; errors: readonly HarnessError[] };
+
+/** Resolve with `work`'s value, or undefined once `ms` elapses first. The timer is unref'd. */
+async function raceDeadline<T>(work: Promise<T>, ms: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), ms);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /**
  * The per-run immutable local-execution-epoch registry.
  *
@@ -177,6 +202,12 @@ export class ExecutionRegistry {
   // ANY poison and NEVER cleared, so callers can ask "was this epoch ever poisoned?"
   // independent of the disposal-masked state enum.
   private poisoned = false;
+  // Issue #1766: STICKY witness that `disposeTools` has cleared (or begun clearing) the
+  // callback and launch tables. Set at the TOP of `disposeTools`, before any await or clear,
+  // and NEVER reset. A failed disposal leaves `state()` at "poisoned" rather than "disposed",
+  // so `settleForCapture` consults this flag, not the state enum, to refuse reading the
+  // cleared (falsely empty) counts.
+  private tablesCleared = false;
 
   private readonly launches = new Map<string, LaunchReservation>();
   private readonly roots: RootRecord[] = [];
@@ -620,12 +651,100 @@ export class ExecutionRegistry {
   }
 
   /**
+   * Issue #1766: drain this epoch for a CREDENTIAL-FREE capture after a vault-locked deferral.
+   *
+   * A registry `disposeTools` has run on answers `incomplete` at once, whether the disposal
+   * succeeded ("disposed") or failed (left "poisoned"): it cleared the callback and launch
+   * tables, so their counts would read falsely empty. Any other state is first POISONED
+   * (sticky; refuses every new launch and callback reservation) with a secret-free reason. No
+   * new state is added. Then, under ONE absolute deadline, it repeats until settled: reap every
+   * registered, unreaped root through the single-flight {@link reapRecord}, re-check the pending
+   * launches, the in-flight callbacks and the unreaped roots, and while anything remains poll on
+   * `pollMs` (a poisoned registry has no wake signal) and reap roots registered meanwhile. A
+   * launch reserved before the poison may still register its root during the drain, because
+   * {@link registerRoot} does not check state; the loop reaps it like any other.
+   *
+   * Returns `observed_empty` ONLY when a final synchronous check finds zero pending launches,
+   * zero in-flight callbacks and every registered root cleanly reaped. A root whose reap is
+   * unclean stays unreaped, is not retried, and yields `incomplete`; so does anything still
+   * unsettled at the deadline. It never calls {@link reapProcesses} or {@link quiesceChildren}
+   * (both refuse a poisoned registry) and never mints a permit.
+   */
+  async settleForCapture(deadlineMs: number, pollMs: number = CAPTURE_SETTLE_POLL_MS): Promise<CaptureSettlement> {
+    if (this.currentState === "disposed" || this.tablesCleared) {
+      return { kind: "incomplete", errors: [{ category: "protocol", message: "settleForCapture: registry disposed" }] };
+    }
+    const deadlineAt = Date.now() + Math.max(0, deadlineMs);
+    const remaining = (): number => Math.max(0, deadlineAt - Date.now());
+    if (this.currentState !== "poisoned") {
+      this.poison({ category: "protocol", message: "codex vault deferral: settling for capture" });
+    }
+    const failed = new Set<RootRecord>();
+    const drained = (): boolean =>
+      this.launches.size === 0 && this.inFlightCallbackCount() === 0 && this.roots.every((r) => r.reaped);
+    // Every exit of this loop falls through to the one final synchronous check below.
+    for (;;) {
+      // state()/tablesCleared re-read across awaits (disposeTools may run meanwhile).
+      if (this.state() === "disposed" || this.tablesCleared || failed.size > 0 || remaining() <= 0) break;
+      const pending = this.roots.filter((r) => !r.reaped && !failed.has(r));
+      if (pending.length > 0) {
+        const outcomes = await raceDeadline(
+          Promise.all(pending.map(async (rec) => ({ rec, outcome: await this.reapRecord(rec, remaining()) }))),
+          remaining(),
+        );
+        if (outcomes === undefined) break; // the deadline elapsed mid-reap
+        for (const { rec, outcome } of outcomes) {
+          if (!outcome.ok) {
+            failed.add(rec);
+            this.poison(outcome.error);
+          }
+        }
+        continue;
+      }
+      if (drained()) break;
+      const wait = Math.min(Math.max(1, pollMs), remaining());
+      if (wait <= 0) break;
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, wait);
+        timer.unref?.();
+      });
+    }
+    // The final synchronous check: the only path to observed_empty.
+    const errors: HarnessError[] = [];
+    if (this.state() === "disposed" || this.tablesCleared) {
+      errors.push({ category: "protocol", message: "settleForCapture: registry disposed during settle" });
+    }
+    if (this.launches.size > 0) {
+      errors.push({
+        category: "protocol",
+        message: `settleForCapture: ${this.launches.size} launch reservation(s) never settled`,
+      });
+    }
+    const unsettled = this.inFlightCallbackCount();
+    if (unsettled > 0) {
+      errors.push({
+        category: "protocol",
+        message: `settleForCapture: ${unsettled} callback/child-turn reservation(s) unsettled`,
+      });
+    }
+    const unreaped = this.roots.filter((r) => !r.reaped).length;
+    if (unreaped > 0) {
+      errors.push({ category: "tool", message: `settleForCapture: ${unreaped} root(s) not cleanly reaped` });
+    }
+    if (errors.length > 0) return { kind: "incomplete", errors };
+    return { kind: "observed_empty" };
+  }
+
+  /**
    * Revokes admission, disposes every registered root, and drops handler/callback
    * references. Idempotent: a second call returns `{ kind: "disposed" }` without
    * re-disposing a root. A failing `dispose()` poisons and returns `incomplete`.
    */
   async disposeTools(deadlineMs: number): Promise<ToolDisposal> {
     if (this.currentState === "disposed") return { kind: "disposed" };
+    // Set BEFORE the first await: a settle observing this registry mid-disposal (or after a
+    // failed one, which leaves the state "poisoned") must never read the tables as empty.
+    this.tablesCleared = true;
     const errors: HarnessError[] = [];
     for (const rec of this.roots) {
       if (rec.disposed) continue;

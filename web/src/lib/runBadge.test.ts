@@ -1235,3 +1235,42 @@ describe("runBadge title — format characters (#124)", () => {
     expect(titleOf("\u202E\u200B")).toBeUndefined();
   });
 });
+
+// PRD #1732 D14: a run the server parked on a disabled credential shares raw status
+// "paused" with the owner pause; hold_reason is what tells them apart, and it must render
+// as the warn-toned "waiting: credential disabled", never the info "‖ paused".
+describe("effectiveRunStatus — credential_disabled hold (PRD #1732)", () => {
+  it("overlays a paused run held on credential_disabled", () => {
+    expect(effectiveRunStatus({ status: "paused", hold_reason: "credential_disabled" })).toBe("credential_disabled");
+    expect(runStatusTone("credential_disabled", null)).toBe("warning");
+  });
+
+  it("leaves an owner pause (no hold reason) and other holds alone", () => {
+    expect(effectiveRunStatus({ status: "paused", hold_reason: null })).toBe("paused");
+    expect(effectiveRunStatus({ status: "paused" })).toBe("paused");
+    expect(effectiveRunStatus({ status: "queued", hold_reason: "credential_disabled" })).toBe("queued");
+  });
+});
+
+// PRD #1732 D14, board shape: the board projection sends hold_reason on every card
+// (latestRunDTO.HoldReason), so a card whose latest run is parked on a disabled credential
+// arrives as a LatestRun with status "paused" + hold_reason "credential_disabled" and must
+// render the warn "waiting: credential disabled" badge, not the owner "paused" pill.
+describe("runBadge — board card held on a disabled credential (PRD #1732)", () => {
+  it("renders the warn credential-disabled badge from a board-shaped LatestRun", () => {
+    expect(runBadge(run({ status: "paused", hold_reason: "credential_disabled" }), NOW)).toEqual({
+      kind: "badge",
+      label: "waiting: credential disabled",
+      tone: "warning",
+      pulse: false,
+      title: "A credential this run needs is disabled. It resumes by itself when you enable it.",
+    });
+  });
+
+  it("keeps an owner pause (null hold_reason) off the credential badge", () => {
+    expect(runBadge(run({ status: "paused", hold_reason: null }), NOW)).toMatchObject({
+      kind: "badge",
+      label: "‖ paused",
+    });
+  });
+});

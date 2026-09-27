@@ -33,6 +33,30 @@ history accordion below the current one, and your feedback for each round
 is stored in the run feed alongside the plan it produced — visible to
 admins the same way a reject reason or a follow-up already is.
 
+Every verdict is bound to the exact gate it was sent against, not just
+"the current one." Each time a plan is shown, the run's `gate_revision`
+counts up by one (readable with `uzi run get <id> --field gate_revision`);
+a client that names the revision it displayed — `expected_gate_revision`
+on the API, or `--expected-gate-revision` on the CLI (see [the CLI
+docs](./cli.md#commands)) — gets a 409 (`gate_revision_mismatch`, naming
+the current `current_gate_revision`) instead of applying to a plan you
+never saw, whenever the run has since moved to a different revision or
+left the gate entirely. An **approve** sent while no gate is visible at
+all (nothing displayed yet, or the run has already moved on) is silently
+ignored, with a note in the run feed — it can never land against a later
+plan by accident. A **reject** or **request changes** sent the same way is
+not ignored: it still applies at the run's first gate, the same
+fail-closed handling these two actions have always had.
+
+If a worker cannot re-present a plan gate it previously showed — for
+example after a restart or credential switch that lost track of what was
+on screen — the run parks at `recovery_wait` (see [Recovery
+wait](./run-recovery-wait.md)) rather than showing a gate it can't stand
+behind, and a fresh claim retries. This is bounded: past
+`RUN_GATE_REFUSAL_MAX` such refusals for one run (see
+[Configuration](./configuration.md)), the next one fails the run instead
+of parking it again, with reason `gate_presentation_refused`.
+
 If the planning turn itself wrote anything to the worktree — a file the
 agent created or modified while it was still just planning, which would
 otherwise be swept invisibly into the first implementation commit — the
@@ -250,18 +274,24 @@ through one of these delivery states:
 | State | Meaning |
 |---|---|
 | Queued | Not yet picked up by the worker — including while the run is sitting at a plan-approval gate. |
-| Delivered | The worker has fetched it for its next turn. |
-| Delivered — applies after approval | Fetched while the run was sitting at a plan-approval gate; it's buffered and takes effect once you approve. |
+| Delivered | The worker has received it. On a Claude run, queued follow-ups are folded into the agent's next work turns one per turn, in order, so with several queued a later one can show Delivered a turn or more before the agent sees it. |
+| Delivered — applies after approval | Fetched while the run was sitting at a plan-approval gate; it's buffered and, on a Claude run, takes effect once you approve. |
 | Not delivered — run finished | The run went terminal before the worker ever fetched it. |
 
 **"Delivered" means handed to the worker, not necessarily acted on.**
 Whether it actually changed what the agent did next is visible in its
-following messages, not in the chip. Two cases show Delivered with nothing
-happening: the worker crashes right after fetching it, or a follow-up
-buffered at a plan gate is never applied because you **reject** the plan
-instead of approving it. Neither is silent for long — a stalled agent trips
-the [`stalled` health flag](./run-health.md), and the fix in both cases is
-the same: send it again.
+following messages, not in the chip. Delivered can show with nothing
+happening: the worker crashes right after fetching it, a follow-up buffered
+at a plan gate is never applied because you **reject** the plan instead of
+approving it, or the run finishes, pauses, or hits its scope ceiling before
+the follow-up's turn comes. A crash is not silent for long: a stalled agent
+trips the [`stalled` health flag](./run-health.md). In each of these cases,
+send it again: on a run that has not finished (a paused one included), from
+the steer queue if you can steer the run; on a finished run, in a new run.
+
+On a Codex run, follow-ups are received but not passed to the agent at all,
+so resending does not help. Put the guidance in the issue before the run
+starts, or use a Claude run.
 
 The queue stays visible, read-only, after the run finishes — so a
 "Not delivered — run finished" input doesn't just vanish.

@@ -471,7 +471,7 @@ func (h *Handler) UndoDismissFinding(w http.ResponseWriter, r *http.Request) {
 }
 
 // findingDispositionDTO projects a re-read finding_dispositions row onto the wire DTO for the
-// bulk-dismiss and undo responses. Unlike the backlog mapper it has no repo_path, seen_in_runs,
+// bulk-dismiss, bulk-done and undo responses. Unlike the backlog mapper it has no repo_path, seen_in_runs,
 // evidence_preview or occurrences to carry (a raw disposition row holds none of them) — the client
 // reconciles by disposition_id + status. FindingID stays nil for the same reason.
 func findingDispositionDTO(d store.FindingDisposition) apitypes.IncidentalFindingDTO {

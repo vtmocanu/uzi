@@ -1897,3 +1897,64 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(20),
   },
 ];
+
+// PRD #1732 D14: runs HELD on `credential_disabled` — server-parked (status `paused`,
+// hold_reason set), resumed by the promoter on Enable, never by a plain Resume. Derived
+// from the owner-paused fixture above so every other field stays realistic.
+const pausedBase = mockRuns.find((r) => r.id === "run-paused")!;
+mockRuns.push(
+  {
+    // A Claude issue run pinned (per-run override) to the disabled token old-laptop: the
+    // panel offers "Enable old-laptop" AND "Run with another token" (the lane accepts an
+    // override, D16).
+    ...pausedBase,
+    id: "run-cred-disabled",
+    issue_iid: 187,
+    issue_title: "Nightly dependency audit for the worker image",
+    issue_description: "See prds/187-dependency-audit.md.",
+    branch: "agent/issue-187",
+    hold_reason: "credential_disabled",
+    credential_override: { mode: "pinned", label: "old-laptop" },
+    anthropic_secret_id: "sec-old-laptop",
+    anthropic_secret_label: "old-laptop",
+    // The server's reason for a per-run pin is run_pinned (selectReasonRunPinned).
+    anthropic_select_reason: "run_pinned",
+    anthropic_headroom_pct: null,
+    milestones_completed: ["tr-1"],
+    checkpoint_tip_at: minsAgo(41),
+    budget_used_seconds: 2400,
+    claimed_at: minsAgo(80),
+    started_at: minsAgo(80),
+    created_at: minsAgo(81),
+    status_since: minsAgo(41),
+    updated_at: minsAgo(41),
+  },
+  {
+    // A Codex run created on the now-disabled alias team-codex-laptop: its frozen alias
+    // waits (D6/D15), and a Codex run has no per-run token switch, so the panel offers
+    // Enable only.
+    ...pausedBase,
+    id: "run-cred-disabled-codex",
+    harness: "codex",
+    issue_iid: 191,
+    issue_title: "Trim the controller's reconcile log noise",
+    issue_description: "See prds/191-reconcile-log-noise.md.",
+    branch: "agent/issue-191",
+    hold_reason: "credential_disabled",
+    credential_override: null,
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_select_reason: null,
+    anthropic_headroom_pct: null,
+    codex_secret_id: "sec-codex-team-laptop",
+    codex_secret_label: "team-codex-laptop",
+    milestones_completed: [],
+    checkpoint_tip_at: null,
+    budget_used_seconds: 600,
+    claimed_at: minsAgo(30),
+    started_at: minsAgo(30),
+    created_at: minsAgo(31),
+    status_since: minsAgo(22),
+    updated_at: minsAgo(22),
+  },
+);

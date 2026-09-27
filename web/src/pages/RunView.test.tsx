@@ -34,6 +34,7 @@ import {
   derivePlanRevision,
 } from "./RunView";
 import { useRunStream } from "../lib/useRunStream";
+import { useAuth } from "../auth/AuthContext";
 // ?raw rather than node:fs — the web tsconfig has no node types, and this repo
 // already makes the same choice for the same reason in WorkerUpgradeBadge.test.tsx
 // and workerSizes.test.ts. Vite inlines it at build time, so the assertion runs
@@ -123,6 +124,18 @@ const mockApi = vi.mocked(api);
 // this mock does not touch the sub-component tests above.
 vi.mock("../lib/useRunStream", () => ({ useRunStream: vi.fn() }));
 const mockUseRunStream = vi.mocked(useRunStream);
+
+// Issue #1766: the vault_locked park body reads the VIEWER's vault state off useAuth (the
+// same signal VaultLockedBanner reads). These renders mount no AuthProvider, so the hook is
+// mocked; only the vault_locked cases below call it, and each sets the state it needs.
+vi.mock("../auth/AuthContext", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../auth/AuthContext")>();
+  return { ...actual, useAuth: vi.fn() };
+});
+const mockUseAuth = vi.mocked(useAuth);
+function viewerVault(unlocked: boolean) {
+  mockUseAuth.mockReturnValue({ vaultUnlocked: unlocked } as unknown as ReturnType<typeof useAuth>);
+}
 
 afterEach(() => {
   cleanup();
@@ -4662,6 +4675,81 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     expect(container.textContent).toContain("transient interruption");
     expect(container.textContent).not.toContain("Waiting for the forge");
   });
+
+  // Issue #1766: a vault_locked park (a Codex credential refresh or release found the run
+  // owner's vault locked) waits for the vault unlock and resumes at its NEXT retry, whose
+  // time the DTO carries for this cause. The copy is owner-neutral: an admin may be reading
+  // another owner's run, and the Run DTO does not say whose it is.
+  const vaultPark = (over: Partial<Run> = {}) =>
+    run({
+      status: "recovery_wait",
+      recovery_wait_cause: "vault_locked",
+      recovery_retry_not_before: "2026-01-01T09:30:00Z",
+      // Forge counters set on purpose: this cause must never borrow the forge park count.
+      forge_park_count: 2,
+      forge_park_max: 5,
+      ...over,
+    });
+  // The same wall-clock HH:MM idiom the panel uses for every retry stamp.
+  const hhmm = (iso: string) =>
+    new Date(Date.parse(iso)).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+
+  it("vault_locked, viewer's vault LOCKED: owner-neutral copy, next retry time, and the banner hint", () => {
+    viewerVault(false);
+    const { container } = render(<RecoveryWaitPanel run={vaultPark()} />);
+    const heading = container.querySelector('[role="status"]')?.textContent ?? "";
+    expect(heading).toContain("Waiting for vault unlock");
+    // N2: `paused` is a different status; this park never calls itself paused.
+    expect(container.textContent).not.toMatch(/paused/i);
+    expect(container.textContent).toContain(
+      `The run owner's vault was locked when this Codex run needed its credential. Once the vault is unlocked, the run resumes at its next retry (${hhmm("2026-01-01T09:30:00Z")}).`,
+    );
+    // The banner is on screen while the viewer's vault is locked; the hint is conditional on
+    // ownership, which the page cannot tell.
+    expect(container.textContent).toContain(
+      "If this is your run, unlock your vault with the banner at the top of the page.",
+    );
+    expect(container.textContent).toContain("the run's work was saved before it parked");
+    expect(container.textContent).not.toContain("transient interruption");
+    expect(container.textContent).not.toContain("Waiting for the forge");
+    expect(container.textContent).not.toContain("2 of 5");
+    // Unlock lives on the global banner: the panel offers no control of its own.
+    expect(container.querySelector("button")).toBeNull();
+  });
+
+  it("vault_locked, viewer's vault UNLOCKED: no banner hint (the banner is gone), only when it resumes", () => {
+    viewerVault(true);
+    const { container } = render(<RecoveryWaitPanel run={vaultPark()} />);
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("Waiting for vault unlock");
+    expect(container.textContent).toContain(
+      `Once the vault is unlocked, the run resumes at its next retry (${hhmm("2026-01-01T09:30:00Z")}).`,
+    );
+    expect(container.textContent).not.toMatch(/banner/i);
+    expect(container.textContent).not.toMatch(/unlock your vault/i);
+  });
+
+  it("vault_locked copy is owner-neutral in both states and never promises an instant resume", () => {
+    for (const unlocked of [false, true]) {
+      cleanup();
+      viewerVault(unlocked);
+      const { container } = render(<RecoveryWaitPanel run={vaultPark()} />);
+      const text = container.textContent ?? "";
+      expect(text).toContain("The run owner's vault");
+      // Never asserts the vault is the viewer's ("your vault was locked", "This run's vault").
+      expect(text).not.toMatch(/your vault (was|is) locked/i);
+      expect(text).not.toContain("This run's vault");
+      expect(text).not.toMatch(/as soon as|the instant|immediately/i);
+    }
+  });
+
+  it("vault_locked with no retry stamp drops the time, not the sentence", () => {
+    viewerVault(true);
+    const { container } = render(
+      <RecoveryWaitPanel run={vaultPark({ recovery_retry_not_before: null })} />,
+    );
+    expect(container.textContent).toContain("the run resumes at its next retry.");
+    expect(container.textContent).not.toMatch(/retry \(/);
+  });
 });
 
 // PRD #1590 D6: a run held on an unusable Codex account. The copy is keyed on the
@@ -4973,6 +5061,24 @@ describe("RunView park announcement — recovery_wait (issue #1197, a11y)", () =
     // Mutation guard: it is the recovery copy, NOT the pool_wait or awaiting_input copy.
     expect(region.textContent).not.toContain("pooled Anthropic token");
     expect(region.textContent).not.toContain("asking you a question");
+  });
+
+  // Issue #1766: a vault_locked park announces the vault unlock it waits on, not the
+  // generic transient interruption, in owner-neutral words (an admin may be the viewer).
+  it("announces a vault_locked park as waiting for vault unlock", async () => {
+    viewerVault(true);
+    renderPage({ status: "recovery_wait", recovery_wait_cause: "vault_locked" });
+    const region = await waitFor(() => {
+      const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement | null;
+      if (!el || el.textContent === "") throw new Error("not announced yet");
+      return el;
+    });
+    expect(region.getAttribute("aria-live")).toBe("polite");
+    expect(region.textContent).toBe(
+      "This run is waiting for vault unlock. The run owner's vault was locked when this Codex run needed its credential. Once the vault is unlocked, the run resumes at its next retry.",
+    );
+    expect(region.textContent).not.toContain("transient interruption");
+    expect(region.textContent).not.toMatch(/paused|unlock your vault/i);
   });
 
   // PRD #1590 D6: a Codex account hold announces its own action, never the transient park.
@@ -5975,5 +6081,454 @@ describe("RunView — forge-aware MR/PR link fallback when mr_web_url is null (#
     // Non-vacuous: the old hard-coded GitLab path would end /-/merge_requests/42 and fail here.
     expect(href.endsWith("/pull/42")).toBe(true);
     expect(href).not.toContain("/-/merge_requests/");
+  });
+});
+
+// PRD #1795 D5: the whole-page plan-gate path. The verdict names the revision of the plan on
+// screen; a 409 gate_revision_mismatch is not a page-banner failure but a panel notice naming
+// the revision to review, and the run is refetched so the panel shows the plan that replaced it.
+describe("RunView — plan-gate verdicts bound to the gate revision (PRD #1795 M4)", () => {
+  const extra = mockApi as unknown as Record<string, unknown>;
+  beforeEach(() => {
+    // The gate page's worker list and token picker self-fetch; neither is in the shared mock.
+    extra.listWorkers = vi.fn().mockResolvedValue({ workers: [] });
+    extra.listSecrets = vi.fn().mockResolvedValue({ secrets: [] });
+  });
+  afterEach(() => {
+    delete extra.listWorkers;
+    delete extra.listSecrets;
+  });
+
+  function streamWith(r: ReturnType<typeof run>, submit: ReturnType<typeof vi.fn>, refreshRun: ReturnType<typeof vi.fn>) {
+    mockUseRunStream.mockReturnValue({
+      run: r,
+      messages: [],
+      connected: true,
+      error: "",
+      submit,
+      refreshRun,
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+  }
+  function mismatch(current: number) {
+    return new ApiError(409, `the plan gate changed: this verdict was sent for revision 2, the run is at revision ${current}`, {
+      error: "the plan gate changed",
+      reason: "gate_revision_mismatch",
+      current_gate_revision: current,
+    });
+  }
+
+  function renderGate(submit: ReturnType<typeof vi.fn>, refreshRun: ReturnType<typeof vi.fn>) {
+    mockUseRunStream.mockReturnValue({
+      run: run({ status: "awaiting_approval", gate_revision: 2, plan_md: "# Plan two" }),
+      messages: [],
+      connected: true,
+      error: "",
+      submit,
+      refreshRun,
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  it("approve submits the displayed gate revision", async () => {
+    const submit = vi.fn().mockResolvedValue(undefined);
+    renderGate(submit, vi.fn());
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    await act(async () => {
+      fireEvent.click(approve);
+    });
+    await waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
+    const call = submit.mock.calls[0];
+    expect(call[0]).toBe("approve_plan");
+    expect(call[5]).toBe(2);
+  });
+
+  it("a reject refused with 409 gate_revision_mismatch shows the notice and refetches the run", async () => {
+    const submit = vi.fn(async () => {
+      throw new ApiError(409, "the plan gate changed: this verdict was sent for revision 2, the run is at revision 3", {
+        error: "the plan gate changed",
+        reason: "gate_revision_mismatch",
+        current_gate_revision: 3,
+      });
+    });
+    const refreshRun = vi.fn().mockResolvedValue(undefined);
+    renderGate(submit, refreshRun);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Reject" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+    });
+
+    expect(submit.mock.calls[0]).toEqual(["reject_plan", "", undefined, undefined, undefined, 2]);
+    await screen.findByText("Your decision was not applied: the run now shows plan revision 3. Review it and decide again.");
+    expect(refreshRun).toHaveBeenCalled();
+    // The refusal is the panel notice, not the page's generic error banner (paired with the
+    // positive notice assertion above, so this cannot pass on an empty render).
+    expect(screen.queryByText(/the plan gate changed: this verdict was sent/)).toBeNull();
+  });
+
+  it("any other verdict error still surfaces on the page banner with no revision notice", async () => {
+    const submit = vi.fn(async () => {
+      throw new ApiError(409, "run has already finished");
+    });
+    const refreshRun = vi.fn();
+    renderGate(submit, refreshRun);
+
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    await act(async () => {
+      fireEvent.click(approve);
+    });
+    await screen.findByText("run has already finished");
+    expect(screen.queryByText(/was not applied/)).toBeNull();
+    expect(refreshRun).not.toHaveBeenCalled();
+  });
+
+  // Between the 409 and the refetch the run on screen is still the refused revision; the page
+  // stays busy until the refetch settles, so no click can bind a verdict to it.
+  it("stays busy after a mismatch until the refetch settles", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(3);
+    });
+    let settle: () => void = () => {};
+    const refreshRun = vi.fn(
+      () =>
+        new Promise<void>((res) => {
+          settle = res;
+        }),
+    );
+    renderGate(submit, refreshRun);
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    await act(async () => {
+      fireEvent.click(approve);
+    });
+    await waitFor(() => expect(refreshRun).toHaveBeenCalledTimes(1));
+    expect((screen.getByRole("button", { name: /Approve plan/ }) as HTMLButtonElement).disabled).toBe(true);
+
+    await act(async () => {
+      settle();
+    });
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: /Approve plan/ }) as HTMLButtonElement).disabled).toBe(false),
+    );
+  });
+
+  // The refetch shows the run left the gate, so PlanPanel unmounts with its notice: the page
+  // itself must still tell the owner their decision was not applied.
+  it("a mismatch whose refetch shows the run left the gate gets a page-level notice", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(2);
+    });
+    const refreshRun = vi.fn(async () => {
+      streamWith(run({ status: "running", gate_revision: 2, plan_md: "# Plan two" }), submit, refreshRun);
+    });
+    renderGate(submit, refreshRun);
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    await act(async () => {
+      fireEvent.click(approve);
+    });
+    await screen.findByText("Your plan decision was not applied: the run is no longer waiting for plan approval.");
+    expect(screen.queryByRole("button", { name: /Approve plan/ })).toBeNull();
+  });
+
+  const LEFT_GATE = "Your plan decision was not applied: the run is no longer waiting for plan approval.";
+  const tree = () => (
+    <MemoryRouter initialEntries={["/runs/r1"]}>
+      <RunView />
+    </MemoryRouter>
+  );
+
+  // The page-level notice is for a run that LEFT the gate. A refetch that keeps the run at the
+  // gate leaves the wording to the panel; the page must not also claim it stopped waiting.
+  it("a mismatch whose refetch keeps the run at the gate gets no page-level notice", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(3);
+    });
+    const refreshRun = vi.fn(async () => {
+      streamWith(run({ status: "awaiting_approval", gate_revision: 3, plan_md: "# Plan three" }), submit, refreshRun);
+    });
+    renderGate(submit, refreshRun);
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    await act(async () => {
+      fireEvent.click(approve);
+    });
+    // Paired with the positive panel notice, so the negative cannot pass on an empty render.
+    await screen.findByText("Your decision was not applied: the run now shows plan revision 3. Review it and decide again.");
+    expect(screen.queryByText(LEFT_GATE)).toBeNull();
+  });
+
+  // The refetch already shows a later gate (4) than the one the refusal named (3): the notice
+  // about revision 3 is stale on arrival and must not greet plan four.
+  it("a mismatch at 3 whose run is at revision 4 clears the panel notice", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(3);
+    });
+    const refreshRun = vi.fn(async () => {
+      streamWith(run({ status: "awaiting_approval", gate_revision: 4, plan_md: "# Plan four" }), submit, refreshRun);
+    });
+    renderGate(submit, refreshRun);
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    await act(async () => {
+      fireEvent.click(approve);
+    });
+    await waitFor(() => expect(refreshRun).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: /Approve plan/ }) as HTMLButtonElement).disabled).toBe(false),
+    );
+    expect(screen.getByText("Plan four")).toBeTruthy();
+    expect(screen.queryByText(/was not applied/)).toBeNull();
+  });
+
+  it("a mismatch notice clears when a later gate revision arrives after the refetch", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(3);
+    });
+    const refreshRun = vi.fn(async () => {
+      streamWith(run({ status: "awaiting_approval", gate_revision: 3, plan_md: "# Plan three" }), submit, refreshRun);
+    });
+    const { rerender } = renderGate(submit, refreshRun);
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    await act(async () => {
+      fireEvent.click(approve);
+    });
+    await screen.findByText("Your decision was not applied: the run now shows plan revision 3. Review it and decide again.");
+
+    streamWith(run({ status: "awaiting_approval", gate_revision: 4, plan_md: "# Plan four" }), submit, refreshRun);
+    rerender(tree());
+    await screen.findByText("Plan four");
+    await waitFor(() => expect(screen.queryByText(/was not applied/)).toBeNull());
+  });
+
+  // The page-level notice describes the run as the refetch showed it. Once the run moves on
+  // (running -> completed), the notice is history and is retired.
+  it("the page-level notice clears when the run's status changes after the refetch", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(2);
+    });
+    const refreshRun = vi.fn(async () => {
+      streamWith(run({ status: "running", gate_revision: 2, plan_md: "# Plan two" }), submit, refreshRun);
+    });
+    const { rerender } = renderGate(submit, refreshRun);
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    await act(async () => {
+      fireEvent.click(approve);
+    });
+    await screen.findByText(LEFT_GATE);
+
+    // A re-render with the same status keeps it (the notice is not retired by any render).
+    rerender(tree());
+    expect(screen.getByText(LEFT_GATE)).toBeTruthy();
+
+    streamWith(run({ status: "completed", gate_revision: 2, plan_md: "# Plan two" }), submit, refreshRun);
+    rerender(tree());
+    await waitFor(() => expect(screen.queryByText(LEFT_GATE)).toBeNull());
+  });
+
+  // A current-0 refusal names no revision, so the revision rule cannot retire it: the next
+  // gate revision the run shows does.
+  it("a current-0 refusal clears when the run shows a new gate revision", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(0);
+    });
+    const refreshRun = vi.fn().mockResolvedValue(undefined);
+    const { rerender } = renderGate(submit, refreshRun);
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    await act(async () => {
+      fireEvent.click(approve);
+    });
+    await screen.findByText("Your decision was not applied because the plan gate changed. Check the plan and try again.");
+
+    streamWith(run({ status: "awaiting_approval", gate_revision: 3, plan_md: "# Plan three" }), submit, refreshRun);
+    rerender(tree());
+    await screen.findByText("Plan three");
+    await waitFor(() => expect(screen.queryByText(/was not applied/)).toBeNull());
+  });
+
+  // A hung refetch cannot hold the gate busy: the wait is bounded, after which the page is
+  // usable again with the notice still showing.
+  it("a hung refetch after a mismatch releases busy after the bounded wait", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(3);
+    });
+    const refreshRun = vi.fn(() => new Promise<void>(() => {}));
+    renderGate(submit, refreshRun);
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    vi.useFakeTimers();
+    try {
+      await act(async () => {
+        fireEvent.click(approve);
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(refreshRun).toHaveBeenCalledTimes(1);
+      expect((screen.getByRole("button", { name: /Approve plan/ }) as HTMLButtonElement).disabled).toBe(true);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4900);
+      });
+      expect((screen.getByRole("button", { name: /Approve plan/ }) as HTMLButtonElement).disabled).toBe(true);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      expect((screen.getByRole("button", { name: /Approve plan/ }) as HTMLButtonElement).disabled).toBe(false);
+      expect(
+        screen.getByText("Your decision was not applied: the run now shows plan revision 3. Review it and decide again."),
+      ).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // PRD #1795 B6: once the bounded wait releases busy, plan two may still be on screen. A retry
+  // from the still-open composer must keep naming the revision it was opened on (2), never the
+  // revision the 409 reported (3), which the owner has not seen.
+  it("retry after a hung refetch still targets the displayed plan", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(3);
+    });
+    const refreshRun = vi.fn(() => new Promise<void>(() => {}));
+    renderGate(submit, refreshRun);
+    await screen.findByRole("button", { name: "Reject" });
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    vi.useFakeTimers();
+    try {
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      expect(screen.getByText("Plan two")).toBeTruthy();
+      expect((screen.getByRole("button", { name: "Send rejection" }) as HTMLButtonElement).disabled).toBe(false);
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(submit).toHaveBeenCalledTimes(2);
+      expect(submit.mock.calls[1]).toEqual(["reject_plan", "", undefined, undefined, undefined, 2]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a request-changes retry after a hung refetch still targets the displayed plan", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(3);
+    });
+    const refreshRun = vi.fn(() => new Promise<void>(() => {}));
+    renderGate(submit, refreshRun);
+    fireEvent.click(await screen.findByRole("button", { name: "Request changes" }));
+    fireEvent.change(screen.getByPlaceholderText(/sent to the planning session/), { target: { value: "split M2" } });
+    vi.useFakeTimers();
+    try {
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: /Send & revise/ }));
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      expect(screen.getByText("Plan two")).toBeTruthy();
+      // The refused revise leaves the composer open with the owner's text.
+      expect((screen.getByPlaceholderText(/sent to the planning session/) as HTMLTextAreaElement).value).toBe(
+        "split M2",
+      );
+      expect((screen.getByRole("button", { name: /Send & revise/ }) as HTMLButtonElement).disabled).toBe(false);
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: /Send & revise/ }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(submit).toHaveBeenCalledTimes(2);
+      expect(submit.mock.calls[1]).toEqual(["revise_plan", "split M2", undefined, undefined, undefined, 2]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // A FAILED refetch (refreshRun rejects) propagates out of the bounded wait into `act`: busy is
+  // released, the failure is on the page banner, the refusal notice stays, and plan two is still on
+  // screen. The retry from the still-open composer keeps naming revision 2. (useRunStream's own
+  // refreshRun catches a failed GET and resolves, which is the hung/unchanged case above; this
+  // pins the contract for a refetch that does reject.)
+  const composers = [
+    {
+      name: "reject",
+      open: "Reject",
+      send: "Send rejection",
+      draft: undefined,
+      verb: "reject_plan",
+      text: "",
+    },
+    {
+      name: "request-changes",
+      open: "Request changes",
+      send: /Send & revise/,
+      draft: "split M2",
+      verb: "revise_plan",
+      text: "split M2",
+    },
+  ] as const;
+  for (const c of composers) {
+    it(`a ${c.name} retry after a failed refetch still targets the displayed plan`, async () => {
+      const submit = vi.fn(async () => {
+        throw mismatch(3);
+      });
+      const refreshRun = vi.fn().mockRejectedValue(new ApiError(503, "refetch failed: network down"));
+      renderGate(submit, refreshRun);
+      fireEvent.click(await screen.findByRole("button", { name: c.open }));
+      if (c.draft !== undefined) {
+        fireEvent.change(screen.getByPlaceholderText(/sent to the planning session/), { target: { value: c.draft } });
+      }
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: c.send }));
+      });
+      await waitFor(() => expect(refreshRun).toHaveBeenCalledTimes(1));
+      await screen.findByText("refetch failed: network down");
+      expect(
+        screen.getByText("Your decision was not applied: the run now shows plan revision 3. Review it and decide again."),
+      ).toBeTruthy();
+      expect(screen.getByText("Plan two")).toBeTruthy();
+      const send = screen.getByRole("button", { name: c.send }) as HTMLButtonElement;
+      expect(send.disabled).toBe(false);
+      // Nothing newer is displayed, so there is nothing to re-bind to.
+      expect(screen.queryByRole("button", { name: /Decide on the displayed plan/ })).toBeNull();
+
+      await act(async () => {
+        fireEvent.click(send);
+      });
+      await waitFor(() => expect(submit).toHaveBeenCalledTimes(2));
+      expect(submit.mock.calls[1]).toEqual([c.verb, c.text, undefined, undefined, undefined, 2]);
+    });
+  }
+
+  // The explicit restart, end to end: the 409 reported 3, the refetch shows 4. The composer offers
+  // to decide on the plan shown (4), and the retry then names 4, never the reported 3.
+  it("the restart button re-binds an open composer to the displayed plan after a refetch", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(3);
+    });
+    const refreshRun = vi.fn(async () => {
+      streamWith(run({ status: "awaiting_approval", gate_revision: 4, plan_md: "# Plan four" }), submit, refreshRun);
+    });
+    renderGate(submit, refreshRun);
+    fireEvent.click(await screen.findByRole("button", { name: "Reject" }));
+    fireEvent.change(screen.getByPlaceholderText(/sent back to the agent/), { target: { value: "too broad" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+    });
+    await screen.findByText("Plan four");
+    expect(submit.mock.calls[0]).toEqual(["reject_plan", "too broad", undefined, undefined, undefined, 2]);
+
+    const restart = await screen.findByRole("button", { name: "Decide on the displayed plan (revision 4)" });
+    await waitFor(() => expect((restart as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(restart);
+    expect((screen.getByPlaceholderText(/sent back to the agent/) as HTMLTextAreaElement).value).toBe("too broad");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+    });
+    await waitFor(() => expect(submit).toHaveBeenCalledTimes(2));
+    expect(submit.mock.calls[1]).toEqual(["reject_plan", "too broad", undefined, undefined, undefined, 4]);
   });
 });

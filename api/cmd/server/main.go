@@ -105,6 +105,11 @@ var (
 	prdsOpen = ""
 )
 
+// The Codex usage poller discovers poke-time recovery (PRD #1732 D7) by a type assertion on
+// its collector, and a failed assertion silently skips the recovery pass. The production
+// collector is the workersvc Service, so this keeps a signature drift a build error.
+var _ codexusagepoller.Recoverer = (*workersvc.Service)(nil)
+
 // codexProviderRequestTimeout bounds one Codex provider HTTP call in the production
 // codexauth.Client (PRD #1171 M1). The refresh callback spends it only on the oauth exchange;
 // import and recovery spend it on their nonrotating identity reads. Request-entry anchoring
@@ -351,6 +356,7 @@ func run() error {
 		// the run fails with fail_origin='forge_unreachable' instead of parking again. 0 =
 		// unlimited. Counted separately from the recovery-park backoff (recovery_wait_count).
 		RunForgeUnreachableMaxParks: cfg.RunForgeUnreachableMaxParks,
+		RunGateRefusalMax:           cfg.RunGateRefusalMax,
 		// PRD #1296 D3/D4 durable-archive upload-retry window: the sweep flips a capture stuck
 		// in a non-terminal upload state past this to needs_action WITHOUT releasing its
 		// custody hold (source retained). Non-positive disables the pass.
@@ -1116,7 +1122,7 @@ func run() error {
 	var usageEngine *usagepoller.Engine
 	if cfg.UsagePollInterval > 0 {
 		anthropicClient := anthropic.New(&http.Client{Timeout: cfg.AnthropicHTTPTimeout})
-		usageEngine = usagepoller.New(q, secretopen.NewOpener(q, vlt, box), anthropicClient, cfg.UsagePollInterval, cfg.UsageProbe, slog.Default())
+		usageEngine = usagepoller.New(q, secretopen.NewOpener(vlt, box), anthropicClient, cfg.UsagePollInterval, cfg.UsageProbe, slog.Default())
 		usageEngine.SetNotifier(notifier) // PRD #1020 M2: deliver the loud early-reset DM
 		bgWG.Add(1)
 		go func() {
@@ -1438,17 +1444,15 @@ func (g gateSubmitter) GetRun(ctx context.Context, userID, runID uuid.UUID) (sto
 	return g.svc.GetRun(ctx, userID, runID)
 }
 
-// SubmitInput adapts the Slack gate's reject path to the run service. Approve goes
-// through SubmitApproval (which carries the agent source); this carries no
-// selection (reject_plan / — never approve_plan from the gate).
-func (g gateSubmitter) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string) error {
-	_, err := g.svc.SubmitInput(ctx, userID, runID, kind, body, nil)
-	// PRD #41: translate the revision-cap sentinel so the Slack replier can show
-	// the "revision limit reached" ephemeral (mirrors ErrSelectionRejected below).
-	if errors.Is(err, workersvc.ErrReviseCapReached) {
-		return slacksvc.ErrReviseCapReached
-	}
-	return err
+// SubmitInput adapts the Slack gate's reject/revise paths (and the replier's follow_up) to the
+// run service. Approve goes through SubmitApproval (which carries the agent source); this
+// carries no selection (reject_plan / revise_plan / follow_up — never approve_plan from the
+// gate). expectedGateRevision is the revision of the Slack card the verdict came from (PRD
+// #1795 M5); nil (a legacy card, a follow_up) keeps the unbound pre-#1795 behaviour.
+func (g gateSubmitter) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string, expectedGateRevision *int64) error {
+	_, err := g.svc.SubmitInputWithOptions(ctx, userID, runID, kind, body, nil,
+		workersvc.SubmitInputOptions{ExpectedGateRevision: expectedGateRevision})
+	return translateGateSubmitErr(err)
 }
 
 // SubmitApproval adapts the Slack agent-picker approve (PRD #37 M7): the gatekeeper
@@ -1457,11 +1461,30 @@ func (g gateSubmitter) SubmitInput(ctx context.Context, userID, runID uuid.UUID,
 // The server re-reads the run's roster and validates; ErrInvalidSelection (the
 // source no longer holds) is translated to the slacksvc sentinel so the gatekeeper
 // leaves the gate open. Keeping this translation in main keeps slacksvc free of a
-// workersvc import.
-func (g gateSubmitter) SubmitApproval(ctx context.Context, userID, runID uuid.UUID, source string) error {
-	_, err := g.svc.SubmitInput(ctx, userID, runID, "approve_plan", "",
-		&workersvc.AgentSelection{Source: source, Exclusions: []string{}})
-	if errors.Is(err, workersvc.ErrInvalidSelection) {
+// workersvc import. expectedGateRevision binds the approve to the card's revision, as
+// for SubmitInput.
+func (g gateSubmitter) SubmitApproval(ctx context.Context, userID, runID uuid.UUID, source string, expectedGateRevision *int64) error {
+	_, err := g.svc.SubmitInputWithOptions(ctx, userID, runID, "approve_plan", "",
+		&workersvc.AgentSelection{Source: source, Exclusions: []string{}},
+		workersvc.SubmitInputOptions{ExpectedGateRevision: expectedGateRevision})
+	return translateGateSubmitErr(err)
+}
+
+// translateGateSubmitErr maps the plan-gate sentinels the Slack gatekeeper and replier branch
+// on to their slacksvc translations, keeping slacksvc free of a workersvc import:
+// ErrReviseCapReached (PRD #41, the "revision limit reached" ephemeral), ErrInvalidSelection
+// (PRD #37 M7, the gate stays open) and *GateRevisionMismatchError (PRD #1795 M5, the card's
+// revision is no longer the run's gate: the superseded notice). Any other error passes through.
+func translateGateSubmitErr(err error) error {
+	var mismatch *workersvc.GateRevisionMismatchError
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, &mismatch):
+		return slacksvc.ErrGateRevisionMismatch
+	case errors.Is(err, workersvc.ErrReviseCapReached):
+		return slacksvc.ErrReviseCapReached
+	case errors.Is(err, workersvc.ErrInvalidSelection):
 		return slacksvc.ErrSelectionRejected
 	}
 	return err

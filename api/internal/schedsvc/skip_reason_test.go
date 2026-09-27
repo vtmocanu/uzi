@@ -10,8 +10,8 @@ import (
 // TestSkipReasonEnumIsHonest pins the Go side of the SkipReason contract internally
 // consistent (PRD #308 M3; PRD #590 M1 added vault_locked; PRD #764 retired the link-less skip;
 // issue #856 added open_mr_exists; PRD #1093 M1 added schedules_paused; PRD #1429 M2 added
-// codex_override_conflict; a PRD #1429 review fix added no_usable_credential): the closed set has
-// exactly the ten expected members with no duplicates, every benign seam sentinel maps into that
+// codex_override_conflict; a PRD #1429 review fix added no_usable_credential; PRD #1732 added
+// credential_disabled): the closed set has exactly the eleven expected members with no duplicates, every benign seam sentinel maps into that
 // set, an unrelated error maps to no reason, and the reasons the seam does not map (fetch_failed
 // is recorded at the sweep site, already_running also at the prompt site, vault_locked at the
 // self_improve site) are still enumerated. The cross-language guard that the TS reason union has
@@ -29,6 +29,7 @@ func TestSkipReasonEnumIsHonest(t *testing.T) {
 		SkipCodexOverrideConflict:   true,
 		SkipSchedulesPaused:         true,
 		SkipNoUsableCredential:      true,
+		SkipCredentialDisabled:      true,
 	}
 
 	if len(AllSkipReasons) != len(want) {
@@ -74,6 +75,8 @@ func TestSkipReasonEnumIsHonest(t *testing.T) {
 		{"ErrCredentialOverrideHarnessUnsupported", workersvc.ErrCredentialOverrideHarnessUnsupported},
 		{"ErrNoUsableCredential", workersvc.ErrNoUsableCredential},
 		{"ErrBranchInUse", workersvc.ErrBranchInUse},
+		{"ErrCredentialDisabled", workersvc.ErrCredentialDisabled},
+		{"ErrHarnessCredentialDisabled", workersvc.ErrHarnessCredentialDisabled},
 	}
 	for _, c := range mapped {
 		got, ok := skipReasonForErr(c.err)
@@ -86,5 +89,25 @@ func TestSkipReasonEnumIsHonest(t *testing.T) {
 	}
 	if r, ok := skipReasonForErr(context.DeadlineExceeded); ok {
 		t.Fatalf("skipReasonForErr(unrelated error) = (%q, true), want (_, false)", r)
+	}
+}
+
+// TestSkipReasonCredentialDisabled (PRD #1732 D2/D15): a disabled stored pin and a pinned
+// harness with no enabled credential both record credential_disabled, while a genuinely absent
+// credential for an explicit harness stays unmapped (the hard, non-advancing refusal).
+//
+// MUTATION: drop the credential_disabled arm; the disabled-harness error then falls to no
+// reason and the pin error to no reason, and this test fails.
+func TestSkipReasonCredentialDisabled(t *testing.T) {
+	for name, err := range map[string]error{
+		"disabled pin":            workersvc.ErrCredentialDisabled,
+		"disabled pinned harness": workersvc.ErrHarnessCredentialDisabled,
+	} {
+		if got, ok := skipReasonForErr(err); !ok || got != SkipCredentialDisabled {
+			t.Fatalf("%s: skipReasonForErr = (%q, %t), want credential_disabled", name, got, ok)
+		}
+	}
+	if got, ok := skipReasonForErr(workersvc.ErrNoCredentialForHarness); ok {
+		t.Fatalf("absent explicit-harness credential mapped to %q, want the hard refusal", got)
 	}
 }

@@ -111,7 +111,7 @@ describe("mrDescription — owner ACCEPT (PRD #1227 M3)", () => {
 describe("mrDescription — no completion_scope is byte-identical to today", () => {
   it("renders the exact legacy issue body (Closes present when renderCloses is true)", () => {
     const expected = [
-      "Implements issue #1.",
+      "Related to #1.",
       "",
       "Closes #1",
       "",

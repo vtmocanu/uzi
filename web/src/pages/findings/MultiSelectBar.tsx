@@ -3,20 +3,23 @@ import { Button } from "../../components/ui";
 import { dismissMenuItems } from "../../components/triage/triageCopy";
 
 // MultiSelectBar is the Findings page's sticky action bar for the checkbox selection (PRD #1183
-// M4). It is the judge MultiSelectBar with the "Mark done" button REMOVED: a finding has no human
-// "done" (done comes only from its filed issue closing), so bulk triage offers Dismiss ▾ + Clear
-// only. It matches the shared TriageActions Dismiss ▾ behaviour — Escape + outside-click close,
-// the menu button carrying aria-haspopup="menu" — and sources its two reasoned menu items from
-// triageCopy("finding") so the worker-voiced sublines cannot drift from the row's. The menu opens
-// UPWARD (`bottom-full`), like the judge bar, because this bar is pinned to the bottom of the
-// viewport.
+// M4; Mark done added by issue #1723). It mirrors the judge MultiSelectBar: Mark done · Dismiss ▾ ·
+// Clear. Mark done applies to every selected finding that is open, filed or dismissed; Dismiss
+// applies to the open ones only (the server skips the rest, and the page reports only what it
+// actually dismissed). It matches the shared TriageActions Dismiss ▾ behaviour — Escape +
+// outside-click close, the menu button carrying aria-haspopup="menu" — and sources its two
+// reasoned menu items from triageCopy("finding") so the worker-voiced sublines cannot drift from
+// the row's. The menu opens UPWARD (`bottom-full`), like the judge bar, because this bar is pinned
+// to the bottom of the viewport.
 export function MultiSelectBar({
   count,
   onClear,
+  onMarkDone,
   onDismiss,
 }: {
   count: number;
   onClear: () => void;
+  onMarkDone: () => void;
   onDismiss: (reason: "wont_do" | "not_an_issue") => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -56,6 +59,9 @@ export function MultiSelectBar({
         </span>
         <span className="text-xs text-faint">Dismiss applies to open findings only.</span>
         <div className="ml-auto flex items-center gap-2">
+          <Button size="sm" variant="secondary" onClick={onMarkDone}>
+            Mark done
+          </Button>
           <div className="relative" ref={wrapRef}>
             <Button
               size="sm"

@@ -190,7 +190,7 @@ func TestTUIDetailMetaGuardClearsOnError(t *testing.T) {
 
 	// The flaky-connection path: a detailMetaMsg for THIS run carrying err != nil. The marker must
 	// clear despite the case's err early-return.
-	next, _ := m.Update(detailMetaMsg{runID: runID, reqID: metaWaitID, err: uzicli.Exitf(uzicli.ExitGeneric, "context deadline exceeded")})
+	next, _ := m.Update(detailMetaMsg{gen: m.detail.gen, runID: runID, reqID: metaWaitID, err: uzicli.Exitf(uzicli.ExitGeneric, "context deadline exceeded")})
 	m = next.(tuiModel)
 	if m.detail.metaWaitID != 0 {
 		t.Fatal("a detailMetaMsg with err != nil did not clear metaWaitID; the detail-meta poll would wedge forever on a flaky link")
@@ -491,7 +491,7 @@ func TestTUIDetailMetaIgnoresReplyForNavigatedAwayRun(t *testing.T) {
 
 	// The late reply for run A (its old runID, reqID 1 == run B's metaWaitID): must be ignored on
 	// the runID check and must NOT clear run B's guard.
-	next, _ = m.Update(detailMetaMsg{runID: runA, reqID: 1, run: apitypes.RunDTO{ID: runA, Status: "completed"}})
+	next, _ = m.Update(detailMetaMsg{gen: m.detail.gen, runID: runA, reqID: 1, run: apitypes.RunDTO{ID: runA, Status: "completed"}})
 	m = next.(tuiModel)
 	if m.detail.metaWaitID != 1 {
 		t.Fatalf("a reply for the navigated-away run A cleared run B's guard: metaWaitID=%d, want 1", m.detail.metaWaitID)
@@ -501,7 +501,7 @@ func TestTUIDetailMetaIgnoresReplyForNavigatedAwayRun(t *testing.T) {
 	}
 
 	// A matching-run FAILED meta reply clears the guard so the next tick retries (D2).
-	next, _ = m.Update(detailMetaMsg{runID: runB, reqID: 1, err: uzicli.Exitf(uzicli.ExitGeneric, "context deadline exceeded")})
+	next, _ = m.Update(detailMetaMsg{gen: m.detail.gen, runID: runB, reqID: 1, err: uzicli.Exitf(uzicli.ExitGeneric, "context deadline exceeded")})
 	m = next.(tuiModel)
 	if m.detail.metaWaitID != 0 {
 		t.Fatal("a matching-run failed meta reply did not clear metaWaitID; the detail poll would wedge on a flaky link")

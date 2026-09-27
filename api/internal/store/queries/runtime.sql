@@ -314,6 +314,14 @@ UPDATE workers SET
     stats_disk_nix_total_bytes  = sqlc.narg('stats_disk_nix_total_bytes'),
     stats_disk_data_bytes       = sqlc.narg('stats_disk_data_bytes'),
     stats_disk_data_total_bytes = sqlc.narg('stats_disk_data_total_bytes'),
+    -- docker-in-docker volume sample (issue #1759): bytes AND inodes, same
+    -- write-every-tick-incl-NULL discipline; display-only, NEVER a disk_pressure input
+    -- (diskOverThreshold reads nix/data only, and @disk_over_threshold below never
+    -- sees these columns).
+    stats_disk_dind_bytes        = sqlc.narg('stats_disk_dind_bytes'),
+    stats_disk_dind_total_bytes  = sqlc.narg('stats_disk_dind_total_bytes'),
+    stats_disk_dind_inodes       = sqlc.narg('stats_disk_dind_inodes'),
+    stats_disk_dind_total_inodes = sqlc.narg('stats_disk_dind_total_inodes'),
     -- Disk-pressure debounce streak (PRD #837 M4). Increment (bounded to 100 so a
     -- perpetually-full worker can't overflow the counter) when THIS tick's sample is
     -- over threshold, else reset to 0 — so a single under-threshold (or absent) sample
@@ -1986,6 +1994,61 @@ WHERE id = @id AND worker_id = @worker_id
   -- awaiting_approval report is expected from a paused row.
   AND status <> 'paused';
 
+-- PRD #1795 M1: gate revision allocation. Every statement below runs inside SetState's
+-- awaiting_approval transaction, AFTER GetRunOwnedByWorkerForUpdate locked the run row and the
+-- report was classified in Go, so none of them re-checks ownership, generation or status: the
+-- lock is the fence. They are split rather than folded into SetRunAwaitingApproval so a
+-- classification that REFUSES the report writes nothing but its refusal accounting.
+
+-- name: RunGatePresentationExists :one
+-- Whether a presentation id was ever published for this run (current or historical).
+SELECT EXISTS (
+    SELECT 1 FROM run_gate_presentations
+    WHERE run_id = @run_id AND presentation_id = @presentation_id
+)::boolean AS present;
+
+-- name: PublishRunGatePresentation :one
+-- A NEW presentation: allocate gate_revision + 1, bind the presentation id (NULL for an
+-- id-less old-worker report), store the immutable presented snapshot and its digest, and reset
+-- the refusal accounting (a successful publication ends any refusal streak).
+UPDATE runs SET
+    gate_revision           = gate_revision + 1,
+    gate_presentation_id    = sqlc.narg('presentation_id'),
+    gate_presented_payload  = @presented_payload::jsonb,
+    gate_payload_digest     = @payload_digest::bytea,
+    gate_refusal_count      = 0,
+    gate_refusal_generation = NULL
+WHERE id = @id
+RETURNING gate_revision;
+
+-- name: InsertRunGatePresentation :exec
+INSERT INTO run_gate_presentations (run_id, presentation_id, revision)
+VALUES (@run_id, @presentation_id, @revision);
+
+-- name: AdoptRunGatePresentation :one
+-- An explicit adoption of an id-less gate at its current revision: bind the id and, for a
+-- migration-era gate with no snapshot yet, initialize the snapshot and digest (an existing
+-- snapshot is kept verbatim). Resets the refusal accounting like a publication.
+UPDATE runs SET
+    gate_presentation_id    = @presentation_id,
+    gate_presented_payload  = COALESCE(gate_presented_payload, @presented_payload::jsonb),
+    gate_payload_digest     = COALESCE(gate_payload_digest, @payload_digest::bytea),
+    gate_refusal_count      = 0,
+    gate_refusal_generation = NULL
+WHERE id = @id
+RETURNING gate_revision;
+
+-- name: ResetRunGateRefusals :exec
+-- A retained presentation (a current-id retry or same-gate re-presentation) was re-published.
+UPDATE runs SET gate_refusal_count = 0, gate_refusal_generation = NULL
+WHERE id = @id;
+
+-- name: SetRunGateRefusal :exec
+-- Record a refused re-presentation. The service decides the values under the row lock: the
+-- count moves only when gate_refusal_generation IS DISTINCT FROM the report's claim generation.
+UPDATE runs SET gate_refusal_count = @refusal_count, gate_refusal_generation = @refusal_generation
+WHERE id = @id;
+
 -- name: ClearRunRequiredCapabilities :execrows
 -- PRD #84 M4 (unit 4c): the user override ("run without the capability", Decision 12).
 -- When the owner approves a plan the capability gate would BLOCK — because plan-time
@@ -2000,8 +2063,13 @@ WHERE id = @id AND worker_id = @worker_id
 -- Owner-scoped (user_id) AND status-guarded (awaiting_approval only): the clear runs from
 -- the owner-authenticated approve path, and a run outside the plan gate is a no-op
 -- (0 rows), so a stray override on a running/terminal run changes nothing.
+--
+-- PRD #1795 M2: additionally scoped to the plan-gate revision the approve was bound to
+-- (@gate_revision; 0 for a legacy pre-migration gate), so an override clear that runs after a
+-- new gate was published cannot clear the requirements of a plan the owner never saw.
 UPDATE runs SET required_capabilities = '{}', updated_at = now()
-WHERE id = @id AND user_id = @user_id AND status = 'awaiting_approval';
+WHERE id = @id AND user_id = @user_id AND status = 'awaiting_approval'
+  AND gate_revision = @gate_revision::bigint;
 
 -- name: SetRunAutopilotPlan :execrows
 -- RC1 (issue #1197): durably persist an AUTOPILOT run's approved plan_md on its
@@ -2348,9 +2416,13 @@ WHERE id = @id AND user_id = @user_id AND status = 'limit_wait';
 -- terminal transitions).
 --
 -- PRD #1392 M1 (D9): this is the UNTYPED park (empty turn, and #1088's provider park once
--- it adopts recovery_wait). It CLEARS recovery_wait_cause to NULL — a later untyped park on
--- a run that forge-parked earlier must REPLACE the typed cause, not coalesce it, so its
--- surface reads the generic wording and its forge cap counter is not consulted. It does NOT
+-- it adopts recovery_wait). It REPLACES recovery_wait_cause with @recovery_cause, never
+-- coalescing it — a later untyped park on a run that forge-parked earlier must drop the typed
+-- cause, so its surface reads the generic wording and its forge cap counter is not consulted.
+-- Issue #1766 M2: the Go caller (setRecoveryWait) passes a non-NULL recovery_cause ONLY for
+-- 'vault_locked' (the worker's codex refresh/release answered 409 vault_locked: the owner's
+-- vault is locked, so the run waits for an unlock) and NULL for every other reported cause,
+-- so empty_turn/provider_outage still store NULL (D9). The column CHECK is the backstop. It does NOT
 -- touch forge_park_count: that lifetime counter belongs to the forge park alone (fact 7 /
 -- D2), so an empty-turn park neither increments nor resets it (a run keeps its forge-park
 -- lifetime count through a later empty-turn park). The forge park has its own writer,
@@ -2359,7 +2431,7 @@ UPDATE runs SET
     status                    = 'recovery_wait',
     status_since              = now(),
     recovery_wait_count       = recovery_wait_count + 1,
-    recovery_wait_cause       = NULL,
+    recovery_wait_cause       = sqlc.narg('recovery_cause')::text,
     recovery_retry_not_before = @retry_not_before,
     session_id                = COALESCE(sqlc.narg('session_id'), session_id),
     health = 'ok', health_reason = NULL, health_since = NULL,
@@ -2700,6 +2772,7 @@ UPDATE runs SET
     updated_at            = now()
 WHERE id = @id AND user_id = @user_id
   AND status = 'paused'
+  AND hold_reason IS DISTINCT FROM 'credential_disabled'
   -- D6: refuse a completion hold unless the completion decision endpoint opts in.
   AND (hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
   -- D7: refuse a budget_exhausted park with no remaining budget (extend is the way back).
@@ -2950,6 +3023,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: ClearRunMilestonesCompleted :execrows
@@ -3055,6 +3129,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: SetRunCompleted :execrows
@@ -3445,6 +3520,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: SupersedeRunByWorker :execrows
@@ -3472,6 +3548,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: FailRunAutoStop :execrows
@@ -3604,7 +3681,11 @@ UPDATE runs SET status = 'failed', status_since = now(), stop_kind = 'plan_rejec
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND user_id = @user_id
-  AND status NOT IN ('completed', 'failed', 'cancelled');
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+  -- PRD #1795 M2 (D5): a reject sent against a revision the run no longer shows does not fail
+  -- the run (0 rows; the caller re-reads and answers gate_revision_mismatch).
+  AND (sqlc.narg('expected_gate_revision')::bigint IS NULL
+       OR (status = 'awaiting_approval' AND gate_revision = sqlc.narg('expected_gate_revision')::bigint));
 
 -- name: UpdateRunLastSeq :execrows
 -- Advance the message high-water mark (never regresses) AND bump last_activity_at
@@ -5320,12 +5401,53 @@ LIMIT @lim;
 -- User inputs (steering) ---------------------------------------------------
 
 -- name: CreateRunInput :one
--- Enqueue a plain steering input (approve_plan / follow_up) for the live worker to
--- consume. This path never touches the runs row — no stop signal, no lock — so a
+-- Enqueue a plain steering input (follow_up, resume, completion_decision) for the live
+-- worker to consume. This path never touches the runs row — no stop signal, no lock — so a
 -- follow-up mid-run is a single cheap insert. Deliberate-stop verdicts go through
--- CreateStopVerdictInput instead (they must stamp runs.stop_kind atomically).
+-- CreateStopVerdictInput instead (they must stamp runs.stop_kind atomically), and a
+-- selection-less approve_plan goes through CreateGateVerdictInput (PRD #1795 M2: a plan-gate
+-- verdict is stamped with the gate revision it was sent against, which needs the run row).
+-- A plan-gate verdict (approve_plan / reject_plan / revise_plan) must never be written here:
+-- it would carry no gate binding and read as legacy.
 INSERT INTO run_user_inputs (run_id, kind, body)
 VALUES (@run_id, @kind, @body)
+RETURNING *;
+
+-- name: CreateGateVerdictInput :one
+-- PRD #1795 M2: enqueue a selection-less approve_plan verdict STAMPED with the plan-gate
+-- revision it was sent against. The leading CTE takes the run row FOR UPDATE, so the binding
+-- is computed from the row as it stands after any in-flight gate publication (SetState's
+-- awaiting_approval arm holds the same row lock while it allocates): a concurrent insert and
+-- publication serialize, and the verdict binds to exactly one revision, in commit order. The
+-- INSERT must SELECT FROM the CTE: an unreferenced SELECT ... FOR UPDATE CTE is never
+-- executed, so it would lock nothing.
+--
+-- Binding (decision 4; the run_user_inputs CHECK pins the shapes):
+--   status='awaiting_approval' AND gate_revision>0 -> 'bound', gate_revision
+--   status='awaiting_approval' AND gate_revision=0 -> NULL (legacy: a pre-migration gate)
+--   any other status                              -> 'unbound'
+--   chat / judge run                              -> NULL always (never allocates)
+--
+-- @expected_gate_revision (D5): when non-NULL the row is selected only while the run sits at
+-- that exact revision of an awaiting_approval gate, so a mismatch writes nothing and returns
+-- no row; the caller re-reads the run and answers gate_revision_mismatch.
+WITH locked AS (
+    SELECT runs.id, runs.status, runs.gate_revision, runs.kind
+    FROM runs
+    WHERE runs.id = @run_id
+      AND (sqlc.narg('expected_gate_revision')::bigint IS NULL
+           OR (runs.status = 'awaiting_approval' AND runs.gate_revision = sqlc.narg('expected_gate_revision')::bigint))
+    FOR UPDATE
+)
+INSERT INTO run_user_inputs (run_id, kind, body, gate_binding, gate_revision)
+SELECT locked.id, 'approve_plan', @body,
+       CASE WHEN locked.kind IN ('chat', 'judge') THEN NULL
+            WHEN locked.status = 'awaiting_approval' AND locked.gate_revision > 0 THEN 'bound'
+            WHEN locked.status = 'awaiting_approval' THEN NULL
+            ELSE 'unbound' END,
+       CASE WHEN locked.kind NOT IN ('chat', 'judge') AND locked.status = 'awaiting_approval' AND locked.gate_revision > 0
+            THEN locked.gate_revision END
+FROM locked
 RETURNING *;
 
 -- name: CreateRunAnswerInput :one
@@ -5422,13 +5544,28 @@ SELECT count(*) FROM run_user_inputs WHERE run_id = @run_id AND kind = 'revise_p
 -- necessarily bare: Postgres rejects a qualified one outright (`UPDATE t SET t.n = ...`
 -- gives `column "t" of relation "t" does not exist`), so "every reference in the UPDATE"
 -- is not a rule anyone could follow — it was the wording here until it was measured.
+--
+-- PRD #1795 M2: the row is STAMPED with the plan-gate binding computed from the bumped (and
+-- therefore locked) run row, exactly as CreateGateVerdictInput documents, and
+-- @expected_gate_revision joins the UPDATE's predicate (a runs-row column comparison, so it
+-- honours the rule above): a mismatch bumps no revise_count and writes no row. A 0-row result
+-- is then ambiguous between the cap and a mismatch; the caller re-reads the run to tell them
+-- apart.
 WITH bumped AS (
     UPDATE runs SET revise_count = runs.revise_count + 1
     WHERE runs.id = @run_id AND runs.revise_count < @max_revisions::int
-    RETURNING runs.id AS run_id
+      AND (sqlc.narg('expected_gate_revision')::bigint IS NULL
+           OR (runs.status = 'awaiting_approval' AND runs.gate_revision = sqlc.narg('expected_gate_revision')::bigint))
+    RETURNING runs.id AS run_id, runs.status AS run_status, runs.gate_revision AS run_gate_revision, runs.kind AS run_kind
 )
-INSERT INTO run_user_inputs (run_id, kind, body)
-SELECT bumped.run_id, 'revise_plan', @body
+INSERT INTO run_user_inputs (run_id, kind, body, gate_binding, gate_revision)
+SELECT bumped.run_id, 'revise_plan', @body,
+       CASE WHEN bumped.run_kind IN ('chat', 'judge') THEN NULL
+            WHEN bumped.run_status = 'awaiting_approval' AND bumped.run_gate_revision > 0 THEN 'bound'
+            WHEN bumped.run_status = 'awaiting_approval' THEN NULL
+            ELSE 'unbound' END,
+       CASE WHEN bumped.run_kind NOT IN ('chat', 'judge') AND bumped.run_status = 'awaiting_approval' AND bumped.run_gate_revision > 0
+            THEN bumped.run_gate_revision END
 FROM bumped
 RETURNING *;
 
@@ -5502,11 +5639,25 @@ WITH selected AS (
                               ELSE NULL END
                  ELSE LEAST(sqlc.arg('run_timeout_seconds')::int * LEAST(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), sqlc.arg('milestone_budget_cap')::int), sqlc.arg('budget_wall_ceiling_seconds')::int) END),
         updated_at       = now()
-    WHERE id = @run_id
-    RETURNING id
+    WHERE runs.id = @run_id
+      -- PRD #1795 M2 (D5): a verdict sent against a revision the run no longer shows writes
+      -- NOTHING — no selection, no milestone/contract/budget freeze, no input row.
+      AND (sqlc.narg('expected_gate_revision')::bigint IS NULL
+           OR (runs.status = 'awaiting_approval' AND runs.gate_revision = sqlc.narg('expected_gate_revision')::bigint))
+    RETURNING runs.id AS run_id, runs.status AS run_status, runs.gate_revision AS run_gate_revision, runs.kind AS run_kind
 )
-INSERT INTO run_user_inputs (run_id, kind, body)
-VALUES (@run_id, 'approve_plan', @body)
+-- PRD #1795 M2: INSERT ... SELECT FROM the update CTE (not VALUES), so the row is stamped with
+-- the binding of the row the UPDATE locked and exists only when the UPDATE matched. Binding
+-- rules: see CreateGateVerdictInput.
+INSERT INTO run_user_inputs (run_id, kind, body, gate_binding, gate_revision)
+SELECT selected.run_id, 'approve_plan', @body,
+       CASE WHEN selected.run_kind IN ('chat', 'judge') THEN NULL
+            WHEN selected.run_status = 'awaiting_approval' AND selected.run_gate_revision > 0 THEN 'bound'
+            WHEN selected.run_status = 'awaiting_approval' THEN NULL
+            ELSE 'unbound' END,
+       CASE WHEN selected.run_kind NOT IN ('chat', 'judge') AND selected.run_status = 'awaiting_approval' AND selected.run_gate_revision > 0
+            THEN selected.run_gate_revision END
+FROM selected
 RETURNING *;
 
 -- name: GetRunMilestoneFreezeSnapshot :one
@@ -5551,13 +5702,29 @@ WHERE id = $1;
 -- would contradict that clean split; auto-stop passes NULL, its identity being
 -- stop_kind='auto_stopped'. The stamp stays unconditional to avoid the
 -- parameter-type-inference pitfall the comment above already warns about.
+--
+-- PRD #1795 M2: INSERT ... SELECT FROM the update CTE, so a reject_plan row is STAMPED with the
+-- plan-gate binding of the row the UPDATE locked (rules: see CreateGateVerdictInput); cancel
+-- and stop rows stay legacy (NULL). @expected_gate_revision joins the UPDATE predicate: a
+-- mismatch stamps no stop_kind and writes no row (the caller answers gate_revision_mismatch).
+-- Only the reject_plan caller ever passes it.
 WITH stamped AS (
     UPDATE runs SET stop_kind = @stop_kind, stop_reason = @stop_reason, updated_at = now()
-    WHERE id = @run_id
-    RETURNING id
+    WHERE runs.id = @run_id
+      AND (sqlc.narg('expected_gate_revision')::bigint IS NULL
+           OR (runs.status = 'awaiting_approval' AND runs.gate_revision = sqlc.narg('expected_gate_revision')::bigint))
+    RETURNING runs.id AS run_id, runs.status AS run_status, runs.gate_revision AS run_gate_revision, runs.kind AS run_kind
 )
-INSERT INTO run_user_inputs (run_id, kind, body)
-VALUES (@run_id, @kind, @body)
+INSERT INTO run_user_inputs (run_id, kind, body, gate_binding, gate_revision)
+SELECT stamped.run_id, @kind, @body,
+       CASE WHEN @kind::text <> 'reject_plan' OR stamped.run_kind IN ('chat', 'judge') THEN NULL
+            WHEN stamped.run_status = 'awaiting_approval' AND stamped.run_gate_revision > 0 THEN 'bound'
+            WHEN stamped.run_status = 'awaiting_approval' THEN NULL
+            ELSE 'unbound' END,
+       CASE WHEN @kind::text = 'reject_plan' AND stamped.run_kind NOT IN ('chat', 'judge')
+                 AND stamped.run_status = 'awaiting_approval' AND stamped.run_gate_revision > 0
+            THEN stamped.run_gate_revision END
+FROM stamped
 RETURNING *;
 
 -- name: CreateScopeCeilingInput :one
@@ -5886,13 +6053,14 @@ WITH pending AS (
 consumed AS (
     UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
     FROM pending WHERE u.id = pending.id
-    RETURNING u.id, u.kind, u.body, u.created_at
+    RETURNING u.id, u.kind, u.body, u.created_at, u.gate_binding, u.gate_revision
 )
-SELECT consumed.id, consumed.kind, consumed.body, consumed.created_at, pending.first_consumption
+SELECT consumed.id, consumed.kind, consumed.body, consumed.created_at, pending.first_consumption,
+       consumed.gate_binding, consumed.gate_revision
 FROM consumed JOIN pending USING (id) ORDER BY consumed.id ASC;
 
 -- name: ListReplayRunInputs :many
-SELECT id, kind, body, created_at FROM run_user_inputs
+SELECT id, kind, body, created_at, gate_binding, gate_revision FROM run_user_inputs
 WHERE run_id = @run_id AND applied_at IS NULL
   AND kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
 ORDER BY id ASC
@@ -5905,7 +6073,7 @@ FROM runs WHERE id = @run_id FOR UPDATE;
 
 -- name: ListInputReceiptRows :many
 SELECT id, kind, body, created_at, consumed_at, consumed_claim_generation, consumed_worker_id, applied_at,
-       disposition
+       disposition, gate_binding, gate_revision
 FROM run_user_inputs WHERE run_id = @run_id AND id = ANY(@ids::bigint[])
   AND kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
 ORDER BY id ASC;
@@ -5914,7 +6082,7 @@ ORDER BY id ASC;
 UPDATE run_user_inputs SET consumed_at = COALESCE(consumed_at, now()), consumed_claim_generation = @claim_generation,
     consumed_worker_id = @worker_id
 WHERE run_id = @run_id AND id = ANY(@ids::bigint[]) AND applied_at IS NULL
-RETURNING id, kind, body, created_at;
+RETURNING id, kind, body, created_at, gate_binding, gate_revision;
 
 -- name: ApplyRunInputRows :execrows
 UPDATE run_user_inputs SET applied_at = now()
@@ -5968,7 +6136,7 @@ ORDER BY id ASC;
 -- model instead of minting a query-specific row type. Dropping a column here is not a
 -- local edit: it re-types this query and breaks the workersvc.Store interface, the
 -- service signature, the handler and its fake.
-SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at FROM run_user_inputs
+SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision FROM run_user_inputs
 WHERE run_id = @run_id AND kind IN ('follow_up', 'scope')
 ORDER BY id DESC;
 

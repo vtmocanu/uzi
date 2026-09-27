@@ -8,6 +8,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, type RateLimitWindow, type TokenRateLimits } from "../lib/api";
 import { useAsyncData } from "../lib/useAsyncData";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
+import { onSidebarTokensChanged } from "../lib/sidebarTokens";
 import { MICRO_METER_GRID_COLS } from "../lib/rateLimitLayout";
 import {
   formatAgo,
@@ -50,6 +51,10 @@ export function useMyRateLimits(intervalMs: number): {
     [],
   );
   usePollWhileVisible(reload, intervalMs);
+  // A credential change saved in Settings (a sidebar toggle, and since PRD #1732 an Enable
+  // or Disable) refetches at once, so a disabled token leaves every meter immediately
+  // rather than on the next poll.
+  useEffect(() => onSidebarTokensChanged(() => void reload()), [reload]);
   return { tokens: data, loading };
 }
 
@@ -192,11 +197,29 @@ function TokenMeters({ token, now }: { token: TokenRateLimits; now: number }) {
 // under the token card). Since PRD #104 it renders ONE METER PAIR PER TOKEN,
 // default first (the server orders them), each named by its label, and the Claude
 // logo leads the title (PRD #1653 D-W4).
-export function RateLimitCard() {
+export function RateLimitCard({ allDisabled = false }: { allDisabled?: boolean } = {}) {
   const { tokens, loading } = useMyRateLimits(60_000);
   const now = useNow();
 
-  if (loading || !tokens || tokens.length === 0) return null;
+  if (loading || !tokens) return null;
+  // An empty list means "no ENABLED token" since PRD #1732. Settings knows whether tokens
+  // exist but are all disabled, and says so rather than hiding the card like a token-less
+  // account.
+  if (tokens.length === 0) {
+    if (!allDisabled) return null;
+    return (
+      <Card className="space-y-2">
+        <SectionTitle className="flex items-center gap-2">
+          <ClaudeIcon className="h-4 w-4 flex-none" />
+          Claude limits
+        </SectionTitle>
+        <p className="text-sm text-muted">
+          Every Anthropic token is disabled, so uzi is not checking any usage. Enable a token above
+          to see its limits again.
+        </p>
+      </Card>
+    );
+  }
 
   return (
     <Card className="space-y-5">

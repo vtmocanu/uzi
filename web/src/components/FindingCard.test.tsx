@@ -7,12 +7,19 @@ import { api, ApiError, type RunMessage } from "../lib/api";
 
 // Mock only the network; the inert-text helpers (stripUnsafeChars), the shared triage components
 // and the isHttpsUrl link guard all run for real via importOriginal. The finding card drives only
-// the three single-finding endpoints — extend this shape only if a new api.* call appears.
+// the single-finding endpoints plus the disposition-keyed undoFinding (issue #1723) — extend this
+// shape only if a new api.* call appears.
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
   return {
     ...actual,
-    api: { fileFinding: vi.fn(), dismissFinding: vi.fn(), findingIssueDraft: vi.fn() },
+    api: {
+      fileFinding: vi.fn(),
+      dismissFinding: vi.fn(),
+      findingIssueDraft: vi.fn(),
+      markFindingDone: vi.fn(),
+      undoFinding: vi.fn(),
+    },
   };
 });
 
@@ -54,7 +61,7 @@ async function openDraft() {
 }
 
 describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
-  it("renders the two-button triage row (File issue . Dismiss, no Mark done), the To triage chip and inert text", () => {
+  it("renders the three-button triage row (File issue . Mark done . Dismiss), the To triage chip and inert text", () => {
     const { container } = render(
       <FindingCard
         id="find-1"
@@ -66,10 +73,9 @@ describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
     );
     // Info/blue accent (D10), not the amber gate / brand action tones.
     expect(container.querySelector(".border-info\\/40")).toBeTruthy();
-    // The shared row: File issue + Dismiss only. A finding has no human Mark done.
-    expect(screen.getByRole("button", { name: "File issue" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Dismiss ▾" })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
+    // The shared row, in order: File issue · Mark done · Dismiss ▾ (issue #1723 added Mark done).
+    const buttons = screen.getAllByRole("button").map((b) => b.textContent);
+    expect(buttons).toEqual(["File issue", "Mark done", "Dismiss ▾"]);
     // The one shared open-state chip.
     expect(screen.getByText("To triage")).toBeTruthy();
     // The old single-finding controls are gone.
@@ -102,6 +108,14 @@ describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
     expect(rendered).not.toMatch(/[\p{Cc}\p{Cf}]/u);
     // The markup never became an element.
     expect(rendered).toContain("Leaked");
+    // textContent cannot see attributes: assert the group's accessible name itself carries the
+    // visible (stripped) title and no control/format character (.claude/rules/web.md).
+    const group = container.querySelector('[role="group"]');
+    const label = group?.getAttribute("aria-label") ?? "";
+    const visibleTitle = screen.getByText(/^Leaked/).textContent ?? "";
+    expect(visibleTitle).toContain("ticker");
+    expect(label).toContain(visibleTitle);
+    expect(label).not.toMatch(/[\p{Cc}\p{Cf}]/u);
   });
 
   it("File issue opens the shared draft; Create posts the edits to fileFinding and shows the Filed #N chip", async () => {
@@ -208,6 +222,116 @@ describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
     await waitFor(() => expect(screen.getByText(/Already filed or resolved/)).toBeTruthy());
     expect(container.textContent).not.toContain("already resolved");
     expect(screen.getByText("resolved")).toBeTruthy();
+  });
+
+  it("Mark done posts the evidence id, shows the plain ✓ Done chip, announces it and focuses Undo", async () => {
+    mockApi.markFindingDone.mockResolvedValue({ status: "done", disposition_id: "disp-1" });
+    const { container } = render(<FindingCard id="find-1" title="Leaked ticker" location="a.go#loop" labels={[]} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+
+    await waitFor(() => expect(mockApi.markFindingDone).toHaveBeenCalledWith("find-1"));
+    // A human done: the plain "Done" chip, never the sync's "Done via".
+    expect(await screen.findByText("Done")).toBeTruthy();
+    expect(screen.queryByText(/Done via/)).toBeNull();
+    // The action row swapped for the disposed row; the persistent live region announced it and
+    // focus moved onto the Undo that just mounted.
+    const undo = screen.getByRole("button", { name: "Undo" });
+    await waitFor(() => expect(document.activeElement).toBe(undo));
+    expect(screen.queryByRole("button", { name: "File issue" })).toBeNull();
+    const region = container.querySelector('[role="status"]');
+    expect(region?.textContent).toBe("Marked done");
+  });
+
+  it("Undo keys on the returned disposition id and restores the open row", async () => {
+    mockApi.markFindingDone.mockResolvedValue({ status: "done", disposition_id: "disp-1" });
+    mockApi.undoFinding.mockResolvedValue({
+      disposition_id: "disp-1",
+      finding_id: "find-1",
+      location: "a.go#loop",
+      repo_id: "repo-uzi",
+      repo_path: "vtmocanu/uzi",
+      status: "open",
+      last_title: "Leaked ticker",
+      seen_in_runs: 1,
+    });
+    render(<FindingCard id="find-1" title="Leaked ticker" location="a.go#loop" labels={[]} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Undo" }));
+
+    await waitFor(() => expect(mockApi.undoFinding).toHaveBeenCalledWith("disp-1"));
+    const file = await screen.findByRole("button", { name: "File issue" });
+    expect(screen.getByText("To triage")).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(file));
+  });
+
+  it("Undo of a done whose coordinate was filed from the backlog lands on the Filed #N chip", async () => {
+    mockApi.markFindingDone.mockResolvedValue({ status: "done", disposition_id: "disp-1" });
+    mockApi.undoFinding.mockResolvedValue({
+      disposition_id: "disp-1",
+      finding_id: "find-1",
+      location: "a.go#loop",
+      repo_id: "repo-uzi",
+      repo_path: "vtmocanu/uzi",
+      status: "filed",
+      last_title: "Leaked ticker",
+      seen_in_runs: 1,
+      filed_issue_iid: 77,
+      filed_issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/77",
+    });
+    render(<FindingCard id="find-1" title="Leaked ticker" location="a.go#loop" labels={[]} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Undo" }));
+
+    const link = await screen.findByRole("link", { name: /Filed #77/ });
+    expect(link.getAttribute("href")).toBe("https://gitlab.example.com/vtmocanu/uzi/-/issues/77");
+    // A filed coordinate does not re-offer File issue.
+    expect(screen.queryByRole("button", { name: "File issue" })).toBeNull();
+    // No button replaces the Undo that just unmounted, so focus lands on the Filed #N link rather
+    // than dropping to document.body.
+    await waitFor(() => expect(document.activeElement).toBe(link));
+  });
+
+  it("Undo that lands on the resolved fallback focuses the card, never document.body", async () => {
+    mockApi.markFindingDone.mockResolvedValue({ status: "done", disposition_id: "disp-1" });
+    // Filed but with no issue link to show: the card falls back to its resolved advisory, which
+    // mounts neither a button nor a link.
+    mockApi.undoFinding.mockResolvedValue({
+      disposition_id: "disp-1",
+      finding_id: "find-1",
+      location: "a.go#loop",
+      repo_id: "repo-uzi",
+      repo_path: "vtmocanu/uzi",
+      status: "filed",
+      last_title: "Leaked ticker",
+      seen_in_runs: 1,
+    });
+    const { container } = render(<FindingCard id="find-1" title="Leaked ticker" location="a.go#loop" labels={[]} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Undo" }));
+
+    await waitFor(() => expect(screen.getByText(/Already filed or resolved/)).toBeTruthy());
+    const card = container.firstElementChild as HTMLElement;
+    await waitFor(() => expect(document.activeElement).toBe(card));
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
+  it("a Mark done that 409s (being filed) shows the resolved advisory", async () => {
+    mockApi.markFindingDone.mockRejectedValue(new ApiError(409, "cannot mark done (finding is being filed)"));
+    const { container } = render(<FindingCard id="find-1" title="Leaked ticker" location="a.go#loop" labels={[]} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+
+    await waitFor(() => expect(screen.getByText(/Already filed or resolved/)).toBeTruthy());
+    expect(container.textContent).not.toContain("being filed");
+    // The Mark done button unmounted with the action row: focus lands on the named card, never body.
+    const card = screen.getByRole("group", { name: "Incidental finding: Leaked ticker" });
+    expect(card).toBe(container.firstElementChild);
+    await waitFor(() => expect(document.activeElement).toBe(card));
+    expect(document.activeElement).not.toBe(document.body);
   });
 
   it("dispatches to the unrenderable fallback when the finding payload carries no id", () => {

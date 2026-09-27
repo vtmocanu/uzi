@@ -162,6 +162,15 @@ var (
 	// caller that already maps the unrecoverable outcome keeps doing so. Never returns a
 	// token. Rides CodexRefreshQuarantined.
 	ErrCodexRefreshRejected = errors.New("codex refresh rejected by the provider; re-login required")
+	// ErrCodexVaultLocked: the run owner's vault is locked, so the codex credential could
+	// not be opened or sealed (issue #1766). Returned ONLY when AuthorizeCodexCredentialOp
+	// passed for the calling worker and run both before the operation and on a recheck after
+	// the locked vault was met, so it never answers a caller whose authority was lost, even
+	// one that lost it during the provider exchange (that caller gets the authorization error).
+	// Transient: the vault may unlock, and a retry of the same operation then proceeds or
+	// reconciles. It wraps the underlying cause, so it may ride together with another
+	// sentinel (the post-exchange vault-locked seal also carries ErrCodexRefreshQuarantined).
+	ErrCodexVaultLocked = errors.New("codex credential vault is locked")
 	// errCodexObservedAhead: the caller's observed generation is HIGHER than the
 	// account's current generation, which cannot happen for an honest caller (the account
 	// is authoritative). Defensive; refuses to rotate on an impossible observation.
@@ -466,7 +475,39 @@ func (s *Service) CoordinatedCodexRefresh(ctx context.Context, wkr store.Worker,
 			return CodexRefreshResult{Outcome: CodexRefreshContended}, rerr
 		}
 	}
+	// A locked vault is answered as ErrCodexVaultLocked (issue #1766) only to a run that
+	// STILL holds authority: the vault-locked seal after the exchange is reached with the
+	// same pre-network authorization as the token path above, so authority is re-verified
+	// here too. A lost recheck returns the recheck's own error, keeping the outcome: 404/403
+	// at the handler for an ownership/capability loss, 409 credential-unavailable for a
+	// stale-state loss such as a requeue or a revoke, and 500 for a transient store/deadline
+	// error on the recheck itself; never vault_locked. The durable state the refresh left is
+	// not touched.
+	//
+	// ErrCodexAccountQuarantined alone does NOT count as lost authority here: the
+	// post-exchange vault-locked seal itself quarantines the account to retain the new
+	// login, so a full recheck would always fail on that. The quarantine check is the LAST
+	// step of evalCodexReleasePredicate, so reaching it means ownership, capability epoch,
+	// material and credential revision all still held.
+	if errors.Is(err, errVaultLocked) {
+		if _, rerr := s.AuthorizeCodexCredentialOp(operationCtx, wkr, runID, capability, ScopeStartRefresh); rerr != nil && !errors.Is(rerr, ErrCodexAccountQuarantined) {
+			return CodexRefreshResult{Outcome: res.Outcome}, rerr
+		}
+		return res, codexVaultLockedErr(err)
+	}
 	return res, err
+}
+
+// codexVaultLockedErr marks a package-private errVaultLocked from any inner vault open or
+// seal as the exported ErrCodexVaultLocked (issue #1766), keeping the original chain so
+// every other errors.Is match still holds. The codex credential entry points call it only
+// after AuthorizeCodexCredentialOp has passed both before the operation and again after it
+// failed, so a caller whose authority lapsed mid-operation gets the authorization error.
+func codexVaultLockedErr(err error) error {
+	if errors.Is(err, errVaultLocked) && !errors.Is(err, ErrCodexVaultLocked) {
+		return fmt.Errorf("%w: %w", ErrCodexVaultLocked, err)
+	}
+	return err
 }
 
 func codexRefreshOperationBudget(ctx context.Context) time.Duration {
@@ -676,7 +717,7 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 				s.markCodexIntentUnrecoverable(ctx, q, userID, operationID)
 				return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %v", ErrCodexRefreshUnrecoverable, perr)
 			}
-			return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: refreshed login retained pending vault unlock", ErrCodexRefreshQuarantined)
+			return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %w: refreshed login retained pending vault unlock", ErrCodexRefreshQuarantined, errVaultLocked)
 		}
 		_, _ = q.SetCodexRefreshIntentState(ctx, store.SetCodexRefreshIntentStateParams{State: codexIntentUnrecoverable, OperationID: operationID, UserID: userID})
 		_, _ = q.QuarantineCodexAccount(ctx, store.QuarantineCodexAccountParams{ID: accountID, UserID: userID, Op: operationID})
@@ -1005,6 +1046,28 @@ func (s *Service) ReleaseCodexCredential(ctx context.Context, wkr store.Worker, 
 		return CodexReleaseResult{}, err
 	}
 
+	result, err := s.releaseCodexCredential(ctx, &authCtx)
+	if err != nil && !errors.Is(err, errVaultLocked) {
+		return CodexReleaseResult{}, err
+	}
+
+	// Re-verify authority immediately before returning the token, or before answering a
+	// locked vault (issue #1766): no provider round-trip separates the credential read in
+	// releaseCodexCredential from this recheck, so a revoke/re-mint that landed in the
+	// interval refuses the release (with the authorization error) rather than leaking a
+	// token, or the vault state, to a run that no longer owns the credential.
+	if _, aerr := s.AuthorizeCodexCredentialOp(ctx, wkr, runID, capability, ScopeReleaseAccessToken); aerr != nil {
+		return CodexReleaseResult{}, aerr
+	}
+	if err != nil {
+		return CodexReleaseResult{}, codexVaultLockedErr(err)
+	}
+	return result, nil
+}
+
+// releaseCodexCredential opens the run's currently usable access token for an already
+// authorized release (ReleaseCodexCredential authorizes before and rechecks after).
+func (s *Service) releaseCodexCredential(ctx context.Context, authCtx *CodexAuthContext) (CodexReleaseResult, error) {
 	result := CodexReleaseResult{AuthMode: authCtx.AuthMode}
 	switch authCtx.AuthMode {
 	case codexAuthModeSubscription:
@@ -1043,13 +1106,6 @@ func (s *Service) ReleaseCodexCredential(ctx context.Context, wkr store.Worker, 
 	default:
 		return CodexReleaseResult{}, ErrCodexRunNotBound
 	}
-
-	// Re-verify authority immediately before returning the token — no provider round-trip
-	// separates the read above from this recheck, so a revoke/re-mint that landed in the
-	// interval refuses the release rather than leaking a token the run no longer owns.
-	if _, err := s.AuthorizeCodexCredentialOp(ctx, wkr, runID, capability, ScopeReleaseAccessToken); err != nil {
-		return CodexReleaseResult{}, err
-	}
 	return result, nil
 }
 
@@ -1067,6 +1123,11 @@ func (s *Service) ReleaseCodexCredential(ctx context.Context, wkr store.Worker, 
 //
 // It NEVER re-spends the old refresh token and NEVER rotates. Returns how many intents it
 // resolved.
+//
+// PRD #1732 D6/D7: the reap and the intent resolution always run — they are local, durable
+// completion of a refresh that already started, which disabling must never interrupt. Only
+// the recovery PROMOTION (an upstream identity call) requires the account to have an enabled
+// linked alias; without one the protected material stays in the slot for a later pass.
 func (s *Service) ReconcileUnresolvedCodexRefresh(ctx context.Context, userID, accountID uuid.UUID) (int, error) {
 	resolved, _, err := s.reconcileUnresolvedCodexRefresh(ctx, userID, accountID)
 	return resolved, err
@@ -1155,6 +1216,16 @@ func (s *Service) reconcileUnresolvedCodexRefresh(ctx context.Context, userID, a
 	// promotion or a verified-mismatch slot clear is a real change.
 	if acct.CoordState == codexCoordQuarantined && len(acct.RecoverySealed) > 0 &&
 		acct.RecoveryGeneration.Valid && acct.RecoveryGeneration.Int64 == acct.Generation {
+		live, lerr := s.codexAccountLive(ctx, userID, accountID)
+		if lerr != nil {
+			return resolved, changed, lerr
+		}
+		if !live {
+			// No enabled linked alias (PRD #1732 D6): no background recovery. A deferral, not a
+			// change — the slot is retained and ListUnresolvedCodexRefreshAccounts stops
+			// re-listing the account until an alias is enabled again.
+			return resolved, changed, nil
+		}
 		promChanged, perr := s.promoteCodexRecovery(ctx, q, userID, acct)
 		if perr != nil {
 			return resolved, changed, perr
@@ -1162,6 +1233,30 @@ func (s *Service) reconcileUnresolvedCodexRefresh(ctx context.Context, userID, a
 		changed = changed || promChanged
 	}
 	return resolved, changed, nil
+}
+
+// codexLivenessStore is the account-liveness read (PRD #1732 D6), kept off codexRefreshStore
+// so the refresh test fakes need not grow a method. *store.Queries satisfies it.
+type codexLivenessStore interface {
+	CountEnabledLinkedAliasesForCodexAccount(ctx context.Context, arg store.CountEnabledLinkedAliasesForCodexAccountParams) (int64, error)
+}
+
+// codexAccountLive reports whether at least one ENABLED alias is linked to the account — the
+// gate on background recovery. A store without the query fails closed (errCodexStoreUnavailable)
+// rather than recovering an account whose liveness it cannot read.
+func (s *Service) codexAccountLive(ctx context.Context, userID, accountID uuid.UUID) (bool, error) {
+	q, ok := s.q.(codexLivenessStore)
+	if !ok {
+		return false, errCodexStoreUnavailable
+	}
+	n, err := q.CountEnabledLinkedAliasesForCodexAccount(ctx, store.CountEnabledLinkedAliasesForCodexAccountParams{
+		UserID:            userID,
+		ProviderAccountID: pgconv.UUID(accountID),
+	})
+	if err != nil {
+		return false, fmt.Errorf("codex reconcile: read account liveness: %w", err)
+	}
+	return n > 0, nil
 }
 
 // codexRefreshSweepStore is the one extra query the always-on survivor sweep needs, kept off

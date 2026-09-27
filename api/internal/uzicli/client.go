@@ -318,7 +318,11 @@ type Client interface {
 	// the run's real roster (the client never composes the worker-bound body itself).
 	// discardPendingOutcome is the PRD #1391 Run B M3d (D13) confirmation, meaningful only with
 	// cancel: it discards a terminal outcome held on the worker (default false → unchanged).
-	SubmitRunInput(ctx context.Context, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool) (apitypes.RunInputResponse, error)
+	// expectedGateRevision is the PRD #1795 D5 plan-gate revision a verdict is bound to,
+	// meaningful only with approve_plan/reject_plan/revise_plan (the server 400s it on any
+	// other kind). nil omits it, keeping today's body; a stale value is a 409 whose
+	// *ExitError carries Reason ReasonGateRevisionMismatch and CurrentGateRevision.
+	SubmitRunInput(ctx context.Context, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool, expectedGateRevision *int64) (apitypes.RunInputResponse, error)
 	// DeleteWorker removes one of the caller's workers: DELETE /api/workers/{id}
 	// (204 No Content on success). A worker with active runs is a 409 (exit 5); an
 	// unknown/foreign id is a 404 (exit 4). Minting a worker stays a webui action —
@@ -538,16 +542,28 @@ type Client interface {
 	// JudgeStats the reply is an UNENVELOPED TriageDTO, and it ignores ?run= server-side (the run
 	// anchor narrows the list, never the counts), so the badge, the tabs and the strip agree.
 	GetFindingsStats(ctx context.Context, repo string) (apitypes.TriageDTO, error)
-	// UndoDismissFinding reopens a dismissed finding coordinate (PRD #1183 M5): DELETE
-	// /api/findings/{id}/dismiss, keyed on the disposition id (a dismissed coordinate may carry no
-	// evidence row, so undo keys on the ALWAYS-present disposition id, not the evidence id the
-	// file/single-dismiss POSTs use). A 404 means the coordinate is not dismissed — an
-	// unknown/foreign id or a non-dismissed one, deliberately indistinguishable — returned as the
-	// sentinel ErrFindingNotDismissed (a plain error, NOT an *ExitError, mirroring
-	// ErrNoDisposition) so `uzi findings undo` can soften it to a friendly "already undone" line
-	// and exit 0. Every other failure propagates as an *ExitError with the documented exit code.
-	// 200 → nil.
-	UndoDismissFinding(ctx context.Context, id string) error
+	// MarkFindingDone is the human "Mark done" on one finding coordinate (issue #1723): POST
+	// /api/findings/{id}/done with an empty body, keyed on the EVIDENCE id (the finding_id `uzi
+	// findings list` prints), like DismissFinding. A local write: no forge call, no spend.
+	// Allowed from open, filed (the issue link is kept), dismissed (the reason is cleared) and
+	// done. Returns {status:"done", disposition_id}; the disposition id is what UndoFinding keys
+	// on. An unknown/foreign id is a 404 (exit 4); a coordinate being filed right now is a 409
+	// (exit 5) — both straight from statusError.
+	MarkFindingDone(ctx context.Context, id string) (apitypes.MarkFindingDoneResultDTO, error)
+	// UndoFinding undoes a human verdict on a finding coordinate (issue #1723): DELETE
+	// /api/findings/{id}/disposition, keyed on the disposition id (a dismissed or done coordinate
+	// may carry no evidence row, so undo keys on the ALWAYS-present disposition id, not the
+	// evidence id the file/dismiss/done POSTs use). A dismissal returns to open; a done returns
+	// to filed when an issue link remains, else to open. Returns the undone coordinate, whose
+	// status is where it landed. A 404 from /disposition retries once on the legacy DELETE
+	// /api/findings/{id}/dismiss (same disposition id, same row shape), because a server built
+	// before #1723 has no /disposition route and would otherwise report "already undone" while
+	// the dismissal stays. A 404 from both means there is nothing to undo — an unknown/foreign id
+	// or one that is not dismissed/done, deliberately indistinguishable — returned as the sentinel
+	// ErrFindingNothingToUndo (a plain error, NOT an *ExitError, mirroring ErrNoDisposition) so
+	// `uzi findings undo` can soften it to a friendly "already undone" line and exit 0. Every
+	// other failure propagates as an *ExitError with the documented exit code.
+	UndoFinding(ctx context.Context, id string) (apitypes.IncidentalFindingDTO, error)
 	// GetReviewIssueDraft fetches the server-templated issue draft for one judge
 	// recommendation (PRD #365 M2): GET
 	// /api/runs/{runID}/review/recommendations/{recID}/issue-draft. Owner-or-admin to READ
@@ -667,12 +683,13 @@ type ProjectSyncStatus struct {
 // message, exit 0) instead of a hard not-found failure.
 var ErrNoDisposition = errors.New("no disposition to undo")
 
-// ErrFindingNotDismissed is returned by UndoDismissFinding when the coordinate had no
-// dismissal to undo (the endpoint answers 404 — an unknown/foreign id or a non-dismissed
-// coordinate, deliberately indistinguishable, no existence oracle). Like ErrNoDisposition
-// it is a plain error, NOT an *ExitError, so `uzi findings undo` can treat it as "already
-// undone" (a friendly message, exit 0) instead of a hard not-found failure.
-var ErrFindingNotDismissed = errors.New("finding is not dismissed")
+// ErrFindingNothingToUndo is returned by UndoFinding when the coordinate had no dismissal or
+// done to undo (DELETE .../disposition and its legacy DELETE .../dismiss fallback both answer
+// 404 — an unknown/foreign id or a coordinate that is open, filed or being filed, deliberately
+// indistinguishable, no existence oracle). Like
+// ErrNoDisposition it is a plain error, NOT an *ExitError, so `uzi findings undo` can treat it as
+// "already undone" (a friendly message, exit 0) instead of a hard not-found failure.
+var ErrFindingNothingToUndo = errors.New("no dismissal or done to undo")
 
 // maxRespBytes caps how much of a response body the client reads, so a broken or
 // hostile endpoint cannot make the CLI allocate without bound. 32 MiB is far above
@@ -977,6 +994,12 @@ func transportMsg(err error) string {
 // field so the CLI branches on the exact condition rather than the human message text.
 const ReasonOutcomePendingConfirmationRequired = "outcome_pending_confirmation_required"
 
+// ReasonGateRevisionMismatch is the server's typed-409 reason code (PRD #1795 D5) for a plan-gate
+// verdict sent with an expected_gate_revision the run no longer shows: a newer plan was presented,
+// or the run is no longer at the gate. Nothing was written. The body's current_gate_revision is
+// carried on *ExitError.CurrentGateRevision.
+const ReasonGateRevisionMismatch = "gate_revision_mismatch"
+
 // statusError maps a non-2xx status to an *ExitError with the documented exit
 // code, folding in the server's {"error": "..."} message when present. retryAfter
 // is the response's Retry-After header (empty when absent), read only for a 429. A
@@ -987,6 +1010,9 @@ func statusError(status int, body []byte, retryAfter string) *ExitError {
 	reason := serverErrReason(body)
 	e := buildStatusError(status, msg, retryAfter)
 	e.Reason = reason
+	if reason == ReasonGateRevisionMismatch {
+		e.CurrentGateRevision = serverErrCurrentGateRevision(body)
+	}
 	return e
 }
 
@@ -1084,6 +1110,18 @@ func serverErrReason(body []byte) string {
 		return strings.TrimSpace(e.Reason)
 	}
 	return ""
+}
+
+// serverErrCurrentGateRevision extracts current_gate_revision from a gate_revision_mismatch
+// body (PRD #1795 D5), or 0 when the body carries none (the run shows no revision).
+func serverErrCurrentGateRevision(body []byte) int64 {
+	var e struct {
+		Current int64 `json:"current_gate_revision"`
+	}
+	if json.Unmarshal(body, &e) == nil {
+		return e.Current
+	}
+	return 0
 }
 
 // parseRetryAfter parses a Retry-After header into a backoff duration. The api's

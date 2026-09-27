@@ -128,7 +128,7 @@ func TestAdminRateLimitsClaudeUnchanged(t *testing.T) {
 				{Label: "personal", IsDefault: true, Limits: apitypes.RateLimitDTO{
 					Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 12}, SevenDay: &apitypes.RateLimitWindow{Pct: 34}}},
 			}},
-			{Email: "b@example.com", VaultLocked: true}, // token-less user → one no_token row
+			{Email: "b@example.com", VaultLocked: true}, // token-less user → one no_enabled_token row (PRD #1732 D9)
 		},
 		// Codex data is present but MUST NOT surface on the claude path.
 		CodexRateLimits: []apitypes.CodexAdminRateLimitRowDTO{
@@ -149,7 +149,7 @@ func TestAdminRateLimitsClaudeUnchanged(t *testing.T) {
 	}
 	for _, want := range []string{"EMAIL", "VAULT", "TOKEN", "STATUS", "5H%", "7D%",
 		"a@example.com", "unlocked", "personal (default)", "ok", "12", "34",
-		"b@example.com", "locked", "no_token"} {
+		"b@example.com", "locked", "no_enabled_token"} {
 		if !strings.Contains(absent, want) {
 			t.Errorf("admin claude table missing %q:\n%s", want, absent)
 		}

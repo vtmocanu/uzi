@@ -15,6 +15,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import type { WorkerStats } from "./protocol.js";
+import { readDindMeterSample, type DindMeterSample } from "./dind-meter.js";
 
 /** Where cgroup v2 exposes this process's own limits + usage. */
 const DEFAULT_CGROUP_ROOT = "/sys/fs/cgroup";
@@ -59,6 +60,9 @@ export interface StatsCollectorOptions {
   nixPath?: string;
   /** The data volume to sample; the real worker passes config.dataDir (default /data). */
   dataDir?: string;
+  /** The DinD data-root sample source (issue #1759); defaults to reading the dind-meter
+   *  sidecar's file. Returns null when there is no valid, fresh sample. Injected in tests. */
+  dindMeter?: () => DindMeterSample | null;
 }
 
 /** A resolved cgroup reading before CPU% (which needs the prior sample). */
@@ -88,6 +92,7 @@ export class StatsCollector {
   private readonly statfs: (path: string) => StatfsSample;
   private readonly nixPath: string;
   private readonly dataDir: string;
+  private readonly dindMeter: () => DindMeterSample | null;
 
   private prevSource?: WorkerStats["source"];
   private prevCpuUsec?: bigint;
@@ -103,6 +108,7 @@ export class StatsCollector {
     this.statfs = opts.statfs ?? ((p) => fs.statfsSync(p));
     this.nixPath = opts.nixPath ?? DEFAULT_NIX_PATH;
     this.dataDir = opts.dataDir ?? DEFAULT_DATA_PATH;
+    this.dindMeter = opts.dindMeter ?? (() => readDindMeterSample());
   }
 
   /**
@@ -130,6 +136,7 @@ export class StatsCollector {
       // only thing whose failure returns undefined (drops the whole heartbeat).
       this.attachDisk(stats, "disk_nix_bytes", "disk_nix_total_bytes", this.nixPath);
       this.attachDisk(stats, "disk_data_bytes", "disk_data_total_bytes", this.dataDir);
+      this.attachDind(stats);
       return stats;
     } catch {
       // The process fallback should not reach here; if it somehow did, drop the
@@ -161,6 +168,25 @@ export class StatsCollector {
       stats[totalKey] = total;
     } catch {
       // Missing mount (dev/compose has no /nix) or a malformed statfs → omit the pair.
+    }
+  }
+
+  /**
+   * Attach the DinD data-root sample (issue #1759): all four disk_dind_* fields from a
+   * valid, fresh dind-meter sample, or none of them. The sidecar exists only on docker
+   * workers, so on every other worker the file is missing and the fields stay absent.
+   * The reader already rejects malformed/stale/future/inconsistent samples. Never throws.
+   */
+  private attachDind(stats: WorkerStats): void {
+    try {
+      const s = this.dindMeter();
+      if (!s) return;
+      stats.disk_dind_bytes = s.bytesUsed;
+      stats.disk_dind_total_bytes = s.bytesTotal;
+      stats.disk_dind_inodes = s.inodesUsed;
+      stats.disk_dind_total_inodes = s.inodesTotal;
+    } catch {
+      // An injected source that throws is treated as "no sample".
     }
   }
 

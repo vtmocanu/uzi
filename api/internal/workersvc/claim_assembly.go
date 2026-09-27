@@ -59,6 +59,11 @@ import (
 func (s *Service) openWithAutoRetry(ctx context.Context, run store.Run, choice secretChoice) (claimCred, secretChoice, error) {
 	cred, err := s.openAnthropic(ctx, run.UserID, choice.secretID)
 	if err != nil {
+		if choice.parkOnEmptyDefault {
+			if perr := s.parkIfDefaultSlotDisabled(ctx, run.UserID, err); perr != nil {
+				return claimCred{}, secretChoice{}, perr
+			}
+		}
 		if !choice.autoLaneRetryable() || !errors.Is(err, errCredentialUnavailable) {
 			return claimCred{}, secretChoice{}, err
 		}
@@ -74,6 +79,44 @@ func (s *Service) openWithAutoRetry(ctx context.Context, run store.Run, choice s
 		}
 	}
 	return cred, choice, nil
+}
+
+// parkIfDefaultSlotDisabled turns a default-only lane's (Judge, self-improve, chat) "no default
+// token" open failure into the credential_disabled park when the owner does hold Anthropic
+// tokens and every one of them is disabled (PRD #1732 D2/D4: disabling the slot's last token
+// cleared its default). An owner with no token at all, or with an enabled token but no default
+// (not reachable under D4), keeps today's terminal failure. It returns nil when openErr is not
+// the no-default case or the slot is not all-disabled, so the caller keeps openErr.
+func (s *Service) parkIfDefaultSlotDisabled(ctx context.Context, userID uuid.UUID, openErr error) error {
+	var noDefault noAnthropicDefaultError
+	if !errors.As(openErr, &noDefault) {
+		return nil
+	}
+	allDisabled, err := s.anthropicSlotAllDisabled(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if !allDisabled {
+		return nil
+	}
+	return fmt.Errorf("%w: every Anthropic token is disabled, so there is no default; enable one in Settings", errCredentialDisabled)
+}
+
+// anthropicSlotAllDisabled reports whether the owner holds Anthropic tokens and none of them is
+// enabled (PRD #1732 D4: the slot then has no default).
+func (s *Service) anthropicSlotAllDisabled(ctx context.Context, userID uuid.UUID) (bool, error) {
+	has, err := s.q.UserHasAnthropicToken(ctx, userID)
+	if err != nil {
+		return false, fmt.Errorf("anthropic token presence check: %w", err)
+	}
+	if !has {
+		return false, nil
+	}
+	enabled, err := s.q.UserHasEnabledAnthropicToken(ctx, userID)
+	if err != nil {
+		return false, fmt.Errorf("enabled anthropic token check: %w", err)
+	}
+	return !enabled, nil
 }
 
 // workerIdentity is the immutable, non-secret provenance label recorded on a custody
@@ -458,6 +501,25 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			resumePlanSeq = seq
 		}
 	}
+	// PRD #1795 M1: the gate resume carries the persisted gate revision, its presentation id
+	// (nil for an id-less gate) and the presented requirements, all from the immutable snapshot,
+	// never the live requirement columns. A gate published before the migration (revision 0)
+	// carries none of them.
+	var resumeGateRevision int64
+	var resumeGatePresentationID *uuid.UUID
+	var resumeGatePresented *GatePresentedRequirements
+	if resumePhase == "awaiting_approval" && run.GateRevision > 0 {
+		resumeGateRevision = run.GateRevision
+		if run.GatePresentationID.Valid {
+			id := uuid.UUID(run.GatePresentationID.Bytes)
+			resumeGatePresentationID = &id
+		}
+		if snap, ok, derr := decodeGatePresentedPayload(run.GatePresentedPayload); derr != nil {
+			slog.Error("workersvc: decode gate presented payload", "run_id", run.ID, "error", derr)
+		} else if ok {
+			resumeGatePresented = snap.requirements()
+		}
+	}
 	// Issue #1604: when the persisted plan is UNAPPROVED (both the awaiting_approval gate resume
 	// and the "" re-plan resume of a session-less run), carry when THAT plan was last shown: the
 	// latest `plan` frame whose plan_md equals the persisted run.PlanMd, so a newer frame for a
@@ -569,6 +631,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		ResumePlanSeq: resumePlanSeq,
 		// Issue #1604: when the unapproved persisted plan was last shown (nil/omitted otherwise).
 		ResumePlanAt: resumePlanAt,
+		// PRD #1795 M1: the gate resume's revision, presentation id and presented requirements.
+		ResumeGateRevision:       resumeGateRevision,
+		ResumeGatePresentationID: resumeGatePresentationID,
+		ResumeGatePresented:      resumeGatePresented,
 		// PlanSource travels to the worker so it can tell D4 row 2 (seeded, no session ⇒
 		// implement) from row 3 (dropped session, not seeded ⇒ re-plan). Server writes
 		// it in M1; the worker consumes it in M2. Additive on the wire — an old worker
@@ -699,13 +765,20 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// same-alias re-login in flight parks the run in recovery_wait, and the other
 			// credential failures (kind/mode mismatch, login blob, revoked revision, identity
 			// change, a store defect) stay terminal.
-			if errors.Is(err, errVaultLocked) || errors.Is(err, errRunVanished) || errors.Is(err, errCodexMintAmbiguous) {
+			// errCredentialDisabled (the frozen alias is disabled, refused before any mint) passes
+			// through too: finishRunClaim parks it on credential_disabled (PRD #1732 D14).
+			if errors.Is(err, errVaultLocked) || errors.Is(err, errRunVanished) || errors.Is(err, errCodexMintAmbiguous) ||
+				errors.Is(err, errCredentialDisabled) {
 				return nil, err
 			}
 			return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, err)
 		}
 		payload.Secrets.Codex = codex
 	}
+
+	// PRD #1798 D9: the existing PR's description record, for a PR-producing run whose PR
+	// already exists. Best-effort (a read error omits it); nil keeps the wire unchanged.
+	payload.PrDescription = s.claimPrDescription(ctx, run)
 
 	// issue #297: a self_improve run carries the in-flight avoid-set so the picker skips
 	// a recommendation whose fix another active run is already doing. Best-effort and

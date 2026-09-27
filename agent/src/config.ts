@@ -177,6 +177,14 @@ export interface Config {
   dockerReadyIntervalMs: number;
   dockerReadyTimeoutMs: number;
   /**
+   * issue #1759 M3: whether this docker worker may run the gated, allowlisted docker
+   * prune when its DinD data root is under pressure (UZI_DIND_PRUNE_ENABLED, rendered
+   * by the controller as "true"/"false"). ONLY the exact string "true" enables it;
+   * anything else, unset included, is off. The prune also needs a wired dockerHost
+   * (see dind-prune.ts `createDindPrune`).
+   */
+  dindPruneEnabled: boolean;
+  /**
    * PRD #1391 M1: the worker-owned authenticated message outbox tree, rooted at
    * `<dataDir>/outbox`. When the api is unreachable the batcher spills run
    * messages here as fsync'd immutable segments and a per-worker drainer replays
@@ -449,6 +457,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // Readiness wait for an EXPECTED docker sidecar (M2 follow-up). ~1s poll, ~30s budget.
     dockerReadyIntervalMs: duration(env, "UZI_DOCKER_READY_INTERVAL", "1s"),
     dockerReadyTimeoutMs: duration(env, "UZI_DOCKER_READY_TIMEOUT", "30s"),
+    // issue #1759 M3: exact "true" only (the controller renders "true"/"false").
+    dindPruneEnabled: env.UZI_DIND_PRUNE_ENABLED === "true",
     // Worker outbox (PRD #1391 M1). The tree is a fixed sibling of the recovery
     // journal under /data; the two byte quotas and the retention window are the
     // operator-tunable bounds. positiveInt keeps the byte knobs plain positive

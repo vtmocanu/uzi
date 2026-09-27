@@ -121,7 +121,7 @@ resources:
     cpu: "2"
 ```
 
-**A [docker sidecar](#docker-sidecar) costs more** on top of either number above: budget roughly an extra **1-2 GiB memory / 1 CPU** for the `dind` daemon itself, plus its own storage for pulled images and build cache — a compose `dinddata` volume, or its k8s equivalent. `dinddata` only grows; reclaim it the same way as `agentnix` (`docker compose down -v`, or `docker volume rm <project>_dinddata`) once you don't need what's cached. On a hosted k8s worker the equivalent is a persistent per-worker PVC rather than an emptyDir, and it is just as unbounded: reclaim it with `docker system prune` inside the worker, or by deleting and reprovisioning the worker, which recreates the PVC empty. Expect a real workload — uzi's own e2e suite pulls `postgres:17` and builds `api`/`web`/`agent` through the sidecar — to land in the **5-20 GiB** range.
+**A [docker sidecar](#docker-sidecar) costs more** on top of either number above: budget roughly an extra **1-2 GiB memory / 1 CPU** for the `dind` daemon itself, plus its own storage for pulled images and build cache — a compose `dinddata` volume, or its k8s equivalent. Under compose, `dinddata` only grows: reclaim it the same way as `agentnix` (`docker compose down -v`, or `docker volume rm <project>_dinddata`) once you don't need what's cached. On a hosted k8s worker the equivalent is a persistent per-worker PVC (`dind-data`), and a `dind-meter` sidecar samples its fill level and lets the worker prune its own build cache automatically once it's under pressure — see [Docker inside a worker](./worker-docker.md#dind-data-metering-and-automatic-pruning) for what that covers and what it doesn't. Expect a real workload — uzi's own e2e suite pulls `postgres:17` and builds `api`/`web`/`agent` through the sidecar — to land in the **5-20 GiB** range.
 
 **On a hosted k8s worker, a per-pod Codex command cache draws on the pod's ephemeral storage, separately from the dind budget above**: it exists only under the uid split. A worker-only emptyDir (`codex-cmd-cache`) holds one directory per run with that run's Codex command build cache (`GOMODCACHE`/`GOCACHE`/npm). It is removed at the end of any run whose command roots have all drained, and via `--remove-cache` after a cache-holder loss; otherwise it is kept on disk until the startup orphan reaper sweeps it. It counts toward `workers.ephemeralRequest`/`workers.docker.ephemeralRequest`, the docker tier's 5Gi default adds provisional headroom for it (issue #1757), unmeasured; the plain tier's 512Mi does not yet, pending a hosted measurement of a Go-heavy Codex run's peak usage.
 
@@ -138,7 +138,13 @@ What the gauges mean:
 - **Disk** shows used/total bytes per reported volume — `/nix` (the tools
   cache) and `/data`, each a separate bar when both are reported, one bar when
   only one is. A volume that fails to report (no `/nix` mount in dev/compose,
-  for instance) shows no bar for that volume rather than a misleading zero.
+  for instance) shows no bar for that volume rather than a misleading zero. A
+  docker-capable hosted worker additionally shows a **Disk dind** bar for the
+  `dind-data` volume — used/total bytes, plus an inode percentage shown
+  alongside only when the (rounded) inode fill exceeds the (rounded) byte
+  fill. It's display-only, sampled by the `dind-meter` sidecar and reported by
+  the worker on its own heartbeat; see
+  [Docker inside a worker](./worker-docker.md#dind-data-metering-and-automatic-pruning).
 - A dropped or malformed sample self-clears the gauge for that one tick (by
   design: stale-but-plausible is worse than briefly blank) rather than holding a
   stale-looking value.

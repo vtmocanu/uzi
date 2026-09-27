@@ -391,6 +391,7 @@ var wantRouteMounts = []routeMount{
 	// store read, RequireUser, no limiter, like /me/rate-limits beside it.
 	{"GET", "/api/me/codex-rate-limits", noLimiter},
 	{"GET", "/api/me/secrets/", noLimiter},
+	{"GET", "/api/me/secrets/{kind}/{id}/dependents", noLimiter},
 	{"GET", "/api/me/settings/", noLimiter},
 	{"GET", "/api/me/slack/", noLimiter},
 	// PRD #1349 M5: the owner-wide custody hold list + aggregate. Owner-scoped RequireUser read,
@@ -465,6 +466,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/ws", noLimiter},
 	{"PATCH", "/api/admin/users/{id}", noLimiter},
 	{"PATCH", "/api/me/secrets/anthropic_token/{id}", noLimiter},
+	{"PATCH", "/api/me/secrets/{kind}/{id}/enabled", noLimiter},
 	// PRD #1147 M1 codex credential patches (rename / set-default / replace): owner-scoped
 	// DB writes, no forge call, no spendable mint → noLimiter, like the anthropic PATCH above.
 	{"PATCH", "/api/me/secrets/codex_auth/{id}", noLimiter},
@@ -562,6 +564,11 @@ var wantRouteMounts = []routeMount{
 	// spend — so neither carries a per-user limiter.
 	{"POST", "/api/findings/dismiss", noLimiter},
 	{"DELETE", "/api/findings/{id}/dismiss", noLimiter},
+	// Issue #1723: human Mark done (single, bulk) and undo of either verdict are LOCAL writes
+	// too — no forge call, no spend — so none carries a per-user limiter.
+	{"POST", "/api/findings/{id}/done", noLimiter},
+	{"POST", "/api/findings/done", noLimiter},
+	{"DELETE", "/api/findings/{id}/disposition", noLimiter},
 	{"POST", "/api/controller/status", noLimiter},
 	// Controller cordon control-write (PRD #422 M4): a fleet-scoped controller-only
 	// route behind RequireController, not a per-user credential, so no per-user
@@ -732,6 +739,13 @@ var wantRouteMounts = []routeMount{
 	// intent idempotency + the plan stale-write guard rather than a per-user limiter.
 	{"POST", "/api/worker/runs/{id}/summary/intent", noLimiter},
 	{"POST", "/api/worker/runs/{id}/summary/plan", noLimiter},
+	// PRD #1798: stage rides proposalLimiter.PerWorkerMiddleware (read as noLimiter by this
+	// per-USER probe, like /proposals and /findings); TestWorkerPrDescriptionStageIsRateLimitedLiveDB
+	// drives that mount through the real WorkerRoutes. Bind/lookup/ack are unlimited.
+	{"POST", "/api/worker/runs/{id}/pr-description/stage", noLimiter},
+	{"POST", "/api/worker/runs/{id}/pr-description/bind", noLimiter},
+	{"POST", "/api/worker/runs/{id}/pr-description/lookup", noLimiter},
+	{"POST", "/api/worker/runs/{id}/pr-description/ack", noLimiter},
 	{"POST", "/api/workers/", noLimiter},
 	{"POST", "/api/workers/hosted", limHosted},
 	// PRD #685 M1: admin upload of a branding logo — cookie-only admin write, raw body

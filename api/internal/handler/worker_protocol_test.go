@@ -51,6 +51,18 @@ type protocolStore struct {
 	followUpCalled bool
 	replayRows     []store.ListReplayRunInputsRow
 	replayRunIDs   []uuid.UUID
+	// Issue #1759: the heartbeat's custody lookup (CountOpenCustodyHoldsForWorker) — the
+	// staged count/error and the params it was called with.
+	custodyHolds  int64
+	custodyErr    error
+	custodyArg    store.CountOpenCustodyHoldsForWorkerParams
+	custodyCalled bool
+}
+
+func (p *protocolStore) CountOpenCustodyHoldsForWorker(_ context.Context, arg store.CountOpenCustodyHoldsForWorkerParams) (int64, error) {
+	p.custodyArg = arg
+	p.custodyCalled = true
+	return p.custodyHolds, p.custodyErr
 }
 
 func (p *protocolStore) ClaimRun(context.Context, store.ClaimRunParams) (store.Run, error) {
@@ -106,6 +118,11 @@ func (p *protocolStore) HeartbeatWorker(_ context.Context, arg store.HeartbeatWo
 		StatsDiskNixTotalBytes:  arg.StatsDiskNixTotalBytes,
 		StatsDiskDataBytes:      arg.StatsDiskDataBytes,
 		StatsDiskDataTotalBytes: arg.StatsDiskDataTotalBytes,
+
+		StatsDiskDindBytes:       arg.StatsDiskDindBytes,
+		StatsDiskDindTotalBytes:  arg.StatsDiskDindTotalBytes,
+		StatsDiskDindInodes:      arg.StatsDiskDindInodes,
+		StatsDiskDindTotalInodes: arg.StatsDiskDindTotalInodes,
 	}, nil
 }
 
@@ -756,6 +773,172 @@ func TestWorkerHeartbeatDropsOverflowDiskFieldOnly(t *testing.T) {
 	}
 }
 
+func TestWorkerHeartbeatStoresValidDindDiskStats(t *testing.T) {
+	// Issue #1759 — a docker-tier heartbeat carrying the dind-data volume's used/total
+	// bytes AND inodes persists all four dind columns and echoes them in the worker DTO.
+	// Distinct values per field so a bytes/inodes or used/total mixup fails.
+	st := &protocolStore{}
+	h := newProtocolHandler(t, st)
+	rec := httptest.NewRecorder()
+	body := `{"version":"1","stats":{"mem_bytes":100,"source":"cgroup",` +
+		`"disk_dind_bytes":5120000,"disk_dind_total_bytes":10240000,` +
+		`"disk_dind_inodes":7000,"disk_dind_total_inodes":65536}}`
+	h.WorkerHeartbeat(rec, workerReq(http.MethodPost, body, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{
+		`"stats_disk_dind_bytes":5120000`, `"stats_disk_dind_total_bytes":10240000`,
+		`"stats_disk_dind_inodes":7000`, `"stats_disk_dind_total_inodes":65536`,
+	} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("expected %s in DTO, got %q", want, rec.Body.String())
+		}
+	}
+	arg := st.heartbeatArg
+	for name, got := range map[string]struct {
+		v    pgtype.Int8
+		want int64
+	}{
+		"StatsDiskDindBytes":       {arg.StatsDiskDindBytes, 5120000},
+		"StatsDiskDindTotalBytes":  {arg.StatsDiskDindTotalBytes, 10240000},
+		"StatsDiskDindInodes":      {arg.StatsDiskDindInodes, 7000},
+		"StatsDiskDindTotalInodes": {arg.StatsDiskDindTotalInodes, 65536},
+	} {
+		if !got.v.Valid || got.v.Int64 != got.want {
+			t.Fatalf("%s must reach the store as %d, got %+v", name, got.want, got.v)
+		}
+	}
+}
+
+func TestWorkerHeartbeatDropsNegativeDindFieldOnly(t *testing.T) {
+	// Issue #1759 — a negative dind field drops ONLY that field, never the stats object:
+	// mem/cpu, the field's valid pair, and the other dind fields all survive.
+	st := &protocolStore{}
+	h := newProtocolHandler(t, st)
+	rec := httptest.NewRecorder()
+	body := `{"version":"1","stats":{"cpu_pct":12,"mem_bytes":555,"source":"cgroup",` +
+		`"disk_dind_bytes":5120000,"disk_dind_total_bytes":10240000,` +
+		`"disk_dind_inodes":-1,"disk_dind_total_inodes":65536}}`
+	h.WorkerHeartbeat(rec, workerReq(http.MethodPost, body, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+	if !st.heartbeatArg.StatsMemBytes.Valid || st.heartbeatArg.StatsMemBytes.Int64 != 555 || !st.heartbeatArg.StatsCpuPct.Valid {
+		t.Fatalf("a negative dind field must not drop mem/cpu, got %+v", st.heartbeatArg)
+	}
+	if st.heartbeatArg.StatsDiskDindInodes.Valid {
+		t.Fatalf("negative disk_dind_inodes must be dropped (NULL), got %+v", st.heartbeatArg.StatsDiskDindInodes)
+	}
+	if !st.heartbeatArg.StatsDiskDindTotalInodes.Valid || st.heartbeatArg.StatsDiskDindTotalInodes.Int64 != 65536 {
+		t.Fatalf("the valid dind inode total must survive its negative pair, got %+v", st.heartbeatArg.StatsDiskDindTotalInodes)
+	}
+	if !st.heartbeatArg.StatsDiskDindBytes.Valid || st.heartbeatArg.StatsDiskDindBytes.Int64 != 5120000 {
+		t.Fatalf("the sibling dind bytes pair must survive, got %+v", st.heartbeatArg.StatsDiskDindBytes)
+	}
+}
+
+func TestWorkerHeartbeatDropsOverflowDindFieldOnly(t *testing.T) {
+	// Issue #1759 — an int64-overflow dind value drops ONLY that field (the *json.Number
+	// decode), leaving mem/source/cpu, its valid pair and the sibling dind pair intact.
+	st := &protocolStore{}
+	h := newProtocolHandler(t, st)
+	rec := httptest.NewRecorder()
+	body := `{"version":"1","stats":{"cpu_pct":12,"mem_bytes":555,"source":"cgroup",` +
+		`"disk_dind_bytes":99999999999999999999,"disk_dind_total_bytes":10240000,` +
+		`"disk_dind_inodes":7000,"disk_dind_total_inodes":65536}}`
+	h.WorkerHeartbeat(rec, workerReq(http.MethodPost, body, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+	if !st.heartbeatArg.StatsMemBytes.Valid || !st.heartbeatArg.StatsSource.Valid || !st.heartbeatArg.StatsCpuPct.Valid {
+		t.Fatalf("an overflow dind field must not drop mem/source/cpu, got %+v", st.heartbeatArg)
+	}
+	if st.heartbeatArg.StatsDiskDindBytes.Valid {
+		t.Fatalf("overflow disk_dind_bytes must be dropped (NULL), got %+v", st.heartbeatArg.StatsDiskDindBytes)
+	}
+	if !st.heartbeatArg.StatsDiskDindTotalBytes.Valid || st.heartbeatArg.StatsDiskDindTotalBytes.Int64 != 10240000 {
+		t.Fatalf("the valid dind total must survive its overflow pair, got %+v", st.heartbeatArg.StatsDiskDindTotalBytes)
+	}
+	if !st.heartbeatArg.StatsDiskDindInodes.Valid || st.heartbeatArg.StatsDiskDindInodes.Int64 != 7000 {
+		t.Fatalf("the sibling dind inode pair must survive, got %+v", st.heartbeatArg.StatsDiskDindInodes)
+	}
+}
+
+func TestWorkerHeartbeatDindAtFullDoesNotSetDiskOverThreshold(t *testing.T) {
+	// Issue #1759 — dind is DISPLAY-ONLY. A dind volume at 99% bytes AND 99% inodes, with
+	// nix/data low, must reach the store as DiskOverThreshold=false so HeartbeatWorker
+	// RESETS rather than increments stats_disk_pressure_streak. Built with a real 0.90
+	// threshold (newProtocolHandler's zero threshold would fire on any sample).
+	box, err := secretbox.New(make([]byte, secretbox.KeySize))
+	if err != nil {
+		t.Fatalf("new box: %v", err)
+	}
+	st := &protocolStore{}
+	h := &Handler{wsvc: workersvc.New(st, box, workersvc.Params{DiskPressureThreshold: 0.90})}
+	rec := httptest.NewRecorder()
+	body := `{"version":"1","stats":{"mem_bytes":100,"source":"cgroup",` +
+		`"disk_nix_bytes":10,"disk_nix_total_bytes":100,"disk_data_bytes":10,"disk_data_total_bytes":100,` +
+		`"disk_dind_bytes":99,"disk_dind_total_bytes":100,"disk_dind_inodes":99,"disk_dind_total_inodes":100}}`
+	h.WorkerHeartbeat(rec, workerReq(http.MethodPost, body, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+	if !st.heartbeatArg.StatsDiskDindBytes.Valid || !st.heartbeatArg.StatsDiskDindInodes.Valid {
+		t.Fatalf("precondition: the dind sample must be stored, got %+v", st.heartbeatArg)
+	}
+	if st.heartbeatArg.DiskOverThreshold {
+		t.Fatal("a full dind volume set DiskOverThreshold; dind must never feed disk_pressure")
+	}
+}
+
+// ── Heartbeat custody flag (issue #1759) ─────────────────────────────────────
+
+func TestWorkerHeartbeatRetainingUnpublishedWork(t *testing.T) {
+	// The heartbeat response's retaining_unpublished_work is TRUTHFUL: it reflects the
+	// worker's open custody-hold count, owner-scoped to the authenticated worker row's
+	// own user_id. A lookup error fails CLOSED (true): the worker reads this flag to
+	// refuse a destructive docker prune, so an unknown answer must never permit one.
+	cases := []struct {
+		name  string
+		holds int64
+		err   error
+		want  bool
+	}{
+		{name: "no open hold => false", holds: 0, want: false},
+		{name: "open hold => true", holds: 2, want: true},
+		{name: "lookup error => true (fail closed)", err: errors.New("db down"), want: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			st := &protocolStore{custodyHolds: c.holds, custodyErr: c.err}
+			h := newProtocolHandler(t, st)
+			rec := httptest.NewRecorder()
+			req := workerReq(http.MethodPost, `{"version":"1"}`, uuid.Nil)
+			wkr, _ := mw.WorkerFromContext(req.Context())
+			h.WorkerHeartbeat(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (a custody lookup error must not fail liveness), body %q", rec.Code, rec.Body.String())
+			}
+			if !st.custodyCalled {
+				t.Fatal("heartbeat never consulted CountOpenCustodyHoldsForWorker")
+			}
+			if st.custodyArg.WorkerID != wkr.ID || st.custodyArg.UserID != wkr.UserID {
+				t.Fatalf("custody lookup params = %+v, want worker %s owner %s", st.custodyArg, wkr.ID, wkr.UserID)
+			}
+			var resp struct {
+				Worker apitypes.WorkerDTO `json:"worker"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v body %q", err, rec.Body.String())
+			}
+			if resp.Worker.RetainingUnpublishedWork != c.want {
+				t.Fatalf("retaining_unpublished_work = %v, want %v", resp.Worker.RetainingUnpublishedWork, c.want)
+			}
+		})
+	}
+}
+
 func TestAdminWorkerDTOIncludesStats(t *testing.T) {
 	// The stats fields ride the shared apitypes.WorkerDTO, so the admin worker DTO
 	// inherits them for free (PRD #49 Decision 6). A worker row with a sample marshals
@@ -876,6 +1059,41 @@ func TestNoDiskStatsColumnsInSchedulingQueries(t *testing.T) {
 	if !sawWriter {
 		t.Fatal("HeartbeatWorker no longer references stats_disk_; the disk write path may have been " +
 			"renamed or dropped, making this guard vacuous")
+	}
+}
+
+func TestNoDindDiskColumnsOutsideHeartbeatWriter(t *testing.T) {
+	// Issue #1759 — the stats_disk_dind_* columns are DISPLAY-ONLY and, unlike nix/data,
+	// never a disk_pressure input. So the allowlist is tighter than the stats_disk_ guard
+	// above: ONLY the HeartbeatWorker writer may name them. Not even
+	// ListHostedWorkersForController (the one disk_pressure reader) may; the worker DTOs
+	// read them via the SELECT * / w.* expansion, which names no column.
+	files, err := filepath.Glob("../store/queries/*.sql")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("glob queries: %v (matched %d files)", err, len(files))
+	}
+	sawWriter := false
+	for _, f := range files {
+		raw, err := os.ReadFile(f) //nolint:gosec // G304: f comes from a fixed repo-relative queries/*.sql glob, never external input.
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		for _, block := range strings.Split(string(raw), "-- name:")[1:] {
+			name := strings.Fields(block)[0]
+			if !strings.Contains(block, "stats_disk_dind_") {
+				continue
+			}
+			if name == "HeartbeatWorker" {
+				sawWriter = true
+				continue
+			}
+			t.Fatalf("query %s in %s references a stats_disk_dind_ column; dind stats are display-only "+
+				"and never a disk_pressure/scheduling input (issue #1759)", name, filepath.Base(f))
+		}
+	}
+	if !sawWriter {
+		t.Fatal("HeartbeatWorker no longer references stats_disk_dind_; the dind write path may have " +
+			"been renamed or dropped, making this guard vacuous")
 	}
 }
 

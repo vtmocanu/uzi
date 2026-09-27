@@ -190,11 +190,11 @@ export function GroupRow({
           aria-label={`Select ${recommendationLabel(group.category)} ${stripUnsafeChars(group.target)}`}
           className="mt-1 h-4 w-4 shrink-0 accent-brand"
         />
-        <div className="min-w-0 flex-1">
+        <div className="min-w-0 flex-1 basis-64">
           <div className="flex flex-wrap items-center gap-2">
             <Badge tone="info">{recommendationLabel(group.category)}</Badge>
             {group.target.trim() !== "" && (
-              <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">
+              <code className="max-w-full break-all rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">
                 {stripUnsafeChars(group.target)}
               </code>
             )}

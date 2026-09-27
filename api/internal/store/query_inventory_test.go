@@ -954,6 +954,22 @@ var queryInventory = []queryPin{
 		"direct call via DELETE /findings/{id}/dismiss: a dismissed coordinate returns to open with " +
 			"dismiss_reason/resolved_at cleared (n=1), and a non-dismissed or foreign row yields " +
 			"pgx.ErrNoRows -> 404"},
+	{"MarkFindingDoneByCoordinate", "findings.sql", "TestMarkFindingDoneLiveDB",
+		"direct call via POST /findings/{id}/done (issue #1723): done from open / filed (iid+url " +
+			"kept, close_synced_at untouched) / dismissed (reason cleared) / done / sync done (set_via " +
+			"-> NULL, close_synced_at preserved); the absent-disposition INSERT arm stores the canonical " +
+			"content_hash + title; a filing row returns pgx.ErrNoRows -> 409 with the row unchanged; a " +
+			"second user and an admin get 404. The close-sync interplay is in forgesvc " +
+			"TestFindingCloseSyncKeepsHumanDoneLiveDB (forgesvc is not in inventoryPackages)"},
+	{"BulkMarkFindingsDone", "findings.sql", "TestBulkMarkFindingsDoneLiveDB",
+		"direct call via POST /findings/done (issue #1723): open/filed/dismissed/done move to a human " +
+			"done and are returned; a duplicate id is applied once, filing/foreign/unknown ids are " +
+			"skipped, a second user and an admin move nothing"},
+	{"UndoFindingDisposition", "findings.sql", "TestUndoFindingDispositionLiveDB",
+		"direct call via DELETE /findings/{id}/disposition (issue #1723): a done carrying an issue " +
+			"link returns to filed (iid kept, resolved_at non-null; a sync done keeps close_synced_at), " +
+			"a done from open/dismissed and a dismissal return to open (resolved_at/reason NULL); " +
+			"open/filed/filing/foreign/admin/unknown -> 404"},
 	{"SweepStrandedFilingFindings", "findings.sql", "TestSweepStrandedFilingFindingsLiveDB",
 		"direct call, both directions and fixture-scoped: a `filing` coordinate whose filing_since " +
 			"is older than the cutoff is reset to `open` (n>=1, read back as open with filing_since " +

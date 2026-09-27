@@ -5,9 +5,9 @@
 -- reseed of that path fails with EACCES and surfaced only as the generic 'agent_failure'. The
 -- worker now refuses to push, capture or reseed when it cannot prove the run's execution stopped
 -- (surviving or unverifiable run-owned processes) or cannot clear or quarantine residue at the
--- run's clone path, and fails the run typed with a NEW seventeenth fail_origin,
+-- run's clone path, and fails the run typed with a NEW eighteenth fail_origin,
 -- 'worker_residue_blocked', instead of guessing. This migration is the schema half: it widens
--- runs_fail_origin_check with that seventeenth value.
+-- runs_fail_origin_check with that eighteenth value.
 --
 -- 'worker_residue_blocked' is WORKER-REPORTABLE: the worker detects the unproven quiescence or
 -- the unclearable residue and reports it on its `failed` state (workersvc/failorigin.go's
@@ -24,9 +24,9 @@
 -- The migration number is a draft: it is renumbered above the live head at landing.
 --
 -- The fail_origin CHECK is `runs_fail_origin_check` (created inline-unnamed in 00126, Postgres
--- auto-named it <table>_<column>_check; widened by 00137, 00139, 00186, 00232, 00235, 00238 and
--- 00250). Drop and re-add it with the widened set: the sixteen values carried verbatim from
--- 00250's Up plus 'worker_residue_blocked'. Immediate DROP+ADD (no NOT VALID), the 00186
+-- auto-named it <table>_<column>_check; widened by 00137, 00139, 00186, 00232, 00235, 00238, 00250
+-- and 00260). Drop and re-add it with the widened set: the seventeen values carried verbatim from
+-- 00260's Up plus 'worker_residue_blocked'. Immediate DROP+ADD (no NOT VALID), the 00186
 -- template: the CHECK validates against the existing rows on ADD, which is cheap for this small
 -- domain column.
 ALTER TABLE runs DROP CONSTRAINT runs_fail_origin_check;
@@ -48,12 +48,13 @@ ALTER TABLE runs ADD CONSTRAINT runs_fail_origin_check
         'history_rewritten',
         'task_undispatched',
         'plan_missing',
+        'gate_presentation_refused',
         'worker_residue_blocked'
     ));
 
 -- +goose Down
 
--- Narrow runs_fail_origin_check back to the sixteen-value set (00250's Up). Any
+-- Narrow runs_fail_origin_check back to the seventeen-value set (00260's Up). Any
 -- 'worker_residue_blocked' rows written while this migration was applied would violate the
 -- narrower CHECK, so clear the now-forbidden value first. NULL it (fail_origin is nullable)
 -- rather than DELETE the rows: a down-migration undoing this FEATURE must not destroy whole run
@@ -77,5 +78,6 @@ ALTER TABLE runs ADD CONSTRAINT runs_fail_origin_check
         'forge_unreachable',
         'history_rewritten',
         'task_undispatched',
-        'plan_missing'
+        'plan_missing',
+        'gate_presentation_refused'
     ));

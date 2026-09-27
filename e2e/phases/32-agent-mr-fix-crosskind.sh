@@ -25,9 +25,9 @@ say "PRD #6: agent-MR same-branch fix + cross-kind race"
 # own manual POST and one loses with a 409 (one ci_fix per ref), flaking the phase
 # intermittently (the "no fail message; last output: curl 409" nightly failures,
 # issue #1155). Disable the poller for the duration; the trap restores it even if an
-# assertion below fails and exits this phase's subshell early. Other ci-fix phases
-# post on ref=main, which the agent/issue-N-only detector ignores, so only this one
-# needs it.
+# assertion below fails and exits this phase's subshell early. The detector also covers a
+# ci_fix run's own fix branch (queries/ci_autofix.sql, kind-awareness), so any phase that
+# posts a failing pipeline on one (05-lane-forgejo) must disable it too; a red ref=main is ignored.
 apiput /api/admin/settings '{"settings":{"ci_autofix_enabled":"false"}}' >/dev/null
 trap 'apiput /api/admin/settings '\''{"settings":{"ci_autofix_enabled":"true"}}'\'' >/dev/null 2>&1 || true' EXIT
 

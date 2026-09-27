@@ -124,12 +124,16 @@ const (
 // plus TestDinDDataDefaultFitsTheChartsLimitRangeMax, which fails if this outgrows the
 // chart's ceiling. Move them together.
 //
-// RESIDUAL, documented rather than built, and it is the identical one nixSize
-// carries for /nix: the cache now PERSISTS across pod rolls and nothing garbage-
-// collects it, so a long-lived docker worker's image cache only grows into this
-// fixed volume. The emptyDir at least died with the pod. `docker system prune` is
-// the remedy and an agent can run it; v1's fallback is the same as everywhere else
-// here — delete + reprovision.
+// RESIDUAL, narrowed by issue #1759: the cache PERSISTS across pod rolls, so a
+// long-lived docker worker's image cache grows into this fixed volume (the emptyDir
+// at least died with the pod). It was the identical residual nixSize carries for
+// /nix, with nothing garbage-collecting it. Since #1759 the dind-meter sidecar
+// (dindMeterContainer) samples this volume's statfs from the DinD side, and the
+// WORKER runs a gated, allowlisted `docker` prune against the daemon when the sample
+// crosses its threshold — gated on UZI_DIND_PRUNE_ENABLED, which podTemplate renders
+// true only when disk self-heal is on and the worker is not ephemeral. The disk-
+// pressure recycle (materializer.go) still deletes only /nix and /data, never this
+// claim, so the prune is the ONLY reclaim path short of delete + reprovision.
 const dindDataDefaultSize = "20Gi"
 
 // dindDataSize is the DinD data-root PVC size: the cluster's override when set,
@@ -212,6 +216,12 @@ var (
 // shared socket dir; NONE of the worker's token/`/data`(cache)/`/nix`. A `docker run -v
 // <anything>:/x` then binds this container's fs, which holds none of them. render_test.go
 // pins this.
+//
+// The data root's fill level is metered by a SEPARATE, unprivileged sidecar
+// (dindMeterContainer, issue #1759), not by this container and not by the worker: the
+// meter mounts the same dind-data claim READ-ONLY and publishes a statfs sample into
+// its own emptyDir, which the worker mounts read-only. So the worker still never
+// mounts dind-data, and this privileged container gains no new mount.
 func dindContainer(cfg RenderConfig) corev1.Container {
 	always := corev1.ContainerRestartPolicyAlways
 	privileged := true
@@ -397,6 +407,116 @@ done
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: dindSocketVolume, MountPath: dindSocketDir},
+		},
+	}
+}
+
+// The dind-meter sidecar's wiring (issue #1759). The meter mounts the DinD data-root
+// claim READ-ONLY at its own path (dindMeterDataDir — not the daemon's posture-specific
+// data root, so one script serves both postures) and writes its sample into a private
+// emptyDir that the worker mounts READ-ONLY at the same path.
+//
+// THE SAMPLE FILE IS A CONTRACT COUPLED TO agent/src/dind-meter.ts (the worker-side
+// parser). dindMeterFile holds exactly one line:
+//
+//	v1 <epoch_s> <frsize> <blocks> <bfree> <files> <ffree>
+//
+// single-space separated, newline-terminated, all fields base-10 non-negative integers:
+// epoch_s is `date +%s` at sampling time; frsize/blocks/bfree/files/ffree are statfs's
+// fragment size in bytes, total and free blocks (in frsize units), and total and free
+// inodes (`stat -f` %S %b %f %c %d). bfree (not bavail) because the daemon runs as root
+// in one posture and the reserved blocks are then usable. The file is replaced
+// atomically (write .tmp, then mv) every dindMeterIntervalSeconds; a failed sample
+// leaves the previous file in place, and the worker treats a sample older than its
+// freshness bound (90s, three intervals) as absent. Change the line shape only by
+// bumping the leading version token, in lockstep with the parser.
+const (
+	dindMeterContainerName   = "dind-meter"
+	dindMeterVolume          = "dind-meter"
+	dindMeterDir             = "/run/uzi-dind-meter"
+	dindMeterFile            = dindMeterDir + "/statfs"
+	dindMeterDataDir         = "/dind-data"
+	dindMeterIntervalSeconds = 30
+)
+
+// dindMeterResources: REQUIRED for the same ResourceQuota reason as dindInitResources
+// (a quota on cpu or memory rejects a pod with any container declaring none, native
+// sidecars included). Deliberately NO ephemeral-storage: the whole pod budget belongs
+// on the worker container (see TestWorkerDeclaresTheWholeEphemeralBudgetAndNoOtherContainerDoes).
+var dindMeterResources = corev1.ResourceRequirements{
+	Requests: corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("10m"),
+		corev1.ResourceMemory: resource.MustParse("16Mi"),
+	},
+	Limits: corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("50m"),
+		corev1.ResourceMemory: resource.MustParse("32Mi"),
+	},
+}
+
+// dindMeterScript samples statfs of the read-only dind-data mount every interval and
+// publishes the v1 line (see dindMeterFile) atomically. POSIX sh / busybox only. No
+// `set -e`: a failed stat or write must skip one sample, never end the loop (a dead
+// meter would restart under restartPolicy Always anyway, but a transient error should
+// not cost a restart). On a failed stat it writes NOTHING and leaves the previous file:
+// the worker's freshness bound turns a stale sample into "no sample". A failed stat
+// prints one fixed line to the container's stderr (stat's own output stays discarded) so
+// a meter that can never sample is visible in `kubectl logs`, not silent.
+func dindMeterScript() string {
+	return fmt.Sprintf(`set -u
+while :; do
+  if s=$(stat -f -c '%%S %%b %%f %%c %%d' %[1]s 2>/dev/null); then
+    t=$(date +%%s) && printf 'v1 %%s %%s\n' "$t" "$s" > %[2]s.tmp && mv -f %[2]s.tmp %[2]s
+  else
+    echo "dind-meter: statfs sample failed" >&2
+  fi
+  sleep %[3]d
+done
+`, dindMeterDataDir, dindMeterFile, dindMeterIntervalSeconds)
+}
+
+// dindMeterContainer is the DinD data-root meter (issue #1759): a NATIVE SIDECAR
+// (restartPolicy Always) rendered for docker workers in BOTH postures, after dind. It
+// exists so the worker can see how full the dind-data PVC is WITHOUT mounting it (the
+// worker never mounts dind-data, Decision 3) and without widening the controller's or
+// the worker's RBAC (no metrics API, no kubelet stats).
+//
+// Unprivileged, and the least-privileged container in the pod: the worker's own uid/gid
+// (10001, non-root), no privilege escalation, a read-only root filesystem, ALL
+// capabilities dropped, RuntimeDefault seccomp. statfs needs no read permission on the
+// mounted directory, so the rootless daemon's uid-1000-owned root (or the root daemon's
+// /var/lib/docker) is measurable from uid 10001 without being readable.
+//
+// Mounts EXACTLY two volumes: dind-data READ-ONLY at dindMeterDataDir, and its own
+// dind-meter emptyDir (rw) at dindMeterDir. NONE of token/data/nix/codex-cache/workdir.
+//
+// No startupProbe on purpose: the meter must never gate the worker. A native sidecar
+// without one counts as started once its process is running, so pod start proceeds to
+// the worker immediately after it; a missing or stale sample only disables the prune.
+func dindMeterContainer(cfg RenderConfig) corev1.Container {
+	always := corev1.ContainerRestartPolicyAlways
+	uid, gid := workerUID, workerGID
+	runAsNonRoot := true
+	noEscalation := false
+	readOnlyRoot := true
+	return corev1.Container{
+		Name:          dindMeterContainerName,
+		Image:         cfg.DinDImage,
+		RestartPolicy: &always,
+		Command:       []string{"/bin/sh", "-c", dindMeterScript()},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsNonRoot:             &runAsNonRoot,
+			RunAsUser:                &uid,
+			RunAsGroup:               &gid,
+			AllowPrivilegeEscalation: &noEscalation,
+			ReadOnlyRootFilesystem:   &readOnlyRoot,
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		},
+		Resources: dindMeterResources,
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: dindDataVolume, MountPath: dindMeterDataDir, ReadOnly: true},
+			{Name: dindMeterVolume, MountPath: dindMeterDir},
 		},
 	}
 }

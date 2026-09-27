@@ -47,7 +47,7 @@ func TestSubmitApproveBlocksOnUnmetCapability(t *testing.T) {
 	if fs.createdApproval != nil {
 		t.Fatal("a blocked approve must NOT enqueue an approve_plan input")
 	}
-	if fs.createdInput != nil {
+	if fs.createdInput != nil || fs.createdGateVerdict != nil {
 		t.Fatal("a blocked approve must not take the plain enqueue path either")
 	}
 }
@@ -65,7 +65,7 @@ func TestSubmitApproveNilSelectionAlsoBlocks(t *testing.T) {
 	if !errors.Is(err, ErrCapabilityUnmet) {
 		t.Fatalf("nil-selection approve_plan must be blocked, got %v", err)
 	}
-	if fs.createdApproval != nil || fs.createdInput != nil {
+	if fs.createdApproval != nil || fs.createdInput != nil || fs.createdGateVerdict != nil {
 		t.Fatal("a blocked nil-selection approve must enqueue nothing on either path")
 	}
 }
@@ -149,7 +149,7 @@ func TestOverrideClearsThenApproveSucceeds(t *testing.T) {
 	// Re-arm the run's requirement (the sanity call did not clear it) and apply the override.
 	fs.runByID.RequiredCapabilities = []string{"docker"}
 	fs.createdApproval = nil
-	if err := svc.OverrideRunRequiredCapabilities(context.Background(), user, runID); err != nil {
+	if err := svc.OverrideRunRequiredCapabilities(context.Background(), user, runID, 0); err != nil {
 		t.Fatalf("OverrideRunRequiredCapabilities: %v", err)
 	}
 	if fs.clearedCaps == nil {

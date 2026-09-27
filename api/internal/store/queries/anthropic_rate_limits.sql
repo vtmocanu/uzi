@@ -20,47 +20,97 @@
 -- #1020): the poller gates the early-reset alert on the owner's per-user opt-in
 -- without a second per-token lookup. INNER JOIN on the owning user is total — every
 -- user_secret has an owner — so it drops no token.
-SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset
+--
+-- A DISABLED token is not listed (PRD #1732 D1: background polling stops on
+-- disable). enablement_rev is captured with the row so the poll's write can be
+-- fenced on the revision it started at (D13, see UpsertRateLimits).
+SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset,
+       s.enablement_rev
 FROM user_secrets s
 JOIN users u ON s.user_id = u.id
-WHERE s.kind = 'anthropic_token'
+WHERE s.kind = 'anthropic_token' AND s.disabled_at IS NULL
 ORDER BY s.user_id, s.id;
+
+-- name: GetAnthropicTokenToPoll :one
+-- The single-token sibling of ListAnthropicTokensToPoll for the out-of-band poke
+-- (PRD #1732 M3a): the named token when @secret_id is set, else the owner's
+-- default. Same projection as the listing, so the poke opens exactly the row it
+-- resolved (never "whatever the default is by open time") and captures the same
+-- enablement_rev fence. A disabled token resolves to no row, so a poke never polls
+-- it (D1).
+SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset,
+       s.enablement_rev
+FROM user_secrets s
+JOIN users u ON s.user_id = u.id
+WHERE s.user_id = @user_id AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
+  AND (s.id = sqlc.narg(secret_id)::uuid
+       OR (sqlc.narg(secret_id)::uuid IS NULL AND s.is_default));
 
 -- name: GetRateLimitsForToken :one
 -- The full stored gauge row for ONE token (PRD #1020): the poller reads the prior
 -- reading before writing the new one, so it can compare the previously reported reset
 -- time against the fresh reading and detect an early window reset.
-SELECT * FROM anthropic_rate_limits WHERE user_secret_id = $1;
+--
+-- Only a reading taken at the poll's own enablement revision counts as prior (PRD
+-- #1732 D13): a reading from before a disable is no comparison basis after the
+-- re-enable, so it reads as no row and cannot fire an alert.
+SELECT * FROM anthropic_rate_limits
+WHERE user_secret_id = @user_secret_id AND enablement_rev = @enablement_rev;
 
--- name: UpsertRateLimits :exec
+-- name: UpsertRateLimits :execrows
 -- Overwrite ONE token's gauge row each poll tick (PRD #53 D4, repointed by #104
 -- M5). A malformed reading never reaches here (the poller fails closed and keeps
 -- the last good row, D5), so every write carries a complete reading.
 --
 -- user_id rides along rather than being looked up: the caller already has it from
--- the poll listing, and it is half of the composite FK that ties this row to a
--- (user, token) pair that exists.
+-- the poll listing. Since PRD #1732 it is a fence predicate (s.user_id = @user_id):
+-- the row to write is selected FROM user_secrets for exactly that (owner, token)
+-- pair, so a mismatched pair selects nothing and writes 0 rows on the insert path
+-- AND the conflict path. Ownership is therefore re-validated on every write,
+-- including an upsert over an existing row; the composite FK (checked only on the
+-- INSERT path, since ON CONFLICT .. DO UPDATE does not touch user_id) is a second
+-- guard behind it.
 --
--- The FK is checked on the INSERT path only: ON CONFLICT .. DO UPDATE deliberately
--- does not touch user_id, so an upsert over an EXISTING row rewrites the reading
--- without re-validating ownership. That is safe BY CONSTRUCTION, not by the
--- caller's discipline — user_secret_id is the global PRIMARY KEY of user_secrets,
--- so an id belongs to exactly one owner for its whole life and no call site can
--- construct a mismatched (user_id, user_secret_id) pair to smuggle through the
--- conflict path. Stated this way on purpose: "the poller always passes a matching
--- pair" would be the weaker true reason, and the weaker one is the one that rots
--- the moment someone adds a third caller.
+-- 🔴 FENCED on the credential's enablement revision (PRD #1732 D13). The row is
+-- written only while the token is still enabled AT @enablement_rev, the revision
+-- the poll captured when it started, so a poll that started before a disable (or
+-- before a disable and the following re-enable) writes nothing: the SELECT yields
+-- no row and the statement affects 0 rows, which the caller reads as "not written"
+-- and then must not notify. FOR SHARE serialises the check against the transition
+-- (SetSecretEnablement's UPDATE, and the handler's FOR UPDATE, conflict with it):
+-- a transition that commits first makes this re-check see the new revision and
+-- write nothing, and one that comes second waits for this write. Without it the
+-- write still waits behind the enablement handler's FOR UPDATE (the FK's KEY SHARE
+-- check conflicts with it) but then lands the old revision's reading, because the
+-- fence was evaluated before the wait; TestRateLimitFenceSerializesWithTransitionLiveDB
+-- measures exactly that.
+-- The row is stamped with the revision it was polled at, which is what hides it
+-- from every reader once the revision moves on.
 INSERT INTO anthropic_rate_limits (
     user_secret_id, user_id, five_hour_pct, five_hour_resets_at,
-    seven_day_pct, seven_day_resets_at, source, synced_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    seven_day_pct, seven_day_resets_at, source, synced_at, enablement_rev
+)
+SELECT s.id, s.user_id,
+       sqlc.narg(five_hour_pct)::smallint,
+       sqlc.narg(five_hour_resets_at)::timestamptz,
+       sqlc.narg(seven_day_pct)::smallint,
+       sqlc.narg(seven_day_resets_at)::timestamptz,
+       sqlc.narg(source)::text,
+       sqlc.narg(synced_at)::timestamptz,
+       s.enablement_rev
+FROM user_secrets s
+WHERE s.id = @user_secret_id AND s.user_id = @user_id
+  AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
+  AND s.enablement_rev = @enablement_rev
+FOR SHARE OF s
 ON CONFLICT (user_secret_id) DO UPDATE SET
     five_hour_pct       = EXCLUDED.five_hour_pct,
     five_hour_resets_at = EXCLUDED.five_hour_resets_at,
     seven_day_pct       = EXCLUDED.seven_day_pct,
     seven_day_resets_at = EXCLUDED.seven_day_resets_at,
     source              = EXCLUDED.source,
-    synced_at           = EXCLUDED.synced_at;
+    synced_at           = EXCLUDED.synced_at,
+    enablement_rev      = EXCLUDED.enablement_rev;
 
 -- name: ListRateLimitsForUser :many
 -- One user's meters, one row per TOKEN, for GET /api/me/rate-limits (PRD #104 D4 —
@@ -82,6 +132,13 @@ ON CONFLICT (user_secret_id) DO UPDATE SET
 -- as a string, so the web never re-derives eligibility from pcts and timestamps
 -- (D21). The LEFT JOIN above is what makes "never polled" expressible at all — an
 -- INNER JOIN would drop exactly the token whose silent ineligibility R7 is about.
+-- A reading counts only at the token's current enablement revision (PRD #1732
+-- D13): the rev match lives in the LEFT JOIN, so a reading from before a disable
+-- makes the token read as never polled after the re-enable until a fresh one lands.
+--
+-- A DISABLED token is not listed at all (PRD #1732 D1, M4): the owner's meters are a
+-- live view, and a suspended credential has no live reading. GET /api/me/secrets
+-- (ListSecretEnablement) is where the owner still sees it, with enabled:false.
 SELECT s.id            AS user_secret_id,
        s.label         AS label,
        s.is_default    AS is_default,
@@ -93,8 +150,9 @@ SELECT s.id            AS user_secret_id,
        rl.source,
        rl.synced_at
 FROM user_secrets s
-LEFT JOIN anthropic_rate_limits rl ON rl.user_secret_id = s.id
-WHERE s.user_id = $1 AND s.kind = 'anthropic_token'
+LEFT JOIN anthropic_rate_limits rl
+       ON rl.user_secret_id = s.id AND rl.enablement_rev = s.enablement_rev
+WHERE s.user_id = $1 AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
 ORDER BY s.is_default DESC, lower(s.label) ASC;
 
 -- name: ListRateLimits :many
@@ -118,6 +176,11 @@ ORDER BY s.is_default DESC, lower(s.label) ASC;
 -- token as un-pooled — a confident, uniform, wrong answer, which is worse than the
 -- field being absent. It is nullable through the LEFT JOIN (a token-less user's row
 -- has no secret at all), and that row is skipped before the flag is read.
+--
+-- A DISABLED token yields no row and no count (PRD #1732 D9, M4). The filter lives in
+-- the user_secrets JOIN condition, not in WHERE, so a user whose tokens are all
+-- disabled still appears exactly as a token-less user does (one row, NULL secret id,
+-- an empty tokens array), rather than vanishing from the admin list.
 SELECT
     u.id            AS user_id,
     u.email         AS email,
@@ -133,8 +196,11 @@ SELECT
     rl.source,
     rl.synced_at
 FROM users u
-LEFT JOIN user_secrets s ON s.user_id = u.id AND s.kind = 'anthropic_token'
-LEFT JOIN anthropic_rate_limits rl ON rl.user_secret_id = s.id
+LEFT JOIN user_secrets s
+       ON s.user_id = u.id AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
+-- Current-revision readings only (PRD #1732 D13), as in ListRateLimitsForUser.
+LEFT JOIN anthropic_rate_limits rl
+       ON rl.user_secret_id = s.id AND rl.enablement_rev = s.enablement_rev
 ORDER BY u.email ASC, s.is_default DESC NULLS LAST, lower(s.label) ASC;
 
 -- name: ListAutoSelectCandidates :many
@@ -146,8 +212,19 @@ ORDER BY u.email ASC, s.is_default DESC NULLS LAST, lower(s.label) ASC;
 -- (autoselect.Classify, D21); filtering here would split it between SQL and Go, and
 -- the ranker could then no longer tell "the user pooled nothing" from "the user
 -- pooled tokens that are all stale" — different fallback reasons that send a user to
--- different places (settings vs. the poller). The WHERE clause is ownership and
--- kind, which are facts about which rows EXIST, never about which are pickable.
+-- different places (settings vs. the poller). The WHERE clause is ownership, kind
+-- and enablement, which are facts about which rows EXIST for selection, never about
+-- which are pickable.
+--
+-- 🔴 A DISABLED token (disabled_at IS NOT NULL, PRD #1732 D1/D8) is filtered HERE,
+-- the one exception, because it is not an eligibility nuance the ranker weighs: a
+-- disabled credential does not exist for any auto lane, pooled or not. Leaving it in
+-- let autoselect.Select pick a disabled pooled token, the claim finisher park the
+-- run on credential_disabled, the promoter resume it (another token IS enabled), and
+-- the next claim pick the same disabled token again, on every sweep. Every caller
+-- (claim-time autoChoice, pool_wait promotion, limit_wait re-evaluation, the
+-- set-token warning) must see the pool without it, so the filter lives in the one
+-- query they share. Its stored auto_eligible flag is kept (D8) and returns on Enable.
 --
 -- Both LEFT JOINs are load-bearing for the same reason. A token with no gauge row
 -- must appear and classify `no_reading` rather than vanish — that row IS R7's silent
@@ -182,7 +259,11 @@ SELECT s.id                     AS user_secret_id,
        rl.synced_at,
        COALESCE(f.n, 0)::bigint AS in_flight_runs
 FROM user_secrets s
-LEFT JOIN anthropic_rate_limits rl ON rl.user_secret_id = s.id
+-- 🔴 The rev match is what keeps a pre-disable reading out of auto-selection after
+-- a re-enable (PRD #1732 D13): such a token classifies no_reading, which Select
+-- skips, until the re-enable's own poll lands a reading at the new revision.
+LEFT JOIN anthropic_rate_limits rl
+       ON rl.user_secret_id = s.id AND rl.enablement_rev = s.enablement_rev
 LEFT JOIN (
     -- 🔴 'limit_wait' IS EXCLUDED DELIBERATELY, AND WIDENING THIS STATUS SET TO
     -- INCLUDE IT IS WRONG (PRD #35, ADR-35 D4). This is the line someone reaches for
@@ -223,6 +304,7 @@ LEFT JOIN (
 ) f ON f.sid = s.id
 WHERE s.user_id = @user_id
   AND s.kind = 'anthropic_token'
+  AND s.disabled_at IS NULL
 ORDER BY s.id;
 
 -- name: MarkFiveHourExhausted :execrows
@@ -268,11 +350,14 @@ SET seven_day_pct = 100, source = 'limit_report'
 WHERE user_secret_id = $1;
 
 -- name: UserHasAnthropicToken :one
--- Whether the user holds an anthropic_token secret, for GET /api/me/rate-limits:
--- the handler derives `no_token` from this (secret-existence), not from the
--- rate_limits rows being absent. Deliberately NOT filtered on is_default — it
--- answers "does this user have any credential at all", which is the question
--- `no_token` asks. Never selects the ciphertext.
+-- Whether the user holds an anthropic_token secret at all, enabled or disabled
+-- (secret-existence, not the rate_limits rows being absent). Callers are the worker
+-- claim path's credential checks in workersvc: claim_assembly.go
+-- (anthropicSlotAllDisabled: tokens held but none enabled), credential_disabled.go
+-- (noAnthropicTokenAtAll: release a held lane with nothing left to enable) and
+-- harness_resolver.go (explicitHarnessRefusal: disabled vs no credential). Deliberately
+-- NOT filtered on is_default or disabled_at: it answers "does this user have any
+-- credential at all". Never selects the ciphertext.
 SELECT EXISTS (
     SELECT 1 FROM user_secrets WHERE user_id = $1 AND kind = 'anthropic_token'
 );

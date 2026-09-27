@@ -314,6 +314,14 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		return res, fmt.Errorf("resume pool-wait runs: %w", err)
 	}
 
+	// Credential-disabled promotion (PRD #1732 D14): the restart-safe fallback to the
+	// post-commit pass that enable, default and binding changes request. It resumes a run
+	// parked on paused/credential_disabled once its exact requirement is enabled again, and
+	// never bypasses an owner pause or a spent budget (the promote query's guards).
+	if res.CredentialPromoted, err = s.promoteAllCredentialDisabledRuns(ctx); err != nil {
+		return res, fmt.Errorf("promote credential-disabled runs: %w", err)
+	}
+
 	// Custody-release reconciler (PRD #1296 M4, D3): the boot/periodic backstop that
 	// settles a recorded successful publication whose best-effort terminal release
 	// (SetState) failed, leaving an open hold's live FKs set and its worker un-reapable.

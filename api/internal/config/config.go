@@ -478,6 +478,15 @@ type Config struct {
 	// recovery_wait_count so the empty-turn park keeps its no-lifetime-cap contract (fact 7).
 	RunForgeUnreachableMaxParks int
 
+	// Plan-gate re-presentation refusal cap (PRD #1795 M1, RUN_GATE_REFUSAL_MAX). A refused
+	// awaiting_approval report (a historical presentation id, a changed payload on the current
+	// id, or a stale adoption) publishes nothing and the worker parks through the transient
+	// recovery path, so the next claim re-presents. The refusal is counted once per claim
+	// generation; the refusal that would push the count past this cap fails the run with
+	// fail_origin='gate_presentation_refused'. 0 = unlimited (never fail on the count); the
+	// default (3) lives in Load.
+	RunGateRefusalMax int
+
 	// CI status integration (PRD #6). The pipeline sync rides the existing poller
 	// tick (no new interval). CIWatchRunWindow bounds how long a finished run's
 	// branch stays watched after it completes; CIWatchMaxRefs caps how many run
@@ -1060,6 +1069,10 @@ func Load() (Config, error) {
 	// park". Default 6 (≈ an hour of parks at the recovery-park defaults; more once earlier
 	// parks raise the backoff).
 	cfg.RunForgeUnreachableMaxParks = parseNonNegInt("RUN_FORGE_UNREACHABLE_MAX_PARKS", 6)
+	// Plan-gate re-presentation refusal cap (PRD #1795 M1). parseNonNegInt, so
+	// RUN_GATE_REFUSAL_MAX=0 is legal and means "unlimited", the same off switch as
+	// RUN_FORGE_UNREACHABLE_MAX_PARKS. Default 3 refused claims.
+	cfg.RunGateRefusalMax = parseNonNegInt("RUN_GATE_REFUSAL_MAX", 3)
 
 	cfg.SkillMaxBytes = parseInt("SKILL_MAX_BYTES", 65536)
 	cfg.SkillsMaxPerRun = parseInt("SKILLS_MAX_PER_RUN", 32)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -167,10 +168,134 @@ func (s *Service) ClaimChat(ctx context.Context, wkr store.Worker) (*ChatClaimPa
 		return nil, err
 	}
 	payload, err := s.assembleChatClaim(ctx, run)
+	if errors.Is(err, errCredentialDisabled) {
+		return nil, s.parkChatCredentialDisabled(ctx, wkr, run)
+	}
 	if err != nil {
 		return nil, s.recoverClaimAssembly(ctx, run, err)
 	}
-	return payload, nil
+	if h := s.claimHooks; h != nil && h.afterChatAssembly != nil {
+		h.afterChatAssembly(ctx, run)
+	}
+	return s.finishChatClaim(ctx, wkr, run, payload)
+}
+
+// chatFinishOutcome is what one finishChatClaimTx attempt decided.
+type chatFinishOutcome int
+
+const (
+	chatFinishDeliver chatFinishOutcome = iota // the credential is still enabled: deliver
+	chatFinishParked                           // parked on credential_disabled: idle, published
+	chatFinishIdle                             // another transition won the claim: idle
+)
+
+// finishChatClaim is the chat lane's counterpart to the run lane's claimCredentialDisabled
+// re-check (PRD #1732 D1/D14): assembleChatClaim opened the owner's default token outside any
+// lock, so a disable committing between that open and the delivery would otherwise still hand
+// the worker a disabled token. It re-checks the credential the claim recorded under the chat
+// row's lock and parks the undelivered claim instead. A 55P03 (the credential row is held by a
+// concurrent disable) rolls back and retries, bounded like finishRunClaim, and past the budget
+// returns the error with no payload and no mutation. With no transaction source (fake-store
+// unit tests) there is no fenced re-check and the payload is delivered as assembled.
+func (s *Service) finishChatClaim(ctx context.Context, wkr store.Worker, run store.Run, payload *ChatClaimPayload) (*ChatClaimPayload, error) {
+	if s.txBeginner == nil {
+		return payload, nil
+	}
+	for attempt := 1; ; attempt++ {
+		outcome, err := s.finishChatClaimTx(ctx, wkr, run)
+		if err == nil {
+			switch outcome {
+			case chatFinishParked:
+				s.publishSwept(run.ID, "paused")
+				return nil, nil
+			case chatFinishIdle:
+				return nil, nil
+			}
+			return payload, nil
+		}
+		if !isLockNotAvailable(err) || attempt >= finishRunClaimAttempts {
+			return nil, err
+		}
+		timer := time.NewTimer(finishRunClaimRetryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("finish chat claim retry: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+// finishChatClaimTx is one attempt of finishChatClaim's transaction. Its lock order is the chat
+// row FOR UPDATE, then the recorded credential row FOR SHARE NOWAIT; it never takes the user's
+// secret mutation lock (which a disable holds before the credential row), so it never waits on
+// that writer while holding the run row. A concurrent disable either committed first (seen
+// here: the chat parks) or waits for this decision (the claim was issued first and finishes,
+// D3). A missing credential row is not this classification.
+func (s *Service) finishChatClaimTx(ctx context.Context, wkr store.Worker, run store.Run) (chatFinishOutcome, error) {
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return chatFinishIdle, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := store.New(tx)
+	locked, err := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{
+		ID: run.ID, WorkerID: pgconv.UUID(wkr.ID),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return chatFinishIdle, nil
+	}
+	if err != nil {
+		return chatFinishIdle, err
+	}
+	if locked.Status != "claimed" || locked.Kind != runkind.Chat {
+		return chatFinishIdle, nil // cancelled or reclaimed since: deliver nothing
+	}
+	if locked.AnthropicSecretID.Valid {
+		disabled, err := q.LockSecretEnablementForShareNowait(ctx, store.LockSecretEnablementForShareNowaitParams{
+			ID: uuid.UUID(locked.AnthropicSecretID.Bytes), UserID: locked.UserID,
+		})
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+		case err != nil:
+			return chatFinishIdle, err
+		case disabled:
+			n, err := q.ParkCredentialDisabledChatRun(ctx, store.ParkCredentialDisabledChatRunParams{
+				ID: run.ID, WorkerID: pgconv.UUID(wkr.ID),
+			})
+			if err != nil {
+				return chatFinishIdle, fmt.Errorf("park chat on credential_disabled: %w", err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return chatFinishIdle, err
+			}
+			if n != 1 {
+				return chatFinishIdle, nil
+			}
+			return chatFinishParked, nil
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return chatFinishIdle, err
+	}
+	return chatFinishDeliver, nil
+}
+
+// parkChatCredentialDisabled holds an undelivered chat claim on credential_disabled (PRD #1732
+// D2/D14) instead of failing it or spending another token: chat is not bindable and takes no
+// per-run override (D16), so it waits for the owner to enable a token (the promoter then
+// queues it again). The claim is idle either way; a 0-row park means another transition won.
+func (s *Service) parkChatCredentialDisabled(ctx context.Context, wkr store.Worker, run store.Run) error {
+	n, err := s.q.ParkCredentialDisabledChatRun(ctx, store.ParkCredentialDisabledChatRunParams{
+		ID: run.ID, WorkerID: pgconv.UUID(wkr.ID),
+	})
+	if err != nil {
+		return fmt.Errorf("park chat on credential_disabled: %w", err)
+	}
+	if n == 1 {
+		s.publishSwept(run.ID, "paused")
+	}
+	return nil
 }
 
 // assembleChatClaim builds the chat claim payload for an already-claimed chat run.
@@ -203,8 +328,14 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 
 	// nil, and it stays nil: chat is deliberately NOT bindable (PRD #104 D1), so a
 	// bound worker's chat runs still spend the owner's default token.
+	// PRD #1732 D2: openAnthropic refuses a disabled row (errCredentialDisabled), and a slot
+	// whose tokens are all disabled has no default: both hold the chat on credential_disabled
+	// (ClaimChat) rather than failing it; a token-less owner keeps today's failure.
 	cred, err := s.openAnthropic(ctx, run.UserID, nil)
 	if err != nil {
+		if perr := s.parkIfDefaultSlotDisabled(ctx, run.UserID, err); perr != nil {
+			return nil, perr
+		}
 		return nil, err
 	}
 	// Chat records its credential too (PRD #111 M1). Its reason is always "default"

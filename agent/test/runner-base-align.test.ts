@@ -9,7 +9,7 @@ import { nullLogger } from "./helpers.js";
 import { type Executor, type RunContext, type ExecutorResult } from "../src/executor.js";
 import { RunRunner, composeBaseAlignConflictReason, type RunnerOptions } from "../src/runner.js";
 import { Outbox } from "../src/outbox.js";
-import { isNonFastForwardRejection } from "../src/git.js";
+import { RunnerCloneImportError, isNonFastForwardRejection } from "../src/git.js";
 import { GitHubClient } from "../src/forge.js";
 import {
   api,
@@ -1134,5 +1134,175 @@ describe("RunRunner — preserved_patch is attached only after a clean exact-tex
     assert.strictEqual(failed.fail_origin, "finalize_base_align_conflict");
     assert.strictEqual(failed.preserved_patch, undefined);
     assert.strictEqual(scans(), 1);
+  });
+});
+
+// issue #1769 m2: a self-contained (Codex) runner clone has no alternate into the worker bare, so
+// the fresh default tip fetchDefaultTip brought into the bare is imported into the clone
+// (ensureRunnerCloneObjects) before any align strategy anchors it. An import failure happens
+// BEFORE any merge/rebase, so it fails typed with an import-stage reason that never claims one ran.
+describe("RunRunner — finalize base-align in a self-contained clone (issue #1769 m2)", () => {
+  const IMPORT_TEXT = /could not import the default branch's new objects into the runner clone/;
+  const failedFor = (runId: string) =>
+    api.states.find((s) => s.runId === runId && s.body.status === "failed")?.body;
+  const statusTexts = (runId: string): string[] =>
+    api
+      .messages(runId)
+      .filter((m) => m.kind === "status")
+      .map((m) => String((m.payload as { text?: unknown }).text ?? ""));
+  const sandboxed = (exec: Executor): Executor => ({ ...exec, sandboxesCommands: true });
+  const failImport = (): { count: () => number } => {
+    let n = 0;
+    git.ensureRunnerCloneObjects = (async (_bare: string, clonePath: string, tip: string) => {
+      n++;
+      throw new RunnerCloneImportError(clonePath, tip, "index-pack exited 128: simulated");
+    }) as typeof git.ensureRunnerCloneObjects;
+    return { count: () => n };
+  };
+
+  it("imports the fresh default tip into the self-contained clone, then the overlay aligns and pushes", async () => {
+    seedWorkflowsOnOrigin();
+    const { github, calls } = fakeGitHub();
+    const strategies = spyAlign();
+    const imports: { tipInCloneBefore: boolean; haves: string[] }[] = [];
+    const orig = git.ensureRunnerCloneObjects.bind(git);
+    git.ensureRunnerCloneObjects = (async (bare: string, clonePath: string, tip: string, haves: string[]) => {
+      let tipInCloneBefore = true;
+      try {
+        execFileSync("git", ["-C", clonePath, "cat-file", "-e", `${tip}^{commit}`], { env: ENV, stdio: "pipe" });
+      } catch {
+        tipInCloneBefore = false;
+      }
+      imports.push({ tipInCloneBefore, haves });
+      return orig(bare, clonePath, tip, haves);
+    }) as typeof git.ensureRunnerCloneObjects;
+    const claim = githubClaim(1769);
+    await githubRunner(github, sandboxed(committingExecutor(
+      { "impl.ts": "export const x = 1;\n" },
+      { ".github/workflows/ci.yml": CI_V2 },
+    ))).execute(claim);
+
+    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, ["running", "running", "completed"]);
+    assert.strictEqual(imports.length, 1, "imported once, before the strategies");
+    assert.strictEqual(imports[0]!.tipInCloneBefore, false, "the self-contained clone could not read the fresh tip before the import");
+    assert.ok(imports[0]!.haves.length >= 1);
+    assert.deepStrictEqual(strategies, ["workflow-subtree"]);
+    assert.strictEqual(calls.length, 1, "the PR was opened");
+    assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-1769:impl.ts"]), "export const x = 1;");
+    assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-1769:.github/workflows/ci.yml"]), CI_V2.trim());
+  });
+
+  it("an import failure fails typed with the import-stage reason and status, preserving the patch, before any strategy", async () => {
+    seedWorkflowsOnOrigin();
+    const { github, calls } = fakeGitHub();
+    const strategies = spyAlign();
+    const imports = failImport();
+    let pushed = false;
+    git.pushBranch = (async () => {
+      pushed = true;
+    }) as typeof git.pushBranch;
+    const claim = githubClaim(1780);
+    await githubRunner(github, sandboxed(committingExecutor(
+      { "impl.ts": "export const x = 1;\n" },
+      { ".github/workflows/ci.yml": CI_V2 },
+    ))).execute(claim);
+
+    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, ["running", "running", "failed"]);
+    assert.strictEqual(imports.count(), 1);
+    assert.deepStrictEqual(strategies, [], "no overlay, merge or rebase was attempted");
+    assert.strictEqual(pushed, false, "nothing was pushed");
+    assert.strictEqual(calls.length, 0, "no PR");
+    const failed = failedFor(claim.run_id)!;
+    assert.strictEqual(failed.fail_origin, "finalize_base_align_conflict");
+    assert.strictEqual(failed.failure_reason, composeBaseAlignConflictReason("main", true, "import"));
+    assert.match(failed.failure_reason ?? "", IMPORT_TEXT);
+    assert.doesNotMatch(failed.failure_reason ?? "", /merge then rebase|tried to merge/);
+    assert.match(failed.failure_reason ?? "", /Your diff is preserved below\./);
+    assert.ok(failed.preserved_patch, "the agent's diff is preserved");
+    assert.match(failed.preserved_patch!, /impl\.ts/);
+    const texts = statusTexts(claim.run_id);
+    const importStatus = texts.find((t) => IMPORT_TEXT.test(t));
+    assert.ok(importStatus, `an import-stage status was emitted (got ${JSON.stringify(texts)})`);
+    assert.match(importStatus!, /failing and preserving the diff for a human to land$/);
+    assert.ok(!texts.some((t) => /merge and rebase conflicted/.test(t)), "no status claims a merge/rebase ran");
+  });
+
+  it("an import failure with an untrustworthy patch scan withholds the patch and says so", async () => {
+    seedWorkflowsOnOrigin();
+    const { github } = fakeGitHub();
+    failImport();
+    git.scanPatchForSecrets = (async () => ({ trusted: false, findings: [] })) as typeof git.scanPatchForSecrets;
+    git.pushBranch = (async () => undefined) as typeof git.pushBranch;
+    const claim = githubClaim(1781);
+    await githubRunner(github, sandboxed(committingExecutor(
+      { "impl.ts": "export const x = 1;\n" },
+      { ".github/workflows/ci.yml": CI_V2 },
+    ))).execute(claim);
+
+    const failed = failedFor(claim.run_id)!;
+    assert.strictEqual(failed.fail_origin, "finalize_base_align_conflict");
+    assert.strictEqual(failed.preserved_patch, undefined, "the patch is withheld");
+    assert.strictEqual(failed.failure_reason, composeBaseAlignConflictReason("main", false, "import"));
+    assert.match(failed.failure_reason ?? "", IMPORT_TEXT);
+    assert.doesNotMatch(failed.failure_reason ?? "", /preserved below/);
+    assert.match(failed.failure_reason ?? "", /recoverable \(export it with `uzi run export`\)\.$/);
+    const importStatus = statusTexts(claim.run_id).find((t) => IMPORT_TEXT.test(t));
+    assert.match(importStatus ?? "", /failing \(the diff is withheld: it could not be preserved or did not scan clean\)$/);
+  });
+
+  it("the align-stage reason and statuses are unchanged by the stage parameter", async () => {
+    // The pre-#1769 align reason, byte for byte (default stage and explicit "align").
+    const legacy = (tail: string, branch = "main") =>
+      `This run's branch is behind the default branch (${branch}) on .github/workflows files, which uzi's ` +
+      "GitHub bot token cannot push while they differ from the default (its scope is `repo`, without " +
+      "`workflow`, by design). uzi tried to merge then rebase the current default into the branch to " +
+      "realign those files, but could not realign and safely push it, so the run failed without " +
+      "pushing. The work is valid; a human can rebase and land it. See docs/github-bot-setup.md." + tail;
+    const preservedTail = " Your diff is preserved below.";
+    const withheldTail = " The committed work is on the run's branch and is recoverable (export it with `uzi run export`).";
+    assert.strictEqual(composeBaseAlignConflictReason("main"), legacy(preservedTail));
+    assert.strictEqual(composeBaseAlignConflictReason("main", true, "align"), legacy(preservedTail));
+    // The align withheld variant drops the token-scope parenthetical so its recovery tail fits
+    // the cap with the branch name intact (it used to overflow: the branch collapsed to "…" and
+    // the final slice cut the tail).
+    const withheld = composeBaseAlignConflictReason("main", false, "align");
+    assert.ok(withheld.length <= 512, `capped at 512 (got ${withheld.length})`);
+    assert.ok(withheld.includes("(main)"), withheld);
+    assert.ok(withheld.endsWith(withheldTail), withheld);
+    assert.ok(withheld.endsWith("`uzi run export`)."), withheld);
+    assert.ok(!withheld.includes("its scope is `repo`"), withheld);
+    assert.match(withheld, /docs\/github-bot-setup\.md/);
+    const longWithheld = composeBaseAlignConflictReason("y".repeat(600), false, "align");
+    assert.ok(longWithheld.length <= 512, `capped at 512 (got ${longWithheld.length})`);
+    assert.match(longWithheld, /\(y+…\) on \.github\/workflows/);
+    assert.ok(longWithheld.endsWith(withheldTail), longWithheld);
+
+    // A real align conflict (test (c)'s fixture) keeps its status text.
+    seedWorkflowsOnOrigin({ "conflict.txt": "base\n" });
+    git.changedFiles = (async () => null) as typeof git.changedFiles;
+    const { github } = fakeGitHub();
+    git.pushBranch = (async () => undefined) as typeof git.pushBranch;
+    const claim = githubClaim(1782);
+    await githubRunner(github, committingExecutor(
+      { "conflict.txt": "branch side\n" },
+      { "conflict.txt": "main side\n", ".github/workflows/ci.yml": CI_V2 },
+    )).execute(claim);
+    const failed = failedFor(claim.run_id)!;
+    assert.strictEqual(failed.failure_reason, legacy(preservedTail));
+    assert.ok(statusTexts(claim.run_id).includes(
+      "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded); failing and preserving the diff for a human to land",
+    ));
+  });
+
+  it("the import-stage reason keeps the doc link and tail within the cap for a long branch name", () => {
+    for (const preserved of [true, false]) {
+      const long = composeBaseAlignConflictReason("x".repeat(300), preserved, "import");
+      assert.ok(long.length <= 512, `capped at 512 (got ${long.length})`);
+      assert.match(long, /docs\/github-bot-setup\.md/);
+      assert.match(long, IMPORT_TEXT);
+      assert.match(long, preserved ? /Your diff is preserved below\.$/ : /`uzi run export`\)\.$/);
+    }
   });
 });

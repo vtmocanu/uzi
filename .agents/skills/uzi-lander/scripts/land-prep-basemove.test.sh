@@ -26,7 +26,9 @@
 #   N. deleting the FIRST copy of a repeated heading (its bullet stranded under the section
 #      above) is refused: only exactly what --collapse makes is accepted;
 #   O. a branch whose later commit rewords its own earlier CHANGELOG bullet stops with exit 5
-#      instead of a union keeping both wordings (#1644).
+#      instead of a union keeping both wordings (#1644);
+#   P. a blank-separated [Unreleased] union keeps main's blank lines, so the guard stays quiet;
+#   Q. ...and so does a sparse one (one existing entry, both sides appending).
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -347,4 +349,36 @@ grep -qF 'a side deletes or rewords a line' "$WORK/out.219" || fail "O: the rewo
 [ -d "$(git -C "$WORK/wt-219" rev-parse --git-path rebase-merge)" ] || fail "O: worktree not left mid-rebase"
 git -C "$WORK/wt-219" rebase --abort
 
-echo "PASS land-prep base move: disjoint tolerated without re-gate, overlap/conflict refused, CHANGELOG union auto-resolve, heading collapse and guard"
+# P. main's [Unreleased] separates entries with one blank line (the current CHANGELOG.md
+#    style); branch and main each append an entry at the same spot. The union keeps every
+#    blank line main carries, so the removal guard does not fire: exit 0, no removed line.
+git -C "$SEED" switch -q main
+printf '## [Unreleased]\n\n### Fixed\n\n- **one**\n  one desc\n\n- **two**\n  two desc\n\n## [0.1.0] - 2026-01-01\n\n- **old**\n' > "$SEED/CHANGELOG.md"
+git -C "$SEED" commit -qam 'blank-separated changelog'; git -C "$SEED" push -q origin main
+cl_two() { awk -v add="$2" -v desc="$3" '{print} $0=="  two desc"{print ""; print add; print desc}' "$1" > "$1.tmp" && mv "$1.tmp" "$1"; }
+mk_branch bp; cl_two "$SEED/CHANGELOG.md" '- **branch p**' '  branch desc'; commit_push bp 'branch p'
+git -C "$SEED" switch -q main; cl_two "$SEED/CHANGELOG.md" '- **main p**' '  main desc'; git -C "$SEED" commit -qam 'main p'; git -C "$SEED" push -q origin main
+run bp 220 --no-push --gate none
+[ "$rc" -eq 0 ] || fail "P: a blank-separated CHANGELOG union returned rc=$rc, want 0: $(cat "$WORK/out.220")"
+grep -q 'auto-resolved the CHANGELOG.md conflict' "$WORK/out.220" || fail "P: the conflict was not union-resolved: $(cat "$WORK/out.220")"
+git -C "$WORK/wt-220" diff origin/main..HEAD -- CHANGELOG.md | awk '/^-/ && !/^--- /{f=1} END{exit !f}' && fail "P: the branch deletes CHANGELOG lines: $(git -C "$WORK/wt-220" diff origin/main..HEAD -- CHANGELOG.md)"
+printf '## [Unreleased]\n\n### Fixed\n\n- **one**\n  one desc\n\n- **two**\n  two desc\n\n- **main p**\n  main desc\n\n- **branch p**\n  branch desc\n\n## [0.1.0] - 2026-01-01\n\n- **old**\n' > "$WORK/p.want"
+diff -u "$WORK/p.want" "$WORK/wt-220/CHANGELOG.md" || fail "P: the union did not keep one blank line between entries"
+
+# Q. Sparse: main's [Unreleased] holds ONE entry; branch and main each append theirs after a
+#    blank line. No item pair exists outside the conflict, yet main's blank line survives:
+#    exit 0, no removed line (the review of #1788 reproduced exit 9 here).
+git -C "$SEED" switch -q main
+printf '## [Unreleased]\n\n### Fixed\n\n- **one**\n  one desc\n\n## [0.1.0] - 2026-01-01\n\n- **old**\n' > "$SEED/CHANGELOG.md"
+git -C "$SEED" commit -qam 'sparse changelog'; git -C "$SEED" push -q origin main
+cl_one_desc() { awk -v add="$2" -v desc="$3" '{print} $0=="  one desc"{print ""; print add; print desc}' "$1" > "$1.tmp" && mv "$1.tmp" "$1"; }
+mk_branch bq; cl_one_desc "$SEED/CHANGELOG.md" '- **branch q**' '  branch desc'; commit_push bq 'branch q'
+git -C "$SEED" switch -q main; cl_one_desc "$SEED/CHANGELOG.md" '- **main q**' '  main desc'; git -C "$SEED" commit -qam 'main q'; git -C "$SEED" push -q origin main
+run bq 221 --no-push --gate none
+[ "$rc" -eq 0 ] || fail "Q: a sparse CHANGELOG union returned rc=$rc, want 0: $(cat "$WORK/out.221")"
+grep -q 'auto-resolved the CHANGELOG.md conflict' "$WORK/out.221" || fail "Q: the conflict was not union-resolved: $(cat "$WORK/out.221")"
+git -C "$WORK/wt-221" diff origin/main..HEAD -- CHANGELOG.md | awk '/^-/ && !/^--- /{f=1} END{exit !f}' && fail "Q: the branch deletes CHANGELOG lines: $(git -C "$WORK/wt-221" diff origin/main..HEAD -- CHANGELOG.md)"
+printf '## [Unreleased]\n\n### Fixed\n\n- **one**\n  one desc\n\n- **main q**\n  main desc\n\n- **branch q**\n  branch desc\n\n## [0.1.0] - 2026-01-01\n\n- **old**\n' > "$WORK/q.want"
+diff -u "$WORK/q.want" "$WORK/wt-221/CHANGELOG.md" || fail "Q: the sparse union did not keep the blank lines"
+
+echo "PASS land-prep base move: disjoint tolerated without re-gate, overlap/conflict refused, CHANGELOG union auto-resolve, heading collapse and guard, blank-separated and sparse union"

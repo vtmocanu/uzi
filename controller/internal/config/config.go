@@ -191,6 +191,10 @@ type Config struct {
 	// disabled. A set-but-unparseable value is a BOOT error rather than a silent default,
 	// mirroring UZI_WORKER_FORCE_ROLL: an operator disabling self-heal by typo must not
 	// silently leave it on.
+	//
+	// It ALSO renders UZI_DIND_PRUNE_ENABLED into docker workers' pods (issue #1759):
+	// flipping it changes those pods' spec hash, so it rolls every non-ephemeral docker
+	// worker.
 	WorkerDiskRecycleEnabled bool
 	// WorkerDiskRecycleCooldown bounds how soon after a recycle the same worker may be
 	// recycled again (UZI_WORKER_DISK_RECYCLE_COOLDOWN, default 1h). A worker back at disk

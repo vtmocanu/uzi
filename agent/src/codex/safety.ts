@@ -26,7 +26,7 @@ import type {
   ProcessReap,
   ToolDisposal,
 } from "../harness.js";
-import type { ExecutionRegistry, ReapOutcome, RegisteredRoot } from "./registry.js";
+import type { CaptureSettlement, ExecutionRegistry, ReapOutcome, RegisteredRoot } from "./registry.js";
 
 /** Which OS identity a boundary action runs as. `worker_pat` is a PAT-bearing
  *  (credentialed) action (e.g. `git push`); `command` is the credential-free
@@ -96,7 +96,21 @@ export type BoundaryActionOutcome =
  *  blocked. */
 export type ReconcileOutcome =
   | { kind: "ready" }
-  | { kind: "blocked"; errors: readonly HarnessError[] };
+  | {
+      kind: "blocked";
+      errors: readonly HarnessError[];
+      /** Issue #1766: set only when the credential authority deferred the reconcile because
+       *  the owner vault is locked. It is a FIELD on `blocked`, not a new kind, so the boundary
+       *  still fails closed (poison + throw) exactly as for any other block; the runner reads
+       *  it off the thrown {@link CodexBoundaryError} to park rather than fail. */
+      deferral?: "vault_locked";
+    };
+
+/** Issue #1766: the result of {@link CodexExecutionSafetyImpl.settleForCredentialFreeCapture}.
+ *  `observed_empty` means the poisoned registry had no pending launch, no in-flight callback
+ *  and every registered root cleanly reaped at the final check; anything else is
+ *  `incomplete` with secret-free errors. */
+export type CredentialFreeCaptureSettlement = CaptureSettlement;
 
 /** PRD #1171 m4: the executor-owned auth-mode reconcile step run BEFORE every Codex
  *  boundary. A subscription run refreshes + durably advances its generation here; an
@@ -117,10 +131,14 @@ export class CodexBoundaryError extends Error {
    *  "preserve primary failure and cleanup evidence separately"). It is also set as
    *  the standard `cause`. Undefined when the action itself did not throw. */
   readonly actionError?: unknown;
+  /** Issue #1766: set when a `reconcile`-stage block carried a vault-locked deferral. The
+   *  registry is still poisoned; this only tells the runner the cause is recoverable. */
+  readonly deferral?: "vault_locked";
   constructor(
     readonly stage: "reconcile" | "quiesce" | "reap" | "action",
     readonly errors: readonly HarnessError[],
     actionError?: unknown,
+    deferral?: "vault_locked",
   ) {
     super(
       `codex boundary failed at ${stage}`,
@@ -128,6 +146,7 @@ export class CodexBoundaryError extends Error {
     );
     this.name = "CodexBoundaryError";
     this.actionError = actionError;
+    if (deferral !== undefined) this.deferral = deferral;
   }
 }
 
@@ -198,6 +217,51 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     }
   }
 
+  /**
+   * Issue #1766: settle the epoch for a CREDENTIAL-FREE capture after a vault-locked deferral.
+   * Serialized behind the same {@link queueTail} as {@link withBoundary}, so it never overlaps a
+   * boundary in flight, then delegates to {@link ExecutionRegistry.settleForCapture} under one
+   * absolute deadline (the queue wait draws from it). It never reconciles, never mints a
+   * permit and never touches completion authority: the registry is poisoned (admission
+   * refused) and drained, nothing more.
+   *
+   * If the deadline passes while still queued behind an earlier boundary, it returns
+   * `incomplete` without touching the registry; its queue slot is then released only after
+   * that earlier boundary settles, so a later boundary still cannot overlap it.
+   */
+  async settleForCredentialFreeCapture(deadlineMs: number): Promise<CredentialFreeCaptureSettlement> {
+    const deadlineAt = Date.now() + Math.max(0, deadlineMs);
+    const prior = this.queueTail;
+    let release!: () => void;
+    this.queueTail = new Promise<void>((res) => {
+      release = res;
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let queued = true;
+    try {
+      const turn = await Promise.race([
+        prior.then(() => "ready" as const),
+        new Promise<"expired">((res) => {
+          timer = setTimeout(() => res("expired"), remainingMs(deadlineAt));
+          timer.unref?.();
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+      if (turn === "expired") {
+        return {
+          kind: "incomplete",
+          errors: [{ category: "timeout", message: "codex capture settle expired in the boundary queue" }],
+        };
+      }
+      queued = false;
+      return await this.registry.settleForCapture(remainingMs(deadlineAt));
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (queued) void prior.then(release);
+      else release();
+    }
+  }
+
   private async runBoundary<T>(
     request: BoundaryRequest,
     action: (permit: BoundaryPermit) => Promise<T>,
@@ -239,7 +303,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       );
       if (reconciled.kind === "blocked") {
         this.registry.poison(reconciled.errors);
-        throw new CodexBoundaryError("reconcile", reconciled.errors);
+        throw new CodexBoundaryError("reconcile", reconciled.errors, undefined, reconciled.deferral);
       }
       requireRemaining("reconcile");
     }

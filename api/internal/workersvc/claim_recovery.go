@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -56,6 +57,8 @@ type claimFinishQueries interface {
 	LockOpenCustodyHoldsForRunWorkerGeneration(ctx context.Context, arg store.LockOpenCustodyHoldsForRunWorkerGenerationParams) ([]uuid.UUID, error)
 	ReleaseCustodyHoldExact(ctx context.Context, arg store.ReleaseCustodyHoldExactParams) (int64, error)
 	ParkRunCodexAccountUnavailable(ctx context.Context, arg store.ParkRunCodexAccountUnavailableParams) (store.Run, error)
+	LockSecretEnablementForShareNowait(ctx context.Context, arg store.LockSecretEnablementForShareNowaitParams) (bool, error)
+	ParkCredentialDisabledRun(ctx context.Context, arg store.ParkCredentialDisabledRunParams) (int64, error)
 	RequeueClaimAssemblyExact(ctx context.Context, arg store.RequeueClaimAssemblyExactParams) (int64, error)
 	FailClaimAssemblyExact(ctx context.Context, arg store.FailClaimAssemblyExactParams) (int64, error)
 }
@@ -107,6 +110,8 @@ type claimTestHooks struct {
 	afterMint func(ctx context.Context, run store.Run)
 	// afterAssembly runs with assembleClaim's result, before finishRunClaim.
 	afterAssembly func(ctx context.Context, run store.Run, payload *ClaimPayload, err error)
+	// afterChatAssembly runs after a successful assembleChatClaim, before finishChatClaim.
+	afterChatAssembly func(ctx context.Context, run store.Run)
 }
 
 // This matches ClaimRun's hold CTE, using the boolean passed to that claim.
@@ -148,14 +153,23 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 	}
 	transient := errors.Is(assemblyErr, errVaultLocked) || errors.Is(assemblyErr, errAutoPoolEmpty) ||
 		errors.Is(assemblyErr, errCustomModelCapabilityMissing)
-	if assemblyErr != nil && !transient && !claimAssemblyTerminal(assemblyErr) {
+	// errCredentialDisabled is its own non-terminal classification (PRD #1732 D14): neither
+	// transient nor terminal, so it must pass this early return to reach the fenced park.
+	if assemblyErr != nil && !transient && !claimAssemblyTerminal(assemblyErr) &&
+		!errors.Is(assemblyErr, errCredentialDisabled) {
 		return nil, assemblyErr
 	}
 	for attempt := 1; ; attempt++ {
-		out, failed, err := s.finishRunClaimTx(ctx, run, payload, assemblyErr, transient, identity)
+		out, settled, err := s.finishRunClaimTx(ctx, run, payload, assemblyErr, transient, identity)
 		if err == nil {
-			if failed {
+			switch settled {
+			case "failed":
 				s.notify(run.ID, "failed")
+			case "paused":
+				// PRD #1732 D14: the claimed -> paused/credential_disabled park is a visible
+				// transition (clients render the hold reason), published like the promoter's
+				// paused -> queued.
+				s.publishSwept(run.ID, "paused")
 			}
 			return out, nil
 		}
@@ -177,12 +191,13 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 }
 
 // finishRunClaimTx is one attempt of finishRunClaim's transaction. It returns the payload to
-// deliver (nil for idle), whether it committed a terminal failure, or an error after which
-// nothing was committed.
-func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *ClaimPayload, assemblyErr error, transient bool, identity claimRecoveryIdentity) (*ClaimPayload, bool, error) {
+// deliver (nil for idle) and the status it committed that the caller must publish ("failed"
+// for a terminal failure, "paused" for the credential_disabled park, "" otherwise), or an
+// error after which nothing was committed.
+func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *ClaimPayload, assemblyErr error, transient bool, identity claimRecoveryIdentity) (*ClaimPayload, string, error) {
 	q, err := s.beginClaimFinish(ctx)
 	if err != nil {
-		return nil, false, err
+		return nil, "", err
 	}
 	defer func() { _ = q.Rollback(ctx) }()
 	locked, err := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{
@@ -190,13 +205,13 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, false, nil
+			return nil, "", nil
 		}
-		return nil, false, err
+		return nil, "", err
 	}
 	if locked.Status != "claimed" || locked.ClaimGeneration != run.ClaimGeneration ||
 		locked.WorkerID != pgconv.UUID(identity.workerID) {
-		return nil, false, nil // another transition won; idle with no mutation
+		return nil, "", nil // another transition won; idle with no mutation
 	}
 
 	// The claim snapshot is the no-mint identity. A successful mint, including
@@ -210,12 +225,12 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		var ok bool
 		epoch, secret, ok = parseCodexCapability(payload.Secrets.Codex.Capability)
 		if !ok {
-			return nil, false, errors.New("invalid minted claim capability")
+			return nil, "", errors.New("invalid minted claim capability")
 		}
 		hash = hashCodexCapability(secret)
 	}
 	if locked.CodexClaimEpoch != epoch || !bytes.Equal(locked.CodexCapHash, hash) {
-		return nil, false, nil // superseded mint; never settle a newer claim's custody
+		return nil, "", nil // superseded mint; never settle a newer claim's custody
 	}
 
 	holdClass := false
@@ -223,7 +238,7 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	if run.Harness == harnessCodex {
 		holdClass, authorityErr, err = classifyLockedCodexClaim(ctx, q, locked)
 		if err != nil {
-			return nil, false, err
+			return nil, "", err
 		}
 		// A no-payload quarantine discovered during assembly still parks when
 		// recovery completes before this lock, provided current authority is valid.
@@ -233,6 +248,16 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			holdClass = true
 		}
 	}
+	// PRD #1732 D14: the credential this claim resolved is disabled. Either assembly said so,
+	// or the in-transaction re-check below sees a disable that committed after the credential
+	// was opened but before this decision. Checked AFTER the exact-claim and Codex
+	// capability-identity checks above, so a stale claim is idle before it is classified.
+	credDisabled := errors.Is(assemblyErr, errCredentialDisabled)
+	if !credDisabled && assemblyErr == nil && payload != nil {
+		if credDisabled, err = claimCredentialDisabled(ctx, q, locked, payload); err != nil {
+			return nil, "", err
+		}
+	}
 	origin := claimAssemblyOrigin(assemblyErr)
 	// Only credential authority faults may park, and only on a custody-holding kind: a judge
 	// stays terminal. Guardrail and provisioning failures remain terminal even if an account
@@ -240,7 +265,15 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	holdClass = holdClass && (assemblyErr == nil || origin == "credential_unavailable" || transient) &&
 		claimOpenedCustody(run.Kind, true)
 	decision := assemblyErr
-	if authorityErr != nil && origin != "provisioning_failed" && origin != "guardrail_blocked" {
+	if credDisabled {
+		// A distinct non-terminal outcome: never a transient requeue, never the account
+		// park, and never rewritten into a failure by the authority rewrite below. The owner
+		// re-enabling (or reassigning) the credential resumes it through the promoter.
+		if decision == nil {
+			decision = errCredentialDisabled
+		}
+		holdClass, transient = false, false
+	} else if authorityErr != nil && origin != "provisioning_failed" && origin != "guardrail_blocked" {
 		// Lock-time authority is the fresher truth. When it decides the outcome (a park it
 		// classified, or a terminal refusal that overrides a success, a transient requeue or
 		// an assembly-time hold), the recorded reason is the authority error that decided it.
@@ -252,9 +285,9 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	}
 	if decision == nil {
 		if err := q.Commit(ctx); err != nil {
-			return nil, false, err
+			return nil, "", err
 		}
-		return payload, false, nil
+		return payload, "", nil
 	}
 
 	expected := 0
@@ -265,11 +298,11 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		RunID: run.ID, Generation: run.ClaimGeneration, WorkerID: identity.workerID,
 	})
 	if err != nil {
-		return nil, false, err
+		return nil, "", err
 	}
 	if len(holds) != expected {
 		slog.Warn("claim custody mismatch", "run", run.ID, "expected", expected, "actual", len(holds))
-		return nil, false, errClaimRecoveryCustody
+		return nil, "", errClaimRecoveryCustody
 	}
 	if expected == 1 {
 		n, err := q.ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
@@ -277,14 +310,24 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			ReleaseEvidence: pgconv.TextOrNull("no_adopted_source"),
 		})
 		if err != nil {
-			return nil, false, err
+			return nil, "", err
 		}
 		if n != 1 {
-			return nil, false, errClaimRecoveryCustody
+			return nil, "", errClaimRecoveryCustody
 		}
 	}
 	var n int64
 	switch {
+	case credDisabled:
+		// Status exactly 'claimed' at this generation and worker with an unreleased claim (the
+		// query's fence, which admits any hold_reason: a resumed completion_blocked annotation
+		// is superseded, see ParkCredentialDisabledRun): the payload was never delivered, so no
+		// running flight is parked (D3). The fence always matches the exact claim locked above,
+		// so this custody release commits with the park instead of rolling back with a stale
+		// park and leaking the hold.
+		n, err = q.ParkCredentialDisabledRun(ctx, store.ParkCredentialDisabledRunParams{
+			ID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
+		})
 	case holdClass:
 		_, err = q.ParkRunCodexAccountUnavailable(ctx, store.ParkRunCodexAccountUnavailableParams{
 			ID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
@@ -308,12 +351,49 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		err = errClaimRecoveryStale
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, "", err
 	}
 	if err := q.Commit(ctx); err != nil {
-		return nil, false, err
+		return nil, "", err
 	}
-	return nil, !holdClass && !transient, nil
+	switch {
+	case credDisabled:
+		return nil, "paused", nil
+	case !holdClass && !transient:
+		return nil, "failed", nil
+	}
+	return nil, "", nil
+}
+
+// claimCredentialDisabled is finishRunClaimTx's in-transaction re-check of the credential a
+// successful payload actually resolved (PRD #1732 D14): the frozen alias for a Codex run, the
+// Anthropic credential assembly just recorded on the locked row for a Claude run. It runs
+// under the exact-claim run lock and after classifyLockedCodexClaim's alias/account locks,
+// and takes the credential row FOR SHARE NOWAIT: a concurrent disable either committed first
+// (seen here, the claim parks) or waits for this decision (the claim was issued first and
+// finishes, D3). A held row is 55P03, which rolls the transaction back for the bounded
+// retry instead of blocking under the run lock. A missing row is not this classification.
+func claimCredentialDisabled(ctx context.Context, q claimFinishQueries, locked store.Run, payload *ClaimPayload) (bool, error) {
+	var secretID pgtype.UUID
+	switch {
+	case locked.Harness == harnessCodex:
+		if payload.Secrets.Codex == nil {
+			return false, nil
+		}
+		secretID = locked.CodexSecretID
+	case payload.Secrets.AnthropicOAuthToken != "":
+		secretID = locked.AnthropicSecretID
+	}
+	if !secretID.Valid {
+		return false, nil
+	}
+	disabled, err := q.LockSecretEnablementForShareNowait(ctx, store.LockSecretEnablementForShareNowaitParams{
+		ID: uuid.UUID(secretID.Bytes), UserID: locked.UserID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return disabled, err
 }
 
 func claimAssemblyTerminal(err error) bool { return claimAssemblyOrigin(err) != "" }

@@ -323,6 +323,19 @@ var knownInstructions = []knownInstruction{
 			"path-resolution check is the complete bar.",
 	},
 	{
+		command:  "uzi run extend",
+		evidence: evidenceHelpOnly,
+		// ARRIVED WITH PRD #1732 (M6 rework). `uzi run wait`'s Long help (run_wait.go) now
+		// names the three kinds of paused run it does not stop on, and cross-links
+		// `uzi run extend` as the way out of a time-limit park. classifyKind reads a cobra
+		// Long field as documentation, so the kind derives HELP; the complete bar for a help
+		// reference is that the path RESOLVES, and `uzi run extend` is a real subcommand,
+		// pinned by TestCommandTree.
+		note: "HELP: `uzi run wait`'s Long help cross-links `uzi run extend` as the way to " +
+			"resume a time-limit park (run_wait.go). Never emitted as a lifted runtime " +
+			"candidate; the path-resolution check is the complete bar.",
+	},
+	{
 		command:  "uzi run resume-now",
 		evidence: evidenceHelpOnly,
 		// ARRIVED WITH PRD #1190 M4. The span sits inside `uzi run resume`'s Long help
@@ -380,7 +393,30 @@ var knownInstructions = []knownInstruction{
 			"path-resolution check is the complete bar.",
 	},
 
+	{
+		command:  "uzi findings undo",
+		evidence: evidenceHelpOnly,
+		// ARRIVED WITH ISSUE #1723 M2. The span sits in `uzi findings resolve`'s Long help
+		// (findings.go), naming the verb that takes the disposition id resolve prints. A cobra
+		// Long field, so the kind derives HELP; the bar is that the path RESOLVES, and `uzi
+		// findings undo` is a real subcommand exercised by the TestFindingsUndo* suite.
+		note: "HELP: `uzi findings resolve`'s Long help cross-links the undo verb (findings.go). " +
+			"The runtime success-line form carries its own `uzi findings undo %s` entry below.",
+	},
 	// ---- RUNTIME: emitted at a decision point. The bar is EXECUTION. --------------------
+	{
+		command:  "uzi findings undo %s",
+		evidence: evidenceGoTest,
+		where:    "TestFindingsResolveUndoHintExecutes",
+		// ARRIVED WITH ISSUE #1723 M2. RUNTIME, derived: the span sits inside a Printf argument
+		// in runFindingsResolve (findings.go), the success line naming the undo command with the
+		// disposition id the server returned.
+		note: "RUNTIME: `uzi findings resolve`'s success line (findings.go) prints `uzi findings " +
+			"undo <disposition-id>` with the returned id. EXECUTED in " +
+			"TestFindingsResolveUndoHintExecutes, which lifts the printed command from resolve's " +
+			"real output, runs it through the real parse and asserts it reaches the undo write " +
+			"with the returned id and reports the undo. Against a fake client, not a booted API.",
+	},
 	{
 		command:  "uzi token list",
 		evidence: evidenceGoTest,

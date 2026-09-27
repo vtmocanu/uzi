@@ -30,6 +30,25 @@ session's job, not uzi's; that session runs `uzi-lander`.
 
 Below, a run id is written `RUN` and a PR number `PR` in the example commands.
 
+## Buddy
+
+Plan steering is done with the buddy bound by `session-peers` (`buddy: @NAME`);
+`peers.py buddy` needs vtmocanu/skills#73+ (unknown command = no CLI support).
+
+- **None bound** → ask the user once for a buddy or solo authorization; until then
+  dispatch and watch, but stop before any approve, revise or reject. **Bound but
+  unavailable** (not live, no route, or no verdict after two requests) → ask for a
+  replacement or solo. Never downgrade silently. **Solo** skips only the co-sign.
+  Prefer a cross-family buddy (Claude with Codex).
+- **Co-sign the exact action**: run id, plan seq, verb and, for a revise or reject,
+  the final message text. Ask for `APPROVE`, `REVISE: N items` or `BLOCK: REASON`;
+  never re-ask on byte-identical material. Act when both agree; otherwise take both
+  positions to the user. The buddy's agreement is never user approval.
+- **Conditional approve**: deltas the implementation needs → `revise`, since
+  `approve` starts implementing at once. Only for non-blocking advice: approve, then
+  send it with `uzi run follow-up`; it may arrive after work starts.
+- **Issues you file**: buddy-review the final draft, then label it `reviewed`.
+
 ## The loop, per run
 
 1. **Resolve + make eligible + pre-flight.** `uzi repo list --json` for the repo id;
@@ -81,9 +100,8 @@ Below, a run id is written `RUN` and a PR number `PR` in the example commands.
    uzi run logs RUN --json | jq -r 'select(.kind=="plan") | .payload.plan_md'
    ```
 
-   Judge it as you would any plan, and run the **plan-trap checks** below. Before approving a
-   higher-risk or multi-component plan, ask an available peer session for a second opinion
-   (the `session-peers` skill); it supplements the plan-trap checks, it does not replace them.
+   Judge it as you would any plan, and run the **plan-trap checks** below, then get the
+   buddy's co-sign (*Buddy*). It supplements the plan-trap checks, it does not replace them.
    Sound plan →
    `uzi run approve`. Salvageable but wrong in places → `uzi run revise` with a `-m`
    message naming the precise change (re-plans without ending the run; then watch for the

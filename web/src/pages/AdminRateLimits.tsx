@@ -414,7 +414,7 @@ export function AdminRateLimits() {
                           <td className="px-4 py-3 text-xs text-faint">—</td>
                           <td className="px-4 py-3 text-xs text-faint">—</td>
                           <td className="px-4 py-3">
-                            <Badge tone="neutral">no token</Badge>
+                            <Badge tone="neutral">no enabled token</Badge>
                           </td>
                         </tr>,
                       ]

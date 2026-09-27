@@ -68,6 +68,9 @@ var neverJudgeFailOrigins = map[string]bool{
 	// agent-caused skip (envPublishFailOrigins): judge skipping is a spend/accuracy trade-off, not a
 	// security boundary, and the failure itself still surfaces through the failed-run broadcast.
 	"worker_residue_blocked": true,
+	// PRD #1795 M1: the refusal cap on plan-gate re-presentation fails the run inside SetState's
+	// awaiting_approval transaction. Server-derived (see failorigin.go), never an agent defect.
+	"gate_presentation_refused": true,
 }
 
 // envPublishFailOrigins is the fail_origin set for ENVIRONMENT-CAUSED publish failures (issue
@@ -191,7 +194,8 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	// Gate 4b (PRD #69 M7a Pass B, Decision 12; PRD #1392 M1; issue #1418): skip the judge for a
 	// failure with no agent behavior to retrospect. Three disjoint sets, differing ONLY in whether
 	// the skip is gated on iteration_count:
-	//   - neverJudgeFailOrigins (forge_unreachable/task_undispatched/worker_residue_blocked):
+	//   - neverJudgeFailOrigins (forge_unreachable/task_undispatched/gate_presentation_refused/
+	//     worker_residue_blocked):
 	//     never a real agent defect, so it skips REGARDLESS of iteration_count. A forge cap-fail on
 	//     a RESUMED run carries iteration_count > 0 (iteration_count is only ever advanced, never
 	//     reset), so gating it on == 0 would wrongly judge it — SC3 requires "no judge run"

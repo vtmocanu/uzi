@@ -178,6 +178,9 @@ var runDTOKeys = []string{
 	// them (and null forever on any generation failure); summary_deltas is
 	// tolerated-on-read (a malformed stored value arrives as null). Always on the wire.
 	"summary_intent", "summary_plan", "summary_deltas",
+	// PRD #1798: the PR's published description and last write outcome, set only on the
+	// GetRun detail read (null elsewhere), but the keys are always on the wire.
+	"pr_description", "pr_description_outcome",
 	"pipeline_ref", "pipeline_web_url", "fix_verdict",
 	// issue #279: a completed run that opened NO merge request (report-only/evidence
 	// completion) and its persisted findings summary. report_only is NOT NULL so always
@@ -323,6 +326,11 @@ func TestRunInputTags(t *testing.T) {
 	assertTags(t, "RunInputRequest(false)", RunInputRequest{}, "kind", "body", "selection", "override_capabilities")
 	assertTags(t, "RunInputRequest(true)", RunInputRequest{DiscardPendingOutcome: true},
 		"kind", "body", "selection", "override_capabilities", "discard_pending_outcome")
+	// PRD #1795 M2: expected_gate_revision is omitted when absent (older-api compatibility) and
+	// present, even at 0, when the client names the revision it displayed.
+	zeroRev := int64(0)
+	assertTags(t, "RunInputRequest(expected revision)", RunInputRequest{ExpectedGateRevision: &zeroRev},
+		"kind", "body", "selection", "override_capabilities", "expected_gate_revision")
 	// id + created_at are omitempty (nil on approve/cancel/reject): the zero value is
 	// still just server_side (PRD #95 S2).
 	assertTags(t, "RunInputResponse", RunInputResponse{}, "server_side")
@@ -631,9 +639,11 @@ func TestPendingJudgeDTOTags(t *testing.T) {
 // TestIncidentalFindingDTOTags pins the PRD #333 M4 backlog-row shape, widened by PRD #1183 M3.
 // disposition_id is ALWAYS present (the id the bulk-dismiss/undo endpoints key on). finding_id,
 // dismiss_reason, set_via, filed_issue_iid, filed_issue_url, resolved_at, evidence_preview and
-// occurrences are all omitempty: a display-only coordinate whose evidence was cascaded away
-// carries no finding_id/evidence_preview/occurrences, an OPEN coordinate carries no
-// filed/resolved fields, and only a dismissed/auto-done coordinate carries a reason/set_via. The
+// occurrences are all omitempty: a coordinate whose evidence was cascaded away carries no
+// finding_id/evidence_preview/occurrences (it cannot be filed or dismissed via the evidence-id
+// routes, but can still be marked done / undone via the disposition-id routes), an OPEN
+// coordinate carries no filed/resolved fields, and only a dismissed/auto-done coordinate carries
+// a reason/set_via. The
 // zero-value pin asserts the always-present key set; the populated pin asserts every optional key
 // surfaces when set.
 func TestIncidentalFindingDTOTags(t *testing.T) {
@@ -741,7 +751,7 @@ func TestSecretDTOTags(t *testing.T) {
 	// field — the pin is here so a future field addition that leaks the secret trips
 	// this test.
 	assertTags(t, "SecretDTO", SecretDTO{},
-		"id", "kind", "label", "is_default",
+		"id", "kind", "label", "is_default", "enabled", "disabled_at",
 		// PRD #111 M2: the auto-selection pool opt-in. A flag the owner set, not a
 		// value — it names no credential and reveals nothing about one.
 		"auto_eligible",
@@ -821,6 +831,11 @@ var workerDTOKeys = []string{
 	// until the worker reports a statfs sample (and re-nulled if it stops). Display-only.
 	"stats_disk_nix_bytes", "stats_disk_nix_total_bytes",
 	"stats_disk_data_bytes", "stats_disk_data_total_bytes",
+	// issue #1759: dind-data volume usage on docker-tier workers, used + total bytes AND
+	// used + total inodes. Null on non-docker workers and until a statfs sample arrives.
+	// Display-only, never a disk_pressure input (that stays nix/data only).
+	"stats_disk_dind_bytes", "stats_disk_dind_total_bytes",
+	"stats_disk_dind_inodes", "stats_disk_dind_total_inodes",
 	// PRD #104 M3: which Anthropic credential this worker's run-lane claims spend.
 	// Both null ⇒ unbound ⇒ the owner's default. The LABEL, never the token value —
 	// this DTO is the shape the web UI and the CLI both read.

@@ -184,6 +184,15 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 		return Result{}, ErrTipMissing
 	}
 
+	// A publish always declares a tip, so it is never a ref delete, and even a zero-object
+	// pack carries a 12-byte header plus a 20-byte checksum. A zero-byte body is therefore
+	// never a valid pack: it is a worker whose pack producer failed. Forwarding it would
+	// send origin a create/update with no pack, which origin answers "eof before pack
+	// header" and surfaces as a 500; refuse it as malformed (a best-effort skip) instead.
+	if len(o.Pack) == 0 {
+		return Result{}, ErrPackInvalid
+	}
+
 	// Step 1: BEFORE resolving anything into the unbounded in-memory storer, walk the
 	// pack and enforce the budget — per-object and cumulative RECONSTRUCTED size
 	// (deltas bounded by their declared target), AND cumulative INFLATION WORK (the

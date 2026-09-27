@@ -4,6 +4,7 @@ package main
 // stop (PRD #1009 M4).
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -208,11 +209,18 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// PRD #1795 D5: the revision is fixed at invocation, BEFORE the credential switch,
+			// so the approve names the plan that was at the gate when the owner decided.
+			expected, err := resolveExpectedGateRevision(cmd, c, args[0])
+			if err != nil {
+				return err
+			}
 			// --token FIRST among the SERVER steps: the override/switch must land before the
 			// approval, so on any error we return WITHOUT approving — the composition failed.
 			// Gated on Changed (like `run create --token`), so an explicit --token "" is a
 			// client-side refusal, not a silent no-op; omitting --token skips the round-trip
 			// entirely, keeping approve byte-identical to today.
+			tokenSwitched := false
 			if cmd.Flags().Changed("token") {
 				token, _ := cmd.Flags().GetString("token")
 				override, err := resolveTokenFlagValue(cmd, c, token)
@@ -228,8 +236,23 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 				if warning != "" {
 					_, _ = fmt.Fprintf(env.Stderr, "warning: %s\n", sanitizeTTY(warning))
 				}
+				tokenSwitched = true
 			}
-			return submitInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel, false)
+			err = submitInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel, false, expected)
+			// PRD #1795 D5: the revision is read BEFORE the switch (above), so a gate refused as
+			// stale can arrive after the switch already landed. The switch is not rolled back;
+			// say so, so the owner re-runs the approve without repeating it.
+			var ee *uzicli.ExitError
+			if tokenSwitched && errors.As(err, &ee) && ee.Reason == uzicli.ReasonGateRevisionMismatch {
+				return &uzicli.ExitError{
+					Code: ee.Code,
+					Err: fmt.Errorf("%w; the --token switch WAS applied to run %s, so re-run the approve without --token",
+						ee.Err, args[0]),
+					Reason:              ee.Reason,
+					CurrentGateRevision: ee.CurrentGateRevision,
+				}
+			}
+			return err
 		},
 	}
 	approve.Flags().String("agent-source", "", "which subagent roster to run: own|repo (default: the run's own default)")
@@ -241,6 +264,7 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 		"switch which Anthropic token this run spends BEFORE approving: a token label (pins "+
 			"the run to it), 'auto' (auto-select from your pool), 'default' (your default token), "+
 			"or 'inherit' (the worker's binding); omit to approve without switching")
+	addExpectedGateRevisionFlag(approve)
 	return approve
 }
 
@@ -260,10 +284,15 @@ func newRunRejectCmd(env Env, gf *globalFlags) *cobra.Command {
 			if strings.TrimSpace(msg) == "" {
 				return uzicli.Exitf(uzicli.ExitUsage, "a rejection needs a reason: pass -m <reason> or pipe it on stdin")
 			}
-			return submitInput(env, gf, c, cmd, args[0], kindRejectPlan, msg, nil, false)
+			expected, err := resolveExpectedGateRevision(cmd, c, args[0])
+			if err != nil {
+				return err
+			}
+			return submitInput(env, gf, c, cmd, args[0], kindRejectPlan, msg, nil, false, expected)
 		},
 	}
 	reject.Flags().StringP("message", "m", "", "reason to send back to the agent (or pipe it on stdin)")
+	addExpectedGateRevisionFlag(reject)
 	return reject
 }
 
@@ -286,7 +315,7 @@ func newRunCancelCmd(env Env, gf *globalFlags) *cobra.Command {
 			// discarding that outcome. This non-TTY flag is the explicit, no-prompt confirmation
 			// the owner passes to discard it and cancel.
 			discard, _ := cmd.Flags().GetBool("discard-pending-outcome")
-			return submitInput(env, gf, c, cmd, args[0], kindCancel, msg, nil, discard)
+			return submitInput(env, gf, c, cmd, args[0], kindCancel, msg, nil, discard, nil)
 		},
 	}
 	cancel.Flags().StringP("message", "m", "", "reason for cancelling (optional; or pipe it on stdin)")
@@ -322,7 +351,7 @@ func newRunStopCmd(env Env, gf *globalFlags) *cobra.Command {
 			// The stop message is OPTIONAL, like a cancel reason — no empty check.
 			msg, _ := cmd.Flags().GetString("message")
 			msg = resolveMessage(env, msg)
-			return submitInput(env, gf, c, cmd, args[0], kindStop, msg, nil, false)
+			return submitInput(env, gf, c, cmd, args[0], kindStop, msg, nil, false, nil)
 		},
 	}
 	stop.Flags().StringP("message", "m", "", "an optional message to accompany the stop (or pipe it on stdin)")

@@ -59,6 +59,27 @@ export interface User {
   last_login: string | null;
 }
 
+// SecretDependentPage is one paged list in the dependents read (PRD #1732 D11): the first
+// page of items, the TOTAL count (which can exceed the page), and a cursor for the next page.
+export interface SecretDependentPage<T> {
+  items: T[];
+  total: number;
+  next_cursor?: string;
+}
+
+// SecretDependents is GET /api/me/secrets/{kind}/{id}/dependents (PRD #1732 D11): what relies
+// on one credential right now, read by the Disable dialog. `default` says whether it is its
+// slot's default; `judge` whether the run judge is pinned to it; `enabled_siblings` are the
+// other ENABLED Codex aliases on the same provider account (always empty for Anthropic).
+export interface SecretDependents {
+  default: boolean;
+  judge: boolean;
+  workers: SecretDependentPage<{ id: string; name: string }>;
+  schedules: SecretDependentPage<{ id: string; target: string }>;
+  runs: SecretDependentPage<{ id: string; status: string }>;
+  enabled_siblings: SecretDependentPage<{ id: string; label: string }>;
+}
+
 // SecretMeta is the metadata-only view of ONE stored per-user secret. The secret
 // value is never returned by the API, so it never appears here.
 //
@@ -84,6 +105,14 @@ export interface SecretMeta {
    *  moves a codex_auth row to "linked" or "failed". Optional, matching the omitempty,
    *  and stateless UI (a badge read straight off this — never a second fetch). */
   codex_status?: string;
+  /** PRD #1732 D10: whether the credential is available. A disabled credential keeps its
+   *  value, label, pool opt-in and sidebar preference; it is only suspended. It never keeps
+   *  the default flag (D4: a disabled credential is never the default).
+   *  `enabled` is derived server-side from `disabled_at IS NULL`. */
+  enabled: boolean;
+  /** When the credential was disabled (ISO-8601), null while enabled. A repeated disable
+   *  keeps the original timestamp, so this is the "Disabled since" date. */
+  disabled_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -695,6 +724,12 @@ export interface LatestRun {
   // null for a non-running/chat/judge/interactive run. Optional for the same api/web
   // rollout skew as is_planning: a pre-feature api pod omits the key.
   deadline_at?: string | null;
+  // hold_reason (PRD #1226/#1497/#1732): why a `paused` run is server-held, null for an owner
+  // pause or a non-paused run. Non-sensitive, so the board projection sends it on every card
+  // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
+  // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused".
+  // Optional for api/web rollout skew: an absent key reads as no hold.
+  hold_reason?: string | null;
   owner_name: string;
   worker_name: string | null;
   is_mine: boolean;
@@ -1490,7 +1525,8 @@ export type ScheduleSkipReason =
   | "open_mr_exists"
   | "codex_override_conflict"
   | "schedules_paused"
-  | "no_usable_credential";
+  | "no_usable_credential"
+  | "credential_disabled";
 
 // One run a persisted fire actually created; issue_iid is null for a prompt schedule.
 export interface LastFireStarted {
@@ -1919,6 +1955,15 @@ export interface Worker {
   stats_disk_nix_total_bytes: number | null;
   stats_disk_data_bytes: number | null;
   stats_disk_data_total_bytes: number | null;
+  // Docker-tier DinD data root (issue #1759): the `dind-data` volume the sidecar docker
+  // daemon writes images/layers/containers to, as used/total bytes AND used/total inodes
+  // (overlay layers exhaust inodes before bytes). All null until a docker-tier worker
+  // reports a sample; a plain worker never does. Display-only: the UI adds a "Disk dind"
+  // bar filled to the fuller of the two ratios.
+  stats_disk_dind_bytes: number | null;
+  stats_disk_dind_total_bytes: number | null;
+  stats_disk_dind_inodes: number | null;
+  stats_disk_dind_total_inodes: number | null;
   // Which Anthropic credential this worker's RUN-lane claims spend (PRD #104 M3).
   // Both null means unbound: the worker spends its owner's default token, which is
   // every worker's state until someone binds one. The label rides alongside the id
@@ -2197,6 +2242,46 @@ export type Harness = "claude" | "codex";
 // Harness — render an unrecognised value honestly.
 export type CostStatus = "metered" | "subscription" | "unreported";
 
+/** PRD #1798: one size-line bucket's line counts. */
+export interface PrDescriptionSizeBucket {
+  added: number;
+  deleted: number;
+}
+
+/** PRD #1798 D3: the deterministic size line as data. `unavailable` marks the case where the
+ *  worker could not classify the diff; its buckets are zero and must not be rendered. */
+export interface PrDescriptionSize {
+  unavailable: boolean;
+  files: number;
+  code: PrDescriptionSizeBucket;
+  tests: PrDescriptionSizeBucket;
+  docs: PrDescriptionSizeBucket;
+  config: PrDescriptionSizeBucket;
+  generated: PrDescriptionSizeBucket;
+  vendored: PrDescriptionSizeBucket;
+}
+
+/** PRD #1798: the api-sanitized description fields. UNTRUSTED display text. */
+export interface PrDescriptionFields {
+  summary: string;
+  changes: string[];
+  scope_notes: { kind: string; text: string }[];
+  review_pointers: string[];
+  verification: { command: string; result: string; verified_at_sha: string }[];
+}
+
+/** PRD #1798: `Run.pr_description`, the published version of the run's PR. */
+export interface RunPrDescription {
+  mr_iid: number;
+  source: string;
+  fields: PrDescriptionFields;
+  size: PrDescriptionSize | null;
+  base_sha: string;
+  head_sha: string;
+  target_branch: string;
+  published_at: string | null;
+}
+
 export interface Run {
   id: string;
   /** Nullable since PRD #39: a chat run has no repo (issue/ci_fix runs always do). */
@@ -2360,6 +2445,11 @@ export interface Run {
    *  never dereferenced, so an absent value reads as not-seeded and the seeded surfaces
    *  simply do not render (no `?? null` normalization needed, unlike pending_judge). */
   plan_source?: PlanSource;
+  /** PRD #1795: the run's current plan-gate revision, allocated by the server when it
+   *  published the gate whose plan_md this run carries. A client that shows the plan sends
+   *  it back as expected_gate_revision. The api omits it (Go omitempty) while it is 0, i.e.
+   *  for a run with no gate published under a revision-allocating api. */
+  gate_revision?: number;
   /** PRD #212: the git-status porcelain lines the plan turn wrote to the worktree,
    *  surfaced at the approval gate. `[]`/absent renders nothing. UNTRUSTED
    *  repo-controlled paths — render as escaped plain text through stripUnsafeChars,
@@ -2378,6 +2468,14 @@ export interface Run {
   summary_intent?: string | null;
   summary_plan?: string | null;
   summary_deltas?: { kind: string; text: string }[] | null;
+  /** PRD #1798: the PUBLISHED plain-English description of the run's PR (the version whose
+   *  region is on the forge) and the PR's last description-write outcome
+   *  (published|skipped_human_edit|skipped_no_region|skipped_malformed|
+   *  skipped_snapshot_moved|write_failed). Set only by the run-detail read, best-effort;
+   *  null for a run with no PR record. The fields are api-sanitized but still UNTRUSTED:
+   *  render as escaped plain text, never <Markdown>. Optional for api/web rollout skew. */
+  pr_description?: RunPrDescription | null;
+  pr_description_outcome?: string | null;
   /** PRD #37: the roster the worker detected in the clone's `.claude/agents/`.
    *  null = no worker reported (a pre-feature run); `[]` = detection ran and found
    *  none (the plan gate's repo card is inert, NOT the same as null). Names +
@@ -2541,9 +2639,13 @@ export interface Run {
   rate_limit_type: string | null;
   /** PRD #1392 M1: the TYPED cause of a `recovery_wait` park. Null is the LEGACY/untyped
    *  park — the empty-turn park (#1197) writes null, so render null as the generic
-   *  "waiting to recover" wording, NOT as any particular cause. Today the only non-null
-   *  value is "forge_unreachable" (the forge stayed unreachable at clone);
-   *  "empty_turn"/"provider_outage" are reserved. Render an unrecognised value honestly (a
+   *  "waiting to recover" wording, NOT as any particular cause. Known non-null values:
+   *  "forge_unreachable" (the forge stayed unreachable at clone), "codex_account_unavailable"
+   *  (PRD #1590: held on its Codex account) and "vault_locked" (issue #1766: a Codex
+   *  credential refresh or release found the run owner's vault locked; the run resumes at its
+   *  next retry, `recovery_retry_not_before`, once the vault is unlocked, and waits `queued`
+   *  while it stays locked); "empty_turn"/"provider_outage"
+   *  are reserved. Render an unrecognised value honestly (a
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
   recovery_wait_cause: string | null;
@@ -2563,7 +2665,8 @@ export interface Run {
    * through sanitizeLabel, never as markup. */
   codex_secret_label: string | null;
   /** PRD #1392 M1: when the server will promote a `recovery_wait` run back to queued — the
-   *  retry stamp the forge-park surface counts down to ("retry at HH:MM"). The
+   *  retry stamp the forge-park surface counts down to ("retry at HH:MM"), and (issue #1766)
+   *  the next retry a `vault_locked` park resumes at once the vault is unlocked. The
    *  recovery-park analog of retry_not_before (the usage-limit park's stamp) and a SEPARATE
    *  field: a run parks on at most one of the two at a time. Null for a run that has never
    *  recovery-parked. ISO-8601 string, like every other timestamp on this type. */
@@ -2649,7 +2752,10 @@ export interface Run {
    *  server-validated milestone keys (not free text), but still sanitize before writing to a
    *  terminal (same rule as milestones).
    *
-   *  `hold_reason` is 'completion_blocked' when the run parked in a completion hold, else null.
+   *  `hold_reason` names why a `paused` run is server-held, else null: 'completion_blocked' for
+   *  a completion hold, 'credential_disabled' for a run waiting on a disabled credential
+   *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'budget_exhausted' for a
+   *  wall-clock park (PRD #1497). Render an unrecognised value honestly.
    *  `hold_context` is the constant "unavailable(same_worker_only)" ONLY while held, else null:
    *  the UI/CLI state the hold's durability HONESTLY from it — the hold is same-worker-only and
    *  must NOT be shown as cross-worker durable.
@@ -3527,17 +3633,19 @@ export interface FindingOccurrence {
 // deduped across every run it recurs in (mirrors apitypes.IncidentalFindingDTO, D7).
 //
 // `disposition_id` is the coordinate's finding_dispositions.id — the ALWAYS-PRESENT id the
-// bulk-dismiss (POST /findings/dismiss {ids}) and undo (DELETE /findings/{id}/dismiss) endpoints
-// key on (PRD #1183 M3). It is distinct from `finding_id`: a dismissed/done coordinate always has
-// a disposition_id even when its evidence is gone, which is exactly why undo keys on it.
+// bulk-dismiss (POST /findings/dismiss {ids}, PRD #1183 M3), bulk Mark done (POST /findings/done
+// {ids}) and undo (DELETE /findings/{id}/disposition) endpoints key on (issue #1723). It is
+// distinct from `finding_id`: a dismissed/done coordinate always has a disposition_id even when
+// its evidence is gone, which is exactly why Mark done and undo key on it.
 //
 // `finding_id` is the latest evidence row's id — the id the file/dismiss actions drive on
 // (M5). It is UNDEFINED (omitempty) on a filed/dismissed coordinate whose evidence rows were
 // cascaded away with a deleted run (D12): the coordinate still appears (the read is
-// disposition-driven) and `last_title` keeps it legible, but there is no evidence row to act
-// on, so a nil finding_id means "not actionable from here".
+// disposition-driven) and `last_title` keeps it legible, but there is no evidence row to file
+// or dismiss, so a nil finding_id means "no File/Dismiss from here" (Mark done still applies).
 //
-// `dismiss_reason` (wont_do | not_an_issue), `set_via` (issue_close), `evidence_preview` (the
+// `dismiss_reason` (wont_do | not_an_issue), `set_via` (issue_close on the sync's done; absent on
+// a human Mark done, issue #1723), `evidence_preview` (the
 // newest evidence row's description_md, plain text, capped) and `occurrences` (newest-first,
 // capped at 20) are the PRD #1183 M3 additions — all OPTIONAL for api/web rollout skew. Like the
 // judge's rationale_preview, `evidence_preview` and every occurrence's `run_title` MUST be

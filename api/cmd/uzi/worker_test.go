@@ -155,6 +155,30 @@ func TestWorkerListShowsReportedRuns(t *testing.T) {
 	}
 }
 
+// TestWorkerListJSONCarriesDindStats pins issue #1759 on the CLI: `worker list --json` emits
+// the WorkerDTO verbatim, so a docker-tier worker's dind-data bytes AND inodes reach a script
+// without any CLI change.
+func TestWorkerListJSONCarriesDindStats(t *testing.T) {
+	used, total, inodes, totalInodes := int64(5120000), int64(10240000), int64(7001), int64(65536)
+	fc := &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{{
+		ID: "w1", Name: "docker", Status: "online", AnthropicBindMode: "default",
+		StatsDiskDindBytes: &used, StatsDiskDindTotalBytes: &total,
+		StatsDiskDindInodes: &inodes, StatsDiskDindTotalInodes: &totalInodes,
+	}}}
+	out, _, code := runCLI(t, fakeEnv(fc), "worker", "list", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("worker list --json exit = %d, want 0", code)
+	}
+	for _, want := range []string{
+		`"stats_disk_dind_bytes": 5120000`, `"stats_disk_dind_total_bytes": 10240000`,
+		`"stats_disk_dind_inodes": 7001`, `"stats_disk_dind_total_inodes": 65536`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("worker list --json = %q, want it to carry %s", out, want)
+		}
+	}
+}
+
 func TestWorkerRm(t *testing.T) {
 	fc := &uzicli.FakeClient{}
 	out, _, code := runCLI(t, fakeEnv(fc), "worker", "rm", "w1")

@@ -30,7 +30,9 @@ echo "$GATE" | jq -e '.run.repo_agents | (type == "array") and (map(.name) | sor
 pass "PRD #37: run detected + reported the repo's .claude/agents/ roster (repo-coder, repo-reviewer)"
 
 say "restart-resilience: down/up (keep volumes) while parked at the gate"
-"${COMPOSE[@]}" down                       # keeps the named volumes (pgdata, agentdata)
+CLAIMED_BEFORE="$(run_claimed_at "$RUN")"
+[ -n "$CLAIMED_BEFORE" ] || fail "run parked at the gate carries no claimed_at"
+"${COMPOSE[@]}" down                      # keeps the named volumes (pgdata, agentdata)
 # The recreated worker re-registers into its EXISTING row using the same join token:
 # UZI_WORKER_TOKEN reaches this (post-#966) subshell via phase 13's `provides` round-trip
 # (see `requires: UZI_WORKER_TOKEN` above), so the `up` below re-sources the real token
@@ -44,7 +46,7 @@ login
 wait_worker_online
 pass "stack restarted; worker back online"
 
-wait_status "$RUN" awaiting_approval
+wait_regated "$RUN" "$CLAIMED_BEFORE"
 pass "orphaned run was re-queued, re-claimed, and is back at the gate"
 
 say "approve the plan with a repo-source selection (choose), excluding repo-reviewer"

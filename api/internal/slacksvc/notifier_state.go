@@ -413,12 +413,14 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 			n.logf("count plan messages", err)
 			return
 		}
-		if currentGen <= storedGen {
-			// Redundant re-broadcast of a plan version already gated — never spam. This also
-			// covers currentGen==0: the worker flushes the `plan` run_message BEFORE it
-			// re-reports awaiting_approval (§343), so a correctly-ordered gate always has
-			// currentGen>=1; a 0 means the plan isn't flushed yet, so waiting (no gate with no
-			// plan) is correct, not a drop.
+		if currentGen == 0 {
+			// The worker flushes the `plan` run_message BEFORE it re-reports awaiting_approval
+			// (§343), so a correctly-ordered gate always has currentGen>=1; a 0 means the plan
+			// isn't flushed yet, so waiting (no gate with no plan) is correct, not a drop.
+			return
+		}
+		if currentGen <= storedGen && !gateRevisionAdvanced(rc, anchor) {
+			// Redundant re-broadcast of a plan version already gated — never spam.
 			return
 		}
 
@@ -426,8 +428,8 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 		// no stale card lingers (the pure-Slack revise flow already cleared gate_ts, so
 		// this fires mainly for a web-UI-driven or timed-out revise).
 		if gateOpen {
-			if err := n.poster.UpdateBlocks(ctx, anchor.ChannelID, anchor.GateTs.String, "Plan superseded by a newer version",
-				gateResolvedBlocks("Superseded by a newer plan version below.")); err != nil {
+			if err := n.poster.UpdateBlocks(ctx, anchor.ChannelID, anchor.GateTs.String, "Plan gate superseded",
+				gateResolvedBlocks(gateRecardSupersededText)); err != nil {
 				n.logf("supersede prior gate", err)
 			}
 		}
@@ -450,13 +452,18 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 		// narrowing so an implausibly large count saturates rather than wrapping to a
 		// negative generation that could suppress a fresh gate. The explicit bound also
 		// makes the cast provable to gosec G115 / CodeQL.
-		gen := currentGen
+		//
+		// A re-card driven by a revision advance at an unchanged plan-message count keeps the
+		// stored generation (never lowers it): the guarded write admits an equal generation
+		// only with a higher revision than the one stored.
+		gen := max(currentGen, storedGen)
 		if gen > math.MaxInt32 {
 			gen = math.MaxInt32
 		}
 		if _, err := n.store.SetSlackRunGateGen(ctx, store.SetSlackRunGateGenParams{
 			RunID: rc.ID, GateTs: pgconv.Text(ts), GateState: pgconv.Text(gateStateOpen),
 			GateGeneration: pgtype.Int4{Int32: int32(gen), Valid: true},
+			GateRevision:   cardGateRevision(rc.GateRevision),
 		}); err != nil {
 			n.logf("record gate", err)
 		}
@@ -472,6 +479,40 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 			n.logf("clear gate", err)
 		}
 	}
+}
+
+// gateRevisionAdvanced reports whether the run is now gated at a higher plan-gate revision than
+// the anchor's card was stamped with (PRD #1795 M5 review). The generation guard alone misses
+// one ordering: the worker saves plan N+1's run_message before it reports the N+1 gate, so a
+// state event in that window reads the run at plan N / revision N while the plan-message count
+// is already N+1, and posts a card for plan N at generation N+1. The real N+1 gate then arrives
+// at the same count; without this check it is dropped as a re-broadcast, and every verdict on
+// the stale card is refused with no newer card to turn to. A legacy anchor (NULL revision)
+// keeps the generation-only behaviour.
+func gateRevisionAdvanced(rc store.GetSlackRunContextRow, anchor store.SlackRunMessage) bool {
+	return anchor.GateRevision.Valid && anchor.GateRevision.Int64 > 0 && rc.GateRevision > anchor.GateRevision.Int64
+}
+
+// cardGateRevision is the plan-gate revision a freshly posted gate card is stamped with (PRD
+// #1795 M5): the run's gate_revision read in the same row as the plan the card renders. A run
+// with no allocated revision (0: a gate published before the api allocated revisions) stamps
+// NULL, so the card's verdicts are sent as legacy verdicts with no expected revision.
+func cardGateRevision(rev int64) pgtype.Int8 {
+	if rev <= 0 {
+		return pgtype.Int8{}
+	}
+	return pgtype.Int8{Int64: rev, Valid: true}
+}
+
+// anchorGateRevision is the expected revision a verdict from the anchor's gate card carries:
+// the revision the card was stamped with, or nil for a legacy card (NULL, or posted before the
+// revision existed), which keeps the pre-#1795 unbound behaviour.
+func anchorGateRevision(anchor store.SlackRunMessage) *int64 {
+	if !anchor.GateRevision.Valid || anchor.GateRevision.Int64 <= 0 {
+		return nil
+	}
+	rev := anchor.GateRevision.Int64
+	return &rev
 }
 
 // rootBlocks builds the content-minimized run-status root as Block Kit (message

@@ -79,12 +79,8 @@ func TestHostedTargetIsThePinnedWorkerVersion(t *testing.T) {
 // (d) A FRESH controller RolledTag stays authoritative ABOVE the static pin (Decision 9):
 // it is what the controller actually rolls to, confirmed live, so it GOVERNS THE TARGET
 // even when a pin is configured — here target resolves to 0.49.0, not the pin 0.48.0.
-// The STATUS, though, is the reuse/mis-stamp case (issue #738): the worker is `settled`
-// on the 0.49.0-rendered pod with a parseable RolledTag one step ahead of its reported
-// 0.48.0, past R3's convergence grace. `settled` proves the pod runs the 0.49.0 image, so
-// a reported version below it is the baked stamp trailing a re-tagged image (PRD #422),
-// not real drift — R7.5 reads it `up_to_date`. Target governance (Decision 9) and status
-// softening (R7.5) are independent: target stays 0.49.0 while the status clears.
+// The worker is `settled` but reports 0.48.0, below that target, past R3's convergence
+// grace, so it is genuinely behind and reads `outdated` by the version compare.
 func TestFreshRolledTagOverridesTheStaticPin(t *testing.T) {
 	now := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
 	anchor := now.Add(-time.Minute)
@@ -110,11 +106,10 @@ func TestFreshRolledTagOverridesTheStaticPin(t *testing.T) {
 	if target != "0.49.0" {
 		t.Errorf("target = %q, want the fresh RolledTag 0.49.0 to govern over the static pin 0.48.0", target)
 	}
-	if status != UpgradeStatusUpToDate {
-		t.Errorf("status = %q, want %q: a fresh settled worker whose parseable RolledTag is one step ahead, "+
-			"past the R3 grace, is the reuse/mis-stamp case (issue #738) — settled proves it is on the "+
-			"RolledTag image and the trailing baked version is the lie",
-			status, UpgradeStatusUpToDate)
+	if status != UpgradeStatusOutdated {
+		t.Errorf("status = %q, want %q: a settled worker reporting 0.48.0 against the fresh RolledTag "+
+			"target 0.49.0, past the R3 grace, is behind its target",
+			status, UpgradeStatusOutdated)
 	}
 }
 

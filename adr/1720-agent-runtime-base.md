@@ -47,6 +47,6 @@ The runtime stage keeps `npm ci` and the agent-browser build guard: the guard's 
 ## Consequences
 
 - Every release pays for the thin release stage; a release whose runtime inputs are unchanged builds nothing else, whether or not the layer cache hits.
-- `ADR-738`'s `settled` softener stays: images published before this change are still re-tagged aliases, and a hosted fleet may be pinned to one.
+- `ADR-738`'s `settled` softener was kept here, because images published before this change are still re-tagged aliases and a hosted fleet may be pinned to one. Issue #1415 later removed it: a fleet pinned to such an alias now reads `outdated`, and the fix is to move the pin to a current release.
 - The fleet-roll decision stays separate (`scripts/worker-tag-autobump.sh`, which now also counts `agent/codex`): publishing an accurately stamped image on every release does not roll hosted workers.
 - New GHCR packages `agent-runtime-base` and `agent-runtime-jvm` appear on the first release after this change. They are build inputs; workers never pull them.

@@ -765,6 +765,15 @@ WHERE user_id = @user_id AND provider_account_id = @provider_account_id AND stat
 -- reap→quarantine→resolve state machine. NOT owner-scoped at the account level: this is a
 -- service-owned global sweep, not a user request. The correlated intent subquery IS owner-scoped
 -- so it rides the (user_id, provider_account_id) leading key of idx_codex_refresh_intent_unresolved.
+--
+-- PRD #1732 D6/D7: only arm (c) — recovery PROMOTION, which re-verifies the recovery
+-- material with an upstream identity call — is gated on the account having an ENABLED linked
+-- alias (no enabled alias, no background recovery). Arms (a) and (b) are NOT gated: reaping
+-- an expired lease and resolving an orphaned rotating intent are local, durable
+-- reconciliation of a refresh that already started (possibly after the single-use refresh
+-- token was spent), and D7 forbids interrupting that. A deferred promotion loses nothing: the
+-- material stays protected in the slot, and re-enabling an alias lets the next pass (or the
+-- re-enable poke) promote it.
 SELECT cpa.id, cpa.user_id
 FROM codex_provider_account cpa
 WHERE (cpa.coord_state = 'in_progress' AND cpa.lease_deadline < @now::timestamptz)
@@ -781,7 +790,13 @@ WHERE (cpa.coord_state = 'in_progress' AND cpa.lease_deadline < @now::timestampt
    )
    OR (cpa.coord_state = 'quarantined'
        AND cpa.recovery_sealed IS NOT NULL
-       AND cpa.recovery_generation = cpa.generation);
+       AND cpa.recovery_generation = cpa.generation
+       AND EXISTS (
+           SELECT 1 FROM codex_credential_state s
+           JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+           WHERE s.user_id = cpa.user_id AND s.provider_account_id = cpa.id
+             AND s.status = 'linked' AND us.disabled_at IS NULL
+       ));
 
 -- name: ClearMismatchedCodexRecoveryAndMarkIntents :one
 -- Clear a VERIFIED-MISMATCH recovery slot AND correct its optimistically-reconciled intents in

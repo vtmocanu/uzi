@@ -78,6 +78,63 @@ var (
 	ErrCredentialOverrideInvalidMode        = errors.New("invalid credential override mode")
 )
 
+// ErrCredentialDisabled is the D5 refusal (PRD #1732): a NEW explicit assignment named a
+// credential the owner has disabled. Every explicit-assignment path returns it BEFORE its
+// write, and the handlers map it to 409 with this message, which names where to fix it. The
+// worker binding and the Judge opt-in plus binding read the credential under the user's secret
+// mutation lock, in the transaction that writes. The per-run override at create, set-token
+// (every writing arm, the reassignment of a held run included) and a schedule fire's stored pin
+// are validated by a plain read, then re-read under a share lock in the writing transaction
+// (lockPinnedOverrideEnabled), so a disable committing between the two is refused too.
+// Schedule create/edit pins are validated by the plain read only: a disable racing that write
+// leaves a stored pin, which the fire's own check turns into the credential_disabled skip.
+// Stored pins are never refused retroactively: the work they drive waits on credential_disabled
+// instead (D2). A schedule fire whose stored pin is disabled records the credential_disabled
+// skip from the same sentinel.
+var ErrCredentialDisabled = errors.New("credential is disabled; enable it in Settings")
+
+// checkStoredOverrideEnabled is the fire-time check of a schedule's STORED pin (PRD #1732 D2):
+// the columns were validated at create/edit and are written as-is, but a pin disabled since
+// must not start a run on it. It returns ErrCredentialDisabled (the scheduler records the
+// credential_disabled skip) for a disabled pin, and nil otherwise; a pin whose credential was
+// deleted keeps today's behaviour (the FK nulled it, so it inherits).
+func checkStoredOverrideEnabled(ctx context.Context, q credentialSecretMetaReader, userID uuid.UUID, o *CredentialOverride) error {
+	if o == nil || o.Mode != CredentialOverrideModePinned || o.SecretID == nil {
+		return nil
+	}
+	meta, err := q.GetUserSecretMetaByIDOfKind(ctx, store.GetUserSecretMetaByIDOfKindParams{
+		ID: *o.SecretID, UserID: userID, Kind: store.KindAnthropicToken,
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil
+	case err != nil:
+		return fmt.Errorf("stored credential override lookup: %w", err)
+	case meta.Disabled:
+		return ErrCredentialDisabled
+	}
+	return nil
+}
+
+// ScheduleCredentialDisabled is the scheduler's read-only pre-fire check of a schedule's stored
+// choices (PRD #1732 D2/D15), made before the fire touches the forge. It returns
+// ErrCredentialDisabled when the stored pin o names a disabled token, ErrHarnessCredentialDisabled
+// when the pinned harness explicit has credentials but none enabled, and nil otherwise. A lookup
+// error, or any other harness refusal, also answers nil: the fire's own in-transaction checks
+// still decide those, so this check never refuses on a fact it could not read.
+func (s *Service) ScheduleCredentialDisabled(ctx context.Context, userID uuid.UUID, o *CredentialOverride, explicit *Harness) error {
+	if err := checkStoredOverrideEnabled(ctx, s.q, userID, o); errors.Is(err, ErrCredentialDisabled) {
+		return err
+	}
+	if explicit == nil {
+		return nil
+	}
+	if _, err := s.resolveRunHarness(ctx, userID, explicit); errors.Is(err, errHarnessCredentialDisabled) {
+		return err
+	}
+	return nil
+}
+
 // ResolveCredentialOverride is the EXPORTED entry point every override write outside this
 // package runs through (PRD #1247 M2): the handler (a different package) has no access to
 // the unexported validateCredentialOverride, so this thin wrapper is its door. It performs
@@ -148,15 +205,21 @@ func validateCredentialOverrideOn(ctx context.Context, q credentialSecretMetaRea
 		// 404: the secret must be the caller's OWN anthropic_token. The kind-scoped
 		// owner-scoped lookup returns pgx.ErrNoRows for a foreign id, a deleted id, or a
 		// wrong-kind id alike — the same "unavailable" fact a foreign id produces at open.
-		if _, err := q.GetUserSecretMetaByIDOfKind(ctx, store.GetUserSecretMetaByIDOfKindParams{
+		meta, err := q.GetUserSecretMetaByIDOfKind(ctx, store.GetUserSecretMetaByIDOfKindParams{
 			ID:     *secretID,
 			UserID: userID,
 			Kind:   store.KindAnthropicToken,
-		}); err != nil {
+		})
+		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil, ErrCredentialOverrideSecretNotFound
 			}
 			return nil, fmt.Errorf("credential override token lookup: %w", err)
+		}
+		// PRD #1732 D5: a new explicit pin onto a disabled token is refused (409), never
+		// stored to wait. Existing stored pins are not re-validated here.
+		if meta.Disabled {
+			return nil, ErrCredentialDisabled
 		}
 		id := *secretID
 		return &CredentialOverride{Mode: CredentialOverrideModePinned, SecretID: &id}, nil

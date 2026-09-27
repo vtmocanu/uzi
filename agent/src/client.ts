@@ -82,6 +82,24 @@ export class RequestError extends Error {
   }
 }
 
+/** Issue #1766: the typed Codex credential deferral a locked owner vault produces. A Codex
+ *  refresh/release that passed authorization but hit a locked vault answers HTTP 409 with
+ *  `{"reason":"vault_locked"}` in the body. Returns "vault_locked" ONLY for that exact shape
+ *  (a {@link RequestError}, status 409, a JSON body whose `reason` is "vault_locked"), and
+ *  undefined for anything else: another 409 reason, another status, a non-JSON body or a
+ *  non-RequestError. It never reads the error's message text. */
+export function codexDeferralReason(err: unknown): "vault_locked" | undefined {
+  if (!(err instanceof RequestError) || err.status !== 409) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(err.body);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  return (parsed as { reason?: unknown }).reason === "vault_locked" ? "vault_locked" : undefined;
+}
+
 const sleepReal = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -438,7 +456,7 @@ export class WorkerClient {
     stats?: WorkerStats,
     outbox?: OutboxHeartbeatEntry[],
     activeSnapshot?: ActiveSnapshot,
-  ): Promise<void> {
+  ): Promise<boolean | undefined> {
     const body: HeartbeatRequest = { version: this.version };
     // Only attach stats when the collector produced a sample (PRD #49): an absent
     // field is the same wire shape as today, so a pre-#49 server ignores the extra
@@ -457,7 +475,7 @@ export class WorkerClient {
     if (includeSnapshot) body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
     const includeExtension = includeOutbox || includeSnapshot;
     try {
-      await this.postJSON(`${WORKER_API_PREFIX}/heartbeat`, body);
+      return await this.postHeartbeat(body);
     } catch (err) {
       // Rollback fallback (PRD #1391 M5, extended by #1390 M2a): a rolled-back api that no
       // longer knows a negotiated heartbeat extension strict-decodes it as an unknown field
@@ -472,13 +490,40 @@ export class WorkerClient {
       if (!includeExtension || !isStrictDecodeError(err)) throw err;
       const stripped: HeartbeatRequest = { version: this.version };
       if (stats) stripped.stats = stats;
-      await this.postJSON(`${WORKER_API_PREFIX}/heartbeat`, stripped);
+      const retaining = await this.postHeartbeat(stripped);
       this.clearFeatures();
       this.log.warn(
         "heartbeat extension rejected by a rolled-back api; retried stripped and cleared the negotiated feature set",
         {},
       );
+      return retaining;
     }
+  }
+
+  /**
+   * POST one heartbeat and decode the custody flag from its response (issue #1759):
+   * `{"worker": {"retaining_unpublished_work": bool, ...}}`. Returns the flag only when
+   * the body decodes and the field is a boolean, else undefined, which the DinD prune
+   * treats as "may be retaining" (fail-closed). A non-2xx still throws exactly like
+   * postJSON, so the strict-decode fallback above is unchanged; an accepted heartbeat
+   * whose body does not parse is still a successful heartbeat.
+   */
+  private async postHeartbeat(body: HeartbeatRequest): Promise<boolean | undefined> {
+    const path = `${WORKER_API_PREFIX}/heartbeat`;
+    const res = await this.fetchRaw("POST", path, body);
+    if (res.status >= 400) throw await this.toError("POST", path, res);
+    if (res.status === 204) return undefined;
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(await res.text());
+    } catch {
+      return undefined;
+    }
+    if (typeof decoded !== "object" || decoded === null) return undefined;
+    const worker = (decoded as { worker?: unknown }).worker;
+    if (typeof worker !== "object" || worker === null) return undefined;
+    const retaining = (worker as { retaining_unpublished_work?: unknown }).retaining_unpublished_work;
+    return typeof retaining === "boolean" ? retaining : undefined;
   }
 
   /** Claim the oldest queued run for this worker's user (the RUN lane — no lane
@@ -620,8 +665,18 @@ export class WorkerClient {
     // 200/409 single-body ACK parse, already-terminal handling and logging are preserved per variant
     // in reportStateOnce, so the fallback only toggles whether claim_generation is on the wire.
     const included = this.includeClaimGeneration(body.claim_generation);
+    // PRD #1795 M3: the api refuses an id-bearing awaiting_approval report without
+    // claim_generation (400 claim_generation_required), and the strict-decode fallback exists for
+    // an api that rolled back past the fields. So whenever claim_generation is NOT on the wire, the
+    // gate presentation fields are not either: the report degrades to an id-less one, which an
+    // allocating api still answers with its revision and an older api accepts unchanged.
     return this.withGenerationFallback(included, (includeField) =>
-      this.reportStateOnce(runId, path, includeField ? body : { ...body, claim_generation: undefined }, signal),
+      this.reportStateOnce(
+        runId,
+        path,
+        includeField ? body : { ...body, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined },
+        signal,
+      ),
     );
   }
 
@@ -695,6 +750,9 @@ export class WorkerClient {
             ack.staleClaim = fields.staleClaim;
           if (fields.credentialSwitchReleased !== undefined)
             ack.credentialSwitchReleased = fields.credentialSwitchReleased;
+          // PRD #1795 M1 (decision 5): the revision an awaiting_approval report was answered with,
+          // read like contractRevision off the same single-use body (top-level, beside `run`).
+          if (fields.gateRevision !== undefined) ack.gateRevision = fields.gateRevision;
           if (!ack.applied) {
             this.log.info("state report not applied server-side", {
               run_id: runId,
@@ -1647,6 +1705,7 @@ export async function readRunAck(res: Response): Promise<{
   credentialSwitch?: { generation: number };
   staleClaim?: boolean;
   credentialSwitchReleased?: boolean;
+  gateRevision?: number;
 }> {
   try {
     const text = await res.text();
@@ -1676,6 +1735,8 @@ export async function readRunAck(res: Response): Promise<{
       // beside `run`, not inside it.
       credential_switch?: unknown;
       disposition?: unknown;
+      // PRD #1795 M1 (decision 5): the awaiting_approval ACK's revision, TOP-LEVEL beside `run`.
+      gate_revision?: unknown;
     };
     const run = parsed?.run;
     const out: {
@@ -1695,6 +1756,7 @@ export async function readRunAck(res: Response): Promise<{
       credentialSwitch?: { generation: number };
       staleClaim?: boolean;
       credentialSwitchReleased?: boolean;
+      gateRevision?: number;
     } = {};
     if (typeof run?.status === "string") out.status = run.status;
     // PRD #1497 M2: the RunDTO's hold_reason rides the SAME body as `status`. A string only — a
@@ -1767,6 +1829,11 @@ export async function readRunAck(res: Response): Promise<{
     // release after a reclaim (status 'running'), so enterCredentialSwitch accepts the release off
     // this flag rather than off status === 'queued' (which missed the idempotent case).
     if (parsed?.disposition === "released") out.credentialSwitchReleased = true;
+    // PRD #1795 M1 (decision 5): the gate revision an awaiting_approval report was answered with. A
+    // positive integer only; anything else (absent on an older api or another report, garbled)
+    // leaves it undefined, which the gate reads as "no revision confirmed" (bound verdicts wait).
+    const gateRev = parsed?.gate_revision;
+    if (typeof gateRev === "number" && Number.isSafeInteger(gateRev) && gateRev >= 1) out.gateRevision = gateRev;
     return out;
   } catch {
     return {};
@@ -1786,10 +1853,16 @@ export function isStrictDecodeError(err: unknown): boolean {
   return err instanceof RequestError && err.status === 400 && /invalid request body/i.test(err.body);
 }
 
+/** Retryable HTTP status: any 5xx (incl. 529 overloaded), 408 or 429; permanent otherwise.
+ * Shared by `isTransient` and the executor's provider-transient classifier (issue #1401). */
+export function isTransientStatus(status: number): boolean {
+  return status >= 500 || status === 408 || status === 429;
+}
+
 /** Retryable: transport failures, 5xx, and 408/429; permanent otherwise. */
 export function isTransient(err: unknown): boolean {
   if (err instanceof RequestError) {
-    return err.status >= 500 || err.status === 408 || err.status === 429;
+    return isTransientStatus(err.status);
   }
   // Network error / timeout (AbortError) / non-HTTP failure.
   return true;

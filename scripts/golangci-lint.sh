@@ -18,6 +18,14 @@
 # The version is an ARGUMENT, not a script default, so `task`'s echo still shows
 # the resolved static pin. This matches scripts/deadcode-gate.sh and
 # validate:api's sqlc pin, and makes a missing pin visible in gate output.
+#
+# The download RETRIES transient failures (issue #1144: a CDN connection reset
+# reddened lint jobs). curl needs --retry-all-errors because plain --retry does
+# not retry a connection reset. wget loops explicitly (4 attempts, 3 retries)
+# instead of --tries, which stays portable to BusyBox and removes any partial
+# output before each attempt. The
+# tarball sha256 check still runs before extraction, so a retry cannot
+# substitute a different artifact.
 set -eu
 
 VERSION="${1:-}"
@@ -137,11 +145,23 @@ if [ "$candidate_ready" -ne 1 ]; then
   # The file-size resource limit stops tools that ignore or never receive a
   # Content-Length. curl and wget remain transport alternatives, not size guards.
   if command -v curl >/dev/null 2>&1; then
-    (ulimit -f "$MAX_ARCHIVE_BLOCKS"; curl -fsSLo "$CANDIDATE" "$url") \
+    (ulimit -f "$MAX_ARCHIVE_BLOCKS"; curl -fsSL --retry 3 --retry-delay 2 \
+      --retry-all-errors --retry-connrefused -o "$CANDIDATE" "$url") \
       || { echo "golangci-lint.sh: bounded download failed: $url" >&2; exit 2; }
   else
-    (ulimit -f "$MAX_ARCHIVE_BLOCKS"; wget -qO "$CANDIDATE" "$url") \
-      || { echo "golangci-lint.sh: bounded download failed: $url" >&2; exit 2; }
+    attempt=1
+    while :; do
+      rm -f "$CANDIDATE"
+      if (ulimit -f "$MAX_ARCHIVE_BLOCKS"; wget -qO "$CANDIDATE" "$url"); then
+        break
+      fi
+      if [ "$attempt" -ge 4 ]; then
+        echo "golangci-lint.sh: bounded download failed: $url" >&2
+        exit 2
+      fi
+      attempt=$((attempt + 1))
+      sleep 2
+    done
   fi
   verify_sha256 "$tar_sha256" "$CANDIDATE" \
     || { echo "golangci-lint.sh: tarball checksum mismatch for $asset (expected $tar_sha256)" >&2; exit 2; }

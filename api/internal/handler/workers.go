@@ -145,6 +145,11 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 		StatsDiskNixTotalBytes:  int8PtrValue(w.StatsDiskNixTotalBytes),
 		StatsDiskDataBytes:      int8PtrValue(w.StatsDiskDataBytes),
 		StatsDiskDataTotalBytes: int8PtrValue(w.StatsDiskDataTotalBytes),
+
+		StatsDiskDindBytes:       int8PtrValue(w.StatsDiskDindBytes),
+		StatsDiskDindTotalBytes:  int8PtrValue(w.StatsDiskDindTotalBytes),
+		StatsDiskDindInodes:      int8PtrValue(w.StatsDiskDindInodes),
+		StatsDiskDindTotalInodes: int8PtrValue(w.StatsDiskDindTotalInodes),
 	}
 }
 
@@ -202,6 +207,11 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersi
 		StatsDiskNixTotalBytes:  int8PtrValue(w.StatsDiskNixTotalBytes),
 		StatsDiskDataBytes:      int8PtrValue(w.StatsDiskDataBytes),
 		StatsDiskDataTotalBytes: int8PtrValue(w.StatsDiskDataTotalBytes),
+
+		StatsDiskDindBytes:       int8PtrValue(w.StatsDiskDindBytes),
+		StatsDiskDindTotalBytes:  int8PtrValue(w.StatsDiskDindTotalBytes),
+		StatsDiskDindInodes:      int8PtrValue(w.StatsDiskDindInodes),
+		StatsDiskDindTotalInodes: int8PtrValue(w.StatsDiskDindTotalInodes),
 	}
 }
 
@@ -663,6 +673,9 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 			// caller that skips the check gets a 400 naming the problem rather than a
 			// 500 from 00088's CHECK.
 			httpx.Error(w, http.StatusBadRequest, "anthropic_bind_mode must be one of: default, pinned, auto")
+		case errors.Is(err, workersvc.ErrCredentialDisabled):
+			// PRD #1732 D5: a new binding onto a disabled token is refused before any write.
+			httpx.Error(w, http.StatusConflict, workersvc.ErrCredentialDisabled.Error())
 		case errors.Is(err, workersvc.ErrWorkerNotFound), errors.Is(err, workersvc.ErrSecretNotOwned):
 			// Both are 404, and deliberately the same 404: distinguishing them would
 			// tell a caller which of the two ids they guessed happens to exist.

@@ -518,7 +518,8 @@ func blockingContainer(p *corev1.Pod) *corev1.ContainerStatus {
 //
 // PERMANENCE IS BOUNDED TO GENUINE CRASH-LOOPS, which is where permanence is correct: no
 // container in the worker pod is designed to exit on a periodic cadence (seed-nix exits
-// once; dind and dind-init are long-running daemons), and none carries a LIVENESS probe
+// once; dind and dind-init are long-running daemons, and dind-meter is a long-running
+// sampler loop with no probe at all), and none carries a LIVENESS probe
 // that could flap it — the only probes under controller/ are two dind StartupProbes, and
 // a StartupProbe failure kills the container rather than cycling it.
 func flappingContainer(p *corev1.Pod, now time.Time) *corev1.ContainerStatus {

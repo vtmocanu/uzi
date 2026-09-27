@@ -15,13 +15,20 @@
 # keep both wordings, so that refuses too, as does a block with no base section. A shared `### <Section>` subsection heading is allowed (each side bringing its own
 # `### Fixed` is the common case) only when the block sits inside `## [Unreleased]`: there
 # a repeated `### <Section>` is collapsed into its first occurrence (its bullets move under
-# it). Blank lines left between bullet items are dropped. A file with no conflict markers is left untouched.
+# it). Every blank line between a section's entries is kept byte-identical. Only a join the
+# union itself makes gets a chosen gap: the first side's last line against the second side's
+# first gets the larger of the two sides' own blank runs there, or, when neither has one,
+# [Unreleased]'s convention; a folded repeat's bullets against its first occurrence's always
+# get the convention (the
+# majority of item pairs each side already had; on a tie the nearest pair before the join,
+# else blank when any pair is blank-separated, else none). A file with no conflict markers
+# is left untouched.
 #
 # --collapse: for a marker-free file (a clean rebase can leave two `### Fixed` headings when a
 # commit adds its own next to the base's). Only a repeated `### <Section>` inside
 # `## [Unreleased]` changes: the repeat's heading and surrounding blank lines go, its lines
-# are appended to the first occurrence's; every other line stays byte-identical. No repeat,
-# no change. Conflict markers are refused (exit 1).
+# are appended to the first occurrence's (after the convention's gap, as above); every other
+# line stays byte-identical. No repeat, no change. Conflict markers are refused (exit 1).
 #
 # Verification before the file is replaced: no marker survives, the multiset of content
 # lines (non-blank, non-marker, non-heading) from the resolved sides is identical before and
@@ -53,10 +60,46 @@ fi
 tmpd=$(mktemp -d "${TMPDIR:-/tmp}/changelog-union.XXXXXX") || exit 2
 trap 'rm -rf "$tmpd"' EXIT
 
+# The separator convention of [Unreleased]: sepcount(s, k) reads the lines of one version
+# of the file (stream k) and counts adjacent list items (a bullet or its indented
+# continuation, then a bullet) that a blank line separates vs. that touch; last[k] is the
+# newest pair's kind (1 blank, 0 touching, "" none since the last heading). The union feeds
+# its first side to stream "o" and its second to "t", the unconflicted text to both, so
+# only pairs one side's own file had vote, never a join the resolution makes.
+SEP_AWK='
+  function sepcount(s, k) {
+    if (s ~ /^[ \t]*$/) { gap[k] = 1; return }
+    if (s ~ /^#/) { pl[k] = 0; gap[k] = 0; last[k] = ""; return }
+    if (s ~ /^[-*] / && pl[k]) { if (gap[k]) nblank++; else ntight++; last[k] = (gap[k] ? 1 : 0) }
+    pl[k] = (s ~ /^[-*] / || s ~ /^  /); gap[k] = 0
+  }
+  # joinstyle(near): 1 = one blank line at a join, 0 = none.
+  function joinstyle(near) {
+    if (nblank != ntight) return (nblank > ntight)
+    if (near != "") return near + 0
+    return (nblank > 0)
+  }
+'
+
+# A line pass 1 prints between the two sides of a block and pass 2 always removes; its text
+# cannot be a CHANGELOG line, and the verification below would catch one that survived.
+SENTINEL='<!-- changelog-union:join -->'
+
 if [ "$MODE" = collapse ]; then
 cp "$FILE" "$tmpd/before" || exit 2
-awk '
+awk "$SEP_AWK"'
   function blank(s) { return s ~ /^[ \t]*$/ }
+  # lastpair(s): the kind of the newest item pair inside section s (1 blank, 0 touching, "").
+  function lastpair(s,   i, x, p, g, r) {
+    r = ""; p = 0; g = 0
+    for (i = 1; i <= sc[s]; i++) {
+      x = S[s, i]
+      if (blank(x)) { g = 1; continue }
+      if (x ~ /^[-*] / && p) r = (g ? 1 : 0)
+      p = (x ~ /^[-*] / || x ~ /^  /); g = 0
+    }
+    return r
+  }
   { L[++n] = $0 }
   END {
     u = 0
@@ -65,6 +108,7 @@ awk '
     e = n + 1
     for (i = u + 1; i <= n; i++) if (L[i] ~ /^## /) { e = i; break }
     ns = 0; np = 0; dup = 0
+    for (i = u + 1; i < e; i++) sepcount(L[i], "f")
     for (i = u + 1; i < e; i++) {
       if (L[i] ~ /^### /) {
         key = L[i]; sub(/[ \t]+$/, "", key)
@@ -82,13 +126,17 @@ awk '
       print hd[s]
       hi = sc[s]; while (hi >= 1 && blank(S[s, hi])) hi--
       for (i = 1; i <= hi; i++) print S[s, i]
+      any = (hi > 0); sep = joinstyle(lastpair(s))
       for (t = s + 1; t <= ns; t++) {
         if (owner[t] != s) continue
         lo = 1; th = sc[t]
         while (lo <= th && blank(S[t, lo])) lo++
         while (th >= lo && blank(S[t, th])) th--
-        if (lo <= th && hi == 0) { print ""; hi = -1 }  # the first occurrence had no body
+        if (lo > th) continue
+        if (hi == 0) { print ""; hi = -1 }  # the first occurrence had no body
+        else if (any && sep) print ""       # blank-separated entries keep one blank at the join
         for (i = lo; i <= th; i++) print S[t, i]
+        any = 1
       }
       for (i = (hi > 0 ? hi : 0) + 1; i <= sc[s]; i++) print S[s, i]
     }
@@ -103,12 +151,20 @@ else
 
 # Pass 1: union the conflict blocks. Also emits, into $tmpd/before, every line the result
 # must keep (both sides and the unconflicted text; the diff3 base is dropped on purpose).
-if ! awk -v before="$tmpd/before" '
+# Between the sides of a block in [Unreleased] it prints a JOIN sentinel line (pass 2
+# replaces it with the join's gap) and records, in $tmpd/sep, the votes and each join's
+# nearest earlier pair.
+if ! awk -v before="$tmpd/before" -v sepfile="$tmpd/sep" -v sentinel="$SENTINEL" "$SEP_AWK"'
   BEGIN { st = 0 }  # 0 outside, 1 first side, 2 diff3 base, 3 second side
   st == 0 && /^## / { unrel = ($0 ~ /^## \[Unreleased\]/) }
   /^<<<<<<<( |$)/ { if (st != 0) { bad = "nested <<<<<<< at line " NR; exit 1 } st = 1; next }
   /^[|]{7}( |$)/  { if (st != 1) { bad = "stray ||||||| at line " NR; exit 1 } st = 2; hasbase = 1; next }
-  /^=======$/     { if (st != 1 && st != 2) { bad = "stray ======= at line " NR; exit 1 } st = 3; next }
+  /^=======$/     {
+    if (st != 1 && st != 2) { bad = "stray ======= at line " NR; exit 1 }
+    st = 3
+    if (unrel) { nj++; near[nj] = (last["o"] != "" ? last["o"] : last["t"]); print sentinel " " nj }
+    next
+  }
   /^>>>>>>>( |$)/ {
     if (st != 3) { bad = "stray >>>>>>> at line " NR; exit 1 }
     # A line on both sides would be written twice: refuse rather than guess a dedupe. Only
@@ -135,35 +191,56 @@ if ! awk -v before="$tmpd/before" '
   st == 2 { C[++nc] = $0; next }
   st == 1 { A[++na] = $0 }
   st == 3 { B[++nb] = $0 }
+  unrel && st != 3 { sepcount($0, "o") }
+  unrel && st != 1 { sepcount($0, "t") }
   { print; print > before }
   END {
     if (bad != "") { print "changelog-union: refusing: " bad > "/dev/stderr"; exit 1 }
     if (st != 0) { print "changelog-union: unterminated conflict block" > "/dev/stderr"; exit 1 }
+    print "votes", nblank + 0, ntight + 0 > sepfile
+    for (j = 1; j <= nj; j++) print "join", j, near[j] > sepfile
   }
 ' "$FILE" > "$tmpd/union"; then
   echo "changelog-union: $FILE left untouched" >&2
   exit 1
 fi
 
-# Pass 2: collapse repeated `### ` headings inside `## [Unreleased]`, trim each section's
-# body, and drop blank lines between list items (a bullet line or its indented
-# continuation, followed after the blanks by another bullet).
-awk '
-  function islist(s) { return s ~ /^[-*] / || s ~ /^  / }
-  function isbullet(s) { return s ~ /^[-*] / }
-  function emit_body(h,   i, lo, hi, j, k, prev) {
+# Pass 2: collapse repeated `### ` headings inside `## [Unreleased]` and trim each
+# section's body. Blank lines are copied as they are, except at a join: a JOIN sentinel
+# (between the two sides of a block) or a folded repeat's start. There the blank runs on
+# either side of the join become one run: a JOIN keeps the longer of the two, so no side
+# loses a separator it had; a join with no blank line on either side, and every folded
+# repeat, gets joinstyle()'s gap.
+awk -v sepfile="$tmpd/sep" -v sentinel="$SENTINEL" "$SEP_AWK"'
+  function isblank(s) { return s ~ /^[ \t]*$/ }
+  function emit_body(h,   i, lo, hi, k, pend, a, injoin, jkind, jid, n, prevc) {
     lo = 1; hi = cnt[h]
-    while (lo <= hi && B[h, lo] ~ /^[ \t]*$/) lo++
-    while (hi >= lo && B[h, hi] ~ /^[ \t]*$/) hi--
-    prev = ""
+    while (lo <= hi && (isblank(B[h, lo]) || B[h, lo] ~ ("^" sentinel " "))) lo++
+    while (hi >= lo && (isblank(B[h, hi]) || B[h, hi] ~ ("^" sentinel " "))) hi--
+    pend = 0; injoin = 0; prevc = ""
     for (i = lo; i <= hi; i++) {
-      if (B[h, i] ~ /^[ \t]*$/) {
-        j = i; while (j <= hi && B[h, j] ~ /^[ \t]*$/) j++
-        if (islist(prev) && isbullet(B[h, j])) { i = j - 1; continue }
-        for (k = i; k < j; k++) print B[h, k]
-        i = j - 1; continue
+      if (isblank(B[h, i])) { pend++; continue }
+      if (B[h, i] ~ ("^" sentinel " ")) {
+        # a = the blanks before the join; blanks after it count from zero again.
+        if (!injoin) { a = pend; pend = 0 }
+        injoin = 1; jkind = B[h, i]; continue
       }
-      print B[h, i]; prev = B[h, i]
+      if (injoin) {
+        jid = jkind; sub(/.* /, "", jid)
+        if (jid == "C") n = (prevc == "" ? 0 : joinstyle(""))
+        else { n = (a > pend ? a : pend); if (n == 0 && prevc != "") n = joinstyle(near[jid]) }
+        pend = n; injoin = 0
+      }
+      for (k = 0; k < pend; k++) print ""
+      pend = 0
+      print B[h, i]; prevc = B[h, i]
+    }
+  }
+  BEGIN {
+    while ((getline ln < sepfile) > 0) {
+      split(ln, f, " ")
+      if (f[1] == "votes") { nblank = f[2] + 0; ntight = f[3] + 0 }
+      else if (f[1] == "join") near[f[2]] = f[3]
     }
   }
   { L[++n] = $0 }
@@ -179,10 +256,10 @@ awk '
       if (L[i] ~ /^### /) {
         key = L[i]; sub(/[ \t]+$/, "", key)
         if (!(key in idx)) { idx[key] = ++nh; hd[nh] = L[i]; cnt[nh] = 0 }
-        else { B[idx[key], ++cnt[idx[key]]] = "" }  # a later occurrence joins after a gap the trim/blank rule removes
+        else { B[idx[key], ++cnt[idx[key]]] = sentinel " C" }  # a folded repeat: a join
         cur = idx[key]; continue
       }
-      if (cur == 0) print L[i]
+      if (cur == 0) { if (L[i] !~ ("^" sentinel " ")) print L[i] }
       else B[cur, ++cnt[cur]] = L[i]
     }
     for (h = 1; h <= nh; h++) {

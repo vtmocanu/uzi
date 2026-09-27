@@ -423,6 +423,17 @@ export interface WorkerStats {
   disk_data_bytes?: number;
   /** Total bytes on the data volume. Paired with disk_data_bytes. */
   disk_data_total_bytes?: number;
+  /** Used bytes on a docker worker's DinD data root (the `dind-data` volume), from
+   *  the dind-meter sidecar's statfs sample: `(blocks − bfree) × frsize` (issue #1759).
+   *  The four disk_dind_* fields are all present or all absent: absent when there is
+   *  no sidecar (a non-docker worker) or no valid, fresh (≤ 90s) sample. */
+  disk_dind_bytes?: number;
+  /** Total bytes on the DinD data root (`blocks × frsize`). */
+  disk_dind_total_bytes?: number;
+  /** Used inodes on the DinD data root (`files − ffree`). */
+  disk_dind_inodes?: number;
+  /** Total inodes on the DinD data root (`files`). */
+  disk_dind_total_inodes?: number;
 }
 
 /**
@@ -1238,6 +1249,31 @@ export interface ClaimResponse {
    *  such an approve when it returned it, so the server still counts it as the human approval; the
    *  worker only ignores it and posts a notice saying it could not be withdrawn. */
   resume_plan_at?: string;
+  /** PRD #1795 M1 (D4): the gate revision of the persisted, unapproved plan an `awaiting_approval`
+   *  gate resume re-presents. Present ONLY on that resume of a run whose gate was published under a
+   *  revision-allocating api (runs.gate_revision > 0); absent everywhere else, and from an older
+   *  api. On the no-bump first gate of an SDK same-gate reclaim the worker reuses
+   *  `resume_gate_presentation_id` (or, when that is absent, explicitly adopts this revision with
+   *  `adopt_gate_revision`), and seeds its confirmed revision from it so a pending bound
+   *  reject/revise acts before the plan is re-presented. */
+  resume_gate_revision?: number;
+  /** PRD #1795 M1 (D4): the persisted CURRENT presentation id of that gate (a UUID), reused by a
+   *  same-gate SDK re-presentation. Absent for an id-less gate (published by an old worker or before
+   *  the migration), which a new worker may adopt. */
+  resume_gate_presentation_id?: string;
+  /** PRD #1795 M1 (decision 3): the requirement half of the IMMUTABLE presented snapshot (never the
+   *  live columns, which an approval's capability override may have cleared). A same-gate
+   *  re-presentation sends exactly these instead of a fresh toolchain detection, so a reclaimed
+   *  worker never re-sends different requirements and conflicts. */
+  resume_gate_presented?: GatePresentedRequirements;
+}
+
+/** PRD #1795: the approval-relevant requirements a gate presentation showed the human
+ *  (api/internal/workersvc/gate_revision.go GatePresentedRequirements). */
+export interface GatePresentedRequirements {
+  required_capabilities?: string[] | null;
+  required_tools?: string[] | null;
+  size_class?: string;
 }
 
 /** One deterministic missing-executable hit (PRD #46 Decision 4). */
@@ -1950,6 +1986,18 @@ export interface StateRequest {
   /** awaiting_approval carries the captured plan; an autopilot `running` report also
    *  carries it, persisted durably via SetRunAutopilotPlan (RC1 #1197). */
   plan_md?: string;
+  /** PRD #1795 M3 (D1): the worker-minted identity (a UUID) of the gate presentation an
+   *  `awaiting_approval` report publishes. A retry of the same report reuses it; an SDK same-gate
+   *  reclaim reuses the claim's persisted id; every other gate mints a fresh one. Sent ONLY when
+   *  the api advertised the `gate_revision_v1` register feature (an older api strict-decodes the
+   *  report and would 400 an unknown field) and only beside claim_generation (the api refuses an
+   *  id-bearing report without it). Omitted entirely otherwise. */
+  presentation_id?: string;
+  /** PRD #1795 M3 (D4): an explicit adoption of an id-less gate at this revision (the claim's
+   *  `resume_gate_revision` with no `resume_gate_presentation_id`), sent with a fresh
+   *  `presentation_id` only by a same-gate SDK re-presentation. Same send gate as
+   *  `presentation_id`. */
+  adopt_gate_revision?: number;
   /** awaiting_input carries the identity of the question being asked (PRD #88).
    *  REQUIRED on that transition — the api rejects the report without it, because a
    *  park with no question identity can never satisfy the resume guard, so the run
@@ -2145,9 +2193,12 @@ export interface StateRequest {
    *  non-completed report — an old worker omits it and a non-interlocked completion has no
    *  permit to match. */
   head?: string;
-  /** PRD #1392 M2 (D9/D10): the typed cause of a `recovery_wait` park. Today the worker only
-   *  ever sends "forge_unreachable" (the pre-clone transient-forge park); the api validates it
-   *  against its own enum (forge_unreachable|empty_turn|provider_outage) before any SQL and a
+  /** PRD #1392 M2 (D9/D10): the typed cause of a `recovery_wait` park. The worker sends
+   *  "forge_unreachable" (the pre-clone transient-forge park, gated on `recovery_park_cause`) and,
+   *  issue #1766, "vault_locked" (a Codex credential refresh/release deferred by a locked owner
+   *  vault, gated on `recovery_cause_vault_locked`; an api without that feature gets the untyped
+   *  park). The api validates it against its own enum
+   *  (forge_unreachable|empty_turn|provider_outage|vault_locked) before any SQL and a
    *  legacy/untyped park omits it (NULL). Additive + optional and OMITTED ENTIRELY on every
    *  other report so a pre-#1392 worker's payload and an ordinary (empty-turn) recovery park
    *  stay byte-identical on the wire; an api that predates the field 400s a report carrying it,
@@ -2288,6 +2339,11 @@ export interface StateAck {
    *  so enterCredentialSwitch treats the release as done off this flag, not off status === 'queued'
    *  (which missed the idempotent-after-reclaim success and gave up on a server-confirmed release). */
   credentialSwitchReleased?: boolean;
+  /** PRD #1795 M1 (decision 5): the TOP-LEVEL `gate_revision` of an `awaiting_approval` ACK — the
+   *  revision the report was answered with, allocated or returned inside the report's transaction.
+   *  The gate confirms THIS revision for bound-verdict matching. A positive integer only; absent
+   *  (older api, another report, an unparseable body) ⇒ undefined = "nothing confirmed". */
+  gateRevision?: number;
 }
 
 export interface UserInput {
@@ -2300,6 +2356,13 @@ export interface UserInput {
    *  `own`, never the untrusted repo source. */
   body?: string | null;
   created_at?: string;
+  /** PRD #1795 M1 (D3): the verdict row's persisted gate binding: "bound" (with `gate_revision`,
+   *  the revision the verdict was stamped against) or "unbound" (sent while no gate was visible).
+   *  Both ABSENT for a legacy row (before the migration, an older api, or a non-verdict kind), which
+   *  keeps today's epoch handling. Any other shape is malformed and fails closed
+   *  (steering.ts parseGateBinding). */
+  gate_binding?: string;
+  gate_revision?: number;
 }
 
 export interface InputsResponse {

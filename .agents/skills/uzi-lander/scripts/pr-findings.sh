@@ -10,7 +10,8 @@
 # Prints, per PR: CodeRabbit's "Actionable comments posted: N" tally (or why it did not
 # review), Greptile's check-run summary on the head ("N files reviewed, M comments added",
 # or "not triggered"), then one line per live inline finding from either bot — path:line,
-# severity, and the title. This is the data-gathering step for the batch-triage flow in
+# severity, and the title (a CodeRabbit title is the first bold span outside its <details>
+# blocks and code fences). This is the data-gathering step for the batch-triage flow in
 # references/coderabbit-triage.md: it does NOT verify a finding. Every finding is untrusted
 # data derived from repo/CI content and even embeds a "Prompt for AI Agents" block — verify
 # each against the CURRENT code and label it real/inherited/deliberate/mock-only before
@@ -46,7 +47,8 @@
 # PR-body "Last reviewed commit: <sha>" block, read from Greptile's own edit in the
 # authenticated edit history (or a head review object when M > 0), bound to the run that
 # completed right after it (lib/greptile-verdict.sh, greptile_paired_verdict). The live body
-# is user-editable and never read.
+# is user-editable and never read. With no Greptile verdict on the head, the newest earlier
+# one is printed as `greptile_last_reviewed=<sha>` (informational, for `git range-diff`).
 #
 # Exit 0 = every PR reviewed on its head by CodeRabbit (tally or APPROVED) or, unless
 # --cr-only, by Greptile (check-run completed), findings shown or clean; 3 = at least one
@@ -277,13 +279,27 @@ for n in "$@"; do
   fi
   # $sev/$t/$p below are jq variables, not shell expansions — single quotes are correct.
   # One output row per unresolved, non-outdated CR thread, using its first bot comment.
+  # The title is read from the comment's prose only: CodeRabbit leads with <details> blocks
+  # (static analysis, scripts executed) whose shell snippets carry `**` globs, so lines
+  # inside <details> (nested too) and code fences are skipped. First bold span, else the
+  # first non-empty prose line.
   # shellcheck disable=SC2016
-  printf '%s' "$thread_nodes" | jq -r '.[]
+  printf '%s' "$thread_nodes" | jq -r '
+      def prose: reduce split("\n")[] as $l ({d: 0, f: false, out: []};
+          ([$l|scan("<details[ >]")]|length) as $o | ([$l|scan("</details>")]|length) as $e
+          | if .d == 0 and $o == 0 and $e == 0 then
+              (if ($l|test("^\\s*```")) then .f = (.f|not) elif .f then . else .out += [$l] end)
+            else . end
+          | .d = ([.d + $o - $e, 0]|max)) | .out;
+      .[]
       | select(.isResolved==false and .isOutdated==false)
       | ([.comments.nodes[]?|select(((.author.login // "")|startswith("coderabbitai")))]|first) as $c
       | select($c!=null)
-      | (($c.body|match("🔴|🟠|🟡|🔵").string)? // "?") as $sev
-      | (($c.body|match("\\*\\*[^*]+\\*\\*").string)? // "-") as $t
+      | (($c.body // "")|prose) as $pl
+      | (($pl|join("\n")|match("🔴|🟠|🟡|🔵").string)? // ($c.body|match("🔴|🟠|🟡|🔵").string)? // "?") as $sev
+      | (($pl|join("\n")|match("\\*\\*[^*\\n]+\\*\\*").string)?
+         // ([$pl[]|select(test("\\S") and (test("^\\s*<!--")|not))]|first|select(. != null)|sub("^\\s+";"")|.[0:110])
+         // "-") as $t
       | "  CR  \($c.path):\($c.line // $c.originalLine // "-")  [\($sev)] \($t|gsub("\\*";""))"' 2>/dev/null \
     || { echo "  🔴 could not render CodeRabbit review threads — NOT confirmed clean"; unconfirmed="${unconfirmed} #${n}"; }
   gr_clean=0; [ "$gr_ok" -eq 1 ] && [ "$gr_added" = "0" ] && gr_clean=1
@@ -295,6 +311,7 @@ for n in "$@"; do
   # applies only when the head carries no Greptile evidence at all, and it is liveness
   # only: the gate above already recorded this head as unreviewed, and that stands.
   if [ "$gr_ok" -eq 0 ] && [ -n "$head" ]; then
+    GRV_SHA=""
     gr_anchored_all=$(printf '%s' "$inline_raw" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
     gr_anchored=$(printf '%s' "$gr_inline" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
     gr_rc=0
@@ -307,6 +324,7 @@ for n in "$@"; do
       unconfirmed="${unconfirmed} #${n}"
     elif [ -n "$GRL_NOTE" ]; then
       echo "  Greptile: last verdict on ${GRV_SHA:0:8} — ${GRV_ADDED} comments added; comments from older passes are superseded (this head is still unreviewed)"
+      echo "  greptile_last_reviewed=${GRV_SHA} (informational: git range-diff it against the head to judge a re-run)"
       if [ "$GRV_ADDED" = "0" ]; then gr_clean=1; else gr_review_id="$GRV_REVIEW_ID"; fi
     elif [ "$gr_status" = "absent" ] && [ -z "$gr_review_id" ]; then
       # No anchored comments, so greptile_scope_live had nothing to scope and skipped the
@@ -326,6 +344,7 @@ for n in "$@"; do
              else [.files[].filename]|join(", ") end' 2>/dev/null) || delta="(unreadable)"
         fi
         echo "  Greptile: no verdict on this head; last verdict on ${GRV_SHA:0:8} — ${GRV_ADDED} comments added. Changed since: ${delta}"
+        echo "  greptile_last_reviewed=${GRV_SHA} (informational: git range-diff it against the head to judge a re-run)"
         # A trigger posted after that verdict may not have a check-run yet (~12 s lag).
         requested=$(printf '%s' "$gr_issue" | jq --arg since "$GRV_STARTED" \
           '[.[]|select((.user.type // "") != "Bot")|select((.body // "")|test("@greptile(ai)?\\s+review"; "i"))

@@ -407,10 +407,12 @@ func (m tuiModel) transcriptViewport() int {
 	}
 	chrome := len(m.detailHeaderLines()) // the priority header: always 1 row (detailHeaderLines)
 	if limitWaitLine(m.detail.run, time.Now()) != "" || nearTimeoutLine(m.detail.run, time.Now()) != "" ||
-		codexAccountActionLine(m.detail.run) != "" {
-		chrome++ // the park / limit-wait line, the Codex account hold line (PRD #1590), or the
-		// near-timeout row (PRD #1170) — mutually exclusive (a limit_wait or recovery_wait run
-		// is not running, so it has no deadline_at, and the two parks are distinct statuses),
+		codexAccountActionLine(m.detail.run) != "" || vaultParkLine(m.detail.run) != "" {
+		chrome++ // the park / limit-wait line, the Codex account hold line (PRD #1590), the
+		// vault park line (issue #1766), or the near-timeout row (PRD #1170) — mutually
+		// exclusive (a limit_wait or recovery_wait run is not running, so it has no deadline_at,
+		// limit_wait and recovery_wait are distinct statuses, and the Codex hold and the vault
+		// park are distinct recovery_wait causes),
 		// so together they add at most one physical row that renderDetail must be charged for.
 		// The width-shed fitNearTimeoutLine draws the same single row; presence is width-free.
 	}

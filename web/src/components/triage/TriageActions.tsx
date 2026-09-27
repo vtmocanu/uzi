@@ -8,9 +8,9 @@ import { dismissMenuItems } from "./triageCopy";
 // row's one-click File / Dismiss pair.
 //
 // It is PRESENTATIONAL: an absent handler hides its button, so a surface renders only the
-// actions it offers (the Findings row passes no onMarkDone — a finding's done comes only from
-// its issue closing). The mutation itself lives in the CALLER's handler, which decides between
-// the two modes the PRD describes:
+// actions it offers (a filed or dismissed Findings row passes only onMarkDone, since it can no
+// longer be filed or dismissed). The mutation itself lives in the CALLER's handler, which decides
+// between the two modes the PRD describes:
 //   * owned (run page, finding card): the handler does the optimistic call, the single-row
 //     refetch, and owns the successor-focus move onto Undo. Because its row swaps THIS
 //     component out for TriageDisposedRow on a mutation, an announce hosted here would unmount

@@ -32,7 +32,9 @@
 #      reported, none passed, or gh failed without a failing/pending check explaining it —
 #      not merged
 #   3  gh error, or the merge command was refused (classifier block, ruleset, conflict):
-#      the exact command is printed for the user to run via a `!` line
+#      the exact command is printed for the user to run via a `!` line. Also the PR
+#      conflicting with its base (mergeable=CONFLICTING), checked before the required
+#      checks because GitHub runs no pull_request CI on a conflicting PR: run land-prep.sh
 #   4  an mr_rework run is active on this MR — defer
 #   7  the merge lock is held by another live session (owner printed) — wait, re-run
 #   8  head mismatch vs --expect-head
@@ -130,6 +132,13 @@ if [ "$REWORK_CHECK" -eq 1 ]; then
   fi
 fi
 
+# A conflicting PR gets no pull_request CI at all, so its checks read as "none reported":
+# name the real cause first. UNKNOWN (GitHub still computing) falls through to the checks.
+if [ "$mg" = "CONFLICTING" ]; then
+  echo "PR #$PR conflicts with its base (mergeable=CONFLICTING, mergeStateStatus=$ms): GitHub runs no CI on it; rebase with land-prep.sh, then re-watch; not merging"
+  exit 3
+fi
+
 # Required checks on the head — FAIL CLOSED: unreadable JSON is "not merging", an EMPTY list
 # is "not merging" (a head with no check runs — CI skipped, a missed dispatch — would
 # otherwise merge ungated), a cancelled required check is not green (supersession), pending
@@ -161,7 +170,6 @@ miss=$(missing_required "$req" "$cj") || { echo "cannot compare the required che
 [ "$cj_rc" -ne 0 ] && { echo "gh pr checks exited $cj_rc with no failing or pending check on ${head:0:8} (partial read?); not merging"; exit 2; }
 ok=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pass")]|length')
 [ "$ok" -gt 0 ] || { echo "no required check passed on ${head:0:8} (only: $(printf '%s' "$cj" | jq -r '[.[].bucket]|unique|join(",")')); not merging"; exit 2; }
-[ "$mg" = "CONFLICTING" ] && { echo "PR has merge conflicts (--admin does not bypass a git conflict); resolve with land-prep.sh"; exit 3; }
 
 # ---- merge lock (repo-wide, 10-min TTL) ----------------------------------------------------
 SD=$(state_dir) || SD=""

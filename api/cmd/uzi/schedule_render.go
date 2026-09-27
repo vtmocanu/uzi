@@ -129,12 +129,13 @@ func scheduleTokenCell(s apitypes.ScheduleDTO) string {
 // guard (that is the Go↔TS test in web/src/lib/scheduleSkipReasons.test.ts). An unknown
 // reason falls back to the raw wire string in skipReasonLabel, so a new server-side reason
 // degrades gracefully rather than rendering blank.
-var skipReasonLabels = map[string]string{
+var skipReasonLabels = map[string]string{ //nolint:gosec // G101: schedule skip-reason labels (credential_disabled is a VOCABULARY value), no credential.
 	"not_eligible":          "not eligible",
 	"already_running":       "already running",
 	"description_too_large": "description too large",
 	"fetch_failed":          "fetch failed",
 	"schedules_paused":      "all schedules paused",
+	"credential_disabled":   "pinned credential is disabled",
 }
 
 // skipReasonLabel renders a skip reason as its human label, falling back to the raw wire
@@ -151,6 +152,8 @@ func skipReasonLabel(reason string) string {
 // caller omits the trailing `# …` for it.
 var skipReasonHints = map[string]string{
 	"not_eligible": "add the configured uzi label or assign the issue to uzi",
+	// PRD #1732 D2/D12: the schedule's pin is kept, never substituted; enabling is web-only.
+	"credential_disabled": "enable the credential in Settings, or change the schedule's token",
 }
 
 // skipReasonHint returns the remediation hint for a skip reason, or "" when none applies.
@@ -208,6 +211,11 @@ func renderLastFire(p *uzicli.Printer, lf *apitypes.LastFire) {
 	}
 	for _, sk := range lf.Skips {
 		p.Printf("    %s  %s  %s\n", fireCandidateLabel(sk.IssueIID), skipReasonLabel(sk.Reason), sk.Title)
+		// PRD #1732: a credential_disabled skip is the one last-fire skip the owner resolves
+		// outside the schedule itself, so the detail says where (Settings).
+		if sk.Reason == "credential_disabled" {
+			p.Printf("      # %s\n", skipReasonHint(sk.Reason))
+		}
 	}
 	if lf.Capped && len(lf.Skips) > 0 && len(lf.Started) == 0 {
 		p.Printf("  %s\n", lastFireCappedHint)

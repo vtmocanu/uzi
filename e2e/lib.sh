@@ -421,6 +421,56 @@ wait_status() {
   fail "timeout: run $run never reached '$want' (last: ${s:-none})"
 }
 
+# run_claimed_at RUN — the run's claimed_at (empty while unclaimed). Capture it BEFORE a
+# disruption and hand it to wait_regated.
+run_claimed_at() { apiget "/api/runs/$1" | jq -r '.run.claimed_at // empty'; }
+
+# settle_runs_terminal TIMEOUT RUN... — best-effort wait for each run a phase cancelled to
+# become terminal (completed/failed/cancelled) before the phase exits. A cancel to a run with a
+# live worker is only ENQUEUED; the worker applies it at its next poll, so a phase that exits
+# right after its cleanup cancels hands the driver's quarantine a still-live run and logs a LEAK.
+# Never fails a phase: it returns 0 whatever happens, and empty ids are skipped. Each status
+# read is a single curl capped at 5s (run_status_quick, no retry), so a hung api cannot stretch
+# the wait much past TIMEOUT.
+run_status_quick() { curl -fsS --max-time 5 -b "$JAR" "$BASE/api/runs/$1" 2>/dev/null | jq -r '.run.status // empty' 2>/dev/null; }
+settle_runs_terminal() {
+  local timeout="$1" deadline r s; shift
+  deadline=$((SECONDS + timeout))
+  for r in "$@"; do
+    [ -n "$r" ] || continue
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      s="$(run_status_quick "$r")" || s=""
+      case "$s" in completed|failed|cancelled) break ;; esac
+      sleep 0.5
+    done
+  done
+  return 0
+}
+
+# wait_regated RUN PREV_CLAIMED_AT [TIMEOUT] — after a restart/kill of a run parked at the
+# plan gate, wait until a NEW claim has re-shown the gate: status awaiting_approval AND
+# claimed_at set and different from PREV_CLAIMED_AT. `wait_status RUN awaiting_approval`
+# alone passes at once on the pre-disruption row (the orphan is only requeued when the
+# worker re-registers), so a verdict posted after it replays into the new claim. A stub or
+# Codex claim re-gates a plan no human has seen and discards a replayed approve as stale
+# (issue #1604, runner.ts resumesAtGate), leaving the run parked until timeout or another
+# verdict (issue #1739).
+wait_regated() {
+  local run="$1" prev="$2" timeout="${3:-90}" s c
+  local start=$SECONDS deadline=$((SECONDS + timeout))
+  while [ $SECONDS -lt $deadline ]; do
+    read -r s c < <(apiget "/api/runs/$run" | jq -r '[.run.status, (.run.claimed_at // "-")] | @tsv')
+    if [ "$s" = awaiting_approval ] && [ "$c" != - ] && [ "$c" != "$prev" ]; then
+      record_margin "run re-gated by a new claim" "$((SECONDS - start))" "$timeout"; return 0
+    fi
+    case "$s" in
+      failed|cancelled) fail "run $run entered '$s' while waiting for a new claim to re-gate it";;
+    esac
+    sleep 0.3
+  done
+  fail "timeout: run $run was never re-gated by a new claim (last: status=${s:-none} claimed_at=${c:-none}, before=$prev)"
+}
+
 # --- forge-fake /_e2e helpers --------------------------------------------------
 # The overlay publishes forge-fake's 443 on a per-run loopback port so the
 # harness reaches the /_e2e mutators/introspection with plain curl (no

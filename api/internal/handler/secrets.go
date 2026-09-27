@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -62,6 +61,7 @@ func secretMeta(id uuid.UUID, kind, label string, isDefault, autoEligible bool, 
 		Kind:         kind,
 		Label:        label,
 		IsDefault:    isDefault,
+		Enabled:      true,
 		AutoEligible: autoEligible,
 		CreatedAt:    created.Time,
 		UpdatedAt:    updated.Time,
@@ -85,7 +85,7 @@ func (h *Handler) ListMySecrets(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	rows, err := h.q.ListUserSecretsAll(r.Context(), user.ID)
+	rows, err := h.q.ListSecretEnablement(r.Context(), user.ID)
 	if err != nil {
 		slog.Error("list user secrets", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -107,6 +107,10 @@ func (h *Handler) ListMySecrets(w http.ResponseWriter, r *http.Request) {
 	out := make([]apitypes.SecretDTO, 0, len(rows))
 	for _, s := range rows {
 		dto := secretMeta(s.ID, s.Kind, s.Label, s.IsDefault, s.AutoEligible, s.CreatedAt, s.UpdatedAt)
+		dto.Enabled = !s.DisabledAt.Valid
+		if s.DisabledAt.Valid {
+			dto.DisabledAt = &s.DisabledAt.Time
+		}
 		if isCodexKind(s.Kind) {
 			dto.CodexStatus = statusByID[s.ID]
 		}
@@ -128,7 +132,11 @@ func (h *Handler) ListMySecrets(w http.ResponseWriter, r *http.Request) {
 // sealUserSecret's vault-nil fallback.
 func (h *Handler) withSecretLock(ctx context.Context, userID uuid.UUID, fn func(q *store.Queries) error) error {
 	if h.pool == nil {
-		return fn(h.q)
+		if err := fn(h.q); err != nil {
+			return err
+		}
+		h.requestCredentialPromotion(userID)
+		return nil
 	}
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
@@ -139,22 +147,28 @@ func (h *Handler) withSecretLock(ctx context.Context, userID uuid.UUID, fn func(
 	// rule as the hosted-provision quota lock). Serializes this user's token
 	// mutations until the transaction ends; XACT-scoped, so there is no unlock to
 	// forget.
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)",
-		store.SecretMutationLockClass, secretMutationLockObjID(userID)); err != nil {
+	if err := store.LockSecretMutation(ctx, tx, userID); err != nil {
 		return err
 	}
 	if err := fn(h.q.WithTx(tx)); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	h.requestCredentialPromotion(userID)
+	return nil
 }
 
-// secretMutationLockObjID derives the objid half of the per-user advisory lock from
-// a user's uuid, exactly as hostedProvisionLockObjID does: a uuid's leading bytes
-// are random, so two users can collide and serialize for a moment — a contention
-// non-event, never a correctness one.
-func secretMutationLockObjID(userID uuid.UUID) int32 {
-	return int32(binary.BigEndian.Uint32(userID[:4])) //nolint:gosec // wraparound is fine: a lock key, not a number
+// requestCredentialPromotion asks workersvc for a non-blocking credential_disabled promoter
+// pass for userID (PRD #1732 D14). It is called only AFTER a secret mutation committed, so
+// the advisory lock is already released: enable, default hand-off, default creation or
+// promotion, and delete can each make a parked run's requirement available again. The
+// request never blocks the handler and is nil-safe for handler tests without workersvc.
+func (h *Handler) requestCredentialPromotion(userID uuid.UUID) {
+	if h.wsvc != nil {
+		h.wsvc.RequestCredentialDisabledPromotion(userID)
+	}
 }
 
 // PutAnthropicToken stores (or rotates) the current user's DEFAULT Anthropic token,
@@ -162,11 +176,8 @@ func secretMutationLockObjID(userID uuid.UUID) int32 {
 // id-keyed POST/PATCH below). The plaintext is never logged, never echoed back, and
 // never appears in any error string. Marked deprecated via the Deprecation header.
 //
-// It stays a single-statement upsert (UpsertDefaultUserSecret) and does NOT take the
-// mutation lock, because a single INSERT..ON CONFLICT is atomic: it cannot interleave
-// into a two-default state, and the "no default" state it once could 500 on is now
-// unreachable — every mutation that could create it (set-default, delete-default)
-// serializes under the lock and preserves exactly-one-default (M2/D12).
+// The mutation lock covers both existing-row promotion and the upsert.
+// A disabled row is never rotated or made default by this compatibility route.
 func (h *Handler) PutAnthropicToken(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Deprecation", "true")
 	user, ok := mw.UserFromContext(r.Context())
@@ -209,13 +220,47 @@ func (h *Handler) PutAnthropicToken(w http.ResponseWriter, r *http.Request) {
 	// Rotates the user's DEFAULT token, or creates their first one labelled
 	// 'default' (PRD #104 D14 — this kind-path route is a compatibility alias over
 	// the default; M2 adds the id-keyed routes and deprecates this one).
-	row, err := h.q.UpsertDefaultUserSecret(r.Context(), store.UpsertDefaultUserSecretParams{
-		UserID:     user.ID,
-		Kind:       store.KindAnthropicToken,
-		Ciphertext: sealed,
-		SealedWith: sealedWith,
+	var row store.UpsertDefaultUserSecretRow
+	err = h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+		_, getErr := q.GetDefaultUserSecretID(r.Context(), store.GetDefaultUserSecretIDParams{
+			UserID: user.ID, Kind: store.KindAnthropicToken,
+		})
+		if getErr != nil && !errors.Is(getErr, pgx.ErrNoRows) {
+			return getErr
+		}
+		if errors.Is(getErr, pgx.ErrNoRows) {
+			candidate, candidateErr := q.GetEnabledUserSecretForKind(r.Context(), store.GetEnabledUserSecretForKindParams{
+				UserID: user.ID, Kind: store.KindAnthropicToken,
+			})
+			if candidateErr != nil && !errors.Is(candidateErr, pgx.ErrNoRows) {
+				return candidateErr
+			}
+			if candidateErr == nil {
+				rotated, rotateErr := q.RotateUserSecret(r.Context(), store.RotateUserSecretParams{
+					ID: candidate, UserID: user.ID, Ciphertext: sealed, SealedWith: sealedWith,
+				})
+				if rotateErr != nil {
+					return rotateErr
+				}
+				promoted, promoteErr := q.SetUserSecretDefault(r.Context(), store.SetUserSecretDefaultParams{
+					ID: rotated.ID, UserID: user.ID,
+				})
+				row = store.UpsertDefaultUserSecretRow(promoted)
+				return promoteErr
+			}
+		}
+		var writeErr error
+		row, writeErr = q.UpsertDefaultUserSecret(r.Context(), store.UpsertDefaultUserSecretParams{
+			UserID: user.ID, Kind: store.KindAnthropicToken,
+			Ciphertext: sealed, SealedWith: sealedWith,
+		})
+		return writeErr
 	})
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusConflict, errSecretDisabled.Error())
+			return
+		}
 		slog.Error("store anthropic token", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
@@ -232,11 +277,9 @@ func (h *Handler) PutAnthropicToken(w http.ResponseWriter, r *http.Request) {
 // DeleteAnthropicToken removes the current user's DEFAULT Anthropic token (PRD #104
 // D14 compatibility alias — deprecated in favor of the id-keyed DELETE below).
 //
-// It 409s for a MULTI-TOKEN user: with several tokens, "delete the default"
-// contradicts D6 (the default cannot be deleted while others exist), so a
-// multi-token user must delete by id. That breaks this route's former
-// unconditional-204 contract, deliberately (D14/R5). A single-token user's delete
-// returns them to the token-less state; a token-less user is the idempotent 204.
+// It 409s when another enabled token exists: deleting the default then
+// would leave an enabled token without a default. That breaks this route's former
+// unconditional-204 contract (D14/R5). A token-less user gets an idempotent 204.
 // Runs under the mutation lock so the count-then-delete cannot race a concurrent
 // create into deleting-the-default-while-a-second-token-lands.
 func (h *Handler) DeleteAnthropicToken(w http.ResponseWriter, r *http.Request) {
@@ -258,17 +301,23 @@ func (h *Handler) DeleteAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		if gerr != nil {
 			return gerr
 		}
-		n, cerr := q.CountUserSecretsForKind(r.Context(), store.CountUserSecretsForKindParams{
+		cur, gerr := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{
+			ID: secretID, UserID: user.ID,
+		})
+		if gerr != nil {
+			return gerr
+		}
+		n, cerr := q.CountEnabledSecretSlot(r.Context(), store.CountEnabledSecretSlotParams{
 			UserID: user.ID, Kind: store.KindAnthropicToken,
 		})
 		if cerr != nil {
 			return cerr
 		}
-		if n > 1 {
-			multiToken = true // 409: a multi-token user deletes by id (D14)
+		if n > 1 || (cur.DisabledAt.Valid && n > 0) {
+			multiToken = true // 409: another enabled token needs a default (D14)
 			return nil
 		}
-		// The sole token (which is the default). Its gauge row goes with it via the
+		// No other enabled token remains. Its gauge row goes via the
 		// ON DELETE CASCADE (M5); no DeleteRateLimits call needed.
 		if _, derr := q.DeleteUserSecret(r.Context(), store.DeleteUserSecretParams{
 			ID: secretID, UserID: user.ID,
@@ -285,7 +334,7 @@ func (h *Handler) DeleteAnthropicToken(w http.ResponseWriter, r *http.Request) {
 	}
 	if multiToken {
 		httpx.Error(w, http.StatusConflict,
-			"you have multiple tokens; delete a specific one by id (DELETE /api/me/secrets/anthropic_token/{id})")
+			"another enabled token exists; delete a specific one by id (DELETE /api/me/secrets/anthropic_token/{id})")
 		return
 	}
 	if deleted && h.usagePoker != nil {
@@ -439,6 +488,7 @@ func (h *Handler) PatchAnthropicToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var out store.RenameUserSecretRow // id/kind/label/is_default/timestamps, shared shape
+	var disabledAt pgtype.Timestamptz
 	var found bool
 	err = h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
 		cur, gerr := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{
@@ -451,6 +501,10 @@ func (h *Handler) PatchAnthropicToken(w http.ResponseWriter, r *http.Request) {
 			return gerr
 		}
 		found = true
+		disabledAt = cur.DisabledAt
+		if cur.DisabledAt.Valid && req.Default != nil && *req.Default {
+			return errSecretDisabled
+		}
 		// AutoEligible is carried from the CURRENT row, not left zero: this handler
 		// never changes the pool flag (that is its own route, D13), so the response
 		// must report what the token's flag actually is. A zero here would answer
@@ -498,6 +552,10 @@ func (h *Handler) PatchAnthropicToken(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, "a token with that label already exists")
 			return
 		}
+		if errors.Is(err, errSecretDisabled) {
+			httpx.Error(w, http.StatusConflict, err.Error())
+			return
+		}
 		slog.Error("patch anthropic token", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
@@ -510,9 +568,12 @@ func (h *Handler) PatchAnthropicToken(w http.ResponseWriter, r *http.Request) {
 	if h.usagePoker != nil {
 		h.usagePoker.Poke(user.ID)
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{
-		"secret": secretMeta(out.ID, out.Kind, out.Label, out.IsDefault, out.AutoEligible, out.CreatedAt, out.UpdatedAt),
-	})
+	dto := secretMeta(out.ID, out.Kind, out.Label, out.IsDefault, out.AutoEligible, out.CreatedAt, out.UpdatedAt)
+	dto.Enabled = !disabledAt.Valid
+	if disabledAt.Valid {
+		dto.DisabledAt = &disabledAt.Time
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"secret": dto})
 }
 
 // PatchAnthropicTokenAutoEligible opts ONE of the user's tokens into or out of the
@@ -568,17 +629,23 @@ func (h *Handler) PatchAnthropicTokenAutoEligible(w http.ResponseWriter, r *http
 	}
 
 	var out store.SetUserSecretAutoEligibleRow
+	var disabledAt pgtype.Timestamptz
 	var found bool
 	err := h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
-		if _, gerr := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{
+		cur, gerr := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{
 			ID: secretID, UserID: user.ID,
-		}); gerr != nil {
+		})
+		if gerr != nil {
 			if errors.Is(gerr, pgx.ErrNoRows) {
 				return nil // found stays false → 404
 			}
 			return gerr
 		}
 		found = true
+		disabledAt = cur.DisabledAt
+		if cur.DisabledAt.Valid && *req.AutoEligible {
+			return errSecretDisabled
+		}
 		row, serr := q.SetUserSecretAutoEligible(r.Context(), store.SetUserSecretAutoEligibleParams{
 			ID: secretID, UserID: user.ID, Kind: store.KindAnthropicToken,
 			AutoEligible: *req.AutoEligible,
@@ -590,6 +657,10 @@ func (h *Handler) PatchAnthropicTokenAutoEligible(w http.ResponseWriter, r *http
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, errSecretDisabled) {
+			httpx.Error(w, http.StatusConflict, err.Error())
+			return
+		}
 		slog.Error("patch anthropic token auto-eligible", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
@@ -601,15 +672,18 @@ func (h *Handler) PatchAnthropicTokenAutoEligible(w http.ResponseWriter, r *http
 	// No usagePoker.Poke here, unlike rotate and set-default: pooling a token
 	// changes which credential future claims PREFER, not which one the poller reads
 	// or what it would read. Poking would spend a header probe to learn nothing.
-	httpx.JSON(w, http.StatusOK, map[string]any{
-		"secret": secretMeta(out.ID, out.Kind, out.Label, out.IsDefault, out.AutoEligible, out.CreatedAt, out.UpdatedAt),
-	})
+	dto := secretMeta(out.ID, out.Kind, out.Label, out.IsDefault, out.AutoEligible, out.CreatedAt, out.UpdatedAt)
+	dto.Enabled = !disabledAt.Valid
+	if disabledAt.Valid {
+		dto.DisabledAt = &disabledAt.Time
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"secret": dto})
 }
 
 // DeleteAnthropicTokenByID deletes ONE of the user's tokens by id (PRD #104 M2).
-// D6: the default may NOT be deleted while other tokens exist — promote another
-// first (409). Deleting the LAST token (even though it is the default) is allowed
-// and returns the user to the token-less state. D5: workers/judge bound to the
+// D6: the default may NOT be deleted while other enabled tokens exist — promote
+// another first (409). Deleting the last enabled token is allowed.
+// D5: workers/judge bound to the
 // deleted token fall back to their default automatically via the ON DELETE SET NULL
 // FKs, and the token's rate-limit gauge row is dropped by the ON DELETE CASCADE
 // (PRD #104 M5) — no app-level cleanup needed.
@@ -637,16 +711,15 @@ func (h *Handler) DeleteAnthropicTokenByID(w http.ResponseWriter, r *http.Reques
 		}
 		found = true
 		if cur.IsDefault {
-			n, cerr := q.CountUserSecretsForKind(r.Context(), store.CountUserSecretsForKindParams{
+			n, cerr := q.CountEnabledSecretSlot(r.Context(), store.CountEnabledSecretSlotParams{
 				UserID: user.ID, Kind: store.KindAnthropicToken,
 			})
 			if cerr != nil {
 				return cerr
 			}
-			// The default can be deleted only when it is the LAST token; otherwise the
-			// user would be left with tokens and no default. Under the lock this count is
-			// stable — no concurrent create can slip a second token in after it (D12).
-			if n > 1 {
+			// The default can be deleted only when no other enabled token remains.
+			// Under the lock this count is stable against concurrent creates (D12).
+			if n > 1 || (cur.DisabledAt.Valid && n > 0) {
 				refusedDefault = true
 				return nil
 			}
@@ -665,7 +738,7 @@ func (h *Handler) DeleteAnthropicTokenByID(w http.ResponseWriter, r *http.Reques
 	}
 	if refusedDefault {
 		httpx.Error(w, http.StatusConflict,
-			"cannot delete the default token while other tokens exist; set another token as default first")
+			"cannot delete the default token while other enabled tokens exist; set another token as default first")
 		return
 	}
 	if h.usagePoker != nil {
@@ -793,7 +866,11 @@ func (h *Handler) createCodexSecret(w http.ResponseWriter, r *http.Request, kind
 		if cerr != nil {
 			return cerr
 		}
-		wantDefault := req.Default || n == 0
+		hasDefault, derr := q.HasSecretDefaultSlot(r.Context(), store.HasSecretDefaultSlotParams{UserID: user.ID, Kind: kind})
+		if derr != nil {
+			return derr
+		}
+		wantDefault := req.Default || n == 0 || !hasDefault
 		if wantDefault {
 			// Clear the single shared codex default first — across BOTH kinds — so the
 			// insert leaves exactly one, never tripping user_secrets_codex_one_default_key.
@@ -925,6 +1002,7 @@ func (h *Handler) patchCodexSecret(w http.ResponseWriter, r *http.Request, kind 
 	}
 
 	var out store.RenameUserSecretRow
+	var disabledAt pgtype.Timestamptz
 	var status string
 	var found bool
 	err = h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
@@ -943,6 +1021,10 @@ func (h *Handler) patchCodexSecret(w http.ResponseWriter, r *http.Request, kind 
 			return nil // found stays false → 404
 		}
 		found = true
+		disabledAt = cur.DisabledAt
+		if cur.DisabledAt.Valid && req.Default != nil && *req.Default {
+			return errSecretDisabled
+		}
 		out = store.RenameUserSecretRow{
 			ID: cur.ID, Kind: cur.Kind, Label: cur.Label,
 			IsDefault: cur.IsDefault, AutoEligible: cur.AutoEligible,
@@ -1008,6 +1090,10 @@ func (h *Handler) patchCodexSecret(w http.ResponseWriter, r *http.Request, kind 
 			httpx.Error(w, http.StatusConflict, "a credential with that label already exists")
 			return
 		}
+		if errors.Is(err, errSecretDisabled) {
+			httpx.Error(w, http.StatusConflict, err.Error())
+			return
+		}
 		slog.Error("patch codex secret", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
@@ -1023,6 +1109,10 @@ func (h *Handler) patchCodexSecret(w http.ResponseWriter, r *http.Request, kind 
 		h.codexUsagePoker.Poke(user.ID)
 	}
 	dto := secretMeta(out.ID, out.Kind, out.Label, out.IsDefault, out.AutoEligible, out.CreatedAt, out.UpdatedAt)
+	dto.Enabled = !disabledAt.Valid
+	if disabledAt.Valid {
+		dto.DisabledAt = &disabledAt.Time
+	}
 	dto.CodexStatus = status
 	httpx.JSON(w, http.StatusOK, map[string]any{"secret": dto})
 }
@@ -1044,11 +1134,9 @@ func (h *Handler) DeleteOpenAIAPIKeyByID(w http.ResponseWriter, r *http.Request)
 // route's kind, so a foreign or mismatched id is a 404. The codex_credential_state row
 // is dropped by its ON DELETE CASCADE FK (00200) — no app-level cleanup.
 //
-// Unlike anthropic, deleting the codex default is ALLOWED even with other codex
-// credentials present: user_secrets_codex_one_default_key forbids TWO defaults, it does
-// not require one, so removing the default simply leaves the user with none until they
-// pick a new one. A single-row delete can never create a two-default state, so no
-// promotion and no default guard are needed in M1.
+// Deleting the default while enabled Codex siblings remain returns 409. The
+// caller explicitly promotes an enabled sibling first. The check and delete share
+// the mutation lock, so an enabled slot retains its default.
 func (h *Handler) deleteCodexSecretByID(w http.ResponseWriter, r *http.Request, kind string) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -1075,10 +1163,28 @@ func (h *Handler) deleteCodexSecretByID(w http.ResponseWriter, r *http.Request, 
 			return nil // wrong-kind id → 404
 		}
 		found = true
+		if cur.IsDefault {
+			count, countErr := q.CountEnabledSecretSlot(r.Context(), store.CountEnabledSecretSlotParams{
+				UserID: user.ID, Kind: kind,
+			})
+			if countErr != nil {
+				return countErr
+			}
+			if count > 1 || (cur.DisabledAt.Valid && count > 0) {
+				return errSecretTransitionConflict
+			}
+		}
 		_, derr := q.DeleteUserSecret(r.Context(), store.DeleteUserSecretParams{ID: secretID, UserID: user.ID})
 		return derr
 	})
 	if err != nil {
+		if errors.Is(err, errSecretTransitionConflict) {
+			// PRD #1732 D12: deleting the default is fixed by picking a new default, which is
+			// the advice the Anthropic twin (DeleteAnthropicTokenByID) gives.
+			httpx.Error(w, http.StatusConflict,
+				"cannot delete the default credential while other enabled credentials exist; set another credential as default first")
+			return
+		}
 		slog.Error("delete codex secret by id", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return

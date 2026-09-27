@@ -18,6 +18,7 @@ import { JudgeRunner } from "./judge-runner.js";
 import { ReviewRunner } from "./review-runner.js";
 import { stubJudgeQueryFn } from "./judge-runner-stub.js";
 import { Worker } from "./worker.js";
+import { createDindPrune, DindPruneGate } from "./dind-prune.js";
 import { reclaimStrandedRunHomes } from "./home-reclaim.js";
 import { errMessage } from "./util.js";
 import { uidSplitActive } from "./runner-uid.js";
@@ -578,7 +579,32 @@ async function main(): Promise<void> {
   // PRD #1391 M2: the Worker owns the per-worker outbox drainer + the heartbeat outbox
   // report, so it takes the same outbox + re-arm registry the runners spill into. The
   // `undefined` preserves the default boot toolchain preflight (only tests inject one).
-  const worker = new Worker(config, client, runner, chatRunner, judgeRunner, reviewRunner, log, undefined, outbox, rearm, activeRuns);
+  // issue #1759 M3: the DinD prune, built only on a docker worker with
+  // UZI_DIND_PRUNE_ENABLED=true (undefined otherwise, so no loop and no claim gate). Its idle
+  // probe reads the worker's own active sets, hence the late-bound `worker` reference: the
+  // probe is only ever called from the prune loop, which the worker itself starts.
+  let worker: Worker | undefined;
+  const dindPrune = createDindPrune(config, {
+    gate: new DindPruneGate(),
+    isIdle: () => worker?.isIdle() ?? false,
+    log,
+  });
+  if (dindPrune) log.info("dind prune enabled", { docker_host_wired: true });
+  worker = new Worker(
+    config,
+    client,
+    runner,
+    chatRunner,
+    judgeRunner,
+    reviewRunner,
+    log,
+    undefined,
+    outbox,
+    rearm,
+    activeRuns,
+    undefined,
+    dindPrune,
+  );
 
   // Signal handlers FIRST, before anything that can take real time. Until these
   // are installed a SIGTERM hits Node's default disposition and terminates the

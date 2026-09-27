@@ -451,6 +451,10 @@ func codexCheckAccountTuple(in codexReleaseInputs) error {
 //
 // api_key rows skip the account tuple/revision/quarantine checks — a static key has no
 // account behind it.
+//
+// Keep the quarantine check LAST: CoordinatedCodexRefresh's vault-locked recheck (issue
+// #1766) tolerates ErrCodexAccountQuarantined alone, which is sound only while reaching it
+// proves every earlier check held.
 func evalCodexReleasePredicate(in codexReleaseInputs) error {
 	if err := codexCheckKindMode(in.authMode, in.boundKind); err != nil {
 		return err
@@ -863,6 +867,21 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 	}
 	if perr := evalCodexReleasePredicate(codexReleaseInputsFromAuthRow(authRow)); perr != nil {
 		return nil, perr
+	}
+	// PRD #1732 D2/D6: the FROZEN alias this run was created with must be enabled. Checked
+	// BEFORE the mint, so a disabled alias mints nothing and its refusal is the plain
+	// errCredentialDisabled (never a codexMintedClaimError): the finisher parks the claim on
+	// credential_disabled and the promoter resumes it when THIS alias is enabled again. A
+	// default hand-off after creation changes nothing here: the run keeps its frozen alias.
+	// A disable that lands after this read is caught by the finisher's locked re-check.
+	if run.CodexSecretID.Valid {
+		meta, merr := s.q.GetUserSecretMetaByID(ctx, store.GetUserSecretMetaByIDParams{ID: secretID, UserID: run.UserID})
+		switch {
+		case merr == nil && meta.Disabled:
+			return nil, fmt.Errorf("%w: Codex credential %q is disabled; enable it in Settings", errCredentialDisabled, meta.Label)
+		case merr != nil && !errors.Is(merr, pgx.ErrNoRows):
+			return nil, fmt.Errorf("codex claim: read alias enablement: %w", merr)
+		}
 	}
 
 	// Mint the per-claim capability and store its hash worker-scoped and generation-fenced,
