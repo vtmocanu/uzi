@@ -138,6 +138,7 @@ uzi review file <id> <rec> [--repo <repo-id>]
 uzi findings list [--repo <id>] [--bucket to_file|filed|done|dismissed|all] [--run <id>]
 uzi findings file <finding-id>
 uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
+uzi findings resolve <finding-id>
 uzi findings undo <disposition-id>
 uzi findings stats [--repo <id>] [--json]
 uzi handoff -m <text> | -f <path> [--base <ref>] [--mr] [--review] [--then-fix] [--interactive] [--repo <id>]
@@ -1495,7 +1496,7 @@ uzi findings stats [--repo <repo-id>]                        # your triage total
 `list` prints one row per `(repo, location)` coordinate, grouped by repo, carrying
 the actionable `finding_id`, the latest title, `seen in N runs`, and a state — a
 dismissed row shows its reason (`Dismissed · Won't do` / `Dismissed · Not an issue`), a
-coordinate you marked done yourself reads `Done`, and one the issue-close sync settled
+coordinate you marked done yourself reads `done`, and one the issue-close sync settled
 (below) reads `Done via #N`. The
 `open_count` (what still needs triage) prints as a meta line and rides the `--json`
 envelope. `--bucket` filters by disposition and defaults to `to_file`; `filed`,
@@ -1521,16 +1522,18 @@ sent; a coordinate that is not dismissable (already filed, being filed, or alrea
 dismissed) is a conflict (exit 5), and an unknown or foreign id is not-found (exit 4).
 
 `resolve` is the twin of [`review resolve`](#reviewing-and-triaging-from-the-cli): it
-marks a coordinate **Done** yourself, the human counterpart to the issue-close sync
+marks a coordinate **done** yourself, the human counterpart to the issue-close sync
 below. It works from `to_file`, `filed`, or `dismissed` (a done from `dismissed`
-replaces the dismissal; resolving an already-done coordinate just re-asserts it). The
-only refusal is a coordinate whose issue is currently being filed — a conflict (exit
-5); an unknown or foreign id is not-found (exit 4). `--json` returns the settled
-coordinate.
+replaces the dismissal; resolving a coordinate the sync already set — `Done via #N`
+— converts it to a human done rather than re-asserting the sync verdict). The only
+refusal is a coordinate whose issue is currently being filed — a conflict (exit 5);
+an unknown or foreign id is not-found (exit 4). It prints the disposition id `uzi
+findings undo` takes; `--json` returns `{finding, status, disposition_id}` — no other
+keys, so read the disposition id off there rather than off `list`'s table.
 
 `undo` reopens a dismissed or done coordinate. From `dismissed` it goes back to
-`to_file`; from a done it exposes `filed` if the coordinate has a filed issue,
-otherwise `to_file` — it never restores a dismissal a done replaced. It keys on the
+`open` (the To triage bucket); from a done it exposes `filed` if the coordinate has a
+filed issue, otherwise `open` — it never restores a dismissal a done replaced. It keys on the
 coordinate's `disposition_id`, **not** the `finding_id` the human `list` view and
 `file`/`dismiss`/`resolve` use — `disposition_id` is always present (a dismissed or
 done coordinate can outlive its own evidence, while `finding_id` goes nil once that
@@ -1545,7 +1548,7 @@ totals object. It's the same number the web nav badge and the Findings tabs show
 the same repo scope.
 
 `<finding-id>` is the id `list` prints as the first column of each coordinate; paste
-it straight into `file`/`dismiss`. Treat `location`, the title and `repo_path` as
+it straight into `file`/`dismiss`/`resolve`. Treat `location`, the title and `repo_path` as
 untrusted free text (they are agent-authored): render them as data, and branch only
 on the `status`/`bucket` enums.
 

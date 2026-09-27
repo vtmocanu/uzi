@@ -18,9 +18,10 @@ uzi.**
 ## Where you'll see it
 
 - **A card in the run's stream**, if you're watching it live: a blue
-  "incidental finding" card with **File**, **Edit & file**, and **Dismiss**.
-  It's non-blocking by design — a different accent from the amber gate cards
-  (plan approval, a clarifying question) that actually park the run.
+  "incidental finding" card with **File issue**, **Mark done**, and
+  **Dismiss ▾**. It's non-blocking by design — a different accent from the
+  amber gate cards (plan approval, a clarifying question) that actually park
+  the run.
 - **A Slack DM** if you've linked your account (see [Slack](./slack.md)) —
   even if you weren't watching. A run that flags several findings sends
   **one** DM, best-effort, not one ping per finding.
@@ -75,16 +76,20 @@ resolved," never an error.
 Findings gets the same **Mark done** a person can already put on a judge
 recommendation. Click **Mark done** from an open row (To triage), from a
 filed row, or from a dismissed row — a done from Dismissed replaces the
-dismissal, and marking done again just re-asserts it. The chip reads **"✓
-Done"** for a done you set yourself, distinct from **"Done via #N"** below.
-The one thing you can't do is mark done a finding whose issue is currently
-being filed — try that and it comes back as a conflict, same as any other
-action mid-filing.
+dismissal. The chip reads **"✓ Done"** for a done you set yourself, distinct
+from **"Done via #N"** below; the web doesn't offer a second Mark done once
+a row is already done. The one thing you can't do is mark done a finding
+whose issue is currently being filed — the web doesn't offer the button on a
+mid-filing row, and `uzi findings resolve` comes back as a conflict (exit 5)
+if you try it from the CLI.
 
-**Undo** — from the toast, the row, or the multi-select bar — clears a human
-done and exposes whatever is underneath: **Filed** if the finding has a
-filed issue, otherwise **To triage**. It does not bring back a previous
-dismissal; a dismissal that a done replaced is gone for good.
+**Undo** clears a human done and exposes whatever is underneath: **Filed**
+if the finding has a filed issue, otherwise **To triage**. On the Findings
+page it's in the **toast** that follows a Mark done, single or bulk; on the
+run page it's the inline **Undo** next to the finding card's own Mark done.
+Once the toast is gone, `uzi findings undo <disposition-id>` is the way
+back. It does not bring back a previous dismissal; a dismissal that a done
+replaced is gone for good.
 
 ## Closing a filed issue marks it done
 
@@ -97,8 +102,10 @@ your verdict — and reopening the *filed issue* on the forge does not undo it.
 If you'd already marked that same coordinate done yourself, the close is
 recorded without changing your verdict: it still reads "✓ Done" for the
 human done, not "Done via #N", and if you later Undo back to Filed, that
-same close won't re-mark it done behind you. A close seen *after* your Undo
-still marks it Done via #N, same as any other filed finding.
+same close won't re-mark it done behind you — that holds even if the issue
+is later reopened and closed again, since this edge fires once per filed
+issue. Only an issue that *first* closes after your Undo marks it Done via
+#N, same as any other filed finding.
 
 If the same bug **reappears** in a later run — a materially different report
 at that same spot — the coordinate goes back to **To triage**, even one
@@ -145,5 +152,5 @@ the `finding_id` the human `list` view prints — read it off `--json`.
 - **A run can't flood the backlog.** A single run stops flagging new findings
   after 10, so a noisy run can't drown out the backlog — it keeps working on
   its actual task either way.
-- **Nothing is spent filing or dismissing.** Both are plain writes against
-  your own connection; no Anthropic token is involved.
+- **Nothing is spent filing, dismissing, or marking done.** All three are
+  plain writes against your own connection; no Anthropic token is involved.
