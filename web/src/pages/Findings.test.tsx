@@ -556,9 +556,11 @@ describe("Findings page — Mark done (issue #1723)", () => {
 
   it("bulk Dismiss over a mixed selection reports and undoes only the rows actually dismissed", async () => {
     await renderMixed();
-    // The server dismisses the open row only; the filed and dismissed ones are skipped.
+    // The server dismisses the open row only; the filed and dismissed ones are skipped. `updated`
+    // deliberately disagrees with the one returned row: the toast count must come from the rows the
+    // server re-read (what actually moved), never from res.updated.
     mockApi.dismissFindings.mockResolvedValue({
-      updated: 1,
+      updated: 3,
       findings: [{ ...mixed[0], status: "dismissed", dismiss_reason: "not_an_issue" }],
     });
     mockApi.undoFinding.mockResolvedValue({ ...mixed[0], status: "open" });
@@ -576,6 +578,41 @@ describe("Findings page — Mark done (issue #1723)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Undo" }));
     await waitFor(() => expect(mockApi.undoFinding).toHaveBeenCalledTimes(1));
     expect(mockApi.undoFinding).toHaveBeenCalledWith("d-open");
+  });
+
+  it("a 409'd File whose reload returns the row filed offers Mark done again, agreeing with its checkbox", async () => {
+    // The row reads open, the File 409s (filed from elsewhere), and the reload brings it back filed.
+    // resolvedIds survives the reload, so the stale suppression must key on the row still reading
+    // open: the reconciled filed row gets its Mark done button back, alongside its checkbox.
+    const openRow = mixed[0];
+    const filedNow = {
+      ...openRow,
+      status: "filed" as const,
+      filed_issue_iid: 88,
+      filed_issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/88",
+    };
+    mockApi.listFindings
+      .mockResolvedValueOnce(backlog({ bucket: "all", repo: "repo-uzi", findings: [openRow] }))
+      .mockResolvedValue(backlog({ bucket: "all", repo: "repo-uzi", findings: [filedNow] }));
+    mockApi.findingIssueDraft.mockResolvedValue({
+      title: "t",
+      description: "d",
+      location: openRow.location,
+      labels: [],
+      provenance: "",
+    });
+    mockApi.fileFinding.mockRejectedValue(new ApiError(409, "already resolved"));
+    renderFindings(["/findings?bucket=all&repo=repo-uzi"]);
+    await waitFor(() => expect(screen.getByText("open row")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "File issue" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Create issue" }));
+
+    await waitFor(() => expect(mockApi.fileFinding).toHaveBeenCalledTimes(1));
+    expect(await within(rowOf("open row")).findByRole("link", { name: /Filed #88/ })).toBeTruthy();
+    const row = rowOf("open row");
+    expect(within(row).getByRole("checkbox")).toBeTruthy();
+    expect(buttonNames(row)).toEqual(["Mark done"]);
   });
 });
 

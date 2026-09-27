@@ -281,6 +281,34 @@ describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
     expect(link.getAttribute("href")).toBe("https://gitlab.example.com/vtmocanu/uzi/-/issues/77");
     // A filed coordinate does not re-offer File issue.
     expect(screen.queryByRole("button", { name: "File issue" })).toBeNull();
+    // No button replaces the Undo that just unmounted, so focus lands on the Filed #N link rather
+    // than dropping to document.body.
+    await waitFor(() => expect(document.activeElement).toBe(link));
+  });
+
+  it("Undo that lands on the resolved fallback focuses the card, never document.body", async () => {
+    mockApi.markFindingDone.mockResolvedValue({ status: "done", disposition_id: "disp-1" });
+    // Filed but with no issue link to show: the card falls back to its resolved advisory, which
+    // mounts neither a button nor a link.
+    mockApi.undoFinding.mockResolvedValue({
+      disposition_id: "disp-1",
+      finding_id: "find-1",
+      location: "a.go#loop",
+      repo_id: "repo-uzi",
+      repo_path: "vtmocanu/uzi",
+      status: "filed",
+      last_title: "Leaked ticker",
+      seen_in_runs: 1,
+    });
+    const { container } = render(<FindingCard id="find-1" title="Leaked ticker" location="a.go#loop" labels={[]} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Undo" }));
+
+    await waitFor(() => expect(screen.getByText(/Already filed or resolved/)).toBeTruthy());
+    const card = container.firstElementChild as HTMLElement;
+    await waitFor(() => expect(document.activeElement).toBe(card));
+    expect(document.activeElement).not.toBe(document.body);
   });
 
   it("a Mark done that 409s (being filed) shows the resolved advisory", async () => {

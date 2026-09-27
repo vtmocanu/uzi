@@ -78,13 +78,22 @@ export function FindingCard({
   // (the disposed row's Undo, or the action row's first button after an Undo) — and never on mount.
   const focusAfterMutation = useRef(false);
   const actionsRef = useRef<HTMLDivElement>(null);
+  const stateSlotRef = useRef<HTMLSpanElement>(null);
+  const cardRef = useRef<HTMLDivElement>(null);
 
   // Deferred until busy drops: the successor is `disabled={busy}`, and a disabled element ignores
-  // .focus(). Both successors are the first <button> in the actions wrapper.
+  // .focus(). The successor is the first <button> in the actions wrapper when the new state has one
+  // (done → Undo, open → File issue). An Undo that lands on filed or on the resolved advisory mounts
+  // no button there, so focus falls to the state chip's "Filed #N" link, else to the card itself
+  // (tabIndex=-1), rather than dropping to document.body with the Undo that just unmounted.
   useEffect(() => {
     if (!focusAfterMutation.current || busy) return;
     focusAfterMutation.current = false;
-    actionsRef.current?.querySelector<HTMLElement>("button")?.focus();
+    const target =
+      actionsRef.current?.querySelector<HTMLElement>("button") ??
+      stateSlotRef.current?.querySelector<HTMLElement>("a[href]") ??
+      cardRef.current;
+    target?.focus();
   }, [state, busy]);
 
   // loadDraft maps the deterministic, owner-scoped finding draft (D4) onto the shared card's seed.
@@ -193,7 +202,11 @@ export function FindingCard({
   };
 
   return (
-    <div className="overflow-hidden rounded-xl border border-info/40 bg-info/[0.06]">
+    <div
+      ref={cardRef}
+      tabIndex={-1}
+      className="overflow-hidden rounded-xl border border-info/40 bg-info/[0.06] focus:outline-none focus-visible:ring-2 focus-visible:ring-info/60"
+    >
       <div className="flex items-center justify-between gap-2 border-b border-info/20 bg-info/10 px-3 py-2">
         <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-info">
           <span aria-hidden="true">
@@ -201,7 +214,9 @@ export function FindingCard({
           </span>
           Incidental finding
         </span>
-        <FindingStateSlot state={state} />
+        <span ref={stateSlotRef}>
+          <FindingStateSlot state={state} />
+        </span>
       </div>
 
       <div className="space-y-3 px-3 py-3">

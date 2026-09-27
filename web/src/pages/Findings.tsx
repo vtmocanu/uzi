@@ -417,9 +417,17 @@ export function Findings() {
   // Select-all and the checkboxes cover the displayed Mark-done-eligible rows (canMarkDone: open,
   // filed or dismissed, with a disposition id). Bulk Dismiss over a mixed selection moves only its
   // open rows; the server skips the rest and the toast reports only what it dismissed.
+  // A 409'd row still reading open is stale (FindingRow's showResolved): it offers no Mark done
+  // button, so it offers no checkbox either. Once the reload returns it filed/dismissed it is
+  // selectable again, exactly when its button comes back.
+  const isStale = useCallback(
+    (f: IncidentalFinding) => f.status === "open" && !!f.finding_id && resolvedIds.has(f.finding_id),
+    [resolvedIds],
+  );
+  const canSelect = useCallback((f: IncidentalFinding) => canMarkDone(f) && !isStale(f), [isStale]);
   const selectableIds = useMemo(
-    () => (backlog?.findings ?? []).filter(canMarkDone).map((f) => f.disposition_id as string),
-    [backlog],
+    () => (backlog?.findings ?? []).filter(canSelect).map((f) => f.disposition_id as string),
+    [backlog, canSelect],
   );
   const allSelected = selectableIds.length > 0 && selectableIds.every((id) => selected.has(id));
   const someSelected = selectableIds.some((id) => selected.has(id));
@@ -437,7 +445,7 @@ export function Findings() {
   // disposition_id) is symmetric with a single-row verdict.
   const rowProps = (f: IncidentalFinding) => ({
     finding: f,
-    selectable: canMarkDone(f),
+    selectable: canSelect(f),
     selected: f.disposition_id ? selected.has(f.disposition_id) : false,
     onToggleSelect: () => f.disposition_id && toggleSelect(f.disposition_id),
     repoLabel: stripUnsafeChars(maskRepoPath(f.repo_path, demo)),
@@ -666,15 +674,18 @@ function FindingRow({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [filing, setFiling] = useState(false);
-  // File and Dismiss: an open row with evidence. Mark done: canMarkDone (no evidence needed). A
-  // 409'd stale row offers neither until the reload reconciles it.
-  const actionable = !!finding.finding_id && finding.status === "open" && !resolved;
-  const markDoneable = canMarkDone(finding) && !resolved;
+  // A 409'd row that still reads open (the reload has not reconciled it yet) is stale: it shows the
+  // neutral "already resolved" note in place of the chip and offers no action. resolvedIds outlives
+  // the reload (only a bucket/repo/run change clears it), so the suppression keys on the row still
+  // reading open: once the reload brings it back filed or dismissed, it is an ordinary row again and
+  // its Mark done button agrees with its checkbox (both canMarkDone).
+  const showResolved = resolved && finding.status === "open";
+  // File and Dismiss: an open row with evidence. Mark done: canMarkDone (no evidence needed).
+  const actionable = !!finding.finding_id && finding.status === "open" && !showResolved;
+  const markDoneable = canMarkDone(finding) && !showResolved;
   const seen = seenInRunsLabel(finding.seen_in_runs);
   const occurrences = finding.occurrences ?? [];
   const hasEvidence = (finding.evidence_preview?.trim() ?? "") !== "" || occurrences.length > 0;
-  // A 409'd stale row shows the neutral "already resolved" note in place of the chip.
-  const showResolved = resolved && finding.status === "open";
   // findingState wants the reason as the closed union; the wire types dismiss_reason as a bare
   // string, so narrow it here (an unknown reason falls to the bare "Dismissed").
   const dismissReason =

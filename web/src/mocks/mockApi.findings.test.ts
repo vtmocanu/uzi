@@ -29,8 +29,9 @@ describe("mockApi findings backlog (PRD #333 M7)", () => {
     expect(mine.some((f) => f.status === "dismissed" && f.dismiss_reason != null)).toBe(true);
     // Every coordinate carries a disposition_id (the bulk-dismiss / undo key).
     expect(mine.every((f) => !!f.disposition_id)).toBe(true);
-    // A display-only coordinate (evidence cascaded away) and more than one repo, so grouping
-    // and the null-finding_id row are both exercised by the surfaces.
+    // An evidence-less coordinate (evidence cascaded away: no File/Dismiss, but still Mark done,
+    // issue #1723) and more than one repo, so grouping and the null-finding_id row are both
+    // exercised by the surfaces.
     expect(mine.some((f) => f.finding_id === null)).toBe(true);
     expect(new Set(mine.map((f) => f.repo_id)).size).toBeGreaterThan(1);
   });
@@ -51,7 +52,7 @@ describe("mockApi findings backlog (PRD #333 M7)", () => {
     expect(filed.findings.every((f) => f.status === "filed")).toBe(true);
   });
 
-  it("filters by repo and omits the finding_id on a display-only coordinate", async () => {
+  it("filters by repo and omits the finding_id on an evidence-less coordinate", async () => {
     const api = await freshApi();
     const uzi = await api.listFindings("all", "repo-uzi");
     expect(uzi.findings.every((f) => f.repo_id === "repo-uzi")).toBe(true);
