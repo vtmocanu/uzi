@@ -5,8 +5,8 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  DEFAULT_DELIVERY_SUMMARY_MODEL,
   SummaryRunner,
-  deliverySummaryDeadline,
   type DeliverySummaryClaimView,
   type DeliverySummaryInput,
 } from "../src/summary-runner.js";
@@ -88,8 +88,10 @@ const emptyGit: DeliveryContextGit = {
   sizeMergeBase: async () => "b".repeat(40),
   diffNumstatZ: async () => "1\t0\tsrc/x.ts\0",
   checkAttrZ: async (_b, _h, paths) => new Map(paths.map((p) => [p, {}])),
-  readBare: async (_b, args) =>
-    args[0] === "log" ? "feat: add x\0" : `diff --git a/src/x.ts b/src/x.ts\n+// ${INJECTION}\n`,
+  readBare: async (_b, args) => ({
+    text: args[0] === "log" ? "feat: add x\0" : `diff --git a/src/x.ts b/src/x.ts\n+// ${INJECTION}\n`,
+    truncated: false,
+  }),
 };
 
 async function context(): Promise<DeliveryContext> {
@@ -98,6 +100,7 @@ async function context(): Promise<DeliveryContext> {
     barePath: "/bare",
     targetBranch: "main",
     headSha: "a".repeat(40),
+    deadlineMs: Date.now() + 60_000,
     redact: makeTextRedactor([]),
     issueTitle: "Add x",
     issueBody: `Please add x. ${INJECTION}`,
@@ -153,17 +156,64 @@ describe("SummaryRunner.generateDeliverySummary (PRD #1798 M5)", () => {
   });
 
   it("a spent deadline returns null without calling the model", async () => {
-    const warns: string[] = [];
-    const log = { ...nullLogger(), warn: (m: string) => void warns.push(m) } as Logger;
+    const warns: Record<string, unknown>[] = [];
+    const log = { ...nullLogger(), warn: (_m: string, f?: Record<string, unknown>) => void warns.push(f ?? {}) } as Logger;
     const r = await runner(forbiddenQueryFn(), { log, now: () => 1_000_000 });
     assert.equal(await r.generateDeliverySummary(await deliveryInput({ deadlineMs: 1_000_000 })), null);
     assert.equal(await r.generateDeliverySummary(await deliveryInput({ deadlineMs: 999_000 })), null);
-    assert.ok(warns.every((w) => /deadline is spent/.test(w)), warns.join("; "));
+    assert.ok(warns.every((w) => /deadline is spent/.test(String(w.reason))), JSON.stringify(warns));
     assert.equal(warns.length, 2);
   });
 
-  it("deliverySummaryDeadline is now plus the configured summary timeout (60 s by default)", () => {
-    assert.equal(deliverySummaryDeadline(1_000), 61_000);
+  it("deliverySummaryDeadline is the runner's clock plus its own model timeout", async () => {
+    // Both injected, so the result does not depend on the SUMMARY_MODEL_TIMEOUT_MS env.
+    const r = await runner(forbiddenQueryFn(), { modelTimeoutMs: 7_000, now: () => 1_000 });
+    assert.equal(r.deliverySummaryDeadline(), 8_000);
+  });
+
+  it("a Claude claim with no summary_model (or an invalid one) runs the default summary model, never the SDK default", async () => {
+    assert.equal(DEFAULT_DELIVERY_SUMMARY_MODEL, "haiku");
+    for (const summary_model of [undefined, null, "", "  ", "bad model"]) {
+      const seen: Seen = { calls: 0 };
+      const r = await runner(claudeQueryFn(JSON.stringify(good), seen));
+      const claim: DeliverySummaryClaimView = { run_id: "run-1", summary_model, secrets: { anthropic_oauth_token: "tok" } };
+      assert.deepEqual(await r.generateDeliverySummary(await deliveryInput({ claim })), good);
+      assert.equal(seen.model, DEFAULT_DELIVERY_SUMMARY_MODEL, String(summary_model));
+    }
+  });
+
+  it("every failure branch logs a fixed reason and the error class only, never the model's text", async () => {
+    const MARK = "MODELTEXT-7f3c";
+    const logged: unknown[] = [];
+    const record = (m: string, f?: Record<string, unknown>) => void logged.push(m, f ?? {});
+    const log = { debug: record, info: record, warn: record, error: record } as unknown as Logger;
+    const failing = (message: string): SdkQueryFn =>
+      // eslint-disable-next-line require-yield
+      (async function* () {
+        throw new Error(message);
+      }) as unknown as SdkQueryFn;
+    const cases: [SdkQueryFn, string][] = [
+      // JSON.parse's message quotes the offending input: an unparseable object candidate.
+      [claudeQueryFn(`{"summary": ${MARK} }`), "unparseable output"],
+      [claudeQueryFn(`no json at all ${MARK}`), "unparseable output"],
+      [claudeQueryFn(JSON.stringify({ changes: [MARK] })), "the output had no usable summary"],
+      [failing(`upstream said ${MARK}`), "the model pass failed"],
+    ];
+    for (const [queryFn, reason] of cases) {
+      logged.length = 0;
+      const r = await runner(queryFn, { log });
+      assert.equal(await r.generateDeliverySummary(await deliveryInput()), null);
+      const warn = logged.find((x) => typeof x === "object" && x !== null && "reason" in x) as Record<string, unknown>;
+      assert.equal(warn.reason, reason);
+      assert.equal(JSON.stringify(logged).includes(MARK), false, `${reason}: ${JSON.stringify(logged)}`);
+      if (reason !== "the output had no usable summary") assert.match(String(warn.error_class), /^[A-Za-z]+$/);
+    }
+    // A malformed codex block: fixed reason, class only.
+    logged.length = 0;
+    const r = await runner(forbiddenQueryFn(), { log, codex: fakeCodexFactory("{}") });
+    const malformed = { run_id: "run-1", secrets: { codex: { auth_mode: MARK } } };
+    assert.equal(await r.generateDeliverySummary(await deliveryInput({ claim: malformed })), null);
+    assert.equal(JSON.stringify(logged).includes(MARK), false, JSON.stringify(logged));
   });
 
   it("malformed JSON, a missing summary, a blank summary and a non-object all return null", async () => {
@@ -198,12 +248,15 @@ describe("SummaryRunner.generateDeliverySummary (PRD #1798 M5)", () => {
     assert.ok(Buffer.byteLength(out.summary) <= 4000);
   });
 
-  it("multibyte output stays within the api's raw byte caps", async () => {
+  it("multibyte output: the code-point clip alone keeps it within the api's raw byte caps", async () => {
+    // At most 4 bytes per code point, the layout limits (600 / 200 code points) already sit under
+    // the raw caps (4000 / 1000 bytes); the byte clip is a backstop this input cannot reach.
     const r = await runner(claudeQueryFn(JSON.stringify({ summary: "\u{1F600}".repeat(700), changes: ["\u{1F600}".repeat(300)] })));
     const out = (await r.generateDeliverySummary(await deliveryInput()))!;
-    assert.ok(Buffer.byteLength(out.summary) <= 4000);
     assert.equal([...out.summary].length, 600);
-    assert.ok(Buffer.byteLength(out.changes[0]!) <= 1000);
+    assert.equal(Buffer.byteLength(out.summary), 599 * 4 + 3);
+    assert.equal([...out.changes[0]!].length, 200);
+    assert.equal(Buffer.byteLength(out.changes[0]!), 199 * 4 + 3);
   });
 
   it("drops scope notes with an invalid kind or blank text, and non-string list items", async () => {

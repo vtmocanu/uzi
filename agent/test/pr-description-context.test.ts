@@ -11,6 +11,7 @@ import {
 import { buildDeliveryPrompt } from "../src/summary-runner.js";
 import { makeTextRedactor } from "../src/redact.js";
 import type { PathAttributes } from "../src/pr-size.js";
+import type { BoundedRead, BoundedReadOptions } from "../src/git.js";
 
 // PRD #1798 M5 (D6/D7): the editor pass's budgeted, redacted input.
 
@@ -32,13 +33,37 @@ interface FakeFile {
   /** For a rename: the old path. */
   from?: string;
   attrs?: PathAttributes;
+  /** Numstat of a binary file: `-\t-\t`. */
+  binary?: boolean;
+  /** The per-path read rejects (a git failure for this path only). */
+  failDiff?: boolean;
+}
+
+interface FakeOpts {
+  subjects?: string[];
+  failMergeBase?: boolean;
+  failAttrs?: boolean;
+  mergeBase?: string;
+  /** Override one bounded read (after it is recorded); undefined falls through to the default. */
+  onRead?: (args: readonly string[], opts: BoundedReadOptions) => BoundedRead | undefined;
+}
+
+/** Honour the read bound like GitCache.readBare: at most maxBytes (UTF-8), truncated past it. */
+function bounded(text: string, maxBytes: number): BoundedRead {
+  const buf = Buffer.from(text);
+  if (buf.length <= maxBytes) return { text, truncated: false };
+  return { text: new TextDecoder().decode(buf.subarray(0, maxBytes)).replace(/\uFFFD$/, ""), truncated: true };
 }
 
 /** A fake bare repo: numstat, attributes, commit subjects and per-path diffs from `files`. */
-function fakeGit(files: FakeFile[], opts: { subjects?: string[]; failMergeBase?: boolean } = {}) {
+function fakeGit(files: FakeFile[], opts: FakeOpts = {}) {
   const reads: (readonly string[])[] = [];
+  const readOpts: BoundedReadOptions[] = [];
   const numstat = files
-    .map((f) => (f.from ? `${f.added}\t${f.deleted}\t\0${f.from}\0${f.path}\0` : `${f.added}\t${f.deleted}\t${f.path}\0`))
+    .map((f) => {
+      const counts = f.binary ? "-\t-\t" : `${f.added}\t${f.deleted}\t`;
+      return f.from ? `${counts}\0${f.from}\0${f.path}\0` : `${counts}${f.path}\0`;
+    })
     .join("");
   const git: DeliveryContextGit = {
     async sizeMergeBase(bare, target, head) {
@@ -46,7 +71,7 @@ function fakeGit(files: FakeFile[], opts: { subjects?: string[]; failMergeBase?:
       assert.equal(target, "main");
       assert.equal(head, HEAD);
       if (opts.failMergeBase) throw new Error("no merge base");
-      return BASE;
+      return opts.mergeBase ?? BASE;
     },
     async diffNumstatZ(_bare, base, head) {
       assert.equal(base, BASE);
@@ -54,24 +79,31 @@ function fakeGit(files: FakeFile[], opts: { subjects?: string[]; failMergeBase?:
       return numstat;
     },
     async checkAttrZ(_bare, _head, paths) {
+      if (opts.failAttrs) throw new Error("check-attr failed");
       const m = new Map<string, PathAttributes>();
       for (const p of paths) m.set(p, files.find((f) => f.path === p)?.attrs ?? {});
       return m;
     },
-    async readBare(bare, args) {
+    async readBare(bare, args, o) {
       assert.equal(bare, BARE);
+      assert.ok(o.maxBytes > 0, "every read is bounded");
+      assert.ok(o.timeoutMs !== undefined && o.timeoutMs > 0, "every read carries the time left");
       reads.push(args);
-      if (args[0] === "log") return (opts.subjects ?? ["feat: one"]).map((s) => `${s}\0`).join("");
-      assert.equal(args[0], "--literal-pathspecs");
-      assert.equal(args[1], "diff");
+      readOpts.push(o);
+      const over = opts.onRead?.(args, o);
+      if (over !== undefined) return over;
+      if (args[0] === "log") return bounded((opts.subjects ?? ["feat: one"]).map((s) => `${s}\0`).join(""), o.maxBytes);
+      assert.deepEqual(args.slice(0, 4), ["-c", "core.quotePath=true", "--literal-pathspecs", "diff"]);
       const sep = args.indexOf("--");
       assert.deepEqual(args.slice(sep - 2, sep), [BASE, HEAD]);
       const target = args[args.length - 1];
-      return files.find((f) => f.path === target)?.diff ?? "";
+      const f = files.find((x) => x.path === target);
+      if (f?.failDiff) throw new Error(`git diff failed for ${target}`);
+      return bounded(f?.diff ?? "", o.maxBytes);
     },
   };
-  const diffReads = () => reads.filter((a) => a[1] === "diff").map((a) => a.slice(a.indexOf("--") + 1));
-  return { git, reads, diffReads };
+  const diffReads = () => reads.filter((a) => a[3] === "diff").map((a) => a.slice(a.indexOf("--") + 1));
+  return { git, reads, readOpts, diffReads };
 }
 
 function input(git: DeliveryContextGit, over: Partial<DeliveryContextInput> = {}): DeliveryContextInput {
@@ -80,6 +112,7 @@ function input(git: DeliveryContextGit, over: Partial<DeliveryContextInput> = {}
     barePath: BARE,
     targetBranch: "main",
     headSha: HEAD,
+    deadlineMs: Date.now() + 60_000,
     redact: makeTextRedactor([SECRET]),
     issueTitle: "Add plain-English PR descriptions",
     issueBody: "The PR body should say what changed.",
@@ -103,7 +136,16 @@ describe("buildDeliveryContext (PRD #1798 M5, D6)", () => {
         prSummary: { what: "Adds descriptions", changes: ["Renderer"], verification: [{ command: "npm test", result: "pass" }] },
       }),
     );
-    assert.deepEqual(ctx.truncated, { issue: false, prd: false, plan: false, claims: false, commits: false, paths: false, diff: false });
+    assert.deepEqual(ctx.truncated, {
+      issue: false,
+      prd: false,
+      plan: false,
+      previous: false,
+      claims: false,
+      commits: false,
+      paths: false,
+      diff: false,
+    });
     assert.match(ctx.issue, /^Title: Add plain-English PR descriptions/);
     assert.equal(ctx.prd, "PRD body");
     assert.match(ctx.plan!, /Plan context, not delivered scope/);
@@ -129,7 +171,7 @@ describe("buildDeliveryContext (PRD #1798 M5, D6)", () => {
     assert.match(withPlan.plan!, /^Plan context, not delivered scope \(the approved plan/);
   });
 
-  it("a refresh carries the previous published fields in the plan part", async () => {
+  it("a refresh carries the previous published fields in their own part, after the plan", async () => {
     const { git } = fakeGit([]);
     const ctx = await buildDeliveryContext(
       input(git, {
@@ -137,9 +179,29 @@ describe("buildDeliveryContext (PRD #1798 M5, D6)", () => {
         summaryPlan: "Plan.",
       }),
     );
-    assert.match(ctx.plan!, /previous summary: Old summary\./);
-    assert.match(ctx.plan!, /previous scope note \(deferred\): docs/);
-    assert.ok(ctx.plan!.indexOf("previous summary") < ctx.plan!.indexOf("Plan context"));
+    assert.match(ctx.previous!, /previous summary: Old summary\./);
+    assert.match(ctx.previous!, /previous scope note \(deferred\): docs/);
+    assert.equal(ctx.plan!.includes("previous summary"), false);
+    const prompt = buildDeliveryPrompt(ctx);
+    assert.ok(prompt.indexOf("Plan context") < prompt.indexOf("previous summary: Old summary."), "the plan part comes first");
+  });
+
+  it("an oversized previous description is capped in its own part and never pushes the plan out", async () => {
+    const { git } = fakeGit([]);
+    const plan = "Plan: " + "p".repeat(5 * 1024);
+    const ctx = await buildDeliveryContext(
+      input(git, {
+        previous: { summary: "s".repeat(10 * 1024), changes: Array(10).fill("c".repeat(900)), scope_notes: [], review_pointers: [] },
+        summaryPlan: plan,
+      }),
+    );
+    assert.equal(ctx.truncated.previous, true);
+    assert.ok(Buffer.byteLength(ctx.previous!) <= 4 * 1024);
+    assert.ok(ctx.previous!.endsWith(TRUNCATED_MARKER));
+    assert.equal(ctx.truncated.plan, false, "the plan keeps its whole 6 KiB part");
+    assert.ok(ctx.plan!.includes(plan));
+    assert.match(buildDeliveryPrompt(ctx), /TRUNCATED INPUT: the previously published description was cut/);
+    assert.ok(ctx.bytes <= DELIVERY_CONTEXT_BUDGET_BYTES);
   });
 
   it("never reads or includes generated or vendored hunks", async () => {
@@ -257,7 +319,7 @@ describe("buildDeliveryContext (PRD #1798 M5, D6)", () => {
     assert.equal(all.includes(SECRET), false);
     // Nor any recognizable half of it.
     assert.equal(all.includes("notAReal012345678901"), false);
-    for (const k of ["issue", "prd", "plan", "claims", "commits", "paths", "diff"] as const) assert.match(ctx[k]!, /\*\*\*REDACTED\*\*\*/, k);
+    for (const k of ["issue", "prd", "plan", "previous", "claims", "commits", "paths", "diff"] as const) assert.match(ctx[k]!, /\*\*\*REDACTED\*\*\*/, k);
   });
 
   it("redaction happens before the cut: a secret straddling a part's cap leaves no fragment", async () => {
@@ -300,5 +362,209 @@ describe("buildDeliveryContext (PRD #1798 M5, D6)", () => {
     assert.doesNotMatch(complete, /TRUNCATED INPUT/);
     const cut = buildDeliveryPrompt(await buildDeliveryContext(input(git, { prdText: "p".repeat(40 * 1024) })));
     assert.match(cut, /TRUNCATED INPUT: the PRD was cut or unavailable\. .*make no exhaustive claims/);
+  });
+
+  it("an attribute lookup failure skips every hunk, never falls back to path rules; the inventory stays", async () => {
+    const warns: string[] = [];
+    const { git, diffReads } = fakeGit(
+      [
+        { path: "src/app.ts", added: 2, deleted: 0, diff: hunk("src/app.ts", "code") },
+        { path: "gen/huge.ts", added: 9000, deleted: 0, diff: hunk("gen/huge.ts", "GENERATED BY ATTRIBUTE") },
+      ],
+      { failAttrs: true },
+    );
+    const ctx = await buildDeliveryContext(input(git, { log: { warn: (m: string) => void warns.push(m) } }));
+    assert.deepEqual(diffReads(), [], "no per-path diff read at all");
+    assert.equal(ctx.diff, "(unavailable: attributes could not be read)");
+    assert.equal(ctx.truncated.diff, true);
+    assert.match(ctx.paths, /^src\/app\.ts \+2 -0 \[code\]$/m);
+    assert.match(ctx.paths, /^gen\/huge\.ts \+9000 -0 /m);
+    assert.equal(ctx.commits, "- feat: one");
+    assert.ok(warns.some((w) => /attribute lookup failed/.test(w)));
+  });
+
+  it("MAX_DIFF_READS bounds the per-path reads: 200 at most, then diff is flagged truncated", async () => {
+    const files: FakeFile[] = Array.from({ length: 260 }, (_, i) => ({
+      path: `src/f${String(i).padStart(3, "0")}.ts`,
+      added: 1,
+      deleted: 0,
+      diff: `+${i}\n`,
+    }));
+    const { git, diffReads } = fakeGit(files);
+    const ctx = await buildDeliveryContext(input(git));
+    assert.equal(diffReads().length, 200);
+    assert.equal(ctx.truncated.diff, true);
+    assert.equal(ctx.truncated.paths, false);
+    assert.ok(ctx.bytes <= DELIVERY_CONTEXT_BUDGET_BYTES);
+  });
+
+  it("at most 2,000 paths whose listing exceeds 24 KiB aggregate per top-level directory", async () => {
+    const files: FakeFile[] = Array.from({ length: 600 }, (_, i) => ({
+      path: `${i % 3 === 0 ? "docs" : "src"}/${"deep/".repeat(8)}file-with-a-long-name-${i}.ts`,
+      added: 2,
+      deleted: 1,
+    }));
+    const { git } = fakeGit(files);
+    const ctx = await buildDeliveryContext(input(git));
+    assert.equal(ctx.truncated.paths, true);
+    assert.match(ctx.paths, /^600 changed files, aggregated per top-level directory:/);
+    assert.match(ctx.paths, /^docs\/ 200 files \+400 -200$/m);
+    assert.match(ctx.paths, /^src\/ 400 files \+800 -400$/m);
+    assert.ok(Buffer.byteLength(ctx.paths) <= 24 * 1024);
+  });
+
+  it("one path's failed read is flagged and skipped; the next paths are still read", async () => {
+    const warns: string[] = [];
+    const { git, diffReads } = fakeGit([
+      { path: "src/a.ts", added: 1, deleted: 0, failDiff: true },
+      { path: "src/b.ts", added: 1, deleted: 0, diff: hunk("src/b.ts", "second file") },
+    ]);
+    const ctx = await buildDeliveryContext(input(git, { log: { warn: (m: string) => void warns.push(m) } }));
+    assert.deepEqual(diffReads(), [["src/a.ts"], ["src/b.ts"]]);
+    assert.match(ctx.diff, /second file/);
+    assert.equal(ctx.truncated.diff, true);
+    assert.ok(warns.some((w) => /path diff unavailable/.test(w)));
+  });
+
+  it("binary files list as binary in the inventory and their diff is read like any other", async () => {
+    const { git } = fakeGit([
+      { path: "assets/logo.png", added: 0, deleted: 0, binary: true, diff: "Binary files a/assets/logo.png and b/assets/logo.png differ\n" },
+    ]);
+    const ctx = await buildDeliveryContext(input(git));
+    assert.match(ctx.paths, /^assets\/logo\.png binary \[\w+\]$/m);
+    assert.match(ctx.diff, /Binary files/);
+  });
+
+  it("a per-path read is bounded to the cap plus a margin; a cut read drops its unredacted tail and is marked", async () => {
+    // The fake returns what a bounded read would: the head of a secret sits at the read boundary.
+    const head = "x".repeat(16 * 1024 + 4 * 1024 - 10);
+    const { git, readOpts } = fakeGit([{ path: "src/big.ts", added: 9999, deleted: 0 }], {
+      onRead: (args) => (args[3] === "diff" ? { text: head + SECRET.slice(0, 10), truncated: true } : undefined),
+    });
+    const ctx = await buildDeliveryContext(input(git));
+    const diffOpts = readOpts[readOpts.length - 1]!;
+    assert.equal(diffOpts.maxBytes, 16 * 1024 + 4 * 1024);
+    assert.equal(ctx.truncated.diff, true);
+    assert.ok(ctx.diff.endsWith(TRUNCATED_MARKER));
+    assert.ok(Buffer.byteLength(ctx.diff) <= 16 * 1024);
+    assert.equal(ctx.diff.includes("glpat-"), false, "the secret's head at the read boundary is cut away");
+  });
+
+  it("a short read that the bound still cut is marked truncated even though it fits the cap", async () => {
+    const { git } = fakeGit([{ path: "src/x.ts", added: 1, deleted: 0 }], {
+      onRead: (args) => (args[3] === "diff" ? { text: "y".repeat(5 * 1024), truncated: true } : undefined),
+    });
+    const ctx = await buildDeliveryContext(input(git));
+    assert.equal(ctx.truncated.diff, true);
+    assert.ok(ctx.diff.endsWith(TRUNCATED_MARKER));
+  });
+
+  it("the commit log read is byte-bounded; a cut read drops its incomplete last record", async () => {
+    const { git, readOpts } = fakeGit([], {
+      onRead: (args) => (args[0] === "log" ? { text: `feat: complete\0fix: rotate ${SECRET.slice(0, 9)}`, truncated: true } : undefined),
+    });
+    const ctx = await buildDeliveryContext(input(git));
+    assert.ok(readOpts[0]!.maxBytes > 0 && readOpts[0]!.maxBytes <= 64 * 1024);
+    assert.equal(ctx.truncated.commits, true);
+    assert.match(ctx.commits, /^- feat: complete$/m);
+    assert.equal(ctx.commits.includes("rotate"), false);
+    assert.ok(ctx.commits.endsWith(TRUNCATED_MARKER));
+  });
+
+  it("a subject clipped to its 200-byte cap flags commits truncated", async () => {
+    const { git } = fakeGit([], { subjects: ["s".repeat(500)] });
+    const ctx = await buildDeliveryContext(input(git));
+    assert.equal(ctx.truncated.commits, true);
+    assert.ok(ctx.commits.endsWith(TRUNCATED_MARKER));
+  });
+
+  it("the deadline stops further git reads and flags the diff truncated; each read gets the time left", async () => {
+    let t = 1_000;
+    const { git, readOpts, diffReads } = fakeGit(
+      Array.from({ length: 5 }, (_, i) => ({ path: `src/f${i}.ts`, added: 1, deleted: 0, diff: hunk(`src/f${i}.ts`, `body ${i}`) })),
+      {
+        onRead: () => {
+          t += 400; // each read takes 400 ms of a 1,500 ms budget
+          return undefined;
+        },
+      },
+    );
+    const ctx = await buildDeliveryContext(input(git, { now: () => t, deadlineMs: 2_500 }));
+    // log at t=1000 (1500 left), f0 at 1400 (1100 left), f1 at 1800 (700 left), f2 at 2200 (300 left); stop at 2600.
+    assert.deepEqual(readOpts.map((o) => o.timeoutMs), [1_500, 1_100, 700, 300]);
+    assert.equal(diffReads().length, 3);
+    assert.equal(ctx.truncated.diff, true);
+    assert.match(ctx.diff, /body 2/);
+    assert.doesNotMatch(ctx.diff, /body 3/);
+  });
+
+  it("a deadline reached before the build leaves every git part unavailable, without a read", async () => {
+    const { git, reads } = fakeGit([{ path: "src/a.ts", added: 1, deleted: 0, diff: hunk("src/a.ts", "x") }]);
+    const ctx = await buildDeliveryContext(input(git, { now: () => 5_000, deadlineMs: 5_000 }));
+    assert.equal(reads.length, 0);
+    assert.deepEqual([ctx.commits, ctx.paths, ctx.diff], ["(unavailable)", "(unavailable)", "(unavailable)"]);
+    assert.equal(ctx.truncated.commits && ctx.truncated.paths && ctx.truncated.diff, true);
+  });
+
+  it("a hung size-line read is abandoned at the deadline", async () => {
+    const { git } = fakeGit([]);
+    const hung: DeliveryContextGit = { ...git, sizeMergeBase: () => new Promise(() => {}) };
+    const started = Date.now();
+    const ctx = await buildDeliveryContext(input(hung, { deadlineMs: Date.now() + 50 }));
+    assert.ok(Date.now() - started < 5_000);
+    assert.equal(ctx.diff, "(unavailable)");
+    assert.equal(ctx.truncated.diff, true);
+  });
+
+  it("a head or merge-base that is not a full object name leaves everything unavailable, with no git read", async () => {
+    for (const headSha of ["HEAD", "a".repeat(39), "--output=/tmp/x", "A".repeat(40)]) {
+      const { git, reads } = fakeGit([{ path: "a.ts", added: 1, deleted: 0 }]);
+      const probe: DeliveryContextGit = {
+        ...git,
+        sizeMergeBase: async () => assert.fail("no git read for an invalid head"),
+      };
+      const ctx = await buildDeliveryContext(input(probe, { headSha }));
+      assert.equal(reads.length, 0, headSha);
+      assert.deepEqual([ctx.commits, ctx.paths, ctx.diff], ["(unavailable)", "(unavailable)", "(unavailable)"]);
+    }
+    const sha256 = "c".repeat(64);
+    const { git: g64, reads: r64 } = fakeGit([], { mergeBase: "not-a-sha" });
+    const bad = await buildDeliveryContext(input(g64));
+    assert.equal(r64.length, 0);
+    assert.equal(bad.paths, "(unavailable)");
+    // A 64-hex (SHA-256) head is accepted.
+    const ok: DeliveryContextGit = {
+      sizeMergeBase: async () => sha256,
+      diffNumstatZ: async () => "",
+      checkAttrZ: async () => new Map(),
+      readBare: async () => ({ text: "", truncated: false }),
+    };
+    const ctx64 = await buildDeliveryContext(input(ok, { headSha: "d".repeat(64) }));
+    assert.equal(ctx64.paths, "(no changed files)");
+  });
+
+  it("a path with a newline, a tab or a bidi override is escaped and cannot forge an inventory row", async () => {
+    const forged = "src/ok.ts\nsrc/evil.ts +1 -0 [code]";
+    const bidi = "src/\u202Eexe.txt";
+    const { git } = fakeGit([
+      { path: forged, added: 1, deleted: 0 },
+      { path: bidi, added: 2, deleted: 0 },
+      { path: "src/a\tb\"c\\d.ts", added: 3, deleted: 0 },
+    ]);
+    const ctx = await buildDeliveryContext(input(git));
+    const rows = ctx.paths.split("\n");
+    assert.equal(rows.length, 3, ctx.paths);
+    assert.equal(rows.some((r) => r.startsWith("src/evil.ts")), false, "no forged row");
+    assert.ok(rows.includes('"src/ok.ts\\nsrc/evil.ts +1 -0 [code]" +1 -0 [code]'), ctx.paths);
+    assert.ok(rows.some((r) => r.startsWith('"src/\\u202eexe.txt" +2 -0 [')), ctx.paths);
+    assert.ok(rows.some((r) => r.startsWith('"src/a\\tb\\"c\\\\d.ts" +3 -0')), ctx.paths);
+    assert.equal(ctx.paths.includes("\u202E"), false);
+  });
+
+  it("per-path diff reads pin core.quotePath so git's own headers escape a crafted path", async () => {
+    const { git, reads } = fakeGit([{ path: "src/a.ts", added: 1, deleted: 0, diff: hunk("src/a.ts", "x") }]);
+    await buildDeliveryContext(input(git));
+    const d = reads.find((a) => a[3] === "diff")!;
+    assert.deepEqual(d.slice(0, 3), ["-c", "core.quotePath=true", "--literal-pathspecs"]);
   });
 });

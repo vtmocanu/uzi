@@ -8,6 +8,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { pipeline } from "node:stream/promises";
 import { PassThrough, type Readable, type Writable } from "node:stream";
+import { StringDecoder } from "node:string_decoder";
 import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
 import { RUNNER_UID, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
@@ -433,6 +434,22 @@ const SECRET_SCAN_REPORT_MAX_BYTES = 16 * 1024 * 1024;
 
 /** A full 40-hex commit SHA (issue #1597 M2: pinned checkpoint ranges are validated with it). */
 const SHA40_RE = /^[0-9a-f]{40}$/;
+
+/** PRD #1798 M5: the bound on a {@link GitCache.readBare} read. */
+export interface BoundedReadOptions {
+  /** Stop reading once more than this many stdout bytes arrived (the kept prefix is at most this). */
+  maxBytes: number;
+  /** Wall-clock bound; the read rejects (and the child is torn down) when it elapses. */
+  timeoutMs?: number;
+  /** Aborting rejects the read and tears the child down. */
+  signal?: AbortSignal;
+}
+
+/** PRD #1798 M5: a bounded read's stdout, and whether the bound cut it. */
+export interface BoundedRead {
+  text: string;
+  truncated: boolean;
+}
 
 // PRD #1416 M3 — cap on the EXTRA parents (beyond the first) a worker-bridge marker candidate may
 // carry in rangeContainsBridge before it is rejected outright. A legitimate bridge has at most 2
@@ -3559,6 +3576,71 @@ export class GitCache {
    */
   async diffNumstatZ(barePath: string, base: string, headSha: string): Promise<string> {
     return this.runGit(barePath, ["diff", "-z", "--numstat", "-M", "--no-ext-diff", "--no-textconv", base, headSha]);
+  }
+
+  /**
+   * PRD #1798 M5 — a BOUNDED read in the worker bare: `git -C <barePath> <args>` as the worker uid on
+   * the credential-free base gitEnv pins (no PAT, no shell), with stdout STREAMED rather than
+   * buffered whole. Once more than `maxBytes` has arrived the read stops: the stream is abandoned
+   * (which tears the child down, see {@link spawnGit}) and the first `maxBytes`, cut back to a UTF-8
+   * code-point boundary, resolve with `truncated: true`. An oversized output is never an error.
+   * Rejects on a non-zero exit before the bound, when `timeoutMs` elapses (or is not positive), and
+   * when `signal` aborts; each of those also tears the child down.
+   */
+  async readBare(barePath: string, args: readonly string[], opts: BoundedReadOptions): Promise<BoundedRead> {
+    const maxBytes = Math.max(0, Math.floor(opts.maxBytes));
+    const what = `git ${args.join(" ")}`;
+    if (opts.signal?.aborted) throw new Error(`${what} aborted before it started`);
+    if (opts.timeoutMs !== undefined && !(opts.timeoutMs > 0)) throw new Error(`${what} has no time left`);
+    const { stdout } = await this.spawnGit(barePath, [...args]);
+    return new Promise<BoundedRead>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      let settled = false;
+      let timer: NodeJS.Timeout | undefined;
+      const finish = (result: BoundedRead | undefined, error?: Error): void => {
+        if (settled) return;
+        settled = true;
+        if (timer !== undefined) clearTimeout(timer);
+        opts.signal?.removeEventListener("abort", onAbort);
+        stdout.removeListener("data", onData);
+        stdout.removeListener("end", onEnd);
+        stdout.removeListener("error", onError);
+        // Abandoning the exit-gated stream before it ended kills (or SIGPIPEs) the child.
+        if (result === undefined || result.truncated) stdout.destroy();
+        if (result === undefined) reject(error);
+        else resolve(result);
+      };
+      const text = (truncated: boolean): BoundedRead => {
+        // StringDecoder.write holds back an incomplete trailing sequence: a cut through a
+        // multi-byte character drops that character instead of rendering U+FFFD.
+        const decoded = new StringDecoder("utf8").write(Buffer.concat(chunks, bytes));
+        return { text: decoded, truncated };
+      };
+      const onData = (chunk: Buffer | string): void => {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        const room = maxBytes - bytes;
+        if (buf.length > room) {
+          if (room > 0) chunks.push(buf.subarray(0, room));
+          bytes = maxBytes;
+          finish(text(true));
+          return;
+        }
+        chunks.push(buf);
+        bytes += buf.length;
+      };
+      const onEnd = (): void => finish(text(false));
+      const onError = (error: Error): void => finish(undefined, error);
+      const onAbort = (): void => finish(undefined, new Error(`${what} aborted`));
+      stdout.on("data", onData);
+      stdout.once("end", onEnd);
+      stdout.once("error", onError);
+      if (opts.timeoutMs !== undefined) {
+        timer = setTimeout(() => finish(undefined, new Error(`${what} exceeded ${opts.timeoutMs}ms`)), opts.timeoutMs);
+      }
+      if (opts.signal?.aborted) onAbort();
+      else opts.signal?.addEventListener("abort", onAbort, { once: true });
+    });
   }
 
   /**

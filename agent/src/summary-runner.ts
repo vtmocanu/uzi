@@ -26,6 +26,7 @@ import { selectCodexBinding } from "./codex/select.js"; // the pure, fail-closed
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only: the injected seam, never constructed here
 import { CODEX_PR_DESCRIPTION_MODEL } from "./codex/pr-description-model.js"; // leaf value import (no runtime dep on codex-executor)
 import type { DeliveryContext } from "./pr-description-context.js";
+import { isValidModel } from "./models.js";
 import { errMessage } from "./util.js";
 import type { Logger } from "./log.js";
 
@@ -48,12 +49,13 @@ function envTimeoutMs(): number {
 
 const SUMMARY_MODEL_TIMEOUT_MS = envTimeoutMs();
 
-/** PRD #1798 D2: the ONE deadline (absolute epoch ms) every editor pass of a publication shares
- *  (the initial pass plus at most one D11 regeneration): `nowMs` + the configured summary timeout
- *  (SUMMARY_MODEL_TIMEOUT_MS, default 60 s). Computed once, at the first pass's start. */
-export function deliverySummaryDeadline(nowMs: number): number {
-  return nowMs + SUMMARY_MODEL_TIMEOUT_MS;
-}
+/** PRD #1798 M5: the Claude model the editor pass runs on when the claim carries no usable
+ *  `summary_model`. The api resolves `summary_model` (user value, else the instance setting,
+ *  default "haiku": api/internal/settings/keys.go DefaultSummaryModel) only onto ISSUE-run claims
+ *  (protocol.ts ClaimResponse.summary_model), so any other claim would otherwise fall to the SDK's
+ *  own default model. This mirrors the api default the intent/plan summaries effectively run on;
+ *  not shared across the TS/Go boundary, change it with DefaultSummaryModel. */
+export const DEFAULT_DELIVERY_SUMMARY_MODEL = "haiku";
 
 // Bounds on what we return to the caller. The api endpoint (M1) re-validates and
 // re-sanitizes everything (it, not this, is the security boundary — Decision 6), so
@@ -131,8 +133,9 @@ export interface DeliverySummaryInput {
   claim: DeliverySummaryClaimView;
   /** The redacted, budgeted input (pr-description-context.ts buildDeliveryContext). */
   context: DeliveryContext;
-  /** PRD #1798 D2: the absolute deadline (epoch ms) shared by every pass of one publication
-   *  ({@link deliverySummaryDeadline}). A pass gets min(modelTimeoutMs, deadline - now). */
+  /** PRD #1798 D2: the absolute deadline (epoch ms) shared by the context build and every pass of
+   *  one publication ({@link SummaryRunner.deliverySummaryDeadline}). A pass gets
+   *  min(modelTimeoutMs, deadline - now). */
   deadlineMs: number;
 }
 
@@ -219,25 +222,50 @@ export class SummaryRunner {
   }
 
   /**
+   * PRD #1798 D2: the ONE deadline (absolute epoch ms) a publication's delivery description
+   * shares: the context build's git reads (buildDeliveryContext `deadlineMs`), the editor pass and
+   * at most one D11 regeneration all run before it. This runner's clock plus its model timeout
+   * (SUMMARY_MODEL_TIMEOUT_MS, default 60 s). Computed once, when the publication starts.
+   */
+  deliverySummaryDeadline(): number {
+    return this.now() + this.modelTimeoutMs;
+  }
+
+  /**
    * PRD #1798 M5 (D1/D2/D6/D13): the editor pass. One tool-less turn writes the plain-English
    * description of the published snapshot from the redacted, budgeted `context`, on the claim's
    * harness: a Codex claim (a validated `secrets.codex`) runs the injected Codex advice harness on
    * CODEX_PR_DESCRIPTION_MODEL; any other claim runs Claude on the owner's Anthropic token and
-   * the resolved `summary_model`. The pass gets min(modelTimeoutMs, deadlineMs - now); a spent
-   * deadline returns null WITHOUT a model call. Advisory: every failure (spent deadline, no
-   * credential, a malformed codex block, timeout, model error, unparseable or summary-less JSON)
-   * returns null after a warn, and it never throws. The result is RAW; the api sanitizes it.
+   * the resolved `summary_model` (else DEFAULT_DELIVERY_SUMMARY_MODEL). The pass gets
+   * min(modelTimeoutMs, deadlineMs - now); a spent deadline returns null WITHOUT a model call.
+   * Advisory: every failure (spent deadline, no credential, a malformed codex block, timeout,
+   * model error, unparseable or summary-less JSON) returns null after a warn, and it never throws.
+   * The warn carries a FIXED reason and at most the error's class, never its message: a parse
+   * error quotes the model's output, and the output is attacker-steerable. The result is RAW; the
+   * api sanitizes it.
    */
   async generateDeliverySummary(input: DeliverySummaryInput): Promise<DeliverySummary | null> {
+    const runId = input.claim.run_id;
+    const fail = (reason: string, err?: unknown): null => {
+      this.log.warn("delivery summary skipped", {
+        run_id: runId,
+        reason,
+        ...(err === undefined ? {} : { error_class: errorClass(err) }),
+      });
+      return null;
+    };
+    const timeoutMs = Math.min(this.modelTimeoutMs, input.deadlineMs - this.now());
+    if (!(timeoutMs > 0)) return fail("the publication's summary deadline is spent");
+    let harness: Pick<ReadOnlyModelPassOpts, "token" | "model" | "codex"> | null;
     try {
-      const timeoutMs = Math.min(this.modelTimeoutMs, input.deadlineMs - this.now());
-      if (!(timeoutMs > 0)) {
-        this.log.warn("delivery summary skipped: the publication's summary deadline is spent", { run_id: input.claim.run_id });
-        return null;
-      }
-      const harness = this.deliveryHarness(input.claim);
-      if (harness === null) return null;
-      const text = await runReadOnlyModelPass({
+      harness = this.deliveryHarness(input.claim, fail);
+    } catch (err) {
+      return fail("the claim's codex block is invalid", err);
+    }
+    if (harness === null) return null;
+    let text: string;
+    try {
+      text = await runReadOnlyModelPass({
         ...harness,
         systemPrompt: DELIVERY_SYSTEM_PROMPT,
         prompt: buildDeliveryPrompt(input.context),
@@ -249,37 +277,38 @@ export class SummaryRunner {
         denyReason: "the summary runner is read-only and runs no tools",
         log: this.log,
       });
-      const out = parseDeliverySummary(text);
-      if (out === null) this.log.warn("delivery summary JSON had no usable summary", { run_id: input.claim.run_id });
-      return out;
     } catch (err) {
-      this.log.warn("delivery summary generation failed", { run_id: input.claim.run_id, error: errMessage(err) });
-      return null;
+      return fail("the model pass failed", err);
     }
+    let out: DeliverySummary | null;
+    try {
+      out = parseDeliverySummary(text);
+    } catch (err) {
+      return fail("unparseable output", err);
+    }
+    return out ?? fail("the output had no usable summary");
   }
 
   /** The harness half of the pass options, chosen by claim shape (the same fail-closed
    *  discriminator the run, judge and review lanes use): a present-but-malformed codex block
    *  THROWS (caught above → null), never a silent Claude fallback. Null (after a warn) when the
    *  selected harness has no credential or no factory. */
-  private deliveryHarness(claim: DeliverySummaryClaimView): Pick<ReadOnlyModelPassOpts, "token" | "model" | "codex"> | null {
+  private deliveryHarness(
+    claim: DeliverySummaryClaimView,
+    fail: (reason: string) => null,
+  ): Pick<ReadOnlyModelPassOpts, "token" | "model" | "codex"> | null {
     const selection = selectCodexBinding({ codex: claim.secrets.codex });
     if (selection.kind === "codex") {
-      if (!this.codexAdviceHarnessFactory) {
-        this.log.warn("delivery summary skipped: Codex claim but no Codex advice-harness factory is wired", { run_id: claim.run_id });
-        return null;
-      }
+      if (!this.codexAdviceHarnessFactory) return fail("Codex claim but no Codex advice-harness factory is wired");
       return {
         model: CODEX_PR_DESCRIPTION_MODEL,
         codex: { runId: claim.run_id, binding: selection.binding, buildHarness: this.codexAdviceHarnessFactory },
       };
     }
     const token = claim.secrets.anthropic_oauth_token?.trim();
-    if (!token) {
-      this.log.warn("delivery summary skipped: the claim carries no Anthropic token", { run_id: claim.run_id });
-      return null;
-    }
-    return { token, model: claim.summary_model ?? "" };
+    if (!token) return fail("the claim carries no Anthropic token");
+    const model = claim.summary_model?.trim() ?? "";
+    return { token, model: isValidModel(model) ? model : DEFAULT_DELIVERY_SUMMARY_MODEL };
   }
 
   /** Generate the intent summary: 1-3 plain-English sentences on what this run will
@@ -455,6 +484,7 @@ const TRUNCATION_LABELS: Record<keyof DeliveryContext["truncated"], string> = {
   issue: "the issue",
   prd: "the PRD",
   plan: "the plan context",
+  previous: "the previously published description",
   claims: "the agent's claims",
   commits: "the commit subjects",
   paths: "the changed-file inventory",
@@ -473,7 +503,10 @@ export function buildDeliveryPrompt(ctx: DeliveryContext): string {
   const close = `</untrusted_delivery_${nonce}>`;
   const sections: string[] = [`## Issue\n${ctx.issue}`];
   if (ctx.prd !== null) sections.push(`## Linked PRD\n${ctx.prd}`);
-  if (ctx.plan !== null) sections.push(`## Plan and previous description (context, not delivered scope)\n${ctx.plan}`);
+  if (ctx.plan !== null) sections.push(`## Plan (context, not delivered scope)\n${ctx.plan}`);
+  if (ctx.previous !== null) {
+    sections.push(`## Previously published description of this PR (refresh context, not evidence)\n${ctx.previous}`);
+  }
   if (ctx.claims !== null) sections.push(`## The implementing agent's own claims (unverified)\n${ctx.claims}`);
   sections.push(`## Commit subjects (newest first)\n${ctx.commits}`);
   sections.push(`## Changed files (path, lines added/deleted, kind)\n${ctx.paths}`);
@@ -539,6 +572,13 @@ function parseDeliverySummary(text: string): DeliverySummary | null {
     scope_notes,
     review_pointers: items(rec.review_pointers, DELIVERY_MAX_REVIEW_POINTERS),
   };
+}
+
+/** The class of a thrown value, for a log field that must not carry its message: an Error's
+ *  `name` when it is a plain identifier, else a fixed fallback. */
+function errorClass(err: unknown): string {
+  if (err instanceof Error) return /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(err.name) ? err.name : "Error";
+  return typeof err;
 }
 
 /** Clip to at most `max` code points INCLUDING the ellipsis (a layout limit is a hard cap). */
