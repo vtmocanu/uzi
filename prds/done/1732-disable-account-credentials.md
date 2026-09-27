@@ -87,7 +87,7 @@ A reversible, per-credential **Disable / Enable** action on the Settings page. D
 - **Owner reads**: `GET /api/me/rate-limits` (`ratelimits.go:46`) and `GET /api/me/codex-rate-limits` (`codex_ratelimits.go:58`) omit disabled credentials; `GET /api/me/secrets` (`secrets.go:82`) keeps listing them with `enabled:false`.
 - **Sidebar settings validation** (`user_settings.go:663`, `:724`) keeps accepting disabled ids in the stored arrays (D8); effective display filters them.
 - **Web mock mode** (`.claude/rules/web.md`) needs fixtures for a disabled token, a slot with no default, a disabled Codex alias with an enabled sibling, and a run held on `credential_disabled`.
-- **Migration**: draft number `00255`, renumbered to `00256` on the branch because the base took `00255` (renumber again at landing if `main` moves, per CLAUDE.md). It adds `disabled_at` and `enablement_rev` to `user_secrets`, the `credential_disabled` hold reason (extend the `hold_reason` check constraint if one exists), and an index serving the promoter's worklist. Park, promote and fenced-upsert queries are new sqlc queries.
+- **Migration**: draft number `00255`, renumbered to `00256` on the branch because the base took `00255`, then to `00257` at landing because `main` took `00256`. It adds `disabled_at` and `enablement_rev` to `user_secrets`, the `credential_disabled` hold reason (extend the `hold_reason` check constraint if one exists), and an index serving the promoter's worklist. Park, promote and fenced-upsert queries are new sqlc queries.
 
 Implementation and validation need no external documentation or network access beyond the repository; every fact above comes from the codebase.
 
