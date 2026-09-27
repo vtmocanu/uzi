@@ -52,6 +52,23 @@ export interface MergeRequest {
   webUrl: string;
 }
 
+/** Normalised lifecycle state of an MR/PR (PRD #1798 D11). GitLab's `opened` maps to
+ *  `open`; GitHub/Forgejo report a merged PR as `closed` + a merged flag, mapped to
+ *  `merged`. `locked` is GitLab-only. */
+export type MergeRequestState = "open" | "closed" | "merged" | "locked";
+
+/** A forge-neutral single-MR/PR read (PRD #1798 D11): the fields the description
+ *  writer needs to bind a write to a snapshot. `description` is "" when the forge
+ *  reports no body (null). */
+export interface MergeRequestDetail {
+  /** Validated 40-hex source-branch head commit id. */
+  headSha: string;
+  /** The MR/PR's own target (base) branch, never the repo default branch. */
+  targetBranch: string;
+  description: string;
+  state: MergeRequestState;
+}
+
 export class ForgeError extends Error {
   constructor(
     readonly status: number,
@@ -83,6 +100,12 @@ export interface ForgeClient {
    *  https-only, redirect:"error" and transient-5xx guards are inherited from `request`.
    *  Throws a ForgeError on a non-2xx so the caller can log-and-continue best-effort. */
   updateMergeRequestDescription(repoUrl: string, pat: string, iid: number, description: string, signal?: AbortSignal): Promise<void>;
+  /** Forge-neutral read of one existing MR/PR (PRD #1798 D11): head SHA, target branch,
+   *  current description and normalised state. Same single-item resource and transport
+   *  guards as getMergeRequestHead. Throws a ForgeError on a non-200 (a 404 for a missing
+   *  MR/PR included), a transient status, or a body missing a valid head SHA, a target
+   *  branch or a known state. The PAT rides the auth header only. */
+  getMergeRequest(repoUrl: string, pat: string, iid: number, signal?: AbortSignal): Promise<MergeRequestDetail>;
 }
 
 export interface ForgeClientOptions {
@@ -161,6 +184,17 @@ abstract class HttpForgeClient implements ForgeClient {
   }
 
   /**
+   * Read one existing MR/PR through the shared transport (PRD #1798 D11). Same resource
+   * (`headUrl`) and the same non-200 handling as getMergeRequestHead; the per-driver bit
+   * is `parseMrDetail`.
+   */
+  async getMergeRequest(repoUrl: string, pat: string, iid: number, signal?: AbortSignal): Promise<MergeRequestDetail> {
+    const res = await this.request("GET", this.headUrl(repoUrl, iid), pat, undefined, signal);
+    if (res.status !== 200) throw new ForgeError(res.status, (await safeText(res)).slice(0, 512));
+    return this.parseMrDetail(await res.text());
+  }
+
+  /**
    * Rewrite an existing MR/PR body through the shared transport (PRD #1225). The
    * single-item URL is the SAME resource as `headUrl` for all three drivers (GitLab
    * `merge_requests/{iid}`, Forgejo/GitHub `pulls/{iid}`), so it is reused rather than
@@ -233,6 +267,10 @@ abstract class HttpForgeClient implements ForgeClient {
   /** Parse a 200 single-MR/PR response body into the validated 40-hex head SHA;
    *  throw a ForgeError when the head field is absent or malformed. */
   protected abstract parseHead(text: string): string;
+  /** Parse a 200 single-MR/PR response body into a MergeRequestDetail; throw a
+   *  ForgeError on malformed JSON, an invalid head SHA, a missing target branch, a
+   *  non-string description or an unknown state (PRD #1798 D11). */
+  protected abstract parseMrDetail(text: string): MergeRequestDetail;
 
   /** HTTP method for the single-item body rewrite. PATCH is correct for Forgejo and
    *  GitHub; GitLabClient overrides to PUT. */
@@ -297,6 +335,19 @@ export class GitLabClient extends HttpForgeClient {
     return head;
   }
 
+  protected parseMrDetail(text: string): MergeRequestDetail {
+    const obj = safeJson(text);
+    const headSha = parseGitlabHead(obj);
+    if (!headSha) throw new ForgeError(200, "merge request response missing a valid head sha");
+    const rec = obj as Record<string, unknown>;
+    return {
+      headSha,
+      targetBranch: requireBranch(rec["target_branch"], "merge request"),
+      description: bodyText(rec["description"], "merge request"),
+      state: gitlabState(rec["state"]),
+    };
+  }
+
   /** GitLab rewrites the MR resource with PUT and a `description` field (not PATCH/`body`). */
   protected override updateMethod(): string {
     return "PUT";
@@ -355,6 +406,10 @@ export class ForgejoClient extends HttpForgeClient {
     const head = parseForgejoHead(safeJson(text));
     if (!head) throw new ForgeError(200, "pull request response missing a valid head sha");
     return head;
+  }
+
+  protected parseMrDetail(text: string): MergeRequestDetail {
+    return parsePrDetail(safeJson(text));
   }
 }
 
@@ -417,6 +472,10 @@ export class GitHubClient extends HttpForgeClient {
     const head = parseGitHubHead(safeJson(text));
     if (!head) throw new ForgeError(200, "pull request response missing a valid head sha");
     return head;
+  }
+
+  protected parseMrDetail(text: string): MergeRequestDetail {
+    return parsePrDetail(safeJson(text));
   }
 }
 
@@ -559,6 +618,55 @@ function prHeadSha(obj: unknown): string | undefined {
   if (!head || typeof head !== "object") return undefined;
   const sha = (head as Record<string, unknown>)["sha"];
   return isCommitSha(sha) ? sha : undefined;
+}
+
+/** GitLab MR `state` → normalised state (`opened` → `open`); unknown → ForgeError. */
+function gitlabState(v: unknown): MergeRequestState {
+  switch (v) {
+    case "opened":
+      return "open";
+    case "closed":
+    case "merged":
+    case "locked":
+      return v;
+    default:
+      throw new ForgeError(200, "merge request response has an unknown state");
+  }
+}
+
+/** Forgejo and GitHub share the PR shape the detail read needs: `head.sha`, `base.ref`,
+ *  `body`, and `state` open/closed with a merge marker (`merged: true`, or GitHub's
+ *  non-null `merged_at`) that turns a closed PR into `merged`. */
+function parsePrDetail(obj: unknown): MergeRequestDetail {
+  const headSha = prHeadSha(obj);
+  if (!headSha) throw new ForgeError(200, "pull request response missing a valid head sha");
+  const rec = obj as Record<string, unknown>;
+  const base = rec["base"];
+  const targetBranch = requireBranch(
+    base && typeof base === "object" ? (base as Record<string, unknown>)["ref"] : undefined,
+    "pull request",
+  );
+  const merged = rec["merged"] === true || (typeof rec["merged_at"] === "string" && rec["merged_at"] !== "");
+  const raw = rec["state"];
+  if (raw !== "open" && raw !== "closed") throw new ForgeError(200, "pull request response has an unknown state");
+  return {
+    headSha,
+    targetBranch,
+    description: bodyText(rec["body"], "pull request"),
+    state: merged ? "merged" : raw,
+  };
+}
+
+function requireBranch(v: unknown, what: string): string {
+  if (typeof v !== "string" || v === "") throw new ForgeError(200, `${what} response missing a target branch`);
+  return v;
+}
+
+/** A null/absent body is an empty description; any other non-string is malformed. */
+function bodyText(v: unknown, what: string): string {
+  if (v === null || v === undefined) return "";
+  if (typeof v !== "string") throw new ForgeError(200, `${what} response has a non-string description`);
+  return v;
 }
 
 function safeJson(text: string): unknown {

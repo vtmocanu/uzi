@@ -585,6 +585,266 @@ describe("GitHubClient.updateMergeRequestDescription", () => {
   });
 });
 
+// PRD #1798 M3 (D11): the forge-neutral single-MR/PR read. Each driver GETs the SAME
+// single-item resource as getMergeRequestHead and normalises head SHA, target branch,
+// description and state. The payloads below are recorded-shape responses from each forge's
+// single-item endpoint, trimmed to the fields the parser reads plus a few neighbours so a
+// parser keyed on the wrong field fails. The PAT rides the auth header only.
+const MR_HEAD = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b";
+const MR_BODY = "## Summary\n\nFixes the login redirect.\n\nCloses #5";
+
+/** GitLab `GET /projects/:id/merge_requests/:iid` (trimmed). */
+function gitlabMrFixture(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 90210,
+    iid: 42,
+    project_id: 311,
+    title: "Fix login redirect",
+    description: MR_BODY,
+    state: "opened",
+    merged_at: null,
+    closed_at: null,
+    target_branch: "release/2.x",
+    source_branch: "agent/issue-5",
+    draft: false,
+    sha: MR_HEAD,
+    merge_commit_sha: null,
+    diff_refs: {
+      base_sha: "0000000000000000000000000000000000000abc",
+      head_sha: MR_HEAD,
+      start_sha: "0000000000000000000000000000000000000abc",
+    },
+    web_url: "https://gitlab.example.com/group/sub/repo/-/merge_requests/42",
+    ...over,
+  };
+}
+
+/** GitHub `GET /repos/{owner}/{repo}/pulls/{n}` (trimmed). */
+function githubPrFixture(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    url: "https://api.github.com/repos/octo/repo/pulls/42",
+    number: 42,
+    state: "open",
+    locked: false,
+    title: "Fix login redirect",
+    body: MR_BODY,
+    created_at: "2026-09-20T10:00:00Z",
+    closed_at: null,
+    merged_at: null,
+    merge_commit_sha: null,
+    draft: false,
+    head: { label: "octo:agent/issue-5", ref: "agent/issue-5", sha: MR_HEAD },
+    base: { label: "octo:release/2.x", ref: "release/2.x", sha: "0000000000000000000000000000000000000abc" },
+    merged: false,
+    mergeable: true,
+    html_url: "https://github.com/octo/repo/pull/42",
+    ...over,
+  };
+}
+
+/** Forgejo `GET /api/v1/repos/{owner}/{repo}/pulls/{index}` (trimmed). */
+function forgejoPrFixture(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 7001,
+    number: 42,
+    title: "Fix login redirect",
+    body: MR_BODY,
+    state: "open",
+    is_locked: false,
+    draft: false,
+    mergeable: true,
+    merged: false,
+    merged_at: null,
+    merge_commit_sha: null,
+    base: { label: "release/2.x", ref: "release/2.x", sha: "0000000000000000000000000000000000000abc", repo_id: 3 },
+    head: { label: "agent/issue-5", ref: "agent/issue-5", sha: MR_HEAD, repo_id: 3 },
+    closed_at: null,
+    html_url: "https://example.com/git/org/repo/pulls/42",
+    ...over,
+  };
+}
+
+const fjSubpathRepo = "https://example.com/git/org/repo";
+
+type Driver = {
+  name: string;
+  make: (fetchFn: FetchFn) => GitLabClient | ForgejoClient | GitHubClient;
+  repoUrl: string;
+  url: string;
+  authHeader: string;
+  authValue: string;
+  fixture: (over?: Record<string, unknown>) => Record<string, unknown>;
+  bodyField: string;
+  withoutTarget: Record<string, unknown>;
+  withSha: (sha: unknown) => Record<string, unknown>;
+};
+
+const drivers: Driver[] = [
+  {
+    name: "GitLabClient",
+    make: (fetchFn) => new GitLabClient({ fetchFn }),
+    repoUrl: base.repoUrl,
+    url: "https://gitlab.example.com/api/v4/projects/group%2Fsub%2Frepo/merge_requests/42",
+    authHeader: "PRIVATE-TOKEN",
+    authValue: PAT,
+    fixture: gitlabMrFixture,
+    bodyField: "description",
+    withoutTarget: { target_branch: undefined },
+    withSha: (sha) => ({ sha, diff_refs: { head_sha: sha } }),
+  },
+  {
+    name: "GitHubClient",
+    make: (fetchFn) => new GitHubClient({ fetchFn }),
+    repoUrl: ghBase.repoUrl,
+    url: "https://api.github.com/repos/octo/repo/pulls/42",
+    authHeader: "Authorization",
+    authValue: `Bearer ${PAT}`,
+    fixture: githubPrFixture,
+    bodyField: "body",
+    withoutTarget: { base: { label: "octo:x", sha: MR_HEAD } },
+    withSha: (sha) => ({ head: { ref: "agent/issue-5", sha } }),
+  },
+  {
+    name: "ForgejoClient",
+    make: (fetchFn) => new ForgejoClient({ fetchFn }),
+    repoUrl: fjSubpathRepo,
+    url: "https://example.com/git/api/v1/repos/org/repo/pulls/42",
+    authHeader: "Authorization",
+    authValue: `token ${PAT}`,
+    fixture: forgejoPrFixture,
+    bodyField: "body",
+    withoutTarget: { base: { label: "x", sha: MR_HEAD } },
+    withSha: (sha) => ({ head: { ref: "agent/issue-5", sha } }),
+  },
+];
+
+for (const d of drivers) {
+  describe(`${d.name}.getMergeRequest`, () => {
+    it("GETs the single-item URL with the PAT in the auth header only, redirect:error, and parses an open MR/PR", async () => {
+      const { fetchFn, calls } = recorder([{ status: 200, body: d.fixture() }]);
+      const mr = await d.make(fetchFn).getMergeRequest(d.repoUrl, PAT, 42);
+
+      assert.deepStrictEqual(mr, { headSha: MR_HEAD, targetBranch: "release/2.x", description: MR_BODY, state: "open" });
+      assert.strictEqual(calls.length, 1);
+      const call = calls[0]!;
+      assert.strictEqual(call.method, "GET");
+      assert.strictEqual(call.url, d.url);
+      assert.strictEqual(call.redirect, "error");
+      assert.strictEqual(call.body, undefined);
+      assert.strictEqual(call.headers[d.authHeader], d.authValue);
+      assert.ok(!call.url.includes(PAT), "PAT not in URL");
+      for (const [k, v] of Object.entries(call.headers)) {
+        if (k !== d.authHeader) assert.ok(!v.includes(PAT), `PAT only in ${d.authHeader}, found in ${k}`);
+      }
+    });
+
+    it("maps a null description/body to the empty string", async () => {
+      const { fetchFn } = recorder([{ status: 200, body: d.fixture({ [d.bodyField]: null }) }]);
+      const mr = await d.make(fetchFn).getMergeRequest(d.repoUrl, PAT, 42);
+      assert.strictEqual(mr.description, "");
+    });
+
+    it("throws ForgeError(404) for a missing MR/PR", async () => {
+      const { fetchFn } = recorder([{ status: 404, body: { message: "404 Not Found" } }]);
+      await assert.rejects(
+        d.make(fetchFn).getMergeRequest(d.repoUrl, PAT, 42),
+        (err: unknown) => err instanceof ForgeError && err.status === 404 && !err.message.includes(PAT),
+      );
+    });
+
+    it("surfaces a transient 5xx as a ForgeError carrying the status", async () => {
+      const { fetchFn, calls } = recorder([{ status: 503, body: "upstream unavailable" }]);
+      await assert.rejects(
+        d.make(fetchFn).getMergeRequest(d.repoUrl, PAT, 42),
+        (err: unknown) => err instanceof ForgeError && err.status === 503,
+      );
+      assert.strictEqual(calls.length, 1, "the client does not retry by itself; forge-retry owns that");
+    });
+
+    it("throws a ForgeError on a malformed head sha", async () => {
+      const { fetchFn } = recorder([{ status: 200, body: d.fixture(d.withSha("deadbeef")) }]);
+      await assert.rejects(d.make(fetchFn).getMergeRequest(d.repoUrl, PAT, 42), (err: unknown) => err instanceof ForgeError);
+    });
+
+    it("throws a ForgeError when the target branch is missing", async () => {
+      const { fetchFn } = recorder([{ status: 200, body: d.fixture(d.withoutTarget) }]);
+      await assert.rejects(
+        d.make(fetchFn).getMergeRequest(d.repoUrl, PAT, 42),
+        (err: unknown) => err instanceof ForgeError && /target branch/.test(err.message),
+      );
+    });
+
+    it("throws a ForgeError on an unknown state", async () => {
+      const { fetchFn } = recorder([{ status: 200, body: d.fixture({ state: "reopened-ish" }) }]);
+      await assert.rejects(
+        d.make(fetchFn).getMergeRequest(d.repoUrl, PAT, 42),
+        (err: unknown) => err instanceof ForgeError && /unknown state/.test(err.message),
+      );
+    });
+
+    it("throws a ForgeError on a malformed JSON body", async () => {
+      const { fetchFn } = recorder([{ status: 200, body: "<html>not json</html>" }]);
+      await assert.rejects(d.make(fetchFn).getMergeRequest(d.repoUrl, PAT, 42), (err: unknown) => err instanceof ForgeError);
+    });
+
+    it("refuses a non-https repo URL before sending the PAT", async () => {
+      const { fetchFn, calls } = recorder([{ status: 200, body: d.fixture() }]);
+      await assert.rejects(
+        d.make(fetchFn).getMergeRequest(d.repoUrl.replace("https://", "http://"), PAT, 42),
+        (err: unknown) => err instanceof ForgeError && err.status === 0,
+      );
+      assert.strictEqual(calls.length, 0);
+    });
+  });
+}
+
+describe("getMergeRequest state mapping (recorded closed/merged/locked shapes)", () => {
+  const read = async (client: (f: FetchFn) => GitLabClient | ForgejoClient | GitHubClient, repoUrl: string, payload: unknown) => {
+    const { fetchFn } = recorder([{ status: 200, body: payload }]);
+    return (await client(fetchFn).getMergeRequest(repoUrl, PAT, 42)).state;
+  };
+  const gl = (f: FetchFn) => new GitLabClient({ fetchFn: f });
+  const gh = (f: FetchFn) => new GitHubClient({ fetchFn: f });
+  const fj = (f: FetchFn) => new ForgejoClient({ fetchFn: f });
+  const MERGED_AT = "2026-09-21T12:00:00Z";
+
+  it("GitLab: opened/closed/merged/locked", async () => {
+    assert.strictEqual(await read(gl, base.repoUrl, gitlabMrFixture({ state: "opened" })), "open");
+    assert.strictEqual(await read(gl, base.repoUrl, gitlabMrFixture({ state: "closed", closed_at: MERGED_AT })), "closed");
+    assert.strictEqual(
+      await read(gl, base.repoUrl, gitlabMrFixture({ state: "merged", merged_at: MERGED_AT, merge_commit_sha: MR_HEAD })),
+      "merged",
+    );
+    assert.strictEqual(await read(gl, base.repoUrl, gitlabMrFixture({ state: "locked" })), "locked");
+  });
+
+  it("GitHub: open, closed-unmerged, closed+merged (flag), closed+merged_at only", async () => {
+    assert.strictEqual(await read(gh, ghBase.repoUrl, githubPrFixture()), "open");
+    assert.strictEqual(await read(gh, ghBase.repoUrl, githubPrFixture({ state: "closed", closed_at: MERGED_AT })), "closed");
+    assert.strictEqual(
+      await read(gh, ghBase.repoUrl, githubPrFixture({ state: "closed", closed_at: MERGED_AT, merged_at: MERGED_AT, merged: true })),
+      "merged",
+    );
+    // The list endpoint omits `merged`; merged_at alone still reads as merged.
+    const { merged: _drop, ...noFlag } = githubPrFixture({ state: "closed", merged_at: MERGED_AT });
+    assert.strictEqual(await read(gh, ghBase.repoUrl, noFlag), "merged");
+  });
+
+  it("Forgejo: open, closed-unmerged, closed+merged", async () => {
+    assert.strictEqual(await read(fj, fjSubpathRepo, forgejoPrFixture()), "open");
+    assert.strictEqual(await read(fj, fjSubpathRepo, forgejoPrFixture({ state: "closed", closed_at: MERGED_AT })), "closed");
+    assert.strictEqual(
+      await read(fj, fjSubpathRepo, forgejoPrFixture({ state: "closed", merged: true, merged_at: MERGED_AT })),
+      "merged",
+    );
+  });
+
+  it("GitHub/Forgejo have no locked state: a GitLab-only value is rejected", async () => {
+    await assert.rejects(read(gh, ghBase.repoUrl, githubPrFixture({ state: "locked" })), (e: unknown) => e instanceof ForgeError);
+    await assert.rejects(read(fj, fjSubpathRepo, forgejoPrFixture({ state: "merged" })), (e: unknown) => e instanceof ForgeError);
+  });
+});
+
 describe("forgeClientFor", () => {
   it("selects GitLab for absent/gitlab, Forgejo for forgejo, GitHub for github", () => {
     assert.ok(forgeClientFor(undefined) instanceof GitLabClient);
