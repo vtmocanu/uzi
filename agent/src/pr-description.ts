@@ -34,13 +34,24 @@
 //
 // closingDirectiveFor is the whole-body scan behind the interlock (D10 rule 1; the interlock runs it
 // through closingDirectiveOutsideCompletion, which leaves out uzi's own completion block only when it
-// is identical to the block uzi rendered, line endings aside): the api
-// sanitizer's prDescClosing pattern (with Forgejo's `!N` references) over the raw text and over a
-// RENDERED view that mirrors the api's prDescNormalize (entities decoded to a fixed point everywhere,
-// code spans and autolinks included, format characters but U+200B dropped, HTML comments, tags, images and link targets
-// removed), each in the api's three marker views, and extended to GitLab's reference lists
-// (`Closes #1, #2 and #3`). It is a detector
-// for text a forge may read as closing, so where the two could disagree it errs towards "closing".
+// is identical to the block uzi rendered, line endings aside): the api sanitizer's prDescClosing
+// pattern (with Forgejo's `!N` references), extended to GitLab's reference lists (`Closes #1, #2 and
+// #3`), over several views of the body (the raw text, a RENDERED view that mirrors the api's
+// prDescNormalize, a decoded-raw view, a tag-stripped view and the two composed), each
+// in the api's three marker views. Where the views could disagree with a forge it errs towards
+// "closing".
+//
+// Threat model. The scan detects closing directives present in the body when uzi writes it: plainly
+// written ones, the api sanitizer's normalised forms, and common markup and entity splits (a keyword
+// split by an entity, a tag, a comment, a processing instruction, CDATA, a declaration or an empty
+// link). It is NOT a guarantee against deliberate obfuscation by someone with edit rights on the PR
+// description: that person can add a plain `Closes #N` at any time after uzi's write, so the scan
+// cannot be a boundary against them. Known gaps, documented and accepted (pinned in the hardening
+// tests): a link destination with balanced parentheses, escapes or a quoted `)` in its title
+// (`[Fix](a(b)c)es #7`); a custom tag with a quoted `>` in an attribute (`Fix<foo title="a>b">es #7`);
+// and, in the block parser rather than the scan, fenced code opened inside a list item (codeRanges:
+// a marker pair a forge shows as code can still be adopted, which never hides a directive from the
+// interlock, see codeRanges).
 
 import { createHash } from "node:crypto";
 import { SanitizedPrDescriptionFields } from "./client.js";
@@ -168,7 +179,7 @@ const NAMED_ENTITIES: Readonly<Record<string, string>> = {
   lcub: "{", lbrace: "{", rcub: "}", rbrace: "}", dollar: "$", percnt: "%", quest: "?", Hat: "^",
   nbsp: "\u00A0", NonBreakingSpace: "\u00A0", ensp: "\u2002", emsp: "\u2003", emsp13: "\u2004", emsp14: "\u2005",
   numsp: "\u2007", puncsp: "\u2008", thinsp: "\u2009", ThinSpace: "\u2009", hairsp: "\u200A", VeryThinSpace: "\u200A",
-  MediumSpace: "\u205F", NewLine: "\n", Tab: "\t",
+  MediumSpace: "\u205F", ThickSpace: "\u205F\u200A", NewLine: "\n", Tab: "\t",
   shy: "\u00AD", zwnj: "\u200C", zwj: "\u200D", lrm: "\u200E", rlm: "\u200F", NoBreak: "\u2060",
   ApplyFunction: "\u2061", af: "\u2061", InvisibleTimes: "\u2062", it: "\u2062", InvisibleComma: "\u2063", ic: "\u2063",
   ZeroWidthSpace: "\u200B", NegativeVeryThinSpace: "\u200B", NegativeThinSpace: "\u200B",
@@ -403,10 +414,12 @@ function renderedView(s: string): string | undefined {
 
 // ── The fail-toward-closing views ──
 //
-// renderedView emulates markdown (links, images, comments), and every gap in that emulation is a
-// directive the forge acts on that the scan would miss. The two views below emulate as little as
-// possible, so a gap in renderedView is still caught: they only ADD texts to the OR-ed scan, never
-// remove one, so they can only turn a non-closing verdict into a closing one.
+// renderedView emulates markdown (links, images, comments), and a gap in that emulation is a
+// directive a forge acts on that it would miss. The views below emulate less (decodedRawView strips
+// nothing, tagStrippedView strips HTML constructs only), and composedView renders the tag-stripped
+// view, which covers a split that needs both an HTML construct and a link removed. They
+// only ADD texts to the OR-ed scan, so they can only turn a non-closing verdict into a closing one.
+// They narrow the gaps; they do not close every one (see the module header's threat model).
 
 /** Line endings as `\n` and every format character but the U+200B breaker (see stripFormat) removed;
  *  controls other than `\r` are kept. */
@@ -496,6 +509,17 @@ function stripAllHtml(s: string): string {
  *  as decodedRawView. Link and image syntax stays as text. */
 function tagStrippedView(s: string): string {
   return decodedRawView(stripAllHtml(lfNoFormat(s)));
+}
+
+/** The composed view: known tags removed from the literal text first (HTML_TAG_RE, which reads a
+ *  quoted `>` in an attribute as part of the tag, so `<span title="x>y">` goes whole), then every
+ *  other HTML construct (tagStrippedView), then the rendered view's link, image and known-tag
+ *  stripping over what is left: `Fi<foo>xes [](u)#7` and `Fi<span title="x>y">xes <foo>#7` read as
+ *  closing. Markup is still read only where it is written literally, so `Clo&lt;x>ses` stays split.
+ *  One pass of each part; undefined when the rendered view does not converge. */
+function composedView(s: string): string | undefined {
+  const lf = lfNoFormat(s);
+  return renderedView(tagStrippedView(lf.includes("<") ? lf.replace(HTML_TAG_RE, dropTag) : lf));
 }
 
 /** Whether a UTF-16 code unit is in REF_SRC's path class `[\w.-]` under its `iu` flags: ASCII
@@ -692,11 +716,19 @@ function refResolves(m: RegExpExecArray, iid: number, repoPath: string | undefin
  * possibly this repo's). The scan is the api sanitizer's prDescClosing pattern, over the raw text
  * and over its rendered view (renderedView: `Fi&#120;es #7`, `Fix<b></b>es #7`, `Clo<!-- -->ses #5`
  * and `Fixes <span>o/r#7</span>` all read as closing), its decoded-raw view (decodedRawView: a
- * directive inside a link target, an unterminated comment or any other construct renderedView
- * strips still reads as closing) and its decoded tag-stripped view (tagStrippedView: `Fixes <?x?>#7`,
- * `Fi&#120;es <foo>#7`), each in the api's three marker views (raw,
- * markers removed, markers blanked), and each keyword's GitLab reference list is followed, so
- * `Resolves #7, #8 and #9` closes #9 here too.
+ * directive inside a link target, an unterminated comment or another construct renderedView strips),
+ * its decoded tag-stripped view (tagStrippedView: `Fixes <?x?>#7`, `Fi&#120;es <foo>#7`) and that
+ * view composed with the rendered view (composedView: `Fi<foo>xes [](u)#7`), each in the api's
+ * three marker views (raw, markers removed, markers blanked), and each keyword's GitLab reference
+ * list is followed, so `Resolves #7, #8 and #9` closes #9 here too.
+ *
+ * What it catches, and what it does not (the module header's threat model): directives present in
+ * the body when uzi writes it, written plainly, in the api sanitizer's normalised forms, or split by
+ * common markup and entities. It is not a boundary against someone with edit rights on the PR
+ * description, who can add a plain `Closes #N` after uzi's write. Accepted gaps: a link destination
+ * with balanced parentheses, escapes or a quoted `)` in its title (`[Fix](a(b)c)es #7`), a custom tag
+ * with a quoted `>` in an attribute (`Fix<foo title="a>b">es #7`), and (in parseOwnedBlocks, not
+ * here) list-item fences.
  *
  * Fails closed (true): an issueIid that is not a non-negative safe integer, a body over
  * FORGE_BODY_MAX_CHARS, or a rendered view that does not converge.
@@ -710,7 +742,10 @@ export function closingDirectiveFor(body: string, issueIid: number, repoPath?: s
   const rendered = renderedView(body);
   if (rendered === undefined) return true;
   const views = new Set<string>();
-  for (const base of new Set([body, rendered, decodedRawView(body), tagStrippedView(body)])) {
+  const tagStripped = tagStrippedView(body);
+  const composed = composedView(body);
+  if (composed === undefined) return true;
+  for (const base of new Set([body, rendered, decodedRawView(body), tagStripped, composed])) {
     for (const v of closingViews(base)) views.add(v.text);
   }
   for (const text of views) {

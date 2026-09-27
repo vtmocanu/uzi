@@ -426,7 +426,9 @@ describe("closingDirectiveFor: a link or image never spans a paragraph end", () 
 describe("closingDirectiveFor fails toward closing: the decoded-raw and tag-stripped views", () => {
   // The rendered view emulates markdown; each of these is a gap in that emulation where micromark
   // shows a directive. The decoded-raw view (entities decoded, no structure stripped) and the
-  // decoded tag-stripped view (every HTML construct removed, links kept as text) catch them all.
+  // decoded tag-stripped view (every HTML construct removed, links kept as text) catch these cases.
+  // They narrow the emulation's gaps without closing all of them: the "accepted gaps" block below
+  // pins the known ones, and the scan is no boundary against someone who can edit the description.
   it("a directive inside a link target, a comment or behind any HTML construct reads as closing", () => {
     for (const text of [
       "[a](\n\n[b ) ](Fixes #&#55;)",
@@ -457,6 +459,22 @@ describe("closingDirectiveFor fails toward closing: the decoded-raw and tag-stri
     }
   });
 
+  it("the composed view: HTML constructs and an empty link together still read as closing", () => {
+    for (const text of [
+      "Fi<foo>xes [](u)#7",
+      "Fixes [](u)<foo>#7",
+      "Fix<!X y>es [](u)#7",
+      "Fi[](u)x<![CDATA[]]>es #7",
+      'Fi<span title="x>y">xes <foo>#7',
+    ]) {
+      assert.equal(closingDirectiveFor(text, 7, "o/r"), true, JSON.stringify(text));
+    }
+  });
+
+  it("&ThickSpace; decodes to a space run", () => {
+    assert.equal(closingDirectiveFor("Fixes&ThickSpace;#7", 7, "o/r"), true);
+  });
+
   it("the tag-stripped view reads markup only where it is written literally", () => {
     // A sanitized field encodes `<` as `&lt;` (a forge shows it as text), and an escaped `\<` is
     // text too: neither is stripped as a tag, so the keyword around it stays split.
@@ -476,6 +494,33 @@ describe("closingDirectiveFor fails toward closing: the decoded-raw and tag-stri
 });
 
 // ── M1: linear scans ──
+
+describe("accepted gaps (documented)", () => {
+  // KNOWN gaps, pinned as current behaviour, not as desired behaviour: the module header of
+  // pr-description.ts documents them as accepted (the closing scan detects directives present when
+  // uzi writes the body; it is not a boundary against someone with edit rights on the description,
+  // who can add a plain `Closes #N` at any time). A change that closes one of these gaps must update
+  // this block and the module header's threat model deliberately, in the same commit.
+  it("a link destination with balanced parentheses, an escape or a quoted `)` in its title hides the split", () => {
+    for (const text of ["[Fix](a(b)c)es #7", "[Fix](a\\)b)es #7", '[Fix](a "t)")es #7']) {
+      assert.equal(closingDirectiveFor(text, 7, "o/r"), false, JSON.stringify(text));
+    }
+  });
+
+  it("a custom tag with a quoted `>` in an attribute hides the split", () => {
+    assert.equal(closingDirectiveFor('Fix<foo title="a>b">es #7', 7, "o/r"), false);
+  });
+
+  it("a fence opened inside a list item is not modelled by parseOwnedBlocks", () => {
+    // A forge shows these markers as code of the list item; the parser still adopts them. The
+    // interlock is unaffected (it removes a completion block only when it equals uzi's own).
+    const region = `${REGION_START}\n${SIZE}\n${REGION_END}`;
+    const real = renderCompletionBlock({ issueIid: 7, branch: "agent/issue-7", closes: false });
+    for (const body of ["- ```\n" + region + "\n\n" + real + "\n  ```", "* ~~~\n" + region + "\n\n" + real + "\n  ~~~"]) {
+      assert.equal(parseOwnedBlocks(body).kind, "ok", JSON.stringify(body));
+    }
+  });
+});
 
 describe("scans stay linear on adversarial input (M1)", () => {
   // A ratio test, not a fixed budget: each shape is timed at N and at 8N characters (best of three,
