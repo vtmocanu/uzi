@@ -956,10 +956,13 @@ type RunInputRequest struct {
 	// ExpectedGateRevision is the PRD #1795 D5 expected plan-gate revision: the gate_revision of
 	// the run the client displayed when the owner acted. Legal only with approve_plan,
 	// reject_plan and revise_plan (400 otherwise). When present, the verdict is written only
-	// while the run is awaiting_approval at exactly this revision; otherwise nothing is written
-	// and the server answers 409 {"error", "reason": "gate_revision_mismatch",
-	// "current_gate_revision"}. Omitted when absent, so a newer client stays compatible with an
-	// older strict-decoding api.
+	// while the run is awaiting_approval at exactly this revision. In every other case (a newer
+	// revision, no gate yet, a run that has finished, or a verdict whose atomic write lost a race
+	// with a new publication) nothing is written and the server answers 409 {"error", "reason":
+	// "gate_revision_mismatch", "current_gate_revision"}; for a finished run this replaces the
+	// untyped "run has already finished" 409. A revise_plan at the revision cap whose revision
+	// still matches keeps the cap's own answer. Omitted when absent, so a newer client stays
+	// compatible with an older strict-decoding api.
 	ExpectedGateRevision *int64 `json:"expected_gate_revision,omitempty"`
 }
 

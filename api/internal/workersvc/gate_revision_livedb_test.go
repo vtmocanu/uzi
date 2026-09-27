@@ -9,7 +9,6 @@ import (
 	"os"
 	"slices"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -769,8 +768,8 @@ func TestGateRevisionRefusalFencingLiveDB(t *testing.T) {
 		if _, _, _, err := f.svc.SetStateReport(f.ctx, otherWkr, run, gateReq(&gen, a)); !errors.Is(err, ErrRunNotOwned) {
 			t.Fatalf("foreign-worker report err = %v, want ErrRunNotOwned", err)
 		}
-		if r := f.row(run); r.refusals != 0 || r.status != "awaiting_approval" || r.revision != 2 {
-			t.Fatalf("fenced stale reports changed the run: %+v", r)
+		if r := f.row(run); r.refusals != 0 || r.refusalGen != nil || r.failOrigin != nil || r.status != "awaiting_approval" || r.revision != 2 {
+			t.Fatalf("fenced stale reports changed the run (want count 0, gate_refusal_generation and fail_origin NULL): %+v", r)
 		}
 	})
 
@@ -866,26 +865,13 @@ func TestGateRevisionRefusalOnParkedOrTerminalRunLiveDB(t *testing.T) {
 	}
 }
 
-// waitForLockWaiter blocks until some backend waits on a row lock (the report's FOR UPDATE).
+// waitForLockWaiter blocks until some backend waits on a row lock (the report's FOR UPDATE). The
+// report's query text is truncated in pg_stat_activity (the expanded runs column list exceeds
+// track_activity_query_size), so it matches on the lock wait alone; see waitForLockWaiters for
+// why that relies on the sweep's -p 1.
 func waitForLockWaiter(t *testing.T, f *gateFix) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		var n int
-		// The report's query text is truncated in pg_stat_activity (the expanded runs column
-		// list exceeds track_activity_query_size), so match on the lock wait alone, in this
-		// database and not this backend. Live-DB packages run with -p 1, so no other binary
-		// shares the database.
-		if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM pg_stat_activity
-		      WHERE wait_event_type = 'Lock' AND datname = current_database() AND pid <> pg_backend_pid()`).Scan(&n); err != nil {
-			t.Fatal(err)
-		}
-		if n > 0 {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatal("the report never blocked on the run row lock")
+	waitForLockWaiters(t, f, 1)
 }
 
 func TestRunUserInputsGateBindingCheckLiveDB(t *testing.T) {

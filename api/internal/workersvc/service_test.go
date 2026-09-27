@@ -410,6 +410,16 @@ type fakeStore struct {
 	// CreateGateVerdictInput, never the plain CreateRunInput).
 	createdGateVerdict *store.CreateGateVerdictInputParams
 	gateVerdictRow     store.RunUserInput
+	// gateVerdictErr / approvalErr / stopVerdictErr program a refusal of the matching verdict
+	// insert (pgx.ErrNoRows simulates the 0-row CTE of a lost expected-revision race).
+	// approvalRow is what CreateApprovePlanInput returns (its gate binding drives the
+	// capability-override clear's revision). rejectRows, when non-nil, is the RowsAffected
+	// RejectRunServerSide reports (nil = 1, applied).
+	gateVerdictErr error
+	approvalErr    error
+	stopVerdictErr error
+	approvalRow    store.RunUserInput
+	rejectRows     *int64
 	// reviseCount is the number of persisted revise_plan rows the fake pretends the run
 	// already has (PRD #41 plan-revision cap); reviseCountRunID captures the run id the
 	// read-only cap query was asked about. reviseCapArg captures the atomic capped-enqueue
@@ -1479,8 +1489,14 @@ func (f *fakeStore) RunHasPendingOutcomeLease(context.Context, uuid.UUID) (bool,
 }
 func (f *fakeStore) ClearRunRequiredCapabilities(_ context.Context, arg store.ClearRunRequiredCapabilitiesParams) (int64, error) {
 	f.clearedCaps = &arg
-	// Mirror the real owner+status-guarded UPDATE: on a matching row, empty the run's
-	// required set so a subsequent SubmitInput reload observes the override.
+	// Mirror the real owner-, status- AND revision-guarded UPDATE (PRD #1795 M2): only a row at
+	// awaiting_approval whose gate_revision is the approve's bound revision is cleared; anything
+	// else is the real query's silent 0-row no-op. On a match, empty the run's required set so a
+	// subsequent SubmitInput reload observes the override.
+	if arg.ID != f.runByID.ID || arg.UserID != f.runByID.UserID || f.runByID.Status != "awaiting_approval" ||
+		f.runByID.GateRevision != arg.GateRevision {
+		return 0, nil
+	}
 	f.runByID.RequiredCapabilities = nil
 	return f.clearCapsRows, nil
 }
@@ -1490,6 +1506,9 @@ func (f *fakeStore) CreateRunInput(_ context.Context, arg store.CreateRunInputPa
 }
 func (f *fakeStore) CreateGateVerdictInput(_ context.Context, arg store.CreateGateVerdictInputParams) (store.RunUserInput, error) {
 	f.createdGateVerdict = &arg
+	if f.gateVerdictErr != nil {
+		return store.RunUserInput{}, f.gateVerdictErr
+	}
 	return f.gateVerdictRow, nil
 }
 func (f *fakeStore) CountRunReviseInputs(_ context.Context, runID uuid.UUID) (int64, error) {
@@ -1507,6 +1526,9 @@ func (f *fakeStore) CreateRunReviseInputIfUnderCap(_ context.Context, arg store.
 }
 func (f *fakeStore) CreateStopVerdictInput(_ context.Context, arg store.CreateStopVerdictInputParams) (store.RunUserInput, error) {
 	f.createdStopVerdict = &arg
+	if f.stopVerdictErr != nil {
+		return store.RunUserInput{}, f.stopVerdictErr
+	}
 	return store.RunUserInput{}, nil
 }
 func (f *fakeStore) CreateScopeCeilingInput(_ context.Context, arg store.CreateScopeCeilingInputParams) (store.RunUserInput, error) {
@@ -1531,7 +1553,10 @@ func (f *fakeStore) CreateExtendInput(_ context.Context, arg store.CreateExtendI
 }
 func (f *fakeStore) CreateApprovePlanInput(_ context.Context, arg store.CreateApprovePlanInputParams) (store.RunUserInput, error) {
 	f.createdApproval = &arg
-	return store.RunUserInput{}, nil
+	if f.approvalErr != nil {
+		return store.RunUserInput{}, f.approvalErr
+	}
+	return f.approvalRow, nil
 }
 func (f *fakeStore) GetRunMilestoneFreezeSnapshot(_ context.Context, id uuid.UUID) (store.GetRunMilestoneFreezeSnapshotRow, error) {
 	// The zero value has empty milestone columns (the original hardcoded behavior, so every
@@ -1568,6 +1593,9 @@ func (f *fakeStore) SupersedeRunByWorker(_ context.Context, arg store.SupersedeR
 }
 func (f *fakeStore) RejectRunServerSide(_ context.Context, arg store.RejectRunServerSideParams) (int64, error) {
 	f.rejected = &arg
+	if f.rejectRows != nil {
+		return *f.rejectRows, nil
+	}
 	return 1, nil
 }
 func (f *fakeStore) GetRepoForUser(context.Context, store.GetRepoForUserParams) (store.GetRepoForUserRow, error) {

@@ -61,10 +61,10 @@ func checkExpectedGateRevision(run store.Run, expected int64) error {
 	return &GateRevisionMismatchError{Expected: expected, Current: run.GateRevision}
 }
 
-// gateRevisionMismatch resolves a verdict write that affected no row. With no expected revision
-// it returns fallback (the pre-#1795 answer for that seam). With one it re-reads the run: a
-// mismatch is answered as *GateRevisionMismatchError; a run that does match (the 0 rows had
-// another cause, e.g. the revision cap) keeps fallback.
+// gateRevisionMismatch resolves a revise_plan write that affected no row, where a second cause
+// (the revision cap) can refuse a verdict whose expected revision still matches. With no expected
+// revision it returns fallback (the cap). With one it re-reads the run: a mismatch is answered as
+// *GateRevisionMismatchError; a run that does match keeps fallback, because the cap refused it.
 func (s *Service) gateRevisionMismatch(ctx context.Context, userID, runID uuid.UUID, expected *int64, fallback error) error {
 	if expected == nil {
 		return fallback
@@ -77,6 +77,24 @@ func (s *Service) gateRevisionMismatch(ctx context.Context, userID, runID uuid.U
 		return err
 	}
 	return fallback
+}
+
+// verdictNotWritten resolves a verdict write that affected no row on a seam whose only refusal
+// besides the expected-revision predicate is the run having vanished or finished (approve,
+// reject with or without a live poller). It re-reads the run, so a vanished run answers
+// ErrRunNotFound. With an expected revision the answer is ALWAYS a *GateRevisionMismatchError
+// carrying the re-read's revision, even when that revision matches again (a publication and a
+// verdict can interleave around the re-read): the verdict was not written, and the client must
+// refetch rather than read success. Without one it returns fallback, the seam's own answer.
+func (s *Service) verdictNotWritten(ctx context.Context, userID, runID uuid.UUID, expected *int64, fallback error) error {
+	run, err := s.GetRun(ctx, userID, runID)
+	if err != nil {
+		return err
+	}
+	if expected == nil {
+		return fallback
+	}
+	return &GateRevisionMismatchError{Expected: *expected, Current: run.GateRevision}
 }
 
 // approveClearRevision is the gate revision an approve's capability-override clear is scoped to:

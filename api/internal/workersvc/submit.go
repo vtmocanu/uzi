@@ -61,9 +61,10 @@ type SubmitInputOptions struct {
 	// ExpectedGateRevision is the PRD #1795 D5 expected plan-gate revision: the revision of the
 	// gate the client displayed when the owner acted. Legal only on approve_plan, reject_plan and
 	// revise_plan (ErrExpectedGateRevisionNotApplicable otherwise). When set, the verdict is
-	// written only while the run is awaiting_approval at exactly that revision; otherwise it
-	// writes nothing (no selection, milestone freeze, revise_count, stop_kind, capability clear,
-	// server-side reject) and returns a *GateRevisionMismatchError naming the current revision.
+	// written only while the run is awaiting_approval at exactly that revision; otherwise (a
+	// finished run included: the check precedes the terminal guard) it writes nothing (no
+	// selection, milestone freeze, revise_count, stop_kind, capability clear, server-side reject)
+	// and returns a *GateRevisionMismatchError naming the current revision.
 	// nil keeps the pre-#1795 behaviour.
 	ExpectedGateRevision *int64
 }
@@ -94,6 +95,21 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	if err != nil {
 		return SubmitInputResult{}, err
 	}
+	// PRD #1795 M2 (D5): an expected gate revision is checked up front against the run just
+	// read, BEFORE the terminal guard, so a verdict sent against a gate the run no longer shows
+	// (a newer revision, no gate yet, or a run that has since finished) is answered with the
+	// typed mismatch naming the current revision rather than something unrelated (the terminal
+	// 409, the capability gate, the roster check). This read is not the guard: every verdict
+	// write below re-checks the same predicate atomically in SQL, under the run-row lock, and a
+	// 0-row result is answered as a mismatch too (verdictNotWritten / gateRevisionMismatch).
+	if opts.ExpectedGateRevision != nil {
+		if !gateVerdictKind(kind) {
+			return SubmitInputResult{}, ErrExpectedGateRevisionNotApplicable
+		}
+		if err := checkExpectedGateRevision(run, *opts.ExpectedGateRevision); err != nil {
+			return SubmitInputResult{}, err
+		}
+	}
 	if terminalStatuses[run.Status] {
 		return SubmitInputResult{}, ErrRunTerminal
 	}
@@ -108,19 +124,6 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	}
 	if sel != nil && kind != "approve_plan" {
 		return SubmitInputResult{}, fmt.Errorf("%w: an agent selection is only valid when approving a plan", ErrInvalidSelection)
-	}
-	// PRD #1795 M2 (D5): an expected gate revision is checked up front against the run just
-	// read, so a verdict sent against a gate the run no longer shows is refused before the
-	// capability gate or roster check can answer something unrelated. This read is not the
-	// guard: every verdict write below re-checks the same predicate atomically in SQL, under the
-	// run-row lock, and a 0-row result re-reads the run (gateRevisionMismatch).
-	if opts.ExpectedGateRevision != nil {
-		if !gateVerdictKind(kind) {
-			return SubmitInputResult{}, ErrExpectedGateRevisionNotApplicable
-		}
-		if err := checkExpectedGateRevision(run, *opts.ExpectedGateRevision); err != nil {
-			return SubmitInputResult{}, err
-		}
 	}
 	// PRD #84 M4 4c: the AUTHORITATIVE capability approval gate runs here for EVERY
 	// approve_plan — both the selection-bearing dispatch and the nil-selection plain-enqueue
@@ -151,8 +154,10 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		}
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				// No row: the expected-revision predicate refused (or the run vanished).
-				return SubmitInputResult{}, s.gateRevisionMismatch(ctx, userID, runID, opts.ExpectedGateRevision, ErrRunNotFound)
+				// No row: the expected-revision predicate refused (or the run vanished). With an
+				// expected revision this is a mismatch even when the re-read matches again: the
+				// approve was not written.
+				return SubmitInputResult{}, s.verdictNotWritten(ctx, userID, runID, opts.ExpectedGateRevision, ErrRunNotFound)
 			}
 			return SubmitInputResult{}, err
 		}
@@ -430,12 +435,14 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 					ID: runID, UserID: userID, FailureReason: pgconv.TextOrNull(reason),
 					ExpectedGateRevision: pgconv.Int8Ptr(opts.ExpectedGateRevision),
 				})
-				if err == nil && rows == 0 && opts.ExpectedGateRevision != nil {
-					// PRD #1795 M2: the expected-revision predicate refused; the run was not
-					// failed. Without an expected revision a 0-row reject keeps today's answer.
-					if merr := s.gateRevisionMismatch(ctx, userID, runID, opts.ExpectedGateRevision, nil); merr != nil {
-						return SubmitInputResult{}, merr
-					}
+				if err == nil && rows == 0 {
+					// PRD #1795 M2: the reject failed nothing, so never fall through to the
+					// failed fan-out (PublishState, notify, judge, scope settle, checkpoint
+					// delete) or report ServerSide success. With an expected revision it is a
+					// mismatch naming the re-read's revision, even if the re-read matches again.
+					// Without one the only predicates are owner + non-terminal, and the owner was
+					// just verified: the run finished (or vanished) under the submit.
+					return SubmitInputResult{}, s.verdictNotWritten(ctx, userID, runID, opts.ExpectedGateRevision, ErrRunTerminal)
 				}
 			}
 			if err != nil {
@@ -496,7 +503,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 			ExpectedGateRevision: pgconv.Int8Ptr(opts.ExpectedGateRevision),
 		}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return SubmitInputResult{}, s.gateRevisionMismatch(ctx, userID, runID, opts.ExpectedGateRevision, ErrRunNotFound)
+				return SubmitInputResult{}, s.verdictNotWritten(ctx, userID, runID, opts.ExpectedGateRevision, ErrRunNotFound)
 			}
 			return SubmitInputResult{}, err
 		}

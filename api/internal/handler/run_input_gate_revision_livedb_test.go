@@ -23,7 +23,8 @@ import (
 // REAL h.Routes() router for PRD #1795 M2 (D5): an approve/reject/revise carrying an
 // expected_gate_revision the run no longer shows is answered 409 with the typed body
 // {"error", "reason": "gate_revision_mismatch", "current_gate_revision"} and writes nothing; a
-// matching one is accepted and stamped bound; an expected revision on a non-verdict kind is 400.
+// matching one is accepted and stamped bound; a finished run answers the same typed 409 (not the
+// untyped terminal one); an expected revision on a non-verdict kind is 400.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; run via
 // ./e2e/run-store-it.sh. A package that prints `ok` with PASS=0 is INVALID, not green.
@@ -135,6 +136,30 @@ func TestCreateRunInputGateRevisionMismatchLiveDB(t *testing.T) {
 				t.Fatalf("rows = %v, want [%s=bound(2)]", rows, kind)
 			}
 		})
+	}
+
+	// Plan decision 10: with expected_gate_revision present the typed mismatch is answered
+	// whenever the run is not awaiting_approval, a finished run included, so a client acting on a
+	// stale gate learns the current revision instead of the untyped "run has already finished".
+	for _, status := range []string{"failed", "completed"} {
+		for _, kind := range []string{"approve_plan", "reject_plan", "revise_plan"} {
+			t.Run(status+" run, "+kind+": an expected revision is 409 gate_revision_mismatch with current_gate_revision", func(t *testing.T) {
+				run := newGate(2)
+				cliMustExec(t, pool, `UPDATE runs SET status = $2, finished_at = now() WHERE id = $1`, run, status)
+				code, body := post(run, fmt.Sprintf(`{"kind":%q,"body":"why","expected_gate_revision":2}`, kind))
+				if code != http.StatusConflict || body["reason"] != "gate_revision_mismatch" || body["current_gate_revision"] != float64(2) {
+					t.Fatalf("status %d body %v, want 409 reason gate_revision_mismatch current_gate_revision 2", code, body)
+				}
+				if rows := inputRows(run); len(rows) != 0 {
+					t.Fatalf("a refused verdict wrote rows: %v", rows)
+				}
+				// Control: without the field the terminal run keeps its untyped 409.
+				code, body = post(run, fmt.Sprintf(`{"kind":%q,"body":"why"}`, kind))
+				if code != http.StatusConflict || body["reason"] != nil {
+					t.Fatalf("without expected_gate_revision: status %d body %v, want the untyped terminal 409", code, body)
+				}
+			})
+		}
 	}
 
 	t.Run("an expected revision on a non-verdict kind is 400", func(t *testing.T) {

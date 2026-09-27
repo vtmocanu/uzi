@@ -334,6 +334,12 @@ func TestGateVerdictRacesPublicationLiveDB(t *testing.T) {
 }
 
 // waitForLockWaiters blocks until at least n backends wait on a lock in this database.
+//
+// It counts EVERY lock waiter in the database, not only those on this test's run row, so it
+// relies on the live-DB sweep running one package binary at a time (./e2e/run-store-it.sh's
+// `go test -p 1`, see .claude/rules/go.md): under a parallel sweep another package's lock waiter
+// could satisfy the count before this test's contender blocks, and the ordering it enforces would
+// silently not hold.
 func waitForLockWaiters(t *testing.T, f *gateFix, n int) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -533,5 +539,36 @@ func TestGateVerdictStoreQueriesLiveDB(t *testing.T) {
 	}
 	if n, err := f.q.ClearRunRequiredCapabilities(f.ctx, store.ClearRunRequiredCapabilitiesParams{ID: run, UserID: f.userID, GateRevision: 2}); err != nil || n != 1 {
 		t.Fatalf("ClearRunRequiredCapabilities at the bound revision = (%d, %v), want 1 row", n, err)
+	}
+}
+
+// TestGateVerdictOverrideClearLiveDB pins the capability-override clear on BOTH approve seams at
+// a revision >= 1 gate: the clear is scoped to the revision the insert bound the row to, so a seam
+// that lost the binding would clear at revision 0 and silently leave required_capabilities set.
+func TestGateVerdictOverrideClearLiveDB(t *testing.T) {
+	f := newGateFix(t, 3)
+	for _, c := range []struct {
+		name string
+		sel  *AgentSelection
+		exp  *int64
+	}{
+		{"with a selection (CreateApprovePlanInput)", &AgentSelection{Source: AgentSourceOwn}, nil},
+		{"with a selection and a matching expected revision", &AgentSelection{Source: AgentSourceOwn}, i64(1)},
+		{"without a selection (CreateGateVerdictInput)", nil, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f.liveWorker()
+			run := f.gatedRun() // revision 1, docker required
+			if r := f.row(run); r.revision != 1 || !slices.Contains(r.caps, capability.Docker) {
+				t.Fatalf("precondition: revision %d caps %v, want revision 1 requiring docker", r.revision, r.caps)
+			}
+			if _, err := f.submit(run, "approve_plan", c.sel, SubmitInputOptions{OverrideCapabilities: true, ExpectedGateRevision: c.exp}); err != nil {
+				t.Fatalf("override approve: %v", err)
+			}
+			f.assertVerdicts(t, run, "approve_plan=bound(1)")
+			if caps := f.row(run).caps; len(caps) != 0 {
+				t.Fatalf("required_capabilities = %v after an override approve at revision 1, want empty", caps)
+			}
+		})
 	}
 }
