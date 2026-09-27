@@ -21,7 +21,7 @@ import (
 //
 //  1. persists the intent (retained -> superseding, recovery_ref = refs/uzi-recovery/<run id>)
 //     before any forge write;
-//  2. creates the recovery ref at the recorded tip (CAS Old = zero, pack-less);
+//  2. creates the recovery ref at the recorded tip (CAS Old = zero, an empty zero-object pack);
 //  3. CAS-deletes the branch ref at that tip;
 //  4. marks the record superseded (or, with no open custody hold, settling) in one statement,
 //     and a settling record's recovery ref is CAS-deleted under the same lock.

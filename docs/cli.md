@@ -850,6 +850,13 @@ uzi run recovery <run-id> [--json]
   byte_size, created_at) whose ids `uzi run export --capture` takes; it's always `[]`
   rather than null, including when the run itself was deleted (a released hold outlives
   its run) or the server predates capture-hold linking. Owner-only.
+- While the server retains the run's last published checkpoint on origin (PRD #1810), the
+  human-readable output adds a line per hold naming where it lives: `hold <id> checkpoint:
+  <ref> @ <12-char tip> (<state>)`, where `<ref>` is `refs/uzi-checkpoints/<branch>` or, once
+  a newer run on the same branch superseded it, `refs/uzi-recovery/<run-id>`. `--json` carries
+  the same information as `checkpoint_ref`, `checkpoint_tip`, and `checkpoint_state` on each
+  hold. A hold with no retained checkpoint ref omits the line (and the `--json` fields are
+  empty).
 
 When a capture-less hold is genuinely not worth keeping, discard that one exact held
 source:

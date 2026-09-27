@@ -11,11 +11,13 @@
 > it, never deletes it.
 
 The api no longer deletes a terminal run's `refs/uzi-checkpoints/<branch>`
-ref best-effort on every terminal transition (PRD #1030 M4). Instead, on a
-terminal transition it retains the ref while any custody hold of that run is
-open, and settles it (compare-and-swap delete on the recorded tip) only once
-the run's last hold is released or discarded. When a new run on the same
-branch is blocked because a retained ref still occupies the slot (a
+ref best-effort at each of the three writers that reach it (PRD #1030 M4):
+the worker-reported terminal state report, and the two server-side
+cancel/reject paths. Instead, at each of those writers it retains the ref
+while any custody hold of that run is open, and settles it
+(compare-and-swap delete on the recorded tip) only once the run's last
+hold is released or discarded. When a new run on the same branch is
+blocked because a retained ref still occupies the slot (a
 `not_descendant` publish refusal), the api **supersedes** the old run's
 record: it moves the tip to `refs/uzi-recovery/<run-id>` and frees the
 branch ref, rather than deleting the tip or force-updating anything.
@@ -25,17 +27,20 @@ with the push broker's existing rule (ADR-0122).
 
 ## Context
 
-PRD #1030 M4 deletes a run's checkpoint ref, best-effort, on every terminal
-transition (three call sites in `api/internal/workersvc`), so a stale ref
-never blocks a later run's publish with `not_descendant`. That is correct
-for a completed run with no open hold. It is wrong for a failed or
-cancelled run: the same code path deliberately keeps custody holds open for
-those runs "for capture or explicit discard", while deleting the one
-off-worker copy of the work the hold exists to protect. On 2026-09-27,
-issue #1798's run published two checkpoints, failed (a full data volume,
-PRD #1809), and both checkpoint publishes were then deleted while the run's
-custody holds were still open with no captures — the committed work
-survived only in the worker's own working clone.
+PRD #1030 M4 deletes a run's checkpoint ref, best-effort, from three writers
+in `api/internal/workersvc` — the worker-reported terminal state report and
+the two server-side cancel/reject paths — so a stale ref never blocks a
+later run's publish with `not_descendant`. A sweeper-driven terminal
+transition, such as failing a stale worker over its cap, never called that
+delete. That is correct for a completed run with no open hold. It is
+wrong for a failed or cancelled run: the same code path deliberately
+keeps custody holds open for those runs "for capture or explicit
+discard", while deleting the one off-worker copy of the work the hold
+exists to protect. On 2026-09-27, issue #1798's run published two
+checkpoints, failed (a full data volume, PRD #1809), and both checkpoint
+publishes were then deleted while the run's custody holds were still open
+with no captures — the committed work survived only in the worker's own
+working clone.
 
 A completed run with an open custody hold from an *older* generation of the
 same run is a related case: freeing the branch ref for the new generation's
@@ -171,9 +176,9 @@ above.
 - **The live-settle ancestry proof (PRD #1349/#1751,
   `ReleasePredecessorCustodyHoldByLiveAncestry`) is unchanged.** It only
   runs against a *live* run's checkpoint or branch head, and a retention
-  record is only ever created for a *terminal* run, so the two can never
-  meet — the PRD's D3 test expecting the live-settle reader to accept a
-  recovery ref was dropped as dormant rather than implemented.
+  record is only ever created for a *terminal* run, so the two do not in
+  practice meet — the PRD's D3 test expecting the live-settle reader to
+  accept a recovery ref was dropped as dormant rather than implemented.
 
 ## References
 

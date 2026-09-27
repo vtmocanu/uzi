@@ -217,6 +217,11 @@ delete, closing the list→delete TOCTOU on a real forge. A CAS refusal (ref adv
 our tip, or already absent) is benign success (nil, never retried); only a transport/auth
 fault returns an error. This half needs no worker-fleet roll.
 
+**Superseded in part by ADR-1810 (PRD #1810):** the terminal cleanup now retains the ref
+while the run's custody hold is open, deleting it only once the last hold is released or
+discarded, instead of deleting best-effort at the terminal transition itself. The CAS,
+never-forced delete described above is unchanged; only when it fires moved.
+
 **Adoption half — additive-optional, needs a worker-fleet roll.** The run's
 `checkpoint_tip` is threaded into the claim payload (`ClaimPayload.CheckpointTip` /
 `ClaimResponse.checkpoint_tip`), and the agent's `runnerCloneForBranch` resume-adopt leg now
