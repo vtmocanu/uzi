@@ -194,7 +194,7 @@ Unit coverage for the seed-time path lives in
 `agent/test/git-materialize.test.ts` and
 `agent/test/runner-clone-self-contained.test.ts` (including the fail-closed
 case: a materialization failure fails the run before the executor runs);
-the finalize import, and the caller-owned producer stream it reads, are
+the finalize import, and the exit-gated producer stream it reads, are
 covered on both spawn paths (plain and boundary) in
 `agent/test/git-import.test.ts`.
 
@@ -242,8 +242,7 @@ probe other than 0 into a FAIL rather than a skip.
   `cgt-1769:37683d7250d8`, image ID
   `sha256:cb92e728dc7f2528c00ec0ad5c33ef8e698163f60617db7b6bee8ca0404ba9ff`
   (from `docker image inspect --format '{{.Id}}'`; the daemon uses the
-  containerd image store, where the ID is the manifest-list digest — the
-  previous section said this too), created 2026-09-27T14:04:36Z. Built with
+  containerd image store, where the ID is the manifest-list digest), created 2026-09-27T14:04:36Z. Built with
   `CODEX_GIT_TRUST_BUILD_NETWORK=host` (a host workaround: bridge egress
   hangs on this worker) and `CODEX_GIT_TRUST_BUILD_TIMEOUT=1800`; the fixture
   container itself always runs `--network none`.
@@ -324,8 +323,8 @@ probe other than 0 into a FAIL rather than a skip.
   "Reconciliation with #1804" above) — each 64 PASS, 0 FAIL. Those contracts
   are pinned by the stalled-process and deterministic red/green tests in
   `agent/test/git-import.test.ts`; they were not re-run here.
-- **What these runs fixed in the fixture (history).** Before this fix, the
-  fixture exited 0 without reaching the shared-clone mode checks or any
+- **What these runs fixed in the fixture (history).** Before the fixture's exit guard, it
+  exited 0 without reaching the shared-clone mode checks or any
   `RESULT` line: it awaited a reaped command root's spawn promise that never
   settles, and node exits 0 when the event loop drains. An exit guard turns
   that into `RESULT: FAIL — the fixture ended before main() completed …`
@@ -348,10 +347,10 @@ probe other than 0 into a FAIL rather than a skip.
   `test:agent-runtime-key`, `test:codex-supervisor`, `scan:secrets`,
   `sast:semgrep`.
 - **Hygiene.** Bind sources were staged under the runner's private tmp,
-  outside the clone; `run.sh` uses read-only `--mount` binds; every docker
-  step ran in the foreground (the lead's shell ran the chain as a
-  background shell job, but no loop, and each `docker run` ran under
-  `run.sh`'s own timeout); containers were named `codex-git-trust-<pid>` by
+  outside the clone; `run.sh` uses read-only `--mount` binds; each
+  `docker build` and `docker run` ran under `run.sh`'s `timeout
+  --foreground`, run one after another (the chain itself was a single
+  backgrounded shell job, with no retry or polling loop); containers were named `codex-git-trust-<pid>` by
   `run.sh`, removed and verified absent by exact name by `run.sh`.
   Afterwards `docker ps -a` showed no `codex-git-trust` or `cgt-1769`
   container. Any file changed after this image build (`37683d72`) is
