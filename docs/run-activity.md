@@ -405,9 +405,10 @@ most of the places that check are not the end of the run:
   unproven means the worker skips the capture for that park entirely — no
   checkpoint publish, so the latest local work stays on this worker only
   for now (a checkpoint publish targets a separate checkpoint ref, never
-  the run's branch directly) — but the park itself still stands, and a
-  later resume recovers from whatever checkpoint was last durably
-  published.
+  the run's branch directly) — but the park itself still stands: a
+  same-worker resume recovers the kept clone's local work directly, while
+  a resume on another worker recovers only from whatever checkpoint was
+  last durably published.
 - At a pause the owner requested, it means the pause itself fails: the run
   reports **pause failed** and keeps running rather than stopping on
   unproven ground.
@@ -417,9 +418,8 @@ most of the places that check are not the end of the run:
   restore point a bounded number of times. If it never succeeds, it reports
   **credential switch failed**; when the server confirms the failure stamp
   cleared, the run simply continues on the old credential in place (its
-  clone and session are kept), and only when that clear isn't confirmed is
-  the run stopped and left to be requeued rather than continuing on
-  uncertain ground.
+  clone and session are kept); otherwise it is stopped and left to be
+  requeued rather than continuing on uncertain ground.
 - A recovery capture that cannot prove the clone stopped is retried rather
   than treated as a failure.
 - On graceful shutdown, an unproven clone means nothing is published to the

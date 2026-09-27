@@ -253,11 +253,30 @@ removes the tree.
   site that gates on quiescence; a non-quiescent Docker result blocks nothing.
   The reaper's scan itself is skipped, not just relaxed, on a Codex run's own
   `mode: "own"` proof (`runner.ts`'s `processes: (!executor.safety || mode !==
-  "own") && process.platform === "linux"`): there, a Codex thread's own
-  supervisor boundary (`withBoundary`) is what proves the run's processes have
-  drained before the sink runs, and the reaper scan runs unconditionally only
-  for a `seed`/`capture` sweep over paths that have no supervisor behind them,
-  or for a Claude/stub run.
+  "own") && process.platform === "linux"`); a `seed`/`capture` sweep runs the
+  scan regardless of executor (those paths have no supervisor behind them),
+  and so does a Claude/stub run's own-mode proof.
+
+  **For an own-mode Codex sink that is credentialed through `reapForSink` or
+  `withCodexBoundaryOnly`** — the limit park, the graceful-shutdown publish,
+  the milestone checkpoint, the pre-settle reap, and finalize — the Codex
+  supervisor's own `withBoundary` boundary is what proves the run's processes
+  have drained before the sink runs, substituting for the skipped reaper scan.
+  **Not every own-mode Codex sink is credentialed that way, and for those the
+  substitution does not hold.** `handlePausePark` mints no Codex permit at all
+  (its publish is credential-free, so per the m4 structural rule — a path
+  mints a permit iff it does a PAT-bearing overlay publish or a
+  terminal/finalize reap — it never routes through `reapForSink`/
+  `withCodexBoundaryOnly`); its `quiesceRun` call therefore runs outside any
+  Codex permit, and for Codex is the Docker teardown only, since the reaper
+  scan is skipped and there is no supervisor boundary either
+  (`codex-executor.ts`: "`parkForPause` does not reap the provider root").
+  `enterWallPark` (`wall_park`), terminal retire, and completion hold call
+  `quiesceRun` the same direct, unboundaried way. So on a Codex run, a pause
+  park, a wall park, a terminal retire, and a completion hold all proceed with
+  **no process proof beyond the plain `killAgentTree` call `quiesceRun` always
+  makes first** — a disclosed gap (see *Follow-ups* below), not a design
+  intent.
 - Never mark `UZI_WORKER_SPAWN` on anything other than a worker-authored,
   fixed-argv spawn. Marking a repo- or agent-invoked command breaks the
   attribution the reaper depends on to distinguish worker infrastructure from
@@ -292,10 +311,17 @@ destructive or credentialed operation gated on it, and fails closed rather than
 guessing when it cannot. This is narrower than proving the clone itself is
 safe to touch: the reaper's process scan is gated to run at all only on Linux
 workers (`agent/src/runner.ts`'s `process.platform === "linux"` check), and
-for a Codex run's own-mode proof the scan is skipped outright in favor of the
-Codex supervisor's own `withBoundary` boundary as the process proof (see the
-invariant above) — the reaper itself is the proof only for a Claude/stub run,
-or for a `seed`/`capture` sweep. It also says nothing about a Docker
+for a Codex run's own-mode proof the scan is skipped outright. Where that
+own-mode sink is credentialed through `reapForSink`/`withCodexBoundaryOnly`
+(the limit park, graceful shutdown, the milestone checkpoint, the pre-settle
+reap, and finalize), the Codex supervisor's own `withBoundary` boundary
+substitutes as the process proof (see the invariant above); a pause park, a
+wall park, terminal retire, and completion hold call `quiesceRun` directly,
+outside any such boundary, so on a Codex run those four sinks run with no
+process proof beyond the plain `killAgentTree` call — a disclosed gap, not a
+design intent (see *Follow-ups* below). The reaper itself is the proof only
+for a Claude/stub run, or for a `seed`/`capture` sweep (which runs regardless
+of executor). It also says nothing about a Docker
 container — the Docker teardown that runs alongside it is best-effort cleanup,
 not proof, so a container that still binds the clone path can, in principle,
 outlive the checks that gate on process quiescence alone. Attempt-unique clone
@@ -309,6 +335,42 @@ remains open work.
 ## Root-only acceptance at the final head
 
 (recorded after the final acceptance run)
+
+Final code commit 576521c0 (runner.ts comment + spawn-site test inventory);
+later commits change only documentation and code comments. Acceptance ran at
+HEAD 60f164b1 (`git diff --stat 576521c0 60f164b1`: adr, docs, embed mirror,
+specs only).
+
+A fresh build (`CQ_BUILD_ARGS="--network host" CQ_IMAGE=cq1783:9ef3a599ddda
+CQ_TIMEOUT=2400 task test:clone-quiescence`) failed twice at image extraction
+with "no space left on device" on the shared Docker daemon's fixed 29.4G
+storage pool (no test ran); so the run used an existing worker base image
+with this tree's `agent/src` mounted:
+
+Command: `CQ_SKIP_BUILD=1 CQ_IMAGE=uzi-agent-codex-git-trust:base
+CQ_MOUNT_SRC=1 CQ_TIMEOUT=900 task test:clone-quiescence` → exit 0.
+
+Image ID `sha256:5c04540739e3cfd6fc43aa13620bb888593783a77eb505058a055ac7b879d788`,
+`org.opencontainers.image.revision` `3692a3801e4ca11759f34b41d40f0acc8a4e097f`.
+Binding: the code under test is this tree's `agent/src` at HEAD (mounted
+read-only, `CQ_SRC`; `fixture.test.ts:40` `const SRC = process.env.CQ_SRC ??
+"/app/src";`), the fixture is the tree's `e2e/` (read-only mount), and every
+other Dockerfile build input (`agent/templates`, `agent/package.json`,
+`agent/package-lock.json`, `agent/bin`, `agent/codex`, `agent/devbox-global`,
+`agent/tsconfig.json`) is byte-identical between `3692a380` and HEAD
+(`git diff --stat 3692a380 HEAD -- …` shows only `e2e/clone-quiescence`).
+
+PASS lines (7/7; tests 7, pass 7, fail 0, cancelled 0, skipped 0):
+
+```
+✔ runs as the worker uid under the split, not as root or single-uid
+✔ A-healthy: a clean clone is quiescent through the real setpriv helper
+✔ A-healthy: an attributed runner-uid straggler is reaped by the helper; a sibling key's is not
+✔ A-foreign-uids: worker, root and runner-cmd processes in scope are ignored, never unverified
+✔ M3: the planted residue is root:root drwxr-sr-x with agent/src and gate-log.loop, and the worker cannot delete it
+✔ M3: a CROSS-parent rename of the residue fails EACCES, which is why the quarantine stays in the same parent
+✔ M3: the canonical reseed renames it within the same parent, keeps it, and completes
+```
 
 ## Follow-ups and accepted risks
 
@@ -336,6 +398,17 @@ These are not filed yet; listed here for the maintainer to file after merge.
   delete can remove a path whose Docker containers were never confirmed torn
   down. A follow-up could require a fresh, successful Docker-use check before
   deleting a retained path, rather than relying on the process proof alone.
+- **Follow-up 4 — a pause park, wall park, terminal retire, and completion
+  hold run with no process proof at all on a Codex run.** Unlike the limit
+  park, graceful shutdown, the milestone checkpoint, the pre-settle reap, and
+  finalize (which get the Codex supervisor's `withBoundary` drain proof
+  because they are credentialed through `reapForSink`/`withCodexBoundaryOnly`),
+  `handlePausePark`, `enterWallPark`, terminal retire, and completion hold all
+  call `quiesceRun` directly: they mint no Codex permit, so the reaper scan is
+  skipped (own-mode) and there is no supervisor boundary to substitute for it
+  either — only the plain `killAgentTree` call inside `quiesceRun` runs. This
+  is disclosed here for the maintainer to file as its own tracking issue, not
+  filed yet.
 
 **Accepted risks:**
 
