@@ -33,6 +33,30 @@ history accordion below the current one, and your feedback for each round
 is stored in the run feed alongside the plan it produced — visible to
 admins the same way a reject reason or a follow-up already is.
 
+Every verdict is bound to the exact gate it was sent against, not just
+"the current one." Each time a plan is shown, the run's `gate_revision`
+counts up by one (readable with `uzi run get <id> --field gate_revision`);
+a client that names the revision it displayed — `expected_gate_revision`
+on the API, or `--expected-gate-revision` on the CLI (see [the CLI
+docs](./cli.md#commands)) — gets a 409 (`gate_revision_mismatch`, naming
+the current `current_gate_revision`) instead of applying to a plan you
+never saw, whenever the run has since moved to a different revision or
+left the gate entirely. An **approve** sent while no gate is visible at
+all (nothing displayed yet, or the run has already moved on) is silently
+ignored, with a note in the run feed — it can never land against a later
+plan by accident. A **reject** or **request changes** sent the same way is
+not ignored: it still applies at the run's first gate, the same
+fail-closed handling these two actions have always had.
+
+If a worker cannot re-present a plan gate it previously showed — for
+example after a restart or credential switch that lost track of what was
+on screen — the run parks at `recovery_wait` (see [Recovery
+wait](./run-recovery-wait.md)) rather than showing a gate it can't stand
+behind, and a fresh claim retries. This is bounded: past
+`RUN_GATE_REFUSAL_MAX` such refusals for one run (see
+[Configuration](./configuration.md)), the next one fails the run instead
+of parking it again, with reason `gate_presentation_refused`.
+
 If the planning turn itself wrote anything to the worktree — a file the
 agent created or modified while it was still just planning, which would
 otherwise be swept invisibly into the first implementation commit — the

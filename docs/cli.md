@@ -90,8 +90,9 @@ uzi run create --repo <id> --issue <iid> [--plan-file <path>]
                 [--planned-commit <sha>] [--require-base] [--force]
                 [--harness claude|codex]
 uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
-uzi run reject <id> [--message <text>]
-uzi run revise <id> [--message <text>]
+                [--expected-gate-revision <n>]
+uzi run reject <id> [--message <text>] [--expected-gate-revision <n>]
+uzi run revise <id> [--message <text>] [--expected-gate-revision <n>]
 uzi run cancel <id> [--discard-pending-outcome]
 uzi run stop <id> [--message <text>]
 uzi run scope <id> --through <n>
@@ -243,6 +244,22 @@ A few worth knowing:
   (`-m`/`--message`, or piped on stdin). Revisions are capped by the run's
   revision limit, and an exhausted limit — or a run that has already finished —
   is a 409 (exit 5).
+- **`run approve|reject|revise` bind to a plan-gate revision.** Every plan
+  presented at the gate has a revision number, exposed as `gate_revision`
+  (readable with `uzi run get <id> --field gate_revision`). Pass
+  `--expected-gate-revision <n>` to make a verdict conditional on that exact
+  revision still being current — the way to say "this is the plan I read."
+  Without the flag, the CLI reads the run once, right before sending the
+  verdict, and sends whatever revision it finds while the run is
+  `awaiting_approval`; that only proves the verdict targets the gate current
+  *at that moment*, not a plan you read earlier in a separate `run get` or in
+  the web UI. A mismatch — the run has since shown a newer plan, or is no
+  longer at the gate — is a 409 (exit 5) that names the current revision, and
+  nothing is applied. `run approve --token <label>` switches the run's
+  Anthropic token before approving; if the expected-revision check then
+  refuses the approve, the token switch is NOT rolled back, and the error
+  says so, so you know a bare re-run of `run approve` (no `--token`) is what's
+  left to do.
 - **`run stop <id>`** gracefully winds down a run. On an **interactive**
   task run (one created with `uzi handoff --interactive`; see [Interactive
   mode](./handoff.md#interactive-mode)) the current turn
@@ -1730,6 +1747,12 @@ backfilled value), one of: `manual`, `autopilot`, `schedule`, `self_improve`,
 `ci_fix`, `mr_rework`, `chat`, `task`, `task_review`, `then_fix`, `judge`,
 `judge_rerun`, `resume`. The human `run get` view prints it as a `TRIGGER` row,
 and `uzi admin runs` shows it as a `TRIGGER` column.
+
+A run's plan-gate revision is readable the same way:
+`uzi run get <id> --field gate_revision` (the number of the plan currently
+presented at the gate, `0` for a run that has never gated under this
+feature). See [Run activity pane](./run-activity.md#plan-approval-gate) and
+`--expected-gate-revision` above.
 
 A run's PRD-completion declaration is readable the same way:
 `uzi run get <id> --field prd_done_path` (the repo-relative path the run
