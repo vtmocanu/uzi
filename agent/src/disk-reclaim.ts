@@ -35,8 +35,9 @@ import { errMessage, RUN_ID_RE, sleep } from "./util.js";
  * by the worker (see `isWorkerOwnedDir` in {@link runDiskReclaimPass}); anything else is
  * counted and skipped before it can take a status lookup or a slot in the run budget, and
  * each root's listing rotates across passes (DEFAULT_DIR_CURSORS, which also says where that
- * rotation stops guaranteeing anything) so a flood of names smaller than the read budget
- * cannot hide a real entry behind the read cap.
+ * rotation stops guaranteeing anything), holding a window until its run budget has rotated
+ * over every worker-owned run in it, so neither a flood of names smaller than the read budget
+ * nor more never-removed runs than the run budget can hide a real entry for good.
  *
  * **Never a live run.** A run this worker is executing is skipped before its status is even
  * asked for, and the check is repeated under the run's {@link RunDiskLocks} lock right
@@ -142,10 +143,10 @@ export interface DiskReclaimDeps {
    */
   dirCursors?: Map<string, number>;
   /**
-   * The run cursor (see "Run budget" in {@link runDiskReclaimPass}), keyed by HOME root.
+   * The run rotation (see "Run budget" in {@link runDiskReclaimPass}), keyed by HOME root.
    * Absent, the module's own map, which outlives a pass.
    */
-  runCursors?: Map<string, string>;
+  runCursors?: Map<string, RunRotation>;
   /**
    * The uid that owns every directory the reclaim may examine: the worker's own
    * (`process.getuid()`, the default). Absent and without `process.getuid`, nothing is
@@ -265,11 +266,16 @@ const PASS_READ_BUDGET_FACTOR = 4;
  * it from every pass. With it, a pass that stops at the cap resumes the next pass where it
  * stopped, and a listing that reaches the directory's end, or whose window ends at the
  * root's read budget (cap x {@link PASS_READ_BUDGET_FACTOR}), starts the next pass from 0.
+ * A pass that stops at its run budget before examining every worker-owned run of its window
+ * holds the window instead (the run rotation, see the end of {@link runDiskReclaimPass}), so
+ * a window of R worker-owned runs is held for at most ceil(R / maxEntries) passes.
  *
  * **What it guarantees, and what it does not.** A root whose readdir order does not change
  * between passes except by this reclaim's own removals (which the cursor subtracts), and
  * whose size N is within the read budget, is read whole across at most ceil(N / cap) + 1
- * consecutive passes. Beyond that it guarantees nothing:
+ * windows, so at most (ceil(N / cap) + 1) x ceil(R / maxEntries) consecutive passes, R being
+ * the most worker-owned runs one window holds (one pass per window when R <= maxEntries).
+ * Beyond that it guarantees nothing:
  *  - entries past the read budget in readdir order are not reached while the root stays
  *    that large (a flood that big hides them; the budget is what keeps a pass bounded);
  *  - a live writer that inserts OR deletes names adaptively around the cursor between two
@@ -280,15 +286,34 @@ const PASS_READ_BUDGET_FACTOR = 4;
 const DEFAULT_DIR_CURSORS = new Map<string, number>();
 
 /**
- * The last run id a pass examined when it stopped at its run budget, keyed by HOME root
- * (see {@link DiskReclaimDeps.runCursors}). Module-level for the reason DEFAULT_DIR_CURSORS is.
+ * A run-budget rotation over one held listing window: the first run id it examined and the
+ * last one a pass examined before stopping at the run budget. The runs it has covered are the
+ * ids from `start` to `last` in cyclic id order.
  */
-const DEFAULT_RUN_CURSORS = new Map<string, string>();
+interface RunRotation {
+  start: string;
+  last: string;
+  /**
+   * How many dirents each root's held window keeps next pass, when its listing stopped at a
+   * cap: this pass's window less the entries it removed from it, so the window still ends at
+   * the same entry and nothing slides into it from past its end. Undefined for a listing that
+   * reached the directory's end, which has nothing past it to slide in.
+   */
+  keep: { home?: number; provision?: number };
+}
+
+/**
+ * The run rotation in progress, keyed by HOME root (see {@link DiskReclaimDeps.runCursors}).
+ * Module-level for the reason DEFAULT_DIR_CURSORS is.
+ */
+const DEFAULT_RUN_CURSORS = new Map<string, RunRotation>();
 
 interface DirListing {
   lists: Array<Map<string, string>>;
   /** Dirents read, the skipped prefix included. */
   read: number;
+  /** Dirents read past the skipped prefix: the pass's window. */
+  kept: number;
   /** The listing stopped at its keep cap or its read budget. */
   capped: boolean;
   /** The listing stopped at the pass deadline. */
@@ -333,7 +358,7 @@ async function listDirs(
     const absent = (err as NodeJS.ErrnoException).code === "ENOENT";
     if (!absent) log.warn("disk reclaim could not read a directory", { dir: root, error: errMessage(err) });
     // An unreadable root keeps its cursor: the next pass retries the same window.
-    return { lists, read: 0, capped, deadline: false, next: absent ? 0 : skip, whole: absent };
+    return { lists, read: 0, kept: 0, capped, deadline: false, next: absent ? 0 : skip, whole: absent };
   }
   try {
     while (skipped < skip) {
@@ -379,11 +404,11 @@ async function listDirs(
   } catch (err) {
     log.warn("disk reclaim could not read a directory", { dir: root, error: errMessage(err) });
     await dir.close().catch(() => undefined);
-    return { lists, read: skipped + read, capped: false, deadline: false, next: skip, whole: false };
+    return { lists, read: skipped + read, kept: read, capped: false, deadline: false, next: skip, whole: false };
   }
   await dir.close().catch(() => undefined);
   if (capped) log.warn("disk reclaim stopped listing a directory at its read cap", { dir: root, max_reads: maxReads, budget, skipped });
-  return { lists, read: skipped + read, capped, deadline: pastDeadline, next, whole: atEnd && skip === 0 };
+  return { lists, read: skipped + read, kept: read, capped, deadline: pastDeadline, next, whole: atEnd && skip === 0 };
 }
 
 /**
@@ -455,18 +480,29 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
   const readBudget = maxDirReads * PASS_READ_BUDGET_FACTOR;
   const homeSkip = cursors.get(deps.homeRoot) ?? 0;
   const provisionSkip = cursors.get(deps.provisionRoot) ?? 0;
+  // A run rotation in progress holds each root's window, to the same end entry (see RunRotation.keep).
+  const rotation = runCursors.get(deps.homeRoot);
   // agent-home is listed once: its run HOMEs and its model-pass HOMEs come from one stream.
   const homeList = await listDirs(
     deps.homeRoot,
     [isRunId, (name) => MODEL_PASS_HOME_RE.test(name)],
     homeSkip,
-    maxDirReads,
+    Math.min(maxDirReads, rotation?.keep.home ?? maxDirReads),
     readBudget,
     passDeadline,
     now,
     log,
   );
-  const provisionList = await listDirs(deps.provisionRoot, [isRunId], provisionSkip, maxDirReads, readBudget, passDeadline, now, log);
+  const provisionList = await listDirs(
+    deps.provisionRoot,
+    [isRunId],
+    provisionSkip,
+    Math.min(maxDirReads, rotation?.keep.provision ?? maxDirReads),
+    readBudget,
+    passDeadline,
+    now,
+    log,
+  );
   const [homes = new Map<string, string>(), passHomes = new Map<string, string>()] = homeList.lists;
   const [provisions = new Map<string, string>()] = provisionList.lists;
   summary.dirEntriesRead = homeList.read + provisionList.read;
@@ -477,15 +513,21 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
   const listed = new Map<string, RunDirs>();
   for (const [id, dir] of homes) listed.set(id, { home: dir });
   for (const [id, dir] of provisions) listed.set(id, { ...listed.get(id), provision: dir });
-  // Run budget: the runs are examined in id order starting after the run cursor (the last
-  // run a pass examined before it stopped at maxEntries), wrapping round. Without it every
-  // pass over the same window would examine the same first maxEntries worker-owned runs, so
-  // enough runs that are never removed (e.g. HOMEs of runs the api no longer knows, 404)
-  // would starve every terminal HOME behind them. Id order, not listing order, so the cursor
-  // means the same thing whatever order the next listing returns.
-  const runCursor = runCursors.get(deps.homeRoot);
+  // Run budget: the runs are examined in id order starting after the rotation's last run
+  // (the last run a pass examined before it stopped at maxEntries), wrapping round. Without
+  // it every pass over the same window would examine the same first maxEntries worker-owned
+  // runs, so enough runs that are never removed (e.g. HOMEs of runs the api no longer knows,
+  // 404) would starve every terminal HOME behind them. Id order, not listing order, so the
+  // rotation means the same thing whatever order the next listing returns. While a rotation
+  // is in progress the listing window is held (below); once a pass reaches a run the
+  // rotation already covered, the whole window has been examined and the listing moves on.
+  const covered = (id: string): boolean => {
+    if (rotation === undefined) return false;
+    const { start, last } = rotation;
+    return start <= last ? id >= start && id <= last : id >= start || id <= last;
+  };
   const ids = [...listed.keys()].sort();
-  const from = runCursor === undefined ? 0 : ids.findIndex((id) => id > runCursor);
+  const from = rotation === undefined ? 0 : ids.findIndex((id) => id > rotation.last);
   const order = from <= 0 ? ids : [...ids.slice(from), ...ids.slice(0, from)];
   const runs = new Map<string, RunDirs>(order.map((id) => [id, listed.get(id) as RunDirs]));
   // Forget runs whose HOME is gone, so the memo stays bounded by what is on the volume. Only
@@ -494,13 +536,18 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
   if (homeList.whole) memo?.retainOnly((id) => homes.has(id));
 
   let consecutiveFailures = 0;
+  let firstExamined: string | undefined;
   let lastExamined: string | undefined;
   let runBudgetStop = false;
+  // This pass reached a run the rotation already covered: every run of the held window has
+  // now been visited. The covered runs sit at the end of `order`, so all the rest came first.
+  let wrapped = false;
   for (const [runId, listed] of runs) {
     if (now() - startedAt >= deadlineMs) {
       summary.stoppedEarly = "deadline";
       break;
     }
+    if (!wrapped && covered(runId)) wrapped = true;
     // Ownership first, before the run budget and any status lookup: the pass acts only on
     // directories the worker owns, the same check rmTreePinned makes on the leaf (it refuses
     // any other owner with EPERM). A run is admitted by either of its dirs being the
@@ -524,6 +571,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
       break;
     }
     summary.runsExamined += 1;
+    firstExamined ??= runId;
     lastExamined = runId;
     if (deps.isRunLive(runId)) {
       memo?.forget(runId); // executing again: its caches may be refilled by the next park
@@ -639,12 +687,21 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
     }
   }
 
-  // A pass that stopped at its run budget keeps both roots on the same window next pass and
-  // resumes the runs after the last one it examined, so every worker-owned run in a window is
-  // examined before the listing moves on. Its removals were all inside the window, at or past
-  // the skip, so the skip stays as it was.
-  if (runBudgetStop && lastExamined !== undefined) {
-    runCursors.set(deps.homeRoot, lastExamined);
+  // A pass that stopped at its run budget before its rotation wrapped holds both roots on the
+  // same window next pass (same skip, and the same end entry: RunRotation.keep) and resumes
+  // the runs after the last one it examined, so every worker-owned run in the window is
+  // examined before the listing moves on: a window with R worker-owned runs is held for at
+  // most ceil(R / maxEntries) passes. Its removals were all inside the window, at or past the
+  // skip, so the skip stays as it was. A pass that wrapped (or that did not stop at the run
+  // budget) ends the rotation and moves the listing on like any other pass.
+  if (runBudgetStop && !wrapped && firstExamined !== undefined && lastExamined !== undefined) {
+    const keep = (root: string, listing: DirListing) =>
+      listing.capped ? Math.max(0, listing.kept - (removedFrom.get(root) ?? 0)) : undefined;
+    runCursors.set(deps.homeRoot, {
+      start: rotation?.start ?? firstExamined,
+      last: lastExamined,
+      keep: { home: keep(deps.homeRoot, homeList), provision: keep(deps.provisionRoot, provisionList) },
+    });
   } else {
     runCursors.delete(deps.homeRoot);
     // Advance each root's cursor past this pass's window, less the entries this pass removed

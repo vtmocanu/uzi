@@ -382,6 +382,18 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     };
   }
 
+  /** `dir`'s names in the order the pass's streamed listing reads them (`readdirSync` may sort). */
+  function listingOrder(dir: string): string[] {
+    const handle = fs.opendirSync(dir);
+    const names: string[] = [];
+    try {
+      for (let e = handle.readSync(); e !== null; e = handle.readSync()) names.push(e.name);
+    } finally {
+      handle.closeSync();
+    }
+    return names;
+  }
+
   /** A minimal worker-owned run HOME (no read-only subtree, so root runs it too). */
   function plainHome(root: string): { id: string; home: string } {
     const id = randomUUID();
@@ -565,7 +577,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     const terminal = Array.from({ length: 20 }, () => plainHome(d.home));
     const status = new Map(terminal.map((r) => [r.id, "completed"]));
     const dirCursors = new Map<string, number>();
-    const runCursors = new Map<string, string>();
+    const runCursors: NonNullable<DiskReclaimDeps["runCursors"]> = new Map();
     const asked = new Map<string, number>();
     const pass = () =>
       runDiskReclaimPass(
@@ -588,6 +600,84 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     for (const r of gone) assert.ok(exists(r.home), "a 404 HOME is never removed");
     for (const r of [...gone, ...terminal]) assert.ok((asked.get(r.id) ?? 0) >= 1, "every run was examined");
     assert.equal(first.terminalHomesRemoved + second.terminalHomesRemoved, 20);
+  });
+
+  it("a capped window with more never-removed runs than the run budget still lets the listing move on to the HOMEs after it", async () => {
+    const d = dataDir();
+    const workerUid = 4242;
+    // 70 HOMEs, given their roles by the order this filesystem lists them in, so the first
+    // window (20 dirents) is all never-removed runs, whatever the readdir order is.
+    for (let i = 0; i < 70; i++) plainHome(d.home);
+    const order = listingOrder(d.home);
+    const persistent = order.slice(0, 30); // 404 HOMEs: examined every rotation, never removed
+    const junk = new Set(order.slice(30, 50).map((id) => path.join(d.home, id))); // planted, not the worker's
+    const terminal = order.slice(50);
+    const status = new Map(terminal.map((id) => [id, "completed"]));
+    const dirCursors = new Map<string, number>();
+    const runCursors: NonNullable<DiskReclaimDeps["runCursors"]> = new Map();
+    const asked = new Map<string, number>();
+    const pass = () =>
+      runDiskReclaimPass(
+        deps(d, {
+          workerUid,
+          lstat: lstatAs(junk, workerUid),
+          maxDirReads: 20,
+          maxEntries: 5,
+          dirCursors,
+          runCursors,
+          statusOf: async (id) => {
+            asked.set(id, (asked.get(id) ?? 0) + 1);
+            return status.get(id);
+          },
+        }),
+      );
+    // (ceil(70 / 20) + 1) windows x ceil(20 / 5) passes per window.
+    const bound = (Math.ceil(70 / 20) + 1) * Math.ceil(20 / 5);
+    let passes = 0;
+    while (passes < bound && terminal.some((id) => exists(path.join(d.home, id)))) {
+      await pass();
+      passes += 1;
+    }
+    for (const id of terminal) assert.equal(exists(path.join(d.home, id)), false, `every terminal HOME is removed within ${bound} passes`);
+    for (const id of persistent) assert.ok(exists(path.join(d.home, id)), "a 404 HOME is never removed");
+    for (const p of junk) assert.ok(exists(p), "a planted dir is never removed");
+    for (const id of persistent) assert.ok((asked.get(id) ?? 0) >= 1, "every persistent run was examined");
+    for (const p of junk) assert.equal(asked.has(path.basename(p)), false, "a planted dir takes no lookup");
+  });
+
+  it("a window held for the run rotation keeps its end entry, so entries past it wait for their own window", async () => {
+    const d = dataDir();
+    for (let i = 0; i < 30; i++) plainHome(d.home);
+    const order = listingOrder(d.home);
+    // The first window (10 dirents): 6 terminal HOMEs and 4 never-removed runs.
+    const terminal = new Set(order.slice(0, 6));
+    const dirCursors = new Map<string, number>();
+    const runCursors: NonNullable<DiskReclaimDeps["runCursors"]> = new Map();
+    const examined: string[][] = [];
+    const pass = async () => {
+      const seen: string[] = [];
+      await runDiskReclaimPass(
+        deps(d, {
+          maxDirReads: 10,
+          maxEntries: 5,
+          dirCursors,
+          runCursors,
+          statusOf: async (id) => {
+            seen.push(id);
+            return terminal.has(id) ? "completed" : undefined;
+          },
+        }),
+      );
+      examined.push(seen);
+    };
+    await pass();
+    assert.equal(examined[0]?.length, 5);
+    assert.equal(dirCursors.has(d.home), false, "the window is held");
+    await pass();
+    const firstWindow = new Set(order.slice(0, 10));
+    for (const id of examined[1] ?? []) assert.ok(firstWindow.has(id), "the held window reads none of the entries past its end");
+    assert.equal(dirCursors.get(d.home), 10 - 6, "the rotation wrapped: the listing moves on past the window, less its removals");
+    assert.equal(runCursors.has(d.home), false);
   });
 
   it("a drop that found nothing is not counted as a drop and logs nothing of its own", { skip: SKIP_ROOT }, async () => {
