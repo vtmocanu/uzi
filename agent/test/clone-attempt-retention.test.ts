@@ -385,7 +385,7 @@ describe("issue #1783 M2 review: retention deletions are re-validated and run as
       return p;
     });
     await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, seedOpts());
-    assert.deepEqual(calls.map((c) => c.args.at(-1)), [planted[0]!.dir, planted[0]!.skills, residue[0]]);
+    assert.deepEqual(calls.map((c) => c.args.at(-1)), [planted[0]!.skills, planted[0]!.dir, residue[0]], "the skills sibling first (NB1)");
     for (const c of calls) {
       assert.equal(c.command, "/bin/setpriv", "wrapped by runnerCommand");
       assert.deepEqual(c.args.slice(-4), ["/bin/rm", "-rf", "--", c.args.at(-1)], "the fixed rm argv, target last");
@@ -466,7 +466,7 @@ describe("issue #1783 M2 review: attempt-journal guards (A′ id mismatch, relea
 });
 
 describe("issue #1783 M2 review: the ledger stays bounded (N4)", () => {
-  it("each seed compacts to the last value per attemptId and drops retired entries whose path is gone", async () => {
+  it("each seed compacts to the last value per attemptId and drops entries whose path is gone", async () => {
     const s = await keyFixture();
     const key = `uzi-attempts.${s.branch}.entry`;
     const kept = plantAttempt(s, idAt(1), "run-1", "live");
@@ -488,10 +488,252 @@ describe("issue #1783 M2 review: the ledger stays bounded (N4)", () => {
     }));
     assert.deepEqual(
       cfgAll(s.bare, key).map((v) => JSON.parse(v) as { attemptId: string; state: string }).map((e) => `${e.attemptId}:${e.state}`),
-      [`${idAt(1)}:abandoned`, `${idAt(3)}:retired`, `${idAt(4)}:abandoned`, `${attemptId}:live`],
+      [`${idAt(1)}:abandoned`, `${idAt(3)}:retired`, `${attemptId}:live`],
     );
     assert.deepEqual(nonLive, [kept.dir, presentRetired.dir].sort(), "only paths that still exist are swept");
     assert.ok(fs.existsSync(seeded.path));
+  });
+});
+
+type CompactSeam = { compactAttemptLedger: (bare: string, branch: string) => Promise<void> };
+type RunGitSeam = { runGit: (cwd: string | undefined, args: string[], ...rest: unknown[]) => Promise<string> };
+
+describe("issue #1783 M2 final review (NB2): a gone entry of any state is dead, except reclaimed-with-custody and journaled", () => {
+  it("drops gone live/abandoned/retired entries and a gone reclaimed one with neither journal nor custody; keeps the rest", async () => {
+    const s = await keyFixture();
+    const key = `uzi-attempts.${s.branch}.entry`;
+    const add = (i: number, runId: string, state: AttemptLedgerState): string => {
+      const clonePath = `${s.canonical}.attempt-${idAt(i)}`;
+      cfg(s.bare, "--add", key, JSON.stringify({ attemptId: idAt(i), runId, clonePath, state }));
+      return clonePath;
+    };
+    add(0, "run-0", "live"); // gone, unjournaled → dropped
+    add(1, "run-1", "abandoned"); // gone → dropped
+    add(2, "run-2", "retired"); // gone → dropped
+    add(3, "owner-3", "reclaimed"); // gone, no journal, no custody → dropped
+    add(4, "owner-4", "reclaimed"); // gone, custody under recovery/ → kept
+    add(5, "owner-5", "reclaimed"); // gone, custody under recovery-settlement/ → kept
+    const journaledReclaimed = add(6, "owner-6", "reclaimed"); // gone, journaled → kept
+    const journaledLive = add(7, "owner-7", "live"); // gone, a journal names it → kept
+    const present = plantAttempt(s, idAt(8), "run-8", "live"); // present → kept
+    fs.mkdirSync(path.join(fx.dataDir, "recovery", "owner-4"), { recursive: true });
+    fs.writeFileSync(path.join(fx.dataDir, "recovery", "owner-4", "capture.json"), "{}");
+    fs.mkdirSync(path.join(fx.dataDir, "recovery-settlement", "owner-5"), { recursive: true });
+    fs.writeFileSync(path.join(fx.dataDir, "recovery-settlement", "owner-5", "settle.json"), "{}");
+    cfg(s.bare, "uzi-recovery.agent/other-6.clone", JSON.stringify({ runId: "owner-6", clonePath: journaledReclaimed }));
+    cfg(s.bare, "uzi-recovery.agent/other-7.clone", JSON.stringify({ runId: "owner-7", clonePath: journaledLive }));
+    await (git as unknown as CompactSeam).compactAttemptLedger(s.bare, s.branch);
+    assert.deepEqual(
+      cfgAll(s.bare, key).map((v) => (JSON.parse(v) as { attemptId: string }).attemptId),
+      [idAt(4), idAt(5), idAt(6), idAt(7), idAt(8)],
+    );
+    assert.ok(fs.existsSync(present.dir));
+  });
+});
+
+describe("issue #1783 M2 final review (NB3): the compaction rewrite is atomic under git's config.lock", () => {
+  function plantCompactable(s: Seeded): { key: string; before: string[] } {
+    const key = `uzi-attempts.${s.branch}.entry`;
+    // A foreign owner's live entry a journal names (the value a partial rewrite could lose) plus
+    // other survivors, and duplicate history that makes the compaction rewrite.
+    const owner = plantAttempt(s, idAt(1), "owner-1", "live");
+    cfg(s.bare, "uzi-recovery.agent/owner.clone", JSON.stringify({ runId: "owner-1", clonePath: owner.dir }));
+    plantAttempt(s, idAt(2), "run-2", "abandoned");
+    plantAttempt(s, idAt(3), "run-3", "reclaimed");
+    cfg(s.bare, "--add", key, JSON.stringify({ attemptId: idAt(2), runId: "run-2", clonePath: `${s.canonical}.attempt-${idAt(2)}`, state: "abandoned" }));
+    cfg(s.bare, "--add", key, "not json");
+    return { key, before: cfgAll(s.bare, key) };
+  }
+
+  it("a failure part-way through the rewrite leaves every ledger value exactly as it was", async () => {
+    const s = await keyFixture();
+    const { key, before } = plantCompactable(s);
+    const seam = git as unknown as RunGitSeam;
+    const real = seam.runGit.bind(git);
+    let replaced = false;
+    seam.runGit = async (cwd, args, ...rest) => {
+      if (args[0] === "config" && args.includes("--replace-all")) replaced = true;
+      else if (replaced && args[0] === "config" && args.includes("--add") && args.includes(key)) throw new Error("injected crash mid-compaction");
+      return real(cwd, args, ...rest);
+    };
+    await (git as unknown as CompactSeam).compactAttemptLedger(s.bare, s.branch);
+    seam.runGit = real;
+    assert.ok(replaced, "the rewrite started");
+    assert.deepEqual(cfgAll(s.bare, key), before, "the journaled owner's live entry (and every other value) survives");
+    assert.equal(fs.existsSync(path.join(s.bare, "config.lock")), false, "no lock left behind");
+    assert.deepEqual(fs.readdirSync(s.bare).filter((n) => n.startsWith("config.uzi-compact-")), [], "no temp file left behind");
+  });
+
+  it("while another git holds config.lock the compaction aborts: the ledger and the foreign lock are untouched", async () => {
+    const s = await keyFixture();
+    const { key, before } = plantCompactable(s);
+    const lock = path.join(s.bare, "config.lock");
+    fs.writeFileSync(lock, "[foreign]\n\tx = 1\n");
+    await (git as unknown as CompactSeam).compactAttemptLedger(s.bare, s.branch);
+    assert.equal(fs.readFileSync(lock, "utf8"), "[foreign]\n\tx = 1\n", "the foreign lock is not ours to touch");
+    fs.rmSync(lock);
+    assert.deepEqual(cfgAll(s.bare, key), before);
+    assert.ok(lines.some((l) => (l as { msg?: string }).msg === "attempt ledger compaction failed; the ledger is left as it was"));
+  });
+
+  it("a successful compaction lands the whole set in one rewrite, keeps the rest of the config and leaves no lock or temp file", async () => {
+    const s = await keyFixture();
+    const { key } = plantCompactable(s);
+    const otherKeys = cfg(s.bare, "--list").split("\n").filter((l) => l !== "" && !l.startsWith(`${key}=`));
+    await (git as unknown as CompactSeam).compactAttemptLedger(s.bare, s.branch);
+    assert.deepEqual(
+      cfgAll(s.bare, key).map((v) => `${(JSON.parse(v) as { attemptId: string }).attemptId}:${(JSON.parse(v) as { state: string }).state}`),
+      [`${idAt(1)}:live`, `${idAt(3)}:reclaimed`, `${idAt(2)}:abandoned`],
+    );
+    assert.deepEqual(cfg(s.bare, "--list").split("\n").filter((l) => l !== "" && !l.startsWith(`${key}=`)), otherKeys);
+    assert.equal(fs.existsSync(path.join(s.bare, "config.lock")), false);
+    assert.deepEqual(fs.readdirSync(s.bare).filter((n) => n.startsWith("config.uzi-compact-")), []);
+  });
+});
+
+describe("issue #1783 M2 final review (NB1): no orphaned .uzi-skills sibling", () => {
+  function failingOn(fail: (target: string) => boolean): void {
+    const rec = recordingLogger();
+    lines = rec.lines;
+    git = new GitCache(
+      fx.dataDir,
+      rec.logger,
+      undefined,
+      testGitCacheOptions({
+        gitleaksBin: defaultGitleaksShim(),
+        retentionDelete: {
+          split: true,
+          run: async (_command, args) => {
+            const target = args.at(-1)!;
+            if (fail(target)) throw new Error("injected rm failure");
+            fs.rmSync(target, { recursive: true, force: true });
+          },
+        },
+      }),
+    );
+  }
+
+  it("a failed skills delete keeps the attempt dir (the skills dir is never left without it)", async () => {
+    failingOn((t) => path.basename(t).startsWith(".uzi-skills-"));
+    const s = await keyFixture();
+    const planted = [0, 1, 2, 3].map((i) => plantAttempt(s, idAt(i), `run-${i}`, "abandoned"));
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, seedOpts());
+    assert.equal(fs.existsSync(planted[0]!.skills), true);
+    assert.equal(fs.existsSync(planted[0]!.dir), true, "the attempt dir is kept with its skills sibling");
+    assert.equal(ledgerState(s, idAt(0)), "abandoned");
+  });
+
+  it("a failed attempt delete after a successful skills delete orphans nothing, and the next seed retries it", async () => {
+    let failAttempt = true;
+    failingOn((t) => failAttempt && !path.basename(t).startsWith("."));
+    const s = await keyFixture();
+    const planted = [0, 1, 2, 3].map((i) => plantAttempt(s, idAt(i), `run-${i}`, "abandoned"));
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, seedOpts());
+    assert.equal(fs.existsSync(planted[0]!.skills), false, "the skills sibling went first");
+    assert.equal(fs.existsSync(planted[0]!.dir), true, "the attempt is kept");
+    assert.equal(ledgerState(s, idAt(0)), "abandoned", "still disposable, not retired");
+    const orphans = fs.readdirSync(s.parent).filter((n) => n.startsWith(".uzi-skills-") && !fs.existsSync(path.join(s.parent, n.slice(".uzi-skills-".length))));
+    assert.deepEqual(orphans, [], "no skills dir without its attempt");
+    failAttempt = false;
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new-2", false, undefined, seedOpts({ attemptId: mintAttemptId(10) }));
+    assert.equal(fs.existsSync(planted[0]!.dir), false, "retried and deleted");
+    assert.equal(ledgerState(s, idAt(0)), "retired");
+  });
+
+  it("sweeps an existing orphan skills dir (attempt gone, entry absent/abandoned/retired), never a reclaimed/live one's, a journaled one or another key's", async () => {
+    const s = await keyFixture();
+    const key = `uzi-attempts.${s.branch}.entry`;
+    const skillsOf = (i: number, k = s.key): string => {
+      const p = path.join(s.parent, `.uzi-skills-${k}.attempt-${idAt(i)}`);
+      fs.mkdirSync(p);
+      fs.writeFileSync(path.join(p, "plugin.json"), "{}");
+      return p;
+    };
+    const entry = (i: number, runId: string, state: AttemptLedgerState): void => {
+      cfg(s.bare, "--add", key, JSON.stringify({ attemptId: idAt(i), runId, clonePath: `${s.canonical}.attempt-${idAt(i)}`, state }));
+    };
+    const noEntry = skillsOf(0);
+    const retiredOne = skillsOf(1);
+    entry(1, "run-1", "retired");
+    const reclaimedOne = skillsOf(2);
+    entry(2, "owner-2", "reclaimed");
+    fs.mkdirSync(path.join(fx.dataDir, "recovery", "owner-2"), { recursive: true });
+    fs.writeFileSync(path.join(fx.dataDir, "recovery", "owner-2", "c.json"), "{}"); // keeps the gone reclaimed entry in the ledger
+    const liveOne = skillsOf(3);
+    entry(3, "owner-3", "live");
+    cfg(s.bare, "uzi-recovery.agent/other-3.clone", JSON.stringify({ runId: "owner-3", clonePath: `${s.canonical}.attempt-${idAt(3)}` }));
+    const journaledOne = skillsOf(4);
+    cfg(s.bare, "uzi-recovery.agent/other-4.clone", JSON.stringify({ runId: "x", clonePath: `${s.canonical}.attempt-${idAt(4)}` }));
+    const otherKey = skillsOf(5, `${s.key}1`);
+    const busy = skillsOf(6);
+    const withAttempt = plantAttempt(s, idAt(7), "run-7", "abandoned");
+    const scanned: string[][] = [];
+    const opts = seedOpts({
+      quiescent: async (paths) => {
+        scanned.push(paths);
+        return paths[0] !== busy;
+      },
+    });
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, "run-new", false, undefined, opts);
+    assert.equal(fs.existsSync(noEntry), false, "no ledger entry: swept");
+    assert.equal(fs.existsSync(retiredOne), false, "retired: swept");
+    for (const p of [reclaimedOne, liveOne, journaledOne, otherKey, busy, withAttempt.skills]) assert.equal(fs.existsSync(p), true, p);
+    assert.ok(scanned.some((c) => c.length === 1 && c[0] === noEntry), "behind a scoped scan");
+  });
+});
+
+describe("issue #1783 M2 final review (NB4): deleteRetainedArtifact's re-validation guards", () => {
+  type DeleteSeam = { deleteRetainedArtifact: (parent: string, target: string, isExpected: (n: string) => boolean) => Promise<boolean> };
+  const del = (parent: string, target: string, isExpected: (n: string) => boolean = () => true): Promise<boolean> =>
+    (git as unknown as DeleteSeam).deleteRetainedArtifact(parent, target, isExpected);
+  const refusedWith = (reason: string): boolean =>
+    lines.some((l) => (l as { msg?: string }).msg?.includes("refusing to delete") && (l as { reason?: string }).reason === reason);
+  const realDir = (p: string): string => {
+    fs.mkdirSync(p, { recursive: true });
+    fs.writeFileSync(path.join(p, "PRECIOUS"), "x");
+    return p;
+  };
+
+  it("refuses a parent that is not directly under runnerRoot, and a target that is not directly under its parent", async () => {
+    const s = await keyFixture();
+    const root = path.dirname(s.parent);
+    // A parent outside runnerRoot (a sibling tree of the data dir).
+    const outsideParent = realDir(path.join(fx.dataDir, "not-runner", "repo"));
+    const outside = realDir(path.join(outsideParent, "victim"));
+    assert.equal(await del(outsideParent, outside), false);
+    assert.equal(fs.existsSync(path.join(outside, "PRECIOUS")), true);
+    // runnerRoot itself as the parent (one level too shallow).
+    const shallow = realDir(path.join(root, "shallow-victim"));
+    assert.equal(await del(root, shallow), false);
+    assert.equal(fs.existsSync(path.join(shallow, "PRECIOUS")), true);
+    // A target two levels below the parent.
+    const deep = realDir(path.join(s.parent, "sub", "deep"));
+    assert.equal(await del(s.parent, deep), false);
+    assert.equal(fs.existsSync(path.join(deep, "PRECIOUS")), true);
+    assert.ok(refusedWith("not a direct child of a runner repo dir"));
+  });
+
+  it("refuses a basename that is not the expected artifact of this key", async () => {
+    const s = await keyFixture();
+    const target = realDir(path.join(s.parent, `${s.key}.attempt-${idAt(1)}`));
+    assert.equal(await del(s.parent, target, (n) => n === "something-else"), false);
+    assert.equal(fs.existsSync(path.join(target, "PRECIOUS")), true);
+    assert.ok(refusedWith("not the expected retained artifact of this key"));
+    // Control: the same target, expected, is deleted.
+    assert.equal(await del(s.parent, target, (n) => n === path.basename(target)), true);
+    assert.equal(fs.existsSync(target), false);
+  });
+
+  it("refuses when the runner repo dir (the parent) is a symlink, even to a real directory", async () => {
+    const s = await keyFixture();
+    const root = path.dirname(s.parent);
+    const elsewhere = realDir(path.join(fx.dataDir, "elsewhere-repo"));
+    const victim = realDir(path.join(elsewhere, "victim"));
+    const linkedParent = path.join(root, "linked-repo");
+    fs.symlinkSync(elsewhere, linkedParent);
+    assert.equal(await del(linkedParent, path.join(linkedParent, "victim")), false);
+    assert.equal(fs.existsSync(path.join(victim, "PRECIOUS")), true);
+    assert.ok(refusedWith("the runner repo dir is not a real directory"));
   });
 });
 

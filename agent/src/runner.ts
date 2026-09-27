@@ -2448,7 +2448,10 @@ export class RunRunner {
               runLog.warn(
                 e instanceof AttemptReleaseError
                   ? `predecessor attempt release failed at the ${e.stage === "ledger" ? "ledger append" : "journal clear"}; journal kept`
-                  : "predecessor attempt release refused (the journal no longer names this attempt); nothing released",
+                  : e instanceof CapturePathMismatchError
+                    ? "predecessor attempt release refused (the journal no longer names this attempt); nothing released"
+                    // The bare-lock wait, the journal read or its parse failed: all before any write.
+                    : "predecessor attempt release failed before any write (bare-lock wait, journal read or parse); nothing released, journal kept as found",
                 { error: errMessage(e) },
               ),
             );

@@ -8,7 +8,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import type { ExecutorResult, RunContext } from "../src/executor.js";
 import type { BoundaryPermit, CodexExecutionSafety } from "../src/harness.js";
-import { GitCache, type AttemptSeedOptions } from "../src/git.js";
+import { CapturePathMismatchError, GitCache, type AttemptSeedOptions } from "../src/git.js";
 import { LimitReachedError } from "../src/limit.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import { CodexSessionStore } from "../src/codex/session-state.js";
@@ -1047,6 +1047,33 @@ describe("issue #1783 M2 review: the predecessor release warning names what actu
     assert.equal(readJournal(iid)?.clonePath, pred.clonePath, "the journal IS kept, as the warning says");
     assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "live", "no release recorded");
   });
+
+  // NB5: the "refused" message is keyed on the mismatch class; every other pre-write failure (the
+  // bare-lock wait, the journal read, its parse) gets an accurate generic message.
+  for (const kind of ["mismatch", "generic"] as const) {
+    it(`a ${kind === "mismatch" ? "journal mismatch" : "pre-write (lock / config read / parse)"} failure is named as such`, async () => {
+      const iid = kind === "mismatch" ? 2092 : 2093;
+      const runId = randomUUID();
+      const pred = await seedPredecessor(iid, runId, { attempt: true });
+      const { logger, lines } = recordingLogger();
+      const { runner, git: rg } = restartedWorker(transientFactory().factory, {}, logger);
+      const seam = rg as unknown as { releaseAttemptInPlace: (...a: unknown[]) => Promise<void> };
+      seam.releaseAttemptInPlace = async () => {
+        throw kind === "mismatch"
+          ? new CapturePathMismatchError("", pred.clonePath, `agent/issue-${iid}`, runId)
+          : new Error("injected: could not read the bare config");
+      };
+      await runner.execute(gitlabClaim(iid, { run_id: runId, session_id: randomUUID() }));
+      const warn = lines.find((l) => ((l as { msg?: string }).msg ?? "").startsWith("predecessor attempt release"));
+      assert.equal(
+        (warn as { msg?: string } | undefined)?.msg,
+        kind === "mismatch"
+          ? "predecessor attempt release refused (the journal no longer names this attempt); nothing released"
+          : "predecessor attempt release failed before any write (bare-lock wait, journal read or parse); nothing released, journal kept as found",
+      );
+      assert.equal(readJournal(iid)?.clonePath, pred.clonePath, "the journal is kept");
+    });
+  }
 });
 
 describe("issue #1783 M2 review (N6): seed availability under an unattributable unreadable process", { skip: !HAS_PROCFS }, () => {

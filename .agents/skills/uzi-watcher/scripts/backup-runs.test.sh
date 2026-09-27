@@ -446,12 +446,15 @@ echo "PASS case12: attempt whose last ledger value names another run rejected"
 # case 13: a ledger entry naming a path OUTSIDE the stem's candidate set (here a
 # quarantined residue / skills-plugin sibling, which the <stem>.attempt-* glob and
 # the host's name check never list) cannot make that path the pick, even when newer.
+# The residue name is the worker's pinned grammar .uzi-residue-<key>.residue-<uuid>
+# (a lowercase v4 uuid; agent/src/attempt-path.ts formatResidueName).
+RESIDUE_UUID=0f8fad5b-d9cb-469f-a165-70867728950e
 reset_layout
 make_clone "$RB/issue-4242.attempt-$A1" agent/issue-4242 a1
-make_clone "$RB/.uzi-residue-issue-4242.attempt-$A3" agent/issue-4242 residue
+make_clone "$RB/.uzi-residue-issue-4242.residue-$RESIDUE_UUID" agent/issue-4242 residue
 make_clone "$RB/.uzi-skills-issue-4242" agent/issue-4242 skills
 ledger "$A1" run-4242 "$RB/issue-4242.attempt-$A1" live
-ledger "$A3" run-4242 "$RB/.uzi-residue-issue-4242.attempt-$A3" live
+ledger "$A3" run-4242 "$RB/.uzi-residue-issue-4242.residue-$RESIDUE_UUID" live
 ledger "$A2" run-4242 "$RB/.uzi-skills-issue-4242" live
 expect_pick 13 "$RB/issue-4242.attempt-$A1" a1
 echo "PASS case13: ledger entries naming non-candidate sibling paths ignored"

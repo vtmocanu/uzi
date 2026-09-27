@@ -606,6 +606,8 @@ function attemptLedgerValue(entry: AttemptLedgerEntry): string {
 
 /** How many abandoned attempts (each with its skills sibling) the retention sweep keeps per key. */
 const RETAINED_ABANDONED_PER_KEY = 3;
+/** The private temp-file prefix of the atomic ledger compaction (inside the bare, beside `config`). */
+const LEDGER_COMPACT_TMP_PREFIX = "config.uzi-compact-";
 /** How many `.uzi-residue-*` entries the retention sweep keeps per clone key. */
 const RETAINED_RESIDUE_PER_KEY = 5;
 /** The retention sweep's runner-uid delete: the image's root-owned busybox rm (absolute, so it
@@ -1304,7 +1306,7 @@ export class GitCache {
       // The attempt id carries 64 random bits: an existing path is not a collision to paper
       // over, it is something planted. Fail closed and touch nothing.
       if (await this.pathPresent(clonePath)) throw new Error("the fresh attempt clone path already exists");
-      // Bound the ledger before reading it: the last value per attemptId, gone `retired` paths dropped.
+      // Bound the ledger before reading it: the last value per attemptId, gone paths dropped (see compactAttemptLedger).
       await this.compactAttemptLedger(barePath, branch);
       // The seed-time recovery sweep over every NON-LIVE path of this key. It throws to block.
       const ledger = await this.readAttemptLedger(barePath, branch);
@@ -1395,7 +1397,8 @@ export class GitCache {
    *
    * Attempts: keeps at most {@link RETAINED_ABANDONED_PER_KEY} DISPOSABLE-KIND attempts per key and
    * deletes the oldest beyond that (attempt-id order), each with its `.uzi-skills-*` sibling as a
-   * pair. The disposable kinds are `abandoned` (a verified capture released it in place) and a
+   * pair (the sibling first, so a failed attempt delete never orphans it). A skills sibling whose
+   * attempt dir is already gone and whose ledger entry is not `reclaimed`/`live` is swept too. The disposable kinds are `abandoned` (a verified capture released it in place) and a
    * crash-window orphan: a `live` entry not live on this worker, named by no journal and whose run
    * holds no custody record (see the ordering note in attemptCloneForBranch). `reclaimed` (an
    * uncaptured foreign owner's attempt), `retired`, a live attempt and a dir with no ledger identity
@@ -1459,11 +1462,37 @@ export class GitCache {
       const skills = path.join(parent, skillsName);
       if (namedByJournal(a.p) || attempt.isLive(a.p) || (await this.custodyHeld(a.entry.runId))) continue;
       if (!(await quiescent([a.p, skills]))) continue;
-      if (!(await this.deleteRetainedArtifact(parent, a.p, (n) => this.clonePathShape(path.join(parent, n), canonical)?.attemptId === a.attemptId))) continue;
+      // The skills sibling FIRST: materializeSkillsPlugin rebuilds it for any attempt that runs, so
+      // losing it costs nothing, while an attempt dir deleted before a failed skills delete would
+      // leave the skills dir orphaned. A failed attempt delete after this keeps the attempt (still
+      // `abandoned`, retried at the next seed) and orphans nothing.
       if (!(await this.deleteRetainedArtifact(parent, skills, (n) => n === skillsName))) continue;
+      if (!(await this.deleteRetainedArtifact(parent, a.p, (n) => this.clonePathShape(path.join(parent, n), canonical)?.attemptId === a.attemptId))) continue;
       const { branch: entryBranch, ...entry } = a.entry;
       await this.appendAttemptLedger(barePath, entryBranch, { ...entry, state: "retired" }).catch(() => undefined);
       this.log.info("runner clone retention: deleted a retained attempt", { path: a.p, state: a.entry.state });
+    }
+
+    // 1b. Orphaned skills siblings of this key: a `.uzi-skills-<key>.attempt-<id>` whose attempt dir
+    // is gone (an older worker's attempt-first delete, or a crash between the two deletes) and whose
+    // ledger entry is neither `reclaimed` nor `live` (an absent entry, e.g. compacted away, counts as
+    // neither). A skills dir holds a rebuilt plugin tree, never run work. Deleted behind the same
+    // journal / live / scoped-quiescence checks and the same re-validated runner-uid delete.
+    for (const name of await fs.readdir(parent)) {
+      const art = parseRetainedArtifactName(name);
+      if (art?.kind !== "skills") continue;
+      const attemptDir = path.join(parent, art.cloneBasename);
+      const id = this.clonePathShape(attemptDir, canonical)?.attemptId;
+      if (id === undefined || attemptDir === seeding) continue;
+      if (await this.pathPresent(attemptDir)) continue;
+      const state = ledgers.get(id)?.state;
+      if (state === "reclaimed" || state === "live") continue;
+      const p = path.join(parent, name);
+      if (namedByJournal(attemptDir) || namedByJournal(p) || attempt.isLive(attemptDir) || attempt.isLive(p)) continue;
+      if (!(await quiescent([p]))) continue;
+      if (await this.deleteRetainedArtifact(parent, p, (n) => n === name)) {
+        this.log.info("runner clone retention: deleted an orphaned skills sibling", { path: p });
+      }
     }
 
     // 2. This key's residue, oldest (mtime) first beyond the cap.
@@ -2686,14 +2715,22 @@ export class GitCache {
   }
 
   /**
-   * issue #1783 M2 review (N4) — bound one branch's attempt ledger, under the caller's bare lock (the
-   * attempt seed). Rewrites `uzi-attempts.<branch>.entry` to the LAST value per attemptId (in
-   * last-write order), dropping every unparseable value and every `retired` entry whose path is gone
-   * (lstat ENOENT): a retired attempt that is gone has nothing left for any reader to find. Every
-   * other state is kept whatever its path, and nothing is rewritten when nothing would change.
-   * The rewrite is a `--replace-all` then one `--add` per further value; a crash between them loses
-   * ledger values, which fails SAFE (an attempt dir with no ledger identity is never counted or
-   * deleted by the retention sweep, only kept). Best-effort: a failure is logged and the seed goes on.
+   * issue #1783 M2 review (N4, NB2, NB3) — bound one branch's attempt ledger, under the caller's bare
+   * lock (the attempt seed). Rewrites `uzi-attempts.<branch>.entry` to the LAST value per attemptId
+   * (in last-write order), dropping every unparseable value and every entry whose (absolute) path is
+   * gone (lstat ENOENT), whatever its state: after a pod roll `<runnerRoot>` is an emptyDir, so a
+   * gone path has nothing left for any reader to find. Two exceptions are always kept:
+   *   - an entry any branch's recovery journal still names (the journal is what (d′) and a capture
+   *     resolve through the ledger);
+   *   - a gone `reclaimed` entry while its run's journal or custody record (`recovery/<runId>`,
+   *     `recovery-settlement/<runId>`) exists; with both gone it is dropped.
+   * Nothing is rewritten when nothing would change.
+   *
+   * The rewrite is ATOMIC ({@link rewriteLedgerAtomically}): the full compacted value set lands in
+   * one rename of the bare config, under git's own `config.lock`, so a crash part-way can never
+   * leave a partial ledger (the old `--replace-all` then N×`--add` could drop a foreign owner's
+   * `live` entry a journal still names, wedging (d′)). Best-effort: a failure (including a
+   * concurrent git holding `config.lock`) is logged and the ledger is left exactly as it was.
    */
   private async compactAttemptLedger(barePath: string, branch: string): Promise<void> {
     try {
@@ -2706,20 +2743,63 @@ export class GitCache {
         last.delete(e.attemptId);
         last.set(e.attemptId, e);
       }
+      const journaled = [...(await this.journaledClonePaths(barePath))];
+      const namedByJournal = (p: string): boolean => journaled.some((j) => isWithinPath(j, p) || isWithinPath(p, j));
       const kept: string[] = [];
       for (const e of last.values()) {
-        if (e.state === "retired" && path.isAbsolute(e.clonePath) && !(await this.pathPresent(e.clonePath))) continue;
-        kept.push(attemptLedgerValue(e));
+        const gone = path.isAbsolute(e.clonePath) && !(await this.pathPresent(e.clonePath));
+        const droppable = gone && !namedByJournal(e.clonePath) && (e.state !== "reclaimed" || !(await this.custodyHeld(e.runId)));
+        if (!droppable) kept.push(attemptLedgerValue(e));
       }
       if (kept.length === raw.length && kept.every((v, i) => v === raw[i])) return;
-      if (kept.length === 0) {
-        await this.runGit(barePath, ["config", "--local", "--unset-all", key]);
-        return;
-      }
-      await this.runGit(barePath, ["config", "--local", "--replace-all", key, kept[0]!]);
-      for (const v of kept.slice(1)) await this.runGit(barePath, ["config", "--local", "--add", key, v]);
+      await this.rewriteLedgerAtomically(barePath, key, kept);
     } catch (err) {
       this.log.warn("attempt ledger compaction failed; the ledger is left as it was", { branch, error: gitErrorMessage(err) });
+    }
+  }
+
+  /**
+   * Replace every value of the multi-valued config `key` in the bare's config with `values`, in ONE
+   * rename, following git's own lockfile protocol (lockfile.c): the new content is built in a
+   * private temp file (a byte copy of the config, edited with `git config --file`), then published
+   * by hard-linking it to `config.lock` — an exclusive create, exactly git's `O_CREAT|O_EXCL` lock,
+   * so it fails (EEXIST) while any git holds the lock, and every git writer fails while we hold it —
+   * then the config is re-read and compared to the snapshot the edit started from (a writer that
+   * committed between the snapshot and our lock aborts us instead of being overwritten), and
+   * `config.lock` is renamed over `config`. Any failure before the rename leaves `config` untouched
+   * and removes our lock. A process crash between the link and the rename leaves a stale
+   * `config.lock` (the same window git's own config writes have), never a partial ledger.
+   */
+  private async rewriteLedgerAtomically(barePath: string, key: string, values: string[]): Promise<void> {
+    const cfgPath = path.join(barePath, "config");
+    const lockPath = `${cfgPath}.lock`;
+    // A temp file left by a crashed compaction is inert (never read by git); clear it. Only this
+    // method creates the prefix, always under the bare lock.
+    for (const n of await fs.readdir(barePath)) {
+      if (n.startsWith(LEDGER_COMPACT_TMP_PREFIX)) await fs.rm(path.join(barePath, n), { force: true });
+    }
+    const snapshot = await fs.readFile(cfgPath);
+    const mode = (await fs.stat(cfgPath)).mode & 0o777;
+    const tmp = path.join(barePath, `${LEDGER_COMPACT_TMP_PREFIX}${randomUUID()}`);
+    try {
+      await fs.writeFile(tmp, snapshot, { flag: "wx", mode });
+      if (values.length === 0) {
+        await this.runGit(barePath, ["config", "--file", tmp, "--unset-all", key]);
+      } else {
+        await this.runGit(barePath, ["config", "--file", tmp, "--replace-all", key, values[0]!]);
+        for (const v of values.slice(1)) await this.runGit(barePath, ["config", "--file", tmp, "--add", key, v]);
+      }
+      await fs.chmod(tmp, mode);
+      await fs.link(tmp, lockPath);
+      try {
+        if (!(await fs.readFile(cfgPath)).equals(snapshot)) throw new Error("the bare config changed during ledger compaction");
+        await fs.rename(lockPath, cfgPath);
+      } catch (err) {
+        await fs.rm(lockPath, { force: true });
+        throw err;
+      }
+    } finally {
+      await fs.rm(tmp, { force: true });
     }
   }
 
