@@ -475,3 +475,61 @@ func retentionBackoff(attempts int32) time.Duration {
 	}
 	return d
 }
+
+// terminalPublishSuperseded reports whether a TERMINAL run's publish must be refused because its
+// branch slot was handed (or is being handed) to a newer run: its record is superseding or
+// superseded, or names a recovery ref at all (a supersession began: the record may since have
+// settled, exited or closed as tip-gone). Re-creating the branch ref for such a run would take
+// the slot back from the run it was handed to. Inert (false) when retention is not wired, and for
+// a run with no record. A read error is returned: the publish is best-effort, and a refused one is
+// safer than one that could leave an untracked ref.
+func (s *Service) terminalPublishSuperseded(ctx context.Context, runID uuid.UUID) (bool, error) {
+	if !s.retentionWired() {
+		return false, nil
+	}
+	row, err := s.q.GetCheckpointRetention(ctx, runID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("publish: read checkpoint retention: %s", secretscrub.Scrub(err.Error()))
+	}
+	return row.State == retentionSuperseding || row.State == retentionSuperseded || row.RecoveryRef.Valid, nil
+}
+
+// trackPublishedCheckpoint makes the run's retention record track the branch-ref tip a successful
+// publish just advanced (PRD #1810), so no ref outlives its record:
+//
+//   - a TERMINAL run (TrackTerminalCheckpointPublish, one guarded statement): no record inserts
+//     one, retained with an open hold else settling; a retained/settling record advances its
+//     tip; a deleted/abandoned record naming the branch ref is REOPENED (retained with an open
+//     hold, else settling). A settling result triggers the settle, so a publish after the run's
+//     record settled is deleted again and a new run on the branch is not blocked;
+//   - a LIVE run (no row from the statement, whose terminal-status predicate proposes nothing):
+//     unchanged, the tip-lag advance of a retained/settling record naming the branch ref
+//     (AdvanceCheckpointRetentionTip).
+//
+// Best-effort: a failure is logged and the publish still reports success (the ref already moved).
+func (s *Service) trackPublishedCheckpoint(ctx context.Context, runID uuid.UUID, branch, ref, tip string) {
+	if !s.retentionWired() {
+		return
+	}
+	state, err := s.q.TrackTerminalCheckpointPublish(ctx, store.TrackTerminalCheckpointPublishParams{
+		RunID: runID, Branch: branch, Ref: ref, Tip: tip,
+	})
+	switch {
+	case err == nil:
+		if state == retentionSettling {
+			s.SettleRetainedCheckpoint(runID)
+		}
+		return
+	case !errors.Is(err, pgx.ErrNoRows):
+		slog.Warn("checkpoint retention: track terminal publish", "run", runID, "tip", tip, "error", err)
+		return
+	}
+	if _, aerr := s.q.AdvanceCheckpointRetentionTip(ctx, store.AdvanceCheckpointRetentionTipParams{
+		RunID: runID, Ref: ref, Tip: tip,
+	}); aerr != nil {
+		slog.Warn("checkpoint retention: advance tip", "run", runID, "tip", tip, "error", aerr)
+	}
+}

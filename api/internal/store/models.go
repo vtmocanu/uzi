@@ -136,8 +136,9 @@ type CheckpointRetention struct {
 }
 
 type CheckpointRetentionMetum struct {
-	ID        bool               `json:"id"`
-	EnabledAt pgtype.Timestamptz `json:"enabled_at"`
+	ID                bool               `json:"id"`
+	EnabledAt         pgtype.Timestamptz `json:"enabled_at"`
+	BackfilledThrough pgtype.Timestamptz `json:"backfilled_through"`
 }
 
 type CiAutofixAttempt struct {

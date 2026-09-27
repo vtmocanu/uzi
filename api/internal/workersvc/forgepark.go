@@ -232,9 +232,13 @@ func (s *Service) parkForgeUnreachable(ctx context.Context, wkr store.Worker, ow
 	if err := tx.Commit(ctx); err != nil {
 		return store.Run{}, 0, err
 	}
-	// PRD #1810 D3: the exact hold's release committed with the park. A parked run is live and
-	// has no retention record, so this is a no-op by construction, wired for parity: every
-	// custody release writer triggers the settle check after its commit.
+	// PRD #1810 D3: the exact hold's release committed with the park. Unlike the cancel and fail
+	// arms above (terminal transitions, where this trigger can settle a real record), THIS arm
+	// leaves the run live: records are written at a terminal transition, so a parked run normally
+	// has none and the settle finds nothing to do. It is wired for parity (every custody release
+	// writer triggers the settle check after its commit) and stays safe if a record exists: the
+	// settle re-reads it under the run's lock and acts only through its own state and open-hold
+	// guards.
 	s.SettleRetainedCheckpoint(run.ID)
 	return parked, 1, nil
 }

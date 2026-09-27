@@ -64,12 +64,23 @@ CREATE INDEX idx_checkpoint_retentions_work
     ON checkpoint_retentions (state, next_attempt_at)
     WHERE state IN ('superseding', 'settling', 'retained', 'superseded');
 
+-- The post-settlement audit's candidate scan (M4): deleted records that named a recovery ref and
+-- are not yet verified, by due time. Every other deleted record (the steady-state bulk) is outside
+-- the index, so the audit's page never walks them.
+CREATE INDEX idx_checkpoint_retentions_audit
+    ON checkpoint_retentions (verify_after)
+    WHERE state = 'deleted' AND verified_at IS NULL AND recovery_ref IS NOT NULL;
+
 -- Singleton: when retention was enabled. Bounds the sweeper's later backfill (M4) of
 -- terminal runs that have no row (the best-effort insert failed) to runs that ended after
 -- this instant, so it never reaches back to runs the old delete-on-terminal path handled.
+-- backfilled_through is the backfill's persisted watermark: every candidate whose status_since
+-- is below it has been recorded, so a pass scans only runs at or after it (less a 10-minute
+-- overlap for commit-order skew). NULL until the first unconfined pass.
 CREATE TABLE checkpoint_retention_meta (
     id boolean PRIMARY KEY DEFAULT true CHECK (id),
-    enabled_at timestamptz NOT NULL
+    enabled_at timestamptz NOT NULL,
+    backfilled_through timestamptz
 );
 INSERT INTO checkpoint_retention_meta (id, enabled_at) VALUES (true, now());
 

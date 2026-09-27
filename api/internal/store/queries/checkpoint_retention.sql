@@ -146,7 +146,10 @@ RETURNING checkpoint_retentions.state;
 -- missing). Nothing uzi owns references the tip any more, so there is nothing to preserve or
 -- delete; the note is kept in last_error for audit. A superseding record names its recovery
 -- ref, so the post-settlement audit (M4) re-verifies it after 10 minutes: a create whose
--- session was lost after its fence may still land after this list.
+-- session was lost after its fence may still land after this list. This close has no open-hold
+-- guard, so the audit is custody-aware: a recovery ref it finds at the tip while a hold is still
+-- open REOPENS the record as superseded (ReopenCheckpointRetentionSupersededIfHeld) and is
+-- never deleted then.
 UPDATE checkpoint_retentions
 SET state = 'deleted',
     last_error = @last_error::text,
@@ -239,9 +242,15 @@ LIMIT @max_rows::int;
 -- claim-assembly and Codex account-wait fails), or a best-effort insert that failed. Bounded to
 -- runs whose current status began at or after retention was enabled
 -- (checkpoint_retention_meta.enabled_at), so it never reaches back to runs the old
--- delete-on-terminal path already handled. The caller derives the branch in Go
--- (checkpointBranch) and records the run through the terminal-time inserts.
-SELECT r.id, r.kind, r.issue_iid
+-- delete-on-terminal path already handled, AND at or after the persisted watermark
+-- (backfilled_through) less a 10-minute overlap, so a steady-state pass scans only recent
+-- terminal runs (idx_runs_checkpoint_backfill) instead of every terminal run since enabled_at.
+-- The overlap covers commit-order skew: status_since is the writer's transaction time, so a run
+-- whose transaction committed after a pass advanced the watermark past its status_since is still
+-- inside the window on the next pass. The caller derives the branch in Go (checkpointBranch),
+-- records the run through the terminal-time inserts, and advances the watermark
+-- (AdvanceCheckpointRetentionBackfillWatermark) from what the page proved.
+SELECT r.id, r.kind, r.issue_iid, r.status_since
 FROM runs r
 CROSS JOIN checkpoint_retention_meta m
 WHERE r.status IN ('completed', 'failed', 'cancelled')
@@ -249,10 +258,23 @@ WHERE r.status IN ('completed', 'failed', 'cancelled')
   AND r.repo_id IS NOT NULL
   AND ((r.kind = 'issue' AND r.issue_iid IS NOT NULL) OR r.kind = 'self_improve')
   AND r.status_since >= m.enabled_at
+  AND (m.backfilled_through IS NULL OR r.status_since >= m.backfilled_through - interval '10 minutes')
   AND NOT EXISTS (SELECT 1 FROM checkpoint_retentions c WHERE c.run_id = r.id)
   AND (sqlc.narg(only_run_id)::uuid IS NULL OR r.id = sqlc.narg(only_run_id)::uuid)
 ORDER BY r.status_since, r.id
 LIMIT @max_rows::int;
+
+-- name: AdvanceCheckpointRetentionBackfillWatermark :execrows
+-- M4 backfill watermark: every backfill candidate whose status_since is below `through` has been
+-- recorded (or was never a candidate). NULL through means "everything up to now": the page was
+-- not full and every candidate on it was recorded. Monotonic (GREATEST), so a pass computed from
+-- an older snapshot never moves the watermark back past a newer pass's proof; the 10-minute
+-- overlap in ListCheckpointRetentionBackfill is what re-scans runs committed late.
+UPDATE checkpoint_retention_meta
+SET backfilled_through = GREATEST(
+        COALESCE(backfilled_through, '-infinity'::timestamptz),
+        COALESCE(sqlc.narg(through)::timestamptz, now())
+    );
 
 -- name: ListCheckpointRetentionAudit :many
 -- M4 post-settlement audit: deleted records that named a recovery ref, due for their one
@@ -291,3 +313,83 @@ SET attempts = attempts + 1,
 WHERE run_id = @run_id
   AND state = 'deleted'
   AND verified_at IS NULL;
+
+-- name: ReopenCheckpointRetentionSupersededIfHeld :execrows
+-- M4 audit (custody guard): deleted -> superseded when the audit finds the run's recovery ref on
+-- origin at the recorded tip (a create whose session was lost after its fence landed after the
+-- record closed) while the run STILL has an open custody hold. That ref is now the only copy of
+-- the tip custody protects, so it is never deleted here: the record names it again (ref =
+-- recovery_ref) and ordinary settlement owns it, deleting it CAS on the tip once the last hold
+-- settles (the settle trigger, or the sweeper's unheld arm). settled_at/verify_after/verified_at
+-- are cleared: the reopened record is live again, and its own later settle re-arms the audit.
+-- Guarded on the audit's preconditions and the open-hold predicate in one statement.
+UPDATE checkpoint_retentions
+SET state = 'superseded',
+    ref = recovery_ref,
+    attempts = 0,
+    last_error = @last_error::text,
+    next_attempt_at = now(),
+    settled_at = NULL,
+    verify_after = NULL,
+    verified_at = NULL,
+    updated_at = now()
+WHERE checkpoint_retentions.run_id = @run_id
+  AND checkpoint_retentions.state = 'deleted'
+  AND checkpoint_retentions.verified_at IS NULL
+  AND checkpoint_retentions.recovery_ref = @recovery_ref::text
+  AND checkpoint_retentions.tip = @tip::text
+  AND EXISTS (
+      SELECT 1 FROM recovery_custody_holds h
+      WHERE h.run_id = checkpoint_retentions.run_id AND h.state = 'open'
+  );
+
+-- name: TrackTerminalCheckpointPublish :one
+-- A successful checkpoint publish by a TERMINAL run (a worker still bound to it: a shutdown
+-- checkpoint of a just-cancelled run may be its latest work) makes the run's record track the
+-- branch-ref tip it just published, in ONE guarded statement, so no ref outlives its record:
+--
+--   - no record: insert one, retained if the run has an open custody hold, else settling;
+--   - retained/settling naming the branch ref: advance the tip (state, attempts and backoff kept);
+--   - deleted/abandoned naming the branch ref: REOPEN it as retained (held) or settling (not),
+--     with the retry bookkeeping and the settle/audit stamps reset.
+--
+-- A record that ever named a recovery ref (recovery_ref set: its branch slot was handed, or was
+-- being handed, to a newer run) is never touched: the conflict WHERE moves zero rows and no row
+-- is returned. Publish refuses such a run before its forge call; this guard is the backstop.
+-- The terminal-status predicate is on the SELECT, so for a live run nothing is proposed and the
+-- ON CONFLICT arm cannot fire either: a live run's record is never reopened.
+-- Returns the record's state after the statement; no row when nothing moved.
+INSERT INTO checkpoint_retentions (run_id, user_id, repo_id, branch, tip, ref, state)
+SELECT r.id, r.user_id, r.repo_id, @branch::text, @tip::text, @ref::text,
+       CASE WHEN EXISTS (
+           SELECT 1 FROM recovery_custody_holds h
+           WHERE h.run_id = r.id AND h.state = 'open'
+       ) THEN 'retained' ELSE 'settling' END
+FROM runs r
+WHERE r.id = @run_id
+  AND r.repo_id IS NOT NULL
+  AND r.status IN ('completed', 'failed', 'cancelled')
+ON CONFLICT (run_id) DO UPDATE
+SET tip = EXCLUDED.tip,
+    state = CASE WHEN checkpoint_retentions.state IN ('retained', 'settling')
+                 THEN checkpoint_retentions.state ELSE EXCLUDED.state END,
+    attempts = CASE WHEN checkpoint_retentions.state IN ('retained', 'settling')
+                    THEN checkpoint_retentions.attempts ELSE 0 END,
+    last_error = CASE WHEN checkpoint_retentions.state IN ('retained', 'settling')
+                      THEN checkpoint_retentions.last_error END,
+    next_attempt_at = CASE WHEN checkpoint_retentions.state IN ('retained', 'settling')
+                           THEN checkpoint_retentions.next_attempt_at ELSE now() END,
+    settled_at = NULL,
+    verify_after = NULL,
+    verified_at = NULL,
+    updated_at = now()
+WHERE checkpoint_retentions.recovery_ref IS NULL
+  AND checkpoint_retentions.ref = EXCLUDED.ref
+  AND checkpoint_retentions.state IN ('retained', 'settling', 'deleted', 'abandoned')
+RETURNING checkpoint_retentions.state;
+
+-- name: GetRunCheckpointTipForRetention :one
+-- The run's server-persisted latest published tip (runs.checkpoint_tip, advanced on every
+-- successful publish). The stuck-supersession exit uses it to prove a branch ref at a tip the
+-- record does not name is still this run's own publish.
+SELECT checkpoint_tip FROM runs WHERE id = @run_id;

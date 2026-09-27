@@ -559,16 +559,47 @@ func TestReconcileAbandonsRecordOfDeletedRunLiveDB(t *testing.T) {
 	}
 }
 
-// TestReconcileConfinedToRunLiveDB (M3 review N6): the per-run pass never drives another run's due
-// record (the LiveDB isolation), while the production pass lists every run.
+// TestReconcileConfinedToRunLiveDB (M3 review N6): a pass confined to one run never drives
+// another run's candidates in ANY arm (the LiveDB isolation): a due settling and a due superseding
+// record (work arm), an unheld retained record (unheld arm), a due unverified deleted record naming
+// a recovery ref (audit arm), and a terminal run that published but has no record (backfill arm)
+// are all left exactly as they were. It does not exercise the unconfined production pass (that
+// would drive every leftover record of a reused database against this test's forge).
 func TestReconcileConfinedToRunLiveDB(t *testing.T) {
 	f := newSupersedeFix(t)
-	other := uuid.New()
-	ref := checkpointRefPrefix + "agent/issue-535353"
-	f.insertRecord(t, other, ref, retentionSettling)
+	type cand struct {
+		runID uuid.UUID
+		state string
+	}
+	var cands []cand
+	for i, state := range []string{retentionSettling, retentionSuperseding, retentionRetained, "deleted"} {
+		other := uuid.New()
+		ref := checkpointRefPrefix + "agent/issue-53535" + string(rune('0'+i))
+		f.insertRecord(t, other, ref, state)
+		f.forge.set(ref, retentionTestTip)
+		cands = append(cands, cand{other, state})
+	}
+	// The superseding and deleted candidates name a recovery ref (the deleted one is due for its
+	// audit); none of the four runs has an open hold.
+	f.e.exec(t, `UPDATE checkpoint_retentions SET recovery_ref = 'refs/uzi-recovery/' || run_id::text
+	             WHERE run_id = ANY($1) AND state IN ('superseding', 'deleted')`, []uuid.UUID{cands[1].runID, cands[3].runID})
+	f.e.exec(t, `UPDATE checkpoint_retentions SET verify_after = now() - interval '1 second', settled_at = now()
+	             WHERE run_id = $1`, cands[3].runID)
+	backfillRun, backfillRef := f.seedIssueRun(t, "failed", f.e.seedWorker(t, nil), 1)
+
 	f.reconcileRun(t, f.svc2, f.oldRun)
-	if r, _ := f.record(t, other); r.State != retentionSettling {
-		t.Fatalf("another run's record = %q after a pass confined to the old run, want untouched", r.State)
+
+	for _, c := range cands {
+		r, ok := f.record(t, c.runID)
+		if !ok || r.State != c.state || r.Attempts != 0 || r.VerifiedAt.Valid || r.LastError.Valid {
+			t.Fatalf("another run's %s record = %+v (present %v) after a pass confined to the old run, want untouched", c.state, r, ok)
+		}
+	}
+	if _, ok := f.record(t, backfillRun); ok {
+		t.Fatalf("a pass confined to the old run backfilled another run")
+	}
+	if tip, _ := f.forge.ref(backfillRef); tip != retentionTestTip {
+		t.Fatalf("another run's ref = %q, want untouched", tip)
 	}
 }
 

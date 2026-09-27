@@ -579,6 +579,12 @@ type Store interface {
 	ListCheckpointRetentionAudit(ctx context.Context, arg store.ListCheckpointRetentionAuditParams) ([]store.CheckpointRetention, error)
 	SetCheckpointRetentionVerified(ctx context.Context, arg store.SetCheckpointRetentionVerifiedParams) (int64, error)
 	DeferCheckpointRetentionVerify(ctx context.Context, arg store.DeferCheckpointRetentionVerifyParams) (int64, error)
+	// PRD #1810 M4 review: the backfill's persisted watermark, the audit's custody-guarded reopen,
+	// the terminal-run publish tracker, and the stuck exit's read of the run's own latest tip.
+	AdvanceCheckpointRetentionBackfillWatermark(ctx context.Context, through pgtype.Timestamptz) (int64, error)
+	ReopenCheckpointRetentionSupersededIfHeld(ctx context.Context, arg store.ReopenCheckpointRetentionSupersededIfHeldParams) (int64, error)
+	TrackTerminalCheckpointPublish(ctx context.Context, arg store.TrackTerminalCheckpointPublishParams) (string, error)
+	GetRunCheckpointTipForRetention(ctx context.Context, runID uuid.UUID) (pgtype.Text, error)
 	// Issue #1582 M1: the predecessor-settle pair. GetCustodyHoldForSettle reads the exact hold
 	// (scoped to its run); ReleasePredecessorCustodyHoldByAncestry is the single guarded
 	// statement that releases that one older-generation hold with 'ancestry' evidence after the
@@ -5056,7 +5062,8 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 
 // PublishResult is the outcome of a checkpoint publish (PRD #122 M8). Published is
 // true only when the push landed. Skipped names the benign reason a publish did NOT
-// advance the ref ("no_ref" | "not_descendant" | "unsupported" | "workflow_scope"); it
+// advance the ref ("no_ref" | "not_descendant" | "unsupported" | "workflow_scope" |
+// "superseded"); it
 // is empty on a successful publish. Either way Ref is the checkpoint ref the worker
 // asked about.
 type PublishResult struct {
@@ -5144,6 +5151,19 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		return PublishResult{}, fmt.Errorf("publish: bot PAT could not be decrypted")
 	}
 
+	// PRD #1810: a worker still bound to a TERMINAL run may publish (a shutdown checkpoint of a
+	// just-cancelled run may be its latest work), but not once the run's branch slot was handed to
+	// a newer run: the publish is refused before any forge call (terminalPublishSuperseded).
+	if terminalStatuses[owned.Status] {
+		superseded, serr := s.terminalPublishSuperseded(ctx, runID)
+		if serr != nil {
+			return PublishResult{}, serr
+		}
+		if superseded {
+			return PublishResult{Published: false, Ref: ref, Skipped: "superseded"}, nil
+		}
+	}
+
 	// 6. Hand the mechanical push to the go-git broker (stubbable seam). Map its
 	// benign sentinels to skips; anything else is a best-effort 5xx.
 	// The broker's Result.Ref equals the ref computed above; the service returns its
@@ -5182,16 +5202,9 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		}); perr != nil {
 			slog.Warn("checkpoint: persist tip", "run", runID, "tip", tipOid, "error", perr)
 		}
-		// Tip lag (PRD #1810): a record of THIS run still naming the branch ref (retained or
-		// settling) follows the ref to the tip just published, so its later CAS delete or
-		// supersession binds to what origin holds. Best-effort like the persist above.
-		if s.retentionWired() {
-			if _, aerr := s.q.AdvanceCheckpointRetentionTip(ctx, store.AdvanceCheckpointRetentionTipParams{
-				RunID: runID, Ref: ref, Tip: tipOid,
-			}); aerr != nil {
-				slog.Warn("checkpoint retention: advance tip", "run", runID, "tip", tipOid, "error", aerr)
-			}
-		}
+		// PRD #1810: the run's retention record follows the ref to the tip just published
+		// (trackPublishedCheckpoint). Best-effort like the persist above.
+		s.trackPublishedCheckpoint(ctx, runID, branch, ref, tipOid)
 		return PublishResult{Published: true, Ref: ref}, nil
 	case errors.Is(err, pushbroker.ErrNotDescendant):
 		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, nil

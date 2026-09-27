@@ -31,9 +31,10 @@ const reconcileRetentionBatch = 10
 // Notes persisted on a record's last_error by the M4 arms (never carry forge output).
 const (
 	retentionGoneNote     = "run, repository or forge connection no longer exists"
-	stuckExitNote         = "supersession stopped and no custody hold is open; the run's refs at the recorded tip were deleted"
+	stuckExitNote         = "supersession stopped and no custody hold is open; the run's own refs on origin were deleted"
 	auditOtherTipNote     = "recovery ref found at another tip during the post-settlement audit; left in place"
 	auditUnverifiableNote = "post-settlement audit could not run: " + retentionGoneNote
+	auditReopenedNote     = "recovery ref found at the recorded tip while custody is open; reopened as superseded"
 )
 
 // ReconcileCheckpointRetentions is the sweeper's checkpoint-retention pass (PRD #1810 M3/M4).
@@ -53,24 +54,17 @@ func (s *Service) ReconcileCheckpointRetentions(ctx context.Context) (int64, err
 //     re-driven, or, when its supersession stopped (last_error set) and no hold is open, exited;
 //  3. unheld: a `retained`/`superseded` record whose run has no open hold moves to settling and
 //     its ref is CAS-deleted;
-//  4. audit: a deleted record that named a recovery ref is re-verified once verify_after passed.
+//  4. audit: a deleted record that named a recovery ref is re-verified once verify_after passed
+//     (a recovery ref found at the recorded tip while custody is open reopens the record instead
+//     of being deleted).
 func (s *Service) reconcileCheckpointRetentions(ctx context.Context, onlyRun pgtype.UUID) (int64, error) {
 	if !s.supersessionWired() {
 		return 0, nil
 	}
-	var progressed int64
-
-	backfill, err := s.q.ListCheckpointRetentionBackfill(ctx, store.ListCheckpointRetentionBackfillParams{
-		OnlyRunID: onlyRun, MaxRows: reconcileRetentionBatch,
-	})
+	// Only an unconfined pass saw every candidate, so only it may advance the global watermark.
+	progressed, err := s.backfillCheckpointRetentions(ctx, onlyRun, !onlyRun.Valid)
 	if err != nil {
-		return 0, fmt.Errorf("list checkpoint retention backfill: %w", err)
-	}
-	for _, r := range backfill {
-		if inserted, _ := s.recordCheckpointRetention(ctx, r.ID, r.Kind, r.IssueIid); inserted {
-			slog.Info("sweeper: checkpoint retention backfilled", "run", r.ID)
-			progressed++
-		}
+		return 0, err
 	}
 
 	work, err := s.q.ListCheckpointRetentionWork(ctx, store.ListCheckpointRetentionWorkParams{
@@ -135,6 +129,67 @@ func (s *Service) reconcileCheckpointRetentions(ctx context.Context, onlyRun pgt
 	return progressed, nil
 }
 
+// backfillCheckpointRetentions is the pass's backfill arm: it records every listed terminal run
+// that has no record (recordCheckpointRetention) and, when advance is set, moves the persisted
+// watermark (checkpoint_retention_meta.backfilled_through) to what the page proved
+// (backfillWatermark). The list starts 10 minutes below the watermark, so a run whose transaction
+// committed after a pass moved the watermark past its status_since is still listed.
+func (s *Service) backfillCheckpointRetentions(ctx context.Context, onlyRun pgtype.UUID, advance bool) (int64, error) {
+	page, err := s.q.ListCheckpointRetentionBackfill(ctx, store.ListCheckpointRetentionBackfillParams{
+		OnlyRunID: onlyRun, MaxRows: reconcileRetentionBatch,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("list checkpoint retention backfill: %w", err)
+	}
+	var progressed int64
+	recorded := make([]bool, len(page))
+	for i, r := range page {
+		inserted, _ := s.recordCheckpointRetention(ctx, r.ID, r.Kind, r.IssueIid)
+		if inserted {
+			slog.Info("sweeper: checkpoint retention backfilled", "run", r.ID)
+			progressed++
+			recorded[i] = true
+			continue
+		}
+		// Not inserted now: recorded only if a record exists (a racing terminal writer wrote it).
+		// A failed insert, or a hold that appeared between the two inserts, leaves no record, and
+		// the watermark must not pass the run.
+		_, gerr := s.q.GetCheckpointRetention(ctx, r.ID)
+		recorded[i] = gerr == nil
+	}
+	if !advance {
+		return progressed, nil
+	}
+	through := backfillWatermark(page, recorded, len(page) >= reconcileRetentionBatch)
+	if _, err := s.q.AdvanceCheckpointRetentionBackfillWatermark(ctx, through); err != nil {
+		// Not fatal: the watermark only bounds the scan; the next pass re-lists from the old one.
+		slog.Warn("sweeper: checkpoint retention backfill watermark", "error", err)
+	}
+	return progressed, nil
+}
+
+// backfillWatermark is the watermark a backfill page proves: every candidate whose status_since is
+// below the returned instant has a record. An invalid (NULL) result means "up to now": the page was
+// not full, so it held every candidate, and each was recorded. A full page proves only up to its
+// last row's status_since (later candidates, and ties with it, were not listed); a run left
+// unrecorded caps it at that run's status_since, so a failing run is re-listed every pass and is
+// never skipped. The page is ordered by status_since.
+func backfillWatermark(page []store.ListCheckpointRetentionBackfillRow, recorded []bool, full bool) pgtype.Timestamptz {
+	var through pgtype.Timestamptz
+	if full && len(page) > 0 {
+		through = page[len(page)-1].StatusSince
+	}
+	for i, r := range page {
+		if !recorded[i] {
+			if !through.Valid || r.StatusSince.Time.Before(through.Time) {
+				through = r.StatusSince
+			}
+			break // ordered: the first unrecorded run is the earliest
+		}
+	}
+	return through
+}
+
 // lockedRetentionStep runs one locked step for runID under its retention lock (try semantics),
 // recovering a panic from the go-git seams into err. done is meaningful only when acquired.
 func (s *Service) lockedRetentionStep(ctx context.Context, runID uuid.UUID,
@@ -186,12 +241,18 @@ func (s *Service) reconcileSuperseding(ctx context.Context, runID uuid.UUID) (do
 // exitStuckSupersessionLocked settles a stopped `superseding` record whose run has no open hold
 // (PRD #1810 M4): under the run's lock it lists both refs once, then, each behind the fence,
 // CAS-deletes the recovery ref if origin holds it at the recorded tip (only then is it ours) and
-// the branch ref if origin holds it at the recorded tip, and closes the record as deleted (with a
-// verify_after, since it names a recovery ref). A ref at any other tip is left alone.
+// the branch ref if origin holds it at a tip provably this run's own publish, and closes the
+// record as deleted (with a verify_after, since it names a recovery ref).
 //
-// Residual, by design: in the tip-lag case the branch ref sits at a LATER tip of the same run
-// that no record binds to; it stays on origin until a human or a later run on the branch clears
-// it. The Warn names the branch so an operator can.
+// The branch ref is this run's at the recorded tip, and also at runs.checkpoint_tip of THIS run:
+// the server-persisted latest tip the run itself published (the tip-lag case, where the record's
+// tip lags a later publish of the same run). A branch ref at any other tip, and a recovery ref at
+// any tip but the recorded one, is left alone.
+//
+// Residual, by design: a branch ref at a tip that is neither (another writer's, or a publish of
+// this run whose tip persist failed) stays on origin, untracked. It blocks a new run's checkpoint
+// on the branch (that run's publishes keep getting the not_descendant skip) until a human deletes
+// it; nothing in uzi clears it later. The Warn names the branch and both tips so an operator can.
 func (s *Service) exitStuckSupersessionLocked(ctx context.Context, row store.CheckpointRetention, fence func(context.Context) error) (bool, error) {
 	runID := row.RunID
 	branchRef := checkpointRefPrefix + row.Branch
@@ -211,6 +272,10 @@ func (s *Service) exitStuckSupersessionLocked(ctx context.Context, row store.Che
 	if problem != "" {
 		return false, s.recordRetentionFailure(ctx, row, retentionSuperseding, problem)
 	}
+	runTip, err := s.q.GetRunCheckpointTipForRetention(ctx, runID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return false, fmt.Errorf("read run checkpoint tip: %w", err)
+	}
 	tips, lerr := s.listRefTipsFn(ctx, pushbroker.ListRefsOptions{CloneURL: f.cloneURL, Username: f.username, PAT: f.pat}, branchRef, recoveryRef)
 	if lerr != nil {
 		return false, s.recordRetentionFailure(ctx, row, retentionSuperseding, "list refs: "+scrubForgeError(lerr.Error(), f.pat))
@@ -221,16 +286,18 @@ func (s *Service) exitStuckSupersessionLocked(ctx context.Context, row store.Che
 		if !ok {
 			continue
 		}
-		if tip != row.Tip {
-			slog.Warn("checkpoint retention: stuck supersession exit leaves a ref at another tip", "run", runID,
-				"branch", row.Branch, "ref", step.ref, "recorded_tip", row.Tip, "origin_tip", tip)
+		ours := tip == row.Tip || (step.ref == branchRef && runTip.Valid && tip == runTip.String)
+		if !ours {
+			slog.Warn("checkpoint retention: stuck supersession exit leaves a ref at a tip that is not this run's; "+
+				"a human must delete it (a new run's checkpoint on the branch stays skipped until then)", "run", runID,
+				"branch", row.Branch, "ref", step.ref, "recorded_tip", row.Tip, "run_tip", runTip.String, "origin_tip", tip)
 			continue
 		}
 		if err := s.beforeRetentionWrite(ctx, runID, step.op, fence); err != nil {
 			return false, err
 		}
 		if derr := s.deleteCheckpointFn(ctx, pushbroker.DeleteOptions{
-			CloneURL: f.cloneURL, Branch: row.Branch, Ref: step.ref, Username: f.username, PAT: f.pat, ExpectedOldTip: row.Tip,
+			CloneURL: f.cloneURL, Branch: row.Branch, Ref: step.ref, Username: f.username, PAT: f.pat, ExpectedOldTip: tip,
 		}); derr != nil {
 			return false, s.recordRetentionFailure(ctx, row, retentionSuperseding,
 				"delete "+step.ref+": "+scrubForgeError(derr.Error(), f.pat))
@@ -250,10 +317,16 @@ func (s *Service) exitStuckSupersessionLocked(ctx context.Context, row store.Che
 // auditRecoveryRefLocked is the post-settlement audit of one deleted record that named a
 // recovery ref (PRD #1810 M4). It closes the residual window the fence cannot: an attempt that
 // passed its fence, lost its session, and whose recovery-ref create landed on origin AFTER another
-// instance settled the record. Under the run's lock it lists the recovery ref once:
+// instance closed the record. Under the run's lock it lists the recovery ref once:
 //
 //   - absent: verified;
-//   - at the recorded tip: the stray is ours; behind the fence, CAS-delete it, then verified;
+//   - at the recorded tip while the run STILL has an open custody hold: the ref is the only copy
+//     of the tip custody protects (the record may have closed as tip-gone with the hold open), so
+//     it is never deleted here. The record is REOPENED as superseded naming it
+//     (ReopenCheckpointRetentionSupersededIfHeld, the open-hold predicate in the same statement),
+//     and ordinary settlement deletes it once the last hold settles;
+//   - at the recorded tip with no open hold: the stray is ours; behind the fence, CAS-delete it,
+//     then verified;
 //   - at another tip: not ours to delete; left in place, logged, verified with a note;
 //   - a forge or connection failure: the verification is deferred with backoff (verified_at
 //     stays NULL).
@@ -289,6 +362,19 @@ func (s *Service) auditRecoveryRefLocked(ctx context.Context, runID uuid.UUID, f
 			"ref", recoveryRef, "recorded_tip", row.Tip, "origin_tip", tip)
 		return s.markRetentionVerified(ctx, runID, auditOtherTipNote)
 	}
+	reopened, err := s.q.ReopenCheckpointRetentionSupersededIfHeld(ctx, store.ReopenCheckpointRetentionSupersededIfHeldParams{
+		RunID: runID, RecoveryRef: recoveryRef, Tip: row.Tip, LastError: auditReopenedNote,
+	})
+	if err != nil {
+		return false, fmt.Errorf("reopen held record: %w", err)
+	}
+	if reopened > 0 {
+		slog.Warn("checkpoint retention: audit found the recovery ref at the recorded tip while custody is open; record reopened as superseded",
+			"run", runID, "ref", recoveryRef, "tip", row.Tip)
+		return true, nil
+	}
+	// Zero rows: no hold of the run is open (the record's own guards held under this lock, and no
+	// writer outside the lock touches a record that names a recovery ref).
 	if err := s.beforeRetentionWrite(ctx, runID, "audit-delete", fence); err != nil {
 		return false, err
 	}
