@@ -1751,8 +1751,20 @@ export class Outbox {
     }
   }
 
-  /** PRD #1809 D6: `{cause: "data_volume_full"}` when the classifier attributes `err` to a full
-   *  data volume, else nothing. Never throws. */
+  /**
+   * PRD #1809 D6: `{cause: "data_volume_full"}` when the classifier attributes `err` to a full
+   * data volume, else nothing. Never throws.
+   *
+   * Why a reserve write that fails on a full volume only tags the log and never parks the run: no
+   * run-state transition depends on the outbox being writable. Park and other non-terminal state
+   * reports are sent straight to the claim-fenced `POST /runs/{id}/state` (WorkerClient.reportState,
+   * stamped with claim_generation), never through the outbox. A terminal report is journaled here
+   * write-ahead, but when even the released reserve cannot admit the journal it is sent unjournaled
+   * over that same claim-fenced call ({@link journalTerminal}'s `reserve_exhausted`), and the
+   * message spill's drop path writes its range record from the same reserve
+   * ({@link appendRangeRecord}). So a full outbox volume costs durability across a restart, not a
+   * run-state report, and the park belongs to the data-volume handling around the clone/fetch.
+   */
   private async diskFullCause(err: unknown): Promise<{ cause?: "data_volume_full" }> {
     if (!this.classifyWriteFailure) return {};
     try {

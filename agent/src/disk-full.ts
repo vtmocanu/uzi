@@ -15,6 +15,16 @@
 //       nearest existing ancestor, which is the directory the write was going into;
 //   (c) a statfs of that volume shows bytes available below a floor, or free inodes below a floor.
 //
+// When (c) is sampled matters. A failed cold `git clone` removes its partial bare before it
+// returns, so a statfs taken AFTER the failure can show the room the clone freed rather than the
+// state the failing write met: the post-failure sample alone gives false negatives (a real
+// disk-full read as "not_disk_full", which keeps today's handling: the safe direction, never a
+// wrongful park). To narrow that window the caller can take a sample BEFORE the operation
+// ({@link DataVolumeGuard.sample}) and pass it to {@link DataVolumeGuard.classify}, which then
+// judges the lower free bytes and free inodes of the two samples. A write that fills the volume
+// from a roomy start and is cleaned up again can still read as not full; that residual gap stays
+// on the safe side.
+//
 // A statfs failure, or a filesystem that keeps no inode accounting (`files` 0), is "unknown":
 // the caller keeps today's handling. No signal, another mount, or a volume with room is
 // "not_disk_full". Only the full verdict changes behaviour (the runner then runs the D7 reclaim,
@@ -119,8 +129,20 @@ export class DataVolumeGuard {
     return this.opts.dataDir;
   }
 
-  /** Classify a failed write whose destination is `destination`. See the module header. */
-  async classify(err: unknown, destination: string): Promise<DiskFullVerdict> {
+  /**
+   * The data volume's current sample, taken before an operation so {@link classify} can judge the
+   * state the operation met (see the module header). Undefined when statfs fails.
+   */
+  sample(): VolumeSample | undefined {
+    return sampleVolume(this.opts.dataDir, this.statfs);
+  }
+
+  /**
+   * Classify a failed write whose destination is `destination`. See the module header. `before`
+   * is an optional sample taken before the write; the verdict then uses the lower free bytes and
+   * free inodes of it and the sample taken now. A current statfs failure stays "unknown".
+   */
+  async classify(err: unknown, destination: string, before?: VolumeSample): Promise<DiskFullVerdict> {
     if (!hasDiskFullSignal(err)) return "not_disk_full";
     let dataDev: number;
     try {
@@ -131,7 +153,7 @@ export class DataVolumeGuard {
     const destDev = await this.nearestDev(destination);
     if (destDev === undefined) return "unknown";
     if (destDev !== dataDev) return "not_disk_full";
-    return this.volumeVerdict();
+    return this.volumeVerdict(before);
   }
 
   /**
@@ -152,9 +174,16 @@ export class DataVolumeGuard {
     }
   }
 
-  private volumeVerdict(): DiskFullVerdict {
-    const sample = sampleVolume(this.opts.dataDir, this.statfs);
-    if (!sample) return "unknown";
+  private volumeVerdict(before?: VolumeSample): DiskFullVerdict {
+    const now = sampleVolume(this.opts.dataDir, this.statfs);
+    if (!now) return "unknown";
+    const sample: VolumeSample = before
+      ? {
+          ...now,
+          bytesAvailable: Math.min(now.bytesAvailable, before.bytesAvailable),
+          inodesFree: Math.min(now.inodesFree, before.inodesFree),
+        }
+      : now;
     const below = volumeBelowFloor(sample);
     if (below === undefined) return "unknown";
     return below ? "data_volume_full" : "not_disk_full";

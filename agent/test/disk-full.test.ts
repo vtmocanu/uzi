@@ -129,6 +129,36 @@ describe("DataVolumeGuard.classify (PRD #1809 D6)", () => {
   );
 
   it(
+    "N1: with a pre-op sample, judges the lower free bytes and inodes of the two samples",
+    withDataDir(async (dataDir) => {
+      const dest = path.join(dataDir, "repos", "x.git");
+      // git removed the failed clone's partial bare: the volume is roomy again by the time the
+      // failure is classified, but the pre-op sample saw it full.
+      let n = 0;
+      const guard = new DataVolumeGuard({ dataDir, statfs: () => (n++ === 0 ? FULL : ROOMY) });
+      const before = guard.sample();
+      assert.ok(before);
+      assert.equal(await guard.classify(enospc(), dest, before), "data_volume_full");
+      // Inodes: bytes roomy in both samples, inodes exhausted only before the write.
+      let m = 0;
+      const inodes = new DataVolumeGuard({ dataDir, statfs: () => (m++ === 0 ? volume(10 * GIB, { ffree: 3 }) : ROOMY) });
+      assert.equal(await inodes.classify(enospc(), dest, inodes.sample()), "data_volume_full");
+      // Roomy before and after: not full. A current statfs failure stays unknown.
+      const roomy = new DataVolumeGuard({ dataDir, statfs: () => ROOMY });
+      assert.equal(await roomy.classify(enospc(), dest, roomy.sample()), "not_disk_full");
+      let k = 0;
+      const failsNow = new DataVolumeGuard({
+        dataDir,
+        statfs: () => {
+          if (k++ === 0) return FULL;
+          throw new Error("EIO");
+        },
+      });
+      assert.equal(await failsNow.classify(enospc(), dest, failsNow.sample()), "unknown");
+    }),
+  );
+
+  it(
     "attributes a destination that does not exist yet through its nearest existing ancestor",
     withDataDir(async (dataDir) => {
       const guard = new DataVolumeGuard({ dataDir, statfs: () => FULL });
