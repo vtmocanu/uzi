@@ -75,6 +75,7 @@ import {
 } from "./terminal-resolve.js";
 import { rmHomeTree } from "./rmtree.js";
 import { dropRunCaches } from "./run-caches.js";
+import type { RunDiskLocks } from "./run-disk-locks.js";
 import {
   SteeringChannel,
   PauseNowSignal,
@@ -1195,6 +1196,11 @@ export interface RunnerOptions {
    *  on terminal / requeue. The worker reads the registry to build the ActiveSnapshot.
    *  Undefined ⇒ no tracking (tests that never negotiate the feature). */
   activeRuns?: ActiveRunRegistry;
+  /** PRD #1809 D7 — the per-run lock shared with the disk reclaim. Each execution waits on it
+   *  before it builds the run's executor (and so before it touches the run's HOME), so a
+   *  resume never starts while the reclaim is deleting that run's files. Undefined ⇒ no
+   *  reclaim runs in this process (tests). */
+  diskLocks?: RunDiskLocks;
   /** PRD #1391 Run B M4 — the wall-clock budget for the queued-duplicate ownership-probe retry: a
    *  TRANSIENT probe failure retries with backoff up to this bound (the api's claim grace minus a
    *  margin), a held/queued row is re-probed until it, then the attempt ends without executing.
@@ -1259,6 +1265,8 @@ export class RunRunner {
    *  Named distinctly from the `activeRuns` shutdown Map below — that tracks abortable
    *  controllers, this tracks the snapshot phase. */
   private readonly snapshotRegistry: ActiveRunRegistry | undefined;
+  /** PRD #1809 D7 — see RunnerOptions.diskLocks. */
+  private readonly diskLocks: RunDiskLocks | undefined;
   private readonly detect: (
     worktreePath: string,
   ) => Promise<DetectedRepoAgents>;
@@ -1412,6 +1420,7 @@ export class RunRunner {
         : 20_000;
     // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
     this.snapshotRegistry = opts.activeRuns;
+    this.diskLocks = opts.diskLocks;
     this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
     this.checkpointTickIntervalMs = opts.checkpointTickIntervalMs ?? 5 * 60_000;
     this.checkpointTestHooks = opts.checkpointTestHooks;
@@ -1476,6 +1485,17 @@ export class RunRunner {
     });
   }
 
+  /**
+   * PRD #1809 D7: whether this runner is executing `runId` right now, from the moment
+   * {@link execute} is entered (before its executor or HOME exists) until its last cleanup
+   * settles. A run parked at a gate stays executing (its execute promise is live); a run
+   * whose park returned from execute does not. The disk reclaim never touches a run for
+   * which this is true.
+   */
+  isExecuting(runId: string): boolean {
+    return this.executionTails.has(runId);
+  }
+
   async execute(claim: ClaimResponse): Promise<void> {
     const runId = claim.run_id;
     // Defense in depth (PRD #42): runId becomes a path segment in the per-run HOME
@@ -1494,6 +1514,12 @@ export class RunRunner {
     // the second even while the second is waiting for the first's cleanup.
     this.executionTails.set(runId, tail);
     try {
+      // PRD #1809 D7: wait out an in-progress disk reclaim of THIS run before anything builds
+      // its executor or touches its HOME. Holding the lock only this long is enough: the
+      // executionTails entry installed above already makes every later reclaim see the run as
+      // executing (isExecuting) and skip it, so the only deletion that can overlap this
+      // execution is one that checked before that entry existed, and that one holds the lock.
+      if (this.diskLocks) (await this.diskLocks.acquire(runId))();
       if (previous) {
         await previous;
         // PRD #1391 Run B M4 — the generation-aware queued-duplicate router. A SECOND (or later) claim

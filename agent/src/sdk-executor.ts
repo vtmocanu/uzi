@@ -35,7 +35,7 @@ import { buildCheckEnv, buildSdkEnv } from "./sdk-env.js";
 import { makeProgressObserver } from "./milestone-progress-observer.js";
 import type { DockerWiring } from "./docker-wiring.js";
 import { provisionTools } from "./provision.js";
-import { provisionRunTools } from "./provision-run.js";
+import { provisionRunTools, removeProvisionDir } from "./provision-run.js";
 import {
   installJsDeps,
   DETAIL_NO_LOCKFILE,
@@ -876,11 +876,8 @@ export class SdkExecutor implements Executor {
       this.killAgentTree();
       // Remove the per-run provisioning dir (the synthesized devbox.json + profile
       // symlinks). The nix STORE is global (on the data volume), NOT here, so this
-      // never evicts the warm-start cache. Best-effort.
-      if (drive.provisionDir)
-        await fs
-          .rm(drive.provisionDir, { recursive: true, force: true })
-          .catch(() => undefined);
+      // never evicts the warm-start cache. Best-effort, uid-aware (PRD #1809 M3).
+      if (drive.provisionDir) await removeProvisionDir(drive.provisionDir, this.log);
     }
   }
 

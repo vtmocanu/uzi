@@ -61,6 +61,27 @@ export interface Config {
    */
   homeReclaimEnabled: boolean;
   /**
+   * PRD #1809 D5/D7: the running disk reclaim and the admission stop (UZI_DISK_RECLAIM,
+   * default on; `0`/`false`/`no`/`off` disables both). When on, the worker runs the
+   * non-destructive reclaim pass every {@link diskReclaimIntervalMs} and whenever its data
+   * volume reaches the soft threshold, and claims no new run while it stays there.
+   */
+  diskReclaimEnabled: boolean;
+  /** PRD #1809 D7: the periodic reclaim cadence (UZI_DISK_RECLAIM_INTERVAL, default 10m). */
+  diskReclaimIntervalMs: number;
+  /**
+   * PRD #1809 D5: the soft threshold's distance below the api's recycle threshold
+   * (UZI_DISK_SOFT_MARGIN, default 0.10, so 0.80 against the default 0.90). A fraction in
+   * [0, 1); anything else falls back to the default.
+   */
+  diskSoftMargin: number;
+  /**
+   * PRD #1809 D4: the hard mid-turn stop's distance below the recycle threshold
+   * (UZI_DISK_HARD_MARGIN, default 0.03). Parsed here with its sibling; read by the D4
+   * pressure stop.
+   */
+  diskHardMargin: number;
+  /**
    * The UZI_WORKER_TOKEN_FILE path, if the join token was delivered by file. The
    * shipping compose default is a read-only secret mount the entrypoint forces to
    * 0400 worker-owned, so it persists (the post-read unlink no-ops) and the cap-less
@@ -306,6 +327,15 @@ function positiveInt(env: NodeJS.ProcessEnv, key: string, fallback: number): num
   return Number.isInteger(n) && n > 0 ? n : fallback;
 }
 
+/** Parse a margin fraction in [0, 1) (e.g. UZI_DISK_SOFT_MARGIN); blank or anything
+ *  outside the range falls back, matching positiveInt's lenient shape. */
+function marginFraction(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
+  const raw = env[key]?.trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 && n < 1 ? n : fallback;
+}
+
 function isLogLevel(v: string): v is LogLevel {
   return v === "debug" || v === "info" || v === "warn" || v === "error";
 }
@@ -416,6 +446,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // defaults to `""`. Set-but-empty means "the deployment mentions this var and
     // expressed no opinion", which is the default, not the opposite of it.
     homeReclaimEnabled: parseBoolDefaultTrue(env.UZI_HOME_RECLAIM),
+    // PRD #1809 D5/D7: default ON, with the same empty-means-default rule as above.
+    diskReclaimEnabled: parseBoolDefaultTrue(env.UZI_DISK_RECLAIM),
+    diskReclaimIntervalMs: duration(env, "UZI_DISK_RECLAIM_INTERVAL", "10m"),
+    diskSoftMargin: marginFraction(env, "UZI_DISK_SOFT_MARGIN", 0.1),
+    diskHardMargin: marginFraction(env, "UZI_DISK_HARD_MARGIN", 0.03),
     workerTokenFile: env.UZI_WORKER_TOKEN_FILE?.trim() || undefined,
     heartbeatIntervalMs: duration(env, "WORKER_HEARTBEAT_INTERVAL", "15s"),
     pollIntervalMs: duration(env, "WORKER_POLL_INTERVAL", "3s"),

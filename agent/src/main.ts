@@ -19,7 +19,9 @@ import { ReviewRunner } from "./review-runner.js";
 import { stubJudgeQueryFn } from "./judge-runner-stub.js";
 import { Worker } from "./worker.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
-import { reclaimStrandedRunHomes } from "./home-reclaim.js";
+import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js";
+import { DiskPressureController, runDiskReclaimPass } from "./disk-reclaim.js";
+import { RunDiskLocks } from "./run-disk-locks.js";
 import { errMessage } from "./util.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { resolveDockerWiring, dockerSidecarExpected, type DockerWiring } from "./docker-wiring.js";
@@ -451,6 +453,8 @@ async function main(): Promise<void> {
       codexCommandSandbox: config.codexCommandSandbox,
       codexSandboxDegraded: config.codexHarness.degraded,
     });
+  // PRD #1809 D7: the per-run lock the runner and the disk reclaim share (run-disk-locks.ts).
+  const diskLocks = new RunDiskLocks();
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
     pollMs: config.pollIntervalMs,
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
@@ -467,6 +471,7 @@ async function main(): Promise<void> {
     gapFillMax: config.gapFillMax,
     // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
     activeRuns,
+    diskLocks,
   });
 
   // The chat lane (PRD #39). Per-session executor factory (PRD #42 Decision 4): each
@@ -588,6 +593,38 @@ async function main(): Promise<void> {
     log,
   });
   if (dindPrune) log.info("dind prune enabled", { docker_host_wired: true });
+  // A run's api status for both HOME reclaims. A 404 is the API ANSWERING not-found (the
+  // run's row is gone, which is exactly what the oldest stranded HOMEs look like): return
+  // undefined so a sweep SKIPS without counting it toward the outage bail; every other error
+  // (down / 5xx / timeout) propagates as a genuine could-not-ask that DOES count (PRD #108
+  // B2/B3, home-reclaim.ts RunStatusLookup contract).
+  const runStatusOf: RunStatusLookup = async (runId) => {
+    try {
+      return (await client.getChatRun(runId)).status;
+    } catch (err) {
+      if (err instanceof RequestError && err.status === 404) return undefined;
+      throw err;
+    }
+  };
+  // PRD #1809 D5/D7: the running disk reclaim and the admission stop, both off with
+  // UZI_DISK_RECLAIM=0. The startup sweep below is separate and stays.
+  const diskPressure = config.diskReclaimEnabled
+    ? new DiskPressureController({
+        softMargin: config.diskSoftMargin,
+        thresholdOf: () => client.diskPressureThreshold,
+        intervalMs: config.diskReclaimIntervalMs,
+        log,
+        reclaim: () =>
+          runDiskReclaimPass({
+            homeRoot: sdkHomeRoot,
+            provisionRoot: path.join(config.dataDir, "provision"),
+            statusOf: runStatusOf,
+            isRunLive: (runId) => runner.isExecuting(runId),
+            locks: diskLocks,
+            log,
+          }),
+      })
+    : undefined;
   worker = new Worker(
     config,
     client,
@@ -602,6 +639,7 @@ async function main(): Promise<void> {
     activeRuns,
     undefined,
     dindPrune,
+    diskPressure,
   );
 
   // Signal handlers FIRST, before anything that can take real time. Until these
@@ -643,19 +681,7 @@ async function main(): Promise<void> {
   if (config.homeReclaimEnabled) {
     await reclaimStrandedRunHomes(
       sdkHomeRoot,
-      async (runId) => {
-        try {
-          return (await client.getChatRun(runId)).status;
-        } catch (err) {
-          // A 404 is the API ANSWERING not-found — the run's row is gone, which is
-          // exactly what the oldest stranded HOMEs look like. Return undefined so the
-          // sweep SKIPS without counting it toward the outage bail; let every other
-          // error (down / 5xx / timeout) propagate as a genuine could-not-ask that
-          // DOES count (PRD #108 B2/B3, home-reclaim.ts RunStatusLookup contract).
-          if (err instanceof RequestError && err.status === 404) return undefined;
-          throw err;
-        }
-      },
+      runStatusOf,
       log,
     ).catch((err) => log.warn("run HOME reclaim failed", { error: errMessage(err) }));
   }

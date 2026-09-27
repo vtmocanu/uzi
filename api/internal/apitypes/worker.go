@@ -63,6 +63,13 @@ type WorkerDTO struct {
 	// owner surface flags it as "retaining unpublished work" rather than idle. Always
 	// false once custody is released or discarded.
 	RetainingUnpublishedWork bool `json:"retaining_unpublished_work"`
+	// DiskPressureThreshold is the api's configured UZI_DISK_PRESSURE_THRESHOLD, the
+	// used/total fraction in (0,1] at/above which a volume counts as under disk pressure
+	// (PRD #1809 D5): the worker derives its soft reclaim/admission and hard stop
+	// thresholds from this. Set ONLY on the heartbeat response; every other WorkerDTO
+	// producer leaves it nil, so the admin/list JSON omits it. Absent from an older api
+	// (or a threshold outside (0,1]) → the worker assumes 0.90.
+	DiskPressureThreshold *float64 `json:"disk_pressure_threshold,omitempty"`
 	// Worker template (PRD #18): the UI-declared choice and the worker's
 	// self-reported value. Either may be null (no choice / older image); the UI
 	// badges drift when both are set and differ.

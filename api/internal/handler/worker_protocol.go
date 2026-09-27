@@ -510,6 +510,14 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		retaining = true
 	}
 	dto.RetainingUnpublishedWork = retaining
+	// Disk-pressure threshold (PRD #1809 D5): hand the worker the SAME threshold the
+	// service applies to its self-reported volumes, so the worker's soft reclaim/admission
+	// and hard stop thresholds track the api's disk_pressure signal. Only a value in (0,1]
+	// is sent; anything else (e.g. an unset Params in a struct-literal service) is omitted,
+	// and the worker then falls back to its 0.90 default.
+	if t := h.wsvc.DiskPressureThreshold(); t > 0 && t <= 1 {
+		dto.DiskPressureThreshold = &t
+	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"worker": dto})
 }
 

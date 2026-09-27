@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { StatsCollector, type StatfsSample, type StatsCollectorOptions } from "../src/stats.js";
+import { dataVolumeUsedFraction, StatsCollector, type StatfsSample, type StatsCollectorOptions } from "../src/stats.js";
 import { readDindMeterSample } from "../src/dind-meter.js";
 
 // Unit tests over fixture cgroup v2 trees (PRD #49 M1). Each test writes a throwaway
@@ -369,5 +369,20 @@ describe("StatsCollector — DinD data-root sample (issue #1759)", () => {
     fs.symlinkSync(real, link);
     const s = collectWith(link);
     for (const k of DIND_KEYS) assert.ok(!(k in s), `${k} absent for a symlink`);
+  });
+});
+
+// PRD #1809 D5: the data volume's used fraction the admission stop reads, from one sample.
+describe("dataVolumeUsedFraction (PRD #1809 D5)", () => {
+  it("is used / total from the data volume pair", () => {
+    const f = dataVolumeUsedFraction({ mem_bytes: 1, mem_limit_bytes: null, source: "process", disk_data_bytes: 80, disk_data_total_bytes: 100 });
+    assert.strictEqual(f, 0.8);
+  });
+
+  it("is unknown (undefined), never 0, without a usable pair", () => {
+    const base = { mem_bytes: 1, mem_limit_bytes: null, source: "process" as const };
+    assert.strictEqual(dataVolumeUsedFraction(undefined), undefined);
+    assert.strictEqual(dataVolumeUsedFraction(base), undefined, "statfs failed: the pair is omitted");
+    assert.strictEqual(dataVolumeUsedFraction({ ...base, disk_data_bytes: 0, disk_data_total_bytes: 0 }), undefined);
   });
 });

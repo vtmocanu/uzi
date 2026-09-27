@@ -288,6 +288,21 @@ export class StatsCollector {
   }
 }
 
+/**
+ * PRD #1809 D5: the data volume's used fraction from one {@link StatsCollector} sample
+ * (`disk_data_bytes / disk_data_total_bytes`, the same statfs reading the heartbeat
+ * reports), or undefined when the sample is missing, omitted the pair (a statfs failure)
+ * or reports a zero-size volume. Undefined is "unknown", never "empty": the admission
+ * stop fails open on it.
+ */
+export function dataVolumeUsedFraction(stats: WorkerStats | undefined): number | undefined {
+  const used = stats?.disk_data_bytes;
+  const total = stats?.disk_data_total_bytes;
+  if (used === undefined || total === undefined || !(total > 0)) return undefined;
+  const fraction = used / total;
+  return Number.isFinite(fraction) && fraction >= 0 ? Math.min(fraction, 1) : undefined;
+}
+
 /** Parse a non-negative integer that occupies the whole (trimmed) string. */
 function readNonNegInt(raw: string): number {
   const n = Number(raw.trim());

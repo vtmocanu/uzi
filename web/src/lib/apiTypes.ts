@@ -1874,6 +1874,10 @@ export interface Worker {
   // teardown is deferred. Distinct from busy/active_runs — it consumes no run slot.
   // Optional in TS (mocks/older payloads may omit it); the api always sends it.
   retaining_unpublished_work?: boolean;
+  // disk_pressure_threshold (PRD #1809 D5): the api's UZI_DISK_PRESSURE_THRESHOLD, set only
+  // on the worker's own heartbeat response (the worker derives its reclaim/admission and hard-stop
+  // thresholds from it); absent from every list/admin response.
+  disk_pressure_threshold?: number;
   // Worker template (PRD #18): the choice recorded at issuance and the value the
   // worker self-reports at register. Either may be null (no choice / older
   // image); a mismatch is surfaced as a drift badge, never a rejection.

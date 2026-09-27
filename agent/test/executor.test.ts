@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,7 +15,10 @@ import {
   STUB_STALL_SENTINEL,
   type EmittedMessage,
   type RunContext,
+  type StubExecutorOptions,
 } from "../src/executor.js";
+import type { ProvisionInput, ProvisionResult } from "../src/provision.js";
+import { restoreTreeWritability } from "../src/rmtree.js";
 import type { PlanVerdict } from "../src/steering.js";
 import { disableAutoMaintenance } from "./fixture-repo.js";
 import { nullLogger } from "./helpers.js";
@@ -441,5 +445,36 @@ describe("StubExecutor — PRD #35 Decision 6b pre-approved resume", () => {
       emitted.some((m) => m.kind === "text" && String(m.payload.text).includes("committed locally")),
       "the run still implements after skipping the gate",
     );
+  });
+});
+
+describe("StubExecutor — provision dir cleanup (PRD #1809 M3)", () => {
+  it("removes the run's provision dir after the run even with a read-only (0555) subtree", async (t) => {
+    if (process.getuid?.() === 0) {
+      t.skip("running as uid 0 — the 0555 part of this fixture is inert for root");
+      return;
+    }
+    const wt = makeWorktree();
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-stub-prov-"));
+    t.after(async () => {
+      wt.cleanup();
+      // Restore write access first so a leaked read-only tree (the failure) cannot fail cleanup.
+      await restoreTreeWritability(dataDir);
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    });
+    const runId = randomUUID();
+    const { ctx } = makeCtx({ runId, worktreePath: wt.path, config: { tool_packages: ["go@1.24"] } as RunContext["config"] });
+    const provision = (async (input: ProvisionInput): Promise<ProvisionResult> => {
+      // What a finished install leaves under the uid split: a read-only subtree with a file in it.
+      const ro = path.join(input.runDir, ".devbox", "nix", "profile");
+      fs.mkdirSync(ro, { recursive: true });
+      fs.writeFileSync(path.join(ro, "manifest.json"), "{}");
+      fs.chmodSync(ro, 0o555);
+      return { toolEnv: {} };
+    }) as unknown as StubExecutorOptions["provision"];
+
+    await new StubExecutor(nullLogger(), { homeDir: path.join(dataDir, "agent-home"), provision }).run(ctx);
+
+    assert.equal(fs.existsSync(path.join(dataDir, "provision", runId)), false, "the provision dir is removed");
   });
 });

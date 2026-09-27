@@ -2261,6 +2261,11 @@ func snapshotRunIDs(snap *ActiveSnapshot) []uuid.UUID {
 	return ids
 }
 
+// DiskPressureThreshold returns the configured UZI_DISK_PRESSURE_THRESHOLD (Params),
+// the same value Heartbeat applies via diskOverThreshold. The heartbeat handler echoes it
+// to the worker (PRD #1809 D5). Zero when Params left it unset.
+func (s *Service) DiskPressureThreshold() float64 { return s.p.DiskPressureThreshold }
+
 // RetainingUnpublishedWork reports whether wkr is the live holder of any OPEN
 // durable-recovery custody hold (issue #1759), owner-scoped to the worker row's own
 // user_id exactly like DeleteWorker's custody guard. The heartbeat surfaces it on the

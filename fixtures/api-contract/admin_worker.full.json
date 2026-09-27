@@ -20,6 +20,7 @@
     }
   ],
   "retaining_unpublished_work": true,
+  "disk_pressure_threshold": 1.5,
   "template_declared": "x",
   "template_reported": "x",
   "version": "x",

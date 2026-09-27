@@ -347,6 +347,20 @@ export class WorkerClient {
     return this.workerOutboxMaxPendingValue;
   }
 
+  /** PRD #1809 D5: the last valid `disk_pressure_threshold` a heartbeat response carried. */
+  private diskPressureThresholdValue: number | undefined;
+
+  /**
+   * PRD #1809 D5: the api's recycle threshold (`UZI_DISK_PRESSURE_THRESHOLD`) as the last
+   * heartbeat response that carried a valid one reported it: a finite fraction in (0, 1].
+   * Undefined until such a response arrives (an older api never sends it; the disk
+   * controller then assumes the api default). A later response with the field absent or
+   * garbled leaves the last good value in place.
+   */
+  get diskPressureThreshold(): number | undefined {
+    return this.diskPressureThresholdValue;
+  }
+
   /** The advertised features as an array (PRD #1392 D7): the runner reads this to pick a
    *  capability-aware degradation for a pre-clone forge-unreachable park. Backed by
    *  `serverFeatures` so the two views never diverge and a rollback clear empties both. The
@@ -501,12 +515,14 @@ export class WorkerClient {
   }
 
   /**
-   * POST one heartbeat and decode the custody flag from its response (issue #1759):
-   * `{"worker": {"retaining_unpublished_work": bool, ...}}`. Returns the flag only when
-   * the body decodes and the field is a boolean, else undefined, which the DinD prune
-   * treats as "may be retaining" (fail-closed). A non-2xx still throws exactly like
-   * postJSON, so the strict-decode fallback above is unchanged; an accepted heartbeat
-   * whose body does not parse is still a successful heartbeat.
+   * POST one heartbeat and decode its response (issue #1759, PRD #1809 D5):
+   * `{"worker": {"retaining_unpublished_work": bool, "disk_pressure_threshold": number, ...}}`.
+   * Returns the custody flag only when the body decodes and the field is a boolean, else
+   * undefined, which the DinD prune treats as "may be retaining" (fail-closed). The
+   * threshold is recorded on {@link diskPressureThreshold} only when it is a finite number in
+   * (0, 1]; anything else keeps the last good value. A non-2xx still throws exactly like
+   * postJSON, so the strict-decode fallback above is unchanged; an accepted heartbeat whose
+   * body does not parse is still a successful heartbeat.
    */
   private async postHeartbeat(body: HeartbeatRequest): Promise<boolean | undefined> {
     const path = `${WORKER_API_PREFIX}/heartbeat`;
@@ -522,6 +538,10 @@ export class WorkerClient {
     if (typeof decoded !== "object" || decoded === null) return undefined;
     const worker = (decoded as { worker?: unknown }).worker;
     if (typeof worker !== "object" || worker === null) return undefined;
+    const threshold = (worker as { disk_pressure_threshold?: unknown }).disk_pressure_threshold;
+    if (typeof threshold === "number" && Number.isFinite(threshold) && threshold > 0 && threshold <= 1) {
+      this.diskPressureThresholdValue = threshold;
+    }
     const retaining = (worker as { retaining_unpublished_work?: unknown }).retaining_unpublished_work;
     return typeof retaining === "boolean" ? retaining : undefined;
   }

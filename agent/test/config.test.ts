@@ -175,6 +175,38 @@ describe("loadConfig UZI_HOME_RECLAIM (PRD #108 M6)", () => {
   });
 });
 
+// PRD #1809 D5/D7: the running disk reclaim + admission stop knobs.
+describe("loadConfig disk reclaim knobs (PRD #1809 D5/D7)", () => {
+  it("defaults: on, every 10m, soft margin 0.10, hard margin 0.03", () => {
+    const c = loadConfig(baseEnv());
+    assert.strictEqual(c.diskReclaimEnabled, true);
+    assert.strictEqual(c.diskReclaimIntervalMs, 10 * 60_000);
+    assert.strictEqual(c.diskSoftMargin, 0.1);
+    assert.strictEqual(c.diskHardMargin, 0.03);
+  });
+
+  it("UZI_DISK_RECLAIM is default-on: empty stays on, an explicit falsy value turns it off", () => {
+    assert.strictEqual(loadConfig(baseEnv({ UZI_DISK_RECLAIM: "" })).diskReclaimEnabled, true);
+    for (const v of ["0", "false", "no", "off"]) {
+      assert.strictEqual(loadConfig(baseEnv({ UZI_DISK_RECLAIM: v })).diskReclaimEnabled, false, `value ${v}`);
+    }
+  });
+
+  it("parses the interval as a duration and the margins as fractions in [0, 1)", () => {
+    const c = loadConfig(baseEnv({ UZI_DISK_RECLAIM_INTERVAL: "90s", UZI_DISK_SOFT_MARGIN: "0.2", UZI_DISK_HARD_MARGIN: "0" }));
+    assert.strictEqual(c.diskReclaimIntervalMs, 90_000);
+    assert.strictEqual(c.diskSoftMargin, 0.2);
+    assert.strictEqual(c.diskHardMargin, 0);
+  });
+
+  it("falls back to the default margin on garbage or out-of-range values", () => {
+    for (const v of ["abc", "-0.1", "1", "1.5", "NaN", "Infinity"]) {
+      assert.strictEqual(loadConfig(baseEnv({ UZI_DISK_SOFT_MARGIN: v })).diskSoftMargin, 0.1, `value ${v}`);
+      assert.strictEqual(loadConfig(baseEnv({ UZI_DISK_HARD_MARGIN: v })).diskHardMargin, 0.03, `value ${v}`);
+    }
+  });
+});
+
 // PRD #1391 M1: the outbox knobs. These pin the VALUES (not just "parses to a
 // number"), so a wrong multiplier — a retention window that is hours not days, or a
 // MiB that is really 1000*1000 — fails here rather than shipping silently.

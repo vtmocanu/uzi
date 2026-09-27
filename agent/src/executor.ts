@@ -29,7 +29,7 @@ import { buildRepoInstructionsContext, type PriorWork } from "./prompt.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { readRepoInstructions } from "./repo-instructions.js";
 import { LimitReachedError } from "./limit.js";
-import { provisionRunTools } from "./provision-run.js";
+import { provisionRunTools, removeProvisionDir } from "./provision-run.js";
 import type { provisionTools } from "./provision.js";
 import { AGENT_GIT_IDENTITY, gitEnv } from "./git.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
@@ -1169,10 +1169,7 @@ export class StubExecutor implements Executor {
         log: this.log,
         provision: this.opts.provision,
       });
-      if (provisionDir)
-        await fs
-          .rm(provisionDir, { recursive: true, force: true })
-          .catch(() => undefined);
+      if (provisionDir) await removeProvisionDir(provisionDir, this.log);
     }
 
     const isCIFix = ctx.kind === "ci_fix";
