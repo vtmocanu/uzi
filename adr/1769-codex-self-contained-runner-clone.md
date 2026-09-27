@@ -248,6 +248,9 @@ noted for the base tree.
     ends on EOF/EPIPE by itself, and the flushStdio race did not reproduce;
     those contracts are pinned by stalled-process and deterministic
     red/green tests in `agent/test/git-import.test.ts` instead.
+    These three ran against fixture `f9e9c551`, which differs from
+    `74122b7c` only by the per-case bounds that `mut-stall` needed; every
+    other run above used `74122b7c`.
 - **What the acceptance runs also fixed in the fixture.** Before these runs
   the fixture exited 0 without reaching the shared-clone mode checks or any
   `RESULT` line (it awaited a reaped command root's promise that never
