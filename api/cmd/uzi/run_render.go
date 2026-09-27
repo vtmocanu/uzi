@@ -1613,7 +1613,7 @@ func vaultParkLine(r apitypes.RunDTO) string {
 	if !isVaultLockedPark(r) {
 		return ""
 	}
-	return vaultParkLead + " — the run owner's vault was locked when this Codex run needed its credential; once the vault is unlocked it resumes at " + vaultRetryClause(r)
+	return vaultParkLead + ": the run owner's vault was locked when this Codex run needed its credential; once the vault is unlocked it resumes at " + vaultRetryClause(r)
 }
 
 // vaultParkLead is the load-bearing opening every vault park rendering starts with.
@@ -1630,7 +1630,7 @@ func vaultRetryClause(r apitypes.RunDTO) string {
 // fitVaultParkLine is vaultParkLine shed to fit a physical width, for the TUI's one-row slots
 // (the board's selected second line and the run detail line). The full sentence ends in the
 // retry time, so clamping it from the right would cut exactly the HH:MM; instead the
-// explanation sheds first: full sentence, then "waiting for vault unlock — once unlocked it
+// explanation sheds first: full sentence, then "waiting for vault unlock: once unlocked it
 // resumes at its next retry (HH:MM)", then the floor "waiting for vault unlock · retry HH:MM"
 // (just the lead without a retry stamp). The floor is never cut here, even when it alone
 // overflows; the caller's clampVisual handles that pathological narrow case. "" for any run
@@ -1644,7 +1644,7 @@ func fitVaultParkLine(r apitypes.RunDTO, width int) string {
 	if r.RecoveryRetryNotBefore != nil {
 		floor += " · retry " + r.RecoveryRetryNotBefore.Local().Format("15:04")
 	}
-	short := vaultParkLead + " — once unlocked it resumes at " + vaultRetryClause(r)
+	short := vaultParkLead + ": once unlocked it resumes at " + vaultRetryClause(r)
 	for _, cand := range []string{full, short} {
 		if visualWidth(cand) <= width {
 			return cand

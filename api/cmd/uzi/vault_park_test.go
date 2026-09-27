@@ -118,7 +118,7 @@ func TestRunLogsFollowVaultLockedNotice(t *testing.T) {
 		t.Fatal("run logs --follow hung on a vault_locked park")
 	}
 	stderr := errBuf.String()
-	want := "run r1 waiting for vault unlock — the run owner's vault was locked when this Codex run needed its credential; once the vault is unlocked it resumes at its next retry (" +
+	want := "run r1 waiting for vault unlock: the run owner's vault was locked when this Codex run needed its credential; once the vault is unlocked it resumes at its next retry (" +
 		parked.RecoveryRetryNotBefore.Local().Format("15:04") + "); still following\n"
 	if n := strings.Count(stderr, want); n != 1 {
 		t.Errorf("vault_locked notice appeared %d times, want exactly 1:\n%s", n, stderr)
@@ -138,7 +138,7 @@ func TestRunLogsFollowVaultLockedNotice(t *testing.T) {
 // retry as local HH:MM, is dropped without a stamp, and any other run gets "".
 func TestVaultParkLine(t *testing.T) {
 	r := vaultParkRun("r1")
-	want := "waiting for vault unlock — the run owner's vault was locked when this Codex run needed its credential; once the vault is unlocked it resumes at its next retry (" +
+	want := "waiting for vault unlock: the run owner's vault was locked when this Codex run needed its credential; once the vault is unlocked it resumes at its next retry (" +
 		r.RecoveryRetryNotBefore.Local().Format("15:04") + ")"
 	if got := vaultParkLine(r); got != want {
 		t.Errorf("vaultParkLine = %q, want %q", got, want)
@@ -351,7 +351,7 @@ func TestFitVaultParkLine(t *testing.T) {
 	r := vaultParkRun("r1")
 	hhmm := r.RecoveryRetryNotBefore.Local().Format("15:04")
 	full := vaultParkLine(r)
-	short := "waiting for vault unlock — once unlocked it resumes at its next retry (" + hhmm + ")"
+	short := "waiting for vault unlock: once unlocked it resumes at its next retry (" + hhmm + ")"
 	floor := "waiting for vault unlock · retry " + hhmm
 	for _, tc := range []struct {
 		width int

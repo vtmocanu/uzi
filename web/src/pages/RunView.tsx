@@ -1686,7 +1686,7 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
         )}
         <p className="mt-1.5 text-xs text-muted">
           {vaultPark
-            ? "Nothing is lost — the run's work was saved before it parked, and it picks up where it left off."
+            ? "Nothing is lost: the run's work was saved before it parked, and it picks up where it left off."
             : "Nothing is lost — the run keeps its branch and its history and picks up where it left off."}
         </p>
       </div>
