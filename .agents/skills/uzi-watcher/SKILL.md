@@ -81,9 +81,11 @@ Below, a run id is written `RUN` and a PR number `PR` in the example commands.
    uzi run logs RUN --json | jq -r 'select(.kind=="plan") | .payload.plan_md'
    ```
 
-   Judge it as you would any plan, and run the **plan-trap checks** below. Before approving a
-   higher-risk or multi-component plan, ask an available peer session for a second opinion
-   (the `session-peers` skill); it supplements the plan-trap checks, it does not replace them.
+   Judge it as you would any plan, and run the **plan-trap checks** below. **When a peer session
+   is paired with you (the `session-peers` skill), steer every plan with it**: send it the plan,
+   and approve, revise or reject only once you both agree. Without a paired peer, still ask an
+   available one before approving a higher-risk or multi-component plan. A peer supplements the
+   plan-trap checks, it does not replace them.
    Sound plan →
    `uzi run approve`. Salvageable but wrong in places → `uzi run revise` with a `-m`
    message naming the precise change (re-plans without ending the run; then watch for the
