@@ -57,7 +57,7 @@ func TestRateLimitsPerTokenLiveDB(t *testing.T) {
 	strangerTok := mkSecret(stranger, "default", true)
 
 	upsert := func(secretID, userID uuid.UUID, pct int16) {
-		if uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+		if _, uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 			UserSecretID: secretID,
 			UserID:       userID,
 			FiveHourPct:  pgtype.Int2{Int16: pct, Valid: true},
@@ -97,12 +97,20 @@ func TestRateLimitsPerTokenLiveDB(t *testing.T) {
 	// only the reading and never re-checks ownership (which is itself correct — the
 	// poller always passes the matching pair from one listing row). `spare` is
 	// owner's, never given a reading, and here mis-claimed as stranger's.
+	//
+	// Since PRD #1732 M3a UpsertRateLimits takes the pair FROM user_secrets under its
+	// fence (s.user_id = @user_id), so a mismatched pair writes 0 rows before the FK
+	// is ever reached; the FK itself is exercised with a raw INSERT.
 	spare := mkSecret(owner, "spare", false)
-	if uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+	if n, uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 		UserSecretID: spare, UserID: stranger, // wrong owner: no (stranger, spare) pair exists
 		FiveHourPct: pgtype.Int2{Int16: 1, Valid: true}, SevenDayPct: pgtype.Int2{Int16: 1, Valid: true},
 		Source: pgtype.Text{String: "usage_endpoint", Valid: true}, SyncedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
-	}); uerr == nil {
+	}); uerr != nil || n != 0 {
+		t.Fatalf("mismatched-owner upsert = %d rows err=%v, want 0 rows refused by the fence", n, uerr)
+	}
+	if _, ierr := pool.Exec(ctx, `INSERT INTO anthropic_rate_limits (user_secret_id, user_id, synced_at)
+		VALUES ($1, $2, now())`, spare, stranger); ierr == nil {
 		t.Fatal("a gauge row with a mismatched (user_id, user_secret_id) pair was accepted — the composite FK is not enforcing")
 	}
 

@@ -281,3 +281,9 @@ func TestWorkerCreateFindingNotificationFailureDoesNotFail200(t *testing.T) {
 		t.Error("the finding must still be durably stored even when the notification fails")
 	}
 }
+
+// GetSecretEnablement satisfies notifysvc.Store's credential re-check (PRD #1732 D13),
+// which only the early-reset alert calls; no finding path reaches it.
+func (s *notifyingSpyStore) GetSecretEnablement(context.Context, store.GetSecretEnablementParams) (store.GetSecretEnablementRow, error) {
+	return store.GetSecretEnablementRow{}, pgx.ErrNoRows
+}

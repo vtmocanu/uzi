@@ -32,15 +32,69 @@ func (q *Queries) DeleteRateLimits(ctx context.Context, userID uuid.UUID) (int64
 	return result.RowsAffected(), nil
 }
 
-const getRateLimitsForToken = `-- name: GetRateLimitsForToken :one
-SELECT user_secret_id, user_id, five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, source, synced_at FROM anthropic_rate_limits WHERE user_secret_id = $1
+const getAnthropicTokenToPoll = `-- name: GetAnthropicTokenToPoll :one
+SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset,
+       s.enablement_rev
+FROM user_secrets s
+JOIN users u ON s.user_id = u.id
+WHERE s.user_id = $1 AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
+  AND (s.id = $2::uuid
+       OR ($2::uuid IS NULL AND s.is_default))
 `
+
+type GetAnthropicTokenToPollParams struct {
+	UserID   uuid.UUID   `json:"user_id"`
+	SecretID pgtype.UUID `json:"secret_id"`
+}
+
+type GetAnthropicTokenToPollRow struct {
+	ID                    uuid.UUID `json:"id"`
+	UserID                uuid.UUID `json:"user_id"`
+	Ciphertext            []byte    `json:"ciphertext"`
+	SealedWith            string    `json:"sealed_with"`
+	NotifyEarlyLimitReset bool      `json:"notify_early_limit_reset"`
+	EnablementRev         int64     `json:"enablement_rev"`
+}
+
+// The single-token sibling of ListAnthropicTokensToPoll for the out-of-band poke
+// (PRD #1732 M3a): the named token when @secret_id is set, else the owner's
+// default. Same projection as the listing, so the poke opens exactly the row it
+// resolved (never "whatever the default is by open time") and captures the same
+// enablement_rev fence. A disabled token resolves to no row, so a poke never polls
+// it (D1).
+func (q *Queries) GetAnthropicTokenToPoll(ctx context.Context, arg GetAnthropicTokenToPollParams) (GetAnthropicTokenToPollRow, error) {
+	row := q.db.QueryRow(ctx, getAnthropicTokenToPoll, arg.UserID, arg.SecretID)
+	var i GetAnthropicTokenToPollRow
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Ciphertext,
+		&i.SealedWith,
+		&i.NotifyEarlyLimitReset,
+		&i.EnablementRev,
+	)
+	return i, err
+}
+
+const getRateLimitsForToken = `-- name: GetRateLimitsForToken :one
+SELECT user_secret_id, user_id, five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, source, synced_at, enablement_rev FROM anthropic_rate_limits
+WHERE user_secret_id = $1 AND enablement_rev = $2
+`
+
+type GetRateLimitsForTokenParams struct {
+	UserSecretID  uuid.UUID `json:"user_secret_id"`
+	EnablementRev int64     `json:"enablement_rev"`
+}
 
 // The full stored gauge row for ONE token (PRD #1020): the poller reads the prior
 // reading before writing the new one, so it can compare the previously reported reset
 // time against the fresh reading and detect an early window reset.
-func (q *Queries) GetRateLimitsForToken(ctx context.Context, userSecretID uuid.UUID) (AnthropicRateLimit, error) {
-	row := q.db.QueryRow(ctx, getRateLimitsForToken, userSecretID)
+//
+// Only a reading taken at the poll's own enablement revision counts as prior (PRD
+// #1732 D13): a reading from before a disable is no comparison basis after the
+// re-enable, so it reads as no row and cannot fire an alert.
+func (q *Queries) GetRateLimitsForToken(ctx context.Context, arg GetRateLimitsForTokenParams) (AnthropicRateLimit, error) {
+	row := q.db.QueryRow(ctx, getRateLimitsForToken, arg.UserSecretID, arg.EnablementRev)
 	var i AnthropicRateLimit
 	err := row.Scan(
 		&i.UserSecretID,
@@ -51,15 +105,17 @@ func (q *Queries) GetRateLimitsForToken(ctx context.Context, userSecretID uuid.U
 		&i.SevenDayResetsAt,
 		&i.Source,
 		&i.SyncedAt,
+		&i.EnablementRev,
 	)
 	return i, err
 }
 
 const listAnthropicTokensToPoll = `-- name: ListAnthropicTokensToPoll :many
-SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset
+SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset,
+       s.enablement_rev
 FROM user_secrets s
 JOIN users u ON s.user_id = u.id
-WHERE s.kind = 'anthropic_token'
+WHERE s.kind = 'anthropic_token' AND s.disabled_at IS NULL
 ORDER BY s.user_id, s.id
 `
 
@@ -69,6 +125,7 @@ type ListAnthropicTokensToPollRow struct {
 	Ciphertext            []byte    `json:"ciphertext"`
 	SealedWith            string    `json:"sealed_with"`
 	NotifyEarlyLimitReset bool      `json:"notify_early_limit_reset"`
+	EnablementRev         int64     `json:"enablement_rev"`
 }
 
 // Every anthropic_token secret to poll each tick (PRD #104 M5): the token's id and
@@ -92,6 +149,10 @@ type ListAnthropicTokensToPollRow struct {
 // #1020): the poller gates the early-reset alert on the owner's per-user opt-in
 // without a second per-token lookup. INNER JOIN on the owning user is total — every
 // user_secret has an owner — so it drops no token.
+//
+// A DISABLED token is not listed (PRD #1732 D1: background polling stops on
+// disable). enablement_rev is captured with the row so the poll's write can be
+// fenced on the revision it started at (D13, see UpsertRateLimits).
 func (q *Queries) ListAnthropicTokensToPoll(ctx context.Context) ([]ListAnthropicTokensToPollRow, error) {
 	rows, err := q.db.Query(ctx, listAnthropicTokensToPoll)
 	if err != nil {
@@ -107,6 +168,7 @@ func (q *Queries) ListAnthropicTokensToPoll(ctx context.Context) ([]ListAnthropi
 			&i.Ciphertext,
 			&i.SealedWith,
 			&i.NotifyEarlyLimitReset,
+			&i.EnablementRev,
 		); err != nil {
 			return nil, err
 		}
@@ -129,7 +191,8 @@ SELECT s.id                     AS user_secret_id,
        rl.synced_at,
        COALESCE(f.n, 0)::bigint AS in_flight_runs
 FROM user_secrets s
-LEFT JOIN anthropic_rate_limits rl ON rl.user_secret_id = s.id
+LEFT JOIN anthropic_rate_limits rl
+       ON rl.user_secret_id = s.id AND rl.enablement_rev = s.enablement_rev
 LEFT JOIN (
     -- 🔴 'limit_wait' IS EXCLUDED DELIBERATELY, AND WIDENING THIS STATUS SET TO
     -- INCLUDE IT IS WRONG (PRD #35, ADR-35 D4). This is the line someone reaches for
@@ -231,6 +294,9 @@ type ListAutoSelectCandidatesRow struct {
 // ORDER BY s.id makes the row order deterministic. autoselect.Select is
 // order-independent by construction, so this is for readable diffs and reproducible
 // tests, not for correctness.
+// 🔴 The rev match is what keeps a pre-disable reading out of auto-selection after
+// a re-enable (PRD #1732 D13): such a token classifies no_reading, which Select
+// skips, until the re-enable's own poll lands a reading at the new revision.
 func (q *Queries) ListAutoSelectCandidates(ctx context.Context, userID uuid.UUID) ([]ListAutoSelectCandidatesRow, error) {
 	rows, err := q.db.Query(ctx, listAutoSelectCandidates, userID)
 	if err != nil {
@@ -278,7 +344,8 @@ SELECT
     rl.synced_at
 FROM users u
 LEFT JOIN user_secrets s ON s.user_id = u.id AND s.kind = 'anthropic_token'
-LEFT JOIN anthropic_rate_limits rl ON rl.user_secret_id = s.id
+LEFT JOIN anthropic_rate_limits rl
+       ON rl.user_secret_id = s.id AND rl.enablement_rev = s.enablement_rev
 ORDER BY u.email ASC, s.is_default DESC NULLS LAST, lower(s.label) ASC
 `
 
@@ -318,6 +385,7 @@ type ListRateLimitsRow struct {
 // token as un-pooled — a confident, uniform, wrong answer, which is worse than the
 // field being absent. It is nullable through the LEFT JOIN (a token-less user's row
 // has no secret at all), and that row is skipped before the flag is read.
+// Current-revision readings only (PRD #1732 D13), as in ListRateLimitsForUser.
 func (q *Queries) ListRateLimits(ctx context.Context) ([]ListRateLimitsRow, error) {
 	rows, err := q.db.Query(ctx, listRateLimits)
 	if err != nil {
@@ -364,7 +432,8 @@ SELECT s.id            AS user_secret_id,
        rl.source,
        rl.synced_at
 FROM user_secrets s
-LEFT JOIN anthropic_rate_limits rl ON rl.user_secret_id = s.id
+LEFT JOIN anthropic_rate_limits rl
+       ON rl.user_secret_id = s.id AND rl.enablement_rev = s.enablement_rev
 WHERE s.user_id = $1 AND s.kind = 'anthropic_token'
 ORDER BY s.is_default DESC, lower(s.label) ASC
 `
@@ -401,6 +470,9 @@ type ListRateLimitsForUserRow struct {
 // as a string, so the web never re-derives eligibility from pcts and timestamps
 // (D21). The LEFT JOIN above is what makes "never polled" expressible at all — an
 // INNER JOIN would drop exactly the token whose silent ineligibility R7 is about.
+// A reading counts only at the token's current enablement revision (PRD #1732
+// D13): the rev match lives in the LEFT JOIN, so a reading from before a disable
+// makes the token read as never polled after the re-enable until a fresh one lands.
 func (q *Queries) ListRateLimitsForUser(ctx context.Context, userID uuid.UUID) ([]ListRateLimitsForUserRow, error) {
 	rows, err := q.db.Query(ctx, listRateLimitsForUser, userID)
 	if err != nil {
@@ -493,29 +565,44 @@ func (q *Queries) MarkSevenDayExhausted(ctx context.Context, userSecretID uuid.U
 	return result.RowsAffected(), nil
 }
 
-const upsertRateLimits = `-- name: UpsertRateLimits :exec
+const upsertRateLimits = `-- name: UpsertRateLimits :execrows
 INSERT INTO anthropic_rate_limits (
     user_secret_id, user_id, five_hour_pct, five_hour_resets_at,
-    seven_day_pct, seven_day_resets_at, source, synced_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    seven_day_pct, seven_day_resets_at, source, synced_at, enablement_rev
+)
+SELECT s.id, s.user_id,
+       $1::smallint,
+       $2::timestamptz,
+       $3::smallint,
+       $4::timestamptz,
+       $5::text,
+       $6::timestamptz,
+       s.enablement_rev
+FROM user_secrets s
+WHERE s.id = $7 AND s.user_id = $8
+  AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
+  AND s.enablement_rev = $9
+FOR SHARE OF s
 ON CONFLICT (user_secret_id) DO UPDATE SET
     five_hour_pct       = EXCLUDED.five_hour_pct,
     five_hour_resets_at = EXCLUDED.five_hour_resets_at,
     seven_day_pct       = EXCLUDED.seven_day_pct,
     seven_day_resets_at = EXCLUDED.seven_day_resets_at,
     source              = EXCLUDED.source,
-    synced_at           = EXCLUDED.synced_at
+    synced_at           = EXCLUDED.synced_at,
+    enablement_rev      = EXCLUDED.enablement_rev
 `
 
 type UpsertRateLimitsParams struct {
-	UserSecretID     uuid.UUID          `json:"user_secret_id"`
-	UserID           uuid.UUID          `json:"user_id"`
 	FiveHourPct      pgtype.Int2        `json:"five_hour_pct"`
 	FiveHourResetsAt pgtype.Timestamptz `json:"five_hour_resets_at"`
 	SevenDayPct      pgtype.Int2        `json:"seven_day_pct"`
 	SevenDayResetsAt pgtype.Timestamptz `json:"seven_day_resets_at"`
 	Source           pgtype.Text        `json:"source"`
 	SyncedAt         pgtype.Timestamptz `json:"synced_at"`
+	UserSecretID     uuid.UUID          `json:"user_secret_id"`
+	UserID           uuid.UUID          `json:"user_id"`
+	EnablementRev    int64              `json:"enablement_rev"`
 }
 
 // Overwrite ONE token's gauge row each poll tick (PRD #53 D4, repointed by #104
@@ -524,7 +611,8 @@ type UpsertRateLimitsParams struct {
 //
 // user_id rides along rather than being looked up: the caller already has it from
 // the poll listing, and it is half of the composite FK that ties this row to a
-// (user, token) pair that exists.
+// (user, token) pair that exists. Since PRD #1732 it is also a fence predicate
+// (s.user_id = @user_id), so a mismatched pair writes 0 rows before the FK is reached.
 //
 // The FK is checked on the INSERT path only: ON CONFLICT .. DO UPDATE deliberately
 // does not touch user_id, so an upsert over an EXISTING row rewrites the reading
@@ -535,18 +623,38 @@ type UpsertRateLimitsParams struct {
 // conflict path. Stated this way on purpose: "the poller always passes a matching
 // pair" would be the weaker true reason, and the weaker one is the one that rots
 // the moment someone adds a third caller.
-func (q *Queries) UpsertRateLimits(ctx context.Context, arg UpsertRateLimitsParams) error {
-	_, err := q.db.Exec(ctx, upsertRateLimits,
-		arg.UserSecretID,
-		arg.UserID,
+//
+// 🔴 FENCED on the credential's enablement revision (PRD #1732 D13). The row is
+// written only while the token is still enabled AT @enablement_rev, the revision
+// the poll captured when it started, so a poll that started before a disable (or
+// before a disable and the following re-enable) writes nothing: the SELECT yields
+// no row and the statement affects 0 rows, which the caller reads as "not written"
+// and then must not notify. FOR SHARE serialises the check against the transition
+// (SetSecretEnablement's UPDATE, and the handler's FOR UPDATE, conflict with it):
+// a transition that commits first makes this re-check see the new revision and
+// write nothing, and one that comes second waits for this write. Without it the
+// write still waits behind the enablement handler's FOR UPDATE (the FK's KEY SHARE
+// check conflicts with it) but then lands the old revision's reading, because the
+// fence was evaluated before the wait; TestRateLimitFenceSerializesWithTransitionLiveDB
+// measures exactly that.
+// The row is stamped with the revision it was polled at, which is what hides it
+// from every reader once the revision moves on.
+func (q *Queries) UpsertRateLimits(ctx context.Context, arg UpsertRateLimitsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, upsertRateLimits,
 		arg.FiveHourPct,
 		arg.FiveHourResetsAt,
 		arg.SevenDayPct,
 		arg.SevenDayResetsAt,
 		arg.Source,
 		arg.SyncedAt,
+		arg.UserSecretID,
+		arg.UserID,
+		arg.EnablementRev,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const userHasAnthropicToken = `-- name: UserHasAnthropicToken :one

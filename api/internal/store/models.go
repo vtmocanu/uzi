@@ -74,6 +74,7 @@ type AnthropicRateLimit struct {
 	SevenDayResetsAt pgtype.Timestamptz `json:"seven_day_resets_at"`
 	Source           pgtype.Text        `json:"source"`
 	SyncedAt         pgtype.Timestamptz `json:"synced_at"`
+	EnablementRev    int64              `json:"enablement_rev"`
 }
 
 type AppSetting struct {

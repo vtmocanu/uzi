@@ -57,7 +57,7 @@ func (h *Handler) PatchSecretEnabled(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var row store.GetSecretEnablementRow
-	found := false
+	found, transitioned := false, false
 	err := h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
 		cur, err := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{ID: id, UserID: user.ID})
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -110,6 +110,7 @@ func (h *Handler) PatchSecretEnabled(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return err
 		}
+		transitioned = true
 		if *req.Enabled {
 			// Re-enable fills an empty default slot without displacing an existing default.
 			if kind == store.KindAnthropicToken {
@@ -151,6 +152,14 @@ func (h *Handler) PatchSecretEnabled(w http.ResponseWriter, r *http.Request) {
 	if !found {
 		httpx.Error(w, 404, "secret not found")
 		return
+	}
+	// A re-enabled Anthropic token polls at once (PRD #1732 M3a, D13): its pre-disable
+	// reading is hidden at the new revision, so without this poke its meter would read
+	// "checking usage" for up to a full poll interval. Only a real transition pokes; an
+	// idempotent repeat changes nothing. After the commit, so the poll resolves the token
+	// as enabled at its new revision. Nil-safe (poller disabled, or tests).
+	if transitioned && *req.Enabled && kind == store.KindAnthropicToken && h.usagePoker != nil {
+		h.usagePoker.PokeSecret(user.ID, id)
 	}
 	dto := secretMeta(row.ID, row.Kind, row.Label, row.IsDefault, row.AutoEligible, row.CreatedAt, row.UpdatedAt)
 	dto.Enabled = !row.DisabledAt.Valid

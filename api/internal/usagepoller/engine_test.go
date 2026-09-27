@@ -33,6 +33,14 @@ type fakeStore struct {
 	prev      map[uuid.UUID]store.AnthropicRateLimit     // keyed by user_secret_id
 	notify    map[uuid.UUID]bool                         // keyed by user id
 	upsertErr error                                      // when set, UpsertRateLimits fails (no write)
+
+	// Enablement (PRD #1732), keyed by secret id: a disabled token is neither listed
+	// nor resolved for a poke, and the upsert mirrors the SQL's revision fence so the
+	// engine's use of the written/refused answer is observable. rev is 0 when unset.
+	disabled map[uuid.UUID]bool
+	rev      map[uuid.UUID]int64
+	// resolved records every poke resolve, so a test can assert which token a poke named.
+	resolved []store.GetAnthropicTokenToPollParams
 }
 
 func newFakeStore(users ...uuid.UUID) *fakeStore {
@@ -43,56 +51,92 @@ func newFakeStore(users ...uuid.UUID) *fakeStore {
 		})
 	}
 	return &fakeStore{
-		rows:    rows,
-		upserts: map[uuid.UUID]store.UpsertRateLimitsParams{},
-		prev:    map[uuid.UUID]store.AnthropicRateLimit{},
-		notify:  map[uuid.UUID]bool{},
+		rows:     rows,
+		upserts:  map[uuid.UUID]store.UpsertRateLimitsParams{},
+		prev:     map[uuid.UUID]store.AnthropicRateLimit{},
+		notify:   map[uuid.UUID]bool{},
+		disabled: map[uuid.UUID]bool{},
+		rev:      map[uuid.UUID]int64{},
 	}
 }
 func (f *fakeStore) ListAnthropicTokensToPoll(context.Context) ([]store.ListAnthropicTokensToPollRow, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	// Reflect any per-user notify opt-in onto the poll rows (the production JOIN),
-	// keeping the tick path and the poke path reading the same flag.
-	out := make([]store.ListAnthropicTokensToPollRow, len(f.rows))
-	for i, r := range f.rows {
+	// keeping the tick path and the poke path reading the same flag. A disabled token
+	// is not listed, and each row carries its revision, as in the production query.
+	out := make([]store.ListAnthropicTokensToPollRow, 0, len(f.rows))
+	for _, r := range f.rows {
+		if f.disabled[r.ID] {
+			continue
+		}
 		r.NotifyEarlyLimitReset = f.notify[r.UserID]
-		out[i] = r
+		r.EnablementRev = f.rev[r.ID]
+		out = append(out, r)
 	}
 	return out, nil
 }
-func (f *fakeStore) GetDefaultUserSecretID(_ context.Context, arg store.GetDefaultUserSecretIDParams) (uuid.UUID, error) {
+func (f *fakeStore) GetAnthropicTokenToPoll(_ context.Context, arg store.GetAnthropicTokenToPollParams) (store.GetAnthropicTokenToPollRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resolved = append(f.resolved, arg)
 	// secret id == user id in this fake, so the user's default is the user id.
-	return arg.UserID, nil
+	id := arg.UserID
+	if arg.SecretID.Valid {
+		id = arg.SecretID.Bytes
+	}
+	for _, r := range f.rows {
+		if r.ID == id && r.UserID == arg.UserID && !f.disabled[id] {
+			return store.GetAnthropicTokenToPollRow{
+				ID: r.ID, UserID: r.UserID, Ciphertext: r.Ciphertext, SealedWith: r.SealedWith,
+				NotifyEarlyLimitReset: f.notify[r.UserID], EnablementRev: f.rev[r.ID],
+			}, nil
+		}
+	}
+	return store.GetAnthropicTokenToPollRow{}, pgx.ErrNoRows
 }
-func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error) {
-	return store.GetUserSecretCiphertextRow{Ciphertext: []byte("ct"), SealedWith: store.SealedWithDEK}, nil
-}
-func (f *fakeStore) UpsertRateLimits(_ context.Context, arg store.UpsertRateLimitsParams) error {
+func (f *fakeStore) UpsertRateLimits(_ context.Context, arg store.UpsertRateLimitsParams) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.upsertErr != nil {
 		// A failed write records nothing: prev stays at the old epoch (SC5).
-		return f.upsertErr
+		return 0, f.upsertErr
+	}
+	if f.disabled[arg.UserSecretID] || f.rev[arg.UserSecretID] != arg.EnablementRev {
+		return 0, nil // the D13 fence: disabled, or the revision moved on
 	}
 	f.upserts[arg.UserSecretID] = arg
 	// Mirror the write into prev, so a following tick's GetRateLimitsForToken sees the
 	// row this tick just wrote — the once-only edge-consumption property depends on it.
-	f.prev[arg.UserSecretID] = store.AnthropicRateLimit(arg)
-	return nil
+	f.prev[arg.UserSecretID] = gaugeRow(arg)
+	return 1, nil
 }
-func (f *fakeStore) GetRateLimitsForToken(_ context.Context, secretID uuid.UUID) (store.AnthropicRateLimit, error) {
+func (f *fakeStore) GetRateLimitsForToken(_ context.Context, arg store.GetRateLimitsForTokenParams) (store.AnthropicRateLimit, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if r, ok := f.prev[secretID]; ok {
+	if r, ok := f.prev[arg.UserSecretID]; ok && r.EnablementRev == arg.EnablementRev {
 		return r, nil
 	}
 	return store.AnthropicRateLimit{}, pgx.ErrNoRows
 }
-func (f *fakeStore) GetUserByID(_ context.Context, id uuid.UUID) (store.User, error) {
+
+// transition flips a token's enablement the way SetSecretEnablement does: the
+// revision moves on every transition.
+func (f *fakeStore) transition(secretID uuid.UUID, enabled bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return store.User{ID: id, NotifyEarlyLimitReset: f.notify[id]}, nil
+	f.disabled[secretID] = !enabled
+	f.rev[secretID]++
+}
+
+// gaugeRow is the stored row an upsert writes.
+func gaugeRow(arg store.UpsertRateLimitsParams) store.AnthropicRateLimit {
+	return store.AnthropicRateLimit{
+		UserSecretID: arg.UserSecretID, UserID: arg.UserID,
+		FiveHourPct: arg.FiveHourPct, FiveHourResetsAt: arg.FiveHourResetsAt,
+		SevenDayPct: arg.SevenDayPct, SevenDayResetsAt: arg.SevenDayResetsAt,
+		Source: arg.Source, SyncedAt: arg.SyncedAt, EnablementRev: arg.EnablementRev,
+	}
 }
 func (f *fakeStore) setNotify(userID uuid.UUID, on bool) {
 	f.mu.Lock()
@@ -131,9 +175,6 @@ func (f *fakeOpener) resolve(userID uuid.UUID) ([]byte, error) {
 		return tok, nil
 	}
 	return []byte("token"), nil
-}
-func (f *fakeOpener) Open(_ context.Context, userID uuid.UUID, _ string) ([]byte, error) {
-	return f.resolve(userID)
 }
 func (f *fakeOpener) OpenSealed(userID uuid.UUID, _ string, _ string, _ []byte) ([]byte, error) {
 	return f.resolve(userID)
@@ -394,7 +435,7 @@ func TestPokeIgnoresBackoff(t *testing.T) {
 
 	e.setBackoff(u) // pretend a prior refusal armed the backoff (secret id == user id here)
 	// The real poke path: resolve the user's default token, then poll it ignoring backoff.
-	e.pokeUser(context.Background(), u)
+	e.pokeUser(context.Background(), u, uuid.Nil)
 
 	if _, ok := st.got(u); !ok {
 		t.Error("poke should poll despite the backoff")
@@ -434,33 +475,26 @@ func (m *multiTokenStore) ListAnthropicTokensToPoll(context.Context) ([]store.Li
 	}
 	return out, nil
 }
-func (m *multiTokenStore) GetDefaultUserSecretID(context.Context, store.GetDefaultUserSecretIDParams) (uuid.UUID, error) {
-	return m.rows[0].ID, nil
+func (m *multiTokenStore) GetAnthropicTokenToPoll(context.Context, store.GetAnthropicTokenToPollParams) (store.GetAnthropicTokenToPollRow, error) {
+	r := m.rows[0]
+	return store.GetAnthropicTokenToPollRow{ID: r.ID, UserID: r.UserID, Ciphertext: r.Ciphertext, SealedWith: r.SealedWith}, nil
 }
-func (m *multiTokenStore) GetUserSecretCiphertext(context.Context, store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error) {
-	return store.GetUserSecretCiphertextRow{Ciphertext: []byte("ct"), SealedWith: store.SealedWithDEK}, nil
-}
-func (m *multiTokenStore) UpsertRateLimits(_ context.Context, arg store.UpsertRateLimitsParams) error {
+func (m *multiTokenStore) UpsertRateLimits(_ context.Context, arg store.UpsertRateLimitsParams) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.upserts[arg.UserSecretID] = arg
 	if m.prev != nil {
-		m.prev[arg.UserSecretID] = store.AnthropicRateLimit(arg)
+		m.prev[arg.UserSecretID] = gaugeRow(arg)
 	}
-	return nil
+	return 1, nil
 }
-func (m *multiTokenStore) GetRateLimitsForToken(_ context.Context, secretID uuid.UUID) (store.AnthropicRateLimit, error) {
+func (m *multiTokenStore) GetRateLimitsForToken(_ context.Context, arg store.GetRateLimitsForTokenParams) (store.AnthropicRateLimit, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if r, ok := m.prev[secretID]; ok {
+	if r, ok := m.prev[arg.UserSecretID]; ok {
 		return r, nil
 	}
 	return store.AnthropicRateLimit{}, pgx.ErrNoRows
-}
-func (m *multiTokenStore) GetUserByID(_ context.Context, id uuid.UUID) (store.User, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return store.User{ID: id, NotifyEarlyLimitReset: m.notify[id]}, nil
 }
 func (m *multiTokenStore) got(secretID uuid.UUID) (store.UpsertRateLimitsParams, bool) {
 	m.mu.Lock()
@@ -556,9 +590,6 @@ func TestPerTokenBackoffIsolation(t *testing.T) {
 // test's client can tell the tokens apart by their bytes.
 type passthroughOpener struct{}
 
-func (passthroughOpener) Open(_ context.Context, _ uuid.UUID, _ string) ([]byte, error) {
-	return []byte("default"), nil
-}
 func (passthroughOpener) OpenSealed(_ uuid.UUID, _, _ string, ciphertext []byte) ([]byte, error) {
 	return ciphertext, nil
 }
@@ -566,7 +597,8 @@ func (passthroughOpener) OpenSealed(_ uuid.UUID, _, _ string, ciphertext []byte)
 // --- early-reset detection (PRD #1020 M2) ---
 
 type earlyResetCall struct {
-	userID             uuid.UUID
+	userID, secretID   uuid.UUID
+	rev                int64
 	expected, observed time.Time
 }
 
@@ -577,10 +609,10 @@ type fakeNotifier struct {
 	calls []earlyResetCall
 }
 
-func (f *fakeNotifier) NotifyEarlyReset(_ context.Context, userID uuid.UUID, expected, observed time.Time) (store.Notification, error) {
+func (f *fakeNotifier) NotifyEarlyReset(_ context.Context, userID, secretID uuid.UUID, rev int64, expected, observed time.Time) (store.Notification, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, earlyResetCall{userID: userID, expected: expected, observed: observed})
+	f.calls = append(f.calls, earlyResetCall{userID: userID, secretID: secretID, rev: rev, expected: expected, observed: observed})
 	return store.Notification{}, nil
 }
 func (f *fakeNotifier) count() int {
@@ -998,7 +1030,7 @@ func TestEarlyResetNilNotifier(t *testing.T) {
 }
 
 // TestEarlyResetOnPokePath: the poke/single-token path runs detection too, reading the
-// owner opt-in via GetUserByID. A poke that skipped detection would upsert the moved
+// owner opt-in off the poke's resolved row (GetAnthropicTokenToPoll). A poke that skipped detection would upsert the moved
 // epoch and silently consume the alert edge.
 func TestEarlyResetOnPokePath(t *testing.T) {
 	tReset := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
@@ -1015,7 +1047,7 @@ func TestEarlyResetOnPokePath(t *testing.T) {
 	clk.set(tReset.Add(-10 * time.Hour))
 	e.SetNotifier(notif)
 
-	e.pokeUser(context.Background(), u)
+	e.pokeUser(context.Background(), u, uuid.Nil)
 
 	if notif.count() != 1 {
 		t.Fatalf("notify calls = %d, want 1 (detection must run on the poke path)", notif.count())

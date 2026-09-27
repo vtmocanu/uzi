@@ -88,7 +88,7 @@ func TestJudgeAutoPicksHigherHeadroomLiveDB(t *testing.T) {
 	// read fresh rather than stale. hiID has clearly more headroom (90) than loID (20).
 	upsertRL := func(secretID uuid.UUID, headroom int16) {
 		t.Helper()
-		if err := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+		if _, err := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 			UserSecretID:     secretID,
 			UserID:           userID,
 			FiveHourPct:      pgtype.Int2{Int16: 100 - headroom, Valid: true},

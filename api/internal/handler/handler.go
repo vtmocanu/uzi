@@ -334,10 +334,12 @@ func (h *Handler) clock() time.Time {
 }
 
 // UsagePoker is the slice of the rate-limit poller the token-save handler needs
-// (PRD #53 D3b): request an out-of-band poll for one user. *usagepoller.Engine
-// satisfies it.
+// (PRD #53 D3b): request an out-of-band poll for one user's default token, or for
+// one named token (PokeSecret, the re-enable path of PRD #1732 M3a, whose token is
+// usually not the default). *usagepoller.Engine satisfies it.
 type UsagePoker interface {
 	Poke(userID uuid.UUID)
+	PokeSecret(userID, secretID uuid.UUID)
 }
 
 // SetUsagePoker wires the rate-limit poller in after construction (built in main

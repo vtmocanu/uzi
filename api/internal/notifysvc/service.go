@@ -46,6 +46,9 @@ type Store interface {
 	// bump its payload count WITHOUT re-firing Slack. See NotifyIncidentalFinding.
 	FindNotificationForRunKind(ctx context.Context, arg store.FindNotificationForRunKindParams) (store.Notification, error)
 	UpdateNotificationPayload(ctx context.Context, arg store.UpdateNotificationPayloadParams) (store.Notification, error)
+	// GetSecretEnablement backs the credential re-check a credential-specific alert
+	// runs before delivery (PRD #1732 D13, see NotifyEarlyReset).
+	GetSecretEnablement(ctx context.Context, arg store.GetSecretEnablementParams) (store.GetSecretEnablementRow, error)
 }
 
 // Slacker is the best-effort Slack delivery seam. The slacksvc Notifier satisfies
@@ -186,6 +189,11 @@ const KindIncidentalFinding = "incidental_finding"
 // generic text column with no CHECK, so this needs no migration.
 const KindEarlyLimitReset = "early_limit_reset"
 
+// ErrCredentialNotCurrent is NotifyEarlyReset's refusal when the credential the alert is
+// about is no longer the owner's enabled token at the revision the reading was written at
+// (PRD #1732 D13). Nothing was recorded or sent.
+var ErrCredentialNotCurrent = errors.New("credential no longer enabled at the alert's revision")
+
 // maxCoalescedFindingIDs caps the finding_ids the coalesced payload accumulates so a
 // noisy run cannot grow one row's jsonb without bound. The count keeps climbing past
 // the cap; only the id list stops appending. The per-run
@@ -313,7 +321,24 @@ type EarlyResetPayload struct {
 //
 // Wording is "observed": the reset is seen on the next poll tick, so this understates true
 // earliness by up to one poll interval — it does not claim an exact reset instant.
-func (s *Service) NotifyEarlyReset(ctx context.Context, userID uuid.UUID, expected, observed time.Time) (store.Notification, error) {
+//
+// The alert is about ONE credential, so it is re-checked before anything is recorded or
+// sent (PRD #1732 D13): secretID must still be userID's Anthropic token, enabled, and at
+// enablementRev, the revision the poller's fenced write landed at. A credential disabled
+// (or disabled and re-enabled) since that write, deleted, or not the owner's delivers
+// nothing and returns ErrCredentialNotCurrent. A DM already handed to Slack before a later
+// disable cannot be recalled and is out of scope.
+func (s *Service) NotifyEarlyReset(ctx context.Context, userID, secretID uuid.UUID, enablementRev int64, expected, observed time.Time) (store.Notification, error) {
+	cur, err := s.q.GetSecretEnablement(ctx, store.GetSecretEnablementParams{ID: secretID, UserID: userID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.Notification{}, ErrCredentialNotCurrent
+	}
+	if err != nil {
+		return store.Notification{}, fmt.Errorf("re-check credential: %w", err)
+	}
+	if cur.Kind != store.KindAnthropicToken || cur.DisabledAt.Valid || cur.EnablementRev != enablementRev {
+		return store.Notification{}, ErrCredentialNotCurrent
+	}
 	hoursEarly := expected.Sub(observed)
 	hoursEarlyInt := int(hoursEarly.Round(time.Hour).Hours())
 
