@@ -146,4 +146,29 @@ func TestWorkerPrDescriptionRoutesLiveDB(t *testing.T) {
 		dto.PrDescriptionOutcome == nil || *dto.PrDescriptionOutcome != "published" {
 		t.Fatalf("GetRun pr_description = %+v outcome=%v", dto.PrDescription, dto.PrDescriptionOutcome)
 	}
+	// Stage rides the per-worker proposal limiter on the REAL worker router (auditor M4): with a
+	// budget of 1 the second stage is a 429 that stores nothing; bind/lookup/ack are not limited.
+	router = h.WorkerRoutes(mw.NewLimiter(1, time.Hour, nil))
+	countVersions := func() int {
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pr_description_versions WHERE run_id = $1`, runID).Scan(&n); err != nil {
+			t.Fatalf("count versions: %v", err)
+		}
+		return n
+	}
+	before := countVersions()
+	if rec := post("stage", tok, stageBody, nil); rec.Code != http.StatusOK {
+		t.Fatalf("first limited stage = %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := post("stage", tok, stageBody, nil); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second limited stage = %d %s, want 429", rec.Code, rec.Body.String())
+	}
+	if n := countVersions(); n != before+1 {
+		t.Fatalf("versions = %d, want %d (the limited stage must store nothing)", n, before+1)
+	}
+	for i := 0; i < 3; i++ {
+		if rec := post("lookup", tok, apitypes.PrDescriptionLookupRequest{ClaimGeneration: i64(6), MrIid: 77, RegionSha256: strings.Repeat("d", 64)}, nil); rec.Code != http.StatusOK {
+			t.Fatalf("lookup %d = %d, want unlimited", i, rec.Code)
+		}
+	}
 }

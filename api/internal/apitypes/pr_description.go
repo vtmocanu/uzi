@@ -37,8 +37,8 @@ type PrDescriptionSizeBucket struct {
 }
 
 // PrDescriptionSize is the deterministic, worker-computed size line (D3) as data. Unavailable
-// marks the "**Size:** unavailable" case (the attribute lookup failed), in which the buckets are
-// zero and must not be rendered.
+// marks the "**Size:** unavailable" case (the attribute lookup failed), in which every bucket
+// must be zero (a stage with a non-zero bucket is refused) and none is rendered.
 type PrDescriptionSize struct {
 	Unavailable bool                    `json:"unavailable"`
 	Files       int64                   `json:"files"`
@@ -50,8 +50,10 @@ type PrDescriptionSize struct {
 	Vendored    PrDescriptionSizeBucket `json:"vendored"`
 }
 
-// PrDescriptionVersionDTO is one staged version (D9). MrIid is null until bound;
-// RenderedRegionSha256 is null until bound; PublishedAt is null unless state is published.
+// PrDescriptionVersionDTO is one staged version (D9). MrIid is null until the version names its
+// PR: it is set at stage for a refresh (the PR already exists), otherwise at bind.
+// RenderedRegionSha256 is null until bound, and a published version always has it.
+// PublishedAt is null unless state is published.
 // Source is generated|lead_only|deterministic_only; State is pending|published|abandoned.
 type PrDescriptionVersionDTO struct {
 	ID                   string              `json:"id"`
@@ -83,7 +85,8 @@ type PrDescriptionState struct {
 }
 
 // PrDescriptionStageRequest is POST /api/worker/runs/{id}/pr-description/stage. Fields are RAW
-// (the api sanitizes them). MrIid is set when the PR already exists (a refresh). A
+// (the api sanitizes them). MrIid is set when the PR already exists (a refresh); it must be the
+// run's own PR (runs.mr_iid when set, else the PR the run first staged or bound for). A
 // deterministic_only stage stores no text: its fields are cleared.
 type PrDescriptionStageRequest struct {
 	ClaimGeneration *int64              `json:"claim_generation"`
@@ -104,7 +107,8 @@ type PrDescriptionStageResponse struct {
 
 // PrDescriptionBindRequest is POST /api/worker/runs/{id}/pr-description/bind: bind the run's
 // pending version to its PR and record the sha256 (64 lowercase hex) of the exact region text the
-// renderer will write. Idempotent for the same (version, mr_iid).
+// renderer will write. MrIid must be the run's own PR (as for stage). Idempotent for the same
+// (version, mr_iid).
 type PrDescriptionBindRequest struct {
 	ClaimGeneration      *int64 `json:"claim_generation"`
 	VersionID            string `json:"version_id"`

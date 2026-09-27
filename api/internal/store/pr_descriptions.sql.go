@@ -58,6 +58,20 @@ func (q *Queries) BindPrDescriptionVersion(ctx context.Context, arg BindPrDescri
 	return i, err
 }
 
+const countPendingPrDescriptionVersionsForRun = `-- name: CountPendingPrDescriptionVersionsForRun :one
+SELECT count(*)::bigint FROM pr_description_versions WHERE run_id = $1 AND state = 'pending'
+`
+
+// The run's pending versions (every generation). Stage refuses past a hard cap, so a looping or
+// hostile worker cannot flood the table; pending versions are kept (never auto-abandoned)
+// because lost-ack recovery matches against them.
+func (q *Queries) CountPendingPrDescriptionVersionsForRun(ctx context.Context, runID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countPendingPrDescriptionVersionsForRun, runID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const ensurePrDescription = `-- name: EnsurePrDescription :exec
 INSERT INTO pr_descriptions (repo_id, mr_iid) VALUES ($1, $2)
 ON CONFLICT (repo_id, mr_iid) DO NOTHING
@@ -118,6 +132,22 @@ func (q *Queries) FindPrDescriptionVersionByRegionHash(ctx context.Context, arg 
 		&i.PublishedAt,
 	)
 	return i, err
+}
+
+const firstPrDescriptionMrIidForRun = `-- name: FirstPrDescriptionMrIidForRun :one
+SELECT mr_iid::bigint AS mr_iid FROM pr_description_versions
+WHERE run_id = $1 AND mr_iid IS NOT NULL
+ORDER BY created_at, id
+LIMIT 1
+`
+
+// The PR this run first staged for or bound a version to. A run describes one PR: once it has a
+// version naming PR X, it cannot stage or bind for PR Y.
+func (q *Queries) FirstPrDescriptionMrIidForRun(ctx context.Context, runID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, firstPrDescriptionMrIidForRun, runID)
+	var mr_iid int64
+	err := row.Scan(&mr_iid)
+	return mr_iid, err
 }
 
 const getPrDescription = `-- name: GetPrDescription :one
@@ -340,7 +370,7 @@ func (q *Queries) MarkPrDescriptionVersionAbandoned(ctx context.Context, id uuid
 const markPrDescriptionVersionPublished = `-- name: MarkPrDescriptionVersionPublished :execrows
 UPDATE pr_description_versions
 SET state = 'published', published_at = now()
-WHERE id = $1 AND state = 'pending'
+WHERE id = $1 AND state = 'pending' AND mr_iid IS NOT NULL AND rendered_region_sha256 IS NOT NULL
 `
 
 func (q *Queries) MarkPrDescriptionVersionPublished(ctx context.Context, id uuid.UUID) (int64, error) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -149,10 +150,37 @@ func (f *prDescFakeStore) LatestBoundPrDescriptionVersionForRun(_ context.Contex
 	return *best, nil
 }
 
+func (f *prDescFakeStore) FirstPrDescriptionMrIidForRun(_ context.Context, runID uuid.UUID) (int64, error) {
+	var best *store.PrDescriptionVersion
+	for _, v := range f.versions {
+		if v.RunID == runID && v.MrIid.Valid && (best == nil || v.CreatedAt.Time.Before(best.CreatedAt.Time)) {
+			c := v
+			best = &c
+		}
+	}
+	if best == nil {
+		return 0, pgx.ErrNoRows
+	}
+	return best.MrIid.Int64, nil
+}
+
+func (f *prDescFakeStore) CountPendingPrDescriptionVersionsForRun(_ context.Context, runID uuid.UUID) (int64, error) {
+	var n int64
+	for _, v := range f.versions {
+		if v.RunID == runID && v.State == "pending" {
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (f *prDescFakeStore) setVersionState(id uuid.UUID, state string) int64 {
 	v, ok := f.versions[id]
 	if !ok || v.State != "pending" {
 		return 0
+	}
+	if state == "published" && (!v.MrIid.Valid || !v.RenderedRegionSha256.Valid) {
+		return 0 // the SQL guard and the migration's published_bound CHECK
 	}
 	v.State = state
 	if state == "published" {
@@ -478,6 +506,7 @@ func TestWorkerPrDescriptionValidation(t *testing.T) {
 		{"bad head sha", mut(func(b *apitypes.PrDescriptionStageRequest) { b.HeadSha = "not-a-sha" }), http.StatusBadRequest},
 		{"branch with newline", mut(func(b *apitypes.PrDescriptionStageRequest) { b.TargetBranch = "main\nx" }), http.StatusBadRequest},
 		{"negative size", mut(func(b *apitypes.PrDescriptionStageRequest) { b.Size.Files = -1 }), http.StatusBadRequest},
+		{"unavailable size with buckets", mut(func(b *apitypes.PrDescriptionStageRequest) { b.Size.Unavailable = true }), http.StatusBadRequest},
 		{"bad scope kind", mut(func(b *apitypes.PrDescriptionStageRequest) {
 			b.Fields.ScopeNotes = []apitypes.PrDescriptionScopeNote{{Kind: "risk", Text: "t"}}
 		}), http.StatusBadRequest},
@@ -527,5 +556,284 @@ func TestWorkerPrDescriptionValidation(t *testing.T) {
 	st.runs[runID] = r
 	if rec := prDescPost(t, router, runID, "stage", prDescStageBody(1, "x"), nil); rec.Code != http.StatusConflict || prDescReason(t, rec) != "stale_claim" {
 		t.Fatalf("released claim stage = %d %s, want 409 stale_claim", rec.Code, rec.Body.String())
+	}
+}
+
+// prDescSeedRun stores a running, repo-ful issue run held by wkr at generation gen.
+func prDescSeedRun(st *prDescFakeStore, wkr store.Worker, repoID uuid.UUID, gen int64) uuid.UUID {
+	runID := uuid.New()
+	st.runs[runID] = store.Run{
+		ID: runID, UserID: wkr.UserID, RepoID: pgtype.UUID{Bytes: repoID, Valid: true}, Status: "running", Kind: "issue",
+		WorkerID: pgtype.UUID{Bytes: wkr.ID, Valid: true}, ClaimGeneration: gen,
+	}
+	return runID
+}
+
+// prDescStageBind stages a version (with mrIid on the stage when stageMr) and binds it to mrIid
+// with hash, failing the test on any non-200.
+func prDescStageBind(t *testing.T, router http.Handler, runID uuid.UUID, gen, mrIid int64, hash string) apitypes.PrDescriptionVersionDTO {
+	t.Helper()
+	var staged apitypes.PrDescriptionStageResponse
+	if rec := prDescPost(t, router, runID, "stage", prDescStageBody(gen, "text"), &staged); rec.Code != http.StatusOK {
+		t.Fatalf("stage = %d %s", rec.Code, rec.Body.String())
+	}
+	var bound apitypes.PrDescriptionBindResponse
+	if rec := prDescPost(t, router, runID, "bind", apitypes.PrDescriptionBindRequest{
+		ClaimGeneration: i64(gen), VersionID: staged.Version.ID, MrIid: mrIid, RenderedRegionSha256: hash,
+	}, &bound); rec.Code != http.StatusOK {
+		t.Fatalf("bind = %d %s", rec.Code, rec.Body.String())
+	}
+	return bound.Version
+}
+
+func prDescHash(c byte) string { return strings.Repeat(string(c), 64) }
+
+// TestWorkerPrDescriptionPublishedAckNeedsBind (review B2): a version staged WITH an mr_iid (the
+// refresh path) but never bound has no rendered_region_sha256, so a published ack for it is a
+// version_conflict; a skip outcome is still recorded.
+func TestWorkerPrDescriptionPublishedAckNeedsBind(t *testing.T) {
+	wkr := store.Worker{ID: uuid.New(), UserID: uuid.New()}
+	st := newPrDescFakeStore()
+	runID := prDescSeedRun(st, wkr, uuid.New(), 1)
+	router := prDescTestRouter(st, wkr)
+
+	v1 := prDescStageBind(t, router, runID, 1, 41, prDescHashA)
+	if rec := prDescPost(t, router, runID, "ack", apitypes.PrDescriptionAckRequest{ClaimGeneration: i64(1), VersionID: v1.ID, Outcome: "published"}, nil); rec.Code != http.StatusOK {
+		t.Fatalf("v1 ack = %d %s", rec.Code, rec.Body.String())
+	}
+	var staged apitypes.PrDescriptionStageResponse
+	body := prDescStageBody(1, "refresh")
+	body.MrIid = i64(41)
+	if rec := prDescPost(t, router, runID, "stage", body, &staged); rec.Code != http.StatusOK {
+		t.Fatalf("refresh stage = %d %s", rec.Code, rec.Body.String())
+	}
+	rec := prDescPost(t, router, runID, "ack", apitypes.PrDescriptionAckRequest{
+		ClaimGeneration: i64(1), VersionID: staged.Version.ID, Outcome: "published", ExpectedLockVersion: 1,
+	}, nil)
+	if rec.Code != http.StatusConflict || prDescReason(t, rec) != "version_conflict" {
+		t.Fatalf("published ack of an unbound version = %d %s, want 409 version_conflict", rec.Code, rec.Body.String())
+	}
+	pr := st.prs[prDescFakeKey{st.runs[runID].RepoID.Bytes, 41}]
+	if uuid.UUID(pr.PublishedVersionID.Bytes).String() != v1.ID || pr.LockVersion != 1 {
+		t.Fatalf("pr moved: %+v", pr)
+	}
+	var acked apitypes.PrDescriptionAckResponse
+	if rec := prDescPost(t, router, runID, "ack", apitypes.PrDescriptionAckRequest{
+		ClaimGeneration: i64(1), VersionID: staged.Version.ID, Outcome: "skipped_snapshot_moved", ExpectedLockVersion: 1,
+	}, &acked); rec.Code != http.StatusOK || acked.PR.PublishedVersion == nil || acked.PR.PublishedVersion.ID != v1.ID {
+		t.Fatalf("skip ack of an unbound version = %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestWorkerPrDescriptionLostAckNeverMovesBackwards (review N1): recovery publishes a pending
+// version only when it is newer than the published one and the forge does not already show the
+// published version's region.
+func TestWorkerPrDescriptionLostAckNeverMovesBackwards(t *testing.T) {
+	wkr := store.Worker{ID: uuid.New(), UserID: uuid.New()}
+	st := newPrDescFakeStore()
+	runID := prDescSeedRun(st, wkr, uuid.New(), 1)
+	router := prDescTestRouter(st, wkr)
+	ack := func(v apitypes.PrDescriptionVersionDTO, outcome string, lock int64, observed string) apitypes.PrDescriptionAckResponse {
+		t.Helper()
+		var out apitypes.PrDescriptionAckResponse
+		req := apitypes.PrDescriptionAckRequest{ClaimGeneration: i64(1), VersionID: v.ID, Outcome: outcome, ExpectedLockVersion: lock}
+		if observed != "" {
+			req.ObservedRegionSha256 = &observed
+		}
+		if rec := prDescPost(t, router, runID, "ack", req, &out); rec.Code != http.StatusOK {
+			t.Fatalf("ack %s = %d %s", v.ID, rec.Code, rec.Body.String())
+		}
+		return out
+	}
+
+	// V1 wrote region A and lost its ack; V2 wrote region B and acked.
+	v1 := prDescStageBind(t, router, runID, 1, 41, prDescHash('a'))
+	v2 := prDescStageBind(t, router, runID, 1, 41, prDescHash('b'))
+	ack(v2, "published", 0, "")
+	// V3 finds region A on the forge (a human restored the older text): V1 is OLDER than the
+	// published V2, so it is not recovered and V2 stays published.
+	v3 := prDescStageBind(t, router, runID, 1, 41, prDescHash('c'))
+	got := ack(v3, "skipped_human_edit", 1, prDescHash('a'))
+	if got.RecoveredVersionID != nil || got.PR.PublishedVersion == nil || got.PR.PublishedVersion.ID != v2.ID {
+		t.Fatalf("an older pending version was recovered over the published one: %+v", got)
+	}
+	if st.versions[uuid.MustParse(v1.ID)].State != "pending" {
+		t.Fatal("V1 must stay pending")
+	}
+	// V4 renders the same region B as the published V2 and loses its ack; V5 observes B, which
+	// the published version already rendered: nothing to recover.
+	_ = prDescStageBind(t, router, runID, 1, 41, prDescHash('b'))
+	v5 := prDescStageBind(t, router, runID, 1, 41, prDescHash('e'))
+	got = ack(v5, "skipped_human_edit", 2, prDescHash('b'))
+	if got.RecoveredVersionID != nil || got.PR.PublishedVersion.ID != v2.ID {
+		t.Fatalf("recovery ran although the published version rendered the observed region: %+v", got)
+	}
+	// V6 wrote region F (newer than V2) and lost its ack; V7 observes F: V6 is recovered, then
+	// V7 publishes.
+	v6 := prDescStageBind(t, router, runID, 1, 41, prDescHash('f'))
+	v7 := prDescStageBind(t, router, runID, 1, 41, prDescHash('7'))
+	got = ack(v7, "published", 3, prDescHash('f'))
+	if got.RecoveredVersionID == nil || *got.RecoveredVersionID != v6.ID || got.PR.PublishedVersion.ID != v7.ID {
+		t.Fatalf("newer lost ack not recovered: %+v", got)
+	}
+}
+
+// TestWorkerPrDescriptionMrIidFence (review N2): stage and bind must name the run's own PR —
+// runs.mr_iid when set, and otherwise the PR the run first staged or bound for.
+func TestWorkerPrDescriptionMrIidFence(t *testing.T) {
+	wkr := store.Worker{ID: uuid.New(), UserID: uuid.New()}
+	st := newPrDescFakeStore()
+	repoID := uuid.New()
+	router := prDescTestRouter(st, wkr)
+	conflict := func(rec *httptest.ResponseRecorder, what string) {
+		t.Helper()
+		if rec.Code != http.StatusConflict || prDescReason(t, rec) != "version_conflict" {
+			t.Fatalf("%s = %d %s, want 409 version_conflict", what, rec.Code, rec.Body.String())
+		}
+	}
+
+	// An mr_rework-style run whose runs.mr_iid is 41.
+	rework := prDescSeedRun(st, wkr, repoID, 1)
+	r := st.runs[rework]
+	r.MrIid = pgtype.Int8{Int64: 41, Valid: true}
+	st.runs[rework] = r
+	body := prDescStageBody(1, "x")
+	body.MrIid = i64(42)
+	conflict(prDescPost(t, router, rework, "stage", body, nil), "stage for another PR than runs.mr_iid")
+	var staged apitypes.PrDescriptionStageResponse
+	if rec := prDescPost(t, router, rework, "stage", prDescStageBody(1, "x"), &staged); rec.Code != http.StatusOK {
+		t.Fatalf("stage = %d", rec.Code)
+	}
+	conflict(prDescPost(t, router, rework, "bind", apitypes.PrDescriptionBindRequest{
+		ClaimGeneration: i64(1), VersionID: staged.Version.ID, MrIid: 42, RenderedRegionSha256: prDescHashA,
+	}, nil), "bind to another PR than runs.mr_iid")
+	_ = prDescStageBind(t, router, rework, 1, 41, prDescHashA)
+
+	// An issue run (no runs.mr_iid) that bound PR 50 is pinned to it.
+	issue := prDescSeedRun(st, wkr, repoID, 1)
+	_ = prDescStageBind(t, router, issue, 1, 50, prDescHashA)
+	body.MrIid = i64(51)
+	conflict(prDescPost(t, router, issue, "stage", body, nil), "stage for a second PR")
+	if rec := prDescPost(t, router, issue, "stage", prDescStageBody(1, "x"), &staged); rec.Code != http.StatusOK {
+		t.Fatalf("stage = %d", rec.Code)
+	}
+	conflict(prDescPost(t, router, issue, "bind", apitypes.PrDescriptionBindRequest{
+		ClaimGeneration: i64(1), VersionID: staged.Version.ID, MrIid: 51, RenderedRegionSha256: prDescHashB,
+	}, nil), "bind to a second PR")
+	if rec := prDescPost(t, router, issue, "bind", apitypes.PrDescriptionBindRequest{
+		ClaimGeneration: i64(1), VersionID: staged.Version.ID, MrIid: 50, RenderedRegionSha256: prDescHashB,
+	}, nil); rec.Code != http.StatusOK {
+		t.Fatalf("bind to the run's own PR = %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestWorkerPrDescriptionStageCap (auditor M4): a run holds at most
+// MaxPrDescPendingVersionsPerRun pending versions; the next stage is 409 too_many_versions.
+func TestWorkerPrDescriptionStageCap(t *testing.T) {
+	wkr := store.Worker{ID: uuid.New(), UserID: uuid.New()}
+	st := newPrDescFakeStore()
+	runID := prDescSeedRun(st, wkr, uuid.New(), 1)
+	router := prDescTestRouter(st, wkr)
+	for i := 0; i < workersvc.MaxPrDescPendingVersionsPerRun; i++ {
+		if rec := prDescPost(t, router, runID, "stage", prDescStageBody(1, "x"), nil); rec.Code != http.StatusOK {
+			t.Fatalf("stage %d = %d %s", i, rec.Code, rec.Body.String())
+		}
+	}
+	rec := prDescPost(t, router, runID, "stage", prDescStageBody(1, "x"), nil)
+	if rec.Code != http.StatusConflict || prDescReason(t, rec) != "too_many_versions" {
+		t.Fatalf("stage past the cap = %d %s, want 409 too_many_versions", rec.Code, rec.Body.String())
+	}
+	if len(st.versions) != workersvc.MaxPrDescPendingVersionsPerRun {
+		t.Fatalf("versions = %d, want %d", len(st.versions), workersvc.MaxPrDescPendingVersionsPerRun)
+	}
+	// Another run of the same worker has its own budget.
+	other := prDescSeedRun(st, wkr, uuid.New(), 1)
+	if rec := prDescPost(t, router, other, "stage", prDescStageBody(1, "x"), nil); rec.Code != http.StatusOK {
+		t.Fatalf("another run's stage = %d", rec.Code)
+	}
+}
+
+// prDescOverlayStore is a runsStore (GetRun's reads) plus the PR-description reader surface,
+// served by a prDescFakeStore or failing with readErr.
+type prDescOverlayStore struct {
+	*runsStore
+	desc    *prDescFakeStore
+	readErr error
+}
+
+func (s *prDescOverlayStore) GetPrDescription(ctx context.Context, a store.GetPrDescriptionParams) (store.PrDescription, error) {
+	if s.readErr != nil {
+		return store.PrDescription{}, s.readErr
+	}
+	return s.desc.GetPrDescription(ctx, a)
+}
+
+func (s *prDescOverlayStore) GetPrDescriptionVersionByID(ctx context.Context, id uuid.UUID) (store.PrDescriptionVersion, error) {
+	return s.desc.GetPrDescriptionVersionByID(ctx, id)
+}
+
+func (s *prDescOverlayStore) FindPrDescriptionVersionByRegionHash(ctx context.Context, a store.FindPrDescriptionVersionByRegionHashParams) (store.PrDescriptionVersion, error) {
+	return s.desc.FindPrDescriptionVersionByRegionHash(ctx, a)
+}
+
+func (s *prDescOverlayStore) LatestBoundPrDescriptionVersionForRun(ctx context.Context, runID uuid.UUID) (store.PrDescriptionVersion, error) {
+	return s.desc.LatestBoundPrDescriptionVersionForRun(ctx, runID)
+}
+
+// TestGetRunPrDescriptionOverlay (review N6): GetRun fills pr_description and
+// pr_description_outcome from the run's PR record, and an overlay read error still answers 200
+// with both null.
+func TestGetRunPrDescriptionOverlay(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	wkr := store.Worker{ID: uuid.New(), UserID: owner.ID}
+	desc := newPrDescFakeStore()
+	repoID := uuid.New()
+	runID := prDescSeedRun(desc, wkr, repoID, 1)
+	router := prDescTestRouter(desc, wkr)
+	v := prDescStageBind(t, router, runID, 1, 41, prDescHashA)
+	if rec := prDescPost(t, router, runID, "ack", apitypes.PrDescriptionAckRequest{ClaimGeneration: i64(1), VersionID: v.ID, Outcome: "published"}, nil); rec.Code != http.StatusOK {
+		t.Fatalf("ack = %d %s", rec.Code, rec.Body.String())
+	}
+	run := desc.runs[runID]
+
+	get := func(t *testing.T, readErr error) (int, map[string]json.RawMessage) {
+		t.Helper()
+		st := &prDescOverlayStore{runsStore: &runsStore{ownerID: owner.ID, run: run}, desc: desc, readErr: readErr}
+		h := newRunsHandler(t, st)
+		h.q = store.New(noRowUserDB{}) // GetRun's other repo-ful reads find nothing
+		rec := httptest.NewRecorder()
+		h.GetRun(rec, runReq(owner, runID))
+		var body struct {
+			Run map[string]json.RawMessage `json:"run"`
+		}
+		if rec.Code == http.StatusOK {
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+		}
+		return rec.Code, body.Run
+	}
+
+	code, got := get(t, nil)
+	if code != http.StatusOK {
+		t.Fatalf("GetRun = %d", code)
+	}
+	var pd apitypes.RunPrDescriptionDTO
+	if err := json.Unmarshal(got["pr_description"], &pd); err != nil {
+		t.Fatalf("pr_description: %v (%s)", err, got["pr_description"])
+	}
+	if pd.MrIid != 41 || pd.Source != "generated" || pd.PublishedAt == nil || pd.Fields.Summary != "text" || pd.HeadSha != v.HeadSha {
+		t.Fatalf("pr_description = %+v", pd)
+	}
+	if string(got["pr_description_outcome"]) != `"published"` {
+		t.Fatalf("pr_description_outcome = %s", got["pr_description_outcome"])
+	}
+
+	code, got = get(t, errors.New("db down"))
+	if code != http.StatusOK {
+		t.Fatalf("GetRun with an overlay error = %d, want 200", code)
+	}
+	if string(got["pr_description"]) != "null" || string(got["pr_description_outcome"]) != "null" {
+		t.Fatalf("overlay error must leave both null, got %s / %s", got["pr_description"], got["pr_description_outcome"])
 	}
 }

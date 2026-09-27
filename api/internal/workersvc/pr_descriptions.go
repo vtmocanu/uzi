@@ -42,6 +42,12 @@ const (
 
 	maxPrDescTargetBranchBytes = 255
 	maxPrDescSizeLines         = int64(1) << 40
+
+	// MaxPrDescPendingVersionsPerRun caps a run's pending versions (every generation). A normal
+	// publication stages once, plus at most one D11 regeneration; a stage past the cap is 409
+	// too_many_versions. Pending versions are never auto-abandoned: lost-ack recovery matches
+	// against them.
+	MaxPrDescPendingVersionsPerRun = 20
 )
 
 var validPrDescSources = map[string]bool{"generated": true, "lead_only": true, prDescSourceDeterministic: true}
@@ -63,8 +69,13 @@ var (
 	// lock_version (another writer acked first) → 409 reason lock_conflict.
 	ErrPrDescriptionLockConflict = errors.New("pr description: lock_version changed")
 	// ErrPrDescriptionVersionConflict: the version cannot take this transition (already bound to
-	// another PR, not bound yet, already published or abandoned) → 409 reason version_conflict.
+	// another PR, not bound yet, already published or abandoned), or the request names a PR other
+	// than the run's own (runs.mr_iid, or the PR the run first staged/bound for) → 409 reason
+	// version_conflict.
 	ErrPrDescriptionVersionConflict = errors.New("pr description: version state does not allow this")
+	// ErrPrDescriptionTooManyVersions: the run already holds MaxPrDescPendingVersionsPerRun
+	// pending versions → 409 reason too_many_versions.
+	ErrPrDescriptionTooManyVersions = errors.New("pr description: too many pending versions for this run")
 	// ErrPrDescriptionVersionNotFound: no such version for this run → 404.
 	ErrPrDescriptionVersionNotFound = errors.New("pr description: version not found for this run")
 	// errPrDescriptionNoTx: neither a pgx transaction source nor a transactional store is wired.
@@ -87,6 +98,8 @@ type PrDescQueries interface {
 	SetPrDescriptionPublished(ctx context.Context, arg store.SetPrDescriptionPublishedParams) (int64, error)
 	SetPrDescriptionOutcome(ctx context.Context, arg store.SetPrDescriptionOutcomeParams) (int64, error)
 	RecoverPrDescriptionLostAck(ctx context.Context, arg store.RecoverPrDescriptionLostAckParams) (int64, error)
+	FirstPrDescriptionMrIidForRun(ctx context.Context, runID uuid.UUID) (int64, error)
+	CountPendingPrDescriptionVersionsForRun(ctx context.Context, runID uuid.UUID) (int64, error)
 }
 
 // PrDescTx is one open PR-description transaction.
@@ -197,6 +210,8 @@ func cleanPrDescTargetBranch(s string) (string, bool) {
 	return clean, true
 }
 
+// validPrDescSize bounds every count; an unavailable size carries all-zero buckets (they are
+// never rendered, so a non-zero one is a worker bug).
 func validPrDescSize(sz *apitypes.PrDescriptionSize) bool {
 	if sz == nil {
 		return true
@@ -208,13 +223,38 @@ func validPrDescSize(sz *apitypes.PrDescriptionSize) bool {
 		if b.Added < 0 || b.Deleted < 0 || b.Added > maxPrDescSizeLines || b.Deleted > maxPrDescSizeLines {
 			return false
 		}
+		if sz.Unavailable && (b.Added != 0 || b.Deleted != 0) {
+			return false
+		}
 	}
 	return true
 }
 
+// checkPrDescRunPR is the mr_iid fence (stage with an mr_iid, and bind): the PR a request names
+// must be the run's own. When runs.mr_iid is set (an mr_rework run, or a run whose completion
+// recorded its PR) it must equal that; and once the run has a version naming a PR, every later
+// version names the same PR.
+func checkPrDescRunPR(ctx context.Context, q PrDescQueries, run store.Run, mrIid int64) error {
+	if run.MrIid.Valid && run.MrIid.Int64 != mrIid {
+		return ErrPrDescriptionVersionConflict
+	}
+	first, err := q.FirstPrDescriptionMrIidForRun(ctx, run.ID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil
+	case err != nil:
+		return err
+	case first != mrIid:
+		return ErrPrDescriptionVersionConflict
+	}
+	return nil
+}
+
 // StagePrDescription validates and sanitizes the worker's RAW fields, then stores a pending
 // version for the run's snapshot (D9 step 1). The returned version's Fields are the sanitized
-// fields: the only text the renderer may publish.
+// fields: the only text the renderer may publish. An mr_iid, when sent, must be the run's own PR
+// (checkPrDescRunPR); a run already holding MaxPrDescPendingVersionsPerRun pending versions is
+// refused (ErrPrDescriptionTooManyVersions).
 func (s *Service) StagePrDescription(ctx context.Context, wkr store.Worker, runID uuid.UUID, req apitypes.PrDescriptionStageRequest) (apitypes.PrDescriptionVersionDTO, error) {
 	if req.ClaimGeneration == nil || !validPrDescSources[req.Source] || !validPrDescSize(req.Size) {
 		return apitypes.PrDescriptionVersionDTO{}, ErrPrDescriptionInvalid
@@ -257,6 +297,19 @@ func (s *Service) StagePrDescription(ctx context.Context, wkr store.Worker, runI
 		if err != nil {
 			return err
 		}
+		if req.MrIid != nil {
+			if err := checkPrDescRunPR(ctx, q, run, *req.MrIid); err != nil {
+				return err
+			}
+		}
+		// The count is read after lockPrDescRun has row-locked the run (FOR UPDATE).
+		pending, err := q.CountPendingPrDescriptionVersionsForRun(ctx, run.ID)
+		if err != nil {
+			return err
+		}
+		if pending >= MaxPrDescPendingVersionsPerRun {
+			return ErrPrDescriptionTooManyVersions
+		}
 		out, err = q.InsertPrDescriptionVersion(ctx, store.InsertPrDescriptionVersionParams{
 			RunID: run.ID, ClaimGeneration: run.ClaimGeneration, RepoID: uuid.UUID(run.RepoID.Bytes),
 			MrIid: mr, Fields: fieldsJSON, Size: sizeJSON,
@@ -273,7 +326,8 @@ func (s *Service) StagePrDescription(ctx context.Context, wkr store.Worker, runI
 // BindPrDescription binds the run's pending version to its PR and records the rendered region
 // hash, creating the PR's pr_descriptions row when absent, in one transaction (D9 step 2). It
 // returns the bound version and the PR's current state (lock_version, published version).
-// Re-binding the same version to the same PR is idempotent (the hash is updated).
+// Re-binding the same version to the same PR is idempotent (the hash is updated). The PR must
+// be the run's own (checkPrDescRunPR).
 func (s *Service) BindPrDescription(ctx context.Context, wkr store.Worker, runID uuid.UUID, req apitypes.PrDescriptionBindRequest) (apitypes.PrDescriptionBindResponse, error) {
 	versionID, err := uuid.Parse(req.VersionID)
 	if err != nil || req.ClaimGeneration == nil || req.MrIid <= 0 || !prDescSHA256Hex.MatchString(req.RenderedRegionSha256) {
@@ -283,6 +337,9 @@ func (s *Service) BindPrDescription(ctx context.Context, wkr store.Worker, runID
 	err = s.withPrDescTx(ctx, func(q PrDescQueries) error {
 		run, err := lockPrDescRun(ctx, q, wkr, runID, *req.ClaimGeneration)
 		if err != nil {
+			return err
+		}
+		if err := checkPrDescRunPR(ctx, q, run, req.MrIid); err != nil {
 			return err
 		}
 		repoID := uuid.UUID(run.RepoID.Bytes)
@@ -326,9 +383,12 @@ func (s *Service) BindPrDescription(ctx context.Context, wkr store.Worker, runID
 // AckPrDescription records the outcome of the forge write for a bound version, compare-and-
 // swapped on expected_lock_version (D9 step 3). A published outcome points the PR at the version
 // and marks it published; any other outcome records last_outcome only and abandons the version,
-// leaving published_version_id untouched. When observed_region_sha256 equals a PENDING version's
-// rendered hash for the same PR, that version is acknowledged as published first (D9 step 4,
-// lost-ack recovery). A retry of an already-applied ack returns the current state.
+// leaving published_version_id untouched. A published outcome needs a BOUND version (mr_iid and
+// rendered_region_sha256 set): a version staged with an mr_iid but never bound is
+// version_conflict, since nothing records what it wrote. When observed_region_sha256 equals a
+// PENDING version's rendered hash for the same PR, that version is acknowledged as published
+// first (D9 step 4, lost-ack recovery; see recoverPrDescLostAck for when it is skipped). A retry
+// of an already-applied ack returns the current state.
 func (s *Service) AckPrDescription(ctx context.Context, wkr store.Worker, runID uuid.UUID, req apitypes.PrDescriptionAckRequest) (apitypes.PrDescriptionAckResponse, error) {
 	versionID, err := uuid.Parse(req.VersionID)
 	if err != nil || req.ClaimGeneration == nil || !validPrDescOutcomes[req.Outcome] || req.ExpectedLockVersion < 0 {
@@ -355,7 +415,7 @@ func (s *Service) AckPrDescription(ctx context.Context, wkr store.Worker, runID 
 			return ErrPrDescriptionVersionNotFound
 		}
 		if !peek.MrIid.Valid {
-			return ErrPrDescriptionVersionConflict // never bound: there is no PR to ack against
+			return ErrPrDescriptionVersionConflict // no PR named yet: there is nothing to ack against
 		}
 		repoID, mrIid := uuid.UUID(run.RepoID.Bytes), peek.MrIid.Int64
 		pr, err := q.GetPrDescriptionForUpdate(ctx, store.GetPrDescriptionForUpdateParams{RepoID: repoID, MrIid: mrIid})
@@ -379,6 +439,9 @@ func (s *Service) AckPrDescription(ctx context.Context, wkr store.Worker, runID 
 				return err
 			}
 			return ErrPrDescriptionVersionConflict
+		}
+		if req.Outcome == PrDescOutcomePublished && !v.RenderedRegionSha256.Valid {
+			return ErrPrDescriptionVersionConflict // never bound: no record of what was written
 		}
 		if pr.LockVersion != req.ExpectedLockVersion {
 			return ErrPrDescriptionLockConflict
@@ -426,8 +489,24 @@ func (s *Service) AckPrDescription(ctx context.Context, wkr store.Worker, runID 
 
 // recoverPrDescLostAck acknowledges, as published, the PENDING version of this PR whose rendered
 // region hash equals the one observed on the forge: its write landed but its ack was lost. It
-// returns that version's id, or nil when nothing needed recovering.
+// returns that version's id, or nil when nothing needed recovering. Recovery never moves the PR
+// backwards: it is skipped when the currently published version already rendered the observed
+// region (the forge shows what the record says), and when the matching pending version was
+// created before (or with) the currently published one (an older write whose text a later
+// publication superseded, re-observed because a human restored it or two versions rendered the
+// same text).
 func recoverPrDescLostAck(ctx context.Context, q PrDescQueries, pr store.PrDescription, acking store.PrDescriptionVersion, observed string) (*string, error) {
+	var published *store.PrDescriptionVersion
+	if pr.PublishedVersionID.Valid {
+		pv, err := q.GetPrDescriptionVersionByID(ctx, uuid.UUID(pr.PublishedVersionID.Bytes))
+		if err != nil {
+			return nil, err
+		}
+		if pv.RenderedRegionSha256.Valid && pv.RenderedRegionSha256.String == observed {
+			return nil, nil
+		}
+		published = &pv
+	}
 	m, err := q.FindPrDescriptionVersionByRegionHash(ctx, store.FindPrDescriptionVersionByRegionHashParams{
 		RepoID: pr.RepoID, MrIid: pr.MrIid, State: prDescStatePending, RenderedRegionSha256: observed,
 	})
@@ -440,6 +519,9 @@ func recoverPrDescLostAck(ctx context.Context, q PrDescQueries, pr store.PrDescr
 	if m.ID == acking.ID {
 		// The forge already shows the acking version's own region (a retried write): the ack
 		// that follows publishes it; there is no other version to recover.
+		return nil, nil
+	}
+	if published != nil && !m.CreatedAt.Time.After(published.CreatedAt.Time) {
 		return nil, nil
 	}
 	if _, err := q.MarkPrDescriptionVersionPublished(ctx, m.ID); err != nil {

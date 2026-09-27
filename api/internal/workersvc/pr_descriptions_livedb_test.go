@@ -366,3 +366,129 @@ func TestAssembleClaimCarriesPrDescriptionLiveDB(t *testing.T) {
 		t.Fatalf("refresh claim pr_description = %+v", payload.PrDescription)
 	}
 }
+
+// TestPrDescriptionLostAckNeverMovesBackwardsLiveDB (review N1), against the real SQL: V1 wrote
+// region A and lost its ack, V2 wrote B and acked; V3 observing A (a human restored the older
+// text) must NOT recover V1 over the newer published V2. A pending version rendering the same
+// region as the published one is not recovered either; a NEWER lost ack still is.
+func TestPrDescriptionLostAckNeverMovesBackwardsLiveDB(t *testing.T) {
+	p := setupPrDescLive(t)
+	v1 := p.stage(t, 1, "V1.", nil)
+	p.bind(t, 1, v1.ID, 21, prDescLiveHashA)
+	v2 := p.stage(t, 1, "V2.", gen(21))
+	p.bind(t, 1, v2.ID, 21, prDescLiveHashB)
+	if _, err := p.ack(1, v2.ID, "published", 0, nil); err != nil {
+		t.Fatalf("publish v2: %v", err)
+	}
+
+	v3 := p.stage(t, 1, "V3.", gen(21))
+	p.bind(t, 1, v3.ID, 21, prDescLiveHashC)
+	observed := prDescLiveHashA
+	a, err := p.ack(1, v3.ID, "skipped_human_edit", 1, &observed)
+	if err != nil || a.RecoveredVersionID != nil || a.PR.PublishedVersion == nil || a.PR.PublishedVersion.ID != v2.ID {
+		t.Fatalf("older pending recovered over the published version: %+v, %v", a, err)
+	}
+	if pub, _, _ := p.dbPR(t, 21); pub == nil || pub.String() != v2.ID {
+		t.Fatalf("published_version_id = %v, want v2", pub)
+	}
+	if st := p.dbVersionState(t, v1.ID); st != "pending" {
+		t.Fatalf("v1 state = %q, want pending", st)
+	}
+
+	// Same region as the published V2: nothing to recover.
+	same := p.stage(t, 1, "Same text as V2.", gen(21))
+	p.bind(t, 1, same.ID, 21, prDescLiveHashB)
+	v4 := p.stage(t, 1, "V4.", gen(21))
+	p.bind(t, 1, v4.ID, 21, prDescLiveHashC)
+	observed = prDescLiveHashB
+	if a, err = p.ack(1, v4.ID, "skipped_human_edit", 2, &observed); err != nil || a.RecoveredVersionID != nil || a.PR.PublishedVersion.ID != v2.ID {
+		t.Fatalf("recovery ran on the published version's own region: %+v, %v", a, err)
+	}
+
+	// A newer lost ack is recovered.
+	newer := p.stage(t, 1, "Newer, ack lost.", gen(21))
+	p.bind(t, 1, newer.ID, 21, prDescLiveHashA)
+	v5 := p.stage(t, 1, "V5.", gen(21))
+	p.bind(t, 1, v5.ID, 21, prDescLiveHashC)
+	observed = prDescLiveHashA
+	a, err = p.ack(1, v5.ID, "skipped_human_edit", 3, &observed)
+	if err != nil || a.RecoveredVersionID == nil || *a.RecoveredVersionID != newer.ID || a.PR.PublishedVersion.ID != newer.ID {
+		t.Fatalf("newer lost ack not recovered: %+v, %v", a, err)
+	}
+}
+
+// TestPrDescriptionPublishedNeedsBindLiveDB (review B2): a version staged with an mr_iid and
+// never bound cannot be acked published, and the schema refuses a published row without its
+// rendered hash.
+func TestPrDescriptionPublishedNeedsBindLiveDB(t *testing.T) {
+	p := setupPrDescLive(t)
+	v1 := p.stage(t, 1, "Bound.", nil)
+	p.bind(t, 1, v1.ID, 31, prDescLiveHashA)
+	if _, err := p.ack(1, v1.ID, "published", 0, nil); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	unbound := p.stage(t, 1, "Staged for the PR, never bound.", gen(31))
+	if _, err := p.ack(1, unbound.ID, "published", 1, nil); !errors.Is(err, ErrPrDescriptionVersionConflict) {
+		t.Fatalf("published ack of an unbound version err = %v, want version_conflict", err)
+	}
+	if pub, lock, _ := p.dbPR(t, 31); pub == nil || pub.String() != v1.ID || lock != 1 {
+		t.Fatalf("pr moved: %v lock %d", pub, lock)
+	}
+	if _, err := p.env.pool.Exec(p.env.ctx,
+		`UPDATE pr_description_versions SET state = 'published' WHERE id = $1`, unbound.ID); err == nil ||
+		!strings.Contains(err.Error(), "pr_description_versions_published_bound") {
+		t.Fatalf("schema accepted a published row without its hash: %v", err)
+	}
+}
+
+// TestPrDescriptionMrIidFenceLiveDB (review N2 / auditor L3): stage and bind must name the run's
+// own PR: runs.mr_iid when set, otherwise the PR the run first staged or bound for.
+func TestPrDescriptionMrIidFenceLiveDB(t *testing.T) {
+	p := setupPrDescLive(t)
+	v := p.stage(t, 1, "First PR.", nil)
+	p.bind(t, 1, v.ID, 40, prDescLiveHashA)
+	if _, err := p.svc.StagePrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionStageRequest{
+		ClaimGeneration: gen(1), Source: "lead_only", BaseSha: "abcdef0", HeadSha: "abcdef1", TargetBranch: "main", MrIid: gen(41),
+	}); !errors.Is(err, ErrPrDescriptionVersionConflict) {
+		t.Fatalf("stage for a second PR err = %v", err)
+	}
+	other := p.stage(t, 1, "Unbound.", nil)
+	if _, err := p.svc.BindPrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionBindRequest{
+		ClaimGeneration: gen(1), VersionID: other.ID, MrIid: 41, RenderedRegionSha256: prDescLiveHashB,
+	}); !errors.Is(err, ErrPrDescriptionVersionConflict) {
+		t.Fatalf("bind to a second PR err = %v", err)
+	}
+
+	// runs.mr_iid pins the PR even before any version exists.
+	p2 := setupPrDescLive(t)
+	p2.env.exec(`UPDATE runs SET mr_iid = 60 WHERE id = $1`, p2.runID)
+	if _, err := p2.svc.StagePrDescription(p2.env.ctx, p2.wkr, p2.runID, apitypes.PrDescriptionStageRequest{
+		ClaimGeneration: gen(1), Source: "lead_only", BaseSha: "abcdef0", HeadSha: "abcdef1", TargetBranch: "main", MrIid: gen(61),
+	}); !errors.Is(err, ErrPrDescriptionVersionConflict) {
+		t.Fatalf("stage against runs.mr_iid err = %v", err)
+	}
+	w := p2.stage(t, 1, "Rework.", nil)
+	if _, err := p2.svc.BindPrDescription(p2.env.ctx, p2.wkr, p2.runID, apitypes.PrDescriptionBindRequest{
+		ClaimGeneration: gen(1), VersionID: w.ID, MrIid: 61, RenderedRegionSha256: prDescLiveHashB,
+	}); !errors.Is(err, ErrPrDescriptionVersionConflict) {
+		t.Fatalf("bind against runs.mr_iid err = %v", err)
+	}
+	p2.bind(t, 1, w.ID, 60, prDescLiveHashB)
+}
+
+// TestPrDescriptionStageCapLiveDB (auditor M4): the run's pending versions are capped.
+func TestPrDescriptionStageCapLiveDB(t *testing.T) {
+	p := setupPrDescLive(t)
+	for i := 0; i < MaxPrDescPendingVersionsPerRun; i++ {
+		p.stage(t, 1, "x", nil)
+	}
+	if _, err := p.svc.StagePrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionStageRequest{
+		ClaimGeneration: gen(1), Source: "lead_only", BaseSha: "abcdef0", HeadSha: "abcdef1", TargetBranch: "main",
+	}); !errors.Is(err, ErrPrDescriptionTooManyVersions) {
+		t.Fatalf("stage past the cap err = %v", err)
+	}
+	var n int
+	if err := p.env.pool.QueryRow(p.env.ctx, `SELECT count(*) FROM pr_description_versions WHERE run_id = $1`, p.runID).Scan(&n); err != nil || n != MaxPrDescPendingVersionsPerRun {
+		t.Fatalf("stored versions = %d (%v), want %d", n, err, MaxPrDescPendingVersionsPerRun)
+	}
+}

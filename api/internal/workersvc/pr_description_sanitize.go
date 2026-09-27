@@ -15,20 +15,22 @@ import (
 //   - RAW caps bound what a worker may send at all. Over them the request is refused (400):
 //     the worker mirrors the layout limits before posting, so an over-cap body is a bug or an
 //     attack, never a legitimate description.
-//   - LAYOUT caps bound what is published. The sanitized text is trimmed to them (rune-safe,
-//     with an ellipsis), and a list longer than its layout cap keeps its first entries.
+//   - LAYOUT caps bound what is published, in BYTES of the final sanitized text (after every
+//     inserted U+200B breaker and backslash escape). A longer text is cut at a rune boundary
+//     and ends with "…" inside the cap; a list longer than its layout cap keeps its first
+//     entries. The worker mirrors these numbers (see /tmp/plan1798/m4a-shapes.md).
 const (
 	MaxPrDescSummaryRawBytes = 4000
 	MaxPrDescItemRawBytes    = 1000
 	MaxPrDescListRawEntries  = 50
 
-	PrDescSummaryMaxChars       = 600
-	PrDescItemMaxChars          = 200
+	PrDescSummaryMaxBytes       = 600
+	PrDescItemMaxBytes          = 200
 	PrDescMaxChanges            = 5
 	PrDescMaxScopeNotes         = 8
 	PrDescMaxReviewPointers     = 2
 	PrDescMaxVerification       = 20
-	PrDescVerifyCommandMaxChars = 200
+	PrDescVerifyCommandMaxBytes = 200
 )
 
 // ErrPrDescriptionInvalid is a malformed stage request (an unknown enum, an over-cap raw field,
@@ -44,18 +46,23 @@ var prDescHexSHA = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
 // so the agent renderer must publish the api-returned fields WITHOUT a Cf strip.
 const zeroWidthSpace = "\u200B"
 
+const prDescEllipsis = "…"
+
 var (
 	// HTML comments, including an unterminated opener that runs to the end of the text.
 	prDescHTMLComment      = regexp.MustCompile(`(?s)<!--.*?-->`)
 	prDescUnterminatedCmnt = regexp.MustCompile(`(?s)<!--.*$`)
-	// Markdown images, inline `![alt](target)` and reference `![alt][ref]`.
-	prDescImageInline = regexp.MustCompile(`!\[[^\]]*\]\([^)]*\)`)
-	prDescImageRef    = regexp.MustCompile(`!\[[^\]]*\]\[[^\]]*\]`)
-	// Markdown links keep their text and lose their target.
+	// Markdown images in every form: inline `![alt](target)`, full `![alt][ref]`, collapsed
+	// `![alt][]` and shortcut `![alt]`. The whole image goes, alt text included.
+	prDescImage = regexp.MustCompile(`!\[[^\]]*\](?:\([^)]*\)|\[[^\]]*\])?`)
+	// Markdown links keep their text and lose their target (inline, full and collapsed).
 	prDescLinkInline = regexp.MustCompile(`\[([^\]]*)\]\([^)]*\)`)
 	prDescLinkRef    = regexp.MustCompile(`\[([^\]]*)\]\[[^\]]*\]`)
-	// A reference definition line `[ref]: target`.
-	prDescLinkDef = regexp.MustCompile(`(?m)^[ \t]*\[[^\]]+\]:[ \t]*\S.*$`)
+	// A reference definition `[label]: target`, ANYWHERE and with any whitespace (newlines
+	// included) between the colon and the target, so a definition split across lines goes too.
+	// Remaining brackets are escaped later, so no definition or shortcut reference can form in
+	// the output either way.
+	prDescLinkDef = regexp.MustCompile(`\[[^\]]+\]:[\s\p{Z}]*\S*`)
 	// Angle-bracket autolinks become the bare URL text.
 	prDescAutolink = regexp.MustCompile(`<((?i:https?|ftp)://[^\s<>]+)>`)
 	// Anything tag-shaped: an element, a closing tag, a declaration or a processing instruction.
@@ -63,107 +70,257 @@ var (
 	// A `<` that could still open markup once a later `>` arrives (the renderer's own markers
 	// follow the region), so it is dropped.
 	prDescOpenAngle = regexp.MustCompile(`<([/!?A-Za-z])`)
-	prDescSpaces    = regexp.MustCompile(`[ \t\r\n\f\v\x{00A0}]+`)
+	// Comment delimiters that survived everything above (`a ----> b`, `--!>`) fold to `->`.
+	prDescCommentClose = regexp.MustCompile(`-{2,}!?>`)
+	prDescCommentOpen  = regexp.MustCompile(`<!-{2,}`)
+	prDescSpaces       = regexp.MustCompile(`[\s\p{Z}]+`)
+
+	// Code-fence runs anywhere (the renderer may place a field at the start of a line).
+	prDescFenceRun = regexp.MustCompile("`{3,}|~{3,}")
+	// A leading ordered-list marker `12.` / `12)`: group 1 is the delimiter to escape.
+	prDescLeadingOrdered = regexp.MustCompile(`^\d{1,9}([.)])`)
 
 	// A mention: `@` at the start or after a non-word character, followed by a handle character.
 	// `a@b.com` is not a mention (the `@` follows a word character) and stays as written.
 	prDescMention = regexp.MustCompile(`(^|[^A-Za-z0-9_])@([A-Za-z0-9_-])`)
 
-	// Closing directives, the GitLab-superset pattern (approver point 4): every GitLab default
-	// keyword form (a superset of GitHub's and Forgejo's), case-insensitive, optional colon,
-	// optional `issue `/`issues `, then a same-project, cross-project or URL reference.
-	// Emphasis markers around the keyword and colon are tolerated so `**Fixes** #1` matches.
+	// Closing directives, the GitLab-superset pattern (approver point 4) widened to err on the
+	// side of neutralising: every GitLab default keyword form (a superset of GitHub's and
+	// Forgejo's), case-insensitive, then any run of ASCII or Unicode spaces with an optional
+	// colon (none needed: `Fixes:#12`), an optional `issue`/`issues`, then a same-project,
+	// cross-project, external-tracker or URL reference. It runs over views of the text with the
+	// emphasis, code, bracket and escape markers removed or blanked (see
+	// neutralizeClosingDirectives), so `_Fixes_ #12`, `Fix**es** #12` and `Fixes [#12]` match.
 	// Group 1 is the keyword; the whole match is only a locator.
 	prDescClosing = regexp.MustCompile(`(?i)\b(clos(?:e[sd]?|ing)|fix(?:e[sd]|ing)?|resolv(?:e[sd]?|ing)|implement(?:s|ed|ing)?)\b` +
-		"[*_~`]*:?[*_~`]*" + `[\s\x{00A0}]+(?:issues?[\s\x{00A0}]+)?` + "[*_~`]*" +
-		`(?:#\d+|gh-\d+|[\w.-]+(?:/[\w.-]+)*#\d+|https?://[^\s<>()\[\]]*?/(?:issues|work_items)/\d+)`)
+		`[\s\p{Z}]*:?[\s\p{Z}]*(?:issues?[\s\p{Z}]*)?` +
+		`(?:#\d+|gh-\d+|[\w.-]+(?:/[\w.-]+)*#\d+|[A-Za-z][A-Za-z0-9_]+-\d+|https?://[^\s<>()]*?/(?:issues|work_items)/\d+)`)
 )
 
+// prDescClosingMarkers are the characters a closing-directive VIEW removes or blanks: markdown
+// emphasis/strikethrough/code markers, brackets, and the backslash escapes this sanitizer adds.
+const prDescClosingMarkers = "*_~`[]\\"
+
 // SanitizePrDescriptionText renders one untrusted, model- or lead-authored PR-description
-// string safe to publish inside uzi's description region (PRD #1798 D7). The api's result is the
-// ONLY text the renderer may publish. Steps, in order:
+// string safe to publish inside uzi's description region (PRD #1798 D7), bounded to maxBytes
+// bytes. The api's result is the ONLY text the renderer may publish. Steps, in order:
 //
-//  1. HTML entities are decoded (to a fixed point), so an encoded `&lt;!--`, `&#35;` or `&#64;`
-//     is seen by every later step as the character it renders as.
-//  2. Control / bidi / format runes are stripped and secret shapes scrubbed (ScrubUntrustedText).
-//  3. HTML comments (terminated or not) are removed, so a forged `<!-- uzi:... -->` marker or a
-//     review bot's marker cannot survive; images are removed; links keep only their text;
-//     autolinks become bare URL text; tag-shaped markup is removed, and any `<` that could still
-//     open markup is dropped. A stray `-->` is folded to `->`.
-//  4. Whitespace (newlines included) collapses to single spaces: every field is one paragraph or
-//     one list item, so model text cannot add headings or sections of its own.
-//  5. Closing directives are neutralised by a zero-width space after the keyword's first letter,
-//     and mentions by one after the `@`.
-//  6. The result is trimmed to maxChars runes (an ellipsis marks a cut).
+//  1. To a fixed point (loop until nothing changes, at most 2*len(s)+8 passes over the
+//     byte-capped input; if that bound is hit the result is "", fail closed): HTML entities are decoded
+//     to their own fixed point, control / bidi / format runes are stripped and secret shapes
+//     scrubbed (ScrubUntrustedText), markup is removed (stripPrDescMarkup), and whitespace
+//     (newlines included) collapses to single spaces. Running the scrub on every pass means a
+//     token split by markup (`glpat-AAAA<b></b>BBBB`) is scrubbed once the markup is gone, and
+//     running the decode on every pass means an entity re-formed by a removal
+//     (`&<b></b>#64;`) is decoded and then handled like the character it renders as. The loop
+//     only ends on a pass that changed nothing, so its result has no entity left that
+//     html.UnescapeString would decode.
+//  2. The text is cut to fit maxBytes (rune-safe, "…" marks a cut), with headroom re-measured
+//     after step 3 until the final text fits.
+//  3. Markdown block syntax is neutralised with backslash escapes: a leading `#`, `>`, `|`,
+//     `=`, fence, list or ordered-list marker, every code-fence run of three or more backticks
+//     or tildes, every `[` / `]` (no link, image, reference or definition can form), and a
+//     trailing odd backslash. Closing directives are neutralised by a zero-width space after
+//     the keyword's first letter, and mentions by one after the `@`. These run on the CUT
+//     text, so a breaker is never cut off a keyword that still has its reference.
 //
-// The output never contains `<!--`, `-->` or a tag-shaped `<`. A second pass over output that was
-// not trimmed returns it unchanged. A trim can cut a neutralised keyword off from its reference;
-// a second pass then drops that keyword's breaker, which is safe because the text is no longer a
-// directive.
-func SanitizePrDescriptionText(s string, maxChars int) string {
-	for i := 0; i < 4; i++ {
-		u := html.UnescapeString(s)
-		if u == s {
-			break
-		}
-		s = u
+// Each field is meant to be one paragraph or one list item, so model text is kept from adding
+// headings, quotes, lists, code blocks or sections of its own. The tests
+// (pr_description_sanitize_test.go, assertPrDescInert) check every output for `<!--`, `-->`, a
+// tag-shaped `<`, a live bracket and a closing directive, and check that output which was not
+// cut is returned unchanged by a second pass.
+func SanitizePrDescriptionText(s string, maxBytes int) string {
+	s, ok := prDescNormalize(s)
+	if !ok || maxBytes <= 0 {
+		return ""
 	}
-	s = ScrubUntrustedText(s)
-	s = stripPrDescMarkup(s)
-	s = strings.TrimSpace(prDescSpaces.ReplaceAllString(s, " "))
-	s = neutralizeClosingDirectives(s)
-	s = breakMentions(s)
-	return trimRunes(s, maxChars)
+	budget := maxBytes
+	for budget > 0 {
+		out := finalizePrDescText(cutPrDescBytes(s, budget))
+		if len(out) <= maxBytes {
+			return out
+		}
+		budget -= len(out) - maxBytes
+	}
+	return ""
 }
 
-// stripPrDescMarkup removes HTML and markdown link/image syntax. Each removal can expose a new
-// instance of an earlier pattern (`<!<!---->--` becomes `<!--`), so it loops to a fixed point.
-func stripPrDescMarkup(s string) string {
-	for i := 0; i < 8; i++ {
+// prDescNormalize runs step 1 of SanitizePrDescriptionText to its fixed point. It reports false
+// when the pass bound is exhausted without converging.
+func prDescNormalize(s string) (string, bool) {
+	limit := 2*len(s) + 8
+	for i := 0; i < limit; i++ {
 		prev := s
-		// Terminated comments first, to a fixed point, so a comment exposed by removing another
-		// (`<!<!---->-- x -->`) is removed as a comment rather than read as unterminated.
-		for j := 0; j < 8; j++ {
-			next := prDescHTMLComment.ReplaceAllString(s, "")
-			if next == s {
-				break
-			}
-			s = next
-		}
-		s = prDescUnterminatedCmnt.ReplaceAllString(s, "")
-		s = prDescImageInline.ReplaceAllString(s, "")
-		s = prDescImageRef.ReplaceAllString(s, "")
-		s = prDescLinkInline.ReplaceAllString(s, "$1")
-		s = prDescLinkRef.ReplaceAllString(s, "$1")
-		s = prDescLinkDef.ReplaceAllString(s, "")
-		s = prDescAutolink.ReplaceAllString(s, "$1")
-		s = prDescTag.ReplaceAllString(s, "")
-		s = prDescOpenAngle.ReplaceAllString(s, "$1")
-		s = strings.ReplaceAll(s, "-->", "->")
+		s = decodePrDescEntities(s)
+		s = ScrubUntrustedText(s)
+		s = stripPrDescMarkup(s)
+		s = strings.TrimSpace(prDescSpaces.ReplaceAllString(s, " "))
 		if s == prev {
-			break
+			return s, true
 		}
+	}
+	return "", false
+}
+
+// decodePrDescEntities decodes HTML entities until the text stops changing, within len(s)+1
+// passes (the caller's outer loop repeats it if the bound ever cut it short).
+func decodePrDescEntities(s string) string {
+	for i := 0; i <= len(s); i++ {
+		u := html.UnescapeString(s)
+		if u == s {
+			return s
+		}
+		s = u
 	}
 	return s
 }
 
+// stripPrDescMarkup removes HTML and markdown link/image syntax, one pass of each rule; the
+// caller loops to the fixed point (a removal can expose a new instance of an earlier rule:
+// `<!<!---->--` becomes `<!--`).
+func stripPrDescMarkup(s string) string {
+	// Terminated comments first, to their own fixed point, so a comment exposed by removing
+	// another (`<!<!---->-- x -->`) is removed as a comment rather than read as unterminated.
+	// Each pass that changes the text shortens it, so the loop ends.
+	for next := prDescHTMLComment.ReplaceAllString(s, ""); next != s; next = prDescHTMLComment.ReplaceAllString(s, "") {
+		s = next
+	}
+	s = prDescUnterminatedCmnt.ReplaceAllString(s, "")
+	s = prDescImage.ReplaceAllString(s, "")
+	s = prDescLinkInline.ReplaceAllString(s, "$1")
+	s = prDescLinkRef.ReplaceAllString(s, "$1")
+	s = prDescLinkDef.ReplaceAllString(s, "")
+	s = prDescAutolink.ReplaceAllString(s, "$1")
+	s = prDescTag.ReplaceAllString(s, "")
+	s = prDescOpenAngle.ReplaceAllString(s, "$1")
+	s = prDescCommentOpen.ReplaceAllString(s, "")
+	return prDescCommentClose.ReplaceAllString(s, "->")
+}
+
+// finalizePrDescText applies step 3: block-syntax escapes, then closing-directive and mention
+// breakers.
+func finalizePrDescText(s string) string {
+	return breakMentions(neutralizeClosingDirectives(escapePrDescMarkdown(s)))
+}
+
+// cutPrDescBytes bounds s to maxBytes bytes at a rune boundary, ending a cut with "…" inside
+// the bound (trailing space before the ellipsis is dropped).
+func cutPrDescBytes(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	keep := maxBytes - len(prDescEllipsis)
+	if keep <= 0 {
+		return ""
+	}
+	for keep > 0 && !utf8.RuneStart(s[keep]) {
+		keep--
+	}
+	return strings.TrimSpace(s[:keep]) + prDescEllipsis
+}
+
+// escapePrDescMarkdown backslash-escapes the markdown syntax a one-line field could still use:
+// a leading block-opening token, every code-fence run, and every bracket. An escape is added
+// only where the character is not already escaped (an even run of backslashes precedes it),
+// which keeps the step idempotent and never turns `\[` into an escaped backslash followed by
+// a live bracket. A trailing odd backslash is doubled so it cannot escape what the renderer
+// writes after the field.
+func escapePrDescMarkdown(s string) string {
+	if s == "" {
+		return s
+	}
+	esc := make([]bool, len(s))
+	for _, loc := range prDescFenceRun.FindAllStringIndex(s, -1) {
+		for i := loc[0]; i < loc[1]; i++ {
+			esc[i] = true
+		}
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] == '[' || s[i] == ']' {
+			esc[i] = true
+		}
+	}
+	if m := prDescLeadingOrdered.FindStringSubmatchIndex(s); m != nil {
+		esc[m[2]] = true
+	} else if prDescLeadingBlockToken(s) {
+		esc[0] = true
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	backslashes := 0
+	for i := 0; i < len(s); i++ {
+		if esc[i] && backslashes%2 == 0 {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(s[i])
+		if s[i] == '\\' {
+			backslashes++
+		} else {
+			backslashes = 0
+		}
+	}
+	if backslashes%2 == 1 {
+		b.WriteByte('\\')
+	}
+	return b.String()
+}
+
+// prDescLeadingBlockToken reports whether s opens with a character that starts a markdown block
+// at the start of a line: an ATX heading, a block quote, a table row, a setext underline, a
+// `-`/`+` list marker or thematic break, or a `*`/`_` list marker or thematic break (a leading
+// `**bold**` is left alone). A leading code fence is a fence run, escaped wherever it appears.
+func prDescLeadingBlockToken(s string) bool {
+	switch s[0] {
+	case '#', '>', '|', '=', '-', '+':
+		return true
+	case '*', '_':
+		if len(s) == 1 || s[1] == ' ' {
+			return true
+		}
+		return strings.Trim(s, string(s[0])+" ") == "" // a thematic break `***` / `_ _ _`
+	}
+	return false
+}
+
 // neutralizeClosingDirectives inserts a zero-width space after the first letter of every closing
-// keyword that is followed by an issue reference, so no forge reads it as a directive.
+// keyword that is followed by an issue reference, so no forge reads it as a directive. The
+// pattern runs over s itself and two views of it: one with the markers in prDescClosingMarkers REMOVED
+// (`Fix**es** #12` reads `Fixes #12`) and one with them BLANKED to spaces (`a_Fixes #12` reads
+// `a Fixes #12`); a keyword found in either view is broken in s.
 func neutralizeClosingDirectives(s string) string {
-	locs := prDescClosing.FindAllStringSubmatchIndex(s, -1)
-	if len(locs) == 0 {
+	removed := make([]byte, 0, len(s))
+	idx := make([]int, 0, len(s))
+	blanked := []byte(s)
+	for i := 0; i < len(s); i++ {
+		if strings.IndexByte(prDescClosingMarkers, s[i]) >= 0 {
+			blanked[i] = ' '
+			continue
+		}
+		removed = append(removed, s[i])
+		idx = append(idx, i)
+	}
+	at := map[int]bool{}
+	for _, loc := range prDescClosing.FindAllStringSubmatchIndex(s, -1) {
+		at[loc[2]] = true
+	}
+	for _, loc := range prDescClosing.FindAllSubmatchIndex(removed, -1) {
+		at[idx[loc[2]]] = true
+	}
+	for _, loc := range prDescClosing.FindAllSubmatchIndex(blanked, -1) {
+		at[loc[2]] = true
+	}
+	if len(at) == 0 {
 		return s
 	}
 	var b strings.Builder
-	last := 0
-	for _, loc := range locs {
-		kwStart := loc[2]
-		_, size := utf8.DecodeRuneInString(s[kwStart:])
-		b.WriteString(s[last : kwStart+size])
-		b.WriteString(zeroWidthSpace)
-		last = kwStart + size
+	for i := 0; i < len(s); {
+		_, size := utf8.DecodeRuneInString(s[i:])
+		b.WriteString(s[i : i+size])
+		if at[i] {
+			b.WriteString(zeroWidthSpace)
+		}
+		i += size
 	}
-	b.WriteString(s[last:])
 	return b.String()
 }
 
@@ -180,15 +337,6 @@ func breakMentions(s string) string {
 		s = next
 	}
 	return s
-}
-
-// trimRunes bounds s to maxChars runes, ending a cut with an ellipsis inside the bound.
-func trimRunes(s string, maxChars int) string {
-	if maxChars <= 0 || utf8.RuneCountInString(s) <= maxChars {
-		return s
-	}
-	r := []rune(s)
-	return strings.TrimSpace(string(r[:maxChars-1])) + "…"
 }
 
 // SanitizePrDescriptionFields validates the raw fields a worker posts and returns the sanitized,
@@ -211,7 +359,7 @@ func SanitizePrDescriptionFields(in apitypes.PrDescriptionFields) (apitypes.PrDe
 		len(in.ReviewPointers) > MaxPrDescListRawEntries || len(in.Verification) > MaxPrDescListRawEntries {
 		return out, ErrPrDescriptionInvalid
 	}
-	out.Summary = SanitizePrDescriptionText(in.Summary, PrDescSummaryMaxChars)
+	out.Summary = SanitizePrDescriptionText(in.Summary, PrDescSummaryMaxBytes)
 
 	var err error
 	if out.Changes, err = sanitizePrDescList(in.Changes, PrDescMaxChanges); err != nil {
@@ -224,7 +372,7 @@ func SanitizePrDescriptionFields(in apitypes.PrDescriptionFields) (apitypes.PrDe
 		if !validPrDescScopeKinds[n.Kind] || len(n.Text) > MaxPrDescItemRawBytes {
 			return out, ErrPrDescriptionInvalid
 		}
-		text := SanitizePrDescriptionText(n.Text, PrDescItemMaxChars)
+		text := SanitizePrDescriptionText(n.Text, PrDescItemMaxBytes)
 		if text == "" || len(out.ScopeNotes) >= PrDescMaxScopeNotes {
 			continue
 		}
@@ -235,7 +383,7 @@ func SanitizePrDescriptionFields(in apitypes.PrDescriptionFields) (apitypes.PrDe
 			!prDescHexSHA.MatchString(v.VerifiedAtSha) {
 			return out, ErrPrDescriptionInvalid
 		}
-		cmd := SanitizePrDescriptionText(v.Command, PrDescVerifyCommandMaxChars)
+		cmd := SanitizePrDescriptionText(v.Command, PrDescVerifyCommandMaxBytes)
 		if cmd == "" || len(out.Verification) >= PrDescMaxVerification {
 			continue
 		}
@@ -252,7 +400,7 @@ func sanitizePrDescList(items []string, maxEntries int) ([]string, error) {
 		if len(it) > MaxPrDescItemRawBytes {
 			return out, ErrPrDescriptionInvalid
 		}
-		text := SanitizePrDescriptionText(it, PrDescItemMaxChars)
+		text := SanitizePrDescriptionText(it, PrDescItemMaxBytes)
 		if text == "" || len(out) >= maxEntries {
 			continue
 		}

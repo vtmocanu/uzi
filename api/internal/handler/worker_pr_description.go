@@ -23,8 +23,10 @@ import (
 // Status map: 400 invalid body / over-cap raw field / bad enum or sha; 404 run not held by
 // this worker, or no such version on this run; 409 with a machine-readable reason:
 // stale_claim (claim generation not live), lock_conflict (the ack's expected_lock_version lost
-// the compare-and-swap), version_conflict (the version cannot take this transition),
-// run_terminal, repo_required.
+// the compare-and-swap), version_conflict (the version cannot take this transition, or the
+// request names a PR that is not the run's own), too_many_versions (stage past
+// workersvc.MaxPrDescPendingVersionsPerRun pending versions), run_terminal, repo_required.
+// Stage also rides the per-worker proposal limiter (429 when exhausted).
 
 // prDescWorker resolves the authenticated worker and the {id} run param, answering the
 // request itself on failure.
@@ -178,6 +180,8 @@ func writePrDescriptionError(w http.ResponseWriter, err error, op string) {
 		httpx.ErrorReason(w, http.StatusConflict, "the pr description changed since expected_lock_version", "lock_conflict")
 	case errors.Is(err, workersvc.ErrPrDescriptionVersionConflict):
 		httpx.ErrorReason(w, http.StatusConflict, "the pr description version cannot take this transition", "version_conflict")
+	case errors.Is(err, workersvc.ErrPrDescriptionTooManyVersions):
+		httpx.ErrorReason(w, http.StatusConflict, "this run has too many pending pr description versions", "too_many_versions")
 	case errors.Is(err, workersvc.ErrRunTerminal):
 		httpx.ErrorReason(w, http.StatusConflict, "the run has finished", "run_terminal")
 	case errors.Is(err, workersvc.ErrSummaryRepoRequired):

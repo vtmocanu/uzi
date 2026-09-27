@@ -61,10 +61,24 @@ WHERE run_id = @run_id AND mr_iid IS NOT NULL
 ORDER BY created_at DESC, id DESC
 LIMIT 1;
 
+-- name: FirstPrDescriptionMrIidForRun :one
+-- The PR this run first staged for or bound a version to. A run describes one PR: once it has a
+-- version naming PR X, it cannot stage or bind for PR Y.
+SELECT mr_iid::bigint AS mr_iid FROM pr_description_versions
+WHERE run_id = @run_id AND mr_iid IS NOT NULL
+ORDER BY created_at, id
+LIMIT 1;
+
+-- name: CountPendingPrDescriptionVersionsForRun :one
+-- The run's pending versions (every generation). Stage refuses past a hard cap, so a looping or
+-- hostile worker cannot flood the table; pending versions are kept (never auto-abandoned)
+-- because lost-ack recovery matches against them.
+SELECT count(*)::bigint FROM pr_description_versions WHERE run_id = @run_id AND state = 'pending';
+
 -- name: MarkPrDescriptionVersionPublished :execrows
 UPDATE pr_description_versions
 SET state = 'published', published_at = now()
-WHERE id = @id AND state = 'pending';
+WHERE id = @id AND state = 'pending' AND mr_iid IS NOT NULL AND rendered_region_sha256 IS NOT NULL;
 
 -- name: MarkPrDescriptionVersionAbandoned :execrows
 UPDATE pr_description_versions

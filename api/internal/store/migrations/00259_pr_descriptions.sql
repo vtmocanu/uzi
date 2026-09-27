@@ -23,7 +23,11 @@ CREATE TABLE pr_description_versions (
     state                  text NOT NULL DEFAULT 'pending'
         CHECK (state IN ('pending', 'published', 'abandoned')),
     created_at             timestamptz NOT NULL DEFAULT now(),
-    published_at           timestamptz
+    published_at           timestamptz,
+    -- A published version was bound first: it names its PR and the hash of the region it wrote,
+    -- which human-edit protection and lost-ack recovery compare against.
+    CONSTRAINT pr_description_versions_published_bound
+        CHECK (state <> 'published' OR (mr_iid IS NOT NULL AND rendered_region_sha256 IS NOT NULL))
 );
 CREATE INDEX idx_pr_description_versions_run ON pr_description_versions (run_id);
 CREATE INDEX idx_pr_description_versions_pr_state ON pr_description_versions (repo_id, mr_iid, state);

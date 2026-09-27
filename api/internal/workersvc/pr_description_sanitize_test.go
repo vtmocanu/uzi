@@ -44,7 +44,7 @@ func TestSanitizePrDescriptionTextMarkup(t *testing.T) {
 		{"autolink becomes bare url", "see <https://example.com/a?b=1> ok", "see https://example.com/a?b=1 ok"},
 		{"bare url kept", "see https://example.com/page", "see https://example.com/page"},
 		{"newlines collapse", "one\n\n## Heading\n- two", "one ## Heading - two"},
-		{"bidi and control stripped", "a\u202Eb\x1b[31mc", "ab[31mc"},
+		{"bidi and control stripped", "a\u202Eb\x1b[31mc", "ab\\[31mc"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -145,13 +145,20 @@ func TestSanitizePrDescriptionClosingKeywords(t *testing.T) {
 	}
 }
 
-// TestSanitizePrDescriptionIdempotent pins that sanitizing sanitized output changes nothing, so a
-// worker re-posting stored fields (a refresh's context) round-trips.
+// TestSanitizePrDescriptionIdempotent pins that sanitizing output that was not cut changes
+// nothing, so a worker re-posting stored fields (a refresh's context) round-trips.
 func TestSanitizePrDescriptionIdempotent(t *testing.T) {
 	inputs := []string{
 		"Fixes #12 for @alice <!-- uzi:description:start v1 --> [x](y) ![i](j) <b>b</b>",
 		"Closing: issues owner/repo#3 and a --> b @@x",
 		"a &amp;lt;!-- x",
+		"# Heading with [brackets] and ```fence``` and ~~~tilde",
+		"1. first _Fixes_ #9 and Fix**es** #10",
+		"- item \\[already\\] escaped \\",
+		"trailing backslash \\",
+		"> quote [r]: https://x.test and ![r] then [r]",
+		"*** ",
+		"a ------------> b <!-- c",
 	}
 	for _, in := range inputs {
 		once := SanitizePrDescriptionText(in, 600)
@@ -161,28 +168,208 @@ func TestSanitizePrDescriptionIdempotent(t *testing.T) {
 		}
 		assertPrDescInert(t, once)
 	}
-	// A trimmed output may lose the breaker of a keyword whose reference the trim cut off; the
+	// A cut output may lose the breaker of a keyword whose reference the cut removed; the
 	// second pass must still be inert and stable from there on.
 	long := strings.Repeat("Implements #1 @z ", 80)
 	once := SanitizePrDescriptionText(long, 600)
 	twice := SanitizePrDescriptionText(once, 600)
 	assertPrDescInert(t, twice)
 	if thrice := SanitizePrDescriptionText(twice, 600); thrice != twice {
-		t.Errorf("trimmed output not stable on the third pass:\n 2x: %q\n 3x: %q", twice, thrice)
+		t.Errorf("cut output not stable on the third pass:\n 2x: %q\n 3x: %q", twice, thrice)
 	}
 }
 
-func TestSanitizePrDescriptionTrim(t *testing.T) {
-	got := SanitizePrDescriptionText(strings.Repeat("é", 700), PrDescSummaryMaxChars)
-	if n := utf8.RuneCountInString(got); n != PrDescSummaryMaxChars {
-		t.Fatalf("trimmed to %d runes, want %d", n, PrDescSummaryMaxChars)
+// TestSanitizePrDescriptionByteCaps pins that the layout caps are BYTES of the final text,
+// breakers and escapes included, that a cut never splits a rune, and that a cut never leaves a
+// keyword with its reference but without its breaker, or a mention without its breaker.
+func TestSanitizePrDescriptionByteCaps(t *testing.T) {
+	for _, maxBytes := range []int{PrDescSummaryMaxBytes, PrDescItemMaxBytes, PrDescVerifyCommandMaxBytes, 7, 1} {
+		for _, in := range []string{
+			strings.Repeat("é", 700),
+			strings.Repeat("@ab ", 300),
+			strings.Repeat("Fixes #1 ", 200),
+			strings.Repeat("[x] ", 300),
+			strings.Repeat("😀", 300),
+			strings.Repeat("a", maxBytes-1) + " @bob",
+		} {
+			got := SanitizePrDescriptionText(in, maxBytes)
+			if len(got) > maxBytes {
+				t.Errorf("cap %d: got %d bytes: %q", maxBytes, len(got), got)
+			}
+			if !utf8.ValidString(got) {
+				t.Errorf("cap %d: invalid UTF-8: %q", maxBytes, got)
+			}
+			if len(in) > maxBytes && got != "" && !strings.HasSuffix(got, "…") {
+				t.Errorf("cap %d: a cut must end with an ellipsis: %q", maxBytes, got)
+			}
+			assertPrDescInert(t, got)
+			if regexp.MustCompile(`@[A-Za-z0-9_-]`).MatchString(got) {
+				t.Errorf("cap %d: a mention lost its breaker: %q", maxBytes, got)
+			}
+		}
 	}
-	if !strings.HasSuffix(got, "…") || !utf8.ValidString(got) {
-		t.Fatalf("trim must end with an ellipsis and stay valid UTF-8, got suffix %q", got[len(got)-8:])
-	}
-	if got := SanitizePrDescriptionText("short", PrDescSummaryMaxChars); got != "short" {
+	if got := SanitizePrDescriptionText("short", PrDescSummaryMaxBytes); got != "short" {
 		t.Fatalf("short text changed: %q", got)
 	}
+	// Exactly at the cap before the breaker is inserted: the breaker pushes it over, so it is cut.
+	exact := strings.Repeat("a", PrDescItemMaxBytes-5) + " @bob"
+	if got := SanitizePrDescriptionText(exact, PrDescItemMaxBytes); len(got) > PrDescItemMaxBytes {
+		t.Fatalf("breaker overflowed the cap: %d bytes", len(got))
+	}
+}
+
+// TestSanitizePrDescriptionSecretsSplitByMarkup: a credential split by markup the sanitizer
+// removes must be scrubbed once the markup is gone (the scrub re-runs after the strip). The
+// fragments are joined at runtime; no token-shaped literal is in source.
+func TestSanitizePrDescriptionSecretsSplitByMarkup(t *testing.T) {
+	a10, b10 := strings.Repeat("A", 10), strings.Repeat("B", 10)
+	ghBody := "notARealToken" + "0123456789abcdefghijklm"
+	cases := []struct{ in, body string }{
+		{"glpat-" + a10 + "<b></b>" + b10, b10},
+		{"glpat-" + a10 + "<!---->" + b10, b10},
+		{"glpat-" + a10 + "[x](y)" + b10, b10},
+		{"ghp_" + "<!-- x -->" + ghBody, ghBody[len(ghBody)-12:]},
+		{"ghp_" + "&lt;b&gt;&lt;/b&gt;" + ghBody, ghBody[len(ghBody)-12:]},
+	}
+	for _, c := range cases {
+		got := SanitizePrDescriptionText("token "+c.in+" leaked", 600)
+		if strings.Contains(got, c.body) {
+			t.Errorf("split secret re-joined unredacted: in=%q out=%q", c.in, got)
+		}
+	}
+}
+
+// TestSanitizePrDescriptionEntityFixedPoint: entities are decoded to a true fixed point, so a
+// deeply encoded mention or reference is handled like the character it renders as, and an
+// entity re-formed by a markup removal is decoded too.
+func TestSanitizePrDescriptionEntityFixedPoint(t *testing.T) {
+	enc := func(s string, levels int) string {
+		for i := 1; i < levels; i++ {
+			s = strings.Replace(s, "&", "&amp;", 1)
+		}
+		return s
+	}
+	mention := SanitizePrDescriptionText("ping "+enc("&#64;", 5)+"eve", 600)
+	if mention != "ping @"+zw+"eve" {
+		t.Errorf("5-level encoded mention = %q", mention)
+	}
+	closing := SanitizePrDescriptionText("Fixes "+enc("&#35;", 5)+"12", 600)
+	if closing != "F"+zw+"ixes #12" {
+		t.Errorf("5-level encoded closing ref = %q", closing)
+	}
+	reformed := SanitizePrDescriptionText("ping &<b></b>#64;eve", 600)
+	if reformed != "ping @"+zw+"eve" {
+		t.Errorf("markup-split entity = %q", reformed)
+	}
+	for _, out := range []string{mention, closing, reformed} {
+		if regexp.MustCompile(`&#?[A-Za-z0-9]+;`).MatchString(out) {
+			t.Errorf("an entity survived: %q", out)
+		}
+	}
+}
+
+// TestSanitizePrDescriptionImagesAndReferences: no image in any form, and no reference link or
+// definition can form, including a definition split across lines (renderable by micromark /
+// CommonMark as `![r]` + `[r]:\nhttps://...`).
+func TestSanitizePrDescriptionImagesAndReferences(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"shortcut image with split definition", "see ![r] here\n\n[r]:\nhttps://evil.test/x.png", "see here"},
+		{"definition only", "[r]:\n  https://evil.test/track", ""},
+		{"full reference image", "a ![alt][r] b", "a b"},
+		{"collapsed reference image", "a ![alt][] b", "a b"},
+		{"inline image", "a ![alt](https://evil.test/x.png) b", "a b"},
+		{"collapsed link keeps text", "a [text][] b", "a text b"},
+		{"shortcut link bracket escaped", "a [r] b\n[r]: https://evil.test", "a \\[r\\] b"},
+		{"definition mid-text", "text [r]: https://evil.test more", "text more"},
+	}
+	for _, c := range cases {
+		got := SanitizePrDescriptionText(c.in, 600)
+		if got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+		if strings.Contains(got, "evil") {
+			t.Errorf("%s: a target survived: %q", c.name, got)
+		}
+		assertPrDescInert(t, got)
+	}
+}
+
+// TestSanitizePrDescriptionBlockSyntax: a field cannot open a heading, quote, table, list, code
+// block or thematic break, and a fence run anywhere is escaped.
+func TestSanitizePrDescriptionBlockSyntax(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"```go\nrm -rf /\n```", "\\`\\`\\`go rm -rf / \\`\\`\\`"},
+		{"~~~ swallow the rest", "\\~\\~\\~ swallow the rest"},
+		{"# Title", "\\# Title"},
+		{"### Title", "\\### Title"},
+		{"> quoted", "\\> quoted"},
+		{"| a | b |", "\\| a | b |"},
+		{"- item", "\\- item"},
+		{"+ item", "\\+ item"},
+		{"* item", "\\* item"},
+		{"1. first", "1\\. first"},
+		{"12) twelfth", "12\\) twelfth"},
+		{"===", "\\==="},
+		{"---", "\\---"},
+		{"***", "\\***"},
+		{"_ _ _", "\\_ _ _"},
+		{"**Bold** start", "**Bold** start"},
+		{"`code` start", "`code` start"},
+		{"mid ```` run", "mid \\`\\`\\`\\` run"},
+		{"already \\``` escaped", "already \\`\\`\\` escaped"},
+		{"a \\\\``` b", "a \\\\\\`\\`\\` b"},
+		{"ends with \\", "ends with \\\\"},
+		{"version 1.2 ok", "version 1.2 ok"},
+	}
+	for _, c := range cases {
+		if got := SanitizePrDescriptionText(c.in, 600); got != c.want {
+			t.Errorf("SanitizePrDescriptionText(%q)\n got: %q\nwant: %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestSanitizePrDescriptionCommentDelimiters: no `-->` / `<!--` survives in any length.
+func TestSanitizePrDescriptionCommentDelimiters(t *testing.T) {
+	for _, in := range []string{"a ------------> b", "a --!> b", "a <!------ b", "x --> y ---> z", "<!<!---->--"} {
+		got := SanitizePrDescriptionText(in, 600)
+		assertPrDescInert(t, got)
+		if strings.Contains(got, "-->") || strings.Contains(got, "--!>") {
+			t.Errorf("comment close survived: in=%q out=%q", in, got)
+		}
+	}
+	if got := SanitizePrDescriptionText("a ------------> b", 600); got != "a -> b" {
+		t.Errorf("long arrow = %q, want %q", got, "a -> b")
+	}
+}
+
+// TestSanitizePrDescriptionClosingEmphasisForms: emphasis, brackets, a missing space and
+// Unicode spaces around a closing keyword cannot hide it.
+func TestSanitizePrDescriptionClosingEmphasisForms(t *testing.T) {
+	for _, in := range []string{
+		"_Fixes_ #12", "__Fixes__ #12", "Fix**es** #12", "Fixes:#12", "Fixes#12",
+		"Fixes\u2003#12", "Fixes\u3000#12", "Fixes\u00A0#12", "Fixes [#12]", "~~Fixes~~ #12",
+		"`Fixes` #12", "**Fixes:** #12", "a_Fixes #12", "Closes PROJ-12",
+	} {
+		got := SanitizePrDescriptionText(in, 600)
+		if !strings.Contains(got, zw) {
+			t.Errorf("no breaker: in=%q out=%q", in, got)
+		}
+		if m := closingViewProbe(got); m != "" {
+			t.Errorf("closing directive survived: in=%q out=%q match=%q", in, got, m)
+		}
+	}
+}
+
+// closingViewProbe looks for a closing directive in s with the markdown markers removed and any
+// space run optional: the widest reading a forge could apply.
+func closingViewProbe(s string) string {
+	view := strings.Map(func(r rune) rune {
+		if strings.ContainsRune("*_~`[]\\", r) {
+			return -1
+		}
+		return r
+	}, s)
+	return regexp.MustCompile(`(?i)\b(clos(e[sd]?|ing)|fix(e[sd]|ing)?|resolv(e[sd]?|ing)|implement(s|ed|ing)?)\b[\s\p{Z}]*:?[\s\p{Z}]*(issues?[\s\p{Z}]*)?(#\d+|[\w.-]+(/[\w.-]+)*#\d+|[A-Z]+-\d+)`).FindString(view)
 }
 
 // TestSanitizePrDescriptionScrubsSecrets feeds credential-shaped strings assembled from
@@ -282,5 +469,18 @@ func assertPrDescInert(t *testing.T, s string) {
 	}
 	if m := closingProbe.FindString(s); m != "" {
 		t.Errorf("output carries a closing directive %q: %q", m, s)
+	}
+	// Every bracket is escaped (an odd run of backslashes precedes it), so no link, image,
+	// reference or definition can form.
+	backslashes := 0
+	for i := 0; i < len(s); i++ {
+		if (s[i] == '[' || s[i] == ']') && backslashes%2 == 0 {
+			t.Errorf("output carries a live bracket at %d: %q", i, s)
+		}
+		if s[i] == '\\' {
+			backslashes++
+		} else {
+			backslashes = 0
+		}
 	}
 }

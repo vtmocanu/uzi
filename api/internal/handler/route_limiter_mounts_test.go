@@ -739,6 +739,9 @@ var wantRouteMounts = []routeMount{
 	// intent idempotency + the plan stale-write guard rather than a per-user limiter.
 	{"POST", "/api/worker/runs/{id}/summary/intent", noLimiter},
 	{"POST", "/api/worker/runs/{id}/summary/plan", noLimiter},
+	// PRD #1798: stage rides proposalLimiter.PerWorkerMiddleware (read as noLimiter by this
+	// per-USER probe, like /proposals and /findings); TestWorkerPrDescriptionStageIsRateLimitedLiveDB
+	// drives that mount through the real WorkerRoutes. Bind/lookup/ack are unlimited.
 	{"POST", "/api/worker/runs/{id}/pr-description/stage", noLimiter},
 	{"POST", "/api/worker/runs/{id}/pr-description/bind", noLimiter},
 	{"POST", "/api/worker/runs/{id}/pr-description/lookup", noLimiter},
