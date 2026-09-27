@@ -2162,10 +2162,11 @@ tasks:
     cmds:
       # jsdom (test:web) has no layout engine, so a wrap/overflow regression such as the
       # 390px triage-row squeeze passes there. These run in headless Chromium via
-      # web/vitest.browser.config.ts. The browser is NOT fetched here (a gate does not hit
-      # the network): a missing one exits 1 with Playwright's "Executable doesn't exist"
-      # banner. Fix with `npx playwright install chromium`, once, from web/. CI installs it
-      # in its own step.
+      # web/vitest.browser.config.ts. A uzi worker uses its prebaked Chromium, found on disk
+      # by that config. Elsewhere the browser is NOT fetched here (a gate does not hit the
+      # network): a missing one exits 1 with Playwright's "Executable doesn't exist" banner.
+      # Fix with `npx playwright install chromium`, once, from web/. CI installs it in its
+      # own step. UZI_WEB_BROWSER_CHROMIUM=<path> runs any other Chromium instead.
       - npm run test:browser
 
   # ----------------------------------------------------------- agent (npm) ----
