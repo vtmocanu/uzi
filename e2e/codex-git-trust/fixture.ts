@@ -6,6 +6,7 @@ import { execFile, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import type { Readable } from "node:stream";
@@ -61,7 +62,9 @@ function dubiousLine(text: string): string {
  *   (a) SUCCESS   — a fresh default-branch commit is imported and merged in.
  *   (b) PRODUCER  — a well-formed but bare-absent tip makes `pack-objects` fail.
  *   (c) CONSUMER  — the clone's `.git/objects/pack` is made unwritable, so `index-pack` fails.
- * After each, two invariants are checked: no live `command`-kind root remains (the guard
+ * After each, `producer and consumer reaped` is checked (the import call settled, no live
+ * `command`-kind root, and no `pack-objects`/`index-pack` process left in the container; see
+ * `proveReaped`), then two invariants: no live `command`-kind root remains (the guard
  * `spawnBoundaryProcess`'s `worker_pat` ordering relies on), and a fresh `worker_pat` boundary
  * action still succeeds — proof the registry was left usable, not wedged by the prior case.
  *
@@ -123,6 +126,25 @@ async function runFinalizeImportPart(
       `code=${result.code} stdout=${JSON.stringify(result.stdout)}`);
   };
 
+  /** `${tag}: producer and consumer reaped`, asserted from three facts:
+   *  (1) `importSettled`: the `ensureRunnerCloneObjects` call itself returned or threw. That
+   *      method awaits both sides' exit statuses (`Promise.all([piped, producerExit,
+   *      consumerExit])` in agent/src/git.ts, doc comment: "this method returns only once both
+   *      exit statuses have settled"), and inside a boundary each completion includes its
+   *      root's reap.
+   *  (2) the registry reports no live `command`-kind root. `ExecutionRegistry` has no public
+   *      accessor for live roots of EVERY kind (`rootCount()` counts registered roots, reaped
+   *      ones included), so the `boundary_action` roots the import registers are covered by
+   *      (3) instead; no production API was added for this fixture.
+   *  (3) no process whose cmdline names `pack-objects` or `index-pack` is left in the
+   *      container, polled for up to 2s before failing. */
+  const proveReaped = async (tag: string, registry: Record<string, any>, importSettled: boolean): Promise<void> => {
+    const liveCommand = registry.hasLiveCommandRoot() as boolean;
+    const leftovers = await pollNoGitPackProcesses(2000);
+    check(`${tag}: producer and consumer reaped`, importSettled && !liveCommand && leftovers.length === 0,
+      `importSettled=${importSettled} hasLiveCommandRoot=${liveCommand} leftover=${leftovers.join("; ") || "(none)"}`);
+  };
+
   // ── (a) SUCCESS ────────────────────────────────────────────────────────────────────────
   await fs.writeFile(path.join(originPath, "finalize-a.txt"), "finalize-a\n");
   await plainGit(originPath, ["add", "finalize-a.txt"]);
@@ -138,12 +160,14 @@ async function runFinalizeImportPart(
 
   const registryA = newRegistry();
   const safetyA = newSafety(registryA);
+  let settledA = false;
   await safetyA.withBoundary({ boundary: "finalize", deadlineMs: 60_000 }, (permit: any) =>
     gitCache.withBoundaryProcessSpawner(
       (p: unknown) => safetyA.spawnBoundaryProcess(permit, p),
       permit.signal,
       async () => {
         await gitCache.ensureRunnerCloneObjects(bare, clonePath, newTipA, [baseCommit]);
+        settledA = true;
         const aligned = await gitCache.alignBranchWithDefault(clonePath, branch, headTip, newTipA, "merge");
         check("FINALIZE-IMPORT (a): alignBranchWithDefault returns \"aligned\"", aligned === "aligned", `result=${aligned}`);
       },
@@ -151,6 +175,7 @@ async function runFinalizeImportPart(
   const postImport = await sandboxRun(`git cat-file -e ${newTipA}`);
   check("FINALIZE-IMPORT (a): sandboxed cat-file -e newTip succeeds after import",
     postImport.code === 0, `code=${postImport.code} stderr=${postImport.stderr.trim()}`);
+  await proveReaped("FINALIZE-IMPORT (a)", registryA, settledA);
   await proveClean("FINALIZE-IMPORT (a)", registryA, safetyA);
 
   // ── (b) PRODUCER failure: a well-formed 40-hex tip absent from the bare ─────────────────
@@ -158,18 +183,26 @@ async function runFinalizeImportPart(
   const registryB = newRegistry();
   const safetyB = newSafety(registryB);
   let threwB: unknown;
+  let settledB = false;
   try {
     await safetyB.withBoundary({ boundary: "finalize", deadlineMs: 60_000 }, (permit: any) =>
       gitCache.withBoundaryProcessSpawner(
         (p: unknown) => safetyB.spawnBoundaryProcess(permit, p),
         permit.signal,
-        () => gitCache.ensureRunnerCloneObjects(bare, clonePath, absentTip, [baseCommit]),
+        async () => {
+          try {
+            await gitCache.ensureRunnerCloneObjects(bare, clonePath, absentTip, [baseCommit]);
+          } finally {
+            settledB = true;
+          }
+        },
       ));
   } catch (err) {
     threwB = err;
   }
   check("FINALIZE-IMPORT (b): a bare-absent tip throws RunnerCloneImportError",
     threwB instanceof gitMod.RunnerCloneImportError, `threw=${threwB instanceof Error ? threwB.constructor.name : typeof threwB}: ${(threwB as Error)?.message}`);
+  await proveReaped("FINALIZE-IMPORT (b)", registryB, settledB);
   await proveClean("FINALIZE-IMPORT (b)", registryB, safetyB);
 
   // ── (c) CONSUMER failure: the clone's objects/pack is unwritable as the runner ──────────
@@ -187,18 +220,26 @@ async function runFinalizeImportPart(
   try {
     const registryC = newRegistry();
     const safetyC = newSafety(registryC);
+    let settledC = false;
     try {
       await safetyC.withBoundary({ boundary: "finalize", deadlineMs: 60_000 }, (permit: any) =>
         gitCache.withBoundaryProcessSpawner(
           (p: unknown) => safetyC.spawnBoundaryProcess(permit, p),
           permit.signal,
-          () => gitCache.ensureRunnerCloneObjects(bare, clonePath, newTipC, [baseCommit, newTipA]),
+          async () => {
+            try {
+              await gitCache.ensureRunnerCloneObjects(bare, clonePath, newTipC, [baseCommit, newTipA]);
+            } finally {
+              settledC = true;
+            }
+          },
         ));
     } catch (err) {
       threwC = err;
     }
     check("FINALIZE-IMPORT (c): an unwritable clone objects/pack throws RunnerCloneImportError",
       threwC instanceof gitMod.RunnerCloneImportError, `threw=${threwC instanceof Error ? threwC.constructor.name : typeof threwC}: ${(threwC as Error)?.message}`);
+    await proveReaped("FINALIZE-IMPORT (c)", registryC, settledC);
     await proveClean("FINALIZE-IMPORT (c)", registryC, safetyC);
   } finally {
     const chmodRW = runner.runnerCommand("chmod", ["0755", packDir]);
@@ -269,6 +310,39 @@ async function runFinalizeImportPart(
  *  fixture's own stand-in bare (it is never written by any git command here). */
 function createHashLikeSha(seed: string): string {
   return createHash("sha1").update(seed).digest("hex");
+}
+
+/** Every process in the container (other than this fixture) whose cmdline names `pack-objects`
+ *  or `index-pack`, as `pid: cmdline` (NUL separators shown as spaces). A pid that exits
+ *  between the readdir and the read (ENOENT, ESRCH) or is unreadable (EACCES) is skipped. */
+async function gitPackProcesses(): Promise<string[]> {
+  const procRoot = "/proc";
+  const found: string[] = [];
+  for (const entry of await fs.readdir(procRoot)) {
+    if (!/^[0-9]+$/.test(entry) || Number(entry) === process.pid) continue;
+    let cmdline: string;
+    try {
+      cmdline = (await fs.readFile(path.join(procRoot, entry, "cmdline"))).toString("utf8").split("\0").join(" ").trim();
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ESRCH" || code === "EACCES") continue;
+      throw err;
+    }
+    if (cmdline.includes("pack-objects") || cmdline.includes("index-pack")) found.push(`${entry}: ${cmdline}`);
+  }
+  return found;
+}
+
+/** Polls {@link gitPackProcesses} every 100ms until it is empty or `budgetMs` has elapsed, and
+ *  returns the last scan (empty on success, the leftover `pid: cmdline` list otherwise). The
+ *  poll gives a just-killed process time to be reaped before the check fails. */
+async function pollNoGitPackProcesses(budgetMs: number): Promise<string[]> {
+  const deadline = Date.now() + budgetMs;
+  for (;;) {
+    const found = await gitPackProcesses();
+    if (found.length === 0 || Date.now() >= deadline) return found;
+    await sleep(100);
+  }
 }
 
 /** Drains a packfile stream (checkpointPack's `pack`) to a Buffer for `git index-pack --stdin`. */
