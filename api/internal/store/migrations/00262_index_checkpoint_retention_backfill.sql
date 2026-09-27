@@ -6,9 +6,9 @@
 -- terminal runs that published a checkpoint, ordered by their backfill key
 -- GREATEST(status_since, checkpoint_tip_at) (the later of the terminal transition and the last
 -- publish, so a late first publish after the run went terminal is not keyed below the
--- watermark) from the persisted watermark (checkpoint_retention_meta.backfilled_through, 00259).
+-- watermark) from the persisted watermark (checkpoint_retention_meta.backfilled_through, 00261).
 -- This expression index, on exactly the query's key and with its partial predicate, bounds that
--- scan to the terminal-with-checkpoint subset instead of the whole runs table. Kept out of 00259 so
+-- scan to the terminal-with-checkpoint subset instead of the whole runs table. Kept out of 00261 so
 -- that migration stays transactional (00091's rule: a concurrent index gets its own migration).
 -- The number is a draft, renumbered above the live head at landing (task migration:renumber).
 -- A failed concurrent build can leave an invalid index. Drop that exact owned index before
