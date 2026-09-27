@@ -637,6 +637,19 @@ func TestSanitizePrDescriptionSecretsSplitByInlineMarkdown(t *testing.T) {
 			t.Errorf("only the item carrying %q must be redacted: %+v", in, fields)
 		}
 	}
+	// GitLab's inline-diff filter removes `{+ … +}` / `[+ … +]` markers (no word boundary; a `\[`
+	// escape is decoded first), so these render a whole token there.
+	for _, in := range []string{
+		gl + a10 + "{+" + "KLMNOPQRST" + "+}",
+		gl + a10 + "[+" + "KLMNOPQRST" + "+]",
+		gl + a10 + "{-" + "KLMNOPQRST" + "-}",
+		gl + a10 + "$" + "KLMNOPQRST",
+		"sk-" + "ant-" + a10 + "{+" + "KLMNOPQRST" + "+}",
+	} {
+		if got := SanitizePrDescriptionText("token "+in+" leaked", 600); got != want {
+			t.Errorf("GitLab inline-diff split %q = %q, want %q", in, got, want)
+		}
+	}
 	// A zero-width rune is stripped before the literal scrub, which then catches the token.
 	if got := SanitizePrDescriptionText("t "+gl+a10+"\u200B"+b10, 600); strings.Contains(got, b10) {
 		t.Errorf("zero-width split secret survived: %q", got)
@@ -646,6 +659,7 @@ func TestSanitizePrDescriptionSecretsSplitByInlineMarkdown(t *testing.T) {
 		"a *b* c `d` ~~e~~ and snake_case_name", "max_app-config and x\\-y", "ghp_ short",
 		"call __init__ then _private_helper_ and max_app-config", "the snake_case_value_ and _leading_",
 		"set tax_app-rate and max_app-config", "box_app-state _app-x_",
+		"use {+} and a+b, {-x-} or [+y+] and $5", "i++ [-1, +1] {+ added +}",
 	} {
 		if got := SanitizePrDescriptionText(in, 600); strings.Contains(got, "redacted") {
 			t.Errorf("false positive: %q -> %q", in, got)
@@ -737,7 +751,13 @@ func TestSanitizePrDescriptionGenericsAndComparisons(t *testing.T) {
 		{"<!-- uzi:description:end v1 -->", ""},
 		{`see <a href="https://evil.test">docs</a> now`, "see docs now"},
 		{"<a href=https://evil.test>docs</a>", "docs"},
-		{"<DIV class='x'>y</DIV>", "y"},
+		{"<DIV class='x'>y</DIV>", "&lt;DIV class='x'>y&lt;/DIV>"},
+		{"Promise<Data>", "Promise&lt;Data>"},
+		{"Future<Output>", "Future&lt;Output>"},
+		{"List<Map>", "List&lt;Map>"},
+		{"Vec<Section>", "Vec&lt;Section>"},
+		{"Option<Time>", "Option&lt;Time>"},
+		{"Box<Object>", "Box&lt;Object>"},
 		{"<script>alert(1)</script>", "alert(1)"},
 		{"<my-widget data-x=1>", "&lt;my-widget data-x=1>"},
 		{"<!DOCTYPE html>", "&lt;!DOCTYPE html>"},
@@ -756,10 +776,13 @@ func TestSanitizePrDescriptionGenericsAndComparisons(t *testing.T) {
 			t.Errorf("not idempotent: %q -> %q -> %q", c.in, got, again)
 		}
 	}
-	// A cut never splits an encoded `<`, and the result still fits the cap.
-	for _, maxBytes := range []int{PrDescItemMaxBytes, 7, 5, 4} {
+	// A cut never splits an encoded `<` (no trailing `&`, `&l` or `&lt` without its `;`), and the
+	// result still fits the cap.
+	for _, maxBytes := range []int{PrDescItemMaxBytes, 7, 6, 5, 4} {
 		got := SanitizePrDescriptionText(strings.Repeat("a<b ", 300), maxBytes)
-		if len(got) > maxBytes || strings.Contains(got, "<") || strings.HasSuffix(strings.TrimSuffix(got, "…"), "&") {
+		body := strings.TrimSuffix(got, "…")
+		partial := strings.HasSuffix(body, "&") || strings.HasSuffix(body, "&l") || strings.HasSuffix(body, "&lt")
+		if len(got) > maxBytes || strings.Contains(got, "<") || partial {
 			t.Errorf("cap %d: %q", maxBytes, got)
 		}
 		if maxBytes >= 7 && got == "" {

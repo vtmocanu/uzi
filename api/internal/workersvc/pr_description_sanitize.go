@@ -108,11 +108,11 @@ var (
 		`(?:#\d+|gh-\d+|[\w.-]+(?:/[\w.-]+)*#\d+|[A-Za-z][A-Za-z0-9_]+-\d+|https?://[^\s<>()]*?/(?:issues|work_items)/\d+)`)
 )
 
-// prDescHTMLNames are the HTML element names prDescHTMLTag removes: multi-letter names in any
-// case, single-letter ones (`b`, `i`, `a`, ...) lowercase only, so a generic type parameter
-// (`Vec<U>`, `Foo<P>`) is not read as an element. A name outside the list is not removed, only
-// encoded, which is equally inert.
-const prDescHTMLNames = `(?i:abbr|address|area|article|aside|audio|base|bdi|bdo|big|blockquote|body|br|button|` +
+// prDescHTMLNames are the HTML element names prDescHTMLTag removes, lowercase only, so a
+// PascalCase generic (`Promise<Data>`, `List<Map>`, `Vec<U>`) is not read as an element. A tag
+// in any other case (`<DIV>`) or with a name outside the list is not removed, only encoded as
+// `&lt;`, which is equally inert.
+const prDescHTMLNames = `(?:abbr|address|area|article|aside|audio|base|bdi|bdo|big|blockquote|body|br|button|` +
 	`canvas|caption|center|cite|code|col|colgroup|data|datalist|dd|del|details|dfn|dialog|dir|div|dl|dt|em|` +
 	`embed|fieldset|figcaption|figure|font|footer|form|frame|frameset|h[1-6]|head|header|hgroup|hr|html|` +
 	`iframe|img|input|ins|kbd|label|legend|li|link|main|map|mark|marquee|math|menu|meta|meter|nav|noscript|` +
@@ -146,8 +146,10 @@ const prDescClosingMarkers = "*_~`[]\\"
 //     literal scrub would not fully hide, the whole field becomes "[redacted]". Otherwise the
 //     literal secret shapes are scrubbed (secretscrub.Scrub). The scrub runs after the markup
 //     is gone, so a token split by markup (`glpat-AAAA<b></b>BBBB`) is scrubbed whole.
-//  2. The text is cut to fit maxBytes (rune-safe, "…" marks a cut): the largest cut whose
-//     step-3 result fits maxBytes is kept (a binary search, since step 3 grows the text).
+//  2. The text is cut to fit maxBytes (rune-safe, "…" marks a cut). Since step 3 grows the
+//     text, a binary search over the cut length finds a large cut whose step-3 result fits
+//     maxBytes; the growth is not monotonic in the cut length, so the kept cut may land a few
+//     bytes short of the largest one that fits.
 //  3. Markdown block syntax is neutralised with backslash escapes: a leading `#`, `>`, `|`,
 //     `=`, fence, list or ordered-list marker, every code-fence run of three or more backticks
 //     or tildes, every `[` / `]` (no link, image, reference or definition can form), and a
@@ -272,7 +274,9 @@ func stripPrDescMarkup(s string) string {
 // A view reveals a secret when scrubbing the view differs from the view of the scrubbed text:
 // either the view forms a secret s does not hold literally (`_glpat_-…`), or the literal scrub
 // hides only part of one the view shows whole (`xoxb-1234-_5678_` scrubs to `[redacted]_5678_`,
-// which renders the token's tail). The check can also fire on an item that already holds a
+// which renders the token's tail). Two more views model GitLab only (prDescGitLabView): its
+// inline-diff markers and inline-math `$` removed, then the second and third views' removals.
+// The check can also fire on an item that already holds a
 // literal secret next to a marker; the whole item is then redacted, which only hides more.
 func prDescRenderedSecret(s string) bool {
 	scrubbed := secretscrub.Scrub(s)
@@ -280,6 +284,8 @@ func prDescRenderedSecret(s string) bool {
 		func(t string) string { return prDescDropRunes(t, "\\") },
 		func(t string) string { return prDescDropRunes(t, "\\*~`") },
 		func(t string) string { return prDescDropBoundaryUnderscores(prDescDropRunes(t, "\\*~`")) },
+		prDescGitLabView,
+		func(t string) string { return prDescDropBoundaryUnderscores(prDescGitLabView(t)) },
 	} {
 		vs := view(scrubbed)
 		if secretscrub.Scrub(vs) != vs || secretscrub.Scrub(view(s)) != vs {
@@ -287,6 +293,20 @@ func prDescRenderedSecret(s string) bool {
 		}
 	}
 	return false
+}
+
+// prDescInlineDiffMarkers removes the markers of GitLab's inline-diff filter
+// (lib/banzai/filter/inline_diff_filter.rb): `{+ … +}`, `{- … -}`, `[+ … +]` and `[- … -]` render
+// their content with no marker and need no word boundary, so `A{+B+}C` renders ABC. Every marker
+// is removed whether or not it is paired, which can only reveal more.
+var prDescInlineDiffMarkers = strings.NewReplacer("{+", "", "+}", "", "[+", "", "+]", "", "{-", "", "-}", "", "[-", "", "-]", "")
+
+// prDescGitLabView is the rendered view of a GitLab description: backslash escapes resolved (they
+// are decoded before the inline-diff filter, so `\[+x+\]` is a marker pair), `$` removed (inline
+// math renders its content), the inline-diff markers removed, then the emphasis, strikethrough and
+// code-span markers removed.
+func prDescGitLabView(s string) string {
+	return prDescDropRunes(prDescInlineDiffMarkers.Replace(prDescDropRunes(s, "\\$")), "*~`")
 }
 
 // prDescDropRunes returns s without any rune in drop.
