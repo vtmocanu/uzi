@@ -131,10 +131,19 @@ func TestSetRunCredentialParkedStatesPromoteLiveDB(t *testing.T) {
 // transition is atomic: an available budget promotes to the queue, while a spent
 // budget or a pending owner pause settles the hold (budget_exhausted, or the owner
 // pause) exactly as the promoter would; every case writes the new override.
+//
+// The subtests share one owner, and SetRunCredential requests a promoter pass for that owner
+// after it commits. With the default `go fn()` dispatcher that pass ran concurrently with the
+// NEXT subtest's seeding and settled or promoted the freshly seeded held run before
+// SetRunCredential reached it (ErrCredentialSwitchRaced, or a pending pause seeded after the
+// promotion so the run read back queued). The dispatcher is therefore synchronous, as in
+// newCDFix: the requested pass finishes before SetRunCredential returns, and each held run is
+// seeded in one statement so no reader ever sees a half-seeded hold.
 func TestSetRunCredentialDisabledHoldReassignmentLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := New(env.q, env.box, testParams())
 	svc.SetTxBeginner(env.pool)
+	svc.SetBackground(func(fn func()) { fn() })
 	o := seedReevalOwner(t, env, BindModeAuto, false)
 	for i, tc := range []struct {
 		name       string
@@ -150,10 +159,10 @@ func TestSetRunCredentialDisabledHoldReassignmentLiveDB(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			runID := seedRunInStatus(t, env, o, int64(4450+i), "paused", time.Now().UTC())
 			env.exec(`UPDATE runs SET hold_reason='credential_disabled', budget_wall_seconds=$2,
-			    claim_released_at=now() WHERE id=$1`, runID, tc.budget)
-			if tc.ownerPause {
-				env.exec(`UPDATE runs SET pause_requested_at=now(), pause_mode='now' WHERE id=$1`, runID)
-			}
+			    claim_released_at=now(),
+			    pause_requested_at=CASE WHEN $3::bool THEN now() END,
+			    pause_mode=CASE WHEN $3::bool THEN 'now' END
+			    WHERE id=$1`, runID, tc.budget, tc.ownerPause)
 			res, err := svc.SetRunCredential(env.ctx, o.userID, runID, CredentialOverrideModePinned, &o.altTok)
 			if err != nil {
 				t.Fatalf("reassignment: %v (want the hold promoted or settled, never ErrCredentialSwitchRaced)", err)
