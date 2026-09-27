@@ -1389,6 +1389,7 @@ const userHasAutoEligibleAnthropicToken = `-- name: UserHasAutoEligibleAnthropic
 SELECT EXISTS (
     SELECT 1 FROM user_secrets
     WHERE user_id = $1 AND kind = 'anthropic_token' AND auto_eligible
+      AND disabled_at IS NULL
 )
 `
 
@@ -1396,6 +1397,9 @@ SELECT EXISTS (
 // (PRD #111 M2 D2). The ephemeral provisioner (issue #804) reads this to decide a
 // burst worker's bind mode: `auto` when the pool is non-empty, else `default`, so an
 // auto worker never parks a run in pool_wait on an empty pool (autoselect.ReasonPoolEmpty).
+// Only an ENABLED token counts (PRD #1732 D8): a disabled token keeps its auto_eligible
+// opt-in so re-enabling restores it, but it is not in the effective pool, which
+// ListAutoSelectCandidates builds from enabled tokens only.
 func (q *Queries) UserHasAutoEligibleAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error) {
 	row := q.db.QueryRow(ctx, userHasAutoEligibleAnthropicToken, userID)
 	var exists bool

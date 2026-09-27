@@ -1172,8 +1172,8 @@ type Store interface {
 	// Worker → token binding (PRD #104 M3): label resolution for the mint-time and
 	// CLI-facing forms, and the id-keyed rebind itself.
 	GetUserSecretIDByLabel(ctx context.Context, arg store.GetUserSecretIDByLabelParams) (uuid.UUID, error)
-	// UserHasAutoEligibleAnthropicToken reports whether the owner has ≥1 auto_eligible
-	// anthropic_token (a non-empty auto-select pool). CreateWorker reads it to derive a
+	// UserHasAutoEligibleAnthropicToken reports whether the owner has ≥1 enabled,
+	// auto_eligible anthropic_token (a non-empty auto-select pool). CreateWorker reads it to derive a
 	// new worker's bind mode the #804 way (PRD #1140 M1): no label + non-empty pool → auto.
 	UserHasAutoEligibleAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
 	SetWorkerAnthropicSecret(ctx context.Context, arg store.SetWorkerAnthropicSecretParams) (store.Worker, error)

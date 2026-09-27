@@ -376,9 +376,13 @@ WHERE id = @id AND user_id = @user_id AND sealed_with = 'master';
 -- (PRD #111 M2 D2). The ephemeral provisioner (issue #804) reads this to decide a
 -- burst worker's bind mode: `auto` when the pool is non-empty, else `default`, so an
 -- auto worker never parks a run in pool_wait on an empty pool (autoselect.ReasonPoolEmpty).
+-- Only an ENABLED token counts (PRD #1732 D8): a disabled token keeps its auto_eligible
+-- opt-in so re-enabling restores it, but it is not in the effective pool, which
+-- ListAutoSelectCandidates builds from enabled tokens only.
 SELECT EXISTS (
     SELECT 1 FROM user_secrets
     WHERE user_id = @user_id AND kind = 'anthropic_token' AND auto_eligible
+      AND disabled_at IS NULL
 );
 
 -- name: ListSecretEnablement :many
