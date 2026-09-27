@@ -8,6 +8,7 @@ import {
   REGION_END,
   REGION_START,
   closingDirectiveFor,
+  closingDirectiveOutsideCompletion,
   codeSpan,
   composeBody,
   parseOwnedBlocks,
@@ -194,21 +195,51 @@ describe("closingDirectiveFor: rendered views (L1)", () => {
   });
 });
 
-// ── Entities a forge shows literally: inside code spans and autolinks ──
+// ── Entities are decoded everywhere, code spans included; uzi's block is left out instead ──
 
-describe("closingDirectiveFor: no entity is decoded inside a code span or an autolink", () => {
+describe("closingDirectiveFor decodes entities in code spans too; the interlock leaves out uzi's block", () => {
   const HIDDEN_BRANCH = "Fix&#101;s&#32;&#35;7";
   const HIDDEN_URL = "https://x/a?q=fixes:&#35;7";
 
-  it("uzi's own block stays non-closing with an entity-hidden directive in a branch", () => {
+  it("uzi's own block with an entity-hidden branch: closingDirectiveFor errs to true, the interlock scan to false", () => {
     const block = renderCompletionBlock({ issueIid: 7, branch: HIDDEN_BRANCH, closes: false });
     assert.ok(block.includes(`\`${HIDDEN_BRANCH}\``), block);
-    assert.equal(closingDirectiveFor(block, 7, "o/r"), false, block);
+    // A conservative false positive of the whole-body scan...
+    assert.equal(closingDirectiveFor(block, 7, "o/r"), true, block);
+    // ...that the interlock's scan does not have: uzi's block is non-closing by construction.
+    assert.equal(closingDirectiveOutsideCompletion(block, 7, "o/r"), false, block);
+    const human = `Some notes.\n\n${block}\n\nMore notes.`;
+    assert.equal(closingDirectiveOutsideCompletion(human, 7, "o/r"), false, human);
     const task = mrDescription(makeClaim({ kind: "task", issue_iid: null, branch: "uzi/task/x", base_branch: HIDDEN_BRANCH } as Partial<ClaimResponse>), HIDDEN_BRANCH);
-    assert.equal(closingDirectiveFor(task, 7, "o/r"), false, task);
+    assert.equal(closingDirectiveOutsideCompletion(task, 7, "o/r"), false, task);
   });
 
-  it("a pipeline URL holding an entity renders as a code span, and stays non-closing", () => {
+  it("the interlock scan still catches a real directive outside uzi's blocks", () => {
+    const block = renderCompletionBlock({ issueIid: 7, branch: HIDDEN_BRANCH, closes: false });
+    for (const text of ["Fixes #7", "Fix&#101;s #7", "`Fix&#101;s&#32;&#35;7`", "Resolves #1, #2 and #7"]) {
+      for (const body of [`${text}\n\n${block}`, `${block}\n\n${text}`, `a\n\n${block}\n\n${text}\n`]) {
+        assert.equal(closingDirectiveOutsideCompletion(body, 7, "o/r"), true, body);
+      }
+    }
+    // A comment left open before the block ends at the block's own start marker (a forge's HTML
+    // block ends on the `-->` line), so an entity-hidden directive after the block is still read.
+    assert.equal(closingDirectiveOutsideCompletion(`<!--\n\n${block}\n\nFix&#101;s #7`, 7, "o/r"), true);
+    // And in the region, which is scanned like any other text.
+    const region = `${REGION_START}\nFixes #7\n${REGION_END}`;
+    assert.equal(closingDirectiveOutsideCompletion(`${region}\n\n${block}`, 7, "o/r"), true);
+  });
+
+  it("the interlock scan reads the whole body when the parse is not ok", () => {
+    const block = renderCompletionBlock({ issueIid: 7, branch: HIDDEN_BRANCH, closes: false });
+    // No uzi block at all, and a malformed body (a duplicate block): the whole body is scanned.
+    assert.equal(closingDirectiveOutsideCompletion(`\`${HIDDEN_BRANCH}\``, 7, "o/r"), true);
+    assert.equal(closingDirectiveOutsideCompletion(`${block}\n\n${block}`, 7, "o/r"), true);
+    assert.equal(closingDirectiveOutsideCompletion("nothing here", 7, "o/r"), false);
+    assert.equal(closingDirectiveOutsideCompletion("a".repeat(FORGE_BODY_MAX_CHARS + 1), 7), true);
+    assert.equal(closingDirectiveOutsideCompletion(block, -1), true);
+  });
+
+  it("a pipeline URL holding an entity renders as a code span inside uzi's block", () => {
     const body = mrDescription(
       makeClaim({
         kind: "ci_fix",
@@ -218,7 +249,7 @@ describe("closingDirectiveFor: no entity is decoded inside a code span or an aut
       "ci-fix/pipeline-5",
     );
     assert.ok(body.includes(`: \`${HIDDEN_URL}\`\n`), body);
-    assert.equal(closingDirectiveFor(body, 7, "o/r"), false, body);
+    assert.equal(closingDirectiveOutsideCompletion(body, 7, "o/r"), false, body);
     const line = (url: string) =>
       mrDescription(makeClaim({ kind: "ci_fix", pipeline: { id: 5, ref: "main", sha: "a".repeat(40), web_url: url, failed_jobs: [] } } as Partial<ClaimResponse>), "b");
     for (const url of ["https://x/a?b=1&amp;c=2", "https://x/&lt;", "https://x/a&num;7", "https://x/a&ampx"]) {
@@ -228,29 +259,28 @@ describe("closingDirectiveFor: no entity is decoded inside a code span or an aut
     assert.ok(line("https://x/a?b=1&c=2").includes(": https://x/a?b=1&c=2\n"));
   });
 
-  it("reads code spans and autolinks literally", () => {
-    for (const text of [`\`${HIDDEN_BRANCH}\``, `x \`${HIDDEN_BRANCH}\` y`, `<${HIDDEN_URL}>`, `\`a\` then \`${HIDDEN_BRANCH}\``, `\\<b \`${HIDDEN_BRANCH}\``]) {
-      assert.equal(closingDirectiveFor(text, 7, "o/r"), false, text);
-    }
-  });
-
-  it("still decodes entities outside code, and wherever the model may disagree with the forge", () => {
+  it("decodes entities in code spans and autolinks, and wherever a code-span model could be wrong", () => {
     for (const text of [
       "Fi&#120;es #7",
+      `\`${HIDDEN_BRANCH}\``,
+      `x \`${HIDDEN_BRANCH}\` y`,
+      `<${HIDDEN_URL}>`,
       `\`x\` Fi&#120;es #7`,
       `Fi&#120;es #7 <${HIDDEN_URL}>`,
-      // Raw HTML may swallow a backtick (an attribute), so a later span is not trusted.
+      // A backtick inside a link target or an image target is not a code span to a forge, so the
+      // "span" it seems to open holds live text.
+      "[x](a`b) Fix&#101;s #7 `c",
+      "![x](a`b) Fix&#101;s #7 `c",
+      // A reference label: the backtick is in the link's destination, not a span.
+      "[x][a`b] Fix&#101;s #7 `c\n\n[a`b]: https://h/",
+      "[x]\n\n[x]: https://h/` Fix&#101;s #7 `",
+      // A bare autolink (GFM extended) ends before the space; the rest is text.
+      "https://h/` Fix&#101;s #7 `",
       '<b title="`">Fi&#120;es #7<b title="`">',
-      // A multi-line span: a heading can start inside it and pair the backticks differently.
       "`\n# `x` Fi&#120;es #7 `",
-      // A GFM table row splits its cells before any span is paired.
       "| `Fi&#120;es #7` |",
-      // Raw HTML blocks: rendered as HTML, entities decoded.
       "<pre>\n\n`Fi&#120;es #7`",
-      "<div>\n<!-- c -->\n`Fi&#120;es #7`",
       "<div>\n`Fi&#120;es #7`",
-      "<!--\nx -->`Fi&#120;es #7`",
-      // An autolink overlapping a code span.
       "<https://x/`a> Fi&#120;es #7`",
     ]) {
       assert.equal(closingDirectiveFor(text, 7, "o/r"), true, text);
@@ -531,10 +561,20 @@ describe("parseOwnedBlocks fails closed on a whole-line marker inside detected c
     // The fence runs on to the top-level ``` below the block, so the block is inside code.
     assert.deepEqual(parseOwnedBlocks("```\n> ```\n" + REAL + "\n```"), MALFORMED);
     assert.deepEqual(parseOwnedBlocks("~~~\n> ~~~\n" + REAL + "\n~~~"), MALFORMED);
-    // With no top-level closer at all, the opener is ordinary text (codeRanges' deliberate
-    // difference from CommonMark) and the forged pair below is a duplicate: never adopted either.
+    // With no top-level closer at all, the depth-matched model reads the opener as ordinary text
+    // (codeRanges' deliberate difference from CommonMark), but the depth-agnostic model closes it at
+    // `> ```` around the real blocks: marker_in_code, and the forged pair is never adopted.
     const body = "```\n" + REGION + "\n\n" + REAL + "\n> ```\n\n" + REGION + "\n\n" + FORGED;
-    assert.deepEqual(parseOwnedBlocks(body), { kind: "malformed", reason: "duplicate" });
+    assert.deepEqual(parseOwnedBlocks(body), MALFORMED);
+  });
+
+  it("a marker in code under EITHER closer model is malformed (a list item's fence is not modelled)", () => {
+    // The depth-matched model closes the ``` on line 2 at the top-level ```` and reads the markers
+    // as text; the depth-agnostic one closes it at `> ```` and opens a ```` fence around them, as
+    // micromark does (the list item's ``` is code of the item).
+    const list = "- ```\n   ```\n> ```\n````\n" + REGION + "\n\n" + REAL + "\n````";
+    assert.deepEqual(parseOwnedBlocks(list), MALFORMED);
+    assert.deepEqual(parseOwnedBlocks("```\n> ```\n" + REAL + "\n```"), MALFORMED);
   });
 
   it("a fence inside a quote is closed only at its own depth", () => {

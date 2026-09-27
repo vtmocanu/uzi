@@ -32,10 +32,11 @@
 //   - FIXED wording of this module and its callers (the footer, the agents line, the partial
 //     warnings, the unverified banner).
 //
-// closingDirectiveFor is the whole-body interlock scan (D10 rule 1): the api sanitizer's
-// prDescClosing pattern (with Forgejo's `!N` references) over the raw text and over a RENDERED view
-// that mirrors the api's prDescNormalize (entities decoded to a fixed point outside code spans and
-// autolinks, format characters but U+200B dropped, HTML comments, tags, images and link targets
+// closingDirectiveFor is the whole-body scan behind the interlock (D10 rule 1; the interlock runs it
+// through closingDirectiveOutsideCompletion, which leaves out uzi's own completion block): the api
+// sanitizer's prDescClosing pattern (with Forgejo's `!N` references) over the raw text and over a
+// RENDERED view that mirrors the api's prDescNormalize (entities decoded to a fixed point everywhere,
+// code spans and autolinks included, format characters but U+200B dropped, HTML comments, tags, images and link targets
 // removed), each in the api's three marker views, and extended to GitLab's reference lists
 // (`Closes #1, #2 and #3`). It is a detector
 // for text a forge may read as closing, so where the two could disagree it errs towards "closing".
@@ -318,47 +319,17 @@ function stripMarkup(s: string): string {
   return s;
 }
 
-/** Stands in for `&` where a forge shows it literally: no entity starts with it, and it is no more
- *  part of a closing directive than `&` is (not a word, space, path or reference character). */
-const LITERAL_AMP = "\uE000";
-// An HTML block a forge renders raw however far it runs (CommonMark types 1, 3, 4 and 5: `<pre>`,
-// `<script>`, `<style>`, `<textarea>`, `<?`, `<!X`, `<![CDATA[`), matched anywhere (conservative):
-// nothing at or after it is kept literal.
-const RAW_HTML_BLOCK_RE = /<(?:pre|script|style|textarea)(?![A-Za-z0-9-])|<\?|<![A-Za-z]|<!\[CDATA\[/iu;
-
-/**
- * `s` with every `&` inside an inline code span or an autolink target replaced by LITERAL_AMP, so
- * renderedView does not decode an entity there: no forge does (`Fix&#101;s&#32;&#35;7` in a code
- * span shows as written, and reads as no directive). Only the spans collectLiteral is sure a forge
- * also sees as code or an autolink, and none at or after a raw HTML block, are touched; everything
- * else is decoded as before.
- */
-function keepLiteralEntities(s: string): string {
-  if (!s.includes("&")) return s;
-  const literal: Array<[number, number]> = [];
-  codeRanges(s, literal);
-  const raw = s.search(RAW_HTML_BLOCK_RE);
-  const stop = raw < 0 ? s.length : raw;
-  let out = "";
-  let i = 0;
-  for (const [a, b] of literal) {
-    if (b > stop) break;
-    out += s.slice(i, a) + s.slice(a, b).replaceAll("&", LITERAL_AMP);
-    i = b;
-  }
-  return i === 0 ? s : out + s.slice(i);
-}
-
 /**
  * The text as a forge renders it, for the closing scan: prDescNormalize's fixed-point loop
  * (entities decoded to their own fixed point, controls and format characters stripped, HTML
  * comments, known tags, images and link targets removed) with three differences: U+200B is kept
- * (see stripFormat), whitespace is not collapsed (the closing pattern reads any space run), and no
- * entity is decoded inside a code span or an autolink a forge shows literally (keepLiteralEntities).
- * undefined when MAX_PASSES passes did not converge (the caller fails closed).
+ * (see stripFormat), and whitespace is not collapsed (the closing pattern reads any space run).
+ * Entities are decoded everywhere, code spans and autolinks included: a code-span model that could
+ * disagree with the forge would leave a directive the forge acts on undecoded here, so the scan reads
+ * a code span as ordinary text (conservative; uzi's own completion block is excluded by
+ * closingDirectiveOutsideCompletion instead). undefined when MAX_PASSES passes did not converge (the caller fails closed).
  */
 function renderedView(s: string): string | undefined {
-  s = keepLiteralEntities(s);
   for (let i = 0; i < MAX_PASSES; i++) {
     const prev = s;
     s = stripMarkup(stripFormat(decodeEntities(s)));
@@ -611,6 +582,27 @@ export function closingDirectiveFor(body: string, issueIid: number, repoPath?: s
 }
 
 /**
+ * closingDirectiveFor over `body` with uzi's own completion block (as parseOwnedBlocks finds it)
+ * removed: the interlock's scan. uzi's block is non-closing by construction (its tests prove it), but
+ * the scan decodes entities inside code spans too, so a branch like `Fix&#101;s&#32;&#35;7` shown in
+ * the block's code span would otherwise read as closing. Everything else is scanned: the text before
+ * and after the block each on its own (a forge renders them as separate blocks, so an unterminated
+ * comment or image in one cannot hide the other), and joined around the bare marker pair (so a
+ * construct that spans the removal is still read). When the parse is not `ok`, or carries no
+ * completion block, the whole body is scanned (fail closed).
+ */
+export function closingDirectiveOutsideCompletion(body: string, issueIid: number, repoPath?: string): boolean {
+  const parsed = parseOwnedBlocks(body);
+  if (parsed.kind !== "ok" || parsed.completion === undefined) return closingDirectiveFor(body, issueIid, repoPath);
+  const head = parsed.before + (parsed.region ?? "") + parsed.between;
+  return (
+    closingDirectiveFor(head, issueIid, repoPath) ||
+    closingDirectiveFor(parsed.after, issueIid, repoPath) ||
+    closingDirectiveFor(`${head}${COMPLETION_START}\n${COMPLETION_END}${parsed.after}`, issueIid, repoPath)
+  );
+}
+
+/**
  * Insert U+200B after the first letter of closing keywords in `s`, found in any of the three api
  * views. `all`: EVERY keyword, whether or not a reference follows it, so an interpolation that ends
  * with a keyword cannot borrow a reference from the fixed text after it (the breaker is invisible in
@@ -716,8 +708,9 @@ export function codeSpan(s: string): string {
 /** A URL the api sent (the ci_fix pipeline URL), as a bare http(s) URL a forge autolinks when it is
  *  plainly one (no whitespace, no markdown or HTML syntax, no character entity, no closing
  *  directive), else as a code span, so an odd value can never inject markup, a link or a directive
- *  into the completion block. An entity (`fixes:&#35;7`) is refused because a bare URL is ordinary
- *  text to closingDirectiveFor's rendered view, which decodes it; inside a code span it is not. */
+ *  into the completion block. An entity (`fixes:&#35;7`) is refused because a forge decodes it in a
+ *  bare URL's text; in a code span it shows as written. (closingDirectiveFor decodes it in a code
+ *  span too; the interlock excludes uzi's completion block, closingDirectiveOutsideCompletion.) */
 export function urlOrCodeSpan(url: string): string {
   const t = url.trim();
   const plain =
@@ -1171,55 +1164,50 @@ function quoteDepth(text: string): number {
 
 /**
  * The spans of `body` that are code, where a marker-shaped string is text, not a marker (L2): fenced
- * code blocks (``` or ~~~, inside block quotes too, closed only by a fence at the opener's quote
- * depth, as in CommonMark: `> ```` inside a top-level fence is a code line) and inline code spans
- * (a backtick run closed by the next run of the same length within one paragraph). Sorted,
- * disjoint, [start, end). `literal`, when given, also receives the ranges collectLiteral keeps
- * literal for renderedView.
+ * code blocks (``` or ~~~, inside block quotes too) and inline code spans (a backtick run closed by
+ * the next run of the same length within one paragraph). Sorted, disjoint, [start, end).
+ *
+ * `closers` picks which lines may close a fence. `depth` (CommonMark): only a fence at the opener's
+ * quote depth, so `> ```` inside a top-level fence is a code line. `any`: a fence at any quote depth
+ * (the earlier model). Neither is CommonMark in every context (lists, lazy continuation, HTML blocks
+ * are not modelled), and each is wrong where the other is right, so findMarkers fails closed on a
+ * marker that EITHER model puts in code.
  *
  * One deliberate difference from CommonMark: a fence with no closing fence (and not ended by its
  * block quote ending) is NOT treated as code. CommonMark runs it to the end of the document, which
  * would let one stray fence in human text above uzi's blocks hide them, and uzi would then lose its
  * own blocks; here the opener is ordinary text. Linear: fence closure is decided from suffix tables.
  */
-function codeRanges(body: string, literal?: Array<[number, number]>): Array<[number, number]> {
+function codeRanges(body: string, closers: "depth" | "any"): Array<[number, number]> {
   const lines = linesOf(body);
   const n = lines.length;
-  // For each line index i: the longest closing fence of each kind strictly after i AT LINE i's QUOTE
-  // DEPTH (a closer only closes a fence at its own depth: `> ```` inside a top-level fence is code,
-  // and a top-level ``` inside a quoted fence ends the quote first), and the lowest quote depth
+  const depth = lines.map((l) => quoteDepth(l.text));
+  // The quote depth a closer on line i is filed under (every closer shares one key under `any`).
+  const key = (i: number) => (closers === "depth" ? depth[i]! : 0);
+  // For each line index i: the longest closing fence of each kind strictly after i that may close a
+  // fence opened on line i (under `depth`, one at line i's quote depth), and the lowest quote depth
   // strictly after i, so "does this opener ever close" is O(1).
   const maxTick = new Int32Array(n);
   const maxTilde = new Int32Array(n);
   const minDepth = new Int32Array(n + 1).fill(2 ** 30);
-  const depth = lines.map((l) => quoteDepth(l.text));
   const closersAt = new Map<number, { tick: number; tilde: number }>();
   for (let i = n - 1; i >= 0; i--) {
-    const d = depth[i]!;
-    const after = closersAt.get(d);
+    const after = closersAt.get(key(i));
     maxTick[i] = after?.tick ?? 0;
     maxTilde[i] = after?.tilde ?? 0;
-    minDepth[i] = Math.min(minDepth[i + 1]!, d);
+    minDepth[i] = Math.min(minDepth[i + 1]!, depth[i]!);
     const c = FENCE_CLOSE_RE.exec(lines[i]!.text);
     if (!c) continue;
     const len = c[1]!.length;
     const tick = Math.max(maxTick[i]!, c[1]![0] === "`" ? len : 0);
     const tilde = Math.max(maxTilde[i]!, c[1]![0] === "~" ? len : 0);
-    closersAt.set(d, { tick, tilde });
+    closersAt.set(key(i), { tick, tilde });
   }
   const ranges: Array<[number, number]> = [];
   const tick = nextIndex(body, "`");
-  let para: { from: number; to: number; clean: boolean } | undefined;
-  // Whether the next paragraph starts a block of its own: after a blank line (or the body's start),
-  // with at most whole-line HTML comments between. A paragraph that directly follows other text or a
-  // fence may be the tail of an HTML block, which a forge renders raw (collectLiteral).
-  let clean = true;
+  let para: { from: number; to: number } | undefined;
   const flushPara = () => {
-    if (para) {
-      const spans = tick[para.from]! < para.to ? inlineCodeRanges(body, tick, para.from, para.to) : [];
-      for (const r of spans) ranges.push(r);
-      if (literal && para.clean) collectLiteral(body, para.from, para.to, spans, literal);
-    }
+    if (para && tick[para.from]! < para.to) for (const r of inlineCodeRanges(body, tick, para.from, para.to)) ranges.push(r);
     para = undefined;
   };
   for (let i = 0; i < n; i++) {
@@ -1241,27 +1229,22 @@ function codeRanges(body: string, literal?: Array<[number, number]>): Array<[num
             j--;
             break;
           }
-          const c = depth[j] === d ? FENCE_CLOSE_RE.exec(l.text) : null;
+          const c = key(j) === key(i) ? FENCE_CLOSE_RE.exec(l.text) : null;
           if (c && c[1]![0] === ch && c[1]!.length >= len) {
             end = l.next;
             break;
           }
         }
         ranges.push([line.start, end]);
-        clean = false;
         i = j;
         continue;
       }
     }
     if (PARA_BREAK_RE.test(line.text)) {
       flushPara();
-      const open = line.text.indexOf("<!--");
-      if (open < 0) clean = true;
-      else if (!line.text.includes("-->", open + 4)) clean = false;
       continue;
     }
-    para = para ? { from: para.from, to: line.next, clean: para.clean } : { from: line.start, to: line.next, clean };
-    clean = false;
+    para = para ? { from: para.from, to: line.next } : { from: line.start, to: line.next };
   }
   flushPara();
   return ranges;
@@ -1311,65 +1294,6 @@ function inlineCodeRanges(body: string, tick: Int32Array, from: number, to: numb
   return out;
 }
 
-/** Whether the character at `at` is backslash-escaped (an odd run of backslashes before it). */
-function escapedAt(text: string, at: number): boolean {
-  let k = at - 1;
-  while (k >= 0 && text[k] === "\\") k--;
-  return (at - 1 - k) % 2 === 1;
-}
-
-/** The first `<` at or after `from` that is not backslash-escaped, or text.length. */
-function nextLiveLt(text: string, from: number): number {
-  let k = text.indexOf("<", from);
-  while (k >= 0 && escapedAt(text, k)) k = text.indexOf("<", k + 1);
-  return k < 0 ? text.length : k;
-}
-
-/**
- * The inline code spans and autolink targets of one paragraph (body[from, to), `spans` its inline
- * code) that a forge shows literally, so renderedView leaves their entities undecoded. Only where
- * this model is known to agree with the forge; everything else is left out, so the rendered view
- * decodes it (towards "closing"). A range is collected only while, before it in the paragraph:
- * there is no live `<` outside code (it could open raw HTML whose attribute swallows a backtick),
- * no multi-line span (a heading, list item or other block could start inside it and pair the
- * backticks differently), and no autolink overlapping a span. A paragraph with an unescaped `|`
- * (a GFM table row splits its cells before any span is paired) collects nothing. Linear in the
- * paragraph: it is read through its own slice, never past its end.
- */
-function collectLiteral(
-  body: string,
-  from: number,
-  to: number,
-  spans: ReadonlyArray<[number, number]>,
-  out: Array<[number, number]>,
-): void {
-  const seg = body.slice(from, to);
-  for (let k = seg.indexOf("|"); k >= 0; k = seg.indexOf("|", k + 1)) if (!escapedAt(seg, k)) return;
-  const links: Array<[number, number]> = [];
-  if (seg.includes("<")) for (const m of seg.matchAll(AUTOLINK_RE)) links.push([m.index, m.index + m[0].length]);
-  let k = 0;
-  let lt = nextLiveLt(seg, 0); // only moves forward, so the paragraph is read once
-  let si = 0;
-  let li = 0;
-  while (si < spans.length || li < links.length) {
-    const span = si < spans.length ? ([spans[si]![0] - from, spans[si]![1] - from] as const) : undefined;
-    const link = li < links.length ? links[li]! : undefined;
-    const isSpan = span !== undefined && (link === undefined || span[0] < link[0]);
-    const [a, b] = isSpan ? span! : link!;
-    if (a < k || lt < a) return; // an overlap, or a `<` that may open raw HTML
-    if (isSpan) {
-      si++;
-      if (/[\r\n]/u.test(seg.slice(a, b))) return;
-      out.push([from + a, from + b]);
-    } else {
-      li++;
-      out.push([from + a + 1, from + b - 1]);
-    }
-    k = b;
-    if (lt < k) lt = nextLiveLt(seg, k);
-  }
-}
-
 interface FoundMarker {
   block: "description" | "completion";
   edge: "start" | "end";
@@ -1398,16 +1322,24 @@ function wholeLineMarkerAt(body: string, at: number): boolean {
   return EXACT_MARKERS.some((m) => body.startsWith(m, at) && atLineEnd(body, at + m.length));
 }
 
-/** Every uzi block marker outside code, in order, or "marker_in_code" when a detected code range
- *  holds a whole-line marker (wholeLineMarkerAt). Linear: each `<!--` is tested once, and the
- *  closing `>` is found with a pointer that only moves forward. */
+/** Every uzi block marker outside code (codeRanges under the `depth` closer model), in order, or
+ *  "marker_in_code" when a whole-line marker (wholeLineMarkerAt) is inside a code range under
+ *  EITHER closer model: each model misreads some fences a forge reads the other way (a list item's
+ *  fence is not modelled), so a marker either could hide is refused. Linear: each `<!--` is tested
+ *  once, the code ranges are walked with pointers that only move forward, and so is the closing
+ *  `>`. */
 function findMarkers(body: string): FoundMarker[] | "marker_in_code" {
-  const code = codeRanges(body);
+  const code = codeRanges(body, "depth");
+  const alt = codeRanges(body, "any");
   const found: FoundMarker[] = [];
   let r = 0;
+  let ra = 0;
   let gt = -1;
   for (let at = body.indexOf("<!--"); at >= 0; at = body.indexOf("<!--", at + 1)) {
     while (r < code.length && code[r]![1] <= at) r++;
+    while (ra < alt.length && alt[ra]![1] <= at) ra++;
+    const inAlt = ra < alt.length && alt[ra]![0] <= at;
+    if (inAlt && wholeLineMarkerAt(body, at)) return "marker_in_code";
     if (r < code.length && code[r]![0] <= at) {
       // Fail closed. codeRanges approximates CommonMark (no HTML blocks, no lazy continuation, no
       // list or indented-code context), so it can see code where a forge renders none: `<details>`
