@@ -73,6 +73,7 @@ if [ "\${1:-}" = api ]; then
     *graphql*) printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":%s,"pageInfo":{"hasNextPage":false}}}}}}\n' "\${THREADS_JSON:-[]}"; exit 0 ;;
     *'/code-scanning/alerts'*)
       [ "\${CS_MODE:-}" = broken ] && { echo 'HTTP 502: Bad Gateway' >&2; exit 1; }
+      [ "\${CS_MODE:-}" = malformed404 ] && { echo '[{"number":1,"tool":{"name":"CodeQL"},"rule":{"id":"bug"},"most_recent_instance":{"message":{"text":"known open alert"}}}]'; printf '{'; echo 'gh: later page failed (HTTP 404)' >&2; exit 1; }
       [ "\${CS_MODE:-}" = partial404 ] && { echo '[{"number":1,"tool":{"name":"CodeQL"},"rule":{"id":"bug"},"most_recent_instance":{"message":{"text":"live finding"}}}]'; echo 'gh: later page failed (HTTP 404)' >&2; exit 1; }
       if [ "\${CS_MODE:-}" = alert ]; then echo '[{"number":52,"tool":{"name":"CodeQL"},"rule":{"id":"js/shell-command-injection-from-environment"},"most_recent_instance":{"location":{"path":"agent/src/js-deps.ts","start_line":576},"message":{"text":"Shell command built from environment values."}}}]'; else echo '[]'; fi
       exit 0 ;;
@@ -305,7 +306,7 @@ export CS_MODE=alert
 merge_run alert
 [ "$rc" -eq 5 ] || fail "an open code-scanning alert did not refuse the merge, rc=$rc: $(cat "$WORK/m.alert")"
 [ ! -e "$WORK/merge.log" ] || fail "merged over an open code-scanning alert"
-for m in broken partial404; do
+for m in broken partial404 malformed404; do
   export CS_MODE=$m
   merge_run "cs$m"
   [ "$rc" -eq 2 ] || fail "an unreadable alert lookup ($m) did not refuse, rc=$rc: $(cat "$WORK/m.cs$m")"
@@ -316,7 +317,7 @@ export COMMENTS_FILE="$WORK/comments.json"
 jq -n '[{id:777,user:{login:"alice"},created_at:"2026-09-27T17:00:00Z",updated_at:"2026-09-27T17:00:00Z",body:"Do not merge before the migration lands."}]' > "$COMMENTS_FILE"
 merge_run unacked
 [ "$rc" -eq 5 ] || fail "an unacknowledged comment did not refuse the merge, rc=$rc: $(cat "$WORK/m.unacked")"
-grep -qE '  UNTRUSTED \[comment c777@[0-9a-f]{16}\] author=alice at=- \| Do not merge before the migration lands\.' "$WORK/m.unacked" || fail "comment not listed: $(cat "$WORK/m.unacked")"
+grep -qF '  UNTRUSTED [comment c777] author=alice at=- | Do not merge before the migration lands.' "$WORK/m.unacked" || fail "comment not listed: $(cat "$WORK/m.unacked")"
 [ ! -e "$WORK/merge.log" ] || fail "merged over an unacknowledged comment"
 # --confirm-only still reconciles an out-of-band merge while a comment is unacknowledged.
 MERGE_STATE=MERGED; export MERGE_STATE
@@ -325,7 +326,7 @@ set +e; bash "$SCRIPT" test/repo 42 --confirm-only > "$WORK/confirm-blocked.out"
 [ "$rc" -eq 0 ] || fail "--confirm-only was blocked by an unacknowledged comment, rc=$rc: $(cat "$WORK/confirm-blocked.out")"
 bash "$HERE/claims.sh" release '#42' --purge > /dev/null
 MERGE_STATE=OPEN; export MERGE_STATE
-d777=$(bash "$HERE/ack-comments.sh" test/repo 42 --list | grep -F '[comment c777@' | sed -E 's/.*c777@([0-9a-f]+)\].*/\1/')
+d777=$(bash "$HERE/ack-comments.sh" test/repo 42 --show c777 | grep -F '[comment c777@' | sed -E 's/.*c777@([0-9a-f]+)\].*/\1/')
 bash "$HERE/ack-comments.sh" test/repo 42 "c777@$d777" > "$WORK/ack.out" 2>&1 || fail "ack failed: $(cat "$WORK/ack.out")"
 merge_run acked
 grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "an acknowledged comment still blocked the merge: $(cat "$WORK/m.acked")"

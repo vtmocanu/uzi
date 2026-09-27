@@ -222,7 +222,8 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
 4. **Findings.** Gather: `S/pr-findings.sh OWNER/REPO PR [PR ...]` (both bots plus every
    author; exit 3 = unreviewed head, unreadable lookup or a BLOCKED item). Resolve each
    `thread` row, fix or dismiss each `alert` row. Read each `comment` / `review-body` in full
-   (`S/ack-comments.sh OWNER/REPO PR --show ID`), act on it, then ack the version you read:
+   (`S/ack-comments.sh OWNER/REPO PR --show ID`, the only view that is complete and prints the
+   digest; excerpts are cut and say INCOMPLETE), act on it, then ack the version you read:
    `S/ack-comments.sh OWNER/REPO PR ID@DIGEST ...`. An edit before or after the ack re-blocks. Verify each against the current code and label it **real / inherited
    / deliberate / mock-only** (references/coderabbit-triage.md). Before touching the branch,
    check for an `mr_rework` run and defer if one is coming (references/mr-rework.md; on a

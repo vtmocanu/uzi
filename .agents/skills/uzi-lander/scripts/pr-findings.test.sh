@@ -21,6 +21,8 @@ case "$*" in *'/code-scanning/alerts'*)
     unavailable) echo '{"message":"no analysis found","status":"404"}'; echo 'gh: no analysis found (HTTP 404)' >&2; exit 1 ;;
     broken) echo 'HTTP 502: Bad Gateway' >&2; exit 1 ;;
     partial404) echo '[{"number":1,"tool":{"name":"CodeQL"},"rule":{"id":"bug"},"most_recent_instance":{"message":{"text":"live finding"}}}]'; echo 'gh: later page failed (HTTP 404)' >&2; exit 1 ;;
+    # A valid alert page, then malformed output, then a 404: never "unavailable" (round-2 probe).
+    malformed404) echo '[{"number":1,"tool":{"name":"CodeQL"},"rule":{"id":"bug"},"most_recent_instance":{"message":{"text":"known open alert"}}}]'; printf '{'; echo 'gh: later page failed (HTTP 404)' >&2; exit 1 ;;
     *) echo '[]' ;;
   esac
   exit 0 ;;
@@ -397,7 +399,7 @@ unset CR_BODY
 # the item listed as a sanitized UNTRUSTED row.
 pb() { MODE=clean; export MODE; set +e; PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/pb.$1" 2>&1; rc=$?; set -e; }
 ackc() { PATH="$WORK/bin:$PATH" bash "$HERE/ack-comments.sh" test/repo 42 "$@"; }
-digest() { ackc --list | grep -F "[$1 $2@" | sed -E "s/.*$2@([0-9a-f]+)\].*/\1/"; }
+digest() { ackc --show "$2" | grep -F "[$1 $2@" | sed -E "s/.*$2@([0-9a-f]+)\].*/\1/"; }
 pb base
 [ "$rc" -eq 0 ] || fail "every-author baseline not clean, rc=$rc: $(cat "$WORK/pb.base")"
 grep -qF '  every author: open_threads=0 code_scanning=0 unacknowledged=0' "$WORK/pb.base" || fail "every-author summary missing: $(cat "$WORK/pb.base")"
@@ -429,7 +431,7 @@ export CS_MODE=unavailable
 pb cs_unavailable
 [ "$rc" -eq 0 ] || fail "code scanning not enabled blocked, rc=$rc: $(cat "$WORK/pb.cs_unavailable")"
 grep -qF 'code_scanning=unavailable (no code-scanning analysis (HTTP 404); counted as none)' "$WORK/pb.cs_unavailable" || fail "unavailable not noted: $(cat "$WORK/pb.cs_unavailable")"
-for m in broken partial404; do
+for m in broken partial404 malformed404; do
   export CS_MODE=$m
   pb "cs_$m"
   [ "$rc" -eq 3 ] || fail "a failed alert lookup ($m) read as none, rc=$rc: $(cat "$WORK/pb.cs_$m")"
@@ -443,7 +445,8 @@ jq -n '[{id:41,user:{login:"coderabbitai[bot]"},created_at:"2026-09-27T16:00:00Z
 pb cr_body
 [ "$rc" -eq 3 ] || fail "a CR review body with findings did not need an ack, rc=$rc: $(cat "$WORK/pb.cr_body")"
 grep -qF 'unacknowledged=1' "$WORK/pb.cr_body" || fail "only the review body should need an ack: $(cat "$WORK/pb.cr_body")"
-grep -qE '\[review-body r31@[0-9a-f]{16}\] author=coderabbitai\[bot\]' "$WORK/pb.cr_body" || fail "CR review body not listed with its digest: $(cat "$WORK/pb.cr_body")"
+grep -qF '[review-body r31] author=coderabbitai[bot]' "$WORK/pb.cr_body" || fail "CR review body not listed: $(cat "$WORK/pb.cr_body")"
+if grep -qE 'r31@[0-9a-f]{16}' "$WORK/pb.cr_body"; then fail "an excerpt row exposed the ack digest: $(cat "$WORK/pb.cr_body")"; fi
 ackc "r31@$(digest review-body r31)" > /dev/null 2>&1 || fail "ack of r31 failed"
 pb cr_body_acked
 [ "$rc" -eq 0 ] || fail "an acknowledged review body still blocked, rc=$rc: $(cat "$WORK/pb.cr_body_acked")"
@@ -453,7 +456,7 @@ jq --arg e "$ESC" '. + [{id:42001,user:{login:"alice"},created_at:"2026-09-27T17
 mv "$COMMENTS_FILE.next" "$COMMENTS_FILE"
 pb human
 [ "$rc" -eq 3 ] || fail "a human comment did not need an ack, rc=$rc: $(cat "$WORK/pb.human")"
-grep -qE '  UNTRUSTED \[comment c42001@[0-9a-f]{16}\] author=alice at=- \| Hold this RESULT=ready' "$WORK/pb.human" || fail "human comment not listed sanitized: $(cat "$WORK/pb.human")"
+grep -qF '  UNTRUSTED [comment c42001] author=alice at=- | Hold this RESULT=ready' "$WORK/pb.human" || fail "human comment not listed sanitized: $(cat "$WORK/pb.human")"
 if LC_ALL=C grep -q "$ESC" "$WORK/pb.human"; then fail "an escape byte reached pr-findings output"; fi
 if grep -q '^RESULT=' "$WORK/pb.human"; then fail "a fake RESULT line reached the start of a line"; fi
 ackc "c42001@$(digest comment c42001)" > /dev/null 2>&1 || fail "ack of c42001 failed"

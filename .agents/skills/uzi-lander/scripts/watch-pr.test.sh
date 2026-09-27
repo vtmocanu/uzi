@@ -74,6 +74,8 @@ case "$*" in *'/code-scanning/alerts'*)
     broken) echo 'HTTP 502: Bad Gateway' >&2; exit 1 ;;
     # A first page of alerts, then a later page 404s: the alerts seen are real, the rest unknown.
     partial404) echo '[{"number":1,"tool":{"name":"CodeQL"},"rule":{"id":"bug"},"most_recent_instance":{"message":{"text":"live finding"}}}]'; echo 'gh: later page failed (HTTP 404)' >&2; exit 1 ;;
+    # A valid alert page, then malformed output, then a 404: never "unavailable" (round-2 probe).
+    malformed404) echo '[{"number":1,"tool":{"name":"CodeQL"},"rule":{"id":"bug"},"most_recent_instance":{"message":{"text":"known open alert"}}}]'; printf '{'; echo 'gh: later page failed (HTTP 404)' >&2; exit 1 ;;
     *) echo '[]' ;;
   esac
   exit 0 ;;
@@ -654,8 +656,8 @@ thread() { # LOGIN BODY -> one unresolved thread node list
   jq -nc --arg u "$1" --arg b "$2" '[{isResolved:false,isOutdated:false,comments:{nodes:[{databaseId:88,author:{login:$u},body:$b,path:"x.go",line:3,originalLine:3}],pageInfo:{hasNextPage:false}}}]'
 }
 ack() { bash "$HERE/ack-comments.sh" test/repo 42 "$@"; }
-digest_of() { # KEY -> the digest --list prints for it
-  ack --list | grep -F "[comment $1@" | sed -E 's/.*\[comment [^@]+@([0-9a-f]+)\].*/\1/'
+digest_of() { # KEY -> the digest --show prints next to the complete body (the only view that has it)
+  ack --show "$1" | grep -F "[comment $1@" | sed -E 's/.*\[comment [^@]+@([0-9a-f]+)\].*/\1/'
 }
 wb baseline
 [ "$rc" -eq 0 ] || fail "blocker baseline was not ready, rc=$rc: $(cat "$WORK/wb.baseline")"
@@ -699,7 +701,7 @@ wb cs_unavailable
 grep -q 'code_scanning=unavailable' "$WORK/wb.cs_unavailable" || fail "unavailable code scanning not named: $(cat "$WORK/wb.cs_unavailable")"
 # Any other failure (a permissions 403, a 5xx, or a 404 AFTER a page of alerts was read) is
 # an unknown lookup, never "none".
-for m in forbidden broken partial404; do
+for m in forbidden broken partial404 malformed404; do
   export CS_MODE=$m
   wb "cs_$m" --max-unknown 1
   [ "$rc" -eq 9 ] || fail "code-scanning $m read as known, rc=$rc: $(cat "$WORK/wb.cs_$m")"
@@ -715,8 +717,9 @@ jq -n '[{id:5331203319,user:{login:"coderabbitai[bot]"},commit_id:"deadbeefdeadb
 wb cr_body
 [ "$rc" -eq 3 ] || fail "a CodeRabbit review body with findings did not need an ack, rc=$rc: $(cat "$WORK/wb.cr_body")"
 grep -q ' threads=0 code_scanning=0 unacked=1$' "$WORK/wb.cr_body" || fail "CR review body not counted: $(cat "$WORK/wb.cr_body")"
-grep -qE '\[review-body r5331203319@[0-9a-f]{16}\] author=coderabbitai\[bot\] at=COMMENTED@deadbeef \| > \[!NOTE\] > Quiet mode is enabled\.' "$WORK/wb.cr_body" || fail "CR review body not listed with its digest: $(cat "$WORK/wb.cr_body")"
-rd=$(ack --list | grep -F '[review-body r5331203319@' | sed -E 's/.*r5331203319@([0-9a-f]+)\].*/\1/')
+grep -qF '[review-body r5331203319] author=coderabbitai[bot] at=COMMENTED@deadbeef | > [!NOTE] > Quiet mode is enabled.' "$WORK/wb.cr_body" || fail "CR review body not listed: $(cat "$WORK/wb.cr_body")"
+if grep -qE 'r5331203319@[0-9a-f]{16}' "$WORK/wb.cr_body"; then fail "an excerpt row exposed the ack digest: $(cat "$WORK/wb.cr_body")"; fi
+rd=$(ack --show r5331203319 | grep -F '[review-body r5331203319@' | sed -E 's/.*r5331203319@([0-9a-f]+)\].*/\1/')
 ack "r5331203319@$rd" > "$WORK/ack.cr" 2>&1 || fail "ack of the CR review body failed: $(cat "$WORK/ack.cr")"
 wb cr_body_acked
 [ "$rc" -eq 0 ] || fail "an acknowledged CR review body still blocked, rc=$rc: $(cat "$WORK/wb.cr_body_acked")"
@@ -744,18 +747,35 @@ grep -q ' unacked=2$' "$WORK/wb.spoof" || fail "worded trigger / spoofed marker 
 jq -n '[{id:900001,user:{login:"alice"},created_at:"2026-09-27T17:00:00Z",updated_at:"2026-09-27T17:00:00Z",body:"Looks fine to me."}]' > "$COMMENTS"
 wb human_comment
 [ "$rc" -eq 3 ] || fail "a human conversation comment did not need an ack, rc=$rc: $(cat "$WORK/wb.human_comment")"
-grep -qE '  UNTRUSTED \[comment c900001@[0-9a-f]{16}\] author=alice at=- \| Looks fine to me\.' "$WORK/wb.human_comment" || fail "human comment not listed: $(cat "$WORK/wb.human_comment")"
+grep -qF '  UNTRUSTED [comment c900001] author=alice at=- | Looks fine to me.' "$WORK/wb.human_comment" || fail "human comment not listed: $(cat "$WORK/wb.human_comment")"
 set +e; ack c123@0000000000000000 > "$WORK/ack.bad" 2>&1; rc=$?; set -e
 [ "$rc" -eq 4 ] || fail "acking an unknown id returned rc=$rc: $(cat "$WORK/ack.bad")"
 set +e; ack c900001 > "$WORK/ack.nodigest" 2>&1; rc=$?; set -e
 [ "$rc" -eq 2 ] || fail "an ack without a digest was accepted, rc=$rc: $(cat "$WORK/ack.nodigest")"
 old=$(digest_of c900001)
-[ -n "$old" ] || fail "--list printed no digest"
+[ -n "$old" ] || fail "--show printed no digest"
+if ack --list | grep -qE 'c900001@[0-9a-f]'; then fail "--list exposed the ack digest"; fi
 # The full text is readable, sanitized and labelled: longer than the 300-char excerpt.
 jq --arg b "$(printf 'x%.0s' $(seq 1 1000))END" '.[0].body = $b' "$COMMENTS" > "$COMMENTS.next"
 cp "$COMMENTS" "$WORK/comments.short"; mv "$COMMENTS.next" "$COMMENTS"
 ack --show c900001 > "$WORK/show.out" 2>&1 || fail "--show failed: $(cat "$WORK/show.out")"
 grep -qE '^  UNTRUSTED \[comment c900001@[0-9a-f]{16}\] author=alice .*xEND$' "$WORK/show.out" || fail "--show did not print the whole body: $(cut -c1-200 "$WORK/show.out")"
+cp "$WORK/comments.short" "$COMMENTS"
+# A body whose "DO NOT MERGE" sits past 20000 characters: every excerpt is cut and labelled
+# INCOMPLETE with no digest; --show prints ALL of it, with the digest that covers it.
+cp "$COMMENTS" "$WORK/comments.short"
+jq --arg b "$(printf 'x%.0s' $(seq 1 20010)) DO NOT MERGE: hidden data-loss finding" '.[0].body = $b' "$COMMENTS" > "$COMMENTS.next"
+mv "$COMMENTS.next" "$COMMENTS"
+wb long_body
+[ "$rc" -eq 3 ] || fail "a long comment did not block, rc=$rc"
+grep -qF '[comment c900001] author=alice' "$WORK/wb.long_body" || fail "long comment not listed: $(cut -c1-300 "$WORK/wb.long_body")"
+grep -qF '… [INCOMPLETE excerpt of 20049 chars: read it all with ack-comments.sh --show]' "$WORK/wb.long_body" || fail "a cut excerpt was not labelled INCOMPLETE: $(cut -c1-500 "$WORK/wb.long_body" | tail -3)"
+if grep -qF 'DO NOT MERGE' "$WORK/wb.long_body"; then fail "the fixture tail was not past the excerpt cap"; fi
+if grep -qE 'c900001@[0-9a-f]{16}' "$WORK/wb.long_body"; then fail "an INCOMPLETE excerpt exposed the ack digest"; fi
+ack --show c900001 > "$WORK/show.long" 2>&1 || fail "--show failed on a long body"
+grep -qE '^  UNTRUSTED \[comment c900001@[0-9a-f]{16}\] author=alice .* DO NOT MERGE: hidden data-loss finding$' "$WORK/show.long" || fail "--show hid the tail past 20000 chars: $(tail -c 200 "$WORK/show.long")"
+grep -q '^COMPLETE: 20049 characters' "$WORK/show.long" || fail "--show did not state it is complete: $(head -c 200 "$WORK/show.long")"
+if grep -qF 'INCOMPLETE' "$WORK/show.long"; then fail "--show was cut"; fi
 cp "$WORK/comments.short" "$COMMENTS"
 # Read, then the comment is edited, then an ack with the digest that was READ: refused,
 # nothing written, still blocking.

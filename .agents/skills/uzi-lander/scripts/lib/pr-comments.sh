@@ -10,7 +10,8 @@
 #            it) to clear it. Input: fetch_review_threads output.
 #   alert    an open code-scanning alert on refs/pull/N/head. When the INITIAL request fails
 #            with 404 (no analysis) or a 403 saying code scanning / Advanced Security is not
-#            enabled: CS_STATE=unavailable (printed, counted as none). Any other failure,
+#            enabled, with stdout empty or only gh's error body: CS_STATE=unavailable (printed,
+#            counted as none). Any other failure, any partial or malformed output,
 #            including one after a page was already read: CS_STATE=unknown.
 #   comment / review-body
 #            an issue comment or non-empty review body, minus known pure-status bot output
@@ -85,7 +86,7 @@ open_threads_json() { printf '%s' "$1" | jq -c "$PRC_JQ"' open_threads' 2>/dev/n
 # items, [] unless ok) and CS_NOTE (why, for unavailable/unknown). Always rc 0.
 # shellcheck disable=SC2034  # CS_* are this function's outputs, read by the sourcing scripts.
 code_scanning_open() {
-  local repo=$1 pr=$2 errf raw rc=0 txt read_a_page
+  local repo=$1 pr=$2 errf raw rc=0 txt stdout_kind
   CS_STATE=unknown; CS_ITEMS='[]'; CS_NOTE=""
   errf=$(mktemp "${TMPDIR:-/tmp}/uzi-lander-cs.XXXXXX") || { CS_NOTE="mktemp failed"; return 0; }
   raw=$(gh api --paginate "repos/${repo}/code-scanning/alerts?ref=refs/pull/${pr}/head&state=open&per_page=100" 2>"$errf") || rc=$?
@@ -99,12 +100,20 @@ code_scanning_open() {
     fi
     return 0
   fi
-  # A failure AFTER a page of alerts was read is never "not enabled": the alerts already
-  # seen are real, and the rest are unknown.
-  read_a_page=$(printf '%s' "$raw" | jq -s 'any(.[]; type == "array")' 2>/dev/null || echo false)
-  if [ "$read_a_page" = true ]; then
-    CS_NOTE="alert listing failed after a page was read (gh exit $rc)"; return 0
-  fi
+  # `unavailable` needs POSITIVE proof that the initial request itself failed: stdout must be
+  # empty, or exactly gh's single JSON error body ({message, documentation_url, status}), and
+  # hold no alert data. Anything else (an alert page, malformed or partial output, a second
+  # document) is unknown; a jq failure is never read as "no page was read".
+  stdout_kind=$(printf '%s' "$raw" | jq -rs '
+    if length == 0 then "empty"
+    elif length == 1 and (.[0] | type) == "object" and (.[0] | has("message"))
+         and ((.[0] | keys) - ["message", "documentation_url", "status"] | length) == 0
+      then "error-body"
+    else "data" end' 2>/dev/null) || stdout_kind=unparseable
+  case "$stdout_kind" in
+    empty|error-body) ;;
+    *) CS_NOTE="alert listing failed with output that is not a bare error ($stdout_kind; gh exit $rc)"; return 0 ;;
+  esac
   case "$txt" in
     *"HTTP 404"*) CS_STATE=unavailable; CS_NOTE="no code-scanning analysis (HTTP 404)" ;;
     *"HTTP 403"*)

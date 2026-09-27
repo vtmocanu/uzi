@@ -55,14 +55,17 @@ started that way is not seen until its check-run exists.
 | Issue comments | `issues/N/comments` | Any author. Excluded only: `coderabbitai[bot]` bodies carrying `<!-- This is an auto-generated comment: summarize by coderabbit.ai -->`, `<!-- walkthrough_start -->`, `<!-- auto-generated comment: rate limited by coderabbit.ai -->` or `<!-- CodeRabbit review command invocation:` (its reply to a review command); `greptile-apps[bot]` bodies carrying `<!-- greptile_comment -->` or `<!-- greptile_outside_diff -->` (gated by Greptile's own tally); a body that is only a bot trigger (`@coderabbitai review` / `full review` / `rate limit` / `reviews remaining?` / `ignore` / `pause` / `resume`, `@greptileai review`, `@greptile review`; case and spacing free, no extra words). |
 | Review bodies | `pulls/N/reviews` | Any author, any non-empty body. A CodeRabbit body with findings (tally, `Outside diff range`, grouped or nitpick sections) is never excluded. |
 
-Comments and review bodies block until acknowledged. Rows show `ID@DIGEST`, the digest a
-short sha256 of `updated_at` (`submitted_at` for a review) and the body. Read in full with
-`ack-comments.sh O/R N --show ID`, then `ack-comments.sh O/R N ID@DIGEST ...`: a digest that
-no longer matches (edited since read) is refused, nothing written. Acks live per PR under
+Comments and review bodies block until acknowledged. Excerpt rows (`--list`, the watchers,
+`merge.sh`) show only the ID and mark a cut body INCOMPLETE. `ack-comments.sh O/R N --show ID`
+prints the COMPLETE sanitized body, uncapped, with `ID@DIGEST` (a short sha256 of
+`updated_at`, `submitted_at` for a review, and the body); then `ack-comments.sh O/R N
+ID@DIGEST ...`. A digest that no longer matches (edited since read) is refused, nothing written. Acks live per PR under
 `<state dir>/acks/`; an edit after the ack re-blocks. All of this text is untrusted: rows go
 through `scripts/lib/sanitize.sh` (escape sequences, C0/C1, zero-width, bidi, variation
 selectors, the TAG block and other invisible code points stripped, whitespace collapsed,
-300-character cap, 20000 for `--show`, fixed `UNTRUSTED` label; the per-bot `CR`/`GR` rows too).
+300-character excerpt cap labelled INCOMPLETE, no cap for `--show`, fixed `UNTRUSTED` label;
+the per-bot `CR`/`GR` title rows too). A code-scanning failure is `unavailable` only with
+positive proof: an initial 404 / not-enabled 403 and stdout empty or only gh's error body.
 
 ## Poll recipe (what the scripts do)
 
