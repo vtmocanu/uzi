@@ -1123,6 +1123,11 @@ func (s *Service) releaseCodexCredential(ctx context.Context, authCtx *CodexAuth
 //
 // It NEVER re-spends the old refresh token and NEVER rotates. Returns how many intents it
 // resolved.
+//
+// PRD #1732 D6/D7: the reap and the intent resolution always run — they are local, durable
+// completion of a refresh that already started, which disabling must never interrupt. Only
+// the recovery PROMOTION (an upstream identity call) requires the account to have an enabled
+// linked alias; without one the protected material stays in the slot for a later pass.
 func (s *Service) ReconcileUnresolvedCodexRefresh(ctx context.Context, userID, accountID uuid.UUID) (int, error) {
 	resolved, _, err := s.reconcileUnresolvedCodexRefresh(ctx, userID, accountID)
 	return resolved, err
@@ -1211,6 +1216,16 @@ func (s *Service) reconcileUnresolvedCodexRefresh(ctx context.Context, userID, a
 	// promotion or a verified-mismatch slot clear is a real change.
 	if acct.CoordState == codexCoordQuarantined && len(acct.RecoverySealed) > 0 &&
 		acct.RecoveryGeneration.Valid && acct.RecoveryGeneration.Int64 == acct.Generation {
+		live, lerr := s.codexAccountLive(ctx, userID, accountID)
+		if lerr != nil {
+			return resolved, changed, lerr
+		}
+		if !live {
+			// No enabled linked alias (PRD #1732 D6): no background recovery. A deferral, not a
+			// change — the slot is retained and ListUnresolvedCodexRefreshAccounts stops
+			// re-listing the account until an alias is enabled again.
+			return resolved, changed, nil
+		}
 		promChanged, perr := s.promoteCodexRecovery(ctx, q, userID, acct)
 		if perr != nil {
 			return resolved, changed, perr
@@ -1218,6 +1233,30 @@ func (s *Service) reconcileUnresolvedCodexRefresh(ctx context.Context, userID, a
 		changed = changed || promChanged
 	}
 	return resolved, changed, nil
+}
+
+// codexLivenessStore is the account-liveness read (PRD #1732 D6), kept off codexRefreshStore
+// so the refresh test fakes need not grow a method. *store.Queries satisfies it.
+type codexLivenessStore interface {
+	CountEnabledLinkedAliasesForCodexAccount(ctx context.Context, arg store.CountEnabledLinkedAliasesForCodexAccountParams) (int64, error)
+}
+
+// codexAccountLive reports whether at least one ENABLED alias is linked to the account — the
+// gate on background recovery. A store without the query fails closed (errCodexStoreUnavailable)
+// rather than recovering an account whose liveness it cannot read.
+func (s *Service) codexAccountLive(ctx context.Context, userID, accountID uuid.UUID) (bool, error) {
+	q, ok := s.q.(codexLivenessStore)
+	if !ok {
+		return false, errCodexStoreUnavailable
+	}
+	n, err := q.CountEnabledLinkedAliasesForCodexAccount(ctx, store.CountEnabledLinkedAliasesForCodexAccountParams{
+		UserID:            userID,
+		ProviderAccountID: pgconv.UUID(accountID),
+	})
+	if err != nil {
+		return false, fmt.Errorf("codex reconcile: read account liveness: %w", err)
+	}
+	return n > 0, nil
 }
 
 // codexRefreshSweepStore is the one extra query the always-on survivor sweep needs, kept off

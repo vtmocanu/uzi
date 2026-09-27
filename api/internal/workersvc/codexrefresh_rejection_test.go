@@ -89,7 +89,7 @@ func (f *rejFakeStore) PromoteCodexRecovery(context.Context, store.PromoteCodexR
 	return 0, errors.New("rejFakeStore: unexpected PromoteCodexRecovery")
 }
 
-func (f *rejFakeStore) CountLinkedAliasesForCodexAccount(context.Context, store.CountLinkedAliasesForCodexAccountParams) (int64, error) {
+func (f *rejFakeStore) CountEnabledLinkedAliasesForCodexAccount(context.Context, store.CountEnabledLinkedAliasesForCodexAccountParams) (int64, error) {
 	return 1, nil
 }
 

@@ -12,12 +12,36 @@
 -- the poll (the reading describes a superseded generation), and the linked-alias fence
 -- rejects a reading for an account whose last codex_auth alias was unlinked/deleted between
 -- observation and write (there is no longer a subscription to meter). INSERT ... SELECT ...
--- WHERE puts BOTH fences in front of the write: a failed fence selects no row, so nothing
+-- WHERE puts every fence in front of the write: a failed fence selects no row, so nothing
 -- is written on EITHER the insert or the conflict path. :execrows — 0 rows means authority
 -- moved, and the caller discards the reading rather than writing it stale.
 --
+-- 🔴 ENABLEMENT fence (PRD #1732 D6/D13). A Codex reading describes an ACCOUNT, and an
+-- account is live only while at least one ENABLED alias is linked to it, so the fence is
+-- account-level: some linked alias must still be enabled, AND @enablement_sig — the
+-- (alias id, enablement_rev) list of the account's linked aliases that the poll listing
+-- captured when the poll started (ListLinkedCodexAccountsToPoll.enablement_sig) — must be
+-- unchanged. The first half alone would let a poll that started before the last alias was
+-- disabled, and finished after it was re-enabled, land its reading; the revision list
+-- rejects it, because every transition bumps the alias's enablement_rev. The list covers
+-- every linked alias, so a sibling's transition (or a newly linked alias) also discards the
+-- in-flight reading: conservative, and the next poll writes a fresh one.
+-- FOR SHARE OF us serialises the check against a transition exactly as the Anthropic
+-- UpsertRateLimits does: the enablement handler's FOR UPDATE and SetSecretEnablement's
+-- UPDATE conflict with it, so a transition that commits first is seen (the re-read row
+-- carries the new revision and the fence fails), and one that comes second waits for this
+-- write.
+--
 -- On conflict the reading + observed counters + success/attempt timestamps are overwritten
 -- and attempt_error is cleared (a success clears the last failure's reason).
+WITH linked_aliases AS (
+    SELECT us.id, us.enablement_rev, us.disabled_at
+    FROM codex_credential_state s
+    JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+    WHERE s.user_id = @user_id AND s.provider_account_id = @provider_account_id
+        AND s.status = 'linked'
+    FOR SHARE OF us
+)
 INSERT INTO codex_account_rate_limits (
     user_id, provider_account_id, buckets,
     observed_generation, observed_credential_revision,
@@ -32,10 +56,11 @@ WHERE EXISTS (
         AND a.generation = @observed_generation::bigint
         AND a.credential_revision = @observed_credential_revision::bigint
 ) AND EXISTS (
-    SELECT 1 FROM codex_credential_state s
-    WHERE s.user_id = @user_id AND s.provider_account_id = @provider_account_id
-        AND s.status = 'linked'
-)
+    SELECT 1 FROM linked_aliases la WHERE la.disabled_at IS NULL
+) AND (
+    SELECT COALESCE(string_agg(la.id::text || ':' || la.enablement_rev::text, ',' ORDER BY la.id), '')
+    FROM linked_aliases la
+) = @enablement_sig::text
 ON CONFLICT (user_id, provider_account_id) DO UPDATE SET
     buckets                      = EXCLUDED.buckets,
     observed_generation          = EXCLUDED.observed_generation,
@@ -48,14 +73,24 @@ ON CONFLICT (user_id, provider_account_id) DO UPDATE SET
 
 -- name: RecordCodexAccountPollFailure :execrows
 -- The health-only FAILURE write (PRD #1209 M1): record that the last poll ATTEMPT failed,
--- WITHOUT touching the last good reading. Same double fence as UpsertCodexAccountRateLimits
--- (still-current generation AND a linked alias), so a failure whose account moved is also
--- discarded. The INSERT path (first-ever poll is a failure) writes NULL buckets and NULL
--- last_success_at — health with no reading. The conflict path updates ONLY the attempt
--- fields (last_attempt_at / attempt_status / attempt_error) and DELIBERATELY leaves
--- buckets, observed_generation, observed_credential_revision and last_success_at intact, so
--- a failure after a prior success reads as "stale reading, last attempt failed" rather than
--- discarding the reading. :execrows — 0 rows means authority moved; the caller discards.
+-- WITHOUT touching the last good reading. Same fences as UpsertCodexAccountRateLimits
+-- (still-current generation, an enabled linked alias, and the unchanged enablement list the
+-- poll started under, PRD #1732 D13), so a failure whose account moved — or whose last
+-- enabled alias was disabled mid-poll — is also discarded. The INSERT path (first-ever poll
+-- is a failure) writes NULL buckets and NULL last_success_at — health with no reading. The
+-- conflict path updates ONLY the attempt fields (last_attempt_at / attempt_status /
+-- attempt_error) and DELIBERATELY leaves buckets, observed_generation,
+-- observed_credential_revision and last_success_at intact, so a failure after a prior
+-- success reads as "stale reading, last attempt failed" rather than discarding the reading.
+-- :execrows — 0 rows means authority moved; the caller discards.
+WITH linked_aliases AS (
+    SELECT us.id, us.enablement_rev, us.disabled_at
+    FROM codex_credential_state s
+    JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+    WHERE s.user_id = @user_id AND s.provider_account_id = @provider_account_id
+        AND s.status = 'linked'
+    FOR SHARE OF us
+)
 INSERT INTO codex_account_rate_limits (
     user_id, provider_account_id, buckets,
     observed_generation, observed_credential_revision,
@@ -70,10 +105,11 @@ WHERE EXISTS (
         AND a.generation = @observed_generation::bigint
         AND a.credential_revision = @observed_credential_revision::bigint
 ) AND EXISTS (
-    SELECT 1 FROM codex_credential_state s
-    WHERE s.user_id = @user_id AND s.provider_account_id = @provider_account_id
-        AND s.status = 'linked'
-)
+    SELECT 1 FROM linked_aliases la WHERE la.disabled_at IS NULL
+) AND (
+    SELECT COALESCE(string_agg(la.id::text || ':' || la.enablement_rev::text, ',' ORDER BY la.id), '')
+    FROM linked_aliases la
+) = @enablement_sig::text
 ON CONFLICT (user_id, provider_account_id) DO UPDATE SET
     last_attempt_at = now(),
     attempt_status  = EXCLUDED.attempt_status,
@@ -162,13 +198,20 @@ ORDER BY u.email ASC, a.id ASC;
 
 -- name: ListLinkedCodexAccountsToPoll :many
 -- The factory-wide poll listing (PRD #1209 M1): one row per canonical account that has at
--- least one linked alias, so the poller polls the ACCOUNT once regardless of how many
--- codex_auth aliases resolve to it (dedup by construction — the EXISTS collapses duplicate
--- aliases to one account row). Carries the identity + coordination fields the poller needs
--- to decide whether to poll and to fence its write: generation/credential_revision (the
+-- least one ENABLED linked alias, so the poller polls the ACCOUNT once regardless of how
+-- many codex_auth aliases resolve to it (dedup by construction — the EXISTS collapses
+-- duplicate aliases to one account row). Carries the identity + coordination fields the
+-- poller needs to decide whether to poll and to fence its write: generation/credential_revision (the
 -- fence the upserts require), coord_state (skip an in-flight refresh), reauth_required (skip
 -- an account already flagged), and has_recovery (a populated recovery slot is a reconcile,
 -- not a poll, target). Ordered by (user, account) for a deterministic tick.
+--
+-- PRD #1732 D6: an account is polled (and so background-refreshed, since the poll's 401
+-- path is the only background refresh) only while at least one ENABLED alias is linked to
+-- it; one disabled sibling does not stop an enabled one. enablement_sig is the (alias id,
+-- enablement_rev) list of ALL the account's linked aliases at listing time — the value the
+-- poll's writes are fenced on (D13, see UpsertCodexAccountRateLimits). It must produce the
+-- same text the two writes recompute (same element format, separator and order).
 SELECT
     a.user_id,
     a.id                              AS provider_account_id,
@@ -178,18 +221,27 @@ SELECT
     a.provider_user_id,
     a.coord_state,
     a.reauth_required,
-    (a.recovery_sealed IS NOT NULL)::boolean AS has_recovery
+    (a.recovery_sealed IS NOT NULL)::boolean AS has_recovery,
+    (
+        SELECT COALESCE(string_agg(us.id::text || ':' || us.enablement_rev::text, ',' ORDER BY us.id), '')
+        FROM codex_credential_state s
+        JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+        WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+    )::text AS enablement_sig
 FROM codex_provider_account a
 WHERE EXISTS (
     SELECT 1 FROM codex_credential_state s
+    JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
     WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+        AND us.disabled_at IS NULL
 )
 ORDER BY a.user_id, a.id;
 
 -- name: ListLinkedCodexAccountsForUser :many
 -- The owner-scoped sibling of ListLinkedCodexAccountsToPoll (PRD #1209 M1): the same
--- one-row-per-canonical-linked-account shape, filtered to one user. The settings handler
--- can use it to resolve the caller's linked accounts in one read.
+-- one-row-per-canonical-account shape and enabled-linked-alias rule (PRD #1732 D6),
+-- filtered to one user. The poller's poke path uses it, so a poke never polls, refreshes
+-- or recovers an account with no enabled linked alias.
 SELECT
     a.user_id,
     a.id                              AS provider_account_id,
@@ -199,11 +251,19 @@ SELECT
     a.provider_user_id,
     a.coord_state,
     a.reauth_required,
-    (a.recovery_sealed IS NOT NULL)::boolean AS has_recovery
+    (a.recovery_sealed IS NOT NULL)::boolean AS has_recovery,
+    (
+        SELECT COALESCE(string_agg(us.id::text || ':' || us.enablement_rev::text, ',' ORDER BY us.id), '')
+        FROM codex_credential_state s
+        JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+        WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+    )::text AS enablement_sig
 FROM codex_provider_account a
 WHERE a.user_id = @user_id
     AND EXISTS (
         SELECT 1 FROM codex_credential_state s
+        JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
         WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+            AND us.disabled_at IS NULL
     )
 ORDER BY a.id;

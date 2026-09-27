@@ -610,19 +610,13 @@ type UpsertRateLimitsParams struct {
 // the last good row, D5), so every write carries a complete reading.
 //
 // user_id rides along rather than being looked up: the caller already has it from
-// the poll listing, and it is half of the composite FK that ties this row to a
-// (user, token) pair that exists. Since PRD #1732 it is also a fence predicate
-// (s.user_id = @user_id), so a mismatched pair writes 0 rows before the FK is reached.
-//
-// The FK is checked on the INSERT path only: ON CONFLICT .. DO UPDATE deliberately
-// does not touch user_id, so an upsert over an EXISTING row rewrites the reading
-// without re-validating ownership. That is safe BY CONSTRUCTION, not by the
-// caller's discipline — user_secret_id is the global PRIMARY KEY of user_secrets,
-// so an id belongs to exactly one owner for its whole life and no call site can
-// construct a mismatched (user_id, user_secret_id) pair to smuggle through the
-// conflict path. Stated this way on purpose: "the poller always passes a matching
-// pair" would be the weaker true reason, and the weaker one is the one that rots
-// the moment someone adds a third caller.
+// the poll listing. Since PRD #1732 it is a fence predicate (s.user_id = @user_id):
+// the row to write is selected FROM user_secrets for exactly that (owner, token)
+// pair, so a mismatched pair selects nothing and writes 0 rows on the insert path
+// AND the conflict path. Ownership is therefore re-validated on every write,
+// including an upsert over an existing row; the composite FK (checked only on the
+// INSERT path, since ON CONFLICT .. DO UPDATE does not touch user_id) is a second
+// guard behind it.
 //
 // 🔴 FENCED on the credential's enablement revision (PRD #1732 D13). The row is
 // written only while the token is still enabled AT @enablement_rev, the revision

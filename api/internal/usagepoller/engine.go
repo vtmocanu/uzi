@@ -31,6 +31,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/anthropic"
+	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -189,16 +190,14 @@ func (e *Engine) Run(ctx context.Context) {
 			e.logger.Info("usage poller stopped")
 			return
 		case p := <-e.poke:
-			// A freshly saved token: ignore any prior backoff (the new credential may
-			// work where the old refused) and poll just that user's DEFAULT token via a
-			// single-user lookup-open (the row wasn't part of a bulk list here).
-			//
-			// The poke identity stays the USER, not the token, because the only poker is
-			// the kind-path save (handler/secrets.go), which rotates the default and has
-			// no token id to offer. A poke therefore refreshes one meter, not all of the
-			// user's — the rest are covered by the next tick, which is the same latency
-			// they had before this feature existed. A re-enable names its token
-			// (PokeSecret), because a re-enabled token is usually not the default.
+			// An out-of-band poll of ONE token, ignoring any prior backoff (the new or
+			// re-enabled credential may work where the old one refused). Poke (a token
+			// save or default change, handler/secrets.go) names only the user and polls
+			// their enabled DEFAULT token; PokeSecret (a re-enable, PRD #1732 M3a) names
+			// its token, because a re-enabled token is usually not the default. Either
+			// way pokeUser resolves the row first and opens exactly that row. A poke
+			// refreshes one meter, not all of the user's; the rest are covered by the
+			// next tick.
 			e.pokeUser(ctx, p.userID, p.secretID)
 		case <-ticker.C:
 			e.tickAll(ctx)
@@ -280,9 +279,9 @@ func (e *Engine) pokeUser(ctx context.Context, userID, secretID uuid.UUID) {
 }
 
 // pollToken polls ONE token, applying the D2 (usage-first, probe fallback) and D5
-// (fail-closed / backoff) rules. open resolves that token via the vault path (bulk
-// OpenSealed on the tick, single-user Open on the poke); ignoreBackoff is set on the
-// poke path so a just-saved credential is polled even if the one it replaced was
+// (fail-closed / backoff) rules. open decrypts that token's already-fetched row via
+// the vault path (OpenSealed on both the tick's listing row and the poke's resolved
+// row); ignoreBackoff is set on the poke path so a just-saved credential is polled even if the one it replaced was
 // backed off. rev is the token's enablement revision captured when the poll
 // started; the write is fenced on it (PRD #1732 D13).
 //
@@ -304,8 +303,8 @@ func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, rev 
 			// D3: locked dek-sealed vault — skip, keep the last reading (marked stale
 			// server-side later). No backoff: the block clears on the next unlock.
 			return
-		case errors.Is(err, secretopen.ErrNoSecret), errors.Is(err, secretopen.ErrUndecryptable):
-			// Token vanished or is undecryptable mid-tick — skip, no backoff.
+		case errors.Is(err, secretopen.ErrUndecryptable):
+			// The fetched row is undecryptable — skip, no backoff.
 			return
 		default:
 			e.logger.Error("usage poller: open token", "user", userID.String(), "error", err)
@@ -427,6 +426,14 @@ func (e *Engine) observe(ctx context.Context, userID, secretID uuid.UUID, rev in
 		return
 	}
 	if _, nerr := e.notifier.NotifyEarlyReset(ctx, userID, secretID, rev, expected, now); nerr != nil {
+		if errors.Is(nerr, notifysvc.ErrCredentialNotCurrent) {
+			// The notifier's own re-check refused the alert: the token was disabled or
+			// moved to a new revision between the fenced write and delivery (PRD #1732
+			// D13). An expected race, not a fault.
+			e.logger.Info("usage poller: early reset alert dropped (credential no longer current)",
+				"user", userID.String(), "secret", secretID.String())
+			return
+		}
 		e.logger.Error("usage poller: notify early reset", "user", userID.String(), "error", nerr)
 	}
 }

@@ -126,3 +126,72 @@ func TestSecretReenablePokesPollAndHidesStaleReadingLiveDB(t *testing.T) {
 		t.Fatalf("a repeat or Codex transition poked the Anthropic poller: users=%v secrets=%v", users, secrets)
 	}
 }
+
+// recordingCodexPoker records the Codex account poller pokes a handler requests.
+type recordingCodexPoker struct {
+	mu    sync.Mutex
+	users []uuid.UUID
+}
+
+func (p *recordingCodexPoker) Poke(userID uuid.UUID) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.users = append(p.users, userID)
+}
+
+func (p *recordingCodexPoker) snapshot() []uuid.UUID {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]uuid.UUID(nil), p.users...)
+}
+
+// TestCodexReenablePokesCodexPollerLiveDB (PRD #1732 M3b, D7): re-enabling a codex_auth login
+// pokes the Codex poller exactly once, whose poke pass is the coordinated recovery and
+// refresh. A disable, an idempotent repeat, and an openai_api_key transition (static, nothing
+// to recover or poll) poke nothing, and a Codex re-enable never pokes the Anthropic poller.
+func TestCodexReenablePokesCodexPollerLiveDB(t *testing.T) {
+	h, pool := secretsCRUDHandler(t)
+	codexPoker, anthropicPoker := &recordingCodexPoker{}, &recordingUsagePoker{}
+	h.SetCodexUsagePoker(codexPoker)
+	h.SetUsagePoker(anthropicPoker)
+	user := mkSecretUser(t, pool)
+	login, apiKey := uuid.New(), uuid.New()
+	for _, s := range []struct {
+		id         uuid.UUID
+		kind, name string
+		isDefault  bool
+	}{{login, "codex_auth", "login", false}, {apiKey, "openai_api_key", "key", true}} {
+		if _, err := pool.Exec(t.Context(), `INSERT INTO user_secrets (id,user_id,kind,label,is_default,ciphertext,sealed_with) VALUES ($1,$2,$3,$4,$5,'x','master')`, s.id, user, s.kind, s.name, s.isDefault); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for i := range 2 { // a disable, then its idempotent repeat
+		if code, _ := enablementRequest(t, h, user, "codex_auth", login, `{"enabled":false}`); code != 200 {
+			t.Fatalf("disable #%d: %d", i+1, code)
+		}
+	}
+	if got := codexPoker.snapshot(); len(got) != 0 {
+		t.Fatalf("a disable poked the Codex poller: %v", got)
+	}
+	for i := range 2 { // a re-enable, then its idempotent repeat
+		if code, _ := enablementRequest(t, h, user, "codex_auth", login, `{"enabled":true}`); code != 200 {
+			t.Fatalf("enable #%d: %d", i+1, code)
+		}
+	}
+	if got := codexPoker.snapshot(); len(got) != 1 || got[0] != user {
+		t.Fatalf("re-enable pokes = %v, want exactly Poke(%s)", got, user)
+	}
+	// The API key is the shared slot's default, so its disable names the login as replacement.
+	for _, body := range []string{`{"enabled":false,"new_default_id":"` + login.String() + `"}`, `{"enabled":true}`} {
+		if code, _ := enablementRequest(t, h, user, "openai_api_key", apiKey, body); code != 200 {
+			t.Fatalf("api key %s: %d", body, code)
+		}
+	}
+	if got := codexPoker.snapshot(); len(got) != 1 {
+		t.Fatalf("an openai_api_key transition poked the Codex poller: %v", got)
+	}
+	if users, secrets := anthropicPoker.snapshot(); len(users)+len(secrets) != 0 {
+		t.Fatalf("a Codex transition poked the Anthropic poller: users=%v secrets=%v", users, secrets)
+	}
+}

@@ -121,6 +121,7 @@ func TestUpsertCodexAccountRateLimitsLiveDB(t *testing.T) {
 		n, err := q.UpsertCodexAccountRateLimits(ctx, store.UpsertCodexAccountRateLimitsParams{
 			UserID: user, ProviderAccountID: acc, Buckets: buckets,
 			ObservedGeneration: gen, ObservedCredentialRevision: rev, AttemptStatus: status,
+			EnablementSig: codexEnablementSig(ctx, t, q, user, acc),
 		})
 		if err != nil {
 			t.Fatalf("UpsertCodexAccountRateLimits: %v", err)
@@ -182,6 +183,7 @@ func TestRecordCodexAccountPollFailureLiveDB(t *testing.T) {
 		n, err := q.RecordCodexAccountPollFailure(ctx, store.RecordCodexAccountPollFailureParams{
 			UserID: user, ProviderAccountID: acc, AttemptStatus: status, AttemptError: errMsg,
 			ObservedGeneration: gen, ObservedCredentialRevision: rev,
+			EnablementSig: codexEnablementSig(ctx, t, q, user, acc),
 		})
 		if err != nil {
 			t.Fatalf("RecordCodexAccountPollFailure: %v", err)
@@ -194,6 +196,7 @@ func TestRecordCodexAccountPollFailureLiveDB(t *testing.T) {
 	if _, err := q.UpsertCodexAccountRateLimits(ctx, store.UpsertCodexAccountRateLimitsParams{
 		UserID: user, ProviderAccountID: acc, Buckets: []byte(`{"good":1}`),
 		ObservedGeneration: 0, ObservedCredentialRevision: 0, AttemptStatus: "ok",
+		EnablementSig: codexEnablementSig(ctx, t, q, user, acc),
 	}); err != nil {
 		t.Fatalf("seed success: %v", err)
 	}

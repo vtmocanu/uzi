@@ -258,6 +258,7 @@ func TestRateLimitFenceSerializesWithTransitionLiveDB(t *testing.T) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	tq := q.WithTx(tx)
+	holder := backendPID(ctx, t, tx)
 	// The enablement handler's shape: lock the row, then transition it.
 	if _, err := tq.GetUserSecretForUpdate(ctx, store.GetUserSecretForUpdateParams{ID: tok, UserID: user}); err != nil {
 		t.Fatal(err)
@@ -279,27 +280,8 @@ func TestRateLimitFenceSerializesWithTransitionLiveDB(t *testing.T) {
 		}
 		done <- n
 	}()
-	// Wait until the write is blocked on the transition's row lock.
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		var waiting int
-		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
-			WHERE wait_event_type = 'Lock' AND query LIKE '%INSERT INTO anthropic_rate_limits%'`).Scan(&waiting); err != nil {
-			t.Fatal(err)
-		}
-		if waiting > 0 {
-			break
-		}
-		select {
-		case n := <-done:
-			t.Fatalf("the fenced write did not wait for the transition: wrote %d rows", n)
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the fenced write never blocked on the transition")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	// Wait until the write is blocked on THIS transition's row lock.
+	waitBlockedBy(ctx, t, pool, holder, "INSERT INTO anthropic_rate_limits", done)
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -312,5 +294,44 @@ func TestRateLimitFenceSerializesWithTransitionLiveDB(t *testing.T) {
 	}
 	if rows != 0 {
 		t.Fatalf("a reading landed behind the disable: %d rows", rows)
+	}
+}
+
+// backendPID is the server process id of tx's connection, the identity a lock probe
+// scopes to.
+func backendPID(ctx context.Context, t *testing.T, tx pgx.Tx) int32 {
+	t.Helper()
+	var pid int32
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatalf("backend pid: %v", err)
+	}
+	return pid
+}
+
+// waitBlockedBy waits until a statement containing queryFragment is blocked by the
+// backend holder (pg_blocking_pids), so the probe sees only this test's own waiter
+// and never a concurrent test's statement on a shared database. A result on done
+// before that means the statement finished without waiting, which fails the test.
+func waitBlockedBy(ctx context.Context, t *testing.T, pool *pgxpool.Pool, holder int32, queryFragment string, done <-chan int64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var waiting int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE $1::int = ANY(pg_blocking_pids(pid)) AND strpos(query, $2) > 0`, holder, queryFragment).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting > 0 {
+			return
+		}
+		select {
+		case n := <-done:
+			t.Fatalf("the fenced write did not wait for the transition: wrote %d rows", n)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the fenced write never blocked on the transition")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

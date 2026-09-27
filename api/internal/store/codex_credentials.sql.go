@@ -76,6 +76,31 @@ func (q *Queries) CountCodexSecrets(ctx context.Context, userID uuid.UUID) (int6
 	return count, err
 }
 
+const countEnabledLinkedAliasesForCodexAccount = `-- name: CountEnabledLinkedAliasesForCodexAccount :one
+SELECT count(*) FROM codex_credential_state s
+JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+WHERE s.user_id = $1 AND s.provider_account_id = $2
+  AND s.status = 'linked' AND us.disabled_at IS NULL
+`
+
+type CountEnabledLinkedAliasesForCodexAccountParams struct {
+	UserID            uuid.UUID   `json:"user_id"`
+	ProviderAccountID pgtype.UUID `json:"provider_account_id"`
+}
+
+// How many ENABLED linked aliases this user holds for one provider account (PRD #1732 D6):
+// the account's background liveness. An account is polled, background-refreshed and
+// recovered only while at least one enabled alias is linked to it, so one disabled sibling
+// never stops an enabled one. Deliberately separate from CountLinkedAliasesForCodexAccount,
+// whose sidebar-membership caller keeps accepting an account whose aliases are all disabled
+// (D8: stored preferences are not rewritten on disable). Owner-scoped like its sibling.
+func (q *Queries) CountEnabledLinkedAliasesForCodexAccount(ctx context.Context, arg CountEnabledLinkedAliasesForCodexAccountParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countEnabledLinkedAliasesForCodexAccount, arg.UserID, arg.ProviderAccountID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countLinkedAliasesForCodexAccount = `-- name: CountLinkedAliasesForCodexAccount :one
 SELECT count(*) FROM codex_credential_state
 WHERE user_id = $1 AND provider_account_id = $2 AND status = 'linked'
@@ -430,9 +455,10 @@ func (q *Queries) ListCodexCredentialStatesForUser(ctx context.Context, userID u
 }
 
 const listStagedCodexAliases = `-- name: ListStagedCodexAliases :many
-SELECT user_id, user_secret_id FROM codex_credential_state
-WHERE status = 'staging'
-ORDER BY user_id, user_secret_id
+SELECT s.user_id, s.user_secret_id FROM codex_credential_state s
+JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+WHERE s.status = 'staging' AND us.disabled_at IS NULL
+ORDER BY s.user_id, s.user_secret_id
 `
 
 type ListStagedCodexAliasesRow struct {
@@ -440,9 +466,15 @@ type ListStagedCodexAliasesRow struct {
 	UserSecretID uuid.UUID `json:"user_secret_id"`
 }
 
-// Every 'staging' codex alias across ALL users (PRD #1209 M1), factory-wide — the aliases
-// a linker/refresher still has to resolve to an account. Returns the (owner, alias) pair
-// so the caller opens each owner-scoped. Ordered for a deterministic, readable sweep.
+// Every ENABLED 'staging' codex alias across ALL users (PRD #1209 M1), factory-wide — the
+// aliases a linker/refresher still has to resolve to an account. Returns the (owner, alias)
+// pair so the caller opens each owner-scoped. Ordered for a deterministic, readable sweep.
+//
+// A disabled alias is not listed (PRD #1732 D6): reconciliation is an upstream identity
+// call made on the alias's own behalf, so it runs only while THAT alias is enabled. The
+// rule is per alias, not per account — a staging alias is by definition not linked yet, so
+// reconciling it must not require a linked sibling, and a disabled sibling on the account
+// it will link to does not stop it.
 func (q *Queries) ListStagedCodexAliases(ctx context.Context) ([]ListStagedCodexAliasesRow, error) {
 	rows, err := q.db.Query(ctx, listStagedCodexAliases)
 	if err != nil {
@@ -464,9 +496,10 @@ func (q *Queries) ListStagedCodexAliases(ctx context.Context) ([]ListStagedCodex
 }
 
 const listStagedCodexAliasesForUser = `-- name: ListStagedCodexAliasesForUser :many
-SELECT user_id, user_secret_id FROM codex_credential_state
-WHERE user_id = $1 AND status = 'staging'
-ORDER BY user_secret_id
+SELECT s.user_id, s.user_secret_id FROM codex_credential_state s
+JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+WHERE s.user_id = $1 AND s.status = 'staging' AND us.disabled_at IS NULL
+ORDER BY s.user_secret_id
 `
 
 type ListStagedCodexAliasesForUserRow struct {
@@ -474,8 +507,9 @@ type ListStagedCodexAliasesForUserRow struct {
 	UserSecretID uuid.UUID `json:"user_secret_id"`
 }
 
-// One user's 'staging' codex aliases (PRD #1209 M1), the owner-scoped sibling of
-// ListStagedCodexAliases. Same shape minus the cross-user fan-out.
+// One user's ENABLED 'staging' codex aliases (PRD #1209 M1, PRD #1732 D6), the owner-scoped
+// sibling of ListStagedCodexAliases. Same shape and enablement rule minus the cross-user
+// fan-out.
 func (q *Queries) ListStagedCodexAliasesForUser(ctx context.Context, userID uuid.UUID) ([]ListStagedCodexAliasesForUserRow, error) {
 	rows, err := q.db.Query(ctx, listStagedCodexAliasesForUser, userID)
 	if err != nil {

@@ -161,6 +161,16 @@ func (h *Handler) PatchSecretEnabled(w http.ResponseWriter, r *http.Request) {
 	if transitioned && *req.Enabled && kind == store.KindAnthropicToken && h.usagePoker != nil {
 		h.usagePoker.PokeSecret(user.ID, id)
 	}
+	// A re-enabled Codex login (PRD #1732 D7) pokes the Codex poller, whose poke pass is the
+	// coordinated recovery and refresh: it reconciles the alias if it is still staging, runs
+	// the crash-safe recovery pass (reap, resolve, promote protected material) on its account,
+	// then polls it, rotating once on a 401. Only a proven no-renewal expiry or a provider
+	// rejection of the refresh material flags reauth_required, the signal to paste a new
+	// login. The poke is asynchronous, so the handler makes no upstream call itself. An
+	// openai_api_key is static and has nothing to recover or poll.
+	if transitioned && *req.Enabled && kind == store.KindCodexAuth && h.codexUsagePoker != nil {
+		h.codexUsagePoker.Poke(user.ID)
+	}
 	dto := secretMeta(row.ID, row.Kind, row.Label, row.IsDefault, row.AutoEligible, row.CreatedAt, row.UpdatedAt)
 	dto.Enabled = !row.DisabledAt.Valid
 	if row.DisabledAt.Valid {

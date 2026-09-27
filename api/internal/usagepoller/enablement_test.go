@@ -2,12 +2,18 @@ package usagepoller
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/anthropic"
+	"github.com/vtmocanu/uzi/api/internal/notifysvc"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // PRD #1732 M3a: the poller's enablement fences. The SQL half of each fence (the
@@ -178,5 +184,74 @@ func TestEarlyResetCarriesSecretAndRevision(t *testing.T) {
 	}
 	if call.userID != u || call.secretID != u || call.rev != 4 {
 		t.Fatalf("alert = user %s secret %s rev %d, want user %s secret %s rev 4", call.userID, call.secretID, call.rev, u, u)
+	}
+}
+
+// refusingNotifier answers every alert with err, like a notifier whose re-check refused.
+type refusingNotifier struct{ err error }
+
+func (n refusingNotifier) NotifyEarlyReset(context.Context, uuid.UUID, uuid.UUID, int64, time.Time, time.Time) (store.Notification, error) {
+	return store.Notification{}, n.err
+}
+
+// levelCounter is a slog handler that counts records per level.
+type levelCounter struct {
+	mu     sync.Mutex
+	counts map[slog.Level]int
+}
+
+func (h *levelCounter) Enabled(context.Context, slog.Level) bool { return true }
+func (h *levelCounter) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.counts[r.Level]++
+	return nil
+}
+func (h *levelCounter) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *levelCounter) WithGroup(string) slog.Handler      { return h }
+
+func (h *levelCounter) count(l slog.Level) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.counts[l]
+}
+
+// An alert the notifier refused because the credential stopped being current between
+// the fenced write and delivery (D13) is an expected race, logged below Error; any
+// other notifier failure is still an Error.
+func TestRefusedEarlyResetAlertIsNotAnError(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		err       error
+		wantError int
+	}{
+		{"credential no longer current", fmt.Errorf("notify: %w", notifysvc.ErrCredentialNotCurrent), 0},
+		{"delivery failure", errors.New("db down"), 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tReset := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+			moved := tReset.Add(72 * time.Hour)
+			u := uuid.New()
+			st := newFakeStore(u)
+			st.setNotify(u, true)
+			st.setPrev(u, prevRow(u, u, 99, anthropic.SourceUsageEndpoint, tReset, tReset.Add(-72*time.Hour)))
+			cl := &fakeClient{usage: func([]byte) (anthropic.Reading, error) {
+				return readingWithReset(10, anthropic.SourceUsageEndpoint, &moved), nil
+			}}
+			e, clk := newEngine(t, st, &fakeOpener{}, cl, true)
+			clk.set(tReset.Add(-10 * time.Hour))
+			logs := &levelCounter{counts: map[slog.Level]int{}}
+			e.logger = slog.New(logs)
+			e.SetNotifier(refusingNotifier{err: tc.err})
+
+			e.tickAll(context.Background())
+
+			if got := logs.count(slog.LevelError); got != tc.wantError {
+				t.Fatalf("error-level records = %d, want %d", got, tc.wantError)
+			}
+			if tc.wantError == 0 && logs.count(slog.LevelInfo) == 0 {
+				t.Fatal("the dropped alert left no trace in the log")
+			}
+		})
 	}
 }
