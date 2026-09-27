@@ -576,7 +576,7 @@ function parseDeliverySummary(text: string): DeliverySummary | null {
 
 /** The class of a thrown value, for a log field that must not carry its message: an Error's
  *  `name` when it is a plain identifier, else a fixed fallback. */
-function errorClass(err: unknown): string {
+export function errorClass(err: unknown): string {
   if (err instanceof Error) return /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(err.name) ? err.name : "Error";
   return typeof err;
 }

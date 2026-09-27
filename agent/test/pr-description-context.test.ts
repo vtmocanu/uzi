@@ -486,6 +486,39 @@ describe("buildDeliveryContext (PRD #1798 M5, D6)", () => {
     assert.equal(ctx.truncated.diff, true);
   });
 
+  it("a read cut inside an ANSI CSI sequence counts the unterminated CSI as invisible, so the head is dropped", async () => {
+    // The redactor matches a secret across a COMPLETE CSI (ESC [ params final). A read cut before the
+    // final byte leaves an unterminated CSI whose parameter bytes are longer than the margin; were
+    // they counted as visible, the margin would be spent on them and the head before them survive.
+    const filler = "x".repeat(8 * 1024);
+    const text = filler + "glpat-" + "\x1b[" + "0".repeat(5000);
+    const { git } = fakeGit([{ path: "src/csi.ts", added: 1, deleted: 0 }], {
+      onRead: (args) => (args[3] === "diff" ? { text, truncated: true } : undefined),
+    });
+    // The real redactor, over the complete secret: it would match "glpat-" ESC[000...m <rest>.
+    const redact = makeTextRedactor([SECRET]);
+    assert.equal(redact("glpat-" + "\x1b[" + "0".repeat(5000) + "m" + SECRET.slice(6)).includes("glpat-"), false);
+    const ctx = await buildDeliveryContext(input(git, { redact }));
+    assert.equal(ctx.diff.includes("glpat-"), false, "the secret's head before the cut CSI is dropped");
+    assert.equal(ctx.diff.includes("\x1b"), false, "the unterminated CSI goes too");
+    assert.equal(ctx.truncated.diff, true);
+  });
+
+  it("a margin cut that lands exactly at the start of a visible run also drops the invisible run before it", async () => {
+    // Visible text: filler, then exactly READ_MARGIN_BYTES of "y" after one zero-width space. The
+    // margin is spent at the first "y", the start of its visible run, so the cut moves back to the end
+    // of the filler: the zero-width space before the dropped run does not survive at the new tail.
+    const filler = "x".repeat(8 * 1024);
+    const text = filler + "​" + "y".repeat(4 * 1024);
+    const { git } = fakeGit([{ path: "src/edge.ts", added: 1, deleted: 0 }], {
+      onRead: (args) => (args[3] === "diff" ? { text, truncated: true } : undefined),
+    });
+    const ctx = await buildDeliveryContext(input(git));
+    assert.equal(ctx.diff.includes("y"), false, "the whole margin run is dropped");
+    assert.equal(ctx.diff.includes("​"), false, "the invisible run before the cut goes too");
+    assert.equal(ctx.diff, `${filler}\n${TRUNCATED_MARKER}`);
+  });
+
   it("a short read that the bound still cut is marked truncated even though it fits the cap", async () => {
     const { git } = fakeGit([{ path: "src/x.ts", added: 1, deleted: 0 }], {
       onRead: (args) => (args[3] === "diff" ? { text: "y".repeat(5 * 1024), truncated: true } : undefined),
@@ -582,6 +615,36 @@ describe("buildDeliveryContext (PRD #1798 M5, D6)", () => {
     assert.equal(JSON.stringify(warns).includes("stderr text"), false);
   });
 
+  it("a read that hit its timeout warns with its own fixed reason, told apart from other failures", async () => {
+    const warns: Array<[string, unknown]> = [];
+    // The messages GitCache.readBare rejects with on its timeout, and when no time was left.
+    const { git } = fakeGit(
+      [
+        { path: "src/a.ts", added: 1, deleted: 0 },
+        { path: "src/b.ts", added: 1, deleted: 0 },
+        { path: "src/c.ts", added: 1, deleted: 0 },
+      ],
+      {
+        onRead: (args) => {
+          const target = args[args.length - 1];
+          if (args[0] === "log") throw new Error(`git ${args.join(" ")} exceeded 1234ms`);
+          if (target === "src/a.ts") throw new Error(`git ${args.join(" ")} has no time left`);
+          if (target === "src/b.ts") throw new Error("git diff failed: fatal: exceeded 5ms of something");
+          return undefined;
+        },
+      },
+    );
+    await buildDeliveryContext(input(git, { log: { warn: (m: string, f?: unknown) => void warns.push([m, f]) } }));
+    assert.deepEqual(
+      warns.map(([, f]) => f),
+      [
+        { reason: "git read timed out", error_class: "Error" },
+        { reason: "git read timed out", error_class: "Error" },
+        { reason: "git diff read failed", error_class: "Error" },
+      ],
+    );
+  });
+
   it("a hung size-line read is abandoned at the deadline", async () => {
     const { git } = fakeGit([]);
     const hung: DeliveryContextGit = { ...git, sizeMergeBase: () => new Promise(() => {}) };
@@ -593,30 +656,42 @@ describe("buildDeliveryContext (PRD #1798 M5, D6)", () => {
   });
 
   it("a head or merge-base that is not a full object name leaves everything unavailable, with no git read", async () => {
-    for (const headSha of ["HEAD", "a".repeat(39), "--output=/tmp/x", "A".repeat(40)]) {
-      const { git, reads } = fakeGit([{ path: "a.ts", added: 1, deleted: 0 }]);
-      const probe: DeliveryContextGit = {
-        ...git,
-        sizeMergeBase: async () => assert.fail("no git read for an invalid head"),
+    /** Wrap a fake so every git call is COUNTED (an assert.fail inside a stub would be swallowed by
+     *  the builder's catch, so it could not gate), and record the warns. */
+    const counted = (git: DeliveryContextGit) => {
+      const calls = { sizeMergeBase: 0, diffNumstatZ: 0, checkAttrZ: 0, readBare: 0 };
+      const warns: Array<[string, unknown]> = [];
+      const wrapped: DeliveryContextGit = {
+        sizeMergeBase: (...a) => (calls.sizeMergeBase++, git.sizeMergeBase(...a)),
+        diffNumstatZ: (...a) => (calls.diffNumstatZ++, git.diffNumstatZ(...a)),
+        checkAttrZ: (...a) => (calls.checkAttrZ++, git.checkAttrZ(...a)),
+        readBare: (...a) => (calls.readBare++, git.readBare(...a)),
       };
-      const ctx = await buildDeliveryContext(input(probe, { headSha }));
-      assert.equal(reads.length, 0, headSha);
+      const log = { warn: (m: string, f?: unknown) => void warns.push([m, f]) };
+      return { calls, warns, git: wrapped, log };
+    };
+    const none = { sizeMergeBase: 0, diffNumstatZ: 0, checkAttrZ: 0, readBare: 0 };
+    const headWarn = "delivery context: the head is not a full object name; the diff parts are unavailable";
+    // Only 40-hex, like GitCache.sizeMergeBase: a 64-hex (SHA-256) head is refused too.
+    for (const headSha of ["HEAD", "a".repeat(39), "--output=/tmp/x", "A".repeat(40), "d".repeat(64)]) {
+      const c = counted(fakeGit([{ path: "a.ts", added: 1, deleted: 0 }]).git);
+      const ctx = await buildDeliveryContext(input(c.git, { headSha, log: c.log }));
+      assert.deepEqual(c.calls, none, headSha);
+      assert.deepEqual(c.warns, [[headWarn, undefined]], headSha);
       assert.deepEqual([ctx.commits, ctx.paths, ctx.diff], ["(unavailable)", "(unavailable)", "(unavailable)"]);
     }
-    const { git: gBad, reads: rBad } = fakeGit([], { mergeBase: "not-a-sha" });
-    const bad = await buildDeliveryContext(input(gBad));
-    assert.equal(rBad.length, 0);
-    assert.equal(bad.paths, "(unavailable)");
-    // Only 40-hex, like GitCache.sizeMergeBase: a 64-hex (SHA-256) head or merge-base is refused.
-    const { git: g64, reads: r64 } = fakeGit([]);
-    const noRead: DeliveryContextGit = { ...g64, sizeMergeBase: async () => assert.fail("no git read for a 64-hex head") };
-    const head64 = await buildDeliveryContext(input(noRead, { headSha: "d".repeat(64) }));
-    assert.equal(r64.length, 0);
-    assert.equal(head64.paths, "(unavailable)");
-    const { git: gBase64, reads: rBase64 } = fakeGit([], { mergeBase: "c".repeat(64) });
-    const base64 = await buildDeliveryContext(input(gBase64));
-    assert.equal(rBase64.length, 0);
-    assert.equal(base64.paths, "(unavailable)");
+    // A merge-base that is not a full 40-hex name (a 64-hex one included) is never passed on.
+    for (const mergeBase of ["not-a-sha", "c".repeat(64)]) {
+      const c = counted(fakeGit([{ path: "a.ts", added: 1, deleted: 0 }], { mergeBase }).git);
+      const ctx = await buildDeliveryContext(input(c.git, { log: c.log }));
+      assert.deepEqual(c.calls, { ...none, sizeMergeBase: 1 }, mergeBase);
+      assert.deepEqual(
+        c.warns,
+        [["delivery context: diff inventory unavailable", { reason: "merge-base or numstat read failed", error_class: "Error" }]],
+        mergeBase,
+      );
+      assert.deepEqual([ctx.commits, ctx.paths, ctx.diff], ["(unavailable)", "(unavailable)", "(unavailable)"]);
+    }
   });
 
   it("a path with a newline, a tab or a bidi override is escaped and cannot forge an inventory row", async () => {

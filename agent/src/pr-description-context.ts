@@ -25,9 +25,9 @@
 import type { BoundedRead, BoundedReadOptions } from "./git.js";
 import type { Logger } from "./log.js";
 import { classifyPath, parseNumstatZ, type PathAttributes, type SizeBucket, type SizeLineGit } from "./pr-size.js";
-import type { TextRedactor } from "./redact.js";
+import { INVISIBLE_SRC, type TextRedactor } from "./redact.js";
 import type { PrSummaryClaim } from "./signals.js";
-import type { Delta } from "./summary-runner.js";
+import { errorClass, type Delta } from "./summary-runner.js";
 
 /** Aggregate input budget (D6), in UTF-8 bytes. */
 export const DELIVERY_CONTEXT_BUDGET_BYTES = 120 * 1024;
@@ -175,26 +175,38 @@ function capBytes(s: string, maxBytes: number, force = false): { text: string; t
   return { text: utf8Prefix(s, maxBytes - byteLen(suffix)) + suffix, truncated: true };
 }
 
-/** The class of a thrown value, for a warn that must not carry its message (a git error quotes the
- *  repo path and git's stderr, both attacker-shapeable): an Error's `name` when it is a plain
- *  identifier, else a fixed fallback. Mirrors summary-runner.ts's errorClass. */
-function errorClass(err: unknown): string {
-  if (err instanceof Error) return /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(err.name) ? err.name : "Error";
-  return typeof err;
-}
+/** The invisible runs the redactor skips when it matches a secret (redact.ts INVISIBLE_SRC): an
+ *  ANSI CSI sequence, or one control (Cc) / format (Cf) character. */
+const INVISIBLE_RE = new RegExp(INVISIBLE_SRC, "gu");
 
-/** The invisible runs the redactor skips when it matches a secret (redact.ts INVISIBLE_SRC, kept in
- *  step with it): an ANSI CSI sequence, or one control (Cc) / format (Cf) character. */
-const INVISIBLE_RE = new RegExp(String.raw`\x1b\[[0-?]*[ -/]*[@-~]|[\p{Cc}\p{Cf}]`, "gu");
+/** The unfinished prefix of an ANSI CSI sequence at the very end of a cut read: ESC [ and its
+ *  parameter and intermediate bytes, without the final byte the bound cut away. The redactor would
+ *  skip the COMPLETE sequence, so this prefix is invisible too, not text that spends the margin.
+ *  (A single Cc/Cf character, the redactor's only other invisible run, has no proper prefix on a
+ *  code-point boundary, and readBare's decoder never ends a read inside a code point.) */
+const UNTERMINATED_CSI_RE = new RegExp(String.raw`\x1b\[[0-?]*[ -/]*$`);
+
+/** Why a git read failed, as a fixed log reason: a read that hit its timeout (GitCache.readBare's
+ *  "exceeded <n>ms", or "has no time left" when none was) is told apart from any other failure. */
+function readFailure(err: unknown, other: string): string {
+  const msg = err instanceof Error ? err.message : "";
+  return / exceeded \d+ms$/.test(msg) || msg.endsWith(" has no time left") ? "git read timed out" : other;
+}
 
 /**
  * Drop the tail of a redacted read that its bound cut: at least `marginBytes` UTF-8 bytes of VISIBLE
- * text (text outside {@link INVISIBLE_RE} runs), plus the invisible run just before the cut. The
- * redactor matches a secret across invisible runs, so its unmatched head at the end of a cut read
- * can be padded with invisible characters to any raw length; counting only visible bytes removes
- * every such head whose visible length is at most the margin, however long its raw span.
+ * text (text outside {@link INVISIBLE_RE} runs, and outside an unterminated trailing CSI prefix, see
+ * {@link UNTERMINATED_CSI_RE}), plus the invisible run just before the cut. The redactor matches a
+ * secret across invisible runs, so its unmatched head at the end of a cut read can be padded with
+ * invisible runs; counting only visible bytes removes every such head whose visible length is at
+ * most the margin, as long as the redactor and this function agree on what is invisible (both use
+ * redact.ts INVISIBLE_SRC; the trailing CSI prefix is the one construct only the cut creates).
  */
 function dropVisibleTail(text: string, marginBytes: number): string {
+  // The trailing unfinished CSI is dropped with the tail anyway; removing it first keeps its
+  // parameter bytes from counting as visible.
+  const csi = UNTERMINATED_CSI_RE.exec(text);
+  if (csi) text = text.slice(0, csi.index);
   const visible: Array<[number, number]> = [];
   let last = 0;
   for (const m of text.matchAll(INVISIBLE_RE)) {
@@ -502,7 +514,7 @@ export async function buildDeliveryContext(input: DeliveryContextInput): Promise
       commits = truncated.commits && !p.truncated ? `${p.text}\n${TRUNCATED_MARKER}` : p.text;
       truncated.commits ||= p.truncated;
     } catch (err) {
-      log?.warn("delivery context: commit subjects unavailable", { reason: "git log read failed", error_class: errorClass(err) });
+      log?.warn("delivery context: commit subjects unavailable", { reason: readFailure(err, "git log read failed"), error_class: errorClass(err) });
       commits = UNAVAILABLE;
       truncated.commits = true;
     }
@@ -578,7 +590,7 @@ export async function buildDeliveryContext(input: DeliveryContextInput): Promise
       try {
         read = await boundedRead(args, cap + READ_MARGIN_BYTES);
       } catch (err) {
-        log?.warn("delivery context: path diff unavailable", { reason: "git diff read failed", error_class: errorClass(err) });
+        log?.warn("delivery context: path diff unavailable", { reason: readFailure(err, "git diff read failed"), error_class: errorClass(err) });
         truncated.diff = true;
         continue;
       }
@@ -586,9 +598,10 @@ export async function buildDeliveryContext(input: DeliveryContextInput): Promise
       // Redact before cut. A read cut at its bound may end in the head of a secret whose tail was
       // never read, which the redactor cannot match. That head is the END of the redacted text, so
       // dropping the last READ_MARGIN_BYTES of its VISIBLE text (dropVisibleTail) removes any head
-      // whose visible length is at most the margin, even one padded with invisible characters the
-      // redactor skips. The drop is measured on the redacted text, so a redaction earlier in the
-      // read that shrank it does not shorten the drop. Residual: a secret whose VISIBLE length
+      // whose visible length is at most the margin, even one padded with the invisible runs the
+      // redactor skips (an unterminated CSI at the cut counts as invisible too). The drop is
+      // measured on the redacted text, so a redaction earlier in the read that shrank it does not
+      // shorten the drop. Residual: a secret whose VISIBLE length
       // exceeds READ_MARGIN_BYTES, straddling the read boundary, can leave its head in the prompt.
       let text = redact(read.text);
       if (read.truncated) text = dropVisibleTail(text, READ_MARGIN_BYTES);

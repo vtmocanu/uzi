@@ -118,7 +118,14 @@ describe("GitCache.readBare (PRD #1798 M5)", () => {
       const slow = ["-c", `alias.wait=!echo $$ > '${pidFile}'; exec sleep 10`, "wait"];
       const started = Date.now();
       await assert.rejects(gc.readBare(bare, slow, { maxBytes: 1024, timeoutMs: 500 }), /exceeded 500ms/);
-      const pid = Number(fs.readFileSync(pidFile, "utf8").trim());
+      // The shell writes the pid file itself, so poll for a complete line rather than assume it
+      // is on disk the moment the read rejects.
+      let recorded = "";
+      while (!recorded.endsWith("\n") && Date.now() - started < 3_000) {
+        recorded = fs.existsSync(pidFile) ? fs.readFileSync(pidFile, "utf8") : "";
+        if (!recorded.endsWith("\n")) await delay(25);
+      }
+      const pid = Number(recorded.trim());
       assert.ok(pid > 0, "the alias recorded its pid");
       // Gone within 3 s of the start; the sleep alone lasts 10 s.
       while (processAlive(pid) && Date.now() - started < 3_000) await delay(25);
