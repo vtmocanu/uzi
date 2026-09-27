@@ -401,6 +401,103 @@ function renderedView(s: string): string | undefined {
   return undefined;
 }
 
+// ── The fail-toward-closing views ──
+//
+// renderedView emulates markdown (links, images, comments), and every gap in that emulation is a
+// directive the forge acts on that the scan would miss. The two views below emulate as little as
+// possible, so a gap in renderedView is still caught: they only ADD texts to the OR-ed scan, never
+// remove one, so they can only turn a non-closing verdict into a closing one.
+
+/** Line endings as `\n` and every format character but the U+200B breaker (see stripFormat) removed;
+ *  controls other than `\r` are kept. */
+function lfNoFormat(s: string): string {
+  return toLf(s).replace(/\p{Cf}/gu, (c) => (c === ZWSP ? c : ""));
+}
+
+/** The decoded-raw view: entities decoded to their fixed point, line endings and format characters
+ *  as lfNoFormat, and NO structural stripping (a link's target, a comment's body and an image's alt
+ *  text all stay as text). */
+function decodedRawView(s: string): string {
+  return lfNoFormat(decodeEntities(lfNoFormat(s)));
+}
+
+/** A finder for the next `needle` at or after a position, for positions asked in increasing order:
+ *  a search that found nothing (or found a match at or after the position) is reused, so every call
+ *  together scans `s` at most once. */
+function forwardFinder(s: string, needle: string): (from: number) => number {
+  let lastFrom = -1;
+  let lastAt = -1;
+  return (from) => {
+    if (lastFrom >= 0 && from >= lastFrom && (lastAt < 0 || lastAt >= from)) return lastAt;
+    lastFrom = from;
+    lastAt = s.indexOf(needle, from);
+    return lastAt;
+  };
+}
+
+function isAsciiLetter(c: string | undefined): boolean {
+  return c !== undefined && ((c >= "A" && c <= "Z") || (c >= "a" && c <= "z"));
+}
+
+/**
+ * Every HTML construct a forge could hide, removed in one linear left-to-right pass over literal
+ * (not entity-decoded) text: a tag (`<name…>`, `</name…>`, any name), a comment (`<!--` … `-->`,
+ * `<!-->` and `<!--->` included; an unterminated `<!--` goes to the end of its line), a processing
+ * instruction (`<?` … `?>`), CDATA (`<![CDATA[` … `]]>`) and a declaration (`<!X` … `>`). A `<`
+ * after an odd run of backslashes is escaped text, not markup, and stays. An unterminated tag, PI,
+ * CDATA or declaration stays as text. Links and images are not touched. The text must already be
+ * LF-only (lfNoFormat).
+ */
+function stripAllHtml(s: string): string {
+  if (!s.includes("<")) return s;
+  const n = s.length;
+  const gt = nextIndex(s, ">");
+  const nl = nextIndex(s, "\n");
+  const commentEnd = forwardFinder(s, "-->");
+  const piEnd = forwardFinder(s, "?>");
+  const cdataEnd = forwardFinder(s, "]]>");
+  let out = "";
+  let i = 0;
+  let backslashes = 0;
+  for (let at = 0; at < n; at++) {
+    const c = s[at]!;
+    if (c === "\\") {
+      backslashes++;
+      continue;
+    }
+    const escaped = backslashes % 2 === 1;
+    backslashes = 0;
+    if (c !== "<" || escaped) continue;
+    let end = -1; // the index just past the construct, or -1 when there is none here
+    const c1 = s[at + 1];
+    if (s.startsWith("<!--", at)) {
+      const close = commentEnd(at + 2);
+      end = close >= 0 ? close + 3 : nl[at]!;
+    } else if (c1 === "?") {
+      const close = piEnd(at + 2);
+      if (close >= 0) end = close + 2;
+    } else if (s.startsWith("<![CDATA[", at)) {
+      const close = cdataEnd(at + 9);
+      if (close >= 0) end = close + 3;
+    } else if ((c1 === "!" && isAsciiLetter(s[at + 2])) || isAsciiLetter(c1) || (c1 === "/" && isAsciiLetter(s[at + 2]))) {
+      const close = gt[at + 1]!;
+      if (close < n) end = close + 1;
+    }
+    if (end < 0) continue;
+    out += s.slice(i, at);
+    i = end;
+    at = end - 1;
+  }
+  return out + s.slice(i);
+}
+
+/** The decoded tag-stripped view: stripAllHtml over the literal text (a forge reads markup only where
+ *  it is written literally, so an encoded `&lt;x>` stays text, as in a sanitized field), then decoded
+ *  as decodedRawView. Link and image syntax stays as text. */
+function tagStrippedView(s: string): string {
+  return decodedRawView(stripAllHtml(lfNoFormat(s)));
+}
+
 /** Whether a UTF-16 code unit is in REF_SRC's path class `[\w.-]` under its `iu` flags: ASCII
  *  letters, digits, `_`, `.`, `-`, and the two non-ASCII characters that case-fold to ASCII word
  *  letters (U+017F LATIN SMALL LETTER LONG S and U+212A KELVIN SIGN). */
@@ -594,7 +691,10 @@ function refResolves(m: RegExpExecArray, iid: number, repoPath: string | undefin
  * `repoPath` (`owner/repo` or `group/sub/project`; omit it to treat every qualified reference as
  * possibly this repo's). The scan is the api sanitizer's prDescClosing pattern, over the raw text
  * and over its rendered view (renderedView: `Fi&#120;es #7`, `Fix<b></b>es #7`, `Clo<!-- -->ses #5`
- * and `Fixes <span>o/r#7</span>` all read as closing), each in the api's three marker views (raw,
+ * and `Fixes <span>o/r#7</span>` all read as closing), its decoded-raw view (decodedRawView: a
+ * directive inside a link target, an unterminated comment or any other construct renderedView
+ * strips still reads as closing) and its decoded tag-stripped view (tagStrippedView: `Fixes <?x?>#7`,
+ * `Fi&#120;es <foo>#7`), each in the api's three marker views (raw,
  * markers removed, markers blanked), and each keyword's GitLab reference list is followed, so
  * `Resolves #7, #8 and #9` closes #9 here too.
  *
@@ -609,8 +709,10 @@ export function closingDirectiveFor(body: string, issueIid: number, repoPath?: s
   if (body.length > FORGE_BODY_MAX_CHARS) return true;
   const rendered = renderedView(body);
   if (rendered === undefined) return true;
-  const views = new Set(closingViews(body).map((v) => v.text));
-  if (rendered !== body) for (const v of closingViews(rendered)) views.add(v.text);
+  const views = new Set<string>();
+  for (const base of new Set([body, rendered, decodedRawView(body), tagStrippedView(body)])) {
+    for (const v of closingViews(base)) views.add(v.text);
+  }
   for (const text of views) {
     let paths: PathRefs | undefined;
     // The positions a reference-list continuation (NEXT_REF_RE) has already been tried at in this

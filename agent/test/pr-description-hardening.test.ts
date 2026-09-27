@@ -421,14 +421,55 @@ describe("closingDirectiveFor: a link or image never spans a paragraph end", () 
     }
   });
 
-  it("still strips a link or image within one paragraph, across a single line break or an inline tag", () => {
+});
+
+describe("closingDirectiveFor fails toward closing: the decoded-raw and tag-stripped views", () => {
+  // The rendered view emulates markdown; each of these is a gap in that emulation where micromark
+  // shows a directive. The decoded-raw view (entities decoded, no structure stripped) and the
+  // decoded tag-stripped view (every HTML construct removed, links kept as text) catch them all.
+  it("a directive inside a link target, a comment or behind any HTML construct reads as closing", () => {
     for (const text of [
+      "[a](\n\n[b ) ](Fixes #&#55;)",
+      "[b](Fixes #&#55;)",
+      "[x](\n# h\nFixes #&#55;)",
+      "[x](\n---\nFixes #&#55;)",
+      "[x](\n- a\nFixes #&#55;)",
+      "[x](\n<b>\nFixes #&#55;)",
+      "[x](\n| a |\n|---|\nFixes #&#55;)",
       "Intro [x](\nFix&#101;s #7)",
       "Intro [x](Fix&#101;s #7)",
-      "Intro ![Fix&#101;s #7](y)",
       "Intro [x](\n<span>Fix&#101;s #7)",
       "Intro [x](a <div>Fix&#101;s #7)",
+      "[x](\r\rFix&#101;s #7)",
+      "x <!-- Fixes #&#55;",
+      "Fi&#120;es <foo>#7",
+      "Fixes <?x?>#7",
+      "Fixes <!X>#7",
+      "Fixes <![CDATA[x]]>#7",
+      "Intro ![Fix&#101;s #7](y)",
+      "Fixes <!-->#7",
+      "Fixes <!--->#7",
+      "Fixes <!-- a -->#7",
+      "Fixes </foo \n bar>#7",
+      "Fix&#8204;es #7",
     ]) {
+      assert.equal(closingDirectiveFor(text, 7, "o/r"), true, JSON.stringify(text));
+    }
+  });
+
+  it("the tag-stripped view reads markup only where it is written literally", () => {
+    // A sanitized field encodes `<` as `&lt;` (a forge shows it as text), and an escaped `\<` is
+    // text too: neither is stripped as a tag, so the keyword around it stays split.
+    for (const text of ["Clo&lt;x>ses #7", "Clo\\<x>ses #7", "Clo&lt;foo bar>ses #7"]) {
+      assert.equal(closingDirectiveFor(text, 7, "o/r"), false, JSON.stringify(text));
+    }
+    // An unterminated comment is removed to the end of its line only.
+    assert.equal(closingDirectiveFor("Fix<!-- a\nes #7", 7, "o/r"), false);
+    assert.equal(closingDirectiveFor("Fixes <!-- a\n#7", 7, "o/r"), true);
+  });
+
+  it("U+200B still breaks a keyword in every view, encoded or not", () => {
+    for (const text of [`F${ZW}ixes #7`, "F&#8203;ixes #7", "F&ZeroWidthSpace;ixes #7", `[x](F${ZW}ixes #7)`, `F${ZW}ixes <foo>#7`]) {
       assert.equal(closingDirectiveFor(text, 7, "o/r"), false, JSON.stringify(text));
     }
   });
@@ -519,6 +560,20 @@ describe("scans stay linear on adversarial input (M1)", () => {
       "`",
       "*_",
       "<https://",
+      // The decoded-raw and tag-stripped views: unterminated constructs of every kind (each finder
+      // is searched once), escaped `<`, backslash runs, and lone CRs.
+      "<?",
+      "<?x?",
+      "<![CDATA[",
+      "<!x",
+      "<!-->",
+      "<a",
+      "</a",
+      "\\",
+      "\\<a>",
+      "\r",
+      "&lt;x>",
+      "Fi&#120;es <a>",
     ];
     const shapes: Array<(n: number) => string> = [
       ...units.map((u) => (n: number) => fillTo(u, n)),
@@ -818,6 +873,25 @@ async function mint(fields: Partial<RawPrDescriptionFields>): Promise<SanitizedP
   }
 }
 
+/**
+ * Field text shaped like the api sanitizer's output (SanitizePrDescriptionText): converged (no entity
+ * left to decode), every live bracket backslash-escaped, `<` encoded as `&lt;`, and U+200B after the
+ * first letter of every closing keyword a reference follows in any of the three marker views. Link-,
+ * tag- and comment-shaped text survives only in this escaped form.
+ */
+const SANITIZED_HOSTILE: Partial<RawPrDescriptionFields> = {
+  summary: `See \\[the docs\\](https://example.com/F${ZW}ixes/7) and \\[F${ZW}ixes #7\\](https://e/x) for why.`,
+  changes: [
+    `Clo&lt;x>ses #7 is shown as text, as is F${ZW}ixes &lt;foo>#7 and F${ZW}ixes &lt;?x?>#7.`,
+    `&lt;!\\[CDATA\\[x\\]\\]> stays text; \\[x\\](\\[b ) \\](F${ZW}ixes #7)`,
+    `R${ZW}esolves o/r#7, see !\\[img\\](F${ZW}ixes #7) and F${ZW}ix**es** #7`,
+  ],
+  scope_notes: [{ kind: "deferred", text: `\\[a\\]: https://e/C${ZW}loses#7 (a reference definition, as prose)` }],
+  // Last, so the rendered view's unterminated-comment strip does not hide the other fields from it.
+  review_pointers: [`Clo&lt;x y="1">ses #7 is split by encoded markup; &lt;!-- F${ZW}ixes #7 -> is text`],
+  verification: [{ command: `task gate:agent &lt;x> F${ZW}ixes #7`, result: "pass", verified_at_sha: "1234567" }],
+};
+
 describe("round trip: the renderer's own output always parses ok", () => {
   const HEAD = "e".repeat(40);
   /** Every marker-shaped comment in `body` (outside nothing: the renderer writes no marker in code)
@@ -938,8 +1012,10 @@ describe("round trip: the renderer's own output always parses ok", () => {
       renderRegion({ sizeLine: SIZE, headSha: HEAD, targetBranch: hostile }).text,
       renderRegion({ sizeLine: SIZE, headSha: HEAD, targetBranch: "main", source: "lead_only" }, fields).text,
       renderRegion({ headSha: HEAD, targetBranch: "main" }).text,
+      renderRegion({ sizeLine: SIZE, headSha: HEAD, targetBranch: "main" }, await mint(SANITIZED_HOSTILE)).text,
     ];
     assert.ok(regions[3]!.includes("### What changed"), regions[3]);
+    assert.ok(regions[5]!.includes("### What changed"), regions[5]);
     for (const [kind, over] of kinds) {
       for (const completionScope of scopes) {
         for (const region of regions) {
@@ -994,6 +1070,17 @@ describe("round trip: the renderer's own output always parses ok", () => {
               assert.equal(o.before, "");
               assert.equal(o.after, "");
               assert.ok(o.completion!.startsWith(COMPLETION_START) && o.completion!.endsWith(COMPLETION_END));
+            }
+          }
+          // The interlock never reads uzi's own output as closing: the region, every kind's block,
+          // every line ending, with and without a repo path (every qualified reference possibly ours).
+          const own = renderBody(region, completion);
+          for (const eol of ["\n", "\r\n", "\r"]) {
+            const b = own.replace(/\n/gu, eol);
+            for (const iid of [7, 42, 77]) {
+              for (const repo of ["o/r", undefined]) {
+                assert.equal(closingDirectiveOutsideCompletion(b, iid, completion, repo), false, `${kind} #${iid} ${JSON.stringify(eol)}:\n${own}`);
+              }
             }
           }
           if (region) {
