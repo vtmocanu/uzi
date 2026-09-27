@@ -275,11 +275,17 @@ removes the tree.
   boundary and no process proof. `captureRecoveryRestorePoint` (the
   `recovery_capture` and `credential_switch` sites) has the identical shape:
   a direct `quiesceRun` call, then an unboundaried status read/WIP
-  marker/fetch-back, then a `withCodexBoundaryOnly`-wrapped publish. So on a
+  marker/fetch-back, then a `withCodexBoundaryOnly`-wrapped publish — except
+  its credential-free branch (`opts.credentialFree`, taken by the Codex
+  vault-lock park and its retries): there the executor's
+  `settleForCredentialFreeCapture` first poisons and drains the Codex
+  registry, and the publish then opens NO Codex boundary. So on a
   Codex run: pause park and terminal retire have no process proof at any
   point; the wall park, the completion hold, and `captureRecoveryRestorePoint`'s
   two sites have no process proof over their pre-publish steps, with the
-  supervisor boundary picking up only the publish itself. **In every one of
+  supervisor boundary picking up only the publish itself (on the
+  credential-free vault-lock capture, the settle drain precedes those steps
+  and the publish is unboundaried instead). **In every one of
   these unboundaried steps, `quiesceRun`'s own `executor.killAgentTree?.()`
   call kills nothing for Codex**: `CodexExecutor` deliberately does not
   implement `killAgentTree` ("This class deliberately does NOT implement
@@ -369,14 +375,15 @@ Image ID `sha256:5c04540739e3cfd6fc43aa13620bb888593783a77eb505058a055ac7b879d78
 `org.opencontainers.image.revision` `3692a3801e4ca11759f34b41d40f0acc8a4e097f`.
 `git diff --stat 3692a3801e4ca11759f34b41d40f0acc8a4e097f 576521c0 --
 agent/templates agent/package.json agent/package-lock.json agent/bin
-agent/codex agent/devbox-global agent/tsconfig.json` is empty; the one other
-Dockerfile build input, `COPY . /opt/uzi-src`, differs between those commits
-but is not read by the fixture. The fixture (`e2e/`, mounted read-only) and
+agent/codex agent/devbox-global agent/tsconfig.json` is empty; the two other
+Dockerfile build inputs, `COPY agent/src ./src` (superseded by the `CQ_SRC`
+mount) and `COPY . /opt/uzi-src`, differ between those commits but are not
+read by the fixture. The fixture (`e2e/`, mounted read-only) and
 `agent/src` (mounted via `CQ_MOUNT_SRC`; `fixture.test.ts:40` `const SRC =
 process.env.CQ_SRC ?? "/app/src";`) come from the tree at 60f164b1, whose
 `agent/src` equals the final code commit 576521c0's (`git diff --stat
-576521c0 60f164b1 -- agent/src` is empty), and the commits between them
-(978cbde5 and the lead's pending comment edit in `runner.ts`) change only
+576521c0 60f164b1 -- agent/src` is empty), and the commits after 60f164b1
+(978cbde5, 312a8fb7, c7e97e4c and the ADR fix that follows them) change only
 docs and code comments.
 
 PASS lines (7/7; tests 7, pass 7, fail 0, cancelled 0, skipped 0):
@@ -429,11 +436,14 @@ These are not filed yet; listed here for the maintainer to file after merge.
   (`captureHoldContext`'s publish, and `captureRecoveryRestorePoint`'s own),
   so the supervisor's drain proof does cover the publish itself, but the
   status read, WIP marker commit, and fetch-back that precede it run with no
-  boundary and no process proof. Unlike the limit park, graceful shutdown,
+  boundary and no process proof. The credential-free (vault-lock)
+  `recovery_capture` branch is the inverse: the executor's
+  `settleForCredentialFreeCapture` drains the Codex registry before those
+  steps, and the publish itself opens no boundary. Unlike the limit park, graceful shutdown,
   the milestone checkpoint, the pre-settle reap, and finalize (which get the
   supervisor's `withBoundary` drain proof over their whole credentialed
   region because they are routed through `reapForSink`/`withCodexBoundaryOnly`
-  end to end), none of these five sites gets that coverage for their
+  end to end), none of these six sites gets that coverage for their
   pre-publish steps. This is disclosed here for the maintainer to file as its
   own tracking issue, not filed yet.
 
