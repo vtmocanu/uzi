@@ -665,8 +665,18 @@ export class WorkerClient {
     // 200/409 single-body ACK parse, already-terminal handling and logging are preserved per variant
     // in reportStateOnce, so the fallback only toggles whether claim_generation is on the wire.
     const included = this.includeClaimGeneration(body.claim_generation);
+    // PRD #1795 M3: the api refuses an id-bearing awaiting_approval report without
+    // claim_generation (400 claim_generation_required), and the strict-decode fallback exists for
+    // an api that rolled back past the fields. So whenever claim_generation is NOT on the wire, the
+    // gate presentation fields are not either: the report degrades to an id-less one, which an
+    // allocating api still answers with its revision and an older api accepts unchanged.
     return this.withGenerationFallback(included, (includeField) =>
-      this.reportStateOnce(runId, path, includeField ? body : { ...body, claim_generation: undefined }, signal),
+      this.reportStateOnce(
+        runId,
+        path,
+        includeField ? body : { ...body, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined },
+        signal,
+      ),
     );
   }
 
@@ -740,6 +750,9 @@ export class WorkerClient {
             ack.staleClaim = fields.staleClaim;
           if (fields.credentialSwitchReleased !== undefined)
             ack.credentialSwitchReleased = fields.credentialSwitchReleased;
+          // PRD #1795 M1 (decision 5): the revision an awaiting_approval report was answered with,
+          // read like contractRevision off the same single-use body (top-level, beside `run`).
+          if (fields.gateRevision !== undefined) ack.gateRevision = fields.gateRevision;
           if (!ack.applied) {
             this.log.info("state report not applied server-side", {
               run_id: runId,
@@ -1692,6 +1705,7 @@ export async function readRunAck(res: Response): Promise<{
   credentialSwitch?: { generation: number };
   staleClaim?: boolean;
   credentialSwitchReleased?: boolean;
+  gateRevision?: number;
 }> {
   try {
     const text = await res.text();
@@ -1721,6 +1735,8 @@ export async function readRunAck(res: Response): Promise<{
       // beside `run`, not inside it.
       credential_switch?: unknown;
       disposition?: unknown;
+      // PRD #1795 M1 (decision 5): the awaiting_approval ACK's revision, TOP-LEVEL beside `run`.
+      gate_revision?: unknown;
     };
     const run = parsed?.run;
     const out: {
@@ -1740,6 +1756,7 @@ export async function readRunAck(res: Response): Promise<{
       credentialSwitch?: { generation: number };
       staleClaim?: boolean;
       credentialSwitchReleased?: boolean;
+      gateRevision?: number;
     } = {};
     if (typeof run?.status === "string") out.status = run.status;
     // PRD #1497 M2: the RunDTO's hold_reason rides the SAME body as `status`. A string only — a
@@ -1812,6 +1829,11 @@ export async function readRunAck(res: Response): Promise<{
     // release after a reclaim (status 'running'), so enterCredentialSwitch accepts the release off
     // this flag rather than off status === 'queued' (which missed the idempotent case).
     if (parsed?.disposition === "released") out.credentialSwitchReleased = true;
+    // PRD #1795 M1 (decision 5): the gate revision an awaiting_approval report was answered with. A
+    // positive integer only; anything else (absent on an older api or another report, garbled)
+    // leaves it undefined, which the gate reads as "no revision confirmed" (bound verdicts wait).
+    const gateRev = parsed?.gate_revision;
+    if (typeof gateRev === "number" && Number.isSafeInteger(gateRev) && gateRev >= 1) out.gateRevision = gateRev;
     return out;
   } catch {
     return {};

@@ -1,0 +1,13 @@
+{
+  "status": "awaiting_approval",
+  "plan_md": "# PERSISTED PLAN\n- the plan the human was shown",
+  "milestones": [
+    {
+      "id": "m1",
+      "title": "first cut"
+    }
+  ],
+  "size_class": "s",
+  "plan_changed_files": [],
+  "claim_generation": 7
+}

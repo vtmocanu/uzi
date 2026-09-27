@@ -37,6 +37,7 @@ import type {
   ClaimCodexSecrets,
   ClaimConfig,
   ClaimResponse,
+  GatePresentedRequirements,
   IterationBudget,
   Milestone,
   RunKind,
@@ -510,6 +511,40 @@ class CredentialSwitchRetainedStop extends Error {
 /** Issue #1604 (D3): why a resumed claim parks when the inputs sent before its release cannot be
  *  read within the channel's bound. */
 const RESUMED_GATE_RECOVERY_REASON = "could not read plan-gate inputs after the resume";
+
+/** PRD #1795 (A3, decision 8): why a claim parks when the api refused its awaiting_approval report
+ *  (a historical presentation id, a changed payload under the current id, or a stale adoption). The
+ *  refused report published nothing, so the next claim re-presents; it is never retried here under
+ *  a fresh id. */
+const GATE_PRESENTATION_REFUSED_REASON = "the plan gate could not be re-presented";
+
+/** PRD #1795 M1: the 409 reasons a refused awaiting_approval report carries
+ *  (api/internal/workersvc/gate_revision.go GatePresentationRefusalReason). */
+const GATE_PRESENTATION_REFUSALS = new Set([
+  "gate_presentation_historical",
+  "gate_presentation_conflict",
+  "gate_adoption_stale",
+]);
+
+/** PRD #1795 M1: the register-response feature under which the api accepts `presentation_id` /
+ *  `adopt_gate_revision` on the awaiting_approval report. Never sent without it: an older api
+ *  strict-decodes the report and would 400 an unknown field. */
+const GATE_REVISION_FEATURE = "gate_revision_v1";
+
+/** PRD #1795 (decision 7): what a gate resume claim says about the persisted gate it re-presents,
+ *  kept until the claim's first gatePlan. Used only when that gate is the no-bump first gate of the
+ *  claim and shows the same persisted plan (an SDK same-gate reclaim). */
+interface GateResume {
+  revision: number;
+  /** The persisted current presentation id, reused; undefined for an id-less gate, adopted. */
+  presentationId: string | undefined;
+  /** The immutable presented requirements, re-sent instead of a fresh detection. */
+  presented: GatePresentedRequirements | undefined;
+  /** The persisted plan the claim carries: a first gate showing any other text mints a fresh id. */
+  planMd: string;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * PRD #1391 Run B M4: phaseClone's FIRST `running` report came back refused (applied:false) with a
@@ -1344,6 +1379,10 @@ export class RunRunner {
    *  regardless of planApprovalTimeoutMs (unlike keying off gateDeadlines). Cleared on a
    *  terminal verdict and, defensively, when the run reaches a terminal state. */
   private readonly gatedRuns = new Set<string>();
+  /** PRD #1795 (decision 7): per run, the gate resume data of a claim whose first gate may re-present
+   *  its persisted gate under the persisted presentation id (or adopt an id-less one). Consumed by
+   *  the claim's first gatePlan; cleared with gatedRuns. */
+  private readonly gateResumes = new Map<string, GateResume>();
   /** PRD #218 M1: the in-flight runs, so a graceful shutdown can abort each and let its
    *  catch fetch the committed work back before the container dies. Registered once the
    *  runner clone exists (there is nothing to fetch back before that) and deregistered
@@ -2332,6 +2371,7 @@ export class RunRunner {
       // leak either).
       this.gateDeadlines.delete(runId);
       this.gatedRuns.delete(runId);
+      this.gateResumes.delete(runId);
       // PRD #88: the clarification park's per-run state follows the SAME rule as the
       // gate maps above, and for the same reason main gives below — these are
       // in-memory per-run entries that would otherwise be held for the whole length of
@@ -5235,7 +5275,30 @@ export class RunRunner {
       // whose replayed verdicts cannot be judged: nothing replayed settles its first gate.
       if (!replayJudged || executor.resumesAtGate !== true || claim.resume_phase !== "awaiting_approval")
         this.gatedRuns.add(runId);
+      // PRD #1795 (decision 7): a claim whose first gate RE-PRESENTS the persisted gate (the no-bump
+      // first gate above: an SDK executor at resume_phase "awaiting_approval" with judged replays)
+      // keeps the gate's presentation: its first gatePlan reuses the persisted id (or adopts an
+      // id-less gate) with the presented requirements. The confirmed revision is seeded from the
+      // claim, so a pending reject or revise bound to that gate acts before it is re-presented
+      // (takeResumedGateEvent); a taken revise clears it and marks the run gated (a fresh id then).
+      const resumeRevision = claim.resume_gate_revision;
+      if (
+        !this.gatedRuns.has(runId) &&
+        typeof resumeRevision === "number" && Number.isSafeInteger(resumeRevision) && resumeRevision > 0
+      ) {
+        const id = claim.resume_gate_presentation_id;
+        this.gateResumes.set(runId, {
+          revision: resumeRevision,
+          presentationId: typeof id === "string" && UUID_RE.test(id) ? id : undefined,
+          presented: claim.resume_gate_presented ?? undefined,
+          planMd: claim.plan_md ?? "",
+        });
+        steering.setGateRevision(resumeRevision);
+      }
     }
+    // PRD #1795 (decision 9): bound/unbound verdict handling applies to a human-gated claim only (an
+    // autopilot gate never waits on a verdict). gatePlan re-asserts it for a gate forced to a human.
+    steering.setHumanGated(!(claim.auto_approve ?? false));
 
     // Last SDK session id the executor observed; carried on EVERY state report so
     // resume survives a lost report.
@@ -10265,6 +10328,10 @@ export class RunRunner {
     // replays it instead of re-presenting the superseded plan.
     settles?: number,
   ): Promise<PlanVerdict> {
+    // PRD #1795 (decision 6): nothing is confirmed until THIS gate's own applied awaiting_approval
+    // ACK says which revision it published, so a verdict bound to an earlier gate cannot act on
+    // this one and a declined, failed or refused report confirms nothing.
+    steering.clearGateRevision();
     batcher.emit({ kind: "plan", agent: "lead", payload: { plan_md: planMd } });
     // Get the plan message onto the stream regardless of mode — it is the audit
     // record of what the agent intended, autopilot or not.
@@ -10380,28 +10447,73 @@ export class RunRunner {
     // best-effort (planChangedFiles swallows errors → []), computed EVERY round so a
     // revision gate reflects that round's tree (a revert between rounds clears the list).
     const planChangedFiles = await this.git.planChangedFiles(worktreePath);
+    // PRD #1795 (decision 9): this gate waits on a human (a CI-config ci_fix plan forces one even on
+    // an auto-approve claim), so bound/unbound verdict handling applies.
+    steering.setHumanGated(true);
+    // PRD #1795 (decision 7): the presentation this gate publishes. Only the no-bump first gate of a
+    // claim that re-presents its persisted gate (an SDK same-gate reclaim: gateResumes, showing the
+    // same persisted plan) keeps that gate's identity: it reuses the persisted id, or explicitly
+    // adopts an id-less gate, and re-sends the presented requirements instead of a fresh detection
+    // (which may differ, or an approval's override may have cleared the live set). Every other gate
+    // (a fresh plan, a revision, a resumed revise, a stub/Codex re-gate of identical text) mints a
+    // fresh id. The fields ride the report only when the api advertised gate_revision_v1; the
+    // client's retries resend this same body, so a lost ACK is answered under the same id.
+    const gateResume = this.gateResumes.get(runId);
+    this.gateResumes.delete(runId);
+    const reuse = !this.gatedRuns.has(runId) && gateResume?.planMd === planMd ? gateResume : undefined;
+    const presentation: Pick<StateRequest, "presentation_id" | "adopt_gate_revision"> = {};
+    if (this.client.protocolFeatures.includes(GATE_REVISION_FEATURE)) {
+      presentation.presentation_id = reuse?.presentationId ?? randomUUID();
+      if (reuse && reuse.presentationId === undefined) presentation.adopt_gate_revision = reuse.revision;
+    }
     const ack = await reportState({
       status: "awaiting_approval",
       plan_md: planMd,
+      ...presentation,
       ...(milestones?.length ? { milestones } : {}),
       // PRD #84 M4: the CANDIDATE requirement set rides the awaiting_approval report so
       // the server can gate plan-approval on worker eligibility. Each field only when
       // non-empty (additive-optional), matching the milestones conditional above.
-      ...toolchainReportFields(toolchainDetection),
+      // PRD #1795: a re-presentation sends the requirements the human was shown instead.
+      ...(reuse ? presentedReportFields(reuse.presented) : toolchainReportFields(toolchainDetection)),
       // PRD #212 (Decision 3): ALWAYS send (empty [] when clean), NOT conditionally
       // spread — so each gate round REPLACES the server's list (M1's COALESCE clears on
       // empty), keeping a revision gate from showing a stale earlier round's writes.
       plan_changed_files: planChangedFiles,
     });
+    // PRD #1795 (A3, decision 8): a refused report (a historical id, a changed payload under the
+    // current id, a stale adoption) published nothing. Confirm nothing, take no verdict, and leave
+    // every receipt unapplied (a revise it answers stays replayable): park through the existing
+    // transient-recovery path so the next claim re-presents. Never retried here under a fresh id,
+    // which would publish a plan the refused gate never showed. The api's refusal cap bounds the
+    // loop (a run past it comes back `failed`, which the recovery path reads as terminal).
+    if (ack.applied !== true && ack.reason !== undefined && GATE_PRESENTATION_REFUSALS.has(ack.reason)) {
+      runLog.warn("plan gate: the api refused the gate presentation; parking for recovery", {
+        run_id: runId,
+        reason: ack.reason,
+        server_status: ack.status ?? "unknown",
+      });
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: `${GATE_PRESENTATION_REFUSED_REASON} (${ack.reason}) — the plan is not offered; parking so the next claim re-presents it` },
+      });
+      throw new TransientRecoveryError(GATE_PRESENTATION_REFUSED_REASON);
+    }
     // Issue #1604 (D2): the revised plan is durable, so the revise it answers is final now.
     if (settles !== undefined && ack.applied === true && ack.status === "awaiting_approval")
       steering.settleRevision(settles);
+    // PRD #1795 (decision 6): confirm the revision THIS gate's applied report was answered with; a
+    // verdict bound to exactly it may act, including one routed while the ACK was in flight (B1).
+    if (ack.applied === true && ack.status === "awaiting_approval" && ack.gateRevision !== undefined)
+      steering.setGateRevision(ack.gateRevision);
     if (this.gatedRuns.has(runId)) steering.bumpEpoch();
     else this.gatedRuns.add(runId);
     const epoch = steering.currentEpoch();
     runLog.info("plan gate: awaiting approval", {
       run_id: runId,
       gate_epoch: epoch,
+      gate_revision: ack.gateRevision ?? null,
     });
 
     // PRD #362 M3c: plan_md is now persisted (the awaiting_approval report above), so the
@@ -10429,6 +10541,7 @@ export class RunRunner {
       if (v.kind !== "revise") {
         this.gateDeadlines.delete(runId);
         this.gatedRuns.delete(runId);
+        this.gateResumes.delete(runId);
         // Issue #1604: no later verdict can act; each is final on arrival.
         steering.closeGate(v.kind);
       }
@@ -10897,6 +11010,19 @@ const FOLLOWUP_TERMINAL_STATUSES: ReadonlySet<string> = new Set([
  *  {milestones} : {}` conditional-spread discipline, so a run that detected nothing (or
  *  whose scan failed and passed `undefined`) reports byte-for-byte as before. `size_class`
  *  is included whenever a detection was computed (it is soft/display-only). */
+/** PRD #1795 (decision 3): the requirement fields of a same-gate re-presentation, from the claim's
+ *  immutable presented snapshot, with toolchainReportFields' conditional shape (each array only when
+ *  non-empty). An absent snapshot sends none: the api then keeps the gate's own presented values,
+ *  which is exactly what the human saw. */
+function presentedReportFields(presented: GatePresentedRequirements | undefined): Partial<StateRequest> {
+  if (!presented) return {};
+  const fields: Partial<StateRequest> = {};
+  if (typeof presented.size_class === "string" && presented.size_class !== "") fields.size_class = presented.size_class;
+  if (presented.required_capabilities?.length) fields.required_capabilities = [...presented.required_capabilities];
+  if (presented.required_tools?.length) fields.required_tools = [...presented.required_tools];
+  return fields;
+}
+
 function toolchainReportFields(
   detection: ToolchainDetection | undefined,
 ): Partial<StateRequest> {
