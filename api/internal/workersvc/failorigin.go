@@ -92,6 +92,16 @@ var failOrigins = []string{
 	// neverJudgeFailOrigins and envPublishFailOrigins (judge_enqueue.go) — and it is not
 	// human-landable (no finalize ran, so there is no committed work to land).
 	"plan_missing",
+	// issue #1783: the worker could not prove the run's execution stopped (surviving or
+	// unverifiable run-owned processes, e.g. a tool shell or Docker invocation that outlived a
+	// park) or could not clear or quarantine residue at the run's clone path, so it refused to
+	// push, capture or reseed and failed the run typed instead of guessing (the generic
+	// agent_failure it surfaced as before). WORKER-REPORTABLE (see workerReportableFailOrigins).
+	// It is WORKER INFRASTRUCTURE, not an agent defect, so it is NEVER JUDGED: a member of
+	// neverJudgeFailOrigins (judge_enqueue.go), which skips regardless of iteration_count, since
+	// it can fire pre-start at reseed or at finalize on a resumed run. It is not human-landable:
+	// the worker refused to publish from an unproven state.
+	"worker_residue_blocked",
 }
 
 // failOriginSet is the lookup form. Built once; failOrigins stays the declaration so
@@ -134,7 +144,9 @@ func AllFailOrigins() []string {
 // published floor, so finalize fails typed with the preserved diff instead of the generic
 // catch), and plan_missing (issue #1593: a gated plan turn ended prose-only, with no
 // submit_plan and no ask_user, after one corrective nudge, so the worker fails the run typed
-// with a fixed failure_reason); agent_failure is included because it is the judgeable
+// with a fixed failure_reason), and worker_residue_blocked (issue #1783: the worker could not
+// prove the run's execution stopped or could not clear or quarantine residue at the run's clone
+// path, so it refused to push, capture or reseed); agent_failure is included because it is the judgeable
 // default the `failed` arm applies anyway, so an explicit worker agent_failure is
 // harmless and semantically correct. The partition (worker-reportable + server-only ==
 // vocabulary) is pinned by TestCoerceFailOrigin.
@@ -152,6 +164,10 @@ var workerReportableFailOrigins = map[string]bool{
 	// issue #1593: the worker fails a gated plan turn that ended prose-only after one
 	// corrective nudge (judge-eligible; see failOrigins).
 	"plan_missing": true,
+	// issue #1783: the worker refuses to push, capture or reseed when it cannot prove the run's
+	// execution stopped or cannot clear the run's clone-path residue (never judged; see
+	// failOrigins and neverJudgeFailOrigins).
+	"worker_residue_blocked": true,
 }
 
 // CoerceFailOrigin maps a worker-reported fail_origin onto the WORKER-REPORTABLE subset.

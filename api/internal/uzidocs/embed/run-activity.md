@@ -360,6 +360,24 @@ one: `scope --through 4` then `scope --through 5` finalizes at 5, not 4, and
 CLI docs](./cli.md#commands) for the exact commands, and
 [ADR-634](../adr/0634-run-scope-steering.md) for the design rationale.
 
+## When the worker cannot prove a run stopped
+
+Before it pushes a run's branch, captures its work, or reseeds its clone,
+the worker checks that everything the run started has actually stopped: the
+processes its tools spawned and the Docker activity it began. It also
+checks that the run's clone path is clear, or can be moved aside into
+quarantine. If it cannot prove the run stopped (a run-owned process
+survived, or its state could not be verified), or it cannot clear the
+leftover files at the clone path, it refuses to push, capture or reseed
+rather than guess, and fails the run with `fail_origin =
+worker_residue_blocked`, shown as **worker residue blocked**.
+
+This is a worker infrastructure problem, not something the agent did wrong,
+so a run that fails this way is never sent to the judge. Nothing is
+published from the unproven state; commits the run had already pushed
+before this point stay on its branch. Start a new run once the worker is
+healthy again.
+
 ## From the CLI
 
 `uzi run inputs <run-id>` shows the same queue from the terminal — see

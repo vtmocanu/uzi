@@ -161,12 +161,14 @@ func TestPreStartInfraFailOriginsExact(t *testing.T) {
 }
 
 // TestNeverJudgeFailOriginsExact pins neverJudgeFailOrigins to its EXACT membership: the
-// server-derived origins with no agent attempt to retrospect — forge_unreachable (PRD #1392)
-// and task_undispatched (issue #1367, a handoff reaped before it was ever claimed). An
-// accidental add (a genuinely judgeable origin slipping into the regardless-of-iteration skip)
-// or drop (either falling out, re-exposing SC3) reddens here.
+// origins with no agent defect to retrospect — forge_unreachable (PRD #1392),
+// task_undispatched (issue #1367, a handoff reaped before it was ever claimed) and
+// worker_residue_blocked (issue #1783, the worker could not prove the run's execution stopped
+// or clear its clone-path residue). An accidental add (a genuinely judgeable origin slipping
+// into the regardless-of-iteration skip) or drop (any falling out, re-exposing SC3) reddens here.
 func TestNeverJudgeFailOriginsExact(t *testing.T) {
-	assertFailOriginSetExact(t, "neverJudgeFailOrigins", neverJudgeFailOrigins, "forge_unreachable", "task_undispatched")
+	assertFailOriginSetExact(t, "neverJudgeFailOrigins", neverJudgeFailOrigins,
+		"forge_unreachable", "task_undispatched", "worker_residue_blocked")
 }
 
 // TestEnvPublishFailOriginsExact pins envPublishFailOrigins (issue #1418) to its EXACT membership:

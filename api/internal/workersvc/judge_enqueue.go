@@ -40,12 +40,13 @@ var preStartInfraFailOrigins = map[string]bool{
 }
 
 // neverJudgeFailOrigins is the fail_origin set that skips the judge REGARDLESS of
-// iteration_count (PRD #1392 M1, SC3). Its members are SERVER-DERIVED origins that are never
-// a real agent defect, so there is nothing to retrospect however far the run got. Today it is
-// EXACTLY forge_unreachable: it is stamped ONLY inside SetState's forge-park transaction (a
-// forge that stayed unreachable at clone past the park cap), never by a worker report
-// (workerReportableFailOrigins excludes it, and CoerceFailOrigin drops a worker forging it),
-// so an untrusted report can never steer this skip. Unlike preStartInfraFailOrigins it is NOT
+// iteration_count (PRD #1392 M1, SC3). Its members are origins that are never a real agent
+// defect, so there is nothing to retrospect however far the run got. forge_unreachable is
+// stamped ONLY inside SetState's forge-park transaction (a forge that stayed unreachable at
+// clone past the park cap), never by a worker report (workerReportableFailOrigins excludes it,
+// and CoerceFailOrigin drops a worker forging it), so an untrusted report cannot steer its
+// skip. worker_residue_blocked (issue #1783) is the one WORKER-REPORTABLE member (see its entry
+// below). Unlike preStartInfraFailOrigins it is NOT
 // gated on iteration_count == 0, because a resumed run's forge cap-fail carries
 // iteration_count > 0 (see preStartInfraFailOrigins). A strict subset of failorigin.go's
 // vocabulary. TestNeverJudgeFailOriginsExact pins the exact set.
@@ -56,6 +57,15 @@ var neverJudgeFailOrigins = map[string]bool{
 	// skips the judge regardless of iteration_count. Server-derived (see failorigin.go); the
 	// sweep already declines to enqueue a judge for these rows, so this is belt-and-braces.
 	"task_undispatched": true,
+	// issue #1783: the worker could not prove the run's execution stopped, or could not clear or
+	// quarantine residue at the run's clone path, so it refused to push, capture or reseed.
+	// Worker infrastructure, not an agent defect, so there is nothing to retrospect. It lives
+	// here and NOT in preStartInfraFailOrigins because it can fire at finalize or on the reseed
+	// of a RESUMED run, which carries iteration_count > 0, so an == 0 gate would wrongly judge
+	// it. WORKER-REPORTABLE, unlike the other members: a worker forging it can at worst decline
+	// to spend judge tokens on its OWN failure, the same spend/accuracy tradeoff (not a security
+	// boundary) envPublishFailOrigins accepts.
+	"worker_residue_blocked": true,
 }
 
 // envPublishFailOrigins is the fail_origin set for ENVIRONMENT-CAUSED publish failures (issue
@@ -178,10 +188,12 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	// Gate 4b (PRD #69 M7a Pass B, Decision 12; PRD #1392 M1; issue #1418): skip the judge for a
 	// failure with no agent behavior to retrospect. Three disjoint sets, differing ONLY in whether
 	// the skip is gated on iteration_count:
-	//   - neverJudgeFailOrigins (forge_unreachable): server-derived, never a real agent defect,
-	//     so it skips REGARDLESS of iteration_count. A forge cap-fail on a RESUMED run carries
-	//     iteration_count > 0 (iteration_count is only ever advanced, never reset), so gating it
-	//     on == 0 would wrongly judge it — SC3 requires "no judge run" unconditionally.
+	//   - neverJudgeFailOrigins (forge_unreachable/task_undispatched/worker_residue_blocked):
+	//     never a real agent defect, so it skips REGARDLESS of iteration_count. A forge cap-fail on
+	//     a RESUMED run carries iteration_count > 0 (iteration_count is only ever advanced, never
+	//     reset), so gating it on == 0 would wrongly judge it — SC3 requires "no judge run"
+	//     unconditionally. worker_residue_blocked (issue #1783) is worker-reportable, the same
+	//     accepted spend/accuracy tradeoff as envPublishFailOrigins below.
 	//   - envPublishFailOrigins (finalize_base_align_conflict/workflow_scope_missing/
 	//     push_secret_blocked): environment-caused publish failures (issue #1418) — the run did all
 	//     its work, the environment refused the push. No agent behaviour to review, so skipped

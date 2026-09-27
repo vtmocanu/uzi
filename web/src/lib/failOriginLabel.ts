@@ -22,6 +22,7 @@ const labels: Record<string, string> = {
   forge_unreachable: "forge unreachable",
   history_rewritten: "history rewritten",
   plan_missing: "plan missing",
+  worker_residue_blocked: "worker residue blocked",
   unknown: "unknown",
 };
 
