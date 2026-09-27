@@ -194,6 +194,14 @@ func (s *Service) driveSupersession(ctx context.Context, row store.CheckpointRet
 		return false, s.recordRetentionFailure(ctx, row, retentionSuperseding,
 			"delete branch ref: "+scrubForgeError(derr.Error(), f.pat))
 	}
+	// The CAS delete reports success for "absent or advanced" too. Advanced by THIS run is not
+	// done: a terminal run's publish that passed its superseded check before step 1 and landed
+	// between steps 2 and 3 leaves the branch ref at the run's later tip, which the record does
+	// not name. Marking the record superseded would leave that ref untracked, blocking every new
+	// run on the branch. So the branch ref is listed once more.
+	if stop, err := s.branchHeldByOwnPublish(ctx, row, f, branchRef); stop || err != nil {
+		return false, err
+	}
 
 	// Step 4: superseded (a hold is open) or straight to settling (none is), one statement.
 	state, err := s.q.MarkCheckpointSuperseded(ctx, runID)
@@ -217,6 +225,40 @@ func (s *Service) driveSupersession(ctx context.Context, row store.CheckpointRet
 		return true, err
 	}
 	return true, nil
+}
+
+// branchHeldByOwnPublish is step 3's follow-up list. It reports stop when origin still advertises
+// the branch ref at the recorded tip (the delete did not take) or at runs.checkpoint_tip of THIS
+// run (the run's own later publish landed inside the supersession). The record then stays
+// superseding with last_error and a backoff: a re-drive repeats steps 2-3 harmlessly, and once no
+// hold is open the stuck exit (exitStuckSupersessionLocked) CAS-deletes the recovery ref at the
+// recorded tip and the branch ref at the run's own tip. An absent branch ref, or one at any other
+// tip (another run's publish), is done, as before. The run tip is read AFTER the list, so a publish
+// whose tip persist committed before the list is recognised.
+//
+// Residual: a publish whose ref update is visible to the list but whose runs.checkpoint_tip persist
+// has not committed yet, or one that lands after the list, is not seen here; its
+// trackPublishedCheckpoint moves no row and logs a Warn naming the run, branch and tip.
+func (s *Service) branchHeldByOwnPublish(ctx context.Context, row store.CheckpointRetention, f retentionForge, branchRef string) (stop bool, err error) {
+	tips, lerr := s.listRefTipsFn(ctx, pushbroker.ListRefsOptions{CloneURL: f.cloneURL, Username: f.username, PAT: f.pat}, branchRef)
+	if lerr != nil {
+		return true, s.recordRetentionFailure(ctx, row, retentionSuperseding, "list branch ref after delete: "+scrubForgeError(lerr.Error(), f.pat))
+	}
+	tip, ok := tips[branchRef]
+	if !ok {
+		return false, nil
+	}
+	if tip != row.Tip {
+		runTip, rerr := s.q.GetRunCheckpointTipForRetention(ctx, row.RunID)
+		if rerr != nil && !errors.Is(rerr, pgx.ErrNoRows) {
+			return true, fmt.Errorf("read run checkpoint tip: %w", rerr)
+		}
+		if !runTip.Valid || runTip.String != tip {
+			return false, nil // another run's publish: the slot left this record
+		}
+	}
+	return true, s.recordRetentionFailure(ctx, row, retentionSuperseding,
+		"branch ref still holds this run's own tip after the delete (a late publish landed); left in place")
 }
 
 // resolveMissingSource disambiguates CreateRef's ErrSourceMissing (origin does not advertise the

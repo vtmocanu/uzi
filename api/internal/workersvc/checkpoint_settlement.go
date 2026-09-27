@@ -133,8 +133,14 @@ func (s *Service) reconcileCheckpointRetentions(ctx context.Context, onlyRun pgt
 // that has no record (recordCheckpointRetention) and, when advance is set, moves the persisted
 // watermark (checkpoint_retention_meta.backfilled_through) to what the page proved
 // (backfillWatermark). The list starts 10 minutes below the watermark, so a run whose transaction
-// committed after a pass moved the watermark past its status_since is still listed.
+// committed after a pass moved the watermark past its backfill key (the later of its terminal
+// transition and its last publish) is still listed.
 func (s *Service) backfillCheckpointRetentions(ctx context.Context, onlyRun pgtype.UUID, advance bool) (int64, error) {
+	// The database clock BEFORE the list: a page that was not full proves only up to here.
+	listedAt, err := s.q.GetCheckpointRetentionBackfillNow(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("read backfill clock: %w", err)
+	}
 	page, err := s.q.ListCheckpointRetentionBackfill(ctx, store.ListCheckpointRetentionBackfillParams{
 		OnlyRunID: onlyRun, MaxRows: reconcileRetentionBatch,
 	})
@@ -160,7 +166,7 @@ func (s *Service) backfillCheckpointRetentions(ctx context.Context, onlyRun pgty
 	if !advance {
 		return progressed, nil
 	}
-	through := backfillWatermark(page, recorded, len(page) >= reconcileRetentionBatch)
+	through := backfillWatermark(page, recorded, len(page) >= reconcileRetentionBatch, listedAt)
 	if _, err := s.q.AdvanceCheckpointRetentionBackfillWatermark(ctx, through); err != nil {
 		// Not fatal: the watermark only bounds the scan; the next pass re-lists from the old one.
 		slog.Warn("sweeper: checkpoint retention backfill watermark", "error", err)
@@ -168,21 +174,22 @@ func (s *Service) backfillCheckpointRetentions(ctx context.Context, onlyRun pgty
 	return progressed, nil
 }
 
-// backfillWatermark is the watermark a backfill page proves: every candidate whose status_since is
-// below the returned instant has a record. An invalid (NULL) result means "up to now": the page was
-// not full, so it held every candidate, and each was recorded. A full page proves only up to its
-// last row's status_since (later candidates, and ties with it, were not listed); a run left
-// unrecorded caps it at that run's status_since, so a failing run is re-listed every pass and is
-// never skipped. The page is ordered by status_since.
-func backfillWatermark(page []store.ListCheckpointRetentionBackfillRow, recorded []bool, full bool) pgtype.Timestamptz {
-	var through pgtype.Timestamptz
+// backfillWatermark is the watermark a backfill page proves: every candidate whose backfill key
+// (GREATEST(status_since, checkpoint_tip_at)) is below the returned instant, and that was committed
+// when the page was listed, has a record. A page that was not full held every such candidate, so
+// it proves up to listedAt, the database clock read immediately before the list (not the later
+// moment the watermark is written). A full page proves only up to its last row's key (later
+// candidates, and ties with it, were not listed). A run left unrecorded caps it at that run's key,
+// so a failing run is re-listed every pass and is never skipped. The page is ordered by the key.
+func backfillWatermark(page []store.ListCheckpointRetentionBackfillRow, recorded []bool, full bool, listedAt pgtype.Timestamptz) pgtype.Timestamptz {
+	through := listedAt
 	if full && len(page) > 0 {
-		through = page[len(page)-1].StatusSince
+		through = page[len(page)-1].BackfillKey
 	}
 	for i, r := range page {
 		if !recorded[i] {
-			if !through.Valid || r.StatusSince.Time.Before(through.Time) {
-				through = r.StatusSince
+			if !through.Valid || r.BackfillKey.Time.Before(through.Time) {
+				through = r.BackfillKey
 			}
 			break // ordered: the first unrecorded run is the earliest
 		}

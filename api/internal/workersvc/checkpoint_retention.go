@@ -509,8 +509,15 @@ func (s *Service) terminalPublishSuperseded(ctx context.Context, runID uuid.UUID
 //     unchanged, the tip-lag advance of a retained/settling record naming the branch ref
 //     (AdvanceCheckpointRetentionTip).
 //
+// A TERMINAL run whose publish moved no row in either statement published a branch ref no record
+// tracks: its record names a recovery ref (its slot was handed to a newer run while this publish,
+// which passed terminalPublishSuperseded before the supersession began, was in flight) or it is in
+// a state neither statement moves. That ref blocks every new run on the branch unless the
+// supersession's own post-delete list or its stuck exit catches it, so a Warn names the run,
+// branch and tip for an operator.
+//
 // Best-effort: a failure is logged and the publish still reports success (the ref already moved).
-func (s *Service) trackPublishedCheckpoint(ctx context.Context, runID uuid.UUID, branch, ref, tip string) {
+func (s *Service) trackPublishedCheckpoint(ctx context.Context, runID uuid.UUID, terminal bool, branch, ref, tip string) {
 	if !s.retentionWired() {
 		return
 	}
@@ -527,9 +534,15 @@ func (s *Service) trackPublishedCheckpoint(ctx context.Context, runID uuid.UUID,
 		slog.Warn("checkpoint retention: track terminal publish", "run", runID, "tip", tip, "error", err)
 		return
 	}
-	if _, aerr := s.q.AdvanceCheckpointRetentionTip(ctx, store.AdvanceCheckpointRetentionTipParams{
+	n, aerr := s.q.AdvanceCheckpointRetentionTip(ctx, store.AdvanceCheckpointRetentionTipParams{
 		RunID: runID, Ref: ref, Tip: tip,
-	}); aerr != nil {
+	})
+	if aerr != nil {
 		slog.Warn("checkpoint retention: advance tip", "run", runID, "tip", tip, "error", aerr)
+		return
+	}
+	if terminal && n == 0 {
+		slog.Warn("checkpoint retention: a terminal run's publish is tracked by no record; the branch ref may block "+
+			"a new run on the branch until it is deleted", "run", runID, "branch", branch, "ref", ref, "tip", tip)
 	}
 }

@@ -1,10 +1,14 @@
 package workersvc
 
 import (
+	"errors"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -286,34 +290,62 @@ func TestBackfillWatermarkOverlapLiveDB(t *testing.T) {
 	}
 	w := f.e.seedWorker(t, nil)
 
+	dbNow := func() time.Time {
+		t.Helper()
+		var n time.Time
+		if err := f.e.pool.QueryRow(f.e.ctx, `SELECT now()`).Scan(&n); err != nil {
+			t.Fatalf("read db clock: %v", err)
+		}
+		return n
+	}
+
 	first, firstRef := f.seedIssueRun(t, "failed", w, 1)
-	start := time.Now()
+	before := dbNow()
 	if _, err := f.svc2.backfillCheckpointRetentions(f.e.ctx, pgconv.UUID(first), true); err != nil {
 		t.Fatalf("backfill: %v", err)
 	}
+	after := dbNow()
 	f.assertRunSettledOrSettling(t, first, firstRef)
 	wm := watermark()
-	if wm.Before(start.Add(-time.Minute)) {
-		t.Fatalf("watermark = %v, want advanced to about now (%v)", wm, start)
+	// The partial page proves up to the database clock read before the list: between the two
+	// reads around the pass.
+	if wm.Before(before) || wm.After(after) {
+		t.Fatalf("watermark = %v, want the list-time clock within [%v, %v]", wm, before, after)
 	}
 
 	// enabled_at is lowered so it is the watermark, not enabled_at, that bounds the scan below.
-	f.e.exec(t, `UPDATE checkpoint_retention_meta SET enabled_at = LEAST(enabled_at, $1)`, wm.Add(-time.Hour))
-	late, _ := f.seedIssueRun(t, "failed", w, 1)
-	f.e.exec(t, `UPDATE runs SET status_since = $2 WHERE id = $1`, late, wm.Add(-5*time.Minute))
-	if _, err := f.svc2.backfillCheckpointRetentions(f.e.ctx, pgconv.UUID(late), false); err != nil {
-		t.Fatalf("backfill: %v", err)
+	f.e.exec(t, `UPDATE checkpoint_retention_meta SET enabled_at = LEAST(enabled_at, $1)`, wm.Add(-3*time.Hour))
+	// keyAt backdates a run's terminal transition and its last publish (its backfill key is the later).
+	keyAt := func(runID uuid.UUID, statusSince, tipAt time.Time) {
+		f.e.exec(t, `UPDATE runs SET status_since = $2, checkpoint_tip_at = $3 WHERE id = $1`, runID, statusSince, tipAt)
 	}
-	if _, ok := f.record(t, late); !ok {
+	backfill := func(runID uuid.UUID) bool {
+		t.Helper()
+		if _, err := f.svc2.backfillCheckpointRetentions(f.e.ctx, pgconv.UUID(runID), false); err != nil {
+			t.Fatalf("backfill: %v", err)
+		}
+		_, ok := f.record(t, runID)
+		return ok
+	}
+
+	late, _ := f.seedIssueRun(t, "failed", w, 1)
+	keyAt(late, wm.Add(-5*time.Minute), wm.Add(-30*time.Minute))
+	if !backfill(late) {
 		t.Fatalf("a run committed late inside the overlap window was not backfilled")
 	}
 
-	old, _ := f.seedIssueRun(t, "failed", w, 1)
-	f.e.exec(t, `UPDATE runs SET status_since = $2 WHERE id = $1`, old, wm.Add(-20*time.Minute))
-	if _, err := f.svc2.backfillCheckpointRetentions(f.e.ctx, pgconv.UUID(old), false); err != nil {
-		t.Fatalf("backfill: %v", err)
+	// A terminal run whose FIRST publish came long after it went terminal (and whose publish-time
+	// record insert failed): its status_since is far below the watermark, its last publish is
+	// inside the window. It is keyed at the publish, so it is still backfilled.
+	latePublish, _ := f.seedIssueRun(t, "failed", w, 1)
+	keyAt(latePublish, wm.Add(-2*time.Hour), wm.Add(-5*time.Minute))
+	if !backfill(latePublish) {
+		t.Fatalf("a terminal run whose late first publish is inside the window was not backfilled")
 	}
-	if _, ok := f.record(t, old); ok {
+
+	old, _ := f.seedIssueRun(t, "failed", w, 1)
+	keyAt(old, wm.Add(-20*time.Minute), wm.Add(-2*time.Hour))
+	if backfill(old) {
 		t.Fatalf("a run below the watermark's overlap was scanned")
 	}
 
@@ -330,5 +362,107 @@ func (f *supersedeFix) assertRunSettledOrSettling(t *testing.T, runID uuid.UUID,
 	t.Helper()
 	if r, ok := f.record(t, runID); !ok || r.Ref != ref {
 		t.Fatalf("record = %+v (present %v), want one at %s", r, ok, ref)
+	}
+}
+
+// --- Round 2: a terminal run's publish landing inside a supersession ---------------------------
+
+// TestSupersessionLatePublishInWindowLiveDB: the OLD (terminal) run's publish passed its superseded
+// check before the supersession began and lands between the recovery-ref create (step 2) and the
+// branch delete (step 3): origin's branch ref moves to the run's later tip T2 and runs.checkpoint_tip
+// follows it. The CAS delete on T1 is a benign no-op, and the record must NOT be marked superseded
+// (that would leave T2 untracked, blocking every new run): it stays superseding with last_error.
+// The late publish's own tracker moves no row and logs a Warn. Once the hold is discarded the stuck
+// exit deletes the recovery ref at T1 and the branch ref at T2, and the new run publishes.
+func TestSupersessionLatePublishInWindowLiveDB(t *testing.T) {
+	f := newSupersedeFix(t)
+	const t2 = "5555555555555555555555555555555555555555"
+	logs := captureSlog(t)
+	var once sync.Once
+	f.forge.beforeDelete = func(ref string) {
+		if ref != f.branchRef {
+			return
+		}
+		once.Do(func() {
+			f.forge.set(f.branchRef, t2)
+			f.e.exec(t, `UPDATE runs SET checkpoint_tip = $2, checkpoint_tip_at = now() WHERE id = $1`, f.oldRun, t2)
+			f.svc2.trackPublishedCheckpoint(f.e.ctx, f.oldRun, true, f.branch, f.branchRef, t2)
+		})
+	}
+
+	res := f.publishNew(t, f.svc1)
+	if res.Published || res.Skipped != "not_descendant" {
+		t.Fatalf("new run's Publish = %+v, want the not_descendant skip (the slot still holds the old run's late tip)", res)
+	}
+	r := f.row(t)
+	if r.State != retentionSuperseding || !r.LastError.Valid || !strings.Contains(r.LastError.String, "own tip") ||
+		!time.Now().Before(r.NextAttemptAt.Time) {
+		t.Fatalf("record = {state %q last_error %v next %v}, want superseding with last_error and backoff",
+			r.State, r.LastError, r.NextAttemptAt.Time)
+	}
+	if tip, _ := f.forge.ref(f.branchRef); tip != t2 {
+		t.Fatalf("branch ref = %q, want the late tip %s", tip, t2)
+	}
+	if tip, _ := f.forge.ref(f.recoveryRef); tip != retentionTestTip {
+		t.Fatalf("recovery ref = %q, want the recorded tip %s", tip, retentionTestTip)
+	}
+	if out := logs.String(); !strings.Contains(out, "tracked by no record") || !strings.Contains(out, f.branch) ||
+		!strings.Contains(out, t2) {
+		t.Fatalf("no Warn naming the untracked publish (branch %s, tip %s):\n%s", f.branch, t2, out)
+	}
+
+	// Hold still open: the re-drive repeats steps 2-3 and stops again, never marks superseded.
+	f.e.exec(t, `UPDATE checkpoint_retentions SET next_attempt_at = now() - interval '1 second' WHERE run_id = $1`, f.oldRun)
+	f.reconcileRun(t, f.svc2, f.oldRun)
+	if r := f.row(t); r.State != retentionSuperseding {
+		t.Fatalf("record with the hold open = %q, want still superseding", r.State)
+	}
+
+	f.discardHold(t)
+	f.e.exec(t, `UPDATE checkpoint_retentions SET next_attempt_at = now() - interval '1 second' WHERE run_id = $1`, f.oldRun)
+	if n := f.reconcileRun(t, f.svc2, f.oldRun); n != 1 {
+		t.Fatalf("reconcile progressed %d, want 1 (the stuck exit)", n)
+	}
+	if r := f.row(t); r.State != "deleted" {
+		t.Fatalf("record = %q, want deleted", r.State)
+	}
+	if _, ok := f.forge.ref(f.branchRef); ok {
+		t.Fatalf("branch ref at the old run's late tip left on origin")
+	}
+	if _, ok := f.forge.ref(f.recoveryRef); ok {
+		t.Fatalf("recovery ref at the recorded tip left on origin")
+	}
+	if res := f.publishNew(t, f.svc2); !res.Published {
+		t.Fatalf("new run's Publish after the exit = %+v, want published", res)
+	}
+}
+
+// TestTrackTerminalPublishSkipsRecoveryRecordsLiveDB pins TrackTerminalCheckpointPublish's
+// `recovery_ref IS NULL` guard by calling it directly: a record that ever named a recovery ref is
+// never advanced or reopened, so no row comes back. The superseded case is also excluded by the
+// state list; the closed-after-supersession case (deleted, still naming the branch ref, recovery_ref
+// set: a tip-gone close or a stuck exit) is excluded by the recovery_ref guard alone.
+func TestTrackTerminalPublishSkipsRecoveryRecordsLiveDB(t *testing.T) {
+	for _, tc := range []struct{ name, setup string }{
+		{"superseded", `UPDATE checkpoint_retentions SET state = 'superseded', recovery_ref = $2, ref = $2 WHERE run_id = $1`},
+		{"deleted after a supersession began", `UPDATE checkpoint_retentions SET state = 'deleted', recovery_ref = $2,
+		                                          settled_at = now() WHERE run_id = $1`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSupersedeFix(t)
+			f.e.exec(t, tc.setup, f.oldRun, f.recoveryRef)
+			before := f.row(t)
+			state, err := f.e.q.TrackTerminalCheckpointPublish(f.e.ctx, store.TrackTerminalCheckpointPublishParams{
+				RunID: f.oldRun, Branch: f.branch, Ref: f.branchRef, Tip: reviewLateTip,
+			})
+			if !errors.Is(err, pgx.ErrNoRows) {
+				t.Fatalf("TrackTerminalCheckpointPublish = %q, %v; want no row (0 rows moved)", state, err)
+			}
+			after := f.row(t)
+			if after.State != before.State || after.Tip != before.Tip || after.Ref != before.Ref || !after.UpdatedAt.Time.Equal(before.UpdatedAt.Time) {
+				t.Fatalf("record moved: {state %q tip %q ref %q} -> {state %q tip %q ref %q}",
+					before.State, before.Tip, before.Ref, after.State, after.Tip, after.Ref)
+			}
+		})
 	}
 }

@@ -16,15 +16,15 @@ const advanceCheckpointRetentionBackfillWatermark = `-- name: AdvanceCheckpointR
 UPDATE checkpoint_retention_meta
 SET backfilled_through = GREATEST(
         COALESCE(backfilled_through, '-infinity'::timestamptz),
-        COALESCE($1::timestamptz, now())
+        $1::timestamptz
     )
 `
 
-// M4 backfill watermark: every backfill candidate whose status_since is below `through` has been
-// recorded (or was never a candidate). NULL through means "everything up to now": the page was
-// not full and every candidate on it was recorded. Monotonic (GREATEST), so a pass computed from
-// an older snapshot never moves the watermark back past a newer pass's proof; the 10-minute
-// overlap in ListCheckpointRetentionBackfill is what re-scans runs committed late.
+// M4 backfill watermark: `through` is what one backfill page proved: every candidate whose
+// backfill key (GREATEST(status_since, checkpoint_tip_at)) is below it and that was committed
+// when the page was listed has been recorded. Monotonic (GREATEST), so a pass computed from an
+// older snapshot never moves the watermark back past a newer pass's proof; the 10-minute overlap
+// in ListCheckpointRetentionBackfill is what re-scans candidates committed late.
 func (q *Queries) AdvanceCheckpointRetentionBackfillWatermark(ctx context.Context, through pgtype.Timestamptz) (int64, error) {
 	result, err := q.db.Exec(ctx, advanceCheckpointRetentionBackfillWatermark, through)
 	if err != nil {
@@ -143,6 +143,20 @@ func (q *Queries) GetCheckpointRetention(ctx context.Context, runID uuid.UUID) (
 		&i.SettledAt,
 	)
 	return i, err
+}
+
+const getCheckpointRetentionBackfillNow = `-- name: GetCheckpointRetentionBackfillNow :one
+SELECT now()::timestamptz AS listed_at
+`
+
+// M4 backfill: the database's clock, read immediately BEFORE a backfill page is listed. A page
+// that was not full proves the watermark only up to this instant (a candidate that became one
+// after it may be missing from the page), never up to the later moment the watermark is advanced.
+func (q *Queries) GetCheckpointRetentionBackfillNow(ctx context.Context) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, getCheckpointRetentionBackfillNow)
+	var listed_at pgtype.Timestamptz
+	err := row.Scan(&listed_at)
+	return listed_at, err
 }
 
 const getRunCheckpointTipForRetention = `-- name: GetRunCheckpointTipForRetention :one
@@ -290,18 +304,23 @@ func (q *Queries) ListCheckpointRetentionAudit(ctx context.Context, arg ListChec
 }
 
 const listCheckpointRetentionBackfill = `-- name: ListCheckpointRetentionBackfill :many
-SELECT r.id, r.kind, r.issue_iid, r.status_since
+SELECT r.id, r.kind, r.issue_iid,
+       GREATEST(r.status_since, r.checkpoint_tip_at)::timestamptz AS backfill_key
 FROM runs r
-CROSS JOIN checkpoint_retention_meta m
 WHERE r.status IN ('completed', 'failed', 'cancelled')
   AND r.checkpoint_tip IS NOT NULL
   AND r.repo_id IS NOT NULL
   AND ((r.kind = 'issue' AND r.issue_iid IS NOT NULL) OR r.kind = 'self_improve')
-  AND r.status_since >= m.enabled_at
-  AND (m.backfilled_through IS NULL OR r.status_since >= m.backfilled_through - interval '10 minutes')
+  AND r.status_since >= (SELECT m.enabled_at FROM checkpoint_retention_meta m)
+  -- The scan's lower bound, as a scalar subquery (an InitPlan) so the planner uses it as the
+  -- index condition on idx_runs_checkpoint_backfill: a join filter against the meta row would
+  -- walk the index from its start. GREATEST ignores a NULL watermark (enabled_at alone).
+  AND GREATEST(r.status_since, r.checkpoint_tip_at) >= (
+      SELECT GREATEST(m.enabled_at, m.backfilled_through - interval '10 minutes') FROM checkpoint_retention_meta m
+  )
   AND NOT EXISTS (SELECT 1 FROM checkpoint_retentions c WHERE c.run_id = r.id)
   AND ($1::uuid IS NULL OR r.id = $1::uuid)
-ORDER BY r.status_since, r.id
+ORDER BY GREATEST(r.status_since, r.checkpoint_tip_at), r.id
 LIMIT $2::int
 `
 
@@ -314,23 +333,31 @@ type ListCheckpointRetentionBackfillRow struct {
 	ID          uuid.UUID          `json:"id"`
 	Kind        string             `json:"kind"`
 	IssueIid    pgtype.Int8        `json:"issue_iid"`
-	StatusSince pgtype.Timestamptz `json:"status_since"`
+	BackfillKey pgtype.Timestamptz `json:"backfill_key"`
 }
 
 // M4 backfill: terminal runs that published a checkpoint and own a checkpoint branch (an issue
 // run with an issue iid, or a self_improve run) but have NO record: a terminal writer that
 // never calls the retention path (the sweeper's worker-loss and cap fails, the auto-stop, the
-// claim-assembly and Codex account-wait fails), or a best-effort insert that failed. Bounded to
+// claim-assembly and Codex account-wait fails), or a best-effort insert that failed (including a
+// terminal run's late first publish whose TrackTerminalCheckpointPublish failed). Bounded to
 // runs whose current status began at or after retention was enabled
 // (checkpoint_retention_meta.enabled_at), so it never reaches back to runs the old
-// delete-on-terminal path already handled, AND at or after the persisted watermark
-// (backfilled_through) less a 10-minute overlap, so a steady-state pass scans only recent
-// terminal runs (idx_runs_checkpoint_backfill) instead of every terminal run since enabled_at.
-// The overlap covers commit-order skew: status_since is the writer's transaction time, so a run
-// whose transaction committed after a pass advanced the watermark past its status_since is still
-// inside the window on the next pass. The caller derives the branch in Go (checkpointBranch),
-// records the run through the terminal-time inserts, and advances the watermark
-// (AdvanceCheckpointRetentionBackfillWatermark) from what the page proved.
+// delete-on-terminal path already handled.
+//
+// Paged by the candidate's BACKFILL KEY, GREATEST(status_since, checkpoint_tip_at): the later of
+// when the run went terminal and when it last published (GREATEST ignores a NULL
+// checkpoint_tip_at). A run becomes a candidate at its terminal transition or at its first
+// publish after it, whichever is later, and its key is that moment, so a run that first
+// publishes long after it went terminal is keyed at the publish, not left below the watermark.
+// The key never decreases (checkpoint_tip_at only moves forward, and a terminal status does not
+// change). The scan starts at the persisted watermark (backfilled_through) less a 10-minute
+// overlap and uses idx_runs_checkpoint_backfill (00260, on exactly this expression), so a
+// steady-state pass reads only recent candidates. The overlap covers commit-order skew: both
+// columns are the writer's transaction time, so a run committed after a pass advanced the
+// watermark past its key is still inside the window on the next pass. The caller derives the
+// branch in Go (checkpointBranch), records the run through the terminal-time inserts, and
+// advances the watermark (AdvanceCheckpointRetentionBackfillWatermark) from what the page proved.
 func (q *Queries) ListCheckpointRetentionBackfill(ctx context.Context, arg ListCheckpointRetentionBackfillParams) ([]ListCheckpointRetentionBackfillRow, error) {
 	rows, err := q.db.Query(ctx, listCheckpointRetentionBackfill, arg.OnlyRunID, arg.MaxRows)
 	if err != nil {
@@ -344,7 +371,7 @@ func (q *Queries) ListCheckpointRetentionBackfill(ctx context.Context, arg ListC
 			&i.ID,
 			&i.Kind,
 			&i.IssueIid,
-			&i.StatusSince,
+			&i.BackfillKey,
 		); err != nil {
 			return nil, err
 		}

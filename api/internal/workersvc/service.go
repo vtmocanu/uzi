@@ -582,6 +582,7 @@ type Store interface {
 	// PRD #1810 M4 review: the backfill's persisted watermark, the audit's custody-guarded reopen,
 	// the terminal-run publish tracker, and the stuck exit's read of the run's own latest tip.
 	AdvanceCheckpointRetentionBackfillWatermark(ctx context.Context, through pgtype.Timestamptz) (int64, error)
+	GetCheckpointRetentionBackfillNow(ctx context.Context) (pgtype.Timestamptz, error)
 	ReopenCheckpointRetentionSupersededIfHeld(ctx context.Context, arg store.ReopenCheckpointRetentionSupersededIfHeldParams) (int64, error)
 	TrackTerminalCheckpointPublish(ctx context.Context, arg store.TrackTerminalCheckpointPublishParams) (string, error)
 	GetRunCheckpointTipForRetention(ctx context.Context, runID uuid.UUID) (pgtype.Text, error)
@@ -5204,7 +5205,7 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		}
 		// PRD #1810: the run's retention record follows the ref to the tip just published
 		// (trackPublishedCheckpoint). Best-effort like the persist above.
-		s.trackPublishedCheckpoint(ctx, runID, branch, ref, tipOid)
+		s.trackPublishedCheckpoint(ctx, runID, terminalStatuses[owned.Status], branch, ref, tipOid)
 		return PublishResult{Published: true, Ref: ref}, nil
 	case errors.Is(err, pushbroker.ErrNotDescendant):
 		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, nil

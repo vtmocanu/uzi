@@ -74,9 +74,13 @@ CREATE INDEX idx_checkpoint_retentions_audit
 -- Singleton: when retention was enabled. Bounds the sweeper's later backfill (M4) of
 -- terminal runs that have no row (the best-effort insert failed) to runs that ended after
 -- this instant, so it never reaches back to runs the old delete-on-terminal path handled.
--- backfilled_through is the backfill's persisted watermark: every candidate whose status_since
--- is below it has been recorded, so a pass scans only runs at or after it (less a 10-minute
--- overlap for commit-order skew). NULL until the first unconfined pass.
+-- backfilled_through is the backfill's persisted watermark. What it guarantees: every candidate
+-- whose backfill key (GREATEST(status_since, checkpoint_tip_at)) is below it AND that was
+-- committed when the proving page was listed had a record then. A candidate whose transaction
+-- committed after that list, with a key below the watermark, is not covered by the watermark
+-- itself: a later pass scans from the watermark less a 10-minute overlap, which catches it only
+-- if it committed within 10 minutes of its key (commit-order skew). A candidate committed later
+-- than that stays unrecorded by the backfill. NULL until the first unconfined pass.
 CREATE TABLE checkpoint_retention_meta (
     id boolean PRIMARY KEY DEFAULT true CHECK (id),
     enabled_at timestamptz NOT NULL,
