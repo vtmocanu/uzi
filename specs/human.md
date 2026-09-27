@@ -816,11 +816,11 @@ Tracked as GitHub issue vtmocanu/uzi#1349; PRD at `prds/1349-recovery-custody-ha
 - At the per-owner unresolved-hold limit, new runs are not admitted, but a requeued run that still holds its own open custody is re-admitted to resume it, even past the limit, until that run alone holds the limit's worth. [AI-synced 2026-09-26, #1751]
 - An older generation's hold adopted by a same-worker resume can also be released while the resumed run is still live, on server-proven ancestry against the checkpoint (or task branch) the run published; a cross-worker predecessor stays held. [AI-synced 2026-09-26, #1751]
 
-## Feature #1810 — A failed run's checkpoint ref is retained, not deleted, while custody is open
+## Feature #1810 — A finished run's checkpoint ref is retained, not deleted, while custody is open
 
 Tracked as GitHub issue vtmocanu/uzi#1810; PRD at `prds/1810-retain-failed-run-checkpoint-ref.md`.
 
-- A failed or cancelled run's last published checkpoint ref stays on the forge while any of its custody holds is open, instead of being deleted at the terminal transition; a new run on the same branch moves it to a per-run recovery ref rather than being blocked by it, and it is deleted only once the run's last hold is released or discarded. [AI-synced 2026-09-27, #1810]
+- A finished run's last published checkpoint ref stays on the forge while any of its custody holds is open — a failed or cancelled run, but also a completed run that still has an older generation's open hold — instead of being deleted at the terminal transition; a new run on the same branch moves it to a per-run recovery ref rather than being blocked by it, and it is deleted only once the run's last hold is released or discarded. [AI-synced 2026-09-27, #1810]
 
 ## Feature #1390 — Api outage does not disturb a run on a still-live worker
 

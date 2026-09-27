@@ -84,9 +84,9 @@ write is skipped, rather than racing another writer that has since taken
 over the record.
 
 Even the lock-plus-fence pair leaves one narrow residual window (below), so
-supersession also runs a **post-settlement audit**: 10 minutes after a
-recovery ref's deletion is recorded, the sweeper re-lists that ref on origin
-and removes it if it is still there at the recorded tip and no hold has
+the sweeper also runs a **post-settlement audit** arm: 10 minutes after a
+recovery ref's deletion is recorded, it re-lists that ref on origin and
+removes it if it is still there at the recorded tip and no hold has
 reopened — closing the gap where a create landed on origin after the fence
 passed but the session was lost before the delete recorded.
 
@@ -94,7 +94,11 @@ passed but the session was lost before the delete recorded.
 
 Triggered only by a *live* run's own publish being refused `not_descendant`
 against a retained ref from a different run — a terminal run's worker has no
-path to trigger it. Under the old run's retention lock:
+path to trigger it. In practice this means an issue run whose branch (keyed
+on the issue) a later run on the same issue reuses; a self-improve run's
+checkpoint branch is keyed on its own run id (`uzi/self-improve/<run-id>`),
+so no two self-improve runs ever share a branch and supersession never
+triggers for that kind. Under the old run's retention lock:
 
 1. **persist the intent first**: `retained` → `superseding`, recording the
    recovery ref name `refs/uzi-recovery/<old-run-id>` and the expected tip,
