@@ -20,8 +20,9 @@ import (
 //     review run A at gen G collides with a re-run B (same target, same worker) claimed at G.
 //     A post stamping A's id is refused with nothing written; B's id lands.
 //   - worker ownership in the statement: a run reassigned to another worker while its claim
-//     is unreleased refuses a legacy unstamped post, both through the service and at the
-//     upsert itself (the release+reclaim-between-authorize-and-write window).
+//     is unreleased refuses a legacy unstamped post: the service refuses it at authorization
+//     (ErrRunNotFound), and the upsert itself refuses it too, which is the half that pins the
+//     in-statement worker predicate (the release+reclaim-between-authorize-and-write window).
 //   - FOR SHARE: a concurrent, not-yet-committed claim_generation bump blocks the fenced
 //     upsert; once it commits, the post re-checks the new row version and is ErrStaleClaim.
 //
@@ -182,8 +183,8 @@ func TestAdviceWorkerOwnershipFenceLiveDB(t *testing.T) {
 
 			env.exec(`UPDATE runs SET worker_id = $1 WHERE id = $2`, otherWorker, advice)
 
-			if err := lane.post(env, svc, legacy, target, AdviceClaim{}); err == nil {
-				t.Fatal("legacy post after reassignment succeeded, want a refusal")
+			if err := lane.post(env, svc, legacy, target, AdviceClaim{}); !errors.Is(err, ErrRunNotFound) {
+				t.Fatalf("legacy post after reassignment err = %v, want ErrRunNotFound (refused at authorization)", err)
 			}
 			if err := lane.upsert(env, target, userID, workerID, advice); !errors.Is(err, pgx.ErrNoRows) {
 				t.Fatalf("fenced upsert by the previous worker err = %v, want pgx.ErrNoRows (nothing written)", err)
