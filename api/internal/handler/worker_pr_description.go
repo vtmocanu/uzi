@@ -25,7 +25,10 @@ import (
 // stale_claim (claim generation not live), lock_conflict (the ack's expected_lock_version lost
 // the compare-and-swap), version_conflict (the version cannot take this transition, or the
 // request names a PR that is not the run's own), too_many_versions (stage past
-// workersvc.MaxPrDescPendingVersionsPerRun pending versions), run_terminal, repo_required.
+// workersvc.MaxPrDescPendingVersionsPerRun pending versions in the live claim generation, or
+// workersvc.MaxPrDescVersionsPerRun versions in all), run_terminal, repo_required. The service
+// checks the claim fence and the caps before it sanitizes, so a stale or capped stage is 409
+// even when its body would be 400.
 // Stage also rides the per-worker proposal limiter (429 when exhausted).
 
 // prDescWorker resolves the authenticated worker and the {id} run param, answering the

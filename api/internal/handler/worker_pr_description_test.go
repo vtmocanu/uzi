@@ -164,10 +164,33 @@ func (f *prDescFakeStore) FirstPrDescriptionMrIidForRun(_ context.Context, runID
 	return best.MrIid.Int64, nil
 }
 
-func (f *prDescFakeStore) CountPendingPrDescriptionVersionsForRun(_ context.Context, runID uuid.UUID) (int64, error) {
+func (f *prDescFakeStore) CountPendingPrDescriptionVersionsForRunGeneration(_ context.Context, a store.CountPendingPrDescriptionVersionsForRunGenerationParams) (int64, error) {
 	var n int64
 	for _, v := range f.versions {
-		if v.RunID == runID && v.State == "pending" {
+		if v.RunID == a.RunID && v.ClaimGeneration == a.ClaimGeneration && v.State == "pending" {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (f *prDescFakeStore) CountPrDescriptionVersionsForRun(_ context.Context, runID uuid.UUID) (int64, error) {
+	var n int64
+	for _, v := range f.versions {
+		if v.RunID == runID {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (f *prDescFakeStore) AbandonStalePrDescriptionVersionsForRun(_ context.Context, a store.AbandonStalePrDescriptionVersionsForRunParams) (int64, error) {
+	var n int64
+	for id, v := range f.versions {
+		if v.RunID == a.RunID && v.ClaimGeneration < a.ClaimGeneration && v.State == "pending" &&
+			(!v.MrIid.Valid || !v.RenderedRegionSha256.Valid) {
+			v.State = "abandoned"
+			f.versions[id] = v
 			n++
 		}
 	}
@@ -835,5 +858,105 @@ func TestGetRunPrDescriptionOverlay(t *testing.T) {
 	}
 	if string(got["pr_description"]) != "null" || string(got["pr_description_outcome"]) != "null" {
 		t.Fatalf("overlay error must leave both null, got %s / %s", got["pr_description"], got["pr_description_outcome"])
+	}
+}
+
+// TestWorkerPrDescriptionStageFencesBeforeSanitizing (H-A): the run/claim fence and the version
+// cap are checked before the raw fields are sanitized, so a caller that does not hold the run (or
+// a run at its cap) is refused on the fence even with a body only the sanitizer would reject (a
+// verification result outside pass|fail).
+func TestWorkerPrDescriptionStageFencesBeforeSanitizing(t *testing.T) {
+	wkr := store.Worker{ID: uuid.New(), UserID: uuid.New()}
+	st := newPrDescFakeStore()
+	runID := prDescSeedRun(st, wkr, uuid.New(), 2)
+	router := prDescTestRouter(st, wkr)
+	bad := func(gen int64) apitypes.PrDescriptionStageRequest {
+		b := prDescStageBody(gen, strings.Repeat("<", workersvc.MaxPrDescSummaryRawBytes-1)+"a")
+		b.Fields.Verification[0].Result = "ok"
+		return b
+	}
+
+	rec := prDescPost(t, router, runID, "stage", bad(1), nil)
+	if rec.Code != http.StatusConflict || prDescReason(t, rec) != "stale_claim" {
+		t.Fatalf("stale-claim stage with an invalid body = %d %s, want 409 stale_claim", rec.Code, rec.Body.String())
+	}
+	for i := 0; i < workersvc.MaxPrDescPendingVersionsPerRun; i++ {
+		if rec := prDescPost(t, router, runID, "stage", prDescStageBody(2, "x"), nil); rec.Code != http.StatusOK {
+			t.Fatalf("stage %d = %d %s", i, rec.Code, rec.Body.String())
+		}
+	}
+	rec = prDescPost(t, router, runID, "stage", bad(2), nil)
+	if rec.Code != http.StatusConflict || prDescReason(t, rec) != "too_many_versions" {
+		t.Fatalf("capped stage with an invalid body = %d %s, want 409 too_many_versions", rec.Code, rec.Body.String())
+	}
+	// A held run under its cap still validates the body: 400.
+	other := prDescSeedRun(st, wkr, uuid.New(), 2)
+	if rec := prDescPost(t, router, other, "stage", bad(2), nil); rec.Code != http.StatusBadRequest {
+		t.Fatalf("held run with an invalid body = %d %s, want 400", rec.Code, rec.Body.String())
+	}
+}
+
+// TestWorkerPrDescriptionStageCapPerGeneration (N1): pending versions left by an older claim
+// generation (a crashed attempt) do not count toward the live generation's cap; the unbound ones
+// are abandoned at stage, the bound ones stay pending for lost-ack recovery; and a per-run total
+// backstop still ends an endless reclaim loop.
+func TestWorkerPrDescriptionStageCapPerGeneration(t *testing.T) {
+	wkr := store.Worker{ID: uuid.New(), UserID: uuid.New()}
+	st := newPrDescFakeStore()
+	runID := prDescSeedRun(st, wkr, uuid.New(), 1)
+	router := prDescTestRouter(st, wkr)
+	bound := prDescStageBind(t, router, runID, 1, 70, prDescHashA)
+	for i := 1; i < workersvc.MaxPrDescPendingVersionsPerRun; i++ {
+		if rec := prDescPost(t, router, runID, "stage", prDescStageBody(1, "x"), nil); rec.Code != http.StatusOK {
+			t.Fatalf("gen-1 stage %d = %d %s", i, rec.Code, rec.Body.String())
+		}
+	}
+	if rec := prDescPost(t, router, runID, "stage", prDescStageBody(1, "x"), nil); rec.Code != http.StatusConflict {
+		t.Fatalf("gen-1 stage past the cap = %d, want 409", rec.Code)
+	}
+
+	// Reclaim: the generation advances and the new flight stages.
+	r := st.runs[runID]
+	r.ClaimGeneration = 2
+	st.runs[runID] = r
+	if rec := prDescPost(t, router, runID, "stage", prDescStageBody(2, "x"), nil); rec.Code != http.StatusOK {
+		t.Fatalf("gen-2 stage after 20 gen-1 pending = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+	var pending1, abandoned1 int
+	for _, v := range st.versions {
+		if v.ClaimGeneration != 1 {
+			continue
+		}
+		switch v.State {
+		case "pending":
+			pending1++
+		case "abandoned":
+			abandoned1++
+		}
+	}
+	if pending1 != 1 || abandoned1 != workersvc.MaxPrDescPendingVersionsPerRun-1 {
+		t.Fatalf("gen-1 versions: %d pending, %d abandoned; want only the bound one pending", pending1, abandoned1)
+	}
+	if st.versions[uuid.MustParse(bound.ID)].State != "pending" {
+		t.Fatalf("the bound gen-1 version must stay pending")
+	}
+
+	// The per-run backstop: enough versions in all refuses even a fresh generation.
+	for g := int64(3); len(st.versions) < workersvc.MaxPrDescVersionsPerRun; g++ {
+		r := st.runs[runID]
+		r.ClaimGeneration = g
+		st.runs[runID] = r
+		for i := 0; i < 10 && len(st.versions) < workersvc.MaxPrDescVersionsPerRun; i++ {
+			if rec := prDescPost(t, router, runID, "stage", prDescStageBody(g, "x"), nil); rec.Code != http.StatusOK {
+				t.Fatalf("gen-%d stage = %d %s", g, rec.Code, rec.Body.String())
+			}
+		}
+	}
+	r = st.runs[runID]
+	r.ClaimGeneration++
+	st.runs[runID] = r
+	rec := prDescPost(t, router, runID, "stage", prDescStageBody(r.ClaimGeneration, "x"), nil)
+	if rec.Code != http.StatusConflict || prDescReason(t, rec) != "too_many_versions" {
+		t.Fatalf("stage at the per-run backstop = %d %s, want 409 too_many_versions", rec.Code, rec.Body.String())
 	}
 }

@@ -69,11 +69,27 @@ WHERE run_id = @run_id AND mr_iid IS NOT NULL
 ORDER BY created_at, id
 LIMIT 1;
 
--- name: CountPendingPrDescriptionVersionsForRun :one
--- The run's pending versions (every generation). Stage refuses past a hard cap, so a looping or
--- hostile worker cannot flood the table; pending versions are kept (never auto-abandoned)
--- because lost-ack recovery matches against them.
-SELECT count(*)::bigint FROM pr_description_versions WHERE run_id = @run_id AND state = 'pending';
+-- name: CountPendingPrDescriptionVersionsForRunGeneration :one
+-- The run's pending versions staged under ONE claim generation (the live one). Stage refuses
+-- past a hard cap, so a looping or hostile worker cannot flood the table; older generations do
+-- not count (their unbound versions are abandoned at stage, their bound ones are kept for
+-- lost-ack recovery), so crashed attempts cannot lock a later one out.
+SELECT count(*)::bigint FROM pr_description_versions
+WHERE run_id = @run_id AND claim_generation = @claim_generation AND state = 'pending';
+
+-- name: CountPrDescriptionVersionsForRun :one
+-- Every version the run ever staged, in any state and generation: the per-run backstop.
+SELECT count(*)::bigint FROM pr_description_versions WHERE run_id = @run_id;
+
+-- name: AbandonStalePrDescriptionVersionsForRun :execrows
+-- At stage time, abandon the run's pending versions from OLDER claim generations that were
+-- never bound (no PR or no rendered hash): nothing was written from them, and no later flight
+-- can bind or ack them (both are generation-fenced). A BOUND older version stays pending: its
+-- forge write may have landed with the ack lost, and lost-ack recovery matches against it.
+UPDATE pr_description_versions
+SET state = 'abandoned'
+WHERE run_id = @run_id AND claim_generation < @claim_generation AND state = 'pending'
+  AND (mr_iid IS NULL OR rendered_region_sha256 IS NULL);
 
 -- name: MarkPrDescriptionVersionPublished :execrows
 UPDATE pr_description_versions

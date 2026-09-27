@@ -12,6 +12,30 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const abandonStalePrDescriptionVersionsForRun = `-- name: AbandonStalePrDescriptionVersionsForRun :execrows
+UPDATE pr_description_versions
+SET state = 'abandoned'
+WHERE run_id = $1 AND claim_generation < $2 AND state = 'pending'
+  AND (mr_iid IS NULL OR rendered_region_sha256 IS NULL)
+`
+
+type AbandonStalePrDescriptionVersionsForRunParams struct {
+	RunID           uuid.UUID `json:"run_id"`
+	ClaimGeneration int64     `json:"claim_generation"`
+}
+
+// At stage time, abandon the run's pending versions from OLDER claim generations that were
+// never bound (no PR or no rendered hash): nothing was written from them, and no later flight
+// can bind or ack them (both are generation-fenced). A BOUND older version stays pending: its
+// forge write may have landed with the ack lost, and lost-ack recovery matches against it.
+func (q *Queries) AbandonStalePrDescriptionVersionsForRun(ctx context.Context, arg AbandonStalePrDescriptionVersionsForRunParams) (int64, error) {
+	result, err := q.db.Exec(ctx, abandonStalePrDescriptionVersionsForRun, arg.RunID, arg.ClaimGeneration)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const bindPrDescriptionVersion = `-- name: BindPrDescriptionVersion :one
 UPDATE pr_description_versions
 SET mr_iid = $1::bigint, rendered_region_sha256 = $2::text
@@ -58,15 +82,34 @@ func (q *Queries) BindPrDescriptionVersion(ctx context.Context, arg BindPrDescri
 	return i, err
 }
 
-const countPendingPrDescriptionVersionsForRun = `-- name: CountPendingPrDescriptionVersionsForRun :one
-SELECT count(*)::bigint FROM pr_description_versions WHERE run_id = $1 AND state = 'pending'
+const countPendingPrDescriptionVersionsForRunGeneration = `-- name: CountPendingPrDescriptionVersionsForRunGeneration :one
+SELECT count(*)::bigint FROM pr_description_versions
+WHERE run_id = $1 AND claim_generation = $2 AND state = 'pending'
 `
 
-// The run's pending versions (every generation). Stage refuses past a hard cap, so a looping or
-// hostile worker cannot flood the table; pending versions are kept (never auto-abandoned)
-// because lost-ack recovery matches against them.
-func (q *Queries) CountPendingPrDescriptionVersionsForRun(ctx context.Context, runID uuid.UUID) (int64, error) {
-	row := q.db.QueryRow(ctx, countPendingPrDescriptionVersionsForRun, runID)
+type CountPendingPrDescriptionVersionsForRunGenerationParams struct {
+	RunID           uuid.UUID `json:"run_id"`
+	ClaimGeneration int64     `json:"claim_generation"`
+}
+
+// The run's pending versions staged under ONE claim generation (the live one). Stage refuses
+// past a hard cap, so a looping or hostile worker cannot flood the table; older generations do
+// not count (their unbound versions are abandoned at stage, their bound ones are kept for
+// lost-ack recovery), so crashed attempts cannot lock a later one out.
+func (q *Queries) CountPendingPrDescriptionVersionsForRunGeneration(ctx context.Context, arg CountPendingPrDescriptionVersionsForRunGenerationParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countPendingPrDescriptionVersionsForRunGeneration, arg.RunID, arg.ClaimGeneration)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const countPrDescriptionVersionsForRun = `-- name: CountPrDescriptionVersionsForRun :one
+SELECT count(*)::bigint FROM pr_description_versions WHERE run_id = $1
+`
+
+// Every version the run ever staged, in any state and generation: the per-run backstop.
+func (q *Queries) CountPrDescriptionVersionsForRun(ctx context.Context, runID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countPrDescriptionVersionsForRun, runID)
 	var column_1 int64
 	err := row.Scan(&column_1)
 	return column_1, err

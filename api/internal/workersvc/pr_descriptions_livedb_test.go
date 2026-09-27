@@ -492,3 +492,63 @@ func TestPrDescriptionStageCapLiveDB(t *testing.T) {
 		t.Fatalf("stored versions = %d (%v), want %d", n, err, MaxPrDescPendingVersionsPerRun)
 	}
 }
+
+// TestPrDescriptionStageCapAcrossGenerationsLiveDB (N1): 20 pending versions left by a crashed
+// generation do not lock the run out. On the reclaimed generation's stage, the old generation's
+// UNBOUND pending versions are abandoned, its BOUND one stays pending and is still recovered by
+// lost-ack recovery, and the per-run total backstop still refuses past MaxPrDescVersionsPerRun.
+func TestPrDescriptionStageCapAcrossGenerationsLiveDB(t *testing.T) {
+	p := setupPrDescLive(t)
+	lost := p.stage(t, 1, "Written by gen 1, ack lost.", nil)
+	p.bind(t, 1, lost.ID, 80, prDescLiveHashA)
+	for i := 1; i < MaxPrDescPendingVersionsPerRun; i++ {
+		p.stage(t, 1, "gen 1 attempt", nil)
+	}
+	if _, err := p.svc.StagePrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionStageRequest{
+		ClaimGeneration: gen(1), Source: "lead_only", BaseSha: "abcdef0", HeadSha: "abcdef1", TargetBranch: "main",
+	}); !errors.Is(err, ErrPrDescriptionTooManyVersions) {
+		t.Fatalf("gen-1 stage past the cap err = %v", err)
+	}
+
+	p.env.exec(`UPDATE runs SET claim_generation = 2 WHERE id = $1`, p.runID)
+	next := p.stage(t, 2, "Gen 2.", gen(80))
+
+	var pending, abandoned int
+	if err := p.env.pool.QueryRow(p.env.ctx,
+		`SELECT count(*) FILTER (WHERE state = 'pending'), count(*) FILTER (WHERE state = 'abandoned')
+		 FROM pr_description_versions WHERE run_id = $1 AND claim_generation = 1`, p.runID).Scan(&pending, &abandoned); err != nil {
+		t.Fatalf("count gen-1 versions: %v", err)
+	}
+	if pending != 1 || abandoned != MaxPrDescPendingVersionsPerRun-1 {
+		t.Fatalf("gen-1 versions: %d pending, %d abandoned; want only the bound one pending", pending, abandoned)
+	}
+	if st := p.dbVersionState(t, lost.ID); st != "pending" {
+		t.Fatalf("bound gen-1 version state = %q, want pending", st)
+	}
+
+	// Lost-ack recovery still finds the bound gen-1 version.
+	p.bind(t, 2, next.ID, 80, prDescLiveHashB)
+	observed := prDescLiveHashA
+	a, err := p.ack(2, next.ID, "published", 0, &observed)
+	if err != nil || a.RecoveredVersionID == nil || *a.RecoveredVersionID != lost.ID {
+		t.Fatalf("ack with recovery = %+v, %v; want the gen-1 version recovered", a, err)
+	}
+	if st := p.dbVersionState(t, lost.ID); st != "published" {
+		t.Fatalf("recovered gen-1 version state = %q, want published", st)
+	}
+
+	// The per-run backstop counts every version in any state and generation.
+	var total int
+	if err := p.env.pool.QueryRow(p.env.ctx, `SELECT count(*) FROM pr_description_versions WHERE run_id = $1`, p.runID).Scan(&total); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	p.env.exec(`INSERT INTO pr_description_versions (run_id, claim_generation, repo_id, fields, base_sha, head_sha, target_branch, source, state)
+		SELECT $1, 1, $2, '{}'::jsonb, 'abcdef0', 'abcdef1', 'main', 'generated', 'abandoned' FROM generate_series(1, $3::int)`,
+		p.runID, p.repo, MaxPrDescVersionsPerRun-total)
+	p.env.exec(`UPDATE runs SET claim_generation = 3 WHERE id = $1`, p.runID)
+	if _, err := p.svc.StagePrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionStageRequest{
+		ClaimGeneration: gen(3), Source: "lead_only", BaseSha: "abcdef0", HeadSha: "abcdef1", TargetBranch: "main",
+	}); !errors.Is(err, ErrPrDescriptionTooManyVersions) {
+		t.Fatalf("stage at the per-run backstop err = %v", err)
+	}
+}

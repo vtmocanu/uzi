@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"context"
 	"errors"
 	"html"
 	"regexp"
@@ -8,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 )
 
 // PR-description field limits (PRD #1798 D7 / target layout). Two kinds of bound:
@@ -48,6 +50,16 @@ const zeroWidthSpace = "\u200B"
 
 const prDescEllipsis = "…"
 
+// prDescRedacted is the text a field item is replaced with, whole, when its rendered view
+// carries a secret the literal scrub missed (the placeholder secretscrub itself writes).
+const prDescRedacted = "[redacted]"
+
+// prDescMaxPasses bounds every fixed-point loop in the sanitizer: the outer normalization loop,
+// the entity decode and the comment removal. Each pass is linear in the text, so a field costs at
+// most a constant number of linear passes; input that has not converged within the bound
+// (adversarially deep nesting or entity encoding, never real prose) sanitizes to "".
+const prDescMaxPasses = 8
+
 var (
 	// HTML comments, including an unterminated opener that runs to the end of the text.
 	prDescHTMLComment      = regexp.MustCompile(`(?s)<!--.*?-->`)
@@ -56,20 +68,23 @@ var (
 	// `![alt][]` and shortcut `![alt]`. The whole image goes, alt text included.
 	prDescImage = regexp.MustCompile(`!\[[^\]]*\](?:\([^)]*\)|\[[^\]]*\])?`)
 	// Markdown links keep their text and lose their target (inline, full and collapsed).
-	prDescLinkInline = regexp.MustCompile(`\[([^\]]*)\]\([^)]*\)`)
-	prDescLinkRef    = regexp.MustCompile(`\[([^\]]*)\]\[[^\]]*\]`)
+	// A label holding a backslash is left for the bracket escape (it neutralises it either way),
+	// so an already-escaped `\[x\](y)` is not re-read as a link on a second pass.
+	prDescLinkInline = regexp.MustCompile(`\[([^\]\\]*)\]\([^)]*\)`)
+	prDescLinkRef    = regexp.MustCompile(`\[([^\]\\]*)\]\[[^\]]*\]`)
 	// A reference definition `[label]: target`, ANYWHERE and with any whitespace (newlines
 	// included) between the colon and the target, so a definition split across lines goes too.
 	// Remaining brackets are escaped later, so no definition or shortcut reference can form in
 	// the output either way.
-	prDescLinkDef = regexp.MustCompile(`\[[^\]]+\]:[\s\p{Z}]*\S*`)
+	prDescLinkDef = regexp.MustCompile(`\[[^\]\\]+\]:[\s\p{Z}]*\S*`)
 	// Angle-bracket autolinks become the bare URL text.
 	prDescAutolink = regexp.MustCompile(`<((?i:https?|ftp)://[^\s<>]+)>`)
 	// Anything tag-shaped: an element, a closing tag, a declaration or a processing instruction.
 	prDescTag = regexp.MustCompile(`<[/!?]?[A-Za-z][^<>]*>`)
 	// A `<` that could still open markup once a later `>` arrives (the renderer's own markers
-	// follow the region), so it is dropped.
-	prDescOpenAngle = regexp.MustCompile(`<([/!?A-Za-z])`)
+	// follow the region), so it is dropped: a whole run of `<` in one match, so `<<<<a` costs
+	// one pass, not one per `<`. A `<` before a space, digit or `=` is not tag-like and stays.
+	prDescOpenAngle = regexp.MustCompile(`<+([/!?A-Za-z])`)
 	// Comment delimiters that survived everything above (`a ----> b`, `--!>`) fold to `->`.
 	prDescCommentClose = regexp.MustCompile(`-{2,}!?>`)
 	prDescCommentOpen  = regexp.MustCompile(`<!-{2,}`)
@@ -79,10 +94,6 @@ var (
 	prDescFenceRun = regexp.MustCompile("`{3,}|~{3,}")
 	// A leading ordered-list marker `12.` / `12)`: group 1 is the delimiter to escape.
 	prDescLeadingOrdered = regexp.MustCompile(`^\d{1,9}([.)])`)
-
-	// A mention: `@` at the start or after a non-word character, followed by a handle character.
-	// `a@b.com` is not a mention (the `@` follows a word character) and stays as written.
-	prDescMention = regexp.MustCompile(`(^|[^A-Za-z0-9_])@([A-Za-z0-9_-])`)
 
 	// Closing directives, the GitLab-superset pattern (approver point 4) widened to err on the
 	// side of neutralising: every GitLab default keyword form (a superset of GitHub's and
@@ -105,8 +116,8 @@ const prDescClosingMarkers = "*_~`[]\\"
 // string safe to publish inside uzi's description region (PRD #1798 D7), bounded to maxBytes
 // bytes. The api's result is the ONLY text the renderer may publish. Steps, in order:
 //
-//  1. To a fixed point (loop until nothing changes, at most 2*len(s)+8 passes over the
-//     byte-capped input; if that bound is hit the result is "", fail closed): HTML entities are decoded
+//  1. To a fixed point (loop until nothing changes, at most prDescMaxPasses passes, each linear;
+//     if that bound is hit the result is "", fail closed): HTML entities are decoded
 //     to their own fixed point, control / bidi / format runes are stripped and secret shapes
 //     scrubbed (ScrubUntrustedText), markup is removed (stripPrDescMarkup), and whitespace
 //     (newlines included) collapses to single spaces. Running the scrub on every pass means a
@@ -114,15 +125,19 @@ const prDescClosingMarkers = "*_~`[]\\"
 //     running the decode on every pass means an entity re-formed by a removal
 //     (`&<b></b>#64;`) is decoded and then handled like the character it renders as. The loop
 //     only ends on a pass that changed nothing, so its result has no entity left that
-//     html.UnescapeString would decode.
+//     html.UnescapeString would decode. Then the RENDERED view is checked for secrets
+//     (prDescRenderedSecret): a token split by inline markdown (`*`, `~`, a code span, a
+//     backslash escape) re-joins when rendered, so if that view carries a secret the whole
+//     field becomes "[redacted]".
 //  2. The text is cut to fit maxBytes (rune-safe, "…" marks a cut), with headroom re-measured
 //     after step 3 until the final text fits.
 //  3. Markdown block syntax is neutralised with backslash escapes: a leading `#`, `>`, `|`,
 //     `=`, fence, list or ordered-list marker, every code-fence run of three or more backticks
 //     or tildes, every `[` / `]` (no link, image, reference or definition can form), and a
-//     trailing odd backslash. Closing directives are neutralised by a zero-width space after
-//     the keyword's first letter, and mentions by one after the `@`. These run on the CUT
-//     text, so a breaker is never cut off a keyword that still has its reference.
+//     trailing odd backslash, and a leading `/` (a GitLab quick action). Closing directives are
+//     neutralised by a zero-width space after the keyword's first letter, and mentions by one
+//     after the `@` (breakMentions). These run on the CUT text, so a breaker is never cut off a
+//     keyword that still has its reference.
 //
 // Each field is meant to be one paragraph or one list item, so model text is kept from adding
 // headings, quotes, lists, code blocks or sections of its own. The tests
@@ -133,6 +148,9 @@ func SanitizePrDescriptionText(s string, maxBytes int) string {
 	s, ok := prDescNormalize(s)
 	if !ok || maxBytes <= 0 {
 		return ""
+	}
+	if prDescRenderedSecret(s) {
+		s = prDescRedacted
 	}
 	budget := maxBytes
 	for budget > 0 {
@@ -146,10 +164,9 @@ func SanitizePrDescriptionText(s string, maxBytes int) string {
 }
 
 // prDescNormalize runs step 1 of SanitizePrDescriptionText to its fixed point. It reports false
-// when the pass bound is exhausted without converging.
+// when prDescMaxPasses passes did not converge.
 func prDescNormalize(s string) (string, bool) {
-	limit := 2*len(s) + 8
-	for i := 0; i < limit; i++ {
+	for i := 0; i < prDescMaxPasses; i++ {
 		prev := s
 		s = decodePrDescEntities(s)
 		s = ScrubUntrustedText(s)
@@ -162,10 +179,11 @@ func prDescNormalize(s string) (string, bool) {
 	return "", false
 }
 
-// decodePrDescEntities decodes HTML entities until the text stops changing, within len(s)+1
-// passes (the caller's outer loop repeats it if the bound ever cut it short).
+// decodePrDescEntities decodes HTML entities until the text stops changing, within
+// prDescMaxPasses passes (the caller's outer loop repeats it if the bound ever cut it short, and
+// fails closed if that loop does not converge either).
 func decodePrDescEntities(s string) string {
-	for i := 0; i <= len(s); i++ {
+	for i := 0; i < prDescMaxPasses && strings.Contains(s, "&"); i++ {
 		u := html.UnescapeString(s)
 		if u == s {
 			return s
@@ -179,22 +197,62 @@ func decodePrDescEntities(s string) string {
 // caller loops to the fixed point (a removal can expose a new instance of an earlier rule:
 // `<!<!---->--` becomes `<!--`).
 func stripPrDescMarkup(s string) string {
-	// Terminated comments first, to their own fixed point, so a comment exposed by removing
-	// another (`<!<!---->-- x -->`) is removed as a comment rather than read as unterminated.
-	// Each pass that changes the text shortens it, so the loop ends.
-	for next := prDescHTMLComment.ReplaceAllString(s, ""); next != s; next = prDescHTMLComment.ReplaceAllString(s, "") {
-		s = next
+	// Each rule runs only when the text holds a substring every one of its matches needs, so a
+	// field pays only for the markup it carries.
+	if strings.Contains(s, "<!--") {
+		// Terminated comments first, to their own fixed point (within prDescMaxPasses passes), so
+		// a comment exposed by removing another (`<!<!---->-- x -->`) is removed as a comment
+		// rather than read as unterminated. Past the bound, the unterminated rule below removes
+		// from the first surviving `<!--` to the end: more text goes, never less.
+		for i := 0; i < prDescMaxPasses; i++ {
+			next := prDescHTMLComment.ReplaceAllString(s, "")
+			if next == s {
+				break
+			}
+			s = next
+		}
+		s = prDescUnterminatedCmnt.ReplaceAllString(s, "")
 	}
-	s = prDescUnterminatedCmnt.ReplaceAllString(s, "")
-	s = prDescImage.ReplaceAllString(s, "")
-	s = prDescLinkInline.ReplaceAllString(s, "$1")
-	s = prDescLinkRef.ReplaceAllString(s, "$1")
-	s = prDescLinkDef.ReplaceAllString(s, "")
-	s = prDescAutolink.ReplaceAllString(s, "$1")
-	s = prDescTag.ReplaceAllString(s, "")
-	s = prDescOpenAngle.ReplaceAllString(s, "$1")
-	s = prDescCommentOpen.ReplaceAllString(s, "")
-	return prDescCommentClose.ReplaceAllString(s, "->")
+	if strings.Contains(s, "[") {
+		s = prDescImage.ReplaceAllString(s, "")
+		s = prDescLinkInline.ReplaceAllString(s, "$1")
+		s = prDescLinkRef.ReplaceAllString(s, "$1")
+		s = prDescLinkDef.ReplaceAllString(s, "")
+	}
+	if strings.Contains(s, "<") {
+		s = prDescAutolink.ReplaceAllString(s, "$1")
+		s = prDescTag.ReplaceAllString(s, "")
+		s = prDescOpenAngle.ReplaceAllString(s, "$1")
+		s = prDescCommentOpen.ReplaceAllString(s, "")
+	}
+	if strings.Contains(s, "--") {
+		s = prDescCommentClose.ReplaceAllString(s, "->")
+	}
+	return s
+}
+
+// prDescRenderedSecret reports whether a secret appears in the text as a markdown renderer shows
+// it, where the literal scrub (already applied) did not see one. s has no format rune left (the
+// scrub's termsafe pass strips Cf, U+200B included). Two views: backslash escapes resolved
+// (`\_` renders `_`, `\-` renders `-`), and additionally the inline emphasis, strikethrough and
+// code-span markers `*`, `~` and a backtick removed (`A*B*C` renders the letters ABC side by
+// side). `_` is kept in the second view: CommonMark never reads an intraword `_` as emphasis, and removing it would join
+// unrelated identifiers into false secret shapes.
+func prDescRenderedSecret(s string) bool {
+	view := func(drop string) string {
+		return strings.Map(func(r rune) rune {
+			if strings.ContainsRune(drop, r) {
+				return -1
+			}
+			return r
+		}, s)
+	}
+	for _, v := range []string{view("\\"), view("\\*~`")} {
+		if secretscrub.Scrub(v) != v {
+			return true
+		}
+	}
+	return false
 }
 
 // finalizePrDescText applies step 3: block-syntax escapes, then closing-directive and mention
@@ -268,10 +326,13 @@ func escapePrDescMarkdown(s string) string {
 // prDescLeadingBlockToken reports whether s opens with a character that starts a markdown block
 // at the start of a line: an ATX heading, a block quote, a table row, a setext underline, a
 // `-`/`+` list marker or thematic break, or a `*`/`_` list marker or thematic break (a leading
-// `**bold**` is left alone). A leading code fence is a fence run, escaped wherever it appears.
+// `**bold**` is left alone), or a `/` that GitLab reads as a quick action (`/close`, `/merge`).
+// A leading code fence is a fence run, escaped wherever it appears. Only the field's first
+// character needs this: whitespace (newlines included) collapses to single spaces in step 1, so
+// no other character of a field starts a line; the renderer places each field at a line start.
 func prDescLeadingBlockToken(s string) bool {
 	switch s[0] {
-	case '#', '>', '|', '=', '-', '+':
+	case '#', '>', '|', '=', '-', '+', '/':
 		return true
 	case '*', '_':
 		if len(s) == 1 || s[1] == ' ' {
@@ -324,19 +385,33 @@ func neutralizeClosingDirectives(s string) string {
 	return b.String()
 }
 
-// breakMentions inserts a zero-width space after every mention `@`, leaving emails intact.
+// breakMentions inserts a zero-width space after every `@` that is not preceded by an ASCII
+// letter or digit, whatever follows it (`_@alice_`, `@\_alice`, `@.bob`), except an `@` that
+// ends the text or is followed by a space. The step is idempotent because step 1 strips every
+// breaker (a Cf rune) before this re-inserts them. An email (`a_b@x.com`, `first.last@example.org`) keeps its `@` as written: a
+// letter or digit precedes it, and no forge reads that as a mention.
 func breakMentions(s string) string {
-	// ReplaceAll cannot see overlapping matches (`@a @b` shares no char, but `(@@x` would), so
-	// it loops; the inserted breaker is not a handle character, so a broken mention never
-	// re-matches and the loop ends.
-	for i := 0; i < 4; i++ {
-		next := prDescMention.ReplaceAllString(s, "${1}@"+zeroWidthSpace+"${2}")
-		if next == s {
-			break
-		}
-		s = next
+	if !strings.Contains(s, "@") {
+		return s
 	}
-	return s
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for i := 0; i < len(s); i++ {
+		b.WriteByte(s[i])
+		if s[i] != '@' || (i > 0 && isASCIIAlnum(s[i-1])) {
+			continue
+		}
+		rest := s[i+1:]
+		if rest == "" || rest[0] == ' ' {
+			continue
+		}
+		b.WriteString(zeroWidthSpace)
+	}
+	return b.String()
+}
+
+func isASCIIAlnum(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
 }
 
 // SanitizePrDescriptionFields validates the raw fields a worker posts and returns the sanitized,
@@ -344,8 +419,9 @@ func breakMentions(s string) string {
 // cap, an unknown scope-note kind, a verification result other than pass|fail, or a
 // verified_at_sha that is not 7-64 hex characters is ErrPrDescriptionInvalid. Entries that are
 // empty after sanitization are dropped; lists longer than their layout cap keep their first
-// entries. The returned slices are never nil.
-func SanitizePrDescriptionFields(in apitypes.PrDescriptionFields) (apitypes.PrDescriptionFields, error) {
+// entries. The returned slices are never nil. ctx is checked between fields: a cancelled request
+// stops sanitizing and returns ctx.Err().
+func SanitizePrDescriptionFields(ctx context.Context, in apitypes.PrDescriptionFields) (apitypes.PrDescriptionFields, error) {
 	out := apitypes.PrDescriptionFields{
 		Changes:        []string{},
 		ScopeNotes:     []apitypes.PrDescriptionScopeNote{},
@@ -359,18 +435,24 @@ func SanitizePrDescriptionFields(in apitypes.PrDescriptionFields) (apitypes.PrDe
 		len(in.ReviewPointers) > MaxPrDescListRawEntries || len(in.Verification) > MaxPrDescListRawEntries {
 		return out, ErrPrDescriptionInvalid
 	}
+	if err := ctx.Err(); err != nil {
+		return out, err
+	}
 	out.Summary = SanitizePrDescriptionText(in.Summary, PrDescSummaryMaxBytes)
 
 	var err error
-	if out.Changes, err = sanitizePrDescList(in.Changes, PrDescMaxChanges); err != nil {
+	if out.Changes, err = sanitizePrDescList(ctx, in.Changes, PrDescMaxChanges); err != nil {
 		return out, err
 	}
-	if out.ReviewPointers, err = sanitizePrDescList(in.ReviewPointers, PrDescMaxReviewPointers); err != nil {
+	if out.ReviewPointers, err = sanitizePrDescList(ctx, in.ReviewPointers, PrDescMaxReviewPointers); err != nil {
 		return out, err
 	}
 	for _, n := range in.ScopeNotes {
 		if !validPrDescScopeKinds[n.Kind] || len(n.Text) > MaxPrDescItemRawBytes {
 			return out, ErrPrDescriptionInvalid
+		}
+		if err := ctx.Err(); err != nil {
+			return out, err
 		}
 		text := SanitizePrDescriptionText(n.Text, PrDescItemMaxBytes)
 		if text == "" || len(out.ScopeNotes) >= PrDescMaxScopeNotes {
@@ -383,6 +465,9 @@ func SanitizePrDescriptionFields(in apitypes.PrDescriptionFields) (apitypes.PrDe
 			!prDescHexSHA.MatchString(v.VerifiedAtSha) {
 			return out, ErrPrDescriptionInvalid
 		}
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
 		cmd := SanitizePrDescriptionText(v.Command, PrDescVerifyCommandMaxBytes)
 		if cmd == "" || len(out.Verification) >= PrDescMaxVerification {
 			continue
@@ -394,11 +479,14 @@ func SanitizePrDescriptionFields(in apitypes.PrDescriptionFields) (apitypes.PrDe
 	return out, nil
 }
 
-func sanitizePrDescList(items []string, maxEntries int) ([]string, error) {
+func sanitizePrDescList(ctx context.Context, items []string, maxEntries int) ([]string, error) {
 	out := []string{}
 	for _, it := range items {
 		if len(it) > MaxPrDescItemRawBytes {
 			return out, ErrPrDescriptionInvalid
+		}
+		if err := ctx.Err(); err != nil {
+			return out, err
 		}
 		text := SanitizePrDescriptionText(it, PrDescItemMaxBytes)
 		if text == "" || len(out) >= maxEntries {

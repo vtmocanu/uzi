@@ -43,11 +43,15 @@ const (
 	maxPrDescTargetBranchBytes = 255
 	maxPrDescSizeLines         = int64(1) << 40
 
-	// MaxPrDescPendingVersionsPerRun caps a run's pending versions (every generation). A normal
-	// publication stages once, plus at most one D11 regeneration; a stage past the cap is 409
-	// too_many_versions. Pending versions are never auto-abandoned: lost-ack recovery matches
-	// against them.
+	// MaxPrDescPendingVersionsPerRun caps a run's pending versions staged under its LIVE claim
+	// generation. A normal publication stages once, plus at most one D11 regeneration; a stage
+	// past the cap is 409 too_many_versions. Older generations do not count: at stage their
+	// unbound pending versions are abandoned, and their BOUND pending versions stay pending
+	// (lost-ack recovery matches against them), so crashed attempts cannot lock a run out.
 	MaxPrDescPendingVersionsPerRun = 20
+	// MaxPrDescVersionsPerRun is the per-run backstop over every version in any state and
+	// generation (a run reclaimed over and over): a stage at it is 409 too_many_versions.
+	MaxPrDescVersionsPerRun = 200
 )
 
 var validPrDescSources = map[string]bool{"generated": true, "lead_only": true, prDescSourceDeterministic: true}
@@ -74,7 +78,8 @@ var (
 	// version_conflict.
 	ErrPrDescriptionVersionConflict = errors.New("pr description: version state does not allow this")
 	// ErrPrDescriptionTooManyVersions: the run already holds MaxPrDescPendingVersionsPerRun
-	// pending versions → 409 reason too_many_versions.
+	// pending versions in its live generation, or MaxPrDescVersionsPerRun versions in all →
+	// 409 reason too_many_versions.
 	ErrPrDescriptionTooManyVersions = errors.New("pr description: too many pending versions for this run")
 	// ErrPrDescriptionVersionNotFound: no such version for this run → 404.
 	ErrPrDescriptionVersionNotFound = errors.New("pr description: version not found for this run")
@@ -99,7 +104,9 @@ type PrDescQueries interface {
 	SetPrDescriptionOutcome(ctx context.Context, arg store.SetPrDescriptionOutcomeParams) (int64, error)
 	RecoverPrDescriptionLostAck(ctx context.Context, arg store.RecoverPrDescriptionLostAckParams) (int64, error)
 	FirstPrDescriptionMrIidForRun(ctx context.Context, runID uuid.UUID) (int64, error)
-	CountPendingPrDescriptionVersionsForRun(ctx context.Context, runID uuid.UUID) (int64, error)
+	CountPendingPrDescriptionVersionsForRunGeneration(ctx context.Context, arg store.CountPendingPrDescriptionVersionsForRunGenerationParams) (int64, error)
+	CountPrDescriptionVersionsForRun(ctx context.Context, runID uuid.UUID) (int64, error)
+	AbandonStalePrDescriptionVersionsForRun(ctx context.Context, arg store.AbandonStalePrDescriptionVersionsForRunParams) (int64, error)
 }
 
 // PrDescTx is one open PR-description transaction.
@@ -234,6 +241,12 @@ func validPrDescSize(sz *apitypes.PrDescriptionSize) bool {
 // must be the run's own. When runs.mr_iid is set (an mr_rework run, or a run whose completion
 // recorded its PR) it must equal that; and once the run has a version naming a PR, every later
 // version names the same PR.
+//
+// First bind unverified; pinned thereafter. While runs.mr_iid is NULL (an issue run whose PR
+// the worker has just opened), the FIRST stage-with-mr_iid or bind may name any PR number in
+// the run's repo: the api cannot check it, because only the worker (holding the forge PAT)
+// learns the PR iid from the forge. From then on every stage and bind of the run is pinned to
+// that PR.
 func checkPrDescRunPR(ctx context.Context, q PrDescQueries, run store.Run, mrIid int64) error {
 	if run.MrIid.Valid && run.MrIid.Int64 != mrIid {
 		return ErrPrDescriptionVersionConflict
@@ -253,8 +266,13 @@ func checkPrDescRunPR(ctx context.Context, q PrDescQueries, run store.Run, mrIid
 // StagePrDescription validates and sanitizes the worker's RAW fields, then stores a pending
 // version for the run's snapshot (D9 step 1). The returned version's Fields are the sanitized
 // fields: the only text the renderer may publish. An mr_iid, when sent, must be the run's own PR
-// (checkPrDescRunPR); a run already holding MaxPrDescPendingVersionsPerRun pending versions is
-// refused (ErrPrDescriptionTooManyVersions).
+// (checkPrDescRunPR); a run at a version cap is refused (ErrPrDescriptionTooManyVersions, see
+// checkPrDescStageCaps).
+//
+// The run/claim/worker fence and the caps are checked BEFORE the fields are sanitized, in a short
+// transaction of their own (its only write is checkPrDescStageCaps' abandonment of stale unbound
+// versions), so a caller that does not hold the run, or a run at its cap, cannot spend the
+// sanitizer's CPU; the write transaction then re-checks both under the run row lock.
 func (s *Service) StagePrDescription(ctx context.Context, wkr store.Worker, runID uuid.UUID, req apitypes.PrDescriptionStageRequest) (apitypes.PrDescriptionVersionDTO, error) {
 	if req.ClaimGeneration == nil || !validPrDescSources[req.Source] || !validPrDescSize(req.Size) {
 		return apitypes.PrDescriptionVersionDTO{}, ErrPrDescriptionInvalid
@@ -268,13 +286,35 @@ func (s *Service) StagePrDescription(ctx context.Context, wkr store.Worker, runI
 	if !okBase || !okHead || !okTarget {
 		return apitypes.PrDescriptionVersionDTO{}, ErrPrDescriptionInvalid
 	}
-	fields, err := SanitizePrDescriptionFields(req.Fields)
-	if err != nil {
+	// fence is the run/claim/worker check, the mr_iid check and the caps, applied twice: once
+	// before sanitizing and again inside the write transaction.
+	fence := func(q PrDescQueries) (store.Run, error) {
+		run, err := lockPrDescRun(ctx, q, wkr, runID, *req.ClaimGeneration)
+		if err != nil {
+			return run, err
+		}
+		if req.MrIid != nil {
+			if err := checkPrDescRunPR(ctx, q, run, *req.MrIid); err != nil {
+				return run, err
+			}
+		}
+		return run, checkPrDescStageCaps(ctx, q, run)
+	}
+	if err := s.withPrDescTx(ctx, func(q PrDescQueries) error {
+		_, err := fence(q)
+		return err
+	}); err != nil {
 		return apitypes.PrDescriptionVersionDTO{}, err
 	}
+
+	raw := req.Fields
 	if req.Source == prDescSourceDeterministic {
 		// D8 rung 3: no model or lead text at all, whatever the worker sent.
-		fields, _ = SanitizePrDescriptionFields(apitypes.PrDescriptionFields{})
+		raw = apitypes.PrDescriptionFields{}
+	}
+	fields, err := SanitizePrDescriptionFields(ctx, raw)
+	if err != nil {
+		return apitypes.PrDescriptionVersionDTO{}, err
 	}
 	fieldsJSON, err := json.Marshal(fields)
 	if err != nil {
@@ -293,22 +333,9 @@ func (s *Service) StagePrDescription(ctx context.Context, wkr store.Worker, runI
 
 	var out store.PrDescriptionVersion
 	err = s.withPrDescTx(ctx, func(q PrDescQueries) error {
-		run, err := lockPrDescRun(ctx, q, wkr, runID, *req.ClaimGeneration)
+		run, err := fence(q)
 		if err != nil {
 			return err
-		}
-		if req.MrIid != nil {
-			if err := checkPrDescRunPR(ctx, q, run, *req.MrIid); err != nil {
-				return err
-			}
-		}
-		// The count is read after lockPrDescRun has row-locked the run (FOR UPDATE).
-		pending, err := q.CountPendingPrDescriptionVersionsForRun(ctx, run.ID)
-		if err != nil {
-			return err
-		}
-		if pending >= MaxPrDescPendingVersionsPerRun {
-			return ErrPrDescriptionTooManyVersions
 		}
 		out, err = q.InsertPrDescriptionVersion(ctx, store.InsertPrDescriptionVersionParams{
 			RunID: run.ID, ClaimGeneration: run.ClaimGeneration, RepoID: uuid.UUID(run.RepoID.Bytes),
@@ -321,6 +348,36 @@ func (s *Service) StagePrDescription(ctx context.Context, wkr store.Worker, runI
 		return apitypes.PrDescriptionVersionDTO{}, err
 	}
 	return prDescVersionDTO(out), nil
+}
+
+// checkPrDescStageCaps runs under the run row lock (lockPrDescRun). It first abandons the run's
+// UNBOUND pending versions from older claim generations (nothing was written from them, and no
+// later flight can bind or ack them); bound ones stay pending for lost-ack recovery. It then
+// refuses a stage when the live generation already holds MaxPrDescPendingVersionsPerRun pending
+// versions, or the run holds MaxPrDescVersionsPerRun versions in all.
+func checkPrDescStageCaps(ctx context.Context, q PrDescQueries, run store.Run) error {
+	if _, err := q.AbandonStalePrDescriptionVersionsForRun(ctx, store.AbandonStalePrDescriptionVersionsForRunParams{
+		RunID: run.ID, ClaimGeneration: run.ClaimGeneration,
+	}); err != nil {
+		return err
+	}
+	pending, err := q.CountPendingPrDescriptionVersionsForRunGeneration(ctx, store.CountPendingPrDescriptionVersionsForRunGenerationParams{
+		RunID: run.ID, ClaimGeneration: run.ClaimGeneration,
+	})
+	if err != nil {
+		return err
+	}
+	if pending >= MaxPrDescPendingVersionsPerRun {
+		return ErrPrDescriptionTooManyVersions
+	}
+	total, err := q.CountPrDescriptionVersionsForRun(ctx, run.ID)
+	if err != nil {
+		return err
+	}
+	if total >= MaxPrDescVersionsPerRun {
+		return ErrPrDescriptionTooManyVersions
+	}
+	return nil
 }
 
 // BindPrDescription binds the run's pending version to its PR and records the rendered region

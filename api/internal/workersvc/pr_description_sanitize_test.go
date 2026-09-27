@@ -1,10 +1,12 @@
 package workersvc
 
 import (
+	"context"
 	"errors"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -159,6 +161,10 @@ func TestSanitizePrDescriptionIdempotent(t *testing.T) {
 		"> quote [r]: https://x.test and ![r] then [r]",
 		"*** ",
 		"a ------------> b <!-- c",
+		"[]:x",
+		"[a\\](b) and [c\\][d]",
+		"/close",
+		"Map<string, int> and x < y and a <= b",
 	}
 	for _, in := range inputs {
 		once := SanitizePrDescriptionText(in, 600)
@@ -386,7 +392,7 @@ func TestSanitizePrDescriptionScrubsSecrets(t *testing.T) {
 		if strings.Contains(got, body) {
 			t.Errorf("secret body survived sanitization: %q", got)
 		}
-		fields, err := SanitizePrDescriptionFields(apitypes.PrDescriptionFields{
+		fields, err := SanitizePrDescriptionFields(context.Background(), apitypes.PrDescriptionFields{
 			Summary:      "uses " + secret,
 			Changes:      []string{"set " + secret},
 			Verification: []apitypes.PrDescriptionVerification{{Command: "curl -H " + secret, Result: "pass", VerifiedAtSha: "abcdef1"}},
@@ -413,7 +419,7 @@ func TestSanitizePrDescriptionFieldsLimitsAndValidation(t *testing.T) {
 		},
 		Verification: []apitypes.PrDescriptionVerification{{Command: "task gate:api", Result: "pass", VerifiedAtSha: "ABCDEF1234567"}},
 	}
-	out, err := SanitizePrDescriptionFields(in)
+	out, err := SanitizePrDescriptionFields(context.Background(), in)
 	if err != nil {
 		t.Fatalf("sanitize: %v", err)
 	}
@@ -433,7 +439,7 @@ func TestSanitizePrDescriptionFieldsLimitsAndValidation(t *testing.T) {
 		t.Errorf("summary closing directive survived: %q", out.Summary)
 	}
 
-	empty, err := SanitizePrDescriptionFields(apitypes.PrDescriptionFields{})
+	empty, err := SanitizePrDescriptionFields(context.Background(), apitypes.PrDescriptionFields{})
 	if err != nil || empty.Changes == nil || empty.ScopeNotes == nil || empty.ReviewPointers == nil || empty.Verification == nil {
 		t.Fatalf("empty fields must sanitize to non-nil slices, got %+v err=%v", empty, err)
 	}
@@ -451,7 +457,7 @@ func TestSanitizePrDescriptionFieldsLimitsAndValidation(t *testing.T) {
 		{"non-hex sha", apitypes.PrDescriptionFields{Verification: []apitypes.PrDescriptionVerification{{Command: "c", Result: "fail", VerifiedAtSha: "zzzzzzz"}}}},
 	}
 	for _, c := range bad {
-		if _, err := SanitizePrDescriptionFields(c.f); !errors.Is(err, ErrPrDescriptionInvalid) {
+		if _, err := SanitizePrDescriptionFields(context.Background(), c.f); !errors.Is(err, ErrPrDescriptionInvalid) {
 			t.Errorf("%s: err = %v, want ErrPrDescriptionInvalid", c.name, err)
 		}
 	}
@@ -482,5 +488,204 @@ func assertPrDescInert(t *testing.T, s string) {
 		} else {
 			backslashes = 0
 		}
+	}
+}
+
+// prDescAdversarial returns worst-case sanitizer inputs of exactly n bytes: shapes that made a
+// fixed-point pass remove one character at a time (quadratic in the field), and deep nesting of
+// comments and entities.
+func prDescAdversarial(n int) []string {
+	fill := func(unit string, tail string) string {
+		body := strings.Repeat(unit, (n-len(tail))/len(unit)+1)[:n-len(tail)]
+		return body + tail
+	}
+	return []string{
+		strings.Repeat("<", n-1) + "a",
+		"</" + strings.Repeat("<", n-3) + "/",
+		strings.Repeat("[", n),
+		fill("&amp;", ""),
+		"&" + fill("amp;", "lt;")[1:],
+		fill("*_", ""),
+		fill("<!", "---->"),
+		fill("<!--", ""),
+		fill("<a", ">"),
+		fill("[x](", ""),
+		fill("![", ""),
+		fill("@_", ""),
+		fill("Fixes #1 ", ""),
+	}
+}
+
+// prDescFullBody is a stage body at every raw cap: the summary, and every list at its entry cap
+// with every entry at the item cap, entries drawn from items in rotation.
+func prDescFullBody(summary string, items []string) apitypes.PrDescriptionFields {
+	in := apitypes.PrDescriptionFields{Summary: summary}
+	for j := 0; j < MaxPrDescListRawEntries; j++ {
+		in.Changes = append(in.Changes, items[j%len(items)])
+		in.ReviewPointers = append(in.ReviewPointers, items[(j+1)%len(items)])
+		in.ScopeNotes = append(in.ScopeNotes, apitypes.PrDescriptionScopeNote{Kind: "added", Text: items[(j+2)%len(items)]})
+		in.Verification = append(in.Verification, apitypes.PrDescriptionVerification{Command: items[(j+3)%len(items)], Result: "pass", VerifiedAtSha: "abcdef1"})
+	}
+	return in
+}
+
+func prDescProse(n int) string {
+	return strings.Repeat("Adds a retry to the uploader, see the notes in docs/retry.md for details. ", n/70+1)[:n]
+}
+
+// TestSanitizePrDescriptionWorstCaseIsLinear (H-A): every adversarial shape, and a full stage body
+// at every raw cap built from all of them, sanitizes in time proportional to its size. Each is
+// timed against the same-size plain prose in the same process (so -race and a loaded host scale
+// both sides) and must stay within 10x of it plus a small constant, with an absolute backstop.
+// Before the fix one 4000-byte `<`-run took seconds (thousands of times plain prose), and a full
+// body of them tens of seconds.
+func TestSanitizePrDescriptionWorstCaseIsLinear(t *testing.T) {
+	timeIt := func(f func()) time.Duration {
+		start := time.Now()
+		f()
+		return time.Since(start)
+	}
+	summaries := prDescAdversarial(MaxPrDescSummaryRawBytes)
+	prose := prDescProse(MaxPrDescSummaryRawBytes)
+	base := timeIt(func() { SanitizePrDescriptionText(prose, PrDescSummaryMaxBytes) })
+	for i, summary := range summaries {
+		var out string
+		elapsed := timeIt(func() { out = SanitizePrDescriptionText(summary, PrDescSummaryMaxBytes) })
+		if elapsed > 10*base+50*time.Millisecond {
+			t.Errorf("shape %d (%.20q…): one %d-byte field took %v (plain prose %v)", i, summary, len(summary), elapsed, base)
+		}
+		assertPrDescInert(t, out)
+	}
+
+	plain := prDescFullBody(prose, []string{prDescProse(MaxPrDescItemRawBytes)})
+	worst := prDescFullBody(summaries[0], prDescAdversarial(MaxPrDescItemRawBytes))
+	var out apitypes.PrDescriptionFields
+	var err error
+	baseBody := timeIt(func() { _, _ = SanitizePrDescriptionFields(context.Background(), plain) })
+	elapsed := timeIt(func() { out, err = SanitizePrDescriptionFields(context.Background(), worst) })
+	if err != nil {
+		t.Fatalf("full body: %v", err)
+	}
+	t.Logf("full stage body: worst case %v, plain prose %v", elapsed, baseBody)
+	if elapsed > 10*baseBody+200*time.Millisecond || elapsed > 10*time.Second {
+		t.Errorf("worst-case full stage body took %v (plain prose %v)", elapsed, baseBody)
+	}
+	for _, s := range append(append([]string{out.Summary}, out.Changes...), out.ReviewPointers...) {
+		assertPrDescInert(t, s)
+	}
+}
+
+// TestSanitizePrDescriptionFieldsHonoursCancel: a cancelled request stops sanitizing.
+func TestSanitizePrDescriptionFieldsHonoursCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := SanitizePrDescriptionFields(ctx, apitypes.PrDescriptionFields{Summary: "x", Changes: []string{"y"}}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+// TestSanitizePrDescriptionSecretsSplitByInlineMarkdown (B-A/M-A): a credential split by inline
+// markdown that re-joins when RENDERED (emphasis, a code span, strikethrough, a backslash escape)
+// replaces the whole field item with the redaction placeholder. Fragments are
+// joined at runtime; no token-shaped literal is in source.
+func TestSanitizePrDescriptionSecretsSplitByInlineMarkdown(t *testing.T) {
+	gl, gh := "gl"+"pat-", "gh"+"p_"
+	a10, b9, b10 := strings.Repeat("A", 10), strings.Repeat("B", 9), strings.Repeat("B", 10)
+	cases := []string{
+		gl + a10 + "*B*" + b9,
+		gl + a10 + "`B`" + b9,
+		gl + a10 + "**B**" + b9,
+		gl + a10 + "~~B~~" + b9,
+		gl + a10 + "\\-" + b9,
+		gl + a10 + "\\_" + b9,
+		gh + a10 + "\\_" + b10,
+	}
+	const want = "\\[redacted\\]"
+	for _, in := range cases {
+		for _, text := range []string{in, "token " + in + " leaked"} {
+			if got := SanitizePrDescriptionText(text, 600); got != want {
+				t.Errorf("SanitizePrDescriptionText(%q) = %q, want %q", text, got, want)
+			}
+		}
+		fields, err := SanitizePrDescriptionFields(context.Background(), apitypes.PrDescriptionFields{
+			Summary: "ok", Changes: []string{"first", "uses " + in},
+		})
+		if err != nil {
+			t.Fatalf("fields: %v", err)
+		}
+		if fields.Summary != "ok" || len(fields.Changes) != 2 || fields.Changes[0] != "first" || fields.Changes[1] != want {
+			t.Errorf("only the item carrying %q must be redacted: %+v", in, fields)
+		}
+	}
+	// A zero-width rune is stripped before the literal scrub, which then catches the token.
+	if got := SanitizePrDescriptionText("t "+gl+a10+"\u200B"+b10, 600); strings.Contains(got, b10) {
+		t.Errorf("zero-width split secret survived: %q", got)
+	}
+	// Ordinary inline markdown and identifiers are not secrets.
+	for _, in := range []string{"a *b* c `d` ~~e~~ and snake_case_name", "max_app-config and x\\-y", "ghp_ short"} {
+		if got := SanitizePrDescriptionText(in, 600); strings.Contains(got, "redacted") {
+			t.Errorf("false positive: %q -> %q", in, got)
+		}
+	}
+}
+
+// TestSanitizePrDescriptionMentionTable (B-B/L-B): every `@` not preceded by an ASCII letter or
+// digit is broken, whatever follows it; emails and a lone `@` are left as written.
+func TestSanitizePrDescriptionMentionTable(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"_@alice_", "_@" + zw + "alice_"},
+		{"__@alice__", "__@" + zw + "alice__"},
+		{"hello _@alice_ there", "hello _@" + zw + "alice_ there"},
+		{"*@alice*", "*@" + zw + "alice*"},
+		{"@\\_alice", "@" + zw + "\\_alice"},
+		{"@\\.bob", "@" + zw + "\\.bob"},
+		{"@.foo", "@" + zw + ".foo"},
+		{"x @@y", "x @" + zw + "@" + zw + "y"},
+		{"a_b@x.com and a.b@example.com", "a_b@x.com and a.b@example.com"},
+		{"first.last@example.org", "first.last@example.org"},
+		{"meet @ noon", "meet @ noon"},
+		{"ends with @", "ends with @"},
+	}
+	for _, c := range cases {
+		got := SanitizePrDescriptionText(c.in, 600)
+		if got != c.want {
+			t.Errorf("SanitizePrDescriptionText(%q) = %q, want %q", c.in, got, c.want)
+		}
+		if again := SanitizePrDescriptionText(got, 600); again != got {
+			t.Errorf("not idempotent: %q -> %q", got, again)
+		}
+	}
+}
+
+// TestSanitizePrDescriptionQuickActions (M-B): a field cannot open a GitLab quick action.
+func TestSanitizePrDescriptionQuickActions(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"/close", "\\/close"},
+		{"/merge", "\\/merge"},
+		{"  /target_branch main", "\\/target_branch main"},
+		{"/approve", "\\/approve"},
+		{"\n/close", "\\/close"},
+		{"text\n/close", "text /close"},
+		{"a/b path", "a/b path"},
+	}
+	for _, c := range cases {
+		got := SanitizePrDescriptionText(c.in, 600)
+		if got != c.want {
+			t.Errorf("SanitizePrDescriptionText(%q) = %q, want %q", c.in, got, c.want)
+		}
+		if again := SanitizePrDescriptionText(got, 600); again != got {
+			t.Errorf("not idempotent: %q -> %q", got, again)
+		}
+	}
+}
+
+// TestValidPrDescSizeUnavailable (N5): an unavailable size with all-zero buckets (exactly what
+// the worker sends when the size cannot be computed) is accepted; a non-zero bucket is not.
+func TestValidPrDescSizeUnavailable(t *testing.T) {
+	if !validPrDescSize(&apitypes.PrDescriptionSize{Unavailable: true}) {
+		t.Fatal("unavailable size with all-zero buckets must be accepted")
+	}
+	if validPrDescSize(&apitypes.PrDescriptionSize{Unavailable: true, Docs: apitypes.PrDescriptionSizeBucket{Deleted: 1}}) {
+		t.Fatal("unavailable size with a non-zero bucket must be refused")
 	}
 }
