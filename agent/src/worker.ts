@@ -429,6 +429,7 @@ export class Worker {
         // the first recovered heartbeat carries the depth ahead of that tick's drain.
         // PRD #1390 M2a: the active-run snapshot rides the same send (built here so its
         // epoch is drawn from the ONE monotonic counter the claim loop also draws from).
+        const sentAtMs = Date.now();
         const retaining = await this.client.heartbeat(
           this.collectStats(stats),
           this.outboxEntries(),
@@ -437,7 +438,8 @@ export class Worker {
         ok = true;
         // issue #1759 M3: the api's custody flag, timestamped by the prune controller so a
         // run of failed heartbeats ages it out (the prune fails closed on a stale flag).
-        this.dindPrune?.recordCustody(retaining);
+        // Stamped with the SEND time: the flag reflects the api's view as of the request.
+        this.dindPrune?.recordCustody(retaining, sentAtMs);
       } catch (err) {
         this.log.warn("heartbeat failed", { error: errMessage(err) });
       }
@@ -672,7 +674,11 @@ export class Worker {
             this.log.warn("claim/execute cycle failed", { error: errMessage(err) }),
           );
           active.add(run);
-          void run.finally(() => active.delete(run));
+          // issue #1759: the ending is activity the DinD prune's custody check orders against.
+          void run.finally(() => {
+            active.delete(run);
+            this.dindPrune?.noteActivityEnded();
+          });
         }
       } catch (err) {
         this.log.warn("claim/execute cycle failed", { error: errMessage(err) });
@@ -741,7 +747,11 @@ export class Worker {
             .execute(claim, signal)
             .catch((err) => this.log.warn("chat execute failed", { error: errMessage(err) }));
           active.add(run);
-          void run.finally(() => active.delete(run));
+          // issue #1759: the ending is activity the DinD prune's custody check orders against.
+          void run.finally(() => {
+            active.delete(run);
+            this.dindPrune?.noteActivityEnded();
+          });
         }
       } catch (err) {
         this.log.warn("chat claim/execute cycle failed", { error: errMessage(err) });

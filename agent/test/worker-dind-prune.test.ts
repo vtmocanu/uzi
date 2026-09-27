@@ -183,6 +183,61 @@ describe("Worker × DinD prune claim gate (issue #1759)", () => {
     for (const e of h.execs) assert.ok(e.idle, `${e.argv.join(" ")} ran while the worker was busy`);
   });
 
+  it("a custody flag from a heartbeat sent before the run ended never authorizes the prune", async () => {
+    const runGate = deferred<void>();
+    let runStarted = false;
+    let runClaims = 0;
+    const hb = { down: false, inFlight: 0 };
+    const runner = {
+      resumePendingRecoveries: async () => {},
+      execute: async () => {
+        runStarted = true;
+        await runGate.promise;
+      },
+    } as unknown as RunRunner;
+    const h = build(
+      {
+        // Custody clear on every heartbeat that gets through; `down` fails them (no record).
+        heartbeat: async () => {
+          hb.inFlight++;
+          try {
+            await tick(1);
+            if (hb.down) throw new Error("api unreachable");
+            return false;
+          } finally {
+            hb.inFlight--;
+          }
+        },
+        claimRun: async (): Promise<ClaimResponse | null> =>
+          runClaims++ === 0 ? ({ run_id: "run-1" } as unknown as ClaimResponse) : null,
+      },
+      runner,
+      idleChat,
+    );
+    const controller = new AbortController();
+    const done = h.worker.run(controller.signal);
+    try {
+      await until(() => runStarted, "the run is active");
+      for (let i = 0; i < 20; i++) await tick(); // several clear heartbeats land while busy
+      hb.down = true;
+      await until(() => hb.inFlight === 0, "no heartbeat straddles the run end");
+      runGate.resolve();
+      await until(() => h.worker.isIdle(), "the run ended");
+      // Pressure only now, so the controller never observed the run itself: only the
+      // worker's run-end hook orders the (still fresh) pre-end custody flag.
+      h.pressure.on = true;
+      for (let i = 0; i < 80; i++) await tick();
+      assert.strictEqual(h.execs.length, 0, "no docker command on a flag that predates the run end");
+      hb.down = false;
+      await until(() => h.execs.some((e) => isPrune(e.argv)), "a heartbeat after the run end clears it");
+    } finally {
+      // Abort even when an assertion above fails, so a red test cannot leave the
+      // worker loops running and hang the file.
+      controller.abort();
+      await done;
+    }
+  });
+
   it("an active chat session blocks the prune", async () => {
     const chatGate = deferred<void>();
     let chatStarted = false;

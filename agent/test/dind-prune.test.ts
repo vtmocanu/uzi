@@ -1,8 +1,11 @@
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readdirSync, rmSync, statSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 
 import {
   DIND_PRUNE_ARGV,
+  DOCKER_BIN,
   DindPruneController,
   DindPruneGate,
   assertDockerArgvAllowed,
@@ -19,6 +22,12 @@ import { recordingLogger } from "./helpers.js";
 // asserts exactly which docker argv ran.
 
 const FORBIDDEN = ["volume", "volumes", "--volumes", "system", "container", "rm"];
+/** DOCKER_CONFIG directories the controllers created, removed after the file. */
+const configDirs = new Set<string>();
+after(() => {
+  for (const d of configDirs) rmSync(d, { recursive: true, force: true });
+});
+
 /** Every argv any controller in this file executed, checked by the last test. */
 const ALL_EXECUTED: string[][] = [];
 
@@ -52,6 +61,7 @@ function harness(opts: { workerName?: string } = {}) {
   };
   const calls: string[][] = [];
   const envs: NodeJS.ProcessEnv[] = [];
+  const files: string[] = [];
   const timeouts: number[] = [];
   const state = {
     psOut: "",
@@ -65,6 +75,7 @@ function harness(opts: { workerName?: string } = {}) {
     calls.push([...argv]);
     ALL_EXECUTED.push([...argv]);
     envs.push(o.env);
+    files.push(o.file);
     timeouts.push(o.timeoutMs);
     await state.onExec?.(argv);
     return argv[0] === "ps" ? state.psOut : "";
@@ -96,7 +107,8 @@ function harness(opts: { workerName?: string } = {}) {
     return ctl.tick();
   };
   const msgs = () => (lines as Array<{ msg: string }>).map((l) => l.msg);
-  return { clock, meter, calls, envs, timeouts, state, gate, ctl, step, msgs, lines };
+  const records = () => lines as Array<{ level: string; msg: string } & Record<string, unknown>>;
+  return { clock, meter, calls, envs, files, timeouts, state, gate, ctl, step, msgs, records, lines };
 }
 
 const DANGLING = [...DIND_PRUNE_ARGV.pruneDangling];
@@ -173,16 +185,39 @@ describe("DinD prune — pressure trigger and debounce", () => {
     h.meter.bytesPct = 95;
     h.meter.frozenEpoch = Math.floor(h.clock.now() / 1000) + 30;
     assert.strictEqual(await h.step(), "pending");
-    // Re-read the SAME file 10s later (still fresh): must not count as a second sample.
-    h.clock.advance(10_000);
+    // Re-read the SAME file 5s later (still fresh): must not count as a second sample.
+    h.clock.advance(5_000);
     h.ctl.recordCustody(false);
     assert.strictEqual(await h.ctl.tick(), "pending");
-    h.clock.advance(10_000);
+    h.clock.advance(5_000);
     h.ctl.recordCustody(false);
     assert.strictEqual(await h.ctl.tick(), "pending");
     assert.deepStrictEqual(h.calls, []);
     // A genuinely new sample is the second one.
     h.meter.frozenEpoch = undefined;
+    relieveAfterBuilder(h, 10);
+    assert.strictEqual(await h.step(), "completed");
+  });
+});
+
+describe("DinD prune — debounce gap", () => {
+  it("an over sample more than 45s after the previous counted one restarts the streak at one", async () => {
+    const h = harness();
+    h.meter.bytesPct = 95;
+    assert.strictEqual(await h.step(), "pending");
+    // The meter stalled: the next distinct sample is 60s newer, not one interval.
+    h.clock.advance(30_000);
+    assert.strictEqual(await h.step(), "pending", "a 60s gap is not consecutive");
+    assert.deepStrictEqual(h.calls, []);
+    relieveAfterBuilder(h, 10);
+    assert.strictEqual(await h.step(), "completed", "the next 30s sample completes the new streak");
+  });
+
+  it("a sample 45s after the previous one still counts as consecutive", async () => {
+    const h = harness();
+    h.meter.bytesPct = 95;
+    assert.strictEqual(await h.step(), "pending");
+    h.clock.advance(15_000);
     relieveAfterBuilder(h, 10);
     assert.strictEqual(await h.step(), "completed");
   });
@@ -261,6 +296,40 @@ describe("DinD prune — custody (fail-closed)", () => {
     assert.deepStrictEqual(h.calls, []);
   });
 
+  it("a custody flag sent before the last run ended is not trusted; one sent after is", async () => {
+    const h = harness();
+    h.meter.bytesPct = 95;
+    await h.step();
+    // A run ends at t; the only custody sample was sent at t-5s (fresh, false).
+    h.clock.advance(TICK);
+    const t = h.clock.now();
+    h.ctl.recordCustody(false, t - 5_000);
+    h.ctl.noteActivityEnded();
+    assert.strictEqual(await h.ctl.tick(), "custody", "a pre-run-end flag may predate the hold the run opened");
+    assert.deepStrictEqual(h.calls, []);
+    // A heartbeat sent at t+5s says false: now the prune may go.
+    h.clock.advance(5_000);
+    h.ctl.recordCustody(false, t + 5_000);
+    h.clock.advance(TICK - 5_000);
+    relieveAfterBuilder(h, 10);
+    assert.strictEqual(await h.ctl.tick(), "completed");
+  });
+
+  it("isIdle observed false makes an earlier custody flag untrusted", async () => {
+    const h = harness();
+    h.meter.bytesPct = 95;
+    h.state.idle = false;
+    await h.step();
+    assert.strictEqual(await h.step(), "busy");
+    // The run ends between ticks; no heartbeat since the busy observation.
+    h.state.idle = true;
+    h.clock.advance(TICK);
+    assert.strictEqual(await h.ctl.tick(), "custody");
+    assert.deepStrictEqual(h.calls, []);
+    relieveAfterBuilder(h, 10);
+    assert.strictEqual(await h.step(), "completed", "a heartbeat after the observation clears it");
+  });
+
   it("no heartbeat ever → no prune", async () => {
     const h = harness();
     h.meter.bytesPct = 95;
@@ -305,9 +374,11 @@ describe("DinD prune — exclusive idle acquisition", () => {
     assert.ok(h.clock.now() - t0 - TICK < 61_000, "and no longer");
     assert.strictEqual(h.gate.claimsClosed(), false);
     assert.deepStrictEqual(h.calls, []);
-    // Not a consumed attempt: once the claim ends, the next tick prunes (no backoff).
+    // Not a consumed attempt: once the claim ends, the prune goes without a backoff. The
+    // 60s drain left a 90s gap since the last counted sample, so the streak restarts first.
     h.gate.exitClaim();
     relieveAfterBuilder(h, 10);
+    assert.strictEqual(await h.step(), "pending", "a 90s sample gap is not consecutive");
     assert.strictEqual(await h.step(), "completed");
   });
 
@@ -354,6 +425,78 @@ describe("DinD prune — exclusive idle acquisition", () => {
     h.state.psOut = "";
     relieveAfterBuilder(h, 10);
     assert.strictEqual(await h.step(), "completed", "no backoff was consumed");
+  });
+
+  it("a running-container deferral is logged at INFO once per pressure episode", async () => {
+    const h = harness({ workerName: "w-name" });
+    h.meter.bytesPct = 95;
+    h.state.psOut = "3f2a9c1b7d4e\n";
+    await h.step();
+    for (let i = 0; i < 5; i++) assert.strictEqual(await h.step(), "busy");
+    const token = "dind-prune-deferred worker=w-name reason=running-container";
+    const logged = () => h.records().filter((l) => l.msg === token);
+    assert.strictEqual(logged().length, 1, "once, not per tick");
+    assert.strictEqual(logged()[0]?.level, "info");
+    // The episode ends (below), a new one starts: logged again, once.
+    h.meter.bytesPct = 50;
+    assert.strictEqual(await h.step(), "below");
+    h.meter.bytesPct = 95;
+    await h.step();
+    for (let i = 0; i < 3; i++) assert.strictEqual(await h.step(), "busy");
+    assert.strictEqual(logged().length, 2);
+  });
+
+  it("docker ps runs with a 30s timeout", async () => {
+    const h = harness();
+    h.meter.bytesPct = 95;
+    relieveAfterBuilder(h, 10);
+    await h.step();
+    assert.strictEqual(await h.step(), "completed");
+    assert.deepStrictEqual(h.calls[0], PS);
+    assert.strictEqual(h.timeouts[0], 30_000);
+  });
+
+  it("three consecutive docker ps failures enter the 1h backoff and log dind-prune-failed once", async () => {
+    const h = harness({ workerName: "w-name" });
+    h.meter.bytesPct = 95;
+    h.state.onExec = (argv) => {
+      if (argv[0] === "ps") throw new Error("Cannot connect to the Docker daemon");
+    };
+    await h.step();
+    assert.strictEqual(await h.step(), "busy");
+    assert.strictEqual(await h.step(), "busy");
+    assert.strictEqual(await h.step(), "failed");
+    assert.deepStrictEqual(h.calls, [PS, PS, PS]);
+    assert.strictEqual(h.gate.claimsClosed(), false);
+    for (let i = 0; i < 20; i++) assert.strictEqual(await h.step(), "backoff");
+    assert.strictEqual(h.calls.length, 3, "the claim gate is no longer closed every tick");
+    const failed = h.records().filter((l) => l.msg === "dind-prune-failed worker=w-name");
+    assert.strictEqual(failed.length, 1);
+    assert.strictEqual(failed[0]?.reason, "docker-ps-failed");
+    assert.strictEqual(
+      h.msgs().filter((m) => m === "dind-prune-deferred worker=w-name reason=docker-ps-failed").length,
+      1,
+    );
+  });
+
+  it("a successful docker ps resets the consecutive-failure count", async () => {
+    const h = harness();
+    h.meter.bytesPct = 95;
+    let fail = true;
+    h.state.onExec = (argv) => {
+      if (argv[0] === "ps" && fail) throw new Error("timeout");
+    };
+    await h.step();
+    assert.strictEqual(await h.step(), "busy");
+    assert.strictEqual(await h.step(), "busy");
+    fail = false;
+    h.state.psOut = "3f2a9c1b7d4e\n";
+    assert.strictEqual(await h.step(), "busy", "ps succeeded (a running container)");
+    fail = true;
+    h.state.psOut = "";
+    assert.strictEqual(await h.step(), "busy");
+    assert.strictEqual(await h.step(), "busy", "the count restarted after the success");
+    assert.strictEqual(await h.step(), "failed");
   });
 
   it("holds the gate through the prune commands", async () => {
@@ -438,6 +581,21 @@ describe("DinD prune — commands and outcomes", () => {
     assert.strictEqual(await h.step(), "backoff");
   });
 
+  it("an abort while waiting for the post-prune sample logs aborted, never completed", async () => {
+    const h = harness({ workerName: "w-name" });
+    h.meter.bytesPct = 95;
+    await h.step();
+    h.meter.frozenEpoch = Math.floor(h.clock.now() / 1000) + TICK / 1000;
+    const ac = new AbortController();
+    h.state.onSleep = () => ac.abort(); // shutdown lands inside waitFreshSample's wait
+    h.clock.advance(TICK);
+    h.ctl.recordCustody(false);
+    assert.strictEqual(await h.ctl.tick(ac.signal), "aborted");
+    assert.deepStrictEqual(h.calls, [PS, DANGLING, BUILDER]);
+    assert.ok(!h.msgs().some((m) => m.startsWith("dind-prune-completed")), "no completed token on shutdown");
+    assert.ok(h.msgs().includes("dind-prune: interrupted by shutdown"));
+  });
+
   it("abandons the remaining steps once the 15 min budget is spent", async () => {
     const h = harness();
     h.meter.bytesPct = 95;
@@ -449,17 +607,31 @@ describe("DinD prune — commands and outcomes", () => {
     assert.deepStrictEqual(h.calls, [PS, DANGLING], "the build-cache prune never started");
   });
 
-  it("runs docker with only PATH, HOME and the wired DOCKER_HOST", async () => {
+  it("runs /usr/bin/docker with a fixed PATH, an empty 0700 DOCKER_CONFIG/HOME and the wired DOCKER_HOST", async () => {
     const h = harness();
     h.meter.bytesPct = 95;
     relieveAfterBuilder(h, 10);
     await h.step();
     await h.step();
+    assert.strictEqual(DOCKER_BIN, "/usr/bin/docker");
+    assert.ok(h.files.length > 0);
+    for (const f of h.files) assert.strictEqual(f, "/usr/bin/docker", "never resolved through PATH");
     assert.ok(h.envs.length > 0);
     for (const env of h.envs) {
       assert.strictEqual(env.DOCKER_HOST, "tcp://127.0.0.1:2375");
-      assert.deepStrictEqual(Object.keys(env).sort(), ["DOCKER_HOST", "HOME", "PATH"]);
+      assert.deepStrictEqual(Object.keys(env).sort(), ["DOCKER_CONFIG", "DOCKER_HOST", "HOME", "PATH"]);
+      assert.strictEqual(env.PATH, "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+      const dir = env.DOCKER_CONFIG as string;
+      assert.strictEqual(env.HOME, dir);
+      assert.notStrictEqual(dir, homedir());
+      assert.ok(dir.startsWith(tmpdir()), dir);
+      const st = statSync(dir);
+      assert.ok(st.isDirectory());
+      assert.strictEqual(st.mode & 0o777, 0o700);
+      assert.deepStrictEqual(readdirSync(dir), [], "empty: no config.json, no cli-plugins");
+      configDirs.add(dir);
     }
+    assert.strictEqual(new Set(h.envs.map((e) => e.DOCKER_CONFIG)).size, 1, "created once");
   });
 });
 
