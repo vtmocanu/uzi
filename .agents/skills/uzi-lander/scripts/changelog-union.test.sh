@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Hermetic tests of changelog-union.sh: a two-sided conflict becomes a union, a repeated
 # `### Fixed` heading under [Unreleased] collapses into the first, a resolution that would
-# lose a content line exits non-zero with the file untouched, and a marker-free file is a
-# no-op success.
+# lose a content line exits non-zero with the file untouched, a marker-free file is a
+# no-op success, and a blank-separated [Unreleased] keeps one blank line between entries.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -455,6 +455,7 @@ cat > "$WORK/col.md" <<'EOF'
 ### Fixed
 
 - **late fix**
+- **late two**
 
 ## [0.1.0] - 2026-01-01
 
@@ -477,6 +478,7 @@ cat > "$WORK/col.want" <<'EOF'
 
 - **spaced base**
 - **late fix**
+- **late two**
 
 ### Changed
 
@@ -508,4 +510,139 @@ set -e
 [ "$rc" -eq 1 ] || fail "--collapse on a conflicted file returned rc=$rc, want 1"
 cmp -s "$WORK/lossy.orig" "$WORK/mk.md" || fail "--collapse modified a conflicted file"
 
-echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, both-sides and repeated-version refusals, shared ### subsections, reword, no-base and version-heading refusals, no-op, --collapse"
+# 8. Blank-separated [Unreleased] (the current CHANGELOG.md style): the union keeps exactly
+#    one blank line between entries, including at the join of the two sides, so no blank
+#    line the base carries is deleted (land-prep's removal guard, exit 9, stays quiet).
+#    Released sections keep their own style.
+cat > "$WORK/blank.md" <<'EOF'
+## [Unreleased]
+
+### Added
+
+- **added**
+  added desc
+
+### Fixed
+
+- **one**
+  one desc
+
+- **two**
+  two desc
+
+<<<<<<< HEAD
+- **main fix**
+  main desc
+||||||| parent
+=======
+- **branch fix**
+  branch desc
+>>>>>>> abc1234 (branch)
+
+## [0.1.0] - 2026-01-01
+
+### Fixed
+
+- **old**
+  old desc
+- **old two**
+EOF
+cat > "$WORK/blank.want" <<'EOF'
+## [Unreleased]
+
+### Added
+
+- **added**
+  added desc
+
+### Fixed
+
+- **one**
+  one desc
+
+- **two**
+  two desc
+
+- **main fix**
+  main desc
+
+- **branch fix**
+  branch desc
+
+## [0.1.0] - 2026-01-01
+
+### Fixed
+
+- **old**
+  old desc
+- **old two**
+EOF
+bash "$SCRIPT" "$WORK/blank.md" > "$WORK/blank.out" 2>&1 || fail "blank-separated union failed: $(cat "$WORK/blank.out")"
+diff -u "$WORK/blank.want" "$WORK/blank.md" || fail "blank-separated union dropped or misplaced a separator"
+
+# 8b. ...and when each side brings its own `### Fixed` (and one a `### Changed`), the folded
+#     entries are blank-separated too.
+cat > "$WORK/blank2.md" <<'EOF'
+## [Unreleased]
+
+### Fixed
+
+- **one**
+
+- **two**
+
+<<<<<<< HEAD
+### Fixed
+
+- **main fix**
+
+- **main fix two**
+||||||| parent
+=======
+### Changed
+
+- **branch changed**
+
+### Fixed
+
+- **branch fix**
+>>>>>>> abc1234 (branch)
+
+## [0.1.0] - 2026-01-01
+
+- **old**
+EOF
+cat > "$WORK/blank2.want" <<'EOF'
+## [Unreleased]
+
+### Fixed
+
+- **one**
+
+- **two**
+
+- **main fix**
+
+- **main fix two**
+
+- **branch fix**
+
+### Changed
+
+- **branch changed**
+
+## [0.1.0] - 2026-01-01
+
+- **old**
+EOF
+bash "$SCRIPT" "$WORK/blank2.md" > "$WORK/blank2.out" 2>&1 || fail "blank-separated shared-heading union failed: $(cat "$WORK/blank2.out")"
+diff -u "$WORK/blank2.want" "$WORK/blank2.md" || fail "blank-separated shared-heading union produced the wrong file"
+
+# 9. --collapse on a blank-separated [Unreleased]: the repeat's entries join the first
+#    occurrence's with one blank line between them.
+printf '## [Unreleased]\n\n### Fixed\n\n- **a**\n  a desc\n\n- **b**\n\n### Fixed\n\n- **c**\n\n- **d**\n\n## [0.1.0] - 2026-01-01\n\n- **old**\n' > "$WORK/bcol.md"
+printf '## [Unreleased]\n\n### Fixed\n\n- **a**\n  a desc\n\n- **b**\n\n- **c**\n\n- **d**\n\n## [0.1.0] - 2026-01-01\n\n- **old**\n' > "$WORK/bcol.want"
+bash "$SCRIPT" --collapse "$WORK/bcol.md" > "$WORK/bcol.out" 2>&1 || fail "blank-separated --collapse failed: $(cat "$WORK/bcol.out")"
+diff -u "$WORK/bcol.want" "$WORK/bcol.md" || fail "blank-separated --collapse dropped the separator at the join"
+
+echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, both-sides and repeated-version refusals, shared ### subsections, reword, no-base and version-heading refusals, no-op, --collapse, blank-separated entries"

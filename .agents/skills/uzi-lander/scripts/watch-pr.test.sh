@@ -25,7 +25,14 @@ cat > "$WORK/bin/gh" <<'STUB'
 set -eu
 if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
   case "$*" in
-    *'--json headRefOid,state'*) echo '{"headRefOid":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"OPEN","baseRefName":"main"}' ;;
+    *'--json headRefOid,state'*)
+      # MERGEABLE_SEQ="A B": the n-th view's mergeable (the last repeats); default MERGEABLE.
+      mg=MERGEABLE
+      if [ -n "${MERGEABLE_SEQ:-}" ]; then
+        n=$(( $(cat "$MERGEABLE_N" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$MERGEABLE_N"
+        read -r -a seq <<< "$MERGEABLE_SEQ"; mg=${seq[$(( n <= ${#seq[@]} ? n - 1 : ${#seq[@]} - 1 ))]}
+      fi
+      printf '{"headRefOid":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"OPEN","baseRefName":"main","mergeable":"%s","mergeStateStatus":"%s"}\n' "$mg" "$([ "$mg" = CONFLICTING ] && echo DIRTY || echo CLEAN)" ;;
     *'-q .headRefOid'*) echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef ;;
     *'-q .baseRefName'*) echo main ;;
     *) echo "unexpected pr view: $*" >&2; exit 1 ;;
@@ -39,6 +46,8 @@ seq_reply() {
   if [ -f "$SEQ_DIR/$1.$n" ]; then cat "$SEQ_DIR/$1.$n"; else cat "$(ls "$SEQ_DIR/$1".[0-9]* | sort -t. -k2 -n | tail -1)"; fi
 }
 if [ "${1:-}" = pr ] && [ "${2:-}" = checks ]; then
+  # A conflicting PR gets no pull_request CI: gh reports no required checks and exits 1.
+  if [ "${CHECKS_NONE:-0}" = 1 ]; then echo "no required checks reported on the 'agent/issue-1' branch" >&2; exit 1; fi
   if [ -n "${SEQ_DIR:-}" ]; then seq_reply checks
   elif [ -n "${CHECKS_JSON:-}" ]; then echo "$CHECKS_JSON"
   else echo '[{"name":"ci","bucket":"pass"}]'; fi
@@ -533,4 +542,30 @@ set -e
 grep -q 'try 2: .*req_missing=1 ' "$WORK/req-refresh.out" || fail "rules not re-read on poll 2: $(cat "$WORK/req-refresh.out")"
 unset SEQ_DIR
 
-echo "PASS watch-pr: settled reviews, unregistered required checks, resolved-thread scope, earlier-verdict Greptile scope, change_assessment head marker, reviewer override, Greptile run on an older commit"
+# A PR that conflicts with its base gets no CI: exit 8 RESULT=conflict at once, never an
+# unknown=1 poll until timeout. mergeable=UNKNOWN (GitHub computing) keeps polling first.
+export CHECKS_NONE=1 MERGEABLE_N="$WORK/mergeable.n" MERGEABLE_SEQ=CONFLICTING
+set +e
+bash "$SCRIPT" test/repo 42 0 3 --reviewer greptile --reviewer-grace 0 > "$WORK/conflict.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 8 ] || fail "a conflicting PR returned rc=$rc, want 8: $(cat "$WORK/conflict.out")"
+grep -q '^RESULT=conflict ' "$WORK/conflict.out" || fail "conflict not named: $(cat "$WORK/conflict.out")"
+grep -q 'unknown=1' "$WORK/conflict.out" && fail "a conflicting PR was polled as unknown: $(cat "$WORK/conflict.out")"
+rm -f "$MERGEABLE_N"; export MERGEABLE_SEQ="UNKNOWN CONFLICTING"
+set +e
+bash "$SCRIPT" test/repo 42 0 3 --reviewer greptile --reviewer-grace 0 > "$WORK/conflict-late.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 8 ] || fail "UNKNOWN then CONFLICTING returned rc=$rc, want 8: $(cat "$WORK/conflict-late.out")"
+grep -q 'try 1: .*unknown=1' "$WORK/conflict-late.out" || fail "mergeable=UNKNOWN was not polled as unknown: $(cat "$WORK/conflict-late.out")"
+rm -f "$MERGEABLE_N"; export MERGEABLE_SEQ=UNKNOWN
+set +e
+bash "$SCRIPT" test/repo 42 0 2 --reviewer greptile --reviewer-grace 0 > "$WORK/computing.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "mergeable=UNKNOWN returned rc=$rc, want 2 (timeout): $(cat "$WORK/computing.out")"
+grep -q 'RESULT=conflict' "$WORK/computing.out" && fail "mergeable=UNKNOWN read as a conflict"
+unset CHECKS_NONE MERGEABLE_N MERGEABLE_SEQ
+
+echo "PASS watch-pr: settled reviews, unregistered required checks, resolved-thread scope, earlier-verdict Greptile scope, change_assessment head marker, reviewer override, Greptile run on an older commit, conflicting PR"

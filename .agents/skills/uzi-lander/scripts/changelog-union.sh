@@ -15,13 +15,16 @@
 # keep both wordings, so that refuses too, as does a block with no base section. A shared `### <Section>` subsection heading is allowed (each side bringing its own
 # `### Fixed` is the common case) only when the block sits inside `## [Unreleased]`: there
 # a repeated `### <Section>` is collapsed into its first occurrence (its bullets move under
-# it). Blank lines left between bullet items are dropped. A file with no conflict markers is left untouched.
+# it). The gap between bullet items follows [Unreleased]'s own convention (blank mode when
+# its entries are mostly blank-separated, counting only pairs the file already had, never a
+# join the resolution makes): exactly one blank line in blank mode, none otherwise, so a
+# union never deletes a separator the base carries. A file with no conflict markers is left untouched.
 #
 # --collapse: for a marker-free file (a clean rebase can leave two `### Fixed` headings when a
 # commit adds its own next to the base's). Only a repeated `### <Section>` inside
 # `## [Unreleased]` changes: the repeat's heading and surrounding blank lines go, its lines
-# are appended to the first occurrence's; every other line stays byte-identical. No repeat,
-# no change. Conflict markers are refused (exit 1).
+# are appended to the first occurrence's (after one blank line in blank mode); every other
+# line stays byte-identical. No repeat, no change. Conflict markers are refused (exit 1).
 #
 # Verification before the file is replaced: no marker survives, the multiset of content
 # lines (non-blank, non-marker, non-heading) from the resolved sides is identical before and
@@ -53,9 +56,23 @@ fi
 tmpd=$(mktemp -d "${TMPDIR:-/tmp}/changelog-union.XXXXXX") || exit 2
 trap 'rm -rf "$tmpd"' EXIT
 
+# The separator convention of [Unreleased]: sepcount() is fed every line of it and counts
+# adjacent list items (a bullet or its indented continuation, then a bullet) that a blank
+# line separates vs. that touch. The caller resets pl/gap at every point where two lines
+# only became adjacent through the resolution (a conflict marker, a moved section), so the
+# union's own joins never vote. More blank-separated pairs than touching ones = blank mode.
+SEP_AWK='
+  function sepcount(s) {
+    if (s ~ /^[ \t]*$/) { gap = 1; return }
+    if (s ~ /^#/) { pl = 0; gap = 0; return }
+    if (s ~ /^[-*] / && pl) { if (gap) nblank++; else ntight++ }
+    pl = (s ~ /^[-*] / || s ~ /^  /); gap = 0
+  }
+'
+
 if [ "$MODE" = collapse ]; then
 cp "$FILE" "$tmpd/before" || exit 2
-awk '
+awk "$SEP_AWK"'
   function blank(s) { return s ~ /^[ \t]*$/ }
   { L[++n] = $0 }
   END {
@@ -65,6 +82,8 @@ awk '
     e = n + 1
     for (i = u + 1; i <= n; i++) if (L[i] ~ /^## /) { e = i; break }
     ns = 0; np = 0; dup = 0
+    for (i = u + 1; i < e; i++) sepcount(L[i])
+    sep = (nblank > ntight)
     for (i = u + 1; i < e; i++) {
       if (L[i] ~ /^### /) {
         key = L[i]; sub(/[ \t]+$/, "", key)
@@ -82,13 +101,17 @@ awk '
       print hd[s]
       hi = sc[s]; while (hi >= 1 && blank(S[s, hi])) hi--
       for (i = 1; i <= hi; i++) print S[s, i]
+      any = (hi > 0)
       for (t = s + 1; t <= ns; t++) {
         if (owner[t] != s) continue
         lo = 1; th = sc[t]
         while (lo <= th && blank(S[t, lo])) lo++
         while (th >= lo && blank(S[t, th])) th--
-        if (lo <= th && hi == 0) { print ""; hi = -1 }  # the first occurrence had no body
+        if (lo > th) continue
+        if (hi == 0) { print ""; hi = -1 }  # the first occurrence had no body
+        else if (any && sep) print ""       # blank-separated entries keep one blank at the join
         for (i = lo; i <= th; i++) print S[t, i]
+        any = 1
       }
       for (i = (hi > 0 ? hi : 0) + 1; i <= sc[s]; i++) print S[s, i]
     }
@@ -103,9 +126,10 @@ else
 
 # Pass 1: union the conflict blocks. Also emits, into $tmpd/before, every line the result
 # must keep (both sides and the unconflicted text; the diff3 base is dropped on purpose).
-if ! awk -v before="$tmpd/before" '
+if ! awk -v before="$tmpd/before" -v sepfile="$tmpd/sep" "$SEP_AWK"'
   BEGIN { st = 0 }  # 0 outside, 1 first side, 2 diff3 base, 3 second side
   st == 0 && /^## / { unrel = ($0 ~ /^## \[Unreleased\]/) }
+  /^(<<<<<<<( |$)|>>>>>>>( |$)|[|]{7}( |$)|=======$)/ { pl = 0; gap = 0 }
   /^<<<<<<<( |$)/ { if (st != 0) { bad = "nested <<<<<<< at line " NR; exit 1 } st = 1; next }
   /^[|]{7}( |$)/  { if (st != 1) { bad = "stray ||||||| at line " NR; exit 1 } st = 2; hasbase = 1; next }
   /^=======$/     { if (st != 1 && st != 2) { bad = "stray ======= at line " NR; exit 1 } st = 3; next }
@@ -135,10 +159,12 @@ if ! awk -v before="$tmpd/before" '
   st == 2 { C[++nc] = $0; next }
   st == 1 { A[++na] = $0 }
   st == 3 { B[++nb] = $0 }
+  unrel { sepcount($0) }
   { print; print > before }
   END {
     if (bad != "") { print "changelog-union: refusing: " bad > "/dev/stderr"; exit 1 }
     if (st != 0) { print "changelog-union: unterminated conflict block" > "/dev/stderr"; exit 1 }
+    print (nblank > ntight ? 1 : 0) > sepfile
   }
 ' "$FILE" > "$tmpd/union"; then
   echo "changelog-union: $FILE left untouched" >&2
@@ -146,9 +172,10 @@ if ! awk -v before="$tmpd/before" '
 fi
 
 # Pass 2: collapse repeated `### ` headings inside `## [Unreleased]`, trim each section's
-# body, and drop blank lines between list items (a bullet line or its indented
-# continuation, followed after the blanks by another bullet).
-awk '
+# body, and normalise the gap between list items (a bullet line or its indented
+# continuation, followed after any blanks by another bullet): exactly one blank line in
+# blank mode, none otherwise.
+awk -v sep="$(cat "$tmpd/sep")" '
   function islist(s) { return s ~ /^[-*] / || s ~ /^  / }
   function isbullet(s) { return s ~ /^[-*] / }
   function emit_body(h,   i, lo, hi, j, k, prev) {
@@ -159,10 +186,11 @@ awk '
     for (i = lo; i <= hi; i++) {
       if (B[h, i] ~ /^[ \t]*$/) {
         j = i; while (j <= hi && B[h, j] ~ /^[ \t]*$/) j++
-        if (islist(prev) && isbullet(B[h, j])) { i = j - 1; continue }
+        if (islist(prev) && isbullet(B[h, j])) { if (sep) { print ""; prev = "" } i = j - 1; continue }
         for (k = i; k < j; k++) print B[h, k]
         i = j - 1; continue
       }
+      if (sep && islist(prev) && isbullet(B[h, i])) print ""
       print B[h, i]; prev = B[h, i]
     }
   }

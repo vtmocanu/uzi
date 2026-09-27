@@ -126,6 +126,7 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    | 5 | CodeRabbit rate-limited, nothing else reviewed | step 3 |
    | 6 | no reviewer will come (skipped / absent past grace) | step 3 |
    | 7 | CR says the last commit was already reviewed | step 3, decide whether to request a full review |
+   | 8 | PR conflicts with its base (`mergeable=CONFLICTING`): GitHub runs no CI on it | step 5 |
 
    Let an auto-review that is already running finish; never re-trigger it. `--reviewer` also
    scopes which bot BLOCKS: `coderabbit`|`greptile` selects one bot AND makes the other fully
@@ -205,6 +206,8 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    ask when unsure and the user is present. Say which in the merge note. Greptile does not
    re-review on its own; re-comment if you want its second pass.
 5. **Base hygiene, when needed, unprompted.** `BEHIND` alone is fine under an admin merge.
+   A conflicting PR gets no CI at all, even right after uzi's own `mr_rework` push: read
+   `mergeable` before waiting on checks.
    A migration-number collision, a `DIRTY` mergeable state, or a strict-check block needs:
 
    ```
@@ -216,6 +219,7 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    unless a bullet appears on both sides of a hunk (a shared `### X` under `[Unreleased]` is
    fine), a hunk holds a `## ` heading, or a side rewords a line: then it refuses and the
    stop is exit 5. Duplicate `###` headings under `[Unreleased]` get their own collapse commit.
+   Union and collapse keep `[Unreleased]`'s one blank line between entries when it uses one.
    Exit 5 = any other conflict, worktree left mid-rebase: resolve (a union of both sides is
    usual for a shared list), `git rebase --continue`, re-run with `--skip-rebase`. Exit 6 = the
    renumber helper reported references to fix by hand. Exit 7 = a gate failed (log path

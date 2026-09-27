@@ -46,6 +46,9 @@
 #      grace, and Greptile has not reviewed it. Trigger a bot or use a local reviewer.
 #   7  CodeRabbit rejected `@coderabbitai review` because it considers the last commit
 #      already reviewed; post `@coderabbitai full review` once, then re-run this watcher.
+#   8  conflict — the PR conflicts with its base (mergeable=CONFLICTING). GitHub runs no
+#      pull_request CI on it, so nothing will arrive: rebase with land-prep.sh, re-run.
+#      mergeable=UNKNOWN (GitHub still computing) is not a conflict; it keeps polling.
 #
 # "CodeRabbit reviewed this head" is the union of robust signals, because a
 # zero-actionable incremental review can post NO new review object AND re-anchor no
@@ -128,7 +131,7 @@ while [ "$i" -lt "$MAX" ]; do
     fi
   fi
 
-  pv=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,state,baseRefName 2>/dev/null || true)
+  pv=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,state,baseRefName,mergeable,mergeStateStatus 2>/dev/null || true)
   head=$(printf '%s' "$pv" | jq -r '.headRefOid // empty' 2>/dev/null || true)
   req_base=$(printf '%s' "$pv" | jq -r '.baseRefName // empty' 2>/dev/null || true)
   pstate=$(printf '%s' "$pv" | jq -r '.state // empty' 2>/dev/null || true)
@@ -138,6 +141,12 @@ while [ "$i" -lt "$MAX" ]; do
     continue
   fi
   if [ "$pstate" != "OPEN" ]; then echo "RESULT=pr_not_open state=$pstate"; exit 2; fi
+  mergeable=$(printf '%s' "$pv" | jq -r '.mergeable // empty' 2>/dev/null || true)
+  if [ "$mergeable" = "CONFLICTING" ]; then
+    echo "try $i: head=${head:0:8} mergeable=CONFLICTING merge_state=$(printf '%s' "$pv" | jq -r '.mergeStateStatus // empty' 2>/dev/null || true)"
+    echo "RESULT=conflict (GitHub runs no CI on a conflicting PR; rebase with land-prep.sh)"
+    exit 8
+  fi
 
   # CI: only REQUIRED checks gate (an optional failure must not force red), and `cancel` is
   # a non-ready state (a cancelled required check = supersession, not green). Parse the JSON

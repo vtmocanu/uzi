@@ -15,7 +15,9 @@
 #   run_failed:<origin>   run failed/cancelled and no PR — hand to uzi-watcher recovery
 #   claimed_by_other      another live session is landing this PR (CLAIM_HELD_BY printed)
 #   merged | closed       nothing to land
-#   conflict              mergeStateStatus DIRTY — resolve in a worktree
+#   conflict              mergeable CONFLICTING (wins over unknown: GitHub runs no CI on a
+#                         conflicting PR, so empty checks are expected) or mergeStateStatus
+#                         DIRTY — rebase with land-prep.sh
 #   migration_collision   PR adds a migration whose number already exists on main — rebase + renumber
 #   ci_red | ci_pending   required checks
 #   mr_rework_active      defer to uzi's rework
@@ -109,6 +111,7 @@ printf '%s' "$pj" | jq -r '
   "REVIEW_DECISION=\(.reviewDecision)", "TITLE=\(.title|.[0:100])"'
 state=$(printf '%s' "$pj" | jq -r .state); head=$(printf '%s' "$pj" | jq -r .headRefOid)
 merge_state=$(printf '%s' "$pj" | jq -r .mergeStateStatus); base=$(printf '%s' "$pj" | jq -r .baseRefName)
+mergeable=$(printf '%s' "$pj" | jq -r '.mergeable // empty')
 case "$state" in MERGED) echo "NEXT=merged"; exit 0;; CLOSED) echo "NEXT=closed"; exit 0;; esac
 
 # Every lookup below that fails or returns an unparseable payload sets UNKNOWN=1 (declared
@@ -124,7 +127,9 @@ if printf '%s' "$cj" | jq -e 'type=="array" and length>0' >/dev/null 2>&1; then
   ci_pend=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length')
   ci_cancel=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length')
 else
-  UNKNOWN=1; echo "CI_CHECKS=unreadable-or-empty"
+  UNKNOWN=1
+  if [ "$mergeable" = "CONFLICTING" ]; then echo "CI_CHECKS=none (conflicting PR: GitHub runs no pull_request CI)"
+  else echo "CI_CHECKS=unreadable-or-empty"; fi
 fi
 echo "CI_FAIL=$ci_fail"; echo "CI_PENDING=$ci_pend"; echo "CI_CANCELLED=$ci_cancel"
 
@@ -306,7 +311,8 @@ fi
 reviewed=$cr_reviewed
 [ "$gr_reviewed" -eq 1 ] && reviewed=1
 echo "UNKNOWN=$UNKNOWN"
-if   [ "$UNKNOWN" -eq 1 ]; then echo "NEXT=unknown (a lookup failed or returned an unreadable payload; re-run before acting)"
+if   [ "$mergeable" = "CONFLICTING" ]; then echo "NEXT=conflict"
+elif [ "$UNKNOWN" -eq 1 ]; then echo "NEXT=unknown (a lookup failed or returned an unreadable payload; re-run before acting)"
 elif [ -n "$collision" ]; then echo "NEXT=migration_collision"
 elif [ "$merge_state" = "DIRTY" ]; then echo "NEXT=conflict"
 elif [ "$ci_fail" -gt 0 ]; then echo "NEXT=ci_red"
