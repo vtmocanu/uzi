@@ -10,11 +10,14 @@ import type { ClaimConfig } from "../src/protocol.js";
 // (ADR 1225) had deliberately withheld `Closes #N`. The title matters too: GitLab's default merge
 // and squash commit messages carry the MR title, and those commits are scanned on the default branch.
 //
-// GITLAB_DEFAULT_CLOSING is GitLab's documented default pattern (docs.gitlab.com, "Default closing
-// pattern"), with %{issue_ref} expanded to the reference forms uzi can emit: `#N`,
-// `group/project#N`, and an issue URL. It is the DEFAULT only; self-managed GitLab may configure
-// its own pattern, which no renderer can anticipate.
-const ISSUE_REF = String.raw`(?:[A-Za-z0-9_.\-]+(?:\/[A-Za-z0-9_.\-]+)+)?#\d+|https?:\/\/\S+\/issues\/\d+`;
+// GITLAB_DEFAULT_CLOSING is a SUBSET of GitLab's documented default pattern (docs.gitlab.com,
+// "Default closing pattern"): the same keywords, optional colon and optional `issue(s)`, with
+// %{issue_ref} narrowed to the reference forms uzi's renderers can emit (`#N`, `group/project#N`,
+// and issue / work-item URLs). It omits the external-tracker key alternative (`ABC-123`) and
+// reference-list chaining, so it proves these fixed strings are not closing directives; it is not
+// a general closing-directive detector (that is PRD #1798's whole-body scan). It models the
+// DEFAULT only; self-managed GitLab may configure its own pattern.
+const ISSUE_REF = String.raw`(?:[A-Za-z0-9_.\-]+(?:\/[A-Za-z0-9_.\-]+)+)?#\d+|https?:\/\/\S+\/(?:issues|work_items)\/\d+`;
 const GITLAB_DEFAULT_CLOSING = new RegExp(
   String.raw`\b((?:[Cc]los(?:e[sd]?|ing)|\b[Ff]ix(?:e[sd]|ing)?|\b[Rr]esolv(?:e[sd]?|ing)|\b[Ii]mplement(?:s|ed|ing)?)(:?) +(?:(?:issues? +)?(?:${ISSUE_REF})))`,
 );
@@ -57,6 +60,8 @@ describe("GitLab default closing pattern oracle (#1801)", () => {
       "fixes group/project#7",
       "Resolved: #7",
       "Resolve issue #7",
+      "Closes https://gitlab.example.com/group/project/-/issues/7",
+      "Implements https://gitlab.example.com/group/project/-/work_items/7",
     ]) {
       assert.match(s, GITLAB_DEFAULT_CLOSING, s);
     }
