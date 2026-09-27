@@ -26,7 +26,7 @@ import type {
   PlanSummaryResult,
   Delta,
 } from "../src/summary-runner.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
 
 // A worktree path that is UNIQUE PER PROCESS AND PER CALL, and that deliberately
 // never exists. Both halves matter. Non-existence is the point of these fixtures --
@@ -1877,6 +1877,75 @@ describe("SdkExecutor agent-tree reap (B1)", () => {
     killed.length = 0;
     exec.killAgentTree();
     assert.deepStrictEqual(killed, []);
+  });
+
+  // issue #1783 (R0): the CLI root the harness spawns is recorded WITH its start time, read at
+  // spawn through the executor's reader, and is what recordedRootPids() hands the quiescence reaper.
+  it("records each spawned CLI root with its start time (onRootSpawned → recordedRootPids)", async () => {
+    let pid = 7000;
+    const seen: unknown[] = [];
+    const reads: number[] = [];
+    let exec: SdkExecutor | undefined;
+    const inner = spawningQuery([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    exec = new SdkExecutor(nullLogger(), homeDir, {
+      // Observe the recorded roots right after each turn's spawn, before the done-path reap.
+      queryFn: (params) => {
+        const gen = inner(params);
+        return (async function* () {
+          let first = true;
+          for await (const m of gen) {
+            if (first) seen.push(exec!.recordedRootPids());
+            first = false;
+            yield m;
+          }
+        })() as ReturnType<SdkQueryFn>;
+      },
+      spawn: () => ({ pid: ++pid }),
+      kill: () => true,
+      rootStartTime: (p) => (reads.push(p), p * 10),
+    });
+    await exec.run(makeCtx().ctx);
+    assert.deepStrictEqual(reads, [7001, 7002], "the start time is read once per root, at spawn");
+    assert.deepStrictEqual(seen, [
+      [{ pid: 7001, startTime: 70010 }],
+      [
+        { pid: 7001, startTime: 70010 },
+        { pid: 7002, startTime: 70020 },
+      ],
+    ]);
+    assert.deepStrictEqual(exec.recordedRootPids(), [], "the done-path reap leaves no recorded root");
+    const kept = (exec as unknown as { rootStartTimes: Map<number, unknown> }).rootStartTimes;
+    assert.equal(kept.size, 0, "a reaped root's start time is pruned with its pid");
+  });
+
+  it("omits a root whose start time is unreadable, and warns once", async () => {
+    let pid = 7100;
+    const { logger, lines } = recordingLogger();
+    const seen: unknown[] = [];
+    let exec: SdkExecutor | undefined;
+    const inner = spawningQuery([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    exec = new SdkExecutor(logger, homeDir, {
+      queryFn: (params) => {
+        const gen = inner(params);
+        return (async function* () {
+          let first = true;
+          for await (const m of gen) {
+            if (first) seen.push(exec!.recordedRootPids());
+            first = false;
+            yield m;
+          }
+        })() as ReturnType<SdkQueryFn>;
+      },
+      spawn: () => ({ pid: ++pid }),
+      kill: () => true,
+      rootStartTime: () => undefined,
+    });
+    await exec.run(makeCtx().ctx);
+    assert.deepStrictEqual(seen, [[], []], "an unrecordable root exempts nothing");
+    const drops = lines.filter((l) => /agent CLI root not recorded/.test(String((l as { msg: string }).msg)));
+    assert.equal(drops.length, 1, "warned once for two unrecordable roots");
+    assert.equal((drops[0] as { level: string; pid: number }).level, "warn");
+    assert.equal((drops[0] as { pid: number }).pid, 7101);
   });
 
   it("reaps the agent subprocess even on a failure path (no plan submitted)", async () => {

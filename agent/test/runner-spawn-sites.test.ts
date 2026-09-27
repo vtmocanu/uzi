@@ -28,7 +28,7 @@ const SETPRIV_LITERAL = /["'`](?:[^"'`\n]*\/)?setpriv["'`]/g;
 /**
  * How a site's spawn is marked: `marked` (always carries workerSpawnEnv), `unmarked` (never: it can
  * run repo-, agent- or model-directed code, so its leaks stay reapable), `conditional` (the site
- * decides per call: runGitAsRunner marks only code-free git subcommands, the tick spawner keeps its
+ * decides per call: runGitAsRunner marks only driver-free git subcommands, the tick spawner keeps its
  * caller's choice for a runner-uid child), or `wrapper` (a wrapper body / reference whose CALLER
  * decides the env).
  */
@@ -43,7 +43,7 @@ const ALLOWLIST: Record<string, { count: number; mark: Mark; disposition: string
   "runner-uid.ts#setpriv-spawn": { count: 2, mark: "marked", disposition: "killRunnerGroup / killRunnerGroupOnly `kill -KILL` (worker-authored fixed argv: workerSpawnEnv)" },
   "runner-uid.ts#setpriv-literal": { count: 1, mark: "wrapper", disposition: "the SETPRIV constant the wrappers use" },
   "executor.ts#runnerCommand()": { count: 1, mark: "unmarked", disposition: "stub executor git (the agent turn's stand-in `add`/`commit` in the clone, which runs clone-configured filters): NOT marked" },
-  "git.ts#runnerCommand()": { count: 1, mark: "conditional", disposition: "runGitAsRunner: workerSpawnEnv only for runnerGitCarriesWorkerMark's code-free subcommands (rev-parse, update-ref, config, ls-files, …); status/add/commit/checkout/reset/merge/rebase/diff/log run UNMARKED (a planted filter/driver stays reapable)" },
+  "git.ts#runnerCommand()": { count: 1, mark: "conditional", disposition: "runGitAsRunner: workerSpawnEnv only for runnerGitCarriesWorkerMark's driver-free subcommands (rev-parse, update-ref, config, ls-files, …; lazy fetch pinned off); status/add/commit/checkout/reset/merge/rebase/diff/log run UNMARKED (a planted filter/driver stays reapable)" },
   "js-deps.ts#runnerCommand()": { count: 1, mark: "unmarked", disposition: "JS deps install: NOT marked (the package manager reads repo-controlled config in the clone; leaks stay reapable)" },
   "provision.ts#runnerCommand()": { count: 2, mark: "conditional", disposition: "devbox/nix run: NOT marked (untrusted nix build hooks; cwd outside the clone); PATH probe (fixed script): workerSpawnEnv" },
   "provision.ts#commandRootCommand()": { count: 1, mark: "marked", disposition: "PATH probe as runner-cmd (uid 10003, never scanned; fixed script): workerSpawnEnv" },
@@ -77,6 +77,29 @@ function codeOf(text: string): string {
     .filter((l) => !/export function (runnerCommand|runnerSpawn|commandRootCommand|setprivRunnerArgs|setprivArgsForUid)\(/.test(l))
     .join("\n");
 }
+
+/**
+ * The local names `fn` is callable by in a file: itself, plus every `fn as <alias>` in a named
+ * import (a namespace import's `ns.fn(` already matches `\bfn\(`). Read from the RAW text, since
+ * codeOf drops the import statements.
+ */
+function callableNames(text: string, fn: string): string[] {
+  const names = [fn];
+  for (const m of text.matchAll(/^import\s+(?:type\s+)?\{([\s\S]*?)\}\s+from\s+"[^"]+";/gm)) {
+    for (const spec of m[1]!.split(",")) {
+      const alias = spec.trim().match(new RegExp(`^${fn}\\s+as\\s+(\\w+)$`));
+      if (alias) names.push(alias[1]!);
+    }
+  }
+  return names;
+}
+
+/** True when `code` calls `fn` under any of `names`. */
+function callsAny(code: string, names: readonly string[]): boolean {
+  return names.some((n) => new RegExp(`\\b${n}\\(`).test(code));
+}
+
+const MARK_FNS = ["workerSpawnEnv", "unmarkedSpawnEnv"] as const;
 
 function found(): Record<string, number> {
   const out: Record<string, number> = {};
@@ -121,10 +144,12 @@ describe("runner-uid spawn sites (issue #1783 R4)", () => {
       byFile.set(file, [...(byFile.get(file) ?? []), v.mark]);
     }
     for (const [file, marks] of byFile) {
-      const code = codeOf(fs.readFileSync(path.join(SRC, file), "utf8"));
+      const text = fs.readFileSync(path.join(SRC, file), "utf8");
+      const code = codeOf(text);
       const marks_ = new Set(marks);
-      const callsMark = /\bworkerSpawnEnv\(/.test(code);
-      const callsUnmark = /\bunmarkedSpawnEnv\(/.test(code);
+      // An import alias (`workerSpawnEnv as markEnv`) is resolved, so a renamed call still counts.
+      const callsMark = callsAny(code, callableNames(text, "workerSpawnEnv"));
+      const callsUnmark = callsAny(code, callableNames(text, "unmarkedSpawnEnv"));
       if ([...marks_].every((m) => m === "unmarked")) {
         assert.equal(callsMark, false, `${file}: every site is unmarked, yet the file calls workerSpawnEnv`);
       }
@@ -134,6 +159,29 @@ describe("runner-uid spawn sites (issue #1783 R4)", () => {
         // spawn built on a replacement env, a fixed probe marked); git.ts and tick-spawner.ts decide
         // inside ONE site, so they must carry both branches.
         assert.equal(callsMark && callsUnmark, true, `${file}: a conditional site must both mark and strip the mark`);
+      }
+    }
+  });
+
+  it("resolves an import alias of the mark functions", () => {
+    const text = 'import { a, workerSpawnEnv as markEnv, unmarkedSpawnEnv } from "./worker-spawn-mark.js";\nconst e = markEnv(x);\n';
+    assert.deepEqual(callableNames(text, "workerSpawnEnv"), ["workerSpawnEnv", "markEnv"]);
+    assert.equal(callsAny(codeOf(text), callableNames(text, "workerSpawnEnv")), true, "the aliased call is seen");
+    assert.equal(callsAny(codeOf(text), ["workerSpawnEnv"]), false, "the bare name alone would miss it");
+  });
+
+  it("no source file re-binds a mark function by value (only direct or import-aliased calls exist)", () => {
+    // A value alias (`const m = workerSpawnEnv`, passing it as a callback) would hide calls from
+    // the per-file check above; forbid it outright outside the defining module.
+    for (const file of listTs(SRC)) {
+      const rel = path.relative(SRC, file).split(path.sep).join("/");
+      if (rel === "worker-spawn-mark.ts") continue;
+      const text = fs.readFileSync(file, "utf8");
+      const code = codeOf(text);
+      for (const fn of MARK_FNS) {
+        for (const name of callableNames(text, fn)) {
+          assert.equal(new RegExp(`\\b${name}\\b(?!\\s*\\()`).test(code), false, `${rel}: \`${name}\` is referenced without being called`);
+        }
       }
     }
   });

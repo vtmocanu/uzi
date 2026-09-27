@@ -11,8 +11,12 @@
 //     agent-configured code: a kill or probe helper, the quiescence helper, and a runner-clone
 //     git whose subcommand touches neither the working tree nor a configurable driver
 //     (rev-parse, rev-list, update-ref, config, ls-files, ls-tree, check-ignore, and the seed's
-//     `clone --no-checkout`). A process carrying THIS worker's nonce and NO attempt marker is
-//     never run-owned: the reaper skips it, so a concurrent worker op survives a reap.
+//     `clone --no-checkout`). Such a git is driver-free, not code-free by itself: a missing
+//     object would LAZY-FETCH through a promisor remote the clone's config plants (its
+//     `uploadpack` is a program). Every worker git pins GIT_NO_LAZY_FETCH=1 and the marked subset
+//     also `protocol.allow=never` (git.ts; test/git-no-lazy-fetch.test.ts runs the plant). A
+//     process carrying THIS worker's nonce and NO attempt marker is never run-owned: the reaper
+//     skips it, so a concurrent worker op survives a reap.
 //     Everything that can execute repo- or agent-authored code is deliberately NOT marked, so
 //     whatever it leaks stays reapable: a self-improve check, a dependency install, provisioning
 //     builds, a Codex provider or command root, the stub executor's git, and EVERY runner-clone
@@ -21,8 +25,10 @@
 //     `gpg.program` cannot be pinned off (git.ts), so `status`, `add`, `commit`, `checkout`,
 //     `reset`, `merge`, `rebase`, `cherry-pick`, `rm`, `clean`, `diff` and `log` run UNMARKED
 //     (runnerGitCarriesWorkerMark in git.ts). A filter such a git starts after a quiescence
-//     proof is therefore reapable, and every sink that runs one between its proof and a
-//     credentialed step re-runs the process proof first (runner.ts).
+//     proof is therefore reapable, and every path that runs one between its proof and a
+//     credentialed step re-runs the process proof first (runner.ts): the park, shutdown and
+//     pause wip markers, the restore-point, hold and settle-transfer captures, and finalize's
+//     base-align and self-improve checks (before its refetch and PAT push).
 //
 // Threat model: the mark defends against ACCIDENTAL escape only. The nonce is random per worker
 // process and never enters a model-directed env, but it is not a secret against a deliberate

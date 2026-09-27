@@ -3780,6 +3780,9 @@ export class RunRunner {
         changed === null ? null : flagGuardPaths(changed),
         checks,
       );
+      // issue #1783: the install and the checks ran agent-authored code in the clone after the
+      // finalize proof; re-prove before anything credentialed (the align's fetch, the push).
+      await this.reproveFinalizeOrThrow(flight, "finalize_checks");
     }
 
     // Guard-critical flag for an ad-hoc scheduled prompt run (PRD #241 Decision 10,
@@ -4373,6 +4376,11 @@ export class RunRunner {
 
             // Re-fetch the aligned tip into the worker bare's tracking ref, then push once.
             const fetchAndPush = async () => {
+              // issue #1783: the align strategy that just ran is unmarked clone git (checkout
+              // --force, reset --hard, clean, merge/rebase, commit) that can start a planted smudge
+              // filter or merge driver. Re-prove BEFORE the refetch and the PAT push; blocked throws
+              // RunResidueBlockedError, which every push catch below rethrows unchanged.
+              await this.reproveFinalizeOrThrow(flight, "finalize_align");
               await this.git.fetchAgentBranch(
                 alignBarePath,
                 runnerClone.path,
@@ -4424,7 +4432,7 @@ export class RunRunner {
                 await fetchAndPush();
                 return false;
               } catch (e) {
-                if (e instanceof ScratchPublicationError) throw e;
+                if (e instanceof ScratchPublicationError || e instanceof RunResidueBlockedError) throw e;
                 if (await reportMovedBranchIfVerified(e)) return true;
                 // PRD #974 M2: an aligned push rejected by GitHub Push Protection (GH013) is a
                 // secret the pre-push gitleaks scan missed — route it to the typed
@@ -4513,6 +4521,7 @@ export class RunRunner {
                   await fetchAndPush(); // sets alignPushed = true on success
                   overlayHandled = true;
                 } catch (e) {
+                  if (e instanceof RunResidueBlockedError) throw e;
                   // PRD #974 M2: an overlay push rejected by GitHub Push Protection (GH013) is a
                   // secret gitleaks missed — typed push_secret_blocked fail (NO preserved diff:
                   // it may carry the secret), not a fall-back to merge/rebase (which cannot clear
@@ -4545,6 +4554,7 @@ export class RunRunner {
                 try {
                   await fetchAndPush();
                 } catch (e) {
+                  if (e instanceof RunResidueBlockedError) throw e;
                   // PRD #974 M2: a merge push rejected by GitHub Push Protection (GH013) is a secret
                   // gitleaks missed — typed push_secret_blocked fail (NO preserved diff: it may
                   // carry the secret), not the rebase fallback (which cannot clear a secret) nor
@@ -7001,9 +7011,13 @@ export class RunRunner {
    * (issue #1783): a boundary called WITH its flight (the limit park, the graceful-shutdown sink,
    * the milestone checkpoint, and the pre-settle reap of every credentialed custody settle) first
    * runs {@link quiesceRun} (whose first step is that same killAgentTree) and skips the body with a
-   * RunResidueBlockedError when the clone is not provably quiescent. A body that runs a runner-clone
-   * git able to start clone-configured code (the wip marker) re-proves before its credentialed step
-   * ({@link quiesceOrBlockSink} with `processOnly`).
+   * RunResidueBlockedError when the clone is not provably quiescent. After that proof, every
+   * runner-clone step able to start clone-configured code is followed by a process re-proof before
+   * the next credentialed step: the park and shutdown bodies' wip marker ({@link quiesceOrBlockSink}
+   * with `processOnly`); the settle transfer, the restore-point and hold captures' status read and
+   * wip marker ({@link reproveAfterRunnerGit}); and, outside this facade, finalize's base-align and
+   * self-improve checks ({@link reproveFinalizeOrThrow}). The milestone checkpoint body runs no
+   * such step, and the pre-settle reap's body is empty.
    *
    * Codex permit scope (advisory): only the sinks routed through HERE run their quiescence (for
    * Codex, the Docker teardown alone: the supervisor proves process drain) INSIDE the held permit.
@@ -7069,7 +7083,11 @@ export class RunRunner {
     site: string,
     opts: { processOnly?: boolean; keepClone?: boolean } = {},
   ): Promise<void> {
-    const q = await this.quiesceRun(flight, executor, { mode: "own", site, processOnly: opts.processOnly });
+    const q = await this.quiesceRun(flight, executor, {
+      mode: "own",
+      site: opts.processOnly ? `${site}:after_runner_git` : site,
+      processOnly: opts.processOnly,
+    });
     if (!q.blocked) return;
     // Keep the clone and its recovery journal: the terminal finally must not retire a tree a
     // surviving process may still be writing. The bare tracking ref is untouched (no fetch-back).
@@ -7087,6 +7105,22 @@ export class RunRunner {
   private async reproveAfterRunnerGit(flight: RunFlight, site: string): Promise<boolean> {
     const q = await this.quiesceRun(flight, flight.executor, { mode: "own", site: `${site}:after_runner_git`, processOnly: true });
     return q.blocked;
+  }
+
+  /**
+   * issue #1783 (reviewer, round 3): the finalize re-proof. Finalize proves the clone quiescent
+   * once (`finalize`), then may still run code the clone configures before its PAT push: the
+   * base-align's unmarked clone git (checkout --force, reset --hard, clean, merge/rebase, commit
+   * can start a planted smudge filter or merge driver) and the dogfood self-improve dependency
+   * install + test suites (agent-authored code). Each is followed by this process re-proof before
+   * the refetch and the push; blocked fails the run exactly like the finalize gate (fail_origin
+   * `worker_residue_blocked`, the clone kept, no credentialed settle).
+   */
+  private async reproveFinalizeOrThrow(flight: RunFlight, site: string): Promise<void> {
+    const q = await this.quiesceRun(flight, flight.executor, { mode: "own", site: `${site}:after_runner_git`, processOnly: true });
+    if (!q.blocked) return;
+    flight.preserveRecoveryClone = true;
+    throw new RunResidueBlockedError(q.outcome.process?.detail ?? "not quiescent");
   }
 
   /**
@@ -7128,6 +7162,7 @@ export class RunRunner {
           // Docker teardown already ran at the sink's first proof, and never blocks anyway.
           dockerHost: opts.processOnly ? undefined : this.dockerHost,
           registry: this.liveAttempts,
+          site: opts.site,
         });
       } catch (err) {
         outcome = {

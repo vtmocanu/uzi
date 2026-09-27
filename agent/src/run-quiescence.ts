@@ -986,6 +986,9 @@ export interface QuiesceRunRequest {
   processes: boolean;
   dockerHost: string | undefined;
   registry: LiveAttemptRegistry;
+  /** The runner site asking (e.g. `finalize`, `park:after_runner_git` for a re-proof after a
+   *  runner-clone git): diagnostic only, the proof itself never reads it. */
+  site?: string;
 }
 
 /** The two halves' results. `process` is undefined when the process half was skipped. */

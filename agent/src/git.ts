@@ -149,7 +149,11 @@ const GITLEAKS_BIN = "/usr/local/bin/gitleaks";
 //     issue #1783: such a runner git is still a WORKER-started process, so it must never carry
 //     the worker spawn mark (a plant it starts would inherit the nonce and be exempt from the
 //     run-quiescence reaper forever): runGitAsRunner marks only runnerGitCarriesWorkerMark's
-//     code-free subcommands.
+//     driver-free subcommands.
+//   - `remote.<name>.uploadpack` / `.promisor` with `extensions.partialClone` — also
+//     arbitrary-name, so not pinnable here; reached by LAZY FETCH of a missing object from any
+//     git, even a pure ref read. Closed by GIT_NO_LAZY_FETCH=1 below (and, for the worker-marked
+//     runner git, `protocol.allow=never`): issue #1783, round 3.
 const GIT_CODE_EXEC_KEY_PINS: ReadonlyArray<readonly [key: string, value: string]> = [
   ["core.fsmonitor", "false"],
   ["diff.external", "true"],
@@ -4731,9 +4735,12 @@ export class GitCache {
     // other runner git here (status, add, commit, checkout, reset, merge, rebase, …) can start an
     // agent-planted filter/driver, which must stay reapable: it runs UNMARKED.
     const runnerEnv: NodeJS.ProcessEnv = { ...base, PATH: runnerPath() };
-    const env: NodeJS.ProcessEnv = runnerGitCarriesWorkerMark(args)
-      ? workerSpawnEnv(runnerEnv)
-      : unmarkedSpawnEnv(runnerEnv);
+    const marked = runnerGitCarriesWorkerMark(args);
+    const env: NodeJS.ProcessEnv = marked ? workerSpawnEnv(runnerEnv) : unmarkedSpawnEnv(runnerEnv);
+    // Belt to gitEnv's GIT_NO_LAZY_FETCH for the marked subset: those reads need no transport
+    // at all, so `protocol.allow=never` refuses any a planted config could still reach (the seed's
+    // `clone --no-checkout` reads the bare over the local transport, so it is exempt).
+    if (marked && firstRunnerGitSubcommand(args) !== "clone") appendGitConfigPair(env, "protocol.allow", "never");
     const tmp = runnerTmpdir();
     if (tmp) env.TMPDIR = tmp;
     // A permit-scoped subprocess is already launched as the isolated command uid
@@ -4970,9 +4977,16 @@ export const OVERLAY_COMMIT_PREFIX = "ckpt(overlay):" as const;
  * unscoped — harmless because local/file transport ignores http.* config entirely.
  */
 /**
- * issue #1783 (R4, auditor M1) — runner-clone git subcommands that execute NO code the clone
- * configures, and so may carry the worker spawn mark. The runner clone's `.git/config` and
- * `.gitattributes` are agent-writable, and the arbitrary-name driver keys (`filter.<name>.*`,
+ * issue #1783 (R4, auditor M1) — runner-clone git subcommands that may carry the worker spawn
+ * mark: they start no filter, diff, merge or signing driver, and (with the pins below) no
+ * transport, so no program the clone configures. They are NOT code-free on their own: a missing
+ * object would make any of them LAZY-FETCH through a `extensions.partialClone` promisor remote
+ * the agent-writable config plants (its `uploadpack` is a program), and a planted program would
+ * inherit the nonce. That path is closed by two pins, not by the subcommand choice:
+ * GIT_NO_LAZY_FETCH=1 in {@link gitEnv} (every worker git, marked or not), and
+ * `protocol.allow=never` on this marked subset (runGitAsRunner; the seed's local clone exempt).
+ * The runner clone's `.git/config` and `.gitattributes` are agent-writable, and the
+ * arbitrary-name driver keys (`filter.<name>.*`,
  * `diff.<name>.*`, `merge.<name>.driver`) and `gpg.program` cannot be pinned off (see the
  * GIT_CODE_EXEC_KEY_PINS note above), so a git that touches the working tree, content-diffs,
  * merges or shows signatures can start an agent-planted program. That program inherits the git's
@@ -4980,8 +4994,9 @@ export const OVERLAY_COMMIT_PREFIX = "ckpt(overlay):" as const;
  * forever. So only these pure ref/object/config/index reads and ref writes are marked; the
  * seed's clone is marked only with `--no-checkout` (no working tree is written). Anything else
  * (status, add, commit, checkout, reset, rm, clean, merge, rebase, cherry-pick, diff, log, …) runs
- * UNMARKED, and every sink that runs one after a quiescence proof re-proves before a credentialed
- * step (runner.ts). Leading `-c key=value` pairs are skipped to find the subcommand.
+ * UNMARKED, and every path that runs one after a quiescence proof (the park, shutdown and pause
+ * wip markers, the restore-point, hold and settle-transfer captures, finalize's base-align) re-proves
+ * before its next credentialed step (runner.ts). Leading `-c key=value` pairs are skipped to find the subcommand.
  */
 const RUNNER_GIT_MARKED_SUBCOMMANDS: ReadonlySet<string> = new Set([
   "rev-parse",
@@ -4993,13 +5008,31 @@ const RUNNER_GIT_MARKED_SUBCOMMANDS: ReadonlySet<string> = new Set([
   "check-ignore",
 ]);
 
-export function runnerGitCarriesWorkerMark(args: readonly string[]): boolean {
+/** The subcommand of a git argv (leading `-c key=value` pairs skipped), or undefined. */
+function firstRunnerGitSubcommandIndex(args: readonly string[]): number {
   let i = 0;
   while (args[i] === "-c" && i + 1 < args.length) i += 2;
+  return i;
+}
+
+function firstRunnerGitSubcommand(args: readonly string[]): string | undefined {
+  return args[firstRunnerGitSubcommandIndex(args)];
+}
+
+export function runnerGitCarriesWorkerMark(args: readonly string[]): boolean {
+  const i = firstRunnerGitSubcommandIndex(args);
   const sub = args[i];
   if (sub === undefined) return false;
   if (sub === "clone") return args.slice(i + 1).includes("--no-checkout");
   return RUNNER_GIT_MARKED_SUBCOMMANDS.has(sub);
+}
+
+/** Append one inline `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` pair to a {@link gitEnv}-built env. */
+function appendGitConfigPair(env: NodeJS.ProcessEnv, key: string, value: string): void {
+  const n = Number.parseInt(env.GIT_CONFIG_COUNT ?? "0", 10) || 0;
+  env[`GIT_CONFIG_KEY_${n}`] = key;
+  env[`GIT_CONFIG_VALUE_${n}`] = value;
+  env.GIT_CONFIG_COUNT = String(n + 1);
 }
 
 export function gitEnv(pat?: string, httpScope?: string, username?: string): NodeJS.ProcessEnv {
@@ -5022,6 +5055,13 @@ export function gitEnv(pat?: string, httpScope?: string, username?: string): Nod
     // key could be planted, and it is outside the inline-pin override guarantee for
     // any key we don't pin. The worker needs nothing from it (PRD #51 M0).
     GIT_CONFIG_NOSYSTEM: "1",
+    // issue #1783 (auditor, round 3): never LAZY-FETCH a missing object. A runner clone's
+    // agent-writable `.git/config` can declare `extensions.partialClone=<remote>` with that
+    // remote's `uploadpack=<program>`; any git that then needs a missing object (even a
+    // `rev-parse --verify <sha>^{commit}`) spawns the planted program to fetch it. No worker git
+    // needs lazy fetch: the bare is a full clone and every runner clone a `clone --shared` of it,
+    // so every object a legitimate op reads is local. With this pin a missing object is an error.
+    GIT_NO_LAZY_FETCH: "1",
   };
   // PRD #51 M3 / 5-bis: keep git's scratch (packs, lockfiles) on the worker's private
   // 0700 TMPDIR (set by the entrypoint) rather than a shared sticky /tmp. Carry it only
