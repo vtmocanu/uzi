@@ -21,7 +21,9 @@ const labels: Record<string, string> = {
   push_secret_blocked: "push secret blocked",
   forge_unreachable: "forge unreachable",
   history_rewritten: "history rewritten",
+  task_undispatched: "task undispatched",
   plan_missing: "plan missing",
+  data_volume_full: "data volume full",
   unknown: "unknown",
 };
 

@@ -233,6 +233,12 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 								_, _ = fmt.Fprintf(env.Stderr,
 									"run %s %s; still following\n",
 									args[0], line)
+							} else if line := diskParkLine(run); line != "" {
+								// PRD #1809 M5: the worker's data volume was full. It resumes
+								// at its next retry; the reclaim frees space in the meantime.
+								_, _ = fmt.Fprintf(env.Stderr,
+									"run %s %s; still following\n",
+									args[0], line)
 							} else {
 								_, _ = fmt.Fprintf(env.Stderr,
 									"run %s recovering — a transient interruption parked it; still following, it resumes on its own\n",
