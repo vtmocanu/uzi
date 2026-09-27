@@ -152,20 +152,36 @@ func (c *HTTPClient) GetFindingsStats(ctx context.Context, repo string) (apitype
 	return out, nil
 }
 
-func (c *HTTPClient) UndoDismissFinding(ctx context.Context, id string) error {
-	// A 404 here means the coordinate is not dismissed (an unknown/foreign id or a non-dismissed
-	// one) — softened to ErrFindingNotDismissed (a plain error) so `uzi findings undo` can report
-	// "already undone" and exit 0. Any other non-2xx keeps its real exit code. Mirrors
-	// DeleteDisposition's DELETE-404 softening; the id is escaped, off the positional.
-	path := "/api/findings/" + url.PathEscape(id) + "/dismiss"
+func (c *HTTPClient) MarkFindingDone(ctx context.Context, id string) (apitypes.MarkFindingDoneResultDTO, error) {
+	// An empty JSON object body: the done endpoint resolves the coordinate from the stored,
+	// owner-scoped evidence row, never from the request. postJSON maps a non-2xx through
+	// statusError (404→4 unknown/foreign, 409→5 being filed), exactly as DismissFinding.
+	var out apitypes.MarkFindingDoneResultDTO
+	if err := c.postJSON(ctx, "/api/findings/"+url.PathEscape(id)+"/done", struct{}{}, &out); err != nil {
+		return apitypes.MarkFindingDoneResultDTO{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) UndoFinding(ctx context.Context, id string) (apitypes.IncidentalFindingDTO, error) {
+	// A 404 here means the coordinate carries no human verdict to undo (an unknown/foreign id,
+	// or one that is open, filed or being filed) — softened to ErrFindingNothingToUndo (a plain
+	// error) so `uzi findings undo` can report "already undone" and exit 0. Any other non-2xx
+	// keeps its real exit code. Mirrors DeleteDisposition's DELETE-404 softening; the id is
+	// escaped, off the positional.
+	path := "/api/findings/" + url.PathEscape(id) + "/disposition"
 	resp, body, err := c.doJSONRead(ctx, http.MethodDelete, path, nil)
 	if err != nil {
-		return err
+		return apitypes.IncidentalFindingDTO{}, err
 	}
 	if resp.StatusCode == http.StatusNotFound {
-		return ErrFindingNotDismissed
+		return apitypes.IncidentalFindingDTO{}, ErrFindingNothingToUndo
 	}
-	return decode2xx(resp, body, path, nil)
+	var out apitypes.IncidentalFindingDTO
+	if err := decode2xx(resp, body, path, &out); err != nil {
+		return apitypes.IncidentalFindingDTO{}, err
+	}
+	return out, nil
 }
 
 // ReviewFiledIssueDTO / ReviewIssueFileResult mirror the review file handler's wire shape
