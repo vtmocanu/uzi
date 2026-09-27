@@ -54,7 +54,15 @@ removes the tree.
    results are `not_wired` (no daemon configured), `docker_unconfirmed`, or
    `docker_error`. **It never reports `quiescent`**: a `create` the daemon already
    accepted can still complete after the last listing, so no Docker result may
-   ever be read as proof of quiescence.
+   ever be read as proof of quiescence. Because it never reports `quiescent`,
+   none of its three outcomes ever blocks anything — a Docker result is
+   best-effort cleanup, logged either way, not a gate. The whole teardown is
+   bounded by an overall budget (15 s by default): the remaining budget is
+   checked before every list and delete request, each individual request is
+   capped by whichever is smaller — its own timeout or the time left — with an
+   absolute wall-clock deadline so a trickling or stalled response cannot
+   outlive the budget, and once the budget is spent the teardown returns
+   `docker_error` rather than starting another request.
 4. **Gating by site**, all fail-closed on a non-quiescent verdict:
    - the limit, wall-clock and completion-hold parks leave the park standing, with
      no credentialed publish;
@@ -228,9 +236,15 @@ removes the tree.
 
 ## Invariants future code must respect
 
-- Never treat a Docker teardown result as proof of quiescence; only the process
-  reaper's `quiescent` state is proof, and only when paired with a clean Docker
-  listing where a daemon is wired.
+- **The process reaper's `quiescent` state is the only proof of quiescence, and
+  it alone is blocking.** `teardownDocker` never returns `quiescent`, ever — its
+  three states are `not_wired`, `docker_unconfirmed`, and `docker_error` — so
+  there is no Docker result to pair a process proof with. Every Docker outcome
+  is treated as best-effort cleanup, never as proof: `docker_unconfirmed` is
+  logged and does not block, and `docker_error` is logged and does not block
+  either. Fail-closed is the process half's rule alone — a surviving or
+  unattributable process (`survivors` or `unverified`) blocks the sink at every
+  site that gates on quiescence; a non-quiescent Docker result blocks nothing.
 - Never mark `UZI_WORKER_SPAWN` on anything other than a worker-authored,
   fixed-argv spawn. Marking a repo- or agent-invoked command breaks the
   attribution the reaper depends on to distinguish worker infrastructure from
@@ -260,11 +274,75 @@ removes the tree.
 
 ## Consequences
 
-The worker can now prove a clone is safe to touch before every destructive or
-credentialed operation, and fails closed rather than guessing when it cannot.
-Attempt-unique clone paths mean an escaped process or a mis-owned directory from
-one attempt can never contaminate a later attempt's work, at the cost of
-same-cwd session resume on Docker-wired workers (Option A). Unremovable residue
-is quarantined rather than left to wedge the worker or silently deleted. The
-durable fix for Option A's continuity loss (Option B, a per-attempt Docker API
-mediation proxy) remains open work.
+The worker can now prove that a run's OWN processes have stopped before every
+destructive or credentialed operation gated on it, and fails closed rather than
+guessing when it cannot. This is narrower than proving the clone itself is
+safe to touch: the process proof runs only where the reaper's process scan is
+gated to run at all (Linux workers; see `agent/src/runner.ts`'s
+`process.platform === "linux"` check), and it says nothing about a Docker
+container — the Docker teardown that runs alongside it is best-effort cleanup,
+not proof, so a container that still binds the clone path can, in principle,
+outlive the checks that gate on process quiescence alone. Attempt-unique clone
+paths mean an escaped process or a mis-owned directory from one attempt can
+never contaminate a later attempt's work, at the cost of same-cwd session
+resume on Docker-wired workers (Option A). Unremovable residue is quarantined
+rather than left to wedge the worker or silently deleted. The durable fix for
+Option A's continuity loss (Option B, a per-attempt Docker API mediation proxy)
+remains open work.
+
+## Root-only acceptance at the final head
+
+(recorded after the final acceptance run)
+
+## Follow-ups and accepted risks
+
+These are not filed yet; listed here for the maintainer to file after merge.
+
+- **Behaviour change: a resume or re-claim on a Docker-wired worker starts a
+  new model session** (Option A above). This is an accepted, disclosed
+  trade-off of the isolation guarantee, not a bug, but it is a real change from
+  prior behavior worth calling out explicitly to anyone debugging a resumed
+  run's apparent memory loss.
+- **Follow-up 1 — the "container binding nothing under a clone path" scope
+  reduction** (see *Disclosed scope reductions* above) is worth its own
+  tracking issue: the Docker teardown only ever targets containers with a bind
+  mount under the clone, so a container that touches the clone some other way
+  is never found or torn down by this work.
+- **Follow-up 2 — Option B, a per-attempt Docker API mediation proxy.** The
+  reviewers named but did not build a proxy that would prove zero container
+  exposure across an attempt boundary and so restore safe in-place session
+  resume without losing conversational continuity (decision 16). This remains
+  open work.
+- **Follow-up 3 — the retention sweep can delete an older attempt or residue
+  path after a process-only check, even when the Docker teardown was
+  unconfirmed.** Raised in a bot security review: since a Docker result never
+  gates the sweep's deletions (only the process proof does), a sweep-triggered
+  delete can remove a path whose Docker containers were never confirmed torn
+  down. A follow-up could require a fresh, successful Docker-use check before
+  deleting a retained path, rather than relying on the process proof alone.
+
+**Accepted risks:**
+
+- **The attempt ledger's compaction depends on hard links.** Rewriting the
+  ledger atomically (decisions 10/14) publishes the edited config by
+  hard-linking a temp file to `config.lock` before renaming it into place
+  (`agent/src/git.ts`, `rewriteLedgerAtomically`) — git's own lockfile
+  protocol. A data volume that does not support hard links cannot run this
+  compaction; that is a deployment constraint on this design, not a design gap.
+- **A crash between the hard-link and the rename can leave a stale
+  `config.lock`.** This is the same window git's own config writes have, not a
+  new one this work introduces: any failure before the rename leaves the bare
+  `config` file untouched, but a process killed at exactly that instant leaves
+  `config.lock` behind, which would block a later git config write against the
+  same bare until the stale lock is cleared.
+
+## Docker-wired Codex worker: attempt seeds are also self-contained
+
+On a Docker-wired worker running Codex, the attempt-path seed introduced by
+this work is made self-contained the same way the canonical seed already was
+(#1769 materialization): after every ref/checkpoint step, and still under the
+bare's lock, the clone is dissociated from the bare because the Codex command
+sandbox does not grant the bare and git inside the sandbox cannot follow the
+alternate. This applies to both the canonical seed and, since the merge that
+reconciled #1783 with #1769, the per-attempt seed as well (see
+`runnerCloneForBranch`'s docstring in `agent/src/git.ts`).

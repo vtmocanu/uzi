@@ -394,13 +394,38 @@ CLI docs](./cli.md#commands) for the exact commands, and
 
 Before it pushes a run's branch, captures its work, or reseeds its clone,
 the worker checks that everything the run started has actually stopped: the
-processes its tools spawned and the Docker activity it began. It also
-checks that the run's clone path is clear, or can be moved aside into
-quarantine. If it cannot prove the run stopped (a run-owned process
-survived, or its state could not be verified), or it cannot clear the
-leftover files at the clone path, it refuses to push, capture or reseed
-rather than guess, and fails the run with `fail_origin =
-worker_residue_blocked`, shown as **worker residue blocked**.
+processes its tools spawned, and, best-effort, the Docker activity it
+began. An unresolved Docker container never blocks anything on its own; only
+an unproven **process** is treated as a run still running.
+
+What happens next depends on where in the run this check comes up, because
+most of the places that check are not the end of the run:
+
+- At a wall-clock, usage-limit, or completion-hold park, the check being
+  unproven means the worker skips publishing a checkpoint for that park —
+  nothing lands on the run's branch this time, but the park itself still
+  stands, and the run resumes normally later.
+- At a pause the owner requested, it means the pause itself fails: the run
+  reports **pause failed** and keeps running rather than stopping on
+  unproven ground.
+- At a milestone checkpoint, it means that one checkpoint's publish is
+  skipped and the run continues to its next milestone.
+- During a credential switch, the worker retries capturing a verified
+  restore point a bounded number of times; if it never succeeds, the switch
+  reports **credential switch failed** and the run is left to be requeued
+  rather than continuing on an unproven clone.
+- A recovery capture that cannot prove the clone stopped is retried rather
+  than treated as a failure.
+- On graceful shutdown, an unproven clone means nothing is published to the
+  run's checkpoint; the pending requeue stands, and a later resume recovers
+  from whatever was last durably saved.
+
+The run actually **fails**, with `fail_origin = worker_residue_blocked`
+(shown as **worker residue blocked**), only at points where there is no
+safe way to continue without the proof: the finalize gate that pushes the
+run's branch (and its re-proofs after any git operation that could have
+started something new), the run's terminal failure path, and a canonical
+clone reseed that cannot free the path it needs.
 
 This is a worker infrastructure problem, not something the agent did wrong,
 so a run that fails this way is never sent to the judge. Nothing is
