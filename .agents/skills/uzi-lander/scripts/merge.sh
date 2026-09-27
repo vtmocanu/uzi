@@ -37,10 +37,11 @@
 #      conflicting with its base (mergeable=CONFLICTING), checked before the required
 #      checks because GitHub runs no pull_request CI on a conflicting PR: run land-prep.sh
 #   4  an mr_rework run is active on this MR — defer
-#   5  every-author blockers live (lib/pr-comments.sh): an unresolved review thread from an
-#      author the bot gates do not cover (CodeQL, a human, any other bot), an open
+#   5  every-author blockers live (lib/pr-comments.sh): ANY unresolved, non-outdated review
+#      thread (CodeRabbit, Greptile, CodeQL, a human, any other author), an open
 #      code-scanning alert on the head, or an unacknowledged comment / review body (listed
-#      as sanitized UNTRUSTED rows). Resolve, fix or dismiss, ack-comments.sh; re-run.
+#      as sanitized UNTRUSTED rows). Resolve, fix or dismiss, ack-comments.sh
+#      (--show ID, then ID@DIGEST); re-run.
 #      A lookup behind this check that cannot be read refuses with exit 2 instead.
 #   7  the merge lock is held by another live session (owner printed) — wait, re-run
 #   8  head mismatch vs --expect-head
@@ -182,11 +183,11 @@ ok=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pass")]|length')
 [ "$ok" -gt 0 ] || { echo "no required check passed on ${head:0:8} (only: $(printf '%s' "$cj" | jq -r '[.[].bucket]|unique|join(",")')); not merging"; exit 2; }
 
 # ---- every-author blockers, last moment — FAIL CLOSED ---------------------------------------
-# Whatever the review bots said: an unresolved thread from anyone else, an open code-scanning
-# alert on the head, or a comment / review body nobody acknowledged refuses (exit 5). A lookup
-# that cannot be read refuses too (exit 2). Rows are sanitized UNTRUSTED data.
+# Whatever the review bots said: any unresolved thread from anyone (bots included), an open
+# code-scanning alert on the head, or a comment / review body nobody acknowledged refuses
+# (exit 5). A lookup that cannot be read refuses too (exit 2). Rows are sanitized UNTRUSTED data.
 tn=$(fetch_review_threads "$REPO" "$PR") || { echo "cannot read the review threads of #$PR; not merging"; exit 2; }
-if ! ot=$(other_threads_json "$tn") || [ -z "$ot" ]; then echo "cannot classify the review threads of #$PR; not merging"; exit 2; fi
+if ! ot=$(open_threads_json "$tn") || [ -z "$ot" ]; then echo "cannot classify the review threads of #$PR; not merging"; exit 2; fi
 code_scanning_open "$REPO" "$PR"
 case "$CS_STATE" in
   ok) cs_items="$CS_ITEMS" ;;
@@ -203,7 +204,7 @@ if ma=$(must_ack_json "$issue_all" "$reviews_all") && acks=$(ack_read "$REPO" "$
 blk=$(jq -nc --argjson a "$ot" --argjson b "$cs_items" --argjson c "$ua" '$a + $b + $c')
 if [ "$(printf '%s' "$blk" | jq 'length')" -gt 0 ]; then
   print_items "$blk"
-  echo "BLOCKED: other_threads=$(printf '%s' "$ot" | jq length) code_scanning=$(printf '%s' "$cs_items" | jq length) unacknowledged=$(printf '%s' "$ua" | jq length) on #$PR — resolve each thread, fix or dismiss each alert, read and ack each comment (ack-comments.sh $REPO $PR ID...); not merging"
+  echo "BLOCKED: open_threads=$(printf '%s' "$ot" | jq length) code_scanning=$(printf '%s' "$cs_items" | jq length) unacknowledged=$(printf '%s' "$ua" | jq length) on #$PR — resolve each thread, fix or dismiss each alert, read each comment in full (ack-comments.sh $REPO $PR --show ID) and ack that version (ID@DIGEST); not merging"
   exit 5
 fi
 

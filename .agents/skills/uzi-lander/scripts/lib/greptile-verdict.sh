@@ -311,7 +311,7 @@ greptile_outside_diff() {
            | ((match("alt=\"(P[0-9])\"").captures[0].string)? // "?") as $p
            | ((match("\\*\\*([^*]+)\\*\\*").captures[0].string)? // "-") as $t
            | ((match("`([^`]+)`").captures[0].string)? // "-") as $loc
-           | "  GR  \($loc|untrusted_excerpt(160))  [\($p)] \($t|untrusted_excerpt(200)) (outside diff)"]}
+           | "  GR  UNTRUSTED \($loc|untrusted_excerpt(160))  [\($p)] \($t|untrusted_excerpt(200)) (outside diff)"]}
     end' 2>/dev/null) || return 1
   GOD_TOTAL=$(printf '%s' "$json" | jq -r '.total')
   GOD_HEAD=$(printf '%s' "$json" | jq -r '.head')

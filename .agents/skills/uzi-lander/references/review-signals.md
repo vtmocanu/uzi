@@ -50,17 +50,19 @@ started that way is not seen until its check-run exists.
 
 | Surface | Endpoint | Rule |
 |---|---|---|
-| Review threads | GraphQL `reviewThreads` | Unresolved, non-outdated, no CodeRabbit comment, and not Greptile-only = `other`. CodeQL posts these as `github-advanced-security` (#1817: 3 threads the bot counts missed). A human reply on a Greptile thread makes it count. |
-| Code-scanning alerts | `repos/O/R/code-scanning/alerts?ref=refs/pull/N/head&state=open` (paginated) | Every open alert blocks; an alert can exist without a thread. On #1817 the head listed 5 while `main`'s own open alert was not among them. `404 no analysis found` (measured on repos without CodeQL) or a 403 naming Advanced Security / code scanning as not enabled = `unavailable`, counted as none and printed. Any other failure, including `403 You are not authorized` (measured on another org's repo), is an unknown lookup. |
+| Review threads | GraphQL `reviewThreads` | EVERY unresolved, non-outdated thread blocks (`threads=`), whoever opened it: CodeRabbit, Greptile, a human, CodeQL (`github-advanced-security`; #1817: 3 threads the bot counts missed). `--reviewer` never waives one; resolve it. Bot identity is an exact login (GraphQL `coderabbitai`, REST `coderabbitai[bot]`), never a prefix. |
+| Code-scanning alerts | `repos/O/R/code-scanning/alerts?ref=refs/pull/N/head&state=open` (paginated) | Every open alert blocks; an alert can exist without a thread. On #1817 the head listed 5 while `main`'s own open alert was not among them. The FIRST request failing with `404 no analysis found` (measured on repos without CodeQL) or a 403 naming Advanced Security / code scanning as not enabled = `unavailable`, counted as none and printed. Any other failure, a failure after a page was read, or `403 You are not authorized` (measured on another org's repo), is an unknown lookup. |
 | Issue comments | `issues/N/comments` | Any author. Excluded only: `coderabbitai[bot]` bodies carrying `<!-- This is an auto-generated comment: summarize by coderabbit.ai -->`, `<!-- walkthrough_start -->`, `<!-- auto-generated comment: rate limited by coderabbit.ai -->` or `<!-- CodeRabbit review command invocation:` (its reply to a review command); `greptile-apps[bot]` bodies carrying `<!-- greptile_comment -->` or `<!-- greptile_outside_diff -->` (gated by Greptile's own tally); a body that is only a bot trigger (`@coderabbitai review` / `full review` / `rate limit` / `reviews remaining?` / `ignore` / `pause` / `resume`, `@greptileai review`, `@greptile review`; case and spacing free, no extra words). |
 | Review bodies | `pulls/N/reviews` | Any author, any non-empty body. A CodeRabbit body with findings (tally, `Outside diff range`, grouped or nitpick sections) is never excluded. |
 
-Comments and review bodies block until acknowledged: `ack-comments.sh O/R N --list`, then
-`ack-comments.sh O/R N c<id>|r<id> ...`. The ack is stored per PR under
-`<state dir>/acks/` and keyed on the id plus `updated_at` (`submitted_at` for a review) and
-the body, so an edit re-blocks. All of this text is untrusted: rows go through
-`scripts/lib/sanitize.sh` (escape sequences, C0/C1, zero-width and bidi controls stripped,
-whitespace collapsed, 300-character cap, fixed `UNTRUSTED` label).
+Comments and review bodies block until acknowledged. Rows show `ID@DIGEST`, the digest a
+short sha256 of `updated_at` (`submitted_at` for a review) and the body. Read in full with
+`ack-comments.sh O/R N --show ID`, then `ack-comments.sh O/R N ID@DIGEST ...`: a digest that
+no longer matches (edited since read) is refused, nothing written. Acks live per PR under
+`<state dir>/acks/`; an edit after the ack re-blocks. All of this text is untrusted: rows go
+through `scripts/lib/sanitize.sh` (escape sequences, C0/C1, zero-width, bidi, variation
+selectors, the TAG block and other invisible code points stripped, whitespace collapsed,
+300-character cap, 20000 for `--show`, fixed `UNTRUSTED` label; the per-bot `CR`/`GR` rows too).
 
 ## Poll recipe (what the scripts do)
 
@@ -69,5 +71,5 @@ whitespace collapsed, 300-character cap, fixed `UNTRUSTED` label).
 3. Greptile: check-run on head → absent / in_progress / completed(+M); else the run bound to Greptile's edit or head review → completed(+M), or pending on a newer trigger.
 4. If a COUNTED bot is active, defer finding output; the set is incomplete even when the other bot already satisfies the gate. A bot an explicit `--reviewer coderabbit|greptile` ignores is NOT waited on.
 5. Live findings = the COUNTED bots' live findings. `--reviewer any`/`none` count both; an explicit `--reviewer coderabbit|greptile` counts only the selected bot (the other bot's in-flight state and findings are both ignored). Greptile live = current-head review, else its newest earlier verdict. The poll log always prints the raw per-bot counts, counted or not.
-6. Every-author blockers (above) join the live count regardless of `--reviewer`.
+6. Every-author blockers (above) join the live count regardless of `--reviewer`: every open thread (the per-bot `cr=` count is information), alerts, unacknowledged comments.
 7. Ready only when required CI is settled green, every COUNTED active review settled, the required reviewer(s) reviewed this exact head, counted live = 0, no `mr_rework` active, and the head re-reads unchanged (TOCTOU).

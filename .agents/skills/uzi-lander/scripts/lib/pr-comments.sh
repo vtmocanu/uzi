@@ -4,23 +4,25 @@
 # lib/state.sh itself.
 #
 # Three blockers, each counted from ANY author (humans, CodeQL's github-advanced-security,
-# any bot), each an "item" {kind,key,id,author,at,body[,fp]} rendered only via untrusted_row:
-#   thread   an unresolved, non-outdated review thread NOT already counted per bot: no
-#            CodeRabbit comment in it, and not Greptile-only (Greptile's liveness is scoped to
-#            its verdicts by lib/greptile-verdict.sh). A human reply on a Greptile thread
-#            makes it count here. Input: fetch_review_threads output.
-#   alert    an open code-scanning alert on refs/pull/N/head. 404 (no analysis) or a 403 that
-#            says code scanning / Advanced Security is not enabled = CS_STATE=unavailable,
-#            never a silent 0; any other failure = CS_STATE=unknown.
+# CodeRabbit, Greptile, any bot), each an "item" {kind,key,id,author,at,body[,fp,digest]}
+# rendered only via untrusted_row. None is waived by a --reviewer selection.
+#   thread   EVERY unresolved, non-outdated review thread. Resolve it (or let a push outdate
+#            it) to clear it. Input: fetch_review_threads output.
+#   alert    an open code-scanning alert on refs/pull/N/head. When the INITIAL request fails
+#            with 404 (no analysis) or a 403 saying code scanning / Advanced Security is not
+#            enabled: CS_STATE=unavailable (printed, counted as none). Any other failure,
+#            including one after a page was already read: CS_STATE=unknown.
 #   comment / review-body
 #            an issue comment or non-empty review body, minus known pure-status bot output
-#            (matched by exact author AND marker) and bare bot-trigger commands. It blocks
-#            until ACKNOWLEDGED (ack-comments.sh). The ack is keyed on the item key (c<id> /
-#            r<id>) and its fingerprint (updated_at or submitted_at, plus the body), so an
-#            edit after the ack blocks again. Acks: <state dir>/acks/<owner>+<repo>+<pr>.json.
+#            (matched by EXACT author login AND marker) and bare bot-trigger commands. It
+#            blocks until acknowledged (ack-comments.sh). Its digest is a short sha256 of its
+#            updated_at (submitted_at for a review) and body; the ack must name the digest the
+#            lander read (ID@DIGEST), so an edit before or after the ack blocks again.
+#            Acks: <state dir>/acks/<owner>+<repo>+<pr>.json, {key: digest}.
 #
 # Comment text is untrusted data: it is handled only inside jq and printed through
-# untrusted_row; nothing here evaluates or interpolates it.
+# untrusted_row; nothing here evaluates or interpolates it. The digest hashes the
+# base64 form jq emits, so no comment byte reaches a shell word.
 
 _PRC_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=sanitize.sh
@@ -30,11 +32,9 @@ _PRC_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # shellcheck disable=SC2016  # jq program text
 PRC_JQ='
-def other_threads:
+def open_threads:
   [ .[]
     | select(.isResolved == false and .isOutdated == false)
-    | select((any(.comments.nodes[]?; ((.author.login // "") | startswith("coderabbitai")))) | not)
-    | select(any(.comments.nodes[]?; ((.author.login // "") != "greptile-apps")))
     | (.comments.nodes[0] // {}) as $c
     | {kind: "thread", key: "t\($c.databaseId // "?")", id: "t\($c.databaseId // "?")",
        author: ($c.author.login // "ghost"),
@@ -70,17 +70,22 @@ def must_ack($issue; $reviews):
       | {kind: "review-body", key: "r\(.id)", id: "r\(.id)", author: (.user.login // "ghost"),
          at: "\(.state // "-")@\((.commit_id // "-")[0:8])",
          body: .body, fp: "\(.submitted_at // "")\n\(.body)"}) ];
-def unacked($acks): map(select(($acks[.key] // null) != .fp));
+def unacked($acks): map(select(.digest == null or ($acks[.key] // null) != .digest));
 '
 
-# other_threads_json THREAD_NODES -> JSON array of thread items. rc 1 on unreadable input.
-other_threads_json() { printf '%s' "$1" | jq -c "$PRC_JQ"' other_threads' 2>/dev/null; }
+# _prc_sha STDIN -> the first 16 hex chars of its sha256.
+_prc_sha() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -c1-16
+}
+
+# open_threads_json THREAD_NODES -> JSON array of thread items. rc 1 on unreadable input.
+open_threads_json() { printf '%s' "$1" | jq -c "$PRC_JQ"' open_threads' 2>/dev/null; }
 
 # code_scanning_open REPO PR -> sets CS_STATE (ok|unavailable|unknown), CS_ITEMS (alert
 # items, [] unless ok) and CS_NOTE (why, for unavailable/unknown). Always rc 0.
 # shellcheck disable=SC2034  # CS_* are this function's outputs, read by the sourcing scripts.
 code_scanning_open() {
-  local repo=$1 pr=$2 errf raw rc=0 txt
+  local repo=$1 pr=$2 errf raw rc=0 txt read_a_page
   CS_STATE=unknown; CS_ITEMS='[]'; CS_NOTE=""
   errf=$(mktemp "${TMPDIR:-/tmp}/uzi-lander-cs.XXXXXX") || { CS_NOTE="mktemp failed"; return 0; }
   raw=$(gh api --paginate "repos/${repo}/code-scanning/alerts?ref=refs/pull/${pr}/head&state=open&per_page=100" 2>"$errf") || rc=$?
@@ -93,6 +98,12 @@ code_scanning_open() {
       CS_ITEMS='[]'; CS_NOTE="unreadable alert listing"
     fi
     return 0
+  fi
+  # A failure AFTER a page of alerts was read is never "not enabled": the alerts already
+  # seen are real, and the rest are unknown.
+  read_a_page=$(printf '%s' "$raw" | jq -s 'any(.[]; type == "array")' 2>/dev/null || echo false)
+  if [ "$read_a_page" = true ]; then
+    CS_NOTE="alert listing failed after a page was read (gh exit $rc)"; return 0
   fi
   case "$txt" in
     *"HTTP 404"*) CS_STATE=unavailable; CS_NOTE="no code-scanning analysis (HTTP 404)" ;;
@@ -107,10 +118,19 @@ code_scanning_open() {
   return 0
 }
 
-# must_ack_json ISSUE_FLAT REVIEWS_FLAT -> JSON array of comment/review-body items. Both
-# inputs are ONE flat JSON array each. rc 1 on unreadable input.
+# must_ack_json ISSUE_FLAT REVIEWS_FLAT -> JSON array of comment/review-body items, each
+# with its digest. Both inputs are ONE flat JSON array each. rc 1 on unreadable input.
 must_ack_json() {
-  jq -nc --argjson i "$1" --argjson r "$2" "$PRC_JQ"' if ($i|type) == "array" and ($r|type) == "array" then must_ack($i; $r) else error("x") end' 2>/dev/null
+  local items b64 digests='' d
+  items=$(jq -nc --argjson i "$1" --argjson r "$2" "$PRC_JQ"' if ($i|type) == "array" and ($r|type) == "array" then must_ack($i; $r) else error("x") end' 2>/dev/null) || return 1
+  # One base64 line per item, in order; the digest hashes that line.
+  while IFS= read -r b64; do
+    d=$(printf '%s' "$b64" | _prc_sha) || return 1
+    digests="${digests}${d}"$'\n'
+  done < <(printf '%s' "$items" | jq -r '.[] | .fp | @base64')
+  jq -nc --argjson it "$items" --arg d "$digests" \
+    '($d | split("\n") | map(select(. != ""))) as $ds
+     | if ($ds | length) != ($it | length) then error("digest count") else [range($it | length) as $n | $it[$n] + {digest: $ds[$n]}] end' 2>/dev/null
 }
 
 # ack_path REPO PR -> the ack file path (creates the acks dir). rc 1 when no state dir.
@@ -130,7 +150,7 @@ ack_read() {
   jq -ce 'if type == "object" then . else error("x") end' "$f" 2>/dev/null
 }
 
-# unacked_json ITEMS ACKS -> the items whose key+fingerprint has no matching ack.
+# unacked_json ITEMS ACKS -> the items whose key has no ack at their current digest.
 unacked_json() { jq -nc --argjson it "$1" --argjson a "$2" "$PRC_JQ"' $it | unacked($a)' 2>/dev/null; }
 
 # print_items ITEMS -> one sanitized untrusted_row per item.

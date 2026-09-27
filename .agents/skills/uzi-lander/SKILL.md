@@ -163,7 +163,7 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    | 0 | CI green, chosen review requirement satisfied, 0 live findings, no rework | step 6 |
    | 1 | required CI red | fix locally (step 4) or flake |
    | 2 | timeout | inspect; never merge on it |
-   | 3 | live findings: CR, Greptile, every-author threads (`other=`), open code-scanning alerts, unacknowledged comments (`unacked=`) | step 4 |
+   | 3 | live findings: CR, Greptile, any unresolved thread from any author (`threads=`), open code-scanning alerts, unacknowledged comments (`unacked=`) | step 4 |
    | 4 | `mr_rework` active | defer: `S/wait-mrrework.sh`, review its commit, re-run |
    | 5 | CodeRabbit rate-limited, nothing else reviewed | step 3 |
    | 6 | no reviewer will come (skipped / absent past grace) | step 3 |
@@ -172,13 +172,13 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    | 9 | a lookup stayed unreadable for `--max-unknown` polls (default 5; no checks yet on a mergeable head is pending for `--ci-grace`, 15 min); `RESULT` names it | inspect that lookup; never merge on it |
 
    Let an auto-review that is already running finish; never re-trigger it. `--reviewer` also
-   scopes which bot BLOCKS: `coderabbit`|`greptile` selects one bot AND makes the other fully
-   non-blocking (its in-flight review is not waited on, its findings do not gate) — the way to
+   scopes which bot's REVIEW blocks: `coderabbit`|`greptile` selects one bot AND makes the other's
+   review non-blocking (its in-flight review is not waited on, its unconfirmed review does not gate) — the way to
    land on one bot while explicitly ignoring the other. `any` waits for and counts both bots'
    findings; `none` requires no reviewed-head signal (the local-review/Renovate lane) but
-   STILL counts live findings from both bots. Every `--reviewer` value counts every author's
-   unresolved threads, open code-scanning alerts on the head and unacknowledged comments or
-   review bodies. Each poll line names its unknown lookups
+   STILL counts live findings from both bots. No `--reviewer` value waives an unresolved,
+   non-outdated thread from any author (bots included: resolve it), an open code-scanning
+   alert on the head, or an unacknowledged comment or review body. Each poll line names its unknown lookups
    (`unknown_lookups=`). `greptile_last_reviewed=<sha>` (also in `pr-findings.sh`) is Greptile's
    newest earlier verdict: `git range-diff` it against a rebased head to decide on a re-run.
 
@@ -221,9 +221,9 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
      the user's prior approval. Absent after the grace means local review, noted at merge.
 4. **Findings.** Gather: `S/pr-findings.sh OWNER/REPO PR [PR ...]` (both bots plus every
    author; exit 3 = unreviewed head, unreadable lookup or a BLOCKED item). Resolve each
-   `thread` row, fix or dismiss each `alert` row, and after reading each `comment` /
-   `review-body` row and acting on it, ack it: `S/ack-comments.sh OWNER/REPO PR c<id>|r<id> ...`
-   (`--list` shows what is open). An edit after the ack re-blocks. Verify each against the current code and label it **real / inherited
+   `thread` row, fix or dismiss each `alert` row. Read each `comment` / `review-body` in full
+   (`S/ack-comments.sh OWNER/REPO PR --show ID`), act on it, then ack the version you read:
+   `S/ack-comments.sh OWNER/REPO PR ID@DIGEST ...`. An edit before or after the ack re-blocks. Verify each against the current code and label it **real / inherited
    / deliberate / mock-only** (references/coderabbit-triage.md). Before touching the branch,
    check for an `mr_rework` run and defer if one is coming (references/mr-rework.md; on a
    run created with `--mr-rework=false` none will). Before editing locally or replying to
@@ -297,7 +297,7 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    ```
 
    It refuses on a moved head, an active rework, red, pending or no passing required checks, a
-   git conflict, or (exit 5) an every-author thread, open code-scanning alert or
+   git conflict, or (exit 5) any unresolved thread, open code-scanning alert or
    unacknowledged comment, takes the repo-wide merge lock (exit 7 = another lander is merging; wait
    for its `main` run to appear), confirms `MERGED`, prints `MERGE_SHA`, writes the trail
    line and releases the claim. A classifier block prints the exact command for the
