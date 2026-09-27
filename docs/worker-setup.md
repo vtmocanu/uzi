@@ -139,9 +139,12 @@ What the gauges mean:
   cache) and `/data`, each a separate bar when both are reported, one bar when
   only one is. A volume that fails to report (no `/nix` mount in dev/compose,
   for instance) shows no bar for that volume rather than a misleading zero. A
-  docker-capable hosted worker additionally shows a **Disk dind** bar (used/total
-  bytes and inodes on the `dind-data` volume) — display-only, self-reported by
-  the `dind-meter` sidecar; see [Docker inside a worker](./worker-docker.md#dind-data-metering-and-automatic-pruning).
+  docker-capable hosted worker additionally shows a **Disk dind** bar for the
+  `dind-data` volume — used/total bytes, plus an inode percentage shown
+  alongside only when the (rounded) inode fill exceeds the (rounded) byte
+  fill. It's display-only, sampled by the `dind-meter` sidecar and reported by
+  the worker on its own heartbeat; see
+  [Docker inside a worker](./worker-docker.md#dind-data-metering-and-automatic-pruning).
 - A dropped or malformed sample self-clears the gauge for that one tick (by
   design: stale-but-plausible is worse than briefly blank) rather than holding a
   stale-looking value.

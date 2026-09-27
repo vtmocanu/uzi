@@ -96,13 +96,15 @@ the threshold after a prune (`dind-prune-insufficient`), there is currently
 no automatic recycle of `dind-data` — the gauge stays elevated and the only
 way to reclaim the volume is the manual fallback below.
 
-**Manual fallback.** Delete the worker and reprovision it (**Settings →
-Workers**, or `uzi worker delete` + re-provision): this tears down the pod
-and its `dind-data` PVC and re-creates it empty, the same reclaim path a
-plain worker's `/nix`/`/data` volumes get automatically. A compose worker has
-no meter or automatic prune (`dind-meter` is a hosted-only sidecar); reclaim
-its `dinddata` volume the same way as `agentnix` — see
-[Worker setup](./worker-setup.md#resource-stats-and-sizing).
+**Manual fallback.** Delete the worker and reprovision it (the
+[Workers page](./hosted-workers.md), or `uzi worker rm <worker-id>` +
+re-provision): this tears down the pod and its `dind-data` PVC and re-creates
+it empty. That's a heavier lever than the automatic `/nix`/`/data` recycle
+([ADR-837](../adr/0837-worker-disk-lifecycle.md)), which reclaims those two
+volumes by deleting and re-creating the PVCs in place, without deleting the
+worker itself. A compose worker has no meter or automatic prune (`dind-meter`
+is a hosted-only sidecar); reclaim its `dinddata` volume the same way as
+`agentnix` — see [Worker setup](./worker-setup.md#resource-stats-and-sizing).
 
 ## Cost
 

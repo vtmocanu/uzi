@@ -822,7 +822,8 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// the agent never has to guess a default: "true" iff the cluster enabled disk
 		// self-heal AND this worker is not ephemeral (a run-bound worker's dind-data dies
 		// with its run, so pruning it is pointless churn — the same exclusion the recycle
-		// arms apply). The agent reads the dind-meter sample only when this is "true".
+		// arms apply). The agent reports the dind-meter sample on every heartbeat (the
+		// gauge) regardless; only its prune loop is gated on this being "true".
 		prune := "false"
 		if cfg.DinDPruneEnabled && !w.Ephemeral {
 			prune = "true"
