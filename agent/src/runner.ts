@@ -23,6 +23,7 @@ import {
   describeProcesses,
   newRunAttempt,
   quiesceRunAttempt,
+  sanitizeForLog,
   type QuiesceMode,
   type QuiesceRunOutcome,
   type QuiesceRunRequest,
@@ -494,11 +495,17 @@ export const REASON_WORKER_RESIDUE_BLOCKED = "worker_residue_blocked";
 /**
  * issue #1783: the run's clone is not provably quiescent at a boundary that must not proceed
  * without it. At finalize it fails the run (fail_origin `worker_residue_blocked`, the clone kept);
- * at a park it means the credentialed sink body was skipped (nothing published, the park stands).
+ * at a limit/wall park or a completion hold it means the credentialed sink body was skipped
+ * (nothing published, the park stands); at a pause park it means no checkpoint and no park (the
+ * pause reports pause_failed and the run continues, Decision 8).
  */
 class RunResidueBlockedError extends Error {
-  constructor(readonly detail: string) {
-    super(`${REASON_WORKER_RESIDUE_BLOCKED}: the run's clone could not be proven quiescent (${detail}); the clone is kept for inspection`);
+  readonly detail: string;
+  constructor(detail: string) {
+    // The detail reaches the run's failure_reason: short, and stripped of control/bidi characters.
+    const clean = sanitizeForLog(detail, 160);
+    super(`${REASON_WORKER_RESIDUE_BLOCKED}: the run's clone could not be proven quiescent (${clean}); the clone is kept for inspection`);
+    this.detail = clean;
     this.name = "RunResidueBlockedError";
   }
 }
@@ -1932,6 +1939,8 @@ export class RunRunner {
           // reap's Codex reconcile would be refused (409); and a blocked pre-reap poisons the
           // registry stickily (codex/registry.ts) so re-reaping cannot recover it anyway, while a
           // Claude/stub killAgentTree cannot fail. Best-effort; runs after the report landed.
+          // issue #1783: limitReaped is also false when the pre-report reap could not prove the
+          // clone quiescent, so a surviving run-owned process never sees a PAT-bearing settle.
           if (limitReaped) await this.settleRecoveryGeneration(claim, flight, runLog);
         }
       } else if (err instanceof TransientRecoveryError) {
@@ -2818,7 +2827,9 @@ export class RunRunner {
     // settle AFTER the terminal report. The credentialed fresh-forge comparison is safe reaped: a
     // provably empty run RELEASES its exact hold, a run that committed work then failed CAPTURES
     // it, and a failed/unverifiable comparison RETAINS — never a wrong release. Best-effort;
-    // skipped on a reap that did not confirm (guard miss or a blocked/failed reap keeps the hold).
+    // skipped on a reap that did not confirm (guard miss or a blocked/failed reap keeps the hold),
+    // and (issue #1783) on a clone the pre-settle reap could not prove quiescent: that reap then
+    // returns false, so custody stays open and the clone is kept.
     if (reaped) await this.settleRecoveryGeneration(claim, flight, runLog);
   }
 
@@ -3287,17 +3298,6 @@ export class RunRunner {
     };
     const runId = claim.run_id;
     const result = flight.result!;
-    // issue #1783: the finalize boundary. Before ANY branch below (the pause/hold/wall/switch parks,
-    // the not_code and report-only completions, the fetch-back + push), prove the clone quiescent:
-    // quiesceRun's first step is the literal killAgentTree, then the process reaper, then the
-    // Docker teardown. A process result of `survivors` or `unverified` fails the run with the typed
-    // fail_origin `worker_residue_blocked` and keeps the clone. The branch-local killAgentTree calls
-    // below stay as they were; they are now idempotent re-reaps of an already-reaped tree.
-    const finalizeQuiescence = await this.quiesceRun(flight, executor, { mode: "own", site: "finalize" });
-    if (finalizeQuiescence.blocked) {
-      flight.preserveRecoveryClone = true;
-      throw new RunResidueBlockedError(finalizeQuiescence.outcome.process?.detail ?? "not quiescent");
-    }
     // PRD #1190 M2: an owner-requested pause PARKED the run mid-loop (handlePausePark reported
     // `paused` and set flight.parked). The run is non-terminal and already reported — there is
     // nothing to finalize (no push, no MR, no completion report), and the finally preserves its
@@ -3365,6 +3365,21 @@ export class RunRunner {
         run_id: runId,
       });
       return;
+    }
+    // issue #1783: the finalize boundary. It sits BELOW the park/hold/wall/switch early returns
+    // above: each of those already reported its non-terminal park, ran its own quiescence gate at
+    // its sink (handlePausePark / enterCompletionHold / enterWallPark), and must never be turned
+    // into a failure here. Before the terminal branches below (the not_code and report-only
+    // completions, whose terminal drive can run the credentialed custody settle, and the
+    // fetch-back + push), prove the clone quiescent: quiesceRun's first step is the literal
+    // killAgentTree, then the process reaper, then the Docker teardown. A process result of
+    // `survivors` or `unverified` fails the run with the typed fail_origin `worker_residue_blocked`
+    // and keeps the clone. The branch-local killAgentTree calls below stay as they were; they are
+    // now idempotent re-reaps of an already-reaped tree.
+    const finalizeQuiescence = await this.quiesceRun(flight, executor, { mode: "own", site: "finalize" });
+    if (finalizeQuiescence.blocked) {
+      flight.preserveRecoveryClone = true;
+      throw new RunResidueBlockedError(finalizeQuiescence.outcome.process?.detail ?? "not quiescent");
     }
     const runnerClone = flight.runnerClone!;
     const barePath = flight.barePath!;
@@ -6941,9 +6956,10 @@ export class RunRunner {
    * Route a durability/publication sink through the Codex `withBoundary` reap facade when the
    * executor is Codex-selected (`executor.safety`), else take the LITERAL legacy
    * `killAgentTree` reap branch (Claude/stub — unchanged ordering, cleanup and errors). Exception
-   * (issue #1783): a `park` boundary called WITH its flight first runs {@link quiesceRun} (whose
-   * first step is that same killAgentTree) and skips the body with a RunResidueBlockedError when
-   * the clone is not provably quiescent.
+   * (issue #1783): a boundary called WITH its flight (the limit park, and the pre-settle reap of
+   * every credentialed custody settle) first runs {@link quiesceRun} (whose first step is that
+   * same killAgentTree) and skips the body with a RunResidueBlockedError when the clone is not
+   * provably quiescent.
    *
    * The runner is HARNESS-AGNOSTIC: it branches ONLY on `!!executor.safety`, never reads
    * authMode/credentials and never imports agent/src/codex/**. Inside a Codex permit it scopes
@@ -6960,24 +6976,25 @@ export class RunRunner {
     action: (permit?: BoundaryPermit) => Promise<void>,
     flight?: RunFlight,
   ): Promise<void> {
-    // issue #1783: a PARK sink first proves the clone quiescent (quiesceRun). The legacy branch's
-    // literal killAgentTree is now the first step of quiesceRun; for Codex the quiescence (its
-    // Docker half only) runs inside the held permit, before the sink body. A non-quiescent process
-    // result skips the credentialed body entirely (RunResidueBlockedError, handled by the caller
-    // like a blocked Codex boundary: nothing published, the park stands) and keeps the clone.
-    const quiescePark = req.boundary === "park" && flight !== undefined;
+    // issue #1783: a sink called with its flight first proves the clone quiescent (quiesceRun). The
+    // legacy branch's literal killAgentTree is now the first step of quiesceRun; for Codex the
+    // quiescence (its Docker half only) runs inside the held permit, before the sink body. A
+    // non-quiescent process result skips the credentialed body entirely (RunResidueBlockedError,
+    // handled by the caller like a blocked Codex boundary: nothing published or settled, the park
+    // stands) and keeps the clone.
+    const quiesceSink = flight !== undefined;
     const safety = executor.safety;
     if (safety) {
       await safety.withBoundary(req, async (permit) => {
-        if (quiescePark) await this.quiesceOrBlockPark(flight, executor);
+        if (quiesceSink) await this.quiesceOrBlockSink(flight, executor, req.boundary);
         await this.git.withBoundaryProcessSpawner(
           (process) => safety.spawnBoundaryProcess(permit, process),
           permit.signal,
           () => action(permit),
         );
       });
-    } else if (quiescePark) {
-      await this.quiesceOrBlockPark(flight, executor);
+    } else if (quiesceSink) {
+      await this.quiesceOrBlockSink(flight, executor, req.boundary);
       await action(undefined);
     } else {
       executor.killAgentTree?.();
@@ -6985,9 +7002,13 @@ export class RunRunner {
     }
   }
 
-  /** issue #1783: a park sink's quiescence gate (see {@link reapForSink}). */
-  private async quiesceOrBlockPark(flight: RunFlight, executor: Executor): Promise<void> {
-    const q = await this.quiesceRun(flight, executor, { mode: "own", site: "park" });
+  /** issue #1783: a gated sink's quiescence gate (see {@link reapForSink}). */
+  private async quiesceOrBlockSink(
+    flight: RunFlight,
+    executor: Executor,
+    boundary: BoundaryRequest["boundary"],
+  ): Promise<void> {
+    const q = await this.quiesceRun(flight, executor, { mode: "own", site: boundary });
     if (!q.blocked) return;
     // Keep the clone and its recovery journal: the terminal finally must not retire a tree a
     // surviving process may still be writing. The bare tracking ref is untouched (no fetch-back).
@@ -8700,6 +8721,10 @@ export class RunRunner {
     if (!isCodePublishingKind(resolveRunKind(claim.kind))) return false;
     if (!flight.barePath) return false; // no clone → nothing to settle, so nothing to protect
     try {
+      // issue #1783: the flight rides along, so the reap also PROVES the clone quiescent (process
+      // reap + Docker teardown) before any credentialed settle may run. A surviving or
+      // unattributable run-owned process throws RunResidueBlockedError: the settle is skipped, the
+      // hold (custody) stays open and the clone + journal are kept (preserveRecoveryClone).
       await this.reapForSink(
         flight.executor,
         { boundary, deadlineMs: this.codexBoundaryDeadlineMs },
@@ -8707,12 +8732,15 @@ export class RunRunner {
           // Empty body: the reap itself is the point. The credentialed settle runs OUTSIDE the
           // boundary (mirroring the park path), after the provider root is reaped.
         },
+        flight,
       );
     } catch (err) {
-      runLog.warn("recovery: pre-settle reap failed; retaining the generation hold (reporting unaffected)", {
-        run_id: claim.run_id,
-        error: errMessage(err),
-      });
+      runLog.warn(
+        err instanceof RunResidueBlockedError
+          ? "recovery: clone not provably quiescent; skipping the credentialed settle and retaining the generation hold (reporting unaffected)"
+          : "recovery: pre-settle reap failed; retaining the generation hold (reporting unaffected)",
+        { run_id: claim.run_id, error: errMessage(err) },
+      );
       return false; // provider not confirmed reaped → do NOT run the credentialed fetch
     }
     return true;
@@ -8988,6 +9016,17 @@ export class RunRunner {
     });
     await batcher.flush().catch(() => undefined);
 
+    // issue #1783: prove the clone quiescent BEFORE the park sink touches it (the wip marker, the
+    // fetch-back into the bare tracking ref, the checkpoint publish). quiesceRun reaps the agent
+    // tree and this attempt's residue. A `survivors`/`unverified` result SKIPS the whole sink body
+    // (no wip marker, nothing fetched back, nothing published; the clone, its recovery journal and
+    // the tracking ref untouched) and, with no durable checkpoint, does NOT park: it follows
+    // Decision 8 below exactly like a publish that did not land (pause_failed, the run continues).
+    // The clone is not flagged preserveRecoveryClone here: the run keeps running, and its terminal
+    // retire runs its own quiescence gate before removing anything.
+    const pauseQuiescence = await this.quiesceRun(flight, flight.executor, { mode: "own", site: "pause_park" });
+    const residueBlocked = pauseQuiescence.blocked;
+
     // Make the clone's work durable in the BARE tracking ref BEFORE the publish. checkpointPack
     // (inside publishCheckpointBestEffort) packs refs/uzi-runner/<branch> in the bare, NOT the
     // runner clone's refs/heads/<branch>; before this fix handlePausePark published WITHOUT first
@@ -8996,10 +9035,12 @@ export class RunRunner {
     // fetch-back — packed a STALE tip while still recording the NEWER cloneTip below as
     // lastPublishedTip: the work between the two was lost on a cross-worker resume AND the
     // bookkeeping named a tip that was never published. Mirror the limit-wait park: capture any
-    // uncommitted edits into a throwaway wip(park): marker, then fetch the clone tip back. NO reap
-    // — the run may CONTINUE (Decision 8), so the agent tree must stay alive; the marker (runner-uid
-    // local commit) and the fetch-back (file://) are credential-free, safe with the agent alive, the
-    // same class as the mid-run reap:false checkpoint.
+    // uncommitted edits into a throwaway wip(park): marker, then fetch the clone tip back. The
+    // marker (runner-uid local commit) and the fetch-back (file://) are credential-free, the same
+    // class as the mid-run reap:false checkpoint. issue #1783: the agent tree and this attempt's
+    // residue WERE reaped just above (the quiescence gate) before either touches the clone; a run
+    // that CONTINUES after a pause_failed (Decision 8) restarts its interrupted step on a fresh
+    // agent process, so the reap costs it only background processes the agent must restart.
     //
     // The fetch-back is GATED on the clone carrying NEW work this cycle (its tip moved beyond the
     // reseed base, including a marker just made). When the clone is still AT its base — a `now` pause
@@ -9012,7 +9053,7 @@ export class RunRunner {
     // durability, unsafe on the seededFrom:"tracking" leg): the publish below always runs; only the
     // redundant fetch-back is skipped when there is nothing new to move.
     let markerCreated = false;
-    if (barePath && branch && runnerClone) {
+    if (!residueBlocked && barePath && branch && runnerClone) {
       markerCreated = await this.git.commitWipMarker(runnerClone.path).catch(() => false);
       const preTip = await this.git
         .branchTip(runnerClone.path, branch)
@@ -9045,7 +9086,7 @@ export class RunRunner {
     // locally-recovered tracking-ref tip and is durable on origin only if the prior park's
     // best-effort publish actually landed.
     let published = false;
-    if (barePath && branch) {
+    if (!residueBlocked && barePath && branch) {
       const cloneTip = runnerClone
         ? await this.git
             .branchTip(runnerClone.path, branch)
@@ -9077,14 +9118,25 @@ export class RunRunner {
       // return false so the loop CONTINUES — a `now` pause restarts the aborted turn on the next
       // iteration. The reason rides the worker's own feed message; the pause_failed report carries
       // none (the server intercepts pause_failed BEFORE its status switch).
-      runLog.warn("could not publish a pause checkpoint; the run stays running", {
-        run_id: flight.runId,
-      });
+      // issue #1783: a clone that is not provably quiescent reaches here with the sink body skipped
+      // (no marker to undo); the log and the feed name that reason instead of a failed publish.
+      if (residueBlocked) {
+        runLog.warn("pause park: clone not provably quiescent; no checkpoint taken, the run stays running", {
+          run_id: flight.runId,
+          state: pauseQuiescence.outcome.process?.state,
+        });
+      } else {
+        runLog.warn("could not publish a pause checkpoint; the run stays running", {
+          run_id: flight.runId,
+        });
+      }
       batcher.emit({
         kind: "pause_failed",
         agent: "worker",
         payload: {
-          text: "Could not pause: the checkpoint could not be published. The run is still running and has restarted the interrupted step.",
+          text: residueBlocked
+            ? "Could not pause: a process this run started could not be stopped, so no checkpoint was taken. The run is still running and has restarted the interrupted step."
+            : "Could not pause: the checkpoint could not be published. The run is still running and has restarted the interrupted step.",
         },
       });
       await reportState({ status: "pause_failed" }).catch((e) =>
@@ -9119,11 +9171,11 @@ export class RunRunner {
       run_id: flight.runId,
     });
     // PRD #1349 M2 (D4): record this generation's checkpointed restore point in the durable
-    // journal. This sink deliberately does NOT reap the agent tree (the run may CONTINUE — the
-    // reap:false / no-overlay class), so it MUST stay credential-free: a PAT fresh-forge
-    // comparison would violate the reap-before-credentialed-git invariant while the agent is
-    // alive. Pin only (a local journal write over the credential-free join-token seam, the same
-    // safety class as the checkpoint publish above); a resume mints a new generation hold, and
+    // journal. This sink is the reap:false / no-overlay class (the run may CONTINUE), so it MUST
+    // stay credential-free even though issue #1783's gate reaped above (a pause never runs a PAT
+    // git, and the settle belongs to the resume-terminal). Pin only
+    // (a local journal write over the credential-free join-token seam, the same safety class as
+    // the checkpoint publish above); a resume mints a new generation hold, and
     // the paused generation's hold settles on its reaped resume-terminal or the reconciler.
     await this.pinRecoveryGeneration(
       claim,
@@ -9287,7 +9339,27 @@ export class RunRunner {
     let captured:
       | { verified: boolean; published: boolean; mode: "same_worker_only"; head: string | null }
       | undefined;
-    for (let attempt = 0; attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS; attempt++) {
+    // issue #1783: prove the clone quiescent BEFORE the capture (a wip commit, a fetch-back into
+    // the bare tracking ref, the credentialed checkpoint publish). On `survivors`/`unverified` the
+    // capture is SKIPPED entirely (the tracking ref untouched, nothing published), the clone and
+    // its journal stay (the preserve flags set above), and the hold is still requested with the
+    // tracking ref's CURRENT tip (else the clone's base): the hold stands rather than failing the
+    // run over a residue, and the latest local work lives on this worker only.
+    const holdQuiescence = await this.quiesceRun(flight, flight.executor, { mode: "own", site: "completion_hold" });
+    if (holdQuiescence.blocked) {
+      const heldHead =
+        (flight.barePath && flight.branch
+          ? await this.git.trackingTip(flight.barePath, flight.branch).catch(() => null)
+          : null) ??
+        flight.runnerClone?.baseCommit ??
+        null;
+      captured = { verified: false, published: false, mode: "same_worker_only", head: heldHead };
+      runLog.warn("completion hold: clone not provably quiescent; skipping the capture and holding anyway", {
+        run_id: flight.runId,
+        state: holdQuiescence.outcome.process?.state,
+      });
+    }
+    for (let attempt = 0; !holdQuiescence.blocked && attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS; attempt++) {
       if (flight.active?.shuttingDown || flight.steering.isCancelled()) break;
       try {
         const result = await this.captureHoldContext(claim, flight, runLog);
@@ -9400,7 +9472,19 @@ export class RunRunner {
     let captured:
       | { verified: boolean; published: boolean; mode: "same_worker_only"; head: string | null }
       | undefined;
-    for (let attempt = 0; attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS; attempt++) {
+    // issue #1783: prove the clone quiescent BEFORE the capture (a wip commit, a fetch-back into
+    // the bare tracking ref, the credentialed checkpoint publish). On `survivors`/`unverified` the
+    // capture is SKIPPED entirely (the tracking ref untouched, nothing published) and the park
+    // goes DEGRADED below exactly like an unverifiable capture: the flags stay set (clone +
+    // journal + HOME kept), the head is reported empty, and the park still stands (D4).
+    const wallQuiescence = await this.quiesceRun(flight, flight.executor, { mode: "own", site: "wall_park" });
+    if (wallQuiescence.blocked) {
+      runLog.warn("wall park: clone not provably quiescent; skipping the capture and parking degraded", {
+        run_id: flight.runId,
+        state: wallQuiescence.outcome.process?.state,
+      });
+    }
+    for (let attempt = 0; !wallQuiescence.blocked && attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS; attempt++) {
       if (flight.active?.shuttingDown || flight.steering.isCancelled()) break;
       try {
         const result = await this.captureHoldContext(claim, flight, runLog);

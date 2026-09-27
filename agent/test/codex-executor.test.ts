@@ -756,6 +756,26 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
     assert.ok(texts.some((t) => t.includes("working on it")), "the accumulated agent text was emitted");
   });
 
+  it("issue #1783: recordedRootPids names the live provider supervisor while the run is in flight", async () => {
+    // The supervisor runs as the runner uid and is non-dumpable; a concurrent Claude run's
+    // quiescence reaper can attribute it (instead of reporting `unverified`) only through these.
+    let executor: CodexExecutor | undefined;
+    const seen: number[][] = [];
+    const rig = makeRig({
+      responder: (c) => {
+        if (c.method === "thread/start") seen.push(executor?.recordedRootPids() ?? []);
+        return defaultResponder(c);
+      },
+    });
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    assert.deepEqual(executor.recordedRootPids(), [], "nothing launched yet");
+    await withTimeout(executor.run(makeCtx().ctx), 3000, "clean run");
+    assert.deepEqual(seen[0], [1234], "the launched provider root's supervisor pid is recorded while live");
+    assert.equal(rig.reaped() + rig.disposed() > 0, true);
+    assert.deepEqual(executor.recordedRootPids(), [], "forgotten once its root was cleanly reaped/disposed");
+  });
+
   it("(8) a failed turn_finished is represented as DATA once and materializes+throws ONCE (never double-thrown)", async () => {
     const rig = makeRig();
     rig.transport.push(threadStarted()).push(turnCompleted("failed")).end();

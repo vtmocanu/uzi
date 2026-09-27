@@ -1,4 +1,5 @@
 import { afterEach, describe, it } from "node:test";
+import { SinkGate } from "../src/sink-gate.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -75,6 +76,9 @@ function minimalFailFlight(opts: {
     },
     cancel,
     runLog: nullLogger(),
+    // issue #1783: the pre-settle reap now proves quiescence inside the flight's sink gate (a real
+    // RunFlight always carries one). No clone path here, so the proof is just the killAgentTree reap.
+    sinkGate: new SinkGate(),
     terminalResolved: false,
     permanentFailureReap: undefined as boolean | undefined,
     permanentFailureReapSafety: undefined as unknown,

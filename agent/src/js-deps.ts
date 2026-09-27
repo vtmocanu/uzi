@@ -82,7 +82,6 @@ import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { killRunnerGroup, runnerCommand } from "./runner-uid.js";
-import { workerSpawnEnv } from "./worker-spawn-mark.js";
 
 /** The package managers whose lockfile we recognize. */
 export type JsPackageManager = "npm" | "pnpm" | "yarn" | "bun";
@@ -576,9 +575,11 @@ export const execInstall: InstallExec = (cmd) =>
     let settled = false;
     const child = spawn(cmd.command, cmd.args, {
       cwd: cmd.cwd,
-      // issue #1783 (R4): worker-marked, so the run-quiescence reaper never attributes the
-      // worker's own install (which overlaps the agent turn) to the run.
-      env: workerSpawnEnv(cmd.env),
+      // issue #1783 (R4): deliberately NOT worker-marked. Install scripts are off (every manager
+      // runs with --ignore-scripts, plus the pnpmfile/yarnPath neutralizers above), but the
+      // package manager still reads repo-controlled config with its cwd in the clone, so anything
+      // it leaks must stay reapable by the run's own quiescence proof.
+      env: cmd.env,
       detached: true,
       stdio: "ignore",
     });

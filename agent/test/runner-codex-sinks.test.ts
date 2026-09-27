@@ -898,7 +898,7 @@ describe("RunRunner m4 — credential-free sinks mint NO permit", () => {
 });
 
 // ================================================================================
-describe("RunRunner m4 — Claude/stub legacy path is byte-unchanged", () => {
+describe("RunRunner m4 — Claude/stub legacy path: literal killAgentTree reaps, plus the issue #1783 quiescence proofs", () => {
   it("(6) an executor with killAgentTree only (no safety) takes the legacy branch — withBoundary is never referenced", async () => {
     const { gitlab, calls } = fakeGitlab();
     const kills: string[] = [];

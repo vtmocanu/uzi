@@ -21,15 +21,18 @@
 //       considered, read from the per-pid `status` file FIRST. A pid that vanishes between steps
 //       is skipped silently. A runner-uid pid whose env or cwd cannot be read (EACCES — a
 //       non-dumpable process) is attributed by ancestry through the world-readable `stat`: a
-//       ppid chain, process group or session leading to a recorded CLI root of ANOTHER live
-//       attempt is out of scope; anything else is `unverified`.
+//       ppid chain, process group or session leading to (or being) a recorded root of ANOTHER
+//       live attempt (a Claude CLI group or a Codex provider supervisor), or a long-lived
+//       runner-uid root the worker itself launched and recorded, is out of scope; anything else
+//       is `unverified`.
 //   R3  SCOPE first. A process is in scope iff its UZI_RUN_CLONE_KEY equals the target key or its
 //       cwd lies (by whole path components) within a target path. Out of scope is ignored
 //       entirely, so two unrelated healthy runs never interact. In scope, by marker: this
 //       attempt's → kill; a LIVE other attempt of the key → never signalled, reported as a
 //       conflict; a terminal attempt's → kill; no marker → kill in mode `own`, but a survivor in
 //       modes `seed`/`capture` (no positive attribution there). A process carrying this worker's
-//       spawn mark (UZI_WORKER_SPAWN) is the worker's own op and is never run-owned.
+//       spawn mark (UZI_WORKER_SPAWN) and NO attempt marker is the worker's own op and is never
+//       run-owned.
 //   R5  The scanner never signals itself or any ancestor up to pid 1, nor a descendant of its own
 //       unless that descendant carries an attempt marker. The exception matters single-uid, where
 //       the scanner is the worker itself: the agent CLI is a worker child, so a marked descendant
@@ -38,25 +41,60 @@
 //
 // Under the uid split the worker cannot read or signal a runner-uid process, so the scan and the
 // kills run AS the runner, in a helper: this same module re-executed through runnerCommand with
-// an explicit env (the worker mark, never an attempt marker) and cwd "/". It prints one JSON line.
-// Single-uid, the scan runs in-process.
+// an explicit env (the worker mark, never an attempt marker), cwd "/", a fresh private TMPDIR and
+// the tsx cache off. It reads its request on stdin and prints exactly one JSON line. Single-uid,
+// the scan runs in-process. Every process-supplied string (comm, cwd, container id) is sanitized
+// before it is logged or reaches a failure reason.
 
 import http from "node:http";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { cloneKeyOf, formatAttemptId, isWithinPath } from "./attempt-path.js";
+import { parseDockerTarget } from "./docker-wiring.js";
 import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import type { SdkAttemptEnv } from "./sdk-env.js";
 import {
   RUN_ATTEMPT_ENV,
   RUN_CLONE_KEY_ENV,
   WORKER_SPAWN_ENV,
+  workerRunnerRootPids,
   workerSpawnEnv,
   workerSpawnNonce,
 } from "./worker-spawn-mark.js";
+
+// ─── Log sanitization ──────────────────────────────────────────────────────────────────────
+
+/** C0/C1 controls, DEL, and the bidi embedding/override/isolate/mark code points. */
+function unsafeCodePoint(c: number): boolean {
+  return (
+    c < 0x20 ||
+    (c >= 0x7f && c <= 0x9f) ||
+    c === 0x061c ||
+    c === 0x200e ||
+    c === 0x200f ||
+    (c >= 0x202a && c <= 0x202e) ||
+    (c >= 0x2066 && c <= 0x2069)
+  );
+}
+
+/**
+ * A process-supplied string (a comm, a cwd, a container id, a helper detail) made safe to log or
+ * to put into a failure reason: every control and bidi code point becomes `?`, and the result is
+ * capped at `max` characters. A runner-uid process chooses its own comm and cwd, so neither may
+ * reach a log line or the run's failure_reason raw.
+ */
+export function sanitizeForLog(text: string, max = 256): string {
+  let out = "";
+  for (const ch of String(text)) {
+    out += unsafeCodePoint(ch.codePointAt(0) ?? 0) ? "?" : ch;
+    if (out.length >= max) return `${out.slice(0, max)}...`;
+  }
+  return out;
+}
 
 // ─── Attempts ──────────────────────────────────────────────────────────────────────────────
 
@@ -154,7 +192,7 @@ function parseStatus(text: string): StatusFacts | undefined {
   if (!uidLine) return undefined;
   const name = /^Name:\s*(.*)$/m.exec(text)?.[1] ?? "?";
   const state = /^State:\s*(\S)/m.exec(text)?.[1];
-  return { uid: Number(uidLine[1]), comm: name, zombie: state === "Z" || state === "X" };
+  return { uid: Number(uidLine[1]), comm: sanitizeForLog(name, 64), zombie: state === "Z" || state === "X" };
 }
 
 interface StatFacts {
@@ -208,7 +246,8 @@ export interface ScanRequest {
   ownMarker?: string;
   /** Markers of every OTHER live attempt on this worker. */
   liveMarkers: string[];
-  /** Recorded CLI root pids of every OTHER live attempt on this worker. */
+  /** Recorded root pids of every OTHER live attempt on this worker (Claude CLI groups, Codex
+   *  provider supervisors), plus the long-lived runner-uid roots the worker itself launched. */
   liveRootPids: number[];
   /** This worker's spawn nonce: a process carrying it is never run-owned. */
   workerNonce: string;
@@ -246,10 +285,11 @@ function ancestorsOf(pid: number, table: ProcTable): number[] {
   return out;
 }
 
-/** True when an unreadable pid leads, by ppid chain, process group or session, to a recorded
- *  CLI root of another live attempt. */
+/** True when an unreadable pid IS, or leads by ppid chain, process group or session to, a recorded
+ *  root of another live attempt or a worker-launched runner-uid root. */
 function attributedToOtherLive(pid: number, table: ProcTable, roots: ReadonlySet<number>): boolean {
   if (roots.size === 0) return false;
+  if (roots.has(pid)) return true;
   const r = tryRead(() => table.readStat(pid));
   if (r.ok) {
     const facts = parseStat(r.value);
@@ -319,13 +359,16 @@ export function scanOnce(
         pid,
         uid: status.uid,
         comm: status.comm,
-        cwd: cwdRead.ok ? cwdRead.value : "unreadable",
+        cwd: cwdRead.ok ? sanitizeForLog(cwdRead.value) : "unreadable",
         reason: "unreadable_unattributed",
       });
       continue;
     }
     const env = parseEnviron(envRead.value);
-    if (env.get(WORKER_SPAWN_ENV) === req.workerNonce) continue;
+    // The worker mark exempts a process only when it carries NO attempt marker: a worker spawn
+    // never has one (workerSpawnEnv strips it), so an attempt-marked process that also claims the
+    // nonce is agent residue that copied it, and is classified like any other.
+    if (env.get(WORKER_SPAWN_ENV) === req.workerNonce && env.get(RUN_ATTEMPT_ENV) === undefined) continue;
     // R5: a descendant is the scanner's own unless an attempt marker says it is agent residue.
     if (descendant && (excludeAllDescendants || env.get(RUN_ATTEMPT_ENV) === undefined)) continue;
     const cwd = cwdRead.value;
@@ -333,7 +376,13 @@ export function scanOnce(
       env.get(RUN_CLONE_KEY_ENV) === req.targetKey ||
       req.targetPaths.some((p) => isWithinPath(stripDeleted(cwd), p));
     if (!inScope) continue;
-    const entry = (reason: string): QuiesceProcess => ({ pid, uid: status.uid, comm: status.comm, cwd, reason });
+    const entry = (reason: string): QuiesceProcess => ({
+      pid,
+      uid: status.uid,
+      comm: status.comm,
+      cwd: sanitizeForLog(cwd),
+      reason,
+    });
     const marker = env.get(RUN_ATTEMPT_ENV);
     if (marker !== undefined && marker === req.ownMarker) result.kill.push(entry("own_attempt"));
     else if (marker !== undefined && liveMarkers.has(marker)) result.survivors.push(entry("live_attempt_conflict"));
@@ -438,8 +487,14 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
 
 const HELPER_FLAG = "--uzi-quiesce-helper";
 const HELPER_FILE = fileURLToPath(import.meta.url);
+/** The helper's stdout is bounded: more than this is not a verdict, it is a failure. */
+const HELPER_STDOUT_MAX = 1024 * 1024;
+/** The request the helper reads from stdin is bounded the same way. */
+const HELPER_REQUEST_MAX = 1024 * 1024;
+const HELPER_PATH = "/usr/local/bin:/usr/bin:/bin";
 
-/** How the helper is started; injectable so a test can force a spawn failure. */
+/** How the helper is started; injectable so a test can force a spawn failure. The request is
+ *  written to the child's stdin, never its argv: a process's cmdline is world-readable. */
 export type HelperSpawn = (
   command: string,
   args: string[],
@@ -447,18 +502,48 @@ export type HelperSpawn = (
 ) => import("node:child_process").ChildProcess;
 
 const defaultHelperSpawn: HelperSpawn = (command, args, opts) =>
-  spawn(command, args, { cwd: opts.cwd, env: opts.env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+  spawn(command, args, { cwd: opts.cwd, env: opts.env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
 
-function helperArgv(req: ScanRequest): string[] {
+/** The helper's private TMPDIR: made fresh (mode 0700, owned by the uid the helper runs as)
+ *  before every helper start and removed after it. Injectable for tests. */
+export interface HelperTmp {
+  make(): string;
+  remove(dir: string): void;
+}
+
+const defaultHelperTmp: HelperTmp = {
+  make: () => {
+    const base = runnerTmpdir() ?? os.tmpdir();
+    // Single-uid the helper runs as this process's uid, so a plain mkdtemp (mode 0700) is its own.
+    if (!uidSplitActive()) return fs.mkdtempSync(path.join(base, "uzi-quiesce-"));
+    // Under the split the dir must be the RUNNER's, so mktemp runs as the runner (mode 0700).
+    const w = runnerCommand("mktemp", ["-d", path.join(base, "uzi-quiesce-XXXXXXXXXX")]);
+    const r = spawnSync(w.command, w.args, {
+      env: workerSpawnEnv({ PATH: HELPER_PATH }),
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5_000,
+    });
+    const dir = String(r.stdout ?? "").trim();
+    if (r.status !== 0 || !path.isAbsolute(dir) || !isWithinPath(dir, base) || path.resolve(dir) === path.resolve(base)) {
+      throw new Error(`mktemp as the runner exited ${String(r.status)}`);
+    }
+    return dir;
+  },
+  remove: (dir) => {
+    if (!uidSplitActive()) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    }
+    const w = runnerCommand("rm", ["-rf", "--", dir]);
+    spawnSync(w.command, w.args, { env: workerSpawnEnv({ PATH: HELPER_PATH }), stdio: "ignore", timeout: 10_000 });
+  },
+};
+
+function helperArgv(): string[] {
   // The helper runs this TypeScript module, so it needs the tsx loader. The loader is resolved to
   // an absolute URL here because the helper's cwd is "/", where a bare `tsx` would not resolve.
-  return [
-    "--import",
-    import.meta.resolve("tsx"),
-    HELPER_FILE,
-    HELPER_FLAG,
-    Buffer.from(JSON.stringify(req), "utf8").toString("base64"),
-  ];
+  return ["--import", import.meta.resolve("tsx"), HELPER_FILE, HELPER_FLAG];
 }
 
 function isProcessQuiescence(v: unknown): v is ProcessQuiescence {
@@ -467,74 +552,130 @@ function isProcessQuiescence(v: unknown): v is ProcessQuiescence {
   return (
     (o.state === "quiescent" || o.state === "survivors" || o.state === "unverified") &&
     Array.isArray(o.processes) &&
+    o.processes.every((p) => typeof p === "object" && p !== null && Number.isInteger((p as { pid?: unknown }).pid)) &&
     Array.isArray(o.killed) &&
+    o.killed.every((n) => Number.isInteger(n)) &&
     typeof o.detail === "string"
   );
+}
+
+/** A helper verdict with every string field sanitized: it crossed a uid boundary. */
+function sanitizeVerdict(v: ProcessQuiescence): ProcessQuiescence {
+  return {
+    state: v.state,
+    processes: v.processes.map((p) => ({
+      pid: p.pid,
+      uid: Number.isInteger(p.uid) ? p.uid : -1,
+      comm: sanitizeForLog(String(p.comm), 64),
+      cwd: sanitizeForLog(String(p.cwd)),
+      reason: sanitizeForLog(String(p.reason), 64),
+    })),
+    killed: v.killed,
+    detail: sanitizeForLog(v.detail),
+  };
+}
+
+/**
+ * The helper's verdict from its whole stdout: exactly ONE non-empty line, and that line a
+ * well-formed verdict. No line, several lines, or a malformed line is `unverified`: a second
+ * line could be a forged verdict racing the real one, and taking either would trust it.
+ */
+function parseHelperVerdict(stdout: string): ProcessQuiescence {
+  const unverified = (detail: string): ProcessQuiescence => ({ state: "unverified", processes: [], killed: [], detail });
+  const lines = stdout.split("\n").filter((l) => l.trim() !== "");
+  if (lines.length === 0) return unverified("quiescence helper answered no JSON");
+  if (lines.length > 1) return unverified(`quiescence helper answered ${lines.length} lines, not one verdict`);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(lines[0]!);
+  } catch {
+    return unverified("quiescence helper answered no JSON");
+  }
+  return isProcessQuiescence(parsed) ? sanitizeVerdict(parsed) : unverified("quiescence helper answered malformed JSON");
 }
 
 /**
  * Run the reap loop in a helper started through `runnerCommand` (setpriv to the runner under
  * the uid split; a passthrough single-uid), with an explicit env carrying the worker mark and no
- * attempt marker, cwd "/", and a 10 s spawn timeout. Any failure to start, finish or answer is
- * `unverified`.
+ * attempt marker, cwd "/", a fresh private TMPDIR, the tsx cache disabled (a cache the agent can
+ * plant would hand the helper forged code), the request on stdin, a bounded stdout, and a 10 s
+ * spawn timeout. Any failure to start, finish or answer is `unverified`.
  */
 async function reapProcessesViaHelper(
   req: ScanRequest,
-  opts: { spawnHelper?: HelperSpawn; timeoutMs?: number } = {},
+  opts: { spawnHelper?: HelperSpawn; timeoutMs?: number; helperTmp?: HelperTmp } = {},
 ): Promise<ProcessQuiescence> {
   const unverified = (detail: string): ProcessQuiescence => ({ state: "unverified", processes: [], killed: [], detail });
   let argv: string[];
   try {
-    argv = helperArgv(req);
+    argv = helperArgv();
   } catch (err) {
     return unverified(`quiescence helper unavailable: ${(err as Error).message}`);
   }
+  const helperTmp = opts.helperTmp ?? defaultHelperTmp;
+  let tmpDir: string;
+  try {
+    tmpDir = helperTmp.make();
+  } catch (err) {
+    return unverified(`quiescence helper TMPDIR unavailable: ${(err as Error).message}`);
+  }
+  const removeTmp = (): void => {
+    try {
+      helperTmp.remove(tmpDir);
+    } catch {
+      // Best effort: a leftover private dir is harmless.
+    }
+  };
   const wrapped = runnerCommand(process.execPath, argv);
-  const env: NodeJS.ProcessEnv = { PATH: runnerPath() ?? "/usr/local/bin:/usr/bin:/bin" };
-  const tmp = runnerTmpdir();
-  if (tmp) env.TMPDIR = tmp;
+  const helperEnv: NodeJS.ProcessEnv = { PATH: runnerPath() ?? HELPER_PATH, TMPDIR: tmpDir, TSX_DISABLE_CACHE: "1" };
   return new Promise<ProcessQuiescence>((resolve) => {
     let settled = false;
+    let timer: NodeJS.Timeout | undefined;
     const done = (r: ProcessQuiescence): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
+      removeTmp();
       resolve(r);
     };
     let child: import("node:child_process").ChildProcess;
     try {
       child = (opts.spawnHelper ?? defaultHelperSpawn)(wrapped.command, wrapped.args, {
         cwd: "/",
-        env: workerSpawnEnv(env),
+        env: workerSpawnEnv(helperEnv),
       });
     } catch (err) {
-      resolve(unverified(`quiescence helper spawn failed: ${(err as Error).message}`));
+      done(unverified(`quiescence helper spawn failed: ${(err as Error).message}`));
       return;
     }
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       killRunnerGroup(child.pid);
       done(unverified("quiescence helper timed out"));
     }, opts.timeoutMs ?? HELPER_TIMEOUT_MS);
     const out: Buffer[] = [];
     let outBytes = 0;
     child.stdout?.on("data", (c: Buffer) => {
+      if (settled) return;
       outBytes += c.length;
-      if (outBytes <= 1024 * 1024) out.push(c);
+      if (outBytes > HELPER_STDOUT_MAX) {
+        killRunnerGroup(child.pid);
+        done(unverified("quiescence helper output exceeded 1 MiB"));
+        return;
+      }
+      out.push(c);
     });
     child.stderr?.resume();
+    // A helper that dies before reading its request fails this write (EPIPE); the close handler
+    // below reports that exit, so the write error itself is only swallowed here.
+    child.stdin?.on("error", () => undefined);
+    child.stdin?.end(JSON.stringify(req));
     child.on("error", (err) => done(unverified(`quiescence helper spawn failed: ${err.message}`)));
     child.on("close", (code, signal) => {
       if (code !== 0) {
         done(unverified(`quiescence helper exited ${code ?? signal ?? "abnormally"}`));
         return;
       }
-      const line = Buffer.concat(out).toString("utf8").trim().split("\n").pop() ?? "";
-      try {
-        const parsed: unknown = JSON.parse(line);
-        done(isProcessQuiescence(parsed) ? parsed : unverified("quiescence helper answered malformed JSON"));
-      } catch {
-        done(unverified("quiescence helper answered no JSON"));
-      }
+      done(parseHelperVerdict(Buffer.concat(out).toString("utf8")));
     });
   });
 }
@@ -545,6 +686,7 @@ export interface ReapRunOptions extends ReapDeps {
   viaHelper?: boolean;
   spawnHelper?: HelperSpawn;
   helperTimeoutMs?: number;
+  helperTmp?: HelperTmp;
 }
 
 /** The uid whose processes a reap considers: the runner under the split, else this process's. */
@@ -555,7 +697,13 @@ function defaultTargetUid(): number {
 /** Reap in-process or through the helper (see {@link reapProcessesViaHelper}). */
 export async function reapRunProcesses(req: ScanRequest, opts: ReapRunOptions = {}): Promise<ProcessQuiescence> {
   const viaHelper = opts.viaHelper ?? uidSplitActive();
-  if (viaHelper) return reapProcessesViaHelper(req, { spawnHelper: opts.spawnHelper, timeoutMs: opts.helperTimeoutMs });
+  if (viaHelper) {
+    return reapProcessesViaHelper(req, {
+      spawnHelper: opts.spawnHelper,
+      timeoutMs: opts.helperTimeoutMs,
+      helperTmp: opts.helperTmp,
+    });
+  }
   try {
     return await reapProcesses(req, opts);
   } catch (err) {
@@ -580,6 +728,8 @@ export interface DockerTeardownOptions {
   dockerHost: string | undefined;
   targetPaths: string[];
   requestTimeoutMs?: number;
+  /** Per-response body cap (default 8 MiB); above it the request is destroyed → docker_error. */
+  maxBodyBytes?: number;
   intervalMs?: number;
   deadlineMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -588,26 +738,39 @@ export interface DockerTeardownOptions {
 
 type Endpoint = { socketPath: string } | { host: string; port: number };
 
+/** Every DOCKER_HOST form docker-wiring accepts (its one shared parser): a bare `/path` socket,
+ *  `unix://<path>`, and `tcp://host[:port]` (no port ⇒ Docker's default 2375). */
 function parseDockerHost(dockerHost: string): Endpoint | undefined {
-  if (dockerHost.startsWith("unix://")) {
-    const socketPath = dockerHost.slice("unix://".length);
-    return socketPath.startsWith("/") ? { socketPath } : undefined;
-  }
-  const m = /^(?:tcp|http):\/\/([^/:]+|\[[^\]]+\]):(\d+)\/?$/.exec(dockerHost);
-  if (!m) return undefined;
-  return { host: m[1]!.replace(/^\[|\]$/g, ""), port: Number(m[2]) };
+  const target = parseDockerTarget(dockerHost);
+  if (!target) return undefined;
+  return "path" in target ? { socketPath: target.path } : { host: target.host, port: target.port };
 }
+
+/** A Docker Engine response body larger than this is refused (the request is destroyed). */
+const DOCKER_BODY_MAX = 8 * 1024 * 1024;
 
 function dockerRequest(
   ep: Endpoint,
   method: string,
   urlPath: string,
   timeoutMs: number,
+  maxBodyBytes: number = DOCKER_BODY_MAX,
 ): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const req = http.request({ ...ep, method, path: urlPath, timeout: timeoutMs }, (res) => {
       const chunks: Buffer[] = [];
-      res.on("data", (c: Buffer) => chunks.push(c));
+      let bytes = 0;
+      res.on("data", (c: Buffer) => {
+        bytes += c.length;
+        if (bytes > maxBodyBytes) {
+          // Reject FIRST (the promise settles once), then tear the connection down.
+          reject(new Error(`docker ${method} response body exceeded ${maxBodyBytes} bytes`));
+          res.destroy();
+          req.destroy();
+          return;
+        }
+        chunks.push(c);
+      });
       res.on("end", () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
       res.on("error", reject);
     });
@@ -639,6 +802,9 @@ function boundContainers(body: string, targetPaths: string[]): string[] {
  * Force-remove every container with a mount source under a target path, then keep listing (1 s
  * apart) until two consecutive listings are clean, within 15 s overall and 5 s per request.
  * Containers binding nothing under a target path are never touched.
+ *
+ * Out of scope (disclosed): a container binding an ANCESTOR of the clone (e.g. the whole runner
+ * root) is not removed, because it may belong to a sibling run.
  */
 export async function teardownDocker(opts: DockerTeardownOptions): Promise<DockerTeardown> {
   if (!opts.dockerHost) return { state: "not_wired", removed: [], detail: "no docker daemon wired" };
@@ -652,7 +818,7 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
   let clean = 0;
   try {
     for (;;) {
-      const list = await dockerRequest(ep, "GET", "/containers/json?all=1", reqTimeout);
+      const list = await dockerRequest(ep, "GET", "/containers/json?all=1", reqTimeout, opts.maxBodyBytes);
       if (list.status !== 200) throw new Error(`container listing returned HTTP ${list.status}`);
       const ids = boundContainers(list.body, opts.targetPaths);
       if (ids.length === 0) {
@@ -667,8 +833,14 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
       } else {
         clean = 0;
         for (const id of ids) {
-          const del = await dockerRequest(ep, "DELETE", `/containers/${encodeURIComponent(id)}?force=1`, reqTimeout);
-          if (del.status === 204 || del.status === 200 || del.status === 404) removed.add(id);
+          const del = await dockerRequest(
+            ep,
+            "DELETE",
+            `/containers/${encodeURIComponent(id)}?force=1`,
+            reqTimeout,
+            opts.maxBodyBytes,
+          );
+          if (del.status === 204 || del.status === 200 || del.status === 404) removed.add(sanitizeForLog(id, 128));
         }
       }
       if (now() >= deadline) {
@@ -681,7 +853,7 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
       await sleep(opts.intervalMs ?? 1_000);
     }
   } catch (err) {
-    return { state: "docker_error", removed: [...removed], detail: (err as Error).message };
+    return { state: "docker_error", removed: [...removed], detail: sanitizeForLog((err as Error).message) };
   }
 }
 
@@ -728,13 +900,20 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       targetPaths: req.targetPaths.map((p) => path.resolve(p)),
       ownMarker: req.attempt?.marker,
       liveMarkers: others.map((a) => a.marker),
-      liveRootPids: others.flatMap((a) => {
-        try {
-          return a.recordedRootPids();
-        } catch {
-          return [];
-        }
-      }),
+      // Other live attempts' recorded roots (Claude CLI groups, Codex provider supervisors) plus
+      // every long-lived runner-uid root this worker launched and recorded itself.
+      liveRootPids: [
+        ...new Set([
+          ...others.flatMap((a) => {
+            try {
+              return a.recordedRootPids();
+            } catch {
+              return [];
+            }
+          }),
+          ...workerRunnerRootPids(),
+        ]),
+      ],
       workerNonce: workerSpawnNonce(),
     };
     processResult = await reapRunProcesses(scan, deps.reap);
@@ -764,10 +943,23 @@ function isScanRequest(v: unknown): v is ScanRequest {
   );
 }
 
-async function helperMain(encoded: string | undefined): Promise<ProcessQuiescence> {
+/** The helper's request, read from stdin (bounded). */
+async function readHelperRequest(): Promise<string> {
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const c of process.stdin) {
+    const buf = Buffer.isBuffer(c) ? c : Buffer.from(String(c));
+    bytes += buf.length;
+    if (bytes > HELPER_REQUEST_MAX) throw new Error("helper request exceeds 1 MiB");
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function helperMain(): Promise<ProcessQuiescence> {
   let req: unknown;
   try {
-    req = JSON.parse(Buffer.from(encoded ?? "", "base64").toString("utf8"));
+    req = JSON.parse(await readHelperRequest());
   } catch {
     return { state: "unverified", processes: [], killed: [], detail: "helper request unparsable" };
   }
@@ -776,7 +968,7 @@ async function helperMain(encoded: string | undefined): Promise<ProcessQuiescenc
 }
 
 if (process.argv[2] === HELPER_FLAG && process.argv[1] && path.resolve(process.argv[1]) === HELPER_FILE) {
-  helperMain(process.argv[3]).then(
+  helperMain().then(
     (r) => {
       process.stdout.write(`${JSON.stringify(r)}\n`, () => process.exit(0));
     },
@@ -789,5 +981,11 @@ if (process.argv[2] === HELPER_FLAG && process.argv[1] && path.resolve(process.a
 
 /** Log line fields for every process a non-quiescent result lists. */
 export function describeProcesses(q: ProcessQuiescence | undefined): Array<Record<string, unknown>> {
-  return (q?.processes ?? []).map((p) => ({ pid: p.pid, uid: p.uid, comm: p.comm, cwd: p.cwd, reason: p.reason }));
+  return (q?.processes ?? []).map((p) => ({
+    pid: p.pid,
+    uid: p.uid,
+    comm: sanitizeForLog(p.comm, 64),
+    cwd: sanitizeForLog(p.cwd),
+    reason: sanitizeForLog(p.reason, 64),
+  }));
 }

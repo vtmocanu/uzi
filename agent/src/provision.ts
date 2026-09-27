@@ -110,8 +110,10 @@ const defaultRun = async (
   const wrapped = runnerCommand(cmd, args);
   const { stdout, stderr } = await execFileAsync(wrapped.command, wrapped.args, {
     cwd: opts.cwd,
-    // issue #1783 (R4): worker-marked (a pre-turn provisioning op, never run-owned).
-    env: workerSpawnEnv(opts.env),
+    // issue #1783 (R4): deliberately NOT worker-marked: nix build hooks are untrusted code (see
+    // above), so anything they leak must stay reapable. Its cwd is the per-run dir OUTSIDE the
+    // clone, so an unmarked provisioning process is out of every clone's reap scope anyway.
+    env: opts.env,
     // Provisioning can be slow on a cold nix store; bounded so a hung fetch fails
     // the run rather than wedging the worker.
     timeout: 10 * 60_000,

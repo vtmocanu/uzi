@@ -397,7 +397,7 @@ describe("A-self: the scanner never kills itself or its ancestors", { skip: !HAS
     const WRAP = `
 const { spawnSync } = require("node:child_process");
 const a = JSON.parse(process.argv[1]);
-const r = spawnSync(a[0], a.slice(1), { stdio: ["ignore", "pipe", "inherit"], encoding: "utf8" });
+const r = spawnSync(a[0], a.slice(1), { stdio: ["inherit", "pipe", "inherit"], encoding: "utf8" });
 process.stdout.write(r.stdout || "");
 process.exit(r.status === null ? 1 : r.status);`;
     const spawnHelper: HelperSpawn = (command, args, opts) => {
@@ -405,10 +405,11 @@ process.exit(r.status === null ? 1 : r.status);`;
       // neither has the worker mark: only the R5 self/ancestor exclusion protects them.
       const env: NodeJS.ProcessEnv = { ...opts.env, ...markerEnv(own) };
       delete env[WORKER_SPAWN_ENV];
+      // stdin is piped through the wrapper: the helper reads its request there (never argv).
       const c = spawn(process.execPath, ["-e", WRAP, JSON.stringify([command, ...args])], {
         cwd: own.clonePath,
         env,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: ["pipe", "pipe", "pipe"],
       });
       spawned.push(c);
       return c;

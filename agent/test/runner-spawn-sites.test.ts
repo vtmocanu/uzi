@@ -7,32 +7,42 @@ import { fileURLToPath } from "node:url";
 // issue #1783 (R4) — every place the worker crosses into a runner/runner-cmd uid is listed here
 // with its disposition toward the run-quiescence reaper. The reaper attributes runner-uid
 // processes by env: an AGENT process carries the attempt marker (only the CLI spawn), and every
-// WORKER-initiated spawn carries the worker mark (UZI_WORKER_SPAWN) so a reap never kills the
-// worker's own op. A new, unlisted `runnerCommand(` / `runnerSpawn(` / `commandRootCommand(` site
-// (or a bare reference that is later called) fails this test until someone decides which side of
-// that line it is on and records it below. A listed site that disappears fails it too.
+// worker-authored, fixed-argv spawn carries the worker mark (UZI_WORKER_SPAWN) so a reap never kills
+// the worker's own op, while a spawn that executes repo- or agent-authored code is deliberately NOT
+// marked (whatever it leaks must stay reapable). A new, unlisted `runnerCommand(` / `runnerSpawn(` /
+// `commandRootCommand(` / `setprivRunnerArgs(` / `setprivArgsForUid(` site, a direct setpriv spawn
+// (`spawnSync(SETPRIV`), or a "/bin/setpriv" literal fails this test until someone decides which
+// side of that line it is on and records it below. A listed site that disappears fails it too.
 
 const SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src");
-const NAMES = ["runnerCommand", "runnerSpawn", "commandRootCommand"] as const;
+const NAMES = ["runnerCommand", "runnerSpawn", "commandRootCommand", "setprivRunnerArgs", "setprivArgsForUid"] as const;
+/** A DIRECT setpriv spawn (bypassing the wrappers above): `spawn(SETPRIV`, `spawnSync(SETPRIV`,
+ *  an execFile of it, or a "/bin/setpriv" literal anywhere. */
+const SETPRIV_SPAWN = /\b(?:spawn|spawnSync|execFile|execFileSync|execFileAsync)\(\s*SETPRIV\b/g;
+const SETPRIV_LITERAL = /["'`]\/bin\/setpriv["'`]/g;
 
 /** `<file>#<name>()` for a call, `<file>#<name>&` for a bare reference → expected count + why. */
 const ALLOWLIST: Record<string, { count: number; disposition: string }> = {
   "sdk-spawn.ts#runnerSpawn()": { count: 1, disposition: "the agent CLI: carries the attempt marker (buildSdkEnv), never the worker mark" },
   "runner-uid.ts#runnerCommand()": { count: 1, disposition: "inside runnerSpawn: the caller's env decides (see sdk-spawn.ts)" },
-  "executor.ts#runnerCommand()": { count: 1, disposition: "stub executor git: workerSpawnEnv; runs inside the stub run(), awaited before it returns" },
-  "git.ts#runnerCommand()": { count: 1, disposition: "runGitAsRunner: workerSpawnEnv" },
-  "js-deps.ts#runnerCommand()": { count: 1, disposition: "JS deps install: worker-marked in execInstall's spawn" },
-  "provision.ts#runnerCommand()": { count: 2, disposition: "devbox/nix run + PATH probe: worker-marked in the default run functions (pre-turn)" },
-  "provision.ts#commandRootCommand()": { count: 1, disposition: "PATH probe as runner-cmd (uid 10003, never scanned): worker-marked anyway" },
-  "self-improve.ts#runnerCommand()": { count: 1, disposition: "finalize-time check: workerSpawnEnv" },
-  "tick-spawner.ts#runnerCommand()": { count: 3, disposition: "tick child + kill/probe helpers: workerSpawnEnv" },
-  "rmtree.ts#runnerCommand&": { count: 2, disposition: "purge helper passes: workerSpawnEnv on the minimal env" },
-  "rmtree.ts#commandRootCommand&": { count: 1, disposition: "purge helper pass as runner-cmd: workerSpawnEnv" },
-  "run-quiescence.ts#runnerCommand()": { count: 1, disposition: "the quiescence helper: workerSpawnEnv, never an attempt marker" },
-  "codex/launcher.ts#runnerCommand()": { count: 1, disposition: "Codex root supervisor: workerSpawnEnv(replacedEnv)" },
-  "codex/launcher.ts#commandRootCommand()": { count: 4, disposition: "Codex command/effect supervisors, standalone modes, kill: workerSpawnEnv" },
-  "codex/launcher.ts#runnerCommand&": { count: 2, disposition: "owned-tree create/remove wrap: workerSpawnEnv on the inert env" },
-  "codex/launcher.ts#commandRootCommand&": { count: 2, disposition: "owned-tree create/remove wrap: workerSpawnEnv on the inert env" },
+  "runner-uid.ts#setprivRunnerArgs()": { count: 3, disposition: "runnerCommand's own body + the two kill helpers (worker-authored fixed argv: workerSpawnEnv)" },
+  "runner-uid.ts#setprivArgsForUid()": { count: 3, disposition: "setprivRunnerArgs / commandRootCommand / workerBoundaryCommand bodies (the wrappers themselves)" },
+  "runner-uid.ts#setpriv-spawn": { count: 2, disposition: "killRunnerGroup / killRunnerGroupOnly `kill -KILL` (worker-authored fixed argv: workerSpawnEnv)" },
+  "runner-uid.ts#setpriv-literal": { count: 1, disposition: "the SETPRIV constant the wrappers use" },
+  "executor.ts#runnerCommand()": { count: 1, disposition: "stub executor git (worker-authored fixed argv): workerSpawnEnv; runs inside the stub run(), awaited before it returns" },
+  "git.ts#runnerCommand()": { count: 1, disposition: "runGitAsRunner (worker-authored git, hooks pinned off by gitEnv): workerSpawnEnv" },
+  "js-deps.ts#runnerCommand()": { count: 1, disposition: "JS deps install: NOT marked (the package manager reads repo-controlled config in the clone; leaks stay reapable)" },
+  "provision.ts#runnerCommand()": { count: 2, disposition: "devbox/nix run: NOT marked (untrusted nix build hooks; cwd outside the clone); PATH probe (fixed script): workerSpawnEnv" },
+  "provision.ts#commandRootCommand()": { count: 1, disposition: "PATH probe as runner-cmd (uid 10003, never scanned; fixed script): workerSpawnEnv" },
+  "self-improve.ts#runnerCommand()": { count: 1, disposition: "finalize-time check: NOT marked (repo-authored command, cwd in the clone; leaks stay reapable)" },
+  "tick-spawner.ts#runnerCommand()": { count: 3, disposition: "tick child + kill/probe helpers (worker-authored fixed argv): workerSpawnEnv" },
+  "rmtree.ts#runnerCommand&": { count: 2, disposition: "purge helper passes (fixed script): workerSpawnEnv on the minimal env" },
+  "rmtree.ts#commandRootCommand&": { count: 1, disposition: "purge helper pass as runner-cmd (fixed script): workerSpawnEnv" },
+  "run-quiescence.ts#runnerCommand()": { count: 3, disposition: "the quiescence helper + its private-TMPDIR mktemp/rm (worker-authored fixed argv): workerSpawnEnv, never an attempt marker" },
+  "codex/launcher.ts#runnerCommand()": { count: 1, disposition: "Codex provider root supervisor: NOT marked (model-directed app-server); a recorded worker-launched root instead" },
+  "codex/launcher.ts#commandRootCommand()": { count: 4, disposition: "Codex command root + effect root: NOT marked (model-directed shells); standalone modes + kill (fixed argv): workerSpawnEnv" },
+  "codex/launcher.ts#runnerCommand&": { count: 2, disposition: "owned-tree create/remove wrap (fixed scripts): workerSpawnEnv on the inert env" },
+  "codex/launcher.ts#commandRootCommand&": { count: 2, disposition: "owned-tree create/remove wrap (fixed scripts): workerSpawnEnv on the inert env" },
 };
 
 function listTs(dir: string): string[] {
@@ -50,7 +60,7 @@ function codeOf(text: string): string {
     .split("\n")
     .filter((l) => !/^\s*(\/\/|\/\*|\*)/.test(l))
     .map((l) => l.replace(/\s\/\/\s.*$/, ""))
-    .filter((l) => !/export function (runnerCommand|runnerSpawn|commandRootCommand)\(/.test(l))
+    .filter((l) => !/export function (runnerCommand|runnerSpawn|commandRootCommand|setprivRunnerArgs|setprivArgsForUid)\(/.test(l))
     .join("\n");
 }
 
@@ -62,6 +72,12 @@ function found(): Record<string, number> {
     for (const name of NAMES) {
       for (const m of code.matchAll(new RegExp(`\\b${name}\\b(\\s*\\()?`, "g"))) {
         const key = `${rel}#${name}${m[1] ? "()" : "&"}`;
+        out[key] = (out[key] ?? 0) + 1;
+      }
+    }
+    for (const [re, tag] of [[SETPRIV_SPAWN, "setpriv-spawn"], [SETPRIV_LITERAL, "setpriv-literal"]] as const) {
+      for (const _m of code.matchAll(re)) {
+        const key = `${rel}#${tag}`;
         out[key] = (out[key] ?? 0) + 1;
       }
     }
@@ -79,5 +95,8 @@ describe("runner-uid spawn sites (issue #1783 R4)", () => {
 
   it("the source scan actually sees calls (not vacuous)", () => {
     assert.ok((found()["tick-spawner.ts#runnerCommand()"] ?? 0) >= 1);
+    // The direct-setpriv detectors see the two kill helpers in runner-uid.ts.
+    assert.ok((found()["runner-uid.ts#setpriv-spawn"] ?? 0) >= 1);
+    assert.ok((found()["runner-uid.ts#setprivRunnerArgs()"] ?? 0) >= 1);
   });
 });

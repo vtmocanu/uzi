@@ -46,7 +46,7 @@ import {
   uidSplitActive,
   workerBoundaryCommand,
 } from "../runner-uid.js";
-import { workerSpawnEnv } from "../worker-spawn-mark.js";
+import { registerWorkerRunnerRoot, workerSpawnEnv } from "../worker-spawn-mark.js";
 import {
   assertNoUnexpectedSystemConfig as defaultAssertNoUnexpectedSystemConfig,
   buildCodexConfigToml,
@@ -662,12 +662,20 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   const wrapped = spec.kind === "command"
     ? commandRootCommand(spec.supervisorBin, supervisorArgv)
     : runnerCommand(spec.supervisorBin, supervisorArgv);
-  // issue #1783 (R4): every launcher spawn carries the worker mark (never an attempt marker).
+  // issue #1783 (R4): NO worker mark. The supervisor runs the Codex app-server, which executes
+  // model-directed work, so anything it leaks must stay reapable and the nonce must stay out of
+  // its env. A runner-uid (provider) root makes itself non-dumpable instead, so the reaper
+  // attributes it through the worker-launched-root registry, recorded here until it exits.
   const child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
     cwd: spec.cwd,
-    env: workerSpawnEnv(replacedEnv),
+    env: replacedEnv,
     stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
   });
+  if (spec.kind !== "command") {
+    const unregister = registerWorkerRunnerRoot(child.pid);
+    child.once("exit", () => unregister());
+    child.once("error", () => unregister());
+  }
 
   // 7. Parse evidence (bounded), await `started`, expose snapshot/dispose + transport.
   const handle = await createHandle(child, uid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, spec.kind);
@@ -731,7 +739,9 @@ export async function launchCodexEffectRoot(
     : workerBoundaryCommand(spec.supervisorBin, supervisorArgv);
   const child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
     cwd: spec.cwd,
-    env: workerSpawnEnv(spec.env), // issue #1783 (R4): worker mark
+    // issue #1783 (R4): NO worker mark. A command root runs model-directed shells, and neither
+    // identity here is the runner uid the reaper scans, so the mark would only spread the nonce.
+    env: { ...spec.env },
     stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
   });
   return createHandle(child, expectedUid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, "command");

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   resolveDockerWiring,
   dockerSidecarExpected,
+  parseDockerTarget,
   DEFAULT_DIND_SOCKET,
   type ResolveDockerWiringOptions,
 } from "../src/docker-wiring.js";
@@ -187,5 +188,24 @@ describe("resolveDockerWiring readiness wait (PRD #83 M2)", () => {
     );
     assert.strictEqual(w.dockerHost, "unix:///run/dind/docker.sock");
     assert.ok(calls >= 3, `EACCES must be retried, not fatal; probe called ${calls}×`);
+  });
+});
+
+// issue #1783: ONE DOCKER_HOST parser shared by the probe and the run-quiescence Docker teardown.
+describe("parseDockerTarget (issue #1783: the shared DOCKER_HOST parser)", () => {
+  it("accepts every form: a bare /path socket, unix://, tcp://host:port[/], tcp without a port (2375), bracketed IPv6", () => {
+    assert.deepStrictEqual(parseDockerTarget("/run/dind/docker.sock"), { path: "/run/dind/docker.sock" });
+    assert.deepStrictEqual(parseDockerTarget("unix:///run/dind/docker.sock"), { path: "/run/dind/docker.sock" });
+    assert.deepStrictEqual(parseDockerTarget("tcp://dind:2376"), { host: "dind", port: 2376 });
+    assert.deepStrictEqual(parseDockerTarget("tcp://dind:2376/"), { host: "dind", port: 2376 });
+    assert.deepStrictEqual(parseDockerTarget("tcp://dind"), { host: "dind", port: 2375 });
+    assert.deepStrictEqual(parseDockerTarget("tcp://[::1]:2376"), { host: "::1", port: 2376 });
+    assert.deepStrictEqual(parseDockerTarget("tcp://[::1]"), { host: "::1", port: 2375 });
+  });
+
+  it("refuses what it cannot connect to", () => {
+    for (const bad of ["ssh://host", "npipe:////./pipe/docker", "tcp://", "tcp://h:0", "tcp://h:99999", "tcp://h:x", "unix://", "relative.sock"]) {
+      assert.strictEqual(parseDockerTarget(bad), undefined, bad);
+    }
   });
 });

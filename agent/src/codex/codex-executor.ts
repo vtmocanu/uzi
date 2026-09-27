@@ -1598,6 +1598,9 @@ export class CodexExecutor implements Executor {
   private readonly opts: CodexExecutorOptions;
   private readonly deps: CodexExecutorDeps;
   private readonly sessionStore: Pick<typeof CodexSessionStore, "adopt" | "inspect" | "remove" | "persist">;
+  /** issue #1783 (R0): the supervisor pids of the provider roots this executor launched and has
+   *  not yet cleanly reaped/disposed (see {@link recordedRootPids}). */
+  private readonly providerRootPids = new Set<number>();
 
   constructor(log: Logger, homeRoot: string, opts: CodexExecutorOptions, deps: CodexExecutorDeps = {}) {
     this.log = log;
@@ -1611,6 +1614,38 @@ export class CodexExecutor implements Executor {
     this.opts = opts;
     this.deps = deps;
     this.sessionStore = deps.sessionStore ?? CodexSessionStore;
+  }
+
+  /** issue #1783 (R0): the live provider-root supervisor pids (see Executor.recordedRootPids).
+   *  The supervisor runs as the runner uid and makes itself non-dumpable, so a concurrent Claude
+   *  run's quiescence reaper can only attribute it (and its descendants) through these roots. */
+  recordedRootPids(): number[] {
+    return [...this.providerRootPids];
+  }
+
+  /** issue #1783: record a launched provider root's supervisor pid until its root is cleanly
+   *  reaped or disposed. An unclean teardown keeps it recorded: the process may still live. */
+  private trackProviderRoot(launched: CodexLaunchRootResult): CodexLaunchRootResult {
+    const pid = launched.supervisorPid;
+    if (!Number.isInteger(pid) || pid <= 1) return launched;
+    this.providerRootPids.add(pid);
+    const forget = (): void => {
+      this.providerRootPids.delete(pid);
+    };
+    const inner = launched.root;
+    const root: RegisteredRoot = {
+      kind: inner.kind,
+      reap: async (deadlineMs) => {
+        const outcome = await inner.reap(deadlineMs);
+        if (outcome.ok) forget();
+        return outcome;
+      },
+      dispose: async (deadlineMs) => {
+        await inner.dispose(deadlineMs);
+        forget();
+      },
+    };
+    return { ...launched, root };
   }
 
   async run(ctx: RunContext): Promise<ExecutorResult> {
@@ -2582,7 +2617,7 @@ export class CodexExecutor implements Executor {
 
       harness = new CodexHarness({
         registry,
-        launchRoot: providerLaunchSeam,
+        launchRoot: async (spec) => this.trackProviderRoot(await providerLaunchSeam(spec)),
         broker: planBroker,
         provider,
         workspace: worktreePath,
