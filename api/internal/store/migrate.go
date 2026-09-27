@@ -173,6 +173,22 @@ const JudgeDispositionCoordLockClass int32 = 0x757A6A64 // "uzjd"
 // pool's default READ COMMITTED isolation (OpenPool sets none), like its siblings.
 const RunBranchLockClass int32 = 0x757A7262 // "uzrb"
 
+// CheckpointRetentionLockClass is the class half of the two-int advisory lock that serializes
+// every forge write against one run's retained checkpoint ref (PRD #1810): the terminal-time
+// settle delete (M1), supersession (M3) and the settlement/reconciliation sweeper (M4). Taken
+// as pg_try_advisory_lock(CheckpointRetentionLockClass, CheckpointRetentionLockObjID(run_id)).
+//
+// Unlike every class above it is SESSION-scoped, not XACT-scoped: the lock is held across a
+// forge round-trip, which must never run inside an open transaction. So it has an unlock path,
+// and the holder (workersvc.withRetentionLock) pins one pool connection for the whole
+// operation, re-checks it is still held (pg_locks) immediately before each forge write, and
+// destroys the connection rather than return it to the pool if the unlock fails. Try-only:
+// a busy key is reported to the caller, which leaves the ref in place for a later retry.
+//
+// Two-int space, disjoint from the other classes here. An objid collision only makes one of
+// two unrelated runs' tries fail for a moment, and a failed try never deletes anything.
+const CheckpointRetentionLockClass int32 = 0x757A6372 // "uzcr"
+
 // Migrate runs all pending goose migrations against the database at dsn. It
 // retries the initial connection so the API can start slightly ahead of
 // Postgres becoming ready.

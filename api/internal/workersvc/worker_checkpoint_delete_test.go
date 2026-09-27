@@ -2,8 +2,8 @@ package workersvc
 
 import (
 	"context"
-	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -13,21 +13,20 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// testCheckpointTip is a plausible checkpoint tip SHA the delete helper seeds by
-// default, so a run under test is treated as one that DID publish a checkpoint
-// (checkpoint_tip non-NULL) and therefore exercises the CAS delete (PRD #1042 M3). A
-// test covering the never-published case clears fs.claimCtx.CheckpointTip to NULL.
+// testCheckpointTip is a plausible checkpoint tip SHA the fake claim context carries, so a
+// run under test is one that DID publish a checkpoint (checkpoint_tip non-NULL): the case in
+// which a delete would be possible at all, and which these fake-store tests show is retained.
 const testCheckpointTip = "1111111111111111111111111111111111111111"
 
-// checkpointDeleteSvc builds a Service wired for the terminal-transition checkpoint
-// cleanup (PRD #1030 M4): the SSRF gate open, a sealed bot PAT in the claim context,
-// the background dispatcher forced SYNCHRONOUS so the async delete is observed
-// deterministically, and the delete seam stubbed to record every DeleteOptions it is
-// called with (and optionally fail, to prove the terminal state is set regardless).
+// checkpointDeleteSvc builds a FAKE-store Service wired for the terminal-transition
+// checkpoint handling (PRD #1030 M4, PRD #1810 M1): the SSRF gate open, a sealed bot PAT in
+// the claim context, the background dispatcher forced SYNCHRONOUS, and the delete seam stubbed
+// to record every DeleteOptions it is called with.
 //
-// The seeded claim context carries a non-NULL checkpoint_tip (testCheckpointTip): the
-// runs these tests exercise DID publish a checkpoint, so the delete must fire. The
-// PRD #1042 M3 NULL-skip case clears it explicitly.
+// It wires NO retention lock pool (a fake store has no Postgres session to hold an advisory
+// lock on), so PRD #1810's fail-safe applies: every terminal transition RETAINS the ref and
+// the delete seam is never called. The delete path itself, with a real lock, custody holds and
+// checkpoint_retentions rows, is covered by checkpoint_retention_livedb_test.go.
 func checkpointDeleteSvc(t *testing.T, fs *fakeStore, deleteErr error) (*Service, *[]pushbroker.DeleteOptions) {
 	t.Helper()
 	box := newBox(t)
@@ -54,179 +53,101 @@ func checkpointDeleteSvc(t *testing.T, fs *fakeStore, deleteErr error) (*Service
 	return svc, &calls
 }
 
-// TestSetStateCompletedDeletesCheckpoint proves a `completed` terminal transition on a
-// checkpoint-eligible issue run deletes the run's checkpoint ref, derived server-side
-// as agent/issue-<iid>, and that the completion itself is recorded.
-func TestSetStateCompletedDeletesCheckpoint(t *testing.T) {
-	fs := &fakeStore{
-		runOwned: store.Run{
-			Kind:     runkind.Issue,
-			IssueIid: pgtype.Int8{Int64: 123, Valid: true},
-			Status:   "completed",
+// retainedFakeCases are terminal transitions on checkpoint-eligible runs that published a
+// checkpoint. Without a retention lock pool none of them may call the delete seam, whatever the
+// terminal status, and each must still record its terminal state.
+func TestTerminalTransitionWithoutRetentionLockRetainsCheckpoint(t *testing.T) {
+	cases := []struct {
+		name  string
+		run   store.Run
+		state string
+		rows  func(fs *fakeStore)
+		check func(t *testing.T, fs *fakeStore)
+	}{
+		{
+			name:  "completed",
+			run:   store.Run{Kind: runkind.Issue, IssueIid: pgtype.Int8{Int64: 123, Valid: true}, Status: "completed"},
+			state: "completed",
+			rows:  func(fs *fakeStore) { fs.setCompletedRows = 1 },
+			check: func(t *testing.T, fs *fakeStore) {
+				if fs.setCompleted == nil {
+					t.Fatalf("SetRunCompleted was not called; the terminal state must be recorded")
+				}
+			},
 		},
-		setCompletedRows: 1,
+		{
+			name:  "completed self_improve",
+			run:   store.Run{ID: uuid.New(), Kind: runkind.SelfImprove, IssueIid: pgtype.Int8{Int64: 7, Valid: true}, Status: "completed"},
+			state: "completed",
+			rows:  func(fs *fakeStore) { fs.setCompletedRows = 1 },
+			check: func(t *testing.T, fs *fakeStore) {
+				if fs.setCompleted == nil {
+					t.Fatalf("SetRunCompleted was not called; the terminal state must be recorded")
+				}
+			},
+		},
+		{
+			name:  "failed routed to cancelled",
+			run:   store.Run{Kind: runkind.Issue, IssueIid: pgtype.Int8{Int64: 77, Valid: true}, Status: "cancelled", StopKind: pgtype.Text{String: "cancelled", Valid: true}},
+			state: "failed",
+			rows:  func(*fakeStore) {},
+			check: func(t *testing.T, fs *fakeStore) {
+				if fs.cancelledByWorker == nil {
+					t.Fatalf("CancelRunByWorker was not called; the terminal state must be recorded")
+				}
+			},
+		},
 	}
-	svc, calls := checkpointDeleteSvc(t, fs, nil)
-
-	_, applied, err := svc.SetState(context.Background(), worker(), fs.runOwned.ID, StateRequest{State: "completed"})
-	if err != nil {
-		t.Fatalf("SetState(completed): %v", err)
-	}
-	if !applied {
-		t.Fatalf("applied = false, want true")
-	}
-	if fs.setCompleted == nil {
-		t.Fatalf("SetRunCompleted was not called; the terminal state must be recorded")
-	}
-	if len(*calls) != 1 {
-		t.Fatalf("delete calls = %d, want 1", len(*calls))
-	}
-	if got := (*calls)[0].Branch; got != "agent/issue-123" {
-		t.Errorf("delete branch = %q, want agent/issue-123", got)
-	}
-	if got := (*calls)[0].CloneURL; got != "https://gitlab.example.com/team/repo.git" {
-		t.Errorf("delete clone URL = %q, want the server-derived clone URL", got)
-	}
-	if got := (*calls)[0].Username; got != "uzi-bot" {
-		t.Errorf("delete username = %q, want uzi-bot", got)
-	}
-	if string((*calls)[0].PAT) != "bot-pat-CHECKPOINTDELETE-abcdef1234567890" {
-		t.Errorf("delete PAT was not the decrypted bot PAT")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &fakeStore{runOwned: tc.run}
+			tc.rows(fs)
+			svc, calls := checkpointDeleteSvc(t, fs, nil)
+			_, applied, err := svc.SetState(context.Background(), worker(), fs.runOwned.ID, StateRequest{State: tc.state})
+			if err != nil {
+				t.Fatalf("SetState(%s): %v", tc.state, err)
+			}
+			if !applied {
+				t.Fatalf("applied = false, want true")
+			}
+			tc.check(t, fs)
+			if len(*calls) != 0 {
+				t.Fatalf("delete calls = %d, want 0 (no retention lock pool: the ref must be retained)", len(*calls))
+			}
+		})
 	}
 }
 
-// TestSetStateCompletedSelfImproveDeletesCheckpoint pins PRD #1062 M3: a terminal
-// self_improve run whose checkpoint_tip is non-NULL deletes its checkpoint ref, targeting
-// the run-uuid-keyed branch uzi/self-improve/<runID> — NOT the issue branch, even though
-// the run carries a valid issue_iid. It would FAIL against the old issue-only gate (which
-// no-op'd every non-issue kind, so this delete never fired).
-func TestSetStateCompletedSelfImproveDeletesCheckpoint(t *testing.T) {
+// TestServerSideCancelWithoutRetentionLockRetainsCheckpoint: the server-side cancel path (no
+// live poller, the run is committed terminal outside SetState) with no retention lock pool
+// records the cancel and retains the ref.
+func TestServerSideCancelWithoutRetentionLockRetainsCheckpoint(t *testing.T) {
+	userID := uuid.New()
 	runID := uuid.New()
 	fs := &fakeStore{
-		runOwned: store.Run{
+		// No WorkerID → hasLivePoller is false, so the cancel commits SERVER-SIDE.
+		runByID: store.Run{
 			ID:       runID,
-			Kind:     runkind.SelfImprove,
-			IssueIid: pgtype.Int8{Int64: 7, Valid: true}, // stable tracking issue, must be ignored
-			Status:   "completed",
-		},
-		setCompletedRows: 1,
-	}
-	svc, calls := checkpointDeleteSvc(t, fs, nil)
-
-	_, applied, err := svc.SetState(context.Background(), worker(), runID, StateRequest{State: "completed"})
-	if err != nil {
-		t.Fatalf("SetState(completed): %v", err)
-	}
-	if !applied {
-		t.Fatalf("applied = false, want true")
-	}
-	if fs.setCompleted == nil {
-		t.Fatalf("SetRunCompleted was not called; the terminal state must be recorded")
-	}
-	if len(*calls) != 1 {
-		t.Fatalf("delete calls = %d, want 1 (a self_improve run's checkpoint must be cleaned up)", len(*calls))
-	}
-	wantBranch := "uzi/self-improve/" + runID.String()
-	if got := (*calls)[0].Branch; got != wantBranch {
-		t.Errorf("delete branch = %q, want %q (run-uuid-keyed, NOT the issue branch)", got, wantBranch)
-	}
-	if got := (*calls)[0].ExpectedOldTip; got != testCheckpointTip {
-		t.Errorf("delete ExpectedOldTip = %q, want the persisted tip %q", got, testCheckpointTip)
-	}
-}
-
-// TestSetStateCompletedNullCheckpointTipNoDelete is the PRD #1042 M3 skip-on-NULL
-// guard: a checkpoint-eligible issue run whose runs.checkpoint_tip is NULL NEVER
-// published a checkpoint ref, so it owns nothing — deleteCheckpointBestEffort must NOT
-// invoke the delete seam (an unconditional delete could clobber a SIBLING run's fresh
-// checkpoint on the same branch). The terminal completion is still recorded.
-func TestSetStateCompletedNullCheckpointTipNoDelete(t *testing.T) {
-	fs := &fakeStore{
-		runOwned: store.Run{
+			UserID:   userID,
 			Kind:     runkind.Issue,
-			IssueIid: pgtype.Int8{Int64: 123, Valid: true},
-			Status:   "completed",
+			IssueIid: pgtype.Int8{Int64: 321, Valid: true},
+			Status:   "running",
 		},
-		setCompletedRows: 1,
 	}
 	svc, calls := checkpointDeleteSvc(t, fs, nil)
-	// This run NEVER published a checkpoint: checkpoint_tip is NULL.
-	fs.claimCtx.CheckpointTip = pgtype.Text{} // Valid == false
 
-	_, applied, err := svc.SetState(context.Background(), worker(), fs.runOwned.ID, StateRequest{State: "completed"})
+	res, err := svc.SubmitInput(context.Background(), userID, runID, "cancel", "operator says stop", nil)
 	if err != nil {
-		t.Fatalf("SetState(completed): %v", err)
+		t.Fatalf("SubmitInput(cancel): %v", err)
 	}
-	if !applied {
-		t.Fatalf("applied = false, want true")
+	if !res.ServerSide {
+		t.Fatalf("ServerSide = false, want true (no live poller → server-side cancel)")
 	}
-	if fs.setCompleted == nil {
-		t.Fatalf("SetRunCompleted was not called; the terminal state must be recorded")
+	if fs.cancelled == nil {
+		t.Fatalf("CancelRunServerSide was not called; the terminal state must be recorded")
 	}
 	if len(*calls) != 0 {
-		t.Fatalf("delete calls = %d, want 0 (a never-published run owns no ref and must not attempt a delete)", len(*calls))
-	}
-}
-
-// TestSetStateCompletedPassesExpectedOldTip proves the non-NULL path: a run that DID
-// publish a checkpoint deletes it, passing its persisted tip as the CAS Old
-// (DeleteOptions.ExpectedOldTip), so the ref is removed only while origin still points
-// at exactly the tip THIS run published.
-func TestSetStateCompletedPassesExpectedOldTip(t *testing.T) {
-	fs := &fakeStore{
-		runOwned: store.Run{
-			Kind:     runkind.Issue,
-			IssueIid: pgtype.Int8{Int64: 55, Valid: true},
-			Status:   "completed",
-		},
-		setCompletedRows: 1,
-	}
-	svc, calls := checkpointDeleteSvc(t, fs, nil) // seeds CheckpointTip = testCheckpointTip
-
-	_, applied, err := svc.SetState(context.Background(), worker(), fs.runOwned.ID, StateRequest{State: "completed"})
-	if err != nil {
-		t.Fatalf("SetState(completed): %v", err)
-	}
-	if !applied {
-		t.Fatalf("applied = false, want true")
-	}
-	if len(*calls) != 1 {
-		t.Fatalf("delete calls = %d, want 1 (a published run must clean up its ref)", len(*calls))
-	}
-	if got := (*calls)[0].ExpectedOldTip; got != testCheckpointTip {
-		t.Errorf("delete ExpectedOldTip = %q, want the persisted tip %q", got, testCheckpointTip)
-	}
-}
-
-// TestSetStateFailedCancelledDeletesCheckpoint proves the failed→cancelled terminal
-// route (a consumed operator cancel arriving as `failed`, stop_kind='cancelled', which
-// SetState routes to CancelRunByWorker) also triggers the checkpoint delete.
-func TestSetStateFailedCancelledDeletesCheckpoint(t *testing.T) {
-	fs := &fakeStore{
-		runOwned: store.Run{
-			Kind:     runkind.Issue,
-			IssueIid: pgtype.Int8{Int64: 77, Valid: true},
-			Status:   "cancelled",
-			StopKind: pgtype.Text{String: "cancelled", Valid: true},
-		},
-	}
-	svc, calls := checkpointDeleteSvc(t, fs, nil)
-
-	_, applied, err := svc.SetState(context.Background(), worker(), fs.runOwned.ID, StateRequest{State: "failed"})
-	if err != nil {
-		t.Fatalf("SetState(failed): %v", err)
-	}
-	if !applied {
-		t.Fatalf("applied = false, want true")
-	}
-	if fs.cancelledByWorker == nil {
-		t.Fatalf("CancelRunByWorker was not called; the terminal state must be recorded")
-	}
-	if len(*calls) != 1 {
-		t.Fatalf("delete calls = %d, want 1", len(*calls))
-	}
-	if got := (*calls)[0].Branch; got != "agent/issue-77" {
-		t.Errorf("delete branch = %q, want agent/issue-77", got)
+		t.Fatalf("delete calls = %d, want 0 (no retention lock pool: the ref must be retained)", len(*calls))
 	}
 }
 
@@ -278,106 +199,31 @@ func TestSetStateNonTerminalNoDelete(t *testing.T) {
 	}
 }
 
-// TestSetStateCompletedDeleteErrorStillCompletes proves the delete is BEST-EFFORT: a
-// delete failure must NOT fail the terminal transition — the completion is still
-// recorded and SetState returns success.
-func TestSetStateCompletedDeleteErrorStillCompletes(t *testing.T) {
-	fs := &fakeStore{
-		runOwned: store.Run{
-			Kind:     runkind.Issue,
-			IssueIid: pgtype.Int8{Int64: 9, Valid: true},
-			Status:   "completed",
-		},
-		setCompletedRows: 1,
-	}
-	svc, calls := checkpointDeleteSvc(t, fs, errors.New("forge is down"))
-
-	_, applied, err := svc.SetState(context.Background(), worker(), fs.runOwned.ID, StateRequest{State: "completed"})
-	if err != nil {
-		t.Fatalf("SetState returned an error on a failed checkpoint delete: %v (the delete is best-effort and must never fail the terminal report)", err)
-	}
-	if !applied {
-		t.Fatalf("applied = false, want true (completion must be recorded despite the delete error)")
-	}
-	if fs.setCompleted == nil {
-		t.Fatalf("SetRunCompleted was not called; the terminal state must be recorded regardless of the delete outcome")
-	}
-	if len(*calls) != 1 {
-		t.Fatalf("delete calls = %d, want 1 (the delete was attempted)", len(*calls))
+// TestRetentionBackoff pins the failed-delete retry schedule: one minute after the first
+// failure, doubling per prior failure, capped at one hour.
+func TestRetentionBackoff(t *testing.T) {
+	for _, tc := range []struct {
+		attempts int32
+		want     time.Duration
+	}{
+		{0, time.Minute}, {1, 2 * time.Minute}, {2, 4 * time.Minute}, {5, 32 * time.Minute}, {6, time.Hour}, {40, time.Hour},
+	} {
+		if got := retentionBackoff(tc.attempts); got != tc.want {
+			t.Errorf("retentionBackoff(%d) = %v, want %v", tc.attempts, got, tc.want)
+		}
 	}
 }
 
-// TestSetStateCompletedDeletePanicRecovered proves the checkpoint-delete closure
-// RECOVERS a panic from the delete seam (pushbroker.Delete drives go-git, which has
-// nil-deref panic paths on hostile forge responses). In production s.background is a
-// DETACHED goroutine, so an unrecovered panic there crashes the whole api process. The
-// test forces the delete seam to PANIC and runs it under the SYNCHRONOUS background seam
-// (fn() inline), so the panic — absent the recover — would propagate out to this test
-// caller and fail it. With the recover in the closure body it is swallowed, the terminal
-// transition still returns success, and the completion is recorded.
-func TestSetStateCompletedDeletePanicRecovered(t *testing.T) {
-	fs := &fakeStore{
-		runOwned: store.Run{
-			Kind:     runkind.Issue,
-			IssueIid: pgtype.Int8{Int64: 42, Valid: true},
-			Status:   "completed",
-		},
-		setCompletedRows: 1,
-	}
-	svc, _ := checkpointDeleteSvc(t, fs, nil)
-	// Override the seam to PANIC, as go-git can on a malformed/hostile forge response.
-	svc.SetDeleteCheckpointFn(func(_ context.Context, _ pushbroker.DeleteOptions) error {
-		panic("go-git nil-deref on hostile forge response")
+// TestWithRetentionLockWithoutPoolNotAcquired: no pool wired means the lock is never taken and
+// fn never runs, so a caller can only retain.
+func TestWithRetentionLockWithoutPoolNotAcquired(t *testing.T) {
+	svc := New(&fakeStore{}, nil, testParams())
+	ran := false
+	acquired, err := svc.withRetentionLock(context.Background(), uuid.New(), func(context.Context, func(context.Context) error) error {
+		ran = true
+		return nil
 	})
-
-	// With the synchronous background seam, a panic that escaped the closure would
-	// propagate here and crash/fail the test. The recover in the closure body must
-	// swallow it.
-	_, applied, err := svc.SetState(context.Background(), worker(), fs.runOwned.ID, StateRequest{State: "completed"})
-	if err != nil {
-		t.Fatalf("SetState(completed): %v (a panic in the best-effort delete must not fail the terminal report)", err)
-	}
-	if !applied {
-		t.Fatalf("applied = false, want true (completion must be recorded despite the delete panic)")
-	}
-	if fs.setCompleted == nil {
-		t.Fatalf("SetRunCompleted was not called; the terminal state must be recorded regardless of the delete panic")
-	}
-}
-
-// TestServerSideCancelDeletesCheckpoint proves the server-side cancel path (no live
-// poller — the run is committed terminal outside SetState) also deletes the run's
-// checkpoint ref.
-func TestServerSideCancelDeletesCheckpoint(t *testing.T) {
-	userID := uuid.New()
-	runID := uuid.New()
-	fs := &fakeStore{
-		// GetRunByIDForUser feeds SubmitInput. No WorkerID → hasLivePoller is false, so
-		// the cancel commits SERVER-SIDE (the distinct terminal path M4 must also hook).
-		runByID: store.Run{
-			ID:       runID,
-			UserID:   userID,
-			Kind:     runkind.Issue,
-			IssueIid: pgtype.Int8{Int64: 321, Valid: true},
-			Status:   "running",
-		},
-	}
-	svc, calls := checkpointDeleteSvc(t, fs, nil)
-
-	res, err := svc.SubmitInput(context.Background(), userID, runID, "cancel", "operator says stop", nil)
-	if err != nil {
-		t.Fatalf("SubmitInput(cancel): %v", err)
-	}
-	if !res.ServerSide {
-		t.Fatalf("ServerSide = false, want true (no live poller → server-side cancel)")
-	}
-	if fs.cancelled == nil {
-		t.Fatalf("CancelRunServerSide was not called; the terminal state must be recorded")
-	}
-	if len(*calls) != 1 {
-		t.Fatalf("delete calls = %d, want 1", len(*calls))
-	}
-	if got := (*calls)[0].Branch; got != "agent/issue-321" {
-		t.Errorf("delete branch = %q, want agent/issue-321", got)
+	if err != nil || acquired || ran {
+		t.Fatalf("withRetentionLock without a pool: acquired=%v err=%v ran=%v, want false/nil/false", acquired, err, ran)
 	}
 }

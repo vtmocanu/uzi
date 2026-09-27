@@ -552,6 +552,15 @@ type Store interface {
 	// so completing a newer generation never releases an older same-worker orphan (PRD #1349 M4).
 	ReleaseCustodyHold(ctx context.Context, arg store.ReleaseCustodyHoldParams) (int64, error)
 	ReleaseCustodyHoldExact(ctx context.Context, arg store.ReleaseCustodyHoldExactParams) (int64, error)
+	// PRD #1810 checkpoint-ref retention (checkpoint_retention.go): the terminal-time record
+	// inserts, the record read, and the state-guarded settle transitions.
+	InsertCheckpointRetentionIfHeld(ctx context.Context, arg store.InsertCheckpointRetentionIfHeldParams) (int64, error)
+	InsertCheckpointRetentionSettling(ctx context.Context, arg store.InsertCheckpointRetentionSettlingParams) (int64, error)
+	GetCheckpointRetention(ctx context.Context, runID uuid.UUID) (store.CheckpointRetention, error)
+	SetCheckpointRetentionSettlingIfUnheld(ctx context.Context, runID uuid.UUID) (int64, error)
+	SetCheckpointRetentionDeleted(ctx context.Context, arg store.SetCheckpointRetentionDeletedParams) (int64, error)
+	RecordCheckpointRetentionFailure(ctx context.Context, arg store.RecordCheckpointRetentionFailureParams) (int64, error)
+	SetCheckpointRetentionAbandoned(ctx context.Context, arg store.SetCheckpointRetentionAbandonedParams) (int64, error)
 	// Issue #1582 M1: the predecessor-settle pair. GetCustodyHoldForSettle reads the exact hold
 	// (scoped to its run); ReleasePredecessorCustodyHoldByAncestry is the single guarded
 	// statement that releases that one older-generation hold with 'ancestry' evidence after the
@@ -1740,6 +1749,16 @@ type Service struct {
 	// credPromoteHooks are the credential_disabled promoter's LiveDB race seams (nil in
 	// production, so inert unless a test sets it; the codexPromoteHooks idiom above).
 	credPromoteHooks *credentialPromoteTestHooks
+	// retentionPool pins the connection the per-run checkpoint-retention SESSION advisory lock
+	// is held on (PRD #1810, withRetentionLock); set via SetRetentionLockPool. Nil means no
+	// retention lock can be taken, so every retention path RETAINS and nothing is deleted.
+	retentionPool ConnAcquirer
+	// retentionSem caps concurrent retention forge operations process-wide (a buffered chan
+	// of retentionDefaultConc slots, made in New). Taken non-blockingly: full means retain now,
+	// retry later.
+	retentionSem chan struct{}
+	// retentionHooks are the retention paths' LiveDB race seams (nil in production).
+	retentionHooks *retentionTestHooks
 	// readyAt is the moment the worker-facing listener(s) became ready (PRD #1390 M1, D1),
 	// stored as Unix nanoseconds (0 = not yet ready). main.go writes it via SetReadyAt after
 	// binding every enabled listener; the sweeper goroutine reads it each tick to anchor the
@@ -1912,6 +1931,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		publishFn:          pushbroker.Publish,
 		deleteCheckpointFn: pushbroker.Delete,
 		background:         func(fn func()) { go fn() },
+		retentionSem:       make(chan struct{}, retentionDefaultConc),
 	}
 }
 
@@ -4211,17 +4231,19 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// committed transition; guarded on wkr.Ephemeral and busy-checked in-query so a
 		// normal run's completion is a no-op. Best-effort — never fails the report.
 		s.maybeTeardownEphemeral(ctx, wkr, run)
-		// PRD #1030 M4: on a COMMITTED terminal transition (completed, or a
+		// PRD #1030 M4 / PRD #1810 M1: on a COMMITTED terminal transition (completed, or a
 		// failed→cancelled/stopped/plan-reject/agent-failure route through the switch
-		// above), delete the run's now-stale checkpoint ref so it cannot later block a
-		// new run on the same branch with a not_descendant skip. Best-effort and
-		// dispatched OFF this goroutine — it must never delay or fail the worker's
-		// terminal report, and it runs AFTER the terminal state is durably recorded. The
-		// terminal guard keeps it off `running`/`awaiting_*` transitions; the helper
-		// kind-gates it to checkpoint-eligible issue runs. `failed` is terminal and NOT
-		// requeued, so deleting here cannot race a requeue-resume (PRD #1030 M4).
+		// above), settle the run's checkpoint ref. While any custody hold of the run is open
+		// (failed and cancelled runs keep theirs, above) the ref is RETAINED for recovery;
+		// with none open it is deleted CAS on its tip, so it cannot later block a new run on
+		// the same branch with a not_descendant skip. It runs AFTER the terminal state is
+		// durably recorded, and the forge call is dispatched OFF this goroutine — it must
+		// never delay or fail the worker's terminal report. The terminal guard keeps it off
+		// `running`/`awaiting_*` transitions; the helper kind-gates it to checkpoint-eligible
+		// runs. `failed` is terminal and NOT requeued, so a delete here cannot race a
+		// requeue-resume (PRD #1030 M4).
 		if terminalStatuses[run.Status] {
-			s.deleteCheckpointBestEffort(runID, run.Kind, run.IssueIid)
+			s.retainOrDeleteCheckpoint(ctx, runID, run.Kind, run.IssueIid)
 		}
 	}
 	if gateRefusal != nil && err == nil {
@@ -5152,115 +5174,6 @@ func forgeHostFromURL(raw string) (string, error) {
 		return "", fmt.Errorf("clone URL %q must be https with a host", raw)
 	}
 	return "https://" + strings.ToLower(u.Host), nil
-}
-
-// deleteCheckpointBestEffort removes a run's stale checkpoint ref
-// (refs/uzi-checkpoints/<branch>) from the forge on a TERMINAL transition (PRD #1030
-// M4). Once a run is terminal its checkpoint ref is stale scratch state; leaving it
-// behind later blocks a NEW run on the same branch with a not_descendant skip, so
-// every terminal path calls this.
-//
-// It is BEST-EFFORT and must NEVER block or fail the caller's terminal transition:
-// the terminal DB write has already committed by the time this runs, and the whole
-// forge round-trip is dispatched on s.background (a detached goroutine in production;
-// tests run it inline) under pushbroker.Delete's own short wall-clock timeout. Any
-// failure is logged and swallowed — a surviving stale ref only re-blocks a later run
-// with a benign skip, never corrupts anything, and the PVC refs/uzi-runner/* remains
-// the primary recovery path.
-//
-// It is gated to the SAME checkpoint-eligible set Publish supports (an issue run with a
-// valid issue iid, or a self_improve run — PRD #1062 M3): only these ever published a
-// checkpoint ref, so any other kind is a no-op with no forge call. The branch, repo
-// connection and PAT are derived SERVER-SIDE exactly as Publish derives them (via
-// checkpointBranch from run-row fields, GetRunClaimContext, the SSRF gate, box.Open),
-// never from the worker.
-func (s *Service) deleteCheckpointBestEffort(runID uuid.UUID, kind string, issueIid pgtype.Int8) {
-	// Kind-gate identically to Publish (dispatch on kind first): a run that never had a
-	// checkpoint ref has nothing to delete. Do this BEFORE dispatching so an ineligible
-	// kind makes no goroutine and no forge call.
-	branch, ok := checkpointBranch(kind, runID, issueIid)
-	if !ok {
-		return
-	}
-	// A deployment that never wired the delete seam or the SSRF gate, or a service
-	// built without a secretbox (some tests), cannot broker the delete — skip rather
-	// than dispatch a goroutine that would only fail. (publishFn/box/forgeBaseURLAllowed
-	// nil-checks mirror Publish's own guards.)
-	if s.deleteCheckpointFn == nil || s.forgeBaseURLAllowed == nil || s.box == nil || s.background == nil {
-		return
-	}
-	s.background(func() {
-		// s.background is a DETACHED goroutine in production, and pushbroker.Delete
-		// drives go-git (ListContext/PushContext), which has nil-deref panic paths on
-		// malformed forge responses. An unrecovered panic in ANY goroutine crashes the
-		// whole api process, so recover FIRST and swallow it — this cleanup is
-		// best-effort, and the failure it prevents (a later not_descendant skip) is
-		// benign. Mirrors forgesvc.ProjectSyncService.launchSeed's recover idiom.
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("checkpoint cleanup: delete panicked", "run", runID, "branch", branch, "panic", secretscrub.Scrub(fmt.Sprint(r)))
-			}
-		}()
-		// Detached from the request/report ctx (which is already returning to the
-		// worker): bind to a fresh context.Background, and let pushbroker.Delete apply
-		// its own bounded timeout on top. A slow/down forge cannot reach the caller.
-		ctx := context.Background()
-
-		rc, err := s.q.GetRunClaimContext(ctx, runID)
-		if err != nil {
-			// No repo/forge connection (a repo-less run) or the row vanished: there is
-			// nothing to delete. Benign.
-			if !errors.Is(err, pgx.ErrNoRows) {
-				slog.Warn("checkpoint cleanup: claim context", "run", runID, "error", err)
-			}
-			return
-		}
-		// Skip entirely when this run NEVER published a checkpoint (checkpoint_tip
-		// NULL): it owns no ref, so there is nothing to delete — and an unconditional
-		// delete could clobber a SIBLING run's fresh checkpoint on the same branch. This
-		// is load-bearing, not an optimisation. When set, rc.CheckpointTip.String is the
-		// CAS Old the delete must match (pushbroker.DeleteOptions.ExpectedOldTip), so
-		// origin's ref is removed only while it still points at exactly the tip THIS run
-		// published.
-		if !rc.CheckpointTip.Valid {
-			slog.Debug("checkpoint cleanup: skip (never published)", "run", runID, "branch", branch)
-			return
-		}
-
-		cloneURL := rc.RepoWebUrl + ".git"
-
-		// Same SSRF gate as Publish, BEFORE decrypting the PAT: never point go-git at
-		// an un-allowlisted host. A misconfigured gate is a skip here (best-effort),
-		// not the loud 500 Publish raises — this path must never fail a terminal report.
-		if !s.forgeBaseURLAllowed(rc.BaseUrl) {
-			slog.Warn("checkpoint cleanup: base URL not allowlisted", "run", runID)
-			return
-		}
-		cloneHost, err := forgeHostFromURL(cloneURL)
-		if err != nil || !s.forgeBaseURLAllowed(cloneHost) {
-			slog.Warn("checkpoint cleanup: clone host not allowlisted", "run", runID)
-			return
-		}
-
-		botPAT, err := s.box.Open(rc.TokenCiphertext)
-		if err != nil {
-			slog.Warn("checkpoint cleanup: bot PAT could not be decrypted", "run", runID)
-			return
-		}
-
-		if derr := s.deleteCheckpointFn(ctx, pushbroker.DeleteOptions{
-			CloneURL:       cloneURL,
-			Branch:         branch,
-			Username:       rc.BotUsername,
-			PAT:            string(botPAT),
-			ExpectedOldTip: rc.CheckpointTip.String,
-		}); derr != nil {
-			// Scrub any credential-bearing go-git error (its remote URL can carry the
-			// PAT in userinfo) before logging — the same invariant Publish's default arm
-			// keeps. Best-effort: the error is logged and swallowed, never surfaced.
-			slog.Warn("checkpoint cleanup: delete ref", "run", runID, "branch", branch, "error", secretscrub.Scrub(derr.Error()))
-		}
-	})
 }
 
 // -------------------------------------------------------------------------

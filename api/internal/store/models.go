@@ -116,6 +116,30 @@ type BrandingAsset struct {
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
+type CheckpointRetention struct {
+	RunID         uuid.UUID          `json:"run_id"`
+	UserID        uuid.UUID          `json:"user_id"`
+	RepoID        uuid.UUID          `json:"repo_id"`
+	Branch        string             `json:"branch"`
+	Tip           string             `json:"tip"`
+	Ref           string             `json:"ref"`
+	RecoveryRef   pgtype.Text        `json:"recovery_ref"`
+	State         string             `json:"state"`
+	Attempts      int32              `json:"attempts"`
+	NextAttemptAt pgtype.Timestamptz `json:"next_attempt_at"`
+	LastError     pgtype.Text        `json:"last_error"`
+	VerifyAfter   pgtype.Timestamptz `json:"verify_after"`
+	VerifiedAt    pgtype.Timestamptz `json:"verified_at"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	SettledAt     pgtype.Timestamptz `json:"settled_at"`
+}
+
+type CheckpointRetentionMetum struct {
+	ID        bool               `json:"id"`
+	EnabledAt pgtype.Timestamptz `json:"enabled_at"`
+}
+
 type CiAutofixAttempt struct {
 	RepoID         uuid.UUID          `json:"repo_id"`
 	Ref            string             `json:"ref"`

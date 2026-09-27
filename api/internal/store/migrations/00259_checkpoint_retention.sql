@@ -1,0 +1,78 @@
+-- +goose Up
+
+-- PRD #1810 M1 (D1): a published checkpoint ref (refs/uzi-checkpoints/<branch>) is RETAINED
+-- on origin while its run has an open custody hold, instead of being deleted best-effort on
+-- every terminal transition. This table is the durable record of each terminal run's
+-- checkpoint ref and what the api has done (or still owes) to it. Purely ADDITIVE: two
+-- brand-new tables, no change to any worker-facing table.
+--
+-- One row per run (run_id PRIMARY KEY). The row is written ONCE at the run's terminal
+-- transition and never reset: a later terminal call for the same run (a duplicate report,
+-- a second cancel path) finds the existing row and leaves its state alone.
+CREATE TABLE checkpoint_retentions (
+    -- Owner/run/repo are PLAIN columns, NOT ON DELETE CASCADE FKs (the rationale
+    -- recovery_custody_holds records in 00223): a run, repo or owner delete must not
+    -- silently drop the record of a ref that may still exist on the forge.
+    run_id uuid PRIMARY KEY,
+    user_id uuid NOT NULL,
+    repo_id uuid NOT NULL,
+    -- The run's checkpoint branch (agent/issue-<iid> or uzi/self-improve/<run id>),
+    -- derived server-side from the run row, never from a worker string.
+    branch text NOT NULL,
+    -- The tip the run last published (runs.checkpoint_tip at the terminal transition).
+    -- Every forge write against the ref is compare-and-swap on this value.
+    tip text NOT NULL,
+    -- The ref that currently carries the tip: refs/uzi-checkpoints/<branch> at first,
+    -- the recovery ref once supersession (M3) has moved it.
+    ref text NOT NULL,
+    -- refs/uzi-recovery/<run id> once supersession (M3) has begun; NULL before.
+    recovery_ref text,
+    -- Lifecycle:
+    --   retained     the run has an open custody hold; the ref is kept on origin.
+    --   superseding  a new run on the branch needs the slot; the recovery ref is being
+    --                created and the branch ref deleted (M3). Intent persisted BEFORE any
+    --                forge write, so a crash leaves the tip discoverable.
+    --   superseded   the tip lives under recovery_ref (now also in ref); the branch slot
+    --                is free. Still owed a delete once the run's last hold settles (M4).
+    --   settling     no hold is open; the ref named in `ref` is owed a CAS delete at `tip`.
+    --   deleted      the delete succeeded (or the ref was already gone / had moved).
+    --   abandoned    the run's repo/forge context is gone, so the delete can never be
+    --                brokered; kept as an audit row.
+    state text NOT NULL CHECK (state IN ('retained', 'superseding', 'superseded', 'settling', 'deleted', 'abandoned')),
+    -- Forge-write retry bookkeeping: attempts counts failed forge writes, next_attempt_at
+    -- is the earliest time a retry may run (backoff computed by the caller), last_error
+    -- the scrubbed last failure.
+    attempts int NOT NULL DEFAULT 0,
+    next_attempt_at timestamptz NOT NULL DEFAULT now(),
+    last_error text,
+    -- Set on a delete of a recovery ref: when the reconciler should re-verify the ref is
+    -- gone, and when it did (M4).
+    verify_after timestamptz,
+    verified_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    settled_at timestamptz
+);
+
+-- The branch-slot lookup (M3 supersession): the active record(s) holding a branch.
+CREATE INDEX idx_checkpoint_retentions_branch_active
+    ON checkpoint_retentions (repo_id, branch)
+    WHERE state IN ('retained', 'superseding', 'settling');
+
+-- The reconciliation sweeper's candidate scan (M4).
+CREATE INDEX idx_checkpoint_retentions_work
+    ON checkpoint_retentions (state, next_attempt_at)
+    WHERE state IN ('superseding', 'settling', 'retained', 'superseded');
+
+-- Singleton: when retention was enabled. Bounds the sweeper's later backfill (M4) of
+-- terminal runs that have no row (the best-effort insert failed) to runs that ended after
+-- this instant, so it never reaches back to runs the old delete-on-terminal path handled.
+CREATE TABLE checkpoint_retention_meta (
+    id boolean PRIMARY KEY DEFAULT true CHECK (id),
+    enabled_at timestamptz NOT NULL
+);
+INSERT INTO checkpoint_retention_meta (id, enabled_at) VALUES (true, now());
+
+-- +goose Down
+DROP TABLE checkpoint_retention_meta;
+DROP TABLE checkpoint_retentions;

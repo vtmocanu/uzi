@@ -467,12 +467,13 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 					slog.Warn("settle scope input disposition (server-side cancel/reject)", "run", runID, "error", setErr)
 				}
 			}
-			// PRD #1030 M4: a server-side cancel/reject commits the run terminal OUTSIDE
-			// SetState (no live worker to route the cleanup through the state report), so
-			// delete the now-stale checkpoint ref here too. Best-effort and dispatched off
-			// this goroutine after the terminal write committed — never delays or fails the
-			// operator's cancel. Kind-gated to checkpoint-eligible issue runs in the helper.
-			s.deleteCheckpointBestEffort(runID, run.Kind, run.IssueIid)
+			// PRD #1030 M4 / PRD #1810 M1: a server-side cancel/reject commits the run
+			// terminal OUTSIDE SetState (no live worker to route the cleanup through the state
+			// report), so settle the checkpoint ref here too: retained while a custody hold of
+			// the run is open, else deleted CAS on its tip. Runs after the terminal write
+			// committed; the forge call is dispatched off this goroutine and never delays or
+			// fails the operator's cancel. Kind-gated to checkpoint-eligible runs in the helper.
+			s.retainOrDeleteCheckpoint(ctx, runID, run.Kind, run.IssueIid)
 			return SubmitInputResult{ServerSide: true}, nil
 		}
 		// Live poller: the worker will consume this verdict. Enqueue it AND stamp the
@@ -700,9 +701,10 @@ func (s *Service) cancelPendingOutcomeRun(ctx context.Context, userID uuid.UUID,
 			slog.Warn("settle scope input disposition (pending-outcome discard cancel)", "run", runID, "error", setErr)
 		}
 	}
-	// PRD #1030 M4: a server-side cancel commits the run terminal OUTSIDE SetState, so delete the
-	// now-stale checkpoint ref here too (best-effort, kind-gated in the helper).
-	s.deleteCheckpointBestEffort(runID, run.Kind, run.IssueIid)
+	// PRD #1030 M4 / PRD #1810 M1: a server-side cancel commits the run terminal OUTSIDE SetState,
+	// so settle the checkpoint ref here too: retained while a custody hold is open, else deleted
+	// CAS on its tip (kind-gated in the helper).
+	s.retainOrDeleteCheckpoint(ctx, runID, run.Kind, run.IssueIid)
 	return SubmitInputResult{ServerSide: true}, nil
 }
 

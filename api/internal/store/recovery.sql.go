@@ -1459,10 +1459,10 @@ type ReleasePredecessorCustodyHoldByLiveAncestryParams struct {
 //     live issue run has none yet) and, for a checkpoint target, the SAME kind and issue iid
 //     the checkpoint branch was derived from;
 //   - the successor generation's OWN hold exists, is still open, and was taken by the same
-//     worker: the durability backstop settle_live.go relies on (a checkpoint ref is deleted on
-//     terminal transitions, so the predecessor's work stays in custody only through that hold;
-//     claim-time hold creation is conditional on recovery capability, so a live claim alone
-//     does not prove it exists);
+//     worker: the durability backstop settle_live.go relies on (a live checkpoint ref can
+//     still be advanced or, once the run ends with no open hold, deleted (PRD #1810), so the
+//     predecessor's work stays in custody only through that hold; claim-time hold creation is
+//     conditional on recovery capability, so a live claim alone does not prove it exists);
 //   - the same server-held capture binding as ReleasePredecessorCustodyHoldByAncestry.
 //
 // Stamps release_evidence='live_ancestry' with 00251's six audit columns plus release_target
