@@ -26,6 +26,8 @@ func TestWorkerHeartbeatCarriesDiskPressureThreshold(t *testing.T) {
 		{name: "default 0.90 flows through", threshold: 0.90, want: ptrFloat(0.90)},
 		{name: "non-default 0.75 flows through", threshold: 0.75, want: ptrFloat(0.75)},
 		{name: "unset threshold is omitted", threshold: 0, want: nil},
+		{name: "out-of-range threshold above 1 is omitted", threshold: 1.5, want: nil},
+		{name: "exactly 1 flows through", threshold: 1, want: ptrFloat(1)},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

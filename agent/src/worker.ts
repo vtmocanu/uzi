@@ -71,9 +71,9 @@ export class Worker {
     // UZI_DIND_PRUNE_ENABLED=true (createDindPrune). Its gate pauses BOTH claim loops while
     // a prune holds it; the heartbeat feeds it the custody flag; run() starts its loop.
     private readonly dindPrune?: DindPruneController,
-    // PRD #1809 D5/D7: the disk-pressure controller, present when UZI_DISK_RECLAIM is on. The
-    // heartbeat feeds it each data-volume sample, the run lane asks it before every claim,
-    // and run() starts its periodic reclaim loop.
+    // PRD #1809 D5/D7: the disk-pressure controller, present when UZI_DISK_RECLAIM or
+    // UZI_DISK_ADMISSION is on. The heartbeat feeds it each data-volume sample, the run lane
+    // asks it before every claim, and run() starts its periodic reclaim loop.
     private readonly diskPressure?: DiskPressureController,
   ) {}
 
@@ -644,7 +644,8 @@ export class Worker {
       loggedAtCapacity = false;
       // PRD #1809 D5: while the data volume is at or over the soft threshold, take no new
       // claim (the controller logs the transition and has already requested a reclaim). An
-      // unknown sample never blocks. Same sleep-and-continue shape as the gates above.
+      // unknown sample never blocks, and the stop is bounded (DiskPressureController).
+      // Same sleep-and-continue shape as the gates above.
       if (this.diskPressure?.claimsBlocked()) {
         await sleep(this.config.pollIntervalMs, signal);
         continue;

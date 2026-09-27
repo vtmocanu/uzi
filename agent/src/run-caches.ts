@@ -25,8 +25,13 @@ const DROP_DEADLINE_MS = 5 * 60_000;
  * a failed measurement drops only the numbers. Every step runs against one deadline
  * (`deadlineMs` from now, {@link DROP_DEADLINE_MS} by default); a subtree the deadline
  * leaves no time for is skipped with a warning, and the second measurement is skipped too.
+ *
+ * Resolves what happened to each subtree, so a caller can tell a drop that freed something
+ * from a no-op. `message` names the log line (the park's by default; the disk reclaim logs
+ * its own), and `quietNoop` suppresses that line when every subtree was already absent.
  */
-export async function dropRunCaches(home: string, log: Logger, deadlineMs: number = DROP_DEADLINE_MS): Promise<void> {
+export async function dropRunCaches(home: string, log: Logger, opts: DropRunCachesOptions = {}): Promise<RunCacheDropResult> {
+  const deadlineMs = opts.deadlineMs ?? DROP_DEADLINE_MS;
   const deadline = Date.now() + deadlineMs;
   const before = await measureQuietly(home, deadline);
   const dropped: string[] = [];
@@ -56,7 +61,9 @@ export async function dropRunCaches(home: string, log: Logger, deadlineMs: numbe
   // Nothing to measure again when nothing was measured, nothing was there, or no time is left.
   const after =
     before && before.cacheBytes > 0 ? (Date.now() < deadline ? await measureQuietly(home, deadline) : undefined) : before;
-  log.info("run caches dropped on park", {
+  const result: RunCacheDropResult = { dropped, absent, failed, skipped };
+  if (opts.quietNoop && isNoop(result)) return result;
+  log.info(opts.message ?? "run caches dropped on park", {
     run_home: home,
     dropped,
     ...(absent.length > 0 ? { absent } : {}),
@@ -70,6 +77,30 @@ export async function dropRunCaches(home: string, log: Logger, deadlineMs: numbe
         }
       : {}),
   });
+  return result;
+}
+
+/** What {@link dropRunCaches} did with each {@link RUN_CACHE_SUBTREES} entry. */
+export interface RunCacheDropResult {
+  dropped: string[];
+  absent: string[];
+  failed: string[];
+  /** Not attempted: the deadline had passed. */
+  skipped: string[];
+}
+
+export interface DropRunCachesOptions {
+  /** The whole drop's wall-time ceiling from now (default {@link DROP_DEADLINE_MS}). */
+  deadlineMs?: number;
+  /** The summary log line's message (default "run caches dropped on park"). */
+  message?: string;
+  /** Log nothing when every subtree was already absent. */
+  quietNoop?: boolean;
+}
+
+/** Every subtree was already absent: the drop found nothing to do. */
+export function isNoop(r: RunCacheDropResult): boolean {
+  return r.dropped.length === 0 && r.failed.length === 0 && r.skipped.length === 0;
 }
 
 async function measureQuietly(home: string, deadline: number): Promise<RunCacheBytes | undefined> {

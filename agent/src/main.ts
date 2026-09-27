@@ -20,7 +20,7 @@ import { stubJudgeQueryFn } from "./judge-runner-stub.js";
 import { Worker } from "./worker.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
 import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js";
-import { DiskPressureController, runDiskReclaimPass } from "./disk-reclaim.js";
+import { DiskPressureController, modelPassMinAgeMs, runDiskReclaimPass } from "./disk-reclaim.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import { errMessage } from "./util.js";
 import { uidSplitActive } from "./runner-uid.js";
@@ -551,6 +551,8 @@ async function main(): Promise<void> {
   // token and zero spend.
   const judgeRunner = new JudgeRunner(client, log, {
     homeRoot: sdkHomeRoot,
+    // The configured cap, so the disk reclaim's model-pass age bound is derived from it.
+    modelTimeoutMs: config.judgeModelTimeoutMs,
     // PRD #1390 M2a: a judge attempt holds a run slot, so it is listed in the snapshot.
     activeRuns,
     // PRD #1391 Run B M3b (D6): journal the judge's terminal STATE write-ahead (never the verdict).
@@ -569,6 +571,7 @@ async function main(): Promise<void> {
   // review), mirroring the judge lane so the e2e can drive it with a dummy token.
   const reviewRunner = new ReviewRunner(client, git, log, {
     homeRoot: sdkHomeRoot,
+    modelTimeoutMs: config.reviewModelTimeoutMs,
     // PRD #1390 M2a: a review attempt holds a run slot, so it is listed in the snapshot.
     activeRuns,
     // PRD #1391 Run B M3b (D6): journal the review's terminal STATE write-ahead (never the review POST).
@@ -606,25 +609,43 @@ async function main(): Promise<void> {
       throw err;
     }
   };
-  // PRD #1809 D5/D7: the running disk reclaim and the admission stop, both off with
-  // UZI_DISK_RECLAIM=0. The startup sweep below is separate and stays.
-  const diskPressure = config.diskReclaimEnabled
-    ? new DiskPressureController({
-        softMargin: config.diskSoftMargin,
-        thresholdOf: () => client.diskPressureThreshold,
-        intervalMs: config.diskReclaimIntervalMs,
-        log,
-        reclaim: () =>
-          runDiskReclaimPass({
-            homeRoot: sdkHomeRoot,
-            provisionRoot: path.join(config.dataDir, "provision"),
-            statusOf: runStatusOf,
-            isRunLive: (runId) => runner.isExecuting(runId),
-            locks: diskLocks,
-            log,
-          }),
-      })
-    : undefined;
+  // PRD #1809 D5/D7: the running disk reclaim (off with UZI_DISK_RECLAIM=0) and the admission
+  // stop (off with UZI_DISK_ADMISSION=0), independently. The startup sweep below is separate
+  // and stays.
+  const cachesDropped = new Set<string>();
+  // A stranded model-pass HOME is collected only once it is older than the longest pass
+  // can live (disk-reclaim.ts modelPassMinAgeMs), derived from the configured caps.
+  const passMinAgeMs = modelPassMinAgeMs([
+    config.judgeModelTimeoutMs,
+    config.reviewModelTimeoutMs,
+    config.summaryModelTimeoutMs,
+  ]);
+  const diskPressure =
+    config.diskReclaimEnabled || config.diskAdmissionEnabled
+      ? new DiskPressureController({
+          softMargin: config.diskSoftMargin,
+          thresholdOf: () => client.diskPressureThreshold,
+          intervalMs: config.diskReclaimIntervalMs,
+          admission: config.diskAdmissionEnabled,
+          admissionMaxWaitMs: config.diskAdmissionMaxWaitMs,
+          log,
+          ...(config.diskReclaimEnabled
+            ? {
+                reclaim: () =>
+                  runDiskReclaimPass({
+                    homeRoot: sdkHomeRoot,
+                    provisionRoot: path.join(config.dataDir, "provision"),
+                    statusOf: runStatusOf,
+                    isRunLive: (runId) => runner.isExecuting(runId),
+                    locks: diskLocks,
+                    log,
+                    cachesDropped,
+                    modelPassMinAgeMs: passMinAgeMs,
+                  }),
+              }
+            : {}),
+        })
+      : undefined;
   worker = new Worker(
     config,
     client,

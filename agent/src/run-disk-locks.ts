@@ -5,9 +5,9 @@
  *
  * An in-process keyed async mutex: one FIFO queue per run id, nothing shared between run
  * ids, and an idle key holds no memory. It is process memory on purpose: the runner and the
- * reclaim that delete and recreate a run's HOME are both in this worker process, and a
- * different worker process never uses this worker's data volume for the same run at the
- * same time (the api's claim fences that).
+ * reclaim that delete and recreate a run's HOME are both in this worker process, and no
+ * other worker process shares this data volume: it is one worker process per data dir
+ * (disk-reclaim.ts's model-pass age bound relies on the same).
  *
  * The lock alone does not make a deletion safe; it closes the check-then-delete window. The
  * reclaim takes the lock, re-checks under it that the runner is not executing the run, and

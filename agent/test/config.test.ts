@@ -192,6 +192,32 @@ describe("loadConfig disk reclaim knobs (PRD #1809 D5/D7)", () => {
     }
   });
 
+  it("UZI_DISK_ADMISSION is default-on and independent of UZI_DISK_RECLAIM", () => {
+    const d = loadConfig(baseEnv());
+    assert.strictEqual(d.diskAdmissionEnabled, true);
+    assert.strictEqual(d.diskAdmissionMaxWaitMs, 15 * 60_000, "the bounded wait defaults to 15m");
+    assert.strictEqual(loadConfig(baseEnv({ UZI_DISK_ADMISSION: "" })).diskAdmissionEnabled, true);
+    for (const v of ["0", "false", "no", "off"]) {
+      const c = loadConfig(baseEnv({ UZI_DISK_ADMISSION: v }));
+      assert.strictEqual(c.diskAdmissionEnabled, false, `value ${v}`);
+      assert.strictEqual(c.diskReclaimEnabled, true, `value ${v}: the reclaim stays on`);
+    }
+    const off = loadConfig(baseEnv({ UZI_DISK_RECLAIM: "0" }));
+    assert.strictEqual(off.diskAdmissionEnabled, true, "UZI_DISK_RECLAIM=0 leaves the admission stop on");
+    assert.strictEqual(loadConfig(baseEnv({ UZI_DISK_ADMISSION_MAX_WAIT: "30m" })).diskAdmissionMaxWaitMs, 30 * 60_000);
+  });
+
+  it("carries the model-pass timeouts: judge and review 5m, summary from SUMMARY_MODEL_TIMEOUT_MS", () => {
+    const d = loadConfig(baseEnv());
+    assert.strictEqual(d.judgeModelTimeoutMs, 5 * 60_000);
+    assert.strictEqual(d.reviewModelTimeoutMs, 5 * 60_000);
+    assert.strictEqual(d.summaryModelTimeoutMs, 60_000);
+    assert.strictEqual(loadConfig(baseEnv({ SUMMARY_MODEL_TIMEOUT_MS: "7200000.9" })).summaryModelTimeoutMs, 7_200_000);
+    for (const v of ["abc", "0", "-5"]) {
+      assert.strictEqual(loadConfig(baseEnv({ SUMMARY_MODEL_TIMEOUT_MS: v })).summaryModelTimeoutMs, 60_000, `value ${v}`);
+    }
+  });
+
   it("parses the interval as a duration and the margins as fractions in [0, 1)", () => {
     const c = loadConfig(baseEnv({ UZI_DISK_RECLAIM_INTERVAL: "90s", UZI_DISK_SOFT_MARGIN: "0.2", UZI_DISK_HARD_MARGIN: "0" }));
     assert.strictEqual(c.diskReclaimIntervalMs, 90_000);

@@ -8,9 +8,12 @@ import { randomUUID } from "node:crypto";
 import {
   DEFAULT_DISK_PRESSURE_THRESHOLD,
   DiskPressureController,
+  modelPassMinAgeMs,
   runDiskReclaimPass,
   type DiskReclaimDeps,
 } from "../src/disk-reclaim.js";
+import { dropRunCaches, type DropRunCachesOptions } from "../src/run-caches.js";
+import { noProcFd, RACED_FILES, seedRacedTree, startSwapRacer } from "./swap-racer.js";
 import { RunDiskLocks } from "../src/run-disk-locks.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import { runReadOnlyModelPass } from "../src/model-pass.js";
@@ -22,7 +25,7 @@ import { makeClaim, nullLogger, recordingLogger } from "./helpers.js";
 
 // PRD #1809 M3 (D5, D7): the running disk reclaim, its per-run lock and the soft-threshold
 // controller. The reclaim tests drive the real pass against a real data-dir fixture (the real
-// rmHomeTree and dropRunCaches, a read-only `0555` Go module cache in every HOME), with the
+// rmTreePinned and dropRunCaches, a read-only `0555` Go module cache in every HOME), with the
 // api status lookup and the runner's live-run check injected.
 
 const SKIP_ROOT = process.getuid?.() === 0 ? "running as uid 0 — the 0555 part of the fixture is inert for root" : false;
@@ -221,6 +224,105 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     assert.equal(down.unexamined, 2);
   });
 
+  it("remembers a parked run whose caches are gone and skips it until it is seen executing again", { skip: SKIP_ROOT }, async () => {
+    const d = dataDir();
+    const run = seedRun(d);
+    const memo = new Set<string>();
+    let live = false;
+    let status = "limit_wait";
+    const calls: Array<{ home: string; opts: DropRunCachesOptions }> = [];
+    const { logger, lines } = recordingLogger();
+    const base = deps(d, {
+      cachesDropped: memo,
+      isRunLive: () => live,
+      statusOf: async () => status,
+      log: logger,
+      dropCaches: async (home, log, opts) => {
+        calls.push({ home, opts });
+        return dropRunCaches(home, log, opts);
+      },
+    });
+
+    const first = await runDiskReclaimPass(base);
+    assert.equal(first.cachesDropped, 1);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.opts.message, "disk reclaim dropped a parked run's caches", "the reclaim's own log line");
+    assert.ok((calls[0]?.opts.deadlineMs ?? Infinity) <= 60_000, "the reclaim-side drop is capped at 60 s");
+    assert.ok(lines.some((l) => (l as { msg: string }).msg === "disk reclaim dropped a parked run's caches"));
+    assert.ok(!lines.some((l) => (l as { msg: string }).msg === "run caches dropped on park"), "not the park's line");
+    assert.ok(memo.has(run.id));
+
+    const second = await runDiskReclaimPass(base);
+    assert.equal(calls.length, 1, "a remembered run is not dropped again");
+    assert.equal(second.cachesDropped, 0, "a skipped run is not counted as a drop");
+    assert.equal(second.cachesAlreadyClear, 1);
+
+    live = true; // resumed here: seen executing
+    await runDiskReclaimPass(base);
+    assert.equal(memo.has(run.id), false, "seeing the run executing forgets the drop");
+    live = false;
+    seedHome(run.home); // the resumed run refilled its caches, then parked again
+    const third = await runDiskReclaimPass(base);
+    assert.equal(calls.length, 2, "dropped again after the run executed");
+    assert.equal(third.cachesDropped, 1);
+    for (const rel of CACHES) assert.equal(exists(path.join(run.home, rel)), false, `${rel} dropped again`);
+
+    status = "running"; // resumed elsewhere
+    await runDiskReclaimPass(base);
+    assert.equal(memo.has(run.id), false, "a non-park status forgets the drop too");
+  });
+
+  it("a drop that found nothing is not counted as a drop and logs nothing of its own", { skip: SKIP_ROOT }, async () => {
+    const d = dataDir();
+    const id = randomUUID();
+    fs.mkdirSync(path.join(d.home, id, ".claude"), { recursive: true });
+    const { logger, lines } = recordingLogger();
+    const s = await runDiskReclaimPass(deps(d, { statusOf: async () => "paused", log: logger }));
+    assert.equal(s.cachesDropped, 0);
+    assert.equal(s.cachesAlreadyClear, 1);
+    const msgs = lines.map((l) => (l as { msg: string }).msg);
+    assert.ok(!msgs.some((m) => /caches/.test(m)), `no drop line for a no-op: ${JSON.stringify(msgs)}`);
+  });
+
+  it("a failed drop is counted as failed and not remembered", { skip: SKIP_ROOT }, async () => {
+    const d = dataDir();
+    const run = seedRun(d);
+    const memo = new Set<string>();
+    const s = await runDiskReclaimPass(
+      deps(d, {
+        cachesDropped: memo,
+        statusOf: async () => "paused",
+        dropCaches: async () => ({ dropped: [".npm/_cacache"], absent: [], failed: ["go/pkg/mod"], skipped: [] }),
+      }),
+    );
+    assert.equal(s.failed, 1);
+    assert.equal(memo.has(run.id), false);
+  });
+
+  /**
+   * The audit's attack against the reclaim itself: a terminal run's HOME is removed while a
+   * same-uid racer swaps intermediate dirs inside it for symlinks to a victim (swap-racer.ts).
+   * With the reclaim's removal on rmHomeTree (`fs.rm`), hundreds of victim files went.
+   */
+  it("removes a terminal HOME without following an intermediate dir swapped for a symlink mid-walk", async (t) => {
+    if (noProcFd) return t.skip("no descriptor-pinned walk on this host: it refuses here by design");
+    const d = dataDir();
+    const victim = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-disk-reclaim-victim-"));
+    roots.push(victim);
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-disk-reclaim-racer-"));
+    roots.push(scratch);
+    const id = randomUUID();
+    const home = path.join(d.home, id);
+    await seedRacedTree(home, victim);
+    const racer = await startSwapRacer(home, victim, scratch);
+    try {
+      await runDiskReclaimPass(deps(d, { statusOf: async () => "completed" }));
+    } finally {
+      await racer.stop();
+    }
+    assert.equal(fs.readdirSync(victim).length, RACED_FILES, "no victim file outside agent-home was deleted");
+  });
+
   it("logs one summary line naming what it freed and what it skipped", { skip: SKIP_ROOT }, async () => {
     const d = dataDir();
     seedRun(d);
@@ -244,6 +346,11 @@ describe("runDiskReclaimPass model-pass HOMEs (PRD #1809 D7)", () => {
     fs.utimesSync(dir, mtimeMs / 1000, mtimeMs / 1000);
     return dir;
   }
+
+  it("derives the age bound from the longest configured model-pass timeout plus a margin", () => {
+    assert.equal(modelPassMinAgeMs([5 * 60_000, 5 * 60_000, 60_000]), 20 * 60_000);
+    assert.equal(modelPassMinAgeMs([5 * 60_000, 5 * 60_000, 2 * 60 * 60_000]), 2 * 60 * 60_000 + 15 * 60_000);
+  });
 
   it("removes a stranded pass HOME older than the bound and keeps a recent one", async () => {
     const d = dataDir();
@@ -337,6 +444,7 @@ describe("RunDiskLocks × RunRunner (PRD #1809 D7)", () => {
         dropEntered();
         await dropGate;
         events.push("drop:end");
+        return { dropped: [...CACHES], absent: [], failed: [], skipped: [] };
       },
     });
     await dropping;
@@ -375,13 +483,24 @@ describe("RunDiskLocks × RunRunner (PRD #1809 D7)", () => {
 });
 
 describe("DiskPressureController (PRD #1809 D5)", () => {
-  function controller(over: { threshold?: () => number | undefined; reclaim?: () => Promise<unknown>; now?: () => number } = {}) {
+  function controller(
+    over: {
+      threshold?: () => number | undefined;
+      reclaim?: () => Promise<unknown>;
+      now?: () => number;
+      admissionMaxWaitMs?: number;
+      pressureSpacingMs?: number;
+    } = {},
+  ) {
     const { logger, lines } = recordingLogger();
     let passes = 0;
     const c = new DiskPressureController({
       softMargin: 0.1,
       thresholdOf: over.threshold ?? (() => undefined),
       intervalMs: 60_000,
+      admission: true,
+      admissionMaxWaitMs: over.admissionMaxWaitMs ?? 15 * 60_000,
+      pressureSpacingMs: over.pressureSpacingMs,
       log: logger,
       now: over.now,
       reclaim:
@@ -416,6 +535,118 @@ describe("DiskPressureController (PRD #1809 D5)", () => {
     assert.equal(passes(), 1, "a pressure pass ran once (the second over-tick fell inside the spacing)");
   });
 
+  it("never puts the soft threshold at or below zero: a threshold under the margin is used as is", () => {
+    const { c } = controller({ threshold: () => 0.05 });
+    assert.equal(c.softThreshold(), 0.05, "0.05 - 0.10 would block at 0%; the threshold itself is used");
+    c.observe(0.02);
+    assert.equal(c.claimsBlocked(), false, "2% used is under a 5% threshold");
+    c.observe(0.06);
+    assert.equal(c.claimsBlocked(), true);
+    const exact = controller({ threshold: () => 0.1 });
+    assert.equal(exact.c.softThreshold(), 0.1, "a margin equal to the threshold also falls back");
+  });
+
+  it("bounds the stop: reopens once a reclaim ran and the wait passed, and closes again on the next crossing", async () => {
+    let now = 1_000;
+    let finish!: () => void;
+    let passes = 0;
+    const { c, lines } = controller({
+      now: () => now,
+      admissionMaxWaitMs: 15 * 60_000,
+      pressureSpacingMs: 0,
+      reclaim: () => {
+        passes++;
+        return new Promise<void>((r) => (finish = r));
+      },
+    });
+    c.observe(0.85);
+    assert.equal(c.claimsBlocked(), true);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(passes, 1, "the crossing requested a pass");
+    now += 20 * 60_000;
+    c.observe(0.85);
+    assert.equal(c.claimsBlocked(), true, "past the wait but the pass has not finished: still blocked");
+    finish();
+    await new Promise((r) => setImmediate(r));
+    c.observe(0.85);
+    assert.equal(c.claimsBlocked(), false, "a reclaim ran and the wait passed: claims reopen");
+    assert.ok(lines.some((l) => /after a reclaim and the admission wait/.test((l as { msg: string }).msg)), "with a warning");
+    now += 60 * 60_000;
+    c.observe(0.95);
+    assert.equal(c.claimsBlocked(), false, "stays open while the volume stays over");
+    await new Promise((r) => setImmediate(r));
+    finish();
+    await new Promise((r) => setImmediate(r));
+
+    c.observe(0.5); // under
+    now += 1_000;
+    c.observe(0.85); // a fresh crossing
+    assert.equal(c.claimsBlocked(), true, "the next crossing closes it again");
+    await new Promise((r) => setImmediate(r));
+    now += 20 * 60_000;
+    c.observe(0.85);
+    assert.equal(c.claimsBlocked(), true, "its pass has not finished yet");
+    finish();
+  });
+
+  it("a pass that started before the crossing does not count toward the bounded wait", async () => {
+    let now = 1_000;
+    let finish!: () => void;
+    const { c } = controller({
+      now: () => now,
+      admissionMaxWaitMs: 1_000,
+      reclaim: () => new Promise<void>((r) => (finish = r)),
+    });
+    const periodic = c.requestReclaim("periodic");
+    await new Promise((r) => setImmediate(r));
+    now += 10;
+    c.observe(0.85); // crosses while the periodic pass is in flight (the pressure request joins it)
+    finish();
+    await periodic;
+    now += 5_000;
+    c.observe(0.85);
+    assert.equal(c.claimsBlocked(), true, "only a pass started after the crossing proves a reclaim ran");
+  });
+
+  it("UZI_DISK_ADMISSION off: never blocks, and the reclaim still runs over the soft threshold", async () => {
+    const { logger } = recordingLogger();
+    let passes = 0;
+    const c = new DiskPressureController({
+      softMargin: 0.1,
+      thresholdOf: () => undefined,
+      intervalMs: 60_000,
+      admission: false,
+      admissionMaxWaitMs: 15 * 60_000,
+      log: logger,
+      reclaim: async () => {
+        passes++;
+      },
+    });
+    c.observe(0.99);
+    assert.equal(c.claimsBlocked(), false);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(passes, 1);
+  });
+
+  it("UZI_DISK_RECLAIM off: no pass ever runs, and the admission stop is still bounded", () => {
+    let now = 0;
+    const c = new DiskPressureController({
+      softMargin: 0.1,
+      thresholdOf: () => undefined,
+      intervalMs: 60_000,
+      admission: true,
+      admissionMaxWaitMs: 1_000,
+      log: nullLogger(),
+      now: () => now,
+    });
+    assert.equal(c.requestReclaim("periodic"), undefined);
+    c.observe(0.85);
+    assert.equal(c.claimsBlocked(), true);
+    now += 1_000;
+    c.observe(0.85);
+    assert.equal(c.claimsBlocked(), false, "with nothing to reclaim, only the wait applies");
+  });
+
   it("fails open: an unknown sample never blocks claims", () => {
     const { c } = controller();
     c.observe(0.99);
@@ -437,6 +668,7 @@ describe("DiskPressureController (PRD #1809 D5)", () => {
     });
     const first = c.requestReclaim("pressure");
     assert.equal(c.requestReclaim("periodic"), first, "a periodic request joins the pass in flight");
+    await new Promise((r) => setImmediate(r)); // the pass starts on a later microtask
     finish();
     await first;
     now = 30_000;
@@ -444,8 +676,27 @@ describe("DiskPressureController (PRD #1809 D5)", () => {
     now = 61_000;
     const third = c.requestReclaim("pressure");
     assert.ok(third);
+    await new Promise((r) => setImmediate(r));
     finish();
     await third;
+    assert.equal(calls, 2);
+  });
+
+  it("a reclaim that throws synchronously never wedges the controller", async () => {
+    let calls = 0;
+    const { c, lines } = controller({
+      reclaim: () => {
+        calls++;
+        throw new Error("sync boom");
+      },
+    });
+    const first = c.requestReclaim("periodic");
+    assert.ok(first, "a pass was started");
+    await first;
+    assert.ok(lines.some((l) => (l as { msg: string }).msg === "disk reclaim pass failed"));
+    const second = c.requestReclaim("periodic");
+    assert.ok(second && second !== first, "the next request starts a new pass: inFlight was cleared");
+    await second;
     assert.equal(calls, 2);
   });
 

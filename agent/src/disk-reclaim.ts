@@ -1,8 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
-import { rmHomeTree } from "./rmtree.js";
-import { dropRunCaches } from "./run-caches.js";
+import { rmTreePinned } from "./rmtree.js";
+import { dropRunCaches, isNoop, type DropRunCachesOptions, type RunCacheDropResult } from "./run-caches.js";
 import { isLiveModelPassHome } from "./model-pass.js";
 import { DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES, TERMINAL_RUN_STATUSES, type RunStatusLookup } from "./home-reclaim.js";
 import type { RunDiskLocks } from "./run-disk-locks.js";
@@ -22,7 +22,12 @@ import { errMessage, RUN_ID_RE, sleep } from "./util.js";
  *      (`awaiting_approval`, `awaiting_input`, `awaiting_followup`) keeps a live executor
  *      and is never eligible; nor is `queued`, `claimed` or `running`;
  *  (c) a model-pass HOME (`uzi-judge-*`, `uzi-review-*`, `uzi-summary-*`) whose pass is
- *      proven over; see {@link DEFAULT_MODEL_PASS_MIN_AGE_MS} for the proof.
+ *      proven over; see {@link modelPassMinAgeMs} for the proof.
+ *
+ * **Every deletion is a pinned-descriptor walk** ({@link rmTreePinned}, and `dropRunCaches`'
+ * own pinned subtree walk), never a path-based `fs.rm`: this pass runs while other runs'
+ * agent processes are live on the same volume as the same uids, and a path-based walk can
+ * be redirected outside the tree by an intermediate directory swapped for a symlink.
  *
  * **Never a live run.** A run this worker is executing is skipped before its status is even
  * asked for, and the check is repeated under the run's {@link RunDiskLocks} lock right
@@ -46,26 +51,46 @@ const PROCESS_ENDED_PARK_STATUSES: ReadonlySet<string> = new Set(["limit_wait", 
 const MODEL_PASS_HOME_RE = /^uzi-(?:judge|review|summary)-/;
 
 /**
+ * The margin {@link modelPassMinAgeMs} adds to the longest model-pass timeout: the abort
+ * grace (500 ms) and the pass's own HOME cleanup (`rmHomeTree`: up to three 120 s helper
+ * passes plus two worker passes), with room to spare.
+ */
+const MODEL_PASS_AGE_MARGIN_MS = 15 * 60_000;
+
+/**
  * How old (by mtime) a model-pass HOME that no pass in THIS process owns must be before the
- * reclaim removes it. The proof that its owner is stopped:
+ * reclaim removes it: the longest configured model-pass wall-clock cap (judge, review,
+ * summary; `timeoutsMs`) plus {@link MODEL_PASS_AGE_MARGIN_MS}. main.ts derives it from the
+ * configured timeouts, so raising one (e.g. SUMMARY_MODEL_TIMEOUT_MS) raises this with it.
+ *
+ * The proof that the owner of an old unregistered HOME is stopped:
  *
  *  - A pass in this process registers its HOME right after `mkdtemp` and unregisters it
  *    only after its own cleanup ran (model-pass.ts `isLiveModelPassHome`), so a HOME a live
- *    pass here owns is always registered and is never removed, whatever its age.
- *  - An unregistered HOME therefore belongs to a pass that already finished here, or to
- *    another process: a previous life of this worker, or a second worker process sharing
- *    the volume. A pass holds its HOME for at most its wall-clock cap (5 minutes for the
- *    judge and review passes, 60 s by default for the summary pass) plus the abort grace
- *    and its own cleanup, after which it never writes there again. A HOME's mtime is never
- *    earlier than its creation, so an mtime older than this bound means the pass that
- *    created it started more than an hour ago and has ended.
- *
- * The one knob that can break the bound is SUMMARY_MODEL_TIMEOUT_MS: an operator who sets it
- * above an hour must also raise this (the `modelPassMinAgeMs` option).
+ *    pass here owns is registered and never removed, whatever its age. The age bound covers
+ *    the moment between `mkdtemp` creating the dir and the registration.
+ *  - An unregistered HOME therefore belongs to a pass that already finished here, or to a
+ *    previous life of this worker. No other worker process shares this data volume: it is
+ *    one worker process per data dir (run-disk-locks.ts relies on the same). A pass holds
+ *    its HOME for at most its wall-clock cap plus the abort grace and its own cleanup,
+ *    after which it never writes there again, and a HOME's mtime is never earlier than its
+ *    creation, so an mtime older than this bound means its pass has ended.
  */
-const DEFAULT_MODEL_PASS_MIN_AGE_MS = 60 * 60_000;
+export function modelPassMinAgeMs(timeoutsMs: readonly number[]): number {
+  return Math.max(0, ...timeoutsMs) + MODEL_PASS_AGE_MARGIN_MS;
+}
 
-/** Wall-clock ceiling for one pass. Each cache drop carries its own five-minute deadline. */
+/** The bound with the built-in timeouts (judge and review 5 min, summary 60 s), for tests. */
+const DEFAULT_MODEL_PASS_MIN_AGE_MS = modelPassMinAgeMs([5 * 60_000, 5 * 60_000, 60_000]);
+
+/**
+ * The deadline of one reclaim-side cache drop. Well under the api's ClaimGrace (5 min): a
+ * resume of the run waits on its lock for the whole drop (run-disk-locks.ts), and the
+ * park's own drop keeps its five minutes.
+ */
+const RECLAIM_DROP_DEADLINE_MS = 60_000;
+
+/** Wall-clock ceiling for one pass. Each cache drop and tree removal is clipped to it. */
 const DEFAULT_PASS_DEADLINE_MS = 10 * 60_000;
 
 /** Cap on run directories examined per pass (each costs one status lookup). */
@@ -82,9 +107,16 @@ export interface DiskReclaimDeps {
   isRunLive: (runId: string) => boolean;
   locks: RunDiskLocks;
   log: Logger;
+  /**
+   * The runs whose caches a pass found all gone (dropped or absent), so later passes skip
+   * them. An entry is dropped when a pass sees the run executing here or reads a status
+   * other than a process-ended park (it was resumed), or when its HOME is gone. Owned by the
+   * caller so it outlives one pass; absent, nothing is remembered.
+   */
+  cachesDropped?: Set<string>;
   /** Seams, injected by tests. */
-  removeTree?: (dir: string) => Promise<void>;
-  dropCaches?: (home: string, log: Logger) => Promise<void>;
+  removeTree?: (parent: string, name: string, deadline: number) => Promise<unknown>;
+  dropCaches?: (home: string, log: Logger, opts: DropRunCachesOptions) => Promise<RunCacheDropResult>;
   isModelPassLive?: (dir: string) => boolean;
   now?: () => number;
   modelPassMinAgeMs?: number;
@@ -98,7 +130,10 @@ export interface DiskReclaimSummary {
   runsExamined: number;
   terminalHomesRemoved: number;
   provisionDirsRemoved: number;
+  /** A parked run whose drop freed at least one cache subtree. */
   cachesDropped: number;
+  /** A parked run whose caches were already gone (remembered from an earlier pass, or a no-op drop). */
+  cachesAlreadyClear: number;
   skippedLive: number;
   skippedStatusUnknown: number;
   /** Neither terminal nor parked with its process ended (gates, queued, running, ...). */
@@ -118,7 +153,7 @@ interface RunDirs {
   provision?: string;
 }
 
-/** Directory entries of `root` whose names pass `keep`, as absolute paths; [] when absent. */
+/** Directory entries of `root` whose names pass `keep`, name -> absolute path; empty when absent. */
 async function listDirs(root: string, keep: (name: string) => boolean, log: Logger): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   let entries;
@@ -141,8 +176,9 @@ async function listDirs(root: string, keep: (name: string) => boolean, log: Logg
  * counted and logged in the summary line.
  */
 export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskReclaimSummary> {
-  const removeTree = deps.removeTree ?? ((dir: string) => rmHomeTree(dir));
+  const removeTree = deps.removeTree ?? ((parent: string, name: string, deadline: number) => rmTreePinned(parent, name, { deadline }));
   const dropCaches = deps.dropCaches ?? dropRunCaches;
+  const memo = deps.cachesDropped;
   const isModelPassLive = deps.isModelPassLive ?? isLiveModelPassHome;
   const now = deps.now ?? Date.now;
   const modelPassMinAgeMs = deps.modelPassMinAgeMs ?? DEFAULT_MODEL_PASS_MIN_AGE_MS;
@@ -156,6 +192,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
     terminalHomesRemoved: 0,
     provisionDirsRemoved: 0,
     cachesDropped: 0,
+    cachesAlreadyClear: 0,
     skippedLive: 0,
     skippedStatusUnknown: 0,
     skippedNotEligible: 0,
@@ -173,6 +210,9 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
   const runs = new Map<string, RunDirs>();
   for (const [id, dir] of homes) runs.set(id, { home: dir });
   for (const [id, dir] of provisions) runs.set(id, { ...runs.get(id), provision: dir });
+  const passDeadline = startedAt + deadlineMs;
+  // Forget runs whose HOME is gone, so the memo stays bounded by what is on the volume.
+  if (memo) for (const id of memo) if (!homes.has(id)) memo.delete(id);
 
   let consecutiveFailures = 0;
   for (const [runId, dirs] of runs) {
@@ -186,6 +226,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
     }
     summary.runsExamined += 1;
     if (deps.isRunLive(runId)) {
+      memo?.delete(runId); // executing again: its caches may be refilled by the next park
       summary.skippedLive += 1;
       continue;
     }
@@ -209,8 +250,15 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
       continue;
     }
     const terminal = TERMINAL_RUN_STATUSES.has(status);
-    if (!terminal && !(PROCESS_ENDED_PARK_STATUSES.has(status) && dirs.home)) {
+    const parked = PROCESS_ENDED_PARK_STATUSES.has(status);
+    // Any other status means the run moved on (resumed, or ended): forget its drop.
+    if (!parked) memo?.delete(runId);
+    if (!terminal && !(parked && dirs.home)) {
       summary.skippedNotEligible += 1;
+      continue;
+    }
+    if (parked && memo?.has(runId)) {
+      summary.cachesAlreadyClear += 1;
       continue;
     }
     await deps.locks.withLock(runId, async () => {
@@ -221,19 +269,28 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
         return;
       }
       if (!terminal) {
-        // dropRunCaches never throws; it logs what it dropped and what it could not.
-        await dropCaches(dirs.home as string, log);
-        summary.cachesDropped += 1;
+        // dropRunCaches never throws; it logs what it dropped and what it could not, under
+        // its own message, and nothing for a no-op.
+        const r = await dropCaches(dirs.home as string, log, {
+          deadlineMs: Math.max(0, Math.min(RECLAIM_DROP_DEADLINE_MS, passDeadline - now())),
+          message: "disk reclaim dropped a parked run's caches",
+          quietNoop: true,
+        });
+        if (r.failed.length > 0 || r.skipped.length > 0) summary.failed += 1;
+        else memo?.add(runId);
+        if (r.dropped.length > 0) summary.cachesDropped += 1;
+        else if (isNoop(r)) summary.cachesAlreadyClear += 1;
         return;
       }
+      memo?.delete(runId);
       let failed = false;
-      for (const [dir, key] of [
-        [dirs.home, "terminalHomesRemoved"],
-        [dirs.provision, "provisionDirsRemoved"],
+      for (const [root, dir, key] of [
+        [deps.homeRoot, dirs.home, "terminalHomesRemoved"],
+        [deps.provisionRoot, dirs.provision, "provisionDirsRemoved"],
       ] as const) {
         if (!dir) continue;
         try {
-          await removeTree(dir);
+          await removeTree(root, runId, passDeadline);
           summary[key] += 1;
         } catch (err) {
           failed = true;
@@ -248,7 +305,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
   // (c) model-pass HOMEs. No lock: a pass always creates a fresh mkdtemp name, so nothing
   // ever resumes into an old one; the registry and the age bound are the whole guard.
   const passHomes = await listDirs(deps.homeRoot, (name) => MODEL_PASS_HOME_RE.test(name), log);
-  for (const dir of passHomes.values()) {
+  for (const [name, dir] of passHomes) {
     if (now() - startedAt >= deadlineMs) {
       summary.stoppedEarly ??= "deadline";
       break;
@@ -268,7 +325,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
       continue;
     }
     try {
-      await removeTree(dir);
+      await removeTree(deps.homeRoot, name, passDeadline);
       summary.modelPassHomesRemoved += 1;
     } catch (err) {
       summary.modelPassHomesFailed += 1;
@@ -281,6 +338,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
     terminal_homes_removed: summary.terminalHomesRemoved,
     provision_dirs_removed: summary.provisionDirsRemoved,
     caches_dropped: summary.cachesDropped,
+    caches_already_clear: summary.cachesAlreadyClear,
     skipped_live: summary.skippedLive,
     skipped_status_unknown: summary.skippedStatusUnknown,
     skipped_not_eligible: summary.skippedNotEligible,
@@ -307,8 +365,19 @@ export interface DiskPressureOptions {
   softMargin: number;
   /** The api's recycle threshold, or undefined when no heartbeat has carried one. */
   thresholdOf: () => number | undefined;
-  /** One reclaim pass (production: {@link runDiskReclaimPass} bound to its deps). */
-  reclaim: () => Promise<unknown>;
+  /**
+   * One reclaim pass (production: {@link runDiskReclaimPass} bound to its deps), or
+   * undefined when the reclaim is off (UZI_DISK_RECLAIM=0): then no pass ever runs.
+   */
+  reclaim?: () => Promise<unknown>;
+  /** Whether the admission stop is on (config.diskAdmissionEnabled, UZI_DISK_ADMISSION). */
+  admission: boolean;
+  /**
+   * How long the admission stop may hold once a reclaim has run since the volume crossed the
+   * soft threshold (config.diskAdmissionMaxWaitMs). Past it, claims reopen until the volume
+   * drops under the soft threshold and crosses it again.
+   */
+  admissionMaxWaitMs: number;
   /** Periodic pass cadence (config.diskReclaimIntervalMs). */
   intervalMs: number;
   log: Logger;
@@ -324,11 +393,27 @@ export interface DiskPressureOptions {
  * Admission fails OPEN: an unknown sample (a statfs failure, no sample yet) never blocks a
  * claim. The stop is an optimisation that keeps a filling volume from taking on new work;
  * the guarantee for a volume that does fill is D6's typed handling, not this.
+ *
+ * **The stop is bounded.** The run lane's claim cannot be narrowed to this worker's own
+ * parked runs (the api's run-lane claim takes no such filter), so a blocked lane refuses a
+ * resume of its own parked run too, and the api's disk recycle (#837) only fires at the
+ * full threshold. Below it, on a single-worker install, an unbounded stop could idle the
+ * worker forever with nothing reclaimable. So once a reclaim pass that started after the
+ * crossing has finished and the volume is still over the soft threshold
+ * `admissionMaxWaitMs` after the crossing, claims reopen with a warning; they close again
+ * only on the next fresh crossing (the volume first drops under the soft threshold).
  */
 export class DiskPressureController {
   private readonly now: () => number;
   private readonly pressureSpacingMs: number;
-  private blocked = false;
+  /** The latest sample is at or over the soft threshold. */
+  private over = false;
+  /** When the current stretch over the soft threshold began. */
+  private overSince = 0;
+  /** A reclaim pass that started during the current stretch has finished (or none can run). */
+  private reclaimedSinceCrossing = false;
+  /** The current stretch outlived its bounded wait: claims are open until the next crossing. */
+  private reopened = false;
   private inFlight: Promise<void> | undefined;
   private lastPressurePassAt = Number.NEGATIVE_INFINITY;
 
@@ -337,14 +422,24 @@ export class DiskPressureController {
     this.pressureSpacingMs = opts.pressureSpacingMs ?? DEFAULT_PRESSURE_SPACING_MS;
   }
 
-  /** The soft threshold: the api threshold (default 0.90) minus the soft margin. */
+  /**
+   * The soft threshold: the api threshold (default 0.90) minus the soft margin. When the
+   * margin is at least the threshold (an api threshold of 0.05 against the default 0.10
+   * margin), that would be zero or less and block every claim at any usage; the soft
+   * threshold is then the api threshold itself.
+   */
   softThreshold(): number {
-    return Math.max(0, (this.opts.thresholdOf() ?? DEFAULT_DISK_PRESSURE_THRESHOLD) - this.opts.softMargin);
+    const threshold = this.opts.thresholdOf() ?? DEFAULT_DISK_PRESSURE_THRESHOLD;
+    const soft = threshold - this.opts.softMargin;
+    return soft > 0 ? soft : threshold;
   }
 
-  /** Whether the run lane must take no new claim: the latest sample is at or over the soft threshold. */
+  /**
+   * Whether the run lane must take no new claim: the admission stop is on, the latest sample
+   * is at or over the soft threshold, and this stretch has not outlived its bounded wait.
+   */
   claimsBlocked(): boolean {
-    return this.blocked;
+    return this.opts.admission && this.over && !this.reopened;
   }
 
   /**
@@ -355,41 +450,70 @@ export class DiskPressureController {
   observe(usedFraction: number | undefined): void {
     const soft = this.softThreshold();
     const over = usedFraction !== undefined && usedFraction >= soft;
-    if (over !== this.blocked) {
-      this.blocked = over;
-      const fields = { used_fraction: usedFraction ?? null, soft_threshold: soft };
-      if (over) this.opts.log.warn("data volume at or over the soft threshold; claiming no new run until it drops", fields);
-      else this.opts.log.info("data volume back under the soft threshold; claiming resumes", fields);
+    const fields = { used_fraction: usedFraction ?? null, soft_threshold: soft };
+    if (over !== this.over) {
+      this.over = over;
+      this.reopened = false;
+      if (over) {
+        this.overSince = this.now();
+        // With the reclaim off there is nothing to wait for before the bound applies.
+        this.reclaimedSinceCrossing = this.opts.reclaim === undefined;
+      }
+      if (this.opts.admission) {
+        if (over) this.opts.log.warn("data volume at or over the soft threshold; claiming no new run until it drops", fields);
+        else this.opts.log.info("data volume back under the soft threshold; claiming resumes", fields);
+      }
     }
-    if (over) void this.requestReclaim("pressure");
+    if (!over) return;
+    void this.requestReclaim("pressure");
+    if (
+      this.opts.admission &&
+      !this.reopened &&
+      this.reclaimedSinceCrossing &&
+      this.now() - this.overSince >= this.opts.admissionMaxWaitMs
+    ) {
+      this.reopened = true;
+      this.opts.log.warn("data volume still over the soft threshold after a reclaim and the admission wait; claiming resumes", {
+        ...fields,
+        waited_ms: this.now() - this.overSince,
+      });
+    }
   }
 
   /**
-   * Start a reclaim pass unless one is running (then its promise is returned) or, for a
-   * pressure trigger, the last pressure-triggered pass started less than the spacing ago
-   * (then undefined). The returned promise never rejects.
+   * Start a reclaim pass unless one is running (then its promise is returned), the reclaim
+   * is off, or, for a pressure trigger, the last pressure-triggered pass started less than
+   * the spacing ago (then undefined). The returned promise never rejects.
    */
   requestReclaim(reason: "periodic" | "pressure"): Promise<void> | undefined {
+    const reclaim = this.opts.reclaim;
+    if (!reclaim) return undefined;
     if (this.inFlight) return this.inFlight;
     if (reason === "pressure") {
       if (this.now() - this.lastPressurePassAt < this.pressureSpacingMs) return undefined;
       this.lastPressurePassAt = this.now();
     }
-    const pass = (async () => {
-      try {
-        await this.opts.reclaim();
-      } catch (err) {
-        this.opts.log.warn("disk reclaim pass failed", { reason, error: errMessage(err) });
-      } finally {
-        this.inFlight = undefined;
-      }
-    })();
+    const startedAt = this.now();
+    // inFlight is assigned before the pass can run at all: the pass starts on a later
+    // microtask, so even a reclaim that throws synchronously settles through the catch below
+    // and clears inFlight after it was set, never before.
+    const pass: Promise<void> = Promise.resolve()
+      .then(reclaim)
+      .then(
+        () => undefined,
+        (err: unknown) => this.opts.log.warn("disk reclaim pass failed", { reason, error: errMessage(err) }),
+      )
+      .finally(() => {
+        if (this.inFlight === pass) this.inFlight = undefined;
+        if (this.over && startedAt >= this.overSince) this.reclaimedSinceCrossing = true;
+      });
     this.inFlight = pass;
     return pass;
   }
 
   /** The periodic pass, every `intervalMs` until `signal` aborts. Never throws. */
   async loop(signal: AbortSignal): Promise<void> {
+    if (!this.opts.reclaim) return;
     while (!signal.aborted) {
       await sleep(this.opts.intervalMs, signal);
       if (signal.aborted) break;

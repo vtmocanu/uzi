@@ -334,7 +334,8 @@ function readSome(dirFd, limit, skip, spend) {
 
 /**
  * PRD #1809 D3: the pinned-descriptor subtree removal, as
- * `node -e <script> <home> <rel> <maxEntries> <budgetMs> [<sync> [<phase>]]`. It pins HOME,
+ * `node -e <script> <home> <rel> <maxEntries> <budgetMs> <mode> <expect> [<sync> [<phase>]]`.
+ * It pins HOME,
  * then each component of `rel` relative to the previous one's descriptor (see
  * {@link PINNED_PRELUDE}); a symlinked or non-directory component is refused, never
  * followed. It then empties the pinned leaf through its own descriptor: each child
@@ -353,7 +354,13 @@ function readSome(dirFd, limit, skip, spend) {
  * also stops at `<budgetMs>` of wall time; hitting either exits 8 with the rest left in
  * place. Recursion holds one descriptor per level.
  *
- * Exit 0: the leaf's name is gone from its pinned parent. 2: a component was already
+ * `<mode>` `remove` (what {@link rmHomeSubtree} passes) does all of the above. `empty` (what
+ * {@link rmTreePinned} passes) stops once the leaf is emptied and never `rmdir`s it: the
+ * caller removes the leaf itself, as the uid that owns it. `<expect>` is `-` or the
+ * `<dev>:<ino>` the leaf must pin to; a leaf that pins to anything else (the name was
+ * swapped since the caller pinned it) is refused before anything is touched (exit 3).
+ *
+ * Exit 0: the leaf's name is gone from its pinned parent (`empty`: the leaf is empty). 2: a component was already
  * missing, nothing to drop. 3: a component or the leaf's final name is a symlink or
  * non-directory (refused). 4: something remained (another uid's entries, a concurrent
  * writer). 5: no `/proc/self/fd`. 6: bad arguments. 7: this uid cannot open a component.
@@ -367,10 +374,11 @@ function readSome(dirFd, limit, skip, spend) {
  * any child in it is pinned.
  */
 const PINNED_SUBTREE_SCRIPT = `${PINNED_PRELUDE}${STREAM_PRELUDE}
-const [home, rel, maxArg, budgetArg, sync, phase = "pinned"] = process.argv.slice(1);
+const [home, rel, maxArg, budgetArg, mode = "remove", expect = "-", sync, phase = "pinned"] = process.argv.slice(1);
 const maxEntries = Number(maxArg);
 const budgetMs = Number(budgetArg);
 if (!home || !home.startsWith("/") || !rel || !(maxEntries >= 0) || !(budgetMs >= 0)) process.exit(6);
+if (mode !== "remove" && mode !== "empty") process.exit(6);
 const deadline = Date.now() + budgetMs;
 let readCount = 0;
 let exhausted = false;
@@ -400,6 +408,10 @@ try {
   }
 } catch (e) {
   process.exit(verdict(e));
+}
+if (expect !== "-") {
+  const st = fs.fstatSync(leafPin, { bigint: true });
+  if (st.dev + ":" + st.ino !== expect) process.exit(3);
 }
 const leafName = parts[parts.length - 1];
 const uid = process.getuid();
@@ -433,7 +445,13 @@ function removeEntry(dirFd, e) {
   try { childFd = openOwned(pin); } catch { return false; } finally { fs.closeSync(pin); }
   try { emptyDir(childFd, false); } finally { fs.closeSync(childFd); }
   if (exhausted) return false;
-  try { fs.rmdirSync(p); return true; } catch (err) { return gone(err); }
+  try { fs.rmdirSync(p); return true; } catch (err) {
+    // Swapped for a symlink or file while it was being emptied: unlink that entry itself.
+    if (err.code === "ENOTDIR") {
+      try { fs.unlinkSync(p); return true; } catch (err2) { return gone(err2); }
+    }
+    return gone(err);
+  }
 }
 function emptyDir(dirFd, isLeaf) {
   const stuck = new Set();
@@ -450,6 +468,11 @@ function emptyDir(dirFd, isLeaf) {
   }
 }
 emptyDir(leafFd, true);
+if (mode === "empty") {
+  let left;
+  try { left = readSome(leafFd, 1, new Set(), () => true).length; } catch { left = 1; }
+  process.exit(exhausted ? 8 : left === 0 ? 0 : 4);
+}
 const pinned = fs.fstatSync(leafPin);
 fs.closeSync(leafFd);
 fs.closeSync(leafPin);
@@ -635,7 +658,12 @@ export async function rmHomeSubtree(
       break;
     }
     const budgetMs = Math.max(0, timeout - HELPER_SLACK_MS);
-    const code = await runHelper(wrap, PINNED_SUBTREE_SCRIPT, [home, rel, String(maxEntries), String(budgetMs)], timeout);
+    const code = await runHelper(
+      wrap,
+      PINNED_SUBTREE_SCRIPT,
+      [home, rel, String(maxEntries), String(budgetMs), "remove", "-"],
+      timeout,
+    );
     if (code === 0) return "removed";
     if (code === 2) return "absent";
     // A symlink is a symlink whoever looks: a refusal is final, no later pass runs.
@@ -659,6 +687,178 @@ export async function rmHomeSubtree(
   throw Object.assign(new Error(`rmHomeSubtree: ${rel} is still present under ${home} (last pass: ${last})`), {
     code: "ENOTEMPTY",
   });
+}
+
+/** `O_PATH` (Linux; absent from `fs.constants`), as in {@link PINNED_PRELUDE}. */
+const O_PATH = 0o10000000;
+const PIN_FLAGS = O_PATH | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+const SELF_FD = "/proc/self/fd/";
+
+/** One path component: no separator, not `.`/`..`, not dash-leading (it becomes a bare
+ *  `node -e` argument). Run ids and `mkdtemp` names (`uzi-judge-XXXXXX`) all fit. */
+const TREE_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
+
+/** The worker itself as a helper's uid: the command unchanged. */
+const asWorker: CommandWrapper = (command, args) => ({ command, args: [...args] });
+
+/** Test seams and the caller's deadline for {@link rmTreePinned}. */
+export interface PinnedTreeRemovalOptions {
+  /** The uids to run the emptying passes as, in order (default: see {@link rmTreePinned}). */
+  wrappers?: readonly CommandWrapper[];
+  /** Dirents one pass may read before it stops (default {@link REMOVE_MAX_ENTRIES}). */
+  maxEntries?: number;
+  /** Epoch ms after which no pass starts and a running one is cut short. */
+  deadline?: number;
+  /** Whether the PRD #51 uid split is active (default: {@link uidSplitActive}). */
+  splitActive?: boolean;
+}
+
+/** `<dev>:<ino>` of a pinned descriptor: the identity the helper checks its own pin against. */
+async function identityOf(pinFd: number): Promise<string> {
+  const st = await fs.stat(SELF_FD + pinFd, { bigint: true });
+  return `${st.dev}:${st.ino}`;
+}
+
+/**
+ * PRD #1809 M3: remove the whole directory `<parent>/<name>` (a terminal run's HOME or
+ * provision dir, a stranded model-pass HOME) without ever resolving a path inside it.
+ * Resolves "removed", or "absent" when there was nothing there; throws on a refusal, an
+ * exhausted budget or deadline, or anything left behind.
+ *
+ * {@link rmHomeTree} walks by path (`fs.rm`), so a same-uid process that swaps an
+ * INTERMEDIATE directory for a symlink mid-walk redirects the deletion outside the tree
+ * (an audit's racer deleted 82 files outside `agent-home` that way). The boot sweep and a
+ * run's own teardown keep using it; the running disk reclaim cannot, because it deletes
+ * while other runs' `runner`/`runner-cmd` processes are live on the same volume. So this
+ * is {@link PINNED_SUBTREE_SCRIPT}'s walk:
+ *
+ *  1. The worker pins `parent`, then `name` inside it through its descriptor with
+ *     `O_PATH | O_DIRECTORY | O_NOFOLLOW`, refusing a symlink, a non-directory, and a
+ *     directory the worker does not own (as `openRootToRunnerGroup` does: none of those
+ *     is a tree this worker created). Under the uid split it adds group `rwx` to the
+ *     pinned root through its descriptor, so the `runner` helpers can traverse it.
+ *  2. The helper empties the tree in `empty` mode, and refuses to start unless its own
+ *     pin of `<parent>/<name>` is the inode the worker pinned: under the split as
+ *     `runner`, `runner-cmd`, `runner`, then the worker (worker-owned leftovers), stopping
+ *     at the first pass that leaves it empty; single-uid once, as the worker.
+ *  3. The worker `rmdir`s the emptied root through its pinned parent, after checking that
+ *     the name there still pins to the same inode.
+ *
+ * Linux-only, like every pinned walk here: without `/proc/self/fd` it refuses outright.
+ */
+export async function rmTreePinned(
+  parent: string,
+  name: string,
+  opts: PinnedTreeRemovalOptions = {},
+): Promise<"removed" | "absent"> {
+  if (!path.isAbsolute(parent)) throw new Error(`rmTreePinned: refusing non-absolute parent ${parent}`);
+  if (!TREE_NAME_RE.test(name)) throw new Error(`rmTreePinned: refusing ${JSON.stringify(name)}, not one path component`);
+  if (process.platform !== "linux") throw new Error("rmTreePinned: refusing, no descriptor-pinned walk here");
+  const split = opts.splitActive ?? uidSplitActive();
+  const target = path.join(parent, name);
+  let parentPin;
+  try {
+    parentPin = await fs.open(parent, PIN_FLAGS);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return "absent";
+    throw err;
+  }
+  try {
+    const at = `${SELF_FD}${parentPin.fd}/${name}`;
+    let leafPin;
+    try {
+      leafPin = await fs.open(at, PIN_FLAGS);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") return "absent";
+      if (code === "ELOOP" || code === "ENOTDIR") {
+        throw Object.assign(new Error(`rmTreePinned: refusing ${target} (symlink or non-directory)`), { code: "ELOOP" });
+      }
+      throw err;
+    }
+    try {
+      const st = await fs.stat(SELF_FD + leafPin.fd);
+      const uid = process.getuid?.();
+      if (uid !== undefined && st.uid !== uid) {
+        throw Object.assign(new Error(`rmTreePinned: ${target} is not owned by this worker (uid ${st.uid})`), {
+          code: "EPERM",
+        });
+      }
+      // chmod follows the magic link to the pinned inode, never a path.
+      if (split) await fs.chmod(SELF_FD + leafPin.fd, (st.mode & 0o7777) | 0o770);
+      const expect = await identityOf(leafPin.fd);
+      const wrappers =
+        opts.wrappers ?? (split ? [runnerCommand, commandRootCommand, runnerCommand, asWorker] : [asWorker]);
+      const maxEntries = opts.maxEntries ?? REMOVE_MAX_ENTRIES;
+      let emptied = false;
+      let last = "no pass ran";
+      for (const wrap of wrappers) {
+        const timeout = passTimeout(opts.deadline);
+        if (timeout <= 0) {
+          last = "the deadline passed before this pass";
+          break;
+        }
+        const budgetMs = Math.max(0, timeout - HELPER_SLACK_MS);
+        const code = await runHelper(
+          wrap,
+          PINNED_SUBTREE_SCRIPT,
+          [parent, name, String(maxEntries), String(budgetMs), "empty", expect],
+          timeout,
+        );
+        if (code === 0) {
+          emptied = true;
+          break;
+        }
+        // The name no longer pins to our inode (swapped or gone): nothing more to do by name.
+        if (code === 2 || code === 3) {
+          last = code === 2 ? "the name vanished" : "the name no longer names the pinned tree";
+          break;
+        }
+        if (code === 5) throw new Error(`rmTreePinned: refusing ${target} (no descriptor-pinned walk here)`);
+        if (code === 8) {
+          last = `the pass ran out of its budget (${maxEntries} entries or ${budgetMs} ms)`;
+          break;
+        }
+        last =
+          code === 4
+            ? "entries remained"
+            : code === 7
+              ? "a component this uid cannot open"
+              : `the helper itself failed (exit ${code})`;
+      }
+      if (emptied) {
+        // Remove the root by name only while the name still pins to the emptied inode. A
+        // swap between this check and the rmdir can at worst remove an empty directory.
+        let current: string | undefined;
+        try {
+          const check = await fs.open(at, PIN_FLAGS);
+          try {
+            current = await identityOf(check.fd);
+          } finally {
+            await check.close().catch(() => undefined);
+          }
+        } catch {
+          current = undefined;
+        }
+        if (current === expect) {
+          try {
+            await fs.rmdir(at);
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          }
+          return "removed";
+        }
+        last = current === undefined ? "the name vanished" : "the name no longer names the pinned tree";
+      }
+      throw Object.assign(new Error(`rmTreePinned: ${target} was not removed (last pass: ${last})`), {
+        code: "ENOTEMPTY",
+      });
+    } finally {
+      await leafPin.close().catch(() => undefined);
+    }
+  } finally {
+    await parentPin.close().catch(() => undefined);
+  }
 }
 
 function isRunCacheSubtree(rel: string): rel is RunCacheSubtree {

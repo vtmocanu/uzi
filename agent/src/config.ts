@@ -61,12 +61,36 @@ export interface Config {
    */
   homeReclaimEnabled: boolean;
   /**
-   * PRD #1809 D5/D7: the running disk reclaim and the admission stop (UZI_DISK_RECLAIM,
-   * default on; `0`/`false`/`no`/`off` disables both). When on, the worker runs the
-   * non-destructive reclaim pass every {@link diskReclaimIntervalMs} and whenever its data
-   * volume reaches the soft threshold, and claims no new run while it stays there.
+   * PRD #1809 D7: the running disk reclaim (UZI_DISK_RECLAIM, default on;
+   * `0`/`false`/`no`/`off` disables it). When on, the worker runs the non-destructive
+   * reclaim pass every {@link diskReclaimIntervalMs} and whenever its data volume reaches
+   * the soft threshold. Independent of {@link diskAdmissionEnabled}.
    */
   diskReclaimEnabled: boolean;
+  /**
+   * PRD #1809 D5: the admission stop (UZI_DISK_ADMISSION, default on; `0`/`false`/`no`/`off`
+   * disables it): the run lane claims no new run while the data volume is at or over the
+   * soft threshold, for at most {@link diskAdmissionMaxWaitMs} after a reclaim has run.
+   * Independent of {@link diskReclaimEnabled}.
+   */
+  diskAdmissionEnabled: boolean;
+  /**
+   * PRD #1809 D5: how long the admission stop may hold once a reclaim pass has run since
+   * the volume crossed the soft threshold (UZI_DISK_ADMISSION_MAX_WAIT, default 15m). Past
+   * it claims reopen, with a warning, until the next fresh crossing: the run lane cannot
+   * restrict a claim to this worker's own parked runs, so an unbounded stop could idle a
+   * single-worker install below the api's recycle threshold forever.
+   */
+  diskAdmissionMaxWaitMs: number;
+  /**
+   * The model passes' wall-clock caps, in ms. Judge and review are the runners' fixed 5
+   * minutes (main.ts passes these to them); summary is SUMMARY_MODEL_TIMEOUT_MS, parsed
+   * exactly as summary-runner.ts parses it (default 60 s). PRD #1809 D7 derives the disk
+   * reclaim's model-pass age bound from the longest of the three.
+   */
+  judgeModelTimeoutMs: number;
+  reviewModelTimeoutMs: number;
+  summaryModelTimeoutMs: number;
   /** PRD #1809 D7: the periodic reclaim cadence (UZI_DISK_RECLAIM_INTERVAL, default 10m). */
   diskReclaimIntervalMs: number;
   /**
@@ -327,6 +351,15 @@ function positiveInt(env: NodeJS.ProcessEnv, key: string, fallback: number): num
   return Number.isInteger(n) && n > 0 ? n : fallback;
 }
 
+/** SUMMARY_MODEL_TIMEOUT_MS exactly as summary-runner.ts reads it: a positive finite number
+ *  of ms (floored), else the 60 s default. */
+function summaryModelTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const raw = env.SUMMARY_MODEL_TIMEOUT_MS;
+  if (!raw) return 60_000;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 60_000;
+}
+
 /** Parse a margin fraction in [0, 1) (e.g. UZI_DISK_SOFT_MARGIN); blank or anything
  *  outside the range falls back, matching positiveInt's lenient shape. */
 function marginFraction(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
@@ -446,8 +479,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // defaults to `""`. Set-but-empty means "the deployment mentions this var and
     // expressed no opinion", which is the default, not the opposite of it.
     homeReclaimEnabled: parseBoolDefaultTrue(env.UZI_HOME_RECLAIM),
-    // PRD #1809 D5/D7: default ON, with the same empty-means-default rule as above.
+    // PRD #1809 D5/D7: both default ON, with the same empty-means-default rule as above.
     diskReclaimEnabled: parseBoolDefaultTrue(env.UZI_DISK_RECLAIM),
+    diskAdmissionEnabled: parseBoolDefaultTrue(env.UZI_DISK_ADMISSION),
+    diskAdmissionMaxWaitMs: duration(env, "UZI_DISK_ADMISSION_MAX_WAIT", "15m"),
+    judgeModelTimeoutMs: 5 * 60_000,
+    reviewModelTimeoutMs: 5 * 60_000,
+    summaryModelTimeoutMs: summaryModelTimeoutMs(env),
     diskReclaimIntervalMs: duration(env, "UZI_DISK_RECLAIM_INTERVAL", "10m"),
     diskSoftMargin: marginFraction(env, "UZI_DISK_SOFT_MARGIN", 0.1),
     diskHardMargin: marginFraction(env, "UZI_DISK_HARD_MARGIN", 0.03),

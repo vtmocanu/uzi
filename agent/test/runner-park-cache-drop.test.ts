@@ -281,7 +281,7 @@ describe("RunRunner — cache drop on a process-ending park (PRD #1809 M1)", () 
     try {
       seedHome(home);
       const { logger, lines } = recordingLogger();
-      await dropRunCaches(home, logger, 0);
+      await dropRunCaches(home, logger, { deadlineMs: 0 });
       assertCachesKept(home);
       assertResumeStateKept(home);
       const warn = lines.find((l) => (l as { msg: string }).msg.includes("ran out of time")) as
