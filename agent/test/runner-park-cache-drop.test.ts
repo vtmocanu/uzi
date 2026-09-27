@@ -3,10 +3,22 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { type ExecutorResult, type RunContext } from "../src/executor.js";
+import type { Options as SdkOptions } from "@anthropic-ai/claude-agent-sdk";
+import { type ExecutorResult, type RunContext, StubExecutor } from "../src/executor.js";
 import { type ExecutorFactory } from "../src/runner.js";
 import { LimitReachedError } from "../src/limit.js";
-import { api, fakeGitlab, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
+import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
+import { nullLogger } from "./helpers.js";
+import {
+  api,
+  fakeGitlab,
+  gitlabClaim,
+  input,
+  installHarness,
+  planThenDoneQuery,
+  runnerWith,
+  simulateCommittedWork,
+} from "./runner-harness.js";
 
 installHarness();
 
@@ -14,6 +26,8 @@ installHarness();
 // (`.cache/go-build`, `go/pkg/mod`, `.npm/_cacache`) from the preserved HOME and keeps
 // everything else a resume needs. On the base code a parked HOME kept every cache, so the
 // first test is the regression: it fails there on the three "cache dropped" assertions.
+// This host runs single-uid; the exact uid-split ownership (runner-owned `0555` module
+// cache under a worker-owned HOME) is the opt-in `e2e/home-uid-split/` fixture's subtree case.
 
 const SID = "aaaaaaaa-bbbb-cccc-dddd-000000001809";
 const PROJECT = "-data-runner-clone";
@@ -89,7 +103,9 @@ function forceRm(dir: string): void {
 }
 
 describe("RunRunner — cache drop on a process-ending park (PRD #1809 M1)", () => {
-  it("a usage-limit park drops the caches, keeps the resume state, and the resume reads its transcript back", async () => {
+  it("a usage-limit park drops the caches, keeps the resume state, and the resume continues the parked session", async (t) => {
+    // The drop pins descriptors through /proc/self/fd and refuses without it (rmHomeSubtree).
+    if (!fs.existsSync("/proc/self/fd")) return t.skip("no /proc/self/fd on this host: the cache drop refuses here by design");
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1809-park-"));
     try {
@@ -118,26 +134,43 @@ describe("RunRunner — cache drop on a process-ending park (PRD #1809 M1)", () 
       assertResumeStateKept(home);
       assert.strictEqual(fs.lstatSync(home).mode, modeBefore, "the HOME root's mode is untouched");
 
-      // The resume continues the ACTUAL session: the runner's transcript preflight keeps the
-      // session id only when `<sid>.jsonl` is still under the HOME, and the executor reads the
-      // transcript bytes back through the same HOME.
+      // The resume continues the ACTUAL session. The runner's transcript preflight hands the
+      // executor the parked session id only while `<sid>.jsonl` is still under the HOME
+      // (otherwise it drops it and starts fresh), and the REAL SdkExecutor then asks the SDK
+      // to resume exactly that session with HOME pointing at the preserved dir, which is
+      // where the CLI reads the transcript back from. The fake queryFn records both.
+      const queries: SdkOptions[] = [];
+      const inner = planThenDoneQuery();
+      const queryFn: SdkQueryFn = (params) => {
+        queries.push(params.options);
+        return inner(params);
+      };
       let seenSession: string | null | undefined;
-      let readBack = "";
-      const resumeFactory: ExecutorFactory = (id) => ({
-        homeDir: path.join(homeRoot, id),
-        executor: {
-          run: async (ctx: RunContext): Promise<ExecutorResult> => {
-            seenSession = ctx.sessionId;
-            readBack = fs.readFileSync(path.join(homeRoot, id, TRANSCRIPT_REL), "utf8");
-            return { branch: ctx.branch };
+      const resumeFactory: ExecutorFactory = (id) => {
+        const sdk = new SdkExecutor(nullLogger(), path.join(homeRoot, id), { queryFn });
+        return {
+          homeDir: path.join(homeRoot, id),
+          executor: {
+            run: async (ctx: RunContext): Promise<ExecutorResult> => {
+              seenSession = ctx.sessionId;
+              return sdk.run(ctx);
+            },
           },
-        },
-      });
+        };
+      };
+      simulateCommittedWork();
+      api.setInputs(runId, [input("approve_plan")]);
       await runnerWith(resumeFactory, gitlab).execute(
         gitlabClaim(iid, { run_id: runId, wait_on_limit: true, session_id: SID, last_seq: 1000 }),
       );
-      assert.strictEqual(seenSession, SID, "the resume keeps the parked session id (transcript found)");
-      assert.strictEqual(readBack, TRANSCRIPT, "the resume reads the parked transcript back");
+      assert.strictEqual(seenSession, SID, "the runner hands the resume the parked session id (transcript found)");
+      assert.ok(queries.length > 0, "precondition: the SDK was queried on the resume");
+      assert.strictEqual(queries[0]!.resume, SID, "the first SDK turn resumes the parked session");
+      assert.strictEqual(queries[0]!.env?.HOME, home, "the SDK resolves that session under the preserved HOME");
+      assert.ok(
+        api.states.some((s) => s.runId === runId && s.body.status === "completed"),
+        "the resumed run completed",
+      );
     } finally {
       forceRm(homeRoot);
     }
@@ -179,6 +212,51 @@ describe("RunRunner — cache drop on a process-ending park (PRD #1809 M1)", () 
       );
       assertCachesKept(home);
       assertResumeStateKept(home);
+    } finally {
+      forceRm(homeRoot);
+    }
+  });
+
+  it("a plan-gate park with its executor still live keeps the caches", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1809-gate-"));
+    try {
+      let home = "";
+      let returned = false;
+      const stub = new StubExecutor(nullLogger(), { planGate: true });
+      const factory: ExecutorFactory = (id) => {
+        home = path.join(homeRoot, id);
+        return {
+          homeDir: home,
+          executor: {
+            run: async (ctx: RunContext): Promise<ExecutorResult> => {
+              seedHome(home);
+              try {
+                return await stub.run(ctx);
+              } finally {
+                returned = true;
+              }
+            },
+          },
+        };
+      };
+      const claim = gitlabClaim(1812);
+      const execution = runnerWith(factory, gitlab, undefined, nullLogger(), { planApprovalTimeoutMs: 5000 }).execute(
+        claim,
+      );
+      const deadline = Date.now() + 4000;
+      while (!api.states.some((s) => s.runId === claim.run_id && s.body.status === "awaiting_approval")) {
+        assert.ok(Date.now() < deadline, "precondition: the run parked at the plan gate");
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      // Let any park-side work settle while the gate is still open.
+      await new Promise((r) => setTimeout(r, 100));
+      assert.strictEqual(returned, false, "precondition: the executor is still live at the gate");
+      assertCachesKept(home);
+      assertResumeStateKept(home);
+      api.setInputs(claim.run_id, [input("approve_plan")]);
+      await execution;
+      assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
     } finally {
       forceRm(homeRoot);
     }
