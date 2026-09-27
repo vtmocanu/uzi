@@ -335,6 +335,7 @@ worker_db_status() { db_psql "SELECT status FROM workers WHERE id = '$1'"; }
 
 # A live run so the worker actually has a snapshot to send across the rollback.
 make_hold_run;  ED="$HOLD_RUN"
+pass "case d: hold run $ED running on the worker"
 WORKER_D="$(run_field "$ED" worker_id)"
 export UZI_ACTIVE_SNAPSHOT_DISABLED=1
 "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate api >/dev/null
@@ -380,5 +381,9 @@ pass "api + agent recreated back to their defaults"
 for r in "$E" "$G" "$EA" "$GA" "$X" "$ED"; do
   [ -n "${r:-}" ] && cancel_run "$r"
 done
+# The cancels are enqueued for the just-recreated agent (which may also requeue and reclaim a
+# run first); wait for them to land so the quarantine does not find a run still settling
+# after the restore and log a LEAK (seen in CI).
+settle_runs_terminal 45 "${E:-}" "${G:-}" "${EA:-}" "${GA:-}" "${X:-}" "${ED:-}"
 
 fi

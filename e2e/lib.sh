@@ -425,6 +425,28 @@ wait_status() {
 # disruption and hand it to wait_regated.
 run_claimed_at() { apiget "/api/runs/$1" | jq -r '.run.claimed_at // empty'; }
 
+# settle_runs_terminal TIMEOUT RUN... — best-effort wait for each run a phase cancelled to
+# become terminal (completed/failed/cancelled) before the phase exits. A cancel to a run with a
+# live worker is only ENQUEUED; the worker applies it at its next poll, so a phase that exits
+# right after its cleanup cancels hands the driver's quarantine a still-live run and logs a LEAK.
+# Never fails a phase: it returns 0 whatever happens, and empty ids are skipped. Each status
+# read is a single curl capped at 5s (run_status_quick, no retry), so a hung api cannot stretch
+# the wait much past TIMEOUT.
+run_status_quick() { curl -fsS --max-time 5 -b "$JAR" "$BASE/api/runs/$1" 2>/dev/null | jq -r '.run.status // empty' 2>/dev/null; }
+settle_runs_terminal() {
+  local timeout="$1" deadline r s; shift
+  deadline=$((SECONDS + timeout))
+  for r in "$@"; do
+    [ -n "$r" ] || continue
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      s="$(run_status_quick "$r")" || s=""
+      case "$s" in completed|failed|cancelled) break ;; esac
+      sleep 0.5
+    done
+  done
+  return 0
+}
+
 # wait_regated RUN PREV_CLAIMED_AT [TIMEOUT] — after a restart/kill of a run parked at the
 # plan gate, wait until a NEW claim has re-shown the gate: status awaiting_approval AND
 # claimed_at set and different from PREV_CLAIMED_AT. `wait_status RUN awaiting_approval`

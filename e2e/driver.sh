@@ -144,7 +144,7 @@ _capture_artifacts() {
 # Runs only when db_psql is usable (a failing db_psql short-circuits to a no-op).
 # Each recorded LEAK also captures artifacts (D5), keyed on NN_SLUG.
 _quarantine() {
-  local nn_slug="$1" slug="$2" handoff="$3" ids id name v held code forced
+  local nn_slug="$1" slug="$2" handoff="$3" ids id name v held code forced what
   ids="$(db_psql_rows "select id from runs where status not in ('completed','failed','cancelled')" 2>/dev/null)" || return 0
   [ -n "$ids" ] || return 0
   held=""
@@ -156,6 +156,10 @@ _quarantine() {
     [ -n "$id" ] || continue
     case " $held " in *" $id "*) continue ;; esac   # declared handoff — not a leak
     forced=""
+    # What the leaked run IS, read before the cancel changes its status: a run no phase
+    # created (a poller-driven mr_rework/ci_fix, a judge run, a schedule fire) is otherwise
+    # indistinguishable in the summary, and CI keeps the rundir only on a failure.
+    what="$(db_psql "select kind||' via '||trigger_source||', status '||status||', age '||extract(epoch from now()-created_at)::int||'s'||coalesce(', branch '||branch,'')||coalesce(', mr !'||mr_iid,'')||coalesce(', schedule '||schedule_id,'') from runs where id='$id'" 2>/dev/null)" || what=""
     # apipost_code both POSTs the cancel and hands back the HTTP status (owner-scoped,
     # so a 4xx here is expected for a run another session created).
     code="$(apipost_code "/api/runs/$id/inputs" '{"kind":"cancel","body":""}')" || code="000"
@@ -168,7 +172,7 @@ _quarantine() {
     # tolerate a timeout: the `exit` would kill the whole driver and skip the results
     # writers. The subshell contains the `exit 1` so `|| true` can catch it.
     ( wait_status "$id" cancelled 10 ) || true
-    _record "$slug" LEAK 0 "leaked run $id cancelled${forced}" "$slug (quarantine)"
+    _record "$slug" LEAK 0 "leaked run $id${what:+ (${what})} cancelled${forced}" "$slug (quarantine)"
     _capture_artifacts "$nn_slug" 0
   done
 }

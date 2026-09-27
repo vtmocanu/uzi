@@ -105,7 +105,35 @@ regate "gate row with no claimed_at"                fail awaiting_approval:
 regate "terminal failure while waiting"             fail awaiting_approval:T0 failed:T1
 regate "cancelled while waiting"                    fail awaiting_approval:T0 cancelled:
 
+# settle_runs_terminal: best-effort, so it must return 0 both when a run settles and when it
+# never does, and it must stop polling a run once that run is terminal. Asserted on the number of
+# status reads, not on wall-clock time, so host load cannot redden it.
+eval "$(awk '/^settle_runs_terminal\(\) \{/,/^\}/' "$LIB")"
+# run_status_quick stub: serves the scripted statuses in order (sticking on the last) and counts calls.
+run_status_quick() {
+  local n calls
+  n="$(cat "$SEQ_DIR/n")"; calls="$(cat "$SEQ_DIR/calls")"
+  echo $((calls + 1)) > "$SEQ_DIR/calls"
+  sed -n "${n}p" "$SEQ_DIR/seq"
+  [ "$n" -ge "$(wc -l < "$SEQ_DIR/seq")" ] || echo $((n + 1)) > "$SEQ_DIR/n"
+}
+# settle NAME WANT_CALLS STATUS... — one run (plus an empty id, which must be skipped); WANT_CALLS
+# is the exact number of reads expected, or "many" for a run that never settles (more than one).
+settle() {
+  cases=$((cases + 1))
+  local name="$1" want="$2" rc calls; shift 2
+  : > "$SEQ_DIR/seq"; echo 1 > "$SEQ_DIR/n"; echo 0 > "$SEQ_DIR/calls"
+  printf '%s\n' "$@" > "$SEQ_DIR/seq"
+  ( settle_runs_terminal 5 R "" ); rc=$?
+  calls="$(cat "$SEQ_DIR/calls")"
+  if [ "$rc" = 0 ] && { [ "$calls" = "$want" ] || { [ "$want" = many ] && [ "$calls" -gt 1 ]; }; }; then
+    passed=$((passed + 1)); echo "PASS: $name"
+  else echo "FAIL: $name — rc=$rc (want 0), status reads=$calls (want $want)"; fi
+}
+settle "stops polling as soon as the run turns terminal" 2 running cancelled
+settle "never-terminal run: returns 0 once the timeout passes" many running
+
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 18 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 20 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 18 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 20 ] && [ "$cases" -eq "$passed" ]
