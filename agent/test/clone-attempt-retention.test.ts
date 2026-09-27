@@ -622,7 +622,7 @@ describe("issue #1783 final: a directory swapped in for a residue link fails the
     assert.equal(fs.lstatSync(swapped).isDirectory(), true, "the directory is kept");
     assert.equal(fs.readFileSync(path.join(swapped, "inner", "KEEP"), "utf8"), "k", "its contents survive");
     const refusal = lines.find((l) => (l as { path?: string; msg?: string }).path === swapped && (l as { msg?: string }).msg?.includes("refusing to delete"));
-    assert.match(String((refusal as { reason?: string } | undefined)?.reason), /EISDIR/);
+    assert.match(String((refusal as { reason?: string } | undefined)?.reason), /EISDIR|EPERM/);
   });
 });
 

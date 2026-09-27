@@ -576,6 +576,31 @@ describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", 
     assert.deepEqual(fs.readdirSync(holdingRoot()), []);
   });
 
+  it("issue #1783: a failed `retired` ledger append neither fails the retire nor leaks the holding copy", async () => {
+    const ownerRunId = "35353535-3535-4535-8535-353535353535";
+    const { bare, branch, clonePath } = await seedResidue(1442, ownerRunId, "Q.txt");
+    type Append = (b: string, br: string, e: { state: string }) => Promise<void>;
+    const target = git as unknown as { appendAttemptLedger: Append };
+    const orig = target.appendAttemptLedger;
+    let failed = 0;
+    target.appendAttemptLedger = async function (this: unknown, b, br, e) {
+      if (e.state === "retired") {
+        failed++;
+        throw new Error("injected ledger append failure");
+      }
+      return orig.call(this, b, br, e);
+    };
+    try {
+      await git.retireRunnerClone(bare, clonePath, branch, ownerRunId, { discard: true, attemptId: "20260927T000000Z-g1-0123456789abcdef" });
+    } finally {
+      target.appendAttemptLedger = orig;
+    }
+    assert.equal(failed, 1, "the retired append was attempted and failed");
+    assert.equal(fs.existsSync(clonePath), false, "the canonical is free");
+    assert.equal(readJournal(bare, branch), undefined, "the journal is cleared");
+    assert.deepEqual(fs.readdirSync(holdingRoot()), [], "step 6 still discarded the holding copy");
+  });
+
   it("T7a: a missing SOURCE is treated as already-free (journal cleared, no throw)", async () => {
     const iid = 1450;
     const ownerRunId = "44444444-4444-4444-8444-444444444444";

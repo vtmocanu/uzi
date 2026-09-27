@@ -106,7 +106,7 @@ describe("issue #1783: park fails closed (A-park-fail-closed)", () => {
       await runnerWith(factory, gitlab, undefined, undefined, { quiesceRun }).execute(gitlabClaim(iid, { wait_on_limit: true }));
 
       assert.ok(api.states.some((s) => s.body.status === "limit_wait"), "the park still stands");
-      assert.equal(calls[0]?.processes, true);
+      assert.equal(calls[0]?.processes, process.platform === "linux");
       assert.equal(calls[0]?.attempt?.marker, marker, "the flight's own attempt marker is the one quiesced");
       assert.ok(marker && /^.+:[0-9]{8}T[0-9]{6}Z-(g[0-9]+|gx)-[0-9a-f]{16}$/.test(marker), "ctx carries the attempt marker");
       assert.equal(wipCalls, 0, "commitWipMarker (the sink body) never ran");

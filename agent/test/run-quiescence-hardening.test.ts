@@ -529,10 +529,12 @@ describe("A-check-leak: a process leaked by a self-improve check is reaped", { s
     fs.mkdirSync(clone, { recursive: true });
     const pidFile = path.join(tmp, "check-leak.pid");
     // The repo-authored "test" backgrounds a detached dev server in the clone and exits 0.
-    const leaky = `const c = require("node:child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd: ${JSON.stringify(clone)}, detached: true, stdio: "ignore" });
-require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(c.pid)); c.unref();`;
+    // A constant program: the clone and the pid file arrive as argv (process.argv[1], [2] under -e).
+    const leaky = `const [cwd, pidFile] = process.argv.slice(1);
+const c = require("node:child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd, detached: true, stdio: "ignore" });
+require("node:fs").writeFileSync(pidFile, String(c.pid)); c.unref();`;
     const run = defaultCheckRunner({ PATH: String(process.env.PATH ?? "") }, 30_000);
-    const res = await run({ name: "leaky", cwd: ".", command: process.execPath, args: ["-e", leaky] }, clone);
+    const res = await run({ name: "leaky", cwd: ".", command: process.execPath, args: ["-e", leaky, clone, pidFile] }, clone);
     assert.equal(res.status, "passed");
     const leaked = Number(fs.readFileSync(pidFile, "utf8"));
     strays.push(leaked);

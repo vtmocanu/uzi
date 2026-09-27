@@ -369,7 +369,7 @@ describe("A-worker-op: a worker-marked op in the clone survives a concurrent rea
     // The worker's op: worker-marked, cwd in the clone, a second of work, then a file write.
     const op = spawn(
       process.execPath,
-      ["-e", `setTimeout(() => { require("node:fs").writeFileSync(${JSON.stringify(done)}, "ok"); }, 1000);`],
+      ["-e", `setTimeout(() => { require("node:fs").writeFileSync(process.argv[1], "ok"); }, 1000);`, done],
       { cwd: own.clonePath, env: workerSpawnEnv({ PATH: process.env.PATH }), stdio: "ignore" },
     );
     spawned.push(op);

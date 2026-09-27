@@ -606,6 +606,40 @@ describe("issue #1783 M2 C′: the journal is cleared ONLY after a verified capt
   });
 });
 
+describe("issue #1783 M2 × #1766: a vault-lock park's exit capture releases a predecessor in place", { skip: !HAS_PROCFS }, () => {
+  it("a verified exit capture on a terminal ownership read marks the predecessor abandoned and clears the journal; the path is untouched", async () => {
+    const iid = 2023;
+    const runId = randomUUID();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    const { factory, started } = transientFactory();
+    const runner = wired(factory);
+    // Seam: the predecessor-capture flight parks through handleRecoveryExhausted with the transient
+    // cause; drive that same park with the #1766 vault_locked cause, so the loop's terminal
+    // ownership read exits through captureForVaultExit.
+    type Park = (...a: unknown[]) => Promise<boolean>;
+    const target = runner as unknown as { handleRecoveryExhausted: Park };
+    const orig = target.handleRecoveryExhausted;
+    const causes: string[] = [];
+    target.handleRecoveryExhausted = function (this: unknown, ...a: unknown[]) {
+      const flight = a[2] as { predecessorCapture: boolean };
+      const cause = flight.predecessorCapture ? { kind: "vault_locked" } : a[7];
+      causes.push((cause as { kind?: string } | undefined)?.kind ?? "transient");
+      return orig.call(this, ...a.slice(0, 7), cause);
+    };
+    // The running confirmation is acked `running`; the loop's ownership read is terminal.
+    api.setOwnershipStatus(runId, "cancelled");
+    await runner.execute(gitlabClaim(iid, { run_id: runId }));
+
+    assert.deepEqual(causes, ["vault_locked"], "the predecessor flight parked vault-locked, once");
+    assert.equal(started(), 0, "no model ever runs in (or for) the predecessor");
+    assert.equal(api.states.some((s) => s.body.status === "recovery_wait"), false, "a terminal run is never parked");
+    assert.ok(trackingHas(iid, "ONLY_COPY.txt"), "the exit capture verified the predecessor's work into the tracking ref");
+    assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "abandoned", "released in place: the ledger says abandoned");
+    assert.equal(readJournal(iid), undefined, "the journal is cleared after the verified exit capture");
+    assert.equal(fs.readFileSync(path.join(pred.clonePath, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n", "the path is untouched");
+  });
+});
+
 // ─── P-capture-blocked ─────────────────────────────────────────────────────────────────────
 
 describe("issue #1783 M2 P-capture-blocked", { skip: !HAS_PROCFS }, () => {

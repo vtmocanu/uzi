@@ -4300,9 +4300,18 @@ export class GitCache {
         await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       }
       // issue #1783 M2: an attempt clone the owner's terminal retire disposed of is `retired` in
-      // the ledger (its id is never reused).
+      // the ledger (its id is never reused). Contained: by here the clone is moved and the journal
+      // cleared, so a failed append must neither fail the completed retire nor skip step 6's
+      // disposal of the holding copy.
       if (opts.attemptId !== undefined) {
-        await this.appendAttemptLedger(barePath, branch, { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" });
+        await this.appendAttemptLedger(barePath, branch, { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" }).catch(
+          (err: unknown) =>
+            this.log.warn("retireRunnerClone: could not record the attempt as retired; the gone path is compacted later", {
+              clone: clonePath,
+              attempt_id: opts.attemptId,
+              error: gitErrorMessage(err),
+            }),
+        );
       }
       return { holding, scratch };
     });
