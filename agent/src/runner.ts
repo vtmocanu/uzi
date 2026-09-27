@@ -165,10 +165,14 @@ const COMPLETION_HOLD_CAPTURE_ATTEMPTS = 3;
 
 /** PRD #1247 M5b (D3): bounded in-call attempts to capture a VERIFIED restore point before a
  *  held-state credential-switch RELEASE. Mirrors COMPLETION_HOLD_CAPTURE_ATTEMPTS — the same
- *  retain-and-retry, bounded because it runs synchronously in executeClaim's catch arm. A capture
- *  that never verifies GIVES UP: enterCredentialSwitch reports `credential_switch_failed`, KEEPS
- *  the preserve flags (no work loss), and returns "gave_up" so the run is left non-terminal for
- *  requeue on the still-standing override — the switch is realized at the reclaim boundary. */
+ *  retain-and-retry, bounded because it runs synchronously (in the executor's in-place
+ *  ctx.attemptCredentialSwitch, or executeClaim's CredentialSwitchSignal safety-net arm). A capture
+ *  that never verifies GIVES UP: enterCredentialSwitch reports `credential_switch_failed` and reads
+ *  the ack. Only when the server confirms the switch stamp cleared does it return "gave_up", and the
+ *  in-place caller then CONTINUES the run on the old token (it clears the preserve flags and undoes
+ *  any wip marker). An unconfirmed clear returns "retained_stop" (flags kept; the caller throws
+ *  CredentialSwitchRetainedStop and the run is left non-terminal for requeue). Only the outer
+ *  safety-net arm, which cannot continue in place, leaves a "gave_up" run non-terminal for requeue. */
 const CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS = 3;
 
 /** PRD #1226 M4 (D5): the STATIC, content-free failure_reason a worker reports when the completion
