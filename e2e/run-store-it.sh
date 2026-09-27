@@ -12,8 +12,8 @@
 #     quota that lets four workers through here.
 #
 # Spins up a THROWAWAY Postgres, points UZI_TEST_DATABASE_URL at it, applies the
-# real goose migrations, seeds fixtures, and runs every *LiveDB test in the five
-# packages that carry one (store, handler, forgesvc, schedsvc, workersvc -- the
+# real goose migrations, seeds fixtures, and runs every *LiveDB test in the six
+# packages that carry one (store, handler, forgesvc, schedsvc, workersvc, recovery -- the
 # list on the `go test` line below, mirrored in .github/workflows/ci.yml).
 # Isolated: unique container + published loopback port, torn down on exit; never
 # touches the user's own stacks or DBs.
@@ -121,7 +121,7 @@ cd "$ROOT/api"
 # second one failed on the UNIQUE constraint). Derive token hashes from a fresh
 # uuid, the way handler/hosted_provision_livedb_test.go documents.
 #
-# PKGS is the ONE list; ci.yml's "LiveDB tests" step carries the same five, and the
+# PKGS is the ONE list; ci.yml's "LiveDB tests" step carries the same six, and the
 # per-package check below is what makes a stale list visible: a listed package that
 # contributes zero *LiveDB tests prints `ok <pkg> 0.01s [no tests to run]`, which the
 # aggregate exit code and the aggregate PASS count both read as green.
@@ -131,6 +131,7 @@ PKGS=(
   ./internal/forgesvc/...
   ./internal/schedsvc/...
   ./internal/workersvc/...
+  ./internal/recovery/...
 )
 # EXPLICIT XXXXXX template, NOT `mktemp -t <name>`: GNU coreutils rejects a `-t`
 # template with too few X's (it needs >=3 consecutive; this one had none) with "too
