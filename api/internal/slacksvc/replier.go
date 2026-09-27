@@ -252,7 +252,17 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 			r.logf("cas revise accept", err)
 			return
 		}
-		if err := r.svc.SubmitInput(ctx, user.ID, anchor.RunID, "revise_plan", text); err != nil {
+		// The feedback binds to the revision of the card it answers (PRD #1795 M5): a newer plan
+		// presented since that card was posted refuses it rather than revising a plan the user
+		// never saw.
+		if err := r.svc.SubmitInput(ctx, user.ID, anchor.RunID, "revise_plan", text, anchorGateRevision(anchor)); err != nil {
+			if errors.Is(err, ErrGateRevisionMismatch) {
+				// Nothing was written and the CAS already cleared this card's anchor, so the
+				// notifier will not touch it again: retire it button-free here.
+				r.editGateMessage(ctx, anchor, "Superseded — this plan gate changed. See the latest plan message.")
+				r.ephemeral(ctx, m, gateSupersededText)
+				return
+			}
 			if errors.Is(err, ErrReviseCapReached) {
 				r.editGateMessage(ctx, anchor, "🔁 Revision limit reached — approve or reject this plan in uzi.")
 				r.ephemeral(ctx, m, "You've hit the plan-revision limit for this run — approve or reject the current plan instead.")
@@ -277,7 +287,14 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 		// while reject-pending and the notifier hasn't yet cleared the anchor, this
 		// stale reply must NOT submit reject_plan (which could wrongly fail a run that
 		// already left the gate) — it falls through to the branches below instead.
-		if err := r.svc.SubmitInput(ctx, user.ID, anchor.RunID, "reject_plan", text); err != nil {
+		// Bound to the card's revision like the revise above (PRD #1795 M5): a stale reason
+		// never rejects a newer plan. On a mismatch the anchor is left for the notifier, which
+		// supersedes or closes this card when it drives the run's new state.
+		if err := r.svc.SubmitInput(ctx, user.ID, anchor.RunID, "reject_plan", text, anchorGateRevision(anchor)); err != nil {
+			if errors.Is(err, ErrGateRevisionMismatch) {
+				r.ephemeral(ctx, m, gateSupersededText)
+				return
+			}
 			r.logf("submit reasoned reject", err)
 			return
 		}
@@ -317,7 +334,7 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 		// "Awaiting your follow-up" park treated as a park — its label is rendered by the
 		// notifier's statusGlyph — and so a future change to the default cannot silently break
 		// the resume of a parked interactive task.
-		if err := r.svc.SubmitInput(ctx, user.ID, anchor.RunID, "follow_up", text); err != nil {
+		if err := r.svc.SubmitInput(ctx, user.ID, anchor.RunID, "follow_up", text, nil); err != nil {
 			r.logf("submit follow_up (awaiting_followup)", err)
 			return
 		}
@@ -325,7 +342,7 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 
 	default:
 		// Live run, no gate → follow_up for the next implement turn.
-		if err := r.svc.SubmitInput(ctx, user.ID, anchor.RunID, "follow_up", text); err != nil {
+		if err := r.svc.SubmitInput(ctx, user.ID, anchor.RunID, "follow_up", text, nil); err != nil {
 			r.logf("submit follow_up", err)
 			return
 		}

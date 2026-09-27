@@ -2057,3 +2057,47 @@ func TestRootBlocksUseEmojiPresentation(t *testing.T) {
 		assertEmojiPresentation(t, section+contextText(blocks)+fallback)
 	}
 }
+
+// A freshly posted gate card is stamped with the run's current plan-gate revision (PRD #1795
+// M5), in the same generation-guarded write as its ts, and a re-card for a new plan version
+// stamps the new revision. A run with no allocated revision (0) stamps NULL (a legacy card).
+func TestNotifierGateCardStampsGateRevision(t *testing.T) {
+	cases := []struct {
+		name     string
+		rev      int64
+		stored   pgtype.Int4
+		count    int64
+		wantNull bool
+	}{
+		{"first card", 4, pgtype.Int4{}, 1, false},
+		{"re-card for a new plan version", 9, pgtype.Int4{Int32: 1, Valid: true}, 2, false},
+		{"no allocated revision", 0, pgtype.Int4{}, 1, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rc := baseRun("awaiting_approval")
+			rc.GateRevision = tc.rev
+			msg := store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1", GateGeneration: tc.stored}
+			if tc.stored.Valid {
+				msg.GateTs, msg.GateState = txt("gate-old"), txt(gateStateOpen)
+			}
+			fs := &fakeNotifStore{rc: rc, delivery: txt("U1"), msg: msg, planCount: tc.count}
+			n := NewNotifier(fs, &fakePoster{dmChannel: "D1"}, fixedBase, nil)
+			n.handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+
+			if len(fs.gateSetGen) != 1 {
+				t.Fatalf("want one fresh-gate anchor write: %+v", fs.gateSetGen)
+			}
+			got := fs.gateSetGen[0].GateRevision
+			if tc.wantNull {
+				if got.Valid {
+					t.Fatalf("a run with no allocated revision must stamp NULL, got %d", got.Int64)
+				}
+				return
+			}
+			if !got.Valid || got.Int64 != tc.rev {
+				t.Fatalf("the card must be stamped with revision %d, got %+v", tc.rev, got)
+			}
+		})
+	}
+}

@@ -457,6 +457,7 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 		if _, err := n.store.SetSlackRunGateGen(ctx, store.SetSlackRunGateGenParams{
 			RunID: rc.ID, GateTs: pgconv.Text(ts), GateState: pgconv.Text(gateStateOpen),
 			GateGeneration: pgtype.Int4{Int32: int32(gen), Valid: true},
+			GateRevision:   cardGateRevision(rc.GateRevision),
 		}); err != nil {
 			n.logf("record gate", err)
 		}
@@ -472,6 +473,28 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 			n.logf("clear gate", err)
 		}
 	}
+}
+
+// cardGateRevision is the plan-gate revision a freshly posted gate card is stamped with (PRD
+// #1795 M5): the run's gate_revision read in the same row as the plan the card renders. A run
+// with no allocated revision (0: a gate published before the api allocated revisions) stamps
+// NULL, so the card's verdicts are sent as legacy verdicts with no expected revision.
+func cardGateRevision(rev int64) pgtype.Int8 {
+	if rev <= 0 {
+		return pgtype.Int8{}
+	}
+	return pgtype.Int8{Int64: rev, Valid: true}
+}
+
+// anchorGateRevision is the expected revision a verdict from the anchor's gate card carries:
+// the revision the card was stamped with, or nil for a legacy card (NULL, or posted before the
+// revision existed), which keeps the pre-#1795 unbound behaviour.
+func anchorGateRevision(anchor store.SlackRunMessage) *int64 {
+	if !anchor.GateRevision.Valid || anchor.GateRevision.Int64 <= 0 {
+		return nil
+	}
+	rev := anchor.GateRevision.Int64
+	return &rev
 }
 
 // rootBlocks builds the content-minimized run-status root as Block Kit (message

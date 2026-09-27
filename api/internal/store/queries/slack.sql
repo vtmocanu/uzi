@@ -191,6 +191,10 @@ SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
        -- and feeds the three-term deadline the Go notifier computes with RunDeadline.
        r.hold_reason, r.budget_finalize_seconds,
        r.fail_origin,
+       -- PRD #1795 M5: the run's current plan-gate revision, stamped onto a freshly posted
+       -- gate card (SetSlackRunGateGen) so the card's verdicts carry the revision it showed.
+       -- Read in this one row with plan_md, so the revision is the one of the plan the card renders.
+       r.gate_revision,
        (r.preserved_patch IS NOT NULL)::boolean AS has_preserved_patch,
        (EXISTS (SELECT 1 FROM recovery_captures c WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state = 'available'))::boolean AS has_available_capture,
        rp.path_with_namespace, rp.web_url, c.forge_type,
@@ -246,8 +250,15 @@ RETURNING *;
 -- what is stored — a slow notifier drain writing generation N can never clobber an
 -- anchor another drain already advanced to N+1. No row returned = the write was
 -- refused (a newer gate already exists), and the caller backs off.
+--
+-- gate_revision (PRD #1795 M5) is the run's plan-gate revision the card was posted for,
+-- written in the SAME guarded statement so the card's ts and the revision its buttons and
+-- replies bind to can never belong to two different gates. NULL = the run had no allocated
+-- revision (a pre-#1795 publication); a verdict from such a card sends no expected revision.
+-- DISTINCT from gate_generation, which counts plan messages, not gate presentations.
 UPDATE slack_run_messages
-SET gate_ts = @gate_ts, gate_state = @gate_state, gate_generation = @gate_generation, updated_at = now()
+SET gate_ts = @gate_ts, gate_state = @gate_state, gate_generation = @gate_generation,
+    gate_revision = sqlc.narg(gate_revision)::bigint, updated_at = now()
 WHERE run_id = @run_id AND (gate_generation IS NULL OR gate_generation < @gate_generation)
 RETURNING *;
 
