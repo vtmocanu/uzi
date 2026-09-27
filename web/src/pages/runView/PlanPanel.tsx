@@ -197,10 +197,13 @@ export function PlanPanel({
   // PRD #1795 D5: set by the caller when a verdict was refused with 409
   // gate_revision_mismatch. `current` is the run's revision at refusal and `expected` the
   // revision the verdict named (absent when none was sent). A NEW object per refusal, so a
-  // second refusal at the same revision still re-arms the panel. The panel shows the notice
-  // and re-binds an open composer to `current`; with no composer open it releases the freeze
-  // (the caller refetches the run and keeps its `busy` up until the refetch settles, so no
-  // click can bind to the refused revision in between).
+  // second refusal at the same revision still re-arms the panel. The panel shows the notice.
+  // An open composer KEEPS the revision it was frozen on: `current` is never used as a
+  // submission revision, because the caller's refetch may not have landed (it waits a bounded
+  // time, then releases `busy`), and binding to a plan the owner has not seen is the failure
+  // this guards against. The owner re-binds explicitly, to the plan on screen, from inside the
+  // composer (or cancels and reopens it). With no composer open the freeze is released, so the
+  // next action binds to the displayed run at its click.
   revisionMismatch?: GateMismatch | null;
 }) {
   const [rejecting, setRejecting] = useState(false);
@@ -218,17 +221,39 @@ export function PlanPanel({
   const [frozenRevision, setFrozenRevision] = useState<{ rev: number | undefined } | null>(null);
   const freezeRevision = useCallback(() => setFrozenRevision({ rev: run.gate_revision }), [run.gate_revision]);
   const boundRevision = frozenRevision ? frozenRevision.rev : run.gate_revision;
-  // A refusal re-binds an OPEN composer to the revision the server reported, so the owner
-  // who keeps typing sends against the plan the refetch shows (never unfrozen, which would
-  // bind to whatever happens to be on screen at the click). With no composer open the freeze
-  // is released: the next action starts fresh from the displayed run. The composer-open flag
-  // is read through a ref so only a NEW refusal fires this, not every open/close.
+  // A refusal leaves an OPEN composer frozen where it was: a retry still names the revision the
+  // owner opened it on and is refused again, never re-pointed at the revision the server
+  // reported (a plan the page may not be showing yet). Re-binding is the owner's explicit act,
+  // via the "Decide on the displayed plan" button the composer shows once the displayed revision
+  // differs from its frozen one (restartComposerRevision below). With no composer open the
+  // freeze is released: the next action starts fresh from the displayed run. The composer-open
+  // flag is read through a ref so only a NEW refusal fires this, not every open/close.
   const composerOpenRef = useRef(false);
   composerOpenRef.current = rejecting || requesting;
   useEffect(() => {
     if (!revisionMismatch) return;
-    setFrozenRevision(composerOpenRef.current ? { rev: revisionMismatch.current } : null);
+    if (!composerOpenRef.current) setFrozenRevision(null);
   }, [revisionMismatch]);
+  // The displayed revision an open composer can be re-bound to, when it differs from the one the
+  // composer is frozen on; undefined when there is nothing to offer (no freeze, no revision on
+  // either side, or they match). The button binds to the DISPLAYED run via freezeRevision, and
+  // leaves the draft text alone.
+  const restartComposerRevision =
+    frozenRevision?.rev !== undefined && run.gate_revision !== undefined && frozenRevision.rev !== run.gate_revision
+      ? run.gate_revision
+      : undefined;
+  const restartComposer =
+    restartComposerRevision !== undefined ? (
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-[11px] text-faint">
+          This draft is for plan revision {frozenRevision?.rev}; the plan shown is revision {restartComposerRevision}.
+          Sent as is, it will not be applied; switch it to the plan shown to decide on that one.
+        </span>
+        <Button variant="secondary" size="sm" disabled={busy} onClick={freezeRevision}>
+          {`Decide on the displayed plan (revision ${restartComposerRevision})`}
+        </Button>
+      </div>
+    ) : null;
 
   const rev = useMemo(() => derivePlanRevision(messages), [messages]);
 
@@ -662,6 +687,7 @@ export function PlanPanel({
               value={feedback}
               onChange={(e) => setFeedback(e.target.value)}
             />
+            {restartComposer}
             <div className="flex flex-wrap items-center justify-between gap-2">
               <span className="text-[11px] text-faint">
                 Feedback goes to the planning session; the agent revises and the plan returns here for approval.{" "}
@@ -695,6 +721,7 @@ export function PlanPanel({
               value={reason}
               onChange={(e) => setReason(e.target.value)}
             />
+            {restartComposer}
             <div className="flex gap-2">
               <Button
                 variant="danger"

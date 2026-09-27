@@ -6385,4 +6385,150 @@ describe("RunView — plan-gate verdicts bound to the gate revision (PRD #1795 M
       vi.useRealTimers();
     }
   });
+
+  // PRD #1795 B6: once the bounded wait releases busy, plan two may still be on screen. A retry
+  // from the still-open composer must keep naming the revision it was opened on (2), never the
+  // revision the 409 reported (3), which the owner has not seen.
+  it("retry after a hung refetch still targets the displayed plan", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(3);
+    });
+    const refreshRun = vi.fn(() => new Promise<void>(() => {}));
+    renderGate(submit, refreshRun);
+    await screen.findByRole("button", { name: "Reject" });
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    vi.useFakeTimers();
+    try {
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      expect(screen.getByText("Plan two")).toBeTruthy();
+      expect((screen.getByRole("button", { name: "Send rejection" }) as HTMLButtonElement).disabled).toBe(false);
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(submit).toHaveBeenCalledTimes(2);
+      expect(submit.mock.calls[1]).toEqual(["reject_plan", "", undefined, undefined, undefined, 2]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a request-changes retry after a hung refetch still targets the displayed plan", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(3);
+    });
+    const refreshRun = vi.fn(() => new Promise<void>(() => {}));
+    renderGate(submit, refreshRun);
+    fireEvent.click(await screen.findByRole("button", { name: "Request changes" }));
+    fireEvent.change(screen.getByPlaceholderText(/sent to the planning session/), { target: { value: "split M2" } });
+    vi.useFakeTimers();
+    try {
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: /Send & revise/ }));
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      expect(screen.getByText("Plan two")).toBeTruthy();
+      // The refused revise leaves the composer open with the owner's text.
+      expect((screen.getByPlaceholderText(/sent to the planning session/) as HTMLTextAreaElement).value).toBe(
+        "split M2",
+      );
+      expect((screen.getByRole("button", { name: /Send & revise/ }) as HTMLButtonElement).disabled).toBe(false);
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: /Send & revise/ }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(submit).toHaveBeenCalledTimes(2);
+      expect(submit.mock.calls[1]).toEqual(["revise_plan", "split M2", undefined, undefined, undefined, 2]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // A FAILED refetch (refreshRun rejects) propagates out of the bounded wait into `act`: busy is
+  // released, the failure is on the page banner, the refusal notice stays, and plan two is still on
+  // screen. The retry from the still-open composer keeps naming revision 2. (useRunStream's own
+  // refreshRun catches a failed GET and resolves, which is the hung/unchanged case above; this
+  // pins the contract for a refetch that does reject.)
+  const composers = [
+    {
+      name: "reject",
+      open: "Reject",
+      send: "Send rejection",
+      draft: undefined,
+      verb: "reject_plan",
+      text: "",
+    },
+    {
+      name: "request-changes",
+      open: "Request changes",
+      send: /Send & revise/,
+      draft: "split M2",
+      verb: "revise_plan",
+      text: "split M2",
+    },
+  ] as const;
+  for (const c of composers) {
+    it(`a ${c.name} retry after a failed refetch still targets the displayed plan`, async () => {
+      const submit = vi.fn(async () => {
+        throw mismatch(3);
+      });
+      const refreshRun = vi.fn().mockRejectedValue(new ApiError(503, "refetch failed: network down"));
+      renderGate(submit, refreshRun);
+      fireEvent.click(await screen.findByRole("button", { name: c.open }));
+      if (c.draft !== undefined) {
+        fireEvent.change(screen.getByPlaceholderText(/sent to the planning session/), { target: { value: c.draft } });
+      }
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: c.send }));
+      });
+      await waitFor(() => expect(refreshRun).toHaveBeenCalledTimes(1));
+      await screen.findByText("refetch failed: network down");
+      expect(
+        screen.getByText("Your decision was not applied: the run now shows plan revision 3. Review it and decide again."),
+      ).toBeTruthy();
+      expect(screen.getByText("Plan two")).toBeTruthy();
+      const send = screen.getByRole("button", { name: c.send }) as HTMLButtonElement;
+      expect(send.disabled).toBe(false);
+      // Nothing newer is displayed, so there is nothing to re-bind to.
+      expect(screen.queryByRole("button", { name: /Decide on the displayed plan/ })).toBeNull();
+
+      await act(async () => {
+        fireEvent.click(send);
+      });
+      await waitFor(() => expect(submit).toHaveBeenCalledTimes(2));
+      expect(submit.mock.calls[1]).toEqual([c.verb, c.text, undefined, undefined, undefined, 2]);
+    });
+  }
+
+  // The explicit restart, end to end: the 409 reported 3, the refetch shows 4. The composer offers
+  // to decide on the plan shown (4), and the retry then names 4, never the reported 3.
+  it("the restart button re-binds an open composer to the displayed plan after a refetch", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(3);
+    });
+    const refreshRun = vi.fn(async () => {
+      streamWith(run({ status: "awaiting_approval", gate_revision: 4, plan_md: "# Plan four" }), submit, refreshRun);
+    });
+    renderGate(submit, refreshRun);
+    fireEvent.click(await screen.findByRole("button", { name: "Reject" }));
+    fireEvent.change(screen.getByPlaceholderText(/sent back to the agent/), { target: { value: "too broad" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+    });
+    await screen.findByText("Plan four");
+    expect(submit.mock.calls[0]).toEqual(["reject_plan", "too broad", undefined, undefined, undefined, 2]);
+
+    const restart = await screen.findByRole("button", { name: "Decide on the displayed plan (revision 4)" });
+    await waitFor(() => expect((restart as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(restart);
+    expect((screen.getByPlaceholderText(/sent back to the agent/) as HTMLTextAreaElement).value).toBe("too broad");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+    });
+    await waitFor(() => expect(submit).toHaveBeenCalledTimes(2));
+    expect(submit.mock.calls[1]).toEqual(["reject_plan", "too broad", undefined, undefined, undefined, 4]);
+  });
 });

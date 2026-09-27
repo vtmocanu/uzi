@@ -404,39 +404,104 @@ describe("PlanPanel — verdicts bound to the gate revision (PRD #1795 M4)", () 
     expect(h.onReject).toHaveBeenCalledWith("", 3);
   });
 
-  it("a mismatch shows the notice naming the current revision and re-binds the open composer to it", async () => {
+  // PRD #1795 B6: a refusal never re-points an open composer. The caller's refetch is bounded and
+  // may not land (or may show a revision other than the one the 409 reported), so the retry still
+  // names the revision the composer was opened on and is refused again, instead of being applied to
+  // a plan the owner has not seen. Re-binding is explicit, to the DISPLAYED plan (below).
+  const RESTART = /Decide on the displayed plan/;
+  const composers = [
+    {
+      name: "reject",
+      open: "Reject",
+      box: /sent back to the agent/,
+      send: "Send rejection",
+      calls: (h: Handlers) => h.onReject,
+    },
+    {
+      name: "request-changes",
+      open: "Request changes",
+      box: /sent to the planning session/,
+      send: /Send & revise/,
+      calls: (h: Handlers) => h.onRequestChanges,
+    },
+  ] as const;
+
+  for (const c of composers) {
+    it(`a mismatch keeps the open ${c.name} composer frozen, with the notice, before and after the refetch`, async () => {
+      const h = handlers();
+      const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+      fireEvent.click(screen.getByRole("button", { name: c.open }));
+      fireEvent.change(screen.getByPlaceholderText(c.box), { target: { value: "draft" } });
+      fireEvent.click(screen.getByRole("button", { name: c.send }));
+      expect(c.calls(h)).toHaveBeenLastCalledWith("draft", 2);
+
+      // The refusal arrives (current 3) but the refetch has not landed: plan two is still shown.
+      rerender(panel(run({ gate_revision: 2, plan_md: "plan two" }), h, { current: 3, expected: 2 }));
+      expect(
+        screen.getByText("Your decision was not applied: the run now shows plan revision 3. Review it and decide again."),
+      ).toBeTruthy();
+      // Nothing to re-bind to yet: the plan shown is the one the composer is frozen on.
+      expect(screen.queryByRole("button", { name: RESTART })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: c.send }));
+      expect(c.calls(h)).toHaveBeenLastCalledWith("draft", 2);
+
+      // The refetch lands with plan three: the retry is still bound to 2 (refused again server-side).
+      rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h, { current: 3, expected: 2 }));
+      expect(screen.getByText("plan three")).toBeTruthy();
+      const send = screen.getByRole("button", { name: c.send }) as HTMLButtonElement;
+      expect(send.disabled).toBe(false);
+      fireEvent.click(send);
+      expect(c.calls(h)).toHaveBeenLastCalledWith("draft", 2);
+      expect(c.calls(h)).toHaveBeenCalledTimes(3);
+    });
+
+    it(`the ${c.name} composer offers the restart only once a newer plan is displayed, and it binds to it`, async () => {
+      const h = handlers();
+      const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+      fireEvent.click(screen.getByRole("button", { name: c.open }));
+      expect(screen.queryByRole("button", { name: RESTART })).toBeNull();
+      fireEvent.change(screen.getByPlaceholderText(c.box), { target: { value: "keep this" } });
+
+      rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h, { current: 3, expected: 2 }));
+      const restart = screen.getByRole("button", { name: "Decide on the displayed plan (revision 3)" });
+      expect(screen.getByText(/This draft is for plan revision 2; the plan shown is revision 3/)).toBeTruthy();
+      fireEvent.click(restart);
+
+      // Re-bound: the offer is gone and the draft survives.
+      expect(screen.queryByRole("button", { name: RESTART })).toBeNull();
+      expect((screen.getByPlaceholderText(c.box) as HTMLTextAreaElement).value).toBe("keep this");
+      fireEvent.click(screen.getByRole("button", { name: c.send }));
+      expect(c.calls(h)).toHaveBeenLastCalledWith("keep this", 3);
+    });
+
+    // N+2: the 409 reported 3 but the refetch already shows 4. The restart binds to what is on
+    // screen (4), never to the reported revision (3), which the owner never saw.
+    it(`the ${c.name} restart binds to the displayed revision, not the one the 409 reported`, async () => {
+      const h = handlers();
+      const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+      fireEvent.click(screen.getByRole("button", { name: c.open }));
+      fireEvent.change(screen.getByPlaceholderText(c.box), { target: { value: "n+2" } });
+      fireEvent.click(screen.getByRole("button", { name: c.send }));
+
+      rerender(panel(run({ gate_revision: 4, plan_md: "plan four" }), h, { current: 3, expected: 2 }));
+      expect(screen.queryByRole("button", { name: "Decide on the displayed plan (revision 3)" })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Decide on the displayed plan (revision 4)" }));
+      expect((screen.getByPlaceholderText(c.box) as HTMLTextAreaElement).value).toBe("n+2");
+      fireEvent.click(screen.getByRole("button", { name: c.send }));
+      expect(c.calls(h)).toHaveBeenLastCalledWith("n+2", 4);
+    });
+  }
+
+  // With no composer open at the refusal, the next composer opens on the plan displayed at that
+  // moment (nothing carries the refused or reported revision forward).
+  it("after a mismatch with no composer open, the next composer binds to the displayed revision", async () => {
     const h = handlers();
     const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
     fireEvent.click(screen.getByRole("button", { name: "Reject" }));
-    fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
-    expect(h.onReject).toHaveBeenLastCalledWith("", 2);
-
-    // The server refused (409 gate_revision_mismatch, current 3); the caller refetched.
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h, { current: 3, expected: 2 }));
-    expect(
-      screen.getByText("Your decision was not applied: the run now shows plan revision 3. Review it and decide again."),
-    ).toBeTruthy();
-
-    fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
-    expect(h.onReject).toHaveBeenLastCalledWith("", 3);
-  });
-
-  // The open composer is re-frozen to the REPORTED revision, not left unfrozen: a refetch that
-  // has not landed yet (or that shows a revision other than the one refused against) must not
-  // decide what the next send binds to.
-  it("a mismatch re-freezes an open composer to the reported revision before the refetch lands", async () => {
-    const h = handlers();
-    const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
     fireEvent.click(screen.getByRole("button", { name: "Reject" }));
-    fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
-
-    // The refusal arrives; the run on screen is still the stale revision 2.
-    rerender(panel(run({ gate_revision: 2, plan_md: "plan two" }), h, { current: 3, expected: 2 }));
-    fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
-    expect(h.onReject).toHaveBeenLastCalledWith("", 3);
-
-    // A refetch that then shows revision 4 does not re-point the frozen composer either.
-    rerender(panel(run({ gate_revision: 4, plan_md: "plan four" }), h, { current: 3, expected: 2 }));
+    expect(screen.queryByRole("button", { name: RESTART })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
     expect(h.onReject).toHaveBeenLastCalledWith("", 3);
   });
