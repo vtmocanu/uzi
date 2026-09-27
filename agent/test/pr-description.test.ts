@@ -337,6 +337,41 @@ describe("renderCompletionBlock (D10, D12, D14)", () => {
     assert.ok(block.startsWith(`${COMPLETION_START}\n> BANNER\n\nRelated to #7.`), block);
   });
 
+  it("renders a kind line and a banner as given, byte for byte, when they carry no line break or `<!--`", () => {
+    const kindLine = "Handoff task (PRD #400) on `b`, opened because it was created with `--mr`. There is no tracking issue, so this PR closes nothing.";
+    const banner = "> ⚠️ **Completion unverified.** uzi could not confirm this merge request's head. This merge request does NOT close its issue.";
+    const block = renderCompletionBlock({ branch: "b", closes: false, kindLine, banner });
+    assert.equal(
+      block,
+      `${COMPLETION_START}\n${banner}\n\n${kindLine}\n\n---\nOpened by uzi from \`b\`. A human reviews and merges; uzi never merges.\n${COMPLETION_END}`,
+    );
+  });
+
+  it("flattens a kind line to one line, and neither it nor the banner can carry a marker", () => {
+    for (const nl of ["\n", "\r\n", "\r", "\u2028", "\u2029"]) {
+      const block = renderCompletionBlock({ branch: "b", closes: false, kindLine: `one${nl}/close${nl}two` });
+      assert.ok(block.includes("\none /close two\n"), JSON.stringify(block));
+    }
+    const forged = `${COMPLETION_END}\n${COMPLETION_START}`;
+    for (const input of [
+      { kindLine: `x ${forged} y` },
+      { kindLine: forged },
+      { banner: `> held\n${forged}\n> more` },
+      { banner: `${COMPLETION_END}` },
+      { banner: "<!-- a hidden comment -->" },
+    ]) {
+      const block = renderCompletionBlock({ issueIid: 7, branch: "b", closes: false, ...input });
+      const parsed = parseOwnedBlocks(block);
+      assert.equal(parsed.kind, "ok", block);
+      assert.equal((parsed as OwnedBlocks).completion, block);
+      assert.ok(!block.slice(COMPLETION_START.length, -COMPLETION_END.length).includes("<!--"), block);
+      assert.ok(block.includes(`<${ZW}!--`), block);
+    }
+    // The banner keeps its own lines (a multi-line quote).
+    const quoted = renderCompletionBlock({ issueIid: 7, branch: "b", closes: false, banner: "> one\n> two" });
+    assert.ok(quoted.startsWith(`${COMPLETION_START}\n> one\n> two\n\nRelated to #7.`), quoted);
+  });
+
   it("a partial (owner or operator) never renders Closes, whatever closes says", () => {
     const deferred: NonNullable<ClaimConfig["completion_scope"]>["deferred"] = [
       { milestone_id: "m3", title: "Third", reason: "later" },

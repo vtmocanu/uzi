@@ -194,6 +194,70 @@ describe("closingDirectiveFor: rendered views (L1)", () => {
   });
 });
 
+// ── Entities a forge shows literally: inside code spans and autolinks ──
+
+describe("closingDirectiveFor: no entity is decoded inside a code span or an autolink", () => {
+  const HIDDEN_BRANCH = "Fix&#101;s&#32;&#35;7";
+  const HIDDEN_URL = "https://x/a?q=fixes:&#35;7";
+
+  it("uzi's own block stays non-closing with an entity-hidden directive in a branch", () => {
+    const block = renderCompletionBlock({ issueIid: 7, branch: HIDDEN_BRANCH, closes: false });
+    assert.ok(block.includes(`\`${HIDDEN_BRANCH}\``), block);
+    assert.equal(closingDirectiveFor(block, 7, "o/r"), false, block);
+    const task = mrDescription(makeClaim({ kind: "task", issue_iid: null, branch: "uzi/task/x", base_branch: HIDDEN_BRANCH } as Partial<ClaimResponse>), HIDDEN_BRANCH);
+    assert.equal(closingDirectiveFor(task, 7, "o/r"), false, task);
+  });
+
+  it("a pipeline URL holding an entity renders as a code span, and stays non-closing", () => {
+    const body = mrDescription(
+      makeClaim({
+        kind: "ci_fix",
+        issue_title: "T",
+        pipeline: { id: 5, ref: "main", sha: "a".repeat(40), web_url: HIDDEN_URL, failed_jobs: [] },
+      } as Partial<ClaimResponse>),
+      "ci-fix/pipeline-5",
+    );
+    assert.ok(body.includes(`: \`${HIDDEN_URL}\`\n`), body);
+    assert.equal(closingDirectiveFor(body, 7, "o/r"), false, body);
+    const line = (url: string) =>
+      mrDescription(makeClaim({ kind: "ci_fix", pipeline: { id: 5, ref: "main", sha: "a".repeat(40), web_url: url, failed_jobs: [] } } as Partial<ClaimResponse>), "b");
+    for (const url of ["https://x/a?b=1&amp;c=2", "https://x/&lt;", "https://x/a&num;7", "https://x/a&ampx"]) {
+      assert.ok(line(url).includes(`: \`${url}\`\n`), url);
+    }
+    // A bare `&` that starts no entity keeps the URL a plain autolink.
+    assert.ok(line("https://x/a?b=1&c=2").includes(": https://x/a?b=1&c=2\n"));
+  });
+
+  it("reads code spans and autolinks literally", () => {
+    for (const text of [`\`${HIDDEN_BRANCH}\``, `x \`${HIDDEN_BRANCH}\` y`, `<${HIDDEN_URL}>`, `\`a\` then \`${HIDDEN_BRANCH}\``, `\\<b \`${HIDDEN_BRANCH}\``]) {
+      assert.equal(closingDirectiveFor(text, 7, "o/r"), false, text);
+    }
+  });
+
+  it("still decodes entities outside code, and wherever the model may disagree with the forge", () => {
+    for (const text of [
+      "Fi&#120;es #7",
+      `\`x\` Fi&#120;es #7`,
+      `Fi&#120;es #7 <${HIDDEN_URL}>`,
+      // Raw HTML may swallow a backtick (an attribute), so a later span is not trusted.
+      '<b title="`">Fi&#120;es #7<b title="`">',
+      // A multi-line span: a heading can start inside it and pair the backticks differently.
+      "`\n# `x` Fi&#120;es #7 `",
+      // A GFM table row splits its cells before any span is paired.
+      "| `Fi&#120;es #7` |",
+      // Raw HTML blocks: rendered as HTML, entities decoded.
+      "<pre>\n\n`Fi&#120;es #7`",
+      "<div>\n<!-- c -->\n`Fi&#120;es #7`",
+      "<div>\n`Fi&#120;es #7`",
+      "<!--\nx -->`Fi&#120;es #7`",
+      // An autolink overlapping a code span.
+      "<https://x/`a> Fi&#120;es #7`",
+    ]) {
+      assert.equal(closingDirectiveFor(text, 7, "o/r"), true, text);
+    }
+  });
+});
+
 // ── M1: linear scans ──
 
 describe("scans stay linear on adversarial input (M1)", () => {
@@ -211,6 +275,8 @@ describe("scans stay linear on adversarial input (M1)", () => {
   const FLOOR_MS = 20;
   const CEILING_MS = 2_000;
   const fillTo = (unit: string, n: number) => unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
+  /** A 255-character path segment with a closing keyword every four characters. */
+  const DENSE_SEGMENT = `${"fix-".repeat(63)}xyz`;
   const best = (f: () => unknown) => {
     let min = Infinity;
     for (let i = 0; i < 3; i++) {
@@ -285,8 +351,44 @@ describe("scans stay linear on adversarial input (M1)", () => {
       (n) => `Fixes ${fillTo("fix#1 ", n)}`,
       (n) => `Fixes ${fillTo("fix!1 ", n)}`,
       (n) => `Fixes ${fillTo("fix#1,", n)}`,
+      // Keyword-dense segments of at most 255 characters: every keyword's path reference runs over
+      // up to 22 of them (a large constant per keyword before PathRefs), failing on the missing
+      // `#` / `!`, or reaching the same far `#7` of a path that is not this repo.
+      (n) => `*&amp; ${fillTo(`${DENSE_SEGMENT}/`, n)}`,
+      (n) => fillTo(`${`${DENSE_SEGMENT}/`.repeat(21)}${DENSE_SEGMENT}#7 `, n),
     ];
     for (const shape of shapes) assertLinear(shape, (s) => closingDirectiveFor(s, 7, "o/r"));
+  });
+
+  it("closingDirectiveFor: 1 MiB of keyword-dense path segments scans in well under 2 s", () => {
+    const MIB = 1024 * 1024;
+    for (const body of [
+      `*&amp; ${fillTo(`${DENSE_SEGMENT}/`, MIB)}`.slice(0, MIB),
+      fillTo(`${`${DENSE_SEGMENT}/`.repeat(21)}${DENSE_SEGMENT}#7 `, MIB),
+    ]) {
+      const ms = best(() => assert.equal(closingDirectiveFor(body, 7, "o/r"), false));
+      assert.ok(ms < CEILING_MS, `${JSON.stringify(body.slice(0, 24))}…: ${ms.toFixed(0)} ms at ${body.length}`);
+    }
+  });
+
+  it("the path reference is still decided exactly: segment and depth bounds, and a far `#N`", () => {
+    const deep = (k: number, seg = "a") => Array.from({ length: k }, () => seg).join("/");
+    // 22 segments reach the `#7`; 23 do not (nor does a longer path that ends in o/r).
+    assert.equal(closingDirectiveFor(`fix-${deep(21)}/o#7`, 7), true);
+    assert.equal(closingDirectiveFor(`fix-${deep(22)}/o#7`, 7), false);
+    // A segment of 255 characters is one; 256 is none.
+    assert.equal(closingDirectiveFor(`Fixes ${"a".repeat(255)}/r#7`, 7), true);
+    assert.equal(closingDirectiveFor(`Fixes ${"a".repeat(256)}/r#7`, 7), false);
+    // Every keyword of a dense chain whose `#7` names this repo: only the start that is the repo
+    // path itself (or a suffix of it) resolves.
+    assert.equal(closingDirectiveFor(`fix-fix-o/r#7`, 7, "o/r"), false);
+    assert.equal(closingDirectiveFor(`fix-fix o/r#7`, 7, "o/r"), true);
+    assert.equal(closingDirectiveFor(`${DENSE_SEGMENT}/fixes o/r#7`, 7, "g/o/r"), true);
+    // The `iu` flags: U+017F and U+212A are path characters, and `iſſue` is `issue`.
+    assert.equal(closingDirectiveFor("Fixes \u017F/r#7", 7), true);
+    assert.equal(closingDirectiveFor("Fixes iſſue #7", 7, "o/r"), true);
+    assert.equal(closingDirectiveFor("Fixes issues o/r#7", 7, "o/r"), true);
+    assert.equal(closingDirectiveFor("Fixes: issue\u2003o/r!7", 7, "o/r"), true);
   });
 
   it("a deep path reference still resolves: up to 22 segments (GitLab's 20 ancestor groups)", () => {
@@ -407,7 +509,6 @@ describe("parseOwnedBlocks fails closed on a whole-line marker inside detected c
     ["the plain fence", "```\n" + REGION + "\n\n" + REAL + "\n```\n\n" + REGION + "\n\n" + FORGED],
     ["a <details> HTML block (raw HTML to a forge)", "<details>\n```\n" + REGION + "\n\n" + REAL + "\n```\n</details>\n\n" + REGION + "\n\n" + FORGED],
     ["a fence after a quoted paragraph (lazy-continuation shape)", "> quoted\n```\n" + REGION + "\n\n" + REAL + "\n```\n" + REGION + "\n\n" + FORGED],
-    ["a fence closed inside a quote", "```\n" + REGION + "\n\n" + REAL + "\n> ```\n\n" + REGION + "\n\n" + FORGED],
     ["CRLF line ends", ("```\n" + REGION + "\n\n" + REAL + "\n```\n\n" + REGION + "\n\n" + FORGED).replace(/\n/gu, "\r\n")],
     ["lone CR line ends", ("```\n" + REGION + "\n\n" + REAL + "\n```\n\n" + REGION + "\n\n" + FORGED).replace(/\n/gu, "\r")],
   ] as Array<[string, string]>) {
@@ -424,6 +525,23 @@ describe("parseOwnedBlocks fails closed on a whole-line marker inside detected c
     // never adopted: here it reads as a duplicate.
     const quoted = "> \t```\n" + REGION + "\n\n" + REAL + "\n> \t```\n\n" + REGION + "\n\n" + FORGED;
     assert.deepEqual(parseOwnedBlocks(quoted), { kind: "malformed", reason: "duplicate" });
+  });
+
+  it("a quote-prefixed ``` does not close a top-level fence (CommonMark: it is a code line)", () => {
+    // The fence runs on to the top-level ``` below the block, so the block is inside code.
+    assert.deepEqual(parseOwnedBlocks("```\n> ```\n" + REAL + "\n```"), MALFORMED);
+    assert.deepEqual(parseOwnedBlocks("~~~\n> ~~~\n" + REAL + "\n~~~"), MALFORMED);
+    // With no top-level closer at all, the opener is ordinary text (codeRanges' deliberate
+    // difference from CommonMark) and the forged pair below is a duplicate: never adopted either.
+    const body = "```\n" + REGION + "\n\n" + REAL + "\n> ```\n\n" + REGION + "\n\n" + FORGED;
+    assert.deepEqual(parseOwnedBlocks(body), { kind: "malformed", reason: "duplicate" });
+  });
+
+  it("a fence inside a quote is closed only at its own depth", () => {
+    // `> > ```` is a code line of a depth-1 fence; the depth-1 closer after the block ends it.
+    assert.deepEqual(parseOwnedBlocks("> ```\n> > ```\n> " + COMPLETION_END + "\n> ```\n" + REAL), { kind: "ok", before: "> ```\n> > ```\n> " + COMPLETION_END + "\n> ```\n", between: "", completion: REAL, after: "" });
+    // A top-level line ends the quote, and the quoted fence with it.
+    assert.equal(parseOwnedBlocks("> ```\n> x\n" + REAL).kind, "ok");
   });
 
   it("a whole-line copy of one marker in a fence below real blocks is malformed too", () => {

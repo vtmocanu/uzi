@@ -34,9 +34,10 @@
 //
 // closingDirectiveFor is the whole-body interlock scan (D10 rule 1): the api sanitizer's
 // prDescClosing pattern (with Forgejo's `!N` references) over the raw text and over a RENDERED view
-// that mirrors the api's prDescNormalize (entities decoded to a fixed point, format characters but
-// U+200B dropped, HTML comments, tags, images and link targets removed), each in the api's three
-// marker views, and extended to GitLab's reference lists (`Closes #1, #2 and #3`). It is a detector
+// that mirrors the api's prDescNormalize (entities decoded to a fixed point outside code spans and
+// autolinks, format characters but U+200B dropped, HTML comments, tags, images and link targets
+// removed), each in the api's three marker views, and extended to GitLab's reference lists
+// (`Closes #1, #2 and #3`). It is a detector
 // for text a forge may read as closing, so where the two could disagree it errs towards "closing".
 
 import { createHash } from "node:crypto";
@@ -81,17 +82,35 @@ const KEYWORD_SRC = String.raw`\b(clos(?:e[sd]?|ing)|fix(?:e[sd]|ing)?|resolv(?:
 // `(?=(x))\N` idiom: a segment is always followed by `/`, `#` or `!`, none of which it can hold,
 // so no shorter segment could match); a path has at most 22 segments (a GitLab group may have up to
 // 20 ancestor groups, so a project path is at most 21 groups and the project: GitHub and Forgejo
-// allow 2), so the path alternative reads at most 22 * 256 characters from any start, which keeps a
-// keyword-glued chain (`fix-/fix-/…`, a keyword at every segment) linear; and a URL's part before
-// `/issues/` is at most 300 characters (GitLab's own bound). Groups are numbered absolutely: no
-// pattern embedding REF_SRC captures before it.
-const REF_SRC =
-  String.raw`(?:[#!](\d+)|gh-(\d+)|((?=([\w.-]{1,255}))\4(?:\/(?=([\w.-]{1,255}))\5){0,21})[#!](\d+)|[A-Za-z][A-Za-z0-9_]+-(\d+)|(https?:\/\/[^\s<>()]{0,300}?)\/(?:issues|work_items)\/(\d+))`;
+// allow 2), so the path alternative reads at most 22 * 256 characters from any start; and a URL's
+// part before `/issues/` is at most 300 characters (GitLab's own bound). Groups are numbered
+// absolutely: no pattern embedding REF_SRC captures before it.
+//
+// That bound is still a large constant per keyword: in a keyword-dense chain (`fix-fix-…/`, a
+// keyword every four characters) every keyword's path alternative reads the rest of the chain.
+// So closingDirectiveFor never runs the path alternative as a regex after a keyword: PathRefs
+// decides it in O(1) per start from tables built once per view, and firstRef runs REF_NUM_SRC and
+// REF_TAIL_SRC (the alternatives before and after it) on their own, in the same order. A reference
+// list's continuation (NEXT_REF_RE) keeps the whole regex: it starts after a space or a comma,
+// which no path holds, so no two continuations read the same path.
+const REF_NUM_SRC = String.raw`[#!](\d+)|gh-(\d+)`;
+const REF_PATH_SRC = String.raw`((?=([\w.-]{1,255}))\4(?:\/(?=([\w.-]{1,255}))\5){0,21})[#!](\d+)`;
+const REF_TAIL_SRC = String.raw`[A-Za-z][A-Za-z0-9_]+-(\d+)|(https?:\/\/[^\s<>()]{0,300}?)\/(?:issues|work_items)\/(\d+)`;
+const REF_SRC = `(?:${REF_NUM_SRC}|${REF_PATH_SRC}|${REF_TAIL_SRC})`;
+/** REF_SRC's first two alternatives alone (groups: 1 = `#N` / `!N`, 2 = `gh-N`). */
+const REF_NUM_RE = new RegExp(`(?:${REF_NUM_SRC})`, "iuy");
+/** REF_SRC's last two alternatives alone (groups: 1 = a tracker key's number, 2/3 = a URL's part
+ *  before `/issues|work_items/`, and N). */
+const REF_TAIL_RE = new RegExp(`(?:${REF_TAIL_SRC})`, "iuy");
 const SP = String.raw`[\s\p{Z}]`;
 const KEYWORD_RE = new RegExp(KEYWORD_SRC, "giu");
+/** closingDirectiveFor's own copy, driven by exec and lastIndex: an early return leaves its
+ *  lastIndex set, which String.prototype.matchAll would inherit if the two shared one regex. */
+const KEYWORD_SCAN_RE = new RegExp(KEYWORD_SRC, "giu");
 /** The first reference after a keyword, prDescClosing's tail (sticky at the keyword end). The Go
  *  `SP*:?SP*` is spelled `SP*(?::SP*)?` (the same language): two adjacent stars over one class
- *  backtrack quadratically on a long space run in V8. */
+ *  backtrack quadratically on a long space run in V8. breakClosingKeywords runs it over short
+ *  deterministic strings; closingDirectiveFor runs the same match as firstRef. */
 const FIRST_REF_RE = new RegExp(`${SP}*(?::${SP}*)?(?:issues?${SP}*)?${REF_SRC}`, "iuy");
 /** A further reference of a GitLab reference list (`#1, #2 and issue #3`): a comma and/or `and`
  *  separator, or plain whitespace, then an optional `issue(s)`. */
@@ -99,6 +118,7 @@ const NEXT_REF_RE = new RegExp(`(?:${SP}*,${SP}*(?:and${SP}+)?|${SP}+and${SP}+|$
 
 /** The characters a closing-directive VIEW removes or blanks (prDescClosingMarkers). */
 const CLOSING_MARKERS = "*_~`[]\\";
+const CLOSING_MARKERS_RE = /[*_~`[\]\\]/gu;
 
 interface View {
   text: string;
@@ -107,8 +127,10 @@ interface View {
 }
 
 /** The three views the api scans (neutralizeClosingDirectives): the text itself, the markers
- *  REMOVED (`Fix**es** #12` reads `Fixes #12`), and the markers BLANKED (`a_Fixes #12`). */
-function closingViews(s: string): View[] {
+ *  REMOVED (`Fix**es** #12` reads `Fixes #12`), and the markers BLANKED (`a_Fixes #12`). `withMap`
+ *  adds the removed view's index map (breakClosingKeywords maps a match back; the scan needs none). */
+function closingViews(s: string, withMap = false): View[] {
+  if (!withMap) return [{ text: s }, { text: s.replace(CLOSING_MARKERS_RE, "") }, { text: s.replace(CLOSING_MARKERS_RE, " ") }];
   let removed = "";
   const map: number[] = [];
   let blanked = "";
@@ -296,14 +318,47 @@ function stripMarkup(s: string): string {
   return s;
 }
 
+/** Stands in for `&` where a forge shows it literally: no entity starts with it, and it is no more
+ *  part of a closing directive than `&` is (not a word, space, path or reference character). */
+const LITERAL_AMP = "\uE000";
+// An HTML block a forge renders raw however far it runs (CommonMark types 1, 3, 4 and 5: `<pre>`,
+// `<script>`, `<style>`, `<textarea>`, `<?`, `<!X`, `<![CDATA[`), matched anywhere (conservative):
+// nothing at or after it is kept literal.
+const RAW_HTML_BLOCK_RE = /<(?:pre|script|style|textarea)(?![A-Za-z0-9-])|<\?|<![A-Za-z]|<!\[CDATA\[/iu;
+
+/**
+ * `s` with every `&` inside an inline code span or an autolink target replaced by LITERAL_AMP, so
+ * renderedView does not decode an entity there: no forge does (`Fix&#101;s&#32;&#35;7` in a code
+ * span shows as written, and reads as no directive). Only the spans collectLiteral is sure a forge
+ * also sees as code or an autolink, and none at or after a raw HTML block, are touched; everything
+ * else is decoded as before.
+ */
+function keepLiteralEntities(s: string): string {
+  if (!s.includes("&")) return s;
+  const literal: Array<[number, number]> = [];
+  codeRanges(s, literal);
+  const raw = s.search(RAW_HTML_BLOCK_RE);
+  const stop = raw < 0 ? s.length : raw;
+  let out = "";
+  let i = 0;
+  for (const [a, b] of literal) {
+    if (b > stop) break;
+    out += s.slice(i, a) + s.slice(a, b).replaceAll("&", LITERAL_AMP);
+    i = b;
+  }
+  return i === 0 ? s : out + s.slice(i);
+}
+
 /**
  * The text as a forge renders it, for the closing scan: prDescNormalize's fixed-point loop
  * (entities decoded to their own fixed point, controls and format characters stripped, HTML
- * comments, known tags, images and link targets removed) with two differences: U+200B is kept
- * (see stripFormat), and whitespace is not collapsed (the closing pattern reads any space run).
+ * comments, known tags, images and link targets removed) with three differences: U+200B is kept
+ * (see stripFormat), whitespace is not collapsed (the closing pattern reads any space run), and no
+ * entity is decoded inside a code span or an autolink a forge shows literally (keepLiteralEntities).
  * undefined when MAX_PASSES passes did not converge (the caller fails closed).
  */
 function renderedView(s: string): string | undefined {
+  s = keepLiteralEntities(s);
   for (let i = 0; i < MAX_PASSES; i++) {
     const prev = s;
     s = stripMarkup(stripFormat(decodeEntities(s)));
@@ -312,16 +367,150 @@ function renderedView(s: string): string | undefined {
   return undefined;
 }
 
-/** For each index, the end of the run of ASCII path characters (`[A-Za-z0-9_.-]`) starting there. */
-function pathRunEnds(text: string): Int32Array {
-  const n = text.length;
-  const out = new Int32Array(n + 1).fill(n);
-  for (let i = n - 1; i >= 0; i--) {
-    const c = text.charCodeAt(i);
-    const path = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 46 || c === 45;
-    out[i] = path ? out[i + 1]! : i;
+/** Whether a UTF-16 code unit is in REF_SRC's path class `[\w.-]` under its `iu` flags: ASCII
+ *  letters, digits, `_`, `.`, `-`, and the two non-ASCII characters that case-fold to ASCII word
+ *  letters (U+017F LATIN SMALL LETTER LONG S and U+212A KELVIN SIGN). */
+function isPathCode(c: number): boolean {
+  return (
+    (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 46 || c === 45 || c === 0x17f || c === 0x212a
+  );
+}
+
+/** A segment's length bound and the extra segments a path may have (REF_PATH_SRC). */
+const PATH_SEGMENT_MAX = 255;
+const PATH_EXTRA_SEGMENTS = 21;
+
+/**
+ * REF_PATH_SRC decided without a regex, for one view. Its segments are atomic, so from a start the
+ * path is forced: the maximal `[\w.-]` run (at most 255 long), then either `[#!]` and a digit (the
+ * reference) or `/` and the next maximal run, up to 21 more times. Tables built right to left in
+ * one pass give, for every run end, how many further segments reach a `[#!]\d` and where it is, so
+ * `at(start)` is O(1), and the digits after one `#` / `!` are read once however many keywords share
+ * it (a keyword-dense chain ending in one reference).
+ */
+class PathRefs {
+  private readonly runEnd: Int32Array;
+  /** At a run end q: the further segments before the reference's `[#!]` (255 when none). */
+  private readonly more: Uint8Array;
+  /** At a run end q with a finite `more`: the index of that `[#!]`. */
+  private readonly hash: Int32Array;
+  private readonly digits = new Map<number, { end: number; same: boolean }>();
+  private readonly repoMax: number | undefined;
+
+  constructor(
+    private readonly text: string,
+    private readonly iid: number,
+    private readonly repoPath: string | undefined,
+  ) {
+    const n = text.length;
+    this.runEnd = new Int32Array(n + 1);
+    this.more = new Uint8Array(n + 1).fill(255);
+    this.hash = new Int32Array(n + 1).fill(-1);
+    this.runEnd[n] = n;
+    for (let q = n - 1; q >= 0; q--) {
+      const c = text.charCodeAt(q);
+      if (isPathCode(c)) {
+        this.runEnd[q] = this.runEnd[q + 1]!;
+        continue;
+      }
+      this.runEnd[q] = q;
+      if (c === 35 || c === 33) {
+        const d = text.charCodeAt(q + 1);
+        if (d >= 48 && d <= 57) {
+          this.more[q] = 0;
+          this.hash[q] = q;
+        }
+      } else if (c === 47 && q + 1 < n && isPathCode(text.charCodeAt(q + 1))) {
+        const e = this.runEnd[q + 1]!;
+        if (e - (q + 1) <= PATH_SEGMENT_MAX && this.more[e]! < PATH_EXTRA_SEGMENTS) {
+          this.more[q] = this.more[e]! + 1;
+          this.hash[q] = this.hash[e]!;
+        }
+      }
+    }
+    // pathCouldBe never holds for a path longer than the repo path plus a `.git` suffix (normalizePath
+    // removes at most that; lowercasing keeps every path character one code unit).
+    this.repoMax = repoPath ? normalizePath(repoPath).length + 4 : undefined;
   }
-  return out;
+
+  /** The path alternative at `start`: where the match ends and whether it resolves, or undefined. */
+  at(start: number): RefHit | undefined {
+    if (start >= this.text.length || !isPathCode(this.text.charCodeAt(start))) return undefined;
+    const e = this.runEnd[start]!;
+    if (e - start > PATH_SEGMENT_MAX || this.more[e]! > PATH_EXTRA_SEGMENTS) return undefined;
+    const h = this.hash[e]!;
+    let d = this.digits.get(h);
+    if (!d) {
+      let end = h + 1;
+      while (end < this.text.length && this.text.charCodeAt(end) >= 48 && this.text.charCodeAt(end) <= 57) end++;
+      d = { end, same: sameNumber(this.text.slice(h + 1, end), this.iid) };
+      this.digits.set(h, d);
+    }
+    const resolves =
+      d.same && (this.repoMax === undefined || h - start <= this.repoMax) && pathCouldBe(this.text.slice(start, h), this.repoPath);
+    return { end: d.end, resolves };
+  }
+}
+
+interface RefHit {
+  /** Where the reference ends (the regex's lastIndex). */
+  end: number;
+  resolves: boolean;
+}
+
+const SP_RUN_RE = new RegExp(`${SP}*`, "uy");
+const ISSUE_WORD_RE = /issue/iuy;
+const S_LETTER_RE = /s/iuy;
+
+function spaceRunEnd(text: string, at: number): number {
+  SP_RUN_RE.lastIndex = at;
+  SP_RUN_RE.exec(text);
+  return SP_RUN_RE.lastIndex;
+}
+
+/**
+ * The positions FIRST_REF_RE's reference can start at after `SP*(?::SP*)?(?:issues?SP*)?` from
+ * `at`, in the order its backtracking tries them. Only starts where a reference could begin are
+ * listed: every other one the prefix reaches holds a space or `:`, which no alternative starts with.
+ */
+function refStarts(text: string, at: number): number[] {
+  // The common case, answered without a regex: a printable ASCII character other than `:` and `i`
+  // (no space, no colon and no `issue` to skip), so the reference can only start right here.
+  const c = text.charCodeAt(at);
+  if (c > 32 && c < 127 && c !== 58 && c !== 73 && c !== 105) return [at];
+  const a = spaceRunEnd(text, at);
+  const y = text[a] === ":" ? spaceRunEnd(text, a + 1) : a;
+  ISSUE_WORD_RE.lastIndex = y;
+  if (!ISSUE_WORD_RE.test(text)) return [y];
+  S_LETTER_RE.lastIndex = y + 5;
+  if (S_LETTER_RE.test(text)) return [spaceRunEnd(text, y + 6), y + 5, y];
+  return [spaceRunEnd(text, y + 5), y];
+}
+
+/** FIRST_REF_RE from a keyword's end, with its path alternative decided by PathRefs: at each start
+ *  in backtracking order, the alternatives in REF_SRC's order; the first that matches wins (nothing
+ *  follows the reference, so no later backtracking can change it). */
+function firstRef(text: string, at: number, paths: PathRefs, iid: number, repoPath: string | undefined): RefHit | undefined {
+  for (const z of refStarts(text, at)) {
+    // Each regex runs only where its first character is: REF_NUM_SRC starts with `#`, `!` or `g`,
+    // REF_TAIL_SRC with a letter (`[A-Za-z]` or `h`, which `iu` also matches as U+017F / U+212A).
+    const c = text.charCodeAt(z);
+    if (c === 35 || c === 33 || c === 103 || c === 71) {
+      REF_NUM_RE.lastIndex = z;
+      const m = REF_NUM_RE.exec(text);
+      if (m) return { end: REF_NUM_RE.lastIndex, resolves: sameNumber(m[1], iid) || sameNumber(m[2], iid) };
+    }
+    const path = paths.at(z);
+    if (path) return path;
+    if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 0x17f || c === 0x212a)) continue;
+    REF_TAIL_RE.lastIndex = z;
+    const m = REF_TAIL_RE.exec(text);
+    if (m) {
+      const resolves = sameNumber(m[1], iid) || (m[2] !== undefined && sameNumber(m[3], iid) && urlCouldBe(m[2], repoPath));
+      return { end: REF_TAIL_RE.lastIndex, resolves };
+    }
+  }
+  return undefined;
 }
 
 function sameNumber(digits: string | undefined, iid: number): boolean {
@@ -389,7 +578,7 @@ export function closingDirectiveFor(body: string, issueIid: number, repoPath?: s
   const views = new Set(closingViews(body).map((v) => v.text));
   if (rendered !== body) for (const v of closingViews(rendered)) views.add(v.text);
   for (const text of views) {
-    let runs: Int32Array | undefined;
+    let paths: PathRefs | undefined;
     // The positions a reference-list continuation (NEXT_REF_RE) has already been tried at in this
     // view. A continuation's outcome depends only on where it starts, and a walk that found a
     // resolving reference has already returned, so a walk that reaches a visited position would only
@@ -399,27 +588,22 @@ export function closingDirectiveFor(body: string, issueIid: number, repoPath?: s
     // is a path reference (`fix`, which may not be this repo) to the outer walk, but its own keyword
     // then reads a bare `#7`; here that inner keyword's first reference is still tried.
     const tried = new Uint8Array(text.length + 1);
-    for (const kw of text.matchAll(KEYWORD_RE)) {
-      const end = kw.index + kw[0].length;
-      // A keyword glued to `.` / `-` (`fix-fix-…`) can only be followed by a path reference that
-      // starts right there; when that run of path characters is over 255 long no reference can
-      // match, so skip the regex, which would otherwise pay up to 255 steps per such keyword.
-      if (text[end] === "." || text[end] === "-") {
-        runs ??= pathRunEnds(text);
-        if (runs[end]! - end > 255) continue;
-      }
-      let re = FIRST_REF_RE;
-      re.lastIndex = end;
-      let m = re.exec(text);
-      while (m) {
-        if (refResolves(m, issueIid, repoPath)) return true;
-        // Follow a GitLab reference list from where this reference ended (sticky regexes).
-        const next = re.lastIndex;
-        if (tried[next]) break;
+    KEYWORD_SCAN_RE.lastIndex = 0;
+    for (let kw = KEYWORD_SCAN_RE.exec(text); kw; kw = KEYWORD_SCAN_RE.exec(text)) {
+      const at = KEYWORD_SCAN_RE.lastIndex;
+      paths ??= new PathRefs(text, issueIid, repoPath);
+      const hit = firstRef(text, at, paths, issueIid, repoPath);
+      if (!hit) continue;
+      if (hit.resolves) return true;
+      // Follow a GitLab reference list from where this reference ended (a sticky regex).
+      let next = hit.end;
+      while (!tried[next]) {
         tried[next] = 1;
         NEXT_REF_RE.lastIndex = next;
-        re = NEXT_REF_RE;
-        m = re.exec(text);
+        const m = NEXT_REF_RE.exec(text);
+        if (!m) break;
+        if (refResolves(m, issueIid, repoPath)) return true;
+        next = NEXT_REF_RE.lastIndex;
       }
     }
   }
@@ -435,7 +619,7 @@ export function closingDirectiveFor(body: string, issueIid: number, repoPath?: s
  */
 function breakClosingKeywords(s: string, mode: "all" | "directives"): string {
   const at = new Set<number>();
-  for (const view of closingViews(s)) {
+  for (const view of closingViews(s, true)) {
     for (const m of view.text.matchAll(KEYWORD_RE)) {
       if (mode === "directives") {
         const end = m.index + m[0].length;
@@ -530,11 +714,14 @@ export function codeSpan(s: string): string {
 }
 
 /** A URL the api sent (the ci_fix pipeline URL), as a bare http(s) URL a forge autolinks when it is
- *  plainly one (no whitespace, no markdown or HTML syntax, no closing directive), else as a code
- *  span, so an odd value can never inject markup, a link or a directive into the completion block. */
+ *  plainly one (no whitespace, no markdown or HTML syntax, no character entity, no closing
+ *  directive), else as a code span, so an odd value can never inject markup, a link or a directive
+ *  into the completion block. An entity (`fixes:&#35;7`) is refused because a bare URL is ordinary
+ *  text to closingDirectiveFor's rendered view, which decodes it; inside a code span it is not. */
 export function urlOrCodeSpan(url: string): string {
   const t = url.trim();
-  const plain = /^https?:\/\/[^\s<>()[\]`*~\\"'{}|$!@]+$/iu.test(t) && breakClosingKeywords(t, "directives") === t;
+  const plain =
+    /^https?:\/\/[^\s<>()[\]`*~\\"'{}|$!@]+$/iu.test(t) && decodeEntitiesOnce(t) === t && breakClosingKeywords(t, "directives") === t;
   return plain ? t : codeSpan(t);
 }
 
@@ -770,7 +957,9 @@ export interface CompletionBlockInput {
   /** The source branch, for the footer. */
   branch: string;
   /** D14: a kind's one-line completion sentence. When set, the issue arm (Related/Closes, partial,
-   *  accepted, gates) is NOT rendered, exactly as a per-kind body replaced it before. */
+   *  accepted, gates) is NOT rendered, exactly as a per-kind body replaced it before. Rendered as
+   *  given (it carries the caller's own escaped spans) but for its line breaks, which become spaces,
+   *  and `<!--`, which is broken (neutraliseMarkers). */
   kindLine?: string;
   /** Sections a kind carries after its line (the self_improve evidence, the prompt run's
    *  guard-critical paths), as structured KindSection data that this renderer escapes. */
@@ -785,7 +974,8 @@ export interface CompletionBlockInput {
   gatesDiscoveryTruncated?: boolean;
   /** The pushed history contains an ancestry bridge (PRD #1416). */
   bridged?: boolean;
-  /** The completion-unverified banner (PRD #1225), rendered first inside the block. */
+  /** The completion-unverified banner (PRD #1225), rendered first inside the block, trimmed, with
+   *  `<!--` broken (neutraliseMarkers); its lines are kept (a banner may be a multi-line quote). */
   banner?: string;
   /** D12: the head the published region describes vs. the PR's current head; a staleness line is
    *  rendered only when they differ. */
@@ -866,6 +1056,17 @@ function issueArm(input: CompletionBlockInput): string[] {
   return lines;
 }
 
+// Every line break a forge reads (CommonMark's three, and the Unicode line and paragraph
+// separators), so a kind line stays the one line D14 promises.
+const LINE_BREAKS_RE = /\r\n|[\r\n\u2028\u2029]/gu;
+
+/** `<!--` broken with U+200B, as codeSpan does, so a caller's text (the kind line, the banner) can
+ *  never carry a block marker, or any HTML comment, into the completion block. Text without `<!--`
+ *  is returned unchanged, so today's fixed wording is byte-identical. */
+function neutraliseMarkers(s: string): string {
+  return s.replace(/<!--/gu, `<${ZWSP}!--`);
+}
+
 /**
  * Render the completion block. Its content keeps today's wording and meaning (mrDescription before
  * PRD #1798), inside the markers: the banner, then either the kind's one-liner (D14) with its
@@ -875,9 +1076,9 @@ function issueArm(input: CompletionBlockInput): string[] {
 export function renderCompletionBlock(input: CompletionBlockInput): string {
   const paras: string[] = [];
   const banner = input.banner?.trim();
-  if (banner) paras.push(banner);
+  if (banner) paras.push(neutraliseMarkers(banner));
   if (input.kindLine !== undefined) {
-    paras.push(input.kindLine);
+    paras.push(neutraliseMarkers(input.kindLine.replace(LINE_BREAKS_RE, " ")));
   } else {
     paras.push(issueArm(input).join("\n"));
   }
@@ -970,35 +1171,55 @@ function quoteDepth(text: string): number {
 
 /**
  * The spans of `body` that are code, where a marker-shaped string is text, not a marker (L2): fenced
- * code blocks (``` or ~~~, inside block quotes too) and inline code spans (a backtick run closed by
- * the next run of the same length within one paragraph). Sorted, disjoint, [start, end).
+ * code blocks (``` or ~~~, inside block quotes too, closed only by a fence at the opener's quote
+ * depth, as in CommonMark: `> ```` inside a top-level fence is a code line) and inline code spans
+ * (a backtick run closed by the next run of the same length within one paragraph). Sorted,
+ * disjoint, [start, end). `literal`, when given, also receives the ranges collectLiteral keeps
+ * literal for renderedView.
  *
  * One deliberate difference from CommonMark: a fence with no closing fence (and not ended by its
  * block quote ending) is NOT treated as code. CommonMark runs it to the end of the document, which
  * would let one stray fence in human text above uzi's blocks hide them, and uzi would then lose its
  * own blocks; here the opener is ordinary text. Linear: fence closure is decided from suffix tables.
  */
-function codeRanges(body: string): Array<[number, number]> {
+function codeRanges(body: string, literal?: Array<[number, number]>): Array<[number, number]> {
   const lines = linesOf(body);
   const n = lines.length;
-  // For each line index i: the longest closing fence of each kind strictly after i, and the lowest
-  // quote depth strictly after i, so "does this opener ever close" is O(1).
-  const maxTick = new Int32Array(n + 1);
-  const maxTilde = new Int32Array(n + 1);
+  // For each line index i: the longest closing fence of each kind strictly after i AT LINE i's QUOTE
+  // DEPTH (a closer only closes a fence at its own depth: `> ```` inside a top-level fence is code,
+  // and a top-level ``` inside a quoted fence ends the quote first), and the lowest quote depth
+  // strictly after i, so "does this opener ever close" is O(1).
+  const maxTick = new Int32Array(n);
+  const maxTilde = new Int32Array(n);
   const minDepth = new Int32Array(n + 1).fill(2 ** 30);
   const depth = lines.map((l) => quoteDepth(l.text));
+  const closersAt = new Map<number, { tick: number; tilde: number }>();
   for (let i = n - 1; i >= 0; i--) {
+    const d = depth[i]!;
+    const after = closersAt.get(d);
+    maxTick[i] = after?.tick ?? 0;
+    maxTilde[i] = after?.tilde ?? 0;
+    minDepth[i] = Math.min(minDepth[i + 1]!, d);
     const c = FENCE_CLOSE_RE.exec(lines[i]!.text);
-    const len = c ? c[1]!.length : 0;
-    maxTick[i] = Math.max(maxTick[i + 1]!, c && c[1]![0] === "`" ? len : 0);
-    maxTilde[i] = Math.max(maxTilde[i + 1]!, c && c[1]![0] === "~" ? len : 0);
-    minDepth[i] = Math.min(minDepth[i + 1]!, depth[i]!);
+    if (!c) continue;
+    const len = c[1]!.length;
+    const tick = Math.max(maxTick[i]!, c[1]![0] === "`" ? len : 0);
+    const tilde = Math.max(maxTilde[i]!, c[1]![0] === "~" ? len : 0);
+    closersAt.set(d, { tick, tilde });
   }
   const ranges: Array<[number, number]> = [];
   const tick = nextIndex(body, "`");
-  let para: { from: number; to: number } | undefined;
+  let para: { from: number; to: number; clean: boolean } | undefined;
+  // Whether the next paragraph starts a block of its own: after a blank line (or the body's start),
+  // with at most whole-line HTML comments between. A paragraph that directly follows other text or a
+  // fence may be the tail of an HTML block, which a forge renders raw (collectLiteral).
+  let clean = true;
   const flushPara = () => {
-    if (para && tick[para.from]! < para.to) for (const r of inlineCodeRanges(body, tick, para.from, para.to)) ranges.push(r);
+    if (para) {
+      const spans = tick[para.from]! < para.to ? inlineCodeRanges(body, tick, para.from, para.to) : [];
+      for (const r of spans) ranges.push(r);
+      if (literal && para.clean) collectLiteral(body, para.from, para.to, spans, literal);
+    }
     para = undefined;
   };
   for (let i = 0; i < n; i++) {
@@ -1008,7 +1229,7 @@ function codeRanges(body: string): Array<[number, number]> {
       const ch = open[2]![0]!;
       const len = open[2]!.length;
       const d = depth[i]!;
-      const closes = (ch === "`" ? maxTick[i + 1]! : maxTilde[i + 1]!) >= len || (d > 0 && minDepth[i + 1]! < d);
+      const closes = (ch === "`" ? maxTick[i]! : maxTilde[i]!) >= len || (d > 0 && minDepth[i + 1]! < d);
       if (closes) {
         flushPara();
         let j = i + 1;
@@ -1020,22 +1241,27 @@ function codeRanges(body: string): Array<[number, number]> {
             j--;
             break;
           }
-          const c = FENCE_CLOSE_RE.exec(l.text);
+          const c = depth[j] === d ? FENCE_CLOSE_RE.exec(l.text) : null;
           if (c && c[1]![0] === ch && c[1]!.length >= len) {
             end = l.next;
             break;
           }
         }
         ranges.push([line.start, end]);
+        clean = false;
         i = j;
         continue;
       }
     }
     if (PARA_BREAK_RE.test(line.text)) {
       flushPara();
+      const open = line.text.indexOf("<!--");
+      if (open < 0) clean = true;
+      else if (!line.text.includes("-->", open + 4)) clean = false;
       continue;
     }
-    para = para ? { from: para.from, to: line.next } : { from: line.start, to: line.next };
+    para = para ? { from: para.from, to: line.next, clean: para.clean } : { from: line.start, to: line.next, clean };
+    clean = false;
   }
   flushPara();
   return ranges;
@@ -1083,6 +1309,65 @@ function inlineCodeRanges(body: string, tick: Int32Array, from: number, to: numb
     k = list[p]!;
   }
   return out;
+}
+
+/** Whether the character at `at` is backslash-escaped (an odd run of backslashes before it). */
+function escapedAt(text: string, at: number): boolean {
+  let k = at - 1;
+  while (k >= 0 && text[k] === "\\") k--;
+  return (at - 1 - k) % 2 === 1;
+}
+
+/** The first `<` at or after `from` that is not backslash-escaped, or text.length. */
+function nextLiveLt(text: string, from: number): number {
+  let k = text.indexOf("<", from);
+  while (k >= 0 && escapedAt(text, k)) k = text.indexOf("<", k + 1);
+  return k < 0 ? text.length : k;
+}
+
+/**
+ * The inline code spans and autolink targets of one paragraph (body[from, to), `spans` its inline
+ * code) that a forge shows literally, so renderedView leaves their entities undecoded. Only where
+ * this model is known to agree with the forge; everything else is left out, so the rendered view
+ * decodes it (towards "closing"). A range is collected only while, before it in the paragraph:
+ * there is no live `<` outside code (it could open raw HTML whose attribute swallows a backtick),
+ * no multi-line span (a heading, list item or other block could start inside it and pair the
+ * backticks differently), and no autolink overlapping a span. A paragraph with an unescaped `|`
+ * (a GFM table row splits its cells before any span is paired) collects nothing. Linear in the
+ * paragraph: it is read through its own slice, never past its end.
+ */
+function collectLiteral(
+  body: string,
+  from: number,
+  to: number,
+  spans: ReadonlyArray<[number, number]>,
+  out: Array<[number, number]>,
+): void {
+  const seg = body.slice(from, to);
+  for (let k = seg.indexOf("|"); k >= 0; k = seg.indexOf("|", k + 1)) if (!escapedAt(seg, k)) return;
+  const links: Array<[number, number]> = [];
+  if (seg.includes("<")) for (const m of seg.matchAll(AUTOLINK_RE)) links.push([m.index, m.index + m[0].length]);
+  let k = 0;
+  let lt = nextLiveLt(seg, 0); // only moves forward, so the paragraph is read once
+  let si = 0;
+  let li = 0;
+  while (si < spans.length || li < links.length) {
+    const span = si < spans.length ? ([spans[si]![0] - from, spans[si]![1] - from] as const) : undefined;
+    const link = li < links.length ? links[li]! : undefined;
+    const isSpan = span !== undefined && (link === undefined || span[0] < link[0]);
+    const [a, b] = isSpan ? span! : link!;
+    if (a < k || lt < a) return; // an overlap, or a `<` that may open raw HTML
+    if (isSpan) {
+      si++;
+      if (/[\r\n]/u.test(seg.slice(a, b))) return;
+      out.push([from + a, from + b]);
+    } else {
+      li++;
+      out.push([from + a + 1, from + b - 1]);
+    }
+    k = b;
+    if (lt < k) lt = nextLiveLt(seg, k);
+  }
 }
 
 interface FoundMarker {
