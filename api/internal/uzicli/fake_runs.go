@@ -21,6 +21,7 @@ func (f *FakeClient) ListRuns(ctx context.Context) ([]apitypes.RunListItemDTO, e
 
 func (f *FakeClient) GetRun(ctx context.Context, id string) (apitypes.RunDTO, error) {
 	f.LastGetRunCtx = ctx
+	f.RunVerbCalls = append(f.RunVerbCalls, "get_run")
 	if f.Err != nil {
 		return apitypes.RunDTO{}, f.Err
 	}
@@ -180,6 +181,7 @@ func (f *FakeClient) ResumeRunNow(_ context.Context, id string) (apitypes.RunDTO
 // the right args; SetRunCredentialErr wins over the blanket Err.
 func (f *FakeClient) SetRunCredential(_ context.Context, id string, override SetRunCredentialOverride) (apitypes.RunDTO, string, error) {
 	f.LastSetTokenRunID = id
+	f.RunVerbCalls = append(f.RunVerbCalls, "set_run_credential")
 	ov := override
 	f.LastSetTokenOverride = &ov
 	if f.SetRunCredentialErr != nil {
@@ -351,6 +353,7 @@ func (f *FakeClient) DispatchTaskRun(_ context.Context, runID string) (apitypes.
 
 func (f *FakeClient) SubmitRunInput(_ context.Context, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool, expectedGateRevision *int64) (apitypes.RunInputResponse, error) {
 	f.LastInputRunID = runID
+	f.RunVerbCalls = append(f.RunVerbCalls, "submit_run_input")
 	f.LastInputKind = kind
 	f.LastInputBody = body
 	f.LastInputSelection = sel

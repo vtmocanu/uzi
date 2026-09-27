@@ -293,6 +293,9 @@ type steerResultMsg struct {
 	kind  string
 	res   apitypes.RunInputResponse
 	err   error
+	// expected is the plan-gate revision the verdict was sent against (PRD #1795 D5), nil
+	// when none was sent, so a refusal can tell a same-revision race from a newer plan.
+	expected *int64
 }
 
 type runInputsMsg struct {
@@ -317,7 +320,7 @@ func (m tuiModel) submitSteerCmd(kind, body string, expectedGateRevision *int64)
 	c, ctx, runID := m.client, m.ctx, m.detail.runID
 	return func() tea.Msg {
 		res, err := c.SubmitRunInput(ctx, runID, kind, body, nil, false, expectedGateRevision)
-		return steerResultMsg{runID: runID, kind: kind, res: res, err: err}
+		return steerResultMsg{runID: runID, kind: kind, res: res, err: err, expected: expectedGateRevision}
 	}
 }
 
@@ -340,16 +343,25 @@ func gateMismatch(err error) (int64, bool) {
 	return 0, false
 }
 
+// gateMismatchNotice is the notice line for a verdict refused with the typed 409 (PRD #1795
+// D5). Nothing was written; the caller re-reads the run so the view catches up. The wording
+// claims only what the numbers support: current == expected means the write lost a race at
+// the same revision (the run may still be at that gate), so it asks for a re-check and retry
+// rather than saying the plan changed; current 0 means no plan gate with a revision is shown.
+func gateMismatchNotice(expected *int64, current int64) string {
+	switch {
+	case current <= 0:
+		return "the run shows no plan gate revision to act on (nothing was applied)"
+	case expected != nil && *expected == current:
+		return fmt.Sprintf("the verdict for plan revision %d was not applied: the gate changed while it was sent; re-check the run and retry", current)
+	default:
+		return fmt.Sprintf("the run now shows plan revision %d: review it before deciding (nothing was applied)", current)
+	}
+}
+
 func (m *tuiModel) applySteerResult(msg steerResultMsg) {
 	if cur, ok := gateMismatch(msg.err); ok {
-		// Nothing was written: the plan on screen is not the one at the gate any more (or the
-		// run left the gate). Say so plainly and name the revision to review; the caller
-		// re-reads the run so the view catches up.
-		if cur > 0 {
-			m.detail.steer.notice = fmt.Sprintf("the plan changed — review revision %d (nothing was sent)", cur)
-		} else {
-			m.detail.steer.notice = "the plan changed — review the current plan (nothing was sent)"
-		}
+		m.detail.steer.notice = gateMismatchNotice(msg.expected, cur)
 		return
 	}
 	if msg.err != nil {

@@ -502,7 +502,9 @@ func TestSteerUnknownIsRetriedOnAStateFrame(t *testing.T) {
 }
 
 // PRD #1795 D5: `y` at the gate binds the approve to the revision the view shows at the
-// keypress; the command carries it even if a refetch lands before the command runs.
+// keypress. (No "refetch before the command runs" half: the command is built from the model
+// VALUE at the keypress and bubbletea hands a later refetch to a different model value, so no
+// ordering a test can stage here could change what this command sends.)
 func TestSteerApproveBindsTheRevisionAtKeypress(t *testing.T) {
 	runID := "r-own"
 	fake := &uzicli.FakeClient{}
@@ -510,21 +512,19 @@ func TestSteerApproveBindsTheRevisionAtKeypress(t *testing.T) {
 	gate.Status, gate.GateRevision = "awaiting_approval", 2
 	m := ownerModel(t, fake, runID, gate)
 
-	nm, cmd := m.handleKey(keyConfirmY)
-	m = nm.(tuiModel)
+	_, cmd := m.handleKey(keyConfirmY)
 	if cmd == nil {
 		t.Fatal("y at the gate did not approve")
 	}
-	// A refetch re-presents the plan before the command executes.
-	newer := gate
-	newer.GateRevision = 3
-	m.detail.applyMeta(newer)
-
-	if msg := cmd().(steerResultMsg); msg.kind != kindApprovePlan {
+	msg := cmd().(steerResultMsg)
+	if msg.kind != kindApprovePlan {
 		t.Fatalf("kind = %q, want %q", msg.kind, kindApprovePlan)
 	}
 	if fake.LastInputExpectedGateRevision == nil || *fake.LastInputExpectedGateRevision != 2 {
 		t.Errorf("expected_gate_revision = %v, want 2 (the revision shown at the keypress)", fake.LastInputExpectedGateRevision)
+	}
+	if msg.expected == nil || *msg.expected != 2 {
+		t.Errorf("result expected = %v, want 2 (carried so a refusal can be worded)", msg.expected)
 	}
 }
 
@@ -599,7 +599,7 @@ func TestSteerGateMismatchNoticeAndRefetch(t *testing.T) {
 		CurrentGateRevision: 3,
 	}})
 	m = next.(tuiModel)
-	if !strings.Contains(m.detail.steer.notice, "the plan changed — review revision 3") {
+	if !strings.Contains(m.detail.steer.notice, "now shows plan revision 3: review it") {
 		t.Errorf("notice = %q, want it to name revision 3", m.detail.steer.notice)
 	}
 	if cmd == nil {
@@ -613,10 +613,51 @@ func TestSteerGateMismatchNoticeAndRefetch(t *testing.T) {
 	before = m.detail.metaSeq
 	next, _ = m.Update(steerResultMsg{runID: runID, kind: kindApprovePlan, err: uzicli.Exitf(uzicli.ExitConflict, "run has already finished")})
 	m = next.(tuiModel)
-	if !strings.Contains(m.detail.steer.notice, "run has already finished") || strings.Contains(m.detail.steer.notice, "plan changed") {
+	if !strings.Contains(m.detail.steer.notice, "run has already finished") || strings.Contains(m.detail.steer.notice, "plan revision") {
 		t.Errorf("generic notice = %q", m.detail.steer.notice)
 	}
 	if m.detail.metaSeq != before {
 		t.Error("a non-mismatch error started a run re-read")
+	}
+}
+
+// The mismatch notice claims only what the numbers support: a same-revision race asks for a
+// re-check and retry (the run may still be at that gate), revision 0 says no gate is shown, and
+// none of them uses the retired "the plan changed" wording or an em dash.
+func TestSteerGateMismatchNoticeWording(t *testing.T) {
+	two := int64(2)
+	cases := []struct {
+		name     string
+		expected *int64
+		current  int64
+		want     string
+		never    []string
+	}{
+		{"same revision race", &two, 2, "plan revision 2 was not applied", []string{"plan changed", "no longer waiting", "review it"}},
+		{"newer revision", &two, 3, "now shows plan revision 3: review it", nil},
+		{"no revision", &two, 0, "no plan gate revision", []string{"revision 0"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runID := "r-own"
+			gate := ownedRun(runID)
+			gate.Status, gate.GateRevision = "awaiting_approval", 2
+			m := ownerModel(t, &uzicli.FakeClient{}, runID, gate)
+			next, _ := m.Update(steerResultMsg{runID: runID, kind: kindRejectPlan, expected: tc.expected, err: &uzicli.ExitError{
+				Code:                uzicli.ExitConflict,
+				Err:                 errors.New("the plan gate changed"),
+				Reason:              uzicli.ReasonGateRevisionMismatch,
+				CurrentGateRevision: tc.current,
+			}})
+			notice := next.(tuiModel).detail.steer.notice
+			if !strings.Contains(notice, tc.want) {
+				t.Errorf("notice = %q, want it to contain %q", notice, tc.want)
+			}
+			for _, bad := range append(tc.never, "\u2014") {
+				if strings.Contains(notice, bad) {
+					t.Errorf("notice = %q must not contain %q", notice, bad)
+				}
+			}
+		})
 	}
 }

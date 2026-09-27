@@ -417,15 +417,39 @@ func resolveExpectedGateRevision(cmd *cobra.Command, c uzicli.Client, runID stri
 	return &rev, nil
 }
 
-// gateRevisionMismatchError turns the typed 409 into the CLI's conflict exit, naming the
-// revision to review. Nothing was written server-side.
+// gateRevisionMismatchError turns the typed 409 into the CLI's conflict exit. Nothing was
+// written server-side. The server answers it for three different situations, and the message
+// names only what the numbers support:
+//   - current 0: the run shows no plan gate with a revision (never gated under an allocating
+//     api, or the verdict named a revision against a run with none), so there is nothing to
+//     review;
+//   - current == expected: the write lost a race at the same revision (the gate may have been
+//     re-presented or left while this verdict was in flight). The run may still be at that
+//     gate, so the caller is told to re-check and retry, not that the plan changed;
+//   - otherwise: the run now shows another revision, which is the one to review.
+//
+// The error keeps Reason ReasonGateRevisionMismatch so a caller that composed the verdict
+// with an earlier write (`run approve --token`) can say what did land.
 func gateRevisionMismatchError(runID string, expected *int64, current int64) error {
-	if expected != nil && *expected == current {
-		return uzicli.Exitf(uzicli.ExitConflict,
-			"run %s is no longer waiting for a verdict on plan revision %d; nothing was sent", runID, current)
+	var msg string
+	switch {
+	case current <= 0:
+		msg = fmt.Sprintf("run %s shows no plan gate with a revision to act on; the verdict was not applied "+
+			"(check the run's status)", runID)
+	case expected != nil && *expected == current:
+		msg = fmt.Sprintf("run %s: the verdict for plan revision %d was not applied because the gate changed "+
+			"while it was being sent; check the run's status and retry if it is still awaiting approval",
+			runID, current)
+	default:
+		msg = fmt.Sprintf("run %s now shows plan revision %d; review it before deciding (the verdict was not applied)",
+			runID, current)
 	}
-	return uzicli.Exitf(uzicli.ExitConflict,
-		"run %s: the plan changed; review revision %d before deciding (nothing was sent)", runID, current)
+	return &uzicli.ExitError{
+		Code:                uzicli.ExitConflict,
+		Err:                 errors.New(msg),
+		Reason:              uzicli.ReasonGateRevisionMismatch,
+		CurrentGateRevision: current,
+	}
 }
 
 // submitInput sends one steering input and reports the outcome. server_side (a

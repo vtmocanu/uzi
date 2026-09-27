@@ -126,22 +126,110 @@ func TestGateVerdictMismatchExitsConflictNamingCurrentRevision(t *testing.T) {
 	if code != uzicli.ExitConflict {
 		t.Fatalf("exit = %d, want ExitConflict %d (stderr: %s)", code, uzicli.ExitConflict, stderr)
 	}
-	if !strings.Contains(stderr, "review revision 3") {
+	if !strings.Contains(stderr, "now shows plan revision 3") {
 		t.Errorf("stderr does not name the current revision: %q", stderr)
 	}
 }
 
-// A run that left the gate at the same revision (approved elsewhere, or finished) is a mismatch
-// too; the message says the gate is gone rather than claiming a newer plan exists.
-func TestGateVerdictMismatchOffTheGateSaysSo(t *testing.T) {
+// expected == current: the write lost a race at the same revision (the gate was re-presented or
+// left while the verdict was in flight). The run may still be at that gate, so the message tells
+// the owner to re-check and retry; it must not claim the plan changed or that the run left.
+func TestGateVerdictMismatchAtTheSameRevisionSaysRetry(t *testing.T) {
 	fc := gateFake("awaiting_approval", 2)
 	fc.SubmitRunInputErr = gateMismatchErr(2)
 	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "reject", "r1", "-m", "no")
 	if code != uzicli.ExitConflict {
 		t.Fatalf("exit = %d, want ExitConflict %d (stderr: %s)", code, uzicli.ExitConflict, stderr)
 	}
-	if !strings.Contains(stderr, "no longer waiting for a verdict on plan revision 2") {
-		t.Errorf("stderr = %q", stderr)
+	if !strings.Contains(stderr, "plan revision 2 was not applied") || !strings.Contains(stderr, "retry") {
+		t.Errorf("stderr does not tell the owner to re-check and retry: %q", stderr)
+	}
+	for _, claim := range []string{"plan changed", "no longer waiting", "review revision"} {
+		if strings.Contains(stderr, claim) {
+			t.Errorf("stderr claims %q, which a same-revision race does not support: %q", claim, stderr)
+		}
+	}
+}
+
+// An explicit flag against a run that shows no revision (current 0) must not ask the owner to
+// "review revision 0": there is no plan gate to review.
+func TestGateVerdictMismatchAtRevisionZeroSaysNoGate(t *testing.T) {
+	fc := gateFake("running", 0)
+	fc.SubmitRunInputErr = gateMismatchErr(0)
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "approve", "r1", "--expected-gate-revision", "4")
+	if code != uzicli.ExitConflict {
+		t.Fatalf("exit = %d, want ExitConflict %d (stderr: %s)", code, uzicli.ExitConflict, stderr)
+	}
+	if strings.Contains(stderr, "revision 0") {
+		t.Errorf("stderr names revision 0: %q", stderr)
+	}
+	if !strings.Contains(stderr, "shows no plan gate") {
+		t.Errorf("stderr does not say no plan gate is shown: %q", stderr)
+	}
+}
+
+// `run approve --token` reads the revision FIRST, then switches the token, then approves: the
+// revision must name the plan that was at the gate when the owner decided, before a switch that
+// could take a while. A 409 after the switch landed must say the switch was applied (it is not
+// rolled back), so the owner re-runs without repeating it.
+func TestGateApproveWithTokenOrderAndMismatchSaysSwitchApplied(t *testing.T) {
+	fc := gateFake("awaiting_approval", 2)
+	fc.SubmitRunInputErr = gateMismatchErr(3)
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "approve", "r1", "--token", "auto")
+	if code != uzicli.ExitConflict {
+		t.Fatalf("exit = %d, want ExitConflict %d (stderr: %s)", code, uzicli.ExitConflict, stderr)
+	}
+	want := []string{"get_run", "set_run_credential", "submit_run_input"}
+	if strings.Join(fc.RunVerbCalls, ",") != strings.Join(want, ",") {
+		t.Errorf("call order = %v, want %v", fc.RunVerbCalls, want)
+	}
+	if fc.LastInputExpectedGateRevision == nil || *fc.LastInputExpectedGateRevision != 2 {
+		t.Errorf("expected_gate_revision = %v, want 2", fc.LastInputExpectedGateRevision)
+	}
+	if !strings.Contains(stderr, "review it before deciding") {
+		t.Errorf("stderr lost the mismatch guidance: %q", stderr)
+	}
+	if !strings.Contains(stderr, "--token switch WAS applied") || !strings.Contains(stderr, "without --token") {
+		t.Errorf("stderr does not say the token switch was applied: %q", stderr)
+	}
+
+	// Control: the same mismatch without --token carries no token note.
+	fc = gateFake("awaiting_approval", 2)
+	fc.SubmitRunInputErr = gateMismatchErr(3)
+	_, stderr, _ = runCLI(t, fakeEnv(fc), "run", "approve", "r1")
+	if strings.Contains(stderr, "--token") {
+		t.Errorf("a plain approve's mismatch mentions --token: %q", stderr)
+	}
+}
+
+// A run the invocation-time read cannot find sends the verdict without an expected revision; the
+// submit answers the authoritative 404 (here the fake accepts it, proving it was sent).
+func TestGateVerdictGetRunNotFoundSendsWithoutRevision(t *testing.T) {
+	fc := &uzicli.FakeClient{}
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "approve", "r-missing")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if fc.LastInputKind != kindApprovePlan || fc.LastInputRunID != "r-missing" {
+		t.Fatalf("the verdict was not sent (kind %q, run %q)", fc.LastInputKind, fc.LastInputRunID)
+	}
+	if fc.LastInputExpectedGateRevision != nil {
+		t.Errorf("expected_gate_revision = %d, want omitted", *fc.LastInputExpectedGateRevision)
+	}
+}
+
+// Any other read failure aborts before sending: a verdict must not go out unbound because the
+// read that would have bound it failed.
+func TestGateVerdictGetRunErrorAborts(t *testing.T) {
+	fc := &uzicli.FakeClient{GetRunHook: func(string) (apitypes.RunDTO, error) {
+		return apitypes.RunDTO{}, uzicli.Exitf(uzicli.ExitUnreachable, "server unreachable")
+	}}
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "revise", "r1", "-m", "more")
+	if code != uzicli.ExitUnreachable {
+		t.Fatalf("exit = %d, want ExitUnreachable %d (stderr: %s)", code, uzicli.ExitUnreachable, stderr)
+	}
+	if fc.LastInputKind != "" {
+		t.Errorf("a failed read still submitted kind %q", fc.LastInputKind)
 	}
 }
 

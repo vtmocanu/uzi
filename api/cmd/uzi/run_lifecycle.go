@@ -4,6 +4,7 @@ package main
 // stop (PRD #1009 M4).
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -219,6 +220,7 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 			// Gated on Changed (like `run create --token`), so an explicit --token "" is a
 			// client-side refusal, not a silent no-op; omitting --token skips the round-trip
 			// entirely, keeping approve byte-identical to today.
+			tokenSwitched := false
 			if cmd.Flags().Changed("token") {
 				token, _ := cmd.Flags().GetString("token")
 				override, err := resolveTokenFlagValue(cmd, c, token)
@@ -234,8 +236,23 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 				if warning != "" {
 					_, _ = fmt.Fprintf(env.Stderr, "warning: %s\n", sanitizeTTY(warning))
 				}
+				tokenSwitched = true
 			}
-			return submitInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel, false, expected)
+			err = submitInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel, false, expected)
+			// PRD #1795 D5: the revision is read BEFORE the switch (above), so a gate refused as
+			// stale can arrive after the switch already landed. The switch is not rolled back;
+			// say so, so the owner re-runs the approve without repeating it.
+			var ee *uzicli.ExitError
+			if tokenSwitched && errors.As(err, &ee) && ee.Reason == uzicli.ReasonGateRevisionMismatch {
+				return &uzicli.ExitError{
+					Code: ee.Code,
+					Err: fmt.Errorf("%w; the --token switch WAS applied to run %s, so re-run the approve without --token",
+						ee.Err, args[0]),
+					Reason:              ee.Reason,
+					CurrentGateRevision: ee.CurrentGateRevision,
+				}
+			}
+			return err
 		},
 	}
 	approve.Flags().String("agent-source", "", "which subagent roster to run: own|repo (default: the run's own default)")

@@ -6099,6 +6099,26 @@ describe("RunView — plan-gate verdicts bound to the gate revision (PRD #1795 M
     delete extra.listSecrets;
   });
 
+  function streamWith(r: ReturnType<typeof run>, submit: ReturnType<typeof vi.fn>, refreshRun: ReturnType<typeof vi.fn>) {
+    mockUseRunStream.mockReturnValue({
+      run: r,
+      messages: [],
+      connected: true,
+      error: "",
+      submit,
+      refreshRun,
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+  }
+  function mismatch(current: number) {
+    return new ApiError(409, `the plan gate changed: this verdict was sent for revision 2, the run is at revision ${current}`, {
+      error: "the plan gate changed",
+      reason: "gate_revision_mismatch",
+      current_gate_revision: current,
+    });
+  }
+
   function renderGate(submit: ReturnType<typeof vi.fn>, refreshRun: ReturnType<typeof vi.fn>) {
     mockUseRunStream.mockReturnValue({
       run: run({ status: "awaiting_approval", gate_revision: 2, plan_md: "# Plan two" }),
@@ -6148,7 +6168,7 @@ describe("RunView — plan-gate verdicts bound to the gate revision (PRD #1795 M
     });
 
     expect(submit.mock.calls[0]).toEqual(["reject_plan", "", undefined, undefined, undefined, 2]);
-    await screen.findByText("The plan changed — review revision 3");
+    await screen.findByText("Your decision was not applied: the run now shows plan revision 3. Review it and decide again.");
     expect(refreshRun).toHaveBeenCalled();
     // The refusal is the panel notice, not the page's generic error banner (paired with the
     // positive notice assertion above, so this cannot pass on an empty render).
@@ -6167,7 +6187,54 @@ describe("RunView — plan-gate verdicts bound to the gate revision (PRD #1795 M
       fireEvent.click(approve);
     });
     await screen.findByText("run has already finished");
-    expect(screen.queryByText(/The plan changed/)).toBeNull();
+    expect(screen.queryByText(/was not applied/)).toBeNull();
     expect(refreshRun).not.toHaveBeenCalled();
+  });
+
+  // Between the 409 and the refetch the run on screen is still the refused revision; the page
+  // stays busy until the refetch settles, so no click can bind a verdict to it.
+  it("stays busy after a mismatch until the refetch settles", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(3);
+    });
+    let settle: () => void = () => {};
+    const refreshRun = vi.fn(
+      () =>
+        new Promise<void>((res) => {
+          settle = res;
+        }),
+    );
+    renderGate(submit, refreshRun);
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    await act(async () => {
+      fireEvent.click(approve);
+    });
+    await waitFor(() => expect(refreshRun).toHaveBeenCalledTimes(1));
+    expect((screen.getByRole("button", { name: /Approve plan/ }) as HTMLButtonElement).disabled).toBe(true);
+
+    await act(async () => {
+      settle();
+    });
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: /Approve plan/ }) as HTMLButtonElement).disabled).toBe(false),
+    );
+  });
+
+  // The refetch shows the run left the gate, so PlanPanel unmounts with its notice: the page
+  // itself must still tell the owner their decision was not applied.
+  it("a mismatch whose refetch shows the run left the gate gets a page-level notice", async () => {
+    const submit = vi.fn(async () => {
+      throw mismatch(2);
+    });
+    const refreshRun = vi.fn(async () => {
+      streamWith(run({ status: "running", gate_revision: 2, plan_md: "# Plan two" }), submit, refreshRun);
+    });
+    renderGate(submit, refreshRun);
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    await act(async () => {
+      fireEvent.click(approve);
+    });
+    await screen.findByText("Your plan decision was not applied: the run is no longer waiting for plan approval.");
+    expect(screen.queryByRole("button", { name: /Approve plan/ })).toBeNull();
   });
 });

@@ -113,6 +113,30 @@ function RevisionThread({ feedback, working = false }: { feedback: string | null
   );
 }
 
+// GateMismatch is one 409 gate_revision_mismatch refusal (PRD #1795 D5): the run's revision
+// when the server refused (`current`) and the revision the verdict named (`expected`, absent
+// when none was sent).
+export type GateMismatch = { current: number; expected?: number };
+
+// gateMismatchMessage words a refusal from the numbers alone, claiming nothing they do not
+// support. `atGate` is whether the run, as last read, is still awaiting approval (the panel's
+// own notice) or has left the gate (RunView's page-level notice once the panel unmounts).
+//   - left the gate: the read status says so; the decision was not applied.
+//   - current == expected: the write lost a race at the same revision (re-presented, or left
+//     and not yet visible). The run may still be at that gate, so: re-check and retry.
+//   - current 0: the run shows no revisioned gate, so there is no revision to name.
+//   - otherwise: the run now shows another revision, which is the one to review.
+export function gateMismatchMessage(m: GateMismatch, atGate: boolean): string {
+  if (!atGate) return "Your plan decision was not applied: the run is no longer waiting for plan approval.";
+  if (m.current > 0 && m.current !== m.expected) {
+    return `Your decision was not applied: the run now shows plan revision ${m.current}. Review it and decide again.`;
+  }
+  if (m.current > 0) {
+    return `Your decision on plan revision ${m.current} was not applied because the gate changed while it was being sent. Check the plan and try again.`;
+  }
+  return "Your decision was not applied because the plan gate changed. Check the plan and try again.";
+}
+
 // PlanPanel: the run's one human decision point — visually the loudest thing on
 // the page while it is pending. Grows the PRD #37 agent picker: the user chooses
 // the subagent roster (repo agents when detected, else their templates) with the
@@ -166,14 +190,18 @@ export function PlanPanel({
   onReject: (reason: string, expectedGateRevision?: number) => void;
   // Request-changes (PRD #41) and the revising-state Cancel-run affordance. Optional
   // with a no-op default so a base-gate-only caller need not wire them.
-  onRequestChanges?: (feedback: string, expectedGateRevision?: number) => void;
+  // PRD #1795: a caller may return a promise resolving true once the revise was accepted;
+  // the panel then closes and resets the composer (see the revision-start reset below).
+  onRequestChanges?: (feedback: string, expectedGateRevision?: number) => void | Promise<boolean>;
   onCancel?: () => void;
-  // PRD #1795 D5: set by the caller when a verdict was refused because the plan moved on
-  // (409 gate_revision_mismatch). `current` is the run's revision at refusal. A NEW object
-  // per refusal, so a second refusal at the same revision still re-arms the panel. The
-  // panel shows the notice and releases any frozen revision, so the next click binds to
-  // the plan that is on screen then (the caller refetches the run).
-  revisionMismatch?: { current: number } | null;
+  // PRD #1795 D5: set by the caller when a verdict was refused with 409
+  // gate_revision_mismatch. `current` is the run's revision at refusal and `expected` the
+  // revision the verdict named (absent when none was sent). A NEW object per refusal, so a
+  // second refusal at the same revision still re-arms the panel. The panel shows the notice
+  // and re-binds an open composer to `current`; with no composer open it releases the freeze
+  // (the caller refetches the run and keeps its `busy` up until the refetch settles, so no
+  // click can bind to the refused revision in between).
+  revisionMismatch?: GateMismatch | null;
 }) {
   const [rejecting, setRejecting] = useState(false);
   const [requesting, setRequesting] = useState(false);
@@ -190,13 +218,39 @@ export function PlanPanel({
   const [frozenRevision, setFrozenRevision] = useState<{ rev: number | undefined } | null>(null);
   const freezeRevision = useCallback(() => setFrozenRevision({ rev: run.gate_revision }), [run.gate_revision]);
   const boundRevision = frozenRevision ? frozenRevision.rev : run.gate_revision;
-  // A refusal releases the freeze: the owner was told the plan changed, and the next click
-  // must bind to the revision on screen then, not the refused one.
+  // A refusal re-binds an OPEN composer to the revision the server reported, so the owner
+  // who keeps typing sends against the plan the refetch shows (never unfrozen, which would
+  // bind to whatever happens to be on screen at the click). With no composer open the freeze
+  // is released: the next action starts fresh from the displayed run. The composer-open flag
+  // is read through a ref so only a NEW refusal fires this, not every open/close.
+  const composerOpenRef = useRef(false);
+  composerOpenRef.current = rejecting || requesting;
   useEffect(() => {
-    if (revisionMismatch) setFrozenRevision(null);
+    if (!revisionMismatch) return;
+    setFrozenRevision(composerOpenRef.current ? { rev: revisionMismatch.current } : null);
   }, [revisionMismatch]);
 
   const rev = useMemo(() => derivePlanRevision(messages), [messages]);
+
+  // A revision round that has started ends the request-changes composer: the feedback was
+  // accepted, the plan it was written against is gone, and the next plan is a new decision.
+  // Without this the composer survived the revising state (the panel stays mounted while the
+  // run stays awaiting_approval) and reopened on plan N+1 still frozen at N, so every second
+  // round was refused. closeRequestComposer also runs on a send the caller reports accepted,
+  // for a feed that never delivers the plan_revising frame.
+  const closeRequestComposer = useCallback(() => {
+    setRequesting(false);
+    setFeedback("");
+    setFrozenRevision(null);
+  }, []);
+  useEffect(() => {
+    if (rev.revising) closeRequestComposer();
+  }, [rev.revising, closeRequestComposer]);
+  const sendRevise = async () => {
+    const accepted =
+      boundRevision !== undefined ? onRequestChanges?.(feedback, boundRevision) : onRequestChanges?.(feedback);
+    if ((await accepted) === true) closeRequestComposer();
+  };
 
   const repoAgents = useMemo(() => run.repo_agents ?? [], [run.repo_agents]);
   const repoDetected = repoAgents.length > 0;
@@ -251,8 +305,9 @@ export function PlanPanel({
   const doApprove = useCallback(
     async (withOverride: boolean) => {
       if (submittingRef.current) return;
-      // Freeze synchronously, before the credential await: a refetch during that await must
-      // not change which plan revision this approve names.
+      // The revision on screen at the click. This callback closes over the render the owner
+      // clicked, so a refetch during the credential await below cannot change it; reading it
+      // here, before the await, keeps that true should this ever move to a latest-run ref.
       const expectedRevision = run.gate_revision;
       submittingRef.current = true;
       setSubmitting(true);
@@ -276,7 +331,7 @@ export function PlanPanel({
         // Preserve the exact onApprove arg-count contract (1 arg for the plain approve,
         // 2 for the capability override) so RunView's `act` wrapper and the panel tests
         // see no change.
-        if (expectedRevision !== undefined) onApprove(selection, withOverride ? true : undefined, expectedRevision);
+        if (expectedRevision !== undefined) onApprove(selection, withOverride || undefined, expectedRevision);
         else if (withOverride) onApprove(selection, true);
         else onApprove(selection);
       } finally {
@@ -420,18 +475,10 @@ export function PlanPanel({
         </div>
       </div>
       <div className="space-y-4 p-4">
-        {/* PRD #1795 D5: the verdict was refused because a newer plan replaced the one it
-            named. The run is refetched by the caller; this names the revision to review. */}
-        {revisionMismatch && (
-          <Alert
-            tone="info"
-            message={
-              revisionMismatch.current > 0
-                ? `The plan changed — review revision ${revisionMismatch.current}`
-                : "The plan changed — review the current plan"
-            }
-          />
-        )}
+        {/* PRD #1795 D5: the verdict was refused (409 gate_revision_mismatch) and nothing
+            was applied. The run is refetched by the caller; the notice says only what the
+            reported revisions support. */}
+        {revisionMismatch && <Alert tone="info" message={gateMismatchMessage(revisionMismatch, true)} />}
 
         {/* The picker exists to shape the approve verdict, so it is an action surface:
             shown only to someone who can approve. The locked-in roster is a separate,
@@ -625,14 +672,7 @@ export function PlanPanel({
                 >
                   Cancel
                 </Button>
-                <Button
-                  disabled={busy || feedback.trim() === ""}
-                  onClick={() =>
-                    boundRevision !== undefined
-                      ? onRequestChanges?.(feedback, boundRevision)
-                      : onRequestChanges?.(feedback)
-                  }
-                >
+                <Button disabled={busy || feedback.trim() === ""} onClick={() => void sendRevise()}>
                   Send &amp; revise
                 </Button>
               </div>

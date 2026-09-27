@@ -81,7 +81,7 @@ import { Alert, Badge, Button, Card, PageHeader, Spinner, StatusPill, cx, type B
 import { Modal } from "../components/Modal";
 import { summaryCollapse } from "../lib/prefs";
 import { ExternalLinkIcon } from "../components/icons";
-import { PlanPanel, SeededPlanPanel } from "./runView/PlanPanel";
+import { gateMismatchMessage, PlanPanel, SeededPlanPanel, type GateMismatch } from "./runView/PlanPanel";
 import { JudgePanel } from "./runView/JudgePanel";
 import { CompletionDecisionPanel } from "./runView/CompletionDecisionPanel";
 
@@ -1824,26 +1824,38 @@ export function RunView() {
 
   // PRD #1795 D5: the plan-gate verdict path. A verdict bound to a revision the run no longer
   // shows is refused with a typed 409 and nothing is written. That is not a failure to show on
-  // the page banner: the gate panel names the revision to review, and the run is refetched so
-  // the panel renders the plan that replaced the one the owner acted on. A new object per
-  // refusal re-arms the panel even when the revision repeats. Any other error surfaces as
-  // before. Bound to the run that earned it, like the discard confirmation below.
-  const [gateMismatch, setGateMismatch] = useState<{ runId: string; current: number } | null>(null);
-  const gateAct = (fn: () => Promise<unknown>) =>
-    act(async () => {
+  // the page banner: the gate panel words the refusal (gateMismatchMessage), and the run is
+  // refetched so the panel renders the plan now at the gate. The refetch is AWAITED inside
+  // `act`, so `busy` stays up until it settles: a click in between cannot bind a verdict to
+  // the refused revision still on screen. A new object per refusal re-arms the panel even when
+  // the revision repeats. Any other error surfaces as before. Bound to the run that earned it,
+  // like the discard confirmation below. Resolves true only when the verdict was accepted.
+  const [gateMismatch, setGateMismatch] = useState<({ runId: string } & GateMismatch) | null>(null);
+  const gateAct = async (expected: number | undefined, fn: () => Promise<unknown>): Promise<boolean> => {
+    let accepted = false;
+    await act(async () => {
       const requestRunId = id;
       setGateMismatch(null);
       try {
         await fn();
+        accepted = true;
       } catch (e) {
         const current = gateRevisionMismatchCurrent(e);
         if (current === null) throw e;
         if (currentRunIdRef.current !== requestRunId) return;
-        setGateMismatch({ runId: requestRunId, current });
-        void refreshRun();
+        setGateMismatch({ runId: requestRunId, current, expected });
+        await refreshRun();
       }
     });
+    return accepted;
+  };
   const revisionMismatch = gateMismatch?.runId === id ? gateMismatch : null;
+  // A refusal whose gate has been superseded by a later one is stale: drop it so the panel
+  // does not greet revision N+2 with a notice about N+1.
+  const runGateRevision = run?.gate_revision ?? 0;
+  useEffect(() => {
+    if (gateMismatch && gateMismatch.current > 0 && runGateRevision > gateMismatch.current) setGateMismatch(null);
+  }, [gateMismatch, runGateRevision]);
 
   // PRD #1391 Run B M3d (D13): the CENTRAL cancel path. ALL cancel entry points on this
   // page route through here so the held-outcome confirmation can never be skipped per-
@@ -2396,6 +2408,11 @@ export function RunView() {
 
       {error && <Alert message={error} />}
       {actionErr && <Alert message={actionErr} />}
+      {/* PRD #1795 D5: a refused plan verdict whose refetch shows the run has left the gate.
+          The panel that would word it has unmounted, so the page says it instead. */}
+      {revisionMismatch && run.status !== "awaiting_approval" && (
+        <Alert tone="info" message={gateMismatchMessage(revisionMismatch, false)} />
+      )}
 
       {/* PRD #1391 Run B M3d (D13): a finished outcome is held on the run's worker because
           the api could not land it. Surface it near the status so the owner knows why the
@@ -2731,15 +2748,19 @@ export function RunView() {
           canSteer={canSteer}
           revisionMismatch={revisionMismatch}
           onApprove={(selection, overrideCapabilities, expectedGateRevision) =>
-            gateAct(() =>
+            void gateAct(expectedGateRevision, () =>
               submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision),
             )
           }
           onReject={(reason, expectedGateRevision) =>
-            gateAct(() => submit("reject_plan", reason, undefined, undefined, undefined, expectedGateRevision))
+            void gateAct(expectedGateRevision, () =>
+              submit("reject_plan", reason, undefined, undefined, undefined, expectedGateRevision),
+            )
           }
           onRequestChanges={(feedback, expectedGateRevision) =>
-            gateAct(() => submit("revise_plan", feedback, undefined, undefined, undefined, expectedGateRevision))
+            gateAct(expectedGateRevision, () =>
+              submit("revise_plan", feedback, undefined, undefined, undefined, expectedGateRevision),
+            )
           }
           onCancel={() => cancelRun()}
         />
