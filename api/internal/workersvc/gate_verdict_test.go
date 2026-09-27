@@ -168,6 +168,36 @@ func TestVerdictZeroRowsWithMatchingRereadIsMismatch(t *testing.T) {
 	}
 }
 
+// A revise whose write matched no row while the re-read still shows the expected revision answers
+// the cap only when the cap is actually spent; otherwise it lost a race with a re-presentation at
+// the same revision and is a mismatch, never a false "revision cap reached".
+func TestReviseZeroRowsWithMatchingRereadIsMismatchUnlessCapSpent(t *testing.T) {
+	rev := int64(3)
+	t.Run("cap not spent", func(t *testing.T) {
+		fs, svc, user, runID := gatedRun(t)
+		fs.runByID.GateRevision = 3
+		fs.reviseErr = pgx.ErrNoRows
+		_, err := svc.SubmitInputWithOptions(context.Background(), user, runID, "revise_plan", "more tests", nil, SubmitInputOptions{ExpectedGateRevision: &rev})
+		var mm *GateRevisionMismatchError
+		if !errors.As(err, &mm) || mm.Current != 3 {
+			t.Fatalf("err = %v, want *GateRevisionMismatchError{Current 3}", err)
+		}
+		if errors.Is(err, ErrReviseCapReached) {
+			t.Fatal("an unspent cap answered revision cap reached")
+		}
+	})
+	t.Run("cap spent", func(t *testing.T) {
+		fs, svc, user, runID := gatedRun(t)
+		fs.runByID.GateRevision = 3
+		fs.runByID.ReviseCount = 3
+		fs.reviseCount = 3
+		_, err := svc.SubmitInputWithOptions(context.Background(), user, runID, "revise_plan", "more tests", nil, SubmitInputOptions{ExpectedGateRevision: &rev})
+		if !errors.Is(err, ErrReviseCapReached) {
+			t.Fatalf("err = %v, want ErrReviseCapReached", err)
+		}
+	})
+}
+
 // Plan decision 10: with expected_gate_revision present on a verdict kind, a finished run answers
 // the typed mismatch (current revision included), not the untyped terminal 409.
 func TestExpectedGateRevisionOnTerminalRunIsMismatch(t *testing.T) {

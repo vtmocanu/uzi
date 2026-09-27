@@ -101,7 +101,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	// typed mismatch naming the current revision rather than something unrelated (the terminal
 	// 409, the capability gate, the roster check). This read is not the guard: every verdict
 	// write below re-checks the same predicate atomically in SQL, under the run-row lock, and a
-	// 0-row result is answered as a mismatch too (verdictNotWritten / gateRevisionMismatch).
+	// 0-row result is answered as a mismatch too (verdictNotWritten / reviseNotWritten).
 	if opts.ExpectedGateRevision != nil {
 		if !gateVerdictKind(kind) {
 			return SubmitInputResult{}, ErrExpectedGateRevisionNotApplicable
@@ -554,7 +554,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		if errors.Is(err, pgx.ErrNoRows) {
 			// PRD #1795 M2: with an expected revision a 0-row result is either the cap or a
 			// revision mismatch; the re-read tells them apart. Without one it is the cap.
-			return SubmitInputResult{}, s.gateRevisionMismatch(ctx, userID, runID, opts.ExpectedGateRevision, ErrReviseCapReached)
+			return SubmitInputResult{}, s.reviseNotWritten(ctx, userID, runID, opts.ExpectedGateRevision)
 		}
 		if err != nil {
 			return SubmitInputResult{}, err

@@ -40,6 +40,8 @@ func uziLabels(extra ...string) []byte {
 // fakeStore embeds the Store interface so unimplemented methods panic if a test
 // path reaches them unexpectedly; the tests override only what they exercise.
 type fakeStore struct {
+	// reviseErr forces CreateRunReviseInputIfUnderCap to fail (PRD #1795: a 0-row race).
+	reviseErr error
 	Store
 
 	// Claim path.
@@ -1517,6 +1519,9 @@ func (f *fakeStore) CountRunReviseInputs(_ context.Context, runID uuid.UUID) (in
 }
 func (f *fakeStore) CreateRunReviseInputIfUnderCap(_ context.Context, arg store.CreateRunReviseInputIfUnderCapParams) (store.RunUserInput, error) {
 	f.reviseCapArg = &arg
+	if f.reviseErr != nil {
+		return store.RunUserInput{}, f.reviseErr
+	}
 	// Emulate the atomic cap: the insert happens only while the already-persisted count
 	// is strictly under the cap, else no row (pgx.ErrNoRows) — same as the real query.
 	if f.reviseCount >= int64(arg.MaxRevisions) {

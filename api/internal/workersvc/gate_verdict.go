@@ -61,13 +61,15 @@ func checkExpectedGateRevision(run store.Run, expected int64) error {
 	return &GateRevisionMismatchError{Expected: expected, Current: run.GateRevision}
 }
 
-// gateRevisionMismatch resolves a revise_plan write that affected no row, where a second cause
+// reviseNotWritten resolves a revise_plan write that affected no row, where a second cause
 // (the revision cap) can refuse a verdict whose expected revision still matches. With no expected
-// revision it returns fallback (the cap). With one it re-reads the run: a mismatch is answered as
-// *GateRevisionMismatchError; a run that does match keeps fallback, because the cap refused it.
-func (s *Service) gateRevisionMismatch(ctx context.Context, userID, runID uuid.UUID, expected *int64, fallback error) error {
+// revision it returns ErrReviseCapReached (the only refusal then). With one it re-reads the run: a
+// mismatch is answered as *GateRevisionMismatchError; a run that matches answers the cap only when
+// the cap is actually spent. A matching run whose cap is NOT spent lost a race with a
+// re-presentation at the same revision (the write did not happen), so it is a mismatch too.
+func (s *Service) reviseNotWritten(ctx context.Context, userID, runID uuid.UUID, expected *int64) error {
 	if expected == nil {
-		return fallback
+		return ErrReviseCapReached
 	}
 	run, err := s.GetRun(ctx, userID, runID)
 	if err != nil {
@@ -76,12 +78,15 @@ func (s *Service) gateRevisionMismatch(ctx context.Context, userID, runID uuid.U
 	if err := checkExpectedGateRevision(run, *expected); err != nil {
 		return err
 	}
-	return fallback
+	if int(run.ReviseCount) >= s.p.PlanMaxRevisions {
+		return ErrReviseCapReached
+	}
+	return &GateRevisionMismatchError{Expected: *expected, Current: run.GateRevision}
 }
 
 // verdictNotWritten resolves a verdict write that affected no row on a seam whose only refusal
-// besides the expected-revision predicate is the run having vanished or finished (approve,
-// reject with or without a live poller). It re-reads the run, so a vanished run answers
+// besides the expected-revision predicate is the run having vanished (the approve and live-poller
+// reject inserts) or, for the no-live-poller server-side reject alone, having finished. It re-reads the run, so a vanished run answers
 // ErrRunNotFound. With an expected revision the answer is ALWAYS a *GateRevisionMismatchError
 // carrying the re-read's revision, even when that revision matches again (a publication and a
 // verdict can interleave around the re-read): the verdict was not written, and the client must
