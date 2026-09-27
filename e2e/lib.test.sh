@@ -103,8 +103,9 @@ regate "requeued then re-gated by a new claim"      pass awaiting_approval:T0 qu
 regate "new claim not yet at the gate"              fail awaiting_approval:T0 running:T1
 regate "gate row with no claimed_at"                fail awaiting_approval:
 regate "terminal failure while waiting"             fail awaiting_approval:T0 failed:T1
+regate "cancelled while waiting"                    fail awaiting_approval:T0 cancelled:
 
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 17 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 18 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 17 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 18 ] && [ "$cases" -eq "$passed" ]
