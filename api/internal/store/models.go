@@ -394,6 +394,33 @@ type PipelineStatus struct {
 	SyncedAt       pgtype.Timestamptz `json:"synced_at"`
 }
 
+type PrDescription struct {
+	RepoID             uuid.UUID          `json:"repo_id"`
+	MrIid              int64              `json:"mr_iid"`
+	PublishedVersionID pgtype.UUID        `json:"published_version_id"`
+	LockVersion        int64              `json:"lock_version"`
+	LastOutcome        pgtype.Text        `json:"last_outcome"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+}
+
+type PrDescriptionVersion struct {
+	ID                   uuid.UUID          `json:"id"`
+	RunID                uuid.UUID          `json:"run_id"`
+	ClaimGeneration      int64              `json:"claim_generation"`
+	RepoID               uuid.UUID          `json:"repo_id"`
+	MrIid                pgtype.Int8        `json:"mr_iid"`
+	Fields               []byte             `json:"fields"`
+	Size                 []byte             `json:"size"`
+	BaseSha              string             `json:"base_sha"`
+	HeadSha              string             `json:"head_sha"`
+	TargetBranch         string             `json:"target_branch"`
+	Source               string             `json:"source"`
+	RenderedRegionSha256 pgtype.Text        `json:"rendered_region_sha256"`
+	State                string             `json:"state"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	PublishedAt          pgtype.Timestamptz `json:"published_at"`
+}
+
 type RecommendationDisposition struct {
 	ID            uuid.UUID          `json:"id"`
 	ReviewID      uuid.UUID          `json:"review_id"`

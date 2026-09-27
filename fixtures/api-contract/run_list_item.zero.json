@@ -70,6 +70,8 @@
   "summary_intent": null,
   "summary_plan": null,
   "summary_deltas": null,
+  "pr_description": null,
+  "pr_description_outcome": null,
   "pipeline_ref": null,
   "pipeline_web_url": null,
   "fix_verdict": null,

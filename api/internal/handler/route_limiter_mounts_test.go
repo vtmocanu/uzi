@@ -739,6 +739,10 @@ var wantRouteMounts = []routeMount{
 	// intent idempotency + the plan stale-write guard rather than a per-user limiter.
 	{"POST", "/api/worker/runs/{id}/summary/intent", noLimiter},
 	{"POST", "/api/worker/runs/{id}/summary/plan", noLimiter},
+	{"POST", "/api/worker/runs/{id}/pr-description/stage", noLimiter},
+	{"POST", "/api/worker/runs/{id}/pr-description/bind", noLimiter},
+	{"POST", "/api/worker/runs/{id}/pr-description/lookup", noLimiter},
+	{"POST", "/api/worker/runs/{id}/pr-description/ack", noLimiter},
 	{"POST", "/api/workers/", noLimiter},
 	{"POST", "/api/workers/hosted", limHosted},
 	// PRD #685 M1: admin upload of a branding logo — cookie-only admin write, raw body

@@ -470,6 +470,13 @@ type RunDTO struct {
 	SummaryIntent *string           `json:"summary_intent"`
 	SummaryPlan   *string           `json:"summary_plan"`
 	SummaryDeltas []RunSummaryDelta `json:"summary_deltas"`
+	// PRD #1798: the published plain-English description of the run's PR (the version whose
+	// region is on the forge) and the PR's last description-write outcome. Set only by the
+	// GetRun detail read, best-effort (the list path and a lookup error leave both null); null
+	// for a run with no PR or no acknowledged write. The fields are api-sanitized, untrusted
+	// display text.
+	PrDescription        *RunPrDescriptionDTO `json:"pr_description"`
+	PrDescriptionOutcome *string              `json:"pr_description_outcome"`
 	// ci_fix context (PRD #6), all null for an issue run: the failing ref, the
 	// failing pipeline's web URL (from the frozen snapshot), and the fix verdict
 	// (verified|fix_failed|not_code|null-while-unverified).

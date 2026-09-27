@@ -125,6 +125,65 @@
       "text": "x"
     }
   ],
+  "pr_description": {
+    "mr_iid": 1,
+    "source": "x",
+    "fields": {
+      "summary": "x",
+      "changes": [
+        "x"
+      ],
+      "scope_notes": [
+        {
+          "kind": "x",
+          "text": "x"
+        }
+      ],
+      "review_pointers": [
+        "x"
+      ],
+      "verification": [
+        {
+          "command": "x",
+          "result": "x",
+          "verified_at_sha": "x"
+        }
+      ]
+    },
+    "size": {
+      "unavailable": true,
+      "files": 1,
+      "code": {
+        "added": 1,
+        "deleted": 1
+      },
+      "tests": {
+        "added": 1,
+        "deleted": 1
+      },
+      "docs": {
+        "added": 1,
+        "deleted": 1
+      },
+      "config": {
+        "added": 1,
+        "deleted": 1
+      },
+      "generated": {
+        "added": 1,
+        "deleted": 1
+      },
+      "vendored": {
+        "added": 1,
+        "deleted": 1
+      }
+    },
+    "base_sha": "x",
+    "head_sha": "x",
+    "target_branch": "x",
+    "published_at": "2020-01-02T03:04:05Z"
+  },
+  "pr_description_outcome": "x",
   "pipeline_ref": "x",
   "pipeline_web_url": "x",
   "fix_verdict": "x",

@@ -753,6 +753,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		payload.Secrets.Codex = codex
 	}
 
+	// PRD #1798 D9: the existing PR's description record, for a PR-producing run whose PR
+	// already exists. Best-effort (a read error omits it); nil keeps the wire unchanged.
+	payload.PrDescription = s.claimPrDescription(ctx, run)
+
 	// issue #297: a self_improve run carries the in-flight avoid-set so the picker skips
 	// a recommendation whose fix another active run is already doing. Best-effort and
 	// self_improve-only; every other kind's claim stays byte-identical to today's.

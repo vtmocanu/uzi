@@ -2242,6 +2242,46 @@ export type Harness = "claude" | "codex";
 // Harness — render an unrecognised value honestly.
 export type CostStatus = "metered" | "subscription" | "unreported";
 
+/** PRD #1798: one size-line bucket's line counts. */
+export interface PrDescriptionSizeBucket {
+  added: number;
+  deleted: number;
+}
+
+/** PRD #1798 D3: the deterministic size line as data. `unavailable` marks the case where the
+ *  worker could not classify the diff; its buckets are zero and must not be rendered. */
+export interface PrDescriptionSize {
+  unavailable: boolean;
+  files: number;
+  code: PrDescriptionSizeBucket;
+  tests: PrDescriptionSizeBucket;
+  docs: PrDescriptionSizeBucket;
+  config: PrDescriptionSizeBucket;
+  generated: PrDescriptionSizeBucket;
+  vendored: PrDescriptionSizeBucket;
+}
+
+/** PRD #1798: the api-sanitized description fields. UNTRUSTED display text. */
+export interface PrDescriptionFields {
+  summary: string;
+  changes: string[];
+  scope_notes: { kind: string; text: string }[];
+  review_pointers: string[];
+  verification: { command: string; result: string; verified_at_sha: string }[];
+}
+
+/** PRD #1798: `Run.pr_description`, the published version of the run's PR. */
+export interface RunPrDescription {
+  mr_iid: number;
+  source: string;
+  fields: PrDescriptionFields;
+  size: PrDescriptionSize | null;
+  base_sha: string;
+  head_sha: string;
+  target_branch: string;
+  published_at: string | null;
+}
+
 export interface Run {
   id: string;
   /** Nullable since PRD #39: a chat run has no repo (issue/ci_fix runs always do). */
@@ -2423,6 +2463,14 @@ export interface Run {
   summary_intent?: string | null;
   summary_plan?: string | null;
   summary_deltas?: { kind: string; text: string }[] | null;
+  /** PRD #1798: the PUBLISHED plain-English description of the run's PR (the version whose
+   *  region is on the forge) and the PR's last description-write outcome
+   *  (published|skipped_human_edit|skipped_no_region|skipped_malformed|
+   *  skipped_snapshot_moved|write_failed). Set only by the run-detail read, best-effort;
+   *  null for a run with no PR record. The fields are api-sanitized but still UNTRUSTED:
+   *  render as escaped plain text, never <Markdown>. Optional for api/web rollout skew. */
+  pr_description?: RunPrDescription | null;
+  pr_description_outcome?: string | null;
   /** PRD #37: the roster the worker detected in the clone's `.claude/agents/`.
    *  null = no worker reported (a pre-feature run); `[]` = detection ran and found
    *  none (the plan gate's repo card is inert, NOT the same as null). Names +

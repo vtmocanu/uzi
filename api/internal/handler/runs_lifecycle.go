@@ -469,6 +469,15 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	// PRD #1590 D6: the derived owner action of a run held on its Codex account (null
 	// otherwise). Best-effort, and queried only for such a held run.
 	h.overlayCodexAccountActions(r.Context(), &dto)
+	// PRD #1798: the run's PR's published description and last write outcome. runToDTO stays
+	// pure, so this detail-only overlay sets both here. Best-effort: a lookup error leaves both
+	// null rather than failing the read of an otherwise-fine run.
+	if desc, outcome, err := h.wsvc.RunPrDescription(r.Context(), run); err != nil {
+		slog.Error("run pr description", "run_id", run.ID, "error", err)
+	} else {
+		dto.PrDescription = desc
+		dto.PrDescriptionOutcome = outcome
+	}
 	// PRD #1353: the server-derived per-in-progress-milestone LIVE LANES, additive to
 	// milestones_agents and populated ONLY on this run-detail read for a non-terminal run
 	// (D9 — the board/list stay a single now-line). Best-effort: a derivation error leaves

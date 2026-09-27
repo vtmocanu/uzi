@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -319,6 +320,15 @@ type ClaimPayload struct {
 	// Present only for kind=ci_fix (omitted for issue runs). Log tails are untrusted
 	// data — the worker frames them as quoted evidence, never instructions.
 	Pipeline *ClaimPipeline `json:"pipeline,omitempty"`
+
+	// PrDescription is the existing PR's description record (PRD #1798 D9 step 2) for a
+	// PR-producing run whose PR already exists: an mr_rework run (runs.mr_iid), a run whose
+	// completion recorded its MR, or a re-claimed issue run that already bound a version. It
+	// carries the PR's mr_iid, lock_version, last_outcome and the currently PUBLISHED version
+	// (sanitized fields, size, snapshot, rendered_region_sha256), so a refresh can bind at
+	// stage time and compare the forge region with the published hash. nil (omitted) when the
+	// PR has no record, so every other claim stays byte-identical to today's wire.
+	PrDescription *apitypes.PrDescriptionState `json:"pr_description,omitempty"`
 
 	Repo    ClaimRepo    `json:"repo"`
 	Secrets ClaimSecrets `json:"secrets"`

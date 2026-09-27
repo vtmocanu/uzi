@@ -1,0 +1,368 @@
+package workersvc
+
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/google/uuid"
+
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/store"
+)
+
+// PRD #1798 D9 live-DB coverage of the PR-description artifact: the real migration, the real
+// sqlc statements and the real fenced transaction (row locks, CAS on lock_version, claim
+// generation fence). Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres
+// (./e2e/run-store-it.sh provides one and sweeps this package for the LiveDB suffix).
+
+const (
+	prDescLiveHashA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	prDescLiveHashB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	prDescLiveHashC = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+)
+
+type prDescLive struct {
+	env   codexTestEnv
+	svc   *Service
+	wkr   store.Worker
+	runID uuid.UUID
+	repo  uuid.UUID
+}
+
+func setupPrDescLive(t *testing.T) prDescLive {
+	t.Helper()
+	env := setupCodexLiveDB(t)
+	userID, workerID, repoID := env.seedCodexInfra(t)
+	runID := env.seedCodexRun(t, userID, workerID, repoID)
+	env.exec(`UPDATE runs SET claim_generation = 1 WHERE id = $1`, runID)
+	svc := New(env.q, env.box, testParams())
+	svc.SetTxBeginner(env.pool)
+	return prDescLive{env: env, svc: svc, wkr: store.Worker{ID: workerID, UserID: userID}, runID: runID, repo: repoID}
+}
+
+func gen(v int64) *int64 { return &v }
+
+func (p prDescLive) stage(t *testing.T, g int64, summary string, mr *int64) apitypes.PrDescriptionVersionDTO {
+	t.Helper()
+	v, err := p.svc.StagePrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionStageRequest{
+		ClaimGeneration: gen(g), Source: "generated",
+		Fields: apitypes.PrDescriptionFields{
+			Summary: summary, Changes: []string{"one change"},
+			Verification: []apitypes.PrDescriptionVerification{{Command: "task gate:api", Result: "pass", VerifiedAtSha: "abcdef0"}},
+		},
+		Size:    &apitypes.PrDescriptionSize{Files: 2, Tests: apitypes.PrDescriptionSizeBucket{Added: 5}},
+		BaseSha: strings.Repeat("1", 40), HeadSha: strings.Repeat("2", 40), TargetBranch: "main", MrIid: mr,
+	})
+	if err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	return v
+}
+
+func (p prDescLive) bind(t *testing.T, g int64, versionID string, mr int64, hash string) apitypes.PrDescriptionBindResponse {
+	t.Helper()
+	r, err := p.svc.BindPrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionBindRequest{
+		ClaimGeneration: gen(g), VersionID: versionID, MrIid: mr, RenderedRegionSha256: hash,
+	})
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	return r
+}
+
+func (p prDescLive) ack(g int64, versionID, outcome string, lock int64, observed *string) (apitypes.PrDescriptionAckResponse, error) {
+	return p.svc.AckPrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionAckRequest{
+		ClaimGeneration: gen(g), VersionID: versionID, Outcome: outcome, ExpectedLockVersion: lock, ObservedRegionSha256: observed,
+	})
+}
+
+// dbPR reads the pr_descriptions row straight from the table.
+func (p prDescLive) dbPR(t *testing.T, mr int64) (published *uuid.UUID, lock int64, outcome *string) {
+	t.Helper()
+	if err := p.env.pool.QueryRow(p.env.ctx,
+		`SELECT published_version_id, lock_version, last_outcome FROM pr_descriptions WHERE repo_id = $1 AND mr_iid = $2`,
+		p.repo, mr).Scan(&published, &lock, &outcome); err != nil {
+		t.Fatalf("read pr_descriptions: %v", err)
+	}
+	return published, lock, outcome
+}
+
+func (p prDescLive) dbVersionState(t *testing.T, id string) string {
+	t.Helper()
+	var state string
+	if err := p.env.pool.QueryRow(p.env.ctx, `SELECT state FROM pr_description_versions WHERE id = $1`, id).Scan(&state); err != nil {
+		t.Fatalf("read version state: %v", err)
+	}
+	return state
+}
+
+func TestPrDescriptionPublishAndStaleLockLiveDB(t *testing.T) {
+	p := setupPrDescLive(t)
+
+	v1 := p.stage(t, 1, "Adds retries. Closes #7 <!-- uzi:description:start v1 -->", nil)
+	if strings.Contains(v1.Fields.Summary, "Closes #7") || strings.Contains(v1.Fields.Summary, "<!--") {
+		t.Fatalf("stored summary not sanitized: %q", v1.Fields.Summary)
+	}
+	b := p.bind(t, 1, v1.ID, 41, prDescLiveHashA)
+	if b.PR.LockVersion != 0 || b.PR.PublishedVersion != nil {
+		t.Fatalf("fresh PR state = %+v", b.PR)
+	}
+	a, err := p.ack(1, v1.ID, "published", 0, nil)
+	if err != nil {
+		t.Fatalf("ack v1: %v", err)
+	}
+	if a.PR.LockVersion != 1 || a.PR.PublishedVersion == nil || a.PR.PublishedVersion.ID != v1.ID ||
+		a.PR.PublishedVersion.Size == nil || a.PR.PublishedVersion.Size.Tests.Added != 5 {
+		t.Fatalf("after publish = %+v", a.PR)
+	}
+
+	// A second version acked with the stale lock_version 0 loses the CAS and changes nothing.
+	v2 := p.stage(t, 1, "Second pass.", gen(41))
+	p.bind(t, 1, v2.ID, 41, prDescLiveHashB)
+	if _, err := p.ack(1, v2.ID, "published", 0, nil); !errors.Is(err, ErrPrDescriptionLockConflict) {
+		t.Fatalf("stale lock ack err = %v, want ErrPrDescriptionLockConflict", err)
+	}
+	pub, lock, outcome := p.dbPR(t, 41)
+	if pub == nil || pub.String() != v1.ID || lock != 1 || outcome == nil || *outcome != "published" {
+		t.Fatalf("a lost CAS must change nothing: published=%v lock=%d outcome=%v", pub, lock, outcome)
+	}
+	if st := p.dbVersionState(t, v2.ID); st != "pending" {
+		t.Fatalf("v2 state after the lost CAS = %q, want pending", st)
+	}
+	// The same ack at the current lock_version wins.
+	if a, err = p.ack(1, v2.ID, "published", 1, nil); err != nil || a.PR.PublishedVersion.ID != v2.ID || a.PR.LockVersion != 2 {
+		t.Fatalf("current-lock ack = %+v, %v", a, err)
+	}
+
+	// The DTO overlay and the claim read the published version.
+	run := mustRun(t, p.env, p.runID)
+	desc, last, err := p.svc.RunPrDescription(p.env.ctx, run)
+	if err != nil || desc == nil || desc.MrIid != 41 || desc.Fields.Summary != "Second pass." || desc.PublishedAt == nil ||
+		last == nil || *last != "published" {
+		t.Fatalf("RunPrDescription = %+v %v %v", desc, last, err)
+	}
+}
+
+func TestPrDescriptionStaleAndReleasedClaimLiveDB(t *testing.T) {
+	p := setupPrDescLive(t)
+	v := p.stage(t, 1, "Summary.", nil)
+	p.bind(t, 1, v.ID, 7, prDescLiveHashA)
+
+	// A stale generation loses on every write.
+	if _, err := p.svc.StagePrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionStageRequest{
+		ClaimGeneration: gen(0), Source: "lead_only", BaseSha: "abcdef0", HeadSha: "abcdef1", TargetBranch: "main",
+	}); !errors.Is(err, ErrPrDescriptionStaleClaim) {
+		t.Fatalf("stale stage err = %v", err)
+	}
+	if _, err := p.ack(0, v.ID, "published", 0, nil); !errors.Is(err, ErrPrDescriptionStaleClaim) {
+		t.Fatalf("stale ack err = %v", err)
+	}
+
+	// A released claim (a held-state switch) loses even at the right generation.
+	p.env.exec(`UPDATE runs SET claim_released_at = now() WHERE id = $1`, p.runID)
+	if _, err := p.ack(1, v.ID, "published", 0, nil); !errors.Is(err, ErrPrDescriptionStaleClaim) {
+		t.Fatalf("released-claim ack err = %v", err)
+	}
+	if _, err := p.svc.BindPrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionBindRequest{
+		ClaimGeneration: gen(1), VersionID: v.ID, MrIid: 7, RenderedRegionSha256: prDescLiveHashA,
+	}); !errors.Is(err, ErrPrDescriptionStaleClaim) {
+		t.Fatalf("released-claim bind err = %v", err)
+	}
+	pub, lock, outcome := p.dbPR(t, 7)
+	if pub != nil || lock != 0 || outcome != nil {
+		t.Fatalf("stale writes must change nothing: %v %d %v", pub, lock, outcome)
+	}
+
+	// Another worker (same user) holding no claim on the run is refused as not-owned.
+	other := uuid.New()
+	p.env.exec(`INSERT INTO workers (id, user_id, name, token_hash, status) VALUES ($1, $2, $3, $4, 'online')`,
+		other, p.wkr.UserID, "w-"+other.String(), other[:])
+	if _, err := p.svc.AckPrDescription(p.env.ctx, store.Worker{ID: other, UserID: p.wkr.UserID}, p.runID,
+		apitypes.PrDescriptionAckRequest{ClaimGeneration: gen(1), VersionID: v.ID, Outcome: "published"}); !errors.Is(err, ErrRunNotOwned) {
+		t.Fatalf("foreign worker ack err = %v, want ErrRunNotOwned", err)
+	}
+}
+
+// TestPrDescriptionReclaimAfterRequeueLiveDB: after a requeue and reclaim (claim_generation
+// advances), the old flight loses on every call, the new flight's version wins, and the new
+// flight cannot ack the old flight's version.
+func TestPrDescriptionReclaimAfterRequeueLiveDB(t *testing.T) {
+	p := setupPrDescLive(t)
+	old := p.stage(t, 1, "Old flight.", nil)
+	p.bind(t, 1, old.ID, 9, prDescLiveHashA)
+
+	// Requeue + reclaim by the same worker: the claim lane bumps the generation.
+	p.env.exec(`UPDATE runs SET claim_generation = 2, status = 'running' WHERE id = $1`, p.runID)
+
+	if _, err := p.ack(1, old.ID, "published", 0, nil); !errors.Is(err, ErrPrDescriptionStaleClaim) {
+		t.Fatalf("old flight ack err = %v, want stale", err)
+	}
+	if _, err := p.ack(2, old.ID, "published", 0, nil); !errors.Is(err, ErrPrDescriptionStaleClaim) {
+		t.Fatalf("new flight acking the old flight's version err = %v, want stale", err)
+	}
+	fresh := p.stage(t, 2, "New flight.", gen(9))
+	b := p.bind(t, 2, fresh.ID, 9, prDescLiveHashB)
+	a, err := p.ack(2, fresh.ID, "published", b.PR.LockVersion, nil)
+	if err != nil || a.PR.PublishedVersion == nil || a.PR.PublishedVersion.ID != fresh.ID || a.PR.PublishedVersion.ClaimGeneration != 2 {
+		t.Fatalf("new flight ack = %+v, %v", a, err)
+	}
+	if st := p.dbVersionState(t, old.ID); st != "pending" {
+		t.Fatalf("old version state = %q, want it left pending", st)
+	}
+}
+
+// TestPrDescriptionSkippedWriteKeepsPublishedLiveDB: a skipped or failed write records only
+// last_outcome and abandons its version; published_version_id still names what is on the forge.
+func TestPrDescriptionSkippedWriteKeepsPublishedLiveDB(t *testing.T) {
+	p := setupPrDescLive(t)
+	v1 := p.stage(t, 1, "First.", nil)
+	p.bind(t, 1, v1.ID, 3, prDescLiveHashA)
+	if _, err := p.ack(1, v1.ID, "published", 0, nil); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	lock := int64(1)
+	for _, outcome := range []string{"skipped_human_edit", "skipped_no_region", "skipped_malformed", "skipped_snapshot_moved", "write_failed"} {
+		v := p.stage(t, 1, "Refresh "+outcome, gen(3))
+		p.bind(t, 1, v.ID, 3, prDescLiveHashB)
+		a, err := p.ack(1, v.ID, outcome, lock, nil)
+		if err != nil {
+			t.Fatalf("%s ack: %v", outcome, err)
+		}
+		lock++
+		if a.PR.PublishedVersion == nil || a.PR.PublishedVersion.ID != v1.ID || *a.PR.LastOutcome != outcome || a.PR.LockVersion != lock {
+			t.Fatalf("%s: state = %+v", outcome, a.PR)
+		}
+		if st := p.dbVersionState(t, v.ID); st != "abandoned" {
+			t.Fatalf("%s: version state = %q, want abandoned", outcome, st)
+		}
+		pub, _, _ := p.dbPR(t, 3)
+		if pub == nil || pub.String() != v1.ID {
+			t.Fatalf("%s: published_version_id moved to %v", outcome, pub)
+		}
+	}
+	run := mustRun(t, p.env, p.runID)
+	desc, last, err := p.svc.RunPrDescription(p.env.ctx, run)
+	if err != nil || desc == nil || desc.Fields.Summary != "First." || last == nil || *last != "write_failed" {
+		t.Fatalf("overlay after skips = %+v %v %v", desc, last, err)
+	}
+}
+
+// TestPrDescriptionLostAckRecoveryLiveDB: a version whose forge write landed but whose ack was
+// lost is recovered by the next ack that observes its region hash, before that ack applies.
+func TestPrDescriptionLostAckRecoveryLiveDB(t *testing.T) {
+	p := setupPrDescLive(t)
+	lost := p.stage(t, 1, "Written, ack lost.", nil)
+	p.bind(t, 1, lost.ID, 5, prDescLiveHashA)
+
+	// Lookup classifies the forge region as a pending (lost-ack) version.
+	look, err := p.svc.LookupPrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionLookupRequest{
+		ClaimGeneration: gen(1), MrIid: 5, RegionSha256: prDescLiveHashA,
+	})
+	if err != nil || look.Match != "pending" || look.MatchedVersionID == nil || *look.MatchedVersionID != lost.ID ||
+		look.PR == nil || look.PR.PublishedVersion != nil {
+		t.Fatalf("lookup = %+v, %v", look, err)
+	}
+	if look, err = p.svc.LookupPrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionLookupRequest{
+		ClaimGeneration: gen(1), MrIid: 5, RegionSha256: prDescLiveHashC,
+	}); err != nil || look.Match != "none" {
+		t.Fatalf("unknown region lookup = %+v, %v", look, err)
+	}
+
+	// The next writer observes hash A on the forge and publishes its own version.
+	next := p.stage(t, 1, "Next write.", gen(5))
+	p.bind(t, 1, next.ID, 5, prDescLiveHashB)
+	observed := prDescLiveHashA
+	a, err := p.ack(1, next.ID, "published", 0, &observed)
+	if err != nil {
+		t.Fatalf("ack with recovery: %v", err)
+	}
+	if a.RecoveredVersionID == nil || *a.RecoveredVersionID != lost.ID {
+		t.Fatalf("recovered = %v, want the lost version", a.RecoveredVersionID)
+	}
+	if a.PR.PublishedVersion == nil || a.PR.PublishedVersion.ID != next.ID || a.PR.LockVersion != 1 {
+		t.Fatalf("after recovery + publish = %+v", a.PR)
+	}
+	if st := p.dbVersionState(t, lost.ID); st != "published" {
+		t.Fatalf("lost version state = %q, want published", st)
+	}
+
+	// Recovery before a SKIP: the recovered version stays the published one.
+	lost2 := p.stage(t, 1, "Written again, ack lost again.", gen(5))
+	p.bind(t, 1, lost2.ID, 5, prDescLiveHashC)
+	skip := p.stage(t, 1, "Human edited.", gen(5))
+	p.bind(t, 1, skip.ID, 5, prDescLiveHashB)
+	observed = prDescLiveHashC
+	a, err = p.ack(1, skip.ID, "skipped_human_edit", 1, &observed)
+	if err != nil || a.RecoveredVersionID == nil || *a.RecoveredVersionID != lost2.ID ||
+		a.PR.PublishedVersion == nil || a.PR.PublishedVersion.ID != lost2.ID || *a.PR.LastOutcome != "skipped_human_edit" {
+		t.Fatalf("recovery before skip = %+v, %v", a, err)
+	}
+	if look, err = p.svc.LookupPrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionLookupRequest{
+		ClaimGeneration: gen(1), MrIid: 5, RegionSha256: prDescLiveHashC,
+	}); err != nil || look.Match != "published" {
+		t.Fatalf("lookup after recovery = %+v, %v", look, err)
+	}
+}
+
+// TestAssembleClaimCarriesPrDescriptionLiveDB: a run whose PR already exists gets the PR's
+// record in its claim, found by runs.mr_iid; a re-claimed issue run with no runs.mr_iid finds it
+// through the latest version it bound; a run with no PR record carries none.
+func TestAssembleClaimCarriesPrDescriptionLiveDB(t *testing.T) {
+	p := setupPrDescLive(t)
+
+	// A real claim assembly opens the bot PAT and an Anthropic token (see
+	// claim_pause_pending_livedb_test.go).
+	botPATSealed, err := p.env.box.Seal([]byte(codexToken("bot-pat")))
+	if err != nil {
+		t.Fatalf("seal bot PAT: %v", err)
+	}
+	p.env.exec(`UPDATE forge_connections SET token_ciphertext = $1 WHERE user_id = $2`, botPATSealed, p.wkr.UserID)
+	anthropicSealed, err := p.env.box.Seal([]byte(codexToken("anthropic")))
+	if err != nil {
+		t.Fatalf("seal anthropic token: %v", err)
+	}
+	p.env.exec(`INSERT INTO user_secrets (id, user_id, kind, label, is_default, ciphertext, sealed_with)
+	          VALUES ($1, $2, 'anthropic_token', $3, true, $4, 'master')`,
+		uuid.New(), p.wkr.UserID, "anthropic-"+uuid.NewString(), anthropicSealed)
+
+	// No record yet: the claim carries no pr_description.
+	payload, err := p.svc.assembleClaim(p.env.ctx, p.wkr, mustRun(t, p.env, p.runID))
+	if err != nil {
+		t.Fatalf("assembleClaim: %v", err)
+	}
+	if payload.PrDescription != nil {
+		t.Fatalf("a run with no PR record must carry no pr_description, got %+v", payload.PrDescription)
+	}
+
+	v := p.stage(t, 1, "Published text.", nil)
+	p.bind(t, 1, v.ID, 11, prDescLiveHashA)
+	if _, err := p.ack(1, v.ID, "published", 0, nil); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	// Re-claimed issue run, runs.mr_iid never recorded: found through the bound version.
+	payload, err = p.svc.assembleClaim(p.env.ctx, p.wkr, mustRun(t, p.env, p.runID))
+	if err != nil {
+		t.Fatalf("assembleClaim: %v", err)
+	}
+	pd := payload.PrDescription
+	if pd == nil || pd.MrIid != 11 || pd.LockVersion != 1 || pd.PublishedVersion == nil ||
+		pd.PublishedVersion.ID != v.ID || pd.PublishedVersion.RenderedRegionSha256 == nil ||
+		*pd.PublishedVersion.RenderedRegionSha256 != prDescLiveHashA || pd.PublishedVersion.HeadSha != strings.Repeat("2", 40) ||
+		pd.PublishedVersion.TargetBranch != "main" || pd.PublishedVersion.Fields.Summary != "Published text." {
+		t.Fatalf("claim pr_description = %+v", pd)
+	}
+
+	// A refresh run on the same PR (a different run, runs.mr_iid set, as an mr_rework run has).
+	refreshID := uuid.New()
+	p.env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, worker_id, mr_iid)
+	        VALUES ($1, $2, $3, 'issue', 2, 't', 'd', 'claimed', $4, 11)`, refreshID, p.wkr.UserID, p.repo, p.wkr.ID)
+	payload, err = p.svc.assembleClaim(p.env.ctx, p.wkr, mustRun(t, p.env, refreshID))
+	if err != nil {
+		t.Fatalf("assembleClaim refresh: %v", err)
+	}
+	if payload.PrDescription == nil || payload.PrDescription.PublishedVersion == nil || payload.PrDescription.PublishedVersion.ID != v.ID {
+		t.Fatalf("refresh claim pr_description = %+v", payload.PrDescription)
+	}
+}

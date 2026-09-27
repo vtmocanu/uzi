@@ -178,6 +178,9 @@ var runDTOKeys = []string{
 	// them (and null forever on any generation failure); summary_deltas is
 	// tolerated-on-read (a malformed stored value arrives as null). Always on the wire.
 	"summary_intent", "summary_plan", "summary_deltas",
+	// PRD #1798: the PR's published description and last write outcome, set only on the
+	// GetRun detail read (null elsewhere), but the keys are always on the wire.
+	"pr_description", "pr_description_outcome",
 	"pipeline_ref", "pipeline_web_url", "fix_verdict",
 	// issue #279: a completed run that opened NO merge request (report-only/evidence
 	// completion) and its persisted findings summary. report_only is NOT NULL so always
