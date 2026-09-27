@@ -153,7 +153,8 @@ const GITLEAKS_BIN = "/usr/local/bin/gitleaks";
 //   - `remote.<name>.uploadpack` / `.promisor` with `extensions.partialClone` — also
 //     arbitrary-name, so not pinnable here; reached by LAZY FETCH of a missing object from any
 //     git, even a pure ref read. Closed by GIT_NO_LAZY_FETCH=1 below (and, for the worker-marked
-//     runner git, `protocol.allow=never`): issue #1783, round 3.
+//     runner git, GIT_ALLOW_PROTOCOL naming no protocol, which overrides every `protocol.*` key a
+//     planted config sets): issue #1783, round 3.
 const GIT_CODE_EXEC_KEY_PINS: ReadonlyArray<readonly [key: string, value: string]> = [
   ["core.fsmonitor", "false"],
   ["diff.external", "true"],
@@ -165,6 +166,9 @@ const GIT_CODE_EXEC_KEY_PINS: ReadonlyArray<readonly [key: string, value: string
 ];
 
 const GIT_TIMEOUT_MS = 10 * 60_000; // 10m — clones can be large on cold caches.
+/** issue #1783: provisioning's `check-ignore` of the scratch dir reads only the local ignore
+ *  files, so it is bounded far below GIT_TIMEOUT_MS (a planted FIFO would otherwise stall it). */
+const SCRATCH_IGNORE_CHECK_TIMEOUT_MS = 15_000;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 /** Wall-clock ceiling on the preserved_patch scan (the patch is already byte-capped by
  *  REVIEW_DIFF_MAX_BYTES, so gitleaks stdin finishes in well under a second in practice). */
@@ -1699,7 +1703,12 @@ export class GitCache {
       // while leaving other artifacts stageable. Publication refusal remains
       // necessary if an agent later changes the repository's ignore rules.
       try {
-        await this.runGitAsRunner(clonePath, ["check-ignore", "-q", "--no-index", "--", ".uzi/scratch/"]);
+        // Bounded: git opens .git/info/exclude with a plain blocking open, so a FIFO swapped in
+        // after the regular-file check above would otherwise hold this for GIT_TIMEOUT_MS. A
+        // timeout is a failed check, i.e. the same fail-closed refusal as any other failure.
+        await this.runGitAsRunner(clonePath, ["check-ignore", "-q", "--no-index", "--", ".uzi/scratch/"], {
+          timeoutMs: SCRATCH_IGNORE_CHECK_TIMEOUT_MS,
+        });
       } catch {
         throw new Error("repository ignore rules expose .uzi/scratch to ordinary staging");
       }
@@ -4728,7 +4737,7 @@ export class GitCache {
    * issue #1783: carries the worker spawn mark only for {@link runnerGitCarriesWorkerMark}'s
    * subcommands; every other runner git runs unmarked (its plants stay reapable).
    */
-  private async runGitAsRunner(cwd: string | undefined, args: string[]): Promise<string> {
+  private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number } = {}): Promise<string> {
     const base = gitEnv();
     // issue #1783 (R4): worker-marked ONLY when the subcommand can run no code the clone
     // configures (runnerGitCarriesWorkerMark), so a concurrent reap never kills that op. Every
@@ -4737,10 +4746,13 @@ export class GitCache {
     const runnerEnv: NodeJS.ProcessEnv = { ...base, PATH: runnerPath() };
     const marked = runnerGitCarriesWorkerMark(args);
     const env: NodeJS.ProcessEnv = marked ? workerSpawnEnv(runnerEnv) : unmarkedSpawnEnv(runnerEnv);
-    // Belt to gitEnv's GIT_NO_LAZY_FETCH for the marked subset: those reads need no transport
-    // at all, so `protocol.allow=never` refuses any a planted config could still reach (the seed's
-    // `clone --no-checkout` reads the bare over the local transport, so it is exempt).
-    if (marked && firstRunnerGitSubcommand(args) !== "clone") appendGitConfigPair(env, "protocol.allow", "never");
+    // Belt to gitEnv's GIT_NO_LAZY_FETCH for the marked subset: those reads need no transport at
+    // all, so GIT_ALLOW_PROTOCOL names no protocol and git refuses every transport. The env var
+    // overrides EVERY `protocol.allow` / `protocol.<name>.allow` config key, so a planted
+    // `[protocol "file"] allow = always` in the agent-writable .git/config cannot re-enable one
+    // (a `protocol.allow=never` config pin could be: the per-protocol key outranks it). The seed's
+    // `clone --no-checkout` reads the bare over the local transport, so it is exempt.
+    if (marked && firstRunnerGitSubcommand(args) !== "clone") env.GIT_ALLOW_PROTOCOL = RUNNER_GIT_NO_PROTOCOL;
     const tmp = runnerTmpdir();
     if (tmp) env.TMPDIR = tmp;
     // A permit-scoped subprocess is already launched as the isolated command uid
@@ -4753,7 +4765,7 @@ export class GitCache {
     try {
       const { stdout } = await this.execScoped(wrapped.command, wrapped.args, {
         env,
-        timeout: GIT_TIMEOUT_MS,
+        timeout: opts.timeoutMs ?? GIT_TIMEOUT_MS,
         maxBuffer: GIT_MAX_BUFFER,
       }, "command");
       return stdout;
@@ -4984,7 +4996,9 @@ export const OVERLAY_COMMIT_PREFIX = "ckpt(overlay):" as const;
  * the agent-writable config plants (its `uploadpack` is a program), and a planted program would
  * inherit the nonce. That path is closed by two pins, not by the subcommand choice:
  * GIT_NO_LAZY_FETCH=1 in {@link gitEnv} (every worker git, marked or not), and
- * `protocol.allow=never` on this marked subset (runGitAsRunner; the seed's local clone exempt).
+ * GIT_ALLOW_PROTOCOL={@link RUNNER_GIT_NO_PROTOCOL} on this marked subset (runGitAsRunner; the
+ * seed's local clone exempt), which no `protocol.*` key in the clone's config can override.
+ * test/git-no-lazy-fetch.test.ts runs the plant against each pin alone.
  * The runner clone's `.git/config` and `.gitattributes` are agent-writable, and the
  * arbitrary-name driver keys (`filter.<name>.*`,
  * `diff.<name>.*`, `merge.<name>.driver`) and `gpg.program` cannot be pinned off (see the
@@ -5008,13 +5022,18 @@ const RUNNER_GIT_MARKED_SUBCOMMANDS: ReadonlySet<string> = new Set([
   "check-ignore",
 ]);
 
-/** The subcommand of a git argv (leading `-c key=value` pairs skipped), or undefined. */
+/** A GIT_ALLOW_PROTOCOL value naming no real protocol: git then allows NO transport. */
+const RUNNER_GIT_NO_PROTOCOL = "none";
+
+/** The argv index of a git subcommand: the first index past any leading `-c key=value` pairs
+ *  (which may be `args.length`, i.e. past the end, when nothing follows them). */
 function firstRunnerGitSubcommandIndex(args: readonly string[]): number {
   let i = 0;
   while (args[i] === "-c" && i + 1 < args.length) i += 2;
   return i;
 }
 
+/** The subcommand of a git argv (leading `-c key=value` pairs skipped), or undefined. */
 function firstRunnerGitSubcommand(args: readonly string[]): string | undefined {
   return args[firstRunnerGitSubcommandIndex(args)];
 }
@@ -5027,13 +5046,6 @@ export function runnerGitCarriesWorkerMark(args: readonly string[]): boolean {
   return RUNNER_GIT_MARKED_SUBCOMMANDS.has(sub);
 }
 
-/** Append one inline `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` pair to a {@link gitEnv}-built env. */
-function appendGitConfigPair(env: NodeJS.ProcessEnv, key: string, value: string): void {
-  const n = Number.parseInt(env.GIT_CONFIG_COUNT ?? "0", 10) || 0;
-  env[`GIT_CONFIG_KEY_${n}`] = key;
-  env[`GIT_CONFIG_VALUE_${n}`] = value;
-  env.GIT_CONFIG_COUNT = String(n + 1);
-}
 
 export function gitEnv(pat?: string, httpScope?: string, username?: string): NodeJS.ProcessEnv {
   // REPLACEMENT env (M10 audit), NOT a process.env spread. A git subprocess can spawn

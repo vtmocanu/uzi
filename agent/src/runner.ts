@@ -3781,8 +3781,11 @@ export class RunRunner {
         checks,
       );
       // issue #1783: the install and the checks ran agent-authored code in the clone after the
-      // finalize proof; re-prove before anything credentialed (the align's fetch, the push).
-      await this.reproveFinalizeOrThrow(flight, "finalize_checks");
+      // finalize proof; re-prove before anything credentialed (the align's fetch, the push). This
+      // is a FULL proof (process reap AND Docker teardown), not a process-only re-proof: that code
+      // can start containers (a test suite's compose/testcontainers) after finalize's teardown,
+      // and they must not survive into the PAT push.
+      await this.reproveFinalizeOrThrow(flight, "finalize_checks", { docker: true });
     }
 
     // Guard-critical flag for an ad-hoc scheduled prompt run (PRD #241 Decision 10,
@@ -7012,8 +7015,9 @@ export class RunRunner {
    * the milestone checkpoint, and the pre-settle reap of every credentialed custody settle) first
    * runs {@link quiesceRun} (whose first step is that same killAgentTree) and skips the body with a
    * RunResidueBlockedError when the clone is not provably quiescent. After that proof, every
-   * runner-clone step able to start clone-configured code is followed by a process re-proof before
-   * the next credentialed step: the park and shutdown bodies' wip marker ({@link quiesceOrBlockSink}
+   * runner-clone step able to start clone-configured code is followed by a re-proof before the next
+   * credentialed step (process-only, except after the self-improve checks, whose agent-authored
+   * code can also start containers, so that one repeats the Docker teardown too): the park and shutdown bodies' wip marker ({@link quiesceOrBlockSink}
    * with `processOnly`); the settle transfer, the restore-point and hold captures' status read and
    * wip marker ({@link reproveAfterRunnerGit}); and, outside this facade, finalize's base-align and
    * self-improve checks ({@link reproveFinalizeOrThrow}). The milestone checkpoint body runs no
@@ -7112,12 +7116,18 @@ export class RunRunner {
    * once (`finalize`), then may still run code the clone configures before its PAT push: the
    * base-align's unmarked clone git (checkout --force, reset --hard, clean, merge/rebase, commit
    * can start a planted smudge filter or merge driver) and the dogfood self-improve dependency
-   * install + test suites (agent-authored code). Each is followed by this process re-proof before
-   * the refetch and the push; blocked fails the run exactly like the finalize gate (fail_origin
-   * `worker_residue_blocked`, the clone kept, no credentialed settle).
+   * install + test suites (agent-authored code). Each is followed by this re-proof before the
+   * refetch and the push; blocked fails the run exactly like the finalize gate (fail_origin
+   * `worker_residue_blocked`, the clone kept, no credentialed settle). After a plain runner git
+   * (the align) it is process-only; `docker: true` (after the self-improve checks, which can start
+   * containers) repeats the Docker teardown too. The Docker result never blocks.
    */
-  private async reproveFinalizeOrThrow(flight: RunFlight, site: string): Promise<void> {
-    const q = await this.quiesceRun(flight, flight.executor, { mode: "own", site: `${site}:after_runner_git`, processOnly: true });
+  private async reproveFinalizeOrThrow(flight: RunFlight, site: string, opts: { docker?: boolean } = {}): Promise<void> {
+    const q = await this.quiesceRun(flight, flight.executor, {
+      mode: "own",
+      site: `${site}:after_runner_git`,
+      processOnly: !opts.docker,
+    });
     if (!q.blocked) return;
     flight.preserveRecoveryClone = true;
     throw new RunResidueBlockedError(q.outcome.process?.detail ?? "not quiescent");

@@ -15,7 +15,11 @@ import { GitCache, gitEnv, runnerGitCarriesWorkerMark } from "../src/git.js";
 // sharpest case, because the program would inherit the worker nonce and be exempt from every reap;
 // but no worker git needs lazy fetch at all (every clone is a `clone --shared` of a full bare), so
 // the pin (GIT_NO_LAZY_FETCH=1) rides EVERY worker git. The marked subset additionally carries
-// `protocol.allow=never`: it needs no transport, so none may start.
+// GIT_ALLOW_PROTOCOL naming no protocol: it needs no transport, so none may start. The fixture
+// also plants `[protocol "file"] allow = always`, which would re-enable the file transport past a
+// `protocol.allow=never` config pin; the env var overrides it. Each marked case runs with every
+// pin present, with each pin stripped in turn (the other alone must still block), and with both
+// stripped (the control: the plant must fire), so each pin is proven independently.
 //
 // The plant is written with fs (not `git config`), and the "program" only writes a marker file.
 
@@ -32,6 +36,32 @@ let git: GitCache;
 type RunGitAsRunner = (cwd: string | undefined, args: string[]) => Promise<string>;
 const runAsRunner = (args: string[]): Promise<string> =>
   (git as unknown as { runGitAsRunner: RunGitAsRunner }).runGitAsRunner.call(git, clone, args);
+
+/** The two env pins a marked runner git carries against a lazy fetch. */
+const PINS = ["GIT_NO_LAZY_FETCH", "GIT_ALLOW_PROTOCOL"] as const;
+type ExecScoped = (command: string, args: string[], options: { env: NodeJS.ProcessEnv }, identity?: string) => Promise<unknown>;
+
+/**
+ * Run `args` through the real runGitAsRunner, deleting `strip` from the env it built just before
+ * the spawn (the env is otherwise exactly production's). Returns the env the git ran with.
+ */
+async function runAsRunnerWithout(args: string[], strip: readonly string[]): Promise<NodeJS.ProcessEnv> {
+  const self = git as unknown as { execScoped: ExecScoped };
+  const orig = self.execScoped;
+  let seen: NodeJS.ProcessEnv = {};
+  self.execScoped = function (this: unknown, command, argv, options, identity) {
+    const env = { ...options.env };
+    for (const k of strip) delete env[k];
+    seen = env;
+    return orig.call(git, command, argv, { ...options, env }, identity);
+  };
+  try {
+    await runAsRunner(args).catch(() => undefined);
+  } finally {
+    self.execScoped = orig;
+  }
+  return seen;
+}
 
 before(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-no-lazy-fetch-"));
@@ -53,7 +83,9 @@ before(() => {
   const cfg = fs.readFileSync(cfgPath, "utf8").replace(/repositoryformatversion = 0/, "repositoryformatversion = 1");
   fs.writeFileSync(
     cfgPath,
-    `${cfg}[extensions]\n\tpartialClone = evil\n[remote "evil"]\n\turl = ${clone}\n\tpromisor = true\n\tuploadpack = ${program}\n`,
+    `${cfg}[extensions]\n\tpartialClone = evil\n[remote "evil"]\n\turl = ${clone}\n\tpromisor = true\n\tuploadpack = ${program}\n` +
+      // Re-enable the file transport past any `protocol.allow` config pin.
+      `[protocol "file"]\n\tallow = always\n`,
   );
   git = new GitCache(path.join(root, "data"), nullLogger(), undefined, testGitCacheOptions());
 });
@@ -94,7 +126,31 @@ describe("issue #1783: runner-clone git never lazy-fetches through a planted pro
       await runAsRunner(args).catch(() => undefined);
       assert.deepEqual(plantedRuns(), [], "the planted uploadpack never ran");
     });
+
+    for (const strip of PINS) {
+      const kept = PINS.find((p) => p !== strip)!;
+      it(`marked \`git ${args.join(" ")}\` with only ${kept} still does not execute the planted program`, async () => {
+        fs.rmSync(marker, { force: true });
+        const env = await runAsRunnerWithout(args, [strip]);
+        assert.equal(env[strip], undefined, `${strip} was stripped`);
+        assert.ok(env[kept] !== undefined, `${kept} is carried`);
+        assert.deepEqual(plantedRuns(), [], `${kept} alone blocks the planted uploadpack`);
+      });
+    }
+
+    it(`control: marked \`git ${args.join(" ")}\` with BOTH pins stripped executes the planted program`, async () => {
+      fs.rmSync(marker, { force: true });
+      await runAsRunnerWithout(args, PINS);
+      assert.ok(plantedRuns().length > 0, "without the pins the same runner git reaches the plant");
+      fs.rmSync(marker, { force: true });
+    });
   }
+
+  it("a marked runner git carries GIT_ALLOW_PROTOCOL; an unmarked one and the seed's clone do not", async () => {
+    assert.equal((await runAsRunnerWithout(["rev-parse", "HEAD"], [])).GIT_ALLOW_PROTOCOL, "none");
+    assert.equal((await runAsRunnerWithout(["log", "-1"], [])).GIT_ALLOW_PROTOCOL, undefined);
+    assert.equal((await runAsRunnerWithout(["clone", "--no-checkout", "/nonexistent", "/nonexistent2"], [])).GIT_ALLOW_PROTOCOL, undefined);
+  });
 
   it("the public marked readers (branchTip, worktreeHead) do not execute the planted program", async () => {
     fs.rmSync(marker, { force: true });

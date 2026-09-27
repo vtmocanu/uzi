@@ -359,6 +359,43 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     assert.equal(fs.readFileSync(uzi, "utf8"), "not a directory");
   });
 
+  it("issue #1783: a FIFO swapped in at .git/info/exclude cannot stall the scratch check-ignore", { timeout: 60_000 }, async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    const excludePath = path.join(clone.path, ".git", "info", "exclude");
+    // The provisioner opens and stats the exclude itself (a FIFO there is refused as "not a regular
+    // file"), so the FIFO is swapped in AFTER that check: right before the check-ignore git runs,
+    // the race a surviving process could win. git then blocks opening it for reading.
+    type RunGitAsRunner = (cwd: string | undefined, args: string[], opts?: { timeoutMs?: number }) => Promise<string>;
+    const self = git as unknown as { runGitAsRunner: RunGitAsRunner };
+    const orig = self.runGitAsRunner;
+    let swapped = false;
+    self.runGitAsRunner = function (this: unknown, cwd, args, opts) {
+      if (args[0] === "check-ignore" && !swapped) {
+        swapped = true;
+        fs.rmSync(excludePath);
+        execFileSync("mkfifo", [excludePath]);
+      }
+      return orig.call(git, cwd, args, opts);
+    };
+    const started = Date.now();
+    try {
+      await assert.rejects(
+        (git as unknown as { provisionRunnerScratch(path: string): Promise<void> }).provisionRunnerScratch(clone.path),
+        (err: unknown) => {
+          assert.ok(err instanceof ScratchProvisionError);
+          assert.match(err.message, /repository ignore rules expose \.uzi\/scratch/);
+          return true;
+        },
+      );
+    } finally {
+      self.runGitAsRunner = orig;
+    }
+    assert.equal(swapped, true, "the check-ignore ran against the FIFO");
+    assert.ok(Date.now() - started < 30_000, `bounded well below the 10-minute git timeout (${Date.now() - started} ms)`);
+    assert.equal(fs.statSync(excludePath).isFIFO(), true);
+  });
+
   it("refuses a git exclude that would exceed the bound after appending the rule", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const clone = await git.createOrAttachRunnerClone(bare, 1719);

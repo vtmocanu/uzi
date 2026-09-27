@@ -14,7 +14,9 @@
 //     `clone --no-checkout`). Such a git is driver-free, not code-free by itself: a missing
 //     object would LAZY-FETCH through a promisor remote the clone's config plants (its
 //     `uploadpack` is a program). Every worker git pins GIT_NO_LAZY_FETCH=1 and the marked subset
-//     also `protocol.allow=never` (git.ts; test/git-no-lazy-fetch.test.ts runs the plant). A
+//     also GIT_ALLOW_PROTOCOL naming no protocol, which overrides every `protocol.*` key the
+//     clone's config sets (git.ts; test/git-no-lazy-fetch.test.ts runs the plant against each
+//     pin alone). A
 //     process carrying THIS worker's nonce and NO attempt marker is never run-owned: the reaper
 //     skips it, so a concurrent worker op survives a reap.
 //     Everything that can execute repo- or agent-authored code is deliberately NOT marked, so
@@ -28,7 +30,8 @@
 //     proof is therefore reapable, and every path that runs one between its proof and a
 //     credentialed step re-runs the process proof first (runner.ts): the park, shutdown and
 //     pause wip markers, the restore-point, hold and settle-transfer captures, and finalize's
-//     base-align and self-improve checks (before its refetch and PAT push).
+//     base-align and self-improve checks (before its refetch and PAT push; the checks' re-proof
+//     also repeats the Docker teardown, since agent-authored code can start containers).
 //
 // Threat model: the mark defends against ACCIDENTAL escape only. The nonce is random per worker
 // process and never enters a model-directed env, but it is not a secret against a deliberate

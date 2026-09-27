@@ -27,18 +27,27 @@ import {
   worktreeDirFor,
 } from "./runner-harness.js";
 
-// issue #1783 (reviewer, round 3) — every RE-PROOF a sink runs after its own runner-clone git (the
-// wip marker's status/add/commit, the finalize base-align, the self-improve checks), and every
-// mapping of a blocked re-proof onto the sink's outcome, is pinned here. The quiescer is SITE-aware:
-// it answers `survivors` only at ONE re-proof site (`<site>:after_runner_git`) and `quiescent`
-// everywhere else, so the first proof of each sink passes and ONLY the re-proof can stop the
-// credentialed step. Removing the re-proof (or its mapping) turns each test red.
+// issue #1783 (reviewer, round 3) — the RE-PROOFS a sink runs after its own runner-clone git or
+// agent-authored code, and the mapping of each blocked re-proof onto the sink's outcome, are
+// pinned here, one site per test: the limit park (`park`) and the pause park (`pause_park`) after
+// their wip marker; the graceful shutdown (`shutdown`) after its wip marker; the restore-point
+// captures (`recovery_capture`, `credential_switch`) and the settle transfer (`settle_transfer`)
+// after their status read / wip marker; the completion hold and the wall park (`hold_capture`)
+// after theirs; and finalize after its base-align (`finalize_align`) and after the self-improve
+// install + checks (`finalize_checks`, a full proof that also repeats the Docker teardown). The
+// quiescer is SITE-aware: it answers `survivors` only at ONE re-proof site
+// (`<site>:after_runner_git`) and `quiescent` everywhere else, so the first proof of each sink
+// passes and ONLY the re-proof can stop the credentialed step. Removing the re-proof (or its
+// mapping) turns each test red. (run-quiescence-planted-filter.test.ts additionally runs a real
+// planted filter through the limit, pause and wall parks and finalize's base-align.)
 
 installHarness();
 
 const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
 const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
 const RUNNER_OPTS = { checkpointIntervalMs: 0, recoveryRetryMs: 1 };
+/** A Docker endpoint the injected quiescer never dials: a re-proof handed it runs the Docker half. */
+const FAKE_DOCKER_HOST = "unix:///nonexistent/uzi-test-docker.sock";
 
 /**
  * Answers `survivors` at `blockSite` for its first `times` calls there, `quiescent` otherwise.
@@ -135,6 +144,96 @@ function waitAbort(signal: AbortSignal): Promise<void> {
     signal.addEventListener("abort", () => resolve(), { once: true });
   });
 }
+
+// ─── limit park / pause park: the re-proof after the wip marker ────────────────────────────
+
+describe("issue #1783: the limit park re-proves after its wip marker", () => {
+  it("blocked at park:after_runner_git: the park stands (limit_wait), nothing fetched back or published", async () => {
+    const { gitlab } = fakeGitlab();
+    const iid = 1878;
+    const q = siteQuiescer("park:after_runner_git");
+    const pub = spyPublish();
+    const fetch = spyFetchBack(q.lastBlocked);
+    const factory: ExecutorFactory = (runId) => ({
+      homeDir: path.join(homeDir, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          commitWork(ctx.worktreePath);
+          fs.writeFileSync(path.join(ctx.worktreePath, "UNCOMMITTED.txt"), "in progress\n");
+          const { LimitReachedError } = await import("../src/limit.js");
+          throw new LimitReachedError({ resetsAtMs: Date.now() + 5 * 3600_000, rateLimitType: "five_hour" });
+        },
+      },
+    });
+    const claim = gitlabClaim(iid, { wait_on_limit: true });
+    await runnerWith(factory, gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun: q.quiesceRun }).execute(claim);
+    assert.ok(q.sites().includes("park"), "the first proof ran (and passed)");
+    assert.equal(q.blockedCount(), 1, "the re-proof after the wip marker ran and blocked");
+    assert.ok(statuses(claim.run_id).includes("limit_wait"), "the park stands");
+    assert.equal(fetch.total(), 0, "no fetch-back");
+    assert.equal(pub.calls(), 0, "no checkpoint published");
+    assert.ok(
+      statusTexts(claim.run_id).some((t) => t.startsWith("park checkpoint NOT published")),
+      JSON.stringify(statusTexts(claim.run_id)),
+    );
+    assert.equal(trackingSha(iid), null, "the tracking ref is untouched");
+  });
+});
+
+describe("issue #1783: the pause park re-proves after its wip marker", () => {
+  it("blocked at pause_park:after_runner_git: pause_failed (never paused), the marker undone, nothing fetched back or published", async () => {
+    const { gitlab } = fakeGitlab();
+    const iid = 1879;
+    const q = siteQuiescer("pause_park:after_runner_git");
+    const pub = spyPublish();
+    const fetch = spyFetchBack(q.lastBlocked);
+    let undos = 0;
+    const origUndo = git.undoWipMarker.bind(git);
+    git.undoWipMarker = (async (...a: Parameters<typeof git.undoWipMarker>) => {
+      undos += 1;
+      return origUndo(...a);
+    }) as typeof git.undoWipMarker;
+    const parked: Array<boolean | undefined> = [];
+    const after: { head?: string; status?: string; fetches?: number; publishes?: number; tracking?: string | null } = {};
+    let trackingBefore: string | null | undefined;
+    const factory: ExecutorFactory = (runId) => ({
+      homeDir: path.join(homeDir, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          commitWork(ctx.worktreePath);
+          fs.writeFileSync(path.join(ctx.worktreePath, "UNCOMMITTED.txt"), "in progress\n");
+          trackingBefore = trackingSha(iid);
+          const p = await ctx.parkForPause?.({ completedCount: 1, total: 2 });
+          parked.push(p);
+          // Observed right after the declined park, before the run goes on to finalize.
+          after.head = gitIn(ctx.worktreePath, ["log", "-1", "--format=%s"]);
+          after.status = gitIn(ctx.worktreePath, ["status", "--porcelain"]);
+          after.fetches = fetch.total();
+          after.publishes = pub.calls();
+          after.tracking = trackingSha(iid);
+          return { branch: ctx.branch };
+        },
+      },
+    });
+    const claim = gitlabClaim(iid);
+    await runnerWith(factory, gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun: q.quiesceRun }).execute(claim);
+    assert.deepEqual(parked, [false], "the pause did not park");
+    assert.ok(q.sites().includes("pause_park"), "the first proof ran (and passed)");
+    assert.equal(q.blockedCount(), 1, "the re-proof after the wip marker ran and blocked");
+    const st = statuses(claim.run_id);
+    assert.ok(st.includes("pause_failed"), `pause_failed reported: ${st.join(",")}`);
+    assert.ok(!st.includes("paused"), "never paused");
+    assert.equal(undos, 1, "the wip marker was undone");
+    assert.equal(after.head, "work", "HEAD is the agent's own commit, not a wip(park): marker");
+    assert.match(after.status ?? "", /^\?\? UNCOMMITTED\.txt$/m, "the marker's content is back in the uncommitted tree");
+    assert.equal(after.fetches, 0, "no fetch-back");
+    assert.equal(fetch.early(), 0, "no fetch-back right after the blocked re-proof");
+    assert.equal(after.publishes, 0, "no checkpoint published");
+    assert.equal(after.tracking, trackingBefore, "the tracking ref is unchanged");
+    const reproof = q.calls.find((c) => c.site === "pause_park:after_runner_git");
+    assert.equal(reproof?.dockerHost, undefined, "a re-proof after a plain runner git is process-only");
+  });
+});
 
 // ─── graceful shutdown: the re-proof after the wip marker ──────────────────────────────────
 
@@ -406,7 +505,12 @@ describe("issue #1783: finalize re-proves after its runner-clone steps, before t
       },
     });
     const claim = githubClaim(iid);
-    await runnerWith(factory, fakeGitlab().gitlab, undefined, undefined, { ...RUNNER_OPTS, github, quiesceRun: q.quiesceRun }).execute(claim);
+    await runnerWith(factory, fakeGitlab().gitlab, undefined, undefined, {
+      ...RUNNER_OPTS,
+      github,
+      quiesceRun: q.quiesceRun,
+      dockerHost: FAKE_DOCKER_HOST,
+    }).execute(claim);
     const failed = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed").at(-1)?.body;
     assert.ok(q.sites().includes("finalize"), "the finalize gate ran (and passed)");
     assert.equal(q.blockedCount(), 1, "the re-proof after the align ran and blocked");
@@ -417,6 +521,8 @@ describe("issue #1783: finalize re-proves after its runner-clone steps, before t
     assert.equal(prCalls.length, 0, "no PR");
     assert.equal(originHasBranch(`agent/issue-${iid}`), false, "nothing reached origin");
     assert.equal(fs.existsSync(path.join(worktreeDirFor(iid), "WORK.txt")), true, "the clone is kept");
+    const reproof = q.calls.find((c) => c.site === "finalize_align:after_runner_git");
+    assert.equal(reproof?.dockerHost, undefined, "the re-proof after the align's plain runner git is process-only");
   });
 
   it("self-improve checks: a blocked finalize_checks re-proof fails the run typed worker_residue_blocked, no MR", async () => {
@@ -442,11 +548,50 @@ describe("issue #1783: finalize re-proves after its runner-clone steps, before t
       ...RUNNER_OPTS,
       checkRunner,
       quiesceRun: q.quiesceRun,
+      dockerHost: FAKE_DOCKER_HOST,
     }).execute(claim);
     const failed = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed").at(-1)?.body;
     assert.ok(checksRan >= 1, "the self-improve checks ran");
     assert.equal(q.blockedCount(), 1, "the re-proof after the checks ran and blocked");
     assert.equal(failed?.fail_origin, "worker_residue_blocked", JSON.stringify(failed));
     assert.equal(mrCalls.length, 0, "no MR opened");
+    // The checks ran agent-authored code that can start containers after finalize's teardown: the
+    // re-proof repeats the Docker teardown (it is handed the daemon), not just the process half.
+    const reproof = q.calls.find((c) => c.site === "finalize_checks:after_runner_git");
+    assert.equal(reproof?.dockerHost, FAKE_DOCKER_HOST, "the finalize_checks re-proof runs the Docker teardown");
+  });
+
+  it("self-improve checks: a quiescent finalize_checks re-proof tears Docker down before the MR is opened", async () => {
+    const { gitlab, calls: mrCalls } = fakeGitlab();
+    const q = siteQuiescer("none");
+    let dockerTeardownAtChecks = 0;
+    let mrsWhenTornDown = -1;
+    const quiesceRun = async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
+      if (req.site === "finalize_checks:after_runner_git" && req.dockerHost !== undefined) {
+        dockerTeardownAtChecks += 1;
+        mrsWhenTornDown = mrCalls.length;
+      }
+      return q.quiesceRun(req);
+    };
+    const claim = makeClaim({
+      kind: "self_improve",
+      issue_iid: 78,
+      issue_title: "Self-improvement cycle",
+      issue_description: "Pick one top improvement and land it.",
+      base_branch: "main",
+      self_improve_dogfood: true,
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      last_seq: 0,
+      secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
+    });
+    await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
+      ...RUNNER_OPTS,
+      checkRunner: async (check) => ({ name: check.name, status: "skipped", detail: "test: not run" }),
+      quiesceRun,
+      dockerHost: FAKE_DOCKER_HOST,
+    }).execute(claim);
+    assert.equal(dockerTeardownAtChecks, 1, "one Docker teardown at finalize_checks");
+    assert.equal(mrsWhenTornDown, 0, "it ran before the MR was opened");
+    assert.ok(mrCalls.length >= 1, "the run went on to open its MR");
   });
 });
