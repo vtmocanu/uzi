@@ -145,7 +145,7 @@ func TestRecoveryWaitUntypedCausesStayNullLiveDB(t *testing.T) {
 	}
 }
 
-// TestRecoveryWaitVaultLockedMigrationRoundTripLiveDB proves migration 00256 in an ISOLATED
+// TestRecoveryWaitVaultLockedMigrationRoundTripLiveDB proves migration 00257 in an ISOLATED
 // database: Up admits 'vault_locked' (and still refuses an unknown cause); Down clears every
 // vault_locked cause to NULL and restores the four-value CHECK, which then refuses it.
 func TestRecoveryWaitVaultLockedMigrationRoundTripLiveDB(t *testing.T) {
@@ -184,8 +184,8 @@ func TestRecoveryWaitVaultLockedMigrationRoundTripLiveDB(t *testing.T) {
 	u.Path = "/" + name
 	isoDSN := u.String()
 
-	if err := store.MigrateTo(ctx, isoDSN, 256); err != nil {
-		t.Fatalf("MigrateTo(256): %v", err)
+	if err := store.MigrateTo(ctx, isoDSN, 257); err != nil {
+		t.Fatalf("MigrateTo(257): %v", err)
 	}
 	pool, err := store.OpenPool(ctx, isoDSN)
 	if err != nil {
@@ -217,18 +217,18 @@ func TestRecoveryWaitVaultLockedMigrationRoundTripLiveDB(t *testing.T) {
 		id := uuid.New()
 		if err := exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, recovery_wait_cause)
 		                VALUES ($1, $2, $3, 'issue', $4, 't', 'd', 'recovery_wait', $5)`, id, userID, repoID, iid, cause); err != nil {
-			t.Fatalf("seed run with cause %q at 00256: %v", cause, err)
+			t.Fatalf("seed run with cause %q at 00257: %v", cause, err)
 		}
 		return id
 	}
 	locked := seedRun(1, "vault_locked")
 	forge := seedRun(2, "forge_unreachable")
 	if err := exec(`UPDATE runs SET recovery_wait_cause = 'not_a_cause' WHERE id = $1`, forge); err == nil {
-		t.Fatal("00256's CHECK admitted an unknown cause")
+		t.Fatal("00257's CHECK admitted an unknown cause")
 	}
 
-	if err := store.MigrateDownTo(ctx, isoDSN, 255); err != nil {
-		t.Fatalf("MigrateDownTo(255): %v", err)
+	if err := store.MigrateDownTo(ctx, isoDSN, 256); err != nil {
+		t.Fatalf("MigrateDownTo(256): %v", err)
 	}
 	causeOf := func(id uuid.UUID) pgtype.Text {
 		t.Helper()
