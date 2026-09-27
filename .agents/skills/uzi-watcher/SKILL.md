@@ -40,6 +40,7 @@ steering is done with it.
   any approve, revise or reject, and report the missing requirement once.
 - **Bound but unavailable** (not live, no route, or no verdict after two requests)
   → ask for a replacement or solo authorization. Never downgrade silently.
+- **Solo** (user-authorized) skips the co-sign; the plan-trap checks still apply.
 - Prefer a cross-family buddy (Claude with Codex); name a same-family one to the user.
 - **The buddy co-signs the exact action**: run id, plan seq, the verb (approve,
   revise or reject) and, for a revise or reject, the final message text. Ask it for

@@ -77,7 +77,9 @@ this lander's second pair of eyes.
   stop before the merge and report the missing requirement once.
 - **Bound but unavailable** (not live, no route, or no verdict after two requests)
   → ask for a replacement or solo authorization. Never downgrade silently.
-- **Solo waives only the buddy**, never independent review, CI or a user review.
+- **Solo waives only the buddy**, never independent review, CI or a user review. Where
+  the table below names the buddy, solo substitutes one local reviewer pinned to the
+  head; every other required review stays.
 - Prefer a cross-family buddy (Claude with Codex); name a same-family one in the trail.
 - **One request per pushed head.** The buddy reviews the exact head SHA; reuse its
   verdict until the head moves. For a user-authorized multi-round loop run
@@ -380,8 +382,8 @@ Branch on the poller's own `EXIT=`/`RESULT=` line, never on the harness's task s
 - Other behaviour changes, new scripts and new rules are batched into **one
   end-of-session ask** ("these three improvements to `uzi-lander`, ok?"), not applied
   silently.
-- A skill-maintenance PR is titled with `[skip-cr]` (no bot review), reviewed by a local
-  the buddy, and by the user. Re-run `agnix` on `SKILL.md` after editing;
+- A skill-maintenance PR is titled with `[skip-cr]` (no bot review), reviewed by the buddy
+  (solo: a local reviewer) and by the user. Re-run `agnix` on `SKILL.md` after editing;
   `task check:skill-size` gates the size. A Codex buddy's shim delivers at most three
   consecutive replies per 30 minutes; for a longer review loop run
   `peers.py budget allow buddy --replies N` (session-peers skill), otherwise the
