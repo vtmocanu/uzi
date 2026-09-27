@@ -278,6 +278,10 @@ WHERE user_id = @user_id AND kind = @kind AND is_default;
 -- after ClearDefaultUserSecret; owner-scoped. Returns metadata for the response.
 -- The caller has already verified ownership via GetUserSecretForUpdate under the
 -- lock; the SQL guard also refuses a disabled target.
+-- LOCK ORDER (PRD #1732 D14): a multi-row user_secrets transition takes the user's
+-- secret-mutation lock EXCLUSIVELY first (store.LockSecretMutation, via withSecretLock),
+-- before this statement locks any row; see the LOCK ORDER note on
+-- UpsertCodexAccountRateLimits in codex_rate_limits.sql for why the Codex poll writes rely on it.
 UPDATE user_secrets SET is_default = true, updated_at = now()
 WHERE id = @id AND user_id = @user_id AND disabled_at IS NULL
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
@@ -388,6 +392,13 @@ SELECT id, kind, label, is_default, auto_eligible, created_at, updated_at,
 FROM user_secrets WHERE id = @id AND user_id = @user_id;
 
 -- name: SetSecretEnablement :one
+-- Flip ONE credential's enablement (PRD #1732 D10/D11): disabled_at set or cleared and
+-- enablement_rev bumped, only when the state actually changes, so a repeat is a no-op that
+-- keeps the original timestamp and revision (0 rows). Owner-scoped.
+-- LOCK ORDER (PRD #1732 D14): a multi-row user_secrets transition takes the user's
+-- secret-mutation lock EXCLUSIVELY first (store.LockSecretMutation, via withSecretLock),
+-- before this statement locks any row; see the LOCK ORDER note on
+-- UpsertCodexAccountRateLimits in codex_rate_limits.sql for why the Codex poll writes rely on it.
 UPDATE user_secrets
 SET disabled_at = CASE WHEN @enabled::boolean THEN NULL ELSE now() END,
     enablement_rev = enablement_rev + 1, updated_at = now()

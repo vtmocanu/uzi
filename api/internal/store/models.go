@@ -164,6 +164,7 @@ type CodexAccountRateLimit struct {
 	AttemptError               pgtype.Text        `json:"attempt_error"`
 	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
+	EnablementSig              pgtype.Text        `json:"enablement_sig"`
 }
 
 type CodexCredentialState struct {

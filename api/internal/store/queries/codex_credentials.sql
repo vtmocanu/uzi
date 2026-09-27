@@ -117,6 +117,10 @@ WHERE user_id = @user_id AND kind IN ('openai_api_key', 'codex_auth');
 -- advisory lock so it cannot race a concurrent promote into two defaults. Affects the
 -- single codex default row, or 0 when there is none. anthropic_token is untouched: it
 -- keeps its own separate default via 00077's per-kind index.
+-- LOCK ORDER (PRD #1732 D14): a multi-row user_secrets transition takes the user's
+-- secret-mutation lock EXCLUSIVELY first (store.LockSecretMutation, via withSecretLock),
+-- before this statement locks any row; see the LOCK ORDER note on
+-- UpsertCodexAccountRateLimits in codex_rate_limits.sql for why the Codex poll writes rely on it.
 UPDATE user_secrets SET is_default = false, updated_at = now()
 WHERE user_id = @user_id AND is_default AND kind IN ('openai_api_key', 'codex_auth');
 

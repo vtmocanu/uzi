@@ -1188,6 +1188,13 @@ type SetSecretEnablementRow struct {
 	EnablementRev int64              `json:"enablement_rev"`
 }
 
+// Flip ONE credential's enablement (PRD #1732 D10/D11): disabled_at set or cleared and
+// enablement_rev bumped, only when the state actually changes, so a repeat is a no-op that
+// keeps the original timestamp and revision (0 rows). Owner-scoped.
+// LOCK ORDER (PRD #1732 D14): a multi-row user_secrets transition takes the user's
+// secret-mutation lock EXCLUSIVELY first (store.LockSecretMutation, via withSecretLock),
+// before this statement locks any row; see the LOCK ORDER note on
+// UpsertCodexAccountRateLimits in codex_rate_limits.sql for why the Codex poll writes rely on it.
 func (q *Queries) SetSecretEnablement(ctx context.Context, arg SetSecretEnablementParams) (SetSecretEnablementRow, error) {
 	row := q.db.QueryRow(ctx, setSecretEnablement, arg.Enabled, arg.ID, arg.UserID)
 	var i SetSecretEnablementRow
@@ -1294,6 +1301,10 @@ type SetUserSecretDefaultRow struct {
 // after ClearDefaultUserSecret; owner-scoped. Returns metadata for the response.
 // The caller has already verified ownership via GetUserSecretForUpdate under the
 // lock; the SQL guard also refuses a disabled target.
+// LOCK ORDER (PRD #1732 D14): a multi-row user_secrets transition takes the user's
+// secret-mutation lock EXCLUSIVELY first (store.LockSecretMutation, via withSecretLock),
+// before this statement locks any row; see the LOCK ORDER note on
+// UpsertCodexAccountRateLimits in codex_rate_limits.sql for why the Codex poll writes rely on it.
 func (q *Queries) SetUserSecretDefault(ctx context.Context, arg SetUserSecretDefaultParams) (SetUserSecretDefaultRow, error) {
 	row := q.db.QueryRow(ctx, setUserSecretDefault, arg.ID, arg.UserID)
 	var i SetUserSecretDefaultRow

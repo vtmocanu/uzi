@@ -21,7 +21,8 @@ import (
 //
 // no_subscription is DELIBERATELY absent here: it is not a per-account status but the shape
 // a user with no linked subscription account produces — an EMPTY accounts array, which both
-// store reads already yield (their EXISTS(linked) filter drops unlinked accounts). So there
+// store reads already yield (their EXISTS(enabled linked alias) filter drops unlinked
+// accounts, and since PRD #1732 M4 accounts whose aliases are all disabled). So there
 // is no per-account value to represent it, and a lone unused const would trip the unused
 // linter; the empty array carries the meaning.
 const (
@@ -89,9 +90,10 @@ func (h *Handler) SelfCodexRateLimits(w http.ResponseWriter, r *http.Request) {
 // Admin-only (mounted under RequireAdminRO), so a non-admin never reaches here.
 //
 // The query returns one row per (user, account), ordered by email then account id and
-// driven from codex_provider_account with an EXISTS(linked) filter, so a user with no
-// linked account simply does not appear (there is no token-less row to skip, unlike the
-// Anthropic admin fold) and consecutive rows for one user collapse into a single
+// driven from codex_provider_account with an EXISTS(enabled linked alias) filter, so a user
+// with no linked account, or only disabled aliases (PRD #1732 D9), simply does not appear
+// (there is no token-less row to skip, unlike the Anthropic admin fold) and consecutive
+// rows for one user collapse into a single
 // CodexAdminRateLimitRowDTO without a map — the ORDER BY is what makes the fold correct.
 // vault_locked is folded in-memory per user (looked up once, on the user's first row),
 // exactly as AdminRateLimits does.

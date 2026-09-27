@@ -343,7 +343,8 @@ SELECT
     rl.source,
     rl.synced_at
 FROM users u
-LEFT JOIN user_secrets s ON s.user_id = u.id AND s.kind = 'anthropic_token'
+LEFT JOIN user_secrets s
+       ON s.user_id = u.id AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
 LEFT JOIN anthropic_rate_limits rl
        ON rl.user_secret_id = s.id AND rl.enablement_rev = s.enablement_rev
 ORDER BY u.email ASC, s.is_default DESC NULLS LAST, lower(s.label) ASC
@@ -385,6 +386,11 @@ type ListRateLimitsRow struct {
 // token as un-pooled — a confident, uniform, wrong answer, which is worse than the
 // field being absent. It is nullable through the LEFT JOIN (a token-less user's row
 // has no secret at all), and that row is skipped before the flag is read.
+//
+// A DISABLED token yields no row and no count (PRD #1732 D9, M4). The filter lives in
+// the user_secrets JOIN condition, not in WHERE, so a user whose tokens are all
+// disabled still appears exactly as a token-less user does (one row, NULL secret id,
+// an empty tokens array), rather than vanishing from the admin list.
 // Current-revision readings only (PRD #1732 D13), as in ListRateLimitsForUser.
 func (q *Queries) ListRateLimits(ctx context.Context) ([]ListRateLimitsRow, error) {
 	rows, err := q.db.Query(ctx, listRateLimits)
@@ -434,7 +440,7 @@ SELECT s.id            AS user_secret_id,
 FROM user_secrets s
 LEFT JOIN anthropic_rate_limits rl
        ON rl.user_secret_id = s.id AND rl.enablement_rev = s.enablement_rev
-WHERE s.user_id = $1 AND s.kind = 'anthropic_token'
+WHERE s.user_id = $1 AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
 ORDER BY s.is_default DESC, lower(s.label) ASC
 `
 
@@ -473,6 +479,10 @@ type ListRateLimitsForUserRow struct {
 // A reading counts only at the token's current enablement revision (PRD #1732
 // D13): the rev match lives in the LEFT JOIN, so a reading from before a disable
 // makes the token read as never polled after the re-enable until a fresh one lands.
+//
+// A DISABLED token is not listed at all (PRD #1732 D1, M4): the owner's meters are a
+// live view, and a suspended credential has no live reading. GET /api/me/secrets
+// (ListSecretEnablement) is where the owner still sees it, with enabled:false.
 func (q *Queries) ListRateLimitsForUser(ctx context.Context, userID uuid.UUID) ([]ListRateLimitsForUserRow, error) {
 	rows, err := q.db.Query(ctx, listRateLimitsForUser, userID)
 	if err != nil {

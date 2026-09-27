@@ -29,17 +29,36 @@ SELECT
 FROM codex_provider_account a
 LEFT JOIN codex_account_rate_limits rl
     ON rl.user_id = a.user_id AND rl.provider_account_id = a.id
+    -- Current readings only (PRD #1732 D13, M4): every ENABLED linked alias must appear in
+    -- the reading's enablement_sig at its current revision (NULL = a pre-column row, which
+    -- covers exactly the revision-0 aliases). A reading from before a disable and re-enable
+    -- therefore reads as no reading (pending) until the re-enable's own poll lands one. A
+    -- sibling that was disabled, or linked, while the account stayed live does not hide it.
+    AND NOT EXISTS (
+        SELECT 1 FROM codex_credential_state cs
+        JOIN user_secrets us ON us.id = cs.user_secret_id AND us.user_id = cs.user_id
+        WHERE cs.user_id = a.user_id AND cs.provider_account_id = a.id AND cs.status = 'linked'
+            AND us.disabled_at IS NULL
+            AND NOT CASE
+                WHEN rl.enablement_sig IS NULL THEN us.enablement_rev = 0
+                ELSE (us.id::text || ':' || us.enablement_rev::text)
+                     = ANY (string_to_array(rl.enablement_sig, ','))
+            END
+    )
 LEFT JOIN LATERAL (
     SELECT array_agg(us.label ORDER BY us.is_default DESC, lower(us.label)) AS labels,
            bool_or(us.is_default)                                           AS is_default
     FROM codex_credential_state s
     JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
     WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+        AND us.disabled_at IS NULL
 ) al ON true
 WHERE a.user_id = $1
     AND EXISTS (
         SELECT 1 FROM codex_credential_state s
+        JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
         WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+            AND us.disabled_at IS NULL
     )
 ORDER BY a.id
 `
@@ -67,6 +86,11 @@ type GetCodexAccountRateLimitsForUserRow struct {
 // name WHICH account each meter describes without a second query. Owner-scoped; carries
 // only labels + flags + the reading, never a token/login/raw-provider-id. Ordered by
 // account id for a deterministic list.
+//
+// ENABLED aliases only (PRD #1732 D6/D8, M4): an account is listed only while at least one
+// ENABLED alias is linked to it (the same liveness rule as ListLinkedCodexAccountsToPoll),
+// and its alias labels and default flag roll up enabled aliases only, so a disabled alias's
+// label never names a meter. An account whose aliases are all disabled is simply absent.
 func (q *Queries) GetCodexAccountRateLimitsForUser(ctx context.Context, userID uuid.UUID) ([]GetCodexAccountRateLimitsForUserRow, error) {
 	rows, err := q.db.Query(ctx, getCodexAccountRateLimitsForUser, userID)
 	if err != nil {
@@ -121,16 +145,35 @@ FROM codex_provider_account a
 JOIN users u ON u.id = a.user_id
 LEFT JOIN codex_account_rate_limits rl
     ON rl.user_id = a.user_id AND rl.provider_account_id = a.id
+    -- Current readings only (PRD #1732 D13, M4): every ENABLED linked alias must appear in
+    -- the reading's enablement_sig at its current revision (NULL = a pre-column row, which
+    -- covers exactly the revision-0 aliases). A reading from before a disable and re-enable
+    -- therefore reads as no reading (pending) until the re-enable's own poll lands one. A
+    -- sibling that was disabled, or linked, while the account stayed live does not hide it.
+    AND NOT EXISTS (
+        SELECT 1 FROM codex_credential_state cs
+        JOIN user_secrets us ON us.id = cs.user_secret_id AND us.user_id = cs.user_id
+        WHERE cs.user_id = a.user_id AND cs.provider_account_id = a.id AND cs.status = 'linked'
+            AND us.disabled_at IS NULL
+            AND NOT CASE
+                WHEN rl.enablement_sig IS NULL THEN us.enablement_rev = 0
+                ELSE (us.id::text || ':' || us.enablement_rev::text)
+                     = ANY (string_to_array(rl.enablement_sig, ','))
+            END
+    )
 LEFT JOIN LATERAL (
     SELECT array_agg(us.label ORDER BY us.is_default DESC, lower(us.label)) AS labels,
            bool_or(us.is_default)                                           AS is_default
     FROM codex_credential_state s
     JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
     WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+        AND us.disabled_at IS NULL
 ) al ON true
 WHERE EXISTS (
     SELECT 1 FROM codex_credential_state s
+    JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
     WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+        AND us.disabled_at IS NULL
 )
 ORDER BY u.email ASC, a.id ASC
 `
@@ -160,6 +203,9 @@ type ListCodexAccountRateLimitsRow struct {
 // one. vault_locked is DELIBERATELY not selected: like ListRateLimits it is computed
 // in-memory from the live vault, never stored, so the handler folds it in. Ordered by email
 // then account id for a stable admin list.
+//
+// Same enabled-alias rule as the owner read (PRD #1732 D9, M4): an account with no enabled
+// linked alias yields no row and no count, and disabled alias labels are never listed.
 func (q *Queries) ListCodexAccountRateLimits(ctx context.Context) ([]ListCodexAccountRateLimitsRow, error) {
 	rows, err := q.db.Query(ctx, listCodexAccountRateLimits)
 	if err != nil {
@@ -377,23 +423,42 @@ WITH secret_mutation_lock AS MATERIALIZED (
 INSERT INTO codex_account_rate_limits (
     user_id, provider_account_id, buckets,
     observed_generation, observed_credential_revision,
-    last_success_at, last_attempt_at, attempt_status, attempt_error
+    last_success_at, last_attempt_at, attempt_status, attempt_error, enablement_sig
 )
 SELECT $1, $2, NULL::jsonb,
        NULL::bigint, NULL::bigint,
-       NULL::timestamptz, now(), $3::text, $4::text
+       NULL::timestamptz, now(), $3::text, $4::text, $5::text
 WHERE EXISTS (
     SELECT 1 FROM codex_provider_account a
     WHERE a.user_id = $1 AND a.id = $2
-        AND a.generation = $5::bigint
-        AND a.credential_revision = $6::bigint
+        AND a.generation = $6::bigint
+        AND a.credential_revision = $7::bigint
 ) AND EXISTS (
     SELECT 1 FROM linked_aliases la WHERE la.disabled_at IS NULL
 ) AND (
     SELECT COALESCE(string_agg(la.id::text || ':' || la.enablement_rev::text, ',' ORDER BY la.id), '')
     FROM linked_aliases la
-) = $7::text
+) = $5::text
 ON CONFLICT (user_id, provider_account_id) DO UPDATE SET
+    (buckets, observed_generation, observed_credential_revision, last_success_at, enablement_sig) = (
+        SELECT CASE WHEN cur.ok THEN codex_account_rate_limits.buckets END,
+               CASE WHEN cur.ok THEN codex_account_rate_limits.observed_generation END,
+               CASE WHEN cur.ok THEN codex_account_rate_limits.observed_credential_revision END,
+               CASE WHEN cur.ok THEN codex_account_rate_limits.last_success_at END,
+               CASE WHEN cur.ok THEN codex_account_rate_limits.enablement_sig
+                    ELSE EXCLUDED.enablement_sig END
+        FROM (
+            SELECT NOT EXISTS (
+                SELECT 1 FROM linked_aliases la
+                WHERE la.disabled_at IS NULL
+                    AND NOT CASE
+                        WHEN codex_account_rate_limits.enablement_sig IS NULL THEN la.enablement_rev = 0
+                        ELSE (la.id::text || ':' || la.enablement_rev::text)
+                             = ANY (string_to_array(codex_account_rate_limits.enablement_sig, ','))
+                    END
+            ) AS ok
+        ) cur
+    ),
     last_attempt_at = now(),
     attempt_status  = EXCLUDED.attempt_status,
     attempt_error   = EXCLUDED.attempt_error,
@@ -405,9 +470,9 @@ type RecordCodexAccountPollFailureParams struct {
 	ProviderAccountID          uuid.UUID `json:"provider_account_id"`
 	AttemptStatus              string    `json:"attempt_status"`
 	AttemptError               string    `json:"attempt_error"`
+	EnablementSig              string    `json:"enablement_sig"`
 	ObservedGeneration         int64     `json:"observed_generation"`
 	ObservedCredentialRevision int64     `json:"observed_credential_revision"`
-	EnablementSig              string    `json:"enablement_sig"`
 }
 
 // The health-only FAILURE write (PRD #1209 M1): record that the last poll ATTEMPT failed,
@@ -423,15 +488,24 @@ type RecordCodexAccountPollFailureParams struct {
 // :execrows — 0 rows means authority moved; the caller discards. The alias share locks are
 // taken behind the shared secret-mutation advisory lock, exactly as in
 // UpsertCodexAccountRateLimits (see its LOCK ORDER note).
+//
+// One exception to "leaves the reading intact" (PRD #1732 D13, M4): when the stored reading
+// is no longer current (an enabled linked alias is missing from its enablement_sig, or at
+// another revision: the reading predates a disable and re-enable), the readers already hide
+// the whole row, so a failure would stay invisible behind it (the meter reads "pending"
+// forever while every poll fails). Such a reading is dropped instead (buckets, observed
+// counters and last_success_at NULLed) and the row is re-stamped with the poll's
+// @enablement_sig, so the failed attempt surfaces as no_reading. A current reading is kept
+// and keeps its own stamp.
 func (q *Queries) RecordCodexAccountPollFailure(ctx context.Context, arg RecordCodexAccountPollFailureParams) (int64, error) {
 	result, err := q.db.Exec(ctx, recordCodexAccountPollFailure,
 		arg.UserID,
 		arg.ProviderAccountID,
 		arg.AttemptStatus,
 		arg.AttemptError,
+		arg.EnablementSig,
 		arg.ObservedGeneration,
 		arg.ObservedCredentialRevision,
-		arg.EnablementSig,
 	)
 	if err != nil {
 		return 0, err
@@ -459,11 +533,11 @@ WITH secret_mutation_lock AS MATERIALIZED (
 INSERT INTO codex_account_rate_limits (
     user_id, provider_account_id, buckets,
     observed_generation, observed_credential_revision,
-    last_success_at, last_attempt_at, attempt_status, attempt_error
+    last_success_at, last_attempt_at, attempt_status, attempt_error, enablement_sig
 )
 SELECT $1, $2, $3::jsonb,
        $4::bigint, $5::bigint,
-       now(), now(), $6::text, NULL::text
+       now(), now(), $6::text, NULL::text, $7::text
 WHERE EXISTS (
     SELECT 1 FROM codex_provider_account a
     WHERE a.user_id = $1 AND a.id = $2
@@ -483,6 +557,7 @@ ON CONFLICT (user_id, provider_account_id) DO UPDATE SET
     last_attempt_at              = now(),
     attempt_status               = EXCLUDED.attempt_status,
     attempt_error                = NULL,
+    enablement_sig               = EXCLUDED.enablement_sig,
     updated_at                   = now()
 `
 
@@ -545,6 +620,12 @@ type UpsertCodexAccountRateLimitsParams struct {
 //
 // On conflict the reading + observed counters + success/attempt timestamps are overwritten
 // and attempt_error is cleared (a success clears the last failure's reason).
+//
+// The reading is stamped with @enablement_sig (PRD #1732 D13, M4): the fence above
+// guarantees it is the account's linked-alias list at write time, and the reads
+// (GetCodexAccountRateLimitsForUser, ListCodexAccountRateLimits) treat the reading as
+// current only while every enabled linked alias still appears in it at its current
+// revision, so a pre-disable reading is not shown after a re-enable.
 func (q *Queries) UpsertCodexAccountRateLimits(ctx context.Context, arg UpsertCodexAccountRateLimitsParams) (int64, error) {
 	result, err := q.db.Exec(ctx, upsertCodexAccountRateLimits,
 		arg.UserID,
