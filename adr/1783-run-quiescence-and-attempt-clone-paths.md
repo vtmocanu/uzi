@@ -39,11 +39,12 @@ removes the tree.
    carries both a well-formed attempt marker and a `UZI_RUN_CLONE_KEY` equal to the
    target key — the key alone never scopes a process, or a forged key with no
    marker could wedge every seed of that key), excludes itself, and excludes
-   worker-marked spawns. Only in `own` mode (the run's own teardown) does it
-   kill what is in scope; in `seed`/`capture` mode nothing is killed — an
-   unmarked in-scope process is left as a survivor, and another live attempt's
-   process is a `live_attempt_conflict` survivor, never signalled, because
-   neither mode has a positive attribution to kill on. It rescans until nothing
+   worker-marked spawns. A process carrying this attempt's marker or a
+   terminal attempt's marker is killed in every mode; another live attempt's
+   process is a `live_attempt_conflict` survivor in every mode, never
+   signalled; an unmarked in-scope process is killed only in `own` mode (the
+   run's own teardown) and is a survivor in `seed`/`capture` mode, where
+   nothing positively attributes it. It rescans until nothing
    is left to kill and nothing is unattributable, and reports one of three
    states: `quiescent`, `survivors`, or `unverified`. `unverified` (an
    unattributable process, a helper timeout, a malformed answer) and `survivors` both **fail closed**: the
@@ -58,8 +59,8 @@ removes the tree.
    - the limit, wall-clock and completion-hold parks leave the park standing, with
      no credentialed publish;
    - an owner pause that cannot prove quiescence reports `pause_failed` and the
-     run keeps running, under the existing pause rule (PRD #35 Decision 8, reused
-     by PRD #1190's park path: no durable checkpoint, no park) rather than
+     run keeps running, under the existing pause rule (PRD #1190 D8: no
+     durable checkpoint, no park) rather than
      parking on unproven ground;
    - finalize fails the run with the typed `fail_origin` `worker_residue_blocked`;
    - terminal retire keeps the clone rather than removing it;
@@ -92,7 +93,7 @@ removes the tree.
 9. **The `.attempt-` separator**, not `@` or another delimiter: `git
    check-ref-format` accepts `.attempt-` inside a ref, so the choice is not about
    what git's grammar forbids. It is chosen because it uses only
-   `[A-Za-z0-9.-]`, the same character class as the key itself, and carries no
+   `[A-Za-z0-9.-]` and carries no
    special meaning to git, npm, Go or nix build tooling the way `@` does (a
    version-pin or scope marker in several of those). The attempt id
    (`<UTC timestamp>-<claim generation>-<16 hex>`) is itself hyphen-separated, so
@@ -155,8 +156,8 @@ removes the tree.
     is worker-owned `2775` and not sticky, so the worker may rename any entry
     inside it, including a root-owned one, to another name in that SAME
     directory. Moving a root-owned directory to a DIFFERENT parent instead needs
-    write permission on the moved directory's own `..` (its current parent), for
-    the rename to rewrite that entry — permission a root-owned directory denies
+    write permission on the moved directory itself, for the rename to rewrite
+    its `..` entry — permission a root-owned directory denies
     the worker; staying in the same parent needs write permission only on the
     parent, which the worker already has.
 18. A symlink or non-directory planted at the canonical path is quarantined
@@ -190,7 +191,11 @@ removes the tree.
     the worker restarts, because an `rm` that may still be walking the tree must
     never be handed a fresh clone or a quarantine rename underneath it. From the
     operator's side this shows up as the same key repeatedly failing with
-    `worker_residue_blocked`, not as one isolated failure.
+    `worker_residue_blocked`, not as one isolated failure. The retention sweep
+    honours the same record: a sweep target at or under an unsettled path is
+    refused and kept with a warning (the sweep does not fail the run), and the
+    worker log records the path entering (`runner-uid delete recorded as
+    unsettled`) and leaving (`left the unsettled record`) the record.
 
 ## Disclosed scope reductions
 
