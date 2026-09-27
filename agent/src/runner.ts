@@ -7484,8 +7484,10 @@ export class RunRunner {
    * Codex permit scope (advisory): only the sinks routed through HERE run their quiescence (for
    * Codex, the Docker teardown alone: the supervisor proves process drain) INSIDE the held permit.
    * The pause park, the wall park and the completion hold call {@link quiesceRun} directly, before
-   * any permit exists, so their Docker teardown runs OUTSIDE the Codex permit; their credentialed
-   * publish then takes the permit through withCodexBoundaryOnly. The Docker result never blocks a
+   * any permit exists, so their Docker teardown runs OUTSIDE the Codex permit; the wall park's and
+   * the completion hold's credentialed publish then takes the permit through withCodexBoundaryOnly,
+   * while the pause park mints no permit at all (its publish is credential-free, see
+   * {@link handlePausePark}). The Docker result never blocks a
    * sink, so the ordering only affects when containers are removed, never what is published.
    *
    * The runner is HARNESS-AGNOSTIC: it branches ONLY on `!!executor.safety`, never reads
