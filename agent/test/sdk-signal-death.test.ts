@@ -9,7 +9,7 @@ import { SdkExecutor, TransientRecoveryError, type SdkQueryFn, type SdkExecutorO
 import type { EmittedMessage, RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import { defaultQueryFn } from "../src/sdk-messages.js";
-import { nullLogger } from "./helpers.js";
+import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 
 // issue #1656: a FOREIGN SIGTERM/SIGKILL of the SDK CLI child (no result frame, no uzi trip)
 // resumes the same session in-process, at most twice per turn, instead of failing the run.
@@ -27,10 +27,7 @@ const FAKE_JOIN_TOKEN = "dummy-join-token-do-not-scan-2222";
 
 // Unique per process and per call, never created (see sdk-executor.test.ts: the executor
 // materializes a sibling skills-plugin dir, and node --test runs files concurrently).
-let nonexistentWorktreeSeq = 0;
-function nonexistentWorktree(): string {
-  return path.join(os.tmpdir(), `uzi-signal-death-wt-${process.pid}-${nonexistentWorktreeSeq++}`);
-}
+const nonexistentWorktree = nonexistentWorktreeFactory("uzi-signal-death");
 
 function assistantText(text: string, sessionId = "sess-1"): SDKMessage {
   return { type: "assistant", session_id: sessionId, message: { content: [{ type: "text", text }] } } as unknown as SDKMessage;

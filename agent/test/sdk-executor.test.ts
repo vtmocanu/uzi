@@ -26,7 +26,7 @@ import type {
   PlanSummaryResult,
   Delta,
 } from "../src/summary-runner.js";
-import { nullLogger } from "./helpers.js";
+import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 
 // A worktree path that is UNIQUE PER PROCESS AND PER CALL, and that deliberately
 // never exists. Both halves matter. Non-existence is the point of these fixtures --
@@ -38,11 +38,11 @@ import { nullLogger } from "./helpers.js";
 // "/tmp/does-not-need-to-exist", so both drove the identical plugin dir and raced:
 // measured 1 failure in 6 on the isolated pair, surfacing as ENOTEMPTY from one file's
 // recursive remove or ENOENT from the other's mkdir. Two different literals would have
-// been the same defect with a longer fuse; the basename has to be unique.
-let nonexistentWorktreeSeq = 0;
-function nonexistentWorktree(): string {
-  return path.join(os.tmpdir(), `uzi-nonexistent-wt-${process.pid}-${nonexistentWorktreeSeq++}`);
-}
+// been the same defect with a longer fuse; the basename has to be unique. The paths
+// live under a per-file mkdtemp root (nonexistentWorktreeFactory) rather than directly
+// in os.tmpdir(), so that materialized sibling lands inside the root and is removed
+// with it instead of leaking one `.uzi-skills-*` dir per test (PRD #1809 M2).
+const nonexistentWorktree = nonexistentWorktreeFactory("uzi-nonexistent");
 
 
 // The SDK executor is exercised only up to — never across — the network boundary:
@@ -1820,6 +1820,17 @@ describe("SdkExecutor findings capture tool mounting (PRD #333 M2, D2)", () => {
   // DELIBERATELY not gated on isIssueRun. A stub client is enough: the executor only
   // closes over it when building the server; the faked turns never call the tool.
   const stubClient = {} as unknown as WorkerClient;
+  // A client + token on an issue run also turns the advisory summaries on, and the
+  // default SummaryRunner spawns the REAL bundled claude CLI (it left `claude-<uid>`
+  // and `cc-socks` in TMPDIR, PRD #1809 M2). The summaries are not under test here.
+  const stubSummaryRunner = {
+    async generateIntentSummary(): Promise<string | null> {
+      return null;
+    },
+    async generatePlanSummary(): Promise<null> {
+      return null;
+    },
+  } as unknown as SummaryRunner;
 
   for (const kind of ["issue", "ci_fix", "self_improve", "prompt"] as const) {
     it(`mounts the findings server on a ${kind} run (not behind isIssueRun)`, async () => {
@@ -1828,7 +1839,9 @@ describe("SdkExecutor findings capture tool mounting (PRD #333 M2, D2)", () => {
         [signalDone(), resultSuccess()],
       ]);
       const probe = makeCtx({ kind });
-      await new SdkExecutor(nullLogger(), homeDir, { queryFn, client: stubClient }).run(probe.ctx);
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn, client: stubClient, summaryRunner: stubSummaryRunner }).run(
+        probe.ctx,
+      );
 
       const o = turns[0]!.options;
       assert.ok(o.mcpServers && FINDINGS_SERVER_NAME in o.mcpServers, `findings server wired for ${kind}`);
@@ -3035,6 +3048,7 @@ describe("SdkExecutor tool provisioning (PRD #18 M3)", () => {
       assert.deepStrictEqual(calls[0]!.packages, ["kubectl@1.31", "jq"]);
     } finally {
       fs.rmSync(worktree, { recursive: true, force: true });
+      fs.rmSync(skillsPluginDir(worktree), { recursive: true, force: true });
     }
   });
 
@@ -3061,6 +3075,7 @@ describe("SdkExecutor tool provisioning (PRD #18 M3)", () => {
       assert.deepStrictEqual(calls[0]!.packages, ["kubectl@1.31"]);
     } finally {
       fs.rmSync(worktree, { recursive: true, force: true });
+      fs.rmSync(skillsPluginDir(worktree), { recursive: true, force: true });
     }
   });
 
@@ -3196,6 +3211,7 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
       assert.ok(!planAppend.includes(POST), "the install's post-kickoff rewrite must never reach the prompt");
     } finally {
       fs.rmSync(worktree, { recursive: true, force: true });
+      fs.rmSync(skillsPluginDir(worktree), { recursive: true, force: true });
     }
   });
 

@@ -2271,7 +2271,15 @@ tasks:
       # had been serial inside one file and now run as seven parallel files.
       # The unit is the lesson, not the number: under node's per-file cap a large
       # test file is a serialization point that no timeout value fixes.
-      - npm test
+      #
+      # PRD #1809 M2: the suite runs under a fresh, empty TMPDIR and the guard fails
+      # it when anything but the two tool caches (tsx's `tsx-<uid>`, npm's
+      # `node-compile-cache`) is left behind, so
+      # a test that forgets its mkdtemp cleanup goes red here instead of filling a
+      # worker's scratch volume. The guard preserves npm test's own failure status
+      # and always removes the scratch dir. It wraps `npm test`, never a bare node
+      # call, for the timeout reason above.
+      - ../scripts/tmpdir-leak-guard.sh npm test
       # PRD 1287 C1 / D7 point 5: the strict Codex M4 conformance contract + the REAL-binary P
       # startup smoke, run as a MANDATORY serial second step here (never from gate:agent directly)
       # so gate:agent and existing Linux CI exercise the P layer EXACTLY ONCE per unchanged tree.

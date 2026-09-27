@@ -23,6 +23,14 @@ afterEach(async () => {
   for (const r of tmpRoots.splice(0)) await fsp.rm(r, { recursive: true, force: true }).catch(() => undefined);
 });
 
+/** makeRecoveryCoordinator over fresh fakes, its recoveryRoot queued for the afterEach
+ *  removal above (the bare call discarded the root and leaked it, PRD #1809 M2). */
+function mkRecoveryCoordinator(): ReturnType<typeof makeRecoveryCoordinator>["coord"] {
+  const { coord, root } = makeRecoveryCoordinator(new FakeRecoveryClient(), new FakeRecoveryGit());
+  tmpRoots.push(root);
+  return coord;
+}
+
 async function mkOutbox(opts?: { rawWrite?: RawWriteSeam }): Promise<Outbox> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "runner-journal-"));
   tmpRoots.push(dir);
@@ -207,7 +215,7 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
   it("PRD #1391 Run B M3 (D5/#1539): install BEFORE abort, then reap BEFORE send (abort < reap < send)", async () => {
     const { gitlab } = fakeGitlab();
     const outbox = await mkOutbox();
-    const { coord } = makeRecoveryCoordinator(new FakeRecoveryClient(), new FakeRecoveryGit());
+    const coord = mkRecoveryCoordinator();
     const run = runner(new StubExecutor(nullLogger()), gitlab, undefined, {
       outbox,
       outboxTerminalMaxBytes: 1 << 20,
@@ -245,7 +253,7 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
   // and exactly one failed is sent, in the order abort < reap < send.
   it("#1539: no-outbox permanent failure still runs abort < reap < send, exactly one failed", async () => {
     const { gitlab } = fakeGitlab();
-    const { coord } = makeRecoveryCoordinator(new FakeRecoveryClient(), new FakeRecoveryGit());
+    const coord = mkRecoveryCoordinator();
     const run = runner(new StubExecutor(nullLogger()), gitlab, undefined, { recovery: coord }); // NO outbox
     const events: string[] = [];
     let sends = 0;
@@ -270,7 +278,7 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
   it("#1539: reserve-exhausted permanent failure sends UNJOURNALED, abort < reap < send", async () => {
     const { gitlab } = fakeGitlab();
     const outbox = await mkOutbox({ rawWrite: enospcTerminalWrite });
-    const { coord } = makeRecoveryCoordinator(new FakeRecoveryClient(), new FakeRecoveryGit());
+    const coord = mkRecoveryCoordinator();
     const run = runner(new StubExecutor(nullLogger()), gitlab, undefined, {
       outbox,
       outboxTerminalMaxBytes: 1 << 20,
@@ -460,7 +468,7 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
   it("#1539 (8/N4): a recorded drainer skip makes the hook re-resolve once on release", async () => {
     const { gitlab } = fakeGitlab();
     const outbox = await mkOutbox();
-    const { coord } = makeRecoveryCoordinator(new FakeRecoveryClient(), new FakeRecoveryGit());
+    const coord = mkRecoveryCoordinator();
     const run = runner(new StubExecutor(nullLogger()), gitlab, undefined, {
       outbox,
       outboxTerminalMaxBytes: 1 << 20,
@@ -504,7 +512,7 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
   it("#1539: the real hook HOLDS the drainer's terminal resolve across abort→reap→send and RELEASES it after", async () => {
     const { gitlab } = fakeGitlab();
     const outbox = await mkOutbox();
-    const { coord } = makeRecoveryCoordinator(new FakeRecoveryClient(), new FakeRecoveryGit());
+    const coord = mkRecoveryCoordinator();
     const run = runner(new StubExecutor(nullLogger()), gitlab, undefined, {
       outbox,
       outboxTerminalMaxBytes: 1 << 20,

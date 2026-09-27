@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
@@ -1430,11 +1430,18 @@ function trackedFile(iid: number, file: string): string | null {
   }
 }
 
+/** Every enabledRecovery() recoveryRoot, removed when the file ends (PRD #1809 M2). */
+const recoveryRoots: string[] = [];
+after(() => {
+  for (const r of recoveryRoots.splice(0)) fs.rmSync(r, { recursive: true, force: true });
+});
+
 /** A recovery-ENABLED coordinator, so the credentialed pre-report reap would really run if a vault
  *  path reached it (a token-less harness short-circuits it and hides the call). */
 function enabledRecovery(): { coord: ReturnType<typeof makeRecoveryCoordinator>["coord"]; archive: FakeRecoveryClient } {
   const archive = new FakeRecoveryClient();
-  const { coord } = makeRecoveryCoordinator(archive, new FakeRecoveryGit());
+  const { coord, root } = makeRecoveryCoordinator(archive, new FakeRecoveryGit());
+  recoveryRoots.push(root);
   return { coord, archive };
 }
 

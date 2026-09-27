@@ -18,7 +18,7 @@ import { SteeringChannel } from "../src/steering.js";
 import type { ClaimResponse, UserInput } from "../src/protocol.js";
 import type { WorkerClient } from "../src/client.js";
 import { RequestError } from "../src/client.js";
-import { makeClaim, nullLogger, stopStartedChannels, withReceipts } from "./helpers.js";
+import { makeClaim, nonexistentWorktreeFactory, nullLogger, stopStartedChannels, withReceipts } from "./helpers.js";
 import {
   api,
   client,
@@ -192,10 +192,7 @@ describe("SdkExecutor interactive task park (PRD #517 M3)", () => {
 
   // A worktree path that never exists — the executor must not require it on disk, and a
   // unique-per-call basename avoids the skills-plugin-dir race sdk-executor.test.ts notes.
-  let wtSeq = 0;
-  function nonexistentWorktree(): string {
-    return path.join(os.tmpdir(), `uzi-park-wt-${process.pid}-${wtSeq++}`);
-  }
+  const nonexistentWorktree = nonexistentWorktreeFactory("uzi-park");
 
   function makeCtx(overrides: Partial<RunContext> = {}): {
     ctx: RunContext;

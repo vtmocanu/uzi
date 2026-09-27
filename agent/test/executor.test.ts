@@ -21,8 +21,13 @@ import { nullLogger } from "./helpers.js";
 
 // A throwaway git worktree the stub can write its marker into and commit. No
 // origin, no network — run() only makes a LOCAL commit (push + MR is the runner).
+// The clone sits one level below its own mkdtemp root because the executor
+// materializes the skills-plugin dir as a SIBLING of the worktree
+// (`.uzi-skills-<basename>`): cleanup removes the root, so that sibling goes with
+// it instead of leaking into TMPDIR (PRD #1809 M2).
 function makeWorktree(): { path: string; cleanup: () => void } {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-stub-wt-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-stub-wt-"));
+  const dir = path.join(root, "wt");
   const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
   execFileSync("git", ["init", "-b", "main", dir], { env, stdio: "pipe" });
   // The stub COMMITS in here, and a commit ends by spawning a detached
@@ -31,9 +36,10 @@ function makeWorktree(): { path: string; cleanup: () => void } {
   disableAutoMaintenance(dir, env);
   // No rmSync retry here, deliberately: disableAutoMaintenance above suppresses the only
   // git writer in this dir (the stub's commit, executor.ts:470), and the skills-plugin dir
-  // is a sibling OUTSIDE it. A retry would guard nothing identifiable while adding up to
-  // 2750 ms of blocking sleep per stuck directory on a real failure (issue #127 review).
-  return { path: dir, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+  // is a sibling OUTSIDE it (inside `root`). A retry would guard nothing identifiable while
+  // adding up to 2750 ms of blocking sleep per stuck directory on a real failure (issue #127
+  // review).
+  return { path: dir, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
 }
 
 function makeCtx(overrides: Partial<RunContext> = {}): { ctx: RunContext; emitted: EmittedMessage[] } {

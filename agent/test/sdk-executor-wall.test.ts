@@ -8,7 +8,7 @@ import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { RunContext, WallParkOutcome } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import { PauseNowSignal } from "../src/steering.js";
-import { nullLogger } from "./helpers.js";
+import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 
 /**
  * PRD #1497 M2 — the SdkExecutor (Claude harness) wall-park routing.
@@ -105,10 +105,7 @@ function fakeTurns(
 
 let homeDir: string;
 let saved: Record<string, string | undefined>;
-let wtSeq = 0;
-function nonexistentWorktree(): string {
-  return path.join(os.tmpdir(), `uzi-wall-wt-${process.pid}-${wtSeq++}`);
-}
+const nonexistentWorktree = nonexistentWorktreeFactory("uzi-wall");
 
 interface Spies {
   parkForWallCalls: number;
