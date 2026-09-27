@@ -551,8 +551,11 @@ type Client interface {
 	// may carry no evidence row, so undo keys on the ALWAYS-present disposition id, not the
 	// evidence id the file/dismiss/done POSTs use). A dismissal returns to open; a done returns
 	// to filed when an issue link remains, else to open. Returns the undone coordinate, whose
-	// status is where it landed. A 404 means there is nothing to undo — an unknown/foreign id or
-	// one that is not dismissed/done, deliberately indistinguishable — returned as the sentinel
+	// status is where it landed. A 404 from /disposition retries once on the legacy DELETE
+	// /api/findings/{id}/dismiss (same disposition id, same row shape), because a server built
+	// before #1723 has no /disposition route and would otherwise report "already undone" while
+	// the dismissal stays. A 404 from both means there is nothing to undo — an unknown/foreign id
+	// or one that is not dismissed/done, deliberately indistinguishable — returned as the sentinel
 	// ErrFindingNothingToUndo (a plain error, NOT an *ExitError, mirroring ErrNoDisposition) so
 	// `uzi findings undo` can soften it to a friendly "already undone" line and exit 0. Every
 	// other failure propagates as an *ExitError with the documented exit code.
@@ -677,8 +680,9 @@ type ProjectSyncStatus struct {
 var ErrNoDisposition = errors.New("no disposition to undo")
 
 // ErrFindingNothingToUndo is returned by UndoFinding when the coordinate had no dismissal or
-// done to undo (the endpoint answers 404 — an unknown/foreign id or a coordinate that is open,
-// filed or being filed, deliberately indistinguishable, no existence oracle). Like
+// done to undo (DELETE .../disposition and its legacy DELETE .../dismiss fallback both answer
+// 404 — an unknown/foreign id or a coordinate that is open, filed or being filed, deliberately
+// indistinguishable, no existence oracle). Like
 // ErrNoDisposition it is a plain error, NOT an *ExitError, so `uzi findings undo` can treat it as
 // "already undone" (a friendly message, exit 0) instead of a hard not-found failure.
 var ErrFindingNothingToUndo = errors.New("no dismissal or done to undo")

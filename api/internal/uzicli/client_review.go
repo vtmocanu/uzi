@@ -164,18 +164,30 @@ func (c *HTTPClient) MarkFindingDone(ctx context.Context, id string) (apitypes.M
 }
 
 func (c *HTTPClient) UndoFinding(ctx context.Context, id string) (apitypes.IncidentalFindingDTO, error) {
-	// A 404 here means the coordinate carries no human verdict to undo (an unknown/foreign id,
-	// or one that is open, filed or being filed) — softened to ErrFindingNothingToUndo (a plain
-	// error) so `uzi findings undo` can report "already undone" and exit 0. Any other non-2xx
-	// keeps its real exit code. Mirrors DeleteDisposition's DELETE-404 softening; the id is
-	// escaped, off the positional.
-	path := "/api/findings/" + url.PathEscape(id) + "/disposition"
+	// A 404 from DELETE .../disposition is ambiguous: on a current server it means the
+	// coordinate carries no human verdict to undo (an unknown/foreign id, or one that is open,
+	// filed or being filed), but a server built before #1723 has no such route and answers a
+	// router 404 while the dismissal stays in place. So a 404 retries once on the legacy DELETE
+	// .../dismiss route, which both old and new servers mount, keyed on the same disposition id
+	// and returning the same row shape. Only a 404 from that fallback too is softened to
+	// ErrFindingNothingToUndo (a plain error) so `uzi findings undo` can report "already undone"
+	// and exit 0; any other non-2xx from either request keeps its real exit code, and a non-404
+	// first response never triggers the fallback. The id is escaped, off the positional.
+	escaped := url.PathEscape(id)
+	path := "/api/findings/" + escaped + "/disposition"
 	resp, body, err := c.doJSONRead(ctx, http.MethodDelete, path, nil)
 	if err != nil {
 		return apitypes.IncidentalFindingDTO{}, err
 	}
 	if resp.StatusCode == http.StatusNotFound {
-		return apitypes.IncidentalFindingDTO{}, ErrFindingNothingToUndo
+		path = "/api/findings/" + escaped + "/dismiss"
+		resp, body, err = c.doJSONRead(ctx, http.MethodDelete, path, nil)
+		if err != nil {
+			return apitypes.IncidentalFindingDTO{}, err
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			return apitypes.IncidentalFindingDTO{}, ErrFindingNothingToUndo
+		}
 	}
 	var out apitypes.IncidentalFindingDTO
 	if err := decode2xx(resp, body, path, &out); err != nil {

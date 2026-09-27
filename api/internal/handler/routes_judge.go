@@ -71,7 +71,9 @@ func (h *Handler) mountJudgeRoutes(r chi.Router, forgeLimiter *mw.Limiter) {
 		r.Post("/{id}/done", h.MarkFindingDone)
 		r.Post("/done", h.BulkMarkFindingsDone)
 		// Undo either human verdict (dismissed or done); the web and CLI now call this one.
-		// DELETE /{id}/dismiss above is kept, unchanged, for CLIs built before #1723.
+		// DELETE /{id}/dismiss above is kept, unchanged, for CLIs built before #1723, and it is
+		// also the current CLI's fallback when this route 404s (a server built before #1723 has
+		// no /disposition route), so it must not be removed.
 		r.Delete("/{id}/disposition", h.UndoFindingDisposition)
 	})
 }
