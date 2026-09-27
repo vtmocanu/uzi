@@ -32,19 +32,37 @@ import { api, fakeGitlab, git as harnessGit, gitlabClaim, installHarness, runner
 
 const MINUS = "−";
 
+// Repository-location variables a git hook (or a `task` target it starts) exports. Inherited, they
+// override `cwd` / `-C`: `git init`/`commit` in makeRepo would hit the CALLER's repository, and an
+// inherited GIT_INDEX_FILE would redirect the attribute lookup. Both helpers below drop them.
+const GIT_LOCATION_VARS = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_COMMON_DIR",
+  "GIT_NAMESPACE",
+  "GIT_CEILING_DIRECTORIES",
+  "GIT_PREFIX",
+];
+
+function scrubbedGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const k of GIT_LOCATION_VARS) delete env[k];
+  return { ...env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", ...extra };
+}
+
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, {
     cwd,
     encoding: "utf8",
-    env: {
-      ...process.env,
-      GIT_CONFIG_GLOBAL: "/dev/null",
-      GIT_CONFIG_NOSYSTEM: "1",
+    env: scrubbedGitEnv({
       GIT_AUTHOR_NAME: "t",
       GIT_AUTHOR_EMAIL: "t@t",
       GIT_COMMITTER_NAME: "t",
       GIT_COMMITTER_EMAIL: "t@t",
-    },
+    }),
   });
 }
 
@@ -99,7 +117,7 @@ function newGitCache(root: string): GitCache {
 /** An AttrGitRunner over the real `git -C <bare>`, rejecting with git's stderr like GitCache does. */
 function realRunner(bare: string): AttrGitRunner {
   return async (args, opts) => {
-    const env: NodeJS.ProcessEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+    const env = scrubbedGitEnv();
     if (opts.indexFile) env.GIT_INDEX_FILE = opts.indexFile;
     const r = spawnSync("git", ["-C", bare, ...args], { input: opts.input ?? "", encoding: "utf8", env });
     if (r.status !== 0) throw Object.assign(new Error(`git ${args[0]} exited ${r.status}`), { stderr: r.stderr });
