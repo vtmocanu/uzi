@@ -557,9 +557,10 @@ func TestGetRunPopulatesOwnAgents(t *testing.T) {
 // TestGetRunCredentialSwitchSuppression proves the PRD #1247 Step A enrichment override
 // (runs_lifecycle.go): the run-detail DTO suppresses a KNOWN-STALE credential_switch once an
 // APPLIED credential epoch exists at a generation STRICTLY GREATER THAN the switch stamp's
-// generation. credentialSwitchState derives credential_switch purely from the run row, but the
-// DB clear of the stamp on a successful application is deferred (D14 / #1422), so after a
-// release+reclaim the row still reads "requested"/"released" for a switch already applied. The
+// generation. credentialSwitchState derives credential_switch purely from the run row; the
+// reclaimed generation's epoch write now clears the stamp in the DB (D14 / #1422), but a row
+// stamped and reclaimed before that clear landed still reads "requested"/"released" for a switch
+// already applied, and this suppression is what hides it. The
 // strict-> comparator is the crux: recordRunCredential already wrote an epoch AT the stamp
 // generation when the current claim opened, so an epoch == G is the pre-request epoch and must
 // NOT suppress — only an applied epoch at > G, written after the reclaim, does. Drives the real

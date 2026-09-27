@@ -577,12 +577,13 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		slog.Error("list run credential epochs", "run_id", run.ID, "error", err)
 	} else {
 		dto.CredentialEpochs = credentialEpochsToDTO(epochs)
-		// PRD #1247 Step A (D14, deferred clear #1422): credentialSwitchState derives
-		// credential_switch purely from the run row, but the DB clear of the switch stamp
-		// on a successful application is deferred to #1422 — so after a release+reclaim the
-		// row still carries credential_switch_requested_at/credential_switch_generation and
-		// the derived field reads a KNOWN-STALE "requested"/"released" for a switch that has
-		// already been applied. Suppress the stale DERIVED field here, where the epochs are
+		// PRD #1247 Step A (D14): credentialSwitchState derives credential_switch purely from
+		// the run row. Since issue #1422 the reclaimed generation's epoch write clears the
+		// switch stamp in the DB, so a switch applied after that landed already reads null.
+		// This suppression is belt-and-braces for rows stamped and reclaimed BEFORE it landed
+		// (there is no backfill): such a row still carries credential_switch_requested_at/
+		// credential_switch_generation and the derived field would read a KNOWN-STALE
+		// "requested"/"released". Suppress the stale DERIVED field here, where the epochs are
 		// in reach; the DB stays untouched and credentialSwitchState is unchanged.
 		//
 		// The stamp targets the CURRENT claim generation G, and recordRunCredential already

@@ -175,13 +175,13 @@ func credentialEpochsToDTO(rows []store.RunCredentialEpoch) []apitypes.Credentia
 // (PRD #1247 D11 fix round) every terminal transition CLEARS them, so a completed/failed/
 // cancelled run never carries a stale switch state.
 //
-// NOT YET IMPLEMENTED (deferred, issue #1422): clearing the stamp on successful APPLICATION
-// at the next epoch write (D14). Until then, after a release+reclaim (the run's
-// claim_generation has advanced PAST credential_switch_generation) this reads the stale
-// pre-reclaim state ("requested"/"released") rather than null. It is NOT a worker-signal leak
-// — PendingCredentialSwitchSignal's generation guard already returns nil there — only this
-// DTO field, and no UI renders it yet (PRD m7/m8), so it is a JSON-contract wart, not a
-// user-visible one.
+// A successful APPLICATION clears them too (D14, issue #1422): the reclaimed generation's
+// epoch write (RecordRunCredentialEpoch's settled_switch CTE) nulls the stamp once
+// claim_generation has advanced PAST credential_switch_generation, so after a
+// release+reclaim this reads null rather than the pre-reclaim "requested"/"released". A
+// reclaim that holds or fails writes no epoch and keeps the stamp visible (released is not
+// applied). GetRun's Step A suppression remains as belt-and-braces for rows stamped and
+// reclaimed before that clear landed.
 func credentialSwitchState(r store.Run) *string {
 	if !r.CredentialSwitchRequestedAt.Valid {
 		return nil

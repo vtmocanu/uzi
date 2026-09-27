@@ -10719,6 +10719,15 @@ func (q *Queries) RecordRunColumnMove(ctx context.Context, arg RecordRunColumnMo
 }
 
 const recordRunCredentialEpoch = `-- name: RecordRunCredentialEpoch :exec
+WITH settled_switch AS (
+    UPDATE runs
+    SET credential_switch_requested_at = NULL,
+        credential_switch_generation   = NULL,
+        updated_at                     = now()
+    WHERE id = $1
+      AND claim_generation = $2
+      AND credential_switch_generation < $2
+)
 INSERT INTO run_credential_epochs (run_id, claim_generation, secret_id, label, select_reason, applied_at)
 VALUES ($1, $2, $3, $4, $5, now())
 ON CONFLICT (run_id, claim_generation) DO UPDATE
@@ -10744,6 +10753,17 @@ type RecordRunCredentialEpochParams struct {
 // snapshot fields in place rather than duplicating the epoch. secret_id/label/select_reason are
 // the credential the claim actually spent; applied_at defaults to now() and is refreshed on a
 // re-record so it names the last apply of that generation.
+//
+// The settled_switch CTE is the D14 successful-APPLICATION clear (issue #1422). Released is not
+// applied: ReleaseCredentialSwitch keeps the switch stamp, and only this epoch write, which proves
+// the reclaimed generation's credential is live, clears credential_switch_requested_at/_generation.
+// Folding the clear into the epoch statement makes the two atomic: no epoch lands without the
+// clear and no clear without the epoch. The fence is two conjuncts. claim_generation =
+// @claim_generation keeps a stale claim (the run already reclaimed past it) from clearing a stamp
+// that belongs to a later flight. credential_switch_generation < @claim_generation keeps a new
+// request stamped AT the current generation (the owner switched again after this reclaim) from
+// being cleared by this generation's own epoch write, a re-record included. A NULL stamp fails
+// the comparison, so a claim with no pending switch touches no runs row.
 func (q *Queries) RecordRunCredentialEpoch(ctx context.Context, arg RecordRunCredentialEpochParams) error {
 	_, err := q.db.Exec(ctx, recordRunCredentialEpoch,
 		arg.RunID,
@@ -11156,9 +11176,9 @@ type ReleaseCredentialSwitchParams struct {
 // old flight is rejected until ClaimRun reclaims and clears it. The switch stamp
 // (credential_switch_requested_at/_generation) is deliberately KEPT on this release transition — it
 // is visible as "released, awaiting reclaim" (D14). It is cleared by any TERMINAL transition now
-// (PRD #1247 D11 fix round, beside the pause-clears). The successful-APPLICATION clear at the next
-// epoch write on reclaim (D14) is NOT yet implemented — deferred to issue #1422 (M9); until it
-// lands the stamp lingers past a same-run reclaim (a stale DTO state only, no signal leak). codex
+// (PRD #1247 D11 fix round, beside the pause-clears), and by the successful APPLICATION: the
+// next epoch write on reclaim (RecordRunCredentialEpoch's settled_switch CTE, D14, issue #1422)
+// clears it once the reclaimed generation's credential is live. codex
 // cap/epoch are revoked/bumped like every other park->queued transition; health is reset because
 // 'queued' is on the detector's allowlist. Status_since is NOT NULL (migration 00163), so the
 // banked interval is never NULL.
