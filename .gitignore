@@ -94,6 +94,9 @@ coverage.out
 # scope by construction.
 coverage.xml
 web/coverage/
+# vitest browser mode (test:web-browser) writes a failing test's screenshot here.
+web/.vitest-attachments/
+web/src/**/__screenshots__/
 # dot-ai agent deck
 .dot-agent-deck/
 # ignoreme folder

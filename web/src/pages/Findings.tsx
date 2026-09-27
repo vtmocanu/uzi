@@ -657,7 +657,7 @@ function groupByRepo(findings: IncidentalFinding[]): RepoGroup[] {
 // evidence cascaded away (null finding_id), offers Mark done only; a done or mid-filing row offers
 // nothing. A non-empty `warning` is the created-with-warning note, surfaced inline beneath the row,
 // mirroring the CLI.
-function FindingRow({
+export function FindingRow({
   finding,
   selectable,
   selected,
@@ -722,7 +722,7 @@ function FindingRow({
             className="mt-1 h-4 w-4 shrink-0 accent-brand"
           />
         )}
-        <div className="min-w-0 flex-1">
+        <div className="min-w-0 flex-1 basis-64">
           <p className="text-sm font-medium text-fg">{stripUnsafeChars(finding.last_title) || "Untitled finding"}</p>
           <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
             <code className="max-w-full break-all rounded bg-raised px-1.5 py-0.5 font-mono text-faint">

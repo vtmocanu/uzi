@@ -443,7 +443,7 @@ tasks:
       - task: test:controller
 
   gate:web:
-    desc: web - deps-check, lint, deadcode, check-docs, check-changelog, check-styles, typecheck, test
+    desc: web - deps-check, lint, deadcode, check-docs, check-changelog, check-styles, typecheck, test, test-browser
     cmds:
       # 🔴 deps-check FIRST, AND IT DELIBERATELY BREAKS THE CHEAPEST-FIRST ORDER THE
       # REST OF THIS TARGET ARGUES FOR (PRD #103 M5 MR-C). oxlint is ~0.06s and this
@@ -536,6 +536,7 @@ tasks:
       - task: check-styles:web
       - task: typecheck:web
       - task: test:web
+      - task: test:web-browser
 
   gate:agent:
     desc: agent - deps-check, lint, deadcode, typecheck, test
@@ -2152,6 +2153,20 @@ tasks:
       # cache is, and the same fixture mutation reddens it with no flag at all.
       # The two halves of this repo are NOT symmetric here.
       - npm test
+
+  test:web-browser:
+    desc: web layout tests in real Chromium (vitest browser mode, *.browser.test.tsx)
+    dir: web
+    env:
+      TZ: UTC
+    cmds:
+      # jsdom (test:web) has no layout engine, so a wrap/overflow regression such as the
+      # 390px triage-row squeeze passes there. These run in headless Chromium via
+      # web/vitest.browser.config.ts. The browser is NOT fetched here (a gate does not hit
+      # the network): a missing one exits 1 with Playwright's "Executable doesn't exist"
+      # banner. Fix with `npx playwright install chromium`, once, from web/. CI installs it
+      # in its own step.
+      - npm run test:browser
 
   # ----------------------------------------------------------- agent (npm) ----
   deps-check:agent:

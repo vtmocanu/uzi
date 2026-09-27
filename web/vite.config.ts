@@ -200,7 +200,8 @@ export default defineConfig({
           // src/pages would leave its tests collected by no project at all, and a
           // suite that silently stops running a directory is green.
           include: ["src/**/*.test.{ts,tsx}"],
-          exclude: [...configDefaults.exclude, "src/lib/**", "src/mocks/**"],
+          // `*.browser.test.*` runs in real Chromium under vitest.browser.config.ts.
+          exclude: [...configDefaults.exclude, "src/lib/**", "src/mocks/**", "src/**/*.browser.test.{ts,tsx}"],
         },
       },
       {

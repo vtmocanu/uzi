@@ -44,6 +44,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Judge and Findings rows are readable on a phone again ([#1806](https://github.com/vtmocanu/uzi/issues/1806)).**
+  At about 390px wide, a row showing its File issue, Mark done and Dismiss buttons squeezed its text into a column about 20px wide, so titles and rationale wrapped one word per line and a Findings location one character per line. The buttons now wrap onto their own line under the text on narrow screens, and a long Judge target breaks instead of widening the row. Desktop layout is unchanged.
+
 - **A merge request uzi opens as non-closing no longer closes its issue on GitLab ([#1801](https://github.com/vtmocanu/uzi/issues/1801)).**
   The issue reference line in a merge request body read `Implements issue #N.`, and GitLab's default closing pattern treats "Implements" as a closing keyword, so merging a held merge request (created without `Closes #N` until its head is verified) still closed the issue on GitLab. The line now reads `Related to #N.`, and the empty-title fallback changes from `Resolve issue #N` to `Work on issue #N`, since GitLab's default merge and squash commit messages carry the title. GitHub and Forgejo were not affected. A verified completion still closes its issue with `Closes #N`.
 
