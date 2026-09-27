@@ -1271,7 +1271,8 @@ export interface ClaimResponse {
    *  PR-producing run whose PR already exists (an mr_rework run, a run whose completion recorded
    *  its MR, or a re-claimed issue run that already bound a version); absent when the PR has no
    *  record or the server predates it. Its `published_version` fields are api-sanitized but
-   *  still untrusted text. */
+   *  still untrusted text. WorkerClient.claimRun shape-checks it (decodeClaimPrDescription) and
+   *  DROPS a malformed one, so a present value is the decoded, branded state. */
   pr_description?: PrDescriptionState;
 }
 
@@ -2593,7 +2594,10 @@ export interface RecoverySettleResponse {
 // ── PRD #1798 D9: plain-English PR description artifact ─────────────────────────────────────
 // Mirrors api/internal/apitypes/pr_description.go (snake_case JSON). In every RESPONSE the api
 // sends non-nil slices; a stage REQUEST carries RAW, untrusted fields the api sanitizes, and only
-// the sanitized fields a response returns may be published (D7).
+// the sanitized fields a response returns may be published (D7). The two are distinct types:
+// {@link RawPrDescriptionFields} (what a stage sends) and {@link SanitizedPrDescriptionFields}
+// (what a version carries), so passing raw text where sanitized text is required is a compile
+// error rather than a review finding.
 
 /** Go: apitypes.PrDescriptionScopeNote. One difference from the ask. */
 export interface PrDescriptionScopeNote {
@@ -2609,14 +2613,31 @@ export interface PrDescriptionVerification {
   verified_at_sha: string;
 }
 
-/** Go: apitypes.PrDescriptionFields. The model- or lead-authored part of a PR description. */
-export interface PrDescriptionFields {
+/** Go: apitypes.PrDescriptionFields. The model- or lead-authored part of a PR description, as a
+ *  bare shape. Use {@link RawPrDescriptionFields} or {@link SanitizedPrDescriptionFields}. */
+interface PrDescriptionFields {
   summary: string;
   changes: string[];
   scope_notes: PrDescriptionScopeNote[];
   review_pointers: string[];
   verification: PrDescriptionVerification[];
 }
+
+/** RAW fields: model- or lead-authored text the api has NOT sanitized yet. Only a stage request
+ *  carries them; they are never rendered (D7). */
+export type RawPrDescriptionFields = PrDescriptionFields;
+
+// A type-only brand: the symbol has no runtime value and is not exported, so no module can build
+// the branded type without a cast. WorkerClient's response decoders (client.ts, the stage / bind /
+// lookup / ack decoders and decodeClaimPrDescription) are the only producers: their type guards
+// assert it on a body that passed the shape check.
+declare const sanitizedBrand: unique symbol;
+
+/** SANITIZED fields: the api-returned text of a staged version, the only text the renderer may
+ *  publish (D7). Produced only by the client's response decoders (see the brand above). A
+ *  sanitized value is still assignable where raw fields are expected (a refresh may re-stage
+ *  it), never the reverse. */
+export type SanitizedPrDescriptionFields = PrDescriptionFields & { readonly [sanitizedBrand]: true };
 
 /** Go: apitypes.PrDescriptionSizeBucket. One size-line bucket's line counts (D3). */
 export interface PrDescriptionSizeBucket {
@@ -2642,7 +2663,8 @@ export interface PrDescriptionSize {
 export type PrDescriptionSource = "generated" | "lead_only" | "deterministic_only";
 
 /** Go: the version `state` enum. There is no worker-sent "abandoned": the api abandons a
- *  version when its ack is any non-published outcome, or when a newer claim generation stages. */
+ *  version when its ack is a non-published outcome (unless the forge shows the version's own
+ *  region, see {@link PR_DESC_ACK_OUTCOMES}), or when a newer claim generation stages. */
 export type PrDescriptionVersionState = "pending" | "published" | "abandoned";
 
 /** Go: apitypes.PrDescriptionVersionDTO. One staged version. `mr_iid` is null until the version
@@ -2653,7 +2675,7 @@ export interface PrDescriptionVersionDTO {
   run_id: string;
   claim_generation: number;
   mr_iid: number | null;
-  fields: PrDescriptionFields;
+  fields: SanitizedPrDescriptionFields;
   size: PrDescriptionSize | null;
   base_sha: string;
   head_sha: string;
@@ -2666,7 +2688,11 @@ export interface PrDescriptionVersionDTO {
 }
 
 /** The exact forge-write outcomes an ack may carry (Go: the ack `outcome` enum). Anything but
- *  `published` abandons the acked version. */
+ *  `published` abandons the acked version, with one exception: when the ack's
+ *  `observed_region_sha256` equals the acked version's OWN rendered region hash (the write landed
+ *  although the worker reports otherwise), the api publishes that version instead, unless a newer
+ *  publication supersedes it, and names it in the response's `recovered_version_id`
+ *  (workersvc.AckPrDescription). */
 export const PR_DESC_ACK_OUTCOMES = [
   "published",
   "skipped_human_edit",
@@ -2679,11 +2705,17 @@ export type PrDescriptionAckOutcome = (typeof PR_DESC_ACK_OUTCOMES)[number];
 
 /** Go: apitypes.PrDescriptionState. The per-PR record: the CAS counter, the version whose region
  *  is on the forge (null before the first acknowledged publish) and the last write outcome (null
- *  before the first ack). The bind / lookup / ack response body and the claim's pr_description. */
+ *  before the first ack). The bind / lookup / ack response body and the claim's pr_description.
+ *
+ *  Forward skew: `last_outcome` is a plain string, not {@link PrDescriptionAckOutcome}. It is a
+ *  history field nothing publishes from, so a newer api that adds an outcome must not make an
+ *  older worker refuse the whole state; the decoder keeps any string (compare it against
+ *  {@link PR_DESC_ACK_OUTCOMES} when it matters). The fields that DO drive publishing (the
+ *  version's fields, source and state, and the lookup `match`) stay strictly checked. */
 export interface PrDescriptionState {
   mr_iid: number;
   lock_version: number;
-  last_outcome: PrDescriptionAckOutcome | null;
+  last_outcome: string | null;
   published_version: PrDescriptionVersionDTO | null;
 }
 
@@ -2693,7 +2725,7 @@ export interface PrDescriptionState {
 export interface PrDescriptionStageRequest {
   claim_generation: number;
   source: PrDescriptionSource;
-  fields: PrDescriptionFields;
+  fields: RawPrDescriptionFields;
   size: PrDescriptionSize | null;
   base_sha: string;
   head_sha: string;

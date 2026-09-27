@@ -6,13 +6,16 @@ import { nullLogger } from "./helpers.js";
 import {
   PrDescriptionConflict,
   PrDescriptionInvalid,
+  PrDescriptionMalformedResponse,
   PrDescriptionNotFound,
   PrDescriptionRateLimited,
   RequestError,
   WorkerClient,
+  decodeClaimPrDescription,
   isTransient,
   type PrDescriptionConflictReason,
 } from "../src/client.js";
+import type { Logger } from "../src/log.js";
 import {
   PR_DESC_ACK_OUTCOMES,
   type PrDescriptionAckRequest,
@@ -21,6 +24,8 @@ import {
   type PrDescriptionStageRequest,
   type PrDescriptionState,
   type PrDescriptionVersionDTO,
+  type RawPrDescriptionFields,
+  type SanitizedPrDescriptionFields,
 } from "../src/protocol.js";
 
 // PRD #1798 M4 (D9), worker transport half: the four pr-description routes pinned against the api
@@ -80,13 +85,18 @@ afterEach(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 });
 
-function newClient(): WorkerClient {
-  return new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), { sleep: async () => {} });
+function newClient(log: Logger = nullLogger()): WorkerClient {
+  return new WorkerClient(baseUrl, TOKEN, "0.1.0-test", log, { sleep: async () => {} });
 }
 
 const zero = () => ({ added: 0, deleted: 0 });
 
-function version(over: Partial<PrDescriptionVersionDTO> = {}): PrDescriptionVersionDTO {
+// Wire fixtures: what the api SENDS, before decoding. Their fields are plain objects (raw at the
+// type level); only the client's decoders turn them into the branded sanitized type.
+type WireVersion = Omit<PrDescriptionVersionDTO, "fields"> & { fields: RawPrDescriptionFields };
+type WireState = Omit<PrDescriptionState, "published_version"> & { published_version: WireVersion | null };
+
+function version(over: Partial<WireVersion> = {}): WireVersion {
   return {
     id: VERSION_ID,
     run_id: RUN_ID,
@@ -121,7 +131,7 @@ function version(over: Partial<PrDescriptionVersionDTO> = {}): PrDescriptionVers
   };
 }
 
-function prState(over: Partial<PrDescriptionState> = {}): PrDescriptionState {
+function prState(over: Partial<WireState> = {}): WireState {
   return { mr_iid: 42, lock_version: 7, last_outcome: null, published_version: null, ...over };
 }
 
@@ -240,6 +250,14 @@ describe("pr-description client wire (PRD #1798 M4, D9)", () => {
     }
   });
 
+  it("an unknown last_outcome string is kept (forward skew), not refused", async () => {
+    const ack = { pr: prState({ lock_version: 8, last_outcome: "skipped_future_reason" }), recovered_version_id: null };
+    respond = () => ({ status: 200, body: JSON.stringify(ack) });
+    const got = await newClient().ackPrDescription(RUN_ID, ackReq());
+    assert.equal(got.pr.last_outcome, "skipped_future_reason");
+    assert.deepEqual(got, ack);
+  });
+
   it("the ack outcome tuple is exactly the api's six outcomes (no abandoned)", () => {
     assert.deepEqual(
       [...PR_DESC_ACK_OUTCOMES],
@@ -259,14 +277,22 @@ describe("pr-description client wire (PRD #1798 M4, D9)", () => {
       ],
       bind: [{ version: version() }, { version: version(), pr: { ...prState(), lock_version: "7" } }],
       lookup: [{ match: "maybe", matched_version_id: null, pr: null }, { match: "none", matched_version_id: 1, pr: null }],
-      ack: [{ pr: prState({ last_outcome: "abandoned" as never }), recovered_version_id: null }, { recovered_version_id: null }],
+      ack: [
+        { pr: { ...prState(), last_outcome: 5 }, recovered_version_id: null },
+        { pr: prState({ published_version: version({ state: "retracted" as never }) }), recovered_version_id: null },
+        { recovered_version_id: null },
+      ],
     };
     for (const { op, call } of CALLS) {
       for (const body of bad[op]!) {
         respond = () => ({ status: 200, body: typeof body === "string" ? body : JSON.stringify(body) });
         await assert.rejects(call(newClient()), (err: unknown) => {
+          assert.ok(err instanceof PrDescriptionMalformedResponse, `${op}: ${String(err)}`);
           assert.ok(!(err instanceof RequestError), `${op}: ${String(err)}`);
+          assert.equal(err.op, op);
           assert.match(String(err), new RegExp(`malformed pr-description ${op} response`));
+          // Non-transient: a retry wrapper must not re-send (a re-stage would create a 2nd version).
+          assert.equal(isTransient(err), false, op);
           return true;
         });
       }
@@ -320,6 +346,13 @@ describe("pr-description typed errors (writePrDescriptionError's status map)", (
       assert.equal(err.status, 429);
       assert.equal(err.retryAfterMs, 60_000);
       assert.equal(isTransient(err), true);
+      return true;
+    });
+    // A huge Retry-After is clamped to 60s, never parked on for hours (or Infinity).
+    respond = () => ({ status: 429, body: "{}", headers: { "Retry-After": "99999999999999999999" } });
+    await assert.rejects(newClient().bindPrDescription(RUN_ID, bindReq()), (err: unknown) => {
+      assert.ok(err instanceof PrDescriptionRateLimited);
+      assert.equal(err.retryAfterMs, 60_000);
       return true;
     });
     respond = () => ({ status: 429, body: "{}", headers: { "Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT" } });
@@ -390,5 +423,57 @@ describe("claim pr_description (workersvc.ClaimPayload.PrDescription, omitempty)
     const claim = await newClient().claimRun();
     assert.deepEqual(claim?.pr_description, state);
     assert.equal(claim?.pr_description?.published_version?.rendered_region_sha256, REGION);
+    // The decoded claim's published fields are the branded sanitized type (compile-checked).
+    const fields: SanitizedPrDescriptionFields | undefined = claim?.pr_description?.published_version?.fields;
+    assert.equal(fields?.summary, "Adds a plain-English description.");
+  });
+
+  it("a malformed pr_description is dropped from the claim, and the warning carries no value", async () => {
+    const malformed: unknown[] = [
+      { ...prState(), lock_version: "7" },
+      prState({ published_version: { ...version(), fields: { ...version().fields, summary: 1 as never } } }),
+      prState({ published_version: version({ source: "model" as never }) }),
+      "a string",
+      null,
+    ];
+    for (const bad of malformed) {
+      const warns: { msg: string; fields: unknown }[] = [];
+      const log: Logger = { ...nullLogger(), warn: (msg: string, fields?: unknown) => void warns.push({ msg, fields }) };
+      respond = () => ({ status: 200, body: claimBody({ pr_description: bad }) });
+      const claim = await newClient(log).claimRun();
+      assert.ok(claim, JSON.stringify(bad));
+      assert.equal("pr_description" in claim, false, JSON.stringify(bad));
+      assert.equal(claim.run_id, RUN_ID);
+      assert.equal(warns.length, 1);
+      assert.deepEqual(warns[0]!.fields, { run_id: RUN_ID });
+    }
+  });
+
+  it("decodeClaimPrDescription validates or returns undefined", () => {
+    const state = prState({ last_outcome: "published", published_version: version({ state: "published", mr_iid: 42 }) });
+    assert.deepEqual(decodeClaimPrDescription(state), state);
+    assert.deepEqual(decodeClaimPrDescription(prState({ last_outcome: "a_newer_outcome" }))?.last_outcome, "a_newer_outcome");
+    for (const bad of [undefined, null, 1, [], {}, { ...prState(), mr_iid: 1.5 }, { ...prState(), last_outcome: false }]) {
+      assert.equal(decodeClaimPrDescription(bad), undefined, JSON.stringify(bad));
+    }
+  });
+});
+
+describe("raw vs sanitized fields are distinct types (D7, compile-checked)", () => {
+  it("raw fields are refused where sanitized are required; sanitized fields may be re-staged", async () => {
+    const raw: RawPrDescriptionFields = version().fields;
+    // @ts-expect-error raw (unsanitized) fields must not type as SanitizedPrDescriptionFields.
+    const notSanitized: SanitizedPrDescriptionFields = raw;
+    // @ts-expect-error a version's fields must be sanitized; a raw literal does not satisfy the DTO.
+    const notDto: PrDescriptionVersionDTO = version();
+    void notSanitized;
+    void notDto;
+
+    respond = () => ({ status: 200, body: JSON.stringify({ version: version() }) });
+    const staged = await newClient().stagePrDescription(RUN_ID, stageReq());
+    const sanitized: SanitizedPrDescriptionFields = staged.version.fields;
+    // The sanitized text is still assignable to a stage request's raw fields (a refresh re-stage).
+    const restage: PrDescriptionStageRequest = { ...stageReq(), fields: sanitized };
+    assert.deepEqual(restage.fields, version().fields);
   });
 });

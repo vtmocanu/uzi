@@ -1,7 +1,6 @@
 import type { Readable } from "node:stream";
 import type { Logger } from "./log.js";
 import {
-  PR_DESC_ACK_OUTCOMES,
   WORKER_API_PREFIX,
   type ActiveSnapshot,
   type PrDescriptionAckRequest,
@@ -14,6 +13,7 @@ import {
   type PrDescriptionStageResponse,
   type PrDescriptionState,
   type PrDescriptionVersionDTO,
+  type SanitizedPrDescriptionFields,
   type ClaimRequest,
   type PublishResponse,
   type PublishResult,
@@ -112,9 +112,9 @@ export function codexDeferralReason(err: unknown): "vault_locked" | undefined {
 }
 
 // ── PRD #1798 D9: typed errors for the pr-description routes ─────────────────────────────────
-// Each extends RequestError (status + truncated body stay readable, and isTransient still treats
-// the 429 as transient), so a caller can branch on the class without parsing the body. The status
-// map is api/internal/handler/worker_pr_description.go's writePrDescriptionError.
+// Each HTTP error extends RequestError (status + truncated body stay readable, and isTransient
+// still treats the 429 as transient), so a caller can branch on the class without parsing the
+// body. The status map is api/internal/handler/worker_pr_description.go's writePrDescriptionError.
 
 /** The 409 `reason` codes writePrDescriptionError sends, verbatim. */
 const PR_DESC_CONFLICT_REASONS = [
@@ -142,8 +142,14 @@ export class PrDescriptionConflict extends RequestError {
   }
 }
 
-/** HTTP 429 from the stage route's per-worker limiter. `retryAfterMs` is the server's
- *  `Retry-After` (whole seconds), when it sent a parseable one. */
+/** Upper bound on {@link PrDescriptionRateLimited.retryAfterMs}: a caller that sleeps on it
+ *  must not be parked for hours (or on Infinity) by a hostile or broken `Retry-After`. */
+const PR_DESC_MAX_RETRY_AFTER_MS = 60_000;
+
+/** HTTP 429 from a pr-description route. Only the stage route carries its own limiter (the
+ *  per-worker bucket it shares with proposals and findings), but a 429 on any of the four routes
+ *  maps here. `retryAfterMs` is the server's `Retry-After` (whole seconds) when it sent a
+ *  parseable one, clamped to {@link PR_DESC_MAX_RETRY_AFTER_MS}. */
 export class PrDescriptionRateLimited extends RequestError {
   constructor(
     base: RequestError,
@@ -169,6 +175,20 @@ export class PrDescriptionNotFound extends RequestError {
   constructor(base: RequestError) {
     super(base.method, base.path, base.status, base.body);
     this.name = "PrDescriptionNotFound";
+  }
+}
+
+/** A 2xx pr-description response whose body does not match the api's shape. NOT a RequestError
+ *  and NOT transient ({@link isTransient} returns false for it): the api answered and applied the
+ *  request, so a blind retry of a stage would create a second version. The message names the
+ *  route only; the body (untrusted text) is not carried. */
+export class PrDescriptionMalformedResponse extends Error {
+  constructor(
+    readonly path: string,
+    readonly op: "stage" | "bind" | "lookup" | "ack",
+  ) {
+    super(`POST ${path} returned a malformed pr-description ${op} response`);
+    this.name = "PrDescriptionMalformedResponse";
   }
 }
 
@@ -200,7 +220,10 @@ function prDescriptionError(err: RequestError, retryAfter: string | null): Reque
     }
     case 429: {
       const secs = retryAfter !== null && /^\d+$/.test(retryAfter.trim()) ? Number(retryAfter.trim()) : undefined;
-      return new PrDescriptionRateLimited(err, secs === undefined ? undefined : secs * 1000);
+      return new PrDescriptionRateLimited(
+        err,
+        secs === undefined ? undefined : Math.min(secs * 1000, PR_DESC_MAX_RETRY_AFTER_MS),
+      );
     }
     default:
       return err;
@@ -209,7 +232,9 @@ function prDescriptionError(err: RequestError, retryAfter: string | null): Reque
 
 // Response decoders: the api promises these shapes (non-nil slices in every response); a body that
 // does not match is refused rather than cast, because the stage response's sanitized fields are the
-// only text the renderer may publish (D7) and a bind/ack state drives the compare-and-swap.
+// only text the renderer may publish (D7) and a bind/ack state drives the compare-and-swap. These
+// decoders (with decodeClaimPrDescription) are the ONLY producers of SanitizedPrDescriptionFields:
+// isFields' type guard asserts the brand on a body that passed the shape check.
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -231,7 +256,7 @@ function isSize(v: unknown): boolean {
   );
 }
 
-function isFields(v: unknown): boolean {
+function isFields(v: unknown): v is SanitizedPrDescriptionFields {
   return (
     isRecord(v) &&
     typeof v.summary === "string" &&
@@ -275,14 +300,23 @@ function isVersion(v: unknown): v is PrDescriptionVersionDTO {
   );
 }
 
+// last_outcome accepts ANY string (forward skew: a newer api's new outcome must not drop the whole
+// state; nothing publishes from it). The published version stays strictly checked.
 function isPrState(v: unknown): v is PrDescriptionState {
   return (
     isRecord(v) &&
     isInt(v.mr_iid) &&
     isInt(v.lock_version) &&
-    (v.last_outcome === null || (PR_DESC_ACK_OUTCOMES as readonly unknown[]).includes(v.last_outcome)) &&
+    isStrOrNull(v.last_outcome) &&
     (v.published_version === null || isVersion(v.published_version))
   );
+}
+
+/** Decode the claim's `pr_description` (PRD #1798 D9 step 2) with the same shape check as the
+ *  bind / lookup / ack responses. Returns undefined for an absent or malformed value: the claim
+ *  then proceeds as if the PR had no record, and nothing here logs the value (untrusted text). */
+export function decodeClaimPrDescription(raw: unknown): PrDescriptionState | undefined {
+  return isPrState(raw) ? raw : undefined;
 }
 
 function decodeStage(v: unknown): PrDescriptionStageResponse | undefined {
@@ -748,7 +782,19 @@ export class WorkerClient {
     const res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/claim`, body);
     if (res.status === 204) return null;
     if (res.status >= 400) throw await this.toError("POST", `${WORKER_API_PREFIX}/runs/claim`, res);
-    return (await res.json()) as ClaimResponse;
+    const claim = (await res.json()) as ClaimResponse;
+    // PRD #1798 D9: the pr_description is validated or dropped, never cast (see
+    // decodeClaimPrDescription). The warning carries the run id only, never the value.
+    if (claim.pr_description !== undefined) {
+      const pr = decodeClaimPrDescription(claim.pr_description);
+      if (pr === undefined) {
+        delete claim.pr_description;
+        this.log.warn("claim pr_description is malformed; ignoring it", { run_id: claim.run_id });
+      } else {
+        claim.pr_description = pr;
+      }
+    }
+    return claim;
   }
 
   /** Claim the oldest queued CHAT run for this worker's user (the disjoint chat
@@ -1626,20 +1672,21 @@ export class WorkerClient {
   }
 
   // ── Plain-English PR descriptions (PRD #1798 D9) ───────────────────────────────────────────
-  // Four worker->api writes, none of which touches the forge. Every request carries the claim's
-  // claim_generation (the api fences each on the live generation: 409 stale_claim otherwise).
-  // Errors are typed: PrDescriptionInvalid (400), PrDescriptionNotFound (404),
-  // PrDescriptionConflict (409 with a known reason), PrDescriptionRateLimited (429, stage only);
-  // anything else is the plain RequestError. A response that does not match the api's shape
-  // throws rather than being cast.
+  // Four worker->api calls, none of which touches the forge: three writes (stage, bind, ack) and
+  // one read (lookup). Every request carries the claim's claim_generation (the api fences each on
+  // the live generation: 409 stale_claim otherwise). Errors are typed: PrDescriptionInvalid (400),
+  // PrDescriptionNotFound (404), PrDescriptionConflict (409 with a known reason),
+  // PrDescriptionRateLimited (429; only stage has its own limiter, but any route's 429 maps
+  // there); anything else is the plain RequestError. A 2xx response that does not match the api's
+  // shape throws PrDescriptionMalformedResponse (non-transient) rather than being cast.
   //
-  // ONE attempt each, no transient retry, like every other non-idempotent worker POST here
-  // (createProposal, reportFinding, postPlanSummary): stage creates a row per call, so a blind
-  // retry after a lost response could stage twice and burn the per-run version cap; ack is a
-  // compare-and-swap, so a retry after a lost response would come back lock_conflict; and bind's
-  // idempotency does not help the caller decide what to do next. The lifecycle (M6) owns recovery:
-  // it can re-read the forge and classify the region with lookup, which exists for the lost-ack
-  // case.
+  // ONE attempt each; the client retries nothing. Only stage is non-idempotent: it creates a row
+  // per call, so a blind retry after a lost response could stage twice and burn the per-run
+  // version cap, and it must never be retried. The other three are safe to replay: bind is
+  // idempotent for the same (version, mr_iid), lookup is a read, and a replayed ack whose
+  // response was lost returns 200 with the current state (workersvc.AckPrDescription checks
+  // prDescAckAlreadyApplied / prDescOwnRecoveryAlreadyApplied before the lock compare-and-swap).
+  // Their retry policy belongs to the lifecycle (M6), which knows the forge state around them.
 
   /** Stage a pending version (POST /worker/runs/:id/pr-description/stage). `req.fields` are RAW;
    *  the returned version's `fields` are the api-sanitized text, the only text the renderer may
@@ -1674,7 +1721,9 @@ export class WorkerClient {
 
   /** Acknowledge the forge write for a bound version, compare-and-swapped on
    *  `expected_lock_version` (POST /worker/runs/:id/pr-description/ack). Any outcome but
-   *  `published` abandons the version. */
+   *  `published` abandons the version, except when `observed_region_sha256` equals the acked
+   *  version's own rendered hash: the forge shows its region, so the api publishes it instead
+   *  (unless a newer publication supersedes it) and names it in `recovered_version_id`. */
   async ackPrDescription(
     runId: string,
     req: PrDescriptionAckRequest,
@@ -1702,7 +1751,7 @@ export class WorkerClient {
       parsed = undefined;
     }
     const out = decode(parsed);
-    if (out === undefined) throw new Error(`POST ${path} returned a malformed pr-description ${op} response`);
+    if (out === undefined) throw new PrDescriptionMalformedResponse(path, op);
     return out;
   }
 
@@ -2146,8 +2195,11 @@ export function isTransientStatus(status: number): boolean {
   return status >= 500 || status === 408 || status === 429;
 }
 
-/** Retryable: transport failures, 5xx, and 408/429; permanent otherwise. */
+/** Retryable: transport failures, 5xx, and 408/429; permanent otherwise (including a malformed
+ *  2xx pr-description response, {@link PrDescriptionMalformedResponse}). */
 export function isTransient(err: unknown): boolean {
+  // A malformed 2xx pr-description body: the api answered, so retrying could re-apply a write.
+  if (err instanceof PrDescriptionMalformedResponse) return false;
   if (err instanceof RequestError) {
     return isTransientStatus(err.status);
   }
