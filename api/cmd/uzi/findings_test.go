@@ -18,7 +18,7 @@ import (
 // than referencing the constants; this file is where the two sides are pinned to each other.
 
 // findingsFake builds a FakeClient with a two-repo backlog: one repo carrying a coordinate seen
-// in two runs plus a display-only coordinate whose evidence cascaded away (nil finding_id), and
+// in two runs plus an evidence-less coordinate (evidence cascaded away) (nil finding_id), and
 // a second repo with one coordinate. open_count is deliberately not derivable from these rows —
 // it is the server's CountOpenFindingsForUser aggregate, so a CLI that recomputed it from the
 // screen would print a different number.

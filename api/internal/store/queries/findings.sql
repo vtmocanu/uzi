@@ -202,7 +202,8 @@ WHERE user_id = @user_id
 -- latest_finding_id: the id of the NEWEST evidence row at the coordinate — the actionable id
 -- the web/CLI drive POST /findings/{id}/issue|dismiss on (M5). It MUST type NULLABLE: it is
 -- NULL for a filed/dismissed coordinate whose evidence was cascaded away with a deleted run
--- (a display-only, non-actionable row) — which is fine, last_title keeps it legible (D12).
+-- (it cannot be filed or dismissed by evidence id, but can still be marked done or undone by
+-- disposition id, #1723) — which is fine, last_title keeps it legible (D12).
 -- sqlc v1.30.0 infers a scalar subquery / derived-table column on findings.id (a NOT NULL
 -- PK) as NON-null and emits a bare uuid.UUID that panics scanning that NULL; only a column
 -- of a LEFT-JOINED BASE TABLE is inferred nullable. So `latest` is the findings table itself,

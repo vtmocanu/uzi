@@ -429,8 +429,16 @@ export function Findings() {
     () => (backlog?.findings ?? []).filter(canSelect).map((f) => f.disposition_id as string),
     [backlog, canSelect],
   );
-  const allSelected = selectableIds.length > 0 && selectableIds.every((id) => selected.has(id));
-  const someSelected = selectableIds.some((id) => selected.has(id));
+  // The EFFECTIVE selection is selected ∩ selectableIds: a row that stopped being selectable after
+  // it was ticked (it went stale after a 409, or a reload dropped or changed it) hides its checkbox,
+  // so it must also drop out of the bar count, select-all and every bulk action — a hidden row must
+  // never be sent. `selected` itself is left as-is; everything that reads it goes through this.
+  const activeSelected = useMemo(
+    () => selectableIds.filter((id) => selected.has(id)),
+    [selectableIds, selected],
+  );
+  const allSelected = selectableIds.length > 0 && activeSelected.length === selectableIds.length;
+  const someSelected = activeSelected.length > 0;
   const toggleSelectAll = (checked: boolean) => setSelected(checked ? new Set(selectableIds) : new Set());
   const toggleSelect = (id: string) =>
     setSelected((prev) => {
@@ -446,7 +454,7 @@ export function Findings() {
   const rowProps = (f: IncidentalFinding) => ({
     finding: f,
     selectable: canSelect(f),
-    selected: f.disposition_id ? selected.has(f.disposition_id) : false,
+    selected: canSelect(f) && f.disposition_id ? selected.has(f.disposition_id) : false,
     onToggleSelect: () => f.disposition_id && toggleSelect(f.disposition_id),
     repoLabel: stripUnsafeChars(maskRepoPath(f.repo_path, demo)),
     warning: f.finding_id ? filedWarnings[f.finding_id] : undefined,
@@ -590,12 +598,12 @@ export function Findings() {
         )
       )}
 
-      {selected.size > 0 && (
+      {activeSelected.length > 0 && (
         <MultiSelectBar
-          count={selected.size}
+          count={activeSelected.length}
           onClear={() => setSelected(new Set())}
-          onMarkDone={() => markDone([...selected])}
-          onDismiss={(reason) => dismiss([...selected], reason)}
+          onMarkDone={() => markDone(activeSelected)}
+          onDismiss={(reason) => dismiss(activeSelected, reason)}
         />
       )}
 

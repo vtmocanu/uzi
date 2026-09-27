@@ -614,6 +614,68 @@ describe("Findings page — Mark done (issue #1723)", () => {
     expect(within(row).getByRole("checkbox")).toBeTruthy();
     expect(buttonNames(row)).toEqual(["Mark done"]);
   });
+
+  // Shared setup for the stale-open cases: an open row and a filed row, the File on the open row
+  // 409s, and EVERY reload (the 409 handler's included) returns the open row still reading open.
+  async function fileThen409StillOpen() {
+    const rows = [mixed[0], mixed[1]];
+    mockApi.listFindings.mockResolvedValue(backlog({ bucket: "all", repo: "repo-uzi", findings: rows }));
+    mockApi.findingIssueDraft.mockResolvedValue({
+      title: "t",
+      description: "d",
+      location: mixed[0].location,
+      labels: [],
+      provenance: "",
+    });
+    mockApi.fileFinding.mockRejectedValue(new ApiError(409, "already resolved"));
+    renderFindings(["/findings?bucket=all&repo=repo-uzi"]);
+    await waitFor(() => expect(screen.getByText("open row")).toBeTruthy());
+    expect(screen.getByRole("checkbox", { name: "Select all 2 shown" })).toBeTruthy();
+  }
+
+  async function fileOpenRowAnd409() {
+    const loads = mockApi.listFindings.mock.calls.length;
+    fireEvent.click(within(rowOf("open row")).getByRole("button", { name: "File issue" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Create issue" }));
+    await waitFor(() => expect(mockApi.fileFinding).toHaveBeenCalledTimes(1));
+    // The 409 handler reloads; wait for that reload AND for the row to settle as stale.
+    await waitFor(() => expect(mockApi.listFindings.mock.calls.length).toBeGreaterThan(loads));
+    expect(await within(rowOf("open row")).findByText("already resolved")).toBeTruthy();
+  }
+
+  it("a 409'd File whose reload returns the row still open offers no checkbox, no Mark done, and drops out of select-all", async () => {
+    await fileThen409StillOpen();
+    await fileOpenRowAnd409();
+
+    const row = rowOf("open row");
+    expect(within(row).queryByRole("checkbox")).toBeNull();
+    expect(buttonNames(row)).toEqual([]);
+    // Only the filed row is still selectable.
+    expect(screen.getByRole("checkbox", { name: "Select all 1 shown" })).toBeTruthy();
+    expect(screen.queryByRole("checkbox", { name: "Select all 2 shown" })).toBeNull();
+    expect(within(rowOf("filed row")).getByRole("checkbox")).toBeTruthy();
+  });
+
+  it("a ticked row that goes stale drops out of the bar count and is never sent by a bulk action", async () => {
+    await fileThen409StillOpen();
+    mockApi.markFindingsDone.mockResolvedValue({ updated: 1, findings: [{ ...mixed[1], status: "done" }] });
+
+    fireEvent.click(within(rowOf("open row")).getByRole("checkbox"));
+    fireEvent.click(within(rowOf("filed row")).getByRole("checkbox"));
+    expect(await screen.findByText(/2 findings selected/)).toBeTruthy();
+
+    await fileOpenRowAnd409();
+
+    // The stale row's checkbox is gone, so it no longer counts: the bar reads 1, and select-all over
+    // the one remaining selectable row reads fully checked.
+    const bar = (await screen.findByText(/1 finding selected/)).parentElement as HTMLElement;
+    expect(screen.queryByText(/2 findings selected/)).toBeNull();
+    expect((screen.getByRole("checkbox", { name: "Select all 1 shown" }) as HTMLInputElement).checked).toBe(true);
+
+    fireEvent.click(within(bar).getByRole("button", { name: "Mark done" }));
+    await waitFor(() => expect(mockApi.markFindingsDone).toHaveBeenCalledTimes(1));
+    expect(mockApi.markFindingsDone).toHaveBeenCalledWith(["d-filed"]);
+  });
 });
 
 describe("Findings page — evidence expander (PRD #1183 M3/M4)", () => {

@@ -319,6 +319,11 @@ describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
 
     await waitFor(() => expect(screen.getByText(/Already filed or resolved/)).toBeTruthy());
     expect(container.textContent).not.toContain("being filed");
+    // The Mark done button unmounted with the action row: focus lands on the named card, never body.
+    const card = screen.getByRole("group", { name: "Incidental finding: Leaked ticker" });
+    expect(card).toBe(container.firstElementChild);
+    await waitFor(() => expect(document.activeElement).toBe(card));
+    expect(document.activeElement).not.toBe(document.body);
   });
 
   it("dispatches to the unrenderable fallback when the finding payload carries no id", () => {

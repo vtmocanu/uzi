@@ -631,9 +631,11 @@ func TestPendingJudgeDTOTags(t *testing.T) {
 // TestIncidentalFindingDTOTags pins the PRD #333 M4 backlog-row shape, widened by PRD #1183 M3.
 // disposition_id is ALWAYS present (the id the bulk-dismiss/undo endpoints key on). finding_id,
 // dismiss_reason, set_via, filed_issue_iid, filed_issue_url, resolved_at, evidence_preview and
-// occurrences are all omitempty: a display-only coordinate whose evidence was cascaded away
-// carries no finding_id/evidence_preview/occurrences, an OPEN coordinate carries no
-// filed/resolved fields, and only a dismissed/auto-done coordinate carries a reason/set_via. The
+// occurrences are all omitempty: a coordinate whose evidence was cascaded away carries no
+// finding_id/evidence_preview/occurrences (it cannot be filed or dismissed via the evidence-id
+// routes, but can still be marked done / undone via the disposition-id routes), an OPEN
+// coordinate carries no filed/resolved fields, and only a dismissed/auto-done coordinate carries
+// a reason/set_via. The
 // zero-value pin asserts the always-present key set; the populated pin asserts every optional key
 // surfaces when set.
 func TestIncidentalFindingDTOTags(t *testing.T) {

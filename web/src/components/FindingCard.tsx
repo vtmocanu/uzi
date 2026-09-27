@@ -164,6 +164,9 @@ export function FindingCard({
       setState({ kind: "done", dispositionId: res.disposition_id, resolvedAt: new Date().toISOString() });
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
+        // The action row (and the Mark done button that held focus) unmounts for the advisory, so
+        // arm the focus move too: it lands via the same fallback chain, on the card itself here.
+        focusAfterMutation.current = true;
         setState({ kind: "resolved" });
       } else {
         setErr(errorMessage(e, "Could not mark the finding done"));
@@ -205,6 +208,10 @@ export function FindingCard({
     <div
       ref={cardRef}
       tabIndex={-1}
+      // The focus fallback target, so it needs an accessible name. title is model-authored and
+      // reaches an attribute here, so it is stripped (.claude/rules/web.md).
+      role="group"
+      aria-label={`Incidental finding: ${stripUnsafeChars(title) || "untitled"}`}
       className="overflow-hidden rounded-xl border border-info/40 bg-info/[0.06] focus:outline-none focus-visible:ring-2 focus-visible:ring-info/60"
     >
       <div className="flex items-center justify-between gap-2 border-b border-info/20 bg-info/10 px-3 py-2">
