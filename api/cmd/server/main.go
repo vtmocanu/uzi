@@ -105,6 +105,11 @@ var (
 	prdsOpen = ""
 )
 
+// The Codex usage poller discovers poke-time recovery (PRD #1732 D7) by a type assertion on
+// its collector, and a failed assertion silently skips the recovery pass. The production
+// collector is the workersvc Service, so this keeps a signature drift a build error.
+var _ codexusagepoller.Recoverer = (*workersvc.Service)(nil)
+
 // codexProviderRequestTimeout bounds one Codex provider HTTP call in the production
 // codexauth.Client (PRD #1171 M1). The refresh callback spends it only on the oauth exchange;
 // import and recovery spend it on their nonrotating identity reads. Request-entry anchoring

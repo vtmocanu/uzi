@@ -74,6 +74,11 @@ const HostedProvisionLockClass int32 = 0x757A6877 // "uzhw"
 // RegistrationLockKey's one-bigint space, and this class differs from
 // HostedProvisionLockClass, so none can collide. XACT-scoped: released on commit or
 // rollback, no unlock to forget.
+//
+// The Codex account poll writes (queries/codex_rate_limits.sql) take this same key in
+// SHARED mode, with the class as the literal 1970959211 and the objid derived in SQL, so a
+// change to either half here must be mirrored there;
+// TestCodexFencedWriteTakesSecretMutationLockLiveDB fails when they disagree.
 const SecretMutationLockClass int32 = 0x757A736B // "uzsk"
 
 // SecretMutationLockObjID derives the objid half of the per-user secret mutation lock from

@@ -157,9 +157,9 @@ func staticChoice(secretID *uuid.UUID, bound string) secretChoice {
 // another user's credential (D11).
 //
 // 🔴 IT NOW RESOLVES THE DEFAULT EXPLICITLY, AND THAT IS THE POINT (PRD #111 D8).
-// The nil case used to hand the whole job to secretopen.Open, which resolves
-// "the user's default of this kind" INSIDE its ciphertext query and returns only
-// plaintext — so there was no id for the caller to record, and a run could not name
+// The nil case used to hand the whole job to a default-resolving open (since
+// removed), which resolved "the user's default of this kind" INSIDE its ciphertext
+// query and returned only plaintext — so there was no id for the caller to record, and a run could not name
 // what it spent. Now the default is resolved to (id, label) first and the open
 // always goes by id, which makes the recorded id provably the opened one.
 //

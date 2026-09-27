@@ -8,7 +8,9 @@
 // staged alias is reconciled only while THAT alias is enabled, and an account is polled (and
 // so background-refreshed, since the poll's 401 path is the only background refresh) only
 // while at least one ENABLED linked alias resolves to it. Both rules live in the listing
-// queries, so a disabled credential never reaches a provider call from here.
+// queries, so a disabled credential is not listed. The listing is check-then-act: a disable
+// that commits between the listing and the reconcile (or recovery promotion) can still let
+// one nonrotating identity call through, which spends no token (ADR 1732 D6).
 //
 //  1. RECONCILE staged aliases FIRST. A freshly imported codex_auth login sits 'staging'
 //     until its identity is established; this engine is its first production caller of

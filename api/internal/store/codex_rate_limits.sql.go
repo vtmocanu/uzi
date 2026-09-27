@@ -359,12 +359,19 @@ func (q *Queries) ListLinkedCodexAccountsToPoll(ctx context.Context) ([]ListLink
 }
 
 const recordCodexAccountPollFailure = `-- name: RecordCodexAccountPollFailure :execrows
-WITH linked_aliases AS (
+WITH secret_mutation_lock AS MATERIALIZED (
+    SELECT pg_advisory_xact_lock_shared(
+        1970959211,
+        ('x' || substr(CAST($1::uuid AS text), 1, 8))::bit(32)::int
+    )
+), linked_aliases AS (
     SELECT us.id, us.enablement_rev, us.disabled_at
     FROM codex_credential_state s
     JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
-    WHERE s.user_id = $1 AND s.provider_account_id = $2
+    WHERE EXISTS (SELECT 1 FROM secret_mutation_lock)
+        AND s.user_id = $1 AND s.provider_account_id = $2
         AND s.status = 'linked'
+    ORDER BY us.id
     FOR SHARE OF us
 )
 INSERT INTO codex_account_rate_limits (
@@ -413,7 +420,9 @@ type RecordCodexAccountPollFailureParams struct {
 // attempt_error) and DELIBERATELY leaves buckets, observed_generation,
 // observed_credential_revision and last_success_at intact, so a failure after a prior
 // success reads as "stale reading, last attempt failed" rather than discarding the reading.
-// :execrows — 0 rows means authority moved; the caller discards.
+// :execrows — 0 rows means authority moved; the caller discards. The alias share locks are
+// taken behind the shared secret-mutation advisory lock, exactly as in
+// UpsertCodexAccountRateLimits (see its LOCK ORDER note).
 func (q *Queries) RecordCodexAccountPollFailure(ctx context.Context, arg RecordCodexAccountPollFailureParams) (int64, error) {
 	result, err := q.db.Exec(ctx, recordCodexAccountPollFailure,
 		arg.UserID,
@@ -432,12 +441,19 @@ func (q *Queries) RecordCodexAccountPollFailure(ctx context.Context, arg RecordC
 
 const upsertCodexAccountRateLimits = `-- name: UpsertCodexAccountRateLimits :execrows
 
-WITH linked_aliases AS (
+WITH secret_mutation_lock AS MATERIALIZED (
+    SELECT pg_advisory_xact_lock_shared(
+        1970959211,
+        ('x' || substr(CAST($1::uuid AS text), 1, 8))::bit(32)::int
+    )
+), linked_aliases AS (
     SELECT us.id, us.enablement_rev, us.disabled_at
     FROM codex_credential_state s
     JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
-    WHERE s.user_id = $1 AND s.provider_account_id = $2
+    WHERE EXISTS (SELECT 1 FROM secret_mutation_lock)
+        AND s.user_id = $1 AND s.provider_account_id = $2
         AND s.status = 'linked'
+    ORDER BY us.id
     FOR SHARE OF us
 )
 INSERT INTO codex_account_rate_limits (
@@ -506,11 +522,26 @@ type UpsertCodexAccountRateLimitsParams struct {
 // rejects it, because every transition bumps the alias's enablement_rev. The list covers
 // every linked alias, so a sibling's transition (or a newly linked alias) also discards the
 // in-flight reading: conservative, and the next poll writes a fresh one.
-// FOR SHARE OF us serialises the check against a transition exactly as the Anthropic
-// UpsertRateLimits does: the enablement handler's FOR UPDATE and SetSecretEnablement's
-// UPDATE conflict with it, so a transition that commits first is seen (the re-read row
-// carries the new revision and the fence fails), and one that comes second waits for this
-// write.
+// FOR SHARE OF us serialises the check against a transition, as the Anthropic
+// UpsertRateLimits' FOR SHARE does for its single token row: the enablement handler's FOR
+// UPDATE and SetSecretEnablement's UPDATE conflict with it, so a transition that commits
+// first is seen (the re-read rows carry the new revision and the fence fails), and one that
+// comes second waits for this write.
+//
+// 🔴 LOCK ORDER (PRD #1732 D14). Unlike the Anthropic write this one share-locks SEVERAL
+// alias rows, and the transactions it serialises against lock several too (disable-default
+// then hand off to a replacement, or make-default: clear the old default then set the new
+// one, in either id order). Row locks alone would let each side hold one alias and wait for
+// the other: a deadlock (40P01). So the statement first takes the user's secret-mutation
+// advisory lock (store.LockSecretMutation's key: class SecretMutationLockClass = 1970959211,
+// objid = the uuid's first four bytes as a signed int32) in SHARED mode, in the
+// secret_mutation_lock CTE that gates the linked_aliases scan, and only then share-locks the
+// rows (in id order). Every multi-row transition takes that lock EXCLUSIVELY as its first
+// statement, so while this write holds it no transition holds any alias row, and a
+// transition that holds it makes this write wait before it locks anything. Concurrent poll
+// writes share it and do not serialise with each other. It is XACT-scoped: an autocommit
+// statement releases it when the statement ends. TestCodexFencedWriteTakesSecretMutationLockLiveDB
+// pins both the key derivation and the wait.
 //
 // On conflict the reading + observed counters + success/attempt timestamps are overwritten
 // and attempt_error is cleared (a success clears the last failure's reason).

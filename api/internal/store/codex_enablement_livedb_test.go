@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -338,5 +339,183 @@ func TestCodexSurvivorScanGatesRecoveryOnEnabledAliasLiveDB(t *testing.T) {
 		coord_operation_id = gen_random_uuid(), lease_deadline = now() - interval '1 hour' WHERE id = $1`, wedged)
 	if !scanned(wedged) {
 		t.Fatal("an expired lease on an account with no enabled alias must still be reaped (D7)")
+	}
+}
+
+// TestCodexTickAndPokeSignaturesAgreeLiveDB: the factory-wide tick listing captures the same
+// enablement list as the owner poke listing for a multi-alias account, and a write fenced on
+// the tick's list lands. The two writes recompute the list in alias-id order, so a tick
+// listing that aggregated in any other order would discard every reading of a multi-alias
+// account.
+func TestCodexTickAndPokeSignaturesAgreeLiveDB(t *testing.T) {
+	ctx, pool, q, user := codexLiveDB(t)
+	acc, _ := mkLinkedCodexAccount(ctx, t, pool, q, user, "sig-a", false)
+	addLinkedAlias(ctx, t, pool, q, user, acc, "sig-b", false)
+
+	all, err := q.ListLinkedCodexAccountsToPoll(ctx)
+	if err != nil {
+		t.Fatalf("ListLinkedCodexAccountsToPoll: %v", err)
+	}
+	tickSig, found := "", false
+	for _, r := range all {
+		if r.UserID == user && r.ProviderAccountID == acc {
+			tickSig, found = r.EnablementSig, true
+		}
+	}
+	if !found {
+		t.Fatal("two-alias account missing from the tick listing")
+	}
+	if pokeSig := codexEnablementSig(ctx, t, q, user, acc); tickSig != pokeSig {
+		t.Fatalf("tick enablement list %q != poke enablement list %q", tickSig, pokeSig)
+	}
+	n, err := q.UpsertCodexAccountRateLimits(ctx, store.UpsertCodexAccountRateLimitsParams{
+		UserID: user, ProviderAccountID: acc, Buckets: []byte(`{"r":1}`), AttemptStatus: "ok",
+		EnablementSig: tickSig,
+	})
+	if err != nil || n != 1 {
+		t.Fatalf("reading fenced on the tick's list = (%d, %v), want (1, nil)", n, err)
+	}
+}
+
+// TestCodexFencedWriteTakesSecretMutationLockLiveDB: the two Codex account writes share-lock
+// every linked alias of the account, and a default hand-off locks two of them in its own
+// order, so each could hold one alias while waiting for the other (40P01). The writes
+// therefore take the user's secret-mutation advisory lock in SHARED mode before any alias
+// row. Here a hand-off transaction holds that lock (store.LockSecretMutation, exclusive) and
+// the old default's row; the write must wait on the ADVISORY lock, holding no alias, so the
+// hand-off (disable the default, clear the slot, promote the sibling) runs to commit
+// without waiting, and the write then finishes without a deadlock and writes nothing (the
+// enablement list moved). Two users whose ids differ in the sign bit of the lock's objid
+// pin the SQL key derivation against SecretMutationLockObjID.
+func TestCodexFencedWriteTakesSecretMutationLockLiveDB(t *testing.T) {
+	ctx, pool, q, _ := codexLiveDB(t)
+	type write func(ctx context.Context, q *store.Queries, user, acc uuid.UUID, sig string) (int64, error)
+	writes := []struct {
+		name string
+		fn   write
+	}{
+		{"reading", func(ctx context.Context, q *store.Queries, user, acc uuid.UUID, sig string) (int64, error) {
+			return q.UpsertCodexAccountRateLimits(ctx, store.UpsertCodexAccountRateLimitsParams{
+				UserID: user, ProviderAccountID: acc, Buckets: []byte(`{"r":1}`), AttemptStatus: "ok",
+				EnablementSig: sig,
+			})
+		}},
+		{"failure", func(ctx context.Context, q *store.Queries, user, acc uuid.UUID, sig string) (int64, error) {
+			return q.RecordCodexAccountPollFailure(ctx, store.RecordCodexAccountPollFailureParams{
+				UserID: user, ProviderAccountID: acc, AttemptStatus: "transient", AttemptError: "x",
+				EnablementSig: sig,
+			})
+		}},
+	}
+	for _, lead := range []byte{0x12, 0xF3} {
+		for _, w := range writes {
+			t.Run(fmt.Sprintf("%s/objid-%02x", w.name, lead), func(t *testing.T) {
+				user := uuid.New()
+				user[0] = lead
+				mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+					user, fmt.Sprintf("codex-%s@e2e", user))
+				acc, oldDefault := mkLinkedCodexAccount(ctx, t, pool, q, user, "handoff-a", true)
+				replacement := addLinkedAlias(ctx, t, pool, q, user, acc, "handoff-b", false)
+				started := codexEnablementSig(ctx, t, q, user, acc)
+
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				tq := q.WithTx(tx)
+				holder := backendPID(ctx, t, tx)
+				if err := store.LockSecretMutation(ctx, tx, user); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := tq.GetUserSecretForUpdate(ctx, store.GetUserSecretForUpdateParams{ID: oldDefault, UserID: user}); err != nil {
+					t.Fatal(err)
+				}
+
+				conn, err := pool.Acquire(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer conn.Release()
+				var writer int32
+				if err := conn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&writer); err != nil {
+					t.Fatal(err)
+				}
+				type result struct {
+					n   int64
+					err error
+				}
+				done := make(chan result, 1)
+				go func() {
+					n, werr := w.fn(ctx, store.New(conn), user, acc, started)
+					done <- result{n, werr}
+				}()
+
+				deadline := time.Now().Add(10 * time.Second)
+				for {
+					var onAdvisory bool
+					var waitType, waitEvent string
+					if err := pool.QueryRow(ctx, `SELECT
+							$2::int = ANY(pg_blocking_pids(pid)) AND wait_event_type = 'Lock' AND wait_event = 'advisory',
+							COALESCE(wait_event_type, ''), COALESCE(wait_event, '')
+						FROM pg_stat_activity WHERE pid = $1`, writer, holder).Scan(&onAdvisory, &waitType, &waitEvent); err != nil {
+						t.Fatal(err)
+					}
+					if onAdvisory {
+						break
+					}
+					select {
+					case r := <-done:
+						t.Fatalf("the fenced write did not wait for the secret-mutation lock: (%d, %v)", r.n, r.err)
+					default:
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("the fenced write never waited on the advisory lock (last wait %s/%s)", waitType, waitEvent)
+					}
+					time.Sleep(20 * time.Millisecond)
+				}
+
+				// The hand-off must not wait on the blocked write: it holds no alias row.
+				hctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				if _, err := tq.SetSecretEnablement(hctx, store.SetSecretEnablementParams{ID: oldDefault, UserID: user, Enabled: false}); err != nil {
+					t.Fatalf("disable old default: %v", err)
+				}
+				if _, err := tq.ClearCodexDefaults(hctx, user); err != nil {
+					t.Fatalf("clear codex defaults: %v", err)
+				}
+				if _, err := tq.SetUserSecretDefault(hctx, store.SetUserSecretDefaultParams{ID: replacement, UserID: user}); err != nil {
+					t.Fatalf("promote replacement: %v", err)
+				}
+				if err := tx.Commit(hctx); err != nil {
+					t.Fatal(err)
+				}
+
+				r := <-done
+				if code := pgCode(r.err); code == "40P01" {
+					t.Fatalf("the fenced write deadlocked against the hand-off: %v", r.err)
+				}
+				if r.err != nil || r.n != 0 {
+					t.Fatalf("write racing the hand-off = (%d, %v), want (0, nil)", r.n, r.err)
+				}
+				var rows int
+				if err := pool.QueryRow(ctx, `SELECT count(*) FROM codex_account_rate_limits WHERE provider_account_id = $1`, acc).Scan(&rows); err != nil {
+					t.Fatal(err)
+				}
+				if rows != 0 {
+					t.Fatalf("a write landed behind the hand-off: %d rows", rows)
+				}
+				// The shared lock is statement-scoped: with the write's connection still open
+				// but idle, the next exclusive taker is not blocked.
+				var free bool
+				if err := pool.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock($1, $2)`,
+					store.SecretMutationLockClass, store.SecretMutationLockObjID(user)).Scan(&free); err != nil {
+					t.Fatal(err)
+				}
+				if !free {
+					t.Fatal("the fenced write kept the secret-mutation lock after it returned")
+				}
+			})
+		}
 	}
 }
