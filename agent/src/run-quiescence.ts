@@ -911,6 +911,12 @@ function parseDockerHost(dockerHost: string): Endpoint | undefined {
 /** A Docker Engine response body larger than this is refused (the request is destroyed). */
 const DOCKER_BODY_MAX = 8 * 1024 * 1024;
 
+/**
+ * One Docker Engine request. `timeoutMs` bounds it TWICE: as the socket inactivity timeout, and as
+ * an absolute wall-clock timer that destroys the request (and any response) when it fires, so a
+ * daemon trickling a body byte by byte cannot hold the request open past it. The promise settles
+ * exactly once; the absolute timer is cleared on settle and unref'd so it never holds the loop.
+ */
 function dockerRequest(
   ep: Endpoint,
   method: string,
@@ -919,25 +925,44 @@ function dockerRequest(
   maxBodyBytes: number = DOCKER_BODY_MAX,
 ): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
-    const req = http.request({ ...ep, method, path: urlPath, timeout: timeoutMs }, (res) => {
+    let settled = false;
+    let res: http.IncomingMessage | undefined;
+    const finish = (err: Error | undefined, value?: { status: number; body: string }): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(absolute);
+      if (err) reject(err);
+      else resolve(value!);
+    };
+    const abort = (err: Error): void => {
+      finish(err);
+      res?.destroy();
+      req.destroy();
+    };
+    const req = http.request({ ...ep, method, path: urlPath, timeout: timeoutMs }, (r) => {
+      res = r;
       const chunks: Buffer[] = [];
       let bytes = 0;
-      res.on("data", (c: Buffer) => {
+      r.on("data", (c: Buffer) => {
+        if (settled) return;
         bytes += c.length;
         if (bytes > maxBodyBytes) {
-          // Reject FIRST (the promise settles once), then tear the connection down.
-          reject(new Error(`docker ${method} response body exceeded ${maxBodyBytes} bytes`));
-          res.destroy();
-          req.destroy();
+          abort(new Error(`docker ${method} response body exceeded ${maxBodyBytes} bytes`));
           return;
         }
         chunks.push(c);
       });
-      res.on("end", () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
-      res.on("error", reject);
+      r.on("end", () => finish(undefined, { status: r.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
+      r.on("error", (err) => finish(err));
+      r.on("aborted", () => finish(new Error(`docker ${method} ${urlPath} response aborted`)));
     });
-    req.on("timeout", () => req.destroy(new Error(`docker ${method} ${urlPath} timed out`)));
-    req.on("error", reject);
+    const absolute = setTimeout(
+      () => abort(new Error(`docker ${method} ${urlPath} exceeded its ${timeoutMs}ms deadline`)),
+      Math.max(0, timeoutMs),
+    );
+    absolute.unref();
+    req.on("timeout", () => abort(new Error(`docker ${method} ${urlPath} timed out`)));
+    req.on("error", (err) => finish(err));
     req.end();
   });
 }
@@ -962,7 +987,12 @@ function boundContainers(body: string, targetPaths: string[]): string[] {
 
 /**
  * Force-remove every container with a mount source under a target path, then keep listing (1 s
- * apart) until two consecutive listings are clean, within 15 s overall and 5 s per request.
+ * apart) until two consecutive listings are clean. The overall deadline (15 s default) is checked
+ * before EVERY request, list and delete alike: once it has passed no further request starts and
+ * the result is `docker_error`. Each request is bounded by min(per-request timeout (5 s default),
+ * time left to the deadline), applied both as the socket inactivity timeout and as an absolute
+ * timer that destroys the request, so a daemon trickling a body cannot outlast it; the sleep
+ * between listings is likewise capped at the time left and the deadline re-checked after it.
  * Containers binding nothing under a target path are never touched.
  *
  * Out of scope (disclosed): a container binding an ANCESTOR of the clone (e.g. the whole runner
@@ -976,11 +1006,25 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
   const now = opts.now ?? Date.now;
   const reqTimeout = opts.requestTimeoutMs ?? 5_000;
   const deadline = now() + (opts.deadlineMs ?? 15_000);
+  const interval = opts.intervalMs ?? 1_000;
   const removed = new Set<string>();
+  const expired = (what: string): DockerTeardown => ({
+    state: "docker_error",
+    removed: [...removed],
+    detail: `deadline passed before ${what}; stopped before two consecutive clean listings`,
+  });
   let clean = 0;
   try {
     for (;;) {
-      const list = await dockerRequest(ep, "GET", "/containers/json?all=1", reqTimeout, opts.maxBodyBytes);
+      let remaining = deadline - now();
+      if (remaining <= 0) return expired("the container listing");
+      const list = await dockerRequest(
+        ep,
+        "GET",
+        "/containers/json?all=1",
+        Math.min(reqTimeout, remaining),
+        opts.maxBodyBytes,
+      );
       if (list.status !== 200) throw new Error(`container listing returned HTTP ${list.status}`);
       const ids = boundContainers(list.body, opts.targetPaths);
       if (ids.length === 0) {
@@ -995,24 +1039,21 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
       } else {
         clean = 0;
         for (const id of ids) {
+          remaining = deadline - now();
+          if (remaining <= 0) return expired("a container deletion");
           const del = await dockerRequest(
             ep,
             "DELETE",
             `/containers/${encodeURIComponent(id)}?force=1`,
-            reqTimeout,
+            Math.min(reqTimeout, remaining),
             opts.maxBodyBytes,
           );
           if (del.status === 204 || del.status === 200 || del.status === 404) removed.add(sanitizeForLog(id, 128));
         }
       }
-      if (now() >= deadline) {
-        return {
-          state: "docker_error",
-          removed: [...removed],
-          detail: "deadline passed before two consecutive clean listings",
-        };
-      }
-      await sleep(opts.intervalMs ?? 1_000);
+      remaining = deadline - now();
+      if (remaining <= 0) return expired("the next listing");
+      await sleep(Math.min(interval, remaining));
     }
   } catch (err) {
     return { state: "docker_error", removed: [...removed], detail: sanitizeForLog((err as Error).message) };
