@@ -238,6 +238,74 @@ describe("Worker × DinD prune claim gate (issue #1759)", () => {
     }
   });
 
+  it("a heartbeat held open across a whole claimed run is stamped at SEND time and never authorizes the prune", async () => {
+    // The straddle: a heartbeat sent BEFORE the claim (the api then reports no hold)
+    // returns only AFTER a fast run has ended. Stamped at receipt, that stale `false`
+    // would look newer than the run end and authorize the prune; stamped at send it
+    // predates the run and must be ignored.
+    const heldResponse = deferred<boolean>();
+    const heldSent = deferred<void>();
+    const runGate = deferred<void>();
+    let runStarted = false;
+    let runClaims = 0;
+    const hb = { calls: 0, down: true, heldSentAtMs: 0 };
+    const at = { claimMs: 0 };
+    const runner = {
+      resumePendingRecoveries: async () => {},
+      execute: async () => {
+        runStarted = true;
+        await runGate.promise;
+      },
+    } as unknown as RunRunner;
+    const h = build(
+      {
+        heartbeat: async () => {
+          hb.calls++;
+          if (hb.calls === 1) {
+            hb.heldSentAtMs = Date.now();
+            heldSent.resolve();
+            return heldResponse.promise; // held open across the whole run
+          }
+          await tick(1);
+          if (hb.down) throw new Error("api unreachable");
+          return false;
+        },
+        claimRun: async (): Promise<ClaimResponse | null> => {
+          if (runClaims++ > 0) return null;
+          await heldSent.promise; // the claim happens only once the held heartbeat is out
+          await tick(2);
+          at.claimMs = Date.now();
+          return { run_id: "run-1" } as unknown as ClaimResponse;
+        },
+      },
+      runner,
+      idleChat,
+    );
+    const controller = new AbortController();
+    const done = h.worker.run(controller.signal);
+    try {
+      await until(() => runStarted, "the run is active");
+      assert.ok(hb.heldSentAtMs < at.claimMs, "the held heartbeat was sent before the claim");
+      assert.strictEqual(hb.calls, 1, "no other heartbeat is sent while one is in flight");
+      runGate.resolve();
+      await until(() => h.worker.isIdle(), "the run ended");
+      // Pressure only after the run end, so only the worker's run-end hook orders the flag.
+      h.pressure.on = true;
+      for (let i = 0; i < 10; i++) await tick();
+      heldResponse.resolve(false); // the pre-claim heartbeat finally returns: custody clear
+      await until(() => hb.calls >= 2, "the held heartbeat's flag was recorded");
+      for (let i = 0; i < 80; i++) await tick();
+      assert.strictEqual(h.execs.length, 0, "no docker command on a flag from a heartbeat sent before the run");
+      hb.down = false; // a LATER heartbeat, sent after the run end, reports custody clear
+      await until(() => h.execs.some((e) => isPrune(e.argv)), "a heartbeat sent after the run end authorizes it");
+    } finally {
+      heldResponse.resolve(false);
+      runGate.resolve();
+      controller.abort();
+      await done;
+    }
+  });
+
   it("an active chat session blocks the prune", async () => {
     const chatGate = deferred<void>();
     let chatStarted = false;

@@ -37,9 +37,10 @@
 // model or repo input (the argv is a frozen constant, validated again at exec time),
 // they talk to the daemon only over DOCKER_HOST (the daemon performs the deletion in its
 // own data root), docker is invoked by absolute path, and the child gets a minimal env
-// (a fixed system PATH, HOME and DOCKER_CONFIG pointing at a worker-owned empty 0700
-// directory, DOCKER_HOST) so no worker secret reaches it and no $HOME/.docker/config.json
-// (aliases, plugin dirs, credential helpers) is read. The runner-uid split exists to fence model-driven commands
+// (a fixed system PATH, DOCKER_HOST, and HOME and DOCKER_CONFIG pointing at a
+// worker-owned 0700 directory, one per process and left in tmpdir, that starts empty and
+// where buildx may later write its own state) so no worker secret reaches it and no
+// $HOME/.docker/config.json (aliases, plugin dirs, credential helpers) is read. The runner-uid split exists to fence model-driven commands
 // away from worker secrets, and none are involved here.
 
 import { execFile } from "node:child_process";
@@ -132,9 +133,9 @@ for (const argv of ALLOWED_ARGV) assertDockerArgvAllowed(argv);
 /**
  * The docker client, by absolute path so the child never resolves `docker` through PATH
  * (which on a worker includes the writable /nix toolchain profile). The worker images
- * install it with Alpine's `docker-cli` apk package (agent/templates/base/Dockerfile
- * line 34, agent/templates/jvm/Dockerfile line 23), which places the client at
- * /usr/bin/docker.
+ * install it with Alpine's `docker-cli` apk package (the `apk add ... docker-cli` step in
+ * agent/templates/base/Dockerfile and agent/templates/jvm/Dockerfile), which places the
+ * client at /usr/bin/docker.
  */
 export const DOCKER_BIN = "/usr/bin/docker";
 
@@ -143,8 +144,9 @@ const CHILD_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 let dockerConfigDir: string | undefined;
 
-/** A worker-owned, empty, 0700 directory used as the child's DOCKER_CONFIG and HOME,
- *  created once per process (mkdtemp creates it 0700). */
+/** A worker-owned 0700 directory used as the child's DOCKER_CONFIG and HOME, created
+ *  once per process (mkdtemp creates it 0700) and left in tmpdir. It starts empty, so no
+ *  config.json is read; buildx may write its own state there afterwards. */
 function emptyDockerConfigDir(): string {
   dockerConfigDir ??= mkdtempSync(join(tmpdir(), "uzi-dind-prune-docker-"));
   return dockerConfigDir;
@@ -525,7 +527,8 @@ export class DindPruneController {
   }
 
   /** The exec wrapper: the runtime argv guard, then docker by absolute path with a
-   *  minimal env whose HOME and DOCKER_CONFIG are a worker-owned empty directory. */
+   *  minimal env whose HOME and DOCKER_CONFIG are a worker-owned 0700 directory that
+   *  starts empty (buildx may write its own state there). */
   private async docker(argv: readonly string[], timeoutMs: number, signal?: AbortSignal): Promise<string> {
     assertDockerArgvAllowed(argv);
     const configDir = emptyDockerConfigDir();

@@ -436,9 +436,11 @@ export class Worker {
           this.buildActiveSnapshot(),
         );
         ok = true;
-        // issue #1759 M3: the api's custody flag, timestamped by the prune controller so a
-        // run of failed heartbeats ages it out (the prune fails closed on a stale flag).
-        // Stamped with the SEND time: the flag reflects the api's view as of the request.
+        // issue #1759 M3: the api's custody flag, stamped here with this heartbeat's SEND
+        // time (the flag reflects the api's view as of the request, so a heartbeat sent
+        // before a claim and returning after that run ended must not look newer than the
+        // run end). The controller ages the stamp out, so a run of failed heartbeats makes
+        // the prune fail closed on a stale flag.
         this.dindPrune?.recordCustody(retaining, sentAtMs);
       } catch (err) {
         this.log.warn("heartbeat failed", { error: errMessage(err) });
