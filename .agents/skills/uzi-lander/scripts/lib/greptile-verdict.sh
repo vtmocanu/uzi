@@ -20,6 +20,9 @@
 # stays an exact-head question. greptile_paired_verdict is the one exception, and still an
 # exact-head answer: it proves a review OF the head whose check-run landed on an older commit.
 
+# shellcheck source=sanitize.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sanitize.sh"
+
 # greptile_newest_run — stdin: `gh api --paginate .../check-runs` pages. Prints the NEWEST
 # `Greptile Review` run as JSON, or {} when there is none; fails on an unreadable payload.
 # The listing is newest first and a re-trigger adds a second same-named run on one commit,
@@ -297,7 +300,7 @@ greptile_scope_live() {
 # shellcheck disable=SC2034  # GOD_* are this function's outputs, read by the sourcing scripts.
 greptile_outside_diff() {
   local head="$1" json
-  json=$(jq --arg h "$head" '
+  json=$(jq --arg h "$head" "$UNTRUSTED_JQ"'
     if type!="array" then error("issue comments are not an array") else
       ([.[]|select(.user.login=="greptile-apps[bot]"
               and ((.body // "")|contains("<!-- greptile_outside_diff -->")))]
@@ -308,7 +311,7 @@ greptile_outside_diff() {
            | ((match("alt=\"(P[0-9])\"").captures[0].string)? // "?") as $p
            | ((match("\\*\\*([^*]+)\\*\\*").captures[0].string)? // "-") as $t
            | ((match("`([^`]+)`").captures[0].string)? // "-") as $loc
-           | "  GR  \($loc)  [\($p)] \($t) (outside diff)"]}
+           | "  GR  \($loc|untrusted_excerpt(160))  [\($p)] \($t|untrusted_excerpt(200)) (outside diff)"]}
     end' 2>/dev/null) || return 1
   GOD_TOTAL=$(printf '%s' "$json" | jq -r '.total')
   GOD_HEAD=$(printf '%s' "$json" | jq -r '.head')
