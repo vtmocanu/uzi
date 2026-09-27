@@ -332,7 +332,8 @@ async function runFinalizeImportPart(
   // so node exited 0 before the rest of the fixture ran (issue #1769 acceptance). Bound it.
   const sleepSettled = await Promise.race([
     sleeping.then(() => true, () => true),
-    new Promise<boolean>((resolve) => { const t = setTimeout(() => resolve(false), 25_000); t.unref(); }),
+    // Deliberately NOT unref()'d: this timer is what keeps the event loop alive while waiting.
+    new Promise<boolean>((resolve) => { setTimeout(() => resolve(false), 25_000); }),
   ]);
   console.log(`OBSERVATION: GUARD INTACT: the reaped command root's spawn promise settled=${sleepSettled}`);
 }
