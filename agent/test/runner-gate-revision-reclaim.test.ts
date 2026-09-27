@@ -85,14 +85,14 @@ function sdkQuery(): SdkQueryFn {
     })();
 }
 
-function sdkRunner(): ReturnType<typeof runnerWith> {
+function sdkRunner(approvalMs = 4_000): ReturnType<typeof runnerWith> {
   const { gitlab } = fakeGitlab();
   return runnerWith(
     () => ({ executor: new SdkExecutor(nullLogger(), homeDir, { queryFn: sdkQuery() }), homeDir }),
     gitlab,
     undefined,
     nullLogger(),
-    { planApprovalTimeoutMs: 4_000, recoveryRetryMs: 1 },
+    { planApprovalTimeoutMs: approvalMs, recoveryRetryMs: 1 },
   );
 }
 
@@ -193,6 +193,57 @@ describe("gate presentation id choice on a reclaim (PRD #1795 decision 7)", () =
     assert.equal(g!.adopt_gate_revision, undefined);
     assert.equal(api.gateOf(runId).revision, 3, "a new gate");
     assert.deepStrictEqual(exec.verdicts.map((v) => v.kind), ["approve"]);
+  });
+});
+
+describe("a resumed revise never keeps the persisted identity (PRD #1795 decision 7)", () => {
+  it("a revised plan whose text EQUALS the persisted plan still mints a fresh id and a new revision", async () => {
+    newApi();
+    const runId = freshClaim().run_id;
+    seed(runId, 2, ID_X);
+    const [revise] = send(runId, row("revise_plan", "keep it as it is", { gate_binding: "bound", gate_revision: 2 }));
+    approveWhenShown(runId);
+    // The revision turn resubmits the persisted text verbatim: only the run being gated (the taken
+    // revise) tells this gate apart from a same-gate re-presentation.
+    const exec = new GateExecutor([PLAN, PLAN], { resumesAtGate: true });
+    await execute(exec, resumeClaim(runId, 2));
+    const [g] = gates(runId);
+    assert.equal(g!.plan_md, PLAN, "the revised plan is the persisted text");
+    assert.match(g!.presentation_id ?? "", UUID_RE);
+    assert.notEqual(g!.presentation_id, ID_X, "a resumed-revise gate mints a fresh id even for identical text");
+    assert.equal(g!.adopt_gate_revision, undefined);
+    assert.deepStrictEqual(api.gateOf(runId), { revision: 3, presentationId: g!.presentation_id! }, "a new gate");
+    assert.ok(api.isApplied(runId, revise!.id), "the revise was settled by the revised gate");
+    assert.deepStrictEqual(exec.verdicts.map((v) => v.kind), ["revise", "approve"]);
+  });
+});
+
+describe("a declined re-presentation confirms nothing (PRD #1795 decision 6)", () => {
+  it("an SDK same-gate reclaim seeded with revision N whose re-presentation is declined never takes a pending approve bound to N", async () => {
+    newApi();
+    const runId = freshClaim().run_id;
+    seed(runId, 3, ID_X);
+    const [pending] = send(runId, row("approve_plan", null, { gate_binding: "bound", gate_revision: 3 }));
+    // A plain decline (409 applied:false, no refusal reason): the report published nothing.
+    let declined: StateRequest | undefined;
+    api.failStateWhen(
+      runId,
+      (b) => {
+        if (b.status !== "awaiting_approval") return false;
+        declined = b;
+        return true;
+      },
+      { runStatus: "awaiting_approval" },
+    );
+    const claim = resumeClaim(runId, 2);
+    assert.equal(claim.resume_gate_revision, 3, "the claim seeds the confirmed revision");
+    await sdkRunner(1_500).execute(claim);
+    assert.equal(declined?.presentation_id, ID_X, "the same-gate re-presentation (reuse path) was the report declined");
+    assert.deepStrictEqual(api.gateRefusals, [], "a decline, not a refusal");
+    assert.equal(gates(runId).length, 0, "nothing was published");
+    assert.ok(api.isDiscarded(runId, pending!.id), "the approve bound to the seeded revision was never taken (disposed of when the gate closed)");
+    assert.ok(!api.humanPlanApproved(runId));
+    assert.ok(!statuses(runId).includes("completed"), "the plan was never approved (the gate timed out)");
   });
 });
 

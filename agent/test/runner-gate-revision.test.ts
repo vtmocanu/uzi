@@ -5,7 +5,10 @@
 // runner-gate-revision-reclaim.test.ts.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { api, fakeGitlab, installHarness, runner } from "./runner-harness.js";
+import { PlanRejectedError, type Executor, type RunContext } from "../src/executor.js";
+import { CI_CONFIG_MARKER } from "../src/prompt.js";
+import { CredentialSwitchSignal, type PlanVerdict } from "../src/steering.js";
+import { api, fakeGitlab, git, installHarness, runner } from "./runner-harness.js";
 import {
   GateExecutor,
   UUID_RE,
@@ -261,5 +264,174 @@ describe("the presentation fields ride the report only when the api advertised t
     await start(exec, claim);
     assert.deepStrictEqual(exec.verdicts.map((v) => v.kind), ["revise", "approve"]);
     assert.ok(api.inputRows(runId).every((r) => r.gate_binding === undefined && r.gate_revision === undefined));
+  });
+});
+
+describe("only this gate's own applied awaiting_approval ACK confirms a revision (PRD #1795 decision 6)", () => {
+  for (const c of [
+    { name: "a 409 (not applied) that still carries gate_revision", httpStatus: 409, runStatus: "awaiting_approval" },
+    { name: "an applied ACK whose run is not awaiting_approval", httpStatus: 200, runStatus: "running" },
+  ]) {
+    it(`${c.name} confirms nothing: an approve bound to that revision is not taken`, async () => {
+      newApi();
+      const claim = freshClaim();
+      const runId = claim.run_id;
+      let bound: number | undefined;
+      api.answerStateOnce(
+        runId,
+        (b) => {
+          if (b.status !== "awaiting_approval") return false;
+          // Created as the report arrives, bound to the revision the answer names.
+          bound = send(runId, row("approve_plan", null, { gate_binding: "bound", gate_revision: 1 }))[0]!.id;
+          return true;
+        },
+        { httpStatus: c.httpStatus, runStatus: c.runStatus, gateRevision: 1 },
+      );
+      const exec = new GateExecutor([PLAN_1]);
+      await start(exec, claim, 1_500);
+      assert.ok(bound !== undefined, "the gate report was answered");
+      assert.deepStrictEqual(exec.verdicts.map((v) => v.kind), ["reject"], "the gate timed out: nothing approved it");
+      assert.ok(api.isDiscarded(runId, bound!), "the bound approve was never taken (disposed of when the gate closed)");
+      assert.ok(!api.humanPlanApproved(runId));
+    });
+  }
+});
+
+/** Plans, then waits at the gate; a credential switch at the gate that GIVES UP re-runs the SAME gate
+ *  on the old token, exactly as the SDK executor's runThroughSwitch does. */
+class SwitchAtGateExecutor implements Executor {
+  readonly verdicts: PlanVerdict[] = [];
+  readonly outcomes: string[] = [];
+  constructor(private readonly plan: string) {}
+
+  async run(ctx: RunContext): Promise<{ branch: string; switchReleased?: boolean }> {
+    for (;;) {
+      let v: PlanVerdict;
+      try {
+        v = await ctx.gatePlan!(this.plan);
+      } catch (err) {
+        if (!(err instanceof CredentialSwitchSignal)) throw err;
+        const outcome = await ctx.attemptCredentialSwitch!();
+        this.outcomes.push(outcome);
+        if (outcome === "released") return { branch: ctx.branch, switchReleased: true };
+        if (outcome !== "gave_up") throw err;
+        continue;
+      }
+      this.verdicts.push(v);
+      if (v.kind === "approve") return { branch: ctx.branch };
+      if (v.kind === "reject") throw new PlanRejectedError(v.reason);
+      throw new Error("run cancelled");
+    }
+  }
+}
+
+describe("a gate re-run in the same claim starts unconfirmed (PRD #1795 decision 6)", () => {
+  it("a credential-switch give-up re-runs the gate; its declined report confirms nothing, so an approve bound to the first gate is not taken", async () => {
+    newApi();
+    const claim = freshClaim();
+    const runId = claim.run_id;
+    let bound: number | undefined;
+    api.onState(runId, (b) => {
+      if (b.status !== "awaiting_approval" || bound !== undefined) return;
+      // Gate 1 is shown (and confirmed by its ACK). The re-run's report will be declined; an approve
+      // bound to revision 1 is created exactly as it arrives.
+      api.failStateWhen(
+        runId,
+        (r) => {
+          if (r.status !== "awaiting_approval") return false;
+          bound = send(runId, row("approve_plan", null, { gate_binding: "bound", gate_revision: 1 }))[0]!.id;
+          return true;
+        },
+        { runStatus: "awaiting_approval" },
+      );
+      // A capture that never verifies (the dirty tree's WIP commit fails): the switch gives up.
+      git.worktreeStatus = (async () => ["M src/impl.ts"]) as typeof git.worktreeStatus;
+      git.commitWipMarker = (async () => false) as typeof git.commitWipMarker;
+      api.requestCredentialSwitch(runId, 1);
+    });
+    const exec = new SwitchAtGateExecutor(PLAN_1);
+    const { gitlab } = fakeGitlab();
+    await runner(exec, gitlab, undefined, { planApprovalTimeoutMs: 1_500, recoveryRetryMs: 1 }).execute(claim);
+    assert.deepStrictEqual(exec.outcomes, ["gave_up"], "the switch gave up and the gate re-ran");
+    assert.ok(statuses(runId).includes("credential_switch_failed"));
+    assert.ok(bound !== undefined, "the re-run gate's report was declined");
+    assert.equal(api.gateOf(runId).revision, 1, "the declined report allocated nothing");
+    assert.deepStrictEqual(exec.verdicts.map((v) => v.kind), ["reject"], "the re-run gate timed out: nothing approved it");
+    assert.ok(api.isDiscarded(runId, bound!), "the approve bound to the first gate was never taken (disposed of when the gate closed)");
+    assert.ok(!api.humanPlanApproved(runId));
+  });
+});
+
+describe("bound/unbound handling follows whether the gate waits on a human (PRD #1795 decision 9)", () => {
+  const CI_PLAN = `${CI_CONFIG_MARKER}\nEdit .gitlab-ci.yml to add the missing job`;
+
+  it("a human-gated claim disposes of an unbound approve on arrival, before any gate is entered", async () => {
+    newApi();
+    const claim = freshClaim();
+    const runId = claim.run_id;
+    let release!: () => void;
+    const exec = new GateExecutor([PLAN_1], { beforeGate: new Promise<void>((r) => (release = r)) });
+    api.onState(runId, (b) => {
+      if (b.status === "awaiting_approval") send(runId, row("approve_plan"));
+    });
+    const done = start(exec, claim, 1_500);
+    try {
+      const [early] = send(runId, row("approve_plan"));
+      assert.equal(early!.gate_binding, "unbound");
+      assert.ok(await until(() => api.isDiscarded(runId, early!.id), 2_000), "disposed of on arrival");
+      assert.equal(exec.gateEntered, false, "while the plan was still being written");
+    } finally {
+      // Released even on a failed assertion, so the held runner never outlives the test.
+      release();
+      await done;
+    }
+    assert.deepStrictEqual(exec.verdicts.map((v) => v.kind), ["approve"], "the approve of the shown gate was taken");
+  });
+
+  it("an auto-approve ci_fix claim whose CI-config plan forces a human gate disposes of an unbound approve at that gate", async () => {
+    newApi();
+    const claim = freshClaim(1, { kind: "ci_fix", auto_approve: true });
+    const runId = claim.run_id;
+    let release!: () => void;
+    const exec = new GateExecutor([CI_PLAN], { beforeGate: new Promise<void>((r) => (release = r)) });
+    const done = start(exec, claim, 1_500);
+    let early: ReturnType<typeof send>[number] | undefined;
+    try {
+      [early] = send(runId, row("approve_plan"));
+      assert.equal(early!.gate_binding, "unbound");
+      await routed(runId, early!.id);
+      assert.ok(!api.isDiscarded(runId, early!.id), "an auto-approve claim reads it as legacy until a gate waits on a human");
+    } finally {
+      release();
+      await done;
+    }
+    assert.equal(gates(runId).length, 1, "the CI-config plan parked for a human");
+    assert.ok(api.isDiscarded(runId, early!.id), "the unbound approve was disposed of at the forced gate");
+    assert.ok(feed(runId).includes(UNBOUND_APPROVE_NOTICE));
+    assert.deepStrictEqual(exec.verdicts.map((v) => v.kind), ["reject"], "the gate timed out: the unbound approve never approved it");
+    assert.ok(!api.humanPlanApproved(runId));
+  });
+
+  it("an autopilot claim never disposes of an unbound approve: its gate does not wait on a verdict", async () => {
+    newApi();
+    const claim = freshClaim(1, { auto_approve: true });
+    const runId = claim.run_id;
+    let release!: () => void;
+    const exec = new GateExecutor([PLAN_1], { beforeGate: new Promise<void>((r) => (release = r)) });
+    const done = start(exec, claim, 1_500);
+    let early: ReturnType<typeof send>[number] | undefined;
+    try {
+      [early] = send(runId, row("approve_plan"));
+      assert.equal(early!.gate_binding, "unbound");
+      await routed(runId, early!.id);
+    } finally {
+      release();
+      await done;
+    }
+    assert.deepStrictEqual(exec.verdicts.map((v) => v.kind), ["approve"], "auto-approved");
+    assert.equal(gates(runId).length, 0, "no human gate");
+    assert.ok(!api.isDiscarded(runId, early!.id), "the unbound approve was not disposed of");
+    assert.ok(!feed(runId).includes(UNBOUND_APPROVE_NOTICE));
+    assert.ok(statuses(runId).includes("completed"));
   });
 });

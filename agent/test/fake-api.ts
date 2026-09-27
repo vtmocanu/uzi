@@ -236,6 +236,11 @@ export class FakeApi {
   /** Every refused awaiting_approval report, in order. */
   readonly gateRefusals: Array<{ runId: string; reason: string; generation: number | undefined }> = [];
   private readonly gateByRun = new Map<string, FakeGate>();
+  /** PRD #1795: one-shot unrecorded answers with a gate revision (see answerStateOnce). */
+  private readonly stateAnswerOnce = new Map<
+    string,
+    { matches: (body: StateRequest) => boolean; httpStatus: number; runStatus: string; gateRevision: number }
+  >();
   /** Reports matching a hook are persisted (recorded, revision allocated) and THEN held or dropped:
    *  "drop" destroys the connection after persistence (a lost ACK), a promise holds the ACK until it
    *  settles (the window between persistence and the response). One-shot. */
@@ -578,6 +583,19 @@ export class FakeApi {
    *  just-persisted gate). One-shot. The dropStatesWhen hook drops BEFORE anything is recorded. */
   afterPersistState(runId: string, matches: (body: StateRequest) => boolean, action: "drop" | Promise<void>): void {
     this.afterPersistHooks.set(runId, { matches, action });
+  }
+
+  /** PRD #1795: answer the next /state report for this run matching `matches` with `httpStatus`
+   *  and a `{run: {status: runStatus}, gate_revision}` body WITHOUT recording it or touching the
+   *  modelled gate: an ACK that carries a gate revision yet does not say the gate was published (a
+   *  409, or a 200 whose run is not awaiting_approval). One-shot; `matches` runs when the report
+   *  arrives, so a test can create rows at exactly that moment. */
+  answerStateOnce(
+    runId: string,
+    matches: (body: StateRequest) => boolean,
+    answer: { httpStatus: number; runStatus: string; gateRevision: number },
+  ): void {
+    this.stateAnswerOnce.set(runId, { matches, ...answer });
   }
 
   /** PRD #1795: seed the run's gate as an api would hold it before this worker's claim (a gate an
@@ -1301,6 +1319,11 @@ export class FakeApi {
         error: "run already terminal",
         run: { id: runId, status: "cancelled" },
       });
+    }
+    const answer = this.stateAnswerOnce.get(runId);
+    if (answer && answer.matches(body)) {
+      this.stateAnswerOnce.delete(runId);
+      return send(res, answer.httpStatus, { gate_revision: answer.gateRevision, run: { id: runId, status: answer.runStatus } });
     }
     // m2 (#1197): a per-run predicate can knock out ONE matching report (see
     // failStateWhen). Checked BEFORE recording, so a refused report is not applied —

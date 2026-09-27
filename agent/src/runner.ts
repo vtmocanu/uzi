@@ -11005,11 +11005,6 @@ const FOLLOWUP_TERMINAL_STATUSES: ReadonlySet<string> = new Set([
   "cancelled",
 ]);
 
-/** PRD #84 M4: the additive `StateRequest` fields for a plan-time toolchain detection.
- *  Each array field is included ONLY when non-empty — mirroring the `milestones?.length ?
- *  {milestones} : {}` conditional-spread discipline, so a run that detected nothing (or
- *  whose scan failed and passed `undefined`) reports byte-for-byte as before. `size_class`
- *  is included whenever a detection was computed (it is soft/display-only). */
 /** PRD #1795 (decision 3): the requirement fields of a same-gate re-presentation, from the claim's
  *  immutable presented snapshot, with toolchainReportFields' conditional shape (each array only when
  *  non-empty). An absent snapshot sends none: the api then keeps the gate's own presented values,
@@ -11023,6 +11018,11 @@ function presentedReportFields(presented: GatePresentedRequirements | undefined)
   return fields;
 }
 
+/** PRD #84 M4: the additive `StateRequest` fields for a plan-time toolchain detection.
+ *  Each array field is included ONLY when non-empty — mirroring the `milestones?.length ?
+ *  {milestones} : {}` conditional-spread discipline, so a run that detected nothing (or
+ *  whose scan failed and passed `undefined`) reports byte-for-byte as before. `size_class`
+ *  is included whenever a detection was computed (it is soft/display-only). */
 function toolchainReportFields(
   detection: ToolchainDetection | undefined,
 ): Partial<StateRequest> {

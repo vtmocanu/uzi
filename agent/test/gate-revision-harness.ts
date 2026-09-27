@@ -88,13 +88,18 @@ export class GateExecutor implements Executor {
 
   constructor(
     private readonly plans: string[],
-    opts: { resumesAtGate?: boolean; milestones?: Milestone[] } = {},
+    opts: { resumesAtGate?: boolean; milestones?: Milestone[]; beforeGate?: Promise<void> } = {},
   ) {
     this.resumesAtGate = opts.resumesAtGate;
     this.milestones = opts.milestones;
+    this.beforeGate = opts.beforeGate;
   }
 
   private readonly milestones: Milestone[] | undefined;
+  /** Held before the first ctx.gatePlan (the planning turn still running). */
+  private readonly beforeGate: Promise<void> | undefined;
+  /** Whether ctx.gatePlan has been entered. */
+  gateEntered = false;
 
   /** Hold the revision turn that produces plan round `n` (1-based) until `release` settles. */
   holdRevision(n: number, release: Promise<void>): void {
@@ -119,7 +124,9 @@ export class GateExecutor implements Executor {
       }
     }
     const milestones = this.milestones ?? (ctx.frozenMilestones ?? undefined);
+    await this.beforeGate;
     for (;;) {
+      this.gateEntered = true;
       const v = await ctx.gatePlan!(plan, milestones, undefined, settles);
       this.verdicts.push(v);
       if (v.kind === "revise") {

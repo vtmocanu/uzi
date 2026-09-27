@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -24,8 +23,9 @@ import (
 // fixtures/worker-state-request/ holds the exact bodies the worker sends in both cases, pinned
 // on the agent side by agent/test/runner-gate-revision-reclaim.test.ts (which captures the real
 // runner's report). This test feeds them through the REAL strict decoder:
-//   - the non-negotiated body decodes into preGateRevisionStateRequest, the StateRequest field
-//     set an api WITHOUT #1795 declares, so an older api accepts it;
+//   - the non-negotiated body decodes into stateRequestMinusGateRevision, the current
+//     StateRequest minus the #1795 fields (the field set an api WITHOUT #1795 declares, plus
+//     any field added since), so an older api accepts it;
 //   - the negotiated body fails that same decode on "presentation_id", proving the send gate is
 //     what keeps an older api working;
 //   - both decode into the current StateRequest.
@@ -33,10 +33,11 @@ import (
 // Run with -count=1 after a fixture-only edit (fixtures/ is outside this package's cache key).
 const workerStateFixtureDir = "../../../fixtures/worker-state-request"
 
-// preGateRevisionStateRequest mirrors workersvc.StateRequest as it stood before PRD #1795: every
-// field in order, with the same type and JSON tag, minus the two #1795 fields.
-// TestWorkerStateDecodeMirrorInLockstep keeps it that way when StateRequest grows.
-type preGateRevisionStateRequest struct {
+// stateRequestMinusGateRevision mirrors the CURRENT workersvc.StateRequest minus the two #1795
+// fields: every other field in order, with the same type and JSON tag. It tracks fields added
+// after #1795 by design (TestWorkerStateDecodeMirrorInLockstep fails until they are mirrored
+// here), so it is not a frozen snapshot of the pre-#1795 struct.
+type stateRequestMinusGateRevision struct {
 	State                string                     `json:"status"`
 	ClaimGeneration      *int64                     `json:"claim_generation"`
 	MessagesThroughSeq   *int64                     `json:"messages_through_seq"`
@@ -82,7 +83,7 @@ var gateRevisionStateFields = map[string]bool{"PresentationID": true, "AdoptGate
 
 func TestWorkerStateDecodeMirrorInLockstep(t *testing.T) {
 	cur := reflect.TypeOf(workersvc.StateRequest{})
-	mirror := reflect.TypeOf(preGateRevisionStateRequest{})
+	mirror := reflect.TypeOf(stateRequestMinusGateRevision{})
 	var want []reflect.StructField
 	seen := map[string]bool{}
 	for i := 0; i < cur.NumField(); i++ {
@@ -99,7 +100,7 @@ func TestWorkerStateDecodeMirrorInLockstep(t *testing.T) {
 		}
 	}
 	if mirror.NumField() != len(want) {
-		t.Fatalf("preGateRevisionStateRequest has %d fields, StateRequest minus the #1795 fields has %d: keep them in lockstep", mirror.NumField(), len(want))
+		t.Fatalf("stateRequestMinusGateRevision has %d fields, StateRequest minus the #1795 fields has %d: keep them in lockstep", mirror.NumField(), len(want))
 	}
 	for i, f := range want {
 		m := mirror.Field(i)
@@ -113,7 +114,13 @@ func TestWorkerStateDecodeMirrorInLockstep(t *testing.T) {
 // /state handler does, from a real *http.Request.
 func decodeStateFixture(t *testing.T, name string, dst any) error {
 	t.Helper()
-	body, err := os.ReadFile(filepath.Join(workerStateFixtureDir, name))
+	// os.Root confines the read to the fixture directory: a name cannot climb out of it.
+	root, err := os.OpenRoot(workerStateFixtureDir)
+	if err != nil {
+		t.Fatalf("open fixture dir %s: %v", workerStateFixtureDir, err)
+	}
+	defer func() { _ = root.Close() }()
+	body, err := root.ReadFile(name)
 	if err != nil {
 		t.Fatalf("read fixture %s: %v", name, err)
 	}
@@ -123,7 +130,7 @@ func decodeStateFixture(t *testing.T, name string, dst any) error {
 }
 
 func TestWorkerStateDecodeWithoutGateRevisionFeature(t *testing.T) {
-	var old preGateRevisionStateRequest
+	var old stateRequestMinusGateRevision
 	if err := decodeStateFixture(t, "awaiting_approval.json", &old); err != nil {
 		t.Fatalf("an api without #1795 must accept the non-negotiated awaiting_approval report: %v", err)
 	}
@@ -140,7 +147,7 @@ func TestWorkerStateDecodeWithoutGateRevisionFeature(t *testing.T) {
 }
 
 func TestWorkerStateDecodeWithGateRevisionFeature(t *testing.T) {
-	var old preGateRevisionStateRequest
+	var old stateRequestMinusGateRevision
 	err := decodeStateFixture(t, "awaiting_approval.gate_revision_v1.json", &old)
 	if err == nil || !strings.Contains(err.Error(), `unknown field "presentation_id"`) {
 		t.Fatalf("an api without #1795 must reject the negotiated report on presentation_id, got %v", err)
