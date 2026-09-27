@@ -6,7 +6,7 @@ import { constants as fsConstants, createReadStream } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import type { Readable } from "node:stream";
+import { PassThrough, type Readable } from "node:stream";
 import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
 import { RUNNER_UID, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
@@ -24,6 +24,58 @@ import {
 } from "./secret-scan-guard.js";
 
 const execFileAsync = promisify(execFile);
+
+/** A child's stdout re-exposed so its end waits for the exit status. Node ends a child's
+ *  stdout BEFORE `close`, so a consumer of the raw stream reads a clean (possibly empty)
+ *  EOF from a failed child and a later destroy(err) is a no-op (issue #1739 follow-up: an
+ *  empty checkpoint pack uploaded as if valid). `exited()` ends the returned stream only
+ *  once the source has ended AND the exit was clean; `exited(err)` errors it instead.
+ *  A consumer that abandons the returned stream first (destroys it, or aborts its upload)
+ *  tears the source down and calls `onAbandon`, so the producer is not left blocked
+ *  writing into a pipe nobody reads. */
+function exitGatedStream(
+  source: Readable,
+  onAbandon?: () => void,
+): { out: Readable; exited: (err?: Error) => void } {
+  const out = new PassThrough();
+  // A caller may drop the stream unread (tests do; a skipped publish could): an exit error
+  // with no listener would be an uncaught exception that kills the worker. Consumers that
+  // attach their own listener, or iterate it, still receive the error.
+  out.on("error", () => undefined);
+  let sourceEnded = false;
+  let finished = false;
+  let exit: { err?: Error } | undefined;
+  const settle = (): void => {
+    if (!exit || out.destroyed || finished) return;
+    if (exit.err) {
+      finished = true;
+      out.destroy(exit.err);
+    } else if (sourceEnded) {
+      finished = true;
+      out.end();
+    }
+  };
+  out.on("close", () => {
+    if (finished) return;
+    // Abandoned by the consumer before the child settled.
+    source.unpipe(out);
+    source.destroy();
+    onAbandon?.();
+  });
+  source.on("error", (err) => out.destroy(err));
+  source.on("end", () => {
+    sourceEnded = true;
+    settle();
+  });
+  source.pipe(out, { end: false });
+  return {
+    out,
+    exited: (err) => {
+      exit ??= { err };
+      settle();
+    },
+  };
+}
 
 export class ScratchPublicationError extends Error {
   readonly code = "scratch_publication_refused";
@@ -4654,9 +4706,10 @@ export class GitCache {
    * there is no runner-uid switch and no PAT. Writes the optional `stdin` and ends it, then
    * returns the child and its stdout so the caller can pipe/drain it.
    *
-   * On a nonzero exit (or a spawn error) the stdout stream is DESTROYED with an Error, so a
-   * consumer streaming it (the publish upload) sees the failure and the caller's best-effort
-   * `.catch` fires rather than a truncated pack landing silently.
+   * The returned stream ends only after the child exits cleanly; on a nonzero exit (or a
+   * spawn error) it errors instead, so a consumer streaming it (the publish upload) sees the
+   * failure and the caller's best-effort `.catch` fires rather than a truncated or empty pack
+   * landing silently (exitGatedStream: the raw stdout ends before `close`).
    */
   private async spawnGit(
     cwd: string,
@@ -4678,35 +4731,37 @@ export class GitCache {
         stderrChunks.push(kept);
         stderrBytes += kept.length;
       });
+      const gated = exitGatedStream(process.stdout);
       process.completed.then(({ code }) => {
         if (code !== 0) {
           const detail = Buffer.concat(stderrChunks).subarray(0, GIT_MAX_BUFFER).toString().trim();
-          process.stdout?.destroy(new Error(`git ${args.join(" ")} exited ${code}${detail ? `: ${detail}` : ""}`));
-        }
-      }, (error: unknown) => process.stdout?.destroy(error instanceof Error ? error : new Error(String(error))));
+          gated.exited(new Error(`git ${args.join(" ")} exited ${code}${detail ? `: ${detail}` : ""}`));
+        } else gated.exited();
+      }, (error: unknown) => gated.exited(error instanceof Error ? error : new Error(String(error))));
       // A child that exits before reading its stdin (e.g. its repo vanished) must not surface an
-      // uncaught EPIPE; the exit status already destroys stdout with the failure.
+      // uncaught EPIPE; the exit status already errors the stream with the failure.
       process.stdin?.on("error", () => undefined);
       process.stdin?.end(stdin ?? "");
-      return { stdout: process.stdout };
+      return { stdout: gated.out };
     }
     const child = spawn("git", withDir(cwd, args), { env });
+    const gated = exitGatedStream(child.stdout as Readable, () => {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+    });
     const stderrChunks: Buffer[] = [];
     child.stderr?.on("data", (c: Buffer) => stderrChunks.push(c));
-    child.on("error", (err) => child.stdout?.destroy(err));
+    child.on("error", (err) => gated.exited(err));
     child.on("close", (code) => {
       if (code !== 0) {
         const detail = Buffer.concat(stderrChunks).toString().trim();
-        child.stdout?.destroy(
-          new Error(`git ${args.join(" ")} exited ${code ?? "signal"}${detail ? `: ${detail}` : ""}`),
-        );
-      }
+        gated.exited(new Error(`git ${args.join(" ")} exited ${code ?? "signal"}${detail ? `: ${detail}` : ""}`));
+      } else gated.exited();
     });
     if (child.stdin) {
       child.stdin.on("error", () => undefined); // see the scoped branch above
       child.stdin.end(stdin ?? "");
     }
-    return { child, stdout: child.stdout as Readable };
+    return { child, stdout: gated.out };
   }
 
   /**
