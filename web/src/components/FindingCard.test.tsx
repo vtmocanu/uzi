@@ -108,6 +108,14 @@ describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
     expect(rendered).not.toMatch(/[\p{Cc}\p{Cf}]/u);
     // The markup never became an element.
     expect(rendered).toContain("Leaked");
+    // textContent cannot see attributes: assert the group's accessible name itself carries the
+    // visible (stripped) title and no control/format character (.claude/rules/web.md).
+    const group = container.querySelector('[role="group"]');
+    const label = group?.getAttribute("aria-label") ?? "";
+    const visibleTitle = screen.getByText(/^Leaked/).textContent ?? "";
+    expect(visibleTitle).toContain("ticker");
+    expect(label).toContain(visibleTitle);
+    expect(label).not.toMatch(/[\p{Cc}\p{Cf}]/u);
   });
 
   it("File issue opens the shared draft; Create posts the edits to fileFinding and shows the Filed #N chip", async () => {

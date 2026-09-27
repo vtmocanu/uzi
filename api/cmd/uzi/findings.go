@@ -199,9 +199,10 @@ func renderFindingsBacklog(p *uzicli.Printer, b apitypes.IncidentalFindingBacklo
 		rows := byRepo[repoID]
 		p.Printf("%s (%s):\n", sanitizeTTY(rows[0].RepoPath), repoID)
 		for _, f := range rows {
-			// A nil finding_id is a display-only, non-actionable coordinate whose evidence rows
-			// were cascaded away with a deleted run (D12) — show a dash so a user does not copy
-			// nothing into file/dismiss.
+			// A nil finding_id is a coordinate whose evidence rows were cascaded away with a
+			// deleted run (D12). The CLI's evidence-id verbs (file/dismiss/resolve) cannot act on
+			// it; the web marks it done by disposition id. Show a dash so a user does not copy
+			// nothing into file/dismiss/resolve.
 			id := "-"
 			if f.FindingID != nil {
 				id = *f.FindingID
