@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/recovery"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
@@ -44,6 +45,19 @@ type memForge struct {
 	creates      map[string]int // refs actually created
 	deletes      map[string]int // refs actually deleted
 	lastCreate   pushbroker.CreateRefOptions
+
+	// M4 seams (set before any concurrent use): deleteErr/listErr fail every delete/list;
+	// beforeCreate/beforeDelete/beforeList run OUTSIDE the mutex at the start of the call (the
+	// fence has already passed), so a test can hold an attempt inside its forge write.
+	deleteErr    error
+	listErr      error
+	beforeCreate func(ref string)
+	// beforeLand runs, with the mutex released, AFTER a create passed every check and BEFORE the
+	// ref is written: the create is in flight and lands whatever happens meanwhile (a push the
+	// remote already accepted).
+	beforeLand   func(ref string)
+	beforeDelete func(ref string)
+	beforeList   func()
 }
 
 func newMemForge() *memForge {
@@ -63,6 +77,9 @@ func (m *memForge) publish(_ context.Context, o pushbroker.Options) (pushbroker.
 }
 
 func (m *memForge) createRef(_ context.Context, o pushbroker.CreateRefOptions) error {
+	if m.beforeCreate != nil {
+		m.beforeCreate(o.Ref)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.createCalls++
@@ -79,17 +96,28 @@ func (m *memForge) createRef(_ context.Context, o pushbroker.CreateRefOptions) e
 	if m.refs[o.SourceRef] != o.Tip {
 		return pushbroker.ErrSourceMissing
 	}
+	if m.beforeLand != nil {
+		m.mu.Unlock()
+		m.beforeLand(o.Ref)
+		m.mu.Lock()
+	}
 	m.refs[o.Ref] = o.Tip
 	m.creates[o.Ref]++
 	return nil
 }
 
 func (m *memForge) deleteRef(_ context.Context, o pushbroker.DeleteOptions) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	ref := o.Ref
 	if ref == "" {
 		ref = checkpointRefPrefix + o.Branch
+	}
+	if m.beforeDelete != nil {
+		m.beforeDelete(ref)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.deleteErr != nil {
+		return m.deleteErr
 	}
 	if o.ExpectedOldTip == "" {
 		return errors.New("memForge: an unconditional delete is never expected from retention")
@@ -102,8 +130,14 @@ func (m *memForge) deleteRef(_ context.Context, o pushbroker.DeleteOptions) erro
 }
 
 func (m *memForge) listRefTips(_ context.Context, _ pushbroker.ListRefsOptions, refs ...string) (map[string]string, error) {
+	if m.beforeList != nil {
+		m.beforeList()
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
 	out := map[string]string{}
 	for _, r := range refs {
 		if tip, ok := m.refs[r]; ok {
@@ -471,11 +505,11 @@ func (f *supersedeFix) crashAt(t *testing.T, op string) {
 	}
 }
 
-// reconcileUntilSuperseded drives ReconcileCheckpointRetentions on svc2 and asserts the record
+// reconcile drives the sweeper pass (confined to the old run) on svc2 and asserts the record
 // reaches superseded with the tip reachable at the recovery ref.
 func (f *supersedeFix) reconcile(t *testing.T) {
 	t.Helper()
-	if _, err := f.svc2.ReconcileCheckpointRetentions(f.e.ctx); err != nil {
+	if _, err := f.svc2.reconcileCheckpointRetentions(f.e.ctx, pgconv.UUID(f.oldRun)); err != nil {
 		t.Fatalf("ReconcileCheckpointRetentions: %v", err)
 	}
 	f.assertSuperseded(t)
@@ -528,7 +562,7 @@ func TestSupersessionCrashAfterBranchDeleteLiveDB(t *testing.T) {
 	f.forge.mu.Lock()
 	delete(f.forge.refs, f.branchRef)
 	f.forge.mu.Unlock()
-	if _, err := f.svc2.ReconcileCheckpointRetentions(f.e.ctx); err != nil {
+	if _, err := f.svc2.reconcileCheckpointRetentions(f.e.ctx, pgconv.UUID(f.oldRun)); err != nil {
 		t.Fatalf("ReconcileCheckpointRetentions: %v", err)
 	}
 	f.assertSuperseded(t)
@@ -542,7 +576,7 @@ func TestSupersessionTipGoneClosesRecordLiveDB(t *testing.T) {
 	delete(f.forge.refs, f.branchRef)
 	f.forge.mu.Unlock()
 	f.e.exec(t, `UPDATE checkpoint_retentions SET state = 'superseding', recovery_ref = $2 WHERE run_id = $1`, f.oldRun, f.recoveryRef)
-	if _, err := f.svc2.ReconcileCheckpointRetentions(f.e.ctx); err != nil {
+	if _, err := f.svc2.reconcileCheckpointRetentions(f.e.ctx, pgconv.UUID(f.oldRun)); err != nil {
 		t.Fatalf("ReconcileCheckpointRetentions: %v", err)
 	}
 	if r := f.row(t); r.State != "deleted" || !r.LastError.Valid {
@@ -616,7 +650,7 @@ func TestSupersessionPausedCreateLockLostLiveDB(t *testing.T) {
 
 	f.rf.terminateHolder(t, f.oldRun)
 	f.discardHold(t)
-	if _, err := f.svc2.ReconcileCheckpointRetentions(f.e.ctx); err != nil {
+	if _, err := f.svc2.reconcileCheckpointRetentions(f.e.ctx, pgconv.UUID(f.oldRun)); err != nil {
 		t.Fatalf("instance 2 ReconcileCheckpointRetentions: %v", err)
 	}
 	if r := f.row(t); r.State != "deleted" {
@@ -679,7 +713,7 @@ func TestSupersessionConcurrentAttemptsLiveDB(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				<-barrier
-				if _, err := f.svc1.ReconcileCheckpointRetentions(f.e.ctx); err != nil {
+				if _, err := f.svc1.reconcileCheckpointRetentions(f.e.ctx, pgconv.UUID(f.oldRun)); err != nil {
 					t.Errorf("ReconcileCheckpointRetentions: %v", err)
 				}
 			}()

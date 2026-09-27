@@ -144,14 +144,37 @@ RETURNING checkpoint_retentions.state;
 -- D2 (M3): superseding -> deleted when origin holds the recorded tip under NEITHER the branch
 -- ref nor the recovery ref (checked by listing both after CreateRef reported the source
 -- missing). Nothing uzi owns references the tip any more, so there is nothing to preserve or
--- delete; the note is kept in last_error for audit.
+-- delete; the note is kept in last_error for audit. A superseding record names its recovery
+-- ref, so the post-settlement audit (M4) re-verifies it after 10 minutes: a create whose
+-- session was lost after its fence may still land after this list.
 UPDATE checkpoint_retentions
 SET state = 'deleted',
     last_error = @last_error::text,
     settled_at = now(),
-    updated_at = now()
+    updated_at = now(),
+    verify_after = CASE WHEN recovery_ref IS NOT NULL THEN now() + interval '10 minutes' END
 WHERE run_id = @run_id
   AND state = 'superseding';
+
+-- name: SetCheckpointSupersessionExited :execrows
+-- M4 (stuck superseding exit): superseding -> deleted for a record whose supersession stopped
+-- (tip lag, or the recovery ref at another tip) once the run has NO open custody hold, after
+-- the caller CAS-deleted whichever of its refs origin still held at the recorded tip. The
+-- recovery ref is re-verified by the audit after 10 minutes, like any deleted recovery ref.
+-- Guarded on the state and on the open-hold predicate, so a racing writer or a hold that
+-- appeared moves zero rows.
+UPDATE checkpoint_retentions
+SET state = 'deleted',
+    last_error = @last_error::text,
+    settled_at = now(),
+    updated_at = now(),
+    verify_after = CASE WHEN recovery_ref IS NOT NULL THEN now() + interval '10 minutes' END
+WHERE checkpoint_retentions.run_id = @run_id
+  AND checkpoint_retentions.state = 'superseding'
+  AND NOT EXISTS (
+      SELECT 1 FROM recovery_custody_holds h
+      WHERE h.run_id = checkpoint_retentions.run_id AND h.state = 'open'
+  );
 
 -- name: AdvanceCheckpointRetentionTip :execrows
 -- Tip lag (M3): a successful publish by a run that already has a record (the checkpoint_tip
@@ -182,11 +205,89 @@ LIMIT 10;
 
 -- name: ListCheckpointRetentionWork :many
 -- The reconciliation sweeper's candidates in the given states, oldest-due first, bounded.
--- The caller names the states its arms handle (M3: superseding; M4 adds the rest), so rows no
--- arm acts on never crowd the bounded page.
+-- The caller names the states its arms handle (superseding, settling), so rows no arm acts on
+-- never crowd the bounded page. only_run_id NULL lists every run (production); a run id
+-- confines the page to that run (the LiveDB tests' isolation from a reused database).
 SELECT * FROM checkpoint_retentions
 WHERE state = ANY(@states::text[])
   AND state IN ('superseding', 'settling', 'retained', 'superseded')
   AND next_attempt_at <= now()
+  AND (sqlc.narg(only_run_id)::uuid IS NULL OR run_id = sqlc.narg(only_run_id)::uuid)
 ORDER BY next_attempt_at, run_id
 LIMIT @max_rows::int;
+
+-- name: ListUnheldCheckpointRetentions :many
+-- M4: retained/superseded records whose run has NO open custody hold: their settle trigger was
+-- lost (a crash between a hold's release and its trigger, a busy lock, a full retention slot)
+-- or a hold settled between the terminal-time insert and its settle. The open-hold predicate is
+-- in the query so the (normal, possibly many) records still held never crowd the bounded page.
+SELECT * FROM checkpoint_retentions
+WHERE checkpoint_retentions.state IN ('retained', 'superseded')
+  AND checkpoint_retentions.next_attempt_at <= now()
+  AND NOT EXISTS (
+      SELECT 1 FROM recovery_custody_holds h
+      WHERE h.run_id = checkpoint_retentions.run_id AND h.state = 'open'
+  )
+  AND (sqlc.narg(only_run_id)::uuid IS NULL OR checkpoint_retentions.run_id = sqlc.narg(only_run_id)::uuid)
+ORDER BY checkpoint_retentions.next_attempt_at, checkpoint_retentions.run_id
+LIMIT @max_rows::int;
+
+-- name: ListCheckpointRetentionBackfill :many
+-- M4 backfill: terminal runs that published a checkpoint and own a checkpoint branch (an issue
+-- run with an issue iid, or a self_improve run) but have NO record: a terminal writer that
+-- never calls the retention path (the sweeper's worker-loss and cap fails, the auto-stop, the
+-- claim-assembly and Codex account-wait fails), or a best-effort insert that failed. Bounded to
+-- runs whose current status began at or after retention was enabled
+-- (checkpoint_retention_meta.enabled_at), so it never reaches back to runs the old
+-- delete-on-terminal path already handled. The caller derives the branch in Go
+-- (checkpointBranch) and records the run through the terminal-time inserts.
+SELECT r.id, r.kind, r.issue_iid
+FROM runs r
+CROSS JOIN checkpoint_retention_meta m
+WHERE r.status IN ('completed', 'failed', 'cancelled')
+  AND r.checkpoint_tip IS NOT NULL
+  AND r.repo_id IS NOT NULL
+  AND ((r.kind = 'issue' AND r.issue_iid IS NOT NULL) OR r.kind = 'self_improve')
+  AND r.status_since >= m.enabled_at
+  AND NOT EXISTS (SELECT 1 FROM checkpoint_retentions c WHERE c.run_id = r.id)
+  AND (sqlc.narg(only_run_id)::uuid IS NULL OR r.id = sqlc.narg(only_run_id)::uuid)
+ORDER BY r.status_since, r.id
+LIMIT @max_rows::int;
+
+-- name: ListCheckpointRetentionAudit :many
+-- M4 post-settlement audit: deleted records that named a recovery ref, due for their one
+-- re-verification (verify_after passed) and not yet verified. Closes the residual window of a
+-- recovery-ref create whose session was lost after its fence but which landed after another
+-- instance settled the record.
+SELECT * FROM checkpoint_retentions
+WHERE state = 'deleted'
+  AND recovery_ref IS NOT NULL
+  AND verify_after <= now()
+  AND verified_at IS NULL
+  AND (sqlc.narg(only_run_id)::uuid IS NULL OR run_id = sqlc.narg(only_run_id)::uuid)
+ORDER BY verify_after, run_id
+LIMIT @max_rows::int;
+
+-- name: SetCheckpointRetentionVerified :execrows
+-- M4 audit: the deleted record's recovery ref is verified (absent, deleted now, or at another
+-- tip that is not ours to delete). A non-NULL note replaces last_error. Guarded so a record is
+-- verified once.
+UPDATE checkpoint_retentions
+SET verified_at = now(),
+    last_error = COALESCE(sqlc.narg(note)::text, last_error),
+    updated_at = now()
+WHERE run_id = @run_id
+  AND state = 'deleted'
+  AND verified_at IS NULL;
+
+-- name: DeferCheckpointRetentionVerify :execrows
+-- M4 audit: the verification could not complete (forge or connection failure); push it out to
+-- the caller-computed backoff and record the (already scrubbed) error. verified_at stays NULL.
+UPDATE checkpoint_retentions
+SET attempts = attempts + 1,
+    last_error = @last_error::text,
+    verify_after = @verify_after::timestamptz,
+    updated_at = now()
+WHERE run_id = @run_id
+  AND state = 'deleted'
+  AND verified_at IS NULL;

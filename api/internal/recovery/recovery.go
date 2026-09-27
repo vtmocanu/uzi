@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -120,6 +121,25 @@ type Service struct {
 	now      func() time.Time
 	uploads  chan struct{}
 	download chan struct{}
+	// custodySettled is called with a run id AFTER a transaction that released or discarded one
+	// of that run's custody holds committed (PRD #1810 D3): the wiring points it at
+	// workersvc.SettleRetainedCheckpoint, which deletes the run's retained checkpoint ref once
+	// its last hold is settled. Nil (the default, and every test that does not wire it) is a
+	// no-op; the sweeper's reconciliation pass is the backstop either way.
+	custodySettled func(runID uuid.UUID)
+}
+
+// SetCustodySettledHook wires the post-commit custody-settlement hook (PRD #1810 D3). Call once
+// at construction, before the service serves requests. A nil fn disables it.
+func (s *Service) SetCustodySettledHook(fn func(runID uuid.UUID)) { s.custodySettled = fn }
+
+// custodySettledAfterCommit fires the custody-settlement hook for runID, if one is wired. Callers
+// invoke it only after the releasing or discarding statement's transaction committed, and only
+// when that statement moved a row.
+func (s *Service) custodySettledAfterCommit(runID uuid.UUID) {
+	if s.custodySettled != nil {
+		s.custodySettled(runID)
+	}
 }
 
 // New builds a Service. box may be nil only in tests that never touch bytes; the upload

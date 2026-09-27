@@ -31,10 +31,6 @@ import (
 // the tip under at least one recorded ref; ReconcileCheckpointRetentions re-drives a
 // `superseding` record from step 2, and every step is idempotent.
 
-// reconcileRetentionBatch bounds one ReconcileCheckpointRetentions pass: each record may cost a
-// few forge round-trips, and the pass runs on the sweeper's tick.
-const reconcileRetentionBatch = 10
-
 // supersessionWired reports whether supersession can run: every retention seam plus the ref
 // create and list seams.
 func (s *Service) supersessionWired() bool {
@@ -47,8 +43,12 @@ func (s *Service) supersessionWired() bool {
 // freed the branch ref, so the caller retries its publish once. A busy lock (another instance
 // or the sweeper is working the record) or a full retention slot stops the search: the caller
 // returns today's not_descendant skip and the worker retries on its next tick.
+//
+// Only a LIVE run may trigger it: GetRunOwnedByWorker (Publish's ownership read) has no status
+// filter, so a worker still bound to a completed, failed or cancelled run could otherwise evict
+// a NEWER run's retained checkpoint to make room for a publish nobody will ever resume.
 func (s *Service) freeCheckpointSlot(ctx context.Context, run store.Run, branch string) bool {
-	if run.Kind != runkind.Issue || !run.RepoID.Valid || !s.supersessionWired() {
+	if run.Kind != runkind.Issue || !run.RepoID.Valid || terminalStatuses[run.Status] || !s.supersessionWired() {
 		return false
 	}
 	ref := checkpointRefPrefix + branch
@@ -97,7 +97,10 @@ func (s *Service) supersedeRetainedCheckpoint(ctx context.Context, runID uuid.UU
 	return freed && acquired, acquired, err
 }
 
-// supersedeLocked re-reads the record under the lock and acts only on the state it finds.
+// supersedeLocked re-reads the record under the lock and dispatches on the state it finds. That
+// switch is the first layer only: every transition it leads to is ALSO guarded in SQL on the
+// expected state (and, for the intent, on the tip), so a record another writer moved between this
+// read and a later write moves zero rows. Both layers exist; the SQL guards are the backstop.
 func (s *Service) supersedeLocked(ctx context.Context, runID uuid.UUID, fence func(context.Context) error) (bool, error) {
 	row, err := s.q.GetCheckpointRetention(ctx, runID)
 	if err != nil {
@@ -249,41 +252,4 @@ func (s *Service) resolveMissingSource(ctx context.Context, row store.Checkpoint
 	}
 	slog.Warn("checkpoint retention: "+note+"; record closed", "run", row.RunID, "branch", row.Branch, "tip", row.Tip)
 	return false, true, nil
-}
-
-// ReconcileCheckpointRetentions is the sweeper's checkpoint-retention pass (PRD #1810). It
-// re-drives records whose work was interrupted, each under its run's retention lock (try
-// semantics: a record whose lock is busy is skipped this tick). Best-effort like
-// ReconcileCustodyReleases: a candidate-list read error fails the pass, a per-record error is
-// logged and skipped. Returns the number of records driven to a final step this pass.
-//
-// M3 arm: `superseding` records (a crash or failure between the persisted intent and the
-// superseded mark) are re-driven through supersession. M4 adds its own arms (settling retries,
-// unheld retained/superseded records moved to settling, the backfill and the audit) as separate
-// cases here, each naming the states it lists.
-func (s *Service) ReconcileCheckpointRetentions(ctx context.Context) (int64, error) {
-	if !s.supersessionWired() {
-		return 0, nil
-	}
-	rows, err := s.q.ListCheckpointRetentionWork(ctx, store.ListCheckpointRetentionWorkParams{
-		States: []string{retentionSuperseding}, MaxRows: reconcileRetentionBatch,
-	})
-	if err != nil {
-		return 0, fmt.Errorf("list checkpoint retention work: %w", err)
-	}
-	var progressed int64
-	for _, r := range rows {
-		switch r.State {
-		case retentionSuperseding:
-			freed, acquired, err := s.supersedeRetainedCheckpoint(ctx, r.RunID)
-			if err != nil {
-				slog.Warn("sweeper: checkpoint supersession re-drive", "run", r.RunID, "error", secretscrub.Scrub(err.Error()))
-				continue
-			}
-			if acquired && freed {
-				progressed++
-			}
-		}
-	}
-	return progressed, nil
 }

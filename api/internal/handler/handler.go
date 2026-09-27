@@ -86,8 +86,9 @@ type Handler struct {
 	forgeBudgetOnce sync.Once
 	// recoverySvc is the durable-recovery archive service (PRD #1296 M2). Accessed only
 	// through recovery(), which lazily constructs it under recoveryOnce from h.q/h.pool/
-	// h.box + the cfg limits, so a struct-literal test Handler (which does not call New)
-	// is race-safe without every construction site wiring it. New sets it directly.
+	// h.box + the cfg limits (production and struct-literal test Handlers alike, so the
+	// latter are race-safe without every construction site wiring it). A test may pin its own
+	// service here before the first recovery() call.
 	recoverySvc  *recovery.Service
 	recoveryOnce sync.Once
 	// box is the generic secret cipher used by the per-user secret endpoints
@@ -469,11 +470,19 @@ func (h *Handler) budget() *forgeBudget {
 // recovery returns the durable-recovery archive service (PRD #1296 M2), lazily built from
 // h.q (the M1 recovery.sql store), h.pool (streaming + bounded upload transactions), h.box
 // (chunk encryption) and the cfg limits. Constructed under recoveryOnce so a struct-literal
-// test handler is race-safe; New sets recoverySvc directly for production. Mirrors budget().
+// test handler is race-safe; this accessor is the ONLY production construction site (New does
+// not set recoverySvc). Mirrors budget().
+//
+// PRD #1810 D3: when the worker service is wired, the service's custody-settlement hook is
+// workersvc.SettleRetainedCheckpoint, so a release or discard through this service triggers
+// the run's retained-checkpoint delete check after its transaction commits.
 func (h *Handler) recovery() *recovery.Service {
 	h.recoveryOnce.Do(func() {
 		if h.recoverySvc == nil {
 			h.recoverySvc = recovery.New(h.q, h.pool, h.box, h.recoveryLimits(), h.now)
+			if h.wsvc != nil {
+				h.recoverySvc.SetCustodySettledHook(h.wsvc.SettleRetainedCheckpoint)
+			}
 		}
 	})
 	return h.recoverySvc

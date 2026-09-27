@@ -337,8 +337,10 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		return res, fmt.Errorf("reconcile custody releases: %w", err)
 	}
 
-	// Checkpoint-retention reconciliation (PRD #1810): re-drive interrupted checkpoint-ref work
-	// (M3: `superseding` records) under each run's retention lock. The same best-effort stance
+	// Checkpoint-retention reconciliation (PRD #1810 M3/M4): backfill terminal runs with no
+	// record, retry failed deletes, settle unheld records whose trigger was lost, re-drive or exit
+	// interrupted supersessions, and audit deleted recovery refs, each record under its run's
+	// retention lock (ReconcileCheckpointRetentions). The same best-effort stance
 	// as the custody pass above: a candidate-list read error fails the pass, a per-record
 	// error is logged and skipped. Inert unless the retention seams are wired.
 	if res.CheckpointRetentionsReconciled, err = s.ReconcileCheckpointRetentions(ctx); err != nil {
@@ -709,6 +711,11 @@ func (s *Service) ReconcileCustodyReleases(ctx context.Context) (int64, error) {
 			continue
 		}
 		released += n
+		if n > 0 {
+			// PRD #1810 D3: the release committed; if it was the run's last open hold, its
+			// retained checkpoint ref is now owed its CAS delete.
+			s.SettleRetainedCheckpoint(h.RunID)
+		}
 	}
 	return released, nil
 }

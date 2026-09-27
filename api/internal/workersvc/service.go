@@ -570,6 +570,15 @@ type Store interface {
 	SetCheckpointSupersessionTipGone(ctx context.Context, arg store.SetCheckpointSupersessionTipGoneParams) (int64, error)
 	AdvanceCheckpointRetentionTip(ctx context.Context, arg store.AdvanceCheckpointRetentionTipParams) (int64, error)
 	ListCheckpointRetentionWork(ctx context.Context, arg store.ListCheckpointRetentionWorkParams) ([]store.CheckpointRetention, error)
+	// PRD #1810 M4 settlement reconciliation: the unheld retained/superseded page, the backfill of
+	// terminal runs with no record, the stuck-superseding exit, and the post-settlement audit.
+	ListUnheldCheckpointRetentions(ctx context.Context, arg store.ListUnheldCheckpointRetentionsParams) ([]store.CheckpointRetention, error)
+	ListCheckpointRetentionBackfill(ctx context.Context, arg store.ListCheckpointRetentionBackfillParams) ([]store.ListCheckpointRetentionBackfillRow, error)
+	RunHasOpenCustodyHold(ctx context.Context, runID uuid.UUID) (bool, error)
+	SetCheckpointSupersessionExited(ctx context.Context, arg store.SetCheckpointSupersessionExitedParams) (int64, error)
+	ListCheckpointRetentionAudit(ctx context.Context, arg store.ListCheckpointRetentionAuditParams) ([]store.CheckpointRetention, error)
+	SetCheckpointRetentionVerified(ctx context.Context, arg store.SetCheckpointRetentionVerifiedParams) (int64, error)
+	DeferCheckpointRetentionVerify(ctx context.Context, arg store.DeferCheckpointRetentionVerifyParams) (int64, error)
 	// Issue #1582 M1: the predecessor-settle pair. GetCustodyHoldForSettle reads the exact hold
 	// (scoped to its run); ReleasePredecessorCustodyHoldByAncestry is the single guarded
 	// statement that releases that one older-generation hold with 'ancestry' evidence after the
@@ -4254,6 +4263,10 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			}); relErr != nil {
 				slog.Warn("release custody on completion", "run", runID, "worker", wkr.ID, "generation", run.ClaimGeneration, "error", relErr)
 			}
+			// PRD #1810 D3: this release's settle trigger is retainOrDeleteCheckpoint below,
+			// which runs on every terminal transition AFTER the release: it records the run
+			// (retained while an older hold is still open, else settling) and hands any record
+			// owing work to SettleRetainedCheckpoint. A second trigger here would only race it.
 		}
 		// PRD #529 M4: an ephemeral worker exists only to serve its bound run, so a
 		// genuinely-applied terminal transition (rows>0) on that run — completed /
@@ -6490,8 +6503,10 @@ type SweepResult struct {
 	// stuck holds, a set that is empty on a healthy instance.
 	CustodyReleased int64
 	// CheckpointRetentionsReconciled is the number of checkpoint_retentions records this pass
-	// drove to completion (PRD #1810): M3 re-drives interrupted `superseding` records. Normally
-	// 0: a supersession finishes on the publish that triggered it.
+	// drove to a final step (PRD #1810 M3/M4): an interrupted `superseding` record re-driven or
+	// exited, a failed delete retried, an unheld record whose settle trigger was lost settled, a
+	// terminal run with no record backfilled, or a deleted recovery ref audited. Normally 0: the
+	// post-commit triggers settle a record on the path that released its last hold.
 	CheckpointRetentionsReconciled int64
 	// RecoveryStalled is the number of durable-archive captures this pass flipped from a
 	// non-terminal upload state (preparing/uploading) to needs_action because they sat past

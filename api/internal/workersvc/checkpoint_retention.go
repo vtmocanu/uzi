@@ -61,8 +61,9 @@ type ConnAcquirer interface {
 // claimHooks idiom). beforeForgeWrite runs under the lock, immediately BEFORE the fence that
 // guards a forge write, so a test can pause an attempt, steal the lock (terminate the backend)
 // or interleave a concurrent writer at the one point it matters. op names the write: "delete"
-// (a settling record's ref), "create" (supersession's recovery ref) or "delete-branch"
-// (supersession's branch ref). afterLock runs once the lock is held, with the pinned
+// (a settling record's ref), "create" (supersession's recovery ref), "delete-branch"
+// (supersession's branch ref), "exit-recovery"/"exit-branch" (a stuck supersession's exit, M4)
+// or "audit-delete" (the post-settlement audit's stray recovery ref, M4). afterLock runs once the lock is held, with the pinned
 // connection, so a test can release the lock WITHOUT ending the session.
 type retentionTestHooks struct {
 	beforeForgeWrite func(runID uuid.UUID, op string)
@@ -208,9 +209,22 @@ func destroyRetentionConn(conn *pgxpool.Conn) {
 // A run that never published (checkpoint_tip NULL) or has no repo gets no record and no forge
 // call: it owns no ref, and a delete could clobber a sibling's checkpoint on the same branch.
 func (s *Service) retainOrDeleteCheckpoint(ctx context.Context, runID uuid.UUID, kind string, issueIid pgtype.Int8) {
-	branch, ok := checkpointBranch(kind, runID, issueIid)
-	if !ok || !s.retentionWired() {
+	if !s.retentionWired() {
 		return
+	}
+	if _, settle := s.recordCheckpointRetention(ctx, runID, kind, issueIid); settle {
+		s.SettleRetainedCheckpoint(runID)
+	}
+}
+
+// recordCheckpointRetention is the record half of retainOrDeleteCheckpoint, shared with the
+// sweeper's backfill (PRD #1810 M4): it inserts the run's `retained` or `settling` record
+// (never resetting an existing one) and reports whether a record was inserted now and whether
+// the run's record owes a settle. It makes no forge call.
+func (s *Service) recordCheckpointRetention(ctx context.Context, runID uuid.UUID, kind string, issueIid pgtype.Int8) (inserted, settle bool) {
+	branch, ok := checkpointBranch(kind, runID, issueIid)
+	if !ok {
+		return false, false
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), retentionRecordTimeout)
 	defer cancel()
@@ -219,34 +233,34 @@ func (s *Service) retainOrDeleteCheckpoint(ctx context.Context, runID uuid.UUID,
 	held, err := s.q.InsertCheckpointRetentionIfHeld(ctx, store.InsertCheckpointRetentionIfHeldParams{RunID: runID, Branch: branch, Ref: ref})
 	if err != nil {
 		slog.Warn("checkpoint retention: record retained", "run", runID, "error", err)
-		return
+		return false, false
 	}
 	if held > 0 {
 		slog.Info("checkpoint retention: ref retained while custody is open", "run", runID, "branch", branch)
-		return
+		return true, false
 	}
 	settling, err := s.q.InsertCheckpointRetentionSettling(ctx, store.InsertCheckpointRetentionSettlingParams{RunID: runID, Branch: branch, Ref: ref})
 	if err != nil {
 		slog.Warn("checkpoint retention: record settling", "run", runID, "error", err)
-		return
+		return false, false
 	}
-	if settling == 0 {
-		row, err := s.q.GetCheckpointRetention(ctx, runID)
-		if err != nil {
-			if !errors.Is(err, pgx.ErrNoRows) {
-				slog.Warn("checkpoint retention: re-read", "run", runID, "error", err)
-			}
-			// No row: the run never published, has no repo, or a hold appeared between the
-			// two inserts. Either way there is nothing this path may delete.
-			return
-		}
-		switch row.State {
-		case retentionRetained, retentionSuperseded, retentionSettling:
-		default:
-			return
-		}
+	if settling > 0 {
+		return true, true
 	}
-	s.SettleRetainedCheckpoint(runID)
+	row, err := s.q.GetCheckpointRetention(ctx, runID)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Warn("checkpoint retention: re-read", "run", runID, "error", err)
+		}
+		// No row: the run never published, has no repo, or a hold appeared between the
+		// two inserts. Either way there is nothing this path may delete.
+		return false, false
+	}
+	switch row.State {
+	case retentionRetained, retentionSuperseded, retentionSettling:
+		return false, true
+	}
+	return false, false
 }
 
 // SettleRetainedCheckpoint dispatches, off the caller's goroutine, the settle of one run's
@@ -273,36 +287,7 @@ func (s *Service) SettleRetainedCheckpoint(runID uuid.UUID) {
 
 // settleRetainedCheckpoint is SettleRetainedCheckpoint's body, run inline.
 func (s *Service) settleRetainedCheckpoint(ctx context.Context, runID uuid.UUID) {
-	acquired, err := s.withRetentionLock(ctx, runID, func(ctx context.Context, fence func(context.Context) error) error {
-		row, err := s.q.GetCheckpointRetention(ctx, runID)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return nil
-			}
-			return fmt.Errorf("read record: %w", err)
-		}
-		switch row.State {
-		case retentionRetained, retentionSuperseded:
-			n, err := s.q.SetCheckpointRetentionSettlingIfUnheld(ctx, runID)
-			if err != nil {
-				return fmt.Errorf("mark settling: %w", err)
-			}
-			if n == 0 {
-				return nil // a hold is still open (or the record moved on): keep the ref
-			}
-			if row, err = s.q.GetCheckpointRetention(ctx, runID); err != nil {
-				return fmt.Errorf("re-read record: %w", err)
-			}
-			if row.State != retentionSettling {
-				return nil
-			}
-		case retentionSettling:
-		default:
-			return nil
-		}
-		_, err = s.deleteSettlingRef(ctx, row, fence)
-		return err
-	})
+	_, acquired, err := s.settleRetainedCheckpointOnce(ctx, runID)
 	if err != nil {
 		slog.Warn("checkpoint retention: settle", "run", runID, "error", secretscrub.Scrub(err.Error()))
 		return
@@ -310,6 +295,46 @@ func (s *Service) settleRetainedCheckpoint(ctx context.Context, runID uuid.UUID)
 	if !acquired {
 		slog.Debug("checkpoint retention: lock busy; ref left for a later settle", "run", runID)
 	}
+}
+
+// settleRetainedCheckpointOnce runs one settle attempt for runID under its retention lock
+// (settleLocked). done reports the forge delete succeeded; acquired is false when the lock or a
+// concurrency slot was busy (nothing ran). A panic from the go-git seams is recovered into err.
+func (s *Service) settleRetainedCheckpointOnce(ctx context.Context, runID uuid.UUID) (done, acquired bool, err error) {
+	return s.lockedRetentionStep(ctx, runID, s.settleLocked)
+}
+
+// settleLocked is one settle under the run's retention lock: a retained/superseded record with no
+// open hold moves to settling (guarded in SQL on the open-hold predicate), and a settling
+// record's ref is CAS-deleted. Any other state is left alone.
+func (s *Service) settleLocked(ctx context.Context, runID uuid.UUID, fence func(context.Context) error) (bool, error) {
+	row, err := s.q.GetCheckpointRetention(ctx, runID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read record: %w", err)
+	}
+	switch row.State {
+	case retentionRetained, retentionSuperseded:
+		n, err := s.q.SetCheckpointRetentionSettlingIfUnheld(ctx, runID)
+		if err != nil {
+			return false, fmt.Errorf("mark settling: %w", err)
+		}
+		if n == 0 {
+			return false, nil // a hold is still open (or the record moved on): keep the ref
+		}
+		if row, err = s.q.GetCheckpointRetention(ctx, runID); err != nil {
+			return false, fmt.Errorf("re-read record: %w", err)
+		}
+		if row.State != retentionSettling {
+			return false, nil
+		}
+	case retentionSettling:
+	default:
+		return false, nil
+	}
+	return s.deleteSettlingRef(ctx, row, fence)
 }
 
 // retentionForge is the server-derived forge connection a retention forge write uses.

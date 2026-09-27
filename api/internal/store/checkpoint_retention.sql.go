@@ -69,6 +69,33 @@ func (q *Queries) BeginCheckpointSupersession(ctx context.Context, arg BeginChec
 	return result.RowsAffected(), nil
 }
 
+const deferCheckpointRetentionVerify = `-- name: DeferCheckpointRetentionVerify :execrows
+UPDATE checkpoint_retentions
+SET attempts = attempts + 1,
+    last_error = $1::text,
+    verify_after = $2::timestamptz,
+    updated_at = now()
+WHERE run_id = $3
+  AND state = 'deleted'
+  AND verified_at IS NULL
+`
+
+type DeferCheckpointRetentionVerifyParams struct {
+	LastError   string             `json:"last_error"`
+	VerifyAfter pgtype.Timestamptz `json:"verify_after"`
+	RunID       uuid.UUID          `json:"run_id"`
+}
+
+// M4 audit: the verification could not complete (forge or connection failure); push it out to
+// the caller-computed backoff and record the (already scrubbed) error. verified_at stays NULL.
+func (q *Queries) DeferCheckpointRetentionVerify(ctx context.Context, arg DeferCheckpointRetentionVerifyParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deferCheckpointRetentionVerify, arg.LastError, arg.VerifyAfter, arg.RunID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getCheckpointRetention = `-- name: GetCheckpointRetention :one
 SELECT run_id, user_id, repo_id, branch, tip, ref, recovery_ref, state, attempts, next_attempt_at, last_error, verify_after, verified_at, created_at, updated_at, settled_at FROM checkpoint_retentions WHERE run_id = $1
 `
@@ -170,25 +197,139 @@ func (q *Queries) InsertCheckpointRetentionSettling(ctx context.Context, arg Ins
 	return result.RowsAffected(), nil
 }
 
+const listCheckpointRetentionAudit = `-- name: ListCheckpointRetentionAudit :many
+SELECT run_id, user_id, repo_id, branch, tip, ref, recovery_ref, state, attempts, next_attempt_at, last_error, verify_after, verified_at, created_at, updated_at, settled_at FROM checkpoint_retentions
+WHERE state = 'deleted'
+  AND recovery_ref IS NOT NULL
+  AND verify_after <= now()
+  AND verified_at IS NULL
+  AND ($1::uuid IS NULL OR run_id = $1::uuid)
+ORDER BY verify_after, run_id
+LIMIT $2::int
+`
+
+type ListCheckpointRetentionAuditParams struct {
+	OnlyRunID pgtype.UUID `json:"only_run_id"`
+	MaxRows   int32       `json:"max_rows"`
+}
+
+// M4 post-settlement audit: deleted records that named a recovery ref, due for their one
+// re-verification (verify_after passed) and not yet verified. Closes the residual window of a
+// recovery-ref create whose session was lost after its fence but which landed after another
+// instance settled the record.
+func (q *Queries) ListCheckpointRetentionAudit(ctx context.Context, arg ListCheckpointRetentionAuditParams) ([]CheckpointRetention, error) {
+	rows, err := q.db.Query(ctx, listCheckpointRetentionAudit, arg.OnlyRunID, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []CheckpointRetention{}
+	for rows.Next() {
+		var i CheckpointRetention
+		if err := rows.Scan(
+			&i.RunID,
+			&i.UserID,
+			&i.RepoID,
+			&i.Branch,
+			&i.Tip,
+			&i.Ref,
+			&i.RecoveryRef,
+			&i.State,
+			&i.Attempts,
+			&i.NextAttemptAt,
+			&i.LastError,
+			&i.VerifyAfter,
+			&i.VerifiedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.SettledAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listCheckpointRetentionBackfill = `-- name: ListCheckpointRetentionBackfill :many
+SELECT r.id, r.kind, r.issue_iid
+FROM runs r
+CROSS JOIN checkpoint_retention_meta m
+WHERE r.status IN ('completed', 'failed', 'cancelled')
+  AND r.checkpoint_tip IS NOT NULL
+  AND r.repo_id IS NOT NULL
+  AND ((r.kind = 'issue' AND r.issue_iid IS NOT NULL) OR r.kind = 'self_improve')
+  AND r.status_since >= m.enabled_at
+  AND NOT EXISTS (SELECT 1 FROM checkpoint_retentions c WHERE c.run_id = r.id)
+  AND ($1::uuid IS NULL OR r.id = $1::uuid)
+ORDER BY r.status_since, r.id
+LIMIT $2::int
+`
+
+type ListCheckpointRetentionBackfillParams struct {
+	OnlyRunID pgtype.UUID `json:"only_run_id"`
+	MaxRows   int32       `json:"max_rows"`
+}
+
+type ListCheckpointRetentionBackfillRow struct {
+	ID       uuid.UUID   `json:"id"`
+	Kind     string      `json:"kind"`
+	IssueIid pgtype.Int8 `json:"issue_iid"`
+}
+
+// M4 backfill: terminal runs that published a checkpoint and own a checkpoint branch (an issue
+// run with an issue iid, or a self_improve run) but have NO record: a terminal writer that
+// never calls the retention path (the sweeper's worker-loss and cap fails, the auto-stop, the
+// claim-assembly and Codex account-wait fails), or a best-effort insert that failed. Bounded to
+// runs whose current status began at or after retention was enabled
+// (checkpoint_retention_meta.enabled_at), so it never reaches back to runs the old
+// delete-on-terminal path already handled. The caller derives the branch in Go
+// (checkpointBranch) and records the run through the terminal-time inserts.
+func (q *Queries) ListCheckpointRetentionBackfill(ctx context.Context, arg ListCheckpointRetentionBackfillParams) ([]ListCheckpointRetentionBackfillRow, error) {
+	rows, err := q.db.Query(ctx, listCheckpointRetentionBackfill, arg.OnlyRunID, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCheckpointRetentionBackfillRow{}
+	for rows.Next() {
+		var i ListCheckpointRetentionBackfillRow
+		if err := rows.Scan(&i.ID, &i.Kind, &i.IssueIid); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listCheckpointRetentionWork = `-- name: ListCheckpointRetentionWork :many
 SELECT run_id, user_id, repo_id, branch, tip, ref, recovery_ref, state, attempts, next_attempt_at, last_error, verify_after, verified_at, created_at, updated_at, settled_at FROM checkpoint_retentions
 WHERE state = ANY($1::text[])
   AND state IN ('superseding', 'settling', 'retained', 'superseded')
   AND next_attempt_at <= now()
+  AND ($2::uuid IS NULL OR run_id = $2::uuid)
 ORDER BY next_attempt_at, run_id
-LIMIT $2::int
+LIMIT $3::int
 `
 
 type ListCheckpointRetentionWorkParams struct {
-	States  []string `json:"states"`
-	MaxRows int32    `json:"max_rows"`
+	States    []string    `json:"states"`
+	OnlyRunID pgtype.UUID `json:"only_run_id"`
+	MaxRows   int32       `json:"max_rows"`
 }
 
 // The reconciliation sweeper's candidates in the given states, oldest-due first, bounded.
-// The caller names the states its arms handle (M3: superseding; M4 adds the rest), so rows no
-// arm acts on never crowd the bounded page.
+// The caller names the states its arms handle (superseding, settling), so rows no arm acts on
+// never crowd the bounded page. only_run_id NULL lists every run (production); a run id
+// confines the page to that run (the LiveDB tests' isolation from a reused database).
 func (q *Queries) ListCheckpointRetentionWork(ctx context.Context, arg ListCheckpointRetentionWorkParams) ([]CheckpointRetention, error) {
-	rows, err := q.db.Query(ctx, listCheckpointRetentionWork, arg.States, arg.MaxRows)
+	rows, err := q.db.Query(ctx, listCheckpointRetentionWork, arg.States, arg.OnlyRunID, arg.MaxRows)
 	if err != nil {
 		return nil, err
 	}
@@ -253,6 +394,65 @@ func (q *Queries) ListCheckpointRetentionsForBranch(ctx context.Context, arg Lis
 		arg.ExcludeRunID,
 		arg.Ref,
 	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []CheckpointRetention{}
+	for rows.Next() {
+		var i CheckpointRetention
+		if err := rows.Scan(
+			&i.RunID,
+			&i.UserID,
+			&i.RepoID,
+			&i.Branch,
+			&i.Tip,
+			&i.Ref,
+			&i.RecoveryRef,
+			&i.State,
+			&i.Attempts,
+			&i.NextAttemptAt,
+			&i.LastError,
+			&i.VerifyAfter,
+			&i.VerifiedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.SettledAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listUnheldCheckpointRetentions = `-- name: ListUnheldCheckpointRetentions :many
+SELECT run_id, user_id, repo_id, branch, tip, ref, recovery_ref, state, attempts, next_attempt_at, last_error, verify_after, verified_at, created_at, updated_at, settled_at FROM checkpoint_retentions
+WHERE checkpoint_retentions.state IN ('retained', 'superseded')
+  AND checkpoint_retentions.next_attempt_at <= now()
+  AND NOT EXISTS (
+      SELECT 1 FROM recovery_custody_holds h
+      WHERE h.run_id = checkpoint_retentions.run_id AND h.state = 'open'
+  )
+  AND ($1::uuid IS NULL OR checkpoint_retentions.run_id = $1::uuid)
+ORDER BY checkpoint_retentions.next_attempt_at, checkpoint_retentions.run_id
+LIMIT $2::int
+`
+
+type ListUnheldCheckpointRetentionsParams struct {
+	OnlyRunID pgtype.UUID `json:"only_run_id"`
+	MaxRows   int32       `json:"max_rows"`
+}
+
+// M4: retained/superseded records whose run has NO open custody hold: their settle trigger was
+// lost (a crash between a hold's release and its trigger, a busy lock, a full retention slot)
+// or a hold settled between the terminal-time insert and its settle. The open-hold predicate is
+// in the query so the (normal, possibly many) records still held never crowd the bounded page.
+func (q *Queries) ListUnheldCheckpointRetentions(ctx context.Context, arg ListUnheldCheckpointRetentionsParams) ([]CheckpointRetention, error) {
+	rows, err := q.db.Query(ctx, listUnheldCheckpointRetentions, arg.OnlyRunID, arg.MaxRows)
 	if err != nil {
 		return nil, err
 	}
@@ -446,12 +646,73 @@ func (q *Queries) SetCheckpointRetentionSettlingIfUnheld(ctx context.Context, ru
 	return result.RowsAffected(), nil
 }
 
+const setCheckpointRetentionVerified = `-- name: SetCheckpointRetentionVerified :execrows
+UPDATE checkpoint_retentions
+SET verified_at = now(),
+    last_error = COALESCE($1::text, last_error),
+    updated_at = now()
+WHERE run_id = $2
+  AND state = 'deleted'
+  AND verified_at IS NULL
+`
+
+type SetCheckpointRetentionVerifiedParams struct {
+	Note  pgtype.Text `json:"note"`
+	RunID uuid.UUID   `json:"run_id"`
+}
+
+// M4 audit: the deleted record's recovery ref is verified (absent, deleted now, or at another
+// tip that is not ours to delete). A non-NULL note replaces last_error. Guarded so a record is
+// verified once.
+func (q *Queries) SetCheckpointRetentionVerified(ctx context.Context, arg SetCheckpointRetentionVerifiedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setCheckpointRetentionVerified, arg.Note, arg.RunID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setCheckpointSupersessionExited = `-- name: SetCheckpointSupersessionExited :execrows
+UPDATE checkpoint_retentions
+SET state = 'deleted',
+    last_error = $1::text,
+    settled_at = now(),
+    updated_at = now(),
+    verify_after = CASE WHEN recovery_ref IS NOT NULL THEN now() + interval '10 minutes' END
+WHERE checkpoint_retentions.run_id = $2
+  AND checkpoint_retentions.state = 'superseding'
+  AND NOT EXISTS (
+      SELECT 1 FROM recovery_custody_holds h
+      WHERE h.run_id = checkpoint_retentions.run_id AND h.state = 'open'
+  )
+`
+
+type SetCheckpointSupersessionExitedParams struct {
+	LastError string    `json:"last_error"`
+	RunID     uuid.UUID `json:"run_id"`
+}
+
+// M4 (stuck superseding exit): superseding -> deleted for a record whose supersession stopped
+// (tip lag, or the recovery ref at another tip) once the run has NO open custody hold, after
+// the caller CAS-deleted whichever of its refs origin still held at the recorded tip. The
+// recovery ref is re-verified by the audit after 10 minutes, like any deleted recovery ref.
+// Guarded on the state and on the open-hold predicate, so a racing writer or a hold that
+// appeared moves zero rows.
+func (q *Queries) SetCheckpointSupersessionExited(ctx context.Context, arg SetCheckpointSupersessionExitedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setCheckpointSupersessionExited, arg.LastError, arg.RunID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setCheckpointSupersessionTipGone = `-- name: SetCheckpointSupersessionTipGone :execrows
 UPDATE checkpoint_retentions
 SET state = 'deleted',
     last_error = $1::text,
     settled_at = now(),
-    updated_at = now()
+    updated_at = now(),
+    verify_after = CASE WHEN recovery_ref IS NOT NULL THEN now() + interval '10 minutes' END
 WHERE run_id = $2
   AND state = 'superseding'
 `
@@ -464,7 +725,9 @@ type SetCheckpointSupersessionTipGoneParams struct {
 // D2 (M3): superseding -> deleted when origin holds the recorded tip under NEITHER the branch
 // ref nor the recovery ref (checked by listing both after CreateRef reported the source
 // missing). Nothing uzi owns references the tip any more, so there is nothing to preserve or
-// delete; the note is kept in last_error for audit.
+// delete; the note is kept in last_error for audit. A superseding record names its recovery
+// ref, so the post-settlement audit (M4) re-verifies it after 10 minutes: a create whose
+// session was lost after its fence may still land after this list.
 func (q *Queries) SetCheckpointSupersessionTipGone(ctx context.Context, arg SetCheckpointSupersessionTipGoneParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setCheckpointSupersessionTipGone, arg.LastError, arg.RunID)
 	if err != nil {

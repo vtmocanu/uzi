@@ -510,6 +510,8 @@ func (s *Service) Release(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		if n > 0 {
 			g := *req.Generation
 			resp.Generation = &g
+			// PRD #1810 D3: the single-statement release has committed (autocommit on the pool).
+			s.custodySettledAfterCommit(runID)
 		}
 		return resp, nil
 	}
@@ -552,6 +554,9 @@ func (s *Service) Release(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return apitypes.RecoveryReleaseResponse{}, err
+	}
+	if n > 0 {
+		s.custodySettledAfterCommit(runID) // PRD #1810 D3: after the release's commit
 	}
 	return apitypes.RecoveryReleaseResponse{RunID: runID.String(), Released: n > 0, HoldsReleased: int(n)}, nil
 }
@@ -770,5 +775,6 @@ func (s *Service) DiscardHold(ctx context.Context, userID, runID, holdID uuid.UU
 	if err := tx.Commit(ctx); err != nil {
 		return false, err
 	}
+	s.custodySettledAfterCommit(runID) // PRD #1810 D3: after the discard's commit
 	return true, nil
 }

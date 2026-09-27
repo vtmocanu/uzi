@@ -356,6 +356,11 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	if err := q.Commit(ctx); err != nil {
 		return nil, "", err
 	}
+	if expected == 1 {
+		// PRD #1810 D3: the exact hold's release committed with the outcome above; if it was
+		// the run's last open hold, a retained checkpoint of the run is now owed its delete.
+		s.SettleRetainedCheckpoint(run.ID)
+	}
 	switch {
 	case credDisabled:
 		return nil, "paused", nil

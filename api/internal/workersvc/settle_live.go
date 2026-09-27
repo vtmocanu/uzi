@@ -210,6 +210,9 @@ func (s *Service) SettlePredecessorHoldLive(ctx context.Context, wkr store.Worke
 		slog.Info("recovery settle: released predecessor hold by live ancestry", "run", runID.String(), "hold", holdID.String(),
 			"predecessor_generation", req.PredecessorGeneration, "successor_generation", req.SuccessorGeneration,
 			"target", req.Target)
+		// PRD #1810 D3, wired for parity with every other release writer: the run is live here,
+		// so it has no retention record yet and the settle is a no-op by construction.
+		s.SettleRetainedCheckpoint(runID)
 		return released(head), nil
 	}
 	// Zero rows: something moved between the proof and the write. Released ONLY when a

@@ -174,6 +174,7 @@ func (s *Service) parkForgeUnreachable(ctx context.Context, wkr store.Worker, ow
 		if err := tx.Commit(ctx); err != nil {
 			return store.Run{}, 0, err
 		}
+		s.SettleRetainedCheckpoint(run.ID) // PRD #1810 D3: the exact hold's release committed
 		return run, 1, nil
 	}
 
@@ -206,6 +207,7 @@ func (s *Service) parkForgeUnreachable(ctx context.Context, wkr store.Worker, ow
 		if err := tx.Commit(ctx); err != nil {
 			return store.Run{}, 0, err
 		}
+		s.SettleRetainedCheckpoint(run.ID) // PRD #1810 D3: the exact hold's release committed
 		return run, 1, nil
 	}
 
@@ -230,6 +232,10 @@ func (s *Service) parkForgeUnreachable(ctx context.Context, wkr store.Worker, ow
 	if err := tx.Commit(ctx); err != nil {
 		return store.Run{}, 0, err
 	}
+	// PRD #1810 D3: the exact hold's release committed with the park. A parked run is live and
+	// has no retention record, so this is a no-op by construction, wired for parity: every
+	// custody release writer triggers the settle check after its commit.
+	s.SettleRetainedCheckpoint(run.ID)
 	return parked, 1, nil
 }
 
