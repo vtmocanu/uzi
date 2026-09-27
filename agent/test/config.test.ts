@@ -213,7 +213,8 @@ describe("loadConfig disk reclaim knobs (PRD #1809 D5/D7)", () => {
     assert.strictEqual(d.reviewModelTimeoutMs, 5 * 60_000);
     assert.strictEqual(d.summaryModelTimeoutMs, 60_000);
     assert.strictEqual(loadConfig(baseEnv({ SUMMARY_MODEL_TIMEOUT_MS: "7200000.9" })).summaryModelTimeoutMs, 7_200_000);
-    for (const v of ["abc", "0", "-5"]) {
+    // "0.5" and "1e-3" are positive but floor to 0: a 0 ms timeout would fire instantly.
+    for (const v of ["abc", "0", "-5", "0.5", "1e-3", "Infinity"]) {
       assert.strictEqual(loadConfig(baseEnv({ SUMMARY_MODEL_TIMEOUT_MS: v })).summaryModelTimeoutMs, 60_000, `value ${v}`);
     }
   });

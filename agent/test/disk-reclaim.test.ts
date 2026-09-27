@@ -368,8 +368,143 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     assert.equal(s.terminalHomesRemoved, 1, "the one run the capped listing read was examined");
     assert.equal(exists(run.home), false);
     assert.ok(memo.has(unseen), "a run past the cap is not known to be gone, so it is not forgotten");
+    // The capped window's one entry was the HOME this pass removed, so the cursor, less that
+    // removal, is back at 0: the next listing is whole.
     await runDiskReclaimPass(deps(d, { cachesDropped: memo }));
-    assert.equal(memo.has(unseen), false, "a complete listing without its HOME forgets it");
+    assert.equal(memo.has(unseen), false, "a whole listing without its HOME forgets it");
+  });
+
+  /** An lstat that presents every path in `foreign` as owned by another uid (the runner's). */
+  function lstatAs(foreign: Set<string>, workerUid: number) {
+    return async (p: string) => {
+      const st = await fs.promises.lstat(p);
+      return { uid: foreign.has(p) ? workerUid + 1 : workerUid, mtimeMs: st.mtimeMs, isDirectory: () => st.isDirectory() };
+    };
+  }
+
+  /** A minimal worker-owned run HOME (no read-only subtree, so root runs it too). */
+  function plainHome(root: string): { id: string; home: string } {
+    const id = randomUUID();
+    const home = path.join(root, id);
+    fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".claude.json"), "{}");
+    return { id, home };
+  }
+
+  it("flood A: planted run-shaped dirs not owned by the worker take no lookup and no budget slot", async () => {
+    const d = dataDir();
+    const workerUid = 4242;
+    const foreign = new Set<string>();
+    for (let i = 0; i < 2_000; i++) {
+      const dir = path.join(i % 2 ? d.home : d.provision, randomUUID());
+      fs.mkdirSync(dir);
+      foreign.add(dir);
+    }
+    const real = Array.from({ length: 20 }, () => plainHome(d.home));
+    let lookups = 0;
+    const s = await runDiskReclaimPass(
+      deps(d, {
+        workerUid,
+        lstat: lstatAs(foreign, workerUid),
+        maxEntries: 500,
+        statusOf: async () => {
+          lookups++;
+          return "completed";
+        },
+      }),
+    );
+    for (const r of real) assert.equal(exists(r.home), false, "every terminal worker-owned HOME is removed in pass 1");
+    for (const dir of foreign) assert.ok(exists(dir), "a planted dir is never touched");
+    assert.equal(lookups, 20, "one status lookup per real run, none for the 2000 planted dirs");
+    assert.equal(s.runsExamined, 20);
+    assert.equal(s.skippedNotOwned, 2_000);
+    assert.equal(s.terminalHomesRemoved, 20);
+    assert.equal(s.unexamined, 0);
+    assert.equal(s.stoppedEarly, undefined);
+  });
+
+  it("a worker-owned HOME admits its run's provision dir whoever owns it (the legacy migration re-owns it to runner)", async () => {
+    const d = dataDir();
+    const workerUid = 4242;
+    const run = plainHome(d.home);
+    const legacyProvision = path.join(d.provision, run.id);
+    fs.mkdirSync(legacyProvision);
+    // A planted HOME beside a worker-owned provision dir: the run is examined through its
+    // provision dir only, and the foreign HOME is left alone.
+    const other = randomUUID();
+    const plantedHome = path.join(d.home, other);
+    const ownedProvision = path.join(d.provision, other);
+    fs.mkdirSync(plantedHome);
+    fs.mkdirSync(ownedProvision);
+    const s = await runDiskReclaimPass(
+      deps(d, {
+        workerUid,
+        lstat: lstatAs(new Set([legacyProvision, plantedHome]), workerUid),
+        statusOf: async () => "completed",
+      }),
+    );
+    assert.equal(exists(run.home), false);
+    assert.equal(exists(legacyProvision), false, "the runner-owned provision dir of a worker-owned run is removed with it");
+    assert.ok(exists(plantedHome), "a HOME the worker does not own is never removed");
+    assert.equal(exists(ownedProvision), false, "the worker-owned provision dir beside it is");
+    assert.equal(s.runsExamined, 2);
+    assert.equal(s.terminalHomesRemoved, 1);
+    assert.equal(s.provisionDirsRemoved, 2);
+  });
+
+  it("never touches a model-pass-named dir the worker does not own, whatever its age", async () => {
+    const d = dataDir();
+    const workerUid = 4242;
+    const planted = path.join(d.home, "uzi-judge-planted");
+    fs.mkdirSync(planted);
+    const old = (Date.now() - 2 * 60 * 60_000) / 1000;
+    fs.utimesSync(planted, old, old);
+    const s = await runDiskReclaimPass(deps(d, { workerUid, lstat: lstatAs(new Set([planted]), workerUid) }));
+    assert.ok(exists(planted));
+    assert.equal(s.modelPassHomesNotOwned, 1);
+    assert.equal(s.modelPassHomesRemoved, 0);
+  });
+
+  it("flood B: a capped listing rotates, so real HOMEs behind a flood of names are reached within ceil(N/cap)+1 passes", async () => {
+    const d = dataDir();
+    // Real HOMEs on both sides of the flood in creation order, so some sit past the first
+    // window whichever order this filesystem lists in.
+    const real = Array.from({ length: 10 }, () => plainHome(d.home));
+    for (let i = 0; i < 200; i++) {
+      if (i % 2) fs.writeFileSync(path.join(d.home, `junk-${i}`), "");
+      else fs.mkdirSync(path.join(d.home, `junk-${i}`));
+    }
+    real.push(...Array.from({ length: 10 }, () => plainHome(d.home)));
+    const cap = 25;
+    const bound = Math.ceil(220 / cap) + 1;
+    const cursors = new Map<string, number>();
+    const removedPerPass: number[] = [];
+    for (let pass = 0; pass < bound && real.some((r) => exists(r.home)); pass++) {
+      const s = await runDiskReclaimPass(deps(d, { maxDirReads: cap, dirCursors: cursors, statusOf: async () => "completed" }));
+      assert.ok(s.dirEntriesRead <= 220, "a pass never reads more than the directory holds");
+      removedPerPass.push(s.terminalHomesRemoved);
+    }
+    for (const r of real) assert.equal(exists(r.home), false, `every real HOME is reached within ${bound} passes`);
+    assert.ok((removedPerPass[0] ?? 0) < 20, "the first window alone does not hold every real HOME");
+    assert.equal(
+      removedPerPass.reduce((a, b) => a + b, 0),
+      20,
+      "each real HOME is removed exactly once",
+    );
+  });
+
+  it("a capped listing resumes where it stopped and wraps to 0 at the directory's end", async () => {
+    const d = dataDir();
+    for (let i = 0; i < 30; i++) fs.writeFileSync(path.join(d.home, `junk-${i}`), "");
+    const cursors = new Map<string, number>();
+    const pass = () => runDiskReclaimPass(deps(d, { maxDirReads: 20, dirCursors: cursors }));
+    await pass();
+    assert.equal(cursors.get(d.home), 20, "stopped at the cap: resume after the window");
+    assert.equal(cursors.has(d.provision), false, "an empty root reached its end: starts from 0");
+    const second = await pass();
+    assert.equal(second.dirEntriesRead, 30, "20 skipped then the last 10 read");
+    assert.equal(second.stoppedEarly, undefined);
+    assert.equal(cursors.has(d.home), false, "reached the end: the next listing starts from 0");
   });
 
   it("a drop that found nothing is not counted as a drop and logs nothing of its own", { skip: SKIP_ROOT }, async () => {
@@ -778,6 +913,36 @@ describe("DiskPressureController (PRD #1809 D5)", () => {
     c.observe(undefined);
     c.observe(0.9);
     assert.equal(c.claimsBlocked(), false, "a reopened stretch stays reopened across an unknown sample");
+  });
+
+  it("warns once when an unknown sample lifts an active stop, and never when no stop was active", () => {
+    const warned = (lines: unknown[]) =>
+      lines.filter((l) => (l as { msg: string }).msg === "disk sample unknown; claims fail open").length;
+    const { c, lines } = controller();
+    c.observe(0.5);
+    c.observe(undefined);
+    assert.equal(warned(lines), 0, "no stop was active under the soft threshold");
+    c.observe(0.95);
+    assert.equal(c.claimsBlocked(), true);
+    c.observe(undefined);
+    c.observe(undefined);
+    assert.equal(warned(lines), 1, "one warning on the known-to-unknown transition, none per unknown tick");
+    c.observe(0.95);
+    c.observe(undefined);
+    assert.equal(warned(lines), 2, "a stop active again warns again on its next lift");
+
+    const offLog = recordingLogger();
+    const quiet = new DiskPressureController({
+      softMargin: 0.1,
+      thresholdOf: () => undefined,
+      intervalMs: 60_000,
+      admission: false,
+      admissionMaxWaitMs: 60_000,
+      log: offLog.logger,
+    });
+    quiet.observe(0.99);
+    quiet.observe(undefined);
+    assert.equal(warned(offLog.lines), 0, "with the admission stop off there is no stop to lift");
   });
 
   it("runs one pass at a time and spaces pressure passes", async () => {
