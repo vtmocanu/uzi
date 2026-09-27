@@ -558,12 +558,14 @@ describe("launchCodexRoot: happy-path lifecycle over the fake supervisor", () =>
     const fake = newFake({ disposeNearBudget: true, exitDelayMs: 10 });
     const handle = await launchCodexRoot(
       baseSpec(),
-      baseDeps(fake, { deadlines: { started: 1000, snapshot: 1000, dispose: 1000, exit: 30 } }),
+      baseDeps(fake, { deadlines: { started: 1000, snapshot: 1000, dispose: 1000, exit: 300 } }),
     );
 
-    const outcome = await handle.dispose(100);
+    // Budgets are wide enough that CPU contention cannot eat the exit-confirmation
+    // margin on real timers; the four-fifths ratio below is the property under test.
+    const outcome = await handle.dispose(1000);
     assert.equal(outcome.clean, true);
-    assert.ok((fake.disposeTimeouts[0] ?? 100) <= 80, "drain received no more than four fifths of the total budget");
+    assert.ok((fake.disposeTimeouts[0] ?? 1000) <= 800, "drain received no more than four fifths of the total budget");
   });
 });
 
