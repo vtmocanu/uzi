@@ -27,6 +27,7 @@ import type {
   Delta,
 } from "../src/summary-runner.js";
 import { nullLogger } from "./helpers.js";
+import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary-fixture.js";
 
 // A worktree path that is UNIQUE PER PROCESS AND PER CALL, and that deliberately
 // never exists. Both halves matter. Non-existence is the point of these fixtures --
@@ -4213,6 +4214,48 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
     assert.deepStrictEqual(rec.planCalls.map((c) => c.planMd), ["# Plan v1", "# Plan v2"]);
   });
 
+  // ── PRD #1798 M2: the accepted plan summary rides the ExecutorResult ──────────────
+  it("forwards the last accepted plan summary + deltas on the result (PRD #1798 M2)", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const { runner, client } = summaryFakes();
+    const probe = makeCtx({ agents: [lead, coder] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn, client, summaryRunner: runner }).run(probe.ctx);
+    assert.strictEqual(result.summaryPlan, "PLAN SUMMARY");
+    assert.deepStrictEqual(result.summaryDeltas, [{ kind: "added", text: "a caching layer" }]);
+  });
+
+  it("omits the plan summary when the api refused it (PRD #1798 M2)", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const { runner, client } = summaryFakes({ postPlan: () => Promise.reject(new Error("409 stale plan")) });
+    const probe = makeCtx({ agents: [lead, coder] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn, client, summaryRunner: runner }).run(probe.ctx);
+    assert.ok(!("summaryPlan" in result) && !("summaryDeltas" in result));
+  });
+
+  it("never forwards a superseded plan's summary when the revised plan's summary fails (PRD #1798 M2)", async () => {
+    const revise = (feedback: string): PlanVerdict => ({ kind: "revise", feedback });
+    const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan v1"), resultSuccess()],
+      [submitPlan("# Plan v2"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    let generation = 0;
+    const { runner, client } = summaryFakes({
+      generatePlan: () => Promise.resolve(++generation === 1 ? { summary: "V1", deltas: [] } : null),
+    });
+    const probe = makeCtx({ agents: [lead, coder] }, [revise("more"), approve]);
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn, client, summaryRunner: runner }).run(probe.ctx);
+    assert.strictEqual(generation, 2);
+    assert.strictEqual(result.summaryPlan, undefined, "v1's summary does not describe the approved v2");
+  });
+
   // ── REGRESSION (code review PR #387, finding 1): POST after plan_md is persisted ──
   // The plan summary carries `plan_md` as the server's stale-write guard value, so the
   // write only lands once the gate has persisted plan_md (the awaiting_approval report).
@@ -5289,4 +5332,45 @@ describe("SdkExecutor provider-transient error handling (issue #1088)", () => {
     assert.strictEqual(err.rateLimitType, "five_hour");
     assert.strictEqual(err.resetsAtMs, IN_5H);
   });
+});
+
+describe("SdkExecutor signal_done pr_summary (PRD #1798 M2)", () => {
+  async function runDeclaring(input: Record<string, unknown>, overrides: Partial<RunContext> = {}) {
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone("sess-1", input), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder], ...overrides });
+    return new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+  }
+
+  it("carries the fixture's claims off the terminating turn, stamped with the worktree HEAD", async () => {
+    const { dir, head } = makeGitRepo();
+    try {
+      const result = await runDeclaring({ pr_summary: PR_SUMMARY_INPUT }, { worktreePath: dir });
+      assert.deepStrictEqual(result.prSummary, { ...PR_SUMMARY_EXPECTED, verifiedAtSha: head });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves verifiedAtSha absent when HEAD cannot be read, and still completes", async () => {
+    const result = await runDeclaring({ pr_summary: PR_SUMMARY_INPUT });
+    assert.strictEqual(result.branch, "agent/issue-5");
+    assert.deepStrictEqual(result.prSummary, PR_SUMMARY_EXPECTED);
+  });
+
+  it("omits the field when the lead declares none or only garbage", async () => {
+    for (const input of [{}, { pr_summary: "not an object" }, { pr_summary: { what: " " } }]) {
+      const result = await runDeclaring(input);
+      assert.ok(!("prSummary" in result), JSON.stringify(input));
+    }
+  });
+
+  for (const kind of ["self_improve", "ci_fix"] as const) {
+    it(`a ${kind} run forwards it too (ungated, it opens a PR)`, async () => {
+      const result = await runDeclaring({ pr_summary: { what: "w" } }, { kind });
+      assert.deepStrictEqual(result.prSummary, { what: "w" });
+    });
+  }
 });

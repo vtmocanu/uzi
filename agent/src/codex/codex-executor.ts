@@ -51,7 +51,8 @@ import type { Readable, Writable } from "node:stream";
 import type { Logger } from "../log.js";
 import { codexDeferralReason, type WorkerClient } from "../client.js";
 import type { DockerWiring } from "../docker-wiring.js";
-import { PlanRejectedError, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
+import { PlanRejectedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
+import type { PrSummaryClaim } from "../signals.js";
 import { PauseNowSignal } from "../steering.js";
 import { resolveRunKind } from "../run-kind.js";
 import {
@@ -81,7 +82,7 @@ import type {
   TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { buildLeadSystemPrompt, buildRevisePlanPrompt, milestoneStatusNote, publishedTipNote } from "../prompt.js";
+import { buildLeadSystemPrompt, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote } from "../prompt.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
@@ -2176,6 +2177,9 @@ export class CodexExecutor implements Executor {
       // Issue #1674 (PRD #265 M1 parity): the latched signal_done declaration, so the terminating
       // turn's milestones_completed reaches the ExecutorResult after the loop breaks.
       let declaredMilestonesCompleted: string[] | undefined;
+      // PRD #1798 M2 (D4, D13 parity with sdk-executor): the latched signal_done pr_summary,
+      // stamped with the worktree HEAD on the done turn that declared it.
+      let declaredPrSummary: PrSummaryClaim | undefined;
       const isIssueRun = resolveRunKind(ctx.kind) === "issue";
       const milestoneNote = (): string => codexMilestoneNote(milestones, latestProgress, progressMissedLastTurn);
       const interlockedIssue = ctx.completionInterlock && resolveRunKind(ctx.kind) === "issue"
@@ -2199,6 +2203,9 @@ export class CodexExecutor implements Executor {
         // Issue #1674 (PRD #265 M1 parity): forward the declared finished-milestone ids on issue
         // runs only, OMITTED when nothing was declared, as sdk-executor does; runner.ts reads it.
         ...(isIssueRun && declaredMilestonesCompleted !== undefined ? { milestonesCompleted: declaredMilestonesCompleted } : {}),
+        // PRD #1798 M2: the lead's PR claims, NOT gated on run kind (as in sdk-executor); OMITTED
+        // when none was declared. The runner reads it only where it renders a PR description.
+        ...(declaredPrSummary !== undefined ? { prSummary: declaredPrSummary } : {}),
       });
       for (;;) {
         iteration++;
@@ -2312,6 +2319,14 @@ export class CodexExecutor implements Executor {
           // A quiet clarification turn does not erase milestone progress.
           if (result.progress) latestProgress = result.progress;
           if (result.milestonesCompleted !== undefined) declaredMilestonesCompleted = result.milestonesCompleted;
+          // PRD #1798 M2: last-wins, and stamped with the worktree HEAD only on the done turn that
+          // carried the claims, so a later bare signal_done keeps the earlier claims with the sha
+          // they were made at. A HEAD read failure leaves verifiedAtSha absent and never throws.
+          if (result.prSummary !== undefined) {
+            declaredPrSummary = result.done
+              ? await stampPrSummaryHead(result.prSummary, ctx.worktreePath)
+              : result.prSummary;
+          }
           if (result.done || result.checkpoint) {
             emitIgnoredQuestions(result);
             break;
@@ -3346,9 +3361,11 @@ export class CodexExecutor implements Executor {
     // #1416 (MR-rework): thread autoApprove so an autopilot Codex run gets the autopilot-safe
     // rewrite guidance, not the human-only `ask_user` wording (matches the SDK builders).
     const note = publishedTipNote(ctx.publishedTip, ctx.defaultBranchCommit, ctx.autoApprove);
+    // PRD #1798 M2 (D4, D13): the same pr_summary ask the Claude implement prompt carries.
+    const withClaims = `${body}\n\n${PR_SUMMARY_GUIDANCE}`;
     // Issue #1674: APPEND the shared milestone tracker guidance (milestoneStatusNote) after the
     // Codex framing. Empty (no approved breakdown) leaves the prompt byte-identical.
-    return withMilestoneNote(note ? `${note}\n\n${body}` : body, milestoneNote);
+    return withMilestoneNote(note ? `${note}\n\n${withClaims}` : withClaims, milestoneNote);
   }
 
 }

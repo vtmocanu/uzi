@@ -25,6 +25,8 @@ import type {
   RunKind,
 } from "./protocol.js";
 import type { AnswerVerdict, PlanVerdict } from "./steering.js";
+import { normalizeVerifiedSha, type PrSummaryClaim } from "./signals.js";
+import type { Delta } from "./summary-runner.js";
 import { buildRepoInstructionsContext, type PriorWork } from "./prompt.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { readRepoInstructions } from "./repo-instructions.js";
@@ -697,6 +699,22 @@ export interface ExecutorResult {
    *  prompt completion path. Absent when the run produced no proposal, which is the common
    *  case (a normal/mr-mode run). StubExecutor never sets it. */
   proposal?: Proposal;
+  /** PRD #1798 M2 (D4): the lead's structured, plain-English PR claims from signal_done's
+   *  `pr_summary` (last-wins across the run's main-thread signal_done calls), parsed and clamped
+   *  to the api's raw caps by signals.ts. `verifiedAtSha` is the run worktree's HEAD read by the
+   *  executor when it latched done (absent when HEAD could not be read). NOT gated on run kind;
+   *  the runner reads it only where it renders a PR description. Absent when the lead declared
+   *  none, which an older prompt or a terse lead does. StubExecutor never sets it. */
+  prSummary?: PrSummaryClaim;
+  /** PRD #1798 M2: the plain-English summary of the approved plan that the in-flight plan
+   *  summary pass produced and the api accepted (sdk-executor generateAndPostPlanSummary),
+   *  latched from the LAST successful generation of this run. Absent whenever that pass did not
+   *  run or did not succeed, which is normal: a resumed run past its gate and every Codex run
+   *  never produce one. */
+  summaryPlan?: string;
+  /** PRD #1798 M2: the tagged deltas (added / changed / dropped) that accompanied
+   *  `summaryPlan`, from the same generation. Present only alongside `summaryPlan`. */
+  summaryDeltas?: Delta[];
   /** PRD #634 M3: set when the operator's scope ceiling truncated the run at the loop top.
    *  `completedCount` frozen milestones were completed and are the committed slice; `total`
    *  is the frozen count (may be absent on a pre-approved resume where the local frozen list
@@ -1065,6 +1083,47 @@ export interface StubExecutorOptions {
  * plan→approve→work→MR path is provable end-to-end without a live Anthropic
  * session (mirrors SdkExecutor's gate handling).
  */
+/**
+ * PRD #1798 M2: read the run worktree's HEAD for a pr_summary's `verifiedAtSha`. Runs git AS
+ * the runner uid (the worktree is the runner-owned clone; see StubExecutor.git for why a
+ * worker-uid git there is wrong) with gitEnv()'s replacement env. Returns the lowercase 40-hex
+ * id, or undefined on ANY failure (no repo, unborn HEAD, timeout, odd output). Never throws.
+ */
+export async function readWorktreeHeadSha(worktreePath: string): Promise<string | undefined> {
+  try {
+    const env: NodeJS.ProcessEnv = { ...gitEnv(), PATH: runnerPath() };
+    const tmp = runnerTmpdir();
+    if (tmp) env.TMPDIR = tmp;
+    const wrapped = runnerCommand("git", ["-C", worktreePath, "rev-parse", "--verify", "HEAD^{commit}"]);
+    const { stdout } = await execFileAsync(wrapped.command, wrapped.args, { env, timeout: 30_000 });
+    return normalizeVerifiedSha(String(stdout));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * PRD #1798 M2: stamp a latched pr_summary with the worktree HEAD at the done signal. Returns a
+ * NEW claim (the input is not mutated) carrying `verifiedAtSha` when HEAD was readable, the
+ * claim unchanged (minus any stale stamp) when it was not, and undefined for no claim, in which
+ * case git is not run at all. Never throws.
+ */
+export async function stampPrSummaryHead(
+  claim: PrSummaryClaim | undefined,
+  worktreePath: string,
+  readHead: (worktreePath: string) => Promise<string | undefined> = readWorktreeHeadSha,
+): Promise<PrSummaryClaim | undefined> {
+  if (claim === undefined) return undefined;
+  const { verifiedAtSha: _stale, ...rest } = claim;
+  let sha: string | undefined;
+  try {
+    sha = normalizeVerifiedSha(await readHead(worktreePath));
+  } catch {
+    sha = undefined;
+  }
+  return sha === undefined ? rest : { ...rest, verifiedAtSha: sha };
+}
+
 export class StubExecutor implements Executor {
   constructor(
     private readonly log: Logger,
