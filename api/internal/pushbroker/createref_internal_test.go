@@ -126,25 +126,82 @@ func TestDeleteRejectsRefOutsideUziNamespaces(t *testing.T) {
 	}
 }
 
-func TestIsRefExistsRefusal(t *testing.T) {
-	yes := []string{
-		"ng refs/uzi-recovery/x failed to update ref",
-		"ng refs/uzi-recovery/x reference already exists",
-		"ng refs/uzi-recovery/x failed to lock",
-		"cannot lock ref 'refs/uzi-recovery/x': reference already exists",
-		"non-fast-forward",
+// TestCreateOutcomeDecidesFromReadBack pins CreateRef's classification: the sentinel is
+// decided from origin's read-back advertisement, never from a receive-pack error's wording
+// (the http-backend wire tests run the same paths against a real receive-pack).
+func TestCreateOutcomeDecidesFromReadBack(t *testing.T) {
+	tip := plumbing.NewHash(testTip)
+	other := plumbing.NewHash("89abcdef0123456789abcdef0123456789abcdef")
+	refused := errors.New("pushbroker: create ref: ng refs/uzi-recovery/x failed to update ref")
+	listDown := errors.New("pushbroker: list: connection refused")
+	cases := []struct {
+		name      string
+		pushErr   error
+		current   plumbing.Hash
+		present   bool
+		listErr   error
+		want      error // a sentinel, or nil for success
+		wantOther bool  // a non-sentinel error
+	}{
+		{name: "accepted and read back at tip", current: tip, present: true, want: nil},
+		{name: "accepted but absent on read-back", wantOther: true},
+		{name: "accepted but read back at another tip", current: other, present: true, want: ErrRefExists},
+		{name: "accepted but read-back failed", listErr: listDown, wantOther: true},
+		{name: "refused, read back at tip (racer or lost response)", pushErr: refused, current: tip, present: true, want: ErrRefExistsAtTip},
+		{name: "refused, read back at another tip", pushErr: refused, current: other, present: true, want: ErrRefExists},
+		{name: "refused, absent on read-back", pushErr: refused, wantOther: true},
+		{name: "refused, read-back failed", pushErr: refused, listErr: listDown, wantOther: true},
 	}
-	for _, m := range yes {
-		if !isRefExistsRefusal(errors.New(m)) {
-			t.Errorf("isRefExistsRefusal(%q) = false, want true", m)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := createOutcome(c.pushErr, c.current, c.present, c.listErr, tip)
+			if c.wantOther {
+				if err == nil || errors.Is(err, ErrRefExists) || errors.Is(err, ErrRefExistsAtTip) || errors.Is(err, ErrSourceMissing) {
+					t.Fatalf("createOutcome = %v, want a wrapped non-sentinel error", err)
+				}
+				return
+			}
+			if c.want == nil {
+				if err != nil {
+					t.Fatalf("createOutcome = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, c.want) {
+				t.Fatalf("createOutcome = %v, want %v", err, c.want)
+			}
+		})
+	}
+}
+
+// TestDeleteRecoveryRefRequiresCAS: a recovery ref is only ever CAS-deleted, so an empty
+// ExpectedOldTip is refused before any network I/O; a malformed ExpectedOldTip is refused
+// for any ref.
+func TestDeleteRecoveryRefRequiresCAS(t *testing.T) {
+	url := "file:///nonexistent/uzi-delete-invalid.git"
+	if err := Delete(context.Background(), DeleteOptions{CloneURL: url, Ref: RecoveryRefPrefix + "run-1"}); !errors.Is(err, ErrInvalidRef) {
+		t.Fatalf("unconditional delete of a recovery ref = %v, want ErrInvalidRef", err)
+	}
+	for _, tip := range []string{
+		testTip[:39], strings.ToUpper(testTip), "z" + testTip[1:], strings.Repeat("0", 40), testTip + "0",
+	} {
+		for _, o := range []DeleteOptions{
+			{CloneURL: url, Branch: "agent/issue-7", ExpectedOldTip: tip},
+			{CloneURL: url, Ref: RecoveryRefPrefix + "run-1", ExpectedOldTip: tip},
+		} {
+			if err := Delete(context.Background(), o); !errors.Is(err, ErrInvalidRef) {
+				t.Errorf("Delete(%+v) = %v, want ErrInvalidRef", o, err)
+			}
 		}
 	}
-	for _, m := range []string{"unpack error: eof before pack header", "missing necessary objects", "connection refused"} {
-		if isRefExistsRefusal(errors.New(m)) {
-			t.Errorf("isRefExistsRefusal(%q) = true, want false", m)
+}
+
+func TestListRefTipsRejectsForeignRefs(t *testing.T) {
+	for _, ref := range []string{"refs/heads/main", "refs/tags/v1", RecoveryRefPrefix, "refs/uzi-recoveryx/a"} {
+		_, err := ListRefTips(context.Background(), ListRefsOptions{CloneURL: "file:///nonexistent/uzi-list-invalid.git"},
+			checkpointRefPrefix+"agent/issue-7", ref)
+		if !errors.Is(err, ErrInvalidRef) {
+			t.Errorf("ListRefTips(%q) = %v, want ErrInvalidRef", ref, err)
 		}
-	}
-	if isRefExistsRefusal(nil) {
-		t.Error("isRefExistsRefusal(nil) = true")
 	}
 }

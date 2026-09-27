@@ -337,6 +337,14 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		return res, fmt.Errorf("reconcile custody releases: %w", err)
 	}
 
+	// Checkpoint-retention reconciliation (PRD #1810): re-drive interrupted checkpoint-ref work
+	// (M3: `superseding` records) under each run's retention lock. The same best-effort stance
+	// as the custody pass above: a candidate-list read error fails the pass, a per-record
+	// error is logged and skipped. Inert unless the retention seams are wired.
+	if res.CheckpointRetentionsReconciled, err = s.ReconcileCheckpointRetentions(ctx); err != nil {
+		return res, fmt.Errorf("reconcile checkpoint retentions: %w", err)
+	}
+
 	// Upload-retry-window sweep (PRD #1296 D3/D4): the LIVE consumer of
 	// UZI_RECOVERY_UPLOAD_RETRY_WINDOW. A reserved capture advances to 'available' within
 	// seconds of a healthy upload, so one still non-terminal (preparing/uploading) past the

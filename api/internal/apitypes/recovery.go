@@ -290,6 +290,13 @@ type RecoveryHoldsResponse struct {
 // carries ""). HasAvailableCapture is true when a ready archive already covers this hold's
 // source; CaptureState is the latest capture's lifecycle state (empty when the hold has none).
 // ReleasedAt is null while the hold is open.
+//
+// CheckpointRef/CheckpointTip/CheckpointState (PRD #1810 M3, D3) say where the run's last
+// published checkpoint lives on origin while the api retains it: the branch checkpoint ref
+// (refs/uzi-checkpoints/<branch>), or refs/uzi-recovery/<run id> once a new run on the branch
+// superseded it; the tip it points at; and the retention record's state (retained |
+// superseding | superseded | settling). All three are absent when the run has no live
+// retention record.
 type RecoveryCustodyHoldDTO struct {
 	ID                  string     `json:"id"`
 	RunID               string     `json:"run_id"`
@@ -303,6 +310,9 @@ type RecoveryCustodyHoldDTO struct {
 	CreatedAt           time.Time  `json:"created_at"`
 	UpdatedAt           time.Time  `json:"updated_at"`
 	ReleasedAt          *time.Time `json:"released_at,omitempty"`
+	CheckpointRef       string     `json:"checkpoint_ref,omitempty"`
+	CheckpointTip       string     `json:"checkpoint_tip,omitempty"`
+	CheckpointState     string     `json:"checkpoint_state,omitempty"`
 }
 
 // RecoveryCustodyAggregateDTO is the owner-level custody summary the board alert and the

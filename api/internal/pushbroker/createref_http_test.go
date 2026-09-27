@@ -89,6 +89,27 @@ func TestCreateRefListOutcomes(t *testing.T) {
 	})
 }
 
+// TestListRefTips: one list, the tips of the requested refs origin advertises, and no key
+// for an absent one; an empty origin is an empty map.
+func TestListRefTips(t *testing.T) {
+	ctx := context.Background()
+	f := newGitFixture(t)
+	empty, err := pushbroker.ListRefTips(ctx, pushbroker.ListRefsOptions{CloneURL: f.cloneURL()}, checkpointRef, recoveryRef)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("ListRefTips on an empty origin = %v, %v; want an empty map", empty, err)
+	}
+	base, tip := seedCheckpoint(t, f)
+	f.git("push", "origin", base+":"+recoveryRef)
+	got, err := pushbroker.ListRefTips(ctx, pushbroker.ListRefsOptions{CloneURL: f.cloneURL()},
+		checkpointRef, recoveryRef, "refs/uzi-checkpoints/absent")
+	if err != nil {
+		t.Fatalf("ListRefTips: %v", err)
+	}
+	if len(got) != 2 || got[checkpointRef] != tip || got[recoveryRef] != base {
+		t.Fatalf("ListRefTips = %v, want {%s: %s, %s: %s}", got, checkpointRef, tip, recoveryRef, base)
+	}
+}
+
 // httpFixture is a seeded fixture served by a real git receive-pack over TLS.
 func httpFixture(t *testing.T) (f *gitFixture, url, base, tip string) {
 	t.Helper()
@@ -178,6 +199,17 @@ func TestCreateRefOverRealReceivePack(t *testing.T) {
 		}
 	})
 
+	// A wire refusal whose read-back shows the ref at exactly our tip (a racer created
+	// the same tip) is success, reported as ErrRefExistsAtTip.
+	t.Run("wire refusal with the ref already at the tip", func(t *testing.T) {
+		f, url, _, tip := httpFixture(t)
+		f.git("push", "origin", tip+":"+recoveryRef)
+		err := pushbroker.PushCreateSkippingList(ctx, url, recoveryRef, tip, pushbroker.EmptyPack())
+		if !errors.Is(err, pushbroker.ErrRefExistsAtTip) {
+			t.Fatalf("wire create over the same tip = %v, want ErrRefExistsAtTip", err)
+		}
+	})
+
 	// The remote's connectivity check is the second guard on the tip's presence: a
 	// create naming an object origin does not hold is refused, list checks skipped.
 	t.Run("wire refuses a tip origin does not hold", func(t *testing.T) {
@@ -186,6 +218,9 @@ func TestCreateRefOverRealReceivePack(t *testing.T) {
 		err := pushbroker.PushCreateSkippingList(ctx, url, recoveryRef, local, pushbroker.EmptyPack())
 		if err == nil {
 			t.Fatal("a create naming an absent object was accepted")
+		}
+		if errors.Is(err, pushbroker.ErrRefExists) || errors.Is(err, pushbroker.ErrRefExistsAtTip) {
+			t.Fatalf("absent-object refusal misclassified as a ref-exists outcome: %v", err)
 		}
 		t.Logf("absent-object create refused as expected: %v", err)
 		if got := f.originRef(recoveryRef); got != "" {

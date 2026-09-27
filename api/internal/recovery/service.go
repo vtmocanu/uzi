@@ -698,6 +698,11 @@ func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openO
 	decisionNeeded := 0
 	for _, r := range rows {
 		dto := custodyHoldToDTO(r)
+		// PRD #1810 M3 (D3): where the run's retained checkpoint lives on origin (the branch
+		// checkpoint ref, or its recovery ref once superseded). Absent without a live record.
+		dto.CheckpointRef = r.CheckpointRef.String
+		dto.CheckpointTip = r.CheckpointTip.String
+		dto.CheckpointState = r.CheckpointState.String
 		if isDecisionAttention(dto.Attention) {
 			decisionNeeded++
 		}

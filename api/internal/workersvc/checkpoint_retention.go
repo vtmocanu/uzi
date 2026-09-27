@@ -28,6 +28,7 @@ import (
 // Checkpoint retention states (checkpoint_retentions.state; see migration 00259).
 const (
 	retentionRetained    = "retained"
+	retentionSuperseding = "superseding"
 	retentionSuperseded  = "superseded"
 	retentionSettling    = "settling"
 	retentionDefaultConc = 2
@@ -58,10 +59,23 @@ type ConnAcquirer interface {
 
 // retentionTestHooks are LiveDB race seams for the retention paths (nil in production, the
 // claimHooks idiom). beforeForgeWrite runs under the lock, immediately BEFORE the fence that
-// guards a forge write, so a test can steal the lock (terminate the backend) or interleave a
-// concurrent writer at the one point it matters. op names the write ("delete").
+// guards a forge write, so a test can pause an attempt, steal the lock (terminate the backend)
+// or interleave a concurrent writer at the one point it matters. op names the write: "delete"
+// (a settling record's ref), "create" (supersession's recovery ref) or "delete-branch"
+// (supersession's branch ref). afterLock runs once the lock is held, with the pinned
+// connection, so a test can release the lock WITHOUT ending the session.
 type retentionTestHooks struct {
 	beforeForgeWrite func(runID uuid.UUID, op string)
+	afterLock        func(runID uuid.UUID, conn *pgxpool.Conn)
+}
+
+// beforeRetentionWrite is the mandatory prelude of every retention forge write: the test hook
+// (if any) and THEN the fence, so a paused attempt whose lock is lost meanwhile is stopped.
+func (s *Service) beforeRetentionWrite(ctx context.Context, runID uuid.UUID, op string, fence func(context.Context) error) error {
+	if h := s.retentionHooks; h != nil && h.beforeForgeWrite != nil {
+		h.beforeForgeWrite(runID, op)
+	}
+	return fence(ctx)
 }
 
 // SetRetentionLockPool wires the pool the per-run retention lock pins its connection from
@@ -123,6 +137,9 @@ func (s *Service) withRetentionLock(ctx context.Context, runID uuid.UUID, fn fun
 		return false, nil
 	}
 	defer releaseRetentionLock(conn, runID, objID)
+	if h := s.retentionHooks; h != nil && h.afterLock != nil {
+		h.afterLock(runID, conn)
+	}
 
 	fence := func(fctx context.Context) error {
 		var n int64
@@ -181,9 +198,12 @@ func destroyRetentionConn(conn *pgxpool.Conn) {
 //     `retained` record, and no forge call. The ref stays on origin for recovery;
 //   - a run that published a checkpoint and has NO open hold (a completed run whose hold was
 //     just released, or a failed/cancelled run on a worker without the recovery capability):
-//     a `settling` record, and a background settle that deletes the ref CAS on its tip;
+//     a `settling` record, and a background settle that deletes the ref CAS on its tip under
+//     the run's retention lock;
 //   - a run that already has a record (a duplicate terminal call): the record is never reset;
-//     one still owing work is handed to the settle, which re-checks custody under the lock.
+//     one still owing work is handed to the settle, which re-reads the record under the lock
+//     and moves it to settling only through the guarded SetCheckpointRetentionSettlingIfUnheld
+//     (its NOT EXISTS open-hold predicate is the custody check).
 //
 // A run that never published (checkpoint_tip NULL) or has no repo gets no record and no forge
 // call: it owns no ref, and a delete could clobber a sibling's checkpoint on the same branch.
@@ -280,7 +300,8 @@ func (s *Service) settleRetainedCheckpoint(ctx context.Context, runID uuid.UUID)
 		default:
 			return nil
 		}
-		return s.deleteSettlingRef(ctx, row, fence)
+		_, err = s.deleteSettlingRef(ctx, row, fence)
+		return err
 	})
 	if err != nil {
 		slog.Warn("checkpoint retention: settle", "run", runID, "error", secretscrub.Scrub(err.Error()))
@@ -291,88 +312,115 @@ func (s *Service) settleRetainedCheckpoint(ctx context.Context, runID uuid.UUID)
 	}
 }
 
-// deleteSettlingRef performs the CAS delete a `settling` record owes, under the run's retention
-// lock. The forge coordinates are derived SERVER-SIDE exactly as Publish derives them
-// (GetRunClaimContext, the SSRF gate on the base URL and clone host, box.Open), never from a
-// worker. A lost lock (fence error) skips the write and records nothing: whoever holds the lock
-// now owns the record. A failed write is recorded with exponential backoff for the retry pass.
-func (s *Service) deleteSettlingRef(ctx context.Context, row store.CheckpointRetention, fence func(context.Context) error) error {
-	runID := row.RunID
-	fail := func(msg string) error {
-		next := time.Now().Add(retentionBackoff(row.Attempts))
-		if _, err := s.q.RecordCheckpointRetentionFailure(ctx, store.RecordCheckpointRetentionFailureParams{
-			RunID: runID, LastError: msg, NextAttemptAt: pgtype.Timestamptz{Time: next, Valid: true}, ExpectedState: retentionSettling,
-		}); err != nil {
-			return fmt.Errorf("record failure (%s): %w", msg, err)
-		}
-		slog.Warn("checkpoint retention: delete deferred", "run", runID, "ref", row.Ref, "attempt", row.Attempts+1, "reason", msg)
-		return nil
-	}
+// retentionForge is the server-derived forge connection a retention forge write uses.
+type retentionForge struct {
+	cloneURL string
+	username string
+	pat      string
+}
 
+// forgeForRetention derives the forge coordinates for a run's retention write SERVER-SIDE,
+// exactly as Publish derives them: GetRunClaimContext, the SSRF gate on BOTH the base URL and
+// the clone host, then box.Open (never from a worker, and never decrypting the PAT for an
+// un-allowlisted host). gone is true when the run, its repo or its forge connection no longer
+// exists, so the write can never be brokered again. Otherwise a non-empty problem is a
+// retryable failure, already safe to persist.
+func (s *Service) forgeForRetention(ctx context.Context, runID uuid.UUID) (f retentionForge, problem string, gone bool) {
 	rc, err := s.q.GetRunClaimContext(ctx, runID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// The run, its repo or its forge connection is gone: the delete can never be
-			// brokered again. Keep the record as an audit row.
-			if _, aerr := s.q.SetCheckpointRetentionAbandoned(ctx, store.SetCheckpointRetentionAbandonedParams{
-				RunID: runID, LastError: "run, repository or forge connection no longer exists", ExpectedState: retentionSettling,
-			}); aerr != nil {
-				return fmt.Errorf("mark abandoned: %w", aerr)
-			}
-			return nil
+			return retentionForge{}, "", true
 		}
-		return fail("claim context: " + secretscrub.Scrub(err.Error()))
+		return retentionForge{}, "claim context: " + secretscrub.Scrub(err.Error()), false
 	}
 	cloneURL := rc.RepoWebUrl + ".git"
-	// Same SSRF gate as Publish, BEFORE decrypting the PAT: never point go-git at an
-	// un-allowlisted host.
 	if !s.forgeBaseURLAllowed(rc.BaseUrl) {
-		return fail("forge base URL is not allowlisted")
+		return retentionForge{}, "forge base URL is not allowlisted", false
 	}
 	cloneHost, err := forgeHostFromURL(cloneURL)
 	if err != nil || !s.forgeBaseURLAllowed(cloneHost) {
-		return fail("clone host is not allowlisted")
+		return retentionForge{}, "clone host is not allowlisted", false
 	}
 	botPAT, err := s.box.Open(rc.TokenCiphertext)
 	if err != nil {
-		return fail("bot PAT could not be decrypted")
+		return retentionForge{}, "bot PAT could not be decrypted", false
+	}
+	return retentionForge{cloneURL: cloneURL, username: rc.BotUsername, pat: string(botPAT)}, "", false
+}
+
+// recordRetentionFailure records a failed (or refused) retention step on the record, guarded on
+// the state the caller acted in: attempts+1, the already-scrubbed msg as last_error, and the
+// next retry pushed out by the exponential backoff. The ref is left as it is.
+func (s *Service) recordRetentionFailure(ctx context.Context, row store.CheckpointRetention, expectedState, msg string) error {
+	next := time.Now().Add(retentionBackoff(row.Attempts))
+	if _, err := s.q.RecordCheckpointRetentionFailure(ctx, store.RecordCheckpointRetentionFailureParams{
+		RunID: row.RunID, LastError: msg, NextAttemptAt: pgtype.Timestamptz{Time: next, Valid: true}, ExpectedState: expectedState,
+	}); err != nil {
+		return fmt.Errorf("record failure (%s): %w", msg, err)
+	}
+	slog.Warn("checkpoint retention: step deferred", "run", row.RunID, "state", expectedState, "ref", row.Ref,
+		"attempt", row.Attempts+1, "reason", msg)
+	return nil
+}
+
+// deleteSettlingRef performs the CAS delete a `settling` record owes, under the run's retention
+// lock, through forgeForRetention's server-derived coordinates. A lost lock (fence error) skips
+// the write and records nothing: whoever holds the lock now owns the record. A failed write is
+// recorded with exponential backoff for the retry pass. done reports that the forge delete
+// returned success (the ref is gone, was already absent, or had advanced past the tip).
+func (s *Service) deleteSettlingRef(ctx context.Context, row store.CheckpointRetention, fence func(context.Context) error) (done bool, err error) {
+	runID := row.RunID
+	f, problem, gone := s.forgeForRetention(ctx, runID)
+	if gone {
+		// The run, its repo or its forge connection is gone: the delete can never be
+		// brokered again. Keep the record as an audit row.
+		if _, aerr := s.q.SetCheckpointRetentionAbandoned(ctx, store.SetCheckpointRetentionAbandonedParams{
+			RunID: runID, LastError: "run, repository or forge connection no longer exists", ExpectedState: retentionSettling,
+		}); aerr != nil {
+			return false, fmt.Errorf("mark abandoned: %w", aerr)
+		}
+		return false, nil
+	}
+	if problem != "" {
+		return false, s.recordRetentionFailure(ctx, row, retentionSettling, problem)
 	}
 
-	if h := s.retentionHooks; h != nil && h.beforeForgeWrite != nil {
-		h.beforeForgeWrite(runID, "delete")
+	if err := s.beforeRetentionWrite(ctx, runID, "delete", fence); err != nil {
+		return false, err
 	}
-	if err := fence(ctx); err != nil {
-		return err
-	}
-	if derr := s.deleteRetainedRef(ctx, cloneURL, rc, string(botPAT), row); derr != nil {
+	if derr := s.deleteRetainedRef(ctx, f, row); derr != nil {
 		// The error is PERSISTED (last_error), so scrub it harder than a log line: the exact PAT
 		// this call used, any URL userinfo (a go-git remote URL can carry the PAT there), then
 		// the known credential shapes.
-		return fail("delete ref: " + scrubForgeError(derr.Error(), string(botPAT)))
+		return false, s.recordRetentionFailure(ctx, row, retentionSettling, "delete ref: "+scrubForgeError(derr.Error(), f.pat))
 	}
 	n, err := s.q.SetCheckpointRetentionDeleted(ctx, store.SetCheckpointRetentionDeletedParams{RunID: runID, Ref: row.Ref, Tip: row.Tip})
 	if err != nil {
-		return fmt.Errorf("mark deleted: %w", err)
+		return true, fmt.Errorf("mark deleted: %w", err)
 	}
 	if n > 0 {
 		slog.Info("checkpoint retention: ref deleted", "run", runID, "ref", row.Ref)
 	}
-	return nil
+	return true, nil
 }
 
-// deleteRetainedRef issues the forge CAS delete of the ref a record names at its recorded tip.
-// pushbroker.Delete treats a ref already absent, or advanced past the tip by another run, as
-// success. M1 records only branch checkpoint refs; a record naming any other ref (a recovery
-// ref, M3) is refused here until the delete is switched to DeleteOptions.Ref.
-func (s *Service) deleteRetainedRef(ctx context.Context, cloneURL string, rc store.GetRunClaimContextRow, pat string, row store.CheckpointRetention) error {
-	if row.Ref != checkpointRefPrefix+row.Branch {
-		return fmt.Errorf("record names %q, not the branch checkpoint ref", row.Ref)
+// deleteRetainedRef issues the forge CAS delete of the ref a record names at its recorded tip,
+// through DeleteOptions.Ref so the same path serves the branch checkpoint ref and the run's
+// recovery ref. pushbroker.Delete treats a ref already absent, or advanced past the tip by
+// another run, as success. A record naming any other ref is refused.
+func (s *Service) deleteRetainedRef(ctx context.Context, f retentionForge, row store.CheckpointRetention) error {
+	isBranch := row.Ref == checkpointRefPrefix+row.Branch
+	isRecovery := row.RecoveryRef.Valid && row.Ref == row.RecoveryRef.String &&
+		row.Ref == pushbroker.RecoveryRefPrefix+row.RunID.String()
+	if !isBranch && !isRecovery {
+		return fmt.Errorf("record names %q, neither the branch checkpoint ref nor the run's recovery ref", row.Ref)
 	}
 	return s.deleteCheckpointFn(ctx, pushbroker.DeleteOptions{
-		CloneURL:       cloneURL,
+		CloneURL:       f.cloneURL,
 		Branch:         row.Branch,
-		Username:       rc.BotUsername,
-		PAT:            pat,
+		Ref:            row.Ref,
+		Username:       f.username,
+		PAT:            f.pat,
 		ExpectedOldTip: row.Tip,
 	})
 }

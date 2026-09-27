@@ -61,6 +61,49 @@ func TestRunRecoveryJSON(t *testing.T) {
 	}
 }
 
+// TestRunRecoveryJSONCheckpointRef (PRD #1810 M3): a hold whose server JSON carries the run's
+// retained checkpoint location (checkpoint_ref/tip/state) round-trips through the DTO into
+// `run recovery --json`, so an agent reads where the work lives on origin (the recovery ref once
+// superseded). A hold without a record omits the keys.
+func TestRunRecoveryJSONCheckpointRef(t *testing.T) {
+	const serverJSON = `{"aggregate":{"open_holds":2,"custody_hold_limit":8,"decision_needed":1,"blocked_runs":0},
+	  "holds":[
+	    {"id":"hold-run1-gen1","run_id":"run1","generation":1,"state":"open","attention":"source_only",
+	     "worker_id":"w1","has_available_capture":false,"created_at":"2026-09-27T10:00:00Z","updated_at":"2026-09-27T10:00:00Z",
+	     "checkpoint_ref":"refs/uzi-recovery/run1","checkpoint_tip":"2222222222222222222222222222222222222222",
+	     "checkpoint_state":"superseded"},
+	    {"id":"hold-run1-gen2","run_id":"run1","generation":2,"state":"open","attention":"active",
+	     "worker_id":"w1","has_available_capture":false,"created_at":"2026-09-27T10:00:00Z","updated_at":"2026-09-27T10:00:00Z"}
+	  ]}`
+	var dto apitypes.RecoveryCustodyHoldsDTO
+	if err := json.Unmarshal([]byte(serverJSON), &dto); err != nil {
+		t.Fatalf("decode server JSON: %v", err)
+	}
+	fc := &uzicli.FakeClient{RecoveryHoldsResult: dto}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", "run1", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	var holds []map[string]any
+	if err := json.Unmarshal([]byte(out), &holds); err != nil {
+		t.Fatalf("run recovery --json is not a hold array: %v\n%s", err, out)
+	}
+	if len(holds) != 2 {
+		t.Fatalf("run recovery --json = %d holds, want 2:\n%s", len(holds), out)
+	}
+	if holds[0]["checkpoint_ref"] != "refs/uzi-recovery/run1" ||
+		holds[0]["checkpoint_tip"] != "2222222222222222222222222222222222222222" ||
+		holds[0]["checkpoint_state"] != "superseded" {
+		t.Errorf("hold 1 checkpoint location = %v/%v/%v, want the recovery ref, its tip and superseded",
+			holds[0]["checkpoint_ref"], holds[0]["checkpoint_tip"], holds[0]["checkpoint_state"])
+	}
+	for _, k := range []string{"checkpoint_ref", "checkpoint_tip", "checkpoint_state"} {
+		if _, ok := holds[1][k]; ok {
+			t.Errorf("hold 2 has no retention record but --json carries %q", k)
+		}
+	}
+}
+
 // TestRunRecoveryEmptyJSON proves --json emits [] (never null) for a run with no holds.
 func TestRunRecoveryEmptyJSON(t *testing.T) {
 	fc := &uzicli.FakeClient{RecoveryHoldsResult: recoveryHoldsFixture()}

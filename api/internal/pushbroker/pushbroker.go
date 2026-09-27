@@ -117,9 +117,12 @@ var (
 	// is not a well-formed git ref name, or (CreateRef) the tip is not a 40-hex non-zero
 	// object id. It is a caller bug, refused before any network I/O.
 	ErrInvalidRef = errors.New("pushbroker: invalid ref")
-	// ErrRefExists means CreateRef found the target ref already present on origin at a
-	// tip other than the one requested (in the list, or as a wire compare-and-swap
-	// refusal of Old = zero). The ref is left untouched.
+	// ErrRefExists means CreateRef found the target ref present on origin at a tip
+	// other than the one requested: in the list before the create, or in the read-back
+	// list after a refused or failed create. It is decided ONLY from an advertisement
+	// that shows the ref at another tip, never from a receive-pack error's wording, so a
+	// refusal for any other reason (a missing object, a pack error) is a wrapped error
+	// and never this sentinel. The ref is left untouched.
 	ErrRefExists = errors.New("pushbroker: ref already exists")
 	// ErrRefExistsAtTip means CreateRef found the target ref already present on origin
 	// at exactly the requested tip: a retry after an earlier create landed. Callers
@@ -398,7 +401,9 @@ type DeleteOptions struct {
 	// Ref, when set, is the FULL name of the ref to delete and replaces
 	// refs/uzi-checkpoints/<Branch>. It must lie under refs/uzi-checkpoints/ or
 	// refs/uzi-recovery/ and be a well-formed ref name, else Delete returns
-	// ErrInvalidRef before any network I/O. Empty keeps the branch-derived name.
+	// ErrInvalidRef before any network I/O. Empty keeps the branch-derived name. A
+	// recovery ref is only ever CAS-deleted: Ref under refs/uzi-recovery/ with an empty
+	// ExpectedOldTip is ErrInvalidRef.
 	Ref string
 	// ExpectedOldTip is the tip this run last published to its checkpoint ref (the
 	// persisted runs.checkpoint_tip). When set, Delete takes a compare-and-swap path:
@@ -406,7 +411,8 @@ type DeleteOptions struct {
 	// CAS refusal (the ref advanced since our last publish, or is already absent) as
 	// benign success — so a terminal cleanup can never clobber a SIBLING run's fresh
 	// checkpoint on the same branch. When empty, Delete preserves its legacy
-	// UNCONDITIONAL list-then-delete behaviour (backward-compatible; see Delete).
+	// UNCONDITIONAL list-then-delete behaviour (backward-compatible; see Delete). When
+	// set it must be a lowercase 40-hex non-zero object id, else ErrInvalidRef.
 	ExpectedOldTip string
 }
 
@@ -456,7 +462,15 @@ func Delete(ctx context.Context, o DeleteOptions) error {
 		if !validRefUnder(o.Ref, checkpointRefPrefix) && !validRefUnder(o.Ref, RecoveryRefPrefix) {
 			return ErrInvalidRef
 		}
+		// A recovery ref preserves a superseded run's only off-worker copy: it is only
+		// ever removed compare-and-swap on its recorded tip, never unconditionally.
+		if o.ExpectedOldTip == "" && strings.HasPrefix(o.Ref, RecoveryRefPrefix) {
+			return ErrInvalidRef
+		}
 		ref = o.Ref
+	}
+	if o.ExpectedOldTip != "" && (!isObjectID(o.ExpectedOldTip) || plumbing.NewHash(o.ExpectedOldTip).IsZero()) {
+		return ErrInvalidRef
 	}
 	refName := plumbing.ReferenceName(ref)
 
@@ -502,7 +516,7 @@ func Delete(ctx context.Context, o DeleteOptions) error {
 	if err == nil || errors.Is(err, git.NoErrAlreadyUpToDate) {
 		return nil
 	}
-	return fmt.Errorf("pushbroker: delete checkpoint ref: %w", err)
+	return fmt.Errorf("pushbroker: delete ref: %w", err)
 }
 
 // casDelete removes refName from origin ONLY if origin still points it at expectedOld
@@ -590,7 +604,7 @@ func casDelete(ctx context.Context, remote *git.Remote, auth transport.AuthMetho
 	case isCASDeleteRefusal(err):
 		return nil // ref moved out from under our Old in the list→delete window — benign
 	default:
-		return fmt.Errorf("pushbroker: cas delete checkpoint ref: %w", err)
+		return fmt.Errorf("pushbroker: cas delete ref: %w", err)
 	}
 }
 
@@ -619,8 +633,15 @@ type CreateRefOptions struct {
 //     unproven.
 //   - It then sends ONE receive-pack command, Old = zero hash, New = o.Tip, with a
 //     zero-object pack. Old = zero is a compare-and-swap: the remote refuses the
-//     create if the ref appeared after the list, which maps to ErrRefExists. The
-//     remote's own connectivity check is the second guard on the tip's presence.
+//     create if the ref appeared after the list. The remote's own connectivity check
+//     is the second guard on the tip's presence.
+//   - Whatever the receive-pack outcome, it LISTS origin again and decides from what
+//     origin now advertises (createOutcome): o.Ref at o.Tip is success (nil after an
+//     accepted create, ErrRefExistsAtTip after a refused or failed one, e.g. a racer
+//     created the same tip or the response was lost); at another tip ErrRefExists;
+//     absent a wrapped error. An accepted create is therefore nil only when the
+//     read-back proves it, and a receive-pack refusal is never mapped to
+//     ErrRefExists from its message text alone.
 //
 // The pack is required, not decorative: git receive-pack reads a pack for every
 // non-delete command, and a create with none is refused ("eof before pack header",
@@ -675,12 +696,20 @@ func createRefWithPack(ctx context.Context, o CreateRefOptions, pack []byte) err
 	if source != tip {
 		return ErrSourceMissing
 	}
-	return pushCreate(ctx, remote, auth, refName, tip, pack)
+	return pushCreateVerified(ctx, remote, auth, refName, tip, pack)
 }
 
-// pushCreate sends the create command through a manual receive-pack session and
-// classifies the outcome: nil on success, ErrRefExists when the remote's Old = zero
-// compare-and-swap refused it, a wrapped error otherwise.
+// pushCreateVerified sends the create command, then re-lists origin and classifies the
+// outcome from the read-back (createOutcome).
+func pushCreateVerified(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, ref plumbing.ReferenceName, tip plumbing.Hash, pack []byte) error {
+	pushErr := pushCreate(ctx, remote, auth, ref, tip, pack)
+	current, present, listErr := listRefTip(ctx, remote, auth, ref)
+	return createOutcome(pushErr, current, present, listErr, tip)
+}
+
+// pushCreate sends the create command through a manual receive-pack session and returns
+// the raw outcome, wrapped: nil when the remote reported success. It does not classify;
+// createOutcome does, from the read-back.
 func pushCreate(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, ref plumbing.ReferenceName, tip plumbing.Hash, pack []byte) error {
 	sess, ar, err := openReceivePack(ctx, remote, auth)
 	if err != nil {
@@ -688,15 +717,102 @@ func pushCreate(ctx context.Context, remote *git.Remote, auth transport.AuthMeth
 	}
 	defer func() { _ = sess.Close() }()
 
-	_, err = sess.ReceivePack(ctx, createRefRequest(ar.Capabilities, ref, tip, pack))
-	switch {
-	case err == nil:
-		return nil
-	case isRefExistsRefusal(err):
-		return ErrRefExists
-	default:
+	if _, err := sess.ReceivePack(ctx, createRefRequest(ar.Capabilities, ref, tip, pack)); err != nil {
 		return fmt.Errorf("pushbroker: create ref: %w", err)
 	}
+	return nil
+}
+
+// listRefTip lists origin and returns where it advertises ref (present false when it does
+// not, including an empty origin).
+func listRefTip(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, ref plumbing.ReferenceName) (plumbing.Hash, bool, error) {
+	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: auth})
+	if err != nil {
+		if errors.Is(err, transport.ErrEmptyRemoteRepository) {
+			return plumbing.ZeroHash, false, nil
+		}
+		return plumbing.ZeroHash, false, fmt.Errorf("pushbroker: list: %w", err)
+	}
+	for _, r := range advertised {
+		if r.Name() == ref {
+			return r.Hash(), true, nil
+		}
+	}
+	return plumbing.ZeroHash, false, nil
+}
+
+// createOutcome classifies a create from its receive-pack result (pushErr) and the
+// read-back list that followed it (current/present, or listErr):
+//
+//   - read-back failed: the outcome is unknown, so a wrapped error (never a sentinel);
+//   - ref at tip: nil when the create was accepted, ErrRefExistsAtTip when it was
+//     refused or failed (someone, or a lost response of ours, put exactly our tip
+//     there). Both are success to callers;
+//   - ref at another tip: ErrRefExists;
+//   - ref absent: a wrapped error. An accepted create the read-back cannot see is an
+//     error too, never a silent success.
+func createOutcome(pushErr error, current plumbing.Hash, present bool, listErr error, tip plumbing.Hash) error {
+	switch {
+	case listErr != nil:
+		if pushErr != nil {
+			return fmt.Errorf("%w (read-back failed: %v)", pushErr, listErr)
+		}
+		return fmt.Errorf("pushbroker: create ref read-back: %w", listErr)
+	case present && current == tip:
+		if pushErr != nil {
+			return ErrRefExistsAtTip
+		}
+		return nil
+	case present:
+		return ErrRefExists
+	case pushErr != nil:
+		return pushErr
+	default:
+		return errors.New("pushbroker: create ref reported success but origin does not advertise the ref")
+	}
+}
+
+// ListRefsOptions names the forge connection ListRefTips lists. Server-derived by the
+// caller, like DeleteOptions.
+type ListRefsOptions struct {
+	CloneURL string
+	Username string
+	PAT      string
+}
+
+// ListRefTips lists origin once and returns the tips of those of refs it advertises
+// (an absent ref has no key; an empty origin yields an empty map). Every ref must lie
+// under refs/uzi-checkpoints/ or refs/uzi-recovery/, else ErrInvalidRef before any
+// network I/O. A read, never a write: a caller uses it to tell the reasons CreateRef
+// reported ErrSourceMissing apart.
+func ListRefTips(ctx context.Context, o ListRefsOptions, refs ...string) (map[string]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, maxDeleteDuration)
+	defer cancel()
+	want := make(map[plumbing.ReferenceName]bool, len(refs))
+	for _, r := range refs {
+		if !validRefUnder(r, checkpointRefPrefix) && !validRefUnder(r, RecoveryRefPrefix) {
+			return nil, ErrInvalidRef
+		}
+		want[plumbing.ReferenceName(r)] = true
+	}
+	remote, err := newOriginRemote(o.CloneURL)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(refs))
+	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: authFor(Options{Username: o.Username, PAT: o.PAT})})
+	if err != nil {
+		if errors.Is(err, transport.ErrEmptyRemoteRepository) {
+			return out, nil
+		}
+		return nil, fmt.Errorf("pushbroker: list: %w", err)
+	}
+	for _, r := range advertised {
+		if want[r.Name()] {
+			out[r.Name().String()] = r.Hash().String()
+		}
+	}
+	return out, nil
 }
 
 // createRefRequest builds the single-command create: Old is ALWAYS the zero hash (the
@@ -1235,22 +1351,6 @@ func isCASDeleteRefusal(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "does not exist") ||
 		strings.Contains(msg, "no such ref")
-}
-
-// isRefExistsRefusal matches a receive-pack report-status that refused CreateRef's
-// Old = zero create because the ref now exists on origin. It reuses isNonFastForward's
-// compare-and-swap / lock-failure forms and adds the "already exists" and "failed to
-// lock" wordings a create-over-existing refusal takes across git versions.
-func isRefExistsRefusal(err error) bool {
-	if err == nil {
-		return false
-	}
-	if isNonFastForward(err) {
-		return true
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "already exists") ||
-		strings.Contains(msg, "failed to lock")
 }
 
 // isWorkflowScopeRejection matches GitHub's remote rejection of a push whose

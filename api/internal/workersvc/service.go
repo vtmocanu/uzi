@@ -561,6 +561,15 @@ type Store interface {
 	SetCheckpointRetentionDeleted(ctx context.Context, arg store.SetCheckpointRetentionDeletedParams) (int64, error)
 	RecordCheckpointRetentionFailure(ctx context.Context, arg store.RecordCheckpointRetentionFailureParams) (int64, error)
 	SetCheckpointRetentionAbandoned(ctx context.Context, arg store.SetCheckpointRetentionAbandonedParams) (int64, error)
+	// PRD #1810 M3 supersession (D2): the branch-slot lookup, the persisted intent, the final
+	// superseded/settling transition, the tip-gone close, the publish-time tip advance, and the
+	// reconciler's candidate page.
+	ListCheckpointRetentionsForBranch(ctx context.Context, arg store.ListCheckpointRetentionsForBranchParams) ([]store.CheckpointRetention, error)
+	BeginCheckpointSupersession(ctx context.Context, arg store.BeginCheckpointSupersessionParams) (int64, error)
+	MarkCheckpointSuperseded(ctx context.Context, runID uuid.UUID) (string, error)
+	SetCheckpointSupersessionTipGone(ctx context.Context, arg store.SetCheckpointSupersessionTipGoneParams) (int64, error)
+	AdvanceCheckpointRetentionTip(ctx context.Context, arg store.AdvanceCheckpointRetentionTipParams) (int64, error)
+	ListCheckpointRetentionWork(ctx context.Context, arg store.ListCheckpointRetentionWorkParams) ([]store.CheckpointRetention, error)
 	// Issue #1582 M1: the predecessor-settle pair. GetCustodyHoldForSettle reads the exact hold
 	// (scoped to its run); ReleasePredecessorCustodyHoldByAncestry is the single guarded
 	// statement that releases that one older-generation hold with 'ancestry' evidence after the
@@ -1695,6 +1704,13 @@ type Service struct {
 	// error-injected) without a real forge. Same seam discipline as publishFn:
 	// pushbroker stays the ONE place go-git lives.
 	deleteCheckpointFn func(ctx context.Context, o pushbroker.DeleteOptions) error
+	// createRefFn is the go-git recovery-ref CREATOR (PRD #1810 M3, D2): supersession preserves
+	// a retained checkpoint tip under refs/uzi-recovery/<run id> before freeing the branch ref.
+	// Defaults to pushbroker.CreateRef (set in New); tests stub it with an in-memory forge.
+	createRefFn func(ctx context.Context, o pushbroker.CreateRefOptions) error
+	// listRefTipsFn is the go-git ref LISTER supersession uses to tell apart why a create found
+	// its source missing (PRD #1810 M3). Defaults to pushbroker.ListRefTips (set in New).
+	listRefTipsFn func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)
 	// background dispatches a best-effort forge side-effect off the request/report
 	// goroutine so a slow/down forge can never delay or wedge the caller (PRD #1030
 	// M4's checkpoint delete). Defaults to `go fn()` (set in New); tests override it
@@ -1860,6 +1876,18 @@ func (s *Service) SetDeleteCheckpointFn(fn func(ctx context.Context, o pushbroke
 	s.deleteCheckpointFn = fn
 }
 
+// SetCreateRefFn overrides the go-git recovery-ref creator (PRD #1810 M3). Production leaves
+// the pushbroker.CreateRef default New installs; tests stub it with an in-memory forge.
+func (s *Service) SetCreateRefFn(fn func(ctx context.Context, o pushbroker.CreateRefOptions) error) {
+	s.createRefFn = fn
+}
+
+// SetListRefTipsFn overrides the go-git ref lister supersession uses (PRD #1810 M3).
+// Production leaves the pushbroker.ListRefTips default New installs.
+func (s *Service) SetListRefTipsFn(fn func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)) {
+	s.listRefTipsFn = fn
+}
+
 // SetBackground overrides the best-effort side-effect dispatcher (PRD #1030 M4).
 // Production leaves the `go fn()` default New installs; tests set a synchronous
 // runner so the async checkpoint delete is observed deterministically.
@@ -1930,6 +1958,8 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), outbox: newOutboxTracker(),
 		publishFn:          pushbroker.Publish,
 		deleteCheckpointFn: pushbroker.Delete,
+		createRefFn:        pushbroker.CreateRef,
+		listRefTipsFn:      pushbroker.ListRefTips,
 		background:         func(fn func()) { go fn() },
 		retentionSem:       make(chan struct{}, retentionDefaultConc),
 	}
@@ -5106,7 +5136,7 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	// The broker's Result.Ref equals the ref computed above; the service returns its
 	// own derived ref (never a value shaped by the worker's input), so the Result is
 	// consulted only for the error.
-	_, err = s.publishFn(ctx, pushbroker.Options{
+	opts := pushbroker.Options{
 		CloneURL:      cloneURL,
 		BaseURL:       rc.BaseUrl,
 		Branch:        branch,
@@ -5115,19 +5145,39 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		PAT:           string(botPAT),
 		DeclaredTip:   tipOid,
 		Pack:          pack,
-	})
+	}
+	_, err = s.publishFn(ctx, opts)
+	// PRD #1810 D2: a not_descendant refusal may be a RETAINED checkpoint of an older run on
+	// this branch holding the slot. freeCheckpointSlot supersedes it (moving its tip to
+	// refs/uzi-recovery/<old run id>, never deleting it) and reports whether the branch ref is
+	// now free; only then is the publish retried, ONCE, with the same options (Pack is a
+	// re-readable []byte). The retry's outcome is mapped exactly like the first attempt's.
+	if errors.Is(err, pushbroker.ErrNotDescendant) && s.freeCheckpointSlot(ctx, owned, branch) {
+		_, err = s.publishFn(ctx, opts)
+	}
 	switch {
 	case err == nil:
 		// The CAS-accepted advance is the ONLY arm that persists the tip: it runs on
 		// EVERY successful publish (mid-run/park/shutdown all route through here), so
-		// runs.checkpoint_tip tracks the just-published tip and the terminal CAS-delete's
-		// stale-tip fallback stays diagnosable. Persist is best-effort — a failure must
-		// NOT fail the publish, since the ref is already advanced on the forge.
+		// runs.checkpoint_tip tracks the just-published tip, which is the tip the
+		// terminal-time retention record (checkpoint_retentions.tip) binds its CAS writes
+		// to. Persist is best-effort — a failure must NOT fail the publish, since the ref
+		// is already advanced on the forge.
 		if _, perr := s.q.SetRunCheckpointTip(ctx, store.SetRunCheckpointTipParams{
 			CheckpointTip: pgtype.Text{String: tipOid, Valid: true},
 			ID:            runID,
 		}); perr != nil {
 			slog.Warn("checkpoint: persist tip", "run", runID, "tip", tipOid, "error", perr)
+		}
+		// Tip lag (PRD #1810): a record of THIS run still naming the branch ref (retained or
+		// settling) follows the ref to the tip just published, so its later CAS delete or
+		// supersession binds to what origin holds. Best-effort like the persist above.
+		if s.retentionWired() {
+			if _, aerr := s.q.AdvanceCheckpointRetentionTip(ctx, store.AdvanceCheckpointRetentionTipParams{
+				RunID: runID, Ref: ref, Tip: tipOid,
+			}); aerr != nil {
+				slog.Warn("checkpoint retention: advance tip", "run", runID, "tip", tipOid, "error", aerr)
+			}
 		}
 		return PublishResult{Published: true, Ref: ref}, nil
 	case errors.Is(err, pushbroker.ErrNotDescendant):
@@ -6439,6 +6489,10 @@ type SweepResult struct {
 	// normal reap can then delete the worker. Normally 0: the candidate query reads only
 	// stuck holds, a set that is empty on a healthy instance.
 	CustodyReleased int64
+	// CheckpointRetentionsReconciled is the number of checkpoint_retentions records this pass
+	// drove to completion (PRD #1810): M3 re-drives interrupted `superseding` records. Normally
+	// 0: a supersession finishes on the publish that triggered it.
+	CheckpointRetentionsReconciled int64
 	// RecoveryStalled is the number of durable-archive captures this pass flipped from a
 	// non-terminal upload state (preparing/uploading) to needs_action because they sat past
 	// the UZI_RECOVERY_UPLOAD_RETRY_WINDOW (PRD #1296 D3/D4). The custody hold is NOT released

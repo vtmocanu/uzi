@@ -116,23 +116,60 @@ WHERE run_id = @run_id
   AND state = 'retained'
   AND tip = @tip::text;
 
--- name: MarkCheckpointSuperseded :execrows
+-- name: MarkCheckpointSuperseded :one
 -- D2 step 4 (M3): superseding -> superseded once the recovery ref exists at the tip and the
--- branch ref is gone; from here `ref` names the recovery ref, which settlement deletes.
+-- branch ref is gone; from here `ref` names the recovery ref, which settlement deletes. In the
+-- SAME statement (so no window between the two), a run with NO open custody hold goes straight
+-- to settling: its recovery ref is owed a CAS delete now, not after a later settle trigger.
+-- Returns the state written; no row when the record was not superseding.
 UPDATE checkpoint_retentions
-SET state = 'superseded',
+SET state = CASE
+        WHEN EXISTS (
+            SELECT 1 FROM recovery_custody_holds h
+            WHERE h.run_id = checkpoint_retentions.run_id AND h.state = 'open'
+        ) THEN 'superseded'
+        ELSE 'settling'
+    END,
     ref = recovery_ref,
     attempts = 0,
     last_error = NULL,
     next_attempt_at = now(),
     updated_at = now()
+WHERE checkpoint_retentions.run_id = @run_id
+  AND checkpoint_retentions.state = 'superseding'
+  AND checkpoint_retentions.recovery_ref IS NOT NULL
+RETURNING checkpoint_retentions.state;
+
+-- name: SetCheckpointSupersessionTipGone :execrows
+-- D2 (M3): superseding -> deleted when origin holds the recorded tip under NEITHER the branch
+-- ref nor the recovery ref (checked by listing both after CreateRef reported the source
+-- missing). Nothing uzi owns references the tip any more, so there is nothing to preserve or
+-- delete; the note is kept in last_error for audit.
+UPDATE checkpoint_retentions
+SET state = 'deleted',
+    last_error = @last_error::text,
+    settled_at = now(),
+    updated_at = now()
 WHERE run_id = @run_id
-  AND state = 'superseding'
-  AND recovery_ref IS NOT NULL;
+  AND state = 'superseding';
+
+-- name: AdvanceCheckpointRetentionTip :execrows
+-- Tip lag (M3): a successful publish by a run that already has a record (the checkpoint_tip
+-- persisted at its terminal transition lags a later publish) moves a record that still names
+-- the branch ref to the tip just published, so a later CAS delete or supersession binds to
+-- the tip origin actually holds. Only retained/settling records naming exactly that ref move;
+-- a superseding/superseded record has already bound its recovery ref to its recorded tip.
+UPDATE checkpoint_retentions
+SET tip = @tip::text,
+    updated_at = now()
+WHERE run_id = @run_id
+  AND ref = @ref::text
+  AND state IN ('retained', 'settling');
 
 -- name: ListCheckpointRetentionsForBranch :many
 -- D2 (M3): the OTHER runs' active records still holding a branch's checkpoint slot (`ref` is the
--- branch ref), due for work now.
+-- branch ref), due for work now, newest first: the most recent terminal run is the likeliest
+-- to own the tip origin currently advertises. Bounded: a branch holds one slot.
 SELECT * FROM checkpoint_retentions
 WHERE repo_id = @repo_id
   AND branch = @branch::text
@@ -140,12 +177,16 @@ WHERE repo_id = @repo_id
   AND ref = @ref::text
   AND state IN ('retained', 'superseding', 'settling')
   AND next_attempt_at <= now()
-ORDER BY created_at, run_id;
+ORDER BY created_at DESC, run_id
+LIMIT 10;
 
 -- name: ListCheckpointRetentionWork :many
--- M4: the reconciliation sweeper's candidates, oldest-due first, bounded.
+-- The reconciliation sweeper's candidates in the given states, oldest-due first, bounded.
+-- The caller names the states its arms handle (M3: superseding; M4 adds the rest), so rows no
+-- arm acts on never crowd the bounded page.
 SELECT * FROM checkpoint_retentions
-WHERE state IN ('superseding', 'settling', 'retained', 'superseded')
+WHERE state = ANY(@states::text[])
+  AND state IN ('superseding', 'settling', 'retained', 'superseded')
   AND next_attempt_at <= now()
 ORDER BY next_attempt_at, run_id
 LIMIT @max_rows::int;

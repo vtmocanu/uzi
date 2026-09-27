@@ -17,12 +17,12 @@ var CreateRefWithPack = createRefWithPack
 var EmptyPack = emptyPack
 
 // PushCreateSkippingList sends CreateRef's wire command (Old = zero) WITHOUT the
-// list-time checks, so a test can reach the remote's own compare-and-swap and
-// connectivity refusals.
+// list-time checks, then classifies it exactly as CreateRef does (the read-back), so a
+// test can reach the remote's own compare-and-swap and connectivity refusals.
 func PushCreateSkippingList(ctx context.Context, cloneURL, ref, tip string, pack []byte) error {
 	remote, err := newOriginRemote(cloneURL)
 	if err != nil {
 		return err
 	}
-	return pushCreate(ctx, remote, nil, plumbing.ReferenceName(ref), plumbing.NewHash(tip), pack)
+	return pushCreateVerified(ctx, remote, nil, plumbing.ReferenceName(ref), plumbing.NewHash(tip), pack)
 }
