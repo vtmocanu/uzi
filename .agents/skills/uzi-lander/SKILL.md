@@ -67,6 +67,33 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   detached worktree at the exact head it certifies, never in the `land-prep.sh` worktree:
   land-prep rebases that tree in place, so a check still running there tests a mixed tree.
 
+## Buddy
+
+A buddy is the peer bound with the `session-peers` skill (`buddy: @NAME`). It is
+this lander's second pair of eyes.
+
+- **On entry run `peers.py buddy`.** None bound → ask the user once: name a buddy
+  or authorize solo. Without either, keep preparing (poll, review, fix, rebase) but
+  stop before the merge and report the missing requirement once.
+- **Bound but unavailable** (not live, no route, or no verdict after two requests)
+  → ask for a replacement or solo authorization. Never downgrade silently.
+- **Solo waives only the buddy**, never independent review, CI or a user review.
+- Prefer a cross-family buddy (Claude with Codex); name a same-family one in the trail.
+- **One request per pushed head.** The buddy reviews the exact head SHA; reuse its
+  verdict until the head moves. For a user-authorized multi-round loop run
+  `peers.py budget allow buddy --replies N` once, not a reset per round.
+- The buddy's `APPROVE` is required where this skill says so below. It never
+  replaces a user approval.
+
+| Lane | Required exact-head reviews |
+|---|---|
+| Small/mechanical non-Renovate PR | the buddy (the initial local reviewer) |
+| After a local fix | the buddy plus CodeRabbit (Greptile when CR is rate-limited) |
+| Bot rate-limited, skipped or absent | the buddy |
+| Skill or script maintenance (`[skip-cr]`) | the buddy plus the user |
+| Bot approved this head, no local fix since | none extra |
+| Renovate, assessed CI-sufficient | none extra; a Renovate PR assessed as needing review follows the rows above |
+
 ## Entry: the snapshot
 
 ```
@@ -107,8 +134,8 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
 2. **Choose the review lane, then wait for readiness.** For a Renovate-class PR, inspect
    the effective diff against the current base and decide whether review is needed. If not,
    state why and use `--reviewer none`; green CI is the independent signal. If review adds
-   value, use one local reviewer by default or a user-approved bot. For other
-   small/mechanical PRs, dispatch one local reviewer on the immutable head and run the
+   value, use the buddy by default or a user-approved bot. For other
+   small/mechanical PRs, send the immutable head to the buddy (*Buddy*) and run the
    waiter with `--reviewer none` in parallel; both must finish clean. For large/high-risk
    PRs, select CodeRabbit or Greptile and let an auto-review already in progress finish.
 
@@ -188,8 +215,7 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    - **small / quick** (localized, no design change): fix locally by default, one push per
      PR via `S/land-prep.sh OWNER/REPO PR` (it re-checks the rework lane and pushes with a
      lease), trail `fix local → pushed`. Before merging, require two clean reviews of that
-     exact SHA: a live Codex lander peer found via session-peers (`peers.py list`; a peer
-     listed `not registered` needs `peers.py up <uuid>` or its reply cannot route back), plus
+     exact SHA: the buddy (`peers.py buddy ping` restores a lost reply route) plus
      CodeRabbit (Greptile when CR is rate-limited). Skill-maintenance `[skip-cr]` PRs keep
      their own rule below;
    - **big** (design-level, many files, needs the plan's context): `uzi run rework RUN -m
@@ -298,8 +324,8 @@ and they precede every merge (step 6):
   failure evidence (same step, same error, same logs), not a similar symptom. Checks that
   failure blocks are still unvalidated for this PR: say which and get the user's call before
   merging. File the regression with both results; add `uzi` only once it is sweep-ready.
-- **Pin every local review to the immutable head.** One focused local reviewer is the
-  default for small/mechanical non-Renovate diffs. For Renovate-class work, record the
+- **Pin every local review to the immutable head.** The buddy is the default reviewer
+  for small/mechanical non-Renovate diffs. For Renovate-class work, record the
   explicit review-needed or CI-sufficient decision. Large/high-risk diffs use the stronger
   bot lane, briefed with the plan's invariants; add a bespoke specialist only when the risk
   class needs one.
@@ -355,11 +381,11 @@ Branch on the poller's own `EXIT=`/`RESULT=` line, never on the harness's task s
   end-of-session ask** ("these three improvements to `uzi-lander`, ok?"), not applied
   silently.
 - A skill-maintenance PR is titled with `[skip-cr]` (no bot review), reviewed by a local
-  agent or a peer session, and by the user. Re-run `agnix` on `SKILL.md` after editing;
-  `task check:skill-size` gates the size. A Codex peer's shim delivers at most three
-  consecutive replies per 30 minutes; before a fourth consecutive review reply run
-  `peers.py budget reset <peer>` (session-peers skill), otherwise the verdict is held
-  (the shim log names it).
+  the buddy, and by the user. Re-run `agnix` on `SKILL.md` after editing;
+  `task check:skill-size` gates the size. A Codex buddy's shim delivers at most three
+  consecutive replies per 30 minutes; for a longer review loop run
+  `peers.py budget allow buddy --replies N` (session-peers skill), otherwise the
+  verdict is held (the shim log names it).
 
 ## Files
 
