@@ -1,7 +1,7 @@
 # PRD #1732: Disable and re-enable account credentials
 
 **Issue**: [#1732](https://github.com/vtmocanu/uzi/issues/1732)
-**Status**: Planned
+**Status**: Complete (2026-09-27)
 **Priority**: Medium
 **Owner**: uzi run (Codex harness), plan steered by the maintainer's session and a Codex peer
 
@@ -87,7 +87,7 @@ A reversible, per-credential **Disable / Enable** action on the Settings page. D
 - **Owner reads**: `GET /api/me/rate-limits` (`ratelimits.go:46`) and `GET /api/me/codex-rate-limits` (`codex_ratelimits.go:58`) omit disabled credentials; `GET /api/me/secrets` (`secrets.go:82`) keeps listing them with `enabled:false`.
 - **Sidebar settings validation** (`user_settings.go:663`, `:724`) keeps accepting disabled ids in the stored arrays (D8); effective display filters them.
 - **Web mock mode** (`.claude/rules/web.md`) needs fixtures for a disabled token, a slot with no default, a disabled Codex alias with an enabled sibling, and a run held on `credential_disabled`.
-- **Migration**: draft number `00255`, landed as `00256` after the base took `00255` (renumbered at merge time per CLAUDE.md). It adds `disabled_at` and `enablement_rev` to `user_secrets`, the `credential_disabled` hold reason (extend the `hold_reason` check constraint if one exists), and an index serving the promoter's worklist. Park, promote and fenced-upsert queries are new sqlc queries.
+- **Migration**: draft number `00255`, renumbered to `00256` on the branch because the base took `00255` (renumber again at landing if `main` moves, per CLAUDE.md). It adds `disabled_at` and `enablement_rev` to `user_secrets`, the `credential_disabled` hold reason (extend the `hold_reason` check constraint if one exists), and an index serving the promoter's worklist. Park, promote and fenced-upsert queries are new sqlc queries.
 
 Implementation and validation need no external documentation or network access beyond the repository; every fact above comes from the codebase.
 
@@ -112,6 +112,7 @@ One gated run; the milestones are sequential, never parallel writers. Each miles
 - [x] **M4. Read surfaces.** Owner and admin rate-limit endpoints omit disabled credentials (admin: no row, no count, D9); Codex account labels use enabled aliases only; `ListMySecrets` includes them with `enabled:false`; usage and cost history unchanged. Tests: owner and admin responses exclude disabled credentials; history totals identical before and after a disable. `task gate:api`.
 - [x] **M5. Web.** Settings cards (Anthropic and Codex): Disable action, the dialog with the dependents list, the required replacement-default choice (or the no-default consequence) and the Codex sibling note; the collapsed-by-default Disabled (n) section with remembered expansion; "Disabled since"; the no-default notice and Enable-and-make-default; Enable with "checking usage…". Sidebar and "+N more" exclude disabled. Pickers omit them with the "N disabled not listed" footer. Run and schedule views show `credential_disabled` with Enable, plus change-token only where D16 allows. Admin Rate limits needs no UI change beyond the API filter; verify it. Mock-mode fixtures. Real `<button>`s, focusable, `aria-expanded` on the section toggle. Tests: section collapsed by default; a disabled card leaves the sidebar; disabling the default cannot be confirmed without a replacement when one exists; the no-default notice renders with the section collapsed; pickers omit disabled entries; no reassignment action on chat/Judge/self-improve. `task gate:web`.
 - [x] **M6. CLI read parity, docs, integration.** D12 read-only parity (`token list` STATE and JSON fields, `run get` / TUI hold reason, `schedule get` skip reason); refusal messages name Settings. Update the user doc covering tokens and credentials (find it with `git grep -n -i 'anthropic token' docs/`) and run `task docs:sync`; CHANGELOG `[Unreleased]` line. Run the full suite. `task gate:api`, `task gate:web` and `task gate:repo` green.
+  - Gate exception, applying to every milestone gated on `task gate:api`: on the run's worker, `gate:api` was green except two `pushbroker` redirect tests that need `git-http-backend` (absent there; package untouched), and `gate:repo` was green except `test:uzi-lander` (untouched skill script), with every other `gate:repo` target run individually. Both were filed as incidental findings; see the Decision Log.
 
 ## Success criteria
 
