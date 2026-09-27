@@ -327,7 +327,14 @@ async function runFinalizeImportPart(
   const guardMessage = guardThrew instanceof Error ? guardThrew.message : String(guardThrew);
   console.log(`OBSERVATION: GUARD INTACT (not asserted): hasLiveCommandRoot() inside the action=${guardHadLiveCommandRootInAction} `
     + `worker_pat threw=${guardThrew !== undefined} (${guardMessage})`);
-  await sleeping.catch(() => undefined);
+  // The boundary reaped (disposed) that command root, and its spawn promise is not guaranteed to
+  // settle afterwards. Awaiting it unbounded let the event loop drain with main() still pending,
+  // so node exited 0 before the rest of the fixture ran (issue #1769 acceptance). Bound it.
+  const sleepSettled = await Promise.race([
+    sleeping.then(() => true, () => true),
+    new Promise<boolean>((resolve) => { const t = setTimeout(() => resolve(false), 25_000); t.unref(); }),
+  ]);
+  console.log(`OBSERVATION: GUARD INTACT: the reaped command root's spawn promise settled=${sleepSettled}`);
 }
 
 /** A deterministic, well-formed-looking 40-hex object id that is guaranteed absent from the
@@ -800,4 +807,13 @@ async function main(): Promise<void> {
     console.log(`RESULT: ${label} PASS`);
   }
 }
-main().catch((error: unknown) => { console.error(error); process.exitCode = 1; });
+// A fixture that ends before main() finishes (the event loop drained on a promise that never
+// settles) must never read as a pass: without this, node exits 0 with no RESULT line.
+let mainCompleted = false;
+process.on("exit", () => {
+  if (!mainCompleted) {
+    console.log("RESULT: FAIL — the fixture ended before main() completed (a pending promise never settled)");
+    process.exitCode = 1;
+  }
+});
+main().then(() => { mainCompleted = true; }, (error: unknown) => { console.error(error); process.exitCode = 1; mainCompleted = true; });
