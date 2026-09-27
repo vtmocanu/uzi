@@ -643,8 +643,12 @@ func TestSanitizePrDescriptionSecretsSplitByInlineMarkdown(t *testing.T) {
 		gl + a10 + "{+" + "KLMNOPQRST" + "+}",
 		gl + a10 + "[+" + "KLMNOPQRST" + "+]",
 		gl + a10 + "{-" + "KLMNOPQRST" + "-}",
+		gl + a10 + "[-" + "KLMNOPQRST" + "-]",
 		gl + a10 + "$" + "KLMNOPQRST",
 		"sk-" + "ant-" + a10 + "{+" + "KLMNOPQRST" + "+}",
+		// Boundary-underscore emphasis combined with a GitLab marker (the fifth view).
+		"_glpat_" + "-" + a10 + "{+" + "KLMNOPQRST" + "+}",
+		"_glpat_" + "-" + a10 + "$" + "KLMNOPQRST",
 	} {
 		if got := SanitizePrDescriptionText("token "+in+" leaked", 600); got != want {
 			t.Errorf("GitLab inline-diff split %q = %q, want %q", in, got, want)
