@@ -156,8 +156,10 @@ skip (77). The fixture container is removed by a time-bounded
 then verified by exact name. An INT or TERM sent only to the script's PID
 does not interrupt the foreground `timeout … docker run`: bash runs the trap
 after that command returns, so cleanup can wait up to
-`CODEX_GIT_TRUST_TIMEOUT` plus the kill grace. A process-group signal (Ctrl-C
-in a terminal) also reaches `docker run` directly, so it returns promptly. A removal that cannot be verified turns a pass
+`CODEX_GIT_TRUST_TIMEOUT` plus the kill grace. The run uses
+`timeout --foreground`, which keeps `docker run` in the script's process
+group, so a process-group signal (Ctrl-C in a terminal) reaches it directly
+and it returns promptly. A removal that cannot be verified turns a pass
 or a skip into a failure (exit 3), because a backgrounded container that
 outlived an earlier run left root-owned directories in a clone. The image
 build opts in to `--network host` only when

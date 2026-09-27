@@ -135,13 +135,16 @@ case "$action" in
     # INT/TERM: exit with the matching status; the EXIT trap then removes the container.
     # bash runs these traps only after the foreground `timeout ... docker run` returns, so a
     # signal sent to this script's PID alone waits up to CODEX_GIT_TRUST_TIMEOUT plus the
-    # kill grace before cleanup starts. A process-group signal (Ctrl-C) also reaches
-    # docker run directly, which then returns promptly.
+    # kill grace before cleanup starts. `timeout --foreground` keeps docker run in this
+    # script's process group (without it, timeout calls setpgid and a group signal never
+    # reaches the container), so a process-group signal (Ctrl-C) reaches docker run
+    # directly and it returns promptly. On expiry --foreground kills only docker run itself,
+    # which is the whole command here.
     trap on_exit EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     set +e
-    timeout --kill-after=10s "${CODEX_GIT_TRUST_TIMEOUT:-180}" docker run --rm --network none \
+    timeout --foreground --kill-after=10s "${CODEX_GIT_TRUST_TIMEOUT:-180}" docker run --rm --network none \
       --cap-drop ALL \
       --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
       --security-opt no-new-privileges --tmpfs /data \
