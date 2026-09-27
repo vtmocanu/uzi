@@ -100,9 +100,11 @@ func TestUndoFindingWire(t *testing.T) {
 func TestUndoFindingLegacyFallback(t *testing.T) {
 	var paths []string
 	mux := http.NewServeMux()
-	mux.HandleFunc("DELETE /api/findings/{id}/dismiss", func(w http.ResponseWriter, r *http.Request) {
+	// The route is registered for the exact id so the router still 404s any other one; the body
+	// is a constant (no request value is echoed back into the response).
+	mux.HandleFunc("DELETE /api/findings/disp-1/dismiss", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"disposition_id":"` + r.PathValue("id") + `","status":"open"}`))
+		_, _ = w.Write([]byte(`{"disposition_id":"disp-1","status":"open"}`))
 	})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.Method+" "+r.URL.EscapedPath())
