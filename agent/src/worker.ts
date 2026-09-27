@@ -430,6 +430,7 @@ export class Worker {
     while (!signal.aborted) {
       let ok = false;
       let sample: WorkerStats | undefined;
+      let sampledAtMs: number | undefined;
       try {
         // PRD #1391 M5: report per-run outbox depth alongside the resource sample. The
         // client sends the array only when the server negotiated `heartbeat_outbox`,
@@ -438,6 +439,7 @@ export class Worker {
         // PRD #1390 M2a: the active-run snapshot rides the same send (built here so its
         // epoch is drawn from the ONE monotonic counter the claim loop also draws from).
         const sentAtMs = Date.now();
+        sampledAtMs = sentAtMs;
         sample = this.collectStats(stats);
         const retaining = await this.client.heartbeat(
           sample,
@@ -458,7 +460,9 @@ export class Worker {
       // against the soft threshold derived from the api's latest threshold (read after the
       // heartbeat so a new value applies at once). Fed whether or not the heartbeat landed:
       // the volume fills regardless of the api.
-      this.diskPressure?.observe(dataVolumeUsedFraction(sample));
+      // PRD #1809 D4: with the time the sample was taken (just before collectStats), so the hard
+      // pressure stop can tell a sample from before a park it caused from one after it.
+      this.diskPressure?.observe(dataVolumeUsedFraction(sample), sampledAtMs);
       // PRD #1391 M2: the re-arm trigger — on EACH successful heartbeat, drain the
       // outbox (single-flight). FIRE-AND-FORGET, like the boot drain: `drainOutbox`
       // replays the ENTIRE per-run backlog with no time budget, so awaiting it here

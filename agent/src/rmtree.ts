@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import { constants } from "node:fs";
-import { execFile } from "node:child_process";
+import { type ChildProcess, execFile, spawn } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
 import { commandRootCommand, runnerCommand, uidSplitActive } from "./runner-uid.js";
@@ -307,15 +307,28 @@ if (process.platform !== "linux" || !fs.existsSync(FD)) process.exit(5);
 `;
 
 /**
- * The streamed directory reader both PRD #1809 helper scripts share. It never loads a whole
- * directory: `fs.opendirSync` + `Dir.readSync()` pulls entries from the kernel in small
- * buffered batches, so a run's (prompt-injectable) agent that fills a cache dir with a
- * million names cannot make a helper allocate them all at once. `readSome(dirFd, limit,
- * skip)` reopens the directory through its pinned descriptor (a fresh stream positioned at
- * the start), reads at most `limit` names not in `skip`, charges every dirent it reads to
- * `spend()` (stopping when that says the budget is gone), and closes the stream.
+ * The streamed directory readers the PRD #1809 helper scripts share. Neither loads a whole
+ * directory: `fs.opendirSync` + `Dir.readSync()` pulls entries from the kernel in small buffered
+ * batches, so a run's (prompt-injectable) agent that fills a cache dir with a million names cannot
+ * make a helper allocate them all at once. Every dirent read is charged to `spend()`, and reading
+ * stops when that says the budget is gone.
+ *
+ * `readSome(dirFd, limit, skip, spend)` reopens the directory through its pinned descriptor (a
+ * fresh stream positioned at the start), reads at most `limit` names not in `skip`, and closes it.
+ *
+ * `drain(dirFd, limit, spend, skip, each, onFirst)` reads the directory through ONE open stream
+ * in batches of at most `limit` names not in `skip`, and hands each batch to `each` (which returns
+ * how many of its names it removed, and adds the ones it could not to `skip`) before reading the
+ * next. The cursor is kept across batches, so a name that could not be removed is read once per
+ * round, not once per batch: an earlier version reopened the stream for every batch, so a
+ * directory of N stuck names cost about N^2/batch reads and could spend a pass's whole entry
+ * budget before the next uid's pass ran (#1809 M1 review). Whether a stream returns an entry added
+ * or removed after it was opened is unspecified, so a round that removed something is followed by
+ * one more round from a fresh stream, which picks up anything the first missed; a round that
+ * removed nothing ends the drain. `onFirst` runs once, after the first batch is read and before it
+ * is handed on. Exported only so a test can drive `drain` over a real directory.
  */
-const STREAM_PRELUDE = `
+export const STREAM_PRELUDE = `
 function readSome(dirFd, limit, skip, spend) {
   const dir = fs.opendirSync(FD + dirFd);
   const out = [];
@@ -329,6 +342,36 @@ function readSome(dirFd, limit, skip, spend) {
     dir.closeSync();
   }
   return out;
+}
+function drain(dirFd, limit, spend, skip, each, onFirst) {
+  let first = true;
+  for (;;) {
+    let dir;
+    try { dir = fs.opendirSync(FD + dirFd); } catch { return; }
+    let removed = 0;
+    let stop = false;
+    try {
+      for (;;) {
+        const batch = [];
+        let ended = false;
+        while (batch.length < limit) {
+          let e;
+          try { e = dir.readSync(); } catch { stop = true; break; }
+          if (e === null) { ended = true; break; }
+          if (!spend()) { stop = true; break; }
+          if (!skip.has(e.name)) batch.push({ name: e.name, isDir: e.isDirectory() });
+        }
+        if (first) { first = false; if (onFirst) onFirst(); }
+        // A batch already read is processed even when reading it spent the budget: its
+        // dirents are paid for, and the handler descends no directory past the budget.
+        if (batch.length > 0) removed += each(batch);
+        if (stop || ended) break;
+      }
+    } finally {
+      dir.closeSync();
+    }
+    if (stop || removed === 0) return;
+  }
 }
 `;
 
@@ -347,12 +390,12 @@ function readSome(dirFd, limit, skip, spend) {
  * inode; a race between that check and the `rmdir` can at worst remove an empty directory
  * planted there. Nothing above the leaf is ever chmodded or removed.
  *
- * Bounded work: each directory is read in streamed batches of {@link STREAM_PRELUDE}'s
- * `readSome` and the batch is processed before the next is read (the stream is closed in
- * between, so removals never race an open cursor; an entry that could not be removed is
- * skipped on the re-read). Every dirent read counts against `<maxEntries>`, and the pass
- * also stops at `<budgetMs>` of wall time; hitting either exits 8 with the rest left in
- * place. Recursion holds one descriptor per level.
+ * Bounded work: each directory is read through {@link STREAM_PRELUDE}'s `drain`, in streamed
+ * batches processed before the next is read, on one cursor per round (an entry that could not
+ * be removed is skipped, and read again only by the one extra round a round with removals
+ * earns). Every dirent read counts against `<maxEntries>`, and the pass also stops at
+ * `<budgetMs>` of wall time; hitting either exits 8 with the rest left in place. Recursion
+ * holds one descriptor per level (two while a level's stream is open).
  *
  * `<mode>` `remove` (what {@link rmHomeSubtree} passes) does all of the above. `empty` (what
  * {@link rmTreePinned} passes) stops once the leaf is emptied and never `rmdir`s it: the
@@ -457,17 +500,14 @@ function removeEntry(dirFd, e) {
 }
 function emptyDir(dirFd, isLeaf) {
   const stuck = new Set();
-  let first = true;
-  while (!exhausted) {
-    let batch;
-    try { batch = readSome(dirFd, BATCH, stuck, spend); } catch { return; }
-    if (isLeaf && first) pause("listed");
-    first = false;
-    if (batch.length === 0) return;
-    // A batch already read is processed even when reading it spent the budget: its
-    // dirents are paid for, and a directory in it is not descended past the budget.
-    for (const e of batch) if (!removeEntry(dirFd, e)) stuck.add(e.name);
-  }
+  drain(dirFd, BATCH, spend, stuck, (batch) => {
+    let removed = 0;
+    for (const e of batch) {
+      if (removeEntry(dirFd, e)) removed++;
+      else stuck.add(e.name);
+    }
+    return removed;
+  }, isLeaf ? () => pause("listed") : undefined);
 }
 emptyDir(leafFd, true);
 if (mode === "empty") {
@@ -511,19 +551,27 @@ const REMOVE_MAX_ENTRIES = 2_000_000;
 const HELPER_SLACK_MS = 5_000;
 
 /**
- * PRD #1809 D8: the measuring walk, as `node -e <script> <home> <rels-json> <max>`. Pins
- * each cache subtree through descriptors exactly as {@link PINNED_SUBTREE_SCRIPT} does (a
+ * PRD #1809 D8: the measuring walk, as `node -e <script> <home> <rels-json> <max> <budgetMs>`.
+ * Pins each cache subtree through descriptors exactly as {@link PINNED_SUBTREE_SCRIPT} does (a
  * symlinked or missing component counts zero), then sums allocated bytes (`blocks * 512`,
  * what the data volume actually loses) over the subtree with `lstat`, descending only
  * into directories it re-pins `O_NOFOLLOW`. Directories are streamed (one dirent at a time
  * from a buffered `Dir`, never a whole listing), every dirent read is counted, and the walk
- * stops at `<max>` and says so (`truncated`), so the reading is a lower bound; unreadable
- * entries are skipped, which also only lowers it. Prints one JSON line, including
- * `entries`, the dirents it counted.
+ * stops at `<max>` dirents or `<budgetMs>` of wall time and says so (`truncated`), so the
+ * reading is a lower bound; unreadable entries are skipped, which also only lowers it. Prints
+ * one JSON line, including `entries`, the dirents it counted.
+ *
+ * The time budget is the helper's own because nothing else can stop it: under the uid split
+ * the helper runs as `runner`/`runner-cmd` and the worker holds no CAP_KILL, so when the
+ * worker's `execFile` timeout fires, its kill fails, the call rejects, and the helper walks on.
+ * The caller sets `<budgetMs>` short of that timeout ({@link HELPER_SLACK_MS}).
  */
 const MEASURE_CACHES_SCRIPT = `${PINNED_PRELUDE}
-const [home, relsJson, maxArg] = process.argv.slice(1);
+const [home, relsJson, maxArg, budgetArg] = process.argv.slice(1);
 const max = Number(maxArg);
+const budgetMs = budgetArg === undefined ? Infinity : Number(budgetArg);
+if (!(budgetMs >= 0)) process.exit(6);
+const deadline = Date.now() + budgetMs;
 let cacheBytes = 0, entries = 0, truncated = false;
 function walk(dirFd) {
   let dir;
@@ -533,7 +581,7 @@ function walk(dirFd) {
     while (!truncated) {
       try { e = dir.readSync(); } catch { return; }
       if (e === null) return;
-      if (entries >= max) { truncated = true; return; }
+      if (entries >= max || Date.now() > deadline) { truncated = true; return; }
       entries++;
       const p = at(dirFd, e.name);
       let st;
@@ -581,9 +629,35 @@ function passTimeout(deadline: number | undefined): number {
   return deadline === undefined ? PURGE_TIMEOUT_MS : Math.min(PURGE_TIMEOUT_MS, deadline - Date.now());
 }
 
-/** Run one helper pass and resolve its exit status. Rejects only when the helper could not
- *  be spawned or was killed (timeout): no exit status is then a verdict. The env is
- *  minimal and explicit, as in {@link purgeChildrenAsAgents}. */
+/** What `execFile` rejects with, for {@link helperFailure}. */
+type HelperExecError = Error & { code?: unknown; killed?: boolean; signal?: NodeJS.Signals | null };
+
+/**
+ * A helper pass that produced no verdict, as a SHORT error. `execFile`'s own message is
+ * "Command failed: <command line>", which quotes the whole `node -e <script>` (several KB of
+ * script) into every log line that carries it (#1809 M1 review), so it is never passed on.
+ */
+function helperFailure(e: HelperExecError): Error {
+  const how =
+    typeof e.code === "number"
+      ? `exited ${e.code}`
+      : e.killed
+        ? `timed out (killed by ${e.signal ?? "a signal"})`
+        : e.signal
+          ? `ended by ${e.signal}`
+          : typeof e.code === "string"
+            ? `could not run or was not waited for (${e.code})`
+            : "timed out or could not run";
+  return Object.assign(new Error(`agent-uid helper ${how}`), typeof e.code === "string" ? { code: e.code } : {});
+}
+
+/** Run one helper pass and resolve its exit status. Rejects, with a short {@link helperFailure},
+ *  only when the helper could not be spawned or the worker stopped waiting for it (its
+ *  timeout): no exit status is then a verdict. The timeout does NOT stop a helper under the uid
+ *  split: the worker has no CAP_KILL over the agent uids, so its kill fails and the helper runs
+ *  on until its own in-script budget (`budgetMs`, set {@link HELPER_SLACK_MS} short of the
+ *  timeout) ends it. Single-uid the kill lands. The env is minimal and explicit, as in
+ *  {@link purgeChildrenAsAgents}. */
 async function runHelper(wrap: CommandWrapper, script: string, args: readonly string[], timeout: number): Promise<number> {
   const wrapped = wrap(process.execPath, ["-e", script, ...args]);
   return execFileAsync(wrapped.command, wrapped.args, {
@@ -592,8 +666,8 @@ async function runHelper(wrap: CommandWrapper, script: string, args: readonly st
     maxBuffer: 64 * 1024,
   }).then(
     () => 0,
-    (e: NodeJS.ErrnoException & { code?: unknown }) => {
-      if (typeof e.code !== "number") throw e;
+    (e: HelperExecError) => {
+      if (typeof e.code !== "number") throw helperFailure(e);
       return e.code;
     },
   );
@@ -884,7 +958,11 @@ export interface MeasureOptions {
   wrappers?: readonly CommandWrapper[];
   /** Dirents one pass may count (default {@link MEASURE_MAX_ENTRIES}). */
   maxEntries?: number;
-  /** Epoch ms after which no pass starts and a running one is killed. */
+  /**
+   * Epoch ms after which no pass starts. A running pass is given its own in-script budget
+   * ending {@link HELPER_SLACK_MS} before the deadline, and the worker stops waiting for it at
+   * the deadline; under the uid split it cannot kill it (see {@link runHelper}).
+   */
   deadline?: number;
 }
 
@@ -910,19 +988,27 @@ export async function measureRunCaches(home: string, opts: MeasureOptions = {}):
       lastErr ??= new Error("measureRunCaches: the deadline passed before a pass could run");
       break;
     }
+    const budgetMs = Math.max(0, timeout - HELPER_SLACK_MS);
     const wrapped = wrap(process.execPath, [
       "-e",
       MEASURE_CACHES_SCRIPT,
       home,
       JSON.stringify(RUN_CACHE_SUBTREES),
       String(maxEntries),
+      String(budgetMs),
     ]);
+    let stdout: string;
     try {
-      const { stdout } = await execFileAsync(wrapped.command, wrapped.args, {
+      ({ stdout } = await execFileAsync(wrapped.command, wrapped.args, {
         env: { PATH: "/usr/local/bin:/usr/bin:/bin" },
         timeout,
         maxBuffer: 64 * 1024,
-      });
+      }));
+    } catch (e) {
+      lastErr = helperFailure(e as HelperExecError);
+      continue;
+    }
+    try {
       const r = JSON.parse(stdout) as RunCacheBytes;
       best =
         best === undefined || r.cacheBytes > best.cacheBytes
@@ -934,4 +1020,601 @@ export async function measureRunCaches(home: string, opts: MeasureOptions = {}):
   }
   if (!best) throw lastErr ?? new Error("measureRunCaches: no measuring pass ran");
   return best;
+}
+
+/** PRD #1809 D4: the cache subtrees a between-turns trim evicts entries from (the module cache
+ *  is never trimmed per entry: it goes whole, through {@link rmHomeSubtree}). */
+const TRIMMABLE_CACHES = [".cache/go-build", ".npm/_cacache"] as const;
+type TrimmableCache = (typeof TRIMMABLE_CACHES)[number];
+
+/** Dirents one listing pass may read (bounds the helper's walk and its memory). */
+const TRIM_LIST_MAX_ENTRIES = 400_000;
+/** Units one listing pass may print, and so one trim may evict. A cache bigger than this is
+ *  trimmed over several quiet points. */
+const TRIM_LIST_MAX_UNITS = 200_000;
+/** Cap on what the worker reads back from one helper pass. */
+const TRIM_MAX_STDOUT = 48 * 1024 * 1024;
+
+/**
+ * The pieces the two PRD #1809 D4 trim scripts share, on top of {@link PINNED_PRELUDE} and
+ * {@link STREAM_PRELUDE}: argument checks, the entry and wall-time budget (`spend`), buffered
+ * output (`w`, printed once at exit), `lst` (an `lstat` through a pinned parent, never
+ * following), `openChild` (a directory inside a pinned parent, pinned `O_NOFOLLOW` then reopened
+ * for reading) and `pinRoot` (the cache root, pinned component by component from HOME, as
+ * {@link PINNED_SUBTREE_SCRIPT} does: a symlinked component exits 3, a missing one 2).
+ */
+const TRIM_PRELUDE = `
+const out = [];
+const w = (line) => out.push(line);
+const flush = () => { if (out.length) process.stdout.write(out.join("\\n") + "\\n"); };
+let seen = 0, exhausted = false, deadline = 0, maxEntries = 0;
+function budget(max, ms) {
+  if (!(max >= 0) || !(ms >= 0)) process.exit(6);
+  maxEntries = max;
+  deadline = Date.now() + ms;
+}
+const spend = () => {
+  if (exhausted) return false;
+  if (seen >= maxEntries || Date.now() > deadline) { exhausted = true; return false; }
+  seen++;
+  return true;
+};
+const lst = (dirFd, name) => { try { return fs.lstatSync(at(dirFd, name), { bigint: true }); } catch { return undefined; } };
+const bytesB = (st) => Number(st.blocks) * 512;
+function openChild(dirFd, name) {
+  const pin = fs.openSync(at(dirFd, name), PIN);
+  try { return reopen(pin); } finally { fs.closeSync(pin); }
+}
+const badPart = (x) => x === "" || x === "." || x === "..";
+function pinRoot(home, rel) {
+  if (!home || !home.startsWith("/") || !rel || rel.split("/").some(badPart)) process.exit(6);
+  let fd;
+  try {
+    fd = fs.openSync(home, PIN);
+    for (const part of rel.split("/")) { const next = fs.openSync(at(fd, part), PIN); fs.closeSync(fd); fd = next; }
+    return fd;
+  } catch (e) {
+    process.exit(e.code === "ENOENT" ? 2 : e.code === "ELOOP" || e.code === "ENOTDIR" ? 3 : 7);
+  }
+}
+// Stream the directory read through dirFd, calling fn(name) for each entry, charged to spend().
+function each(dirFd, fn) {
+  let dir;
+  try { dir = fs.opendirSync(FD + dirFd); } catch { return; }
+  try {
+    for (;;) {
+      let e;
+      try { e = dir.readSync(); } catch { return; }
+      if (e === null || !spend()) return;
+      fn(e.name);
+    }
+  } finally {
+    dir.closeSync();
+  }
+}
+`;
+
+/**
+ * PRD #1809 D4: the trim's LIST pass, as
+ * `node -e <script> <home> <rel> <kind> <needBytes> <maxEntries> <maxUnits> <budgetMs>`. Read-only:
+ * a no-follow `lstat` walk over pinned descriptors ({@link TRIM_PRELUDE}); a symlink is never
+ * followed and never a unit. Prints tab-separated lines, then one `H\t<json>` summary line
+ * (`truncated`: the entry or time budget ran out, so the listing is partial).
+ *
+ * `<kind>` `go` (`<rel>` is `.cache/go-build`): one unit is a regular file named `*-a` or `*-d`
+ * in a top-level directory (Go's own trim selects entries by that suffix,
+ * `cmd/go/internal/cache/cache.go`), or a directory there (Go's executable cache entries are
+ * directories; its bytes are its whole tree's). `README`, `trim.txt` and `testexpire.txt`, and
+ * every other top-level file, are never units. The units are sorted oldest-mtime first and only
+ * the oldest prefix whose bytes reach `<needBytes>` is printed (at most `<maxUnits>`), as
+ * `U\t<mtimeNs>\t<f|d>\t<bytes>\t<xx/name>`: under the uid split each uid prints its own oldest
+ * prefix, and the oldest units covering the need across all uids are always inside the union.
+ *
+ * `<kind>` `npm` (`<rel>` is `.npm/_cacache`): every `index-v5` bucket file as
+ * `B\t<mtimeNs>\t<bytes>\t<index-v5/...>\t<integrity tokens, space-separated>` (every
+ * `sha<N>-<base64>` token anywhere in the bucket, so a torn or unparsed line still counts as a
+ * reference); a bucket this uid could not read as `X\t<rel>`; every index directory it opened
+ * as `D\t<rel>`, and one it could not, or a symlink or other non-file in the index, as
+ * `E\t<rel>` (the worker trusts a listing only when every index directory and bucket was read by
+ * some uid); and every `content-v2/<algo>/<xx>/<yy>/<rest>`
+ * file as `C\t<mtimeNs>\t<bytes>\t<rel>`.
+ *
+ * Exit 0 (listed), 2 (the cache is absent), 3 (a symlinked component), 5, 6, 7 as the removal
+ * script; a truncated listing still exits 0 and says so in its summary.
+ */
+const TRIM_LIST_SCRIPT = `${PINNED_PRELUDE}${TRIM_PRELUDE}
+const [home, rel, kind, needArg, maxArg, maxUnitsArg, budgetArg] = process.argv.slice(1);
+const need = Number(needArg);
+const maxUnits = Number(maxUnitsArg);
+if ((kind !== "go" && kind !== "npm") || !(need >= 0) || !(maxUnits >= 0)) process.exit(6);
+budget(Number(maxArg), Number(budgetArg));
+const rootPin = pinRoot(home, rel);
+let root;
+try { root = reopen(rootPin); } catch { process.exit(7); }
+function treeBytes(dirFd) {
+  let n = 0;
+  each(dirFd, (name) => {
+    const st = lst(dirFd, name);
+    if (!st) return;
+    n += bytesB(st);
+    if (!st.isDirectory()) return;
+    let fd;
+    try { fd = openChild(dirFd, name); } catch { return; }
+    try { n += treeBytes(fd); } finally { fs.closeSync(fd); }
+  });
+  return n;
+}
+if (kind === "go") {
+  const KEEP = new Set(["README", "trim.txt", "testexpire.txt"]);
+  const units = [];
+  each(root, (top) => {
+    if (KEEP.has(top)) return;
+    const st = lst(root, top);
+    if (!st || !st.isDirectory()) return;
+    let sub;
+    try { sub = openChild(root, top); } catch { return; }
+    try {
+      each(sub, (name) => {
+        const cst = lst(sub, name);
+        if (!cst) return;
+        if (cst.isFile() && /-[ad]$/.test(name)) {
+          units.push([cst.mtimeNs, "f", bytesB(cst), top + "/" + name]);
+        } else if (cst.isDirectory()) {
+          let fd;
+          try { fd = openChild(sub, name); } catch { return; }
+          try { units.push([cst.mtimeNs, "d", bytesB(cst) + treeBytes(fd), top + "/" + name]); } finally { fs.closeSync(fd); }
+        }
+      });
+    } finally {
+      fs.closeSync(sub);
+    }
+  });
+  units.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  let sum = 0, printed = 0, total = 0;
+  for (const u of units) total += u[2];
+  for (const u of units) {
+    if (sum >= need || printed >= maxUnits) break;
+    w("U\\t" + u[0] + "\\t" + u[1] + "\\t" + u[2] + "\\t" + u[3]);
+    sum += u[2];
+    printed++;
+  }
+  w("H\\t" + JSON.stringify({ units: units.length, bytes: total, truncated: exhausted }));
+} else {
+  const INTEGRITY = /sha[0-9]+-[A-Za-z0-9+/=]+/g;
+  const MAX_BUCKET = 8 * 1024 * 1024;
+  let printed = 0;
+  const unit = (line) => { if (printed >= maxUnits) { exhausted = true; return; } w(line); printed++; };
+  function walkIndex(dirFd, relp, depth) {
+    each(dirFd, (name) => {
+      const st = lst(dirFd, name);
+      if (!st) return;
+      const r = relp + "/" + name;
+      if (st.isDirectory()) {
+        // Deeper than cacache writes (index-v5/<xx>/<yy>/<bucket>): not a layout this trusts.
+        if (depth >= 3) { w("E\\t" + r); return; }
+        let fd;
+        try { fd = openChild(dirFd, name); } catch { w("E\\t" + r); return; }
+        w("D\\t" + r);
+        try { walkIndex(fd, r, depth + 1); } finally { fs.closeSync(fd); }
+      } else if (st.isFile()) {
+        let text;
+        if (st.size <= MAX_BUCKET) {
+          try {
+            const fd = fs.openSync(at(dirFd, name), C.O_RDONLY | C.O_NOFOLLOW);
+            try { text = fs.readFileSync(fd, "latin1"); } finally { fs.closeSync(fd); }
+          } catch {}
+        }
+        if (text === undefined) { w("X\\t" + r); return; }
+        const ints = [...new Set(text.match(INTEGRITY) || [])];
+        unit("B\\t" + st.mtimeNs + "\\t" + bytesB(st) + "\\t" + r + "\\t" + ints.join(" "));
+      } else {
+        // A symlink (or anything else) in the index: never followed here, but npm would follow
+        // it and read entries this listing cannot see, so the index is not complete.
+        w("E\\t" + r);
+      }
+    });
+  }
+  function walkContent(dirFd, relp, depth) {
+    each(dirFd, (name) => {
+      const st = lst(dirFd, name);
+      if (!st) return;
+      const r = relp + "/" + name;
+      if (st.isDirectory() && depth < 4) {
+        let fd;
+        try { fd = openChild(dirFd, name); } catch { return; }
+        try { walkContent(fd, r, depth + 1); } finally { fs.closeSync(fd); }
+      } else if (st.isFile() && depth === 4) {
+        unit("C\\t" + st.mtimeNs + "\\t" + bytesB(st) + "\\t" + r);
+      }
+    });
+  }
+  const idxSt = lst(rootPin, "index-v5");
+  if (idxSt && idxSt.isDirectory()) {
+    let fd;
+    try { fd = openChild(rootPin, "index-v5"); } catch { w("E\\tindex-v5"); }
+    if (fd !== undefined) {
+      w("D\\tindex-v5");
+      try { walkIndex(fd, "index-v5", 1); } finally { fs.closeSync(fd); }
+    }
+  } else if (idxSt) {
+    w("E\\tindex-v5");
+  }
+  const conSt = lst(rootPin, "content-v2");
+  if (conSt && conSt.isDirectory()) {
+    let fd;
+    try { fd = openChild(rootPin, "content-v2"); } catch {}
+    if (fd !== undefined) {
+      try { walkContent(fd, "content-v2", 1); } finally { fs.closeSync(fd); }
+    }
+  }
+  w("H\\t" + JSON.stringify({ truncated: exhausted }));
+}
+flush();
+`;
+
+/**
+ * PRD #1809 D4: the trim's EVICT pass, as `node -e <script> <home> <rel> <maxEntries> <budgetMs>`
+ * with the units to evict on stdin, one `<f|d>\t<mtimeNs>\t<relpath>` per line (relative to the
+ * cache root). For each unit it pins the cache root and every directory component of the unit
+ * `O_NOFOLLOW` through descriptors ({@link TRIM_PRELUDE}), then `lstat`s the unit through its
+ * pinned parent and evicts it only when it is still the listed type (a regular file for `f`, a
+ * directory for `d`, never a symlink) with the listed mtime, to the nanosecond: an entry written
+ * or used since the listing is kept. A file is `unlink`ed; a directory is emptied through pinned
+ * descriptors as in {@link PINNED_SUBTREE_SCRIPT} (a symlink inside it is unlinked, never
+ * followed; a directory this uid owns gets owner `rwx`) and then `rmdir`ed. Prints `R\t<relpath>`
+ * per evicted unit and one `H\t<json>` summary (`removed`, `kept`, `missing`, `failed`,
+ * `exhausted`). Every unit and every dirent inside an evicted directory counts against
+ * `<maxEntries>`; the pass stops there or at `<budgetMs>`. Exits as {@link TRIM_LIST_SCRIPT}.
+ */
+const TRIM_EVICT_SCRIPT = `${PINNED_PRELUDE}${STREAM_PRELUDE}${TRIM_PRELUDE}
+const [home, rel, maxArg, budgetArg] = process.argv.slice(1);
+budget(Number(maxArg), Number(budgetArg));
+const rootPin = pinRoot(home, rel);
+const uid = process.getuid();
+function openOwned(pinFd) {
+  const st = fs.fstatSync(pinFd);
+  if (st.uid === uid && (st.mode & 0o700) !== 0o700) {
+    try { fs.chmodSync(FD + pinFd, (st.mode & 0o7777) | 0o700); } catch {}
+  }
+  return reopen(pinFd);
+}
+const gone = (err) => err.code === "ENOENT";
+function removeEntry(dirFd, e) {
+  const p = at(dirFd, e.name);
+  if (!e.isDir) {
+    try { fs.unlinkSync(p); return true; } catch (err) { return gone(err); }
+  }
+  let pin;
+  try { pin = fs.openSync(p, PIN); } catch (err) {
+    if (err.code === "ELOOP" || err.code === "ENOTDIR") {
+      try { fs.unlinkSync(p); return true; } catch (err2) { return gone(err2); }
+    }
+    return gone(err);
+  }
+  let fd;
+  try { fd = openOwned(pin); } catch { return false; } finally { fs.closeSync(pin); }
+  try { emptyDir(fd); } finally { fs.closeSync(fd); }
+  if (exhausted) return false;
+  try { fs.rmdirSync(p); return true; } catch (err) { return gone(err); }
+}
+function emptyDir(dirFd) {
+  const stuck = new Set();
+  drain(dirFd, 256, spend, stuck, (batch) => {
+    let removed = 0;
+    for (const e of batch) {
+      if (removeEntry(dirFd, e)) removed++;
+      else stuck.add(e.name);
+    }
+    return removed;
+  });
+}
+const res = { removed: 0, kept: 0, missing: 0, failed: 0 };
+const input = fs.readFileSync(0, "utf8");
+for (const line of input.split("\\n")) {
+  if (!line) continue;
+  if (!spend()) break;
+  const [t, mtime, r] = line.split("\\t");
+  const parts = r ? r.split("/") : [];
+  if ((t !== "f" && t !== "d") || !mtime || parts.length === 0 || parts.some(badPart)) { res.failed++; continue; }
+  const held = [];
+  let parent = rootPin;
+  try {
+    for (const part of parts.slice(0, -1)) { parent = fs.openSync(at(parent, part), PIN); held.push(parent); }
+  } catch (e) {
+    for (const fd of held) fs.closeSync(fd);
+    if (gone(e)) res.missing++; else res.kept++;
+    continue;
+  }
+  try {
+    const name = parts[parts.length - 1];
+    let st;
+    try { st = fs.lstatSync(at(parent, name), { bigint: true }); } catch (e) {
+      if (gone(e)) res.missing++; else res.failed++;
+      continue;
+    }
+    if (!(t === "f" ? st.isFile() : st.isDirectory()) || String(st.mtimeNs) !== mtime) { res.kept++; continue; }
+    if (removeEntry(parent, { name, isDir: t === "d" })) { res.removed++; w("R\\t" + r); }
+    else res.failed++;
+  } finally {
+    for (const fd of held) fs.closeSync(fd);
+  }
+}
+w("H\\t" + JSON.stringify({ ...res, exhausted }));
+flush();
+`;
+
+/** One trim unit: a go-build entry, an npm index bucket, or an npm content file. */
+export interface CacheUnit {
+  /** Relative to the cache root (`.cache/go-build` or `.npm/_cacache`). */
+  rel: string;
+  /** The listed mtime in nanoseconds, as the helper printed it: eviction re-checks it exactly. */
+  mtimeNs: string;
+  bytes: number;
+  type: "f" | "d";
+  /** Indices of the wrappers (uids) whose listing saw it; eviction runs as those. */
+  seenBy: number[];
+}
+
+/** An npm index bucket: a unit plus the integrity tokens its lines carry. */
+interface NpmBucket extends CacheUnit {
+  integrities: string[];
+}
+
+/** One `.npm/_cacache` listing, merged across uids. */
+export interface NpmCacheListing {
+  buckets: NpmBucket[];
+  contents: CacheUnit[];
+  /** Every index directory and bucket was read by some uid and no pass was truncated: only then
+   *  may content be judged unreferenced. */
+  complete: boolean;
+}
+
+/** Test seams and the caller's deadline for the trim helpers. */
+export interface TrimHelperOptions {
+  /** The uids to run the passes as, in order (default: {@link agentWrappers}). */
+  wrappers?: readonly CommandWrapper[];
+  /** Dirents one pass may read (default {@link TRIM_LIST_MAX_ENTRIES}). */
+  maxEntries?: number;
+  /** Units one listing pass may print (default {@link TRIM_LIST_MAX_UNITS}). */
+  maxUnits?: number;
+  /** Epoch ms after which no pass starts; a running one stops at its own budget. */
+  deadline?: number;
+}
+
+/** Spawn one trim helper pass with `input` on stdin; resolve its exit status and stdout. The
+ *  deadline and the no-kill caveat are {@link runHelper}'s; the stdout read back is capped. */
+async function runTrimHelper(
+  wrap: CommandWrapper,
+  script: string,
+  args: readonly string[],
+  timeout: number,
+  input = "",
+): Promise<{ code: number; stdout: string }> {
+  const wrapped = wrap(process.execPath, ["-e", script, ...args]);
+  return await new Promise((resolve, reject) => {
+    let child: ChildProcess;
+    try {
+      child = spawn(wrapped.command, wrapped.args, {
+        env: { PATH: "/usr/local/bin:/usr/bin:/bin" },
+        stdio: ["pipe", "pipe", "ignore"],
+      });
+    } catch (e) {
+      reject(helperFailure(e as HelperExecError));
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let overflow = false;
+    let settled = false;
+    const settle = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      settle(() => reject(helperFailure({ name: "Error", message: "", killed: true, signal: "SIGKILL" })));
+    }, timeout);
+    child.stdout?.on("data", (b: Buffer) => {
+      size += b.length;
+      if (size > TRIM_MAX_STDOUT) overflow = true;
+      if (!overflow) chunks.push(b);
+    });
+    child.on("error", (e) => settle(() => reject(helperFailure(e as HelperExecError))));
+    child.on("close", (code, signal) =>
+      settle(() => {
+        if (overflow) reject(new Error(`agent-uid helper printed more than ${TRIM_MAX_STDOUT} bytes`));
+        else if (code === null) reject(helperFailure({ name: "Error", message: "", signal }));
+        else resolve({ code, stdout: Buffer.concat(chunks).toString("utf8") });
+      }),
+    );
+    // The helper may exit before reading its input (a refused root): never an unhandled EPIPE.
+    child.stdin?.on("error", () => undefined);
+    child.stdin?.end(input);
+  });
+}
+
+/** The helper's `H` summary line, or undefined when it printed none. */
+function summaryOf(stdout: string): Record<string, unknown> | undefined {
+  for (const line of stdout.split("\n")) {
+    if (line.startsWith("H\t")) return JSON.parse(line.slice(2)) as Record<string, unknown>;
+  }
+  return undefined;
+}
+
+function assertTrimmable(home: string, rel: string, caller: string): asserts rel is TrimmableCache {
+  if (!path.isAbsolute(home)) throw new Error(`${caller}: refusing non-absolute HOME ${home}`);
+  if (!(TRIMMABLE_CACHES as readonly string[]).includes(rel)) {
+    throw new Error(`${caller}: refusing ${JSON.stringify(rel)}, not a trimmable cache`);
+  }
+}
+
+/**
+ * Run the LIST pass over `rel` as each wrapper and hand each pass's stdout to `onPass`. A pass
+ * that finds the cache absent (2) or refuses a symlinked component (3) contributes nothing; any
+ * other non-zero status, a failed helper or a missing summary makes the result partial.
+ */
+async function listPasses(
+  home: string,
+  rel: TrimmableCache,
+  kind: "go" | "npm",
+  needBytes: number,
+  opts: TrimHelperOptions,
+  onPass: (stdout: string, index: number) => void,
+): Promise<{ partial: boolean }> {
+  const wrappers = opts.wrappers ?? agentWrappers("measure");
+  let partial = false;
+  for (const [index, wrap] of wrappers.entries()) {
+    const timeout = passTimeout(opts.deadline);
+    if (timeout <= 0) {
+      partial = true;
+      break;
+    }
+    const budgetMs = Math.max(0, timeout - HELPER_SLACK_MS);
+    const args = [
+      home,
+      rel,
+      kind,
+      String(Math.max(0, Math.ceil(needBytes))),
+      String(opts.maxEntries ?? TRIM_LIST_MAX_ENTRIES),
+      String(opts.maxUnits ?? TRIM_LIST_MAX_UNITS),
+      String(budgetMs),
+    ];
+    let result;
+    try {
+      result = await runTrimHelper(wrap, TRIM_LIST_SCRIPT, args, timeout);
+    } catch {
+      partial = true;
+      continue;
+    }
+    if (result.code === 2 || result.code === 3) continue;
+    const summary = result.code === 0 ? summaryOf(result.stdout) : undefined;
+    if (!summary) {
+      partial = true;
+      continue;
+    }
+    if (summary.truncated === true) partial = true;
+    onPass(result.stdout, index);
+  }
+  return { partial };
+}
+
+/** Merge one unit into `byRel`, recording which uid saw it. */
+function mergeUnit<T extends CacheUnit>(byRel: Map<string, T>, unit: T, index: number): void {
+  const prior = byRel.get(unit.rel);
+  if (prior) {
+    if (!prior.seenBy.includes(index)) prior.seenBy.push(index);
+  } else {
+    byRel.set(unit.rel, unit);
+  }
+}
+
+const byMtime = (a: CacheUnit, b: CacheUnit): number => {
+  const x = BigInt(a.mtimeNs);
+  const y = BigInt(b.mtimeNs);
+  return x < y ? -1 : x > y ? 1 : 0;
+};
+
+/**
+ * PRD #1809 D4: list `.cache/go-build`'s oldest units (see {@link TRIM_LIST_SCRIPT}, kind `go`)
+ * whose bytes reach `needBytes`, merged across the agent uids and sorted oldest-mtime first.
+ * `truncated` when some pass ran out of budget or failed: the units are then the oldest of what
+ * was seen, which is still safe to evict, just not globally oldest.
+ */
+export async function listGoBuildUnits(
+  home: string,
+  needBytes: number,
+  opts: TrimHelperOptions = {},
+): Promise<{ units: CacheUnit[]; truncated: boolean }> {
+  const rel = ".cache/go-build";
+  assertTrimmable(home, rel, "listGoBuildUnits");
+  const byRel = new Map<string, CacheUnit>();
+  const { partial } = await listPasses(home, rel, "go", needBytes, opts, (stdout, index) => {
+    for (const line of stdout.split("\n")) {
+      const f = line.split("\t");
+      if (f[0] !== "U" || f.length !== 5) continue;
+      mergeUnit(byRel, { mtimeNs: f[1]!, type: f[2] === "d" ? "d" : "f", bytes: Number(f[3]), rel: f[4]!, seenBy: [index] }, index);
+    }
+  });
+  return { units: [...byRel.values()].sort(byMtime), truncated: partial };
+}
+
+/**
+ * PRD #1809 D4: list `.npm/_cacache`'s index buckets (with the integrity tokens each references)
+ * and content files (see {@link TRIM_LIST_SCRIPT}, kind `npm`), merged across the agent uids.
+ * `complete` only when no pass was partial and every index directory and bucket some uid could
+ * not read was read by another: content may be judged unreferenced only against a complete index.
+ */
+export async function listNpmCache(home: string, opts: TrimHelperOptions = {}): Promise<NpmCacheListing> {
+  const rel = ".npm/_cacache";
+  assertTrimmable(home, rel, "listNpmCache");
+  const buckets = new Map<string, NpmBucket>();
+  const contents = new Map<string, CacheUnit>();
+  const opened = new Set<string>();
+  const unreadable = new Set<string>();
+  const { partial } = await listPasses(home, rel, "npm", 0, opts, (stdout, index) => {
+    for (const line of stdout.split("\n")) {
+      const f = line.split("\t");
+      if (f[0] === "B" && f.length === 5) {
+        const integrities = f[4] ? f[4].split(" ").filter(Boolean) : [];
+        mergeUnit(buckets, { mtimeNs: f[1]!, bytes: Number(f[2]), rel: f[3]!, type: "f", seenBy: [index], integrities }, index);
+      } else if (f[0] === "C" && f.length === 4) {
+        mergeUnit(contents, { mtimeNs: f[1]!, bytes: Number(f[2]), rel: f[3]!, type: "f", seenBy: [index] }, index);
+      } else if (f[0] === "D" && f.length === 2) {
+        opened.add(f[1]!);
+      } else if ((f[0] === "E" || f[0] === "X") && f.length === 2) {
+        unreadable.add(f[1]!);
+      }
+    }
+  });
+  const unresolved = [...unreadable].some((r) => !opened.has(r) && !buckets.has(r));
+  return {
+    buckets: [...buckets.values()].sort(byMtime),
+    contents: [...contents.values()],
+    complete: !partial && !unresolved,
+  };
+}
+
+/**
+ * PRD #1809 D4: evict `units` (relative to the cache root `rel`) through the EVICT pass (see
+ * {@link TRIM_EVICT_SCRIPT}): each uid gets only the units its own listing saw and that no
+ * earlier uid removed. Resolves the set of units actually removed; a unit whose mtime or type
+ * changed since the listing, or that is gone, is simply not in it. Never throws for a pass that
+ * failed: what it did not remove stays.
+ */
+export async function evictCacheUnits(
+  home: string,
+  rel: string,
+  units: readonly CacheUnit[],
+  opts: TrimHelperOptions = {},
+): Promise<{ removed: Set<string>; kept: number; failed: number }> {
+  assertTrimmable(home, rel, "evictCacheUnits");
+  const wrappers = opts.wrappers ?? agentWrappers("measure");
+  const removed = new Set<string>();
+  let kept = 0;
+  let failed = 0;
+  for (const [index, wrap] of wrappers.entries()) {
+    const mine = units.filter((u) => u.seenBy.includes(index) && !removed.has(u.rel));
+    if (mine.length === 0) continue;
+    const timeout = passTimeout(opts.deadline);
+    if (timeout <= 0) break;
+    const budgetMs = Math.max(0, timeout - HELPER_SLACK_MS);
+    // Each unit is one entry, plus what an evicted directory holds.
+    const maxEntries = opts.maxEntries ?? REMOVE_MAX_ENTRIES;
+    const input = mine.map((u) => `${u.type}\t${u.mtimeNs}\t${u.rel}`).join("\n") + "\n";
+    let result;
+    try {
+      result = await runTrimHelper(wrap, TRIM_EVICT_SCRIPT, [home, rel, String(maxEntries), String(budgetMs)], timeout, input);
+    } catch {
+      continue;
+    }
+    for (const line of result.stdout.split("\n")) {
+      if (line.startsWith("R\t")) removed.add(line.slice(2));
+    }
+    const summary = summaryOf(result.stdout);
+    kept = typeof summary?.kept === "number" ? summary.kept : kept;
+    failed = typeof summary?.failed === "number" ? summary.failed : failed;
+  }
+  return { removed, kept, failed };
 }

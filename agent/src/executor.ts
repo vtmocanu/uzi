@@ -24,7 +24,7 @@ import type {
   ReviewCommentsSnapshot,
   RunKind,
 } from "./protocol.js";
-import type { AnswerVerdict, PlanVerdict } from "./steering.js";
+import type { AnswerVerdict, PauseMode, PlanVerdict } from "./steering.js";
 import { buildRepoInstructionsContext, type PriorWork } from "./prompt.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { readRepoInstructions } from "./repo-instructions.js";
@@ -466,7 +466,17 @@ export interface RunContext {
    * ACK's pauseRequested regressed — an ACK-independent fallback. Absent on the stub/test executors
    * ⇒ no fallback (the ACK's pauseRequested is then the sole park trigger, as before).
    */
-  pauseModeRequested?(): "milestone" | "now" | "wall" | null;
+  pauseModeRequested?(): PauseMode;
+  /**
+   * PRD #1809 D4 (soft layer): called by the executor at every implement turn boundary, before
+   * the next turn is driven. `processAlive` is the executor's quiet-point probe (true while any
+   * process of the run is alive, from its own process tracking); the runner's cache governor calls
+   * it only when the run's caches are over its cap, trims them at a quiet point, and resolves
+   * "park" when the run stays over the cap: the executor then throws a preventive
+   * DiskParkSignal (cache-cap.ts) and the runner parks the run so its caches are dropped. Absent on the
+   * stub/test executors and when the cap is off ⇒ no cap.
+   */
+  cacheCapBoundary?(processAlive: () => Promise<boolean>): Promise<"continue" | "park">;
   /**
    * PRD #1497 M2: park the run at its WALL-CLOCK limit — the CAPTURE-FIRST wall park (D4), NOT
    * handlePausePark's publish-or-stay contract. The runner's implementation reaps the agent tree,

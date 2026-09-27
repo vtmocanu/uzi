@@ -101,10 +101,33 @@ export interface Config {
   diskSoftMargin: number;
   /**
    * PRD #1809 D4: the hard mid-turn stop's distance below the recycle threshold
-   * (UZI_DISK_HARD_MARGIN, default 0.03). Parsed here with its sibling; read by the D4
-   * pressure stop.
+   * (UZI_DISK_HARD_MARGIN, default 0.03). Read by the D4 hard layer (cache-cap.ts).
    */
   diskHardMargin: number;
+  /**
+   * PRD #1809 D4: the soft layer, the per-run cache cap (UZI_RUN_CACHE_CAP_ENABLED, default on;
+   * `0`/`false`/`no`/`off` disables it). When on, a Claude run whose caches exceed the cap is
+   * trimmed at a proven quiet point between turns, and parked when it stays over.
+   */
+  runCacheCapEnabled: boolean;
+  /**
+   * PRD #1809 D4: the share of the data volume all running runs' caches may use together
+   * (UZI_RUN_CACHE_CAP_FRACTION, default 0.5). One run's cap is this fraction of the volume's
+   * size divided by WORKER_MAX_CONCURRENT_RUNS. A fraction in (0, 1]; anything else falls back.
+   */
+  runCacheCapFraction: number;
+  /**
+   * PRD #1809 D4: where a trim stops, as a fraction of the cap (UZI_RUN_CACHE_LOW_WATER, default
+   * 0.6): a trim evicts until the run's caches are at or under this share of its cap. A fraction
+   * strictly in (0, 1); anything else falls back.
+   */
+  runCacheLowWater: number;
+  /**
+   * PRD #1809 D4: the hard layer, the mid-turn pressure stop (UZI_DISK_HARD_STOP_ENABLED, default
+   * on; `0`/`false`/`no`/`off` disables it). When on, a data volume at or over the api threshold
+   * minus {@link diskHardMargin} stops the Claude run with the largest caches and parks it.
+   */
+  diskHardStopEnabled: boolean;
   /**
    * The UZI_WORKER_TOKEN_FILE path, if the join token was delivered by file. The
    * shipping compose default is a read-only secret mount the entrypoint forces to
@@ -372,6 +395,20 @@ function marginFraction(env: NodeJS.ProcessEnv, key: string, fallback: number): 
   return Number.isFinite(n) && n >= 0 && n < 1 ? n : fallback;
 }
 
+/** Parse a fraction strictly above 0 and below 1 (or up to and including 1 with `includeOne`),
+ *  e.g. UZI_RUN_CACHE_LOW_WATER; blank or anything outside the range falls back. */
+function openFraction(
+  env: NodeJS.ProcessEnv,
+  key: string,
+  fallback: number,
+  opts: { includeOne: boolean },
+): number {
+  const raw = env[key]?.trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 && (opts.includeOne ? n <= 1 : n < 1) ? n : fallback;
+}
+
 function isLogLevel(v: string): v is LogLevel {
   return v === "debug" || v === "info" || v === "warn" || v === "error";
 }
@@ -492,6 +529,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     diskReclaimIntervalMs: duration(env, "UZI_DISK_RECLAIM_INTERVAL", "10m"),
     diskSoftMargin: marginFraction(env, "UZI_DISK_SOFT_MARGIN", 0.1),
     diskHardMargin: marginFraction(env, "UZI_DISK_HARD_MARGIN", 0.03),
+    runCacheCapEnabled: parseBoolDefaultTrue(env.UZI_RUN_CACHE_CAP_ENABLED),
+    runCacheCapFraction: openFraction(env, "UZI_RUN_CACHE_CAP_FRACTION", 0.5, { includeOne: true }),
+    runCacheLowWater: openFraction(env, "UZI_RUN_CACHE_LOW_WATER", 0.6, { includeOne: false }),
+    diskHardStopEnabled: parseBoolDefaultTrue(env.UZI_DISK_HARD_STOP_ENABLED),
     workerTokenFile: env.UZI_WORKER_TOKEN_FILE?.trim() || undefined,
     heartbeatIntervalMs: duration(env, "WORKER_HEARTBEAT_INTERVAL", "15s"),
     pollIntervalMs: duration(env, "WORKER_POLL_INTERVAL", "3s"),

@@ -771,6 +771,11 @@ export interface DiskPressureOptions {
   log: Logger;
   pressureSpacingMs?: number;
   now?: () => number;
+  /**
+   * PRD #1809 D4: also handed every sample {@link DiskPressureController.observe} receives, with
+   * when it was taken: the hard disk-pressure layer (DiskGovernor.observe), on the same stats tick.
+   */
+  onSample?: (usedFraction: number | undefined, sampledAtMs: number | undefined) => void;
 }
 
 /**
@@ -844,7 +849,13 @@ export class DiskPressureController {
    * fails open while the latest sample is unknown, with one warning when that lifts an active
    * stop (a later unknown sample finds the stop already lifted and says nothing).
    */
-  observe(usedFraction: number | undefined): void {
+  observe(usedFraction: number | undefined, sampledAtMs?: number): void {
+    // PRD #1809 D4: the hard layer sees every sample, whatever the soft threshold's state.
+    try {
+      this.opts.onSample?.(usedFraction, sampledAtMs);
+    } catch (err) {
+      this.opts.log.warn("disk pressure stop failed", { error: errMessage(err) });
+    }
     if (usedFraction === undefined) {
       // Say once, on the known-to-unknown transition, that an active stop just lifted.
       if (this.claimsBlocked()) {

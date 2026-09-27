@@ -84,6 +84,7 @@ import {
 } from "./signals.js";
 import { classifyLimitEvidence, LimitReachedError } from "./limit.js";
 import { PauseNowSignal, CredentialSwitchSignal, PLAN_APPROVAL_TIMEOUT_REASON, type PlanVerdict } from "./steering.js";
+import { DiskParkSignal } from "./cache-cap.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { buildForgeToolsServer, FORGE_SERVER_NAME } from "./forge-tools.js";
 import { buildFindingsToolsServer, FINDINGS_SERVER_NAME } from "./findings-tools.js";
@@ -436,7 +437,19 @@ export interface SdkExecutorOptions {
    *  {@link EMPTY_TURN_MAX_RETRIES}; finite nonnegative overrides are floored,
    *  with zero disabling in-process retries. Invalid values use the default. */
   emptyTurnMaxRetries?: number;
+  /** PRD #1809 D4: how long the quiet-point probe waits for the previous turn's processes to
+   *  exit before it calls the run busy (default {@link QUIET_SETTLE_MS}). Injected in tests. */
+  quietSettleMs?: number;
 }
+
+/**
+ * PRD #1809 D4: how long the between-turns quiet-point probe polls for every process group of the
+ * run to be gone before it reports a live process. A finished turn's CLI can take a moment to exit
+ * after its result arrives, and a probe that called that "alive" would block a trim, or with a
+ * runaway cache even park the run, for no reason.
+ */
+const QUIET_SETTLE_MS = 2_000;
+const QUIET_POLL_MS = 100;
 
 /** What one turn observed: the session id, and any workflow signals. */
 interface TurnResult {
@@ -632,6 +645,8 @@ export class SdkExecutor implements Executor {
   private readonly kill: (pid: number | undefined) => boolean;
   private readonly killCliGroup: (pgid: number) => boolean;
   private readonly cliGroupPresent: (pgid: number) => boolean | undefined;
+  /** PRD #1809 D4: see SdkExecutorOptions.quietSettleMs. */
+  private readonly quietSettleMs: number;
   private readonly secretPaths: readonly string[];
   private readonly provisionRoot: string;
   private readonly provisionHomeDir: string;
@@ -695,6 +710,7 @@ export class SdkExecutor implements Executor {
     this.kill = opts.kill ?? killProcessGroup;
     this.killCliGroup = opts.killCliGroup ?? killProcessGroupOnly;
     this.cliGroupPresent = opts.cliGroupPresent ?? processGroupPresent;
+    this.quietSettleMs = opts.quietSettleMs ?? QUIET_SETTLE_MS;
     this.secretPaths = opts.secretPaths ?? [];
     // Provisioning HOME + root are SHARED worker-lifetime paths (Decision 5): they
     // must NOT be derived from the per-run SDK homeDir, or the nix profile/devbox
@@ -2272,6 +2288,8 @@ export class SdkExecutor implements Executor {
           // pending mode reads `wall`. A post-attempt run never reaches here for a wall (the server's
           // #1226 carve-out steers it to the completion hold via budgetExhausted below instead), so
           // this pre-attempt boundary parks it at the wall.
+          // PRD #1809 D4: a worker-local `disk` stop is never an owner pause park.
+          if (ctx.pauseModeRequested?.() === "disk") throw new DiskParkSignal(false);
           if (ctx.pauseModeRequested?.() === "wall") {
             const outcome = await this.parkForWall(ctx, at);
             if (outcome === "parked" || outcome === "undeliverable") {
@@ -2305,6 +2323,14 @@ export class SdkExecutor implements Executor {
         ) {
           completionHeld = { reason: REASON_COMPLETION_BUDGET_EXHAUSTED };
           break;
+        }
+        // PRD #1809 D4 (soft layer): the per-run cache cap, at this turn boundary. The governor
+        // measures the run's caches and, over the cap, trims them only at a proven quiet point (the
+        // probe: no process of the run alive). A run that stays over the cap parks here, through
+        // the runner's process-ending data_volume_full park (preventive, uncounted), which drops
+        // its caches on the way out.
+        if ((await ctx.cacheCapBoundary?.(() => this.runProcessAlive())) === "park") {
+          throw new DiskParkSignal(true);
         }
         ctx.emit({
           kind: "status",
@@ -2462,6 +2488,10 @@ export class SdkExecutor implements Executor {
                 served?.completedCount ?? latestProgress?.completed.length ?? 0,
               total: frozenMilestones?.length,
             };
+            // PRD #1809 D4 (hard layer): a worker-local `disk` stop rides the same PauseNowSignal.
+            // It is not an owner pause and never a completion hold: the runner reaps the tree,
+            // captures what is committed and parks the run (data_volume_full, counted).
+            if (ctx.pauseModeRequested?.() === "disk") throw new DiskParkSignal(false);
             // PRD #1497 M2: a `wall` pause (the sweep's system-authored wall-clock park) rides the
             // SAME PauseNowSignal that drops the turn but carries no mode; branch on getPauseMode.
             if (ctx.pauseModeRequested?.() === "wall") {
@@ -3826,6 +3856,31 @@ export class SdkExecutor implements Executor {
         ? `provider transient error persisted after bounded in-process retries: ${lastProviderErr.message}`
         : undefined,
     );
+  }
+
+  /**
+   * PRD #1809 D4: the quiet-point probe the cache cap trims behind. Resolves true while ANY process
+   * of this run is alive: every CLI this run spawned leads its own process group (spawnDetached),
+   * and everything the agent started (a backgrounded build, a `nohup` server) stays in that group,
+   * so a group that still has members is a live process of the run, whatever files it touches. A
+   * group whose presence cannot be determined counts as alive (fail closed). Polls up to
+   * {@link quietSettleMs} for groups to empty, since the previous turn's CLI may still be exiting.
+   * Only meaningful between turns, which is the only place the implement loop calls it.
+   */
+  private async runProcessAlive(): Promise<boolean> {
+    const started = Date.now();
+    for (;;) {
+      let alive = false;
+      for (const pid of this.spawnedPids) {
+        if (this.cliGroupPresent(pid) !== false) {
+          alive = true;
+          break;
+        }
+      }
+      if (!alive) return false;
+      if (Date.now() - started >= this.quietSettleMs) return true;
+      await sleep(QUIET_POLL_MS);
+    }
   }
 
   /**

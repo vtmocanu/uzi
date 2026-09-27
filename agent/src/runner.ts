@@ -78,6 +78,7 @@ import { dropRunCaches } from "./run-caches.js";
 import type { RunDiskLocks } from "./run-disk-locks.js";
 import type { CachesDroppedMemo } from "./disk-reclaim.js";
 import { DataVolumeFullError, type DataVolumeGuard } from "./disk-full.js";
+import { DiskParkSignal, type DiskGovernor } from "./cache-cap.js";
 import {
   SteeringChannel,
   PauseNowSignal,
@@ -193,10 +194,14 @@ function isInputReceiptError(err: unknown): boolean {
 
 /** Issue #1766: the typed cause a recovery park is taken for. `transient` is the #1197 empty-turn
  *  recovery (unchanged); `vault_locked` is a Codex credential deferral by a locked owner vault,
- *  which parks credential-free (see RunRunner.handleRecoveryExhausted). `data_volume_full` (PRD
- *  #1809 D6) is a write to the worker's data volume that stayed disk-full after a reclaim and one
- *  retry; it parks through the claim-fenced pre-clone park flow (RunRunner.handleDataVolumeFull). */
-type RecoveryParkCause = { kind: "transient" } | { kind: "vault_locked" } | { kind: "data_volume_full" };
+ *  which parks credential-free (see RunRunner.handleRecoveryExhausted). `data_volume_full` is
+ *  PRD #1809 D4's MID-RUN disk park (the cache cap's preventive park, or the hard pressure stop's
+ *  counted one); it keeps the custody hold. The pre-clone D6 disk park is a separate flow
+ *  (RunRunner.handleDataVolumeFull). */
+type RecoveryParkCause =
+  | { kind: "transient" }
+  | { kind: "vault_locked" }
+  | { kind: "data_volume_full"; preventive: boolean };
 
 /** Issue #1766: how many doublings a vault-lock park's retry wait may grow by before it is capped
  *  (base recoveryRetryMs x 16). */
@@ -1252,6 +1257,11 @@ export interface RunnerOptions {
   /** PRD #1809 D6 (N3) — the bound on how long the data-volume handling waits for a D7 reclaim
    *  pass before it moves on. Default 2 minutes; a non-positive value falls back to it. */
   dataVolumeReclaimWaitMs?: number;
+  /** PRD #1809 D4 — the worker's cache governor: the per-run cache cap checked at every implement
+   *  turn boundary (soft layer) and the per-tick pressure stop (hard layer). Each running Claude
+   *  run that can take the fenced disk park is registered with it for its flight. Undefined ⇒ no
+   *  cap and no pressure stop (tests that do not exercise them; both layers disabled). */
+  diskGovernor?: DiskGovernor;
   /** PRD #1391 Run B M4 — the wall-clock budget for the queued-duplicate ownership-probe retry: a
    *  TRANSIENT probe failure retries with backoff up to this bound (the api's claim grace minus a
    *  margin), a held/queued row is re-probed until it, then the attempt ends without executing.
@@ -1322,6 +1332,8 @@ export class RunRunner {
   private readonly cachesDropped: CachesDroppedMemo | undefined;
   /** PRD #1809 D6 — see RunnerOptions.dataVolume. */
   private readonly dataVolume: DataVolumeGuard | undefined;
+  /** PRD #1809 D4 — see RunnerOptions.diskGovernor. */
+  private readonly diskGovernor: DiskGovernor | undefined;
   private readonly detect: (
     worktreePath: string,
   ) => Promise<DetectedRepoAgents>;
@@ -1483,6 +1495,7 @@ export class RunRunner {
     this.diskLocks = opts.diskLocks;
     this.cachesDropped = opts.cachesDropped;
     this.dataVolume = opts.dataVolume;
+    this.diskGovernor = opts.diskGovernor?.enabled ? opts.diskGovernor : undefined;
     this.dataVolumeReclaimWaitMs =
       opts.dataVolumeReclaimWaitMs && opts.dataVolumeReclaimWaitMs > 0
         ? opts.dataVolumeReclaimWaitMs
@@ -1829,6 +1842,13 @@ export class RunRunner {
     // finally removes it (a park that RETURNS from executeClaim — limit_wait/recovery/
     // pre-clone — is a requeue, so it stops being listed there too). Idempotent per run id.
     this.snapshotRegistry?.add(runId, claim.claim_generation ?? 0);
+    // PRD #1809 D4: watch this run's caches for its flight. Claude runs only (a Codex run has
+    // `executor.safety`; its caches live on its own per-run volume) with a HOME, and only runs
+    // that can take the claim-fenced disk park (a claim generation to fence it with): anything
+    // else keeps today's handling. Unregistered at the end of the finally below.
+    if (this.diskGovernor && runHome && !executor.safety && this.dataVolumeParkable(claim)) {
+      this.diskGovernor.register(runId, { home: runHome, requestStop: () => steering.requestDiskStop() });
+    }
     try {
       await this.phaseClone(claim, flight);
       const sessionId = await this.phaseResume(claim, flight);
@@ -2030,6 +2050,22 @@ export class RunRunner {
           // Claude/stub killAgentTree cannot fail. Best-effort; runs after the report landed.
           if (limitReaped) await this.settleRecoveryGeneration(claim, flight, runLog);
         }
+      } else if (err instanceof DiskParkSignal || (err instanceof PauseNowSignal && steering.getPauseMode() === "disk")) {
+        // PRD #1809 D4: the cache cap parks a run that stayed over it (preventive), or the hard
+        // pressure layer stopped this run's turn (a `disk` stop; a PauseNowSignal that escaped the
+        // implement loop, e.g. from a reclaim wait, is the same stop). Take the mid-run
+        // data_volume_full recovery park: reap the tree, capture what is committed, park. The run
+        // keeps its custody hold (a clone exists), and the finally drops its caches on the park.
+        flight.parked = await this.handleRecoveryExhausted(
+          err,
+          claim,
+          flight,
+          executor,
+          batcher,
+          reportState,
+          runLog,
+          { kind: "data_volume_full", preventive: err instanceof DiskParkSignal && err.preventive },
+        );
       } else if (err instanceof TransientRecoveryError) {
         // Retry capture without abandoning the live claim. Only verified local
         // durability permits automatic promotion; shutdown retains uncaptured work
@@ -2604,6 +2640,9 @@ export class RunRunner {
           },
         );
       }
+      // PRD #1809 D4: last, after the park's cache drop above, so a hard stop's follow-up
+      // reclaim and its "fresh sample" wait start from the dropped HOME. A no-op when unwatched.
+      this.diskGovernor?.unregister(runId);
     }
   }
 
@@ -3219,6 +3258,23 @@ export class RunRunner {
     const wait = await this.awaitDataVolumeReclaim(guard, flight, "preflight");
     if (wait === "cancelled") throw new DataVolumeFullError("preflight");
     if (guard.preflight() === "data_volume_full") throw new DataVolumeFullError("preflight");
+  }
+
+  /**
+   * PRD #1809 D4 — the mid-run disk park's report. The TYPED `{recovery_wait, recovery_cause:
+   * data_volume_full}` when the api advertises `recovery_cause_data_volume_full`, stamped with the
+   * claim generation it is fenced on, and `disk_park_preventive: true` for the cache cap's park
+   * (uncounted toward the api's disk-park cap; a hard pressure stop omits it and is counted). An
+   * older api gets the untyped `{recovery_wait}`, as the pre-clone disk park falls back (M5).
+   */
+  private diskParkBody(claim: ClaimResponse, preventive: boolean): StateRequest {
+    if (!this.client.protocolFeatures.includes(DATA_VOLUME_FULL_FEATURE)) return { status: "recovery_wait" };
+    return {
+      status: "recovery_wait",
+      recovery_cause: "data_volume_full",
+      claim_generation: claim.claim_generation,
+      ...(preventive ? { disk_park_preventive: true } : {}),
+    };
   }
 
   /**
@@ -6795,6 +6851,11 @@ export class RunRunner {
       cancelRequested: () => steering.isCancelled(),
       pauseModeRequested: () => steering.getPauseMode(),
       onPauseNow: (cb) => steering.onPauseNow(cb),
+      // PRD #1809 D4 (soft layer): the per-run cache cap at every implement turn boundary. The
+      // governor answers "continue" for a run it does not watch (a Codex or unfenced run).
+      ...(this.diskGovernor
+        ? { cacheCapBoundary: (processAlive: () => Promise<boolean>) => this.diskGovernor!.boundary(runId, processAlive) }
+        : {}),
       // PRD #1247 M5b: re-arm the in-flight turn drop for a held-state credential switch (the
       // analog of onPauseNow), and restore the gate phase after a switch resume (D13). Absent
       // resume_phase ⇒ undefined (a fresh run, or an older server), which the executor treats as
@@ -9221,6 +9282,11 @@ export class RunRunner {
     cause: RecoveryParkCause = { kind: "transient" },
   ): Promise<boolean> {
     const vault = cause.kind === "vault_locked";
+    // PRD #1809 D4: the mid-run disk park (the cache cap's preventive park, or the hard pressure
+    // stop's counted one). The transient park's steps, with the typed cause on the park report and
+    // the custody hold KEPT (no post-park settle): a clone exists, and the api keeps custody for a
+    // data_volume_full park.
+    const disk = cause.kind === "data_volume_full" ? cause : undefined;
     executor.killAgentTree?.();
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
@@ -9503,8 +9569,30 @@ export class RunRunner {
           const parkBody: StateRequest =
             vault && this.client.protocolFeatures.includes("recovery_cause_vault_locked")
               ? { status: "recovery_wait", recovery_cause: "vault_locked" }
-              : { status: "recovery_wait" };
+              : disk
+                ? this.diskParkBody(claim, disk.preventive)
+                : { status: "recovery_wait" };
           const ack = await reportState(parkBody);
+          if (ack.status === "recovery_wait" && disk) {
+            runLog.info("run parked mid-run for its data volume; its caches are dropped and it resumes automatically", {
+              run_id: flight.runId,
+              cause: "data_volume_full",
+              preventive: disk.preventive,
+              typed: parkBody.recovery_cause !== undefined,
+              published: capture.published,
+            });
+            batcher.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: disk.preventive
+                  ? "paused because this run's build caches stayed over their size cap; the caches are dropped and it resumes automatically"
+                  : "paused because the worker's data volume is nearly full; this run's build caches are dropped and it resumes automatically",
+              },
+            });
+            // No reapThenSettleRecoveryGeneration: the custody hold is kept (see `disk` above).
+            return true;
+          }
           if (ack.status === "recovery_wait") {
             if (vault) {
               // Issue #1766: NO reapThenSettleRecoveryGeneration — its credentialed reap would

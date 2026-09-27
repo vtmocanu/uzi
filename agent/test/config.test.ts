@@ -234,6 +234,41 @@ describe("loadConfig disk reclaim knobs (PRD #1809 D5/D7)", () => {
   });
 });
 
+// PRD #1809 D4: the in-run cache cap and the mid-turn pressure stop.
+describe("loadConfig cache cap and pressure stop knobs (PRD #1809 D4)", () => {
+  it("defaults: both layers on, cap fraction 0.5, low-water 0.6", () => {
+    const c = loadConfig(baseEnv());
+    assert.strictEqual(c.runCacheCapEnabled, true);
+    assert.strictEqual(c.diskHardStopEnabled, true);
+    assert.strictEqual(c.runCacheCapFraction, 0.5);
+    assert.strictEqual(c.runCacheLowWater, 0.6);
+  });
+
+  it("each layer can be disabled on its own", () => {
+    for (const v of ["0", "false", "no", "off"]) {
+      const cap = loadConfig(baseEnv({ UZI_RUN_CACHE_CAP_ENABLED: v }));
+      assert.strictEqual(cap.runCacheCapEnabled, false, `value ${v}`);
+      assert.strictEqual(cap.diskHardStopEnabled, true, `value ${v}: the hard layer stays on`);
+      const hard = loadConfig(baseEnv({ UZI_DISK_HARD_STOP_ENABLED: v }));
+      assert.strictEqual(hard.diskHardStopEnabled, false, `value ${v}`);
+      assert.strictEqual(hard.runCacheCapEnabled, true, `value ${v}: the soft layer stays on`);
+    }
+    assert.strictEqual(loadConfig(baseEnv({ UZI_RUN_CACHE_CAP_ENABLED: "" })).runCacheCapEnabled, true);
+  });
+
+  it("the cap fraction is in (0, 1], the low-water mark strictly in (0, 1)", () => {
+    const c = loadConfig(baseEnv({ UZI_RUN_CACHE_CAP_FRACTION: "1", UZI_RUN_CACHE_LOW_WATER: "0.75" }));
+    assert.strictEqual(c.runCacheCapFraction, 1);
+    assert.strictEqual(c.runCacheLowWater, 0.75);
+    for (const v of ["abc", "0", "-0.2", "1.5", "NaN", "Infinity"]) {
+      assert.strictEqual(loadConfig(baseEnv({ UZI_RUN_CACHE_CAP_FRACTION: v })).runCacheCapFraction, 0.5, `value ${v}`);
+    }
+    for (const v of ["abc", "0", "1", "-0.5", "2", "NaN"]) {
+      assert.strictEqual(loadConfig(baseEnv({ UZI_RUN_CACHE_LOW_WATER: v })).runCacheLowWater, 0.6, `value ${v}`);
+    }
+  });
+});
+
 // PRD #1391 M1: the outbox knobs. These pin the VALUES (not just "parses to a
 // number"), so a wrong multiplier — a retention window that is hours not days, or a
 // MiB that is really 1000*1000 — fails here rather than shipping silently.

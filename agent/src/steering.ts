@@ -167,6 +167,10 @@ function parseAnswerBody(
  * sdk-executor.ts, and `instanceof`-tested in runner.ts) so it crosses files and knip sees a
  * live consumer of the export.
  */
+/** The sticky pause mode (see SteeringChannel.getPauseMode): an owner `milestone`/`now` pause, the
+ *  sweep's `wall` park (PRD #1497), the worker-local `disk` stop (PRD #1809 D4), or none. */
+export type PauseMode = "milestone" | "now" | "wall" | "disk" | null;
+
 export class PauseNowSignal extends Error {
   constructor() {
     super("run paused (now)");
@@ -1223,8 +1227,16 @@ export class SteeringChannel {
    *  landing does), because it is the server's involuntary park, not an owner request the owner may
    *  withdraw. The mode is read via getPauseMode()/ctx.pauseModeRequested(); the PauseNowSignal that
    *  drops the turn carries NO mode, so the executor branches on getPauseMode() to route a `wall`
-   *  abort to the capture-first wall park instead of handlePausePark. */
-  private pauseMode: "milestone" | "now" | "wall" | null = null;
+   *  abort to the capture-first wall park instead of handlePausePark.
+   *
+   *  PRD #1809 D4: `disk` joins the union — the WORKER-LOCAL stop the hard disk-pressure layer
+   *  requests (requestDiskStop, never an input and never seeded from a claim). It drops the turn
+   *  exactly like `now`/`wall`, and the executor routes it (getPauseMode() === "disk") to the
+   *  data_volume_full disk park. It is not an owner pause: it never sets the run paused, a
+   *  `pause_cancel` cannot clear it, and a later owner `pause` input does not replace it (the park
+   *  it leads to already ends the flight; a pending owner pause is re-seeded from the claim on the
+   *  resume). */
+  private pauseMode: PauseMode = null;
   /** PRD #1190 rework (N2): a RE-ARMABLE interrupt the executor registers (via ctx.onPauseNow) so a
    *  `now` pause can drop the in-flight turn EVERY time — not only the first. The shared cancel
    *  AbortController fires 'abort' exactly once, so a SECOND `now` after a declined park (which
@@ -1352,8 +1364,23 @@ export class SteeringChannel {
    *  PRODUCTION by the executor at its first loop boundary (via the runner's ctx.pauseModeRequested
    *  wiring) so a seeded/steered pause parks even if the running-report ACK's pauseRequested
    *  regressed — see seedPauseRequested. Also read by the M2 tests. */
-  getPauseMode(): "milestone" | "now" | "wall" | null {
+  getPauseMode(): PauseMode {
     return this.pauseMode;
+  }
+
+  /**
+   * PRD #1809 D4: the hard disk-pressure layer's local entry point, beside {@link route}. Records
+   * the sticky `disk` mode, then drops the in-flight turn exactly as a `now`/`wall` pause does: the
+   * shared cancel controller aborted with a PauseNowSignal (the pre-registration safety net), and
+   * the re-armable pause-now interrupt (which also trips a turn that starts after the controller
+   * was spent). The executor reads getPauseMode() on the resulting PauseNowSignal and takes the
+   * disk park, never an owner pause park. Idempotent.
+   */
+  requestDiskStop(): void {
+    if (this.pauseMode === "disk") return;
+    this.pauseMode = "disk";
+    if (!this.cancel.signal.aborted) this.cancel.abort(new PauseNowSignal());
+    this.pauseNowInterrupt?.();
   }
 
   /** PRD #1497 M2: clear a STICKY `wall` pause mode. Called by the executor after a REFUSED
@@ -1978,6 +2005,9 @@ export class SteeringChannel {
         // instead of handlePausePark. Any non-"now"/"wall" body is the safe "milestone" default.
         const trimmed = body?.trim();
         const mode = trimmed === "now" ? "now" : trimmed === "wall" ? "wall" : "milestone";
+        // PRD #1809 D4: a worker-local disk stop already dropping this flight's turn keeps its
+        // route to the disk park; the owner's pause stays pending server-side for the resume.
+        if (this.pauseMode === "disk") break;
         this.pauseMode = mode;
         if (mode === "now" || mode === "wall") {
           if (!this.cancel.signal.aborted)
@@ -1997,7 +2027,8 @@ export class SteeringChannel {
         // CancelPauseInput has the matching `pause_mode IS DISTINCT FROM 'wall'` guard, so the
         // columns stay set too). Only clearWallMode (a refused wall_park) or the park landing clears
         // it. A `wall` mode therefore SURVIVES a pause_cancel here.
-        if (this.pauseMode !== "wall") this.pauseMode = null;
+        // PRD #1809 D4: nor can it clear a worker-local `disk` stop, which is not an owner pause.
+        if (this.pauseMode !== "wall" && this.pauseMode !== "disk") this.pauseMode = null;
         break;
       case "follow_up":
         // issue #559 M2: carry the input id alongside the body so a delivery (takeFollowUp)

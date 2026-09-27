@@ -23,6 +23,8 @@ import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js
 import { CachesDroppedMemo, DiskPressureController, modelPassMinAgeMs, runDiskReclaimPass } from "./disk-reclaim.js";
 import { DataVolumeGuard } from "./disk-full.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
+import { DiskGovernor } from "./cache-cap.js";
+import { sampleVolume } from "./stats.js";
 import { errMessage } from "./util.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { resolveDockerWiring, dockerSidecarExpected, type DockerWiring } from "./docker-wiring.js";
@@ -474,6 +476,24 @@ async function main(): Promise<void> {
   // The reclaim's memo of runs whose caches it found gone; the runner forgets a run there
   // each time it starts executing it (disk-reclaim.ts CachesDroppedMemo).
   const cachesDropped = new CachesDroppedMemo();
+  // PRD #1809 D4: the per-run cache cap (UZI_RUN_CACHE_CAP_ENABLED) and the mid-turn pressure stop
+  // (UZI_DISK_HARD_STOP_ENABLED). The cap reads the data volume's size at each check; the pressure
+  // stop is fed every stats tick through the DiskPressureController below, and runs the D7 reclaim
+  // (bound late, like the data-volume guard's) after the run it stopped has parked.
+  const diskGovernor = new DiskGovernor({
+    config: {
+      capEnabled: config.runCacheCapEnabled,
+      capFraction: config.runCacheCapFraction,
+      lowWater: config.runCacheLowWater,
+      maxConcurrentRuns: config.maxConcurrentRuns,
+      hardStopEnabled: config.diskHardStopEnabled,
+      hardMargin: config.diskHardMargin,
+    },
+    log,
+    volumeTotalBytes: () => sampleVolume(config.dataDir)?.bytesTotal,
+    thresholdOf: () => client.diskPressureThreshold,
+    reclaim: () => reclaimNow?.() ?? Promise.resolve(),
+  });
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
     pollMs: config.pollIntervalMs,
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
@@ -493,6 +513,7 @@ async function main(): Promise<void> {
     diskLocks,
     cachesDropped,
     dataVolume,
+    diskGovernor,
   });
 
   // The chat lane (PRD #39). Per-session executor factory (PRD #42 Decision 4): each
@@ -641,7 +662,7 @@ async function main(): Promise<void> {
     config.summaryModelTimeoutMs,
   ]);
   const diskPressure =
-    config.diskReclaimEnabled || config.diskAdmissionEnabled
+    config.diskReclaimEnabled || config.diskAdmissionEnabled || config.diskHardStopEnabled
       ? new DiskPressureController({
           softMargin: config.diskSoftMargin,
           thresholdOf: () => client.diskPressureThreshold,
@@ -649,6 +670,8 @@ async function main(): Promise<void> {
           admission: config.diskAdmissionEnabled,
           admissionMaxWaitMs: config.diskAdmissionMaxWaitMs,
           log,
+          // PRD #1809 D4: the hard pressure stop sees every stats tick's sample.
+          onSample: (usedFraction, sampledAtMs) => diskGovernor.observe(usedFraction, sampledAtMs),
           ...(config.diskReclaimEnabled
             ? {
                 reclaim: () =>
