@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawnSync, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import {
   compareAttemptIds,
@@ -421,6 +422,139 @@ describe("issue #1783 M2 review: retention deletions are re-validated and run as
     assert.equal(ledgerState(s, idAt(0)), "abandoned", "not marked retired");
     const refusals = lines.filter((l) => (l as { msg?: string }).msg?.includes("refusing to delete")).map((l) => (l as { path?: string }).path);
     assert.deepEqual(refusals, [oldest], "only the symlinked attempt is refused");
+  });
+});
+
+describe("issue #1783 final: a timed-out retention rm is waited out, and an unsettled one stops the sweep", () => {
+  /** A stand-in rm child: the first spawn never exits on its own (the busybox rm still walking);
+   *  later ones delete their target and exit 0. */
+  function fakeRm(events: string[], onKill: (child: ChildProcess) => boolean) {
+    let first: ChildProcess | undefined;
+    return {
+      split: true,
+      timeoutMs: 20,
+      closeWaitMs: 5_000,
+      spawn: (_command: string, args: string[]): ChildProcess => {
+        const target = args.at(-1)!;
+        events.push(`spawn ${path.basename(target)}`);
+        const c = new EventEmitter() as unknown as ChildProcess;
+        Object.assign(c, { pid: 920000 + events.length, stderr: null });
+        if (first === undefined) {
+          first = c;
+        } else {
+          setImmediate(() => {
+            fs.rmSync(target, { recursive: true, force: true });
+            c.emit("close", 0, null);
+          });
+        }
+        return c;
+      },
+      kill: () => {
+        events.push("kill");
+        return onKill(first!);
+      },
+    };
+  }
+
+  async function sweepFixture() {
+    const s = await keyFixture();
+    const planted = [0, 1, 2, 3].map((i) => plantAttempt(s, idAt(i), `run-${i}`, "abandoned"));
+    const residue = [0, 1, 2, 3, 4, 5].map((i) => {
+      const p = path.join(s.parent, formatResidueName(s.key, randomUUID()));
+      fs.mkdirSync(p);
+      fs.utimesSync(p, 1_700_000_000 + i, 1_700_000_000 + i);
+      return p;
+    });
+    return { s, planted, residue };
+  }
+
+  function withRm(retentionDelete: ReturnType<typeof fakeRm>): void {
+    const rec = recordingLogger();
+    lines = rec.lines;
+    git = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim(), retentionDelete }));
+  }
+
+  it("the group kill fails: the sweep stops, no further delete starts, the artifact is kept", async () => {
+    const events: string[] = [];
+    withRm(fakeRm(events, () => false));
+    const { s, planted, residue } = await sweepFixture();
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
+    assert.deepEqual(events, [`spawn ${path.basename(planted[0]!.skills)}`, "kill"], "no delete after the unsettled one");
+    assert.equal(fs.existsSync(planted[0]!.skills), true);
+    assert.equal(fs.existsSync(planted[0]!.dir), true);
+    assert.equal(fs.existsSync(residue[0]!), true);
+    assert.equal(ledgerState(s, idAt(0)), "abandoned");
+    const warn = lines.find((l) => (l as { msg?: string }).msg?.includes("retention sweep failed"));
+    assert.match(String((warn as { error?: string } | undefined)?.error), /may still be running/);
+  });
+
+  it("the kill lands but 'close' never arrives: the sweep stops, no further delete starts", async () => {
+    const events: string[] = [];
+    const rm = fakeRm(events, () => true);
+    rm.closeWaitMs = 50;
+    withRm(rm);
+    const { s, planted, residue } = await sweepFixture();
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
+    assert.deepEqual(events, [`spawn ${path.basename(planted[0]!.skills)}`, "kill"]);
+    assert.equal(fs.existsSync(residue[0]!), true);
+    const warn = lines.find((l) => (l as { msg?: string }).msg?.includes("retention sweep failed"));
+    assert.match(String((warn as { error?: string } | undefined)?.error), /no exit within 50ms/);
+  });
+
+  it("'close' arrives after the kill: the next delete starts only after it, and the timed-out artifact is kept", async () => {
+    const events: string[] = [];
+    withRm(
+      fakeRm(events, (child) => {
+        setTimeout(() => {
+          events.push("close");
+          child.emit("close", null, "SIGKILL");
+        }, 300);
+        return true;
+      }),
+    );
+    const { s, planted, residue } = await sweepFixture();
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
+    assert.deepEqual(events, [`spawn ${path.basename(planted[0]!.skills)}`, "kill", "close", `spawn ${path.basename(residue[0]!)}`]);
+    assert.equal(fs.existsSync(planted[0]!.skills), true, "the timed-out skills sibling is kept");
+    assert.equal(fs.existsSync(planted[0]!.dir), true, "and its attempt with it (skills-first)");
+    assert.equal(fs.existsSync(residue[0]!), false, "the sweep went on once the rm was gone");
+  });
+});
+
+describe("issue #1783 final: a directory swapped in for a residue link fails the unlink with EISDIR and is kept", () => {
+  it("the re-validation lstat reports a symlink while the entry is a real directory: the directory and its contents survive", async () => {
+    const s = await keyFixture();
+    const swapped = path.join(s.parent, formatResidueName(s.key, randomUUID()));
+    fs.mkdirSync(path.join(swapped, "inner"), { recursive: true });
+    fs.writeFileSync(path.join(swapped, "inner", "KEEP"), "k");
+    fs.utimesSync(swapped, 1_600_000_000, 1_600_000_000);
+    for (let i = 0; i < 5; i++) fs.mkdirSync(path.join(s.parent, formatResidueName(s.key, randomUUID())));
+    const lied: string[] = [];
+    const rec = recordingLogger();
+    lines = rec.lines;
+    git = new GitCache(
+      fx.dataDir,
+      rec.logger,
+      undefined,
+      testGitCacheOptions({
+        gitleaksBin: defaultGitleaksShim(),
+        retentionDelete: {
+          lstat: async (p) => {
+            const st = await fs.promises.lstat(p);
+            if (p !== swapped) return st;
+            lied.push(p);
+            // A symlink at the check; a real directory by the time of the delete.
+            return Object.assign(Object.create(st) as fs.Stats, { isSymbolicLink: () => true, isDirectory: () => false });
+          },
+        },
+      }),
+    );
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
+    assert.deepEqual(lied, [swapped], "the sweep's re-validation saw the swapped entry");
+    assert.equal(fs.lstatSync(swapped).isDirectory(), true, "the directory is kept");
+    assert.equal(fs.readFileSync(path.join(swapped, "inner", "KEEP"), "utf8"), "k", "its contents survive");
+    const refusal = lines.find((l) => (l as { path?: string; msg?: string }).path === swapped && (l as { msg?: string }).msg?.includes("refusing to delete"));
+    assert.match(String((refusal as { reason?: string } | undefined)?.reason), /EISDIR/);
   });
 });
 

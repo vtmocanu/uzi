@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import type { ExecutorResult, RunContext } from "../src/executor.js";
 import {
   CapturePathMismatchError,
@@ -740,5 +741,162 @@ describe("issue #1783 M3 rework (N5): there is no unproven plain-rm fallback", (
     await assert.rejects(git.createOrAttachRunnerClone(b, iid, undefined as unknown as CanonicalReseedOptions, randomUUID()));
     assert.equal(treeHash(canonical), hash, "the canonical tree was not deleted");
     assert.deepEqual(residueNames(), []);
+  });
+});
+
+describe("issue #1783 final: a timed-out canonical rm is waited out before any quarantine or reseed", () => {
+  type Seams = Pick<GitCacheOptions, "retentionDelete" | "canonicalFree">;
+
+  function seamed(seams: Seams): GitCache {
+    return new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim(), ...seams }));
+  }
+
+  /** A stand-in rm child that never exits on its own (the busybox rm still walking). */
+  function hangingChild(pid: number): ChildProcess {
+    const c = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(c, { pid, stderr: null });
+    return c;
+  }
+
+  function plantPlainTree(canonical: string): void {
+    fs.mkdirSync(path.join(canonical, "old"), { recursive: true });
+    fs.writeFileSync(path.join(canonical, "old", "f.txt"), "x");
+  }
+
+  it("the group kill fails: typed CloneResidueBlockedError, nothing renamed, nothing reseeded", async () => {
+    const iid = 3601;
+    const canonical = canonicalFor(iid);
+    plantPlainTree(canonical);
+    const hash = treeHash(canonical);
+    const kills: Array<number | undefined> = [];
+    const g = seamed({
+      retentionDelete: { split: true, spawn: () => hangingChild(910001), kill: (pid) => (kills.push(pid), false), timeoutMs: 20, closeWaitMs: 50 },
+    });
+    const b = await g.ensureClone(fx.originPath);
+    await assert.rejects(g.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID()), (err: unknown) => {
+      assert.ok(err instanceof CloneResidueBlockedError, String(err));
+      assert.match(err.detail, /may still be running: the runner group kill of pid 910001 failed/);
+      assert.match(err.detail, /nothing quarantined or reseeded/);
+      return true;
+    });
+    assert.deepEqual(kills, [910001]);
+    assert.equal(treeHash(canonical), hash, "the canonical tree is untouched: no rename, no seed");
+    assert.deepEqual(residueNames(), []);
+  });
+
+  it("the kill lands but 'close' never arrives: typed CloneResidueBlockedError, nothing renamed, nothing reseeded", async () => {
+    const iid = 3602;
+    const canonical = canonicalFor(iid);
+    plantPlainTree(canonical);
+    const hash = treeHash(canonical);
+    const g = seamed({ retentionDelete: { split: true, spawn: () => hangingChild(910002), kill: () => true, timeoutMs: 20, closeWaitMs: 50 } });
+    const b = await g.ensureClone(fx.originPath);
+    await assert.rejects(g.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID()), (err: unknown) => {
+      assert.ok(err instanceof CloneResidueBlockedError, String(err));
+      assert.match(err.detail, /may still be running: no exit within 50ms of the runner group kill/);
+      return true;
+    });
+    assert.equal(treeHash(canonical), hash, "the canonical tree is untouched: no rename, no seed");
+    assert.deepEqual(residueNames(), []);
+  });
+
+  it("'close' arrives after the kill: the quarantine runs only after it, and the reseed proceeds", async () => {
+    const iid = 3603;
+    const canonical = canonicalFor(iid);
+    plantPlainTree(canonical);
+    const events: string[] = [];
+    let child: ChildProcess | undefined;
+    const g = seamed({
+      retentionDelete: {
+        split: true,
+        spawn: () => (child = hangingChild(910003)),
+        kill: () => {
+          events.push("kill");
+          setTimeout(() => {
+            events.push("close");
+            child!.emit("close", null, "SIGKILL");
+          }, 300);
+          return true;
+        },
+        timeoutMs: 20,
+        closeWaitMs: 5_000,
+      },
+      canonicalFree: {
+        rename: async (from, to) => {
+          events.push("rename");
+          await fs.promises.rename(from, to);
+        },
+      },
+    });
+    const b = await g.ensureClone(fx.originPath);
+    const clone = await g.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID());
+    assert.equal(clone.path, canonical);
+    assert.deepEqual(events, ["kill", "close", "rename"], "the rename waited for the killed rm's close");
+    const names = residueNames();
+    assert.equal(names.length, 1);
+    assert.equal(fs.readFileSync(path.join(runnerRepoDir(), names[0]!, "old", "f.txt"), "utf8"), "x", "the tree was moved, whole");
+  });
+});
+
+describe("issue #1783 final (R3): the clone key alone never puts a process in a seed's scope", { skip: HAS_PROCFS ? false : "reads procfs (Linux only)" }, () => {
+  /** A canonical reseed of `iid` over the REAL in-process scan, its canonical_reseed verdicts recorded. */
+  async function reseedWith(iid: number, liveAttempts: LiveAttemptRegistry) {
+    const verdicts: QuiesceRunOutcome[] = [];
+    const quiesceRun = async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
+      const out = await quiesceRunAttempt(req);
+      if (req.site === "canonical_reseed") verdicts.push(out);
+      return out;
+    };
+    const { factory, started } = transientFactory();
+    const claim = gitlabClaim(iid);
+    await unwired(factory, { quiesceRun, liveAttempts }).execute(claim);
+    return { verdicts, started: started(), failed: lastFailed(claim.run_id) };
+  }
+
+  const keyOf = (canonical: string): string => newRunAttempt(randomUUID(), 1, canonical, () => []).cloneKey;
+
+  it("a key-only foreign process in /tmp (no attempt marker) neither blocks the seed nor is killed by it", async () => {
+    const iid = 3701;
+    const canonical = canonicalFor(iid);
+    fs.mkdirSync(path.join(canonical, "old"), { recursive: true });
+    // Run B: from /tmp, with the attempt marker unset and this key set, a detached sleep.
+    const pid = orphanIn("/tmp", { [RUN_CLONE_KEY_ENV]: keyOf(canonical) });
+    const { verdicts, started, failed } = await reseedWith(iid, new LiveAttemptRegistry());
+    assert.notEqual(failed?.fail_origin, "worker_residue_blocked", String(failed?.failure_reason));
+    assert.equal(started, 1, "the seed went through and the model started");
+    assert.equal(verdicts[0]?.process?.state, "quiescent", verdicts[0]?.process?.detail);
+    assert.ok(!verdicts[0]?.process?.processes.some((p) => p.pid === pid), "never reported");
+    assert.deepEqual(verdicts[0]?.process?.killed, [], "never signalled");
+    assert.equal(alive(pid), true, "the foreign process is alive");
+  });
+
+  it("a MARKED terminal same-key process in /tmp is still in scope by key, and killed", async () => {
+    const iid = 3702;
+    const canonical = canonicalFor(iid);
+    fs.mkdirSync(path.join(canonical, "old"), { recursive: true });
+    const gone = newRunAttempt(randomUUID(), 1, canonical, () => []);
+    const pid = orphanIn("/tmp", { [RUN_ATTEMPT_ENV]: gone.marker, [RUN_CLONE_KEY_ENV]: gone.cloneKey });
+    const { verdicts, started } = await reseedWith(iid, new LiveAttemptRegistry());
+    assert.equal(started, 1, "the seed went through");
+    assert.deepEqual(verdicts[0]?.process?.killed, [pid], "the terminal attempt's process was reaped");
+    assert.equal(alive(pid), false);
+  });
+
+  it("a MARKED live same-key process in /tmp is still a conflict: never signalled, the seed blocks", async () => {
+    const iid = 3703;
+    const canonical = canonicalFor(iid);
+    fs.mkdirSync(path.join(canonical, "old"), { recursive: true });
+    const hash = treeHash(canonical);
+    const liveAttempts = new LiveAttemptRegistry();
+    const other = newRunAttempt(randomUUID(), 1, canonical, () => []);
+    liveAttempts.add(other);
+    const pid = orphanIn("/tmp", { [RUN_ATTEMPT_ENV]: other.marker, [RUN_CLONE_KEY_ENV]: other.cloneKey });
+    const { verdicts, started, failed } = await reseedWith(iid, liveAttempts);
+    assert.equal(started, 0, "no model started");
+    assert.equal(failed?.fail_origin, "worker_residue_blocked");
+    assert.ok(verdicts[0]?.process?.processes.some((p) => p.pid === pid && p.reason === "live_attempt_conflict"), "reported as a conflict");
+    assert.deepEqual(verdicts[0]?.process?.killed, []);
+    assert.equal(alive(pid), true);
+    assert.equal(treeHash(canonical), hash, "nothing moved");
   });
 });

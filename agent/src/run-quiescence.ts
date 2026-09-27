@@ -27,9 +27,16 @@
 //       is `unverified`. A root is recorded as its pid AND its start time (`stat` field 22,
 //       captured at spawn/registration) and matches only a live process with both, so a pid the
 //       kernel recycled after the root exited never exempts anything.
-//   R3  SCOPE first. A process is in scope iff its UZI_RUN_CLONE_KEY equals the target key or its
-//       cwd lies (by whole path components) within a target path. Out of scope is ignored
-//       entirely, so two unrelated healthy runs never interact. In scope, by marker: this
+//   R3  SCOPE first. A process is in scope iff its cwd lies (by whole path components) within a
+//       target path, or it carries BOTH a well-formed attempt marker (UZI_RUN_ATTEMPT,
+//       `<runId>:<attemptId>`) AND a UZI_RUN_CLONE_KEY equal to the target key. The key alone
+//       never scopes a process: a runner-uid process of another run can carry any key with no
+//       marker (`env -u UZI_RUN_ATTEMPT UZI_RUN_CLONE_KEY=<key> setsid …` from /tmp) and would
+//       otherwise be an unattributed survivor wedging that key's every seed until the pod
+//       restarts. Such a process, with its cwd outside every target path, is ignored. Deliberate
+//       env forgery (a copied marker) and evasion (a cwd outside the clone with no marker) stay
+//       out of scope of this proof. Out of scope is ignored entirely, so two unrelated healthy
+//       runs never interact. In scope, by marker: this
 //       attempt's → kill; a LIVE other attempt of the key → never signalled, reported as a
 //       conflict; a terminal attempt's → kill; no marker → kill in mode `own`, but a survivor in
 //       modes `seed`/`capture` (no positive attribution there). A process carrying this worker's
@@ -142,6 +149,14 @@ export function newRunAttempt(
     cloneKey: cloneKeyOf(clonePath).cloneKey,
     recordedRootPids,
   };
+}
+
+/** True for a marker of newRunAttempt's shape, `<runId>:<attemptId>`: a non-empty run id, then
+ *  (after the LAST colon) an attempt id matching {@link ATTEMPT_ID_RE}. */
+function wellFormedAttemptMarker(marker: string | undefined): boolean {
+  if (marker === undefined) return false;
+  const i = marker.lastIndexOf(":");
+  return i > 0 && ATTEMPT_ID_RE.test(marker.slice(i + 1));
 }
 
 /** The in-process set of LIVE attempts on this worker, keyed by marker. An attempt is added
@@ -428,8 +443,11 @@ export function scanOnce(
     // R5: a descendant is the scanner's own unless an attempt marker says it is agent residue.
     if (descendant && (excludeAllDescendants || env.get(RUN_ATTEMPT_ENV) === undefined)) continue;
     const cwd = cwdRead.value;
+    // R3: the key alone never scopes a process (a foreign run can carry another key's
+    // UZI_RUN_CLONE_KEY with no marker and wedge that key's every seed); only together with a
+    // well-formed attempt marker, which is what every agent CLI spawn carries.
     const inScope =
-      env.get(RUN_CLONE_KEY_ENV) === req.targetKey ||
+      (env.get(RUN_CLONE_KEY_ENV) === req.targetKey && wellFormedAttemptMarker(env.get(RUN_ATTEMPT_ENV))) ||
       req.targetPaths.some((p) => isWithinPath(stripDeleted(cwd), p));
     if (!inScope) continue;
     const entry = (reason: string): QuiesceProcess => ({

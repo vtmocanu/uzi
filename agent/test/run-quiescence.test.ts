@@ -573,11 +573,51 @@ describe("A-component: whole-component scope on an injected table", () => {
       30: { uid: RUNNER, cwd: "/data/runner/github.com+o+r/issue-1769", env: {} },
       31: { uid: RUNNER, cwd: "/elsewhere", env: { [RUN_CLONE_KEY_ENV]: "github.com+o+r/issue-1769" } },
       32: { uid: RUNNER, cwd: "/data/runner/github.com+o+r/issue-17 (deleted)", env: {} },
-      33: { uid: RUNNER, cwd: "/elsewhere", env: { [RUN_CLONE_KEY_ENV]: KEY } },
+      33: { uid: RUNNER, cwd: "/elsewhere", env: { [RUN_CLONE_KEY_ENV]: KEY, [RUN_ATTEMPT_ENV]: `run-gone:${TERMINAL_ID}` } },
     };
     const { r, signalled } = await fakeReap(procs, fakeReq());
     assert.equal(r.state, "quiescent");
     assert.deepEqual(signalled.sort(), [32, 33]);
+  });
+});
+
+const TERMINAL_ID = "20260101T000000Z-g1-0000000000000000";
+
+describe("issue #1783 final (R3): the key scopes a process only together with a well-formed attempt marker", () => {
+  it("a key-only (or malformed-marker) process outside every target path is out of scope in every mode", async () => {
+    for (const mode of ["seed", "capture", "own"] as const) {
+      const procs: Record<number, FakeProc> = {
+        80: { uid: RUNNER, cwd: "/tmp", env: { [RUN_CLONE_KEY_ENV]: KEY } },
+        81: { uid: RUNNER, cwd: "/tmp", env: { [RUN_CLONE_KEY_ENV]: KEY, [RUN_ATTEMPT_ENV]: "run-b:not-an-attempt-id" } },
+        82: { uid: RUNNER, cwd: "/tmp", env: { [RUN_CLONE_KEY_ENV]: KEY, [RUN_ATTEMPT_ENV]: `:${TERMINAL_ID}` } },
+        83: { uid: RUNNER, cwd: "/tmp", env: { [RUN_CLONE_KEY_ENV]: KEY, [RUN_ATTEMPT_ENV]: "" } },
+      };
+      const { r, signalled } = await fakeReap(procs, fakeReq({ mode }));
+      assert.equal(r.state, "quiescent", `${mode}: ${r.detail}`);
+      assert.deepEqual(signalled, [], mode);
+      assert.deepEqual(r.processes, [], mode);
+    }
+  });
+
+  it("with a well-formed marker the key still scopes it: terminal → killed, live → conflict, own → killed", async () => {
+    const live = `run-live:20260101T000001Z-g2-00000000000000aa`;
+    const own = `run-own:20260101T000002Z-g3-00000000000000bb`;
+    const procs: Record<number, FakeProc> = {
+      84: { uid: RUNNER, cwd: "/tmp", env: { [RUN_CLONE_KEY_ENV]: KEY, [RUN_ATTEMPT_ENV]: `run-gone:${TERMINAL_ID}` } },
+      85: { uid: RUNNER, cwd: "/tmp", env: { [RUN_CLONE_KEY_ENV]: KEY, [RUN_ATTEMPT_ENV]: live } },
+      86: { uid: RUNNER, cwd: "/tmp", env: { [RUN_CLONE_KEY_ENV]: KEY, [RUN_ATTEMPT_ENV]: own } },
+    };
+    const { r, signalled } = await fakeReap(procs, fakeReq({ mode: "seed", ownMarker: own, liveMarkers: [live] }));
+    assert.equal(r.state, "survivors");
+    assert.deepEqual(signalled.sort(), [84, 86]);
+    assert.deepEqual(r.processes.map((p) => [p.pid, p.reason]), [[85, "live_attempt_conflict"]]);
+  });
+
+  it("a key-only process whose cwd IS in a target path stays in scope (cwd scope is unchanged)", async () => {
+    const { r, signalled } = await fakeReap({ 87: { uid: RUNNER, cwd: CLONE, env: { [RUN_CLONE_KEY_ENV]: KEY } } }, fakeReq({ mode: "seed" }));
+    assert.equal(r.state, "survivors");
+    assert.deepEqual(signalled, []);
+    assert.equal(r.processes[0]?.reason, "unattributed_in_scope");
   });
 });
 
