@@ -306,6 +306,11 @@ func TestNotifyEarlyResetBuildsLoudSlackDM(t *testing.T) {
 		t.Fatalf("facts[2] = %q, want expected date markup %q", r.Facts[2], wantExpected)
 	}
 
+	// The D13 fence rides the queued DM so the notifier can re-check it at dispatch.
+	if r.Credential == nil || *r.Credential != (CredentialFence{SecretID: secret, Kind: store.KindAnthropicToken, EnablementRev: 0}) {
+		t.Fatalf("slack render credential fence = %+v, want secret %s anthropic_token rev 0", r.Credential, secret)
+	}
+
 	// Defensive mention-inertness: no field of the built render carries a raw <@ mention
 	// sequence. The safety is not runtime escaping (notificationBlocks does NOT escape
 	// Facts) — it is that every fact is built from trusted numeric time.Time unix stamps

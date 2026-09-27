@@ -100,13 +100,35 @@ func New(q Store, slack Slacker, cap int, logger *slog.Logger) *Service {
 // LinkLabel is an optional caller-set FIXED label for the deep link (e.g. "Open the
 // pipeline"); empty renders the default "Open in uzi", so a render that leaves it unset
 // is byte-identical to one built before the field existed.
+//
+// Credential, when set, fences a credential-specific alert (PRD #1732 D13): the notifier
+// re-reads the credential immediately before the Slack post and drops the DM unless it
+// is still current (see CredentialFence). nil for every notification not about one
+// credential.
 type SlackRender struct {
-	Title     string
-	Body      string
-	Link      string
-	LinkLabel string
-	Emoji     string
-	Facts     []string
+	Title      string
+	Body       string
+	Link       string
+	LinkLabel  string
+	Emoji      string
+	Facts      []string
+	Credential *CredentialFence
+}
+
+// CredentialFence names the one credential an alert is about and the enablement
+// revision it was produced at (PRD #1732 D13). It travels with the queued Slack DM so
+// the delivery goroutine can re-check it at dispatch, not only at enqueue: a DM queued
+// before a disable (or a disable and re-enable) is dropped rather than posted.
+type CredentialFence struct {
+	SecretID      uuid.UUID
+	Kind          string
+	EnablementRev int64
+}
+
+// Current reports whether row, the owner-scoped GetSecretEnablement read of the fenced
+// credential, is still that kind, enabled, and at the fenced revision.
+func (f CredentialFence) Current(row store.GetSecretEnablementRow) bool {
+	return row.Kind == f.Kind && !row.DisabledAt.Valid && row.EnablementRev == f.EnablementRev
 }
 
 // CIAutofixPayload is the jsonb carried by the poller's halt notifications:
@@ -326,9 +348,12 @@ type EarlyResetPayload struct {
 // sent (PRD #1732 D13): secretID must still be userID's Anthropic token, enabled, and at
 // enablementRev, the revision the poller's fenced write landed at. A credential disabled
 // (or disabled and re-enabled) since that write, deleted, or not the owner's delivers
-// nothing and returns ErrCredentialNotCurrent. A DM already handed to Slack before a later
-// disable cannot be recalled and is out of scope.
+// nothing and returns ErrCredentialNotCurrent. The same fence rides the queued Slack DM
+// (SlackRender.Credential), and the notifier re-checks it just before posting, so a
+// disable landing while the DM waits in the queue drops it too. A DM already handed to
+// Slack before a later disable cannot be recalled and is out of scope.
 func (s *Service) NotifyEarlyReset(ctx context.Context, userID, secretID uuid.UUID, enablementRev int64, expected, observed time.Time) (store.Notification, error) {
+	fence := CredentialFence{SecretID: secretID, Kind: store.KindAnthropicToken, EnablementRev: enablementRev}
 	cur, err := s.q.GetSecretEnablement(ctx, store.GetSecretEnablementParams{ID: secretID, UserID: userID})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return store.Notification{}, ErrCredentialNotCurrent
@@ -336,7 +361,7 @@ func (s *Service) NotifyEarlyReset(ctx context.Context, userID, secretID uuid.UU
 	if err != nil {
 		return store.Notification{}, fmt.Errorf("re-check credential: %w", err)
 	}
-	if cur.Kind != store.KindAnthropicToken || cur.DisabledAt.Valid || cur.EnablementRev != enablementRev {
+	if !fence.Current(cur) {
 		return store.Notification{}, ErrCredentialNotCurrent
 	}
 	hoursEarly := expected.Sub(observed)
@@ -360,6 +385,7 @@ func (s *Service) NotifyEarlyReset(ctx context.Context, userID, secretID uuid.UU
 				fmt.Sprintf("observed <!date^%d^{time}|%s>", observed.Unix(), observed.UTC().Format("15:04 MST")),
 				fmt.Sprintf("expected <!date^%d^{time}|%s>", expected.Unix(), expected.UTC().Format("15:04 MST")),
 			},
+			Credential: &fence,
 		},
 	})
 }

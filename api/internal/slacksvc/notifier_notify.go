@@ -11,6 +11,7 @@ import (
 	"github.com/slack-go/slack"
 
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // The generic notification DM seam (PRD #46): handleNotify delivers a
@@ -42,9 +43,36 @@ func (n *Notifier) handleNotify(ctx context.Context, ev notifyEvent) {
 	}
 
 	blocks, fallback := notificationBlocks(ev)
+	if !n.notifyCredentialCurrent(ctx, ev) {
+		return
+	}
 	if _, err := n.poster.PostBlocks(ctx, channel, "", fallback, blocks); err != nil {
 		n.logf("post notification", err)
 	}
+}
+
+// notifyCredentialCurrent is the dispatch-time half of the PRD #1732 D13 fence: a
+// credential-specific alert is posted only while its credential is still the owner's,
+// of the fenced kind, enabled, and at the fenced enablement revision. It runs as the
+// last step before the post and holds no lock, so a disable committing between this
+// read and Slack accepting the post still delivers that one DM; the window is one
+// Slack round trip, not the queue's dwell time. A read failure drops the DM (fail
+// closed: a missed alert is recoverable, a DM about a disabled credential is not).
+// An unfenced notification always passes.
+func (n *Notifier) notifyCredentialCurrent(ctx context.Context, ev notifyEvent) bool {
+	f := ev.credential
+	if f == nil {
+		return true
+	}
+	row, err := n.store.GetSecretEnablement(ctx, store.GetSecretEnablementParams{ID: f.SecretID, UserID: ev.userID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false
+	}
+	if err != nil {
+		n.logf("re-check notification credential", err)
+		return false
+	}
+	return f.Current(row)
 }
 
 // notifyFactMarkupStripper removes the intentional mrkdwn markup from a fact so it can

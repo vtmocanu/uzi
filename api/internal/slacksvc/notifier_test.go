@@ -64,6 +64,22 @@ type fakeNotifStore struct {
 	credSwitch     []byte
 	credSwitchErr  error
 	credSwitchArgs []store.GetLatestCredentialSwitchSinceParams
+	// PRD #1732 D13: the dispatch-time credential re-check. A nil secret with no error
+	// models "no row" (deleted, or another owner's); secretAsked captures the scoped read.
+	secret      *store.GetSecretEnablementRow
+	secretErr   error
+	secretAsked []store.GetSecretEnablementParams
+}
+
+func (f *fakeNotifStore) GetSecretEnablement(_ context.Context, arg store.GetSecretEnablementParams) (store.GetSecretEnablementRow, error) {
+	f.secretAsked = append(f.secretAsked, arg)
+	if f.secretErr != nil {
+		return store.GetSecretEnablementRow{}, f.secretErr
+	}
+	if f.secret == nil {
+		return store.GetSecretEnablementRow{}, pgx.ErrNoRows
+	}
+	return *f.secret, nil
 }
 
 func (f *fakeNotifStore) GetSlackRunContext(context.Context, uuid.UUID) (store.GetSlackRunContextRow, error) {
