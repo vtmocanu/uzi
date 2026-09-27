@@ -589,24 +589,6 @@ async function runSharedCloneSection(
     ? codex.withCommandGitTrust(codex.buildCommandEnv("/tmp", {}), await codex.canonicalCheckoutPath(rc.path))
     : codex.buildCommandEnv("/tmp", {});
 
-  // issue #1769 m3 part 2 — the finalize import, gated on FIXED (both the boundary-machinery
-  // test seam and the import API must exist on the mounted src) and real Landlock (the whole
-  // point is proving the import works with the bare NOT sandbox-granted).
-  const importFixed = scFixed
-    && typeof codex.boundaryProcessSpawnerForTest === "function"
-    && typeof gitCache.ensureRunnerCloneObjects === "function";
-  if (importFixed && probe.status === 0) {
-    const safetyMod = await load("codex/safety.js");
-    const headTipWrapped = runner.runnerCommand("git", ["-C", rc.path, "rev-parse", "HEAD"]);
-    const headTip = (await exec(headTipWrapped.command, headTipWrapped.args, { env: { PATH: "/usr/bin:/bin" } })).stdout.trim();
-    await runFinalizeImportPart(
-      git, gitCache, codex, launcher, registry, safetyMod, runner,
-      bare, rc.path, branch, headTip, rc.baseCommit, originPath, scCommandEnv,
-    );
-  } else {
-    console.log(`SKIP: FINALIZE-IMPORT part; importFixed=${importFixed} probe.status=${probe.status}`);
-  }
-
   const runMode = async (mode: "best-effort" | "required") => {
     const roots = new registry.ExecutionRegistry(registry.newLocalExecutionEpoch(mode === "required" ? 173 : 172));
     const spawn: Spawn = codex.makeDefaultSpawnCommand(roots, launcher.launchCodexEffectRoot, 5000, rc.path, scCommandEnv, mode);
@@ -670,6 +652,26 @@ async function runSharedCloneSection(
   await runMode("best-effort");
   if (probe.status === 0) await runMode("required");
   else console.log("SKIP: SHARED-CLONE Codex required mode; sandbox --probe returned 10");
+
+  // The finalize-import part runs AFTER both command modes: its case (a) merges the default tip
+  // into this same clone, which would consume the staged cherry-picked WIP the modes check.
+  // issue #1769 m3 part 2 — the finalize import, gated on FIXED (both the boundary-machinery
+  // test seam and the import API must exist on the mounted src) and real Landlock (the whole
+  // point is proving the import works with the bare NOT sandbox-granted).
+  const importFixed = scFixed
+    && typeof codex.boundaryProcessSpawnerForTest === "function"
+    && typeof gitCache.ensureRunnerCloneObjects === "function";
+  if (importFixed && probe.status === 0) {
+    const safetyMod = await load("codex/safety.js");
+    const headTipWrapped = runner.runnerCommand("git", ["-C", rc.path, "rev-parse", "HEAD"]);
+    const headTip = (await exec(headTipWrapped.command, headTipWrapped.args, { env: { PATH: "/usr/bin:/bin" } })).stdout.trim();
+    await runFinalizeImportPart(
+      git, gitCache, codex, launcher, registry, safetyMod, runner,
+      bare, rc.path, branch, headTip, rc.baseCommit, originPath, scCommandEnv,
+    );
+  } else {
+    console.log(`SKIP: FINALIZE-IMPORT part; importFixed=${importFixed} probe.status=${probe.status}`);
+  }
 
   // issue #1769 m3 review — a per-section result line, distinct from the #1716 section's
   // final RESULT below: a before-run headline must not read as the #1716 section's own
