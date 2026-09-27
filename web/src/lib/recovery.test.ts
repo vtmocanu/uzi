@@ -327,3 +327,53 @@ describe("groupHoldsByWorker — grouping + ordering (D8)", () => {
     expect(groups[0].holds.map((h) => h.id)).toEqual(["h3", "h2"]);
   });
 });
+
+describe("custodyHoldView — checkpoint location (PRD #1810)", () => {
+  const SHA = "3f9c2a7d41be08e6c5a9f1d27b4e3c8a90d6f512";
+
+  it("is null when no checkpoint_ref is set (nothing retained)", () => {
+    expect(custodyHoldView(hold({ attention: "source_only" })).checkpoint).toBeNull();
+    expect(custodyHoldView(hold({ attention: "source_only", checkpoint_ref: "" })).checkpoint).toBeNull();
+  });
+
+  it("reads a refs/uzi-recovery ref as moved, with a 12-char tip and an explanatory note", () => {
+    const c = custodyHoldView(
+      hold({ checkpoint_ref: "refs/uzi-recovery/r1", checkpoint_tip: SHA, checkpoint_state: "superseded" }),
+    ).checkpoint;
+    expect(c?.kind).toBe("recovery");
+    expect(c?.label).toBe("Moved to recovery ref");
+    expect(c?.ref).toBe("refs/uzi-recovery/r1");
+    expect(c?.shortTip).toBe("3f9c2a7d41be");
+    expect(c?.note).toMatch(/Nothing was deleted/);
+  });
+
+  it("reads a branch checkpoint ref by state: retained, settling, superseding", () => {
+    const at = (checkpoint_state: string) =>
+      custodyHoldView(
+        hold({ checkpoint_ref: "refs/uzi-checkpoints/agent/issue-7", checkpoint_tip: SHA, checkpoint_state }),
+      ).checkpoint;
+    expect(at("retained")?.kind).toBe("branch");
+    expect(at("retained")?.label).toBe("Branch checkpoint");
+    expect(at("retained")?.note).toBe("");
+    expect(at("settling")?.label).toBe("Branch checkpoint, settling");
+    expect(at("superseding")?.label).toBe("Branch checkpoint, moving to a recovery ref");
+  });
+
+  it("treats a superseded state as moved even if the ref namespace disagrees", () => {
+    const c = custodyHoldView(
+      hold({ checkpoint_ref: "refs/uzi-checkpoints/agent/issue-7", checkpoint_state: "superseded" }),
+    ).checkpoint;
+    expect(c?.kind).toBe("recovery");
+    expect(c?.shortTip).toBe("");
+  });
+
+  it("sanitizes control/format chars out of the ref and tip", () => {
+    const ZWSP = String.fromCharCode(0x200b);
+    const RLO = String.fromCharCode(0x202e);
+    const c = custodyHoldView(
+      hold({ checkpoint_ref: `refs/uzi-checkpoints/ag${RLO}ent/x${ZWSP}y`, checkpoint_tip: `ab${ZWSP}cd` }),
+    ).checkpoint;
+    expect(c?.ref).toBe("refs/uzi-checkpoints/agent/xy");
+    expect(c?.shortTip).toBe("abcd");
+  });
+});

@@ -3,10 +3,10 @@ import { Link } from "react-router-dom";
 
 import { api, type RecoveryCustodyHold, type RecoveryCustodyHolds } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
-import { custodyHoldView, groupHoldsByWorker } from "../lib/recovery";
+import { custodyHoldView, groupHoldsByWorker, type CustodyCheckpointView } from "../lib/recovery";
 import { stripUnsafeChars } from "../lib/safeText";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
-import { Badge, Button, Card, SectionTitle } from "./ui";
+import { Badge, Button, Card, SectionTitle, cx } from "./ui";
 import { ShieldIcon, ChevronRightIcon, TrashIcon } from "./icons";
 
 // RecoveryHoldsSurface is the durable, detailed owner resolution surface for custody holds
@@ -199,6 +199,7 @@ function HoldRow({
             <span className="font-mono">hold {holdShort}</span>
             <span>updated {new Date(hold.updated_at).toLocaleString()}</span>
           </p>
+          {view.checkpoint && <CheckpointLocation checkpoint={view.checkpoint} />}
         </div>
 
         <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
@@ -290,6 +291,39 @@ function HoldRow({
         </div>
       )}
     </li>
+  );
+}
+
+// CheckpointLocation says where this run's retained published checkpoint lives on the forge
+// (PRD #1810): the branch checkpoint slot, or a recovery ref once a newer run on the same
+// branch took that slot. The ref is the answer the owner needs to fetch the work, so it is
+// the one monospace, full-contrast element; it breaks anywhere so a long branch name wraps on
+// a phone instead of overflowing the row. A moved ref reads in the info tone so "moved, not
+// lost" is distinguishable at a glance from work that still sits at its branch.
+function CheckpointLocation({
+  checkpoint,
+}: {
+  checkpoint: CustodyCheckpointView;
+}) {
+  const moved = checkpoint.kind === "recovery";
+  return (
+    <div
+      className={cx("mt-1 space-y-0.5 border-l-2 pl-2 text-xs", moved ? "border-info/50" : "border-edge")}
+    >
+      <p className="flex flex-wrap items-baseline gap-x-2">
+        <span className="text-faint">Checkpoint on forge</span>
+        <span className={moved ? "font-medium text-info" : "text-muted"}>{checkpoint.label}</span>
+      </p>
+      <p className="break-all font-mono text-fg">
+        {checkpoint.ref}
+        {checkpoint.shortTip && (
+          <span className="text-faint">
+            {" "}@ {checkpoint.shortTip}
+          </span>
+        )}
+      </p>
+      {checkpoint.note && <p className="text-faint">{checkpoint.note}</p>}
+    </div>
   );
 }
 

@@ -69,9 +69,12 @@ function seedCustodyHolds(): RecoveryCustodyHold[] {
     mk({ id: "hold-a4", run_id: "run-a4", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 4, attention: "active" }),
     mk({ id: "hold-a3", run_id: "run-a3", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 3, attention: "capturing", capture_state: "uploading" }),
     mk({ id: "hold-a2", run_id: "run-a2", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 2, attention: "archive_ready", has_available_capture: true, capture_state: "available" }),
-    mk({ id: "hold-a1", run_id: "run-a1", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 1, attention: "source_only" }),
+    // Its published checkpoint was superseded by a newer run on the same branch (PRD #1810):
+    // the work now lives at the run's recovery ref.
+    mk({ id: "hold-a1", run_id: "run-a1", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 1, attention: "source_only", checkpoint_ref: "refs/uzi-recovery/run-a1", checkpoint_tip: "3f9c2a7d41be08e6c5a9f1d27b4e3c8a90d6f512", checkpoint_state: "superseded" }),
     // Worker B — jvm-worker: an actionable capture failure + a source-only hold.
-    mk({ id: "hold-b2", run_id: "run-b2", worker_id: "wkr-jvm", worker_name: "jvm-worker", generation: 2, attention: "needs_action", capture_state: "needs_action" }),
+    // Still at its branch checkpoint slot (PRD #1810); the long branch exercises phone wrapping.
+    mk({ id: "hold-b2", run_id: "run-b2", worker_id: "wkr-jvm", worker_name: "jvm-worker", generation: 2, attention: "needs_action", capture_state: "needs_action", checkpoint_ref: "refs/uzi-checkpoints/agent/issue-1810-retain-published-checkpoints-across-supersession", checkpoint_tip: "b41e7d09a2c3f58e61d4a7b90c2e5f3a1d8b6c47", checkpoint_state: "retained" }),
     mk({ id: "hold-b1", run_id: "run-b1", worker_id: "wkr-jvm", worker_name: "jvm-worker", generation: 1, attention: "source_only" }),
     // Worker C — hostile name: a source-only decision + healthy protection.
     mk({ id: "hold-c2", run_id: "run-c2", worker_id: "wkr-ext", worker_name: HOSTILE_WORKER_NAME, generation: 2, attention: "active" }),

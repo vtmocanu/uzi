@@ -237,4 +237,81 @@ describe("RecoveryHoldsSurface", () => {
       expect(btn.textContent).not.toContain("Discarding");
     });
   });
+
+  describe("checkpoint location (PRD #1810)", () => {
+    // Each hold's row is its <li>, found from the row's own run-id meta line so the queries
+    // below are scoped to ONE hold, never the whole card.
+    const rowFor = (runShort: string) => {
+      const li = screen.getByText(`run ${runShort}`).closest("li");
+      expect(li).not.toBeNull();
+      return li as HTMLElement;
+    };
+
+    it("renders the recovery ref and a short tip for a superseded (moved) hold", async () => {
+      await renderSurface(
+        listing([
+          hold({
+            id: "h-rec",
+            run_id: "runrec01",
+            attention: "source_only",
+            checkpoint_ref: "refs/uzi-recovery/runrec01",
+            checkpoint_tip: "3f9c2a7d41be08e6c5a9f1d27b4e3c8a90d6f512",
+            checkpoint_state: "superseded",
+          }),
+        ]),
+      );
+      const row = within(rowFor("runrec01"));
+      expect(row.getByText("Checkpoint on forge")).toBeTruthy();
+      expect(row.getByText("Moved to recovery ref")).toBeTruthy();
+      expect(row.getByText("refs/uzi-recovery/runrec01", { exact: false })).toBeTruthy();
+      expect(row.getByText("3f9c2a7d41be", { exact: false })).toBeTruthy();
+      // Short tip only: the full 40-char sha is not rendered.
+      expect(row.queryByText("3f9c2a7d41be08e6c5a9f1d27b4e3c8a90d6f512", { exact: false })).toBeNull();
+      expect(row.getByText(/Nothing was deleted/)).toBeTruthy();
+    });
+
+    it("labels a hold still at its branch checkpoint as a branch checkpoint", async () => {
+      await renderSurface(
+        listing([
+          hold({
+            id: "h-br",
+            run_id: "runbr001",
+            attention: "needs_action",
+            checkpoint_ref: "refs/uzi-checkpoints/agent/issue-7",
+            checkpoint_tip: "b41e7d09a2c3f58e61d4a7b90c2e5f3a1d8b6c47",
+            checkpoint_state: "retained",
+          }),
+        ]),
+      );
+      const row = within(rowFor("runbr001"));
+      expect(row.getByText("Branch checkpoint")).toBeTruthy();
+      expect(row.getByText("refs/uzi-checkpoints/agent/issue-7", { exact: false })).toBeTruthy();
+      expect(row.getByText("b41e7d09a2c3", { exact: false })).toBeTruthy();
+      expect(row.queryByText("Moved to recovery ref")).toBeNull();
+    });
+
+    it("renders no checkpoint line for a hold without checkpoint_ref, beside one that has it", async () => {
+      await renderSurface(
+        listing([
+          hold({ id: "h-none", run_id: "runnone1", attention: "source_only" }),
+          hold({
+            id: "h-rec2",
+            run_id: "runrec02",
+            attention: "source_only",
+            checkpoint_ref: "refs/uzi-recovery/runrec02",
+            checkpoint_tip: "0123456789abcdef",
+            checkpoint_state: "superseded",
+          }),
+        ]),
+      );
+      // Positive anchors in the SAME hold: its row rendered (run meta + decision badge), so
+      // the absence below is about the checkpoint line, not a row that never mounted.
+      const bare = within(rowFor("runnone1"));
+      expect(bare.getByText("Decision required")).toBeTruthy();
+      expect(bare.queryByText("Checkpoint on forge")).toBeNull();
+      expect(bare.queryByText(/refs\/uzi-/)).toBeNull();
+      // Control: the sibling hold with a ref DOES render the line, so the query can see it.
+      expect(within(rowFor("runrec02")).getByText("Checkpoint on forge")).toBeTruthy();
+    });
+  });
 });
