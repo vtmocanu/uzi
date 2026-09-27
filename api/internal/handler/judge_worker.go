@@ -152,6 +152,10 @@ type workerReviewRequest struct {
 	Model           string            `json:"model"`
 	Status          string            `json:"status"`
 	Recommendations []workerReviewRec `json:"recommendations"`
+	// ClaimGeneration is the judge flight's claim generation (issue #1423): the write is
+	// fenced on it so a superseded flight cannot overwrite the current verdict. A capability
+	// worker must stamp it; a legacy worker omits it (nil).
+	ClaimGeneration *int64 `json:"claim_generation"`
 }
 
 type workerReviewRec struct {
@@ -184,10 +188,13 @@ func (h *Handler) WorkerRunReview(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	res, err := h.wsvc.PostReview(r.Context(), wkr, targetID, sub)
+	res, err := h.wsvc.PostReview(r.Context(), wkr, targetID, sub, req.ClaimGeneration)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotFound) {
 			httpx.Error(w, http.StatusNotFound, "run not found")
+			return
+		}
+		if writeAdviceClaimRefusal(w, err) {
 			return
 		}
 		slog.Error("worker run review", "error", err)
@@ -200,6 +207,26 @@ func (h *Handler) WorkerRunReview(w http.ResponseWriter, r *http.Request) {
 	// review is the source of truth and re-running is cheap.
 	h.notifyReviewReady(r.Context(), targetID, res, sub)
 	httpx.JSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+// writeAdviceClaimRefusal answers the issue #1423 claim-fence refusals shared by the judge
+// review and task-review advice POSTs, and reports whether it wrote a response. Nothing was
+// persisted in either case, so the caller must not notify.
+//   - ErrMissingClaimGeneration: a capability worker omitted claim_generation, so the fence
+//     could not engage; 409 with an error the worker fixes by stamping the generation.
+//   - ErrStaleClaim: the advice run's claim was released or superseded (a reclaim bumped its
+//     generation); the same {"disposition":"stale_claim"} 409 WorkerRunMessages answers,
+//     which the worker reads to abandon the old flight rather than fail the run.
+func writeAdviceClaimRefusal(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, workersvc.ErrMissingClaimGeneration):
+		httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on every advice post")
+	case errors.Is(err, workersvc.ErrStaleClaim):
+		httpx.JSON(w, http.StatusConflict, map[string]any{"disposition": "stale_claim"})
+	default:
+		return false
+	}
+	return true
 }
 
 // judgeReviewNotificationKind is the notification kind the judge produces at review

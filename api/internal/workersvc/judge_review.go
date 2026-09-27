@@ -3,11 +3,15 @@ package workersvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -80,10 +84,21 @@ type ReviewResult struct {
 // Provenance — the producing judge run + owner — is stamped on every recommendation.
 // Returns the owner + review id so the caller can notify persist-first (the review is
 // the durable source of truth; the notification is a best-effort surface layered on).
-func (s *Service) PostReview(ctx context.Context, wkr store.Worker, targetID uuid.UUID, sub ReviewSubmission) (ReviewResult, error) {
+//
+// Issue #1423: the write is fenced on the JUDGE run's claim, mirroring the message fence.
+// claimGen is the generation the posting flight holds (nil = not stamped). A capability
+// worker (capability.CredentialSwitchV1) MUST stamp it, so a nil claimGen from one is
+// refused with ErrMissingClaimGeneration before anything is written; a legacy worker's nil
+// claimGen is honoured on a live (unreleased) claim only. The upsert persists nothing when
+// the judge run's claim is released or at a different generation, and that no-row outcome
+// surfaces as ErrStaleClaim (the auto-dismiss net is skipped: there is no fresh review).
+func (s *Service) PostReview(ctx context.Context, wkr store.Worker, targetID uuid.UUID, sub ReviewSubmission, claimGen *int64) (ReviewResult, error) {
 	judge, target, err := s.authorizeJudgeTrace(ctx, wkr, targetID)
 	if err != nil {
 		return ReviewResult{}, err
+	}
+	if claimGen == nil && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+		return ReviewResult{}, ErrMissingClaimGeneration
 	}
 	recs := sub.Recommendations
 	if recs == nil {
@@ -104,8 +119,12 @@ func (s *Service) PostReview(ctx context.Context, wkr store.Worker, targetID uui
 		ProducedByRunID:  pgconv.UUID(judge.ID),
 		ProducedByUserID: pgconv.UUID(target.UserID),
 		Recommendations:  recsJSON,
+		ClaimGeneration:  pgconv.Int8Ptr(claimGen),
 	})
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ReviewResult{}, ErrStaleClaim
+		}
 		return ReviewResult{}, err
 	}
 	s.autoDismissDeniedCLIRecommendations(ctx, reviewID, recs)

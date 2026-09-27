@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -102,10 +104,17 @@ func (s *Service) authorizeTaskReviewTarget(ctx context.Context, wkr store.Worke
 // header and its findings are written in ONE atomic CTE with UPSERT (replace) semantics,
 // so a re-review overwrites the prior findings rather than 23505-ing (the same shape the
 // judge's PostReview uses; workersvc holds no pool for a service-level tx).
-func (s *Service) PostTaskReview(ctx context.Context, wkr store.Worker, targetID uuid.UUID, sub TaskReviewSubmission) error {
+//
+// Issue #1423: fenced on the REVIEW run's claim exactly like PostReview: a capability
+// worker's nil claimGen is ErrMissingClaimGeneration (nothing written), and a released or
+// superseded claim persists nothing and surfaces as ErrStaleClaim.
+func (s *Service) PostTaskReview(ctx context.Context, wkr store.Worker, targetID uuid.UUID, sub TaskReviewSubmission, claimGen *int64) error {
 	review, target, err := s.authorizeTaskReviewTarget(ctx, wkr, targetID)
 	if err != nil {
 		return err
+	}
+	if claimGen == nil && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+		return ErrMissingClaimGeneration
 	}
 	findings := sub.Findings
 	if findings == nil {
@@ -116,13 +125,17 @@ func (s *Service) PostTaskReview(ctx context.Context, wkr store.Worker, targetID
 		return fmt.Errorf("marshal findings: %w", err)
 	}
 	if _, err := s.q.UpsertTaskReviewWithFindings(ctx, store.UpsertTaskReviewWithFindingsParams{
-		TargetRunID: target.ID,
-		ReviewRunID: pgconv.UUID(review.ID),
-		UserID:      target.UserID,
-		Status:      sub.Status,
-		SummaryMd:   sub.SummaryMd,
-		Findings:    findingsJSON,
+		TargetRunID:     target.ID,
+		ReviewRunID:     pgconv.UUID(review.ID),
+		UserID:          target.UserID,
+		Status:          sub.Status,
+		SummaryMd:       sub.SummaryMd,
+		Findings:        findingsJSON,
+		ClaimGeneration: pgconv.Int8Ptr(claimGen),
 	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrStaleClaim
+		}
 		return err
 	}
 	return nil

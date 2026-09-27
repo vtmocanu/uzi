@@ -27,6 +27,9 @@ type workerTaskReviewRequest struct {
 	Status   string                 `json:"status"`
 	Summary  string                 `json:"summary"`
 	Findings []workerTaskReviewFind `json:"findings"`
+	// ClaimGeneration is the review flight's claim generation (issue #1423), the same fence
+	// the judge review POST carries. A capability worker must stamp it; a legacy one omits it.
+	ClaimGeneration *int64 `json:"claim_generation"`
 }
 
 type workerTaskReviewFind struct {
@@ -62,9 +65,12 @@ func (h *Handler) WorkerTaskReview(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := h.wsvc.PostTaskReview(r.Context(), wkr, targetID, sub); err != nil {
+	if err := h.wsvc.PostTaskReview(r.Context(), wkr, targetID, sub, req.ClaimGeneration); err != nil {
 		if errors.Is(err, workersvc.ErrRunNotFound) {
 			httpx.Error(w, http.StatusNotFound, "run not found")
+			return
+		}
+		if writeAdviceClaimRefusal(w, err) {
 			return
 		}
 		slog.Error("worker task review", "error", err)

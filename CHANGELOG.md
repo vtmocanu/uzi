@@ -46,6 +46,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **A superseded judge or task-review flight can no longer overwrite the current review ([#1423](https://github.com/vtmocanu/uzi/issues/1423)).**
+  When a judge or review run was requeued and reclaimed at a newer claim generation, the old flight could still post its verdict or findings over the new one. The review write is now fenced on the advice run's claim in the same statement: a post from a released or superseded claim persists nothing and is answered with a 409 `stale_claim`, and the worker abandons that flight without failing the run. A worker advertising `credential_switch_v1` must stamp `claim_generation` on these posts; a legacy worker is still accepted on a live claim.
+
 - **Judge and Findings rows are readable on a phone again ([#1806](https://github.com/vtmocanu/uzi/issues/1806)).**
   At about 390px wide, a row showing its File issue, Mark done and Dismiss buttons squeezed its text into a column about 20px wide, so titles and rationale wrapped one word per line and a Findings location one character per line. The buttons now wrap onto their own line under the text on narrow screens, and a long Judge target breaks instead of widening the row. Desktop layout is unchanged.
 

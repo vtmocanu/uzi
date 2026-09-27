@@ -1136,17 +1136,42 @@ export class WorkerClient {
   }
 
   /** Post the judge's verdict + recommendations (POST /worker/runs/:id/review). The
-   *  server validates + scrubs; a bad enum is a 400. `targetRunId` is the reviewed run. */
-  async postReview(targetRunId: string, review: ReviewRequest): Promise<void> {
-    await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(targetRunId)}/review`, review);
+   *  server validates + scrubs; a bad enum is a 400. `targetRunId` is the reviewed run.
+   *  `claimGeneration` is the JUDGE run's claim generation (issue #1423): the server fences
+   *  the write on it, so a superseded flight's post is refused with a 409
+   *  `{disposition:"stale_claim"}` (see isStaleClaimRefusal) and persists nothing. */
+  async postReview(targetRunId: string, review: ReviewRequest, claimGeneration?: number): Promise<void> {
+    await this.postAdvice(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(targetRunId)}/review`, review, claimGeneration);
   }
 
   /** Post a diff-review's structured findings (POST /worker/runs/:id/task-review, PRD
    *  #400 M4b). `targetRunId` is the reviewed task run (claim.review_target_run_id). The
    *  server caps/scrubs the findings and validates `severity`; report-only — nothing is
-   *  pushed. Mirrors postReview. */
-  async postTaskReview(targetRunId: string, review: TaskReviewRequest): Promise<void> {
-    await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(targetRunId)}/task-review`, review);
+   *  pushed. Mirrors postReview, including the claim-generation fence (issue #1423). */
+  async postTaskReview(targetRunId: string, review: TaskReviewRequest, claimGeneration?: number): Promise<void> {
+    await this.postAdvice(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(targetRunId)}/task-review`,
+      review,
+      claimGeneration,
+    );
+  }
+
+  /** The shared advice-post path (issue #1423): stamp `claim_generation` through the same
+   *  send-gate and strict-decode fallback as postMessages, so `0`/undefined is never sent, a
+   *  capability worker stamps optimistically, and a rolled-back api's strict-decode 400 is
+   *  retried ONCE with the field stripped. The caller's request object is never mutated. */
+  private async postAdvice(
+    path: string,
+    review: ReviewRequest | TaskReviewRequest,
+    claimGeneration?: number,
+  ): Promise<void> {
+    const included = this.includeClaimGeneration(claimGeneration);
+    await this.withGenerationFallback(included, (includeField) => {
+      const body = { ...review };
+      delete body.claim_generation;
+      if (includeField) body.claim_generation = claimGeneration;
+      return this.postJSON(path, body);
+    });
   }
 
   /** Create a PENDING issue proposal on a chat run (POST /worker/runs/:id/proposals).

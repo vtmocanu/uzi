@@ -9,7 +9,7 @@ import { CODEX_TASK_REVIEW_MODEL } from "../src/codex/task-review-model.js";
 import { Outbox } from "../src/outbox.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import type { GitCache } from "../src/git.js";
-import type { WorkerClient } from "../src/client.js";
+import { RequestError, type WorkerClient } from "../src/client.js";
 import type { ClaimResponse, StateAck, StateRequest, TaskReviewRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 
@@ -303,11 +303,11 @@ describe("ReviewRunner", () => {
     assert.equal(calls.review, undefined, "no task review is posted when the pre-post probe is stale");
   });
 
-  // PRD #1247 fix round (Greptile P1 disposition): the pre-post probe is a SUPERSESSION FENCE and is
-  // FAIL-CLOSED. A TRANSIENT failure (a throw, NOT a staleClaim ack) leaves ownership UNKNOWN, and
-  // postTaskReview is generation-blind until #1423, so proceeding could overwrite a reclaiming
-  // flight's review. The throw propagates to the advice-phase catch (safeReportFailed) and posts NO
-  // review. Removing the fence (or making it best-effort) reddens this (a review would be posted).
+  // PRD #1247 fix round (Greptile P1 disposition): the pre-post probe is FAIL-CLOSED. A TRANSIENT
+  // failure (a throw, NOT a staleClaim ack) leaves ownership UNKNOWN, so the throw propagates to the
+  // advice-phase catch (safeReportFailed) and posts NO review. The server fence on postTaskReview
+  // (issue #1423) is the guard against a stale overwrite; this probe is the fast path. Making the
+  // probe best-effort reddens this (a review would be posted).
   it("fails closed when the pre-post probe throws transiently: NO review post, the run reports failed", async () => {
     let running = 0;
     const calls: { review?: unknown; states: string[] } = { states: [] };
@@ -332,6 +332,67 @@ describe("ReviewRunner", () => {
     assert.equal(calls.review, undefined, "a probe throw posts NO review (fail-closed: ownership unknown)");
     assert.ok(calls.states.includes("failed"), "the run reports failed via the advice-phase catch");
     assert.ok(!calls.states.includes("completed"), "no completed report when the pre-post fence fails closed");
+  });
+
+  // Issue #1423: the runner hands postTaskReview the claim's generation for the server fence.
+  it("passes the claim generation to postTaskReview (issue #1423)", async () => {
+    let gotGeneration: number | undefined;
+    const client = {
+      reportState: async (_id: string, body: StateRequest) => ({ applied: true, status: body.status }) as never,
+      postTaskReview: async (_id: string, _review: TaskReviewRequest, claimGeneration?: number) => {
+        gotGeneration = claimGeneration;
+      },
+    } as unknown as WorkerClient;
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    await runner.execute(reviewClaim({ claim_generation: 6 }));
+    assert.equal(gotGeneration, 6, "postTaskReview receives the claim's generation");
+  });
+
+  // Issue #1423: a supersession landing after the pre-post probe is refused by the server fence
+  // with 409 {"disposition":"stale_claim"}; the runner abandons with NO completed/failed report.
+  it("abandons on a 409 stale_claim from the task-review post with no completed/failed report (issue #1423)", async () => {
+    const states: string[] = [];
+    let posts = 0;
+    const client = {
+      reportState: async (_id: string, body: StateRequest) => {
+        states.push(body.status);
+        return { applied: true, status: body.status } as never;
+      },
+      postTaskReview: async () => {
+        posts++;
+        throw new RequestError("POST", "/api/worker/runs/t/task-review", 409, '{"disposition":"stale_claim"}');
+      },
+    } as unknown as WorkerClient;
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    await runner.execute(reviewClaim({ claim_generation: 5 }));
+    assert.equal(posts, 1, "the task-review post was attempted once");
+    assert.deepEqual(states, ["running", "running"], "no completed/failed report after a stale_claim refusal");
+  });
+
+  // Contrast: a non-stale 409 (the missing-generation refusal) is a real failure: the run reports failed.
+  it("reports failed on a non-stale 409 from the task-review post (issue #1423)", async () => {
+    const states: string[] = [];
+    const client = {
+      reportState: async (_id: string, body: StateRequest) => {
+        states.push(body.status);
+        return { applied: true, status: body.status } as never;
+      },
+      postTaskReview: async () => {
+        throw new RequestError(
+          "POST",
+          "/api/worker/runs/t/task-review",
+          409,
+          '{"error":"this worker must stamp claim_generation on every advice post"}',
+        );
+      },
+    } as unknown as WorkerClient;
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    await runner.execute(reviewClaim({ claim_generation: 5 }));
+    assert.ok(states.includes("failed"), "a non-stale refusal fails the run");
+    assert.ok(!states.includes("completed"));
   });
 
   it("posts zero findings WITHOUT calling the model on an empty diff", async () => {

@@ -132,9 +132,34 @@ LIMIT @lim;
 -- a service-level transaction. The recommendation rows arrive already validated +
 -- scrubbed in Go; the table CHECK on category/confidence is the backstop. provenance
 -- (produced_by_*) is the same judge run + owner for every row, passed as scalars.
-WITH upserted AS (
+--
+-- Issue #1423: the write is FENCED on the JUDGE (advice) run's claim, mirroring the
+-- InsertRunMessage fence. When @judge_run_id is NOT NULL (every production caller), the
+-- review lands ONLY while that judge run's claim is UNRELEASED (claim_released_at IS NULL)
+-- and, when the caller stamps @claim_generation, still at that generation. A superseded
+-- flight (stale requeue + same-worker reclaim bumped runs.claim_generation) or a released
+-- one therefore writes NOTHING: `upserted` yields no row, `cleared` deletes nothing,
+-- `inserted` is guarded by EXISTS(upserted) so no recommendation row lands, and the final
+-- SELECT returns no row (pgx.ErrNoRows, which the service maps to ErrStaleClaim). A NULL
+-- @judge_run_id is the unfenced seeder path (tests that seed a review with no judge run).
+--
+-- `live` takes FOR SHARE on the judge run row, a strengthening over the message fence: it
+-- serializes against ClaimRun's `claim_generation = claim_generation + 1` row UPDATE, so a
+-- reclaim that commits while this statement waits makes Postgres re-check the predicate on
+-- the NEW row version (READ COMMITTED EvalPlanQual) instead of passing on the old snapshot,
+-- and a reclaim that starts after the lock waits until this write commits.
+WITH live AS (
+    SELECT r.id FROM runs r
+    WHERE r.id = sqlc.narg('judge_run_id')::uuid
+      AND r.claim_released_at IS NULL
+      AND (sqlc.narg('claim_generation')::bigint IS NULL
+           OR r.claim_generation = sqlc.narg('claim_generation')::bigint)
+    FOR SHARE
+),
+upserted AS (
     INSERT INTO run_reviews (target_run_id, judge_run_id, user_id, verdict, summary_md, judge_model, status)
-    VALUES (@target_run_id, @judge_run_id, @user_id, @verdict, @summary_md, @judge_model, @status)
+    SELECT @target_run_id, sqlc.narg('judge_run_id')::uuid, @user_id, @verdict, @summary_md, @judge_model, @status
+    WHERE sqlc.narg('judge_run_id')::uuid IS NULL OR EXISTS (SELECT 1 FROM live)
     ON CONFLICT (target_run_id) DO UPDATE
         SET judge_run_id = EXCLUDED.judge_run_id,
             verdict      = EXCLUDED.verdict,
@@ -154,6 +179,7 @@ inserted AS (
            sqlc.narg('produced_by_run_id'), sqlc.narg('produced_by_user_id')
     FROM jsonb_to_recordset(@recommendations::jsonb)
         AS x(category text, target text, rationale_md text, confidence text)
+    WHERE EXISTS (SELECT 1 FROM upserted)
 )
 SELECT id FROM upserted;
 

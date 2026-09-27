@@ -1344,6 +1344,9 @@ export interface ReviewRequest {
   /** "complete" = a real LLM verdict; "failed" = the deterministic fallback. */
   status: "complete" | "failed";
   recommendations: ReviewRecommendation[];
+  /** The judge run's claim generation (issue #1423): the server fences the write on it.
+   *  Stamped by the client send-gate only (never 0/undefined on the wire). */
+  claim_generation?: number;
 }
 
 /** One structured finding the diff-review reviewer posts back (PRD #400 M4b). Every
@@ -1368,6 +1371,8 @@ export interface TaskReviewRequest {
   status: "complete" | "failed";
   summary: string;
   findings: TaskReviewFinding[];
+  /** The review run's claim generation (issue #1423), fenced server-side like ReviewRequest's. */
+  claim_generation?: number;
 }
 
 /**
