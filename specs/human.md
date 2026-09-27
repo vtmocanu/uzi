@@ -912,7 +912,7 @@ Tracked as GitHub issue vtmocanu/uzi#1695.
 
 ## Feature #1732 — Disable and re-enable account credentials
 
-Tracked as GitHub issue vtmocanu/uzi#1732; PRD at `prds/1732-disable-account-credentials.md`.
+Tracked as GitHub issue vtmocanu/uzi#1732; PRD at `prds/done/1732-disable-account-credentials.md`.
 
 - A user can disable any Anthropic token or OpenAI/Codex credential and re-enable it on demand. Disabled means kept (value, name, preferences) but not polled, not refreshed in the background, not selectable, hidden from the sidebar and pickers, and absent from the admin Rate limits page (no row, no count). Past runs and spend stay in history. (AI-synced 2026-09-26)
 - Work pinned or bound to a disabled credential waits and resumes on re-enable; uzi never silently spends a different credential instead. A run already holding the credential finishes. (AI-synced 2026-09-26)
