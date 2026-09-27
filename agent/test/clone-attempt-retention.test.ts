@@ -589,7 +589,7 @@ describe("issue #1783 final: a timed-out retention rm is waited out, and an unse
   });
 });
 
-describe("issue #1783 final: a directory swapped in for a residue link fails the unlink with EISDIR and is kept", () => {
+describe("issue #1783 final: a directory swapped in for a residue link fails the unlink (EISDIR on Linux, EPERM on macOS) and is kept", () => {
   it("the re-validation lstat reports a symlink while the entry is a real directory: the directory and its contents survive", async () => {
     const s = await keyFixture();
     const swapped = path.join(s.parent, formatResidueName(s.key, randomUUID()));
@@ -622,7 +622,7 @@ describe("issue #1783 final: a directory swapped in for a residue link fails the
     assert.equal(fs.lstatSync(swapped).isDirectory(), true, "the directory is kept");
     assert.equal(fs.readFileSync(path.join(swapped, "inner", "KEEP"), "utf8"), "k", "its contents survive");
     const refusal = lines.find((l) => (l as { path?: string; msg?: string }).path === swapped && (l as { msg?: string }).msg?.includes("refusing to delete"));
-    assert.match(String((refusal as { reason?: string } | undefined)?.reason), /EISDIR|EPERM/);
+    assert.match(String((refusal as { reason?: string } | undefined)?.reason), process.platform === "linux" ? /EISDIR/ : /EISDIR|EPERM/);
   });
 });
 

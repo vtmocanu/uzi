@@ -895,6 +895,9 @@ export interface DockerTeardownOptions {
   intervalMs?: number;
   deadlineMs?: number;
   sleep?: (ms: number) => Promise<void>;
+  /** Clock in real-scale milliseconds (default `Date.now`). Differences between its readings
+   *  become real timer durations (each request's absolute timeout), so an injected clock must
+   *  tick in milliseconds, not in arbitrary units. */
   now?: () => number;
 }
 

@@ -44,7 +44,7 @@ describe("teardownDocker overall deadline", () => {
     }
   });
 
-  it("a listing whose body trickles forever is cut off at the overall deadline, not the inactivity timeout", async () => {
+  it("a listing whose body trickles forever is cut off at the overall deadline, not the inactivity timeout", { timeout: 10_000 }, async () => {
     const timers = new Set<NodeJS.Timeout>();
     const server = http.createServer((_req, res) => {
       res.writeHead(200, { "content-type": "application/json" });
@@ -71,7 +71,7 @@ describe("teardownDocker overall deadline", () => {
     }
   });
 
-  it("a listing that sends headers then stalls is cut off at the overall deadline", async () => {
+  it("a listing that sends headers then stalls is cut off at the overall deadline", { timeout: 10_000 }, async () => {
     const server = http.createServer((_req, res) => {
       res.writeHead(200, { "content-type": "application/json" });
       res.flushHeaders();
@@ -88,6 +88,49 @@ describe("teardownDocker overall deadline", () => {
       const elapsed = Date.now() - started;
       assert.equal(result.state, "docker_error");
       assert.ok(elapsed < 3000, `teardown took ${elapsed}ms against a 1500ms deadline`);
+    } finally {
+      await shutdown(server);
+    }
+  });
+
+  it("the inter-pass sleep is capped at the time left and no listing starts once the deadline has passed", { timeout: 10_000 }, async () => {
+    const deadlineMs = 2500;
+    let clock = 0;
+    const slept: Array<{ ms: number; remaining: number }> = [];
+    const lateGets: number[] = [];
+    let gets = 0;
+    const server = http.createServer((req, res) => {
+      if (req.method === "GET") {
+        gets++;
+        if (clock >= deadlineMs) lateGets.push(clock);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify([{ Id: "c0", Mounts: [{ Source: "/clone" }] }]));
+      } else {
+        clock += 100;
+        res.writeHead(204);
+        res.end();
+      }
+    });
+    const port = await listen(server);
+    try {
+      const result = await teardownDocker({
+        dockerHost: `tcp://127.0.0.1:${port}`,
+        targetPaths: ["/clone"],
+        now: () => clock,
+        deadlineMs,
+        intervalMs: 1000,
+        sleep: async (ms) => {
+          slept.push({ ms, remaining: deadlineMs - clock });
+          clock += ms;
+        },
+      });
+      assert.equal(result.state, "docker_error");
+      // The loop-top check must stop it, not a GET dispatched with a zero timeout that dies in flight.
+      assert.match(result.detail, /deadline passed before the container listing/);
+      assert.ok(slept.length > 0, "the daemon never went clean, so teardown must have slept between passes");
+      for (const s of slept) assert.ok(s.ms <= s.remaining, `slept ${s.ms}ms with only ${s.remaining}ms left`);
+      assert.deepEqual(lateGets, [], `listing(s) started at or after the deadline, at simulated ${lateGets.join(", ")}ms`);
+      assert.equal(gets, 3);
     } finally {
       await shutdown(server);
     }
