@@ -258,8 +258,9 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 		if err := r.svc.SubmitInput(ctx, user.ID, anchor.RunID, "revise_plan", text, anchorGateRevision(anchor)); err != nil {
 			if errors.Is(err, ErrGateRevisionMismatch) {
 				// Nothing was written and the CAS already cleared this card's anchor, so the
-				// notifier will not touch it again: retire it button-free here.
-				r.editGateMessage(ctx, anchor, "Superseded — this plan gate changed. See the latest plan message.")
+				// notifier will not touch it again: retire it button-free here. The refusal
+				// cannot tell a newer plan from a run that left the gate, so the copy names neither.
+				r.editGateMessage(ctx, anchor, gateNoLongerOpenText)
 				r.ephemeral(ctx, m, gateSupersededText)
 				return
 			}
@@ -288,8 +289,11 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 		// stale reply must NOT submit reject_plan (which could wrongly fail a run that
 		// already left the gate) — it falls through to the branches below instead.
 		// Bound to the card's revision like the revise above (PRD #1795 M5): a stale reason
-		// never rejects a newer plan. On a mismatch the anchor is left for the notifier, which
-		// supersedes or closes this card when it drives the run's new state.
+		// never rejects a newer plan. On a mismatch nothing is written and the anchor is left
+		// reject-pending at this card's ts. The notifier retires the card when a state event
+		// posts a newer gate card or finds the run past the gate, but that is best-effort (a
+		// missed or skipped event leaves it); until then a further reply here meets the same
+		// mismatch and gets the same superseded notice, never a verdict.
 		if err := r.svc.SubmitInput(ctx, user.ID, anchor.RunID, "reject_plan", text, anchorGateRevision(anchor)); err != nil {
 			if errors.Is(err, ErrGateRevisionMismatch) {
 				r.ephemeral(ctx, m, gateSupersededText)

@@ -2101,3 +2101,94 @@ func TestNotifierGateCardStampsGateRevision(t *testing.T) {
 		})
 	}
 }
+
+// applyGateGen folds a recorded fresh-gate anchor write back into the fake's anchor row, so a
+// multi-event sequence sees what the live guarded UPDATE would have stored.
+func (f *fakeNotifStore) applyGateGen(t *testing.T) {
+	t.Helper()
+	if len(f.gateSetGen) == 0 {
+		t.Fatal("no fresh-gate anchor write to apply")
+	}
+	w := f.gateSetGen[len(f.gateSetGen)-1]
+	f.msg.GateTs, f.msg.GateState = w.GateTs, w.GateState
+	f.msg.GateGeneration, f.msg.GateRevision = w.GateGeneration, w.GateRevision
+}
+
+// The revise window race (PRD #1795 M5 review): the worker saves plan N+1's run_message BEFORE
+// it reports the N+1 gate, so a state event inside that window reads the run row at plan N /
+// gate_revision N while CountRunPlanMessages already says N+1. It posts a card for plan N,
+// stamped revision N, at generation N+1. When the real N+1 gate arrives the plan-message count
+// is unchanged, so the generation guard alone would swallow it and every click on the stale card
+// would answer "superseded" with no newer card to scroll to. A run revision above the anchor's
+// stamped revision must re-card, superseding the stale card.
+func TestNotifierRecardsWhenRevisionAdvancesAtSameGeneration(t *testing.T) {
+	rc := baseRun("awaiting_approval")
+	rc.PlanMd = txt("## Plan v1\nthe first approach")
+	rc.GateRevision = 1
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg: store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1",
+			GateGeneration: pgtype.Int4{Int32: 1, Valid: true}, GateRevision: pgtype.Int8{Int64: 1, Valid: true}},
+		planCount: 2, // plan v2's message is saved; the run row still shows v1 at revision 1
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+
+	// Event 1, inside the window: a card for plan v1, stamped revision 1, generation 2.
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+	if len(fs.gateSetGen) != 1 || fs.gateSetGen[0].GateGeneration.Int32 != 2 || fs.gateSetGen[0].GateRevision.Int64 != 1 {
+		t.Fatalf("window event: want a card at generation 2 stamped revision 1: %+v", fs.gateSetGen)
+	}
+	fs.applyGateGen(t)
+	staleTs := fs.msg.GateTs.String
+
+	// Event 2, the real v2 gate: same plan-message count, revision 2.
+	fs.rc.PlanMd = txt("## Plan v2\nthe revised approach")
+	fs.rc.GateRevision = 2
+	postsBefore := len(fp.blocks)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+
+	if len(fs.gateSetGen) != 2 {
+		t.Fatalf("the revision-2 gate must re-card even at an unchanged plan-message count: %+v", fs.gateSetGen)
+	}
+	w := fs.gateSetGen[1]
+	if !w.GateRevision.Valid || w.GateRevision.Int64 != 2 || w.GateGeneration.Int32 != 2 {
+		t.Fatalf("the re-card must be stamped revision 2 and keep generation 2: %+v", w)
+	}
+	fresh := fp.blocks[postsBefore:]
+	if len(fresh) != 2 || !strings.Contains(fresh[0].sectionText, "revised approach") || len(fresh[1].actionIDs) == 0 {
+		t.Fatalf("want the v2 plan in the thread plus a fresh gate card: %+v", fresh)
+	}
+	superseded, ok := findUpdateBlock(fp.updateBlocks, staleTs)
+	if !ok || len(superseded.actionIDs) != 0 || !strings.Contains(strings.ToLower(superseded.sectionText), "superseded") {
+		t.Fatalf("the stale revision-1 card must be superseded button-free: %+v", fp.updateBlocks)
+	}
+
+	// Event 3, a redundant re-broadcast of the revision-2 gate: no spam.
+	fs.applyGateGen(t)
+	postsBefore = len(fp.blocks)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+	if len(fp.blocks) != postsBefore || len(fs.gateSetGen) != 2 {
+		t.Fatalf("a same-revision re-broadcast must not re-card: blocks=%+v gen=%+v", fp.blocks[postsBefore:], fs.gateSetGen)
+	}
+}
+
+// A legacy anchor (NULL stamped revision) keeps the generation-only guard: a run revision above
+// nothing is not a reason to re-card, so a same-generation re-broadcast stays silent.
+func TestNotifierLegacyAnchorKeepsGenerationGuard(t *testing.T) {
+	rc := baseRun("awaiting_approval")
+	rc.PlanMd = txt("## Plan\ndo the thing")
+	rc.GateRevision = 3
+	fs := &fakeNotifStore{
+		rc:        rc,
+		delivery:  txt("U1"),
+		msg:       store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1", GateTs: txt("gate-ts"), GateState: txt(gateStateOpen), GateGeneration: pgtype.Int4{Int32: 1, Valid: true}},
+		planCount: 1,
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	NewNotifier(fs, fp, fixedBase, nil).handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+	if len(fp.blocks) != 0 || len(fs.gateSetGen) != 0 {
+		t.Fatalf("a legacy anchor at the same generation must not re-card: blocks=%+v gen=%+v", fp.blocks, fs.gateSetGen)
+	}
+}

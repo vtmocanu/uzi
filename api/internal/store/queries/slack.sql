@@ -256,10 +256,19 @@ RETURNING *;
 -- replies bind to can never belong to two different gates. NULL = the run had no allocated
 -- revision (a pre-#1795 publication); a verdict from such a card sends no expected revision.
 -- DISTINCT from gate_generation, which counts plan messages, not gate presentations.
+--
+-- An EQUAL generation is also admitted when it carries a higher revision than the stamped one
+-- (PRD #1795 M5 review): a state event read between the worker saving plan N+1's message and
+-- reporting the N+1 gate stamps a plan-N card at generation N+1, and the real N+1 gate re-cards
+-- at that same generation. A NULL stamped revision (legacy card) keeps the generation-only guard,
+-- and an older or equal revision at an equal generation is still refused.
 UPDATE slack_run_messages
 SET gate_ts = @gate_ts, gate_state = @gate_state, gate_generation = @gate_generation,
     gate_revision = sqlc.narg(gate_revision)::bigint, updated_at = now()
-WHERE run_id = @run_id AND (gate_generation IS NULL OR gate_generation < @gate_generation)
+WHERE run_id = @run_id
+  AND (gate_generation IS NULL OR gate_generation < @gate_generation
+       OR (gate_generation = @gate_generation AND gate_revision IS NOT NULL
+           AND sqlc.narg(gate_revision)::bigint > gate_revision))
 RETURNING *;
 
 -- name: SetSlackRunMilestoneNotified :one

@@ -958,3 +958,35 @@ func TestReplierVerdictReplyRevisionMismatchAnswersSuperseded(t *testing.T) {
 		})
 	}
 }
+
+// A revise reply refused for a changed revision retires its card button-free (PRD #1795 M5
+// review): the CAS already cleared the anchor, so the notifier will never edit that card again,
+// and leaving its buttons live would invite clicks that can only be refused. The copy must be
+// true whether the gate changed or the run left it, and carries no em dash.
+func TestReplierReviseMismatchRetiresCard(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user, anchor: revisionAnchorRow(runID, gateStateRevisePending, 2)}
+	sub := &fakeSubmitter{run: awaitingRun(runID, user.ID), currentGateRevision: 3}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+
+	r.HandleMessage(context.Background(), reply("stale feedback"))
+
+	if len(fp.updateBlocks) != 1 {
+		t.Fatalf("the refused revise must edit exactly its own card: %+v", fp.updateBlocks)
+	}
+	u := fp.updateBlocks[0]
+	if u.ts != "gate1" || u.channel != "D1" || len(u.actionIDs) != 0 {
+		t.Fatalf("the card must be edited in place, button-free: %+v", u)
+	}
+	if u.sectionText != gateNoLongerOpenText || u.fallback != gateNoLongerOpenText {
+		t.Fatalf("the retired card must read %q: %+v", gateNoLongerOpenText, u)
+	}
+	lower := strings.ToLower(u.sectionText)
+	if strings.Contains(lower, "changed") && !strings.Contains(lower, "no longer") {
+		t.Fatalf("the copy must not claim the gate changed (the run may have left it): %q", u.sectionText)
+	}
+	if strings.ContainsRune(u.sectionText, '—') {
+		t.Fatalf("user-facing copy must not carry an em dash: %q", u.sectionText)
+	}
+}

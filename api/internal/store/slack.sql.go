@@ -705,7 +705,10 @@ const setSlackRunGateGen = `-- name: SetSlackRunGateGen :one
 UPDATE slack_run_messages
 SET gate_ts = $1, gate_state = $2, gate_generation = $3,
     gate_revision = $4::bigint, updated_at = now()
-WHERE run_id = $5 AND (gate_generation IS NULL OR gate_generation < $3)
+WHERE run_id = $5
+  AND (gate_generation IS NULL OR gate_generation < $3
+       OR (gate_generation = $3 AND gate_revision IS NOT NULL
+           AND $4::bigint > gate_revision))
 RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at, park_kind, gate_revision
 `
 
@@ -728,6 +731,12 @@ type SetSlackRunGateGenParams struct {
 // replies bind to can never belong to two different gates. NULL = the run had no allocated
 // revision (a pre-#1795 publication); a verdict from such a card sends no expected revision.
 // DISTINCT from gate_generation, which counts plan messages, not gate presentations.
+//
+// An EQUAL generation is also admitted when it carries a higher revision than the stamped one
+// (PRD #1795 M5 review): a state event read between the worker saving plan N+1's message and
+// reporting the N+1 gate stamps a plan-N card at generation N+1, and the real N+1 gate re-cards
+// at that same generation. A NULL stamped revision (legacy card) keeps the generation-only guard,
+// and an older or equal revision at an equal generation is still refused.
 func (q *Queries) SetSlackRunGateGen(ctx context.Context, arg SetSlackRunGateGenParams) (SlackRunMessage, error) {
 	row := q.db.QueryRow(ctx, setSlackRunGateGen,
 		arg.GateTs,

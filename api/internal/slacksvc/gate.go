@@ -61,6 +61,11 @@ var ErrGateRevisionMismatch = errors.New("slack: plan gate revision changed")
 // the anchor moved to a newer card, or the server refused the card's revision.
 const gateSupersededText = "This gate was superseded — scroll down to the latest plan message."
 
+// gateNoLongerOpenText retires a gate card whose verdict the server refused for a changed
+// revision (PRD #1795 M5). The refusal cannot tell a newer plan from a run that left the gate,
+// so the copy claims neither: it only says this card is closed and where to look instead.
+const gateNoLongerOpenText = "This plan gate is no longer open. Check the latest message in this thread, or open the run in uzi."
+
 // ErrAnswerStale and ErrNotAwaitingInput are the replier-facing translations of
 // workersvc's ErrStaleAnswer / ErrRunNotAwaitingInput (PRD #88 M3). Both mean the run
 // left the question the reply was written against, between the replier reading its
