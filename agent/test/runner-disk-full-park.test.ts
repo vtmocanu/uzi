@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import { RequestError, WorkerClient } from "../src/client.js";
-import { DataVolumeGuard } from "../src/disk-full.js";
+import { DataVolumeFullError, DataVolumeGuard } from "../src/disk-full.js";
 import type { StatfsSample } from "../src/stats.js";
 import type { RecoveryReleaseResponse, StateAck, StateRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
@@ -574,7 +574,7 @@ describe("RunRunner — the data-volume reclaim wait is bounded and abortable (P
     });
   });
 
-  it("a worker shutdown during the wait parks at once, without the retry", async () => {
+  it("a worker shutdown during the wait leaves the run for requeue: no park, no release, no failed report (N4)", async () => {
     await withHome("uzi-diskpark-wait-shutdown-", async (homeRoot) => {
       const client = new DiskParkClient([FEATURE, FENCE, ECHO]);
       const { factory } = homeFactory(homeRoot);
@@ -589,9 +589,62 @@ describe("RunRunner — the data-volume reclaim wait is bounded and abortable (P
       await runner.execute(gitlabClaim(1833, { claim_generation: 33 }));
 
       assert.ok(Date.now() - started < 60_000, "the shutdown ended the wait");
-      assert.strictEqual(calls(), 0, "the preflight parked before any clone");
+      assert.strictEqual(calls(), 0, "the preflight stopped before any clone");
       assert.strictEqual(probe.reclaims(), 1);
-      assert.strictEqual(park(client)?.recovery_cause, "data_volume_full");
+      assert.strictEqual(park(client), undefined, "a drain spends no counted disk park");
+      assert.strictEqual(client.releaseCalls.length, 0, "the custody hold is left for the requeue");
+      assert.ok(!statuses(client).includes("failed"), "the run stays non-terminal for the server to requeue");
+    });
+  });
+
+  it("a pause-now during the wait hands the run to the pause handling, never a data_volume_full park (N1)", async () => {
+    await withHome("uzi-diskpark-wait-pause-", async (homeRoot) => {
+      const claim = gitlabClaim(1834, { claim_generation: 34 });
+      const client = new DiskParkClient([FEATURE, FENCE, ECHO]);
+      const { factory } = homeFactory(homeRoot);
+      const calls = failingClone();
+      let samples = 0;
+      const probe = guardWith(() => (samples++ === 0 ? ROOMY : FULL), {
+        onReclaim: () => api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]),
+        reclaimPass: stuckPass,
+      });
+      const started = Date.now();
+      // The default 2-minute bound stays in force: only the pause can end the wait in time.
+      await makeRunner(client, factory, probe.guard).execute(claim);
+
+      assert.ok(Date.now() - started < 60_000, "the pause ended the wait");
+      assert.strictEqual(calls(), 1, "no retry after the pause");
+      assert.strictEqual(park(client), undefined, "no data_volume_full park");
+      assert.strictEqual(client.releaseCalls.length, 0, "no disk-park custody release");
+      assert.ok(!statuses(client).includes("failed"), "a pause never fails the run");
+    });
+  });
+});
+
+describe("RunRunner — the data_volume_full park is pre-clone only (PRD #1809 M5b N2)", () => {
+  it("a DataVolumeFullError with a clone in place releases nothing and takes today's failed path", async () => {
+    await withHome("uzi-diskpark-postclone-", async (homeRoot) => {
+      const client = new DiskParkClient([FEATURE, FENCE, ECHO]);
+      let reached = false;
+      const factory: ExecutorFactory = (runId) => {
+        const runHome = path.join(homeRoot, runId);
+        fs.mkdirSync(runHome, { recursive: true });
+        return {
+          homeDir: runHome,
+          executor: {
+            run: async () => {
+              reached = true;
+              throw new DataVolumeFullError("mid-run write");
+            },
+          },
+        };
+      };
+      await makeRunner(client, factory).execute(gitlabClaim(1851, { claim_generation: 51 }));
+
+      assert.ok(reached, "the clone succeeded and the executor ran");
+      assert.strictEqual(client.releaseCalls.length, 0, "a hold over a clone is never released by the pre-clone park");
+      assert.strictEqual(park(client), undefined, "no park");
+      assert.ok(statuses(client).includes("failed"), "today's failed path");
     });
   });
 });

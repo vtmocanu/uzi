@@ -1710,11 +1710,11 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
           {vaultPark
             ? "Nothing is lost: the run's work was saved before it parked, and it picks up where it left off."
             : diskPark
-              ? // PRD #1809: a disk park frees space by dropping caches (this run's build caches
-                // included), so the generic "keeps its branch and its history" line is not the
-                // claim to make; what holds is the branch, its pushed checkpoint, and the
-                // run's work the worker keeps until it resumes.
-                "The run keeps its branch and its pushed checkpoint, and the worker keeps the run's work until it resumes."
+              ? // PRD #1809: a disk park frees space on the worker, so the generic "keeps its
+                // branch and its history" line is not the claim to make. A first-claim park may
+                // have no branch or checkpoint yet, so only what the run already has is kept,
+                // plus the run's work the worker keeps until it resumes.
+                "Any branch or pushed checkpoint the run already has is kept, and the worker keeps the run's work until it resumes."
               : "Nothing is lost — the run keeps its branch and its history and picks up where it left off."}
         </p>
       </div>
@@ -1756,7 +1756,7 @@ function VaultLockedParkBody({ retryAt }: { retryAt: string | null }) {
 /**
  * PRD #1809 M5: the body of a `data_volume_full` recovery park. The worker's data volume is full
  * or nearly full (a park can be preventive, before the volume fills), uzi frees space on that
- * worker (this run's build caches included), and the run resumes at its next retry (`retryAt`,
+ * worker, and the run resumes at its next retry (`retryAt`,
  * HH:MM, or null when the server sent no stamp), the same words as `uzi run get` and the TUI.
  * `parkCount` is the run's lifetime count of COUNTED disk parks: preventive parks are not
  * counted, so it can read 0 across several parks. The server's cap on it is not on the DTO (and
@@ -1766,7 +1766,7 @@ function DiskFullParkBody({ retryAt, parkCount }: { retryAt: string | null; park
   return (
     <>
       <p className="mt-0.5 text-xs text-muted">
-        {`The worker's disk is full or nearly full. uzi frees space (including this run's build caches), and the run resumes at its next retry${retryAt ? ` (${retryAt})` : ""}. No action is needed.`}
+        {`The worker's disk is full or nearly full. uzi frees space on the worker and the run resumes at its next retry${retryAt ? ` (${retryAt})` : ""}. No action is needed.`}
       </p>
       <p className="mt-1.5 text-xs text-muted">
         {`Counted disk parks so far: ${parkCount}. If the disk stays full, the run can fail after repeated counted parks.`}
@@ -2045,7 +2045,7 @@ export function RunView() {
             : parkKey === "vault_locked"
               ? "This run is waiting for vault unlock. The run owner's vault was locked when this Codex run needed its credential. Once the vault is unlocked, the run resumes at its next retry."
             : parkKey === "data_volume_full"
-              ? "This run is waiting for disk space. The worker's disk is full or nearly full; uzi frees space (including this run's build caches), and the run resumes at its next retry."
+              ? "This run is waiting for disk space. The worker's disk is full or nearly full; uzi frees space on the worker and the run resumes at its next retry."
             : parkKey.startsWith("codex:")
               ? codexHoldCopy(parkKey.slice("codex:".length) || null, "").announce
             : parkKey === "credential_disabled"

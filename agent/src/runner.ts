@@ -552,6 +552,19 @@ class RunningAckTerminalError extends Error {
   }
 }
 
+/**
+ * PRD #1809 D6 (N4): a worker shutdown ended a pre-clone data-volume reclaim wait. executeClaim
+ * leaves the run non-terminal for the server to requeue, with NO park report (a counted
+ * data_volume_full park would spend the run's cap on the worker's own drain) and no custody
+ * release. Local, thrown and caught entirely within this file.
+ */
+class DataVolumeWaitShutdown extends Error {
+  constructor(readonly operation: string) {
+    super(`worker shut down during the data-volume reclaim wait (${operation})`);
+    this.name = "DataVolumeWaitShutdown";
+  }
+}
+
 /** Map a known failure-reason CONSTANT to the server's fail_origin enum (PRD #69
  *  M7a). Authored WORKER-SIDE from the reason constant the throw site used — it never
  *  parses free text: it matches only the fixed prefixes the two fatal pre-start
@@ -2256,6 +2269,19 @@ export class RunRunner {
         if (outcome === "fail") {
           await this.reportGenericFailure(claim, flight, err);
         }
+      } else if (err instanceof DataVolumeWaitShutdown) {
+        // PRD #1809 D6 (N4): the worker began draining while a pre-clone run waited on the D7
+        // reclaim. Today's pre-clone shutdown posture (reconcileForgeParkByProbe's drain arm):
+        // report nothing, so the run stays non-terminal and the server requeues it, keep HOME and
+        // the SDK session only when a resume transcript is resolvable here (D4), and close the
+        // batcher so this execution can drain. The custody hold is left open, as any interrupted
+        // claim leaves it.
+        runLog.info("run interrupted by worker shutdown during the data-volume reclaim wait; leaving it for requeue", {
+          run_id: flight.runId,
+          operation: err.operation,
+        });
+        await this.preserveForgeParkSessionIfResolvable(claim, flight, runLog, runHome);
+        await batcher.close().catch(() => undefined);
       } else if (err instanceof ServerWallParkedError) {
         // PRD #1497 M2 (D5/D16/D17): a fenced report revealed the run was SERVER-PARKED at its
         // wall-clock limit (paused + budget_exhausted). Caught BEFORE the StaleClaimError arm below:
@@ -3044,9 +3070,11 @@ export class RunRunner {
    * returns, so the after-failure sample alone can show room the failing write never had.
    *
    * The reclaim wait is bounded and abortable ({@link awaitDataVolumeReclaim}). On a timeout the
-   * retry still runs. When the run is cancelled or the worker shuts down during the wait, the retry
-   * is skipped and the full verdict already in hand parks the run: the park is claim-fenced, and a
-   * stamped stop verdict turns it into a cancel server-side.
+   * retry still runs. When the owner cancels the run during the wait, the retry is skipped and the
+   * full verdict already in hand parks the run: the park is claim-fenced, and a stamped stop
+   * verdict turns it into a cancel server-side. A worker shutdown or any other abort of the flight
+   * (a pause, a credential switch, a claim fence) ends the wait by throwing to that reason's own
+   * handling instead, never a counted disk park.
    */
   private async withDataVolumeRetry<T>(
     flight: RunFlight,
@@ -3078,7 +3106,7 @@ export class RunRunner {
         error: errMessage(err),
       });
       const wait = await this.awaitDataVolumeReclaim(guard, flight, operation);
-      if (wait === "cancelled" || wait === "shutdown") throw new DataVolumeFullError(operation, err);
+      if (wait === "cancelled") throw new DataVolumeFullError(operation, err);
       before = guard.sample();
       try {
         return await op();
@@ -3093,32 +3121,44 @@ export class RunRunner {
 
   /**
    * PRD #1809 D6 (N3) — wait for one D7 reclaim pass, bounded by `dataVolumeReclaimWaitMs` and cut
-   * short by the run's cancel (the steering cancel aborts `flight.cancel`) or a worker shutdown.
-   * Pre-clone the flight is not yet in `activeRuns`, so `shutdown()` reaches it only through the
-   * runner's own shutdown signal. The pass itself is not aborted: it belongs to the disk-pressure
-   * controller and keeps running; only this run stops waiting for it.
+   * short by a worker shutdown or any abort of `flight.cancel`. Pre-clone the flight is not yet in
+   * `activeRuns`, so `shutdown()` reaches it only through the runner's own shutdown signal. The
+   * pass itself is not aborted: it belongs to the disk-pressure controller and keeps running; only
+   * this run stops waiting for it.
+   *
+   * How the wait ends decides what happens next (N1/N4):
+   *  - "reclaimed" / "timeout": the caller re-checks (retry or re-sample).
+   *  - "cancelled": ONLY an owner cancel (the sticky `steering.isCancelled()`). The caller parks on
+   *    the full verdict without a retry; the api's stamped stop turns that park into a cancel.
+   *  - a worker shutdown throws {@link DataVolumeWaitShutdown}: the run is left for requeue.
+   *  - any other abort of `flight.cancel` (a pause-now or wall pause, a credential switch, a claim
+   *    fence) rethrows the abort's reason, so executeClaim's catch hands it to that reason's own
+   *    arm exactly as if the signal had escaped anywhere else. None of these is a counted disk park.
    */
   private async awaitDataVolumeReclaim(
     guard: DataVolumeGuard,
     flight: RunFlight,
     operation: string,
-  ): Promise<"reclaimed" | "timeout" | "cancelled" | "shutdown"> {
-    const interrupted = (): "cancelled" | "shutdown" | undefined =>
+  ): Promise<"reclaimed" | "timeout" | "cancelled"> {
+    type Outcome = "reclaimed" | "timeout" | "cancelled" | "shutdown" | "aborted";
+    const interrupted = (): Outcome | undefined =>
       this.shuttingDownGlobal
         ? "shutdown"
-        : flight.cancel.signal.aborted || flight.steering.isCancelled()
+        : flight.steering.isCancelled()
           ? "cancelled"
-          : undefined;
+          : flight.cancel.signal.aborted
+            ? "aborted"
+            : undefined;
     const early = interrupted();
     const outcome =
       early ??
-      (await new Promise<"reclaimed" | "timeout" | "cancelled" | "shutdown">((resolve) => {
+      (await new Promise<Outcome>((resolve) => {
         const signals = [flight.cancel.signal, this.shutdownSignal.signal];
-        const onAbort = (): void => finish(interrupted() ?? "cancelled");
+        const onAbort = (): void => finish(interrupted() ?? "aborted");
         const timer = setTimeout(() => finish("timeout"), this.dataVolumeReclaimWaitMs);
         timer.unref?.();
         let done = false;
-        const finish = (o: "reclaimed" | "timeout" | "cancelled" | "shutdown"): void => {
+        const finish = (o: Outcome): void => {
           if (done) return;
           done = true;
           clearTimeout(timer);
@@ -3129,29 +3169,41 @@ export class RunRunner {
         // guard.reclaim never throws.
         void guard.reclaim().then(() => finish("reclaimed"));
       }));
-    if (outcome !== "reclaimed") {
-      flight.runLog.warn(
-        outcome === "timeout"
-          ? "data volume reclaim pass did not finish in time; moving on without it"
-          : "data volume reclaim wait interrupted; parking on the full verdict without a retry",
-        {
-          run_id: flight.runId,
-          operation,
-          cause: "data_volume_full",
-          outcome,
-          ...(outcome === "timeout" ? { wait_ms: this.dataVolumeReclaimWaitMs } : {}),
-        },
-      );
+    if (outcome === "reclaimed") return outcome;
+    const log = {
+      run_id: flight.runId,
+      operation,
+      cause: "data_volume_full",
+      outcome,
+      ...(outcome === "timeout" ? { wait_ms: this.dataVolumeReclaimWaitMs } : {}),
+    };
+    switch (outcome) {
+      case "timeout":
+        flight.runLog.warn("data volume reclaim pass did not finish in time; moving on without it", log);
+        return outcome;
+      case "cancelled":
+        flight.runLog.warn("data volume reclaim wait ended by the owner's cancel; parking on the full verdict without a retry", log);
+        return outcome;
+      case "shutdown":
+        flight.runLog.warn("data volume reclaim wait ended by a worker shutdown; leaving the run for requeue", log);
+        throw new DataVolumeWaitShutdown(operation);
+      case "aborted": {
+        const reason: unknown = flight.cancel.signal.reason;
+        flight.runLog.warn("data volume reclaim wait interrupted; handing the run to the interrupt's own handling", {
+          ...log,
+          reason: reason instanceof Error ? reason.name : String(reason),
+        });
+        throw reason instanceof Error ? reason : new Error(`run interrupted during the data-volume reclaim wait (${operation})`);
+      }
     }
-    return outcome;
   }
 
   /**
    * PRD #1809 D6 — the claim/resume preflight. When the api can take the typed park and the run
    * can be fenced for it, sample the data volume before the clone/fetch; below its floor, run the
    * D7 reclaim (bounded and abortable, as in {@link withDataVolumeRetry}) and re-sample, and still
-   * below → {@link DataVolumeFullError}, parked like the typed handling. A cancel or shutdown
-   * during the wait parks at once on the full sample. Gated on the feature: against an older api
+   * below → {@link DataVolumeFullError}, parked like the typed handling. An owner cancel during the
+   * wait parks at once on the full sample; a shutdown or any other abort throws to its own handling. Gated on the feature: against an older api
    * the untyped park carries no cap, so a preflight there would only add parks the typed handling
    * does not need; the retry around the clone still guards it. An unknown sample never parks.
    */
@@ -3165,7 +3217,7 @@ export class RunRunner {
       cause: "data_volume_full",
     });
     const wait = await this.awaitDataVolumeReclaim(guard, flight, "preflight");
-    if (wait === "cancelled" || wait === "shutdown") throw new DataVolumeFullError("preflight");
+    if (wait === "cancelled") throw new DataVolumeFullError("preflight");
     if (guard.preflight() === "data_volume_full") throw new DataVolumeFullError("preflight");
   }
 
@@ -3198,8 +3250,16 @@ export class RunRunner {
    *
    * The release is not atomic with the park; that is safe because the released generation adopted
    * nothing: a park that then fails (400, unrecognised ack) or turns into a stop leaves no work
-   * behind the released hold, and the failed path's own settle finds nothing left to release. A
-   * claim that cannot be fenced returns "fail" (today's failed path).
+   * behind the released hold. Before the clone the failed path has no settle of its own to run
+   * (reapRecoveryProviderForSettle returns false while `flight.barePath` is unset), so this release
+   * is the only one the generation gets. The arms that return "fail" BEFORE the release (no claim
+   * generation, no exact-release echo, no positive proof) therefore leave the pre-clone hold open,
+   * as every other pre-clone failure does today.
+   *
+   * N2: every such park is pre-clone by construction. The release is guarded on it: a
+   * DataVolumeFullError that arrives with a clone in place (`flight.barePath` set) releases nothing
+   * and takes today's failed path with a warn, because a hold over a clone may cover adopted work
+   * (M4's mid-run park is a separate path).
    */
   private async handleDataVolumeFull(
     err: DataVolumeFullError,
@@ -3211,6 +3271,14 @@ export class RunRunner {
   ): Promise<"parked" | "stop" | "fail"> {
     if (!this.dataVolumeParkable(claim)) {
       runLog.warn("data volume full, but this claim carries no claim generation to fence a park; taking today's failed path", {
+        run_id: flight.runId,
+        operation: err.operation,
+        cause: "data_volume_full",
+      });
+      return "fail";
+    }
+    if (flight.barePath !== undefined) {
+      runLog.warn("data volume full after the clone; a pre-clone disk park cannot release this custody hold, taking today's failed path", {
         run_id: flight.runId,
         operation: err.operation,
         cause: "data_volume_full",

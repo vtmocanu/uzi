@@ -31,7 +31,7 @@ func diskParkRun(id string) apitypes.RunDTO {
 // isDiskFullPark on the cause alone.
 func TestDiskParkLine(t *testing.T) {
 	r := diskParkRun("r1")
-	want := "waiting for disk space: the worker's data volume is full or nearly full; uzi frees space (including this run's build caches) and the run resumes at its next retry (" +
+	want := "waiting for disk space: the worker's data volume is full or nearly full; uzi frees space on the worker and the run resumes at its next retry (" +
 		r.RecoveryRetryNotBefore.Local().Format("15:04") + "); counted disk parks: 2"
 	if got := diskParkLine(r); got != want {
 		t.Errorf("diskParkLine = %q, want %q", got, want)

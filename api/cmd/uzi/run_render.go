@@ -1771,7 +1771,7 @@ func diskParkLine(r apitypes.RunDTO) string {
 	if !isDiskFullPark(r) {
 		return ""
 	}
-	return diskParkLead + ": the worker's data volume is full or nearly full; uzi frees space (including this run's build caches) and the run resumes at " +
+	return diskParkLead + ": the worker's data volume is full or nearly full; uzi frees space on the worker and the run resumes at " +
 		vaultRetryClause(r) + "; " + diskParkCountClause(r)
 }
 
