@@ -103,4 +103,6 @@ image at build time and reported at registration, and each release builds a fres
 hosted worker's reported version is what it actually runs. Just after a roll, a worker whose
 new pod is Ready but has not re-registered yet briefly reads *upgrading*; after that, a worker
 still reporting an older release (for example one cordoned while it finishes work on its previous
-pod) reads *outdated* until it rolls.
+pod) reads *outdated* until it rolls. Agent images published before release 0.84.0 could be re-tagged
+aliases that report an older version than their tag; a worker pinned to one reads *outdated*
+for good, so move the pin to a current release.
