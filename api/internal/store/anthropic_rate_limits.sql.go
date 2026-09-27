@@ -667,11 +667,14 @@ SELECT EXISTS (
 )
 `
 
-// Whether the user holds an anthropic_token secret, for GET /api/me/rate-limits:
-// the handler derives `no_token` from this (secret-existence), not from the
-// rate_limits rows being absent. Deliberately NOT filtered on is_default — it
-// answers "does this user have any credential at all", which is the question
-// `no_token` asks. Never selects the ciphertext.
+// Whether the user holds an anthropic_token secret at all, enabled or disabled
+// (secret-existence, not the rate_limits rows being absent). Callers are the worker
+// claim path's credential checks in workersvc: claim_assembly.go
+// (anthropicSlotAllDisabled: tokens held but none enabled), credential_disabled.go
+// (noAnthropicTokenAtAll: release a held lane with nothing left to enable) and
+// harness_resolver.go (explicitHarnessRefusal: disabled vs no credential). Deliberately
+// NOT filtered on is_default or disabled_at: it answers "does this user have any
+// credential at all". Never selects the ciphertext.
 func (q *Queries) UserHasAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error) {
 	row := q.db.QueryRow(ctx, userHasAnthropicToken, userID)
 	var exists bool

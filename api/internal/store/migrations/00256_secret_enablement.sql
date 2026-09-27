@@ -11,7 +11,10 @@ ALTER TABLE anthropic_rate_limits ADD COLUMN enablement_rev bigint NOT NULL DEFA
 -- was polled under (the poll's fenced enablement_sig). It is current only while every
 -- currently ENABLED linked alias appears in it at its current revision. NULL marks a row
 -- written before this column existed, when every credential was at revision 0; readers
--- treat it as covering exactly the revision-0 aliases, so no backfill is needed.
+-- treat it as covering exactly the revision-0 aliases, so no backfill is needed. That
+-- makes a NULL row tolerate a newly linked rev-0 alias, while a stamped row does not
+-- (the new alias's id is not in its list): the stamped reading is not current until the
+-- next successful poll re-stamps it.
 ALTER TABLE codex_account_rate_limits ADD COLUMN enablement_sig text;
 CREATE INDEX runs_credential_disabled_promoter_idx ON runs (user_id, status_since, id)
     WHERE status = 'paused' AND hold_reason = 'credential_disabled';

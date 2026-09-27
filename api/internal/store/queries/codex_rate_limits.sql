@@ -54,7 +54,9 @@
 -- guarantees it is the account's linked-alias list at write time, and the reads
 -- (GetCodexAccountRateLimitsForUser, ListCodexAccountRateLimits) treat the reading as
 -- current only while every enabled linked alias still appears in it at its current
--- revision, so a pre-disable reading is not shown after a re-enable.
+-- revision, so a pre-disable reading is not shown after a re-enable. The same rule hides
+-- the reading after a newly linked alias or a sibling's re-enable until the next successful
+-- poll re-stamps it: conservative, since the account reading itself has not changed.
 WITH secret_mutation_lock AS MATERIALIZED (
     SELECT pg_advisory_xact_lock_shared(
         1970959211,
@@ -216,7 +218,11 @@ LEFT JOIN codex_account_rate_limits rl
     -- the reading's enablement_sig at its current revision (NULL = a pre-column row, which
     -- covers exactly the revision-0 aliases). A reading from before a disable and re-enable
     -- therefore reads as no reading (pending) until the re-enable's own poll lands one. A
-    -- sibling that was disabled, or linked, while the account stayed live does not hide it.
+    -- sibling DISABLED while the account stayed live does not hide it (disabled aliases are
+    -- not checked), but a NEWLY LINKED enabled alias, or a sibling's re-enable, does: its
+    -- (id, rev) is not in the stamp, so the reading is not current until the next
+    -- successful poll re-stamps it, and a failed poll in that window drops it
+    -- (RecordCodexAccountPollFailure). Conservative by design.
     AND NOT EXISTS (
         SELECT 1 FROM codex_credential_state cs
         JOIN user_secrets us ON us.id = cs.user_secret_id AND us.user_id = cs.user_id
@@ -280,7 +286,11 @@ LEFT JOIN codex_account_rate_limits rl
     -- the reading's enablement_sig at its current revision (NULL = a pre-column row, which
     -- covers exactly the revision-0 aliases). A reading from before a disable and re-enable
     -- therefore reads as no reading (pending) until the re-enable's own poll lands one. A
-    -- sibling that was disabled, or linked, while the account stayed live does not hide it.
+    -- sibling DISABLED while the account stayed live does not hide it (disabled aliases are
+    -- not checked), but a NEWLY LINKED enabled alias, or a sibling's re-enable, does: its
+    -- (id, rev) is not in the stamp, so the reading is not current until the next
+    -- successful poll re-stamps it, and a failed poll in that window drops it
+    -- (RecordCodexAccountPollFailure). Conservative by design.
     AND NOT EXISTS (
         SELECT 1 FROM codex_credential_state cs
         JOIN user_secrets us ON us.id = cs.user_secret_id AND us.user_id = cs.user_id

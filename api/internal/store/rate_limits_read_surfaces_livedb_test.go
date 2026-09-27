@@ -177,8 +177,10 @@ func TestCodexRateLimitReadsUseEnabledAliasesLiveDB(t *testing.T) {
 // disabled and re-enabled, the old reading is not current in either read (no buckets, no
 // last success, so the meter reads pending), until a fresh poll lands one. A failed first
 // poll after the re-enable surfaces as an attempt with no reading instead of staying hidden.
-// A sibling disabled while the account stayed live does not hide a current reading, and a
-// row written before the stamp existed (NULL) stays current while every alias is at rev 0.
+// A sibling disabled while the account stayed live does not hide a current reading, but a
+// newly linked enabled alias does until the next successful poll (a failed poll in between
+// drops it). A row written before the stamp existed (NULL) stays current while every alias
+// is at rev 0, including a newly linked one.
 func TestCodexReadingNotCurrentAfterReenableLiveDB(t *testing.T) {
 	ctx, pool, q, user := codexLiveDB(t)
 	upsert := func(acc uuid.UUID) {
@@ -265,6 +267,32 @@ func TestCodexReadingNotCurrentAfterReenableLiveDB(t *testing.T) {
 		t.Fatal("the reading is current across the sibling's re-enable")
 	}
 
+	// --- a newly linked enabled alias (conservative, N1): its (id, rev) is not in the stamp,
+	// so the reading is not current until the next successful poll; a failed poll in that
+	// window drops it, and a successful poll restores it ---
+	linked, _ := mkLinkedCodexAccount(ctx, t, pool, q, user, "linked-a", false)
+	upsert(linked)
+	if s, _ := current(linked); !s {
+		t.Fatal("control: a fresh reading is not current")
+	}
+	addLinkedAlias(ctx, t, pool, q, user, linked, "linked-b", false)
+	if s, _ := current(linked); s {
+		t.Fatal("the reading is current across a newly linked enabled alias")
+	}
+	fail(linked)
+	if s, at := current(linked); s || !at {
+		t.Fatalf("after a failed poll following the new link: success=%v attempt=%v, want an attempt and no reading", s, at)
+	}
+	var linkedBuckets []byte
+	if err := pool.QueryRow(ctx, `SELECT buckets FROM codex_account_rate_limits WHERE user_id = $1 AND provider_account_id = $2`,
+		user, linked).Scan(&linkedBuckets); err != nil || linkedBuckets != nil {
+		t.Fatalf("stale reading kept after the new-link failure: buckets %q (err %v), want NULL", linkedBuckets, err)
+	}
+	upsert(linked)
+	if s, _ := current(linked); !s {
+		t.Fatal("a reading polled after the new link is not current")
+	}
+
 	// --- a row stamped before the column existed (NULL) ---
 	legacy, legacyAlias := mkLinkedCodexAccount(ctx, t, pool, q, user, "legacy", false)
 	mustExec(ctx, t, pool, `INSERT INTO codex_account_rate_limits
@@ -273,6 +301,11 @@ func TestCodexReadingNotCurrentAfterReenableLiveDB(t *testing.T) {
 		VALUES ($1, $2, '[{"id":"primary"}]'::jsonb, 0, 0, now(), now(), 'ok')`, user, legacy)
 	if s, _ := current(legacy); !s {
 		t.Fatal("a pre-column (NULL-stamped) reading at revision 0 is not current")
+	}
+	// Unlike a stamped row, a NULL row tolerates a newly linked revision-0 alias.
+	addLinkedAlias(ctx, t, pool, q, user, legacy, "legacy-b", false)
+	if s, _ := current(legacy); !s {
+		t.Fatal("a NULL-stamped reading is hidden by a newly linked revision-0 alias")
 	}
 	setEnabled(ctx, t, q, user, legacyAlias, false)
 	setEnabled(ctx, t, q, user, legacyAlias, true)
