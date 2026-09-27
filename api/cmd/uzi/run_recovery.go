@@ -36,7 +36,11 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			"healthy protection of a still-running run and needs nothing.\n\n" +
 			"--json emits each of the run's hold DTOs plus a `captures` array listing that hold's " +
 			"recovery captures (id, state, source_sha, byte_size, created_at); a capture id is what " +
-			"`run export --capture` takes. A hold that outlived its deleted run lists `captures: []`.",
+			"`run export --capture` takes. A hold that outlived its deleted run lists `captures: []`.\n\n" +
+			"While the server retains the run's last published checkpoint on origin, the hold also " +
+			"names where it lives: `refs/uzi-checkpoints/<branch>`, or `refs/uzi-recovery/<run-id>` " +
+			"once a newer run on the same branch superseded it, with its tip and retention state " +
+			"(--json: checkpoint_ref, checkpoint_tip, checkpoint_state).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)
@@ -174,11 +178,39 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 	if err := p.Table([]string{"HOLD ID", "GEN", "DISPOSITION", "STATE", "CAPTURE", "WORKER"}, rows); err != nil {
 		return err
 	}
+	for _, h := range holds {
+		if line := checkpointLine(h); line != "" {
+			p.Printf("%s\n", line)
+		}
+	}
 	if decisionNeeded > 0 && !gf.quiet {
 		p.Printf("\n%d hold(s) await a decision: recover with `uzi run export` or discard with "+
 			"`uzi run discard %s --hold <hold-id> --yes`\n", decisionNeeded, sanitizeTTY(runID))
 	}
 	return nil
+}
+
+// checkpointLine renders where a hold's retained published checkpoint lives on origin (PRD
+// #1810): `hold <id> checkpoint: <ref> @ <12-char tip> (<state>)`, or "" when the hold carries
+// no checkpoint ref. Every field is server-supplied, so each passes cellText (control stripping
+// plus newline/tab folding) before it reaches the terminal; the tip is cut by rune after
+// sanitizing so a hostile value cannot be split into invalid UTF-8.
+func checkpointLine(h apitypes.RecoveryCustodyHoldDTO) string {
+	ref := cellText(h.CheckpointRef)
+	if ref == "" {
+		return ""
+	}
+	line := fmt.Sprintf("hold %s checkpoint: %s", cellText(h.ID), ref)
+	if tip := []rune(cellText(h.CheckpointTip)); len(tip) > 0 {
+		if len(tip) > 12 {
+			tip = tip[:12]
+		}
+		line += " @ " + string(tip)
+	}
+	if state := cellText(h.CheckpointState); state != "" {
+		line += " (" + state + ")"
+	}
+	return line
 }
 
 // captureCell renders a hold's latest capture state, or "-" when the hold has no capture yet.

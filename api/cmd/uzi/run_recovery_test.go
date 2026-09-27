@@ -104,6 +104,52 @@ func TestRunRecoveryJSONCheckpointRef(t *testing.T) {
 	}
 }
 
+// TestRunRecoveryRendersCheckpointRef (PRD #1810 M5): the human render names where a hold's
+// retained checkpoint lives on origin, one line per hold carrying a checkpoint ref (ref, the
+// 12-char tip and the retention state), and prints no such line for a hold without one.
+func TestRunRecoveryRendersCheckpointRef(t *testing.T) {
+	dto := recoveryHoldsFixture()
+	dto.Holds = append(dto.Holds, apitypes.RecoveryCustodyHoldDTO{
+		ID: "hold-run1-gen2", RunID: "run1", Generation: 2, State: "open", Attention: "active",
+		WorkerID: "w1", WorkerName: "alpha",
+		CheckpointRef:   "refs/uzi-recovery/run1",
+		CheckpointTip:   "2222222222222222222222222222222222222222",
+		CheckpointState: "superseded",
+	})
+	fc := &uzicli.FakeClient{RecoveryHoldsResult: dto}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", "run1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	const want = "hold hold-run1-gen2 checkpoint: refs/uzi-recovery/run1 @ 222222222222 (superseded)\n"
+	if !strings.Contains(out, want) {
+		t.Errorf("run recovery output missing the checkpoint line %q:\n%s", want, out)
+	}
+	if n := strings.Count(out, "checkpoint:"); n != 1 {
+		t.Errorf("run recovery printed %d checkpoint lines, want 1 (hold-run1-gen1 has no ref):\n%s", n, out)
+	}
+}
+
+// TestRunRecoveryCheckpointLineSanitizes proves the server-supplied checkpoint fields cannot
+// smuggle a newline or an escape sequence into the rendered line.
+func TestRunRecoveryCheckpointLineSanitizes(t *testing.T) {
+	got := checkpointLine(apitypes.RecoveryCustodyHoldDTO{
+		ID:              "h1",
+		CheckpointRef:   "refs/uzi-recovery/r1\nhold forged checkpoint: x",
+		CheckpointTip:   "\x1b[31mabc",
+		CheckpointState: "retained",
+	})
+	if strings.ContainsAny(got, "\n\x1b") {
+		t.Errorf("checkpointLine leaked a control byte: %q", got)
+	}
+	if !strings.HasPrefix(got, "hold h1 checkpoint: refs/uzi-recovery/r1") || !strings.HasSuffix(got, "(retained)") {
+		t.Errorf("checkpointLine = %q, want the sanitized ref and state", got)
+	}
+	if checkpointLine(apitypes.RecoveryCustodyHoldDTO{ID: "h2", CheckpointTip: "abc"}) != "" {
+		t.Error("checkpointLine rendered a line for a hold with no checkpoint ref")
+	}
+}
+
 // TestRunRecoveryEmptyJSON proves --json emits [] (never null) for a run with no holds.
 func TestRunRecoveryEmptyJSON(t *testing.T) {
 	fc := &uzicli.FakeClient{RecoveryHoldsResult: recoveryHoldsFixture()}
