@@ -65,7 +65,7 @@ func TestValidatePVCCeilings(t *testing.T) {
 			// tier's ceiling must be refused, naming the ephemeral case and its knob.
 			name:    "restricted ceiling below the run-bound /data override",
 			cfg:     RenderConfig{MaxPVCStorage: "25Gi", EphemeralDataSize: "30Gi"},
-			wantErr: []string{"restricted tier", "ephemeral", "30Gi", "UZI_WORKER_EPHEMERAL_DATA_SIZE", "workers.ephemeralWorkerDataSize"},
+			wantErr: []string{"restricted tier", "ephemeral", "30Gi", "at every preset", "UZI_WORKER_EPHEMERAL_DATA_SIZE", "workers.ephemeralWorkerDataSize"},
 		},
 		{
 			name:    "docker ceiling below the run-bound /data override",

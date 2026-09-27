@@ -116,7 +116,8 @@ func ValidatePVCCeilings(cfg RenderConfig, resolver preset.Resolver) error {
 			return fmt.Errorf("%s=%q is not a resource quantity: %w", tier.key, tier.max, err)
 		}
 
-		// The largest claim seen per PVC, and the preset that produced it.
+		// The largest claim seen per PVC, and where it came from (`preset "l"`, or
+		// `every preset` for the preset-independent run-bound /data).
 		type worst struct {
 			size   resource.Quantity
 			preset string
@@ -145,14 +146,16 @@ func ValidatePVCCeilings(cfg RenderConfig, resolver preset.Resolver) error {
 					for _, pvc := range RenderPVCs(cfg, w, spec) {
 						got := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
 						name := strings.TrimPrefix(pvc.Name, NamePrefix+ceilingProbeID)
-						label := size
+						label := fmt.Sprintf("preset %q", size)
 						if !ephemeral {
 							persistent[name] = got
 						} else {
 							if twin, ok := persistent[name]; ok && twin.Cmp(got) == 0 {
 								continue
 							}
-							label = "ephemeral (" + size + ")"
+							// The run-bound size is preset-independent: it is the same
+							// claim at every preset, so name none of them.
+							label = "every preset"
 							name += " (ephemeral, run-bound worker)"
 						}
 						if cur, seen := largest[name]; !seen || got.Cmp(cur.size) > 0 {
@@ -172,7 +175,7 @@ func ValidatePVCCeilings(cfg RenderConfig, resolver preset.Resolver) error {
 			w := largest[name]
 			if w.size.Cmp(max) > 0 {
 				problems = append(problems, fmt.Sprintf(
-					"%s tier: the %s claim is %s at preset %q, which exceeds %s = %s",
+					"%s tier: the %s claim is %s at %s, which exceeds %s = %s",
 					tier.what, name, w.size.String(), w.preset, tier.key, max.String()))
 			}
 		}

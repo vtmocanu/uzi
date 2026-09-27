@@ -562,8 +562,8 @@ func RenderSecret(cfg RenderConfig, w protocol.DesiredWorker, token string) *cor
 //
 // The first two point opposite ways for opposite reasons. /data is the clone
 // cache + per-run workspaces and varies by size for a persistent worker; a run-bound
-// (Ephemeral) worker's /data is instead the flat cfg.dataSize override (issue #1815,
-// see ephemeralDataDefaultSize). /nix is FLAT (20Gi, PRD #87 bump
+// (Ephemeral) worker's /data is instead the flat run-bound size cfg.dataSize returns:
+// the cfg.EphemeralDataSize override, else ephemeralDataDefaultSize (issue #1815). /nix is FLAT (20Gi, PRD #87 bump
 // for the prebaked Chromium closure) and persists because the store is an expensive
 // INTERNET fetch (measured: 209 MB baked pre-#87 -> ~2.6 GiB baked with Chromium),
 // and Decision 9 rolls every worker on every release —
@@ -605,6 +605,11 @@ func RenderPVCs(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) []
 // TestEphemeralDataDefaultFitsTheChartsLimitRangeMax reads them out of values.yaml —
 // and the tiers' quota.requestsStorage budget, which the fleet-storage test checks.
 // ValidatePVCCeilings checks an override against the live ceilings at boot.
+//
+// CHART MIRROR: deploy/chart/templates/worker-invariants.yaml carries a "20Gi" literal
+// for this constant (Helm cannot read Go) so its run-bound /data guard checks the unset
+// path too, and deploy/chart/values.yaml ships workers.ephemeralWorkerDataSize at the
+// same value. Move all three together.
 const ephemeralDataDefaultSize = "20Gi"
 
 // dataSize is the /data PVC size for w: the run-bound size (the cluster's

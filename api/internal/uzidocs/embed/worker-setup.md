@@ -342,7 +342,9 @@ since hosted workers only roll on release — and the operator must size the pre
 to hold that many concurrent runs. It's the same knob described above, and raising
 it opts into the same intra-user residuals just covered. An ephemeral (run-bound)
 hosted worker is always recorded with a cap of 1, whatever it advertises, since it
-only ever runs the one run it was created for.
+only ever runs the one run it was created for. Its `/data` volume also has its own
+operator-set size, 20Gi by default, rather than its size preset's (see
+[Type and size](./hosted-workers.md#type-and-size)).
 
 ## Multiple workers, removing a worker
 

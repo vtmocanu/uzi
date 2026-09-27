@@ -199,6 +199,15 @@ spec:
             - name: UZI_WORKER_EPHEMERAL_REQUEST
               value: {{ . | quote }}
             {{- end }}
+            # A RUN-BOUND worker's /data PVC size (issue #1815). "Ephemeral" = run-bound,
+            # unrelated to ephemeralRequest above. Replaces the preset's DataSize for such
+            # a worker on both tiers; validated at boot against both PVC ceilings, and
+            # worker-invariants.yaml refuses a value over either. Empty leaves the
+            # controller's built-in 20Gi.
+            {{- with .Values.workers.ephemeralWorkerDataSize }}
+            - name: UZI_WORKER_EPHEMERAL_DATA_SIZE
+              value: {{ . | quote }}
+            {{- end }}
             {{- /* Where the worker's join-token Secret mounts (issue #1761). Rendered only
             when set, so a default install renders byte-identically; OpenShift sets it
             because CRI-O shadows /run/secrets (uzi.validateSecretMountPath). */}}
