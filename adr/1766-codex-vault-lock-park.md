@@ -164,13 +164,15 @@ gap: the fix needs its own investigation into safely retrying (or reconciling) a
 failure without risking a double-mint, and is deliberately left to #1770 rather than folded in
 here.
 
-Two related paths also still fail the run, and are noted as follow-ups rather than covered by this
-decision:
+Two related paths are not covered by this decision:
 
 - A lock during a long turn — a mid-turn app-server refresh hitting the same 409 — is not covered
-  by this park; the mid-turn refresh path fails as before.
+  by this park. The refresh bridge collapses the typed reply into a generic refresh failure, so
+  the run can still fail terminally; issue #1789 owns it.
 - Advice-lane credential calls (the isolated advice harness's own credential bridge) are not
-  deferred by this decision either; a vault lock reached from that lane still fails the run.
+  deferred either, but a vault lock there does not fail the run: the judge falls back to its
+  deterministic review, and a review-advice run posts a failed review and completes. The cost is
+  a degraded or failed advice result, not a failed run.
 
 ## Consequences and residuals
 
@@ -185,6 +187,7 @@ decision:
   vault-locked recheck's tolerance from scratch.
 - A post-exchange seal failure combined with a lost reply remains a real, if rare, way for a run
   to still fail outright on a vault lock; issue #1770 owns closing it.
-- A mid-turn app-server refresh and advice-lane credential calls remain un-deferred; both are
-  narrower windows than the boundary-reconcile path this ADR covers, and are listed above as
-  follow-ups rather than taken on here.
+- A mid-turn app-server refresh remains un-deferred and can still fail the run (issue #1789).
+  Advice-lane credential calls remain un-deferred too, but degrade to fallback or failed advice
+  rather than failing the run. Both are narrower windows than the boundary-reconcile path this
+  ADR covers.
