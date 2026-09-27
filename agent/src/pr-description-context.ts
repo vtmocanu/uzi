@@ -10,7 +10,8 @@
 //   3. keeps the whole input under one aggregate budget (120 KiB): the fixed parts first, then diff
 //      hunks fill what is left, code first, then tests, never generated or vendored files;
 //   4. reports which parts were cut (`truncated`), so the prompt can forbid exhaustive claims;
-//   5. renders path names escaped (see renderPath), so a crafted file name cannot forge a row.
+//   5. renders path names and commit subjects escaped (see renderPath), so a crafted file name or
+//      subject cannot forge a row or reorder text with a bidi control.
 //
 // Git access is injected (DeliveryContextGit): the size-line reads of pr-size.ts (merge-base,
 // NUL numstat, check-attr at the head) are reused as-is, and the two extra reads this module needs
@@ -27,7 +28,6 @@ import { classifyPath, parseNumstatZ, type PathAttributes, type SizeBucket, type
 import type { TextRedactor } from "./redact.js";
 import type { PrSummaryClaim } from "./signals.js";
 import type { Delta } from "./summary-runner.js";
-import { errMessage } from "./util.js";
 
 /** Aggregate input budget (D6), in UTF-8 bytes. */
 export const DELIVERY_CONTEXT_BUDGET_BYTES = 120 * 1024;
@@ -52,8 +52,9 @@ const MAX_LISTED_PATHS = 2_000;
 const PATHS_CAP = 24 * 1024;
 /** One file's hunks never take more than this, so one huge file cannot starve the rest. */
 const PER_PATH_DIFF_CAP = 16 * 1024;
-/** Extra bytes read past a per-path cap. A read cut at the bound loses this tail after redaction
- *  (see buildDeliveryContext), which is what keeps a secret straddling the READ boundary out. */
+/** Extra bytes read past a per-path cap. A read cut at the bound loses at least this many VISIBLE
+ *  bytes of its tail after redaction (see dropVisibleTail), which is what keeps a secret straddling
+ *  the READ boundary out. */
 const READ_MARGIN_BYTES = 4 * 1024;
 /** Bound on per-path `git diff` reads, so a many-file PR cannot turn into thousands of spawns. */
 const MAX_DIFF_READS = 200;
@@ -63,9 +64,11 @@ const MIN_USEFUL_DIFF_BYTES = 256;
 export const TRUNCATED_MARKER = "[truncated]";
 const UNAVAILABLE = "(unavailable)";
 const ATTRS_UNAVAILABLE = "(unavailable: attributes could not be read)";
+const ATTRS_DEADLINE = "(unavailable: the deadline was reached before the attributes were read)";
 
-/** A full object name: SHA-1 (40 hex) or SHA-256 (64 hex). */
-const OBJECT_ID_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+/** A full 40-hex (SHA-1) object name: the only form GitCache.sizeMergeBase returns, so the only
+ *  form accepted here. A SHA-256 repository leaves the git parts unavailable. */
+const OBJECT_ID_RE = /^[0-9a-f]{40}$/;
 
 /** The git reads the builder needs. GitCache provides all of them. */
 export interface DeliveryContextGit extends SizeLineGit {
@@ -89,7 +92,7 @@ export interface DeliveryContextInput {
   barePath: string;
   /** The PR's target branch (resolved like the size line's: the bare's origin-tracking ref). */
   targetBranch: string;
-  /** The exact head being published (40- or 64-hex; anything else leaves the git parts unavailable). */
+  /** The exact head being published (40-hex; anything else leaves the git parts unavailable). */
   headSha: string;
   /** D2: the absolute deadline (epoch ms) of the whole publication budget (SummaryRunner
    *  deliverySummaryDeadline). No git read is issued at or after it, each read's timeout is the time
@@ -172,6 +175,46 @@ function capBytes(s: string, maxBytes: number, force = false): { text: string; t
   return { text: utf8Prefix(s, maxBytes - byteLen(suffix)) + suffix, truncated: true };
 }
 
+/** The class of a thrown value, for a warn that must not carry its message (a git error quotes the
+ *  repo path and git's stderr, both attacker-shapeable): an Error's `name` when it is a plain
+ *  identifier, else a fixed fallback. Mirrors summary-runner.ts's errorClass. */
+function errorClass(err: unknown): string {
+  if (err instanceof Error) return /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(err.name) ? err.name : "Error";
+  return typeof err;
+}
+
+/** The invisible runs the redactor skips when it matches a secret (redact.ts INVISIBLE_SRC, kept in
+ *  step with it): an ANSI CSI sequence, or one control (Cc) / format (Cf) character. */
+const INVISIBLE_RE = new RegExp(String.raw`\x1b\[[0-?]*[ -/]*[@-~]|[\p{Cc}\p{Cf}]`, "gu");
+
+/**
+ * Drop the tail of a redacted read that its bound cut: at least `marginBytes` UTF-8 bytes of VISIBLE
+ * text (text outside {@link INVISIBLE_RE} runs), plus the invisible run just before the cut. The
+ * redactor matches a secret across invisible runs, so its unmatched head at the end of a cut read
+ * can be padded with invisible characters to any raw length; counting only visible bytes removes
+ * every such head whose visible length is at most the margin, however long its raw span.
+ */
+function dropVisibleTail(text: string, marginBytes: number): string {
+  const visible: Array<[number, number]> = [];
+  let last = 0;
+  for (const m of text.matchAll(INVISIBLE_RE)) {
+    if (m.index > last) visible.push([last, m.index]);
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) visible.push([last, text.length]);
+  let dropped = 0;
+  for (let v = visible.length - 1; v >= 0; v--) {
+    const [from, to] = visible[v]!;
+    let at = to;
+    for (const ch of Array.from(text.slice(from, to)).reverse()) {
+      at -= ch.length;
+      dropped += byteLen(ch);
+      if (dropped >= marginBytes) return text.slice(0, at === from ? (visible[v - 1]?.[1] ?? 0) : at);
+    }
+  }
+  return "";
+}
+
 /** Redact FIRST, then cap: the cut can never split a secret the redactor would have matched. */
 function part(redact: TextRedactor, raw: string, cap: number): { text: string; truncated: boolean } {
   return capBytes(redact(raw), cap);
@@ -186,19 +229,35 @@ const PATH_UNSAFE_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}"\\]/u;
  *  double-quoted with every unsafe character escaped, so a crafted name (a newline forging an
  *  inventory row, a bidi override reordering one) reads as one inert token. */
 function renderPath(p: string): string {
-  if (!PATH_UNSAFE_RE.test(p)) return p;
-  let out = '"';
-  for (const ch of p) {
-    if (ch === '"' || ch === "\\") out += `\\${ch}`;
-    else if (ch === "\n") out += "\\n";
-    else if (ch === "\t") out += "\\t";
-    else if (ch === "\r") out += "\\r";
-    else if (PATH_UNSAFE_RE.test(ch)) {
-      const cp = ch.codePointAt(0)!;
-      out += cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, "0")}`;
-    } else out += ch;
+  return renderClipped(p, Infinity).text;
+}
+
+/** One character of the escaped (quoted) form. */
+function escapeChar(ch: string): string {
+  if (ch === '"' || ch === "\\") return `\\${ch}`;
+  if (ch === "\n") return "\\n";
+  if (ch === "\t") return "\\t";
+  if (ch === "\r") return "\\r";
+  if (!PATH_UNSAFE_RE.test(ch)) return ch;
+  const cp = ch.codePointAt(0)!;
+  return cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, "0")}`;
+}
+
+/** {@link renderPath}'s form of `s`, at most `maxBytes` UTF-8 bytes, quotes included: the cut falls
+ *  between two escapes, never inside one. `truncated` when something was cut. */
+function renderClipped(s: string, maxBytes: number): { text: string; truncated: boolean } {
+  const quoted = PATH_UNSAFE_RE.test(s);
+  const budget = maxBytes - (quoted ? 2 : 0);
+  let out = "";
+  let used = 0;
+  for (const ch of s) {
+    const piece = quoted ? escapeChar(ch) : ch;
+    const n = byteLen(piece);
+    if (used + n > budget) return { text: quoted ? `"${out}"` : out, truncated: true };
+    out += piece;
+    used += n;
   }
-  return `${out}"`;
+  return { text: quoted ? `"${out}"` : out, truncated: false };
 }
 
 function renderClaims(c: PrSummaryClaim): string {
@@ -374,7 +433,7 @@ export async function buildDeliveryContext(input: DeliveryContextInput): Promise
   let base: string | null = null;
   let rows: PathRow[] = [];
   let renames = new Map<string, string>();
-  let attrsFailed = false;
+  let attrsUnavailable: string | null = null;
   if (!OBJECT_ID_RE.test(headSha)) {
     log?.warn("delivery context: the head is not a full object name; the diff parts are unavailable");
   } else {
@@ -392,20 +451,28 @@ export async function buildDeliveryContext(input: DeliveryContextInput): Promise
           // Without the attributes a generated or vendored file cannot be told from code, so no hunk
           // is read at all (a path-rule guess could feed the model a huge generated file as "code").
           // The inventory is still listed, its kinds by the path rules alone.
-          attrsFailed = true;
-          log?.warn("delivery context: attribute lookup failed; the diff hunks are skipped", { error: errMessage(err) });
+          const deadline = err instanceof DeadlineReached;
+          attrsUnavailable = deadline ? ATTRS_DEADLINE : ATTRS_UNAVAILABLE;
+          log?.warn("delivery context: attribute lookup failed; the diff hunks are skipped", {
+            reason: deadline ? "deadline reached" : "check-attr failed",
+            error_class: errorClass(err),
+          });
         }
       }
       rows = entries.map((e) => ({ ...e, bucket: classifyPath(e.path, attrs.get(e.path)) }));
       base = mergeBase;
     } catch (err) {
-      log?.warn("delivery context: diff inventory unavailable", { error: errMessage(err) });
+      log?.warn("delivery context: diff inventory unavailable", {
+        reason: err instanceof DeadlineReached ? "deadline reached" : "merge-base or numstat read failed",
+        error_class: errorClass(err),
+      });
       rows = [];
     }
   }
 
   // Commit subjects, newest first. The read is bounded; a cut read drops its last record, which
-  // may be incomplete (and so may hold the head of a secret the redactor could not match).
+  // may be incomplete (and so may hold the head of a secret the redactor could not match). Each
+  // subject is rendered like a path (renderPath): a control, bidi or format character is escaped.
   let commits = UNAVAILABLE;
   if (base === null) {
     truncated.commits = true;
@@ -426,16 +493,16 @@ export async function buildDeliveryContext(input: DeliveryContextInput): Promise
       const subjects = records.filter((s) => s !== "");
       if (subjects.length > MAX_COMMITS) truncated.commits = true;
       const lines = subjects.slice(0, MAX_COMMITS).map((s) => {
-        const c = capBytes(redact(s), COMMIT_SUBJECT_CAP);
+        const c = renderClipped(redact(s), COMMIT_SUBJECT_CAP);
         if (c.truncated) truncated.commits = true;
-        return `- ${c.text}`;
+        return `- ${c.text}${c.truncated ? ` ${TRUNCATED_MARKER}` : ""}`;
       });
       const empty = read.truncated ? "(no complete commit subject within the read bound)" : "(no commits)";
       const p = capBytes(lines.length > 0 ? lines.join("\n") : empty, COMMITS_CAP);
       commits = truncated.commits && !p.truncated ? `${p.text}\n${TRUNCATED_MARKER}` : p.text;
       truncated.commits ||= p.truncated;
     } catch (err) {
-      log?.warn("delivery context: commit subjects unavailable", { error: errMessage(err) });
+      log?.warn("delivery context: commit subjects unavailable", { reason: "git log read failed", error_class: errorClass(err) });
       commits = UNAVAILABLE;
       truncated.commits = true;
     }
@@ -467,8 +534,8 @@ export async function buildDeliveryContext(input: DeliveryContextInput): Promise
   let diff = UNAVAILABLE;
   if (base === null) {
     truncated.diff = true;
-  } else if (attrsFailed) {
-    diff = ATTRS_UNAVAILABLE;
+  } else if (attrsUnavailable !== null) {
+    diff = attrsUnavailable;
     truncated.diff = true;
   } else {
     const ordered = DIFF_ORDER.flatMap((b) => rows.filter((r) => r.bucket === b));
@@ -511,18 +578,20 @@ export async function buildDeliveryContext(input: DeliveryContextInput): Promise
       try {
         read = await boundedRead(args, cap + READ_MARGIN_BYTES);
       } catch (err) {
-        log?.warn("delivery context: path diff unavailable", { error: errMessage(err) });
+        log?.warn("delivery context: path diff unavailable", { reason: "git diff read failed", error_class: errorClass(err) });
         truncated.diff = true;
         continue;
       }
       if (read.text === "") continue;
       // Redact before cut. A read cut at its bound may end in the head of a secret whose tail was
       // never read, which the redactor cannot match. That head is the END of the redacted text, so
-      // dropping its last READ_MARGIN_BYTES removes a head shorter than the margin (the test
-      // "a per-path read is bounded..." pins one). Residual: a secret longer than
-      // READ_MARGIN_BYTES straddling the read boundary can leave its head in the prompt.
+      // dropping the last READ_MARGIN_BYTES of its VISIBLE text (dropVisibleTail) removes any head
+      // whose visible length is at most the margin, even one padded with invisible characters the
+      // redactor skips. The drop is measured on the redacted text, so a redaction earlier in the
+      // read that shrank it does not shorten the drop. Residual: a secret whose VISIBLE length
+      // exceeds READ_MARGIN_BYTES, straddling the read boundary, can leave its head in the prompt.
       let text = redact(read.text);
-      if (read.truncated) text = utf8Prefix(text, byteLen(text) - READ_MARGIN_BYTES);
+      if (read.truncated) text = dropVisibleTail(text, READ_MARGIN_BYTES);
       const p = capBytes(text, cap, read.truncated);
       if (p.truncated) truncated.diff = true;
       chunks.push(p.text);

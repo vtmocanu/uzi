@@ -6,8 +6,11 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
+import { setTimeout as delay } from "node:timers/promises";
 
-import { GitCache } from "../src/git.js";
+import { GitCache, type BoundaryProcessSpawner } from "../src/git.js";
+import type { BoundaryProcessRequest } from "../src/harness.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 
 function git(cwd: string, ...args: string[]): string {
@@ -107,4 +110,87 @@ describe("GitCache.readBare (PRD #1798 M5)", () => {
       assert.ok(Date.now() - started < 2_500, "settled at the abort");
     });
   });
+
+  it("a timeout kills the child: the aliased sleep is gone well before it would have finished", async () => {
+    await withBare({ "a.txt": "a" }, async (gc, bare) => {
+      const pidFile = path.join(path.dirname(bare), "alias.pid");
+      // A literal, inert alias: record the shell's pid, then become a long sleep under that pid.
+      const slow = ["-c", `alias.wait=!echo $$ > '${pidFile}'; exec sleep 10`, "wait"];
+      const started = Date.now();
+      await assert.rejects(gc.readBare(bare, slow, { maxBytes: 1024, timeoutMs: 500 }), /exceeded 500ms/);
+      const pid = Number(fs.readFileSync(pidFile, "utf8").trim());
+      assert.ok(pid > 0, "the alias recorded its pid");
+      // Gone within 3 s of the start; the sleep alone lasts 10 s.
+      while (processAlive(pid) && Date.now() - started < 3_000) await delay(25);
+      assert.equal(processAlive(pid), false, "the child's sleep was terminated at the timeout");
+    });
+  });
+
+  it("keeps at most 64 KiB of git's stderr in a failure message", async () => {
+    await withBare({ "a.txt": "a" }, async (gc, bare) => {
+      // A literal, inert alias: 300,000 bytes of stderr, then a non-zero exit.
+      const noisy = ["-c", "alias.noisy=!head -c 300000 /dev/zero | tr '\\0' e >&2; exit 3", "noisy"];
+      const err = await gc.readBare(bare, noisy, { maxBytes: 1024 }).then(
+        () => assert.fail("a non-zero exit rejects"),
+        (e: unknown) => e as Error,
+      );
+      assert.match(err.message, /exited 3: e{1000}/);
+      assert.ok(err.message.length <= 64 * 1024 + 200, `stderr capped (${err.message.length})`);
+    });
+  });
+
+  it("throws up front on a non-finite or negative maxBytes and a non-finite timeoutMs", async () => {
+    await withBare({ "a.txt": "a" }, async (gc, bare) => {
+      for (const maxBytes of [Number.NaN, -1, Number.POSITIVE_INFINITY]) {
+        await assert.rejects(gc.readBare(bare, ["show", "HEAD:a.txt"], { maxBytes }), /maxBytes must be/, String(maxBytes));
+      }
+      await assert.rejects(
+        gc.readBare(bare, ["show", "HEAD:a.txt"], { maxBytes: 1, timeoutMs: Number.POSITIVE_INFINITY }),
+        /timeoutMs must be finite/,
+      );
+      await assert.rejects(gc.readBare(bare, ["show", "HEAD:a.txt"], { maxBytes: 1, timeoutMs: Number.NaN }), /no time left/);
+    });
+  });
+
+  it("inside a boundary scope, forwards the read's timeout (default GIT_TIMEOUT_MS) to the spawner", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-readbare-b-"));
+    const gc = new GitCache(root, nullLogger(), undefined, testGitCacheOptions());
+    const requests: BoundaryProcessRequest[] = [];
+    const spawner: BoundaryProcessSpawner = async (request) => {
+      requests.push(request);
+      const stdout = new PassThrough();
+      stdout.end("hello");
+      return { stdin: null, stdout, stderr: null, completed: Promise.resolve({ code: 0 }) };
+    };
+    const ac = new AbortController();
+    try {
+      const reads = await gc.withBoundaryProcessSpawner(spawner, ac.signal, async () => [
+        await gc.readBare("/bare.git", ["show", "HEAD:a.txt"], { maxBytes: 1024, timeoutMs: 1_234 }),
+        await gc.readBare("/bare.git", ["show", "HEAD:a.txt"], { maxBytes: 1024 }),
+      ]);
+      assert.deepEqual(reads, [
+        { text: "hello", truncated: false },
+        { text: "hello", truncated: false },
+      ]);
+      assert.deepEqual(
+        requests.map((r) => [r.timeoutMs, r.identity, r.argv.slice(-2)]),
+        [
+          [1_234, "worker_pat", ["show", "HEAD:a.txt"]],
+          [10 * 60_000, "worker_pat", ["show", "HEAD:a.txt"]],
+        ],
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
+
+/** Is `pid` still a live process? (Signal 0 probes without sending anything.) */
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}

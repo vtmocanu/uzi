@@ -437,12 +437,27 @@ const SHA40_RE = /^[0-9a-f]{40}$/;
 
 /** PRD #1798 M5: the bound on a {@link GitCache.readBare} read. */
 export interface BoundedReadOptions {
-  /** Stop reading once more than this many stdout bytes arrived (the kept prefix is at most this). */
+  /** Stop reading once more than this many stdout bytes arrived (the kept prefix is at most this).
+   *  Must be finite and non-negative; readBare throws otherwise. */
   maxBytes: number;
-  /** Wall-clock bound; the read rejects (and the child is torn down) when it elapses. */
+  /** Wall-clock bound, default GIT_TIMEOUT_MS; must be positive and finite. The read rejects when it
+   *  elapses. The child's termination at that bound differs per spawn path: see GitCache.readBare. */
   timeoutMs?: number;
-  /** Aborting rejects the read and tears the child down. */
+  /** Aborting rejects the read. What that does to the child: see GitCache.readBare. */
   signal?: AbortSignal;
+}
+
+/** PRD #1798 M5: the most git stderr a {@link GitCache.readBare} keeps for its failure message. */
+const READ_BARE_STDERR_MAX_BYTES = 64 * 1024;
+
+/** Optional per-call knobs of GitCache.spawnGit. Absent, spawnGit behaves as it always has. */
+interface SpawnGitOptions {
+  /** Inside a boundary scope: forwarded as BoundaryProcessRequest.timeoutMs, so the spawner
+   *  terminates the child's process group when it elapses. Ignored outside a scope. */
+  timeoutMs?: number;
+  /** Cap on the stderr kept for the failure message (both paths). Default: the boundary path keeps
+   *  up to GIT_MAX_BUFFER, the plain path keeps all of it. */
+  stderrMaxBytes?: number;
 }
 
 /** PRD #1798 M5: a bounded read's stdout, and whether the bound cut it. */
@@ -3581,18 +3596,38 @@ export class GitCache {
   /**
    * PRD #1798 M5 — a BOUNDED read in the worker bare: `git -C <barePath> <args>` as the worker uid on
    * the credential-free base gitEnv pins (no PAT, no shell), with stdout STREAMED rather than
-   * buffered whole. Once more than `maxBytes` has arrived the read stops: the stream is abandoned
-   * (which tears the child down, see {@link spawnGit}) and the first `maxBytes`, cut back to a UTF-8
-   * code-point boundary, resolve with `truncated: true`. An oversized output is never an error.
-   * Rejects on a non-zero exit before the bound, when `timeoutMs` elapses (or is not positive), and
-   * when `signal` aborts; each of those also tears the child down.
+   * buffered whole. Once more than `maxBytes` has arrived the read stops and the first `maxBytes`,
+   * cut back to a UTF-8 code-point boundary, resolve with `truncated: true`. An oversized output is
+   * never an error. Rejects on a non-zero exit before the bound (with at most
+   * READ_BARE_STDERR_MAX_BYTES of git's stderr in the message), when `timeoutMs` (default
+   * GIT_TIMEOUT_MS) elapses, and when `signal` aborts. Throws up front on a non-finite or negative
+   * `maxBytes`, a non-positive or non-finite `timeoutMs`, or an already-aborted `signal`.
+   *
+   * On the bound, the timeout and the abort, the stdout stream is abandoned (destroyed). What
+   * that does to the child depends on the spawn path ({@link spawnGit}):
+   * - Outside a boundary scope, abandoning the stream kills the child (SIGTERM) at once.
+   * - Inside a boundary scope (withBoundaryProcessSpawner) the handle exposes no kill: abandoning
+   *   the stream only unpipes and destroys its stdout, so a child that is still writing meets a
+   *   closed pipe on its next write and an idle one keeps running. Its termination is then left to
+   *   the `timeoutMs` forwarded to the spawner (BoundaryProcessRequest.timeoutMs, whose contract is
+   *   to terminate the child's process group; only the forwarding is tested here, with a fake
+   *   spawner) and to the scope's own boundary deadline. An abort through `signal` therefore rejects at once but, in
+   *   this path, leaves an idle child alive until that timeout.
    */
   async readBare(barePath: string, args: readonly string[], opts: BoundedReadOptions): Promise<BoundedRead> {
-    const maxBytes = Math.max(0, Math.floor(opts.maxBytes));
     const what = `git ${args.join(" ")}`;
+    if (!Number.isFinite(opts.maxBytes) || opts.maxBytes < 0) {
+      throw new Error(`${what}: maxBytes must be a finite, non-negative number`);
+    }
+    const maxBytes = Math.floor(opts.maxBytes);
     if (opts.signal?.aborted) throw new Error(`${what} aborted before it started`);
-    if (opts.timeoutMs !== undefined && !(opts.timeoutMs > 0)) throw new Error(`${what} has no time left`);
-    const { stdout } = await this.spawnGit(barePath, [...args]);
+    const timeoutMs = opts.timeoutMs ?? GIT_TIMEOUT_MS;
+    if (Number.isNaN(timeoutMs) || timeoutMs <= 0) throw new Error(`${what} has no time left`);
+    if (!Number.isFinite(timeoutMs)) throw new Error(`${what}: timeoutMs must be finite`);
+    const { stdout } = await this.spawnGit(barePath, [...args], undefined, {
+      timeoutMs,
+      stderrMaxBytes: READ_BARE_STDERR_MAX_BYTES,
+    });
     return new Promise<BoundedRead>((resolve, reject) => {
       const chunks: Buffer[] = [];
       let bytes = 0;
@@ -3606,7 +3641,8 @@ export class GitCache {
         stdout.removeListener("data", onData);
         stdout.removeListener("end", onEnd);
         stdout.removeListener("error", onError);
-        // Abandoning the exit-gated stream before it ended kills (or SIGPIPEs) the child.
+        // Abandon the exit-gated stream before it ended: outside a boundary this kills the child;
+        // inside one it only closes its stdout (see the docstring).
         if (result === undefined || result.truncated) stdout.destroy();
         if (result === undefined) reject(error);
         else resolve(result);
@@ -3635,9 +3671,7 @@ export class GitCache {
       stdout.on("data", onData);
       stdout.once("end", onEnd);
       stdout.once("error", onError);
-      if (opts.timeoutMs !== undefined) {
-        timer = setTimeout(() => finish(undefined, new Error(`${what} exceeded ${opts.timeoutMs}ms`)), opts.timeoutMs);
-      }
+      timer = setTimeout(() => finish(undefined, new Error(`${what} exceeded ${timeoutMs}ms`)), timeoutMs);
       if (opts.signal?.aborted) onAbort();
       else opts.signal?.addEventListener("abort", onAbort, { once: true });
     });
@@ -5234,31 +5268,42 @@ export class GitCache {
    * signal death or a rejected completion resolves to -1, so a caller that ignores it cannot
    * leak an unhandled rejection. Stream completion alone does not prove the process is reaped;
    * a caller that must know (e.g. {@link ensureRunnerCloneObjects}) awaits `exited` as well.
+   *
+   * `opts` (PRD #1798 M5, used by {@link readBare} only) forwards a child timeout to the boundary
+   * spawner and caps the stderr kept for the failure message; every other caller omits it.
    */
   private async spawnGit(
     cwd: string,
     args: string[],
     stdin?: string,
+    opts: SpawnGitOptions = {},
   ): Promise<{ child?: ChildProcess; stdout: Readable; exited: Promise<number> }> {
     const env = gitEnv();
     this.log.debug("git (spawn)", { cwd, args });
     const boundary = this.boundaryProcesses.getStore();
     if (boundary) {
-      const process = await boundary.spawn({ argv: [GIT_BIN, ...withDir(cwd, args)], cwd, env, identity: "worker_pat" });
+      const process = await boundary.spawn({
+        argv: [GIT_BIN, ...withDir(cwd, args)],
+        cwd,
+        env,
+        identity: "worker_pat",
+        ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
+      });
       if (!process.stdout) throw new Error("supervised git process has no stdout");
+      const stderrCap = opts.stderrMaxBytes ?? GIT_MAX_BUFFER;
       const stderrChunks: Buffer[] = [];
       let stderrBytes = 0;
       process.stderr?.on("data", (c: Buffer | string) => {
-        if (stderrBytes >= GIT_MAX_BUFFER) return;
+        if (stderrBytes >= stderrCap) return;
         const chunk = Buffer.isBuffer(c) ? c : Buffer.from(c);
-        const kept = chunk.subarray(0, GIT_MAX_BUFFER - stderrBytes);
+        const kept = chunk.subarray(0, stderrCap - stderrBytes);
         stderrChunks.push(kept);
         stderrBytes += kept.length;
       });
       const gated = exitGatedStream(process.stdout);
       process.completed.then(({ code }) => {
         if (code !== 0) {
-          const detail = Buffer.concat(stderrChunks).subarray(0, GIT_MAX_BUFFER).toString().trim();
+          const detail = Buffer.concat(stderrChunks).subarray(0, stderrCap).toString().trim();
           gated.exited(new Error(`git ${args.join(" ")} exited ${code}${detail ? `: ${detail}` : ""}`));
         } else gated.exited();
       }, (error: unknown) => gated.exited(error instanceof Error ? error : new Error(String(error))));
@@ -5278,7 +5323,18 @@ export class GitCache {
       if (child.exitCode === null && child.signalCode === null) child.kill();
     });
     const stderrChunks: Buffer[] = [];
-    child.stderr?.on("data", (c: Buffer) => stderrChunks.push(c));
+    const stderrCap = opts.stderrMaxBytes;
+    let stderrBytes = 0;
+    child.stderr?.on("data", (c: Buffer) => {
+      if (stderrCap === undefined) {
+        stderrChunks.push(c);
+        return;
+      }
+      if (stderrBytes >= stderrCap) return;
+      const kept = c.subarray(0, stderrCap - stderrBytes);
+      stderrChunks.push(kept);
+      stderrBytes += kept.length;
+    });
     child.on("error", (err) => gated.exited(err));
     child.on("close", (code) => {
       if (code !== 0) {

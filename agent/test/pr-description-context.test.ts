@@ -450,6 +450,42 @@ describe("buildDeliveryContext (PRD #1798 M5, D6)", () => {
     assert.equal(ctx.diff.includes("glpat-"), false, "the secret's head at the read boundary is cut away");
   });
 
+  it("the margin drop is measured on the REDACTED text: a redaction that shrank the read still loses the head", async () => {
+    // A 5 KiB known secret early in the read shrinks to the redaction marker, so the redacted text
+    // fits under the 16 KiB cap and only the margin drop (not the cap) can remove the head of a
+    // second secret sitting at the read boundary.
+    const big = "Q".repeat(5 * 1024);
+    const bound = 16 * 1024 + 4 * 1024;
+    const tailHead = SECRET.slice(0, 10);
+    const filler = "x".repeat(bound - big.length - tailHead.length);
+    const { git } = fakeGit([{ path: "src/big.ts", added: 9999, deleted: 0 }], {
+      onRead: (args) => (args[3] === "diff" ? { text: big + filler + tailHead, truncated: true } : undefined),
+    });
+    const ctx = await buildDeliveryContext(input(git, { redact: makeTextRedactor([SECRET, big]) }));
+    assert.ok(Buffer.byteLength(ctx.diff) < 16 * 1024 - 1024, "the redacted read is well under the cap");
+    assert.equal(ctx.diff.includes("QQQQ"), false);
+    assert.equal(ctx.diff.includes("glpat-"), false, "the secret's head at the read boundary is cut away");
+    assert.equal(ctx.truncated.diff, true);
+    assert.ok(ctx.diff.endsWith(TRUNCATED_MARKER));
+  });
+
+  it("the margin counts visible bytes: a secret head padded with invisible characters is still dropped", async () => {
+    // Each character of the head is separated by a run of zero-width spaces far longer than the
+    // margin in raw bytes; the redactor would match the whole secret across such runs.
+    const pad = "\u200B".repeat(1000);
+    const paddedHead = [..."glpat-"].join(pad);
+    const bound = 16 * 1024 + 4 * 1024;
+    const filler = "x".repeat(bound - Buffer.byteLength(paddedHead));
+    const { git } = fakeGit([{ path: "src/pad.ts", added: 1, deleted: 0 }], {
+      onRead: (args) => (args[3] === "diff" ? { text: filler + paddedHead, truncated: true } : undefined),
+    });
+    const ctx = await buildDeliveryContext(input(git));
+    const visible = ctx.diff.replace(/[\p{Cc}\p{Cf}]/gu, "");
+    assert.equal(visible.includes("glp"), false, "no visible piece of the head survives");
+    assert.equal(ctx.diff.includes("\u200B"), false, "the invisible run before the cut goes too");
+    assert.equal(ctx.truncated.diff, true);
+  });
+
   it("a short read that the bound still cut is marked truncated even though it fits the cap", async () => {
     const { git } = fakeGit([{ path: "src/x.ts", added: 1, deleted: 0 }], {
       onRead: (args) => (args[3] === "diff" ? { text: "y".repeat(5 * 1024), truncated: true } : undefined),
@@ -469,6 +505,14 @@ describe("buildDeliveryContext (PRD #1798 M5, D6)", () => {
     assert.match(ctx.commits, /^- feat: complete$/m);
     assert.equal(ctx.commits.includes("rotate"), false);
     assert.ok(ctx.commits.endsWith(TRUNCATED_MARKER));
+  });
+
+  it("commit subjects escape control, bidi and format characters like paths", async () => {
+    const { git } = fakeGit([], { subjects: ["fix: \u202Eexe.txt", "feat: a\u200Bb", "docs: plain"] });
+    const ctx = await buildDeliveryContext(input(git));
+    const lines = ctx.commits.split("\n");
+    assert.deepEqual(lines, ['- "fix: \\u202eexe.txt"', '- "feat: a\\u200bb"', "- docs: plain"]);
+    assert.equal(/[\u202E\u200B]/.test(ctx.commits), false);
   });
 
   it("a subject clipped to its 200-byte cap flags commits truncated", async () => {
@@ -506,6 +550,38 @@ describe("buildDeliveryContext (PRD #1798 M5, D6)", () => {
     assert.equal(ctx.truncated.commits && ctx.truncated.paths && ctx.truncated.diff, true);
   });
 
+  it("a check-attr read abandoned at the deadline renders the deadline, not an attribute failure", async () => {
+    const warns: Array<[string, unknown]> = [];
+    const { git } = fakeGit([{ path: "src/a.ts", added: 1, deleted: 0, diff: hunk("src/a.ts", "x") }]);
+    const hung: DeliveryContextGit = { ...git, checkAttrZ: () => new Promise(() => {}) };
+    const ctx = await buildDeliveryContext(
+      input(hung, { deadlineMs: Date.now() + 50, log: { warn: (m: string, f?: unknown) => void warns.push([m, f]) } }),
+    );
+    assert.equal(ctx.diff, "(unavailable: the deadline was reached before the attributes were read)");
+    assert.equal(ctx.truncated.diff, true);
+    const w = warns.find(([m]) => /attribute lookup failed/.test(m));
+    assert.deepEqual(w?.[1], { reason: "deadline reached", error_class: "DeadlineReached" });
+  });
+
+  it("a failed git read warns with a fixed reason and the error class only, never its message", async () => {
+    const warns: Array<[string, unknown]> = [];
+    const leaky = new Error("git -C /bare/\u202Erepo diff failed: fatal: stderr text");
+    const { git } = fakeGit([{ path: "src/a.ts", added: 1, deleted: 0 }], {
+      onRead: () => {
+        throw leaky;
+      },
+    });
+    await buildDeliveryContext(input(git, { log: { warn: (m: string, f?: unknown) => void warns.push([m, f]) } }));
+    assert.deepEqual(
+      warns.map(([, f]) => f),
+      [
+        { reason: "git log read failed", error_class: "Error" },
+        { reason: "git diff read failed", error_class: "Error" },
+      ],
+    );
+    assert.equal(JSON.stringify(warns).includes("stderr text"), false);
+  });
+
   it("a hung size-line read is abandoned at the deadline", async () => {
     const { git } = fakeGit([]);
     const hung: DeliveryContextGit = { ...git, sizeMergeBase: () => new Promise(() => {}) };
@@ -527,20 +603,20 @@ describe("buildDeliveryContext (PRD #1798 M5, D6)", () => {
       assert.equal(reads.length, 0, headSha);
       assert.deepEqual([ctx.commits, ctx.paths, ctx.diff], ["(unavailable)", "(unavailable)", "(unavailable)"]);
     }
-    const sha256 = "c".repeat(64);
-    const { git: g64, reads: r64 } = fakeGit([], { mergeBase: "not-a-sha" });
-    const bad = await buildDeliveryContext(input(g64));
-    assert.equal(r64.length, 0);
+    const { git: gBad, reads: rBad } = fakeGit([], { mergeBase: "not-a-sha" });
+    const bad = await buildDeliveryContext(input(gBad));
+    assert.equal(rBad.length, 0);
     assert.equal(bad.paths, "(unavailable)");
-    // A 64-hex (SHA-256) head is accepted.
-    const ok: DeliveryContextGit = {
-      sizeMergeBase: async () => sha256,
-      diffNumstatZ: async () => "",
-      checkAttrZ: async () => new Map(),
-      readBare: async () => ({ text: "", truncated: false }),
-    };
-    const ctx64 = await buildDeliveryContext(input(ok, { headSha: "d".repeat(64) }));
-    assert.equal(ctx64.paths, "(no changed files)");
+    // Only 40-hex, like GitCache.sizeMergeBase: a 64-hex (SHA-256) head or merge-base is refused.
+    const { git: g64, reads: r64 } = fakeGit([]);
+    const noRead: DeliveryContextGit = { ...g64, sizeMergeBase: async () => assert.fail("no git read for a 64-hex head") };
+    const head64 = await buildDeliveryContext(input(noRead, { headSha: "d".repeat(64) }));
+    assert.equal(r64.length, 0);
+    assert.equal(head64.paths, "(unavailable)");
+    const { git: gBase64, reads: rBase64 } = fakeGit([], { mergeBase: "c".repeat(64) });
+    const base64 = await buildDeliveryContext(input(gBase64));
+    assert.equal(rBase64.length, 0);
+    assert.equal(base64.paths, "(unavailable)");
   });
 
   it("a path with a newline, a tab or a bidi override is escaped and cannot forge an inventory row", async () => {
