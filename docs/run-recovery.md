@@ -158,6 +158,34 @@ Each retained claim keeps its own hold, keyed to the exact claim that
 produced the work, so a later run on the same worker never drops an older
 claim's only copy.
 
+## Where the work is kept
+
+A failed or cancelled run that already published a checkpoint to your forge
+keeps that ref, `refs/uzi-checkpoints/<branch>`, for as long as any of its
+custody holds is still open. It's not deleted the moment the run ends, so
+the published copy stays reachable even if the worker and its disk are gone.
+Once every hold on the run is released or discarded, uzi removes the ref.
+
+If you start a new run on the same branch while the old ref is still held,
+uzi moves the old tip out of the way rather than blocking your new run or
+overwriting it: it creates `refs/uzi-recovery/<run-id>` pointing at the old
+run's tip, frees `refs/uzi-checkpoints/<branch>` for the new run, and keeps
+the old ref around under its own name until that run's holds are resolved.
+
+`uzi run recovery <run-id>` shows exactly which ref currently holds a run's
+checkpoint, its tip commit, and its retention state — so you always know
+whether to fetch the branch ref or the recovery ref. Fetch either directly
+from your forge:
+
+```sh
+git fetch origin refs/uzi-checkpoints/<branch>
+git fetch origin refs/uzi-recovery/<run-id>
+```
+
+The ref disappears once the run's last hold is released (automatically, by
+settlement) or discarded (`uzi run discard`) — the same custody lifecycle
+that governs the recovery archives above.
+
 ## Automatic settlement of an older held generation
 
 When a run is resumed on the same worker (after a rate-limit park, a
