@@ -307,30 +307,87 @@ if (process.platform !== "linux" || !fs.existsSync(FD)) process.exit(5);
 `;
 
 /**
- * PRD #1809 D3: the pinned-descriptor subtree removal, as
- * `node -e <script> <home> <rel> [<sync>]`. It pins HOME, then each component of `rel`
- * relative to the previous one's descriptor (see {@link PINNED_PRELUDE}); a symlinked or
- * non-directory component is refused, never followed. It then empties the pinned leaf
- * through its own descriptor: each child directory is pinned `O_NOFOLLOW` before it is
- * descended, a symlink or file is `unlink`ed (never followed), and a directory this uid
- * owns gets OWNER `rwx` added through its pinned descriptor (the Go module cache's `0555`
- * dirs; never group, as in {@link PURGE_CHILDREN_SCRIPT}). Only then is the leaf
- * `rmdir`ed through its pinned PARENT, and only while the leaf's name there still names
- * the inode that was emptied. Nothing above the leaf is ever chmodded or removed.
- *
- * Exit 0: the leaf's name is gone from its pinned parent. 1: something remained (another
- * uid's entries, a concurrent writer). 2: a component was already missing, nothing to
- * drop. 3: a component or the leaf's final name is a symlink or non-directory (refused).
- * 4: this uid cannot open a component. 5: no `/proc/self/fd`. 6: bad arguments.
- *
- * `<sync>` is a test seam only (the worker never passes it): once the leaf is pinned the
- * script creates `<sync>.pinned` and waits up to 10 s for `<sync>.go`, so a test can swap
- * a component for a symlink between verification and removal.
+ * The streamed directory reader both PRD #1809 helper scripts share. It never loads a whole
+ * directory: `fs.opendirSync` + `Dir.readSync()` pulls entries from the kernel in small
+ * buffered batches, so a run's (prompt-injectable) agent that fills a cache dir with a
+ * million names cannot make a helper allocate them all at once. `readSome(dirFd, limit,
+ * skip)` reopens the directory through its pinned descriptor (a fresh stream positioned at
+ * the start), reads at most `limit` names not in `skip`, charges every dirent it reads to
+ * `spend()` (stopping when that says the budget is gone), and closes the stream.
  */
-const PINNED_SUBTREE_SCRIPT = `${PINNED_PRELUDE}
-const [home, rel, sync] = process.argv.slice(1);
-if (!home || !home.startsWith("/") || !rel) process.exit(6);
-const verdict = (e) => (e.code === "ENOENT" ? 2 : e.code === "ELOOP" || e.code === "ENOTDIR" ? 3 : 4);
+const STREAM_PRELUDE = `
+function readSome(dirFd, limit, skip, spend) {
+  const dir = fs.opendirSync(FD + dirFd);
+  const out = [];
+  try {
+    let e;
+    while (out.length < limit && (e = dir.readSync()) !== null) {
+      if (!spend()) break;
+      if (!skip.has(e.name)) out.push({ name: e.name, isDir: e.isDirectory() });
+    }
+  } finally {
+    dir.closeSync();
+  }
+  return out;
+}
+`;
+
+/**
+ * PRD #1809 D3: the pinned-descriptor subtree removal, as
+ * `node -e <script> <home> <rel> <maxEntries> <budgetMs> [<sync> [<phase>]]`. It pins HOME,
+ * then each component of `rel` relative to the previous one's descriptor (see
+ * {@link PINNED_PRELUDE}); a symlinked or non-directory component is refused, never
+ * followed. It then empties the pinned leaf through its own descriptor: each child
+ * directory is pinned `O_NOFOLLOW` before it is descended, a symlink or file is `unlink`ed
+ * (never followed), and a directory this uid owns gets OWNER `rwx` added through its pinned
+ * descriptor (the Go module cache's `0555` dirs; never group, as in
+ * {@link PURGE_CHILDREN_SCRIPT}). Finally the leaf is `rmdir`ed through its pinned PARENT,
+ * after checking immediately before that the name there still resolves to the emptied
+ * inode; a race between that check and the `rmdir` can at worst remove an empty directory
+ * planted there. Nothing above the leaf is ever chmodded or removed.
+ *
+ * Bounded work: each directory is read in streamed batches of {@link STREAM_PRELUDE}'s
+ * `readSome` and the batch is processed before the next is read (the stream is closed in
+ * between, so removals never race an open cursor; an entry that could not be removed is
+ * skipped on the re-read). Every dirent read counts against `<maxEntries>`, and the pass
+ * also stops at `<budgetMs>` of wall time; hitting either exits 8 with the rest left in
+ * place. Recursion holds one descriptor per level.
+ *
+ * Exit 0: the leaf's name is gone from its pinned parent. 2: a component was already
+ * missing, nothing to drop. 3: a component or the leaf's final name is a symlink or
+ * non-directory (refused). 4: something remained (another uid's entries, a concurrent
+ * writer). 5: no `/proc/self/fd`. 6: bad arguments. 7: this uid cannot open a component.
+ * 8: the entry or time budget ran out. Any other status (Node's 1 on an uncaught throw, a
+ * `setpriv` failure) means the helper itself failed, which is not a verdict on the tree.
+ *
+ * `<sync>` is a test seam only (the worker never passes it): the script creates
+ * `<sync>.<phase>` and waits up to 10 s for `<sync>.go`, so a test can swap a path
+ * between verification and removal. Phase `pinned` (the default) pauses once the leaf is
+ * pinned; phase `listed` pauses after the leaf's first batch of names was read and before
+ * any child in it is pinned.
+ */
+const PINNED_SUBTREE_SCRIPT = `${PINNED_PRELUDE}${STREAM_PRELUDE}
+const [home, rel, maxArg, budgetArg, sync, phase = "pinned"] = process.argv.slice(1);
+const maxEntries = Number(maxArg);
+const budgetMs = Number(budgetArg);
+if (!home || !home.startsWith("/") || !rel || !(maxEntries >= 0) || !(budgetMs >= 0)) process.exit(6);
+const deadline = Date.now() + budgetMs;
+let readCount = 0;
+let exhausted = false;
+const spend = () => {
+  if (exhausted) return false;
+  if (readCount >= maxEntries || Date.now() > deadline) { exhausted = true; return false; }
+  readCount++;
+  return true;
+};
+function pause(point) {
+  if (!sync || phase !== point) return;
+  fs.writeFileSync(sync + "." + phase, "");
+  const cell = new Int32Array(new SharedArrayBuffer(4));
+  const until = Date.now() + 10000;
+  while (!fs.existsSync(sync + ".go") && Date.now() < until) Atomics.wait(cell, 0, 0, 10);
+}
+const verdict = (e) => (e.code === "ENOENT" ? 2 : e.code === "ELOOP" || e.code === "ENOTDIR" ? 3 : 7);
 const parts = rel.split("/");
 let parentFd;
 let leafPin;
@@ -354,41 +411,49 @@ function openOwned(pinFd) {
   return reopen(pinFd);
 }
 let leafFd;
-try { leafFd = openOwned(leafPin); } catch { process.exit(4); }
-if (sync) {
-  fs.writeFileSync(sync + ".pinned", "");
-  const cell = new Int32Array(new SharedArrayBuffer(4));
-  const deadline = Date.now() + 10000;
-  while (!fs.existsSync(sync + ".go") && Date.now() < deadline) Atomics.wait(cell, 0, 0, 10);
+try { leafFd = openOwned(leafPin); } catch { process.exit(7); }
+pause("pinned");
+const BATCH = 256;
+const gone = (err) => err.code === "ENOENT";
+// Remove one entry of the directory pinned at dirFd; true when its name is gone.
+function removeEntry(dirFd, e) {
+  const p = at(dirFd, e.name);
+  if (!e.isDir) {
+    try { fs.unlinkSync(p); return true; } catch (err) { return gone(err); }
+  }
+  let pin;
+  try { pin = fs.openSync(p, PIN); } catch (err) {
+    // Swapped for a symlink or file since it was listed: remove that entry, never follow it.
+    if (err.code === "ELOOP" || err.code === "ENOTDIR") {
+      try { fs.unlinkSync(p); return true; } catch (err2) { return gone(err2); }
+    }
+    return gone(err);
+  }
+  let childFd;
+  try { childFd = openOwned(pin); } catch { return false; } finally { fs.closeSync(pin); }
+  try { emptyDir(childFd, false); } finally { fs.closeSync(childFd); }
+  if (exhausted) return false;
+  try { fs.rmdirSync(p); return true; } catch (err) { return gone(err); }
 }
-let failed = 0;
-function emptyDir(dirFd) {
-  let entries;
-  try { entries = fs.readdirSync(FD + dirFd, { withFileTypes: true }); } catch { failed++; return; }
-  for (const e of entries) {
-    const p = at(dirFd, e.name);
-    if (!e.isDirectory()) {
-      try { fs.unlinkSync(p); } catch (err) { if (err.code !== "ENOENT") failed++; }
-      continue;
-    }
-    let pin;
-    try { pin = fs.openSync(p, PIN); } catch (err) {
-      // Swapped for a symlink or file since readdir: remove that entry, never follow it.
-      if (err.code === "ELOOP" || err.code === "ENOTDIR") { try { fs.unlinkSync(p); } catch { failed++; } }
-      else if (err.code !== "ENOENT") failed++;
-      continue;
-    }
-    let childFd;
-    try { childFd = openOwned(pin); } catch { failed++; } finally { fs.closeSync(pin); }
-    if (childFd === undefined) continue;
-    try { emptyDir(childFd); } finally { fs.closeSync(childFd); }
-    try { fs.rmdirSync(p); } catch (err) { if (err.code !== "ENOENT") failed++; }
+function emptyDir(dirFd, isLeaf) {
+  const stuck = new Set();
+  let first = true;
+  while (!exhausted) {
+    let batch;
+    try { batch = readSome(dirFd, BATCH, stuck, spend); } catch { return; }
+    if (isLeaf && first) pause("listed");
+    first = false;
+    if (batch.length === 0) return;
+    // A batch already read is processed even when reading it spent the budget: its
+    // dirents are paid for, and a directory in it is not descended past the budget.
+    for (const e of batch) if (!removeEntry(dirFd, e)) stuck.add(e.name);
   }
 }
-emptyDir(leafFd);
+emptyDir(leafFd, true);
 const pinned = fs.fstatSync(leafPin);
 fs.closeSync(leafFd);
 fs.closeSync(leafPin);
+if (exhausted) process.exit(8);
 function nameState() {
   try {
     const fd = fs.openSync(at(parentFd, leafName), PIN);
@@ -403,42 +468,63 @@ if (nameState() === "pinned") {
   try { fs.rmdirSync(at(parentFd, leafName)); } catch {}
 }
 const after = nameState();
-process.exit(after === "gone" ? 0 : after === "refused" ? 3 : 1);
+process.exit(after === "gone" ? 0 : after === "refused" ? 3 : 4);
 `;
 
 /** Hard ceiling on the entries one measuring pass counts (see {@link measureRunCaches}). */
 const MEASURE_MAX_ENTRIES = 500_000;
 
 /**
+ * Hard ceiling on the dirents one removal pass reads (see {@link rmHomeSubtree}). A planted
+ * flood of names ends the pass here instead of holding the teardown; a real cache bigger
+ * than this is left partly dropped, and the drop says so.
+ */
+const REMOVE_MAX_ENTRIES = 2_000_000;
+
+/** Wall time a helper's own budget stops short of its kill timeout, so a pass that runs out
+ *  of time exits with its budget verdict instead of being killed by `execFile`. */
+const HELPER_SLACK_MS = 5_000;
+
+/**
  * PRD #1809 D8: the measuring walk, as `node -e <script> <home> <rels-json> <max>`. Pins
  * each cache subtree through descriptors exactly as {@link PINNED_SUBTREE_SCRIPT} does (a
  * symlinked or missing component counts zero), then sums allocated bytes (`blocks * 512`,
  * what the data volume actually loses) over the subtree with `lstat`, descending only
- * into directories it re-pins `O_NOFOLLOW`. It stops after `<max>` entries and says so
- * (`truncated`), so the reading is a lower bound; unreadable entries are skipped, which
- * also only lowers it. Prints one JSON line.
+ * into directories it re-pins `O_NOFOLLOW`. Directories are streamed (one dirent at a time
+ * from a buffered `Dir`, never a whole listing), every dirent read is counted, and the walk
+ * stops at `<max>` and says so (`truncated`), so the reading is a lower bound; unreadable
+ * entries are skipped, which also only lowers it. Prints one JSON line, including
+ * `entries`, the dirents it counted.
  */
 const MEASURE_CACHES_SCRIPT = `${PINNED_PRELUDE}
 const [home, relsJson, maxArg] = process.argv.slice(1);
 const max = Number(maxArg);
 let cacheBytes = 0, entries = 0, truncated = false;
 function walk(dirFd) {
-  let names;
-  try { names = fs.readdirSync(FD + dirFd); } catch { return; }
-  for (const name of names) {
-    if (entries >= max) { truncated = true; return; }
-    entries++;
-    const p = at(dirFd, name);
-    let st;
-    try { st = fs.lstatSync(p); } catch { continue; }
-    cacheBytes += bytesOf(st);
-    if (!st.isDirectory()) continue;
-    let childFd;
-    try { const pin = fs.openSync(p, PIN); try { childFd = reopen(pin); } finally { fs.closeSync(pin); } } catch { continue; }
-    try { walk(childFd); } finally { fs.closeSync(childFd); }
+  let dir;
+  try { dir = fs.opendirSync(FD + dirFd); } catch { return; }
+  try {
+    let e;
+    while (!truncated) {
+      try { e = dir.readSync(); } catch { return; }
+      if (e === null) return;
+      if (entries >= max) { truncated = true; return; }
+      entries++;
+      const p = at(dirFd, e.name);
+      let st;
+      try { st = fs.lstatSync(p); } catch { continue; }
+      cacheBytes += bytesOf(st);
+      if (!st.isDirectory()) continue;
+      let childFd;
+      try { const pin = fs.openSync(p, PIN); try { childFd = reopen(pin); } finally { fs.closeSync(pin); } } catch { continue; }
+      try { walk(childFd); } finally { fs.closeSync(childFd); }
+    }
+  } finally {
+    dir.closeSync();
   }
 }
 for (const rel of JSON.parse(relsJson)) {
+  if (truncated) break;
   let fd;
   try {
     fd = fs.openSync(home, PIN);
@@ -452,7 +538,7 @@ for (const rel of JSON.parse(relsJson)) {
     if (fd !== undefined) fs.closeSync(fd);
   }
 }
-process.stdout.write(JSON.stringify({ cacheBytes, truncated }) + "\\n");
+process.stdout.write(JSON.stringify({ cacheBytes, entries, truncated }) + "\\n");
 `;
 
 /** The uids a PRD #1809 helper runs as: under the split `runner`, then `runner-cmd` (Codex
@@ -464,14 +550,20 @@ function agentWrappers(passes: "remove" | "measure"): CommandWrapper[] {
   return passes === "remove" ? [runnerCommand, commandRootCommand, runnerCommand] : [runnerCommand, commandRootCommand];
 }
 
+/** Milliseconds a helper pass may run: {@link PURGE_TIMEOUT_MS}, clipped to what is left
+ *  before `deadline` (epoch ms). Zero or less means the caller's deadline has passed. */
+function passTimeout(deadline: number | undefined): number {
+  return deadline === undefined ? PURGE_TIMEOUT_MS : Math.min(PURGE_TIMEOUT_MS, deadline - Date.now());
+}
+
 /** Run one helper pass and resolve its exit status. Rejects only when the helper could not
- *  run at all (spawn failure, timeout): no exit status is then a verdict. The env is
+ *  be spawned or was killed (timeout): no exit status is then a verdict. The env is
  *  minimal and explicit, as in {@link purgeChildrenAsAgents}. */
-async function runHelper(wrap: CommandWrapper, script: string, args: readonly string[]): Promise<number> {
+async function runHelper(wrap: CommandWrapper, script: string, args: readonly string[], timeout: number): Promise<number> {
   const wrapped = wrap(process.execPath, ["-e", script, ...args]);
   return execFileAsync(wrapped.command, wrapped.args, {
     env: { PATH: "/usr/local/bin:/usr/bin:/bin" },
-    timeout: PURGE_TIMEOUT_MS,
+    timeout,
     maxBuffer: 64 * 1024,
   }).then(
     () => 0,
@@ -482,10 +574,21 @@ async function runHelper(wrap: CommandWrapper, script: string, args: readonly st
   );
 }
 
+/** Test seams and the caller's deadline for {@link rmHomeSubtree}. */
+export interface SubtreeRemovalOptions {
+  /** The uids to run the passes as, in order (default: {@link agentWrappers}). */
+  wrappers?: readonly CommandWrapper[];
+  /** Dirents one pass may read before it stops (default {@link REMOVE_MAX_ENTRIES}). */
+  maxEntries?: number;
+  /** Epoch ms after which no pass starts and a running one is cut short. */
+  deadline?: number;
+}
+
 /**
  * PRD #1809 D3: remove ONE named cache subtree (a {@link RUN_CACHE_SUBTREES} entry)
  * inside a run HOME, leaving the HOME root and every sibling intact. Resolves "removed"
- * or "absent" (nothing to drop); throws on a refusal or when the subtree is still there.
+ * or "absent" (nothing to drop); throws on a refusal, on an exhausted budget or deadline,
+ * or when the subtree is still there.
  *
  * {@link rmHomeTree} cannot be pointed at a subtree: it widens the root it is given to
  * group `runner` and expects a worker-owned root, while a cache dir is written by the
@@ -507,12 +610,14 @@ async function runHelper(wrap: CommandWrapper, script: string, args: readonly st
  * refuses in both modes: every worker is a Linux container, and the path-based fallback
  * is exactly what this replaced.
  *
- * `wrappers` is a test seam: the uids to run the passes as, in order.
+ * Each pass is bounded by `maxEntries` dirents read and by its timeout (clipped to
+ * `deadline`); a pass that runs out stops the removal (another uid would meet the same
+ * tree), so the drop is best-effort and reports what it could not finish.
  */
 export async function rmHomeSubtree(
   home: string,
   rel: string,
-  wrappers: readonly CommandWrapper[] = agentWrappers("remove"),
+  opts: SubtreeRemovalOptions = {},
 ): Promise<"removed" | "absent"> {
   // The helper takes both as bare `node -e` arguments, so a relative or dash-leading
   // HOME, or an unlisted `rel`, is refused before anything runs.
@@ -520,9 +625,17 @@ export async function rmHomeSubtree(
   if (!isRunCacheSubtree(rel)) {
     throw new Error(`rmHomeSubtree: refusing ${JSON.stringify(rel)}, not a listed cache subtree`);
   }
+  const wrappers = opts.wrappers ?? agentWrappers("remove");
+  const maxEntries = opts.maxEntries ?? REMOVE_MAX_ENTRIES;
   let last = "no pass ran";
   for (const wrap of wrappers) {
-    const code = await runHelper(wrap, PINNED_SUBTREE_SCRIPT, [home, rel]);
+    const timeout = passTimeout(opts.deadline);
+    if (timeout <= 0) {
+      last = "the deadline passed before this pass";
+      break;
+    }
+    const budgetMs = Math.max(0, timeout - HELPER_SLACK_MS);
+    const code = await runHelper(wrap, PINNED_SUBTREE_SCRIPT, [home, rel, String(maxEntries), String(budgetMs)], timeout);
     if (code === 0) return "removed";
     if (code === 2) return "absent";
     // A symlink is a symlink whoever looks: a refusal is final, no later pass runs.
@@ -532,7 +645,16 @@ export async function rmHomeSubtree(
       });
     }
     if (code === 5) throw new Error(`rmHomeSubtree: refusing ${rel} under ${home} (no descriptor-pinned walk here)`);
-    last = code === 4 ? "a component this uid cannot open" : `exit ${code}`;
+    if (code === 8) {
+      last = `the pass ran out of its budget (${maxEntries} entries or ${budgetMs} ms)`;
+      break;
+    }
+    last =
+      code === 4
+        ? "entries remained"
+        : code === 7
+          ? "a component this uid cannot open"
+          : `the helper itself failed (exit ${code})`;
   }
   throw Object.assign(new Error(`rmHomeSubtree: ${rel} is still present under ${home} (last pass: ${last})`), {
     code: "ENOTEMPTY",
@@ -546,8 +668,20 @@ function isRunCacheSubtree(rel: string): rel is RunCacheSubtree {
 /** PRD #1809 D8: allocated bytes under a run HOME's {@link RUN_CACHE_SUBTREES}. */
 export interface RunCacheBytes {
   cacheBytes: number;
+  /** Dirents the kept pass counted (at most its `maxEntries`). */
+  entries: number;
   /** A pass hit its entry ceiling, so `cacheBytes` is a lower bound. */
   truncated: boolean;
+}
+
+/** Test seams and the caller's deadline for {@link measureRunCaches}. */
+export interface MeasureOptions {
+  /** The uids to run the passes as, in order (default: {@link agentWrappers}). */
+  wrappers?: readonly CommandWrapper[];
+  /** Dirents one pass may count (default {@link MEASURE_MAX_ENTRIES}). */
+  maxEntries?: number;
+  /** Epoch ms after which no pass starts and a running one is killed. */
+  deadline?: number;
 }
 
 /**
@@ -555,19 +689,23 @@ export interface RunCacheBytes {
  * HOME). Under the uid split the worker cannot list the agent's `0700` dirs, so the walk
  * runs as `runner` and as `runner-cmd` through the same wrappers the removal uses, and
  * the larger reading is kept: each uid sees a subset, so the result is a lower bound,
- * never an over-count from summing passes. Single-uid it runs once as the worker. Each
- * pass stops after `maxEntries` entries and flags the reading truncated. Rejects only
- * when no pass produced a reading. `wrappers` and `maxEntries` are test seams.
+ * never an over-count from summing passes. That means a cache both uids can read is
+ * walked twice; the cost is bounded by `maxEntries` per pass and counted against the
+ * caller's `deadline`. Single-uid it runs once as the worker. Rejects only when no pass
+ * produced a reading.
  */
-export async function measureRunCaches(
-  home: string,
-  wrappers: readonly CommandWrapper[] = agentWrappers("measure"),
-  maxEntries: number = MEASURE_MAX_ENTRIES,
-): Promise<RunCacheBytes> {
+export async function measureRunCaches(home: string, opts: MeasureOptions = {}): Promise<RunCacheBytes> {
   if (!path.isAbsolute(home)) throw new Error(`measureRunCaches: refusing non-absolute HOME ${home}`);
+  const wrappers = opts.wrappers ?? agentWrappers("measure");
+  const maxEntries = opts.maxEntries ?? MEASURE_MAX_ENTRIES;
   let best: RunCacheBytes | undefined;
   let lastErr: unknown;
   for (const wrap of wrappers) {
+    const timeout = passTimeout(opts.deadline);
+    if (timeout <= 0) {
+      lastErr ??= new Error("measureRunCaches: the deadline passed before a pass could run");
+      break;
+    }
     const wrapped = wrap(process.execPath, [
       "-e",
       MEASURE_CACHES_SCRIPT,
@@ -578,14 +716,14 @@ export async function measureRunCaches(
     try {
       const { stdout } = await execFileAsync(wrapped.command, wrapped.args, {
         env: { PATH: "/usr/local/bin:/usr/bin:/bin" },
-        timeout: PURGE_TIMEOUT_MS,
+        timeout,
         maxBuffer: 64 * 1024,
       });
       const r = JSON.parse(stdout) as RunCacheBytes;
-      best = {
-        cacheBytes: Math.max(best?.cacheBytes ?? 0, r.cacheBytes),
-        truncated: (best?.truncated ?? false) || r.truncated,
-      };
+      best =
+        best === undefined || r.cacheBytes > best.cacheBytes
+          ? { ...r, truncated: (best?.truncated ?? false) || r.truncated }
+          : { ...best, truncated: best.truncated || r.truncated };
     } catch (e) {
       lastErr = e;
     }

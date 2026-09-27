@@ -8,7 +8,8 @@ import { type ExecutorResult, type RunContext, StubExecutor } from "../src/execu
 import { type ExecutorFactory } from "../src/runner.js";
 import { LimitReachedError } from "../src/limit.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
-import { nullLogger } from "./helpers.js";
+import { dropRunCaches } from "../src/run-caches.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
 import {
   api,
   fakeGitlab,
@@ -221,6 +222,17 @@ describe("RunRunner — cache drop on a process-ending park (PRD #1809 M1)", () 
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1809-gate-"));
     try {
+      // Calibrate the settle below on a real drop over the same HOME shape on this host, so
+      // a drop started at the gate (even fire-and-forget) would have finished, and logged,
+      // well within it; a fixed short sleep let such a drop pass unseen.
+      const probe = path.join(homeRoot, "calibrate");
+      seedHome(probe);
+      const t0 = Date.now();
+      await dropRunCaches(probe, nullLogger());
+      const settleMs = Math.max(500, 3 * (Date.now() - t0));
+      const { logger, lines } = recordingLogger();
+      const dropLines = () =>
+        lines.filter((l) => /run cache/.test((l as { msg: string }).msg)).map((l) => (l as { msg: string }).msg);
       let home = "";
       let returned = false;
       const stub = new StubExecutor(nullLogger(), { planGate: true });
@@ -241,24 +253,50 @@ describe("RunRunner — cache drop on a process-ending park (PRD #1809 M1)", () 
         };
       };
       const claim = gitlabClaim(1812);
-      const execution = runnerWith(factory, gitlab, undefined, nullLogger(), { planApprovalTimeoutMs: 5000 }).execute(
-        claim,
-      );
-      const deadline = Date.now() + 4000;
+      const execution = runnerWith(factory, gitlab, undefined, logger, { planApprovalTimeoutMs: 60_000 }).execute(claim);
+      const deadline = Date.now() + 10_000;
       while (!api.states.some((s) => s.runId === claim.run_id && s.body.status === "awaiting_approval")) {
         assert.ok(Date.now() < deadline, "precondition: the run parked at the plan gate");
         await new Promise((r) => setTimeout(r, 5));
       }
       // Let any park-side work settle while the gate is still open.
-      await new Promise((r) => setTimeout(r, 100));
+      await new Promise((r) => setTimeout(r, settleMs));
       assert.strictEqual(returned, false, "precondition: the executor is still live at the gate");
       assertCachesKept(home);
       assertResumeStateKept(home);
+      assert.deepStrictEqual(dropLines(), [], "no cache drop ran at the gate");
       api.setInputs(claim.run_id, [input("approve_plan")]);
       await execution;
       assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
+      // A completed run removes its whole HOME instead; no drop runs on the way either.
+      await new Promise((r) => setTimeout(r, settleMs));
+      assert.deepStrictEqual(dropLines(), [], "no cache drop ran at any point of a gate-then-complete run");
     } finally {
       forceRm(homeRoot);
+    }
+  });
+
+  it("dropRunCaches: a spent deadline skips every subtree with a warning and keeps the caches", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1809-deadline-"));
+    try {
+      seedHome(home);
+      const { logger, lines } = recordingLogger();
+      await dropRunCaches(home, logger, 0);
+      assertCachesKept(home);
+      assertResumeStateKept(home);
+      const warn = lines.find((l) => (l as { msg: string }).msg.includes("ran out of time")) as
+        | { level: string; skipped: string[] }
+        | undefined;
+      assert.ok(warn, `a warning names the skipped subtrees: ${JSON.stringify(lines)}`);
+      assert.strictEqual(warn.level, "warn");
+      assert.deepStrictEqual(warn.skipped, CACHES);
+      const info = lines.find((l) => (l as { msg: string }).msg === "run caches dropped on park") as
+        | { dropped: string[]; skipped: string[] }
+        | undefined;
+      assert.deepStrictEqual(info?.dropped, []);
+      assert.deepStrictEqual(info?.skipped, CACHES);
+    } finally {
+      forceRm(home);
     }
   });
 
