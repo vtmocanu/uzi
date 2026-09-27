@@ -115,8 +115,11 @@ prints the exact undo command — keep it). After a batch, re-run
   duplicate / tracked / false with evidence.
 - Check the current Findings capabilities before settling fixed items. A
   finding already fixed elsewhere gets `uzi findings resolve <finding-id>`
-  (human Done, #1723); leave the rest open unless the user chooses another
-  disposition.
+  (human Done, #1723), only after the user confirms — `resolve` needs the
+  evidence's finding id, not just the coordinate: a coordinate whose evidence
+  was deleted (its run was deleted) shows `-` in `uzi findings list` and has
+  nothing `resolve` can act on, so mark it done from the web Findings page
+  instead. Leave the rest open unless the user chooses another disposition.
 - Until grouped filing is available, manually file one issue per coherent root
   cause and list its finding IDs. This does not link their dispositions or
   enable automatic Done; leave their triage state unchanged.
