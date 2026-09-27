@@ -264,3 +264,261 @@ async function purgeChildrenAsAgents(target: string): Promise<void> {
     });
   }
 }
+
+/**
+ * PRD #1809 D2: the rebuildable caches a process-ending park drops from a run HOME,
+ * relative to that HOME. Each is refilled on demand by its tool (`go build` refills the
+ * build cache, `go` re-downloads modules, `npm` refills its content cache), so dropping
+ * one costs a resumed run time, never state. Nothing outside this list is ever deleted
+ * by {@link rmHomeSubtree}: the session transcript, `.claude.json`, `go/bin` and every
+ * unknown file stay. Adding an entry needs code evidence that it is rebuildable.
+ */
+export const RUN_CACHE_SUBTREES = [".cache/go-build", "go/pkg/mod", ".npm/_cacache"] as const;
+
+type RunCacheSubtree = (typeof RUN_CACHE_SUBTREES)[number];
+
+/** What an agent-uid chain helper concluded (see {@link SUBTREE_CHAIN_SCRIPT}). */
+type ChainVerdict = "ok" | "absent" | "refused" | "failed";
+
+/** Seams for {@link rmHomeSubtree}, injected by tests to simulate the uid split. */
+export interface SubtreeRemovalDeps {
+  splitActive: boolean;
+  removeTree: (target: string) => Promise<void>;
+  purgeChildrenAsAgents: (target: string) => Promise<void>;
+  /** Run {@link SUBTREE_CHAIN_SCRIPT} as the agent uids: `check` verifies the chain,
+   *  `rmdir` also removes the (by then empty) leaf. */
+  chainAsAgents: (home: string, rel: RunCacheSubtree, mode: "check" | "rmdir") => Promise<ChainVerdict>;
+}
+
+function defaultSubtreeRemovalDeps(): SubtreeRemovalDeps {
+  return {
+    splitActive: uidSplitActive(),
+    removeTree: rmTreeForce,
+    purgeChildrenAsAgents: purgeChildrenAsAgents,
+    chainAsAgents: chainAsAgents,
+  };
+}
+
+/**
+ * PRD #1809 D3: remove ONE named cache subtree (a {@link RUN_CACHE_SUBTREES} entry)
+ * inside a run HOME, leaving the HOME root and every sibling intact.
+ *
+ * {@link rmHomeTree} cannot be pointed at a subtree: it widens the root it is given to
+ * group `runner` and expects a worker-owned root, while a cache dir is written by the
+ * agent. This helper never chmods the HOME root or any sibling.
+ *
+ *  1. Refuse anything but a listed `rel` under an absolute `home`.
+ *  2. Walk HOME and each component of `rel` with `O_DIRECTORY | O_NOFOLLOW` opens: a
+ *     symlinked or non-directory `.cache`, `go`, `go/pkg`, `.npm` or leaf is refused
+ *     (a throw), never followed. A missing component means there is nothing to drop,
+ *     which is success. Under the split, a component the worker cannot open (a
+ *     runner-private dir) is checked by the same walk run as the agent uids.
+ *  3. Try the worker's plain {@link rmTreeForce}. Single-uid and worker-writable trees
+ *     end here.
+ *  4. Under the split, on a permission error only: run {@link PURGE_CHILDREN_SCRIPT} on
+ *     the subtree as the agent uids (it removes the subtree's children, not the subtree),
+ *     then remove the now-empty leaf, first as the worker and, when its parent is
+ *     agent-owned (`go/pkg`), by an agent-uid `rmdir` behind a re-run of the chain walk.
+ *  5. Walk the chain again and throw unless the subtree is gone. Whether that failure
+ *     matters is the caller's call; the park caller logs it and keeps the run parked.
+ *
+ * The walk resolves each level by path (Node has no `openat`), so the residual
+ * {@link restoreTreeWritability} documents applies here too: a writer racing an
+ * intermediate component into a symlink between the walk and the removal. The park
+ * caller runs after the run's agent processes are reaped, which removes that writer.
+ */
+export async function rmHomeSubtree(
+  home: string,
+  rel: string,
+  deps: SubtreeRemovalDeps = defaultSubtreeRemovalDeps(),
+): Promise<void> {
+  if (!path.isAbsolute(home)) throw new Error(`rmHomeSubtree: refusing non-absolute HOME ${home}`);
+  if (!isRunCacheSubtree(rel)) {
+    throw new Error(`rmHomeSubtree: refusing ${JSON.stringify(rel)}, not a listed cache subtree`);
+  }
+  const target = path.join(home, rel);
+  if ((await verifyChain(home, rel, deps)) === "absent") return;
+  try {
+    await deps.removeTree(target);
+    return;
+  } catch (err) {
+    if (!deps.splitActive || !isPermissionError(err)) throw err;
+  }
+  // As in rmHomeTree, the helper's exit status is not the verdict; the final walk is.
+  await deps.purgeChildrenAsAgents(target).catch(() => undefined);
+  try {
+    await deps.removeTree(target);
+  } catch (err) {
+    if (!isPermissionError(err)) throw err;
+    await deps.chainAsAgents(home, rel, "rmdir");
+  }
+  if ((await verifyChain(home, rel, deps)) !== "absent") {
+    throw Object.assign(new Error(`rmHomeSubtree: ${rel} is still present under ${home}`), { code: "ENOTEMPTY" });
+  }
+}
+
+function isRunCacheSubtree(rel: string): rel is RunCacheSubtree {
+  return (RUN_CACHE_SUBTREES as readonly string[]).includes(rel);
+}
+
+/**
+ * Steps 2 and 5 of {@link rmHomeSubtree}: "present" (every component a real directory)
+ * or "absent" (some component missing); a symlink / non-directory component, or
+ * anything else the walk could not settle, throws.
+ */
+async function verifyChain(
+  home: string,
+  rel: RunCacheSubtree,
+  deps: SubtreeRemovalDeps,
+): Promise<"present" | "absent"> {
+  let dir = home;
+  for (const part of ["", ...rel.split("/")]) {
+    if (part !== "") dir = path.join(dir, part);
+    try {
+      const handle = await fs.open(dir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      await handle.close().catch(() => undefined);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === "ENOENT") return "absent";
+      if (deps.splitActive && isPermissionError(err)) {
+        // A runner-private component the worker cannot open: let the agent uids walk it.
+        const verdict = await deps.chainAsAgents(home, rel, "check");
+        if (verdict === "ok") return "present";
+        if (verdict === "absent") return "absent";
+        throw new Error(`rmHomeSubtree: refusing ${rel} under ${home} (agent-uid walk: ${verdict})`);
+      }
+      // ELOOP (Linux) / ENOTDIR (macOS, or a plain file): a symlink or non-directory is
+      // not a path this code deletes through.
+      throw Object.assign(new Error(`rmHomeSubtree: refusing ${dir} (${code ?? "error"})`), { code });
+    }
+  }
+  return "present";
+}
+
+/**
+ * The agent-uid half of {@link verifyChain}, as `node -e <script> <home> <rel> <mode>`.
+ * Walks HOME then each component of `rel` with `O_DIRECTORY | O_NOFOLLOW` opens. Exit
+ * 0: every component is a real directory (and, in `rmdir` mode, the leaf was removed or
+ * was already gone); 2: a component is missing; 3: a symlink or non-directory component
+ * (refused); anything else: this uid could not decide (e.g. it cannot traverse a
+ * component). `rmdirSync` removes only an EMPTY directory and never follows a symlink.
+ */
+export const SUBTREE_CHAIN_SCRIPT = `
+const fs = require("node:fs");
+const path = require("node:path");
+const [home, rel, mode] = process.argv.slice(1);
+const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
+let dir = home;
+for (const part of ["", ...rel.split("/")]) {
+  if (part !== "") dir = path.join(dir, part);
+  let fd;
+  try { fd = fs.openSync(dir, flags); } catch (e) {
+    if (e.code === "ENOENT") process.exit(2);
+    if (e.code === "ELOOP" || e.code === "ENOTDIR") process.exit(3);
+    process.exit(4);
+  }
+  fs.closeSync(fd);
+}
+if (mode === "rmdir") {
+  try { fs.rmdirSync(dir); } catch (e) { if (e.code !== "ENOENT") process.exit(4); }
+}
+process.exit(0);
+`;
+
+/**
+ * Run {@link SUBTREE_CHAIN_SCRIPT} as `runner`, then `runner-cmd`, stopping at the first
+ * definite answer. A refusal from either uid is final: a symlink is a symlink whoever
+ * looks. Same minimal env and ceiling as {@link purgeChildrenAsAgents}.
+ */
+async function chainAsAgents(home: string, rel: RunCacheSubtree, mode: "check" | "rmdir"): Promise<ChainVerdict> {
+  for (const wrap of [runnerCommand, commandRootCommand]) {
+    const wrapped = wrap(process.execPath, ["-e", SUBTREE_CHAIN_SCRIPT, home, rel, mode]);
+    const code = await execFileAsync(wrapped.command, wrapped.args, {
+      env: { PATH: "/usr/local/bin:/usr/bin:/bin" },
+      timeout: PURGE_TIMEOUT_MS,
+      maxBuffer: 64 * 1024,
+    }).then(
+      () => 0,
+      (e: NodeJS.ErrnoException & { code?: unknown }) => {
+        if (typeof e.code !== "number") throw e;
+        return e.code;
+      },
+    );
+    if (code === 0) return "ok";
+    if (code === 2) return "absent";
+    if (code === 3) return "refused";
+  }
+  return "failed";
+}
+
+/** PRD #1809 D6: allocated bytes of a run HOME and of its {@link RUN_CACHE_SUBTREES}. */
+export interface HomeSubtreeBytes {
+  homeBytes: number;
+  cacheBytes: number;
+}
+
+/**
+ * The walk each measuring uid runs, as `node -e <script> <home> <subtrees-json>`. An
+ * `lstat` walk that never follows a symlink (only `lstat` directories are descended),
+ * summing allocated bytes (`blocks * 512`, what the data volume actually loses; `size`
+ * where a platform reports no blocks). Unreadable entries are skipped, so a pass is a
+ * lower bound of what it could not see. Prints one JSON line.
+ */
+const MEASURE_HOME_SCRIPT = `
+const fs = require("node:fs");
+const path = require("node:path");
+const home = process.argv[1];
+const caches = JSON.parse(process.argv[2]).map((r) => path.join(home, r));
+let homeBytes = 0, cacheBytes = 0;
+function walk(p, inCache) {
+  let st;
+  try { st = fs.lstatSync(p); } catch { return; }
+  const n = typeof st.blocks === "number" ? st.blocks * 512 : st.size;
+  homeBytes += n;
+  if (inCache) cacheBytes += n;
+  if (!st.isDirectory()) return;
+  let entries;
+  try { entries = fs.readdirSync(p); } catch { return; }
+  for (const e of entries) { const c = path.join(p, e); walk(c, inCache || caches.includes(c)); }
+}
+walk(home, false);
+process.stdout.write(JSON.stringify({ homeBytes, cacheBytes }) + "\\n");
+`;
+
+type CommandWrapper = (command: string, args: readonly string[]) => { command: string; args: string[] };
+
+/**
+ * PRD #1809 D3/D6: measure a run HOME and the cache bytes under it. Under the uid split
+ * the worker cannot list the agent's `0700` dirs, so the walk runs as `runner` and as
+ * `runner-cmd` through the same cap-clearing wrappers the purge uses, and the larger
+ * reading of each field is kept: each uid sees a subset, so the result is a lower bound,
+ * never an over-count from summing passes. Single-uid it runs once, unwrapped (the
+ * wrapper is the identity there). Rejects only when no pass produced a reading.
+ */
+export async function measureHomeSubtrees(
+  home: string,
+  wrappers: readonly CommandWrapper[] = uidSplitActive() ? [runnerCommand, commandRootCommand] : [runnerCommand],
+): Promise<HomeSubtreeBytes> {
+  if (!path.isAbsolute(home)) throw new Error(`measureHomeSubtrees: refusing non-absolute HOME ${home}`);
+  let best: HomeSubtreeBytes | undefined;
+  let lastErr: unknown;
+  for (const wrap of wrappers) {
+    const wrapped = wrap(process.execPath, ["-e", MEASURE_HOME_SCRIPT, home, JSON.stringify(RUN_CACHE_SUBTREES)]);
+    try {
+      const { stdout } = await execFileAsync(wrapped.command, wrapped.args, {
+        env: { PATH: "/usr/local/bin:/usr/bin:/bin" },
+        timeout: PURGE_TIMEOUT_MS,
+        maxBuffer: 64 * 1024,
+      });
+      const r = JSON.parse(stdout) as HomeSubtreeBytes;
+      best = {
+        homeBytes: Math.max(best?.homeBytes ?? 0, r.homeBytes),
+        cacheBytes: Math.max(best?.cacheBytes ?? 0, r.cacheBytes),
+      };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (!best) throw lastErr ?? new Error("measureHomeSubtrees: no measuring pass ran");
+  return best;
+}

@@ -74,6 +74,7 @@ import {
   type TerminalOutboxDeps,
 } from "./terminal-resolve.js";
 import { rmHomeTree } from "./rmtree.js";
+import { dropRunCaches } from "./run-caches.js";
 import {
   SteeringChannel,
   PauseNowSignal,
@@ -2432,6 +2433,15 @@ export class RunRunner {
         await rmHomeTree(runHome).catch((e) =>
           runLog.warn("run HOME cleanup failed", { error: errMessage(e) }),
         );
+      }
+      // PRD #1809 D2: a park that ended the run's process keeps its HOME for the resume but
+      // drops the rebuildable caches in it (RUN_CACHE_SUBTREES only; the transcript and every
+      // other file stay). Keyed on `parked`, NOT `preserveSession`: a shutdown interrupt or a
+      // failed pause expects a quick same-worker re-claim, so its warm caches are kept. Claude
+      // runs only (no `executor.safety`): a Codex run's caches sit on its own per-run volume
+      // (PRD #1809, Codex caches). Never throws: dropRunCaches logs and swallows its failures.
+      if (runHome && preserveResumeArtifacts && flight.parked && !executor.safety) {
+        await dropRunCaches(runHome, runLog);
       }
       if (flight.preClonePark) {
         // PRD #1392 M2: a pre-clone forge-unreachable park. It preserves HOME/session only when a

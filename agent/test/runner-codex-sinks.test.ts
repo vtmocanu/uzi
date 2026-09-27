@@ -665,6 +665,35 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
     }
   });
 
+  // PRD #1809 D2: the park cache drop is Claude-only. A Codex run's caches live on its own
+  // per-run volume, so a Codex park leaves its HOME exactly as it was.
+  it("a Codex park does not drop the run caches from its HOME (PRD #1809)", async () => {
+    const { gitlab } = fakeGitlab();
+    const restore = spyPublishLands();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1809-codex-park-"));
+    try {
+      const rig = codexRig();
+      const home = path.join(homeRoot, "home");
+      const caches = [".cache/go-build", "go/pkg/mod", ".npm/_cacache"];
+      const exec = new FakeCodexExecutor(rig.safety, async () => {
+        for (const rel of caches) {
+          fs.mkdirSync(path.join(home, rel), { recursive: true });
+          fs.writeFileSync(path.join(home, rel, "entry"), "cached\n");
+        }
+        throw new LimitReachedError({ resetsAtMs: Date.now() + 5 * 3600_000, rateLimitType: "five_hour" });
+      });
+      const claim = gitlabClaim(1809, { wait_on_limit: true });
+      await runnerWith(() => ({ executor: exec, homeDir: home }), gitlab).execute(claim);
+      assert.ok(statuses(claim.run_id).includes("limit_wait"), "precondition: the run parked at limit_wait");
+      for (const rel of caches) {
+        assert.ok(fs.existsSync(path.join(home, rel, "entry")), `${rel} must be untouched on a Codex park`);
+      }
+    } finally {
+      restore();
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("(1) graceful shutdown routes through withBoundary (boundary=shutdown)", async () => {
     const { gitlab } = fakeGitlab();
     const restore = spyPublishLands();
