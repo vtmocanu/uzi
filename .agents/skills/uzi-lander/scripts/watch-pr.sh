@@ -16,6 +16,7 @@
 #
 # Usage: watch-pr.sh OWNER/REPO PR [interval_secs] [max_polls]
 #                    [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN]
+#                    [--max-unknown N]
 #   interval_secs default 60, max_polls default 60.
 #   --reviewer        which bot must have reviewed the head (default any: either one).
 #                     Selecting ONE bot (coderabbit|greptile) also makes the OTHER fully
@@ -28,6 +29,14 @@
 #                     measured from the first poll). CodeRabbit's walkthrough normally
 #                     lands a few minutes after the PR opens; Greptile's check-run appears
 #                     ~12 s after `@greptileai review`. Pass 2 right after triggering.
+#   --max-unknown     consecutive polls with a failed or unreadable lookup before exit 9
+#                     (default 5, or $WATCH_PR_MAX_UNKNOWN). A Greptile review still running
+#                     (`greptile_pending`) is a wait, not a failure, and does not count.
+#                     Every poll line names the unknown lookups (`unknown_lookups=`).
+#
+# When Greptile has not reviewed the head, the poll line carries `greptile_last_reviewed=<sha>`,
+# its newest verdict on an earlier commit (informational: `git range-diff` it against a rebased
+# head to decide whether to re-run Greptile). It never gates.
 #
 # Exit codes (callers branch on these; keep them stable):
 #   0  merge-ready — CI green on head, the required reviewer(s) reviewed this head with
@@ -49,6 +58,8 @@
 #   8  conflict — the PR conflicts with its base (mergeable=CONFLICTING). GitHub runs no
 #      pull_request CI on it, so nothing will arrive: rebase with land-prep.sh, re-run.
 #      mergeable=UNKNOWN (GitHub still computing) is not a conflict; it keeps polling.
+#   9  unknown — --max-unknown consecutive polls could not read a lookup; RESULT names them
+#      (RESULT=unknown_persistent lookups=a,b). Fix or inspect that lookup; never merge on it.
 #
 # "CodeRabbit reviewed this head" is the union of robust signals, because a
 # zero-actionable incremental review can post NO new review object AND re-anchor no
@@ -76,14 +87,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/required-checks.sh
 . "$HERE/lib/required-checks.sh"
 
-usage() { echo "usage: watch-pr.sh OWNER/REPO PR [interval_secs] [max_polls] [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN]" >&2; exit 2; }
+usage() { echo "usage: watch-pr.sh OWNER/REPO PR [interval_secs] [max_polls] [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN] [--max-unknown N]" >&2; exit 2; }
 
-REVIEWER="any"; GRACE_MIN=10
+REVIEWER="any"; GRACE_MIN=10; MAX_UNKNOWN="${WATCH_PR_MAX_UNKNOWN:-5}"
 POS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --reviewer) REVIEWER="${2:?}"; shift 2;;
     --reviewer-grace) GRACE_MIN="${2:?}"; shift 2;;
+    --max-unknown) MAX_UNKNOWN="${2:?}"; shift 2;;
     -h|--help) usage;;
     -*) echo "unknown flag: $1" >&2; usage;;
     *) POS+=("$1"); shift;;
@@ -95,6 +107,27 @@ PR=${POS[1]}
 INTERVAL=${POS[2]:-60}
 MAX=${POS[3]:-60}
 case "$REVIEWER" in any|coderabbit|greptile|none) ;; *) echo "bad --reviewer: $REVIEWER" >&2; usage;; esac
+case "$MAX_UNKNOWN" in ''|*[!0-9]*|0) echo "bad --max-unknown: $MAX_UNKNOWN" >&2; usage;; esac
+
+# unk LOOKUP: this poll's LOOKUP failed or was unreadable. Names it for the poll line and
+# the persistent-unknown exit.
+unk() {
+  unknown=1
+  case ",$unk_why," in *",$1,"*) ;; *) unk_why="${unk_why:+$unk_why,}$1" ;; esac
+}
+# unknown_streak: count a poll whose unknowns are not all a running review (greptile_pending);
+# exit 9 once MAX_UNKNOWN such polls run back to back.
+unk_streak=0
+unknown_streak() {
+  case ",$unk_why," in
+    ,greptile_pending,) unk_streak=0 ;;
+    *) unk_streak=$((unk_streak + 1)) ;;
+  esac
+  if [ "$unk_streak" -ge "$MAX_UNKNOWN" ]; then
+    echo "RESULT=unknown_persistent lookups=$unk_why polls=$unk_streak"
+    exit 9
+  fi
+}
 
 # A request that SUCCEEDED but returned a payload jq cannot read must count as UNKNOWN,
 # never as "zero findings" — that is a route to a false ready. `gh api --paginate` emits
@@ -119,7 +152,7 @@ while [ "$i" -lt "$MAX" ]; do
   # Any lookup that FAILS (network/API error) sets unknown=1 for this iteration, so the
   # decision is deferred to the next poll rather than made on a masked zero. A failed lookup
   # is not the same as a zero result.
-  unknown=0
+  unknown=0; unk_why=""
 
   if [ "$repo_known" -eq 0 ]; then
     # Only a listing that parses as an array is a KNOWN answer; malformed output must not
@@ -136,7 +169,9 @@ while [ "$i" -lt "$MAX" ]; do
   req_base=$(printf '%s' "$pv" | jq -r '.baseRefName // empty' 2>/dev/null || true)
   pstate=$(printf '%s' "$pv" | jq -r '.state // empty' 2>/dev/null || true)
   if [ -z "$head" ]; then
-    echo "try $i: head unresolved (retrying)"
+    unk pr_view
+    echo "try $i: head unresolved (retrying) unknown_lookups=$unk_why"
+    unknown_streak
     sleep "$INTERVAL"
     continue
   fi
@@ -158,34 +193,34 @@ while [ "$i" -lt "$MAX" ]; do
   fail=0; pend=0; cancel=0; missing=0
   cj=$(gh pr checks "$PR" --repo "$REPO" --required --json name,bucket 2>/dev/null || true)
   if printf '%s' "$cj" | jq -e 'type=="array" and length>0' >/dev/null 2>&1; then
-    fail=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="fail")]|length') || unknown=1
-    pend=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length') || unknown=1
-    cancel=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length') || unknown=1
+    fail=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="fail")]|length') || unk ci_checks
+    pend=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length') || unk ci_checks
+    cancel=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length') || unk ci_checks
     # Re-read every poll: a retargeted PR or a rules change must not be judged by stale rules.
     req_ctx=""
     if [ -n "$req_base" ]; then req_ctx=$(required_contexts "$REPO" "$req_base") || req_ctx=""; fi
     if [ -n "$req_ctx" ]; then
-      missing=$(missing_required "$req_ctx" "$cj") || unknown=1
+      missing=$(missing_required "$req_ctx" "$cj") || unk ci_checks
       pend=$((pend + ${missing:-0}))
     else
-      unknown=1
+      unk required_rules
     fi
   else
-    unknown=1
+    unk ci_checks
   fi
 
   # mr_rework: an active (non-terminal) run on this (repo_id, mr_iid). Only skip the check on
   # a KNOWN-not-connected repo; an unresolved repo_id or a failed run-list is unknown.
   mrw_active=0
   if [ "$repo_known" -eq 0 ]; then
-    unknown=1
+    unk uzi_repo_list
   elif [ -n "$repo_id" ]; then
     if rl2=$(uzi run list --json 2>/dev/null) && is_array "$rl2"; then
       mrw_active=$(printf '%s' "$rl2" | jq -r --arg repo "$repo_id" --argjson pr "$PR" \
         '[.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr
-                     and ((.status|test("completed|failed|cancelled"))|not))]|length' 2>/dev/null) || unknown=1
+                     and ((.status|test("completed|failed|cancelled"))|not))]|length' 2>/dev/null) || unk mr_rework
     else
-      unknown=1
+      unk mr_rework
     fi
   fi
 
@@ -197,7 +232,7 @@ while [ "$i" -lt "$MAX" ]; do
   # (no context) = CR has not touched this head at all.
   cr_desc=""; cr_pending=0; cr_limited=0; cr_skipped=0; cr_absent=0; cr_status_at=""
   if st=$(gh api "repos/$REPO/commits/$head/status" 2>/dev/null) && printf '%s' "$st" | jq -e 'has("statuses")' >/dev/null 2>&1; then
-    cr_desc=$(printf '%s' "$st" | jq -r '[.statuses[]|select(.context=="CodeRabbit")]|last|.description // empty' 2>/dev/null) || unknown=1
+    cr_desc=$(printf '%s' "$st" | jq -r '[.statuses[]|select(.context=="CodeRabbit")]|last|.description // empty' 2>/dev/null) || unk cr_status
     cr_status_at=$(printf '%s' "$st" | jq -r '[.statuses[]|select(.context=="CodeRabbit")]|last|.updated_at // empty' 2>/dev/null || true)
     case "$cr_desc" in
       "") cr_absent=1 ;;
@@ -206,7 +241,7 @@ while [ "$i" -lt "$MAX" ]; do
       *"skipped"*) cr_skipped=1 ;;
     esac
   else
-    unknown=1
+    unk cr_status
   fi
 
   # Signal (a): a CodeRabbit review object on this exact head that is a VERDICT — APPROVED
@@ -223,25 +258,25 @@ while [ "$i" -lt "$MAX" ]; do
     # shellcheck disable=SC2016  # $h is a jq var (--arg), must stay single-quoted
     rev_on_head=$(printf '%s' "$rev_raw" | jq -rs --arg h "$head" \
       '[.[][]|select(.user.login=="coderabbitai[bot]" and .commit_id==$h
-                     and (.state=="APPROVED" or ((.body // "")|test("Actionable comments posted: [0-9]+"))))]|length' 2>/dev/null) || unknown=1
+                     and (.state=="APPROVED" or ((.body // "")|test("Actionable comments posted: [0-9]+"))))]|length' 2>/dev/null) || unk reviews
     [ "${rev_on_head:-0}" -gt 0 ] && cr_reviewed=1
     # shellcheck disable=SC2016
     cr_unconfirmed=$(printf '%s' "$rev_raw" | jq -rs --arg h "$head" \
       '[.[][]|select(.user.login=="coderabbitai[bot]" and .commit_id==$h
-                     and .state!="APPROVED" and (((.body // "")|test("Actionable comments posted: [0-9]+"))|not))]|length' 2>/dev/null) || unknown=1
+                     and .state!="APPROVED" and (((.body // "")|test("Actionable comments posted: [0-9]+"))|not))]|length' 2>/dev/null) || unk reviews
     # cr_a: the commit CodeRabbit reviewed MOST RECENTLY (any head), for the equivalent-head
     # signal (d) below. Reviews come back oldest-first, so the last coderabbit entry is its
     # newest verdict. Empty when CodeRabbit has posted no review object yet.
     cr_a=$(printf '%s' "$rev_raw" | jq -rs \
-      '[.[][]|select(.user.login=="coderabbitai[bot]")]|last|.commit_id // empty' 2>/dev/null) || unknown=1
+      '[.[][]|select(.user.login=="coderabbitai[bot]")]|last|.commit_id // empty' 2>/dev/null) || unk reviews
     # Greptile posts a review object only when it adds comments. Keep its current-head review
     # id so old still-anchored comments from prior reviews cannot contaminate this pass.
     gr_review_id=$(printf '%s' "$rev_raw" | jq -rs --arg h "$head" \
-      '[.[][]|select(.user.login=="greptile-apps[bot]" and .commit_id==$h)]|last|.id // empty' 2>/dev/null) || unknown=1
+      '[.[][]|select(.user.login=="greptile-apps[bot]" and .commit_id==$h)]|last|.id // empty' 2>/dev/null) || unk reviews
     gr_review_at=$(printf '%s' "$rev_raw" | jq -rs --arg h "$head" \
-      '[.[][]|select(.user.login=="greptile-apps[bot]" and .commit_id==$h)]|last|.submitted_at // empty' 2>/dev/null) || unknown=1
+      '[.[][]|select(.user.login=="greptile-apps[bot]" and .commit_id==$h)]|last|.submitted_at // empty' 2>/dev/null) || unk reviews
   else
-    unknown=1
+    unk reviews
   fi
   # Signal (c): the walkthrough comment, which CodeRabbit edits in place each pass and which
   # covers the zero-actionable incremental case (that posts no review object). It keys on the
@@ -265,7 +300,7 @@ while [ "$i" -lt "$MAX" ]; do
   # exactly-one walkthrough rule (it is informational, not a merge signal).
   cr_reset_min=""; cr_full_required=0
   if issue_c=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null) && pages_are_arrays "$issue_c"; then
-    wt_count=$(printf '%s' "$issue_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("<!-- walkthrough_start -->"))]|length' 2>/dev/null) || unknown=1
+    wt_count=$(printf '%s' "$issue_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("<!-- walkthrough_start -->"))]|length' 2>/dev/null) || unk issue_comments
     if [ "${wt_count:-0}" -eq 1 ]; then
       wt_body=$(printf '%s' "$issue_c" | jq -rs '.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("<!-- walkthrough_start -->"))|.body' 2>/dev/null || true)
       # final_review_risk marker: "up to `<sha>`" parsed ONLY within its own block.
@@ -327,9 +362,9 @@ while [ "$i" -lt "$MAX" ]; do
                              and (((.body // "")|gsub("^\\s+|\\s+$";""))=="@coderabbitai full review"))]|length) as $full
               | if $full==0 then 1 else 0 end
             end
-        end' 2>/dev/null) || unknown=1
+        end' 2>/dev/null) || unk issue_comments
   else
-    unknown=1
+    unk issue_comments
   fi
 
   # CodeRabbit liveness comes from GraphQL reviewThreads: REST line anchors survive a human
@@ -340,31 +375,31 @@ while [ "$i" -lt "$MAX" ]; do
     threads_ok=1
     cr_live=$(printf '%s' "$thread_nodes" | jq \
       '[.[]|select(.isResolved==false and .isOutdated==false)
-            |select(any(.comments.nodes[]?; ((.author.login // "")|startswith("coderabbitai"))))]|length' 2>/dev/null) || unknown=1
+            |select(any(.comments.nodes[]?; ((.author.login // "")|startswith("coderabbitai"))))]|length' 2>/dev/null) || unk review_threads
   else
-    unknown=1
+    unk review_threads
   fi
   # Greptile liveness is scoped to its current-head review id; the check-run tally below
   # proves whether GitHub has exposed the complete set. Liveness also drops comments whose
   # thread is resolved (gr_live_c), as CodeRabbit's does; the tally check keeps them all.
   gr_live_c='[]'; gr_anchored=0
   if pull_c=$(gh api --paginate "repos/$REPO/pulls/$PR/comments" 2>/dev/null) && pages_are_arrays "$pull_c"; then
-    gr_live_c=$(printf '%s' "$pull_c" | jq -s 'add // []' 2>/dev/null) || { gr_live_c='[]'; unknown=1; }
-    gr_anchored=$(printf '%s' "$gr_live_c" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null) || unknown=1
+    gr_live_c=$(printf '%s' "$pull_c" | jq -s 'add // []' 2>/dev/null) || { gr_live_c='[]'; unk pull_comments; }
+    gr_anchored=$(printf '%s' "$gr_live_c" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null) || unk pull_comments
     if [ "$threads_ok" -eq 1 ]; then
-      gr_live_c=$(printf '%s' "$gr_live_c" | drop_resolved_comments "$thread_nodes") || { gr_live_c='[]'; unknown=1; }
+      gr_live_c=$(printf '%s' "$gr_live_c" | drop_resolved_comments "$thread_nodes") || { gr_live_c='[]'; unk pull_comments; }
     fi
     if [ -n "$gr_review_id" ]; then
       gr_scoped_total=$(printf '%s' "$pull_c" | jq -rs --argjson rid "$gr_review_id" \
-        '[.[][]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid)]|length' 2>/dev/null) || unknown=1
+        '[.[][]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid)]|length' 2>/dev/null) || unk pull_comments
       gr_live=$(printf '%s' "$gr_live_c" | jq -r --argjson rid "$gr_review_id" \
-        '[.[]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid and .line!=null)]|length' 2>/dev/null) || unknown=1
+        '[.[]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid and .line!=null)]|length' 2>/dev/null) || unk pull_comments
     else
       gr_live=$(printf '%s' "$gr_live_c" | jq -r \
-        '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null) || unknown=1
+        '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null) || unk pull_comments
     fi
   else
-    unknown=1
+    unk pull_comments
   fi
 
   # Greptile: its `Greptile Review` check-run on the head (app slug greptile-apps). Absent =
@@ -374,18 +409,18 @@ while [ "$i" -lt "$MAX" ]; do
   # skipped is not a review. `gh api --paginate` emits one object per page, so slurp first.
   gr_state="absent"; gr_summary=""; gr_concl=""
   if cr_raw=$(gh api --paginate "repos/$REPO/commits/$head/check-runs" 2>/dev/null) && pages_are_checkruns "$cr_raw"; then
-    gr_json=$(printf '%s' "$cr_raw" | greptile_newest_run) || { unknown=1; gr_json=""; gr_state="unreadable"; }
+    gr_json=$(printf '%s' "$cr_raw" | greptile_newest_run) || { unk greptile_checkruns; gr_json=""; gr_state="unreadable"; }
     [ "$gr_json" = "{}" ] && gr_json=""
     if [ -n "$gr_json" ]; then
-      gr_state=$(printf '%s' "$gr_json" | jq -r '.status // "absent"' 2>/dev/null) || unknown=1
-      gr_concl=$(printf '%s' "$gr_json" | jq -r '.conclusion // ""' 2>/dev/null) || unknown=1
+      gr_state=$(printf '%s' "$gr_json" | jq -r '.status // "absent"' 2>/dev/null) || unk greptile_checkruns
+      gr_concl=$(printf '%s' "$gr_json" | jq -r '.conclusion // ""' 2>/dev/null) || unk greptile_checkruns
       gr_summary=$(printf '%s' "$gr_json" | jq -r '.output.summary // ""' 2>/dev/null | grep -oE '[0-9]+ files reviewed, [0-9]+ comments added' || true)
     fi
   else
     # Not `absent`: that means "read, and Greptile has no run here", which is what lets an
     # earlier verdict scope the findings below. An unreadable listing must not.
     gr_state="unreadable"
-    unknown=1
+    unk greptile_checkruns
   fi
   # No completed review run on the head: a push that raced `@greptileai review` leaves the run
   # on an older commit while Greptile reviewed this head (PR #1698). A head review object, or
@@ -406,7 +441,7 @@ while [ "$i" -lt "$MAX" ]; do
              gr_state="completed"; gr_concl="success"; gr_summary="$GRP_SUMMARY"; gr_via="($GRP_NOTE)"
            fi ;;
         2) gr_pending=1; gr_via="(pending: trigger $GRP_TRIGGER is newer than the run that reviewed ${head:0:8})" ;;
-        *) unknown=1 ;;
+        *) unk greptile_paired ;;
       esac ;;
   esac
   # Greptile's outside-diff findings live in one ISSUE comment, not in a review object
@@ -416,7 +451,7 @@ while [ "$i" -lt "$MAX" ]; do
   if [ -n "${issue_c:-}" ] && greptile_outside_diff "$head" < <(printf '%s' "$issue_c" | jq -s 'add // []'); then
     god_total="$GOD_TOTAL"; god_head="$GOD_HEAD"
   else
-    unknown=1
+    unk greptile_outside_diff
   fi
   gr_reviewed=0; gr_added=""
   if [ "$gr_state" = "completed" ] && [ "$gr_concl" = "success" ] && [ -n "$gr_summary" ]; then
@@ -435,11 +470,11 @@ while [ "$i" -lt "$MAX" ]; do
     elif [ -z "$gr_review_id" ]; then
       # A summary says inline comments were added but no current-head review id can scope
       # them. Fail closed rather than mixing old and new comments into a false finding set.
-      unknown=1
+      unk greptile_tally
     elif [ "$gr_scoped_total" -ne "$gr_inline_added" ]; then
       # GitHub can expose the completed check/review before all inline comments. Until the
       # review-scoped count matches Greptile's own tally, the finding set is incomplete.
-      unknown=1
+      unk greptile_tally
     fi
   fi
   # No Greptile review on THIS head, yet Greptile comments are still anchored. A push
@@ -457,10 +492,14 @@ while [ "$i" -lt "$MAX" ]; do
     if [ "$gr_rc" -eq 0 ]; then
       gr_live="$GRL_LIVE"; gr_prior="$GRL_NOTE"
     else
-      unknown=1
+      if [ "$gr_rc" -eq 2 ]; then unk greptile_pending; else unk greptile_prior; fi
       [ "$gr_rc" -eq 2 ] && gr_prior="pending"
     fi
   fi
+  # Informational only, never gating: Greptile's newest verdict on an EARLIER commit, so the
+  # lander can `git range-diff` it against a rebased head and decide whether to re-run it.
+  gr_last=""
+  if [ "$gr_reviewed" -eq 0 ] && greptile_prior_verdict "$REPO" "$PR" "$head" 2>/dev/null; then gr_last="$GRV_SHA"; fi
   gr_live=$(( gr_live + god_total ))
   [ "$gr_state" = "completed" ] && [ "$gr_reviewed" -eq 0 ] && gr_state="completed(${gr_concl:-no-conclusion}, no summary)"
   # An unconfirmed CodeRabbit review counts as live; Greptile is scoped to its current-head
@@ -530,7 +569,7 @@ while [ "$i" -lt "$MAX" ]; do
       fi
       [ "$equiv" -eq 1 ] && cr_reviewed=1
     else
-      unknown=1
+      unk cr_equiv_compare
     fi
   fi
 
@@ -546,10 +585,11 @@ while [ "$i" -lt "$MAX" ]; do
   [ "$equiv" -eq 1 ] && eqnote=" equiv=1"
   [ "$gr_reviewed" -eq 1 ] && grnote=" gr_scope=$gr_scoped_total+${god_head}od/${gr_added:-?}"
   [ -n "$gr_prior" ] && grnote=" gr_prior=$gr_prior"
-  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend${missing:+ req_missing=$missing} req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' cr_full_required=$cr_full_required greptile=$gr_state$gr_via${gr_summary:+ ($gr_summary)}${grnote} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${unknown:+ unknown=$unknown}"
+  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend${missing:+ req_missing=$missing} req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' cr_full_required=$cr_full_required greptile=$gr_state$gr_via${gr_summary:+ ($gr_summary)}${grnote} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${unknown:+ unknown=$unknown}${gr_last:+ greptile_last_reviewed=$gr_last}${unk_why:+ unknown_lookups=$unk_why}"
 
   # A failed lookup this iteration: defer, do not decide on masked values.
-  if [ "$unknown" -ne 0 ]; then sleep "$INTERVAL"; continue; fi
+  if [ "$unknown" -ne 0 ]; then unknown_streak; sleep "$INTERVAL"; continue; fi
+  unk_streak=0
 
   if [ "$fail" -gt 0 ]; then echo "RESULT=red"; exit 1; fi
   if [ "$mrw_active" -gt 0 ]; then echo "RESULT=mr_rework_active"; exit 4; fi

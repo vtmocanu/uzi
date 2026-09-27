@@ -212,6 +212,8 @@ rc=$?
 set -e
 [ "$rc" -eq 0 ] || fail "clean current Greptile review counted an old finding, rc=$rc: $(cat "$WORK/greptile.out")"
 grep -q '^RESULT=ready$' "$WORK/greptile.out" || fail "clean Greptile review did not reach ready"
+# ...and only when Greptile has not reviewed the head itself.
+grep -q 'greptile_last_reviewed=' "$WORK/greptile.out" && fail "greptile_last_reviewed printed for a Greptile-reviewed head"
 
 # The completed check/review may arrive before its inline comments; that is unknown, not clean.
 MODE="greptile_race"; export MODE
@@ -284,6 +286,8 @@ rc=$?
 set -e
 [ "$rc" -eq 0 ] || fail "superseded Greptile finding stayed live on an unreviewed head, rc=$rc: $(cat "$WORK/prior-clean.out")"
 grep -q 'gr_prior=bbbbbbbb/0.*live=0' "$WORK/prior-clean.out" || fail "earlier clean verdict was not shown: $(cat "$WORK/prior-clean.out")"
+# The full SHA of that verdict is printed for `git range-diff` (informational, not a gate)...
+grep -q 'greptile_last_reviewed=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' "$WORK/prior-clean.out" || fail "greptile_last_reviewed not printed: $(cat "$WORK/prior-clean.out")"
 
 # ...but it never satisfies the reviewer gate: the same head is still unreviewed by Greptile.
 set +e
@@ -568,4 +572,33 @@ set -e
 grep -q 'RESULT=conflict' "$WORK/computing.out" && fail "mergeable=UNKNOWN read as a conflict"
 unset CHECKS_NONE MERGEABLE_N MERGEABLE_SEQ
 
-echo "PASS watch-pr: settled reviews, unregistered required checks, resolved-thread scope, earlier-verdict Greptile scope, change_assessment head marker, reviewer override, Greptile run on an older commit, conflicting PR"
+# A lookup that stays unreadable (#1778: 24+ silent unknown=1 polls): every poll line names
+# it, and --max-unknown consecutive unknown polls exit 9 naming it, before max_polls.
+export CHECKS_NONE=1
+set +e
+bash "$SCRIPT" test/repo 42 0 20 --reviewer greptile --reviewer-grace 0 > "$WORK/unk-default.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 9 ] || fail "a persistent unknown returned rc=$rc, want 9: $(cat "$WORK/unk-default.out")"
+grep -q '^RESULT=unknown_persistent lookups=ci_checks polls=5$' "$WORK/unk-default.out" || fail "persistent unknown not named after 5 polls: $(cat "$WORK/unk-default.out")"
+grep -q 'try 1: .*unknown=1 unknown_lookups=ci_checks$' "$WORK/unk-default.out" || fail "the poll line does not name the unknown lookup: $(cat "$WORK/unk-default.out")"
+grep -q '^try 6:' "$WORK/unk-default.out" && fail "polled past the persistent-unknown limit"
+set +e
+bash "$SCRIPT" test/repo 42 0 20 --reviewer greptile --reviewer-grace 0 --max-unknown 2 > "$WORK/unk-flag.out" 2>&1
+rc=$?
+WATCH_PR_MAX_UNKNOWN=3 bash "$SCRIPT" test/repo 42 0 20 --reviewer greptile --reviewer-grace 0 > "$WORK/unk-env.out" 2>&1
+rc_env=$?
+set -e
+[ "$rc" -eq 9 ] && grep -q 'polls=2$' "$WORK/unk-flag.out" || fail "--max-unknown 2 not honoured, rc=$rc: $(cat "$WORK/unk-flag.out")"
+[ "$rc_env" -eq 9 ] && grep -q 'polls=3$' "$WORK/unk-env.out" || fail "WATCH_PR_MAX_UNKNOWN=3 not honoured, rc=$rc_env: $(cat "$WORK/unk-env.out")"
+unset CHECKS_NONE
+# A Greptile review still running is a wait, not an unreadable lookup: it never exits 9.
+MODE="prior_pending"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 7 --reviewer none --max-unknown 2 > "$WORK/unk-pending.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "a running Greptile review counted as persistent unknown, rc=$rc: $(cat "$WORK/unk-pending.out")"
+grep -q 'unknown_lookups=greptile_pending$' "$WORK/unk-pending.out" || fail "the pending review was not named: $(cat "$WORK/unk-pending.out")"
+
+echo "PASS watch-pr: settled reviews, unregistered required checks, resolved-thread scope, earlier-verdict Greptile scope, change_assessment head marker, reviewer override, Greptile run on an older commit, conflicting PR, persistent unknown"

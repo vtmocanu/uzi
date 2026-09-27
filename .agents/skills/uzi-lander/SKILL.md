@@ -127,13 +127,16 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    | 6 | no reviewer will come (skipped / absent past grace) | step 3 |
    | 7 | CR says the last commit was already reviewed | step 3, decide whether to request a full review |
    | 8 | PR conflicts with its base (`mergeable=CONFLICTING`): GitHub runs no CI on it | step 5 |
+   | 9 | a lookup stayed unreadable for `--max-unknown` polls (default 5); `RESULT` names it | inspect that lookup; never merge on it |
 
    Let an auto-review that is already running finish; never re-trigger it. `--reviewer` also
    scopes which bot BLOCKS: `coderabbit`|`greptile` selects one bot AND makes the other fully
    non-blocking (its in-flight review is not waited on, its findings do not gate) — the way to
    land on one bot while explicitly ignoring the other. `any` waits for and counts both bots'
    findings; `none` requires no reviewed-head signal (the local-review/Renovate lane) but
-   STILL counts live findings from both bots.
+   STILL counts live findings from both bots. Each poll line names its unknown lookups
+   (`unknown_lookups=`). `greptile_last_reviewed=<sha>` (also in `pr-findings.sh`) is Greptile's
+   newest earlier verdict: `git range-diff` it against a rebased head to decide on a re-run.
 
    **Greptile's clean pass posts no review and no comment:** only its `Greptile Review`
    check-run plus its PR-body edit naming "Last reviewed commit". A push racing the trigger
