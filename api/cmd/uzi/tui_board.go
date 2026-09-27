@@ -162,7 +162,7 @@ func (b *boardState) visible() []apitypes.RunListItemDTO {
 
 // The three triage bands, in fixed top-to-bottom order.
 const (
-	bandNeedsYou = iota // awaiting_approval + awaiting_input + awaiting_followup + a Codex relogin_required hold — the only rows a human must act on
+	bandNeedsYou = iota // awaiting_approval + awaiting_input + awaiting_followup + a Codex relogin_required hold + a credential_disabled hold — the only rows a human must act on
 	bandFloor           // everything non-terminal not in NEEDS YOU (running/claimed/queued/planning/limit_wait/pool_wait/recovery_wait, stalled)
 	bandDone            // terminal: completed/failed/cancelled
 	numBands
@@ -195,10 +195,11 @@ func runBand(status string, isRevising bool) int {
 // runBandOf is runBand over a list row, plus the one band decision the status cannot make
 // alone: a run held on its Codex account that needs the owner to re-log in (PRD #1590
 // relogin_required) is the owner's turn, so it bands into NEEDS YOU. Every other Codex hold
-// action resolves without the owner and stays ON THE FLOOR. Every band decision on the board
+// action resolves without the owner and stays ON THE FLOOR. A run held on credential_disabled
+// (PRD #1732 D14) resumes only on the owner's Enable or token switch, so it is NEEDS YOU too. Every band decision on the board
 // (the ordering, the eyebrow counts, the row's title ink) goes through here so they agree.
 func runBandOf(r apitypes.RunListItemDTO) int {
-	if codexReloginHold(r.RunDTO) {
+	if codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) {
 		return bandNeedsYou
 	}
 	return runBand(r.Status, r.IsRevising)
@@ -209,6 +210,9 @@ func runBandOf(r apitypes.RunListItemDTO) int {
 func runStateWord(r apitypes.RunListItemDTO) string {
 	if codexReloginHold(r.RunDTO) {
 		return codexReloginWord
+	}
+	if isCredentialDisabledHold(r.RunDTO) {
+		return credDisabledWord
 	}
 	_, word := stateGlyphWord(r.Status, r.Health, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.RecoveryWaitCause, ""))
 	return word
@@ -387,8 +391,9 @@ const vaultLockedReasonSubstr = "vault is locked"
 // the best-effort tier-2 escalation input (PRD #1251 M3, R3/R6). A run counts when its
 // HealthReason contains vaultLockedReasonSubstr (case-insensitive); the reason is only a
 // best-effort input (it is run-health-gated and collapses into the generic waiting_worker
-// status, D10), so a run-health-off board simply counts 0 and the indicator stays at the M2
-// tier-1 hint.
+// status, D10), so a run-health-off board simply counts 0 queued runs and the indicator stays
+// at the M2 tier-1 hint. Issue #1766: a run also counts when it is a recovery_wait park with
+// cause vault_locked (isVaultLockedPark), a typed signal that needs no run-health.
 //
 // It is computed over m.board.runs — the FULL loaded set, not the scrolled window — matching
 // boardSummary's run-source convention, so the count is stable while the board scrolls.
@@ -412,7 +417,10 @@ func (m tuiModel) ownParkedOnVaultCount() int {
 	}
 	n := 0
 	for _, r := range m.board.runs {
-		if r.HealthReason == nil || !strings.Contains(strings.ToLower(*r.HealthReason), vaultLockedReasonSubstr) {
+		// Issue #1766: a run already in flight when the vault locked parks as recovery_wait
+		// with cause vault_locked, whatever its health reason says; it is parked on the vault too.
+		queuedOnVault := r.HealthReason != nil && strings.Contains(strings.ToLower(*r.HealthReason), vaultLockedReasonSubstr)
+		if !queuedOnVault && !isVaultLockedPark(r.RunDTO) {
 			continue
 		}
 		if admin && (r.OwnerEmail == nil || !strings.EqualFold(*r.OwnerEmail, m.selfEmail)) {
@@ -975,17 +983,21 @@ func (m tuiModel) syncedScroll() int {
 	return start
 }
 
-// boardSummary is the top-right glyph cluster: ⚑ N · ✎ N · ➤ N · ⚿ N · ▲ N · <total> runs.
+// boardSummary is the top-right glyph cluster: ⚑ N · ✎ N · ➤ N · ⚿ N · ⊘ N · ▲ N · <total> runs.
 // Zero-count segments are dropped, so a healthy factory reads simply "N runs". Computed
 // over m.board.runs so it does not shrink under a filter. Every park in the NEEDS YOU
 // band gets a segment — awaiting_followup (PRD #517) alongside awaiting_approval and
 // awaiting_input, and the Codex relogin_required hold (PRD #1590, ⚿) — so no run that is
-// the owner's turn is invisible in the summary line.
+// the owner's turn is invisible in the summary line. The credential_disabled hold (PRD #1732,
+// ⊘) is counted the same way.
 func (m tuiModel) boardSummary() string {
-	approvals, inputs, followups, relogins, warn := 0, 0, 0, 0, 0
+	approvals, inputs, followups, relogins, credOff, warn := 0, 0, 0, 0, 0, 0
 	for _, r := range m.board.runs {
 		if codexReloginHold(r.RunDTO) {
 			relogins++
+		}
+		if isCredentialDisabledHold(r.RunDTO) {
+			credOff++
 		}
 		switch r.Status {
 		case "awaiting_approval":
@@ -1018,6 +1030,9 @@ func (m tuiModel) boardSummary() string {
 	}
 	if relogins > 0 {
 		segs = append(segs, paintSeg(m.pal.amber, nil, false, codexReloginGlyph+" "+itoa(relogins)))
+	}
+	if credOff > 0 {
+		segs = append(segs, paintSeg(m.pal.amber, nil, false, credDisabledGlyph+" "+itoa(credOff)))
 	}
 	if warn > 0 {
 		segs = append(segs, paintSeg(m.pal.stall, nil, false, "▲ "+itoa(warn)))

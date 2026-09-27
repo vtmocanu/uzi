@@ -114,7 +114,7 @@ func TestMarkFiveHourExhaustedLiveDB(t *testing.T) {
 	sec := mkExhaustSecret(ctx, t, pool, q, "five-hour-key")
 
 	base := time.Now().UTC()
-	if err := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+	if _, err := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 		UserSecretID:     sec,
 		UserID:           gaugeOwner(ctx, t, pool, sec),
 		FiveHourPct:      pgtype.Int2{Int16: 40, Valid: true},
@@ -174,7 +174,7 @@ func TestMarkSevenDayExhaustedLiveDB(t *testing.T) {
 	sec := mkExhaustSecret(ctx, t, pool, q, "seven-day-key")
 
 	base := time.Now().UTC()
-	if err := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+	if _, err := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 		UserSecretID:     sec,
 		UserID:           gaugeOwner(ctx, t, pool, sec),
 		FiveHourPct:      pgtype.Int2{Int16: 40, Valid: true},
@@ -228,7 +228,7 @@ func TestMarkFiveHourExhaustedNullPctLiveDB(t *testing.T) {
 	sec := mkExhaustSecret(ctx, t, pool, q, "null-pct-key")
 
 	base := time.Now().UTC()
-	if err := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+	if _, err := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 		UserSecretID:     sec,
 		UserID:           gaugeOwner(ctx, t, pool, sec),
 		FiveHourPct:      pgtype.Int2{}, // NULL — the Unmeasured five-hour window
@@ -333,7 +333,7 @@ func TestMarkFiveHourExhaustedShiftsNextAvailableLiveDB(t *testing.T) {
 	}
 
 	base := time.Now().UTC()
-	if err := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+	if _, err := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 		UserSecretID:     sec,
 		UserID:           owner,
 		FiveHourPct:      pgtype.Int2{Int16: 40, Valid: true},

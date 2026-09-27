@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/cgi" //nolint:gosec // G504: test-only CGI host for git http-backend on a fixed modern Go toolchain; httpoxy (CVE-2016-5386) affects Go < 1.6.3 only.
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -68,12 +69,48 @@ type gitHTTPRemote struct {
 	redirected atomic.Int64
 }
 
-func newGitHTTPRemote(t *testing.T, f *gitFixture) *gitHTTPRemote {
+// gitHTTPBackendStatus reports whether git-http-backend is an executable regular
+// file under execPath. When it is not, fatal says whether the caller must fail
+// (CI) rather than skip, and reason is the message for either.
+func gitHTTPBackendStatus(execPath string, inCI bool) (path string, ok, fatal bool, reason string) {
+	path = filepath.Join(execPath, "git-http-backend")
+	fi, err := os.Stat(path)
+	if err == nil && fi.Mode().IsRegular() && fi.Mode().Perm()&0o111 != 0 {
+		return path, true, false, ""
+	}
+	problem := "not an executable file"
+	if err != nil {
+		problem = err.Error()
+	}
+	if inCI {
+		return path, false, true, "git-http-backend unavailable at " + path + " (" + problem +
+			"); the credential-redirect regression suite must not be skipped in CI"
+	}
+	return path, false, false, "git-http-backend unavailable at " + path + " (" + problem +
+		"); install it (Alpine: apk add git-daemon; Debian/Ubuntu: ships with git)"
+}
+
+// requireGitHTTPBackend returns the git-http-backend path, skipping the test
+// locally and failing it in CI when the CGI binary is missing (Alpine's git
+// package omits it, which otherwise surfaces as opaque HTTP 500s).
+func requireGitHTTPBackend(t *testing.T) string {
+	t.Helper()
+	execPath := strings.TrimSpace(run(t, "", "git", "--exec-path"))
+	path, ok, fatal, reason := gitHTTPBackendStatus(execPath, os.Getenv("CI") != "")
+	if !ok {
+		if fatal {
+			t.Fatal(reason)
+		}
+		t.Skip(reason)
+	}
+	return path
+}
+
+func newGitHTTPRemote(t *testing.T, f *gitFixture, backendPath string) *gitHTTPRemote {
 	t.Helper()
 	run(t, "", "git", "-C", f.bare, "config", "http.receivepack", "true")
-	execPath := strings.TrimSpace(run(t, "", "git", "--exec-path"))
 	backend := &cgi.Handler{
-		Path: filepath.Join(execPath, "git-http-backend"),
+		Path: backendPath,
 		Env: []string{
 			"GIT_PROJECT_ROOT=" + filepath.Dir(f.bare),
 			"GIT_HTTP_EXPORT_ALL=1",
@@ -205,13 +242,14 @@ func brokerOps() []brokerOp {
 }
 
 func TestBrokerRefusesOffOriginRedirect(t *testing.T) {
+	backend := requireGitHTTPBackend(t)
 	for _, op := range brokerOps() {
 		for _, oo := range offOrigins() {
 			t.Run(op.name+"/"+oo.name, func(t *testing.T) {
 				trustLoopbackTLS(t)
 				f := newGitFixture(t)
 				call := op.setup(t, f)
-				remote := newGitHTTPRemote(t, f)
+				remote := newGitHTTPRemote(t, f, backend)
 				bad := newForbiddenRemote(t, oo.useTLS)
 				remote.redirSvc, remote.redirNth = op.svc, op.nth
 				remote.redirTo = func(path, q string) string { return oo.host(bad.srv.URL) + path + "?" + q }
@@ -237,12 +275,13 @@ func TestBrokerRefusesOffOriginRedirect(t *testing.T) {
 // Positive control: a same-origin redirect of each operation's discovery request is
 // still followed and the operation completes.
 func TestBrokerFollowsSameOriginRedirect(t *testing.T) {
+	backend := requireGitHTTPBackend(t)
 	for _, op := range brokerOps() {
 		t.Run(op.name, func(t *testing.T) {
 			trustLoopbackTLS(t)
 			f := newGitFixture(t)
 			call := op.setup(t, f)
-			remote := newGitHTTPRemote(t, f)
+			remote := newGitHTTPRemote(t, f, backend)
 			remote.redirSvc, remote.redirNth = op.svc, op.nth
 			remote.redirTo = func(path, q string) string { return "/alias" + path + "?" + q }
 
@@ -251,6 +290,42 @@ func TestBrokerFollowsSameOriginRedirect(t *testing.T) {
 			}
 			if n := remote.redirected.Load(); n != 1 {
 				t.Fatalf("redirects served = %d, want 1", n)
+			}
+		})
+	}
+}
+
+func TestGitHTTPBackendStatus(t *testing.T) {
+	cases := []struct {
+		name      string
+		mode      os.FileMode // 0 = absent
+		inCI      bool
+		wantOK    bool
+		wantFatal bool
+	}{
+		{"absent locally skips", 0, false, false, false},
+		{"absent in CI is fatal", 0, true, false, true},
+		{"executable is ok", 0o755, true, true, false},
+		{"non-executable is not ok", 0o644, false, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			want := filepath.Join(dir, "git-http-backend")
+			if tc.mode != 0 {
+				if err := os.WriteFile(want, []byte("#!/bin/sh\n"), tc.mode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			path, ok, fatal, reason := gitHTTPBackendStatus(dir, tc.inCI)
+			if path != want || ok != tc.wantOK || fatal != tc.wantFatal {
+				t.Fatalf("got (%q, ok=%v, fatal=%v), want (%q, ok=%v, fatal=%v)", path, ok, fatal, want, tc.wantOK, tc.wantFatal)
+			}
+			if !ok && !strings.Contains(reason, "git-http-backend") {
+				t.Fatalf("reason %q does not name git-http-backend", reason)
+			}
+			if fatal && !strings.Contains(reason, "must not be skipped in CI") {
+				t.Fatalf("CI reason %q does not say the suite must not be skipped", reason)
 			}
 		})
 	}

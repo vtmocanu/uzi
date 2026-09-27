@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 
 	gh "github.com/google/go-github/v92/github"
 )
@@ -141,4 +142,33 @@ func truncateForError(s string) string {
 		return s[:limit] + "..."
 	}
 	return s
+}
+
+// RefHead implements Forge (issue #1751 M2). GET /repos/{o}/{r}/git/ref/{ref without
+// "refs/"}, each ref segment path-escaped, through the same redirect-refusing, bounded read as
+// BranchHead. GitHub's singular git/ref endpoint matches exactly (a missing ref is a 404, which
+// is ErrRefNotFound); the echoed `ref` must still equal the requested full ref and point at a
+// commit object, so an answer naming another ref (or an annotated tag) is an error.
+func (g *github) RefHead(ctx context.Context, projectID int64, ref string) (string, error) {
+	if err := validateFullRef("github", ref); err != nil {
+		return "", err
+	}
+	slug, err := g.repoSlugFor(ctx, projectID)
+	if err != nil {
+		return "", err
+	}
+	path := fmt.Sprintf("repos/%s/%s/git/ref/%s", url.PathEscape(slug.owner), url.PathEscape(slug.repo),
+		escapePathSegments(strings.TrimPrefix(ref, "refs/")))
+	status, body, err := g.githubGetBounded(ctx, "ref head", path, ancestryBodyLimit)
+	if err != nil {
+		if status == http.StatusNotFound {
+			return "", ErrRefNotFound
+		}
+		return "", err
+	}
+	var b refObjectBody
+	if err := json.Unmarshal(body, &b); err != nil {
+		return "", g.wrapErr("ref head: decode", err)
+	}
+	return b.commitSHAOf("github", ref)
 }

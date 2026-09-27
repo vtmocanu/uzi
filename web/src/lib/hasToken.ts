@@ -11,11 +11,16 @@
 // ANY-ROW semantics are the contract: a user whose tokens are all non-default
 // still has a token. D6 makes that state unreachable through the UI today, which
 // is exactly why the rule has to be pinned by a test rather than by the runtime.
+//
+// PRD #1732 D15: "has a token" means an ENABLED one. A stored-but-disabled token can run
+// nothing, so a user whose tokens are all disabled reads exactly like a user with none
+// (the server's harness resolution and presence gates say the same). `enabled` absent is
+// enabled: a pre-#1732 api pod omits the key.
 
 import type { SecretMeta } from "./api";
 
 export function hasAnthropicToken(secrets: SecretMeta[]): boolean {
-  return secrets.some((s) => s.kind === "anthropic_token");
+  return secrets.some((s) => s.kind === "anthropic_token" && s.enabled !== false);
 }
 
 // anthropicTokenCount is the ">1 token" gate for the Runs-list credential badge

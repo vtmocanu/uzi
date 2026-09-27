@@ -449,17 +449,26 @@ type FakeClient struct {
 	LastDismissFindingReason string
 	DismissFindingErr        error
 
-	// GetFindingsStats / UndoDismissFinding capture (PRD #1183 M5). FindingsStatsResult is the
-	// canned `findings stats` reply and LastFindingsStatsRepo records the repo filter forwarded
+	// GetFindingsStats / UndoFinding capture (PRD #1183 M5, issue #1723). FindingsStatsResult is
+	// the canned `findings stats` reply and LastFindingsStatsRepo records the repo filter forwarded
 	// (empty = the flag was unset and the parameter omitted, so the SERVER's "all repos" default
 	// applies — the fake must not substitute one, mirroring LastFindingsBucket). LastUndoFindingID
-	// records the id `findings undo` targeted; UndoDismissFindingErr, like DismissFindingErr, is
-	// returned by the WRITE in preference to Err so a test can model the not-dismissed sentinel
-	// (ErrFindingNotDismissed) or a hard failure while the capture still proves the call was reached.
+	// records the id `findings undo` targeted and UndoFindingResult is the canned undone row;
+	// UndoFindingErr, like DismissFindingErr, is returned by the WRITE in preference to Err so a
+	// test can model the nothing-to-undo sentinel (ErrFindingNothingToUndo) or a hard failure
+	// while the capture still proves the call was reached.
 	FindingsStatsResult   apitypes.TriageDTO
 	LastFindingsStatsRepo string
 	LastUndoFindingID     string
-	UndoDismissFindingErr error
+	UndoFindingResult     apitypes.IncidentalFindingDTO
+	UndoFindingErr        error
+
+	// MarkFindingDone capture (issue #1723). LastMarkDoneFindingID records the evidence id
+	// `findings resolve` targeted; MarkFindingDoneResult is the canned reply; MarkFindingDoneErr
+	// wins over Err so a test can model a 404/409 while the capture proves the write was reached.
+	LastMarkDoneFindingID string
+	MarkFindingDoneResult apitypes.MarkFindingDoneResultDTO
+	MarkFindingDoneErr    error
 
 	// Review issue filing (PRD #365 M2). ReviewIssueDraft is the canned issue-draft reply;
 	// ReviewFileResult / Last... capture the file write. *Err fields win over Err so a test can

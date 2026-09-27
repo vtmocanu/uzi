@@ -447,7 +447,7 @@ tasks:
       - task: test:controller
 
   gate:web:
-    desc: web - deps-check, lint, deadcode, check-docs, check-changelog, check-styles, typecheck, test
+    desc: web - deps-check, lint, deadcode, check-docs, check-changelog, check-styles, typecheck, test, test-browser
     cmds:
       # 🔴 deps-check FIRST, AND IT DELIBERATELY BREAKS THE CHEAPEST-FIRST ORDER THE
       # REST OF THIS TARGET ARGUES FOR (PRD #103 M5 MR-C). oxlint is ~0.06s and this
@@ -540,6 +540,7 @@ tasks:
       - task: check-styles:web
       - task: typecheck:web
       - task: test:web
+      - task: test:web-browser
 
   gate:agent:
     desc: agent - deps-check, lint, deadcode, typecheck, test
@@ -945,13 +946,14 @@ tasks:
       - ./scripts/check-e2e-driver.sh
 
   test:e2e-lib:
-    desc: hermetic regression for lib.sh's db_psql tag-strip (#1351) and its phase chokepoint (#1511), tally-guarded (no stack, no docker)
+    desc: hermetic regression for lib.sh's db_psql tag-strip (#1351) and its phase chokepoint (#1511), plus wait_regated's new-claim gate wait (#1739), tally-guarded (no stack, no docker)
     cmds:
       # e2e/lib.test.sh extracts the real _psql_strip_tags out of e2e/lib.sh (which cannot be sourced
       # -- its top level provisions the whole stack) and drives it over stdin. It prints a mandatory
-      # `cases=N passed=N` tally and exits nonzero unless every case (>= 11) is green, so a gutted
+      # `cases=N passed=N` tally and exits nonzero unless every case (>= 18) is green, so a gutted
       # zero-case run cannot read green. Guards the psql command-tag corruption fix for scalar reads,
-      # and that no e2e phase invokes psql outside db_psql/db_psql_rows (#1511).
+      # that no e2e phase invokes psql outside db_psql/db_psql_rows (#1511), and that wait_regated only
+      # passes on a gate re-shown by a NEW claim (#1739).
       - ./e2e/lib.test.sh
 
   test:uzi-watcher-backups:
@@ -2168,6 +2170,21 @@ tasks:
       # cache is, and the same fixture mutation reddens it with no flag at all.
       # The two halves of this repo are NOT symmetric here.
       - npm test
+
+  test:web-browser:
+    desc: web layout tests in real Chromium (vitest browser mode, *.browser.test.tsx)
+    dir: web
+    env:
+      TZ: UTC
+    cmds:
+      # jsdom (test:web) has no layout engine, so a wrap/overflow regression such as the
+      # 390px triage-row squeeze passes there. These run in headless Chromium via
+      # web/vitest.browser.config.ts. A uzi worker uses its prebaked Chromium, found on disk
+      # by that config. Elsewhere the browser is NOT fetched here (a gate does not hit the
+      # network): a missing one exits 1 with Playwright's "Executable doesn't exist" banner.
+      # Fix with `npx playwright install chromium`, once, from web/. CI installs it in its
+      # own step. UZI_WEB_BROWSER_CHROMIUM=<path> runs any other Chromium instead.
+      - npm run test:browser
 
   # ----------------------------------------------------------- agent (npm) ----
   deps-check:agent:

@@ -168,3 +168,43 @@ func escapePathSegments(p string) string {
 	}
 	return strings.Join(segs, "/")
 }
+
+// RefHead implements Forge (issue #1751 M2). GET /repos/{o}/{r}/git/refs/{ref without
+// "refs/"}, each ref segment escaped as BranchHead does, through the same redirect-refusing,
+// bounded read. Forgejo matches that path as a PREFIX and answers a JSON array (or, for a
+// single match, one object), so the driver selects the entry whose `ref` equals the requested
+// full ref EXACTLY and requires it to point at a commit object. A 404 is ErrRefNotFound; an
+// answer with no exact entry (only a longer ref sharing the prefix) is an error, never another
+// ref's head.
+func (f *forgejo) RefHead(ctx context.Context, projectID int64, ref string) (string, error) {
+	if err := validateFullRef("forgejo", ref); err != nil {
+		return "", err
+	}
+	slug, err := f.forgejoSlug(ctx, projectID)
+	if err != nil {
+		return "", err
+	}
+	path := fmt.Sprintf("/repos/%s/%s/git/refs/%s", url.PathEscape(slug.owner), url.PathEscape(slug.repo),
+		escapePathSegments(strings.TrimPrefix(ref, "refs/")))
+	status, body, err := f.forgejoGetBounded(ctx, "ref head", path, ancestryBodyLimit)
+	if err != nil {
+		if status == http.StatusNotFound {
+			return "", ErrRefNotFound
+		}
+		return "", err
+	}
+	var entries []refObjectBody
+	if err := json.Unmarshal(body, &entries); err != nil {
+		var one refObjectBody
+		if err2 := json.Unmarshal(body, &one); err2 != nil {
+			return "", f.wrapErr("ref head: decode", err2)
+		}
+		entries = []refObjectBody{one}
+	}
+	for _, e := range entries {
+		if e.Ref != nil && *e.Ref == ref {
+			return e.commitSHAOf("forgejo", ref)
+		}
+	}
+	return "", errors.New("forgejo: ref head: response does not name the requested ref")
+}

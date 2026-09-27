@@ -1071,7 +1071,7 @@ func (s *Service) judgeChoice(ctx context.Context, run store.Run) (secretChoice,
 		}
 		// pinned with a NULL pointer resolves as default (D6), recorded honestly as
 		// default — staticChoice(nil, …) discards the bound reason on a nil id.
-		return staticChoice(nil, selectReasonJudge), nil
+		return judgeDefaultChoice(staticChoice(nil, selectReasonJudge)), nil
 	case BindModeAuto:
 		choice, aerr := s.autoChoice(ctx, run)
 		if aerr != nil {
@@ -1081,7 +1081,9 @@ func (s *Service) judgeChoice(ctx context.Context, run store.Run) (secretChoice,
 				// would rewrite the reason to `default`) so openAnthropic(nil) resolves
 				// the owner's default and recordRunCredential logs reason=pool_empty
 				// with the default's id and NULL headroom.
-				return secretChoice{reason: string(autoselect.ReasonPoolEmpty)}, nil
+				// PRD #1732 D2: the #1140 fallback spends only the enabled default; with no
+				// default at all (every token disabled) the run parks instead.
+				return judgeDefaultChoice(secretChoice{reason: string(autoselect.ReasonPoolEmpty)}), nil
 			}
 			return secretChoice{}, aerr
 		}
@@ -1089,8 +1091,15 @@ func (s *Service) judgeChoice(ctx context.Context, run store.Run) (secretChoice,
 	default:
 		// BindModeDefault, and any unrecognised value: the safe direction is the
 		// owner's default token (what the judge lane spent before it had a bind mode).
-		return staticChoice(nil, selectReasonJudge), nil
+		return judgeDefaultChoice(staticChoice(nil, selectReasonJudge)), nil
 	}
+}
+
+// judgeDefaultChoice marks a Judge-lane choice of the owner default so an empty Anthropic
+// slot whose tokens are all disabled parks the run instead of failing it (PRD #1732 D2/D4).
+func judgeDefaultChoice(c secretChoice) secretChoice {
+	c.parkOnEmptyDefault = true
+	return c
 }
 
 // assembleJudgeClaim builds the claim payload for a judge run (PRD #46 Decisions 1, 3
@@ -1300,7 +1309,9 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 	if run.Harness == harnessCodex {
 		codex, err := s.codexClaimSecrets(ctx, wkr, run)
 		if err != nil {
-			if errors.Is(err, errVaultLocked) || errors.Is(err, errRunVanished) {
+			// errCredentialDisabled passes through as well: a disabled frozen alias parks the
+			// judge on credential_disabled (PRD #1732 D2/D14), the one park a judge takes.
+			if errors.Is(err, errVaultLocked) || errors.Is(err, errRunVanished) || errors.Is(err, errCredentialDisabled) {
 				return nil, err
 			}
 			return nil, wrapJudgeCodexClaimError(err)

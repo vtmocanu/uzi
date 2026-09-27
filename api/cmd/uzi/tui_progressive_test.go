@@ -182,7 +182,7 @@ func TestTUIDetailLiveFrameBeforeTailRenders(t *testing.T) {
 
 	// A live frame arrives BEFORE the tail page (tailLoaded still false).
 	agent, at := "lead", now
-	next, _ = m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{{
+	next, _ = m.Update(streamEventsMsg{gen: m.detail.gen, runID: runID, events: []apitypes.RunEventDTO{{
 		Type: uzicli.RunEventTypeMessage, Seq: 7, Kind: "text", Agent: &agent, CreatedAt: &at,
 		Payload: json.RawMessage(`{"text":"beat the tail"}`),
 	}}})

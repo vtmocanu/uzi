@@ -16,7 +16,8 @@ import {
 // importOriginal is spread so the REAL isHttpsUrl (TriageStateChip's filed-link guard), ApiError and
 // the DTO types run for real; only the `api` object is replaced. This inner `api:{}` is NOT spread
 // from actual, so EVERY api.* the page or the AppShell chrome reaches must be listed here — the M4
-// additions (getFindingsStats / dismissFindings / undoDismissFinding) and the AppShell nav polls.
+// additions (getFindingsStats / dismissFindings), the issue #1723 verbs (markFindingsDone /
+// undoFinding) and the AppShell nav polls.
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
   return {
@@ -27,7 +28,8 @@ vi.mock("../lib/api", async (importOriginal) => {
       listFindings: vi.fn(),
       getFindingsStats: vi.fn(),
       dismissFindings: vi.fn(),
-      undoDismissFinding: vi.fn(),
+      markFindingsDone: vi.fn(),
+      undoFinding: vi.fn(),
       fileFinding: vi.fn(),
       dismissFinding: vi.fn(),
       findingIssueDraft: vi.fn(),
@@ -230,6 +232,30 @@ describe("Findings page — state chips (PRD #1183 vocabulary)", () => {
     await waitFor(() => expect(screen.getByText("auto-done")).toBeTruthy());
     expect(screen.getByText(/Done via #344/)).toBeTruthy();
   });
+
+  it("shows the plain ✓ Done chip on a human-done row, even one that keeps its issue link", async () => {
+    mockApi.listFindings.mockResolvedValue(
+      backlog({
+        bucket: "done",
+        repo: "repo-uzi",
+        findings: [
+          finding({
+            disposition_id: "d-hdone",
+            finding_id: "f-hdone",
+            status: "done",
+            filed_issue_iid: 12,
+            filed_issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/12",
+            last_title: "hand-done",
+          }),
+        ],
+      }),
+    );
+    renderFindings(["/findings?bucket=done&repo=repo-uzi"]);
+    await waitFor(() => expect(screen.getByText("hand-done")).toBeTruthy());
+    const row = screen.getByText("hand-done").closest("li") as HTMLElement;
+    expect(within(row).getByText("Done")).toBeTruthy();
+    expect(within(row).queryByText(/Done via/)).toBeNull();
+  });
 });
 
 describe("Findings page — File issue via the shared draft card", () => {
@@ -329,7 +355,7 @@ describe("Findings page — select-all, bulk dismiss + bounded Undo", () => {
     let inFlight = 0;
     let maxInFlight = 0;
     const releases: Array<() => void> = [];
-    mockApi.undoDismissFinding.mockImplementation((id: string) => {
+    mockApi.undoFinding.mockImplementation((id: string) => {
       inFlight += 1;
       maxInFlight = Math.max(maxInFlight, inFlight);
       return new Promise<IncidentalFinding>((resolve) => {
@@ -359,7 +385,7 @@ describe("Findings page — select-all, bulk dismiss + bounded Undo", () => {
     fireEvent.click(undoBtn);
 
     // BOUNDED: exactly UNDO_CONCURRENCY (6) DELETEs are in flight before any resolves, never all 8.
-    await waitFor(() => expect(mockApi.undoDismissFinding).toHaveBeenCalledTimes(6));
+    await waitFor(() => expect(mockApi.undoFinding).toHaveBeenCalledTimes(6));
     expect(maxInFlight).toBe(6);
 
     // Drain the gate; the remaining two fire as workers free up, reaching 8 total.
@@ -369,7 +395,7 @@ describe("Findings page — select-all, bulk dismiss + bounded Undo", () => {
         await Promise.resolve();
       }
     });
-    await waitFor(() => expect(mockApi.undoDismissFinding).toHaveBeenCalledTimes(8));
+    await waitFor(() => expect(mockApi.undoFinding).toHaveBeenCalledTimes(8));
     expect(maxInFlight).toBe(6);
   });
 
@@ -384,7 +410,7 @@ describe("Findings page — select-all, bulk dismiss + bounded Undo", () => {
       findings: rows.map((r) => ({ ...r, status: "dismissed", dismiss_reason: "wont_do" as const })),
     });
     // One of the three reopens fails.
-    mockApi.undoDismissFinding.mockImplementation(async (id: string) => {
+    mockApi.undoFinding.mockImplementation(async (id: string) => {
       if (id === "disp-2") throw new ApiError(500, "boom");
       return finding({ disposition_id: id, status: "open" });
     });
@@ -397,7 +423,258 @@ describe("Findings page — select-all, bulk dismiss + bounded Undo", () => {
     fireEvent.click(within(screen.getByRole("menu")).getByText("Won't do"));
     fireEvent.click(await screen.findByRole("button", { name: "Undo" }));
 
-    expect(await screen.findByText(/Partly undone: 2 of 3 reopened, 1 failed/)).toBeTruthy();
+    expect(await screen.findByText(/Partly undone: 2 of 3 undone, 1 failed/)).toBeTruthy();
+  });
+});
+
+// Issue #1723: the human Mark done. Mark done eligibility is split from File/Dismiss eligibility:
+// open rows with evidence get all three; filed/dismissed rows and rows without evidence get Mark
+// done only; done rows get none. Single and bulk both go through markFindingsDone(disposition ids).
+describe("Findings page — Mark done (issue #1723)", () => {
+  // One row per state, in the All bucket of a single repo (flat list).
+  const mixed = [
+    finding({ disposition_id: "d-open", finding_id: "f-open", last_title: "open row", location: "a.go#1" }),
+    finding({
+      disposition_id: "d-filed",
+      finding_id: "f-filed",
+      status: "filed",
+      filed_issue_iid: 71,
+      filed_issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/71",
+      last_title: "filed row",
+      location: "a.go#2",
+    }),
+    finding({ disposition_id: "d-dis", finding_id: "f-dis", status: "dismissed", dismiss_reason: "wont_do", last_title: "dismissed row", location: "a.go#3" }),
+    finding({ disposition_id: "d-done", finding_id: "f-done", status: "done", last_title: "done row", location: "a.go#4" }),
+    finding({ disposition_id: "d-noev", finding_id: undefined, last_title: "no evidence row", location: "a.go#5" }),
+  ];
+
+  function rowOf(title: string): HTMLElement {
+    return screen.getByText(title).closest("li") as HTMLElement;
+  }
+
+  function buttonNames(row: HTMLElement): string[] {
+    return within(row)
+      .queryAllByRole("button")
+      .map((b) => b.textContent ?? "")
+      .filter((t) => ["File issue", "Mark done", "Dismiss ▾"].includes(t));
+  }
+
+  async function renderMixed() {
+    mockApi.listFindings.mockResolvedValue(backlog({ bucket: "all", repo: "repo-uzi", findings: mixed }));
+    renderFindings(["/findings?bucket=all&repo=repo-uzi"]);
+    await waitFor(() => expect(screen.getByText("open row")).toBeTruthy());
+  }
+
+  it("splits eligibility: open rows get File · Mark done · Dismiss, filed/dismissed/no-evidence rows Mark done only, done rows nothing", async () => {
+    await renderMixed();
+    expect(buttonNames(rowOf("open row"))).toEqual(["File issue", "Mark done", "Dismiss ▾"]);
+    expect(buttonNames(rowOf("filed row"))).toEqual(["Mark done"]);
+    expect(buttonNames(rowOf("dismissed row"))).toEqual(["Mark done"]);
+    expect(buttonNames(rowOf("no evidence row"))).toEqual(["Mark done"]);
+    // The done row still renders (positive first), but offers no action and no checkbox.
+    const done = rowOf("done row");
+    expect(within(done).getByText("Done")).toBeTruthy();
+    expect(buttonNames(done)).toEqual([]);
+    expect(within(done).queryByRole("checkbox")).toBeNull();
+  });
+
+  it("select-all counts only the Mark-done-eligible rows on screen", async () => {
+    await renderMixed();
+    // open + filed + dismissed + no-evidence = 4 of the 5 rows; the done row is not selectable.
+    expect(screen.getByRole("checkbox", { name: "Select all 4 shown" })).toBeTruthy();
+    expect(within(rowOf("filed row")).getByRole("checkbox")).toBeTruthy();
+    expect(within(rowOf("no evidence row")).getByRole("checkbox")).toBeTruthy();
+  });
+
+  it("a single-row Mark done goes through the bulk endpoint, patches the chip, reloads stats and toasts", async () => {
+    mockApi.markFindingsDone.mockResolvedValue({
+      updated: 1,
+      findings: [finding({ disposition_id: "disp-1", status: "done", last_title: "Leaked ticker in sweepLoop" })],
+    });
+    renderFindings();
+    await waitFor(() => expect(screen.getByText("Leaked ticker in sweepLoop")).toBeTruthy());
+    const statsCalls = mockApi.getFindingsStats.mock.calls.length;
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+
+    await waitFor(() => expect(mockApi.markFindingsDone).toHaveBeenCalledWith(["disp-1"]));
+    // A human done reads the plain chip, never the sync's "Done via".
+    const row = rowOf("Leaked ticker in sweepLoop");
+    expect(await within(row).findByText("Done")).toBeTruthy();
+    expect(within(row).queryByText(/Done via/)).toBeNull();
+    expect(await screen.findByText("1 finding marked done.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Undo" })).toBeTruthy();
+    await waitFor(() => expect(mockApi.getFindingsStats.mock.calls.length).toBeGreaterThan(statsCalls));
+  });
+
+  it("bulk Mark done toasts only the applied rows, and Undo restores Filed vs To triage from the returned rows", async () => {
+    await renderMixed();
+    // Server applies open + filed, skips the no-evidence one (say it went mid-filing meanwhile).
+    mockApi.markFindingsDone.mockResolvedValue({
+      updated: 2,
+      findings: [
+        { ...mixed[0], status: "done" },
+        { ...mixed[1], status: "done" },
+      ],
+    });
+    mockApi.undoFinding.mockImplementation(async (id: string) =>
+      id === "d-filed" ? { ...mixed[1], status: "filed" } : { ...mixed[0], status: "open" },
+    );
+
+    fireEvent.click(within(rowOf("open row")).getByRole("checkbox"));
+    fireEvent.click(within(rowOf("filed row")).getByRole("checkbox"));
+    fireEvent.click(within(rowOf("no evidence row")).getByRole("checkbox"));
+    const bar = (await screen.findByText(/3 findings selected/)).parentElement as HTMLElement;
+    fireEvent.click(within(bar).getByRole("button", { name: "Mark done" }));
+
+    await waitFor(() => expect(mockApi.markFindingsDone).toHaveBeenCalledTimes(1));
+    expect(new Set(mockApi.markFindingsDone.mock.calls[0][0])).toEqual(new Set(["d-open", "d-filed", "d-noev"]));
+    // The message counts what the server applied, not what was sent.
+    expect(await screen.findByText("2 findings marked done.")).toBeTruthy();
+    expect(within(rowOf("filed row")).getByText("Done")).toBeTruthy();
+    // The selection cleared.
+    expect(screen.queryByText(/findings selected/)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    await waitFor(() => expect(mockApi.undoFinding).toHaveBeenCalledTimes(2));
+    expect(new Set(mockApi.undoFinding.mock.calls.map((c) => c[0]))).toEqual(new Set(["d-open", "d-filed"]));
+    // The done that still carried an issue link lands back on "Filed #71"; the other on To triage.
+    expect(await within(rowOf("filed row")).findByRole("link", { name: /Filed #71/ })).toBeTruthy();
+    expect(within(rowOf("open row")).getByText("To triage")).toBeTruthy();
+  });
+
+  it("a Mark done the server applies to nothing says so neutrally, with no Undo", async () => {
+    mockApi.markFindingsDone.mockResolvedValue({ updated: 0, findings: [] });
+    renderFindings();
+    await waitFor(() => expect(screen.getByText("Leaked ticker in sweepLoop")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+
+    expect(await screen.findByText(/^Nothing to update/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
+  });
+
+  it("bulk Dismiss over a mixed selection reports and undoes only the rows actually dismissed", async () => {
+    await renderMixed();
+    // The server dismisses the open row only; the filed and dismissed ones are skipped. `updated`
+    // deliberately disagrees with the one returned row: the toast count must come from the rows the
+    // server re-read (what actually moved), never from res.updated.
+    mockApi.dismissFindings.mockResolvedValue({
+      updated: 3,
+      findings: [{ ...mixed[0], status: "dismissed", dismiss_reason: "not_an_issue" }],
+    });
+    mockApi.undoFinding.mockResolvedValue({ ...mixed[0], status: "open" });
+
+    fireEvent.click(within(rowOf("open row")).getByRole("checkbox"));
+    fireEvent.click(within(rowOf("filed row")).getByRole("checkbox"));
+    fireEvent.click(within(rowOf("dismissed row")).getByRole("checkbox"));
+    const bar = (await screen.findByText(/3 findings selected/)).parentElement as HTMLElement;
+    fireEvent.click(within(bar).getByRole("button", { name: "Dismiss ▾" }));
+    fireEvent.click(within(screen.getByRole("menu")).getByText("Not an issue"));
+
+    expect(await screen.findByText("1 finding dismissed.")).toBeTruthy();
+    // The filed row did not move.
+    expect(within(rowOf("filed row")).getByRole("link", { name: /Filed #71/ })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    await waitFor(() => expect(mockApi.undoFinding).toHaveBeenCalledTimes(1));
+    expect(mockApi.undoFinding).toHaveBeenCalledWith("d-open");
+  });
+
+  it("a 409'd File whose reload returns the row filed offers Mark done again, agreeing with its checkbox", async () => {
+    // The row reads open, the File 409s (filed from elsewhere), and the reload brings it back filed.
+    // resolvedIds survives the reload, so the stale suppression must key on the row still reading
+    // open: the reconciled filed row gets its Mark done button back, alongside its checkbox.
+    const openRow = mixed[0];
+    const filedNow = {
+      ...openRow,
+      status: "filed" as const,
+      filed_issue_iid: 88,
+      filed_issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/88",
+    };
+    mockApi.listFindings
+      .mockResolvedValueOnce(backlog({ bucket: "all", repo: "repo-uzi", findings: [openRow] }))
+      .mockResolvedValue(backlog({ bucket: "all", repo: "repo-uzi", findings: [filedNow] }));
+    mockApi.findingIssueDraft.mockResolvedValue({
+      title: "t",
+      description: "d",
+      location: openRow.location,
+      labels: [],
+      provenance: "",
+    });
+    mockApi.fileFinding.mockRejectedValue(new ApiError(409, "already resolved"));
+    renderFindings(["/findings?bucket=all&repo=repo-uzi"]);
+    await waitFor(() => expect(screen.getByText("open row")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "File issue" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Create issue" }));
+
+    await waitFor(() => expect(mockApi.fileFinding).toHaveBeenCalledTimes(1));
+    expect(await within(rowOf("open row")).findByRole("link", { name: /Filed #88/ })).toBeTruthy();
+    const row = rowOf("open row");
+    expect(within(row).getByRole("checkbox")).toBeTruthy();
+    expect(buttonNames(row)).toEqual(["Mark done"]);
+  });
+
+  // Shared setup for the stale-open cases: an open row and a filed row, the File on the open row
+  // 409s, and EVERY reload (the 409 handler's included) returns the open row still reading open.
+  async function fileThen409StillOpen() {
+    const rows = [mixed[0], mixed[1]];
+    mockApi.listFindings.mockResolvedValue(backlog({ bucket: "all", repo: "repo-uzi", findings: rows }));
+    mockApi.findingIssueDraft.mockResolvedValue({
+      title: "t",
+      description: "d",
+      location: mixed[0].location,
+      labels: [],
+      provenance: "",
+    });
+    mockApi.fileFinding.mockRejectedValue(new ApiError(409, "already resolved"));
+    renderFindings(["/findings?bucket=all&repo=repo-uzi"]);
+    await waitFor(() => expect(screen.getByText("open row")).toBeTruthy());
+    expect(screen.getByRole("checkbox", { name: "Select all 2 shown" })).toBeTruthy();
+  }
+
+  async function fileOpenRowAnd409() {
+    const loads = mockApi.listFindings.mock.calls.length;
+    fireEvent.click(within(rowOf("open row")).getByRole("button", { name: "File issue" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Create issue" }));
+    await waitFor(() => expect(mockApi.fileFinding).toHaveBeenCalledTimes(1));
+    // The 409 handler reloads; wait for that reload AND for the row to settle as stale.
+    await waitFor(() => expect(mockApi.listFindings.mock.calls.length).toBeGreaterThan(loads));
+    expect(await within(rowOf("open row")).findByText("already resolved")).toBeTruthy();
+  }
+
+  it("a 409'd File whose reload returns the row still open offers no checkbox, no Mark done, and drops out of select-all", async () => {
+    await fileThen409StillOpen();
+    await fileOpenRowAnd409();
+
+    const row = rowOf("open row");
+    expect(within(row).queryByRole("checkbox")).toBeNull();
+    expect(buttonNames(row)).toEqual([]);
+    // Only the filed row is still selectable.
+    expect(screen.getByRole("checkbox", { name: "Select all 1 shown" })).toBeTruthy();
+    expect(screen.queryByRole("checkbox", { name: "Select all 2 shown" })).toBeNull();
+    expect(within(rowOf("filed row")).getByRole("checkbox")).toBeTruthy();
+  });
+
+  it("a ticked row that goes stale drops out of the bar count and is never sent by a bulk action", async () => {
+    await fileThen409StillOpen();
+    mockApi.markFindingsDone.mockResolvedValue({ updated: 1, findings: [{ ...mixed[1], status: "done" }] });
+
+    fireEvent.click(within(rowOf("open row")).getByRole("checkbox"));
+    fireEvent.click(within(rowOf("filed row")).getByRole("checkbox"));
+    expect(await screen.findByText(/2 findings selected/)).toBeTruthy();
+
+    await fileOpenRowAnd409();
+
+    // The stale row's checkbox is gone, so it no longer counts: the bar reads 1, and select-all over
+    // the one remaining selectable row reads fully checked.
+    const bar = (await screen.findByText(/1 finding selected/)).parentElement as HTMLElement;
+    expect(screen.queryByText(/2 findings selected/)).toBeNull();
+    expect((screen.getByRole("checkbox", { name: "Select all 1 shown" }) as HTMLInputElement).checked).toBe(true);
+
+    fireEvent.click(within(bar).getByRole("button", { name: "Mark done" }));
+    await waitFor(() => expect(mockApi.markFindingsDone).toHaveBeenCalledTimes(1));
+    expect(mockApi.markFindingsDone).toHaveBeenCalledWith(["d-filed"]);
   });
 });
 
@@ -460,7 +737,7 @@ describe("Findings page — repo grouping (PRD #333 M7, D3)", () => {
     expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, undefined);
   });
 
-  it("renders a null finding_id row display-only, with no File/Dismiss actions", async () => {
+  it("renders a null finding_id row with Mark done only (no File/Dismiss), and selectable", async () => {
     mockApi.listFindings.mockResolvedValue(
       backlog({
         bucket: "filed",
@@ -472,9 +749,11 @@ describe("Findings page — repo grouping (PRD #333 M7, D3)", () => {
     );
     renderFindings(["/findings?bucket=filed&repo=repo-uzi"]);
     await waitFor(() => expect(screen.getByText("orphaned filed")).toBeTruthy());
+    // Mark done keys on the disposition, so a coordinate without evidence still offers it.
+    expect(screen.getByRole("button", { name: "Mark done" })).toBeTruthy();
+    expect(screen.getByRole("checkbox", { name: /Select orphaned filed/ })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "File issue" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Dismiss ▾" })).toBeNull();
-    expect(screen.queryByRole("checkbox")).toBeNull();
   });
 });
 

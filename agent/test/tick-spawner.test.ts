@@ -196,6 +196,17 @@ ${exitAfterMs === undefined ? "setInterval(() => {}, 1000);" : `setTimeout(() =>
     assert.equal(alive(sp.pids()[0]!), false);
   });
 
+  it("a child deadline terminates and reaps its owned process group", async () => {
+    const ac = new AbortController();
+    const sp = new TickSpawner({ signal: ac.signal, killGraceMs: 50 });
+    const h = await sp.spawn({ ...req([NODE, stubborn()]), timeoutMs: 500 });
+    await ready(h);
+    await assert.rejects(h.completed, /timed out/);
+    await sp.settled();
+    assert.equal(alive(sp.pids()[0]!), false);
+    assert.equal(ac.signal.aborted, false);
+  });
+
   it("a group that survives SIGKILL past the bounded wait is reported by survivors(); settled() still resolves", async () => {
     const ac = new AbortController();
     let forceAlive = true;

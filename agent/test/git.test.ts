@@ -8,8 +8,9 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger, recordingLogger } from "./helpers.js";
-import { GitCache, bareDirName, gitEnv } from "../src/git.js";
+import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
+import { GitCache, ScratchProvisionError, bareDirName, gitEnv } from "../src/git.js";
+import { TickSpawner } from "../src/tick-spawner.js";
 
 let fx: Fixture;
 let git: GitCache;
@@ -127,6 +128,24 @@ describe("permit-scoped git output collection", () => {
   });
 });
 
+describe("supervised execScoped timeout", () => {
+  it("terminates and reaps the owned child at its wall clock deadline", async () => {
+    const ac = new AbortController();
+    const spawner = new TickSpawner({ signal: ac.signal, killGraceMs: 100 });
+    const internals = git as unknown as { execScoped: (
+      command: string, args: string[], options: { env: NodeJS.ProcessEnv; timeout: number },
+    ) => Promise<unknown> };
+    const start = Date.now();
+    await assert.rejects(git.withBoundaryProcessSpawner(spawner.spawn, ac.signal, () =>
+      internals.execScoped(process.execPath, ["-e", "setInterval(() => {}, 1000)"],
+        { env: process.env, timeout: 150 })), /timed out/);
+    await spawner.settled();
+    assert.ok(Date.now() - start < 3000, "the supervised child finished within the deadline and reap grace");
+    assert.equal(spawner.pids().length, 1);
+    assert.throws(() => process.kill(spawner.pids()[0]!, 0), { code: "ESRCH" });
+  });
+});
+
 describe("ensureClone", () => {
   it("clones bare on first call and fetches on the second", async () => {
     const bare = await git.ensureClone(fx.originPath);
@@ -179,7 +198,32 @@ describe("ensureClone", () => {
   });
 });
 
-describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () => {
+const linuxCloneSkip = process.platform === "linux" ? false : "runner clone scratch provisioning requires Linux procfs";
+
+describe("scratch provisioning platform support", () => {
+  it("refuses an unsupported platform with a named failure before any path access", async () => {
+    const provision = (git as unknown as {
+      provisionRunnerScratch(path: string, platform: string): Promise<void>;
+    }).provisionRunnerScratch.bind(git);
+    await assert.rejects(provision(path.join(fx.dataDir, "missing-clone"), "darwin"), (err: unknown) => {
+      assert.ok(err instanceof ScratchProvisionError);
+      assert.match(err.message, /Linux no-follow descriptor-relative scratch provisioning is unavailable/);
+      return true;
+    });
+    assert.equal(fs.existsSync(path.join(fx.dataDir, "missing-clone")), false);
+  });
+
+  it("keeps the test scratch provisioner out of every production call site", () => {
+    const srcDir = path.join(import.meta.dirname, "..", "src");
+    const users = (fs.readdirSync(srcDir, { recursive: true }) as string[])
+      .filter((f) => f.endsWith(".ts"))
+      .filter((f) => fs.readFileSync(path.join(srcDir, f), "utf8").includes("scratchProvisioner"));
+    // Only its definition in git.ts names it; no caller, env var or config key selects it.
+    assert.deepEqual(users, ["git.ts"]);
+  });
+});
+
+describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { skip: linuxCloneSkip }, () => {
   const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
   function refInBare(bare: string, ref: string): boolean {
     try {
@@ -213,6 +257,148 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
     // On a FRESH branch the seed IS the default tip, so the two commits coincide — which
     // is what lets the prompt state one command instead of two.
     assert.strictEqual(rc.defaultBranchCommit, rc.baseCommit);
+  });
+
+  it("provisions ignored, group-writable scratch on fresh and reseeded clones", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const first = await git.createOrAttachRunnerClone(bare, 1719);
+    const scratch = path.join(first.path, ".uzi", "scratch");
+    const stat = fs.statSync(scratch);
+    assert.equal(stat.isDirectory(), true);
+    assert.equal(stat.mode & 0o2070, 0o2070);
+    assert.equal(fs.readFileSync(path.join(first.path, ".git", "info", "exclude"), "utf8")
+      .split("\n").filter((line) => line === "/.uzi/scratch/").length, 1);
+    fs.writeFileSync(path.join(scratch, "gate-log.test"), "output");
+    assert.equal(gitIn(first.path, ["status", "--porcelain"]), "");
+    gitIn(first.path, ["add", "-A"]);
+    assert.equal(gitIn(first.path, ["diff", "--cached", "--name-only"]), "");
+    const second = await git.createOrAttachRunnerClone(bare, 1719, "run", true);
+    assert.equal(fs.existsSync(path.join(second.path, ".uzi", "scratch", "gate-log.test")), false);
+    assert.equal(fs.statSync(path.join(second.path, ".uzi", "scratch")).isDirectory(), true);
+  });
+
+  it("refuses repository ignore rules that expose scratch to git add -A", async () => {
+    fs.writeFileSync(path.join(fx.originPath, ".gitignore"), "!.uzi/scratch/\n");
+    gitIn(fx.originPath, ["add", ".gitignore"]);
+    gitIn(fx.originPath, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "expose scratch"]);
+    const bare = await git.ensureClone(fx.originPath);
+    await assert.rejects(git.createOrAttachRunnerClone(bare, 1719), ScratchProvisionError);
+  });
+
+  it("refuses ignore rules that hide only the scratch probe while exposing artifacts", async () => {
+    fs.writeFileSync(path.join(fx.originPath, ".gitignore"),
+      "!.uzi/scratch/\n.uzi/scratch/.uzi-ignore-probe\n");
+    gitIn(fx.originPath, ["add", ".gitignore"]);
+    gitIn(fx.originPath, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "hide probe only"]);
+    const bare = await git.ensureClone(fx.originPath);
+    await assert.rejects(git.createOrAttachRunnerClone(bare, 1719), ScratchProvisionError);
+  });
+
+  it("accepts an unrelated repository unignore rule while scratch stays ignored", async () => {
+    fs.writeFileSync(path.join(fx.originPath, ".gitignore"), "!README.md\n");
+    gitIn(fx.originPath, ["add", ".gitignore"]);
+    gitIn(fx.originPath, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "unrelated unignore"]);
+    const bare = await git.ensureClone(fx.originPath);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    fs.writeFileSync(path.join(clone.path, ".uzi", "scratch", "artifact.txt"), "artifact");
+    gitIn(clone.path, ["add", "-A"]);
+    assert.equal(gitIn(clone.path, ["diff", "--cached", "--name-only"]), "");
+  });
+
+  it("rejects a crafted local exclude that hides one probe but exposes artifacts", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    const excludePath = path.join(clone.path, ".git", "info", "exclude");
+    fs.writeFileSync(excludePath, "/.uzi/scratch/\n!/.uzi/scratch/\n/.uzi/scratch/.uzi-ignore-probe\n");
+    await assert.rejects(
+      (git as unknown as { provisionRunnerScratch(path: string): Promise<void> }).provisionRunnerScratch(clone.path),
+      ScratchProvisionError,
+    );
+  });
+
+  it("rejects an unwritable scratch directory on single-uid adoption", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    const scratch = path.join(clone.path, ".uzi", "scratch");
+    fs.chmodSync(scratch, 0o500);
+    await assert.rejects(
+      (git as unknown as { provisionRunnerScratch(path: string): Promise<void> }).provisionRunnerScratch(clone.path),
+      ScratchProvisionError,
+    );
+  });
+
+  it("rejects a symlinked scratch leaf on revalidation without following it", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    const scratch = path.join(clone.path, ".uzi", "scratch");
+    fs.rmSync(scratch, { recursive: true });
+    fs.symlinkSync(fx.originPath, scratch);
+    await assert.rejects(
+      (git as unknown as { provisionRunnerScratch(path: string): Promise<void> }).provisionRunnerScratch(clone.path),
+      ScratchProvisionError,
+    );
+    assert.equal(fs.lstatSync(scratch).isSymbolicLink(), true);
+  });
+
+  it("preserves unrelated tracked .uzi content and rejects a non-directory .uzi ancestor", async () => {
+    fs.mkdirSync(path.join(fx.originPath, ".uzi"));
+    fs.writeFileSync(path.join(fx.originPath, ".uzi", "keep.txt"), "keep");
+    gitIn(fx.originPath, ["add", ".uzi/keep.txt"]);
+    gitIn(fx.originPath, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "unrelated uzi"]);
+    const bare = await git.ensureClone(fx.originPath);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    assert.equal(fs.readFileSync(path.join(clone.path, ".uzi", "keep.txt"), "utf8"), "keep");
+    assert.equal(fs.statSync(path.join(clone.path, ".uzi", "scratch")).gid, fs.statSync(clone.path).gid);
+    const uzi = path.join(clone.path, ".uzi");
+    fs.rmSync(uzi, { recursive: true });
+    fs.writeFileSync(uzi, "not a directory");
+    await assert.rejects(
+      (git as unknown as { provisionRunnerScratch(path: string): Promise<void> }).provisionRunnerScratch(clone.path),
+      ScratchProvisionError,
+    );
+    assert.equal(fs.readFileSync(uzi, "utf8"), "not a directory");
+  });
+
+  it("refuses a git exclude that would exceed the bound after appending the rule", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    const excludePath = path.join(clone.path, ".git", "info", "exclude");
+    const atLimit = "x".repeat(64 * 1024);
+    fs.writeFileSync(excludePath, atLimit);
+    await assert.rejects(
+      (git as unknown as { provisionRunnerScratch(path: string): Promise<void> }).provisionRunnerScratch(clone.path),
+      ScratchProvisionError,
+    );
+    assert.equal(fs.readFileSync(excludePath, "utf8"), atLimit);
+  });
+
+  it("refuses an oversized git exclude without reading or appending the whole file", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    const excludePath = path.join(clone.path, ".git", "info", "exclude");
+    const oversized = "x".repeat(64 * 1024 + 1);
+    fs.writeFileSync(excludePath, oversized);
+    await assert.rejects(
+      (git as unknown as { provisionRunnerScratch(path: string): Promise<void> }).provisionRunnerScratch(clone.path),
+      ScratchProvisionError,
+    );
+    assert.equal(fs.readFileSync(excludePath, "utf8"), oversized);
+  });
+
+  it("refuses tracked scratch and symlinked .uzi with a named provisioning error", async () => {
+    fs.mkdirSync(path.join(fx.originPath, ".uzi", "scratch"), { recursive: true });
+    fs.writeFileSync(path.join(fx.originPath, ".uzi", "scratch", "tracked.txt"), "x");
+    gitIn(fx.originPath, ["add", ".uzi/scratch/tracked.txt"]);
+    gitIn(fx.originPath, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "tracked scratch"]);
+    const bare = await git.ensureClone(fx.originPath);
+    await assert.rejects(git.createOrAttachRunnerClone(bare, 1720), ScratchProvisionError);
+
+    fs.rmSync(path.join(fx.originPath, ".uzi"), { recursive: true });
+    fs.symlinkSync(".", path.join(fx.originPath, ".uzi"));
+    gitIn(fx.originPath, ["add", "-A"]);
+    gitIn(fx.originPath, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "symlinked ancestor"]);
+    await git.ensureClone(fx.originPath);
+    await assert.rejects(git.createOrAttachRunnerClone(bare, 1721), ScratchProvisionError);
   });
 
   it("round-trips: commit in the clone → worker fetch-back → bare tree-diff → push to origin", async () => {
@@ -773,7 +959,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
   });
 });
 
-describe("branchTip / trackingTip (PRD #122 M6)", () => {
+describe("branchTip / trackingTip (PRD #122 M6)", { skip: linuxCloneSkip }, () => {
   const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
 
   it("branchTip reads the runner clone's own head; trackingTip is null before a fetch-back and the tip after", async () => {
@@ -806,7 +992,7 @@ describe("branchTip / trackingTip (PRD #122 M6)", () => {
   });
 });
 
-describe("checkpoint reseed candidate (PRD #122 M8)", () => {
+describe("checkpoint reseed candidate (PRD #122 M8)", { skip: linuxCloneSkip }, () => {
   const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
 
   /** Commit `file` in the runner clone and return the new HEAD sha. */
@@ -935,7 +1121,7 @@ describe("checkpoint reseed candidate (PRD #122 M8)", () => {
   });
 });
 
-describe("checkpointPack (PRD #122 M8)", () => {
+describe("checkpointPack (PRD #122 M8)", { skip: linuxCloneSkip }, () => {
   const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
 
   async function drain(r: Readable): Promise<Buffer> {
@@ -1346,7 +1532,7 @@ describe("issue #781 — disjoint-ref seed guard + fetch --prune", () => {
     }
   }
 
-  it("rejects a disjoint origin branch ref and seeds off the default tip instead", async () => {
+  it("rejects a disjoint origin branch ref and seeds off the default tip instead", { skip: linuxCloneSkip }, async () => {
     // Build a DISJOINT branch at origin matching the seed branch name for issue 55 — an
     // orphan root, so it shares no history (and no content) with main.
     gitIn(fx.originPath, ["checkout", "--orphan", "agent/issue-55"]);
@@ -1383,7 +1569,7 @@ describe("issue #781 — disjoint-ref seed guard + fetch --prune", () => {
     assert.notStrictEqual(rc.baseCommit, disjointTip, "…explicitly NOT the disjoint ref tip");
   });
 
-  it("keeps a far-ahead owned tracking ref that merely diverges from default (guard is not over-aggressive)", async () => {
+  it("keeps a far-ahead owned tracking ref that merely diverges from default (guard is not over-aggressive)", { skip: linuxCloneSkip }, async () => {
     const bare = await git.ensureClone(fx.originPath);
     // Seed a first runner clone off the initial default and build a tracking ref several
     // commits ahead, owned by run-far. It forks off main's initial commit — so it merely
@@ -1474,6 +1660,8 @@ describe("issue #781 — disjoint-ref seed guard + fetch --prune", () => {
 // fetchAgentBranch must clear the conflicting ancestor first (archiving its tip), land the
 // agent commit, and leave unrelated sibling tracking refs untouched.
 describe("issue #887 — fetchAgentBranch clears a D/F-conflicting legacy ancestor tracking ref", () => {
+  // Not a scratch suite: off Linux it runs on the test provisioner (a no-op on Linux).
+  beforeEach(() => { git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions()); });
   const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
   function refInBare(bare: string, ref: string): boolean {
     try {
@@ -1552,6 +1740,8 @@ describe("issue #887 — fetchAgentBranch clears a D/F-conflicting legacy ancest
 });
 
 describe("issue #909 — the owner-stamp reader falls back to the pre-#887 flattened key, collision-guarded", () => {
+  // Not a scratch suite: off Linux it runs on the test provisioner (a no-op on Linux).
+  beforeEach(() => { git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions()); });
   const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
   function refInBare(bare: string, ref: string): boolean {
     try {

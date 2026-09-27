@@ -65,7 +65,7 @@ const (
 	// reauth-flagged, or carrying recovery material) — not an error, just not a poll target.
 	CodexUsageFailDisabled
 	// CodexUsageFailNotLinked: the account does not resolve to an owned account, or it has no
-	// linked codex_auth alias (there is no subscription to meter).
+	// ENABLED linked codex_auth alias (there is no live subscription to meter, PRD #1732 D6).
 	CodexUsageFailNotLinked
 )
 
@@ -163,7 +163,7 @@ func (s *Service) codexUsageReader() (CodexUsageReader, bool) {
 // Store interface for the same reason codexAuthzStore is. *store.Queries satisfies it.
 type codexUsageStore interface {
 	GetCodexProviderAccountByID(ctx context.Context, arg store.GetCodexProviderAccountByIDParams) (store.CodexProviderAccount, error)
-	CountLinkedAliasesForCodexAccount(ctx context.Context, arg store.CountLinkedAliasesForCodexAccountParams) (int64, error)
+	CountEnabledLinkedAliasesForCodexAccount(ctx context.Context, arg store.CountEnabledLinkedAliasesForCodexAccountParams) (int64, error)
 	MarkCodexReauthRequired(ctx context.Context, arg store.MarkCodexReauthRequiredParams) (int64, error)
 }
 
@@ -183,14 +183,18 @@ func (s *Service) codexUsageQueries() (codexUsageStore, bool) {
 // worker-scoped:
 //
 //  1. re-read the account (user, id) — refuse if it does not resolve;
-//  2. prove a linked alias exists for it;
+//  2. prove an ENABLED linked alias exists for it (PRD #1732 D6: an account with no enabled
+//     linked alias is neither polled nor background-refreshed);
 //  3. refuse a non-pollable coord state (in_progress/quarantined) and build the principal;
 //  4. open the committed access token (a locked vault → vault_locked, prior reading kept);
 //  5. ReadUsage with the persisted workspace id as ChatGPT-Account-Id;
 //  6. identity-mismatch check BEFORE returning any reading;
 //  7. rejected-access loop: a 401 does ONE bounded retry on a newer committed generation,
 //     else one coordinated rotation + retry; a proven no-renewal expiry flags reauth; a bare
-//     403 is transient (never a refresh, never reauth); a 429 backs off;
+//     403 is transient (never a refresh, never reauth); a 429 backs off. The enabled-alias
+//     proof is repeated immediately before a rotation starts, so a disable that landed during
+//     the first read does not start a background refresh; a rotation already started always
+//     completes and persists (D7);
 //  8. finalize: re-read and discard a reading whose authority moved.
 func (s *Service) CollectCodexAccountUsage(ctx context.Context, userID, accountID uuid.UUID) (CodexUsageReading, error) {
 	q, ok := s.codexUsageQueries()
@@ -211,7 +215,7 @@ func (s *Service) CollectCodexAccountUsage(ctx context.Context, userID, accountI
 		return CodexUsageReading{}, codexUsageFail(CodexUsageFailTransient)
 	}
 
-	// (2) Prove a linked alias for THIS account.
+	// (2) Prove an enabled linked alias for THIS account.
 	if f := s.codexRequireLinkedAlias(ctx, q, userID, accountID); f != nil {
 		return CodexUsageReading{}, f
 	}
@@ -314,6 +318,14 @@ func (s *Service) handleCodexUsageUnauthorized(ctx context.Context, q codexUsage
 	if f := codexRotatableState(fresh); f != nil {
 		return codexauth.UsageReading{}, store.CodexProviderAccount{}, f
 	}
+	// A rotation is a background refresh: re-prove the account is still live right before
+	// starting it (PRD #1732 D6), so a disable of its last enabled alias during the first read
+	// spends no refresh token. This narrows the window rather than closing it: a disable that
+	// lands after this check meets a rotation that has started, which D7 requires to complete
+	// and persist; its reading is then discarded by the writer's enablement fence.
+	if f := s.codexRequireLinkedAlias(ctx, q, principal.userID, principal.accountID); f != nil {
+		return codexauth.UsageReading{}, store.CodexProviderAccount{}, f
+	}
 
 	operationBudget := codexRefreshOperationBudget(ctx)
 	if operationBudget <= codexRefreshCommitReserve {
@@ -367,8 +379,8 @@ func (s *Service) handleCodexUsageUnauthorized(ctx context.Context, q codexUsage
 }
 
 // finalizeCodexUsage re-reads the account after the provider call and refuses a stale reading
-// (step 8): a moved generation/credential_revision, a vanished last linked alias, or a locked
-// vault all discard the reading so the poller keeps the prior good one.
+// (step 8): a moved generation/credential_revision, a vanished (or disabled) last linked alias,
+// or a locked vault all discard the reading so the poller keeps the prior good one.
 func (s *Service) finalizeCodexUsage(ctx context.Context, q codexUsageStore, captured store.CodexProviderAccount) *CodexUsageFailure {
 	fresh, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: captured.UserID, ID: captured.ID})
 	if err != nil {
@@ -389,10 +401,11 @@ func (s *Service) finalizeCodexUsage(ctx context.Context, q codexUsageStore, cap
 	return nil
 }
 
-// codexRequireLinkedAlias returns not_linked unless the account has at least one linked
-// codex_auth alias owned by the user.
+// codexRequireLinkedAlias returns not_linked unless the account has at least one ENABLED
+// linked codex_auth alias owned by the user (PRD #1732 D6): an account whose aliases are all
+// disabled is not a background poll or refresh target.
 func (s *Service) codexRequireLinkedAlias(ctx context.Context, q codexUsageStore, userID, accountID uuid.UUID) *CodexUsageFailure {
-	n, err := q.CountLinkedAliasesForCodexAccount(ctx, store.CountLinkedAliasesForCodexAccountParams{
+	n, err := q.CountEnabledLinkedAliasesForCodexAccount(ctx, store.CountEnabledLinkedAliasesForCodexAccountParams{
 		UserID:            userID,
 		ProviderAccountID: pgconv.UUID(accountID),
 	})

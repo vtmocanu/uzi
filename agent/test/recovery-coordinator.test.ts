@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { Readable } from "node:stream";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache, type RecoveryBundleResult } from "../src/git.js";
 import { RUN_KINDS, type RunKind } from "../src/protocol.js";
 import {
@@ -484,7 +484,7 @@ describe("RecoveryCoordinator — byte-identical restart re-upload with NO forge
     // The worker bare's own `origin` is the forge (as the runner clone's would resolve to).
     rawGit(worker, ["remote", "add", "origin", forge]);
 
-    const realGit = new GitCache(path.join(gitBase, "data"), nullLogger());
+    const realGit = new GitCache(path.join(gitBase, "data"), nullLogger(), undefined, testGitCacheOptions());
 
     // FIRST capture attempt: real producer builds+journals a REAL bundle, then the upload
     // fails, leaving a journaled bundle on disk (source retained).
@@ -615,6 +615,81 @@ describe("RecoveryCoordinator — exact generation identity end to end (PRD #134
       fs.existsSync(nBundle),
       "gen 10's bundle SURVIVES — releasing a sibling generation never wipes the run dir",
     );
+  });
+
+  it("forgetGeneration removes ONLY that generation's files; the run dir goes only once EMPTY (issue #1751 N5)", async () => {
+    const coord = makeCoordinator();
+    const runId = "run-forget";
+    await coord.pin({ runId, sourceSha: H, kind: "issue", branch: "b", generation: 1 });
+    await coord.pin({ runId, sourceSha: H_PRIME, kind: "issue", branch: "b", generation: 2 });
+    const dir = path.join(root, runId);
+    // A file the journal does not (yet) list, e.g. the live successor's bundle written ahead of its record.
+    const foreign = path.join(dir, "cap-live-successor.bundle");
+    fs.writeFileSync(foreign, "bytes");
+    await coord.forgetGeneration(runId, 1);
+    assert.deepEqual((await coord.inspect(runId)).map((r) => r.generation), [2], "gen 2's record survives");
+    assert.ok(fs.existsSync(foreign), "a file of another generation is never deleted");
+    await coord.forgetGeneration(runId, 2);
+    assert.ok(fs.existsSync(foreign), "a non-empty run dir is never removed recursively");
+    fs.rmSync(foreign);
+    await coord.forgetGeneration(runId, 2);
+    assert.equal(fs.existsSync(dir), false, "an empty run dir is removed");
+    await coord.forgetGeneration(runId, 2); // ENOENT: a no-op, never a throw
+  });
+
+  it("a record written into the run dir BETWEEN the listing and the removal survives (issue #1751 N5)", async () => {
+    const coord = makeCoordinator();
+    const runId = "run-forget-race";
+    await coord.pin({ runId, sourceSha: H, kind: "issue", branch: "b", generation: 1 });
+    // The live successor writes its own record right after forgetGeneration listed the dir.
+    const late = new RecoveryCoordinator({
+      client: new FakeClient(),
+      git: new FakeGit(),
+      log: nullLogger(),
+      recoveryRoot: root,
+      workerToken: TOKEN,
+      now: () => 1_700_000_000_000,
+    });
+    const internal = coord as unknown as { listRecords: (runId: string) => Promise<unknown[]> };
+    const list = internal.listRecords.bind(coord);
+    internal.listRecords = async (id: string) => {
+      const out = await list(id);
+      await late.pin({ runId, sourceSha: H_PRIME, kind: "issue", branch: "b", generation: 2 });
+      return out;
+    };
+    await coord.forgetGeneration(runId, 1);
+    const left = await late.inspect(runId);
+    assert.deepEqual(left.map((r) => [r.generation, r.sourceSha]), [[2, H_PRIME]], "the concurrent record survives");
+  });
+
+  it("release() of the LAST generation sweeps the run dir recursively: tampered .json, orphan .bundle and .tmp go too (issue #1751 NB2)", async () => {
+    const coord = makeCoordinator();
+    const runId = "run-sweep";
+    await coord.pin({ runId, sourceSha: H, kind: "issue", branch: "b", generation: 7 });
+    const dir = path.join(root, runId);
+    // Leftovers the authenticated journal never lists: a MAC-mismatch record, an orphan bundle,
+    // and an interrupted atomic-write temp file.
+    const tampered = path.join(dir, "cap-tampered.json");
+    fs.writeFileSync(tampered, JSON.stringify({ runId, captureId: "cap-tampered", generation: 3, mac: "00" }));
+    const orphan = path.join(dir, "cap-orphan.bundle");
+    fs.writeFileSync(orphan, "bytes");
+    const tmp = path.join(dir, "cap-x.json.0f1e2d3c.tmp");
+    fs.writeFileSync(tmp, "partial");
+    assert.deepEqual((await coord.inspect(runId)).map((r) => r.generation), [7], "only gen 7 authenticates");
+    await coord.release(runId, 7);
+    assert.equal(fs.existsSync(dir), false, "the completed-run release removes the whole run dir");
+  });
+
+  it("release() of a generation while an authenticated sibling remains keeps unlisted leftovers (no recursive sweep)", async () => {
+    const coord = makeCoordinator();
+    const runId = "run-sweep-sibling";
+    await coord.pin({ runId, sourceSha: H, kind: "issue", branch: "b", generation: 1 });
+    await coord.pin({ runId, sourceSha: H_PRIME, kind: "issue", branch: "b", generation: 2 });
+    const orphan = path.join(root, runId, "cap-orphan.bundle");
+    fs.writeFileSync(orphan, "bytes");
+    await coord.release(runId, 2);
+    assert.deepEqual((await coord.inspect(runId)).map((r) => r.generation), [1]);
+    assert.ok(fs.existsSync(orphan), "the run dir is not swept while a sibling generation remains");
   });
 
   it("a server-RETAINED release keeps the local journal (the source stays protected)", async () => {

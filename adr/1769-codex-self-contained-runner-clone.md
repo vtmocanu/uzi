@@ -88,6 +88,50 @@ the same typed origin). The diff is preserved when the failing state still
 scans clean for secrets, and withheld otherwise, matching how every other
 `finalize_base_align_conflict` path already behaves.
 
+### Reconciliation with #1804
+
+This branch merged origin/main at `e078ba7916c809ebac7618f157ff5a9906eec04b`,
+which brought #1804's `exitGatedStream` into `agent/src/git.ts`. Both changes
+wrapped `spawnGit`'s stdout in a `PassThrough` for overlapping reasons, so
+the branch's `callerOwnedStdout` was deleted and both `spawnGit` paths (the
+supervised `boundary.spawn` and the plain `spawn`) now return
+`exitGatedStream`'s stream. That one mechanism serves the checkpoint pack
+upload and the finalize import alike: it pipes the child's stdout into the
+returned stream at once (Node's child_process `flushStdio` resumes an unread
+stdout when the child exits, so a reader that starts later would see only
+EOF), ends it only after a clean exit, destroys it with git's stderr on a
+nonzero exit, a spawn error or a rejected completion, and tears the producer
+down when a consumer abandons it (outside a boundary it also kills a
+still-live child).
+
+Two parts of the branch's design stay. `spawnGit` still returns an `exited`
+promise that never rejects: inside a boundary it settles only after the
+supervisor root has reaped, and outside one on `close` (or -1 on a spawn
+error). And `ensureRunnerCloneObjects` still waits for the pipe, the
+producer's `exited` and the consumer's `exited` before it returns, and still
+tears the peer down when one side fails. Stream completion is not evidence
+that a process, or its supervisor root, is gone, and the finalize boundary
+must not close with a root of the import still live.
+
+Tests that pin it on both paths are in `agent/test/git-import.test.ts`:
+a late reader receives every pack byte (a producer that exits before the
+consumer starts, and a multi-MiB pack whose consumer starts only once the
+producer blocked), a late reader still sees a nonzero exit, and the
+stalled-peer teardown cases. Main's
+`agent/test/git-spawn-stream-failure.test.ts` pins the checkpoint upload's
+side of the same contract, unchanged. Mutations run against the merged tree:
+piping lazily turns the late-reader byte cases red on both paths; ending
+the stream cleanly on a failed exit turns the late-reader failure cases red
+on both paths, along with main's stream-failure tests; removing
+`ensureRunnerCloneObjects`' teardown turns the "consumer cannot start" cases
+red on both paths, plus the stalled-before-first-write and SIGKILL cases.
+The "consumer exits at once" cases go red only when `exitGatedStream`'s
+abandon teardown is removed as well, because a broken pipe also reaches the
+producer through that teardown. The boundary case where a producer fails
+fast and the consumer is stalled on stdin stays green under both, because
+`pipeline` destroying the consumer's stdin does the same thing the abort
+does inside a boundary.
+
 ## Rejected alternative: grant the bare read access instead of dissociating
 
 Adding a read-only Landlock rule for the bare's objects directory, so the
@@ -265,7 +309,8 @@ below.
   shell commands, which those logs do not echo; 64 PASS, 0 FAIL each): reverting all of
   `1c3be1a3`'s `agent/src/git.ts` change (tip validation before the probe,
   side attribution, teardown), removing the peer teardown alone, and
-  reverting `callerOwnedStdout`. In these three real cases git ends on
+  reverting `callerOwnedStdout` (since replaced by `exitGatedStream`, see
+  "Reconciliation with #1804" above). In these three real cases git ends on
   EOF/EPIPE by itself and the drained-stdout race did not reproduce; those
   contracts are pinned by stalled-process and deterministic red/green tests
   in `agent/test/git-import.test.ts`.

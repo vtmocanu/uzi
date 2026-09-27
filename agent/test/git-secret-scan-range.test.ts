@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache } from "../src/git.js";
 
 // issue #1398 — the finalize secret scan must floor on the REAL push delta, not the
@@ -95,7 +95,7 @@ function seedBaseFR(): { shaBase: string; shaF: string; shaR: string } {
 describe("resolvePublicationFloor (issue #1398)", () => {
   it("resumed clean delta: floors on the fresh remote tip R, not the default branch", async () => {
     const { shaBase, shaF, shaR } = seedBaseFR();
-    const gc = new GitCache(fx.dataDir, nullLogger());
+    const gc = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
     const bare = await gc.ensureClone(fx.originPath); // mirror ORIGIN_MIRROR = R
 
     // Plant the tracking ref C (a clean child of R). origin's BRANCH stays at R.
@@ -122,7 +122,7 @@ describe("resolvePublicationFloor (issue #1398)", () => {
 
   it("fresh scratch-ref against an advanced remote: returns R2, leaves origin mirror pinned at R, cleans the scratch ref", async () => {
     const { shaF, shaR } = seedBaseFR();
-    const gc = new GitCache(fx.dataDir, nullLogger());
+    const gc = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
     const bare = await gc.ensureClone(fx.originPath); // mirror ORIGIN_MIRROR = R
 
     // Advance the REAL origin branch to a descendant R2.
@@ -158,7 +158,7 @@ describe("resolvePublicationFloor (issue #1398)", () => {
 
   it("new-secret delta placement: the new commit C is inside floor..track", async () => {
     const { shaR } = seedBaseFR();
-    const gc = new GitCache(fx.dataDir, nullLogger());
+    const gc = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
     const bare = await gc.ensureClone(fx.originPath);
 
     git(fx.originPath, "checkout", "-b", "src-place", shaR);
@@ -180,7 +180,7 @@ describe("resolvePublicationFloor (issue #1398)", () => {
     const shaC = commitFile(fx.originPath, "c.txt", "third commit\n", "C");
     git(fx.originPath, "checkout", "main");
 
-    const gc = new GitCache(fx.dataDir, nullLogger());
+    const gc = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
     const bare = await gc.ensureClone(fx.originPath);
     fetchIntoRef(bare, "src-first", TRACK);
 
@@ -201,7 +201,7 @@ describe("resolvePublicationFloor (issue #1398)", () => {
 
   it("diverged: fresh remote tip is not an ancestor of track -> null (fail open), scratch removed", async () => {
     const { shaR } = seedBaseFR();
-    const gc = new GitCache(fx.dataDir, nullLogger());
+    const gc = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
     const bare = await gc.ensureClone(fx.originPath); // mirror = R
 
     // Tracking ref C: a child of R.
@@ -220,7 +220,7 @@ describe("resolvePublicationFloor (issue #1398)", () => {
 
   it("unreadable: the fresh fetch fails -> null", async () => {
     const { shaR } = seedBaseFR();
-    const gc = new GitCache(fx.dataDir, nullLogger());
+    const gc = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
     const bare = await gc.ensureClone(fx.originPath); // mirror = R
 
     git(fx.originPath, "checkout", "-b", "src-unread", shaR);

@@ -7,7 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache, RunnerCloneImportError, type BoundaryProcessSpawner, type RunnerClone } from "../src/git.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "../src/harness.js";
 
@@ -33,7 +33,7 @@ let git: GitCache;
 
 beforeEach(() => {
   fx = makeFixture({ "conflict.txt": "base\n" });
-  git = new GitCache(fx.dataDir, nullLogger());
+  git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
 });
 
 afterEach(() => fx.cleanup());
@@ -560,12 +560,13 @@ describe("GitCache.ensureRunnerCloneObjects (issue #1769 m2)", () => {
   });
 });
 
-// issue #1769 — spawnGit hands back a caller-owned PassThrough piped from the child's stdout
-// (callerOwnedStdout), on BOTH spawn paths: the boundary branch (a supervised handle) and the
-// plain `spawn` branch. These cases pin its contract: bytes are never lost to a late consumer,
-// backpressure holds with no reader, errors cross in both directions, and the import settles
-// with every child gone. Each case runs on both paths.
-describe("GitCache spawnGit caller-owned stdout (issue #1769)", () => {
+// issue #1769 (reconciled with #1804) — spawnGit hands back exitGatedStream's PassThrough, piped
+// from the child's stdout at once and ended only on a clean exit, on BOTH spawn paths: the
+// boundary branch (a supervised handle) and the plain `spawn` branch. These cases pin its
+// contract for the finalize import: bytes are never lost to a late consumer, a failure still
+// reaches a late reader, backpressure holds with no reader, errors cross in both directions, and
+// the import settles with every child gone. Each case runs on both paths.
+describe("GitCache spawnGit exit-gated stdout, finalize import (issue #1769)", () => {
   const BIG_MIB = 8;
   const PACK_ARGS = ["pack-objects", "--revs", "--stdout", "-q"];
   const faults: string[] = [];

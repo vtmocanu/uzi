@@ -67,7 +67,10 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 203 as of this commit. PRD #1650 M2 retired the notifications inbox read path (GET
+// 204 as of this commit. Issue #1751 M2 added POST
+// /api/worker/runs/{id}/recovery-holds/{holdID}/settle-live — the live twin of /settle below,
+// mounted on the same proposalLimiter.PerWorkerMiddleware (noLimiter to this per-USER probe).
+// It was 203 until then. PRD #1650 M2 retired the notifications inbox read path (GET
 // /api/notifications/, GET /api/notifications/unread_count and POST
 // /api/notifications/{id}/read were removed, all three noLimiter; the removal is pinned by
 // TestNotificationsInboxRoutesAreGone). Issue #1660 added GET /api/worker/runs/{id}/follow-ups,
@@ -388,6 +391,7 @@ var wantRouteMounts = []routeMount{
 	// store read, RequireUser, no limiter, like /me/rate-limits beside it.
 	{"GET", "/api/me/codex-rate-limits", noLimiter},
 	{"GET", "/api/me/secrets/", noLimiter},
+	{"GET", "/api/me/secrets/{kind}/{id}/dependents", noLimiter},
 	{"GET", "/api/me/settings/", noLimiter},
 	{"GET", "/api/me/slack/", noLimiter},
 	// PRD #1349 M5: the owner-wide custody hold list + aggregate. Owner-scoped RequireUser read,
@@ -462,6 +466,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/ws", noLimiter},
 	{"PATCH", "/api/admin/users/{id}", noLimiter},
 	{"PATCH", "/api/me/secrets/anthropic_token/{id}", noLimiter},
+	{"PATCH", "/api/me/secrets/{kind}/{id}/enabled", noLimiter},
 	// PRD #1147 M1 codex credential patches (rename / set-default / replace): owner-scoped
 	// DB writes, no forge call, no spendable mint → noLimiter, like the anthropic PATCH above.
 	{"PATCH", "/api/me/secrets/codex_auth/{id}", noLimiter},
@@ -559,6 +564,11 @@ var wantRouteMounts = []routeMount{
 	// spend — so neither carries a per-user limiter.
 	{"POST", "/api/findings/dismiss", noLimiter},
 	{"DELETE", "/api/findings/{id}/dismiss", noLimiter},
+	// Issue #1723: human Mark done (single, bulk) and undo of either verdict are LOCAL writes
+	// too — no forge call, no spend — so none carries a per-user limiter.
+	{"POST", "/api/findings/{id}/done", noLimiter},
+	{"POST", "/api/findings/done", noLimiter},
+	{"DELETE", "/api/findings/{id}/disposition", noLimiter},
 	{"POST", "/api/controller/status", noLimiter},
 	// Controller cordon control-write (PRD #422 M4): a fleet-scoped controller-only
 	// route behind RequireController, not a per-user credential, so no per-user
@@ -710,8 +720,11 @@ var wantRouteMounts = []routeMount{
 	// per-USER probe reads as noLimiter, like /findings and /proposals.
 	// TestRecoverySettleIsRateLimitedLiveDB proves the mount through the real WorkerRoutes.
 	{"POST", "/api/worker/runs/{id}/recovery-holds/{holdID}/settle", noLimiter},
+	// Issue #1751 M2: the live predecessor-hold settle, mounted exactly like /settle above.
+	{"POST", "/api/worker/runs/{id}/recovery-holds/{holdID}/settle-live", noLimiter},
 	{"POST", "/api/worker/runs/{id}/inputs/ack", noLimiter},
 	{"POST", "/api/worker/runs/{id}/inputs/applied", noLimiter},
+	{"POST", "/api/worker/runs/{id}/inputs/discarded", noLimiter},
 	{"POST", "/api/worker/runs/{id}/memory", noLimiter},
 	{"POST", "/api/worker/runs/{id}/messages", noLimiter},
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},

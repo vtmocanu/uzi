@@ -1,9 +1,13 @@
 # ADR-738: Hosted-worker upgrade classification trusts the controller's `settled` signal over the baked worker version
 
-**Status**: Accepted (issue #738; classifier rule + tests + docs merged)
+**Status**: Superseded (issue #1415): R7.5 removed after [ADR-1720](1720-agent-runtime-base.md) / #1729 retired agent-image re-tagging
 **Date**: 2026-08-28
 **Deciders**: Vlad Mocanu + agent team (issue #738 / PRD #738 Decision Log)
 **PRD**: [prds/done/738-worker-upgrade-settled-classify.md](../prds/done/738-worker-upgrade-settled-classify.md) — the PRD carries the full Decision Log, milestone tests, and the offline validation split; this ADR carries the durable design shape and its rationale.
+
+## Superseded
+
+Issue #1415 deleted R7.5. Once ADR-1720 stopped `publish-agent` from re-tagging a previous release's digest, every agent image reports exactly its own tag, so the only remaining effect of the softener was a false `up_to_date`: a cordoned, draining hosted worker still on its previous release's pod, with a fresh `settled` signal and `RolledTag` set to the new target, was reported as "running the target image". The classifier now lets the version compare decide (R3 still covers the brief post-roll re-registration window). The accepted consequence is that a fleet deliberately pinned to a pre-#1729 re-tagged tag reads `outdated`. The text below is kept as the historical record.
 
 ## Decision (summary)
 

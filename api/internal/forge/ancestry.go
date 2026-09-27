@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -81,4 +82,61 @@ func readBounded(r io.Reader, limit int64) ([]byte, error) {
 		return nil, errAncestryOversize
 	}
 	return b, nil
+}
+
+// maxRefHeadLen bounds a full ref name RefHead will send to a forge (issue #1751 M2): the
+// "refs/" prefix plus migration 00251's 255-byte release_branch ceiling.
+const maxRefHeadLen = len("refs/") + 255
+
+// validateFullRef is RefHead's pre-request gate (issue #1751 M2): ref must be a FULL ref name
+// ("refs/" followed by at least one more component) that satisfies git-check-ref-format's
+// rules, so no caller-supplied string can steer the request anywhere but one exact ref. It
+// refuses an over-long ref, "..", "//", "@{", a component starting with ".", a trailing "/",
+// "." or ".lock", and any control character, DEL, space or one of ~ ^ : ? * [ \ .
+func validateFullRef(driver, ref string) error {
+	bad := func() error {
+		return fmt.Errorf("%s: ref head: %q is not a well-formed full ref name", driver, truncateForError(ref))
+	}
+	rest, ok := strings.CutPrefix(ref, "refs/")
+	if !ok || rest == "" || len(ref) > maxRefHeadLen {
+		return bad()
+	}
+	if strings.Contains(ref, "..") || strings.Contains(ref, "//") || strings.Contains(ref, "@{") || strings.Contains(ref, "/.") {
+		return bad()
+	}
+	if strings.HasSuffix(ref, "/") || strings.HasSuffix(ref, ".") || strings.HasSuffix(ref, ".lock") {
+		return bad()
+	}
+	for i := 0; i < len(ref); i++ {
+		c := ref[i]
+		if c < 0x20 || c == 0x7f || strings.IndexByte(" ~^:?*[\\", c) >= 0 {
+			return bad()
+		}
+	}
+	return nil
+}
+
+// refObjectBody is the ONLY part of a GitHub / Forgejo git reference object RefHead reads:
+// the full `ref` name (to refuse an answer naming another ref) and object.type/object.sha.
+type refObjectBody struct {
+	Ref    *string `json:"ref"`
+	Object *struct {
+		Type *string `json:"type"`
+		SHA  *string `json:"sha"`
+	} `json:"object"`
+}
+
+// commitSHAOf returns the commit id a decoded reference object carries for exactly ref, or an
+// error when it names another ref, points at a non-commit object, or carries no 40-hex id.
+func (b refObjectBody) commitSHAOf(driver, ref string) (string, error) {
+	if b.Ref == nil || *b.Ref != ref {
+		return "", fmt.Errorf("%s: ref head: response does not name the requested ref", driver)
+	}
+	if b.Object == nil || b.Object.Type == nil || *b.Object.Type != "commit" {
+		return "", fmt.Errorf("%s: ref head: requested ref does not point at a commit object", driver)
+	}
+	if b.Object.SHA == nil || !isCommitSHA(*b.Object.SHA) {
+		return "", fmt.Errorf("%s: ref head: response carries no 40-hex commit sha", driver)
+	}
+	return *b.Object.SHA, nil
 }

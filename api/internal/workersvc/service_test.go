@@ -184,6 +184,13 @@ type fakeStore struct {
 	// SQLSTATE errors to drive finishRunClaim's bounded 55P03 retry.
 	claimFinishLockErrs []error
 	claimFinishBegins   int
+	// PRD #1732 D14: claimSecretDisabled is what the finisher's enablement re-check reads for
+	// the resolved credential; claimSecretLockErrs is consumed one per re-check (55P03
+	// staging); claimCredParked records the COMMITTED credential_disabled park.
+	claimSecretDisabled bool
+	claimSecretLockErrs []error
+	claimSecretChecks   int
+	claimCredParked     *store.ParkCredentialDisabledRunParams
 	// hasActiveRunForIssue is what the CreateRun dedup pre-check returns (PRD #754 M4);
 	// hasActiveRunForIssueErr forces its error path.
 	hasActiveRunForIssue    bool
@@ -260,7 +267,9 @@ type fakeStore struct {
 	setFollowupRows int64
 	setCompleted    *store.SetRunCompletedParams
 	setFailed       *store.SetRunFailedParams
-	reconciledMR    *store.ReconcileRunMRParams
+	// Issue #1604: the plan_rejected failed arm's settle-and-fail query.
+	setFailedPlanRejected *store.SetRunFailedPlanRejectedParams
+	reconciledMR          *store.ReconcileRunMRParams
 	// PRD #1226 M2: completion-attempt + permit-issue capture for the fake-store denial/grant
 	// unit tests (the transactional completion path is covered by the LiveDB tests instead).
 	recordedAttempts   []store.RecordCompletionAttemptParams
@@ -285,6 +294,7 @@ type fakeStore struct {
 	registerParams     *store.RegisterWorkerParams
 	registerResult     store.Worker
 	heartbeat          store.Worker
+	heartbeatArg       *store.HeartbeatWorkerParams
 	callOrder          []string
 
 	// Sweep.
@@ -552,7 +562,7 @@ type fakeStore struct {
 
 	// PRD #1296 M4 (D3/D4) custody. openCustodyHolds is the count both the DeleteWorker
 	// guard (CountOpenCustodyHoldsForWorker) and the queued-reason rung
-	// (CountUnresolvedCustodyHoldsForOwner) read; default 0 → no custody, so pre-#1296
+	// (GetCustodyAdmissionForRun open_holds) read; default 0 → no custody, so pre-#1296
 	// tests are unaffected. countCustodyWorkerParams captures the last DeleteWorker guard
 	// call so a test can prove it was owner-scoped. releasableHolds seeds the reconciler
 	// candidate list; releaseCustodyRows is what the release queries report.
@@ -755,6 +765,9 @@ func (f *fakeStore) ClaimChatRun(_ context.Context, arg store.ClaimChatRunParams
 	f.callOrder = append(f.callOrder, "claim_chat")
 	return f.chatClaimRun, f.chatClaimErr
 }
+func (f *fakeStore) ParkCredentialDisabledChatRun(context.Context, store.ParkCredentialDisabledChatRunParams) (int64, error) {
+	return 1, nil
+}
 func (f *fakeStore) GetChatRunClaimContext(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.resumeSession, nil
 }
@@ -925,6 +938,17 @@ func (f *fakeStore) GetUserSecretMetaByIDOfKind(_ context.Context, arg store.Get
 		label = "token-" + arg.ID.String()[:8]
 	}
 	return store.GetUserSecretMetaByIDOfKindRow{ID: arg.ID, Label: label, Kind: arg.Kind}, nil
+}
+
+// LockSecretForPromotion mirrors the owner-scoped share-locked enablement read (PRD #1732)
+// over the same byIDSecrets fixtures: a missing or foreign id is pgx.ErrNoRows, and a staged
+// token reads enabled (the fake stages no disabled state; the live-DB tests own that).
+func (f *fakeStore) LockSecretForPromotion(_ context.Context, arg store.LockSecretForPromotionParams) (bool, error) {
+	row, ok := f.byIDSecrets[arg.ID]
+	if !ok || (row.UserID != uuid.Nil && row.UserID != arg.UserID) {
+		return false, pgx.ErrNoRows
+	}
+	return true, nil
 }
 
 // RecordRunCredentialEpoch records the per-claim attribution-journal write (PRD #1247
@@ -1136,6 +1160,10 @@ func (f *fakeStore) SetRunFailed(_ context.Context, arg store.SetRunFailedParams
 	f.setFailed = &arg
 	return 1, nil
 }
+func (f *fakeStore) SetRunFailedPlanRejected(_ context.Context, arg store.SetRunFailedPlanRejectedParams) (int64, error) {
+	f.setFailedPlanRejected = &arg
+	return 1, nil
+}
 func (f *fakeStore) ReconcileRunMR(_ context.Context, arg store.ReconcileRunMRParams) (int64, error) {
 	f.reconciledMR = &arg
 	return f.reconcileMRRows, nil
@@ -1251,7 +1279,8 @@ func (f *fakeStore) RegisterWorker(_ context.Context, arg store.RegisterWorkerPa
 	f.callOrder = append(f.callOrder, "register")
 	return store.RegisterWorkerRow(f.registerResult), nil
 }
-func (f *fakeStore) HeartbeatWorker(context.Context, store.HeartbeatWorkerParams) (store.Worker, error) {
+func (f *fakeStore) HeartbeatWorker(_ context.Context, arg store.HeartbeatWorkerParams) (store.Worker, error) {
+	f.heartbeatArg = &arg
 	return f.heartbeat, nil
 }
 func (f *fakeStore) MarkStaleWorkersOffline(_ context.Context, cutoff pgtype.Timestamptz) (int64, error) {
@@ -1572,6 +1601,9 @@ func (f *fakeStore) CreateManualMRReworkRunAndAdvance(_ context.Context, arg sto
 func (f *fakeStore) UserHasAnthropicToken(context.Context, uuid.UUID) (bool, error) {
 	return f.hasAnthropicToken, f.hasAnthropicTokenErr
 }
+func (f *fakeStore) UserHasEnabledAnthropicToken(context.Context, uuid.UUID) (bool, error) {
+	return f.hasAnthropicToken, f.hasAnthropicTokenErr
+}
 func (f *fakeStore) CreatePromptRun(_ context.Context, arg store.CreatePromptRunParams) (store.Run, error) {
 	f.promptRunParams = &arg
 	return f.promptRunResult, f.promptRunErr
@@ -1646,8 +1678,8 @@ func (f *fakeStore) CountOpenCustodyHoldsForWorker(_ context.Context, arg store.
 	f.countCustodyWorkerParams = &arg
 	return f.openCustodyHolds, nil
 }
-func (f *fakeStore) CountUnresolvedCustodyHoldsForOwner(_ context.Context, _ uuid.UUID) (int64, error) {
-	return f.openCustodyHolds, nil
+func (f *fakeStore) GetCustodyAdmissionForRun(_ context.Context, _ store.GetCustodyAdmissionForRunParams) (store.GetCustodyAdmissionForRunRow, error) {
+	return store.GetCustodyAdmissionForRunRow{OpenHolds: f.openCustodyHolds}, nil
 }
 func (f *fakeStore) ListReleasableCustodyHolds(_ context.Context) ([]store.ListReleasableCustodyHoldsRow, error) {
 	return f.releasableHolds, nil

@@ -15,19 +15,12 @@ import (
 )
 
 type fakeStore struct {
-	row store.GetUserSecretCiphertextRow
-	err error
-
 	// byID is the row GetUserSecretCiphertextByID returns, and byIDArg records what
 	// it was asked for — the owner scoping is a property of the query, so the test
 	// asserts on the arguments rather than re-implementing the predicate.
 	byID    store.GetUserSecretCiphertextByIDRow
 	byIDErr error
 	byIDArg store.GetUserSecretCiphertextByIDParams
-}
-
-func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error) {
-	return f.row, f.err
 }
 
 func (f *fakeStore) GetUserSecretCiphertextByID(_ context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error) {
@@ -37,39 +30,6 @@ func (f *fakeStore) GetUserSecretCiphertextByID(_ context.Context, arg store.Get
 
 // key is a valid 32-byte AES key for a real master box (nil-vault path).
 var key = []byte("0123456789abcdef0123456789abcdef")
-
-func TestOpenNoSecret(t *testing.T) {
-	box, err := secretbox.New(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = Open(context.Background(), &fakeStore{err: pgx.ErrNoRows}, nil, box, uuid.New(), "anthropic_token")
-	if !errors.Is(err, ErrNoSecret) {
-		t.Fatalf("want ErrNoSecret, got %v", err)
-	}
-}
-
-func TestOpenLookupError(t *testing.T) {
-	box, _ := secretbox.New(key)
-	sentinel := errors.New("db down")
-	_, err := Open(context.Background(), &fakeStore{err: sentinel}, nil, box, uuid.New(), "anthropic_token")
-	if errors.Is(err, ErrNoSecret) || errors.Is(err, ErrUndecryptable) {
-		t.Fatalf("a non-ErrNoRows lookup error must not collapse to a credential sentinel: %v", err)
-	}
-	if !errors.Is(err, sentinel) {
-		t.Fatalf("lookup error should wrap the underlying error, got %v", err)
-	}
-}
-
-func TestOpenUndecryptable(t *testing.T) {
-	box, _ := secretbox.New(key)
-	// Ciphertext that the master box cannot open.
-	row := store.GetUserSecretCiphertextRow{Ciphertext: []byte("not a valid sealed blob"), SealedWith: store.SealedWithMaster}
-	_, err := Open(context.Background(), &fakeStore{row: row}, nil, box, uuid.New(), "anthropic_token")
-	if !errors.Is(err, ErrUndecryptable) {
-		t.Fatalf("want ErrUndecryptable, got %v", err)
-	}
-}
 
 func TestOpenSealed(t *testing.T) {
 	box, _ := secretbox.New(key)
@@ -181,7 +141,7 @@ func TestOpenByIDForeignRowIsNoSecret(t *testing.T) {
 }
 
 // TestOpenByIDSentinels: an unknown id and a lookup fault map to the same sentinels
-// as the by-kind Open, so callers need one error-handling shape for both.
+// as OpenSealed and OpenByIDOfKind, so callers need one error-handling shape for all.
 func TestOpenByIDSentinels(t *testing.T) {
 	box, _ := secretbox.New(key)
 	uid := uuid.New()
@@ -208,7 +168,7 @@ func TestOpenByIDSentinels(t *testing.T) {
 	}
 }
 
-// TestOpenByIDVaultLocked: the by-id path shares Open's vault dispatch, so a
+// TestOpenByIDVaultLocked: the by-id path shares OpenSealed's vault dispatch, so a
 // dek-sealed row belonging to a locked user is transient (ErrVaultLocked), not a
 // terminal credential failure.
 func TestOpenByIDVaultLocked(t *testing.T) {
@@ -308,21 +268,5 @@ func TestOpenByIDOfKindForeignRowIsNotFound(t *testing.T) {
 	}
 	if plain != nil {
 		t.Fatalf("a foreign row must yield no plaintext, got %q", plain)
-	}
-}
-
-func TestOpenRoundTripNilVault(t *testing.T) {
-	box, _ := secretbox.New(key)
-	sealed, err := box.Seal([]byte("s3cr3t-token"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	row := store.GetUserSecretCiphertextRow{Ciphertext: sealed, SealedWith: store.SealedWithMaster}
-	plain, err := Open(context.Background(), &fakeStore{row: row}, nil, box, uuid.New(), "anthropic_token")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(plain) != "s3cr3t-token" {
-		t.Fatalf("plaintext = %q, want s3cr3t-token", plain)
 	}
 }

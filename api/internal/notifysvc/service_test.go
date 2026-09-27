@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -26,6 +27,25 @@ type fakeStore struct {
 	returnedID   uuid.UUID
 	insertCalled bool
 	pruneCalled  bool
+
+	// The credential re-check (PRD #1732 D13). secret overrides the row the lookup
+	// returns (nil: the asked-for id, an enabled anthropic_token at revision 0);
+	// secretErr fails the lookup. secretAsked records the scoped lookup.
+	secret      *store.GetSecretEnablementRow
+	secretErr   error
+	secretAsked store.GetSecretEnablementParams
+}
+
+func (f *fakeStore) GetSecretEnablement(_ context.Context, arg store.GetSecretEnablementParams) (store.GetSecretEnablementRow, error) {
+	f.order = append(f.order, "recheck")
+	f.secretAsked = arg
+	if f.secretErr != nil {
+		return store.GetSecretEnablementRow{}, f.secretErr
+	}
+	if f.secret != nil {
+		return *f.secret, nil
+	}
+	return store.GetSecretEnablementRow{ID: arg.ID, Kind: store.KindAnthropicToken}, nil
 }
 
 func (f *fakeStore) InsertNotification(_ context.Context, arg store.InsertNotificationParams) (store.Notification, error) {
@@ -228,10 +248,15 @@ func TestNotifyEarlyResetBuildsLoudSlackDM(t *testing.T) {
 	observed := time.Date(2026, 9, 2, 8, 0, 0, 0, time.UTC)
 	expected := observed.Add(5 * time.Hour)
 
-	if _, err := svc.NotifyEarlyReset(context.Background(), user, expected, observed); err != nil {
+	secret := uuid.New()
+	if _, err := svc.NotifyEarlyReset(context.Background(), user, secret, 0, expected, observed); err != nil {
 		t.Fatalf("NotifyEarlyReset: %v", err)
 	}
 
+	// The credential is re-checked first, scoped to the owner (PRD #1732 D13).
+	if fs.secretAsked != (store.GetSecretEnablementParams{ID: secret, UserID: user}) || fs.order[0] != "recheck" {
+		t.Fatalf("re-check = %+v order=%v, want (secret %s, user %s) before the insert", fs.secretAsked, fs.order, secret, user)
+	}
 	// The row is written (persist-first) with the new kind.
 	if !fs.insertCalled {
 		t.Fatalf("early-reset notification must persist its row")
@@ -281,6 +306,11 @@ func TestNotifyEarlyResetBuildsLoudSlackDM(t *testing.T) {
 		t.Fatalf("facts[2] = %q, want expected date markup %q", r.Facts[2], wantExpected)
 	}
 
+	// The D13 fence rides the queued DM so the notifier can re-check it at dispatch.
+	if r.Credential == nil || *r.Credential != (CredentialFence{SecretID: secret, Kind: store.KindAnthropicToken, EnablementRev: 0}) {
+		t.Fatalf("slack render credential fence = %+v, want secret %s anthropic_token rev 0", r.Credential, secret)
+	}
+
 	// Defensive mention-inertness: no field of the built render carries a raw <@ mention
 	// sequence. The safety is not runtime escaping (notificationBlocks does NOT escape
 	// Facts) — it is that every fact is built from trusted numeric time.Time unix stamps
@@ -301,7 +331,7 @@ func TestNotifyEarlyResetRoundsHoursEarly(t *testing.T) {
 	observed := time.Date(2026, 9, 2, 8, 0, 0, 0, time.UTC)
 	expected := observed.Add(2*time.Hour + 50*time.Minute)
 
-	if _, err := svc.NotifyEarlyReset(context.Background(), uuid.New(), expected, observed); err != nil {
+	if _, err := svc.NotifyEarlyReset(context.Background(), uuid.New(), uuid.New(), 0, expected, observed); err != nil {
 		t.Fatalf("NotifyEarlyReset: %v", err)
 	}
 	var payload EarlyResetPayload
@@ -313,5 +343,51 @@ func TestNotifyEarlyResetRoundsHoursEarly(t *testing.T) {
 	}
 	if slk.lastRender.Facts[0] != "reset ~3h early" {
 		t.Fatalf("facts[0] = %q, want the rounded 3h figure", slk.lastRender.Facts[0])
+	}
+}
+
+// TestNotifyEarlyResetRechecksCredential: the alert is delivered only while the
+// credential is still the owner's enabled Anthropic token at the revision the
+// poller's fenced write landed at (PRD #1732 D13). Any other state records no row,
+// sends no DM, and returns ErrCredentialNotCurrent; a lookup failure is an error.
+func TestNotifyEarlyResetRechecksCredential(t *testing.T) {
+	observed := time.Date(2026, 9, 2, 8, 0, 0, 0, time.UTC)
+	expected := observed.Add(10 * time.Hour)
+	disabledAt := pgtype.Timestamptz{Time: observed, Valid: true}
+	boom := errors.New("db down")
+	cases := []struct {
+		name    string
+		row     *store.GetSecretEnablementRow
+		err     error
+		wantErr error
+	}{
+		{name: "gone or another owner's", err: pgx.ErrNoRows, wantErr: ErrCredentialNotCurrent},
+		{name: "disabled", row: &store.GetSecretEnablementRow{Kind: store.KindAnthropicToken, DisabledAt: disabledAt, EnablementRev: 3}, wantErr: ErrCredentialNotCurrent},
+		{name: "re-enabled since the write", row: &store.GetSecretEnablementRow{Kind: store.KindAnthropicToken, EnablementRev: 5}, wantErr: ErrCredentialNotCurrent},
+		{name: "not an anthropic token", row: &store.GetSecretEnablementRow{Kind: "codex_auth", EnablementRev: 3}, wantErr: ErrCredentialNotCurrent},
+		{name: "lookup fails", err: boom, wantErr: boom},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &fakeStore{secret: tc.row, secretErr: tc.err}
+			slk := &fakeSlacker{order: &fs.order}
+			svc := New(fs, slk, 0, nil)
+			_, err := svc.NotifyEarlyReset(context.Background(), uuid.New(), uuid.New(), 3, expected, observed)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tc.wantErr)
+			}
+			if fs.insertCalled || slk.calls != 0 {
+				t.Fatalf("a stale credential delivered: insert=%v slack=%d", fs.insertCalled, slk.calls)
+			}
+		})
+	}
+	// The same revision, still enabled, delivers.
+	fs := &fakeStore{secret: &store.GetSecretEnablementRow{Kind: store.KindAnthropicToken, EnablementRev: 3}}
+	slk := &fakeSlacker{order: &fs.order}
+	if _, err := New(fs, slk, 0, nil).NotifyEarlyReset(context.Background(), uuid.New(), uuid.New(), 3, expected, observed); err != nil {
+		t.Fatalf("current credential: %v", err)
+	}
+	if !fs.insertCalled || slk.calls != 1 {
+		t.Fatalf("current credential not delivered: insert=%v slack=%d", fs.insertCalled, slk.calls)
 	}
 }

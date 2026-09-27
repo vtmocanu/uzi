@@ -25,10 +25,14 @@ PREV=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 greptile() { printf '{"check_runs":[{"id":10,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"%s","conclusion":%s,"output":{"summary":"%s"}}]}\n' "$1" "$2" "$3"; }
 none() { echo '{"check_runs":[{"id":5,"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","output":{"summary":""}}]}'; }
 if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
-  printf '{"number":42,"state":"OPEN","isDraft":false,"headRefOid":"%s","headRefName":"agent/issue-1","baseRefName":"main","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","reviewDecision":"","title":"t"}\n' "$HEAD"
+  printf '{"number":42,"state":"OPEN","isDraft":false,"headRefOid":"%s","headRefName":"agent/issue-1","baseRefName":"main","mergeable":"%s","mergeStateStatus":"%s","reviewDecision":"","title":"t"}\n' "$HEAD" "${MERGEABLE:-MERGEABLE}" "${MERGE_STATE:-CLEAN}"
   exit 0
 fi
-if [ "${1:-}" = pr ] && [ "${2:-}" = checks ]; then echo '[{"bucket":"pass"}]'; exit 0; fi
+if [ "${1:-}" = pr ] && [ "${2:-}" = checks ]; then
+  # A conflicting PR gets no pull_request CI: gh reports no required checks and exits 1.
+  if [ "${CHECKS_NONE:-0}" = 1 ]; then echo "no required checks reported on the 'agent/issue-1' branch" >&2; exit 1; fi
+  echo '[{"bucket":"pass"}]'; exit 0
+fi
 [ "${1:-}" = api ] || { echo "unexpected gh call: $*" >&2; exit 1; }
 # pushrace* modes: the PR #1698 race, shared with the other entrypoints' tests.
 case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; esac
@@ -199,4 +203,18 @@ has pushrace_findings_noreview 'NEXT=unknown'
 snap pushrace_pending_first
 has pushrace_pending_first 'NEXT=review_pending'
 
-echo "PASS takeover: Greptile liveness agrees with watch-pr and pr-findings, including a run on an older commit"
+# ---- a PR that conflicts with its base gets no CI at all ----------------------------------
+# NEXT=conflict, not unknown: the empty checks are explained, and land-prep is the next step.
+export MERGEABLE=CONFLICTING MERGE_STATE=DIRTY CHECKS_NONE=1
+snap head_clean_conflict
+has head_clean_conflict 'CI_CHECKS=none (conflicting PR'
+has head_clean_conflict 'NEXT=conflict'
+hasnt head_clean_conflict 'NEXT=unknown'
+# mergeable=UNKNOWN is GitHub still computing: unknown (re-run), never conflict.
+export MERGEABLE=UNKNOWN MERGE_STATE=UNKNOWN
+snap head_clean_computing
+has head_clean_computing 'NEXT=unknown'
+hasnt head_clean_computing 'NEXT=conflict'
+unset MERGEABLE MERGE_STATE CHECKS_NONE
+
+echo "PASS takeover: Greptile liveness agrees with watch-pr and pr-findings, including a run on an older commit; a conflicting PR is NEXT=conflict"

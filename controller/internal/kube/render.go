@@ -412,6 +412,14 @@ type RenderConfig struct {
 	// touches a plain worker's spec/hash. See dindDataDefaultSize for the 20Gi
 	// admission ceiling and the no-GC residual.
 	DinDDataSize string
+	// DinDPruneEnabled lets a docker worker run its gated, allowlisted DinD prune when
+	// the dind-meter sample shows the dind-data PVC filling (issue #1759). Rendered as
+	// UZI_DIND_PRUNE_ENABLED on docker workers only — "true" iff this is set AND the
+	// worker is not ephemeral (a run-bound worker's volumes die with its run), else
+	// "false". Wired from the disk self-heal toggle (UZI_WORKER_DISK_RECYCLE_ENABLED),
+	// so one knob governs every automatic reclaim. Docker-only, so it never touches a
+	// plain worker's spec/hash.
+	DinDPruneEnabled bool
 	// ServiceAccountName is the workers' own zero-permission SA. It carries the
 	// imagePullSecrets (so the controller need not know about Harbor) and its token is
 	// never automounted.
@@ -809,6 +817,18 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// staged under $TMPDIR still resolves in the daemon. M1 renders the TMPDIR the split
 		// then derives beneath; PRD #1493 M2 owns that entrypoint change.
 		env = append(env, corev1.EnvVar{Name: "TMPDIR", Value: dindWorkdirDir})
+
+		// The DinD prune gate (issue #1759), docker workers ONLY and ALWAYS explicit, so
+		// the agent never has to guess a default: "true" iff the cluster enabled disk
+		// self-heal AND this worker is not ephemeral (a run-bound worker's dind-data dies
+		// with its run, so pruning it is pointless churn — the same exclusion the recycle
+		// arms apply). The agent reports the dind-meter sample on every heartbeat (the
+		// gauge) regardless; only its prune loop is gated on this being "true".
+		prune := "false"
+		if cfg.DinDPruneEnabled && !w.Ephemeral {
+			prune = "true"
+		}
+		env = append(env, corev1.EnvVar{Name: "UZI_DIND_PRUNE_ENABLED", Value: prune})
 	}
 
 	// The Codex command sandbox mode (PRD #1493 M1), worker container only. Normalize an
@@ -970,6 +990,10 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// prepare — the worker reaches the root daemon over pod-loopback TCP, not a
 		// shared volume — so dind-init and the dind-sock socket volume+mounts are dropped
 		// entirely.
+		//
+		// Both postures then append [dind-meter] (issue #1759) AFTER dind: an unprivileged
+		// statfs sampler with no startupProbe, so it counts as started once running and
+		// never holds the worker; placed last so it cannot delay the daemon either.
 		if cfg.DinDNonRootless {
 			initContainers = append(initContainers, dindContainer(cfg))
 		} else {
@@ -978,6 +1002,11 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 			// and NOTHING else transits it (Decision 3).
 			workerMounts = append(workerMounts, corev1.VolumeMount{Name: dindSocketVolume, MountPath: dindSocketDir})
 		}
+		initContainers = append(initContainers, dindMeterContainer(cfg))
+		// The meter's sample dir, READ-ONLY in the worker: it reads the statfs line and
+		// can write nothing back. The worker still mounts NO dind-data (Decision 3); the
+		// meter is the only non-daemon container that sees that claim, read-only.
+		workerMounts = append(workerMounts, corev1.VolumeMount{Name: dindMeterVolume, MountPath: dindMeterDir, ReadOnly: true})
 		// The shared no-secrets run workdir (M-workdir), BOTH postures: mounted into the
 		// worker AND the dind sidecar at the SAME path so a `docker run -v` bind source
 		// under the run's checkout resolves in the daemon. Secrets + the /data cache +
@@ -1000,6 +1029,9 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 			// The shared run workdir (M-workdir). emptyDir, so it is torn down with the pod
 			// and is never a persistence surface; carries the run's checkout, NO secrets.
 			corev1.Volume{Name: dindWorkdirVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+			// The dind-meter sample dir (issue #1759). emptyDir, torn down with the pod;
+			// carries one statfs line, no secrets. Written by dind-meter, read by the worker.
+			corev1.Volume{Name: dindMeterVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 		)
 		if !cfg.DinDNonRootless {
 			// Rootless only: the socket-only shared dir. emptyDir, torn down with the pod;

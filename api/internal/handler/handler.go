@@ -334,10 +334,12 @@ func (h *Handler) clock() time.Time {
 }
 
 // UsagePoker is the slice of the rate-limit poller the token-save handler needs
-// (PRD #53 D3b): request an out-of-band poll for one user. *usagepoller.Engine
-// satisfies it.
+// (PRD #53 D3b): request an out-of-band poll for one user's default token, or for
+// one named token (PokeSecret, the re-enable path of PRD #1732 M3a, whose token is
+// usually not the default). *usagepoller.Engine satisfies it.
 type UsagePoker interface {
 	Poke(userID uuid.UUID)
+	PokeSecret(userID, secretID uuid.UUID)
 }
 
 // SetUsagePoker wires the rate-limit poller in after construction (built in main
@@ -1080,6 +1082,9 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Get("/runs/{id}/inputs", h.WorkerRunInputs)
 		r.Post("/runs/{id}/inputs/ack", h.WorkerRunInputsAck)
 		r.Post("/runs/{id}/inputs/applied", h.WorkerRunInputsApplied)
+		// Issue #1604: settles approve_plan rows the worker discarded as stale, so they leave
+		// the replay list without counting as approval (disposition 'superseded').
+		r.Post("/runs/{id}/inputs/discarded", h.WorkerRunInputsDiscarded)
 		// Issue #1660: the run's already-consumed follow-ups, READ ONLY, run-scoped via
 		// GetRunOwnedByWorker. The worker rehydrates its operator constraints from it on
 		// every claim so a follow-up survives into the subagents of a later claim.
@@ -1231,13 +1236,19 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// Issue #1582 M1: settle ONE older-generation hold on a completed run by the api's own
 		// forge ancestry proof. The worker supplies candidate SHAs only (strict decode). Each
 		// call that reaches the proof spends the OWNER's forge quota (one branch-head read plus
-		// up to three compares, six on Forgejo, which asks both directions), so it rides the
-		// per-worker proposal limiter instance. That limiter keys its buckets by (route
-		// pattern, worker id), so this route has its OWN bucket, separate from the proposal
-		// and finding routes', but every bucket is sized by the same PROPOSAL_RATE_LIMIT_MAX /
-		// PROPOSAL_RATE_LIMIT_WINDOW settings: a looping worker cannot burn the owner's forge
-		// budget.
+		// up to three compares, six on Forgejo, which makes two calls per candidate, asking both
+		// directions), so it rides the per-worker proposal limiter instance. That limiter keys
+		// its buckets by (route pattern, worker id), so this route has its OWN bucket, separate
+		// from the proposal and finding routes', but every bucket is sized by the same
+		// PROPOSAL_RATE_LIMIT_MAX / PROPOSAL_RATE_LIMIT_WINDOW settings: a looping worker
+		// cannot burn the owner's forge budget.
 		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/recovery-holds/{holdID}/settle", h.WorkerSettleRecoveryHold)
+		// Issue #1751 M2: the LIVE twin — settle ONE older-generation hold while the same-worker
+		// successor is still live, proven against the target it published (checkpoint ref or run
+		// branch). Same forge cost per call (one ref/branch-head read plus up to three compares,
+		// six on Forgejo, which makes two calls per candidate), so it rides the same per-worker
+		// proposal limiter instance, in its own route bucket.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/recovery-holds/{holdID}/settle-live", h.WorkerSettleRecoveryHoldLive)
 	})
 }
 

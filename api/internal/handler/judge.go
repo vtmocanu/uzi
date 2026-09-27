@@ -65,14 +65,11 @@ func (h *Handler) SetJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The WHOLE binding request is parsed, validated and label-resolved BEFORE the
-	// first write. The opt-in flip and the binding are two separate statements,
-	// deliberately non-transactional (independent settings), and that is exactly why
-	// every 400 must be decided up front: a body like
-	// {"enabled":true,"judge_bind_mode":"pinned"} with no label must not durably
-	// enable judge runs (which spend the user's tokens) and THEN report a 400 for the
-	// half it could not apply. Validating first turns the only remaining
-	// half-applied pair into "the opt-in flipped, the rebind hit a 5xx", which the
-	// user can see and redo.
+	// first write: a body like {"enabled":true,"judge_bind_mode":"pinned"} with no
+	// label must not durably enable judge runs (which spend the user's tokens) and
+	// THEN report a 400 for the half it could not apply. When a binding is named, the
+	// opt-in and the binding are then written in one transaction (SetUserJudgeBinding),
+	// so its locked ownership and enablement checks refuse both halves together.
 	//
 	// An absent anthropic_token leaves an existing binding alone, or every existing
 	// client that PUTs {"enabled":true} would silently unbind the user's judge
@@ -125,19 +122,19 @@ func (h *Handler) SetJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	updated, err := h.q.SetUserJudgeEnabled(r.Context(), store.SetUserJudgeEnabledParams{
-		ID:           user.ID,
-		JudgeEnabled: req.Enabled,
-	})
-	if err != nil {
-		slog.Error("set judge enabled", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-
+	var updated store.User
 	if bindRequested {
-		bound, berr := h.wsvc.SetUserJudgeBinding(r.Context(), user.ID, mode, secretID)
+		// PRD #1732 D5: the opt-in and the binding are ONE transaction under the user's secret
+		// mutation lock, with the ownership and enablement checks read inside it first. A
+		// token that is disabled (or not the caller's) refuses the whole request, so a 409 or
+		// 404 never leaves judge_enabled flipped, even against a concurrent disable.
+		enabled := req.Enabled
+		bound, berr := h.wsvc.SetUserJudgeBinding(r.Context(), user.ID, mode, secretID, &enabled)
 		if berr != nil {
+			if errors.Is(berr, workersvc.ErrCredentialDisabled) {
+				httpx.Error(w, http.StatusConflict, workersvc.ErrCredentialDisabled.Error())
+				return
+			}
 			if errors.Is(berr, workersvc.ErrSecretNotOwned) {
 				// 404, not 403: a 403 would confirm the id names a real credential
 				// belonging to someone else.
@@ -149,6 +146,18 @@ func (h *Handler) SetJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		updated = bound
+	} else {
+		// No binding named: the opt-in alone, nothing to keep atomic with it.
+		var err error
+		updated, err = h.q.SetUserJudgeEnabled(r.Context(), store.SetUserJudgeEnabledParams{
+			ID:           user.ID,
+			JudgeEnabled: req.Enabled,
+		})
+		if err != nil {
+			slog.Error("set judge enabled", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
 	}
 
 	dto := toDTO(updated)

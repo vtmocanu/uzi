@@ -461,3 +461,33 @@ describe("SidebarUsageLimits: selection refetch", () => {
     expect(screen.getByRole("group", { name: "Codex account extra-codex" })).toBeTruthy();
   });
 });
+
+// PRD #1732: a disabled credential leaves the sidebar AT ONCE. The server omits it from the
+// rate-limit reads; the Settings Enable/Disable handlers emit the shared change event, and
+// the rail's meter reads refetch on it rather than waiting for their 60s poll. The "+N
+// more" count comes from the same reads, so it excludes the disabled one too.
+describe("SidebarUsageLimits — a disabled credential leaves the rail (PRD #1732)", () => {
+  beforeEach(() => {
+    mockApi.getMySettings.mockResolvedValue(settings(["sec-2"], []));
+  });
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it("drops a shown token and its '+N more' share on the change event, without a poll", async () => {
+    const spare = token("sec-3", "spare", false, okReading);
+    mockData([team, consoleKey, spare], []);
+    renderList();
+    expect(await screen.findByRole("group", { name: "Claude account console-key" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "+1 more account in Settings" })).toBeTruthy();
+
+    // console-key and spare are disabled: the server's next read omits both.
+    mockData([team], []);
+    emitSidebarTokensChanged();
+
+    await waitFor(() => expect(screen.queryByRole("group", { name: "Claude account console-key" })).toBeNull());
+    expect(screen.getByRole("group", { name: "Claude account team" })).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /more account/ })).toBeNull();
+  });
+});

@@ -246,6 +246,15 @@ func sanitizeFindingText(s string, max int) string {
 	return scrubThenBound(s, max)
 }
 
+// FindingContentHash exports the D3 content hash for the human "Mark done" path (issue #1723):
+// when a done lands on a coordinate with no disposition yet, the handler inserts the row with the
+// SAME hash the capture path would have stored, computed over the stored (already-sanitised)
+// findings.title and findings.description_md, so a later identical re-report stays suppressed and
+// a changed one re-opens it.
+func FindingContentHash(title, description string) string {
+	return findingContentHash(title, description)
+}
+
 // findingContentHash is the D3 re-open discriminator: the sha256 (hex) of a
 // deterministic normalisation of title+description. NORMALISATION: each of title and
 // description is Unicode-lowercased and has every run of whitespace collapsed to a

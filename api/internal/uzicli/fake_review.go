@@ -108,15 +108,33 @@ func (f *FakeClient) GetFindingsStats(_ context.Context, repo string) (apitypes.
 	return f.FindingsStatsResult, nil
 }
 
-// UndoDismissFinding records the id it was asked to reopen. UndoDismissFindingErr wins over the
-// blanket Err so a test can model the not-dismissed sentinel (ErrFindingNotDismissed) or a hard
-// failure while the id capture still proves the call was reached.
-func (f *FakeClient) UndoDismissFinding(_ context.Context, id string) error {
+// UndoFinding records the id it was asked to undo and returns the canned undone row.
+// UndoFindingErr wins over the blanket Err so a test can model the nothing-to-undo sentinel
+// (ErrFindingNothingToUndo) or a hard failure while the id capture still proves the call was
+// reached.
+func (f *FakeClient) UndoFinding(_ context.Context, id string) (apitypes.IncidentalFindingDTO, error) {
 	f.LastUndoFindingID = id
-	if f.UndoDismissFindingErr != nil {
-		return f.UndoDismissFindingErr
+	if f.UndoFindingErr != nil {
+		return apitypes.IncidentalFindingDTO{}, f.UndoFindingErr
 	}
-	return f.Err
+	if f.Err != nil {
+		return apitypes.IncidentalFindingDTO{}, f.Err
+	}
+	return f.UndoFindingResult, nil
+}
+
+// MarkFindingDone records the evidence id it was called with and returns the canned result.
+// MarkFindingDoneErr wins over Err so a test can model a 404/409 on the write while the capture
+// still records what reached it.
+func (f *FakeClient) MarkFindingDone(_ context.Context, id string) (apitypes.MarkFindingDoneResultDTO, error) {
+	f.LastMarkDoneFindingID = id
+	if f.MarkFindingDoneErr != nil {
+		return apitypes.MarkFindingDoneResultDTO{}, f.MarkFindingDoneErr
+	}
+	if f.Err != nil {
+		return apitypes.MarkFindingDoneResultDTO{}, f.Err
+	}
+	return f.MarkFindingDoneResult, nil
 }
 
 // GetReviewIssueDraft records the (run, rec) it was asked about and returns the canned draft.

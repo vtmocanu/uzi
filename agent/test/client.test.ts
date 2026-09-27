@@ -4,7 +4,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { FakeApi } from "./fake-api.js";
 import { makeClaim, nullLogger } from "./helpers.js";
-import { WorkerClient, RequestError, isTransient } from "../src/client.js";
+import { WorkerClient, RequestError, isTransient, isTransientStatus, codexDeferralReason } from "../src/client.js";
 import { MessageBatcher } from "../src/batcher.js";
 
 const TOKEN = "worker-join-token-0123456789";
@@ -608,6 +608,44 @@ describe("input receipts", () => {
   });
 });
 
+// Issue #1604: POST /inputs/discarded settles a claim's own disposed approve_plan rows (disposition
+// superseded): never counted as the human approval, and out of the replay list.
+describe("discardInputs (issue #1604)", () => {
+  beforeEach(() => {
+    api.strictReceiptGenerations = true;
+  });
+
+  it("posts the ids and generation, and the discarded approve leaves the replay list without counting as approval", async () => {
+    const client = newClient();
+    api.setInputClaimGeneration("discard-run", 3);
+    api.setInputs("discard-run", [{ id: 5, kind: "approve_plan", body: null }]);
+    await client.ackInputs("discard-run", [5], 3);
+    const receipt = await client.discardInputs("discard-run", [5], 3);
+    assert.strictEqual(receipt.active, true);
+    assert.deepStrictEqual(receipt.inputs.map((r) => r.id), [5]);
+    assert.deepStrictEqual(api.inputReceiptCalls.at(-1), { runId: "discard-run", kind: "discarded", ids: [5], generation: 3 });
+    assert.deepStrictEqual((await client.getInputs("discard-run")).inputs, [], "out of the replay list");
+    assert.strictEqual(api.humanPlanApproved("discard-run"), false, "not the human approval");
+    assert.strictEqual((await client.discardInputs("discard-run", [5], 3)).active, true, "idempotent");
+  });
+
+  it("maps a non-approve row to 400, a fenced claim to a typed 409, and an api without the route to 404", async () => {
+    const client = newClient();
+    api.setInputClaimGeneration("discard-run", 3);
+    api.setInputs("discard-run", [{ id: 5, kind: "approve_plan", body: null }, { id: 6, kind: "reject_plan", body: "no" }]);
+    await client.ackInputs("discard-run", [5, 6], 3);
+    await assert.rejects(client.discardInputs("discard-run", [5, 6], 3), (err: unknown) => err instanceof RequestError && err.status === 400);
+    api.setInputClaimGeneration("discard-run", 4);
+    api.setInputFenceReason("discard-run", "released");
+    await assert.rejects(
+      client.discardInputs("discard-run", [5], 3),
+      (err: unknown) => err instanceof RequestError && err.status === 409 && JSON.parse(err.body).reason === "released",
+    );
+    api.discardRouteMissing = true;
+    await assert.rejects(client.discardInputs("discard-run", [5], 4), (err: unknown) => err instanceof RequestError && err.status === 404);
+  });
+});
+
 // Issue #1660: the worker rehydrates its operator constraints from the run's already-consumed
 // follow-ups on every claim; the read consumes nothing.
 describe("getConsumedFollowUps (issue #1660)", () => {
@@ -731,6 +769,17 @@ describe("isTransient", () => {
     assert.strictEqual(isTransient(new RequestError("POST", "/x", 404, "")), false);
     assert.strictEqual(isTransient(new Error("network down")), true);
   });
+});
+
+describe("isTransientStatus", () => {
+  for (const [status, want] of [
+    [500, true], [503, true], [529, true], [429, true], [408, true],
+    [400, false], [401, false], [403, false], [404, false], [413, false],
+  ] as const) {
+    it(`${status} → ${want}`, () => {
+      assert.strictEqual(isTransientStatus(status), want);
+    });
+  }
 });
 
 // Chat agent read surface (PRD #39 M3): the four worker-authenticated endpoints the
@@ -922,5 +971,28 @@ describe("completion permit + hold client calls (PRD #1226 M4)", () => {
     } finally {
       await srv.close();
     }
+  });
+});
+
+// Issue #1766: the typed 409 vault_locked reply on the Codex credential routes.
+describe("codexDeferralReason", () => {
+  const locked = JSON.stringify({ error: "codex credential vault is locked; retry after unlock", reason: "vault_locked" });
+  it("returns vault_locked for a 409 RequestError whose JSON body carries reason vault_locked", () => {
+    assert.equal(codexDeferralReason(new RequestError("POST", "/api/worker/runs/r/codex/refresh", 409, locked)), "vault_locked");
+  });
+  it("returns undefined for another 409 reason, a 500, a non-JSON body, a non-object body and a non-RequestError", () => {
+    const cases: unknown[] = [
+      new RequestError("POST", "/p", 409, JSON.stringify({ reason: "refresh_contended" })),
+      new RequestError("POST", "/p", 409, JSON.stringify({ error: "vault_locked" })),
+      new RequestError("POST", "/p", 500, locked),
+      new RequestError("POST", "/p", 409, "vault_locked"),
+      new RequestError("POST", "/p", 409, ""),
+      new RequestError("POST", "/p", 409, JSON.stringify(["vault_locked"])),
+      new RequestError("POST", "/p", 409, "null"),
+      new Error(`POST /p returned 409: ${locked}`),
+      { status: 409, body: locked },
+      undefined,
+    ];
+    for (const err of cases) assert.equal(codexDeferralReason(err), undefined, String(err));
   });
 });

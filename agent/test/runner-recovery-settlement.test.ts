@@ -16,10 +16,10 @@ import {
   type RecoverySettleClient,
   type SettlementRecord,
 } from "../src/recovery-settlement.js";
-import type { RecoverySettleRequest, RecoverySettleResponse } from "../src/protocol.js";
+import type { RecoveryLiveSettleRequest, RecoverySettleRequest, RecoverySettleResponse } from "../src/protocol.js";
 import { FakeRecoveryClient, FakeRecoveryGit, commitInTree, fixture as codexFixture } from "./codex-reap-fixture.js";
-import { nullLogger, recordingLogger } from "./helpers.js";
-import { api, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
+import { makeClaim, nullLogger, recordingLogger } from "./helpers.js";
+import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
 
@@ -735,4 +735,420 @@ describe("RunRunner — settlement promotion on every terminal path (issue #1582
       }
     });
   }
+});
+
+// ── issue #1751 M2: the LIVE settle trigger on a confirmed checkpoint publish ─────────────────────
+
+/** A settle client with the live RPC; a live answer may be a promise that never settles unless the
+ *  call's signal aborts (the "hanging settle" case). */
+class FakeLiveSettleClient extends FakeSettleClient {
+  liveCalls: Array<{ runId: string; holdId: string; req: RecoveryLiveSettleRequest }> = [];
+  liveAnswer: (holdId: string) => RecoverySettleResponse | Error | "hang" = () => new Error("no live answer configured");
+  async settleRecoveryHoldLive(
+    runId: string,
+    holdId: string,
+    req: RecoveryLiveSettleRequest,
+    signal?: AbortSignal,
+  ): Promise<RecoverySettleResponse> {
+    this.liveCalls.push({ runId, holdId, req });
+    const a = this.liveAnswer(holdId);
+    if (a === "hang") {
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        setTimeout(() => reject(new Error("never aborted")), 5_000).unref();
+      });
+    }
+    if (a instanceof Error) throw a;
+    return a;
+  }
+}
+
+describe("RunRunner — live settle on a confirmed checkpoint publish (issue #1751 M2)", () => {
+  const RUN_ID = "0d751000-0000-4000-8000-000000000001";
+
+  interface LiveRig {
+    settlementRoot: string;
+    settlement: SettlementJournal;
+    settleClient: FakeLiveSettleClient;
+    runner: ReturnType<typeof runnerWith>;
+    observed: Array<Promise<number>>;
+    /** The arguments of every observeLivePublication call (runId, generation, tip, target). */
+    observedArgs: unknown[][];
+    settled: Array<Promise<void>>;
+    bare: string;
+    src: string;
+    adopted: string;
+    published: string;
+    cleanup: () => void;
+  }
+
+  /** Real commits in the worker bare (the source and adopted tips are ancestors of the published
+   *  tip), a token-keyed journal, and a runner whose settler's live entry points are observed. */
+  async function liveRig(): Promise<LiveRig> {
+    const settlementRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-live-set-"));
+    const settlement = new SettlementJournal({ root: settlementRoot, workerToken: WORKER_TOKEN, log: nullLogger() });
+    const settleClient = new FakeLiveSettleClient();
+    const src = originCommit("live-src", "LIVE-SRC.txt");
+    const adopted = originCommit("live-adopted", "LIVE-ADOPTED.txt");
+    const published = originCommit("live-published", "LIVE-PUB.txt");
+    const bareP = await git.ensureClone(fx.originPath);
+    const runner = runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), fakeGitlab().gitlab, undefined, nullLogger(), {
+      settlement,
+      settleClient,
+    });
+    const settler = (runner as unknown as {
+      settler: {
+        observeLivePublication: (...a: unknown[]) => Promise<number>;
+        settleLive: (...a: unknown[]) => Promise<void>;
+      };
+    }).settler;
+    const observed: Array<Promise<number>> = [];
+    const observedArgs: unknown[][] = [];
+    const settled: Array<Promise<void>> = [];
+    const obs = settler.observeLivePublication.bind(settler);
+    settler.observeLivePublication = (...a: unknown[]) => {
+      observedArgs.push(a);
+      const p = obs(...a);
+      observed.push(p);
+      return p;
+    };
+    const sl = settler.settleLive.bind(settler);
+    settler.settleLive = (...a: unknown[]) => {
+      const p = sl(...a);
+      settled.push(p);
+      return p;
+    };
+    return {
+      settlementRoot,
+      settlement,
+      settleClient,
+      runner,
+      observed,
+      observedArgs,
+      settled,
+      bare: bareP,
+      src,
+      adopted,
+      published,
+      cleanup: () => fs.rmSync(settlementRoot, { recursive: true, force: true }),
+    };
+  }
+
+  function adoptedRecord(r: LiveRig, holdId: string, over: Partial<SettlementRecord> = {}): SettlementRecord {
+    return {
+      version: 1,
+      runId: RUN_ID,
+      holdId,
+      predecessorGeneration: 1,
+      successorGeneration: 2,
+      sourceSha: r.src,
+      sourceCaptureId: "cap-live",
+      adoptedSha: r.adopted,
+      seededFrom: "checkpoint",
+      branch: "agent/issue-1751",
+      barePath: r.bare,
+      createdAt: 1,
+      state: "adopted",
+      attempts: 0,
+      ...over,
+    };
+  }
+
+  function liveFlight(over: Record<string, unknown> = {}): Record<string, unknown> & { cancel: AbortController } {
+    return {
+      runId: RUN_ID,
+      runKind: "issue",
+      claimGeneration: 2,
+      cancel: new AbortController(),
+      lastCheckpointRefTip: undefined,
+      lastAttemptedCheckpointRefTip: undefined,
+      reportedPublishOutcomes: new Set<string>(),
+      runLog: nullLogger(),
+      batcher: { emit() {} },
+      ...over,
+    } as Record<string, unknown> & { cancel: AbortController };
+  }
+
+  /** Publish once through the private best-effort seam with the pack and the broker stubbed. */
+  async function publish(
+    r: LiveRig,
+    flight: Record<string, unknown>,
+    result: unknown | Error,
+  ): Promise<boolean> {
+    const origPack = git.checkpointPack.bind(git);
+    const origPub = client.publishCheckpoint.bind(client);
+    (git as unknown as { checkpointPack: unknown }).checkpointPack = async () => ({
+      tipOid: r.published,
+      pack: { resume() {} },
+    });
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async () => {
+      if (result instanceof Error) throw result;
+      return result;
+    };
+    try {
+      return await (r.runner as unknown as {
+        publishCheckpointBestEffort: (f: unknown, bare: string, branch: string) => Promise<boolean>;
+      }).publishCheckpointBestEffort(flight, r.bare, "agent/issue-1751");
+    } finally {
+      (git as unknown as { checkpointPack: unknown }).checkpointPack = origPack;
+      (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = origPub;
+    }
+  }
+
+  const PUBLISHED_OK = { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-1751" } };
+
+  it("published:true sends a live settle with the exact body; released cleans up exactly that hold (sibling untouched)", async () => {
+    const r = await liveRig();
+    try {
+      const side = sideCommit("live-side", "LIVE-SIDE.txt"); // HOLD_B's source: NOT in the published tip
+      await git.ensureClone(fx.originPath);
+      await r.settlement.put(adoptedRecord(r, HOLD_A));
+      await r.settlement.put(adoptedRecord(r, HOLD_B, { sourceSha: side }));
+      for (const [h, source] of [[HOLD_A, r.src], [HOLD_B, side]] as const) {
+        assert.ok(await git.pinSettlementRefs(r.bare, RUN_ID, h, { source, adopted: r.adopted }));
+      }
+      r.settleClient.liveAnswer = (h) => released(RUN_ID, h);
+      assert.equal(await publish(r, liveFlight(), PUBLISHED_OK), true);
+      assert.equal(r.observed.length, 1, "the confirmed publish fired the live trigger");
+      await Promise.all(r.observed);
+      await Promise.all(r.settled);
+      assert.deepEqual(r.settleClient.liveCalls, [
+        {
+          runId: RUN_ID,
+          holdId: HOLD_A,
+          req: {
+            predecessor_generation: 1,
+            successor_generation: 2,
+            published_sha: r.published,
+            source_sha: r.src,
+            adopted_sha: r.adopted,
+            target: "checkpoint",
+          },
+        },
+      ]);
+      assert.equal(r.settleClient.calls.length, 0, "no completed /settle while the run is live");
+      assert.deepEqual((await r.settlement.listRun(RUN_ID)).map((x) => [x.holdId, x.state, x.live]), [
+        [HOLD_B, "adopted", undefined],
+      ], "only the released hold's record is removed; the sibling took no leg");
+      for (const kind of ["source", "adopted", "published"]) {
+        assert.equal(refOrNull(r.bare, settleRef(RUN_ID, HOLD_A, kind)), null, `HOLD_A ${kind} pin deleted`);
+      }
+      assert.equal(refOrNull(r.bare, settleRef(RUN_ID, HOLD_B, "source")), side, "the sibling's pins are kept");
+      assert.equal(refOrNull(r.bare, settleRef(RUN_ID, HOLD_B, "published")), null, "the sibling was never pinned");
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it("a live settle fired from inside an ended boundary scope does not inherit that scope", async () => {
+    // issue #1751 M2 review: the checkpoint publish runs inside Codex permits and the mid-turn
+    // tick, under GitCache's AsyncLocalStorage boundary scope. The fire-and-forget live settle
+    // must run in the runner's own (permit-free) context, or its git reads use the scope's
+    // spawner and signal after the permit has ended.
+    const r = await liveRig();
+    try {
+      await git.ensureClone(fx.originPath);
+      await r.settlement.put(adoptedRecord(r, HOLD_A));
+      assert.ok(await git.pinSettlementRefs(r.bare, RUN_ID, HOLD_A, { source: r.src, adopted: r.adopted }));
+      r.settleClient.liveAnswer = (h) => released(RUN_ID, h);
+      const ended = new AbortController();
+      ended.abort(new Error("permit ended"));
+      let scopedSpawns = 0;
+      const deadSpawner = async () => {
+        scopedSpawns += 1;
+        throw new Error("boundary spawner used after its permit ended");
+      };
+      assert.equal(
+        await git.withBoundaryProcessSpawner(deadSpawner, ended.signal, () => publish(r, liveFlight(), PUBLISHED_OK)),
+        true,
+      );
+      assert.equal(r.observed.length, 1, "the confirmed publish fired the live trigger");
+      await Promise.all(r.observed);
+      await Promise.all(r.settled);
+      assert.equal(scopedSpawns, 0, "no git child went through the ended permit's spawner");
+      assert.equal(r.settleClient.liveCalls.length, 1, "the live leg was recorded and sent");
+      assert.deepEqual(await r.settlement.listRun(RUN_ID), [], "released cleaned the record up");
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  for (const [label, result] of [
+    ["published:false (a 2xx skip)", { ok: true, body: { published: false, ref: "", skipped: "workflow_scope" } }],
+    ["a non-ok publish (HTTP 500)", { ok: false, httpStatus: 500 }],
+    ["an unacknowledged publish (the call throws)", new Error("socket hang up")],
+  ] as const) {
+    it(`${label} records and sends nothing live`, async () => {
+      const r = await liveRig();
+      try {
+        await r.settlement.put(adoptedRecord(r, HOLD_A));
+        r.settleClient.liveAnswer = (h) => released(RUN_ID, h);
+        assert.equal(await publish(r, liveFlight(), result), false);
+        // The trigger calls observeLivePublication synchronously when it fires, so none now = never.
+        assert.equal(r.observed.length, 0, "no live trigger");
+        assert.equal(r.settleClient.liveCalls.length, 0);
+        const [rec] = await r.settlement.listRun(RUN_ID);
+        assert.equal(rec!.live, undefined, "no leg recorded");
+        assert.equal(refOrNull(r.bare, settleRef(RUN_ID, HOLD_A, "published")), null, "no published pin");
+      } finally {
+        r.cleanup();
+      }
+    });
+  }
+
+  for (const kind of ["task", "ci_fix", "mr_rework", "prompt"]) {
+    it(`a confirmed CHECKPOINT publish of a ${kind} run fires nothing (checkpoint target is issue/self_improve only)`, async () => {
+      const r = await liveRig();
+      try {
+        await r.settlement.put(adoptedRecord(r, HOLD_A));
+        assert.equal(await publish(r, liveFlight({ runKind: kind }), PUBLISHED_OK), true);
+        assert.equal(r.observed.length, 0);
+        assert.equal((await r.settlement.listRun(RUN_ID))[0]!.live, undefined);
+      } finally {
+        r.cleanup();
+      }
+    });
+  }
+
+  // ── the finalize-push `branch` trigger (issue #1751 M2 rework, B1/N4): task runs only ──────────
+
+  const TASK_BRANCH = "uzi/task/live-settle";
+
+  /** Fire the finalize-push trigger through its private seam, with the branch's runner tracking
+   *  ref at the published tip (what a landed finalize push leaves in the bare). */
+  function finalizePushed(r: LiveRig, flight: Record<string, unknown>): void {
+    gitOut(r.bare, "update-ref", `refs/uzi-runner/${TASK_BRANCH}`, r.published);
+    (r.runner as unknown as {
+      triggerBranchLiveSettle: (f: unknown, bare: string, branch: string) => void;
+    }).triggerBranchLiveSettle(flight, r.bare, TASK_BRANCH);
+  }
+
+  /** Wait (bounded) for `want` fire-and-forget triggers, then for their observe + send to finish. */
+  async function drained(r: LiveRig, want: number): Promise<void> {
+    for (let i = 0; i < 200 && r.observed.length < want; i++) await new Promise((res) => setTimeout(res, 5));
+    await Promise.all(r.observed);
+    await Promise.all(r.settled);
+  }
+
+  it("a TASK run's finalize push fires a live settle with target branch and the exact body; released cleans up", async () => {
+    const r = await liveRig();
+    try {
+      await r.settlement.put(adoptedRecord(r, HOLD_A));
+      assert.ok(await git.pinSettlementRefs(r.bare, RUN_ID, HOLD_A, { source: r.src, adopted: r.adopted }));
+      r.settleClient.liveAnswer = (h) => released(RUN_ID, h);
+      finalizePushed(r, liveFlight({ runKind: "task" }));
+      await drained(r, 1);
+      assert.deepEqual(r.observedArgs, [[RUN_ID, 2, r.published, "branch"]]);
+      assert.deepEqual(r.settleClient.liveCalls, [
+        {
+          runId: RUN_ID,
+          holdId: HOLD_A,
+          req: {
+            predecessor_generation: 1,
+            successor_generation: 2,
+            published_sha: r.published,
+            source_sha: r.src,
+            adopted_sha: r.adopted,
+            target: "branch",
+          },
+        },
+      ]);
+      assert.equal(r.settleClient.calls.length, 0, "no completed /settle");
+      assert.deepEqual(await r.settlement.listRun(RUN_ID), [], "released: the record is removed");
+      for (const kind of ["source", "adopted", "published"]) {
+        assert.equal(refOrNull(r.bare, settleRef(RUN_ID, HOLD_A, kind)), null, `${kind} pin deleted`);
+      }
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  for (const kind of ["ci_fix", "mr_rework", "prompt", "issue", "self_improve"]) {
+    it(`a ${kind} run's finalize push fires nothing (runs.branch is not a live target for it)`, async () => {
+      const r = await liveRig();
+      try {
+        await r.settlement.put(adoptedRecord(r, HOLD_A));
+        r.settleClient.liveAnswer = (h) => released(RUN_ID, h);
+        finalizePushed(r, liveFlight({ runKind: kind }));
+        await new Promise((res) => setTimeout(res, 100));
+        assert.equal(r.observed.length, 0, "no live trigger");
+        assert.equal(r.settleClient.liveCalls.length, 0);
+        assert.equal((await r.settlement.listRun(RUN_ID))[0]!.live, undefined, "no leg recorded");
+        assert.equal(refOrNull(r.bare, settleRef(RUN_ID, HOLD_A, "published")), null, "no published pin");
+      } finally {
+        r.cleanup();
+      }
+    });
+  }
+
+  it("a self_improve run's confirmed checkpoint publish fires a live settle with target checkpoint", async () => {
+    const r = await liveRig();
+    try {
+      await r.settlement.put(adoptedRecord(r, HOLD_A));
+      r.settleClient.liveAnswer = (h) => released(RUN_ID, h);
+      assert.equal(await publish(r, liveFlight({ runKind: "self_improve" }), PUBLISHED_OK), true);
+      await drained(r, 1);
+      assert.deepEqual(r.observedArgs, [[RUN_ID, 2, r.published, "checkpoint"]]);
+      assert.equal(r.settleClient.liveCalls.length, 1);
+      assert.equal(r.settleClient.liveCalls[0]!.req.target, "checkpoint");
+      assert.deepEqual(await r.settlement.listRun(RUN_ID), []);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it("end to end: a completing TASK run's landed finalize push fires the branch trigger with its pushed tip", async () => {
+    const r = await liveRig();
+    try {
+      const branch = `feature/live-settle-${Date.now()}`;
+      const claim = makeClaim({
+        kind: "task",
+        issue_iid: null,
+        issue_title: "Handoff: live settle",
+        issue_description: "Do the task.",
+        branch,
+        open_mr: false,
+        claim_generation: 2,
+        repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+        last_seq: 0,
+        secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
+      });
+      await r.runner.execute(claim);
+      assert.ok(hasStatus(claim.run_id, "completed"), "the task run completed");
+      await drained(r, 1);
+      const pushed = gitOut(fx.originPath, "rev-parse", `refs/heads/${branch}`);
+      assert.deepEqual(r.observedArgs, [[claim.run_id, 2, pushed, "branch"]], "fired once, with the pushed tip");
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it("the live trigger never blocks execution: a hanging settle does not delay the publish, and the cancel signal ends it", async () => {
+    const r = await liveRig();
+    try {
+      await r.settlement.put(adoptedRecord(r, HOLD_A));
+      r.settleClient.liveAnswer = () => "hang";
+      const flight = liveFlight();
+      const t0 = Date.now();
+      assert.equal(await publish(r, flight, PUBLISHED_OK), true);
+      assert.ok(Date.now() - t0 < 1_000, "the publish returned without waiting on the settle");
+      await Promise.all(r.observed);
+      // The send is (or will shortly be) in flight and hangs; the run is not waiting on it.
+      for (let i = 0; i < 100 && r.settleClient.liveCalls.length === 0; i++) await new Promise((res) => setTimeout(res, 10));
+      assert.equal(r.settleClient.liveCalls.length, 1, "the live settle was sent in the background");
+      const t1 = Date.now();
+      flight.cancel.abort();
+      await Promise.all(r.settled);
+      assert.ok(Date.now() - t1 < 1_000, "the flight's cancel signal ends the hanging settle");
+      const [rec] = await r.settlement.listRun(RUN_ID);
+      assert.deepEqual(
+        [rec!.state, rec!.live?.sent, rec!.live?.attempts],
+        ["adopted", true, 0],
+        "an aborted send consumes no attempt; the sweep retries it",
+      );
+      assert.equal(refOrNull(r.bare, settleRef(RUN_ID, HOLD_A, "published")), r.published, "evidence kept");
+    } finally {
+      r.cleanup();
+    }
+  });
 });

@@ -144,6 +144,7 @@ func TestCodexReauthSurvivesRestartThenReplacementClearsLiveDB(t *testing.T) {
 		ObservedGeneration:         reading.ObservedGeneration,
 		ObservedCredentialRevision: reading.ObservedCredentialRevision,
 		AttemptStatus:              "ok",
+		EnablementSig:              codexEnablementSig(t, env, fx.userID, fx.accountID),
 	})
 	if err != nil || n != 1 {
 		t.Fatalf("persist recovered reading: n=%d err=%v", n, err)

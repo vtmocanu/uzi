@@ -37,7 +37,7 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 
 	list := &cobra.Command{
 		Use:   "list",
-		Short: "List your Anthropic tokens (labels, default flag, pool opt-in; never values)",
+		Short: "List your Anthropic tokens (labels, enabled state, default flag, pool opt-in; never values)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)
@@ -79,7 +79,9 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 				// UNKNOWN (the meters read failed, or did not mention it) must not look
 				// like one that is fine. null, "" and absent must not collapse — so the
 				// field is always present, and it is null exactly when the answer is not
-				// known.
+				// known. A disabled token is omitted from the meters read (PRD #1732), so
+				// its auto_status is null too: a script reads `enabled` first, and treats
+				// null as "unknown" only for an enabled token (docs/cli.md).
 				out := make([]tokenListItem, 0, len(secrets))
 				for _, s := range secrets {
 					item := tokenListItem{SecretDTO: s}
@@ -128,14 +130,26 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 				if isAnthropic {
 					poolCell = boolStr(s.AutoEligible)
 				}
+				//
+				// STATE is the credential's enablement (PRD #1732 D12). A disabled token keeps
+				// its stored pool opt-in (D8), so POOL still reports the setting, but it is
+				// never picked while disabled and the meters read omits it: ELIGIBLE reads
+				// "-" rather than the "?" an unknown pooled token would get.
+				eligible := eligibilityCell(s.AutoEligible, eligibility[s.ID])
+				if secretDisabled(s) && isAnthropic {
+					eligible = "-"
+				}
 				rows = append(rows, []string{
 					s.ID, tokenKindAlias(s.Kind), cellText(s.Label), boolStr(s.IsDefault),
-					poolCell, eligibilityCell(s.AutoEligible, eligibility[s.ID]),
+					poolCell, eligible,
 					codexStatusCell(s.CodexStatus),
 					s.CreatedAt.Format("2006-01-02"),
+					// Last, so the multi-word "disabled since <date>" never shifts the
+					// columns a script reading this table by position already relies on.
+					secretStateCell(s),
 				})
 			}
-			return p.Table([]string{"ID", "KIND", "LABEL", "DEFAULT", "POOL", "ELIGIBLE", "STATUS", "CREATED"}, rows)
+			return p.Table([]string{"ID", "KIND", "LABEL", "DEFAULT", "POOL", "ELIGIBLE", "STATUS", "CREATED", "STATE"}, rows)
 		},
 	}
 
@@ -217,6 +231,14 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 				// A usage error, not a 404: the label never reached the server, so this
 				// reports what actually happened — the caller holds no token by that name.
 				return uzicli.Exitf(uzicli.ExitUsage, "no Anthropic token labelled %q; `uzi token list` shows yours", args[0])
+			}
+			// PRD #1732 D5: a disabled token cannot join the pool. Refuse before the write
+			// with the same advice the server's 409 gives ("credential is disabled; enable
+			// it in Settings", workersvc.ErrCredentialDisabled); enabling is a web-only
+			// action (D12). Opting a disabled token OUT stays allowed.
+			if on && secretDisabled(target) {
+				return uzicli.Exitf(uzicli.ExitConflict,
+					"token %q is disabled; enable it in Settings before adding it to the pool", cellText(target.Label))
 			}
 			out, err := c.SetTokenAutoEligible(cmd.Context(), target.ID, on)
 			if err != nil {
@@ -322,6 +344,23 @@ func tokenKindAlias(kind string) string {
 	default:
 		return kind
 	}
+}
+
+// secretDisabled reports whether a credential is disabled (PRD #1732 D10). It keys on
+// disabled_at rather than the enabled boolean on purpose: a server that predates the
+// feature omits both fields, and a missing `enabled` decodes as false, which would read
+// every credential as disabled. A missing disabled_at decodes as nil, i.e. enabled.
+func secretDisabled(s apitypes.SecretDTO) bool {
+	return s.DisabledAt != nil
+}
+
+// secretStateCell renders the STATE column for `uzi token list` (PRD #1732 D12): "enabled",
+// or "disabled since <date>" (UTC, the same date format as CREATED).
+func secretStateCell(s apitypes.SecretDTO) string {
+	if !secretDisabled(s) {
+		return "enabled"
+	}
+	return "disabled since " + s.DisabledAt.UTC().Format("2006-01-02")
 }
 
 // codexStatusCell renders the STATUS column for `uzi token list` (PRD #1147 M3):

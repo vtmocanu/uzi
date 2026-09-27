@@ -22,7 +22,7 @@ describe("TriageActions — which buttons render", () => {
     expect(screen.queryByRole("button", { name: "File issue" })).toBeNull();
   });
 
-  it("hides Mark done when onMarkDone is absent (the Findings row)", () => {
+  it("hides Mark done when onMarkDone is absent", () => {
     render(<TriageActions onFile={vi.fn()} onDismiss={vi.fn()} />);
     expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
     expect(screen.getByRole("button", { name: "File issue" })).toBeTruthy();

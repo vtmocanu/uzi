@@ -59,7 +59,7 @@ if [ "\${1:-}" = pr ] && [ "\${2:-}" = view ]; then
     *)     if [ -n "\$oid" ]; then
              echo '{"state":"'"\$st"'","headRefOid":"$HEAD","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","mergeCommit":{"oid":"'"\$oid"'"},"baseRefName":"main"}'
            else
-             echo '{"state":"'"\$st"'","headRefOid":"$HEAD","mergeStateStatus":"BLOCKED","mergeable":"MERGEABLE","mergeCommit":null,"baseRefName":"main"}'
+             echo '{"state":"'"\$st"'","headRefOid":"$HEAD","mergeStateStatus":"BLOCKED","mergeable":"'"\${MERGEABLE:-MERGEABLE}"'","mergeCommit":null,"baseRefName":"main"}'
            fi ;;
   esac
   exit 0
@@ -250,4 +250,20 @@ merge_run rulesmalformed
 [ ! -e "$WORK/merge.log" ] || fail "merged on a malformed required-check rule"
 unset CHECKS_JSON CHECKS_RC RULES_JSON
 
-echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse"
+# 6. A PR that conflicts with its base gets no pull_request CI, so gh reports no required
+#    checks and exits 1. Name the conflict (exit 3, land-prep), not "cannot read the checks".
+export MERGEABLE=CONFLICTING CHECKS_JSON='' CHECKS_RC=1
+merge_run conflict
+[ "$rc" -eq 3 ] || fail "a conflicting PR returned rc=$rc, want 3: $(cat "$WORK/m.conflict")"
+grep -q 'conflicts with its base (mergeable=CONFLICTING' "$WORK/m.conflict" || fail "conflict not named: $(cat "$WORK/m.conflict")"
+grep -q 'land-prep.sh' "$WORK/m.conflict" || fail "land-prep not pointed to: $(cat "$WORK/m.conflict")"
+grep -q 'cannot read the required checks' "$WORK/m.conflict" && fail "a conflict was reported as unreadable checks"
+[ ! -e "$WORK/merge.log" ] || fail "merged a conflicting PR"
+# mergeable=UNKNOWN (GitHub computing) is not a conflict: the checks gate still decides.
+export MERGEABLE=UNKNOWN
+merge_run computing
+[ "$rc" -eq 2 ] || fail "mergeable=UNKNOWN returned rc=$rc, want 2: $(cat "$WORK/m.computing")"
+grep -q 'conflicts with its base' "$WORK/m.computing" && fail "mergeable=UNKNOWN read as a conflict"
+unset MERGEABLE CHECKS_JSON CHECKS_RC
+
+echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict"

@@ -38,6 +38,8 @@ function secret(over: Partial<SecretMeta> = {}): SecretMeta {
     kind: "codex_auth",
     label: "default",
     is_default: true,
+    enabled: true,
+    disabled_at: null,
     auto_eligible: false,
     codex_status: "staging",
     created_at: "2026-01-01T00:00:00Z",

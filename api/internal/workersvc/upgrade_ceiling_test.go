@@ -1,7 +1,6 @@
 package workersvc
 
 import (
-	"strings"
 	"testing"
 	"time"
 )
@@ -660,28 +659,20 @@ func TestComposeDegradationNoControllerMeansVersionCompareOnly(t *testing.T) {
 }
 
 // -------------------------------------------------------------------------
-// R7.5 (issue #738): trust the controller's `settled` observation over a baked
-// UZI_AGENT_VERSION that trails a reuse-retagged image (PRD #422).
+// A `settled` hosted worker reporting a version behind its target.
 //
-// The live-observed repro: a release tag advanced to a new version that points at a
-// PRIOR release's digest, so a hosted worker's baked version (reported at register)
-// trails the tag while the pod is, in fact, running the target image. The controller
-// reports `settled` for the current-spec-hash pod, which is direct confirmation the
-// worker is on the target. Before R7.5 the version compare read `outdated` and the
-// worker was counted for the nav badge; R7.5 clears it.
-//
-// CALIBRATION: every fixture below reports a version GENUINELY BELOW its target
-// (0.66.0 < 0.66.1), so classifyByVersion alone returns `outdated`. If R7.5 were
-// removed from upgrade.go, the reuse case would read `outdated` — that is what makes
-// these tests non-vacuous.
+// The settled softener, rule 7.5 (issue #738), once read such a worker `up_to_date`, on
+// the theory that its baked version trailed a re-tagged agent image. #1720 ended agent-image re-tagging, so that
+// softener only produced false `up_to_date` for workers genuinely on an older release,
+// and #1415 removed it. A settled worker behind its target now reads by the version
+// compare (after R3's convergence grace).
 // -------------------------------------------------------------------------
 
 // hostedSettledInput builds a HOSTED worker with a FRESH `settled` controller signal
 // rolling to `target`, reporting `reported`, whose Ready transition happened
 // `phaseSinceAge` ago. `phaseSinceAge` older than RegisterConvergenceGrace keeps R3 out
-// of the way so any `upgrading` here would have to come from R3 and any `up_to_date`
-// from R7.5 — never a grace. The fresh RolledTag == target makes `target` the resolved
-// hosted comparison target (Decision 9).
+// of the way. The fresh RolledTag == target makes `target` the resolved hosted
+// comparison target (Decision 9).
 func hostedSettledInput(now time.Time, reported, target string, phaseSinceAge time.Duration) UpgradeInput {
 	settledAt := now.Add(-phaseSinceAge)
 	anchor := now.Add(-time.Minute)
@@ -701,133 +692,44 @@ func hostedSettledInput(now time.Time, reported, target string, phaseSinceAge ti
 	}
 }
 
-// (a) The reuse case. A hosted worker the controller confirms `settled` on the target
-// image, reporting a version that trails the tag (a reuse-retagged image, PRD #422),
-// must read `up_to_date` — not `outdated` — and the detail must name the target.
-func TestR7_5ReuseRetaggedImageReadsUpToDate_Issue738(t *testing.T) {
-	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
-	// Ready long ago (past the register grace), so R3 cannot be the reason.
-	in := hostedSettledInput(now, "0.66.0+g4a5c0f4", "0.66.1", time.Hour)
+// Issue #1415 regression: a hosted worker the controller reports `settled`, honestly
+// stamped with an older release than its target, past R3's grace, is genuinely behind.
+// It must read `outdated` and count for the nav badge, never a false `up_to_date`.
+func TestSettledWorkerOnOlderReleaseIsNeverUpToDate_Issue1415(t *testing.T) {
+	now := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
+	in := hostedSettledInput(now, "0.83.0-rc.2+gda4b492", "0.83.0-rc.6", time.Hour)
 
 	status, detail := ClassifyUpgrade(in, ceilingParams())
-	if status != UpgradeStatusUpToDate {
-		t.Fatalf("issue #738: a `settled` worker on a reuse-retagged image must read %q, got %q (%q). "+
-			"The controller directly confirms the pod is on the target; the trailing baked version is the lie.",
+	if status != UpgradeStatusOutdated {
+		t.Fatalf("issue #1415: a settled worker on 0.83.0-rc.2 with target 0.83.0-rc.6 must read %q, "+
+			"got %q (%q)", UpgradeStatusOutdated, status, detail)
+	}
+	if !InUpgradeAttentionSet(status) {
+		t.Errorf("issue #1415: a genuinely behind worker (%q) must count for the nav badge", status)
+	}
+	// The plain version-compare detail, not the removed softener's claim that the worker
+	// runs the target image.
+	if want := "running 0.83.0-rc.2+gda4b492, target 0.83.0-rc.6"; detail != want {
+		t.Errorf("issue #1415: detail = %q, want the version-compare detail %q", detail, want)
+	}
+
+	// CONTROL: the same honestly stamped worker settled on a target that MATCHES its own
+	// release (the controller rolls to its pin, rc.2) reads `up_to_date`, and the +g<sha>
+	// build metadata does not change the compare. Without this the assertion above would
+	// also pass against a classifier that calls every settled worker outdated.
+	onPin := hostedSettledInput(now, "0.83.0-rc.2+gda4b492", "0.83.0-rc.2", time.Hour)
+	onPin.CPVersion = "0.83.0-rc.6" // the api has moved ahead of the worker pin
+	onPin.PinnedWorkerVersion = "0.83.0-rc.2"
+	if status, detail := ClassifyUpgrade(onPin, ceilingParams()); status != UpgradeStatusUpToDate {
+		t.Errorf("a settled worker on its own pin (build metadata aside) must read %q, got %q (%q)",
 			UpgradeStatusUpToDate, status, detail)
 	}
-	if !strings.Contains(detail, "0.66.1") {
-		t.Errorf("the detail should name the target image (0.66.1) so the divergence is legible, got %q", detail)
-	}
-	// (e) attention: `up_to_date` is by definition NOT in the attention set, so the reuse
-	// worker no longer inflates the nav-badge count. The summary endpoint counts through
-	// exactly this InUpgradeAttentionSet, so pinning the classification pins the count.
-	if InUpgradeAttentionSet(status) {
-		t.Errorf("issue #738: the reuse worker (%q) is still counted for the nav badge; R7.5 must clear it "+
-			"from the attention set", status)
-	}
 }
 
-// (b) control: a `rolling` signal past the INV-5 ceiling falls through R2 to the compare
-// and must stay `outdated` — R7.5 is `settled`-only and must not rescue it.
-func TestR7_5DoesNotFireForRollingPastCeiling_Issue738(t *testing.T) {
-	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
-	anchor := now.Add(-testWindow - time.Minute) // past the ceiling
-	in := UpgradeInput{
-		Reported:  "0.66.0",
-		Kind:      "hosted",
-		CPVersion: "0.66.1",
-		Signal: &RollSignal{
-			Phase: PhaseRolling, ObservedAt: now, UpgradingSince: &anchor,
-			RolledTag: "0.66.1", BlockingReason: "Pulling image",
-		},
-		Now:          now,
-		APIStartedAt: now.Add(-24 * time.Hour),
-	}
-	status, detail := ClassifyUpgrade(in, ceilingParams())
-	if status == UpgradeStatusUpToDate {
-		t.Fatalf("issue #738: a `rolling` worker past the ceiling must NOT be cleared by R7.5 (settled-only); got %q", status)
-	}
-	if status != UpgradeStatusOutdated {
-		t.Errorf("want %q for a past-ceiling `rolling` worker, got %q (%q)", UpgradeStatusOutdated, status, detail)
-	}
-}
-
-// (b) control: a `stuck` signal is R1 (`upgrade_failed`) and must never be softened to
-// `up_to_date` by R7.5.
-func TestR7_5DoesNotFireForStuckSignal_Issue738(t *testing.T) {
-	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
-	anchor := now.Add(-time.Minute)
-	in := UpgradeInput{
-		Reported:  "0.66.0",
-		Kind:      "hosted",
-		CPVersion: "0.66.1",
-		Signal: &RollSignal{
-			Phase: PhaseStuck, ObservedAt: now, UpgradingSince: &anchor,
-			RolledTag: "0.66.1", BlockingContainer: "seed-nix", BlockingReason: "CrashLoopBackOff",
-		},
-		Now:          now,
-		APIStartedAt: now.Add(-24 * time.Hour),
-	}
-	status, _ := ClassifyUpgrade(in, ceilingParams())
-	if status == UpgradeStatusUpToDate {
-		t.Fatalf("issue #738: a `stuck` worker must stay an alert, never `up_to_date`; got %q", status)
-	}
-	if status != UpgradeStatusUpgradeFailed {
-		t.Errorf("want %q (R1) for a fresh `stuck` signal, got %q", UpgradeStatusUpgradeFailed, status)
-	}
-}
-
-// (b) control: a hosted worker with NO fresh controller signal past the api-start grace
-// classifies by version compare alone — `outdated`. R7.5 needs a fresh `settled`
-// observation to fire and there is none. Covers both the nil-signal and stale-signal
-// shapes.
-func TestR7_5RequiresFreshSettledSignal_Issue738(t *testing.T) {
-	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
-
-	// nil signal, past the hosted roll grace.
-	nilSig := UpgradeInput{
-		Reported: "0.66.0", Kind: "hosted", CPVersion: "0.66.1", Signal: nil,
-		Now: now, APIStartedAt: now.Add(-24 * time.Hour),
-	}
-	if status, _ := ClassifyUpgrade(nilSig, ceilingParams()); status != UpgradeStatusOutdated {
-		t.Errorf("no signal + past the grace ⇒ %q, got %q. R7.5 must not fire without a fresh settled signal",
-			UpgradeStatusOutdated, status)
-	}
-
-	// A `settled` signal that is STALE (observed outside the TTL): freshness gates R7.5,
-	// so it must not clear the worker.
-	anchor := now.Add(-time.Minute)
-	settledAt := now.Add(-time.Hour)
-	staleSig := UpgradeInput{
-		Reported: "0.66.0", Kind: "hosted", CPVersion: "0.66.1",
-		Signal: &RollSignal{
-			Phase: PhaseSettled, ObservedAt: now.Add(-10 * time.Minute), // outside the 60s TTL
-			UpgradingSince: &anchor, RolledTag: "0.66.1", PhaseSince: &settledAt,
-		},
-		Now: now, APIStartedAt: now.Add(-24 * time.Hour),
-	}
-	if status, _ := ClassifyUpgrade(staleSig, ceilingParams()); status != UpgradeStatusOutdated {
-		t.Errorf("a STALE settled signal must not clear the worker; want %q, got %q", UpgradeStatusOutdated, status)
-	}
-}
-
-// (c) fallback unchanged: an EXTERNAL worker genuinely behind stays `outdated` even with a
-// fresh `settled` signal — every controller row (R7.5 included) is hosted-only, because
-// nothing upgrades an external worker for its owner.
-func TestR7_5DoesNotFireForExternalWorker_Issue738(t *testing.T) {
-	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
-	in := hostedSettledInput(now, "0.66.0", "0.66.1", time.Hour)
-	in.Kind = "external"
-	if status, _ := ClassifyUpgrade(in, ceilingParams()); status != UpgradeStatusOutdated {
-		t.Errorf("issue #738: R7.5 must be hosted-only; an external worker behind its target stays %q, got %q",
-			UpgradeStatusOutdated, status)
-	}
-}
-
-// (c) fallback unchanged: a `dev` control plane disables version comparison fleet-wide
-// (R4 ⇒ `unknown`), and R7.5 only ever softens `outdated`, so it can never override
-// `unknown`. Even with a fresh `settled` signal the worker stays `unknown`.
-func TestR7_5DoesNotOverrideUnknownOnDevControlPlane_Issue738(t *testing.T) {
+// A `dev` control plane disables version comparison fleet-wide (R4 ⇒ `unknown`). Even
+// with a fresh `settled` signal carrying no rolled tag, the worker stays `unknown` and
+// does not badge the nav item.
+func TestDevControlPlaneStaysUnknownWithAFreshSettledSignal(t *testing.T) {
 	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
 	anchor := now.Add(-time.Minute)
 	settledAt := now.Add(-time.Hour)
@@ -844,7 +746,7 @@ func TestR7_5DoesNotOverrideUnknownOnDevControlPlane_Issue738(t *testing.T) {
 	}
 	status, _ := ClassifyUpgrade(in, ceilingParams())
 	if status != UpgradeStatusUnknown {
-		t.Fatalf("issue #738: a `dev` control plane must stay %q; R7.5 must never override unknown, got %q",
+		t.Fatalf("a `dev` control plane must stay %q even with a fresh settled signal, got %q",
 			UpgradeStatusUnknown, status)
 	}
 	if InUpgradeAttentionSet(status) {
@@ -852,15 +754,12 @@ func TestR7_5DoesNotOverrideUnknownOnDevControlPlane_Issue738(t *testing.T) {
 	}
 }
 
-// (d) ordering vs R3. SAME versions, differing ONLY in how long ago the pod became Ready:
-//   - Ready recently (within RegisterConvergenceGrace): R3 wins ⇒ `upgrading` (awaiting
-//     re-registration), NOT R7.5.
-//   - Ready long ago (past the grace): R3 falls through and R7.5 clears it ⇒ `up_to_date`,
-//     NOT `outdated`.
-//
-// R7.5 sits BELOW R3 exactly so a still-converging roll reads `upgrading` rather than
-// prematurely `up_to_date`.
-func TestR7_5OrdersBelowR3_Issue738(t *testing.T) {
+// R3 vs the version compare. SAME versions, differing ONLY in how long ago the pod
+// became Ready:
+//   - Ready recently (within RegisterConvergenceGrace): R3 ⇒ `upgrading` (awaiting
+//     re-registration).
+//   - Ready long ago (past the grace): R3 falls through to the compare ⇒ `outdated`.
+func TestSettledBehindWorkerR3ThenOutdated(t *testing.T) {
 	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
 
 	// Ready just now — inside the 1s register grace of ceilingParams(): R3 fires.
@@ -870,49 +769,10 @@ func TestR7_5OrdersBelowR3_Issue738(t *testing.T) {
 			"got %q (%q)", UpgradeStatusUpgrading, status, detail)
 	}
 
-	// Ready an hour ago — past the grace: R3 falls through, R7.5 clears it.
+	// Ready an hour ago — past the grace: R3 falls through to the version compare.
 	old := hostedSettledInput(now, "0.66.0+g4a5c0f4", "0.66.1", time.Hour)
-	if status, detail := ClassifyUpgrade(old, ceilingParams()); status != UpgradeStatusUpToDate {
-		t.Errorf("past the register grace the same worker must read %q (R7.5), not outdated, got %q (%q)",
-			UpgradeStatusUpToDate, status, detail)
-	}
-}
-
-// (b) control / the narrowing guard: R7.5 fires only when the RolledTag is PARSEABLE, so
-// `settled` provably means "on the resolved target" (target == RolledTag). When the pinned
-// tag is a non-semver string (e.g. "nightly"), the controller reports `settled` but with an
-// UNPARSEABLE RolledTag, so the classifier's target falls back to CPVersion and `settled`
-// no longer confirms the worker is on that fallback coordinate. A genuinely-behind worker on
-// a stale non-semver pin must therefore STILL surface attention (`outdated`), never be
-// falsely cleared. This is the adversarial repro that made the verbatim (guard-less) R7.5
-// too broad; the semver.IsValid(RolledTag) conjunct closes it.
-func TestR7_5DoesNotFireWhenRolledTagUnparseable_Issue738(t *testing.T) {
-	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
-	settledLongAgo := now.Add(-time.Hour) // past R3's grace
-	anchor := now.Add(-time.Minute)
-	in := UpgradeInput{
-		Reported:  "0.11.0", // genuinely below the CPVersion fallback target 0.11.7
-		Kind:      "hosted",
-		CPVersion: "0.11.7",
-		// No valid pin; the controller renders a non-semver tag and reports settled on it.
-		PinnedWorkerVersion: "nightly",
-		Signal: &RollSignal{
-			Phase:          PhaseSettled,
-			ObservedAt:     now, // fresh
-			UpgradingSince: &anchor,
-			RolledTag:      "nightly", // unparseable ⇒ target falls back to CPVersion 0.11.7
-			PhaseSince:     &settledLongAgo,
-		},
-		Now:          now,
-		APIStartedAt: now.Add(-24 * time.Hour),
-	}
-	status, detail, target := ClassifyUpgradeWithTarget(in, ceilingParams())
-	if target != "0.11.7" {
-		t.Errorf("an unparseable RolledTag must fall the target back to CPVersion 0.11.7, got %q", target)
-	}
-	if status != UpgradeStatusOutdated {
-		t.Fatalf("issue #738: a genuinely-behind worker settled on an UNPARSEABLE pinned tag must stay %q "+
-			"(settled proves nothing about the CPVersion fallback), got %q (%q). R7.5's semver.IsValid guard "+
-			"exists precisely to keep this real drift visible.", UpgradeStatusOutdated, status, detail)
+	if status, detail := ClassifyUpgrade(old, ceilingParams()); status != UpgradeStatusOutdated {
+		t.Errorf("past the register grace the same worker must read %q, got %q (%q)",
+			UpgradeStatusOutdated, status, detail)
 	}
 }

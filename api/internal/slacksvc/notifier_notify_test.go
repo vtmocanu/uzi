@@ -2,14 +2,17 @@ package slacksvc
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // The generic notification DM path (PRD #46 M2): PublishNotification →
@@ -269,5 +272,58 @@ func TestPublishNotificationNeverBlocks(t *testing.T) {
 	// return (dropping the overflow) rather than block.
 	for i := 0; i < notifierQueue+10; i++ {
 		n.PublishNotification(uuid.New(), notifysvc.SlackRender{Title: "t", Body: "b"})
+	}
+}
+
+// TestQueuedCredentialAlertRecheckedAtDispatch: a credential-specific alert carries its
+// PRD #1732 D13 fence through the queue, and handleNotify re-reads the credential just
+// before posting. An alert enqueued while the token was enabled is dropped when, by the
+// time the drain reaches it, the token was disabled, or disabled and re-enabled (a new
+// revision), or deleted, or the read fails. Still-current delivers.
+func TestQueuedCredentialAlertRecheckedAtDispatch(t *testing.T) {
+	user, secret := uuid.New(), uuid.New()
+	fence := &notifysvc.CredentialFence{SecretID: secret, Kind: store.KindAnthropicToken, EnablementRev: 3}
+	enabled := store.GetSecretEnablementRow{ID: secret, Kind: store.KindAnthropicToken, EnablementRev: 3}
+	cases := []struct {
+		name     string
+		atPost   *store.GetSecretEnablementRow
+		err      error
+		wantPost bool
+	}{
+		{name: "still current", atPost: &enabled, wantPost: true},
+		{name: "disabled while queued", atPost: &store.GetSecretEnablementRow{ID: secret, Kind: store.KindAnthropicToken, EnablementRev: 4, DisabledAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}}},
+		{name: "disabled and re-enabled while queued", atPost: &store.GetSecretEnablementRow{ID: secret, Kind: store.KindAnthropicToken, EnablementRev: 5}},
+		{name: "deleted while queued"},
+		{name: "re-check fails", err: errors.New("db down")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Enqueued while the credential was current.
+			fs := &fakeNotifStore{delivery: linked("U123"), secret: &enabled}
+			fp := &fakePoster{}
+			n := NewNotifier(fs, fp, fixedBase, nil)
+			n.PublishNotification(user, notifysvc.SlackRender{Title: "7-DAY RATE LIMIT RESET EARLY", Credential: fence})
+
+			// The enablement changes before the drain dispatches it.
+			fs.secret, fs.secretErr = tc.atPost, tc.err
+			n.handleNotify(context.Background(), <-n.notifyCh)
+
+			if got := len(fp.blocks) == 1; got != tc.wantPost {
+				t.Fatalf("posted=%v (%d blocks), want posted=%v", got, len(fp.blocks), tc.wantPost)
+			}
+			if len(fs.secretAsked) != 1 || fs.secretAsked[0] != (store.GetSecretEnablementParams{ID: secret, UserID: user}) {
+				t.Fatalf("re-check = %+v, want one owner-scoped read of %s for %s", fs.secretAsked, secret, user)
+			}
+		})
+	}
+
+	// An unfenced notification never reads a credential and posts as before.
+	fs := &fakeNotifStore{delivery: linked("U123")}
+	fp := &fakePoster{}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.PublishNotification(user, notifysvc.SlackRender{Title: "judge review ready"})
+	n.handleNotify(context.Background(), <-n.notifyCh)
+	if len(fp.blocks) != 1 || len(fs.secretAsked) != 0 {
+		t.Fatalf("unfenced: blocks=%d re-checks=%d, want 1 post and no credential read", len(fp.blocks), len(fs.secretAsked))
 	}
 }

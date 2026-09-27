@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger, recordingLogger } from "./helpers.js";
+import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache, RunnerCloneMaterializationError, WIP_PARK_COMMIT_PREFIX, materializeEnv, type RunnerClone } from "../src/git.js";
 
 // issue #1769 m1 — a Codex (sandboxed) run's runner clone is made SELF-CONTAINED at seed:
@@ -69,7 +69,7 @@ function refsUnder(clone: string, prefix: string): string {
 function worker(name: string, logger = nullLogger()): GitCache {
   const dataDir = path.join(fx.dataDir, name);
   fs.mkdirSync(dataDir, { recursive: true });
-  return new GitCache(dataDir, logger);
+  return new GitCache(dataDir, logger, undefined, testGitCacheOptions());
 }
 
 /** Move the worker bare out of the way, so any object still borrowed from it is unreadable. */

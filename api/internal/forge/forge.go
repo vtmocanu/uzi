@@ -895,6 +895,20 @@ type Forge interface {
 	// require the response to name the requested branch. A 404 returns ErrRefNotFound; a
 	// head that is not a 40-char lowercase hex id is an error. Errors are PAT-redacted.
 	BranchHead(ctx context.Context, projectID int64, branch string) (string, error)
+	// RefHead returns the 40-hex commit id a FULL ref name (for example
+	// refs/uzi-checkpoints/agent/issue-7) currently points at (issue #1751 M2), the head a
+	// live predecessor settle proves against when the successor published to its forge
+	// checkpoint ref rather than a branch. The ref must start with "refs/" and be a
+	// well-formed git ref name (no "..", "//", "@{", control character, space or any of
+	// ~ ^ : ? * [ \); anything else is an error with no request. GitHub: GET
+	// /repos/{o}/{r}/git/ref/{ref without "refs/"} (object.sha of a commit object, the
+	// echoed `ref` must equal the requested ref); GitLab: GET
+	// /projects/:id/repository/commits/{url-escaped ref} (id); Forgejo: GET
+	// /repos/{o}/{r}/git/refs/{ref without "refs/"} (the entry whose `ref` equals the
+	// requested ref exactly, object.sha of a commit object). Every driver refuses redirects
+	// like BranchHead. A 404 returns ErrRefNotFound; a head that is not a 40-char lowercase
+	// hex id, or an answer naming another ref, is an error. Errors are PAT-redacted.
+	RefHead(ctx context.Context, projectID int64, ref string) (string, error)
 	// CompareAncestry answers "is candidate an ancestor of, or equal to, head" using the
 	// forge's own compare API (issue #1582 M1). Both arguments must be 40-char
 	// lowercase hex commit ids (never ref names); anything else is AncestryUnknown with

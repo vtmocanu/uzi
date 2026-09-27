@@ -66,6 +66,10 @@ type NotifierStore interface {
 	// park cycle (PRD #1247 M9, D14). handleLimitResume uses it to name the new token in the
 	// ▶️ Resumed DM; no row (pgx.ErrNoRows) = no switch this cycle, so the DM is unchanged.
 	GetLatestCredentialSwitchSince(ctx context.Context, arg store.GetLatestCredentialSwitchSinceParams) ([]byte, error)
+	// GetSecretEnablement re-reads a fenced notification's credential immediately before
+	// its DM is posted (PRD #1732 D13), so an alert queued before a disable is dropped at
+	// dispatch. Owner-scoped: another user's id reads as no row.
+	GetSecretEnablement(ctx context.Context, arg store.GetSecretEnablementParams) (store.GetSecretEnablementRow, error)
 }
 
 // Poster is the outbound Slack surface the notifier drives: open a DM channel and
@@ -197,6 +201,9 @@ type notifyEvent struct {
 	linkLabel string
 	emoji     string
 	facts     []string
+	// credential is the PRD #1732 D13 fence of a credential-specific alert; nil for
+	// every other notification. handleNotify re-checks it just before posting.
+	credential *notifysvc.CredentialFence
 }
 
 // healthEvent is a run-health flag change (PRD #47 M4). nudge is set only when the
@@ -239,7 +246,7 @@ func NewNotifier(s NotifierStore, poster Poster, baseURL func(context.Context) (
 // already persisted).
 func (n *Notifier) PublishNotification(userID uuid.UUID, r notifysvc.SlackRender) {
 	select {
-	case n.notifyCh <- notifyEvent{userID: userID, title: r.Title, body: r.Body, link: r.Link, linkLabel: r.LinkLabel, emoji: r.Emoji, facts: r.Facts}:
+	case n.notifyCh <- notifyEvent{userID: userID, title: r.Title, body: r.Body, link: r.Link, linkLabel: r.LinkLabel, emoji: r.Emoji, facts: r.Facts, credential: r.Credential}:
 	default:
 		n.logger.Warn("slack: notifier queue full, dropping notification", "user", userID.String())
 	}

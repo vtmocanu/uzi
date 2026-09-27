@@ -28,6 +28,17 @@ type judgeBindStore struct {
 
 	secrets map[uuid.UUID]uuid.UUID // secret id → owner
 	labels  map[string]uuid.UUID    // "owner|label" → secret id
+	// disabled marks a secret the owner has disabled (PRD #1732 D5).
+	disabled map[uuid.UUID]bool
+	// disableAfterReads, when > 0, disables every secret once that many ciphertext reads
+	// were served: a disable committing between an unlocked read and the write.
+	disableAfterReads int
+	reads             int
+
+	// enabledCalled / enabledArg record the Judge opt-in, which a PUT naming a binding
+	// writes through the service in the binding's transaction (PRD #1732 D5).
+	enabledCalled bool
+	enabledArg    store.SetUserJudgeEnabledParams
 
 	setCalled bool
 	setArg    store.SetUserJudgeAnthropicBindingParams
@@ -52,7 +63,15 @@ func (j *judgeBindStore) GetUserSecretCiphertextByID(_ context.Context, arg stor
 	if !ok || owner != arg.UserID {
 		return store.GetUserSecretCiphertextByIDRow{}, pgx.ErrNoRows
 	}
-	return store.GetUserSecretCiphertextByIDRow{UserID: owner, Kind: store.KindAnthropicToken}, nil
+	disabled := j.disabled[arg.ID] || (j.disableAfterReads > 0 && j.reads >= j.disableAfterReads)
+	j.reads++
+	return store.GetUserSecretCiphertextByIDRow{UserID: owner, Kind: store.KindAnthropicToken, Disabled: disabled}, nil
+}
+
+func (j *judgeBindStore) SetUserJudgeEnabled(_ context.Context, arg store.SetUserJudgeEnabledParams) (store.User, error) {
+	j.enabledCalled = true
+	j.enabledArg = arg
+	return store.User{ID: arg.ID, JudgeEnabled: arg.JudgeEnabled}, nil
 }
 
 func (j *judgeBindStore) SetUserJudgeAnthropicBinding(_ context.Context, arg store.SetUserJudgeAnthropicBindingParams) (store.User, error) {

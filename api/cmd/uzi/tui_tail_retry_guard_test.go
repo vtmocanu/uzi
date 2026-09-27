@@ -43,7 +43,7 @@ func TestTUIDetailTailRetryIsGuardedInFlight(t *testing.T) {
 	m = next.(tuiModel)
 	next, _ = m.Update(detailPageMsg{runID: runID, kind: pageTail, err: errFake("tail boom")})
 	m = next.(tuiModel)
-	next, _ = m.Update(streamReadyMsg{runID: runID, err: errFake("stream down")})
+	next, _ = m.Update(streamReadyMsg{gen: m.detail.gen, runID: runID, err: errFake("stream down")})
 	m = next.(tuiModel)
 	if m.detail.highSeq != 0 || m.detail.pageErr == nil || !m.detail.polling || m.detail.tailInFlight {
 		t.Fatalf("setup: want the stuck state with no tail in flight; got highSeq=%d pageErr=%v polling=%v tailInFlight=%v",

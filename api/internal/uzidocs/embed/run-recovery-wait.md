@@ -162,15 +162,78 @@ cancelled and re-created.
   stay in ON THE FLOOR and read `~ codex wait`, like any other
   self-resolving recovery park.
 
+## Vault locked
+
+A `recovery_wait` park can also come from your own vault: a Codex
+subscription or api\_key credential refresh or release reached a locked
+owner vault. The api only answers this after the request was authorized and
+authority still held on a recheck, so it is a typed refusal, not a generic
+failure.
+
+Rather than fail the run, uzi parks it. It confirms the run is still
+running, brings its Codex processes to a stop without touching the
+credential, then makes a verified capture of the work done so far,
+publishing it credential-free when it can. It keeps custody of your source
+and does not open the merge request while the vault stays locked.
+
+Unlike the Codex-account hold above, this park **does** resume on a timer:
+it takes the same capped backoff as an empty-turn park
+(`RUN_RECOVERY_PARK_BASE` up to `RUN_RECOVERY_MAX_PARK`), with no lifetime
+cap, rather than waiting on an external signal. Unlocking the vault does
+not promote the run early — it still waits for that timer. Once the timer
+promotes it back to `queued`, a still-locked vault means claiming it idles;
+you'll see it queued with **your vault is locked, so this run can't start**
+until the vault is actually unlocked. After that, it is re-claimed and
+resumes where it left off — the resume costs at least one model turn before
+finalize opens the merge request.
+
+The direct case — the vault locks right after the provider exchange, and the
+worker gets the answer — is covered by this park too: it is still answered
+`vault_locked` and parked like any other case above. Sealing after the
+exchange quarantines the account either way, to hold the refreshed login
+until the vault unlocks, whether or not the worker ever hears back. A vault
+that locks while sealing after the provider exchange, when the worker does
+not receive the reply (a dropped connection between the api's answer and the
+worker learning it), still fails the run: the worker sees a plain transport
+error, not a typed `vault_locked` answer, so it blocks the boundary and fails
+as before. A retry would not help either, because the quarantined account
+refuses the same operation at authorization. This is tracked separately; see
+[issue #1770](https://github.com/vtmocanu/uzi/issues/1770).
+
+Because the account is quarantined in the directly covered case too, a
+resumed claim that arrives before the recovery sweep promotes the refreshed
+login may briefly show the Codex-account hold ("reconciling") before it
+resumes.
+
+### Where you'll see the vault park
+
+- The run page's recovery panel, reading **waiting for vault unlock** with
+  the next retry time. The web run list shows only a generic recovery wait
+  status.
+- `uzi run get <id>` — a `VAULT` row with the owner-neutral park sentence
+  and its next retry time.
+- `uzi run list` / `uzi admin runs` — the STATUS cell appends `(waiting for
+  vault unlock)`, with no retry time.
+- `uzi tui` — this park stays in ON THE FLOOR and reads `~ vault wait`, like
+  any other self-resolving recovery park; it also counts toward the board's
+  vault-locked indicator alongside runs that are queued and blocked on the
+  same lock. Selecting the run shows the park and its next retry time on
+  the row's second line and in the run detail, shortened to fit the
+  terminal width.
+- The repo board's run badge carries no vault-specific tooltip; check the
+  run page for the detail above.
+
 ## Other waiting states
 
 - `recovery_wait`: a positively-empty SDK turn or a transient provider error
   persisted through bounded retries, the forge was unreachable at clone/fetch
-  (see [Forge unreachable at clone](#forge-unreachable-at-clone) above), or
-  the Codex subscription account is unavailable (see
-  [Codex account unavailable](#codex-account-unavailable) above). The server
-  retries automatically after a backoff, except the Codex account hold,
-  which has no timer and instead resumes when the account does.
+  (see [Forge unreachable at clone](#forge-unreachable-at-clone) above), a
+  Codex credential refresh or release found the owner's vault locked (see
+  [Vault locked](#vault-locked) above), or the Codex subscription account is
+  unavailable (see [Codex account unavailable](#codex-account-unavailable)
+  above). The server retries automatically after a backoff, except the
+  Codex account hold, which has no timer and instead resumes when the
+  account does.
 - `limit_wait`: a usage-limit window must reset. See
   [Paused on a usage limit](run-limit-wait.md).
 - `pool_wait`: no token is available in the selected pool. It needs an

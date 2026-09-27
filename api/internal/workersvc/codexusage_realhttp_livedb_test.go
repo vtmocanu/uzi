@@ -111,6 +111,7 @@ func codexPersistReading(t *testing.T, env codexTestEnv, userID, accountID uuid.
 		ObservedGeneration:         reading.ObservedGeneration,
 		ObservedCredentialRevision: reading.ObservedCredentialRevision,
 		AttemptStatus:              "ok",
+		EnablementSig:              codexEnablementSig(t, env, userID, accountID),
 	})
 	if err != nil {
 		t.Fatalf("upsert reading: %v", err)
@@ -311,6 +312,7 @@ func TestCollectCodexAccountUsageRealHTTPEndToEndLiveDB(t *testing.T) {
 			AttemptError:               "transient usage read failure",
 			ObservedGeneration:         0,
 			ObservedCredentialRevision: 0,
+			EnablementSig:              codexEnablementSig(t, env, fx.userID, fx.accountID),
 		})
 		if ferr != nil || n != 1 {
 			t.Fatalf("record failure: n=%d err=%v", n, ferr)

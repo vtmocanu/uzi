@@ -210,6 +210,30 @@ func TestUserHasAutoEligibleAnthropicTokenLiveDB(t *testing.T) {
 	} else if !has {
 		t.Errorf("UserHasAutoEligibleAnthropicToken = false with an opted-in token, want true")
 	}
+
+	// PRD #1732 D8: disabling the only pooled token empties the effective pool (a new worker
+	// must not default to auto), while the row keeps its opt-in, so re-enabling restores it.
+	if _, err := q.SetSecretEnablement(ctx, store.SetSecretEnablementParams{ID: tok.ID, UserID: user, Enabled: false}); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if has, err := q.UserHasAutoEligibleAnthropicToken(ctx, user); err != nil {
+		t.Fatalf("query (disabled): %v", err)
+	} else if has {
+		t.Errorf("UserHasAutoEligibleAnthropicToken = true with the only pooled token disabled, want false")
+	}
+	if row, err := q.GetSecretEnablement(ctx, store.GetSecretEnablementParams{ID: tok.ID, UserID: user}); err != nil {
+		t.Fatalf("read disabled token: %v", err)
+	} else if !row.AutoEligible {
+		t.Errorf("disable cleared auto_eligible; want the opt-in kept for re-enable")
+	}
+	if _, err := q.SetSecretEnablement(ctx, store.SetSecretEnablementParams{ID: tok.ID, UserID: user, Enabled: true}); err != nil {
+		t.Fatalf("re-enable: %v", err)
+	}
+	if has, err := q.UserHasAutoEligibleAnthropicToken(ctx, user); err != nil {
+		t.Fatalf("query (re-enabled): %v", err)
+	} else if !has {
+		t.Errorf("UserHasAutoEligibleAnthropicToken = false after re-enabling the pooled token, want true")
+	}
 }
 
 // TestCreateEphemeralHostedWorkerPersistsBindModeLiveDB proves the caller-supplied

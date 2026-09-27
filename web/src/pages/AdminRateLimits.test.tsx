@@ -114,7 +114,7 @@ describe("AdminRateLimits", () => {
     // Per-state badges (mockup frame C).
     expect(screen.getByText("5h nearly out")).toBeTruthy();
     expect(screen.getByText("🔒 vault locked")).toBeTruthy();
-    expect(screen.getByText("no token")).toBeTruthy();
+    expect(screen.getByText("no enabled token")).toBeTruthy();
     expect(screen.getByText("no reading yet")).toBeTruthy();
     expect(screen.getAllByText("Live")).toHaveLength(2); // vlad + radu (warn stays Live)
   });

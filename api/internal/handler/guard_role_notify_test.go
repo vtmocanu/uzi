@@ -206,3 +206,9 @@ func TestCreateRunInputApproveExcludingGuardRoleNotifies(t *testing.T) {
 		}
 	})
 }
+
+// GetSecretEnablement satisfies notifysvc.Store's credential re-check (PRD #1732 D13),
+// which only the early-reset alert calls; the guard-role path never reaches it.
+func (s *countingNotifStore) GetSecretEnablement(context.Context, store.GetSecretEnablementParams) (store.GetSecretEnablementRow, error) {
+	return store.GetSecretEnablementRow{}, pgx.ErrNoRows
+}

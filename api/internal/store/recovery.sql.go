@@ -367,7 +367,12 @@ SELECT
         THEN (SELECT count(*) FROM runs r
                 WHERE r.user_id = $1::uuid
                   AND r.status = 'queued'
-                  AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework'))
+                  AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+                  AND NOT (r.claim_generation >= 1
+                           AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
+                                         WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
+                           AND (SELECT count(*) FROM recovery_custody_holds oh2
+                                  WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < $2::int))
         ELSE 0
      END)::bigint AS blocked_runs
 `
@@ -390,7 +395,12 @@ type GetCustodyAggregateForOwnerRow struct {
 // the owner is AT/OVER the limit — so it is 0 unless open_holds >= @custody_hold_limit (and a
 // non-positive @custody_hold_limit DISABLES the gate exactly like the claim path, yielding 0).
 // The code-publishing kinds match ClaimRun's custody-hold CTE (issue/ci_fix/self_improve/prompt/
-// task/mr_rework). Both columns are cast ::bigint so sqlc types them as int64, never interface{}.
+// task/mr_rework). Issue #1751 / ADR-1751: a CONTINUATION-EXEMPT queued run (claim_generation >= 1
+// AND its own owner-scoped open-hold count at least 1 and below @custody_hold_limit, the per-run
+// bound that stops a never-started sweep loop) is NOT blocked — ClaimRun admits it at/over the
+// cap — so blocked_runs excludes it with the SAME expression ClaimRun and
+// GetCustodyAdmissionForRun use (parity: the aggregate, the pill and the claim agree).
+// Both columns are cast ::bigint so sqlc types them as int64, never interface{}.
 // Every column is table-qualified and @user_id carries an explicit ::uuid cast: this is a
 // top-level SELECT with no FROM, so sqlc's param-type inference cannot pick a single relation
 // for an untyped @user_id when both recovery_custody_holds and runs expose a user_id column
@@ -403,7 +413,7 @@ func (q *Queries) GetCustodyAggregateForOwner(ctx context.Context, arg GetCustod
 }
 
 const getCustodyHoldForSettle = `-- name: GetCustodyHoldForSettle :one
-SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch FROM recovery_custody_holds
+SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target FROM recovery_custody_holds
 WHERE id = $1 AND run_id = $2
 `
 
@@ -441,6 +451,7 @@ func (q *Queries) GetCustodyHoldForSettle(ctx context.Context, arg GetCustodyHol
 		&i.ReleaseFinalHeadSha,
 		&i.ReleaseSuccessorGeneration,
 		&i.ReleaseBranch,
+		&i.ReleaseTarget,
 	)
 	return i, err
 }
@@ -944,7 +955,7 @@ func (q *Queries) ListOwnersWithClearedCustodyEpisode(ctx context.Context, custo
 }
 
 const listReleasableCustodyHolds = `-- name: ListReleasableCustodyHolds :many
-SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at, h.release_evidence, h.release_pushed_sha, h.release_source_sha, h.release_adopted_sha, h.release_final_head_sha, h.release_successor_generation, h.release_branch,
+SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at, h.release_evidence, h.release_pushed_sha, h.release_source_sha, h.release_adopted_sha, h.release_final_head_sha, h.release_successor_generation, h.release_branch, h.release_target,
     CASE
         WHEN EXISTS (SELECT 1 FROM runs r
                        WHERE r.id = h.run_id
@@ -987,6 +998,7 @@ type ListReleasableCustodyHoldsRow struct {
 	ReleaseFinalHeadSha        pgtype.Text        `json:"release_final_head_sha"`
 	ReleaseSuccessorGeneration pgtype.Int8        `json:"release_successor_generation"`
 	ReleaseBranch              pgtype.Text        `json:"release_branch"`
+	ReleaseTarget              pgtype.Text        `json:"release_target"`
 	Reason                     string             `json:"reason"`
 }
 
@@ -1056,6 +1068,7 @@ func (q *Queries) ListReleasableCustodyHolds(ctx context.Context) ([]ListReleasa
 			&i.ReleaseFinalHeadSha,
 			&i.ReleaseSuccessorGeneration,
 			&i.ReleaseBranch,
+			&i.ReleaseTarget,
 			&i.Reason,
 		); err != nil {
 			return nil, err
@@ -1337,6 +1350,141 @@ func (q *Queries) ReleasePredecessorCustodyHoldByAncestry(ctx context.Context, a
 		arg.PredecessorGeneration,
 		arg.WorkerID,
 		arg.CompletedSince,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const releasePredecessorCustodyHoldByLiveAncestry = `-- name: ReleasePredecessorCustodyHoldByLiveAncestry :execrows
+WITH cutoff AS (
+    SELECT COALESCE(
+        (SELECT min(s.created_at) FROM recovery_custody_holds s
+         WHERE s.run_id = $9 AND s.generation = $5::bigint),
+        (SELECT r.claimed_at FROM runs r WHERE r.id = $9),
+        'infinity'::timestamptz
+    ) AS at
+)
+UPDATE recovery_custody_holds h
+SET state = 'released',
+    live_worker_id = NULL,
+    live_run_id = NULL,
+    release_evidence = 'live_ancestry',
+    released_at = now(),
+    updated_at = now(),
+    release_pushed_sha = $1::text,
+    release_source_sha = $2::text,
+    release_adopted_sha = $3::text,
+    release_final_head_sha = $4::text,
+    release_successor_generation = $5::bigint,
+    release_branch = $6::text,
+    release_target = $7::text
+WHERE h.id = $8
+  AND h.run_id = $9
+  AND h.user_id = $10::uuid
+  AND h.generation = $11::bigint
+  AND h.original_worker_id = $12::uuid
+  AND h.state = 'open'
+  AND h.generation < $5::bigint
+  AND EXISTS (
+      SELECT 1 FROM runs r
+      WHERE r.id = h.run_id
+        AND r.user_id = $10::uuid
+        AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+        AND r.claim_generation = $5::bigint
+        AND r.worker_id = $12::uuid
+        AND r.claim_released_at IS NULL
+        AND r.branch IS NOT DISTINCT FROM $13::text
+        AND ($7::text <> 'checkpoint' OR (
+            r.kind = $14::text
+            AND r.issue_iid IS NOT DISTINCT FROM $15::bigint
+        ))
+      -- FOR SHARE (here and on the successor hold below): PostgreSQL re-checks a concurrent
+      -- change only on the UPDATE's target row, not on rows a subquery merely reads. Locking
+      -- them makes a terminal completion (or a successor-hold settlement) either wait for this
+      -- release, or, when it committed first, re-evaluate these predicates on the committed
+      -- row, so the two can never pass each other.
+      FOR SHARE
+  )
+  AND EXISTS (
+      SELECT 1 FROM recovery_custody_holds s
+      WHERE s.run_id = h.run_id
+        AND s.user_id = $10::uuid
+        AND s.generation = $5::bigint
+        AND s.original_worker_id = $12::uuid
+        AND s.state = 'open'
+      FOR SHARE
+  )
+  AND (
+      NOT EXISTS (SELECT 1 FROM recovery_captures c, cutoff
+                  WHERE c.hold_id = h.id AND c.created_at < cutoff.at)
+      OR EXISTS (SELECT 1 FROM recovery_captures c, cutoff
+                 WHERE c.hold_id = h.id AND c.created_at < cutoff.at AND c.source_sha = $2::text)
+  )
+`
+
+type ReleasePredecessorCustodyHoldByLiveAncestryParams struct {
+	PublishedSha          string      `json:"published_sha"`
+	SourceSha             string      `json:"source_sha"`
+	AdoptedSha            string      `json:"adopted_sha"`
+	FinalHeadSha          string      `json:"final_head_sha"`
+	SuccessorGeneration   int64       `json:"successor_generation"`
+	ProvenBranch          string      `json:"proven_branch"`
+	Target                string      `json:"target"`
+	HoldID                uuid.UUID   `json:"hold_id"`
+	RunID                 uuid.UUID   `json:"run_id"`
+	UserID                uuid.UUID   `json:"user_id"`
+	PredecessorGeneration int64       `json:"predecessor_generation"`
+	WorkerID              uuid.UUID   `json:"worker_id"`
+	CapturedBranch        pgtype.Text `json:"captured_branch"`
+	Kind                  string      `json:"kind"`
+	IssueIid              pgtype.Int8 `json:"issue_iid"`
+}
+
+// Issue #1751 M2: release ONE older-generation hold while the successor generation of the SAME
+// run is still LIVE on the SAME worker, once the api has PROVEN (via the forge, never the
+// worker's opinion) that the published target the successor pushed, the predecessor's
+// journaled source and the tip the successor adopted are each an ancestor of (or equal to) the
+// target's head. The target is the run's forge checkpoint ref (refs/uzi-checkpoints/<branch
+// derived from kind + run id + issue iid>) or the run branch; release_target names which and
+// release_branch the branch name the proof resolved. Every guard is re-asserted in this one
+// statement so a change between the proof and the write moves ZERO rows (the caller then
+// re-reads and answers state_changed):
+//   - the hold: exact id + run + predecessor generation + owner, taken by the caller worker,
+//     still open, and strictly older than the successor generation;
+//   - the run: same owner, still in a LIVE status (the allowlist below), still at the
+//     successor claim generation, still held by the caller worker with its claim unreleased,
+//     on the SAME runs.branch the service captured before it asked the forge (NULL-safe: a
+//     live issue run has none yet) and, for a checkpoint target, the SAME kind and issue iid
+//     the checkpoint branch was derived from;
+//   - the successor generation's OWN hold exists, is still open, and was taken by the same
+//     worker: the durability backstop settle_live.go relies on (a checkpoint ref is deleted on
+//     terminal transitions, so the predecessor's work stays in custody only through that hold;
+//     claim-time hold creation is conditional on recovery capability, so a live claim alone
+//     does not prove it exists);
+//   - the same server-held capture binding as ReleasePredecessorCustodyHoldByAncestry.
+//
+// Stamps release_evidence='live_ancestry' with 00251's six audit columns plus release_target
+// (migration 00255's CHECK refuses a 'live_ancestry' row missing any of them). Nulls both live
+// FKs like every release. Never touches a sibling hold: the WHERE names exactly one id.
+func (q *Queries) ReleasePredecessorCustodyHoldByLiveAncestry(ctx context.Context, arg ReleasePredecessorCustodyHoldByLiveAncestryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releasePredecessorCustodyHoldByLiveAncestry,
+		arg.PublishedSha,
+		arg.SourceSha,
+		arg.AdoptedSha,
+		arg.FinalHeadSha,
+		arg.SuccessorGeneration,
+		arg.ProvenBranch,
+		arg.Target,
+		arg.HoldID,
+		arg.RunID,
+		arg.UserID,
+		arg.PredecessorGeneration,
+		arg.WorkerID,
+		arg.CapturedBranch,
+		arg.Kind,
+		arg.IssueIid,
 	)
 	if err != nil {
 		return 0, err

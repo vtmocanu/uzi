@@ -5,7 +5,7 @@ import { RunRunner } from "../src/runner.js";
 import { buildAgentGuardHook, NESTED_AGENT_TOOL } from "../src/guardrails.js";
 import { FakeApi } from "./fake-api.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { makeClaim, nullLogger } from "./helpers.js";
+import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
 import { WorkerClient } from "../src/client.js";
 import { GitCache } from "../src/git.js";
 import type { Executor, RunContext } from "../src/executor.js";
@@ -25,7 +25,7 @@ describe("operator constraints survive a re-claim (issue #1660)", () => {
     api = new FakeApi(TOKEN);
     const baseUrl = await api.listen();
     fx = makeFixture();
-    git = new GitCache(fx.dataDir, nullLogger());
+    git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
     client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
   });
   afterEach(async () => {

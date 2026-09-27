@@ -13,7 +13,8 @@ Loaded when you touch `web/`. The repo-wide map is the root `CLAUDE.md`.
 task gate:web          # deps-check + lint + deadcode + check-docs + typecheck + test
 task lint:web          # lint slot alone (oxlint; NOT ratcheted)
 task deadcode:web      # dead-code slot alone (knip)
-task test:web          # vitest run
+task test:web          # vitest run (jsdom/node: no layout engine)
+task test:web-browser  # *.browser.test.tsx in headless Chromium; first run: cd web && npx playwright install chromium
 task typecheck:web     # or check-docs:web, individually
 cd web && npx vitest run src/pages/Foo.test.tsx   # single file — no Task target
 cd web && npm run build                 # check-docs + tsc --noEmit + vite build

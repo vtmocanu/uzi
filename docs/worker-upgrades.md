@@ -98,14 +98,11 @@ deferral, so a state added or renamed must be edited in both. This page is your 
 an admin sees the same roll health **across every owner** from Admin → Health
 (`fleet.roll`) — see [Admin health](admin-health.md).
 
-**A reused agent image reads *up to date*, not *outdated*.** Recall the version is baked at
-build time and reported at registration. When a release leaves the worker agent unchanged, the
-build is skipped and the new tag simply re-points at the previous release's image, so that image
-still reports the *older* version even though it is exactly the pinned release. For a hosted
-worker this would otherwise read *outdated* forever: its reported version trails the tag it is
-pinned to. It does not, because the cluster reports the worker's roll as *settled* — a direct
-confirmation that the worker's current pod is running the image its deployment pins — and that
-confirmation is trusted over the baked version string. So a hosted worker the cluster has
-confirmed is on its target image reads *up to date* even when its reported version looks a
-release behind. This applies only to hosted workers with a live controller signal; an external
-worker, which has no such signal, is still read by its version string alone.
+**A settled worker behind its target reads *outdated*.** The version is baked into every agent
+image at build time and reported at registration, and each release builds a fresh image, so a
+hosted worker's reported version is what it actually runs. Just after a roll, a worker whose
+new pod is Ready but has not re-registered yet briefly reads *upgrading*; after that, a worker
+still reporting an older release (for example one cordoned while it finishes work on its previous
+pod) reads *outdated* until it rolls. Agent images published before release 0.84.0 could be re-tagged
+aliases that report an older version than their tag; a worker pinned to one reads *outdated*
+for good, so move the pin to a current release.

@@ -1,10 +1,11 @@
 // Package usagepoller is the per-TOKEN Claude rate-limit poller (PRD #53, repointed
 // from per-user by #104 M5), a self-improve/privcheck-shaped engine: a Boot pass at
 // start plus an interval ticker, 0 disables it, wired in main.go under the background
-// WaitGroup. Each tick it lists every anthropic_token in the factory (one row per
-// TOKEN, not per user), opens each via the shared vault path (secretopen), asks
-// Anthropic (usage endpoint first, ~1-token header probe as fallback — D2), and
-// upserts one gauge row per TOKEN (D4). The token never leaves this process; only
+// WaitGroup. Each tick it lists every ENABLED anthropic_token in the factory (PRD
+// #1732; one row per TOKEN, not per user), opens each via the shared vault path
+// (secretopen), asks Anthropic (usage endpoint first, ~1-token header probe as
+// fallback — D2), and upserts one gauge row per TOKEN (D4), fenced on the token's
+// enablement revision (PRD #1732 D13). The token never leaves this process; only
 // percentages + reset epochs are stored.
 //
 // Failure semantics are copied from cc-statusline (D5): a malformed response never
@@ -30,6 +31,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/anthropic"
+	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -52,41 +54,41 @@ const backoffDuration = 15 * time.Minute
 const pokeBuffer = 64
 
 // Store is the query surface the engine needs. *store.Queries satisfies it.
-// ListAnthropicTokensToPoll returns each TOKEN's id, owner, ciphertext +
-// sealed_with so the tick opens them in one pass (no per-row re-fetch);
-// GetDefaultUserSecretID backs the single-user poke path, which polls the token a
-// save just touched.
+// ListAnthropicTokensToPoll returns each ENABLED TOKEN's id, owner, ciphertext +
+// sealed_with, owner opt-in and enablement revision so the tick opens them in one
+// pass (no per-row re-fetch); GetAnthropicTokenToPoll is its single-token sibling
+// for the poke path, which polls the token a save or re-enable just touched.
 type Store interface {
 	ListAnthropicTokensToPoll(ctx context.Context) ([]store.ListAnthropicTokensToPollRow, error)
-	GetDefaultUserSecretID(ctx context.Context, arg store.GetDefaultUserSecretIDParams) (uuid.UUID, error)
-	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error)
-	UpsertRateLimits(ctx context.Context, arg store.UpsertRateLimitsParams) error
+	GetAnthropicTokenToPoll(ctx context.Context, arg store.GetAnthropicTokenToPollParams) (store.GetAnthropicTokenToPollRow, error)
+	// UpsertRateLimits is the revision-fenced write (PRD #1732 D13): it returns the
+	// rows written, 0 when the token was disabled or its enablement revision moved
+	// on since the poll started.
+	UpsertRateLimits(ctx context.Context, arg store.UpsertRateLimitsParams) (int64, error)
 	// GetRateLimitsForToken reads the prior gauge row for a token before the tick
 	// overwrites it, so early-reset detection can compare the previously reported
 	// 7-day reset against the fresh reading (PRD #1020 M2). Returns pgx.ErrNoRows
-	// when the token has no prior row.
-	GetRateLimitsForToken(ctx context.Context, userSecretID uuid.UUID) (store.AnthropicRateLimit, error)
-	// GetUserByID backs the poke path's owner-setting lookup: the poke listing
-	// carries no settings, so the notify_early_limit_reset opt-in is read here (PRD
-	// #1020 M2). The tick path already has the flag on its row and needs no lookup.
-	GetUserByID(ctx context.Context, id uuid.UUID) (store.User, error)
+	// when the token has no prior row at the poll's enablement revision.
+	GetRateLimitsForToken(ctx context.Context, arg store.GetRateLimitsForTokenParams) (store.AnthropicRateLimit, error)
 }
 
 // EarlyResetNotifier delivers the loud "7-day window reset early" alert (PRD #1020
 // M3). *notifysvc.Service satisfies it. Optional and nil-safe: a nil notifier (the
 // default) means detection still runs and logs but does not deliver.
+//
+// It carries the credential and the enablement revision the fenced write landed at
+// (PRD #1732 D13), so the notifier re-checks that the credential is still that
+// owner's, still enabled and still at that revision before it delivers anything.
 type EarlyResetNotifier interface {
-	NotifyEarlyReset(ctx context.Context, userID uuid.UUID, expected, observed time.Time) (store.Notification, error)
+	NotifyEarlyReset(ctx context.Context, userID, secretID uuid.UUID, enablementRev int64, expected, observed time.Time) (store.Notification, error)
 }
 
 // TokenOpener opens a user's Anthropic token via the vault path (PRD #53 D1/D3).
-// *secretopen.Opener satisfies it in production; tests inject a fake. OpenSealed is
-// the tick path (row already fetched); Open is the poke path (single-user lookup).
-// Both return secretopen.ErrVaultLocked for a locked dek-sealed vault (skip, keep
-// the last reading) and ErrNoSecret/ErrUndecryptable when the token is
-// gone/undecryptable.
+// *secretopen.Opener satisfies it in production; tests inject a fake. Both the
+// tick and the poke open the row they already fetched. It returns
+// secretopen.ErrVaultLocked for a locked dek-sealed vault (skip, keep the last
+// reading) and ErrUndecryptable when the token is undecryptable.
 type TokenOpener interface {
-	Open(ctx context.Context, userID uuid.UUID, kind string) ([]byte, error)
 	OpenSealed(userID uuid.UUID, kind, sealedWith string, ciphertext []byte) ([]byte, error)
 }
 
@@ -113,8 +115,9 @@ type Engine struct {
 	backoff map[uuid.UUID]time.Time
 
 	// poke carries poke-on-token-save signals (D3b): a user whose token was just
-	// saved is polled out-of-band so meters appear in seconds, not a full interval.
-	poke chan uuid.UUID
+	// saved (or re-enabled, PRD #1732 M3a) is polled out-of-band so meters appear
+	// in seconds, not a full interval.
+	poke chan pokeRequest
 
 	// notifier delivers the early-reset alert (PRD #1020 M3). Optional and nil-safe:
 	// nil (the default) means detection runs and logs but does not deliver.
@@ -143,16 +146,31 @@ func New(st Store, opener TokenOpener, client Client, interval time.Duration, pr
 		now:      time.Now,
 		logger:   logger,
 		backoff:  make(map[uuid.UUID]time.Time),
-		poke:     make(chan uuid.UUID, pokeBuffer),
+		poke:     make(chan pokeRequest, pokeBuffer),
 	}
 }
 
 // Poke requests an out-of-band poll for one user (D3b). Non-blocking: it drops the
 // signal when the buffer is full (the next tick covers the user regardless), so a
 // caller — the token-save handler — never blocks on the poller.
-func (e *Engine) Poke(userID uuid.UUID) {
+func (e *Engine) Poke(userID uuid.UUID) { e.send(pokeRequest{userID: userID}) }
+
+// PokeSecret requests an out-of-band poll of ONE named token (PRD #1732 M3a): the
+// re-enable handler's immediate poll, which must reach a token that is not the
+// default. Non-blocking like Poke; a disabled or missing token polls nothing.
+func (e *Engine) PokeSecret(userID, secretID uuid.UUID) {
+	e.send(pokeRequest{userID: userID, secretID: secretID})
+}
+
+// pokeRequest names the token a poke polls: secretID when set, else the owner's
+// default.
+type pokeRequest struct {
+	userID, secretID uuid.UUID
+}
+
+func (e *Engine) send(p pokeRequest) {
 	select {
-	case e.poke <- userID:
+	case e.poke <- p:
 	default:
 	}
 }
@@ -171,17 +189,16 @@ func (e *Engine) Run(ctx context.Context) {
 		case <-ctx.Done():
 			e.logger.Info("usage poller stopped")
 			return
-		case userID := <-e.poke:
-			// A freshly saved token: ignore any prior backoff (the new credential may
-			// work where the old refused) and poll just that user's DEFAULT token via a
-			// single-user lookup-open (the row wasn't part of a bulk list here).
-			//
-			// The poke identity stays the USER, not the token, because the only poker is
-			// the kind-path save (handler/secrets.go), which rotates the default and has
-			// no token id to offer. A poke therefore refreshes one meter, not all of the
-			// user's — the rest are covered by the next tick, which is the same latency
-			// they had before this feature existed.
-			e.pokeUser(ctx, userID)
+		case p := <-e.poke:
+			// An out-of-band poll of ONE token, ignoring any prior backoff (the new or
+			// re-enabled credential may work where the old one refused). Poke (a token
+			// save or default change, handler/secrets.go) names only the user and polls
+			// their enabled DEFAULT token; PokeSecret (a re-enable, PRD #1732 M3a) names
+			// its token, because a re-enabled token is usually not the default. Either
+			// way pokeUser resolves the row first and opens exactly that row. A poke
+			// refreshes one meter, not all of the user's; the rest are covered by the
+			// next tick.
+			e.pokeUser(ctx, p.userID, p.secretID)
 		case <-ticker.C:
 			e.tickAll(ctx)
 		}
@@ -217,7 +234,9 @@ func (e *Engine) tickAll(ctx context.Context) {
 			// ciphertext stays in this goroutine and is never logged. The owner's
 			// notify_early_limit_reset opt-in rides along on the row (JOIN in
 			// ListAnthropicTokensToPoll), so detection needs no second lookup here.
-			e.pollToken(tickCtx, row.UserID, row.ID, false, row.NotifyEarlyLimitReset, func() ([]byte, error) {
+			// The listing holds enabled tokens only (PRD #1732 D1) and carries the
+			// enablement revision this poll is fenced on (D13).
+			e.pollToken(tickCtx, row.UserID, row.ID, row.EnablementRev, false, row.NotifyEarlyLimitReset, func() ([]byte, error) {
 				return e.opener.OpenSealed(row.UserID, store.KindAnthropicToken, row.SealedWith, row.Ciphertext)
 			})
 		}(row)
@@ -225,52 +244,52 @@ func (e *Engine) tickAll(ctx context.Context) {
 	wg.Wait()
 }
 
-// pokeUser polls the token a just-saved credential landed on: the user's DEFAULT,
-// which is what the kind-path save rotates or creates. Resolving the id first is
-// what lets the reading be written against the right gauge row now that the gauge
-// is per-token — writing it against "the user" is no longer expressible.
+// pokeUser polls one token out-of-band: secretID when the poke names it (a
+// re-enable, PRD #1732 M3a), else the user's DEFAULT, which is what the kind-path
+// save rotates or creates. Resolving the row first is what lets the reading be
+// written against the right gauge row now that the gauge is per-token, and the
+// poke opens exactly the row it resolved, so a default that moves between resolve
+// and open cannot put one token's reading on another's gauge.
 //
-// A user with no default (no token at all, or the transient no-default state D12
-// describes) has nothing to poll, which is not an error worth logging on a path
-// triggered by a delete-then-poke race.
-func (e *Engine) pokeUser(ctx context.Context, userID uuid.UUID) {
-	secretID, err := e.store.GetDefaultUserSecretID(ctx, store.GetDefaultUserSecretIDParams{
-		UserID: userID,
-		Kind:   store.KindAnthropicToken,
-	})
+// The resolve returns ENABLED tokens only (PRD #1732 D1), so a poke never polls a
+// disabled token, and it captures the enablement revision the write is fenced on
+// (D13). It also carries the owner's notify_early_limit_reset opt-in: detection
+// MUST run on this path too, because a poke that upserts without detecting
+// advances the stored prev to the moved reset epoch and silently consumes the
+// early-reset edge.
+//
+// A user with no enabled default (no token at all, every token disabled, or the
+// transient no-default state D12 describes) has nothing to poll, which is not an
+// error worth logging on a path triggered by a delete-then-poke race.
+func (e *Engine) pokeUser(ctx context.Context, userID, secretID uuid.UUID) {
+	arg := store.GetAnthropicTokenToPollParams{UserID: userID}
+	if secretID != uuid.Nil {
+		arg.SecretID = pgtype.UUID{Bytes: secretID, Valid: true}
+	}
+	row, err := e.store.GetAnthropicTokenToPoll(ctx, arg)
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
-			e.logger.Error("usage poller: resolve default token for poke", "user", userID.String(), "error", err)
+			e.logger.Error("usage poller: resolve token for poke", "user", userID.String(), "error", err)
 		}
 		return
 	}
-	// The poke listing carries no owner settings, so read the notify_early_limit_reset
-	// opt-in here. Detection MUST run on this path too: if a poke upserts the fresh
-	// reading without detecting, it advances the stored prev to the moved reset epoch
-	// and silently consumes the early-reset edge, losing the alert forever. The single
-	// extra query is affordable on this rare out-of-band path.
-	notifyEarly := false
-	if u, uerr := e.store.GetUserByID(ctx, userID); uerr == nil {
-		notifyEarly = u.NotifyEarlyLimitReset
-	} else {
-		e.logger.Error("usage poller: read owner settings for poke", "user", userID.String(), "error", uerr)
-	}
-	e.pollToken(ctx, userID, secretID, true, notifyEarly, func() ([]byte, error) {
-		return e.opener.Open(ctx, userID, store.KindAnthropicToken)
+	e.pollToken(ctx, row.UserID, row.ID, row.EnablementRev, true, row.NotifyEarlyLimitReset, func() ([]byte, error) {
+		return e.opener.OpenSealed(row.UserID, store.KindAnthropicToken, row.SealedWith, row.Ciphertext)
 	})
 }
 
 // pollToken polls ONE token, applying the D2 (usage-first, probe fallback) and D5
-// (fail-closed / backoff) rules. open resolves that token via the vault path (bulk
-// OpenSealed on the tick, single-user Open on the poke); ignoreBackoff is set on the
-// poke path so a just-saved credential is polled even if the one it replaced was
-// backed off.
+// (fail-closed / backoff) rules. open decrypts that token's already-fetched row via
+// the vault path (OpenSealed on both the tick's listing row and the poke's resolved
+// row); ignoreBackoff is set on the poke path so a just-saved credential is polled even if the one it replaced was
+// backed off. rev is the token's enablement revision captured when the poll
+// started; the write is fenced on it (PRD #1732 D13).
 //
 // Backoff is keyed on the TOKEN since M5, not the user: one refusing credential
 // must not silence its owner's other meters, which is precisely the case this
 // feature exists to support (a throttled subscription alongside a working console
 // key).
-func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, ignoreBackoff, notifyEarly bool, open func() ([]byte, error)) {
+func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, rev int64, ignoreBackoff, notifyEarly bool, open func() ([]byte, error)) {
 	if ignoreBackoff {
 		e.clearBackoff(secretID)
 	} else if e.inBackoff(secretID) {
@@ -284,8 +303,8 @@ func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, igno
 			// D3: locked dek-sealed vault — skip, keep the last reading (marked stale
 			// server-side later). No backoff: the block clears on the next unlock.
 			return
-		case errors.Is(err, secretopen.ErrNoSecret), errors.Is(err, secretopen.ErrUndecryptable):
-			// Token vanished or is undecryptable mid-tick — skip, no backoff.
+		case errors.Is(err, secretopen.ErrUndecryptable):
+			// The fetched row is undecryptable — skip, no backoff.
 			return
 		default:
 			e.logger.Error("usage poller: open token", "user", userID.String(), "error", err)
@@ -296,7 +315,7 @@ func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, igno
 
 	reading, err := e.client.Usage(ctx, token)
 	if err == nil {
-		e.observe(ctx, userID, secretID, notifyEarly, reading)
+		e.observe(ctx, userID, secretID, rev, notifyEarly, reading)
 		e.clearBackoff(secretID)
 		return
 	}
@@ -319,7 +338,7 @@ func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, igno
 	}
 	preading, perr := e.client.ProbeHeaders(ctx, token)
 	if perr == nil {
-		e.observe(ctx, userID, secretID, notifyEarly, preading)
+		e.observe(ctx, userID, secretID, rev, notifyEarly, preading)
 		e.clearBackoff(secretID)
 		return
 	}
@@ -358,17 +377,24 @@ const pctResetCeil = 1
 //
 // Ordering is at-most-once (D7): read prev, decide, upsert next FIRST, then notify.
 // A notify error is logged, not fatal, and never before the write.
-func (e *Engine) observe(ctx context.Context, userID, secretID uuid.UUID, notifyEarly bool, next anthropic.Reading) {
+//
+// Both the prev read and the write are pinned to rev, the enablement revision the
+// poll started at (PRD #1732 D13): a prev from an earlier revision is no basis, and
+// a write the fence refused (the token was disabled, or disabled and re-enabled,
+// while the poll was in flight) notifies nothing.
+func (e *Engine) observe(ctx context.Context, userID, secretID uuid.UUID, rev int64, notifyEarly bool, next anthropic.Reading) {
 	if !notifyEarly {
 		// Opt-out (or the default): upsert as today, no read, no fire. The write
 		// result is irrelevant here (nothing downstream depends on it), so ignore it.
-		_ = e.upsert(ctx, userID, secretID, next)
+		_, _ = e.upsert(ctx, userID, secretID, rev, next)
 		return
 	}
 
 	// Read prev BEFORE the upsert overwrites it. A missing row (ErrNoRows) or a read
 	// failure means no comparison basis → no fire, but the write still proceeds.
-	prev, err := e.store.GetRateLimitsForToken(ctx, secretID)
+	prev, err := e.store.GetRateLimitsForToken(ctx, store.GetRateLimitsForTokenParams{
+		UserSecretID: secretID, EnablementRev: rev,
+	})
 	hasPrev := err == nil
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		e.logger.Error("usage poller: read prior gauge for early-reset", "secret", secretID.String(), "error", err)
@@ -381,8 +407,11 @@ func (e *Engine) observe(ctx context.Context, userID, secretID uuid.UUID, notify
 	// SC5: a failed write leaves prev at the OLD epoch, so the moved-epoch edge is not
 	// consumed and the next tick re-evaluates it. Notifying anyway would then re-fire
 	// on every tick until the write finally succeeds, breaking the at-most-once
-	// guarantee — so a failed upsert stays silent.
-	if err := e.upsert(ctx, userID, secretID, next); err != nil {
+	// guarantee — so a failed upsert stays silent. A write the D13 fence refused
+	// (0 rows) is silent for the stronger reason: the credential was disabled, or
+	// moved to a new revision, after this poll started, so the reading is not its
+	// owner's current state and must alert nothing.
+	if written, err := e.upsert(ctx, userID, secretID, rev, next); err != nil || !written {
 		return
 	}
 
@@ -396,7 +425,15 @@ func (e *Engine) observe(ctx context.Context, userID, secretID uuid.UUID, notify
 			"user", userID.String(), "secret", secretID.String())
 		return
 	}
-	if _, nerr := e.notifier.NotifyEarlyReset(ctx, userID, expected, now); nerr != nil {
+	if _, nerr := e.notifier.NotifyEarlyReset(ctx, userID, secretID, rev, expected, now); nerr != nil {
+		if errors.Is(nerr, notifysvc.ErrCredentialNotCurrent) {
+			// The notifier's own re-check refused the alert: the token was disabled or
+			// moved to a new revision between the fenced write and delivery (PRD #1732
+			// D13). An expected race, not a fault.
+			e.logger.Info("usage poller: early reset alert dropped (credential no longer current)",
+				"user", userID.String(), "secret", secretID.String())
+			return
+		}
 		e.logger.Error("usage poller: notify early reset", "user", userID.String(), "error", nerr)
 	}
 }
@@ -447,9 +484,11 @@ func earlyResetFires(prev store.AnthropicRateLimit, hasPrev bool, next anthropic
 }
 
 // upsert overwrites ONE TOKEN's gauge row (PRD #53 D4, repointed by #104 M5).
-// synced_at is stamped now.
-func (e *Engine) upsert(ctx context.Context, userID, secretID uuid.UUID, r anthropic.Reading) error {
-	if err := e.store.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+// synced_at is stamped now. It reports whether the row was written: false with a
+// nil error means the D13 fence refused it (PRD #1732), because the token is
+// disabled or its enablement revision is no longer rev.
+func (e *Engine) upsert(ctx context.Context, userID, secretID uuid.UUID, rev int64, r anthropic.Reading) (bool, error) {
+	n, err := e.store.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 		UserSecretID:     secretID,
 		UserID:           userID,
 		FiveHourPct:      pgInt2(r.FiveHour.Pct),
@@ -458,12 +497,14 @@ func (e *Engine) upsert(ctx context.Context, userID, secretID uuid.UUID, r anthr
 		SevenDayResetsAt: pgconv.TimePtr(r.SevenDay.ResetsAt),
 		Source:           pgconv.Text(r.Source),
 		SyncedAt:         pgconv.Time(e.now().UTC()),
-	}); err != nil {
+		EnablementRev:    rev,
+	})
+	if err != nil {
 		// The token id is safe to log — it is a row identifier, never the credential.
 		e.logger.Error("usage poller: upsert", "user", userID.String(), "secret", secretID.String(), "error", err)
-		return err
+		return false, err
 	}
-	return nil
+	return n > 0, nil
 }
 
 // The backoff map is keyed by SECRET id since M5 (it was user id under PRD #53's

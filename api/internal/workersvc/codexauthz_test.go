@@ -3,8 +3,11 @@ package workersvc
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // TestMintCodexCapabilityRoundTrip proves a minted capability's stored hash matches
@@ -268,4 +271,47 @@ func TestClaimCodexSecretsShape(t *testing.T) {
 			t.Fatal("subscription claim without a verified account id marshaled successfully")
 		}
 	})
+}
+
+// TestEvalCodexReleasePredicateQuarantineCheckedLast pins "the quarantine check runs LAST" in
+// evalCodexReleasePredicate (issue #1766). CoordinatedCodexRefresh's vault-locked recheck
+// tolerates ErrCodexAccountQuarantined alone, which is sound only while reaching that check
+// proves every earlier check held. So with the account quarantined AND any earlier check
+// failing, the earlier check's sentinel must win; a reorder that moved the quarantine check up
+// would answer ErrCodexAccountQuarantined and let a caller that lost authority be told
+// vault_locked.
+func TestEvalCodexReleasePredicateQuarantineCheckedLast(t *testing.T) {
+	quarantined := func(t *testing.T) codexReleaseInputs {
+		in := heldReleasableInputs(t)
+		in.status = "running"
+		in.coordState, in.coordStateValid = codexCoordQuarantined, true
+		return in
+	}
+	if err := evalCodexReleasePredicate(quarantined(t)); !errors.Is(err, ErrCodexAccountQuarantined) {
+		t.Fatalf("baseline: err = %v, want ErrCodexAccountQuarantined (every earlier check holds)", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(in *codexReleaseInputs)
+		want   error
+	}{
+		{"kind/mode mismatch", func(in *codexReleaseInputs) { in.boundKind = store.KindOpenAIAPIKey }, ErrCodexKindModeMismatch},
+		{"not actively claimed", func(in *codexReleaseInputs) { in.status = "queued" }, ErrCodexRunNotActivelyClaimed},
+		{"material revision stale", func(in *codexReleaseInputs) { in.currentMaterialRev++ }, ErrCodexMaterialRevisionStale},
+		{"tuple mismatch", func(in *codexReleaseInputs) { in.currentWorkspaceAccountID = "ws-other" }, ErrCodexAccountTupleMismatch},
+		{"account key unfrozen", func(in *codexReleaseInputs) { in.frozenAccountKeyValid = false }, ErrCodexAccountKeyUnfrozen},
+		{"credential revision stale", func(in *codexReleaseInputs) { in.currentCredentialRev++ }, ErrCodexAccountRevisionStale},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := quarantined(t)
+			tc.mutate(&in)
+			err := evalCodexReleasePredicate(in)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v (the earlier check must win over quarantine)", err, tc.want)
+			}
+			if errors.Is(err, ErrCodexAccountQuarantined) {
+				t.Fatalf("err = %v: the quarantine check ran before an earlier failing check", err)
+			}
+		})
+	}
 }

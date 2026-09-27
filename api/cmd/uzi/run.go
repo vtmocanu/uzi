@@ -103,9 +103,15 @@ const statusPaused = "paused"
 // convention the status constants above follow. hold_reason is unconstrained text on the
 // wire, so a renderer that branches on these still passes an UNRECOGNISED value through the
 // terminal-safe path rather than trusting it.
+//
+// holdCredentialDisabled (PRD #1732 D14) is the server-owned park of a run that needs one
+// specific credential its owner has disabled. It resumes by itself once that credential is
+// enabled again (or, where the CLI and web offer a per-run override, once the owner points
+// the run at another token); uzi never substitutes a credential on its own (D2).
 const (
-	holdBudgetExhausted   = "budget_exhausted"
-	holdCompletionBlocked = "completion_blocked"
+	holdBudgetExhausted    = "budget_exhausted"
+	holdCompletionBlocked  = "completion_blocked"
+	holdCredentialDisabled = "credential_disabled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
 )
 
 // logsPollInterval is how often `uzi run logs --follow` re-polls

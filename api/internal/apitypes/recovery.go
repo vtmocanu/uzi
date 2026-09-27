@@ -213,6 +213,38 @@ const (
 	RecoverySettleBranchMissing = "branch_missing"
 )
 
+// RecoveryLiveSettleRequest is the worker's request that the api settle ONE older-generation
+// custody hold while the SUCCESSOR generation of the same run is still LIVE on the same worker
+// (issue #1751 M2), POSTed to /api/worker/runs/{id}/recovery-holds/{holdID}/settle-live.
+// PublishedSha is the head the successor generation published to Target; SourceSha is the
+// PREDECESSOR generation's journaled source; AdoptedSha is the tip the successor adopted.
+// Target names the published target the api reads the head of: RecoverySettleTargetCheckpoint
+// (the run's forge checkpoint ref, refs/uzi-checkpoints/<branch the api derives from the run
+// row>) or RecoverySettleTargetBranch (the run's branch). The api proves, through the forge
+// alone, that each SHA is an ancestor of (or equal to) that head. Like RecoverySettleRequest
+// there is NO field for the worker's own verdict (strict decode: an extra field is a 400), and
+// every SHA must be a 40-char lowercase hex commit id. The answer is a RecoverySettleResponse.
+//
+// Choosing Target: RecoverySettleTargetBranch applies to task runs, the one kind whose
+// runs.branch is set at creation. issue and self_improve runs use
+// RecoverySettleTargetCheckpoint. Every other kind (prompt, ci_fix, mr_rework, ...) leaves
+// runs.branch NULL while live and has no checkpoint target, so it answers retained/not_eligible
+// while live and settles on completion instead.
+type RecoveryLiveSettleRequest struct {
+	PredecessorGeneration int64  `json:"predecessor_generation"`
+	SuccessorGeneration   int64  `json:"successor_generation"`
+	PublishedSha          string `json:"published_sha"`
+	SourceSha             string `json:"source_sha"`
+	AdoptedSha            string `json:"adopted_sha"`
+	Target                string `json:"target"`
+}
+
+// The published targets a live settle may be proven against (issue #1751 M2).
+const (
+	RecoverySettleTargetCheckpoint = "checkpoint"
+	RecoverySettleTargetBranch     = "branch"
+)
+
 // RecoverySettleResponse is the api's answer to a RecoverySettleRequest (issue #1582 M1).
 // FinalHeadSha is the branch head the api proved against, set only on a release.
 type RecoverySettleResponse struct {

@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -191,5 +192,56 @@ func TestHasLivePollerIsFalseForARecoveryParkedRun(t *testing.T) {
 	}
 	if live {
 		t.Fatal("a recovery-parked run reported a live poller; a cancel enqueued here would sit unconsumed until the promotion pass")
+	}
+}
+
+// TestSetStateRecoveryWaitVaultLockedPersistsCause (issue #1766 M2): a worker reporting
+// {recovery_wait, recovery_cause:"vault_locked"} is ACCEPTED (not the unknown-cause 400) and
+// takes the ordinary park, which is the ONE cause that park persists; every other ordinary
+// cause (empty_turn, provider_outage, absent) stays NULL (PRD #1392 D9). A garbage cause is
+// still the 400 before any state SQL.
+func TestSetStateRecoveryWaitVaultLockedPersistsCause(t *testing.T) {
+	for name, tc := range map[string]struct {
+		cause *string
+		want  string // "" = stored NULL
+	}{
+		"vault_locked persists": {strPtr("vault_locked"), "vault_locked"},
+		"empty_turn stays NULL": {strPtr("empty_turn"), ""},
+		"provider_outage NULL":  {strPtr("provider_outage"), ""},
+		"absent stays NULL":     {nil, ""},
+	} {
+		run := recoveryRun(0)
+		fs, svc, wkr := limitParkFixture(t, run)
+		fs.setRecoveryWaitRows = 1
+
+		_, applied, err := svc.SetState(context.Background(), wkr, run.ID,
+			StateRequest{State: "recovery_wait", RecoveryCause: tc.cause})
+		if err != nil {
+			t.Fatalf("%s: SetState: %v", name, err)
+		}
+		if !applied || fs.setRecoveryWait == nil {
+			t.Fatalf("%s: the report did not park through SetRunRecoveryWait (applied=%v)", name, applied)
+		}
+		got := fs.setRecoveryWait.RecoveryCause
+		if tc.want == "" {
+			if got.Valid {
+				t.Fatalf("%s: recovery_wait_cause = %q, want NULL (D9)", name, got.String)
+			}
+			continue
+		}
+		if !got.Valid || got.String != tc.want {
+			t.Fatalf("%s: recovery_wait_cause = %+v, want %q", name, got, tc.want)
+		}
+	}
+
+	run := recoveryRun(0)
+	fs, svc, wkr := limitParkFixture(t, run)
+	_, applied, err := svc.SetState(context.Background(), wkr, run.ID,
+		StateRequest{State: "recovery_wait", RecoveryCause: strPtr("vault_unlocked_maybe")})
+	if !errors.Is(err, ErrInvalidState) || applied {
+		t.Fatalf("garbage cause: err=%v applied=%v, want ErrInvalidState and not applied", err, applied)
+	}
+	if fs.setRecoveryWait != nil {
+		t.Fatal("a garbage cause reached SetRunRecoveryWait")
 	}
 }

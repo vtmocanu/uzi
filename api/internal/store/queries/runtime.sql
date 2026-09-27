@@ -314,6 +314,14 @@ UPDATE workers SET
     stats_disk_nix_total_bytes  = sqlc.narg('stats_disk_nix_total_bytes'),
     stats_disk_data_bytes       = sqlc.narg('stats_disk_data_bytes'),
     stats_disk_data_total_bytes = sqlc.narg('stats_disk_data_total_bytes'),
+    -- docker-in-docker volume sample (issue #1759): bytes AND inodes, same
+    -- write-every-tick-incl-NULL discipline; display-only, NEVER a disk_pressure input
+    -- (diskOverThreshold reads nix/data only, and @disk_over_threshold below never
+    -- sees these columns).
+    stats_disk_dind_bytes        = sqlc.narg('stats_disk_dind_bytes'),
+    stats_disk_dind_total_bytes  = sqlc.narg('stats_disk_dind_total_bytes'),
+    stats_disk_dind_inodes       = sqlc.narg('stats_disk_dind_inodes'),
+    stats_disk_dind_total_inodes = sqlc.narg('stats_disk_dind_total_inodes'),
     -- Disk-pressure debounce streak (PRD #837 M4). Increment (bounded to 100 so a
     -- perpetually-full worker can't overflow the counter) when THIS tick's sample is
     -- over threshold, else reset to 0 — so a single under-threshold (or absent) sample
@@ -596,6 +604,24 @@ FROM run_messages
 WHERE run_id = @run_id::uuid
   AND kind IN ('plan', 'plan_revising');
 
+-- name: LatestPersistedPlanFrameAtForRun :one
+-- The created_at of the run's latest `plan` frame whose payload plan_md EQUALS @plan_md, the
+-- persisted runs.plan_md the claim carries (issue #1604): when the persisted, unapproved plan was
+-- last shown. The worker emits and flushes the plan frame BEFORE the awaiting_approval report
+-- persists plan_md, so a declined report or a worker that died in between leaves a newer frame
+-- for a plan that was never persisted; matching on plan_md keeps that frame from moving this
+-- instant. kind = 'plan' only; a plan_revising frame is not a plan. NULL when no plan frame
+-- matches (the caller omits the field, never falling back to the latest frame). The comparison
+-- is exact and needs no NUL normalisation: neither side can hold a NUL (Postgres text rejects
+-- 0x00 and jsonb rejects \u0000; the worker's batcher and sanitizePayloadJSON strip it from the
+-- frame, stripNULParam from plan_md). The worker discards a replayed gate verdict created
+-- strictly before this instant (it was sent against an earlier plan).
+SELECT MAX(created_at)::timestamptz AS at
+FROM run_messages
+WHERE run_id = @run_id::uuid
+  AND kind = 'plan'
+  AND payload->>'plan_md' = @plan_md::text;
+
 -- name: LatestToolUseForRuns :many
 -- The newest tool_use frame per run for a page of runs (PRD #1064 D3, current_activity):
 -- DISTINCT ON (run_id) with ORDER BY run_id, seq DESC yields exactly one row per run —
@@ -819,7 +845,31 @@ WITH target AS (
       -- non-positive @custody_hold_limit DISABLES the gate (limit "<= 0" means unlimited),
       -- so it never blocks an ordinary claim; the production caller always passes the
       -- configured positive default (workersvc.custodyHoldLimit, 8).
+      --
+      -- Issue #1751 / ADR-1751: CONTINUATION EXEMPTION. A requeued run that was already
+      -- claimed before (claim_generation >= 1) AND still holds its OWN open custody hold
+      -- (same owner, same run_id) is exempt from the custody-count admission check: it is
+      -- continuing work the owner already has in custody, not new work. The continuation may
+      -- create another generation hold (the hold CTE below opens one per claim), but is exempt
+      -- from custody-count admission. A fresh run (generation 0), or one whose own holds are
+      -- all released/discarded, still faces the cap. The #1318 overshoot under concurrent
+      -- claims still stands: this is an admission gate, not a strict ceiling.
+      --
+      -- The exemption is BOUNDED PER RUN: it holds only while the run's OWN open-hold count
+      -- is below @custody_hold_limit (and at least one). Without the bound a claimed run that never
+      -- reports running is swept back to queued by SweepClaimedNeverStarted (no requeue_count
+      -- bump, no hold release), reclaims under the exemption, opens another generation hold,
+      -- and loops forever; the owner cap used to stop that loop. Once a single run holds
+      -- @custody_hold_limit open holds of its own, it faces the owner cap like new work. The
+      -- same exemption expression is mirrored by GetCustodyAdmissionForRun (health reason) and
+      -- GetCustodyAggregateForOwner.blocked_runs, so the pill, the aggregate and the claim
+      -- agree.
       AND (@custody_hold_limit::int <= 0
+           OR (r.claim_generation >= 1
+               AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
+                             WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
+               AND (SELECT count(*) FROM recovery_custody_holds oh2
+                      WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < @custody_hold_limit::int)
            OR (SELECT count(*) FROM recovery_custody_holds ch
                  WHERE ch.user_id = @user_id AND ch.state = 'open') < @custody_hold_limit::int)
       -- PRD #1226 M1 (D2): the NON-BYPASSABLE completion-protocol claim clause. An
@@ -1185,12 +1235,26 @@ UPDATE runs SET
 WHERE id = (SELECT id FROM target)
 RETURNING *;
 
--- name: CountUnresolvedCustodyHoldsForOwner :one
--- PRD #1296 M1 (D2/D4): the owner's UNRESOLVED (state='open') custody-hold count — the
--- same admission signal the ClaimRun predicate blocks on. A later milestone's health
--- resolver reads this to surface a distinct custody-limit queued reason against the SAME
--- decision the claim used, so the pill and the claim never disagree.
-SELECT count(*) FROM recovery_custody_holds WHERE user_id = @user_id AND state = 'open';
+-- name: GetCustodyAdmissionForRun :one
+-- Issue #1751 / ADR-1751: the per-run custody-admission facts the health resolver reads so
+-- its reasonCustodyLimit pill agrees with ClaimRun. open_holds is the owner's UNRESOLVED
+-- (state='open') hold count, the same count ClaimRun's custody clause compares against
+-- @custody_hold_limit; continuation_exempt is ClaimRun's continuation exemption, byte-for-byte
+-- the same expression: the run was claimed before (claim_generation >= 1) AND its OWN open
+-- custody-hold count (owner-scoped) is at least 1 and below @custody_hold_limit. The upper bound
+-- stops a run that the never-started sweep keeps requeueing from opening holds forever (see
+-- ClaimRun). An exempt run is never blocked by the custody cap. A run that does not exist (or
+-- belongs to another owner), or a non-positive limit, yields continuation_exempt = false.
+SELECT
+    (SELECT count(*) FROM recovery_custody_holds h
+        WHERE h.user_id = @user_id::uuid AND h.state = 'open')::bigint AS open_holds,
+    COALESCE((SELECT (r.claim_generation >= 1
+                      AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
+                                    WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
+                      AND (SELECT count(*) FROM recovery_custody_holds oh2
+                             WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < @custody_hold_limit::int)
+                FROM runs r
+                WHERE r.id = @run_id::uuid AND r.user_id = @user_id::uuid), false)::boolean AS continuation_exempt;
 
 -- name: GetRunClaimContext :one
 -- The repo + connection facts the claim payload needs, alongside the run. The
@@ -1219,7 +1283,8 @@ SELECT count(*) FROM recovery_custody_holds WHERE user_id = @user_id AND state =
 -- property of the QUERY PAIR and not of the worker's loop:
 --   * a park is running-only (SetRunLimitWait's positive source guard), and
 --   * a revise round sits at awaiting_approval, which SetRunRunning refuses to
---     leave for 'running' unless a consumed approve_plan exists.
+--     leave for 'running' unless a consumed approve_plan exists (applied, and not
+--     settled as discarded with disposition 'superseded', issue #1604).
 -- So the ordinary multi-round revise flow cannot reach a park at all. The one
 -- surviving residual is the stale round-2 pre-gate report SetRunRunning's comment
 -- already names: if that admits a run to 'running' and it then parks, the resume
@@ -1262,7 +1327,10 @@ SELECT r.checkpoint_tip,
        (EXISTS (SELECT 1 FROM run_user_inputs i
                 WHERE i.run_id = r.id
                   AND i.kind = 'approve_plan'
-                  AND i.applied_at IS NOT NULL))::boolean AS human_plan_approved
+                  AND i.applied_at IS NOT NULL
+                  -- Issue #1604: a discarded (stale) approve is settled with applied_at AND
+                  -- disposition 'superseded' (DiscardRunInputRows); it is not an approval.
+                  AND i.disposition IS DISTINCT FROM 'superseded'))::boolean AS human_plan_approved
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id -- #1688: owner-scoped token
@@ -1406,6 +1474,9 @@ WHERE id = @id AND user_id = @user_id;
 -- consumed approve_plan input exists — i.e. the legitimate post-approval resume
 -- report, which by construction is sent after the worker consumed the verdict. A
 -- stale pre-gate report (no consumed approve_plan yet) leaves the gate intact.
+-- "Consumed" here means APPLIED and not discarded (issue #1604): an approve the worker
+-- discarded as stale is settled by DiscardRunInputRows with disposition 'superseded', and
+-- that row never opens the gate.
 -- claimed→running and running→running are unaffected (the guard only narrows the
 -- awaiting_approval source status); autopilot never enters awaiting_approval.
 -- Accepted residual (out of scope, see specs/ai.md): in a multi-round re-gate a
@@ -1668,7 +1739,11 @@ WHERE runs.id = @id AND worker_id = @worker_id
         SELECT 1 FROM run_user_inputs
         WHERE run_user_inputs.run_id = @id
           AND run_user_inputs.kind = 'approve_plan'
-          AND run_user_inputs.applied_at IS NOT NULL))
+          AND run_user_inputs.applied_at IS NOT NULL
+          -- Issue #1604: an approve the worker discarded as stale is settled (applied_at set,
+          -- disposition 'superseded', DiscardRunInputRows) but never applied, so it must not
+          -- open the plan gate.
+          AND run_user_inputs.disposition IS DISTINCT FROM 'superseded'))
   -- awaiting_input → running is guarded the same way and for the same reason
   -- (PRD #88 M1), as a SECOND, INDEPENDENT clause. Never merge the two into
   -- `status NOT IN (...) OR kind IN (...)`: that would let a consumed `answer`
@@ -2281,9 +2356,13 @@ WHERE id = @id AND user_id = @user_id AND status = 'limit_wait';
 -- terminal transitions).
 --
 -- PRD #1392 M1 (D9): this is the UNTYPED park (empty turn, and #1088's provider park once
--- it adopts recovery_wait). It CLEARS recovery_wait_cause to NULL — a later untyped park on
--- a run that forge-parked earlier must REPLACE the typed cause, not coalesce it, so its
--- surface reads the generic wording and its forge cap counter is not consulted. It does NOT
+-- it adopts recovery_wait). It REPLACES recovery_wait_cause with @recovery_cause, never
+-- coalescing it — a later untyped park on a run that forge-parked earlier must drop the typed
+-- cause, so its surface reads the generic wording and its forge cap counter is not consulted.
+-- Issue #1766 M2: the Go caller (setRecoveryWait) passes a non-NULL recovery_cause ONLY for
+-- 'vault_locked' (the worker's codex refresh/release answered 409 vault_locked: the owner's
+-- vault is locked, so the run waits for an unlock) and NULL for every other reported cause,
+-- so empty_turn/provider_outage still store NULL (D9). The column CHECK is the backstop. It does NOT
 -- touch forge_park_count: that lifetime counter belongs to the forge park alone (fact 7 /
 -- D2), so an empty-turn park neither increments nor resets it (a run keeps its forge-park
 -- lifetime count through a later empty-turn park). The forge park has its own writer,
@@ -2292,7 +2371,7 @@ UPDATE runs SET
     status                    = 'recovery_wait',
     status_since              = now(),
     recovery_wait_count       = recovery_wait_count + 1,
-    recovery_wait_cause       = NULL,
+    recovery_wait_cause       = sqlc.narg('recovery_cause')::text,
     recovery_retry_not_before = @retry_not_before,
     session_id                = COALESCE(sqlc.narg('session_id'), session_id),
     health = 'ok', health_reason = NULL, health_since = NULL,
@@ -2633,6 +2712,7 @@ UPDATE runs SET
     updated_at            = now()
 WHERE id = @id AND user_id = @user_id
   AND status = 'paused'
+  AND hold_reason IS DISTINCT FROM 'credential_disabled'
   -- D6: refuse a completion hold unless the completion decision endpoint opts in.
   AND (hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
   -- D7: refuse a budget_exhausted park with no remaining budget (extend is the way back).
@@ -2883,6 +2963,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: ClearRunMilestonesCompleted :execrows
@@ -2988,6 +3069,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: SetRunCompleted :execrows
@@ -3161,6 +3243,64 @@ WHERE id = @id AND worker_id = @worker_id
   AND (sqlc.narg('claim_generation')::bigint IS NULL
        OR claim_generation = sqlc.narg('claim_generation')::bigint);
 
+-- name: SetRunFailedPlanRejected :one
+-- Issue #1604: the worker's plan_rejected `failed` report. It fails the run exactly as
+-- SetRunFailed does AND settles the run's still-unapplied reject_plan inputs in the SAME
+-- statement, so a pool-bound (generation-less legacy) report is atomic too: a later claim
+-- can never replay a reject for a run that is already failed, and a declined transition
+-- leaves every input untouched. The `failed` CTE MUST stay in lockstep with SetRunFailed:
+-- every SET field and every WHERE guard is copied verbatim from it (only `runs.id` is
+-- table-qualified, which sqlc needs to resolve @id beside run_user_inputs.id). The result counts
+-- TRANSITIONED RUNS (0 or 1), never the settled inputs, so a run whose reject rows an older
+-- worker already APPLIED still reports 1.
+WITH failed AS (
+    UPDATE runs SET
+        status             = 'failed',
+        status_since       = now(),
+        failure_reason     = @failure_reason,
+        -- PRD #69 M7a: the TRUSTED failure class, always set from Go (the worker-reported
+        -- `failed` arm coerces req.fail_origin through the allowlist and defaults a
+        -- classless failure to 'agent_failure'; the limit-opt-out non-park path stamps
+        -- 'rate_limited'). Never derived from failure_reason, which is never parsed.
+        fail_origin        = @fail_origin,
+        -- PRD #377 M1: the agent's secret-scrubbed, size-capped branch diff, preserved on a
+        -- workflow_scope_missing failure so a human can apply the work the bot PAT could not
+        -- push. NULL on every other failed path (only that arm sends a non-nil value).
+        preserved_patch    = @preserved_patch,
+        session_id         = COALESCE(sqlc.narg('session_id'), session_id),
+        move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,
+        finished_at        = now(),
+        -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+        milestones_in_progress = NULL,
+        milestones_agents = NULL,
+        -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+        pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+        credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
+        -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+        health = 'ok', health_reason = NULL, health_since = NULL,
+        updated_at         = now()
+    WHERE runs.id = @id AND worker_id = @worker_id
+      AND status NOT IN ('completed', 'failed', 'cancelled')
+      -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
+      -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
+      -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
+      -- still-held run at that exact generation: a late gen-G report matches 0 rows against a run
+      -- released after G (claim_released_at set) or reclaimed to G+1 (generation moved on), so it
+      -- cannot clobber the reclaiming flight. nil = legacy/outer-lock-fenced callers, unchanged.
+      -- PRD #1497 M1 (D16): claim_released_at IS NULL is a STANDALONE conjunct, so a released claim is
+      -- rejected even for a generation-less (legacy) report; a live claim still honours a NULL generation.
+      AND claim_released_at IS NULL
+      AND (sqlc.narg('claim_generation')::bigint IS NULL
+           OR claim_generation = sqlc.narg('claim_generation')::bigint)
+    RETURNING runs.id AS failed_run_id
+),
+settled AS (
+    UPDATE run_user_inputs SET applied_at = now(), consumed_at = COALESCE(consumed_at, now())
+    WHERE run_id IN (SELECT failed_run_id FROM failed) AND kind = 'reject_plan' AND applied_at IS NULL
+    RETURNING id
+)
+SELECT count(*) FROM failed;
+
 -- name: MarkRunFailedByID :execrows
 -- Service-internal fail (e.g. a claim whose secrets are missing/undecryptable):
 -- the run was just claimed by this worker but cannot run. failed → origin
@@ -3320,6 +3460,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: SupersedeRunByWorker :execrows
@@ -3347,6 +3488,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: FailRunAutoStop :execrows
@@ -5779,7 +5921,8 @@ SELECT id, status, worker_id, claim_generation, claim_released_at, credential_sw
 FROM runs WHERE id = @run_id FOR UPDATE;
 
 -- name: ListInputReceiptRows :many
-SELECT id, kind, body, created_at, consumed_at, consumed_claim_generation, consumed_worker_id, applied_at
+SELECT id, kind, body, created_at, consumed_at, consumed_claim_generation, consumed_worker_id, applied_at,
+       disposition
 FROM run_user_inputs WHERE run_id = @run_id AND id = ANY(@ids::bigint[])
   AND kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
 ORDER BY id ASC;
@@ -5793,6 +5936,21 @@ RETURNING id, kind, body, created_at;
 -- name: ApplyRunInputRows :execrows
 UPDATE run_user_inputs SET applied_at = now()
 WHERE run_id = @run_id AND id = ANY(@ids::bigint[])
+  AND consumed_claim_generation = @claim_generation AND consumed_worker_id = @worker_id
+  AND consumed_at IS NOT NULL AND applied_at IS NULL;
+
+-- name: DiscardRunInputRows :execrows
+-- Issue #1604: settle approve_plan rows the worker DISCARDED as stale (a replayed verdict sent
+-- against an earlier plan) without counting them as approval. A discarded approve is never
+-- APPLIED, so without this it stayed applied_at IS NULL forever, and ListReplayRunInputs'
+-- LIMIT 1000 oldest-first window would fill with them and starve every later cancel,
+-- follow_up, answer or pause. applied_at takes the row off the replay list; disposition
+-- 'superseded' (00162's CHECK already allows it) is what the approval readers
+-- (GetRunClaimContext's human_plan_approved, SetRunRunning's awaiting_approval clause) exclude.
+-- Same claim fence as ApplyRunInputRows, plus kind = 'approve_plan' so no other kind can be
+-- settled this way even if the service check were bypassed.
+UPDATE run_user_inputs SET applied_at = now(), disposition = 'superseded'
+WHERE run_id = @run_id AND id = ANY(@ids::bigint[]) AND kind = 'approve_plan'
   AND consumed_claim_generation = @claim_generation AND consumed_worker_id = @worker_id
   AND consumed_at IS NOT NULL AND applied_at IS NULL;
 

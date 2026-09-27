@@ -1,0 +1,7 @@
+{
+  "_comment": "Issue #1604: the resume-relevant fields of a claim assembled from a persisted run row with an unapproved agent plan and session_id NULL. api/internal/workersvc asserts the live-DB claim assembly produces these fields; agent/test/runner-gate-verdict-interruption.test.ts builds its claim from them. resume_phase is absent: resumePhaseFor returns \"\" for this row.",
+  "plan_md": "# Submitted plan\n- step one: the plan the owner asked to revise",
+  "plan_source": "agent",
+  "plan_approved": false,
+  "session_id": null
+}

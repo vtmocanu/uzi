@@ -20,6 +20,7 @@ import {
   type RunMessage,
   type Worker,
 } from "../lib/api";
+import { useAuth } from "../auth/AuthContext";
 import { mergeRequestUrl } from "../lib/forgeUrls";
 import { errorMessage } from "../lib/apiError";
 import { canToggleWaitOnLimit, formatCountdown, runWindowLabel } from "../lib/limitWait";
@@ -66,6 +67,7 @@ import {
   RunCredentialOverride,
   SwitchTokenAction,
 } from "../components/RunCredentialOverride";
+import { CredentialDisabledPanel, isCredentialDisabledHold } from "../components/CredentialDisabledPanel";
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
 import { formatDuration } from "../components/RunEvent";
 import { RunUsagePanel } from "../components/RunUsage";
@@ -677,7 +679,8 @@ export function MilestoneChecklist({ run, activity = null }: { run: Run; activit
 // completion hold is durable across workers.
 export function CompletionStatePanel({ run }: { run: Run }) {
   const phase = run.completion_phase ?? "";
-  const held = run.hold_reason != null;
+  // PRD #1732: a credential_disabled hold is not a completion state; its own panel covers it.
+  const held = run.hold_reason != null && run.hold_reason !== "credential_disabled";
   if (phase === "" && !held) return null;
   const unmet = run.completion_unmet ?? [];
   const attempts = run.completion_attempts ?? 0;
@@ -1110,7 +1113,14 @@ export function PausedPanel({
   // recovers via the continue-decision path, not a plain resume — so it is excluded
   // here; the informational CompletionStatePanel + the "Completion blocked" StatusPill
   // cover it.
-  if (run.status !== "paused" || run.hold_reason === "completion_blocked") return null;
+  // PRD #1732: a credential_disabled hold is server-parked and resumes on Enable, not on a
+  // plain Resume; CredentialDisabledPanel covers it.
+  if (
+    run.status !== "paused" ||
+    run.hold_reason === "completion_blocked" ||
+    run.hold_reason === "credential_disabled"
+  )
+    return null;
 
   // The pause landed when the run entered the state: status_since (issue #1727), falling back to
   // updated_at only when it is absent/null/unparseable (updated_at moves on unrelated writes such
@@ -1585,6 +1595,11 @@ function codexHoldCopy(
  * PRD #1590 D6: when the cause is `codex_account_unavailable` the panel swaps in the
  * per-action Codex copy from codexHoldCopy instead, with no retry time or park count.
  *
+ * Issue #1766: when the cause is `vault_locked` (a Codex credential refresh or release found
+ * the run owner's vault locked) the panel renders VaultLockedParkBody: waiting for a vault
+ * unlock, with the next retry time from `recovery_retry_not_before`. The run resumes at that
+ * timer-based retry once the vault is unlocked, never the instant of unlock.
+ *
  * A null/other cause keeps the generic transient-interruption copy (issue #1197, widened
  * by issue #1088). The wording is kept consistent with the TUI and `uzi run get`.
  *
@@ -1600,6 +1615,9 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
   // codex_account_unavailable hold gets the Codex copy below. Every other cause (including
   // the null/untyped transient-interruption park, issue #1197/#1088) keeps the generic copy.
   const forgePark = run.recovery_wait_cause === "forge_unreachable";
+  // Issue #1766: a vault_locked park waits for the run owner's vault to be unlocked; it
+  // resumes at its next retry after that, not the instant of unlock.
+  const vaultPark = run.recovery_wait_cause === "vault_locked";
   // PRD #1590 D6: a Codex account hold has its own copy and, unlike the forge park, NO
   // retry time or park count — the hold has no timer, so nothing may count down.
   const codexHold =
@@ -1630,7 +1648,9 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
             ? codexHold.heading
             : forgePark
               ? "Waiting for the forge"
-              : "Recovering and resuming automatically"}
+              : vaultPark
+                ? "Waiting for vault unlock"
+                : "Recovering and resuming automatically"}
         </p>
         {codexHold ? (
           <>
@@ -1659,6 +1679,8 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
               {retryAt ? `Retry at ${retryAt} (${parkLabel}).` : `Attempt ${parkLabel}.`}
             </p>
           </>
+        ) : vaultPark ? (
+          <VaultLockedParkBody retryAt={retryAt} />
         ) : (
           <>
             <p className="mt-0.5 text-xs text-muted">
@@ -1672,10 +1694,43 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
           </>
         )}
         <p className="mt-1.5 text-xs text-muted">
-          Nothing is lost — the run keeps its branch and its history and picks up where it left off.
+          {vaultPark
+            ? "Nothing is lost: the run's work was saved before it parked, and it picks up where it left off."
+            : "Nothing is lost — the run keeps its branch and its history and picks up where it left off."}
         </p>
       </div>
     </div>
+  );
+}
+
+/**
+ * Issue #1766: the body of a `vault_locked` recovery park. The park comes from a Codex
+ * credential refresh or release that found the run OWNER's vault locked, and the run resumes
+ * at its next timer retry (`retryAt`, HH:MM, or null when the server sent no stamp) once that
+ * vault is unlocked.
+ *
+ * The copy is owner-neutral ("the run owner's vault"), like codexHoldCopy's "the run's": an
+ * admin may be reading another owner's run, and the Run DTO does not say who owns it. The
+ * viewer's own vault state (useAuth().vaultUnlocked, the same signal VaultLockedBanner reads)
+ * only decides whether to point at the banner: while the viewer's vault is locked the banner
+ * is on screen, so the panel names it for the case where this is the viewer's run; once it is
+ * unlocked the banner is gone and the panel only says when the run resumes.
+ *
+ * A separate component so useAuth runs only while this park is on screen.
+ */
+function VaultLockedParkBody({ retryAt }: { retryAt: string | null }) {
+  const { vaultUnlocked } = useAuth();
+  return (
+    <>
+      <p className="mt-0.5 text-xs text-muted">
+        {`The run owner's vault was locked when this Codex run needed its credential. Once the vault is unlocked, the run resumes at its next retry${retryAt ? ` (${retryAt})` : ""}.`}
+      </p>
+      {!vaultUnlocked && (
+        <p className="mt-1.5 text-xs text-muted">
+          If this is your run, unlock your vault with the banner at the top of the page.
+        </p>
+      )}
+    </>
   );
 }
 
@@ -1871,6 +1926,14 @@ export function RunView() {
   // worst kind of accessibility bug: the markup looks right". Putting role="status" on
   // the QuestionPanel itself — which mounts with the park — would have been exactly that.
   const [parkAnnounce, setParkAnnounce] = useState("");
+  // PRD #1732: "Enabled X. The run resumes in a moment." after an Enable in the
+  // credential_disabled panel. It rides this same always-mounted region because the panel
+  // unmounts the moment the refetched run is no longer held, taking any region of its own
+  // with it. It outlives the hold's own park key (which clears as the run resumes) and is
+  // dropped when the run parks again.
+  const [resumeAnnounce, setResumeAnnounce] = useState("");
+  // Where focus goes after that Enable: the run's status, which is what just changed.
+  const statusRef = useRef<HTMLSpanElement>(null);
   // PRD #517: BOTH needs-you parks announce, not just awaiting_input — awaiting_followup is
   // classified identically by needsHumanAttention and shows the same loud ring, so a
   // screen-reader user parking into it must get a signal too. A single stable KEY drives
@@ -1910,7 +1973,14 @@ export function RunView() {
               // (codexHoldCopy's `announce`), so each action change is re-announced.
               run.recovery_wait_cause === "codex_account_unavailable"
               ? `codex:${run.codex_account_action ?? ""}`
-              : "recovery_wait"
+              : // Issue #1766: a vault_locked park is not a transient interruption; it
+                // waits on the run owner's vault unlock, so it gets its own stable key and
+                // an owner-neutral sentence (an admin may be reading another owner's run).
+                run.recovery_wait_cause === "vault_locked"
+                ? "vault_locked"
+                : "recovery_wait"
+            : run?.status === "paused" && run.hold_reason === "credential_disabled"
+              ? "credential_disabled"
             : run?.status === "paused"
               ? "paused"
             : "";
@@ -1919,6 +1989,7 @@ export function RunView() {
       setParkAnnounce("");
       return;
     }
+    setResumeAnnounce("");
     setParkAnnounce(
       parkKey === "followup"
         ? "The run is waiting for your next follow-up."
@@ -1926,8 +1997,12 @@ export function RunView() {
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
           : parkKey === "recovery_wait"
             ? "This run paused to recover from a transient interruption and will resume automatically."
+            : parkKey === "vault_locked"
+              ? "This run is waiting for vault unlock. The run owner's vault was locked when this Codex run needed its credential. Once the vault is unlocked, the run resumes at its next retry."
             : parkKey.startsWith("codex:")
               ? codexHoldCopy(parkKey.slice("codex:".length) || null, "").announce
+            : parkKey === "credential_disabled"
+              ? "The run is waiting because a credential it needs is disabled. Enable it and the run resumes automatically."
             : parkKey === "paused"
               ? "The run is paused. Resume it from this page or with the uzi run resume command."
             : "The agent is asking you a question. The run is parked until you answer.",
@@ -2026,7 +2101,11 @@ export function RunView() {
               {/* A stopped run (cancel or stop-shaped failure) reads as a neutral
                   "stopped" pill — StatusPill's default tone — so it stays calm and
                   agrees with the board/RunsList. */}
-              <StatusPill status={pillStatus} />
+              {/* Focus target after a credential Enable (PRD #1732): the held panel that
+                  had focus unmounts, and the status is what changed. */}
+              <span ref={statusRef} tabIndex={-1} className="rounded-md focus-visible:ring-2 focus-visible:ring-brand/60 focus:outline-none">
+                <StatusPill status={pillStatus} />
+              </span>
               {/* PRD #320 M6: the queue-priority pill + the owner's Expedite/undo action.
                   Both are QUEUED-ONLY (the pill self-hides on any other status; the action
                   is wrapped in the status guard) — the server is queued-only too (409). */}
@@ -2068,6 +2147,9 @@ export function RunView() {
                   + the "Completion blocked" StatusPill cover it. */}
               {run.status === "paused" &&
                 run.hold_reason !== "completion_blocked" &&
+                // PRD #1732: a credential_disabled hold resumes on Enable (its panel), and a
+                // plain Resume would only park it again.
+                run.hold_reason !== "credential_disabled" &&
                 (canSteer ? (
                   <Button
                     size="sm"
@@ -2088,7 +2170,11 @@ export function RunView() {
                   a primary control for the owner, inert text for a non-owner, and hidden
                   entirely for a refused lane (task_review / chat / judge / self_improve) or a
                   terminal run (those 409 server-side). It refreshes the run after a switch. */}
-              <SwitchTokenAction run={run} canSteer={canSteer} onSwitched={refreshRun} />
+              {/* A credential_disabled hold offers the switch in its own panel, named for
+                  what it does there ("Run with another token", PRD #1732 D16). */}
+              {!isCredentialDisabledHold(run) && (
+                <SwitchTokenAction run={run} canSteer={canSteer} onSwitched={refreshRun} />
+              )}
               {/* PRD #1190: the pending-pause chip. Shown whenever a request is pending
                   (pause_requested_at set) — including on a run overtaken by an involuntary
                   park, where the intent survives (D6). Info-toned and, unlike the status
@@ -2281,7 +2367,7 @@ export function RunView() {
           effect fires after mount, so the region exists before its content changes even
           on a page load that arrives at an already-parked run. */}
       <div className="sr-only" role="status" aria-live="polite">
-        {parkAnnounce}
+        {resumeAnnounce || parkAnnounce}
       </div>
 
       {error && <Alert message={error} />}
@@ -2348,6 +2434,17 @@ export function RunView() {
       {/* PRD #1190: the paused-run panel. Self-hides on every status but `paused`. Resume
           hits the widened /resume-now (api.resumeRun) then refetches; Stop mirrors the
           limit-wait panel's own Stop (a cancel input). */}
+      {/* PRD #1732 D14: the credential_disabled hold. Self-hides on every other state. */}
+      <CredentialDisabledPanel
+        run={run}
+        canSteer={canSteer}
+        onChanged={refreshRun}
+        onEnabled={(label) => {
+          setResumeAnnounce(`Enabled “${label}”. The run resumes in a moment.`);
+          statusRef.current?.focus();
+        }}
+      />
+
       <PausedPanel
         run={run}
         busy={busy}

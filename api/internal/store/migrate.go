@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
@@ -72,7 +74,30 @@ const HostedProvisionLockClass int32 = 0x757A6877 // "uzhw"
 // RegistrationLockKey's one-bigint space, and this class differs from
 // HostedProvisionLockClass, so none can collide. XACT-scoped: released on commit or
 // rollback, no unlock to forget.
+//
+// The Codex account poll writes (queries/codex_rate_limits.sql) take this same key in
+// SHARED mode, with the class as the literal 1970959211 and the objid derived in SQL, so a
+// change to either half here must be mirrored there;
+// TestCodexFencedWriteTakesSecretMutationLockLiveDB fails when they disagree.
 const SecretMutationLockClass int32 = 0x757A736B // "uzsk"
+
+// SecretMutationLockObjID derives the objid half of the per-user secret mutation lock from
+// a user's uuid, exactly as the hosted-provision lock does: a uuid's leading bytes are
+// random, so two users can collide and serialize for a moment, a contention non-event,
+// never a correctness one.
+func SecretMutationLockObjID(userID uuid.UUID) int32 {
+	return int32(binary.BigEndian.Uint32(userID[:4])) //nolint:gosec // wraparound is fine: a lock key, not a number
+}
+
+// LockSecretMutation takes the per-user secret mutation lock inside db's transaction. It is
+// the one lock order every credential enablement, default, binding and reassignment writer
+// shares with the credential_disabled promoter (PRD #1732 D14): this user lock FIRST, then
+// any run row, then requirement-source and credential rows. Callers must never take it
+// while already holding a run row lock.
+func LockSecretMutation(ctx context.Context, db DBTX, userID uuid.UUID) error {
+	_, err := db.Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)", SecretMutationLockClass, SecretMutationLockObjID(userID))
+	return err
+}
 
 // SettingsMutationLockKey is the fixed key passed to pg_advisory_xact_lock as the
 // first statement of every app_settings write transaction (issue #831). It

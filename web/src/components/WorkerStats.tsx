@@ -8,6 +8,7 @@
 // to 100% regardless of the stored value (the server accepts up to 6400% cpu_pct),
 // and label a process-source sample "worker process only".
 
+import { useId } from "react";
 import { cx } from "./ui";
 import { MeterTrack } from "./Meter";
 import type { Worker } from "../lib/api";
@@ -49,24 +50,57 @@ function pctOf(used: number, limit: number | null): number | null {
   return (used / limit) * 100;
 }
 
-/** The two disk volumes a worker reports (PRD #837), each a used/total byte pair.
- *  A volume is "present" only when BOTH its used and total are non-null — they arrive
- *  as a pair — so a worker can report /nix, /data, both, or neither independently of
- *  the mem sample. Returns each present volume with its used/total pct (total is always
- *  positive when present, so pctOf never falls back to null here). */
-function diskVolumes(w: Worker): { label: string; used: number; total: number; pct: number }[] {
-  const out: { label: string; used: number; total: number; pct: number }[] = [];
-  const pairs: [string, number | null, number | null][] = [
-    ["Disk /nix", w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes],
-    ["Disk /data", w.stats_disk_data_bytes, w.stats_disk_data_total_bytes],
+/** One reported disk volume. `pct` is the bar fill: the bytes ratio, or the inode ratio
+ *  when that is fuller (only the dind volume reports inodes). `inodePct` is set only when
+ *  the ROUNDED inode percent exceeds the rounded bytes percent, i.e. exactly when it
+ *  explains the displayed fill (78.2% bytes / 78.4% inodes is not "78% · inodes 78%"). */
+interface DiskVolume {
+  label: string;
+  hint?: string;
+  used: number;
+  total: number;
+  bytesPct: number;
+  inodePct: number | null;
+  pct: number;
+}
+
+/** The disk volumes a worker reports: /nix and /data (PRD #837), plus the docker-tier
+ *  DinD data root (issue #1759). A volume is "present" only when BOTH its used and total
+ *  bytes are non-null — they arrive as a pair — so a worker can report any subset
+ *  independently of the mem sample. A present volume with a zero (or negative) total has
+ *  no meaningful ratio, so pctOf returns null and the volume is skipped rather than drawn
+ *  as an empty bar. The dind volume also carries an inode pair; a malformed one (either
+ *  side null, or a zero total) is ignored rather than skewing the bar. */
+function diskVolumes(w: Worker): DiskVolume[] {
+  const out: DiskVolume[] = [];
+  const vols: { label: string; hint?: string; used: number | null; total: number | null; inodes?: number | null; totalInodes?: number | null }[] = [
+    { label: "Disk /nix", used: w.stats_disk_nix_bytes, total: w.stats_disk_nix_total_bytes },
+    { label: "Disk /data", used: w.stats_disk_data_bytes, total: w.stats_disk_data_total_bytes },
+    {
+      label: "Disk dind",
+      hint: "docker daemon data (images, layers, containers)",
+      used: w.stats_disk_dind_bytes,
+      total: w.stats_disk_dind_total_bytes,
+      inodes: w.stats_disk_dind_inodes,
+      totalInodes: w.stats_disk_dind_total_inodes,
+    },
   ];
-  for (const [label, used, total] of pairs) {
+  for (const { label, hint, used, total, inodes, totalInodes } of vols) {
     if (used == null || total == null) continue;
-    const pct = pctOf(used, total);
-    if (pct == null) continue;
-    out.push({ label, used, total, pct });
+    const bytesPct = pctOf(used, total);
+    if (bytesPct == null) continue;
+    const rawInodePct = inodes == null ? null : pctOf(inodes, totalInodes ?? null);
+    // Compare what is displayed, not the raw ratios: inodes "dominate" only when they
+    // would read as a higher whole percent than the bytes beside them.
+    const inodePct = rawInodePct != null && Math.round(rawInodePct) > Math.round(bytesPct) ? rawInodePct : null;
+    out.push({ label, hint, used, total, bytesPct, inodePct, pct: inodePct ?? bytesPct });
   }
   return out;
+}
+
+/** " · inodes 98%" when inodes (not bytes) are what fill the bar, else "". */
+function inodeSuffix(d: DiskVolume, sep: string): string {
+  return d.inodePct == null ? "" : `${sep}inodes ${Math.round(d.inodePct)}%`;
 }
 
 /** True once the worker has reported a usable sample. The single source of truth for
@@ -77,20 +111,36 @@ export function hasStats(w: Worker): boolean {
   return w.stats_source != null && w.stats_mem_bytes != null;
 }
 
-function Bar({ label, value, valueText, fillPct }: { label: string; value: string; valueText: string; fillPct: number }) {
+function Bar({ label, hint, value, valueText, fillPct }: { label: string; hint?: string; value: string; valueText: string; fillPct: number }) {
   // The label row; MeterTrack (shared with the PRD #53 rate-limit meters) is the
   // accessible bar itself, keying tone/width/aria-valuenow off one clamped, rounded
   // integer. valueText is read by a screen reader instead of the bare "N percent":
-  // the byte figures for memory, and "no reading yet" for a first-tick CPU.
+  // the byte figures for memory, and "no reading yet" for a first-tick CPU. A hint is a
+  // hover title for sighted users and, via aria-describedby on the bar, a description for
+  // assistive tech (the accessible name stays the bare label).
+  const hintId = useId();
   return (
     <div>
       <div className="flex items-center justify-between text-xs">
         {/* text-muted (not text-faint) so the label clears WCAG AA 4.5:1 at 12px
             (web-ux finding) and matches the value span. */}
-        <span className="text-muted">{label}</span>
+        <span className="text-muted" title={hint}>
+          {label}
+        </span>
         <span className="tabular-nums text-muted">{value}</span>
       </div>
-      <MeterTrack className="mt-1 h-1.5" label={label} fillPct={fillPct} valueText={valueText} />
+      <MeterTrack
+        className="mt-1 h-1.5"
+        label={label}
+        fillPct={fillPct}
+        valueText={valueText}
+        describedBy={hint ? hintId : undefined}
+      />
+      {hint && (
+        <span id={hintId} className="sr-only">
+          {hint}
+        </span>
+      )}
     </div>
   );
 }
@@ -143,8 +193,9 @@ export function WorkerStatGauges({ worker }: { worker: Worker }) {
         <Bar
           key={d.label}
           label={d.label}
-          value={`${formatBytesPair(d.used, d.total)} · ${Math.round(d.pct)}%`}
-          valueText={`${formatBytesPair(d.used, d.total)}, ${Math.round(d.pct)}%`}
+          hint={d.hint}
+          value={`${formatBytesPair(d.used, d.total)} · ${Math.round(d.bytesPct)}%${inodeSuffix(d, " · ")}`}
+          valueText={`${formatBytesPair(d.used, d.total)}, ${Math.round(d.bytesPct)}%${inodeSuffix(d, ", ")}`}
           fillPct={d.pct}
         />
       ))}
@@ -165,8 +216,9 @@ export function WorkerStatLine({ worker }: { worker: Worker }) {
   const mem = worker.stats_mem_bytes!;
   const limit = worker.stats_mem_limit_bytes;
   const memText = limit != null && limit > 0 ? formatBytesPair(mem, limit) : formatBytes(mem);
-  // The fuller of the two reported volumes (highest used/total pct) stands in for disk
-  // on the one-liner; omitted entirely when no volume is reported (no dangling "· disk").
+  // The fullest reported volume (highest fill pct, inode-aware for dind) stands in for
+  // disk on the one-liner; omitted entirely when no volume is reported (no dangling
+  // "· disk"). When inodes are what fill it, say so, or "8/20 GiB" would read as roomy.
   const fullestDisk = diskVolumes(worker).sort((a, b) => b.pct - a.pct)[0];
   return (
     <span
@@ -174,7 +226,13 @@ export function WorkerStatLine({ worker }: { worker: Worker }) {
       title={worker.stats_source === "process" ? "measures the worker process only" : undefined}
     >
       cpu {cpu == null ? "—" : `${Math.round(cpu)}%`} · mem {memText}
-      {fullestDisk && <> · disk {formatBytesPair(fullestDisk.used, fullestDisk.total)}</>}
+      {fullestDisk && (
+        <>
+          {" "}
+          · disk {formatBytesPair(fullestDisk.used, fullestDisk.total)}
+          {fullestDisk.inodePct != null && ` (inodes ${Math.round(fullestDisk.inodePct)}%)`}
+        </>
+      )}
     </span>
   );
 }

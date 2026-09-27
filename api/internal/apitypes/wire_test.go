@@ -631,9 +631,11 @@ func TestPendingJudgeDTOTags(t *testing.T) {
 // TestIncidentalFindingDTOTags pins the PRD #333 M4 backlog-row shape, widened by PRD #1183 M3.
 // disposition_id is ALWAYS present (the id the bulk-dismiss/undo endpoints key on). finding_id,
 // dismiss_reason, set_via, filed_issue_iid, filed_issue_url, resolved_at, evidence_preview and
-// occurrences are all omitempty: a display-only coordinate whose evidence was cascaded away
-// carries no finding_id/evidence_preview/occurrences, an OPEN coordinate carries no
-// filed/resolved fields, and only a dismissed/auto-done coordinate carries a reason/set_via. The
+// occurrences are all omitempty: a coordinate whose evidence was cascaded away carries no
+// finding_id/evidence_preview/occurrences (it cannot be filed or dismissed via the evidence-id
+// routes, but can still be marked done / undone via the disposition-id routes), an OPEN
+// coordinate carries no filed/resolved fields, and only a dismissed/auto-done coordinate carries
+// a reason/set_via. The
 // zero-value pin asserts the always-present key set; the populated pin asserts every optional key
 // surfaces when set.
 func TestIncidentalFindingDTOTags(t *testing.T) {
@@ -741,7 +743,7 @@ func TestSecretDTOTags(t *testing.T) {
 	// field — the pin is here so a future field addition that leaks the secret trips
 	// this test.
 	assertTags(t, "SecretDTO", SecretDTO{},
-		"id", "kind", "label", "is_default",
+		"id", "kind", "label", "is_default", "enabled", "disabled_at",
 		// PRD #111 M2: the auto-selection pool opt-in. A flag the owner set, not a
 		// value — it names no credential and reveals nothing about one.
 		"auto_eligible",
@@ -821,6 +823,11 @@ var workerDTOKeys = []string{
 	// until the worker reports a statfs sample (and re-nulled if it stops). Display-only.
 	"stats_disk_nix_bytes", "stats_disk_nix_total_bytes",
 	"stats_disk_data_bytes", "stats_disk_data_total_bytes",
+	// issue #1759: dind-data volume usage on docker-tier workers, used + total bytes AND
+	// used + total inodes. Null on non-docker workers and until a statfs sample arrives.
+	// Display-only, never a disk_pressure input (that stays nix/data only).
+	"stats_disk_dind_bytes", "stats_disk_dind_total_bytes",
+	"stats_disk_dind_inodes", "stats_disk_dind_total_inodes",
 	// PRD #104 M3: which Anthropic credential this worker's run-lane claims spend.
 	// Both null ⇒ unbound ⇒ the owner's default. The LABEL, never the token value —
 	// this DTO is the shape the web UI and the CLI both read.
@@ -1195,6 +1202,9 @@ func TestRecoveryWorkerRPCTags(t *testing.T) {
 	// ancestry verdict), every field always on the wire.
 	assertTags(t, "RecoverySettleRequest", RecoverySettleRequest{},
 		"predecessor_generation", "successor_generation", "pushed_sha", "source_sha", "adopted_sha")
+	// Issue #1751 M2: the live settle names the published target too; every field on the wire.
+	assertTags(t, "RecoveryLiveSettleRequest", RecoveryLiveSettleRequest{},
+		"predecessor_generation", "successor_generation", "published_sha", "source_sha", "adopted_sha", "target")
 	// reason (retained only) and final_head_sha (released only) are omitempty.
 	assertTags(t, "RecoverySettleResponse", RecoverySettleResponse{}, "run_id", "hold_id", "outcome")
 	assertTags(t, "RecoverySettleResponse(full)",
@@ -1218,6 +1228,19 @@ func TestRecoverySettleReasonValues(t *testing.T) {
 	} {
 		if got != want {
 			t.Errorf("settle wire value = %q, want %q", got, want)
+		}
+	}
+}
+
+// TestRecoverySettleTargetValues pins the live settle target STRINGS (issue #1751 M2): the
+// worker sends them and the api validates against them, so a renamed value is a protocol break.
+func TestRecoverySettleTargetValues(t *testing.T) {
+	for got, want := range map[string]string{
+		RecoverySettleTargetCheckpoint: "checkpoint",
+		RecoverySettleTargetBranch:     "branch",
+	} {
+		if got != want {
+			t.Errorf("settle target wire value = %q, want %q", got, want)
 		}
 	}
 }

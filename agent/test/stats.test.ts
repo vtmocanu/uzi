@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { StatsCollector, type StatfsSample, type StatsCollectorOptions } from "../src/stats.js";
+import { readDindMeterSample } from "../src/dind-meter.js";
 
 // Unit tests over fixture cgroup v2 trees (PRD #49 M1). Each test writes a throwaway
 // /sys/fs/cgroup-shaped dir plus a /proc/self/cgroup file, so the collector's real
@@ -259,5 +260,114 @@ describe("StatsCollector — disk sampling (PRD #837 M1)", () => {
     assert.ok(!("disk_data_bytes" in s));
     // The mem reading is untouched by the disk failure.
     assert.strictEqual(s.mem_bytes, 104857600 - 4194304);
+  });
+});
+
+// issue #1759 M3: the DinD data-root sample (the dind-meter sidecar's statfs line) rides
+// the heartbeat as four disk_dind_* fields, all present from a valid fresh sample or all
+// absent. The meter file is UNTRUSTED, so every malformed/stale/future/inconsistent/
+// overflowing line must leave the fields absent. These drive the REAL reader (real file
+// I/O against a temp file) with an injected clock.
+describe("StatsCollector — DinD data-root sample (issue #1759)", () => {
+  const NOW_MS = 1_700_000_000_000;
+  const EPOCH = NOW_MS / 1000;
+  const DIND_KEYS = ["disk_dind_bytes", "disk_dind_total_bytes", "disk_dind_inodes", "disk_dind_total_inodes"];
+
+  function meterFile(content: string): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-dind-meter-"));
+    tmpdirs.push(dir);
+    const p = path.join(dir, "statfs");
+    fs.writeFileSync(p, content);
+    return p;
+  }
+
+  /** A collector over the process fallback (no cgroup), with the meter read from `p`. */
+  function collectWith(p: string) {
+    const c = new StatsCollector({
+      cgroupRoot: "/nonexistent-cgroup",
+      procCgroupPath: "/nonexistent-proc-cgroup",
+      now: () => 0n,
+      cpuCount: () => 1,
+      statfs: () => ({ bsize: 4096, blocks: 10, bfree: 5, bavail: 5 }),
+      dindMeter: () => readDindMeterSample({ path: p, nowMs: () => NOW_MS }),
+    });
+    const s = c.collect();
+    assert.ok(s, "the heartbeat sample survives whatever the meter file holds");
+    return s;
+  }
+
+  function assertAbsent(content: string, why: string): void {
+    const s = collectWith(meterFile(content));
+    for (const k of DIND_KEYS) assert.ok(!(k in s), `${k} absent: ${why}`);
+  }
+
+  it("attaches all four fields from a valid fresh sample", () => {
+    const s = collectWith(meterFile(`v1 ${EPOCH} 4096 1000 250 500 100\n`));
+    assert.strictEqual(s.disk_dind_bytes, 750 * 4096, "used = (blocks - bfree) * frsize");
+    assert.strictEqual(s.disk_dind_total_bytes, 1000 * 4096, "total = blocks * frsize");
+    assert.strictEqual(s.disk_dind_inodes, 400, "inodes used = files - ffree");
+    assert.strictEqual(s.disk_dind_total_inodes, 500);
+  });
+
+  it("accepts a line without the trailing newline and a sample up to 90s old", () => {
+    const s = collectWith(meterFile(`v1 ${EPOCH - 90} 4096 1000 250 500 100`));
+    assert.strictEqual(s.disk_dind_total_bytes, 4_096_000);
+  });
+
+  it("omits the fields when the meter file is missing (every non-docker worker)", () => {
+    const s = collectWith(path.join(os.tmpdir(), "uzi-dind-meter-does-not-exist", "statfs"));
+    for (const k of DIND_KEYS) assert.ok(!(k in s), `${k} absent`);
+  });
+
+  it("omits the fields for a malformed line", () => {
+    const cases: Array<[string, string]> = [
+      [`v1 ${EPOCH} 4096 1000 250 500\n`, "five fields"],
+      [`v1 ${EPOCH} 4096 1000 250 500 100 7\n`, "seven fields"],
+      [`v2 ${EPOCH} 4096 1000 250 500 100\n`, "wrong version"],
+      [`v1 0${EPOCH} 4096 1000 250 500 100\n`, "leading zero"],
+      [`v1 ${EPOCH}  4096 1000 250 500 100\n`, "double space"],
+      [`v1 ${EPOCH} 4096 1000 250 500 -100\n`, "negative"],
+      [`v1 ${EPOCH} 4096 1000 250 500 100\n\n`, "two newlines"],
+      [`v1 ${EPOCH} 4096 1000 250 500 1e2\n`, "exponent"],
+      [` v1 ${EPOCH} 4096 1000 250 500 100\n`, "leading space"],
+      [`v1 ${EPOCH} 4096 1000 250 500 100\r\n`, "CRLF"],
+      ["", "empty file"],
+      [`v1 ${EPOCH} 4096 1000 250 500 100\n` + " ".repeat(300), "oversized"],
+    ];
+    for (const [line, why] of cases) assertAbsent(line, why);
+  });
+
+  it("omits the fields for a stale sample (older than 90s)", () => {
+    assertAbsent(`v1 ${EPOCH - 91} 4096 1000 250 500 100\n`, "stale");
+  });
+
+  it("omits the fields for a sample dated more than 5s in the future", () => {
+    assertAbsent(`v1 ${EPOCH + 6} 4096 1000 250 500 100\n`, "future");
+    // Within the skew tolerance it is accepted (the bound, not a blanket future ban).
+    const s = collectWith(meterFile(`v1 ${EPOCH + 5} 4096 1000 250 500 100\n`));
+    assert.strictEqual(s.disk_dind_inodes, 400);
+  });
+
+  it("omits the fields for impossible statfs relations", () => {
+    assertAbsent(`v1 ${EPOCH} 4096 1000 1001 500 100\n`, "bfree > blocks");
+    assertAbsent(`v1 ${EPOCH} 4096 1000 250 500 501\n`, "ffree > files");
+    assertAbsent(`v1 ${EPOCH} 4096 0 0 500 100\n`, "blocks = 0");
+    assertAbsent(`v1 ${EPOCH} 4096 1000 250 0 0\n`, "files = 0");
+    assertAbsent(`v1 ${EPOCH} 0 1000 250 500 100\n`, "frsize = 0");
+  });
+
+  it("omits the fields when an integer (or the derived total) is not a safe integer", () => {
+    assertAbsent(`v1 ${EPOCH} 4096 9007199254740992 0 500 100\n`, "blocks = 2^53");
+    assertAbsent(`v1 ${EPOCH} 4096 9999999999999999999 0 500 100\n`, "19-digit blocks");
+    assertAbsent(`v1 ${EPOCH} 4096 1125899906842624 0 500 100\n`, "blocks * frsize overflows");
+    assertAbsent(`v1 ${EPOCH} 4096 1000 250 9007199254740993 100\n`, "files > 2^53");
+  });
+
+  it("refuses a symlinked meter file (never follows a planted link)", () => {
+    const real = meterFile(`v1 ${EPOCH} 4096 1000 250 500 100\n`);
+    const link = path.join(path.dirname(real), "link");
+    fs.symlinkSync(real, link);
+    const s = collectWith(link);
+    for (const k of DIND_KEYS) assert.ok(!(k in s), `${k} absent for a symlink`);
   });
 });

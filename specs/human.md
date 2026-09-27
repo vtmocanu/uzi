@@ -385,7 +385,7 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/done/46-run-judge-self-imp
   correctness, verification depth, or code quality. [user 2026-08-15]
 - `cost_efficiency` is triage-only: it does NOT feed the self-improvement job.
   [user 2026-08-15]
-- **Judge and Findings share one triage row and one vocabulary** (File issue · Mark done · Dismiss ▾ at equal weight; the open state is "To triage" everywhere; filed is "Filed #N"); Findings shows each coordinate's evidence and the runs it was seen in, counted tabs, multi-select with undo, and a filed finding becomes Done when its issue closes on the forge. [user 2026-09-07]
+- **Judge and Findings share one triage row and one vocabulary** (File issue · Mark done · Dismiss ▾ at equal weight; the open state is "To triage" everywhere; filed is "Filed #N"); Findings shows each coordinate's evidence and the runs it was seen in, counted tabs, multi-select with undo, and a filed finding becomes Done when its issue closes on the forge; a person can also mark a finding done (from To triage, Filed or Dismissed) with the judge's disposition semantics, and Undo exposes Filed or To triage. [user 2026-09-07] (AI-synced 2026-09-26)
 
 ## Feature #45 — OIDC SSO login (Keycloak / Pocket ID)
 
@@ -516,6 +516,7 @@ Tracked as GitLab issue vtmocanu/uzi#83; PRD at `prds/done/83-docker-capable-wor
 - Trust model: trust the USER who owns the worker, not the repo code the agent runs (prompt-injectable). Security compromises allowed to cut complexity; agent-facing defenses stay load-bearing. [user]
 - k8s is the first-class test/runtime environment (not the deferred track). [user]
 - k8s docker posture: a dedicated privileged-tier namespace running the rootless-DinD sidecar. [user, Q-B owner decision]
+- dind-data is metered and cache-pruned automatically under an exclusion gate; never volumes; never feeds the /nix+/data recycle. (AI-synced 2026-09-27)
 
 ## Feature #95 — Run activity pane v2: crew roster, opt-in follow, steer-queue delivery
 
@@ -812,6 +813,8 @@ Tracked as GitHub issue vtmocanu/uzi#1349; PRD at `prds/1349-recovery-custody-ha
 
 - An owner can see retained unpublished committed work, recover an available archive, and explicitly discard one exact held source only after a warning distinguishes recoverable work from a possible only copy. [AI-synced 2026-09-14, #1349]
 - An older generation's custody hold adopted by a same-worker resume is released automatically on server-proven ancestry of its candidate commits against the completed run's published branch head (or, as before, once its own capture is durably archived); otherwise it is retained. [AI-synced 2026-09-24, #1582]
+- At the per-owner unresolved-hold limit, new runs are not admitted, but a requeued run that still holds its own open custody is re-admitted to resume it, even past the limit, until that run alone holds the limit's worth. [AI-synced 2026-09-26, #1751]
+- An older generation's hold adopted by a same-worker resume can also be released while the resumed run is still live, on server-proven ancestry against the checkpoint (or task branch) the run published; a cross-worker predecessor stays held. [AI-synced 2026-09-26, #1751]
 
 ## Feature #1390 — Api outage does not disturb a run on a still-live worker
 
@@ -909,12 +912,21 @@ Tracked as GitHub issue vtmocanu/uzi#1695.
 
 ## Feature #1732 — Disable and re-enable account credentials
 
-Tracked as GitHub issue vtmocanu/uzi#1732; PRD at `prds/1732-disable-account-credentials.md`.
+Tracked as GitHub issue vtmocanu/uzi#1732; PRD at `prds/done/1732-disable-account-credentials.md`.
 
 - A user can disable any Anthropic token or OpenAI/Codex credential and re-enable it on demand. Disabled means kept (value, name, preferences) but not polled, not refreshed in the background, not selectable, hidden from the sidebar and pickers, and absent from the admin Rate limits page (no row, no count). Past runs and spend stay in history. (AI-synced 2026-09-26)
 - Work pinned or bound to a disabled credential waits and resumes on re-enable; uzi never silently spends a different credential instead. A run already holding the credential finishes. (AI-synced 2026-09-26)
 - Every default is enabled: disabling the default requires choosing an enabled replacement; disabling the last credential of a kind leaves that kind with no default. The Judge keeps Feature #1140's empty-pool fallback to the (enabled) default. (AI-synced 2026-09-26)
 - Disabled credentials collapse into a "Disabled (n)" section, collapsed by default. Enable/disable is web-only; the CLI only shows the state. (AI-synced 2026-09-26)
+
+## Feature #1604 — Plan-gate verdicts survive interruptions
+
+Tracked as GitHub issue vtmocanu/uzi#1604; decision record `adr/1604-plan-gate-verdict-durability.md`.
+
+- An approve, reject or request-changes sent at the plan gate is never lost silently across a credential switch, worker restart or resumed run (an empty change request carries nothing); it takes effect once its result is saved, and otherwise carries over to the resumed run. A carried-over verdict uzi cannot match to a plan is ignored with a feed note asking to re-send it; on Codex runs every carried-over verdict (approve, reject or request-changes) is ignored that way, and a fresh plan is shown. (AI-synced 2026-09-26)
+- A verdict is never applied to a plan the owner did not see: one sent before the current plan was shown, or one uzi cannot match to a plan, is ignored, and an ignored approve never counts as approval. (AI-synced 2026-09-26)
+- A resumed run with an unapproved plan reads the owner's pending verdicts before it shows a plan. On Claude runs a pending cancel, reject or request-changes acts first (changes revise the submitted plan rather than re-offering it); a pending approve waits for the gate, where it is judged like any replayed verdict. On Codex runs every pending approve, reject or request-changes is ignored with a note asking to re-send it, and a fresh plan is shown. (AI-synced 2026-09-26)
+- Every ignored verdict is explained in the run feed, except an approve replaced by a newer verdict, a repeat approve after the plan was approved, and an empty change request. (AI-synced 2026-09-26)
 
 ## Startup admin seed
 

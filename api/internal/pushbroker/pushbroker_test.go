@@ -117,6 +117,33 @@ func TestPublishFirstCheckpointCreatesRef(t *testing.T) {
 	}
 }
 
+// TestPublishRejectsZeroBytePack: a publish body with no bytes is never a valid pack (even
+// a zero-object pack has a header and checksum), so it is refused as ErrPackInvalid before
+// anything reaches origin, instead of forwarding a pack-less create that origin answers
+// "eof before pack header" (a 500 on the publish). Origin's checkpoint ref stays absent.
+// The declared tip is one origin already holds (a planning-only run whose tracking tip is
+// still the default branch tip, the #1739 nightly shape): that tip passes the presence and
+// ancestry checks, so without this guard the empty body reached origin.
+func TestPublishRejectsZeroBytePack(t *testing.T) {
+	f := newGitFixture(t)
+	base := f.commit("a.txt", "base\n", "base")
+	f.pushMain()
+
+	_, err := pushbroker.Publish(context.Background(), pushbroker.Options{
+		CloneURL:      f.cloneURL(),
+		Branch:        "agent/issue-2",
+		DefaultBranch: "main",
+		DeclaredTip:   base,
+		Pack:          []byte{},
+	})
+	if !errors.Is(err, pushbroker.ErrPackInvalid) {
+		t.Fatalf("err = %v, want ErrPackInvalid", err)
+	}
+	if got := f.originRef("refs/uzi-checkpoints/agent/issue-2"); got != "" {
+		t.Fatalf("origin checkpoint = %q, want absent", got)
+	}
+}
+
 // TestPublishFirstCheckpointOnNeverPushedBranch is the ACTUAL mid-run primary case:
 // the agent's branch was NEVER pushed to refs/heads (branchTip zero AND checkpointTip
 // zero). Origin only carries the default branch (main); the checkpoint feature branch

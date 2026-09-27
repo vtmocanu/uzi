@@ -74,6 +74,7 @@ type AnthropicRateLimit struct {
 	SevenDayResetsAt pgtype.Timestamptz `json:"seven_day_resets_at"`
 	Source           pgtype.Text        `json:"source"`
 	SyncedAt         pgtype.Timestamptz `json:"synced_at"`
+	EnablementRev    int64              `json:"enablement_rev"`
 }
 
 type AppSetting struct {
@@ -163,6 +164,7 @@ type CodexAccountRateLimit struct {
 	AttemptError               pgtype.Text        `json:"attempt_error"`
 	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
+	EnablementSig              pgtype.Text        `json:"enablement_sig"`
 }
 
 type CodexCredentialState struct {
@@ -471,6 +473,7 @@ type RecoveryCustodyHold struct {
 	ReleaseFinalHeadSha        pgtype.Text        `json:"release_final_head_sha"`
 	ReleaseSuccessorGeneration pgtype.Int8        `json:"release_successor_generation"`
 	ReleaseBranch              pgtype.Text        `json:"release_branch"`
+	ReleaseTarget              pgtype.Text        `json:"release_target"`
 }
 
 type Repo struct {
@@ -900,16 +903,18 @@ type User struct {
 }
 
 type UserSecret struct {
-	ID           uuid.UUID          `json:"id"`
-	UserID       uuid.UUID          `json:"user_id"`
-	Kind         string             `json:"kind"`
-	Ciphertext   []byte             `json:"ciphertext"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
-	SealedWith   string             `json:"sealed_with"`
-	Label        string             `json:"label"`
-	IsDefault    bool               `json:"is_default"`
-	AutoEligible bool               `json:"auto_eligible"`
+	ID            uuid.UUID          `json:"id"`
+	UserID        uuid.UUID          `json:"user_id"`
+	Kind          string             `json:"kind"`
+	Ciphertext    []byte             `json:"ciphertext"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	SealedWith    string             `json:"sealed_with"`
+	Label         string             `json:"label"`
+	IsDefault     bool               `json:"is_default"`
+	AutoEligible  bool               `json:"auto_eligible"`
+	DisabledAt    pgtype.Timestamptz `json:"disabled_at"`
+	EnablementRev int64              `json:"enablement_rev"`
 }
 
 type UserVault struct {
@@ -922,43 +927,47 @@ type UserVault struct {
 }
 
 type Worker struct {
-	ID                      uuid.UUID          `json:"id"`
-	UserID                  uuid.UUID          `json:"user_id"`
-	Name                    string             `json:"name"`
-	TokenHash               []byte             `json:"token_hash"`
-	Status                  string             `json:"status"`
-	LastHeartbeatAt         pgtype.Timestamptz `json:"last_heartbeat_at"`
-	Version                 pgtype.Text        `json:"version"`
-	CreatedAt               pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt               pgtype.Timestamptz `json:"updated_at"`
-	TemplateDeclared        pgtype.Text        `json:"template_declared"`
-	TemplateReported        pgtype.Text        `json:"template_reported"`
-	MaxConcurrentRuns       pgtype.Int4        `json:"max_concurrent_runs"`
-	StatsCpuPct             pgtype.Float4      `json:"stats_cpu_pct"`
-	StatsMemBytes           pgtype.Int8        `json:"stats_mem_bytes"`
-	StatsMemLimitBytes      pgtype.Int8        `json:"stats_mem_limit_bytes"`
-	StatsSource             pgtype.Text        `json:"stats_source"`
-	Kind                    string             `json:"kind"`
-	HostedSize              pgtype.Text        `json:"hosted_size"`
-	HostedGeneration        int64              `json:"hosted_generation"`
-	DockerEnabled           pgtype.Bool        `json:"docker_enabled"`
-	AnthropicSecretID       pgtype.UUID        `json:"anthropic_secret_id"`
-	AnthropicBindMode       string             `json:"anthropic_bind_mode"`
-	OnlineSince             pgtype.Timestamptz `json:"online_since"`
-	DrainingSince           pgtype.Timestamptz `json:"draining_since"`
-	Capabilities            []string           `json:"capabilities"`
-	Ephemeral               bool               `json:"ephemeral"`
-	EphemeralRunID          pgtype.UUID        `json:"ephemeral_run_id"`
-	StatsDiskNixBytes       pgtype.Int8        `json:"stats_disk_nix_bytes"`
-	StatsDiskNixTotalBytes  pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
-	StatsDiskDataBytes      pgtype.Int8        `json:"stats_disk_data_bytes"`
-	StatsDiskDataTotalBytes pgtype.Int8        `json:"stats_disk_data_total_bytes"`
-	StatsDiskPressureStreak int32              `json:"stats_disk_pressure_streak"`
-	ProtocolCapabilities    []string           `json:"protocol_capabilities"`
-	SnapshotEpoch           int64              `json:"snapshot_epoch"`
-	SnapshotRegisterNonce   pgtype.Text        `json:"snapshot_register_nonce"`
-	PendingOverflow         bool               `json:"pending_overflow"`
-	PendingOverflowUntil    pgtype.Timestamptz `json:"pending_overflow_until"`
+	ID                       uuid.UUID          `json:"id"`
+	UserID                   uuid.UUID          `json:"user_id"`
+	Name                     string             `json:"name"`
+	TokenHash                []byte             `json:"token_hash"`
+	Status                   string             `json:"status"`
+	LastHeartbeatAt          pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version                  pgtype.Text        `json:"version"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                pgtype.Timestamptz `json:"updated_at"`
+	TemplateDeclared         pgtype.Text        `json:"template_declared"`
+	TemplateReported         pgtype.Text        `json:"template_reported"`
+	MaxConcurrentRuns        pgtype.Int4        `json:"max_concurrent_runs"`
+	StatsCpuPct              pgtype.Float4      `json:"stats_cpu_pct"`
+	StatsMemBytes            pgtype.Int8        `json:"stats_mem_bytes"`
+	StatsMemLimitBytes       pgtype.Int8        `json:"stats_mem_limit_bytes"`
+	StatsSource              pgtype.Text        `json:"stats_source"`
+	Kind                     string             `json:"kind"`
+	HostedSize               pgtype.Text        `json:"hosted_size"`
+	HostedGeneration         int64              `json:"hosted_generation"`
+	DockerEnabled            pgtype.Bool        `json:"docker_enabled"`
+	AnthropicSecretID        pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicBindMode        string             `json:"anthropic_bind_mode"`
+	OnlineSince              pgtype.Timestamptz `json:"online_since"`
+	DrainingSince            pgtype.Timestamptz `json:"draining_since"`
+	Capabilities             []string           `json:"capabilities"`
+	Ephemeral                bool               `json:"ephemeral"`
+	EphemeralRunID           pgtype.UUID        `json:"ephemeral_run_id"`
+	StatsDiskNixBytes        pgtype.Int8        `json:"stats_disk_nix_bytes"`
+	StatsDiskNixTotalBytes   pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
+	StatsDiskDataBytes       pgtype.Int8        `json:"stats_disk_data_bytes"`
+	StatsDiskDataTotalBytes  pgtype.Int8        `json:"stats_disk_data_total_bytes"`
+	StatsDiskPressureStreak  int32              `json:"stats_disk_pressure_streak"`
+	ProtocolCapabilities     []string           `json:"protocol_capabilities"`
+	SnapshotEpoch            int64              `json:"snapshot_epoch"`
+	SnapshotRegisterNonce    pgtype.Text        `json:"snapshot_register_nonce"`
+	PendingOverflow          bool               `json:"pending_overflow"`
+	PendingOverflowUntil     pgtype.Timestamptz `json:"pending_overflow_until"`
+	StatsDiskDindBytes       pgtype.Int8        `json:"stats_disk_dind_bytes"`
+	StatsDiskDindTotalBytes  pgtype.Int8        `json:"stats_disk_dind_total_bytes"`
+	StatsDiskDindInodes      pgtype.Int8        `json:"stats_disk_dind_inodes"`
+	StatsDiskDindTotalInodes pgtype.Int8        `json:"stats_disk_dind_total_inodes"`
 }
 
 type WorkerActiveRun struct {

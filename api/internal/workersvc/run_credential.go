@@ -119,16 +119,42 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 	}
 
 	switch run.Status {
-	case "queued", "limit_wait", "pool_wait", "recovery_wait", "paused":
+	case "paused":
+		if run.HoldReason.Valid && run.HoldReason.String == "credential_disabled" {
+			// PRD #1732 D2/D14: the reassignment writes the override and leaves the hold in
+			// the promoter's lock order, so it and a concurrent promotion serialize: exactly
+			// one moves the run, and the loser is ErrCredentialSwitchRaced with nothing
+			// written. A run with a pending pause or a spent budget settles into that pause
+			// or budget_exhausted rather than being refused.
+			status, err := s.reassignCredentialDisabledRun(ctx, userID, runID, resolved)
+			if err != nil {
+				return SetRunCredentialResult{}, err
+			}
+			if status == "queued" {
+				if _, err := s.q.CreateRunInput(ctx, store.CreateRunInputParams{RunID: runID, Kind: "resume", Body: pgtype.Text{}}); err != nil {
+					slog.Warn("set run credential: write resume audit row", "run", runID, "error", err)
+				}
+			}
+			break
+		}
+		fallthrough
+	case "queued", "limit_wait", "pool_wait", "recovery_wait":
 		// Write the override columns FIRST (idempotent, harmless if the transition then
-		// finds 0 rows), then the state-specific transition.
-		if _, werr := s.q.SetRunCredentialOverride(ctx, store.SetRunCredentialOverrideParams{
-			Mode:     pgOverrideMode(resolved),
-			SecretID: pgOverrideSecretID(resolved),
-			ID:       runID,
-			UserID:   userID,
+		// finds 0 rows), then the state-specific transition. The write runs under the user's
+		// secret mutation lock and re-checks a pin's enablement after it (PRD #1732 D5), so a
+		// disable racing the validation above refuses it and nothing is written.
+		if werr := s.withSecretMutation(ctx, userID, func(q secretMutationQueries) error {
+			if _, err := q.SetRunCredentialOverride(ctx, store.SetRunCredentialOverrideParams{
+				Mode:     pgOverrideMode(resolved),
+				SecretID: pgOverrideSecretID(resolved),
+				ID:       runID,
+				UserID:   userID,
+			}); err != nil {
+				return fmt.Errorf("set run credential override: %w", err)
+			}
+			return lockPinnedOverrideEnabled(ctx, q, userID, resolved, ErrCredentialOverrideSecretNotFound)
 		}); werr != nil {
-			return SetRunCredentialResult{}, fmt.Errorf("set run credential override: %w", werr)
+			return SetRunCredentialResult{}, werr
 		}
 		if terr := s.applyCredentialTransition(ctx, userID, runID, run.Status); terr != nil {
 			return SetRunCredentialResult{}, terr
@@ -165,6 +191,10 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 	// pre-transition row carries them. A warning-computation read error is logged and
 	// dropped, never fails the verb.
 	warning := s.credentialSwitchWarning(ctx, run, resolved)
+
+	// A committed override can be the requirement a concurrently parked credential_disabled
+	// run now waits on, so request a promoter pass (post-commit, non-blocking; PRD #1732 D14).
+	s.RequestCredentialDisabledPromotion(userID)
 
 	updated, err := s.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: userID})
 	if err != nil {
@@ -213,21 +243,26 @@ func (s *Service) stampHeldStateSwitch(ctx context.Context, run store.Run, userI
 	// inconsistent while the verb returned 200. Exactly one row is required; a 0-row result is a
 	// raced release/reclaim between the read above and this write → ErrCredentialSwitchRaced with
 	// nothing written (the UPDATE matched no row).
-	rows, err := s.q.StampHeldCredentialSwitch(ctx, store.StampHeldCredentialSwitchParams{
-		Mode:       pgOverrideMode(resolved),
-		SecretID:   pgOverrideSecretID(resolved),
-		Generation: pgtype.Int8{Int64: run.ClaimGeneration, Valid: true},
-		ID:         runID,
-		UserID:     userID,
-		WorkerID:   pgtype.UUID{Bytes: wkr.ID, Valid: true},
+	//
+	// The stamp runs under the user's secret mutation lock and re-checks a pin's enablement
+	// after it (PRD #1732 D5), so a disable racing the validation refuses it with nothing written.
+	return s.withSecretMutation(ctx, userID, func(q secretMutationQueries) error {
+		rows, err := q.StampHeldCredentialSwitch(ctx, store.StampHeldCredentialSwitchParams{
+			Mode:       pgOverrideMode(resolved),
+			SecretID:   pgOverrideSecretID(resolved),
+			Generation: pgtype.Int8{Int64: run.ClaimGeneration, Valid: true},
+			ID:         runID,
+			UserID:     userID,
+			WorkerID:   pgtype.UUID{Bytes: wkr.ID, Valid: true},
+		})
+		if err != nil {
+			return fmt.Errorf("stamp held credential switch: %w", err)
+		}
+		if rows != 1 {
+			return ErrCredentialSwitchRaced
+		}
+		return lockPinnedOverrideEnabled(ctx, q, userID, resolved, ErrCredentialOverrideSecretNotFound)
 	})
-	if err != nil {
-		return fmt.Errorf("stamp held credential switch: %w", err)
-	}
-	if rows != 1 {
-		return ErrCredentialSwitchRaced
-	}
-	return nil
 }
 
 // applyCredentialTransition performs the state-specific transition after the override

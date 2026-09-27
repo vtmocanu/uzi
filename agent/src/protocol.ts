@@ -423,6 +423,17 @@ export interface WorkerStats {
   disk_data_bytes?: number;
   /** Total bytes on the data volume. Paired with disk_data_bytes. */
   disk_data_total_bytes?: number;
+  /** Used bytes on a docker worker's DinD data root (the `dind-data` volume), from
+   *  the dind-meter sidecar's statfs sample: `(blocks − bfree) × frsize` (issue #1759).
+   *  The four disk_dind_* fields are all present or all absent: absent when there is
+   *  no sidecar (a non-docker worker) or no valid, fresh (≤ 90s) sample. */
+  disk_dind_bytes?: number;
+  /** Total bytes on the DinD data root (`blocks × frsize`). */
+  disk_dind_total_bytes?: number;
+  /** Used inodes on the DinD data root (`files − ffree`). */
+  disk_dind_inodes?: number;
+  /** Total inodes on the DinD data root (`files`). */
+  disk_dind_total_inodes?: number;
 }
 
 /**
@@ -1224,6 +1235,20 @@ export interface ClaimResponse {
    *  approve_plan with the right plan revision (workersvc.ClaimPayload.ResumePlanSeq). 0/absent for
    *  every other phase. Additive + optional. */
   resume_plan_seq?: number;
+  /** Issue #1604: the created_at (RFC 3339, microsecond precision from Postgres) of the run's latest
+   *  `plan` run_message whose plan_md equals the claim's plan_md (a frame emitted for a plan that was
+   *  never persisted does not count; with no match the field is absent), carried whenever the claim
+   *  carries an UNAPPROVED persisted plan (resume_phase "awaiting_approval", or "" with plan_md). The
+   *  worker's gate epoch restarts at 0 on every claim, so it cannot tell a replayed
+   *  approve/reject/revise written against an earlier plan from one written against this one; a
+   *  replayed gate verdict whose input created_at is strictly before this instant (or absent or
+   *  unparseable) is stale. Absent or unparseable on such a claim (an older server, a query error, a
+   *  tombstoned or redacted plan frame), the worker ignores every replayed approve/reject read before
+   *  its replayed backlog is drained and its first gate is shown (SteeringChannel.setReplayCutoff).
+   *  Residual: an api old enough to consume inputs on read (no receipts marker) has already applied
+   *  such an approve when it returned it, so the server still counts it as the human approval; the
+   *  worker only ignores it and posts a notice saying it could not be withdrawn. */
+  resume_plan_at?: string;
 }
 
 /** One deterministic missing-executable hit (PRD #46 Decision 4). */
@@ -2131,9 +2156,12 @@ export interface StateRequest {
    *  non-completed report — an old worker omits it and a non-interlocked completion has no
    *  permit to match. */
   head?: string;
-  /** PRD #1392 M2 (D9/D10): the typed cause of a `recovery_wait` park. Today the worker only
-   *  ever sends "forge_unreachable" (the pre-clone transient-forge park); the api validates it
-   *  against its own enum (forge_unreachable|empty_turn|provider_outage) before any SQL and a
+  /** PRD #1392 M2 (D9/D10): the typed cause of a `recovery_wait` park. The worker sends
+   *  "forge_unreachable" (the pre-clone transient-forge park, gated on `recovery_park_cause`) and,
+   *  issue #1766, "vault_locked" (a Codex credential refresh/release deferred by a locked owner
+   *  vault, gated on `recovery_cause_vault_locked`; an api without that feature gets the untyped
+   *  park). The api validates it against its own enum
+   *  (forge_unreachable|empty_turn|provider_outage|vault_locked) before any SQL and a
    *  legacy/untyped park omits it (NULL). Additive + optional and OMITTED ENTIRELY on every
    *  other report so a pre-#1392 worker's payload and an ordinary (empty-turn) recovery park
    *  stay byte-identical on the wire; an api that predates the field 400s a report carrying it,
@@ -2476,6 +2504,22 @@ export interface RecoverySettleRequest {
   pushed_sha: string;
   source_sha: string;
   adopted_sha: string;
+}
+
+/** RecoveryLiveSettleRequest asks the api to settle ONE older-generation custody hold while the
+ *  resumed run is still LIVE (issue #1751 M2, mirrors api/internal/apitypes/recovery.go):
+ *  POST /runs/{id}/recovery-holds/{holdID}/settle-live. published_sha is the successor
+ *  generation's PUBLISHED tip (a confirmed checkpoint publish, or the finalize branch push);
+ *  target names what the api proves it against: `checkpoint` (refs/uzi-checkpoints/<branch>) or
+ *  `branch` (runs.branch). Candidate SHAs only (40-char lowercase hex); no worker verdict field.
+ *  The answer is the same {@link RecoverySettleResponse}. */
+export interface RecoveryLiveSettleRequest {
+  predecessor_generation: number;
+  successor_generation: number;
+  published_sha: string;
+  source_sha: string;
+  adopted_sha: string;
+  target: "checkpoint" | "branch";
 }
 
 /** RecoverySettleResponse is the api's answer to a {@link RecoverySettleRequest} (issue #1582).

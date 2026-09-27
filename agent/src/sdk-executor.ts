@@ -83,11 +83,11 @@ import {
   SIGNAL_SERVER_NAME,
 } from "./signals.js";
 import { classifyLimitEvidence, LimitReachedError } from "./limit.js";
-import { PauseNowSignal, CredentialSwitchSignal } from "./steering.js";
+import { PauseNowSignal, CredentialSwitchSignal, PLAN_APPROVAL_TIMEOUT_REASON, type PlanVerdict } from "./steering.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { buildForgeToolsServer, FORGE_SERVER_NAME } from "./forge-tools.js";
 import { buildFindingsToolsServer, FINDINGS_SERVER_NAME } from "./findings-tools.js";
-import type { WorkerClient } from "./client.js";
+import { isTransientStatus, type WorkerClient } from "./client.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
@@ -304,11 +304,14 @@ function foreignCliTermination(err: Error): string | undefined {
  * issue #1088: whether a FAILED terminal is a TRANSIENT provider error that should be
  * retried and, on a sustained outage, PARKED (recovery_wait) rather than terminal-failed.
  *
- * A guarded AND, deliberately NOT an OR: it requires `terminal_reason === "api_error"`
- * AND a retryable status. Permanent api errors (401/403/400) are `api_error` too, so an
- * OR — or dropping the status guard — would park them forever in the uncapped recovery
- * park. Mirrors client.ts's `isTransient` (transport/network, 408, 429, ≥500 incl. 529);
- * a status-less api_error is a transport/network failure and is retryable.
+ * A present HTTP status decides on its own, whatever `terminal_reason` says (issue #1401):
+ * the SDK can report a 529 with no `terminal_reason`, and materialize already treats
+ * `terminal_reason === "api_error" || apiErrorStatus != null` as an api error. The status
+ * still goes through `isTransientStatus` (client.ts: 408, 429, >=500 incl. 529), so a
+ * permanent 401/403/400 is never parked forever in the uncapped recovery park. Only a
+ * status-less failure falls back to `terminal_reason === "api_error"`: that is a
+ * transport/network failure and retryable, while a status-less failure without it is not
+ * a provider error at all.
  *
  * Module-private (used only by driveTurn); the 529/401 behavior is proven end-to-end
  * through `run()` in the tests rather than by a direct predicate call.
@@ -316,11 +319,7 @@ function foreignCliTermination(err: Error): string | undefined {
 function isProviderTransient(t: HarnessTerminal): boolean {
   return (
     t.outcome === "failed" &&
-    t.terminalReason === "api_error" &&
-    (t.apiErrorStatus == null ||
-      t.apiErrorStatus === 408 ||
-      t.apiErrorStatus === 429 ||
-      t.apiErrorStatus >= 500)
+    (t.apiErrorStatus != null ? isTransientStatus(t.apiErrorStatus) : t.terminalReason === "api_error")
   );
 }
 
@@ -625,6 +624,9 @@ interface DriveState {
 }
 
 export class SdkExecutor implements Executor {
+  /** Issue #1604: see Executor.resumesAtGate — the plan gate reads a resumed claim's pending
+   *  inputs (takeResumedGateEvent) and re-presents an awaiting_approval claim's plan. */
+  readonly resumesAtGate = true;
   private readonly queryFn: SdkQueryFn;
   private readonly spawn: (opts: SpawnOptions) => { pid?: number };
   private readonly kill: (pid: number | undefined) => boolean;
@@ -1665,7 +1667,45 @@ export class SdkExecutor implements Executor {
         // entries, so the server drops the candidate to NULL rather than reading "no milestones"
         // (or a narrowed list) as the completion contract.
         let gateMilestones: Milestone[] | undefined;
-        if (resumeAtGate) {
+        // Issue #1604 (D3): a resumed, unapproved claim with a persisted plan (resume_phase
+        // "awaiting_approval", with or without its session, or "" with none) first reads the inputs
+        // the owner sent before the claim was released, and acts on them BEFORE offering any plan:
+        // a cancel ends the run, a reject fails it (the failed transition settles the reject), and
+        // a revise revises the SUBMITTED plan instead of re-presenting it. An approve stays
+        // buffered for the re-presented gate below. The wait never falls back to the gate.
+        let pending: PlanVerdict | undefined;
+        // Only for an UNAPPROVED plan (the runner guards the same condition): a plan approved by the
+        // server but re-planned here (its session is gone) has no pending gate verdict to read.
+        if (ctx.planApproved !== true && ctx.approvedPlan?.trim() && ctx.takeResumedGateEvent) {
+          const step = await this.runThroughSwitch(ctx, state, () => ctx.takeResumedGateEvent!(ctx.signal));
+          if ("released" in step) return { branch: ctx.branch, switchReleased: true };
+          pending = step.value;
+        }
+        if (pending?.kind === "cancel") throw new Error(REASON_CANCELLED);
+        if (pending?.kind === "reject") {
+          ctx.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text: "the owner rejected the submitted plan before the claim was released — failing the run without offering it again",
+            },
+          });
+          throw new PlanRejectedError(pending.reason);
+        }
+        const resumedRevise = pending?.kind === "revise" ? pending : undefined;
+        if (resumedRevise) {
+          ctx.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text: "resuming at the plan gate with a revision the owner sent before the claim was released — revising the submitted plan instead of re-presenting it",
+            },
+          });
+          approvedPlan = ctx.approvedPlan!;
+          // The candidate breakdown the server delivered with the submitted plan (see below).
+          candidateMilestones = ctx.frozenMilestones ?? undefined;
+          gateMilestones = candidateMilestones;
+        } else if (resumeAtGate) {
           ctx.emit({
             kind: "status",
             agent: "worker",
@@ -1735,19 +1775,42 @@ export class SdkExecutor implements Executor {
         // PRD #1247 M5b (data-integrity fix): the plan gate is a HELD idle state — a credential
         // switch trips by rejecting the parked gate waiter with a CredentialSwitchSignal. Handle it
         // IN PLACE at EVERY gate wait via runThroughSwitch: "released" ends the flight (surface
-        // switchReleased; the reclaim resumes at resume_phase and re-presents this plan), "gave_up"
+        // switchReleased; the reclaim first reads the inputs sent before the release (issue #1604)
+        // and re-presents this plan only when none of them is a revise or reject), "gave_up"
         // re-presents the SAME gate on the OLD token (re-run ctx.gatePlan — keep waiting for a real
         // verdict). The gate already loops for revisions; this only adds switch-survival to each wait.
-        const g0 = await this.runThroughSwitch(ctx, state, () =>
-          ctx.gatePlan!(approvedPlan, gateMilestones, (planMd) =>
-            this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
-          ),
-        );
-        if ("released" in g0) return { branch: ctx.branch, switchReleased: true };
-        let verdict = g0.value;
+        // Issue #1604: a revise read on the resume skips this first gate: the submitted plan was
+        // already offered, and the revise enters the revision loop directly.
+        let verdict: PlanVerdict;
+        if (resumedRevise) verdict = resumedRevise;
+        else {
+          const g0 = await this.runThroughSwitch(ctx, state, () =>
+            ctx.gatePlan!(approvedPlan, gateMilestones, (planMd) =>
+              this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
+            ),
+          );
+          if ("released" in g0) return { branch: ctx.branch, switchReleased: true };
+          verdict = g0.value;
+          // Issue #1604 (D5): a verdict that settles a RE-PRESENTED gate gets one line naming it.
+          if (resumeAtGate && (verdict.kind === "approve" || verdict.kind === "reject"))
+            ctx.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: verdict.kind === "approve"
+                  ? "the re-presented plan was approved — implementing it"
+                  : verdict.reason === PLAN_APPROVAL_TIMEOUT_REASON
+                    ? "the re-presented plan timed out waiting for approval — failing the run"
+                    : "the re-presented plan was rejected — failing the run",
+              },
+            });
+        }
         let revisions = 0;
         while (verdict.kind === "revise") {
           const feedback = verdict.feedback;
+          // Issue #1604 (D2): the re-gate of the revised plan settles THIS revise, once the revised
+          // plan is confirmed persisted; until then an interruption replays it.
+          const settles = verdict.inputId;
           // Record the reviewer's feedback on the feed. Ordered BEFORE the revision turn
           // (and thus before the next gatePlan flushes the new plan), so the feed never
           // lags the awaiting_approval re-report.
@@ -1773,7 +1836,7 @@ export class SdkExecutor implements Executor {
               },
             });
             const gExhausted = await this.runThroughSwitch(ctx, state, () =>
-              ctx.gatePlan!(approvedPlan, gateMilestones),
+              ctx.gatePlan!(approvedPlan, gateMilestones, undefined, settles),
             );
             if ("released" in gExhausted) return { branch: ctx.branch, switchReleased: true };
             verdict = gExhausted.value;
@@ -1790,16 +1853,23 @@ export class SdkExecutor implements Executor {
           // selection only takes effect once a plan is APPROVED (PRD #37 Decision 5).
           // PRD #1247 M5b (MAJOR-6 rework): DEFER the credential switch across the revision planning
           // turn instead of releasing mid-turn. The turn's new plan is not persisted until the gate
-          // report below, so a mid-turn release would leave the run row on the OLD plan_md and a
-          // reclaim would re-present the SUPERSEDED plan (resume_phase 'awaiting_approval' re-emits
-          // run.plan_md verbatim). Deferring holds the switch — which rides every inputs poll — until
-          // the NEXT trip point, the gate wait just below, AFTER gatePlan has persisted the revised
-          // plan; the reclaim then resumes at the gate on the CORRECT plan. The defer window covers
-          // the turn's own ask_user sub-park and closes before the gate wait. A stub/test executor
-          // that does not wire the hook runs the turn undeferred (the switch signal then reaches the
-          // outer catch, byte-identical to the pre-rework behaviour).
+          // report below. Since issue #1604 a mid-turn release is recoverable (the revise stays
+          // unapplied until its revised plan is persisted, so the reclaim reads it again before
+          // offering any plan and revises the submitted plan), but it would spend the revision
+          // turn twice. Deferring holds the switch — which rides every inputs poll — until the NEXT
+          // trip point, the gate wait just below, AFTER gatePlan has persisted the revised plan and
+          // settled the revise; the reclaim then resumes at the gate on the revised plan. The defer
+          // window covers the turn's own ask_user sub-park and closes before the gate wait. A
+          // stub/test executor that does not wire the hook runs the turn undeferred (the switch
+          // signal then reaches the outer catch, byte-identical to the pre-rework behaviour).
+          // Issue #1604 (D4): with no session to resume, the turn has never seen the plan it is
+          // revising, so it gets the full planning prompt plus the submitted plan and the feedback.
+          const revisePrompt =
+            resumeId === undefined
+              ? `${planPrompt}\n\n${buildRevisePlanPrompt(feedback, approvedPlan)}`
+              : buildRevisePlanPrompt(feedback);
           const runRevisionTurn = () =>
-            this.drivePlanningTurn(ctx, baseConfig, resumeId, buildRevisePlanPrompt(feedback), state, idleMs, budget);
+            this.drivePlanningTurn(ctx, baseConfig, resumeId, revisePrompt, state, idleMs, budget);
           const turn = ctx.deferCredentialSwitch
             ? await ctx.deferCredentialSwitch(runRevisionTurn)
             : await runRevisionTurn();
@@ -1812,8 +1882,11 @@ export class SdkExecutor implements Executor {
           // the gate's onAwaitingApproval callback (after the re-report persists the NEW
           // plan_md) so its stale-write guard matches the new plan.
           const gRev = await this.runThroughSwitch(ctx, state, () =>
-            ctx.gatePlan!(approvedPlan, gateMilestones, (planMd) =>
-              this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
+            ctx.gatePlan!(
+              approvedPlan,
+              gateMilestones,
+              (planMd) => this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
+              settles,
             ),
           );
           if ("released" in gRev) return { branch: ctx.branch, switchReleased: true };
@@ -2243,9 +2316,10 @@ export class SdkExecutor implements Executor {
         });
         // PRD #1416 M2: drain the worker-authoritative safety steer BEFORE building the implement
         // prompt, so an M2-armed steer reaches the next turn and an M5-armed steer reaches
-        // iteration 1. Every iteration (including the first), and AHEAD of the end-of-iteration
-        // follow-up drain at ~2672 — it survives the paths that `continue` before that drain, and
-        // is rendered as worker guidance OUTSIDE the <follow_up> fence (see buildImplementPrompt).
+        // iteration 1. Every iteration (including the first), and AHEAD of the follow-up drains
+        // (end of iteration and cooperative checkpoint) — it survives the park paths that `continue`
+        // before those drains, and is rendered as worker guidance OUTSIDE the <follow_up> fence (see
+        // buildImplementPrompt).
         const safetySteer = ctx.pullSafetySteer?.();
         // PRD #1064 M1 (Decisions 1/2): a per-turn progress observer. It owns the diff base
         // (seeded from the loop-scope latestProgress, the previous turn's final snapshot, so
@@ -2542,6 +2616,10 @@ export class SdkExecutor implements Executor {
             latestProgress = undefined;
           }
           resetStallState(); // a cooperative checkpoint is progress → breaks any refusal streak
+          // Issue #1152: drain the follow-up queue at the checkpoint boundary too (FIFO, one per
+          // turn, like the end-of-iteration drain below). Assigning also clears the follow-up this
+          // turn already carried, so it is not replayed into the next prompt.
+          followUp = ctx.pullFollowUp?.();
           continue;
         }
         if (turn.done) {
@@ -2863,7 +2941,8 @@ export class SdkExecutor implements Executor {
         followUp = ctx.pullFollowUp?.();
 
         // PRD #390 M3 (D2/D4): enforcement evaluation. Only normal work turns reach here — the
-        // checkpoint and park paths `continue` above, and done/max-iter exit above. On a
+        // checkpoint and park paths `continue` above (the checkpoint path drains its own follow-up
+        // first, #1152), and done/max-iter exit above. On a
         // milestone-bearing run (≥1 frozen milestone) where the tracker shows NO milestone in
         // progress, escalate the next turn's prompt and count the miss; after K consecutive misses
         // emit a feed-only status so a silently-non-reporting lead is observable. A lead that
@@ -3508,7 +3587,7 @@ export class SdkExecutor implements Executor {
         // a status-less transport api_error) is thrown as a ProviderTransientError so the
         // recovery wrapper retries it and, on a sustained outage, PARKS via recovery_wait
         // instead of terminal-failing. Permanent api errors (401/403/400) fail through
-        // materialize as before (isProviderTransient's status guard excludes them).
+        // materialize as before (isProviderTransient's isTransientStatus check excludes them).
         if (!limitFacts && isProviderTransient(terminal)) {
           throw new ProviderTransientError(
             providerErrorMessage(terminal.apiErrorStatus, terminal.resultText),

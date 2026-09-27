@@ -1,25 +1,30 @@
 // The Findings backlog (PRD #333 M7, D7/D8; rebuilt onto Judge's skeleton in PRD #1183 M4): the
 // per-repo, coordinate-deduped list of off-task bugs workers flagged mid-run, which the user
 // triages the way the judge backlog is triaged — file (turn into a real forge issue on their own
-// connection) or dismiss with a reason.
+// connection), mark done (issue #1723), or dismiss with a reason.
 //
 // It now renders Judge's skeleton on the shared triage components: a stats-driven summary strip and
 // five counted tabs (To triage / Filed / Done / Dismissed / All) whose counts come from the
 // canonical GET /findings/stats aggregate (never a tally of the rows on screen), select-all +
-// per-row checkboxes + a Dismiss-only MultiSelectBar, an UndoToast after a dismiss, and each row's
-// shared TriageActions / TriageStateChip plus an evidence + run-links expander.
+// per-row checkboxes + a Mark done · Dismiss ▾ MultiSelectBar, an UndoToast after a Mark done or a
+// dismiss, and each row's shared TriageActions / TriageStateChip plus an evidence + run-links
+// expander.
 //
-// KEY ROUTING (PRD #1183 M3, critical): file keys on the EVIDENCE id (finding_id); dismiss (single
-// row AND bulk) and undo key on the DISPOSITION id (disposition_id) via the bulk endpoint, so a
-// dismiss/undo pair is symmetric and a dismissed coordinate whose evidence cascaded away can still
-// be undone.
+// KEY ROUTING (PRD #1183 M3, critical): file keys on the EVIDENCE id (finding_id); dismiss and Mark
+// done (single row AND bulk) and undo key on the DISPOSITION id (disposition_id) via the bulk
+// endpoints, so a verdict/undo pair is symmetric and a coordinate whose evidence cascaded away can
+// still be marked done and undone.
+//
+// ELIGIBILITY (issue #1723) is split in two: File and Dismiss need an OPEN row with evidence
+// (finding_id); Mark done needs only a disposition_id on an open, filed or dismissed row (the
+// judge's semantics — a done row offers no second Mark done, and a mid-filing row none at all).
 //
 // Two rules copied from the judge/proposal surfaces:
 //   - last_title / repo_path / location / evidence_preview / run_title are AGENT-authored,
 //     untrusted: rendered as escaped JSX text through stripUnsafeChars, never Markdown (issue #124);
 //     any that reach a title=/aria-label= attribute are stripped there too (.claude/rules/web.md).
 //   - file/dismiss act on the coordinate's ids; a null finding_id (evidence cascaded away with a
-//     deleted run, D12) is a display-only, non-actionable row.
+//     deleted run, D12) cannot be filed or dismissed, but can still be marked done.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
@@ -95,14 +100,22 @@ function seenInRunsLabel(n: number): string {
   return `seen in ${n} runs`;
 }
 
+// canMarkDone is the Mark done eligibility (issue #1723): a coordinate with a disposition_id in
+// open, filed or dismissed. Evidence (finding_id) is NOT required — Mark done keys on the
+// disposition. A done row is excluded (a second Mark done is a no-op the UI does not offer), and so
+// is a mid-filing row (the server refuses it). Both the row's button and the checkbox read this.
+function canMarkDone(f: IncidentalFinding): boolean {
+  return !!f.disposition_id && (f.status === "open" || f.status === "filed" || f.status === "dismissed");
+}
+
 // UNDO_CONCURRENCY bounds the parallel DELETEs an Undo issues (lifted from Judge.tsx). Undo
-// re-expands, one request per coordinate, a dismiss the bulk endpoint collapsed into a single
+// re-expands, one request per coordinate, a verdict the bulk endpoint collapsed into a single
 // statement; firing them all at once from the browser is exactly the amplification the one-statement
 // write exists to prevent, moved to the client. Small enough to stay polite, large enough that a
 // realistic undo is not perceptibly serial.
 const UNDO_CONCURRENCY = 6;
 
-// A pending Undo: the message and the disposition ids to reopen. Kept as a plain string[] here (the
+// A pending Undo: the message and the disposition ids to undo (a dismiss's or a Mark done's). Kept as a plain string[] here (the
 // shared UndoToast's Toast.undo is JudgeSettledMember[], adapted at the render site below).
 type FindingsToast = { message: string; undo: string[] };
 
@@ -124,7 +137,8 @@ export function Findings() {
   // Coordinates that came back 409 (already filed/dismissed from elsewhere): best-effort, the backlog
   // is the source of truth, so the row shows a friendly note and a reload reconciles.
   const [resolvedIds, setResolvedIds] = useState<Set<string>>(new Set());
-  // The checkbox selection is keyed on DISPOSITION ids (what bulk dismiss and undo act on).
+  // The checkbox selection is keyed on DISPOSITION ids (what bulk Mark done, bulk dismiss and undo
+  // act on).
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [toast, setToast] = useState<FindingsToast | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -238,8 +252,8 @@ export function Findings() {
     );
   }, []);
 
-  // patchByDisposition flips a coordinate's fields in place keyed by disposition_id (the dismiss/undo
-  // path — a dismissed coordinate may have no finding_id to key by).
+  // patchByDisposition flips a coordinate's fields in place keyed by disposition_id (the dismiss /
+  // Mark done / undo path — such a coordinate may have no finding_id to key by).
   const patchByDisposition = useCallback((dispositionID: string, patch: Partial<IncidentalFinding>) => {
     setBacklog((prev) =>
       prev
@@ -278,58 +292,107 @@ export function Findings() {
     [patchByFinding, load, reloadStats],
   );
 
+  // settle patches every row a bulk verdict response re-read (exactly the rows that moved, never the
+  // skipped ones) and returns their disposition ids — the Undo set.
+  const settle = useCallback(
+    (rows: IncidentalFinding[]): string[] => {
+      const settled: string[] = [];
+      for (const row of rows) {
+        if (!row.disposition_id) continue;
+        settled.push(row.disposition_id);
+        patchByDisposition(row.disposition_id, {
+          status: row.status,
+          dismiss_reason: row.dismiss_reason,
+          set_via: row.set_via,
+          resolved_at: row.resolved_at,
+        });
+      }
+      return settled;
+    },
+    [patchByDisposition],
+  );
+
   // dismiss routes BOTH a single-row dismiss and a multi-select dismiss through the bulk endpoint
-  // (keyed on disposition_id), so Undo (also disposition_id) is symmetric with either. The response
-  // re-reads exactly the rows that moved; patch each in place, publish the fresh stats, and offer an
-  // Undo over the settled ids.
+  // (keyed on disposition_id), so Undo (also disposition_id) is symmetric with either. The server
+  // dismisses OPEN rows only and skips the rest of a mixed selection, so the count and the Undo set
+  // come from what it re-read (the rows that actually moved), never from the ids sent. Patch each in
+  // place, publish the fresh stats, and offer an Undo over the settled ids.
   const dismiss = useCallback(
     async (dispositionIDs: string[], reason: "wont_do" | "not_an_issue") => {
       if (dispositionIDs.length === 0) return;
       setActionErr("");
       try {
         const res = await api.dismissFindings(dispositionIDs, reason);
-        const settled: string[] = [];
-        for (const row of res.findings) {
-          if (!row.disposition_id) continue;
-          settled.push(row.disposition_id);
-          patchByDisposition(row.disposition_id, {
-            status: row.status,
-            dismiss_reason: row.dismiss_reason,
-            resolved_at: row.resolved_at,
-          });
-        }
+        const settled = settle(res.findings);
         reloadStats();
         setSelected(new Set());
         showToast({
           message:
-            res.updated === 0
+            settled.length === 0
               ? "Nothing to update — those findings were already resolved."
-              : `${res.updated} ${res.updated === 1 ? "finding" : "findings"} dismissed.`,
+              : `${settled.length} ${settled.length === 1 ? "finding" : "findings"} dismissed.`,
           undo: settled,
         });
       } catch (e) {
         setActionErr(errorMessage(e, "Could not dismiss the finding"));
       }
     },
-    [patchByDisposition, reloadStats, showToast],
+    [settle, reloadStats, showToast],
   );
 
+  // markDone is the human Mark done (issue #1723): single-row and multi-select both go through the
+  // bulk endpoint keyed on disposition_id, exactly like dismiss, so the toast's Undo is symmetric.
+  // The server skips a mid-filing/foreign/unknown id, so the message and the Undo set cover only
+  // the rows it actually applied.
+  const markDone = useCallback(
+    async (dispositionIDs: string[]) => {
+      if (dispositionIDs.length === 0) return;
+      setActionErr("");
+      try {
+        const res = await api.markFindingsDone(dispositionIDs);
+        const settled = settle(res.findings);
+        reloadStats();
+        setSelected(new Set());
+        showToast({
+          message:
+            settled.length === 0
+              ? "Nothing to update — none of those findings could be marked done."
+              : `${settled.length} ${settled.length === 1 ? "finding" : "findings"} marked done.`,
+          undo: settled,
+        });
+      } catch (e) {
+        setActionErr(errorMessage(e, "Could not mark the finding done"));
+      }
+    },
+    [settle, reloadStats, showToast],
+  );
+
+  // undo reverts the toast's verdict (a dismiss or a Mark done) on each settled coordinate through
+  // the one disposition route. The server decides where each lands — a done with an issue link back
+  // to filed, anything else to open — so the row is patched from the RETURNED row, never assumed.
   const undo = useCallback(async () => {
     const ids = toast?.undo ?? [];
     setToast(null);
     if (toastTimer.current) clearTimeout(toastTimer.current);
     if (ids.length === 0) return;
     setActionErr("");
-    // Reopen each dismissed coordinate at BOUNDED concurrency, one DELETE per disposition id — the
-    // same queue+workers shape Judge uses so a large undo cannot fan out unbounded from the browser,
-    // and a partial failure is reported honestly rather than masked by a first-rejection Promise.all.
+    // One DELETE per disposition id at BOUNDED concurrency — the same queue+workers shape Judge
+    // uses so a large undo cannot fan out unbounded from the browser, and a partial failure is
+    // reported honestly rather than masked by a first-rejection Promise.all.
     let failed = 0;
     const queue = [...ids];
     const workers = Array.from({ length: Math.min(UNDO_CONCURRENCY, queue.length) }, async () => {
       for (let id = queue.shift(); id !== undefined; id = queue.shift()) {
         try {
-          const row = await api.undoDismissFinding(id);
-          patchByDisposition(id, { status: row.status, dismiss_reason: undefined, resolved_at: row.resolved_at });
+          const row = await api.undoFinding(id);
+          patchByDisposition(id, {
+            status: row.status,
+            dismiss_reason: row.dismiss_reason,
+            set_via: row.set_via,
+            resolved_at: row.resolved_at,
+            filed_issue_iid: row.filed_issue_iid,
+            filed_issue_url: row.filed_issue_url,
+          });
         } catch {
           failed += 1;
         }
@@ -339,8 +402,8 @@ export function Findings() {
     if (failed > 0) {
       setActionErr(
         failed === ids.length
-          ? "Could not undo — nothing was reopened."
-          : `Partly undone: ${ids.length - failed} of ${ids.length} reopened, ${failed} failed. Re-check the affected findings.`,
+          ? "Could not undo — nothing was changed."
+          : `Partly undone: ${ids.length - failed} of ${ids.length} undone, ${failed} failed. Re-check the affected findings.`,
       );
     }
     reloadStats();
@@ -351,17 +414,31 @@ export function Findings() {
   const singleRepo = repoFilter !== "";
   const groups = useMemo(() => groupByRepo(backlog?.findings ?? []), [backlog]);
 
-  // Select-all + bulk dismiss act only on OPEN coordinates carrying a disposition id (the only rows
-  // the bulk endpoint can move). The rest of the list is not selectable.
-  const selectableIds = useMemo(
-    () =>
-      (backlog?.findings ?? [])
-        .filter((f) => f.status === "open" && !!f.disposition_id)
-        .map((f) => f.disposition_id as string),
-    [backlog],
+  // Select-all and the checkboxes cover the displayed Mark-done-eligible rows (canMarkDone: open,
+  // filed or dismissed, with a disposition id). Bulk Dismiss over a mixed selection moves only its
+  // open rows; the server skips the rest and the toast reports only what it dismissed.
+  // A 409'd row still reading open is stale (FindingRow's showResolved): it offers no Mark done
+  // button, so it offers no checkbox either. Once the reload returns it filed/dismissed it is
+  // selectable again, exactly when its button comes back.
+  const isStale = useCallback(
+    (f: IncidentalFinding) => f.status === "open" && !!f.finding_id && resolvedIds.has(f.finding_id),
+    [resolvedIds],
   );
-  const allSelected = selectableIds.length > 0 && selectableIds.every((id) => selected.has(id));
-  const someSelected = selectableIds.some((id) => selected.has(id));
+  const canSelect = useCallback((f: IncidentalFinding) => canMarkDone(f) && !isStale(f), [isStale]);
+  const selectableIds = useMemo(
+    () => (backlog?.findings ?? []).filter(canSelect).map((f) => f.disposition_id as string),
+    [backlog, canSelect],
+  );
+  // The EFFECTIVE selection is selected ∩ selectableIds: a row that stopped being selectable after
+  // it was ticked (it went stale after a 409, or a reload dropped or changed it) hides its checkbox,
+  // so it must also drop out of the bar count, select-all and every bulk action — a hidden row must
+  // never be sent. `selected` itself is left as-is; everything that reads it goes through this.
+  const activeSelected = useMemo(
+    () => selectableIds.filter((id) => selected.has(id)),
+    [selectableIds, selected],
+  );
+  const allSelected = selectableIds.length > 0 && activeSelected.length === selectableIds.length;
+  const someSelected = activeSelected.length > 0;
   const toggleSelectAll = (checked: boolean) => setSelected(checked ? new Set(selectableIds) : new Set());
   const toggleSelect = (id: string) =>
     setSelected((prev) => {
@@ -371,13 +448,13 @@ export function Findings() {
       return next;
     });
 
-  // Per-row handlers bound to the row's ids. File keys on finding_id (the evidence id); dismiss keys
-  // on disposition_id and routes through the bulk endpoint, so Undo (also disposition_id) is
-  // symmetric with a single-row dismiss.
+  // Per-row handlers bound to the row's ids. File keys on finding_id (the evidence id); dismiss and
+  // Mark done key on disposition_id and route through the bulk endpoints, so Undo (also
+  // disposition_id) is symmetric with a single-row verdict.
   const rowProps = (f: IncidentalFinding) => ({
     finding: f,
-    selectable: f.status === "open" && !!f.disposition_id,
-    selected: f.disposition_id ? selected.has(f.disposition_id) : false,
+    selectable: canSelect(f),
+    selected: canSelect(f) && f.disposition_id ? selected.has(f.disposition_id) : false,
     onToggleSelect: () => f.disposition_id && toggleSelect(f.disposition_id),
     repoLabel: stripUnsafeChars(maskRepoPath(f.repo_path, demo)),
     warning: f.finding_id ? filedWarnings[f.finding_id] : undefined,
@@ -386,6 +463,9 @@ export function Findings() {
       f.finding_id ? fileFinding(f.finding_id, body) : Promise.resolve(),
     onDismiss: (reason: "wont_do" | "not_an_issue") => {
       if (f.disposition_id) dismiss([f.disposition_id], reason);
+    },
+    onMarkDone: () => {
+      if (f.disposition_id) markDone([f.disposition_id]);
     },
   });
 
@@ -400,7 +480,7 @@ export function Findings() {
             Findings
           </h1>
         }
-        description="Off-task bugs your workers flagged mid-run, deduped per repo. File one as a real issue or dismiss it."
+        description="Off-task bugs your workers flagged mid-run, deduped per repo. File one as a real issue, mark it done, or dismiss it."
       />
 
       {error && <Alert message={error} />}
@@ -518,11 +598,12 @@ export function Findings() {
         )
       )}
 
-      {selected.size > 0 && (
+      {activeSelected.length > 0 && (
         <MultiSelectBar
-          count={selected.size}
+          count={activeSelected.length}
           onClear={() => setSelected(new Set())}
-          onDismiss={(reason) => dismiss([...selected], reason)}
+          onMarkDone={() => markDone(activeSelected)}
+          onDismiss={(reason) => dismiss(activeSelected, reason)}
         />
       )}
 
@@ -571,11 +652,12 @@ function groupByRepo(findings: IncidentalFinding[]): RepoGroup[] {
 
 // FindingRow is one coordinate on the shared triage row: the inert last_title, its location,
 // "seen in N runs" (from 2 up), the shared TriageStateChip, a chevron expander showing the newest
-// evidence and one link per run it was seen in, and the shared TriageActions (File issue · Dismiss ▾,
-// no Mark done — a finding's done comes only from its issue closing). A null finding_id row is
-// display-only (no actions); its evidence has cascaded away. A non-empty `warning` is the
-// created-with-warning note, surfaced inline beneath the row, mirroring the CLI.
-function FindingRow({
+// evidence and one link per run it was seen in, and the shared TriageActions: an open row with
+// evidence offers File issue · Mark done · Dismiss ▾; a filed or dismissed row, or an open row whose
+// evidence cascaded away (null finding_id), offers Mark done only; a done or mid-filing row offers
+// nothing. A non-empty `warning` is the created-with-warning note, surfaced inline beneath the row,
+// mirroring the CLI.
+export function FindingRow({
   finding,
   selectable,
   selected,
@@ -585,6 +667,7 @@ function FindingRow({
   resolved,
   onFile,
   onDismiss,
+  onMarkDone,
 }: {
   finding: IncidentalFinding;
   selectable: boolean;
@@ -595,15 +678,22 @@ function FindingRow({
   resolved: boolean;
   onFile: (body: { title: string; description: string; labels: string[] }) => Promise<void>;
   onDismiss: (reason: "wont_do" | "not_an_issue") => void;
+  onMarkDone: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [filing, setFiling] = useState(false);
-  const actionable = !!finding.finding_id && finding.status === "open" && !resolved;
+  // A 409'd row that still reads open (the reload has not reconciled it yet) is stale: it shows the
+  // neutral "already resolved" note in place of the chip and offers no action. resolvedIds outlives
+  // the reload (only a bucket/repo/run change clears it), so the suppression keys on the row still
+  // reading open: once the reload brings it back filed or dismissed, it is an ordinary row again and
+  // its Mark done button agrees with its checkbox (both canMarkDone).
+  const showResolved = resolved && finding.status === "open";
+  // File and Dismiss: an open row with evidence. Mark done: canMarkDone (no evidence needed).
+  const actionable = !!finding.finding_id && finding.status === "open" && !showResolved;
+  const markDoneable = canMarkDone(finding) && !showResolved;
   const seen = seenInRunsLabel(finding.seen_in_runs);
   const occurrences = finding.occurrences ?? [];
   const hasEvidence = (finding.evidence_preview?.trim() ?? "") !== "" || occurrences.length > 0;
-  // A 409'd stale row shows the neutral "already resolved" note in place of the chip.
-  const showResolved = resolved && finding.status === "open";
   // findingState wants the reason as the closed union; the wire types dismiss_reason as a bare
   // string, so narrow it here (an unknown reason falls to the bare "Dismissed").
   const dismissReason =
@@ -632,7 +722,7 @@ function FindingRow({
             className="mt-1 h-4 w-4 shrink-0 accent-brand"
           />
         )}
-        <div className="min-w-0 flex-1">
+        <div className="min-w-0 flex-1 basis-64">
           <p className="text-sm font-medium text-fg">{stripUnsafeChars(finding.last_title) || "Untitled finding"}</p>
           <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
             <code className="max-w-full break-all rounded bg-raised px-1.5 py-0.5 font-mono text-faint">
@@ -652,8 +742,13 @@ function FindingRow({
         </div>
 
         <div className="flex shrink-0 items-center gap-1.5">
-          {actionable && !filing && (
-            <TriageActions onFile={() => setFiling(true)} onDismiss={onDismiss} dismissCopy="finding" />
+          {(actionable || markDoneable) && !filing && (
+            <TriageActions
+              onFile={actionable ? () => setFiling(true) : undefined}
+              onMarkDone={markDoneable ? onMarkDone : undefined}
+              onDismiss={actionable ? onDismiss : undefined}
+              dismissCopy="finding"
+            />
           )}
           {hasEvidence && (
             <button

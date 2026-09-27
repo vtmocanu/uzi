@@ -1388,6 +1388,8 @@ func TestCoordinatedCodexRefreshRecoverySlotSurvivesCtxCancelLiveDB(t *testing.T
 //
 // FAILS OLD: the prior vault-locked branch quarantined an EMPTY recovery slot and later
 // reconciliation marked the operation unrecoverable, so its "retained" claim was false.
+// Issue #1766: the error is also ErrCodexVaultLocked (the handler answers 409 vault_locked),
+// and after unlock reconciliation promotes the retained login with no second exchange.
 func TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	newAccess := codexToken("access-new")
@@ -1405,6 +1407,9 @@ func TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB(t *testing.T) {
 	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0)
 	if !errors.Is(err, ErrCodexRefreshQuarantined) {
 		t.Fatalf("err = %v, want ErrCodexRefreshQuarantined (retained)", err)
+	}
+	if !errors.Is(err, ErrCodexVaultLocked) {
+		t.Fatalf("err = %v, want ErrCodexVaultLocked beside ErrCodexRefreshQuarantined", err)
 	}
 	if errors.Is(err, ErrCodexRefreshUnrecoverable) {
 		t.Fatalf("err = %v, must NOT be unrecoverable on a transient vault-locked seal", err)
@@ -1454,6 +1459,20 @@ func TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB(t *testing.T) {
 	}
 	if blob.AccessToken != newAccess {
 		t.Fatalf("promoted access token = %q, want retained %q", blob.AccessToken, newAccess)
+	}
+	// The retried op and a caller still at the old generation both reconcile to the
+	// promoted login with NO second provider exchange.
+	if it := mustIntent(t, env, op, f.userID); it.State != codexIntentReconciled {
+		t.Fatalf("intent state = %q, want reconciled", it.State)
+	}
+	for _, retryOp := range []uuid.UUID{op, uuid.New()} {
+		again, aerr := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, retryOp, 0)
+		if aerr != nil || again.AccessToken != newAccess || again.Generation != 1 {
+			t.Fatalf("post-unlock retry = (%+v, %v), want the promoted token at generation 1", again, aerr)
+		}
+	}
+	if fake.calls != 1 {
+		t.Fatalf("provider calls = %d, want still 1 (reconcile must not re-exchange)", fake.calls)
 	}
 }
 

@@ -122,8 +122,9 @@ type detailState struct {
 	// metaWaitID == 0 meaning idle — a boardTickMsg issues a new meta refresh only while idle.
 	// A detailMetaMsg is honoured only when its reqID == metaWaitID (and its runID matches),
 	// and a failed poll clears metaWaitID so the next tick retries (the D2 anti-wedge property).
-	// metaSeq restarts per run (newDetailState), which is safe because the detailMetaMsg case
-	// checks runID BEFORE comparing the id, so a reply for an old run can never match.
+	// metaSeq restarts per detail session (newDetailState), which is safe because the
+	// detailMetaMsg case checks runID and the session gen BEFORE comparing the id, so a reply
+	// for an old run, or an earlier session on the same run, can never match (#1151).
 	metaSeq    uint64
 	metaWaitID uint64
 
@@ -774,6 +775,17 @@ func (m tuiModel) renderDetail() string {
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)), m.width) + "\n")
 	}
 
+	// The vault park line (issue #1766), in the same slot and wait ink as the Codex hold line
+	// above: a vault_locked park is a recovery_wait run whose cause differs from the Codex hold's,
+	// so the two never both draw. fitVaultParkLine sheds the explanation to m.width so the
+	// retry HH:MM (at the sentence's end) survives instead of being clamped away; the 240-rune
+	// cap matches the board's second line (the full sentence is longer than 120), and
+	// clampVisual is the narrow-terminal backstop keeping it one physical row, which
+	// transcriptViewport charges (the #379 invariant).
+	if line := fitVaultParkLine(d.run, m.width); line != "" {
+		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
+	}
+
 	// The near-timeout countdown (PRD #1170), the run detail's OTHER conditional second
 	// row. Drawn only while the run is flagged `slow` and carries a deadline_at, in the
 	// stall colour that matches the ▲ token above. fitNearTimeoutLine sheds clauses to
@@ -795,7 +807,11 @@ func (m tuiModel) renderDetail() string {
 	// show on such a parked run too, matching the web's pending chip and `run get`'s
 	// PAUSE_REQUESTED row. On a limit_wait run both this and the rate-limit park line above
 	// draw: the run is held on a limit AND carries a pending pause.
-	if d.run.Status == statusPaused {
+	if line := credentialDisabledLine(d.run); line != "" {
+		// PRD #1732 D14: a credential_disabled hold is a server park, not an owner pause, so it
+		// must not read "paused by you". Same slot and colour; clampVisual keeps it one row.
+		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)), m.width) + "\n")
+	} else if d.run.Status == statusPaused {
 		line := pausedLine(d.run, time.Now(), m.width)
 		sb.WriteString(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, m.width)) + "\n")
 	} else if d.run.PauseRequestedAt != nil {

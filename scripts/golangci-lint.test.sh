@@ -75,6 +75,14 @@ assert_eq "$TASK_PIN" "$LINUX_PIN" "Taskfile/Linux pin"
 FAKE_BIN="$TMP/bin"
 mkdir -p "$FAKE_BIN"
 
+# Real tools the wrapper (and its fakes) need when run under a curl-free PATH.
+# Resolved now, from the caller's PATH, so the wget cases can link them.
+NO_CURL_REAL_TOOLS=""
+for tool in awk cat chmod cmp cp mkdir mv rm sort tr wc; do
+  tool_path="$(command -v "$tool")" || fail "required tool not found: $tool"
+  NO_CURL_REAL_TOOLS="$NO_CURL_REAL_TOOLS $tool_path"
+done
+
 cat > "$FAKE_BIN/uname" <<'EOF'
 #!/bin/sh
 case "${1:-}" in
@@ -103,6 +111,7 @@ EOF
 
 cat > "$FAKE_BIN/curl" <<'EOF'
 #!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_CURL_ARGV_LOG:-/dev/null}"
 [ "${FAKE_DOWNLOAD_FAIL:-0}" != "1" ] || exit 22
 if [ "${FAKE_DOWNLOAD_DELAY:-0}" != "0" ]; then
   sleep "$FAKE_DOWNLOAD_DELAY"
@@ -120,6 +129,38 @@ done
 [ -n "$out" ] || exit 2
 printf 'archive:%s:%s\n' "$FAKE_ASSET" "$FAKE_VERSION" > "$out"
 printf '%s\n' "$FAKE_ASSET" >> "$FAKE_DOWNLOAD_LOG"
+EOF
+
+# Fails its first FAKE_WGET_FAIL_FIRST calls, each leaving partial junk at the
+# -O target, then writes the same archive the fake curl does. It logs whether
+# the target already existed, so a leftover partial file is observable.
+cat > "$FAKE_BIN/wget" <<'EOF'
+#!/bin/sh
+count=0
+if [ -s "$FAKE_WGET_COUNT_FILE" ]; then count="$(cat "$FAKE_WGET_COUNT_FILE")"; fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$FAKE_WGET_COUNT_FILE"
+out=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -*O)
+      shift
+      out="${1:-}"
+      ;;
+  esac
+  shift
+done
+[ -n "$out" ] || exit 2
+if [ -e "$out" ]; then
+  printf 'call %s: target preexisted\n' "$count" >> "$FAKE_WGET_LOG"
+else
+  printf 'call %s: target absent\n' "$count" >> "$FAKE_WGET_LOG"
+fi
+if [ "$count" -le "${FAKE_WGET_FAIL_FIRST:-0}" ]; then
+  printf 'partial-junk' >> "$out"
+  exit 4
+fi
+printf 'archive:%s:%s\n' "$FAKE_ASSET" "$FAKE_VERSION" > "$out"
 EOF
 
 cat > "$FAKE_BIN/gzip" <<'EOF'
@@ -240,7 +281,26 @@ child.once("exit", (code, signal) => {
 });
 EOF
 chmod +x "$FAKE_BIN/uname" "$FAKE_BIN/mktemp" "$FAKE_BIN/sha256sum" "$FAKE_BIN/curl" \
-  "$FAKE_BIN/gzip" "$FAKE_BIN/go" "$FAKE_BIN/tar" "$FAKE_LINTER_TEMPLATE"
+  "$FAKE_BIN/wget" "$FAKE_BIN/gzip" "$FAKE_BIN/go" "$FAKE_BIN/tar" "$FAKE_LINTER_TEMPLATE"
+
+# A curl-free PATH for the wget cases: the FAKE_BIN fakes minus curl, the real
+# tools resolved above, and a no-op sleep that records its argument, so the
+# retry wait costs nothing but stays observable.
+NO_CURL_BIN="$TMP/bin-no-curl"
+mkdir -p "$NO_CURL_BIN"
+for fake in "$FAKE_BIN"/*; do
+  [ "$(basename "$fake")" = "curl" ] || ln -s "$fake" "$NO_CURL_BIN/"
+done
+for tool_path in $NO_CURL_REAL_TOOLS; do
+  ln -s "$tool_path" "$NO_CURL_BIN/$(basename "$tool_path")"
+done
+SLEEP_LOG="$TMP/sleep.log"
+cat > "$NO_CURL_BIN/sleep" <<EOF
+#!/bin/sh
+printf '%s\\n' "\$1" >> "$SLEEP_LOG"
+EOF
+chmod +x "$NO_CURL_BIN/sleep"
+[ ! -e "$NO_CURL_BIN/curl" ] || fail "curl-free PATH still contains curl"
 
 DOWNLOAD_LOG="$TMP/downloads.log"
 EXEC_LOG="$TMP/executions.log"
@@ -249,12 +309,18 @@ MKTEMP_LOG="$TMP/mktemp.log"
 CHILD_PID_FILE="$TMP/child.pid"
 WRAPPER_PID_FILE="$TMP/wrapper.pid"
 SIGNAL_LOG="$TMP/signals.log"
+CURL_ARGV_LOG="$TMP/curl-argv.log"
+WGET_COUNT_FILE="$TMP/wget-count"
+WGET_LOG="$TMP/wget.log"
 READINESS_MAX_TRIES=500 # 10s at the 20ms polling interval, bounded but tolerant of loaded CI.
 mkdir -p "$WRAPPER_TMP_ROOT"
 : > "$DOWNLOAD_LOG"
 : > "$EXEC_LOG"
 : > "$MKTEMP_LOG"
 : > "$SIGNAL_LOG"
+: > "$CURL_ARGV_LOG"
+: > "$WGET_COUNT_FILE"
+: > "$WGET_LOG"
 RUN_RC=0
 
 run_wrapper() {
@@ -287,7 +353,7 @@ run_wrapper() {
   (
     cd "$cwd"
     env \
-      PATH="$FAKE_BIN:$PATH" \
+      PATH="${WRAPPER_PATH:-$FAKE_BIN:$PATH}" \
       FAKE_MKTEMP_ROOT="$WRAPPER_TMP_ROOT" \
       FAKE_MKTEMP_LOG="$MKTEMP_LOG" \
       UZI_GOLANGCI_LINT_DIR="$cache" \
@@ -299,6 +365,10 @@ run_wrapper() {
       FAKE_DOWNLOAD_FAIL="$download_fail" \
       FAKE_DOWNLOAD_DELAY="${FAKE_DOWNLOAD_DELAY:-0}" \
       FAKE_DOWNLOAD_LOG="$DOWNLOAD_LOG" \
+      FAKE_CURL_ARGV_LOG="$CURL_ARGV_LOG" \
+      FAKE_WGET_FAIL_FIRST="${FAKE_WGET_FAIL_FIRST:-0}" \
+      FAKE_WGET_COUNT_FILE="$WGET_COUNT_FILE" \
+      FAKE_WGET_LOG="$WGET_LOG" \
       FAKE_TAR_EXTRA="${FAKE_TAR_EXTRA:-0}" \
       FAKE_TAR_LINK="${FAKE_TAR_LINK:-0}" \
       FAKE_TAR_EMPTY_BINARY="${FAKE_TAR_EMPTY_BINARY:-0}" \
@@ -445,6 +515,13 @@ run_wrapper "$TMP/darwin-warm.out" Darwin arm64 "$DARWIN_CACHE" "$TMP" 1.26.2 0 
 assert_eq 0 "$RUN_RC" "Darwin warm offline run"
 assert_eq 1 "$(grep -Fxc 'darwin-arm64' "$DOWNLOAD_LOG")" "Darwin download count"
 
+# The curl download is invoked with retry flags; a connection reset is only
+# retried under --retry-all-errors (issue #1144). An argv check, not a simulation.
+assert_eq 1 "$(wc -l < "$CURL_ARGV_LOG" | tr -d ' ')" "Darwin cold curl invocation count"
+assert_contains "$CURL_ARGV_LOG" "--retry 3"
+assert_contains "$CURL_ARGV_LOG" "--retry-all-errors"
+assert_contains "$CURL_ARGV_LOG" "--retry-delay 2"
+
 # Linux uses its own archive and digest rather than reusing Darwin's.
 LINUX_CACHE="$TMP/cache-linux"
 run_wrapper "$TMP/linux-cold.out" Linux x86_64 "$LINUX_CACHE" "$TMP" 1.26.2 0 0 version
@@ -478,6 +555,40 @@ wait "$pid_a" || rc_a=$?
 wait "$pid_b" || rc_b=$?
 assert_eq 0 "$rc_a" "concurrent corrupt caller A"
 assert_eq 0 "$rc_b" "concurrent corrupt caller B"
+
+# Without curl, wget is retried in an explicit loop: two transient failures
+# (each leaving partial junk) are followed by a clean third attempt, with a
+# 2s wait after each failure.
+WGET_RETRY_CACHE="$TMP/cache-wget-retry"
+: > "$EXEC_LOG"
+: > "$WGET_COUNT_FILE"
+: > "$WGET_LOG"
+: > "$SLEEP_LOG"
+WRAPPER_PATH="$NO_CURL_BIN"
+FAKE_WGET_FAIL_FIRST=2
+run_wrapper "$TMP/wget-retry.out" Linux x86_64 "$WGET_RETRY_CACHE" "$TMP" 1.26.2 0 0 run ./...
+unset WRAPPER_PATH FAKE_WGET_FAIL_FIRST
+assert_eq 0 "$RUN_RC" "wget retry after two transient failures"
+assert_eq 3 "$(cat "$WGET_COUNT_FILE")" "wget retry call count"
+assert_eq 2 "$(grep -Fxc '2' "$SLEEP_LOG" || true)" "wget retry waits"
+assert_contains "$EXEC_LOG" "run ./..."
+# Every attempt starts from a removed target, so partial output never accumulates.
+assert_eq 0 "$(grep -Fc 'target preexisted' "$WGET_LOG" || true)" "wget attempts with a leftover target"
+
+# A wget that never succeeds gives up after four attempts (three retries) and
+# executes nothing.
+WGET_FAIL_CACHE="$TMP/cache-wget-fail"
+: > "$EXEC_LOG"
+: > "$WGET_COUNT_FILE"
+: > "$WGET_LOG"
+WRAPPER_PATH="$NO_CURL_BIN"
+FAKE_WGET_FAIL_FIRST=1000
+run_wrapper "$TMP/wget-fail.out" Linux x86_64 "$WGET_FAIL_CACHE" "$TMP" 1.26.2 0 0 run ./...
+unset WRAPPER_PATH FAKE_WGET_FAIL_FIRST
+assert_eq 2 "$RUN_RC" "wget always failing"
+assert_contains "$TMP/wget-fail.out" "bounded download failed"
+assert_eq 4 "$(cat "$WGET_COUNT_FILE")" "wget failing call count"
+assert_empty "$EXEC_LOG"
 
 # A corrupt cache plus a failed replacement download executes no binary.
 CORRUPT_CACHE="$TMP/cache-corrupt"

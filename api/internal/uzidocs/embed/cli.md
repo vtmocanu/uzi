@@ -138,6 +138,7 @@ uzi review file <id> <rec> [--repo <repo-id>]
 uzi findings list [--repo <id>] [--bucket to_file|filed|done|dismissed|all] [--run <id>]
 uzi findings file <finding-id>
 uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
+uzi findings resolve <finding-id>
 uzi findings undo <disposition-id>
 uzi findings stats [--repo <id>] [--json]
 uzi handoff -m <text> | -f <path> [--base <ref>] [--mr] [--review] [--then-fix] [--interactive] [--repo <id>]
@@ -1487,14 +1488,16 @@ uzi findings list --run <run-id>                             # coordinates that 
 uzi findings file <finding-id>                               # file a forge issue from a coordinate
 uzi findings dismiss <finding-id> --reason wont-do           # valid, not worth doing
 uzi findings dismiss <finding-id> --reason not-an-issue      # false positive
-uzi findings undo <disposition-id>                           # reopen a dismissal
+uzi findings resolve <finding-id>                            # mark it done yourself
+uzi findings undo <disposition-id>                           # undo a done or a dismissal
 uzi findings stats [--repo <repo-id>]                        # your triage totals, across your repos
 ```
 
 `list` prints one row per `(repo, location)` coordinate, grouped by repo, carrying
 the actionable `finding_id`, the latest title, `seen in N runs`, and a state — a
-dismissed row shows its reason (`Dismissed · Won't do` / `Dismissed · Not an issue`)
-and a coordinate the issue-close sync settled (below) reads `Done via #N`. The
+dismissed row shows its reason (`Dismissed · Won't do` / `Dismissed · Not an issue`), a
+coordinate you marked done yourself reads `done`, and one the issue-close sync settled
+(below) reads `Done via #N`. The
 `open_count` (what still needs triage) prints as a meta line and rides the `--json`
 envelope. `--bucket` filters by disposition and defaults to `to_file`; `filed`,
 `done`, `dismissed` and `all` show the rest. `--repo <repo-id>` (from
@@ -1518,13 +1521,25 @@ A missing or invalid `--reason` is a usage error (exit 2) raised before any requ
 sent; a coordinate that is not dismissable (already filed, being filed, or already
 dismissed) is a conflict (exit 5), and an unknown or foreign id is not-found (exit 4).
 
-`undo` reopens a dismissed coordinate back to `to_file`. It keys on the coordinate's
-`disposition_id`, **not** the `finding_id` the human `list` view and `file`/`dismiss`
-use — `disposition_id` is always present (a dismissed coordinate can outlive its own
-evidence, while `finding_id` goes nil once that evidence is gone), so read it off
-`--json`, not off `list`'s table. A coordinate that is not currently dismissed —
-unknown, foreign, or never dismissed — is treated as already-undone: a friendly line,
-exit 0, never a crash.
+`resolve` is the twin of [`review resolve`](#reviewing-and-triaging-from-the-cli): it
+marks a coordinate **done** yourself, the human counterpart to the issue-close sync
+below. It works from `to_file`, `filed`, or `dismissed` (a done from `dismissed`
+replaces the dismissal; resolving a coordinate the sync already set — `Done via #N`
+— converts it to a human done rather than re-asserting the sync verdict). The only
+refusal is a coordinate whose issue is currently being filed — a conflict (exit 5);
+an unknown or foreign id is not-found (exit 4). It prints the disposition id `uzi
+findings undo` takes; `--json` returns `{finding, status, disposition_id}` — no other
+keys, so read the disposition id off there rather than off `list`'s table.
+
+`undo` reopens a dismissed or done coordinate. From `dismissed` it goes back to
+`open` (the To triage bucket); from a done it exposes `filed` if the coordinate has a
+filed issue, otherwise `open` — it never restores a dismissal a done replaced. It keys on the
+coordinate's `disposition_id`, **not** the `finding_id` the human `list` view and
+`file`/`dismiss`/`resolve` use — `disposition_id` is always present (a dismissed or
+done coordinate can outlive its own evidence, while `finding_id` goes nil once that
+evidence is gone), so read it off `--json`, not off `list`'s table. A coordinate with
+no disposition to undo — unknown, foreign, or never dismissed or done — is treated as
+already-undone: a friendly line, exit 0, never a crash.
 
 `stats` prints your Findings triage totals (total, to triage, filed, done, dismissed,
 false positives) across every repo you own; `--repo <repo-id>` narrows it to one (a
@@ -1533,7 +1548,7 @@ totals object. It's the same number the web nav badge and the Findings tabs show
 the same repo scope.
 
 `<finding-id>` is the id `list` prints as the first column of each coordinate; paste
-it straight into `file`/`dismiss`. Treat `location`, the title and `repo_path` as
+it straight into `file`/`dismiss`/`resolve`. Treat `location`, the title and `repo_path` as
 untrusted free text (they are agent-authored): render them as data, and branch only
 on the `status`/`bucket` enums.
 
@@ -1544,7 +1559,7 @@ point individual workers at them. The CLI can **read** that set and **move a
 worker between its members** — it cannot change the set itself:
 
 ```sh
-uzi token list                                 # labels, default flag, pool opt-in, live eligibility
+uzi token list                                 # labels, default flag, pool opt-in, live eligibility, enabled state
 uzi token pool console-key --on                # add it to the auto-selection pool
 uzi token pool console-key --off               # take it back out
 uzi worker set-token <worker-id> console-key   # bind a worker to a named token
@@ -1577,6 +1592,17 @@ Under `--json` the same answer is the `auto_status` field. It is always
 present and is **`null` when it is not known** — which is not the same as
 "not eligible", so branch on null before you branch on the value. An
 un-pooled token reports `not_pooled` there rather than the table's `-`.
+
+The last column, `STATE`, is `enabled` or `disabled since <date>` for a
+credential you have [disabled](./anthropic-token.md#disabling-a-token) in
+Settings; `--json` carries it as `enabled` (true/false) and `disabled_at`
+(null while enabled). A disabled token keeps its `POOL` opt-in but reads `-`
+under `ELIGIBLE`, since nothing picks it while it is disabled; under `--json`
+its `auto_status` is `null`, because uzi reads no usage for it, so a script
+checks `enabled` first and treats a `null` `auto_status` as "unknown" only for
+an enabled token. `uzi token pool <name> --on` refuses a disabled token.
+Disabling and enabling are
+web-only; the CLI has no command for them.
 
 `uzi worker list` carries a `TOKEN` column showing how each worker chooses:
 the token's **name** when it is pinned, or `default` / `auto`. An `auto`
@@ -1791,7 +1817,11 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
 - `recovery_wait` — parked to recover from a resumed turn that came back empty
   (no model activity) or hit a transient provider error; the sweep auto-resumes
   it on a capped backoff until it recovers or you cancel it — see [Recovering
-  from a transient interruption](run-recovery-wait.md). A Codex subscription
+  from a transient interruption](run-recovery-wait.md). A Codex credential
+  refresh or release that found the owner's vault locked also parks here
+  (cause `vault_locked`); it takes the same capped backoff and no lifetime
+  cap, and resumes once its timer promotes it and the vault is unlocked — see
+  [Vault locked](run-recovery-wait.md#vault-locked). A Codex subscription
   run can also park here because its account is quarantined or needs a fresh
   login (cause `codex_account_unavailable`); unlike the transient park it has
   no backoff or cap, and it resumes when the account is usable again, or fails
@@ -1811,7 +1841,15 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
   pause carries none of them. Before it parks that way, an interlocked run
   also passes through two running-state `COMPLETION` labels of its own —
   **Checking completion** and **Reworking unmet milestones** — still `status:
-  running` underneath, not a distinct CLI status value.
+  running` underneath, not a distinct CLI status value. A `paused` run can
+  also be **waiting on a disabled credential** (`hold_reason:
+  credential_disabled`): a token or Codex login it needs was [disabled in
+  Settings](anthropic-token.md#work-that-needs-a-disabled-token-waits). It
+  resumes on its own once that credential is enabled again. `run get` prints
+  a `HOLD` row reading `credential disabled` with the next step (enable it in
+  Settings, or `uzi run set-token` where the run accepts a token switch),
+  `run list` shows `paused (credential disabled)`, and the TUI draws it as
+  `⊘ cred disabled` in NEEDS YOU.
 
 `limit_wait` and `recovery_wait` auto-resume on their own on a timer — nothing
 to do but wait or cancel; `pool_wait` instead clears only when a token is

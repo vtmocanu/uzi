@@ -512,6 +512,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = $1 AND worker_id = $2
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
@@ -700,7 +701,31 @@ WITH target AS (
       -- non-positive @custody_hold_limit DISABLES the gate (limit "<= 0" means unlimited),
       -- so it never blocks an ordinary claim; the production caller always passes the
       -- configured positive default (workersvc.custodyHoldLimit, 8).
+      --
+      -- Issue #1751 / ADR-1751: CONTINUATION EXEMPTION. A requeued run that was already
+      -- claimed before (claim_generation >= 1) AND still holds its OWN open custody hold
+      -- (same owner, same run_id) is exempt from the custody-count admission check: it is
+      -- continuing work the owner already has in custody, not new work. The continuation may
+      -- create another generation hold (the hold CTE below opens one per claim), but is exempt
+      -- from custody-count admission. A fresh run (generation 0), or one whose own holds are
+      -- all released/discarded, still faces the cap. The #1318 overshoot under concurrent
+      -- claims still stands: this is an admission gate, not a strict ceiling.
+      --
+      -- The exemption is BOUNDED PER RUN: it holds only while the run's OWN open-hold count
+      -- is below @custody_hold_limit (and at least one). Without the bound a claimed run that never
+      -- reports running is swept back to queued by SweepClaimedNeverStarted (no requeue_count
+      -- bump, no hold release), reclaims under the exemption, opens another generation hold,
+      -- and loops forever; the owner cap used to stop that loop. Once a single run holds
+      -- @custody_hold_limit open holds of its own, it faces the owner cap like new work. The
+      -- same exemption expression is mirrored by GetCustodyAdmissionForRun (health reason) and
+      -- GetCustodyAggregateForOwner.blocked_runs, so the pill, the aggregate and the claim
+      -- agree.
       AND ($10::int <= 0
+           OR (r.claim_generation >= 1
+               AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
+                             WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
+               AND (SELECT count(*) FROM recovery_custody_holds oh2
+                      WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < $10::int)
            OR (SELECT count(*) FROM recovery_custody_holds ch
                  WHERE ch.user_id = $2 AND ch.state = 'open') < $10::int)
       -- PRD #1226 M1 (D2): the NON-BYPASSABLE completion-protocol claim clause. An
@@ -2113,21 +2138,6 @@ func (q *Queries) CountRunsAwaitingUsageRefold(ctx context.Context) (int64, erro
 	return count, err
 }
 
-const countUnresolvedCustodyHoldsForOwner = `-- name: CountUnresolvedCustodyHoldsForOwner :one
-SELECT count(*) FROM recovery_custody_holds WHERE user_id = $1 AND state = 'open'
-`
-
-// PRD #1296 M1 (D2/D4): the owner's UNRESOLVED (state='open') custody-hold count — the
-// same admission signal the ClaimRun predicate blocks on. A later milestone's health
-// resolver reads this to surface a distinct custody-limit queued reason against the SAME
-// decision the claim used, so the pill and the claim never disagree.
-func (q *Queries) CountUnresolvedCustodyHoldsForOwner(ctx context.Context, userID uuid.UUID) (int64, error) {
-	row := q.db.QueryRow(ctx, countUnresolvedCustodyHoldsForOwner, userID)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
-
 const countUsersPausedWithEnabledSchedules = `-- name: CountUsersPausedWithEnabledSchedules :one
 SELECT count(*) FROM (
     SELECT u.id
@@ -3059,7 +3069,7 @@ const createWorker = `-- name: CreateWorker :one
 
 INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id, anthropic_bind_mode)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes
 `
 
 type CreateWorkerParams struct {
@@ -3140,6 +3150,10 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 		&i.SnapshotRegisterNonce,
 		&i.PendingOverflow,
 		&i.PendingOverflowUntil,
+		&i.StatsDiskDindBytes,
+		&i.StatsDiskDindTotalBytes,
+		&i.StatsDiskDindInodes,
+		&i.StatsDiskDindTotalInodes,
 	)
 	return i, err
 }
@@ -3211,6 +3225,42 @@ type DeleteWorkerForUserParams struct {
 
 func (q *Queries) DeleteWorkerForUser(ctx context.Context, arg DeleteWorkerForUserParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteWorkerForUser, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const discardRunInputRows = `-- name: DiscardRunInputRows :execrows
+UPDATE run_user_inputs SET applied_at = now(), disposition = 'superseded'
+WHERE run_id = $1 AND id = ANY($2::bigint[]) AND kind = 'approve_plan'
+  AND consumed_claim_generation = $3 AND consumed_worker_id = $4
+  AND consumed_at IS NOT NULL AND applied_at IS NULL
+`
+
+type DiscardRunInputRowsParams struct {
+	RunID           uuid.UUID   `json:"run_id"`
+	Ids             []int64     `json:"ids"`
+	ClaimGeneration pgtype.Int8 `json:"claim_generation"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+}
+
+// Issue #1604: settle approve_plan rows the worker DISCARDED as stale (a replayed verdict sent
+// against an earlier plan) without counting them as approval. A discarded approve is never
+// APPLIED, so without this it stayed applied_at IS NULL forever, and ListReplayRunInputs'
+// LIMIT 1000 oldest-first window would fill with them and starve every later cancel,
+// follow_up, answer or pause. applied_at takes the row off the replay list; disposition
+// 'superseded' (00162's CHECK already allows it) is what the approval readers
+// (GetRunClaimContext's human_plan_approved, SetRunRunning's awaiting_approval clause) exclude.
+// Same claim fence as ApplyRunInputRows, plus kind = 'approve_plan' so no other kind can be
+// settled this way even if the service check were bypassed.
+func (q *Queries) DiscardRunInputRows(ctx context.Context, arg DiscardRunInputRowsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, discardRunInputRows,
+		arg.RunID,
+		arg.Ids,
+		arg.ClaimGeneration,
+		arg.WorkerID,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -3907,6 +3957,46 @@ func (q *Queries) GetConsumedCompletionPermit(ctx context.Context, arg GetConsum
 	return i, err
 }
 
+const getCustodyAdmissionForRun = `-- name: GetCustodyAdmissionForRun :one
+SELECT
+    (SELECT count(*) FROM recovery_custody_holds h
+        WHERE h.user_id = $1::uuid AND h.state = 'open')::bigint AS open_holds,
+    COALESCE((SELECT (r.claim_generation >= 1
+                      AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
+                                    WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
+                      AND (SELECT count(*) FROM recovery_custody_holds oh2
+                             WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < $2::int)
+                FROM runs r
+                WHERE r.id = $3::uuid AND r.user_id = $1::uuid), false)::boolean AS continuation_exempt
+`
+
+type GetCustodyAdmissionForRunParams struct {
+	UserID           uuid.UUID `json:"user_id"`
+	CustodyHoldLimit int32     `json:"custody_hold_limit"`
+	RunID            uuid.UUID `json:"run_id"`
+}
+
+type GetCustodyAdmissionForRunRow struct {
+	OpenHolds          int64 `json:"open_holds"`
+	ContinuationExempt bool  `json:"continuation_exempt"`
+}
+
+// Issue #1751 / ADR-1751: the per-run custody-admission facts the health resolver reads so
+// its reasonCustodyLimit pill agrees with ClaimRun. open_holds is the owner's UNRESOLVED
+// (state='open') hold count, the same count ClaimRun's custody clause compares against
+// @custody_hold_limit; continuation_exempt is ClaimRun's continuation exemption, byte-for-byte
+// the same expression: the run was claimed before (claim_generation >= 1) AND its OWN open
+// custody-hold count (owner-scoped) is at least 1 and below @custody_hold_limit. The upper bound
+// stops a run that the never-started sweep keeps requeueing from opening holds forever (see
+// ClaimRun). An exempt run is never blocked by the custody cap. A run that does not exist (or
+// belongs to another owner), or a non-positive limit, yields continuation_exempt = false.
+func (q *Queries) GetCustodyAdmissionForRun(ctx context.Context, arg GetCustodyAdmissionForRunParams) (GetCustodyAdmissionForRunRow, error) {
+	row := q.db.QueryRow(ctx, getCustodyAdmissionForRun, arg.UserID, arg.CustodyHoldLimit, arg.RunID)
+	var i GetCustodyAdmissionForRunRow
+	err := row.Scan(&i.OpenHolds, &i.ContinuationExempt)
+	return i, err
+}
+
 const getForgeTypeForRepo = `-- name: GetForgeTypeForRepo :one
 SELECT c.forge_type
 FROM repos r
@@ -4456,7 +4546,10 @@ SELECT r.checkpoint_tip,
        (EXISTS (SELECT 1 FROM run_user_inputs i
                 WHERE i.run_id = r.id
                   AND i.kind = 'approve_plan'
-                  AND i.applied_at IS NOT NULL))::boolean AS human_plan_approved
+                  AND i.applied_at IS NOT NULL
+                  -- Issue #1604: a discarded (stale) approve is settled with applied_at AND
+                  -- disposition 'superseded' (DiscardRunInputRows); it is not an approval.
+                  AND i.disposition IS DISTINCT FROM 'superseded'))::boolean AS human_plan_approved
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id -- #1688: owner-scoped token
@@ -4507,7 +4600,8 @@ type GetRunClaimContextRow struct {
 // property of the QUERY PAIR and not of the worker's loop:
 //   - a park is running-only (SetRunLimitWait's positive source guard), and
 //   - a revise round sits at awaiting_approval, which SetRunRunning refuses to
-//     leave for 'running' unless a consumed approve_plan exists.
+//     leave for 'running' unless a consumed approve_plan exists (applied, and not
+//     settled as discarded with disposition 'superseded', issue #1604).
 //
 // So the ordinary multi-round revise flow cannot reach a park at all. The one
 // surviving residual is the stale round-2 pre-gate report SetRunRunning's comment
@@ -5200,7 +5294,7 @@ func (q *Queries) GetUnconsumedCompletionPermit(ctx context.Context, arg GetUnco
 }
 
 const getWorkerByID = `-- name: GetWorkerByID :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until FROM workers WHERE id = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes FROM workers WHERE id = $1
 `
 
 func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, error) {
@@ -5244,12 +5338,16 @@ func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, erro
 		&i.SnapshotRegisterNonce,
 		&i.PendingOverflow,
 		&i.PendingOverflowUntil,
+		&i.StatsDiskDindBytes,
+		&i.StatsDiskDindTotalBytes,
+		&i.StatsDiskDindInodes,
+		&i.StatsDiskDindTotalInodes,
 	)
 	return i, err
 }
 
 const getWorkerByIDForUser = `-- name: GetWorkerByIDForUser :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until FROM workers WHERE id = $1 AND user_id = $2
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes FROM workers WHERE id = $1 AND user_id = $2
 `
 
 type GetWorkerByIDForUserParams struct {
@@ -5298,12 +5396,16 @@ func (q *Queries) GetWorkerByIDForUser(ctx context.Context, arg GetWorkerByIDFor
 		&i.SnapshotRegisterNonce,
 		&i.PendingOverflow,
 		&i.PendingOverflowUntil,
+		&i.StatsDiskDindBytes,
+		&i.StatsDiskDindTotalBytes,
+		&i.StatsDiskDindInodes,
+		&i.StatsDiskDindTotalInodes,
 	)
 	return i, err
 }
 
 const getWorkerByTokenHash = `-- name: GetWorkerByTokenHash :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until FROM workers WHERE token_hash = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes FROM workers WHERE token_hash = $1
 `
 
 // Worker auth: Bearer join token → sha256 → this lookup.
@@ -5348,12 +5450,16 @@ func (q *Queries) GetWorkerByTokenHash(ctx context.Context, tokenHash []byte) (W
 		&i.SnapshotRegisterNonce,
 		&i.PendingOverflow,
 		&i.PendingOverflowUntil,
+		&i.StatsDiskDindBytes,
+		&i.StatsDiskDindTotalBytes,
+		&i.StatsDiskDindInodes,
+		&i.StatsDiskDindTotalInodes,
 	)
 	return i, err
 }
 
 const getWorkerForUpdate = `-- name: GetWorkerForUpdate :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until FROM workers WHERE id = $1 FOR UPDATE
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes FROM workers WHERE id = $1 FOR UPDATE
 `
 
 // PRD #1390 M2a: lock the worker row FOR UPDATE at the top of the Register transaction, in
@@ -5402,6 +5508,10 @@ func (q *Queries) GetWorkerForUpdate(ctx context.Context, id uuid.UUID) (Worker,
 		&i.SnapshotRegisterNonce,
 		&i.PendingOverflow,
 		&i.PendingOverflowUntil,
+		&i.StatsDiskDindBytes,
+		&i.StatsDiskDindTotalBytes,
+		&i.StatsDiskDindInodes,
+		&i.StatsDiskDindTotalInodes,
 	)
 	return i, err
 }
@@ -5426,6 +5536,14 @@ UPDATE workers SET
     stats_disk_nix_total_bytes  = $6,
     stats_disk_data_bytes       = $7,
     stats_disk_data_total_bytes = $8,
+    -- docker-in-docker volume sample (issue #1759): bytes AND inodes, same
+    -- write-every-tick-incl-NULL discipline; display-only, NEVER a disk_pressure input
+    -- (diskOverThreshold reads nix/data only, and @disk_over_threshold below never
+    -- sees these columns).
+    stats_disk_dind_bytes        = $9,
+    stats_disk_dind_total_bytes  = $10,
+    stats_disk_dind_inodes       = $11,
+    stats_disk_dind_total_inodes = $12,
     -- Disk-pressure debounce streak (PRD #837 M4). Increment (bounded to 100 so a
     -- perpetually-full worker can't overflow the counter) when THIS tick's sample is
     -- over threshold, else reset to 0 — so a single under-threshold (or absent) sample
@@ -5434,25 +5552,29 @@ UPDATE workers SET
     -- correctly resets. The poll derives disk_pressure = streak>=2 AND fresh; this column
     -- is display/lifecycle-only and never a scheduling input (Decision 5).
     stats_disk_pressure_streak = CASE
-        WHEN $9::boolean THEN LEAST(workers.stats_disk_pressure_streak + 1, 100)
+        WHEN $13::boolean THEN LEAST(workers.stats_disk_pressure_streak + 1, 100)
         ELSE 0
     END,
     updated_at            = now()
-WHERE id = $10
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until
+WHERE id = $14
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes
 `
 
 type HeartbeatWorkerParams struct {
-	StatsCpuPct             pgtype.Float4 `json:"stats_cpu_pct"`
-	StatsMemBytes           pgtype.Int8   `json:"stats_mem_bytes"`
-	StatsMemLimitBytes      pgtype.Int8   `json:"stats_mem_limit_bytes"`
-	StatsSource             pgtype.Text   `json:"stats_source"`
-	StatsDiskNixBytes       pgtype.Int8   `json:"stats_disk_nix_bytes"`
-	StatsDiskNixTotalBytes  pgtype.Int8   `json:"stats_disk_nix_total_bytes"`
-	StatsDiskDataBytes      pgtype.Int8   `json:"stats_disk_data_bytes"`
-	StatsDiskDataTotalBytes pgtype.Int8   `json:"stats_disk_data_total_bytes"`
-	DiskOverThreshold       bool          `json:"disk_over_threshold"`
-	ID                      uuid.UUID     `json:"id"`
+	StatsCpuPct              pgtype.Float4 `json:"stats_cpu_pct"`
+	StatsMemBytes            pgtype.Int8   `json:"stats_mem_bytes"`
+	StatsMemLimitBytes       pgtype.Int8   `json:"stats_mem_limit_bytes"`
+	StatsSource              pgtype.Text   `json:"stats_source"`
+	StatsDiskNixBytes        pgtype.Int8   `json:"stats_disk_nix_bytes"`
+	StatsDiskNixTotalBytes   pgtype.Int8   `json:"stats_disk_nix_total_bytes"`
+	StatsDiskDataBytes       pgtype.Int8   `json:"stats_disk_data_bytes"`
+	StatsDiskDataTotalBytes  pgtype.Int8   `json:"stats_disk_data_total_bytes"`
+	StatsDiskDindBytes       pgtype.Int8   `json:"stats_disk_dind_bytes"`
+	StatsDiskDindTotalBytes  pgtype.Int8   `json:"stats_disk_dind_total_bytes"`
+	StatsDiskDindInodes      pgtype.Int8   `json:"stats_disk_dind_inodes"`
+	StatsDiskDindTotalInodes pgtype.Int8   `json:"stats_disk_dind_total_inodes"`
+	DiskOverThreshold        bool          `json:"disk_over_threshold"`
+	ID                       uuid.UUID     `json:"id"`
 }
 
 // Refresh liveness AND overwrite the worker's latest resource sample (PRD #49). The
@@ -5472,6 +5594,10 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 		arg.StatsDiskNixTotalBytes,
 		arg.StatsDiskDataBytes,
 		arg.StatsDiskDataTotalBytes,
+		arg.StatsDiskDindBytes,
+		arg.StatsDiskDindTotalBytes,
+		arg.StatsDiskDindInodes,
+		arg.StatsDiskDindTotalInodes,
 		arg.DiskOverThreshold,
 		arg.ID,
 	)
@@ -5514,6 +5640,10 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 		&i.SnapshotRegisterNonce,
 		&i.PendingOverflow,
 		&i.PendingOverflowUntil,
+		&i.StatsDiskDindBytes,
+		&i.StatsDiskDindTotalBytes,
+		&i.StatsDiskDindInodes,
+		&i.StatsDiskDindTotalInodes,
 	)
 	return i, err
 }
@@ -5626,6 +5756,37 @@ func (q *Queries) InvalidatePriorCompletionPermits(ctx context.Context, arg Inva
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const latestPersistedPlanFrameAtForRun = `-- name: LatestPersistedPlanFrameAtForRun :one
+SELECT MAX(created_at)::timestamptz AS at
+FROM run_messages
+WHERE run_id = $1::uuid
+  AND kind = 'plan'
+  AND payload->>'plan_md' = $2::text
+`
+
+type LatestPersistedPlanFrameAtForRunParams struct {
+	RunID  uuid.UUID `json:"run_id"`
+	PlanMd string    `json:"plan_md"`
+}
+
+// The created_at of the run's latest `plan` frame whose payload plan_md EQUALS @plan_md, the
+// persisted runs.plan_md the claim carries (issue #1604): when the persisted, unapproved plan was
+// last shown. The worker emits and flushes the plan frame BEFORE the awaiting_approval report
+// persists plan_md, so a declined report or a worker that died in between leaves a newer frame
+// for a plan that was never persisted; matching on plan_md keeps that frame from moving this
+// instant. kind = 'plan' only; a plan_revising frame is not a plan. NULL when no plan frame
+// matches (the caller omits the field, never falling back to the latest frame). The comparison
+// is exact and needs no NUL normalisation: neither side can hold a NUL (Postgres text rejects
+// 0x00 and jsonb rejects \u0000; the worker's batcher and sanitizePayloadJSON strip it from the
+// frame, stripNULParam from plan_md). The worker discards a replayed gate verdict created
+// strictly before this instant (it was sent against an earlier plan).
+func (q *Queries) LatestPersistedPlanFrameAtForRun(ctx context.Context, arg LatestPersistedPlanFrameAtForRunParams) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, latestPersistedPlanFrameAtForRun, arg.RunID, arg.PlanMd)
+	var at pgtype.Timestamptz
+	err := row.Scan(&at)
+	return at, err
 }
 
 const latestPlanSeqForRun = `-- name: LatestPlanSeqForRun :one
@@ -6203,7 +6364,7 @@ func (q *Queries) ListActiveRunsForWorkers(ctx context.Context, workerIds []uuid
 }
 
 const listAllWorkers = `-- name: ListAllWorkers :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
@@ -6315,6 +6476,10 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.Worker.SnapshotRegisterNonce,
 			&i.Worker.PendingOverflow,
 			&i.Worker.PendingOverflowUntil,
+			&i.Worker.StatsDiskDindBytes,
+			&i.Worker.StatsDiskDindTotalBytes,
+			&i.Worker.StatsDiskDindInodes,
+			&i.Worker.StatsDiskDindTotalInodes,
 			&i.Busy,
 			&i.ActiveRuns,
 			&i.OwnerEmail,
@@ -6587,7 +6752,8 @@ func (q *Queries) ListGaveUpColumnMoves(ctx context.Context, arg ListGaveUpColum
 }
 
 const listInputReceiptRows = `-- name: ListInputReceiptRows :many
-SELECT id, kind, body, created_at, consumed_at, consumed_claim_generation, consumed_worker_id, applied_at
+SELECT id, kind, body, created_at, consumed_at, consumed_claim_generation, consumed_worker_id, applied_at,
+       disposition
 FROM run_user_inputs WHERE run_id = $1 AND id = ANY($2::bigint[])
   AND kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
 ORDER BY id ASC
@@ -6607,6 +6773,7 @@ type ListInputReceiptRowsRow struct {
 	ConsumedClaimGeneration pgtype.Int8        `json:"consumed_claim_generation"`
 	ConsumedWorkerID        pgtype.UUID        `json:"consumed_worker_id"`
 	AppliedAt               pgtype.Timestamptz `json:"applied_at"`
+	Disposition             pgtype.Text        `json:"disposition"`
 }
 
 func (q *Queries) ListInputReceiptRows(ctx context.Context, arg ListInputReceiptRowsParams) ([]ListInputReceiptRowsRow, error) {
@@ -6627,6 +6794,7 @@ func (q *Queries) ListInputReceiptRows(ctx context.Context, arg ListInputReceipt
 			&i.ConsumedClaimGeneration,
 			&i.ConsumedWorkerID,
 			&i.AppliedAt,
+			&i.Disposition,
 		); err != nil {
 			return nil, err
 		}
@@ -8180,7 +8348,7 @@ func (q *Queries) ListUnplaceableQueuedRunsForEphemeral(ctx context.Context, arg
 }
 
 const listWorkersByUser = `-- name: ListWorkersByUser :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes,
        s.label AS anthropic_secret_label,
        EXISTS (
            SELECT 1 FROM runs r
@@ -8265,6 +8433,10 @@ type ListWorkersByUserRow struct {
 	SnapshotRegisterNonce    pgtype.Text        `json:"snapshot_register_nonce"`
 	PendingOverflow          bool               `json:"pending_overflow"`
 	PendingOverflowUntil     pgtype.Timestamptz `json:"pending_overflow_until"`
+	StatsDiskDindBytes       pgtype.Int8        `json:"stats_disk_dind_bytes"`
+	StatsDiskDindTotalBytes  pgtype.Int8        `json:"stats_disk_dind_total_bytes"`
+	StatsDiskDindInodes      pgtype.Int8        `json:"stats_disk_dind_inodes"`
+	StatsDiskDindTotalInodes pgtype.Int8        `json:"stats_disk_dind_total_inodes"`
 	AnthropicSecretLabel     pgtype.Text        `json:"anthropic_secret_label"`
 	Busy                     bool               `json:"busy"`
 	ActiveRuns               int64              `json:"active_runs"`
@@ -8347,6 +8519,10 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.SnapshotRegisterNonce,
 			&i.PendingOverflow,
 			&i.PendingOverflowUntil,
+			&i.StatsDiskDindBytes,
+			&i.StatsDiskDindTotalBytes,
+			&i.StatsDiskDindInodes,
+			&i.StatsDiskDindTotalInodes,
 			&i.AnthropicSecretLabel,
 			&i.Busy,
 			&i.ActiveRuns,
@@ -10333,7 +10509,7 @@ WITH prev AS (
         last_heartbeat_at   = now(),
         updated_at          = now()
     WHERE workers.id = $1
-    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until
+    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes
 ), cleared AS (
     UPDATE worker_upgrade_reports r
        SET upgrading_since    = NULL,
@@ -10385,7 +10561,7 @@ WITH prev AS (
        -- preserves that.
        AND split_part($2::text, '+', 1) IS DISTINCT FROM split_part(prev.old_version, '+', 1)
 )
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until FROM upd
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes FROM upd
 `
 
 type RegisterWorkerParams struct {
@@ -10399,43 +10575,47 @@ type RegisterWorkerParams struct {
 }
 
 type RegisterWorkerRow struct {
-	ID                      uuid.UUID          `json:"id"`
-	UserID                  uuid.UUID          `json:"user_id"`
-	Name                    string             `json:"name"`
-	TokenHash               []byte             `json:"token_hash"`
-	Status                  string             `json:"status"`
-	LastHeartbeatAt         pgtype.Timestamptz `json:"last_heartbeat_at"`
-	Version                 pgtype.Text        `json:"version"`
-	CreatedAt               pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt               pgtype.Timestamptz `json:"updated_at"`
-	TemplateDeclared        pgtype.Text        `json:"template_declared"`
-	TemplateReported        pgtype.Text        `json:"template_reported"`
-	MaxConcurrentRuns       pgtype.Int4        `json:"max_concurrent_runs"`
-	StatsCpuPct             pgtype.Float4      `json:"stats_cpu_pct"`
-	StatsMemBytes           pgtype.Int8        `json:"stats_mem_bytes"`
-	StatsMemLimitBytes      pgtype.Int8        `json:"stats_mem_limit_bytes"`
-	StatsSource             pgtype.Text        `json:"stats_source"`
-	Kind                    string             `json:"kind"`
-	HostedSize              pgtype.Text        `json:"hosted_size"`
-	HostedGeneration        int64              `json:"hosted_generation"`
-	DockerEnabled           pgtype.Bool        `json:"docker_enabled"`
-	AnthropicSecretID       pgtype.UUID        `json:"anthropic_secret_id"`
-	AnthropicBindMode       string             `json:"anthropic_bind_mode"`
-	OnlineSince             pgtype.Timestamptz `json:"online_since"`
-	DrainingSince           pgtype.Timestamptz `json:"draining_since"`
-	Capabilities            []string           `json:"capabilities"`
-	Ephemeral               bool               `json:"ephemeral"`
-	EphemeralRunID          pgtype.UUID        `json:"ephemeral_run_id"`
-	StatsDiskNixBytes       pgtype.Int8        `json:"stats_disk_nix_bytes"`
-	StatsDiskNixTotalBytes  pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
-	StatsDiskDataBytes      pgtype.Int8        `json:"stats_disk_data_bytes"`
-	StatsDiskDataTotalBytes pgtype.Int8        `json:"stats_disk_data_total_bytes"`
-	StatsDiskPressureStreak int32              `json:"stats_disk_pressure_streak"`
-	ProtocolCapabilities    []string           `json:"protocol_capabilities"`
-	SnapshotEpoch           int64              `json:"snapshot_epoch"`
-	SnapshotRegisterNonce   pgtype.Text        `json:"snapshot_register_nonce"`
-	PendingOverflow         bool               `json:"pending_overflow"`
-	PendingOverflowUntil    pgtype.Timestamptz `json:"pending_overflow_until"`
+	ID                       uuid.UUID          `json:"id"`
+	UserID                   uuid.UUID          `json:"user_id"`
+	Name                     string             `json:"name"`
+	TokenHash                []byte             `json:"token_hash"`
+	Status                   string             `json:"status"`
+	LastHeartbeatAt          pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version                  pgtype.Text        `json:"version"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                pgtype.Timestamptz `json:"updated_at"`
+	TemplateDeclared         pgtype.Text        `json:"template_declared"`
+	TemplateReported         pgtype.Text        `json:"template_reported"`
+	MaxConcurrentRuns        pgtype.Int4        `json:"max_concurrent_runs"`
+	StatsCpuPct              pgtype.Float4      `json:"stats_cpu_pct"`
+	StatsMemBytes            pgtype.Int8        `json:"stats_mem_bytes"`
+	StatsMemLimitBytes       pgtype.Int8        `json:"stats_mem_limit_bytes"`
+	StatsSource              pgtype.Text        `json:"stats_source"`
+	Kind                     string             `json:"kind"`
+	HostedSize               pgtype.Text        `json:"hosted_size"`
+	HostedGeneration         int64              `json:"hosted_generation"`
+	DockerEnabled            pgtype.Bool        `json:"docker_enabled"`
+	AnthropicSecretID        pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicBindMode        string             `json:"anthropic_bind_mode"`
+	OnlineSince              pgtype.Timestamptz `json:"online_since"`
+	DrainingSince            pgtype.Timestamptz `json:"draining_since"`
+	Capabilities             []string           `json:"capabilities"`
+	Ephemeral                bool               `json:"ephemeral"`
+	EphemeralRunID           pgtype.UUID        `json:"ephemeral_run_id"`
+	StatsDiskNixBytes        pgtype.Int8        `json:"stats_disk_nix_bytes"`
+	StatsDiskNixTotalBytes   pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
+	StatsDiskDataBytes       pgtype.Int8        `json:"stats_disk_data_bytes"`
+	StatsDiskDataTotalBytes  pgtype.Int8        `json:"stats_disk_data_total_bytes"`
+	StatsDiskPressureStreak  int32              `json:"stats_disk_pressure_streak"`
+	ProtocolCapabilities     []string           `json:"protocol_capabilities"`
+	SnapshotEpoch            int64              `json:"snapshot_epoch"`
+	SnapshotRegisterNonce    pgtype.Text        `json:"snapshot_register_nonce"`
+	PendingOverflow          bool               `json:"pending_overflow"`
+	PendingOverflowUntil     pgtype.Timestamptz `json:"pending_overflow_until"`
+	StatsDiskDindBytes       pgtype.Int8        `json:"stats_disk_dind_bytes"`
+	StatsDiskDindTotalBytes  pgtype.Int8        `json:"stats_disk_dind_total_bytes"`
+	StatsDiskDindInodes      pgtype.Int8        `json:"stats_disk_dind_inodes"`
+	StatsDiskDindTotalInodes pgtype.Int8        `json:"stats_disk_dind_total_inodes"`
 }
 
 // Worker announces version + its self-reported template and comes online;
@@ -10534,6 +10714,10 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		&i.SnapshotRegisterNonce,
 		&i.PendingOverflow,
 		&i.PendingOverflowUntil,
+		&i.StatsDiskDindBytes,
+		&i.StatsDiskDindTotalBytes,
+		&i.StatsDiskDindInodes,
+		&i.StatsDiskDindTotalInodes,
 	)
 	return i, err
 }
@@ -11068,6 +11252,7 @@ UPDATE runs SET
     updated_at            = now()
 WHERE id = $1 AND user_id = $2
   AND status = 'paused'
+  AND hold_reason IS DISTINCT FROM 'credential_disabled'
   -- D6: refuse a completion hold unless the completion decision endpoint opts in.
   AND (hold_reason IS DISTINCT FROM 'completion_blocked' OR $3::boolean)
   -- D7: refuse a budget_exhausted park with no remaining budget (extend is the way back).
@@ -12037,6 +12222,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = $3 AND worker_id = $4
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
@@ -12089,6 +12275,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = $4 AND worker_id = $5
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
@@ -12689,6 +12876,90 @@ func (q *Queries) SetRunFailed(ctx context.Context, arg SetRunFailedParams) (int
 	return result.RowsAffected(), nil
 }
 
+const setRunFailedPlanRejected = `-- name: SetRunFailedPlanRejected :one
+WITH failed AS (
+    UPDATE runs SET
+        status             = 'failed',
+        status_since       = now(),
+        failure_reason     = $1,
+        -- PRD #69 M7a: the TRUSTED failure class, always set from Go (the worker-reported
+        -- ` + "`" + `failed` + "`" + ` arm coerces req.fail_origin through the allowlist and defaults a
+        -- classless failure to 'agent_failure'; the limit-opt-out non-park path stamps
+        -- 'rate_limited'). Never derived from failure_reason, which is never parsed.
+        fail_origin        = $2,
+        -- PRD #377 M1: the agent's secret-scrubbed, size-capped branch diff, preserved on a
+        -- workflow_scope_missing failure so a human can apply the work the bot PAT could not
+        -- push. NULL on every other failed path (only that arm sends a non-nil value).
+        preserved_patch    = $3,
+        session_id         = COALESCE($4, session_id),
+        move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,
+        finished_at        = now(),
+        -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+        milestones_in_progress = NULL,
+        milestones_agents = NULL,
+        -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+        pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+        credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
+        -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+        health = 'ok', health_reason = NULL, health_since = NULL,
+        updated_at         = now()
+    WHERE runs.id = $5 AND worker_id = $6
+      AND status NOT IN ('completed', 'failed', 'cancelled')
+      -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
+      -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
+      -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
+      -- still-held run at that exact generation: a late gen-G report matches 0 rows against a run
+      -- released after G (claim_released_at set) or reclaimed to G+1 (generation moved on), so it
+      -- cannot clobber the reclaiming flight. nil = legacy/outer-lock-fenced callers, unchanged.
+      -- PRD #1497 M1 (D16): claim_released_at IS NULL is a STANDALONE conjunct, so a released claim is
+      -- rejected even for a generation-less (legacy) report; a live claim still honours a NULL generation.
+      AND claim_released_at IS NULL
+      AND ($7::bigint IS NULL
+           OR claim_generation = $7::bigint)
+    RETURNING runs.id AS failed_run_id
+),
+settled AS (
+    UPDATE run_user_inputs SET applied_at = now(), consumed_at = COALESCE(consumed_at, now())
+    WHERE run_id IN (SELECT failed_run_id FROM failed) AND kind = 'reject_plan' AND applied_at IS NULL
+    RETURNING id
+)
+SELECT count(*) FROM failed
+`
+
+type SetRunFailedPlanRejectedParams struct {
+	FailureReason   pgtype.Text `json:"failure_reason"`
+	FailOrigin      pgtype.Text `json:"fail_origin"`
+	PreservedPatch  pgtype.Text `json:"preserved_patch"`
+	SessionID       pgtype.Text `json:"session_id"`
+	ID              uuid.UUID   `json:"id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration pgtype.Int8 `json:"claim_generation"`
+}
+
+// Issue #1604: the worker's plan_rejected `failed` report. It fails the run exactly as
+// SetRunFailed does AND settles the run's still-unapplied reject_plan inputs in the SAME
+// statement, so a pool-bound (generation-less legacy) report is atomic too: a later claim
+// can never replay a reject for a run that is already failed, and a declined transition
+// leaves every input untouched. The `failed` CTE MUST stay in lockstep with SetRunFailed:
+// every SET field and every WHERE guard is copied verbatim from it (only `runs.id` is
+// table-qualified, which sqlc needs to resolve @id beside run_user_inputs.id). The result counts
+// TRANSITIONED RUNS (0 or 1), never the settled inputs, so a run whose reject rows an older
+// worker already APPLIED still reports 1.
+func (q *Queries) SetRunFailedPlanRejected(ctx context.Context, arg SetRunFailedPlanRejectedParams) (int64, error) {
+	row := q.db.QueryRow(ctx, setRunFailedPlanRejected,
+		arg.FailureReason,
+		arg.FailOrigin,
+		arg.PreservedPatch,
+		arg.SessionID,
+		arg.ID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const setRunHealth = `-- name: SetRunHealth :execrows
 UPDATE runs SET
     health             = $1,
@@ -13077,12 +13348,12 @@ UPDATE runs SET
     status                    = 'recovery_wait',
     status_since              = now(),
     recovery_wait_count       = recovery_wait_count + 1,
-    recovery_wait_cause       = NULL,
-    recovery_retry_not_before = $1,
-    session_id                = COALESCE($2, session_id),
+    recovery_wait_cause       = $1::text,
+    recovery_retry_not_before = $2,
+    session_id                = COALESCE($3, session_id),
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at                = now()
-WHERE id = $3 AND worker_id = $4
+WHERE id = $4 AND worker_id = $5
   AND status = 'running'
   AND kind <> 'judge'
   -- PRD #1247 M5a-1 rework (reviewer NB1): the per-query generation fence, identical to
@@ -13094,11 +13365,12 @@ WHERE id = $3 AND worker_id = $4
   -- PRD #1497 M1 (D16): claim_released_at IS NULL is a STANDALONE conjunct, so a released claim is
   -- rejected even for a generation-less (legacy) report; a live claim still honours a NULL generation.
   AND claim_released_at IS NULL
-  AND ($5::bigint IS NULL
-       OR claim_generation = $5::bigint)
+  AND ($6::bigint IS NULL
+       OR claim_generation = $6::bigint)
 `
 
 type SetRunRecoveryWaitParams struct {
+	RecoveryCause   pgtype.Text        `json:"recovery_cause"`
 	RetryNotBefore  pgtype.Timestamptz `json:"retry_not_before"`
 	SessionID       pgtype.Text        `json:"session_id"`
 	ID              uuid.UUID          `json:"id"`
@@ -13148,15 +13420,20 @@ type SetRunRecoveryWaitParams struct {
 // terminal transitions).
 //
 // PRD #1392 M1 (D9): this is the UNTYPED park (empty turn, and #1088's provider park once
-// it adopts recovery_wait). It CLEARS recovery_wait_cause to NULL — a later untyped park on
-// a run that forge-parked earlier must REPLACE the typed cause, not coalesce it, so its
-// surface reads the generic wording and its forge cap counter is not consulted. It does NOT
+// it adopts recovery_wait). It REPLACES recovery_wait_cause with @recovery_cause, never
+// coalescing it — a later untyped park on a run that forge-parked earlier must drop the typed
+// cause, so its surface reads the generic wording and its forge cap counter is not consulted.
+// Issue #1766 M2: the Go caller (setRecoveryWait) passes a non-NULL recovery_cause ONLY for
+// 'vault_locked' (the worker's codex refresh/release answered 409 vault_locked: the owner's
+// vault is locked, so the run waits for an unlock) and NULL for every other reported cause,
+// so empty_turn/provider_outage still store NULL (D9). The column CHECK is the backstop. It does NOT
 // touch forge_park_count: that lifetime counter belongs to the forge park alone (fact 7 /
 // D2), so an empty-turn park neither increments nor resets it (a run keeps its forge-park
 // lifetime count through a later empty-turn park). The forge park has its own writer,
 // ParkRunForgeUnreachable, which sets the cause and bumps forge_park_count.
 func (q *Queries) SetRunRecoveryWait(ctx context.Context, arg SetRunRecoveryWaitParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setRunRecoveryWait,
+		arg.RecoveryCause,
 		arg.RetryNotBefore,
 		arg.SessionID,
 		arg.ID,
@@ -13428,7 +13705,11 @@ WHERE runs.id = $19 AND worker_id = $20
         SELECT 1 FROM run_user_inputs
         WHERE run_user_inputs.run_id = $19
           AND run_user_inputs.kind = 'approve_plan'
-          AND run_user_inputs.applied_at IS NOT NULL))
+          AND run_user_inputs.applied_at IS NOT NULL
+          -- Issue #1604: an approve the worker discarded as stale is settled (applied_at set,
+          -- disposition 'superseded', DiscardRunInputRows) but never applied, so it must not
+          -- open the plan gate.
+          AND run_user_inputs.disposition IS DISTINCT FROM 'superseded'))
   -- awaiting_input → running is guarded the same way and for the same reason
   -- (PRD #88 M1), as a SECOND, INDEPENDENT clause. Never merge the two into
   -- ` + "`" + `status NOT IN (...) OR kind IN (...)` + "`" + `: that would let a consumed ` + "`" + `answer` + "`" + `
@@ -13551,6 +13832,9 @@ type SetRunRunningParams struct {
 // consumed approve_plan input exists — i.e. the legitimate post-approval resume
 // report, which by construction is sent after the worker consumed the verdict. A
 // stale pre-gate report (no consumed approve_plan yet) leaves the gate intact.
+// "Consumed" here means APPLIED and not discarded (issue #1604): an approve the worker
+// discarded as stale is settled by DiscardRunInputRows with disposition 'superseded', and
+// that row never opens the gate.
 // claimed→running and running→running are unaffected (the guard only narrows the
 // awaiting_approval source status); autopilot never enters awaiting_approval.
 // Accepted residual (out of scope, see specs/ai.md): in a multi-round re-gate a
@@ -13861,7 +14145,7 @@ SET anthropic_secret_id = $1,
     anthropic_bind_mode = $2,
     updated_at = now()
 WHERE id = $3 AND user_id = $4
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes
 `
 
 type SetWorkerAnthropicSecretParams struct {
@@ -13939,6 +14223,10 @@ func (q *Queries) SetWorkerAnthropicSecret(ctx context.Context, arg SetWorkerAnt
 		&i.SnapshotRegisterNonce,
 		&i.PendingOverflow,
 		&i.PendingOverflowUntil,
+		&i.StatsDiskDindBytes,
+		&i.StatsDiskDindTotalBytes,
+		&i.StatsDiskDindInodes,
+		&i.StatsDiskDindTotalInodes,
 	)
 	return i, err
 }
@@ -14232,6 +14520,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = $1 AND worker_id = $2
+  AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 

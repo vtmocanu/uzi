@@ -78,6 +78,23 @@ func (t *fakeClaimFinishTx) ParkRunCodexAccountUnavailable(_ context.Context, ar
 	return store.Run{ID: arg.ID, Status: "recovery_wait"}, nil
 }
 
+func (t *fakeClaimFinishTx) LockSecretEnablementForShareNowait(context.Context, store.LockSecretEnablementForShareNowaitParams) (bool, error) {
+	t.f.claimSecretChecks++
+	if len(t.f.claimSecretLockErrs) > 0 {
+		err := t.f.claimSecretLockErrs[0]
+		t.f.claimSecretLockErrs = t.f.claimSecretLockErrs[1:]
+		if err != nil {
+			return false, err
+		}
+	}
+	return t.f.claimSecretDisabled, nil
+}
+
+func (t *fakeClaimFinishTx) ParkCredentialDisabledRun(_ context.Context, arg store.ParkCredentialDisabledRunParams) (int64, error) {
+	t.pending = append(t.pending, func() { t.f.claimCredParked = &arg })
+	return 1, nil
+}
+
 func (t *fakeClaimFinishTx) RequeueClaimAssemblyExact(_ context.Context, arg store.RequeueClaimAssemblyExactParams) (int64, error) {
 	t.pending = append(t.pending, func() { t.f.claimRequeued = &arg })
 	return 1, nil

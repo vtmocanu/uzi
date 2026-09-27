@@ -142,8 +142,8 @@ export function judgeState(input: JudgeOccurrence | JudgeAdminOccurrence | Dispo
 // type-sound while Child B adds `dismiss_reason` / `set_via` / the `done` status to that wire;
 // a real finding row (present and future) is assignable to it.
 export interface FindingStateInput {
-  // The finding's open state is `to_file`, not the judge's `todo`; a `done` finding is one
-  // whose filed issue closed on the forge (there is no human "done" on a finding).
+  // The finding's open state is `to_file`, not the judge's `todo`. A `done` finding is either a
+  // human Mark done (issue #1723, no set_via) or the issue-close sync's (set_via "issue_close").
   status: string;
   dismiss_reason?: "wont_do" | "not_an_issue";
   set_via?: string;
@@ -151,15 +151,16 @@ export interface FindingStateInput {
   filed_issue_url?: string;
 }
 
-// findingState normalises one finding row. `done` is always the issue-close sync's doing, so
-// it reports set_via `issue_close`; a filed/done row's link comes from filed_issue_iid/url.
+// findingState normalises one finding row. A done row passes its set_via through untouched, so a
+// human done (no set_via) reads the plain "✓ Done" — the judge's human-done chip — and a sync
+// done reads "Done via #N"; a filed/done row's link comes from filed_issue_iid/url.
 export function findingState(f: FindingStateInput): TriageStateView {
   const filed = f.filed_issue_iid != null ? { issue_iid: f.filed_issue_iid, issue_url: f.filed_issue_url ?? "" } : undefined;
   switch (f.status) {
     case "filed":
       return { state: "filed", filed };
     case "done":
-      return { state: "done", setVia: f.set_via ?? "issue_close", filed };
+      return { state: "done", setVia: f.set_via, filed };
     case "dismissed":
       return { state: "dismissed", reason: f.dismiss_reason };
     default:

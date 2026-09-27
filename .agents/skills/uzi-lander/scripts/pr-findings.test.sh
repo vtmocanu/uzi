@@ -24,6 +24,8 @@ case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; e
         echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"comments":{"nodes":[{"databaseId":992,"author":{"login":"greptile-apps"},"body":"P1 finding","path":"old.go","line":8,"originalLine":8}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
       elif [ "$MODE" = prior_resolved ]; then
         echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"comments":{"nodes":[{"databaseId":990,"author":{"login":"greptile-apps"},"body":"P1 old finding","path":"old.go","line":8,"originalLine":8}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
+      elif [ "$MODE" = cr_details ]; then
+        jq -nc --rawfile b "$CR_BODY" '{data:{repository:{pullRequest:{reviewThreads:{nodes:[{isResolved:false,isOutdated:false,comments:{nodes:[{databaseId:41,author:{login:"coderabbitai"},body:$b,path:"api/internal/store/migrations/00257_recovery_wait_vault_locked.sql",line:7,originalLine:7}],pageInfo:{hasNextPage:false}}}],pageInfo:{hasNextPage:false}}}}}}'
       elif [ "$MODE" = cr_ca_findings ]; then
         echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":false,"comments":{"nodes":[{"databaseId":31,"author":{"login":"coderabbitai"},"body":"🟠 **carried finding**","path":"ca.go","line":4,"originalLine":4}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
       else
@@ -169,6 +171,8 @@ set -e
 grep -q 'NOT REVIEWED on head by any bot' "$WORK/prior-noanchor.out" || fail "unreviewed head was not reported: $(cat "$WORK/prior-noanchor.out")"
 grep -q 'Greptile: no verdict on this head; last verdict on bbbbbbbb — 0 comments added. Changed since: docs/a.md, api/internal/uzidocs/embed/a.md' "$WORK/prior-noanchor.out" \
   || fail "earlier clean verdict and delta were not named: $(cat "$WORK/prior-noanchor.out")"
+grep -q '^  greptile_last_reviewed=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ' "$WORK/prior-noanchor.out" || fail "greptile_last_reviewed not printed: $(cat "$WORK/prior-noanchor.out")"
+grep -q '^  greptile_last_reviewed=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ' "$WORK/prior-clean.out" || fail "greptile_last_reviewed not printed (scoped verdict): $(cat "$WORK/prior-clean.out")"
 
 # GitHub's compare lists at most 300 files: a full page must read INCOMPLETE, never as a
 # docs-only list that could hide code past file 300.
@@ -353,4 +357,19 @@ pf pushrace_pending_first
 [ "$rc" -eq 3 ] || fail "pushrace_pending_first exited rc=$rc: $(cat "$WORK/pushrace_pending_first.out")"
 grep -q 'review still in progress; findings deferred' "$WORK/pushrace_pending_first.out" || fail "pushrace_pending_first not deferred: $(cat "$WORK/pushrace_pending_first.out")"
 
-echo "PASS pr-findings: settled, resolved current-head scope, earlier-verdict Greptile scope, change_assessment head marker, Greptile run on an older commit"
+# ---- CodeRabbit finding titles (PR #1778) ----------------------------------------------
+# The body leads with <details> blocks whose "Script executed" snippets carry `**` globs;
+# the title is the bold line after them, never a fragment of a shell command.
+CR_BODY="$HERE/lib/cr-details-title.fixture.md"; export CR_BODY
+pf cr_details
+grep -qxF '  CR  api/internal/store/migrations/00257_recovery_wait_vault_locked.sql:7  [🟠] Split constraint validation into a separate migration.' "$WORK/cr_details.out" \
+  || fail "cr_details: wrong CodeRabbit title: $(grep '^  CR  ' "$WORK/cr_details.out")"
+# No bold line outside <details>: the first non-empty prose line, still never the snippet.
+printf '<details>\n<summary>Script executed</summary>\n\n```bash\nrg x --glob '"'"'!node_modules/**'"'"' .\n```\n\n<details>\n<summary>nested</summary>\n**inside nested**\n</details>\n</details>\n\n<!-- marker -->\nPlain title line.\n' > "$WORK/nobold.md"
+CR_BODY="$WORK/nobold.md"
+pf cr_details
+grep -q '^  CR  .*:7  \[?\] Plain title line\.$' "$WORK/cr_details.out" \
+  || fail "cr_details fallback: wrong CodeRabbit title: $(grep '^  CR  ' "$WORK/cr_details.out")"
+unset CR_BODY
+
+echo "PASS pr-findings: settled, resolved current-head scope, earlier-verdict Greptile scope, change_assessment head marker, Greptile run on an older commit, CodeRabbit title after <details>"

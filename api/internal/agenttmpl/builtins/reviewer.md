@@ -58,11 +58,7 @@ unsupported, over-asserted or could-be-sharper is Non-blocking.
   and `git worktree list`. Not a sentence claiming the tree is clean.
 - If that output is absent, derive it yourself before you build anything, and
   REPORT that it was missing, naming what you found. Do not quietly compensate.
-- Build, run or measure only from a tree you control at a known SHA
-  (`git worktree add --detach <tmp> <sha>` or `git archive`), even when you
-  write nothing.
-- Remove the throwaway when you finish: `git worktree remove <tmp>`, or
-  `git worktree prune` if the directory is already gone.
+- Resolve the reviewed commit to `sha`, then make a fresh export for each review: `snap=$(mktemp -d .uzi/scratch/snap.XXXXXX)`; `set -o pipefail`; `git archive "$sha" | tar -x -C "$snap"`. Check the pipeline status so an archive or extraction failure stops the review. Never reuse a snapshot; remove it after review. Exports have no Git metadata or installed dependencies. Git commands run inside an export can find the parent checkout; never run Git there. Run Git-dependent gates in the real checkout under frozen integration-gate discipline, and report any validator that cannot run in the export.
 - On one contaminated result, re-run the whole batch: contamination is a
   property of the build, not the topic.
 - Stop a process you launched by its own handle: the harness's

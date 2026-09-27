@@ -97,10 +97,6 @@ type codexCredStore interface {
 	// (the same by-id primitive openAnthropic resolves through). Returns the row's
 	// kind + sealed_with so the reconciler decrypts on the shared vault path.
 	GetUserSecretCiphertextByID(ctx context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error)
-	// GetUserSecretCiphertext is the by-kind sibling; it is unused by the reconciler
-	// directly but required so this interface satisfies secretopen.Store, the surface
-	// OpenByIDOfKind resolves the kind-guarded open through.
-	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error)
 }
 
 // codexLoginBlob is the shape of a codex_auth secret's decrypted ciphertext: a JSON

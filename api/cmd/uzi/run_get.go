@@ -155,10 +155,11 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 				}
 				return nil
 			}
-			// parked tracks whether the LAST poll saw the run parked on a usage limit,
-			// so the notice below fires on the EDGE into the park rather than every
-			// 2 seconds for the hours one lasts.
-			parked := false
+			// parkedIn is the hold the LAST poll saw the run in ("" when it was in none),
+			// so each notice below fires on the EDGE into a hold rather than every 2
+			// seconds for the hours one lasts. It is a key (status plus hold reason),
+			// not a bool, so a direct hold-to-hold transition is announced too.
+			parkedIn := ""
 			for {
 				if err := drain(); err != nil {
 					return err
@@ -186,19 +187,25 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 				// NDJSON there for an agent to parse line by line (renderMessage). A
 				// human-readable notice on that stream would corrupt the contract. This
 				// is the same split cobra's deprecation notice already uses here.
-				if run.Status == statusLimitWait || run.Status == statusPoolWait || run.Status == statusRecoveryWait {
-					if !parked {
-						parked = true
+				holdKey := run.Status + "/" + strOr(run.HoldReason, "")
+				if run.Status == statusLimitWait || run.Status == statusPoolWait || run.Status == statusRecoveryWait ||
+					isCredentialDisabledHold(run) {
+					if parkedIn != holdKey {
+						parkedIn = holdKey
 						// pool_wait and recovery_wait are the sibling silences limit_wait is
 						// (all long, output-less holds that look like a hang from the outside),
 						// so each earns the same one-shot notice — but a DIFFERENT one, because
 						// they resume on different triggers: pool_wait on a pooled token,
-						// recovery_wait on a capped backoff clock, limit_wait on a clock. A
-						// direct park⇄park transition would be missed by the bare `parked`
-						// bool, but it cannot happen — a held run is promoted to `queued` (a
-						// non-held status that clears `parked` via the else-if below) before it
-						// could hold again, so re-arming here is exact.
+						// recovery_wait on a capped backoff clock, limit_wait on a clock. The
+						// notice re-arms on any change of hold key, so a direct move from one
+						// hold to another is announced as the new hold.
 						switch run.Status {
+						case statusPaused:
+							// PRD #1732 D14: the only paused run gated in above is a
+							// credential_disabled hold. It resumes on Enable (web Settings), or on
+							// a token switch where the lane allows one; never on its own clock.
+							_, _ = fmt.Fprintf(env.Stderr, "run %s held — a credential it needs is disabled; %s; still following\n",
+								args[0], credentialDisabledAction(run))
 						case statusPoolWait:
 							_, _ = fmt.Fprintf(env.Stderr,
 								"run %s held — its token pool is empty; still following, it resumes when a token is pooled\n",
@@ -218,6 +225,14 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 								_, _ = fmt.Fprintf(env.Stderr,
 									"run %s %s — still following; it resumes on its own\n",
 									args[0], forgeParkLine(run))
+							} else if line := vaultParkLine(run); line != "" {
+								// Issue #1766: a Codex credential refresh or release found the
+								// run owner's vault locked. It resumes at its next retry once
+								// the vault is unlocked, not the instant of unlock; the wording
+								// is owner-neutral (the follower may be an admin).
+								_, _ = fmt.Fprintf(env.Stderr,
+									"run %s %s; still following\n",
+									args[0], line)
 							} else {
 								_, _ = fmt.Fprintf(env.Stderr,
 									"run %s recovering — a transient interruption parked it; still following, it resumes on its own\n",
@@ -228,8 +243,17 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 								args[0], limitWaitLine(run, time.Now()))
 						}
 					}
-				} else if parked {
-					parked = false
+				} else if parkedIn != "" && run.Status == statusPaused {
+					// PRD #1732 D14: the credential_disabled promoter can settle a held run
+					// straight into an owner pause or budget_exhausted, so the run did NOT
+					// resume. Name the pause it is in now, once per pause, and keep
+					// following; its later exit prints "resumed" below.
+					if parkedIn != holdKey {
+						parkedIn = holdKey
+						_, _ = fmt.Fprintf(env.Stderr, "run %s %s; still following\n", args[0], pausedHoldNotice(run))
+					}
+				} else if parkedIn != "" {
+					parkedIn = ""
 					// cellText, NOT sanitizeTTY, and the difference is the whole point:
 					// sanitizeTTY spares "\n", so a status carrying one would inject a
 					// line onto stderr. Unreachable today because runs_status_check

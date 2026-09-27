@@ -441,7 +441,7 @@ func detailBase(dark bool, run apitypes.RunDTO, now time.Time, allow bool) tuiMo
 }
 
 func withLiveStream(m tuiModel) tuiModel {
-	return step(m, streamReadyMsg{runID: detailRunID, stream: uzicli.NewRunStream(context.Background(), nil)})
+	return step(m, streamReadyMsg{gen: m.detail.gen, runID: detailRunID, stream: uzicli.NewRunStream(context.Background(), nil)})
 }
 
 func detailRunning(dark bool, now time.Time) string {
@@ -680,7 +680,7 @@ func detailDegraded(dark bool, now time.Time) string {
 		IssueTitle: "Add rate-limit headroom to the scheduler poll",
 		StartedAt:  tp(now.Add(-4 * time.Minute))} // header elapsed WORK time (`● running · 4m`)
 	m := detailBase(dark, run, now, true)
-	m = step(m, streamReadyMsg{runID: detailRunID, err: uzicli.Exitf(uzicli.ExitUnreachable, "dial tcp: connection refused")})
+	m = step(m, streamReadyMsg{gen: m.detail.gen, runID: detailRunID, err: uzicli.Exitf(uzicli.ExitUnreachable, "dial tcp: connection refused")})
 	return m.View().Content
 }
 

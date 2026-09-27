@@ -4,6 +4,14 @@
 //
 // Each pass does TWO phases, in order:
 //
+// Background work follows PRD #1732 D6: disable is per alias, liveness is per account. A
+// staged alias is reconciled only while THAT alias is enabled, and an account is polled (and
+// so background-refreshed, since the poll's 401 path is the only background refresh) only
+// while at least one ENABLED linked alias resolves to it. Both rules live in the listing
+// queries, so a disabled credential is not listed. The listing is check-then-act: a disable
+// that commits between the listing and the reconcile (or recovery promotion) can still let
+// one nonrotating identity call through, which spends no token (ADR 1732 D6).
+//
 //  1. RECONCILE staged aliases FIRST. A freshly imported codex_auth login sits 'staging'
 //     until its identity is established; this engine is its first production caller of
 //     ReconcileCodexAuthIdentity (a NONROTATING DiscoverIdentity — it never spends a
@@ -17,7 +25,15 @@
 //     reading is written with the revision-fenced UpsertCodexAccountRateLimits; a typed
 //     failure with the revision-fenced RecordCodexAccountPollFailure (which preserves the
 //     last-good reading). Both queries return 0 rows when authority moved — a discard, not an
-//     error.
+//     error. Both are also fenced on the account's enablement list captured by the listing
+//     (PRD #1732 D13), so a poll that started before its last enabled alias was disabled
+//     writes nothing, even if the alias was re-enabled before the write.
+//
+// A POKE (credential save, login, vault unlock, re-enable) additionally runs the existing
+// crash-safe recovery pass on the user's live accounts that are not pollable because of an
+// unfinished refresh or a protected recovery slot, BEFORE polling them (PRD #1732 D7): the
+// poll that follows performs the normal coordinated refresh on a 401, and only a proven
+// no-renewal expiry or a provider rejection flags reauth_required (a new login paste).
 //
 // The engine makes NO model calls and has NO run/worker dependency: the Codex usage GET is
 // free (it reads the account's own meter, spending no token). Bounded concurrency, a per-tick
@@ -79,6 +95,15 @@ type UsageCollector interface {
 // *workersvc.CodexReconciler satisfies it.
 type Reconciler interface {
 	ReconcileCodexAuthIdentity(ctx context.Context, userID, userSecretID uuid.UUID) error
+}
+
+// Recoverer runs the crash-safe recovery pass for one account: reap an expired refresh lease,
+// resolve orphaned refresh intents, and promote identity-verified recovery material. It never
+// re-spends a refresh token. *workersvc.Service satisfies it; the engine discovers it on the
+// collector (the production collector IS the Service), so a test collector that does not
+// implement it simply skips poke-time recovery.
+type Recoverer interface {
+	ReconcileUnresolvedCodexRefresh(ctx context.Context, userID, accountID uuid.UUID) (int, error)
 }
 
 // Engine is the Codex rate-limit poller.
@@ -187,9 +212,10 @@ func (e *Engine) tickAll(ctx context.Context) {
 	e.pollAccounts(tickCtx, targets, false)
 }
 
-// pokeUser runs an out-of-band pass for ONE user: reconcile their staged aliases, then poll
-// their linked accounts, ignoring any prior backoff (a just-saved credential may work where an
-// earlier attempt failed).
+// pokeUser runs an out-of-band pass for ONE user: reconcile their enabled staged aliases,
+// recover their live accounts left unpollable by an unfinished refresh or a protected
+// recovery slot, then poll their live accounts, ignoring any prior backoff (a just-saved or
+// just-enabled credential may work where an earlier attempt failed).
 func (e *Engine) pokeUser(ctx context.Context, userID uuid.UUID) {
 	pokeCtx, cancel := context.WithTimeout(ctx, e.interval)
 	defer cancel()
@@ -203,16 +229,62 @@ func (e *Engine) pokeUser(ctx context.Context, userID uuid.UUID) {
 		}
 	}
 
-	rows, err := e.store.ListLinkedCodexAccountsForUser(pokeCtx, userID)
+	targets, ok := e.listUserTargets(pokeCtx, userID)
+	if !ok {
+		return
+	}
+	// Recovery first (PRD #1732 D7). The listing only returns accounts with an enabled linked
+	// alias, so recovery is gated exactly like polling. A recovery attempt may change the
+	// account's state (a promotion advances its generation and makes it pollable), so the
+	// targets are re-read before polling rather than polled on the stale row.
+	if e.recoverAccounts(pokeCtx, targets) {
+		if targets, ok = e.listUserTargets(pokeCtx, userID); !ok {
+			return
+		}
+	}
+	e.pollAccounts(pokeCtx, targets, true)
+}
+
+// listUserTargets lists one user's live (enabled-linked) accounts as poll targets.
+func (e *Engine) listUserTargets(ctx context.Context, userID uuid.UUID) ([]pollTarget, bool) {
+	rows, err := e.store.ListLinkedCodexAccountsForUser(ctx, userID)
 	if err != nil {
 		e.logger.Error("codex usage poller: list linked accounts for poke", "user", userID.String(), "error", err)
-		return
+		return nil, false
 	}
 	targets := make([]pollTarget, 0, len(rows))
 	for _, r := range rows {
 		targets = append(targets, pollTargetFromForUserRow(r))
 	}
-	e.pollAccounts(pokeCtx, targets, true)
+	return targets, true
+}
+
+// recoverAccounts runs the recovery pass on every target that needs it (an unfinished refresh
+// or a protected recovery slot) and reports whether it attempted any. It is a no-op when the
+// collector does not implement Recoverer. A failure is logged and never blocks the poll.
+func (e *Engine) recoverAccounts(ctx context.Context, targets []pollTarget) bool {
+	rec, ok := e.collector.(Recoverer)
+	if !ok {
+		return false
+	}
+	attempted := false
+	for _, t := range targets {
+		if !targetNeedsRecovery(t) {
+			continue
+		}
+		attempted = true
+		if _, err := rec.ReconcileUnresolvedCodexRefresh(ctx, t.userID, t.accountID); err != nil {
+			e.logger.Info("codex usage poller: recover account", "account", t.accountID.String(), "error", err.Error())
+		}
+	}
+	return attempted
+}
+
+// targetNeedsRecovery reports whether a live account is a recovery target: a refresh that did
+// not settle (in progress, or quarantined) or a populated recovery slot. A reauth-flagged
+// account with neither needs a new login, which recovery cannot provide.
+func targetNeedsRecovery(t pollTarget) bool {
+	return t.hasRecovery || t.coordState == "in_progress" || t.coordState == "quarantined"
 }
 
 // pollTarget is the common shape both linked listings project to, so pollAccounts is shared
@@ -225,6 +297,9 @@ type pollTarget struct {
 	coordState         string
 	reauthRequired     bool
 	hasRecovery        bool
+	// enablementSig is the account's linked-alias enablement list at listing time (PRD #1732
+	// D13): both writes are fenced on it, so a poll that raced an enable/disable writes nothing.
+	enablementSig string
 }
 
 func pollTargetFromToPollRow(r store.ListLinkedCodexAccountsToPollRow) pollTarget {
@@ -236,6 +311,7 @@ func pollTargetFromToPollRow(r store.ListLinkedCodexAccountsToPollRow) pollTarge
 		coordState:         r.CoordState,
 		reauthRequired:     r.ReauthRequired,
 		hasRecovery:        r.HasRecovery,
+		enablementSig:      r.EnablementSig,
 	}
 }
 
@@ -248,6 +324,7 @@ func pollTargetFromForUserRow(r store.ListLinkedCodexAccountsForUserRow) pollTar
 		coordState:         r.CoordState,
 		reauthRequired:     r.ReauthRequired,
 		hasRecovery:        r.HasRecovery,
+		enablementSig:      r.EnablementSig,
 	}
 }
 
@@ -324,14 +401,16 @@ func (e *Engine) writeReading(ctx context.Context, t pollTarget, reading workers
 		ObservedGeneration:         reading.ObservedGeneration,
 		ObservedCredentialRevision: reading.ObservedCredentialRevision,
 		AttemptStatus:              attemptStatusOK,
+		EnablementSig:              t.enablementSig,
 	})
 	if err != nil {
 		e.logger.Error("codex usage poller: upsert reading", "account", t.accountID.String(), "error", err)
 		return
 	}
 	if n == 0 {
-		// Fence rejected the write (generation/credential_revision moved, or the last linked
-		// alias vanished) — the reading is discarded, the prior good row untouched.
+		// Fence rejected the write (generation/credential_revision moved, the last linked
+		// alias vanished, no linked alias is enabled any more, or an alias's enablement moved
+		// since the listing) — the reading is discarded, the prior good row untouched.
 		e.logger.Info("codex usage poller: reading discarded (authority moved)", "account", t.accountID.String())
 	}
 }
@@ -348,6 +427,7 @@ func (e *Engine) recordFailure(ctx context.Context, t pollTarget, err error) {
 		AttemptError:               failureMessage(kind),
 		ObservedGeneration:         t.generation,
 		ObservedCredentialRevision: t.credentialRevision,
+		EnablementSig:              t.enablementSig,
 	}); werr != nil {
 		e.logger.Error("codex usage poller: record failure", "account", t.accountID.String(), "error", werr)
 	}

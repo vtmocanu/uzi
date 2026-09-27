@@ -9,17 +9,17 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 )
 
-// The forge.Forge interface has exactly 34 methods. This test invokes EVERY one
+// The forge.Forge interface has exactly 35 methods. This test invokes EVERY one
 // on a *BaseFake and asserts its default. It is both the contract proof (each
 // method returns what the package promises) AND the deadcode shield: the
 // compile-time `var _ forge.Forge = (*BaseFake)(nil)` assertion in basefake.go
 // creates NO reachability, so a BaseFake method that every fake overrides and
 // nothing else invokes could be flagged by `deadcode -test`. Actually calling
-// each method here is what keeps them all reachable — so all 34 must appear
-// below (32 action methods + 2 pipeline reads). A missing method defeats the
+// each method here is what keeps them all reachable — so all 35 must appear
+// below (33 action methods + 2 pipeline reads). A missing method defeats the
 // shield.
 
-// actionMethods are the 32 methods that default to notStubbed(<name>). Each
+// actionMethods are the 33 methods that default to notStubbed(<name>). Each
 // closure calls exactly one method and returns only its error return, so every
 // method is invoked and every arity collapses to a single comparable error.
 func actionMethods() []struct {
@@ -127,6 +127,10 @@ func actionMethods() []struct {
 			_, err := b.BranchHead(ctx, 1, "main")
 			return err
 		}},
+		{"RefHead", func(b *BaseFake) error {
+			_, err := b.RefHead(ctx, 1, "refs/heads/main")
+			return err
+		}},
 		{"CompareAncestry", func(b *BaseFake) error {
 			a, err := b.CompareAncestry(ctx, 1, "h", "c")
 			// The default must fail CLOSED: an unstubbed ancestry answer is unknown, never
@@ -141,8 +145,8 @@ func actionMethods() []struct {
 
 func TestBaseFakeActionMethodsNotStubbed(t *testing.T) {
 	methods := actionMethods()
-	if len(methods) != 32 {
-		t.Fatalf("expected 32 action methods, got %d", len(methods))
+	if len(methods) != 33 {
+		t.Fatalf("expected 33 action methods, got %d", len(methods))
 	}
 	b := &BaseFake{}
 	for _, m := range methods {

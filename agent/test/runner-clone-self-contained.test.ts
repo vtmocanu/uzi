@@ -5,7 +5,7 @@ import { GitCache, RunnerCloneMaterializationError, type RunnerClone } from "../
 import type { Executor, ExecutorResult, RunContext } from "../src/executor.js";
 import type { CodexExecutionSafety } from "../src/harness.js";
 import { CodexExecutor, type CodexExecutorOptions } from "../src/codex/codex-executor.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { api, client, fakeGitlab, fx, gitlabClaim, installHarness } from "./runner-harness.js";
 
 installHarness();
@@ -21,7 +21,7 @@ const STOP = "stop after recording the clone options (issue #1769 test)";
 class RecordingGit extends GitCache {
   readonly seen: Array<{ selfContained?: boolean } | undefined> = [];
   constructor(dataDir: string) {
-    super(dataDir, nullLogger());
+    super(dataDir, nullLogger(), undefined, testGitCacheOptions());
   }
   override async runnerCloneForBranch(
     _barePath: string,
@@ -103,7 +103,7 @@ const MATERIALIZE_CAUSE = "repack of the borrowed objects failed (issue #1769 te
 class MaterializationFailingGit extends GitCache {
   seeds = 0;
   constructor(dataDir: string) {
-    super(dataDir, nullLogger());
+    super(dataDir, nullLogger(), undefined, testGitCacheOptions());
   }
   override async runnerCloneForBranch(): Promise<RunnerClone> {
     this.seeds++;

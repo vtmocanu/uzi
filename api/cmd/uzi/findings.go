@@ -16,9 +16,9 @@ import (
 // per-repo Findings backlog the worker fills mid-run with off-task bugs. `list` reads the
 // coordinate-deduped backlog; `file` turns one coordinate into a real forge issue on the user's
 // own connection (server-templated, marker-labelled — the CLI files defaults, the web is the
-// rich editor); `dismiss` triages one to `dismissed` with a reason. It mirrors
-// `uzi review backlog`/`resolve`/`dismiss`: filing is the human-gated forge write, dismissal a
-// local one.
+// rich editor); `dismiss` triages one to `dismissed` with a reason; `resolve` marks one done
+// (issue #1723); `undo` clears either human verdict. It mirrors `uzi review
+// backlog`/`resolve`/`dismiss`/`undo`: filing is the human-gated forge write, the rest are local.
 func newFindingsCmd(env Env, gf *globalFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "findings",
@@ -30,7 +30,7 @@ func newFindingsCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "List your incidental findings, deduped by (repo, location) across runs",
 		Long: "List every finding coordinate you own, deduped by (repo, location) so a bug seen in\n" +
 			"three runs is ONE row carrying \"seen in 3 runs\", grouped under its repo. The\n" +
-			"finding_id each row prints is what `uzi findings file`/`dismiss` act on.",
+			"finding_id each row prints is what `uzi findings file`/`dismiss`/`resolve` act on.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)
@@ -104,14 +104,33 @@ func newFindingsCmd(env Env, gf *globalFlags) *cobra.Command {
 	// a 404 (no existence oracle); an unparseable id is the server's 400 → exit 2.
 	stats.Flags().String("repo", "", "narrow the tally to one repo id (as `uzi repo list` prints it); a foreign/unknown id is an all-zero tally, never a 404")
 
+	resolve := &cobra.Command{
+		Use:   "resolve <finding-id>",
+		Short: "Mark a finding done (you fixed it or it is handled)",
+		Long: "Mark one finding coordinate done: you fixed it, or it is otherwise handled. A local\n" +
+			"write, nothing touches the forge. Works from to-file, filed (the issue link is kept),\n" +
+			"dismissed (the reason is cleared) and done. Prints the disposition id that\n" +
+			"`uzi findings undo` takes. Exit 4 if the id is unknown or not yours, 5 if the\n" +
+			"coordinate is being filed right now.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			return runFindingsResolve(env, gf, c, cmd, args[0])
+		},
+	}
+
 	undo := &cobra.Command{
 		Use:   "undo <disposition-id>",
-		Short: "Reopen a dismissed finding (undo a dismissal)",
-		Long: "Reopen a dismissed finding coordinate, undoing a dismissal (back to the to-file\n" +
-			"bucket). The id is the disposition id (present on every backlog row, including a\n" +
-			"dismissed one whose evidence was cascaded away). A coordinate that is not dismissed —\n" +
-			"unknown, foreign, or never dismissed — is treated as already-undone: a friendly line,\n" +
-			"exit 0, never a crash (mirroring the judge undo).",
+		Short: "Undo a dismissal or a done on a finding",
+		Long: "Undo a human verdict on a finding coordinate. A dismissal goes back to the to-file\n" +
+			"bucket; a done goes back to filed when the coordinate still has its issue, otherwise\n" +
+			"to the to-file bucket. The id is the disposition id (present on every backlog row,\n" +
+			"including one whose evidence was cascaded away). A coordinate with nothing to undo —\n" +
+			"unknown, foreign, or neither dismissed nor done — is treated as already-undone: a\n" +
+			"friendly line, exit 0, never a crash (mirroring the judge undo).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)
@@ -122,7 +141,7 @@ func newFindingsCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(list, file, dismiss, stats, undo)
+	cmd.AddCommand(list, file, dismiss, resolve, stats, undo)
 	return cmd
 }
 
@@ -180,9 +199,10 @@ func renderFindingsBacklog(p *uzicli.Printer, b apitypes.IncidentalFindingBacklo
 		rows := byRepo[repoID]
 		p.Printf("%s (%s):\n", sanitizeTTY(rows[0].RepoPath), repoID)
 		for _, f := range rows {
-			// A nil finding_id is a display-only, non-actionable coordinate whose evidence rows
-			// were cascaded away with a deleted run (D12) — show a dash so a user does not copy
-			// nothing into file/dismiss.
+			// A nil finding_id is a coordinate whose evidence rows were cascaded away with a
+			// deleted run (D12). The CLI's evidence-id verbs (file/dismiss/resolve) cannot act on
+			// it; the web marks it done by disposition id. Show a dash so a user does not copy
+			// nothing into file/dismiss/resolve.
 			id := "-"
 			if f.FindingID != nil {
 				id = *f.FindingID
@@ -260,39 +280,62 @@ func runFindingsStats(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Comm
 	return p.Table(nil, rows)
 }
 
-// runFindingsUndo reopens a dismissed finding coordinate (PRD #1183 M5), mirroring `uzi review
-// undo`: the sentinel ErrFindingNotDismissed (the endpoint's 404 for a non-dismissed/foreign id)
-// is softened to a friendly "already undone" line and exit 0, never a crash. Any other failure
-// propagates with its real exit code. --json emits a small envelope.
+// runFindingsUndo undoes a dismissal or a done on a finding coordinate (PRD #1183 M5, issue
+// #1723), mirroring `uzi review undo`: the sentinel ErrFindingNothingToUndo (the endpoint's 404
+// for a foreign id or one that is neither dismissed nor done) is softened to a friendly "already
+// undone" line and exit 0, never a crash. Any other failure propagates with its real exit code.
+// The reported status is where the coordinate landed (open, or filed for a done that kept its
+// issue link), read from the server's reply. --json emits a small envelope.
 func runFindingsUndo(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, id string) error {
-	err := c.UndoDismissFinding(cmd.Context(), id)
-	if errors.Is(err, uzicli.ErrFindingNotDismissed) {
+	row, err := c.UndoFinding(cmd.Context(), id)
+	if errors.Is(err, uzicli.ErrFindingNothingToUndo) {
 		// Nothing to undo — treat as already-undone: friendly line, exit 0.
-		return reportFindingNotDismissed(env, gf, id)
+		return reportFindingNothingToUndo(env, gf, id)
 	}
 	if err != nil {
 		return err
 	}
 	p := env.printer(gf)
 	if p.Format == uzicli.FormatJSON {
-		return p.JSON(map[string]any{"finding": id, "status": "reopened", "undone": true})
+		return p.JSON(map[string]any{"finding": id, "status": row.Status, "undone": true})
 	}
 	if !gf.quiet {
-		p.Printf("finding %s: dismissal undone (reopened)\n", id)
+		// status is a closed enum, so it prints raw.
+		p.Printf("finding %s: undone (now %s)\n", id, row.Status)
 	}
 	return nil
 }
 
-// reportFindingNotDismissed is the friendly already-undone report for `uzi findings undo` when the
-// coordinate had no dismissal to undo (the endpoint's 404, softened): exit 0, not a not-found
-// failure — mirroring reportNoDisposition on the judge undo.
-func reportFindingNotDismissed(env Env, gf *globalFlags, id string) error {
+// reportFindingNothingToUndo is the friendly already-undone report for `uzi findings undo` when
+// the coordinate had no dismissal or done to undo (the endpoint's 404, softened): exit 0, not a
+// not-found failure — mirroring reportNoDisposition on the judge undo.
+func reportFindingNothingToUndo(env Env, gf *globalFlags, id string) error {
 	p := env.printer(gf)
 	if p.Format == uzicli.FormatJSON {
-		return p.JSON(map[string]any{"finding": id, "status": "no dismissal to undo", "undone": false})
+		return p.JSON(map[string]any{"finding": id, "status": "nothing to undo", "undone": false})
 	}
 	if !gf.quiet {
-		p.Printf("finding %s: no dismissal to undo\n", id)
+		p.Printf("finding %s: nothing to undo (not dismissed or done)\n", id)
+	}
+	return nil
+}
+
+// runFindingsResolve marks one finding coordinate done (issue #1723), the finding twin of `uzi
+// review resolve`. It reports the disposition id the server returned, since that (not the
+// evidence id it was called with) is what `uzi findings undo` takes. A 404 (unknown/foreign id)
+// and a 409 (being filed) propagate as exit 4 / 5 from statusError. --json emits the coordinate,
+// the status and the disposition id.
+func runFindingsResolve(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, id string) error {
+	res, err := c.MarkFindingDone(cmd.Context(), id)
+	if err != nil {
+		return err
+	}
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		return p.JSON(map[string]any{"finding": id, "status": res.Status, "disposition_id": res.DispositionID})
+	}
+	if !gf.quiet {
+		p.Printf("finding %s: resolved (%s); undo with `uzi findings undo %s`\n", id, res.Status, res.DispositionID)
 	}
 	return nil
 }

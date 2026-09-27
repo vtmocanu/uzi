@@ -323,7 +323,9 @@ func (s *Service) StartMRReworkForRun(ctx context.Context, userID, runID uuid.UU
 	// authoritative codex-usability check is createRunResolved (it fails ErrNoCredentialForHarness
 	// if the inherited codex harness is unusable). Only a Claude source run keeps the Anthropic gate.
 	if Harness(run.Harness) != HarnessCodex {
-		hasToken, err := s.q.UserHasAnthropicToken(ctx, userID)
+		// PRD #1732 D15: only an ENABLED token can pay; a slot whose tokens are all
+		// disabled has no default and refuses at the door like a token-less owner.
+		hasToken, err := s.q.UserHasEnabledAnthropicToken(ctx, userID)
 		if err != nil {
 			return store.Run{}, fmt.Errorf("check anthropic token: %w", err)
 		}

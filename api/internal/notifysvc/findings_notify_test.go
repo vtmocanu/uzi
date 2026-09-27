@@ -223,3 +223,9 @@ func TestNotifyIncidentalFindingCoalescesSameRunInsertsNewRun(t *testing.T) {
 		t.Errorf("new row anchored to run %s, want %s", got, otherRun)
 	}
 }
+
+// GetSecretEnablement satisfies Store's credential re-check (PRD #1732 D13), which
+// only the early-reset alert calls; the finding path never reaches it.
+func (s *coalescingStore) GetSecretEnablement(context.Context, store.GetSecretEnablementParams) (store.GetSecretEnablementRow, error) {
+	return store.GetSecretEnablementRow{}, pgx.ErrNoRows
+}

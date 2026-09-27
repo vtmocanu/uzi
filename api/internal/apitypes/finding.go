@@ -9,9 +9,12 @@ import "time"
 //
 // FindingID is the latest evidence row's id — the id POST /findings/{id}/issue|dismiss act
 // on (M5). It is omitempty and nil for a filed/dismissed coordinate whose evidence rows were
-// cascaded away with a deleted run (a display-only, non-actionable row, D12): the coordinate
-// still appears (the read is disposition-driven), last_title keeps it legible, but there is no
-// evidence row to act on. A client MUST treat a nil finding_id as "not actionable from here".
+// cascaded away with a deleted run (D12): the coordinate still appears (the read is
+// disposition-driven) and last_title keeps it legible. With no evidence row, a client cannot file
+// or dismiss it through the evidence-id routes (POST /findings/{id}/issue|dismiss|done), but it
+// can still mark it done and undo that through the disposition-id routes (POST /findings/done,
+// DELETE /findings/{id}/disposition, issue #1723). A client MUST NOT offer the evidence-id actions
+// on a nil finding_id.
 //
 // LastTitle is a disposition snapshot (D12), refreshed on each report, so a coordinate stays
 // legible after its evidence is gone. It is agent-authored, already-sanitised text (inert at
@@ -27,7 +30,8 @@ import "time"
 //
 // DispositionID is the coordinate's finding_dispositions.id — the ALWAYS-PRESENT primary id the
 // bulk-dismiss (POST /findings/dismiss {ids}) and undo (DELETE /findings/{id}/dismiss) endpoints
-// key on (PRD #1183 M3). It is distinct from FindingID: FindingID is the newest EVIDENCE row's
+// key on (PRD #1183 M3), as do the bulk Mark done (POST /findings/done {ids}) and the neutral undo
+// (DELETE /findings/{id}/disposition) from issue #1723. It is distinct from FindingID: FindingID is the newest EVIDENCE row's
 // id (nil once the evidence was cascaded away with a deleted run), while a dismissed/done/filed
 // coordinate always has a disposition id even with no evidence — which is exactly why undo keys
 // on this, not on the evidence id. It is NOT omitempty: every real backlog row carries one.
@@ -111,6 +115,31 @@ type DismissFindingResultDTO struct {
 // the client can reconcile them in place. Findings is never nil on the wire (an empty result
 // encodes []), so a client iterates it without a null guard.
 type BulkDismissFindingsResultDTO struct {
+	Updated  int                    `json:"updated"`
+	Findings []IncidentalFindingDTO `json:"findings"`
+}
+
+// MarkFindingDoneResultDTO is the POST /api/findings/{id}/done response (issue #1723). Status is
+// always "done" on the 200 path; DispositionID is the coordinate's finding_dispositions.id (the
+// id Undo — DELETE /findings/{id}/disposition — and the bulk route key on), returned because the
+// request was keyed on an EVIDENCE id and the done may have created the disposition row.
+type MarkFindingDoneResultDTO struct {
+	Status        string `json:"status"`
+	DispositionID string `json:"disposition_id"`
+}
+
+// BulkMarkFindingsDoneRequest is the body of POST /api/findings/done (issue #1723): a set of
+// disposition ids. The handler caps IDs at 100 (a 400 above it) and skips a foreign, unknown or
+// mid-filing id silently; the query is owner-scoped.
+type BulkMarkFindingsDoneRequest struct {
+	IDs []string `json:"ids"`
+}
+
+// BulkMarkFindingsDoneResultDTO is the POST /api/findings/done response (issue #1723), the twin
+// of BulkDismissFindingsResultDTO. Updated counts the coordinates the one statement moved to done
+// (re-asserting done on an already-done row counts; a skipped or duplicate id does not); Findings
+// re-reads exactly those rows. Findings is never nil on the wire (an empty result encodes []).
+type BulkMarkFindingsDoneResultDTO struct {
 	Updated  int                    `json:"updated"`
 	Findings []IncidentalFindingDTO `json:"findings"`
 }

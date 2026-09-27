@@ -35,6 +35,8 @@ type bindStore struct {
 	// belongs to someone else, which is the cross-user case D11 is about.
 	secrets map[uuid.UUID]uuid.UUID
 	labels  map[string]uuid.UUID
+	// disabled marks a secret the owner has disabled (PRD #1732 D5).
+	disabled map[uuid.UUID]bool
 
 	setCalled bool
 	setArg    store.SetWorkerAnthropicSecretParams
@@ -57,7 +59,7 @@ func (b *bindStore) GetUserSecretCiphertextByID(_ context.Context, arg store.Get
 	if !ok || owner != arg.UserID {
 		return store.GetUserSecretCiphertextByIDRow{}, pgx.ErrNoRows
 	}
-	return store.GetUserSecretCiphertextByIDRow{UserID: owner, Kind: store.KindAnthropicToken}, nil
+	return store.GetUserSecretCiphertextByIDRow{UserID: owner, Kind: store.KindAnthropicToken, Disabled: b.disabled[arg.ID]}, nil
 }
 
 func (b *bindStore) SetWorkerAnthropicSecret(_ context.Context, arg store.SetWorkerAnthropicSecretParams) (store.Worker, error) {

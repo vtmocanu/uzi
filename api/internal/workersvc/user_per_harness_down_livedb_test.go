@@ -156,6 +156,13 @@ func TestUserPerHarnessDownProjectionLiveDB(t *testing.T) {
 		users = append(users, seeded{id: id, claudeLane: claudeLane, codexLane: codexLane, c: c})
 	}
 
+	// The resolver reads columns later migrations add (PRD #1732's user_secrets.disabled_at),
+	// so bring the seeded database to the head schema before running it; every seeded
+	// credential is enabled, so the lane it computes is the one 00246's Down mirrors.
+	if err := store.Migrate(ctx, newDSN); err != nil {
+		t.Fatalf("Migrate to head: %v", err)
+	}
+
 	// Compute the EXPECTED active lane per user with the real resolver, BEFORE Down.
 	expected := make(map[uuid.UUID]string, len(users))
 	for _, s := range users {

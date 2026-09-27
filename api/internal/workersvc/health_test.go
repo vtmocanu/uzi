@@ -101,16 +101,23 @@ type healthFakeStore struct {
 	// protocolCalls records every lookup's user id, so a test can prove the rung asks about THIS
 	// run's user and that the guards ahead of it (and the non-interlocked case) short-circuit.
 	protocolCalls []uuid.UUID
-	// custodyHolds is the canned CountUnresolvedCustodyHoldsForOwner answer (PRD #1296 M4): the
-	// owner's OPEN custody-hold count. >= custodyHoldLimit drives reasonCustodyLimit.
+	// custodyHolds is the canned GetCustodyAdmissionForRun open_holds answer (PRD #1296 M4): the
+	// owner's OPEN custody-hold count. >= custodyHoldLimit drives reasonCustodyLimit unless
+	// custodyExempt (issue #1751 continuation exemption) is set.
 	// custodyErr forces the read to fail (falls through to the generic queuedReason). The count
 	// predicate itself is pinned against a real Postgres by the store package; this side pins the
 	// ARM (count vs limit → reason mapping).
-	custodyHolds int64
-	custodyErr   error
+	custodyHolds  int64
+	custodyExempt bool
+	custodyErr    error
 	// custodyCalls records every lookup's user id, so a test can prove the rung asks about THIS
 	// run's owner (the SAME predicate the claim gates on) and that vault-lock short-circuits it.
 	custodyCalls []uuid.UUID
+	// custodyRunCalls records every lookup's run id (issue #1751: the exemption is per run).
+	custodyRunCalls []uuid.UUID
+	// custodyLimitCalls records every lookup's custody_hold_limit (issue #1751: the per-run
+	// exemption bound is the same limit ClaimRun is passed).
+	custodyLimitCalls []int32
 }
 
 func (f *healthFakeStore) ListActiveRunsForHealth(context.Context, []string) ([]store.ListActiveRunsForHealthRow, error) {
@@ -191,12 +198,14 @@ func (f *healthFakeStore) ListRunLeadToolWindow(_ context.Context, arg store.Lis
 	}
 	return out, nil
 }
-func (f *healthFakeStore) CountUnresolvedCustodyHoldsForOwner(_ context.Context, userID uuid.UUID) (int64, error) {
-	f.custodyCalls = append(f.custodyCalls, userID)
+func (f *healthFakeStore) GetCustodyAdmissionForRun(_ context.Context, arg store.GetCustodyAdmissionForRunParams) (store.GetCustodyAdmissionForRunRow, error) {
+	f.custodyCalls = append(f.custodyCalls, arg.UserID)
+	f.custodyRunCalls = append(f.custodyRunCalls, arg.RunID)
+	f.custodyLimitCalls = append(f.custodyLimitCalls, arg.CustodyHoldLimit)
 	if f.custodyErr != nil {
-		return 0, f.custodyErr
+		return store.GetCustodyAdmissionForRunRow{}, f.custodyErr
 	}
-	return f.custodyHolds, nil
+	return store.GetCustodyAdmissionForRunRow{OpenHolds: f.custodyHolds, ContinuationExempt: f.custodyExempt}, nil
 }
 func (f *healthFakeStore) CountOnlineWorkersForUser(context.Context, uuid.UUID) (int64, error) {
 	return f.onlineWorkers, nil
@@ -717,7 +726,7 @@ func TestHealthQueuedHandoffSetup(t *testing.T) {
 // TestHealthQueuedCustodyLimit drives the PRD #1296 M4 (D4) custody-limit rung through
 // detectRunHealth: a queued run whose OWNER is at the custody-hold admission limit reports
 // reasonCustodyLimit (flag healthWaitingWorker), resolved against the SAME predicate the
-// claim gates on (CountUnresolvedCustodyHoldsForOwner vs custodyHoldLimit) and AHEAD of every
+// claim gates on (GetCustodyAdmissionForRun vs custodyHoldLimit) and AHEAD of every
 // worker-availability reason — so even a zero-worker fleet reports the custody block, because
 // bringing a worker online cannot clear it. Below the limit, or on a read error, it falls
 // through to the generic worker reasons rather than inventing one.
@@ -725,15 +734,20 @@ func TestHealthQueuedCustodyLimit(t *testing.T) {
 	cases := []struct {
 		name    string
 		holds   int64
+		exempt  bool
 		holdErr error
 		// zero online workers, so the fall-through reason is reasonNoWorker: proves the
 		// custody rung is checked AHEAD of worker availability (it wins despite 0 workers).
 		want string
 	}{
-		{"at the limit fires custody reason (beats no-worker)", int64(custodyHoldLimit), nil, reasonCustodyLimit},
-		{"over the limit fires custody reason", int64(custodyHoldLimit) + 3, nil, reasonCustodyLimit},
-		{"one below the limit falls through", int64(custodyHoldLimit) - 1, nil, reasonNoWorker},
-		{"read error falls through (no invented reason)", int64(custodyHoldLimit), errors.New("boom"), reasonNoWorker},
+		{"at the limit fires custody reason (beats no-worker)", int64(custodyHoldLimit), false, nil, reasonCustodyLimit},
+		{"over the limit fires custody reason", int64(custodyHoldLimit) + 3, false, nil, reasonCustodyLimit},
+		{"one below the limit falls through", int64(custodyHoldLimit) - 1, false, nil, reasonNoWorker},
+		{"read error falls through (no invented reason)", int64(custodyHoldLimit), false, errors.New("boom"), reasonNoWorker},
+		// Issue #1751: a continuation-exempt run is admitted by ClaimRun at/over the cap, so
+		// the pill must not claim a custody block for it.
+		{"continuation-exempt run at the limit falls through", int64(custodyHoldLimit), true, nil, reasonNoWorker},
+		{"continuation-exempt run over the limit falls through", int64(custodyHoldLimit) + 3, true, nil, reasonNoWorker},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -742,6 +756,7 @@ func TestHealthQueuedCustodyLimit(t *testing.T) {
 			fs := &healthFakeStore{
 				active:        []store.ListActiveRunsForHealthRow{r},
 				custodyHolds:  tc.holds,
+				custodyExempt: tc.exempt,
 				custodyErr:    tc.holdErr,
 				onlineWorkers: 0, // no worker online → fall-through reason is reasonNoWorker
 			}
@@ -758,6 +773,12 @@ func TestHealthQueuedCustodyLimit(t *testing.T) {
 			// The rung asks about THIS run's owner — the same predicate/owner the claim gates on.
 			if len(fs.custodyCalls) != 1 || fs.custodyCalls[0] != r.UserID {
 				t.Fatalf("custody lookups = %v, want exactly [%s] (the run's owner)", fs.custodyCalls, r.UserID)
+			}
+			if len(fs.custodyRunCalls) != 1 || fs.custodyRunCalls[0] != r.ID {
+				t.Fatalf("custody run lookups = %v, want exactly [%s] (this run)", fs.custodyRunCalls, r.ID)
+			}
+			if len(fs.custodyLimitCalls) != 1 || fs.custodyLimitCalls[0] != custodyHoldLimit {
+				t.Fatalf("custody limit args = %v, want exactly [%d] (the claim's limit)", fs.custodyLimitCalls, custodyHoldLimit)
 			}
 		})
 	}

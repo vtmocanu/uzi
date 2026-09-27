@@ -81,6 +81,14 @@ var (
 	// unit test can still assert this precise sentinel. M5B may remap it to a surface
 	// error; the terminal-failure semantics are already correct via the wrap.
 	errNoUsableCredential = fmt.Errorf("%w: no usable harness credential for this user", errCredentialUnavailable)
+
+	// errHarnessCredentialDisabled is errNoCredentialForHarness for an EXPLICIT harness whose
+	// credential slot holds credentials, every one of them disabled (PRD #1732 D15: presence
+	// tells a stored-but-disabled credential apart from an absent one). It WRAPS
+	// errNoCredentialForHarness, so every consumer keying on that keeps refusing the request
+	// with no fallback; the scheduler alone tells it apart to record the credential_disabled
+	// skip rather than a hard, non-advancing refusal.
+	errHarnessCredentialDisabled = fmt.Errorf("%w: the selected harness's credentials are all disabled; enable one in Settings", errNoCredentialForHarness)
 )
 
 // resolveHarness is the PURE D11 harness resolver (PRD #1332 D4, parent D11). It takes
@@ -150,10 +158,16 @@ type resolvedHarness struct {
 // (the same idiom codexauthz.go's codexAuthzStore uses) means this dark layer reuses
 // ONLY existing C1 queries without widening the broad Store interface — GetUserDefaultHarness
 // and CountCodexSecrets are C1 additions not on that interface, and this file must not edit it.
+//
+// PRD #1732 D15: usability reads the ENABLED variants (UserHasEnabledAnthropicToken,
+// CountEnabledCodexSecrets); the any-credential variants are read only to classify an explicit
+// refusal as disabled-not-absent (errHarnessCredentialDisabled).
 type harnessResolverStore interface {
 	UserHasAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
+	UserHasEnabledAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
 	GetUserDefaultHarness(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	CountCodexSecrets(ctx context.Context, userID uuid.UUID) (int64, error)
+	CountEnabledCodexSecrets(ctx context.Context, userID uuid.UUID) (int64, error)
 	GetDefaultUserSecretMeta(ctx context.Context, arg store.GetDefaultUserSecretMetaParams) (store.GetDefaultUserSecretMetaRow, error)
 	GetCodexCredentialState(ctx context.Context, arg store.GetCodexCredentialStateParams) (store.CodexCredentialState, error)
 }
@@ -199,9 +213,10 @@ func (s *Service) resolveRunHarness(ctx context.Context, userID uuid.UUID, expli
 // leave a Codex row bound to a vanished credential. *store.Queries satisfies harnessResolverStore,
 // so a qtx derived via WithTx is a valid q here. resolveRunHarness is the ambient-q wrapper.
 func (s *Service) resolveRunHarnessQ(ctx context.Context, userID uuid.UUID, explicit *Harness, q harnessResolverStore) (resolvedHarness, error) {
-	// Claude usability is exactly "does the user hold an Anthropic token", the same
-	// door-check GET /api/me/rate-limits derives no_token from.
-	claudeUsable, err := q.UserHasAnthropicToken(ctx, userID)
+	// Claude usability is "does the user hold an ENABLED Anthropic token" (PRD #1732 D15: a
+	// slot whose tokens are all disabled has no default and counts as unavailable, so a new
+	// implicit request falls back as it would for a token-less user).
+	claudeUsable, err := q.UserHasEnabledAnthropicToken(ctx, userID)
 	if err != nil {
 		return resolvedHarness{}, fmt.Errorf("harness resolve: anthropic token check: %w", err)
 	}
@@ -224,6 +239,9 @@ func (s *Service) resolveRunHarnessQ(ctx context.Context, userID uuid.UUID, expl
 		avail:       harnessAvailability{claudeUsable: claudeUsable, codexUsable: codexUsable},
 	})
 	if err != nil {
+		if explicit != nil && errors.Is(err, errNoCredentialForHarness) {
+			return resolvedHarness{}, explicitHarnessRefusal(ctx, q, userID, *explicit)
+		}
 		return resolvedHarness{}, err
 	}
 
@@ -238,6 +256,36 @@ func (s *Service) resolveRunHarnessQ(ctx context.Context, userID uuid.UUID, expl
 		return resolvedHarness{Harness: HarnessCodex, Codex: &choice}, nil
 	}
 	return resolvedHarness{Harness: h}, nil
+}
+
+// explicitHarnessRefusal classifies an explicit harness's no-usable-credential refusal (PRD
+// #1732 D15): errHarnessCredentialDisabled when the harness's slot holds credentials but none is
+// enabled, else the plain errNoCredentialForHarness. Both refuse the request; neither falls
+// back. A store error is returned as-is.
+func explicitHarnessRefusal(ctx context.Context, q harnessResolverStore, userID uuid.UUID, h Harness) error {
+	switch h {
+	case HarnessClaude:
+		present, err := q.UserHasAnthropicToken(ctx, userID)
+		if err != nil {
+			return fmt.Errorf("harness resolve: anthropic token presence: %w", err)
+		}
+		if present {
+			return errHarnessCredentialDisabled
+		}
+	case HarnessCodex:
+		total, err := q.CountCodexSecrets(ctx, userID)
+		if err != nil {
+			return fmt.Errorf("harness resolve: count codex secrets: %w", err)
+		}
+		enabled, err := q.CountEnabledCodexSecrets(ctx, userID)
+		if err != nil {
+			return fmt.Errorf("harness resolve: count enabled codex secrets: %w", err)
+		}
+		if total > 0 && enabled == 0 {
+			return errHarnessCredentialDisabled
+		}
+	}
+	return errNoCredentialForHarness
 }
 
 // ResolveSettingsHarness resolves the harness the settings surface projects the legacy
@@ -269,7 +317,7 @@ func (s *Service) ResolveSettingsHarnessWithDefault(ctx context.Context, userID 
 	if !ok {
 		return "", errHarnessStoreUnavailable
 	}
-	claudeUsable, err := q.UserHasAnthropicToken(ctx, userID)
+	claudeUsable, err := q.UserHasEnabledAnthropicToken(ctx, userID)
 	if err != nil {
 		return "", fmt.Errorf("harness resolve: anthropic token check: %w", err)
 	}
@@ -331,9 +379,10 @@ func (s *Service) userDefaultHarness(ctx context.Context, userID uuid.UUID, q ha
 // (D4: "a failed or missing subscription never spends an API key"). It is reads only — no
 // lock or lease (D6).
 func (s *Service) resolveUsableCodexCredential(ctx context.Context, userID uuid.UUID, q harnessResolverStore) (codexCredentialChoice, bool, error) {
-	// Cheap "is Codex configured at all" guard. Zero codex credentials ⇒ no default to
-	// select ⇒ Codex unusable, without the per-kind default lookups.
-	n, err := q.CountCodexSecrets(ctx, userID)
+	// Cheap "is Codex configured at all" guard. Zero ENABLED codex credentials ⇒ no default
+	// to select (PRD #1732 D4/D15: disabling the slot's last credential clears its default) ⇒
+	// Codex unusable, without the per-kind default lookups.
+	n, err := q.CountEnabledCodexSecrets(ctx, userID)
 	if err != nil {
 		return codexCredentialChoice{}, false, fmt.Errorf("harness resolve: count codex secrets: %w", err)
 	}
@@ -347,6 +396,11 @@ func (s *Service) resolveUsableCodexCredential(ctx context.Context, userID uuid.
 		return codexCredentialChoice{}, false, err
 	}
 	if ok {
+		// Defensive (PRD #1732 D4 keeps every default enabled): a disabled default is not
+		// usable, and like a failed subscription it never falls through to another alias.
+		if sub.Disabled {
+			return codexCredentialChoice{}, false, nil
+		}
 		st, serr := q.GetCodexCredentialState(ctx, store.GetCodexCredentialStateParams{
 			UserSecretID: sub.ID,
 			UserID:       userID,
@@ -376,7 +430,7 @@ func (s *Service) resolveUsableCodexCredential(ctx context.Context, userID uuid.
 	if err != nil {
 		return codexCredentialChoice{}, false, err
 	}
-	if ok {
+	if ok && !api.Disabled {
 		return codexCredentialChoice{
 			SecretID: api.ID,
 			Label:    api.Label,

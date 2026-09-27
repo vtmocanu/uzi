@@ -67,6 +67,45 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   detached worktree at the exact head it certifies, never in the `land-prep.sh` worktree:
   land-prep rebases that tree in place, so a check still running there tests a mixed tree.
 
+## Buddy
+
+A buddy is the peer bound with the `session-peers` skill (`buddy: @NAME`). It is
+this lander's second pair of eyes.
+
+- **Requires the session-peers `buddy` command** (vtmocanu/skills#73 or later,
+  installed). If `peers.py buddy` is an unknown command, say the CLI lacks buddy
+  support, which is not the same as no buddy bound, and ask the user as below.
+- **On entry run `peers.py buddy`.** None bound → ask the user once: name a buddy
+  or authorize solo. Without either, keep preparing (poll, review, fix, rebase) but
+  stop before the merge and report the missing requirement once.
+- **Bound but unavailable** (not live, no route, or no verdict after two requests)
+  → ask for a replacement or solo authorization. Never downgrade silently.
+- **Solo waives only the buddy**, never independent review, CI or a user review. Where
+  the table below names the buddy, solo substitutes one local reviewer pinned to the
+  head; every other required review stays.
+- Prefer a cross-family buddy (Claude with Codex); name a same-family one in the trail.
+- **One request per pushed head.** The buddy reviews the exact head SHA; reuse its
+  verdict until the head moves. Re-request on the same head only when the findings
+  or evidence change (a new bot finding, a disposition it should concur on).
+- **Longer loops.** With a Claude lander and a Codex buddy, a user-authorized
+  multi-round loop runs `peers.py budget allow buddy --replies N` once, not a reset
+  per round. A correlated `ask`/`dispatch` reply needs no allowance.
+- **Issues you file** (follow-ups, inherited or incidental findings): the buddy
+  reviews the final draft, then add the `reviewed` label. Solo: a local reviewer.
+- The buddy's `APPROVE` is required where this skill says so below. It never
+  replaces a user approval.
+
+| Lane | Required exact-head reviews |
+|---|---|
+| Small/mechanical non-Renovate PR | the buddy (the initial local reviewer) |
+| After a local fix | the buddy plus CodeRabbit (Greptile when CR is rate-limited) |
+| CodeRabbit rate-limited | switch to Greptile (step 3); the buddy reviews too |
+| Bot skipped or absent | the buddy |
+| Skill or script maintenance (`[skip-cr]`) | the buddy plus the user |
+| Rebase or renumber only | the buddy's `APPROVE` of the range-diff on the new head, plus green CI (`watch-pr.sh --reviewer none`, which still checks current-head CI and live findings); a prior review of the old head carries over only when the range-diff changes no reviewed semantics. This is the one exception to the exact-SHA review rules below |
+| Bot approved this head, no local fix since | none extra, except large or trust-boundary PRs: the buddy too |
+| Renovate, assessed CI-sufficient | none extra; a Renovate PR assessed as needing review follows the rows above |
+
 ## Entry: the snapshot
 
 ```
@@ -107,8 +146,8 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
 2. **Choose the review lane, then wait for readiness.** For a Renovate-class PR, inspect
    the effective diff against the current base and decide whether review is needed. If not,
    state why and use `--reviewer none`; green CI is the independent signal. If review adds
-   value, use one local reviewer by default or a user-approved bot. For other
-   small/mechanical PRs, dispatch one local reviewer on the immutable head and run the
+   value, use the buddy by default or a user-approved bot. For other
+   small/mechanical PRs, send the immutable head to the buddy (*Buddy*) and run the
    waiter with `--reviewer none` in parallel; both must finish clean. For large/high-risk
    PRs, select CodeRabbit or Greptile and let an auto-review already in progress finish.
 
@@ -126,13 +165,17 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    | 5 | CodeRabbit rate-limited, nothing else reviewed | step 3 |
    | 6 | no reviewer will come (skipped / absent past grace) | step 3 |
    | 7 | CR says the last commit was already reviewed | step 3, decide whether to request a full review |
+   | 8 | PR conflicts with its base (`mergeable=CONFLICTING`): GitHub runs no CI on it | step 5 |
+   | 9 | a lookup stayed unreadable for `--max-unknown` polls (default 5; no checks yet on a mergeable head is pending for `--ci-grace`, 15 min); `RESULT` names it | inspect that lookup; never merge on it |
 
    Let an auto-review that is already running finish; never re-trigger it. `--reviewer` also
    scopes which bot BLOCKS: `coderabbit`|`greptile` selects one bot AND makes the other fully
    non-blocking (its in-flight review is not waited on, its findings do not gate) — the way to
    land on one bot while explicitly ignoring the other. `any` waits for and counts both bots'
    findings; `none` requires no reviewed-head signal (the local-review/Renovate lane) but
-   STILL counts live findings from both bots.
+   STILL counts live findings from both bots. Each poll line names its unknown lookups
+   (`unknown_lookups=`). `greptile_last_reviewed=<sha>` (also in `pr-findings.sh`) is Greptile's
+   newest earlier verdict: `git range-diff` it against a rebased head to decide on a re-run.
 
    **Greptile's clean pass posts no review and no comment:** only its `Greptile Review`
    check-run plus its PR-body edit naming "Last reviewed commit". A push racing the trigger
@@ -184,9 +227,9 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    - **small / quick** (localized, no design change): fix locally by default, one push per
      PR via `S/land-prep.sh OWNER/REPO PR` (it re-checks the rework lane and pushes with a
      lease), trail `fix local → pushed`. Before merging, require two clean reviews of that
-     exact SHA: a live Codex lander peer found via session-peers (`peers.py list`; a peer
-     listed `not registered` needs `peers.py up <uuid>` or its reply cannot route back), plus
-     CodeRabbit (Greptile when CR is rate-limited). Skill-maintenance `[skip-cr]` PRs keep
+     exact SHA: the buddy (`peers.py buddy ping` restores a lost reply route) plus
+     CodeRabbit (Greptile when CR is rate-limited). A later rebase-only push keeps them
+     via the rebase lane (*Buddy*). Skill-maintenance `[skip-cr]` PRs keep
      their own rule below;
    - **big** (design-level, many files, needs the plan's context): `uzi run rework RUN -m
      'GUIDANCE'` (single-quoted), `SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)` captured first,
@@ -205,6 +248,8 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    ask when unsure and the user is present. Say which in the merge note. Greptile does not
    re-review on its own; re-comment if you want its second pass.
 5. **Base hygiene, when needed, unprompted.** `BEHIND` alone is fine under an admin merge.
+   A conflicting PR gets no CI at all, even right after uzi's own `mr_rework` push: read
+   `mergeable` before waiting on checks.
    A migration-number collision, a `DIRTY` mergeable state, or a strict-check block needs:
 
    ```
@@ -216,6 +261,7 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    unless a bullet appears on both sides of a hunk (a shared `### X` under `[Unreleased]` is
    fine), a hunk holds a `## ` heading, or a side rewords a line: then it refuses and the
    stop is exit 5. Duplicate `###` headings under `[Unreleased]` get their own collapse commit.
+   Union and collapse keep every existing blank line; only their own joins follow `[Unreleased]`'s convention.
    Exit 5 = any other conflict, worktree left mid-rebase: resolve (a union of both sides is
    usual for a shared list), `git rebase --continue`, re-run with `--skip-rebase`. Exit 6 = the
    renumber helper reported references to fix by hand. Exit 7 = a gate failed (log path
@@ -225,7 +271,7 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    environment, and confirming they come from Linux-only `/proc/self/fd` operations; unchanged
    imports alone are insufficient. Exit 7 stopped before the push: record both results,
    complete the other required checks, push the reviewed head with an explicit lease, and
-   require green Linux CI and review of that exact SHA before merging. Any additional or
+   require green Linux CI and review of that exact SHA (or the rebase lane, *Buddy*) before merging. Any additional or
    different failure blocks this exception. A base move sharing no branch file but `CHANGELOG.md` is
    rebased without re-gating (CI on the pushed head is the gate). Exit 8 = the branch
    moved, or the base moved into other branch files or conflicts: restart with `--fresh`; it resets to
@@ -291,8 +337,8 @@ and they precede every merge (step 6):
   failure evidence (same step, same error, same logs), not a similar symptom. Checks that
   failure blocks are still unvalidated for this PR: say which and get the user's call before
   merging. File the regression with both results; add `uzi` only once it is sweep-ready.
-- **Pin every local review to the immutable head.** One focused local reviewer is the
-  default for small/mechanical non-Renovate diffs. For Renovate-class work, record the
+- **Pin every local review to the immutable head.** The buddy is the default reviewer
+  for small/mechanical non-Renovate diffs. For Renovate-class work, record the
   explicit review-needed or CI-sufficient decision. Large/high-risk diffs use the stronger
   bot lane, briefed with the plan's invariants; add a bespoke specialist only when the risk
   class needs one.
@@ -347,12 +393,12 @@ Branch on the poller's own `EXIT=`/`RESULT=` line, never on the harness's task s
 - Other behaviour changes, new scripts and new rules are batched into **one
   end-of-session ask** ("these three improvements to `uzi-lander`, ok?"), not applied
   silently.
-- A skill-maintenance PR is titled with `[skip-cr]` (no bot review), reviewed by a local
-  agent or a peer session, and by the user. Re-run `agnix` on `SKILL.md` after editing;
-  `task check:skill-size` gates the size. A Codex peer's shim delivers at most three
-  consecutive replies per 30 minutes; before a fourth consecutive review reply run
-  `peers.py budget reset <peer>` (session-peers skill), otherwise the verdict is held
-  (the shim log names it).
+- A skill-maintenance PR is titled with `[skip-cr]` (no bot review), reviewed by the buddy
+  (solo: a local reviewer) and by the user. Re-run `agnix` on `SKILL.md` after editing;
+  `task check:skill-size` gates the size. A Codex buddy's shim delivers at most three
+  consecutive replies per 30 minutes; for a longer review loop run
+  `peers.py budget allow buddy --replies N` (session-peers skill), otherwise the
+  verdict is held (the shim log names it).
 
 ## Files
 

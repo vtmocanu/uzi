@@ -55,12 +55,13 @@ vi.mock("../lib/api", () => ({
     // PRD #333 M7 / PRD #1183 M4: AppShell now polls the Findings open-count badge from
     // getFindingsStats().todo on navigation; zero counts so these tests assert the nav STRUCTURE
     // without a findings badge in the way. listFindings stays stubbed (Findings page uses it), and
-    // the bulk-dismiss / undo verbs are added so any new api.* call resolves (this module mock has
+    // the bulk-dismiss / Mark done / undo verbs are added so any new api.* call resolves (this module mock has
     // no importOriginal, so every function AppShell/Judge/Findings can reach must exist here).
     listFindings: vi.fn().mockResolvedValue({ bucket: "to_file", repo: "", run: "", open_count: 0, findings: [] }),
     getFindingsStats: vi.fn().mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
     dismissFindings: vi.fn(),
-    undoDismissFinding: vi.fn(),
+    markFindingsDone: vi.fn(),
+    undoFinding: vi.fn(),
     listRuns: vi.fn().mockResolvedValue({ runs: [] }),
     getMyRateLimits: vi.fn().mockResolvedValue({ status: "no_token" }),
     // SidebarUsageLimits fetches the chosen sidebar-account set on mount.

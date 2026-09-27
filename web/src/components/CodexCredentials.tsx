@@ -16,7 +16,7 @@
 // or an API key, does count as a usable credential: lib/hasToken.ts's
 // hasUsableCredential accepts either harness.)
 
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { api, type SecretMeta } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { isVaultLocked } from "../lib/api";
@@ -25,6 +25,22 @@ import { Badge, Button, Card, Field, Input, SectionTitle, Skeleton } from "./ui"
 import type { BadgeTone } from "./ui";
 import { DocLink } from "./DocLink";
 import { DOC_CODEX_CREDENTIALS } from "../lib/doclinks";
+import { emitSidebarTokensChanged } from "../lib/sidebarTokens";
+import {
+  CheckingUsageBadge,
+  DisableCredentialDialog,
+  DisabledCredentialRow,
+  DisabledSection,
+  NoDefaultNotice,
+  disableButtonId,
+  disabledSince,
+  enableButtonId,
+  slotHasDefault,
+  splitByEnablement,
+  useCheckingUsage,
+  usePendingFocus,
+  useRememberedExpansion,
+} from "./CredentialEnablement";
 
 // vaultLockedMessage is the shared copy for a 409 vault_locked: the global handler
 // has already refreshed the session, so the unlock banner is showing above.
@@ -34,7 +50,7 @@ const VAULT_LOCKED =
 // D6's reason, in one place: rendered as a tooltip AND as the screen-reader
 // description the disabled-looking Delete points at, so the two cannot drift.
 const D6_HINT =
-  "Make another credential the default first; every account needs one default while any credential exists.";
+  "Make another credential the default first; every account needs one default while any other enabled credential exists.";
 
 // What happens to a `staging` login next, in one place: the badge hint and the status
 // legend both say it, so the two cannot drift. uzi's Codex usage poller is the only
@@ -163,11 +179,39 @@ export function codexShapeError(raw: string): string | null {
 // carries no such bindings). The default is reachable here only as the LAST
 // credential (D6 blocks deleting a default while others exist), so that branch is
 // the disconnect-my-account case.
-function codexDeleteWarning(label: string, isDefault: boolean): string {
+function codexDeleteWarning(label: string, isDefault: boolean, disabledLeft = 0): string {
   if (isDefault) {
+    // PRD #1732: disabled credentials that stay behind keep the account on file; deleting
+    // the last ENABLED one leaves the shared slot with no default.
+    if (disabledLeft > 0) {
+      return `Delete “${label}”? This is your last enabled Codex credential, so you will have no default until you enable one of your disabled credentials.`;
+    }
     return `Delete “${label}”? This is your last Codex credential — uzi will no longer be connected to your OpenAI account.`;
   }
   return `Delete “${label}”? Removing it changes nothing else — your default Codex credential is unaffected.`;
+}
+
+// replacementOrder offers the new-default candidates with failed logins LAST: a failed
+// default leaves Codex unusable (isCodexUsable), so it should never be the first pick.
+function replacementOrder(rows: SecretMeta[]): SecretMeta[] {
+  const failed = (s: SecretMeta) => (s.codex_status === "failed" ? 1 : 0);
+  return [...rows].sort((a, b) => failed(a) - failed(b));
+}
+
+// replacementBadges is what the Disable dialog shows beside each candidate: the same kind
+// and status badges its row wears, so "make X the default" is chosen knowing X's state.
+function replacementBadges(s: SecretMeta) {
+  const badge = statusBadge(s.codex_status);
+  return (
+    <>
+      <Badge tone="neutral">{kindLabel(s.kind)}</Badge>
+      {badge && (
+        <Badge tone={badge.tone} title={badge.hint}>
+          {badge.label}
+        </Badge>
+      )}
+    </>
+  );
 }
 
 // CredentialRow is one stored Codex credential: its label, the kind, the stateless
@@ -178,13 +222,23 @@ function CredentialRow({
   secret,
   busy,
   soleCredential,
+  disabledLeft,
+  checkingUsage,
+  onDisable,
   onChanged,
   onError,
   onNotice,
 }: {
   secret: SecretMeta;
   busy: boolean;
+  // The only ENABLED credential in the shared slot (PRD #1732): the server lets the
+  // default go only when no other enabled credential remains.
   soleCredential: boolean;
+  // Disabled credentials that stay behind, for the last-credential delete warning.
+  disabledLeft: number;
+  // PRD #1732: just enabled, and no fresh reading has landed yet.
+  checkingUsage: boolean;
+  onDisable: () => void;
   onChanged: () => Promise<void>;
   onError: (m: string) => void;
   onNotice: (m: string) => void;
@@ -286,10 +340,11 @@ function CredentialRow({
               </>
             )}
             {secret.is_default && <Badge tone="ok">default</Badge>}
+            {checkingUsage && <CheckingUsageBadge />}
           </div>
         )}
         {!renaming && (
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <Button
               variant="ghost"
               size="sm"
@@ -314,6 +369,17 @@ function CredentialRow({
                 Make default
               </Button>
             )}
+            {/* PRD #1732: reversible suspension, beside Rename / Make default / Delete. */}
+            <Button
+              id={disableButtonId(secret.id)}
+              variant="ghost"
+              size="sm"
+              disabled={disabled}
+              onClick={onDisable}
+              aria-label={`Disable ${sanitizeLabel(secret.label)}`}
+            >
+              Disable
+            </Button>
             <Button
               variant="danger"
               size="sm"
@@ -331,7 +397,7 @@ function CredentialRow({
                 if (blockedByD6) return;
                 if (
                   !window.confirm(
-                    codexDeleteWarning(sanitizeLabel(secret.label), secret.is_default),
+                    codexDeleteWarning(sanitizeLabel(secret.label), secret.is_default, disabledLeft),
                   )
                 )
                   return;
@@ -582,6 +648,128 @@ export function CodexCredentials({
   const first = secrets.length === 0;
   const anyBusy = busy || rotateBusy;
 
+  // PRD #1732: live credentials above, suspended ones on the Disabled shelf below. The
+  // default is shared across both Codex kinds, so "the slot" is the whole card.
+  const { active, disabled } = splitByEnablement(secrets);
+  const hasDefault = slotHasDefault(secrets);
+  const [shelfOpen, setShelfOpen] = useRememberedExpansion("uzi.settings.disabledCodexOpen");
+  const [disabling, setDisabling] = useState<SecretMeta | null>(null);
+  const [shelfBusy, setShelfBusy] = useState(false);
+  const shelfToggleId = useId();
+  const focusLater = usePendingFocus();
+  // "checking usage…" after enabling a Codex login: until an account naming this alias
+  // carries a fresh reading. An API key has no subscription meter, so it never checks.
+  const secretsRef = useRef(secrets);
+  useEffect(() => {
+    secretsRef.current = secrets;
+  });
+  const { checking, start: startChecking } = useCheckingUsage(async (ids) => {
+    const { accounts } = await api.getMyCodexRateLimits();
+    const freshAliases = new Set(accounts.filter((a) => a.status === "fresh").flatMap((a) => a.aliases));
+    return ids.filter((id) => {
+      const row = secretsRef.current.find((s) => s.id === id);
+      return !row || freshAliases.has(row.label);
+    });
+  });
+  // D6: a disabled login whose ChatGPT account stays live through an ENABLED sibling
+  // says so instead of "Disabled since". Read lazily, only while the shelf is open.
+  const [siblingNotes, setSiblingNotes] = useState<Record<string, string>>({});
+  const disabledLoginIds = disabled
+    .filter((s) => s.kind === "codex_auth")
+    .map((s) => s.id)
+    .join(",");
+  useEffect(() => {
+    if (!shelfOpen || disabledLoginIds === "") return;
+    let cancelled = false;
+    for (const id of disabledLoginIds.split(",")) {
+      void api
+        .getSecretDependents("codex_auth", id)
+        .then(({ enabled_siblings: sib }) => {
+          if (cancelled) return;
+          // No enabled sibling any more (it was disabled or deleted since the last
+          // read): drop the note, so the row falls back to "Disabled since".
+          if (sib.total === 0) {
+            setSiblingNotes((prev) => {
+              if (!(id in prev)) return prev;
+              const next = { ...prev };
+              delete next[id];
+              return next;
+            });
+            return;
+          }
+          const first = sib.items[0] ? `“${sanitizeLabel(sib.items[0].label)}”` : "another login";
+          const more = sib.total > 1 ? ` and ${sib.total - 1} more` : "";
+          setSiblingNotes((prev) => ({
+            ...prev,
+            [id]: `Disabled. Its ChatGPT account stays live through ${first}${more}.`,
+          }));
+        })
+        .catch(() => {});
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [shelfOpen, disabledLoginIds]);
+
+  const confirmDisable = async (newDefaultId: string | undefined) => {
+    const target = disabling;
+    if (!target) return;
+    onError("");
+    onNotice("");
+    await api.setSecretEnabled(target.kind, target.id, false, newDefaultId);
+    setDisabling(null);
+    const promoted = newDefaultId ? secrets.find((s) => s.id === newDefaultId) : undefined;
+    onNotice(
+      promoted
+        ? `Disabled “${sanitizeLabel(target.label)}”. “${sanitizeLabel(promoted.label)}” is now your default Codex credential.`
+        : `Disabled “${sanitizeLabel(target.label)}”. Enable it again from the Disabled section.`,
+    );
+    emitSidebarTokensChanged();
+    // The row now sits behind the shelf toggle; focus goes there, not to <body>.
+    focusLater(shelfToggleId);
+    await reload();
+  };
+
+  const enable = async (s: SecretMeta) => {
+    onError("");
+    onNotice("");
+    setShelfBusy(true);
+    try {
+      const { secret: updated } = await api.setSecretEnabled(s.kind, s.id, true);
+      if (s.kind === "codex_auth") startChecking(s.id);
+      onNotice(
+        updated.is_default
+          ? `Enabled “${sanitizeLabel(s.label)}”. It is now your default Codex credential.`
+          : `Enabled “${sanitizeLabel(s.label)}”.`,
+      );
+      emitSidebarTokensChanged();
+      // Back in the live list: focus its Disable, the control that undoes this.
+      focusLater(disableButtonId(s.id));
+      await reload();
+    } catch (err) {
+      onError(errText(err, "Failed to enable the credential"));
+    } finally {
+      setShelfBusy(false);
+    }
+  };
+
+  // A disabled credential is never the default (D4), so its delete is the ordinary one.
+  const removeDisabled = async (s: SecretMeta) => {
+    if (!window.confirm(codexDeleteWarning(sanitizeLabel(s.label), false))) return;
+    onError("");
+    onNotice("");
+    setShelfBusy(true);
+    try {
+      await apiForKind(s.kind).del(s.id);
+      onNotice(`Deleted “${s.label}”.`);
+      await reload();
+    } catch (err) {
+      onError(errText(err, "Failed to delete the credential"));
+    } finally {
+      setShelfBusy(false);
+    }
+  };
+
   const rotate = async (e: FormEvent) => {
     e.preventDefault();
     onError("");
@@ -623,6 +811,19 @@ export function CodexCredentials({
         </p>
       </div>
 
+      {/* PRD #1732 D4: every Codex credential disabled leaves the shared slot with no
+          default. Said at the top of the card, whether or not the shelf is open. */}
+      {!loading && !first && !hasDefault && (
+        <NoDefaultNotice
+          slot="codex"
+          expanded={shelfOpen}
+          onShow={() => {
+            setShelfOpen(true);
+            if (disabled[0]) focusLater(enableButtonId(disabled[0].id));
+          }}
+        />
+      )}
+
       {loading ? (
         <Skeleton className="h-16 w-full" />
       ) : first ? (
@@ -631,18 +832,52 @@ export function CodexCredentials({
         </div>
       ) : (
         <div className="space-y-2">
-          {secrets.map((s) => (
+          {active.map((s) => (
             <CredentialRow
               key={s.id}
               secret={s}
-              busy={anyBusy}
-              soleCredential={secrets.length === 1}
+              busy={anyBusy || shelfBusy}
+              soleCredential={active.length === 1}
+              disabledLeft={disabled.length}
+              checkingUsage={checking.has(s.id)}
+              onDisable={() => setDisabling(s)}
               onChanged={reload}
               onError={onError}
               onNotice={onNotice}
             />
           ))}
+          <DisabledSection
+            count={disabled.length}
+            expanded={shelfOpen}
+            onToggle={setShelfOpen}
+            toggleId={shelfToggleId}
+          >
+            {disabled.map((s) => (
+              <DisabledCredentialRow
+                key={s.id}
+                testId={`codex-${s.id}`}
+                secret={s}
+                kindLabel={kindLabel(s.kind)}
+                note={siblingNotes[s.id] ?? disabledSince(s.disabled_at)}
+                enableLabel={hasDefault ? "Enable" : "Enable and make default"}
+                busy={anyBusy || shelfBusy}
+                onEnable={() => void enable(s)}
+                onDelete={() => void removeDisabled(s)}
+              />
+            ))}
+          </DisabledSection>
         </div>
+      )}
+
+      {disabling && (
+        <DisableCredentialDialog
+          secret={disabling}
+          slot="codex"
+          replacements={replacementOrder(active.filter((s) => s.id !== disabling.id))}
+          replacementBadges={replacementBadges}
+          onClose={() => setDisabling(null)}
+          onConfirm={confirmDisable}
+        />
       )}
 
       {/* An API key has no ChatGPT/Codex SUBSCRIPTION, so it has no per-account
@@ -727,6 +962,7 @@ export function CodexCredentials({
                 <option key={s.id} value={s.id}>
                   {s.label} — {kindLabel(s.kind)}
                   {s.is_default ? " (default)" : ""}
+                  {s.enabled === false ? " (disabled)" : ""}
                 </option>
               ))}
             </select>

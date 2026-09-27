@@ -63,7 +63,7 @@ func TestCommandTree(t *testing.T) {
 		// as a forge issue from the CLI, mirroring `findings file`.
 		"review": {"show", "backlog", "resolve", "dismiss", "undo", "stats", "file"},
 		// PRD #333 M6: the terminal form of the per-repo Findings backlog.
-		"findings": {"list", "file", "dismiss"},
+		"findings": {"list", "file", "dismiss", "resolve", "undo"},
 		"worker":   {"list", "rm", "set-token"},
 		"token":    {"list"},
 		"repo":     {"list", "remove"},

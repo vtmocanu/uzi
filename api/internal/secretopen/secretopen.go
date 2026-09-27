@@ -25,7 +25,8 @@ import (
 // unavailable" cases the caller may collapse; keeping them distinct lets
 // workersvc preserve its original two failure-reason messages.
 var (
-	// ErrNoSecret: the user has no secret of the requested kind.
+	// ErrNoSecret: the requested secret does not exist for this user (or is of
+	// another kind, for OpenByIDOfKind).
 	ErrNoSecret = errors.New("secretopen: secret not configured")
 	// ErrUndecryptable: the ciphertext exists but could not be decrypted.
 	ErrUndecryptable = errors.New("secretopen: secret could not be decrypted")
@@ -35,38 +36,16 @@ var (
 	ErrVaultLocked = errors.New("secretopen: vault locked")
 )
 
-// Store is the narrow query surface Open and OpenByID need. *store.Queries
-// satisfies it, as does workersvc's own Store interface.
+// Store is the narrow query surface OpenByID and OpenByIDOfKind need.
+// *store.Queries satisfies it, as does workersvc's own Store interface.
 type Store interface {
-	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error)
 	GetUserSecretCiphertextByID(ctx context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error)
-}
-
-// Open returns the decrypted plaintext of the user's DEFAULT secret of the given
-// kind (PRD #104 D14 — with several secrets of a kind possible, by-kind resolution
-// means the default; the partial unique index makes at most one row match).
-// vlt is the concrete *vault.Vault (nil in tests → open under box directly, the
-// pre-vault behavior); passing the concrete type keeps the nil check honest (a
-// typed-nil interface would not be nil). box opens legacy master-sealed rows and
-// the nil-vault path.
-func Open(ctx context.Context, q Store, vlt *vault.Vault, box *secretbox.Box, userID uuid.UUID, kind string) ([]byte, error) {
-	secret, err := q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
-		UserID: userID,
-		Kind:   kind,
-	})
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNoSecret
-		}
-		return nil, fmt.Errorf("secretopen: lookup: %w", err)
-	}
-	return OpenSealed(vlt, box, userID, kind, secret.SealedWith, secret.Ciphertext)
 }
 
 // OpenByID returns the decrypted plaintext of ONE specific secret of the user's,
 // named by identity rather than by kind — the primitive a bound worker (M3) or a
 // bound judge lane (M4) resolves through. Same sentinels and the same vault
-// dispatch as Open, so callers map one set of errors either way.
+// dispatch as OpenSealed, so callers map one set of errors either way.
 //
 // A secret id that does not belong to userID is ErrNoSecret, never that other
 // user's credential: the query is owner-scoped AND the returned owner is
@@ -134,7 +113,7 @@ func OpenByIDOfKind(ctx context.Context, q Store, vlt *vault.Vault, box *secretb
 
 // OpenSealed decrypts an already-fetched sealed row, without a DB lookup — the
 // path the rate-limit poller takes when it lists every token in one query (D1).
-// It is the crypto half of Open and shares the exact vault dispatch: a 'dek' row
+// It is the crypto half of OpenByID and shares the exact vault dispatch: a 'dek' row
 // needs the owner unlocked (ErrVaultLocked otherwise), a legacy 'master' row opens
 // under the master box regardless of lock state, and a nil vault opens under box
 // directly. There is no ErrNoSecret here — the caller already has the row. Open
@@ -156,28 +135,22 @@ func OpenSealed(vlt *vault.Vault, box *secretbox.Box, userID uuid.UUID, kind, se
 	return plain, nil
 }
 
-// Opener binds Open's collaborators so it satisfies a caller's one-method seam
-// (the usage poller's TokenOpener). One instance is shared across polls.
+// Opener binds OpenSealed's collaborators so it satisfies a caller's one-method
+// seam (the usage poller's TokenOpener). One instance is shared across polls.
 type Opener struct {
-	q   Store
 	vlt *vault.Vault
 	box *secretbox.Box
 }
 
-// NewOpener builds an Opener over the store, the per-user vault (may be nil), and
-// the master box.
-func NewOpener(q Store, vlt *vault.Vault, box *secretbox.Box) *Opener {
-	return &Opener{q: q, vlt: vlt, box: box}
+// NewOpener builds an Opener over the per-user vault (may be nil) and the
+// master box.
+func NewOpener(vlt *vault.Vault, box *secretbox.Box) *Opener {
+	return &Opener{vlt: vlt, box: box}
 }
 
-// Open opens the user's secret of the given kind with a DB lookup (the poke path:
-// one user, so N+1 is irrelevant), returning the same sentinels as package Open.
-func (o *Opener) Open(ctx context.Context, userID uuid.UUID, kind string) ([]byte, error) {
-	return Open(ctx, o.q, o.vlt, o.box, userID, kind)
-}
-
-// OpenSealed opens an already-fetched sealed row without a lookup (the tick path:
-// the ciphertext + sealed_with came from the bulk list query).
+// OpenSealed opens an already-fetched sealed row without a lookup. Both of the
+// usage poller's paths take it: the tick opens the rows of its bulk listing, and
+// the poke opens the one row it resolved.
 func (o *Opener) OpenSealed(userID uuid.UUID, kind, sealedWith string, ciphertext []byte) ([]byte, error) {
 	return OpenSealed(o.vlt, o.box, userID, kind, sealedWith, ciphertext)
 }

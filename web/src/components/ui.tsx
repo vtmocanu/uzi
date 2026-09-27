@@ -503,6 +503,11 @@ export const RUN_STATUS_TONES: Record<
   completion_checking: { tone: "info", pulse: true },
   completion_reworking: { tone: "info", pulse: true },
   completion_blocked: { tone: "warning" },
+  /** PRD #1732 D14: a run the server parked because a credential it needs is disabled
+   *  (raw status "paused", overlaid by effectiveRunStatus from hold_reason). Warn like the
+   *  other involuntary holds, NOT the owner-pause info tone, and not pulsing: it does no
+   *  work until the credential is enabled. Label below. */
+  credential_disabled: { tone: "warning" },
   completed: { tone: "ok" },
   /** issue #1418: a StatusPill-ONLY pseudo-status for a `failed` run whose committed work
    *  is human-landable (server-derived landing_state === "needs_landing"). RunsList/RunView
@@ -550,6 +555,8 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   completion_checking: "Checking completion",
   completion_reworking: "Reworking unmet milestones",
   completion_blocked: "Completion blocked",
+  // PRD #1732: kept in step with runBadge's matching label.
+  credential_disabled: "waiting: credential disabled",
 };
 
 export function StatusPill({ status }: { status: string }) {

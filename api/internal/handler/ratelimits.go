@@ -40,9 +40,9 @@ var _ = rateLimitStatusNoToken // retained for the wire contract; see the const 
 // Each element carries its credential's label + default flag (a name, never the
 // value) and the same status union as before: a token with a reading is `ok`, a
 // token with no reading yet (fresh save, probe disabled, refused credential) is
-// `unavailable`. A user with no tokens gets an empty array, which the client
-// renders as the old no_token state — there is no per-token status to report when
-// there is no token.
+// `unavailable`. A user with no enabled token (none at all, or every one disabled:
+// disabled tokens are omitted, PRD #1732) gets an empty array, which means "no enabled
+// token" — there is no per-token status to report when there is no enabled token.
 func (h *Handler) SelfRateLimits(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {

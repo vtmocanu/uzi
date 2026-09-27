@@ -9,13 +9,14 @@ import (
 // EXACTLY the union of the tokens the landed PRDs ship — #1392 M1's recovery pair, #1391 Run
 // A's heartbeat_outbox, #1247's claim_generation_fence (this api implements the fence, so it
 // advertises server support), #1391 Run B M3c's terminal_fence (the api now fences a terminal
-// transition on messages_through_seq contiguity), and #1390 M2a's active_run_snapshot when the
-// feature is enabled — in slice order (append order = declaration order). terminal_fence sits
-// AFTER claim_generation_fence and BEFORE active_run_snapshot. A drift here is a wire-contract
+// transition on messages_through_seq contiguity), issue #1766 M2's recovery_cause_vault_locked
+// (unconditional), and #1390 M2a's active_run_snapshot when the feature is enabled — in slice
+// order (append order = declaration order). terminal_fence sits AFTER claim_generation_fence,
+// then recovery_cause_vault_locked, and active_run_snapshot is last. A drift here is a wire-contract
 // change a worker negotiates on.
 func TestRegisterAdvertisesProtocolFeatures(t *testing.T) {
 	got := protocolFeatures(true)
-	want := []string{"recovery_park_cause", "recovery_release_exact_echo", "heartbeat_outbox", "claim_generation_fence", "terminal_fence", "active_run_snapshot"}
+	want := []string{"recovery_park_cause", "recovery_release_exact_echo", "heartbeat_outbox", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "active_run_snapshot"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("protocolFeatures(true) = %v, want exactly %v", got, want)
 	}
@@ -31,7 +32,7 @@ func TestRegisterAdvertisesProtocolFeatures(t *testing.T) {
 // worker never sends the snapshot) while every other landed token stays exactly as it was.
 func TestProtocolFeaturesOmitsSnapshotWhenDisabled(t *testing.T) {
 	got := protocolFeatures(false)
-	want := []string{"recovery_park_cause", "recovery_release_exact_echo", "heartbeat_outbox", "claim_generation_fence", "terminal_fence"}
+	want := []string{"recovery_park_cause", "recovery_release_exact_echo", "heartbeat_outbox", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("protocolFeatures(false) = %v, want exactly %v", got, want)
 	}

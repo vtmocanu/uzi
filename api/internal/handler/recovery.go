@@ -210,6 +210,47 @@ func (h *Handler) WorkerSettleRecoveryHold(w http.ResponseWriter, r *http.Reques
 	httpx.JSON(w, http.StatusOK, res)
 }
 
+// WorkerSettleRecoveryHoldLive asks the api to release ONE older-generation custody hold while
+// the same-worker SUCCESSOR generation of the run is still LIVE (issue #1751 M2), on the api's
+// OWN forge proof against the target the successor published (its checkpoint ref or its run
+// branch). The body is decoded STRICTLY exactly like WorkerSettleRecoveryHold, with the same
+// error mapping: a malformed SHA, generation or target is a 400; a run of another owner is a
+// 404; every eligibility or proof outcome is a 200 with Outcome released|retained.
+func (h *Handler) WorkerSettleRecoveryHoldLive(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	holdID, ok := httpx.PathUUID(w, r, "holdID", "hold")
+	if !ok {
+		return
+	}
+	var req apitypes.RecoveryLiveSettleRequest
+	if err := httpx.DecodeJSONStrict(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid settle request")
+		return
+	}
+	res, err := h.wsvc.SettlePredecessorHoldLive(r.Context(), wkr, runID, holdID, req)
+	if err != nil {
+		switch {
+		case errors.Is(err, workersvc.ErrInvalidSettleRequest):
+			httpx.Error(w, http.StatusBadRequest, "invalid settle request")
+		case errors.Is(err, workersvc.ErrRunNotOwned):
+			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+		default:
+			slog.Error("recovery live settle", "run", runID.String(), "hold", holdID.String(), "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+	httpx.JSON(w, http.StatusOK, res)
+}
+
 // WorkerRecoveryRelease releases the caller worker's open custody holds on the run.
 func (h *Handler) WorkerRecoveryRelease(w http.ResponseWriter, r *http.Request) {
 	wkr, ok := mw.WorkerFromContext(r.Context())

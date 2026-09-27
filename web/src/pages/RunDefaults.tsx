@@ -292,7 +292,8 @@ export function RunDefaults() {
   // lane in "auto" with ZERO pooled tokens spends the DEFAULT token (D4), unlike a
   // worker which holds — so the empty-pool warning below is worded for that fallback.
   // Derived rather than fetched: auto_eligible already rides SecretMeta.
-  const pooledCount = secrets.filter((s) => s.auto_eligible).length;
+  // PRD #1732 D8: effective pool membership requires enabled.
+  const pooledCount = secrets.filter((s) => s.auto_eligible && s.enabled !== false).length;
 
 
   // Same validation path as the worker model (PRD #69 M2): the shared modelFieldWarning
@@ -643,12 +644,18 @@ export function RunDefaults() {
               <option value="">Use my default token</option>
               <option value={AUTO_OPTION}>Auto-select from the pool</option>
               <optgroup label="Pin to a token">
-                {secrets.map((s) => (
-                  <option key={s.id} value={s.label}>
-                    {s.label}
-                    {s.is_default ? " (your default)" : ""}
-                  </option>
-                ))}
+                {/* PRD #1732 D5: a disabled token cannot be newly bound, so it is not
+                    offered; the one the judge is ALREADY pinned to stays visible and
+                    marked (D2 keeps the binding; retrospectives wait on it). */}
+                {secrets
+                  .filter((s) => s.enabled !== false || s.id === user?.judge_anthropic_secret_id)
+                  .map((s) => (
+                    <option key={s.id} value={s.label} disabled={s.enabled === false}>
+                      {s.label}
+                      {s.is_default ? " (your default)" : ""}
+                      {s.enabled === false ? " (disabled)" : ""}
+                    </option>
+                  ))}
               </optgroup>
             </Select>
             <p className="mt-1.5 text-xs text-faint">

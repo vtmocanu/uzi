@@ -152,6 +152,7 @@ export function effectiveRunStatus(
     is_planning?: boolean;
     is_revising?: boolean;
     completion_phase?: "checking" | "reworking" | "blocked" | "";
+    hold_reason?: string | null;
   },
 ): string {
   if (isPlanningRun(run)) return "planning";
@@ -172,6 +173,13 @@ export function effectiveRunStatus(
     case "blocked":
       return "completion_blocked";
   }
+  // PRD #1732 D14: a run the server parked because a credential it needs is disabled. Its
+  // raw status is "paused" (shared with the owner pause), so it is overlaid here, like a
+  // completion hold, to read "waiting: credential disabled" instead of "‖ paused". Only a
+  // surface whose projection carries hold_reason can tell: the full Run (RunView/RunsList)
+  // and the board card's LatestRun (the server's board projection sends hold_reason on every
+  // card, so runBadge meets this key too).
+  if (run.status === "paused" && run.hold_reason === "credential_disabled") return "credential_disabled";
   return run.status;
 }
 
@@ -285,6 +293,8 @@ export function runStatusTone(
   // print one colour per status.
   if (status === "completion_checking" || status === "completion_reworking") return "info";
   if (status === "completion_blocked") return "warning";
+  // PRD #1732: held on a disabled credential. Warn like the other involuntary holds.
+  if (status === "credential_disabled") return "warning";
   if (status === "awaiting_approval" || status === "awaiting_input")
     return "warning";
   // PRD #517: an interactive run parked awaiting the owner's next follow-up.
@@ -534,6 +544,17 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         label: "Completion blocked",
         tone: "warning",
         pulse: false,
+      };
+    // PRD #1732 D14: held because a credential it needs is disabled. Static warn, like the
+    // other holds; the label is StatusPill's RUN_STATUS_LABELS word, so the pill and the
+    // board badge agree (asserted by the ui.test.tsx label-agreement loop).
+    case "credential_disabled":
+      return {
+        kind: "badge",
+        label: "waiting: credential disabled",
+        tone: "warning",
+        pulse: false,
+        title: "A credential this run needs is disabled. It resumes by itself when you enable it.",
       };
     case "running":
       // The running elapsed moved OUT of the badge to the uniform per-card duration

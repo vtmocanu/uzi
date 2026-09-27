@@ -56,6 +56,7 @@ import {
   type RecoveryReleaseResponse,
   type RecoveryReleaseRequest,
   type RecoveryHoldsResponse,
+  type RecoveryLiveSettleRequest,
   type RecoverySettleRequest,
   type RecoverySettleResponse,
 } from "./protocol.js";
@@ -79,6 +80,24 @@ export class RequestError extends Error {
     super(`${method} ${path} returned ${status}: ${body}`);
     this.name = "RequestError";
   }
+}
+
+/** Issue #1766: the typed Codex credential deferral a locked owner vault produces. A Codex
+ *  refresh/release that passed authorization but hit a locked vault answers HTTP 409 with
+ *  `{"reason":"vault_locked"}` in the body. Returns "vault_locked" ONLY for that exact shape
+ *  (a {@link RequestError}, status 409, a JSON body whose `reason` is "vault_locked"), and
+ *  undefined for anything else: another 409 reason, another status, a non-JSON body or a
+ *  non-RequestError. It never reads the error's message text. */
+export function codexDeferralReason(err: unknown): "vault_locked" | undefined {
+  if (!(err instanceof RequestError) || err.status !== 409) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(err.body);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  return (parsed as { reason?: unknown }).reason === "vault_locked" ? "vault_locked" : undefined;
 }
 
 const sleepReal = (ms: number): Promise<void> =>
@@ -437,7 +456,7 @@ export class WorkerClient {
     stats?: WorkerStats,
     outbox?: OutboxHeartbeatEntry[],
     activeSnapshot?: ActiveSnapshot,
-  ): Promise<void> {
+  ): Promise<boolean | undefined> {
     const body: HeartbeatRequest = { version: this.version };
     // Only attach stats when the collector produced a sample (PRD #49): an absent
     // field is the same wire shape as today, so a pre-#49 server ignores the extra
@@ -456,7 +475,7 @@ export class WorkerClient {
     if (includeSnapshot) body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
     const includeExtension = includeOutbox || includeSnapshot;
     try {
-      await this.postJSON(`${WORKER_API_PREFIX}/heartbeat`, body);
+      return await this.postHeartbeat(body);
     } catch (err) {
       // Rollback fallback (PRD #1391 M5, extended by #1390 M2a): a rolled-back api that no
       // longer knows a negotiated heartbeat extension strict-decodes it as an unknown field
@@ -471,13 +490,40 @@ export class WorkerClient {
       if (!includeExtension || !isStrictDecodeError(err)) throw err;
       const stripped: HeartbeatRequest = { version: this.version };
       if (stats) stripped.stats = stats;
-      await this.postJSON(`${WORKER_API_PREFIX}/heartbeat`, stripped);
+      const retaining = await this.postHeartbeat(stripped);
       this.clearFeatures();
       this.log.warn(
         "heartbeat extension rejected by a rolled-back api; retried stripped and cleared the negotiated feature set",
         {},
       );
+      return retaining;
     }
+  }
+
+  /**
+   * POST one heartbeat and decode the custody flag from its response (issue #1759):
+   * `{"worker": {"retaining_unpublished_work": bool, ...}}`. Returns the flag only when
+   * the body decodes and the field is a boolean, else undefined, which the DinD prune
+   * treats as "may be retaining" (fail-closed). A non-2xx still throws exactly like
+   * postJSON, so the strict-decode fallback above is unchanged; an accepted heartbeat
+   * whose body does not parse is still a successful heartbeat.
+   */
+  private async postHeartbeat(body: HeartbeatRequest): Promise<boolean | undefined> {
+    const path = `${WORKER_API_PREFIX}/heartbeat`;
+    const res = await this.fetchRaw("POST", path, body);
+    if (res.status >= 400) throw await this.toError("POST", path, res);
+    if (res.status === 204) return undefined;
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(await res.text());
+    } catch {
+      return undefined;
+    }
+    if (typeof decoded !== "object" || decoded === null) return undefined;
+    const worker = (decoded as { worker?: unknown }).worker;
+    if (typeof worker !== "object" || worker === null) return undefined;
+    const retaining = (worker as { retaining_unpublished_work?: unknown }).retaining_unpublished_work;
+    return typeof retaining === "boolean" ? retaining : undefined;
   }
 
   /** Claim the oldest queued run for this worker's user (the RUN lane — no lane
@@ -899,6 +945,34 @@ export class WorkerClient {
     )) as RecoverySettleResponse;
   }
 
+  /** settleRecoveryHoldLive asks the api to settle ONE older-generation custody hold while the
+   *  resumed run is still live (issue #1751 M2): POST /runs/{id}/recovery-holds/{holdID}/settle-live
+   *  with the strict six-field body. Same answer shape and error contract as
+   *  {@link settleRecoveryHold}: throws RequestError on 4xx/5xx (a 404 is also an older api without
+   *  the route), bounded by the client's request timeout, and `signal` aborts an in-flight call. */
+  async settleRecoveryHoldLive(
+    runId: string,
+    holdId: string,
+    req: RecoveryLiveSettleRequest,
+    signal?: AbortSignal,
+  ): Promise<RecoverySettleResponse> {
+    // Build the body field-by-field so nothing beyond the six strict fields can ride along.
+    const body: RecoveryLiveSettleRequest = {
+      predecessor_generation: req.predecessor_generation,
+      successor_generation: req.successor_generation,
+      published_sha: req.published_sha,
+      source_sha: req.source_sha,
+      adopted_sha: req.adopted_sha,
+      target: req.target,
+    };
+    return (await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds/${encodeURIComponent(holdId)}/settle-live`,
+      body,
+      undefined,
+      signal,
+    )) as RecoverySettleResponse;
+  }
+
   async getInputs(runId: string): Promise<{ inputs: UserInput[]; credentialSwitch?: { generation: number }; receipts?: boolean }> {
     const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/inputs`)) as InputsResponse;
     // PRD #1247 M5b: the held-state credential-switch signal rides EVERY inputs response (including
@@ -915,6 +989,16 @@ export class WorkerClient {
 
   async applyInputs(runId: string, ids: number[], claimGeneration: number): Promise<InputReceipt> {
     return (await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs/applied`,
+      { ids, claim_generation: claimGeneration })) as InputReceipt;
+  }
+
+  /** Issue #1604: settle this claim's own approve_plan rows that were disposed of without a gate
+   *  taking them (stale, superseded, or after the gate closed) as applied with disposition
+   *  'superseded' (POST /worker/runs/{id}/inputs/discarded). The server does not count such a row as
+   *  the human approval and leaves it out of the replay list. Same reply and status mapping as
+   *  applyInputs; an older api answers 404 for the route. */
+  async discardInputs(runId: string, ids: number[], claimGeneration: number): Promise<InputReceipt> {
+    return (await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs/discarded`,
       { ids, claim_generation: claimGeneration })) as InputReceipt;
   }
 
@@ -1747,10 +1831,16 @@ export function isStrictDecodeError(err: unknown): boolean {
   return err instanceof RequestError && err.status === 400 && /invalid request body/i.test(err.body);
 }
 
+/** Retryable HTTP status: any 5xx (incl. 529 overloaded), 408 or 429; permanent otherwise.
+ * Shared by `isTransient` and the executor's provider-transient classifier (issue #1401). */
+export function isTransientStatus(status: number): boolean {
+  return status >= 500 || status === 408 || status === 429;
+}
+
 /** Retryable: transport failures, 5xx, and 408/429; permanent otherwise. */
 export function isTransient(err: unknown): boolean {
   if (err instanceof RequestError) {
-    return err.status >= 500 || err.status === 408 || err.status === 429;
+    return isTransientStatus(err.status);
   }
   // Network error / timeout (AbortError) / non-HTTP failure.
   return true;
