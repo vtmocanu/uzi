@@ -34,7 +34,7 @@
 //
 // closingDirectiveFor is the whole-body scan behind the interlock (D10 rule 1; the interlock runs it
 // through closingDirectiveOutsideCompletion, which leaves out uzi's own completion block only when it
-// is byte-identical to the block uzi rendered): the api
+// is identical to the block uzi rendered, line endings aside): the api
 // sanitizer's prDescClosing pattern (with Forgejo's `!N` references) over the raw text and over a
 // RENDERED view that mirrors the api's prDescNormalize (entities decoded to a fixed point everywhere,
 // code spans and autolinks included, format characters but U+200B dropped, HTML comments, tags, images and link targets
@@ -228,9 +228,51 @@ function nextIndex(s: string, ch: string): Int32Array {
   return out;
 }
 
+// A line that ends a paragraph for link purposes (a forge forms no link or image across it): a
+// blank line (inside block quotes too), or a line that starts an HTML block which can interrupt a
+// paragraph (CommonMark types 1 to 6: `<!--`, `<?`, `<!X`, `<![CDATA[`, and the block tags). Type 7
+// (any other complete tag) cannot interrupt a paragraph, so it is not a break.
+const HTML_BLOCK_NAMES =
+  String.raw`address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|` +
+  String.raw`dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|` +
+  String.raw`iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|` +
+  String.raw`summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul`;
+const HTML_BLOCK_START_SRC =
+  String.raw`<(?:!--|\?|!\[CDATA\[|![A-Za-z]|\/?(?:${HTML_BLOCK_NAMES})(?=[\s/>]|$)|(?:pre|script|style|textarea)(?=[\s>]|$))`;
+const LINK_BREAK_LINE_RE = new RegExp(String.raw`^(?: {0,3}>)*(?:[ \t]*$| {0,3}${HTML_BLOCK_START_SRC})`, "iu");
+/** A removed tag or comment that opened an HTML block (checked on the removed text alone). */
+const HTML_BLOCK_OPEN_RE = new RegExp(`^${HTML_BLOCK_START_SRC}`, "iu");
+
+/** For each index i, the start of the first link-breaking line (LINK_BREAK_LINE_RE) that starts
+ *  after i, or `n` when there is none (length n + 1). One pass over the lines. */
+function nextLinkBreak(s: string): Int32Array {
+  const n = s.length;
+  const out = new Int32Array(n + 1).fill(n);
+  const breaks = linesOf(s)
+    .filter((l) => LINK_BREAK_LINE_RE.test(l.text))
+    .map((l) => l.start);
+  let next = n;
+  let b = breaks.length - 1;
+  for (let i = n; i >= 0; i--) {
+    out[i] = next;
+    while (b >= 0 && breaks[b]! >= i) next = Math.min(next, breaks[b--]!);
+  }
+  return out;
+}
+
+/** Whether `at` is a line start, after at most three spaces of indentation (where an HTML block
+ *  can open). */
+function blockLineStart(s: string, at: number): boolean {
+  let i = at;
+  while (i > 0 && at - i < 3 && s[i - 1] === " ") i--;
+  return i === 0 || s[i - 1] === "\n" || s[i - 1] === "\r";
+}
+
 /** HTML comments, terminated or not, left to right in one linear pass: a terminated comment goes;
  *  an unterminated opener goes with everything after it (prDescHTMLComment, then
- *  prDescUnterminatedCmnt; the caller's loop removes a comment one removal exposes). */
+ *  prDescUnterminatedCmnt; the caller's loop removes a comment one removal exposes). A comment that
+ *  opens its line opened an HTML block, which ends a paragraph: it leaves a line break behind, so
+ *  stripLinks / stripImages still stop there once it is gone. */
 function stripComments(s: string): string {
   let out = "";
   let i = 0;
@@ -240,40 +282,53 @@ function stripComments(s: string): string {
     out += s.slice(i, open);
     const close = s.indexOf("-->", open + 4);
     if (close < 0) return out;
+    if (blockLineStart(s, open)) out += "\n";
     i = close + 3;
   }
 }
 
-/** prDescImage (`![alt](t)`, `![alt][r]`, `![alt][]`, `![alt]`), removed whole, in one linear pass. */
+/** prDescImage (`![alt](t)`, `![alt][r]`, `![alt][]`, `![alt]`), removed whole, in one linear pass.
+ *  An image never spans a blank line or a line that opens an HTML block (nextLinkBreak): a forge
+ *  ends the paragraph there, so no image forms and the text after it stays. */
 function stripImages(s: string): string {
   if (!s.includes("![")) return s;
   const n = s.length;
   const rb = nextIndex(s, "]");
   const rp = nextIndex(s, ")");
+  const brk = nextLinkBreak(s);
   let out = "";
   let i = 0;
+  let from = 0;
   for (;;) {
-    const at = s.indexOf("![", i);
+    const at = s.indexOf("![", from);
     if (at < 0) break;
     const j = rb[at + 2]!;
     if (j >= n) break; // no `]` after it, so none after any later `![` either
+    const lim = brk[at]!;
+    if (j >= lim) {
+      from = at + 2;
+      continue;
+    }
     let end = j + 1;
-    if (s[end] === "(" && rp[end + 1]! < n) end = rp[end + 1]! + 1;
-    else if (s[end] === "[" && rb[end + 1]! < n) end = rb[end + 1]! + 1;
+    if (s[end] === "(" && rp[end + 1]! < lim) end = rp[end + 1]! + 1;
+    else if (s[end] === "[" && rb[end + 1]! < lim) end = rb[end + 1]! + 1;
     out += s.slice(i, at);
-    i = end;
+    i = from = end;
   }
   return out + s.slice(i);
 }
 
 /** prDescLinkInline (`[text](target)`) and prDescLinkRef (`[text][ref]`): the text is kept, the
- *  target dropped; a label holding a backslash is not a link here (as in the api). Linear. */
+ *  target dropped; a label holding a backslash is not a link here (as in the api), nor is one that
+ *  spans a blank line or a line that opens an HTML block (nextLinkBreak: a forge ends the paragraph
+ *  there, so `[x](` then a blank line then `Fixes #7)` is no link and the directive stays). Linear. */
 function stripLinks(s: string, kind: "inline" | "ref"): string {
   if (!s.includes("[")) return s;
   const n = s.length;
   const rb = nextIndex(s, "]");
   const bs = nextIndex(s, "\\");
   const rp = nextIndex(s, ")");
+  const brk = nextLinkBreak(s);
   let out = "";
   let i = 0;
   let from = 0;
@@ -283,7 +338,7 @@ function stripLinks(s: string, kind: "inline" | "ref"): string {
     const j = rb[at + 1]!;
     if (j >= n) break;
     const closeAt = kind === "inline" ? (s[j + 1] === "(" ? rp[j + 2]! : n) : s[j + 1] === "[" ? rb[j + 2]! : n;
-    if (bs[at + 1]! < j || closeAt >= n) {
+    if (bs[at + 1]! < j || closeAt >= brk[at]!) {
       from = at + 1;
       continue;
     }
@@ -311,11 +366,18 @@ const COMMENT_OPEN_RE = /<!-{2,}/gu;
 // matches (a leftmost match always starts a run), without V8 re-scanning a long run at every dash.
 const COMMENT_CLOSE_RE = /(?<!-)-{2,}!?>/gu;
 
+/** HTML_TAG_RE's replacement: a tag goes, but one that opens an HTML block at the start of its line
+ *  leaves a line break behind (as stripComments does), so the next pass's link and image stripping
+ *  still stops at the paragraph end it made. */
+function dropTag(tag: string, at: number, s: string): string {
+  return blockLineStart(s, at) && HTML_BLOCK_OPEN_RE.test(tag) ? "\n" : "";
+}
+
 /** stripPrDescMarkup: one pass of each rule, in the api's order. */
 function stripMarkup(s: string): string {
   if (s.includes("<!--")) s = stripComments(s);
   if (s.includes("[")) s = stripLinks(stripLinks(stripImages(s), "inline"), "ref");
-  if (s.includes("<")) s = s.replace(AUTOLINK_RE, "$1").replace(HTML_TAG_RE, "").replace(COMMENT_OPEN_RE, "");
+  if (s.includes("<")) s = s.replace(AUTOLINK_RE, "$1").replace(HTML_TAG_RE, dropTag).replace(COMMENT_OPEN_RE, "");
   if (s.includes("--")) s = s.replace(COMMENT_CLOSE_RE, "->");
   return s;
 }
@@ -586,28 +648,43 @@ export function closingDirectiveFor(body: string, issueIid: number, repoPath?: s
  * closingDirectiveFor over `body` with uzi's own completion block removed: the interlock's scan.
  *
  * Precondition: `expectedCompletion` is the exact completion block uzi rendered for this run
- * (renderCompletionBlock's output, both markers included), not text read back from the forge. The
- * block is removed only when parseOwnedBlocks(body) is `ok` AND its completion block equals
- * `expectedCompletion` byte for byte; a body read from the forge is attacker-editable, so a forged
- * block, or uzi's block with a directive inserted into it, is never trusted and the whole body is
- * scanned instead (fail closed). Otherwise every parse outcome (`none`, `malformed`, no completion
- * block, a completion block that differs) scans the whole body too.
+ * (renderCompletionBlock's output, both markers included), never text read back from the forge
+ * (not parseOwnedBlocks(body).completion: a block compared with itself always matches, so a
+ * directive inserted into it would be removed unscanned). The block is removed only when
+ * parseOwnedBlocks(body) is `ok` AND its completion block equals `expectedCompletion` once line
+ * endings (`\r\n`, a lone `\r`) are normalised to `\n` on both sides (a body edited in a forge's
+ * web UI may come back with CRLF), and otherwise byte for byte. A body read from the forge is
+ * attacker-editable, so a forged block, or uzi's block with a directive inserted into it, is never
+ * trusted and the whole body is scanned instead (fail closed). Every other parse outcome (`none`,
+ * `malformed`, no completion block, a completion block that differs) scans the whole body too.
  *
  * Why removal is needed at all: uzi's block is non-closing by construction (its tests prove it), but
  * the scan decodes entities inside code spans too, so a branch like `Fix&#101;s&#32;&#35;7` shown in
- * the block's code span would otherwise read as closing. When the block is removed, the text before
- * it and the text after it are scanned once, joined around the bare marker pair, so a construct that
- * spans the removal is still read. Removing the block cannot join a keyword before it to a reference
- * after it: the renderer never ends the block's last content line with a closing keyword nor starts
- * its first content line with a reference (asserted over every kind in the tests).
+ * the block's code span would otherwise read as closing.
+ *
+ * When the block is removed, three texts are scanned and any closing one is closing: the text before
+ * it (the region and everything around it) and the text after it, each alone, and the two joined
+ * around the bare marker pair. The split scans read each side as the forge does, where uzi's block
+ * (an HTML block) ends the paragraph; the joined scan reads a construct that spans the removal. The
+ * joined scan may join a keyword before the block to a reference after it, which the forge would not
+ * read as one directive: a conservative false positive, and acceptable.
  */
 export function closingDirectiveOutsideCompletion(body: string, issueIid: number, expectedCompletion: string, repoPath?: string): boolean {
   const parsed = parseOwnedBlocks(body);
-  if (parsed.kind !== "ok" || parsed.completion === undefined || parsed.completion !== expectedCompletion) {
+  if (parsed.kind !== "ok" || parsed.completion === undefined || toLf(parsed.completion) !== toLf(expectedCompletion)) {
     return closingDirectiveFor(body, issueIid, repoPath);
   }
   const head = parsed.before + (parsed.region ?? "") + parsed.between;
-  return closingDirectiveFor(`${head}${COMPLETION_START}\n${COMPLETION_END}${parsed.after}`, issueIid, repoPath);
+  return (
+    closingDirectiveFor(`${head}${COMPLETION_START}\n${COMPLETION_END}${parsed.after}`, issueIid, repoPath) ||
+    closingDirectiveFor(head, issueIid, repoPath) ||
+    closingDirectiveFor(parsed.after, issueIid, repoPath)
+  );
+}
+
+/** CommonMark's three line endings (`\r\n`, `\n`, a lone `\r`) as `\n`; nothing else changes. */
+function toLf(s: string): string {
+  return s.replace(/\r\n?/gu, "\n");
 }
 
 /**
@@ -1190,8 +1267,8 @@ function quoteDepth(text: string): number {
  * Known, accepted limitation: fences inside list items (`* ~~~`, an indented `   ```` or a longer
  * ````` fence opened in a list item) are not modelled, so a marker pair the forge shows as code can
  * still be adopted as uzi's blocks. This never yields a closing false negative: the interlock
- * (closingDirectiveOutsideCompletion) removes a completion block only when it is byte-identical to
- * the block uzi rendered, and scans the whole body otherwise.
+ * (closingDirectiveOutsideCompletion) removes a completion block only when it is identical to the
+ * block uzi rendered (line endings aside), and scans the whole body otherwise.
  */
 function codeRanges(body: string, closers: "depth" | "any"): Array<[number, number]> {
   const lines = linesOf(body);

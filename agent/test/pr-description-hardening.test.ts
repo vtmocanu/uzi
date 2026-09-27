@@ -19,6 +19,7 @@ import {
   type OwnedBlocks,
 } from "../src/pr-description.js";
 import { RUN_KINDS, type ClaimConfig, type ClaimResponse, type RawPrDescriptionFields, type RunKind } from "../src/protocol.js";
+import { RUN_KIND_PROFILES, resolveRunKind } from "../src/run-kind.js";
 import { mrDescription } from "../src/runner.js";
 import { guardCriticalMrSection, selfImproveMrSection } from "../src/self-improve.js";
 import { makeClaim, nullLogger } from "./helpers.js";
@@ -50,6 +51,23 @@ function rawHtml(body: string): RegExpMatchArray | null {
   let t = outsideCode(body);
   for (const m of [REGION_START, REGION_END, COMPLETION_START, COMPLETION_END]) t = t.split(m).join("");
   return t.match(/(?<!\\)<[A-Za-z!/?]/u);
+}
+
+/**
+ * The completion block mrDescription writes for `claim` on `branch`, built from the render path
+ * (renderCompletionBlock with mrDescription's own inputs and defaults), never parsed out of a body.
+ *
+ * WARNING: closingDirectiveOutsideCompletion's `expectedCompletion` must always come from a render
+ * like this one. Never pass parseOwnedBlocks(body).completion (text read back from the body under
+ * test): it matches itself whatever was inserted into it, so a directive planted inside uzi's
+ * block would be removed unscanned.
+ */
+function renderedCompletion(claim: ClaimResponse, branch: string): string {
+  const kindLine = RUN_KIND_PROFILES[resolveRunKind(claim.kind)].completionLine?.(claim, {
+    branch,
+    baseBranch: claim.base_branch?.trim() || undefined,
+  });
+  return renderCompletionBlock({ issueIid: claim.issue_iid, branch, kindLine, kindSections: [], closes: true });
 }
 
 // ── H1: agent-chosen paths reach the completion block only through the renderer's escaping ──
@@ -210,8 +228,10 @@ describe("closingDirectiveFor decodes entities in code spans too; the interlock 
     assert.equal(closingDirectiveOutsideCompletion(block, 7, block, "o/r"), false, block);
     const human = `Some notes.\n\n${block}\n\nMore notes.`;
     assert.equal(closingDirectiveOutsideCompletion(human, 7, block, "o/r"), false, human);
-    const task = mrDescription(makeClaim({ kind: "task", issue_iid: null, branch: "uzi/task/x", base_branch: HIDDEN_BRANCH } as Partial<ClaimResponse>), HIDDEN_BRANCH);
-    const taskBlock = (parseOwnedBlocks(task) as OwnedBlocks).completion!;
+    const taskClaim = makeClaim({ kind: "task", issue_iid: null, branch: "uzi/task/x", base_branch: HIDDEN_BRANCH } as Partial<ClaimResponse>);
+    const task = mrDescription(taskClaim, HIDDEN_BRANCH);
+    const taskBlock = renderedCompletion(taskClaim, HIDDEN_BRANCH);
+    assert.equal((parseOwnedBlocks(task) as OwnedBlocks).completion, taskBlock, task);
     assert.equal(closingDirectiveOutsideCompletion(task, 7, taskBlock, "o/r"), false, task);
     // The same bodies checked against a different expected render are scanned whole: true.
     assert.equal(closingDirectiveOutsideCompletion(human, 7, taskBlock, "o/r"), true, human);
@@ -271,16 +291,16 @@ describe("closingDirectiveFor decodes entities in code spans too; the interlock 
   });
 
   it("a pipeline URL holding an entity renders as a code span inside uzi's block", () => {
-    const body = mrDescription(
-      makeClaim({
-        kind: "ci_fix",
-        issue_title: "T",
-        pipeline: { id: 5, ref: "main", sha: "a".repeat(40), web_url: HIDDEN_URL, failed_jobs: [] },
-      } as Partial<ClaimResponse>),
-      "ci-fix/pipeline-5",
-    );
+    const ciClaim = makeClaim({
+      kind: "ci_fix",
+      issue_title: "T",
+      pipeline: { id: 5, ref: "main", sha: "a".repeat(40), web_url: HIDDEN_URL, failed_jobs: [] },
+    } as Partial<ClaimResponse>);
+    const body = mrDescription(ciClaim, "ci-fix/pipeline-5");
     assert.ok(body.includes(`: \`${HIDDEN_URL}\`\n`), body);
-    assert.equal(closingDirectiveOutsideCompletion(body, 7, (parseOwnedBlocks(body) as OwnedBlocks).completion!, "o/r"), false, body);
+    const ciBlock = renderedCompletion(ciClaim, "ci-fix/pipeline-5");
+    assert.equal((parseOwnedBlocks(body) as OwnedBlocks).completion, ciBlock, body);
+    assert.equal(closingDirectiveOutsideCompletion(body, 7, ciBlock, "o/r"), false, body);
     const line = (url: string) =>
       mrDescription(makeClaim({ kind: "ci_fix", pipeline: { id: 5, ref: "main", sha: "a".repeat(40), web_url: url, failed_jobs: [] } } as Partial<ClaimResponse>), "b");
     for (const url of ["https://x/a?b=1&amp;c=2", "https://x/&lt;", "https://x/a&num;7", "https://x/a&ampx"]) {
@@ -315,6 +335,101 @@ describe("closingDirectiveFor decodes entities in code spans too; the interlock 
       "<https://x/`a> Fi&#120;es #7`",
     ]) {
       assert.equal(closingDirectiveFor(text, 7, "o/r"), true, text);
+    }
+  });
+});
+
+// ── The interlock's split scans, links that stop at a paragraph end, and CRLF bodies ──
+
+describe("the interlock scans each side of uzi's block alone as well as joined", () => {
+  const blk = renderCompletionBlock({ issueIid: 7, branch: "Fix&#101;s&#32;&#35;7", closes: false });
+
+  it("uzi's render used here is non-closing on its own", () => {
+    assert.equal(closingDirectiveOutsideCompletion(blk, 7, blk, "o/r"), false, blk);
+  });
+
+  it("a link or image opened before the block and closed after it hides no directive", () => {
+    for (const body of [
+      `Intro [x](\n${blk}\nFix&#101;s #7)\n`,
+      `Intro ![x](\n${blk}\nFix&#101;s #7)\n`,
+      `Intro [x][\n${blk}\nFix&#101;s #7]\n`,
+      `Intro [x](\n\n${blk}\n\nFix&#101;s #7)\n`,
+      `Intro ![x](\n\n${blk}\n\nFix&#101;s #7)\n`,
+      `Intro [x][\n\n${blk}\n\nFix&#101;s #7]\n`,
+    ]) {
+      assert.equal(parseOwnedBlocks(body).kind, "ok", body);
+      assert.equal(closingDirectiveOutsideCompletion(body, 7, blk, "o/r"), true, body);
+    }
+  });
+
+  it("each side alone is scanned: a directive wholly before or wholly after the block", () => {
+    for (const body of [`Fix&#101;s #7\n\n${blk}`, `${blk}\n\nFix&#101;s #7`, `Intro [x](y)\n${blk}\nFix&#101;s #7\n`]) {
+      assert.equal(closingDirectiveOutsideCompletion(body, 7, blk, "o/r"), true, body);
+    }
+    // A tag's quoted attribute opened on one side and closed on the other swallows the directive in
+    // the joined view (the tag pattern crosses lines), but uzi's block ends the paragraph, so the
+    // forge forms no tag and reads the directive: only the split scans catch these.
+    for (const body of [`Intro <b title="\n${blk}\nFix&#101;s #7 ">\n`, `<b title="\nFix&#101;s #7\n${blk}\n">\n`]) {
+      assert.equal(parseOwnedBlocks(body).kind, "ok", body);
+      assert.equal(closingDirectiveOutsideCompletion(body, 7, blk, "o/r"), true, body);
+    }
+    // Text on both sides that closes nothing stays non-closing.
+    assert.equal(closingDirectiveOutsideCompletion(`Intro [x](y)\n\n${blk}\n\nMore [a](b).\n`, 7, blk, "o/r"), false);
+  });
+
+  it("a body whose line endings became CRLF still matches uzi's LF render", () => {
+    const real = renderCompletionBlock({ issueIid: 7, branch: "Fix&#101;s&#32;&#35;7", closes: false });
+    for (const eol of ["\r\n", "\r"]) {
+      const body = `Notes.${eol}${eol}${real.replace(/\n/gu, eol)}${eol}${eol}More.${eol}`;
+      assert.equal(parseOwnedBlocks(body).kind, "ok", JSON.stringify(eol));
+      assert.equal(closingDirectiveOutsideCompletion(body, 7, real, "o/r"), false, JSON.stringify(eol));
+      // A directive outside the block is still read.
+      assert.equal(closingDirectiveOutsideCompletion(`${body}Fixes #7${eol}`, 7, real, "o/r"), true, JSON.stringify(eol));
+    }
+    // Only line endings are normalised: any other difference scans the whole body.
+    const spaced = `${real.replace("\n---\n", "\n--- \n")}`;
+    assert.notEqual(spaced, real);
+    assert.equal(closingDirectiveOutsideCompletion(spaced, 7, real, "o/r"), true, spaced);
+  });
+});
+
+describe("closingDirectiveFor: a link or image never spans a paragraph end", () => {
+  it("stops at a blank line", () => {
+    for (const text of [
+      "Intro [x](\n\nFix&#101;s #7)",
+      "Intro ![x](\n\nFix&#101;s #7)",
+      "Intro [x][\n\nFix&#101;s #7]",
+      "Intro [x](\n  \t\nFix&#101;s #7)",
+      "> Intro [x](\n>\n> Fix&#101;s #7)",
+      "Intro [x](\r\n\r\nFix&#101;s #7)",
+      "Intro [x\n\nFix&#101;s #7](y)",
+    ]) {
+      assert.equal(closingDirectiveFor(text, 7, "o/r"), true, JSON.stringify(text));
+    }
+  });
+
+  it("stops at a line that opens an HTML block, even once the tag or comment is stripped", () => {
+    for (const text of [
+      "Intro [x](\n<div>\nFix&#101;s #7)",
+      "Intro [x](\n<div>Fix&#101;s #7)",
+      "Intro ![x](\n</table>Fix&#101;s #7)",
+      "Intro [x](\n<!-- c -->Fix&#101;s #7)",
+      "Intro [x](\n<!-- c -->\nFix&#101;s #7)",
+      "Intro [x](\n  <pre>\nFix&#101;s #7)",
+    ]) {
+      assert.equal(closingDirectiveFor(text, 7, "o/r"), true, JSON.stringify(text));
+    }
+  });
+
+  it("still strips a link or image within one paragraph, across a single line break or an inline tag", () => {
+    for (const text of [
+      "Intro [x](\nFix&#101;s #7)",
+      "Intro [x](Fix&#101;s #7)",
+      "Intro ![Fix&#101;s #7](y)",
+      "Intro [x](\n<span>Fix&#101;s #7)",
+      "Intro [x](a <div>Fix&#101;s #7)",
+    ]) {
+      assert.equal(closingDirectiveFor(text, 7, "o/r"), false, JSON.stringify(text));
     }
   });
 });
@@ -386,6 +501,10 @@ describe("scans stay linear on adversarial input (M1)", () => {
       "[",
       "[a](",
       "[a][",
+      "[a](\n\n",
+      "![a](\n<div>\n",
+      "[a](\n<!-- -->",
+      "\n",
       "<!--",
       "<!",
       "-",
