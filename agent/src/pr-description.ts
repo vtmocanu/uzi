@@ -33,7 +33,8 @@
 //     warnings, the unverified banner).
 //
 // closingDirectiveFor is the whole-body scan behind the interlock (D10 rule 1; the interlock runs it
-// through closingDirectiveOutsideCompletion, which leaves out uzi's own completion block): the api
+// through closingDirectiveOutsideCompletion, which leaves out uzi's own completion block only when it
+// is byte-identical to the block uzi rendered): the api
 // sanitizer's prDescClosing pattern (with Forgejo's `!N` references) over the raw text and over a
 // RENDERED view that mirrors the api's prDescNormalize (entities decoded to a fixed point everywhere,
 // code spans and autolinks included, format characters but U+200B dropped, HTML comments, tags, images and link targets
@@ -582,24 +583,31 @@ export function closingDirectiveFor(body: string, issueIid: number, repoPath?: s
 }
 
 /**
- * closingDirectiveFor over `body` with uzi's own completion block (as parseOwnedBlocks finds it)
- * removed: the interlock's scan. uzi's block is non-closing by construction (its tests prove it), but
+ * closingDirectiveFor over `body` with uzi's own completion block removed: the interlock's scan.
+ *
+ * Precondition: `expectedCompletion` is the exact completion block uzi rendered for this run
+ * (renderCompletionBlock's output, both markers included), not text read back from the forge. The
+ * block is removed only when parseOwnedBlocks(body) is `ok` AND its completion block equals
+ * `expectedCompletion` byte for byte; a body read from the forge is attacker-editable, so a forged
+ * block, or uzi's block with a directive inserted into it, is never trusted and the whole body is
+ * scanned instead (fail closed). Otherwise every parse outcome (`none`, `malformed`, no completion
+ * block, a completion block that differs) scans the whole body too.
+ *
+ * Why removal is needed at all: uzi's block is non-closing by construction (its tests prove it), but
  * the scan decodes entities inside code spans too, so a branch like `Fix&#101;s&#32;&#35;7` shown in
- * the block's code span would otherwise read as closing. Everything else is scanned: the text before
- * and after the block each on its own (a forge renders them as separate blocks, so an unterminated
- * comment or image in one cannot hide the other), and joined around the bare marker pair (so a
- * construct that spans the removal is still read). When the parse is not `ok`, or carries no
- * completion block, the whole body is scanned (fail closed).
+ * the block's code span would otherwise read as closing. When the block is removed, the text before
+ * it and the text after it are scanned once, joined around the bare marker pair, so a construct that
+ * spans the removal is still read. Removing the block cannot join a keyword before it to a reference
+ * after it: the renderer never ends the block's last content line with a closing keyword nor starts
+ * its first content line with a reference (asserted over every kind in the tests).
  */
-export function closingDirectiveOutsideCompletion(body: string, issueIid: number, repoPath?: string): boolean {
+export function closingDirectiveOutsideCompletion(body: string, issueIid: number, expectedCompletion: string, repoPath?: string): boolean {
   const parsed = parseOwnedBlocks(body);
-  if (parsed.kind !== "ok" || parsed.completion === undefined) return closingDirectiveFor(body, issueIid, repoPath);
+  if (parsed.kind !== "ok" || parsed.completion === undefined || parsed.completion !== expectedCompletion) {
+    return closingDirectiveFor(body, issueIid, repoPath);
+  }
   const head = parsed.before + (parsed.region ?? "") + parsed.between;
-  return (
-    closingDirectiveFor(head, issueIid, repoPath) ||
-    closingDirectiveFor(parsed.after, issueIid, repoPath) ||
-    closingDirectiveFor(`${head}${COMPLETION_START}\n${COMPLETION_END}${parsed.after}`, issueIid, repoPath)
-  );
+  return closingDirectiveFor(`${head}${COMPLETION_START}\n${COMPLETION_END}${parsed.after}`, issueIid, repoPath);
 }
 
 /**
@@ -710,7 +718,8 @@ export function codeSpan(s: string): string {
  *  directive), else as a code span, so an odd value can never inject markup, a link or a directive
  *  into the completion block. An entity (`fixes:&#35;7`) is refused because a forge decodes it in a
  *  bare URL's text; in a code span it shows as written. (closingDirectiveFor decodes it in a code
- *  span too; the interlock excludes uzi's completion block, closingDirectiveOutsideCompletion.) */
+ *  span too; the interlock excludes uzi's exact rendered completion block,
+ *  closingDirectiveOutsideCompletion.) */
 export function urlOrCodeSpan(url: string): string {
   const t = url.trim();
   const plain =
@@ -1177,6 +1186,12 @@ function quoteDepth(text: string): number {
  * block quote ending) is NOT treated as code. CommonMark runs it to the end of the document, which
  * would let one stray fence in human text above uzi's blocks hide them, and uzi would then lose its
  * own blocks; here the opener is ordinary text. Linear: fence closure is decided from suffix tables.
+ *
+ * Known, accepted limitation: fences inside list items (`* ~~~`, an indented `   ```` or a longer
+ * ````` fence opened in a list item) are not modelled, so a marker pair the forge shows as code can
+ * still be adopted as uzi's blocks. This never yields a closing false negative: the interlock
+ * (closingDirectiveOutsideCompletion) removes a completion block only when it is byte-identical to
+ * the block uzi rendered, and scans the whole body otherwise.
  */
 function codeRanges(body: string, closers: "depth" | "any"): Array<[number, number]> {
   const lines = linesOf(body);

@@ -207,36 +207,67 @@ describe("closingDirectiveFor decodes entities in code spans too; the interlock 
     // A conservative false positive of the whole-body scan...
     assert.equal(closingDirectiveFor(block, 7, "o/r"), true, block);
     // ...that the interlock's scan does not have: uzi's block is non-closing by construction.
-    assert.equal(closingDirectiveOutsideCompletion(block, 7, "o/r"), false, block);
+    assert.equal(closingDirectiveOutsideCompletion(block, 7, block, "o/r"), false, block);
     const human = `Some notes.\n\n${block}\n\nMore notes.`;
-    assert.equal(closingDirectiveOutsideCompletion(human, 7, "o/r"), false, human);
+    assert.equal(closingDirectiveOutsideCompletion(human, 7, block, "o/r"), false, human);
     const task = mrDescription(makeClaim({ kind: "task", issue_iid: null, branch: "uzi/task/x", base_branch: HIDDEN_BRANCH } as Partial<ClaimResponse>), HIDDEN_BRANCH);
-    assert.equal(closingDirectiveOutsideCompletion(task, 7, "o/r"), false, task);
+    const taskBlock = (parseOwnedBlocks(task) as OwnedBlocks).completion!;
+    assert.equal(closingDirectiveOutsideCompletion(task, 7, taskBlock, "o/r"), false, task);
+    // The same bodies checked against a different expected render are scanned whole: true.
+    assert.equal(closingDirectiveOutsideCompletion(human, 7, taskBlock, "o/r"), true, human);
   });
 
   it("the interlock scan still catches a real directive outside uzi's blocks", () => {
     const block = renderCompletionBlock({ issueIid: 7, branch: HIDDEN_BRANCH, closes: false });
     for (const text of ["Fixes #7", "Fix&#101;s #7", "`Fix&#101;s&#32;&#35;7`", "Resolves #1, #2 and #7"]) {
       for (const body of [`${text}\n\n${block}`, `${block}\n\n${text}`, `a\n\n${block}\n\n${text}\n`]) {
-        assert.equal(closingDirectiveOutsideCompletion(body, 7, "o/r"), true, body);
+        assert.equal(closingDirectiveOutsideCompletion(body, 7, block, "o/r"), true, body);
       }
     }
     // A comment left open before the block ends at the block's own start marker (a forge's HTML
     // block ends on the `-->` line), so an entity-hidden directive after the block is still read.
-    assert.equal(closingDirectiveOutsideCompletion(`<!--\n\n${block}\n\nFix&#101;s #7`, 7, "o/r"), true);
+    assert.equal(closingDirectiveOutsideCompletion(`<!--\n\n${block}\n\nFix&#101;s #7`, 7, block, "o/r"), true);
     // And in the region, which is scanned like any other text.
     const region = `${REGION_START}\nFixes #7\n${REGION_END}`;
-    assert.equal(closingDirectiveOutsideCompletion(`${region}\n\n${block}`, 7, "o/r"), true);
+    assert.equal(closingDirectiveOutsideCompletion(`${region}\n\n${block}`, 7, block, "o/r"), true);
   });
 
   it("the interlock scan reads the whole body when the parse is not ok", () => {
     const block = renderCompletionBlock({ issueIid: 7, branch: HIDDEN_BRANCH, closes: false });
     // No uzi block at all, and a malformed body (a duplicate block): the whole body is scanned.
-    assert.equal(closingDirectiveOutsideCompletion(`\`${HIDDEN_BRANCH}\``, 7, "o/r"), true);
-    assert.equal(closingDirectiveOutsideCompletion(`${block}\n\n${block}`, 7, "o/r"), true);
-    assert.equal(closingDirectiveOutsideCompletion("nothing here", 7, "o/r"), false);
-    assert.equal(closingDirectiveOutsideCompletion("a".repeat(FORGE_BODY_MAX_CHARS + 1), 7), true);
-    assert.equal(closingDirectiveOutsideCompletion(block, -1), true);
+    assert.equal(closingDirectiveOutsideCompletion(`\`${HIDDEN_BRANCH}\``, 7, block, "o/r"), true);
+    assert.equal(closingDirectiveOutsideCompletion(`${block}\n\n${block}`, 7, block, "o/r"), true);
+    assert.equal(closingDirectiveOutsideCompletion("nothing here", 7, block, "o/r"), false);
+    assert.equal(closingDirectiveOutsideCompletion("a".repeat(FORGE_BODY_MAX_CHARS + 1), 7, block), true);
+    assert.equal(closingDirectiveOutsideCompletion(block, -1, block), true);
+  });
+
+  it("removes the completion block only when it is byte-identical to uzi's render", () => {
+    // uzi's real render (a plain branch, so its own text is non-closing on a whole-body scan too).
+    const real = renderCompletionBlock({ issueIid: 7, branch: "agent/issue-7", closes: false });
+    assert.equal(closingDirectiveFor(real, 7, "o/r"), false, real);
+    assert.equal(closingDirectiveOutsideCompletion(real, 7, real, "o/r"), false, real);
+    const forged = (inner: string) => `${COMPLETION_START}\n${inner}\n${COMPLETION_END}`;
+    const region = `${REGION_START}\nSummary.\n${REGION_END}`;
+    // uzi's block with a directive inserted just after its start marker line.
+    const tampered = real.replace(`${COMPLETION_START}\n`, `${COMPLETION_START}\n\nFixes #7\n`);
+    assert.notEqual(tampered, real);
+    const bodies = [
+      // A forged block standing alone.
+      forged("Fixes #7"),
+      // Human text plus a forged block, uzi's real block deleted.
+      `Human notes.\n\n${forged("Fixes #7")}`,
+      // uzi's real render with a directive inserted inside it.
+      tampered,
+      // A forged pair wrapping only the reference after the keyword.
+      `Fixes\n${forged("#7")}`,
+      // The region plus a forged block.
+      `${region}\n\n${forged("Resolves #7")}`,
+    ];
+    for (const body of bodies) {
+      assert.equal(parseOwnedBlocks(body).kind, "ok", body);
+      assert.equal(closingDirectiveOutsideCompletion(body, 7, real, "o/r"), true, body);
+    }
   });
 
   it("a pipeline URL holding an entity renders as a code span inside uzi's block", () => {
@@ -249,7 +280,7 @@ describe("closingDirectiveFor decodes entities in code spans too; the interlock 
       "ci-fix/pipeline-5",
     );
     assert.ok(body.includes(`: \`${HIDDEN_URL}\`\n`), body);
-    assert.equal(closingDirectiveOutsideCompletion(body, 7, "o/r"), false, body);
+    assert.equal(closingDirectiveOutsideCompletion(body, 7, (parseOwnedBlocks(body) as OwnedBlocks).completion!, "o/r"), false, body);
     const line = (url: string) =>
       mrDescription(makeClaim({ kind: "ci_fix", pipeline: { id: 5, ref: "main", sha: "a".repeat(40), web_url: url, failed_jobs: [] } } as Partial<ClaimResponse>), "b");
     for (const url of ["https://x/a?b=1&amp;c=2", "https://x/&lt;", "https://x/a&num;7", "https://x/a&ampx"]) {
@@ -701,6 +732,78 @@ describe("round trip: the renderer's own output always parses ok", () => {
       accepted: [{ id: hostile, text: hostile, reason: hostile }],
     } as ClaimConfig["completion_scope"],
   ];
+
+  it("no completion block starts with a reference or ends with a closing keyword (removing it hides nothing)", () => {
+    // The interlock scan removes uzi's block and joins the text around it. That join could only form
+    // a directive across the boundary if the block's first content line began with a reference (a
+    // keyword just above it would borrow it) or its last content line ended with a keyword (a
+    // reference just below it would complete it). The renderer's wording never does either.
+    const REF_AT_START = /^[\s\p{Z}]*(?:[#!]\d|[\w.-]+(?:\/[\w.-]+)*[#!]\d|gh-\d|https?:\/\/)/iu;
+    const KEYWORD_AT_END = /\b(?:clos(?:e[sd]?|ing)|fix(?:e[sd]|ing)?|resolv(?:e[sd]?|ing)|implement(?:s|ed|ing)?)[\s\p{Z}:]*$/iu;
+    let checked = 0;
+    const check = (completion: string, label: string) => {
+      assert.ok(completion.startsWith(`${COMPLETION_START}\n`) && completion.endsWith(`\n${COMPLETION_END}`), label);
+      const lines = completion.split("\n").slice(1, -1);
+      const first = lines.find((l) => l.trim() !== "");
+      const last = lines.findLast((l) => l.trim() !== "");
+      assert.ok(first !== undefined && last !== undefined, label);
+      assert.doesNotMatch(first, REF_AT_START, `${label}: first line ${JSON.stringify(first)}`);
+      assert.doesNotMatch(last, KEYWORD_AT_END, `${label}: last line ${JSON.stringify(last)}`);
+      checked++;
+    };
+    const banners = [undefined, "> ⚠️ **Completion unverified.** x"];
+    for (const [kind, over] of kinds) {
+      for (const completionScope of scopes) {
+        for (const closes of [true, false]) {
+          for (const scopeCapped of [undefined, { completedCount: 1, total: 2 }]) {
+            for (const banner of banners) {
+              const claim = makeClaim({ kind, issue_title: "T", ...over } as Partial<ClaimResponse>);
+              const label = `${kind} closes=${closes} capped=${!!scopeCapped} scope=${!!completionScope} banner=${!!banner}`;
+              for (const issueIid of [claim.issue_iid, 7]) {
+                check(
+                  renderCompletionBlock({
+                    issueIid,
+                    branch: hostile,
+                    kindLine: kind === "issue" ? undefined : `Kind ${kind}.`,
+                    kindSections: [section, selfImproveMrSection([hostile], [{ name: hostile, status: "failed", detail: hostile }])],
+                    closes,
+                    completionScope,
+                    scopeCapped,
+                    repoAgents: closes,
+                    gatesUnverified: scopeCapped ? [hostile] : undefined,
+                    gatesDiscoveryTruncated: !!scopeCapped,
+                    bridged: !closes,
+                    banner,
+                    staleness: banner ? { describedSha: "1".repeat(40), headSha: HEAD } : undefined,
+                  }),
+                  `render ${label} iid=${issueIid}`,
+                );
+              }
+              const body = mrDescription(
+                claim,
+                hostile,
+                closes ? { source: "repo", agents: ["a"] } : undefined,
+                section,
+                section,
+                scopeCapped ? [hostile] : undefined,
+                !!scopeCapped,
+                scopeCapped,
+                closes,
+                completionScope,
+                !closes,
+                SIZE,
+                banner ? { headSha: HEAD, targetBranch: hostile, banner, staleness: { describedSha: "1".repeat(40), headSha: HEAD } } : undefined,
+              );
+              const p = parseOwnedBlocks(body);
+              assert.equal(p.kind, "ok", body);
+              check((p as OwnedBlocks).completion!, `mrDescription ${label}`);
+            }
+          }
+        }
+      }
+    }
+    assert.ok(checked > 0);
+  });
 
   it("every kind, with and without a region, every optional part, LF / CRLF / CR", async () => {
     const fields = await mint({
