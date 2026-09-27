@@ -12,7 +12,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
-// diskParkRun is a recovery_wait run parked because its worker's data volume was full (PRD
+// diskParkRun is a recovery_wait run parked because its worker's data volume is full or nearly full (PRD
 // #1809 M5). Forge counters are set on purpose: this cause must never borrow the forge wording
 // or its "N of MAX" count; its own count is DiskParkCount.
 func diskParkRun(id string) apitypes.RunDTO {
@@ -26,13 +26,13 @@ func diskParkRun(id string) apitypes.RunDTO {
 }
 
 // TestDiskParkLine pins the shared sentence: the retry clause carries local HH:MM, the park
-// count reads "disk parks: N", the retry time is dropped without a stamp, and any other run
+// count reads "counted disk parks: N", the retry time is dropped without a stamp, and any other run
 // (including a vault park) gets "". Reddening mutation: drop the count clause, or key
 // isDiskFullPark on the cause alone.
 func TestDiskParkLine(t *testing.T) {
 	r := diskParkRun("r1")
-	want := "waiting for disk space: the worker's data volume is full; uzi freed what it could and the run resumes at its next retry (" +
-		r.RecoveryRetryNotBefore.Local().Format("15:04") + "); disk parks: 2"
+	want := "waiting for disk space: the worker's data volume is full or nearly full; uzi frees space (including this run's build caches) and the run resumes at its next retry (" +
+		r.RecoveryRetryNotBefore.Local().Format("15:04") + "); counted disk parks: 2"
 	if got := diskParkLine(r); got != want {
 		t.Errorf("diskParkLine = %q, want %q", got, want)
 	}
@@ -40,7 +40,7 @@ func TestDiskParkLine(t *testing.T) {
 		t.Errorf("diskParkLine borrowed the forge cap: %q", diskParkLine(r))
 	}
 	r.RecoveryRetryNotBefore = nil
-	if got := diskParkLine(r); !strings.HasSuffix(got, "resumes at its next retry; disk parks: 2") {
+	if got := diskParkLine(r); !strings.HasSuffix(got, "resumes at its next retry; counted disk parks: 2") {
 		t.Errorf("diskParkLine(no stamp) = %q, want the retry clause without a time", got)
 	}
 	running := diskParkRun("r1")
@@ -57,13 +57,13 @@ func TestDiskParkLine(t *testing.T) {
 }
 
 // TestFitDiskParkLine pins the shedding order: full, then "waiting for disk space: resumes at
-// its next retry (HH:MM); disk parks: N", then the floor "waiting for disk space · retry
+// its next retry (HH:MM); counted disk parks: N", then the floor "waiting for disk space · retry
 // HH:MM", which is never cut. Reddening mutation: return diskParkLine unshed.
 func TestFitDiskParkLine(t *testing.T) {
 	r := diskParkRun("r1")
 	hhmm := r.RecoveryRetryNotBefore.Local().Format("15:04")
 	full := diskParkLine(r)
-	short := "waiting for disk space: resumes at its next retry (" + hhmm + "); disk parks: 2"
+	short := "waiting for disk space: resumes at its next retry (" + hhmm + "); counted disk parks: 2"
 	floor := "waiting for disk space · retry " + hhmm
 	for _, tc := range []struct {
 		width int
@@ -100,24 +100,24 @@ func TestSteerStateDataVolumeFull(t *testing.T) {
 	}
 }
 
-// TestStateGlyphWordDataVolumeFull pins the TUI token "~ disk full" in the wait family, fitting
+// TestStateGlyphWordDataVolumeFull pins the TUI token "~ disk wait" in the wait family, fitting
 // the board's status-word cell. Reddening mutation: drop the dataVolumeFullCause arm in
 // stateGlyphWord (it falls back to "recovery wait").
 func TestStateGlyphWordDataVolumeFull(t *testing.T) {
 	glyph, word := stateGlyphWord(statusRecoveryWait, "", false, false, "", dataVolumeFullCause)
-	if glyph != "~" || word != "disk full" {
-		t.Errorf("data_volume_full token = (%q, %q), want (~, disk full)", glyph, word)
+	if glyph != "~" || word != "disk wait" {
+		t.Errorf("data_volume_full token = (%q, %q), want (~, disk wait)", glyph, word)
 	}
 	if n := len([]rune(word)); n >= boardStatusWordWidth {
 		t.Errorf("data_volume_full word %q is %d runes, does not fit boardStatusWordWidth %d", word, n, boardStatusWordWidth)
 	}
-	if got := runStateWord(apitypes.RunListItemDTO{RunDTO: diskParkRun("r1")}); got != "disk full" {
-		t.Errorf("runStateWord(data_volume_full) = %q, want %q", got, "disk full")
+	if got := runStateWord(apitypes.RunListItemDTO{RunDTO: diskParkRun("r1")}); got != "disk wait" {
+		t.Errorf("runStateWord(data_volume_full) = %q, want %q", got, "disk wait")
 	}
 	p := newPalette(true)
 	tok := p.runStateToken(diskParkRun("r1"), false)
-	if tok.glyph != "~" || tok.word != "disk full" || tok.color != p.wait {
-		t.Errorf("runStateToken(data_volume_full) = (%q, %q, %v), want (~, disk full, wait colour)", tok.glyph, tok.word, tok.color)
+	if tok.glyph != "~" || tok.word != "disk wait" || tok.color != p.wait {
+		t.Errorf("runStateToken(data_volume_full) = (%q, %q, %v), want (~, disk wait, wait colour)", tok.glyph, tok.word, tok.color)
 	}
 }
 
@@ -142,7 +142,7 @@ func TestRenderRunDetailFailOrigin(t *testing.T) {
 	origin := dataVolumeFullCause
 	failed := apitypes.RunDTO{ID: "r1", Kind: "issue", Status: "failed", FailOrigin: &origin, DiskParkCount: 3}
 	line := lineWith(t, renderDetailString(t, failed), "FAIL_ORIGIN")
-	if want := "data_volume_full (the worker's data volume stayed full; the run failed after disk parks: 3)"; !strings.Contains(line, want) {
+	if want := "data_volume_full (the worker's data volume stayed full after 3 counted disk parks)"; !strings.Contains(line, want) {
 		t.Errorf("FAIL_ORIGIN row = %q, want it to carry %q", line, want)
 	}
 	other := "forge_unreachable"

@@ -1757,10 +1757,11 @@ func isDiskFullPark(r apitypes.RunDTO) bool {
 // diskParkLead is the load-bearing opening every disk park rendering starts with.
 const diskParkLead = "waiting for disk space"
 
-// diskParkCountClause is "disk parks: N", the run's lifetime count of counted disk parks. The
-// cap is not on the DTO, so no surface renders "N of MAX" for this cause.
+// diskParkCountClause is "counted disk parks: N", the run's lifetime count of COUNTED disk
+// parks. A preventive park is not counted, so N can stay 0 across several parks, and the cap is
+// not on the DTO, so no surface renders "N of MAX" for this cause.
 func diskParkCountClause(r apitypes.RunDTO) string {
-	return "disk parks: " + itoa(r.DiskParkCount)
+	return "counted disk parks: " + itoa(r.DiskParkCount)
 }
 
 // diskParkLine is the data_volume_full park sentence (PRD #1809 M5) `uzi run get`'s DISK row,
@@ -1770,13 +1771,13 @@ func diskParkLine(r apitypes.RunDTO) string {
 	if !isDiskFullPark(r) {
 		return ""
 	}
-	return diskParkLead + ": the worker's data volume is full; uzi freed what it could and the run resumes at " +
+	return diskParkLead + ": the worker's data volume is full or nearly full; uzi frees space (including this run's build caches) and the run resumes at " +
 		vaultRetryClause(r) + "; " + diskParkCountClause(r)
 }
 
 // fitDiskParkLine is diskParkLine shed to fit a physical width, for the TUI's one-row slots,
 // in the same order as fitVaultParkLine: the full sentence, then "waiting for disk space:
-// resumes at its next retry (HH:MM); disk parks: N", then the floor "waiting for disk space ·
+// resumes at its next retry (HH:MM); counted disk parks: N", then the floor "waiting for disk space ·
 // retry HH:MM" (the bare lead without a stamp). The floor is never cut here; the caller's
 // clampVisual is the narrow-terminal backstop. "" for any run that is not a disk park.
 func fitDiskParkLine(r apitypes.RunDTO, width int) string {
@@ -1799,12 +1800,12 @@ func fitDiskParkLine(r apitypes.RunDTO, width int) string {
 
 // failOriginCell is `uzi run get`'s FAIL_ORIGIN cell: the typed fail_origin enum, with a plain
 // explanation for data_volume_full (PRD #1809 M5), whose raw name does not say that uzi parked
-// and retried before giving up. The enum is server-coerced, but an unrecognised value from a
+// and retried before giving up. N is the counted parks only (preventive parks are uncounted). The enum is server-coerced, but an unrecognised value from a
 // newer server still prints as itself, through sanitizeTTY like the STOP_KIND row.
 func failOriginCell(r apitypes.RunDTO) string {
 	origin := strOr(r.FailOrigin, "")
 	if origin == dataVolumeFullCause {
-		return origin + " (the worker's data volume stayed full; the run failed after " + diskParkCountClause(r) + ")"
+		return origin + " (the worker's data volume stayed full after " + itoa(r.DiskParkCount) + " counted disk parks)"
 	}
 	return sanitizeTTY(origin)
 }

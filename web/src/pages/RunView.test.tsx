@@ -4751,8 +4751,8 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     expect(container.textContent).not.toMatch(/retry \(/);
   });
 
-  // PRD #1809 M5: a data_volume_full park (the worker's data volume was full) waits for disk
-  // space, retries on its own at its next retry, and shows the run's lifetime disk-park count.
+  // PRD #1809 M5: a data_volume_full park (the worker's data volume is full or nearly full)
+  // waits for disk space, resumes at its next retry, and shows the run's counted disk parks.
   const diskPark = (over: Partial<Run> = {}) =>
     run({
       status: "recovery_wait",
@@ -4769,11 +4769,12 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     const { container } = render(<RecoveryWaitPanel run={diskPark()} />);
     expect(container.querySelector('[role="status"]')?.textContent).toContain("Waiting for disk space");
     expect(container.textContent).toContain(
-      `The worker's disk is full. uzi freed what space it could, and the run retries on its own at ${hhmm("2026-01-01T09:30:00Z")}. No action is needed.`,
+      `The worker's disk is full or nearly full. uzi frees space (including this run's build caches), and the run resumes at its next retry (${hhmm("2026-01-01T09:30:00Z")}). No action is needed.`,
     );
     expect(container.textContent).toContain(
-      "Disk parks so far: 2. If the disk is still full after repeated parks, the run fails.",
+      "Counted disk parks so far: 2. If the disk stays full, the run can fail after repeated counted parks.",
     );
+    expect(container.textContent).not.toContain("uzi freed");
     expect(container.textContent).not.toContain("transient interruption");
     expect(container.textContent).not.toContain("Waiting for the forge");
     expect(container.textContent).not.toContain("4 of 5");
@@ -4785,8 +4786,21 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     const { container } = render(
       <RecoveryWaitPanel run={diskPark({ recovery_retry_not_before: null, disk_park_count: undefined })} />,
     );
-    expect(container.textContent).toContain("the run retries on its own. No action is needed.");
-    expect(container.textContent).toContain("Disk parks so far: 0.");
+    expect(container.textContent).toContain("the run resumes at its next retry. No action is needed.");
+    expect(container.textContent).not.toMatch(/retry \(/);
+    expect(container.textContent).toContain("Counted disk parks so far: 0.");
+  });
+
+  // PRD #1809: the disk park's footer says what actually holds (branch, pushed checkpoint, the
+  // worker keeping the run's work), not the generic "keeps its branch and its history" line.
+  // Reddening mutation: drop the diskPark arm of the footer ternary.
+  it("data_volume_full: disk-specific footer, not the generic nothing-is-lost line", () => {
+    const { container } = render(<RecoveryWaitPanel run={diskPark()} />);
+    expect(container.textContent).toContain(
+      "The run keeps its branch and its pushed checkpoint, and the worker keeps the run's work until it resumes.",
+    );
+    expect(container.textContent).not.toContain("Nothing is lost");
+    expect(container.textContent).not.toContain("its branch and its history");
   });
 });
 
@@ -5129,7 +5143,7 @@ describe("RunView park announcement — recovery_wait (issue #1197, a11y)", () =
       return el;
     });
     expect(region.textContent).toBe(
-      "This run is waiting for disk space. The worker's disk is full; uzi freed what space it could, and the run retries on its own.",
+      "This run is waiting for disk space. The worker's disk is full or nearly full; uzi frees space (including this run's build caches), and the run resumes at its next retry.",
     );
     expect(region.textContent).not.toContain("transient interruption");
   });
