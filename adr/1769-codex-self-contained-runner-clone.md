@@ -1,6 +1,6 @@
 # ADR-1769: the Codex runner clone is dissociated from the worker bare, not granted read access to it
 
-**Status**: Implemented; acceptance evidence pending (issue #1769)
+**Status**: Accepted and implemented; Landlock acceptance recorded below (issue #1769)
 **Date**: 2026-09-26
 **Deciders**: architect (design), coder (implementation), reviewer.
 **Related**: issue #1769, PRD #51 (uid split), adr/1598-codex-command-storage.md.
@@ -173,3 +173,92 @@ wrapper contract with a stub `docker`: exit 2 before any docker call for a
 missing bind source, read-only `--mount` binds only, the 0/77-to-3 cleanup
 mapping, the `host`-only build network, and a process-group SIGINT that
 reaches `docker run` and `docker build` and exits 130 promptly.
+
+## Acceptance evidence (2026-09-27)
+
+Recorded on the uzi worker host (kernel 6.12, Landlock available: the
+image's `uzi-codex-command-sandbox --probe` exited 0, which the sandbox only
+returns for Landlock ABI >= 1; ABI < 1 or a probe error exits 11). Every run
+set `CODEX_GIT_TRUST_REQUIRE_LANDLOCK=1`, so a missing Landlock would have
+been a FAIL, not a skip. No line in any run below was a SKIP except the one
+noted for the base tree.
+
+- **Tree and image.** Fixture tree at `74122b7c66b1c476d22a633378e168280c48da17`
+  (the runs use its `e2e/codex-git-trust/`, bind-mounted). Image
+  `cgt-1769:68deb3e6d41a` (image ID `sha256:a4e68a07cbb3…`, manifest list
+  `sha256:dcadaccdfc5b…`), built by
+  `CODEX_GIT_TRUST_IMAGE=cgt-1769:68deb3e6d41a CODEX_GIT_TRUST_BUILD_NETWORK=host task test:codex-git-trust:build`
+  at `68deb3e6`, exit 0. `git diff 68deb3e6..74122b7c` touches only
+  `e2e/codex-git-trust/fixture.ts`, so the image's `agent/src`, binaries and
+  entrypoint are those of the final tree.
+- **How the gate ran.** `task test:codex-git-trust` is `build` then
+  `fixture`; they were run as those two subtasks, not as one invocation.
+  The one-shot form was attempted at the final SHA and could not finish on
+  this host: a rebuild under a new `UZI_SRC_SHA` re-runs the image's
+  `chmod -R a+rX /nix` layer (about 260 s) plus a 3–4 minute export, and the
+  second copy of that 8.75 GB image then failed with `no space left on
+  device` on the shared daemon's volume. `--network host` for the build is a
+  host workaround (bridge egress hangs here); the fixture container ran
+  `--network none` throughout.
+- **After (fixed source, the image's own `agent/src`).**
+  `CODEX_GIT_TRUST_REQUIRE_LANDLOCK=1 CODEX_GIT_TRUST_IMAGE=cgt-1769:68deb3e6d41a task test:codex-git-trust:fixture`
+  exit 0: `LANDLOCK: probe=0`, `SHARED-CLONE MODE: FIXED`,
+  `SHARED-CLONE RESULT: FIXED PASS`, `RESULT: FIXED PASS`, 64 PASS, 0 FAIL,
+  0 SKIP. Among them, in best-effort and required modes:
+  `SHARED-CLONE FIXED required: git status`, `… git diff HEAD`,
+  `… git log --oneline`, `… write + git add + git commit`, the anchored
+  `cat-file -e` of the base, checkpoint marker and advanced default tip, and
+  the controls `… ls bare objects/pack is denied` and
+  `… ls sibling clone .git is denied`.
+- **Before (base `87cb446b`, mounted via `CODEX_GIT_TRUST_SRC_DIR`).** Same
+  command, exit 1 (task 201): `SHARED-CLONE MODE: UNFIXED`,
+  `SHARED-CLONE RESULT: UNFIXED FAIL`. `git status`, `git diff HEAD`,
+  `git log --oneline` and `write + git add + git commit` FAIL in both modes
+  with `error: unable to open object pack directory: /data/repos/…/objects/pack:
+  Permission denied` (the issue's evidence). The bare and sibling denial
+  controls PASS on both trees. The finalize-import part SKIPs on this tree
+  (it has no import API), so its red evidence comes from the controls below.
+- **Finalize import, through the real boundary machinery.** On the fixed
+  tree each case PASSes its named lines: calibration
+  (`FINALIZE-IMPORT: process scan sees a sandboxed command-identity process`),
+  (a) success (`sandboxed cat-file -e newTip FAILS before import`,
+  `alignBranchWithDefault returns "aligned"`,
+  `sandboxed cat-file -e newTip succeeds after import`), (b) producer failure
+  (`a bare-absent tip throws RunnerCloneImportError`), (c) consumer failure
+  (`an unwritable clone objects/pack throws RunnerCloneImportError`), and for
+  each of (a), (b), (c): `producer and consumer reaped`,
+  `no live command-kind root`, `a subsequent worker_pat boundary action succeeds`.
+- **Negative controls** (each a copy of the fixed `agent/src` with one change,
+  mounted via `CODEX_GIT_TRUST_SRC_DIR`; a SKIP, missing line or crash never
+  counts as red):
+  - `mut-noimport` (`ensureRunnerCloneObjects` returns before streaming a
+    pack): red on (a) `alignBranchWithDefault returns "aligned"` and
+    `sandboxed cat-file -e newTip succeeds after import`, (b)
+    `a bare-absent tip throws RunnerCloneImportError`, (c)
+    `an unwritable clone objects/pack throws RunnerCloneImportError`.
+  - `mut-stall` (no peer teardown, and the consumer's stdin never ended): red
+    on (b) `a bare-absent tip throws RunnerCloneImportError` (the boundary
+    did not settle within the case bound), (b) and (c)
+    `producer and consumer reaped` (a leftover `uzi-codex-supervisor … index-pack`
+    process, uid 10003, named in the detail), and (a) and (b)
+    `a subsequent worker_pat boundary action succeeds`.
+  - Recorded as NOT discriminated at this layer (green): reverting
+    `1c3be1a3`'s teardown/attribution hunk, removing the peer teardown
+    alone, and reverting `callerOwnedStdout`. In these three real cases git
+    ends on EOF/EPIPE by itself, and the flushStdio race did not reproduce;
+    those contracts are pinned by stalled-process and deterministic
+    red/green tests in `agent/test/git-import.test.ts` instead.
+- **What the acceptance runs also fixed in the fixture.** Before these runs
+  the fixture exited 0 without reaching the shared-clone mode checks or any
+  `RESULT` line (it awaited a reaped command root's promise that never
+  settles, and node exits 0 when the loop drains). It now fails with
+  `RESULT: FAIL — the fixture ended before main() completed` in that case,
+  bounds that wait, runs the finalize-import part after the mode checks it
+  would otherwise disturb, and bounds each finalize boundary so a stall is a
+  named FAIL rather than a hang.
+- **Hygiene.** All bind sources were staged outside the runner clone; every
+  docker step ran in the foreground under `timeout`; containers were named
+  `codex-git-trust-<pid>` / `cgt-1769-*` and checked absent by exact name.
+  One probe container that timed out before starting was found later in the
+  `Created` state (no binds) and removed by exact name.
+
