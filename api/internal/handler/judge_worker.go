@@ -156,6 +156,11 @@ type workerReviewRequest struct {
 	// fenced on it so a superseded flight cannot overwrite the current verdict. A capability
 	// worker must stamp it; a legacy worker omits it (nil).
 	ClaimGeneration *int64 `json:"claim_generation"`
+	// AdviceRunID is the judge run the posting flight holds (issue #1423). Generations are
+	// per-run counters, so without it a stale flight of an earlier judge run could match a
+	// re-judge's generation; a mismatch with the authorized judge run is a 409 stale_claim.
+	// Optional (a legacy worker omits it); a present value must be a uuid (400 otherwise).
+	AdviceRunID *string `json:"advice_run_id"`
 }
 
 type workerReviewRec struct {
@@ -188,7 +193,12 @@ func (h *Handler) WorkerRunReview(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	res, err := h.wsvc.PostReview(r.Context(), wkr, targetID, sub, req.ClaimGeneration)
+	claim, err := adviceClaim(req.ClaimGeneration, req.AdviceRunID)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	res, err := h.wsvc.PostReview(r.Context(), wkr, targetID, sub, claim)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotFound) {
 			httpx.Error(w, http.StatusNotFound, "run not found")
@@ -209,13 +219,29 @@ func (h *Handler) WorkerRunReview(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
+// adviceClaim builds the issue #1423 advice-post fence from the request's optional
+// claim_generation and advice_run_id. A present advice_run_id that is not a uuid is a
+// request error (400); whether it names the authorized advice run is the service's call.
+func adviceClaim(gen *int64, runID *string) (workersvc.AdviceClaim, error) {
+	claim := workersvc.AdviceClaim{Generation: gen}
+	if runID != nil {
+		id, err := uuid.Parse(*runID)
+		if err != nil {
+			return workersvc.AdviceClaim{}, errors.New("advice_run_id must be a uuid")
+		}
+		claim.RunID = &id
+	}
+	return claim, nil
+}
+
 // writeAdviceClaimRefusal answers the issue #1423 claim-fence refusals shared by the judge
 // review and task-review advice POSTs, and reports whether it wrote a response. Nothing was
 // persisted in either case, so the caller must not notify.
 //   - ErrMissingClaimGeneration: a capability worker omitted claim_generation, so the fence
 //     could not engage; 409 with an error the worker fixes by stamping the generation.
-//   - ErrStaleClaim: the advice run's claim was released or superseded (a reclaim bumped its
-//     generation); the same {"disposition":"stale_claim"} 409 WorkerRunMessages answers,
+//   - ErrStaleClaim: the advice run's claim was released, superseded (a reclaim bumped its
+//     generation), reassigned to another worker, or the stamped advice_run_id is not the
+//     authorized advice run; the same {"disposition":"stale_claim"} 409 WorkerRunMessages answers,
 //     which the worker reads to abandon the old flight rather than fail the run.
 func writeAdviceClaimRefusal(w http.ResponseWriter, err error) bool {
 	switch {

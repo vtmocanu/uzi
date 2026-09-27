@@ -1347,6 +1347,10 @@ export interface ReviewRequest {
   /** The judge run's claim generation (issue #1423): the server fences the write on it.
    *  Stamped by the client send-gate only (never 0/undefined on the wire). */
   claim_generation?: number;
+  /** The judge run id the posting flight holds (issue #1423). Generations are per-run
+   *  counters, so this is what refuses a stale flight of an EARLIER judge run whose
+   *  generation collides with a re-judge's. Sent only alongside claim_generation. */
+  advice_run_id?: string;
 }
 
 /** One structured finding the diff-review reviewer posts back (PRD #400 M4b). Every
@@ -1373,6 +1377,8 @@ export interface TaskReviewRequest {
   findings: TaskReviewFinding[];
   /** The review run's claim generation (issue #1423), fenced server-side like ReviewRequest's. */
   claim_generation?: number;
+  /** The review run id the posting flight holds (issue #1423), as ReviewRequest's. */
+  advice_run_id?: string;
 }
 
 /**

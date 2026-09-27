@@ -120,8 +120,9 @@ RETURNING *;
 -- Issue #1423: the write is FENCED on the REVIEW (advice) run's claim, the same fence the
 -- judge's UpsertRunReviewWithRecommendations carries (see its comment for the full shape):
 -- with @review_run_id NOT NULL (every production caller) the header + findings land ONLY
--- while that run's claim is unreleased and, when @claim_generation is stamped, still at
--- that generation. A fenced-out call writes nothing and returns no row (pgx.ErrNoRows ->
+-- while that run is still claimed by the posting worker (@worker_id, checked in the same
+-- statement as the write), its claim is unreleased and, when @claim_generation is stamped,
+-- still at that generation. A fenced-out call writes nothing and returns no row (pgx.ErrNoRows ->
 -- ErrStaleClaim in the service); `inserted` is guarded by EXISTS(upserted). A NULL
 -- @review_run_id is the unfenced seeder path. `live` takes FOR SHARE on the run row so a
 -- concurrent ClaimRun `claim_generation = claim_generation + 1` UPDATE serializes with this
@@ -130,6 +131,7 @@ RETURNING *;
 WITH live AS (
     SELECT r.id FROM runs r
     WHERE r.id = sqlc.narg('review_run_id')::uuid
+      AND r.worker_id = sqlc.arg('worker_id')::uuid
       AND r.claim_released_at IS NULL
       AND (sqlc.narg('claim_generation')::bigint IS NULL
            OR r.claim_generation = sqlc.narg('claim_generation')::bigint)

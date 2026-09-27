@@ -5,12 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -105,16 +103,16 @@ func (s *Service) authorizeTaskReviewTarget(ctx context.Context, wkr store.Worke
 // so a re-review overwrites the prior findings rather than 23505-ing (the same shape the
 // judge's PostReview uses; workersvc holds no pool for a service-level tx).
 //
-// Issue #1423: fenced on the REVIEW run's claim exactly like PostReview: a capability
-// worker's nil claimGen is ErrMissingClaimGeneration (nothing written), and a released or
-// superseded claim persists nothing and surfaces as ErrStaleClaim.
-func (s *Service) PostTaskReview(ctx context.Context, wkr store.Worker, targetID uuid.UUID, sub TaskReviewSubmission, claimGen *int64) error {
+// Issue #1423: fenced on the REVIEW run's claim exactly like PostReview (checkAdviceClaim,
+// then the in-statement fence): a released, superseded, reassigned or mismatched claim
+// persists nothing and surfaces as ErrStaleClaim.
+func (s *Service) PostTaskReview(ctx context.Context, wkr store.Worker, targetID uuid.UUID, sub TaskReviewSubmission, claim AdviceClaim) error {
 	review, target, err := s.authorizeTaskReviewTarget(ctx, wkr, targetID)
 	if err != nil {
 		return err
 	}
-	if claimGen == nil && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
-		return ErrMissingClaimGeneration
+	if err := checkAdviceClaim(wkr, review.ID, claim); err != nil {
+		return err
 	}
 	findings := sub.Findings
 	if findings == nil {
@@ -131,7 +129,8 @@ func (s *Service) PostTaskReview(ctx context.Context, wkr store.Worker, targetID
 		Status:          sub.Status,
 		SummaryMd:       sub.SummaryMd,
 		Findings:        findingsJSON,
-		ClaimGeneration: pgconv.Int8Ptr(claimGen),
+		ClaimGeneration: pgconv.Int8Ptr(claim.Generation),
+		WorkerID:        wkr.ID,
 	}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrStaleClaim

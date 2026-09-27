@@ -127,7 +127,7 @@ func TestTaskReviewLiveDB(t *testing.T) {
 			{File: "api/util.go", Symbol: "", Line: 0, Severity: "info", SummaryMd: "rename", RationaleMd: "clarity"},
 		},
 	}
-	if err := svc.PostTaskReview(ctx, wkr, taskID, sub, nil); err != nil {
+	if err := svc.PostTaskReview(ctx, wkr, taskID, sub, AdviceClaim{}); err != nil {
 		t.Fatalf("PostTaskReview: %v", err)
 	}
 
@@ -158,7 +158,7 @@ func TestTaskReviewLiveDB(t *testing.T) {
 	sub2 := TaskReviewSubmission{Status: "complete", SummaryMd: "re-reviewed", Findings: []TaskReviewFinding{
 		{File: "api/main.go", Line: 7, Severity: "warning", SummaryMd: "still off", RationaleMd: "y"},
 	}}
-	if err := svc.PostTaskReview(ctx, wkr, taskID, sub2, nil); err != nil {
+	if err := svc.PostTaskReview(ctx, wkr, taskID, sub2, AdviceClaim{}); err != nil {
 		t.Fatalf("re-PostTaskReview: %v", err)
 	}
 	got2, err := svc.GetTaskReviewPanel(ctx, userID, false, taskID)

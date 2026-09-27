@@ -172,3 +172,44 @@ func TestAdvicePostLegacyWorkerUnstamped(t *testing.T) {
 		})
 	}
 }
+
+// Issue #1423 advice_run_id: a flight stamps the advice run it holds; a different run's id (a
+// stale flight of an earlier judge/review run whose generation collides) is a 409 stale_claim
+// with nothing written, a non-uuid is a 400, and the authorized run's id lands.
+func TestAdvicePostAdviceRunID(t *testing.T) {
+	for _, tc := range adviceCases {
+		t.Run(tc.name+"/mismatch is 409 stale_claim", func(t *testing.T) {
+			st := newAdviceFakeStore()
+			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
+			extra := `,"claim_generation":1,"advice_run_id":"` + uuid.NewString() + `"`
+			rec := advicePost(adviceRouter(st, wkr), st.targetID, tc.path, adviceBody(tc.body, extra))
+			if rec.Code != http.StatusConflict || adviceDisposition(rec) != "stale_claim" {
+				t.Fatalf("mismatched advice_run_id = %d %s, want 409 disposition stale_claim", rec.Code, rec.Body.String())
+			}
+			if st.reviewParams != nil || st.taskParams != nil {
+				t.Fatal("a mismatched advice_run_id must write nothing")
+			}
+		})
+		t.Run(tc.name+"/malformed is 400", func(t *testing.T) {
+			st := newAdviceFakeStore()
+			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
+			rec := advicePost(adviceRouter(st, wkr), st.targetID, tc.path,
+				adviceBody(tc.body, `,"claim_generation":1,"advice_run_id":"not-a-uuid"`))
+			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "advice_run_id") {
+				t.Fatalf("malformed advice_run_id = %d %s, want 400 naming advice_run_id", rec.Code, rec.Body.String())
+			}
+			if st.reviewParams != nil || st.taskParams != nil {
+				t.Fatal("a malformed advice_run_id must write nothing")
+			}
+		})
+		t.Run(tc.name+"/matching id lands", func(t *testing.T) {
+			st := newAdviceFakeStore()
+			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
+			extra := `,"claim_generation":1,"advice_run_id":"` + st.adviceRunID.String() + `"`
+			rec := advicePost(adviceRouter(st, wkr), st.targetID, tc.path, adviceBody(tc.body, extra))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("matching advice_run_id = %d %s, want 200", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}

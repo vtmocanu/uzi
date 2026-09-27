@@ -335,18 +335,22 @@ describe("ReviewRunner", () => {
   });
 
   // Issue #1423: the runner hands postTaskReview the claim's generation for the server fence.
-  it("passes the claim generation to postTaskReview (issue #1423)", async () => {
+  it("passes the claim generation and the review run id to postTaskReview (issue #1423)", async () => {
     let gotGeneration: number | undefined;
+    let gotRunId: string | undefined;
     const client = {
       reportState: async (_id: string, body: StateRequest) => ({ applied: true, status: body.status }) as never,
-      postTaskReview: async (_id: string, _review: TaskReviewRequest, claimGeneration?: number) => {
+      postTaskReview: async (_id: string, _review: TaskReviewRequest, claimGeneration?: number, adviceRunId?: string) => {
         gotGeneration = claimGeneration;
+        gotRunId = adviceRunId;
       },
     } as unknown as WorkerClient;
     const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
     const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
-    await runner.execute(reviewClaim({ claim_generation: 6 }));
+    const claim = reviewClaim({ claim_generation: 6 });
+    await runner.execute(claim);
     assert.equal(gotGeneration, 6, "postTaskReview receives the claim's generation");
+    assert.equal(gotRunId, claim.run_id, "postTaskReview receives the review run's own id (advice_run_id)");
   });
 
   // Issue #1423: a supersession landing after the pre-post probe is refused by the server fence

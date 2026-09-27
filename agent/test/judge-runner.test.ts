@@ -368,20 +368,24 @@ describe("JudgeRunner", () => {
 
   // Issue #1423: the server fences postReview on the judge run's claim generation, so the runner
   // hands it the claim's generation (the client's send-gate decides whether it goes on the wire).
-  it("passes the claim generation to postReview (issue #1423)", async () => {
+  it("passes the claim generation and the judge run id to postReview (issue #1423)", async () => {
     let gotGeneration: number | undefined;
+    let gotRunId: string | undefined;
     const client = {
       getTrace: async () => emptyTrace,
-      postReview: async (_id: string, _review: ReviewRequest, claimGeneration?: number) => {
+      postReview: async (_id: string, _review: ReviewRequest, claimGeneration?: number, adviceRunId?: string) => {
         gotGeneration = claimGeneration;
+        gotRunId = adviceRunId;
       },
       reportState: async (_id: string, body: StateRequest) => ({ applied: true, status: body.status }) as never,
       postMessages: async () => {},
     } as unknown as WorkerClient;
     const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
     const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn(modelJson) });
-    await runner.execute(judgeClaim({ claim_generation: 6 }));
+    const claim = judgeClaim({ claim_generation: 6 });
+    await runner.execute(claim);
     assert.equal(gotGeneration, 6, "postReview receives the claim's generation");
+    assert.equal(gotRunId, claim.run_id, "postReview receives the judge run's own id (advice_run_id)");
   });
 
   // Issue #1423: a supersession landing AFTER the pre-post probe is caught by the server fence,

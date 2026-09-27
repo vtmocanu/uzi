@@ -135,8 +135,11 @@ LIMIT @lim;
 --
 -- Issue #1423: the write is FENCED on the JUDGE (advice) run's claim, mirroring the
 -- InsertRunMessage fence. When @judge_run_id is NOT NULL (every production caller), the
--- review lands ONLY while that judge run's claim is UNRELEASED (claim_released_at IS NULL)
--- and, when the caller stamps @claim_generation, still at that generation. A superseded
+-- review lands ONLY while that judge run is still claimed by the posting worker (@worker_id,
+-- checked in this statement so a release + reclaim by another worker between the service's
+-- authorize read and this write cannot let a legacy unstamped post through), its claim is
+-- UNRELEASED (claim_released_at IS NULL) and, when the caller stamps @claim_generation, still
+-- at that generation. A superseded
 -- flight (stale requeue + same-worker reclaim bumped runs.claim_generation) or a released
 -- one therefore writes NOTHING: `upserted` yields no row, `cleared` deletes nothing,
 -- `inserted` is guarded by EXISTS(upserted) so no recommendation row lands, and the final
@@ -151,6 +154,7 @@ LIMIT @lim;
 WITH live AS (
     SELECT r.id FROM runs r
     WHERE r.id = sqlc.narg('judge_run_id')::uuid
+      AND r.worker_id = sqlc.arg('worker_id')::uuid
       AND r.claim_released_at IS NULL
       AND (sqlc.narg('claim_generation')::bigint IS NULL
            OR r.claim_generation = sqlc.narg('claim_generation')::bigint)

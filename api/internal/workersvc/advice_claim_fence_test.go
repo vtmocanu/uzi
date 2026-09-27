@@ -36,7 +36,7 @@ func TestPostReviewPassesAdviceRunAndClaimGeneration(t *testing.T) {
 	fs := judgeFenceStore(owner, judgeID, target)
 	svc := New(fs, newBox(t), testParams())
 	if _, err := svc.PostReview(context.Background(), capabilityWorker(), target,
-		ReviewSubmission{Verdict: "ok", Status: "complete"}, i64(7)); err != nil {
+		ReviewSubmission{Verdict: "ok", Status: "complete"}, AdviceClaim{Generation: i64(7)}); err != nil {
 		t.Fatalf("PostReview: %v", err)
 	}
 	got := fs.upsertedReview
@@ -56,7 +56,7 @@ func TestPostReviewLegacyNilGenerationIsUnstamped(t *testing.T) {
 	fs := judgeFenceStore(owner, judgeID, target)
 	svc := New(fs, newBox(t), testParams())
 	if _, err := svc.PostReview(context.Background(), worker(), target,
-		ReviewSubmission{Verdict: "ok", Status: "complete"}, nil); err != nil {
+		ReviewSubmission{Verdict: "ok", Status: "complete"}, AdviceClaim{}); err != nil {
 		t.Fatalf("legacy PostReview: %v", err)
 	}
 	if fs.upsertedReview == nil || fs.upsertedReview.ClaimGeneration.Valid {
@@ -75,7 +75,7 @@ func TestPostReviewFencedOutIsStaleClaim(t *testing.T) {
 	_, err := svc.PostReview(context.Background(), capabilityWorker(), target, ReviewSubmission{
 		Verdict: "issues", Status: "complete",
 		Recommendations: []ReviewRecommendation{{Category: "enable_tool", Target: "gh", RationaleMd: "r"}},
-	}, i64(3))
+	}, AdviceClaim{Generation: i64(3)})
 	if !errors.Is(err, ErrStaleClaim) {
 		t.Fatalf("err = %v, want ErrStaleClaim", err)
 	}
@@ -89,7 +89,7 @@ func TestPostReviewCapabilityWorkerMissingGeneration(t *testing.T) {
 	fs := judgeFenceStore(owner, judgeID, target)
 	svc := New(fs, newBox(t), testParams())
 	_, err := svc.PostReview(context.Background(), capabilityWorker(), target,
-		ReviewSubmission{Verdict: "ok", Status: "complete"}, nil)
+		ReviewSubmission{Verdict: "ok", Status: "complete"}, AdviceClaim{})
 	if !errors.Is(err, ErrMissingClaimGeneration) {
 		t.Fatalf("err = %v, want ErrMissingClaimGeneration", err)
 	}
@@ -102,7 +102,7 @@ func TestPostReviewUnauthorizedBeatsMissingGeneration(t *testing.T) {
 	fs := &fakeStore{activeJudgeRunErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())
 	_, err := svc.PostReview(context.Background(), capabilityWorker(), uuid.New(),
-		ReviewSubmission{Verdict: "ok", Status: "complete"}, nil)
+		ReviewSubmission{Verdict: "ok", Status: "complete"}, AdviceClaim{})
 	if !errors.Is(err, ErrRunNotFound) {
 		t.Fatalf("err = %v, want ErrRunNotFound (authorization is checked first)", err)
 	}
@@ -121,7 +121,7 @@ func TestPostTaskReviewPassesAdviceRunAndClaimGeneration(t *testing.T) {
 	fs := taskReviewFenceStore(owner, reviewID, target)
 	svc := New(fs, newBox(t), testParams())
 	if err := svc.PostTaskReview(context.Background(), capabilityWorker(), target,
-		TaskReviewSubmission{Status: "complete"}, i64(9)); err != nil {
+		TaskReviewSubmission{Status: "complete"}, AdviceClaim{Generation: i64(9)}); err != nil {
 		t.Fatalf("PostTaskReview: %v", err)
 	}
 	got := fs.upsertTaskReviewParams
@@ -141,7 +141,7 @@ func TestPostTaskReviewFencedOutIsStaleClaim(t *testing.T) {
 	fs := taskReviewFenceStore(owner, reviewID, target)
 	fs.upsertTaskReviewErr = pgx.ErrNoRows
 	svc := New(fs, newBox(t), testParams())
-	err := svc.PostTaskReview(context.Background(), capabilityWorker(), target, TaskReviewSubmission{Status: "complete"}, i64(2))
+	err := svc.PostTaskReview(context.Background(), capabilityWorker(), target, TaskReviewSubmission{Status: "complete"}, AdviceClaim{Generation: i64(2)})
 	if !errors.Is(err, ErrStaleClaim) {
 		t.Fatalf("err = %v, want ErrStaleClaim", err)
 	}
@@ -151,11 +151,86 @@ func TestPostTaskReviewCapabilityWorkerMissingGeneration(t *testing.T) {
 	owner, reviewID, target := uuid.New(), uuid.New(), uuid.New()
 	fs := taskReviewFenceStore(owner, reviewID, target)
 	svc := New(fs, newBox(t), testParams())
-	err := svc.PostTaskReview(context.Background(), capabilityWorker(), target, TaskReviewSubmission{Status: "complete"}, nil)
+	err := svc.PostTaskReview(context.Background(), capabilityWorker(), target, TaskReviewSubmission{Status: "complete"}, AdviceClaim{})
 	if !errors.Is(err, ErrMissingClaimGeneration) {
 		t.Fatalf("err = %v, want ErrMissingClaimGeneration", err)
 	}
 	if fs.upsertTaskReviewParams != nil {
 		t.Fatal("a capability worker's unstamped post must write nothing")
+	}
+}
+
+func TestPostTaskReviewUnauthorizedBeatsMissingGeneration(t *testing.T) {
+	fs := &fakeStore{activeTaskReviewRunErr: pgx.ErrNoRows}
+	svc := New(fs, newBox(t), testParams())
+	err := svc.PostTaskReview(context.Background(), capabilityWorker(), uuid.New(),
+		TaskReviewSubmission{Status: "complete"}, AdviceClaim{})
+	if !errors.Is(err, ErrRunNotFound) {
+		t.Fatalf("err = %v, want ErrRunNotFound (authorization is checked first)", err)
+	}
+	if fs.upsertTaskReviewParams != nil {
+		t.Fatal("an unauthorized post must write nothing")
+	}
+}
+
+// Issue #1423 advice_run_id: generations are per-run counters, so the flight also stamps the
+// advice run it holds. A stamped id that is not the authorized (active) advice run is a stale
+// flight of an earlier run and is refused before any write; the matching id passes, and the
+// posting worker's id reaches the in-statement ownership fence.
+func TestAdviceRunIDFence(t *testing.T) {
+	type lane struct {
+		name string
+		// post runs the lane against a fresh store authorizing adviceID and reports whether
+		// the upsert was reached, plus the WorkerID the upsert received.
+		post func(t *testing.T, wkr store.Worker, adviceID uuid.UUID, claim AdviceClaim) (wrote bool, gotWorker uuid.UUID, err error)
+	}
+	lanes := []lane{
+		{"judge review", func(t *testing.T, wkr store.Worker, adviceID uuid.UUID, claim AdviceClaim) (bool, uuid.UUID, error) {
+			target := uuid.New()
+			fs := judgeFenceStore(wkr.UserID, adviceID, target)
+			_, err := New(fs, newBox(t), testParams()).PostReview(context.Background(), wkr, target,
+				ReviewSubmission{Verdict: "ok", Status: "complete"}, claim)
+			if fs.upsertedReview == nil {
+				return false, uuid.Nil, err
+			}
+			return true, fs.upsertedReview.WorkerID, err
+		}},
+		{"task review", func(t *testing.T, wkr store.Worker, adviceID uuid.UUID, claim AdviceClaim) (bool, uuid.UUID, error) {
+			target := uuid.New()
+			fs := taskReviewFenceStore(wkr.UserID, adviceID, target)
+			err := New(fs, newBox(t), testParams()).PostTaskReview(context.Background(), wkr, target,
+				TaskReviewSubmission{Status: "complete"}, claim)
+			if fs.upsertTaskReviewParams == nil {
+				return false, uuid.Nil, err
+			}
+			return true, fs.upsertTaskReviewParams.WorkerID, err
+		}},
+	}
+	for _, l := range lanes {
+		t.Run(l.name+"/mismatched id is stale", func(t *testing.T) {
+			other := uuid.New()
+			wrote, _, err := l.post(t, capabilityWorker(), uuid.New(), AdviceClaim{Generation: i64(1), RunID: &other})
+			if !errors.Is(err, ErrStaleClaim) || wrote {
+				t.Fatalf("err = %v wrote = %v, want ErrStaleClaim and no write", err, wrote)
+			}
+		})
+		t.Run(l.name+"/missing generation beats a mismatched id", func(t *testing.T) {
+			other := uuid.New()
+			wrote, _, err := l.post(t, capabilityWorker(), uuid.New(), AdviceClaim{RunID: &other})
+			if !errors.Is(err, ErrMissingClaimGeneration) || wrote {
+				t.Fatalf("err = %v wrote = %v, want ErrMissingClaimGeneration and no write", err, wrote)
+			}
+		})
+		t.Run(l.name+"/matching id lands with the posting worker fenced", func(t *testing.T) {
+			adviceID := uuid.New()
+			wkr := capabilityWorker()
+			wrote, gotWorker, err := l.post(t, wkr, adviceID, AdviceClaim{Generation: i64(1), RunID: &adviceID})
+			if err != nil || !wrote {
+				t.Fatalf("err = %v wrote = %v, want a write", err, wrote)
+			}
+			if gotWorker != wkr.ID {
+				t.Fatalf("upsert worker_id = %v, want the posting worker %v", gotWorker, wkr.ID)
+			}
+		})
 	}
 }

@@ -237,9 +237,11 @@ export class ReviewRunner {
       // plus a same-worker reclaim (concurrency 2) advances the run to G+1 mid-flight. Re-probe with
       // an idempotent running report (SetRunRunning preserves status_since) before the advice
       // write; a stale ack abandons before postTaskReview. This probe is now the FAST PATH: the
-      // guard is the server fence (issue #1423), which checks the review run's claim generation and
-      // unreleased claim atomically in the same statement as the review upsert, so a supersession
-      // landing between this probe and the post is refused there (409 stale_claim, handled below).
+      // guard is the server fence (issue #1423), which checks the review run's claim generation,
+      // unreleased claim and owning worker atomically in the same statement as the review upsert
+      // (and the stamped run id against the authorized run, so an EARLIER run's colliding generation
+      // cannot land under a re-run), so a supersession landing between this probe and the post is
+      // refused there (409 stale_claim, handled below).
       // A probe throw still PROPAGATES to the advice-phase catch (safeReportFailed, itself
       // generation-fenced), posting NO review: ownership is unknown during a transport failure,
       // and in the api-unreachable case postTaskReview would fail anyway.
@@ -254,7 +256,7 @@ export class ReviewRunner {
         return;
       }
       try {
-        await this.client.postTaskReview(targetId, review, claim.claim_generation);
+        await this.client.postTaskReview(targetId, review, claim.claim_generation, reviewRunId);
       } catch (err) {
         // Issue #1423: the server fence refused the write because this flight's claim was
         // superseded (reclaimed at a newer generation) or released. Nothing was persisted and the

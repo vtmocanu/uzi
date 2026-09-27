@@ -75,6 +75,35 @@ type ReviewResult struct {
 	ReviewID uuid.UUID
 }
 
+// AdviceClaim is the claim a judge or task-review flight stamps on its advice POST (issue
+// #1423). Both fields are optional on the wire (nil = not stamped).
+//   - Generation is the advice run's claim_generation the flight holds; the upsert is fenced
+//     on it in the same statement as the write.
+//   - RunID is the advice run the flight holds. Generations are PER-RUN counters, so a stale
+//     flight of an earlier judge run A (gen 1) and a re-judge B of the same target claimed by
+//     the same worker (also gen 1) would otherwise be indistinguishable: authorization
+//     resolves (worker, target) to the ACTIVE run B, and A's generation would match B's.
+//     Stamping the run id makes that post ErrStaleClaim instead of landing under B.
+type AdviceClaim struct {
+	Generation *int64
+	RunID      *uuid.UUID
+}
+
+// checkAdviceClaim applies the pre-write half of the advice-post fence, AFTER authorization
+// (ErrRunNotFound wins over everything here): a credential_switch_v1 worker that omits the
+// generation is ErrMissingClaimGeneration, then a stamped advice run id that is not the
+// authorized advice run is ErrStaleClaim. The generation / unreleased-claim / owning-worker
+// half runs inside the upsert itself.
+func checkAdviceClaim(wkr store.Worker, adviceRunID uuid.UUID, claim AdviceClaim) error {
+	if claim.Generation == nil && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+		return ErrMissingClaimGeneration
+	}
+	if claim.RunID != nil && *claim.RunID != adviceRunID {
+		return ErrStaleClaim
+	}
+	return nil
+}
+
 // PostReview persists a judge's review of a target run (PRD #46 Decision 5) — the
 // worker's write-back at judge-run completion. Authorization is judge-run-scoped
 // (authorizeJudgeTrace): the caller's worker must own the active judge run reviewing
@@ -85,20 +114,18 @@ type ReviewResult struct {
 // Returns the owner + review id so the caller can notify persist-first (the review is
 // the durable source of truth; the notification is a best-effort surface layered on).
 //
-// Issue #1423: the write is fenced on the JUDGE run's claim, mirroring the message fence.
-// claimGen is the generation the posting flight holds (nil = not stamped). A capability
-// worker (capability.CredentialSwitchV1) MUST stamp it, so a nil claimGen from one is
-// refused with ErrMissingClaimGeneration before anything is written; a legacy worker's nil
-// claimGen is honoured on a live (unreleased) claim only. The upsert persists nothing when
-// the judge run's claim is released or at a different generation, and that no-row outcome
-// surfaces as ErrStaleClaim (the auto-dismiss net is skipped: there is no fresh review).
-func (s *Service) PostReview(ctx context.Context, wkr store.Worker, targetID uuid.UUID, sub ReviewSubmission, claimGen *int64) (ReviewResult, error) {
+// Issue #1423: the write is fenced on the JUDGE run's claim, mirroring the message fence
+// (see AdviceClaim and checkAdviceClaim). The upsert persists nothing when the judge run is
+// no longer claimed by wkr, its claim is released, or it is at a different generation, and
+// that no-row outcome surfaces as ErrStaleClaim (the auto-dismiss net is skipped: there is
+// no fresh review).
+func (s *Service) PostReview(ctx context.Context, wkr store.Worker, targetID uuid.UUID, sub ReviewSubmission, claim AdviceClaim) (ReviewResult, error) {
 	judge, target, err := s.authorizeJudgeTrace(ctx, wkr, targetID)
 	if err != nil {
 		return ReviewResult{}, err
 	}
-	if claimGen == nil && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
-		return ReviewResult{}, ErrMissingClaimGeneration
+	if err := checkAdviceClaim(wkr, judge.ID, claim); err != nil {
+		return ReviewResult{}, err
 	}
 	recs := sub.Recommendations
 	if recs == nil {
@@ -119,7 +146,8 @@ func (s *Service) PostReview(ctx context.Context, wkr store.Worker, targetID uui
 		ProducedByRunID:  pgconv.UUID(judge.ID),
 		ProducedByUserID: pgconv.UUID(target.UserID),
 		Recommendations:  recsJSON,
-		ClaimGeneration:  pgconv.Int8Ptr(claimGen),
+		ClaimGeneration:  pgconv.Int8Ptr(claim.Generation),
+		WorkerID:         wkr.ID,
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

@@ -713,14 +713,15 @@ const upsertRunReviewWithRecommendations = `-- name: UpsertRunReviewWithRecommen
 WITH live AS (
     SELECT r.id FROM runs r
     WHERE r.id = $1::uuid
+      AND r.worker_id = $2::uuid
       AND r.claim_released_at IS NULL
-      AND ($2::bigint IS NULL
-           OR r.claim_generation = $2::bigint)
+      AND ($3::bigint IS NULL
+           OR r.claim_generation = $3::bigint)
     FOR SHARE
 ),
 upserted AS (
     INSERT INTO run_reviews (target_run_id, judge_run_id, user_id, verdict, summary_md, judge_model, status)
-    SELECT $3, $1::uuid, $4, $5, $6, $7, $8
+    SELECT $4, $1::uuid, $5, $6, $7, $8, $9
     WHERE $1::uuid IS NULL OR EXISTS (SELECT 1 FROM live)
     ON CONFLICT (target_run_id) DO UPDATE
         SET judge_run_id = EXCLUDED.judge_run_id,
@@ -738,8 +739,8 @@ inserted AS (
     INSERT INTO review_recommendations
         (review_id, category, target, rationale_md, confidence, produced_by_run_id, produced_by_user_id)
     SELECT (SELECT id FROM upserted), x.category, x.target, x.rationale_md, x.confidence,
-           $9, $10
-    FROM jsonb_to_recordset($11::jsonb)
+           $10, $11
+    FROM jsonb_to_recordset($12::jsonb)
         AS x(category text, target text, rationale_md text, confidence text)
     WHERE EXISTS (SELECT 1 FROM upserted)
 )
@@ -748,6 +749,7 @@ SELECT id FROM upserted
 
 type UpsertRunReviewWithRecommendationsParams struct {
 	JudgeRunID       pgtype.UUID `json:"judge_run_id"`
+	WorkerID         uuid.UUID   `json:"worker_id"`
 	ClaimGeneration  pgtype.Int8 `json:"claim_generation"`
 	TargetRunID      uuid.UUID   `json:"target_run_id"`
 	UserID           uuid.UUID   `json:"user_id"`
@@ -770,8 +772,11 @@ type UpsertRunReviewWithRecommendationsParams struct {
 //
 // Issue #1423: the write is FENCED on the JUDGE (advice) run's claim, mirroring the
 // InsertRunMessage fence. When @judge_run_id is NOT NULL (every production caller), the
-// review lands ONLY while that judge run's claim is UNRELEASED (claim_released_at IS NULL)
-// and, when the caller stamps @claim_generation, still at that generation. A superseded
+// review lands ONLY while that judge run is still claimed by the posting worker (@worker_id,
+// checked in this statement so a release + reclaim by another worker between the service's
+// authorize read and this write cannot let a legacy unstamped post through), its claim is
+// UNRELEASED (claim_released_at IS NULL) and, when the caller stamps @claim_generation, still
+// at that generation. A superseded
 // flight (stale requeue + same-worker reclaim bumped runs.claim_generation) or a released
 // one therefore writes NOTHING: `upserted` yields no row, `cleared` deletes nothing,
 // `inserted` is guarded by EXISTS(upserted) so no recommendation row lands, and the final
@@ -786,6 +791,7 @@ type UpsertRunReviewWithRecommendationsParams struct {
 func (q *Queries) UpsertRunReviewWithRecommendations(ctx context.Context, arg UpsertRunReviewWithRecommendationsParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, upsertRunReviewWithRecommendations,
 		arg.JudgeRunID,
+		arg.WorkerID,
 		arg.ClaimGeneration,
 		arg.TargetRunID,
 		arg.UserID,

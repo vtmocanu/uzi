@@ -120,7 +120,7 @@ func TestPostReviewAutoDismissesDeniedCLILiveDB(t *testing.T) {
 		 VALUES ($1, $2, 'gh', 'done', 'human-hash', $3)`, reviewID, catInstall, owner)
 
 	// ── the hook under test ──
-	res, err := svc.PostReview(ctx, store.Worker{ID: workerID, UserID: owner}, targetID, sub, nil)
+	res, err := svc.PostReview(ctx, store.Worker{ID: workerID, UserID: owner}, targetID, sub, workersvc.AdviceClaim{})
 	if err != nil {
 		t.Fatalf("PostReview: %v", err)
 	}

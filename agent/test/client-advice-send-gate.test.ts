@@ -70,10 +70,11 @@ const TASK_REVIEW: TaskReviewRequest = { status: "complete", summary: "s", findi
 const OK = { status: 200, body: { status: "ok" } };
 
 // Both advice posts, driven through one table so each assertion covers judge AND task review.
-const LANES: { name: string; post: (c: WorkerClient, gen?: number) => Promise<void> }[] = [
-  { name: "postReview", post: (c, gen) => c.postReview("target-1", REVIEW, gen) },
-  { name: "postTaskReview", post: (c, gen) => c.postTaskReview("target-1", TASK_REVIEW, gen) },
+const LANES: { name: string; post: (c: WorkerClient, gen?: number, runId?: string) => Promise<void> }[] = [
+  { name: "postReview", post: (c, gen, runId) => c.postReview("target-1", REVIEW, gen, runId) },
+  { name: "postTaskReview", post: (c, gen, runId) => c.postTaskReview("target-1", TASK_REVIEW, gen, runId) },
 ];
+const ADVICE_RUN = "11111111-2222-4333-8444-555555555555";
 
 describe("advice post send-gate (issue #1423)", () => {
   for (const lane of LANES) {
@@ -154,14 +155,67 @@ describe("advice post send-gate (issue #1423)", () => {
     });
   }
 
+  for (const lane of LANES) {
+    it(`${lane.name}: advice_run_id rides with claim_generation`, async () => {
+      const srv = await adviceServer({ worker_id: "w1" }, () => OK);
+      try {
+        const client = clientFor(srv.url);
+        await client.register("cap", undefined, 1, undefined, ["credential_switch_v1"]);
+        await lane.post(client, 7, ADVICE_RUN);
+        assert.equal(srv.posts[0]!.body.claim_generation, 7);
+        assert.equal(srv.posts[0]!.body.advice_run_id, ADVICE_RUN);
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it(`${lane.name}: advice_run_id is omitted whenever claim_generation is (gen 0, bare worker)`, async () => {
+      const srv = await adviceServer({ worker_id: "w1" }, () => OK);
+      try {
+        const cap = clientFor(srv.url);
+        await cap.register("cap", undefined, 1, undefined, ["credential_switch_v1"]);
+        await lane.post(cap, 0, ADVICE_RUN);
+        const bare = clientFor(srv.url);
+        await bare.register("bare");
+        await lane.post(bare, 5, ADVICE_RUN);
+        assert.equal(srv.posts.length, 2);
+        for (const p of srv.posts) {
+          assert.equal("claim_generation" in p.body, false);
+          assert.equal("advice_run_id" in p.body, false, "advice_run_id never rides without the generation");
+        }
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it(`${lane.name}: the strict-decode retry strips advice_run_id together with claim_generation`, async () => {
+      const srv = await adviceServer({ worker_id: "w1" }, (_b, attempt) =>
+        attempt === 0 ? { status: 400, body: { error: "invalid request body" } } : OK,
+      );
+      try {
+        const client = clientFor(srv.url);
+        await client.register("cap", undefined, 1, undefined, ["credential_switch_v1"]);
+        await lane.post(client, 4, ADVICE_RUN);
+        assert.equal(srv.posts.length, 2, "one stamped attempt + one stripped retry");
+        assert.equal(srv.posts[0]!.body.claim_generation, 4);
+        assert.equal(srv.posts[0]!.body.advice_run_id, ADVICE_RUN);
+        assert.equal("claim_generation" in srv.posts[1]!.body, false);
+        assert.equal("advice_run_id" in srv.posts[1]!.body, false, "the retry stripped both fields");
+      } finally {
+        await srv.close();
+      }
+    });
+  }
+
   it("does not mutate the caller's request object", async () => {
     const srv = await adviceServer({ worker_id: "w1" }, () => OK);
     try {
       const client = clientFor(srv.url);
       await client.register("cap", undefined, 1, undefined, ["credential_switch_v1"]);
       const review: ReviewRequest = { ...REVIEW };
-      await client.postReview("target-1", review, 9);
+      await client.postReview("target-1", review, 9, ADVICE_RUN);
       assert.equal("claim_generation" in review, false);
+      assert.equal("advice_run_id" in review, false);
       assert.equal(srv.posts[0]!.body.claim_generation, 9);
     } finally {
       await srv.close();

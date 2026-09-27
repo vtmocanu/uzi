@@ -355,7 +355,7 @@ func TestPostReviewPersistsVerdictAndRecs(t *testing.T) {
 	res, err := svc.PostReview(context.Background(), worker(), target, ReviewSubmission{
 		Verdict: "issues", SummaryMd: "needs a tool", JudgeModel: "haiku", Status: "complete",
 		Recommendations: []ReviewRecommendation{{Category: "install_worker_tool", Target: "shellcheck", RationaleMd: "missing", Confidence: "high"}},
-	}, nil)
+	}, AdviceClaim{})
 	if err != nil {
 		t.Fatalf("PostReview: %v", err)
 	}
@@ -588,7 +588,7 @@ func TestSubmitInputRejectServerSideCapsReason(t *testing.T) {
 func TestPostReviewRejectsUnauthorizedWorker(t *testing.T) {
 	fs := &fakeStore{activeJudgeRunErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())
-	_, err := svc.PostReview(context.Background(), worker(), uuid.New(), ReviewSubmission{Verdict: "ok", Status: "complete"}, nil)
+	_, err := svc.PostReview(context.Background(), worker(), uuid.New(), ReviewSubmission{Verdict: "ok", Status: "complete"}, AdviceClaim{})
 	if err != ErrRunNotFound {
 		t.Fatalf("err = %v, want ErrRunNotFound (no active judge run for this worker/target)", err)
 	}
