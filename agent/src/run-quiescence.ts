@@ -24,7 +24,9 @@
 //       ppid chain, process group or session leading to (or being) a recorded root of ANOTHER
 //       live attempt (a Claude CLI group or a Codex provider supervisor), or a long-lived
 //       runner-uid root the worker itself launched and recorded, is out of scope; anything else
-//       is `unverified`.
+//       is `unverified`. A root is recorded as its pid AND its start time (`stat` field 22,
+//       captured at spawn/registration) and matches only a live process with both, so a pid the
+//       kernel recycled after the root exited never exempts anything.
 //   R3  SCOPE first. A process is in scope iff its UZI_RUN_CLONE_KEY equals the target key or its
 //       cwd lies (by whole path components) within a target path. Out of scope is ignored
 //       entirely, so two unrelated healthy runs never interact. In scope, by marker: this
@@ -50,7 +52,7 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { cloneKeyOf, formatAttemptId, isWithinPath } from "./attempt-path.js";
@@ -61,14 +63,17 @@ import {
   RUN_ATTEMPT_ENV,
   RUN_CLONE_KEY_ENV,
   WORKER_SPAWN_ENV,
+  statStartTime,
   workerRunnerRootPids,
   workerSpawnEnv,
   workerSpawnNonce,
+  type RecordedRoot,
 } from "./worker-spawn-mark.js";
 
 // ─── Log sanitization ──────────────────────────────────────────────────────────────────────
 
-/** C0/C1 controls, DEL, and the bidi embedding/override/isolate/mark code points. */
+/** C0/C1 controls, DEL, the U+2028/U+2029 line/paragraph separators (a line break to a JSON log
+ *  reader or a JS-string sink), and the bidi embedding/override/isolate/mark code points. */
 function unsafeCodePoint(c: number): boolean {
   return (
     c < 0x20 ||
@@ -76,6 +81,8 @@ function unsafeCodePoint(c: number): boolean {
     c === 0x061c ||
     c === 0x200e ||
     c === 0x200f ||
+    c === 0x2028 ||
+    c === 0x2029 ||
     (c >= 0x202a && c <= 0x202e) ||
     (c >= 0x2066 && c <= 0x2069)
   );
@@ -89,9 +96,12 @@ function unsafeCodePoint(c: number): boolean {
  */
 export function sanitizeForLog(text: string, max = 256): string {
   let out = "";
+  // Iterating a string yields whole code points, so a surrogate pair is appended or dropped as a
+  // unit (never split), and `...` marks only a string that really had more to say.
   for (const ch of String(text)) {
-    out += unsafeCodePoint(ch.codePointAt(0) ?? 0) ? "?" : ch;
-    if (out.length >= max) return `${out.slice(0, max)}...`;
+    const safe = unsafeCodePoint(ch.codePointAt(0) ?? 0) ? "?" : ch;
+    if (out.length + safe.length > max) return `${out}...`;
+    out += safe;
   }
   return out;
 }
@@ -102,8 +112,9 @@ export function sanitizeForLog(text: string, max = 256): string {
 export interface RunAttempt extends SdkAttemptEnv {
   runId: string;
   attemptId: string;
-  /** The recorded CLI root pids (process-group leaders) of this attempt not yet reaped. */
-  recordedRootPids: () => number[];
+  /** The recorded CLI roots (process-group leaders, pid + start time) of this attempt not yet
+   *  reaped. */
+  recordedRootPids: () => RecordedRoot[];
 }
 
 /** Mint a fresh attempt for `runId` running in `clonePath`. */
@@ -111,7 +122,7 @@ export function newRunAttempt(
   runId: string,
   claimGeneration: number | undefined,
   clonePath: string,
-  recordedRootPids: () => number[],
+  recordedRootPids: () => RecordedRoot[],
   now: Date = new Date(),
 ): RunAttempt {
   const attemptId = formatAttemptId(now, claimGeneration, randomBytes(8).toString("hex"));
@@ -199,6 +210,8 @@ interface StatFacts {
   ppid: number;
   pgid: number;
   sid: number;
+  /** Field 22, or undefined when the line carries none. */
+  startTime: number | undefined;
 }
 
 function parseStat(text: string): StatFacts | undefined {
@@ -210,7 +223,7 @@ function parseStat(text: string): StatFacts | undefined {
   const pgid = Number(fields[2]);
   const sid = Number(fields[3]);
   if (![ppid, pgid, sid].every(Number.isInteger)) return undefined;
-  return { ppid, pgid, sid };
+  return { ppid, pgid, sid, startTime: statStartTime(text) };
 }
 
 function parseEnviron(text: string): Map<string, string> {
@@ -246,9 +259,10 @@ export interface ScanRequest {
   ownMarker?: string;
   /** Markers of every OTHER live attempt on this worker. */
   liveMarkers: string[];
-  /** Recorded root pids of every OTHER live attempt on this worker (Claude CLI groups, Codex
-   *  provider supervisors), plus the long-lived runner-uid roots the worker itself launched. */
-  liveRootPids: number[];
+  /** Recorded roots (pid + start time) of every OTHER live attempt on this worker (Claude CLI
+   *  groups, Codex provider supervisors), plus the long-lived runner-uid roots the worker itself
+   *  launched. A root matches only while a live process has BOTH its pid and its start time. */
+  liveRoots: RecordedRoot[];
   /** This worker's spawn nonce: a process carrying it is never run-owned. */
   workerNonce: string;
 }
@@ -285,17 +299,45 @@ function ancestorsOf(pid: number, table: ProcTable): number[] {
   return out;
 }
 
+/** Recorded roots by pid → the start times recorded for that pid. */
+type RootIndex = ReadonlyMap<number, ReadonlySet<number>>;
+
+function indexRoots(roots: readonly RecordedRoot[]): RootIndex {
+  const out = new Map<number, Set<number>>();
+  for (const root of roots) {
+    const times = out.get(root.pid) ?? new Set<number>();
+    times.add(root.startTime);
+    out.set(root.pid, times);
+  }
+  return out;
+}
+
+/** True when `candidate` is a live process that IS a recorded root: its pid is recorded AND its
+ *  current start time equals the one recorded. A recycled pid (same number, a later start time)
+ *  never matches, and neither does a root that is gone (its start time cannot be read). */
+function isRecordedRoot(candidate: number, table: ProcTable, roots: RootIndex): boolean {
+  const recorded = roots.get(candidate);
+  if (recorded === undefined) return false;
+  const r = tryRead(() => table.readStat(candidate));
+  const startTime = r.ok ? parseStat(r.value)?.startTime : undefined;
+  return startTime !== undefined && recorded.has(startTime);
+}
+
 /** True when an unreadable pid IS, or leads by ppid chain, process group or session to, a recorded
- *  root of another live attempt or a worker-launched runner-uid root. */
-function attributedToOtherLive(pid: number, table: ProcTable, roots: ReadonlySet<number>): boolean {
+ *  root of another live attempt or a worker-launched runner-uid root (pid AND start time). */
+function attributedToOtherLive(pid: number, table: ProcTable, roots: RootIndex): boolean {
   if (roots.size === 0) return false;
-  if (roots.has(pid)) return true;
+  const candidates = new Set<number>([pid]);
   const r = tryRead(() => table.readStat(pid));
   if (r.ok) {
     const facts = parseStat(r.value);
-    if (facts && (roots.has(facts.pgid) || roots.has(facts.sid))) return true;
+    if (facts) {
+      candidates.add(facts.pgid);
+      candidates.add(facts.sid);
+    }
   }
-  return ancestorsOf(pid, table).some((a) => roots.has(a));
+  for (const a of ancestorsOf(pid, table)) candidates.add(a);
+  return [...candidates].some((c) => isRecordedRoot(c, table, roots));
 }
 
 /** One pass over the process table. Pure apart from the reads; signals nothing. */
@@ -330,7 +372,7 @@ export function scanOnce(
     return false;
   };
   const liveMarkers = new Set(req.liveMarkers);
-  const roots = new Set(req.liveRootPids);
+  const roots = indexRoots(req.liveRoots);
 
   for (const pid of pids) {
     if (excluded.has(pid)) continue;
@@ -505,38 +547,107 @@ const defaultHelperSpawn: HelperSpawn = (command, args, opts) =>
   spawn(command, args, { cwd: opts.cwd, env: opts.env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
 
 /** The helper's private TMPDIR: made fresh (mode 0700, owned by the uid the helper runs as)
- *  before every helper start and removed after it. Injectable for tests. */
+ *  before every helper start and removed after it. Injectable for tests; either method may be
+ *  synchronous or return a promise. */
 export interface HelperTmp {
-  make(): string;
-  remove(dir: string): void;
+  make(): string | Promise<string>;
+  remove(dir: string): void | Promise<void>;
+}
+
+/** How a helper-TMPDIR command (mktemp / rm) is wrapped to run as the runner: `runnerCommand`
+ *  in production, injectable so a test can drive the uid-split branch on a single-uid host. */
+type RunnerWrap = (command: string, args: string[]) => { command: string; args: string[] };
+
+const HELPER_TMP_MAKE_TIMEOUT_MS = 5_000;
+const HELPER_TMP_REMOVE_TIMEOUT_MS = 10_000;
+
+/**
+ * Run one fixed, worker-authored command (as the runner, through `wrap`) ASYNCHRONOUSLY, with the
+ * worker mark, stdout captured (bounded) and a hard timeout: a hung mktemp or rm never blocks the
+ * worker's event loop (a spawnSync would, for up to its whole timeout, stalling every other run's
+ * heartbeat and sink) and never outlives its deadline (the group is killed and the call rejects).
+ */
+function runFixedAsRunner(
+  wrap: RunnerWrap,
+  command: string,
+  args: string[],
+  timeoutMs: number,
+): Promise<{ status: number | null; stdout: string }> {
+  const w = wrap(command, args);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const child = spawn(w.command, w.args, {
+      env: workerSpawnEnv({ PATH: HELPER_PATH }),
+      detached: true,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      killRunnerGroup(child.pid);
+      reject(new Error(`${command} as the runner timed out after ${timeoutMs} ms`));
+    }, timeoutMs);
+    let out = "";
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (c: string) => {
+      if (out.length < 64 * 1024) out += c;
+    });
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (status) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ status, stdout: out });
+    });
+  });
+}
+
+/**
+ * The uid-split HelperTmp: the private dir must be the RUNNER's, so `mktemp -d` (mode 0700) and
+ * the final `rm -rf` run as the runner through `wrap`, each asynchronously and time-bounded (see
+ * {@link runFixedAsRunner}). `make` rejects unless mktemp exited 0 with an absolute path strictly
+ * inside `base`. Exported for its test (an injected `wrap` on a single-uid host).
+ */
+export function runnerHelperTmp(
+  base: string,
+  wrap: RunnerWrap = runnerCommand,
+  timeouts: { makeMs?: number; removeMs?: number } = {},
+): { make(): Promise<string>; remove(dir: string): Promise<void> } {
+  return {
+    make: async () => {
+      const r = await runFixedAsRunner(
+        wrap,
+        "mktemp",
+        ["-d", path.join(base, "uzi-quiesce-XXXXXXXXXX")],
+        timeouts.makeMs ?? HELPER_TMP_MAKE_TIMEOUT_MS,
+      );
+      const dir = r.stdout.trim();
+      if (r.status !== 0 || !path.isAbsolute(dir) || !isWithinPath(dir, base) || path.resolve(dir) === path.resolve(base)) {
+        throw new Error(`mktemp as the runner exited ${String(r.status)}`);
+      }
+      return dir;
+    },
+    remove: async (dir) => {
+      await runFixedAsRunner(wrap, "rm", ["-rf", "--", dir], timeouts.removeMs ?? HELPER_TMP_REMOVE_TIMEOUT_MS);
+    },
+  };
 }
 
 const defaultHelperTmp: HelperTmp = {
   make: () => {
     const base = runnerTmpdir() ?? os.tmpdir();
     // Single-uid the helper runs as this process's uid, so a plain mkdtemp (mode 0700) is its own.
-    if (!uidSplitActive()) return fs.mkdtempSync(path.join(base, "uzi-quiesce-"));
-    // Under the split the dir must be the RUNNER's, so mktemp runs as the runner (mode 0700).
-    const w = runnerCommand("mktemp", ["-d", path.join(base, "uzi-quiesce-XXXXXXXXXX")]);
-    const r = spawnSync(w.command, w.args, {
-      env: workerSpawnEnv({ PATH: HELPER_PATH }),
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 5_000,
-    });
-    const dir = String(r.stdout ?? "").trim();
-    if (r.status !== 0 || !path.isAbsolute(dir) || !isWithinPath(dir, base) || path.resolve(dir) === path.resolve(base)) {
-      throw new Error(`mktemp as the runner exited ${String(r.status)}`);
-    }
-    return dir;
+    if (!uidSplitActive()) return fs.promises.mkdtemp(path.join(base, "uzi-quiesce-"));
+    return runnerHelperTmp(base).make();
   },
   remove: (dir) => {
-    if (!uidSplitActive()) {
-      fs.rmSync(dir, { recursive: true, force: true });
-      return;
-    }
-    const w = runnerCommand("rm", ["-rf", "--", dir]);
-    spawnSync(w.command, w.args, { env: workerSpawnEnv({ PATH: HELPER_PATH }), stdio: "ignore", timeout: 10_000 });
+    if (!uidSplitActive()) return fs.promises.rm(dir, { recursive: true, force: true });
+    return runnerHelperTmp(runnerTmpdir() ?? os.tmpdir()).remove(dir);
   },
 };
 
@@ -615,15 +726,17 @@ async function reapProcessesViaHelper(
   const helperTmp = opts.helperTmp ?? defaultHelperTmp;
   let tmpDir: string;
   try {
-    tmpDir = helperTmp.make();
+    tmpDir = await helperTmp.make();
   } catch (err) {
     return unverified(`quiescence helper TMPDIR unavailable: ${(err as Error).message}`);
   }
   const removeTmp = (): void => {
+    // Best effort, not awaited (the verdict does not wait on cleanup): a leftover private dir is
+    // harmless, and a synchronous throw or a rejection is swallowed alike.
     try {
-      helperTmp.remove(tmpDir);
+      void Promise.resolve(helperTmp.remove(tmpDir)).catch(() => undefined);
     } catch {
-      // Best effort: a leftover private dir is harmless.
+      // swallowed, see above
     }
   };
   const wrapped = runnerCommand(process.execPath, argv);
@@ -902,17 +1015,15 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       liveMarkers: others.map((a) => a.marker),
       // Other live attempts' recorded roots (Claude CLI groups, Codex provider supervisors) plus
       // every long-lived runner-uid root this worker launched and recorded itself.
-      liveRootPids: [
-        ...new Set([
-          ...others.flatMap((a) => {
-            try {
-              return a.recordedRootPids();
-            } catch {
-              return [];
-            }
-          }),
-          ...workerRunnerRootPids(),
-        ]),
+      liveRoots: [
+        ...others.flatMap((a) => {
+          try {
+            return a.recordedRootPids();
+          } catch {
+            return [];
+          }
+        }),
+        ...workerRunnerRootPids(),
       ],
       workerNonce: workerSpawnNonce(),
     };
@@ -937,8 +1048,14 @@ function isScanRequest(v: unknown): v is ScanRequest {
     strings(o.targetPaths) &&
     (o.ownMarker === undefined || typeof o.ownMarker === "string") &&
     strings(o.liveMarkers) &&
-    Array.isArray(o.liveRootPids) &&
-    o.liveRootPids.every((n) => Number.isInteger(n)) &&
+    Array.isArray(o.liveRoots) &&
+    o.liveRoots.every(
+      (r) =>
+        typeof r === "object" &&
+        r !== null &&
+        Number.isInteger((r as { pid?: unknown }).pid) &&
+        Number.isSafeInteger((r as { startTime?: unknown }).startTime),
+    ) &&
     typeof o.workerNonce === "string"
   );
 }

@@ -20,7 +20,7 @@ import {
   type ScanRequest,
 } from "../src/run-quiescence.js";
 import { SinkGate } from "../src/sink-gate.js";
-import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV, workerSpawnEnv, workerSpawnNonce } from "../src/worker-spawn-mark.js";
+import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV, recordRoot, workerSpawnEnv, workerSpawnNonce, type RecordedRoot } from "../src/worker-spawn-mark.js";
 
 // issue #1783 (R0/R3/R5 + Docker) — the run-quiescence reaper. Real processes where stated (single
 // uid: the "runner uid" is this test's uid), a fake Docker daemon on a unix socket, and an injected
@@ -75,7 +75,7 @@ function makeClones(name: string, keys: string[]): Record<string, string> {
   return out;
 }
 
-function attemptFor(runId: string, clone: string, roots: () => number[] = () => []): RunAttempt {
+function attemptFor(runId: string, clone: string, roots: () => RecordedRoot[] = () => []): RunAttempt {
   return newRunAttempt(runId, 1, clone, roots);
 }
 
@@ -252,13 +252,13 @@ describe("A-core: a setsid'd agent tool survives killAgentTree; quiesce + retire
     const daemon = await startFakeDaemon(path.join(tmp, "core-docker"));
     try {
       const registry = new LiveAttemptRegistry();
-      let ownRoots: number[] = [];
+      let ownRoots: RecordedRoot[] = [];
       const own = attemptFor("run-17", clones["issue-17"]!, () => ownRoots);
       const sib = attemptFor("run-1769", clones["issue-1769"]!);
       registry.add(own);
       registry.add(sib);
       const ownAgent = await startAgent(own, daemon.socket, path.join(own.clonePath, "data"));
-      ownRoots = [ownAgent.cli.pid!];
+      ownRoots = [recordRoot(ownAgent.cli.pid)!];
       const sibAgent = await startAgent(sib, daemon.socket, path.join(sib.clonePath, "data"));
       assert.ok(await until(() => boundUnder(daemon, own.clonePath).length > 0 && boundUnder(daemon, sib.clonePath).length > 0));
 
@@ -446,7 +446,11 @@ interface FakeProc {
   cwd?: string | "EACCES" | "ENOENT";
   env?: Record<string, string> | "EACCES" | "ENOENT";
   zombie?: boolean;
+  /** `stat` field 22 (start time); default {@link DEFAULT_START}. */
+  start?: number;
 }
+
+const DEFAULT_START = 1000;
 
 function errno(code: string): Error {
   return Object.assign(new Error(code), { code });
@@ -479,7 +483,8 @@ function fakeTable(procs: Record<number, FakeProc>, opts: { listThrows?: boolean
     },
     readStat: (pid) => {
       const p = get(pid);
-      return `${pid} (proc ${pid}) S ${p.ppid ?? 1} ${p.pgid ?? pid} ${p.sid ?? pid} 0 0`;
+      // Fields 3..22 (state … starttime): 15 zero fields sit between the session and field 22.
+      return `${pid} (proc ${pid}) S ${p.ppid ?? 1} ${p.pgid ?? pid} ${p.sid ?? pid} ${"0 ".repeat(15)}${p.start ?? DEFAULT_START} 0 0`;
     },
   };
 }
@@ -496,7 +501,7 @@ function scanReq(own: RunAttempt | undefined, targetPaths: string[], extra: Part
     targetPaths,
     ownMarker: own?.marker,
     liveMarkers: [],
-    liveRootPids: [],
+    liveRoots: [],
     workerNonce: workerSpawnNonce(),
     ...extra,
   };
@@ -510,7 +515,7 @@ function fakeReq(extra: Partial<ScanRequest> = {}): ScanRequest {
     targetPaths: [CLONE],
     ownMarker: "run-17:own",
     liveMarkers: [],
-    liveRootPids: [],
+    liveRoots: [],
     workerNonce: "nonce",
     ...extra,
   };
@@ -605,7 +610,7 @@ describe("A-nondumpable: a runner-uid process whose environ is unreadable", () =
         61: { uid: RUNNER, ppid: root, cwd: "/data/runner/github.com+o+r/issue-99", env: {} },
         62: { uid: RUNNER, cwd: "EACCES", env: "EACCES", ...shape },
       };
-      const { r } = await fakeReap(procs, fakeReq({ liveRootPids: [root], liveMarkers: ["run-99:x"] }));
+      const { r } = await fakeReap(procs, fakeReq({ liveRoots: [{ pid: root, startTime: DEFAULT_START }], liveMarkers: ["run-99:x"] }));
       assert.equal(r.state, "quiescent", JSON.stringify(shape));
     }
   });
@@ -739,6 +744,26 @@ describe("A-docker: the teardown never claims quiescence", () => {
       release();
       await late;
       assert.equal(boundUnder(daemon, clones["issue-17"]!).length, 1, "the accepted create completed after the teardown");
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  it("N6: a container binding the clone's PARENT (the repo dir) or an ancestor (the runner root) is never removed", async () => {
+    const clones = makeClones("docker-ancestor", ["issue-17"]);
+    const clone = clones["issue-17"]!;
+    const repoDir = path.dirname(clone); // /…/runner/<repo>
+    const runnerRoot = path.dirname(repoDir); // /…/runner
+    const daemon = await startFakeDaemon(path.join(tmp, "docker-ancestor-daemon"));
+    try {
+      const parent = await createContainer(daemon.socket, repoDir);
+      const ancestor = await createContainer(daemon.socket, runnerRoot);
+      const own = await createContainer(daemon.socket, clone);
+      const r = await teardownDocker({ dockerHost: `unix://${daemon.socket}`, targetPaths: [clone], intervalMs: 20 });
+      assert.equal(r.state, "docker_unconfirmed");
+      assert.deepEqual(r.removed, [own], "only the container bound AT the clone was removed");
+      assert.ok(daemon.containers.has(parent), "the parent-bound container (it may serve a sibling run) is untouched");
+      assert.ok(daemon.containers.has(ancestor), "the ancestor-bound container is untouched");
     } finally {
       await daemon.close();
     }

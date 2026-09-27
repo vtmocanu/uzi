@@ -10,7 +10,7 @@ import type { Readable } from "node:stream";
 import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
 import { RUNNER_UID, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
-import { workerSpawnEnv } from "./worker-spawn-mark.js";
+import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { withForgeRetry } from "./forge-retry.js";
 
 import {
@@ -146,6 +146,10 @@ const GITLEAKS_BIN = "/usr/local/bin/gitleaks";
 //     `config.worktree` to reach). Where the runner checks out its own clone, such a key is
 //     the untrusted uid exec'ing in its OWN tree — not a boundary crossing. In M0 (no split,
 //     the worker did the checkout) they WERE reachable worker-side; (b) removed that path.
+//     issue #1783: such a runner git is still a WORKER-started process, so it must never carry
+//     the worker spawn mark (a plant it starts would inherit the nonce and be exempt from the
+//     run-quiescence reaper forever): runGitAsRunner marks only runnerGitCarriesWorkerMark's
+//     code-free subcommands.
 const GIT_CODE_EXEC_KEY_PINS: ReadonlyArray<readonly [key: string, value: string]> = [
   ["core.fsmonitor", "false"],
   ["diff.external", "true"],
@@ -4717,11 +4721,19 @@ export class GitCache {
    * but with the RUNNER PATH + the runner's private TMPDIR so `git` resolves and its
    * scratch lands on the runner's 0700 tmp (not the worker's, which the runner cannot
    * write). Single-uid (#58): `runnerCommand` is a passthrough, so this is a plain git.
+   * issue #1783: carries the worker spawn mark only for {@link runnerGitCarriesWorkerMark}'s
+   * subcommands; every other runner git runs unmarked (its plants stay reapable).
    */
   private async runGitAsRunner(cwd: string | undefined, args: string[]): Promise<string> {
     const base = gitEnv();
-    // issue #1783 (R4): worker-marked, so a concurrent reap never kills the worker's own git.
-    const env: NodeJS.ProcessEnv = workerSpawnEnv({ ...base, PATH: runnerPath() });
+    // issue #1783 (R4): worker-marked ONLY when the subcommand can run no code the clone
+    // configures (runnerGitCarriesWorkerMark), so a concurrent reap never kills that op. Every
+    // other runner git here (status, add, commit, checkout, reset, merge, rebase, …) can start an
+    // agent-planted filter/driver, which must stay reapable: it runs UNMARKED.
+    const runnerEnv: NodeJS.ProcessEnv = { ...base, PATH: runnerPath() };
+    const env: NodeJS.ProcessEnv = runnerGitCarriesWorkerMark(args)
+      ? workerSpawnEnv(runnerEnv)
+      : unmarkedSpawnEnv(runnerEnv);
     const tmp = runnerTmpdir();
     if (tmp) env.TMPDIR = tmp;
     // A permit-scoped subprocess is already launched as the isolated command uid
@@ -4957,6 +4969,39 @@ export const OVERLAY_COMMIT_PREFIX = "ckpt(overlay):" as const;
  * (local fixture path / scp form) has no scope, so the header falls back to
  * unscoped — harmless because local/file transport ignores http.* config entirely.
  */
+/**
+ * issue #1783 (R4, auditor M1) — runner-clone git subcommands that execute NO code the clone
+ * configures, and so may carry the worker spawn mark. The runner clone's `.git/config` and
+ * `.gitattributes` are agent-writable, and the arbitrary-name driver keys (`filter.<name>.*`,
+ * `diff.<name>.*`, `merge.<name>.driver`) and `gpg.program` cannot be pinned off (see the
+ * GIT_CODE_EXEC_KEY_PINS note above), so a git that touches the working tree, content-diffs,
+ * merges or shows signatures can start an agent-planted program. That program inherits the git's
+ * env: were the git worker-marked, the plant would carry the nonce and be exempt from every reap
+ * forever. So only these pure ref/object/config/index reads and ref writes are marked; the
+ * seed's clone is marked only with `--no-checkout` (no working tree is written). Anything else
+ * (status, add, commit, checkout, reset, rm, clean, merge, rebase, cherry-pick, diff, log, …) runs
+ * UNMARKED, and every sink that runs one after a quiescence proof re-proves before a credentialed
+ * step (runner.ts). Leading `-c key=value` pairs are skipped to find the subcommand.
+ */
+const RUNNER_GIT_MARKED_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  "rev-parse",
+  "rev-list",
+  "update-ref",
+  "config",
+  "ls-files",
+  "ls-tree",
+  "check-ignore",
+]);
+
+export function runnerGitCarriesWorkerMark(args: readonly string[]): boolean {
+  let i = 0;
+  while (args[i] === "-c" && i + 1 < args.length) i += 2;
+  const sub = args[i];
+  if (sub === undefined) return false;
+  if (sub === "clone") return args.slice(i + 1).includes("--no-checkout");
+  return RUNNER_GIT_MARKED_SUBCOMMANDS.has(sub);
+}
+
 export function gitEnv(pat?: string, httpScope?: string, username?: string): NodeJS.ProcessEnv {
   // REPLACEMENT env (M10 audit), NOT a process.env spread. A git subprocess can spawn
   // agent-controlled code (a hook at the default path) as the worker uid, outside the

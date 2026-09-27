@@ -13,6 +13,7 @@ import {
   quiesceRunAttempt,
   reapProcesses,
   reapRunProcesses,
+  runnerHelperTmp,
   sanitizeForLog,
   scanOnce,
   teardownDocker,
@@ -70,7 +71,11 @@ interface FakeProc {
   comm?: string;
   cwd?: string | "EACCES";
   env?: Record<string, string> | "EACCES";
+  /** `stat` field 22 (start time); default {@link DEFAULT_START}. */
+  start?: number;
 }
+
+const DEFAULT_START = 1000;
 
 function errno(code: string): Error {
   return Object.assign(new Error(code), { code });
@@ -100,7 +105,8 @@ function fakeTable(procs: Record<number, FakeProc>): ProcTable {
     },
     readStat: (pid) => {
       const p = get(pid);
-      return `${pid} (proc ${pid}) S ${p.ppid ?? 1} ${p.pgid ?? pid} ${p.sid ?? pid} 0 0`;
+      // Fields 3..22 (state … starttime): 15 zero fields sit between the session and field 22.
+      return `${pid} (proc ${pid}) S ${p.ppid ?? 1} ${p.pgid ?? pid} ${p.sid ?? pid} ${"0 ".repeat(15)}${p.start ?? DEFAULT_START} 0 0`;
     },
   };
 }
@@ -130,7 +136,7 @@ function fakeReq(extra: Partial<ScanRequest> = {}): ScanRequest {
     targetPaths: [CLONE],
     ownMarker: "run-17:own",
     liveMarkers: [],
-    liveRootPids: [],
+    liveRoots: [],
     workerNonce: "nonce",
     ...extra,
   };
@@ -159,7 +165,7 @@ describe("A-codex-sibling: a concurrent Codex attempt's non-dumpable supervisor"
   it("does not make a Claude run's reap unverified when the Codex attempt records its supervisor", async () => {
     const registry = new LiveAttemptRegistry();
     registry.add(claude);
-    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => [SUP]));
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => [{ pid: SUP, startTime: DEFAULT_START }]));
     const out = await quiesce(registry, codexProcs());
     assert.equal(out.process?.state, "quiescent", out.process?.detail);
   });
@@ -176,7 +182,7 @@ describe("A-codex-sibling: a concurrent Codex attempt's non-dumpable supervisor"
   it("a worker-launched runner-uid root recorded in the registry is attributable with no attempt at all", async () => {
     const registry = new LiveAttemptRegistry();
     registry.add(claude);
-    const unregister = registerWorkerRunnerRoot(SUP);
+    const unregister = registerWorkerRunnerRoot(SUP, () => DEFAULT_START);
     try {
       assert.equal((await quiesce(registry, codexProcs())).process?.state, "quiescent");
     } finally {
@@ -185,10 +191,32 @@ describe("A-codex-sibling: a concurrent Codex attempt's non-dumpable supervisor"
     assert.equal((await quiesce(registry, codexProcs())).process?.state, "unverified", "unregistered ⇒ unattributable again");
   });
 
+  it("L1: a stale recorded root whose pid was recycled (same pid, a different start time) exempts nothing", async () => {
+    // The Codex supervisor recorded as SUP exited and the kernel handed SUP to an unrelated
+    // non-dumpable runner-uid process (live start time DEFAULT_START, recorded DEFAULT_START - 1).
+    const stale = { pid: SUP, startTime: DEFAULT_START - 1 };
+    const viaAttempt = new LiveAttemptRegistry();
+    viaAttempt.add(claude);
+    viaAttempt.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => [stale]));
+    const out = await quiesce(viaAttempt, codexProcs());
+    assert.equal(out.process?.state, "unverified", "an attempt's stale root does not exempt the recycled pid");
+    assert.deepEqual(out.process?.processes.map((p) => p.pid).sort(), [SUP, 301]);
+
+    const viaWorker = new LiveAttemptRegistry();
+    viaWorker.add(claude);
+    const unregister = registerWorkerRunnerRoot(SUP, () => DEFAULT_START - 1);
+    try {
+      const w = await quiesce(viaWorker, codexProcs());
+      assert.equal(w.process?.state, "unverified", "a worker-launched stale root does not exempt the recycled pid");
+    } finally {
+      unregister();
+    }
+  });
+
   it("an unattributed non-dumpable process still makes it unverified", async () => {
     const registry = new LiveAttemptRegistry();
     registry.add(claude);
-    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => [SUP]));
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => [{ pid: SUP, startTime: DEFAULT_START }]));
     const procs = { ...codexProcs(), 400: { uid: RUNNER, ppid: 1, cwd: "EACCES", env: "EACCES" } as FakeProc };
     const out = await quiesce(registry, procs);
     assert.equal(out.process?.state, "unverified");
@@ -216,6 +244,23 @@ describe("A-sanitize: comm, cwd and helper strings never reach a log raw", () =>
     assert.equal(sanitizeForLog("a\u001b[31mb\u0085c\u007fd‮e⁦f‎g"), "a?[31mb?c?d?e?f?g");
     assert.equal(sanitizeForLog("x".repeat(10), 4), "xxxx...");
     assert.equal(sanitizeForLog("plain/path issue-17"), "plain/path issue-17");
+  });
+
+  it("nit: no '...' at exactly max length", () => {
+    assert.equal(sanitizeForLog("xxxx", 4), "xxxx", "a string of exactly max length is complete, not truncated");
+    assert.equal(sanitizeForLog("xxxxx", 4), "xxxx...");
+  });
+
+  it("nit: a surrogate pair is never split by the cap", () => {
+    // "ab" + U+1F600 (a surrogate pair, 2 UTF-16 units) + "c": a cap of 3 must not keep half the pair.
+    const cut = sanitizeForLog("ab\u{1F600}c", 3);
+    assert.ok(![...cut].some((ch) => { const c = ch.codePointAt(0)!; return c >= 0xd800 && c <= 0xdfff; }), "no lone surrogate");
+    assert.equal(cut, "ab...");
+    assert.equal(sanitizeForLog("ab\u{1F600}c", 4), "ab\u{1F600}...");
+  });
+
+  it("nit: U+2028/U+2029 are neutralized", () => {
+    assert.equal(sanitizeForLog("a\u2028b\u2029c"), "a?b?c", "line/paragraph separators are replaced");
   });
 
   it("a scanned comm and cwd with control/bidi characters are sanitized in the result", () => {
@@ -265,6 +310,75 @@ function scriptHelper(script: string, seen?: { args?: string[]; env?: NodeJS.Pro
 }
 
 const VERDICT = (detail: string) => JSON.stringify({ state: "quiescent", processes: [], killed: [], detail });
+
+describe("A-helper-tmp: the uid-split TMPDIR setup runs mktemp/rm asynchronously and time-bounded", () => {
+  /** A runner-command wrapper for a single-uid host: runs the command as this uid, unchanged. */
+  const passthrough = (command: string, args: string[]) => ({ command, args });
+
+  it("mktemp (through the injected runner command) makes a private dir inside base; rm removes it", async () => {
+    const base = fs.mkdtempSync(path.join(tmp, "split-base-"));
+    const seen: string[][] = [];
+    const t = runnerHelperTmp(base, (command, args) => {
+      seen.push([command, ...args]);
+      return passthrough(command, args);
+    });
+    const dir = await t.make();
+    assert.equal(path.dirname(dir), base);
+    assert.match(path.basename(dir), /^uzi-quiesce-/);
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700, "mktemp -d makes it 0700");
+    await t.remove(dir);
+    assert.equal(fs.existsSync(dir), false);
+    assert.deepEqual(seen.map((a) => a[0]), ["mktemp", "rm"], "both steps went through the runner command");
+  });
+
+  it("a hung mktemp does not block the event loop, is killed at its deadline, and the reap is unverified", async () => {
+    const base = fs.mkdtempSync(path.join(tmp, "split-hang-"));
+    const pidFile = path.join(base, "hung.pid");
+    const hang = () => ({ command: "sh", args: ["-c", `echo $$ > ${pidFile}; exec sleep 30`] });
+    let ticks = 0;
+    const ticker = setInterval(() => (ticks += 1), 10);
+    const started = Date.now();
+    let err: unknown;
+    try {
+      await runnerHelperTmp(base, hang, { makeMs: 300 }).make();
+    } catch (e) {
+      err = e;
+    } finally {
+      clearInterval(ticker);
+    }
+    assert.match(String((err as Error | undefined)?.message), /timed out/);
+    assert.ok(Date.now() - started < 5_000, "bounded by its deadline");
+    assert.ok(ticks >= 5, `the event loop kept running while mktemp hung (ticks=${ticks})`);
+    const hungPid = Number(fs.readFileSync(pidFile, "utf8").trim());
+    const gone = await (async () => {
+      for (let i = 0; i < 100; i++) {
+        try {
+          if (/^State:\s*[ZX]/m.test(procfsTable.readStatus(hungPid))) return true;
+        } catch {
+          return true;
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      return false;
+    })();
+    assert.ok(gone, "the hung mktemp's group was killed at the deadline");
+
+    const r = await reapRunProcesses(fakeReq(), {
+      viaHelper: true,
+      spawnHelper: scriptHelper(`process.stdout.write(${JSON.stringify(`${VERDICT("x")}\n`)});`),
+      helperTmp: runnerHelperTmp(base, () => ({ command: "sleep", args: ["30"] }), { makeMs: 200 }),
+    });
+    assert.equal(r.state, "unverified");
+    assert.match(r.detail, /TMPDIR unavailable/);
+  });
+
+  it("an mktemp answer outside base (or a failed exit) is refused", async () => {
+    const base = fs.mkdtempSync(path.join(tmp, "split-outside-"));
+    await assert.rejects(runnerHelperTmp(base, () => ({ command: "sh", args: ["-c", "echo /etc"] })).make(), /mktemp as the runner exited/);
+    await assert.rejects(runnerHelperTmp(base, () => ({ command: "sh", args: ["-c", "exit 3"] })).make(), /exited 3/);
+    await assert.rejects(runnerHelperTmp(base, () => ({ command: "sh", args: ["-c", `echo ${base}`] })).make(), /mktemp as the runner/);
+  });
+});
 
 describe("A-helper: request on stdin, private TMPDIR, tsx cache off, one bounded verdict", () => {
   it("the request rides stdin (never argv), TMPDIR is a fresh private dir removed after, TSX_DISABLE_CACHE=1", async () => {
@@ -438,7 +552,7 @@ require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(c.pid)); c.u
       targetPaths: [clone],
       ownMarker: own.marker,
       liveMarkers: [],
-      liveRootPids: [],
+      liveRoots: [],
       workerNonce: workerSpawnNonce(),
     });
     assert.equal(r.state, "quiescent", r.detail);

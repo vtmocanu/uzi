@@ -42,6 +42,7 @@
 // post-run sinks and the runner disposes it via `safety.dispose` after the last sink (F1);
 // STANDALONE, run()'s finally backstops the registry teardown itself.
 
+import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
@@ -1361,6 +1362,9 @@ export interface CodexExecutorDeps {
    * selecting only a validated in-container HTTP loopback provider with WebSockets off.
    * Production leaves this absent and keeps pinned Codex's built-in provider. */
   readonly appServerAuthOpenAIBaseUrlForTest?: string;
+  /** issue #1783 (R0): reads a launched supervisor pid's start time when it is recorded as a root
+   *  (default procfs); a test whose fake launcher returns a fake pid injects it. */
+  readonly rootStartTime?: StartTimeReader;
   /** Test-only high-level command seam. Production leaves this absent and uses
    * the registered supervisor-root implementation. */
   readonly spawnCommand?: SpawnCommandSeam;
@@ -1600,7 +1604,7 @@ export class CodexExecutor implements Executor {
   private readonly sessionStore: Pick<typeof CodexSessionStore, "adopt" | "inspect" | "remove" | "persist">;
   /** issue #1783 (R0): the supervisor pids of the provider roots this executor launched and has
    *  not yet cleanly reaped/disposed (see {@link recordedRootPids}). */
-  private readonly providerRootPids = new Set<number>();
+  private readonly providerRootPids = new Map<number, RecordedRoot>();
 
   constructor(log: Logger, homeRoot: string, opts: CodexExecutorOptions, deps: CodexExecutorDeps = {}) {
     this.log = log;
@@ -1619,18 +1623,21 @@ export class CodexExecutor implements Executor {
   /** issue #1783 (R0): the live provider-root supervisor pids (see Executor.recordedRootPids).
    *  The supervisor runs as the runner uid and makes itself non-dumpable, so a concurrent Claude
    *  run's quiescence reaper can only attribute it (and its descendants) through these roots. */
-  recordedRootPids(): number[] {
-    return [...this.providerRootPids];
+  recordedRootPids(): RecordedRoot[] {
+    return [...this.providerRootPids.values()];
   }
 
   /** issue #1783: record a launched provider root's supervisor pid until its root is cleanly
    *  reaped or disposed. An unclean teardown keeps it recorded: the process may still live. */
   private trackProviderRoot(launched: CodexLaunchRootResult): CodexLaunchRootResult {
-    const pid = launched.supervisorPid;
-    if (!Number.isInteger(pid) || pid <= 1) return launched;
-    this.providerRootPids.add(pid);
+    // The start time is captured NOW, at launch: a pid read later may name a recycled process.
+    // A supervisor whose start time cannot be read is not recorded (it then exempts nothing).
+    const recorded = recordRoot(launched.supervisorPid, this.deps.rootStartTime);
+    if (!recorded) return launched;
+    const pid = recorded.pid;
+    this.providerRootPids.set(pid, recorded);
     const forget = (): void => {
-      this.providerRootPids.delete(pid);
+      if (this.providerRootPids.get(pid) === recorded) this.providerRootPids.delete(pid);
     };
     const inner = launched.root;
     const root: RegisteredRoot = {

@@ -229,16 +229,19 @@ describe("launchCodexRoot: env allowlist, trees, argv", () => {
 
   it("issue #1783: a runner-uid provider root is a recorded worker-launched root until it exits; a command root is not; neither carries the worker mark", async () => {
     const provider = newFake();
-    await launchCodexRoot(baseSpec(), baseDeps(provider));
+    await launchCodexRoot(baseSpec(), baseDeps(provider, { rootStartTime: (pid) => pid + 7 }));
     assert.equal(spawnCalls[0]?.options.env[WORKER_SPAWN_ENV], undefined, "no worker mark on the model-driving provider root");
-    assert.ok(workerRunnerRootPids().includes(provider.pid), "the non-dumpable provider supervisor is attributable");
+    assert.ok(
+      workerRunnerRootPids().some((r) => r.pid === provider.pid && r.startTime === provider.pid + 7),
+      "the non-dumpable provider supervisor is attributable (pid + the start time read at registration)",
+    );
     provider.exitWith(0);
-    assert.equal(workerRunnerRootPids().includes(provider.pid), false, "unregistered once it exited");
+    assert.equal(workerRunnerRootPids().some((r) => r.pid === provider.pid), false, "unregistered once it exited");
 
     const command = newFake({ uid: COMMAND_UID });
-    await launchCodexRoot(baseSpec({ kind: "command", childArgv: ["exec", "--", "echo"] }), baseDeps(command));
+    await launchCodexRoot(baseSpec({ kind: "command", childArgv: ["exec", "--", "echo"] }), baseDeps(command, { rootStartTime: (pid) => pid + 7 }));
     assert.equal(spawnCalls[1]?.options.env[WORKER_SPAWN_ENV], undefined, "no worker mark on a command root");
-    assert.equal(workerRunnerRootPids().includes(command.pid), false, "a runner-cmd root is never scanned, so never recorded");
+    assert.equal(workerRunnerRootPids().some((r) => r.pid === command.pid), false, "a runner-cmd root is never scanned, so never recorded");
   });
 
   it("(c) creates the fresh trees 0700 as the runner uid via the injected step", async () => {

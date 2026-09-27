@@ -253,7 +253,7 @@ function holdFactory(held: Array<boolean | undefined>): ExecutorFactory {
 
 describe("issue #1783: the completion hold is gated and still stands", () => {
   for (const state of NOT_QUIESCENT) {
-    it(`${state}: held on the clone's base (no capture, no publish), never failed, the clone kept`, async () => {
+    it(`${state}: held with an EMPTY head (no capture, no publish), never failed, the clone kept`, async () => {
       const { gitlab, calls: mrCalls } = fakeGitlab();
       const iid = 1820 + (state === "survivors" ? 0 : 1);
       api.setCompletionHoldResponse("paused", 200);
@@ -265,7 +265,7 @@ describe("issue #1783: the completion hold is gated and still stands", () => {
       assert.deepEqual(held, [true], "the hold stands");
       assert.equal(api.completionHoldRequests.length, 1);
       const head = (api.completionHoldRequests[0]!.body as { head: string }).head;
-      assert.equal(head.length, 40, "a real head (the clone base; the tracking ref has none) rode the request");
+      assert.equal(head, "", "an empty head rode the request (like the wall park's degraded park): nothing was captured");
       assert.ok(!statuses(claim.run_id).includes("failed"), "never converted into a failure");
       assert.equal(pub.calls(), 0, "no checkpoint published");
       assert.equal(trackingSha(iid), null, "no capture: the tracking ref is untouched");
@@ -384,5 +384,43 @@ describe("issue #1783: a residue's detail reaches failure_reason short and sanit
     assert.ok(reason.includes("evil?[2J?x"), reason.slice(0, 120));
     assert.ok(![...reason].some((ch) => { const c = ch.codePointAt(0)!; return c < 0x20 || c === 0x202e; }), "no control/bidi code point");
     assert.ok(reason.length < 400, `capped: ${reason.length}`);
+  });
+});
+
+// ─── reportGenericFailure with a RunResidueBlockedError (tester item) ──────────────────────
+
+describe("issue #1783: a RunResidueBlockedError reaching reportGenericFailure skips the credentialed settle", () => {
+  it("the finalize gate's residue error fails the run but never settles custody, even when a later proof would pass", async () => {
+    const { gitlab } = fakeGitlab();
+    const iid = 1845;
+    simulateCommittedWork();
+    // Blocked at the FIRST proof only (the finalize gate, which throws RunResidueBlockedError into
+    // reportGenericFailure); every later proof answers quiescent. So the ONLY thing keeping the
+    // credentialed settle from running is reportGenericFailure's `err instanceof
+    // RunResidueBlockedError ? false : …` branch: without it, its pre-settle reap would pass and
+    // settleRecoveryGeneration would run the PAT-bearing capture.
+    const { calls, quiesceRun } = firstCallQuiescer("survivors");
+    let released = 0;
+    const { recovery, captures } = fakeRecovery();
+    (recovery as unknown as { release: () => Promise<void> }).release = async () => {
+      released += 1;
+    };
+    const factory: ExecutorFactory = (runId) => ({
+      homeDir: path.join(homeDir, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          commitWork(ctx.worktreePath);
+          return { branch: ctx.branch, summary: "done" };
+        },
+      },
+    });
+    const claim = gitlabClaim(iid);
+    await runnerWith(factory, gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun, recovery }).execute(claim);
+    const failed = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed").at(-1)?.body;
+    assert.equal(failed?.fail_origin, "worker_residue_blocked", "the finalize gate threw RunResidueBlockedError into reportGenericFailure");
+    assert.equal(calls[0]?.mode, "own");
+    assert.equal(captures(), 0, "settleRecoveryGeneration never ran its credentialed capture");
+    assert.equal(released, 0, "no hold was released: custody stays open");
+    assert.equal(fs.existsSync(path.join(worktreeDirFor(iid), "WORK.txt")), true, "the clone is kept");
   });
 });

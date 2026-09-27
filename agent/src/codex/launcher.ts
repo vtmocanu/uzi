@@ -46,7 +46,7 @@ import {
   uidSplitActive,
   workerBoundaryCommand,
 } from "../runner-uid.js";
-import { registerWorkerRunnerRoot, workerSpawnEnv } from "../worker-spawn-mark.js";
+import { registerWorkerRunnerRoot, workerSpawnEnv, type StartTimeReader } from "../worker-spawn-mark.js";
 import {
   assertNoUnexpectedSystemConfig as defaultAssertNoUnexpectedSystemConfig,
   buildCodexConfigToml,
@@ -197,6 +197,9 @@ export interface LauncherDeps {
   /** Static, path-free diagnostic for a best-effort tree-removal failure. */
   readonly reportRunnerTreeCleanupFailure?: () => void;
   readonly spawnSupervisor?: SpawnSupervisor;
+  /** issue #1783 (R0): reads a supervisor pid's start time when it is recorded as a worker-launched
+   *  root (default procfs); a test with a fake supervisor pid injects it. */
+  readonly rootStartTime?: StartTimeReader;
   readonly assertNoUnexpectedSystemConfig?: (etcCodexDir?: string) => void;
   readonly etcCodexDir?: string;
   readonly deadlines?: Partial<LauncherDeadlines>;
@@ -672,7 +675,7 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
     stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
   });
   if (spec.kind !== "command") {
-    const unregister = registerWorkerRunnerRoot(child.pid);
+    const unregister = registerWorkerRunnerRoot(child.pid, deps.rootStartTime);
     child.once("exit", () => unregister());
     child.once("error", () => unregister());
   }

@@ -22,6 +22,7 @@
 // (testing-credentials policy). The plan/done signals are observed from that
 // stream (see signals.ts), so a scripted fake proves them without a live SDK.
 
+import { recordRoot, type RecordedRoot } from "./worker-spawn-mark.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type {
@@ -669,6 +670,9 @@ export class SdkExecutor implements Executor {
    *  signal (its group not confirmed gone). The run-end reap signals these group-only: after
    *  the leader exited, killProcessGroup's bare-pid fallback could hit a recycled process. */
   private readonly deadCliPids = new Set<number>();
+  /** issue #1783 (R0): each spawned CLI root with its start time, captured AT SPAWN (a pid read
+   *  later may already name a recycled process). Keyed by pid; read through spawnedPids. */
+  private readonly rootStartTimes = new Map<number, RecordedRoot>();
   /** The Claude run-lane adapter (PRD #1146 M2). Owns query options finalization,
    *  frame decode, the lead context read, process ownership and terminal building;
    *  driveTurn drives it and the per-run reducer. */
@@ -745,6 +749,11 @@ export class SdkExecutor implements Executor {
       log: this.log,
       contextUsageTimeoutMs: this.contextUsageTimeoutMs,
       spawnedPids: this.spawnedPids,
+      onRootSpawned: (pid) => {
+        const root = recordRoot(pid);
+        if (root) this.rootStartTimes.set(pid, root);
+        else this.rootStartTimes.delete(pid);
+      },
       homeDir: this.homeDir,
     });
     this.reducer = new RunTurnReducerImpl(this.harness.contextHook);
@@ -769,9 +778,14 @@ export class SdkExecutor implements Executor {
     this.deadCliPids.clear();
   }
 
-  /** issue #1783 (R0): the CLI process-group roots not yet reaped (see Executor.recordedRootPids). */
-  recordedRootPids(): number[] {
-    return [...this.spawnedPids];
+  /** issue #1783 (R0): the CLI process-group roots not yet reaped, each with the start time
+   *  captured when it was spawned (see Executor.recordedRootPids). A root whose start time could
+   *  not be read at spawn is omitted: it then exempts nothing. */
+  recordedRootPids(): RecordedRoot[] {
+    return [...this.spawnedPids].flatMap((pid) => {
+      const root = this.rootStartTimes.get(pid);
+      return root ? [root] : [];
+    });
   }
 
   /**

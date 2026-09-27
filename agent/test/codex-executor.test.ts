@@ -466,6 +466,8 @@ function makeRig(opts: { responder?: Responder; token?: string } = {}): Rig {
       (transport as unknown as { specProviderName?: string }).specProviderName = spec.provider.name;
       return { root, transport, supervisorPid: 1234 };
     },
+    // issue #1783 (R0): the fake supervisor pid's start time, as recorded at launch.
+    rootStartTime: (pid) => pid * 10,
     spawnCommand: async (argv, cmdOpts) => {
       spawnCommandCalls.push({ argv, opts: cmdOpts });
       return { code: 0, stdout: "ok", stderr: "" };
@@ -760,7 +762,7 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
     // The supervisor runs as the runner uid and is non-dumpable; a concurrent Claude run's
     // quiescence reaper can attribute it (instead of reporting `unverified`) only through these.
     let executor: CodexExecutor | undefined;
-    const seen: number[][] = [];
+    const seen: Array<Array<{ pid: number; startTime: number }>> = [];
     const rig = makeRig({
       responder: (c) => {
         if (c.method === "thread/start") seen.push(executor?.recordedRootPids() ?? []);
@@ -771,7 +773,7 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
     executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
     assert.deepEqual(executor.recordedRootPids(), [], "nothing launched yet");
     await withTimeout(executor.run(makeCtx().ctx), 3000, "clean run");
-    assert.deepEqual(seen[0], [1234], "the launched provider root's supervisor pid is recorded while live");
+    assert.deepEqual(seen[0], [{ pid: 1234, startTime: 12340 }], "the launched provider root's supervisor pid AND start time are recorded while live");
     assert.equal(rig.reaped() + rig.disposed() > 0, true);
     assert.deepEqual(executor.recordedRootPids(), [], "forgotten once its root was cleanly reaped/disposed");
   });

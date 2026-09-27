@@ -7,42 +7,56 @@ import { fileURLToPath } from "node:url";
 // issue #1783 (R4) — every place the worker crosses into a runner/runner-cmd uid is listed here
 // with its disposition toward the run-quiescence reaper. The reaper attributes runner-uid
 // processes by env: an AGENT process carries the attempt marker (only the CLI spawn), and every
-// worker-authored, fixed-argv spawn carries the worker mark (UZI_WORKER_SPAWN) so a reap never kills
-// the worker's own op, while a spawn that executes repo- or agent-authored code is deliberately NOT
-// marked (whatever it leaks must stay reapable). A new, unlisted `runnerCommand(` / `runnerSpawn(` /
+// worker-authored, fixed-argv spawn that can run no repo-configured code carries the worker mark
+// (UZI_WORKER_SPAWN) so a reap never kills the worker's own op, while a spawn that executes repo-,
+// clone-config- or agent-authored code (a runner-clone `git status`/`add`/`commit` with a planted
+// filter included) is deliberately NOT marked (whatever it leaks must stay reapable). A new, unlisted `runnerCommand(` / `runnerSpawn(` /
 // `commandRootCommand(` / `setprivRunnerArgs(` / `setprivArgsForUid(` site, a direct setpriv spawn
-// (`spawnSync(SETPRIV`), or a "/bin/setpriv" literal fails this test until someone decides which
-// side of that line it is on and records it below. A listed site that disappears fails it too.
+// (`spawnSync(SETPRIV`), or any string literal ending in `setpriv` ("/bin/setpriv",
+// "/usr/bin/setpriv", "setpriv") fails this test until someone decides which side of that line it
+// is on and records it below. A listed site that disappears fails it too.
 
 const SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src");
 const NAMES = ["runnerCommand", "runnerSpawn", "commandRootCommand", "setprivRunnerArgs", "setprivArgsForUid"] as const;
 /** A DIRECT setpriv spawn (bypassing the wrappers above): `spawn(SETPRIV`, `spawnSync(SETPRIV`,
  *  an execFile of it, or a "/bin/setpriv" literal anywhere. */
 const SETPRIV_SPAWN = /\b(?:spawn|spawnSync|execFile|execFileSync|execFileAsync)\(\s*SETPRIV\b/g;
-const SETPRIV_LITERAL = /["'`]\/bin\/setpriv["'`]/g;
+/** Any string literal whose value ENDS in `setpriv`: "/bin/setpriv", "/usr/bin/setpriv", a bare
+ *  "setpriv" resolved through PATH, or a template literal of either. */
+const SETPRIV_LITERAL = /["'`](?:[^"'`\n]*\/)?setpriv["'`]/g;
+
+/**
+ * How a site's spawn is marked: `marked` (always carries workerSpawnEnv), `unmarked` (never: it can
+ * run repo-, agent- or model-directed code, so its leaks stay reapable), `conditional` (the site
+ * decides per call: runGitAsRunner marks only code-free git subcommands, the tick spawner keeps its
+ * caller's choice for a runner-uid child), or `wrapper` (a wrapper body / reference whose CALLER
+ * decides the env).
+ */
+type Mark = "marked" | "unmarked" | "conditional" | "wrapper";
 
 /** `<file>#<name>()` for a call, `<file>#<name>&` for a bare reference → expected count + why. */
-const ALLOWLIST: Record<string, { count: number; disposition: string }> = {
-  "sdk-spawn.ts#runnerSpawn()": { count: 1, disposition: "the agent CLI: carries the attempt marker (buildSdkEnv), never the worker mark" },
-  "runner-uid.ts#runnerCommand()": { count: 1, disposition: "inside runnerSpawn: the caller's env decides (see sdk-spawn.ts)" },
-  "runner-uid.ts#setprivRunnerArgs()": { count: 3, disposition: "runnerCommand's own body + the two kill helpers (worker-authored fixed argv: workerSpawnEnv)" },
-  "runner-uid.ts#setprivArgsForUid()": { count: 3, disposition: "setprivRunnerArgs / commandRootCommand / workerBoundaryCommand bodies (the wrappers themselves)" },
-  "runner-uid.ts#setpriv-spawn": { count: 2, disposition: "killRunnerGroup / killRunnerGroupOnly `kill -KILL` (worker-authored fixed argv: workerSpawnEnv)" },
-  "runner-uid.ts#setpriv-literal": { count: 1, disposition: "the SETPRIV constant the wrappers use" },
-  "executor.ts#runnerCommand()": { count: 1, disposition: "stub executor git (worker-authored fixed argv): workerSpawnEnv; runs inside the stub run(), awaited before it returns" },
-  "git.ts#runnerCommand()": { count: 1, disposition: "runGitAsRunner (worker-authored git, hooks pinned off by gitEnv): workerSpawnEnv" },
-  "js-deps.ts#runnerCommand()": { count: 1, disposition: "JS deps install: NOT marked (the package manager reads repo-controlled config in the clone; leaks stay reapable)" },
-  "provision.ts#runnerCommand()": { count: 2, disposition: "devbox/nix run: NOT marked (untrusted nix build hooks; cwd outside the clone); PATH probe (fixed script): workerSpawnEnv" },
-  "provision.ts#commandRootCommand()": { count: 1, disposition: "PATH probe as runner-cmd (uid 10003, never scanned; fixed script): workerSpawnEnv" },
-  "self-improve.ts#runnerCommand()": { count: 1, disposition: "finalize-time check: NOT marked (repo-authored command, cwd in the clone; leaks stay reapable)" },
-  "tick-spawner.ts#runnerCommand()": { count: 3, disposition: "tick child + kill/probe helpers (worker-authored fixed argv): workerSpawnEnv" },
-  "rmtree.ts#runnerCommand&": { count: 2, disposition: "purge helper passes (fixed script): workerSpawnEnv on the minimal env" },
-  "rmtree.ts#commandRootCommand&": { count: 1, disposition: "purge helper pass as runner-cmd (fixed script): workerSpawnEnv" },
-  "run-quiescence.ts#runnerCommand()": { count: 3, disposition: "the quiescence helper + its private-TMPDIR mktemp/rm (worker-authored fixed argv): workerSpawnEnv, never an attempt marker" },
-  "codex/launcher.ts#runnerCommand()": { count: 1, disposition: "Codex provider root supervisor: NOT marked (model-directed app-server); a recorded worker-launched root instead" },
-  "codex/launcher.ts#commandRootCommand()": { count: 4, disposition: "Codex command root + effect root: NOT marked (model-directed shells); standalone modes + kill (fixed argv): workerSpawnEnv" },
-  "codex/launcher.ts#runnerCommand&": { count: 2, disposition: "owned-tree create/remove wrap (fixed scripts): workerSpawnEnv on the inert env" },
-  "codex/launcher.ts#commandRootCommand&": { count: 2, disposition: "owned-tree create/remove wrap (fixed scripts): workerSpawnEnv on the inert env" },
+const ALLOWLIST: Record<string, { count: number; mark: Mark; disposition: string }> = {
+  "sdk-spawn.ts#runnerSpawn()": { count: 1, mark: "unmarked", disposition: "the agent CLI: carries the attempt marker (buildSdkEnv), never the worker mark" },
+  "runner-uid.ts#runnerCommand()": { count: 1, mark: "wrapper", disposition: "inside runnerSpawn: the caller's env decides (see sdk-spawn.ts)" },
+  "runner-uid.ts#setprivRunnerArgs()": { count: 3, mark: "marked", disposition: "runnerCommand's own body + the two kill helpers (worker-authored fixed argv: workerSpawnEnv)" },
+  "runner-uid.ts#setprivArgsForUid()": { count: 3, mark: "wrapper", disposition: "setprivRunnerArgs / commandRootCommand / workerBoundaryCommand bodies (the wrappers themselves)" },
+  "runner-uid.ts#setpriv-spawn": { count: 2, mark: "marked", disposition: "killRunnerGroup / killRunnerGroupOnly `kill -KILL` (worker-authored fixed argv: workerSpawnEnv)" },
+  "runner-uid.ts#setpriv-literal": { count: 1, mark: "wrapper", disposition: "the SETPRIV constant the wrappers use" },
+  "executor.ts#runnerCommand()": { count: 1, mark: "unmarked", disposition: "stub executor git (the agent turn's stand-in `add`/`commit` in the clone, which runs clone-configured filters): NOT marked" },
+  "git.ts#runnerCommand()": { count: 1, mark: "conditional", disposition: "runGitAsRunner: workerSpawnEnv only for runnerGitCarriesWorkerMark's code-free subcommands (rev-parse, update-ref, config, ls-files, …); status/add/commit/checkout/reset/merge/rebase/diff/log run UNMARKED (a planted filter/driver stays reapable)" },
+  "js-deps.ts#runnerCommand()": { count: 1, mark: "unmarked", disposition: "JS deps install: NOT marked (the package manager reads repo-controlled config in the clone; leaks stay reapable)" },
+  "provision.ts#runnerCommand()": { count: 2, mark: "conditional", disposition: "devbox/nix run: NOT marked (untrusted nix build hooks; cwd outside the clone); PATH probe (fixed script): workerSpawnEnv" },
+  "provision.ts#commandRootCommand()": { count: 1, mark: "marked", disposition: "PATH probe as runner-cmd (uid 10003, never scanned; fixed script): workerSpawnEnv" },
+  "self-improve.ts#runnerCommand()": { count: 1, mark: "unmarked", disposition: "finalize-time check: NOT marked (repo-authored command, cwd in the clone; leaks stay reapable)" },
+  "tick-spawner.ts#runnerCommand()": { count: 3, mark: "conditional", disposition: "kill/probe helpers (worker-authored fixed argv): workerSpawnEnv; tick child: a worker_pat child is marked, a runner-uid (`command`) child keeps its caller's mark decision (runGitAsRunner)" },
+  "rmtree.ts#runnerCommand&": { count: 2, mark: "marked", disposition: "purge helper passes (fixed script): workerSpawnEnv on the minimal env" },
+  "rmtree.ts#commandRootCommand&": { count: 1, mark: "marked", disposition: "purge helper pass as runner-cmd (fixed script): workerSpawnEnv" },
+  "run-quiescence.ts#runnerCommand()": { count: 1, mark: "marked", disposition: "the quiescence helper (worker-authored fixed argv): workerSpawnEnv, never an attempt marker" },
+  "run-quiescence.ts#runnerCommand&": { count: 1, mark: "marked", disposition: "the helper's private-TMPDIR mktemp/rm wrap (fixed argv, async + time-bounded): workerSpawnEnv" },
+  "codex/launcher.ts#runnerCommand()": { count: 1, mark: "unmarked", disposition: "Codex provider root supervisor: NOT marked (model-directed app-server); a recorded worker-launched root (pid + start time) instead" },
+  "codex/launcher.ts#commandRootCommand()": { count: 4, mark: "conditional", disposition: "Codex command root + effect root: NOT marked (model-directed shells); standalone modes + kill (fixed argv): workerSpawnEnv" },
+  "codex/launcher.ts#runnerCommand&": { count: 2, mark: "marked", disposition: "owned-tree create/remove wrap (fixed scripts): workerSpawnEnv on the inert env" },
+  "codex/launcher.ts#commandRootCommand&": { count: 2, mark: "marked", disposition: "owned-tree create/remove wrap (fixed scripts): workerSpawnEnv on the inert env" },
 };
 
 function listTs(dir: string): string[] {
@@ -91,6 +105,37 @@ describe("runner-uid spawn sites (issue #1783 R4)", () => {
     const expected = Object.fromEntries(Object.entries(ALLOWLIST).map(([k, v]) => [k, v.count]));
     assert.deepEqual(actual, expected);
     for (const v of Object.values(ALLOWLIST)) assert.ok(v.disposition.length > 0);
+  });
+
+  // A PER-SITE check (does this very call pass workerSpawnEnv?) needs each call's enclosing
+  // function, i.e. a real TypeScript parse: this repo's typescript is 7.x, whose only JS API is the
+  // `typescript/unstable/*` surface, and a brace/regex heuristic misattributes sites (default
+  // parameters, multi-line arrow headers). So the mark is checked per FILE, which is robust: a file
+  // whose every site is `unmarked` must never call workerSpawnEnv (re-marking the stub executor's
+  // git, the agent CLI, the deps install or a self-improve check reddens here), a file with a
+  // `marked` site must call it, and a `conditional` file must also strip the mark (unmarkedSpawnEnv).
+  it("each file's spawn-mark calls agree with its sites' dispositions", () => {
+    const byFile = new Map<string, Mark[]>();
+    for (const [key, v] of Object.entries(ALLOWLIST)) {
+      const file = key.slice(0, key.indexOf("#"));
+      byFile.set(file, [...(byFile.get(file) ?? []), v.mark]);
+    }
+    for (const [file, marks] of byFile) {
+      const code = codeOf(fs.readFileSync(path.join(SRC, file), "utf8"));
+      const marks_ = new Set(marks);
+      const callsMark = /\bworkerSpawnEnv\(/.test(code);
+      const callsUnmark = /\bunmarkedSpawnEnv\(/.test(code);
+      if ([...marks_].every((m) => m === "unmarked")) {
+        assert.equal(callsMark, false, `${file}: every site is unmarked, yet the file calls workerSpawnEnv`);
+      }
+      if (marks_.has("marked")) assert.equal(callsMark, true, `${file}: a marked site, yet no workerSpawnEnv call`);
+      if (marks_.has("conditional") && file !== "provision.ts" && file !== "codex/launcher.ts") {
+        // provision.ts / codex/launcher.ts are conditional across DIFFERENT sites (a model-directed
+        // spawn built on a replacement env, a fixed probe marked); git.ts and tick-spawner.ts decide
+        // inside ONE site, so they must carry both branches.
+        assert.equal(callsMark && callsUnmark, true, `${file}: a conditional site must both mark and strip the mark`);
+      }
+    }
   });
 
   it("the source scan actually sees calls (not vacuous)", () => {

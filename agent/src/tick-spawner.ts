@@ -34,7 +34,7 @@ import path from "node:path";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
 import type { Logger } from "./log.js";
 import { runnerCommand, uidSplitActive } from "./runner-uid.js";
-import { workerSpawnEnv } from "./worker-spawn-mark.js";
+import { WORKER_SPAWN_ENV, unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 
 /** A tick child's process group that was still alive after its SIGKILL and the bounded wait. */
 export interface SurvivingGroup {
@@ -343,7 +343,12 @@ export class TickSpawner {
       cwd: req.cwd,
       // issue #1783 (R4): a tick child is the worker's own op (it runs only while holding the
       // sink gate); the mark keeps a concurrent quiescence reap from attributing it to the run.
-      env: workerSpawnEnv(req.env),
+      // A runner-uid (`command`) child keeps the mark decision its caller made: runGitAsRunner
+      // leaves a git that can run clone-configured code UNMARKED, and the spawner must not
+      // re-mark it (a plant would inherit the nonce).
+      env: req.identity === "command" && req.env[WORKER_SPAWN_ENV] === undefined
+        ? unmarkedSpawnEnv(req.env)
+        : workerSpawnEnv(req.env),
       detached: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
