@@ -38,7 +38,7 @@ through `[0.52.0]`.)
 ### Fixed
 
 - **The Fleet upgrade panel no longer counts a hosted worker on an older release as up to date ([#1415](https://github.com/vtmocanu/uzi/issues/1415)).**
-  A hosted worker that the controller reports as settled but that reports a version behind its target (for example a cordoned, draining worker still on its previous release) now reads `outdated` instead of `up_to_date` with a "re-tagged image" note, so it counts toward the attention badge and the "N up to date" summary stays honest. The settled softener from ADR-738 is removed, since agent images are no longer re-tagged (#1720). A fleet deliberately pinned to a pre-#1720 re-tagged tag now reads `outdated`.
+  A hosted worker that the controller reports as settled but that reports a version behind its target (for example a cordoned, draining worker still on its previous release) now reads `outdated` instead of `up_to_date` with a "re-tagged image" note, so it counts toward the attention badge and the "N up to date" summary stays honest. The settled softener from ADR-738 is removed, since agent images are no longer re-tagged (#1720). A fleet deliberately pinned to a pre-#1729 re-tagged tag now reads `outdated`.
 
 - **A follow-up sent to a Claude issue run now reaches the agent after a milestone checkpoint ([#1152](https://github.com/vtmocanu/uzi/issues/1152)).**
   When the agent checkpointed a finished milestone, queued follow-ups stayed buffered even though the steer queue showed them as Delivered, and the agent could be shown the previous follow-up again. The worker now hands the agent the next queued follow-up (one per turn, in order) after each checkpoint too. The docs now list more cases where a follow-up shows Delivered but is never acted on.
