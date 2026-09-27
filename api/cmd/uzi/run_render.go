@@ -7,6 +7,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -176,6 +177,9 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	// and every one is emit-only-when-set, so a pre-feature run or one whose summaries
 	// have not landed yet is byte-for-byte unchanged. Routed through cellText below.
 	rows = append(rows, summaryRows(r)...)
+	// PRD #1798 M7: the run's published PR description, the `run get` twin of RunView's
+	// "Delivered" section. Emit-only-when-present like the summary rows above.
+	rows = append(rows, prDescriptionRows(r)...)
 	// PRD-link lifecycle (#150), the CLI twin of the fields exposed on the DTO in the
 	// prior commit. Both rows are emit-only-when-set: a run that moved no PRD, or one
 	// predating the feature, must not print a blank row. PRD_MOVE carries the run's own
@@ -1166,6 +1170,139 @@ func summaryRows(r apitypes.RunDTO) [][]string {
 		rows = append(rows, []string{"DELTA", cellText(deltaGlyph(d.Kind) + " " + d.Kind + ": " + d.Text)})
 	}
 	return rows
+}
+
+// prDescriptionRows is the CLI surface of the run's published PR description (PRD #1798 M7):
+// the summary (DELIVERED), the size line (SIZE) and, when the PR's last description write did
+// not publish, a plain note saying why (PR_UPDATE). The web twin is DeliveredCard
+// (web/src/pages/runView/DeliveredCard.tsx); `--json` already carries the whole artifact.
+//
+// The fields are lead- or model-authored UNTRUSTED text that the api sanitized for the forge's
+// markdown, so each is first unescaped for display (displayPrText) and then goes through
+// cellText, the same untrusted-text path as the PRD #362 summary rows: control, bidi and format
+// runes stripped (the sanitizer's U+200B breakers included; a terminal forms no mention or
+// closing directive), newlines and tabs folded, length capped. Nothing is emitted when the run
+// has no published description, so such a run's detail is unchanged.
+func prDescriptionRows(r apitypes.RunDTO) [][]string {
+	d := r.PrDescription
+	if d == nil {
+		return nil
+	}
+	var rows [][]string
+	if s := cellText(displayPrText(d.Fields.Summary)); s != "" {
+		rows = append(rows, []string{"DELIVERED", s})
+	}
+	if body := prSizeBody(d.Size); body != "" {
+		rows = append(rows, []string{"SIZE", body})
+	}
+	if note := prDescriptionOutcomeNote(r.PrDescriptionOutcome); note != "" {
+		rows = append(rows, []string{"PR_UPDATE", cellText(note)})
+	}
+	return rows
+}
+
+// prDescMarkdownEscape is a CommonMark backslash escape (a backslash before ASCII punctuation):
+// every escape the api sanitizer adds has this form, and a backslash before anything else is
+// literal in CommonMark, so it is kept.
+var prDescMarkdownEscape = regexp.MustCompile("\\\\([!-/:-@\\[-`{-~])")
+
+// prDescEntities decodes, in ONE pass, the entities an HTML-escaping writer emits (the sanitizer
+// itself only emits `&lt;`), so `&amp;lt;` reads as the literal text `&lt;`, never `<`.
+var prDescEntities = strings.NewReplacer("&lt;", "<", "&gt;", ">", "&amp;", "&", "&quot;", `"`, "&#39;", "'", "&#x27;", "'", "&apos;", "'")
+
+// displayPrText undoes the forge-markdown encoding the api sanitizer applied to a PR
+// description field (api/internal/workersvc/pr_description_sanitize.go, step 3): backslash
+// escapes resolved, then entities decoded. The result is display text, as hostile as the lead
+// wrote it, and must still go through the untrusted-text path (cellText).
+func displayPrText(s string) string {
+	return prDescEntities.Replace(prDescMarkdownEscape.ReplaceAllString(s, "$1"))
+}
+
+// prSizeBuckets is the size line's bucket order (D3), matching agent/src/pr-size.ts.
+var prSizeBuckets = []struct {
+	name   string
+	bucket func(*apitypes.PrDescriptionSize) apitypes.PrDescriptionSizeBucket
+}{
+	{"code", func(s *apitypes.PrDescriptionSize) apitypes.PrDescriptionSizeBucket { return s.Code }},
+	{"tests", func(s *apitypes.PrDescriptionSize) apitypes.PrDescriptionSizeBucket { return s.Tests }},
+	{"docs", func(s *apitypes.PrDescriptionSize) apitypes.PrDescriptionSizeBucket { return s.Docs }},
+	{"config", func(s *apitypes.PrDescriptionSize) apitypes.PrDescriptionSizeBucket { return s.Config }},
+	{"generated", func(s *apitypes.PrDescriptionSize) apitypes.PrDescriptionSizeBucket { return s.Generated }},
+	{"vendored", func(s *apitypes.PrDescriptionSize) apitypes.PrDescriptionSizeBucket { return s.Vendored }},
+}
+
+// prSizeBody is the size line after its "Size: " label, in the agent's format
+// (agent/src/pr-size.ts renderSizeLine, PRD #1798 D3): `code +1,810 −12 · tests +40 −0 · 2 files`,
+// buckets with no added and no deleted lines omitted, U+2212 minus, U+00B7 separator, en-US
+// thousands separators; "unavailable" for an unavailable size; "" (no row) for a nil size or
+// one with no files. Pinned with the web's prSizeLine to fixtures/pr-size-line/cases.json.
+func prSizeBody(size *apitypes.PrDescriptionSize) string {
+	if size == nil {
+		return ""
+	}
+	if size.Unavailable {
+		return "unavailable"
+	}
+	if size.Files <= 0 {
+		return ""
+	}
+	var parts []string
+	for _, b := range prSizeBuckets {
+		v := b.bucket(size)
+		if v.Added == 0 && v.Deleted == 0 {
+			continue
+		}
+		parts = append(parts, b.name+" +"+groupThousands(v.Added)+" \u2212"+groupThousands(v.Deleted))
+	}
+	noun := "files"
+	if size.Files == 1 {
+		noun = "file"
+	}
+	parts = append(parts, groupThousands(size.Files)+" "+noun)
+	return strings.Join(parts, " \u00b7 ")
+}
+
+// groupThousands formats n with en-US thousands separators (1810 → "1,810").
+func groupThousands(n int64) string {
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	digits := strconv.FormatInt(n, 10)
+	var b strings.Builder
+	if neg {
+		b.WriteByte('-')
+	}
+	for i, c := range digits {
+		if i > 0 && (len(digits)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteRune(c)
+	}
+	return b.String()
+}
+
+// prDescriptionOutcomeNote is the PR's last description-write outcome, other than published, as
+// one plain sentence ("" for published or none). Mirrors the web's prDescriptionOutcomeNote. An
+// outcome this binary does not know (a newer server) is named rather than dropped; the caller
+// runs the whole note through cellText.
+func prDescriptionOutcomeNote(outcome *string) string {
+	if outcome == nil || *outcome == "" || *outcome == "published" {
+		return ""
+	}
+	switch *outcome {
+	case "skipped_human_edit":
+		return "Last PR update skipped: a human edited the description."
+	case "skipped_no_region":
+		return "Last PR update skipped: the description no longer has a uzi section."
+	case "skipped_malformed":
+		return "Last PR update skipped: the uzi section of the description was damaged."
+	case "skipped_snapshot_moved":
+		return "Last PR update skipped: the branch moved before the update was written."
+	case "write_failed":
+		return "Last PR update failed: the forge did not accept the new description."
+	}
+	return "Last PR update was not published (" + *outcome + ")."
 }
 
 // deltaGlyph is the one-rune prefix for a plan-summary delta kind, mirroring the web's

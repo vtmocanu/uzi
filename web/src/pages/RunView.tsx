@@ -84,6 +84,7 @@ import { ExternalLinkIcon } from "../components/icons";
 import { gateMismatchMessage, PlanPanel, SeededPlanPanel, type GateMismatch } from "./runView/PlanPanel";
 import { JudgePanel } from "./runView/JudgePanel";
 import { CompletionDecisionPanel } from "./runView/CompletionDecisionPanel";
+import { DeliveredCard } from "./runView/DeliveredCard";
 
 // The Plan cluster moved to ./runView/PlanPanel; re-exported so external importers
 // and tests stay byte-identical.
@@ -731,6 +732,8 @@ const DELTA_KIND: Record<string, { tone: BadgeTone; glyph: string; label: string
  * PRD #362 M4 (Decisions 2/6/9/10): the run-summary cards — the intent summary ("what this
  * run will implement"), the plan summary (labelled proposed/approved from run status,
  * Decision 2 — never regenerated), and the plan's deltas from the original ask (Decision 6).
+ * PRD #1798 M7 adds the "Delivered" section (runView/DeliveredCard): the run's published PR
+ * description, rendered as plain text only, under the same collapse.
  *
  * Rendered ONLY once a summary exists; until then this returns null and the issue-title
  * header (RunHeading) stands as the fallback (Decision 1's accepted consequence, and the
@@ -766,9 +769,11 @@ export function RunSummary({ run }: { run: Run }) {
   const deltas = Array.isArray(run.summary_deltas) ? run.summary_deltas : [];
   const hasIntent = intent !== "";
   const hasPlan = plan !== "";
+  // PRD #1798 M7: the published PR description ("Delivered") rides the same card and collapse.
+  const hasDelivered = run.pr_description != null && typeof run.pr_description === "object";
 
   // Nothing to show yet — the issue-title header stands (Decision 1/5).
-  if (!hasIntent && !hasPlan) return null;
+  if (!hasIntent && !hasPlan && !hasDelivered) return null;
 
   const toggle = () => {
     const next = !collapsed;
@@ -837,6 +842,8 @@ export function RunSummary({ run }: { run: Run }) {
               )}
             </section>
           )}
+
+          {hasDelivered && <DeliveredCard run={run} />}
         </div>
       )}
     </Card>

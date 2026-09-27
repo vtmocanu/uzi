@@ -1,0 +1,72 @@
+[
+  {
+    "name": "every bucket, thousands separators",
+    "size": {
+      "unavailable": false,
+      "files": 1234,
+      "code": { "added": 1810, "deleted": 42 },
+      "tests": { "added": 250, "deleted": 7 },
+      "docs": { "added": 12, "deleted": 1 },
+      "config": { "added": 3, "deleted": 2 },
+      "generated": { "added": 10500, "deleted": 9999 },
+      "vendored": { "added": 1000000, "deleted": 1 }
+    },
+    "expected": "Size: code +1,810 −42 · tests +250 −7 · docs +12 −1 · config +3 −2 · generated +10,500 −9,999 · vendored +1,000,000 −1 · 1,234 files"
+  },
+  {
+    "name": "zero buckets omitted",
+    "size": {
+      "unavailable": false,
+      "files": 3,
+      "code": { "added": 120, "deleted": 0 },
+      "tests": { "added": 0, "deleted": 0 },
+      "docs": { "added": 0, "deleted": 15 },
+      "config": { "added": 0, "deleted": 0 },
+      "generated": { "added": 0, "deleted": 0 },
+      "vendored": { "added": 0, "deleted": 0 }
+    },
+    "expected": "Size: code +120 −0 · docs +0 −15 · 3 files"
+  },
+  {
+    "name": "one file is singular",
+    "size": {
+      "unavailable": false,
+      "files": 1,
+      "code": { "added": 0, "deleted": 0 },
+      "tests": { "added": 5, "deleted": 2 },
+      "docs": { "added": 0, "deleted": 0 },
+      "config": { "added": 0, "deleted": 0 },
+      "generated": { "added": 0, "deleted": 0 },
+      "vendored": { "added": 0, "deleted": 0 }
+    },
+    "expected": "Size: tests +5 −2 · 1 file"
+  },
+  {
+    "name": "unavailable",
+    "size": {
+      "unavailable": true,
+      "files": 0,
+      "code": { "added": 0, "deleted": 0 },
+      "tests": { "added": 0, "deleted": 0 },
+      "docs": { "added": 0, "deleted": 0 },
+      "config": { "added": 0, "deleted": 0 },
+      "generated": { "added": 0, "deleted": 0 },
+      "vendored": { "added": 0, "deleted": 0 }
+    },
+    "expected": "Size: unavailable"
+  },
+  {
+    "name": "no files renders no line (the agent renders none for an empty diff)",
+    "size": {
+      "unavailable": false,
+      "files": 0,
+      "code": { "added": 0, "deleted": 0 },
+      "tests": { "added": 0, "deleted": 0 },
+      "docs": { "added": 0, "deleted": 0 },
+      "config": { "added": 0, "deleted": 0 },
+      "generated": { "added": 0, "deleted": 0 },
+      "vendored": { "added": 0, "deleted": 0 }
+    },
+    "expected": null
+  }
+]
