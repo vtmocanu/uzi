@@ -109,6 +109,7 @@ import { installJsDeps } from "./js-deps.js";
 import { detectToolchain, type ToolchainDetection } from "./toolchain-detect.js";
 import { isCIConfigPlan } from "./prompt.js";
 import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
+import { computeSizeLine, SIZE_UNAVAILABLE } from "./pr-size.js";
 import { REASON_PROVISION_FAILED } from "./provision-run.js";
 import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
 import { PLAN_MISSING_QUESTION, PLAN_MISSING_QUESTION_HEADER, REASON_PLAN_MISSING } from "./plan-missing.js";
@@ -4822,6 +4823,20 @@ export class RunRunner {
       claim.repo.default_branch?.trim() ||
       (await this.git.defaultBranchName(barePath)) ||
       "main";
+    // PRD #1798 M1 (D3): the deterministic size line, computed HERE — after the push, align and
+    // history bridge (so the branch that will be published is final) and after the interlock permit
+    // (so the head is the landed tip, never a pre-align candidate) — from the worker-side tracking ref
+    // against the merge-base with the target branch. It is threaded into BOTH mrDescription calls
+    // (creation and the verified-head reconcile) so a body rewrite keeps it. computeSizeLine never
+    // throws; the extra catch only guards the tracking-ref read, so the size line can never fail a run.
+    let sizeLine: string | null;
+    try {
+      const sizeHead = await this.git.trackingTip(barePath, result.branch);
+      sizeLine = await computeSizeLine(this.git, barePath, targetBranch, sizeHead, runLog);
+    } catch (err) {
+      runLog.warn("PR size line unavailable", { run_id: runId, error: errMessage(err) });
+      sizeLine = SIZE_UNAVAILABLE;
+    }
     // Pick the forge client from the claim's forge_type (absent ⇒ gitlab, R8), so
     // the worker opens an MR on GitLab and a PR on Forgejo/GitHub from the same code
     // path; each client derives its own API base + project from repo.url (D9).
@@ -4860,6 +4875,7 @@ export class RunRunner {
             renderCloses,
             claim.config?.completion_scope,
             bridged,
+            sizeLine ?? undefined,
           ),
         }, boundarySignal),
       { log: runLog, signal: boundarySignal },
@@ -4905,6 +4921,7 @@ export class RunRunner {
           withCloses,
           claim.config?.completion_scope,
           bridged,
+          sizeLine ?? undefined,
         );
         const desc = banner ? `${banner}\n\n${base}` : base;
         await withForgeRetry(
@@ -10921,6 +10938,11 @@ export function mrDescription(
   // body of EVERY kind's MR — never "the worker bridged it", because the agent's own `git merge -s
   // ours <P>` bridge is equally possible. Defaults false so a non-bridged MR is byte-identical to today.
   bridged = false,
+  // PRD #1798 M1 (D3): the deterministic size line (`**Size:** ...`, or `**Size:** unavailable`),
+  // appended to EVERY kind's body: before the `---` footer in the issue arm, after the body (like the
+  // bridge note) in a per-kind arm. Absent/empty (no diff, or a caller that does not pass it) ⇒ the
+  // body is byte-identical to today.
+  sizeLine?: string,
 ): string {
   const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
   // One generic sentence, rendered into whichever body arm runs below (a per-kind body or the issue
@@ -10956,7 +10978,8 @@ export function mrDescription(
     selfImproveSection,
     promptGuardSection,
   });
-  if (kindBody !== undefined) return kindBody + bridgeNote;
+  const sizeNote = sizeLine ? `\n\n${sizeLine}` : "";
+  if (kindBody !== undefined) return kindBody + bridgeNote + sizeNote;
   // PRD #1227 M2/M3: the owner completion decisions. `deferred` non-empty ⇒ owner PARTIAL
   // (scope_reduced): the issue is NOT fully delivered. `accepted` non-empty ⇒ owner-waived unmet
   // criteria to name in a warning block. Both absent/empty on a normal run.
@@ -11022,6 +11045,8 @@ export function mrDescription(
   if (gatesSection) body.push("", gatesSection);
   // #1416 FIX 6: render the bridge sentence WITHIN the body, before the `---` footer.
   if (bridgeSentence) body.push("", bridgeSentence);
+  // PRD #1798 M1: the size line, after gates/bridge and before the `---` footer.
+  if (sizeLine) body.push("", sizeLine);
   body.push("", "---", footer);
   return body.join("\n");
 }

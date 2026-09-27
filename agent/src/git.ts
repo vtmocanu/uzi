@@ -22,6 +22,7 @@ import {
   stripAnsiSgr,
   type SecretFinding,
 } from "./secret-scan-guard.js";
+import { lookupAttributes, type PathAttributes } from "./pr-size.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -3323,6 +3324,63 @@ export class GitCache {
     // Slice on a byte boundary so a giant diff cannot balloon the string we keep. A cut
     // through a multi-byte rune yields at most one U+FFFD; harmless for review text.
     return buf.subarray(0, REVIEW_DIFF_MAX_BYTES).toString("utf8") + marker;
+  }
+
+  /**
+   * PRD #1798 M1 — the merge-base of the MR's target branch and the landed head, the base of the
+   * size line's diff (D3). `targetBranch` resolves the same way {@link reviewDiff} resolves its base:
+   * the bare's origin-tracking ref `refs/remotes/origin/<target>` when it exists, else verbatim.
+   * Worker-uid bare read. Throws when no merge-base resolves (the caller renders "unavailable").
+   */
+  async sizeMergeBase(barePath: string, targetBranch: string, headSha: string): Promise<string> {
+    const remoteRef = `refs/remotes/origin/${targetBranch}`;
+    const targetRef = (await this.refExists(barePath, remoteRef)) ? remoteRef : targetBranch;
+    const sha = (await this.runGit(barePath, ["merge-base", targetRef, headSha])).trim();
+    if (!SHA40_RE.test(sha)) throw new Error(`merge-base of ${targetRef} and ${headSha} is not a commit SHA`);
+    return sha;
+  }
+
+  /**
+   * PRD #1798 M1 — raw `git diff -z --numstat -M <base> <head>` of the landed head (D3), parsed by
+   * pr-size.ts. A tree-to-tree diff in the worker bare (no working tree). `--no-ext-diff` and
+   * `--no-textconv` keep git's own line counts regardless of a repo-declared diff driver (gitEnv pins
+   * `diff.external`, see {@link reviewDiff}). Throws on failure.
+   */
+  async diffNumstatZ(barePath: string, base: string, headSha: string): Promise<string> {
+    return this.runGit(barePath, ["diff", "-z", "--numstat", "-M", "--no-ext-diff", "--no-textconv", base, headSha]);
+  }
+
+  /**
+   * PRD #1798 M1 — the linguist attributes of `paths` at commit `headSha`, via `check-attr --source`
+   * with the isolated temp-index fallback for a git without `--source` (the order and the failure
+   * rules live in {@link lookupAttributes}). Worker-uid bare reads. Throws on any failure other than
+   * "--source unsupported", so the size line renders unavailable rather than ignoring attributes.
+   */
+  async checkAttrZ(barePath: string, headSha: string, paths: readonly string[]): Promise<Map<string, PathAttributes>> {
+    return lookupAttributes((args, opts) => this.sizeAttrGit(barePath, args, opts), headSha, paths);
+  }
+
+  /** The attribute-lookup git runner behind {@link checkAttrZ}: `git -C <bare> <args>` with optional stdin
+   *  and an optional GIT_INDEX_FILE. The rejection keeps git's raw `stderr` (unlike runGit's wrapped
+   *  message, which echoes the args and so would always "mention --source"). */
+  private async sizeAttrGit(barePath: string, args: string[], opts: { input?: string; indexFile?: string }): Promise<string> {
+    const env = gitEnv();
+    if (opts.indexFile) env.GIT_INDEX_FILE = opts.indexFile;
+    this.log.debug("git", { cwd: barePath, args });
+    try {
+      const { stdout } = await this.execScoped("git", withDir(barePath, args), {
+        env,
+        timeout: GIT_TIMEOUT_MS,
+        maxBuffer: GIT_MAX_BUFFER,
+        ...(opts.input === undefined ? {} : { input: opts.input }),
+      });
+      return stdout;
+    } catch (err) {
+      const stderr = (err as { stderr?: unknown }).stderr;
+      const wrapped = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`) as Error & { stderr?: string };
+      wrapped.stderr = typeof stderr === "string" ? stderr : "";
+      throw wrapped;
+    }
   }
 
   /**
