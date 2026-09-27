@@ -20,6 +20,7 @@ import {
   ForgejoClient,
   GitHubClient,
   type FetchFn,
+  type FetchResponse,
 } from "../src/forge.js";
 import {
   RunRunner,
@@ -123,6 +124,10 @@ export interface FakeForgeOpts {
    *  test can move the head or edit the description at a given write (or, by changing `headStatus`
    *  on the options object it passed, make later reads fail). */
   onWrite?: (pr: FakePr, description: string) => void;
+  /** PRD #1798 M6: answers a request before the fake does (the request is still recorded). Return
+   *  undefined to let the fake answer. A test uses it for a response the options cannot express (a
+   *  real streamed Response over a byte cap, a slow create). */
+  intercept?: (req: { method: string; url: string }, pr: FakePr) => Promise<FetchResponse | undefined> | FetchResponse | undefined;
 }
 
 /** A captured fake forge. `calls` holds the create POSTs and the body writes (PUT/PATCH), `reads`
@@ -151,6 +156,11 @@ function fakeTransport(
   const fetchFn: FetchFn = async (url, init) => {
     const call = { url, method: init.method, headers: init.headers, body: init.body };
     all.push(call);
+    const answer = await opts.intercept?.({ method: init.method, url }, pr);
+    if (answer) {
+      (init.method === "GET" ? reads : calls).push(call);
+      return answer;
+    }
     if (init.method === "GET") {
       reads.push(call);
       const status = opts.headStatus ?? 200;

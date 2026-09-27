@@ -825,17 +825,93 @@ describe("publisher: closingRemains on a non-closing issue publication", () => {
     assert.equal((await closing.publish(MR)).closingRemains, false);
   });
 
-  it("an over-cap read (ForgeResponseTooLarge) is an unreadable PR: nothing is written, nothing observed", async () => {
+  it("an over-cap read (ForgeResponseTooLarge) is an unreadable PR: the blind non-closing rewrite runs", async () => {
     const r = rig();
+    r.forge.pr.description = `Closes #7\n\n${completion(true)}`;
     r.forge.getMergeRequest = async () => {
       throw new ForgeResponseTooLarge(MR_DETAIL_MAX_BYTES);
     };
     const pub = await r.publisher.prepare(nonClosing(), { headSha: H1, targetBranch: "main" });
     const out = await pub.publish(MR);
+    assert.equal(out.wrote, true);
+    assert.deepEqual(r.forge.writes, [pub.initialBody(completion(false))], "uzi's region and the non-closing block, nothing preserved");
+    assert.equal(closingDirectiveFor(r.forge.pr.description, IID, "o/r"), false);
+    assert.equal(out.closingRemains, false);
+    assert.deepEqual(api.acks(), [], "a blind rewrite binds and acks nothing");
+  });
+
+  it("no read ever succeeds and the blind rewrite is refused: closingRemains (nothing observed is not proof)", async () => {
+    const r = rig();
+    r.forge.pr.description = `Closes #7\n\n${completion(true)}`;
+    r.forge.failRead = () => true;
+    r.forge.failWrite = true;
+    const pub = await r.publisher.prepare(nonClosing(), { headSha: H1, targetBranch: "main" });
+    const out = await pub.publish(MR);
     assert.equal(out.wrote, false);
+    assert.equal(out.closingRemains, true);
+  });
+
+  it("no read ever succeeds on a CLOSING publication: nothing is written and nothing is reported", async () => {
+    const r = rig();
+    r.forge.failRead = () => true;
+    const pub = await r.publisher.prepare(makeSpec({ interlockIssueIid: IID }), { headSha: H1, targetBranch: "main" });
+    const out = await pub.publish(MR);
     assert.equal(r.forge.writes.length, 0);
     assert.equal(out.closingRemains, false);
-    assert.deepEqual(api.acks(), []);
+  });
+
+  it("the blind rewrite runs under the caller's signal, not the spent budget", async () => {
+    const r = rig();
+    let writeSignal: AbortSignal | undefined;
+    r.forge.getMergeRequest = (_u?: string, _p?: string, _i?: number, signal?: AbortSignal) =>
+      new Promise<MergeRequestDetail>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new ForgeError(0, "aborted")), { once: true });
+      });
+    const write = r.forge.updateMergeRequestDescription.bind(r.forge);
+    r.forge.updateMergeRequestDescription = async (u, p, i, d, signal?: AbortSignal) => {
+      writeSignal = signal;
+      return write(u, p, i, d);
+    };
+    const publisher = new PrDescriptionPublisher({ forge: r.forge, api: client, pass: null, log: nullLogger(), emit: () => {}, forgeBudgetMs: 30 });
+    const caller = new AbortController();
+    const pub = await publisher.prepare(nonClosing({ signal: caller.signal }), { headSha: H1, targetBranch: "main" });
+    const out = await pub.publish(MR);
+    assert.equal(out.wrote, true, "the budget ended the hung read, and the blind rewrite still ran");
+    assert.equal(writeSignal, caller.signal);
+    assert.equal(out.closingRemains, false);
+  });
+});
+
+describe("publisher: a stale_claim at staging judges closingRemains like a stop at bind or lookup", () => {
+  const nonClosing = (over: Partial<PublicationSpec> = {}) =>
+    makeSpec({ interlockIssueIid: IID, completionCloses: false, completion: (st) => completion(false, st), ...over });
+
+  for (const [op, closing] of [
+    ["stage", true],
+    ["stage", false],
+    ["bind", true],
+    ["bind", false],
+  ] as const) {
+    it(`${op} answers 409 stale_claim over a ${closing ? "closing" : "non-closing"} body: closingRemains is ${closing}, nothing is written`, async () => {
+      const r = rig();
+      r.forge.pr.description = `${closing ? "Closes #7" : "Notes"}\n\n${[REGION_START, SIZE_LINE, REGION_END].join("\n")}\n\n${completion(false)}`;
+      api.failNext(op, 409, "stale_claim");
+      const pub = await r.publisher.prepare(nonClosing(), { headSha: H1, targetBranch: "main" });
+      const out = await pub.publish(MR);
+      assert.equal(r.forge.writes.length, 0, "a stopped publication writes nothing");
+      assert.ok(r.forge.reads >= 1, "the PR was read");
+      assert.equal(out.closingRemains, closing);
+    });
+  }
+
+  it("a stale_claim at staging over an unreadable PR: no write, and closingRemains fails closed", async () => {
+    const r = rig();
+    r.forge.failRead = () => true;
+    api.failNext("stage", 409, "stale_claim");
+    const pub = await r.publisher.prepare(nonClosing(), { headSha: H1, targetBranch: "main" });
+    const out = await pub.publish(MR);
+    assert.equal(r.forge.writes.length, 0);
+    assert.equal(out.closingRemains, true);
   });
 });
 
@@ -913,6 +989,18 @@ describe("publisher: one overall time budget", () => {
     const out = await pub.publish(MR);
     assert.ok(Date.now() - started < 5_000, "the budget ended the hung read");
     assert.equal(out.wrote, false);
+  });
+
+  it("the forge budget starts at publish(), not prepare(): a create slower than the budget still leaves publish its reads", async () => {
+    const forge = new FakeForge();
+    const publisher = new PrDescriptionPublisher({ forge, api: client, pass: null, log: nullLogger(), emit: () => {}, sleep: async () => {}, headLagRetryMs: 0, forgeBudgetMs: 100 });
+    const pub = await publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    // The create (between prepare and publish) takes longer than the whole forge budget.
+    await new Promise((r) => setTimeout(r, 250));
+    forge.pr.description = pub.initialBody(completion(true));
+    const out = await pub.publish(MR);
+    assert.ok(forge.reads >= 2, `publish read the PR (read 1 and read 2): ${forge.reads}`);
+    assert.equal(out.ack, "published", "the publication ran to its ack under its own budget");
   });
 
   it("the budget covers the editor pass's deadline plus the forge share", async () => {

@@ -7,6 +7,7 @@ import {
   ForgeError,
   ForgeResponseTooLarge,
   MR_DETAIL_MAX_BYTES,
+  MR_LIST_MAX_BYTES,
   forgeClientFor,
   gitlabBaseUrl,
   gitlabProjectPath,
@@ -852,7 +853,9 @@ describe("getMergeRequest — the byte-capped detail read (H1)", () => {
     assert.strictEqual(textCalled, false, "the whole body is never buffered through text()");
     assert.ok(h.pulled() <= MR_DETAIL_MAX_BYTES + 2 * MiB, `pulled ${h.pulled()} bytes`);
     assert.ok(h.cancelled(), "the rest of the stream is cancelled");
-    assert.strictEqual(MR_DETAIL_MAX_BYTES, 4 * MiB + 64 * 1024);
+    // 6 bytes per character (JSON's `\u0001` escape of a control character) for 1,048,576
+    // characters, plus 64 KiB of headroom.
+    assert.strictEqual(MR_DETAIL_MAX_BYTES, 6 * MiB + 64 * 1024);
   });
 
   it("a streamed answer under the cap parses exactly as text() does (a real Response)", async () => {
@@ -989,5 +992,114 @@ describe("URL helpers", () => {
 
   it("rejects a GitHub URL that has no owner/repo", () => {
     assert.throws(() => githubRepoParts("https://github.com/only-one"), (e: unknown) => e instanceof ForgeError);
+  });
+});
+
+// PRD #1798 M6 (H1): every remaining forge read is byte-capped too: the head read, the create (201)
+// response, and the find-existing lookup (a list on GitLab/GitHub, a single PR on Forgejo). Each is a
+// REAL fetch Response over a lazily pulled ReadableStream, so the test proves the read stops near the
+// cap and cancels the stream instead of buffering it.
+describe("byte caps on every forge read path (H1)", () => {
+  const MiB = 1_048_576;
+  /** A real Response whose body is `total` bytes of JSON-ish filler, pulled 1 MiB at a time. */
+  function streamed(status: number, total: number): { res: Response; pulled: () => number; cancelled: () => boolean } {
+    let pulled = 0;
+    let cancelled = false;
+    const chunk = new Uint8Array(MiB).fill(0x61);
+    const body = new ReadableStream<Uint8Array>({
+      pull(ctl) {
+        if (pulled >= total) return ctl.close();
+        pulled += chunk.byteLength;
+        ctl.enqueue(chunk);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    return { res: new Response(body, { status }), pulled: () => pulled, cancelled: () => cancelled };
+  }
+  const tooLarge = (max: number) => (err: unknown) => {
+    assert.ok(err instanceof ForgeResponseTooLarge, String(err));
+    assert.ok(err instanceof ForgeError);
+    assert.strictEqual(err.status, 0);
+    assert.strictEqual(err.maxBytes, max);
+    return true;
+  };
+  /** A transport answering `first` (a status-only answer) and then the streamed response. */
+  function sequence(first: number | undefined, s: ReturnType<typeof streamed>): { fetchFn: FetchFn; methods: string[] } {
+    const methods: string[] = [];
+    const fetchFn: FetchFn = async (_url, init) => {
+      methods.push(init.method);
+      if (first !== undefined && methods.length === 1) return { status: first, text: async () => "duplicate" };
+      return s.res;
+    };
+    return { fetchFn, methods };
+  }
+
+  const heads: Array<[string, (f: FetchFn) => GitLabClient | ForgejoClient | GitHubClient, string]> = [
+    ["GitLab", (f) => new GitLabClient({ fetchFn: f }), base.repoUrl],
+    ["Forgejo", (f) => new ForgejoClient({ fetchFn: f }), fjBase.repoUrl],
+    ["GitHub", (f) => new GitHubClient({ fetchFn: f }), ghBase.repoUrl],
+  ];
+  for (const [name, make, repoUrl] of heads) {
+    it(`${name} getMergeRequestHead: a 64 MiB answer is refused at the detail cap and the stream is cancelled`, async () => {
+      const s = streamed(200, 64 * MiB);
+      const { fetchFn } = sequence(undefined, s);
+      await assert.rejects(make(fetchFn).getMergeRequestHead(repoUrl, PAT, 42), tooLarge(MR_DETAIL_MAX_BYTES));
+      assert.ok(s.pulled() <= MR_DETAIL_MAX_BYTES + 2 * MiB, `pulled ${s.pulled()} bytes`);
+      assert.ok(s.cancelled());
+    });
+  }
+
+  it("a head read under the cap still parses (a real Response)", async () => {
+    const fetchFn: FetchFn = async () => new Response(JSON.stringify({ iid: 42, sha: HEAD_TOP_LEVEL }), { status: 200 });
+    assert.strictEqual(await new GitLabClient({ fetchFn }).getMergeRequestHead(base.repoUrl, PAT, 42), HEAD_TOP_LEVEL);
+  });
+
+  it("createMergeRequest: an over-cap 201 answer is refused at the detail cap, not buffered", async () => {
+    const s = streamed(201, 64 * MiB);
+    const { fetchFn, methods } = sequence(undefined, s);
+    await assert.rejects(new GitLabClient({ fetchFn }).createMergeRequest(base), tooLarge(MR_DETAIL_MAX_BYTES));
+    assert.deepStrictEqual(methods, ["POST"]);
+    assert.ok(s.pulled() <= MR_DETAIL_MAX_BYTES + 2 * MiB, `pulled ${s.pulled()} bytes`);
+    assert.ok(s.cancelled());
+  });
+
+  it("GitLab findOpenMr: an over-cap list after a 409 is refused at the list cap", async () => {
+    const s = streamed(200, 64 * MiB);
+    const { fetchFn, methods } = sequence(409, s);
+    await assert.rejects(new GitLabClient({ fetchFn }).createMergeRequest(base), tooLarge(MR_LIST_MAX_BYTES));
+    assert.deepStrictEqual(methods, ["POST", "GET"]);
+    assert.ok(s.pulled() <= MR_LIST_MAX_BYTES + 2 * MiB, `pulled ${s.pulled()} bytes`);
+    assert.ok(s.cancelled());
+  });
+
+  it("GitHub findOpenMr: an over-cap list after a 422 is refused at the list cap", async () => {
+    const s = streamed(200, 64 * MiB);
+    const { fetchFn, methods } = sequence(422, s);
+    await assert.rejects(new GitHubClient({ fetchFn }).createMergeRequest(ghBase), tooLarge(MR_LIST_MAX_BYTES));
+    assert.deepStrictEqual(methods, ["POST", "GET"]);
+    assert.ok(s.pulled() <= MR_LIST_MAX_BYTES + 2 * MiB, `pulled ${s.pulled()} bytes`);
+    assert.ok(s.cancelled());
+  });
+
+  it("Forgejo findOpenMr: the single-PR lookup after a 409 is refused at the detail cap", async () => {
+    const s = streamed(200, 64 * MiB);
+    const { fetchFn, methods } = sequence(409, s);
+    await assert.rejects(new ForgejoClient({ fetchFn }).createMergeRequest(fjBase), tooLarge(MR_DETAIL_MAX_BYTES));
+    assert.deepStrictEqual(methods, ["POST", "GET"]);
+    assert.ok(s.pulled() <= MR_DETAIL_MAX_BYTES + 2 * MiB, `pulled ${s.pulled()} bytes`);
+    assert.ok(s.cancelled());
+  });
+
+  it("the list cap admits one worst-case MR: a list over the detail cap but under the list cap is adopted", async () => {
+    assert.ok(MR_LIST_MAX_BYTES > MR_DETAIL_MAX_BYTES + 64 * 1024, "the list cap holds one detail-sized object");
+    const one = [{ iid: 7, web_url: "https://gitlab.example.com/x/-/merge_requests/7", description: "\u0001".repeat(Math.ceil(MR_DETAIL_MAX_BYTES / 6) + 1024) }];
+    const text = JSON.stringify(one);
+    assert.ok(Buffer.byteLength(text) > MR_DETAIL_MAX_BYTES && Buffer.byteLength(text) < MR_LIST_MAX_BYTES);
+    let n = 0;
+    const fetchFn: FetchFn = async () => (++n === 1 ? { status: 409, text: async () => "duplicate" } : new Response(text, { status: 200 }));
+    const mr = await new GitLabClient({ fetchFn }).createMergeRequest(base);
+    assert.deepStrictEqual(mr, { iid: 7, webUrl: "https://gitlab.example.com/x/-/merge_requests/7" });
   });
 });

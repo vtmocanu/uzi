@@ -7,13 +7,21 @@
 // forge ended up showing (D9). Every failure here is ADVISORY: nothing in this module fails or
 // holds a run. The interlock's own reconcile (reconcileCompletion) reports a typed result and the
 // runner decides whether to hold or fail closed. One outcome the runner does act on: on an issue run
-// whose completion block is non-closing, `closingRemains` reports that the PR still carries a
-// closing directive uzi could not remove (amended D10), and the runner fails the run closed.
+// whose completion block is non-closing, `closingRemains` reports that the PR may still carry a
+// closing directive uzi could not remove, or could not rule out because it never saw the body and
+// its blind rewrite failed (amended D10), and the runner fails the run closed.
 //
-// A publication runs under ONE time budget (the editor pass's deadline plus FORGE_BUDGET_MS); every
-// api call, forge call and wait honours it. A 409 `stale_claim` or `run_terminal` from any route
-// stops the publication: no further api call and no forge write (the interlock's writes are the
-// runner's and are unaffected).
+// A publication runs under a time budget (the editor pass's remaining deadline plus FORGE_BUDGET_MS);
+// every api call, forge call and wait honours it. prepare() runs under one budget; publish() starts a
+// fresh one when it is called (after createMergeRequest returned), so a slow create cannot spend the
+// publication's forge share. The editor pass's own deadline is fixed at prepare() and never
+// restarts. A 409 `stale_claim` or `run_terminal` from any route stops the publication: no further
+// api call and no forge write (the interlock's writes are the runner's and are unaffected).
+//
+// One forge write sits outside the budget: when a scanning publication (see closingRemains) never
+// read the PR, it falls back to the blind whole-body non-closing rewrite reconcileCompletion uses,
+// under the caller's signal (spec.signal) rather than the spent or failed budget. It is a safety
+// write, not a region update, and a stopped publication never makes it.
 //
 // The publication, in the spec's steps:
 //
@@ -174,11 +182,13 @@ export interface PublishOutcome {
   interlockRewrite: boolean;
   /**
    * Only for a publication that scans (an `own` issue run whose completion block is non-closing):
-   * the body the PR is last known to carry still has a closing directive for the issue outside
-   * uzi's completion block, because the rewrite failed, was never attempted (a publication stopped
-   * after reading the PR, or one whose budget ran out), or could not be confirmed by a re-read. False when the publication does not scan,
-   * and when no read of the PR ever succeeded (nothing was observed). The runner fails such a run
-   * closed (amended D10).
+   * the PR may still carry a closing directive for the issue outside uzi's completion block. True
+   * when the body the PR is last known to carry has one (the rewrite failed, was never attempted,
+   * e.g. a publication stopped after reading the PR, or could not be confirmed by a re-read), and
+   * when no read of the PR ever succeeded and the blind whole-body non-closing rewrite that then
+   * follows failed or was not attempted (a stopped publication): nothing observed is not proof of
+   * nothing closing. After a blind rewrite lands, the body it wrote is what is judged. False when
+   * the publication does not scan. The runner fails such a run closed (amended D10).
    */
   closingRemains: boolean;
 }
@@ -451,7 +461,7 @@ export class PrDescriptionPublisher {
 
 export class PrDescriptionPublication {
   private staged!: Staged;
-  /** The editor pass's ONE deadline (D2), fixed when the publication starts. */
+  /** The editor pass's ONE deadline (D2), fixed when the publication starts (prepare). */
   private readonly deadline: number | undefined;
   private regenerationLeft = true;
   private recomposeLeft = true;
@@ -461,9 +471,9 @@ export class PrDescriptionPublication {
   /** Every region this publication rendered (each staged version's region and size-only form): a
    *  region on the forge equal to one of them is uzi's own, whatever became of its version. */
   private readonly rendered = new Set<string>();
-  /** spec.signal combined with the publication's one time budget (Timing): every api call, forge
-   *  call and wait uses it. */
-  private readonly signal: AbortSignal;
+  /** spec.signal combined with the current phase's time budget (Timing): every api call, forge call
+   *  and wait uses it. Set at prepare(), and replaced by a fresh budget when publish() starts. */
+  private signal: AbortSignal;
   /** A stale_claim / run_terminal 409 was answered: no further api call and no forge write. */
   private stopped = false;
   private readonly memo = new BodyMemo();
@@ -478,10 +488,16 @@ export class PrDescriptionPublication {
   ) {
     this.state = spec.prior ?? null;
     this.deadline = deps.pass?.deliverySummaryDeadline();
-    const passMs = this.deadline === undefined ? 0 : Math.min(PASS_BUDGET_MAX_MS, Math.max(0, this.deadline - Date.now()));
-    const budget = AbortSignal.timeout(passMs + (deps.forgeBudgetMs ?? FORGE_BUDGET_MS));
-    this.signal = spec.signal ? AbortSignal.any([spec.signal, budget]) : budget;
+    this.signal = this.budget();
     this.sleep = deps.sleep ?? ((ms) => abortableSleep(ms, this.signal));
+  }
+
+  /** A budget starting now: what is left of the editor pass's deadline (a publish-time regeneration
+   *  runs the pass again under that same deadline) plus the forge-and-api share. */
+  private budget(): AbortSignal {
+    const passMs = this.deadline === undefined ? 0 : Math.min(PASS_BUDGET_MAX_MS, Math.max(0, this.deadline - Date.now()));
+    const budget = AbortSignal.timeout(passMs + (this.deps.forgeBudgetMs ?? FORGE_BUDGET_MS));
+    return this.spec.signal ? AbortSignal.any([this.spec.signal, budget]) : budget;
   }
 
   private forgeRetry<T>(fn: () => Promise<T>): Promise<T> {
@@ -831,13 +847,16 @@ export class PrDescriptionPublication {
   /** Publish onto PR `mrIid`. Never throws; every failure is advisory, except that a scanning
    *  publication reports `closingRemains` (the runner fails that run closed). */
   async publish(mrIid: number): Promise<PublishOutcome> {
+    // The forge budget starts here, after createMergeRequest returned, not at prepare().
+    this.signal = this.budget();
     try {
       return await this.publishInner(mrIid);
     } catch (e) {
       this.deps.log.warn("PR description: publishing failed", { run_id: this.spec.runId, error: errMsg(e) });
+      const wrote = await this.blindIfUnread(mrIid);
       return {
         region: this.staged.region,
-        wrote: false,
+        wrote,
         interlockRewrite: false,
         ack: this.acks.at(-1),
         closingRemains: this.remainsClosing(),
@@ -845,11 +864,43 @@ export class PrDescriptionPublication {
     }
   }
 
-  /** The last body known on the forge still closes the issue (see PublishOutcome.closingRemains).
-   *  Scanned against the completion block uzi last composed (the run's own block when none was):
-   *  a forge block that differs from it is scanned as ordinary text (fail closed). */
+  /**
+   * A scanning publication that never read the PR (read 1 failed, was over the byte cap, or the
+   * budget ran out first) cannot tell whether an adopted body closes the issue, so it writes the
+   * blind whole-body non-closing rewrite reconcileCompletion falls back to: uzi's region and the
+   * run's non-closing completion block, nothing preserved. It runs under spec.signal, not the
+   * budget (see the header). A stopped publication makes no forge write. True when it was written.
+   */
+  private async blindIfUnread(mrIid: number): Promise<boolean> {
+    if (!this.scans() || this.forgeBody !== undefined || this.stopped) return false;
+    const { spec, deps } = this;
+    const completion = spec.completion();
+    const body = this.initialBody(completion);
+    const write = () => deps.forge.updateMergeRequestDescription(spec.repoUrl, spec.pat, mrIid, body, spec.signal);
+    try {
+      await (deps.forgeRetry ? deps.forgeRetry(write, spec.signal) : write());
+    } catch (e) {
+      deps.log.warn("PR description: the PR could not be read, and the non-closing rewrite failed", {
+        run_id: spec.runId,
+        error: errMsg(e),
+      });
+      return false;
+    }
+    this.forgeBody = body;
+    this.expectedCompletion = completion;
+    deps.log.info("PR description: the PR could not be read, so its body was rewritten whole and non-closing", {
+      run_id: spec.runId,
+    });
+    return true;
+  }
+
+  /** The PR may still close the issue (see PublishOutcome.closingRemains). The last body known on
+   *  the forge is scanned against the completion block uzi last composed (the run's own block when
+   *  none was): a forge block that differs from it is scanned as ordinary text (fail closed). A
+   *  scanning publication that knows no body at all fails closed. */
   private remainsClosing(): boolean {
-    if (this.forgeBody === undefined) return false;
+    if (!this.scans()) return false;
+    if (this.forgeBody === undefined) return true;
     return this.closingIn(this.forgeBody, this.expectedCompletion ?? this.spec.completion());
   }
 
@@ -867,7 +918,18 @@ export class PrDescriptionPublication {
     const { deps } = this;
     if (this.stopped) {
       deps.log.info("PR description: the publication was stopped; the PR is left as it is", { run_id: this.spec.runId });
-      return { region: this.staged.region, wrote: false, interlockRewrite: false, closingRemains: false };
+      // Judged like a stop at bind or lookup, which comes after read 1: a scanning publication reads
+      // the PR (a read, no api call and no write) and judges closingRemains on what it shows. An
+      // unreadable PR is not rewritten (a stopped publication makes no forge write), so it fails
+      // closed.
+      if (this.scans()) {
+        try {
+          await this.read(mrIid);
+        } catch (e) {
+          deps.log.warn("PR description: a stopped publication could not read the PR", { run_id: this.spec.runId, error: errMsg(e) });
+        }
+      }
+      return { region: this.staged.region, wrote: false, interlockRewrite: false, closingRemains: this.remainsClosing() };
     }
     let read = await this.read(mrIid);
     // Step 3. A forge can lag a push by a moment (GitLab especially): when the head differs, re-read

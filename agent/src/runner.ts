@@ -5013,9 +5013,16 @@ export class RunRunner {
     // head is verified, an owner partial, a scope-capped run) has its whole body scanned for a
     // closing directive for the issue.
     const scanIid = runKind === "issue" && typeof claim.issue_iid === "number" ? claim.issue_iid : undefined;
-    const createCloses = renderCloses && !isOwnerPartial && !result.scopeCapped;
-    // H1: a detail read over its byte cap is a deterministic answer, not a blip: never retried. Both
-    // the publisher and the interlock then treat the MR as unreadable.
+    // The ONE non-closing-delivery predicate: this run delivers less than its issue asked for, so no
+    // body it writes may close the issue, verified head or not. Every closing decision below (the
+    // creation block, the reconcile's `closes`, whether the verified reconcile ADDED Closes) derives
+    // from it. Any new partial or blocker arm (a delivery that must not close its issue) MUST set it
+    // here rather than add its own check at one of those sites.
+    const nonClosingDelivery = isOwnerPartial || !!result.scopeCapped;
+    const createCloses = renderCloses && !nonClosingDelivery;
+    // H1: a forge response over its byte cap is a deterministic answer, not a blip: never retried
+    // (classifyForgeError alone would read its status 0 as a transport failure). Both the publisher
+    // and the interlock then treat the MR as unreadable; on the create path it fails the create.
     const classifyDescriptionError = (e: unknown): "transient" | "permanent" =>
       e instanceof ForgeResponseTooLarge ? "permanent" : classifyForgeError(e);
     // The publisher passes its budgeted signal (one time budget for the whole publication).
@@ -5115,7 +5122,7 @@ export class RunRunner {
           title: mrTitle(claim, result.scopeCapped, claim.config?.completion_scope),
           description: description.initialBody(completionFor(renderCloses)),
         }, boundarySignal),
-      { log: runLog, signal: boundarySignal },
+      { log: runLog, signal: boundarySignal, classify: classifyDescriptionError },
     );
     batcher.emit({
       kind: "status",
@@ -5172,7 +5179,7 @@ export class RunRunner {
     // non-closing write a failed read falls back to the blind whole-body rewrite (today's behaviour),
     // reported as `blind`: accepted by a hold's strip, never enough to complete.
     const reconcileMrDescription = async (withCloses: boolean, banner?: string): Promise<ReconcileResult> => {
-      const closes = withCloses && !isOwnerPartial && !result.scopeCapped;
+      const closes = withCloses && !nonClosingDelivery;
       return reconcileCompletion({
         forge,
         repoUrl: claim.repo.url,
@@ -5249,28 +5256,27 @@ export class RunRunner {
       // cannot remove fails the run closed rather than holding or completing a closing MR.
       const verified = await reconcileMrDescription(!isOwnerPartial);
       // PRD #1798 M6 (ADR 1225): whether this reconcile ADDED `Closes #N` (reconcileMrDescription's
-      // own `closes`). On that path EVERY non-confirmed result (a write attempted but unconfirmed, a
-      // confirm read that failed, a re-read that did not carry the written block) may have left
-      // Closes on the MR, so it strips Closes and holds, failing closed when the strip is not
-      // confirmed. A plain hold here would keep `Closes #N` on an unverified head.
-      const addedCloses = !isOwnerPartial && !result.scopeCapped;
-      if (addedCloses && verified !== "confirmed") {
-        await stripClosesThenHold(
-          "could not assert the verified-head completion body",
-          "could not strip Closes after an unconfirmed add",
-        );
-        return;
-      }
+      // own `closes`: always !nonClosingDelivery here, since the verified reconcile asks for Closes
+      // unless the delivery is partial).
+      const addedCloses = !nonClosingDelivery;
       if (verified === "closing") {
         await failInterlockedClosed("could not remove a closing directive from a non-closing MR");
         return;
       }
       if (verified === "unconfirmed") {
-        // A non-closing reconcile that could not be confirmed: the MR may still carry an adopted
-        // closing block, so the hold strips first (and fails closed when it cannot).
+        // The reconcile could not be confirmed, so the MR may carry Closes: the one this reconcile
+        // ADDED (a write attempted but unconfirmed, a confirm read that failed, a re-read that did not
+        // carry the written block), or, on a non-closing delivery, an adopted closing block. Either
+        // way the hold strips first and fails closed when the strip is not confirmed; a plain hold
+        // here would keep `Closes #N` on an unverified head. This is EVERY non-confirmed result of a
+        // Closes add: a closing reconcile scans nothing and never falls back blind, so it answers only
+        // `confirmed` or `unconfirmed` (reconcileCompletion reports `blind` and `closing` only for a
+        // non-closing write).
         await stripClosesThenHold(
           "could not assert the verified-head completion body",
-          "could not strip Closes from an unconfirmed non-closing MR",
+          addedCloses
+            ? "could not strip Closes after an unconfirmed add"
+            : "could not strip Closes from an unconfirmed non-closing MR",
         );
         return;
       }

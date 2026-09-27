@@ -244,13 +244,13 @@ describe("RunRunner — the verified-head Closes add is bound to what was writte
     assert.ok(!statuses(claim.run_id).includes("completed"), "never completes on a moved head");
     assert.doesNotMatch(pr.description, /Closes #1901/, "no Closes is left on the MR");
     assert.equal(closingDirectiveFor(pr.description, 1901, "org/repo"), false);
-    const held = api.completionHoldRequests.length === 1;
-    const failed = statuses(claim.run_id).includes("failed");
-    assert.ok(held || failed, "it holds (or fails closed)");
-    if (held) assert.match(pr.description, /Completion unverified/);
+    // The strip is readable and confirmed, so the run holds (exactly once) and does not fail.
+    assert.equal(api.completionHoldRequests.length, 1, "exactly one hold");
+    assert.ok(!statuses(claim.run_id).includes("failed"), "the strip landed, so it holds rather than fails");
+    assert.match(pr.description, /Completion unverified/);
   });
 
-  it("PROBE-B: the MR becomes unreadable (404) after the Closes write → Closes is stripped and the run holds or fails closed", async () => {
+  it("PROBE-B: the MR becomes unreadable (404) after the Closes write → Closes is stripped and the run holds", async () => {
     api.prDescription = new FakePrDescApi();
     const opts: FakeForgeOpts = {};
     opts.onWrite = (_p, description) => {
@@ -268,7 +268,11 @@ describe("RunRunner — the verified-head Closes add is bound to what was writte
     assert.ok(!statuses(claim.run_id).includes("completed"), "never completes on an unreadable MR");
     assert.doesNotMatch(pr.description, /Closes #1902/, "no Closes is left on the MR");
     assert.equal(closingDirectiveFor(pr.description, 1902, "org/repo"), false);
-    assert.ok(api.completionHoldRequests.length === 1 || statuses(claim.run_id).includes("failed"), "it holds (or fails closed)");
+    // The strip's read fails, so it falls back to the blind non-closing rewrite (which lands): the
+    // run holds exactly once and does not fail.
+    assert.equal(api.completionHoldRequests.length, 1, "exactly one hold");
+    assert.ok(!statuses(claim.run_id).includes("failed"));
+    assert.match(pr.description, /Completion unverified/);
   });
 });
 
@@ -347,7 +351,7 @@ describe("RunRunner — the publication and the interlock are independent (PRD #
 
 describe("RunRunner — an over-cap MR read (PRD #1798 M6, H1)", () => {
   it("the publisher skips the region, the read is not retried, and a legacy run still completes", async () => {
-    const { gitlab, pr, reads, calls } = fakeGitlab({ existing: "x".repeat(5 * 1_048_576) });
+    const { gitlab, pr, reads, calls } = fakeGitlab({ existing: "x".repeat(7 * 1_048_576) });
     followHead(pr);
     const claim = gitlabClaim(1860);
 
@@ -393,5 +397,178 @@ describe("RunRunner — the size line counts the PR's actual target, not the rep
     const stages = prApi.calls.filter((c) => c.op === "stage").map((c) => c.body.target_branch);
     assert.equal(stages.at(-1), "release", "the version the PR carries was staged for its real target");
     assert.deepEqual(prApi.acks().at(-1), "published");
+  });
+});
+
+// PRD #1798 M6: the verified-head path of an INTERLOCKED non-closing delivery (an owner partial, a
+// scope cap). The head is verified, so the reconcile writes the partial's non-closing block; its two
+// failure shapes take different arms. A failed MR read falls back to the blind non-closing rewrite
+// (`blind`): nothing confirmed the completion, so the run holds and never completes. A refused write
+// leaves the MR unconfirmed (it may still carry an adopted closing block), so the strip runs first,
+// and when the strip is refused too the run fails closed with no hold.
+describe("RunRunner — an interlocked non-closing delivery on a verified head (PRD #1798 M6)", () => {
+  const OWNER_PARTIAL = { deferred: [{ milestone_id: "m2", title: "Second", reason: "later" }] };
+  const arms: Array<[string, (iid: number) => ClaimResponse, () => StubExecutor]> = [
+    ["owner partial", (iid) => interlockedClaim(iid, OWNER_PARTIAL), () => new StubExecutor(nullLogger())],
+    ["scope cap", (iid) => interlockedClaim(iid), () => new ScopeCappedStub(nullLogger())],
+  ];
+  let iid = 1910;
+  for (const [name, makeClaim_, makeExecutor] of arms) {
+    it(`${name}: the reconcile's MR read fails (403) → the run HOLDS and never reports completed`, async () => {
+      const n = iid++;
+      const opts: FakeForgeOpts = { head: H, existing: adoptedBody(n, "Notes from the maintainer.") };
+      const { gitlab, pr, all } = fakeGitlab(opts);
+      // The head reads keep verifying H; every MR DETAIL read after the first head read (the
+      // reconcile's) is answered 403 by the transport. The head reads are left working so a run that
+      // skipped the `blind` arm would re-verify the head and complete (the mutation this gates).
+      let verified = false;
+      let refused = 0;
+      const readHead = gitlab.getMergeRequestHead.bind(gitlab);
+      gitlab.getMergeRequestHead = async (...args: Parameters<typeof readHead>) => {
+        const head = await readHead(...args);
+        verified = true;
+        return head;
+      };
+      const readDetail = gitlab.getMergeRequest.bind(gitlab);
+      gitlab.getMergeRequest = async (...args: Parameters<typeof readDetail>) => {
+        if (!verified) return readDetail(...args);
+        refused++;
+        opts.headStatus = 403;
+        try {
+          return await readDetail(...args);
+        } finally {
+          opts.headStatus = undefined;
+        }
+      };
+      const claim = makeClaim_(n);
+      api.setCompletionPermitResponse(true);
+      git.trackingTip = (async () => H) as typeof git.trackingTip;
+
+      await runnerWith(() => ({ executor: makeExecutor() }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
+
+      assert.ok(refused >= 1, "the reconcile's read was refused after the head was verified");
+      assert.ok(!statuses(claim.run_id).includes("completed"), "an unconfirmed partial never completes");
+      assert.equal(api.completionHoldRequests.length, 1, "exactly one hold");
+      assert.ok(!statuses(claim.run_id).includes("failed"), "the blind rewrite landed, so it holds rather than fails");
+      assert.equal(closingDirectiveFor(pr.description, n, "org/repo"), false);
+      assert.ok(!pr.description.includes("Notes from the maintainer."), "the blind rewrite replaced the body whole");
+      assert.equal(all.at(-1)?.method, "PUT", "the last forge call is the blind rewrite");
+    });
+
+    it(`${name}: body writes are refused (403) → the run FAILS closed with no hold`, async () => {
+      const n = iid++;
+      const { gitlab, pr } = fakeGitlab({ head: H, putStatus: 403, existing: adoptedBody(n, "Notes from the maintainer.") });
+      const claim = makeClaim_(n);
+      api.setCompletionPermitResponse(true);
+      git.trackingTip = (async () => H) as typeof git.trackingTip;
+
+      await runnerWith(() => ({ executor: makeExecutor() }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
+
+      assert.ok(!statuses(claim.run_id).includes("completed"));
+      assert.equal(api.completionHoldRequests.length, 0, "never holds an MR the strip could not confirm");
+      assert.ok(statuses(claim.run_id).includes("failed"), "fails closed");
+      assert.equal(pr.description, adoptedBody(n, "Notes from the maintainer."), "every write really was refused");
+    });
+  }
+});
+
+/** A real streamed Response of `total` filler bytes (a body over a byte cap). */
+function streamedResponse(status: number, total: number): Response {
+  const MiB = 1_048_576;
+  let sent = 0;
+  const chunk = new Uint8Array(MiB).fill(0x61);
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      pull(ctl) {
+        if (sent >= total) return ctl.close();
+        sent += chunk.byteLength;
+        ctl.enqueue(chunk);
+      },
+    }),
+    { status },
+  );
+}
+
+describe("RunRunner — over-cap forge answers are permanent and treated as unreadable (PRD #1798 M6, H1)", () => {
+  it("an over-cap create (201) answer fails the run after ONE POST: never retried", async () => {
+    const { gitlab, calls } = fakeGitlab({
+      intercept: (req) => (req.method === "POST" ? streamedResponse(201, 16 * 1_048_576) : undefined),
+    });
+    const claim = gitlabClaim(1920);
+
+    await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
+
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+    assert.ok(statuses(claim.run_id).includes("failed"));
+    assert.equal(calls.filter((c) => c.method === "POST").length, 1, "a response-too-large create is not retried");
+  });
+
+  it("an interlocked run whose head read is over the cap takes the unreadable-head path: strip, then hold", async () => {
+    const { gitlab, pr } = fakeGitlab({
+      head: H,
+      existing: adoptedBody(1921, "Closes #1921 please"),
+      intercept: (req) => (req.method === "GET" ? streamedResponse(200, 16 * 1_048_576) : undefined),
+    });
+    const claim = interlockedClaim(1921);
+    api.setCompletionPermitResponse(true);
+    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
+    await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
+      recoveryRetryMs: 1,
+    }).execute(claim);
+
+    assert.ok(!statuses(claim.run_id).includes("completed"), "an unreadable head never completes");
+    assert.equal(api.completionHoldRequests.length, 1, "exactly one hold");
+    assert.ok(!statuses(claim.run_id).includes("failed"));
+    assert.equal(closingDirectiveFor(pr.description, 1921, "org/repo"), false, "the adopted directive was stripped (blind)");
+    assert.match(pr.description, /Completion unverified/);
+  });
+});
+
+// PRD #1798 M6 (amended D10, M1): a legacy non-closing run whose publisher NEVER read the PR must not
+// complete on the strength of having observed nothing. It falls back to the blind whole-body
+// non-closing rewrite; only when that is refused too does the run fail closed.
+describe("RunRunner — a legacy non-closing run whose PR is never readable (PRD #1798 M6, amended D10)", () => {
+  const closingCompletion = (iid: number) =>
+    [COMPLETION_START, `Related to #${iid}.`, "", `Closes #${iid}`, "", "---", "Opened by uzi.", COMPLETION_END].join("\n");
+
+  it("every GET is refused (403): the blind non-closing rewrite lands and the scope-capped run completes non-closing", async () => {
+    const existing = `${SIZE_REGION}\n\n${closingCompletion(1930)}`;
+    const { gitlab, pr, calls } = fakeGitlab({ headStatus: 403, existing });
+    const claim = gitlabClaim(1930);
+
+    await runner(new ScopeCappedStub(nullLogger()), gitlab).execute(claim);
+
+    assert.ok(statuses(claim.run_id).includes("completed"), "the blind rewrite removed the directive");
+    assert.equal(closingDirectiveFor(pr.description, 1930, "org/repo"), false);
+    assert.equal(calls.filter((c) => c.method === "PUT").length, 1, "one blind write");
+  });
+
+  it("every GET and every PUT is refused (403): the run fails closed and never completes", async () => {
+    const existing = `${SIZE_REGION}\n\n${closingCompletion(1931)}`;
+    const { gitlab, pr } = fakeGitlab({ headStatus: 403, putStatus: 403, existing });
+    const claim = gitlabClaim(1931);
+
+    await runner(new ScopeCappedStub(nullLogger()), gitlab).execute(claim);
+
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+    const failed = api.states.find((st) => st.runId === claim.run_id && st.body.status === "failed")?.body;
+    assert.equal(failed?.failure_reason, "completion interlock: a closing directive could not be removed from a non-closing merge request");
+    assert.equal(pr.description, existing, "the write really was refused");
+  });
+
+  it("an over-cap body: the read is refused, and the blind rewrite path runs (the run completes non-closing)", async () => {
+    const existing = `Closes #1932\n\n${"x".repeat(7 * 1_048_576)}\n\n${SIZE_REGION}\n\n${closingCompletion(1932)}`;
+    const { gitlab, pr, reads, calls } = fakeGitlab({ existing });
+    followHead(pr);
+    const claim = gitlabClaim(1932);
+
+    await runner(new ScopeCappedStub(nullLogger()), gitlab).execute(claim);
+
+    assert.equal(reads.length, 1, "the over-cap read is permanent: not retried");
+    assert.equal(calls.filter((c) => c.method === "PUT").length, 1, "the blind rewrite");
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.equal(closingDirectiveFor(pr.description, 1932, "org/repo"), false);
+    assert.ok(pr.description.length < 1_048_576, "the body was rewritten whole");
   });
 });

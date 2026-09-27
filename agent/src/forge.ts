@@ -42,10 +42,20 @@ export type FetchFn = (
   },
 ) => Promise<FetchResponse>;
 
-/** PRD #1798 M6 (H1): the byte cap on a single-MR/PR detail read. A forge caps a description at
- *  about 1,048,576 characters (FORGE_BODY_MAX_CHARS), up to 4 UTF-8 bytes each, plus 64 KiB of
- *  headroom for JSON escaping and the rest of the object. */
-export const MR_DETAIL_MAX_BYTES = 4 * 1_048_576 + 64 * 1024;
+/** PRD #1798 M6 (H1): the byte cap on a single-MR/PR response (the detail read, the head read and
+ *  the create response). A forge caps a description at about 1,048,576 characters
+ *  (FORGE_BODY_MAX_CHARS), and JSON escapes a control character as `\u0001`: 6 bytes for one
+ *  character, more than any raw UTF-8 character takes (4 at most). So 6 bytes per character, plus
+ *  64 KiB of headroom for the rest of the object. */
+export const MR_DETAIL_MAX_BYTES = 6 * 1_048_576 + 64 * 1024;
+
+/** PRD #1798 M6 (H1): the byte cap on the find-existing LIST read (findOpenMr on GitLab and GitHub).
+ *  The list is filtered to open MRs/PRs for one source and target branch, and both forges allow only
+ *  one open MR/PR per such pair, so it normally carries a single object: the cap admits one
+ *  worst-case object (MR_DETAIL_MAX_BYTES) with room to spare, while a list that grew past a few MiB
+ *  (a forge ignoring the filter, or a hostile answer) is refused instead of buffered. Only the first
+ *  element is ever used. */
+export const MR_LIST_MAX_BYTES = 8 * 1_048_576;
 
 /** The bytes an error body is read to before it is cut (the message keeps 512 characters). */
 const ERROR_BODY_MAX_BYTES = 4096;
@@ -98,8 +108,9 @@ export class ForgeError extends Error {
 }
 
 /** A response body over its byte cap (status 0: no forge status is at fault). It is a
- *  deterministic answer, not a transport blip, so a caller's retry should treat it as permanent
- *  (the runner's PR-description retry does); every caller treats it as an unreadable MR/PR. */
+ *  deterministic answer, not a transport blip, so it is permanent and never retried: the runner's
+ *  forge retries classify it permanent before classifyForgeError (which reads a bare status 0 as a
+ *  transport failure). Every caller treats it as an unreadable MR/PR. */
 export class ForgeResponseTooLarge extends ForgeError {
   constructor(readonly maxBytes: number) {
     super(0, `response too large (over ${maxBytes} bytes)`);
@@ -166,7 +177,8 @@ abstract class HttpForgeClient implements ForgeClient {
 
   async createMergeRequest(p: CreateMrParams, signal?: AbortSignal): Promise<MergeRequest> {
     const res = await this.request("POST", this.createUrl(p.repoUrl), p.pat, this.createBody(p), signal);
-    if (res.status === 201) return this.parseMr(await res.text());
+    // H1: the created object echoes the description, so it is capped like a detail read.
+    if (res.status === 201) return this.parseMr(await readCapped(res, MR_DETAIL_MAX_BYTES));
 
     // An MR/PR for this branch may already exist (a resume, or a prior finish that
     // pushed + opened before the state report landed). Which status the forge answers
@@ -208,7 +220,9 @@ abstract class HttpForgeClient implements ForgeClient {
   async getMergeRequestHead(repoUrl: string, pat: string, iid: number, signal?: AbortSignal): Promise<string> {
     const res = await this.request("GET", this.headUrl(repoUrl, iid), pat, undefined, signal);
     if (res.status !== 200) throw new ForgeError(res.status, (await safeText(res)).slice(0, 512));
-    return this.parseHead(await res.text());
+    // H1: the same resource as getMergeRequest, capped the same way. An over-cap answer throws
+    // ForgeResponseTooLarge, which the interlock treats as an unreadable head (hold, after a strip).
+    return this.parseHead(await readCapped(res, MR_DETAIL_MAX_BYTES));
   }
 
   /**
@@ -342,7 +356,7 @@ export class GitLabClient extends HttpForgeClient {
     const q = `${this.createUrl(p.repoUrl)}?state=opened&source_branch=${encodeURIComponent(p.sourceBranch)}&target_branch=${encodeURIComponent(p.targetBranch)}`;
     const res = await this.request("GET", q, p.pat, undefined, signal);
     if (res.status !== 200) return undefined;
-    const list = safeJson(await res.text());
+    const list = safeJson(await readCapped(res, MR_LIST_MAX_BYTES));
     if (Array.isArray(list) && list.length > 0) return parseGitlabMr(list[0]);
     return undefined;
   }
@@ -414,7 +428,8 @@ export class ForgejoClient extends HttpForgeClient {
     const url = `${apiBase}/api/v1/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${encodeURIComponent(p.targetBranch)}/${encodeURIComponent(p.sourceBranch)}`;
     const res = await this.request("GET", url, p.pat, undefined, signal);
     if (res.status !== 200) return undefined;
-    const obj = safeJson(await res.text());
+    // A single-PR lookup: capped like a detail read.
+    const obj = safeJson(await readCapped(res, MR_DETAIL_MAX_BYTES));
     if (!obj || typeof obj !== "object") return undefined;
     if ((obj as Record<string, unknown>)["state"] !== "open") return undefined;
     return parseForgejoMr(obj);
@@ -478,7 +493,7 @@ export class GitHubClient extends HttpForgeClient {
     const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?state=open&head=${encodeURIComponent(head)}&base=${encodeURIComponent(p.targetBranch)}`;
     const res = await this.request("GET", url, p.pat, undefined, signal);
     if (res.status !== 200) return undefined;
-    const list = safeJson(await res.text());
+    const list = safeJson(await readCapped(res, MR_LIST_MAX_BYTES));
     if (!Array.isArray(list) || list.length === 0) return undefined;
     const first = list[0];
     if (!first || typeof first !== "object") return undefined;
