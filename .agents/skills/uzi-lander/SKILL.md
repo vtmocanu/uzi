@@ -102,7 +102,7 @@ this lander's second pair of eyes.
 | CodeRabbit rate-limited | switch to Greptile (step 3); the buddy reviews too |
 | Bot skipped or absent | the buddy |
 | Skill or script maintenance (`[skip-cr]`) | the buddy plus the user |
-| Rebase or renumber only | the buddy's `APPROVE` of the range-diff on the new head, plus green CI; a prior bot approval carries over only when the range-diff changes no reviewed semantics |
+| Rebase or renumber only | the buddy's `APPROVE` of the range-diff on the new head, plus green CI (`watch-pr.sh --reviewer none`, which still checks current-head CI and live findings); a prior review of the old head carries over only when the range-diff changes no reviewed semantics. This is the one exception to the exact-SHA review rules below |
 | Bot approved this head, no local fix since | none extra, except large or trust-boundary PRs: the buddy too |
 | Renovate, assessed CI-sufficient | none extra; a Renovate PR assessed as needing review follows the rows above |
 
@@ -228,7 +228,8 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
      PR via `S/land-prep.sh OWNER/REPO PR` (it re-checks the rework lane and pushes with a
      lease), trail `fix local → pushed`. Before merging, require two clean reviews of that
      exact SHA: the buddy (`peers.py buddy ping` restores a lost reply route) plus
-     CodeRabbit (Greptile when CR is rate-limited). Skill-maintenance `[skip-cr]` PRs keep
+     CodeRabbit (Greptile when CR is rate-limited). A later rebase-only push keeps them
+     via the rebase lane (*Buddy*). Skill-maintenance `[skip-cr]` PRs keep
      their own rule below;
    - **big** (design-level, many files, needs the plan's context): `uzi run rework RUN -m
      'GUIDANCE'` (single-quoted), `SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)` captured first,
@@ -270,7 +271,7 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    environment, and confirming they come from Linux-only `/proc/self/fd` operations; unchanged
    imports alone are insufficient. Exit 7 stopped before the push: record both results,
    complete the other required checks, push the reviewed head with an explicit lease, and
-   require green Linux CI and review of that exact SHA before merging. Any additional or
+   require green Linux CI and review of that exact SHA (or the rebase lane, *Buddy*) before merging. Any additional or
    different failure blocks this exception. A base move sharing no branch file but `CHANGELOG.md` is
    rebased without re-gating (CI on the pushed head is the gate). Exit 8 = the branch
    moved, or the base moved into other branch files or conflicts: restart with `--fresh`; it resets to
