@@ -1414,7 +1414,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
 
 // ── PRD #218 M1 — the same fetch-back on the WORKER-SHUTDOWN path ──────────────
 //
-// The larger loss: a requeue re-claims and the reseed's unconditional `fs.rm`
+// The larger loss: a requeue re-claims and the canonical reseed's `fs.rm`
 // destroys committed work with no usage limit involved. A graceful SIGTERM aborts each
 // run; its catch fetches the work back and leaves the run NON-terminal so the sweeper
 // requeues it onto the recovered tree. The discriminator is the shutdown FLAG, never

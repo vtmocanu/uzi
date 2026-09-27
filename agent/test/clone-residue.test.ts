@@ -1,0 +1,522 @@
+import { afterEach, describe, it } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import type { ExecutorResult, RunContext } from "../src/executor.js";
+import {
+  CapturePathMismatchError,
+  CloneResidueBlockedError,
+  ForeignCaptureBlockedError,
+  GitCache,
+  PendingRecoveryCaptureError,
+  type AttemptSeedOptions,
+  type CanonicalReseedOptions,
+} from "../src/git.js";
+import { failOriginForReason, RunRunner, type ExecutorFactory } from "../src/runner.js";
+import { formatResidueName, parseRetainedArtifactName } from "../src/attempt-path.js";
+import {
+  LiveAttemptRegistry,
+  mintAttemptId,
+  newRunAttempt,
+  quiesceRunAttempt,
+  type QuiesceRunOutcome,
+  type QuiesceRunRequest,
+} from "../src/run-quiescence.js";
+import { RUN_ATTEMPT_ENV, RUN_CLONE_KEY_ENV } from "../src/worker-spawn-mark.js";
+import { defaultGitleaksShim } from "./gitleaks-shim.js";
+import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
+import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
+
+// issue #1783 M3 — the CANONICAL reseed (an unwired worker's `<runnerRoot>/<repoDir>/<key>`) frees
+// the canonical path only after a seed-mode process proof scoped to it, and quarantines what the
+// delete cannot remove (a root-owned or read-only tree, e.g. `EACCES … rmdir '…/agent/src'`) by a
+// SAME-PARENT rename to `.uzi-residue-<key>.residue-<uuid>`, which is kept. Anything that blocks
+// fails the run typed `worker_residue_blocked`, with nothing moved. These tests run non-root.
+
+const HAS_PROCFS = process.platform === "linux";
+
+/** Directories made read-only by a test, restored (u+w) before the harness removes the fixture. */
+const readOnly: string[] = [];
+const orphans: number[] = [];
+
+// Registered BEFORE installHarness so it runs before the harness removes the fixture dir.
+afterEach(() => {
+  for (const d of readOnly.splice(0)) {
+    try {
+      fs.chmodSync(d, 0o755);
+    } catch {
+      /* gone */
+    }
+  }
+  for (const pid of orphans.splice(0)) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      /* gone */
+    }
+  }
+});
+
+installHarness();
+
+function chmodReadOnly(dir: string): void {
+  fs.chmodSync(dir, 0o555);
+  readOnly.push(dir);
+}
+
+function bare(): string {
+  return git.barePathFor(fx.originPath);
+}
+
+function runnerRepoDir(): string {
+  return path.join(fx.dataDir, "runner", path.basename(bare()).replace(/\.git$/, ""));
+}
+
+function canonicalFor(iid: number): string {
+  return path.join(runnerRepoDir(), `issue-${iid}`);
+}
+
+/** The incident's shape, self-owned: a canonical clone path holding `agent/` at 0555 with
+ *  `agent/src` (and a file) inside, so a recursive delete fails `EACCES … rmdir '…/agent/src'`. */
+function plantReadOnlyTree(canonical: string): void {
+  fs.mkdirSync(path.join(canonical, "agent", "src"), { recursive: true });
+  fs.writeFileSync(path.join(canonical, "agent", "src", "gate-log.loop"), "residue\n");
+  fs.writeFileSync(path.join(canonical, "STALE.txt"), "a stale clone file\n");
+  chmodReadOnly(path.join(canonical, "agent"));
+}
+
+/** Every `.uzi-residue-*` entry of the runner repo dir. */
+function residueNames(): string[] {
+  try {
+    return fs.readdirSync(runnerRepoDir()).filter((n) => n.startsWith(".uzi-residue-"));
+  } catch {
+    return [];
+  }
+}
+
+/** A content hash of a whole tree (paths + bytes + types + modes), for an unchanged-tree assertion. */
+function treeHash(root: string): string {
+  const h = createHash("sha256");
+  const walk = (dir: string): void => {
+    for (const name of fs.readdirSync(dir).sort()) {
+      const p = path.join(dir, name);
+      const st = fs.lstatSync(p);
+      h.update(`${path.relative(root, p)}\0${st.isDirectory() ? "d" : st.isSymbolicLink() ? "l" : "f"}\0${st.mode}\0`);
+      if (st.isDirectory()) walk(p);
+      else if (st.isFile()) h.update(fs.readFileSync(p));
+    }
+  };
+  walk(root);
+  return h.digest("hex");
+}
+
+/** An executor that records the clone it was handed, then stops the run. */
+function transientFactory(onRun: (ctx: RunContext) => void = () => {}): { factory: ExecutorFactory; started: () => number } {
+  let started = 0;
+  const factory: ExecutorFactory = (runId) => ({
+    homeDir: path.join(homeDir, runId),
+    executor: {
+      run: async (ctx: RunContext): Promise<ExecutorResult> => {
+        started++;
+        onRun(ctx);
+        throw new Error("stop after the seed");
+      },
+    },
+  });
+  return { factory, started: () => started };
+}
+
+const quiescentOutcome = (): QuiesceRunOutcome => ({
+  process: { state: "quiescent", processes: [], killed: [], detail: "scripted quiescent" },
+  docker: { state: "not_wired", removed: [], detail: "" },
+});
+
+/** A recorder that answers every proof quiescent (the behaviour under test is the delete/quarantine,
+ *  not the host's process table). */
+function recordedQuiescent() {
+  const calls: QuiesceRunRequest[] = [];
+  return {
+    calls,
+    quiesceRun: async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
+      calls.push(req);
+      return quiescentOutcome();
+    },
+  };
+}
+
+/** An unwired runner (no dockerHost) over the harness GitCache, or over `gitCache` when given. */
+function unwired(factory: ExecutorFactory, extra: Parameters<typeof runnerWith>[4] = {}, gitCache?: GitCache) {
+  if (!gitCache) return runnerWith(factory, fakeGitlab().gitlab, undefined, nullLogger(), { recoveryRetryMs: 5, ...extra });
+  return new RunRunner(client, gitCache, factory, nullLogger(), 20, undefined, {
+    pollMs: 5,
+    planApprovalTimeoutMs: 0,
+    questionTimeoutMs: 600,
+    gitlab: fakeGitlab().gitlab,
+    recoveryRetryMs: 5,
+    ...extra,
+  });
+}
+
+function lastFailed(runId: string) {
+  return api.states.filter((s) => s.runId === runId && s.body.status === "failed").at(-1)?.body;
+}
+
+/** An env-scrubbed process whose cwd is `cwd`, orphaned (double fork) so it is not a descendant of
+ *  the scanning process. */
+function orphanIn(cwd: string, extraEnv: Record<string, string> = {}): number {
+  const out = execFileSync("/bin/sh", ["-c", "sleep 300 </dev/null >/dev/null 2>&1 & echo $!"], {
+    cwd,
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", ...extraEnv },
+    encoding: "utf8",
+  });
+  const pid = Number(out.trim());
+  orphans.push(pid);
+  return pid;
+}
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ─── the typed failure ─────────────────────────────────────────────────────────────────────
+
+describe("issue #1783 M3: CloneResidueBlockedError is typed worker_residue_blocked", () => {
+  it("maps through failOriginForReason, never the generic agent_failure", () => {
+    const err = new CloneResidueBlockedError("quarantine rename failed: EACCES");
+    assert.equal(failOriginForReason(err.message), "worker_residue_blocked");
+    assert.equal(err.name, "CloneResidueBlockedError");
+  });
+});
+
+// ─── the self-owned residue (the incident, non-root) ───────────────────────────────────────
+
+describe("issue #1783 M3: a canonical reseed quarantines what it cannot delete", () => {
+  it("a 0555 agent/ with agent/src: the reseed succeeds, the residue is kept in the same parent under the pinned name, and the log names it", async () => {
+    const iid = 3001;
+    const canonical = canonicalFor(iid);
+    plantReadOnlyTree(canonical);
+    const { logger, lines } = recordingLogger();
+    const recordingGit = new GitCache(fx.dataDir, logger, undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
+    let worktree = "";
+    let seededHasGit = false;
+    const { factory, started } = transientFactory((ctx) => {
+      worktree = ctx.worktreePath;
+      seededHasGit = fs.existsSync(path.join(ctx.worktreePath, ".git"));
+    });
+    const { calls, quiesceRun } = recordedQuiescent();
+    const claim = gitlabClaim(iid);
+    await unwired(factory, { quiesceRun }, recordingGit).execute(claim);
+
+    assert.equal(started(), 1, "the model started: the reseed succeeded");
+    assert.equal(worktree, canonical, "an unwired worker reseeds the canonical path");
+    assert.equal(seededHasGit, true, "a fresh clone was seeded at the canonical path");
+    const names = residueNames();
+    assert.equal(names.length, 1, `one residue entry: ${names.join(",")}`);
+    const residue = path.join(runnerRepoDir(), names[0]!);
+    const art = parseRetainedArtifactName(names[0]!);
+    assert.ok(art?.kind === "residue", "the pinned residue grammar");
+    assert.equal(art.key, `issue-${iid}`);
+    assert.equal(names[0], formatResidueName(`issue-${iid}`, art.uuid), "the pinned grammar round-trips");
+    assert.equal(path.dirname(residue), path.dirname(canonical), "quarantined in the SAME parent");
+    assert.equal(fs.readFileSync(path.join(residue, "agent", "src", "gate-log.loop"), "utf8"), "residue\n", "what the delete could not remove is kept");
+    readOnly.push(path.join(residue, "agent"));
+    // The proof ran first, in seed mode, scoped to the canonical path alone.
+    const reseedProof = calls.find((c) => c.site === "canonical_reseed");
+    assert.ok(reseedProof, "a canonical_reseed proof ran");
+    assert.equal(reseedProof.mode, "seed");
+    assert.deepEqual(reseedProof.targetPaths, [canonical]);
+    const warn = lines.find((l) => (l as { msg?: string }).msg?.includes("quarantined it as residue"));
+    assert.ok(warn, "the quarantine is logged");
+    assert.equal((warn as { residue?: string }).residue, residue, "the log names the residue path");
+    assert.equal((warn as { canonical?: string }).canonical, canonical);
+    // The failed run's terminal retire removed its own clone; the residue is untouched.
+    assert.equal(lastFailed(claim.run_id)?.fail_origin, undefined, "the stop is an ordinary agent failure, not a residue block");
+    assert.equal(fs.existsSync(residue), true, "the residue is never deleted right after quarantine");
+  });
+
+  it("a canonical path the delete CAN remove is removed, no residue is made", async () => {
+    const iid = 3002;
+    const canonical = canonicalFor(iid);
+    fs.mkdirSync(path.join(canonical, "old"), { recursive: true });
+    fs.writeFileSync(path.join(canonical, "old", "f.txt"), "x");
+    let worktree = "";
+    const { factory } = transientFactory((ctx) => {
+      worktree = ctx.worktreePath;
+    });
+    const { calls, quiesceRun } = recordedQuiescent();
+    await unwired(factory, { quiesceRun }).execute(gitlabClaim(iid));
+    assert.equal(worktree, canonical);
+    assert.deepEqual(residueNames(), []);
+    assert.equal(calls.filter((c) => c.site === "canonical_reseed").length, 1);
+  });
+
+  it("no canonical path on disk: nothing to free, no proof", async () => {
+    const iid = 3003;
+    const { factory, started } = transientFactory();
+    const { calls, quiesceRun } = recordedQuiescent();
+    await unwired(factory, { quiesceRun }).execute(gitlabClaim(iid));
+    assert.equal(started(), 1);
+    assert.equal(calls.filter((c) => c.site === "canonical_reseed").length, 0);
+  });
+});
+
+// ─── the journal cases run first ───────────────────────────────────────────────────────────
+
+describe("issue #1783 M3: journal classification runs before any free; a journal case leaves the residue untouched", () => {
+  const branch = (iid: number) => `agent/issue-${iid}`;
+
+  function recordingReseed(): { reseed: CanonicalReseedOptions; calls: string[] } {
+    const calls: string[] = [];
+    return { calls, reseed: { beforeFree: async (p) => void calls.push(p) } };
+  }
+
+  async function primedCanonical(iid: number): Promise<{ b: string; canonical: string; hash: string }> {
+    const b = await git.ensureClone(fx.originPath);
+    const canonical = canonicalFor(iid);
+    plantReadOnlyTree(canonical);
+    return { b, canonical, hash: treeHash(canonical) };
+  }
+
+  function assertUntouched(canonical: string, hash: string, calls: string[]): void {
+    assert.deepEqual(calls, [], "the free's proof never ran");
+    assert.equal(treeHash(canonical), hash, "the canonical tree is unchanged");
+    assert.deepEqual(residueNames(), [], "nothing was quarantined");
+  }
+
+  it("Case C (this run's own journal): PendingRecoveryCaptureError, nothing freed", async () => {
+    const iid = 3101;
+    const runId = randomUUID();
+    const { b, canonical, hash } = await primedCanonical(iid);
+    await git.markRecoveryCapture(b, canonical, branch(iid), runId);
+    const { reseed, calls } = recordingReseed();
+    await assert.rejects(git.createOrAttachRunnerClone(b, iid, runId, false, undefined, undefined, reseed), PendingRecoveryCaptureError);
+    assertUntouched(canonical, hash, calls);
+  });
+
+  it("Case B (another run's journal on the canonical path): ForeignCaptureBlockedError, nothing freed", async () => {
+    const iid = 3102;
+    const { b, canonical, hash } = await primedCanonical(iid);
+    await git.markRecoveryCapture(b, canonical, branch(iid), randomUUID());
+    const { reseed, calls } = recordingReseed();
+    await assert.rejects(git.createOrAttachRunnerClone(b, iid, randomUUID(), false, undefined, undefined, reseed), ForeignCaptureBlockedError);
+    assertUntouched(canonical, hash, calls);
+  });
+
+  it("Case A (the journal names another path that exists): CapturePathMismatchError, nothing freed", async () => {
+    const iid = 3103;
+    const { b, canonical, hash } = await primedCanonical(iid);
+    const other = path.join(runnerRepoDir(), `agent-issue-${iid}`);
+    fs.mkdirSync(other, { recursive: true });
+    await git.markRecoveryCapture(b, other, branch(iid), randomUUID());
+    const { reseed, calls } = recordingReseed();
+    await assert.rejects(git.createOrAttachRunnerClone(b, iid, randomUUID(), false, undefined, undefined, reseed), CapturePathMismatchError);
+    assertUntouched(canonical, hash, calls);
+  });
+
+  describe("the primed variants on a wired worker (A′/B′/C′) never free the canonical path", () => {
+    function attemptOpts(): { opts: AttemptSeedOptions; seeds: string[][] } {
+      const seeds: string[][] = [];
+      return {
+        seeds,
+        opts: { attemptId: mintAttemptId(1), isLive: () => false, beforeSeed: async (p) => void seeds.push(p), quiescent: async () => true },
+      };
+    }
+
+    it("C′ (own journal on the legacy canonical path): PendingRecoveryCaptureError, canonical untouched", async () => {
+      const iid = 3111;
+      const runId = randomUUID();
+      const { b, canonical, hash } = await primedCanonical(iid);
+      await git.markRecoveryCapture(b, canonical, branch(iid), runId);
+      const { reseed, calls } = recordingReseed();
+      const { opts, seeds } = attemptOpts();
+      await assert.rejects(git.createOrAttachRunnerClone(b, iid, runId, false, undefined, opts, reseed), PendingRecoveryCaptureError);
+      assert.deepEqual(seeds, [], "the attempt sweep never ran");
+      assertUntouched(canonical, hash, calls);
+    });
+
+    it("B′ (a foreign journal on the legacy canonical path): ForeignCaptureBlockedError, canonical untouched", async () => {
+      const iid = 3112;
+      const { b, canonical, hash } = await primedCanonical(iid);
+      await git.markRecoveryCapture(b, canonical, branch(iid), randomUUID());
+      const { reseed, calls } = recordingReseed();
+      const { opts, seeds } = attemptOpts();
+      await assert.rejects(git.createOrAttachRunnerClone(b, iid, randomUUID(), false, undefined, opts, reseed), ForeignCaptureBlockedError);
+      assert.deepEqual(seeds, []);
+      assertUntouched(canonical, hash, calls);
+    });
+
+    it("A′ (a journal naming another key): CapturePathMismatchError, canonical untouched", async () => {
+      const iid = 3113;
+      const { b, canonical, hash } = await primedCanonical(iid);
+      const other = path.join(runnerRepoDir(), `agent-issue-${iid}`);
+      fs.mkdirSync(other, { recursive: true });
+      await git.markRecoveryCapture(b, other, branch(iid), randomUUID());
+      const { reseed, calls } = recordingReseed();
+      const { opts, seeds } = attemptOpts();
+      await assert.rejects(git.createOrAttachRunnerClone(b, iid, randomUUID(), false, undefined, opts, reseed), CapturePathMismatchError);
+      assert.deepEqual(seeds, []);
+      assertUntouched(canonical, hash, calls);
+    });
+
+    it("no journal: the wired seed goes to a fresh attempt path and never frees or quarantines the canonical one", async () => {
+      const iid = 3114;
+      const { b, canonical, hash } = await primedCanonical(iid);
+      const { reseed, calls } = recordingReseed();
+      const { opts } = attemptOpts();
+      const clone = await git.createOrAttachRunnerClone(b, iid, randomUUID(), false, undefined, opts, reseed);
+      assert.notEqual(clone.path, canonical);
+      assertUntouched(canonical, hash, calls);
+    });
+  });
+});
+
+// ─── refusals: nothing moves ───────────────────────────────────────────────────────────────
+
+describe("issue #1783 M3: a blocked canonical free moves nothing and fails worker_residue_blocked", () => {
+  it(
+    "active owner: a live same-key attempt's marker process in scope blocks; it is never signalled and nothing moves",
+    { skip: HAS_PROCFS ? false : "reads procfs (Linux only)" },
+    async () => {
+      const iid = 3201;
+      const canonical = canonicalFor(iid);
+      plantReadOnlyTree(canonical);
+      const hash = treeHash(canonical);
+      const liveAttempts = new LiveAttemptRegistry();
+      const other = newRunAttempt(randomUUID(), 1, canonical, () => []);
+      liveAttempts.add(other);
+      const pid = orphanIn(canonical, { [RUN_ATTEMPT_ENV]: other.marker, [RUN_CLONE_KEY_ENV]: other.cloneKey });
+      // The REAL scan (in-process on a non-split host), recorded.
+      const verdicts: QuiesceRunOutcome[] = [];
+      const quiesceRun = async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
+        const out = await quiesceRunAttempt(req);
+        if (req.site === "canonical_reseed") verdicts.push(out);
+        return out;
+      };
+      const { factory, started } = transientFactory();
+      const claim = gitlabClaim(iid);
+      await unwired(factory, { quiesceRun, liveAttempts }).execute(claim);
+      assert.equal(started(), 0, "no model started");
+      const failed = lastFailed(claim.run_id);
+      assert.equal(failed?.fail_origin, "worker_residue_blocked");
+      assert.match(String(failed?.failure_reason), /canonical runner clone path could not be freed/);
+      assert.ok(
+        verdicts[0]?.process?.processes.some((p) => p.pid === pid && p.reason === "live_attempt_conflict"),
+        "the live owner is reported as a conflict",
+      );
+      assert.deepEqual(verdicts[0]?.process?.killed, [], "no signal is sent");
+      assert.equal(alive(pid), true, "the live attempt's process is alive");
+      assert.equal(treeHash(canonical), hash, "nothing was deleted");
+      assert.deepEqual(residueNames(), [], "nothing was moved");
+    },
+  );
+
+  it("unverified at reseed blocks too: the attempt seed's unreadable-unattributed relaxation does not apply; nothing moves", async () => {
+    const iid = 3202;
+    const canonical = canonicalFor(iid);
+    plantReadOnlyTree(canonical);
+    const hash = treeHash(canonical);
+    // Exactly the verdict the wired attempt seed relaxes (unverifiedOnlyByUnattributedUnreadable).
+    const quiesceRun = async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> =>
+      req.mode === "seed"
+        ? {
+            process: {
+              state: "unverified",
+              processes: [{ pid: 424242, uid: 10002, comm: "node", cwd: "unreadable", reason: "unreadable_unattributed" }],
+              killed: [],
+              detail: "1 runner-uid process(es) could not be attributed",
+            },
+            docker: { state: "not_wired", removed: [], detail: "" },
+          }
+        : quiescentOutcome();
+    const { factory, started } = transientFactory();
+    const claim = gitlabClaim(iid);
+    await unwired(factory, { quiesceRun }).execute(claim);
+    assert.equal(started(), 0);
+    assert.equal(lastFailed(claim.run_id)?.fail_origin, "worker_residue_blocked");
+    assert.equal(treeHash(canonical), hash, "nothing was deleted");
+    assert.deepEqual(residueNames(), [], "nothing was moved");
+  });
+
+  it("a symlinked canonical path is refused, not followed: the link and its target stay, no proof, no residue", async () => {
+    const iid = 3203;
+    const canonical = canonicalFor(iid);
+    const target = path.join(fx.dataDir, "elsewhere");
+    fs.mkdirSync(target, { recursive: true });
+    fs.writeFileSync(path.join(target, "KEEP.txt"), "not the runner's\n");
+    fs.mkdirSync(path.dirname(canonical), { recursive: true });
+    fs.symlinkSync(target, canonical);
+    const { calls, quiesceRun } = recordedQuiescent();
+    const { factory, started } = transientFactory();
+    const claim = gitlabClaim(iid);
+    await unwired(factory, { quiesceRun }).execute(claim);
+    assert.equal(started(), 0);
+    const failed = lastFailed(claim.run_id);
+    assert.equal(failed?.fail_origin, "worker_residue_blocked");
+    assert.match(String(failed?.failure_reason), /symlink/);
+    assert.equal(fs.lstatSync(canonical).isSymbolicLink(), true, "the link itself is left in place");
+    assert.equal(fs.readFileSync(path.join(target, "KEEP.txt"), "utf8"), "not the runner's\n", "its target is untouched");
+    assert.equal(calls.filter((c) => c.site === "canonical_reseed").length, 0, "no proof over a path that is not a real directory");
+    assert.deepEqual(residueNames(), []);
+  });
+
+  it(
+    "a non-writable parent makes the quarantine rename fail: the run fails worker_residue_blocked, what is left stays",
+    { skip: process.getuid?.() === 0 ? "root bypasses the parent's mode" : false },
+    async () => {
+      const iid = 3204;
+      const canonical = canonicalFor(iid);
+      plantReadOnlyTree(canonical);
+      // Warm the bare first so the only thing the read-only parent can refuse is the free.
+      await git.ensureClone(fx.originPath);
+      chmodReadOnly(path.dirname(canonical));
+      const { factory, started } = transientFactory();
+      const claim = gitlabClaim(iid);
+      await unwired(factory, { quiesceRun: recordedQuiescent().quiesceRun }).execute(claim);
+      assert.equal(started(), 0);
+      const failed = lastFailed(claim.run_id);
+      assert.equal(failed?.fail_origin, "worker_residue_blocked", `failure_reason: ${String(failed?.failure_reason)}`);
+      assert.match(String(failed?.failure_reason), /quarantine rename failed/);
+      assert.equal(fs.existsSync(path.join(canonical, "agent", "src", "gate-log.loop")), true, "the undeletable part is still at the canonical path");
+      assert.deepEqual(residueNames(), []);
+    },
+  );
+});
+
+// ─── listing consumers ─────────────────────────────────────────────────────────────────────
+
+describe("issue #1783 M3: a quarantined residue is never mistaken for a clone", () => {
+  it("a wired seed's sweep never lists residue as a non-live path of the key, and leaves it in place", async () => {
+    const iid = 3301;
+    const b = await git.ensureClone(fx.originPath);
+    const key = `issue-${iid}`;
+    const residue = path.join(runnerRepoDir(), formatResidueName(key, randomUUID()));
+    fs.mkdirSync(path.join(residue, "agent", "src"), { recursive: true });
+    const seeds: string[][] = [];
+    const opts: AttemptSeedOptions = {
+      attemptId: mintAttemptId(1),
+      isLive: () => false,
+      beforeSeed: async (p) => void seeds.push(p),
+      quiescent: async () => true,
+    };
+    await git.createOrAttachRunnerClone(b, iid, randomUUID(), false, undefined, opts);
+    assert.equal(seeds.length, 1);
+    assert.deepEqual(
+      seeds[0]!.filter((p) => path.basename(p).startsWith(".uzi-")),
+      [],
+      "no retained artifact is ever a path of the key",
+    );
+    assert.equal(fs.existsSync(path.join(residue, "agent", "src")), true, "one residue (under the cap) is kept");
+    // A later canonical reseed of the same key leaves it alone too.
+    const again = await git.createOrAttachRunnerClone(b, iid, randomUUID(), false, undefined, undefined, { beforeFree: async () => {} });
+    assert.equal(again.path, canonicalFor(iid));
+    assert.equal(fs.existsSync(residue), true);
+    assert.equal(fs.readdirSync(runnerRepoDir()).filter((n) => n.startsWith(".uzi-residue-")).length, 1);
+  });
+});

@@ -106,9 +106,12 @@ import {
   AttemptReleaseError,
   CHECKPOINT_SCAN_TIMEOUT_MS,
   CapturePathMismatchError,
+  CloneResidueBlockedError,
   ForeignCaptureBlockedError,
   PendingRecoveryCaptureError,
+  REASON_WORKER_RESIDUE_BLOCKED,
   type AttemptSeedOptions,
+  type CanonicalReseedOptions,
   ScratchPublicationError,
 } from "./git.js";
 import {
@@ -495,9 +498,11 @@ class RunningAckTerminalError extends Error {
 }
 
 /** issue #1783: the failure-reason prefix of a run whose finalize boundary could not prove the
- *  clone quiescent (a run-owned process survived the reap, or its attribution was unverifiable).
- *  failOriginForReason maps it to the fail_origin `worker_residue_blocked`. */
-export const REASON_WORKER_RESIDUE_BLOCKED = "worker_residue_blocked";
+ *  clone quiescent (a run-owned process survived the reap, or its attribution was unverifiable),
+ *  or whose canonical reseed could not free the canonical clone path (M3,
+ *  CloneResidueBlockedError). failOriginForReason maps it to the fail_origin
+ *  `worker_residue_blocked`. Defined in git.ts, where CloneResidueBlockedError is thrown. */
+export { REASON_WORKER_RESIDUE_BLOCKED };
 
 /**
  * issue #1783: the run's clone is not provably quiescent at a boundary that must not proceed
@@ -532,6 +537,7 @@ export function failOriginForReason(rawReason: string): string | undefined {
   if (rawReason.startsWith(REASON_PROVISION_FAILED)) return "provisioning_failed";
   if (rawReason.startsWith(REASON_NO_TOKEN)) return "credential_unavailable";
   if (rawReason === REASON_PLAN_MISSING) return "plan_missing";
+  // issue #1783: RunResidueBlockedError and (M3) CloneResidueBlockedError both open with this prefix.
   if (rawReason.startsWith(`${REASON_WORKER_RESIDUE_BLOCKED}: `)) return "worker_residue_blocked";
   return undefined;
 }
@@ -5628,6 +5634,35 @@ export class RunRunner {
   }
 
   /**
+   * issue #1783 M3: the canonical-reseed options (see CanonicalReseedOptions). Before the git layer
+   * frees an existing canonical clone path (an unwired worker's reseed, or any canonical seed), a
+   * seed-mode process scan scoped to that path must prove it quiescent: a terminal attempt's marked
+   * residue is killed, while an unattributed in-scope process, a live same-key owner (never
+   * signalled) or an unverified verdict blocks with nothing removed or moved
+   * (CloneResidueBlockedError, fail_origin `worker_residue_blocked`).
+   *
+   * The attempt seed's relaxation (an unreadable, unattributed runner-uid process does not block,
+   * see attemptSeedOptions) deliberately does NOT apply here. It is sound there only because seeding
+   * a FRESH attempt path moves, frees and deletes nothing. Freeing the canonical path deletes the
+   * tree and may rename what is left: an unreadable process could be one whose cwd or open files are
+   * inside it (a dev server, a container's bind), and deleting or moving its tree under it is exactly
+   * the residue hazard this issue closes. So unverified blocks.
+   */
+  private canonicalReseedOptions(flight: RunFlight): CanonicalReseedOptions {
+    return {
+      beforeFree: async (canonical) => {
+        const proof = await this.quiesceRun(flight, flight.executor, {
+          mode: "seed",
+          site: "canonical_reseed",
+          targetPaths: [canonical],
+          clonePath: canonical,
+        });
+        if (proof.blocked) throw new CloneResidueBlockedError(proof.outcome.process?.detail ?? "not quiescent");
+      },
+    };
+  }
+
+  /**
    * Issue #1660: seed the steering channel with the run's already-consumed follow-ups (GET
    * /follow-ups) on every claim, first and re-claim, so the operator's earlier constraints still
    * reach this claim's subagents. A transient failure is retried; a failure that persists, or a 4xx
@@ -5733,9 +5768,10 @@ export class RunRunner {
     // fresh attempt clone path, and the journal, the ledger and the attempt marker reuse it.
     if (this.attemptPaths) flight.attemptId = mintAttemptId(claim.claim_generation, new Date(this.now()));
     const attemptSeed = this.attemptSeedOptions(claim, flight);
+    const reseed = this.canonicalReseedOptions(flight);
     let retained = false;
     try {
-      const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, attemptSeed));
+      const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, attemptSeed, reseed));
       flight.worktreePath = runnerClone.path;
       flight.branch = runnerClone.branch;
     } catch (err) {
@@ -5770,7 +5806,7 @@ export class RunRunner {
         // else fail closed. Replaces the old worker-scoped getRunOwnership probe, which
         // 404'd on a worker move (Gap 2).
         await this.reclaimTerminalOrphan(barePath, claim, flight, err.clonePath, err.branch, err.ownerRunId, err);
-        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, attemptSeed));
+        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, attemptSeed, reseed));
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;
       } else if (err instanceof CapturePathMismatchError) {
@@ -5778,7 +5814,7 @@ export class RunRunner {
         // divergence, e.g. an issue owner's `issue-N` vs this mr_rework's `agent-issue-N`).
         // The SAME owner-derived validation decides; any unmet predicate fails closed.
         await this.reclaimTerminalOrphan(barePath, claim, flight, err.journaledPath, err.branch, err.ownerRunId, err);
-        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, attemptSeed));
+        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, attemptSeed, reseed));
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;
       } else {
@@ -10308,7 +10344,12 @@ export class RunRunner {
    * vs the repo's default branch. The working tree lives ONLY in this clone; the
    * worker fetches the agent branch back from it before pushing (fetchAgentBranch).
    */
-  private async runnerCloneForClaim(barePath: string, claim: ClaimResponse, attempt?: AttemptSeedOptions) {
+  private async runnerCloneForClaim(
+    barePath: string,
+    claim: ClaimResponse,
+    attempt?: AttemptSeedOptions,
+    reseed?: CanonicalReseedOptions,
+  ) {
     // PRD #218 M2: thread the run id as the tracking-ref OWNERSHIP anchor. The git layer
     // stays claim-agnostic — it consults the tracking ref only when its stamp matches
     // this run id, so neither a fresh run nor a different run on the same issue can
@@ -10349,10 +10390,11 @@ export class RunRunner {
         resume,
         expectedCheckpointTip,
         attempt,
+        reseed,
       );
     if (claim.issue_iid == null)
       throw new Error("issue run claim is missing issue_iid");
-    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId, resume, expectedCheckpointTip, attempt);
+    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId, resume, expectedCheckpointTip, attempt, reseed);
   }
 
   /**

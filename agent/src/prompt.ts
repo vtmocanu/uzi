@@ -715,7 +715,8 @@ function priorWorkNote(prior: PriorWork | undefined): string {
 
 // ─── The reseed warning (issue #222) ─────────────────────────────────────────
 // The runner clone is rebuilt on EVERY claim. An unwired worker wipes and re-seeds the one
-// canonical clone path (git.ts `runnerCloneForBranch` opens with an unconditional `fs.rm`); a
+// canonical clone path (git.ts `runnerCloneForBranch` deletes it, or quarantines what it cannot
+// delete as `.uzi-residue-*` beside it, issue #1783 M3); a
 // Docker-wired worker (issue #1783 M2) seeds a FRESH `<key>.attempt-<id>` path per attempt and
 // RETAINS the predecessor's path in place, unreachable from the new attempt — its work arrives
 // only through the branch, the tracking ref, checkpoint adoption and the journal/capture. On a

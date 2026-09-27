@@ -7,6 +7,10 @@
 #
 #   ./run.sh            build the base worker image (unless skipped), then run the suite
 #
+# The container starts as root through plant-residue.sh (issue #1783 M3), which plants a root-owned
+# residue at a canonical clone path and then execs the real root-start entrypoint unchanged; see the
+# header of plant-residue.sh for why the root step lives there.
+#
 # Environment:
 #   CQ_IMAGE        image tag to build/run            (default: uzi-agent-clone-quiescence:base)
 #   CQ_DOCKERFILE   Dockerfile to build               (default: agent/templates/base/Dockerfile)
@@ -53,11 +57,12 @@ timeout --kill-after=30s "$TIMEOUT" docker run --rm --init --network none \
   --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
   --security-opt no-new-privileges \
   --tmpfs /data \
-  --entrypoint /usr/local/sbin/uzi-entrypoint \
+  --tmpfs /tmp/cq-residue \
+  --entrypoint /bin/sh \
   --mount "type=bind,src=$REPO/e2e,dst=/work/e2e,readonly" \
   "${src_args[@]}" \
   --name "$NAME" \
-  "$IMAGE" /bin/sh -c 'cd /app && exec /usr/local/bin/node --import tsx --test --test-concurrency=1 --test-timeout=120000 \
+  "$IMAGE" /work/e2e/clone-quiescence/plant-residue.sh /bin/sh -c 'cd /app && exec /usr/local/bin/node --import tsx --test --test-concurrency=1 --test-timeout=120000 \
     /work/e2e/clone-quiescence/fixture.test.ts'
 rc=$?
 set -e
