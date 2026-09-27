@@ -20,6 +20,7 @@ const labels: Record<string, string> = {
   finalize_base_align_conflict: "finalize base-align conflict",
   push_secret_blocked: "push secret blocked",
   forge_unreachable: "forge unreachable",
+  gate_presentation_refused: "plan gate refused",
   history_rewritten: "history rewritten",
   plan_missing: "plan missing",
   unknown: "unknown",

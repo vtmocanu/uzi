@@ -1994,6 +1994,61 @@ WHERE id = @id AND worker_id = @worker_id
   -- awaiting_approval report is expected from a paused row.
   AND status <> 'paused';
 
+-- PRD #1795 M1: gate revision allocation. Every statement below runs inside SetState's
+-- awaiting_approval transaction, AFTER GetRunOwnedByWorkerForUpdate locked the run row and the
+-- report was classified in Go, so none of them re-checks ownership, generation or status: the
+-- lock is the fence. They are split rather than folded into SetRunAwaitingApproval so a
+-- classification that REFUSES the report writes nothing but its refusal accounting.
+
+-- name: RunGatePresentationExists :one
+-- Whether a presentation id was ever published for this run (current or historical).
+SELECT EXISTS (
+    SELECT 1 FROM run_gate_presentations
+    WHERE run_id = @run_id AND presentation_id = @presentation_id
+)::boolean AS present;
+
+-- name: PublishRunGatePresentation :one
+-- A NEW presentation: allocate gate_revision + 1, bind the presentation id (NULL for an
+-- id-less old-worker report), store the immutable presented snapshot and its digest, and reset
+-- the refusal accounting (a successful publication ends any refusal streak).
+UPDATE runs SET
+    gate_revision           = gate_revision + 1,
+    gate_presentation_id    = sqlc.narg('presentation_id'),
+    gate_presented_payload  = @presented_payload::jsonb,
+    gate_payload_digest     = @payload_digest::bytea,
+    gate_refusal_count      = 0,
+    gate_refusal_generation = NULL
+WHERE id = @id
+RETURNING gate_revision;
+
+-- name: InsertRunGatePresentation :exec
+INSERT INTO run_gate_presentations (run_id, presentation_id, revision)
+VALUES (@run_id, @presentation_id, @revision);
+
+-- name: AdoptRunGatePresentation :one
+-- An explicit adoption of an id-less gate at its current revision: bind the id and, for a
+-- migration-era gate with no snapshot yet, initialize the snapshot and digest (an existing
+-- snapshot is kept verbatim). Resets the refusal accounting like a publication.
+UPDATE runs SET
+    gate_presentation_id    = @presentation_id,
+    gate_presented_payload  = COALESCE(gate_presented_payload, @presented_payload::jsonb),
+    gate_payload_digest     = COALESCE(gate_payload_digest, @payload_digest::bytea),
+    gate_refusal_count      = 0,
+    gate_refusal_generation = NULL
+WHERE id = @id
+RETURNING gate_revision;
+
+-- name: ResetRunGateRefusals :exec
+-- A retained presentation (a current-id retry or same-gate re-presentation) was re-published.
+UPDATE runs SET gate_refusal_count = 0, gate_refusal_generation = NULL
+WHERE id = @id;
+
+-- name: SetRunGateRefusal :exec
+-- Record a refused re-presentation. The service decides the values under the row lock: the
+-- count moves only when gate_refusal_generation IS DISTINCT FROM the report's claim generation.
+UPDATE runs SET gate_refusal_count = @refusal_count, gate_refusal_generation = @refusal_generation
+WHERE id = @id;
+
 -- name: ClearRunRequiredCapabilities :execrows
 -- PRD #84 M4 (unit 4c): the user override ("run without the capability", Decision 12).
 -- When the owner approves a plan the capability gate would BLOCK — because plan-time
@@ -5903,13 +5958,14 @@ WITH pending AS (
 consumed AS (
     UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
     FROM pending WHERE u.id = pending.id
-    RETURNING u.id, u.kind, u.body, u.created_at
+    RETURNING u.id, u.kind, u.body, u.created_at, u.gate_binding, u.gate_revision
 )
-SELECT consumed.id, consumed.kind, consumed.body, consumed.created_at, pending.first_consumption
+SELECT consumed.id, consumed.kind, consumed.body, consumed.created_at, pending.first_consumption,
+       consumed.gate_binding, consumed.gate_revision
 FROM consumed JOIN pending USING (id) ORDER BY consumed.id ASC;
 
 -- name: ListReplayRunInputs :many
-SELECT id, kind, body, created_at FROM run_user_inputs
+SELECT id, kind, body, created_at, gate_binding, gate_revision FROM run_user_inputs
 WHERE run_id = @run_id AND applied_at IS NULL
   AND kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
 ORDER BY id ASC
@@ -5922,7 +5978,7 @@ FROM runs WHERE id = @run_id FOR UPDATE;
 
 -- name: ListInputReceiptRows :many
 SELECT id, kind, body, created_at, consumed_at, consumed_claim_generation, consumed_worker_id, applied_at,
-       disposition
+       disposition, gate_binding, gate_revision
 FROM run_user_inputs WHERE run_id = @run_id AND id = ANY(@ids::bigint[])
   AND kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
 ORDER BY id ASC;
@@ -5931,7 +5987,7 @@ ORDER BY id ASC;
 UPDATE run_user_inputs SET consumed_at = COALESCE(consumed_at, now()), consumed_claim_generation = @claim_generation,
     consumed_worker_id = @worker_id
 WHERE run_id = @run_id AND id = ANY(@ids::bigint[]) AND applied_at IS NULL
-RETURNING id, kind, body, created_at;
+RETURNING id, kind, body, created_at, gate_binding, gate_revision;
 
 -- name: ApplyRunInputRows :execrows
 UPDATE run_user_inputs SET applied_at = now()
@@ -5985,7 +6041,7 @@ ORDER BY id ASC;
 -- model instead of minting a query-specific row type. Dropping a column here is not a
 -- local edit: it re-types this query and breaks the workersvc.Store interface, the
 -- service signature, the handler and its fake.
-SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at FROM run_user_inputs
+SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision FROM run_user_inputs
 WHERE run_id = @run_id AND kind IN ('follow_up', 'scope')
 ORDER BY id DESC;
 

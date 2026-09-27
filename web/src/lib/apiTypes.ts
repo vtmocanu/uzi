@@ -2445,6 +2445,11 @@ export interface Run {
    *  never dereferenced, so an absent value reads as not-seeded and the seeded surfaces
    *  simply do not render (no `?? null` normalization needed, unlike pending_judge). */
   plan_source?: PlanSource;
+  /** PRD #1795: the run's current plan-gate revision, allocated by the server when it
+   *  published the gate whose plan_md this run carries. A client that shows the plan sends
+   *  it back as expected_gate_revision. The api omits it (Go omitempty) while it is 0, i.e.
+   *  for a run with no gate published under a revision-allocating api. */
+  gate_revision?: number;
   /** PRD #212: the git-status porcelain lines the plan turn wrote to the worktree,
    *  surfaced at the approval gate. `[]`/absent renders nothing. UNTRUSTED
    *  repo-controlled paths — render as escaped plain text through stripUnsafeChars,

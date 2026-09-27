@@ -458,6 +458,12 @@ type RunDTO struct {
 	// pointer — a pre-feature run reads "agent". The SPA's SeededPlanPanel keys on it to
 	// surface a seeded run's plan, which the approval UI would otherwise never render.
 	PlanSource string `json:"plan_source"`
+	// GateRevision is the run's current plan-gate revision (PRD #1795 M1): the monotonic
+	// per-run number the server allocated when it published the gate whose plan_md this DTO
+	// carries. A client that shows the plan sends it back as expected_gate_revision so a
+	// verdict can only act on the revision that was displayed. Omitted (0) for a run that
+	// never published a gate under an api that allocates (pre-migration gates, chat, judge).
+	GateRevision int64 `json:"gate_revision,omitempty"`
 	// Plain-English run summaries (PRD #362), all null until the worker generates and
 	// posts them (and null forever on any generation failure — summaries are advisory
 	// and never block a run). SummaryIntent ("what this run will implement") lands early

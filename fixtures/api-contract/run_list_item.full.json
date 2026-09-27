@@ -117,6 +117,7 @@
   "deadline_at": "2020-01-02T03:04:05Z",
   "plan_md": "x",
   "plan_source": "x",
+  "gate_revision": 1,
   "summary_intent": "x",
   "summary_plan": "x",
   "summary_deltas": [

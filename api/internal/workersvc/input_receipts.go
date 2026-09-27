@@ -195,7 +195,7 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 		if row.Kind == "follow_up" && !row.ConsumedAt.Valid {
 			followUp = true
 		}
-		out = append(out, InputDTO{ID: row.ID, Kind: row.Kind, Body: textPtr(row.Body), CreatedAt: row.CreatedAt.Time})
+		out = append(out, inputDTO(row.ID, row.Kind, row.Body, row.CreatedAt, row.GateBinding, row.GateRevision))
 	}
 	if len(toAck) > 0 {
 		stamped, err := q.AckRunInputRows(ctx, store.AckRunInputRowsParams{RunID: runID, Ids: toAck, ClaimGeneration: pgtype.Int8{Int64: generation, Valid: true}, WorkerID: pgconv.UUID(wkr.ID)})

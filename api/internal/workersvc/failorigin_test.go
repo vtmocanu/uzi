@@ -38,7 +38,7 @@ func TestCoerceFailOrigin(t *testing.T) {
 	// forge-park transaction stamps it directly, never the worker. task_undispatched (issue
 	// #1367) is server-derived too: the undispatched-handoff sweep stamps it inside its own
 	// conditional UPDATE, never a worker report.
-	serverOnly := []string{"worker_lost", "run_timeout", "plan_rejected", "auto_stopped", "guardrail_blocked", "forge_unreachable", "task_undispatched"}
+	serverOnly := []string{"worker_lost", "run_timeout", "plan_rejected", "auto_stopped", "guardrail_blocked", "forge_unreachable", "task_undispatched", "gate_presentation_refused"}
 	for _, s := range serverOnly {
 		if !failOriginSet[s] {
 			t.Fatalf("%q is in the server-only list but not in the stored vocabulary", s)

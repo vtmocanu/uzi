@@ -56,6 +56,9 @@ var neverJudgeFailOrigins = map[string]bool{
 	// skips the judge regardless of iteration_count. Server-derived (see failorigin.go); the
 	// sweep already declines to enqueue a judge for these rows, so this is belt-and-braces.
 	"task_undispatched": true,
+	// PRD #1795 M1: the refusal cap on plan-gate re-presentation fails the run inside SetState's
+	// awaiting_approval transaction. Server-derived (see failorigin.go), never an agent defect.
+	"gate_presentation_refused": true,
 }
 
 // envPublishFailOrigins is the fail_origin set for ENVIRONMENT-CAUSED publish failures (issue

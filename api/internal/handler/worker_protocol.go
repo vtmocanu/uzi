@@ -400,6 +400,11 @@ func protocolFeatures(activeSnapshotEnabled bool) []string {
 		// and stores the cause. Advertised UNCONDITIONALLY (no config gates the park): a worker
 		// must see it before sending the cause, because an older api 400s an unknown recovery_cause.
 		{"recovery_cause_vault_locked"},
+		// PRD #1795 M1: this api accepts presentation_id / adopt_gate_revision on the
+		// awaiting_approval report and answers the allocated gate_revision on its ACK. A worker
+		// sends the new fields ONLY when it sees this token, because an older api's strict
+		// decoder 400s an unknown field.
+		{"gate_revision_v1"},
 	}
 	if activeSnapshotEnabled {
 		groups = append(groups, []string{"active_run_snapshot"}) // PRD #1390 M2a
@@ -1028,8 +1033,24 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	run, applied, err := h.wsvc.SetState(r.Context(), wkr, runID, req)
+	run, applied, gateRevision, err := h.wsvc.SetStateReport(r.Context(), wkr, runID, req)
 	if err != nil {
+		// PRD #1795 M1: a refused awaiting_approval report (historical presentation id, changed
+		// payload under the current id, stale adoption) published nothing. 409 with the same
+		// {run, reason} shape as the forge-park refusals; the worker parks through transient
+		// recovery and the next claim re-presents. The run may already be failed when the
+		// refusal cap was reached.
+		if reason, ok := workersvc.GatePresentationRefusalReason(err); ok {
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"run":    runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock()),
+				"reason": reason,
+			})
+			return
+		}
+		if errors.Is(err, workersvc.ErrClaimGenerationRequired) {
+			httpx.ErrorReason(w, http.StatusBadRequest, "presentation_id and adopt_gate_revision require claim_generation", "claim_generation_required")
+			return
+		}
 		// PRD #1392 M1: the two forge-park precedence refusals are 409 with a {run, reason}
 		// body — the worker dispatches on `reason` (stale_claim stops silently; custody_unsettled
 		// falls to today's failed path). recovery_retry_not_before rides on the run (RunDTO), not
@@ -1115,6 +1136,12 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// up on the idempotent-after-reclaim success (applied=true, status 'running'), leaving the
 		// old flight to continue on a claim the reclaim already owns.
 		ack["disposition"] = "released"
+	}
+	if req.State == "awaiting_approval" && gateRevision > 0 {
+		// PRD #1795 M1 (decision 5): the revision this report was answered with, allocated or
+		// returned inside the report's transaction and threaded back from SetStateReport, never
+		// re-read after commit. The worker confirms THIS revision for bound-verdict matching.
+		ack["gate_revision"] = gateRevision
 	}
 	httpx.JSON(w, http.StatusOK, ack)
 }

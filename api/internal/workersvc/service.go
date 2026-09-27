@@ -728,6 +728,14 @@ type Store interface {
 	// refills from empty. Returns rows-affected (0 when the ownership/status guard refuses).
 	ClearRunMilestonesCompleted(ctx context.Context, arg store.ClearRunMilestonesCompletedParams) (int64, error)
 	SetRunAwaitingApproval(ctx context.Context, arg store.SetRunAwaitingApprovalParams) (int64, error)
+	// PRD #1795 M1: plan-gate revision allocation, all run inside SetState's awaiting_approval
+	// transaction under the run-row lock.
+	RunGatePresentationExists(ctx context.Context, arg store.RunGatePresentationExistsParams) (bool, error)
+	PublishRunGatePresentation(ctx context.Context, arg store.PublishRunGatePresentationParams) (int64, error)
+	InsertRunGatePresentation(ctx context.Context, arg store.InsertRunGatePresentationParams) error
+	AdoptRunGatePresentation(ctx context.Context, arg store.AdoptRunGatePresentationParams) (int64, error)
+	ResetRunGateRefusals(ctx context.Context, id uuid.UUID) error
+	SetRunGateRefusal(ctx context.Context, arg store.SetRunGateRefusalParams) error
 	// Plain-English run summaries (PRD #362 M1). Intent is a plain UPDATE (the
 	// idempotent-on-set decision lives in the service); the plan write carries the
 	// Decision 3 stale-write guard (updates only if plan_md still matches), returning
@@ -1411,6 +1419,13 @@ type Params struct {
 	// caps the forge park), matching RUN_LIMIT_MAX_WAITS==0's "never park" shape. The positive
 	// default lives in config.go where the env is read.
 	RunForgeUnreachableMaxParks int
+
+	// RunGateRefusalMax (PRD #1795 M1), mirrored from config RUN_GATE_REFUSAL_MAX. The refusal
+	// cap on plan-gate re-presentation: a refused awaiting_approval report counts once per claim
+	// generation, and the refusal that would push the count past this cap fails the run with
+	// fail_origin='gate_presentation_refused'. The ZERO VALUE is "unlimited", the same safe off
+	// direction as RunForgeUnreachableMaxParks; the positive default lives in config.go.
+	RunGateRefusalMax int
 
 	// RecoveryUploadRetryWindow (PRD #1296 D3/D4, UZI_RECOVERY_UPLOAD_RETRY_WINDOW) is the
 	// durable-archive upload-retry window: a capture reserved but still non-terminal
@@ -3226,6 +3241,23 @@ type StateRequest struct {
 	// Absent (nil) on every non-recovery_wait report and on a legacy worker's empty-turn park. httpx.DecodeJSON rejects unknown fields, so this field MUST
 	// exist here or a new worker's report 400s.
 	RecoveryCause *string `json:"recovery_cause"`
+	// PresentationID is the worker-minted identity of the gate presentation an
+	// `awaiting_approval` report publishes (PRD #1795 M1, D1). A new id allocates the run's next
+	// gate revision; the run's CURRENT id with an unchanged approval-relevant payload is an
+	// idempotent retry answered with the current revision; a historical id, or the current id
+	// with a changed payload, is refused (409). Absent on an old worker's report, which
+	// allocates a new revision on every accepted report. A worker sends it only after the api
+	// advertised the gate_revision_v1 register feature: httpx.DecodeJSON rejects unknown
+	// fields, so this field MUST exist here. Requires claim_generation. Ignored on every
+	// other state.
+	PresentationID *uuid.UUID `json:"presentation_id,omitempty"`
+	// AdoptGateRevision is an explicit adoption (PRD #1795 M1, D4): a worker re-presenting the
+	// SAME persisted plan of an id-less gate (published by an old worker or before the
+	// migration) binds PresentationID to that gate's revision N instead of allocating N+1. The
+	// server accepts it only under the run-row lock when the current revision is N, the current
+	// presentation id is NULL and the payload is unchanged; otherwise it is refused
+	// (gate_adoption_stale). Requires PresentationID and claim_generation.
+	AdoptGateRevision *int64 `json:"adopt_gate_revision,omitempty"`
 }
 
 // ProposalPayload is the structured idea a scheduled issues-mode prompt run emits on
@@ -3296,6 +3328,20 @@ func (s *Service) terminalMessageFence(ctx context.Context, q Store, runID uuid.
 // "already terminal" as success and learns it was cancelled), per the M2 wire
 // contract.
 func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest) (run store.Run, applied bool, err error) {
+	return s.setState(ctx, wkr, runID, req, nil)
+}
+
+// SetStateReport is SetState plus the plan-gate revision (PRD #1795 M1) an applied
+// awaiting_approval report was answered with: the revision allocated (a new presentation) or
+// returned (a retained or adopted one) INSIDE the report's transaction, never re-read after
+// commit. 0 when the report allocated nothing (every other state, a declined report, a chat or
+// judge run, or a refusal).
+func (s *Service) SetStateReport(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest) (run store.Run, applied bool, gateRevision int64, err error) {
+	run, applied, err = s.setState(ctx, wkr, runID, req, &gateRevision)
+	return run, applied, gateRevision, err
+}
+
+func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, gateRevisionOut *int64) (run store.Run, applied bool, err error) {
 	// PRD #1392 M1: validate the TYPED recovery cause against the server enum BEFORE any state
 	// SQL, so an unknown non-nil value is a loud 400 (ErrInvalidState) rather than a
 	// constraint violation at the park write. Absent (nil) is fine (an ordinary report or a
@@ -3395,6 +3441,22 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// through the tx-bound `q`; the multi-query park helpers (limit_wait/recovery_wait) and the
 	// interlocked-completion permit transaction do NOT nest under this lock — see
 	// stateUsesGenerationFence for why each is covered by its own guard.
+	// PRD #1795 M1: an id-bearing awaiting_approval report (presentation_id or
+	// adopt_gate_revision) must stamp claim_generation, because a refusal's accounting is fenced
+	// on it; a current worker always stamps it and an id-less report never refuses. Adoption
+	// always names the id it adopts with, and a revision is positive.
+	gateTracked := req.State == "awaiting_approval" && gateRevisionKind(owned.Kind)
+	if gateTracked && (req.PresentationID != nil || req.AdoptGateRevision != nil) {
+		if req.ClaimGeneration == nil {
+			return owned, false, ErrClaimGenerationRequired
+		}
+		if req.PresentationID == nil {
+			return store.Run{}, false, fmt.Errorf("%w: adopt_gate_revision requires presentation_id", ErrInvalidState)
+		}
+		if req.AdoptGateRevision != nil && *req.AdoptGateRevision <= 0 {
+			return store.Run{}, false, fmt.Errorf("%w: adopt_gate_revision must be positive", ErrInvalidState)
+		}
+	}
 	q := Store(s.q)
 	var fenceTx pgx.Tx
 	defer func() {
@@ -3443,7 +3505,33 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		owned = locked
 		q = qtx
 	}
+	// PRD #1795 M1: an awaiting_approval report of a plan-gated run is classified and allocated
+	// under the run-row lock, so a nil-generation (legacy) report takes the lock too — no
+	// generation check is added for it, only atomicity and serialization against a concurrent
+	// verdict insert or publication. A nil txBeginner (unit tests; prod wires SetTxBeginner)
+	// keeps the pre-#1795 unlocked write and allocates nothing.
+	if gateTracked && fenceTx == nil && s.txBeginner != nil {
+		tx, berr := s.txBeginner.Begin(ctx)
+		if berr != nil {
+			return store.Run{}, false, berr
+		}
+		fenceTx = tx
+		qtx := store.New(tx)
+		locked, lerr := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
+		if lerr != nil {
+			if errors.Is(lerr, pgx.ErrNoRows) {
+				return store.Run{}, false, ErrRunNotOwned
+			}
+			return store.Run{}, false, lerr
+		}
+		owned = locked
+		q = qtx
+	}
 	var rows int64
+	// PRD #1795 M1: a refused awaiting_approval report (historical id, changed payload on the
+	// current id, stale adoption). It wrote no report; it is returned AFTER the commit (its
+	// accounting commits) and after the terminal fan-out when the refusal cap failed the run.
+	var gateRefusal error
 	// PRD #634 M4: the disposition to settle the pending scope audit row(s) with, decided in
 	// the `completed` case and applied best-effort in the applied-transition block below.
 	// Empty means "no settle". The failed arm also sets it 'declined' for a scope-directed run;
@@ -3592,7 +3680,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// as an absent-safe pgtype.Text, so an off-vocabulary or absent value is an invalid
 		// (SQL NULL) param the query's COALESCE keeps out of the column.
 		inferredCaps, inferredTools, sizeClass := inferredRequirementParams(req)
-		rows, err = q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
+		approvalParams := store.SetRunAwaitingApprovalParams{
 			PlanMd: stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			// Issue #1626: an interlocked run's FIRST plan-bearing report with no milestones is the
 			// explicit `[]` (planMilestonesParam), so the approve freeze builds a criteria:[]
@@ -3608,7 +3696,59 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			InferredTools:        inferredTools,
 			SizeClass:            sizeClass,
 			PlanChangedFiles:     planChangedFilesParam(req.PlanChangedFiles),
-		})
+		}
+		// PRD #1795 M1: classify the report under the run-row lock BEFORE any write (see
+		// gate_revision.go). The effective presented payload is computed in Go, so a conflict
+		// needs no trial write.
+		decision := gateDecision{class: gateClassUntracked}
+		if gateTracked && fenceTx != nil {
+			decision, err = classifyGateReport(ctx, q, owned, req, gateReportFields{
+				planMd:             approvalParams.PlanMd,
+				milestones:         approvalParams.MilestonesCandidate,
+				milestonesReported: req.Milestones != nil,
+				caps:               inferredCaps,
+				tools:              inferredTools,
+				sizeClass:          sizeClass,
+			})
+			if err != nil {
+				return store.Run{}, false, err
+			}
+		}
+		if decision.refusal != nil {
+			// A refusal writes no report. Its accounting runs in this transaction under the lock
+			// the fence took: ownership (the locked read is worker-scoped), the claim generation
+			// and an unreleased claim were verified there, and the status was admissible at
+			// classification. An id-bearing report always carries claim_generation (checked
+			// above), and only an id-bearing report can be refused.
+			gateRefusal = decision.refusal
+			rows, err = s.recordGateRefusal(ctx, q, owned, wkr, *req.ClaimGeneration, decision.refusal, sessionID)
+			break
+		}
+		if decision.class == gateClassRetain || decision.class == gateClassAdopt {
+			// A retained presentation is not re-derived from the report: the live requirement
+			// columns keep their current (possibly override-cleared) state, and the candidate
+			// stays the presented one, so an approval's capability override survives a
+			// same-gate re-presentation.
+			approvalParams.InferredCapabilities = nil
+			approvalParams.InferredTools = nil
+			approvalParams.SizeClass = pgtype.Text{}
+			approvalParams.MilestonesCandidate = retainedMilestonesCandidate(decision.retained)
+		}
+		rows, err = q.SetRunAwaitingApproval(ctx, approvalParams)
+		if err == nil && rows > 0 {
+			// Allocation only when the report was actually applied, in the same transaction.
+			var rev int64
+			switch decision.class {
+			case gateClassPublish, gateClassAdopt:
+				rev, err = applyGateDecision(ctx, q, runID, decision)
+			case gateClassRetain:
+				rev = owned.GateRevision
+				err = q.ResetRunGateRefusals(ctx, runID)
+			}
+			if err == nil && gateRevisionOut != nil {
+				*gateRevisionOut = rev
+			}
+		}
 	case "awaiting_input":
 		// PRD #88 M1: park on a clarification question. The question id is REQUIRED
 		// and rejected when absent rather than defaulted, because a NULL
@@ -4080,6 +4220,11 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			s.deleteCheckpointBestEffort(runID, run.Kind, run.IssueIid)
 		}
 	}
+	if gateRefusal != nil && err == nil {
+		// PRD #1795 M1: the refused report's accounting (and a cap failure) committed above; the
+		// report itself changed nothing the worker may treat as a published gate.
+		return run, false, gateRefusal
+	}
 	return run, rows > 0, err
 }
 
@@ -4340,6 +4485,23 @@ type InputDTO struct {
 	Kind      string    `json:"kind"`
 	Body      *string   `json:"body"`
 	CreatedAt time.Time `json:"created_at"`
+	// GateBinding and GateRevision are the verdict row's persisted gate binding (PRD #1795 M1,
+	// D3): "bound" with the positive revision it binds to, "unbound" with no revision, or both
+	// absent for a legacy row (pre-migration rows, non-verdict kinds, chat and judge runs).
+	// omitempty keeps a legacy row's wire byte-identical to before, so an old worker and a new
+	// worker reading a legacy row see today's shape.
+	GateBinding  *string `json:"gate_binding,omitempty"`
+	GateRevision *int64  `json:"gate_revision,omitempty"`
+}
+
+// inputDTO builds the worker-facing InputDTO from a run_user_inputs row's projected columns,
+// so every delivery path (legacy consume, receipt replay, receipt ACK) carries the gate binding
+// the same way.
+func inputDTO(id int64, kind string, body pgtype.Text, createdAt pgtype.Timestamptz, gateBinding pgtype.Text, gateRevision pgtype.Int8) InputDTO {
+	return InputDTO{
+		ID: id, Kind: kind, Body: textPtr(body), CreatedAt: createdAt.Time,
+		GateBinding: textPtr(gateBinding), GateRevision: int64Ptr(gateRevision),
+	}
 }
 
 // ConsumeInputsResult is what ConsumeInputs returns: the drained steering inputs and, when a
@@ -4397,7 +4559,7 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 		}
 		out := make([]InputDTO, 0, len(rows))
 		for _, row := range rows {
-			out = append(out, InputDTO{ID: row.ID, Kind: row.Kind, Body: textPtr(row.Body), CreatedAt: row.CreatedAt.Time})
+			out = append(out, inputDTO(row.ID, row.Kind, row.Body, row.CreatedAt, row.GateBinding, row.GateRevision))
 		}
 		return ConsumeInputsResult{Inputs: out, Receipts: true}, nil
 	}
@@ -4411,7 +4573,7 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 		if row.Kind == "follow_up" && row.FirstConsumption {
 			consumedFollowUp = true
 		}
-		out = append(out, InputDTO{ID: row.ID, Kind: row.Kind, Body: textPtr(row.Body), CreatedAt: row.CreatedAt.Time})
+		out = append(out, inputDTO(row.ID, row.Kind, row.Body, row.CreatedAt, row.GateBinding, row.GateRevision))
 	}
 	// Delivery ack (PRD #95 Decision 5): a follow-up first became consumed
 	// (consumed_at stamped, committed above), so poke the browser to re-read its steer queue and

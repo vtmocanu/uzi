@@ -686,6 +686,12 @@ type Run struct {
 	BudgetFinalizeSeconds       int32              `json:"budget_finalize_seconds"`
 	ReleasedWorkerID            pgtype.UUID        `json:"released_worker_id"`
 	ReleasedWorkerNonce         pgtype.Text        `json:"released_worker_nonce"`
+	GateRevision                int64              `json:"gate_revision"`
+	GatePresentationID          pgtype.UUID        `json:"gate_presentation_id"`
+	GatePresentedPayload        []byte             `json:"gate_presented_payload"`
+	GatePayloadDigest           []byte             `json:"gate_payload_digest"`
+	GateRefusalCount            int32              `json:"gate_refusal_count"`
+	GateRefusalGeneration       pgtype.Int8        `json:"gate_refusal_generation"`
 }
 
 type RunCompletionAttempt struct {
@@ -718,6 +724,13 @@ type RunCredentialEpoch struct {
 	Label           pgtype.Text        `json:"label"`
 	SelectReason    pgtype.Text        `json:"select_reason"`
 	AppliedAt       pgtype.Timestamptz `json:"applied_at"`
+}
+
+type RunGatePresentation struct {
+	RunID          uuid.UUID          `json:"run_id"`
+	PresentationID uuid.UUID          `json:"presentation_id"`
+	Revision       int64              `json:"revision"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
 type RunMessage struct {
@@ -822,6 +835,8 @@ type RunUserInput struct {
 	ConsumedClaimGeneration pgtype.Int8        `json:"consumed_claim_generation"`
 	ConsumedWorkerID        pgtype.UUID        `json:"consumed_worker_id"`
 	AppliedAt               pgtype.Timestamptz `json:"applied_at"`
+	GateBinding             pgtype.Text        `json:"gate_binding"`
+	GateRevision            pgtype.Int8        `json:"gate_revision"`
 }
 
 type Skill struct {
@@ -850,6 +865,7 @@ type SlackRunMessage struct {
 	StatusTs                    pgtype.Text        `json:"status_ts"`
 	LimitPausedAt               pgtype.Timestamptz `json:"limit_paused_at"`
 	ParkKind                    pgtype.Text        `json:"park_kind"`
+	GateRevision                pgtype.Int8        `json:"gate_revision"`
 }
 
 type TaskReview struct {

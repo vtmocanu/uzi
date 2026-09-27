@@ -501,6 +501,25 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			resumePlanSeq = seq
 		}
 	}
+	// PRD #1795 M1: the gate resume carries the persisted gate revision, its presentation id
+	// (nil for an id-less gate) and the presented requirements, all from the immutable snapshot,
+	// never the live requirement columns. A gate published before the migration (revision 0)
+	// carries none of them.
+	var resumeGateRevision int64
+	var resumeGatePresentationID *uuid.UUID
+	var resumeGatePresented *GatePresentedRequirements
+	if resumePhase == "awaiting_approval" && run.GateRevision > 0 {
+		resumeGateRevision = run.GateRevision
+		if run.GatePresentationID.Valid {
+			id := uuid.UUID(run.GatePresentationID.Bytes)
+			resumeGatePresentationID = &id
+		}
+		if snap, ok, derr := decodeGatePresentedPayload(run.GatePresentedPayload); derr != nil {
+			slog.Error("workersvc: decode gate presented payload", "run_id", run.ID, "error", derr)
+		} else if ok {
+			resumeGatePresented = snap.requirements()
+		}
+	}
 	// Issue #1604: when the persisted plan is UNAPPROVED (both the awaiting_approval gate resume
 	// and the "" re-plan resume of a session-less run), carry when THAT plan was last shown: the
 	// latest `plan` frame whose plan_md equals the persisted run.PlanMd, so a newer frame for a
@@ -612,6 +631,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		ResumePlanSeq: resumePlanSeq,
 		// Issue #1604: when the unapproved persisted plan was last shown (nil/omitted otherwise).
 		ResumePlanAt: resumePlanAt,
+		// PRD #1795 M1: the gate resume's revision, presentation id and presented requirements.
+		ResumeGateRevision:       resumeGateRevision,
+		ResumeGatePresentationID: resumeGatePresentationID,
+		ResumeGatePresented:      resumeGatePresented,
 		// PlanSource travels to the worker so it can tell D4 row 2 (seeded, no session ⇒
 		// implement) from row 3 (dropped session, not seeded ⇒ re-plan). Server writes
 		// it in M1; the worker consumes it in M2. Additive on the wire — an old worker

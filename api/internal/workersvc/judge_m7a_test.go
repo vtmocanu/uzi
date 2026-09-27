@@ -166,7 +166,7 @@ func TestPreStartInfraFailOriginsExact(t *testing.T) {
 // accidental add (a genuinely judgeable origin slipping into the regardless-of-iteration skip)
 // or drop (either falling out, re-exposing SC3) reddens here.
 func TestNeverJudgeFailOriginsExact(t *testing.T) {
-	assertFailOriginSetExact(t, "neverJudgeFailOrigins", neverJudgeFailOrigins, "forge_unreachable", "task_undispatched")
+	assertFailOriginSetExact(t, "neverJudgeFailOrigins", neverJudgeFailOrigins, "forge_unreachable", "task_undispatched", "gate_presentation_refused")
 }
 
 // TestEnvPublishFailOriginsExact pins envPublishFailOrigins (issue #1418) to its EXACT membership:
