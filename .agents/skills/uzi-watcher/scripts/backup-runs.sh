@@ -81,6 +81,11 @@ if [ -z "$REPO_SLUG" ]; then
   REPO_SLUG="$(printf '%s' "$origin" | sed -E 's#^[a-z]+://##; s#^[^@]+@##; s#\.git$##; s#[:/]#+#g')"
 fi
 RUNNER_BASE="${UZI_RUNNER_BASE:-/data/runner/$REPO_SLUG}"
+# Strip trailing slashes: candidates are built as "$RUNNER_BASE/<name>" and compared
+# byte-for-byte against the journal/ledger clonePath, so "base/" would yield "base//x".
+while [ "${#RUNNER_BASE}" -gt 1 ] && [ "${RUNNER_BASE%/}" != "$RUNNER_BASE" ]; do
+  RUNNER_BASE="${RUNNER_BASE%/}"
+done
 REPOS_BASE="${UZI_REPOS_BASE:-/data/repos}"
 case "$RETENTION_DAYS" in
   ''|*[!0-9]*) echo "error: UZI_BACKUP_RETENTION_DAYS must be a non-negative integer (got '$RETENTION_DAYS')" >&2; exit 2 ;;
@@ -312,16 +317,18 @@ list_pods(){
 # dir ($1=runner base, $2=stem): the canonical dir plus every <stem>.attempt-*
 # sibling (quoted prefix, so the glob can never reach another stem). <branch> is
 # empty when the dir has no readable .git (a recreated empty or root-owned attempt
-# dir). Quarantined residue and skills-plugin dirs never qualify; a name carrying a
-# newline is skipped so it cannot forge a second line.
+# dir). Quarantined residue and skills-plugin dirs never qualify (defensive: the
+# stem-anchored glob cannot produce them today). A path carrying a newline or a TAB is
+# skipped: a newline could forge a second line, a tab could forge the branch field.
 # shellcheck disable=SC2016
 LIST_CANDIDATES='
 set -u
+tab="$(printf "\t")"
 for d in "$1/$2" "$1/$2".attempt-*; do
   [ -d "$d" ] || continue
   case "${d##*/}" in .uzi-residue-*|.uzi-skills-*) continue ;; esac
   case "$d" in *"
-"*) continue ;; esac
+"*|*"$tab"*) continue ;; esac
   br=""
   if [ -r "$d/.git" ]; then
     br="$(git -c safe.directory="$d" -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null)" || br=""
@@ -331,11 +338,26 @@ done
 '
 ATTEMPT_RE='^[0-9]{8}T[0-9]{6}Z-(g[0-9]+|gx)-[0-9a-f]{16}$'
 
+# aid_newer <a> <b>: succeed when attemptId <a> is newer than <b>. Both match
+# ATTEMPT_RE. Order: timestamp (fixed width, so lexical), then the generation
+# NUMERICALLY (g10 > g9; gx, an unknown generation, is lowest), then the full id
+# lexically as a deterministic tie-break.
+aid_newer(){
+  local ta="${1%%-*}" tb="${2%%-*}" ga gb
+  [ "$ta" = "$tb" ] || { [[ "$ta" > "$tb" ]]; return; }
+  ga="${1#*-g}"; ga="${ga%%-*}"; gb="${2#*-g}"; gb="${gb%%-*}"
+  if [ "$ga" = x ]; then ga=-1; else ga=$((10#$ga)); fi
+  if [ "$gb" = x ]; then gb=-1; else gb=$((10#$gb)); fi
+  [ "$ga" -eq "$gb" ] || { [ "$ga" -gt "$gb" ]; return; }
+  [[ "$1" > "$2" ]]
+}
+
 # select_clone <ns> <pod> <stem> <branch> <rid>: print the identity-verified working
 # clone for run <rid> on this pod, or return 1 (see the header's "Clone layout").
 # A candidate is valid only when (a) the journal or the ledger names it for <rid>
 # (runId equal, clonePath equal, attemptId equal when the entry carries one) and
-# (b) its .git reports <branch>. Journal-named wins; else the newest attemptId.
+# (b) its .git reports <branch>. Journal-named wins; else the newest attemptId
+# (aid_newer).
 select_clone(){
   local ns="$1" pod="$2" stem="$3" branch="$4" rid="$5"
   local LC_ALL=C listing journal ledger ledger_ok jr="" jc="" ja="" path br name aid
@@ -364,6 +386,9 @@ select_clone(){
     | .[] | select(.runId == $rid) | "\(.attemptId)\t\(.clonePath)"' 2>/dev/null)" || ledger_ok=""
   while IFS="$tab" read -r path br; do
     [ -n "$path" ] && [ "${path%/*}" = "$RUNNER_BASE" ] || continue
+    # Belt-and-braces for the on-pod tab filter: a tab left in the branch field
+    # means the line had an extra field, so it cannot be trusted.
+    case "$br" in *"$tab"*) continue ;; esac
     name="${path##*/}"
     if [ "$name" = "$stem" ]; then
       aid=""
@@ -378,7 +403,7 @@ select_clone(){
     fi
     [ -n "$aid" ] || continue
     printf '%s\n' "$ledger_ok" | grep -qxF -- "$aid$tab$path" || continue
-    if [ "$have_best" -eq 0 ] || [[ "$aid" > "$best_aid" ]]; then
+    if [ "$have_best" -eq 0 ] || aid_newer "$aid" "$best_aid"; then
       best="$path"; best_aid="$aid"; have_best=1
     fi
   done <<< "$listing"

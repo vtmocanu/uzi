@@ -276,10 +276,15 @@ and namespace from your own kubeconfig; they are deployment-specific, do not har
    newer, empty one. Read `uzi-recovery.BRANCH.clone` and every
    `uzi-attempts.BRANCH.entry` (last value per `attemptId` wins) from BARE with
    `git config --get` / `--get-all`; take the dir whose entry has this run's `runId`
-   (journal first, else newest ledger `attemptId`), then confirm it has a `.git` and
-   `git -C CLONE rev-parse --abbrev-ref HEAD` prints BRANCH. Never pick by newest name
-   alone, never a `.uzi-residue-*` or `.uzi-skills-*` dir. Then `git -C CLONE bundle
-   create /tmp/r.bundle BRANCH --not origin/main`. `backup-runs.sh` emits a `BARE` capture automatically when the current
+   and that dir's `clonePath` (journal first, and only when its `attemptId`, if
+   present, equals the dir's `ID`; else the newest ledger `attemptId`: timestamp, then
+   numeric generation, `gx` lowest). Then confirm it has a `.git` and
+   `git -c safe.directory=CLONE -C CLONE rev-parse --abbrev-ref HEAD` prints BRANCH
+   (`kubectl exec` runs as a different uid than the clone's owner, so every `git -C
+   CLONE` here needs `-c safe.directory=CLONE`). Never pick by newest name alone,
+   never a `.uzi-residue-*` or `.uzi-skills-*` dir. Then `git -c
+   safe.directory=CLONE -C CLONE bundle create /tmp/r.bundle BRANCH --not
+   origin/main`. `backup-runs.sh` emits a `BARE` capture automatically when the current
    worker has no clone (cold-reassignment) or the clone is gone. Such a capture preserves
    committed checkpoints only and states that uncommitted WIP is unavailable. By hand, use:
    `git --git-dir=BARE bundle create /tmp/r.bundle
