@@ -230,21 +230,34 @@ removes the tree.
   workers as a known follow-up.
 - The ledger rewrite (decision 10/14) needs hard links on the data volume; a
   volume that does not support them is a deployment constraint on this design,
-  not a design gap.
+  not a design gap. The compaction that bounds the ledger's size
+  (`compactAttemptLedger`) is itself best-effort: it catches its own failure,
+  logs "attempt ledger compaction failed; the ledger is left as it was", and
+  leaves the ledger uncompacted rather than failing the run. A volume without
+  hard link support therefore degrades to unbounded ledger growth over time,
+  not a hard failure.
 - Legacy journaled root-owned canonical retire (residue that predates M3) is a
   follow-up, not retrofitted by this work.
 
 ## Invariants future code must respect
 
-- **The process reaper's `quiescent` state is the only proof of quiescence, and
-  it alone is blocking.** `teardownDocker` never returns `quiescent`, ever — its
-  three states are `not_wired`, `docker_unconfirmed`, and `docker_error` — so
-  there is no Docker result to pair a process proof with. Every Docker outcome
-  is treated as best-effort cleanup, never as proof: `docker_unconfirmed` is
+- **The process reaper's `quiescent` state is the only proof of quiescence a
+  seed or capture sweep can ever get, and where it applies it alone is
+  blocking.** `teardownDocker` never returns `quiescent`, ever — its three
+  states are `not_wired`, `docker_unconfirmed`, and `docker_error` — so there
+  is no Docker result to pair a process proof with. Every Docker outcome is
+  treated as best-effort cleanup, never as proof: `docker_unconfirmed` is
   logged and does not block, and `docker_error` is logged and does not block
   either. Fail-closed is the process half's rule alone — a surviving or
   unattributable process (`survivors` or `unverified`) blocks the sink at every
   site that gates on quiescence; a non-quiescent Docker result blocks nothing.
+  The reaper's scan itself is skipped, not just relaxed, on a Codex run's own
+  `mode: "own"` proof (`runner.ts`'s `processes: (!executor.safety || mode !==
+  "own") && process.platform === "linux"`): there, a Codex thread's own
+  supervisor boundary (`withBoundary`) is what proves the run's processes have
+  drained before the sink runs, and the reaper scan runs unconditionally only
+  for a `seed`/`capture` sweep over paths that have no supervisor behind them,
+  or for a Claude/stub run.
 - Never mark `UZI_WORKER_SPAWN` on anything other than a worker-authored,
   fixed-argv spawn. Marking a repo- or agent-invoked command breaks the
   attribution the reaper depends on to distinguish worker infrastructure from
@@ -277,9 +290,12 @@ removes the tree.
 The worker can now prove that a run's OWN processes have stopped before every
 destructive or credentialed operation gated on it, and fails closed rather than
 guessing when it cannot. This is narrower than proving the clone itself is
-safe to touch: the process proof runs only where the reaper's process scan is
-gated to run at all (Linux workers; see `agent/src/runner.ts`'s
-`process.platform === "linux"` check), and it says nothing about a Docker
+safe to touch: the reaper's process scan is gated to run at all only on Linux
+workers (`agent/src/runner.ts`'s `process.platform === "linux"` check), and
+for a Codex run's own-mode proof the scan is skipped outright in favor of the
+Codex supervisor's own `withBoundary` boundary as the process proof (see the
+invariant above) — the reaper itself is the proof only for a Claude/stub run,
+or for a `seed`/`capture` sweep. It also says nothing about a Docker
 container — the Docker teardown that runs alongside it is best-effort cleanup,
 not proof, so a container that still binds the clone path can, in principle,
 outlive the checks that gate on process quiescence alone. Attempt-unique clone

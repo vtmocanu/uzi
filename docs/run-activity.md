@@ -402,18 +402,24 @@ What happens next depends on where in the run this check comes up, because
 most of the places that check are not the end of the run:
 
 - At a wall-clock, usage-limit, or completion-hold park, the check being
-  unproven means the worker skips publishing a checkpoint for that park —
-  nothing lands on the run's branch this time, but the park itself still
-  stands, and the run resumes normally later.
+  unproven means the worker skips the capture for that park entirely — no
+  checkpoint publish, so the latest local work stays on this worker only
+  for now (a checkpoint publish targets a separate checkpoint ref, never
+  the run's branch directly) — but the park itself still stands, and a
+  later resume recovers from whatever checkpoint was last durably
+  published.
 - At a pause the owner requested, it means the pause itself fails: the run
   reports **pause failed** and keeps running rather than stopping on
   unproven ground.
 - At a milestone checkpoint, it means that one checkpoint's publish is
   skipped and the run continues to its next milestone.
 - During a credential switch, the worker retries capturing a verified
-  restore point a bounded number of times; if it never succeeds, the switch
-  reports **credential switch failed** and the run is left to be requeued
-  rather than continuing on an unproven clone.
+  restore point a bounded number of times. If it never succeeds, it reports
+  **credential switch failed**; when the server confirms the failure stamp
+  cleared, the run simply continues on the old credential in place (its
+  clone and session are kept), and only when that clear isn't confirmed is
+  the run stopped and left to be requeued rather than continuing on
+  uncertain ground.
 - A recovery capture that cannot prove the clone stopped is retried rather
   than treated as a failure.
 - On graceful shutdown, an unproven clone means nothing is published to the
@@ -421,11 +427,17 @@ most of the places that check are not the end of the run:
   from whatever was last durably saved.
 
 The run actually **fails**, with `fail_origin = worker_residue_blocked`
-(shown as **worker residue blocked**), only at points where there is no
-safe way to continue without the proof: the finalize gate that pushes the
-run's branch (and its re-proofs after any git operation that could have
-started something new), the run's terminal failure path, and a canonical
-clone reseed that cannot free the path it needs.
+(shown as **worker residue blocked**), at points where there is no safe
+way to continue without the proof: the finalize gate that pushes the run's
+branch (and its re-proofs after any git operation that could have started
+something new), seeding a fresh attempt clone for a new execution attempt,
+capturing a predecessor attempt's or a reclaimed orphan's work (both on a
+Docker-wired worker), and a canonical clone reseed that cannot free the
+path it needs. A blocked check during cleanup **after** a run has already
+reached its own outcome — retiring a finished run's clone, for instance —
+does not itself fail the run: the clone is simply kept in place instead of
+being removed, and the run's own status and failure reason (if any) stand
+unchanged.
 
 This is a worker infrastructure problem, not something the agent did wrong,
 so a run that fails this way is never sent to the judge. Nothing is
