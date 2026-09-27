@@ -228,6 +228,8 @@ var runDTOKeys = []string{
 	// promotion stamp (a distinct column from retry_not_before, the limit park's); forge_park_count
 	// is the forge-only lifetime counter; forge_park_max is the effective cap (0 = unlimited).
 	"recovery_wait_cause", "recovery_retry_not_before", "forge_park_count", "forge_park_max",
+	// PRD #1809 M5: the disk-only lifetime counter of counted data_volume_full parks.
+	"disk_park_count",
 	// PRD #1590 D6: the derived owner action for a codex_account_unavailable hold (null otherwise).
 	"codex_account_action",
 	// Issue #1730: the run's bound alias id and its independent snapshotted label.

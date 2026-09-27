@@ -356,6 +356,9 @@ func run() error {
 		// the run fails with fail_origin='forge_unreachable' instead of parking again. 0 =
 		// unlimited. Counted separately from the recovery-park backoff (recovery_wait_count).
 		RunForgeUnreachableMaxParks: cfg.RunForgeUnreachableMaxParks,
+		// Data-volume-full park cap (PRD #1809 M5, D6): past this many COUNTED disk parks the run
+		// fails with fail_origin='data_volume_full'. 0 = unlimited. Preventive parks never count.
+		RunDiskParkMax: cfg.RunDiskParkMax,
 		// PRD #1296 D3/D4 durable-archive upload-retry window: the sweep flips a capture stuck
 		// in a non-terminal upload state past this to needs_action WITHOUT releasing its
 		// custody hold (source retained). Non-positive disables the pass.

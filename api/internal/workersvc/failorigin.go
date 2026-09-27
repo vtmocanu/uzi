@@ -92,6 +92,14 @@ var failOrigins = []string{
 	// neverJudgeFailOrigins and envPublishFailOrigins (judge_enqueue.go) — and it is not
 	// human-landable (no finalize ran, so there is no committed work to land).
 	"plan_missing",
+	// PRD #1809 M5 (D6): a run whose worker's data volume stayed full across more than
+	// UZI_RUN_DISK_PARK_MAX counted 'data_volume_full' parks. SERVER-DERIVED, NOT
+	// worker-reportable (stamped directly inside SetState's disk-park transaction,
+	// parkDataVolumeFull, so it is deliberately absent from workerReportableFailOrigins — a
+	// worker reporting it is a forgery CoerceFailOrigin drops). Excluded from the judge
+	// (neverJudgeFailOrigins, judge_enqueue.go) REGARDLESS of iteration_count: a full worker
+	// volume is the environment's failure, not an agent defect, and it lands mid-run.
+	"data_volume_full",
 }
 
 // failOriginSet is the lookup form. Built once; failOrigins stays the declaration so

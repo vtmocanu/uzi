@@ -2428,6 +2428,47 @@ WHERE id = @id AND worker_id = @worker_id
   AND kind <> 'judge'
 RETURNING *;
 
+-- name: ParkRunDataVolumeFull :one
+-- PRD #1809 M5 (D6): the DATA-VOLUME-FULL park writer, the typed sibling of
+-- ParkRunForgeUnreachable — same 'recovery_wait' transition, same backoff-shaping
+-- recovery_wait_count bump, same health-trio reset and session_id COALESCE, same positive
+-- source guard (status = 'running') — with its own cause and counter:
+--
+--   - recovery_wait_cause = 'data_volume_full' — the TYPED cause the surfaces render the
+--     disk-full wording off of.
+--   - disk_park_count = disk_park_count + 1 when @counted — the DISK-ONLY lifetime counter the
+--     cap (UZI_RUN_DISK_PARK_MAX) decides on, bumped in the SAME statement as the transition so
+--     a counted park cannot land without its counter advancing. A PREVENTIVE park (the worker
+--     stopped the run before the volume filled; @counted = false) leaves it untouched, so
+--     repeated preventive parks can never walk a run into the cap. forge_park_count is never
+--     touched here: it belongs to the forge park alone.
+--
+-- RETURNING * so the service reads back the counter and the stamped recovery_retry_not_before
+-- for the ack. Run INSIDE the disk-park transaction after the run row is FOR UPDATE locked and
+-- its status/generation/release verified in Go, so the guards below are the belt-and-braces
+-- backstop rather than the race barrier (the row lock is). The generation and released-claim
+-- conjuncts are SetRunRecoveryWait's (sqlc.narg, never @name, for the same parser reason).
+-- It does NOT touch recovery_custody_holds: unlike the pre-clone forge park, a disk park can
+-- land mid-run with work only this worker holds, so the generation's hold stays open (D6: the
+-- park still holds custody).
+UPDATE runs SET
+    status                    = 'recovery_wait',
+    status_since              = now(),
+    recovery_wait_count       = recovery_wait_count + 1,
+    recovery_wait_cause       = 'data_volume_full',
+    disk_park_count           = disk_park_count + CASE WHEN sqlc.arg('counted')::boolean THEN 1 ELSE 0 END,
+    recovery_retry_not_before = @retry_not_before,
+    session_id                = COALESCE(sqlc.narg('session_id'), session_id),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at                = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status = 'running'
+  AND kind <> 'judge'
+  AND claim_released_at IS NULL
+  AND (sqlc.narg('claim_generation')::bigint IS NULL
+       OR claim_generation = sqlc.narg('claim_generation')::bigint)
+RETURNING *;
+
 -- name: LockOpenCustodyHoldsForRunWorkerGeneration :many
 -- PRD #1392 M1 (D3): the forge park's EXACT-hold cardinality lock. Returns the ids of every
 -- OPEN custody hold on @run_id at @generation held live by @worker_id, FOR UPDATE, so the

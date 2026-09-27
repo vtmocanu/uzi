@@ -684,7 +684,8 @@ type RunDTO struct {
 	// non-null values are "forge_unreachable" (the forge stayed unreachable at clone),
 	// "codex_account_unavailable" (PRD #1590, held on its Codex account) and "vault_locked"
 	// (issue #1766, the owner's vault is locked; the run resumes at its next retry once the
-	// vault is unlocked);
+	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
+	// or about to fill; the run resumes at its next retry, see DiskParkCount);
 	// "empty_turn"/"provider_outage" are reserved. Clients render an unrecognised value
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
@@ -732,6 +733,12 @@ type RunDTO struct {
 	// zero. It is one server constant, but unlike LimitWaitCount's cap it IS on the row because
 	// the forge wording ("N of MAX") needs the denominator inline.
 	ForgeParkMax int `json:"forge_park_max"`
+	// DiskParkCount is how many COUNTED 'data_volume_full' parks this run has taken in its
+	// lifetime (PRD #1809 M5, D6), the DISK-ONLY counter the UZI_RUN_DISK_PARK_MAX cap decides
+	// on — distinct from ForgeParkCount and from the backoff-shaping recovery_wait_count. A
+	// preventive disk park (the worker stopped the run before its volume filled) does not count.
+	// 0 for a run that has never taken a counted disk park.
+	DiskParkCount int `json:"disk_park_count"`
 	// Model is the model frozen onto the run at fire time by the schedule that created it
 	// (PRD #300): nil means the run inherited the owner's per-user Worker default. Surfaced
 	// read-only so a scheduled run's model is confirmable.

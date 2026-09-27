@@ -2595,7 +2595,9 @@ export interface Run {
    *  (PRD #1590: held on its Codex account) and "vault_locked" (issue #1766: a Codex
    *  credential refresh or release found the run owner's vault locked; the run resumes at its
    *  next retry, `recovery_retry_not_before`, once the vault is unlocked, and waits `queued`
-   *  while it stays locked); "empty_turn"/"provider_outage"
+   *  while it stays locked), and "data_volume_full" (PRD #1809 M5: the worker's data volume
+   *  was full or about to fill; the run resumes at its next retry, see disk_park_count);
+   *  "empty_turn"/"provider_outage"
    *  are reserved. Render an unrecognised value honestly (a
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
@@ -2633,6 +2635,11 @@ export interface Run {
    *  limit_wait_count's cap it IS on the row because the forge wording ("N of MAX") needs
    *  the denominator inline. */
   forge_park_max: number;
+  /** PRD #1809 M5: how many COUNTED `data_volume_full` parks this run has taken in its
+   *  lifetime — the DISK-ONLY counter the UZI_RUN_DISK_PARK_MAX cap decides on, distinct
+   *  from forge_park_count. A preventive disk park (the worker stopped the run before its
+   *  data volume filled) does not count. 0 for a run that has never taken a counted disk park. */
+  disk_park_count?: number;
   /** PRD #84 M4: the run's inferred/hinted scheduling requirements, surfaced RAW so the
    *  web derives the plan-gate readiness display from them plus the assigned worker's
    *  capabilities (there is no server-computed "capability_block" field — the 409 the

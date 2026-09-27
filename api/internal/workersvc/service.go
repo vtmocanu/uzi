@@ -1411,6 +1411,11 @@ type Params struct {
 	// caps the forge park), matching RUN_LIMIT_MAX_WAITS==0's "never park" shape. The positive
 	// default lives in config.go where the env is read.
 	RunForgeUnreachableMaxParks int
+	// RunDiskParkMax (PRD #1809 M5, D6), mirrored from config (UZI_RUN_DISK_PARK_MAX). The
+	// DATA-VOLUME-FULL park's lifetime cap: parkDataVolumeFull fails the run with the
+	// server-derived fail_origin='data_volume_full' instead of parking when a COUNTED park would
+	// take disk_park_count past it. A preventive park is neither counted nor capped. 0 = unlimited.
+	RunDiskParkMax int
 
 	// RecoveryUploadRetryWindow (PRD #1296 D3/D4, UZI_RECOVERY_UPLOAD_RETRY_WINDOW) is the
 	// durable-archive upload-retry window: a capture reserved but still non-terminal
@@ -3223,14 +3228,23 @@ type StateRequest struct {
 	SizeClass            *string   `json:"size_class"`
 	// RecoveryCause is the worker's TYPED cause for a 'recovery_wait' park (PRD #1392 M1).
 	// UNTRUSTED free text on arrival: SetState validates it against the server enum
-	// {forge_unreachable, empty_turn, provider_outage, vault_locked} BEFORE any state SQL and
-	// rejects an unknown non-nil value as ErrInvalidState (400), so a garbled cause can never
-	// reach the constrained column. Only recovery_cause == "forge_unreachable" triggers the
-	// dedicated custody-settling park transaction; the other causes take the ordinary park,
+	// {forge_unreachable, empty_turn, provider_outage, vault_locked, data_volume_full} BEFORE any
+	// state SQL and rejects an unknown non-nil value as ErrInvalidState (400), so a garbled cause
+	// can never reach the constrained column. Only recovery_cause == "forge_unreachable" triggers the
+	// dedicated custody-settling park transaction, and "data_volume_full" (PRD #1809 M5) its own
+	// counted park transaction (parkDataVolumeFull); the other causes take the ordinary park,
 	// which writes cause NULL (D9) except for vault_locked, which it persists (issue #1766 M2).
 	// Absent (nil) on every non-recovery_wait report and on a legacy worker's empty-turn park. httpx.DecodeJSON rejects unknown fields, so this field MUST
 	// exist here or a new worker's report 400s.
 	RecoveryCause *string `json:"recovery_cause"`
+	// DiskParkPreventive qualifies a recovery_cause "data_volume_full" park (PRD #1809 M5, D6):
+	// true means the worker stopped the run BEFORE its data volume filled (a pressure stop), so
+	// the park is neither counted in disk_park_count nor capped by UZI_RUN_DISK_PARK_MAX; absent
+	// or false is a counted park (a write actually failed disk-full). Only valid with that cause:
+	// SetState rejects it with any other cause, or none, as ErrInvalidState (400) before any SQL
+	// (validateDiskParkPreventive). httpx.DecodeJSON rejects unknown fields, so a worker sends it
+	// only once the api advertises the recovery_cause_data_volume_full feature.
+	DiskParkPreventive *bool `json:"disk_park_preventive"`
 }
 
 // ProposalPayload is the structured idea a scheduled issues-mode prompt run emits on
@@ -3307,12 +3321,16 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// legacy untyped park). Only forge_unreachable triggers the dedicated park transaction
 	// below; empty_turn/provider_outage are accepted here (reserved, D9) but take the ordinary
 	// untyped park, which writes cause NULL. vault_locked (issue #1766 M2) takes the same
-	// ordinary park, which persists that one cause.
+	// ordinary park, which persists that one cause. data_volume_full (PRD #1809 M5) takes its
+	// own counted park transaction; disk_park_preventive is valid only alongside it.
 	if req.RecoveryCause != nil && serverRecoveryWaitCauses[*req.RecoveryCause] {
 		return store.Run{}, false, fmt.Errorf("%w: recovery_cause %q is server-only", ErrInvalidState, *req.RecoveryCause)
 	}
 	if req.RecoveryCause != nil && !recoveryWaitCauses[*req.RecoveryCause] {
 		return store.Run{}, false, fmt.Errorf("%w: unknown recovery_cause %q", ErrInvalidState, *req.RecoveryCause)
+	}
+	if err := validateDiskParkPreventive(req); err != nil {
+		return store.Run{}, false, err
 	}
 	owned, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
@@ -3806,6 +3824,20 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				// stale_claim / custody_unsettled: carry the run so the handler can render the
 				// 409 {run, reason} body; nothing was committed.
 				return frun, false, err
+			}
+			break
+		}
+		// PRD #1809 M5 (D6): the DATA-VOLUME-FULL park is its own locked transaction too — the
+		// forge park's claim-generation fencing, a disk-only lifetime counter (bumped unless the
+		// park is preventive) and a cap past which the run fails with fail_origin
+		// 'data_volume_full'. It settles no custody hold (the park keeps custody) and, like the
+		// forge park, falls through to the shared post-switch fan-out. A stale claim returns
+		// early carrying the locked run for the handler's generic stale_claim 409.
+		if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseDataVolumeFull {
+			var drun store.Run
+			drun, rows, err = s.parkDataVolumeFull(ctx, wkr, owned, req, sessionID)
+			if err != nil {
+				return drun, false, err
 			}
 			break
 		}

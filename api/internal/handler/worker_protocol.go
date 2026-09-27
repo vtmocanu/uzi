@@ -400,6 +400,12 @@ func protocolFeatures(activeSnapshotEnabled bool) []string {
 		// and stores the cause. Advertised UNCONDITIONALLY (no config gates the park): a worker
 		// must see it before sending the cause, because an older api 400s an unknown recovery_cause.
 		{"recovery_cause_vault_locked"},
+		// PRD #1809 M5 (D6): this api accepts {status:"recovery_wait",
+		// recovery_cause:"data_volume_full"} with the optional disk_park_preventive flag, stores
+		// the cause and counts the park toward UZI_RUN_DISK_PARK_MAX. Advertised UNCONDITIONALLY
+		// (no config gates the park; 0 only lifts the cap): a worker must see it before sending
+		// the cause or the flag, because an older api 400s both.
+		{"recovery_cause_data_volume_full"},
 	}
 	if activeSnapshotEnabled {
 		groups = append(groups, []string{"active_run_snapshot"}) // PRD #1390 M2a

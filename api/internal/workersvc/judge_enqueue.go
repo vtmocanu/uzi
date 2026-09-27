@@ -41,8 +41,8 @@ var preStartInfraFailOrigins = map[string]bool{
 
 // neverJudgeFailOrigins is the fail_origin set that skips the judge REGARDLESS of
 // iteration_count (PRD #1392 M1, SC3). Its members are SERVER-DERIVED origins that are never
-// a real agent defect, so there is nothing to retrospect however far the run got. Today it is
-// EXACTLY forge_unreachable: it is stamped ONLY inside SetState's forge-park transaction (a
+// a real agent defect, so there is nothing to retrospect however far the run got. Its first
+// member is forge_unreachable: it is stamped ONLY inside SetState's forge-park transaction (a
 // forge that stayed unreachable at clone past the park cap), never by a worker report
 // (workerReportableFailOrigins excludes it, and CoerceFailOrigin drops a worker forging it),
 // so an untrusted report can never steer this skip. Unlike preStartInfraFailOrigins it is NOT
@@ -56,6 +56,11 @@ var neverJudgeFailOrigins = map[string]bool{
 	// skips the judge regardless of iteration_count. Server-derived (see failorigin.go); the
 	// sweep already declines to enqueue a judge for these rows, so this is belt-and-braces.
 	"task_undispatched": true,
+	// PRD #1809 M5 (D6): a run failed past the disk park cap (its worker's data volume stayed
+	// full). Server-derived (stamped in parkDataVolumeFull, never a worker report) and an
+	// environment failure, not an agent defect, so it skips the judge regardless of
+	// iteration_count: it lands mid-run, where iteration_count is usually > 0.
+	"data_volume_full": true,
 }
 
 // envPublishFailOrigins is the fail_origin set for ENVIRONMENT-CAUSED publish failures (issue
