@@ -48,6 +48,7 @@ seq_reply() {
 if [ "${1:-}" = pr ] && [ "${2:-}" = checks ]; then
   # A conflicting PR gets no pull_request CI: gh reports no required checks and exits 1.
   if [ "${CHECKS_NONE:-0}" = 1 ]; then echo "no required checks reported on the 'agent/issue-1' branch" >&2; exit 1; fi
+  if [ "${CHECKS_BROKEN:-0}" = 1 ]; then echo "HTTP 502: Bad Gateway" >&2; exit 1; fi
   if [ -n "${SEQ_DIR:-}" ]; then seq_reply checks
   elif [ -n "${CHECKS_JSON:-}" ]; then echo "$CHECKS_JSON"
   else echo '[{"name":"ci","bucket":"pass"}]'; fi
@@ -573,8 +574,9 @@ grep -q 'RESULT=conflict' "$WORK/computing.out" && fail "mergeable=UNKNOWN read 
 unset CHECKS_NONE MERGEABLE_N MERGEABLE_SEQ
 
 # A lookup that stays unreadable (#1778: 24+ silent unknown=1 polls): every poll line names
-# it, and --max-unknown consecutive unknown polls exit 9 naming it, before max_polls.
-export CHECKS_NONE=1
+# it, and --max-unknown consecutive unknown polls exit 9 naming it, before max_polls. Here
+# the checks listing stays empty past --ci-grace (0), so it is the ci_checks unknown.
+export CHECKS_NONE=1 WATCH_PR_CI_GRACE=0
 set +e
 bash "$SCRIPT" test/repo 42 0 20 --reviewer greptile --reviewer-grace 0 > "$WORK/unk-default.out" 2>&1
 rc=$?
@@ -591,7 +593,25 @@ rc_env=$?
 set -e
 [ "$rc" -eq 9 ] && grep -q 'polls=2$' "$WORK/unk-flag.out" || fail "--max-unknown 2 not honoured, rc=$rc: $(cat "$WORK/unk-flag.out")"
 [ "$rc_env" -eq 9 ] && grep -q 'polls=3$' "$WORK/unk-env.out" || fail "WATCH_PR_MAX_UNKNOWN=3 not honoured, rc=$rc_env: $(cat "$WORK/unk-env.out")"
-unset CHECKS_NONE
+unset WATCH_PR_CI_GRACE
+# Inside --ci-grace (default 15 min) a fresh head with NO checks yet is pending CI, never an
+# unknown: 20 polls end in a timeout, not exit 9 (queued runners, review of #1788).
+set +e
+bash "$SCRIPT" test/repo 42 0 20 --reviewer greptile --reviewer-grace 0 > "$WORK/ci-grace.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "unregistered CI inside the grace returned rc=$rc, want 2: $(tail -3 "$WORK/ci-grace.out")"
+grep -q 'try 20: .*req_pend=1 .*ci_unregistered=[0-9]*s unknown=0$' "$WORK/ci-grace.out" || fail "unregistered CI not read as pending: $(tail -3 "$WORK/ci-grace.out")"
+grep -q 'RESULT=unknown_persistent' "$WORK/ci-grace.out" && fail "unregistered CI inside the grace counted as unknown"
+# ...past it (--ci-grace 0) the same empty listing is the ci_checks unknown (above), and a
+# checks FAILURE is unknown at once, grace or not.
+unset CHECKS_NONE; export CHECKS_BROKEN=1
+set +e
+bash "$SCRIPT" test/repo 42 0 20 --reviewer greptile --reviewer-grace 0 --max-unknown 2 > "$WORK/ci-broken.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 9 ] && grep -q '^RESULT=unknown_persistent lookups=ci_checks polls=2$' "$WORK/ci-broken.out" || fail "a failed checks lookup was graced, rc=$rc: $(cat "$WORK/ci-broken.out")"
+unset CHECKS_BROKEN
 # A Greptile review still running is a wait, not an unreadable lookup: it never exits 9.
 MODE="prior_pending"; export MODE
 set +e
@@ -601,4 +621,4 @@ set -e
 [ "$rc" -eq 2 ] || fail "a running Greptile review counted as persistent unknown, rc=$rc: $(cat "$WORK/unk-pending.out")"
 grep -q 'unknown_lookups=greptile_pending$' "$WORK/unk-pending.out" || fail "the pending review was not named: $(cat "$WORK/unk-pending.out")"
 
-echo "PASS watch-pr: settled reviews, unregistered required checks, resolved-thread scope, earlier-verdict Greptile scope, change_assessment head marker, reviewer override, Greptile run on an older commit, conflicting PR, persistent unknown"
+echo "PASS watch-pr: settled reviews, unregistered required checks, resolved-thread scope, earlier-verdict Greptile scope, change_assessment head marker, reviewer override, Greptile run on an older commit, conflicting PR, persistent unknown, CI registration grace"

@@ -33,6 +33,12 @@
 #                     (default 5, or $WATCH_PR_MAX_UNKNOWN). A Greptile review still running
 #                     (`greptile_pending`) is a wait, not a failure, and does not count.
 #                     Every poll line names the unknown lookups (`unknown_lookups=`).
+#   --ci-grace        minutes a mergeable=MERGEABLE head may report NO checks at all (gh: "no
+#                     required checks reported", or `[]`) and still read as pending CI
+#                     (`ci_unregistered=<s>`), for queued runners (default 15, or
+#                     $WATCH_PR_CI_GRACE). Measured from the first poll that saw the head,
+#                     which is never earlier than its push. Past it, the empty listing is the
+#                     `ci_checks` unknown again; any other checks failure is unknown at once.
 #
 # When Greptile has not reviewed the head, the poll line carries `greptile_last_reviewed=<sha>`,
 # its newest verdict on an earlier commit (informational: `git range-diff` it against a rebased
@@ -87,15 +93,16 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/required-checks.sh
 . "$HERE/lib/required-checks.sh"
 
-usage() { echo "usage: watch-pr.sh OWNER/REPO PR [interval_secs] [max_polls] [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN] [--max-unknown N]" >&2; exit 2; }
+usage() { echo "usage: watch-pr.sh OWNER/REPO PR [interval_secs] [max_polls] [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN] [--max-unknown N] [--ci-grace MIN]" >&2; exit 2; }
 
-REVIEWER="any"; GRACE_MIN=10; MAX_UNKNOWN="${WATCH_PR_MAX_UNKNOWN:-5}"
+REVIEWER="any"; GRACE_MIN=10; MAX_UNKNOWN="${WATCH_PR_MAX_UNKNOWN:-5}"; CI_GRACE_MIN="${WATCH_PR_CI_GRACE:-15}"
 POS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --reviewer) REVIEWER="${2:?}"; shift 2;;
     --reviewer-grace) GRACE_MIN="${2:?}"; shift 2;;
     --max-unknown) MAX_UNKNOWN="${2:?}"; shift 2;;
+    --ci-grace) CI_GRACE_MIN="${2:?}"; shift 2;;
     -h|--help) usage;;
     -*) echo "unknown flag: $1" >&2; usage;;
     *) POS+=("$1"); shift;;
@@ -108,6 +115,9 @@ INTERVAL=${POS[2]:-60}
 MAX=${POS[3]:-60}
 case "$REVIEWER" in any|coderabbit|greptile|none) ;; *) echo "bad --reviewer: $REVIEWER" >&2; usage;; esac
 case "$MAX_UNKNOWN" in ''|*[!0-9]*|0) echo "bad --max-unknown: $MAX_UNKNOWN" >&2; usage;; esac
+case "$CI_GRACE_MIN" in ''|*[!0-9]*) echo "bad --ci-grace: $CI_GRACE_MIN" >&2; usage;; esac
+cj_errf=$(mktemp "${TMPDIR:-/tmp}/watch-pr-checks.XXXXXX") || exit 2
+trap 'rm -f "$cj_errf"' EXIT
 
 # unk LOOKUP: this poll's LOOKUP failed or was unreadable. Names it for the poll line and
 # the persistent-unknown exit.
@@ -190,8 +200,10 @@ while [ "$i" -lt "$MAX" ]; do
   # registered yet, or a malformed reply) would count as zero failing / zero pending and
   # forge a green, so both are unknown. A required context the base branch's rules name but
   # the list lacks has not registered yet: it counts as pending (lib/required-checks.sh).
-  fail=0; pend=0; cancel=0; missing=0
-  cj=$(gh pr checks "$PR" --repo "$REPO" --required --json name,bucket 2>/dev/null || true)
+  fail=0; pend=0; cancel=0; missing=0; ci_wait=""
+  # The first poll that saw this head starts its --ci-grace window.
+  if [ "$head" != "${seen_head:-}" ]; then seen_head="$head"; seen_ts=$(date +%s); fi
+  cj=$(gh pr checks "$PR" --repo "$REPO" --required --json name,bucket 2>"$cj_errf" || true)
   if printf '%s' "$cj" | jq -e 'type=="array" and length>0' >/dev/null 2>&1; then
     fail=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="fail")]|length') || unk ci_checks
     pend=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length') || unk ci_checks
@@ -205,6 +217,12 @@ while [ "$i" -lt "$MAX" ]; do
     else
       unk required_rules
     fi
+  elif [ "$mergeable" = MERGEABLE ] \
+       && { [ "$(printf '%s' "$cj" | jq -c . 2>/dev/null)" = "[]" ] || grep -qF 'no required checks reported' "$cj_errf"; } \
+       && [ $(( $(date +%s) - seen_ts )) -lt $(( CI_GRACE_MIN * 60 )) ]; then
+    # No checks registered yet on a fresh MERGEABLE head (queued runners): pending CI, not
+    # unknown. mergeable=UNKNOWN (still computing, may yet conflict) gets no grace.
+    ci_wait=$(( $(date +%s) - seen_ts )); pend=1
   else
     unk ci_checks
   fi
@@ -585,7 +603,7 @@ while [ "$i" -lt "$MAX" ]; do
   [ "$equiv" -eq 1 ] && eqnote=" equiv=1"
   [ "$gr_reviewed" -eq 1 ] && grnote=" gr_scope=$gr_scoped_total+${god_head}od/${gr_added:-?}"
   [ -n "$gr_prior" ] && grnote=" gr_prior=$gr_prior"
-  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend${missing:+ req_missing=$missing} req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' cr_full_required=$cr_full_required greptile=$gr_state$gr_via${gr_summary:+ ($gr_summary)}${grnote} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${unknown:+ unknown=$unknown}${gr_last:+ greptile_last_reviewed=$gr_last}${unk_why:+ unknown_lookups=$unk_why}"
+  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend${missing:+ req_missing=$missing} req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' cr_full_required=$cr_full_required greptile=$gr_state$gr_via${gr_summary:+ ($gr_summary)}${grnote} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${ci_wait:+ ci_unregistered=${ci_wait}s}${unknown:+ unknown=$unknown}${gr_last:+ greptile_last_reviewed=$gr_last}${unk_why:+ unknown_lookups=$unk_why}"
 
   # A failed lookup this iteration: defer, do not decide on masked values.
   if [ "$unknown" -ne 0 ]; then unknown_streak; sleep "$INTERVAL"; continue; fi

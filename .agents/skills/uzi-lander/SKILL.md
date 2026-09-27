@@ -127,7 +127,7 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    | 6 | no reviewer will come (skipped / absent past grace) | step 3 |
    | 7 | CR says the last commit was already reviewed | step 3, decide whether to request a full review |
    | 8 | PR conflicts with its base (`mergeable=CONFLICTING`): GitHub runs no CI on it | step 5 |
-   | 9 | a lookup stayed unreadable for `--max-unknown` polls (default 5); `RESULT` names it | inspect that lookup; never merge on it |
+   | 9 | a lookup stayed unreadable for `--max-unknown` polls (default 5; no checks yet on a mergeable head is pending for `--ci-grace`, 15 min); `RESULT` names it | inspect that lookup; never merge on it |
 
    Let an auto-review that is already running finish; never re-trigger it. `--reviewer` also
    scopes which bot BLOCKS: `coderabbit`|`greptile` selects one bot AND makes the other fully
@@ -222,7 +222,7 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    unless a bullet appears on both sides of a hunk (a shared `### X` under `[Unreleased]` is
    fine), a hunk holds a `## ` heading, or a side rewords a line: then it refuses and the
    stop is exit 5. Duplicate `###` headings under `[Unreleased]` get their own collapse commit.
-   Union and collapse keep `[Unreleased]`'s one blank line between entries when it uses one.
+   Union and collapse keep every existing blank line; only their own joins follow `[Unreleased]`'s convention.
    Exit 5 = any other conflict, worktree left mid-rebase: resolve (a union of both sides is
    usual for a shared list), `git rebase --continue`, re-run with `--skip-rebase`. Exit 6 = the
    renumber helper reported references to fix by hand. Exit 7 = a gate failed (log path
