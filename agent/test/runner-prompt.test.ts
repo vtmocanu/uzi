@@ -64,7 +64,7 @@ describe("RunRunner — ad-hoc prompt kind (PRD #241 M8)", () => {
     const body = JSON.parse(calls[0]!.body ?? "{}");
     assert.equal(body.source_branch, `uzi/prompt-${claim.run_id}`);
 
-    // Title comes from the scheduler-derived issue_title — never `Resolve issue #null`.
+    // Title comes from the scheduler-derived issue_title — never `Work on issue #null`.
     assert.equal(body.title, "Hunt for flaky tests and open an MR");
     assert.ok(!String(body.title).includes("#null"));
 

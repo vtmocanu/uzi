@@ -49,7 +49,7 @@ interface MrBodyCtx {
  *   `cloneBranch`) falls through to `createOrAttachRunnerClone` on issue_iid.
  * - `mrTitle` — the raw MR title (NO `[partial]` prefix; the caller applies that only to
  *   the trimmed issue title and the issue fallback). `undefined` falls through to
- *   `Resolve issue #<iid>`.
+ *   `Work on issue #<iid>`.
  * - `mrBody` — the MR description; `undefined` falls through to the issue body (the
  *   scopeCapped / gates / Closes arm).
  */
@@ -171,7 +171,7 @@ export const RUN_KIND_PROFILES: Record<RunKind, RunKindProfile> = {
     cloneBranch: (_claim, runId) => deriveCloneKey({ kind: "self_improve", runId }),
     // A self_improve MR references its tracking issue but does NOT `Closes` it — the issue
     // is a stable container reused across cycles (PRD #46 Decision 10). No mrTitle: the
-    // issue fallback `Resolve issue #<iid>` is the intended empty-title behaviour.
+    // issue fallback `Work on issue #<iid>` is the intended empty-title behaviour.
     mrBody: (claim, ctx) =>
       [
         "Autonomous self-improvement change (PRD #46). Picks one top improvement per cycle.",

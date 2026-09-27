@@ -10876,12 +10876,14 @@ export function mrTitle(
   if (t) return prefix + t;
   // PRD #983 M4b: the per-kind empty-title fallbacks (ci_fix's pipeline line, prompt/
   // task/mr_rework's fixed labels) live in RUN_KIND_PROFILES. A row's undefined — every
-  // issue-shaped kind, and ci_fix with no pipeline — takes the `Resolve issue #<iid>`
-  // fallback below, never `Resolve issue #null` for the issue-less kinds whose derived
+  // issue-shaped kind, and ci_fix with no pipeline — takes the `Work on issue #<iid>`
+  // fallback below, never `Work on issue #null` for the issue-less kinds whose derived
   // issue_title almost always won the trimmed branch above.
   const kindTitle = RUN_KIND_PROFILES[resolveRunKind(claim.kind)].mrTitle?.(claim);
   if (kindTitle !== undefined) return kindTitle;
-  return `${prefix}Resolve issue #${claim.issue_iid}`;
+  // #1801: NOT `Resolve issue #N` — GitLab's default merge/squash commit messages carry the title,
+  // and `Resolve` + ref there closes the issue on the default branch.
+  return `${prefix}Work on issue #${claim.issue_iid}`;
 }
 
 /** MR body: links + closes the issue (issue run) or links the failing pipeline
@@ -10901,8 +10903,11 @@ export function mrDescription(
   // PRD #1226 M4 (D5): render the `Closes #N` line only when told to. A legacy issue run passes true
   // at MR creation (unchanged); an interlocked run passes false at creation and true ONLY on the
   // verified-head reconcile that ADDS Closes after PR-head verification (PRD #1225). This makes the
-  // "no `Closes` on an unverified head" invariant structural — the function cannot emit a closing body
-  // on its own. Defaults true so the sole issue-arm caller keeps today's behavior.
+  // "no `Closes` on an unverified head" invariant structural for the fixed text this function writes.
+  // #1801: that only holds if no OTHER fixed line is a closing directive on some forge; GitLab's default
+  // pattern also closes on `Implement(s|ed|ing)`, so the reference line reads `Related to #N.`.
+  // Interpolated owner text (deferred titles/reasons, accepted criteria) is not scanned here (PRD #1798).
+  // Defaults true so the sole issue-arm caller keeps today's behavior.
   renderCloses = true,
   // PRD #1227 M2/M3: the run's owner completion decisions. `deferred` (non-empty ⇒ owner PARTIAL,
   // scope_reduced) drives a partial-delivery body that lists each deferred milestone + reason and
@@ -10966,7 +10971,7 @@ export function mrDescription(
   //   1. PRD #1227 owner partial (deferred) — partial-delivery body listing each deferred milestone +
   //      reason; NO Closes. Takes precedence over the #634 scopeCapped count body.
   //   2. PRD #634 operator scope (scopeCapped) — the existing count-only partial body, UNCHANGED.
-  //   3. normal — `Implements issue #N` with the Closes pair gated on effectiveCloses.
+  //   3. normal — `Related to #N.` with the Closes pair gated on effectiveCloses.
   const body = isOwnerPartial
     ? [
         `Implements part of #${claim.issue_iid} (partial delivery — owner scope decision; this MR does NOT close the issue).`,
@@ -10993,7 +10998,9 @@ export function mrDescription(
           ...repoMarker,
         ]
       : [
-          `Implements issue #${claim.issue_iid}.`,
+          // #1801: NOT `Implements issue #N.` — GitLab's default closing pattern treats Implement(s)
+          // as a closing keyword, which made this "non-closing" body close the issue on merge.
+          `Related to #${claim.issue_iid}.`,
           // PRD #1226 M4 (D5): the closing line is CONDITIONAL. When effectiveCloses is true (a legacy
           // run at creation, or an interlocked run's verified-head reconcile — PRD #1225) this spreads
           // to exactly the prior `"", "Closes #N"` pair, so the legacy body is byte-for-byte unchanged.

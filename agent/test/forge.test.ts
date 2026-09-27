@@ -509,7 +509,7 @@ describe("GitHubClient.getMergeRequestHead", () => {
 // Forgejo/GitHub PATCH + `body`. This pins the per-driver updateMethod()/updateBody() split so a
 // flip on the non-GitLab drivers (which the runner-level interlock test only covers for GitLab)
 // is caught here. The PAT rides the auth header only.
-const RECONCILED_BODY = "Implements issue #5.\n\n---\nunverified";
+const RECONCILED_BODY = "Related to #5.\n\n---\nunverified";
 
 describe("GitLabClient.updateMergeRequestDescription", () => {
   it("PUTs the single-MR endpoint with a `description` field (PAT header only)", async () => {

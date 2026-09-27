@@ -44,6 +44,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **A merge request uzi opens as non-closing no longer closes its issue on GitLab ([#1801](https://github.com/vtmocanu/uzi/issues/1801)).**
+  The issue reference line in a merge request body read `Implements issue #N.`, and GitLab's default closing pattern treats "Implements" as a closing keyword, so merging a held merge request (created without `Closes #N` until its head is verified) still closed the issue on GitLab. The line now reads `Related to #N.`, and the empty-title fallback changes from `Resolve issue #N` to `Work on issue #N`, since GitLab's default merge and squash commit messages carry the title. GitHub and Forgejo were not affected. A verified completion still closes its issue with `Closes #N`.
+
 - **The Fleet upgrade panel no longer counts a hosted worker on an older release as up to date ([#1415](https://github.com/vtmocanu/uzi/issues/1415)).**
   A hosted worker that the controller reports as settled but that reports a version behind its target (for example a cordoned, draining worker still on its previous release) now reads `outdated` instead of `up_to_date` with a "re-tagged image" note, so it counts toward the attention badge and the "N up to date" summary stays honest. The settled softener from ADR-738 is removed, since agent images are no longer re-tagged (#1720). A fleet deliberately pinned to a pre-#1729 re-tagged tag now reads `outdated`.
 
