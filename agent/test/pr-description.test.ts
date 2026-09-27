@@ -286,7 +286,8 @@ describe("capBody (D15)", () => {
     const f = await mint(FULL);
     const full = renderRegion({ sizeLine: SIZE, headSha: HEAD, targetBranch: "main" }, f).text;
     const sizeOnly = renderRegion({ sizeLine: SIZE, headSha: HEAD, targetBranch: "main" }).text;
-    const preserved = "p".repeat(BODY_CAP_CHARS - COMPLETION.length - 400);
+    // Preserved text ends its line: uzi's markers are only read at column 0.
+    const preserved = `${"p".repeat(BODY_CAP_CHARS - COMPLETION.length - 400)}\n`;
     const parts = parseOwnedBlocks(`${preserved}${REGION}\n\n${COMPLETION}`) as OwnedBlocks;
     const compose = (r: string) => composeBody(parts, { region: r });
     const capped = capBody(compose, full, sizeOnly);
@@ -297,7 +298,7 @@ describe("capBody (D15)", () => {
     const fine = capBody((r) => composeBody(shortParts, { region: r }), full, sizeOnly);
     assert.deepEqual(fine, { body: `hi\n${full}\n\n${COMPLETION}`, capped: false });
     // Preserved text alone over the cap: never truncated (the body stays over).
-    const huge = parseOwnedBlocks(`${"q".repeat(BODY_CAP_CHARS)}${REGION}\n${COMPLETION}`) as OwnedBlocks;
+    const huge = parseOwnedBlocks(`${"q".repeat(BODY_CAP_CHARS)}\n${REGION}\n${COMPLETION}`) as OwnedBlocks;
     const over = capBody((r) => composeBody(huge, { region: r }), full, sizeOnly);
     assert.equal(over.capped, true);
     assert.ok(over.body!.startsWith("q".repeat(BODY_CAP_CHARS)));

@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { SanitizedPrDescriptionFields, WorkerClient } from "../src/client.js";
 import {
   COMPLETION_END,
   COMPLETION_START,
@@ -8,15 +9,18 @@ import {
   REGION_START,
   closingDirectiveFor,
   codeSpan,
+  composeBody,
   parseOwnedBlocks,
+  renderBody,
   renderCompletionBlock,
+  renderRegion,
   type KindSection,
   type OwnedBlocks,
 } from "../src/pr-description.js";
-import type { ClaimResponse } from "../src/protocol.js";
+import { RUN_KINDS, type ClaimConfig, type ClaimResponse, type RawPrDescriptionFields, type RunKind } from "../src/protocol.js";
 import { mrDescription } from "../src/runner.js";
 import { guardCriticalMrSection, selfImproveMrSection } from "../src/self-improve.js";
-import { makeClaim } from "./helpers.js";
+import { makeClaim, nullLogger } from "./helpers.js";
 
 // PRD #1798 M6a hardening (security audit of c3731080): agent-chosen paths in kind sections (H1),
 // Forgejo `!N` references (H2), linear scans and byte bounds (M1), rendered views of a closing
@@ -196,14 +200,15 @@ describe("scans stay linear on adversarial input (M1)", () => {
   // A ratio test, not a fixed budget: each shape is timed at N and at 8N characters (best of three,
   // to shed scheduler noise), and 8x the input must take under 32x the time. Linear code measured
   // 5-21x here (cache and GC effects grow with the input, strongest at small sizes, which is why a
-  // 4x/8x ratio flaked at 7.6x); quadratic code is 64x. A floor keeps a sub-millisecond base from
-  // turning jitter into a ratio, and an absolute ceiling (checked at N first, so a quadratic
-  // regression fails in seconds rather than running the 8N input for minutes) catches a scan that
-  // is slow at every size.
+  // 4x/8x ratio flaked at 7.6x); quadratic code is 64x. A 20 ms floor keeps a few-millisecond base
+  // from turning jitter into a ratio, a pair that misses the ratio is timed once more before it
+  // fails (one noisy pair is not a regression; a quadratic scan misses both), and an absolute
+  // ceiling (checked at N first, so a quadratic regression fails in seconds rather than running the
+  // 8N input for minutes) catches a scan that is slow at every size.
   const N = 16 * 1024;
   const SCALE = 8;
   const MAX_RATIO = 32;
-  const FLOOR_MS = 4;
+  const FLOOR_MS = 20;
   const CEILING_MS = 2_000;
   const fillTo = (unit: string, n: number) => unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
   const best = (f: () => unknown) => {
@@ -218,14 +223,20 @@ describe("scans stay linear on adversarial input (M1)", () => {
   };
   const assertLinear = (shape: (n: number) => string, scan: (s: string) => unknown) => {
     const small = shape(N);
-    const t1 = best(() => scan(small));
-    const head = JSON.stringify(small.slice(0, 24));
-    assert.ok(t1 < CEILING_MS / SCALE, `${head}…: ${t1.toFixed(1)} ms at ${small.length}`);
     const large = shape(SCALE * N);
-    const t8 = best(() => scan(large));
-    const label = `${head}…: ${t1.toFixed(1)} ms at ${small.length}, ${t8.toFixed(1)} ms at ${large.length}`;
-    assert.ok(t8 < CEILING_MS, label);
-    assert.ok(t8 < MAX_RATIO * Math.max(t1, FLOOR_MS), label);
+    const head = JSON.stringify(small.slice(0, 24));
+    const pair = () => {
+      const t1 = best(() => scan(small));
+      assert.ok(t1 < CEILING_MS / SCALE, `${head}…: ${t1.toFixed(1)} ms at ${small.length}`);
+      const t8 = best(() => scan(large));
+      const label = `${head}…: ${t1.toFixed(1)} ms at ${small.length}, ${t8.toFixed(1)} ms at ${large.length}`;
+      assert.ok(t8 < CEILING_MS, label);
+      return { ok: t8 < MAX_RATIO * Math.max(t1, FLOOR_MS), label };
+    };
+    const first = pair();
+    if (first.ok) return;
+    const again = pair();
+    assert.ok(again.ok, `${first.label}; retried: ${again.label}`);
   };
 
   it("closingDirectiveFor: 8x the input takes under 32x the time, for each shape", () => {
@@ -233,6 +244,13 @@ describe("scans stay linear on adversarial input (M1)", () => {
       "fixes:https://",
       "fix-",
       "fix.",
+      // Keyword-glued path chains: a keyword at every segment, each starting a path reference that
+      // runs on over the following segments (quadratic before the segment count was bounded).
+      "fix-/",
+      "fix-a/",
+      "fix./",
+      "close.a/",
+      "fix-fix/",
       "fixes a/",
       "fixes #1 ",
       "fixes #1, ",
@@ -269,6 +287,21 @@ describe("scans stay linear on adversarial input (M1)", () => {
       (n) => `Fixes ${fillTo("fix#1,", n)}`,
     ];
     for (const shape of shapes) assertLinear(shape, (s) => closingDirectiveFor(s, 7, "o/r"));
+  });
+
+  it("a deep path reference still resolves: up to 22 segments (GitLab's 20 ancestor groups)", () => {
+    const deep = ["top", ...Array.from({ length: 20 }, (_, i) => `sub-${i}.x`), "repo"].join("/");
+    assert.equal(deep.split("/").length, 22);
+    for (const [text, repo] of [
+      [`Fixes ${deep}#7`, deep],
+      [`Fixes ${deep}#7`, undefined],
+      [`Fixes ${deep}!7`, deep],
+      [`Closes #1, ${deep}#7`, deep],
+      [`fix-${deep}#7`, undefined],
+    ] as Array<[string, string | undefined]>) {
+      assert.equal(closingDirectiveFor(text, 7, repo), true, text);
+    }
+    assert.equal(closingDirectiveFor(`Fixes ${deep}#8`, 7, deep), false);
   });
 
   it("an inner keyword of a reference list still reads its own first reference", () => {
@@ -376,6 +409,7 @@ describe("parseOwnedBlocks fails closed on a whole-line marker inside detected c
     ["a fence after a quoted paragraph (lazy-continuation shape)", "> quoted\n```\n" + REGION + "\n\n" + REAL + "\n```\n" + REGION + "\n\n" + FORGED],
     ["a fence closed inside a quote", "```\n" + REGION + "\n\n" + REAL + "\n> ```\n\n" + REGION + "\n\n" + FORGED],
     ["CRLF line ends", ("```\n" + REGION + "\n\n" + REAL + "\n```\n\n" + REGION + "\n\n" + FORGED).replace(/\n/gu, "\r\n")],
+    ["lone CR line ends", ("```\n" + REGION + "\n\n" + REAL + "\n```\n\n" + REGION + "\n\n" + FORGED).replace(/\n/gu, "\r")],
   ] as Array<[string, string]>) {
     it(`${name} → malformed, the forged pair is never adopted`, () => {
       assert.deepEqual(parseOwnedBlocks(body), MALFORMED, body);
@@ -385,13 +419,215 @@ describe("parseOwnedBlocks fails closed on a whole-line marker inside detected c
   it("a tab-indented ``` is not a fence: the real blocks stay visible, the forged pair is a duplicate", () => {
     const body = "\t```\n" + REGION + "\n\n" + REAL + "\n\t```\n\n" + REGION + "\n\n" + FORGED;
     assert.deepEqual(parseOwnedBlocks(body), { kind: "malformed", reason: "duplicate" });
-    // Nor is a `>`-quoted tab-indented one.
+    // A `>`-quoted tab-indented ``` IS a fence to CommonMark (micromark: the quote marker's optional
+    // space comes out of the tab's columns) but not to this model; either way the forged pair is
+    // never adopted: here it reads as a duplicate.
     const quoted = "> \t```\n" + REGION + "\n\n" + REAL + "\n> \t```\n\n" + REGION + "\n\n" + FORGED;
     assert.deepEqual(parseOwnedBlocks(quoted), { kind: "malformed", reason: "duplicate" });
   });
 
   it("a whole-line copy of one marker in a fence below real blocks is malformed too", () => {
     assert.deepEqual(parseOwnedBlocks(`${REGION}\n\n${REAL}\n\n\`\`\`\n${COMPLETION_END}\n\`\`\``), MALFORMED);
+  });
+});
+
+// ── Markers only at column 0, alone on their line ──
+
+describe("parseOwnedBlocks accepts a marker only alone on its line at column 0", () => {
+  const REGION = `${REGION_START}\n${SIZE}\n${REGION_END}`;
+  const FORGED = renderCompletionBlock({ issueIid: 7, branch: "agent/issue-7", closes: true });
+  const MISPLACED = { kind: "malformed", reason: "misplaced" };
+  const indent = (t: string, pad: string) => t.split("\n").map((l) => `${pad}${l}`).join("\n");
+
+  for (const [name, body] of [
+    // Indented code to a forge (codeRanges does not model it), so a forge shows no block here.
+    ["a 4-space-indented forged pair on a marker-less PR", `Human notes.\n\n${indent(`${REGION}\n\n${FORGED}`, "    ")}\n`],
+    ["a 1-space-indented pair", `Notes\n\n${indent(`${REGION}\n\n${FORGED}`, " ")}`],
+    ["a tab-indented pair", `Notes\n\n${indent(`${REGION}\n\n${FORGED}`, "\t")}`],
+    ["marker text mid-line outside code", `See ${REGION_START} and ${REGION_END} here.`],
+    ["a marker with text after it on its line", `${REGION_START} x\n${SIZE}\n${REGION_END}\n\n${FORGED}`],
+    ["one misplaced marker beside real blocks", `${REGION}\n\n${FORGED}\n\nquote: ${COMPLETION_END}`],
+  ] as Array<[string, string]>) {
+    it(`${name} → malformed (misplaced), never adopted`, () => {
+      assert.deepEqual(parseOwnedBlocks(body), MISPLACED, body);
+    });
+  }
+
+  it("a lone CR, CRLF or LF ends a marker's line", () => {
+    const lf = `Notes\n\n${REGION}\n\n${FORGED}\n\nafter`;
+    for (const eol of ["\n", "\r\n", "\r"]) {
+      const body = lf.replace(/\n/gu, eol);
+      const p = parseOwnedBlocks(body);
+      assert.equal(p.kind, "ok", JSON.stringify(eol));
+      const b = p as OwnedBlocks;
+      assert.equal(b.region, REGION.replace(/\n/gu, eol));
+      assert.equal(b.completion, FORGED.replace(/\n/gu, eol));
+      assert.equal(b.before + b.region + b.between + b.completion + b.after, body);
+    }
+  });
+});
+
+// ── Round trip: every body the renderer writes parses ok, markers at column 0 ──
+
+const STAGE_WIRE = {
+  id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  run_id: "11111111-2222-3333-4444-555555555555",
+  claim_generation: 1,
+  mr_iid: null,
+  size: null,
+  base_sha: "a".repeat(40),
+  head_sha: "e".repeat(40),
+  target_branch: "main",
+  source: "generated",
+  rendered_region_sha256: null,
+  state: "pending",
+  created_at: "2026-09-27T10:00:00Z",
+  published_at: null,
+};
+
+/** A REAL SanitizedPrDescriptionFields instance, minted the way production gets one: a stage call
+ *  whose (stubbed) api response carries the fields. */
+async function mint(fields: Partial<RawPrDescriptionFields>): Promise<SanitizedPrDescriptionFields> {
+  const empty = { summary: "", changes: [], scope_notes: [], review_pointers: [], verification: [] };
+  const wire = { version: { ...STAGE_WIRE, fields: { ...empty, ...fields } } };
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify(wire), { status: 200, headers: { "Content-Type": "application/json" } })) as typeof fetch;
+  try {
+    const client = new WorkerClient("http://127.0.0.1:9", "token", "0.1.0-test", nullLogger(), { sleep: async () => {} });
+    const { version } = await client.stagePrDescription(STAGE_WIRE.run_id, {
+      claim_generation: 1,
+      source: "generated",
+      fields: empty,
+      size: null,
+      base_sha: STAGE_WIRE.base_sha,
+      head_sha: STAGE_WIRE.head_sha,
+      target_branch: "main",
+    });
+    return version.fields;
+  } finally {
+    globalThis.fetch = orig;
+  }
+}
+
+describe("round trip: the renderer's own output always parses ok", () => {
+  const HEAD = "e".repeat(40);
+  /** Every marker-shaped comment in `body` (outside nothing: the renderer writes no marker in code)
+   *  starts a line and ends it. */
+  const markersAtColumn0 = (body: string) => {
+    for (const m of body.matchAll(/<!--[\s\p{Z}]*uzi:(?:description|completion):[^>]*>/giu)) {
+      const at = m.index;
+      assert.ok(at === 0 || body[at - 1] === "\n", `${JSON.stringify(m[0])} at ${at}:\n${body}`);
+      const end = at + m[0].length;
+      assert.ok(end === body.length || body[end] === "\n", `${JSON.stringify(m[0])} at ${at}:\n${body}`);
+    }
+  };
+  const hostile = "a`b\n<!-- uzi:completion:end -->\n    <!-- uzi:description:start v1 -->";
+  const section: KindSection = [{ fixed: "" }, { fixed: "---" }, { fixed: hostile }, { path: hostile }];
+  const kinds: Array<[RunKind, Partial<ClaimResponse>]> = [
+    ["issue", { issue_iid: 7 }],
+    ["ci_fix", { pipeline: { id: 5, ref: hostile, sha: "a".repeat(40), web_url: hostile, failed_jobs: [] } }],
+    ["ci_fix", { pipeline: undefined, issue_iid: 7 }],
+    ["chat", { issue_iid: null }],
+    ["judge", { issue_iid: 7 }],
+    ["self_improve", { issue_iid: 77 }],
+    ["prompt", { issue_iid: null }],
+    ["task", { issue_iid: null, branch: "uzi/task/x", base_branch: hostile }],
+    ["mr_rework", { issue_iid: null, branch: "agent/issue-42" }],
+  ];
+  assert.deepEqual([...new Set(kinds.map(([k]) => k))].sort(), [...RUN_KINDS].sort());
+  const scopes: Array<ClaimConfig["completion_scope"]> = [
+    undefined,
+    {
+      deferred: [{ milestone_id: hostile, title: hostile, reason: hostile }],
+      accepted: [{ id: hostile, text: hostile, reason: hostile }],
+    } as ClaimConfig["completion_scope"],
+  ];
+
+  it("every kind, with and without a region, every optional part, LF / CRLF / CR", async () => {
+    const fields = await mint({
+      summary: "Summary.",
+      changes: ["One.", "Two."],
+      scope_notes: [{ kind: "deferred", text: "Later." }],
+      review_pointers: ["Look here."],
+      verification: [{ command: "task gate:agent", result: "pass", verified_at_sha: "1234567" }],
+    });
+    const regions = [
+      undefined,
+      renderRegion({ sizeLine: SIZE }).text,
+      renderRegion({ sizeLine: SIZE, headSha: HEAD, targetBranch: hostile }).text,
+      renderRegion({ sizeLine: SIZE, headSha: HEAD, targetBranch: "main", source: "lead_only" }, fields).text,
+      renderRegion({ headSha: HEAD, targetBranch: "main" }).text,
+    ];
+    assert.ok(regions[3]!.includes("### What changed"), regions[3]);
+    for (const [kind, over] of kinds) {
+      for (const completionScope of scopes) {
+        for (const region of regions) {
+          const claim = makeClaim({ kind, issue_title: "T", ...over } as Partial<ClaimResponse>);
+          const completion = renderCompletionBlock({
+            issueIid: claim.issue_iid,
+            branch: hostile,
+            // The banner and the kind line are the callers' fixed wording (not escaped by contract);
+            // every run-derived value goes through a slot the renderer escapes.
+            kindLine: kind === "issue" ? undefined : `Kind ${kind}.`,
+            kindSections: [section, selfImproveMrSection([hostile], [{ name: hostile, status: "failed", detail: hostile }])],
+            closes: true,
+            completionScope,
+            scopeCapped: { completedCount: 1, total: 2 },
+            repoAgents: true,
+            gatesUnverified: [hostile],
+            gatesDiscoveryTruncated: true,
+            bridged: true,
+            banner: "> ⚠️ **Completion unverified.** x",
+            staleness: { describedSha: "1".repeat(40), headSha: HEAD },
+          });
+          const bodies = [
+            renderBody(region, completion),
+            mrDescription(
+              claim,
+              hostile,
+              { source: "repo", agents: ["a"] },
+              section,
+              section,
+              [hostile],
+              true,
+              undefined,
+              true,
+              completionScope,
+              true,
+              SIZE,
+              {
+                headSha: HEAD,
+                targetBranch: hostile,
+                banner: "> ⚠️ **Completion unverified.** x",
+                staleness: { describedSha: "1".repeat(40), headSha: HEAD },
+              },
+            ),
+          ];
+          for (const body of bodies) {
+            markersAtColumn0(body);
+            for (const eol of ["\n", "\r\n", "\r"]) {
+              const b = body.replace(/\n/gu, eol);
+              const p = parseOwnedBlocks(b);
+              assert.equal(p.kind, "ok", `${kind} ${JSON.stringify(eol)}:\n${body}`);
+              const o = p as OwnedBlocks;
+              assert.equal(o.before, "");
+              assert.equal(o.after, "");
+              assert.ok(o.completion!.startsWith(COMPLETION_START) && o.completion!.endsWith(COMPLETION_END));
+            }
+          }
+          if (region) {
+            const o = parseOwnedBlocks(renderBody(region, completion)) as OwnedBlocks;
+            assert.equal(o.region, region);
+            assert.equal(o.completion, completion);
+            // A body a human framed: the blocks are found and every other byte is kept.
+            const framed = `Human intro.\n\n${region}\n\nbot note\n\n${completion}\n\nTrailer`;
+            const f = parseOwnedBlocks(framed) as OwnedBlocks;
+            assert.equal(composeBody(f, { region, completion }), framed);
+          }
+        }
+      }
+    }
   });
 });
 

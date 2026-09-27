@@ -79,10 +79,14 @@ const KEYWORD_SRC = String.raw`\b(clos(?:e[sd]?|ing)|fix(?:e[sd]|ing)?|resolv(?:
 // backtracking engine (the api's RE2 is linear without them): a path segment is at most 255
 // characters (no forge allows a longer namespace or project name) and is matched atomically (the
 // `(?=(x))\N` idiom: a segment is always followed by `/`, `#` or `!`, none of which it can hold,
-// so no shorter segment could match), and a URL's part before `/issues/` is at most 300 characters
-// (GitLab's own bound). Groups are numbered absolutely: no pattern embedding REF_SRC captures before it.
+// so no shorter segment could match); a path has at most 22 segments (a GitLab group may have up to
+// 20 ancestor groups, so a project path is at most 21 groups and the project: GitHub and Forgejo
+// allow 2), so the path alternative reads at most 22 * 256 characters from any start, which keeps a
+// keyword-glued chain (`fix-/fix-/…`, a keyword at every segment) linear; and a URL's part before
+// `/issues/` is at most 300 characters (GitLab's own bound). Groups are numbered absolutely: no
+// pattern embedding REF_SRC captures before it.
 const REF_SRC =
-  String.raw`(?:[#!](\d+)|gh-(\d+)|((?=([\w.-]{1,255}))\4(?:\/(?=([\w.-]{1,255}))\5)*)[#!](\d+)|[A-Za-z][A-Za-z0-9_]+-(\d+)|(https?:\/\/[^\s<>()]{0,300}?)\/(?:issues|work_items)\/(\d+))`;
+  String.raw`(?:[#!](\d+)|gh-(\d+)|((?=([\w.-]{1,255}))\4(?:\/(?=([\w.-]{1,255}))\5){0,21})[#!](\d+)|[A-Za-z][A-Za-z0-9_]+-(\d+)|(https?:\/\/[^\s<>()]{0,300}?)\/(?:issues|work_items)\/(\d+))`;
 const SP = String.raw`[\s\p{Z}]`;
 const KEYWORD_RE = new RegExp(KEYWORD_SRC, "giu");
 /** The first reference after a keyword, prDescClosing's tail (sticky at the keyword end). The Go
@@ -908,7 +912,10 @@ export interface OwnedBlocks {
 export type ParsedBody =
   | { kind: "none" }
   | ({ kind: "ok" } & OwnedBlocks)
-  | { kind: "malformed"; reason: "duplicate" | "unbalanced" | "unknown_version" | "oversize" | "marker_in_code" };
+  | {
+      kind: "malformed";
+      reason: "duplicate" | "unbalanced" | "unknown_version" | "oversize" | "marker_in_code" | "misplaced";
+    };
 
 // The head of any uzi block marker, however spelled: detection is lenient so a mangled marker is
 // reported malformed rather than silently ignored; only the exact forms above are accepted. The
@@ -917,10 +924,12 @@ export type ParsedBody =
 const MARKER_HEAD_RE = /<!--[\s\p{Z}]*uzi:(description|completion):(start|end)\b/iuy;
 
 // A fence line (CommonMark: up to 3 SPACES of indent, optionally inside `>` quotes, then 3+
-// backticks or tildes). A tab is never fence indentation here: CommonMark expands a leading tab to
-// a 4-column stop, so a top-level tab-indented ``` is indented code or paragraph text, not a fence
-// (a fail-closed whole-line marker check in findMarkers covers what this model gets wrong). An opener's info
-// string may not hold a backtick when its fence is backticks.
+// backticks or tildes). A tab is never fence indentation here. That is right for a TOP-LEVEL line
+// only: CommonMark expands a leading tab to a 4-column stop, so a top-level tab-indented ``` is
+// indented code or paragraph text, not a fence; after a `>` the quote marker's optional space is
+// taken from the tab's columns, so `> \t```` IS a fence to CommonMark and not to this model (the
+// fail-closed checks in findMarkers cover what this model gets wrong). An opener's info string may
+// not hold a backtick when its fence is backticks.
 const FENCE_OPEN_RE = /^((?: {0,3}>)*) {0,3}(`{3,}|~{3,})([^\n]*)$/u;
 const FENCE_CLOSE_RE = /^(?: {0,3}>)* {0,3}(`{3,}|~{3,})[ \t]*$/u;
 const QUOTE_PREFIX_RE = /^(?: {0,3}>)*/u;
@@ -930,24 +939,26 @@ const PARA_BREAK_RE = /^(?: {0,3}>)*(?:[ \t]*$| {0,3}<!--)/u;
 
 interface Line {
   start: number;
-  /** The line's text without its `\n` (and without a trailing `\r`). */
+  /** The line's text without its line ending. */
   text: string;
-  /** The offset just past the line's `\n` (or the body's end). */
+  /** The offset just past the line's ending (or the body's end). */
   next: number;
 }
 
+/** The body's lines. A line ends at `\r\n`, `\n` or a lone `\r` (CommonMark's three line endings),
+ *  so a `\r`-joined body is read line by line as a forge reads it. */
 function linesOf(body: string): Line[] {
   const out: Line[] = [];
+  const n = body.length;
   let start = 0;
-  while (start <= body.length) {
-    const nl = body.indexOf("\n", start);
-    const end = nl < 0 ? body.length : nl;
-    const text = body.slice(start, end).replace(/\r$/u, "");
-    out.push({ start, text, next: nl < 0 ? body.length : nl + 1 });
-    if (nl < 0) break;
-    start = nl + 1;
+  for (;;) {
+    let end = start;
+    while (end < n && body[end] !== "\n" && body[end] !== "\r") end++;
+    const next = end >= n ? n : body[end] === "\r" && body[end + 1] === "\n" ? end + 2 : end + 1;
+    out.push({ start, text: body.slice(start, end), next });
+    if (end >= n) return out;
+    start = next;
   }
-  return out;
 }
 
 function quoteDepth(text: string): number {
@@ -1079,22 +1090,27 @@ interface FoundMarker {
   edge: "start" | "end";
   at: number;
   text: string;
+  /** At column 0 and alone on its line, as uzi writes every marker. */
+  wholeLine: boolean;
 }
 
 const EXACT_MARKERS = [REGION_START, REGION_END, COMPLETION_START, COMPLETION_END];
 
+/** Whether `at` starts a line (the body's start, or just after `\n` or `\r`). */
+function atLineStart(body: string, at: number): boolean {
+  return at === 0 || body[at - 1] === "\n" || body[at - 1] === "\r";
+}
+
+/** Whether `at` ends a line (the body's end, or a `\n` or `\r`). */
+function atLineEnd(body: string, at: number): boolean {
+  return at === body.length || body[at] === "\n" || body[at] === "\r";
+}
+
 /** Whether the line at `at` is exactly one of uzi's block markers, as uzi writes it: at column 0,
- *  alone on its line (a trailing `\r` allowed). */
+ *  alone on its line (any of the three line endings after it). */
 function wholeLineMarkerAt(body: string, at: number): boolean {
-  if (at > 0 && body[at - 1] !== "\n") return false;
-  for (const m of EXACT_MARKERS) {
-    if (!body.startsWith(m, at)) continue;
-    const after = at + m.length;
-    if (after === body.length || body[after] === "\n" || body.startsWith("\r\n", after) || (body[after] === "\r" && after + 1 === body.length)) {
-      return true;
-    }
-  }
-  return false;
+  if (!atLineStart(body, at)) return false;
+  return EXACT_MARKERS.some((m) => body.startsWith(m, at) && atLineEnd(body, at + m.length));
 }
 
 /** Every uzi block marker outside code, in order, or "marker_in_code" when a detected code range
@@ -1114,8 +1130,8 @@ function findMarkers(body: string): FoundMarker[] | "marker_in_code" {
       // inside a "fence" here and promote a forged pair written after it. uzi never writes a marker
       // inside code, so a whole-line marker in a detected code range makes the whole parse
       // malformed, which the publisher (next unit) is to treat as skipped_malformed: the region is
-      // skipped and the completion block falls back per D10. A marker quoted mid-line (inline code, an indented or `>`-quoted line
-      // in a fence) is still text and still ignored (L2).
+      // skipped and the completion block falls back per D10. A marker quoted mid-line (inline code,
+      // an indented or `>`-quoted line in a fence) is still text and still ignored (L2).
       if (wholeLineMarkerAt(body, at)) return "marker_in_code";
       continue;
     }
@@ -1131,6 +1147,7 @@ function findMarkers(body: string): FoundMarker[] | "marker_in_code" {
       edge: head[2]!.toLowerCase() as "start" | "end",
       at,
       text: body.slice(at, gt + 1),
+      wholeLine: atLineStart(body, at) && atLineEnd(body, gt + 1),
     });
   }
   return found;
@@ -1139,16 +1156,21 @@ function findMarkers(body: string): FoundMarker[] | "marker_in_code" {
 /** Split `body` around uzi's two owned blocks. `none`: no uzi block marker at all (a legacy PR).
  *  `malformed`: a duplicate marker, an unbalanced or nested pair, a region after the completion
  *  block, a start marker of an unknown version / an inexact spelling, or a body over
- *  FORGE_BODY_MAX_CHARS (`oversize`: no forge returns one, so it is not scanned), or one of uzi's
+ *  FORGE_BODY_MAX_CHARS (`oversize`: no forge returns one, so it is not scanned), one of uzi's
  *  exact markers alone on a line at column 0 inside a detected code range (`marker_in_code`, fail
- *  closed: see findMarkers). Other marker-shaped text inside a fenced code block or an inline code
- *  span is text, not a marker (a copy quoted mid-line or indented neither breaks the parse nor
- *  moves the blocks). */
+ *  closed: see findMarkers), or a marker outside code that is not alone on its line at column 0
+ *  (`misplaced`: indented or mid-line). Other marker-shaped text inside a fenced code block or an
+ *  inline code span is text, not a marker (a copy quoted mid-line or indented there neither breaks
+ *  the parse nor moves the blocks). A line ends at `\r\n`, `\n` or a lone `\r`. */
 export function parseOwnedBlocks(body: string): ParsedBody {
   if (body.length > FORGE_BODY_MAX_CHARS) return { kind: "malformed", reason: "oversize" };
   const found = findMarkers(body);
   if (found === "marker_in_code") return { kind: "malformed", reason: "marker_in_code" };
   if (found.length === 0) return { kind: "none" };
+  // uzi writes every marker at column 0, alone on its line. One anywhere else (indented, as a
+  // 4-space indented-code copy that codeRanges does not model, or mid-line outside code) is not
+  // uzi's, and adopting it could promote a forged pair: fail closed.
+  if (found.some((f) => !f.wholeLine)) return { kind: "malformed", reason: "misplaced" };
   const exact = { description: { start: REGION_START, end: REGION_END }, completion: { start: COMPLETION_START, end: COMPLETION_END } };
   const spans: Partial<Record<"description" | "completion", { start: number; end: number }>> = {};
   for (const block of ["description", "completion"] as const) {
