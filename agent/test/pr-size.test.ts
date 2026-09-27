@@ -7,11 +7,13 @@ import path from "node:path";
 import { GitCache } from "../src/git.js";
 import {
   classifyPath,
+  computeSize,
   computeSizeLine,
   isSourceUnsupported,
   lookupAttributes,
   parseNumstatZ,
   renderSizeLine,
+  sizeTotals,
   SIZE_UNAVAILABLE,
   type AttrGitRunner,
   type NumstatEntry,
@@ -483,6 +485,115 @@ describe("renderSizeLine (PRD #1798 D3)", () => {
   it("an empty diff renders no line", () => assert.strictEqual(renderSizeLine([], new Map()), null));
 });
 
+// PRD #1798 D9: the structured size must carry exactly the numbers the rendered line prints. Parse
+// the line back (grouping and U+2212 undone) and compare bucket by bucket; a bucket the line omits
+// must be zero in the structured size.
+const BUCKET_NAMES: readonly SizeBucket[] = ["code", "tests", "docs", "config", "generated", "vendored"];
+function assertSizeMatchesLine(size: ReturnType<typeof sizeTotals>, line: string | null): void {
+  assert.strictEqual(size.unavailable, false);
+  if (line === null) {
+    assert.strictEqual(size.files, 0);
+    for (const b of BUCKET_NAMES) assert.deepStrictEqual(size[b], { added: 0, deleted: 0 }, b);
+    return;
+  }
+  const num = (raw: string) => Number(raw.replaceAll(",", ""));
+  const parts = line.replace(/^\*\*Size:\*\* /, "").split(" · ");
+  const filesPart = parts.pop()!;
+  const fm = /^([\d,]+) files?$/.exec(filesPart);
+  assert.ok(fm, filesPart);
+  assert.strictEqual(size.files, num(fm[1]!), "files");
+  const seen = new Map<string, { added: number; deleted: number }>();
+  for (const p of parts) {
+    const m = new RegExp(`^([a-z]+) \\+([\\d,]+) ${MINUS}([\\d,]+)$`).exec(p);
+    assert.ok(m, p);
+    seen.set(m[1]!, { added: num(m[2]!), deleted: num(m[3]!) });
+  }
+  for (const b of BUCKET_NAMES) assert.deepStrictEqual(size[b], seen.get(b) ?? { added: 0, deleted: 0 }, b);
+}
+
+describe("sizeTotals: the structured size beside the rendered line (PRD #1798 D9)", () => {
+  const e = (p: string, added: number, deleted: number, binary = false): NumstatEntry => ({ path: p, added, deleted, binary });
+  const vendoredA = new Map<string, PathAttributes>([["src/a.ts", { "linguist-vendored": "set" }]]);
+  const big: NumstatEntry[] = [e("a.ts", 1, 0), e("a.test.ts", 1, 0), e("a.md", 1, 0), e("a.yml", 1, 0), e("a.snap", 1, 0)];
+  for (let i = 0; i < 995; i++) big.push(e(`v/${i}.c`, 0, 1));
+  const bigAttrs = new Map<string, PathAttributes>(big.filter((x) => x.path.startsWith("v/")).map((x) => [x.path, { "linguist-vendored": "set" }]));
+  const cases: [string, NumstatEntry[], Map<string, PathAttributes>][] = [
+    ["mixed buckets", [e("src/a.ts", 1500, 20), e("src/b.ts", 310, 3), e("a_test.go", 40, 2), e("go.sum", 7, 7), e("README.md", 5, 0)], new Map()],
+    ["attribute-classified", [e("src/a.ts", 2, 1)], vendoredA],
+    ["binary only", [e("logo.png", 0, 0, true)], new Map()],
+    ["all six buckets, 1,000 files", big, bigAttrs],
+    ["empty diff", [], new Map()],
+  ];
+  for (const [name, entries, attrs] of cases) {
+    it(`${name}: equals the rendered line's numbers`, () => {
+      assertSizeMatchesLine(sizeTotals(entries, attrs), renderSizeLine(entries, attrs));
+    });
+  }
+  it("pins one case literally", () => {
+    assert.deepStrictEqual(sizeTotals([e("src/a.ts", 3, 1), e("docs/x.md", 0, 4), e("logo.png", 0, 0, true)], new Map()), {
+      unavailable: false,
+      files: 3,
+      code: { added: 3, deleted: 1 },
+      tests: { added: 0, deleted: 0 },
+      docs: { added: 0, deleted: 4 },
+      config: { added: 0, deleted: 0 },
+      generated: { added: 0, deleted: 0 },
+      vendored: { added: 0, deleted: 0 },
+    });
+  });
+});
+
+describe("computeSize: line plus structured size, same failure contract (PRD #1798 D9)", () => {
+  const head = "c".repeat(40);
+  const ok: SizeLineGit = {
+    sizeMergeBase: async () => "d".repeat(40),
+    diffNumstatZ: async () => "1\t0\tsrc/a.ts\0" + "2\t5\tdocs/b.md\0" + "4\t0\tstore/q.sql.go\0",
+    checkAttrZ: async (_bare, _head, paths) =>
+      new Map(paths.map((p) => [p, p.endsWith(".sql.go") ? { "linguist-generated": "set" } : { "linguist-generated": "unspecified" }])),
+  };
+  const UNAVAILABLE = {
+    unavailable: true,
+    files: 0,
+    code: { added: 0, deleted: 0 },
+    tests: { added: 0, deleted: 0 },
+    docs: { added: 0, deleted: 0 },
+    config: { added: 0, deleted: 0 },
+    generated: { added: 0, deleted: 0 },
+    vendored: { added: 0, deleted: 0 },
+  };
+
+  it("the line is computeSizeLine's, and the size carries its numbers", async () => {
+    const got = await computeSize(ok, "/bare", "main", head, nullLogger());
+    assert.strictEqual(got.line, await computeSizeLine(ok, "/bare", "main", head, nullLogger()));
+    assert.strictEqual(got.line, `**Size:** code +1 ${MINUS}0 · docs +2 ${MINUS}5 · generated +4 ${MINUS}0 · 3 files`);
+    assertSizeMatchesLine(got.size, got.line);
+  });
+
+  it("an empty diff: no line, a zero (available) size", async () => {
+    const got = await computeSize({ ...ok, diffNumstatZ: async () => "" }, "/bare", "main", head);
+    assert.strictEqual(got.line, null);
+    assert.deepStrictEqual(got.size, { ...UNAVAILABLE, unavailable: false });
+  });
+
+  it("every failure: the unavailable line and a zeroed unavailable size, one warn each", async () => {
+    const warns: string[] = [];
+    const log = { warn: (msg: string) => void warns.push(msg) };
+    const failures: [SizeLineGit, string | null][] = [
+      [{ ...ok, checkAttrZ: async () => { throw new Error("git check-attr failed"); } }, head],
+      [{ ...ok, checkAttrZ: async () => new Map([["src/a.ts", {}]]) }, head],
+      [{ ...ok, diffNumstatZ: async () => "not numstat" }, head],
+      [{ ...ok, sizeMergeBase: async () => { throw new Error("no merge base"); } }, head],
+      [ok, null],
+    ];
+    for (const [g, h] of failures) {
+      const got = await computeSize(g, "/bare", "main", h, log);
+      assert.strictEqual(got.line, SIZE_UNAVAILABLE);
+      assert.deepStrictEqual(got.size, UNAVAILABLE);
+    }
+    assert.strictEqual(warns.length, failures.length);
+  });
+});
+
 describe("computeSizeLine end to end on a real bare clone (PRD #1798 M1)", () => {
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x00, 0x01, 0x02, 0x00, 0xff]);
   const helper = Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n") + "\n";
@@ -514,6 +625,9 @@ describe("computeSizeLine end to end on a real bare clone (PRD #1798 M1)", () =>
       // docs: the deleted docs/gone.md (old path) −3. generated: store/runs.sql.go via .gitattributes.
       // config: .gitattributes itself is code (no rule matches it).
       assert.strictEqual(line, `**Size:** code +3 ${MINUS}0 · docs +0 ${MINUS}3 · generated +2 ${MINUS}0 · 6 files`);
+      const computed = await computeSize(gc, fx.bare, "main", fx.head, nullLogger());
+      assert.strictEqual(computed.line, line);
+      assertSizeMatchesLine(computed.size, line);
     } finally {
       fx.cleanup();
     }

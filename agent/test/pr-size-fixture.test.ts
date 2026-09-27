@@ -15,7 +15,9 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   classifyPath,
+  computeSize,
   renderSizeLine,
+  sizeTotals,
   SIZE_UNAVAILABLE,
   type NumstatEntry,
   type PathAttributes,
@@ -68,6 +70,10 @@ describe("pr-size fixture parity (agent renderSizeLine vs the stored-size read s
       for (const b of BUCKETS) assert.deepEqual(c.size[b], sums.get(b), b);
     });
 
+    it(`${c.name}: the agent's structured size (sizeTotals) is the stored size exactly`, () => {
+      assert.deepEqual(sizeTotals(entries, attrsOf(entries)), c.size);
+    });
+
     it(`${c.name}: agent line${c.agent_expected !== undefined ? " (documented divergence)" : ""}`, () => {
       const got = unbold(renderSizeLine(entries, attrsOf(entries)));
       assert.equal(got, c.agent_expected ?? c.expected);
@@ -86,6 +92,20 @@ describe("pr-size fixture parity (agent renderSizeLine vs the stored-size read s
       assert.ok(onlyAgent.length > 0, c.name);
       for (const p of onlyAgent) assert.match(p, /^[a-z]+ \+0 −0$/, `${c.name}: ${p}`);
     }
+  });
+
+  it("the agent's unavailable size is the stored unavailable size exactly", async () => {
+    const c = cases.find((d) => d.size.unavailable)!;
+    const failing = {
+      sizeMergeBase: async () => {
+        throw new Error("no merge base");
+      },
+      diffNumstatZ: async () => "",
+      checkAttrZ: async () => new Map<string, PathAttributes>(),
+    };
+    const got = await computeSize(failing, "/bare", "main", "c".repeat(40));
+    assert.equal(unbold(got.line), c.expected);
+    assert.deepEqual(got.size, c.size);
   });
 
   it("the unavailable line agrees", () => {

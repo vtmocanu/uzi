@@ -18,6 +18,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { Logger } from "./log.js";
+import type { PrDescriptionSize } from "./protocol.js";
 
 export type SizeBucket = "code" | "tests" | "docs" | "config" | "generated" | "vendored";
 
@@ -215,14 +216,9 @@ const NUMBER_FORMAT = new Intl.NumberFormat("en-US");
 const MINUS = "−";
 const SEPARATOR = " · ";
 
-/**
- * Render the size line (D3). A bucket is omitted when it has no files at all; a bucket whose only
- * files are binaries (0 lines) still renders as `+0 −0` so the file total adds up. Numbers use en-US
- * thousands grouping ("1,810"), deletions use U+2212 MINUS SIGN, and parts are joined by " · ".
- * The trailing count reads "1 file" / "N files". Returns null for an empty diff (no line at all).
- */
-export function renderSizeLine(entries: readonly NumstatEntry[], attrs: ReadonlyMap<string, PathAttributes>): string | null {
-  if (entries.length === 0) return null;
+/** Per-bucket totals of a diff: the one bucketing both the rendered line and the structured size
+ *  read, so the two cannot disagree. */
+function bucketTotals(entries: readonly NumstatEntry[], attrs: ReadonlyMap<string, PathAttributes>): Map<SizeBucket, BucketTotals> {
   const totals = new Map<SizeBucket, BucketTotals>();
   for (const e of entries) {
     const bucket = classifyPath(e.path, attrs.get(e.path));
@@ -232,6 +228,38 @@ export function renderSizeLine(entries: readonly NumstatEntry[], attrs: Readonly
     t.files += 1;
     totals.set(bucket, t);
   }
+  return totals;
+}
+
+/** A size with every count zero. `zeroSize(true)` is the size stored for "**Size:** unavailable"
+ *  (the api refuses a non-zero bucket beside `unavailable`). */
+function zeroSize(unavailable: boolean): PrDescriptionSize {
+  const z = () => ({ added: 0, deleted: 0 });
+  return { unavailable, files: 0, code: z(), tests: z(), docs: z(), config: z(), generated: z(), vendored: z() };
+}
+
+/**
+ * PRD #1798 D9: the structured size (the api's `PrDescriptionSize`) of the same diff
+ * {@link renderSizeLine} renders, from the same bucketing. `files` counts every file (binaries
+ * included); each bucket carries its line counts, zero when no file landed in it. An empty diff is
+ * `files: 0` with every bucket zero.
+ */
+export function sizeTotals(entries: readonly NumstatEntry[], attrs: ReadonlyMap<string, PathAttributes>): PrDescriptionSize {
+  const size = zeroSize(false);
+  size.files = entries.length;
+  for (const [bucket, t] of bucketTotals(entries, attrs)) size[bucket] = { added: t.added, deleted: t.deleted };
+  return size;
+}
+
+/**
+ * Render the size line (D3). A bucket is omitted when it has no files at all; a bucket whose only
+ * files are binaries (0 lines) still renders as `+0 −0` so the file total adds up. Numbers use en-US
+ * thousands grouping ("1,810"), deletions use U+2212 MINUS SIGN, and parts are joined by " · ".
+ * The trailing count reads "1 file" / "N files". Returns null for an empty diff (no line at all).
+ */
+export function renderSizeLine(entries: readonly NumstatEntry[], attrs: ReadonlyMap<string, PathAttributes>): string | null {
+  if (entries.length === 0) return null;
+  const totals = bucketTotals(entries, attrs);
   const parts: string[] = [];
   for (const bucket of SIZE_BUCKETS) {
     const t = totals.get(bucket);
@@ -302,6 +330,15 @@ export interface SizeLineGit {
   checkAttrZ(barePath: string, headSha: string, paths: readonly string[]): Promise<Map<string, PathAttributes>>;
 }
 
+/** The size line and the same numbers as the api's structured size (PRD #1798 D9). */
+export interface ComputedSize {
+  /** The rendered line; null only for an empty diff. */
+  line: string | null;
+  /** The structured totals: `unavailable: true` with every count zero when `line` is
+   *  {@link SIZE_UNAVAILABLE}, `files: 0` with every bucket zero for an empty diff. */
+  size: PrDescriptionSize;
+}
+
 /**
  * PRD #1798 M1 — the size line for the landed `headSha` against `targetBranch`. Returns null only for
  * an empty diff; any failure (merge-base, numstat, attribute lookup, or a numstat path absent from the
@@ -315,11 +352,26 @@ export async function computeSizeLine(
   headSha: string | null,
   log?: Pick<Logger, "warn">,
 ): Promise<string | null> {
+  return (await computeSize(git, barePath, targetBranch, headSha, log)).line;
+}
+
+/**
+ * PRD #1798 D9 — {@link computeSizeLine}'s line plus the structured size the stage request carries,
+ * both from one git read and one bucketing. Same failure contract: never throws; any failure is
+ * logged at warn and yields `{ line: SIZE_UNAVAILABLE, size: unavailable }`.
+ */
+export async function computeSize(
+  git: SizeLineGit,
+  barePath: string,
+  targetBranch: string,
+  headSha: string | null,
+  log?: Pick<Logger, "warn">,
+): Promise<ComputedSize> {
   try {
     if (!headSha || !/^[0-9a-f]{40}$/.test(headSha)) throw new Error("landed head is not a commit SHA");
     const base = await git.sizeMergeBase(barePath, targetBranch, headSha);
     const entries = parseNumstatZ(await git.diffNumstatZ(barePath, base, headSha));
-    if (entries.length === 0) return null;
+    if (entries.length === 0) return { line: null, size: sizeTotals(entries, new Map()) };
     const paths = [...new Set(entries.map((e) => e.path))];
     const attrs = await git.checkAttrZ(barePath, headSha, paths);
     // A path git did not report attributes for would otherwise be classified by path rules alone:
@@ -328,9 +380,9 @@ export async function computeSizeLine(
     if (missing.length > 0) {
       throw new Error(`check-attr reported no attributes for ${missing.length} of ${paths.length} path(s), e.g. ${JSON.stringify(missing[0])}`);
     }
-    return renderSizeLine(entries, attrs);
+    return { line: renderSizeLine(entries, attrs), size: sizeTotals(entries, attrs) };
   } catch (err) {
     log?.warn("PR size line unavailable", { error: err instanceof Error ? err.message : String(err) });
-    return SIZE_UNAVAILABLE;
+    return { line: SIZE_UNAVAILABLE, size: zeroSize(true) };
   }
 }
