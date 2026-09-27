@@ -11,6 +11,7 @@ import { Link, useParams } from "react-router-dom";
 import {
   api,
   ApiError,
+  gateRevisionMismatchCurrent,
   isOutcomePendingConfirmation,
   preferForgeUrl,
   isTerminalRun,
@@ -1821,6 +1822,29 @@ export function RunView() {
     }
   };
 
+  // PRD #1795 D5: the plan-gate verdict path. A verdict bound to a revision the run no longer
+  // shows is refused with a typed 409 and nothing is written. That is not a failure to show on
+  // the page banner: the gate panel names the revision to review, and the run is refetched so
+  // the panel renders the plan that replaced the one the owner acted on. A new object per
+  // refusal re-arms the panel even when the revision repeats. Any other error surfaces as
+  // before. Bound to the run that earned it, like the discard confirmation below.
+  const [gateMismatch, setGateMismatch] = useState<{ runId: string; current: number } | null>(null);
+  const gateAct = (fn: () => Promise<unknown>) =>
+    act(async () => {
+      const requestRunId = id;
+      setGateMismatch(null);
+      try {
+        await fn();
+      } catch (e) {
+        const current = gateRevisionMismatchCurrent(e);
+        if (current === null) throw e;
+        if (currentRunIdRef.current !== requestRunId) return;
+        setGateMismatch({ runId: requestRunId, current });
+        void refreshRun();
+      }
+    });
+  const revisionMismatch = gateMismatch?.runId === id ? gateMismatch : null;
+
   // PRD #1391 Run B M3d (D13): the CENTRAL cancel path. ALL cancel entry points on this
   // page route through here so the held-outcome confirmation can never be skipped per-
   // button. The server refuses a cancel of a run whose worker holds a finished-but-
@@ -2705,11 +2729,18 @@ export function RunView() {
           workers={workers}
           busy={busy}
           canSteer={canSteer}
-          onApprove={(selection, overrideCapabilities) =>
-            act(() => submit("approve_plan", "", selection, overrideCapabilities))
+          revisionMismatch={revisionMismatch}
+          onApprove={(selection, overrideCapabilities, expectedGateRevision) =>
+            gateAct(() =>
+              submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision),
+            )
           }
-          onReject={(reason) => act(() => submit("reject_plan", reason))}
-          onRequestChanges={(feedback) => act(() => submit("revise_plan", feedback))}
+          onReject={(reason, expectedGateRevision) =>
+            gateAct(() => submit("reject_plan", reason, undefined, undefined, undefined, expectedGateRevision))
+          }
+          onRequestChanges={(feedback, expectedGateRevision) =>
+            gateAct(() => submit("revise_plan", feedback, undefined, undefined, undefined, expectedGateRevision))
+          }
           onCancel={() => cancelRun()}
         />
       )}

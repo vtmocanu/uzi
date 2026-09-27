@@ -131,6 +131,12 @@ type FakeClient struct {
 	// SubmitRunInput carried (PRD #1391 Run B M3d), so a test can assert `uzi run cancel
 	// --discard-pending-outcome` threaded it onto the request.
 	LastInputDiscardPendingOutcome bool
+	// LastInputExpectedGateRevision records the expected_gate_revision the last
+	// SubmitRunInput carried (PRD #1795 D5), nil when none was sent.
+	LastInputExpectedGateRevision *int64
+	// SubmitRunInputErr fails SubmitRunInput alone (winning over Err), so a test can have the
+	// invocation-time GetRun succeed while only the write is refused (a PRD #1795 409).
+	SubmitRunInputErr error
 
 	// CreateTaskRun / DispatchTaskRun capture (PRD #400 M3). CreatedTaskRun is the
 	// canned create reply (its Branch is what the handoff command pushes to);

@@ -934,8 +934,29 @@ export const runsApi = {
     body = "",
     selection?: AgentSelectionInput,
     overrideCapabilities?: boolean,
+    _discardPendingOutcome?: boolean,
+    expectedGateRevision?: number,
   ) => {
-    if (!getRun(id)) throw new ApiError(404, "run not found");
+    const current = getRun(id);
+    if (!current) throw new ApiError(404, "run not found");
+    // PRD #1795 D5: mirror the server's expected-revision contract. A revision on any kind
+    // other than a plan verdict is a 400; a verdict bound to a revision the run no longer
+    // shows (a different gate_revision, or no open gate at all) is the typed 409 with the
+    // run's current revision, and nothing is applied.
+    if (expectedGateRevision !== undefined) {
+      if (kind !== "approve_plan" && kind !== "reject_plan" && kind !== "revise_plan") {
+        throw new ApiError(400, "expected_gate_revision applies only to approve_plan, reject_plan and revise_plan");
+      }
+      const currentRevision = current.gate_revision ?? 0;
+      if (current.status !== "awaiting_approval" || currentRevision !== expectedGateRevision) {
+        const message = `the plan gate changed: this verdict was sent for revision ${expectedGateRevision}, the run is at revision ${currentRevision}`;
+        throw new ApiError(409, message, {
+          error: message,
+          reason: "gate_revision_mismatch",
+          current_gate_revision: currentRevision,
+        });
+      }
+    }
     // PRD #88: the engine returns the refusals the real api answers with (a 409 for an
     // answer to a question that has moved on, a 400 for a malformed body) rather than
     // resolving 200 over a no-op. A mock that swallows a refusal is how a surface ends up

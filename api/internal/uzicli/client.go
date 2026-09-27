@@ -318,7 +318,11 @@ type Client interface {
 	// the run's real roster (the client never composes the worker-bound body itself).
 	// discardPendingOutcome is the PRD #1391 Run B M3d (D13) confirmation, meaningful only with
 	// cancel: it discards a terminal outcome held on the worker (default false → unchanged).
-	SubmitRunInput(ctx context.Context, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool) (apitypes.RunInputResponse, error)
+	// expectedGateRevision is the PRD #1795 D5 plan-gate revision a verdict is bound to,
+	// meaningful only with approve_plan/reject_plan/revise_plan (the server 400s it on any
+	// other kind). nil omits it, keeping today's body; a stale value is a 409 whose
+	// *ExitError carries Reason ReasonGateRevisionMismatch and CurrentGateRevision.
+	SubmitRunInput(ctx context.Context, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool, expectedGateRevision *int64) (apitypes.RunInputResponse, error)
 	// DeleteWorker removes one of the caller's workers: DELETE /api/workers/{id}
 	// (204 No Content on success). A worker with active runs is a 409 (exit 5); an
 	// unknown/foreign id is a 404 (exit 4). Minting a worker stays a webui action —
@@ -990,6 +994,12 @@ func transportMsg(err error) string {
 // field so the CLI branches on the exact condition rather than the human message text.
 const ReasonOutcomePendingConfirmationRequired = "outcome_pending_confirmation_required"
 
+// ReasonGateRevisionMismatch is the server's typed-409 reason code (PRD #1795 D5) for a plan-gate
+// verdict sent with an expected_gate_revision the run no longer shows: a newer plan was presented,
+// or the run is no longer at the gate. Nothing was written. The body's current_gate_revision is
+// carried on *ExitError.CurrentGateRevision.
+const ReasonGateRevisionMismatch = "gate_revision_mismatch"
+
 // statusError maps a non-2xx status to an *ExitError with the documented exit
 // code, folding in the server's {"error": "..."} message when present. retryAfter
 // is the response's Retry-After header (empty when absent), read only for a 429. A
@@ -1000,6 +1010,9 @@ func statusError(status int, body []byte, retryAfter string) *ExitError {
 	reason := serverErrReason(body)
 	e := buildStatusError(status, msg, retryAfter)
 	e.Reason = reason
+	if reason == ReasonGateRevisionMismatch {
+		e.CurrentGateRevision = serverErrCurrentGateRevision(body)
+	}
 	return e
 }
 
@@ -1097,6 +1110,18 @@ func serverErrReason(body []byte) string {
 		return strings.TrimSpace(e.Reason)
 	}
 	return ""
+}
+
+// serverErrCurrentGateRevision extracts current_gate_revision from a gate_revision_mismatch
+// body (PRD #1795 D5), or 0 when the body carries none (the run shows no revision).
+func serverErrCurrentGateRevision(body []byte) int64 {
+	var e struct {
+		Current int64 `json:"current_gate_revision"`
+	}
+	if json.Unmarshal(body, &e) == nil {
+		return e.Current
+	}
+	return 0
 }
 
 // parseRetryAfter parses a Retry-After header into a backoff duration. The api's

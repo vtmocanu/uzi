@@ -6083,3 +6083,91 @@ describe("RunView — forge-aware MR/PR link fallback when mr_web_url is null (#
     expect(href).not.toContain("/-/merge_requests/");
   });
 });
+
+// PRD #1795 D5: the whole-page plan-gate path. The verdict names the revision of the plan on
+// screen; a 409 gate_revision_mismatch is not a page-banner failure but a panel notice naming
+// the revision to review, and the run is refetched so the panel shows the plan that replaced it.
+describe("RunView — plan-gate verdicts bound to the gate revision (PRD #1795 M4)", () => {
+  const extra = mockApi as unknown as Record<string, unknown>;
+  beforeEach(() => {
+    // The gate page's worker list and token picker self-fetch; neither is in the shared mock.
+    extra.listWorkers = vi.fn().mockResolvedValue({ workers: [] });
+    extra.listSecrets = vi.fn().mockResolvedValue({ secrets: [] });
+  });
+  afterEach(() => {
+    delete extra.listWorkers;
+    delete extra.listSecrets;
+  });
+
+  function renderGate(submit: ReturnType<typeof vi.fn>, refreshRun: ReturnType<typeof vi.fn>) {
+    mockUseRunStream.mockReturnValue({
+      run: run({ status: "awaiting_approval", gate_revision: 2, plan_md: "# Plan two" }),
+      messages: [],
+      connected: true,
+      error: "",
+      submit,
+      refreshRun,
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  it("approve submits the displayed gate revision", async () => {
+    const submit = vi.fn().mockResolvedValue(undefined);
+    renderGate(submit, vi.fn());
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    await act(async () => {
+      fireEvent.click(approve);
+    });
+    await waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
+    const call = submit.mock.calls[0];
+    expect(call[0]).toBe("approve_plan");
+    expect(call[5]).toBe(2);
+  });
+
+  it("a reject refused with 409 gate_revision_mismatch shows the notice and refetches the run", async () => {
+    const submit = vi.fn(async () => {
+      throw new ApiError(409, "the plan gate changed: this verdict was sent for revision 2, the run is at revision 3", {
+        error: "the plan gate changed",
+        reason: "gate_revision_mismatch",
+        current_gate_revision: 3,
+      });
+    });
+    const refreshRun = vi.fn().mockResolvedValue(undefined);
+    renderGate(submit, refreshRun);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Reject" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+    });
+
+    expect(submit.mock.calls[0]).toEqual(["reject_plan", "", undefined, undefined, undefined, 2]);
+    await screen.findByText("The plan changed — review revision 3");
+    expect(refreshRun).toHaveBeenCalled();
+    // The refusal is the panel notice, not the page's generic error banner (paired with the
+    // positive notice assertion above, so this cannot pass on an empty render).
+    expect(screen.queryByText(/the plan gate changed: this verdict was sent/)).toBeNull();
+  });
+
+  it("any other verdict error still surfaces on the page banner with no revision notice", async () => {
+    const submit = vi.fn(async () => {
+      throw new ApiError(409, "run has already finished");
+    });
+    const refreshRun = vi.fn();
+    renderGate(submit, refreshRun);
+
+    const approve = await screen.findByRole("button", { name: /Approve plan/ });
+    await act(async () => {
+      fireEvent.click(approve);
+    });
+    await screen.findByText("run has already finished");
+    expect(screen.queryByText(/The plan changed/)).toBeNull();
+    expect(refreshRun).not.toHaveBeenCalled();
+  });
+});

@@ -218,6 +218,8 @@ function planningScript(runId: string): Timed[] {
         patchRun(runId, {
           status: "awaiting_approval",
           plan_md: SAMPLE_PLAN(),
+          // PRD #1795: each presentation allocates the next gate revision.
+          gate_revision: (getRun(runId)?.gate_revision ?? 0) + 1,
           milestones_candidate: HEARTBEAT_MILESTONES,
           milestones: null,
           milestones_completed: null,
@@ -451,6 +453,7 @@ function revisedPlanScript(runId: string, reason: string): Timed[] {
         patchRun(runId, {
           status: "awaiting_approval",
           plan_md: plan,
+          gate_revision: (getRun(runId)?.gate_revision ?? 0) + 1,
           milestones_candidate: HEARTBEAT_MILESTONES,
           milestones: null,
           milestones_completed: null,

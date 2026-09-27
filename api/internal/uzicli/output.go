@@ -58,6 +58,10 @@ type ExitError struct {
 	// string-matching the human message — PRD #1391 Run B M3d's cancel reads it for
 	// "outcome_pending_confirmation_required". Advisory: the exit code is unaffected.
 	Reason string
+	// CurrentGateRevision is the run's plan-gate revision from a 409 gate_revision_mismatch
+	// body (PRD #1795 D5; Reason == ReasonGateRevisionMismatch), so the CLI can name the
+	// revision to review. Zero for every other error.
+	CurrentGateRevision int64
 }
 
 func (e *ExitError) Error() string {

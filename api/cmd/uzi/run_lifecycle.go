@@ -208,6 +208,12 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// PRD #1795 D5: the revision is fixed at invocation, BEFORE the credential switch,
+			// so the approve names the plan that was at the gate when the owner decided.
+			expected, err := resolveExpectedGateRevision(cmd, c, args[0])
+			if err != nil {
+				return err
+			}
 			// --token FIRST among the SERVER steps: the override/switch must land before the
 			// approval, so on any error we return WITHOUT approving — the composition failed.
 			// Gated on Changed (like `run create --token`), so an explicit --token "" is a
@@ -229,7 +235,7 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 					_, _ = fmt.Fprintf(env.Stderr, "warning: %s\n", sanitizeTTY(warning))
 				}
 			}
-			return submitInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel, false)
+			return submitInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel, false, expected)
 		},
 	}
 	approve.Flags().String("agent-source", "", "which subagent roster to run: own|repo (default: the run's own default)")
@@ -241,6 +247,7 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 		"switch which Anthropic token this run spends BEFORE approving: a token label (pins "+
 			"the run to it), 'auto' (auto-select from your pool), 'default' (your default token), "+
 			"or 'inherit' (the worker's binding); omit to approve without switching")
+	addExpectedGateRevisionFlag(approve)
 	return approve
 }
 
@@ -260,10 +267,15 @@ func newRunRejectCmd(env Env, gf *globalFlags) *cobra.Command {
 			if strings.TrimSpace(msg) == "" {
 				return uzicli.Exitf(uzicli.ExitUsage, "a rejection needs a reason: pass -m <reason> or pipe it on stdin")
 			}
-			return submitInput(env, gf, c, cmd, args[0], kindRejectPlan, msg, nil, false)
+			expected, err := resolveExpectedGateRevision(cmd, c, args[0])
+			if err != nil {
+				return err
+			}
+			return submitInput(env, gf, c, cmd, args[0], kindRejectPlan, msg, nil, false, expected)
 		},
 	}
 	reject.Flags().StringP("message", "m", "", "reason to send back to the agent (or pipe it on stdin)")
+	addExpectedGateRevisionFlag(reject)
 	return reject
 }
 
@@ -286,7 +298,7 @@ func newRunCancelCmd(env Env, gf *globalFlags) *cobra.Command {
 			// discarding that outcome. This non-TTY flag is the explicit, no-prompt confirmation
 			// the owner passes to discard it and cancel.
 			discard, _ := cmd.Flags().GetBool("discard-pending-outcome")
-			return submitInput(env, gf, c, cmd, args[0], kindCancel, msg, nil, discard)
+			return submitInput(env, gf, c, cmd, args[0], kindCancel, msg, nil, discard, nil)
 		},
 	}
 	cancel.Flags().StringP("message", "m", "", "reason for cancelling (optional; or pipe it on stdin)")
@@ -322,7 +334,7 @@ func newRunStopCmd(env Env, gf *globalFlags) *cobra.Command {
 			// The stop message is OPTIONAL, like a cancel reason — no empty check.
 			msg, _ := cmd.Flags().GetString("message")
 			msg = resolveMessage(env, msg)
-			return submitInput(env, gf, c, cmd, args[0], kindStop, msg, nil, false)
+			return submitInput(env, gf, c, cmd, args[0], kindStop, msg, nil, false, nil)
 		},
 	}
 	stop.Flags().StringP("message", "m", "", "an optional message to accompany the stop (or pipe it on stdin)")

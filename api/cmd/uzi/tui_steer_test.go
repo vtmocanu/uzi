@@ -500,3 +500,123 @@ func TestSteerUnknownIsRetriedOnAStateFrame(t *testing.T) {
 		t.Error("a batch containing a state frame was not recognised; the retry would never fire")
 	}
 }
+
+// PRD #1795 D5: `y` at the gate binds the approve to the revision the view shows at the
+// keypress; the command carries it even if a refetch lands before the command runs.
+func TestSteerApproveBindsTheRevisionAtKeypress(t *testing.T) {
+	runID := "r-own"
+	fake := &uzicli.FakeClient{}
+	gate := ownedRun(runID)
+	gate.Status, gate.GateRevision = "awaiting_approval", 2
+	m := ownerModel(t, fake, runID, gate)
+
+	nm, cmd := m.handleKey(keyConfirmY)
+	m = nm.(tuiModel)
+	if cmd == nil {
+		t.Fatal("y at the gate did not approve")
+	}
+	// A refetch re-presents the plan before the command executes.
+	newer := gate
+	newer.GateRevision = 3
+	m.detail.applyMeta(newer)
+
+	if msg := cmd().(steerResultMsg); msg.kind != kindApprovePlan {
+		t.Fatalf("kind = %q, want %q", msg.kind, kindApprovePlan)
+	}
+	if fake.LastInputExpectedGateRevision == nil || *fake.LastInputExpectedGateRevision != 2 {
+		t.Errorf("expected_gate_revision = %v, want 2 (the revision shown at the keypress)", fake.LastInputExpectedGateRevision)
+	}
+}
+
+// The reject revision is captured when the confirmation OPENS and kept through the confirm, so
+// a plan re-presented while the prompt is up is refused server-side, not rejected unseen.
+func TestSteerRejectKeepsTheRevisionFromTheConfirmationOpen(t *testing.T) {
+	runID := "r-own"
+	fake := &uzicli.FakeClient{}
+	gate := ownedRun(runID)
+	gate.Status, gate.GateRevision = "awaiting_approval", 2
+	m := ownerModel(t, fake, runID, gate)
+
+	m = press(t, m, keyConfirmN)
+	if m.detail.steer.mode != steerConfirming || m.detail.steer.pending != kindRejectPlan {
+		t.Fatalf("n did not open the reject confirmation (mode=%v pending=%q)", m.detail.steer.mode, m.detail.steer.pending)
+	}
+	newer := gate
+	newer.GateRevision = 3
+	m.detail.applyMeta(newer)
+	if m.detail.run.GateRevision != 3 {
+		t.Fatalf("fixture: the refetch did not land (revision %d)", m.detail.run.GateRevision)
+	}
+
+	nm, cmd := m.handleKey(keyConfirmY)
+	if cmd == nil {
+		t.Fatal("y did not confirm the reject")
+	}
+	if msg := cmd().(steerResultMsg); msg.kind != kindRejectPlan {
+		t.Fatalf("kind = %q, want %q", msg.kind, kindRejectPlan)
+	}
+	if fake.LastInputExpectedGateRevision == nil || *fake.LastInputExpectedGateRevision != 2 {
+		t.Errorf("expected_gate_revision = %v, want 2 (captured when the confirmation opened)", fake.LastInputExpectedGateRevision)
+	}
+	if nm.(tuiModel).detail.steer.pendingRevision != nil {
+		t.Error("the captured revision outlived the confirmation")
+	}
+}
+
+// A legacy gate (no revision) sends none.
+func TestSteerApproveLegacyGateSendsNoRevision(t *testing.T) {
+	runID := "r-own"
+	fake := &uzicli.FakeClient{}
+	gate := ownedRun(runID)
+	gate.Status = "awaiting_approval"
+	m := ownerModel(t, fake, runID, gate)
+	_, cmd := m.handleKey(keyConfirmY)
+	if cmd == nil {
+		t.Fatal("y at the gate did not approve")
+	}
+	cmd()
+	if fake.LastInputKind != kindApprovePlan {
+		t.Fatalf("kind = %q, want %q", fake.LastInputKind, kindApprovePlan)
+	}
+	if fake.LastInputExpectedGateRevision != nil {
+		t.Errorf("expected_gate_revision = %d, want omitted", *fake.LastInputExpectedGateRevision)
+	}
+}
+
+// A 409 gate_revision_mismatch shows a clear notice naming the current revision and re-reads
+// the run so the next `y`/`n` binds to the plan now at the gate.
+func TestSteerGateMismatchNoticeAndRefetch(t *testing.T) {
+	runID := "r-own"
+	gate := ownedRun(runID)
+	gate.Status, gate.GateRevision = "awaiting_approval", 2
+	m := ownerModel(t, &uzicli.FakeClient{}, runID, gate)
+	before := m.detail.metaSeq
+
+	next, cmd := m.Update(steerResultMsg{runID: runID, kind: kindApprovePlan, err: &uzicli.ExitError{
+		Code:                uzicli.ExitConflict,
+		Err:                 errors.New("the plan gate changed"),
+		Reason:              uzicli.ReasonGateRevisionMismatch,
+		CurrentGateRevision: 3,
+	}})
+	m = next.(tuiModel)
+	if !strings.Contains(m.detail.steer.notice, "the plan changed — review revision 3") {
+		t.Errorf("notice = %q, want it to name revision 3", m.detail.steer.notice)
+	}
+	if cmd == nil {
+		t.Fatal("a mismatch produced no follow-up command")
+	}
+	if m.detail.metaSeq != before+1 || m.detail.metaWaitID != m.detail.metaSeq {
+		t.Errorf("a mismatch did not start a run re-read (metaSeq %d -> %d, waitID %d)", before, m.detail.metaSeq, m.detail.metaWaitID)
+	}
+
+	// Control: any other error keeps the generic notice and starts no re-read.
+	before = m.detail.metaSeq
+	next, _ = m.Update(steerResultMsg{runID: runID, kind: kindApprovePlan, err: uzicli.Exitf(uzicli.ExitConflict, "run has already finished")})
+	m = next.(tuiModel)
+	if !strings.Contains(m.detail.steer.notice, "run has already finished") || strings.Contains(m.detail.steer.notice, "plan changed") {
+		t.Errorf("generic notice = %q", m.detail.steer.notice)
+	}
+	if m.detail.metaSeq != before {
+		t.Error("a non-mismatch error started a run re-read")
+	}
+}

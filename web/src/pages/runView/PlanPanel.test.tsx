@@ -9,7 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { PlanPanel } from "./PlanPanel";
-import { api, ApiError, type Run, type SecretMeta } from "../../lib/api";
+import { api, ApiError, type AgentSelectionInput, type Run, type SecretMeta } from "../../lib/api";
 
 vi.mock("../../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../lib/api")>();
@@ -279,5 +279,141 @@ describe("PlanPanel — gate credential path (PRD #1247 M7)", () => {
     mockApi.listSecrets.mockResolvedValue({ secrets: [token()] });
     renderPanel({ harness: "claude" });
     expect(await screen.findByLabelText("Anthropic token for the implementation phase")).toBeTruthy();
+  });
+});
+
+// PRD #1795 D5: every verdict is bound to the plan-gate revision of the plan the owner is
+// looking at, frozen when the action starts, so a refetch that re-presents a newer plan while
+// the owner is mid-action cannot silently re-point the verdict at a plan they have not read.
+describe("PlanPanel — verdicts bound to the gate revision (PRD #1795 M4)", () => {
+  type Handlers = {
+    onApprove: ReturnType<typeof vi.fn<(s: AgentSelectionInput, o?: boolean, r?: number) => void>>;
+    onReject: ReturnType<typeof vi.fn<(reason: string, r?: number) => void>>;
+    onRequestChanges: ReturnType<typeof vi.fn<(feedback: string, r?: number) => void>>;
+  };
+  function panel(r: Run, h: Handlers, revisionMismatch: { current: number } | null = null) {
+    return (
+      <PlanPanel
+        run={r}
+        busy={false}
+        canSteer
+        onApprove={h.onApprove}
+        onReject={h.onReject}
+        onRequestChanges={h.onRequestChanges}
+        revisionMismatch={revisionMismatch}
+      />
+    );
+  }
+  function handlers(): Handlers {
+    return {
+      onApprove: vi.fn<(s: AgentSelectionInput, o?: boolean, r?: number) => void>(),
+      onReject: vi.fn<(reason: string, r?: number) => void>(),
+      onRequestChanges: vi.fn<(feedback: string, r?: number) => void>(),
+    };
+  }
+
+  it("approve sends the displayed revision", async () => {
+    const h = handlers();
+    render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+    fireEvent.click(screen.getByRole("button", { name: /Approve plan/ }));
+    await waitFor(() => expect(h.onApprove).toHaveBeenCalledTimes(1));
+    expect(h.onApprove).toHaveBeenCalledWith({ source: "own", exclusions: [] }, undefined, 2);
+  });
+
+  it("the capability-override approve sends the displayed revision too", async () => {
+    const h = handlers();
+    render(panel(run({ gate_revision: 5, required_capabilities: ["docker"], worker_id: null }), h));
+    fireEvent.click(screen.getByRole("button", { name: /Run without docker/ }));
+    await waitFor(() => expect(h.onApprove).toHaveBeenCalledTimes(1));
+    expect(h.onApprove).toHaveBeenCalledWith({ source: "own", exclusions: [] }, true, 5);
+  });
+
+  it("approve keeps the revision captured at the click through a refetch during the credential await", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [token()] });
+    let resolveSet: (v: { run: Run }) => void = () => {};
+    mockApi.setRunCredential.mockReturnValue(
+      new Promise<{ run: Run }>((res) => {
+        resolveSet = res;
+      }),
+    );
+    const h = handlers();
+    const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+    const select = screen.getByLabelText("Anthropic token for the implementation phase") as HTMLSelectElement;
+    const opt = (await within(select).findByRole("option", { name: /console-key/ })) as HTMLOptionElement;
+    fireEvent.change(select, { target: { value: opt.value } });
+
+    fireEvent.click(screen.getByRole("button", { name: /Approve plan/ }));
+    // A refetch lands mid-await with a re-presented plan.
+    rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h));
+    resolveSet({ run: run() });
+
+    await waitFor(() => expect(h.onApprove).toHaveBeenCalledTimes(1));
+    expect(h.onApprove.mock.calls[0][2]).toBe(2);
+  });
+
+  it("the reject composer freezes the revision it was opened on through a refetch", async () => {
+    const h = handlers();
+    const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+
+    // While the owner types, a refetch re-presents revision 3.
+    rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h));
+    expect(screen.getByText("plan three")).toBeTruthy();
+    fireEvent.change(screen.getByPlaceholderText(/sent back to the agent/), { target: { value: "no" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+
+    expect(h.onReject).toHaveBeenCalledWith("no", 2);
+  });
+
+  it("the request-changes composer freezes the revision it was opened on through a refetch", async () => {
+    const h = handlers();
+    const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+    fireEvent.click(screen.getByRole("button", { name: "Request changes" }));
+
+    rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h));
+    fireEvent.change(screen.getByPlaceholderText(/sent to the planning session/), {
+      target: { value: "split M2" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Send & revise/ }));
+
+    expect(h.onRequestChanges).toHaveBeenCalledWith("split M2", 2);
+  });
+
+  it("cancelling a composer releases the freeze: the next action binds to the displayed revision", async () => {
+    const h = handlers();
+    const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+    expect(h.onReject).toHaveBeenCalledWith("", 3);
+  });
+
+  it("a mismatch shows the notice naming the current revision and re-binds the open composer to it", async () => {
+    const h = handlers();
+    const { rerender } = render(panel(run({ gate_revision: 2, plan_md: "plan two" }), h));
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+    expect(h.onReject).toHaveBeenLastCalledWith("", 2);
+
+    // The server refused (409 gate_revision_mismatch, current 3); the caller refetched.
+    rerender(panel(run({ gate_revision: 3, plan_md: "plan three" }), h, { current: 3 }));
+    expect(screen.getByText("The plan changed — review revision 3")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+    expect(h.onReject).toHaveBeenLastCalledWith("", 3);
+  });
+
+  it("a run without a gate revision keeps the legacy arg counts (no revision sent)", async () => {
+    const h = handlers();
+    render(panel(run({ plan_md: "legacy" }), h));
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
+    expect(h.onReject).toHaveBeenCalledTimes(1);
+    expect(h.onReject.mock.calls[0]).toHaveLength(1);
+    // No notice without a refusal (paired with the positive notice case above).
+    expect(screen.queryByText(/The plan changed/)).toBeNull();
   });
 });

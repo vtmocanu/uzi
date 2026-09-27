@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   type AgentSelectionInput,
@@ -129,6 +129,7 @@ export function PlanPanel({
   onReject,
   onRequestChanges,
   onCancel,
+  revisionMismatch = null,
 }: {
   run: Run;
   // The run's feed, used to derive the version chip / round counter / revising state
@@ -153,17 +154,47 @@ export function PlanPanel({
   // PRD #84 M4 4d: onApprove takes an optional overrideCapabilities flag — the "run without
   // the capability" false-positive correction. The normal Approve button omits it (undefined
   // ≡ false); the readiness block's override button passes true.
-  onApprove: (selection: AgentSelectionInput, overrideCapabilities?: boolean) => void;
-  onReject: (reason: string) => void;
+  // PRD #1795 D5: every verdict callback also receives the plan-gate revision it is bound
+  // to (expectedGateRevision) as its LAST argument, but only when the run carries one — a run
+  // with no gate_revision keeps the exact pre-#1795 arg count (1 for approve/reject/revise, 2
+  // for the capability override), so an ungated caller sees no change.
+  onApprove: (
+    selection: AgentSelectionInput,
+    overrideCapabilities?: boolean,
+    expectedGateRevision?: number,
+  ) => void;
+  onReject: (reason: string, expectedGateRevision?: number) => void;
   // Request-changes (PRD #41) and the revising-state Cancel-run affordance. Optional
   // with a no-op default so a base-gate-only caller need not wire them.
-  onRequestChanges?: (feedback: string) => void;
+  onRequestChanges?: (feedback: string, expectedGateRevision?: number) => void;
   onCancel?: () => void;
+  // PRD #1795 D5: set by the caller when a verdict was refused because the plan moved on
+  // (409 gate_revision_mismatch). `current` is the run's revision at refusal. A NEW object
+  // per refusal, so a second refusal at the same revision still re-arms the panel. The
+  // panel shows the notice and releases any frozen revision, so the next click binds to
+  // the plan that is on screen then (the caller refetches the run).
+  revisionMismatch?: { current: number } | null;
 }) {
   const [rejecting, setRejecting] = useState(false);
   const [requesting, setRequesting] = useState(false);
   const [reason, setReason] = useState("");
   const [feedback, setFeedback] = useState("");
+
+  // PRD #1795 D5: the revision a verdict is bound to is read from the SAME run object whose
+  // plan_md this panel renders, and frozen the moment an action starts: at the approve click
+  // (before doApprove's credential await), and when the reject or request-changes composer
+  // opens. A refetch that lands while the owner is still typing may re-present a newer plan;
+  // the frozen value keeps the verdict bound to the plan the owner opened the composer on, so
+  // the server refuses it (409) instead of applying it to a plan they have not read.
+  // null = nothing frozen (bind to the displayed run at click time).
+  const [frozenRevision, setFrozenRevision] = useState<{ rev: number | undefined } | null>(null);
+  const freezeRevision = useCallback(() => setFrozenRevision({ rev: run.gate_revision }), [run.gate_revision]);
+  const boundRevision = frozenRevision ? frozenRevision.rev : run.gate_revision;
+  // A refusal releases the freeze: the owner was told the plan changed, and the next click
+  // must bind to the revision on screen then, not the refused one.
+  useEffect(() => {
+    if (revisionMismatch) setFrozenRevision(null);
+  }, [revisionMismatch]);
 
   const rev = useMemo(() => derivePlanRevision(messages), [messages]);
 
@@ -220,6 +251,9 @@ export function PlanPanel({
   const doApprove = useCallback(
     async (withOverride: boolean) => {
       if (submittingRef.current) return;
+      // Freeze synchronously, before the credential await: a refetch during that await must
+      // not change which plan revision this approve names.
+      const expectedRevision = run.gate_revision;
       submittingRef.current = true;
       setSubmitting(true);
       setCredentialError("");
@@ -242,7 +276,8 @@ export function PlanPanel({
         // Preserve the exact onApprove arg-count contract (1 arg for the plain approve,
         // 2 for the capability override) so RunView's `act` wrapper and the panel tests
         // see no change.
-        if (withOverride) onApprove(selection, true);
+        if (expectedRevision !== undefined) onApprove(selection, withOverride ? true : undefined, expectedRevision);
+        else if (withOverride) onApprove(selection, true);
         else onApprove(selection);
       } finally {
         // Clear the guard. On the happy path onApprove has already flipped RunView's
@@ -252,7 +287,7 @@ export function PlanPanel({
         setSubmitting(false);
       }
     },
-    [credential, credentialTouched, run.id, onApprove, selection],
+    [credential, credentialTouched, run.id, run.gate_revision, onApprove, selection],
   );
 
   const activeRoster = selection.source === "repo" ? repoAgents.map((a) => a.name) : ownTemplates.map((t) => t.name);
@@ -360,10 +395,24 @@ export function PlanPanel({
               <Button disabled={busy || submitting} onClick={() => void doApprove(false)}>
                 {approveLabel}
               </Button>
-              <Button variant="secondary" disabled={busy} onClick={() => setRequesting(true)}>
+              <Button
+                variant="secondary"
+                disabled={busy}
+                onClick={() => {
+                  freezeRevision();
+                  setRequesting(true);
+                }}
+              >
                 Request changes
               </Button>
-              <Button variant="danger" disabled={busy} onClick={() => setRejecting(true)}>
+              <Button
+                variant="danger"
+                disabled={busy}
+                onClick={() => {
+                  freezeRevision();
+                  setRejecting(true);
+                }}
+              >
                 Reject
               </Button>
             </div>
@@ -371,6 +420,19 @@ export function PlanPanel({
         </div>
       </div>
       <div className="space-y-4 p-4">
+        {/* PRD #1795 D5: the verdict was refused because a newer plan replaced the one it
+            named. The run is refetched by the caller; this names the revision to review. */}
+        {revisionMismatch && (
+          <Alert
+            tone="info"
+            message={
+              revisionMismatch.current > 0
+                ? `The plan changed — review revision ${revisionMismatch.current}`
+                : "The plan changed — review the current plan"
+            }
+          />
+        )}
+
         {/* The picker exists to shape the approve verdict, so it is an action surface:
             shown only to someone who can approve. The locked-in roster is a separate,
             read-only card (AgentRosterSummary) once the run is past the gate. */}
@@ -553,10 +615,24 @@ export function PlanPanel({
                 {MAX_REVISION_ROUNDS} revision rounds max.
               </span>
               <div className="flex gap-2">
-                <Button variant="ghost" disabled={busy} onClick={() => setRequesting(false)}>
+                <Button
+                  variant="ghost"
+                  disabled={busy}
+                  onClick={() => {
+                    setRequesting(false);
+                    setFrozenRevision(null);
+                  }}
+                >
                   Cancel
                 </Button>
-                <Button disabled={busy || feedback.trim() === ""} onClick={() => onRequestChanges?.(feedback)}>
+                <Button
+                  disabled={busy || feedback.trim() === ""}
+                  onClick={() =>
+                    boundRevision !== undefined
+                      ? onRequestChanges?.(feedback, boundRevision)
+                      : onRequestChanges?.(feedback)
+                  }
+                >
                   Send &amp; revise
                 </Button>
               </div>
@@ -574,10 +650,21 @@ export function PlanPanel({
               onChange={(e) => setReason(e.target.value)}
             />
             <div className="flex gap-2">
-              <Button variant="danger" disabled={busy} onClick={() => onReject(reason)}>
+              <Button
+                variant="danger"
+                disabled={busy}
+                onClick={() => (boundRevision !== undefined ? onReject(reason, boundRevision) : onReject(reason))}
+              >
                 Send rejection
               </Button>
-              <Button variant="ghost" disabled={busy} onClick={() => setRejecting(false)}>
+              <Button
+                variant="ghost"
+                disabled={busy}
+                onClick={() => {
+                  setRejecting(false);
+                  setFrozenRevision(null);
+                }}
+              >
                 Cancel
               </Button>
             </div>
