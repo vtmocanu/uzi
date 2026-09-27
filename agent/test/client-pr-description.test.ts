@@ -289,6 +289,24 @@ describe("pr-description client wire (PRD #1798 M4, D9)", () => {
     assert.equal(JSON.stringify(v.fields), JSON.stringify(v.fields.toRaw()));
   });
 
+  it("a decoded size is rebuilt from its known keys and frozen: unknown size and bucket keys are dropped", async () => {
+    const wire = version();
+    const extra = {
+      ...wire,
+      size: { ...wire.size, injected: "x", code: { ...wire.size!.code, extra: 1 } },
+    };
+    respond = () => ({ status: 200, body: JSON.stringify({ version: extra }) });
+    const { version: v } = await newClient().stagePrDescription(RUN_ID, stageReq());
+    assert.ok(v.size !== null);
+    assert.equal("injected" in v.size, false);
+    assert.equal("extra" in v.size.code, false);
+    assert.deepEqual(plain(v.size), wire.size);
+    assert.ok(Object.isFrozen(v.size));
+    for (const b of ["code", "tests", "docs", "config", "generated", "vendored"] as const) {
+      assert.ok(Object.isFrozen(v.size[b]), b);
+    }
+  });
+
   it("the ack outcome tuple is exactly the api's six outcomes (no abandoned)", () => {
     assert.deepEqual(
       [...PR_DESC_ACK_OUTCOMES],
@@ -557,6 +575,22 @@ describe("raw vs sanitized fields are distinct types (D7, compile-checked)", () 
     for (const spread of [{ ...sanitized }, { ...sanitized, ...raw }]) {
       assert.equal(SanitizedPrDescriptionFields.is(spread), false);
     }
+    // structuredClone and Proxy are declared to return their argument's type, so both compile
+    // into the slot with no cast; neither carries the #private brand at runtime.
+    slot = structuredClone(sanitized);
+    assert.equal(SanitizedPrDescriptionFields.is(slot), false);
+    assert.equal(Object.getPrototypeOf(slot), Object.prototype);
+    slot = new Proxy(sanitized, {});
+    assert.equal(SanitizedPrDescriptionFields.is(slot), false);
+    // A lying proxy cannot report other text for a frozen member: the Proxy invariant throws.
+    const lying = new Proxy(sanitized, { get: (t, k, r) => (k === "summary" ? raw.summary : Reflect.get(t, k, r)) });
+    assert.throws(() => lying.summary, TypeError);
+    // Mapped types over the class drop the #private brand, so they are structural: Pick of the
+    // data members takes raw fields, Readonly<> takes raw fields plus a toRaw function.
+    const picked: Pick<SanitizedPrDescriptionFields, "summary" | "changes" | "scope_notes" | "review_pointers" | "verification"> = raw;
+    const readonlyView: Readonly<SanitizedPrDescriptionFields> = { ...raw, toRaw: () => raw };
+    assert.equal(SanitizedPrDescriptionFields.is(picked), false);
+    assert.equal(SanitizedPrDescriptionFields.is(readonlyView), false);
     assert.ok(SanitizedPrDescriptionFields.is(sanitized));
 
     // A sanitized value is NOT assignable where raw fields are expected (readonly arrays): a

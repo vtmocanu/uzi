@@ -256,9 +256,17 @@ const MINT: unique symbol = Symbol("SanitizedPrDescriptionFields.mint");
  * `{} & SanitizedPrDescriptionFields & Raw`, and an intersection is assignable to each member;
  * and an `any` (an untyped `JSON.parse`, an `as any`) assigned to the slot compiles too. Neither
  * produces an instance at runtime, and {@link SanitizedPrDescriptionFields.is} (an unforgeable
- * #private brand check, not `instanceof`) returns false for both. So a renderer caller must take
- * fields ONLY from a DTO a WorkerClient pr-description call or claimRun returned, never from a
- * value it assembled, and a renderer that wants a runtime backstop checks `is()` before writing.
+ * #private brand check, not `instanceof`) returns false for both. `structuredClone(sanitized)` and
+ * `new Proxy(sanitized, handler)` compile into a sanitized slot with no cast at all (both are
+ * declared to return their argument's type), yet the clone is a plain object and the proxy has
+ * no #private slot, so `is()` is false for each. (A proxy cannot report different text for the
+ * frozen data members: the Proxy invariants make such a `get` throw, as the test file pins.)
+ * And a MAPPED type over the class (`Readonly<SanitizedPrDescriptionFields>`, `Pick<...>`) drops
+ * the #private brand: it is structural, so `Pick` of the data members accepts raw fields and
+ * `Readonly<>` accepts raw fields plus a `toRaw` function. So a renderer parameter is typed exactly `SanitizedPrDescriptionFields`
+ * (never a mapped type of it), its fields come ONLY from a DTO a WorkerClient pr-description call
+ * or claimRun returned, never from a value the caller assembled, and the renderer calls
+ * {@link SanitizedPrDescriptionFields.is} at runtime before writing.
  */
 export class SanitizedPrDescriptionFields {
   readonly summary: string;
@@ -306,8 +314,9 @@ export class SanitizedPrDescriptionFields {
 // Response decoders: the api promises these shapes (non-nil slices in every response); a body that
 // does not match is refused rather than cast, because the stage response's sanitized fields are the
 // only text the renderer may publish (D7) and a bind/ack state drives the compare-and-swap. Each
-// decoder BUILDS a fresh value from the checked body (unknown keys dropped) and mints the fields
-// as a SanitizedPrDescriptionFields instance. None is exported: minting from arbitrary input stays
+// decoder BUILDS a fresh value from the checked keys only, so an unknown key is dropped at every
+// level (the version, its fields and their list entries, the size and its buckets): the fields are
+// minted as a frozen SanitizedPrDescriptionFields instance and the size is rebuilt frozen. None is exported: minting from arbitrary input stays
 // inside this module, on HTTP response bodies only.
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -328,6 +337,22 @@ function isSize(v: unknown): v is PrDescriptionSize {
     isInt(v.files) &&
     ["code", "tests", "docs", "config", "generated", "vendored"].every((b) => isBucket(v[b]))
   );
+}
+
+/** Rebuild a checked size from its known keys only (an unknown top-level or bucket key is
+ *  dropped), frozen with each bucket, so the decoded DTO never aliases the wire object. */
+function decodeSize(v: PrDescriptionSize): PrDescriptionSize {
+  const bucket = (b: PrDescriptionSize["code"]) => Object.freeze({ added: b.added, deleted: b.deleted });
+  return Object.freeze({
+    unavailable: v.unavailable,
+    files: v.files,
+    code: bucket(v.code),
+    tests: bucket(v.tests),
+    docs: bucket(v.docs),
+    config: bucket(v.config),
+    generated: bucket(v.generated),
+    vendored: bucket(v.vendored),
+  });
 }
 
 function decodeFields(v: unknown): SanitizedPrDescriptionFields | undefined {
@@ -383,7 +408,7 @@ function decodeVersion(v: unknown): PrDescriptionVersionDTO | undefined {
     claim_generation: v.claim_generation,
     mr_iid: v.mr_iid,
     fields,
-    size: v.size,
+    size: v.size === null ? null : decodeSize(v.size),
     base_sha: v.base_sha,
     head_sha: v.head_sha,
     target_branch: v.target_branch,

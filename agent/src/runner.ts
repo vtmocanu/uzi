@@ -111,6 +111,8 @@ import { detectToolchain, type ToolchainDetection } from "./toolchain-detect.js"
 import { isCIConfigPlan } from "./prompt.js";
 import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
 import { computeSizeLine, SIZE_UNAVAILABLE } from "./pr-size.js";
+import { SummaryRunner } from "./summary-runner.js";
+import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only: the injected seam, never constructed here
 import { REASON_PROVISION_FAILED } from "./provision-run.js";
 import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
 import { PLAN_MISSING_QUESTION, PLAN_MISSING_QUESTION_HEADER, REASON_PLAN_MISSING } from "./plan-missing.js";
@@ -1260,6 +1262,17 @@ export interface RunnerOptions {
    *  Measured against the injectable `now`, so a test can shrink it. Default 20s — well under the
    *  api's claimed-never-started grace so a probe never outlives the claim. */
   queuedDuplicateProbeBudgetMs?: number;
+  /** PRD #1798 M5 (D13): the Codex advice-harness factory the PR-description editor pass runs a
+   *  Codex claim on. Used only when `summaryRunner` is not injected (the default SummaryRunner is
+   *  built with it); without either, a Codex claim gets no generated description (D8 fallback). */
+  codexAdviceHarnessFactory?: CodexAdviceHarnessFactory;
+  /** PRD #1798 M5: the SummaryRunner whose generateDeliverySummary writes the PR description.
+   *  main.ts injects one on the SDK HOME root with the production Codex factory; default: a
+   *  SummaryRunner on this runner's clock and `codexAdviceHarnessFactory`. */
+  summaryRunner?: SummaryRunner;
+  /** PRD #1798 M5: never run the editor pass (main.ts sets it under UZI_EXECUTOR=stub, so an e2e
+   *  spends nothing on either harness: the Codex advice path ignores the stub queryFn). */
+  skipDeliverySummary?: boolean;
 }
 
 /**
@@ -1345,6 +1358,8 @@ export class RunRunner {
   private readonly setTimer: (cb: () => void, ms: number) => () => void;
   /** issue #1597 M2: arms the repeating mid-turn checkpoint tick (see RunnerOptions.setTickTimer). */
   private readonly setTickTimer: (cb: () => void, ms: number) => () => void;
+  /** PRD #1798 M5: see {@link RunRunner.deliverySummaryRunner}. */
+  private readonly deliverySummary: SummaryRunner | null;
   /** PRD #41: absolute plan-approval deadline (epoch ms) per runId, set on the FIRST
    *  gate entry and reused across every revision round so N rounds share ONE budget (not
    *  24h per round). Cleared when the gate resolves terminally (approve/reject/cancel/
@@ -1493,6 +1508,18 @@ export class RunRunner {
     };
     this.setTimer = opts.setTimer ?? realTimer;
     this.setTickTimer = opts.setTickTimer ?? realTimer;
+    // PRD #1798 M5: the PR-description editor pass, or null when it must never run (stub).
+    this.deliverySummary = opts.skipDeliverySummary
+      ? null
+      : (opts.summaryRunner ??
+        new SummaryRunner(this.log, { codexAdviceHarnessFactory: opts.codexAdviceHarnessFactory, now: this.now }));
+  }
+
+  /** PRD #1798 M5: the SummaryRunner the finalize path runs the PR-description editor pass on, or
+   *  null when the pass is disabled (`skipDeliverySummary`), in which case the description falls
+   *  back to the lead's claims or the size line alone (D8). */
+  deliverySummaryRunner(): SummaryRunner | null {
+    return this.deliverySummary;
   }
 
   /** PRD #1296 M3 — restart-safe recovery resume (called once by the worker after

@@ -16,6 +16,7 @@ import { Outbox, deriveTerminalReserveBytes } from "./outbox.js";
 import { ActiveRunRegistry } from "./active-run-registry.js";
 import { JudgeRunner } from "./judge-runner.js";
 import { ReviewRunner } from "./review-runner.js";
+import { SummaryRunner } from "./summary-runner.js";
 import { stubJudgeQueryFn } from "./judge-runner-stub.js";
 import { Worker } from "./worker.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
@@ -451,6 +452,32 @@ async function main(): Promise<void> {
       codexCommandSandbox: config.codexCommandSandbox,
       codexSandboxDegraded: config.codexHarness.degraded,
     });
+  // PRD #1429 M3: the Codex advice-harness factory judge/review thread into
+  // runReadOnlyModelPass (model-pass.ts) so a Codex judge/review claim (secrets.codex
+  // present) gets a REAL Codex advice pass instead of the missing-token fallback. PRD #1798 M5
+  // also hands it to the run lane's PR-description editor pass (the RunRunner below), which,
+  // unlike judge/review, is skipped outright under the stub executor. Built
+  // HERE — one of the two sites semgrep/codex-fixed-constructor.yml allows to construct a
+  // Codex class (the other is codex/codex-executor.ts itself) — and injected as an option.
+  //
+  // UNLIKE the run lane's `buildRunExecutor` (PRD #1429 M6, above this function): this
+  // factory is always built, and a codex-bound judge/review claim always constructs the
+  // REAL CodexAdviceHarness, regardless of `config.executor`. The judge/review e2e path
+  // proves itself through the packaged-only LOOPBACK app-server provider
+  // (`CODEX_M3B_LOOPBACK_PROVIDER_NAME`, wired via `appServerAuthOpenAIBaseUrlForTest`),
+  // not through a generic stub — so there is no judge-lane equivalent of the run lane's
+  // stub-before-codex short-circuit. `stubJudgeQueryFn` below only ever gates the CLAUDE
+  // judge's `queryFn`; the Codex judge/review path (`runCodexAdviceModelPass`) takes no
+  // `queryFn` at all and is unaffected by it.
+  //
+  // (This comment used to say makeExecutor "unconditionally" selected the real
+  // CodexExecutor the same way, with UZI_EXECUTOR=stub "only ever" affecting the Claude
+  // path. That was the M6 bug this PRD fixes, not an intended parallel: the run lane's
+  // stub now DOES short-circuit a codex-bound claim to StubExecutor before it ever
+  // reaches the codex branch. Only this judge/review advice lane keeps the old
+  // always-real-CodexAdviceHarness shape.)
+  const codexAdviceHarnessFactory = makeProductionCodexAdviceHarnessFactory(client, log, sdkHomeRoot);
+
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
     pollMs: config.pollIntervalMs,
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
@@ -467,6 +494,13 @@ async function main(): Promise<void> {
     gapFillMax: config.gapFillMax,
     // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
     activeRuns,
+    // PRD #1798 M5: the PR-description editor pass, on the same HOME root as the executor's own
+    // SummaryRunner and the judge (the uid split needs its setgid agent-home parent), with the
+    // production Codex factory for a Codex claim.
+    summaryRunner: new SummaryRunner(log, { homeRoot: sdkHomeRoot, codexAdviceHarnessFactory }),
+    // Under the stub executor the pass never runs: the e2e spends nothing on either harness (the
+    // Codex advice path takes no queryFn, so a stub queryFn could not neutralize it).
+    skipDeliverySummary: config.executor === "stub",
   });
 
   // The chat lane (PRD #39). Per-session executor factory (PRD #42 Decision 4): each
@@ -513,30 +547,6 @@ async function main(): Promise<void> {
     transientTripMs: config.transientTripMs,
     outboxSpillBufferBytes: config.outboxSpillBufferBytes,
   });
-
-  // PRD #1429 M3: the Codex advice-harness factory judge/review thread into
-  // runReadOnlyModelPass (model-pass.ts) so a Codex judge/review claim (secrets.codex
-  // present) gets a REAL Codex advice pass instead of the missing-token fallback. Built
-  // HERE — one of the two sites semgrep/codex-fixed-constructor.yml allows to construct a
-  // Codex class (the other is codex/codex-executor.ts itself) — and injected as an option.
-  //
-  // UNLIKE the run lane's `buildRunExecutor` (PRD #1429 M6, above this function): this
-  // factory is always built, and a codex-bound judge/review claim always constructs the
-  // REAL CodexAdviceHarness, regardless of `config.executor`. The judge/review e2e path
-  // proves itself through the packaged-only LOOPBACK app-server provider
-  // (`CODEX_M3B_LOOPBACK_PROVIDER_NAME`, wired via `appServerAuthOpenAIBaseUrlForTest`),
-  // not through a generic stub — so there is no judge-lane equivalent of the run lane's
-  // stub-before-codex short-circuit. `stubJudgeQueryFn` below only ever gates the CLAUDE
-  // judge's `queryFn`; the Codex judge/review path (`runCodexAdviceModelPass`) takes no
-  // `queryFn` at all and is unaffected by it.
-  //
-  // (This comment used to say makeExecutor "unconditionally" selected the real
-  // CodexExecutor the same way, with UZI_EXECUTOR=stub "only ever" affecting the Claude
-  // path. That was the M6 bug this PRD fixes, not an intended parallel: the run lane's
-  // stub now DOES short-circuit a codex-bound claim to StubExecutor before it ever
-  // reaches the codex branch. Only this judge/review advice lane keeps the old
-  // always-real-CodexAdviceHarness shape.)
-  const codexAdviceHarnessFactory = makeProductionCodexAdviceHarnessFactory(client, log, sdkHomeRoot);
 
   // The judge lane (PRD #46): a slim runner for `judge` claims. It reuses the SDK
   // HOME root but needs no executor/clone — it fetches the trace, calls the model
