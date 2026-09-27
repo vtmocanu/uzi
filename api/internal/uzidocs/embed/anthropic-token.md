@@ -62,10 +62,11 @@ It is what runs whenever nothing more specific applies:
 - every **chat** run, on any worker, bound or not (see below);
 - the run judge, unless you point it somewhere else.
 
-While you hold any token at all, you have exactly one default — uzi will not
-let you end up with none. To move the default, click **Make default** on
+While you hold any enabled token, you have exactly one default — uzi will
+not let you end up with none. To move the default, click **Make default** on
 another token; the badge moves in one step, with no window in which you have
-none.
+none. The default is always an enabled token; the one way to be left without
+a default is to [disable](#disabling-a-token) every token you hold.
 
 ## Pointing a worker at a token
 
@@ -315,6 +316,110 @@ click **Replace value**. The new value is used from the next run; nothing
 else changes. Renaming is likewise safe — bindings follow the token, not its
 name, so a rename never silently re-points a worker.
 
+## Disabling a token
+
+A token you have stopped using does not have to be deleted. Click
+**Disable** on its card (beside **Rename**, **Make default** and **Delete**)
+to put it aside, and **Enable** to bring it back. Disabling is a pause, not
+a deletion: the stored value, the name, the pool opt-in and your sidebar
+choice are all kept, and come back unchanged when you enable it again. It
+does not revoke the token at Anthropic.
+
+While a token is disabled:
+
+- nothing new spends it: no new run, no chat, no judge or self-improvement
+  run, and no scheduled fire;
+- uzi stops checking its usage in the background, and it disappears from
+  the sidebar meters, from `uzi rate-limits`, and from the admin **Rate
+  limits** page;
+- it is left out of the token pickers (starting a run, switching a run's
+  token, the plan gate, the schedule dialog) and of the auto-selection
+  pool, and the pickers say how many disabled tokens they are not listing;
+- you cannot point anything new at it: binding a worker, pinning a run or a
+  schedule, choosing it for the judge, adding it to the pool or making it
+  the default are refused with a message that sends you to **Settings**.
+
+What it has already done stays on record: past runs keep its name and their
+usage and cost, as before.
+
+**A run already using it finishes first.** Disabling stops future use; a
+run that is already working with the token keeps it until that run is done
+with it.
+
+### The disable dialog
+
+**Disable** opens a dialog that explains the above and lists what relies on
+the token right now: workers bound to it (they will wait), schedules pinned
+to it (their fires will be skipped), runs in flight (they finish first),
+and whether the judge uses it.
+
+If the token is your **default**, the dialog asks you to pick which of your
+other enabled tokens becomes the default, and applies both changes
+together. uzi never picks a replacement for you. If it is your **last**
+enabled token, there is nothing to pick: the dialog tells you that you will
+be left with no default token, and that work which relies on the default
+will wait (or, for a new run that doesn't name a harness, may start on
+Codex instead if you have a usable Codex credential).
+
+### Where it goes
+
+A disabled token moves into a **Disabled** section at the bottom of the
+Anthropic tokens card, collapsed by default (your browser remembers whether
+you expanded it). Each row shows the name, **Disabled since** and the date,
+and **Enable** and **Delete** buttons. The pool and sidebar checkboxes are
+hidden while it is disabled, not cleared.
+
+When every token is disabled, a notice at the top of the card says you
+have no default token, even with the Disabled section collapsed, and each
+disabled row's button reads **Enable and make default**.
+
+### Work that needs a disabled token waits
+
+uzi never quietly spends a different token in its place, because that
+changes which account pays. Work that needs this token specifically waits
+instead:
+
+- a run on a worker bound to it, or a run pinned to it;
+- the judge or a self-improvement run when the judge is set to it, or when
+  it uses your default and every token is disabled;
+- a chat, when every token is disabled and you have no default.
+
+A waiting run shows **waiting: credential disabled** on the run page, with
+an **Enable** button for the token, plus **Run with another token** when
+the run accepts a per-run token switch (chats, judge and self-improvement
+runs, task reviews and Codex runs do not; for those, enable the token or
+change the default or the binding in Settings). The run resumes on its own
+as soon as you enable the token, and the time it spends waiting does not
+count against its time limit. In the CLI the run's status is `paused`, and
+`uzi run get` prints a `HOLD` row reading `credential disabled` with the
+same next step.
+
+An auto worker is different: disabled tokens simply leave its pool. If the
+pool ends up empty, its runs [wait for a pooled token](#waiting-for-a-token)
+as usual.
+
+### Schedules
+
+A schedule pinned to a disabled token starts nothing when it comes due. Its
+last fire records the skip **pinned credential is disabled**
+(`credential_disabled`). A recurring schedule keeps its cadence and fires
+normally again once you enable the token or change the schedule's token. A
+one-time schedule is not used up: it stays due and fires once the token is
+enabled or the schedule points at another one. A schedule that just uses
+your default follows whichever token is the default at the time.
+
+### Enabling it again
+
+**Enable** brings the token back exactly as it was, except that it returns
+as an ordinary token rather than the default (unless you had no default
+left, in which case the button is **Enable and make default**). Its usage
+meter reads "checking usage…" until a fresh reading arrives; a reading from
+before you disabled it is never shown as current.
+
+Disabling and enabling are web-only. The CLI shows the state: `uzi token
+list` has a `STATE` column (`enabled`, or `disabled since` and the date),
+and its `--json` output carries `enabled` and `disabled_at`.
+
 ## Deleting a token
 
 Click **Delete** on the token's row. Two rules:
@@ -323,9 +428,9 @@ Click **Delete** on the token's row. Two rules:
   judge setting) bound to it falls back to your default token from its next
   claim. The confirmation dialog says so, because a silent fallback is
   acceptable behavior but not acceptable surprise.
-- **You cannot delete your default while other tokens exist.** Make another
-  token the default first — the **Delete** button is disabled with a
-  hint explaining why. Deleting your *last* token is allowed, and returns you
+- **You cannot delete your default while another enabled token exists.**
+  Make another token the default first — the **Delete** button is disabled
+  with a hint explaining why. Deleting your *last* token is allowed, and returns you
   to the disconnected state: no token, no runs.
 
 ## Good to know
@@ -341,9 +446,10 @@ Click **Delete** on the token's row. Two rules:
 - **Meters are per token.** Each stored token gets its own 5-hour and 7-day
   reading — see [Claude rate limits](./rate-limits.md).
 - **The CLI can list tokens, and can move them in and out of the pool.**
-  `uzi token list` prints names, default flags, pool opt-in and live
-  eligibility; `uzi token pool <name> --on|--off` is the one write it has.
-  Adding, renaming, re-defaulting and deleting are web-only. That is a deliberate boundary, not a gap: a CLI
+  `uzi token list` prints names, default flags, pool opt-in, live
+  eligibility and whether each token is enabled; `uzi token pool <name>
+  --on|--off` is the one write it has. Adding, renaming, re-defaulting,
+  disabling, enabling and deleting are web-only. That is a deliberate boundary, not a gap: a CLI
   token is a bearer credential, and if it could mint or replace Anthropic
   credentials, a stolen one could swap out your account's credentials rather
   than merely read their names. See [the CLI guide](./cli.md#anthropic-tokens).

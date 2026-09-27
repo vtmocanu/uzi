@@ -78,6 +78,12 @@ func runSelfRateLimits(cmd *cobra.Command, c uzicli.Client, p *uzicli.Printer) e
 	if p.Format == uzicli.FormatJSON {
 		return p.JSON(meters)
 	}
+	// PRD #1732 D1: the owner endpoint omits disabled tokens, so an empty list means no
+	// ENABLED token (the user may still hold disabled ones, listed by `uzi token list`).
+	if len(meters) == 0 {
+		p.Printf("no enabled Anthropic token; add or enable one in Settings (`uzi token list` shows every token you hold)\n")
+		return nil
+	}
 	rows := make([][]string, 0, len(meters))
 	for _, tk := range meters {
 		rows = append(rows, []string{
@@ -102,6 +108,12 @@ func runSelfCodexRateLimits(cmd *cobra.Command, c uzicli.Client, p *uzicli.Print
 	}
 	if p.Format == uzicli.FormatJSON {
 		return p.JSON(accts)
+	}
+	// PRD #1732 D6: an account is listed only while an enabled linked login resolves to it,
+	// so an empty list does not mean the user holds no Codex credential.
+	if len(accts) == 0 {
+		p.Printf("no linked Codex account with an enabled login; add or enable one in Settings\n")
+		return nil
 	}
 	rows := codexRateLimitRows(accts)
 	return p.Table([]string{"ACCOUNT", "STATUS", "BUCKET", "PRIMARY", "SECONDARY", "RESET"}, rows)

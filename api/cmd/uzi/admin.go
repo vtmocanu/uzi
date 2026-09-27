@@ -224,11 +224,16 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 			// column, and a token-less user is a single row with an empty token cell and
 			// a no_token status — so every user still appears exactly once when they hold
 			// no token, and once per token when they hold several.
+			//
+			// PRD #1732 D9: the server omits disabled tokens (no row, no count), so an empty
+			// token list means "no ENABLED token", not "no token". The cell says exactly that
+			// and nothing more, so it neither claims the user holds none nor hints at how
+			// many are disabled.
 			rows := make([][]string, 0, len(rls))
 			for _, rl := range rls {
 				if len(rl.Tokens) == 0 {
 					rows = append(rows, []string{
-						rl.Email, vaultCell(rl.VaultLocked), "-", "no_token", "-", "-",
+						rl.Email, vaultCell(rl.VaultLocked), "-", "no_enabled_token", "-", "-",
 					})
 					continue
 				}

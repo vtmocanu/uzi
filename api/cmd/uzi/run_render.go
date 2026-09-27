@@ -435,6 +435,8 @@ func completionRows(r apitypes.RunDTO) [][]string {
 //   - budget_exhausted (a wall park): "time limit reached · parked HH:MM (dur) · C/N milestones ·
 //     extend: uzi run extend <id> --by 2h"
 //   - completion_blocked (the PRD #1226 hold): "completion blocked · parked HH:MM (dur) · C/N milestones"
+//   - credential_disabled (PRD #1732 D14): "credential disabled · parked HH:MM (dur) · C/N milestones ·
+//     enable it in Settings[, or switch token: uzi run set-token <id> <label>]"
 //
 // The milestone clause is dropped when the run carries no frozen milestones (a prompt-kind park),
 // and the extend clause rides ONLY the wall park (a completion hold resumes through its own
@@ -452,8 +454,11 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 	if done, total, _ := milestoneProgress(r); total > 0 {
 		clauses = append(clauses, fmt.Sprintf("%d/%d milestones", done, total))
 	}
-	if *r.HoldReason == holdBudgetExhausted {
+	switch *r.HoldReason {
+	case holdBudgetExhausted:
 		clauses = append(clauses, "extend: uzi run extend "+r.ID+" --by 2h")
+	case holdCredentialDisabled:
+		clauses = append(clauses, credentialDisabledAction(r))
 	}
 	return []string{"HOLD", strings.Join(clauses, " · ")}
 }
@@ -468,9 +473,54 @@ func holdReasonLabel(reason string) string {
 		return "time limit reached"
 	case holdCompletionBlocked:
 		return "completion blocked"
+	case holdCredentialDisabled:
+		return "credential disabled"
 	default:
 		return sanitizeTTY(reason)
 	}
+}
+
+// isCredentialDisabledHold reports whether r is parked because a credential it needs is
+// disabled (PRD #1732 D14: status paused, hold_reason credential_disabled).
+func isCredentialDisabledHold(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdCredentialDisabled
+}
+
+// credentialSwitchableLane reports whether r's lane accepts a per-run token switch
+// (`uzi run set-token`), the D16 rule the web's isCredentialSwitchRefusedLane applies: never
+// a Codex run (the override is Anthropic-only), a task review, a chat, the Judge or
+// self-improve. The server refuses the switch on those lanes, so the CLI must not offer it.
+func credentialSwitchableLane(r apitypes.RunDTO) bool {
+	if r.Harness == "codex" || r.TriggerSource == "task_review" {
+		return false
+	}
+	switch r.Kind {
+	case "chat", "judge", "self_improve":
+		return false
+	}
+	return true
+}
+
+// credentialDisabledAction is the owner's next step for a credential_disabled hold (PRD #1732
+// D12/D16). Enabling stays web-only (D12), so it always names Settings; the set-token switch
+// is appended only where the lane supports a per-run override.
+func credentialDisabledAction(r apitypes.RunDTO) string {
+	action := "enable it in Settings"
+	if credentialSwitchableLane(r) {
+		action += ", or switch token: uzi run set-token " + r.ID + " <label>"
+	}
+	return action
+}
+
+// credentialDisabledLine is the one-line held-run sentence the TUI detail and `run logs
+// --follow` print for a credential_disabled hold, or "" for any other run. It names no label:
+// which credential the run waits on depends on server-side resolution the DTO does not carry
+// (the run's CREDENTIAL row already names its Codex alias).
+func credentialDisabledLine(r apitypes.RunDTO) string {
+	if !isCredentialDisabledHold(r) {
+		return ""
+	}
+	return "waiting: credential disabled · " + credentialDisabledAction(r)
 }
 
 // holdParkedClause renders "parked HH:MM (dur)" from the instant the run entered its current
@@ -1733,12 +1783,17 @@ func codexAccountActionShort(r apitypes.RunDTO) string {
 // displayRunStatus, plus the short Codex account action in parentheses for a run held on its
 // Codex account (PRD #1590), so the list says what the held run needs without a `run get`.
 // Issue #1766: a vault_locked park adds "(waiting for vault unlock)" the same way.
+// A run held on credential_disabled (PRD #1732 D14) gets "(credential disabled)" likewise.
 func runStatusCell(r apitypes.RunListItemDTO) string {
 	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState)
 	if short := codexAccountActionShort(r.RunDTO); short != "" {
 		s += " (" + short + ")"
 	} else if isVaultLockedPark(r.RunDTO) {
 		s += " (waiting for vault unlock)"
+	}
+	if isCredentialDisabledHold(r.RunDTO) {
+		// PRD #1732 D14: say why the run is paused, so it does not read as an owner pause.
+		s += " (credential disabled)"
 	}
 	return s
 }

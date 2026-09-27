@@ -340,6 +340,15 @@ exceed `max_issues` once backfill walks past a skip), which ones
   fallback, so the fire starts nothing and leaves the stored override
   untouched. Benign: the schedule advances and re-fires next cadence, and
   may resolve back to Claude (or the override may be changed) by then.
+- `credential_disabled` — the schedule is pinned to a token you have
+  [disabled](anthropic-token.md#disabling-a-token), or to a harness whose
+  credentials are all disabled. The fire starts nothing and never swaps in
+  another credential or harness; the pin is kept. A recurring schedule
+  advances and re-fires next cadence. A one-time schedule is **held**
+  instead: it stays due, un-advanced, with this skip recorded as its last
+  fire, and fires once you enable the credential or change the schedule's
+  token. The web shows it as "pinned credential is disabled"; `uzi schedule
+  get` prints the same label with a hint pointing at Settings.
 
 `examined == started + skipped` always holds — every candidate the fire
 reaches lands in exactly one bucket, so the tally never silently drops one.
@@ -383,10 +392,14 @@ Only the **last** fire is kept, and only the last *scheduled* one:
 `last_fire` is written on the same path that advances the schedule, so
 a **parked** schedule (bad repo or config) or a fire that hit a
 transient error (retried next tick, see `fetch_failed` above) leaves
-`last_fire` untouched — it shows whatever fired before, or nothing. A
+`last_fire` untouched — it shows whatever fired before, or nothing. The
+one exception is a one-time schedule held on a disabled credential (see
+`credential_disabled` above): it records that skip as its last fire
+without advancing, so it can show a `last_fire` while it is still due. A
 `run-now` fire reports its own outcome in the response without
 touching `last_fire` at all, since a manual fire must not disturb the
-cadence. A schedule that has never fired reads `last_fire: null`.
+cadence. A schedule that has never fired and was never held that way
+reads `last_fire: null`.
 
 ## Default jobs
 

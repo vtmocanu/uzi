@@ -807,7 +807,11 @@ func (m tuiModel) renderDetail() string {
 	// show on such a parked run too, matching the web's pending chip and `run get`'s
 	// PAUSE_REQUESTED row. On a limit_wait run both this and the rate-limit park line above
 	// draw: the run is held on a limit AND carries a pending pause.
-	if d.run.Status == statusPaused {
+	if line := credentialDisabledLine(d.run); line != "" {
+		// PRD #1732 D14: a credential_disabled hold is a server park, not an owner pause, so it
+		// must not read "paused by you". Same slot and colour; clampVisual keeps it one row.
+		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)), m.width) + "\n")
+	} else if d.run.Status == statusPaused {
 		line := pausedLine(d.run, time.Now(), m.width)
 		sb.WriteString(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, m.width)) + "\n")
 	} else if d.run.PauseRequestedAt != nil {

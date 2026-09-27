@@ -385,13 +385,26 @@ const (
 	codexReloginWord  = "codex login"
 )
 
+// Glyph and word of a credential_disabled hold (PRD #1732 D14): the run waits on a credential
+// its owner disabled and resumes only on the owner's action (Enable in Settings, or a token
+// switch where the lane allows one), so it is an amber NEEDS YOU token like the Codex relogin
+// hold. ⊘ is its NO_COLOR twin; the 13-rune word fits boardStatusWordWidth.
+const (
+	credDisabledGlyph = "⊘"
+	credDisabledWord  = "cred disabled"
+)
+
 // runStateToken is stateToken over a whole run: the Codex relogin_required hold (which the
-// status/cause pair cannot express, it hangs on CodexAccountAction) reads as an amber
-// attention token, and every other run takes stateToken unchanged. isRevising is passed
+// status/cause pair cannot express, it hangs on CodexAccountAction) and the credential_disabled
+// hold (it hangs on HoldReason) read as amber attention tokens, and every other run takes
+// stateToken unchanged. isRevising is passed
 // separately because only the list DTO carries it (the detail header passes false).
 func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
 	if codexReloginHold(r) {
 		return runToken{glyph: codexReloginGlyph, word: codexReloginWord, color: p.amber}
+	}
+	if isCredentialDisabledHold(r) {
+		return runToken{glyph: credDisabledGlyph, word: credDisabledWord, color: p.amber}
 	}
 	return p.stateToken(r.Status, r.Health, r.IsPlanning, isRevising, r.LandingState, strOr(r.RecoveryWaitCause, ""))
 }

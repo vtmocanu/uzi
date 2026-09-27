@@ -187,3 +187,38 @@ A linked account's meter can land in a state that needs your attention:
 - **Vault locked** — uzi can't open the login to poll it until you unlock
   your vault again. The last known reading stays on screen, greyed and
   marked stale, rather than disappearing.
+
+## Disabling a credential
+
+A Codex login or OpenAI API key you have stopped using can be put aside
+without deleting it: click **Disable** on its card, and **Enable** to bring
+it back. It works the way [disabling an Anthropic
+token](anthropic-token.md#disabling-a-token) does: the stored value, the
+name and your sidebar choice are kept, nothing new spends it, uzi stops
+checking and renewing it in the background, it disappears from the sidebar,
+the pickers and the admin **Rate limits** page, and a run already using it
+finishes first. It moves into the card's **Disabled** section, and the CLI
+shows it in `uzi token list` with a `STATE` of `disabled since` and the
+date.
+
+A few things are specific to Codex:
+
+- **Several logins can share one account.** If you saved more than one
+  login for the same ChatGPT account, disabling one of them keeps the
+  account live as long as another enabled login points at it: its meter
+  keeps updating and the disabled row says so. The account goes quiet only
+  when every login for it is disabled.
+- **A Codex run keeps the login it started with.** A Codex run that was
+  created with a login you later disable waits, showing **waiting:
+  credential disabled**, and resumes when you enable that login again. It
+  is never moved to another login or to Claude, and Codex runs have no
+  per-run token switch.
+- **The default is shared.** Your Codex logins and OpenAI API key share one
+  default. Disabling the default asks you to pick an enabled replacement;
+  disabling the last enabled one leaves you with no Codex default, and a
+  new run that doesn't name a harness may then start on Claude instead.
+- **Enabling a login tries to renew it first.** When you enable a login
+  again, uzi first tries to recover and renew it on its own, and only asks
+  for a new paste (the **Credential action required** state above) if that
+  fails. How long an unused login stays valid at OpenAI is outside uzi's
+  control.

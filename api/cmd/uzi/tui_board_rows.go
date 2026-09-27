@@ -502,13 +502,15 @@ func (m tuiModel) milestoneMarker(r apitypes.RunListItemDTO, dim bool, bg color.
 
 // boardShowSecondLine reports whether the SELECTED row gets its second "now" line (PRD #1064
 // D4): a non-terminal run with a server-derived current_activity, a run held on its Codex
-// account (PRD #1590), whose second line is the account action, or a vault_locked park (issue
-// #1766), whose second line is the vault park sentence. It has no milestone
+// account (PRD #1590), whose second line is the account action, a vault_locked park (issue
+// #1766), whose second line is the vault park sentence, or a run held on credential_disabled
+// (PRD #1732), whose second line is its next step. It has no milestone
 // precondition (D5) — the board reads current_activity directly. Used both by the row window
 // math (which must reserve a physical line for it) and by renderBoard.
 func (m tuiModel) boardShowSecondLine(r apitypes.RunListItemDTO) bool {
 	return (r.CurrentActivity != nil && !terminalRunStatuses[r.Status]) ||
-		codexAccountActionLine(r.RunDTO) != "" || vaultParkLine(r.RunDTO) != ""
+		codexAccountActionLine(r.RunDTO) != "" || vaultParkLine(r.RunDTO) != "" ||
+		credentialDisabledLine(r.RunDTO) != ""
 }
 
 // boardSecondLine is the selected row's second line (PRD #1064 D4): `▸ <id> <title> · <role>
@@ -524,7 +526,13 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 	// bands into NEEDS YOU via runBandOf; its line keeps the wait ink). The line carries
 	// the owner's alias label (user-authored), folded through cellText by
 	// codexAccountActionLine and through renderer.Plain here (D7).
-	if line := codexAccountActionLine(r.RunDTO); line != "" {
+	line := codexAccountActionLine(r.RunDTO)
+	if line == "" {
+		// PRD #1732 D14: a run held on credential_disabled has no live activity either; its
+		// second line is what the owner can do about it.
+		line = credentialDisabledLine(r.RunDTO)
+	}
+	if line != "" {
 		out := paintSeg(m.pal.tungsten, bg, false, "  ▸ ") + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 120))
 		return padSeg(clampVisual(out, m.width), m.width, bg)
 	}

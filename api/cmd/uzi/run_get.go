@@ -186,7 +186,8 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 				// NDJSON there for an agent to parse line by line (renderMessage). A
 				// human-readable notice on that stream would corrupt the contract. This
 				// is the same split cobra's deprecation notice already uses here.
-				if run.Status == statusLimitWait || run.Status == statusPoolWait || run.Status == statusRecoveryWait {
+				if run.Status == statusLimitWait || run.Status == statusPoolWait || run.Status == statusRecoveryWait ||
+					isCredentialDisabledHold(run) {
 					if !parked {
 						parked = true
 						// pool_wait and recovery_wait are the sibling silences limit_wait is
@@ -199,6 +200,12 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 						// non-held status that clears `parked` via the else-if below) before it
 						// could hold again, so re-arming here is exact.
 						switch run.Status {
+						case statusPaused:
+							// PRD #1732 D14: the only paused run gated in above is a
+							// credential_disabled hold. It resumes on Enable (web Settings), or on
+							// a token switch where the lane allows one; never on its own clock.
+							_, _ = fmt.Fprintf(env.Stderr, "run %s held — a credential it needs is disabled; %s; still following\n",
+								args[0], credentialDisabledAction(run))
 						case statusPoolWait:
 							_, _ = fmt.Fprintf(env.Stderr,
 								"run %s held — its token pool is empty; still following, it resumes when a token is pooled\n",

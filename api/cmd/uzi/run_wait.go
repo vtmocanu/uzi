@@ -94,6 +94,12 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 				_, _ = fmt.Fprintf(env.Stderr,
 					"run %s: parked at its time limit; waiting for the owner (uzi run extend %s --by 2h)\n", runID, runID)
 			}
+			// PRD #1732 D14: likewise a run held because a credential it needs is disabled. It
+			// resumes by itself once that credential is enabled, so the wait keeps going.
+			if isCredentialDisabledHold(run) {
+				_, _ = fmt.Fprintf(env.Stderr,
+					"run %s: held, a credential it needs is disabled; %s\n", runID, credentialDisabledAction(run))
+			}
 		}
 		// A status outside the twelve-value enum means the server is newer than this
 		// binary. Surface it once and keep waiting (it can never be a target — `--until`
