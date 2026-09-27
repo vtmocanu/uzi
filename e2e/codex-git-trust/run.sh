@@ -140,12 +140,14 @@ case "$action" in
     # script's process group (without it, timeout calls setpgid and a group signal never
     # reaches `docker run`, the CLI), so a process-group signal (Ctrl-C) reaches docker run
     # directly and it returns promptly. On expiry --foreground kills only docker run itself,
-    # which is the whole command here.
+    # which is the whole command here. The default CODEX_GIT_TRUST_TIMEOUT (420s) covers a
+    # normal full run (~105s) plus two stalled finalize-import cases (~97s each, fixture.ts
+    # CASE_BOUND_MS), so a stall ends in the fixture's named FAIL lines, not this timeout.
     trap on_exit EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     set +e
-    timeout --foreground --kill-after=10s "${CODEX_GIT_TRUST_TIMEOUT:-180}" docker run --rm --network none \
+    timeout --foreground --kill-after=10s "${CODEX_GIT_TRUST_TIMEOUT:-420}" docker run --rm --network none \
       --cap-drop ALL \
       --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
       --security-opt no-new-privileges --tmpfs /data \

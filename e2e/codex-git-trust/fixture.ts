@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { writeSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -76,10 +77,21 @@ function dubiousLine(text: string): string {
  * action runs, so the refusal is not reachable through the public API (see the body).
  */
 /** How long one finalize-import boundary may take before the case records a FAIL and the part
- *  moves on. Well past the 60s boundary deadline: a boundary that outlives it is itself the
- *  defect (a stalled import the deadline did not free), and must read as a named FAIL — never
- *  as a fixture hang that only the outer `timeout` ends. */
-const CASE_BOUND_MS = 120_000;
+ *  moves on: the 60s boundary deadline plus 15s. A boundary that outlives it is itself the
+ *  defect (a stalled import the deadline did not free), and must read as a named FAIL, never
+ *  as a fixture hang that only the outer `timeout` ends.
+ *
+ *  Budget against run.sh's default `CODEX_GIT_TRUST_TIMEOUT` of 420s: a stalled case costs at
+ *  most CASE_BOUND_MS (75s) + proveReaped's 2s poll + proveClean's PROVE_CLEAN_BOUND_MS (20s)
+ *  = ~97s; a normal full run takes ~105s. Two stalled cases (~194s) plus the normal run
+ *  (~105s) is ~300s, which leaves ~120s for the GUARD INTACT bounds (45s + 25s) and slack, so
+ *  even then every case ends in a named FAIL line and a RESULT line before the outer timeout.
+ *  Raise CODEX_GIT_TRUST_TIMEOUT with any of these bounds. */
+const CASE_BOUND_MS = 75_000;
+/** proveClean's bound on its `worker_pat` boundary action (a plain `rev-parse` of the bare). */
+const PROVE_CLEAN_BOUND_MS = 20_000;
+/** The GUARD INTACT observation's bound on its boundary (deadline 30s plus 15s). */
+const GUARD_BOUND_MS = 45_000;
 
 /** Races `p` against a timer; on expiry rejects naming `what`. The timer is cleared on settle
  *  and deliberately not unref()'d (it is what keeps the event loop alive while waiting). */
@@ -145,7 +157,7 @@ async function runFinalizeImportPart(
         const out = await drain(proc.stdout as Readable);
         const term = await proc.completed;
         return { code: term.code, stdout: out.toString("utf8").trim() };
-      }), 45_000, `${tag}: the worker_pat boundary action`);
+      }), PROVE_CLEAN_BOUND_MS, `${tag}: the worker_pat boundary action`);
     } catch (err) {
       result = { code: null, stdout: `threw ${err instanceof Error ? err.message : String(err)}` };
     }
@@ -182,17 +194,32 @@ async function runFinalizeImportPart(
    *  pid fails it instead of counting as gone. git.ts's own teardown (both exit statuses awaited
    *  before `ensureRunnerCloneObjects` settles) is pinned by agent/test/git-import.test.ts, not
    *  here. `importSettled` and `hasLiveCommandRoot()` are also required but are corroborating,
-   *  not independent: both are the machinery under test reporting on itself. */
-  const proveReaped = async (tag: string, registry: Record<string, any>, importSettled: boolean): Promise<void> => {
+   *  not independent: both are the machinery under test reporting on itself.
+   *
+   *  The scan is container-wide, so each case passes the {@link gitPackBaseline} it took right
+   *  before its boundary started: only a pid NOT in that baseline counts against this case. A
+   *  baseline pid still present is listed as "pre-existing from an earlier case" (that earlier
+   *  case's own reaped check already failed on it) without failing this one. An unreadable pid
+   *  still fails the check, baseline or not. */
+  const proveReaped = async (tag: string, registry: Record<string, any>, importSettled: boolean, baseline: ReadonlySet<string>): Promise<void> => {
     const liveCommand = registry.hasLiveCommandRoot() as boolean;
-    const scan = await pollNoGitPackProcesses(2000);
+    const scan = await pollNoGitPackProcesses(2000, baseline);
+    const ours = scan.found.filter((e) => !baseline.has(e.pid));
+    const earlier = scan.found.filter((e) => baseline.has(e.pid));
+    const earlierDetail = earlier.length > 0 ? ` pre-existing from an earlier case: ${earlier.map(formatProc).join("; ")}` : "";
+    if (earlier.length > 0) console.log(`OBSERVATION: ${tag}:${earlierDetail}`);
     check(`${tag}: producer and consumer reaped`,
-      importSettled && !liveCommand && scan.found.length === 0 && scan.unreadable.length === 0,
+      importSettled && !liveCommand && ours.length === 0 && scan.unreadable.length === 0,
       `${calibrated ? "" : "calibration FAILED, so an empty scan proves nothing; "}`
-      + `leftover=${scan.found.map(formatProc).join("; ") || "(none)"} `
+      + `leftover=${ours.map(formatProc).join("; ") || "(none)"} `
       + `unreadable=${scan.unreadable.join("; ") || "(none)"} `
-      + `(corroborating: importSettled=${importSettled} hasLiveCommandRoot=${liveCommand})`);
+      + `(corroborating: importSettled=${importSettled} hasLiveCommandRoot=${liveCommand})${earlierDetail}`);
   };
+  /** The pids of every git pack process alive right now: taken immediately before a case's
+   *  boundary starts, so that case's {@link proveReaped} is not charged with an earlier case's
+   *  leftovers. Unreadable pids are not recorded here; proveReaped's own scan reports them. */
+  const gitPackBaseline = async (): Promise<Set<string>> =>
+    new Set((await scanProcesses(isGitPackProcess)).found.map((e) => e.pid));
 
   // ── (a) SUCCESS ────────────────────────────────────────────────────────────────────────
   await fs.writeFile(path.join(originPath, "finalize-a.txt"), "finalize-a\n");
@@ -214,6 +241,10 @@ async function runFinalizeImportPart(
   // is recorded as this case's align FAIL and the part continues, so every case still emits its
   // named lines: a crash must never stand in for a red, nor skip the cases after it.
   let alignChecked = false;
+  // Set once the bound fires: the action keeps running after a timeout, so a late align result
+  // must not print a PASS under the same name after the FAIL recorded below.
+  let timedOutA = false;
+  const baselineA = await gitPackBaseline();
   try {
     await bounded(safetyA.withBoundary({ boundary: "finalize", deadlineMs: 60_000 }, (permit: any) =>
       gitCache.withBoundaryProcessSpawner(
@@ -226,11 +257,13 @@ async function runFinalizeImportPart(
             settledA = true;
           }
           const aligned = await gitCache.alignBranchWithDefault(clonePath, branch, headTip, newTipA, "merge");
+          if (timedOutA) return;
           alignChecked = true;
           check("FINALIZE-IMPORT (a): alignBranchWithDefault returns \"aligned\"", aligned === "aligned", `result=${aligned}`);
         },
       )), CASE_BOUND_MS, "FINALIZE-IMPORT (a): the import boundary");
   } catch (err) {
+    timedOutA = true;
     if (!alignChecked) {
       check("FINALIZE-IMPORT (a): alignBranchWithDefault returns \"aligned\"", false,
         `threw ${err instanceof Error ? `${err.constructor.name}: ${err.message}` : String(err)}`);
@@ -239,7 +272,7 @@ async function runFinalizeImportPart(
   const postImport = await sandboxRun(`git cat-file -e ${newTipA}`);
   check("FINALIZE-IMPORT (a): sandboxed cat-file -e newTip succeeds after import",
     postImport.code === 0, `code=${postImport.code} stderr=${postImport.stderr.trim()}`);
-  await proveReaped("FINALIZE-IMPORT (a)", registryA, settledA);
+  await proveReaped("FINALIZE-IMPORT (a)", registryA, settledA, baselineA);
   await proveClean("FINALIZE-IMPORT (a)", registryA, safetyA);
 
   // ── (b) PRODUCER failure: a well-formed 40-hex tip absent from the bare ─────────────────
@@ -248,6 +281,7 @@ async function runFinalizeImportPart(
   const safetyB = newSafety(registryB);
   let threwB: unknown;
   let settledB = false;
+  const baselineB = await gitPackBaseline();
   try {
     await bounded(safetyB.withBoundary({ boundary: "finalize", deadlineMs: 60_000 }, (permit: any) =>
       gitCache.withBoundaryProcessSpawner(
@@ -266,7 +300,7 @@ async function runFinalizeImportPart(
   }
   check("FINALIZE-IMPORT (b): a bare-absent tip throws RunnerCloneImportError",
     threwB instanceof gitMod.RunnerCloneImportError, `threw=${threwB instanceof Error ? threwB.constructor.name : typeof threwB}: ${(threwB as Error)?.message}`);
-  await proveReaped("FINALIZE-IMPORT (b)", registryB, settledB);
+  await proveReaped("FINALIZE-IMPORT (b)", registryB, settledB, baselineB);
   await proveClean("FINALIZE-IMPORT (b)", registryB, safetyB);
 
   // ── (c) CONSUMER failure: the clone's objects/pack is unwritable as the runner ──────────
@@ -285,6 +319,7 @@ async function runFinalizeImportPart(
     const registryC = newRegistry();
     const safetyC = newSafety(registryC);
     let settledC = false;
+    const baselineC = await gitPackBaseline();
     try {
       await bounded(safetyC.withBoundary({ boundary: "finalize", deadlineMs: 60_000 }, (permit: any) =>
         gitCache.withBoundaryProcessSpawner(
@@ -303,7 +338,7 @@ async function runFinalizeImportPart(
     }
     check("FINALIZE-IMPORT (c): an unwritable clone objects/pack throws RunnerCloneImportError",
       threwC instanceof gitMod.RunnerCloneImportError, `threw=${threwC instanceof Error ? threwC.constructor.name : typeof threwC}: ${(threwC as Error)?.message}`);
-    await proveReaped("FINALIZE-IMPORT (c)", registryC, settledC);
+    await proveReaped("FINALIZE-IMPORT (c)", registryC, settledC, baselineC);
     await proveClean("FINALIZE-IMPORT (c)", registryC, safetyC);
   } finally {
     const chmodRW = runner.runnerCommand("chmod", ["0755", packDir]);
@@ -352,7 +387,9 @@ async function runFinalizeImportPart(
   let guardThrew: unknown;
   let guardHadLiveCommandRootInAction = false;
   try {
-    await guardSafety.withBoundary({ boundary: "finalize", deadlineMs: 30_000 }, async (permit: any) => {
+    // Bounded like the cases: a stall here is recorded in the observation text (as `threw`),
+    // never a check, and never a fixture hang.
+    await bounded(guardSafety.withBoundary({ boundary: "finalize", deadlineMs: 30_000 }, async (permit: any) => {
       guardHadLiveCommandRootInAction = guardRegistry.hasLiveCommandRoot();
       await guardSafety.spawnBoundaryProcess(permit, {
         identity: "worker_pat",
@@ -360,7 +397,7 @@ async function runFinalizeImportPart(
         cwd: bare,
         env: { PATH: "/usr/bin:/bin" },
       });
-    });
+    }), GUARD_BOUND_MS, "GUARD INTACT boundary");
   } catch (err) {
     guardThrew = err;
   }
@@ -476,10 +513,12 @@ async function pollProcesses(
   }
 }
 
-/** Polls until no git pack process (zombies included) AND no unreadable pid remain, for up to
- *  `budgetMs`, giving a just-killed process time to be reaped before the check fails. */
-async function pollNoGitPackProcesses(budgetMs: number): Promise<ProcScan> {
-  return pollProcesses(isGitPackProcess, budgetMs, (s) => s.found.length === 0 && s.unreadable.length === 0);
+/** Polls until no git pack process (zombies included) outside `baseline` AND no unreadable pid
+ *  remain, for up to `budgetMs`, giving a just-killed process time to be reaped before the check
+ *  fails. */
+async function pollNoGitPackProcesses(budgetMs: number, baseline: ReadonlySet<string>): Promise<ProcScan> {
+  return pollProcesses(isGitPackProcess, budgetMs,
+    (s) => s.found.every((e) => baseline.has(e.pid)) && s.unreadable.length === 0);
 }
 
 /** Drains a packfile stream (checkpointPack's `pack`) to a Buffer for `git index-pack --stdin`. */
@@ -639,19 +678,19 @@ async function runSharedCloneSection(
       const r = await sh(`git ${args}`);
       check(`${tag}: git ${args}`, r.code === 0, `code=${r.code} stderr=${r.stderr.trim()}`);
     }
-    // The cat-file checks below are UNFIXED-discriminating ONLY under real Landlock
-    // confinement: an UNFIXED (`--shared`) clone resolves these shas through its
-    // alternate into the bare, which sits outside the sandbox's granted root
-    // (`rc.path`) and is only rejected when the kernel actually confines reads.
-    // Without Landlock the alternate is freely readable regardless of FIXED/UNFIXED,
-    // so the checks would spuriously pass for UNFIXED too — skip them instead.
+    // The cat-file checks below are a FIXED-side positive check, not the discriminating one:
+    // they show the anchored SHAs resolve inside the sandbox without the bare. On the real
+    // base (UNFIXED) run under Landlock (probe 0) they PASSED too: git's lazy object reads for
+    // `cat-file -e` of these shas did not hit the denial on the bare. The UNFIXED
+    // discriminators are the status/diff/log checks above and the commit below. They run only
+    // under Landlock, matching the denial checks further down.
     if (probe.status === 0) {
       for (const sha of [rc.baseCommit, marker, advancedTip]) {
         const r = await sh(`git cat-file -e ${sha}`);
         check(`${tag}: cat-file -e ${sha.slice(0, 12)}`, r.code === 0, `code=${r.code} stderr=${r.stderr.trim()}`);
       }
     } else {
-      console.log(`SKIP: ${tag}: cat-file -e checks (UNFIXED-discriminating, need Landlock); sandbox --probe returned ${probe.status}`);
+      console.log(`SKIP: ${tag}: cat-file -e checks (need Landlock); sandbox --probe returned ${probe.status}`);
     }
     // Checked BEFORE the write+commit below: that commit stages+commits WHATEVER is in the
     // index (including this cherry-pick), so the WIP file is only OBSERVABLY staged pre-commit.
@@ -855,11 +894,14 @@ async function main(): Promise<void> {
 let mainCompleted = false;
 process.on("exit", () => {
   if (!mainCompleted) {
-    console.log("RESULT: FAIL — the fixture ended before main() completed (a pending promise never settled)");
+    // Synchronous: inside 'exit' an async stdout write to a pipe may never be flushed.
+    writeSync(1, "RESULT: FAIL — the fixture ended before main() completed (a pending promise never settled, or an uncaught error)\n");
     process.exitCode = 1;
   }
 });
 // Exit explicitly once main() settles: a stalled boundary case leaves live handles (a stuck git
 // child) that would otherwise keep node, and the container, running until the outer timeout.
+// The empty write's callback runs after the writes queued before it, so exit waits for stdout
+// (RESULT is the last write) to drain instead of truncating a piped log.
 main().then(() => { mainCompleted = true; }, (error: unknown) => { console.error(error); process.exitCode = 1; mainCompleted = true; })
-  .finally(() => process.exit());
+  .finally(() => { process.stdout.write("", () => process.exit()); });

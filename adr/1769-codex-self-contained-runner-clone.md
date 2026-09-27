@@ -156,7 +156,9 @@ skip (77). The fixture container is removed by a time-bounded
 then verified by exact name. An INT or TERM sent only to the script's PID
 does not interrupt the foreground `timeout … docker run`: bash runs the trap
 after that command returns, so cleanup can wait up to
-`CODEX_GIT_TRUST_TIMEOUT` plus the kill grace. The run uses
+`CODEX_GIT_TRUST_TIMEOUT` (default 420s, sized so two stalled
+finalize-import cases still end in named FAIL lines) plus the kill grace.
+The run uses
 `timeout --foreground`, which keeps `docker run` in the script's process
 group, so a process-group signal (Ctrl-C in a terminal) reaches it directly
 and it returns promptly. A removal that cannot be verified turns a pass
