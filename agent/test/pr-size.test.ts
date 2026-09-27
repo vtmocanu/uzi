@@ -685,32 +685,39 @@ describe("computeSizeLine end to end on a real bare clone (PRD #1798 M1)", () =>
 
 describe("mrDescription carries the size line (PRD #1798 M1)", () => {
   const SIZE = `**Size:** code +1 ${MINUS}0 · 1 file`;
-  it("issue arm: before the --- footer; absent ⇒ byte-identical to today", () => {
+  // PRD #1798 M6: the size line lives in the size-only description region, which precedes the
+  // completion block; without a size line the body is the completion block alone.
+  const REGION = `<!-- uzi:description:start v1 -->\n${SIZE}\n<!-- uzi:description:end -->`;
+  it("issue arm: a size-only region before the completion block; absent ⇒ no region", () => {
     const claim = makeClaim({ issue_iid: 1, issue_title: "Do the thing" });
     const without = mrDescription(claim, "agent/issue-1");
     const withSize = mrDescription(claim, "agent/issue-1", undefined, undefined, undefined, undefined, undefined, undefined, true, undefined, false, SIZE);
     assert.strictEqual(mrDescription(claim, "agent/issue-1", undefined, undefined, undefined, undefined, undefined, undefined, true, undefined, false, ""), without);
-    assert.strictEqual(withSize, without.replace("\n\n---\n", `\n\n${SIZE}\n\n---\n`));
+    assert.strictEqual(withSize, `${REGION}\n\n${without}`);
+    assert.ok(without.startsWith("<!-- uzi:completion:start v1 -->\n"), without);
   });
-  it("per-kind arm: appended after the body", () => {
+  it("per-kind arm: the same size-only region before the completion block", () => {
     const claim = makeClaim({ kind: "prompt", issue_iid: null, issue_title: "Prompt run" } as Parameters<typeof makeClaim>[0]);
     const without = mrDescription(claim, "uzi/prompt/x");
     const withSize = mrDescription(claim, "uzi/prompt/x", undefined, undefined, undefined, undefined, undefined, undefined, true, undefined, false, SIZE);
-    assert.strictEqual(withSize, `${without}\n\n${SIZE}`);
+    assert.strictEqual(withSize, `${REGION}\n\n${without}`);
   });
 });
 
 describe("RunRunner puts the size line in the opened MR body (PRD #1798 M1)", () => {
   installHarness();
-  it("the created MR's description carries a **Size:** line before the footer", async () => {
+  it("the created MR's description opens with a size-only region carrying the **Size:** line", async () => {
     const { gitlab, calls } = fakeGitlab();
     const claim = gitlabClaim(7);
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
     assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
     const body = JSON.parse(calls.find((c) => c.method === "POST")!.body ?? "{}") as { description: string };
     // StubExecutor commits one markdown file; the line is computed from the landed tracking tip
-    // against the merge-base with main, and sits before the `---` footer.
-    assert.match(body.description, /\n\n\*\*Size:\*\* docs \+\d+ −0 · 1 file\n\n---\n/);
+    // against the merge-base with main, and sits in the region before the completion block.
+    assert.match(
+      body.description,
+      /^<!-- uzi:description:start v1 -->\n\*\*Size:\*\* docs \+\d+ −0 · 1 file\n<!-- uzi:description:end -->\n\n<!-- uzi:completion:start v1 -->\n/,
+    );
   });
 });
 
@@ -736,8 +743,9 @@ describe("RunRunner keeps the size line in the verified-head reconcile (PRD #179
     assert.deepStrictEqual(calls.map((c) => c.method), ["POST", "GET", "PUT", "GET"]);
     const post = JSON.parse(calls.find((c) => c.method === "POST")!.body ?? "{}") as { description: string };
     const put = JSON.parse(calls.find((c) => c.method === "PUT")!.body ?? "{}") as { description: string };
-    assert.ok(post.description.includes(`\n\n${SIZE}\n\n---\n`), post.description);
+    const region = `<!-- uzi:description:start v1 -->\n${SIZE}\n<!-- uzi:description:end -->\n\n`;
+    assert.ok(post.description.startsWith(region), post.description);
     assert.match(put.description, /Closes #1798/, "the PUT is the verified-head reconcile");
-    assert.ok(put.description.includes(`\n\n${SIZE}\n\n---\n`), `the reconcile body lost the size line:\n${put.description}`);
+    assert.ok(put.description.startsWith(region), `the reconcile body lost the size line:\n${put.description}`);
   });
 });

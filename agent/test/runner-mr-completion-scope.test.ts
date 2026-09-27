@@ -108,15 +108,19 @@ describe("mrDescription — owner ACCEPT (PRD #1227 M3)", () => {
   });
 });
 
-describe("mrDescription — no completion_scope is byte-identical to today", () => {
-  it("renders the exact legacy issue body (Closes present when renderCloses is true)", () => {
+describe("mrDescription — no completion_scope renders the plain completion block", () => {
+  it("renders the exact issue completion block (Closes present when renderCloses is true)", () => {
+    // PRD #1798 M6: the body is the marked completion block, ending in the maintainer-approved
+    // footer (2026-09-27), byte-pinned.
     const expected = [
+      "<!-- uzi:completion:start v1 -->",
       "Related to #1.",
       "",
       "Closes #1",
       "",
       "---",
-      "Opened automatically by the uzi agent from branch `agent/issue-1`. Please review and merge manually — the agent never merges.",
+      "Opened by uzi from `agent/issue-1`. A human reviews and merges; uzi never merges.",
+      "<!-- uzi:completion:end -->",
     ].join("\n");
     assert.strictEqual(render(undefined, true), expected);
     // An empty completion_scope (both arrays absent) must render identically to no completion_scope.

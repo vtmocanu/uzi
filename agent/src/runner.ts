@@ -111,6 +111,7 @@ import { detectToolchain, type ToolchainDetection } from "./toolchain-detect.js"
 import { isCIConfigPlan } from "./prompt.js";
 import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
 import { computeSizeLine, SIZE_UNAVAILABLE } from "./pr-size.js";
+import { renderBody, renderCompletionBlock, renderRegion } from "./pr-description.js";
 import type { SummaryRunner } from "./summary-runner.js";
 import { REASON_PROVISION_FAILED } from "./provision-run.js";
 import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
@@ -5026,7 +5027,8 @@ export class RunRunner {
       "> ⚠️ **Completion unverified.** uzi could not confirm this merge request's head matches the permitted completion head, so the run was held for owner review. This merge request does NOT close its issue and must not be merged as a completion until re-verified.";
     const reconcileMrDescription = async (withCloses: boolean, banner?: string): Promise<boolean> => {
       try {
-        const base = mrDescription(
+        // PRD #1798: the banner renders INSIDE the completion block (mrDescription opts.banner).
+        const desc = mrDescription(
           claim,
           result.branch,
           result.agentSelection,
@@ -5039,8 +5041,8 @@ export class RunRunner {
           claim.config?.completion_scope,
           bridged,
           sizeLine ?? undefined,
+          { banner },
         );
-        const desc = banner ? `${banner}\n\n${base}` : base;
         await withForgeRetry(
           () =>
             forge.updateMergeRequestDescription(
@@ -11112,11 +11114,24 @@ export function mrTitle(
   return `${prefix}Work on issue #${claim.issue_iid}`;
 }
 
-/** MR body: links + closes the issue (issue run) or links the failing pipeline
- *  (ci_fix, PRD #6), states the primary directive (humans merge), and — when the
- *  run used the repo's own agents (PRD #37 Decision 3b) — a marker so the human
- *  reviewer knows the internal review loop was performed by repo-authored agents,
- *  not by uzi's built-in reviewer. */
+/** PRD #1798: the options mrDescription gained after its positional parameters. All optional, so
+ *  every existing caller renders as before. `headSha` / `targetBranch` feed the region's provenance
+ *  line (D12); `banner` is the completion-unverified banner (PRD #1225), rendered INSIDE the
+ *  completion block; `staleness` is the D12 staleness line's two SHAs. */
+export interface MrDescriptionOptions {
+  headSha?: string;
+  targetBranch?: string;
+  banner?: string;
+  staleness?: { describedSha: string; headSha: string };
+}
+
+/** MR body (PRD #1798 D10): the size-line-only description region (when a size line is given; no
+ *  model text is published from here) followed by the completion block, which carries every
+ *  deterministic line this function has always owned: `Related to #N.` and `Closes #N` (issue arm),
+ *  the partial and accepted warnings (PRD #1227), the gates-unverified section, the history-bridge
+ *  sentence (PRD #1416), the completion-unverified banner (PRD #1225), the agents line (PRD #37
+ *  Decision 3b), the kind's one-liner (D14) and the footer. A thin wrapper over
+ *  pr-description.ts renderRegion / renderCompletionBlock. */
 export function mrDescription(
   claim: ClaimResponse,
   branch: string,
@@ -11132,155 +11147,54 @@ export function mrDescription(
   // "no `Closes` on an unverified head" invariant structural for the fixed text this function writes.
   // #1801: that only holds if no OTHER fixed line is a closing directive on some forge; GitLab's default
   // pattern also closes on `Implement(s|ed|ing)`, so the reference line reads `Related to #N.`.
-  // Interpolated owner text (deferred titles/reasons, accepted criteria) is not scanned here (PRD #1798).
+  // PRD #1798 D7: interpolated owner text (deferred titles/reasons, accepted criteria) is escaped
+  // with its closing keywords and mentions broken (pr-description.ts escapeInline).
   // Defaults true so the sole issue-arm caller keeps today's behavior.
   renderCloses = true,
   // PRD #1227 M2/M3: the run's owner completion decisions. `deferred` (non-empty ⇒ owner PARTIAL,
   // scope_reduced) drives a partial-delivery body that lists each deferred milestone + reason and
   // NEVER closes the issue — it takes precedence over the #634 scopeCapped count body. `accepted`
   // (non-empty) appends a warning block naming each owner-accepted unmet criterion (id + text +
-  // reason), present in ANY branch — including on a closing accept-only PR. Absent/empty ⇒ no partial,
-  // no accept, so the body is byte-identical to today.
+  // reason), present in ANY branch — including on a closing accept-only PR.
   completionScope?: ClaimConfig["completion_scope"],
   // PRD #1416 M3 (Part D): the pushed history contains an ancestry bridge (derived from history via
-  // rangeContainsBridge, NOT a flight-local flag). When true, ONE GENERIC sentence is appended to the
-  // body of EVERY kind's MR — never "the worker bridged it", because the agent's own `git merge -s
-  // ours <P>` bridge is equally possible. Defaults false so a non-bridged MR is byte-identical to today.
+  // rangeContainsBridge, NOT a flight-local flag). When true, ONE GENERIC sentence is rendered in the
+  // completion block of EVERY kind's MR — never "the worker bridged it", because the agent's own
+  // `git merge -s ours <P>` bridge is equally possible.
   bridged = false,
-  // PRD #1798 M1 (D3): the deterministic size line (`**Size:** ...`, or `**Size:** unavailable`),
-  // appended to EVERY kind's body: before the `---` footer in the issue arm, after the body (like the
-  // bridge note) in a per-kind arm. Absent/empty (no diff, or a caller that does not pass it) ⇒ the
-  // body is byte-identical to today.
+  // PRD #1798 M1 (D3): the deterministic size line (`**Size:** ...`, or `**Size:** unavailable`). When
+  // given, the body opens with a description region carrying it (plus the provenance line when
+  // `opts` names the head and target). Absent/empty ⇒ no region, only the completion block.
   sizeLine?: string,
+  opts?: MrDescriptionOptions,
 ): string {
-  const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
-  // One generic sentence, rendered into whichever body arm runs below (a per-kind body or the issue
-  // body) so the note is path- AND kind-independent. Empty when not bridged (body unchanged). #1416
-  // FIX 6: the issue arm renders it WITHIN the body (before the `---` footer); the bridgeNote form
-  // (with its leading blank line) is kept for the per-kind arm, which appends it to a body that
-  // already carries its own footer.
-  const bridgeSentence = bridged
-    ? "This branch contains a history bridge: a published commit was restored as an ancestor so the branch fast-forwards without a force-push, and `git log --first-parent` still reads as the intended history."
-    : "";
-  const bridgeNote = bridgeSentence ? `\n\n${bridgeSentence}` : "";
-  const repoMarker =
-    agentSelection?.source === "repo"
-      ? [
-          "",
-          "> ⚠️ This run used agent definitions from the repository's own " +
-            `\`.claude/agents/\` (${agentSelection.agents.join(", ") || "none"}). The internal ` +
-            "review was performed by those repo-authored agents, not by uzi's built-in " +
-            "reviewer — review this change accordingly.",
-        ]
-      : [];
-  // PRD #983 M4b: the per-kind MR bodies (self_improve's tracking-issue reference,
-  // ci_fix's pipeline body, prompt/task/mr_rework's issue-less bodies) live in
-  // RUN_KIND_PROFILES.mrBody, each returning its exact array-`.join("\n")` string from
-  // one explicit context bag. A row's undefined — ci_fix with no pipeline, and the
-  // issue/chat/judge kinds that carry no mrBody — falls through to the issue body below
-  // (the scopeCapped / gates / Closes arm), which stays here as the richest arm.
-  const kindBody = RUN_KIND_PROFILES[resolveRunKind(claim.kind)].mrBody?.(claim, {
+  // PRD #983 M4b / PRD #1798 D14: a kind's one-line completion sentence lives in
+  // RUN_KIND_PROFILES.completionLine. A row's undefined — ci_fix with no pipeline, and the
+  // issue/chat/judge kinds that carry none — takes the issue arm (Related / Closes / partial /
+  // accepted / gates) inside renderCompletionBlock.
+  const kindLine = RUN_KIND_PROFILES[resolveRunKind(claim.kind)].completionLine?.(claim, {
     branch,
-    baseBranch: claim.base_branch?.trim(),
-    repoMarker,
-    footer,
-    selfImproveSection,
-    promptGuardSection,
+    baseBranch: claim.base_branch?.trim() || undefined,
   });
-  const sizeNote = sizeLine ? `\n\n${sizeLine}` : "";
-  if (kindBody !== undefined) return kindBody + bridgeNote + sizeNote;
-  // PRD #1227 M2/M3: the owner completion decisions. `deferred` non-empty ⇒ owner PARTIAL
-  // (scope_reduced): the issue is NOT fully delivered. `accepted` non-empty ⇒ owner-waived unmet
-  // criteria to name in a warning block. Both absent/empty on a normal run.
-  const deferred = completionScope?.deferred ?? [];
-  const accepted = completionScope?.accepted ?? [];
-  const isOwnerPartial = deferred.length > 0;
-  const hasAccepted = accepted.length > 0;
-  // An owner partial NEVER closes the issue, regardless of the caller's renderCloses — this makes
-  // "a partial never closes" structural in the renderer too, not only in the create-then-verify flow.
-  const effectiveCloses = renderCloses && !isOwnerPartial;
-  // Body selection, in precedence order:
-  //   1. PRD #1227 owner partial (deferred) — partial-delivery body listing each deferred milestone +
-  //      reason; NO Closes. Takes precedence over the #634 scopeCapped count body.
-  //   2. PRD #634 operator scope (scopeCapped) — the existing count-only partial body, UNCHANGED.
-  //   3. normal — `Related to #N.` with the Closes pair gated on effectiveCloses.
-  const body = isOwnerPartial
-    ? [
-        `Implements part of #${claim.issue_iid} (partial delivery — owner scope decision; this MR does NOT close the issue).`,
-        "",
-        "> ⚠️ **Partial delivery — owner scope decision (PRD #1227).** The owner reduced this run's",
-        "> completion scope. The milestone(s) below were DEFERRED BY THE OWNER and are NOT delivered by",
-        "> this merge request, so it does not close the issue:",
-        ...deferred.map(
-          (d) => `> - \`${d.milestone_id}\` — ${d.title}: ${d.reason}`,
-        ),
-        ...repoMarker,
-      ]
-    : scopeCapped
-      ? // PRD #634 M3: a partial delivery from an operator scope directive does NOT close the
-        // issue — it delivered only the approved slice of milestones — so the closing line is
-        // replaced with a partial-delivery statement and a scope-note blockquote is inserted.
-        [
-          `Implements part of #${claim.issue_iid} (partial delivery — see the scope note below; this MR does NOT close the issue).`,
-          "",
-          "> ⚠️ **Partial delivery — operator scope directive.** The operator narrowed this run's",
-          `> scope mid-flight. ${scopeCapped.completedCount}${typeof scopeCapped.total === "number" ? ` of ${scopeCapped.total}` : ""} approved milestone(s) were completed and`,
-          "> are included here; any remaining milestones were deferred to a follow-up run. Review this",
-          "> as a partial implementation — it does not complete the issue.",
-          ...repoMarker,
-        ]
-      : [
-          // #1801: NOT `Implements issue #N.` — GitLab's default closing pattern treats Implement(s)
-          // as a closing keyword, which made this "non-closing" body close the issue on merge.
-          `Related to #${claim.issue_iid}.`,
-          // PRD #1226 M4 (D5): the closing line is CONDITIONAL. When effectiveCloses is true (a legacy
-          // run at creation, or an interlocked run's verified-head reconcile — PRD #1225) this spreads
-          // to exactly the prior `"", "Closes #N"` pair, so the legacy body is byte-for-byte unchanged.
-          ...(effectiveCloses ? ["", `Closes #${claim.issue_iid}`] : []),
-          ...repoMarker,
-        ];
-  // PRD #1227 M3 (D3): WHENEVER the owner accepted unmet criteria, append a warning block naming each
-  // by id + criterion text + owner reason. Present in ANY branch above — including on a closing
-  // accept-only PR, so a closing PR carries the reason the unmet criteria were waived.
-  if (hasAccepted) {
-    body.push(
-      "",
-      "> ⚠️ **Accepted unmet criteria — owner decision (PRD #1227).** The owner accepted the following",
-      "> unmet criteria as-is with the reason given; they are NOT met by this merge request:",
-      ...accepted.map((a) => `> - \`${a.id}\` — ${a.text}: ${a.reason}`),
-    );
-  }
-  const gatesSection = gatesUnverifiedMrSection(gatesUnverified, gatesDiscoveryTruncated);
-  if (gatesSection) body.push("", gatesSection);
-  // #1416 FIX 6: render the bridge sentence WITHIN the body, before the `---` footer.
-  if (bridgeSentence) body.push("", bridgeSentence);
-  // PRD #1798 M1: the size line, after gates/bridge and before the `---` footer.
-  if (sizeLine) body.push("", sizeLine);
-  body.push("", "---", footer);
-  return body.join("\n");
-}
-
-/** Issue #293 M2: an "unverified gates" note for the MR body, or "" when every
- *  component's deps installed AND discovery saw the whole tree. Dir names arrive already
- *  clamped (safeDirLabel). The truncation caveat (review F1) fires even when `dirs` is
- *  empty: a capped discovery means components it never reached could be unverified too,
- *  which named dirs alone cannot say. */
-function gatesUnverifiedMrSection(dirs?: string[], discoveryTruncated?: boolean): string {
-  const named = dirs ?? [];
-  if (named.length === 0 && !discoveryTruncated) return "";
-  const parts: string[] = [];
-  if (named.length > 0) {
-    const list = named.map((d) => `\`${d}\``).join(", ");
-    parts.push(
-      `JS dependencies did not install in: ${list}. Gates that need them (e.g. \`vitest\`, \`knip\`) could not run on this change, so treat those gates as unverified, not passing.`,
-    );
-  }
-  if (discoveryTruncated) {
-    parts.push(
-      "Dependency discovery stopped at its scan cap, so components beyond it were never checked and their gates may also be unverified.",
-    );
-  }
-  return `> ⚠️ **Quality gates unverified.** ${parts.join(" ")}`;
+  const completion = renderCompletionBlock({
+    issueIid: claim.issue_iid,
+    branch,
+    kindLine,
+    kindSections: [selfImproveSection, promptGuardSection],
+    closes: renderCloses,
+    completionScope,
+    scopeCapped,
+    repoAgents: agentSelection?.source === "repo",
+    gatesUnverified,
+    gatesDiscoveryTruncated,
+    bridged,
+    banner: opts?.banner,
+    staleness: opts?.staleness,
+  });
+  const region = sizeLine
+    ? renderRegion({ sizeLine, headSha: opts?.headSha, targetBranch: opts?.targetBranch }).text
+    : undefined;
+  return renderBody(region, completion);
 }
 
 /** Feed text for an autopilot run's resolved default selection (PRD #37 Decision

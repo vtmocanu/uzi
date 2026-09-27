@@ -504,6 +504,38 @@ describe("buildDeliveryContext (PRD #1798 M5, D6)", () => {
     assert.equal(ctx.truncated.diff, true);
   });
 
+  it("an unterminated CSI made of INTERMEDIATE bytes is invisible too, so the head before it is dropped", async () => {
+    // Carried M5 gap: ESC [ followed only by intermediate bytes (0x20-0x2F, here spaces) is still an
+    // unfinished CSI the redactor would skip once complete. UNTERMINATED_CSI_RE must cover the
+    // `[ -/]*` run: without it the 5000 spaces count as visible, spend the margin, and the head survives.
+    const filler = "x".repeat(8 * 1024);
+    const text = filler + "glpat-" + "\x1b[" + " ".repeat(5000);
+    const { git } = fakeGit([{ path: "src/csi.ts", added: 1, deleted: 0 }], {
+      onRead: (args) => (args[3] === "diff" ? { text, truncated: true } : undefined),
+    });
+    const redact = makeTextRedactor([SECRET]);
+    // The redactor matches the secret across the COMPLETE sequence (intermediates, then a final byte).
+    assert.equal(redact("glpat-" + "\x1b[" + " ".repeat(5000) + "m" + SECRET.slice(6)).includes("glpat-"), false);
+    const ctx = await buildDeliveryContext(input(git, { redact }));
+    assert.equal(ctx.diff.includes("glpat-"), false, "the secret's head before the cut CSI is dropped");
+    assert.equal(ctx.diff.includes("\x1b"), false, "the unterminated CSI goes too");
+    assert.equal(ctx.truncated.diff, true);
+  });
+
+  it("a cut read with an EARLIER complete CSI keeps the text after it: only a trailing CSI prefix is dropped", async () => {
+    // Carried M5 gap: UNTERMINATED_CSI_RE is anchored at the end (`$`). Unanchored, it would match the
+    // start of the complete "\x1b[31m" early in the read and cut everything after it away.
+    const text = "x".repeat(2048) + "\x1b[31m" + "KEEP-THIS" + "y".repeat(8 * 1024) + "z".repeat(4000);
+    const { git } = fakeGit([{ path: "src/color.ts", added: 1, deleted: 0 }], {
+      onRead: (args) => (args[3] === "diff" ? { text, truncated: true } : undefined),
+    });
+    const ctx = await buildDeliveryContext(input(git));
+    assert.ok(ctx.diff.includes("\x1b[31mKEEP-THIS"), "the content after the earlier complete CSI survives");
+    assert.ok(ctx.diff.includes("y".repeat(8 * 1024 - 200)), "only the margin at the cut is dropped");
+    assert.equal(ctx.diff.includes("z"), false, "the margin (4 KiB of the tail) is dropped");
+    assert.equal(ctx.truncated.diff, true);
+  });
+
   it("a margin cut that lands exactly at the start of a visible run also drops the invisible run before it", async () => {
     // Visible text: filler, then exactly READ_MARGIN_BYTES of "y" after one zero-width space. The
     // margin is spent at the first "y", the start of its visible run, so the cut moves back to the end
