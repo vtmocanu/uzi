@@ -669,9 +669,10 @@ const RETENTION_RM_CLOSE_WAIT_MS = 10_000;
  * issue #1783 — the runner-uid delete timed out and its rm could NOT be shown gone: the child's
  * 'close' did not arrive within {@link RETENTION_RM_CLOSE_WAIT_MS} after the group kill, whether
  * the kill reported success or failure (a failed kill may be ESRCH from a group already gone, so
- * it waits for 'close' too). The GitCache remembers the path until that 'close' arrives. busybox rm walks by PATH, so a surviving rm deletes whatever is later created at
- * that path (a fresh clone reseeded there). A caller must neither quarantine nor reseed at, nor
- * keep deleting beside, a path such an rm may still be walking.
+ * it waits for 'close' too). The GitCache remembers the path until that 'close' arrives. busybox
+ * rm walks by PATH, so a surviving rm deletes whatever is later created at that path (a fresh
+ * clone reseeded there). A caller must neither quarantine nor reseed at, nor keep deleting beside,
+ * a path such an rm may still be walking.
  */
 class RunnerDeleteUnsettledError extends Error {
   constructor(detail: string) {
@@ -930,7 +931,9 @@ export class GitCache {
   /** issue #1783 (N1): the targets (resolved) of every runner-uid delete that settled as a
    *  {@link RunnerDeleteUnsettledError}, each counted until its child's 'close' arrives. In-process
    *  only: the rm walks by path, so a canonical free or reseed at such a path is refused
-   *  ({@link assertNoUnsettledDelete}) for as long as that rm may still be running. */
+   *  ({@link assertNoUnsettledDelete}), and the retention sweep keeps such a path or anything
+   *  under it ({@link deleteRetainedArtifact}), for as long as that rm may still be running. An
+   *  entry is logged (warn) when it is recorded and (info) when its 'close' removes it. */
   private readonly unsettledDeletes = new Map<string, number>();
   /** issue #1597 M2: memoised `--remerge-diff` support probe. */
   private remergeProbe: Promise<boolean> | undefined;
@@ -1335,7 +1338,6 @@ export class GitCache {
       }
       // issue #1783 M3: the journal cases above ran first and threw with the path untouched.
       await this.freeCanonicalClonePath(clonePath, key, reseed);
-      this.assertNoUnsettledDelete(clonePath);
       return this.seedRunnerClone(barePath, branch, clonePath, runId, resume, expectedCheckpointTip);
     });
   }
@@ -1783,7 +1785,9 @@ export class GitCache {
    * Single-uid (#58): there is no second uid and so no boundary to route through (the worker IS the
    * agent's uid there, the #58 accepted posture): the delete stays the in-process fs.rm.
    * A timed-out rm that cannot be shown gone (no 'close' within the bounded wait after the group
-   * kill, whether or not the kill succeeded) is rethrown, which stops the whole sweep.
+   * kill, whether or not the kill succeeded) is rethrown, which stops the whole sweep. A target
+   * such an rm (of this sweep or an earlier one) may still be walking, the recorded path itself or
+   * anything under it, is refused (kept, logged) before any delete starts.
    * Returns true when the target is gone.
    */
   private async deleteRetainedArtifact(
@@ -1799,6 +1803,13 @@ export class GitCache {
     const root = path.resolve(this.runnerRoot);
     if (path.dirname(parent) !== root || path.dirname(target) !== parent) return refuse("not a direct child of a runner repo dir");
     if (!isExpected(path.basename(target))) return refuse("not the expected retained artifact of this key");
+    // An earlier runner-uid rm of this path (or of a directory above it) may still be walking it:
+    // a second rm here would run beside it. Keep the target; a later sweep retries it after 'close'.
+    for (const unsettled of this.unsettledDeletes.keys()) {
+      if (isWithinPath(target, unsettled)) {
+        return refuse(`an earlier runner-uid delete of this path (${unsettled}) may still be running`);
+      }
+    }
     const lstat = this.retentionDeleteSeam?.lstat ?? ((p: string) => fs.lstat(p));
     try {
       const pst = await lstat(parent);
@@ -1872,11 +1883,23 @@ export class GitCache {
           // N1: remember the path until this child's 'close' (the listener below stays attached
           // after settle), so no later claim frees or reseeds where this rm may still walk.
           const key = path.resolve(target);
-          this.unsettledDeletes.set(key, (this.unsettledDeletes.get(key) ?? 0) + 1);
-          child.once("close", () => {
+          const pending = (this.unsettledDeletes.get(key) ?? 0) + 1;
+          this.unsettledDeletes.set(key, pending);
+          this.log.warn("runner-uid delete recorded as unsettled: it may still be running; no free, reseed or retention delete of this path until it exits", {
+            path: key,
+            pid: child.pid,
+            pending,
+          });
+          child.once("close", (code: number | null, signal: NodeJS.Signals | null) => {
             const n = (this.unsettledDeletes.get(key) ?? 1) - 1;
             if (n > 0) this.unsettledDeletes.set(key, n);
             else this.unsettledDeletes.delete(key);
+            this.log.info("runner-uid delete exited and left the unsettled record", {
+              path: key,
+              pid: child.pid,
+              exit: code ?? signal ?? "abnormal",
+              pending: n,
+            });
           });
         }
         if (err) reject(err);

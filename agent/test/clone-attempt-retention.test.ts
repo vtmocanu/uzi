@@ -539,6 +539,54 @@ describe("issue #1783 final: a timed-out retention rm is waited out, and an unse
     assert.equal(fs.existsSync(planted[0]!.dir), true, "and its attempt with it (skills-first)");
     assert.equal(fs.existsSync(residue[0]!), false, "the sweep went on once the rm was gone");
   });
+
+  it("NB-2: a later sweep never starts a second rm on a path an unsettled rm may still walk; it keeps and logs it", async () => {
+    const events: string[] = [];
+    const rm = fakeRm(events, () => false);
+    rm.closeWaitMs = 50;
+    withRm(rm);
+    const { s, planted, residue } = await sweepFixture();
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
+    const skillsSpawn = `spawn ${path.basename(planted[0]!.skills)}`;
+    assert.deepEqual(events, [skillsSpawn, "kill"], "the first sweep stopped on the unsettled rm");
+    // A second seed of the same key: its sweep reaches the same skills sibling first.
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-newer", false, undefined, seedOpts());
+    assert.equal(events.filter((e) => e === skillsSpawn).length, 1, "no second rm on the path the first rm may still walk");
+    assert.equal(fs.existsSync(planted[0]!.skills), true, "the unsettled target is kept");
+    assert.equal(fs.existsSync(planted[0]!.dir), true, "and its attempt with it (skills-first)");
+    const refusal = lines.find(
+      (l) => (l as { msg?: string }).msg?.includes("refusing to delete") && (l as { path?: string }).path === planted[0]!.skills,
+    ) as { reason?: string } | undefined;
+    assert.match(String(refusal?.reason), /runner-uid delete of this path .* may still be running/);
+    assert.equal(fs.existsSync(residue[0]!), false, "the sweep went on past the kept target");
+  });
+
+  it("NB-3: the worker log records a path entering the unsettled record and leaving it on 'close'", async () => {
+    const events: string[] = [];
+    let late: ChildProcess | undefined;
+    const rm = fakeRm(events, (child) => {
+      late = child;
+      return true;
+    });
+    rm.closeWaitMs = 50;
+    withRm(rm);
+    const { s, planted } = await sweepFixture();
+    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
+    const entered = lines.find((l) => (l as { msg?: string }).msg?.includes("recorded as unsettled")) as
+      | { level?: string; path?: string; pending?: number }
+      | undefined;
+    assert.equal(entered?.level, "warn");
+    assert.equal(entered?.path, path.resolve(planted[0]!.skills));
+    assert.equal(entered?.pending, 1);
+    assert.equal(lines.some((l) => (l as { msg?: string }).msg?.includes("left the unsettled record")), false, "nothing left yet");
+    late!.emit("close", null, "SIGKILL");
+    const left = lines.find((l) => (l as { msg?: string }).msg?.includes("left the unsettled record")) as
+      | { level?: string; path?: string; pending?: number }
+      | undefined;
+    assert.equal(left?.level, "info");
+    assert.equal(left?.path, path.resolve(planted[0]!.skills));
+    assert.equal(left?.pending, 0);
+  });
 });
 
 describe("issue #1783 final: a directory swapped in for a residue link fails the unlink with EISDIR and is kept", () => {
