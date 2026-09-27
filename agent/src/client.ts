@@ -9,11 +9,14 @@ import {
   type PrDescriptionBindResponse,
   type PrDescriptionLookupRequest,
   type PrDescriptionLookupResponse,
+  type PrDescriptionScopeNote,
+  type PrDescriptionSize,
   type PrDescriptionStageRequest,
   type PrDescriptionStageResponse,
   type PrDescriptionState,
+  type PrDescriptionVerification,
   type PrDescriptionVersionDTO,
-  type SanitizedPrDescriptionFields,
+  type RawPrDescriptionFields,
   type ClaimRequest,
   type PublishResponse,
   type PublishResult,
@@ -230,24 +233,95 @@ function prDescriptionError(err: RequestError, retryAfter: string | null): Reque
   }
 }
 
+// ── Sanitized PR-description fields (PRD #1798 D7) ──────────────────────────────────────────
+// The mint token: a module-private symbol, so only code in THIS file can construct the class
+// below (the constructor refuses any other value at runtime, and its parameter type,
+// `typeof MINT`, is a unique symbol no other module can name or produce).
+const MINT: unique symbol = Symbol("SanitizedPrDescriptionFields.mint");
+
+/**
+ * SANITIZED fields: the api-returned text of a staged version, the only text the renderer may
+ * publish (D7). Instances are created only by WorkerClient's response decoders below (stage /
+ * bind / lookup / ack, and claimRun's pr_description), from JSON that passed the shape check;
+ * each instance and its arrays are frozen. JSON.stringify yields the plain fields; toRaw() gives
+ * a mutable {@link RawPrDescriptionFields} copy for a refresh re-stage.
+ *
+ * Nominal, not structural: the ECMAScript #private field makes the class type assignable only
+ * from a real instance, so raw fields, `{ ...sanitized }` and `{ ...sanitized, summary: raw.summary }`
+ * (or `...raw`) are compile errors in a sanitized slot (test/client-pr-description.test.ts pins
+ * each with @ts-expect-error).
+ *
+ * What the compiler does NOT catch, measured by that test file: `Object.assign({}, sanitized,
+ * raw)` compiles into a sanitized slot, because its declared return type is the intersection
+ * `{} & SanitizedPrDescriptionFields & Raw`, and an intersection is assignable to each member;
+ * and an `any` (an untyped `JSON.parse`, an `as any`) assigned to the slot compiles too. Neither
+ * produces an instance at runtime, and {@link SanitizedPrDescriptionFields.is} (an unforgeable
+ * #private brand check, not `instanceof`) returns false for both. So a renderer caller must take
+ * fields ONLY from a DTO a WorkerClient pr-description call or claimRun returned, never from a
+ * value it assembled, and a renderer that wants a runtime backstop checks `is()` before writing.
+ */
+export class SanitizedPrDescriptionFields {
+  readonly summary: string;
+  readonly changes: readonly string[];
+  readonly scope_notes: readonly Readonly<PrDescriptionScopeNote>[];
+  readonly review_pointers: readonly string[];
+  readonly verification: readonly Readonly<PrDescriptionVerification>[];
+  readonly #sanitized = true;
+
+  constructor(mint: typeof MINT, fields: RawPrDescriptionFields) {
+    if (mint !== MINT) throw new TypeError("SanitizedPrDescriptionFields is created only by the WorkerClient decoders");
+    this.summary = fields.summary;
+    this.changes = Object.freeze([...fields.changes]);
+    this.scope_notes = Object.freeze(fields.scope_notes.map((n) => Object.freeze({ kind: n.kind, text: n.text })));
+    this.review_pointers = Object.freeze([...fields.review_pointers]);
+    this.verification = Object.freeze(
+      fields.verification.map((e) =>
+        Object.freeze({ command: e.command, result: e.result, verified_at_sha: e.verified_at_sha }),
+      ),
+    );
+    Object.freeze(this);
+  }
+
+  /** True only for a real instance (the #private brand check cannot be forged by a prototype). */
+  static is(v: unknown): v is SanitizedPrDescriptionFields {
+    return typeof v === "object" && v !== null && #sanitized in v && v.#sanitized;
+  }
+
+  /** A mutable plain copy, typed RAW: re-staging sends it back through the api's sanitizer. */
+  toRaw(): RawPrDescriptionFields {
+    return {
+      summary: this.summary,
+      changes: [...this.changes],
+      scope_notes: this.scope_notes.map((n) => ({ kind: n.kind, text: n.text })),
+      review_pointers: [...this.review_pointers],
+      verification: this.verification.map((e) => ({
+        command: e.command,
+        result: e.result,
+        verified_at_sha: e.verified_at_sha,
+      })),
+    };
+  }
+}
+
 // Response decoders: the api promises these shapes (non-nil slices in every response); a body that
 // does not match is refused rather than cast, because the stage response's sanitized fields are the
-// only text the renderer may publish (D7) and a bind/ack state drives the compare-and-swap. These
-// decoders (with decodeClaimPrDescription) are the ONLY producers of SanitizedPrDescriptionFields:
-// isFields' type guard asserts the brand on a body that passed the shape check.
+// only text the renderer may publish (D7) and a bind/ack state drives the compare-and-swap. Each
+// decoder BUILDS a fresh value from the checked body (unknown keys dropped) and mints the fields
+// as a SanitizedPrDescriptionFields instance. None is exported: minting from arbitrary input stays
+// inside this module, on HTTP response bodies only.
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 const isInt = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v);
-const isStrOrNull = (v: unknown): boolean => v === null || typeof v === "string";
-const isStrArray = (v: unknown): boolean => Array.isArray(v) && v.every((x) => typeof x === "string");
+const isStrOrNull = (v: unknown): v is string | null => v === null || typeof v === "string";
+const isStrArray = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === "string");
 
 function isBucket(v: unknown): boolean {
   return isRecord(v) && isInt(v.added) && isInt(v.deleted);
 }
 
-function isSize(v: unknown): boolean {
+function isSize(v: unknown): v is PrDescriptionSize {
   return (
     isRecord(v) &&
     typeof v.unavailable === "boolean" &&
@@ -256,8 +330,8 @@ function isSize(v: unknown): boolean {
   );
 }
 
-function isFields(v: unknown): v is SanitizedPrDescriptionFields {
-  return (
+function decodeFields(v: unknown): SanitizedPrDescriptionFields | undefined {
+  const ok =
     isRecord(v) &&
     typeof v.summary === "string" &&
     isStrArray(v.changes) &&
@@ -276,68 +350,93 @@ function isFields(v: unknown): v is SanitizedPrDescriptionFields {
         typeof e.command === "string" &&
         typeof e.verified_at_sha === "string" &&
         (e.result === "pass" || e.result === "fail"),
-    )
-  );
+    );
+  // The checks above establish RawPrDescriptionFields' shape; the constructor copies only its keys.
+  return ok ? new SanitizedPrDescriptionFields(MINT, v as unknown as RawPrDescriptionFields) : undefined;
 }
 
-function isVersion(v: unknown): v is PrDescriptionVersionDTO {
-  return (
-    isRecord(v) &&
-    typeof v.id === "string" &&
-    typeof v.run_id === "string" &&
-    isInt(v.claim_generation) &&
-    (v.mr_iid === null || isInt(v.mr_iid)) &&
-    isFields(v.fields) &&
-    (v.size === null || isSize(v.size)) &&
-    typeof v.base_sha === "string" &&
-    typeof v.head_sha === "string" &&
-    typeof v.target_branch === "string" &&
-    ["generated", "lead_only", "deterministic_only"].includes(v.source as string) &&
-    isStrOrNull(v.rendered_region_sha256) &&
-    ["pending", "published", "abandoned"].includes(v.state as string) &&
-    typeof v.created_at === "string" &&
-    isStrOrNull(v.published_at)
-  );
+function decodeVersion(v: unknown): PrDescriptionVersionDTO | undefined {
+  if (!isRecord(v)) return undefined;
+  const fields = decodeFields(v.fields);
+  const { source, state } = v;
+  if (
+    fields === undefined ||
+    typeof v.id !== "string" ||
+    typeof v.run_id !== "string" ||
+    !isInt(v.claim_generation) ||
+    !(v.mr_iid === null || isInt(v.mr_iid)) ||
+    !(v.size === null || isSize(v.size)) ||
+    typeof v.base_sha !== "string" ||
+    typeof v.head_sha !== "string" ||
+    typeof v.target_branch !== "string" ||
+    (source !== "generated" && source !== "lead_only" && source !== "deterministic_only") ||
+    !isStrOrNull(v.rendered_region_sha256) ||
+    (state !== "pending" && state !== "published" && state !== "abandoned") ||
+    typeof v.created_at !== "string" ||
+    !isStrOrNull(v.published_at)
+  ) {
+    return undefined;
+  }
+  return {
+    id: v.id,
+    run_id: v.run_id,
+    claim_generation: v.claim_generation,
+    mr_iid: v.mr_iid,
+    fields,
+    size: v.size,
+    base_sha: v.base_sha,
+    head_sha: v.head_sha,
+    target_branch: v.target_branch,
+    source,
+    rendered_region_sha256: v.rendered_region_sha256,
+    state,
+    created_at: v.created_at,
+    published_at: v.published_at,
+  };
 }
 
 // last_outcome accepts ANY string (forward skew: a newer api's new outcome must not drop the whole
 // state; nothing publishes from it). The published version stays strictly checked.
-function isPrState(v: unknown): v is PrDescriptionState {
-  return (
-    isRecord(v) &&
-    isInt(v.mr_iid) &&
-    isInt(v.lock_version) &&
-    isStrOrNull(v.last_outcome) &&
-    (v.published_version === null || isVersion(v.published_version))
-  );
-}
-
-/** Decode the claim's `pr_description` (PRD #1798 D9 step 2) with the same shape check as the
- *  bind / lookup / ack responses. Returns undefined for an absent or malformed value: the claim
- *  then proceeds as if the PR had no record, and nothing here logs the value (untrusted text). */
-export function decodeClaimPrDescription(raw: unknown): PrDescriptionState | undefined {
-  return isPrState(raw) ? raw : undefined;
+function decodePrState(v: unknown): PrDescriptionState | undefined {
+  if (!isRecord(v) || !isInt(v.mr_iid) || !isInt(v.lock_version) || !isStrOrNull(v.last_outcome)) return undefined;
+  let published_version: PrDescriptionVersionDTO | null = null;
+  if (v.published_version !== null) {
+    const pv = decodeVersion(v.published_version);
+    if (pv === undefined) return undefined;
+    published_version = pv;
+  }
+  return { mr_iid: v.mr_iid, lock_version: v.lock_version, last_outcome: v.last_outcome, published_version };
 }
 
 function decodeStage(v: unknown): PrDescriptionStageResponse | undefined {
-  return isRecord(v) && isVersion(v.version) ? { version: v.version } : undefined;
+  const version = isRecord(v) ? decodeVersion(v.version) : undefined;
+  return version === undefined ? undefined : { version };
 }
 
 function decodeBind(v: unknown): PrDescriptionBindResponse | undefined {
-  return isRecord(v) && isVersion(v.version) && isPrState(v.pr) ? { version: v.version, pr: v.pr } : undefined;
+  if (!isRecord(v)) return undefined;
+  const version = decodeVersion(v.version);
+  const pr = decodePrState(v.pr);
+  return version === undefined || pr === undefined ? undefined : { version, pr };
 }
 
 function decodeLookup(v: unknown): PrDescriptionLookupResponse | undefined {
-  if (!isRecord(v) || !isStrOrNull(v.matched_version_id) || !(v.pr === null || isPrState(v.pr))) return undefined;
+  if (!isRecord(v) || !isStrOrNull(v.matched_version_id)) return undefined;
   const match = v.match;
   if (match !== "published" && match !== "pending" && match !== "none") return undefined;
-  return { match, matched_version_id: v.matched_version_id as string | null, pr: v.pr as PrDescriptionState | null };
+  let pr: PrDescriptionState | null = null;
+  if (v.pr !== null) {
+    const decoded = decodePrState(v.pr);
+    if (decoded === undefined) return undefined;
+    pr = decoded;
+  }
+  return { match, matched_version_id: v.matched_version_id, pr };
 }
 
 function decodeAck(v: unknown): PrDescriptionAckResponse | undefined {
-  return isRecord(v) && isPrState(v.pr) && isStrOrNull(v.recovered_version_id)
-    ? { pr: v.pr, recovered_version_id: v.recovered_version_id as string | null }
-    : undefined;
+  if (!isRecord(v) || !isStrOrNull(v.recovered_version_id)) return undefined;
+  const pr = decodePrState(v.pr);
+  return pr === undefined ? undefined : { pr, recovered_version_id: v.recovered_version_id };
 }
 
 const sleepReal = (ms: number): Promise<void> =>
@@ -783,10 +882,12 @@ export class WorkerClient {
     if (res.status === 204) return null;
     if (res.status >= 400) throw await this.toError("POST", `${WORKER_API_PREFIX}/runs/claim`, res);
     const claim = (await res.json()) as ClaimResponse;
-    // PRD #1798 D9: the pr_description is validated or dropped, never cast (see
-    // decodeClaimPrDescription). The warning carries the run id only, never the value.
-    if (claim.pr_description !== undefined) {
-      const pr = decodeClaimPrDescription(claim.pr_description);
+    // PRD #1798 D9: the pr_description is validated or dropped, never cast (decodePrState, the
+    // same check as the bind / lookup / ack responses). The warning carries the run id only,
+    // never the value (untrusted text). The isRecord guard keeps a `null` (or other non-object)
+    // 200 body returning as it did before this check existed, rather than throwing here.
+    if (isRecord(claim) && claim.pr_description !== undefined) {
+      const pr = decodePrState(claim.pr_description);
       if (pr === undefined) {
         delete claim.pr_description;
         this.log.warn("claim pr_description is malformed; ignoring it", { run_id: claim.run_id });
@@ -1683,9 +1784,13 @@ export class WorkerClient {
   // ONE attempt each; the client retries nothing. Only stage is non-idempotent: it creates a row
   // per call, so a blind retry after a lost response could stage twice and burn the per-run
   // version cap, and it must never be retried. The other three are safe to replay: bind is
-  // idempotent for the same (version, mr_iid), lookup is a read, and a replayed ack whose
-  // response was lost returns 200 with the current state (workersvc.AckPrDescription checks
-  // prDescAckAlreadyApplied / prDescOwnRecoveryAlreadyApplied before the lock compare-and-swap).
+  // idempotent for the same (version, mr_iid, rendered_region_sha256) while the version is
+  // pending, lookup is a read, and a replayed ack whose response was lost returns 200 with the
+  // current state (workersvc.AckPrDescription checks prDescAckAlreadyApplied /
+  // prDescOwnRecoveryAlreadyApplied before the lock compare-and-swap) only when the PR's
+  // lock_version advanced EXACTLY ONCE past the replay's expected_lock_version (anything else is
+  // 409 version_conflict); that replay response's recovered_version_id is always null, so it
+  // does not say whether the original ack recovered a version.
   // Their retry policy belongs to the lifecycle (M6), which knows the forge state around them.
 
   /** Stage a pending version (POST /worker/runs/:id/pr-description/stage). `req.fields` are RAW;
@@ -1723,7 +1828,9 @@ export class WorkerClient {
    *  `expected_lock_version` (POST /worker/runs/:id/pr-description/ack). Any outcome but
    *  `published` abandons the version, except when `observed_region_sha256` equals the acked
    *  version's own rendered hash: the forge shows its region, so the api publishes it instead
-   *  (unless a newer publication supersedes it) and names it in `recovered_version_id`. */
+   *  and names it in `recovered_version_id`. It still abandons it when the published version
+   *  already rendered the same region, when a newer publication supersedes it, or when lost-ack
+   *  recovery published another pending version on this ack (see PR_DESC_ACK_OUTCOMES). */
   async ackPrDescription(
     runId: string,
     req: PrDescriptionAckRequest,

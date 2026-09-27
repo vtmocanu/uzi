@@ -10,8 +10,8 @@ import {
   PrDescriptionNotFound,
   PrDescriptionRateLimited,
   RequestError,
+  SanitizedPrDescriptionFields,
   WorkerClient,
-  decodeClaimPrDescription,
   isTransient,
   type PrDescriptionConflictReason,
 } from "../src/client.js";
@@ -25,7 +25,6 @@ import {
   type PrDescriptionState,
   type PrDescriptionVersionDTO,
   type RawPrDescriptionFields,
-  type SanitizedPrDescriptionFields,
 } from "../src/protocol.js";
 
 // PRD #1798 M4 (D9), worker transport half: the four pr-description routes pinned against the api
@@ -92,7 +91,10 @@ function newClient(log: Logger = nullLogger()): WorkerClient {
 const zero = () => ({ added: 0, deleted: 0 });
 
 // Wire fixtures: what the api SENDS, before decoding. Their fields are plain objects (raw at the
-// type level); only the client's decoders turn them into the branded sanitized type.
+// type level); only the client's decoders turn them into SanitizedPrDescriptionFields instances.
+// assert/strict's deepEqual compares prototypes, so a decoded value is compared through its JSON
+// form (which is the plain wire shape: an instance serializes to its fields).
+const plain = (v: unknown): unknown => JSON.parse(JSON.stringify(v));
 type WireVersion = Omit<PrDescriptionVersionDTO, "fields"> & { fields: RawPrDescriptionFields };
 type WireState = Omit<PrDescriptionState, "published_version"> & { published_version: WireVersion | null };
 
@@ -228,11 +230,17 @@ describe("pr-description client wire (PRD #1798 M4, D9)", () => {
   it("decodes each response shape", async () => {
     const published = version({ state: "published", mr_iid: 42, rendered_region_sha256: REGION, published_at: "2026-09-27T10:05:00Z" });
     respond = () => ({ status: 200, body: JSON.stringify({ version: version() }) });
-    assert.deepEqual(await newClient().stagePrDescription(RUN_ID, stageReq()), { version: version() });
+    const staged = await newClient().stagePrDescription(RUN_ID, stageReq());
+    assert.deepEqual(plain(staged), { version: version() });
+    assert.ok(staged.version.fields instanceof SanitizedPrDescriptionFields);
+    assert.ok(SanitizedPrDescriptionFields.is(staged.version.fields));
 
     const bound = { version: version({ mr_iid: 42, rendered_region_sha256: REGION }), pr: prState({ published_version: published, last_outcome: "published" }) };
     respond = () => ({ status: 200, body: JSON.stringify(bound) });
-    assert.deepEqual(await newClient().bindPrDescription(RUN_ID, bindReq()), bound);
+    const gotBound = await newClient().bindPrDescription(RUN_ID, bindReq());
+    assert.deepEqual(plain(gotBound), bound);
+    assert.ok(SanitizedPrDescriptionFields.is(gotBound.version.fields));
+    assert.ok(SanitizedPrDescriptionFields.is(gotBound.pr.published_version?.fields));
 
     for (const lookup of [
       { match: "published", matched_version_id: VERSION_ID, pr: prState({ published_version: published }) },
@@ -240,13 +248,15 @@ describe("pr-description client wire (PRD #1798 M4, D9)", () => {
       { match: "none", matched_version_id: null, pr: null },
     ]) {
       respond = () => ({ status: 200, body: JSON.stringify(lookup) });
-      assert.deepEqual(await newClient().lookupPrDescription(RUN_ID, lookupReq()), lookup);
+      const got = await newClient().lookupPrDescription(RUN_ID, lookupReq());
+      assert.deepEqual(plain(got), lookup);
+      if (got.pr?.published_version) assert.ok(SanitizedPrDescriptionFields.is(got.pr.published_version.fields));
     }
 
     for (const outcome of PR_DESC_ACK_OUTCOMES) {
       const ack = { pr: prState({ lock_version: 8, last_outcome: outcome }), recovered_version_id: outcome === "published" ? VERSION_ID : null };
       respond = () => ({ status: 200, body: JSON.stringify(ack) });
-      assert.deepEqual(await newClient().ackPrDescription(RUN_ID, { ...ackReq(), outcome }), ack);
+      assert.deepEqual(plain(await newClient().ackPrDescription(RUN_ID, { ...ackReq(), outcome })), ack);
     }
   });
 
@@ -255,7 +265,28 @@ describe("pr-description client wire (PRD #1798 M4, D9)", () => {
     respond = () => ({ status: 200, body: JSON.stringify(ack) });
     const got = await newClient().ackPrDescription(RUN_ID, ackReq());
     assert.equal(got.pr.last_outcome, "skipped_future_reason");
-    assert.deepEqual(got, ack);
+    assert.deepEqual(plain(got), ack);
+  });
+
+  it("decoded fields are frozen instances built from the checked keys only", async () => {
+    const wire = version();
+    const extra = { ...wire, fields: { ...wire.fields, injected: "x", scope_notes: [{ kind: "added", text: "t", extra: 1 }] } };
+    respond = () => ({ status: 200, body: JSON.stringify({ version: extra }) });
+    const { version: v } = await newClient().stagePrDescription(RUN_ID, stageReq());
+    assert.ok(Object.isFrozen(v.fields));
+    assert.ok(Object.isFrozen(v.fields.changes));
+    assert.ok(Object.isFrozen(v.fields.scope_notes));
+    assert.ok(Object.isFrozen(v.fields.scope_notes[0]));
+    assert.ok(Object.isFrozen(v.fields.verification[0]));
+    assert.equal("injected" in v.fields, false);
+    assert.deepEqual(plain(v.fields.scope_notes), [{ kind: "added", text: "t" }]);
+    // toRaw is a mutable plain copy, not an instance, and serializes identically.
+    const raw = v.fields.toRaw();
+    assert.equal(SanitizedPrDescriptionFields.is(raw), false);
+    assert.equal(Object.getPrototypeOf(raw), Object.prototype);
+    raw.changes.push("mutated");
+    assert.equal(v.fields.changes.length, 1);
+    assert.equal(JSON.stringify(v.fields), JSON.stringify(v.fields.toRaw()));
   });
 
   it("the ack outcome tuple is exactly the api's six outcomes (no abandoned)", () => {
@@ -407,11 +438,27 @@ describe("claim pr_description (workersvc.ClaimPayload.PrDescription, omitempty)
       ...extra,
     });
 
-  it("absent on a claim without a PR record", async () => {
+  const recordingLog = () => {
+    const warns: { msg: string; fields: unknown }[] = [];
+    const log: Logger = { ...nullLogger(), warn: (msg: string, fields?: unknown) => void warns.push({ msg, fields }) };
+    return { warns, log };
+  };
+
+  it("absent on a claim without a PR record, with no warning", async () => {
     respond = () => ({ status: 200, body: claimBody({}) });
-    const claim = await newClient().claimRun();
+    const { warns, log } = recordingLog();
+    const claim = await newClient(log).claimRun();
     assert.ok(claim);
     assert.equal(claim.pr_description, undefined);
+    assert.equal("pr_description" in claim, false);
+    assert.deepEqual(warns, []);
+  });
+
+  it("a null 200 claim body is tolerated (returned as before), not a TypeError", async () => {
+    respond = () => ({ status: 200, body: "null" });
+    const { warns, log } = recordingLog();
+    assert.equal(await newClient(log).claimRun(), null);
+    assert.deepEqual(warns, []);
   });
 
   it("carries the PR state, including the published version, when present", async () => {
@@ -420,12 +467,17 @@ describe("claim pr_description (workersvc.ClaimPayload.PrDescription, omitempty)
       published_version: version({ state: "published", mr_iid: 42, rendered_region_sha256: REGION, published_at: "2026-09-27T10:05:00Z" }),
     });
     respond = () => ({ status: 200, body: claimBody({ pr_description: state }) });
-    const claim = await newClient().claimRun();
-    assert.deepEqual(claim?.pr_description, state);
+    const { warns, log } = recordingLog();
+    const claim = await newClient(log).claimRun();
+    assert.deepEqual(plain(claim?.pr_description), state);
     assert.equal(claim?.pr_description?.published_version?.rendered_region_sha256, REGION);
-    // The decoded claim's published fields are the branded sanitized type (compile-checked).
+    // The decoded claim's published fields are real sanitized instances (and typed so).
     const fields: SanitizedPrDescriptionFields | undefined = claim?.pr_description?.published_version?.fields;
-    assert.equal(fields?.summary, "Adds a plain-English description.");
+    assert.ok(fields instanceof SanitizedPrDescriptionFields);
+    assert.ok(SanitizedPrDescriptionFields.is(fields));
+    assert.ok(Object.isFrozen(fields));
+    assert.equal(fields.summary, "Adds a plain-English description.");
+    assert.deepEqual(warns, []);
   });
 
   it("a malformed pr_description is dropped from the claim, and the warning carries no value", async () => {
@@ -433,12 +485,16 @@ describe("claim pr_description (workersvc.ClaimPayload.PrDescription, omitempty)
       { ...prState(), lock_version: "7" },
       prState({ published_version: { ...version(), fields: { ...version().fields, summary: 1 as never } } }),
       prState({ published_version: version({ source: "model" as never }) }),
+      { ...prState(), mr_iid: 1.5 },
+      { ...prState(), last_outcome: false },
       "a string",
       null,
+      1,
+      [],
+      {},
     ];
     for (const bad of malformed) {
-      const warns: { msg: string; fields: unknown }[] = [];
-      const log: Logger = { ...nullLogger(), warn: (msg: string, fields?: unknown) => void warns.push({ msg, fields }) };
+      const { warns, log } = recordingLog();
       respond = () => ({ status: 200, body: claimBody({ pr_description: bad }) });
       const claim = await newClient(log).claimRun();
       assert.ok(claim, JSON.stringify(bad));
@@ -449,31 +505,66 @@ describe("claim pr_description (workersvc.ClaimPayload.PrDescription, omitempty)
     }
   });
 
-  it("decodeClaimPrDescription validates or returns undefined", () => {
-    const state = prState({ last_outcome: "published", published_version: version({ state: "published", mr_iid: 42 }) });
-    assert.deepEqual(decodeClaimPrDescription(state), state);
-    assert.deepEqual(decodeClaimPrDescription(prState({ last_outcome: "a_newer_outcome" }))?.last_outcome, "a_newer_outcome");
-    for (const bad of [undefined, null, 1, [], {}, { ...prState(), mr_iid: 1.5 }, { ...prState(), last_outcome: false }]) {
-      assert.equal(decodeClaimPrDescription(bad), undefined, JSON.stringify(bad));
-    }
+  it("an unknown last_outcome on the claim's record is kept (forward skew)", async () => {
+    respond = () => ({ status: 200, body: claimBody({ pr_description: prState({ last_outcome: "a_newer_outcome" }) }) });
+    const { warns, log } = recordingLog();
+    const claim = await newClient(log).claimRun();
+    assert.equal(claim?.pr_description?.last_outcome, "a_newer_outcome");
+    assert.deepEqual(warns, []);
   });
 });
 
 describe("raw vs sanitized fields are distinct types (D7, compile-checked)", () => {
-  it("raw fields are refused where sanitized are required; sanitized fields may be re-staged", async () => {
-    const raw: RawPrDescriptionFields = version().fields;
-    // @ts-expect-error raw (unsanitized) fields must not type as SanitizedPrDescriptionFields.
-    const notSanitized: SanitizedPrDescriptionFields = raw;
-    // @ts-expect-error a version's fields must be sanitized; a raw literal does not satisfy the DTO.
-    const notDto: PrDescriptionVersionDTO = version();
-    void notSanitized;
-    void notDto;
-
+  it("only a decoded instance fits a sanitized slot; spreads, raw fields and outside construction do not", async () => {
     respond = () => ({ status: 200, body: JSON.stringify({ version: version() }) });
     const staged = await newClient().stagePrDescription(RUN_ID, stageReq());
     const sanitized: SanitizedPrDescriptionFields = staged.version.fields;
-    // The sanitized text is still assignable to a stage request's raw fields (a refresh re-stage).
-    const restage: PrDescriptionStageRequest = { ...stageReq(), fields: sanitized };
+    const raw: RawPrDescriptionFields = { ...version().fields, summary: "RAW model text" };
+    let slot: SanitizedPrDescriptionFields = sanitized;
+
+    // @ts-expect-error raw (unsanitized) fields must not type as SanitizedPrDescriptionFields.
+    slot = raw;
+    // @ts-expect-error a spread copy is a plain object, not an instance (the #private brand is lost).
+    slot = { ...sanitized };
+    // @ts-expect-error overlaying one raw field on a spread copy is refused.
+    slot = { ...sanitized, summary: raw.summary };
+    // @ts-expect-error overlaying all raw fields on a spread copy is refused.
+    slot = { ...sanitized, ...raw };
+    // @ts-expect-error a version's fields must be sanitized; a raw literal does not satisfy the DTO.
+    const notDto: PrDescriptionVersionDTO = version();
+    void notDto;
+    // @ts-expect-error no other module can construct one: the mint token is module-private.
+    assert.throws(() => new SanitizedPrDescriptionFields(Symbol("forged"), raw), TypeError);
+    // Nor can a subclass, which has to pass the same token to super().
+    class Forged extends SanitizedPrDescriptionFields {
+      constructor() {
+        // @ts-expect-error the mint token is module-private.
+        super(Symbol("forged"), raw);
+      }
+    }
+    assert.throws(() => new Forged(), TypeError);
+
+    // KNOWN TYPE HOLES (documented on the class): Object.assign's declared return type is an
+    // intersection, which is assignable to each member, so this compiles; so does an `any`.
+    // Neither is an instance at runtime, and is() says so (the brand is #private, so a forged
+    // prototype does not pass either).
+    slot = Object.assign({}, sanitized, raw);
+    assert.equal(SanitizedPrDescriptionFields.is(slot), false);
+    const untyped: unknown = JSON.parse(JSON.stringify(sanitized));
+    slot = untyped as any;
+    assert.equal(SanitizedPrDescriptionFields.is(slot), false);
+    assert.equal(SanitizedPrDescriptionFields.is(Object.create(SanitizedPrDescriptionFields.prototype)), false);
+    for (const spread of [{ ...sanitized }, { ...sanitized, ...raw }]) {
+      assert.equal(SanitizedPrDescriptionFields.is(spread), false);
+    }
+    assert.ok(SanitizedPrDescriptionFields.is(sanitized));
+
+    // A sanitized value is NOT assignable where raw fields are expected (readonly arrays): a
+    // refresh re-stages through toRaw(), which the api sanitizes again.
+    // @ts-expect-error readonly sanitized arrays do not fit the mutable raw request shape.
+    const badRestage: PrDescriptionStageRequest = { ...stageReq(), fields: sanitized };
+    void badRestage;
+    const restage: PrDescriptionStageRequest = { ...stageReq(), fields: sanitized.toRaw() };
     assert.deepEqual(restage.fields, version().fields);
   });
 });

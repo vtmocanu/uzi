@@ -9,6 +9,8 @@
 // PRD #4 Decision Log for the reconciliation history.
 
 import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
+// Type-only (erased at runtime): the sanitized-fields class lives beside the decoders that mint it.
+import type { SanitizedPrDescriptionFields } from "./client.js";
 
 /** All worker endpoints live under this prefix and take a Bearer join token. */
 export const WORKER_API_PREFIX = "/api/worker";
@@ -1271,8 +1273,15 @@ export interface ClaimResponse {
    *  PR-producing run whose PR already exists (an mr_rework run, a run whose completion recorded
    *  its MR, or a re-claimed issue run that already bound a version); absent when the PR has no
    *  record or the server predates it. Its `published_version` fields are api-sanitized but
-   *  still untrusted text. WorkerClient.claimRun shape-checks it (decodeClaimPrDescription) and
-   *  DROPS a malformed one, so a present value is the decoded, branded state. */
+   *  still untrusted text. WorkerClient.claimRun shape-checks it and DROPS a malformed one (with
+   *  a warning), so a present value is the decoded state whose fields are
+   *  {@link SanitizedPrDescriptionFields} instances.
+   *
+   *  ABSENT IS NOT AUTHORITATIVE: it means "no record reached this worker", which covers an older
+   *  server, a PR the api has no row for, and a malformed record this client dropped. It never
+   *  means "nothing protected is on the forge". A caller must not treat an absent value as safe to
+   *  write the PR description without first reading the forge's markers (and looking an unknown
+   *  region up) the way it would for an unknown record. */
   pr_description?: PrDescriptionState;
 }
 
@@ -2595,9 +2604,10 @@ export interface RecoverySettleResponse {
 // Mirrors api/internal/apitypes/pr_description.go (snake_case JSON). In every RESPONSE the api
 // sends non-nil slices; a stage REQUEST carries RAW, untrusted fields the api sanitizes, and only
 // the sanitized fields a response returns may be published (D7). The two are distinct types:
-// {@link RawPrDescriptionFields} (what a stage sends) and {@link SanitizedPrDescriptionFields}
-// (what a version carries), so passing raw text where sanitized text is required is a compile
-// error rather than a review finding.
+// {@link RawPrDescriptionFields} (what a stage sends, a plain interface) and
+// SanitizedPrDescriptionFields (what a version carries: a class in client.ts, nominal through an
+// ECMAScript #private field, whose instances only WorkerClient's response decoders create). Its
+// comment there lists what the compiler does and does not catch.
 
 /** Go: apitypes.PrDescriptionScopeNote. One difference from the ask. */
 export interface PrDescriptionScopeNote {
@@ -2624,20 +2634,9 @@ interface PrDescriptionFields {
 }
 
 /** RAW fields: model- or lead-authored text the api has NOT sanitized yet. Only a stage request
- *  carries them; they are never rendered (D7). */
+ *  carries them; they are never rendered (D7). A sanitized value is not assignable here (its
+ *  arrays are readonly): a refresh re-stages it through SanitizedPrDescriptionFields.toRaw(). */
 export type RawPrDescriptionFields = PrDescriptionFields;
-
-// A type-only brand: the symbol has no runtime value and is not exported, so no module can build
-// the branded type without a cast. WorkerClient's response decoders (client.ts, the stage / bind /
-// lookup / ack decoders and decodeClaimPrDescription) are the only producers: their type guards
-// assert it on a body that passed the shape check.
-declare const sanitizedBrand: unique symbol;
-
-/** SANITIZED fields: the api-returned text of a staged version, the only text the renderer may
- *  publish (D7). Produced only by the client's response decoders (see the brand above). A
- *  sanitized value is still assignable where raw fields are expected (a refresh may re-stage
- *  it), never the reverse. */
-export type SanitizedPrDescriptionFields = PrDescriptionFields & { readonly [sanitizedBrand]: true };
 
 /** Go: apitypes.PrDescriptionSizeBucket. One size-line bucket's line counts (D3). */
 export interface PrDescriptionSizeBucket {
@@ -2690,9 +2689,11 @@ export interface PrDescriptionVersionDTO {
 /** The exact forge-write outcomes an ack may carry (Go: the ack `outcome` enum). Anything but
  *  `published` abandons the acked version, with one exception: when the ack's
  *  `observed_region_sha256` equals the acked version's OWN rendered region hash (the write landed
- *  although the worker reports otherwise), the api publishes that version instead, unless a newer
- *  publication supersedes it, and names it in the response's `recovered_version_id`
- *  (workersvc.AckPrDescription). */
+ *  although the worker reports otherwise), the api publishes that version instead and names it
+ *  in the response's `recovered_version_id` (workersvc.AckPrDescription). The version is still
+ *  ABANDONED, with that id null, when the currently published version already rendered the same
+ *  region, when a newer publication supersedes it, or when lost-ack recovery published ANOTHER
+ *  pending version on this ack (then `recovered_version_id` names that other version). */
 export const PR_DESC_ACK_OUTCOMES = [
   "published",
   "skipped_human_edit",
@@ -2741,7 +2742,8 @@ export interface PrDescriptionStageResponse {
 
 /** Go: apitypes.PrDescriptionBindRequest (POST /runs/{id}/pr-description/bind). Binds the run's
  *  pending version to its PR with the sha256 (64 lowercase hex) of the exact region text the
- *  renderer will write. Idempotent for the same (version, mr_iid). */
+ *  renderer will write. Idempotent for the same (version, mr_iid, rendered_region_sha256) while
+ *  the version is pending: a different hash, or a version no longer pending, is version_conflict. */
 export interface PrDescriptionBindRequest {
   claim_generation: number;
   version_id: string;
@@ -2785,7 +2787,9 @@ export interface PrDescriptionAckRequest {
 }
 
 /** Go: apitypes.PrDescriptionAckResponse. The PR's state after the ack; `recovered_version_id`
- *  names the pending version lost-ack recovery published first (null when none). */
+ *  names the version lost-ack recovery published (null when none). A REPLAYED ack (a retry whose
+ *  first response was lost) always answers null here, even when the original ack recovered a
+ *  version: null on a replay does not mean nothing was recovered. */
 export interface PrDescriptionAckResponse {
   pr: PrDescriptionState;
   recovered_version_id: string | null;
