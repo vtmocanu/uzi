@@ -44,9 +44,9 @@ Plan steering is done with the buddy bound by `session-peers` (`buddy: @NAME`);
   the final message text. Ask for `APPROVE`, `REVISE: N items` or `BLOCK: REASON`;
   never re-ask on byte-identical material. Act when both agree; otherwise take both
   positions to the user. The buddy's agreement is never user approval.
-- **Conditional approve**: on `APPROVE` with exact mechanical deltas, approve, send
-  the deltas verbatim with `uzi run follow-up`, and confirm delivery (`uzi run
-  inputs`) before dependent work. An unresolved `REVISE` still blocks.
+- **Conditional approve**: deltas the implementation needs → `revise`, since
+  `approve` starts implementing at once. Only for non-blocking advice: approve, then
+  send it with `uzi run follow-up`; it may arrive after work starts.
 - **Issues you file**: buddy-review the final draft, then label it `reviewed`.
 
 ## The loop, per run
