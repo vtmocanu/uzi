@@ -714,9 +714,10 @@ describe("RunRunner puts the size line in the opened MR body (PRD #1798 M1)", ()
     const body = JSON.parse(calls.find((c) => c.method === "POST")!.body ?? "{}") as { description: string };
     // StubExecutor commits one markdown file; the line is computed from the landed tracking tip
     // against the merge-base with main, and sits in the region before the completion block.
+    // PRD #1798 M6: the region also ends with the deterministic provenance line (D12).
     assert.match(
       body.description,
-      /^<!-- uzi:description:start v1 -->\n\*\*Size:\*\* docs \+\d+ −0 · 1 file\n<!-- uzi:description:end -->\n\n<!-- uzi:completion:start v1 -->\n/,
+      /^<!-- uzi:description:start v1 -->\n\*\*Size:\*\* docs \+\d+ −0 · 1 file\n\nDescribes `[0-9a-f]{7}` against `main`\.\n<!-- uzi:description:end -->\n\n<!-- uzi:completion:start v1 -->\n/,
     );
   });
 });
@@ -728,7 +729,7 @@ describe("RunRunner keeps the size line in the verified-head reconcile (PRD #179
     // via updateMergeRequestDescription to add Closes. That rewrite must keep the size line.
     const H = "1111111111111111111111111111111111111111";
     const SIZE = `**Size:** code +3 ${MINUS}1 · tests +2 ${MINUS}0 · 2 files`;
-    const { gitlab, calls } = fakeGitlab({ head: H });
+    const { gitlab, calls, all } = fakeGitlab({ head: H });
     const claim = gitlabClaim(1798, { config: { completion_contract_version: 1, contract_revision: 1 } });
     api.setCompletionPermitResponse(true);
     harnessGit.trackingTip = (async () => H) as typeof harnessGit.trackingTip;
@@ -740,10 +741,12 @@ describe("RunRunner keeps the size line in the verified-head reconcile (PRD #179
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
     assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
-    assert.deepStrictEqual(calls.map((c) => c.method), ["POST", "GET", "PUT", "GET"]);
+    // PRD #1798 M6: create, the publisher's read and revalidate, the head verify, then the reconcile's
+    // read, write and confirm, then the post-add head re-verify.
+    assert.deepStrictEqual(all.map((c) => c.method), ["POST", "GET", "GET", "GET", "GET", "PUT", "GET", "GET"]);
     const post = JSON.parse(calls.find((c) => c.method === "POST")!.body ?? "{}") as { description: string };
     const put = JSON.parse(calls.find((c) => c.method === "PUT")!.body ?? "{}") as { description: string };
-    const region = `<!-- uzi:description:start v1 -->\n${SIZE}\n<!-- uzi:description:end -->\n\n`;
+    const region = `<!-- uzi:description:start v1 -->\n${SIZE}\n\nDescribes \`1111111\` against \`main\`.\n<!-- uzi:description:end -->\n\n`;
     assert.ok(post.description.startsWith(region), post.description);
     assert.match(put.description, /Closes #1798/, "the PUT is the verified-head reconcile");
     assert.ok(put.description.startsWith(region), `the reconcile body lost the size line:\n${put.description}`);

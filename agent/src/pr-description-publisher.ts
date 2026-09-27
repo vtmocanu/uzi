@@ -1,0 +1,955 @@
+// PRD #1798 M6 (D8, D9, D10, D11, D12, D15, D17): the PR-description publisher and the completion
+// interlock's read-replace-write reconcile.
+//
+// The renderer (pr-description.ts) is pure; this module does the I/O around it: it stages the
+// run's description through the api (the only source of publishable text, D7), binds the staged
+// version to the PR, reads the forge before and after writing (D11), and acknowledges what the
+// forge ended up showing (D9). Every failure here is ADVISORY: nothing in this module fails or
+// holds a run. The interlock's own reconcile (reconcileCompletion) reports a typed result and the
+// runner decides whether to hold or fail closed.
+//
+// The publication, in the spec's steps:
+//
+//   1. prepare(): build the editor context and run the editor pass under ONE deadline, then stage
+//      `generated` (pass OK), `lead_only` (pass failed, lead claims present) or `deterministic_only`
+//      (neither). A failed stage (never retried) leaves the region deterministic and unversioned.
+//   2. initialBody(): the body a NEW PR is created with (no preserved text).
+//   3. publish(): read 1. A head or target that differs from the staged snapshot spends the ONE
+//      regeneration (a new version for the read's snapshot; the old unbound one stays pending).
+//   4. The PR's state: claim.pr_description, else a lookup of the observed region.
+//   5. Compose from read 1 (outside text, the human-edit check, D10/D17, the interlock scan, the
+//      D15 cap; a cap that shrank the region restages deterministic_only).
+//   6. Bind the version with the FINAL region hash.
+//   7. Read 2 revalidates: a changed description (same snapshot) spends the ONE recompose; a moved
+//      head or target acks the bound version skipped_snapshot_moved and regenerates (step 3's
+//      budget). Once a budget is spent, a further change skips the region write (the completion
+//      block is still written). A body is never written from a read older than the latest read.
+//   8. Write only when the composed body differs from the latest read.
+//   9. Re-read: the bound region on the forge → ack `published`; a failed write → `write_failed`;
+//      a post-write mismatch is recorded (write_failed), never retried.
+
+import {
+  PrDescriptionConflict,
+  PrDescriptionMalformedResponse,
+  PrDescriptionRateLimited,
+  isTransient,
+  type WorkerClient,
+} from "./client.js";
+import type { ForgeClient, MergeRequestDetail } from "./forge.js";
+import type { Logger } from "./log.js";
+import type { DeliveryContext, PreviousDescriptionFields } from "./pr-description-context.js";
+import {
+  COMPLETION_END,
+  REGION_END,
+  REGION_START,
+  STALENESS_END,
+  STALENESS_START,
+  capBody,
+  closingDirectiveOutsideCompletion,
+  composeBody,
+  parseOwnedBlocks,
+  regionSha256,
+  renderBody,
+  renderCompletionBlock,
+  renderRegion,
+  type OwnedBlocks,
+} from "./pr-description.js";
+import type { ComputedSize } from "./pr-size.js";
+import type {
+  PrDescriptionAckOutcome,
+  PrDescriptionState,
+  PrDescriptionVerification,
+  PrDescriptionVersionDTO,
+  RawPrDescriptionFields,
+} from "./protocol.js";
+import type { PrSummaryClaim } from "./signals.js";
+import type { DeliverySummary, DeliverySummaryClaimView, DeliverySummaryInput } from "./summary-runner.js";
+
+// ── Seams ──────────────────────────────────────────────────────────────────────────────────
+
+/** The forge reads and writes the publisher needs (every ForgeClient driver has them). */
+export type PublisherForge = Pick<ForgeClient, "getMergeRequest" | "updateMergeRequestDescription">;
+
+/** The four pr-description routes (WorkerClient). Stage is NEVER retried; bind, lookup and ack are
+ *  safe to replay and get a bounded retry. */
+export type PublisherApi = Pick<
+  WorkerClient,
+  "stagePrDescription" | "bindPrDescription" | "lookupPrDescription" | "ackPrDescription"
+>;
+
+/** The editor pass (SummaryRunner). Null under the stub executor or when none was injected. */
+export interface DeliveryPass {
+  deliverySummaryDeadline(): number;
+  generateDeliverySummary(input: DeliverySummaryInput): Promise<DeliverySummary | null>;
+}
+
+export interface PublisherDeps {
+  forge: PublisherForge;
+  api: PublisherApi;
+  pass: DeliveryPass | null;
+  log: Pick<Logger, "info" | "warn">;
+  /** A run status message (the runner's batcher, kind "status"). Fixed wording only. */
+  emit: (text: string) => void;
+  /** Wraps each forge call (the runner passes its bounded forge retry); default: one attempt. */
+  forgeRetry?: <T>(fn: () => Promise<T>) => Promise<T>;
+  /** Sleep between bind / lookup / ack replays and before a head-lag re-read (tests pass a no-op). */
+  sleep?: (ms: number) => Promise<void>;
+  /** How long to wait before re-reading once when read 1's head is not the landed head (a forge
+   *  may lag a push by a moment, GitLab especially). 0 disables the re-read. Default 2 s. */
+  headLagRetryMs?: number;
+}
+
+/** The (head, target) a staged version describes. */
+export interface PrSnapshot {
+  headSha: string;
+  targetBranch: string;
+}
+
+/** The deterministic facts of a snapshot: the size (pr-size.ts computeSize) and the merge-base the
+ *  stage records as base_sha (null when it could not be computed: the version is then not staged). */
+export interface SnapshotFacts {
+  baseSha: string | null;
+  size: ComputedSize;
+}
+
+export interface PublicationSpec {
+  runId: string;
+  claimGeneration: number;
+  /** The claim facts the editor pass selects its harness from. */
+  claim: DeliverySummaryClaimView;
+  repoUrl: string;
+  pat: string;
+  /** `owner/repo` or `group/sub/project`, for the closing-directive scan (repoPathFromUrl). */
+  repoPath?: string;
+  /** D17: `own` runs author the completion block; `refresh` runs (mr_rework, a ci_fix adopting an
+   *  existing branch) refresh only the region, and only on a PR that already carries uzi markers,
+   *  touching the completion block's staleness line alone. */
+  mode: "own" | "refresh";
+  /** Set for an issue run: when the completion block is non-closing, the whole resulting body is
+   *  scanned for a closing directive for this issue (amended D10). */
+  interlockIssueIid?: number;
+  /** Whether the completion block this run writes closes the issue. */
+  completionCloses: boolean;
+  /** claim.pr_description: the PR's record as the api delivered it. Absent is NOT authoritative. */
+  prior?: PrDescriptionState;
+  /** The lead's structured claims (D4), stamped with verifiedAtSha. */
+  lead?: PrSummaryClaim;
+  facts(snapshot: PrSnapshot): Promise<SnapshotFacts>;
+  /** The redacted, budgeted editor input (buildDeliveryContext) for a snapshot. */
+  context(snapshot: PrSnapshot, deadlineMs: number, previous: PreviousDescriptionFields | null): Promise<DeliveryContext>;
+  /** The completion block this run writes, with the D12 staleness line when the two SHAs differ. */
+  completion(staleness?: { describedSha: string; headSha: string }): string;
+  signal?: AbortSignal;
+}
+
+/** What a publication did, for the runner's interlock and logs. */
+export interface PublishOutcome {
+  /** The last ack the publication sent for its final version (undefined: none was sent). */
+  ack?: PrDescriptionAckOutcome;
+  /** uzi's own region for this publication (the region a whole-body rewrite writes). */
+  region: string;
+  /** The head the region on the forge describes after this publication, when known (D12). */
+  describedSha?: string;
+  /** The body was written. */
+  wrote: boolean;
+  /** The amended-D10 scan found a closing directive and the body was rewritten whole. */
+  interlockRewrite: boolean;
+}
+
+// ── Small helpers ──────────────────────────────────────────────────────────────────────────
+
+const SHA_RE = /^[0-9a-f]{7,64}$/i;
+const SHA40_RE = /^[0-9a-f]{40}$/i;
+const LEAD_SUMMARY_MAX_BYTES = 4000;
+const REPLAY_ATTEMPTS = 3;
+const MAX_ROUNDS = 4;
+
+function toLf(s: string): string {
+  return s.replace(/\r\n?/gu, "\n");
+}
+
+function sameSha(a: string, b: string): boolean {
+  return a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
+function sameSnapshot(read: MergeRequestDetail, s: PrSnapshot): boolean {
+  return sameSha(read.headSha, s.headSha) && read.targetBranch === s.targetBranch;
+}
+
+function errMsg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/** The longest prefix of `s` within `max` UTF-8 bytes, cut on a code-point boundary. */
+function clampBytes(s: string, max: number): string {
+  if (Buffer.byteLength(s, "utf8") <= max) return s;
+  let out = "";
+  let used = 0;
+  for (const ch of s) {
+    const n = Buffer.byteLength(ch, "utf8");
+    if (used + n > max) break;
+    out += ch;
+    used += n;
+  }
+  return out;
+}
+
+/** `owner/repo` (or a GitLab group path) from a forge web URL; undefined when it does not parse,
+ *  which makes the closing scan treat every qualified reference as this repo's (fail closed). */
+export function repoPathFromUrl(url: string): string | undefined {
+  try {
+    const p = new URL(url).pathname.replace(/\.git$/iu, "").replace(/^\/+|\/+$/gu, "");
+    return p || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The lead's verification entries, stamped with the SHA they were reported at. Without a valid
+ *  stamp every entry is dropped (the api rejects an unstamped entry). */
+function leadVerification(lead: PrSummaryClaim | undefined): PrDescriptionVerification[] {
+  const sha = lead?.verifiedAtSha?.trim();
+  if (!lead?.verification?.length || !sha || !SHA_RE.test(sha)) return [];
+  return lead.verification.map((v) => ({ command: v.command, result: v.result, verified_at_sha: sha.toLowerCase() }));
+}
+
+/** D8 rung 2: the lead's claims as RAW fields (`what` + " " + `why` as the summary, clamped to the
+ *  api's raw summary cap), or null when the lead declared nothing. */
+function leadFields(lead: PrSummaryClaim | undefined): RawPrDescriptionFields | null {
+  if (!lead) return null;
+  const summary = clampBytes([lead.what, lead.why].filter((s): s is string => !!s?.trim()).map((s) => s.trim()).join(" "), LEAD_SUMMARY_MAX_BYTES);
+  const fields: RawPrDescriptionFields = {
+    summary,
+    changes: [...(lead.changes ?? [])],
+    scope_notes: (lead.scope_notes ?? []).map((n) => ({ kind: n.kind, text: n.text })),
+    review_pointers: [...(lead.review_pointers ?? [])],
+    verification: leadVerification(lead),
+  };
+  const empty =
+    !fields.summary &&
+    fields.changes.length === 0 &&
+    fields.scope_notes.length === 0 &&
+    fields.review_pointers.length === 0 &&
+    fields.verification.length === 0;
+  return empty ? null : fields;
+}
+
+const EMPTY_FIELDS: RawPrDescriptionFields = { summary: "", changes: [], scope_notes: [], review_pointers: [], verification: [] };
+
+const SIZE_LINE_RE = /^\*\*Size:\*\* [^\n]*$/u;
+const PROVENANCE_RE = /^Describes `[0-9a-f]{7}` against .+\.$/u;
+
+/**
+ * Whether `region` is exactly uzi's deterministic region: the size line and/or the provenance line
+ * and nothing else (renderRegion with no fields). Bodies created before this publisher carry a
+ * size-line-only region with no provenance and no version; that shape is uzi's own, so a region
+ * with no published version and no matching version (lookup `none`) may be overwritten only when
+ * it has this shape. Anything else is treated as a human edit.
+ */
+export function isDeterministicRegion(region: string): boolean {
+  const lines = toLf(region).split("\n");
+  if (lines[0] !== REGION_START || lines[lines.length - 1] !== REGION_END) return false;
+  const inner = lines.slice(1, -1);
+  if (inner.length === 0) return true;
+  if (inner.length === 1) return SIZE_LINE_RE.test(inner[0]!) || PROVENANCE_RE.test(inner[0]!);
+  return inner.length === 3 && SIZE_LINE_RE.test(inner[0]!) && inner[1] === "" && PROVENANCE_RE.test(inner[2]!);
+}
+
+/** The D12 staleness pair (inner markers included) exactly as renderCompletionBlock renders it,
+ *  or "" when the two SHAs name the same commit. */
+function stalenessPair(describedSha: string, headSha: string): string {
+  const block = renderCompletionBlock({ branch: "b", closes: false, kindLine: "", staleness: { describedSha, headSha } });
+  const start = block.indexOf(STALENESS_START);
+  const end = block.indexOf(STALENESS_END);
+  return start >= 0 && end > start ? block.slice(start, end + STALENESS_END.length) : "";
+}
+
+/**
+ * D17: `completion` (an existing block read from the forge) with ONLY its staleness line replaced
+ * by `pair` ("" removes it). Everything else in the block is kept byte for byte. A block without a
+ * staleness line gets the pair inserted before its footer rule (or its end marker).
+ */
+export function withStalenessLine(completion: string, pair: string): string {
+  const start = completion.indexOf(STALENESS_START);
+  const end = completion.indexOf(STALENESS_END);
+  if (start >= 0 && end > start) {
+    const tail = end + STALENESS_END.length;
+    if (pair) return completion.slice(0, start) + pair + completion.slice(tail);
+    // Drop the pair and the blank line that separated it from the next paragraph.
+    const after = completion.slice(tail).replace(/^(?:\r?\n){1,2}/u, "");
+    return completion.slice(0, start) + after;
+  }
+  if (!pair) return completion;
+  const footer = completion.lastIndexOf("\n---\n");
+  const at = footer >= 0 ? footer + 1 : completion.lastIndexOf(`\n${COMPLETION_END}`) + 1;
+  if (at <= 0) return completion;
+  return `${completion.slice(0, at)}${pair}\n\n${completion.slice(at)}`;
+}
+
+/** The completion block of `body` when it parses and equals `completion` (line endings aside). */
+function carriesCompletion(body: string, completion: string): boolean {
+  const p = parseOwnedBlocks(body);
+  return p.kind === "ok" && p.completion !== undefined && toLf(p.completion) === toLf(completion);
+}
+
+async function replay<T>(fn: () => Promise<T>, sleep: (ms: number) => Promise<void>): Promise<T> {
+  let last: unknown;
+  for (let attempt = 0; attempt < REPLAY_ATTEMPTS; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      last = e;
+      const retryable = e instanceof PrDescriptionMalformedResponse || isTransient(e);
+      if (!retryable || attempt === REPLAY_ATTEMPTS - 1) throw e;
+      await sleep(e instanceof PrDescriptionRateLimited && e.retryAfterMs !== undefined ? e.retryAfterMs : 250 * (attempt + 1));
+    }
+  }
+  throw last;
+}
+
+// ── The publication ────────────────────────────────────────────────────────────────────────
+
+interface Staged {
+  snapshot: PrSnapshot;
+  /** undefined: persistence failed (D8 rung 3): nothing to bind or ack. */
+  version?: PrDescriptionVersionDTO;
+  /** The full region for this version (fields when staged with any). */
+  region: string;
+  /** The size-and-provenance-only region for the same snapshot (the D15 fallback). */
+  sizeOnly: string;
+  /** The hash this version was bound with, once bound. */
+  boundHash?: string;
+  /** The version has been acknowledged (no further ack for it). */
+  acked?: boolean;
+}
+
+type RegionSkip = "skipped_human_edit" | "skipped_no_region" | "skipped_malformed" | "skipped_snapshot_moved";
+
+interface Composition {
+  /** The body to write; undefined: leave the forge body as it is. */
+  body: string | undefined;
+  /** The region text the body carries as uzi's (the region written or kept as ours). */
+  region?: string;
+  /** Why the region was not written. */
+  skip?: RegionSkip;
+  /** The D15 cap replaced the region with its size-only form. */
+  capped: boolean;
+  /** The amended-D10 scan forced a whole-body non-closing rewrite. */
+  interlockRewrite: boolean;
+  /** A refresh on a legacy PR (no markers): nothing is written, nothing is acked. */
+  legacyUntouched: boolean;
+  describedSha?: string;
+}
+
+const SKIP_MESSAGES: Record<RegionSkip, string> = {
+  skipped_human_edit:
+    "PR description: the description region was edited by a person, so uzi left it as it is and refreshed only its completion block",
+  skipped_no_region: "PR description: the description region was removed from the PR, so uzi did not put it back",
+  skipped_malformed: "PR description: uzi's markers in the PR description are malformed, so uzi left the description region untouched",
+  skipped_snapshot_moved: "PR description: the PR head or target moved while uzi was writing the description, so the description region was not updated",
+};
+
+export class PrDescriptionPublisher {
+  constructor(private readonly deps: PublisherDeps) {}
+
+  /** Steps 1 and 2: stage the description for `snapshot` and return the publication. Never throws. */
+  async prepare(spec: PublicationSpec, snapshot: PrSnapshot): Promise<PrDescriptionPublication> {
+    const pub = new PrDescriptionPublication(this.deps, spec);
+    await pub.stageInitial(snapshot);
+    return pub;
+  }
+}
+
+export class PrDescriptionPublication {
+  private staged!: Staged;
+  private deadline: number | undefined;
+  private regenerationLeft = true;
+  private recomposeLeft = true;
+  private state: PrDescriptionState | null;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly forgeRetry: <T>(fn: () => Promise<T>) => Promise<T>;
+  private readonly acks: PrDescriptionAckOutcome[] = [];
+  /** Every region this publication rendered (each staged version's region and size-only form): a
+   *  region on the forge equal to one of them is uzi's own, whatever became of its version. */
+  private readonly rendered = new Set<string>();
+
+  constructor(
+    private readonly deps: PublisherDeps,
+    private readonly spec: PublicationSpec,
+  ) {
+    this.state = spec.prior ?? null;
+    this.sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    this.forgeRetry = deps.forgeRetry ?? ((fn) => fn());
+  }
+
+  /** uzi's own region for the current staged version. */
+  get region(): string {
+    return this.staged.region;
+  }
+
+  /** The body a NEW PR is created with: the region and the completion block, no preserved text
+   *  (D15-capped like any other body). */
+  initialBody(completion: string): string {
+    return capBody((r) => renderBody(r, completion), this.staged.region, this.staged.sizeOnly).body ?? renderBody(this.staged.sizeOnly, completion);
+  }
+
+  /** @internal prepare()'s staging. */
+  async stageInitial(snapshot: PrSnapshot): Promise<void> {
+    this.staged = await this.stage(snapshot, false);
+    this.remember();
+  }
+
+  // ── Staging (step 1, and every restage) ──
+
+  private async stage(snapshot: PrSnapshot, deterministic: boolean): Promise<Staged> {
+    const { spec, deps } = this;
+    let facts: SnapshotFacts | undefined;
+    try {
+      facts = await spec.facts(snapshot);
+    } catch (e) {
+      deps.log.warn("PR description: snapshot facts unavailable", { run_id: spec.runId, error: errMsg(e) });
+    }
+    const sizeLine = facts?.size.line ?? null;
+    let source: "generated" | "lead_only" | "deterministic_only" = "deterministic_only";
+    let fields: RawPrDescriptionFields = EMPTY_FIELDS;
+    if (!deterministic) {
+      const generated = await this.editorPass(snapshot);
+      const lead = leadFields(spec.lead);
+      if (generated) {
+        source = "generated";
+        fields = { ...generated, scope_notes: generated.scope_notes.map((n) => ({ ...n })), verification: leadVerification(spec.lead) };
+      } else if (lead) {
+        source = "lead_only";
+        fields = lead;
+      }
+    }
+    let version: PrDescriptionVersionDTO | undefined;
+    const base = facts?.baseSha ?? null;
+    if (base && SHA40_RE.test(base) && SHA40_RE.test(snapshot.headSha) && snapshot.targetBranch) {
+      try {
+        // Stage is NEVER retried: a lost response may already have stored a version.
+        version = (
+          await deps.api.stagePrDescription(
+            spec.runId,
+            {
+              claim_generation: spec.claimGeneration,
+              source,
+              fields,
+              size: facts?.size.size ?? null,
+              base_sha: base.toLowerCase(),
+              head_sha: snapshot.headSha.toLowerCase(),
+              target_branch: snapshot.targetBranch,
+            },
+            spec.signal,
+          )
+        ).version;
+      } catch (e) {
+        deps.log.warn("PR description: staging failed; the region carries the size line only", {
+          run_id: spec.runId,
+          error: errMsg(e),
+        });
+      }
+    } else {
+      deps.log.warn("PR description: the snapshot has no merge-base or head; the region is not staged", { run_id: spec.runId });
+    }
+    const input = { sizeLine, headSha: snapshot.headSha, targetBranch: snapshot.targetBranch };
+    return {
+      snapshot,
+      version,
+      region: renderRegion({ ...input, source: version?.source }, version?.fields).text,
+      sizeOnly: renderRegion(input).text,
+    };
+  }
+
+  /** The editor pass for `snapshot`, under the publication's ONE deadline (D2). Null on any failure. */
+  private async editorPass(snapshot: PrSnapshot): Promise<DeliverySummary | null> {
+    const { pass, log } = this.deps;
+    if (!pass) return null;
+    this.deadline ??= pass.deliverySummaryDeadline();
+    try {
+      const previous = this.state?.published_version?.fields ?? null;
+      const context = await this.spec.context(snapshot, this.deadline, previous);
+      return await pass.generateDeliverySummary({ claim: this.spec.claim, context, deadlineMs: this.deadline });
+    } catch (e) {
+      log.warn("PR description: the editor pass failed", { run_id: this.spec.runId, error: errMsg(e) });
+      return null;
+    }
+  }
+
+  // ── api calls ──
+
+  private async bind(mrIid: number, staged: Staged, hash: string): Promise<void> {
+    if (!staged.version || staged.boundHash !== undefined) return;
+    try {
+      const res = await replay(
+        () =>
+          this.deps.api.bindPrDescription(
+            this.spec.runId,
+            { claim_generation: this.spec.claimGeneration, version_id: staged.version!.id, mr_iid: mrIid, rendered_region_sha256: hash },
+            this.spec.signal,
+          ),
+        this.sleep,
+      );
+      staged.boundHash = hash;
+      this.state = res.pr;
+    } catch (e) {
+      this.deps.log.warn("PR description: binding the version failed", { run_id: this.spec.runId, error: errMsg(e) });
+    }
+  }
+
+  private async lookup(mrIid: number, hash: string): Promise<{ match: "published" | "pending" | "none" } | undefined> {
+    try {
+      const res = await replay(
+        () =>
+          this.deps.api.lookupPrDescription(
+            this.spec.runId,
+            { claim_generation: this.spec.claimGeneration, mr_iid: mrIid, region_sha256: hash },
+            this.spec.signal,
+          ),
+        this.sleep,
+      );
+      if (res.pr) this.state = res.pr;
+      return { match: res.match };
+    } catch (e) {
+      this.deps.log.warn("PR description: looking up the PR's region failed", { run_id: this.spec.runId, error: errMsg(e) });
+      return undefined;
+    }
+  }
+
+  /** Ack a BOUND version once. Only the six api outcomes exist; a lost compare-and-swap refreshes
+   *  the lock version through a lookup and replays. */
+  private async ack(mrIid: number, staged: Staged, outcome: PrDescriptionAckOutcome, observed?: string): Promise<void> {
+    if (!staged.version || staged.boundHash === undefined || staged.acked) return;
+    staged.acked = true;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const res = await replay(
+          () =>
+            this.deps.api.ackPrDescription(
+              this.spec.runId,
+              {
+                claim_generation: this.spec.claimGeneration,
+                version_id: staged.version!.id,
+                outcome,
+                expected_lock_version: this.state?.lock_version ?? 0,
+                ...(observed ? { observed_region_sha256: observed } : {}),
+              },
+              this.spec.signal,
+            ),
+          this.sleep,
+        );
+        this.state = res.pr;
+        this.acks.push(outcome);
+        return;
+      } catch (e) {
+        if (attempt === 0 && e instanceof PrDescriptionConflict && e.reason === "lock_conflict") {
+          await this.lookup(mrIid, observed ?? regionSha256(""));
+          continue;
+        }
+        this.deps.log.warn("PR description: the ack failed", { run_id: this.spec.runId, outcome, error: errMsg(e) });
+        return;
+      }
+    }
+  }
+
+  private async read(mrIid: number): Promise<MergeRequestDetail> {
+    const { spec, deps } = this;
+    return this.forgeRetry(() => deps.forge.getMergeRequest(spec.repoUrl, spec.pat, mrIid, spec.signal));
+  }
+
+  // ── Ownership and composition ──
+
+  /**
+   * Whether the region on the forge is uzi's to overwrite (D10 rule 2): it is a region this
+   * publication rendered (its current or a superseded version's), the published version's region, a region a pending version rendered (a
+   * lost ack, D9 step 4), or (with no published version and no matching version) exactly uzi's
+   * deterministic shape. Also refreshes this.state (a lookup answers the PR's record).
+   */
+  private async ownership(mrIid: number, region: string | undefined): Promise<"ours" | "human"> {
+    const hash = regionSha256(region ?? "");
+    const published = this.state?.published_version?.rendered_region_sha256;
+    if (region !== undefined && this.rendered.has(toLf(region))) {
+      if (!this.spec.prior && !this.state) await this.lookup(mrIid, hash);
+      return "ours";
+    }
+    if (region !== undefined && published && published === hash) return "ours";
+    const found = await this.lookup(mrIid, hash);
+    if (region === undefined) return "ours";
+    if (found && found.match !== "none") return "ours";
+    return !this.state?.published_version && isDeterministicRegion(region) ? "ours" : "human";
+  }
+
+  private compose(read: MergeRequestDetail, wantRegion: boolean, owner: "ours" | "human"): Composition {
+    const { spec } = this;
+    const staged = this.staged;
+    const parsed = parseOwnedBlocks(read.description);
+    const hasPublished = !!this.state?.published_version;
+    const publishedHead = this.state?.published_version?.head_sha;
+    let skip: RegionSkip | undefined;
+    let writeRegion = wantRegion;
+    if (parsed.kind === "malformed") {
+      skip = "skipped_malformed";
+      writeRegion = false;
+    } else if (parsed.kind === "none") {
+      if (spec.mode === "refresh") {
+        return { body: undefined, capped: false, interlockRewrite: false, legacyUntouched: true };
+      }
+      if (hasPublished) {
+        skip = "skipped_no_region";
+        writeRegion = false;
+      }
+    } else if (parsed.region !== undefined) {
+      if (owner === "human") {
+        skip = "skipped_human_edit";
+        writeRegion = false;
+      }
+    } else if (hasPublished) {
+      skip = "skipped_no_region";
+      writeRegion = false;
+    }
+    const describedFor = (written: boolean): string | undefined => (written ? staged.snapshot.headSha : publishedHead);
+    const completionFor = (written: boolean): string => {
+      const d = describedFor(written);
+      return spec.completion(d ? { describedSha: d, headSha: read.headSha } : undefined);
+    };
+
+    // The body with `region` as uzi's region (undefined: keep whatever region the forge shows).
+    const build = (region: string | undefined): string | undefined => {
+      const completion = completionFor(region !== undefined);
+      if (parsed.kind === "malformed") return undefined;
+      if (parsed.kind === "none") {
+        // own mode only (refresh returned above). A legacy PR with no published version is
+        // rewritten whole (D10, today's behaviour); a removed region keeps the text and appends
+        // the completion block.
+        return region !== undefined ? renderBody(region, completion) : `${read.description.trimEnd()}\n\n${completion}`;
+      }
+      const parts: OwnedBlocks = parsed;
+      if (spec.mode === "refresh") {
+        const nextCompletion =
+          parts.completion !== undefined ? withStalenessLine(parts.completion, stalenessOf(region !== undefined)) : undefined;
+        if (region !== undefined && parts.region === undefined) {
+          return insertRegion(parts, region, nextCompletion);
+        }
+        return composeBody(parts, { region, completion: nextCompletion });
+      }
+      if (region !== undefined && parts.region === undefined) return insertRegion(parts, region, completion);
+      if (parts.completion === undefined) {
+        const withRegion = composeBody(parts, { region }) ?? read.description;
+        return `${withRegion.trimEnd()}\n\n${completion}`;
+      }
+      return composeBody(parts, { region, completion });
+    };
+    const stalenessOf = (written: boolean): string => {
+      const d = describedFor(written);
+      return d ? stalenessPair(d, read.headSha) : "";
+    };
+
+    let body: string | undefined;
+    let region: string | undefined;
+    let capped = false;
+    if (writeRegion) {
+      const res = capBody((r) => build(r), staged.region, staged.sizeOnly);
+      body = res.body;
+      capped = res.capped;
+      region = capped ? staged.sizeOnly : staged.region;
+    } else {
+      body = build(undefined);
+    }
+
+    // Amended D10: a non-closing completion for an issue run → scan the WHOLE resulting body for a
+    // closing directive uzi does not write; if one remains, preservation yields: rewrite the body
+    // whole, with uzi's own region and completion only.
+    let interlockRewrite = false;
+    if (spec.mode === "own" && spec.interlockIssueIid !== undefined && !spec.completionCloses) {
+      const ownRegion = region ?? staged.region;
+      const completion = completionFor(region !== undefined);
+      const result = body ?? read.description;
+      if (closingDirectiveOutsideCompletion(result, spec.interlockIssueIid, completion, spec.repoPath)) {
+        const wholeCompletion = completionFor(true);
+        const whole = capBody((r) => renderBody(r, wholeCompletion), ownRegion, staged.sizeOnly);
+        body = whole.body ?? renderBody(staged.sizeOnly, wholeCompletion);
+        region = whole.capped ? staged.sizeOnly : ownRegion;
+        capped = capped || whole.capped;
+        interlockRewrite = true;
+        skip = undefined;
+      }
+    }
+    return {
+      body,
+      region,
+      skip: region === undefined ? skip : undefined,
+      capped,
+      interlockRewrite,
+      legacyUntouched: false,
+      describedSha: describedFor(region !== undefined),
+    };
+  }
+
+  // ── Steps 3-9 ──
+
+  /** Publish onto PR `mrIid`. Never throws; every failure is advisory. */
+  async publish(mrIid: number): Promise<PublishOutcome> {
+    try {
+      return await this.publishInner(mrIid);
+    } catch (e) {
+      this.deps.log.warn("PR description: publishing failed", { run_id: this.spec.runId, error: errMsg(e) });
+      return { region: this.staged.region, wrote: false, interlockRewrite: false, ack: this.acks.at(-1) };
+    }
+  }
+
+  private async restage(snapshot: PrSnapshot, deterministic: boolean): Promise<void> {
+    this.staged = await this.stage(snapshot, deterministic);
+    this.remember();
+  }
+
+  private remember(): void {
+    this.rendered.add(toLf(this.staged.region));
+    this.rendered.add(toLf(this.staged.sizeOnly));
+  }
+
+  private async publishInner(mrIid: number): Promise<PublishOutcome> {
+    const { deps } = this;
+    let read = await this.read(mrIid);
+    // Step 3. A forge can lag a push by a moment (GitLab especially): when the head differs, re-read
+    // once after a short wait before spending the regeneration on what may be a stale head.
+    if (!sameSha(read.headSha, this.staged.snapshot.headSha) && (deps.headLagRetryMs ?? 2000) > 0) {
+      await this.sleep(deps.headLagRetryMs ?? 2000);
+      read = await this.read(mrIid);
+    }
+    if (!sameSnapshot(read, this.staged.snapshot)) {
+      this.regenerationLeft = false;
+      await this.restage({ headSha: read.headSha, targetBranch: read.targetBranch }, false);
+    }
+    // A region skip forced by a spent budget (the completion block is still written).
+    let budgetSkip: RegionSkip | undefined;
+    let comp!: Composition;
+    let latest = read;
+    for (let round = 0; round < MAX_ROUNDS; round++) {
+      // Steps 4-5.
+      comp = await this.composeFrom(mrIid, read, budgetSkip === undefined);
+      if (comp.legacyUntouched) {
+        deps.log.info("PR description: a refresh leaves a PR without uzi markers untouched", { run_id: this.spec.runId });
+        return { region: this.staged.region, wrote: false, interlockRewrite: false };
+      }
+      if (comp.capped && this.staged.version && this.staged.version.source !== "deterministic_only") {
+        // D15: the cap dropped the fields, so the staged version no longer matches what is written.
+        // It is still unbound, so it simply stays pending; a deterministic_only version replaces it.
+        await this.restage(this.staged.snapshot, true);
+        comp = await this.composeFrom(mrIid, read, budgetSkip === undefined);
+      }
+      // Step 6: bind with the FINAL region hash (the region this version would write).
+      await this.bind(mrIid, this.staged, regionSha256(comp.region ?? this.staged.region));
+      // Step 7: read 2 revalidates the snapshot and the description.
+      const read2 = await this.read(mrIid);
+      latest = read2;
+      if (!sameSnapshot(read2, read)) {
+        // (b) The head or target moved: the bound version describes a snapshot the PR no longer has.
+        await this.ack(mrIid, this.staged, "skipped_snapshot_moved");
+        read = read2;
+        if (this.regenerationLeft) {
+          this.regenerationLeft = false;
+          await this.restage({ headSha: read2.headSha, targetBranch: read2.targetBranch }, false);
+          continue;
+        }
+        budgetSkip = "skipped_snapshot_moved";
+        comp = await this.composeFrom(mrIid, read, false);
+        break;
+      }
+      if (read2.description !== read.description) {
+        // (a) The description changed on the same snapshot.
+        read = read2;
+        if (this.recomposeLeft) {
+          this.recomposeLeft = false;
+          const next = await this.composeFrom(mrIid, read, true);
+          if (next.region !== undefined && comp.region !== undefined && next.region !== comp.region && this.staged.version) {
+            // The recompose changed the region (a different D15 cap): the bound version no longer
+            // matches what would be written. skipped_snapshot_moved is the outcome that abandons a
+            // bound version superseded this way (there is no "abandoned" outcome to send); the
+            // replacement is a deterministic_only version, bound and revalidated with a new read.
+            await this.ack(mrIid, this.staged, "skipped_snapshot_moved");
+            await this.restage(this.staged.snapshot, true);
+            continue;
+          }
+          comp = next;
+          break;
+        }
+        // The recompose is spent: the region is left, the completion block is still written.
+        await this.ack(mrIid, this.staged, "skipped_human_edit");
+        budgetSkip = "skipped_human_edit";
+        comp = await this.composeFrom(mrIid, read, false);
+        break;
+      }
+      break;
+    }
+    if (budgetSkip === undefined && comp.region === undefined && comp.skip) {
+      await this.ack(mrIid, this.staged, comp.skip);
+    }
+    const skip = comp.region === undefined ? (budgetSkip ?? comp.skip) : undefined;
+    if (skip) deps.emit(SKIP_MESSAGES[skip]);
+
+    // Step 8: write only when the body composed from the LATEST read differs from it.
+    const observedBefore = observedRegionHash(latest.description);
+    let wrote = false;
+    if (comp.body !== undefined && comp.body !== latest.description) {
+      try {
+        await this.forgeRetry(() =>
+          deps.forge.updateMergeRequestDescription(this.spec.repoUrl, this.spec.pat, mrIid, comp.body!, this.spec.signal),
+        );
+        wrote = true;
+      } catch (e) {
+        deps.log.warn("PR description: the forge write failed", { run_id: this.spec.runId, error: errMsg(e) });
+        await this.ack(mrIid, this.staged, "write_failed", observedBefore);
+        return this.outcome(comp, false, observedBefore === this.staged.boundHash);
+      }
+    }
+    // Step 9: confirm. Without a write the latest read is the confirmation.
+    let confirm = latest;
+    if (wrote) {
+      try {
+        confirm = await this.read(mrIid);
+      } catch (e) {
+        // Unconfirmed: the version stays bound and pending, so the next writer's lookup recovers
+        // it (D9 step 4) if the write landed. Never ack published for an unconfirmed version.
+        deps.log.warn("PR description: could not re-read the PR after writing", { run_id: this.spec.runId, error: errMsg(e) });
+        return this.outcome(comp, true, false);
+      }
+    }
+    const observed = observedRegionHash(confirm.description);
+    const onForge = observed !== undefined && observed === this.staged.boundHash;
+    if (onForge) {
+      await this.ack(mrIid, this.staged, "published", observed);
+    } else if (comp.region !== undefined) {
+      // A post-write mismatch (or a region that never reached the forge) is recorded, not retried.
+      await this.ack(mrIid, this.staged, "write_failed", observed);
+    }
+    return this.outcome(comp, wrote, onForge);
+  }
+
+  private async composeFrom(mrIid: number, read: MergeRequestDetail, wantRegion: boolean): Promise<Composition> {
+    const parsed = parseOwnedBlocks(read.description);
+    const region = parsed.kind === "ok" ? parsed.region : undefined;
+    const owner = parsed.kind === "malformed" ? "human" : await this.ownership(mrIid, region);
+    return this.compose(read, wantRegion, owner);
+  }
+
+  private outcome(comp: Composition, wrote: boolean, onForge: boolean): PublishOutcome {
+    return {
+      ack: this.acks.at(-1),
+      region: comp.region ?? this.staged.region,
+      describedSha: onForge ? this.staged.snapshot.headSha : comp.region === undefined ? comp.describedSha : undefined,
+      wrote,
+      interlockRewrite: comp.interlockRewrite,
+    };
+  }
+}
+
+/** The region hash of a body read from the forge, or undefined when it carries no parseable region. */
+function observedRegionHash(body: string): string | undefined {
+  const p = parseOwnedBlocks(body);
+  return p.kind === "ok" && p.region !== undefined ? regionSha256(p.region) : undefined;
+}
+
+/** `parts` with `region` inserted before the completion block (a body that had none). */
+function insertRegion(parts: OwnedBlocks, region: string, completion: string | undefined): string {
+  if (parts.completion === undefined) return `${region}\n\n${parts.before}${parts.between}${parts.after}`;
+  return `${parts.before}${region}\n\n${parts.between}${completion ?? parts.completion}${parts.after}`;
+}
+
+// ── The completion interlock's reconcile (runner.ts phasePublish) ─────────────────────────────
+
+export interface ReconcileArgs {
+  forge: PublisherForge;
+  repoUrl: string;
+  pat: string;
+  mrIid: number;
+  signal?: AbortSignal;
+  /** The completion block to write, with the staleness line for `headSha` when given. */
+  completion: (headSha?: string) => string;
+  /** uzi's own region for a whole-body rewrite (undefined: the completion block alone). */
+  ownRegion: string | undefined;
+  /** Set when the block is NON-closing on an issue run: the whole result is scanned for a closing
+   *  directive for this issue (amended D10), and a failed read falls back to a blind whole-body
+   *  rewrite (which carries no directive by construction). */
+  nonClosing?: { issueIid: number; repoPath?: string };
+  forgeRetry?: <T>(fn: () => Promise<T>) => Promise<T>;
+  log: Pick<Logger, "warn">;
+}
+
+/**
+ * `confirmed`: the re-read body carries the rendered completion block (and, when non-closing, no
+ * closing directive outside it). `unconfirmed`: the write or its confirmation failed.
+ * `closing`: a non-closing write found a closing directive it could not remove.
+ */
+export type ReconcileResult = "confirmed" | "unconfirmed" | "closing";
+
+/**
+ * The interlock's reconcile: read, replace ONLY the completion block, write, re-read. Malformed or
+ * missing completion markers (and a PR with no markers) get a whole-body rewrite. On a non-closing
+ * write the result is scanned (amended D10); a directive uzi does not write forces a whole-body
+ * non-closing rewrite, re-read and re-scanned. A failed read on a non-closing write falls back to
+ * the blind whole-body rewrite (today's behaviour). Never throws.
+ */
+export async function reconcileCompletion(a: ReconcileArgs): Promise<ReconcileResult> {
+  const retry = a.forgeRetry ?? ((fn) => fn());
+  const read = () => retry(() => a.forge.getMergeRequest(a.repoUrl, a.pat, a.mrIid, a.signal));
+  const write = (body: string) => retry(() => a.forge.updateMergeRequestDescription(a.repoUrl, a.pat, a.mrIid, body, a.signal));
+  const closingOutside = (body: string, completion: string) =>
+    a.nonClosing !== undefined && closingDirectiveOutsideCompletion(body, a.nonClosing.issueIid, completion, a.nonClosing.repoPath);
+  const blind = async (): Promise<ReconcileResult> => {
+    try {
+      await write(renderBody(a.ownRegion, a.completion()));
+      return "confirmed";
+    } catch (e) {
+      a.log.warn("completion interlock: the whole-body rewrite failed", { error: errMsg(e) });
+      return "unconfirmed";
+    }
+  };
+  let current: MergeRequestDetail;
+  try {
+    current = await read();
+  } catch (e) {
+    a.log.warn("completion interlock: could not read the MR description", { error: errMsg(e) });
+    return a.nonClosing ? blind() : "unconfirmed";
+  }
+  let whole = false;
+  let foundDirective = false;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const completion = a.completion(current.headSha);
+    let body: string | undefined;
+    if (!whole) {
+      const parsed = parseOwnedBlocks(current.description);
+      body = parsed.kind === "ok" && parsed.completion !== undefined ? composeBody(parsed, { completion }) : undefined;
+      if (body !== undefined && closingOutside(body, completion)) {
+        foundDirective = true;
+        body = undefined;
+      }
+    }
+    if (body === undefined) {
+      whole = true;
+      body = renderBody(a.ownRegion, completion);
+    }
+    if (body !== current.description) {
+      try {
+        await write(body);
+      } catch (e) {
+        a.log.warn("completion interlock: could not write the MR description", { error: errMsg(e) });
+        return foundDirective ? "closing" : "unconfirmed";
+      }
+    }
+    try {
+      current = await read();
+    } catch (e) {
+      a.log.warn("completion interlock: could not re-read the MR description", { error: errMsg(e) });
+      if (!a.nonClosing) return "unconfirmed";
+      const r = await blind();
+      return r === "confirmed" || !foundDirective ? r : "closing";
+    }
+    const carried = carriesCompletion(current.description, a.completion(current.headSha));
+    const closing = carried && closingOutside(current.description, a.completion(current.headSha));
+    if (carried && !closing) return "confirmed";
+    if (closing) foundDirective = true;
+    if (!a.nonClosing || whole) break;
+    whole = true;
+  }
+  return foundDirective ? "closing" : "unconfirmed";
+}

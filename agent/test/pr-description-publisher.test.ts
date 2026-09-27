@@ -1,0 +1,772 @@
+import { afterEach, beforeEach, describe, it } from "node:test";
+import assert from "node:assert/strict";
+import type { WorkerClient } from "../src/client.js";
+import { ForgeError, type MergeRequestDetail } from "../src/forge.js";
+import type { DeliveryContext } from "../src/pr-description-context.js";
+import {
+  PrDescriptionPublisher,
+  isDeterministicRegion,
+  reconcileCompletion,
+  repoPathFromUrl,
+  withStalenessLine,
+  type DeliveryPass,
+  type PublicationSpec,
+  type PublisherForge,
+} from "../src/pr-description-publisher.js";
+import {
+  BODY_CAP_CHARS,
+  REGION_END,
+  REGION_START,
+  STALENESS_START,
+  closingDirectiveFor,
+  parseOwnedBlocks,
+  regionSha256,
+  renderBody,
+  renderCompletionBlock,
+  renderRegion,
+} from "../src/pr-description.js";
+import { PR_DESC_ACK_OUTCOMES, type PrDescriptionSize, type PrDescriptionState } from "../src/protocol.js";
+import type { PrSummaryClaim } from "../src/signals.js";
+import type { DeliverySummary } from "../src/summary-runner.js";
+import { FakePrDescApi, clientFor } from "./fake-pr-desc-api.js";
+import { nullLogger } from "./helpers.js";
+
+// PRD #1798 M6 (M6b): the PR-description publisher (steps 1-9, D8-D12, D15, D17) and the completion
+// interlock's reconcile, driven against an in-memory forge and an in-memory model of the api's
+// pr-description routes (real WorkerClient decoding, so published fields are real sanitized
+// instances).
+
+const RUN = "11111111-2222-3333-4444-555555555555";
+const H1 = "a".repeat(40);
+const H2 = "c".repeat(40);
+const H3 = "d".repeat(40);
+const BASE = "b".repeat(40);
+const MR = 42;
+const IID = 7;
+const SIZE_LINE = "**Size:** code +3 −1 · 1 file";
+const ZERO = { added: 0, deleted: 0 };
+const SIZE: PrDescriptionSize = { unavailable: false, files: 1, code: { added: 3, deleted: 1 }, tests: ZERO, docs: ZERO, config: ZERO, generated: ZERO, vendored: ZERO };
+const CTX: DeliveryContext = {
+  issue: "",
+  prd: null,
+  plan: null,
+  previous: null,
+  claims: null,
+  commits: "",
+  paths: "",
+  diff: "",
+  truncated: { issue: false, prd: false, plan: false, previous: false, claims: false, commits: false, paths: false, diff: false },
+  bytes: 0,
+};
+const SUMMARY: DeliverySummary = {
+  summary: "Reviewers can now mark a finding done from the Findings page.",
+  changes: ["Web: a Mark done button on each row."],
+  scope_notes: [],
+  review_pointers: ["The disposition rules are shared with the judge."],
+};
+const LEAD: PrSummaryClaim = {
+  what: "Adds a Mark done button.",
+  why: "Findings piled up.",
+  verification: [{ command: "task gate:web", result: "pass" }],
+  verifiedAtSha: H1,
+};
+
+// ── Fakes ───────────────────────────────────────────────────────────────────────────────────
+
+class FakeForge implements PublisherForge {
+  pr = { head: H1, target: "main", description: "" };
+  reads = 0;
+  readonly writes: string[] = [];
+  /** Runs before the nth read (1-based), so a test can edit the PR between reads. */
+  beforeRead?: (n: number, pr: FakeForge["pr"]) => void;
+  failRead?: (n: number) => boolean;
+  failWrite = false;
+  /** Runs after a write lands, so a test can model a concurrent edit the confirm read sees. */
+  afterWrite?: (pr: FakeForge["pr"]) => void;
+
+  async getMergeRequest(): Promise<MergeRequestDetail> {
+    this.reads++;
+    this.beforeRead?.(this.reads, this.pr);
+    if (this.failRead?.(this.reads)) throw new ForgeError(503, "down");
+    return { headSha: this.pr.head, targetBranch: this.pr.target, description: this.pr.description, state: "open" };
+  }
+
+  async updateMergeRequestDescription(_url: string, _pat: string, _iid: number, description: string): Promise<void> {
+    if (this.failWrite) throw new ForgeError(500, "write refused");
+    this.writes.push(description);
+    this.pr.description = description;
+    this.afterWrite?.(this.pr);
+  }
+}
+
+class FakePass implements DeliveryPass {
+  deadlines = 0;
+  readonly calls: number[] = [];
+  constructor(private readonly out: DeliverySummary | null) {}
+  deliverySummaryDeadline(): number {
+    this.deadlines++;
+    return 1_000_000;
+  }
+  async generateDeliverySummary(input: { deadlineMs: number }): Promise<DeliverySummary | null> {
+    this.calls.push(input.deadlineMs);
+    return this.out;
+  }
+}
+
+let api: FakePrDescApi;
+let client: WorkerClient;
+let restore: () => void;
+/** Every ack outcome any test sent, checked against the six api values at the end. */
+const everyAck: string[] = [];
+
+beforeEach(() => {
+  api = new FakePrDescApi();
+  ({ client, restore } = clientFor(api));
+});
+afterEach(() => {
+  everyAck.push(...api.acks());
+  restore();
+});
+
+function completion(closes: boolean, staleness?: { describedSha: string; headSha: string }): string {
+  return renderCompletionBlock({ issueIid: IID, branch: "agent/issue-7", closes, staleness });
+}
+
+function makeSpec(over: Partial<PublicationSpec> = {}): PublicationSpec {
+  return {
+    runId: RUN,
+    claimGeneration: 1,
+    claim: { run_id: RUN, secrets: {} },
+    repoUrl: "https://gitlab.example.test/o/r",
+    pat: "pat",
+    repoPath: "o/r",
+    mode: "own",
+    completionCloses: true,
+    facts: async () => ({ baseSha: BASE, size: { line: SIZE_LINE, size: SIZE } }),
+    context: async () => CTX,
+    completion: (st) => completion(true, st),
+    ...over,
+  };
+}
+
+interface Rig {
+  forge: FakeForge;
+  emitted: string[];
+  publisher: PrDescriptionPublisher;
+  pass: FakePass | null;
+}
+
+function rig(pass: FakePass | null = new FakePass(SUMMARY)): Rig {
+  const forge = new FakeForge();
+  const emitted: string[] = [];
+  const publisher = new PrDescriptionPublisher({
+    forge,
+    api: client,
+    pass,
+    log: nullLogger(),
+    emit: (t) => emitted.push(t),
+    sleep: async () => {},
+    headLagRetryMs: 0,
+  });
+  return { forge, emitted, publisher, pass };
+}
+
+/** A new PR: prepare, create with the initial body, publish. */
+async function newPr(r: Rig, spec: PublicationSpec = makeSpec()) {
+  const pub = await r.publisher.prepare(spec, { headSha: H1, targetBranch: "main" });
+  r.forge.pr.description = pub.initialBody(spec.completion());
+  const out = await pub.publish(MR);
+  return { pub, out };
+}
+
+/** The PR's record as the claim carries it, decoded by the real client. */
+async function priorState(): Promise<PrDescriptionState> {
+  const res = await client.lookupPrDescription(RUN, { claim_generation: 1, mr_iid: MR, region_sha256: "0".repeat(64) });
+  api.calls.length = 0;
+  return res.pr!;
+}
+
+function stages() {
+  return api.calls.filter((c) => c.op === "stage").map((c) => c.body);
+}
+
+const OLD_REGION = [REGION_START, "An older summary of this PR.", "", SIZE_LINE, "", "Describes `aaaaaaa` against `main`.", REGION_END].join("\n");
+
+// ── Step 1 and the fallback ladder (D8) ──────────────────────────────────────────────────────
+
+describe("publisher: staging and the fallback ladder (D8)", () => {
+  it("rung 1: the editor pass stages `generated` with the lead's stamped checks, and a new PR is published as created", async () => {
+    const r = rig();
+    const { pub, out } = await newPr(r, makeSpec({ lead: LEAD }));
+    const [stage] = stages();
+    assert.equal(stage!.source, "generated");
+    assert.deepEqual((stage!.fields as { verification: unknown }).verification, [
+      { command: "task gate:web", result: "pass", verified_at_sha: H1 },
+    ]);
+    assert.equal(stage!.head_sha, H1);
+    assert.equal(stage!.base_sha, BASE);
+    assert.match(pub.region, /Reviewers can now mark a finding done/);
+    assert.match(pub.region, /Reported by the agent at `aaaaaaa`/);
+    assert.equal(r.forge.writes.length, 0, "the body it was created with is already current: no write");
+    assert.deepEqual(api.acks(), ["published"]);
+    const bind = api.calls.find((c) => c.op === "bind")!.body;
+    assert.equal(bind.rendered_region_sha256, regionSha256(pub.region), "bound with the exact region hash");
+    assert.equal(out.describedSha, H1);
+  });
+
+  it("rung 2: a failed pass with lead claims stages `lead_only` (what + why), with the rung-2 note", async () => {
+    const r = rig(new FakePass(null));
+    const { pub } = await newPr(r, makeSpec({ lead: LEAD }));
+    const [stage] = stages();
+    assert.equal(stage!.source, "lead_only");
+    assert.equal((stage!.fields as { summary: string }).summary, "Adds a Mark done button. Findings piled up.");
+    assert.match(pub.region, /Summary written by the agent, not checked against the diff/);
+    assert.deepEqual(api.acks(), ["published"]);
+  });
+
+  it("rung 3: no pass and no claims stages `deterministic_only`; the region is the size and provenance lines", async () => {
+    const r = rig(null);
+    const { pub } = await newPr(r);
+    assert.equal(stages()[0]!.source, "deterministic_only");
+    assert.equal(pub.region, renderRegion({ sizeLine: SIZE_LINE, headSha: H1, targetBranch: "main" }).text);
+    assert.ok(isDeterministicRegion(pub.region));
+  });
+
+  it("rung 3: a failed stage is never retried; nothing is bound or acked and the region is deterministic", async () => {
+    const r = rig();
+    api.failNext("stage", 503);
+    const { pub, out } = await newPr(r, makeSpec({ lead: LEAD }));
+    assert.equal(stages().length, 1, "stage is never retried");
+    assert.ok(!api.calls.some((c) => c.op === "bind" || c.op === "ack"));
+    assert.ok(isDeterministicRegion(pub.region));
+    assert.equal(out.ack, undefined);
+  });
+
+  it("lead checks without a verified_at stamp are dropped (the api rejects unstamped entries)", async () => {
+    const r = rig();
+    await newPr(r, makeSpec({ lead: { ...LEAD, verifiedAtSha: undefined } }));
+    assert.deepEqual((stages()[0]!.fields as { verification: unknown[] }).verification, []);
+  });
+
+  it("the editor pass and a regeneration share ONE deadline", async () => {
+    const pass = new FakePass(SUMMARY);
+    const r = rig(pass);
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    r.forge.pr.description = pub.initialBody(completion(true));
+    r.forge.pr.head = H2; // read 1 sees another head: the one regeneration
+    await pub.publish(MR);
+    assert.equal(pass.deadlines, 1, "the deadline is computed once per publication");
+    assert.deepEqual(pass.calls, [1_000_000, 1_000_000]);
+  });
+});
+
+// ── Composition: preservation, human edits and markers (D10, D15) ─────────────────────────────
+
+describe("publisher: preservation and human-edit protection (D10)", () => {
+  it("text outside both blocks survives a refresh byte-for-byte", async () => {
+    const r = rig();
+    api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+    const before = "## Template\r\nFilled by a person.  \n\n";
+    const between = "\n\n<details>bot</details>\n\n";
+    const after = "\n\n## Summary by a review bot\nKeep\tme\r\n";
+    r.forge.pr.description = before + OLD_REGION + between + completion(false) + after;
+    const pub = await r.publisher.prepare(makeSpec({ prior: await priorState() }), { headSha: H1, targetBranch: "main" });
+    await pub.publish(MR);
+    assert.equal(r.forge.writes.length, 1);
+    const written = r.forge.writes[0]!;
+    assert.equal(written, before + pub.region + between + completion(true) + after);
+    assert.deepEqual(api.acks(), ["published"]);
+  });
+
+  it("an edited region is not overwritten: skipped_human_edit, a run message, and the completion block still written", async () => {
+    const r = rig();
+    api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+    const edited = OLD_REGION.replace("An older summary", "A maintainer's own summary");
+    r.forge.pr.description = `${edited}\n\n${completion(false)}`;
+    const pub = await r.publisher.prepare(makeSpec({ prior: await priorState() }), { headSha: H1, targetBranch: "main" });
+    const out = await pub.publish(MR);
+    const parsed = parseOwnedBlocks(r.forge.pr.description);
+    assert.equal(parsed.kind, "ok");
+    assert.equal(parsed.kind === "ok" && parsed.region, edited, "the edited region is kept byte for byte");
+    assert.equal(parsed.kind === "ok" && parsed.completion, completion(true), "the completion block is rewritten");
+    assert.deepEqual(api.acks(), ["skipped_human_edit"]);
+    assert.equal(out.ack, "skipped_human_edit");
+    assert.ok(r.emitted.some((t) => /edited by a person/.test(t)), "a run status message names the skip");
+  });
+
+  it("a region with no published version is overwritten only when it has uzi's deterministic shape", async () => {
+    // Bodies created before this publisher: a size-line-only region, no provenance, no version.
+    const legacy = [REGION_START, SIZE_LINE, REGION_END].join("\n");
+    const r = rig();
+    r.forge.pr.description = `${legacy}\n\n${completion(true)}`;
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    await pub.publish(MR);
+    assert.equal(r.forge.pr.description, renderBody(pub.region, completion(true)));
+    assert.deepEqual(api.acks(), ["published"]);
+
+    const r2 = rig();
+    const foreign = [REGION_START, "Someone wrote this.", REGION_END].join("\n");
+    r2.forge.pr.description = `${foreign}\n\n${completion(true)}`;
+    const pub2 = await r2.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    await pub2.publish(MR);
+    assert.match(r2.forge.pr.description, /Someone wrote this\./);
+    assert.deepEqual(api.acks().slice(-1), ["skipped_human_edit"]);
+  });
+
+  it("a region removed from a PR with a published version is not put back: skipped_no_region", async () => {
+    const r = rig();
+    api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+    r.forge.pr.description = `Only human text.\n\n${completion(false)}`;
+    const pub = await r.publisher.prepare(makeSpec({ prior: await priorState() }), { headSha: H1, targetBranch: "main" });
+    await pub.publish(MR);
+    assert.equal(r.forge.pr.description, `Only human text.\n\n${completion(true)}`);
+    assert.deepEqual(api.acks(), ["skipped_no_region"]);
+  });
+
+  it("malformed markers: skipped_malformed and the body is left as it is", async () => {
+    const r = rig();
+    const body = `${REGION_START}\nx\n${REGION_START}\n${REGION_END}\n\n${completion(true)}`;
+    r.forge.pr.description = body;
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    await pub.publish(MR);
+    assert.equal(r.forge.pr.description, body);
+    assert.equal(r.forge.writes.length, 0);
+    assert.deepEqual(api.acks(), ["skipped_malformed"]);
+  });
+
+  it("a legacy PR without markers is rewritten whole (D10, today's behaviour)", async () => {
+    const r = rig();
+    r.forge.pr.description = "Old body. Implements the thing.";
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    await pub.publish(MR);
+    assert.equal(r.forge.pr.description, renderBody(pub.region, completion(true)));
+    assert.deepEqual(api.acks(), ["published"]);
+  });
+
+  it("D15: a body over the cap drops the region to the size line and restages deterministic_only", async () => {
+    const r = rig();
+    const bulk = "x".repeat(BODY_CAP_CHARS - 200);
+    r.forge.pr.description = `${bulk}\n\n${[REGION_START, SIZE_LINE, REGION_END].join("\n")}\n\n${completion(true)}`;
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    await pub.publish(MR);
+    assert.deepEqual(stages().map((s) => s.source), ["generated", "deterministic_only"]);
+    const parsed = parseOwnedBlocks(r.forge.pr.description);
+    assert.ok(parsed.kind === "ok" && parsed.region !== undefined && isDeterministicRegion(parsed.region));
+    assert.ok(r.forge.pr.description.startsWith(bulk), "preserved text is never truncated");
+    // The superseded version was never bound, so it stays pending (never acked); only its
+    // replacement is published.
+    const [v1] = [...api.versions.values()].filter((v) => v.source === "generated");
+    assert.equal(v1!.state, "pending");
+    assert.deepEqual(api.acks(), ["published"]);
+  });
+});
+
+// ── The completion interlock inside the publisher (amended D10) ────────────────────────────────
+
+describe("publisher: a non-closing completion block scans the whole body (amended D10)", () => {
+  const nonClosing = (over: Partial<PublicationSpec> = {}) =>
+    makeSpec({ interlockIssueIid: IID, completionCloses: false, completion: (st) => completion(false, st), ...over });
+
+  it("a human-typed `Closes #7` outside the blocks forces a whole-body non-closing rewrite", async () => {
+    const r = rig();
+    api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+    r.forge.pr.description = `Closes #7 please\n\n${OLD_REGION}\n\n${completion(false)}`;
+    const pub = await r.publisher.prepare(nonClosing({ prior: await priorState() }), { headSha: H1, targetBranch: "main" });
+    const out = await pub.publish(MR);
+    assert.equal(r.forge.pr.description, renderBody(pub.region, completion(false)));
+    assert.equal(closingDirectiveFor(r.forge.pr.description, IID, "o/r"), false);
+    assert.ok(out.interlockRewrite);
+    assert.deepEqual(api.acks(), ["published"]);
+  });
+
+  it("`Closes #7` typed into the (human-edited) region yields too: the region is replaced by uzi's", async () => {
+    const r = rig();
+    api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+    const edited = OLD_REGION.replace("An older summary of this PR.", "Closes #7");
+    r.forge.pr.description = `${edited}\n\n${completion(false)}`;
+    const pub = await r.publisher.prepare(nonClosing({ prior: await priorState() }), { headSha: H1, targetBranch: "main" });
+    await pub.publish(MR);
+    assert.equal(r.forge.pr.description, renderBody(pub.region, completion(false)));
+  });
+
+  it("malformed markers with a closing directive are rewritten whole", async () => {
+    const r = rig();
+    r.forge.pr.description = `Fixes #7\n${REGION_START}\n${REGION_START}\n\n${completion(false)}`;
+    const pub = await r.publisher.prepare(nonClosing(), { headSha: H1, targetBranch: "main" });
+    await pub.publish(MR);
+    assert.equal(r.forge.pr.description, renderBody(pub.region, completion(false)));
+  });
+
+  it("a closing completion (a legacy issue run) keeps human text as it is", async () => {
+    const r = rig();
+    r.forge.pr.description = `Closes #7 please\n\n${[REGION_START, SIZE_LINE, REGION_END].join("\n")}\n\n${completion(true)}`;
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    await pub.publish(MR);
+    assert.ok(r.forge.pr.description.startsWith("Closes #7 please\n\n"));
+  });
+});
+
+// ── D11 revalidation ─────────────────────────────────────────────────────────────────────────
+
+describe("publisher: D11 revalidation between reads", () => {
+  it("a description changed between read 1 and read 2 is recomposed ONCE from the newer read", async () => {
+    const r = rig();
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    r.forge.pr.description = `Human notes.\n\n${[REGION_START, SIZE_LINE, REGION_END].join("\n")}\n\n${completion(true)}`;
+    r.forge.beforeRead = (n, pr) => {
+      if (n === 2) pr.description += "\n\nA late review-bot note.";
+    };
+    await pub.publish(MR);
+    assert.equal(r.forge.writes.length, 1);
+    assert.match(r.forge.writes[0]!, /A late review-bot note\.$/, "the write is composed from the newer read");
+    assert.equal(stages().length, 1, "the recompose does not restage");
+    assert.deepEqual(api.acks(), ["published"]);
+  });
+
+  it("a head that moved between reads acks the bound version skipped_snapshot_moved, then restages for the new head", async () => {
+    const r = rig();
+    const { pub } = await (async () => {
+      const p = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+      r.forge.pr.description = p.initialBody(completion(true));
+      r.forge.beforeRead = (n, pr) => {
+        if (n === 2) pr.head = H2;
+      };
+      await p.publish(MR);
+      return { pub: p };
+    })();
+    assert.deepEqual(stages().map((s) => s.head_sha), [H1, H2]);
+    assert.deepEqual(api.acks(), ["skipped_snapshot_moved", "published"]);
+    assert.match(pub.region, /Describes `ccccccc` against `main`\./);
+    assert.equal(parseOwnedBlocks(r.forge.pr.description).kind === "ok" && (parseOwnedBlocks(r.forge.pr.description) as { region?: string }).region, pub.region);
+  });
+
+  it("read 1 on another target regenerates for the PR's actual target (the size line is recomputed against it)", async () => {
+    const r = rig();
+    const targets: string[] = [];
+    const spec = makeSpec({
+      facts: async (s) => {
+        targets.push(s.targetBranch);
+        return { baseSha: BASE, size: { line: SIZE_LINE, size: SIZE } };
+      },
+    });
+    const pub = await r.publisher.prepare(spec, { headSha: H1, targetBranch: "main" });
+    r.forge.pr.description = pub.initialBody(completion(true));
+    r.forge.pr.target = "develop";
+    await pub.publish(MR);
+    assert.deepEqual(targets, ["main", "develop"]);
+    assert.match(r.forge.pr.description, /Describes `aaaaaaa` against `develop`\./);
+    assert.deepEqual(api.acks(), ["published"], "the version for `main` was never bound, so it is never acked");
+  });
+
+  it("a second head move after the regeneration is spent skips the region, still writing the completion block", async () => {
+    const r = rig();
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    r.forge.pr.description = `${OLD_REGION}\n\n${completion(false)}`;
+    api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+    r.forge.beforeRead = (n, pr) => {
+      if (n === 2) pr.head = H2;
+      if (n === 3) pr.head = H3;
+    };
+    await pub.publish(MR);
+    assert.deepEqual(api.acks(), ["skipped_snapshot_moved", "skipped_snapshot_moved"]);
+    const parsed = parseOwnedBlocks(r.forge.pr.description);
+    assert.ok(parsed.kind === "ok");
+    assert.equal(parsed.kind === "ok" && parsed.region, OLD_REGION, "the region is left");
+    // The completion block is written from the LATEST read (head H3) with the staleness line.
+    assert.equal(parsed.kind === "ok" && parsed.completion, completion(true, { describedSha: H1, headSha: H3 }));
+  });
+
+  it("with the regeneration spent, the completion block is still interlock-checked", async () => {
+    const r = rig();
+    const spec = makeSpec({ interlockIssueIid: IID, completionCloses: false, completion: (st) => completion(false, st) });
+    const pub = await r.publisher.prepare(spec, { headSha: H1, targetBranch: "main" });
+    r.forge.pr.description = `Resolves #7\n\n${[REGION_START, SIZE_LINE, REGION_END].join("\n")}\n\n${completion(false)}`;
+    r.forge.beforeRead = (n, pr) => {
+      if (n === 2) pr.head = H2;
+      if (n === 3) pr.head = H3;
+    };
+    await pub.publish(MR);
+    assert.equal(closingDirectiveFor(r.forge.pr.description, IID, "o/r"), false);
+    assert.ok(r.forge.pr.description.startsWith(REGION_START), "rewritten whole");
+  });
+
+  it("never writes a body composed from a read older than the latest read", async () => {
+    const r = rig();
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    r.forge.pr.description = `${[REGION_START, SIZE_LINE, REGION_END].join("\n")}\n\n${completion(false)}`;
+    const seen: string[] = [];
+    r.forge.beforeRead = (n, pr) => {
+      if (n === 2) pr.description = `Edited between reads.\n\n${pr.description}`;
+      seen.push(pr.description);
+    };
+    await pub.publish(MR);
+    const latest = seen[seen.length - 1]!;
+    const written = r.forge.writes[0]!;
+    const w = parseOwnedBlocks(written);
+    const l = parseOwnedBlocks(latest);
+    assert.ok(w.kind === "ok" && l.kind === "ok");
+    assert.equal(w.kind === "ok" && w.before, l.kind === "ok" && l.before, "the outside text is the latest read's");
+  });
+});
+
+describe("publisher: D11 budgets once spent", () => {
+  it("the recompose is spent on the first change; a change seen after a restage skips the region (skipped_human_edit)", async () => {
+    // The first description change grows the body over the D15 cap, so the recompose changes the
+    // region: the bound version is acked skipped_snapshot_moved (cap supersession) and a
+    // deterministic_only version is bound and revalidated by read 3, which sees a second change.
+    const r = rig();
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    r.forge.pr.description = pub.initialBody(completion(true));
+    r.forge.beforeRead = (n, pr) => {
+      if (n === 2) pr.description = `${"y".repeat(BODY_CAP_CHARS)}\n\n${pr.description}`;
+      if (n === 3) pr.description = `Second edit.\n\n${pr.description}`;
+    };
+    await pub.publish(MR);
+    assert.deepEqual(api.acks(), ["skipped_snapshot_moved", "skipped_human_edit"]);
+    assert.deepEqual(stages().map((s) => s.source), ["generated", "deterministic_only"]);
+    assert.ok(r.forge.pr.description.startsWith("Second edit.\n\n"), "the completion block is written from the latest read");
+    assert.ok(r.emitted.some((t) => /edited by a person/.test(t)));
+  });
+
+  it("D15 cap supersession of a BOUND version acks skipped_snapshot_moved, then publishes the deterministic version", async () => {
+    const r = rig();
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    r.forge.pr.description = pub.initialBody(completion(true));
+    r.forge.beforeRead = (n, pr) => {
+      if (n === 2) pr.description = `${"y".repeat(BODY_CAP_CHARS)}\n\n${pr.description}`;
+    };
+    await pub.publish(MR);
+    assert.deepEqual(api.acks(), ["skipped_snapshot_moved", "published"]);
+    const parsed = parseOwnedBlocks(r.forge.pr.description);
+    assert.ok(parsed.kind === "ok" && parsed.region !== undefined && isDeterministicRegion(parsed.region));
+  });
+});
+
+// ── Step 9: acks ───────────────────────────────────────────────────────────────────────────────
+
+describe("publisher: acknowledgement (step 9)", () => {
+  it("a failed forge write acks write_failed", async () => {
+    const r = rig();
+    r.forge.pr.description = `Legacy body`;
+    r.forge.failWrite = true;
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    const out = await pub.publish(MR);
+    assert.deepEqual(api.acks(), ["write_failed"]);
+    assert.equal(out.wrote, false);
+  });
+
+  it("published only for a version confirmed on the forge: a post-write mismatch is recorded (write_failed), not retried", async () => {
+    const r = rig();
+    r.forge.pr.description = `Legacy body`;
+    r.forge.afterWrite = (pr) => {
+      pr.description = pr.description.replace("Reviewers can now", "Someone changed");
+    };
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    await pub.publish(MR);
+    assert.deepEqual(api.acks(), ["write_failed"]);
+    assert.equal(r.forge.writes.length, 1, "not retried");
+  });
+
+  it("an unconfirmable write leaves the version bound and pending (lost-ack recovery), never acked published", async () => {
+    const r = rig();
+    r.forge.pr.description = `Legacy body`;
+    r.forge.failRead = (n) => n === 3;
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    await pub.publish(MR);
+    assert.deepEqual(api.acks(), []);
+    const v = [...api.versions.values()][0]!;
+    assert.equal(v.state, "pending");
+    assert.equal(v.rendered_region_sha256, regionSha256(pub.region));
+  });
+
+  it("a lost lock compare-and-swap refreshes the lock version and replays the ack", async () => {
+    const r = rig();
+    api.failNext("ack", 409, "lock_conflict");
+    await newPr(r);
+    assert.deepEqual(api.acks(), ["published", "published"]);
+    assert.equal([...api.versions.values()][0]!.state, "published");
+  });
+
+  it("a read-1 failure is advisory: nothing is written or acked", async () => {
+    const r = rig();
+    r.forge.failRead = () => true;
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    const out = await pub.publish(MR);
+    assert.equal(out.wrote, false);
+    assert.deepEqual(api.acks(), []);
+    assert.equal(out.region, pub.region);
+  });
+});
+
+// ── D17 refresh runs and the staleness line (D12) ─────────────────────────────────────────────
+
+describe("publisher: refresh runs (D17) and the staleness line (D12)", () => {
+  const refresh = (over: Partial<PublicationSpec> = {}) =>
+    makeSpec({
+      mode: "refresh",
+      completion: () => renderCompletionBlock({ branch: "agent/issue-7", closes: false, kindLine: "Automated MR rework." }),
+      ...over,
+    });
+
+  it("a legacy PR without uzi markers is left untouched: no write, no bind, no ack", async () => {
+    const r = rig();
+    r.forge.pr.description = "Closes #7\n\nA human wrote all of this.";
+    const pub = await r.publisher.prepare(refresh(), { headSha: H2, targetBranch: "main" });
+    r.forge.pr.head = H2;
+    await pub.publish(MR);
+    assert.equal(r.forge.writes.length, 0);
+    assert.ok(!api.calls.some((c) => c.op === "bind" || c.op === "ack"));
+  });
+
+  it("a marked PR gets a new region; its completion block keeps Closes and loses a now-current staleness line", async () => {
+    const r = rig();
+    api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+    const closing = completion(true, { describedSha: H1, headSha: H2 });
+    assert.ok(closing.includes(STALENESS_START));
+    r.forge.pr.head = H2;
+    r.forge.pr.description = `${OLD_REGION}\n\n${closing}`;
+    const pub = await r.publisher.prepare(refresh({ prior: await priorState() }), { headSha: H2, targetBranch: "main" });
+    await pub.publish(MR);
+    const parsed = parseOwnedBlocks(r.forge.pr.description);
+    assert.ok(parsed.kind === "ok");
+    assert.equal(parsed.kind === "ok" && parsed.region, pub.region);
+    assert.equal(parsed.kind === "ok" && parsed.completion, completion(true), "only the staleness line changed: Closes is kept");
+    assert.deepEqual(api.acks(), ["published"]);
+  });
+
+  it("a refresh that skips an edited region adds the staleness line and changes nothing else in the completion block", async () => {
+    const r = rig();
+    api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+    const edited = OLD_REGION.replace("older", "hand-written");
+    r.forge.pr.head = H2;
+    r.forge.pr.description = `${edited}\n\n${completion(true)}`;
+    const pub = await r.publisher.prepare(refresh({ prior: await priorState() }), { headSha: H2, targetBranch: "main" });
+    await pub.publish(MR);
+    assert.equal(r.forge.pr.description, `${edited}\n\n${completion(true, { describedSha: H1, headSha: H2 })}`);
+    assert.match(r.forge.pr.description, /This description may be outdated: it describes `aaaaaaa`; the PR head is `ccccccc`\./);
+    assert.deepEqual(api.acks(), ["skipped_human_edit"]);
+  });
+});
+
+// ── The interlock's reconcile ─────────────────────────────────────────────────────────────────
+
+describe("reconcileCompletion (the interlock's read-replace-write)", () => {
+  const region = renderRegion({ sizeLine: SIZE_LINE, headSha: H1, targetBranch: "main" }).text;
+  const args = (forge: FakeForge, closes: boolean) => ({
+    forge,
+    repoUrl: "https://gitlab.example.test/o/r",
+    pat: "pat",
+    mrIid: MR,
+    completion: () => completion(closes),
+    ownRegion: region,
+    nonClosing: closes ? undefined : { issueIid: IID, repoPath: "o/r" },
+    log: nullLogger(),
+  });
+
+  it("replaces only the completion block and confirms from the re-read", async () => {
+    const f = new FakeForge();
+    f.pr.description = `Human text.\n\n${region}\n\n${completion(false)}\n\nBot text.`;
+    assert.equal(await reconcileCompletion(args(f, true)), "confirmed");
+    assert.equal(f.pr.description, `Human text.\n\n${region}\n\n${completion(true)}\n\nBot text.`);
+  });
+
+  it("malformed or missing completion markers get a whole-body rewrite", async () => {
+    for (const body of ["No markers at all.", `${region}\n\n${region}`, `${region}\n\nhuman only`]) {
+      const f = new FakeForge();
+      f.pr.description = body;
+      assert.equal(await reconcileCompletion(args(f, true)), "confirmed", body);
+      assert.equal(f.pr.description, renderBody(region, completion(true)));
+    }
+  });
+
+  it("never reports confirmed when the re-read does not carry the rendered block", async () => {
+    const f = new FakeForge();
+    f.pr.description = `${region}\n\n${completion(false)}`;
+    f.afterWrite = (pr) => {
+      pr.description = pr.description.replace("Closes #7", "Related.");
+    };
+    assert.equal(await reconcileCompletion(args(f, true)), "unconfirmed");
+  });
+
+  it("non-closing: a human `Closes #7` forces a whole-body non-closing rewrite, re-read and re-scanned", async () => {
+    const f = new FakeForge();
+    f.pr.description = `Closes #7\n\n${region}\n\n${completion(true)}`;
+    assert.equal(await reconcileCompletion(args(f, false)), "confirmed");
+    assert.equal(f.pr.description, renderBody(region, completion(false)));
+  });
+
+  it("non-closing: a rewrite that cannot be written is `closing` (the caller fails closed)", async () => {
+    const f = new FakeForge();
+    f.pr.description = `Closes #7\n\n${region}\n\n${completion(true)}`;
+    f.failWrite = true;
+    assert.equal(await reconcileCompletion(args(f, false)), "closing");
+  });
+
+  it("non-closing: a directive that survives the whole-body rewrite is `closing`", async () => {
+    const f = new FakeForge();
+    f.pr.description = `Closes #7\n\n${region}\n\n${completion(true)}`;
+    f.afterWrite = (pr) => {
+      pr.description = `Fixes #7\n\n${pr.description}`;
+    };
+    assert.equal(await reconcileCompletion(args(f, false)), "closing");
+  });
+
+  it("non-closing: a failed read falls back to the blind whole-body rewrite", async () => {
+    const f = new FakeForge();
+    f.pr.description = `Closes #7`;
+    f.failRead = () => true;
+    assert.equal(await reconcileCompletion(args(f, false)), "confirmed");
+    assert.equal(f.pr.description, renderBody(region, completion(false)));
+  });
+
+  it("closing: a failed read is unconfirmed (the caller holds) and nothing is written", async () => {
+    const f = new FakeForge();
+    f.failRead = () => true;
+    assert.equal(await reconcileCompletion(args(f, true)), "unconfirmed");
+    assert.equal(f.writes.length, 0);
+  });
+});
+
+// ── Helpers and invariants ────────────────────────────────────────────────────────────────────
+
+describe("publisher helpers", () => {
+  it("withStalenessLine inserts, replaces and removes only the staleness pair", () => {
+    const plain = completion(true);
+    const stale = completion(true, { describedSha: H1, headSha: H2 });
+    const pair = stale.slice(stale.indexOf(STALENESS_START), stale.indexOf("<!-- /uzi:staleness -->") + "<!-- /uzi:staleness -->".length);
+    assert.equal(withStalenessLine(plain, pair), stale);
+    assert.equal(withStalenessLine(stale, ""), plain);
+    const other = completion(true, { describedSha: H3, headSha: H2 });
+    const otherPair = other.slice(other.indexOf(STALENESS_START), other.indexOf("<!-- /uzi:staleness -->") + "<!-- /uzi:staleness -->".length);
+    assert.equal(withStalenessLine(stale, otherPair), other);
+  });
+
+  it("isDeterministicRegion accepts only the size and provenance shapes", () => {
+    assert.ok(isDeterministicRegion([REGION_START, SIZE_LINE, REGION_END].join("\n")));
+    assert.ok(isDeterministicRegion(renderRegion({ sizeLine: SIZE_LINE, headSha: H1, targetBranch: "main" }).text));
+    assert.ok(!isDeterministicRegion(OLD_REGION));
+    assert.ok(!isDeterministicRegion([REGION_START, SIZE_LINE, "Closes #7", REGION_END].join("\n")));
+  });
+
+  it("repoPathFromUrl", () => {
+    assert.equal(repoPathFromUrl("https://gitlab.example.test/group/sub/proj.git"), "group/sub/proj");
+    assert.equal(repoPathFromUrl("https://github.com/o/r/"), "o/r");
+    assert.equal(repoPathFromUrl("not a url"), undefined);
+  });
+
+  it("no rendered region contains a closing directive (hostile fields, targets and sizes)", async () => {
+    const hostile = ["Closes #7", "Fixes o/r#7", "resolves https://gitlab.example.test/o/r/-/issues/7", "Implements #7", "fix&#101;s #7"];
+    for (const text of hostile) {
+      for (const target of ["main", "Closes #7", "fix/#7", "fixes-#7"]) {
+        const r = rig(new FakePass({ summary: text, changes: [text], scope_notes: [{ kind: "added", text }], review_pointers: [text] }));
+        const pub = await r.publisher.prepare(makeSpec({ lead: { ...LEAD, what: text } }), { headSha: H1, targetBranch: target });
+        assert.equal(closingDirectiveFor(pub.region, IID, "o/r"), false, `${text} / ${target}`);
+      }
+    }
+  });
+
+  it("every ack any test sent is one of the six api outcomes", () => {
+    assert.ok(everyAck.length > 0);
+    for (const a of everyAck) assert.ok((PR_DESC_ACK_OUTCOMES as readonly string[]).includes(a), a);
+  });
+});

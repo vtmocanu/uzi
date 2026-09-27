@@ -475,12 +475,15 @@ describe("closingDirectiveFor fails toward closing: the decoded-raw and tag-stri
     assert.equal(closingDirectiveFor("Fixes&ThickSpace;#7", 7, "o/r"), true);
   });
 
-  it("the tag-stripped view reads markup only where it is written literally", () => {
+  it("the tag-stripped view reads custom markup only where it is written literally", () => {
     // A sanitized field encodes `<` as `&lt;` (a forge shows it as text), and an escaped `\<` is
-    // text too: neither is stripped as a tag, so the keyword around it stays split.
+    // text too: neither is stripped as a custom tag, so the keyword around it stays split.
     for (const text of ["Clo&lt;x>ses #7", "Clo\\<x>ses #7", "Clo&lt;foo bar>ses #7"]) {
       assert.equal(closingDirectiveFor(text, 7, "o/r"), false, JSON.stringify(text));
     }
+    // A KNOWN tag is read after decoding (renderedView decodes before it strips known tags), so an
+    // encoded known tag does not split the keyword.
+    assert.equal(closingDirectiveFor("Clo&lt;b>ses #7", 7, "o/r"), true);
     // An unterminated comment is removed to the end of its line only.
     assert.equal(closingDirectiveFor("Fix<!-- a\nes #7", 7, "o/r"), false);
     assert.equal(closingDirectiveFor("Fixes <!-- a\n#7", 7, "o/r"), true);
@@ -496,13 +499,13 @@ describe("closingDirectiveFor fails toward closing: the decoded-raw and tag-stri
 // ── M1: linear scans ──
 
 describe("accepted gaps (documented)", () => {
-  // KNOWN gaps, pinned as current behaviour, not as desired behaviour: the module header of
+  // KNOWN gaps (including, not limited to, these), pinned as current behaviour, not as desired behaviour: the module header of
   // pr-description.ts documents them as accepted (the closing scan detects directives present when
   // uzi writes the body; it is not a boundary against someone with edit rights on the description,
   // who can add a plain `Closes #N` at any time). A change that closes one of these gaps must update
   // this block and the module header's threat model deliberately, in the same commit.
-  it("a link destination with balanced parentheses, an escape or a quoted `)` in its title hides the split", () => {
-    for (const text of ["[Fix](a(b)c)es #7", "[Fix](a\\)b)es #7", '[Fix](a "t)")es #7']) {
+  it("a link destination with balanced parentheses, an escape, a quoted `)` in its title or a pointy destination holding `)` hides the split", () => {
+    for (const text of ["[Fix](a(b)c)es #7", "[Fix](a\\)b)es #7", '[Fix](a "t)")es #7', "[Fix](<1)>)es #7"]) {
       assert.equal(closingDirectiveFor(text, 7, "o/r"), false, JSON.stringify(text));
     }
   });

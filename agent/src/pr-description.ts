@@ -37,7 +37,7 @@
 // is identical to the block uzi rendered, line endings aside): the api sanitizer's prDescClosing
 // pattern (with Forgejo's `!N` references), extended to GitLab's reference lists (`Closes #1, #2 and
 // #3`), over several views of the body (the raw text, a RENDERED view that mirrors the api's
-// prDescNormalize, a decoded-raw view, a tag-stripped view and the two composed), each
+// prDescNormalize, a decoded-raw view, a tag-stripped view and the two composed into one), each
 // in the api's three marker views. Where the views could disagree with a forge it errs towards
 // "closing".
 //
@@ -46,12 +46,14 @@
 // split by an entity, a tag, a comment, a processing instruction, CDATA, a declaration or an empty
 // link). It is NOT a guarantee against deliberate obfuscation by someone with edit rights on the PR
 // description: that person can add a plain `Closes #N` at any time after uzi's write, so the scan
-// cannot be a boundary against them. Known gaps, documented and accepted (pinned in the hardening
-// tests): a link destination with balanced parentheses, escapes or a quoted `)` in its title
-// (`[Fix](a(b)c)es #7`); a custom tag with a quoted `>` in an attribute (`Fix<foo title="a>b">es #7`);
-// and, in the block parser rather than the scan, fenced code opened inside a list item (codeRanges:
-// a marker pair a forge shows as code can still be adopted, which never hides a directive from the
-// interlock, see codeRanges).
+// cannot be a boundary against them. Anyone without edit rights reaches the body only through the
+// api sanitizer (model and lead text) and this module's escaping (deterministic interpolations), D7.
+// Known gaps, documented and accepted (pinned in the hardening tests), including: a link destination
+// with balanced parentheses, escapes, a quoted `)` in its title or a pointy destination holding `)`
+// (`[Fix](a(b)c)es #7`, `[Fix](<1)>)es #7`); a custom tag with a quoted `>` in an attribute
+// (`Fix<foo title="a>b">es #7`); and, in the block parser rather than the scan, fenced code opened
+// inside a list item (codeRanges: a marker pair a forge shows as code can still be adopted, which
+// never hides a directive from the interlock, see codeRanges).
 
 import { createHash } from "node:crypto";
 import { SanitizedPrDescriptionFields } from "./client.js";
@@ -504,9 +506,11 @@ function stripAllHtml(s: string): string {
   return out + s.slice(i);
 }
 
-/** The decoded tag-stripped view: stripAllHtml over the literal text (a forge reads markup only where
- *  it is written literally, so an encoded `&lt;x>` stays text, as in a sanitized field), then decoded
- *  as decodedRawView. Link and image syntax stays as text. */
+/** The decoded tag-stripped view: stripAllHtml over the literal text, then decoded as decodedRawView.
+ *  THIS view strips a construct only where it is written literally, so an encoded `&lt;x>` stays
+ *  text here (as in a sanitized field). That is not true of the scan as a whole: renderedView decodes
+ *  before it strips known tags, so an encoded known tag is still read (`Clo&lt;b>ses #7` is closing),
+ *  while an encoded custom tag (`Clo&lt;x>ses #7`) stays split. Link and image syntax stays as text. */
 function tagStrippedView(s: string): string {
   return decodedRawView(stripAllHtml(lfNoFormat(s)));
 }
@@ -515,8 +519,10 @@ function tagStrippedView(s: string): string {
  *  quoted `>` in an attribute as part of the tag, so `<span title="x>y">` goes whole), then every
  *  other HTML construct (tagStrippedView), then the rendered view's link, image and known-tag
  *  stripping over what is left: `Fi<foo>xes [](u)#7` and `Fi<span title="x>y">xes <foo>#7` read as
- *  closing. Markup is still read only where it is written literally, so `Clo&lt;x>ses` stays split.
- *  One pass of each part; undefined when the rendered view does not converge. */
+ *  closing. Custom tags and other constructs are removed only where written literally, so
+ *  `Clo&lt;x>ses` stays split; known tags are also read after decoding (the renderedView step), so
+ *  `Clo&lt;b>ses` does not. One pass of the known-tag strip and stripAllHtml, then renderedView to
+ *  its fixed point; undefined when the rendered view does not converge. */
 function composedView(s: string): string | undefined {
   const lf = lfNoFormat(s);
   return renderedView(tagStrippedView(lf.includes("<") ? lf.replace(HTML_TAG_RE, dropTag) : lf));
@@ -725,10 +731,10 @@ function refResolves(m: RegExpExecArray, iid: number, repoPath: string | undefin
  * What it catches, and what it does not (the module header's threat model): directives present in
  * the body when uzi writes it, written plainly, in the api sanitizer's normalised forms, or split by
  * common markup and entities. It is not a boundary against someone with edit rights on the PR
- * description, who can add a plain `Closes #N` after uzi's write. Accepted gaps: a link destination
- * with balanced parentheses, escapes or a quoted `)` in its title (`[Fix](a(b)c)es #7`), a custom tag
- * with a quoted `>` in an attribute (`Fix<foo title="a>b">es #7`), and (in parseOwnedBlocks, not
- * here) list-item fences.
+ * description, who can add a plain `Closes #N` after uzi's write. Accepted gaps include: a link
+ * destination with balanced parentheses, escapes, a quoted `)` in its title or a pointy destination
+ * holding `)` (`[Fix](a(b)c)es #7`, `[Fix](<1)>)es #7`), a custom tag with a quoted `>` in an
+ * attribute (`Fix<foo title="a>b">es #7`), and (in parseOwnedBlocks, not here) list-item fences.
  *
  * Fails closed (true): an issueIid that is not a non-negative safe integer, a body over
  * FORGE_BODY_MAX_CHARS, or a rendered view that does not converge.

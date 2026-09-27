@@ -110,7 +110,15 @@ import { installJsDeps } from "./js-deps.js";
 import { detectToolchain, type ToolchainDetection } from "./toolchain-detect.js";
 import { isCIConfigPlan } from "./prompt.js";
 import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
-import { computeSizeLine, SIZE_UNAVAILABLE } from "./pr-size.js";
+import { computeSize } from "./pr-size.js";
+import { buildDeliveryContext } from "./pr-description-context.js";
+import { resolvePrdInput } from "./prd-link.js";
+import {
+  PrDescriptionPublisher,
+  reconcileCompletion,
+  repoPathFromUrl,
+  type ReconcileResult,
+} from "./pr-description-publisher.js";
 import { renderBody, renderCompletionBlock, renderRegion, type KindSection } from "./pr-description.js";
 import type { SummaryRunner } from "./summary-runner.js";
 import { REASON_PROVISION_FAILED } from "./provision-run.js";
@@ -1270,6 +1278,9 @@ export interface RunnerOptions {
   /** PRD #1798 M5: never run the editor pass (main.ts sets it under UZI_EXECUTOR=stub, so an e2e
    *  spends nothing on either harness: the Codex advice path ignores the stub queryFn). */
   skipDeliverySummary?: boolean;
+  /** PRD #1798 M6: how long the description publisher waits before re-reading a PR whose head is
+   *  not yet the landed head (a forge may lag a push by a moment). Default 2 s; tests pass 0. */
+  prDescriptionHeadLagMs?: number;
 }
 
 /**
@@ -1357,6 +1368,8 @@ export class RunRunner {
   private readonly setTickTimer: (cb: () => void, ms: number) => () => void;
   /** PRD #1798 M5: see {@link RunRunner.deliverySummaryRunner}. */
   private readonly deliverySummary: SummaryRunner | null;
+  /** PRD #1798 M6: see RunnerOptions.prDescriptionHeadLagMs. */
+  private readonly prDescriptionHeadLagMs: number | undefined;
   /** PRD #41: absolute plan-approval deadline (epoch ms) per runId, set on the FIRST
    *  gate entry and reused across every revision round so N rounds share ONE budget (not
    *  24h per round). Cleared when the gate resolves terminally (approve/reject/cancel/
@@ -1508,6 +1521,7 @@ export class RunRunner {
     // PRD #1798 M5: the injected PR-description editor pass, or null when none is injected or it
     // must never run (stub).
     this.deliverySummary = opts.skipDeliverySummary ? null : (opts.summaryRunner ?? null);
+    this.prDescriptionHeadLagMs = opts.prDescriptionHeadLagMs;
   }
 
   /** PRD #1798 M5: the SummaryRunner the finalize path runs the PR-description editor pass on, or
@@ -4941,20 +4955,6 @@ export class RunRunner {
       claim.repo.default_branch?.trim() ||
       (await this.git.defaultBranchName(barePath)) ||
       "main";
-    // PRD #1798 M1 (D3): the deterministic size line, computed HERE — after the push, align and
-    // history bridge (so the branch that will be published is final) and after the interlock permit
-    // (so the head is the landed tip, never a pre-align candidate) — from the worker-side tracking ref
-    // against the merge-base with the target branch. It is threaded into BOTH mrDescription calls
-    // (creation and the verified-head reconcile) so a body rewrite keeps it. computeSizeLine never
-    // throws; the extra catch only guards the tracking-ref read, so the size line can never fail a run.
-    let sizeLine: string | null;
-    try {
-      const sizeHead = await this.git.trackingTip(barePath, result.branch);
-      sizeLine = await computeSizeLine(this.git, barePath, targetBranch, sizeHead, runLog);
-    } catch (err) {
-      runLog.warn("PR size line unavailable", { run_id: runId, error: errMessage(err) });
-      sizeLine = SIZE_UNAVAILABLE;
-    }
     // Pick the forge client from the claim's forge_type (absent ⇒ gitlab, R8), so
     // the worker opens an MR on GitLab and a PR on Forgejo/GitHub from the same code
     // path; each client derives its own API base + project from repo.url (D9).
@@ -4968,11 +4968,119 @@ export class RunRunner {
         : claim.repo.forge_type === "github"
           ? this.github
           : this.gitlab;
+
+    // ── PRD #1798 M6: the PR description (D8-D12, D15, D17) ──────────────────────
+    // The completion block this run writes, with or without `Closes #N` and the unverified banner.
+    // mrDescription's own wording; the publisher and the reconcile compose the region and the
+    // preserved text around it.
+    const completionFor = (withCloses: boolean, opts?: MrDescriptionOptions): string =>
+      mrCompletionBlock(
+        claim,
+        result.branch,
+        result.agentSelection,
+        selfImproveSection,
+        promptGuardSection,
+        result.gatesUnverified,
+        result.gatesDiscoveryTruncated,
+        result.scopeCapped,
+        withCloses,
+        claim.config?.completion_scope,
+        bridged,
+        opts,
+      );
+    const runKind = resolveRunKind(claim.kind);
+    // D17: a refresh run (mr_rework, or a ci_fix adopting an existing branch rather than opening a
+    // fresh ci-fix/pipeline-N one) refreshes only the region and never authors closing semantics.
+    const refreshRun =
+      runKind === "mr_rework" ||
+      (runKind === "ci_fix" && !!claim.pipeline && result.branch === claim.pipeline.ref);
+    const repoPath = repoPathFromUrl(claim.repo.url);
+    // Amended D10: an issue run whose completion block is non-closing (an interlocked run until its
+    // head is verified, an owner partial, a scope-capped run) has its whole body scanned for a
+    // closing directive for the issue.
+    const scanIid = runKind === "issue" && typeof claim.issue_iid === "number" ? claim.issue_iid : undefined;
+    const createCloses = renderCloses && !isOwnerPartial && !result.scopeCapped;
+    const forgeRetry = <T>(fn: () => Promise<T>): Promise<T> =>
+      withForgeRetry(fn, { log: runLog, signal: boundarySignal, label: "PR description" });
+    // The landed head the description describes (D2: after the push, align and bridge, so the branch
+    // is final). A read failure leaves it empty: the size line then reads unavailable.
+    let landedHead = "";
+    try {
+      landedHead = (await this.git.trackingTip(barePath, result.branch)) ?? "";
+    } catch (err) {
+      runLog.warn("PR description: the landed head is unreadable", { run_id: runId, error: errMessage(err) });
+    }
+    const publisher = new PrDescriptionPublisher({
+      forge,
+      api: this.client,
+      pass: this.deliverySummaryRunner(),
+      log: runLog,
+      emit: (text) => batcher.emit({ kind: "status", agent: "worker", payload: { text } }),
+      forgeRetry,
+      headLagRetryMs: this.prDescriptionHeadLagMs,
+    });
+    // Step 1: context + editor pass + stage, before createMergeRequest (D2). Never throws; every
+    // failure falls down the D8 ladder. The size line is computed per snapshot, so a regeneration for
+    // the PR's actual target (read back after create) recomputes it against that target.
+    const description = await publisher.prepare(
+      {
+        runId,
+        claimGeneration: flight.claimGeneration,
+        claim,
+        repoUrl: claim.repo.url,
+        pat: claim.secrets.forge_pat,
+        repoPath,
+        mode: refreshRun ? "refresh" : "own",
+        interlockIssueIid: scanIid,
+        completionCloses: createCloses,
+        prior: claim.pr_description,
+        lead: result.prSummary,
+        facts: async (s) => {
+          const size = await computeSize(this.git, barePath, s.targetBranch, s.headSha || null, runLog);
+          let baseSha: string | null = null;
+          try {
+            if (s.headSha) baseSha = await this.git.sizeMergeBase(barePath, s.targetBranch, s.headSha);
+          } catch {
+            baseSha = null;
+          }
+          return { size, baseSha };
+        },
+        context: async (s, deadlineMs, previous) => {
+          const prd = flight.worktreePath
+            ? await resolvePrdInput(claim.issue_description ?? "", flight.worktreePath, claim.issue_iid, runLog)
+            : { prdText: null };
+          // flight.redactText scrubs every claim secret: the forge PAT, the Anthropic token, the join
+          // token, the git basic credential and, on a Codex run, the Codex access token and capability.
+          return buildDeliveryContext({
+            git: this.git,
+            barePath,
+            targetBranch: s.targetBranch,
+            headSha: s.headSha,
+            deadlineMs,
+            signal: boundarySignal,
+            redact: redactText,
+            issueTitle: claim.issue_title ?? "",
+            issueBody: claim.issue_description ?? "",
+            prdText: prd.prdText,
+            summaryPlan: result.summaryPlan,
+            summaryDeltas: result.summaryDeltas,
+            planMd: claim.plan_md ?? null,
+            prSummary: result.prSummary,
+            previous,
+            log: runLog,
+          });
+        },
+        completion: (staleness) => completionFor(renderCloses, { staleness }),
+        signal: boundarySignal,
+      },
+      { headSha: landedHead, targetBranch },
+    );
     // PRD #284 Layer A/D3: wrap the WHOLE createMergeRequest call (POST → duplicate
     // → findOpenMr GET) in the retry loop, not just its final thrown status. It is
     // already idempotent — on a duplicate it adopts the existing MR/PR — but a
     // transient findOpenMr failure after a duplicate POST would otherwise fail a run
-    // whose MR actually exists; retrying the whole call re-runs it instead.
+    // whose MR actually exists; retrying the whole call re-runs it instead. Create
+    // failures stay fatal. Step 2: a new PR is created with the final body.
     const mr = await withForgeRetry(
       () =>
         forge.createMergeRequest({
@@ -4981,20 +5089,7 @@ export class RunRunner {
           sourceBranch: result.branch,
           targetBranch,
           title: mrTitle(claim, result.scopeCapped, claim.config?.completion_scope),
-          description: mrDescription(
-            claim,
-            result.branch,
-            result.agentSelection,
-            selfImproveSection,
-            promptGuardSection,
-            result.gatesUnverified,
-            result.gatesDiscoveryTruncated,
-            result.scopeCapped,
-            renderCloses,
-            claim.config?.completion_scope,
-            bridged,
-            sizeLine ?? undefined,
-          ),
+          description: description.initialBody(completionFor(renderCloses)),
         }, boundarySignal),
       { log: runLog, signal: boundarySignal },
     );
@@ -5003,6 +5098,12 @@ export class RunRunner {
       agent: "worker",
       payload: { text: `merge request opened: !${mr.iid} ${mr.webUrl}` },
     });
+    // Steps 3-9: read, bind, revalidate, write, confirm, ack. Advisory: never throws, never fails or
+    // holds the run. For an interlocked run it writes the NON-closing creation completion block; the
+    // interlock below then owns that block.
+    const published = await description.publish(mr.iid);
+    // uzi's own region: what a whole-body rewrite below writes (never text read back from the forge).
+    const ownRegion = published.region;
 
     // ── PRD #1226 M4 (D5): PR-head verification (create-then-verify) ────────────
     // For an interlocked run (completionHead set on the granted path) the MR now exists; read its
@@ -5025,50 +5126,40 @@ export class RunRunner {
     // undefined), so its completion is byte-for-byte unchanged.
     const UNVERIFIED_BANNER =
       "> ⚠️ **Completion unverified.** uzi could not confirm this merge request's head matches the permitted completion head, so the run was held for owner review. This merge request does NOT close its issue and must not be merged as a completion until re-verified.";
-    const reconcileMrDescription = async (withCloses: boolean, banner?: string): Promise<boolean> => {
-      try {
-        // PRD #1798: the banner renders INSIDE the completion block (mrDescription opts.banner).
-        const desc = mrDescription(
-          claim,
-          result.branch,
-          result.agentSelection,
-          selfImproveSection,
-          promptGuardSection,
-          result.gatesUnverified,
-          result.gatesDiscoveryTruncated,
-          result.scopeCapped,
-          withCloses,
-          claim.config?.completion_scope,
-          bridged,
-          sizeLine ?? undefined,
-          { banner },
-        );
-        await withForgeRetry(
-          () =>
-            forge.updateMergeRequestDescription(
-              claim.repo.url,
-              claim.secrets.forge_pat,
-              mr.iid,
-              desc,
-              boundarySignal,
-            ),
-          { log: runLog, signal: boundarySignal },
-        );
-        return true;
-      } catch (e) {
-        runLog.warn(
-          "completion interlock: could not reconcile the MR description; leaving the created MR as-is",
-          { run_id: runId, error: errMessage(e) },
-        );
-        return false;
-      }
+    // PRD #1798 M6 (D10): the reconcile reads the MR, replaces ONLY its completion block (preserving
+    // the region and every byte outside the blocks), writes, and re-reads: `confirmed` only when the
+    // re-read body carries the rendered completion block. Malformed or missing completion markers get
+    // a whole-body rewrite. A NON-closing block on an issue run (a hold, an owner partial, a scope cap)
+    // scans the whole result for a closing directive uzi does not write; one forces a whole-body
+    // non-closing rewrite (re-read and re-scanned), and `closing` means it could not be removed. On a
+    // non-closing write a failed read falls back to the blind whole-body rewrite (today's behaviour).
+    const reconcileMrDescription = async (withCloses: boolean, banner?: string): Promise<ReconcileResult> => {
+      const closes = withCloses && !isOwnerPartial && !result.scopeCapped;
+      return reconcileCompletion({
+        forge,
+        repoUrl: claim.repo.url,
+        pat: claim.secrets.forge_pat,
+        mrIid: mr.iid,
+        signal: boundarySignal,
+        completion: (headSha) =>
+          completionFor(withCloses, {
+            banner,
+            staleness:
+              headSha && published.describedSha ? { describedSha: published.describedSha, headSha } : undefined,
+          }),
+        ownRegion,
+        nonClosing: !closes && scanIid !== undefined ? { issueIid: scanIid, repoPath } : undefined,
+        forgeRetry: (fn) => withForgeRetry(fn, { log: runLog, signal: boundarySignal }),
+        log: runLog,
+      });
     };
     // PRD #1225 (CodeRabbit !1254): strip any `Closes #N` (writing the unverified banner) BEFORE a
-    // hold. If that write FAILS we cannot guarantee the MR is non-closing — `createMergeRequest` can
-    // ADOPT a pre-existing MR that already carried `Closes #N` — so fail CLOSED rather than hold a
-    // possibly-closing MR on an unverified head.
+    // hold. If that write FAILS, or cannot be confirmed non-closing, we cannot guarantee the MR is
+    // non-closing — `createMergeRequest` can ADOPT a pre-existing MR that already carried `Closes #N`,
+    // and a human may have typed one anywhere in the body (amended D10) — so fail CLOSED rather than
+    // hold a possibly-closing MR on an unverified head.
     const stripClosesThenHold = async (holdReason: string, failReason: string): Promise<void> => {
-      if (!(await reconcileMrDescription(false, UNVERIFIED_BANNER))) {
+      if ((await reconcileMrDescription(false, UNVERIFIED_BANNER)) !== "confirmed") {
         await failInterlockedClosed(failReason);
         return;
       }
@@ -5113,7 +5204,14 @@ export class RunRunner {
       // head, so it re-renders its NON-closing partial body here (reconcileMrDescription(false)) instead
       // of adding Closes; the head is still verified (permit binding) — only the Closes-add is
       // suppressed. An accept-only/full-delivery run has isOwnerPartial=false and adds Closes as before.
-      if (!(await reconcileMrDescription(!isOwnerPartial))) {
+      // PRD #1798 M6 (amended D10): the partial's non-closing write is scanned; a closing directive it
+      // cannot remove fails the run closed rather than holding or completing a closing MR.
+      const verified = await reconcileMrDescription(!isOwnerPartial);
+      if (verified === "closing") {
+        await failInterlockedClosed("could not remove a closing directive from a non-closing MR");
+        return;
+      }
+      if (verified !== "confirmed") {
         await holdOrFailInterlocked("could not assert the verified-head completion body");
         return;
       }
@@ -11170,6 +11268,43 @@ export function mrDescription(
   sizeLine?: string,
   opts?: MrDescriptionOptions,
 ): string {
+  const completion = mrCompletionBlock(
+    claim,
+    branch,
+    agentSelection,
+    selfImproveSection,
+    promptGuardSection,
+    gatesUnverified,
+    gatesDiscoveryTruncated,
+    scopeCapped,
+    renderCloses,
+    completionScope,
+    bridged,
+    opts,
+  );
+  const region = sizeLine
+    ? renderRegion({ sizeLine, headSha: opts?.headSha, targetBranch: opts?.targetBranch }).text
+    : undefined;
+  return renderBody(region, completion);
+}
+
+/** PRD #1798 M6: mrDescription's completion block alone (same parameters, no size line), for the
+ *  publisher and the interlock's reconcile, which compose the region and the preserved text
+ *  themselves. */
+function mrCompletionBlock(
+  claim: ClaimResponse,
+  branch: string,
+  agentSelection: { source: AgentSource; agents: string[] } | undefined,
+  selfImproveSection: KindSection | undefined,
+  promptGuardSection: KindSection | undefined,
+  gatesUnverified: string[] | undefined,
+  gatesDiscoveryTruncated: boolean | undefined,
+  scopeCapped: { completedCount: number; total?: number } | undefined,
+  renderCloses: boolean,
+  completionScope: ClaimConfig["completion_scope"] | undefined,
+  bridged: boolean,
+  opts?: MrDescriptionOptions,
+): string {
   // PRD #983 M4b / PRD #1798 D14: a kind's one-line completion sentence lives in
   // RUN_KIND_PROFILES.completionLine. A row's undefined — ci_fix with no pipeline, and the
   // issue/chat/judge kinds that carry none — takes the issue arm (Related / Closes / partial /
@@ -11178,7 +11313,7 @@ export function mrDescription(
     branch,
     baseBranch: claim.base_branch?.trim() || undefined,
   });
-  const completion = renderCompletionBlock({
+  return renderCompletionBlock({
     issueIid: claim.issue_iid,
     branch,
     kindLine,
@@ -11193,10 +11328,6 @@ export function mrDescription(
     banner: opts?.banner,
     staleness: opts?.staleness,
   });
-  const region = sizeLine
-    ? renderRegion({ sizeLine, headSha: opts?.headSha, targetBranch: opts?.targetBranch }).text
-    : undefined;
-  return renderBody(region, completion);
 }
 
 /** Feed text for an autopilot run's resolved default selection (PRD #37 Decision

@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { nullLogger } from "./helpers.js";
+import { parseOwnedBlocks } from "../src/pr-description.js";
 import { StubExecutor } from "../src/executor.js";
 import type { StateRequest } from "../src/protocol.js";
 import {
@@ -75,7 +76,7 @@ function mrPutBody(calls: { method: string; body?: string }[]): Record<string, u
 
 describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D5)", () => {
   it("granted + PR head matches H → opens the MR WITHOUT Closes, adds Closes only after verifying head H, and completes WITH head H", async () => {
-    const { gitlab, calls } = fakeGitlab({ head: H });
+    const { gitlab, calls, all } = fakeGitlab({ head: H });
     const claim = interlockedClaim(1300);
     api.setCompletionPermitResponse(true);
     git.trackingTip = (async () => H) as typeof git.trackingTip;
@@ -90,7 +91,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     // The MR was created and the PR head was read back (a GET) to verify it.
     const body = mrPostBody(calls);
     assert.doesNotMatch(String(body.description), /Closes #/, "an interlocked MR is created WITHOUT Closes; the closing line is added only after head verification");
-    assert.ok(calls.some((c) => c.method === "GET"), "the PR head was read to verify it");
+    assert.ok(all.some((c) => c.method === "GET"), "the PR head was read to verify it");
     // Completed WITH head H (the permit-bound head rides the terminal report).
     const done = completedBody(claim.run_id);
     assert.ok(done, "the run reported completed");
@@ -106,15 +107,17 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     // create (no Closes) → verify head → add Closes → RE-VERIFY head. A wrong ordering (e.g. adding
     // Closes before the verify, or skipping the post-add re-verify) would leave the per-kind checks
     // above green while breaking the head bind.
+    // PRD #1798 M6: the description publisher reads the new PR twice (read, revalidate) and writes
+    // nothing when the body it created is current; the reconcile then reads, writes and re-reads.
     assert.deepStrictEqual(
-      calls.map((c) => c.method),
-      ["POST", "GET", "PUT", "GET"],
-      "forge calls run in the order: create MR (POST) → verify head (GET) → add Closes (PUT) → re-verify head (GET)",
+      all.map((c) => c.method),
+      ["POST", "GET", "GET", "GET", "GET", "PUT", "GET", "GET"],
+      "forge calls run in the order: create MR (POST) → publisher read + revalidate (GET, GET) → verify head (GET) → reconcile read (GET) → add Closes (PUT) → reconcile confirm (GET) → re-verify head (GET)",
     );
   });
 
   it("OWNER PARTIAL (PRD #1227 M2): creates a [partial] MR with NO Closes, verifies head H, and the post-verify PUT STILL has no Closes", async () => {
-    const { gitlab, calls } = fakeGitlab({ head: H });
+    const { gitlab, calls, all, pr } = fakeGitlab({ head: H });
     const claim = ownerPartialClaim(1310);
     api.setCompletionPermitResponse(true);
     git.trackingTip = (async () => H) as typeof git.trackingTip;
@@ -130,13 +133,16 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     assert.match(String(post.description), /owner scope decision/, "the created body states the partial delivery");
     assert.match(String(post.description), /m3.*Third milestone.*deprioritized/, "the deferred milestone is named with its owner reason");
     // The head is verified (permit binding) — the partial does not skip verification.
-    assert.ok(calls.some((c) => c.method === "GET"), "the PR head is still verified for a partial");
+    assert.ok(all.some((c) => c.method === "GET"), "the PR head is still verified for a partial");
     // CRITICAL (PRD #1227 M2): the post-verify reconcile PUT re-renders the NON-closing partial body —
     // reconcileMrDescription(!isOwnerPartial) with isOwnerPartial=true → withCloses=false. The verified
     // head does NOT add Closes for a partial, contrasting the non-partial test above which DOES.
-    const put = mrPutBody(calls);
-    assert.doesNotMatch(String(put.description), /Closes #/, "a partial NEVER adds Closes even after head verification");
-    assert.match(String(put.description), /owner scope decision/, "the reconciled body is still the partial-delivery body");
+    // PRD #1798 M6: the reconcile writes only when the completion block differs, and the partial's
+    // block is already the non-closing one it was created with, so the check is on the PR as it
+    // stands after the verified-head reconcile (the reconcile re-read it and found its block).
+    assert.ok(!calls.some((c) => c.method === "PUT"), "the non-closing partial block was already current: no rewrite");
+    assert.doesNotMatch(pr.description, /Closes #/, "a partial NEVER adds Closes even after head verification");
+    assert.match(pr.description, /owner scope decision/, "the reconciled body is still the partial-delivery body");
     // The run completes (the head verified) and carries head H, like any granted interlocked run.
     const done = completedBody(claim.run_id);
     assert.ok(done, "an owner partial run still completes on a verified head");
@@ -145,7 +151,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
   });
 
   it("permit DENIED → never creates the MR, never completes, holds the run", async () => {
-    const { gitlab, calls } = fakeGitlab({ head: H });
+    const { gitlab, all } = fakeGitlab({ head: H });
     const claim = interlockedClaim(1301);
     api.setCompletionPermitResponse(false, { denyReason: "missing_milestones" });
     // The hold ACK defaults to paused/200, so enterCompletionHold parks the run.
@@ -156,14 +162,14 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     }).execute(claim);
 
     assert.strictEqual(api.completionPermitRequests.length, 1, "the permit was requested");
-    assert.strictEqual(calls.length, 0, "a denied permit opens NO MR and reads NO PR head");
+    assert.strictEqual(all.length, 0, "a denied permit opens NO MR and reads NO PR head");
     assert.ok(!statuses(claim.run_id).includes("completed"), "a denied permit never completes");
     assert.ok(!statuses(claim.run_id).includes("failed"), "a denied permit holds, not fails");
     assert.strictEqual(api.completionHoldRequests.length, 1, "the run entered the completion hold");
   });
 
   it("granted but PR head != H → MR is created but the run does NOT complete; it holds", async () => {
-    const { gitlab, calls } = fakeGitlab({ head: OTHER });
+    const { gitlab, calls, all } = fakeGitlab({ head: OTHER });
     const claim = interlockedClaim(1302);
     api.setCompletionPermitResponse(true);
     git.trackingTip = (async () => H) as typeof git.trackingTip;
@@ -174,7 +180,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
 
     // The MR exists (create-then-verify), and the head was read.
     assert.ok(calls.some((c) => c.method === "POST"), "the MR was created before the head verify");
-    assert.ok(calls.some((c) => c.method === "GET"), "the PR head was read");
+    assert.ok(all.some((c) => c.method === "GET"), "the PR head was read");
     // A head mismatch must not report completed; the run holds.
     assert.ok(!statuses(claim.run_id).includes("completed"), "a PR-head mismatch never completes");
     assert.strictEqual(api.completionHoldRequests.length, 1, "a PR-head mismatch holds the run");
@@ -189,7 +195,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
   it("granted but the PR head read THROWS → MR is created, run holds, and the body is reconciled off Closes", async () => {
     // A non-200 single-item GET makes getMergeRequestHead throw a ForgeError (the "cannot verify"
     // branch), distinct from the value-mismatch branch above.
-    const { gitlab, calls } = fakeGitlab({ head: H, headStatus: 404 });
+    const { gitlab, calls, all } = fakeGitlab({ head: H, headStatus: 404 });
     const claim = interlockedClaim(1305);
     api.setCompletionPermitResponse(true);
     git.trackingTip = (async () => H) as typeof git.trackingTip;
@@ -200,7 +206,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
 
     // The MR exists (create-then-verify) and the head read was attempted (a GET) before it threw.
     assert.ok(calls.some((c) => c.method === "POST"), "the MR was created before the head verify");
-    assert.ok(calls.some((c) => c.method === "GET"), "the PR head read was attempted");
+    assert.ok(all.some((c) => c.method === "GET"), "the PR head read was attempted");
     // An unreadable head must not report completed; the run holds.
     assert.ok(!statuses(claim.run_id).includes("completed"), "an unreadable PR head never completes");
     assert.strictEqual(api.completionHoldRequests.length, 1, "an unreadable PR head holds the run");
@@ -245,7 +251,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
   });
 
   it("granted + head matches H but the add-Closes reconcile FAILS → MR holds (no Closes), never completes", async () => {
-    const { gitlab, calls } = fakeGitlab({ head: H, putStatus: 404 });
+    const { gitlab, calls, all } = fakeGitlab({ head: H, putStatus: 404 });
     const claim = interlockedClaim(1306);
     api.setCompletionPermitResponse(true);
     git.trackingTip = (async () => H) as typeof git.trackingTip;
@@ -256,7 +262,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
 
     const body = mrPostBody(calls);
     assert.doesNotMatch(String(body.description), /Closes #/, "the interlocked MR is created WITHOUT Closes");
-    assert.ok(calls.some((c) => c.method === "GET"), "the PR head was read to verify it");
+    assert.ok(all.some((c) => c.method === "GET"), "the PR head was read to verify it");
     assert.ok(calls.some((c) => c.method === "PUT"), "the add-Closes reconcile was attempted");
     assert.ok(!statuses(claim.run_id).includes("completed"), "a failed add-Closes never completes");
     assert.ok(!statuses(claim.run_id).includes("failed"), "it holds rather than fails");
@@ -264,9 +270,15 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
   });
 
   it("head matches at verify but CHANGES before the post-add re-verify → strips Closes and holds (bind to verified head, CodeRabbit !1254)", async () => {
-    // The first GET (verify) answers H so the add proceeds; the second GET (post-add re-verify) answers
-    // OTHER, modelling a head change in the read→add window. Closes must not be left on the changed head.
-    const { gitlab, calls } = fakeGitlab({ heads: [H, OTHER] });
+    // The verify read answers H so the add proceeds; the add-Closes write moves the head to OTHER, so the
+    // post-add re-verify reads OTHER, modelling a head change in the read→add window. Closes must not be
+    // left on the changed head.
+    const { gitlab, calls, all } = fakeGitlab({
+      head: H,
+      onWrite: (pr, description) => {
+        if (/Closes #1307/.test(description)) pr.head = OTHER;
+      },
+    });
     const claim = interlockedClaim(1307);
     api.setCompletionPermitResponse(true);
     git.trackingTip = (async () => H) as typeof git.trackingTip;
@@ -275,10 +287,12 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
       recoveryRetryMs: 1,
     }).execute(claim);
 
+    // The PR is read by the publisher (read, revalidate), the head verify, the add-Closes reconcile
+    // (read, confirm), the post-add re-verify, and the strip reconcile (read, confirm).
     assert.strictEqual(
-      calls.filter((c) => c.method === "GET").length,
-      2,
-      "the head is read twice: verify then post-add re-verify",
+      all.filter((c) => c.method === "GET").length,
+      8,
+      "the head is read at verify and again after the add (the re-verify)",
     );
     assert.ok(!statuses(claim.run_id).includes("completed"), "a head change after adding Closes never completes");
     assert.strictEqual(api.completionHoldRequests.length, 1, "a post-add head change holds the run");
@@ -292,7 +306,8 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
   it("PR head != H AND the non-closing strip write FAILS → fails CLOSED (never holds a possibly-closing MR, CodeRabbit !1254)", async () => {
     // An adopted MR may already carry Closes; if the strip-to-non-closing write fails on the hold path
     // we cannot prove the MR is non-closing, so the run must FAIL rather than park a possibly-closing MR.
-    const { gitlab, calls } = fakeGitlab({ head: OTHER, putStatus: 500 });
+    // A permanent write refusal (403): a 5xx would be retried by the forge retry schedule first.
+    const { gitlab, calls } = fakeGitlab({ head: OTHER, putStatus: 403 });
     const claim = interlockedClaim(1308);
     api.setCompletionPermitResponse(true);
     git.trackingTip = (async () => H) as typeof git.trackingTip;
@@ -308,7 +323,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
   });
 
   it("LEGACY (non-interlocked) run → no permit, no PR-head read, Closes as before, completes with NO head", async () => {
-    const { gitlab, calls } = fakeGitlab({ head: H });
+    const { gitlab, calls, pr } = fakeGitlab({ head: H });
     const claim = gitlabClaim(1304); // no config ⇒ legacy
     api.setCompletionPermitResponse(true); // armed, but must never be reached
 
@@ -316,7 +331,13 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
 
     // The interlock is entirely inert for a legacy run.
     assert.strictEqual(api.completionPermitRequests.length, 0, "a legacy run never requests a permit");
-    assert.ok(!calls.some((c) => c.method === "GET"), "a legacy run never reads the PR head");
+    // PRD #1798 M6: the description publisher reads the PR (D11) and may refresh its region (here the
+    // fake's head differs from the landed one, so it regenerates for it), but nothing verifies the head
+    // and the completion block is the one the MR was created with.
+    const created = parseOwnedBlocks(String(mrPostBody(calls).description));
+    const now = parseOwnedBlocks(pr.description);
+    assert.ok(created.kind === "ok" && now.kind === "ok");
+    assert.equal(now.kind === "ok" && now.completion, created.kind === "ok" && created.completion, "a legacy run never reconciles the completion block");
     // Closes renders exactly as before, and the completed report carries NO head.
     const body = mrPostBody(calls);
     assert.match(String(body.description), /Closes #1304/, "the legacy Closes renders unchanged");
