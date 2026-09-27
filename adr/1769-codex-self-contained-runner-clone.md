@@ -166,4 +166,10 @@ build opts in to `--network host` only when
 `CODEX_GIT_TRUST_BUILD_NETWORK=host` (bridge egress hangs on some hosts).
 Acceptance runs of `task test:codex-git-trust` pass it on every full
 invocation because that recipe rebuilds the image. The fixture container
-itself always runs with `--network none`.
+itself always runs with `--network none`. The image build also runs under
+`timeout --foreground`, and the hermetic `e2e/codex-git-trust/run.test.sh`
+(`task test:codex-git-trust-wrapper`, in `gate:repo`, Linux-only) pins this
+wrapper contract with a stub `docker`: exit 2 before any docker call for a
+missing bind source, read-only `--mount` binds only, the 0/77-to-3 cleanup
+mapping, the `host`-only build network, and a process-group SIGINT that
+reaches `docker run` and `docker build` and exits 130 promptly.

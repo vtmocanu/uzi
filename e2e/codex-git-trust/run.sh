@@ -109,7 +109,8 @@ case "$action" in
         echo "WARN: CODEX_GIT_TRUST_BUILD_NETWORK=$CODEX_GIT_TRUST_BUILD_NETWORK is not \"host\"; not forwarding it (the build uses the default network)" >&2
       fi
     fi
-    DOCKER_BUILDKIT=1 timeout --kill-after=10s "${CODEX_GIT_TRUST_BUILD_TIMEOUT:-600}" docker build \
+    # --foreground: same reason as the fixture's `timeout ... docker run` below (Ctrl-C reach).
+    DOCKER_BUILDKIT=1 timeout --foreground --kill-after=10s "${CODEX_GIT_TRUST_BUILD_TIMEOUT:-600}" docker build \
       "${build_network_args[@]}" -f "$repo/agent/templates/base/Dockerfile" -t "$image" \
       --build-arg "UZI_SRC_SHA=$(git -c safe.directory="$repo" -C "$repo" rev-parse HEAD)" "$repo"
     ;;
@@ -137,7 +138,7 @@ case "$action" in
     # signal sent to this script's PID alone waits up to CODEX_GIT_TRUST_TIMEOUT plus the
     # kill grace before cleanup starts. `timeout --foreground` keeps docker run in this
     # script's process group (without it, timeout calls setpgid and a group signal never
-    # reaches the container), so a process-group signal (Ctrl-C) reaches docker run
+    # reaches `docker run`, the CLI), so a process-group signal (Ctrl-C) reaches docker run
     # directly and it returns promptly. On expiry --foreground kills only docker run itself,
     # which is the whole command here.
     trap on_exit EXIT

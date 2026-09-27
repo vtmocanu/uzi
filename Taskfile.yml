@@ -318,6 +318,10 @@ tasks:
       # (`docker rm -v`); the missing `-v` leaked one pg volume per run and filled
       # the worker's Docker data-root. Before `scan:secrets` (deliberately last).
       - task: test:store-it-cleanup
+      # hermetic (~11s, fake docker, no daemon; Linux-only via `platforms`): the opt-in
+      # codex-git-trust wrapper's bind/cleanup/exit-code/signal contract (#1769). Its
+      # SIGTERM case waits out the 10s kill grace, so it is not sub-second.
+      - task: test:codex-git-trust-wrapper
       # Hermetic end-to-end tests for the repo-local uzi-watcher backup scripts. They use
       # fake uzi/kubectl commands and temporary git repos: no cluster, forge or live backup
       # directory is touched. This gates clone capture, bare-ref fallback, fail-closed
@@ -915,6 +919,19 @@ tasks:
       # `-v` leaked one anonymous pg data volume per run and filled the worker's
       # Docker data-root. Sibling of test:e2e-reclaim.
       - ./e2e/run-store-it.test.sh
+
+  test:codex-git-trust-wrapper:
+    desc: hermetic test of e2e/codex-git-trust/run.sh's binds, cleanup exit codes, build network opt-in and process-group signals (fake docker)
+    platforms: [linux]
+    cmds:
+      # No real docker daemon: a fake `docker` on PATH records argv, its pid/pgid and the
+      # signals it receives. Asserts a missing bind source exits 2 before any docker call,
+      # an unverified cleanup maps 0/77 to 3, BUILD_NETWORK=host is the only forwarded
+      # value, every bind is a read-only --mount, and that `timeout --foreground` keeps
+      # docker run/build in the script's process group so a group SIGINT exits 130
+      # promptly. Prints a `cases=N passed=N` tally and fails below its case floor.
+      # Linux-only: reads each process's stat file and needs GNU timeout --foreground.
+      - ./e2e/codex-git-trust/run.test.sh
 
   test:e2e-driver:
     desc: hermetic behavioural test of the e2e phase-registry driver, tally-guarded (fake docker/curl/psql)
