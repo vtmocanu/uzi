@@ -39,11 +39,15 @@ removes the tree.
    carries both a well-formed attempt marker and a `UZI_RUN_CLONE_KEY` equal to the
    target key — the key alone never scopes a process, or a forged key with no
    marker could wedge every seed of that key), excludes itself, and excludes
-   worker-marked spawns. It kills what is in scope, rescans until empty, and
-   reports one of three states: `quiescent`, `survivors`, or `unverified`.
-   `unverified` (an unattributable process, a helper timeout, a malformed answer)
-   and `survivors` both **fail closed**: the worker never treats "could not prove
-   it" as "proved it."
+   worker-marked spawns. Only in `own` mode (the run's own teardown) does it
+   kill what is in scope; in `seed`/`capture` mode nothing is killed — an
+   unmarked in-scope process is left as a survivor, and another live attempt's
+   process is a `live_attempt_conflict` survivor, never signalled, because
+   neither mode has a positive attribution to kill on. It rescans until nothing
+   is left to kill and nothing is unattributable, and reports one of three
+   states: `quiescent`, `survivors`, or `unverified`. `unverified` (an
+   unattributable process, a helper timeout, a malformed answer) and `survivors` both **fail closed**: the
+   worker never treats "could not prove it" as "proved it."
 3. **A Docker Engine API teardown** force-removes every container with a bind
    mount under the clone, then lists until two consecutive listings are clean. Its
    results are `not_wired` (no daemon configured), `docker_unconfirmed`, or
@@ -54,7 +58,9 @@ removes the tree.
    - the limit, wall-clock and completion-hold parks leave the park standing, with
      no credentialed publish;
    - an owner pause that cannot prove quiescence reports `pause_failed` and the
-     run keeps running (Decision 8) rather than parking on unproven ground;
+     run keeps running, under the existing pause rule (PRD #35 Decision 8, reused
+     by PRD #1190's park path: no durable checkpoint, no park) rather than
+     parking on unproven ground;
    - finalize fails the run with the typed `fail_origin` `worker_residue_blocked`;
    - terminal retire keeps the clone rather than removing it;
    - graceful shutdown, milestone checkpoint, and restore-point capture are all
@@ -62,12 +68,17 @@ removes the tree.
 5. Re-proofs run after any runner-clone git operation, since git itself can run
    repo-configured code (filters, textconv) that spawns processes.
 6. Every worker-invoked runner-clone git call sets `GIT_NO_LAZY_FETCH=1`; the
-   worker-marked subset additionally sets `GIT_ALLOW_PROTOCOL` to a value naming no
-   real protocol, so git refuses every transport. Together these close a
-   promisor/uploadpack exec path that could otherwise inherit the worker mark and
-   run arbitrary repo-configured code with it.
+   worker-marked subset additionally sets `GIT_ALLOW_PROTOCOL` to a value naming
+   no real protocol, on every worker-marked git subcommand except `clone` (which
+   needs a transport to run at all), so those calls refuse every other
+   transport. Together these close a promisor/uploadpack exec path that could
+   otherwise inherit the worker mark and run arbitrary repo-configured code with
+   it.
 7. uzi's own e2e scripts use `--mount type=bind` instead of the older `-v` bind
-   syntax, so a bind's exact source and target are always explicit.
+   syntax for every real mount; the Decision-3 sidecar-isolation fixture
+   (`e2e/phases/49-docker-sidecar.sh`) deliberately keeps `-v` in its attack
+   matrix as a negative probe, proving a sidecar container cannot read worker
+   secrets through it.
 
 ### M2 — attempt-unique clone paths on Docker-wired workers
 
@@ -78,13 +89,18 @@ removes the tree.
    never inherits an earlier attempt's residue, escaped process, or bind-mounted
    container, because it never touches that path at all. M1's sweep and M3's
    quarantine are recovery for what is left behind, not what makes isolation hold.
-9. **The `.attempt-` separator**, not `@` or another delimiter: the attempt id
-   (`<UTC timestamp>-<claim generation>-<16 hex>`) is itself hyphen-separated, and
-   the basename grammar needs a separator that cannot appear inside a git branch
-   component (which the key is derived from) while staying unambiguous under a
-   greedy-key regex — the LAST `.attempt-` followed by a complete, anchored id is
-   always the true separator, so key and id parse back losslessly even if a key
-   were ever to contain the literal string `.attempt-` followed by other text.
+9. **The `.attempt-` separator**, not `@` or another delimiter: `git
+   check-ref-format` accepts `.attempt-` inside a ref, so the choice is not about
+   what git's grammar forbids. It is chosen because it uses only
+   `[A-Za-z0-9.-]`, the same character class as the key itself, and carries no
+   special meaning to git, npm, Go or nix build tooling the way `@` does (a
+   version-pin or scope marker in several of those). The attempt id
+   (`<UTC timestamp>-<claim generation>-<16 hex>`) is itself hyphen-separated, so
+   the basename grammar still needs to stay unambiguous under a greedy-key
+   regex — the parser is anchored and takes the LAST `.attempt-` followed by a
+   complete, strictly-formatted id as the true separator, so key and id parse
+   back losslessly even if a key happens to contain the literal string
+   `.attempt-` followed by other text.
 10. A bare-config ledger, `uzi-attempts.<branch>.entry`, records every attempt's
     state: `live`, `abandoned`, `retired`, or `reclaimed`. `reclaimed` (a foreign
     attempt released without capture) is never disposable — it is not eligible for
@@ -95,9 +111,11 @@ removes the tree.
     predecessor-scoped quiescence before releasing the predecessor's path in
     place — the predecessor is never removed out from under a proof that has not
     run.
-13. **Retention is bounded**: 3 abandoned attempts per key, and 5 quarantined
-    residue entries per key (`agent/src/git.ts`,
-    `RETAINED_ABANDONED_PER_KEY` / `RETAINED_RESIDUE_PER_KEY`). Deletes run as the
+13. **Retention is bounded where the sweep runs**: 3 abandoned attempts per key,
+    and 5 quarantined residue entries per key (`agent/src/git.ts`,
+    `RETAINED_ABANDONED_PER_KEY` / `RETAINED_RESIDUE_PER_KEY`) — see the disclosed
+    scope reduction below: the sweep that enforces these caps runs only on
+    Docker-wired workers. Deletes run as the
     **runner uid**, never a worker-uid recursive removal over a tree the runner
     (and, transitively, the agent) can write to. Reclaimed-but-uncaptured attempts
     are excluded from deletion regardless of age or count.
@@ -128,13 +146,19 @@ removes the tree.
 ### M3 — residue quarantine at the canonical clone path
 
 17. **The canonical reseed proves quiescence first**, then deletes as the runner
-    uid. On `EACCES`/`EPERM`/`ENOTEMPTY` it renames the residue, within the SAME
-    parent directory, to `.uzi-residue-<key>.residue-<uuid>` and keeps it there —
-    it is never deleted by this path. The same-parent constraint is not
-    stylistic: moving a root-owned directory to a DIFFERENT parent needs write
-    permission on that directory's own `..`, which a root-owned subtree does not
-    grant the runner uid; renaming within the same parent needs only write
-    permission on the parent the runner uid already owns.
+    uid. Whatever remains after a failed or timed-out-and-settled runner-uid
+    delete (the delete reports only an exit code under the uid split, not the
+    errno that left something behind) is renamed by the WORKER, in-process
+    (`fs.rename` in `quarantineCanonical`), within the SAME parent directory, to
+    `.uzi-residue-<key>.residue-<uuid>`, and kept there — it is never deleted by
+    this path. The same-parent constraint is not stylistic: `<runnerRoot>/<repoDir>`
+    is worker-owned `2775` and not sticky, so the worker may rename any entry
+    inside it, including a root-owned one, to another name in that SAME
+    directory. Moving a root-owned directory to a DIFFERENT parent instead needs
+    write permission on the moved directory's own `..` (its current parent), for
+    the rename to rewrite that entry — permission a root-owned directory denies
+    the worker; staying in the same parent needs write permission only on the
+    parent, which the worker already has.
 18. A symlink or non-directory planted at the canonical path is quarantined
     without ever being followed or opened — a planted link cannot be used to
     redirect the reseed's proof or its delete elsewhere.
@@ -154,6 +178,19 @@ removes the tree.
     through its root-start entrypoint and the production uid split, because a
     host or single-uid run cannot reproduce the split and a run wholly as root
     passes vacuously.
+23. **An unsettled runner-uid delete blocks the path it was walking, not just the
+    caller that started it** (`unsettledDeletes`, `assertNoUnsettledDelete`,
+    `runRunnerUidDelete` in `agent/src/git.ts`). A group kill sent to a timed-out
+    `rm` still waits for the child's `'close'` event before the delete settles —
+    a failed kill (e.g. `ESRCH` racing an already-exiting process) does not
+    shortcut that wait. When `'close'` has not arrived within the bounded wait
+    after the kill, the delete is left `unsettled` for that resolved path: every
+    LATER free or reseed attempt against the same path on this worker blocks
+    immediately (`CloneResidueBlockedError`) until `'close'` finally arrives or
+    the worker restarts, because an `rm` that may still be walking the tree must
+    never be handed a fresh clone or a quarantine rename underneath it. From the
+    operator's side this shows up as the same key repeatedly failing with
+    `worker_residue_blocked`, not as one isolated failure.
 
 ## Disclosed scope reductions
 
@@ -165,8 +202,19 @@ removes the tree.
   survive its own reaper.
 - Every pause now kills the attempt's background processes and removes its
   clone-bound containers — this is new coverage, not a pre-existing behavior.
-- Residue quarantine (M3) covers Docker-wired workers only; unwired workers are
-  not swept for the same class of residue.
+- **M3 canonical-path quarantine (`freeCanonicalClonePath`/`quarantineCanonical`
+  in `agent/src/git.ts`) runs on EVERY worker, wired or not**: `attemptSeedOptions`
+  returns `undefined` when the worker has no Docker endpoint, so
+  `runnerCloneForBranch` takes the canonical (non-attempt) path, and that path
+  always reseeds through the M3 quarantine, not just on Docker-wired workers.
+  What is genuinely Docker-only is the retention SWEEP (`sweepRetainedArtifacts`)
+  that bounds decision 13's caps and reclaims old residue — it is called only
+  from `attemptCloneForBranch`, which itself only runs when the worker is
+  Docker-wired. So an unwired worker quarantines residue exactly as a
+  Docker-wired one does, but nothing ever caps or sweeps what accumulates there:
+  a `.uzi-residue-*` entry on an unwired worker is retained forever. This is an
+  accepted gap, not a design intent; treat unbounded residue growth on unwired
+  workers as a known follow-up.
 - The ledger rewrite (decision 10/14) needs hard links on the data volume; a
   volume that does not support them is a deployment constraint on this design,
   not a design gap.
@@ -182,11 +230,17 @@ removes the tree.
   fixed-argv spawn. Marking a repo- or agent-invoked command breaks the
   attribution the reaper depends on to distinguish worker infrastructure from
   agent activity.
-- Never introduce a second attempt-path grammar or separator; parse and mint
-  paths only through `agent/src/attempt-path.ts`'s helpers, so `cloneKeyOf`,
-  `parseAttemptPath` and `formatResidueName` stay the single source of truth for
-  every consumer (the reaper, the retention sweep, `uzi-watcher`'s recovery
-  scripts).
+- Never introduce a second attempt-path grammar or separator inside the agent:
+  parse and mint paths only through `agent/src/attempt-path.ts`'s helpers
+  (`cloneKeyOf`, `parseAttemptPath`, `formatResidueName`) and mint attempt ids
+  only through `mintAttemptId` (`agent/src/run-quiescence.ts`) — they are the
+  single source of truth for every in-process consumer, including the reaper and
+  the retention sweep. `uzi-watcher`'s recovery shell scripts
+  (`.agents/skills/uzi-watcher/scripts/backup-runs.sh`) are outside that
+  boundary: they cannot import TypeScript, so they parse the same
+  `<stem>.attempt-<id>` grammar themselves (`ATTEMPT_RE`, basename matching) — a
+  second, necessarily duplicated implementation. Keep it byte-for-byte in sync
+  with `attempt-path.ts`'s grammar when either changes.
 - Never delete a `reclaimed` ledger entry's clone via the retention sweep, and
   never delete anything as the worker uid when the runner uid can do it instead.
 - Never follow a symlink or non-directory found at a canonical clone path during
@@ -195,6 +249,9 @@ removes the tree.
   go to `runner-quarantine`, unjournaled residue goes to `.uzi-residue-*`.
   Merging them would erase the diagnostic signal that a `.uzi-residue-*` entry
   carries.
+- Never treat a failed group-kill as a settled delete: wait for the child's
+  `'close'` regardless of whether the kill itself succeeded, and never free or
+  reseed a path an unsettled delete may still be walking (decision 23).
 
 ## Consequences
 
