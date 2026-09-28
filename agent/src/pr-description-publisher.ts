@@ -571,7 +571,9 @@ export class PrDescriptionPublication {
     const sizeLine = facts?.size.line ?? null;
     let source: "generated" | "lead_only" | "deterministic_only" = "deterministic_only";
     let fields: RawPrDescriptionFields = EMPTY_FIELDS;
-    if (!deterministic) {
+    // A stopped publication (a 409 stale_claim/run_terminal) no longer owns the run: skip the
+    // model pass, whose result would be thrown away, rather than spend the owner's credential on it.
+    if (!deterministic && !this.stopped) {
       const generated = await this.editorPass(snapshot);
       const lead = leadFields(spec.lead);
       if (generated) {

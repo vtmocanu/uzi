@@ -185,7 +185,8 @@ something goes wrong or a human has touched the request in between:
   with, a blind rewrite that succeeds is still accepted, even though
   nothing read the body back to confirm it. A read-back that errors
   outright after the rewrite is written plays out differently by run
-  kind: on a legacy (seeded) run, that failure has no further fallback
+  kind: on a legacy (non-interlocked: seeded, kill-switched or pre-rollout) run,
+  that failure has no further fallback
   and the run fails closed there and then; on an interlocked run, that
   same failure falls through to the same blind whole-body rewrite the
   unreadable case uses, and is accepted on the same terms. This scan and

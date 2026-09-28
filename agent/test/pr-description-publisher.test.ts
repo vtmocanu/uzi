@@ -998,7 +998,8 @@ describe("publisher: a stale_claim / run_terminal 409 stops every further region
   }
 
   it("an ack answered 409 stale_claim stops too: no restage, no later ack, no write", async () => {
-    const r = rig();
+    const pass = new FakePass(SUMMARY);
+    const r = rig(pass);
     r.forge.pr.description = "Legacy body";
     // The head moves between read 1 and read 2: the bound version is acked skipped_snapshot_moved,
     // which the api refuses as stale; without the stop, the publication would restage and write.
@@ -1010,6 +1011,7 @@ describe("publisher: a stale_claim / run_terminal 409 stops every further region
     await pub.publish(MR);
     assert.deepEqual(api.acks(), ["skipped_snapshot_moved"]);
     assert.equal(stages().length, 1, "no restage after the stop");
+    assert.equal(pass.calls.length, 1, "no editor pass after the stop");
     assert.equal(r.forge.writes.length, 0);
   });
 });
