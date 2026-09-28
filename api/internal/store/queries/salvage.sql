@@ -7,8 +7,8 @@
 
 -- name: ListSalvageCandidates :many
 -- Failed, checkpoint-eligible runs with a recorded checkpoint tip on an enabled forge kind,
--- finished inside the window and not yet recorded. Plan-rejected runs keep today's immediate
--- delete, so they are excluded here. Oldest first; bounded by lim.
+-- finished inside the window and not yet recorded. Plan-rejected runs are never salvaged, so
+-- they are excluded here. Oldest first; bounded by lim.
 SELECT r.id, r.user_id, p.id AS repo_id, r.kind, r.issue_iid,
        r.checkpoint_tip::text AS checkpoint_tip, r.fail_origin, c.forge_type
 FROM runs r

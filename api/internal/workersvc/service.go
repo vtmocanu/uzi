@@ -1517,8 +1517,9 @@ type Params struct {
 
 	// SalvageForges (PRD #1867, UZI_SALVAGE_FORGES) lists the forge kinds ("github",
 	// "gitlab", "forgejo") whose failed runs SweepSalvage enqueues for a salvage ref. It gates
-	// ONLY the enqueue: rows already recorded keep expiring when their forge leaves the list.
-	// Empty (the zero value) is off.
+	// the enqueue and the create: rows already recorded keep expiring when their forge leaves
+	// the list, and a pending row there settles 'disabled' after a CAS delete of any unrecorded
+	// copy. Empty (the zero value) is off.
 	SalvageForges []string
 }
 

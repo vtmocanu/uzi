@@ -731,8 +731,10 @@ type Config struct {
 	// (github, gitlab, forgejo; trimmed and lower-cased) whose failed runs the salvage sweep
 	// copies into refs/uzi-salvage/<run-id>. Default empty: OFF. It is enabled per forge only
 	// after the maintainer real-forge check for that forge passes (PRD #1867 M6). An unknown
-	// entry refuses to start (config.Load errors). It gates only the enqueue: salvage refs
-	// already created keep expiring after UZI_RECOVERY_READY_RETENTION.
+	// entry refuses to start (config.Load errors). It gates the enqueue and the create: rows
+	// already recorded keep expiring after UZI_RECOVERY_READY_RETENTION, and a pending row
+	// on a forge that left the list is settled 'disabled' (after a CAS delete of any
+	// unrecorded copy), so a rollback can still make forge calls for existing rows.
 	SalvageForges []string
 }
 

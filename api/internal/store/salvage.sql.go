@@ -263,8 +263,8 @@ type ListSalvageCandidatesRow struct {
 // cleared when the row settles; the CHECKs in 00268 enforce that, so every transition below
 // that clears it is guarded on the source state.
 // Failed, checkpoint-eligible runs with a recorded checkpoint tip on an enabled forge kind,
-// finished inside the window and not yet recorded. Plan-rejected runs keep today's immediate
-// delete, so they are excluded here. Oldest first; bounded by lim.
+// finished inside the window and not yet recorded. Plan-rejected runs are never salvaged, so
+// they are excluded here. Oldest first; bounded by lim.
 func (q *Queries) ListSalvageCandidates(ctx context.Context, arg ListSalvageCandidatesParams) ([]ListSalvageCandidatesRow, error) {
 	rows, err := q.db.Query(ctx, listSalvageCandidates, arg.Forges, arg.Since, arg.Lim)
 	if err != nil {
