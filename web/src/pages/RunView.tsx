@@ -60,6 +60,7 @@ import { deriveRunUsage } from "../lib/runUsage";
 import { statusSinceIso } from "../lib/statusSince";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
 import { RecoveryArchivesPanel } from "../components/RecoveryArchives";
+import { SalvagePanel } from "../components/SalvagePanel";
 import { RunIssueRef } from "../components/RunIssueRef";
 import { RunCredential } from "../components/RunCredential";
 import { HarnessBadge } from "../components/HarnessBadge";
@@ -2835,6 +2836,11 @@ export function RunView() {
           honest legacy/unavailable note on a finalization-blocked run), rendering nothing
           for an ordinary run. Owner-only: a non-owner's 404 renders nothing. */}
       <RecoveryArchivesPanel run={run} />
+
+      {/* Checkpoint salvage (PRD #1867): the bounded archive copy of a failed run's last
+          published checkpoint at refs/uzi-salvage/<run-id>. Renders only for a failed run
+          whose detail read carries a salvage_state; nothing otherwise. */}
+      <SalvagePanel run={run} />
 
       {/* Run retrospective (PRD #46 M4): the LLM judge's verdict + recommendations,
           shown once a run is finished. The panel fetches its own review and owns the

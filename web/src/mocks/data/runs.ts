@@ -1356,6 +1356,15 @@ export const mockRuns: Run[] = [
     mr_iid: null,
     mr_state: null,
     failure_reason: "run timed out after 2h0m0s (RUN_TIMEOUT)",
+    // PRD #1867: a promoted salvage, so mock mode shows the Salvage panel's saved state
+    // with the fetch command. The ref id is UUID-shaped (the real ref is keyed by the run's
+    // UUID; mock run ids are slugs), because the panel offers the command only for a
+    // well-formed refs/uzi-salvage/<uuid> ref.
+    salvage_state: "promoted",
+    salvage_ref: "refs/uzi-salvage/5f0c2a4e-8d1b-4c7a-9e3f-2b6d8a1c4e70",
+    salvage_tip: "9c41e07b2d5a8f3e61b0c7d94a2e5f18b3c6d0a7",
+    salvage_expires_at: minsAhead(60 * 24 * 13),
+    salvage_last_error: null,
     stop_kind: null,
     stop_reason: null,
     health: "ok",
@@ -1442,6 +1451,13 @@ export const mockRuns: Run[] = [
       "The agent's change is valid but touches .github/workflows/main-guard.yml, which " +
       "uzi's bot token can't push (it is scoped to `repo`, not `workflow`, by design). " +
       "Land the preserved diff below as a human PR; see docs/github-bot-setup.md.",
+    // PRD #1867: a salvage that gave up after its retry cap, carrying the bounded,
+    // server-scrubbed forge error the panel shows as plain text.
+    salvage_state: "failed",
+    salvage_ref: null,
+    salvage_tip: null,
+    salvage_expires_at: null,
+    salvage_last_error: "forge returned 503 Service Unavailable while creating the ref",
     preserved_patch:
       "diff --git a/.github/workflows/main-guard.yml b/.github/workflows/main-guard.yml\n" +
       "new file mode 100644\n" +
