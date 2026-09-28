@@ -5,7 +5,8 @@
 #      skipped the renumber);
 #   2. a branch that deletes CHANGELOG.md lines the base carries stops with exit 9;
 #   3. a gate on a worktree without node_modules installs them with --ignore-scripts first;
-#   4. a reused worktree reinstalls when the recorded package-lock.json hash is absent or stale.
+#   4. a reused worktree reinstalls when the recorded package-lock.json hash is absent or stale;
+#   5. a workflow edit on a uzi-owned branch stops before the push (exit 10) unless overridden.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -53,7 +54,14 @@ mk_branch deps
 printf 'x\n' > "$SEED/agent/x.ts"
 printf '## [Unreleased]\n\n- base entry one\n- base entry two\n- deps entry\n' > "$SEED/CHANGELOG.md"
 git -C "$SEED" add -A && git -C "$SEED" commit -qm deps
-git -C "$SEED" push -q origin collide clrm deps
+# agent/issue-9: a uzi-owned branch carrying a workflow edit; lander/wf: the same edit on a
+# branch uzi never pushes to.
+for b in agent/issue-9 lander/wf; do
+  mk_branch "$b"
+  mkdir -p "$SEED/.github/workflows"; printf 'on: push\n' > "$SEED/.github/workflows/ci.yml"
+  git -C "$SEED" add -A && git -C "$SEED" commit -qm "wf on $b"
+done
+git -C "$SEED" push -q origin collide clrm deps agent/issue-9 lander/wf
 git clone -q "$ORIGIN" "$ROOT"
 git -C "$ROOT" config user.name test
 git -C "$ROOT" config user.email test@example.com
@@ -125,6 +133,23 @@ grep -q 'base entry two' "$WORK/out.102" || fail "the removed line was not print
 run clrm 102 --skip-rebase --allow-changelog-removals --no-push --gate none
 [ "$rc" -eq 0 ] || fail "--allow-changelog-removals did not pass, rc=$rc: $(cat "$WORK/out.102")"
 
+# 5. a workflow edit on a uzi-owned branch stops before the push (exit 10): uzi's worker PAT
+# lacks workflow scope, so every later uzi push there would fail. Not pushed.
+before=$(git --git-dir="$ORIGIN" rev-parse refs/heads/agent/issue-9)
+run agent/issue-9 105 --gate none
+[ "$rc" -eq 10 ] || fail "workflow edit on a uzi branch not stopped, rc=$rc: $(cat "$WORK/out.105")"
+grep -q '^RESULT=workflow_edit ' "$WORK/out.105" || fail "workflow stop not named: $(cat "$WORK/out.105")"
+grep -q 'workflow_scope_missing' "$WORK/out.105" || fail "the consequence was not named"
+# (the rebase onto main is a no-op here, so a push would not have moved the ref either; the
+# rc and RESULT are the evidence)
+[ "$(git --git-dir="$ORIGIN" rev-parse refs/heads/agent/issue-9)" = "$before" ] || fail "agent/issue-9 was pushed"
+# ...the explicit override pushes, and a non-uzi branch is not stopped at all.
+run agent/issue-9 105 --skip-rebase --gate none --allow-workflow-edit
+[ "$rc" -eq 0 ] || fail "--allow-workflow-edit did not pass, rc=$rc: $(cat "$WORK/out.105")"
+run lander/wf 106 --gate none
+[ "$rc" -eq 0 ] || fail "a non-uzi branch with a workflow edit was stopped, rc=$rc: $(cat "$WORK/out.106")"
+grep -q 'NOTE: branch changes workflow files' "$WORK/out.106" || fail "the workflow note is missing on a non-uzi branch"
+
 # 3a. A failing install stops as a gate failure whose LOG is a real file carrying npm's output.
 : > "$TASK_LOG"
 NPM_FAIL=1 run deps 104 --no-push
@@ -171,4 +196,4 @@ run deps 103 --skip-rebase --no-push
 grep -q -- 'ci --ignore-scripts' "$NPM_LOG" || fail "node_modules without a recorded hash was not reinstalled"
 [ -s "$STAMP" ] || fail "the reinstall recorded no hash"
 
-echo "PASS land-prep guards: migration collision under pipefail, CHANGELOG removal stop, node_modules install, lockfile-hash reinstall"
+echo "PASS land-prep guards: migration collision under pipefail, CHANGELOG removal stop, node_modules install, lockfile-hash reinstall, workflow edit on a uzi branch"

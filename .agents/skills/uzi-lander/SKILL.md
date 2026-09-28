@@ -252,7 +252,9 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
      of that exact SHA (`peers.py buddy ping` restores a lost reply route) plus green CI; no
      bot re-review. A later rebase-only push keeps it via the rebase lane (*Buddy*).
      Skill-maintenance `[skip-cr]` PRs keep their own rule below;
-   - **big** (design-level, many files, needs the plan's context): `uzi run rework RUN -m
+   - **big** (design-level, many files, needs the plan's context). First fetch and run the
+     two-dot workflow check (*Always yours*); a non-empty result means no uzi push can
+     succeed on this branch, so never send it back to uzi: fix locally. Then `uzi run rework RUN -m
      'GUIDANCE'` (single-quoted), `SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)` captured first,
      `S/wait-mrrework.sh OWNER/REPO PR 45 60 "$SINCE"`, review its commit, trail `fix rework`.
      Exit 3 means the rework is still running: re-run the waiter with the same `$SINCE`.
@@ -311,7 +313,9 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    the remote, so cherry-pick back any commit it names under `FRESH_BACKUP=`, but never a
    whole file from that backup: it predates what landed on the base since. Exit 9 = the
    branch deletes `CHANGELOG.md` lines the base carries (a stale-copy resolution): restore
-   them; `--allow-changelog-removals` only for a deliberate reword.
+   them; `--allow-changelog-removals` only for a deliberate reword. Exit 10 = a uzi-owned
+   branch changes workflow files: split the edit out (*Always yours*);
+   `--allow-workflow-edit` only when no uzi push to the branch can follow.
    A push re-enters the chosen review lane in step 2. Trail `rebase+renumber → pushed`.
    Say what you resolved in the merge note; do not ask first.
 6. **Merge.** When the readiness poll says ready and the *Always yours* checks below have
@@ -357,7 +361,11 @@ and they precede every merge (step 6):
   origin/main..origin/BRANCH -- .github/workflows/`. Empty means the branch's workflow tree
   matches `main`, so a workflow file in the three-dot PR diff is only a base-realignment
   artifact and the merge is safe; non-empty is a real workflow change, which only your
-  token can push (`uzi-watcher`, *The workflow-scope guardrail*).
+  token can push (`uzi-watcher`, *The workflow-scope guardrail*). **Never put a workflow
+  edit on a uzi-owned branch** (`agent/*`, `uzi/*`) while any uzi push to it can follow (a
+  rework, a `ci_fix`, a re-run): that push then fails atomically and loses its commits.
+  Land the workflow edit in a separate maintainer PR after this one; `land-prep.sh` stops
+  such a push (exit 10).
 - **Plan ↔ diff scope match.** Read the approved plan (`uzi run logs RUN --json`, the last
   `plan` message) against `gh pr diff PR --name-only`: did the run do what the plan said,
   no more, no less? A dropped milestone or an unplanned surface is a finding (step 4); a
