@@ -93,7 +93,7 @@ func run(args []string) result {
 	if drift == 0 {
 		fmt.Fprintf(&out, "builtins match upstream (%d roles; lead is product-only)\n", len(names))
 	} else {
-		fmt.Fprintf(&out, "\n%d of %d builtins drift from upstream. Copy product-agents/<role>.md from the pinned tag; put uzi-only rules in agent/src/prompt.ts and uzi-only tools in agenttmpl/tool_delta.go.\n", drift, len(names))
+		fmt.Fprintf(&out, "\n%d of %d builtins drift from upstream. Copy product-agents/<role>.md from the pinned commit; put uzi-only rules in agent/src/prompt.ts and uzi-only tools in agenttmpl/tool_delta.go.\n", drift, len(names))
 	}
 	return result{code: 0, stdout: out.String()}
 }

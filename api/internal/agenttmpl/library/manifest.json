@@ -1,6 +1,6 @@
 {
   "upstream_repo": "github.com/vtmocanu/skills",
-  "upstream_sha": "f3246f352b2564bf5ca714b45f3e486b36ecc259",
+  "upstream_sha": "51bb4f3803f75b602d039b1fa8f46d1210ec5d79",
   "path": "skills/agent-kit/agent-team/roles.yaml",
   "synced": "2026-09-28",
   "roles": {

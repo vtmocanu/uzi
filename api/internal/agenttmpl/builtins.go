@@ -13,7 +13,7 @@ import (
 // builtinFS holds the product's builtin agent-template definitions, versioned
 // in git, shipped in the binary via go:embed, and boot-seeded into the
 // database. Every file except lead.md is a verbatim copy of the upstream role
-// library's published product-agents/ file at the tag pinned in
+// library's published product-agents/ file at the release commit pinned in
 // library/manifest.json (PRD #1849); uzi-only rules live in the worker's
 // prompt append (agent/src/prompt.ts) and uzi-only tools in productToolDelta.
 // It is independent of this repo's own .claude/agents/ dev-team roster (which
