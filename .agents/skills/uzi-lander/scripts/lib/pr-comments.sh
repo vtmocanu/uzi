@@ -59,7 +59,11 @@ def status_only:
         ($b | contains("<!-- This is an auto-generated comment: summarize by coderabbit.ai -->"))
         or ($b | contains("<!-- walkthrough_start -->"))
         or ($b | contains("<!-- auto-generated comment: rate limited by coderabbit.ai -->"))
-        or ($b | contains("<!-- CodeRabbit review command invocation:"))))
+        or ($b | contains("<!-- CodeRabbit review command invocation:"))
+        # The answer to the cr-rate-limit.sh quota query: pure status, short, no finding.
+        or (($b | contains("<!-- This is an auto-generated reply by CodeRabbit -->"))
+            and ($b | test("More reviews will be available in [0-9]+ minutes?|Reviews are available now"))
+            and ($b | length) < 600)))
     or ($u == "greptile-apps[bot]" and (
         ($b | contains("<!-- greptile_comment -->"))
         or ($b | contains("<!-- greptile_outside_diff -->"))));
