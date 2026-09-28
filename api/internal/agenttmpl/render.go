@@ -47,7 +47,7 @@ func Render(d Definition) []byte {
 	if d.Version > 0 {
 		b.WriteString("version: " + strconv.Itoa(d.Version) + "\n")
 	}
-	b.WriteString("description: " + d.Description + "\n")
+	b.WriteString("description: " + quoteScalar(d.Description) + "\n")
 	if len(d.Tools) > 0 {
 		b.WriteString("tools: " + strings.Join(d.Tools, ", ") + "\n")
 	}
