@@ -50,8 +50,10 @@ import { restoreHermeticView } from "./setup/hermetic-proc.js";
 // build). The markers test uses ANOTHER live attempt's markers (a registered attempt that is not the
 // one being seeded), so its readable branch proves `live_attempt_conflict`, not own-attempt reaping.
 //
-// Every reap below reads only the tracked agent's real procfs entries. Only the unreadable
-// kill case can signal; its injected kill checks the recorded start time again.
+// Each reap lists only a tracked, test-owned agent as a candidate; ancestry checks can also
+// read other procfs stat entries. Only the unreadable kill case can signal that tracked PID,
+// after checking its recorded start time. That case injects a synthetic UID-split decision
+// through the test-only narrowed table, not through the single-UID production request path.
 
 const PROC = path.join("/", "proc");
 

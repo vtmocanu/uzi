@@ -697,14 +697,34 @@ describe("UID-split solitary unreadable runner process", () => {
     assert.deepEqual(r.processes.map((p) => p.pid), [51]);
   });
 
-  it("single-uid keeps a solitary unreadable process unverified and unsignalled", async () => {
-    const { r, signalled } = await fakeReap(
-      { 52: { uid: ME, cwd: "EACCES", env: "EACCES", ppid: 1 } },
-      fakeReq({ targetUid: ME }),
-    );
-    assert.equal(r.state, "unverified");
+  it("single-uid request construction keeps a solitary unreadable process unverified", async () => {
+    assert.notEqual(process.env.UZI_UID_SPLIT, "1", "this process must exercise the single-uid path");
+    const signalled: number[] = [];
+    let now = 0;
+    const req = {
+      mode: "own" as const,
+      attempt: undefined,
+      cloneKey: KEY,
+      targetPaths: [CLONE],
+      processes: true,
+      dockerHost: undefined,
+      registry: new LiveAttemptRegistry(),
+      otherClaimInFlight: false,
+    };
+    const out = await quiesceRunAttempt(req, {
+      targetUid: ME,
+      reap: {
+        table: fakeTable({ 52: { uid: ME, cwd: "EACCES", env: "EACCES", ppid: 1 } }),
+        selfPid: SELF,
+        deadlineMs: 20,
+        now: () => now,
+        sleep: async (ms) => { now += ms; },
+        kill: (pid) => { signalled.push(pid); },
+      },
+    });
+    assert.equal(out.process?.state, "unverified");
     assert.deepEqual(signalled, []);
-    assert.deepEqual(r.processes.map((p) => p.pid), [52]);
+    assert.deepEqual(out.process?.processes.map((p) => p.pid), [52]);
   });
 
   it("a recorded live root exempts its unreadable child", async () => {
