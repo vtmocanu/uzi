@@ -32,7 +32,9 @@ import { restoreHermeticView } from "./setup/hermetic-proc.js";
 // process's own descendant, a readable unmarked agent would be excluded as "the scanner's own"
 // (R5), which no production stray is. `$!` is the agent's own pid (sh forks, the child execs
 // ssh-agent), confirmed below from its world-readable stat. The launcher writes `$!` to a pidfile
-// before it prints it, so an agent whose launcher fails after starting it is still stopped. Every
+// before it prints it, so an agent whose launcher fails after starting it is still stopped (only
+// while that pid's stat still names ssh-agent with a start time at or after a floor taken just
+// before the launch, so a reused pid is adopted only if it is itself an ssh-agent started since). Every
 // agent is recorded with its start time (field 22 of its world-readable stat) at launch, and is
 // signalled only by that exact pid, and only while the pid's start time still matches: a pid the
 // kernel has since reused for an unrelated process is never signalled.
@@ -125,6 +127,34 @@ function track(pid: number): void {
   if (startTime !== undefined) started.set(pid, startTime);
 }
 
+/** A boot-relative start-time floor taken just before a launch: the start time (same clock-tick
+ *  units as field 22) of a throwaway `sh` that reads its own stat and exits. Any process started
+ *  after this call has a start time at or above it. Undefined when it cannot be read. */
+function startTimeFloor(): number | undefined {
+  try {
+    return statStartTime(execFileSync("sh", ["-c", 'cat "$0/$$/stat"', PROC], { encoding: "utf8", timeout: 5_000 }));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Recovery-path tracking (the launcher failed, so its pid came from the pidfile): record `pid` only
+ *  when its stat still names `ssh-agent` and its start time is at or after `floor`, taken before the
+ *  launch. If the agent died and the kernel reused its pid, the reused process is adopted only when it
+ *  is itself an ssh-agent started after this launch began; any other process is left alone. */
+function trackRecovered(pid: number, floor: number | undefined): void {
+  if (floor === undefined) return;
+  let stat: string;
+  try {
+    stat = procfsTable.readStat(pid);
+  } catch {
+    return; // gone
+  }
+  const startTime = statStartTime(stat);
+  if (!/^\d+ \(ssh-agent\) /.test(stat) || startTime === undefined || startTime < floor) return;
+  started.set(pid, startTime);
+}
+
 /** SIGTERM `pid`, then SIGKILL it if it is still alive after 2 s. By exact pid only, and only while
  *  its start time still matches the one recorded at launch, re-checked before each signal. */
 async function stopByPid(pid: number): Promise<void> {
@@ -173,6 +203,7 @@ async function startAgent(t: TestContext, cwd: string, env: NodeJS.ProcessEnv): 
     return undefined;
   }
   const pidFile = path.join(sockDir, "agent.pid");
+  const floor = startTimeFloor();
   let out: string;
   try {
     out = execFileSync(
@@ -182,9 +213,9 @@ async function startAgent(t: TestContext, cwd: string, env: NodeJS.ProcessEnv): 
     );
   } catch (err) {
     // The launcher failed or timed out: recover the agent's pid from the pidfile, so the cleanup
-    // still stops it.
+    // still stops it, but only while that pid is still an ssh-agent started after `floor`.
     const recovered = Number(fs.existsSync(pidFile) ? fs.readFileSync(pidFile, "utf8").trim() : NaN);
-    if (Number.isSafeInteger(recovered) && recovered > 0) track(recovered);
+    if (Number.isSafeInteger(recovered) && recovered > 0) trackRecovered(recovered, floor);
     throw err;
   }
   const pid = Number(out.trim());

@@ -30,6 +30,11 @@ function code(file: string): string {
     .replace(/(^|[^:\\])\/\/.*$/gm, "$1");
 }
 
+/** `text` with every single- and double-quoted string literal emptied (template literals are kept,
+ *  since their `${}` holes are code). */
+const withoutStrings = (text: string): string =>
+  text.replace(/"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'/g, (m) => m[0]! + m[0]!);
+
 const matches = (text: string, re: RegExp): string[] => [...text.matchAll(re)].map((m) => m[0]);
 
 describe("production code never installs a quiescence test view", () => {
@@ -57,11 +62,27 @@ describe("production code never installs a quiescence test view", () => {
 
   it("in run-quiescence.ts, the test-view state is written only inside the setter", () => {
     const src = code(OWNER);
-    // Plain `=` and the logical assignments `??=`, `||=`, `&&=` (never `==` / `===`).
-    const writes = matches(src, /\btestView\s*(?:\?\?|\|\||&&)?=(?!=)[^;]*;/g);
+    // The declaration carries no initializer: it starts undefined, and only the setter sets it.
+    assert.deepEqual(matches(src, /\b(?:let|var|const)\s+testView\b[^;]*;/g), ["let testView: QuiescenceView | undefined;"]);
+    // Plain `=` and the logical assignments `??=`, `||=`, `&&=` (never `==` / `===`), including one
+    // after a type annotation (`testView: T = ...`), so an initialized declaration counts as a write.
+    const writes = matches(src, /\btestView\b(?:\s*:[^=;]*)?\s*(?:\?\?|\|\||&&)?=(?!=)[^;]*;/g);
     assert.deepEqual(writes, ["testView = view === undefined ? undefined : structuredClone(view);"]);
     const setter = /export function setQuiescenceViewForTests\([^)]*\): void \{[\s\S]*?\n\}/.exec(src)?.[0] ?? "";
     assert.ok(setter.includes(writes[0]!), "the one write sits in the setter's body");
+  });
+
+  it("run-quiescence.ts never reads the environment, so no env var can supply or shape a view", () => {
+    const src = code(OWNER);
+    // `process.env`, `process["env"]`, and a destructured `{ env } = process`.
+    assert.deepEqual(matches(src, /\bprocess\s*(?:\?\.|\.)\s*env\b|\bprocess\s*\[\s*["'`]env["'`]\s*\]/g), []);
+    assert.deepEqual(matches(src, /\benv\b[^}=]*\}\s*=\s*process\b/g), []);
+    // And, stated for the view path itself: the setter and the view validation mention no `process`.
+    const setter = /export function setQuiescenceViewForTests\([^)]*\): void \{[\s\S]*?\n\}/.exec(src)?.[0] ?? "";
+    const validation = /function isQuiescenceView\([^)]*\): v is QuiescenceView \{[\s\S]*?\n\}/.exec(src)?.[0] ?? "";
+    assert.ok(setter.length > 0 && validation.length > 0, "found the setter and the view validation");
+    assert.doesNotMatch(setter, /\bprocess\b/);
+    assert.doesNotMatch(validation, /\bprocess\b/);
   });
 
   it("in run-quiescence.ts, `view` is added to a request only from the test-set state", () => {
@@ -81,6 +102,6 @@ describe("production code never installs a quiescence test view", () => {
     // a member access or a spread (`o.view`, `...view`).
     assert.deepEqual(matches(src, /\.view\s*=(?!=)/g), []);
     assert.deepEqual(matches(src, /\[\s*["'`]view["'`]\s*\]/g), []);
-    assert.deepEqual(matches(src, /(?<![.\w$])view\s*[,}]/g), []);
+    assert.deepEqual(matches(withoutStrings(src), /(?<![.\w$])view\s*[,}]/g), []);
   });
 });
