@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import os from "node:os";
@@ -115,8 +115,16 @@ const good = {
   review_pointers: ["The budget split in the context builder."],
 };
 
+// Every runner's homeRoot is a fresh mkdtemp; they are removed at the end of the file so
+// `task test:agent`'s TMPDIR leak guard (PRD #1809 M2) stays green.
+const homeRoots: string[] = [];
+after(async () => {
+  await Promise.all(homeRoots.map((d) => fs.rm(d, { recursive: true, force: true })));
+});
+
 async function runner(queryFn: SdkQueryFn, opts: { modelTimeoutMs?: number; codex?: unknown; now?: () => number; log?: Logger } = {}) {
   const homeRoot = await fs.mkdtemp(path.join(os.tmpdir(), "delivery-summary-test-"));
+  homeRoots.push(homeRoot);
   return new SummaryRunner(opts.log ?? nullLogger(), {
     queryFn,
     homeRoot,

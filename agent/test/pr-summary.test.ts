@@ -198,11 +198,11 @@ describe("verifiedAtSha stamp (PRD #1798 M2)", () => {
   });
 
   it("reads the worktree HEAD of a real repository", async () => {
-    const { dir, head } = makeGitRepo();
+    const { dir, head, root } = makeGitRepo();
     try {
       assert.equal(await readWorktreeHeadSha(dir), head);
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 

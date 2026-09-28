@@ -206,7 +206,15 @@ export function clientFor(api: FakePrDescApi): { client: WorkerClient; restore: 
   const orig = globalThis.fetch;
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input instanceof Request ? input.url : input);
-    if (!url.startsWith(FAKE_BASE)) return orig(input, init);
+    // Compare the parsed origin, not a string prefix: `http://pr-desc.fake.test.evil` would pass a
+    // startsWith check (CodeQL js/incomplete-url-substring-sanitization).
+    let origin: string | undefined;
+    try {
+      origin = new URL(url).origin;
+    } catch {
+      origin = undefined;
+    }
+    if (origin !== FAKE_BASE) return orig(input, init);
     const m = /\/runs\/([^/]+)\/pr-description\/(stage|bind|lookup|ack)$/.exec(url);
     if (!m) return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
     const body = init?.body ? (JSON.parse(String(init.body)) as Json) : {};

@@ -6703,7 +6703,7 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
       message: { content: [{ type: "tool_use", name: "mcp__uzi__signal_done", input: { pr_summary: PR_SUMMARY_INPUT } }] },
     }).prSummary;
     assert.deepEqual(claude, PR_SUMMARY_EXPECTED);
-    const { dir, head } = makeGitRepo();
+    const { dir, head, root } = makeGitRepo();
     try {
       for (const kind of ["issue", "task"] as const) {
         const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn, { pr_summary: PR_SUMMARY_INPUT })]])]);
@@ -6712,7 +6712,7 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
         assert.deepEqual(result.prSummary, { ...claude, verifiedAtSha: head }, `${kind}: same shape plus the HEAD stamp`);
       }
     } finally {
-      await fs.rm(dir, { recursive: true, force: true });
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -6736,7 +6736,7 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
     // The claims must survive with the sha they were made at, not be dropped or re-stamped.
     // Mutation: dropping the `if (result.prSummary !== undefined)` guard re-stamps undefined on the
     // bare done turn, so the result carries no prSummary and this reddens.
-    const { dir, head } = makeGitRepo();
+    const { dir, head, root } = makeGitRepo();
     try {
       const rig = makeMultiEpochRig([
         script("th-1", [(th, tn) => [done(21, th, tn, { milestones_completed: ["m1"], pr_summary: PR_SUMMARY_INPUT })]]),
@@ -6766,7 +6766,7 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
       assert.ok(moved !== undefined && moved !== head, "HEAD moved between the two done turns");
       assert.deepEqual(result.prSummary, { ...PR_SUMMARY_EXPECTED, verifiedAtSha: head });
     } finally {
-      await fs.rm(dir, { recursive: true, force: true });
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 

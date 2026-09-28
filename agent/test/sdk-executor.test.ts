@@ -5362,12 +5362,12 @@ describe("SdkExecutor signal_done pr_summary (PRD #1798 M2)", () => {
   }
 
   it("carries the fixture's claims off the terminating turn, stamped with the worktree HEAD", async () => {
-    const { dir, head } = makeGitRepo();
+    const { dir, head, root } = makeGitRepo();
     try {
       const result = await runDeclaring({ pr_summary: PR_SUMMARY_INPUT }, { worktreePath: dir });
       assert.deepStrictEqual(result.prSummary, { ...PR_SUMMARY_EXPECTED, verifiedAtSha: head });
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -5390,7 +5390,7 @@ describe("SdkExecutor signal_done pr_summary (PRD #1798 M2)", () => {
     // The claims must survive with the sha they were made at, not be dropped or re-stamped.
     // Mutation: dropping the `if (turn.prSummary !== undefined)` guard re-stamps undefined on the
     // bare done turn, so the result carries no prSummary and this reddens.
-    const { dir, head } = makeGitRepo();
+    const { dir, head, root } = makeGitRepo();
     try {
       const { queryFn, turns } = fakeTurns([
         [submitPlan("plan"), resultSuccess()],
@@ -5422,7 +5422,7 @@ describe("SdkExecutor signal_done pr_summary (PRD #1798 M2)", () => {
       assert.ok(moved !== undefined && moved !== head, "HEAD moved between the two done turns");
       assert.deepStrictEqual(result.prSummary, { ...PR_SUMMARY_EXPECTED, verifiedAtSha: head });
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 

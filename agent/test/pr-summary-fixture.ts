@@ -39,9 +39,14 @@ export const PR_SUMMARY_EXPECTED = {
   review_pointers: ["The clamp in signals.ts."],
 };
 
-/** A throwaway git repository with one commit. Returns its path and its HEAD sha. */
-export function makeGitRepo(): { dir: string; head: string } {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-prsum-wt-"));
+/** A throwaway git repository with one commit, at `<root>/wt` inside its own mkdtemp root. Returns its
+ *  path, its HEAD sha and the root. Remove `root`, not `dir`: an executor run against `dir`
+ *  materializes a sibling `.uzi-skills-wt` (skillsPluginDir), which only the root removal takes
+ *  with it (`task test:agent` fails on any TMPDIR leftover, PRD #1809 M2). */
+export function makeGitRepo(): { dir: string; head: string; root: string } {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-prsum-"));
+  const dir = path.join(root, "wt");
+  fs.mkdirSync(dir);
   const git = (...args: string[]): string =>
     execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", ...args], {
       encoding: "utf8",
@@ -50,5 +55,5 @@ export function makeGitRepo(): { dir: string; head: string } {
   fs.writeFileSync(path.join(dir, "a.txt"), "a\n");
   git("add", "a.txt");
   git("commit", "-q", "-m", "init");
-  return { dir, head: git("rev-parse", "HEAD").trim() };
+  return { dir, head: git("rev-parse", "HEAD").trim(), root };
 }
