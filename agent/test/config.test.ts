@@ -219,6 +219,13 @@ describe("loadConfig disk reclaim knobs (PRD #1809 D5/D7)", () => {
     }
   });
 
+  it("UZI_RUN_DISK_SAMPLE_INTERVAL (PRD #1809 D8) defaults to 5m, parses as a duration, and 0 turns it off", () => {
+    assert.strictEqual(loadConfig(baseEnv()).runDiskSampleIntervalMs, 5 * 60_000);
+    assert.strictEqual(loadConfig(baseEnv({ UZI_RUN_DISK_SAMPLE_INTERVAL: "" })).runDiskSampleIntervalMs, 5 * 60_000);
+    assert.strictEqual(loadConfig(baseEnv({ UZI_RUN_DISK_SAMPLE_INTERVAL: "90s" })).runDiskSampleIntervalMs, 90_000);
+    assert.strictEqual(loadConfig(baseEnv({ UZI_RUN_DISK_SAMPLE_INTERVAL: "0" })).runDiskSampleIntervalMs, 0);
+  });
+
   it("parses the interval as a duration and the margins as fractions in [0, 1)", () => {
     const c = loadConfig(baseEnv({ UZI_DISK_RECLAIM_INTERVAL: "90s", UZI_DISK_SOFT_MARGIN: "0.2", UZI_DISK_HARD_MARGIN: "0" }));
     assert.strictEqual(c.diskReclaimIntervalMs, 90_000);

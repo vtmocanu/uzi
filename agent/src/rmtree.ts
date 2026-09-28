@@ -614,6 +614,72 @@ for (const rel of JSON.parse(relsJson)) {
 process.stdout.write(JSON.stringify({ cacheBytes, entries, truncated }) + "\\n");
 `;
 
+/**
+ * PRD #1809 D8: the whole-HOME measuring walk, as `node -e <script> <home> <rels-json> <max> <budgetMs>`.
+ * The {@link MEASURE_CACHES_SCRIPT} walk (pinned `O_NOFOLLOW` descent, allocated bytes by `lstat`,
+ * streamed directories, the `<max>` dirent and `<budgetMs>` wall-time budget, `truncated` when
+ * either ran out) over the whole HOME, adding each entry to `homeBytes` and, when it is one of the
+ * `<rels-json>` cache subtrees or under one, to `cacheBytes` too. A cache subtree that is a symlink
+ * is not a directory to `lstat`, so it is counted as the link alone and never followed. Exits 7
+ * when the HOME itself cannot be pinned (missing, a symlink, unreadable to this uid).
+ */
+const MEASURE_HOME_SCRIPT = `${PINNED_PRELUDE}
+const [home, relsJson, maxArg, budgetArg] = process.argv.slice(1);
+const max = Number(maxArg);
+const budgetMs = Number(budgetArg);
+if (!home || !home.startsWith("/") || !(max >= 0) || !(budgetMs >= 0)) process.exit(6);
+const rels = new Set(JSON.parse(relsJson));
+const prefixes = new Set();
+for (const r of rels) { const parts = r.split("/"); for (let i = 1; i < parts.length; i++) prefixes.add(parts.slice(0, i).join("/")); }
+const deadline = Date.now() + budgetMs;
+let homeBytes = 0, cacheBytes = 0, entries = 0, truncated = false;
+function walk(dirFd, rel, inCache) {
+  let dir;
+  try { dir = fs.opendirSync(FD + dirFd); } catch { return; }
+  try {
+    let e;
+    while (!truncated) {
+      try { e = dir.readSync(); } catch { return; }
+      if (e === null) return;
+      if (entries >= max || Date.now() > deadline) { truncated = true; return; }
+      entries++;
+      const p = at(dirFd, e.name);
+      let st;
+      try { st = fs.lstatSync(p); } catch { continue; }
+      const b = bytesOf(st);
+      homeBytes += b;
+      const childRel = rel === null ? null : rel === "" ? e.name : rel + "/" + e.name;
+      const childInCache = inCache || (childRel !== null && st.isDirectory() && rels.has(childRel));
+      if (childInCache) cacheBytes += b;
+      if (!st.isDirectory()) continue;
+      let childFd;
+      try { const pin = fs.openSync(p, PIN); try { childFd = reopen(pin); } finally { fs.closeSync(pin); } } catch { continue; }
+      const nextRel = !childInCache && childRel !== null && prefixes.has(childRel) ? childRel : null;
+      try { walk(childFd, nextRel, childInCache); } finally { fs.closeSync(childFd); }
+    }
+  } finally {
+    dir.closeSync();
+  }
+}
+let fd;
+try {
+  fd = fs.openSync(home, PIN);
+  homeBytes += bytesOf(fs.fstatSync(fd));
+} catch {
+  process.exit(7);
+}
+try {
+  const dirFd = reopen(fd);
+  try { walk(dirFd, "", false); } finally { fs.closeSync(dirFd); }
+} catch {
+  // An unreadable HOME root: what was counted stands, as a partial reading.
+  truncated = true;
+} finally {
+  fs.closeSync(fd);
+}
+process.stdout.write(JSON.stringify({ homeBytes, cacheBytes, entries, truncated }) + "\\n");
+`;
+
 /** The uids a PRD #1809 helper runs as: under the split `runner`, then `runner-cmd` (Codex
  *  command roots are members of group `runner` and can write into a group-writable HOME),
  *  then, for a removal, `runner` again for what the second pass unblocked. Single-uid the
@@ -1019,6 +1085,81 @@ export async function measureRunCaches(home: string, opts: MeasureOptions = {}):
     }
   }
   if (!best) throw lastErr ?? new Error("measureRunCaches: no measuring pass ran");
+  return best;
+}
+
+/** PRD #1809 D8: allocated bytes under a whole run HOME, and the part of them in its caches. */
+export interface RunHomeBytes {
+  homeBytes: number;
+  /** Bytes under the HOME's {@link RUN_CACHE_SUBTREES}, part of `homeBytes`. */
+  cacheBytes: number;
+  /** Dirents the largest pass counted (at most its `maxEntries`). */
+  entries: number;
+  /** A pass hit its entry or time budget (or could not read the HOME root), so both numbers
+   *  are lower bounds. */
+  truncated: boolean;
+}
+
+/** Dirents one whole-HOME measuring pass may count by default: a HOME holds far more than its
+ *  caches (a clone's objects, the SDK state), so the budget is the caches' one. */
+const MEASURE_HOME_MAX_ENTRIES = MEASURE_MAX_ENTRIES;
+
+/**
+ * PRD #1809 D8: measure a whole run HOME, for the heartbeat's per-run size. The same machinery
+ * and bounds as {@link measureRunCaches} (agent-uid passes under the uid split, pinned and
+ * streamed, an entry ceiling per pass and the caller's `deadline`), over the whole HOME instead
+ * of its cache subtrees only, returning the cache share alongside. Each uid sees a subset, so the
+ * larger reading of each number is kept: a lower bound, never a sum of passes. Rejects only when
+ * no pass produced a reading (a missing HOME, or every pass failed).
+ */
+export async function measureRunHome(home: string, opts: MeasureOptions = {}): Promise<RunHomeBytes> {
+  if (!path.isAbsolute(home)) throw new Error(`measureRunHome: refusing non-absolute HOME ${home}`);
+  const wrappers = opts.wrappers ?? agentWrappers("measure");
+  const maxEntries = opts.maxEntries ?? MEASURE_HOME_MAX_ENTRIES;
+  let best: RunHomeBytes | undefined;
+  let lastErr: unknown;
+  for (const wrap of wrappers) {
+    const timeout = passTimeout(opts.deadline);
+    if (timeout <= 0) {
+      lastErr ??= new Error("measureRunHome: the deadline passed before a pass could run");
+      break;
+    }
+    const budgetMs = Math.max(0, timeout - HELPER_SLACK_MS);
+    const wrapped = wrap(process.execPath, [
+      "-e",
+      MEASURE_HOME_SCRIPT,
+      home,
+      JSON.stringify(RUN_CACHE_SUBTREES),
+      String(maxEntries),
+      String(budgetMs),
+    ]);
+    let stdout: string;
+    try {
+      ({ stdout } = await execFileAsync(wrapped.command, wrapped.args, {
+        env: { PATH: "/usr/local/bin:/usr/bin:/bin" },
+        timeout,
+        maxBuffer: 64 * 1024,
+      }));
+    } catch (e) {
+      lastErr = helperFailure(e as HelperExecError);
+      continue;
+    }
+    try {
+      const r = JSON.parse(stdout) as RunHomeBytes;
+      best =
+        best === undefined
+          ? r
+          : {
+              homeBytes: Math.max(best.homeBytes, r.homeBytes),
+              cacheBytes: Math.max(best.cacheBytes, r.cacheBytes),
+              entries: Math.max(best.entries, r.entries),
+              truncated: best.truncated || r.truncated,
+            };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (!best) throw lastErr ?? new Error("measureRunHome: no measuring pass ran");
   return best;
 }
 

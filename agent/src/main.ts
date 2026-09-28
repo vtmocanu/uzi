@@ -21,6 +21,7 @@ import { Worker } from "./worker.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
 import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js";
 import { CachesDroppedMemo, DiskPressureController, modelPassMinAgeMs, runDiskReclaimPass } from "./disk-reclaim.js";
+import { RunDiskSampler } from "./run-disk.js";
 import { DataVolumeGuard } from "./disk-full.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import { DiskGovernor } from "./cache-cap.js";
@@ -690,6 +691,18 @@ async function main(): Promise<void> {
         })
       : undefined;
   if (diskPressure && config.diskReclaimEnabled) reclaimNow = () => diskPressure.reclaimNow();
+  // PRD #1809 D8: the per-run HOME size on the heartbeat, measured in the background at most
+  // every UZI_RUN_DISK_SAMPLE_INTERVAL (0 turns it off).
+  const runDisk =
+    config.runDiskSampleIntervalMs > 0
+      ? new RunDiskSampler({
+          homeRoot: sdkHomeRoot,
+          intervalMs: config.runDiskSampleIntervalMs,
+          isRunLive: (runId) => runner.isExecuting(runId),
+          statusOf: runStatusOf,
+          log,
+        })
+      : undefined;
   worker = new Worker(
     config,
     client,
@@ -705,6 +718,7 @@ async function main(): Promise<void> {
     undefined,
     dindPrune,
     diskPressure,
+    runDisk,
   );
 
   // Signal handlers FIRST, before anything that can take real time. Until these

@@ -248,6 +248,28 @@ describe("StatsCollector — disk sampling (PRD #837 M1)", () => {
     assert.strictEqual(s.disk_data_total_bytes, 8_192_000);
   });
 
+  it("PRD #1809 D8: attaches the data volume's inode pair (used = files − ffree), never /nix's", () => {
+    const statfs = (path: string): StatfsSample =>
+      path === "/nix"
+        ? { bsize: 4096, blocks: 1000, bfree: 250, bavail: 200, files: 900, ffree: 100 }
+        : { bsize: 4096, blocks: 2000, bfree: 1500, bavail: 1400, files: 65_536, ffree: 60_000 };
+    const s = new StatsCollector({ ...base(), now: () => 0n, cpuCount: () => 8, statfs, dataDir: "/data" }).collect();
+    assert.ok(s);
+    assert.strictEqual(s.disk_data_inodes, 5_536);
+    assert.strictEqual(s.disk_data_total_inodes, 65_536);
+    assert.ok(!Object.keys(s).some((k) => k.startsWith("disk_nix_") && k.includes("inode")), "no /nix inode fields");
+  });
+
+  it("PRD #1809 D8: omits the inode pair without inode accounting (files 0, absent, or inconsistent)", () => {
+    for (const extra of [{ files: 0, ffree: 0 }, {}, { files: 10, ffree: 11 }, { files: Number.NaN, ffree: 1 }]) {
+      const statfs = (): StatfsSample => ({ bsize: 4096, blocks: 2000, bfree: 1500, bavail: 1400, ...extra });
+      const s = new StatsCollector({ ...base(), now: () => 0n, cpuCount: () => 8, statfs, dataDir: "/data" }).collect();
+      assert.ok(s);
+      assert.strictEqual(s.disk_data_bytes, 2_048_000, "the byte pair stays");
+      assert.ok(!("disk_data_inodes" in s) && !("disk_data_total_inodes" in s), `omitted for ${JSON.stringify(extra)}`);
+    }
+  });
+
   it("still returns the mem stats (heartbeat not failed) when statfs throws for BOTH volumes", () => {
     const statfs = (): StatfsSample => {
       throw new Error("statfs unavailable");

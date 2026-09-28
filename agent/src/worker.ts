@@ -14,6 +14,7 @@ import type { DindPruneController } from "./dind-prune.js";
 import { makeTerminalOutboxDeps, resolvePendingTerminal, type SendTerminalState } from "./terminal-resolve.js";
 import { dataVolumeUsedFraction, StatsCollector } from "./stats.js";
 import type { DiskPressureController } from "./disk-reclaim.js";
+import type { RunDiskSampler } from "./run-disk.js";
 import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
 import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY } from "./codex/codex-runtime-probe.js";
@@ -75,6 +76,9 @@ export class Worker {
     // UZI_DISK_ADMISSION is on. The heartbeat feeds it each data-volume sample, the run lane
     // asks it before every claim, and run() starts its periodic reclaim loop.
     private readonly diskPressure?: DiskPressureController,
+    // PRD #1809 D8: the background per-run HOME measure. The heartbeat attaches its latest
+    // finished sample as `stats.run_disk` and never waits on it.
+    private readonly runDisk?: RunDiskSampler,
   ) {}
 
   /** The run lane's in-flight executions (issue #1759: a field so {@link isIdle} can read it). */
@@ -441,6 +445,10 @@ export class Worker {
         const sentAtMs = Date.now();
         sampledAtMs = sentAtMs;
         sample = this.collectStats(stats);
+        // PRD #1809 D8: the latest finished per-run HOME sample (the call starts the next one in
+        // the background when due; it never awaits a measure).
+        const runDisk = this.runDisk?.current();
+        if (sample && runDisk) sample.run_disk = runDisk;
         const retaining = await this.client.heartbeat(
           sample,
           this.outboxEntries(),

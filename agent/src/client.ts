@@ -1382,7 +1382,7 @@ export class WorkerClient {
    *  treated as refused, the safe default). */
   async reportWallPark(
     runId: string,
-    args: { head: string; published: boolean; claimGeneration?: number },
+    args: { head: string; published: boolean; claimGeneration?: number; checkpointContainsLatest?: boolean },
   ): Promise<{ status: string; budgetTotalSeconds?: number; budgetUsedSeconds?: number }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/wall-park`;
     // Stamp the claim-lane generation through the shared send-gate + skew-safe fallback, exactly as
@@ -1393,6 +1393,8 @@ export class WorkerClient {
     return this.withGenerationFallback(included, async (includeField) => {
       const body: WallParkRequest = { head: args.head, published: args.published };
       if (includeField) body.claim_generation = args.claimGeneration;
+      // PRD #1809 D8: the caller passes it only when the api advertised run_checkpoint_durability.
+      if (args.checkpointContainsLatest !== undefined) body.checkpoint_contains_latest = args.checkpointContainsLatest;
       const res = await this.fetchRaw("POST", path, body);
       if (res.status === 200 || res.status === 409) {
         const fields = await readRunAck(res);

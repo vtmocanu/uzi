@@ -94,6 +94,12 @@ export interface Config {
   /** PRD #1809 D7: the periodic reclaim cadence (UZI_DISK_RECLAIM_INTERVAL, default 10m). */
   diskReclaimIntervalMs: number;
   /**
+   * PRD #1809 D8: how often the background per-run HOME measure runs for the heartbeat's
+   * `run_disk` (UZI_RUN_DISK_SAMPLE_INTERVAL, default 5m; `0` turns the sampler off). The
+   * heartbeat only reads the latest finished sample, so this never delays a heartbeat.
+   */
+  runDiskSampleIntervalMs: number;
+  /**
    * PRD #1809 D5: the soft threshold's distance below the api's recycle threshold
    * (UZI_DISK_SOFT_MARGIN, default 0.10, so 0.80 against the default 0.90). A fraction in
    * [0, 1); anything else falls back to the default.
@@ -527,6 +533,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     reviewModelTimeoutMs: 5 * 60_000,
     summaryModelTimeoutMs: summaryModelTimeoutMs(env),
     diskReclaimIntervalMs: duration(env, "UZI_DISK_RECLAIM_INTERVAL", "10m"),
+    runDiskSampleIntervalMs: duration(env, "UZI_RUN_DISK_SAMPLE_INTERVAL", "5m"),
     diskSoftMargin: marginFraction(env, "UZI_DISK_SOFT_MARGIN", 0.1),
     diskHardMargin: marginFraction(env, "UZI_DISK_HARD_MARGIN", 0.03),
     runCacheCapEnabled: parseBoolDefaultTrue(env.UZI_RUN_CACHE_CAP_ENABLED),

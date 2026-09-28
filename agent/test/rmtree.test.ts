@@ -10,6 +10,7 @@ import {
   PURGE_CHILDREN_SCRIPT,
   type HomeRemovalDeps,
   measureRunCaches,
+  measureRunHome,
   rmHomeSubtree,
   rmHomeTree,
   rmTreeForce,
@@ -749,6 +750,71 @@ describe("measureRunCaches (PRD #1809)", () => {
       await assert.rejects(measureRunCaches(home, { wrappers: [broken] }));
       await assert.rejects(measureRunCaches("relative", { wrappers: [identity] }), /non-absolute/);
     } finally {
+      await forceCleanup(home);
+    }
+  });
+});
+
+describe("measureRunHome (PRD #1809 D8)", () => {
+  const identity = (command: string, args: readonly string[]) => ({ command, args: [...args] });
+
+  it("counts the whole HOME and its cache share, without following a symlink out", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const home = await mktmp();
+    const outside = await mktmp();
+    try {
+      await fs.mkdir(path.join(home, ".cache", "go-build"), { recursive: true });
+      await fs.writeFile(path.join(home, ".cache", "go-build", "obj"), Buffer.alloc(256 * 1024, 1));
+      await fs.mkdir(path.join(home, ".cache", "other"), { recursive: true });
+      await fs.writeFile(path.join(home, ".cache", "other", "f"), Buffer.alloc(128 * 1024, 1));
+      await fs.writeFile(path.join(home, "notes"), Buffer.alloc(512 * 1024, 1));
+      await fs.writeFile(path.join(outside, "big"), Buffer.alloc(4 * 1024 * 1024, 1));
+      await fs.symlink(outside, path.join(home, "escape"), "dir");
+      await fs.symlink(outside, path.join(home, ".npm"), "dir");
+      const r = await measureRunHome(home, { wrappers: [identity] });
+      assert.ok(r.cacheBytes >= 256 * 1024 && r.cacheBytes < 384 * 1024, `only go-build is cache: ${r.cacheBytes}`);
+      assert.ok(r.homeBytes >= r.cacheBytes + 640 * 1024, `the HOME counts the cache, .cache/other and notes: ${r.homeBytes}`);
+      assert.ok(r.homeBytes < 4 * 1024 * 1024, `a symlink target is never counted: ${r.homeBytes}`);
+      assert.strictEqual(r.truncated, false);
+    } finally {
+      await forceCleanup(home);
+      await forceCleanup(outside);
+    }
+  });
+
+  it("is bounded: stops at its entry ceiling and at its deadline, flagging a lower bound", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const home = await mktmp();
+    try {
+      for (let i = 0; i < 50; i++) await fs.writeFile(path.join(home, `f${i}`), Buffer.alloc(4096, 1));
+      const full = await measureRunHome(home, { wrappers: [identity] });
+      const capped = await measureRunHome(home, { wrappers: [identity], maxEntries: 5 });
+      assert.strictEqual(full.truncated, false);
+      assert.strictEqual(full.entries, 50);
+      assert.strictEqual(capped.truncated, true);
+      assert.strictEqual(capped.entries, 5);
+      assert.ok(capped.homeBytes < full.homeBytes);
+      await assert.rejects(measureRunHome(home, { wrappers: [identity], deadline: Date.now() - 1 }), /deadline passed/);
+    } finally {
+      await forceCleanup(home);
+    }
+  });
+
+  it("rejects a missing or symlinked HOME and a relative path; keeps the larger reading across passes", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const home = await mktmp();
+    const link = path.join(os.tmpdir(), `uzi-home-link-${process.pid}-${Date.now()}`);
+    try {
+      await fs.writeFile(path.join(home, "f"), Buffer.alloc(8192, 1));
+      await fs.symlink(home, link, "dir");
+      await assert.rejects(measureRunHome(link, { wrappers: [identity] }), /exited 7/);
+      await assert.rejects(measureRunHome(path.join(home, "missing"), { wrappers: [identity] }), /exited 7/);
+      await assert.rejects(measureRunHome("relative", { wrappers: [identity] }), /non-absolute/);
+      const broken = () => ({ command: "/nonexistent/uzi-no-such-binary", args: [] });
+      const single = await measureRunHome(home, { wrappers: [identity] });
+      assert.deepStrictEqual(await measureRunHome(home, { wrappers: [broken, identity, identity] }), single);
+    } finally {
+      await fs.rm(link, { force: true });
       await forceCleanup(home);
     }
   });

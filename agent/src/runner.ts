@@ -461,6 +461,11 @@ const DATA_VOLUME_RECLAIM_WAIT_MS = 2 * 60_000;
  *  it 400s the cause, so the worker sends the untyped `recovery_wait` park instead. */
 const DATA_VOLUME_FULL_FEATURE = "recovery_cause_data_volume_full";
 
+/** PRD #1809 D8: the api feature that accepts `checkpoint_contains_latest` on a park report. The
+ *  /state decode is strict, so an api without it would 400 the field: it is sent only when
+ *  advertised. */
+const CHECKPOINT_DURABILITY_FEATURE = "run_checkpoint_durability";
+
 /**
  * PRD #1247 M5b: a /state report came back with the top-level `stale_claim` disposition
  * (`ack.staleClaim`) — a held-state credential switch RELEASED this claim, or a reclaim
@@ -1934,24 +1939,16 @@ export class RunRunner {
           runLog,
           "terminal",
         );
-        flight.parked = await this.handleLimitReached(
-          err,
-          claim,
-          batcher,
-          reportState,
-          runLog,
-        );
-        // parked === true is the ONLY thing that preserves on-disk state; see the
-        // carve-out in the finally.
-        //
-        // PRD #218 M1: fetch the agent's committed work back into the worker bare
-        // BEFORE the finally's carve-out — the tracking ref is where the next claim's
-        // reseed (M2) reads it from, and it survives the `fs.rm` that the clone does
-        // not. Only when the run actually parked (a resume is coming) and a clone
-        // existed to fetch from. Best-effort: a park that fails is worse than a park
-        // that loses work (D4), so a failed fetch-back must not undo the park.
-        if (flight.parked) {
-          if (flight.barePath && flight.worktreePath && flight.branch) {
+        // PRD #1809 D8: the park's durability publish runs BEFORE the limit_wait report (it used to
+        // run after it), so the report can say whether the published checkpoint contains the run's
+        // latest committed work. handleLimitReached calls it after the limit_wait feed line and
+        // before the report, on the waiting path only (an opted-out run fails without a publish).
+        let parkSinkRan = false;
+        let parkPublished = false;
+        let parkHoldsLatest = false;
+        const parkSink = async (): Promise<Pick<StateRequest, "checkpoint_contains_latest">> => {
+          if (!(flight.barePath && flight.worktreePath && flight.branch)) return {};
+          parkSinkRan = true;
           const barePath = flight.barePath;
           const worktreePath = flight.worktreePath;
           const branch = flight.branch;
@@ -1961,8 +1958,8 @@ export class RunRunner {
           // run() finally reaps first — kept consistent with the done/shutdown fetch-back
           // sites) followed by the publish body, byte-for-byte. For a Codex run the facade
           // quiesces+reaps the provider root (after its per-sink auth-mode reconcile) and holds
-          // the permit across the whole publish body.
-          let parkPublished = false;
+          // the permit across the whole publish body. The run is still `running` here, which is
+          // actively-claimed, so the boundary's reconcile is authorized.
           try {
             await this.reapForSink(
               executor,
@@ -1975,7 +1972,10 @@ export class RunRunner {
                 // Best-effort — commitWipMarker swallows every error and the .catch is belt-and-
                 // braces so nothing here can undo the park (D4).
                 await this.git.commitWipMarker(worktreePath).catch(() => false);
-                await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+                const fetched = await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+                // PRD #1809 D8: what the publish below packs is the tracking ref; it holds the
+                // latest work only when this fetch-back landed and the ref equals the clone HEAD.
+                parkHoldsLatest = await this.trackingHoldsLatest(fetched, barePath, worktreePath, branch);
                 // PRD #1416 M3 (C5): bridge a divergent tracking tip BEFORE the park publish so a
                 // reseed on resume adopts B (the rewritten work), not the published tip. Best-effort:
                 // a park that fails is worse than a park that loses work (D4), so it NEVER throws —
@@ -1999,7 +1999,8 @@ export class RunRunner {
               },
             );
           } catch (err) {
-            // A NON-boundary throw propagates exactly as before. A CodexBoundaryError means the
+            // A NON-boundary throw propagates to handleLimitReached, which logs it and still
+            // reports the park (without the durability field). A CodexBoundaryError means the
             // Codex boundary could not reap/publish — nothing landed on origin, the same
             // durability consequence as a publish failure (parkPublished stays false); it must
             // NOT undo the park.
@@ -2009,6 +2010,26 @@ export class RunRunner {
               error: errMessage(err),
             });
           }
+          return this.checkpointDurabilityField(parkPublished ? parkHoldsLatest : undefined);
+        };
+        flight.parked = await this.handleLimitReached(
+          err,
+          claim,
+          batcher,
+          reportState,
+          runLog,
+          parkSink,
+        );
+        // parked === true is the ONLY thing that preserves on-disk state; see the
+        // carve-out in the finally.
+        //
+        // PRD #218 M1: the agent's committed work was fetched back into the worker bare
+        // above (parkSink), BEFORE the finally's carve-out — the tracking ref is where the next
+        // claim's reseed (M2) reads it from, and it survives the `fs.rm` that the clone does
+        // not. Best-effort: a park that fails is worse than a park that loses work (D4), so a
+        // failed fetch-back must not undo the park.
+        if (flight.parked) {
+          if (parkSinkRan) {
           // issue #1030: the park-publish result is EXPLICIT on the feed — a success line, and a
           // failure line naming the durability consequence (a resume on another worker restarts
           // from the default branch). The false case covers a real publish failure, an empty
@@ -2016,13 +2037,18 @@ export class RunRunner {
           // landed on refs/uzi-checkpoints/<branch>. publishCheckpointBestEffort ALSO emits the
           // specific HTTP/skip outcome (deduped). This batcher.emit lands because
           // handleLimitReached FLUSHES (not closes) the batcher on the park branch.
+          // PRD #1809 D8: "published" keeps meaning only that a ref landed; a published checkpoint
+          // older than the run's latest work says so.
+          if (parkPublished && !parkHoldsLatest) this.logStaleParkCheckpoint(runLog, runId, "limit");
           batcher.emit({
             kind: "status",
             agent: "worker",
             payload: {
-              text: parkPublished
-                ? "park checkpoint published to origin"
-                : "park checkpoint NOT published — a resume on another worker will restart from the default branch",
+              text: !parkPublished
+                ? "park checkpoint NOT published — a resume on another worker will restart from the default branch"
+                : parkHoldsLatest
+                  ? "park checkpoint published to origin"
+                  : "park checkpoint published to origin, but it does not contain the latest committed work: that work is on this worker only",
             },
           });
           }
@@ -7521,9 +7547,10 @@ export class RunRunner {
     branch: string,
     runId: string,
     runLog: Logger,
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       await this.git.fetchAgentBranch(barePath, worktreePath, branch, runId);
+      return true;
     } catch (e) {
       // PRD #1809 D6: name a fetch-back that failed because the data volume (where the worker
       // bare lives) is full, and start a reclaim pass so the resume has room. Not awaited and not
@@ -7535,7 +7562,43 @@ export class RunRunner {
         ...(full ? { cause: "data_volume_full" } : {}),
       });
       if (full) void this.dataVolume?.reclaim();
+      return false;
     }
+  }
+
+  /**
+   * PRD #1809 D8: the `checkpoint_contains_latest` field for a park report, or nothing. Omitted
+   * when no checkpoint was published on this park (`containsLatest` undefined) and when the api
+   * did not advertise {@link CHECKPOINT_DURABILITY_FEATURE}.
+   */
+  private checkpointDurabilityField(containsLatest: boolean | undefined): Pick<StateRequest, "checkpoint_contains_latest"> {
+    if (containsLatest === undefined || !this.client.protocolFeatures.includes(CHECKPOINT_DURABILITY_FEATURE)) return {};
+    return { checkpoint_contains_latest: containsLatest };
+  }
+
+  /**
+   * PRD #1809 D8: whether the worker bare's tracking ref (what a checkpoint publish packs) holds
+   * the run's latest committed work: the park's fetch-back landed and the ref now equals the
+   * clone's HEAD. Read after the fetch-back and BEFORE the park-sink bridge, which may move the
+   * ref to a bridge commit carrying the same tree. False on any failure (never throws).
+   */
+  private async trackingHoldsLatest(
+    fetchedBack: boolean,
+    barePath: string,
+    worktreePath: string,
+    branch: string,
+  ): Promise<boolean> {
+    if (!fetchedBack) return false;
+    return this.git.verifyRunnerTrackingCovers(barePath, worktreePath, branch).catch(() => false);
+  }
+
+  /** PRD #1809 D8: log a park whose published checkpoint is older than the run's latest work. */
+  private logStaleParkCheckpoint(runLog: Logger, runId: string, park: string): void {
+    runLog.warn("park checkpoint does not contain the run's latest committed work; that work is on this worker only", {
+      run_id: runId,
+      park,
+      checkpoint_contains_latest: false,
+    });
   }
 
   /**
@@ -8494,6 +8557,9 @@ export class RunRunner {
     batcher: MessageBatcher,
     reportState: (body: StateRequest) => Promise<StateAck>,
     runLog: Logger,
+    /** PRD #1809 D8: the park's durability publish, run after the limit_wait feed line and
+     *  before the park report on the waiting path; returns extra park-report fields. */
+    beforePark?: () => Promise<Pick<StateRequest, "checkpoint_contains_latest">>,
   ): Promise<boolean> {
     const detail = describeLimit(err);
     // The structured fields ride BOTH the park and the opt-out failure report. The
@@ -8568,9 +8634,18 @@ export class RunRunner {
     // on those paths.
     await batcher.flush().catch(() => undefined);
 
+    // PRD #1809 D8: the durability publish, so the report can carry what it published. A throw is
+    // logged and the park is still reported, without the field.
+    const durability = beforePark
+      ? await beforePark().catch((e: unknown) => {
+          runLog.warn("park checkpoint step failed; reporting the park without it", { error: errMessage(e) });
+          return {};
+        })
+      : {};
+
     let ack: StateAck;
     try {
-      ack = await reportState({ status: "limit_wait", ...limitFields });
+      ack = await reportState({ status: "limit_wait", ...limitFields, ...durability });
     } catch (e) {
       // The park request never landed. Clean up: this run is not parked, and a
       // preserved HOME nothing will ever claim is an unbounded leak.
@@ -9611,12 +9686,17 @@ export class RunRunner {
         // Cancellation/shutdown may have arrived during local git or publish.
         if (flight.active?.shuttingDown || flight.steering.isCancelled()) continue;
         try {
-          const parkBody: StateRequest =
-            vault && this.client.protocolFeatures.includes("recovery_cause_vault_locked")
+          const parkBody: StateRequest = {
+            ...(vault && this.client.protocolFeatures.includes("recovery_cause_vault_locked")
               ? { status: "recovery_wait", recovery_cause: "vault_locked" }
               : disk
                 ? this.diskParkBody(claim, disk.preventive)
-                : { status: "recovery_wait" };
+                : { status: "recovery_wait" }),
+            // PRD #1809 D8: a verified capture fetched the clone's HEAD into the tracking ref before
+            // the publish packed it, so a checkpoint published here holds the latest committed work.
+            // Nothing published: the field is omitted (the work is on this worker only).
+            ...this.checkpointDurabilityField(capture.published ? true : undefined),
+          };
           const ack = await reportState(parkBody);
           if (ack.status === "recovery_wait" && disk) {
             runLog.info("run parked mid-run for its data volume; its caches are dropped and it resumes automatically", {
@@ -9809,13 +9889,18 @@ export class RunRunner {
     // durability, unsafe on the seededFrom:"tracking" leg): the publish below always runs; only the
     // redundant fetch-back is skipped when there is nothing new to move.
     let markerCreated = false;
+    // PRD #1809 D8: whether the tracking ref the publish packs holds the clone's HEAD (read before
+    // the bridge below, which may move the ref to a bridge commit carrying the same tree). Unknown
+    // without a runner clone to compare against.
+    let holdsLatest: boolean | undefined;
     if (barePath && branch && runnerClone) {
       markerCreated = await this.git.commitWipMarker(runnerClone.path).catch(() => false);
       const preTip = await this.git
         .branchTip(runnerClone.path, branch)
         .catch(() => null);
+      let fetched = true; // nothing new to move: the ref is what the reseed left
       if (preTip !== null && preTip !== runnerClone.baseCommit) {
-        await this.fetchBackBestEffort(
+        fetched = await this.fetchBackBestEffort(
           barePath,
           runnerClone.path,
           branch,
@@ -9823,6 +9908,7 @@ export class RunRunner {
           runLog,
         );
       }
+      holdsLatest = await this.trackingHoldsLatest(fetched, barePath, runnerClone.path, branch);
       // PRD #1416 M3 (C7): bridge a divergent tracking tip BEFORE the pause-park publish so a resume
       // adopts B (the rewritten work), not the published tip. handlePausePark is checkpoint-first and
       // does NOT route through the doCheckpointPublish/reapForSink machinery C1/C5/C6 cover, so it is
@@ -9850,6 +9936,8 @@ export class RunRunner {
         : null;
       if (cloneTip !== null && cloneTip === flight.lastPublishedTip) {
         published = true;
+        // The clone's tip is the one a prior publish confirmed landed: the checkpoint holds it.
+        holdsLatest = true;
       } else {
         published = await this.publishCheckpointBestEffort(
           flight,
@@ -9890,9 +9978,13 @@ export class RunRunner {
       return false;
     }
 
+    // PRD #1809 D8: a published pause checkpoint older than the clone's HEAD is reported as such.
+    // The pause still parks: its custody handling is unchanged (the pin below; the hold settles on
+    // the resume-terminal or the reconciler).
+    if (holdsLatest === false) this.logStaleParkCheckpoint(runLog, flight.runId, "pause");
     let ack: StateAck;
     try {
-      ack = await reportState({ status: "paused" });
+      ack = await reportState({ status: "paused", ...this.checkpointDurabilityField(holdsLatest) });
     } catch (e) {
       // The park report never landed. Not parked: the loop keeps running (its next report
       // self-heals), exactly as handleLimitReached cleans up when its park report throws.
@@ -10256,6 +10348,11 @@ export class RunRunner {
         // PRD #1497 M1 (D16): stamp the claim-lane generation so the fence refuses a
         // released/superseded stale flight's reclaimed run (the SAME value the reportState closure stamps).
         claimGeneration: flight.claimGeneration,
+        // PRD #1809 D8: a verified capture fetched the clone's HEAD into the tracking ref before the
+        // publish packed it, so a published wall checkpoint holds the latest committed work; on a
+        // degraded park nothing verified was published and the field is omitted.
+        checkpointContainsLatest: this.checkpointDurabilityField(head !== null && published ? true : undefined)
+          .checkpoint_contains_latest,
       }));
       if (budgetTotalSeconds !== undefined) refresh.totalSeconds = budgetTotalSeconds;
       if (budgetUsedSeconds !== undefined) refresh.usedSeconds = budgetUsedSeconds;

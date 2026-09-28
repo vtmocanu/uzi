@@ -179,7 +179,7 @@ export class StatsCollector {
       // the mem/cpu reading above nor throws out of collect(). The mem reading is the
       // only thing whose failure returns undefined (drops the whole heartbeat).
       this.attachDisk(stats, "disk_nix_bytes", "disk_nix_total_bytes", this.nixPath);
-      this.attachDisk(stats, "disk_data_bytes", "disk_data_total_bytes", this.dataDir);
+      this.attachDisk(stats, "disk_data_bytes", "disk_data_total_bytes", this.dataDir, true);
       this.attachDind(stats);
       return stats;
     } catch {
@@ -202,14 +202,30 @@ export class StatsCollector {
     usedKey: "disk_nix_bytes" | "disk_data_bytes",
     totalKey: "disk_nix_total_bytes" | "disk_data_total_bytes",
     path: string,
+    inodes = false,
   ): void {
     try {
-      const { bsize, blocks, bfree } = this.statfs(path);
+      const { bsize, blocks, bfree, files, ffree } = this.statfs(path);
       const total = blocks * bsize;
       const used = (blocks - bfree) * bsize;
       if (!Number.isFinite(total) || !Number.isFinite(used) || total < 0 || used < 0) return;
       stats[usedKey] = used;
       stats[totalKey] = total;
+      // PRD #1809 D8: the data volume's inode pair from the same statfs, both or neither. A
+      // filesystem without inode accounting reports files 0 (and a bytes-only fake none): omitted.
+      if (
+        inodes &&
+        typeof files === "number" &&
+        typeof ffree === "number" &&
+        Number.isFinite(files) &&
+        Number.isFinite(ffree) &&
+        files > 0 &&
+        ffree >= 0 &&
+        ffree <= files
+      ) {
+        stats.disk_data_inodes = files - ffree;
+        stats.disk_data_total_inodes = files;
+      }
     } catch {
       // Missing mount (dev/compose has no /nix) or a malformed statfs → omit the pair.
     }
