@@ -422,8 +422,10 @@ most of the places that check are not the end of the run:
   cleared, the run normally continues on the old credential in place (its
   clone and session are kept); otherwise it is stopped and left to be
   requeued rather than continuing on uncertain ground.
-- A recovery capture that cannot prove the clone stopped is retried rather
-  than treated as a failure.
+- A recovery capture that cannot prove the clone stopped is retried, up to a
+  bounded number of times; if the clone still can't be proven stopped after
+  that, the run fails the same way finalize does (see below), with the clone
+  kept.
 - On graceful shutdown, an unproven clone means nothing is published to the
   run's checkpoint; the pending requeue stands, and a later resume recovers
   from whatever was last durably saved.
@@ -434,12 +436,23 @@ way to continue without the proof: the finalize gate that pushes the run's
 branch (and its re-proofs after any git operation that could have started
 something new), seeding a fresh attempt clone for a new execution attempt,
 capturing a predecessor attempt's or a reclaimed orphan's work (both on a
-Docker-wired worker), and a canonical clone reseed that cannot free the
-path it needs. A blocked check during cleanup **after** a run has already
-reached its own outcome — retiring a finished run's clone, for instance —
-does not itself fail the run: the clone is simply kept in place instead of
-being removed, and the run's own status and failure reason (if any) stand
-unchanged.
+Docker-wired worker), a canonical clone reseed that cannot free the path it
+needs, and a recovery capture whose proof stays blocked past its bounded
+number of retries (above). A blocked check during cleanup **after** a run
+has already reached its own outcome — retiring a finished run's clone, for
+instance — does not itself fail the run: the clone is simply kept in place
+instead of being removed, and the run's own status and failure reason (if
+any) stand unchanged.
+
+When the check is unproven because a specific process could not be
+confirmed stopped, the failure reason names that process's process ID and
+program name, so an operator knows exactly what to look for on the worker.
+That process does not have to belong to the run that failed — any process
+running as the same worker user that the worker cannot positively account
+for blocks every run on that worker the same way, by design: the worker
+would rather refuse to proceed than guess. To clear it, stop the named
+process on the worker (or wait for it to exit on its own), then start a new
+run.
 
 This is a worker infrastructure problem, not something the agent did wrong,
 so a run that fails this way is never sent to the judge. Nothing is

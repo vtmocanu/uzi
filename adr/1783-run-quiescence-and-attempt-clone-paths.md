@@ -398,6 +398,83 @@ path:
   three newest values (with main's `gate_presentation_refused` and `data_volume_full`) that
   a worker may report. All three are never judged, and none is human-landable.
 
+## Worker-wide lockout by an unreadable same-uid process
+
+Found by CI, not the uzi worker: the GitHub Actions runner that ran this
+branch's own test suite had a same-uid process (a setgid `ssh-agent`) whose
+`/proc/<pid>/environ` and `cwd` are unreadable to a non-root reader by
+construction; the uzi worker itself did not have one. `scanOnce` (decision R0
+above) treats any runner-uid process whose env or cwd it cannot read as
+`unreadable_unattributed` unless ancestry attributes it to a recorded live
+root, and an unattributed process makes the whole scan `unverified`. Because
+`unverified` fails closed at every gated site, a single such process anywhere
+on the worker — an ssh-agent an unrelated tool started, not necessarily this
+run's own — is a **worker-wide lockout** for as long as it lives: terminal
+retire keeps the clone instead of removing it, canonical reseed refuses, and
+finalize and every recovery/credential-switch capture fail or skip (only the
+`unverifiedOnlyByUnattributedUnreadable` exception for a fresh attempt seed,
+decision R0/N6 above, is unaffected, because seeding a fresh path moves or
+frees nothing).
+
+**The maintainer's decision is to keep this fail-closed, not to relax it.**
+An unreadable, unattributed runner-uid process is never treated as out of
+scope, and ancestry (parent pid, session, process group, start time) is never
+used to CLEAR one — only to attribute a readable one to a known root. A
+process that forks twice and calls `setsid` defeats ancestry-based clearing
+trivially, so accepting it here would reopen exactly the escape path this ADR
+closes.
+
+**Operator visibility.** The `unreadable_unattributed` entry's world-readable
+`/proc/<pid>/stat` still names the process, so the failure reason and the
+worker log name the pid and its (sanitized, quoted) comm, e.g.:
+
+```
+runner-uid pid 4242 "ssh-agent" could not be attributed (env/cwd unreadable)
+```
+
+and `describeProcesses` adds `attribution: "could not be attributed"` to that
+process's log fields. The operator action is to stop that process on the
+worker (kill it, or let it exit on its own) and start a new run; the lockout
+clears the moment no such process remains.
+
+**A bounded wait, not an unbounded retry, on a blocked recovery capture.**
+`handleRecoveryExhausted`'s capture retry used to retry a blocked quiescence
+proof forever — this is what could hang a test run driving the same code
+path. It is now bounded: after `RECOVERY_CAPTURE_BLOCKED_ATTEMPTS` (5)
+CONSECUTIVE captures whose proof blocked (roughly 30 s at the defaults), the
+run fails with the typed `fail_origin` `worker_residue_blocked`, the clone
+and session kept for inspection. Any capture outcome that is not a blocked
+proof resets the count. Shutdown and cancellation still take precedence over
+this bound: the loop's top routes a shutdown to the retained posture and a
+cancel to the cancel report before the bound is ever checked, so neither is
+starved by it. A vault-locked (Codex credential-deferral) park that hits the
+bound additionally keeps the custody hold, as its other given-up paths do.
+This changes decision 19 above (and the D6 text under M1 decision 4) only in
+degree: the run still fails `worker_residue_blocked` with the clone kept, it
+now does so after a bounded wait instead of an unbounded one.
+
+**Test seam.** Production always scans the real `/proc` with real `SIGKILL`
+and the 5 s deadline. A narrower view can be installed only in-process, only
+by the programmatic, test-only `setQuiescenceViewForTests` — never by an
+environment variable or config read, which would be a fail-open knob on
+production code (see the `QuiescenceView` docstring in
+`agent/src/run-quiescence.ts`). The runner-uid helper honours a `view` only
+when it arrives on the stdin request the worker itself wrote to the child it
+spawned, so a test view never crosses a trust boundary the worker does not
+already own. Every agent test now installs an empty fake proc root by default
+(`agent/test/setup/hermetic-proc.ts`, preloaded and re-imported by the test
+harness), so no test's outcome depends on the host's live process table; the
+real-procfs `ssh-agent` integration tests
+(`agent/test/run-quiescence-procfs-ssh-agent.test.ts`) deliberately clear that
+default and pin this fail-closed behaviour against the real proc root on
+Linux CI, the same shape that produced the original incident.
+
+**Follow-up 6 — a per-attempt cgroup v2 boundary.** The durable fix for this
+whole class is proper per-run process ownership (a cgroup v2 boundary scoped
+to the attempt), separate from this PR's fail-closed-with-a-bound mitigation.
+Not built here; listed for the maintainer to file after merge, alongside
+Follow-ups 1-5 above.
+
 ## Root-only acceptance at the final head
 
 (recorded after the final acceptance run, following the #1826 merge)
@@ -501,6 +578,10 @@ These are not filed yet; listed here for the maintainer to file after merge.
   end to end), none of these six sites gets that coverage for their
   pre-publish steps. This is disclosed here for the maintainer to file as its
   own tracking issue, not filed yet.
+- **Follow-up 6 — a per-attempt cgroup v2 boundary.** Proper per-run process
+  ownership, scoped to the attempt, would remove the unreadable-unattributed
+  same-uid-process lockout described above at the source instead of bounding
+  the retry against it. Not built here; not filed yet.
 
 **Accepted risks:**
 
