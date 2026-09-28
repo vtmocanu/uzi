@@ -158,6 +158,46 @@ Each retained claim keeps its own hold, keyed to the exact claim that
 produced the work, so a later run on the same worker never drops an older
 claim's only copy.
 
+## Where the work is kept
+
+A finished run that already published a checkpoint to your forge keeps that
+ref, `refs/uzi-checkpoints/<branch>`, for as long as any of its custody
+holds is still open — a failed or cancelled run, but also a completed run
+that still has an open hold from an older generation of the same run. It's
+not deleted the moment the run ends, so the published copy stays reachable
+even if the worker and its disk are gone. Once every hold on the run is
+released or discarded, uzi removes the ref.
+
+If you start a new run on the same branch while the old ref is still held,
+uzi normally moves the old tip out of the way rather than blocking your
+new run: it creates `refs/uzi-recovery/<run-id>` pointing at the old run's
+tip, frees `refs/uzi-checkpoints/<branch>` for the new run, and keeps the
+old ref around under its own name until that run's holds are resolved. A
+stuck supersession — for example, the branch is not actually at the tip
+its record names — is the exception: it can refuse your new run's
+checkpoints until the old run's holds all release, rather than blocking
+just the one publish that hit it.
+
+`uzi run recovery <run-id>` shows which ref uzi's record names for a run's
+checkpoint, its tip commit, and its retention state — so you usually know
+whether to fetch the branch ref or the recovery ref. It can lag briefly
+during an in-progress supersession, or leave a stray ref untracked in a
+narrow window described in
+[ADR-1810](../adr/1810-checkpoint-retention-follows-custody.md#consequences);
+when in doubt, check both refs on your forge. Fetch either directly from
+your forge into a local branch; a bare fetch only sets `FETCH_HEAD`, which
+the next fetch overwrites, so the commit could become unreachable once uzi
+deletes the ref:
+
+```sh
+git fetch origin refs/uzi-checkpoints/<branch>:refs/heads/recovered/<run-id>
+git fetch origin refs/uzi-recovery/<run-id>:refs/heads/recovered/<run-id>
+```
+
+The ref disappears once the run's last hold is released (automatically, by
+settlement) or discarded (`uzi run discard`) — the same custody lifecycle
+that governs the recovery archives above.
+
 ## Automatic settlement of an older held generation
 
 When a run is resumed on the same worker (after a rate-limit park, a

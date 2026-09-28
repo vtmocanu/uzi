@@ -16,17 +16,24 @@
 // remote's compare-and-swap on that fetched Old refuses any update that would move the
 // ref off it. A non-fast-forward / CAS-mismatch rejection is mapped to ErrNotDescendant
 // — a legitimate "origin moved" outcome the caller turns into a 200 skip, never a 5xx.
+//
+// The other two ref writes keep the same invariant. Delete removes a checkpoint,
+// recovery or salvage ref (a CAS on the expected tip when one is known; always a CAS for
+// a recovery or salvage ref), and CreateRef (PRD #1810 D2, widened by PRD #1867) creates a
+// refs/uzi-recovery/* or refs/uzi-salvage/* ref with a single command whose Old is the
+// zero hash, so the remote's compare-and-swap refuses it whenever the ref already exists.
+// No path in this package sends a forced update.
 package pushbroker
 
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
+	"crypto/sha1" //nolint:gosec // G505: SHA-1 is the git packfile trailer format, not a security primitive.
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"slices"
 	"strings"
 	"time"
 
@@ -36,6 +43,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/format/packfile"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp"
+	"github.com/go-git/go-git/v5/plumbing/protocol/packp/capability"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/go-git/go-git/v5/plumbing/transport/client"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
@@ -70,6 +78,10 @@ type Options struct {
 // Result reports the ref that was (or would have been) advanced.
 type Result struct {
 	Ref string
+	// AlreadyCurrent: origin's checkpoint ref already pointed at the declared tip, so nothing
+	// was written. The success proves only that origin holds the tip, not who wrote it; the
+	// caller decides whether the tip is the run's own (PRD #1810).
+	AlreadyCurrent bool
 }
 
 var (
@@ -106,6 +118,27 @@ var (
 	// cleanly (checkpoints are best-effort — PRD #456 M4) and never fails the run. The
 	// finalize base-align (PRD #456 M1) is the real safety net for such a run's work.
 	ErrWorkflowScopeRejected = errors.New("pushbroker: checkpoint push rejected for missing workflow scope")
+	// ErrInvalidRef means a ref name or tip handed to CreateRef, Delete or ListRefTips is
+	// outside the namespaces this package may touch (refs/uzi-checkpoints/*,
+	// refs/uzi-recovery/*, refs/uzi-salvage/*; CreateRef narrows that per target, see
+	// validateCreateRef), is not a well-formed git ref name, or (CreateRef) the tip is not
+	// a 40-hex non-zero object id. It is a caller bug, refused before any network I/O.
+	ErrInvalidRef = errors.New("pushbroker: invalid ref")
+	// ErrRefExists means CreateRef found the target ref present on origin at a tip
+	// other than the one requested: in the list before the create, or in the read-back
+	// list after a refused or failed create. It is decided ONLY from an advertisement
+	// that shows the ref at another tip, never from a receive-pack error's wording, so a
+	// refusal for any other reason (a missing object, a pack error) is a wrapped error
+	// and never this sentinel. The ref is left untouched.
+	ErrRefExists = errors.New("pushbroker: ref already exists")
+	// ErrRefExistsAtTip means CreateRef found the target ref already present on origin
+	// at exactly the requested tip: a retry after an earlier create landed. Callers
+	// treat it as success.
+	ErrRefExistsAtTip = errors.New("pushbroker: ref already exists at the requested tip")
+	// ErrSourceMissing means CreateRef's source ref is not advertised by origin at
+	// exactly the requested tip (or origin is empty), so the tip object's presence on
+	// origin is not proven and nothing was sent.
+	ErrSourceMissing = errors.New("pushbroker: source ref not at the requested tip")
 )
 
 // Pack inflation budget (PRD #122 M8 hardening). The handler caps the COMPRESSED
@@ -150,6 +183,10 @@ const (
 // which swallows the outcome regardless. Deliberately shorter than maxPublishDuration.
 const maxDeleteDuration = 30 * time.Second
 
+// maxCreateRefDuration is the wall-clock ceiling on ONE CreateRef: a list plus a
+// receive-pack session carrying a single command and a 32-byte empty pack.
+const maxCreateRefDuration = 30 * time.Second
+
 // maxPublishDuration is a hard wall-clock ceiling on ONE brokered publish — the
 // untrusted-pack budget scan (single-core zlib inflation), the origin fetch, and the
 // non-forced push combined. /publish carries no request timeout of its own, and a
@@ -159,33 +196,46 @@ const maxDeleteDuration = 30 * time.Second
 // request can never run unbounded.
 const maxPublishDuration = 60 * time.Second
 
+// MaxPublishDuration exports maxPublishDuration for the retention timing relations in workersvc
+// (PRD #1810 D2: the supersession cooling period is sized above a live publish's pre-push budget
+// plus this client-side ceiling).
+const MaxPublishDuration = maxPublishDuration
+
+// MaxDeleteDuration and MaxCreateRefDuration export the per-call ceilings of Delete, ListRefTips
+// (which shares maxDeleteDuration) and CreateRef for the retention timing relations in workersvc
+// (PRD #1810: one hung forge call ends at its own ceiling, inside the sweeper's per-record
+// timeout, so the record's failure is recorded before the operation's deadline).
+const (
+	MaxDeleteDuration    = maxDeleteDuration
+	MaxCreateRefDuration = maxCreateRefDuration
+)
+
 // checkpointRefPrefix is the uzi-owned ref namespace no CI watches (Rule 3). The
 // end-of-run push targets refs/heads/<branch>; checkpoints never do.
 const checkpointRefPrefix = "refs/uzi-checkpoints/"
 
-// salvageRefPrefix is the run-scoped namespace a FAILED run's last published checkpoint
-// is copied into (PRD #1867). Keyed by run id, not branch, so a salvage ref never blocks
-// a later run on the same branch the way a stale branch-scoped checkpoint ref does (a
-// not_descendant skip); like refs/uzi-checkpoints/ no CI watches it. Salvage creates and
-// deletes refs in this namespace only.
-const salvageRefPrefix = "refs/uzi-salvage/"
+// RecoveryRefPrefix is the uzi-owned namespace a superseded run's checkpoint tip is
+// preserved under (PRD #1810 D2): refs/uzi-recovery/<run-id>. Like the checkpoint
+// namespace it is outside refs/heads, so no CI watches it.
+const RecoveryRefPrefix = "refs/uzi-recovery/"
+
+// SalvageRefPrefix is the run-scoped namespace a FAILED run's last published checkpoint
+// tip is copied into for bounded archival (PRD #1867): refs/uzi-salvage/<run-id>. Keyed
+// by run id, so it never blocks a later run on the same branch, and outside refs/heads,
+// so no CI watches it. Its refs are only ever created (CreateRef) and CAS-deleted.
+const SalvageRefPrefix = "refs/uzi-salvage/"
 
 // SalvageRef names the salvage ref for runID: refs/uzi-salvage/<run-id>.
 func SalvageRef(runID uuid.UUID) string {
-	return salvageRefPrefix + runID.String()
+	return SalvageRefPrefix + runID.String()
 }
 
-// salvageRecoverySourcePrefix is the run-scoped namespace PR #1819 (PRD #1810) moves a
-// retained run's checkpoint tip into when a new run needs the branch slot:
-// refs/uzi-recovery/<run-id>. #1810 owns every ref there (creation, custody and
-// deletion); salvage only READS it, as a second verified source for the tip it copies.
-const salvageRecoverySourcePrefix = "refs/uzi-recovery/"
-
-// maxSalvageCreateDuration is a hard wall-clock ceiling on ONE CreateSalvageRef (PRD
-// #1867): a list, at most one packless create and at most one re-list. A caller with a
-// shorter deadline (the sweep's per-pass budget) wins, since context.WithTimeout never
-// extends a parent deadline.
-const maxSalvageCreateDuration = 45 * time.Second
+// validManagedRef reports whether ref is a well-formed ref strictly under one of the
+// namespaces Delete and ListRefTips accept: checkpoint, recovery or salvage.
+func validManagedRef(ref string) bool {
+	return validRefUnder(ref, checkpointRefPrefix) || validRefUnder(ref, RecoveryRefPrefix) ||
+		validRefUnder(ref, SalvageRefPrefix)
+}
 
 // Publish fetches origin's base objects, applies the worker's delta pack, verifies
 // the declared tip strictly descends origin's current tip, and pushes it —
@@ -281,6 +331,7 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	// checkpoint ref, so its presence is proven and there is nothing to advance. tipHash
 	// is non-zero (guarded above), so this fires only for a real, matching checkpoint ref.
 	if checkpointTip == tipHash {
+		result.AlreadyCurrent = true
 		return result, nil
 	}
 
@@ -387,24 +438,37 @@ type DeleteOptions struct {
 	Branch   string
 	Username string
 	PAT      string
+	// Ref, when set, is the FULL name of the ref to delete and replaces
+	// refs/uzi-checkpoints/<Branch>. It must lie under refs/uzi-checkpoints/,
+	// refs/uzi-recovery/ or refs/uzi-salvage/ (PRD #1867) and be a well-formed ref name,
+	// else Delete returns ErrInvalidRef before any network I/O. Empty keeps the
+	// branch-derived name. A recovery or salvage ref is only ever CAS-deleted: Ref under
+	// either prefix with an empty ExpectedOldTip is ErrInvalidRef.
+	Ref string
 	// ExpectedOldTip is the tip this run last published to its checkpoint ref (the
 	// persisted runs.checkpoint_tip). When set, Delete takes a compare-and-swap path:
 	// it removes the ref ONLY if origin still points at exactly this tip, and treats a
 	// CAS refusal (the ref advanced since our last publish, or is already absent) as
 	// benign success — so a terminal cleanup can never clobber a SIBLING run's fresh
 	// checkpoint on the same branch. When empty, Delete preserves its legacy
-	// UNCONDITIONAL list-then-delete behaviour (backward-compatible; see Delete).
+	// UNCONDITIONAL list-then-delete behaviour (backward-compatible; see Delete). When
+	// set it must be a lowercase 40-hex non-zero object id, else ErrInvalidRef.
 	ExpectedOldTip string
 }
 
-// Delete removes refs/uzi-checkpoints/<branch> from the remote, BEST-EFFORT (PRD
-// #1030 M4). A run's checkpoint ref is uzi-owned scratch state; once the run reaches
+// Delete removes refs/uzi-checkpoints/<branch> (or o.Ref, a checkpoint, recovery or
+// salvage ref named in full) from the remote, BEST-EFFORT (PRD #1030 M4). A run's checkpoint ref is uzi-owned scratch state; once the run reaches
 // a terminal state it is stale, and a stale ref left behind later blocks a NEW run on
 // the same branch with a not_descendant skip (the new run's tip does not descend the
-// dead run's checkpoint). The caller invokes this on every terminal transition and
-// SWALLOWS the returned error — it must never block or fail the worker's terminal
-// report — so this carries its OWN short wall-clock timeout rather than inheriting an
-// unbounded ctx.
+// dead run's checkpoint). PRD #1810 routes terminal cleanup through checkpoint
+// retention (workersvc), not a delete on every terminal transition: the branch ref is
+// deleted once the run's last open custody hold settles, or immediately at the
+// terminal transition when the run has no hold; a supersession (another run needing
+// the slot) and the sweep reconciler also call this, each a CAS on the run's recorded
+// tip. The salvage sweep (PRD #1867) CAS-deletes only its own refs/uzi-salvage/<run-id>
+// at expiry. Every caller SWALLOWS or records the returned error — it must never block or
+// fail the worker's terminal report — so this carries its OWN short wall-clock
+// timeout rather than inheriting an unbounded ctx.
 //
 // The delete goes out as a go-git delete refspec (":<ref>" — empty source, the ref as
 // destination), the pure-Go equivalent of `git push origin :refs/uzi-checkpoints/…`.
@@ -439,6 +503,21 @@ func Delete(ctx context.Context, o DeleteOptions) error {
 	defer cancel()
 
 	ref := checkpointRefPrefix + o.Branch
+	if o.Ref != "" {
+		if !validManagedRef(o.Ref) {
+			return ErrInvalidRef
+		}
+		// A recovery ref preserves a superseded run's only off-worker copy, and a salvage
+		// ref a failed run's archived tip: each is only ever removed compare-and-swap on
+		// its recorded tip, never unconditionally.
+		if o.ExpectedOldTip == "" && (strings.HasPrefix(o.Ref, RecoveryRefPrefix) || strings.HasPrefix(o.Ref, SalvageRefPrefix)) {
+			return ErrInvalidRef
+		}
+		ref = o.Ref
+	}
+	if o.ExpectedOldTip != "" && (!isObjectID(o.ExpectedOldTip) || plumbing.NewHash(o.ExpectedOldTip).IsZero()) {
+		return ErrInvalidRef
+	}
 	refName := plumbing.ReferenceName(ref)
 
 	remote, err := newOriginRemote(o.CloneURL)
@@ -483,7 +562,7 @@ func Delete(ctx context.Context, o DeleteOptions) error {
 	if err == nil || errors.Is(err, git.NoErrAlreadyUpToDate) {
 		return nil
 	}
-	return fmt.Errorf("pushbroker: delete checkpoint ref: %w", err)
+	return fmt.Errorf("pushbroker: delete ref: %w", err)
 }
 
 // casDelete removes refName from origin ONLY if origin still points it at expectedOld
@@ -501,9 +580,9 @@ func Delete(ctx context.Context, o DeleteOptions) error {
 //     delete ships no objects). A real forge's receive-pack compare-and-swap on Old then
 //     refuses the delete if the ref moved in the list→delete window; that refusal is
 //     classified benign (isCASDeleteRefusal, reusing isNonFastForward) → nil, never a
-//     retry. (go-git's file:// client execs the real git-receive-pack, which enforces this
-//     wire CAS too; the local guard above stays the primary one — see Publish's note that
-//     the pure wire race is not reproducible in the harness.)
+//     retry. (The go-git internal server behind file:// does not enforce this wire CAS,
+//     which is why the local guard above is the primary one — see Publish's note that the
+//     pure wire race is not reproducible in the harness.)
 //
 // Only a genuine transport/session/auth fault returns a wrapped error, which the caller
 // swallows best-effort (scrubbed of the credential URL).
@@ -571,278 +650,294 @@ func casDelete(ctx context.Context, remote *git.Remote, auth transport.AuthMetho
 	case isCASDeleteRefusal(err):
 		return nil // ref moved out from under our Old in the list→delete window — benign
 	default:
-		return fmt.Errorf("pushbroker: cas delete %s: %w", refName, err)
+		return fmt.Errorf("pushbroker: cas delete ref: %w", err)
 	}
 }
 
-// DeleteRefOptions carries a CAS-only delete of a run's own salvage ref (PRD #1867: the
-// sweep expiring refs/uzi-salvage/<run-id>). Every field is derived by the caller from
-// its own rows, never from a worker. Unlike DeleteOptions there is no unconditional
-// form: ExpectedOldTip is REQUIRED, so an expiry can only ever remove the exact tip the
-// caller recorded.
-type DeleteRefOptions struct {
-	CloneURL       string
-	Ref            string
-	Username       string
-	PAT            string
-	ExpectedOldTip string
+// CreateRefOptions carries a recovery-ref create (PRD #1810 D2) or a salvage-ref create
+// (PRD #1867). Like DeleteOptions every field is server-derived by the caller: the forge
+// connection, the ref to create (Ref), the tip it must point at, and the ref (SourceRef)
+// origin must currently advertise at exactly that tip. A recovery Ref (under
+// RecoveryRefPrefix) takes a SourceRef under refs/uzi-checkpoints/ only; a salvage Ref
+// (under SalvageRefPrefix) takes a SourceRef under refs/uzi-checkpoints/ or
+// refs/uzi-recovery/ (validateCreateRef).
+type CreateRefOptions struct {
+	CloneURL  string
+	Username  string
+	PAT       string
+	Ref       string
+	Tip       string
+	SourceRef string
 }
 
-// casDeleteFunc is the CAS delete deleteRef runs: casDelete in production. It is a
-// parameter so a test can model a refusal casDelete classified benign (nil) while the
-// ref stayed put, which real git-receive-pack does not produce on demand.
-type casDeleteFunc func(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, refName plumbing.ReferenceName, expectedOld plumbing.Hash) error
-
-// DeleteRef CAS-deletes o.Ref, a salvage ref, from origin: it removes the ref ONLY while
-// origin still points it at o.ExpectedOldTip, and treats an absent or moved ref as benign
-// success (the same casDelete Delete's ExpectedOldTip path runs). Because casDelete also
-// reads some lock-failure refusals ("cannot lock ref", "failed to update ref") as benign,
-// and a forge can emit that text for transient lock contention, its nil is not taken on
-// trust: DeleteRef re-lists origin and returns an error when the ref is still at the
-// expected tip, so the caller retries instead of recording the ref as gone.
+// CreateRef creates o.Ref on origin pointing at o.Tip, an object origin already holds
+// (it is the tip of o.SourceRef), so no objects are shipped. It never moves an
+// existing ref:
 //
-// It refuses, with an error and before any network I/O, a Ref outside refs/uzi-salvage/
-// (salvage never deletes a branch checkpoint ref or a refs/uzi-recovery/ ref: PR #1819's
-// retention owns those), a Ref with nothing after the prefix, a trailing "/" or a "..",
-// and an ExpectedOldTip that is not a full non-zero 40-hex sha. It carries Delete's own
-// maxDeleteDuration ceiling. A transport/session/auth fault returns a wrapped error; the
-// caller scrubs it (secretscrub) before it reaches a log or a row.
-func DeleteRef(ctx context.Context, o DeleteRefOptions) error {
-	return deleteRef(ctx, o, casDelete)
+//   - It LISTS origin's refs first. o.Ref already at o.Tip returns ErrRefExistsAtTip
+//     (a retry after an earlier create; callers treat it as success); at any other tip
+//     it returns ErrRefExists. o.SourceRef not advertised at exactly o.Tip (or an empty
+//     origin) returns ErrSourceMissing: without it the tip's presence on origin is
+//     unproven.
+//   - It then sends ONE receive-pack command, Old = zero hash, New = o.Tip, with a
+//     zero-object pack. Old = zero is a compare-and-swap: the remote refuses the
+//     create if the ref appeared after the list. The remote's own connectivity check
+//     is the second guard on the tip's presence.
+//   - Whatever the receive-pack outcome, it LISTS origin again and decides from what
+//     origin now advertises (createOutcome): o.Ref at o.Tip is success (nil after an
+//     accepted create, ErrRefExistsAtTip after a refused or failed one, e.g. a racer
+//     created the same tip or the response was lost); at another tip ErrRefExists;
+//     absent a wrapped error. An accepted create is therefore nil only when the
+//     read-back proves it, and a receive-pack refusal is never mapped to
+//     ErrRefExists from its message text alone.
+//
+// The pack is required, not decorative: git receive-pack reads a pack for every
+// non-delete command, and a create with none is refused ("eof before pack header",
+// as Publish records). Invalid inputs return ErrInvalidRef before any network I/O.
+// Any other failure is a wrapped error the caller must scrub like Delete's.
+func CreateRef(ctx context.Context, o CreateRefOptions) error {
+	return createRefWithPack(ctx, o, emptyPack())
 }
 
-func deleteRef(ctx context.Context, o DeleteRefOptions, del casDeleteFunc) error {
-	if err := validateRefUnder(salvageRefPrefix, o.Ref); err != nil {
-		return fmt.Errorf("pushbroker: delete ref: %w", err)
-	}
-	tip, ok := parseFullSHA(o.ExpectedOldTip)
-	if !ok {
-		return errors.New("pushbroker: delete ref: expected old tip must be a full non-zero sha")
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, maxDeleteDuration)
+// createRefWithPack is CreateRef with the pack as a parameter, so a test can prove
+// against a real git receive-pack that the empty pack is what makes the create land.
+func createRefWithPack(ctx context.Context, o CreateRefOptions, pack []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, maxCreateRefDuration)
 	defer cancel()
 
-	remote, err := newOriginRemote(o.CloneURL)
-	if err != nil {
+	if err := validateCreateRef(o); err != nil {
 		return err
 	}
-	auth := authFor(Options{Username: o.Username, PAT: o.PAT})
 	refName := plumbing.ReferenceName(o.Ref)
-	if err := del(ctx, remote, auth, refName, tip); err != nil {
-		return err
-	}
-	// casDelete's nil also covers refusals it classifies benign, so confirm the outcome.
-	tips, err := listRefTips(ctx, remote, auth, refName)
-	if err != nil {
-		return fmt.Errorf("pushbroker: delete ref: confirm %s: %w", refName, err)
-	}
-	if tips[refName] == tip {
-		return fmt.Errorf("pushbroker: delete ref: %s still at tip after delete", refName)
-	}
-	return nil
-}
-
-// validateRefUnder admits only a ref inside prefix with a non-empty remainder, no
-// trailing "/" and no "..", so a caller-built name can never escape its namespace.
-func validateRefUnder(prefix, ref string) error {
-	rest, ok := strings.CutPrefix(ref, prefix)
-	if !ok {
-		return fmt.Errorf("%q is outside %s", ref, prefix)
-	}
-	if rest == "" || strings.HasSuffix(ref, "/") || strings.Contains(ref, "..") {
-		return fmt.Errorf("%q is not a valid ref under %s", ref, prefix)
-	}
-	return nil
-}
-
-// parseFullSHA accepts exactly a 40-hex, non-zero object id.
-func parseFullSHA(s string) (plumbing.Hash, bool) {
-	if len(s) != 40 {
-		return plumbing.ZeroHash, false
-	}
-	if _, err := hex.DecodeString(s); err != nil {
-		return plumbing.ZeroHash, false
-	}
-	h := plumbing.NewHash(s)
-	if h.IsZero() {
-		return plumbing.ZeroHash, false
-	}
-	return h, true
-}
-
-// CreateSalvageRefOptions carries one salvage-ref create (PRD #1867). Every field is
-// derived by the caller (the sweep) from the run row: Tip is the persisted
-// runs.checkpoint_tip, Branch the run's checkpoint branch, RunID the failed run.
-type CreateSalvageRefOptions struct {
-	CloneURL string
-	Branch   string
-	Username string
-	PAT      string
-	Tip      string
-	RunID    uuid.UUID
-}
-
-// SalvageResult is the outcome of CreateSalvageRef. The zero value is SalvageFailed, so
-// a forgotten assignment can never read as a success.
-type SalvageResult int
-
-const (
-	// SalvageFailed: no salvage ref was confirmed at the tip (invalid input, a transport
-	// fault, or a refused create). Nothing else was touched; the caller retries later.
-	SalvageFailed SalvageResult = iota
-	// SalvageCreated: refs/uzi-salvage/<run-id> is at the tip, created here or already
-	// present at exactly that tip (idempotent).
-	SalvageCreated
-	// SalvageUnavailable: neither verified source (the branch checkpoint ref nor
-	// refs/uzi-recovery/<run-id>) is at the tip. Nothing was written.
-	SalvageUnavailable
-	// SalvageRefused: the salvage ref already exists at a DIFFERENT tip. Never
-	// overwritten; nothing was written.
-	SalvageRefused
-)
-
-// String returns the snake_case name the caller persists or logs.
-func (r SalvageResult) String() string {
-	switch r {
-	case SalvageFailed:
-		return "failed"
-	case SalvageCreated:
-		return "created"
-	case SalvageUnavailable:
-		return "unavailable"
-	case SalvageRefused:
-		return "refused"
-	default:
-		return fmt.Sprintf("SalvageResult(%d)", int(r))
-	}
-}
-
-// emptyPack is a zero-object packfile: "PACK", version 2 and object count 0 (each a
-// big-endian uint32), then the SHA-1 of those 12 bytes as the trailer
-// (029d0882…3ed31e; pinned by TestEmptyPackTrailer). Real git receive-pack reads a pack
-// for any non-delete command and refuses one with no pack at all ("unpack eof before
-// pack header"); go-git sends none when Packfile is nil, so the salvage create ships
-// this explicitly. Never mutated: forwardPack reads it through a fresh bytes.Reader.
-var emptyPack = []byte{
-	'P', 'A', 'C', 'K', 0, 0, 0, 2, 0, 0, 0, 0,
-	0x02, 0x9d, 0x08, 0x82, 0x3b, 0xd8, 0xa8, 0xea, 0xb5, 0x10,
-	0xad, 0x6a, 0xc7, 0x5c, 0x82, 0x3c, 0xfd, 0x3e, 0xd3, 0x1e,
-}
-
-// CreateSalvageRef copies a FAILED run's last published checkpoint tip into the
-// run-scoped refs/uzi-salvage/<run-id> (PRD #1867), identity-bound to o.Tip, idempotent
-// and CREATE-ONLY: it never deletes or moves any other ref. The branch checkpoint ref
-// refs/uzi-checkpoints/<branch> and refs/uzi-recovery/<run-id> belong to PR #1819's
-// retention (PRD #1810); salvage only reads them. In order:
-//
-//  1. It lists origin's refs once (an empty remote reads as "nothing present").
-//  2. A salvage ref already AT the tip is SalvageCreated (idempotent), with no write. One
-//     at any other tip is SalvageRefused, with no write: a salvage ref is never
-//     overwritten.
-//  3. When neither refs/uzi-checkpoints/<branch> nor refs/uzi-recovery/<run-id> is at the
-//     tip, it is SalvageUnavailable, with no write: origin no longer vouches that it
-//     holds the recorded tip under a uzi ref, so salvage creates nothing.
-//  4. Otherwise it creates the salvage ref (createRefPackless: Old=zero, New=tip, the
-//     empty pack, never forced). If the create fails it re-lists origin once, closing the
-//     list→create race with a concurrent creator: a salvage ref now AT the tip is
-//     SalvageCreated; one at another tip is SalvageRefused; otherwise (or when the
-//     re-list itself fails) it is SalvageFailed with the create error.
-//
-// Invalid input (a nil RunID, a Tip that is not a full non-zero sha, an empty Branch, or
-// a Branch whose checkpoint ref name is not a valid ref under refs/uzi-checkpoints/)
-// returns SalvageFailed and an error before any network I/O. It runs through the same
-// remote/auth/transport setup as Publish and Delete, under maxSalvageCreateDuration.
-// Errors carry no credential from this package; the caller still scrubs them
-// (secretscrub) before persisting.
-func CreateSalvageRef(ctx context.Context, o CreateSalvageRefOptions) (SalvageResult, error) {
-	if o.RunID == uuid.Nil {
-		return SalvageFailed, errors.New("pushbroker: create salvage ref: run id is required")
-	}
-	tip, ok := parseFullSHA(o.Tip)
-	if !ok {
-		return SalvageFailed, errors.New("pushbroker: create salvage ref: tip must be a full non-zero sha")
-	}
-	if o.Branch == "" {
-		return SalvageFailed, errors.New("pushbroker: create salvage ref: branch is required")
-	}
-	branchRef := plumbing.ReferenceName(checkpointRefPrefix + o.Branch)
-	if err := validateRefUnder(checkpointRefPrefix, branchRef.String()); err != nil {
-		return SalvageFailed, fmt.Errorf("pushbroker: create salvage ref: branch: %w", err)
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, maxSalvageCreateDuration)
-	defer cancel()
+	sourceName := plumbing.ReferenceName(o.SourceRef)
+	tip := plumbing.NewHash(o.Tip)
 
 	remote, err := newOriginRemote(o.CloneURL)
 	if err != nil {
-		return SalvageFailed, err
+		return err
 	}
 	auth := authFor(Options{Username: o.Username, PAT: o.PAT})
-	salvageRef := plumbing.ReferenceName(SalvageRef(o.RunID))
-	recoveryRef := plumbing.ReferenceName(salvageRecoverySourcePrefix + o.RunID.String())
 
-	tips, err := listRefTips(ctx, remote, auth, salvageRef, branchRef, recoveryRef)
-	if err != nil {
-		return SalvageFailed, fmt.Errorf("pushbroker: create salvage ref: list: %w", err)
-	}
-	switch {
-	case tips[salvageRef] == tip:
-		return SalvageCreated, nil
-	case !tips[salvageRef].IsZero():
-		return SalvageRefused, nil
-	case tips[branchRef] != tip && tips[recoveryRef] != tip:
-		return SalvageUnavailable, nil
-	}
-
-	if cerr := createRefPackless(ctx, remote, auth, salvageRef, tip); cerr != nil {
-		// A concurrent creator may have written the salvage ref between our list and our
-		// create; re-list once so that race is not reported as a failure.
-		now, lerr := listRefTips(ctx, remote, auth, salvageRef)
-		switch {
-		case lerr == nil && now[salvageRef] == tip:
-			return SalvageCreated, nil
-		case lerr == nil && !now[salvageRef].IsZero():
-			return SalvageRefused, nil
-		default:
-			return SalvageFailed, fmt.Errorf("pushbroker: create salvage ref: create %s: %w", salvageRef, cerr)
-		}
-	}
-	return SalvageCreated, nil
-}
-
-// createRefPackless creates ref at tip on origin, which already holds tip's objects: one
-// manual receive-pack command Old=zero, New=tip carrying emptyPack, never forced (the
-// remote's compare-and-swap on the zero Old refuses it if the ref exists).
-//
-// PR #1819 (PRD #1810) adds pushbroker.CreateRef, the same primitive restricted to
-// refs/uzi-recovery/. On landing, fold this helper into CreateRef by widening its allowed
-// prefix to refs/uzi-salvage/.
-func createRefPackless(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, ref plumbing.ReferenceName, tip plumbing.Hash) error {
-	return forwardPack(ctx, remote, auth, ref, plumbing.ZeroHash, tip, emptyPack)
-}
-
-// listRefTips lists origin's advertised refs once and returns the tip of each named ref
-// (the zero hash for an absent one). An empty remote reads as all absent, not an error.
-func listRefTips(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, names ...plumbing.ReferenceName) (map[plumbing.ReferenceName]plumbing.Hash, error) {
-	tips := make(map[plumbing.ReferenceName]plumbing.Hash, len(names))
 	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: auth})
 	if err != nil {
 		if errors.Is(err, transport.ErrEmptyRemoteRepository) {
-			return tips, nil
+			return ErrSourceMissing // an empty origin holds no source ref
 		}
-		return nil, err
+		return fmt.Errorf("pushbroker: list: %w", err)
 	}
+	var target, source plumbing.Hash
+	var targetPresent bool
 	for _, r := range advertised {
-		if slices.Contains(names, r.Name()) {
-			tips[r.Name()] = r.Hash()
+		switch r.Name() {
+		case refName:
+			target, targetPresent = r.Hash(), true
+		case sourceName:
+			source = r.Hash()
 		}
 	}
-	return tips, nil
+	if targetPresent {
+		if target == tip {
+			return ErrRefExistsAtTip
+		}
+		return ErrRefExists
+	}
+	if source != tip {
+		return ErrSourceMissing
+	}
+	return pushCreateVerified(ctx, remote, auth, refName, tip, pack)
 }
 
-// newOriginRemote builds the in-memory "origin" remote every broker operation dials:
-// no objects, one URL, the same transport resolution (httpTransport for http(s)).
+// pushCreateVerified sends the create command, then re-lists origin and classifies the
+// outcome from the read-back (createOutcome).
+func pushCreateVerified(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, ref plumbing.ReferenceName, tip plumbing.Hash, pack []byte) error {
+	pushErr := pushCreate(ctx, remote, auth, ref, tip, pack)
+	current, present, listErr := listRefTip(ctx, remote, auth, ref)
+	return createOutcome(pushErr, current, present, listErr, tip)
+}
+
+// pushCreate sends the create command through a manual receive-pack session and returns
+// the raw outcome, wrapped: nil when the remote reported success. It does not classify;
+// createOutcome does, from the read-back.
+func pushCreate(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, ref plumbing.ReferenceName, tip plumbing.Hash, pack []byte) error {
+	sess, ar, err := openReceivePack(ctx, remote, auth)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = sess.Close() }()
+
+	if _, err := sess.ReceivePack(ctx, createRefRequest(ar.Capabilities, ref, tip, pack)); err != nil {
+		return fmt.Errorf("pushbroker: create ref: %w", err)
+	}
+	return nil
+}
+
+// listRefTip lists origin and returns where it advertises ref (present false when it does
+// not, including an empty origin).
+func listRefTip(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, ref plumbing.ReferenceName) (plumbing.Hash, bool, error) {
+	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: auth})
+	if err != nil {
+		if errors.Is(err, transport.ErrEmptyRemoteRepository) {
+			return plumbing.ZeroHash, false, nil
+		}
+		return plumbing.ZeroHash, false, fmt.Errorf("pushbroker: list: %w", err)
+	}
+	for _, r := range advertised {
+		if r.Name() == ref {
+			return r.Hash(), true, nil
+		}
+	}
+	return plumbing.ZeroHash, false, nil
+}
+
+// createOutcome classifies a create from its receive-pack result (pushErr) and the
+// read-back list that followed it (current/present, or listErr):
+//
+//   - read-back failed: the outcome is unknown, so a wrapped error (never a sentinel);
+//   - ref at tip: nil when the create was accepted, ErrRefExistsAtTip when it was
+//     refused or failed (someone, or a lost response of ours, put exactly our tip
+//     there). Both are success to callers;
+//   - ref at another tip: ErrRefExists;
+//   - ref absent: a wrapped error. An accepted create the read-back cannot see is an
+//     error too, never a silent success.
+func createOutcome(pushErr error, current plumbing.Hash, present bool, listErr error, tip plumbing.Hash) error {
+	switch {
+	case listErr != nil:
+		if pushErr != nil {
+			return fmt.Errorf("%w (read-back failed: %v)", pushErr, listErr)
+		}
+		return fmt.Errorf("pushbroker: create ref read-back: %w", listErr)
+	case present && current == tip:
+		if pushErr != nil {
+			return ErrRefExistsAtTip
+		}
+		return nil
+	case present:
+		return ErrRefExists
+	case pushErr != nil:
+		return pushErr
+	default:
+		return errors.New("pushbroker: create ref reported success but origin does not advertise the ref")
+	}
+}
+
+// ListRefsOptions names the forge connection ListRefTips lists. Server-derived by the
+// caller, like DeleteOptions.
+type ListRefsOptions struct {
+	CloneURL string
+	Username string
+	PAT      string
+}
+
+// ListRefTips lists origin once and returns the tips of those of refs it advertises
+// (an absent ref has no key; an empty origin yields an empty map). Every ref must lie
+// under refs/uzi-checkpoints/, refs/uzi-recovery/ or refs/uzi-salvage/, else
+// ErrInvalidRef before any network I/O. A read, never a write: a caller uses it to tell
+// the reasons CreateRef reported ErrSourceMissing apart, to pick a salvage source, or to
+// confirm a salvage delete (PRD #1867).
+func ListRefTips(ctx context.Context, o ListRefsOptions, refs ...string) (map[string]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, maxDeleteDuration)
+	defer cancel()
+	want := make(map[plumbing.ReferenceName]bool, len(refs))
+	for _, r := range refs {
+		if !validManagedRef(r) {
+			return nil, ErrInvalidRef
+		}
+		want[plumbing.ReferenceName(r)] = true
+	}
+	remote, err := newOriginRemote(o.CloneURL)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(refs))
+	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: authFor(Options{Username: o.Username, PAT: o.PAT})})
+	if err != nil {
+		if errors.Is(err, transport.ErrEmptyRemoteRepository) {
+			return out, nil
+		}
+		return nil, fmt.Errorf("pushbroker: list: %w", err)
+	}
+	for _, r := range advertised {
+		if want[r.Name()] {
+			out[r.Name().String()] = r.Hash().String()
+		}
+	}
+	return out, nil
+}
+
+// createRefRequest builds the single-command create: Old is ALWAYS the zero hash (the
+// wire compare-and-swap that refuses an existing ref), New is the tip, and the pack
+// is attached when non-nil. There is no force form.
+func createRefRequest(caps *capability.List, ref plumbing.ReferenceName, tip plumbing.Hash, pack []byte) *packp.ReferenceUpdateRequest {
+	req := packp.NewReferenceUpdateRequestFromCapabilities(caps)
+	req.Commands = []*packp.Command{{
+		Name: ref,
+		Old:  plumbing.ZeroHash,
+		New:  tip,
+	}}
+	if pack != nil {
+		req.Packfile = io.NopCloser(bytes.NewReader(pack))
+	}
+	return req
+}
+
+// emptyPack returns a valid zero-object packfile: "PACK", version 2, object count 0
+// (both big-endian uint32), then the SHA-1 of those 12 bytes. 32 bytes in all.
+func emptyPack() []byte {
+	hdr := make([]byte, 12, 32)
+	copy(hdr, "PACK")
+	binary.BigEndian.PutUint32(hdr[4:8], 2)
+	binary.BigEndian.PutUint32(hdr[8:12], 0)
+	sum := sha1.Sum(hdr) //nolint:gosec // G401: the packfile trailer is defined as SHA-1 by the git pack format, not used for security.
+	return append(hdr, sum[:]...)
+}
+
+// validateCreateRef checks CreateRef's inputs without touching the network. The target
+// is a recovery ref sourced from a checkpoint ref (PRD #1810), or a salvage ref sourced
+// from a checkpoint or recovery ref (PRD #1867); every other pairing is ErrInvalidRef.
+func validateCreateRef(o CreateRefOptions) error {
+	switch {
+	case validRefUnder(o.Ref, RecoveryRefPrefix):
+		if !validRefUnder(o.SourceRef, checkpointRefPrefix) {
+			return ErrInvalidRef
+		}
+	case validRefUnder(o.Ref, SalvageRefPrefix):
+		if !validRefUnder(o.SourceRef, checkpointRefPrefix) && !validRefUnder(o.SourceRef, RecoveryRefPrefix) {
+			return ErrInvalidRef
+		}
+	default:
+		return ErrInvalidRef
+	}
+	if !isObjectID(o.Tip) || plumbing.NewHash(o.Tip).IsZero() {
+		return ErrInvalidRef
+	}
+	return nil
+}
+
+// validRefUnder reports whether ref is a well-formed git ref name (git
+// check-ref-format rules, via go-git) strictly under prefix.
+func validRefUnder(ref, prefix string) bool {
+	if !strings.HasPrefix(ref, prefix) || len(ref) == len(prefix) {
+		return false
+	}
+	return plumbing.ReferenceName(ref).Validate() == nil
+}
+
+// isObjectID reports whether s is a lowercase 40-hex SHA-1 object id.
+func isObjectID(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// newOriginRemote builds the throwaway in-memory repo and its "origin" remote every
+// list/receive-pack operation here dials.
 func newOriginRemote(cloneURL string) (*git.Remote, error) {
 	repo, err := git.Init(memory.NewStorage(), nil)
 	if err != nil {
@@ -856,6 +951,34 @@ func newOriginRemote(cloneURL string) (*git.Remote, error) {
 		return nil, fmt.Errorf("pushbroker: create remote: %w", err)
 	}
 	return remote, nil
+}
+
+// openReceivePack opens a manual receive-pack session on remote's URL (through
+// transportFor, so http(s) keeps the same-origin redirect guard) and returns it with
+// its reference advertisement. The caller closes the session.
+func openReceivePack(ctx context.Context, remote *git.Remote, auth transport.AuthMethod) (transport.ReceivePackSession, *packp.AdvRefs, error) {
+	urls := remote.Config().URLs
+	if len(urls) == 0 {
+		return nil, nil, fmt.Errorf("pushbroker: remote has no URL")
+	}
+	ep, err := transport.NewEndpoint(urls[0])
+	if err != nil {
+		return nil, nil, fmt.Errorf("pushbroker: endpoint: %w", err)
+	}
+	c, err := transportFor(ep)
+	if err != nil {
+		return nil, nil, fmt.Errorf("pushbroker: transport client: %w", err)
+	}
+	sess, err := c.NewReceivePackSession(ep, auth)
+	if err != nil {
+		return nil, nil, fmt.Errorf("pushbroker: receive-pack session: %w", err)
+	}
+	ar, err := sess.AdvertisedReferencesContext(ctx)
+	if err != nil {
+		_ = sess.Close()
+		return nil, nil, fmt.Errorf("pushbroker: advertise: %w", err)
+	}
+	return sess, ar, nil
 }
 
 // forwardPack ships the worker's (non-thin) packfile to origin through a MANUAL

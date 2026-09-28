@@ -3,37 +3,26 @@ package pushbroker
 import (
 	"context"
 
-	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/transport"
 )
 
-// Test-only access for the external pushbroker_test package (PRD #1867 M1). Compiled
-// into test binaries only.
+// Test-only hooks for the external pushbroker_test package, whose git http-backend
+// harness is the only place a real receive-pack is reachable.
 
-// EmptyPackForTest returns a copy of the zero-object pack the salvage create ships.
-func EmptyPackForTest() []byte { return append([]byte(nil), emptyPack...) }
+// CreateRefWithPack is CreateRef with the pack under the test's control, so a test
+// can prove the empty pack is what makes a real receive-pack accept the create.
+var CreateRefWithPack = createRefWithPack
 
-// ForwardPackForTest runs forwardPack against cloneURL with an explicit pack (nil for
-// none), so a test can compare the salvage create with and without emptyPack against
-// the real git-receive-pack.
-func ForwardPackForTest(ctx context.Context, cloneURL, ref string, oldTip, newTip string, pack []byte) error {
+// EmptyPack is the zero-object pack CreateRef sends.
+var EmptyPack = emptyPack
+
+// PushCreateSkippingList sends CreateRef's wire command (Old = zero) WITHOUT the
+// list-time checks, then classifies it exactly as CreateRef does (the read-back), so a
+// test can reach the remote's own compare-and-swap and connectivity refusals.
+func PushCreateSkippingList(ctx context.Context, cloneURL, ref, tip string, pack []byte) error {
 	remote, err := newOriginRemote(cloneURL)
 	if err != nil {
 		return err
 	}
-	old := plumbing.ZeroHash
-	if oldTip != "" {
-		old = plumbing.NewHash(oldTip)
-	}
-	return forwardPack(ctx, remote, nil, plumbing.ReferenceName(ref), old, plumbing.NewHash(newTip), pack)
-}
-
-// DeleteRefWithBenignDeleteForTest runs DeleteRef with a CAS delete that reports success
-// WITHOUT deleting, the shape of a refusal casDelete classifies benign (e.g. a forge's
-// transient "cannot lock ref") while the ref stays at the tip.
-func DeleteRefWithBenignDeleteForTest(ctx context.Context, o DeleteRefOptions) error {
-	return deleteRef(ctx, o, func(context.Context, *git.Remote, transport.AuthMethod, plumbing.ReferenceName, plumbing.Hash) error {
-		return nil
-	})
+	return pushCreateVerified(ctx, remote, nil, plumbing.ReferenceName(ref), plumbing.NewHash(tip), pack)
 }

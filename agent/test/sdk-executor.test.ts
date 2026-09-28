@@ -7,6 +7,7 @@ import path from "node:path";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, resolveLeadModel, embedSeededPlan, TransientRecoveryError, ProviderTransientError, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
 import { LimitReachedError } from "../src/limit.js";
+import { EnvProbeCleanupError } from "../src/env-probe.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill, Milestone, MilestoneAgent, MilestoneProgress } from "../src/protocol.js";
@@ -5501,4 +5502,120 @@ describe("SdkExecutor signal_done pr_summary (PRD #1798 M2)", () => {
       assert.deepStrictEqual(result.prSummary, { what: "w" });
     });
   }
+});
+
+// Issue #1866 M2: the run-start environment probe on the Claude harness. phaseSetup probes once
+// (after the SDK env is built, before the plan turn), the plan prompt and the first implement
+// prompt carry the facts, one worker status line names them, and an unconfirmed probe cleanup
+// fails the run before any turn.
+describe("SdkExecutor run-start environment probe (issue #1866 M2)", () => {
+  const probeLine = (proc: string, home: string, tmp: string): string =>
+    `${JSON.stringify({ uzi_envprobe: 1, proc, home, tmp })}\n`;
+  const factsStatus = (emits: EmittedMessage[]): string[] =>
+    emits
+      .filter((m) => m.kind === "status")
+      .map((m) => String(m.payload["text"] ?? ""))
+      .filter((t) => t.startsWith("environment facts"));
+
+  it("probes before the plan turn and renders the facts in the plan prompt, the first implement prompt and one status line", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# The Plan"), resultSuccess()],
+      [assistantText("implementing"), signalDone(), resultSuccess()],
+    ]);
+    const seen: { argv: readonly string[]; env: NodeJS.ProcessEnv; turnsBefore: number }[] = [];
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    await new SdkExecutor(nullLogger(), homeDir, {
+      queryFn,
+      envProbeSpawner: async (argv, env) => {
+        seen.push({ argv, env, turnsBefore: turns.length });
+        return { code: 0, stdout: probeLine("limited", "ok", "ok"), cleanedUp: true };
+      },
+    }).run(probe.ctx);
+
+    assert.equal(seen.length, 1, "exactly one probe");
+    assert.equal(seen[0]!.turnsBefore, 0, "the probe ran before the plan turn");
+    assert.equal(seen[0]!.argv[1], "-e");
+    assert.equal(seen[0]!.env.HOME, homeDir, "the probe runs with the SDK env (its HOME)");
+    assert.equal(seen[0]!.env.NODE_OPTIONS, undefined);
+    const plan = turns[0]!.promptText ?? "";
+    const impl = turns[1]!.promptText ?? "";
+    for (const [label, text] of [["plan", plan], ["first implement", impl]] as const) {
+      assert.ok(text.includes("under your uid on the claude harness"), `${label}: the claude facts header`);
+      assert.ok(text.includes("- /proc cannot be enumerated from your commands."), `${label}: the proc fact`);
+      assert.ok(text.includes("- Docker is not wired on this worker"), `${label}: the docker fact`);
+    }
+    assert.deepStrictEqual(factsStatus(probe.emits), [
+      "environment facts (claude): /proc limited; $HOME ok; $TMPDIR ok; docker not wired",
+    ]);
+  });
+
+  it("a cleanedUp:false probe fails the run with EnvProbeCleanupError before the plan turn and before the deps install", async () => {
+    const { queryFn, turns } = fakeTurns([[submitPlan("plan"), resultSuccess()]]);
+    const probe = makeCtx();
+    let installs = 0;
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, {
+        queryFn,
+        installDeps: async () => {
+          installs += 1;
+          return { results: [], truncated: false };
+        },
+        envProbeSpawner: async () => ({ code: 0, stdout: probeLine("ok", "ok", "ok"), cleanedUp: false }),
+      }).run(probe.ctx),
+      EnvProbeCleanupError,
+    );
+    assert.equal(turns.length, 0, "no turn ran");
+    assert.deepStrictEqual(probe.gated, []);
+    assert.equal(installs, 0, "no JS-deps install was started (a phaseSetup throw would leak it)");
+  });
+
+  it("an unconfirmed probe cleanup removes the run's provisioning dir before failing the run", async () => {
+    // A throw from phaseSetup never reaches run()'s finally, so the probe's catch is the only
+    // place the per-run provisioning dir (created by a successful tool provision) is removed.
+    const runId = "66666666-6666-6666-6666-666666666666";
+    const provisionRoot = path.join(homeDir, "provision-root");
+    const provisionRunDir = path.join(provisionRoot, runId);
+    let provisioned: string | undefined;
+    let existedAtProbe = false;
+    const provision: SdkExecutorOptions["provision"] = async (input) => {
+      provisioned = input.runDir;
+      fs.mkdirSync(input.runDir, { recursive: true });
+      fs.writeFileSync(path.join(input.runDir, "devbox.json"), "{}");
+      return { toolEnv: {} };
+    };
+    const { queryFn, turns } = fakeTurns([[submitPlan("plan"), resultSuccess()]]);
+    const probe = makeCtx({ runId, config: { tool_packages: ["jq"] } });
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, {
+        queryFn,
+        provision,
+        provisionRoot,
+        envProbeSpawner: async () => {
+          existedAtProbe = fs.existsSync(path.join(provisionRunDir, "devbox.json"));
+          return { code: 0, stdout: probeLine("ok", "ok", "ok"), cleanedUp: false };
+        },
+      }).run(probe.ctx),
+      EnvProbeCleanupError,
+    );
+    assert.equal(provisioned, provisionRunDir, "the tool provision ran against the per-run dir");
+    assert.equal(existedAtProbe, true, "the dir existed when the probe ran");
+    assert.equal(fs.existsSync(provisionRunDir), false, "the per-run provisioning dir was removed");
+    assert.equal(turns.length, 0, "no turn ran");
+  });
+
+  it("all ok with Docker wired: no facts block and no status line", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# The Plan"), resultSuccess()],
+      [assistantText("implementing"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, {
+      queryFn,
+      dockerWiring: { dockerHost: "tcp://docker:2375" },
+      envProbeSpawner: async () => ({ code: 0, stdout: probeLine("ok", "ok", "ok"), cleanedUp: true }),
+    }).run(probe.ctx);
+    assert.ok(!(turns[0]!.promptText ?? "").includes("Environment facts for this run"));
+    assert.ok(!(turns[1]!.promptText ?? "").includes("Environment facts for this run"));
+    assert.deepStrictEqual(factsStatus(probe.emits), []);
+  });
 });

@@ -83,7 +83,8 @@ import type {
   TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { buildLeadSystemPrompt, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote } from "../prompt.js";
+import { buildEnvironmentFactsBlock, buildLeadSystemPrompt, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote } from "../prompt.js";
+import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
@@ -1416,6 +1417,9 @@ export interface CodexExecutorDeps {
   readonly provisionRunTools?: typeof provisionRunTools;
   readonly idleMs?: number;
   readonly wallMs?: number;
+  /** Issue #1866 M2: the run-start environment probe's bound; defaults to
+   *  CODEX_ENV_PROBE_TIMEOUT_MS. Tests lower it to drive the timeout path fast. */
+  readonly envProbeTimeoutMs?: number;
   /** Issue #1600: the refused-park race allowance; defaults to REDRIVE_RACE_ALLOWANCE_MS. */
   readonly redriveAllowanceMs?: number;
   readonly boundaryDeadlineMs?: number;
@@ -1612,6 +1616,14 @@ function refreshWallAfterRefusal(
   } else {
     wall.remainingMs = Math.max(wall.remainingMs, wall.claimMs);
   }
+}
+
+/** Issue #1864: the bound on a delegated child's `turn/interrupt`. The delegation awaits that
+ *  interrupt before its root `spawn_agent` reservation settles, and the next boundary's quiesce
+ *  waits for that reservation under its own deadline, so the interrupt must finish well inside
+ *  it: a quarter of the boundary budget, at most 5 s, at least 1 ms. */
+function childInterruptDeadlineMs(boundaryDeadlineMs: number): number {
+  return Math.min(5_000, Math.max(1, Math.floor(boundaryDeadlineMs / 4)));
 }
 
 export class CodexExecutor implements Executor {
@@ -2028,6 +2040,19 @@ export class CodexExecutor implements Executor {
       epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochIndex);
       this.safety = epoch.safety;
 
+      // Issue #1866 M2: measure the lead's command environment ONCE, through epoch 0's registered
+      // command seam (the per-command private HOME/TMPDIR commandEffectSpec sets is what is
+      // measured), before any turn: the plan turn, or the first implement turn of a pre-approved
+      // resume. A run-local const, so a later epoch recreation never probes again. An unconfirmed
+      // probe cleanup throws EnvProbeCleanupError out of run() before any turn.
+      const environmentFacts = await runEnvProbe(
+        this.envProbeSpawner(epoch, worktreePath),
+        commandEnv,
+        { harness: "codex", dockerWired: this.opts.dockerWiring?.dockerHost !== undefined, timeoutMs: this.deps.envProbeTimeoutMs ?? CODEX_ENV_PROBE_TIMEOUT_MS },
+      );
+      const factsStatus = environmentFactsSummary(environmentFacts);
+      if (factsStatus) ctx.emit({ kind: "status", agent: "worker", payload: { text: factsStatus } });
+
       const reducer = new RunTurnReducerImpl(NOOP_CONTEXT_HOOK);
       const idleMs = this.deps.idleMs ?? (ctx.config?.idle_timeout_seconds ? ctx.config.idle_timeout_seconds * 1000 : DEFAULT_IDLE_MS);
       const wallMs = this.deps.wallMs ?? (ctx.config?.run_timeout_seconds ? ctx.config.run_timeout_seconds * 1000 : DEFAULT_WALL_MS);
@@ -2129,7 +2154,7 @@ export class CodexExecutor implements Executor {
         // PRD #1497 M2: drive the plan turn through the wall-park wrapper — a wall trip (the own
         // timer's REASON_WALL, or a `wall` PauseNowSignal) parks the run instead of failing it, even
         // during planning (the completion interlock cannot have attempted completion yet).
-        const planTurn = await drivePlan(this.planPrompt(ctx));
+        const planTurn = await drivePlan(this.planPrompt(ctx, environmentFacts));
         if (planTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
         if (planTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: planTurn.reason } };
         let planResult = planTurn.result;
@@ -2332,7 +2357,7 @@ export class CodexExecutor implements Executor {
         const safetySteer = ctx.pullSafetySteer?.();
         // Issue #1674: every implement-phase prompt (the base, the completion-rework follow-up and
         // the clarification continuation below) carries the shared milestone tracker guidance.
-        const basePrompt = this.implementPrompt(ctx, gatedPlan, milestoneNote());
+        const basePrompt = this.implementPrompt(ctx, gatedPlan, milestoneNote(), environmentFacts);
         const implementBody = completionFollowUp !== undefined
           ? withMilestoneNote(completionFollowUp, milestoneNote())
           : basePrompt;
@@ -2395,7 +2420,7 @@ export class CodexExecutor implements Executor {
           // Issue #1764: set BEFORE the await, so a checkpoint that reaps and then throws still
           // keeps the finally from persisting the deleted home.
           reapedSinceLastPersist = true;
-          await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+          await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "milestone_checkpoint" });
           // Issue #1674 (PRD #390 M3 / PRD #1224 parity): a milestone boundary re-arms enforcement
           // and drops only the checkpointed ids, keeping a concurrent sibling's in-progress state.
           progressMissedLastTurn = false;
@@ -2412,7 +2437,7 @@ export class CodexExecutor implements Executor {
           // Issue #1764: set BEFORE the await, so a checkpoint that reaps and then throws still
           // keeps the finally from persisting the deleted home.
           reapedSinceLastPersist = true;
-          await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+          await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "done_checkpoint" });
           const worktreeFingerprint = ctx.worktreeFingerprint ? await ctx.worktreeFingerprint() : null;
           const head = worktreeFingerprint === null ? null : (worktreeFingerprint.split("\n", 1)[0] ?? null);
           const { unmet } = await ctx.recordCompletionAttempt!({
@@ -2655,7 +2680,8 @@ export class CodexExecutor implements Executor {
         const delegationRunner = new CodexDelegationRunner({
           registry,
           roles: runPlan.roles,
-          startChildTurn: (spec: StartChildTurnSpec) => this.startChildTurn(harness!, provider, worktreePath, spec),
+          startChildTurn: (spec: StartChildTurnSpec) =>
+            this.startChildTurn(harness!, provider, worktreePath, spec, childInterruptDeadlineMs(boundaryDeadlineMs)),
           spawnCommand,
           fileop,
           worktreePath,
@@ -2917,9 +2943,17 @@ export class CodexExecutor implements Executor {
     // LEAD_TEXT_TAIL_KEEP characters are held, so a long turn never grows this without bound.
     let rootText = "";
 
+    // Issue #1864: the per-turn broker's effects signal also fires when this turn returns, so a
+    // delegation still open when the lead turn finishes is cancelled: its effects reap and its
+    // reservations settle before the next boundary's quiesce, instead of running to the child
+    // deadline. Callbacks that ignore the signal (MCP handlers, fileop) stay fail-closed at
+    // quiesce. turnAbort itself is not aborted on a clean finish: it is the turn request's
+    // signal, and the harness reads an abort of it as an owner stop (watchdog/cancel), not as a
+    // clean end of the turn. A separate controller cancels only the delegations.
+    const effectsAbort = new AbortController();
     const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal);
     try {
-      harness.useBroker(buildPhaseBroker(phase, turnAbort.signal));
+      harness.useBroker(buildPhaseBroker(phase, AbortSignal.any([turnAbort.signal, effectsAbort.signal])));
       if (tripReason) throw this.tripError(tripReason, tripToken!);
       armIdle();
       let turn = harness.startTurn(request);
@@ -2990,6 +3024,7 @@ export class CodexExecutor implements Executor {
       if (tripReason) throw this.tripError(tripReason, tripToken!);
       throw err instanceof Error ? err : new Error(errMessage(err));
     } finally {
+      effectsAbort.abort();
       unsubscribeCallbacks();
       if (idleTimer) clearTimeout(idleTimer);
       if (wallTimer) clearTimeout(wallTimer);
@@ -3246,6 +3281,7 @@ export class CodexExecutor implements Executor {
     provider: CodexProviderConfig,
     workspace: string,
     spec: StartChildTurnSpec,
+    interruptDeadlineMs: number,
   ): Promise<ChildThreadController> {
     return (async (): Promise<ChildThreadController> => {
       // Start a CHILD thread on the SAME app-server transport as the root (same untrusted
@@ -3304,9 +3340,16 @@ export class CodexExecutor implements Executor {
         notifications: () => sink.iterator(),
         project: (items) => harness.emitChildFrame(childThreadId, items),
         respond: (requestId, reply) => harness.respondOnTransport(requestId, reply),
+        // Issue #1864: the delegation interrupts only AFTER spec.signal aborted, and the transport
+        // rejects a request whose signal is already aborted, so the interrupt carries no signal and
+        // is bounded by the transport's own short deadline instead (childInterruptDeadlineMs).
         interrupt: async (): Promise<void> => {
           await harness
-            .requestOnTransport("turn/interrupt", { threadId: childThreadId, turnId: childTurnId }, { signal: spec.signal })
+            .requestOnTransport(
+              "turn/interrupt",
+              { threadId: childThreadId, turnId: childTurnId },
+              { deadlineMs: interruptDeadlineMs },
+            )
             .catch(() => undefined);
         },
         close: async (): Promise<void> => {
@@ -3374,9 +3417,11 @@ export class CodexExecutor implements Executor {
     return phase === "plan" ? this.planPrompt(ctx) : this.implementPrompt(ctx);
   }
 
-  private planPrompt(ctx: RunContext): string {
+  /** Issue #1866 M2: `facts` appends the run-start environment facts block (empty ⇒ unchanged). */
+  private planPrompt(ctx: RunContext, facts?: EnvFacts): string {
     const head = ctx.issueIid != null ? `Issue #${ctx.issueIid}: ${ctx.issueTitle}` : ctx.issueTitle;
-    const body = `${head}\n\n${ctx.issueDescription}\n\nProduce a plan for this work and submit it for approval.`;
+    const block = buildEnvironmentFactsBlock(facts);
+    const body = `${head}\n\n${ctx.issueDescription}\n\nProduce a plan for this work and submit it for approval.${block ? `\n\n${block}` : ""}`;
     // PRD #1416 M1: these Codex builders bypass the shared buildPlanPrompt/buildImplementPrompt,
     // so prepend the published-floor paragraph here. Empty ⇒ unchanged (a fresh branch).
     // #1416 (MR-rework): thread autoApprove so an autopilot Codex run gets the autopilot-safe
@@ -3390,8 +3435,15 @@ export class CodexExecutor implements Executor {
    *  out so it cannot compete. Absent ⇒ the pre-approved resume (the raw persisted
    *  ctx.approvedPlan, unframed) or the issue fallback. Every body is then followed by the shared
    *  PR_SUMMARY_GUIDANCE paragraph (PRD #1798 M2), preceded by the published-floor note when
-   *  there is one and followed by the milestone tracker note when there is one. */
-  private implementPrompt(ctx: RunContext, gatedPlan?: string, milestoneNote = ""): string {
+   *  there is one and followed by the milestone tracker note when there is one.
+   *
+   *  Issue #1866 M2: `facts` appends the run-start environment facts block (at most eight short
+   *  lines) at the end. The Codex implement prompt is rebuilt every implement iteration, and the
+   *  block rides every iteration that uses this base prompt (not only the first), so a turn on a
+   *  recreated epoch still sees the facts cached at run start. The completion-rework follow-up
+   *  and the clarification continuation replace this prompt for their turn and do not carry the
+   *  block. Empty block ⇒ byte-identical. */
+  private implementPrompt(ctx: RunContext, gatedPlan?: string, milestoneNote = "", facts?: EnvFacts): string {
     const approved = ctx.approvedPlan?.trim();
     const head = ctx.issueIid != null ? `Issue #${ctx.issueIid}: ${ctx.issueTitle}` : ctx.issueTitle;
     const body = gatedPlan !== undefined
@@ -3414,7 +3466,38 @@ export class CodexExecutor implements Executor {
     const withClaims = `${body}\n\n${PR_SUMMARY_GUIDANCE}`;
     // Issue #1674: APPEND the shared milestone tracker guidance (milestoneStatusNote) after the
     // Codex framing. Empty (no approved breakdown) leaves the prompt byte-identical.
-    return withMilestoneNote(note ? `${note}\n\n${withClaims}` : withClaims, milestoneNote);
+    const prompt = withMilestoneNote(note ? `${note}\n\n${withClaims}` : withClaims, milestoneNote);
+    const block = buildEnvironmentFactsBlock(facts);
+    return block ? `${prompt}\n\n${block}` : prompt;
+  }
+
+  /** Issue #1866 M2: the Codex environment-probe spawner, routed through `epoch`'s registered
+   *  command seam (the same command root, sandbox and scrubbed env a model command gets; the
+   *  seam forces the command env, so runEnvProbe's `env` argument is not used here). Cleanup is
+   *  proven by the epoch registry: after the seam settles on ANY path, a poisoned registry (the
+   *  sticky flag reapRoot sets on an incomplete reap, and registerRoot sets before refusing a
+   *  root's admission, whose best-effort dispose outcome the seam discards) or the seam's own
+   *  "did not reap cleanly" error throws ProbeCleanupError, which runEnvProbe turns into
+   *  EnvProbeCleanupError. Any other seam failure (e.g. "command aborted" on the probe timeout)
+   *  with an unpoisoned registry is a clean, unverified probe. */
+  private envProbeSpawner(epoch: ProviderEpoch, worktreePath: string): EnvProbeSpawner {
+    return async (argv, _env, signal) => {
+      let result: SpawnCommandResult | undefined;
+      let failure: unknown;
+      try {
+        result = await epoch.spawnCommand(argv, { cwd: worktreePath, signal });
+      } catch (err) {
+        failure = err;
+      }
+      if (epoch.registry.isPoisoned()) {
+        throw new ProbeCleanupError("the command registry was poisoned during the probe");
+      }
+      if (failure instanceof Error && failure.message === COMMAND_ROOT_UNREAPED) {
+        throw new ProbeCleanupError(failure.message);
+      }
+      if (result === undefined) throw failure;
+      return { code: result.code, stdout: result.stdout, cleanedUp: true };
+    };
   }
 
 }
@@ -3435,6 +3518,14 @@ export const MAX_COMMAND_CAPTURE_BYTES = 1 << 20; // 1 MiB
 export const COMMAND_CAPTURE_KILLED_CODE = 137;
 
 const COMMAND_SANDBOX_BIN = "/usr/local/bin/uzi-codex-command-sandbox";
+
+/** The default command seam's error when a command's supervisor root did not reap cleanly (the
+ *  environment probe's spawner reads it as an unconfirmed cleanup, issue #1866). */
+const COMMAND_ROOT_UNREAPED = "command supervisor root did not reap cleanly";
+
+/** Issue #1866 M2: the Codex probe's bound. Longer than runEnvProbe's 2s default because the
+ *  probe starts a registered, sandboxed command supervisor root, not a bare process. */
+const CODEX_ENV_PROBE_TIMEOUT_MS = 10_000;
 
 async function assertCommandWorktreePosture(worktreePath: string): Promise<void> {
   const stat = await fs.stat(worktreePath);
@@ -3944,7 +4035,7 @@ export function makeDefaultSpawnCommand(
       ]);
       if (onAbort && opts.signal) opts.signal.removeEventListener("abort", onAbort);
       const reaped = await registry.reapRoot(launched.root, reapDeadlineMs);
-      if (!reaped.ok) throw new Error("command supervisor root did not reap cleanly");
+      if (!reaped.ok) throw new Error(COMMAND_ROOT_UNREAPED);
       await outputEnded;
       if (first.kind === "aborted") throw new Error("command aborted");
       return {

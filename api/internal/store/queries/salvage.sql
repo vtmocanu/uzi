@@ -1,8 +1,8 @@
--- PRD #1867 M2: the run_salvage lifecycle (migration 00264). The sweep enqueues failed,
+-- PRD #1867 M2: the run_salvage lifecycle (migration 00268). The sweep enqueues failed,
 -- checkpoint-published runs, creates a run-scoped salvage ref at the recorded tip (never
 -- touching the branch checkpoint ref, which #1810's retention owns), and later expires it.
 -- The live_run_id pointer (ON DELETE RESTRICT) is held while a remote ref may exist and
--- cleared when the row settles; the CHECKs in 00264 enforce that, so every transition below
+-- cleared when the row settles; the CHECKs in 00268 enforce that, so every transition below
 -- that clears it is guarded on the source state.
 
 -- name: ListSalvageCandidates :many

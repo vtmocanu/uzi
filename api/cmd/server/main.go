@@ -557,6 +557,10 @@ func run() error {
 	// completion errors rather than completing non-atomically), so this wiring is what lets an
 	// interlocked run complete at all.
 	wsvc.SetTxBeginner(pool)
+	// Checkpoint-ref retention (PRD #1810): the per-run SESSION advisory lock that serialises
+	// every forge write against a retained checkpoint ref pins its connection from this pool. A
+	// nil pool is fail-safe (every retained ref is kept, nothing is deleted).
+	wsvc.SetRetentionLockPool(pool)
 
 	// Codex production oauth-exchange client (PRD #1171 M1), ships DARK. Wire the API-owned
 	// codexauth.Client into the coordinated refresher so a worker /codex/refresh route can

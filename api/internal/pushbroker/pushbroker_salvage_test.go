@@ -2,6 +2,7 @@ package pushbroker_test
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -10,7 +11,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -18,14 +18,19 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 )
 
-// PRD #1867: CreateSalvageRef (a CREATE-ONLY copy of a failed run's checkpoint tip into
-// the run-scoped refs/uzi-salvage/<run-id>) and the salvage-only CAS DeleteRef, against
-// the same file:// bare fixture the publish tests use. go-git's file:// transport execs
-// the REAL git-receive-pack, so the packless create, the report-status and every hook
-// below are real git behaviour.
+// PRD #1867: a failed run's checkpoint tip copied into the run-scoped
+// refs/uzi-salvage/<run-id> with #1810's primitives, whose allowed namespaces PRD #1867
+// widens: CreateRef (a salvage Ref sourced from the branch checkpoint ref or the run's
+// refs/uzi-recovery/<run-id>), the CAS-only Delete of a salvage Ref, and ListRefTips of a
+// salvage ref. They run against the same file:// bare fixture the publish tests use, whose
+// hooks below are real git behaviour; the smart-HTTP test at the end runs a real
+// git receive-pack. createref_http_test.go and createref_internal_test.go cover the
+// primitives' own mechanics (the empty pack, the wire CAS, the read-back classification),
+// which do not depend on the namespace.
 //
 // The branch checkpoint ref and refs/uzi-recovery/<run-id> belong to PR #1819's
-// retention (PRD #1810): every test asserts salvage leaves both exactly as they were.
+// retention (PRD #1810): every test asserts a salvage write leaves both exactly as they
+// were.
 
 const salvageBranch = "agent/issue-5"
 
@@ -43,29 +48,34 @@ func salvageFixture(t *testing.T) (f *gitFixture, base, tip string) {
 	f.pushMain()
 	f.git("checkout", "-b", salvageBranch, base)
 	tip = f.commit("b.txt", "work\n", "run work")
-	f.git("push", "origin", tip+":"+checkpointRef())
-	f.git("push", "origin", base+":"+recoveryRef())
-	if got := f.originRef(checkpointRef()); got != tip {
+	f.git("push", "origin", tip+":"+salvageCheckpointRef())
+	f.git("push", "origin", base+":"+salvageRecoveryRef())
+	if got := f.originRef(salvageCheckpointRef()); got != tip {
 		t.Fatalf("setup: checkpoint = %q, want %q", got, tip)
 	}
 	return f, base, tip
 }
 
-func checkpointRef() string { return "refs/uzi-checkpoints/" + salvageBranch }
+func salvageCheckpointRef() string { return "refs/uzi-checkpoints/" + salvageBranch }
 
-func recoveryRef() string { return "refs/uzi-recovery/" + salvageRunID.String() }
+func salvageRecoveryRef() string { return pushbroker.RecoveryRefPrefix + salvageRunID.String() }
 
 func salvageRef() string { return pushbroker.SalvageRef(salvageRunID) }
 
-func createOpts(cloneURL, tip string) pushbroker.CreateSalvageRefOptions {
-	return pushbroker.CreateSalvageRefOptions{CloneURL: cloneURL, Branch: salvageBranch, Tip: tip, RunID: salvageRunID}
+// salvageCreateOpts is a salvage create sourced from the branch checkpoint ref.
+func salvageCreateOpts(cloneURL, tip string) pushbroker.CreateRefOptions {
+	return pushbroker.CreateRefOptions{CloneURL: cloneURL, Ref: salvageRef(), Tip: tip, SourceRef: salvageCheckpointRef()}
+}
+
+func salvageDeleteOpts(cloneURL, tip string) pushbroker.DeleteOptions {
+	return pushbroker.DeleteOptions{CloneURL: cloneURL, Ref: salvageRef(), ExpectedOldTip: tip}
 }
 
 // foreignRefs snapshots every ref salvage must never write: the branch checkpoint ref,
 // this run's recovery ref and main.
 func foreignRefs(f *gitFixture) map[string]string {
 	out := map[string]string{}
-	for _, r := range []string{checkpointRef(), recoveryRef(), "refs/heads/main"} {
+	for _, r := range []string{salvageCheckpointRef(), salvageRecoveryRef(), "refs/heads/main"} {
 		out[r] = f.originRef(r)
 	}
 	return out
@@ -100,42 +110,55 @@ func TestSalvageRefName(t *testing.T) {
 	if got, want := salvageRef(), "refs/uzi-salvage/8f0c2a4e-1b3d-4c5e-9f60-7a8b9c0d1e2f"; got != want {
 		t.Fatalf("SalvageRef = %q, want %q", got, want)
 	}
+	if !strings.HasPrefix(salvageRef(), pushbroker.SalvageRefPrefix) {
+		t.Fatalf("SalvageRef %q is not under SalvageRefPrefix", salvageRef())
+	}
 }
 
-// TestCreateSalvageRefFromBranchRef is the happy path: the branch checkpoint ref is at
-// the tip, so the salvage ref is created there with a packless create, and the branch
-// ref, the recovery ref and main are all left exactly as they were.
-func TestCreateSalvageRefFromBranchRef(t *testing.T) {
+// TestSalvageCreateRefFromBranchRef is the happy path: the branch checkpoint ref is at
+// the tip, so CreateRef creates the salvage ref there, and the branch ref, the recovery
+// ref and main are all left exactly as they were.
+func TestSalvageCreateRefFromBranchRef(t *testing.T) {
 	f, _, tip := salvageFixture(t)
 	before := foreignRefs(f)
 
-	res, err := pushbroker.CreateSalvageRef(context.Background(), createOpts(f.cloneURL(), tip))
-	if err != nil || res != pushbroker.SalvageCreated {
-		t.Fatalf("CreateSalvageRef = (%v, %v), want (created, nil)", res, err)
+	if err := pushbroker.CreateRef(context.Background(), salvageCreateOpts(f.cloneURL(), tip)); err != nil {
+		t.Fatalf("CreateRef(salvage) = %v, want nil", err)
 	}
 	if got := f.originRef(salvageRef()); got != tip {
 		t.Fatalf("salvage ref = %q, want tip %q", got, tip)
 	}
-	if got := f.originRef(checkpointRef()); got != tip {
-		t.Fatalf("branch checkpoint ref = %q, want still %q", got, tip)
-	}
 	assertForeignRefsUntouched(t, f, before)
+
+	tips, err := pushbroker.ListRefTips(context.Background(), pushbroker.ListRefsOptions{CloneURL: f.cloneURL()},
+		salvageRef(), salvageCheckpointRef(), salvageRecoveryRef())
+	if err != nil {
+		t.Fatalf("ListRefTips with a salvage ref: %v", err)
+	}
+	if tips[salvageRef()] != tip || tips[salvageCheckpointRef()] != tip || tips[salvageRecoveryRef()] != before[salvageRecoveryRef()] {
+		t.Fatalf("ListRefTips = %v", tips)
+	}
 }
 
-// TestCreateSalvageRefFromRecoveryRef: #1810 moved the run's tip to
-// refs/uzi-recovery/<run-id> and a newer run owns the branch ref. The recovery ref at the
-// tip is a verified source, so the salvage ref is created; neither source ref moves.
-func TestCreateSalvageRefFromRecoveryRef(t *testing.T) {
+// TestSalvageCreateRefFromRecoveryRef: #1810 moved the run's tip to
+// refs/uzi-recovery/<run-id> and a newer run owns (or freed) the branch ref. The
+// recovery ref at the tip is a valid salvage source, so the salvage ref is created;
+// neither source ref moves.
+func TestSalvageCreateRefFromRecoveryRef(t *testing.T) {
+	opts := func(url, tip string) pushbroker.CreateRefOptions {
+		o := salvageCreateOpts(url, tip)
+		o.SourceRef = salvageRecoveryRef()
+		return o
+	}
 	t.Run("branch ref moved", func(t *testing.T) {
 		f, _, tip := salvageFixture(t)
-		f.git("push", "origin", "+"+tip+":"+recoveryRef())
+		f.git("push", "origin", "+"+tip+":"+salvageRecoveryRef())
 		sibling := f.commit("c.txt", "sibling\n", "sibling run")
-		f.git("push", "origin", sibling+":"+checkpointRef())
+		f.git("push", "origin", sibling+":"+salvageCheckpointRef())
 		before := foreignRefs(f)
 
-		res, err := pushbroker.CreateSalvageRef(context.Background(), createOpts(f.cloneURL(), tip))
-		if err != nil || res != pushbroker.SalvageCreated {
-			t.Fatalf("CreateSalvageRef = (%v, %v), want (created, nil)", res, err)
+		if err := pushbroker.CreateRef(context.Background(), opts(f.cloneURL(), tip)); err != nil {
+			t.Fatalf("CreateRef(salvage from recovery) = %v, want nil", err)
 		}
 		if got := f.originRef(salvageRef()); got != tip {
 			t.Fatalf("salvage ref = %q, want tip %q", got, tip)
@@ -144,13 +167,12 @@ func TestCreateSalvageRefFromRecoveryRef(t *testing.T) {
 	})
 	t.Run("branch ref absent", func(t *testing.T) {
 		f, _, tip := salvageFixture(t)
-		f.git("push", "origin", "+"+tip+":"+recoveryRef())
-		f.git("push", "origin", ":"+checkpointRef())
+		f.git("push", "origin", "+"+tip+":"+salvageRecoveryRef())
+		f.git("push", "origin", ":"+salvageCheckpointRef())
 		before := foreignRefs(f)
 
-		res, err := pushbroker.CreateSalvageRef(context.Background(), createOpts(f.cloneURL(), tip))
-		if err != nil || res != pushbroker.SalvageCreated {
-			t.Fatalf("CreateSalvageRef = (%v, %v), want (created, nil)", res, err)
+		if err := pushbroker.CreateRef(context.Background(), opts(f.cloneURL(), tip)); err != nil {
+			t.Fatalf("CreateRef(salvage from recovery) = %v, want nil", err)
 		}
 		if got := f.originRef(salvageRef()); got != tip {
 			t.Fatalf("salvage ref = %q, want tip %q", got, tip)
@@ -159,70 +181,42 @@ func TestCreateSalvageRefFromRecoveryRef(t *testing.T) {
 	})
 }
 
-// TestSalvageCreateNeedsEmptyPack is the negative control for the explicit empty pack:
-// the identical create command with NO pack is refused by real receive-pack ("unpack
-// eof before pack header"), while the same command with the empty pack succeeds. So the
-// empty pack is load-bearing, not decoration.
-func TestSalvageCreateNeedsEmptyPack(t *testing.T) {
-	f, _, tip := salvageFixture(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	err := pushbroker.ForwardPackForTest(ctx, f.cloneURL(), salvageRef(), "", tip, nil)
-	if err == nil {
-		t.Fatal("packless create with NO pack succeeded; want real receive-pack to refuse it")
-	}
-	t.Logf("no-pack create refused as expected: %v", err)
-	if got := f.originRef(salvageRef()); got != "" {
-		t.Fatalf("salvage ref = %q after refused create, want absent", got)
-	}
-
-	if err := pushbroker.ForwardPackForTest(ctx, f.cloneURL(), salvageRef(), "", tip, pushbroker.EmptyPackForTest()); err != nil {
-		t.Fatalf("create with the empty pack: %v", err)
-	}
-	if got := f.originRef(salvageRef()); got != tip {
-		t.Fatalf("salvage ref = %q, want tip %q", got, tip)
-	}
-}
-
-// TestCreateSalvageRefIdempotent: a salvage ref already at the tip is created with NO
-// write (a hook refusing every command proves it), even once both sources are gone.
-func TestCreateSalvageRefIdempotent(t *testing.T) {
+// TestSalvageCreateRefIdempotent: a salvage ref already at the tip is ErrRefExistsAtTip
+// with NO write (a hook refusing every command proves it), even once both sources are
+// gone, since the target is checked before the source.
+func TestSalvageCreateRefIdempotent(t *testing.T) {
 	f, _, tip := salvageFixture(t)
 	f.git("push", "origin", tip+":"+salvageRef())
 	before := foreignRefs(f)
 	installPreReceive(t, f, refuseAllWrites)
 
-	res, err := pushbroker.CreateSalvageRef(context.Background(), createOpts(f.cloneURL(), tip))
-	if err != nil || res != pushbroker.SalvageCreated {
-		t.Fatalf("CreateSalvageRef = (%v, %v), want (created, nil)", res, err)
+	if err := pushbroker.CreateRef(context.Background(), salvageCreateOpts(f.cloneURL(), tip)); !errors.Is(err, pushbroker.ErrRefExistsAtTip) {
+		t.Fatalf("CreateRef = %v, want ErrRefExistsAtTip", err)
 	}
 	assertForeignRefsUntouched(t, f, before)
 
-	// Sources gone (e.g. #1810 settled and deleted them): still idempotent success.
+	// Sources gone (e.g. #1810 settled and deleted them): still the same-tip outcome.
 	_ = os.Remove(filepath.Join(f.bare, "hooks", "pre-receive"))
-	f.git("push", "origin", ":"+checkpointRef())
-	f.git("push", "origin", ":"+recoveryRef())
+	f.git("push", "origin", ":"+salvageCheckpointRef())
+	f.git("push", "origin", ":"+salvageRecoveryRef())
 	installPreReceive(t, f, refuseAllWrites)
-	res, err = pushbroker.CreateSalvageRef(context.Background(), createOpts(f.cloneURL(), tip))
-	if err != nil || res != pushbroker.SalvageCreated {
-		t.Fatalf("re-run without sources = (%v, %v), want (created, nil)", res, err)
+	if err := pushbroker.CreateRef(context.Background(), salvageCreateOpts(f.cloneURL(), tip)); !errors.Is(err, pushbroker.ErrRefExistsAtTip) {
+		t.Fatalf("re-run without sources = %v, want ErrRefExistsAtTip", err)
 	}
 	if got := f.originRef(salvageRef()); got != tip {
 		t.Fatalf("salvage ref = %q, want tip %q", got, tip)
 	}
 }
 
-// TestCreateSalvageRefRefusesOtherTip: an existing salvage ref at a different tip is
-// never overwritten, and nothing else is touched.
-func TestCreateSalvageRefRefusesOtherTip(t *testing.T) {
+// TestSalvageCreateRefRefusesOtherTip: an existing salvage ref at a different tip is
+// never overwritten (ErrRefExists), and nothing else is touched.
+func TestSalvageCreateRefRefusesOtherTip(t *testing.T) {
 	f, base, tip := salvageFixture(t)
 	f.git("push", "origin", base+":"+salvageRef())
 	before := foreignRefs(f)
 
-	res, err := pushbroker.CreateSalvageRef(context.Background(), createOpts(f.cloneURL(), tip))
-	if err != nil || res != pushbroker.SalvageRefused {
-		t.Fatalf("CreateSalvageRef = (%v, %v), want (refused, nil)", res, err)
+	if err := pushbroker.CreateRef(context.Background(), salvageCreateOpts(f.cloneURL(), tip)); !errors.Is(err, pushbroker.ErrRefExists) {
+		t.Fatalf("CreateRef = %v, want ErrRefExists", err)
 	}
 	if got := f.originRef(salvageRef()); got != base {
 		t.Fatalf("salvage ref = %q, want untouched %q", got, base)
@@ -230,17 +224,16 @@ func TestCreateSalvageRefRefusesOtherTip(t *testing.T) {
 	assertForeignRefsUntouched(t, f, before)
 }
 
-// TestCreateSalvageRefUnavailable: when neither the branch ref nor the recovery ref is
-// at the tip, nothing is created and the refs a sibling or #1810 own are left alone.
-func TestCreateSalvageRefUnavailable(t *testing.T) {
+// TestSalvageCreateRefSourceMissing: when the named source is not at the tip, nothing is
+// created (ErrSourceMissing) and the refs a sibling or #1810 own are left alone.
+func TestSalvageCreateRefSourceMissing(t *testing.T) {
 	t.Run("branch ref missing", func(t *testing.T) {
 		f, _, tip := salvageFixture(t)
-		f.git("push", "origin", ":"+checkpointRef())
+		f.git("push", "origin", ":"+salvageCheckpointRef())
 		before := foreignRefs(f)
 
-		res, err := pushbroker.CreateSalvageRef(context.Background(), createOpts(f.cloneURL(), tip))
-		if err != nil || res != pushbroker.SalvageUnavailable {
-			t.Fatalf("CreateSalvageRef = (%v, %v), want (unavailable, nil)", res, err)
+		if err := pushbroker.CreateRef(context.Background(), salvageCreateOpts(f.cloneURL(), tip)); !errors.Is(err, pushbroker.ErrSourceMissing) {
+			t.Fatalf("CreateRef = %v, want ErrSourceMissing", err)
 		}
 		if got := f.originRef(salvageRef()); got != "" {
 			t.Fatalf("salvage ref = %q, want absent", got)
@@ -250,32 +243,27 @@ func TestCreateSalvageRefUnavailable(t *testing.T) {
 	t.Run("branch ref moved", func(t *testing.T) {
 		f, _, tip := salvageFixture(t)
 		sibling := f.commit("c.txt", "sibling\n", "sibling run")
-		f.git("push", "origin", sibling+":"+checkpointRef())
+		f.git("push", "origin", sibling+":"+salvageCheckpointRef())
 		before := foreignRefs(f)
 
-		res, err := pushbroker.CreateSalvageRef(context.Background(), createOpts(f.cloneURL(), tip))
-		if err != nil || res != pushbroker.SalvageUnavailable {
-			t.Fatalf("CreateSalvageRef = (%v, %v), want (unavailable, nil)", res, err)
+		if err := pushbroker.CreateRef(context.Background(), salvageCreateOpts(f.cloneURL(), tip)); !errors.Is(err, pushbroker.ErrSourceMissing) {
+			t.Fatalf("CreateRef = %v, want ErrSourceMissing", err)
 		}
 		if got := f.originRef(salvageRef()); got != "" {
 			t.Fatalf("salvage ref = %q, want absent", got)
 		}
 		assertForeignRefsUntouched(t, f, before)
 	})
-	t.Run("empty remote", func(t *testing.T) {
-		f := newGitFixture(t)
-		tip := strings.Repeat("ab", 20)
-		res, err := pushbroker.CreateSalvageRef(context.Background(), createOpts(f.cloneURL(), tip))
-		if err != nil || res != pushbroker.SalvageUnavailable {
-			t.Fatalf("CreateSalvageRef = (%v, %v), want (unavailable, nil)", res, err)
-		}
-	})
 }
 
-// TestCreateSalvageRefCreateFailure: when the salvage create is refused (a hook
-// declining refs/uzi-salvage/*) or origin is unreachable, the result is failed and no
-// other ref is touched.
-func TestCreateSalvageRefCreateFailure(t *testing.T) {
+// TestSalvageCreateRefCreateFailure: when the salvage create is refused (a hook
+// declining refs/uzi-salvage/*) or origin is unreachable, CreateRef returns a
+// non-sentinel error and no other ref is touched.
+func TestSalvageCreateRefCreateFailure(t *testing.T) {
+	isSentinel := func(err error) bool {
+		return errors.Is(err, pushbroker.ErrRefExists) || errors.Is(err, pushbroker.ErrRefExistsAtTip) ||
+			errors.Is(err, pushbroker.ErrSourceMissing) || errors.Is(err, pushbroker.ErrInvalidRef)
+	}
 	t.Run("create refused", func(t *testing.T) {
 		f, _, tip := salvageFixture(t)
 		before := foreignRefs(f)
@@ -284,9 +272,9 @@ func TestCreateSalvageRefCreateFailure(t *testing.T) {
 			"  case \"$ref\" in refs/uzi-salvage/*) echo 'salvage refused by test hook' >&2; exit 1;; esac\n"+
 			"done\nexit 0\n")
 
-		res, err := pushbroker.CreateSalvageRef(context.Background(), createOpts(f.cloneURL(), tip))
-		if err == nil || res != pushbroker.SalvageFailed {
-			t.Fatalf("CreateSalvageRef = (%v, %v), want (failed, error)", res, err)
+		err := pushbroker.CreateRef(context.Background(), salvageCreateOpts(f.cloneURL(), tip))
+		if err == nil || isSentinel(err) {
+			t.Fatalf("CreateRef = %v, want a non-sentinel error", err)
 		}
 		if got := f.originRef(salvageRef()); got != "" {
 			t.Fatalf("salvage ref = %q, want absent", got)
@@ -296,19 +284,19 @@ func TestCreateSalvageRefCreateFailure(t *testing.T) {
 	t.Run("origin unreachable", func(t *testing.T) {
 		f, _, tip := salvageFixture(t)
 		before := foreignRefs(f)
-		res, err := pushbroker.CreateSalvageRef(context.Background(), createOpts(closedHTTPURL(t), tip))
-		if err == nil || res != pushbroker.SalvageFailed {
-			t.Fatalf("CreateSalvageRef = (%v, %v), want (failed, error)", res, err)
+		err := pushbroker.CreateRef(context.Background(), salvageCreateOpts(closedHTTPURL(t), tip))
+		if err == nil || isSentinel(err) {
+			t.Fatalf("CreateRef = %v, want a non-sentinel error", err)
 		}
 		assertForeignRefsUntouched(t, f, before)
 	})
 }
 
-// TestCreateSalvageRefCreateRaceRelists: a concurrent creator writes the salvage ref
-// between CreateSalvageRef's list and its create (staged by a pre-receive hook that
-// writes the ref, then declines ours). It re-lists once: the ref at OUR tip is created;
-// at ANOTHER tip it is refused. No other ref moves either way.
-func TestCreateSalvageRefCreateRaceRelists(t *testing.T) {
+// TestSalvageCreateRefCreateRace: a concurrent creator writes the salvage ref between
+// CreateRef's list and its create (staged by a pre-receive hook that writes the ref, then
+// declines ours). CreateRef's read-back decides: the ref at OUR tip is ErrRefExistsAtTip;
+// at ANOTHER tip it is ErrRefExists. No other ref moves either way.
+func TestSalvageCreateRefCreateRace(t *testing.T) {
 	// raceHook writes refs/uzi-salvage/* to sha before declining the create. The hook
 	// runs with GIT_QUARANTINE_PATH set, under which git refuses ref updates, so it is
 	// unset for the inner update-ref.
@@ -323,9 +311,8 @@ func TestCreateSalvageRefCreateRaceRelists(t *testing.T) {
 		before := foreignRefs(f)
 		installPreReceive(t, f, raceHook(tip))
 
-		res, err := pushbroker.CreateSalvageRef(context.Background(), createOpts(f.cloneURL(), tip))
-		if err != nil || res != pushbroker.SalvageCreated {
-			t.Fatalf("CreateSalvageRef = (%v, %v), want (created, nil)", res, err)
+		if err := pushbroker.CreateRef(context.Background(), salvageCreateOpts(f.cloneURL(), tip)); !errors.Is(err, pushbroker.ErrRefExistsAtTip) {
+			t.Fatalf("CreateRef = %v, want ErrRefExistsAtTip", err)
 		}
 		if got := f.originRef(salvageRef()); got != tip {
 			t.Fatalf("salvage ref = %q, want tip %q", got, tip)
@@ -337,9 +324,8 @@ func TestCreateSalvageRefCreateRaceRelists(t *testing.T) {
 		before := foreignRefs(f)
 		installPreReceive(t, f, raceHook(base))
 
-		res, err := pushbroker.CreateSalvageRef(context.Background(), createOpts(f.cloneURL(), tip))
-		if err != nil || res != pushbroker.SalvageRefused {
-			t.Fatalf("CreateSalvageRef = (%v, %v), want (refused, nil)", res, err)
+		if err := pushbroker.CreateRef(context.Background(), salvageCreateOpts(f.cloneURL(), tip)); !errors.Is(err, pushbroker.ErrRefExists) {
+			t.Fatalf("CreateRef = %v, want ErrRefExists", err)
 		}
 		if got := f.originRef(salvageRef()); got != base {
 			t.Fatalf("salvage ref = %q, want the racer's %q", got, base)
@@ -348,55 +334,32 @@ func TestCreateSalvageRefCreateRaceRelists(t *testing.T) {
 	})
 }
 
-// TestDeleteRefSalvage: DeleteRef CAS-deletes a salvage ref at the matching tip; a
+// TestDeleteSalvageRef: Delete{Ref: salvage ref} CAS-deletes it at the matching tip; a
 // mismatch or an absent ref is benign nil. The branch and recovery refs never move.
-func TestDeleteRefSalvage(t *testing.T) {
+func TestDeleteSalvageRef(t *testing.T) {
 	f, base, tip := salvageFixture(t)
 	f.git("push", "origin", tip+":"+salvageRef())
 	before := foreignRefs(f)
 	del := func(expected string) error {
-		return pushbroker.DeleteRef(context.Background(), pushbroker.DeleteRefOptions{
-			CloneURL: f.cloneURL(), Ref: salvageRef(), ExpectedOldTip: expected,
-		})
+		return pushbroker.Delete(context.Background(), salvageDeleteOpts(f.cloneURL(), expected))
 	}
 
 	if err := del(base); err != nil {
-		t.Fatalf("mismatched DeleteRef = %v, want nil", err)
+		t.Fatalf("mismatched Delete = %v, want nil", err)
 	}
 	if got := f.originRef(salvageRef()); got != tip {
-		t.Fatalf("mismatched DeleteRef moved the ref: %q, want %q", got, tip)
+		t.Fatalf("mismatched Delete moved the ref: %q, want %q", got, tip)
 	}
 	if err := del(tip); err != nil {
-		t.Fatalf("matching DeleteRef = %v, want nil", err)
+		t.Fatalf("matching Delete = %v, want nil", err)
 	}
 	if got := f.originRef(salvageRef()); got != "" {
 		t.Fatalf("salvage ref = %q, want deleted", got)
 	}
 	if err := del(tip); err != nil {
-		t.Fatalf("DeleteRef of absent ref = %v, want nil", err)
+		t.Fatalf("Delete of absent ref = %v, want nil", err)
 	}
 	assertForeignRefsUntouched(t, f, before)
-}
-
-// TestDeleteRefBenignRefusalIsNotDone: casDelete reads a lock-failure refusal ("cannot
-// lock ref" / "failed to update ref") as benign, and a forge can emit that text for
-// transient lock contention, so its nil does not prove the ref is gone. Real
-// git-receive-pack cannot be made to emit that reason on demand (a hook's stderr travels
-// on the sideband, not in the "ng" reason), so the delete is stubbed to return nil
-// without deleting. DeleteRef's re-list must find the ref still at the tip and error.
-func TestDeleteRefBenignRefusalIsNotDone(t *testing.T) {
-	f, _, tip := salvageFixture(t)
-	f.git("push", "origin", tip+":"+salvageRef())
-
-	err := pushbroker.DeleteRefWithBenignDeleteForTest(context.Background(), pushbroker.DeleteRefOptions{
-		CloneURL: f.cloneURL(), Ref: salvageRef(), ExpectedOldTip: tip,
-	})
-	if err == nil || !strings.Contains(err.Error(), "still at tip after delete") {
-		t.Fatalf("DeleteRef = %v; want the post-delete re-list to report the ref still at the tip", err)
-	}
-	if got := f.originRef(salvageRef()); got != tip {
-		t.Fatalf("salvage ref = %q, want intact %q", got, tip)
-	}
 }
 
 // countingServer counts every request it receives; the validation tests require zero.
@@ -411,67 +374,60 @@ func countingServer(t *testing.T) (url string, hits *atomic.Int64) {
 	return srv.URL + "/origin.git", hits
 }
 
-func TestDeleteRefRejectsInvalidInputWithoutNetwork(t *testing.T) {
+// TestSalvagePrefixPositionsRejectedWithoutNetwork: refs/uzi-salvage/ is accepted only in
+// the positions PRD #1867 widens (a CreateRef target with a checkpoint or recovery
+// source, a CAS Delete, a ListRefTips entry). Every other placement, and every malformed
+// salvage ref, is ErrInvalidRef before any request.
+func TestSalvagePrefixPositionsRejectedWithoutNetwork(t *testing.T) {
 	url, hits := countingServer(t)
-	good := strings.Repeat("ab", 20)
-	cases := []struct{ name, ref, tip string }{
-		{"heads ref", "refs/heads/main", good},
-		{"branch checkpoint ref", checkpointRef(), good},
-		{"recovery ref", recoveryRef(), good},
-		{"tags ref", "refs/tags/v1", good},
-		{"foreign prefix lookalike", "refs/uzi-salvaged/x", good},
-		{"empty ref", "", good},
-		{"bare salvage prefix", "refs/uzi-salvage/", good},
-		{"trailing slash", "refs/uzi-salvage/agent/", good},
-		{"dot-dot escape", "refs/uzi-salvage/../heads/main", good},
-		{"empty tip", salvageRef(), ""},
-		{"short tip", salvageRef(), "abc123"},
-		{"zero tip", salvageRef(), strings.Repeat("0", 40)},
-		{"non-hex tip", salvageRef(), strings.Repeat("zz", 20)},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := pushbroker.DeleteRef(context.Background(), pushbroker.DeleteRefOptions{
-				CloneURL: url, Ref: tc.ref, ExpectedOldTip: tc.tip,
-			})
-			if err == nil {
-				t.Fatal("DeleteRef accepted invalid input")
-			}
-		})
-	}
-	if n := hits.Load(); n != 0 {
-		t.Fatalf("invalid DeleteRef input reached the network %d time(s), want 0", n)
-	}
-}
+	ctx := context.Background()
+	tip := strings.Repeat("ab", 20)
+	checkpoint, recovery, salvage := salvageCheckpointRef(), salvageRecoveryRef(), salvageRef()
 
-func TestCreateSalvageRefRejectsInvalidInputWithoutNetwork(t *testing.T) {
-	url, hits := countingServer(t)
-	good := strings.Repeat("ab", 20)
-	cases := []struct {
-		name string
-		o    pushbroker.CreateSalvageRefOptions
-	}{
-		{"nil run id", pushbroker.CreateSalvageRefOptions{CloneURL: url, Branch: salvageBranch, Tip: good}},
-		{"empty tip", pushbroker.CreateSalvageRefOptions{CloneURL: url, Branch: salvageBranch, RunID: salvageRunID}},
-		{"short tip", pushbroker.CreateSalvageRefOptions{CloneURL: url, Branch: salvageBranch, Tip: "abc123", RunID: salvageRunID}},
-		{"zero tip", pushbroker.CreateSalvageRefOptions{CloneURL: url, Branch: salvageBranch, Tip: strings.Repeat("0", 40), RunID: salvageRunID}},
-		{"non-hex tip", pushbroker.CreateSalvageRefOptions{CloneURL: url, Branch: salvageBranch, Tip: strings.Repeat("zz", 20), RunID: salvageRunID}},
-		{"empty branch", pushbroker.CreateSalvageRefOptions{CloneURL: url, Tip: good, RunID: salvageRunID}},
-		{"dot-dot branch escape", pushbroker.CreateSalvageRefOptions{CloneURL: url, Branch: "../heads/main", Tip: good, RunID: salvageRunID}},
-		{"dot-dot inside branch", pushbroker.CreateSalvageRefOptions{CloneURL: url, Branch: "x/../y", Tip: good, RunID: salvageRunID}},
-		{"trailing slash branch", pushbroker.CreateSalvageRefOptions{CloneURL: url, Branch: "agent/", Tip: good, RunID: salvageRunID}},
-		{"bare slash branch", pushbroker.CreateSalvageRefOptions{CloneURL: url, Branch: "/", Tip: good, RunID: salvageRunID}},
+	creates := []struct{ name, ref, source string }{
+		{"salvage sourced from a salvage ref", salvage, pushbroker.SalvageRef(uuid.New())},
+		{"salvage sourced from a head", salvage, "refs/heads/main"},
+		{"salvage with an empty source", salvage, ""},
+		{"recovery sourced from a salvage ref", recovery, salvage},
+		{"recovery sourced from a recovery ref", recovery, pushbroker.RecoveryRefPrefix + uuid.NewString()},
+		{"checkpoint target", checkpoint, salvage},
+		{"bare salvage prefix", pushbroker.SalvageRefPrefix, checkpoint},
+		{"salvage lookalike prefix", "refs/uzi-salvaged/x", checkpoint},
+		{"salvage with dotdot", pushbroker.SalvageRefPrefix + "a..b", checkpoint},
+		{"salvage with trailing slash", pushbroker.SalvageRefPrefix + "a/", checkpoint},
+		{"salvage with lock suffix", pushbroker.SalvageRefPrefix + "a.lock", checkpoint},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			res, err := pushbroker.CreateSalvageRef(context.Background(), tc.o)
-			if err == nil || res != pushbroker.SalvageFailed {
-				t.Fatalf("CreateSalvageRef = (%v, %v), want (failed, error)", res, err)
-			}
-		})
+	for _, c := range creates {
+		o := pushbroker.CreateRefOptions{CloneURL: url, Ref: c.ref, Tip: tip, SourceRef: c.source}
+		if err := pushbroker.CreateRef(ctx, o); !errors.Is(err, pushbroker.ErrInvalidRef) {
+			t.Errorf("CreateRef %s (Ref=%q SourceRef=%q) = %v, want ErrInvalidRef", c.name, c.ref, c.source, err)
+		}
+	}
+
+	deletes := []struct{ name, ref, tip string }{
+		{"salvage without a tip (CAS only)", salvage, ""},
+		{"bare salvage prefix", pushbroker.SalvageRefPrefix, tip},
+		{"salvage lookalike prefix", "refs/uzi-salvaged/x", tip},
+		{"salvage with dotdot", pushbroker.SalvageRefPrefix + "../heads/main", tip},
+		{"salvage with trailing slash", pushbroker.SalvageRefPrefix + "agent/", tip},
+		{"salvage with a short tip", salvage, "abc123"},
+		{"salvage with a zero tip", salvage, strings.Repeat("0", 40)},
+		{"salvage with a non-hex tip", salvage, strings.Repeat("zz", 20)},
+	}
+	for _, d := range deletes {
+		o := pushbroker.DeleteOptions{CloneURL: url, Ref: d.ref, ExpectedOldTip: d.tip}
+		if err := pushbroker.Delete(ctx, o); !errors.Is(err, pushbroker.ErrInvalidRef) {
+			t.Errorf("Delete %s (Ref=%q tip=%q) = %v, want ErrInvalidRef", d.name, d.ref, d.tip, err)
+		}
+	}
+
+	for _, ref := range []string{pushbroker.SalvageRefPrefix, "refs/uzi-salvaged/x", pushbroker.SalvageRefPrefix + "a..b"} {
+		if _, err := pushbroker.ListRefTips(ctx, pushbroker.ListRefsOptions{CloneURL: url}, salvage, ref); !errors.Is(err, pushbroker.ErrInvalidRef) {
+			t.Errorf("ListRefTips(%q) = %v, want ErrInvalidRef", ref, err)
+		}
 	}
 	if n := hits.Load(); n != 0 {
-		t.Fatalf("invalid CreateSalvageRef input reached the network %d time(s), want 0", n)
+		t.Fatalf("invalid salvage input reached the network %d time(s), want 0", n)
 	}
 }
 
@@ -494,9 +450,10 @@ func salvageTestPAT() string {
 	return "gh" + "p_" + strings.Repeat("Sa1vage", 6)
 }
 
-// TestSalvageErrorsNeverCarryPAT: a transport failure from CreateSalvageRef and DeleteRef never
-// carries the credential, whether it arrives as the BasicAuth password or embedded in
-// the clone URL's userinfo, and the scrubbed form the caller persists never does either.
+// TestSalvageErrorsNeverCarryPAT: a transport failure from the three salvage calls
+// (CreateRef, Delete and ListRefTips of a salvage ref) never carries the credential,
+// whether it arrives as the BasicAuth password or embedded in the clone URL's userinfo,
+// and the scrubbed form the caller persists never does either.
 func TestSalvageErrorsNeverCarryPAT(t *testing.T) {
 	pat := salvageTestPAT()
 	if !strings.Contains(secretscrub.Scrub("x "+pat+" y"), "[redacted]") {
@@ -510,13 +467,18 @@ func TestSalvageErrorsNeverCarryPAT(t *testing.T) {
 	}
 	for name, u := range urls {
 		t.Run(name, func(t *testing.T) {
-			_, perr := pushbroker.CreateSalvageRef(context.Background(), pushbroker.CreateSalvageRefOptions{
-				CloneURL: u, Branch: salvageBranch, Tip: tip, RunID: salvageRunID, Username: "uzi-bot", PAT: pat,
-			})
-			derr := pushbroker.DeleteRef(context.Background(), pushbroker.DeleteRefOptions{
-				CloneURL: u, Ref: salvageRef(), ExpectedOldTip: tip, Username: "uzi-bot", PAT: pat,
-			})
-			for op, err := range map[string]error{"CreateSalvageRef": perr, "DeleteRef": derr} {
+			ctx := context.Background()
+			co := salvageCreateOpts(u, tip)
+			co.Username, co.PAT = "uzi-bot", pat
+			do := salvageDeleteOpts(u, tip)
+			do.Username, do.PAT = "uzi-bot", pat
+			_, lerr := pushbroker.ListRefTips(ctx, pushbroker.ListRefsOptions{CloneURL: u, Username: "uzi-bot", PAT: pat}, salvageRef())
+			errs := map[string]error{
+				"CreateRef":   pushbroker.CreateRef(ctx, co),
+				"Delete":      pushbroker.Delete(ctx, do),
+				"ListRefTips": lerr,
+			}
+			for op, err := range errs {
 				if err == nil {
 					t.Fatalf("%s against a closed port succeeded; want a transport error", op)
 				}
@@ -531,34 +493,37 @@ func TestSalvageErrorsNeverCarryPAT(t *testing.T) {
 	}
 }
 
-// TestCreateSalvageRefOverSmartHTTP runs the packless salvage create and the salvage
-// DeleteRef over REAL smart HTTP (git http-backend), the transport every forge uses. It
-// skips locally when git-http-backend is absent and fails in CI (requireGitHTTPBackend).
-func TestCreateSalvageRefOverSmartHTTP(t *testing.T) {
+// TestSalvageRefOverSmartHTTP runs the salvage create (from the branch checkpoint ref,
+// idempotently re-run) and the salvage CAS Delete over REAL smart HTTP (git
+// http-backend), the transport every forge uses. It skips locally when git-http-backend
+// is absent and fails in CI (requireGitHTTPBackend).
+func TestSalvageRefOverSmartHTTP(t *testing.T) {
 	backend := requireGitHTTPBackend(t)
 	trustLoopbackTLS(t)
 	f, _, tip := salvageFixture(t)
 	before := foreignRefs(f)
-	remote := newGitHTTPRemote(t, f, backend)
-	u := remote.cloneURL(f)
+	u := newGitHTTPRemote(t, f, backend).cloneURL(f)
+	ctx := context.Background()
 
-	res, err := pushbroker.CreateSalvageRef(context.Background(), pushbroker.CreateSalvageRefOptions{
-		CloneURL: u, Branch: salvageBranch, Tip: tip, RunID: salvageRunID, Username: "uzi-bot", PAT: redirectTestPAT(),
-	})
-	if err != nil || res != pushbroker.SalvageCreated {
-		t.Fatalf("CreateSalvageRef over smart HTTP = (%v, %v), want (created, nil)", res, err)
+	co := salvageCreateOpts(u, tip)
+	co.Username, co.PAT = "uzi-bot", redirectTestPAT()
+	if err := pushbroker.CreateRef(ctx, co); err != nil {
+		t.Fatalf("CreateRef(salvage) over smart HTTP = %v, want nil", err)
 	}
 	if got := f.originRef(salvageRef()); got != tip {
 		t.Fatalf("salvage ref = %q, want tip %q", got, tip)
 	}
+	if err := pushbroker.CreateRef(ctx, co); !errors.Is(err, pushbroker.ErrRefExistsAtTip) {
+		t.Fatalf("second CreateRef(salvage) = %v, want ErrRefExistsAtTip", err)
+	}
 
-	if err := pushbroker.DeleteRef(context.Background(), pushbroker.DeleteRefOptions{
-		CloneURL: u, Ref: salvageRef(), ExpectedOldTip: tip, Username: "uzi-bot", PAT: redirectTestPAT(),
-	}); err != nil {
-		t.Fatalf("DeleteRef over smart HTTP: %v", err)
+	do := salvageDeleteOpts(u, tip)
+	do.Username, do.PAT = "uzi-bot", redirectTestPAT()
+	if err := pushbroker.Delete(ctx, do); err != nil {
+		t.Fatalf("Delete(salvage) over smart HTTP: %v", err)
 	}
 	if got := f.originRef(salvageRef()); got != "" {
-		t.Fatalf("salvage ref = %q after DeleteRef, want deleted", got)
+		t.Fatalf("salvage ref = %q after Delete, want deleted", got)
 	}
 	assertForeignRefsUntouched(t, f, before)
 }

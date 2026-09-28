@@ -1002,7 +1002,7 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 // count is reported alongside.
 const salvageRefListCap = 5
 
-// salvageRestrictConstraint is run_salvage's live pointer FK (migration 00264). The
+// salvageRestrictConstraint is run_salvage's live pointer FK (migration 00268). The
 // handlers match it by name so only a salvage restriction maps to the salvage 409.
 const salvageRestrictConstraint = "run_salvage_live_run_id_fkey"
 

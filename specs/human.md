@@ -816,6 +816,12 @@ Tracked as GitHub issue vtmocanu/uzi#1349; PRD at `prds/1349-recovery-custody-ha
 - At the per-owner unresolved-hold limit, new runs are not admitted, but a requeued run that still holds its own open custody is re-admitted to resume it, even past the limit, until that run alone holds the limit's worth. [AI-synced 2026-09-26, #1751]
 - An older generation's hold adopted by a same-worker resume can also be released while the resumed run is still live, on server-proven ancestry against the checkpoint (or task branch) the run published; a cross-worker predecessor stays held. [AI-synced 2026-09-26, #1751]
 
+## Feature #1810 — A finished run's checkpoint ref is retained, not deleted, while custody is open
+
+Tracked as GitHub issue vtmocanu/uzi#1810; PRD at `prds/1810-retain-failed-run-checkpoint-ref.md`.
+
+- A finished run's last published checkpoint ref stays on the forge while any of its custody holds is open — a failed or cancelled run, but also a completed run that still has an older generation's open hold — instead of being deleted at the terminal transition; a new run on the same branch moves it to a per-run recovery ref rather than being blocked by it, and it is deleted only once the run's last hold is released or discarded. [AI-synced 2026-09-27, #1810]
+
 ## Feature #1390 — Api outage does not disturb a run on a still-live worker
 
 Tracked as GitHub issue vtmocanu/uzi#1390; PRD at `prds/1390-outage-requeue-readoption.md`.
@@ -936,7 +942,8 @@ Tracked as GitHub issue vtmocanu/uzi#1783; decision record `adr/1783-run-quiesce
 - On a Docker-wired worker, a run's clone path is never reused by a later execution attempt of the same run; each attempt seeds its own path. (AI-synced 2026-09-27)
 - Foreign residue found at the CANONICAL clone path is quarantined beside it rather than left to wedge the worker; a run that cannot prove its canonical clone path clear fails with the `worker_residue_blocked` fail origin. This holds at the canonical path only: a Docker-wired worker's per-attempt path is never reused by a later attempt, and a pre-existing fresh attempt path (one that should not yet exist) fails the run closed instead of being quarantined. (AI-synced 2026-09-27)
 - A resume or re-claim on a Docker-wired worker starts a fresh model session (Claude session or Codex thread); its earlier committed work still carries forward through the branch, tracking ref and checkpoints, but the conversation itself is not resumed. Unwired workers keep full same-path resume. (AI-synced 2026-09-27)
-- A runner-uid process whose env or cwd cannot be read stays fail-closed (`unverified`) unless ancestry (its own pid/pgid/sid, or its ppid chain) positively ties it, by matching pid and start time, to a recorded root of another live attempt or a worker-launched spawn; the ABSENCE of such a link, or any other ancestry-based guess that the process is unrelated, never clears it, because that would be trivially defeated by a double fork plus `setsid`. The failure names that process's pid and program name so an operator can stop it. A recovery capture whose quiescence proof keeps blocking is retried only a bounded number of times (typically about 30 s at the defaults, about 40 s on the vault-locked park whose backoff doubles; less when a proof returns early — a `survivors` proof with nothing left to kill returns almost at once — and more when the best-effort Docker teardown or the runner-uid helper runs out its own budget), then the run fails `worker_residue_blocked` with the clone kept, rather than retrying forever. (AI-synced 2026-09-28)
+- Under the uid split, an unreadable, unattributed runner-uid process is killed in any scan mode only when no other claim or attempt is in flight, its start time still matches immediately before SIGKILL, and a rescan confirms its exit. Scanner descendants are excluded. A recorded live root is exempt by matching pid and start time. On single-uid workers or with another claim or attempt in flight, the process remains `unverified` and fails closed. No process is cleared as unrelated merely because ancestry is absent. This relies on runner-uid processes being agent-controlled code, recorded worker roots and descendants, readable worker-marked fixed-command spawns, or the scanner. (AI-synced 2026-09-28)
+- A recovery capture whose quiescence proof keeps blocking is retried only a bounded number of times, then the run fails `worker_residue_blocked` with the clone kept. The failure names the unreadable process's pid and program name so an operator can stop it. (AI-synced 2026-09-28)
 
 ## Feature #1795 — Plan-gate verdicts bound to the gate revision they were sent against
 
@@ -976,6 +983,12 @@ Tracked as GitHub issue vtmocanu/uzi#1809; PRD at `prds/1809-worker-disk-safety.
 - A full data volume at clone/fetch or at the claim/resume check, the cache cap (uncounted) and the hard disk stop (counted) park the run in `recovery_wait` with the cause `data_volume_full`; it fails with that cause only after a bounded number of counted waits. A disk-full write later in the run (e.g. a build mid-turn) fails the run with its own error, not this wait. (AI-synced 2026-09-28)
 - Each live or parked run's HOME and cache size is visible before it can fill a volume: `uzi run get` for any run, each worker's largest run in the worker lists, the run page's park panels; admin health warns on a large run (`fleet.rundisk`). (AI-synced 2026-09-28)
 - The in-run cache cap, the hard disk stop, the periodic reclaim and the admission stop each have an off switch; the park-time cache drop and the claim/resume disk check are always on. (AI-synced 2026-09-28)
+
+## Bug #1864 — Codex delegation still open when the lead's turn ends
+
+Tracked as GitHub issue vtmocanu/uzi#1864.
+
+- A Codex delegation still open when the lead's turn ends is cancelled and its work settled before the next checkpoint; a boundary that still cannot settle fails closed, and the failure reason and worker log name the stage, the checkpoint and the unsettled work. (AI-synced 2026-09-28)
 
 ## Startup admin seed
 

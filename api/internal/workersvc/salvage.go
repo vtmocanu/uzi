@@ -31,6 +31,11 @@ import (
 // path and PR #1819's checkpoint retention (PRD #1810): this file never deletes or moves
 // them, never calls deleteCheckpointFn, and never changes a custody hold. The only ref it
 // deletes is its own refs/uzi-salvage/<run-id>, CAS-bound to the recorded tip.
+//
+// Every forge call goes through #1810's pushbroker primitives (ListRefTips, CreateRef,
+// Delete), whose allowed namespaces PRD #1867 widened to refs/uzi-salvage/; salvage has
+// no broker primitive of its own. The calls run through the salvage-named seams on
+// Service (salvageListRefTipsFn, salvageCreateRefFn, salvageDeleteRefFn).
 const (
 	// salvagePassBudgetDefault bounds one whole SweepSalvage pass (DB reads and every broker
 	// call), so a slow forge can never hold the shared sweeper tick. The pass runs serially
@@ -94,7 +99,7 @@ const (
 	salvageStateExpired       = "expired"
 	salvageStateDisabled      = "disabled"
 
-	// salvageLiveRunFK is the RESTRICT pointer's constraint (migration 00264): a 23503 on it
+	// salvageLiveRunFK is the RESTRICT pointer's constraint (migration 00268): a 23503 on it
 	// at insert means the run was deleted between the candidate read and the insert.
 	salvageLiveRunFK = "run_salvage_live_run_id_fkey"
 )
@@ -111,12 +116,13 @@ const (
 //  2. At most salvageMaxItems items, alternating due expiries and due pending rows. The
 //     list that leads alternates per pass (expiry on the first pass, then pending), so a
 //     hanging remote on one list's head row costs the other list at most every other pass:
-//     - expiry: DeleteRef on refs/uzi-salvage/<run-id> at the recorded tip; success
-//     (deleted, absent or moved) settles 'expired', an error is recorded and retried.
+//     - expiry: deleteSalvageRef (a CAS Delete of refs/uzi-salvage/<run-id> at the recorded
+//     tip, confirmed by a re-list); success (deleted, absent or moved) settles 'expired',
+//     an error is recorded and retried.
 //     Expiry runs whatever SalvageForges says: a promoted row on a forge that has since
 //     left the list is simply left to this normal expiry, which keeps its bounded
 //     retention and needs no second delete path.
-//     - pending, forge enabled, below the cap: CreateSalvageRef; created records the
+//     - pending, forge enabled, below the cap: createSalvageRef; created records the
 //     creation and expiry and marks the row promoted, unavailable/refused settle, anything
 //     else (including an SSRF, claim-context or PAT failure) counts a failed attempt.
 //     - pending, forge enabled, the attempt that reaches salvageAttemptCap: NO create. It
@@ -356,16 +362,9 @@ func (s *Service) advancePendingSalvage(ctx context.Context, row store.RunSalvag
 		return s.recordSalvageAttempt(ctx, row, salvageErrText(err, ""), salvageAttemptCap)
 	}
 	*pat = remote.pat
-	res, berr := s.createSalvageFn(ctx, pushbroker.CreateSalvageRefOptions{
-		CloneURL: remote.cloneURL,
-		Branch:   row.Branch,
-		Username: remote.username,
-		PAT:      remote.pat,
-		Tip:      row.Tip,
-		RunID:    row.RunID,
-	})
+	res, berr := s.createSalvageRef(ctx, remote, row)
 	switch res {
-	case pushbroker.SalvageCreated:
+	case salvageCreated:
 		expires := now
 		if r := s.p.RecoveryReadyRetention; r > 0 {
 			expires = now.Add(r)
@@ -380,9 +379,9 @@ func (s *Service) advancePendingSalvage(ctx context.Context, row store.RunSalvag
 		}
 		m, err := s.q.MarkSalvagePromoted(wctx, store.MarkSalvagePromotedParams{PromotedAt: salvageTS(now), RunID: row.RunID})
 		return n + m, err
-	case pushbroker.SalvageUnavailable:
+	case salvageUnavailable:
 		return s.settleSalvage(ctx, row.RunID, salvageStateUnavailable)
-	case pushbroker.SalvageRefused:
+	case salvageRefused:
 		return s.settleSalvage(ctx, row.RunID, salvageStateRefused)
 	default:
 		if berr == nil {
@@ -400,13 +399,7 @@ func (s *Service) expireSalvage(ctx context.Context, row store.RunSalvage, pat *
 		return s.recordSalvageExpireFailure(ctx, row, salvageErrText(err, ""))
 	}
 	*pat = remote.pat
-	if derr := s.deleteSalvageFn(ctx, pushbroker.DeleteRefOptions{
-		CloneURL:       remote.cloneURL,
-		Ref:            pushbroker.SalvageRef(row.RunID),
-		Username:       remote.username,
-		PAT:            remote.pat,
-		ExpectedOldTip: row.Tip,
-	}); derr != nil {
+	if derr := s.deleteSalvageRef(ctx, remote, row); derr != nil {
 		return s.recordSalvageExpireFailure(ctx, row, salvageErrText(derr, remote.pat))
 	}
 	return s.settleSalvage(ctx, row.RunID, salvageStateExpired)
@@ -416,7 +409,7 @@ func (s *Service) expireSalvage(ctx context.Context, row store.RunSalvage, pat *
 // row with no recorded salvage ref, before that row is settled without one ('disabled',
 // or 'failed' at the attempt cap): a create may have landed on the forge unrecorded. It
 // dials through salvageRemote (the SSRF gate before the PAT is decrypted) and touches only
-// the run's own salvage ref; an absent or moved ref is DeleteRef's benign success. It
+// the run's own salvage ref; an absent or moved ref is deleteSalvageRef's success. It
 // stores the decrypted PAT in *pat so the caller's error text redacts it. The returned
 // error is not yet scrubbed.
 func (s *Service) deleteUnrecordedSalvage(ctx context.Context, row store.RunSalvage, pat *string) error {
@@ -425,14 +418,114 @@ func (s *Service) deleteUnrecordedSalvage(ctx context.Context, row store.RunSalv
 		return fmt.Errorf("salvage: unrecorded salvage ref cleanup: %w", err)
 	}
 	*pat = remote.pat
-	if err := s.deleteSalvageFn(ctx, pushbroker.DeleteRefOptions{
+	if err := s.deleteSalvageRef(ctx, remote, row); err != nil {
+		return fmt.Errorf("salvage: unrecorded salvage ref cleanup: %w", err)
+	}
+	return nil
+}
+
+// salvageResult is the outcome of createSalvageRef. The zero value is salvageFailed, so a
+// forgotten assignment can never read as a success.
+type salvageResult int
+
+const (
+	// salvageFailed: no salvage ref was confirmed at the tip (a list, transport or
+	// refused-create fault). Nothing else was touched; the caller counts a failed attempt.
+	salvageFailed salvageResult = iota
+	// salvageCreated: refs/uzi-salvage/<run-id> is at the tip, created here or already
+	// present at exactly that tip (idempotent).
+	salvageCreated
+	// salvageUnavailable: neither verified source (the branch checkpoint ref nor
+	// refs/uzi-recovery/<run-id>) is at the tip. Nothing was written.
+	salvageUnavailable
+	// salvageRefused: the salvage ref already exists at a DIFFERENT tip. Never
+	// overwritten; nothing was written.
+	salvageRefused
+)
+
+// createSalvageRef copies row.Tip into refs/uzi-salvage/<run-id>, identity-bound to the
+// recorded tip, idempotent and CREATE-ONLY, using #1810's primitives:
+//
+//  1. One ListRefTips of the salvage ref, the branch checkpoint ref and
+//     refs/uzi-recovery/<run-id>. A salvage ref already AT the tip is salvageCreated with
+//     no write; one at any other tip is salvageRefused with no write.
+//  2. The source is the first of the checkpoint ref and the recovery ref that is at the
+//     tip. With neither, it is salvageUnavailable with no write: origin no longer vouches
+//     for the recorded tip under a uzi ref.
+//  3. CreateRef{Ref: salvage ref, Tip, SourceRef}: Old = zero, an empty pack, never
+//     forced, and read back. nil or ErrRefExistsAtTip (a racer, or a lost response of
+//     ours, put exactly our tip there) is salvageCreated; ErrRefExists (a racer at another
+//     tip) is salvageRefused; ErrSourceMissing (the source moved between the list and the
+//     create) is salvageUnavailable; any other error is salvageFailed with that error.
+//
+// The two source refs are only ever read here: neither is passed to a write.
+func (s *Service) createSalvageRef(ctx context.Context, remote retentionForge, row store.RunSalvage) (salvageResult, error) {
+	salvage := pushbroker.SalvageRef(row.RunID)
+	branchRef := checkpointRefPrefix + row.Branch
+	recoveryRef := pushbroker.RecoveryRefPrefix + row.RunID.String()
+	tips, err := s.salvageListRefTipsFn(ctx, salvageListOptions(remote), salvage, branchRef, recoveryRef)
+	if err != nil {
+		return salvageFailed, fmt.Errorf("salvage: list: %w", err)
+	}
+	if cur, ok := tips[salvage]; ok {
+		if cur == row.Tip {
+			return salvageCreated, nil
+		}
+		return salvageRefused, nil
+	}
+	source := ""
+	for _, ref := range []string{branchRef, recoveryRef} {
+		if cur, ok := tips[ref]; ok && cur == row.Tip {
+			source = ref
+			break
+		}
+	}
+	if source == "" {
+		return salvageUnavailable, nil
+	}
+	err = s.salvageCreateRefFn(ctx, pushbroker.CreateRefOptions{
+		CloneURL:  remote.cloneURL,
+		Username:  remote.username,
+		PAT:       remote.pat,
+		Ref:       pushbroker.SalvageRef(row.RunID),
+		Tip:       row.Tip,
+		SourceRef: source,
+	})
+	switch {
+	case err == nil, errors.Is(err, pushbroker.ErrRefExistsAtTip):
+		return salvageCreated, nil
+	case errors.Is(err, pushbroker.ErrRefExists):
+		return salvageRefused, nil
+	case errors.Is(err, pushbroker.ErrSourceMissing):
+		return salvageUnavailable, nil
+	default:
+		return salvageFailed, fmt.Errorf("salvage: create %s: %w", salvage, err)
+	}
+}
+
+// deleteSalvageRef CAS-deletes the run's own refs/uzi-salvage/<run-id> at row.Tip through
+// pushbroker.Delete, which refuses a salvage ref without ExpectedOldTip. Delete's nil also
+// covers an absent or moved ref (benign: we owned only our tip) and some lock-failure
+// refusals it classifies benign, which a forge can emit for transient lock contention; so
+// a nil is confirmed with a re-list, and a salvage ref still at row.Tip is an error the
+// caller retries instead of recording the ref as gone.
+func (s *Service) deleteSalvageRef(ctx context.Context, remote retentionForge, row store.RunSalvage) error {
+	salvage := pushbroker.SalvageRef(row.RunID)
+	if err := s.salvageDeleteRefFn(ctx, pushbroker.DeleteOptions{
 		CloneURL:       remote.cloneURL,
-		Ref:            pushbroker.SalvageRef(row.RunID),
 		Username:       remote.username,
 		PAT:            remote.pat,
+		Ref:            pushbroker.SalvageRef(row.RunID),
 		ExpectedOldTip: row.Tip,
 	}); err != nil {
-		return fmt.Errorf("salvage: unrecorded salvage ref cleanup: %w", err)
+		return fmt.Errorf("salvage: delete %s: %w", salvage, err)
+	}
+	tips, err := s.salvageListRefTipsFn(ctx, salvageListOptions(remote), salvage)
+	if err != nil {
+		return fmt.Errorf("salvage: confirm delete of %s: %w", salvage, err)
+	}
+	if tips[salvage] == row.Tip {
+		return fmt.Errorf("salvage: %s still at %s after delete", salvage, row.Tip)
 	}
 	return nil
 }
@@ -506,39 +599,32 @@ func (s *Service) recordSalvageExpireFailure(ctx context.Context, row store.RunS
 	return s.q.RecordSalvageExpireFailed(wctx, store.RecordSalvageExpireFailedParams{LastError: msg, RunID: row.RunID})
 }
 
-// salvageRemoteInfo is the server-derived connection a salvage broker call dials.
-type salvageRemoteInfo struct {
-	cloneURL, username, pat string
+// salvageListOptions is the ListRefTips connection for f.
+func salvageListOptions(f retentionForge) pushbroker.ListRefsOptions {
+	return pushbroker.ListRefsOptions{CloneURL: f.cloneURL, Username: f.username, PAT: f.pat}
 }
 
-// salvageRemote derives the clone URL, bot username and PAT for runID exactly as Publish
-// and the checkpoint cleanup do: GetRunClaimContext, the SSRF gate on both the base URL
-// and the dialed clone host (BEFORE decrypting the PAT), then box.Open. A missing gate or
-// box is an error, never fail-open.
-func (s *Service) salvageRemote(ctx context.Context, runID uuid.UUID) (salvageRemoteInfo, error) {
+// salvageRemote derives the clone URL, bot username and PAT for runID through #1810's
+// forgeForRetention, the same server-side derivation Publish and retention use:
+// GetRunClaimContext, the SSRF gate on both the base URL and the dialed clone host
+// (BEFORE decrypting the PAT), then box.Open. A missing gate or box is an error, checked
+// here first, never fail-open. A run, repo or connection that is gone is an error too:
+// the attempt is counted and the row settles through the attempt cap and hard ceiling.
+func (s *Service) salvageRemote(ctx context.Context, runID uuid.UUID) (retentionForge, error) {
 	if s.forgeBaseURLAllowed == nil {
-		return salvageRemoteInfo{}, errors.New("salvage: forge base URL allowlist is not configured")
+		return retentionForge{}, errors.New("salvage: forge base URL allowlist is not configured")
 	}
 	if s.box == nil {
-		return salvageRemoteInfo{}, errors.New("salvage: secret box is not configured")
+		return retentionForge{}, errors.New("salvage: secret box is not configured")
 	}
-	rc, err := s.q.GetRunClaimContext(ctx, runID)
-	if err != nil {
-		return salvageRemoteInfo{}, fmt.Errorf("salvage: claim context: %w", err)
+	f, problem, gone := s.forgeForRetention(ctx, runID)
+	switch {
+	case gone:
+		return retentionForge{}, errors.New("salvage: claim context: the run, its repo or its forge connection is gone")
+	case problem != "":
+		return retentionForge{}, errors.New("salvage: " + problem)
 	}
-	cloneURL := rc.RepoWebUrl + ".git"
-	if !s.forgeBaseURLAllowed(rc.BaseUrl) {
-		return salvageRemoteInfo{}, errors.New("salvage: forge base URL is not allowlisted")
-	}
-	cloneHost, err := forgeHostFromURL(cloneURL)
-	if err != nil || !s.forgeBaseURLAllowed(cloneHost) {
-		return salvageRemoteInfo{}, errors.New("salvage: clone host is not allowlisted")
-	}
-	pat, err := s.box.Open(rc.TokenCiphertext)
-	if err != nil {
-		return salvageRemoteInfo{}, errors.New("salvage: bot PAT could not be decrypted")
-	}
-	return salvageRemoteInfo{cloneURL: cloneURL, username: rc.BotUsername, pat: string(pat)}, nil
+	return f, nil
 }
 
 // salvageErrText makes err safe for a log or last_error, in this order:

@@ -79,8 +79,10 @@ export interface StartChildTurnSpec {
   readonly effort?: HarnessEffort;
   /** The parent callback's identity, for lineage/audit only (never authority). */
   readonly parent: CallbackRuntimeId;
-  /** Fires on the run/turn abort OR the per-child deadline; the seam should bound its
-   *  RPCs by it so a slow child start does not outlive cancellation. */
+  /** Fires on the run/turn abort, when the lead turn that owns the delegation returns (issue
+   *  #1864), OR on the per-child deadline; the seam should bound its RPCs by it so a slow child
+   *  start does not outlive cancellation. The child `interrupt` runs after it fired, so that RPC
+   *  deliberately uses its own short bound instead. */
   readonly signal: AbortSignal;
 }
 
@@ -126,8 +128,10 @@ export interface CodexDelegationRunnerOptions {
   readonly worktreePath: string;
   readonly toolHandlers?: ReadonlyMap<string, ToolHandler>;
   readonly screenPolicy?: ScreenPolicy;
-  /** The run/turn abort. When it fires, in-flight children are interrupted + settled
-   *  and resolve `child_aborted`. Absent ⇒ children are bounded only by the deadline. */
+  /** The run/turn abort, which also fires when the lead turn that owns the delegation returns
+   *  (issue #1864). When it fires, in-flight children are interrupted + settled and resolve
+   *  `child_aborted`; the interrupt RPC deliberately uses its own short bound, not this signal.
+   *  Absent ⇒ children are bounded only by the deadline. */
   readonly signal?: AbortSignal;
   /** Wall-clock bound for a single child turn; a child that never terminates resolves
    *  `child_timeout`. Defaults to {@link DEFAULT_CHILD_TURN_DEADLINE_MS}. */

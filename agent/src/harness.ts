@@ -295,9 +295,16 @@ export type SafeBoundary =
   | "finalize"
   | "credentialed_git";
 
+/** Issue #1864: which checkpoint sink asked for a `checkpoint` boundary. Diagnostic only:
+ *  it labels a boundary failure ("milestone checkpoint" vs "done checkpoint") and never
+ *  changes what the boundary does. */
+export type BoundarySink = "milestone_checkpoint" | "done_checkpoint";
+
 export interface BoundaryRequest {
   boundary: SafeBoundary;
   deadlineMs: number; // total wall-clock budget, converted once to an absolute deadline
+  /** Issue #1864: optional diagnostic label of the sink that requested this boundary. */
+  sink?: BoundarySink;
 }
 
 export type ChildQuiescence =

@@ -3,10 +3,10 @@ import { Link } from "react-router-dom";
 
 import { api, type RecoveryCustodyHold, type RecoveryCustodyHolds } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
-import { custodyHoldView, groupHoldsByWorker } from "../lib/recovery";
+import { custodyHoldView, groupHoldsByWorker, type CustodyCheckpointView } from "../lib/recovery";
 import { stripUnsafeChars } from "../lib/safeText";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
-import { Badge, Button, Card, SectionTitle } from "./ui";
+import { Badge, Button, Card, SectionTitle, cx } from "./ui";
 import { ShieldIcon, ChevronRightIcon, TrashIcon } from "./icons";
 
 // RecoveryHoldsSurface is the durable, detailed owner resolution surface for custody holds
@@ -45,6 +45,17 @@ export function RecoveryHoldsSurface() {
   const decisionHolds = holds.holds.filter((h) => custodyHoldView(h).needsDecision);
   if (decisionHolds.length === 0) return null;
   const groups = groupHoldsByWorker(decisionHolds);
+  // Open holds per run, counted over the FULL listing (not just the decision rows): the
+  // retained checkpoint ref follows custody, so discarding a run's last open hold also deletes
+  // that ref on the forge (PRD #1810). A healthy sibling hold filtered out above still counts.
+  // Allowlist, mirroring the server: it deletes the ref only when no hold of the run has
+  // state 'open', so any other state (released, discarded, or one this client does not
+  // know yet) must not suppress the warning.
+  const openHoldsByRun = new Map<string, number>();
+  for (const h of holds.holds) {
+    if (h.state !== "open") continue;
+    openHoldsByRun.set(h.run_id, (openHoldsByRun.get(h.run_id) ?? 0) + 1);
+  }
   const { open_holds, custody_hold_limit, decision_needed } = holds.aggregate;
 
   return (
@@ -91,7 +102,12 @@ export function RecoveryHoldsSurface() {
             </div>
             <ul className="mt-2 space-y-2">
               {g.holds.map((hold) => (
-                <HoldRow key={hold.id} hold={hold} onChanged={load} />
+                <HoldRow
+                  key={hold.id}
+                  hold={hold}
+                  isLastOpenHold={openHoldsByRun.get(hold.run_id) === 1}
+                  onChanged={load}
+                />
               ))}
             </ul>
           </section>
@@ -108,9 +124,13 @@ export function RecoveryHoldsSurface() {
 // information only.
 function HoldRow({
   hold,
+  isLastOpenHold,
   onChanged,
 }: {
   hold: RecoveryCustodyHold;
+  // True when this is the run's only open hold, so discarding it releases the run's custody
+  // and with it the retained checkpoint ref on the forge.
+  isLastOpenHold: boolean;
   // Returns the parent's reload promise so the discard handler can await it and clear `busy`
   // only once the listing has settled (see discard's finally).
   onChanged: () => void | Promise<void>;
@@ -173,6 +193,10 @@ function HoldRow({
   const holdShort = shortId(hold.id);
   const workerName = hold.worker_name ? stripUnsafeChars(hold.worker_name) : "this worker";
   const warningId = `discard-warning-${hold.id}`;
+  const refWarningId = `discard-ref-warning-${hold.id}`;
+  // Every checkpoint-backed hold warns: the server decides at discard time, so a sibling hold
+  // that settles after this listing loaded would otherwise delete the ref with no warning.
+  const refWarning = view.checkpoint;
   const inputId = `discard-input-${hold.id}`;
   const canDiscard = typed.trim().toLowerCase() === "discard";
 
@@ -199,6 +223,7 @@ function HoldRow({
             <span className="font-mono">hold {holdShort}</span>
             <span>updated {new Date(hold.updated_at).toLocaleString()}</span>
           </p>
+          {view.checkpoint && <CheckpointLocation checkpoint={view.checkpoint} />}
         </div>
 
         <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
@@ -244,7 +269,7 @@ function HoldRow({
           tabIndex={-1}
           role="group"
           aria-label={`Discard held work for run ${runShort} on ${workerName}, generation ${hold.generation}`}
-          aria-describedby={warningId}
+          aria-describedby={refWarning ? `${warningId} ${refWarningId}` : warningId}
           onKeyDown={(e) => {
             if (e.key === "Escape") dismiss();
           }}
@@ -260,6 +285,20 @@ function HoldRow({
             its disk to be torn down, which can destroy this work permanently. This cannot be
             undone.
           </p>
+          {refWarning && (
+            <p id={refWarningId} className="text-sm text-danger">
+              {isLastOpenHold ? (
+                <>This is the run&rsquo;s last open hold: discarding it also deletes the retained</>
+              ) : (
+                <>
+                  If no other hold of this run is still open when you discard, this also deletes
+                  the retained
+                </>
+              )}{" "}
+              checkpoint ref <code className="break-all font-mono">{refWarning.ref}</code> on the
+              forge. Fetch it first if you need it.
+            </p>
+          )}
           <div className="space-y-1.5">
             <label htmlFor={inputId} className="block text-xs font-medium text-muted">
               Type <span className="font-mono text-danger">discard</span> to confirm.
@@ -290,6 +329,39 @@ function HoldRow({
         </div>
       )}
     </li>
+  );
+}
+
+// CheckpointLocation says where this run's retained published checkpoint lives on the forge
+// (PRD #1810): the branch checkpoint slot, or a recovery ref once a newer run on the same
+// branch took that slot. The ref is the answer the owner needs to fetch the work, so it is
+// the one monospace, full-contrast element; it breaks anywhere so a long branch name wraps on
+// a phone instead of overflowing the row. A moved ref reads in the info tone so "moved, not
+// lost" is distinguishable at a glance from work that still sits at its branch.
+function CheckpointLocation({
+  checkpoint,
+}: {
+  checkpoint: CustodyCheckpointView;
+}) {
+  const moved = checkpoint.kind === "recovery";
+  return (
+    <div
+      className={cx("mt-1 space-y-0.5 border-l-2 pl-2 text-xs", moved ? "border-info/50" : "border-edge")}
+    >
+      <p className="flex flex-wrap items-baseline gap-x-2">
+        <span className="text-faint">Checkpoint on forge</span>
+        <span className={moved ? "font-medium text-info" : "text-muted"}>{checkpoint.label}</span>
+      </p>
+      <p className="break-all font-mono text-fg">
+        {checkpoint.ref}
+        {checkpoint.shortTip && (
+          <span className="text-faint">
+            {" "}@ {checkpoint.shortTip}
+          </span>
+        )}
+      </p>
+      {checkpoint.note && <p className="text-faint">{checkpoint.note}</p>}
+    </div>
   );
 }
 

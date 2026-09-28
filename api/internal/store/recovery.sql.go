@@ -727,10 +727,15 @@ SELECT
         WHERE c.hold_id = h.id
         ORDER BY c.created_at DESC, c.id DESC
         LIMIT 1), '')::text AS capture_state,
-    COALESCE(r.status, '')::text AS run_status
+    COALESCE(r.status, '')::text AS run_status,
+    cr.ref AS checkpoint_ref,
+    cr.tip AS checkpoint_tip,
+    cr.state AS checkpoint_state
 FROM recovery_custody_holds h
 LEFT JOIN workers w ON w.id = h.original_worker_id AND w.user_id = h.user_id
 LEFT JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
+LEFT JOIN checkpoint_retentions cr ON cr.run_id = h.run_id AND cr.user_id = h.user_id
+    AND cr.state <> 'deleted' AND cr.state <> 'abandoned'
 WHERE h.user_id = $1
   AND ($2::uuid IS NULL OR h.run_id = $2::uuid)
   AND ($3::uuid IS NULL OR h.original_worker_id = $3::uuid)
@@ -758,6 +763,9 @@ type ListCustodyHoldsForOwnerRow struct {
 	HasAvailableCapture bool               `json:"has_available_capture"`
 	CaptureState        string             `json:"capture_state"`
 	RunStatus           string             `json:"run_status"`
+	CheckpointRef       pgtype.Text        `json:"checkpoint_ref"`
+	CheckpointTip       pgtype.Text        `json:"checkpoint_tip"`
+	CheckpointState     pgtype.Text        `json:"checkpoint_state"`
 }
 
 // PRD #1349 M1 (D7): the owner-scoped, bounded hold list the web Workers surface and the
@@ -777,6 +785,12 @@ type ListCustodyHoldsForOwnerRow struct {
 // terminal and carries no capture — a source needing an owner decision). It is NOT added to
 // the frozen RecoveryCustodyHoldDTO wire shape; it never reaches the SPA/CLI JSON. Ordered
 // oldest-first for a stable list.
+//
+// checkpoint_ref/checkpoint_tip/checkpoint_state (PRD #1810 M3, D3) name where the run's
+// published checkpoint lives on origin while it is retained: the branch checkpoint ref, or the
+// run's refs/uzi-recovery/<run id> once supersession moved it. NULL when the run has no live
+// retention record (none, or deleted/abandoned). checkpoint_retentions is keyed by run_id, so
+// the join adds no rows.
 func (q *Queries) ListCustodyHoldsForOwner(ctx context.Context, arg ListCustodyHoldsForOwnerParams) ([]ListCustodyHoldsForOwnerRow, error) {
 	rows, err := q.db.Query(ctx, listCustodyHoldsForOwner,
 		arg.UserID,
@@ -804,6 +818,9 @@ func (q *Queries) ListCustodyHoldsForOwner(ctx context.Context, arg ListCustodyH
 			&i.HasAvailableCapture,
 			&i.CaptureState,
 			&i.RunStatus,
+			&i.CheckpointRef,
+			&i.CheckpointTip,
+			&i.CheckpointState,
 		); err != nil {
 			return nil, err
 		}
@@ -1459,10 +1476,10 @@ type ReleasePredecessorCustodyHoldByLiveAncestryParams struct {
 //     live issue run has none yet) and, for a checkpoint target, the SAME kind and issue iid
 //     the checkpoint branch was derived from;
 //   - the successor generation's OWN hold exists, is still open, and was taken by the same
-//     worker: the durability backstop settle_live.go relies on (a checkpoint ref is deleted on
-//     terminal transitions, so the predecessor's work stays in custody only through that hold;
-//     claim-time hold creation is conditional on recovery capability, so a live claim alone
-//     does not prove it exists);
+//     worker: the durability backstop settle_live.go relies on (a live checkpoint ref can
+//     still be advanced or, once the run ends with no open hold, deleted (PRD #1810), so the
+//     predecessor's work stays in custody only through that hold; claim-time hold creation is
+//     conditional on recovery capability, so a live claim alone does not prove it exists);
 //   - the same server-held capture binding as ReleasePredecessorCustodyHoldByAncestry.
 //
 // Stamps release_evidence='live_ancestry' with 00251's six audit columns plus release_target

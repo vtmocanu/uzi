@@ -36,6 +36,7 @@ type Mark = "marked" | "unmarked" | "conditional" | "wrapper";
 
 /** `<file>#<name>()` for a call, `<file>#<name>&` for a bare reference → expected count + why. */
 const ALLOWLIST: Record<string, { count: number; mark: Mark; disposition: string }> = {
+  "env-probe.ts#runnerSpawn&": { count: 1, mark: "unmarked", disposition: "issue #1866: spawnRunnerProbe's default spawn of the fixed run-start environment probe (constant `node -e` script, NODE_OPTIONS/NODE_PATH stripped) under the SDK env: carries the attempt marker (buildSdkEnv) like the agent CLI, never the worker mark, so a probe that outlived its own group-kill proof stays reapable" },
   "sdk-spawn.ts#runnerSpawn()": { count: 1, mark: "unmarked", disposition: "the agent CLI: carries the attempt marker (buildSdkEnv), never the worker mark" },
   "runner-uid.ts#runnerCommand()": { count: 1, mark: "wrapper", disposition: "inside runnerSpawn: the caller's env decides (see sdk-spawn.ts)" },
   "runner-uid.ts#setprivRunnerArgs()": { count: 3, mark: "marked", disposition: "runnerCommand's own body + the two kill helpers (worker-authored fixed argv: workerSpawnEnv)" },

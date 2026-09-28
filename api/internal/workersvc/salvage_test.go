@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -159,62 +160,165 @@ func (f *salvageStore) GetRunClaimContext(_ context.Context, _ uuid.UUID) (store
 	return f.claimCtx, f.claimErr
 }
 
-// salvageBroker fakes CreateSalvageRef and DeleteRef. order logs every call as
-// "create:<run>" / "delete:<run>" so a test can check the round-robin.
+// salvageBroker is a fake forge behind the three salvage seams (salvageListRefTipsFn,
+// salvageCreateRefFn, salvageDeleteRefFn), modelling #1810's primitives. Every row in
+// these tests records tip salvageTip. Per run, result picks the forge state the next
+// attempt sees:
+//
+//   - unset, salvageCreated or salvageFailed: the branch checkpoint ref (or, with
+//     fromRecovery, refs/uzi-recovery/<run-id>) is at the tip, so a create lands, unless
+//     result is salvageFailed or createErr is set, when CreateRef fails without writing;
+//   - salvageUnavailable: neither source is at the tip;
+//   - salvageRefused: refs/uzi-salvage/<run-id> is already at salvageOtherTip.
+//
+// order logs every call as "list:<run>", "create:<run>" or "delete:<run>".
 type salvageBroker struct {
 	t *testing.T
 
-	mu        sync.Mutex
-	result    map[uuid.UUID]pushbroker.SalvageResult
-	createErr map[uuid.UUID]error
-	panicOn   map[uuid.UUID]bool
-	block     bool
-	// blockRes: a blocked create returns its configured result once ctx is done (the
-	// forge applied it but the reply arrived after the pass budget), not a failure.
+	mu           sync.Mutex
+	result       map[uuid.UUID]salvageResult
+	createErr    map[uuid.UUID]error
+	fromRecovery map[uuid.UUID]bool
+	panicOn      map[uuid.UUID]bool
+	// salvage is the forge's refs/uzi-salvage/<run-id> tips.
+	salvage map[uuid.UUID]string
+	listErr error
+	block   bool
+	// blockRes: a blocked create applies once ctx is done (the forge applied it but the
+	// reply arrived after the pass budget) and returns nil, not a failure.
 	blockRes bool
-	// blockDelete: every DeleteRef hangs until ctx is done (a remote that stalls rather
+	// blockDelete: every Delete hangs until ctx is done (a remote that stalls rather
 	// than failing fast).
 	blockDelete bool
 	deleteErr   error
-	creates     []pushbroker.CreateSalvageRefOptions
-	deletes     []pushbroker.DeleteRefOptions
-	order       []string
+	// deleteNoop: Delete returns nil but leaves the ref in place, as casDelete does for a
+	// lock-failure refusal it classifies benign.
+	deleteNoop bool
+	lists      []pushbroker.ListRefsOptions
+	creates    []pushbroker.CreateRefOptions
+	deletes    []pushbroker.DeleteOptions
+	order      []string
 }
 
-func (b *salvageBroker) create(ctx context.Context, o pushbroker.CreateSalvageRefOptions) (pushbroker.SalvageResult, error) {
+const salvageOtherTip = "3333333333333333333333333333333333333333"
+
+// runOf is the run id a salvage-seam call is about, read from its refs/uzi-salvage/ ref.
+func (b *salvageBroker) runOf(refs ...string) uuid.UUID {
+	for _, r := range refs {
+		if id, ok := strings.CutPrefix(r, pushbroker.SalvageRefPrefix); ok {
+			return uuid.MustParse(id)
+		}
+	}
+	b.t.Fatalf("salvage call without a refs/uzi-salvage/ ref: %v", refs)
+	return uuid.Nil
+}
+
+// sourceTip is where the fake forge advertises ref for run id: a source ref at the tip
+// unless the run is unavailable, and only the source the run is configured for.
+func (b *salvageBroker) sourceTip(id uuid.UUID, ref string) (string, bool) {
+	if b.result[id] == salvageUnavailable {
+		return "", false
+	}
+	switch {
+	case strings.HasPrefix(ref, pushbroker.RecoveryRefPrefix):
+		return salvageTip, b.fromRecovery[id]
+	case strings.HasPrefix(ref, checkpointRefPrefix):
+		return salvageTip, !b.fromRecovery[id]
+	}
+	return "", false
+}
+
+func (b *salvageBroker) salvageTipOf(id uuid.UUID) (string, bool) {
+	if b.result[id] == salvageRefused {
+		return salvageOtherTip, true
+	}
+	tip, ok := b.salvage[id]
+	return tip, ok
+}
+
+func (b *salvageBroker) list(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
+	id := b.runOf(refs...)
+	b.lists = append(b.lists, o)
+	b.order = append(b.order, "list:"+id.String())
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if b.listErr != nil {
+		return nil, b.listErr
+	}
+	out := map[string]string{}
+	for _, r := range refs {
+		var tip string
+		var ok bool
+		if strings.HasPrefix(r, pushbroker.SalvageRefPrefix) {
+			tip, ok = b.salvageTipOf(id)
+		} else {
+			tip, ok = b.sourceTip(id, r)
+		}
+		if ok {
+			out[r] = tip
+		}
+	}
+	return out, nil
+}
+
+func (b *salvageBroker) create(ctx context.Context, o pushbroker.CreateRefOptions) error {
+	b.mu.Lock()
+	id := b.runOf(o.Ref)
+	if o.Ref != pushbroker.SalvageRef(id) {
+		b.t.Errorf("CreateRef called with %q; salvage may only create refs/uzi-salvage/<run-id>", o.Ref)
+	}
 	b.creates = append(b.creates, o)
-	b.order = append(b.order, "create:"+o.RunID.String())
-	res, err, boom, block, blockRes := b.result[o.RunID], b.createErr[o.RunID], b.panicOn[o.RunID], b.block, b.blockRes
+	b.order = append(b.order, "create:"+id.String())
+	err, boom, block, blockRes := b.createErr[id], b.panicOn[id], b.block, b.blockRes
 	b.mu.Unlock()
 	if boom {
-		panic("go-git nil deref for " + o.RunID.String() + " via " + o.PAT)
+		panic("go-git nil deref for " + id.String() + " via " + o.PAT)
 	}
 	if block {
 		<-ctx.Done()
-		if blockRes {
-			return res, err
+		if !blockRes {
+			return ctx.Err()
 		}
-		return pushbroker.SalvageFailed, ctx.Err()
 	}
-	return res, err
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if r, set := b.result[id]; set && r == salvageFailed && !block {
+		return errors.New("pushbroker: create ref: ng " + o.Ref + " refused")
+	}
+	if tip, ok := b.salvageTipOf(id); ok {
+		if tip == o.Tip {
+			return pushbroker.ErrRefExistsAtTip
+		}
+		return pushbroker.ErrRefExists
+	}
+	if tip, ok := b.sourceTip(id, o.SourceRef); !ok || tip != o.Tip {
+		return pushbroker.ErrSourceMissing
+	}
+	b.salvage[id] = o.Tip
+	return nil
 }
 
 // delete fails with ctx's error once ctx is done (as a real network call would), and
 // panics for a run in panicOn.
-func (b *salvageBroker) delete(ctx context.Context, o pushbroker.DeleteRefOptions) error {
+func (b *salvageBroker) delete(ctx context.Context, o pushbroker.DeleteOptions) error {
 	b.mu.Lock()
-	if !strings.HasPrefix(o.Ref, "refs/uzi-salvage/") {
-		b.t.Errorf("DeleteRef called with %q; salvage may only delete refs/uzi-salvage/*", o.Ref)
+	if !strings.HasPrefix(o.Ref, pushbroker.SalvageRefPrefix) || o.ExpectedOldTip == "" || o.Branch != "" {
+		b.t.Errorf("Delete called with %+v; salvage may only CAS-delete refs/uzi-salvage/*", o)
 	}
-	id := strings.TrimPrefix(o.Ref, "refs/uzi-salvage/")
+	id := b.runOf(o.Ref)
 	b.deletes = append(b.deletes, o)
-	b.order = append(b.order, "delete:"+id)
-	boom := b.panicOn[uuid.MustParse(id)]
+	b.order = append(b.order, "delete:"+id.String())
+	boom := b.panicOn[id]
 	err, block := b.deleteErr, b.blockDelete
 	b.mu.Unlock()
 	if boom {
-		panic("go-git nil deref deleting " + id + " via " + o.PAT)
+		panic("go-git nil deref deleting " + id.String() + " via " + o.PAT)
 	}
 	if block {
 		<-ctx.Done()
@@ -222,8 +326,19 @@ func (b *salvageBroker) delete(ctx context.Context, o pushbroker.DeleteRefOption
 	if cerr := ctx.Err(); cerr != nil {
 		return cerr
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.deleteNoop && b.salvage[id] == o.ExpectedOldTip {
+		delete(b.salvage, id)
+	}
+	return nil
 }
+
+// orderOf builds an expected broker order from kind:run pairs.
+func orderOf(parts ...string) string { return strings.Join(parts, " ") }
 
 // newSalvageSvc wires a Service for SweepSalvage: an open SSRF gate for the fake forge, a
 // sealed bot PAT, the fake broker, a fixed clock, and a deleteCheckpointFn that fails the
@@ -250,13 +365,22 @@ func newSalvageSvc(t *testing.T, fs *salvageStore, forges []string, retention ti
 	svc.now = func() time.Time { return salvageNow }
 	svc.SetForgeBaseURLAllowed(func(u string) bool { return u == "https://github.example.com" })
 	b := &salvageBroker{
-		t:         t,
-		result:    map[uuid.UUID]pushbroker.SalvageResult{},
-		createErr: map[uuid.UUID]error{},
-		panicOn:   map[uuid.UUID]bool{},
+		t:            t,
+		result:       map[uuid.UUID]salvageResult{},
+		createErr:    map[uuid.UUID]error{},
+		fromRecovery: map[uuid.UUID]bool{},
+		panicOn:      map[uuid.UUID]bool{},
+		salvage:      map[uuid.UUID]string{},
 	}
-	svc.createSalvageFn = b.create
-	svc.deleteSalvageFn = b.delete
+	svc.salvageListRefTipsFn = b.list
+	svc.salvageCreateRefFn = b.create
+	svc.salvageDeleteRefFn = b.delete
+	failShared := func(name string) { t.Errorf("salvage reached %s; it must use its own seams", name) }
+	svc.SetCreateRefFn(func(context.Context, pushbroker.CreateRefOptions) error { failShared("createRefFn"); return nil })
+	svc.SetListRefTipsFn(func(context.Context, pushbroker.ListRefsOptions, ...string) (map[string]string, error) {
+		failShared("listRefTipsFn")
+		return nil, nil
+	})
 	svc.SetDeleteCheckpointFn(func(context.Context, pushbroker.DeleteOptions) error {
 		t.Errorf("salvage reached deleteCheckpointFn; it must never delete the branch checkpoint ref")
 		return nil
@@ -395,40 +519,63 @@ func TestSweepSalvageOffMakesNoEnqueueAndNoBrokerCall(t *testing.T) {
 	}
 }
 
-// TestSweepSalvagePendingTransitions pins each CreateSalvageRef outcome's store write.
+// TestSweepSalvagePendingTransitions pins each createSalvageRef outcome's store write, and
+// that only a create that can land writes: unavailable and refused are decided from the
+// list alone.
 func TestSweepSalvagePendingTransitions(t *testing.T) {
 	leak := "remote https://uzi-bot:" + salvagePATok + "@github.example.com failed"
 	cases := []struct {
-		name      string
-		res       pushbroker.SalvageResult
-		err       error
-		settled   string
-		attempted bool
-		created   bool
+		name         string
+		res          salvageResult
+		fromRecovery bool
+		err          error
+		settled      string
+		attempted    bool
+		created      bool
 	}{
-		{"created", pushbroker.SalvageCreated, nil, "", false, true},
-		{"unavailable", pushbroker.SalvageUnavailable, nil, "unavailable", false, false},
-		{"refused", pushbroker.SalvageRefused, nil, "refused", false, false},
-		{"failed with error", pushbroker.SalvageFailed, errors.New(leak), "", true, false},
-		{"failed without error", pushbroker.SalvageFailed, nil, "", true, false},
+		{"created from the branch ref", salvageCreated, false, nil, "", false, true},
+		{"created from the recovery ref", salvageCreated, true, nil, "", false, true},
+		{"unavailable", salvageUnavailable, false, nil, "unavailable", false, false},
+		{"refused", salvageRefused, false, nil, "refused", false, false},
+		{"failed with error", salvageFailed, false, errors.New(leak), "", true, false},
+		{"create refused", salvageFailed, false, nil, "", true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			row := pendingSalvageRow("github")
 			fs := &salvageStore{duePending: []store.RunSalvage{row}}
 			svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
-			b.result[row.RunID], b.createErr[row.RunID] = tc.res, tc.err
+			b.result[row.RunID], b.fromRecovery[row.RunID] = tc.res, tc.fromRecovery
+			if tc.err != nil {
+				b.createErr[row.RunID] = tc.err
+			}
 
 			if _, err := svc.SweepSalvage(context.Background()); err != nil {
 				t.Fatalf("SweepSalvage: %v", err)
 			}
-			if len(b.creates) != 1 {
-				t.Fatalf("creates = %d, want 1", len(b.creates))
+			if len(b.lists) != 1 {
+				t.Fatalf("lists = %d, want 1", len(b.lists))
 			}
-			o := b.creates[0]
-			if o.CloneURL != "https://github.example.com/team/repo.git" || o.Branch != row.Branch || o.Tip != row.Tip ||
-				o.RunID != row.RunID || o.Username != "uzi-bot" || o.PAT != salvagePATok {
-				t.Errorf("create options = %+v, want the server-derived remote, the row's branch/tip and the decrypted PAT", o)
+			if l := b.lists[0]; l.CloneURL != "https://github.example.com/team/repo.git" || l.Username != "uzi-bot" || l.PAT != salvagePATok {
+				t.Errorf("list options = %+v, want the server-derived remote and the decrypted PAT", l)
+			}
+			wantCreates := 1
+			if tc.res == salvageUnavailable || tc.res == salvageRefused {
+				wantCreates = 0
+			}
+			if len(b.creates) != wantCreates {
+				t.Fatalf("creates = %d, want %d", len(b.creates), wantCreates)
+			}
+			if wantCreates == 1 {
+				o := b.creates[0]
+				source := checkpointRefPrefix + row.Branch
+				if tc.fromRecovery {
+					source = pushbroker.RecoveryRefPrefix + row.RunID.String()
+				}
+				if o.CloneURL != "https://github.example.com/team/repo.git" || o.Ref != pushbroker.SalvageRef(row.RunID) ||
+					o.Tip != row.Tip || o.SourceRef != source || o.Username != "uzi-bot" || o.PAT != salvagePATok {
+					t.Errorf("create options = %+v, want the server-derived remote, the run's salvage ref at the row's tip from %s, and the decrypted PAT", o, source)
+				}
 			}
 			if tc.created {
 				if len(fs.created) != 1 || len(fs.promoted) != 1 {
@@ -479,7 +626,7 @@ func TestSweepSalvageExpiresAtRetention(t *testing.T) {
 		row := pendingSalvageRow("github")
 		fs := &salvageStore{duePending: []store.RunSalvage{row}}
 		svc, b := newSalvageSvc(t, fs, []string{"github"}, tc.retention)
-		b.result[row.RunID] = pushbroker.SalvageCreated
+		b.result[row.RunID] = salvageCreated
 		if _, err := svc.SweepSalvage(context.Background()); err != nil {
 			t.Fatalf("SweepSalvage: %v", err)
 		}
@@ -529,7 +676,7 @@ func TestSweepSalvageUnrecordedCreateThenRollback(t *testing.T) {
 			row := pendingSalvageRow("github")
 			fs := &salvageStore{duePending: []store.RunSalvage{row}, createdErr: errors.New("db: connection reset")}
 			svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
-			b.result[row.RunID] = pushbroker.SalvageCreated
+			b.result[row.RunID] = salvageCreated
 
 			// Pass 1: the ref lands on the forge, the record fails.
 			if _, err := svc.SweepSalvage(context.Background()); err == nil {
@@ -598,9 +745,14 @@ func TestSweepSalvageAttemptCapCleansUpFirst(t *testing.T) {
 			if _, err := svc.SweepSalvage(context.Background()); err != nil {
 				t.Fatalf("SweepSalvage: %v", err)
 			}
-			wantOrder := "create:" + row.RunID.String()
+			id := row.RunID.String()
+			wantOrder := orderOf("list:"+id, "create:"+id)
 			if tc.attempts+1 >= salvageAttemptCap {
-				wantOrder = "delete:" + row.RunID.String()
+				// A successful cleanup is confirmed by a re-list; a failed one is not.
+				wantOrder = orderOf("delete:"+id, "list:"+id)
+				if tc.deleteErr != nil {
+					wantOrder = orderOf("delete:" + id)
+				}
 				if b.deletes[0].Ref != pushbroker.SalvageRef(row.RunID) || b.deletes[0].ExpectedOldTip != row.Tip {
 					t.Errorf("delete = %+v, want the run's salvage ref at the tip", b.deletes[0])
 				}
@@ -671,11 +823,13 @@ func TestSweepSalvageBackoffPastCap(t *testing.T) {
 
 	fs := &salvageStore{duePending: rows}
 	svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
-	b.result[below.RunID] = pushbroker.SalvageUnavailable
+	b.result[below.RunID] = salvageUnavailable
 	if _, err := svc.SweepSalvage(context.Background()); err != nil {
 		t.Fatalf("SweepSalvage: %v", err)
 	}
-	want := "delete:" + due.RunID.String() + " create:" + below.RunID.String()
+	// The due row's capping cleanup (delete, then its confirming list), then the row below
+	// the cap, whose list alone settles it unavailable.
+	want := orderOf("delete:"+due.RunID.String(), "list:"+due.RunID.String(), "list:"+below.RunID.String())
 	if got := strings.Join(b.order, " "); got != want {
 		t.Fatalf("broker order = %s, want %s (backed-off rows skipped without using the budget)", got, want)
 	}
@@ -794,7 +948,7 @@ func TestSweepSalvageCreatedOutcomeSurvivesBudget(t *testing.T) {
 	svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
 	svc.salvagePassBudget = 50 * time.Millisecond
 	b.block, b.blockRes = true, true
-	b.result[row.RunID] = pushbroker.SalvageCreated
+	b.result[row.RunID] = salvageCreated
 	if _, err := svc.SweepSalvage(context.Background()); err != nil {
 		t.Fatalf("SweepSalvage: %v", err)
 	}
@@ -831,6 +985,7 @@ func TestSweepSalvageExpiry(t *testing.T) {
 		row := promotedSalvageRow("github")
 		fs := &salvageStore{dueExpiry: []store.RunSalvage{row}}
 		svc, b := newSalvageSvc(t, fs, nil, 168*time.Hour)
+		b.salvage[row.RunID] = row.Tip
 		n, err := svc.SweepSalvage(context.Background())
 		if err != nil || n != 1 {
 			t.Fatalf("SweepSalvage = (%d, %v), want (1, nil)", n, err)
@@ -841,13 +996,16 @@ func TestSweepSalvageExpiry(t *testing.T) {
 		d := b.deletes[0]
 		if d.Ref != pushbroker.SalvageRef(row.RunID) || d.ExpectedOldTip != row.Tip || d.PAT != salvagePATok ||
 			d.CloneURL != "https://github.example.com/team/repo.git" {
-			t.Errorf("DeleteRef options = %+v, want the run's salvage ref at the recorded tip", d)
+			t.Errorf("Delete options = %+v, want the run's salvage ref at the recorded tip", d)
+		}
+		if _, ok := b.salvage[row.RunID]; ok {
+			t.Errorf("salvage ref still on the fake forge after expiry")
 		}
 		if len(fs.settled) != 1 || fs.settled[0].State != "expired" {
 			t.Errorf("settled = %+v, want expired", fs.settled)
 		}
 		if len(b.creates) != 0 {
-			t.Errorf("expiry called CreateSalvageRef")
+			t.Errorf("expiry called CreateRef")
 		}
 	})
 	t.Run("delete error", func(t *testing.T) {
@@ -895,17 +1053,57 @@ func TestSweepSalvageSSRFRefusal(t *testing.T) {
 	}
 }
 
-// TestSweepSalvageClaimContextErrorIsAttemptFailure: a claim-context read failure counts
-// as a failed attempt, not a pass error.
+// TestSweepSalvageClaimContextErrorIsAttemptFailure: a claim-context read failure, or a
+// run whose repo or connection is gone (no rows), counts as a failed attempt with no
+// broker call, not a pass error.
 func TestSweepSalvageClaimContextErrorIsAttemptFailure(t *testing.T) {
-	row := pendingSalvageRow("github")
-	fs := &salvageStore{duePending: []store.RunSalvage{row}, claimErr: errors.New("no rows in result set")}
-	svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
-	if _, err := svc.SweepSalvage(context.Background()); err != nil {
-		t.Fatalf("SweepSalvage: %v", err)
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"read fails", errors.New("db: connection reset"), "claim context"},
+		{"run gone", pgx.ErrNoRows, "gone"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			row := pendingSalvageRow("github")
+			fs := &salvageStore{duePending: []store.RunSalvage{row}, claimErr: tc.err}
+			svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
+			if _, err := svc.SweepSalvage(context.Background()); err != nil {
+				t.Fatalf("SweepSalvage: %v", err)
+			}
+			if len(fs.attempts) != 1 || len(b.lists)+len(b.creates) != 0 || !strings.Contains(fs.attempts[0].LastError, tc.want) {
+				t.Fatalf("attempts=%+v lists=%d creates=%d, want one attempt naming %q and no broker call",
+					fs.attempts, len(b.lists), len(b.creates), tc.want)
+			}
+		})
 	}
-	if len(fs.attempts) != 1 || len(b.creates) != 0 {
-		t.Fatalf("attempts=%d creates=%d, want 1/0", len(fs.attempts), len(b.creates))
+}
+
+// TestSweepSalvageFailsClosedWithoutGateOrBox: with no SSRF gate or no secret box wired,
+// every item is a failed attempt with no claim-context read and no broker call.
+func TestSweepSalvageFailsClosedWithoutGateOrBox(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		unset func(*Service)
+	}{
+		{"no allowlist", func(s *Service) { s.forgeBaseURLAllowed = nil }},
+		{"no box", func(s *Service) { s.box = nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			row := pendingSalvageRow("github")
+			fs := &salvageStore{duePending: []store.RunSalvage{row}}
+			svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
+			tc.unset(svc)
+			if _, err := svc.SweepSalvage(context.Background()); err != nil {
+				t.Fatalf("SweepSalvage: %v", err)
+			}
+			if len(fs.attempts) != 1 || !strings.Contains(fs.attempts[0].LastError, "not configured") ||
+				fs.claimCalls != 0 || len(b.lists)+len(b.creates)+len(b.deletes) != 0 {
+				t.Fatalf("attempts=%+v claim=%d broker=%d/%d/%d, want one fail-closed attempt and no forge work",
+					fs.attempts, fs.claimCalls, len(b.lists), len(b.creates), len(b.deletes))
+			}
+		})
 	}
 }
 
@@ -921,15 +1119,18 @@ func TestSweepSalvageRoundRobinAtMostFive(t *testing.T) {
 	fs := &salvageStore{dueExpiry: exp, duePending: pend}
 	svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
 	for _, r := range pend {
-		b.result[r.RunID] = pushbroker.SalvageUnavailable
+		b.result[r.RunID] = salvageUnavailable
 	}
 	if _, err := svc.SweepSalvage(context.Background()); err != nil {
 		t.Fatalf("SweepSalvage: %v", err)
 	}
+	// An expiry is a delete plus its confirming list; an unavailable pending row is a list.
+	exp0, exp1, exp2 := exp[0].RunID.String(), exp[1].RunID.String(), exp[2].RunID.String()
+	pend0, pend1, pend2 := pend[0].RunID.String(), pend[1].RunID.String(), pend[2].RunID.String()
 	want := []string{
-		"delete:" + exp[0].RunID.String(), "create:" + pend[0].RunID.String(),
-		"delete:" + exp[1].RunID.String(), "create:" + pend[1].RunID.String(),
-		"delete:" + exp[2].RunID.String(),
+		"delete:" + exp0, "list:" + exp0, "list:" + pend0,
+		"delete:" + exp1, "list:" + exp1, "list:" + pend1,
+		"delete:" + exp2, "list:" + exp2,
 	}
 	if strings.Join(b.order, " ") != strings.Join(want, " ") {
 		t.Fatalf("broker order =\n  %v\nwant\n  %v", b.order, want)
@@ -939,9 +1140,9 @@ func TestSweepSalvageRoundRobinAtMostFive(t *testing.T) {
 		t.Fatalf("second SweepSalvage: %v", err)
 	}
 	want2 := []string{
-		"create:" + pend[0].RunID.String(), "delete:" + exp[0].RunID.String(),
-		"create:" + pend[1].RunID.String(), "delete:" + exp[1].RunID.String(),
-		"create:" + pend[2].RunID.String(),
+		"list:" + pend0, "delete:" + exp0, "list:" + exp0,
+		"list:" + pend1, "delete:" + exp1, "list:" + exp1,
+		"list:" + pend2,
 	}
 	if got := b.order[len(want):]; strings.Join(got, " ") != strings.Join(want2, " ") {
 		t.Fatalf("second-pass broker order =\n  %v\nwant\n  %v", got, want2)
@@ -1077,7 +1278,7 @@ func TestSweepSalvagePanicIsRecoveredPerItem(t *testing.T) {
 	fs := &salvageStore{duePending: []store.RunSalvage{bad, good}}
 	svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
 	b.panicOn[bad.RunID] = true
-	b.result[good.RunID] = pushbroker.SalvageCreated
+	b.result[good.RunID] = salvageCreated
 	if _, err := svc.SweepSalvage(context.Background()); err != nil {
 		t.Fatalf("SweepSalvage: %v", err)
 	}
@@ -1239,9 +1440,17 @@ func TestSweepSalvageDueListErrorIsReturned(t *testing.T) {
 }
 
 // TestSalvageSourceNeverDeletesCheckpointRefs is the static half of "salvage never
-// deletes or moves a ref #1810 manages": salvage.go references none of the branch
-// checkpoint deleters (deleteCheckpointFn, deleteCheckpointBestEffort, pushbroker.Delete,
-// pushbroker.DeleteOptions), and its only pushbroker delete is DeleteRef on SalvageRef.
+// deletes or moves a ref #1810 manages". salvage.go:
+//
+//   - references none of the branch checkpoint deleters or #1810's own seams
+//     (deleteCheckpointFn, deleteCheckpointBestEffort, retainOrDeleteCheckpoint,
+//     createRefFn, listRefTipsFn), and calls no pushbroker primitive directly
+//     (pushbroker.Delete, CreateRef, ListRefTips), only its own seams;
+//   - builds a pushbroker.DeleteOptions only as the literal argument of a
+//     salvageDeleteRefFn call, with Ref = pushbroker.SalvageRef(...), a non-empty
+//     ExpectedOldTip and no Branch (Delete refuses a salvage Ref without a tip, too);
+//   - builds a pushbroker.CreateRefOptions only with Ref = pushbroker.SalvageRef(...).
+//
 // Comments are ignored (the AST carries identifiers only).
 func TestSalvageSourceNeverDeletesCheckpointRefs(t *testing.T) {
 	fset := token.NewFileSet()
@@ -1249,7 +1458,73 @@ func TestSalvageSourceNeverDeletesCheckpointRefs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse salvage.go: %v", err)
 	}
-	forbidden := map[string]bool{"deleteCheckpointFn": true, "deleteCheckpointBestEffort": true, "retainOrDeleteCheckpoint": true}
+	forbidden := map[string]bool{
+		"deleteCheckpointFn": true, "deleteCheckpointBestEffort": true, "retainOrDeleteCheckpoint": true,
+		"createRefFn": true, "listRefTipsFn": true,
+	}
+	isPB := func(e ast.Expr, name string) bool {
+		sel, ok := e.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		return ok && pkg.Name == "pushbroker" && sel.Sel.Name == name
+	}
+	field := func(lit *ast.CompositeLit, name string) (ast.Expr, bool) {
+		for _, e := range lit.Elts {
+			if kv, ok := e.(*ast.KeyValueExpr); ok {
+				if key, ok := kv.Key.(*ast.Ident); ok && key.Name == name {
+					return kv.Value, true
+				}
+			}
+		}
+		return nil, false
+	}
+	isSalvageRefCall := func(e ast.Expr) bool {
+		call, ok := e.(*ast.CallExpr)
+		return ok && isPB(call.Fun, "SalvageRef")
+	}
+
+	// Every salvageDeleteRefFn call must take a DeleteOptions literal; those literals are
+	// the only DeleteOptions allowed.
+	allowedDelete := map[*ast.CompositeLit]bool{}
+	deleteCalls := 0
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "salvageDeleteRefFn" {
+			return true
+		}
+		deleteCalls++
+		var lit *ast.CompositeLit
+		if len(call.Args) == 2 {
+			lit, _ = call.Args[1].(*ast.CompositeLit)
+		}
+		if lit == nil || !isPB(lit.Type, "DeleteOptions") {
+			t.Errorf("%s: salvageDeleteRefFn is not called with a pushbroker.DeleteOptions literal", fset.Position(call.Pos()))
+			return true
+		}
+		allowedDelete[lit] = true
+		if ref, ok := field(lit, "Ref"); !ok || !isSalvageRefCall(ref) {
+			t.Errorf("%s: a salvage Delete's Ref is not pushbroker.SalvageRef(...)", fset.Position(lit.Pos()))
+		}
+		if tip, ok := field(lit, "ExpectedOldTip"); !ok {
+			t.Errorf("%s: a salvage Delete has no ExpectedOldTip (it must be a CAS)", fset.Position(lit.Pos()))
+		} else if bl, ok := tip.(*ast.BasicLit); ok && bl.Value == `""` {
+			t.Errorf("%s: a salvage Delete's ExpectedOldTip is empty", fset.Position(lit.Pos()))
+		}
+		if _, ok := field(lit, "Branch"); ok {
+			t.Errorf("%s: a salvage Delete names a Branch (the branch checkpoint ref)", fset.Position(lit.Pos()))
+		}
+		return true
+	})
+	if deleteCalls == 0 {
+		t.Fatal("found no salvageDeleteRefFn call in salvage.go; the guard is not looking at the right code")
+	}
+
 	ast.Inspect(f, func(n ast.Node) bool {
 		switch x := n.(type) {
 		case *ast.Ident:
@@ -1257,35 +1532,174 @@ func TestSalvageSourceNeverDeletesCheckpointRefs(t *testing.T) {
 				t.Errorf("%s: salvage.go references %s", fset.Position(x.Pos()), x.Name)
 			}
 		case *ast.SelectorExpr:
-			if pkg, ok := x.X.(*ast.Ident); ok && pkg.Name == "pushbroker" &&
-				(x.Sel.Name == "Delete" || x.Sel.Name == "DeleteOptions") {
-				t.Errorf("%s: salvage.go uses pushbroker.%s (the branch checkpoint deleter)", fset.Position(x.Pos()), x.Sel.Name)
+			for _, name := range []string{"Delete", "CreateRef", "ListRefTips"} {
+				if isPB(x, name) {
+					t.Errorf("%s: salvage.go calls pushbroker.%s directly instead of its seam", fset.Position(x.Pos()), name)
+				}
 			}
 		case *ast.CompositeLit:
-			// Every DeleteRefOptions literal names its Ref via pushbroker.SalvageRef.
-			sel, ok := x.Type.(*ast.SelectorExpr)
-			if !ok || sel.Sel.Name != "DeleteRefOptions" {
-				return true
-			}
-			found := false
-			for _, e := range x.Elts {
-				kv, ok := e.(*ast.KeyValueExpr)
-				if !ok {
-					continue
+			switch {
+			case isPB(x.Type, "DeleteOptions") && !allowedDelete[x]:
+				t.Errorf("%s: a pushbroker.DeleteOptions outside a salvageDeleteRefFn call", fset.Position(x.Pos()))
+			case isPB(x.Type, "CreateRefOptions"):
+				if ref, ok := field(x, "Ref"); !ok || !isSalvageRefCall(ref) {
+					t.Errorf("%s: a CreateRefOptions Ref is not pushbroker.SalvageRef(...)", fset.Position(x.Pos()))
 				}
-				if key, ok := kv.Key.(*ast.Ident); !ok || key.Name != "Ref" {
-					continue
-				}
-				if call, ok := kv.Value.(*ast.CallExpr); ok {
-					if fn, ok := call.Fun.(*ast.SelectorExpr); ok && fn.Sel.Name == "SalvageRef" {
-						found = true
-					}
-				}
-			}
-			if !found {
-				t.Errorf("%s: a DeleteRefOptions Ref is not pushbroker.SalvageRef(...)", fset.Position(x.Pos()))
 			}
 		}
 		return true
 	})
+	// A DeleteOptions value declared any other way (var, conversion) has no literal to check.
+	ast.Inspect(f, func(n ast.Node) bool {
+		if vs, ok := n.(*ast.ValueSpec); ok && vs.Type != nil && isPB(vs.Type, "DeleteOptions") {
+			t.Errorf("%s: a pushbroker.DeleteOptions variable in salvage.go", fset.Position(vs.Pos()))
+		}
+		return true
+	})
+}
+
+// TestCreateSalvageRefMapsOutcomes pins createSalvageRef on #1810's primitives: the list
+// decides idempotent success, refusal, unavailability and the source (branch checkpoint
+// ref first, then refs/uzi-recovery/<run-id>) with no write; CreateRef's sentinels map to
+// created (nil, ErrRefExistsAtTip), refused (ErrRefExists) and unavailable
+// (ErrSourceMissing: the source moved after the list), and anything else is a failure.
+func TestCreateSalvageRefMapsOutcomes(t *testing.T) {
+	other := errors.New("pushbroker: create ref: ng refs/uzi-salvage/x 500")
+	for _, tc := range []struct {
+		name       string
+		tips       map[string]string // list result, keyed by "salvage", "branch", "recovery"
+		listErr    error
+		createErr  error
+		want       salvageResult
+		wantErr    bool
+		wantSource string // "" = no create
+	}{
+		{"salvage at tip", map[string]string{"salvage": salvageTip}, nil, nil, salvageCreated, false, ""},
+		{"salvage at another tip", map[string]string{"salvage": salvageOtherTip, "branch": salvageTip}, nil, nil, salvageRefused, false, ""},
+		{"no source", map[string]string{}, nil, nil, salvageUnavailable, false, ""},
+		{"sources elsewhere", map[string]string{"branch": salvageOtherTip, "recovery": salvageOtherTip}, nil, nil, salvageUnavailable, false, ""},
+		{"list fails", nil, errors.New("pushbroker: list: 503"), nil, salvageFailed, true, ""},
+		{"branch source", map[string]string{"branch": salvageTip, "recovery": salvageTip}, nil, nil, salvageCreated, false, "branch"},
+		{"recovery source", map[string]string{"branch": salvageOtherTip, "recovery": salvageTip}, nil, nil, salvageCreated, false, "recovery"},
+		{"created by a racer", map[string]string{"branch": salvageTip}, nil, pushbroker.ErrRefExistsAtTip, salvageCreated, false, "branch"},
+		{"a racer at another tip", map[string]string{"branch": salvageTip}, nil, pushbroker.ErrRefExists, salvageRefused, false, "branch"},
+		{"source moved after the list", map[string]string{"branch": salvageTip}, nil, pushbroker.ErrSourceMissing, salvageUnavailable, false, "branch"},
+		{"create fails", map[string]string{"branch": salvageTip}, nil, other, salvageFailed, true, "branch"},
+		{"invalid ref", map[string]string{"branch": salvageTip}, nil, pushbroker.ErrInvalidRef, salvageFailed, true, "branch"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			row := pendingSalvageRow("github")
+			refs := map[string]string{
+				"salvage":  pushbroker.SalvageRef(row.RunID),
+				"branch":   checkpointRefPrefix + row.Branch,
+				"recovery": pushbroker.RecoveryRefPrefix + row.RunID.String(),
+			}
+			svc := New(&salvageStore{}, nil, testParams())
+			var listed []string
+			var creates []pushbroker.CreateRefOptions
+			svc.salvageListRefTipsFn = func(_ context.Context, _ pushbroker.ListRefsOptions, rs ...string) (map[string]string, error) {
+				listed = rs
+				out := map[string]string{}
+				for k, v := range tc.tips {
+					out[refs[k]] = v
+				}
+				return out, tc.listErr
+			}
+			svc.salvageCreateRefFn = func(_ context.Context, o pushbroker.CreateRefOptions) error {
+				creates = append(creates, o)
+				return tc.createErr
+			}
+			svc.salvageDeleteRefFn = func(context.Context, pushbroker.DeleteOptions) error {
+				t.Error("createSalvageRef deleted a ref")
+				return nil
+			}
+			res, err := svc.createSalvageRef(context.Background(), retentionForge{cloneURL: "https://x/r.git"}, row)
+			if res != tc.want || (err != nil) != tc.wantErr {
+				t.Fatalf("createSalvageRef = (%v, %v), want (%v, err=%v)", res, err, tc.want, tc.wantErr)
+			}
+			if strings.Join(listed, " ") != strings.Join([]string{refs["salvage"], refs["branch"], refs["recovery"]}, " ") {
+				t.Errorf("listed %v, want the salvage, branch and recovery refs", listed)
+			}
+			if tc.wantSource == "" {
+				if len(creates) != 0 {
+					t.Fatalf("creates = %+v, want none", creates)
+				}
+				return
+			}
+			if len(creates) != 1 || creates[0].SourceRef != refs[tc.wantSource] || creates[0].Ref != refs["salvage"] || creates[0].Tip != row.Tip {
+				t.Fatalf("creates = %+v, want one salvage create at the tip from %s", creates, refs[tc.wantSource])
+			}
+		})
+	}
+}
+
+// TestDeleteSalvageRefConfirmsWithRelist: pushbroker.Delete's nil also covers some
+// lock-failure refusals it reads as benign, so deleteSalvageRef re-lists. A salvage ref
+// still at the tip after a nil Delete is an error (the row is retried, never settled); a
+// ref that is gone or moved is success (we owned only our tip); a failed confirm list is
+// an error.
+func TestDeleteSalvageRefConfirmsWithRelist(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		after   string // the salvage ref's tip after the Delete ("" = absent)
+		listErr error
+		wantErr string
+	}{
+		{"deleted", "", nil, ""},
+		{"moved by someone else", salvageOtherTip, nil, ""},
+		{"benign refusal left it at the tip", salvageTip, nil, "still at"},
+		{"confirm list fails", "", errors.New("pushbroker: list: 503"), "confirm delete"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			row := pendingSalvageRow("github")
+			ref := pushbroker.SalvageRef(row.RunID)
+			svc := New(&salvageStore{}, nil, testParams())
+			var deletes []pushbroker.DeleteOptions
+			svc.salvageDeleteRefFn = func(_ context.Context, o pushbroker.DeleteOptions) error {
+				deletes = append(deletes, o)
+				return nil
+			}
+			svc.salvageListRefTipsFn = func(_ context.Context, _ pushbroker.ListRefsOptions, rs ...string) (map[string]string, error) {
+				if len(rs) != 1 || rs[0] != ref {
+					t.Errorf("confirm listed %v, want only %s", rs, ref)
+				}
+				out := map[string]string{}
+				if tc.after != "" {
+					out[ref] = tc.after
+				}
+				return out, tc.listErr
+			}
+			err := svc.deleteSalvageRef(context.Background(), retentionForge{cloneURL: "https://x/r.git"}, row)
+			if tc.wantErr == "" && err != nil || tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Fatalf("deleteSalvageRef = %v, want error containing %q", err, tc.wantErr)
+			}
+			if len(deletes) != 1 || deletes[0].Ref != ref || deletes[0].ExpectedOldTip != row.Tip || deletes[0].Branch != "" {
+				t.Fatalf("deletes = %+v, want one CAS delete of %s at the tip", deletes, ref)
+			}
+		})
+	}
+}
+
+// TestSweepSalvageBenignDeleteRefusalIsRetried: through the whole pass, a nil Delete that
+// left the salvage ref at the tip keeps an expiring row un-expired (its failure recorded
+// for retry), and keeps a rolled-back pending row from settling 'disabled'.
+func TestSweepSalvageBenignDeleteRefusalIsRetried(t *testing.T) {
+	exp := promotedSalvageRow("github")
+	pend := pendingSalvageRow("gitlab") // gitlab is not enabled: the rollback path
+	fs := &salvageStore{dueExpiry: []store.RunSalvage{exp}, duePending: []store.RunSalvage{pend}}
+	svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
+	b.salvage[exp.RunID], b.salvage[pend.RunID] = exp.Tip, pend.Tip
+	b.deleteNoop = true
+	if _, err := svc.SweepSalvage(context.Background()); err != nil {
+		t.Fatalf("SweepSalvage: %v", err)
+	}
+	if len(fs.settled) != 0 {
+		t.Fatalf("settled = %+v, want nothing settled while the salvage refs remain", fs.settled)
+	}
+	if len(fs.expireFailed) != 1 || !strings.Contains(fs.expireFailed[0].LastError, "still at") {
+		t.Errorf("expireFailed = %+v, want the expiry retried", fs.expireFailed)
+	}
+	if len(fs.attempts) != 1 || fs.attempts[0].AttemptCap != salvageNoCap || !strings.Contains(fs.attempts[0].LastError, "still at") {
+		t.Errorf("attempts = %+v, want one uncapped rollback attempt", fs.attempts)
+	}
 }

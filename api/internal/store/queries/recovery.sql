@@ -422,10 +422,10 @@ WHERE h.id = @hold_id
 --     live issue run has none yet) and, for a checkpoint target, the SAME kind and issue iid
 --     the checkpoint branch was derived from;
 --   * the successor generation's OWN hold exists, is still open, and was taken by the same
---     worker: the durability backstop settle_live.go relies on (a checkpoint ref is deleted on
---     terminal transitions, so the predecessor's work stays in custody only through that hold;
---     claim-time hold creation is conditional on recovery capability, so a live claim alone
---     does not prove it exists);
+--     worker: the durability backstop settle_live.go relies on (a live checkpoint ref can
+--     still be advanced or, once the run ends with no open hold, deleted (PRD #1810), so the
+--     predecessor's work stays in custody only through that hold; claim-time hold creation is
+--     conditional on recovery capability, so a live claim alone does not prove it exists);
 --   * the same server-held capture binding as ReleasePredecessorCustodyHoldByAncestry.
 -- Stamps release_evidence='live_ancestry' with 00251's six audit columns plus release_target
 -- (migration 00255's CHECK refuses a 'live_ancestry' row missing any of them). Nulls both live
@@ -576,6 +576,12 @@ ORDER BY h.created_at ASC;
 -- terminal and carries no capture — a source needing an owner decision). It is NOT added to
 -- the frozen RecoveryCustodyHoldDTO wire shape; it never reaches the SPA/CLI JSON. Ordered
 -- oldest-first for a stable list.
+--
+-- checkpoint_ref/checkpoint_tip/checkpoint_state (PRD #1810 M3, D3) name where the run's
+-- published checkpoint lives on origin while it is retained: the branch checkpoint ref, or the
+-- run's refs/uzi-recovery/<run id> once supersession moved it. NULL when the run has no live
+-- retention record (none, or deleted/abandoned). checkpoint_retentions is keyed by run_id, so
+-- the join adds no rows.
 SELECT
     h.id,
     h.run_id,
@@ -592,10 +598,15 @@ SELECT
         WHERE c.hold_id = h.id
         ORDER BY c.created_at DESC, c.id DESC
         LIMIT 1), '')::text AS capture_state,
-    COALESCE(r.status, '')::text AS run_status
+    COALESCE(r.status, '')::text AS run_status,
+    cr.ref AS checkpoint_ref,
+    cr.tip AS checkpoint_tip,
+    cr.state AS checkpoint_state
 FROM recovery_custody_holds h
 LEFT JOIN workers w ON w.id = h.original_worker_id AND w.user_id = h.user_id
 LEFT JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
+LEFT JOIN checkpoint_retentions cr ON cr.run_id = h.run_id AND cr.user_id = h.user_id
+    AND cr.state <> 'deleted' AND cr.state <> 'abandoned'
 WHERE h.user_id = @user_id
   AND (sqlc.narg('run_id')::uuid IS NULL OR h.run_id = sqlc.narg('run_id')::uuid)
   AND (sqlc.narg('worker_id')::uuid IS NULL OR h.original_worker_id = sqlc.narg('worker_id')::uuid)

@@ -1,0 +1,435 @@
+# ADR-1810: A published checkpoint stays while its run's custody is open; supersession preserves a held tip under a recovery ref
+
+**Status**: Accepted (PRD #1810 M1-M4 implemented, including rework rounds 1 and 2; M5 in progress)
+**Date**: 2026-09-27 (amended 2026-09-28, rework rounds 1 and 2)
+**Deciders**: agent team, per PRD #1810
+**PRD**: [PRD #1810](../prds/1810-retain-failed-run-checkpoint-ref.md)
+
+## Decision (summary)
+
+> A published checkpoint survives its run's terminal transition while any
+> custody hold of the run is open. Once the last hold is released or
+> discarded, its ref is owed a CAS delete, retried until it succeeds. When a
+> new run needs the branch slot, supersession preserves a held run's tip
+> under a run-scoped recovery ref.
+
+The api no longer deletes a terminal run's `refs/uzi-checkpoints/<branch>`
+ref best-effort at each of the three writers that reach it (PRD #1030 M4):
+the worker-reported terminal state report, and the two server-side
+cancel/reject paths. Instead, at each of those writers it retains the ref
+while any custody hold of that run is open, and settles it
+(compare-and-swap delete on the recorded tip) only once the run's last
+hold is released or discarded. When another run needs the slot a retained
+ref still occupies — its publish would be refused `not_descendant`, or
+would fast-forward over the retained tip and succeed with no refusal at
+all — the api **supersedes** the old run's record: it moves the tip to
+`refs/uzi-recovery/<run-id>` and frees the branch ref, rather than
+deleting the tip or force-updating anything.
+
+Every forge write this invariant requires is CAS, never forced, consistent
+with the push broker's existing rule (ADR-0122).
+
+## Context
+
+PRD #1030 M4 deletes a run's checkpoint ref, best-effort, from three writers
+in `api/internal/workersvc` — the worker-reported terminal state report and
+the two server-side cancel/reject paths — so a stale ref never blocks a
+later run's publish with `not_descendant`. A sweeper-driven terminal
+transition, such as failing a stale worker over its cap, never called that
+delete. That is correct for a completed run with no open hold. It is
+wrong for a failed or cancelled run: the same code path deliberately
+keeps custody holds open for those runs "for capture or explicit
+discard", while deleting the one off-worker copy of the work the hold
+exists to protect. On 2026-09-27, issue #1798's run published two
+checkpoints, failed (a full data volume, PRD #1809), and both checkpoint
+publishes were then deleted while the run's custody holds were still open
+with no captures — the committed work survived only in the worker's own
+working clone.
+
+A completed run with an open custody hold from an *older* generation of the
+same run is a related case: freeing the branch ref for the new generation's
+publish must not destroy the older generation's only off-worker copy either.
+
+## The mechanism
+
+### Retention (M1)
+
+At each of the three terminal writers that used to delete the ref (and
+later, through the sweeper backfill, for every other terminal writer) the
+api inserts a `checkpoint_retentions` row
+(one per run, migration 00264) recording the run's checkpoint branch, the
+published tip, and the ref that currently carries it. A run with an open
+custody hold gets state `retained` and no forge call. A run with no open
+hold (a completed run whose hold already settled, or a failed/cancelled run
+on a worker without the recovery capability) gets `settling`, and a
+background settle deletes the ref, CAS on the recorded tip, under the run's
+retention lock.
+
+### Per-run session advisory lock, not a row lock (amends the PRD's D2)
+
+The PRD's D2 originally described supersession and settlement as
+serializing on the old run's row lock. That is insufficient: the operation
+spans several forge round-trips (list, create, delete), and a Postgres row
+lock is released the instant its transaction commits — it cannot hold
+across an intent commit *and* the forge writes that follow it, which is
+exactly the ordering the invariant needs (the intent must be durable
+**before** any forge write, so a crash mid-operation leaves the tip
+discoverable from the persisted state alone).
+
+Instead every retention forge write — settle's delete, supersession's
+create and branch-delete, a stuck supersession's exit, and the
+post-settlement audit's delete — runs under one **per-run PostgreSQL
+session advisory lock**, held for the whole operation including every forge
+call, taken with try semantics (a busy lock is a no-op: the caller leaves
+the ref alone and a later trigger or the sweeper retries). Because the lock
+is session-scoped, it is pinned to one dedicated pool connection for the
+operation's duration.
+
+A session advisory lock alone is not sufficient either: a lock can be lost
+mid-operation if its backend is terminated or its connection drops, silently
+leaving the caller without exclusivity it believes it still holds. So every
+forge write is preceded by a **fence**: a re-check, on the same pinned
+session, that `pg_locks` still shows the lock granted to this backend. A
+lock lost between acquisition and the write is caught by the fence and the
+write is skipped, rather than racing another writer that has since taken
+over the record.
+
+Even the lock-plus-fence pair leaves one narrow residual window (below), so
+the sweeper also runs a **post-settlement audit** arm: 10 minutes after a
+recovery ref's deletion is recorded, it re-lists that ref on origin and
+removes it if it is still there at the recorded tip and no hold has
+reopened — closing the gap where a create landed on origin after the fence
+passed but the session was lost before the delete recorded.
+
+### Supersession (M3, widened 2026-09-28)
+
+Triggered by any publish by a run that does not own the active
+retained/superseding record on the branch, whether the broker refuses the
+push `not_descendant` or the push would *descend* the old tip and succeed.
+The original design triggered only on a `not_descendant` refusal, which
+missed the fast-forward case: a new run's publish whose work descends from
+the old retained tip is accepted by the broker's CAS with no refusal at
+all, leaving the old run's record stranded `retained` at a tip that is no
+longer the branch tip. A live issue run now claims the branch slot BEFORE
+pushing (`claimCheckpointSlot`): it lists every other run's active record
+on the branch and supersedes each one first, proceeding with the push only
+once all of them freed the ref; a record still in its own retry backoff
+is left alone and the publish is refused `not_descendant` for the worker to
+retry next tick (the original `not_descendant` → free-then-retry path
+stays wired as the fallback for a record the claim check does not drive: a
+settling record, one that appears after the check, a race with another
+writer). A **terminal** run's publish over another run's active record is
+refused `superseded`, with no forge call at all — a terminal run's worker
+still has no path to trigger a supersession of someone else's record. In
+practice this means an issue run whose branch (keyed on the issue) a later
+run on the same issue reuses; a self-improve run's checkpoint branch is
+keyed on its own run id (`uzi/self-improve/<run-id>`), so no two
+self-improve runs ever share a branch and supersession never triggers for
+that kind. Under the old run's retention lock:
+
+1. **persist the intent first**: `retained` → `superseding`, recording the
+   recovery ref name `refs/uzi-recovery/<old-run-id>` and the expected tip,
+   before any forge write;
+2. create the recovery ref at that tip, CAS with old = zero;
+3. CAS-delete the branch ref at that tip;
+4. mark the record `superseded` (a hold is still open) or drive straight to
+   `settling` (none is), in one statement.
+
+Every step is idempotent, so a crash at any point leaves the tip
+discoverable under at least one recorded ref, and the sweeper re-drives an
+interrupted `superseding` record from step 2.
+
+### A terminal run's own publish is now serialized under its retention lock (2026-09-28)
+
+Widening the supersession trigger to cover a fast-forwarding publish (above)
+removed the one thing the original design relied on to keep a terminal
+run's own publish from landing mid-supersession: waiting for a broker
+refusal before doing anything. Once supersession can start ahead of a
+push that would otherwise succeed, a terminal run's publish (its
+`terminalPublishSuperseded` check, the branch-slot claim, the forge push,
+the tip persist, and the retention-record track) must not be allowed to
+interleave with a supersession of that same run. `publishTerminalLocked`
+now runs that whole sequence under the run's own retention advisory lock,
+fenced immediately before the push (the same `pg_locks` re-check every
+retention forge write uses, though not through `beforeRetentionWrite` —
+that write has no test hook): a supersession of the run (which takes the
+same lock) can neither begin between the check and the push nor land
+between the push and the track. `withRetentionLock` itself is a single
+try (`pg_try_advisory_lock`, no retry loop), and a full retention
+concurrency slot is busy in the same way a held lock is. Only
+`publishTerminalLocked` retries a busy lock, every
+`terminalPublishLockRetryInterval` (200ms) for up to
+`terminalPublishLockRetryBudget` (3s total) — because the agent's shutdown
+checkpoint sink is one-shot, so a skip under brief contention would lose a
+cancelled run's last checkpoint outright. A lock still busy past that
+budget (another instance or the sweeper already working the run's record,
+or the retention slots full) is a benign `not_descendant` skip with no
+forge call; the worker retries next tick. Any settle the publish itself
+ends up owing is dispatched only *after* the lock releases: dispatching it
+under the lock would have it try-lock the same key and lose to the lock
+this operation still holds.
+
+### The terminal `checkpoint_retentions` row is written in the same transaction as the status commit (rework round 2)
+
+Before this round the row was inserted only after the terminal status
+committed — by the post-commit Go path at the three original writers, or,
+for the seven other terminal writers named in the PRD's amended Problem
+statement, only later by the sweeper's backfill arm. In the window between
+a terminal commit at one of those seven writers and the backfill arm
+catching up, `claimCheckpointSlot` could list the branch's active records,
+see none, and push a new run's descendant tip straight over the old run's
+retained checkpoint. A migration-00266 (draft number; renumbered at merge)
+`AFTER UPDATE OF status` trigger on `runs` now inserts the
+`checkpoint_retentions` row in the SAME transaction as every terminal
+transition — `retained` while a custody hold is open, else `settling`, the
+branch derived exactly as `checkpointBranch` does (kind first: an issue run
+with an iid, or a self-improve run keyed on its own run id) — so any reader
+that observes the terminal status also observes the row, with no writer
+able to skip it. Because no new issue run exists until the old one is
+terminal (`uq_runs_one_active_per_issue`, migration 00170), no branch lock
+is needed for this fix. The Go post-commit path still runs afterward: it
+re-reads the row the trigger already wrote (`ON CONFLICT (run_id) DO
+NOTHING` keeps the trigger's own insert authoritative) and dispatches the
+settle that row owes. The sweeper's backfill arm stays wired as the
+backstop for whatever coverage gap the trigger itself does not close (a row
+inserted before this migration's deploy, a repo-less or non-checkpointing
+run kind).
+
+### Residual 2 closed by a durable pre-push record, not by the cooling period (rework round 2)
+
+Rework round 1 narrowed residual 2 to a specific window and left it open,
+relying on a five-minute cooling period (`checkpointSupersessionCooling`)
+before a supersession's recovery-ref create to reduce how often a
+live-routed publish's unlocked push could land inside that window. Reviewer
+and lander steering on that round held the cooling period does not prove
+the window closed: a client-side push timeout is evidence about the
+client, not about the forge — a receive-pack request already accepted can
+still land on origin after the client gave up, after the run went
+terminal, and after a newer run superseded its record. A per-publish lease
+was considered and rejected (see the PRD's D4): it lapses while a detached
+supersession's own forge round-trips are still running, is unsafe to clear
+after a push whose outcome is unknown, and is overwritten by two
+overlapping publishes of the same run.
+
+Round 2 instead makes the outcome durable and reconcilable rather than
+inferred from elapsed time. `routedAt` is stamped BEFORE the run's status
+read in `Publish` (so a slow read only shortens the budget below, never
+starts it after the run's terminal commit). A live-routed push carries a
+`livePublishPrePushBudget` (2 minutes): once that much time has passed
+since `routedAt`, the push is refused rather than sent. Independently of
+that budget, every push — live or terminal — writes a durable
+`checkpoint_publish_attempts` row (migration 00267, draft number) BEFORE
+the forge call: the branch, ref and tip the push would set, keyed to the
+run. The row is cleared only on a KNOWN outcome: a definitive refusal
+(nothing landed), or a successful push whose tip is persisted
+(`runs.checkpoint_tip`) and tracked on the run's retention record. A row
+whose outcome the api never learned, or whose landed tip no record tracks,
+stays.
+
+The sweeper's attempts arm (part of `ReconcileCheckpointRetentions`)
+compares the branch ref actually on origin against outstanding attempt
+rows for terminal runs. Under the run's retention lock it either
+re-records the landed tip on the run's retention record — compare-and-set
+against the tip the arm itself read immediately before listing origin, so
+it never overwrites a newer publish or another reconciliation — or, once
+no custody hold of the run is open, CAS-deletes the branch ref at exactly
+that tip (the run's slot was handed to a newer run, and no hold still needs
+the ref as its only copy). While a hold IS open, the arm leaves the ref in
+place and re-records instead: the newer run's checkpoints keep being
+refused `not_descendant` until that hold releases, the same cost the
+stuck-supersession exit already accepts elsewhere in this design. The
+publish path's own tip persist and record track are themselves
+compare-and-set against what the push observed immediately before its
+forge call, so a write that arrives late can never move either backwards
+over a newer publish or the sweeper's own re-record.
+
+`TestLatePublishLandsAfterCoolingLiveDB`
+(`api/internal/workersvc/checkpoint_publish_attempt_livedb_test.go`) drives
+a remote update that lands after the cooling window has already elapsed
+and asserts it cannot leave a permanently untracked branch ref. The cooling
+period is kept — it still reduces how often a late push and a
+supersession's recovery-ref create overlap in the first place — but is now
+documented as a delay that narrows exposure, not as the mechanism that
+proves the window safe; the durable attempt record and its CAS
+reconciliation are that mechanism.
+
+Two residuals remain, both documented rather than closed: while a custody
+hold stays open over a re-recorded late push, a newer run's checkpoints on
+that branch keep taking `not_descendant` skips until the hold releases; and
+an attempt row is retired after `publishAttemptHorizon` (7 days) or dropped
+with its run, so a push that lands on origin after either point still
+leaves an untracked branch ref for a human to clear.
+
+### The sweeper's retention pass is now time-bounded (rework round 2)
+
+`ReconcileCheckpointRetentions` previously ran each of its arms to
+completion with no time budget, so a slow or hung forge could stall the
+rest of that Sweep tick indefinitely. It now runs under a `retentionPass`:
+a pass-wide budget (`retentionPassBudget`, 30s) checked before starting
+each record, in every arm, never mid-record; each record's locked
+operation runs under an op timeout (`retentionSweepOpTimeout`, 60s) rather
+than the publish path's 2-minute `retentionOpTimeout`. The bound is a
+documented relation, not a derivation: 60s fits the longest locked
+operation (a superseding record's re-drive, five forge calls) on a slow
+but healthy forge answering in about 10s per call. Sizing it to five calls
+at the broker's 30s per-call ceiling (160s) would let one record hold the
+sweeper's single goroutine for minutes on every tick it is due. A forge
+slower than about 12s per call makes a sweeper re-drive time out; the
+record backs off, every re-drive step is idempotent against origin (what
+completed stays done, though a re-drive repeats each call), with no
+custody hold open the next pass takes the three-call stuck exit, and the
+publish path's own re-drive runs under its 2-minute bound. A record cut off
+by its own deadline still runs its failure bookkeeping and releases its
+lock on un-cancelled contexts, so a hung forge call is recorded as a
+failure and backed off rather than left holding the lock. All of one
+operation's bookkeeping after its deadline shares a single 10s window past
+that deadline, and the expiry bookkeeping writes nothing unless a fresh
+fence re-check shows the lock is still held. The step's own failure write
+after a forge call that ran into the deadline is not fenced: a lock lost
+during that call can still see that one write, guarded only on the
+record's state. Per the code's own accounting, the worst case for the
+retention pass is `retentionPassBudget + retentionSweepOpTimeout + 3 × 10s
+= 30s + 60s + 30s = 120s` (the bookkeeping window, the unlock, the
+connection teardown). That bounds the pass, not the whole Sweep tick: the
+tick's other passes add to it, so the margin under the sweeper health
+beat's danger line of ten 15s default intervals (150s) is thinner than the
+pass bound alone suggests. Any records or arms the pass could not reach are left
+for the next tick, logged once per pass rather than per record. The pass's
+four forge-calling arms (work, unheld, audit, attempts) also rotate which
+arm runs first each pass, so a burst of slow records in one arm cannot
+starve the arms after it across many consecutive passes.
+
+### Empty pack, not "pack-less" (amends the PRD's D2)
+
+The PRD's D2 describes the recovery-ref create as "pack-less", since the
+object is already on the remote and nothing new needs to be sent. In
+practice `git receive-pack` requires a pack for any non-delete command, even
+an empty one (a zero-object pack is the smallest legal payload), so the
+push broker's new CAS ref-create primitive (M2) sends an empty pack rather
+than omitting one.
+
+### Settlement and the sweeper (M4)
+
+The recovery ref (or the branch ref, if supersession never triggered) is
+deleted, CAS on its recorded tip, once the run's last custody hold is
+released or discarded. Every release and discard writer in
+`api/internal/store/queries/recovery.sql` triggers the settle check after
+its transaction commits. Because that trigger can be lost (a busy lock, a
+full concurrency slot, a crash) or never fire at all (several terminal
+writers besides the original three call sites never touched retention —
+see the PRD's amended Problem statement), the sweeper's
+`ReconcileCheckpointRetentions` pass is the backstop: it retries failed
+deletes with exponential backoff, drives due `superseding` records, settles
+records whose holds have since cleared, backfills a record for any terminal
+run that published a checkpoint but has none (a watermarked scan bounded by
+migration 00265's index), and runs the post-settlement audit described
+above.
+
+## Consequences
+
+- **A checkpoint ref can now persist well past a run's terminal
+  transition**, for as long as its custody holds stay open. This is the
+  point: it is the fix for the data-loss mode PRD #1810 exists to close.
+- **The remaining coverage gap between a terminal writer's commit and the
+  api recording that run's retention is closed (rework round 2).** A
+  database trigger on `runs.status`, not a post-commit Go call, now writes
+  the `checkpoint_retentions` row in the same transaction as every terminal
+  transition, so the seven terminal writers that never called the original
+  Go retention path (see the PRD's amended Problem statement) can no longer
+  leave a window where a new run's `claimCheckpointSlot` sees no record for
+  the old run at all.
+- **The sweeper's retention reconciliation pass is now time-bounded
+  (rework round 2)**, trading unbounded work per tick (previously able to
+  stall on a hung forge) for a documented worst case per retention pass
+  (~120s, before the rest of the Sweep tick) and leftover work that carries
+  to the next tick under load.
+- **A publish that finds its tip already on origin counts only for the
+  run's own persisted tip (landing review, 2026-09-28).** The broker's
+  already-current short-circuit writes nothing, so its success proves only
+  that origin holds the tip. Counted as published, a new run could record
+  another run's ref at the same SHA (a `settling` record's ref, or a late
+  push the attempts arm deletes) as its durable checkpoint, and that run's
+  CAS delete, matching the SHA, removed it. `publishOutcome` now answers the
+  benign `not_descendant` skip unless the tip equals the run's persisted
+  `runs.checkpoint_tip`, read immediately before the push; an outstanding
+  attempt row is not proof, since it is written before its push. A resumed
+  run re-declaring its own tip still succeeds (PRD #1030 M1). The cost: a
+  run whose only unpublished tip is another run's gets skips until its
+  first commit or until that ref goes.
+- **Runs that went terminal before this migration are not backfilled.**
+  The backfill arm starts at `checkpoint_retention_meta.enabled_at`, and
+  the terminal trigger cannot record a transition that already happened.
+  A pre-migration failed run that still has an open custody hold and a
+  surviving branch ref (the sweeper failure paths never deleted theirs) has
+  no record, so a new run on the branch neither supersedes nor preserves
+  it: a descendant publish fast-forwards over it (the old tip stays
+  reachable as an ancestor) and a divergent one is refused, both as before
+  this change. Recover such a run with `uzi run export` or its preserved
+  patch.
+- **The api's forge-write surface for checkpoints grows**: a create-ref
+  primitive alongside the existing publish/delete (ADR-0122), still CAS,
+  still never forced.
+- **A per-run advisory lock plus a fence plus a scheduled audit is more
+  machinery than a row lock**, but it is what the "intent commits before
+  any forge write, and forge writes never race a lost lock" invariant
+  actually requires; see the PRD's D2 amendment above for why the simpler
+  design does not work.
+- **Residual 1 (terminal-at-read publish) is closed (2026-09-28) by
+  serializing a terminal run's own publish under its retention lock**
+  (above): a publish that `Publish` routes as terminal at its status read
+  can no longer land *inside* a supersession of that same run —
+  `publishTerminalLocked` holds the same lock a supersession of it would
+  need, across the check, the push and the track.
+- **Residual 2 is closed (2026-09-28, rework round 2) by a durable
+  pre-push record and sweeper reconciliation, not by the cooling period
+  alone.** A run that reads as **live** at the moment its own `Publish`
+  call starts — so it takes the unlocked live-run path rather than
+  `publishTerminalLocked` — can still turn terminal (a concurrent cancel or
+  completion) while that unlocked push is still in flight, and its push can
+  still land on origin after a supersession has already moved the branch
+  slot on. What closes the window is not the five-minute cooling period
+  (kept only as a delay that narrows how often this is even reachable) but
+  `checkpoint_publish_attempts`: a row written before every push, a
+  2-minute pre-push budget on a live-routed push, and a sweeper arm that
+  compares the branch ref actually on origin against outstanding attempt
+  rows for terminal runs and CAS re-records or CAS-deletes accordingly (see
+  the mechanism section above). Two residuals remain from this fix, both
+  documented rather than closed: a re-recorded late push under an open
+  custody hold costs a newer run `not_descendant` skips until that hold
+  releases, and an attempt row past its 7-day horizon, or one whose run no
+  longer exists, is no longer reconciled — a push that lands after either
+  point still leaves an untracked branch ref for a human to clear.
+- **A remaining known residual (tip lag), by design, rather than closed
+  with a primitive the push broker does not have:** in the tip-lag case —
+  the record's recorded tip lags what the run itself later published, and
+  that later tip is not the run's own persisted `checkpoint_tip` either —
+  a stuck supersession's exit leaves the branch ref for a human, because
+  nothing in the record can prove ownership of a tip it never recorded.
+  Moving the ref instead of leaving it for a human would need a
+  CAS-*update* primitive the push broker does not have.
+- **New residual (2026-09-28): a stuck `superseding` record blocks a new
+  live run's checkpoints entirely, not just the one publish that hit it,
+  for as long as the record stays in backoff.** `claimCheckpointSlot`
+  treats a record still in its retry backoff as `not_descendant` and
+  refuses the new run's push outright; its list is bounded (`LIMIT 10`)
+  as well. This is not sweeper-only: once a record's backoff expires, the
+  very next publish on the branch re-drives it inline through the same
+  `claimCheckpointSlot` path, no sweeper tick required. That frees the
+  new run only when the cause was transient (a forge error); a persistent
+  cause (the branch is not at the recorded tip, a recovery ref at another
+  tip) fails the re-drive the same way and restarts the backoff, so the
+  new run stays blocked until the old run's holds all release and the
+  sweeper's stuck-exit path (`exitStuckSupersessionLocked`) clears the
+  record.
+- **The live-settle ancestry proof (PRD #1349/#1751,
+  `ReleasePredecessorCustodyHoldByLiveAncestry`) is unchanged.** It only
+  runs against a *live* run's checkpoint or branch head, and a retention
+  record is only ever created for a *terminal* run, so the two do not in
+  practice meet — the PRD's D3 test expecting the live-settle reader to
+  accept a recovery ref was dropped as dormant rather than implemented.
+
+## References
+
+- [PRD #1810](../prds/1810-retain-failed-run-checkpoint-ref.md)
+- [ADR-0122](0122-checkpoint-push-broker.md) — the push broker's CAS,
+  never-forced invariant this ADR extends to a second ref namespace.

@@ -1,0 +1,373 @@
+package workersvc
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/vtmocanu/uzi/api/internal/pushbroker"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
+	"github.com/vtmocanu/uzi/api/internal/secretscrub"
+	"github.com/vtmocanu/uzi/api/internal/store"
+)
+
+// PRD #1810 M3 (D2): SUPERSESSION. A new issue run on the same branch needs the checkpoint slot
+// a retained ref of an older run still occupies (its first publish is refused not_descendant).
+// The old tip is MOVED, never deleted: under the OLD run's retention lock the api
+//
+//  1. persists the intent (retained -> superseding, recovery_ref = refs/uzi-recovery/<run id>)
+//     before any forge write;
+//  2. creates the recovery ref at the recorded tip (CAS Old = zero, an empty zero-object pack);
+//  3. CAS-deletes the branch ref at that tip;
+//  4. marks the record superseded (or, with no open custody hold, settling) in one statement,
+//     and a settling record's recovery ref is CAS-deleted under the same lock.
+//
+// The whole operation, forge calls included, runs under the one lock, and every forge write is
+// preceded by beforeRetentionWrite (the test hook, then the fence). A crash at any point leaves
+// the tip under at least one recorded ref; ReconcileCheckpointRetentions re-drives a
+// `superseding` record from step 2, and every step is idempotent.
+
+// supersessionWired reports whether supersession can run: every retention seam plus the ref
+// create and list seams.
+func (s *Service) supersessionWired() bool {
+	return s.retentionWired() && s.createRefFn != nil && s.listRefTipsFn != nil
+}
+
+// claimCheckpointSlot is Publish's pre-push branch-slot check (PRD #1810 D2). A publish that
+// DESCENDS from an older run's retained tip is a fast-forward the broker accepts, so waiting for a
+// not_descendant refusal (freeCheckpointSlot) would leave that run's record `retained` at a tip
+// that is no longer the branch tip. Before any forge push, an issue run therefore lists the OTHER
+// runs' records holding (retained) or handing off (superseding) the branch ref, and returns the
+// skip label Publish must answer with instead of pushing, or "" to proceed:
+//
+//   - no such record, or the run is ineligible (not an issue run, no repo, supersession not
+//     wired): "" (proceed, the pre-#1810 behaviour);
+//   - a TERMINAL run: "superseded" while any such record exists. A terminal run must never
+//     evict another run's retention, nor fast-forward over it;
+//   - a LIVE run: each record is superseded (supersedeRetainedCheckpoint, under the record's own
+//     run's retention lock) and "" is returned only when every one freed the branch ref. A busy
+//     lock or slot, a supersession that did not free, or a record still in its retry backoff (a
+//     stopped supersession is not re-driven on every publish tick, only once its backoff expires;
+//     the sweeper retries it too) is "not_descendant": the push is refused and the worker retries
+//     on its next tick.
+//
+// A list error is also "not_descendant": whether another run's record holds the slot is then
+// unknown, and pushing could fast-forward over a retained tip and leave its record stale, while
+// refusing costs one best-effort checkpoint that the worker retries next tick.
+func (s *Service) claimCheckpointSlot(ctx context.Context, run store.Run, branch string) string {
+	if run.Kind != runkind.Issue || !run.RepoID.Valid || !s.supersessionWired() {
+		return ""
+	}
+	rows, err := s.q.ListActiveCheckpointRetentionsForBranch(ctx, store.ListActiveCheckpointRetentionsForBranchParams{
+		RepoID: uuid.UUID(run.RepoID.Bytes), Branch: branch, ExcludeRunID: run.ID, Ref: checkpointRefPrefix + branch,
+	})
+	if err != nil {
+		slog.Warn("checkpoint retention: list active branch records; publish refused", "run", run.ID, "branch", branch, "error", err)
+		return "not_descendant"
+	}
+	if len(rows) == 0 {
+		return ""
+	}
+	if terminalStatuses[run.Status] {
+		return "superseded"
+	}
+	now := time.Now()
+	for _, r := range rows {
+		if r.NextAttemptAt.Valid && r.NextAttemptAt.Time.After(now) {
+			return "not_descendant"
+		}
+		freed, acquired, err := s.supersedeRetainedCheckpoint(ctx, r.RunID)
+		if err != nil {
+			slog.Warn("checkpoint retention: supersede", "run", r.RunID, "for_run", run.ID, "error", secretscrub.Scrub(err.Error()))
+		}
+		if !acquired || !freed {
+			return "not_descendant"
+		}
+	}
+	return ""
+}
+
+// freeCheckpointSlot is Publish's not_descendant follow-up (PRD #1810 D2), the fallback behind
+// claimCheckpointSlot for the records that check does not drive (a settling record, a record that
+// appeared after the check, a race with another writer): for an issue run it
+// looks for OTHER runs' records still holding the branch's checkpoint ref, newest first, and
+// supersedes them one at a time until one frees the ref. It reports true only when a record
+// freed the branch ref, so the caller retries its publish once. A busy lock (another instance
+// or the sweeper is working the record) or a full retention slot stops the search: the caller
+// returns today's not_descendant skip and the worker retries on its next tick.
+//
+// Only a LIVE run may trigger it: GetRunOwnedByWorker (Publish's ownership read) has no status
+// filter, so a worker still bound to a completed, failed or cancelled run could otherwise evict
+// a NEWER run's retained checkpoint to make room for a publish nobody will ever resume.
+func (s *Service) freeCheckpointSlot(ctx context.Context, run store.Run, branch string) bool {
+	if run.Kind != runkind.Issue || !run.RepoID.Valid || terminalStatuses[run.Status] || !s.supersessionWired() {
+		return false
+	}
+	ref := checkpointRefPrefix + branch
+	rows, err := s.q.ListCheckpointRetentionsForBranch(ctx, store.ListCheckpointRetentionsForBranchParams{
+		RepoID: uuid.UUID(run.RepoID.Bytes), Branch: branch, ExcludeRunID: run.ID, Ref: ref,
+	})
+	if err != nil {
+		slog.Warn("checkpoint retention: list branch records", "run", run.ID, "branch", branch, "error", err)
+		return false
+	}
+	for _, r := range rows {
+		freed, acquired, err := s.supersedeRetainedCheckpoint(ctx, r.RunID)
+		if err != nil {
+			slog.Warn("checkpoint retention: supersede", "run", r.RunID, "for_run", run.ID, "error", secretscrub.Scrub(err.Error()))
+		}
+		if !acquired {
+			return false
+		}
+		if freed {
+			return true
+		}
+	}
+	return false
+}
+
+// supersedeRetainedCheckpoint runs one supersession attempt for runID's record under the run's
+// retention lock (try semantics; withRetentionLock detaches from ctx and applies its own
+// deadline, so a caller's short request timeout cannot cancel it between steps). freed reports
+// that the record no longer holds the branch checkpoint ref; acquired is false when the lock or
+// a concurrency slot was busy (nothing ran). A panic from the go-git seams is recovered into err:
+// the sweeper and the publish handler must survive a hostile forge response.
+func (s *Service) supersedeRetainedCheckpoint(ctx context.Context, runID uuid.UUID) (freed, acquired bool, err error) {
+	if !s.supersessionWired() {
+		return false, false, nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("supersession panicked: %s", secretscrub.Scrub(fmt.Sprint(r)))
+		}
+	}()
+	acquired, err = s.withRetentionLock(ctx, runID, func(ctx context.Context, fence func(context.Context) error) error {
+		var ferr error
+		freed, ferr = s.supersedeLocked(ctx, runID, fence)
+		return ferr
+	})
+	return freed && acquired, acquired, err
+}
+
+// supersedeLocked re-reads the record under the lock and dispatches on the state it finds. That
+// switch is the first layer only: every transition it leads to is ALSO guarded in SQL on the
+// expected state (and, for the intent, on the tip), so a record another writer moved between this
+// read and a later write moves zero rows. Both layers exist; the SQL guards are the backstop.
+func (s *Service) supersedeLocked(ctx context.Context, runID uuid.UUID, fence func(context.Context) error) (bool, error) {
+	row, err := s.q.GetCheckpointRetention(ctx, runID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read record: %w", err)
+	}
+	branchRef := checkpointRefPrefix + row.Branch
+	switch row.State {
+	case retentionRetained:
+		if row.Ref != branchRef {
+			return false, nil
+		}
+		n, err := s.q.BeginCheckpointSupersession(ctx, store.BeginCheckpointSupersessionParams{
+			RunID: runID, RecoveryRef: pushbroker.RecoveryRefPrefix + runID.String(), Tip: row.Tip,
+			Cooling: pgtype.Interval{Microseconds: s.checkpointSupersessionCooling.Microseconds(), Valid: true},
+		})
+		if err != nil {
+			return false, fmt.Errorf("record supersession intent: %w", err)
+		}
+		if n == 0 {
+			// The run is still inside its cooling period (checkpointSupersessionCooling: a push
+			// routed while it was live may still land and advance this record), the tip advanced
+			// (a late publish), or the record moved on. Nothing is written, so no backoff: the
+			// caller answers not_descendant and the next publish tick re-reads.
+			return false, nil
+		}
+		if row, err = s.q.GetCheckpointRetention(ctx, runID); err != nil {
+			return false, fmt.Errorf("re-read record: %w", err)
+		}
+		if row.State != retentionSuperseding {
+			return false, nil
+		}
+	case retentionSuperseding:
+	case retentionSettling:
+		if row.Ref != branchRef {
+			return true, nil // settling a recovery ref: the branch slot is already free
+		}
+		// No hold is open: settle it the ordinary way, deleting the branch ref CAS on its tip.
+		// No recovery ref is created for a record nobody needs any more.
+		return s.deleteSettlingRef(ctx, row, fence)
+	default:
+		return row.Ref != branchRef, nil
+	}
+	return s.driveSupersession(ctx, row, fence)
+}
+
+// driveSupersession runs steps 2-4 for a `superseding` record. Every step is idempotent, so a
+// re-drive after a crash repeats the completed ones harmlessly.
+func (s *Service) driveSupersession(ctx context.Context, row store.CheckpointRetention, fence func(context.Context) error) (bool, error) {
+	runID := row.RunID
+	branchRef := checkpointRefPrefix + row.Branch
+	recoveryRef := pushbroker.RecoveryRefPrefix + runID.String()
+	if !row.RecoveryRef.Valid || row.RecoveryRef.String != recoveryRef {
+		return false, fmt.Errorf("superseding record names recovery ref %q, want %q", row.RecoveryRef.String, recoveryRef)
+	}
+	f, problem, gone := s.forgeForRetention(ctx, runID)
+	if gone {
+		problem = "run, repository or forge connection no longer exists"
+	}
+	if problem != "" {
+		return false, s.recordRetentionFailure(ctx, row, retentionSuperseding, problem)
+	}
+
+	// Step 2: the recovery ref at the recorded tip.
+	if err := s.beforeRetentionWrite(ctx, runID, "create", fence); err != nil {
+		return false, err
+	}
+	cerr := s.createRefFn(ctx, pushbroker.CreateRefOptions{
+		CloneURL: f.cloneURL, Username: f.username, PAT: f.pat, Ref: recoveryRef, Tip: row.Tip, SourceRef: branchRef,
+	})
+	switch {
+	case cerr == nil, errors.Is(cerr, pushbroker.ErrRefExistsAtTip):
+	case errors.Is(cerr, pushbroker.ErrRefExists):
+		return false, s.recordRetentionFailure(ctx, row, retentionSuperseding,
+			"recovery ref exists at another tip; branch ref left in place")
+	case errors.Is(cerr, pushbroker.ErrSourceMissing):
+		proceed, freed, err := s.resolveMissingSource(ctx, row, f, branchRef, recoveryRef)
+		if !proceed {
+			return freed, err
+		}
+	default:
+		return false, s.recordRetentionFailure(ctx, row, retentionSuperseding,
+			"create recovery ref: "+scrubForgeError(cerr.Error(), f.pat))
+	}
+
+	// Step 3: free the branch ref, CAS on the tip. Absent or advanced by another run is done.
+	if err := s.beforeRetentionWrite(ctx, runID, "delete-branch", fence); err != nil {
+		return false, err
+	}
+	if derr := s.deleteCheckpointFn(ctx, pushbroker.DeleteOptions{
+		CloneURL: f.cloneURL, Branch: row.Branch, Ref: branchRef, Username: f.username, PAT: f.pat, ExpectedOldTip: row.Tip,
+	}); derr != nil {
+		return false, s.recordRetentionFailure(ctx, row, retentionSuperseding,
+			"delete branch ref: "+scrubForgeError(derr.Error(), f.pat))
+	}
+	// The CAS delete reports success for "absent or advanced" too. Advanced by THIS run would not
+	// be done: the branch ref at a later tip of the run, which the record does not name, would be
+	// left untracked by a superseded record, blocking every new run on the branch. A publish that
+	// Publish routed as TERMINAL holds this same retention lock from its superseded check through
+	// its track (publishTerminalLocked). One routed LIVE is sent only within its pre-push budget,
+	// and the cooling period keeps this supersession from starting until such a push has had time
+	// to land and be tracked; the list below is the backstop for what those delays cannot rule
+	// out: a push of unknown outcome that the forge applies late, a tip persist that lagged, and a
+	// ref written outside Publish.
+	if stop, err := s.branchHeldByOwnPublish(ctx, row, f, branchRef); stop || err != nil {
+		return false, err
+	}
+
+	// Step 4: superseded (a hold is open) or straight to settling (none is), one statement.
+	state, err := s.q.MarkCheckpointSuperseded(ctx, runID)
+	if err != nil {
+		// The branch ref is free either way; a record left superseding is re-driven.
+		return true, fmt.Errorf("mark superseded: %w", err)
+	}
+	slog.Info("checkpoint retention: superseded", "run", runID, "branch", row.Branch, "recovery_ref", recoveryRef, "state", state)
+	if state != retentionSettling {
+		return true, nil
+	}
+	// No hold is open: the recovery ref is owed its CAS delete now, under the same lock.
+	settling, err := s.q.GetCheckpointRetention(ctx, runID)
+	if err != nil {
+		return true, fmt.Errorf("re-read record: %w", err)
+	}
+	if settling.State != retentionSettling {
+		return true, nil
+	}
+	if _, err := s.deleteSettlingRef(ctx, settling, fence); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+// branchHeldByOwnPublish is step 3's follow-up list. It reports stop when origin
+// still advertises the branch ref at the recorded tip (the delete did not take) or at
+// a tip of THIS run's own (a later publish of the run). The record then stays
+// superseding with last_error and a backoff: a re-drive repeats steps 2-3 harmlessly, and once no
+// hold is open the stuck exit (exitStuckSupersessionLocked) CAS-deletes the recovery ref at the
+// recorded tip and the branch ref at the run's own tip. An absent branch ref, or one at any other
+// tip (another run's publish), is done, as before. The run's own tips are read AFTER the list.
+//
+// A tip is the run's own when it is runs.checkpoint_tip or a tip the run ATTEMPTED to push and has
+// not accounted for (checkpoint_publish_attempts, written before every push), so a push whose tip
+// persist lags, or whose outcome the api never learned, is still recognised here.
+//
+// Only a record of a TERMINAL run is ever superseded. A publish Publish routes as terminal runs its
+// superseded check, push and record track under this run's retention lock (publishTerminalLocked),
+// which the supersession holds throughout. A publish routed LIVE is sent only within its pre-push
+// budget and the supersession waits out the cooling period first, so an ordinary in-flight push has
+// landed and been tracked before this runs. The list stays as the backstop for what those delays
+// cannot rule out: a push of unknown outcome the forge applies late, a delayed tip persist, and a
+// ref written outside Publish. A push that lands after this list is left to the sweeper's attempts
+// arm (reconcilePublishAttempts).
+func (s *Service) branchHeldByOwnPublish(ctx context.Context, row store.CheckpointRetention, f retentionForge, branchRef string) (stop bool, err error) {
+	tips, lerr := s.listRefTipsFn(ctx, pushbroker.ListRefsOptions{CloneURL: f.cloneURL, Username: f.username, PAT: f.pat}, branchRef)
+	if lerr != nil {
+		return true, s.recordRetentionFailure(ctx, row, retentionSuperseding, "list branch ref after delete: "+scrubForgeError(lerr.Error(), f.pat))
+	}
+	tip, ok := tips[branchRef]
+	if !ok {
+		return false, nil
+	}
+	if tip != row.Tip {
+		own, oerr := s.ownPublishedTip(ctx, row.RunID, tip)
+		if oerr != nil {
+			return true, oerr
+		}
+		if !own {
+			return false, nil // another run's publish: the slot left this record
+		}
+	}
+	return true, s.recordRetentionFailure(ctx, row, retentionSuperseding,
+		"branch ref still holds this run's own tip after the delete (a late publish landed); left in place")
+}
+
+// resolveMissingSource disambiguates CreateRef's ErrSourceMissing (origin does not advertise the
+// branch ref at the recorded tip) by listing both refs once:
+//
+//   - the recovery ref at the tip: an earlier attempt created it and crashed; proceed to step 3;
+//   - the recovery ref at another tip: stop, branch ref untouched;
+//   - the branch ref at a different tip (checkpoint_tip lagged a later publish of the same run,
+//     or another writer moved it): stop, the record kept for a later attempt;
+//   - neither ref: nothing uzi owns holds the tip any more; the record closes as deleted.
+//
+// freed is meaningful only when proceed is false.
+func (s *Service) resolveMissingSource(ctx context.Context, row store.CheckpointRetention, f retentionForge, branchRef, recoveryRef string) (proceed, freed bool, err error) {
+	tips, lerr := s.listRefTipsFn(ctx, pushbroker.ListRefsOptions{CloneURL: f.cloneURL, Username: f.username, PAT: f.pat}, branchRef, recoveryRef)
+	if lerr != nil {
+		return false, false, s.recordRetentionFailure(ctx, row, retentionSuperseding, "list refs: "+scrubForgeError(lerr.Error(), f.pat))
+	}
+	rec, recOK := tips[recoveryRef]
+	_, brOK := tips[branchRef]
+	switch {
+	case recOK && rec == row.Tip:
+		return true, false, nil
+	case recOK:
+		return false, false, s.recordRetentionFailure(ctx, row, retentionSuperseding,
+			"recovery ref exists at another tip; branch ref left in place")
+	case brOK:
+		return false, false, s.recordRetentionFailure(ctx, row, retentionSuperseding,
+			"branch ref is not at the recorded tip (checkpoint tip lag or another writer); left in place")
+	}
+	const note = "origin holds the recorded tip under neither the branch ref nor the recovery ref"
+	bctx, cancel := retentionBookkeepingCtx(ctx)
+	defer cancel()
+	if _, err := s.q.SetCheckpointSupersessionTipGone(bctx, store.SetCheckpointSupersessionTipGoneParams{RunID: row.RunID, LastError: note}); err != nil {
+		return false, true, fmt.Errorf("mark tip gone: %w", err)
+	}
+	slog.Warn("checkpoint retention: "+note+"; record closed", "run", row.RunID, "branch", row.Branch, "tip", row.Tip)
+	return false, true, nil
+}

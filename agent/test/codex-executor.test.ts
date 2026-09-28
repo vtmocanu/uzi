@@ -40,7 +40,7 @@ import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
 import { selectCodexBinding, CodexSelectionError, type CodexBinding } from "../src/codex/select.js";
 import type { CodexLaunchRootResult, CodexProviderConfig } from "../src/codex/codex-harness.js";
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "../src/codex/registry.js";
-import { createCodexExecutionSafety } from "../src/codex/safety.js";
+import { CodexBoundaryError, createCodexExecutionSafety } from "../src/codex/safety.js";
 import type { FileopHelperHandle } from "../src/codex/fileop-client.js";
 import type {
   CodexAdviceLaunchResult,
@@ -57,6 +57,8 @@ import type { RunContext, EmittedMessage, Executor, WallParkOutcome } from "../s
 import { PauseNowSignal } from "../src/steering.js";
 import { scanSignals } from "../src/signals.js";
 import { PR_SUMMARY_GUIDANCE } from "../src/prompt.js";
+import { ENV_PROBE_SCRIPT, EnvProbeCleanupError } from "../src/env-probe.js";
+import type { SpawnCommandOptions } from "../src/codex/broker.js";
 import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary-fixture.js";
 import type { Logger } from "../src/log.js";
 import type { DockerWiring } from "../src/docker-wiring.js";
@@ -160,14 +162,14 @@ interface ResponderCtx {
 type Responder = (c: ResponderCtx) => unknown;
 
 class FakeTransport implements CodexTransport {
-  requests: { method: string; params: unknown; opts?: { signal?: AbortSignal } }[] = [];
+  requests: { method: string; params: unknown; opts?: { signal?: AbortSignal; deadlineMs?: number } }[] = [];
   responses: { requestId: number | string; response: unknown }[] = [];
   notifies: { method: string; params: unknown }[] = [];
   closes = 0;
   threadStartCount = 0;
   turnStartCount = 0;
   /** When set for a method, request() returns THIS (rejects/pends) instead of the responder. */
-  requestOverride?: (c: ResponderCtx, opts?: { signal?: AbortSignal }) => Promise<unknown> | undefined;
+  requestOverride?: (c: ResponderCtx, opts?: { signal?: AbortSignal; deadlineMs?: number }) => Promise<unknown> | undefined;
 
   private readonly queue: CodexNotification[] = [];
   private ended = false;
@@ -199,7 +201,7 @@ class FakeTransport implements CodexTransport {
     return this;
   }
 
-  request<T = unknown>(method: string, params?: unknown, opts?: { signal?: AbortSignal }): Promise<T> {
+  request<T = unknown>(method: string, params?: unknown, opts?: { signal?: AbortSignal; deadlineMs?: number }): Promise<T> {
     this.requests.push({ method, params, opts });
     // The pinned app-server auth handshake (createCodexAppServerAuth → authenticate): answer
     // initialize + account/login/start here so EVERY responder (and requestOverride) is free of
@@ -447,6 +449,8 @@ interface Rig {
   effectDisposes: () => number;
   providerLaunches: () => number;
   sessionOps: { adopt: number; removeCalls: number; inspect: number; persist: number };
+  /** Issue #1866 M2: the environment probes makeExecutor answered for this rig. */
+  probeCalls: ProbeCall[];
   deps: CodexExecutorDeps;
 }
 
@@ -538,21 +542,43 @@ function makeRig(opts: { responder?: Responder; token?: string } = {}): Rig {
     effectDisposes: () => effectDisposes,
     providerLaunches: () => providerLaunches,
     sessionOps,
+    probeCalls: [],
     deps,
   };
 }
 
+// Issue #1866 M2: every run probes its command environment once through the epoch's command seam
+// before the first turn. The shared rigs answer that probe (an all-ok probe line) ahead of the
+// test's own seam, so a seam that waits on its gate or abort signal does not hold the run's start,
+// and records it in `probeCalls` (never in `spawnCommandCalls`, which stays the model's commands).
+const PROBE_OK_STDOUT = `${JSON.stringify({ uzi_envprobe: 1, proc: "ok", home: "ok", tmp: "ok" })}\n`;
+function isEnvProbe(argv: readonly string[]): boolean {
+  return argv.length === 3 && argv[1] === "-e" && argv[2] === ENV_PROBE_SCRIPT;
+}
+type ProbeCall = { argv: readonly string[]; opts: SpawnCommandOptions };
+function answerEnvProbe(
+  seam: NonNullable<CodexExecutorDeps["spawnCommand"]>,
+  probeCalls?: ProbeCall[],
+): NonNullable<CodexExecutorDeps["spawnCommand"]> {
+  return async (argv, opts) => {
+    if (!isEnvProbe(argv)) return seam(argv, opts);
+    probeCalls?.push({ argv, opts });
+    return { code: 0, stdout: PROBE_OK_STDOUT, stderr: "" };
+  };
+}
+
 function makeExecutor(
-  rig: { client: FakeClient; deps: CodexExecutorDeps },
+  rig: { client: FakeClient; deps: CodexExecutorDeps; probeCalls?: ProbeCall[] },
   binding: CodexBinding,
   log: Logger = noopLog,
   dockerWiring?: DockerWiring,
 ): CodexExecutor {
+  const seam = rig.deps.spawnCommand;
   return new CodexExecutor(
     log,
     "/data/agent-home/run-1",
     { binding, client: rig.client as never, provider, dockerWiring },
-    rig.deps,
+    seam ? { ...rig.deps, spawnCommand: answerEnvProbe(seam, rig.probeCalls) } : rig.deps,
   );
 }
 
@@ -574,6 +600,8 @@ interface MultiRig {
   sessionOps: { adopt: number; removeCalls: number; inspect: number; persist: number };
   providerLaunches: () => number;
   effectDisposes: () => number;
+  /** Issue #1866 M2: the environment probes makeExecutor answered for this rig. */
+  probeCalls: ProbeCall[];
   deps: CodexExecutorDeps;
 }
 function makeMultiEpochRig(responders: Responder[], opts: { token?: string } = {}): MultiRig {
@@ -594,6 +622,10 @@ function makeMultiEpochRig(responders: Responder[], opts: { token?: string } = {
       (epoch.transport as unknown as { launchAuthMode?: string }).launchAuthMode = authMode;
       return { root: epoch.root, transport: epoch.transport, supervisorPid: 1000 + providerLaunches };
     },
+    // Issue #1866 M2: an injected command seam, so the run-start environment probe (answered by
+    // makeExecutor, see answerEnvProbe) never launches a command root over this rig's fake
+    // supervisor, whose streams never end. No multi-epoch test issues a model command.
+    spawnCommand: async () => ({ code: 0, stdout: "ok", stderr: "" }),
     launchEffectRoot: async (_spec: CodexEffectLaunchSpec): Promise<CodexRootHandle> => {
       const stdin = new PassThrough();
       const stdout = new PassThrough();
@@ -634,6 +666,7 @@ function makeMultiEpochRig(responders: Responder[], opts: { token?: string } = {
     sessionOps,
     providerLaunches: () => providerLaunches,
     effectDisposes: () => effectDisposes,
+    probeCalls: [],
     deps,
   };
 }
@@ -3978,7 +4011,9 @@ describe("CodexExecutor — in-process approved plan drives implement (#1586)", 
         return approve;
       },
     });
-    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1586 pre-approved run");
+    // Issue #1866 M2: Docker wired + the rig's all-ok probe ⇒ no environment-facts block, so the
+    // prompt stays byte-exact below.
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, { dockerHost: "tcp://docker:2375" }).run(ctx), 5000, "#1586 pre-approved run");
 
     assert.equal(gateCalls, 0, "a pre-approved resume skips the in-process gate");
     const texts = turnTexts(rig.epochs[0]!.transport);
@@ -4010,14 +4045,18 @@ describe("CodexExecutor: new-root resume + session lifecycle (m4)", () => {
       }),
     ]);
     let exec!: CodexExecutor;
+    const sinks: unknown[] = [];
     const { ctx } = makeCtx({
       checkpoint: async (opts) => {
+        sinks.push(opts.sink);
         // Faithfully mirror the runner: reap the CURRENT epoch's roots through withBoundary.
         if (opts.reap) await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
       },
     });
     exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
     const result = await withTimeout(exec.run(ctx), 5000, "m4-1 run");
+    // Issue #1864: the milestone checkpoint names its sink, so a boundary failure there says so.
+    assert.deepEqual(sinks, ["milestone_checkpoint"], "the milestone checkpoint is labelled milestone_checkpoint");
 
     assert.equal(result.branch, "agent/issue-42", "the run resolved on the NEW root's signal_done");
     assert.equal(rig.providerLaunches(), 2, "the checkpoint reap recreated a fresh provider epoch");
@@ -4025,6 +4064,179 @@ describe("CodexExecutor: new-root resume + session lifecycle (m4)", () => {
     assert.ok(rig.epochs[0]!.disposed() >= 1, "epoch 0 was fully disposed on recreation");
     assert.equal(rig.epochs[1]!.transport.turnStartCount, 1, "the next implement turn ran on the NEW root");
     assert.ok(rig.epochs[1]!.transport.requests.some((r) => r.method === "thread/resume"), "the new epoch resumed the prior session");
+  });
+
+  // Issue #1864: a spawn_agent delegation still open when the lead turn finishes must be
+  // cancelled at turn end, so the next reap:true checkpoint's quiesce sees its effects settled
+  // instead of timing out on a child that would otherwise run to the child-turn deadline.
+  describe("open delegation at lead turn end (issue #1864)", () => {
+    const delegationAgents: AgentTemplate[] = [
+      { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [] },
+    ];
+
+    async function runOpenDelegation(shellHonoursAbort: boolean, interruptNeverAnswers = false): Promise<{
+      outcome: { ok: true; branch: string } | { ok: false; error: unknown };
+      shellObservedAbort: boolean;
+      interruptsDelivered: unknown[];
+      checkpointRegistry: ExecutionRegistry | undefined;
+      registryStateAfterBoundary: string | undefined;
+      rig: MultiRig;
+      releaseShell: () => void;
+    }> {
+      const interruptsDelivered: unknown[] = [];
+      // Epoch 0: the root turn delegates; the CHILD turn (started on the same transport) issues a
+      // shell callback. The root's checkpoint + terminal are pushed by the test only once the
+      // child's shell effect is running.
+      const epoch0: Responder = (c) => {
+        if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) {
+            c.transport
+              .push(threadStarted("th-1"))
+              .push(toolCall(1, "spawn_agent", { subagent_type: "coder", description: "[m1] open", prompt: "p" }, "th-1", "tn-1", "c-spawn"));
+            return { turn: { id: "tn-1" } };
+          }
+          c.transport.push(toolCall(11, "uzi_bash", { command: "sleep 60" }, "th-child", "tn-child", "cc-bash"));
+          return { turn: { id: "tn-child" } };
+        }
+        return {};
+      };
+      const rig = makeMultiEpochRig([
+        epoch0,
+        epochResponder("resumed-1", "tn-2", (t, th, tn) => {
+          t.push(toolCall(2, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
+        }),
+      ]);
+      // Mirror transport.ts: a request whose signal is already aborted is rejected before send.
+      rig.epochs[0]!.transport.requestOverride = (c, o) => {
+        if (o?.signal?.aborted) {
+          return Promise.reject(new CodexTransportError({ category: "aborted", message: "codex transport request aborted before send" }));
+        }
+        if (c.method === "turn/interrupt") {
+          interruptsDelivered.push(c.params);
+          // A provider that never answers the interrupt: only the request's own deadline (as in
+          // transport.ts) ends it.
+          if (interruptNeverAnswers && rec(c.params).threadId === "th-child") {
+            const deadlineMs = o?.deadlineMs;
+            if (deadlineMs === undefined) return new Promise(() => {});
+            return new Promise((_resolve, reject) => {
+              setTimeout(
+                () => reject(new CodexTransportError({ category: "timeout", message: "codex transport request deadline exceeded" })),
+                deadlineMs,
+              ).unref();
+            });
+          }
+        }
+        return undefined;
+      };
+      // A short boundary budget (and hence a short child-interrupt bound) for the never-answering case.
+      if (interruptNeverAnswers) rig.deps = { ...rig.deps, boundaryDeadlineMs: 200 };
+      let shellStarted = false;
+      let shellObservedAbort = false;
+      let releaseShell!: () => void;
+      const shellGate = new Promise<void>((r) => {
+        releaseShell = r;
+      });
+      rig.deps = {
+        ...rig.deps,
+        spawnCommand: async (_argv, opts) => new Promise((resolve) => {
+          shellStarted = true;
+          void shellGate.then(() => resolve({ code: 0, stdout: "late", stderr: "" }));
+          if (!shellHonoursAbort) return;
+          const settle = (): void => {
+            shellObservedAbort = true;
+            resolve({ code: 137, stdout: "", stderr: "" });
+          };
+          if (opts.signal?.aborted) settle();
+          else opts.signal?.addEventListener("abort", settle, { once: true });
+        }),
+      };
+      let exec!: CodexExecutor;
+      let checkpointRegistry: ExecutionRegistry | undefined;
+      let registryStateAfterBoundary: string | undefined;
+      const { ctx } = makeCtx({
+        agents: delegationAgents,
+        checkpoint: async (opts) => {
+          if (!opts.reap) return;
+          const safety = exec.safety!;
+          checkpointRegistry = (safety as unknown as { registry?: ExecutionRegistry }).registry;
+          try {
+            await safety.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+          } finally {
+            registryStateAfterBoundary = checkpointRegistry?.state();
+          }
+        },
+      });
+      exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const runP = exec.run(ctx).then(
+        (r) => ({ ok: true as const, branch: r.branch }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      await waitFor(() => shellStarted, "child shell effect start");
+      rig.epochs[0]!.transport
+        .push(toolCall(3, "checkpoint", {}, "th-1", "tn-1", "c-ckpt"))
+        .push(turnCompleted("completed", "th-1", "tn-1"));
+      const outcome = await withTimeout(runP, 4000, "open-delegation run");
+      return { outcome, shellObservedAbort, interruptsDelivered, checkpointRegistry, registryStateAfterBoundary, rig, releaseShell };
+    }
+
+    it("(a) the turn-end cancel aborts the child's shell, so the reap:true checkpoint quiesces and the run recreates the epoch", async () => {
+      const r = await runOpenDelegation(true);
+      r.releaseShell();
+      assert.equal(r.outcome.ok, true, r.outcome.ok ? "" : `run failed: ${String((r.outcome as { error: unknown }).error)}`);
+      if (r.outcome.ok) assert.equal(r.outcome.branch, "agent/issue-42");
+      assert.equal(r.shellObservedAbort, true, "the child's shell effect saw its abort at lead turn end");
+      assert.equal(r.rig.providerLaunches(), 2, "the checkpoint reap recreated a fresh provider epoch");
+      assert.ok(r.checkpointRegistry, "the checkpoint boundary's registry is observable");
+      assert.equal(r.checkpointRegistry!.inFlightCallbackCount(), 0, "no callback was left in flight across the boundary");
+    });
+
+    it("(b) a callback that ignores the signal stays fail-closed: the checkpoint quiesce fails with unsettled reservations", async () => {
+      const r = await runOpenDelegation(false);
+      try {
+        assert.equal(r.outcome.ok, false, "the run failed at the checkpoint boundary");
+        const err = (r.outcome as { error: unknown }).error;
+        assert.ok(err instanceof CodexBoundaryError, `got ${String(err)}`);
+        assert.equal(err.stage, "quiesce");
+        assert.ok(
+          err.errors.some((e) => /callback\/child-turn reservation\(s\) unsettled/.test(e.message)),
+          JSON.stringify(err.errors),
+        );
+        assert.equal(r.shellObservedAbort, false);
+        assert.equal(r.rig.providerLaunches(), 1, "no fresh epoch was launched past the failed boundary");
+        assert.equal(r.registryStateAfterBoundary, "poisoned", "the failed quiesce poisoned the registry");
+      } finally {
+        r.releaseShell();
+      }
+    });
+
+    it("(c) the child turn/interrupt is actually sent on the turn-end cancel (not rejected on the already-aborted child signal)", async () => {
+      const r = await runOpenDelegation(true);
+      r.releaseShell();
+      assert.equal(r.outcome.ok, true);
+      assert.deepEqual(
+        r.interruptsDelivered.filter((p) => rec(p).threadId === "th-child"),
+        [{ threadId: "th-child", turnId: "tn-child" }],
+        "the child interrupt reached the transport",
+      );
+      const interrupt = r.rig.epochs[0]!.transport.requests.find(
+        (q) => q.method === "turn/interrupt" && rec(q.params).threadId === "th-child",
+      );
+      assert.equal(interrupt?.opts?.signal, undefined, "the interrupt carries no (already-aborted) signal");
+      assert.ok(
+        typeof interrupt?.opts?.deadlineMs === "number" && interrupt.opts.deadlineMs > 0 && interrupt.opts.deadlineMs <= 5_000,
+        `the interrupt is bounded well below the boundary budget: ${String(interrupt?.opts?.deadlineMs)}`,
+      );
+    });
+
+    it("(d) a provider that never answers the child turn/interrupt still lets the checkpoint quiesce inside its boundary", async () => {
+      const r = await runOpenDelegation(true, true);
+      r.releaseShell();
+      assert.equal(r.outcome.ok, true, r.outcome.ok ? "" : `run failed: ${String((r.outcome as { error: unknown }).error)}`);
+      assert.equal(r.interruptsDelivered.filter((p) => rec(p).threadId === "th-child").length, 1, "the interrupt was sent");
+      assert.equal(r.rig.providerLaunches(), 2, "the checkpoint reap recreated a fresh provider epoch");
+    });
   });
 
   it("(m4-1 fail-old) a checkpoint withBoundary reap PERMANENTLY closes the registry, so reusing it for the next provider root is DENIED (recreation REQUIRES a fresh registry)", async () => {
@@ -5777,6 +5989,10 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     /** The timeoutMs each removal was given. */
     removeTimeouts: number[];
     holder: FakeHolder;
+    /** Issue #1866 M2: the run-start environment probe's command root, launched through the same
+     *  production seam but kept out of `specs`/`events` (and the index-keyed options), so each
+     *  test still reads its own model commands from index 1. Always a clean fake root. */
+    probeSpecs: CodexEffectLaunchSpec[];
   }
   function cacheRig(opts: {
     startFails?: boolean;
@@ -5791,6 +6007,7 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     const events: string[] = [];
     const removals: string[] = [];
     const removeTimeouts: number[] = [];
+    const probeSpecs: CodexEffectLaunchSpec[] = [];
     const holder = fakeHolder(events, opts.holderResult);
     rig.deps = {
       ...rig.deps,
@@ -5811,6 +6028,10 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
         return { state: "removed", reason: "" };
       },
       launchEffectRoot: async (spec: CodexEffectLaunchSpec): Promise<CodexRootHandle> => {
+        if (spec.args.includes(ENV_PROBE_SCRIPT)) {
+          probeSpecs.push(spec);
+          return effectHandle(false);
+        }
         const index = specs.length;
         specs.push(spec);
         events.push(`launch:${spec.args[spec.args.indexOf("--") + 1] ?? "?"}:${spec.args.includes("--cache") ? "cache" : "nocache"}`);
@@ -5818,7 +6039,7 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
         return effectHandle(opts.unclean?.(index, spec) ?? false);
       },
     };
-    return { rig, specs, events, removals, removeTimeouts, holder };
+    return { rig, specs, events, removals, removeTimeouts, holder, probeSpecs };
   }
 
   /** The sandbox flags before `--`. */
@@ -6332,11 +6553,12 @@ describe("Codex completion interlock", () => {
   it("checkpoints before the server attempt and reworks on the same thread", async () => {
     const rig = makeMultiEpochRig([firstEpoch(1), doneEpoch(2)]);
     const order: string[] = [];
+    const sinks: unknown[] = [];
     let count = 0;
     const { ctx } = makeCtx({
       kind: "issue", completionInterlock: true,
       frozenMilestones: [{ id: "m2", title: "Remaining" }],
-      checkpoint: async (opts) => { assert.equal(opts.reap, true); order.push("checkpoint"); },
+      checkpoint: async (opts) => { assert.equal(opts.reap, true); sinks.push(opts.sink); order.push("checkpoint"); },
       worktreeFingerprint: async () => { order.push("fingerprint"); return "head-1\n M x"; },
       recordCompletionAttempt: async (args) => {
         order.push("attempt");
@@ -6347,6 +6569,8 @@ describe("Codex completion interlock", () => {
     const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "completion rework");
     assert.equal(result.completionHeld, undefined);
     assert.deepEqual(order, ["checkpoint", "fingerprint", "attempt", "checkpoint", "fingerprint", "attempt"]);
+    // Issue #1864: each done-with-interlock checkpoint names its sink.
+    assert.deepEqual(sinks, ["done_checkpoint", "done_checkpoint"], "the done checkpoint is labelled done_checkpoint");
     assert.equal(rig.providerLaunches(), 2);
     assert.equal(rig.epochs[0]!.disposed(), 1);
     assert.ok(rig.sessionOps.persist >= 2);
@@ -8250,5 +8474,369 @@ describe("CodexExecutor: vault_locked deferral (issue #1766)", () => {
     assert.equal(executor.safety, undefined);
     assert.ok(rig.effectDisposes() >= 1, "the fileop root was launched and disposed");
     assert.deepEqual(await executor.settleForCredentialFreeCapture(100), { kind: "observed_empty" });
+  });
+});
+
+// ================================================================================
+// Issue #1866 M2 — the run-start environment probe on the Codex harness. The probe runs ONCE,
+// through epoch 0's registered command seam, before any turn; its facts are cached for the whole
+// run (a recreated epoch never probes again); an unconfirmed cleanup fails the run before any turn.
+describe("CodexExecutor: run-start environment probe (issue #1866 M2)", () => {
+  const probeLine = (proc: string, home: string, tmp: string): string =>
+    `${JSON.stringify({ uzi_envprobe: 1, proc, home, tmp })}\n`;
+  const turnTexts = (t: FakeTransport): string[] =>
+    t.requests
+      .filter((r) => r.method === "turn/start")
+      .map((r) => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "");
+  const FACTS_HEADER = "Environment facts for this run";
+  const statusTexts = (emitted: EmittedMessage[]): string[] =>
+    emitted
+      .filter((m) => m.kind === "status")
+      .map((m) => String((m.payload as { text?: unknown }).text ?? ""))
+      .filter((t) => t.startsWith("environment facts"));
+  // Built directly (not through makeExecutor) so the test's own seam sees the probe.
+  const executorWith = (
+    rig: { client: FakeClient; deps: CodexExecutorDeps },
+    deps: Partial<CodexExecutorDeps>,
+    dockerWiring?: DockerWiring,
+  ): CodexExecutor =>
+    new CodexExecutor(
+      noopLog,
+      "/data/agent-home/run-1",
+      { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider, dockerWiring },
+      { ...rig.deps, ...deps },
+    );
+  const approve = { kind: "approve", selection: { source: "own", agents: [] } } as never;
+  const planEpoch = (plan: string): Responder => (c) => {
+    if (c.method === "thread/start") return { thread: { id: "th-plan" } };
+    if (c.method === "turn/start") {
+      c.transport
+        .push(threadStarted("th-plan"))
+        .push(toolCall(1, "submit_plan", { plan_md: plan }, "th-plan", "tn-plan", "c-plan"))
+        .push(turnCompleted("completed", "th-plan", "tn-plan"));
+      return { turn: { id: "tn-plan" } };
+    }
+    return {};
+  };
+  /** A fake command root for the probe over the PRODUCTION seam: prints `stdout` when waited on;
+   *  `unclean` makes its dispose unconfirmed, so the registry's reap fails and poisons it. */
+  const probeRoot = (opts: { stdout?: string; unclean?: boolean }): CodexRootHandle => {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let ended = false;
+    return {
+      started: { event: "started", supervisorPid: 70, childPid: 71, subreaper: true, nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+      supervisorPid: 70,
+      transport: { stdin: new PassThrough(), stdout, stderr },
+      snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+      waitChild: async () => {
+        if (opts.stdout !== undefined) stdout.write(opts.stdout);
+        return { event: "child_exit", code: 0 };
+      },
+      dispose: async (): Promise<DisposeOutcome> => {
+        if (!ended) { ended = true; stdout.end(); stderr.end(); }
+        return opts.unclean
+          ? { clean: false, reason: "dispose unconfirmed" }
+          : { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } };
+      },
+      failed: undefined,
+      whenFailed: new Promise<Error>(() => undefined),
+    };
+  };
+
+  it("probes once through the epoch's command seam before the first turn, and every prompt carries the cached facts across epoch recreations", async () => {
+    const PLAN = "PLAN-ENV-1866";
+    const rig = makeMultiEpochRig([
+      planEpoch(PLAN),
+      // Implement epoch A: a cooperative checkpoint, NOT done → persist, reap, recreate.
+      epochResponder("resumed-a", "tn-impl-a", (t, th, tn) => {
+        t.push(toolCall(71, "checkpoint", {}, th, tn, "c-ckpt")).push(turnCompleted("completed", th, tn));
+      }),
+      // Implement epoch B (the NEW root): done.
+      epochResponder("resumed-b", "tn-impl-b", (t, th, tn) => {
+        t.push(toolCall(72, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const turnsSoFar = (): number => rig.epochs.reduce((n, e) => n + e.transport.turnStartCount, 0);
+    const probes: { argv: readonly string[]; opts: SpawnCommandOptions; turnsBefore: number; launches: number }[] = [];
+    const { ctx, emitted } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      checkpoint: async () => undefined,
+      gatePlan: async () => approve,
+    });
+    const result = await withTimeout(
+      executorWith(rig, {
+        spawnCommand: async (argv, opts) => {
+          if (isEnvProbe(argv)) {
+            probes.push({ argv, opts, turnsBefore: turnsSoFar(), launches: rig.providerLaunches() });
+            return { code: 0, stdout: probeLine("limited", "ok", "ok"), stderr: "" };
+          }
+          return { code: 0, stdout: "ok", stderr: "" };
+        },
+      }).run(ctx),
+      5000,
+      "#1866 probe run",
+    );
+
+    assert.equal(result.branch, "agent/issue-42");
+    assert.equal(rig.providerLaunches(), 3, "plan epoch + implement epoch + the recreated NEW root");
+    assert.equal(probes.length, 1, "exactly one probe for the whole run, despite two epoch recreations");
+    const probe = probes[0]!;
+    assert.deepEqual([...probe.argv], [process.execPath, "-e", ENV_PROBE_SCRIPT], "the fixed probe argv");
+    assert.equal(probe.turnsBefore, 0, "the probe ran before the first turn/start");
+    assert.equal(probe.launches, 0, "on epoch 0, before its provider root is even launched (the harness launches it lazily at the first turn)");
+    assert.equal(probe.opts.cwd, WORKSPACE);
+    assert.equal(probe.opts.env?.TMPDIR, "/run/runner-tmp", "the seam forces the run's command env");
+    assert.equal(probe.opts.env?.NODE_OPTIONS, undefined);
+    assert.ok(probe.opts.signal instanceof AbortSignal, "the probe is bounded by its own signal");
+
+    const plan = turnTexts(rig.epochs[0]!.transport);
+    const implA = turnTexts(rig.epochs[1]!.transport);
+    const implB = turnTexts(rig.epochs[2]!.transport);
+    assert.equal(plan.length, 1);
+    assert.equal(implA.length, 1);
+    assert.equal(implB.length, 1, "the continuation turn ran on the recreated epoch");
+    for (const [label, text] of [["plan", plan[0]!], ["implement", implA[0]!], ["new-root implement", implB[0]!]] as const) {
+      assert.ok(text.includes(FACTS_HEADER), `${label}: carries the facts block`);
+      assert.ok(text.includes("through your command sandbox on the codex harness"), `${label}: codex wording`);
+      assert.ok(text.includes("- /proc cannot be enumerated from your commands."), `${label}: the cached proc fact`);
+      assert.ok(text.includes("- Docker is not wired on this worker"), `${label}: the docker fact`);
+    }
+    assert.ok(implB[0]!.includes(`<approved_plan>\n${PLAN}\n</approved_plan>`), "the new-root prompt is still the gated plan");
+    assert.deepEqual(
+      statusTexts(emitted),
+      ["environment facts (codex): /proc limited; $HOME ok; $TMPDIR ok; docker not wired"],
+      "one worker status line names the facts",
+    );
+  });
+
+  it("a pre-approved resume (no plan turn) still probes, and the implement prompt carries the facts", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    // The turn count each probe saw, recorded in the seam and asserted after the run: a throw
+    // inside the seam would be swallowed into a not-verified probe, never fail the test.
+    const turnsAtProbe: number[] = [];
+    const { ctx, emitted } = makeCtx();
+    await withTimeout(
+      executorWith(rig, {
+        spawnCommand: async (argv) => {
+          if (isEnvProbe(argv)) {
+            turnsAtProbe.push(rig.transport.turnStartCount);
+            return { code: 0, stdout: probeLine("ok", "limited", "ok"), stderr: "" };
+          }
+          return { code: 0, stdout: "ok", stderr: "" };
+        },
+      }, { dockerHost: "tcp://docker:2375" }).run(ctx),
+      3000,
+      "#1866 pre-approved run",
+    );
+    assert.deepEqual(turnsAtProbe, [0], "one probe, before the implement turn");
+    assert.equal(rig.transport.turnStartCount, 1, "the implement turn then ran");
+    const [impl] = turnTexts(rig.transport);
+    assert.ok(impl!.startsWith("the approved plan"), "the pre-approved implement prompt");
+    assert.ok(impl!.includes("- A command's own private $HOME is not writable."));
+    assert.ok(impl!.includes("each command gets its own private $HOME and $TMPDIR, which do not persist between commands"));
+    assert.ok(!impl!.includes("Docker is not wired"), "Docker wired: no docker line");
+    assert.deepEqual(statusTexts(emitted), ["environment facts (codex): /proc ok; $HOME limited; $TMPDIR ok; docker wired"]);
+  });
+
+  it("all ok with Docker wired: no facts block and no status line", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx, emitted } = makeCtx();
+    await withTimeout(
+      makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, { dockerHost: "tcp://docker:2375" }).run(ctx),
+      3000,
+      "#1866 all-ok run",
+    );
+    assert.equal(rig.probeCalls.length, 1, "the probe still ran");
+    const [impl] = turnTexts(rig.transport);
+    assert.equal(impl, `the approved plan\n\n${PR_SUMMARY_GUIDANCE}`, "byte-identical to a run without facts");
+    assert.deepEqual(statusTexts(emitted), []);
+  });
+
+  it("a clean probe timeout (\"command aborted\", registry unpoisoned) yields not-verified facts in the plan prompt", async () => {
+    const rig = makeMultiEpochRig([
+      planEpoch("PLAN-X"),
+      epochResponder("resumed-a", "tn-impl-a", (t, th, tn) => {
+        t.push(toolCall(72, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    let aborted = false;
+    const { ctx, emitted } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan: async () => approve });
+    await withTimeout(
+      executorWith(rig, {
+        envProbeTimeoutMs: 30,
+        spawnCommand: async (argv, opts) => {
+          if (!isEnvProbe(argv)) return { code: 0, stdout: "ok", stderr: "" };
+          // The default seam's abort path: the root is reaped cleanly, then it throws.
+          await new Promise<void>((resolve) => opts.signal?.addEventListener("abort", () => resolve(), { once: true }));
+          aborted = true;
+          throw new Error("command aborted");
+        },
+      }).run(ctx),
+      5000,
+      "#1866 probe-timeout run",
+    );
+    assert.equal(aborted, true, "the probe's own bound aborted it");
+    const [plan] = turnTexts(rig.epochs[0]!.transport);
+    assert.ok(plan!.includes("- /proc enumeration: could not be confirmed."));
+    assert.ok(plan!.includes("- $HOME writability: not verified."));
+    assert.ok(plan!.includes("- $TMPDIR writability: not verified."));
+    assert.deepEqual(statusTexts(emitted), [
+      "environment facts (codex): /proc not verified; $HOME not verified; $TMPDIR not verified; docker not wired",
+    ]);
+  });
+
+  it("the seam's \"did not reap cleanly\" error fails the run with EnvProbeCleanupError before any turn", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan: async () => approve });
+    await assert.rejects(
+      withTimeout(
+        executorWith(rig, {
+          spawnCommand: async (argv) => {
+            if (isEnvProbe(argv)) throw new Error("command supervisor root did not reap cleanly");
+            return { code: 0, stdout: "ok", stderr: "" };
+          },
+        }).run(ctx),
+        3000,
+        "#1866 unreaped probe run",
+      ),
+      (err: unknown) => err instanceof EnvProbeCleanupError && /cleanup of the probe process could not be confirmed/.test(err.message),
+    );
+    assert.equal(rig.transport.turnStartCount, 0, "no turn ever started");
+  });
+
+  /** Run `body` while recording every registry that reserves a `command` root launch (the
+   *  epoch's fileop root and, on the production seam, the probe's), restoring the prototype
+   *  afterwards. */
+  const withCommandRegistries = async (body: (registries: Set<ExecutionRegistry>) => Promise<void>): Promise<void> => {
+    const reserveLaunch = ExecutionRegistry.prototype.reserveLaunch;
+    const registries = new Set<ExecutionRegistry>();
+    const record = (registry: ExecutionRegistry): void => { registries.add(registry); };
+    ExecutionRegistry.prototype.reserveLaunch = function (kind) {
+      if (kind === "command") record(this);
+      return reserveLaunch.call(this, kind);
+    };
+    try {
+      await body(registries);
+    } finally {
+      ExecutionRegistry.prototype.reserveLaunch = reserveLaunch;
+    }
+  };
+
+  it("a probe root whose reap is unconfirmed poisons the epoch registry and fails the run before any turn (production seam)", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const baseLaunch = rig.deps.launchEffectRoot!;
+    let probeLaunches = 0;
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan: async () => approve });
+    await withCommandRegistries(async (registries) => {
+      await assert.rejects(
+        withTimeout(
+          executorWith(rig, {
+            // The PRODUCTION command seam (makeDefaultSpawnCommand) over a faked supervisor.
+            spawnCommand: undefined,
+            launchEffectRoot: async (spec, deadlineMs) => {
+              if (!spec.args.includes(ENV_PROBE_SCRIPT)) return baseLaunch(spec, deadlineMs);
+              probeLaunches += 1;
+              return probeRoot({ stdout: probeLine("ok", "ok", "ok"), unclean: true });
+            },
+          }).run(ctx),
+          3000,
+          "#1866 poisoned probe run",
+        ),
+        EnvProbeCleanupError,
+      );
+      assert.equal(registries.size, 1, "one epoch registry reserved command roots (fileop and probe)");
+      assert.equal([...registries][0]!.isPoisoned(), true, "the unconfirmed reap poisoned the epoch registry");
+    });
+    assert.equal(probeLaunches, 1, "the probe launched as a registered command root");
+    assert.equal(rig.transport.turnStartCount, 0, "no turn ever started");
+    assert.equal(rig.providerLaunches(), 0, "no provider root ever launched (no turn, no epoch recreation)");
+  });
+
+  it("a probe root refused registry admission poisons the registry and fails the run before any turn, though the seam's error is not the unreaped one (production seam)", async () => {
+    // The registry's own admission refusal (a kind mismatch here) poisons it and makes the seam
+    // throw "command root failed registry admission", not "did not reap cleanly", after a
+    // best-effort dispose whose outcome is discarded. Only the spawner's isPoisoned() check
+    // turns that into a failed cleanup; without it the probe would read as clean, not verified.
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const baseLaunch = rig.deps.launchEffectRoot!;
+    let probeLaunches = 0;
+    const seamErrors: string[] = [];
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan: async () => approve });
+    // Set by the probe's launch, so only the probe root's admission (the very next registerRoot)
+    // is refused; the epoch's fileop root registers as a command root too.
+    let refuseNextAdmission = false;
+    const registerRoot = ExecutionRegistry.prototype.registerRoot;
+    ExecutionRegistry.prototype.registerRoot = function (reservation, root) {
+      if (!refuseNextAdmission) return registerRoot.call(this, reservation, root);
+      refuseNextAdmission = false;
+      const result = registerRoot.call(this, reservation, { ...root, kind: "boundary_action" });
+      if (!result.ok) seamErrors.push(result.error.message);
+      return result;
+    };
+    try {
+      await withCommandRegistries(async (registries) => {
+        await assert.rejects(
+          withTimeout(
+            executorWith(rig, {
+              spawnCommand: undefined,
+              launchEffectRoot: async (spec, deadlineMs) => {
+                if (!spec.args.includes(ENV_PROBE_SCRIPT)) return baseLaunch(spec, deadlineMs);
+                probeLaunches += 1;
+                refuseNextAdmission = true;
+                return probeRoot({ stdout: probeLine("ok", "ok", "ok"), unclean: true });
+              },
+            }).run(ctx),
+            3000,
+            "#1866 refused-admission probe run",
+          ),
+          (err: unknown) => err instanceof EnvProbeCleanupError && /poisoned/.test(err.message),
+        );
+        assert.equal(registries.size, 1, "one epoch registry reserved command roots (fileop and probe)");
+        assert.equal([...registries][0]!.isPoisoned(), true, "the refused admission poisoned the epoch registry");
+      });
+    } finally {
+      ExecutionRegistry.prototype.registerRoot = registerRoot;
+    }
+    assert.deepEqual(seamErrors, ["registerRoot: root kind does not match reservation"], "the registry refused the probe root");
+    assert.equal(probeLaunches, 1);
+    assert.equal(rig.transport.turnStartCount, 0, "no turn ever started");
+    assert.equal(rig.providerLaunches(), 0, "no provider root ever launched");
+  });
+
+  it("the production seam measures a clean probe root's output", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const baseLaunch = rig.deps.launchEffectRoot!;
+    const probeSpecs: CodexEffectLaunchSpec[] = [];
+    const { ctx } = makeCtx();
+    await withTimeout(
+      executorWith(rig, {
+        spawnCommand: undefined,
+        launchEffectRoot: async (spec, deadlineMs) => {
+          if (!spec.args.includes(ENV_PROBE_SCRIPT)) return baseLaunch(spec, deadlineMs);
+          probeSpecs.push(spec);
+          return probeRoot({ stdout: probeLine("ok", "ok", "limited") });
+        },
+      }).run(ctx),
+      3000,
+      "#1866 production-seam probe run",
+    );
+    assert.equal(probeSpecs.length, 1);
+    const spec = probeSpecs[0]!;
+    const flags = spec.args.slice(0, spec.args.indexOf("--"));
+    const tmp = flags[flags.indexOf("--tmp") + 1];
+    assert.equal(spec.env.HOME, tmp, "the probe measures the per-command private HOME");
+    assert.equal(spec.env.TMPDIR, tmp, "and the per-command private TMPDIR");
+    assert.equal(spec.env.NODE_OPTIONS, undefined);
+    assert.equal(spec.env.NODE_PATH, undefined);
+    const [impl] = turnTexts(rig.transport);
+    assert.ok(impl!.includes("- A command's own private $TMPDIR is not writable."));
   });
 });

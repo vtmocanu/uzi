@@ -248,6 +248,9 @@ func (s *Service) SettlePredecessorHold(ctx context.Context, wkr store.Worker, r
 	if n == 1 {
 		slog.Info("recovery settle: released predecessor hold by ancestry", "run", runID.String(), "hold", holdID.String(),
 			"predecessor_generation", req.PredecessorGeneration, "successor_generation", req.SuccessorGeneration)
+		// PRD #1810 D3: if that was the run's last open hold, its retained checkpoint ref is now
+		// owed its CAS delete (the statement above committed on its own).
+		s.SettleRetainedCheckpoint(runID)
 		return released(head), nil
 	}
 	// Zero rows: something moved between the proof and the write. Released ONLY when a

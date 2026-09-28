@@ -817,12 +817,15 @@ chain in the diagram above, with no intervening `running`.
   heartbeat-staleness (bounded by `WORKER_AFFINITY_CEILING`). Independently, the
   forge-checkpoint `pushbroker.Publish` no longer fails when `main` advanced past
   the clone base (a server-side compare-and-swap on the fetched checkpoint tip),
-  publish outcomes now surface on the run feed, and a worker-reported terminal
-  transition (`SetState`) or a server-side cancel/reject attempts tip-fenced
-  checkpoint cleanup on the run's `refs/uzi-checkpoints/<branch>`; a
-  sweeper-driven terminal transition (timeout, worker-lost-over-cap) does not:
-  it only broadcasts the status, leaving that ref in place. See
+  and publish outcomes now surface on the run feed. See
   [ADR-628](adr/0628-cross-worker-resume-durability.md)'s #1030 amendment.
+  The best-effort terminal-transition delete this amendment first added was
+  superseded by [PRD #1810](prds/1810-retain-failed-run-checkpoint-ref.md): the
+  ref is not deleted at any terminal transition while a custody hold
+  stays open on the run (any writer, sweeper-driven included), and a new run
+  needing the same branch slot moves the old tip to a per-run
+  `refs/uzi-recovery/<run-id>` ref rather than deleting or overwriting it. See
+  [ADR-1810](adr/1810-checkpoint-retention-follows-custody.md).
   This same affinity leg is what lets a **paused** run's `resume` fall open
   to a different worker once the pinned one is stale or gone; see
   [ADR-1190](adr/1190-run-pause-invariants.md).

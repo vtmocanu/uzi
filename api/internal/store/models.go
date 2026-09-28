@@ -116,6 +116,43 @@ type BrandingAsset struct {
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
+type CheckpointPublishAttempt struct {
+	ID          uuid.UUID          `json:"id"`
+	RunID       uuid.UUID          `json:"run_id"`
+	Branch      string             `json:"branch"`
+	Ref         string             `json:"ref"`
+	Tip         string             `json:"tip"`
+	AttemptedAt pgtype.Timestamptz `json:"attempted_at"`
+	NextCheckAt pgtype.Timestamptz `json:"next_check_at"`
+	Checks      int32              `json:"checks"`
+	LastError   pgtype.Text        `json:"last_error"`
+}
+
+type CheckpointRetention struct {
+	RunID         uuid.UUID          `json:"run_id"`
+	UserID        uuid.UUID          `json:"user_id"`
+	RepoID        uuid.UUID          `json:"repo_id"`
+	Branch        string             `json:"branch"`
+	Tip           string             `json:"tip"`
+	Ref           string             `json:"ref"`
+	RecoveryRef   pgtype.Text        `json:"recovery_ref"`
+	State         string             `json:"state"`
+	Attempts      int32              `json:"attempts"`
+	NextAttemptAt pgtype.Timestamptz `json:"next_attempt_at"`
+	LastError     pgtype.Text        `json:"last_error"`
+	VerifyAfter   pgtype.Timestamptz `json:"verify_after"`
+	VerifiedAt    pgtype.Timestamptz `json:"verified_at"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	SettledAt     pgtype.Timestamptz `json:"settled_at"`
+}
+
+type CheckpointRetentionMetum struct {
+	ID                bool               `json:"id"`
+	EnabledAt         pgtype.Timestamptz `json:"enabled_at"`
+	BackfilledThrough pgtype.Timestamptz `json:"backfilled_through"`
+}
+
 type CiAutofixAttempt struct {
 	RepoID         uuid.UUID          `json:"repo_id"`
 	Ref            string             `json:"ref"`

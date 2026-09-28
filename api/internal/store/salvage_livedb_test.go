@@ -18,7 +18,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// PRD #1867 M2: the live-DB proof of the run_salvage table (migration 00264) and its
+// PRD #1867 M2: the live-DB proof of the run_salvage table (migration 00268) and its
 // queries (queries/salvage.sql): the CHECKs, the RESTRICT live pointer, each state
 // transition, and the sweep's candidate selection. A fake store cannot exhibit any of it.
 //

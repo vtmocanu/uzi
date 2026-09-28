@@ -3,7 +3,6 @@ package pushbroker_test
 import (
 	"context"
 	"crypto/tls"
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/cgi" //nolint:gosec // G504: test-only CGI host for git http-backend on a fixed modern Go toolchain; httpoxy (CVE-2016-5386) affects Go < 1.6.3 only.
@@ -20,7 +19,8 @@ import (
 
 // Regression tests for the forge-credential redirect boundary on every go-git HTTP
 // operation the broker performs: reference listing, fetch, manual receive-pack
-// (publish, CAS delete, salvage create and DeleteRef) and the refspec delete push.
+// (publish, CAS delete, and CreateRef and the CAS Delete of a salvage ref) and the
+// refspec delete push.
 // The remote is a real smart-HTTP server (git http-backend behind an httptest TLS proxy) so each
 // operation's earlier discovery steps succeed and the redirect lands on exactly the
 // request under test; the forbidden destination counts requests and must see ZERO.
@@ -231,36 +231,43 @@ func brokerOps() []brokerOp {
 			}
 		}
 	}
-	// salvageSetup puts a run tip on origin's checkpoint ref over file://, so
-	// CreateSalvageRef creates the salvage ref over the HTTP remote.
-	salvageSetup := func(t *testing.T, f *gitFixture) func(string) error {
+	// salvageCreateSetup puts a run tip on origin's checkpoint ref over file://, so
+	// CreateRef creates the salvage ref (PRD #1867) from it over the HTTP remote: a list,
+	// a receive-pack session, then the read-back list.
+	salvageCreateSetup := func(t *testing.T, f *gitFixture) func(string) error {
 		t.Helper()
 		f.commit("a.txt", "base\n", "base")
 		f.pushMain()
 		tip := f.commit("b.txt", "one\n", "c1")
 		f.git("push", "origin", tip+":refs/uzi-checkpoints/main")
 		return func(u string) error {
-			res, err := pushbroker.CreateSalvageRef(context.Background(), pushbroker.CreateSalvageRefOptions{
-				CloneURL: u, Branch: "main", Tip: tip, RunID: salvageRunID, Username: "uzi-bot", PAT: redirectTestPAT(),
+			return pushbroker.CreateRef(context.Background(), pushbroker.CreateRefOptions{
+				CloneURL: u, Ref: pushbroker.SalvageRef(salvageRunID), Tip: tip, SourceRef: "refs/uzi-checkpoints/main",
+				Username: "uzi-bot", PAT: redirectTestPAT(),
 			})
-			if err == nil && res != pushbroker.SalvageCreated {
-				return fmt.Errorf("create salvage ref = %v, want created", res)
-			}
-			return err
 		}
 	}
-	// deleteRefSetup puts a salvage ref on origin over file:// for DeleteRef to remove.
-	deleteRefSetup := func(t *testing.T, f *gitFixture) func(string) error {
-		t.Helper()
-		f.commit("a.txt", "base\n", "base")
-		f.pushMain()
-		tip := f.commit("b.txt", "one\n", "c1")
-		ref := pushbroker.SalvageRef(salvageRunID)
-		f.git("push", "origin", tip+":"+ref)
-		return func(u string) error {
-			return pushbroker.DeleteRef(context.Background(), pushbroker.DeleteRefOptions{
-				CloneURL: u, Ref: ref, ExpectedOldTip: tip, Username: "uzi-bot", PAT: redirectTestPAT(),
-			})
+	// salvageRefSetup puts a salvage ref on origin over file:// for the salvage CAS Delete
+	// and ListRefTips to reach.
+	salvageRefSetup := func(list bool) func(*testing.T, *gitFixture) func(string) error {
+		return func(t *testing.T, f *gitFixture) func(string) error {
+			t.Helper()
+			f.commit("a.txt", "base\n", "base")
+			f.pushMain()
+			tip := f.commit("b.txt", "one\n", "c1")
+			ref := pushbroker.SalvageRef(salvageRunID)
+			f.git("push", "origin", tip+":"+ref)
+			return func(u string) error {
+				if list {
+					_, err := pushbroker.ListRefTips(context.Background(), pushbroker.ListRefsOptions{
+						CloneURL: u, Username: "uzi-bot", PAT: redirectTestPAT(),
+					}, ref)
+					return err
+				}
+				return pushbroker.Delete(context.Background(), pushbroker.DeleteOptions{
+					CloneURL: u, Ref: ref, ExpectedOldTip: tip, Username: "uzi-bot", PAT: redirectTestPAT(),
+				})
+			}
 		}
 	}
 	return []brokerOp{
@@ -271,11 +278,12 @@ func brokerOps() []brokerOp {
 		{"delete push", "git-receive-pack", 1, deleteSetup(false)},
 		{"cas delete list", "git-upload-pack", 1, deleteSetup(true)},
 		{"cas delete receive-pack", "git-receive-pack", 1, deleteSetup(true)},
-		{"salvage create list", "git-upload-pack", 1, salvageSetup},
-		{"salvage create receive-pack", "git-receive-pack", 1, salvageSetup},
-		{"delete ref list", "git-upload-pack", 1, deleteRefSetup},
-		{"delete ref receive-pack", "git-receive-pack", 1, deleteRefSetup},
-		{"delete ref confirm list", "git-upload-pack", 2, deleteRefSetup},
+		{"salvage create ref list", "git-upload-pack", 1, salvageCreateSetup},
+		{"salvage create ref receive-pack", "git-receive-pack", 1, salvageCreateSetup},
+		{"salvage create ref read-back list", "git-upload-pack", 2, salvageCreateSetup},
+		{"salvage cas delete list", "git-upload-pack", 1, salvageRefSetup(false)},
+		{"salvage cas delete receive-pack", "git-receive-pack", 1, salvageRefSetup(false)},
+		{"salvage list ref tips", "git-upload-pack", 1, salvageRefSetup(true)},
 	}
 }
 

@@ -285,6 +285,60 @@ Codex also screens the shell working directory and uses Landlock where
 available. OS permissions and the worker/runner uid split still apply. The
 existing credential and `.git` restrictions also apply inside scratch.
 
+### Environment facts in the lead's prompt
+
+Before the lead's first turn (the plan turn, or the first implement turn on a
+run with no plan turn, e.g. a pre-approved resume), the worker runs a fixed
+probe it owns (a constant `node -e` script, never a repo script). It measures
+three facts: whether `/proc` can be enumerated (a `/proc` mounted with
+`hidepid` or `subset=` lists entries but hides other processes, so it counts
+as limited), whether the command's actual `$HOME` is writable, and whether its
+actual `$TMPDIR` is writable. A probe
+that times out or fails is reported as "not verified", never as access being
+available.
+
+The timeout and the point in the run differ by harness. On Claude, the probe
+runs as the runner uid with the agent's SDK env — a copy with `NODE_OPTIONS`
+and `NODE_PATH` removed, so nothing outside the fixed script can change what
+it runs — with a 2-second cap, right after tool provisioning finishes and
+before the JS dependency install starts. On Codex, the probe runs through the
+same registered command sandbox the agent's shell commands use, right after
+the first provider epoch starts and before any turn, with a 10-second cap: it
+starts a sandboxed command root, not a bare process, so it needs longer. On
+Codex the result is cached for the run rather than re-measured when the
+provider epoch is recreated, and each Codex command gets its own private
+`$HOME` and `$TMPDIR`, so "writable" there says nothing about what persists
+between commands. Either way, if the worker cannot confirm the probe's own
+process was cleaned up — a check that can add a short bounded wait after a
+timeout — the run fails before that first turn rather than reporting a fact
+it can't stand behind.
+
+The worker also passes through, unprobed, the harness and whether Docker is
+wired — worker configuration, not a measurement. It reports no egress tier:
+the worker receives no egress-tier configuration to pass through.
+
+The facts feed the prompt on a schedule that differs by harness. On Claude,
+the issue plan prompt and the first implement prompt carry them; the CI-fix
+and self-improvement plan prompts do not. On Codex, the plan prompt and each
+regular implement prompt carry them; a completion-rework follow-up or a
+clarification continuation replaces that prompt and does not, relying on the
+same session having already seen the block. The block lists only the limits and "not
+verified" facts it found, plus a Docker-not-wired line when Docker isn't
+wired on this worker — so on a non-Docker worker it appears every run, even
+with every probed fact `ok` — plus a fixed rule: when a gate is blocked by a
+verified limit, the lead records it as not run or blocked, runs the checks
+that remain valid, and names the CI or other test lane that must complete
+validation. A plan needs an **Environment limits** section only when a
+measured fact actually affects its planned validation — a missing `/proc`
+alone does not prove a gate is blocked.
+
+When the block has anything to report, the worker also posts one status
+line to the run's activity summarizing the facts, e.g. `environment facts
+(codex): /proc limited; $HOME ok; $TMPDIR not verified; docker not wired`.
+This is what makes the [uzi-watcher](../.agents/skills/uzi-watcher/SKILL.md)
+plan-trap check for a gate the environment facts affect actionable without
+reading the full transcript.
+
 ## Concurrent runs
 
 By default a worker executes one run at a time. Set `WORKER_MAX_CONCURRENT_RUNS`

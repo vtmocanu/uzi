@@ -337,6 +337,25 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		return res, fmt.Errorf("reconcile custody releases: %w", err)
 	}
 
+	// Checkpoint-retention reconciliation (PRD #1810 M3/M4): backfill terminal runs with no
+	// record, retry failed deletes, settle unheld records whose trigger was lost, re-drive or exit
+	// interrupted supersessions, and audit deleted recovery refs, each record under its run's
+	// retention lock (ReconcileCheckpointRetentions). A per-record error is logged and skipped
+	// inside the pass; unlike the custody pass above, the pass's own error (a candidate-list
+	// read) is logged here and does NOT fail the sweep: the passes below (the recovery upload and
+	// retention expiries among them) must not be starved by a checkpoint-retention fault, and the
+	// next tick retries. The count is reported only for a pass that succeeded. Inert unless the
+	// retention seams are wired. The pass makes forge calls, so it is time-bounded for the same
+	// reason: it starts no record once Service.retentionPassBudget has passed and runs each record
+	// it starts under Service.retentionSweepOpTimeout, leaving the rest for the next tick with a nil
+	// error; its forge-calling arms start from a rotating arm each pass so one slow arm cannot
+	// starve the others (reconcileCheckpointRetentions).
+	if n, rerr := s.ReconcileCheckpointRetentions(ctx); rerr != nil {
+		slog.Error("sweeper: reconcile checkpoint retentions failed", "error", rerr)
+	} else {
+		res.CheckpointRetentionsReconciled = n
+	}
+
 	// Upload-retry-window sweep (PRD #1296 D3/D4): the LIVE consumer of
 	// UZI_RECOVERY_UPLOAD_RETRY_WINDOW. A reserved capture advances to 'available' within
 	// seconds of a healthy upload, so one still non-terminal (preparing/uploading) past the
@@ -701,6 +720,11 @@ func (s *Service) ReconcileCustodyReleases(ctx context.Context) (int64, error) {
 			continue
 		}
 		released += n
+		if n > 0 {
+			// PRD #1810 D3: the release committed; if it was the run's last open hold, its
+			// retained checkpoint ref is now owed its CAS delete.
+			s.SettleRetainedCheckpoint(h.RunID)
+		}
 	}
 	return released, nil
 }

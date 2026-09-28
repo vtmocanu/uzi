@@ -61,6 +61,95 @@ func TestRunRecoveryJSON(t *testing.T) {
 	}
 }
 
+// TestRunRecoveryJSONCheckpointRef (PRD #1810 M3): a hold whose server JSON carries the run's
+// retained checkpoint location (checkpoint_ref/tip/state) round-trips through the DTO into
+// `run recovery --json`, so an agent reads where the work lives on origin (the recovery ref once
+// superseded). A hold without a record omits the keys.
+func TestRunRecoveryJSONCheckpointRef(t *testing.T) {
+	const serverJSON = `{"aggregate":{"open_holds":2,"custody_hold_limit":8,"decision_needed":1,"blocked_runs":0},
+	  "holds":[
+	    {"id":"hold-run1-gen1","run_id":"run1","generation":1,"state":"open","attention":"source_only",
+	     "worker_id":"w1","has_available_capture":false,"created_at":"2026-09-27T10:00:00Z","updated_at":"2026-09-27T10:00:00Z",
+	     "checkpoint_ref":"refs/uzi-recovery/run1","checkpoint_tip":"2222222222222222222222222222222222222222",
+	     "checkpoint_state":"superseded"},
+	    {"id":"hold-run1-gen2","run_id":"run1","generation":2,"state":"open","attention":"active",
+	     "worker_id":"w1","has_available_capture":false,"created_at":"2026-09-27T10:00:00Z","updated_at":"2026-09-27T10:00:00Z"}
+	  ]}`
+	var dto apitypes.RecoveryCustodyHoldsDTO
+	if err := json.Unmarshal([]byte(serverJSON), &dto); err != nil {
+		t.Fatalf("decode server JSON: %v", err)
+	}
+	fc := &uzicli.FakeClient{RecoveryHoldsResult: dto}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", "run1", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	var holds []map[string]any
+	if err := json.Unmarshal([]byte(out), &holds); err != nil {
+		t.Fatalf("run recovery --json is not a hold array: %v\n%s", err, out)
+	}
+	if len(holds) != 2 {
+		t.Fatalf("run recovery --json = %d holds, want 2:\n%s", len(holds), out)
+	}
+	if holds[0]["checkpoint_ref"] != "refs/uzi-recovery/run1" ||
+		holds[0]["checkpoint_tip"] != "2222222222222222222222222222222222222222" ||
+		holds[0]["checkpoint_state"] != "superseded" {
+		t.Errorf("hold 1 checkpoint location = %v/%v/%v, want the recovery ref, its tip and superseded",
+			holds[0]["checkpoint_ref"], holds[0]["checkpoint_tip"], holds[0]["checkpoint_state"])
+	}
+	for _, k := range []string{"checkpoint_ref", "checkpoint_tip", "checkpoint_state"} {
+		if _, ok := holds[1][k]; ok {
+			t.Errorf("hold 2 has no retention record but --json carries %q", k)
+		}
+	}
+}
+
+// TestRunRecoveryRendersCheckpointRef (PRD #1810 M5): the human render names where a hold's
+// retained checkpoint lives on origin, one line per hold carrying a checkpoint ref (ref, the
+// 12-char tip and the retention state), and prints no such line for a hold without one.
+func TestRunRecoveryRendersCheckpointRef(t *testing.T) {
+	dto := recoveryHoldsFixture()
+	dto.Holds = append(dto.Holds, apitypes.RecoveryCustodyHoldDTO{
+		ID: "hold-run1-gen2", RunID: "run1", Generation: 2, State: "open", Attention: "active",
+		WorkerID: "w1", WorkerName: "alpha",
+		CheckpointRef:   "refs/uzi-recovery/run1",
+		CheckpointTip:   "2222222222222222222222222222222222222222",
+		CheckpointState: "superseded",
+	})
+	fc := &uzicli.FakeClient{RecoveryHoldsResult: dto}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", "run1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	const want = "hold hold-run1-gen2 checkpoint: refs/uzi-recovery/run1 @ 222222222222 (superseded)\n"
+	if !strings.Contains(out, want) {
+		t.Errorf("run recovery output missing the checkpoint line %q:\n%s", want, out)
+	}
+	if n := strings.Count(out, "checkpoint:"); n != 1 {
+		t.Errorf("run recovery printed %d checkpoint lines, want 1 (hold-run1-gen1 has no ref):\n%s", n, out)
+	}
+}
+
+// TestRunRecoveryCheckpointLineSanitizes proves the server-supplied checkpoint fields cannot
+// smuggle a newline or an escape sequence into the rendered line.
+func TestRunRecoveryCheckpointLineSanitizes(t *testing.T) {
+	got := checkpointLine(apitypes.RecoveryCustodyHoldDTO{
+		ID:              "h1",
+		CheckpointRef:   "refs/uzi-recovery/r1\nhold forged checkpoint: x",
+		CheckpointTip:   "\x1b[31mabc",
+		CheckpointState: "retained",
+	})
+	if strings.ContainsAny(got, "\n\x1b") {
+		t.Errorf("checkpointLine leaked a control byte: %q", got)
+	}
+	if !strings.HasPrefix(got, "hold h1 checkpoint: refs/uzi-recovery/r1") || !strings.HasSuffix(got, "(retained)") {
+		t.Errorf("checkpointLine = %q, want the sanitized ref and state", got)
+	}
+	if checkpointLine(apitypes.RecoveryCustodyHoldDTO{ID: "h2", CheckpointTip: "abc"}) != "" {
+		t.Error("checkpointLine rendered a line for a hold with no checkpoint ref")
+	}
+}
+
 // TestRunRecoveryEmptyJSON proves --json emits [] (never null) for a run with no holds.
 func TestRunRecoveryEmptyJSON(t *testing.T) {
 	fc := &uzicli.FakeClient{RecoveryHoldsResult: recoveryHoldsFixture()}
@@ -264,6 +353,32 @@ func TestRunDiscardConfirmCancelled(t *testing.T) {
 	}
 	if !strings.Contains(errb, "aborted") {
 		t.Errorf("a declined discard should say it aborted; stderr=%q stdout=%q", errb, out)
+	}
+}
+
+// TestRunDiscardWarnsCheckpointRefDeletion proves both the interactive prompt and the help
+// text say that discarding a run's last open hold also deletes its retained checkpoint ref on
+// the forge (PRD #1810: retention follows custody).
+func TestRunDiscardWarnsCheckpointRefDeletion(t *testing.T) {
+	const want = "last open hold also deletes its retained checkpoint ref on the forge"
+	fc := &uzicli.FakeClient{}
+	env := fakeEnv(fc)
+	env.StdinTTY = true
+	env.Stdin = strings.NewReader("n\n")
+	_, errb, code := runCLI(t, env, "run", "discard", "run1", "--hold", "hold-x")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 on a declined prompt\nstderr=%q", code, errb)
+	}
+	if !strings.Contains(errb, "[y/N]") || !strings.Contains(errb, want) {
+		t.Errorf("prompt should warn about the checkpoint ref; stderr=%q", errb)
+	}
+
+	out, errb, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), "run", "discard", "--help")
+	if code != uzicli.ExitOK {
+		t.Fatalf("help exit = %d, want 0\nstderr=%q", code, errb)
+	}
+	if !strings.Contains(out, "Discard ONE exact custody hold") || !strings.Contains(out, want) {
+		t.Errorf("help should warn about the checkpoint ref; stdout=%q", out)
 	}
 }
 

@@ -403,51 +403,51 @@ path:
 Found by CI, not the uzi worker: the GitHub Actions runner that ran this
 branch's own test suite had a same-uid process (a setgid `ssh-agent`) whose
 `/proc/<pid>/environ` and `cwd` are unreadable to a non-root reader by
-construction; the uzi worker itself did not have one. `scanOnce` (decision 2
-above) treats any runner-uid process whose env or cwd it cannot read as
-`unreadable_unattributed`, UNLESS ancestry (its own pid/pgid/sid, or its
+construction; the uzi worker itself did not have one. Before #1854, `scanOnce`
+(decision 2 above) treated any runner-uid process whose env or cwd it could not
+read as `unreadable_unattributed`, UNLESS ancestry (its own pid/pgid/sid, or its
 ppid chain) POSITIVELY ties it — pid and recorded start time both matching —
 to a recorded root of another live attempt or a worker-launched runner-uid
-root, in which case it is skipped entirely rather than reported. An
-unreadable process that is not positively attributed this way makes the
-whole scan `unverified`. Because `unverified` fails closed everywhere the
-scan actually runs, a single such process anywhere on the worker — an
+root, in which case it was skipped entirely rather than reported. An
+unreadable process not positively attributed this way made the whole scan
+`unverified`. Because `unverified` fails closed everywhere the scan runs, a
+single such process anywhere on the worker — an
 ssh-agent an unrelated tool started, not necessarily this run's own — is a
-**worker-wide lockout** for as long as it lives, at every site the scan
-covers. Canonical reseed and the predecessor/orphan capture sites
-(`predecessor_capture`, `orphan_reclaim`) run `seed`/`capture` mode, which
-always scans regardless of executor (see the Invariants section above), so
-they lock out on any run, Codex included. Terminal retire, finalize, the
-`recovery_capture`/`credential_switch` sites, and the pause/wall/completion-
-hold parks all run `mode: "own"` (except on a flight capturing a
-predecessor attempt's clone, where `quiesceRun` switches every proof to
-`capture` mode, which scans), so for a Claude or stub run they are
-covered and lock out the same way, but **a Codex run's own-mode proof at
-those sites is not**: it skips the process scan outright (mode `"own"`, per
-the Invariants section above), so an unrelated unreadable process elsewhere
-on the worker does not lock out a Codex run's own finalize, terminal
-retire, or recovery/credential-switch capture the way it locks out a Claude
-or stub run's — a disclosed gap in the opposite direction from this
-lockout, covered by the Invariants section and Follow-up 4 below, not a
-new claim about a Codex run being more locked out than it is. Where one of
-those Codex own-mode sinks is credentialed through
-`reapForSink`/`withCodexBoundaryOnly` (finalize is one), the supervisor's
-own drain boundary substitutes for the skipped scan as that sink's process
-proof; it is not itself gated by this same-uid lockout either. (Only the
-`unverifiedOnlyByUnattributedUnreadable` exception for a fresh attempt seed
-is unaffected on any run, because seeding a fresh path moves or frees
-nothing.)
+**worker-wide lockout** for as long as it lived, at every site the scan
+covers. Canonical reseed and predecessor/orphan capture run `seed`/`capture`
+mode, which scans regardless of executor. Claude and stub `own` mode sites
+also scan. Codex `own` mode sites skip the process scan and use their own
+supervisor boundary at credentialed sinks; the separate Codex gap remains as
+described in the Invariants section. Under the revised decision below, only
+concurrent-claim and single-uid cases can still lock out these scanning sites
+solely because of an unattributed unreadable process. The fresh-attempt seed
+exception remains because seeding a fresh path moves or frees nothing.
 
-**The maintainer's decision is to keep this fail-closed, not to relax it.**
-An unreadable, unattributed runner-uid process is never treated as out of
-scope, and the ABSENCE of an ancestry link — or any ancestry-based guess
-that a process is unrelated to this run — is never used to CLEAR one: a
-process not positively tied to a recorded live root stays unverified.
-Positive attribution to a recorded root (pid and start time both matching)
-is the pre-existing, unchanged exception, not a new way to clear a process
-by guessing it is unrelated. A process that forks twice and calls `setsid`
-defeats an absence-of-ancestry clearing trivially, so accepting that here
-would reopen exactly the escape path this ADR closes.
+**Decision revised for #1854.** Under the uid split, an unreadable,
+unattributed runner-uid process is killed in `own`, `seed` and `capture` mode
+only when no other claim is executing and no other live attempt is recorded.
+The worker snapshots its execution registry before the helper scan; the helper
+rechecks the candidate's `/proc/<pid>/stat` start time immediately before
+SIGKILL, then rescans to prove it is gone. A changed or unreadable start time
+vetoes the signal. A pid recycled between that final read and the signal remains
+a kernel race; this check narrows it but cannot eliminate it without pidfd.
+An unconfirmed kill still fails closed. With another claim
+or attempt in flight, or on a single-uid worker, the process stays
+`unverified`. A recorded live root and its descendants remain exempt only
+when the root's pid and start time both match. The scanner excludes its own
+descendants; an unreadable descendant without a readable attempt marker cannot
+be chosen as a kill target.
+
+This permission relies on every runner-uid process under the split being
+agent-controlled code of a current or finished claim, a recorded worker root
+or descendant, a readable worker-marked fixed-argv spawn that runs no repo
+code, or the scanner itself. Agent-controlled code includes dependency
+installs, provisioning builds, self-improve checks, stub git and runner-clone
+git that can run configured code. A future worker spawn that can become
+non-dumpable must be recorded as a root. The permission kills a process and
+requires its exit; it never clears one as unrelated merely because ancestry
+is absent. The accepted admission race is that another claim can start after
+the worker's snapshot and before the helper signals.
 
 **Operator visibility.** The `unreadable_unattributed` entry's world-readable
 `/proc/<pid>/stat` still names the process, so the failure reason and the
@@ -458,9 +458,8 @@ runner-uid pid 4242 "ssh-agent" could not be attributed (env/cwd unreadable)
 ```
 
 and `describeProcesses` adds `attribution: "could not be attributed"` to that
-process's log fields. The operator action is to stop that process on the
-worker (kill it, or let it exit on its own) and start a new run; the lockout
-clears the moment no such process remains.
+process's log fields. This remains the operator action when the solitary
+uid-split permission does not apply or the kill cannot be confirmed.
 
 **A bounded wait, not an unbounded retry, on a blocked recovery capture.**
 `handleRecoveryExhausted`'s capture retry used to retry a blocked quiescence
@@ -636,9 +635,8 @@ These are not filed yet; listed here for the maintainer to file after merge.
   pre-publish steps. This is disclosed here for the maintainer to file as its
   own tracking issue, not filed yet.
 - **Follow-up 5 — a per-attempt cgroup v2 boundary.** Proper per-run process
-  ownership, scoped to the attempt, would remove the unreadable-unattributed
-  same-uid-process lockout described above at the source instead of bounding
-  the retry against it. Not built here; not filed yet.
+  ownership would resolve the remaining concurrent-claim and single-uid
+  lockout. This direction is parked in #1862.
 
 **Accepted risks:**
 

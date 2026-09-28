@@ -556,6 +556,53 @@ type Store interface {
 	// so completing a newer generation never releases an older same-worker orphan (PRD #1349 M4).
 	ReleaseCustodyHold(ctx context.Context, arg store.ReleaseCustodyHoldParams) (int64, error)
 	ReleaseCustodyHoldExact(ctx context.Context, arg store.ReleaseCustodyHoldExactParams) (int64, error)
+	// PRD #1810 checkpoint-ref retention (checkpoint_retention.go): the terminal-time record
+	// inserts, the record read, and the state-guarded settle transitions.
+	InsertCheckpointRetentionIfHeld(ctx context.Context, arg store.InsertCheckpointRetentionIfHeldParams) (int64, error)
+	InsertCheckpointRetentionSettling(ctx context.Context, arg store.InsertCheckpointRetentionSettlingParams) (int64, error)
+	GetCheckpointRetention(ctx context.Context, runID uuid.UUID) (store.CheckpointRetention, error)
+	SetCheckpointRetentionSettlingIfUnheld(ctx context.Context, runID uuid.UUID) (int64, error)
+	SetCheckpointRetentionDeleted(ctx context.Context, arg store.SetCheckpointRetentionDeletedParams) (int64, error)
+	RecordCheckpointRetentionFailure(ctx context.Context, arg store.RecordCheckpointRetentionFailureParams) (int64, error)
+	SetCheckpointRetentionAbandoned(ctx context.Context, arg store.SetCheckpointRetentionAbandonedParams) (int64, error)
+	// PRD #1810 M3 supersession (D2): the branch-slot lookup, the persisted intent, the final
+	// superseded/settling transition, the tip-gone close, the publish-time tip advance, and the
+	// reconciler's candidate page.
+	ListCheckpointRetentionsForBranch(ctx context.Context, arg store.ListCheckpointRetentionsForBranchParams) ([]store.CheckpointRetention, error)
+	ListActiveCheckpointRetentionsForBranch(ctx context.Context, arg store.ListActiveCheckpointRetentionsForBranchParams) ([]store.CheckpointRetention, error)
+	BeginCheckpointSupersession(ctx context.Context, arg store.BeginCheckpointSupersessionParams) (int64, error)
+	MarkCheckpointSuperseded(ctx context.Context, runID uuid.UUID) (string, error)
+	SetCheckpointSupersessionTipGone(ctx context.Context, arg store.SetCheckpointSupersessionTipGoneParams) (int64, error)
+	AdvanceCheckpointRetentionTip(ctx context.Context, arg store.AdvanceCheckpointRetentionTipParams) (int64, error)
+	ListCheckpointRetentionWork(ctx context.Context, arg store.ListCheckpointRetentionWorkParams) ([]store.CheckpointRetention, error)
+	// PRD #1810 M4 settlement reconciliation: the unheld retained/superseded page, the backfill of
+	// terminal runs with no record, the stuck-superseding exit, and the post-settlement audit.
+	ListUnheldCheckpointRetentions(ctx context.Context, arg store.ListUnheldCheckpointRetentionsParams) ([]store.CheckpointRetention, error)
+	ListCheckpointRetentionBackfill(ctx context.Context, arg store.ListCheckpointRetentionBackfillParams) ([]store.ListCheckpointRetentionBackfillRow, error)
+	RunHasOpenCustodyHold(ctx context.Context, runID uuid.UUID) (bool, error)
+	SetCheckpointSupersessionExited(ctx context.Context, arg store.SetCheckpointSupersessionExitedParams) (int64, error)
+	ListCheckpointRetentionAudit(ctx context.Context, arg store.ListCheckpointRetentionAuditParams) ([]store.CheckpointRetention, error)
+	SetCheckpointRetentionVerified(ctx context.Context, arg store.SetCheckpointRetentionVerifiedParams) (int64, error)
+	DeferCheckpointRetentionVerify(ctx context.Context, arg store.DeferCheckpointRetentionVerifyParams) (int64, error)
+	// PRD #1810 M4 review: the backfill's persisted watermark, the audit's custody-guarded reopen,
+	// the terminal-run publish tracker, and the stuck exit's read of the run's own latest tip.
+	AdvanceCheckpointRetentionBackfillWatermark(ctx context.Context, through pgtype.Timestamptz) (int64, error)
+	GetCheckpointRetentionBackfillNow(ctx context.Context) (pgtype.Timestamptz, error)
+	ReopenCheckpointRetentionSupersededIfHeld(ctx context.Context, arg store.ReopenCheckpointRetentionSupersededIfHeldParams) (int64, error)
+	TrackTerminalCheckpointPublish(ctx context.Context, arg store.TrackTerminalCheckpointPublishParams) (string, error)
+	GetRunCheckpointTipForRetention(ctx context.Context, runID uuid.UUID) (pgtype.Text, error)
+	// PRD #1810 D2 residual 2: the durable record of a checkpoint push written before the forge
+	// call (checkpoint_publish_attempts, 00267), and the sweeper's attempts arm that reconciles a
+	// push whose outcome the api never learned.
+	RecordCheckpointPublishAttempt(ctx context.Context, arg store.RecordCheckpointPublishAttemptParams) (uuid.UUID, error)
+	DeleteCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (int64, error)
+	GetCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (store.CheckpointPublishAttempt, error)
+	RunHasCheckpointPublishAttempt(ctx context.Context, arg store.RunHasCheckpointPublishAttemptParams) (bool, error)
+	ListDueCheckpointPublishAttempts(ctx context.Context, arg store.ListDueCheckpointPublishAttemptsParams) ([]store.CheckpointPublishAttempt, error)
+	DeferCheckpointPublishAttempt(ctx context.Context, arg store.DeferCheckpointPublishAttemptParams) (int64, error)
+	CheckpointTipClaimedByOtherRun(ctx context.Context, arg store.CheckpointTipClaimedByOtherRunParams) (bool, error)
+	TrackReconciledCheckpointPublish(ctx context.Context, arg store.TrackReconciledCheckpointPublishParams) (string, error)
+	SetRunCheckpointTipIf(ctx context.Context, arg store.SetRunCheckpointTipIfParams) (int64, error)
 	// Issue #1582 M1: the predecessor-settle pair. GetCustodyHoldForSettle reads the exact hold
 	// (scoped to its run); ReleasePredecessorCustodyHoldByAncestry is the single guarded
 	// statement that releases that one older-generation hold with 'ancestry' evidence after the
@@ -1711,15 +1758,28 @@ type Service struct {
 	// error-injected) without a real forge. Same seam discipline as publishFn:
 	// pushbroker stays the ONE place go-git lives.
 	deleteCheckpointFn func(ctx context.Context, o pushbroker.DeleteOptions) error
-	// createSalvageFn / deleteSalvageFn are SweepSalvage's broker seams (PRD #1867),
-	// defaulting to pushbroker.CreateSalvageRef / pushbroker.DeleteRef (set in New); tests
-	// stub them. salvagePassBudget overrides the pass's wall-clock budget (zero = the
-	// 10s salvagePassBudgetDefault); tests shorten it. salvageLeadPending is which due
-	// list leads the next pass's round-robin (false = expiries), flipped every pass.
-	createSalvageFn    func(ctx context.Context, o pushbroker.CreateSalvageRefOptions) (pushbroker.SalvageResult, error)
-	deleteSalvageFn    func(ctx context.Context, o pushbroker.DeleteRefOptions) error
-	salvagePassBudget  time.Duration
-	salvageLeadPending bool
+	// salvageListRefTipsFn / salvageCreateRefFn / salvageDeleteRefFn are SweepSalvage's
+	// broker seams (PRD #1867). They have the types of listRefTipsFn / createRefFn /
+	// deleteCheckpointFn and default to the same #1810 primitives (pushbroker.ListRefTips,
+	// CreateRef and Delete, set in New), but are separate fields so a salvage test's fake
+	// forge never serves retention's calls, and so deleteCheckpointFn stays a tripwire
+	// salvage must never reach. salvage.go only ever passes a refs/uzi-salvage/<run-id>
+	// Ref with an ExpectedOldTip to salvageDeleteRefFn (pinned by an AST test).
+	// salvagePassBudget overrides the pass's wall-clock budget (zero = the 10s
+	// salvagePassBudgetDefault); tests shorten it. salvageLeadPending is which due list
+	// leads the next pass's round-robin (false = expiries), flipped every pass.
+	salvageListRefTipsFn func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)
+	salvageCreateRefFn   func(ctx context.Context, o pushbroker.CreateRefOptions) error
+	salvageDeleteRefFn   func(ctx context.Context, o pushbroker.DeleteOptions) error
+	salvagePassBudget    time.Duration
+	salvageLeadPending   bool
+	// createRefFn is the go-git recovery-ref CREATOR (PRD #1810 M3, D2): supersession preserves
+	// a retained checkpoint tip under refs/uzi-recovery/<run id> before freeing the branch ref.
+	// Defaults to pushbroker.CreateRef (set in New); tests stub it with an in-memory forge.
+	createRefFn func(ctx context.Context, o pushbroker.CreateRefOptions) error
+	// listRefTipsFn is the go-git ref LISTER supersession uses to tell apart why a create found
+	// its source missing (PRD #1810 M3). Defaults to pushbroker.ListRefTips (set in New).
+	listRefTipsFn func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)
 	// background dispatches a best-effort forge side-effect off the request/report
 	// goroutine so a slow/down forge can never delay or wedge the caller (PRD #1030
 	// M4's checkpoint delete). Defaults to `go fn()` (set in New); tests override it
@@ -1774,6 +1834,36 @@ type Service struct {
 	// credPromoteHooks are the credential_disabled promoter's LiveDB race seams (nil in
 	// production, so inert unless a test sets it; the codexPromoteHooks idiom above).
 	credPromoteHooks *credentialPromoteTestHooks
+	// retentionPool pins the connection the per-run checkpoint-retention SESSION advisory lock
+	// is held on (PRD #1810, withRetentionLock); set via SetRetentionLockPool. Nil means no
+	// retention lock can be taken, so every retention path RETAINS and nothing is deleted.
+	retentionPool ConnAcquirer
+	// retentionSem caps concurrent retention forge operations process-wide (a buffered chan
+	// of retentionDefaultConc slots, made in New). Taken non-blockingly: full means retain now,
+	// retry later.
+	retentionSem chan struct{}
+	// retentionHooks are the retention paths' LiveDB race seams (nil in production).
+	retentionHooks *retentionTestHooks
+	// terminalLockRetryBudget and terminalLockRetryInterval bound publishTerminalLocked's retry
+	// of a busy retention lock (set in New from the terminalPublishLockRetry* constants; a test
+	// shrinks them to stay fast).
+	terminalLockRetryBudget   time.Duration
+	terminalLockRetryInterval time.Duration
+	// livePublishPrePushBudget bounds how long after Publish routed a publish as LIVE any of its
+	// pushes may still be SENT (PRD #1810 D2, residual 2; set in New, a test shrinks it).
+	livePublishPrePushBudget time.Duration
+	// checkpointSupersessionCooling is how long a run must have been terminal before a supersession
+	// intent may be recorded for it (BeginCheckpointSupersession; set in New, a test shrinks it).
+	checkpointSupersessionCooling time.Duration
+	// retentionPassBudget bounds how long after it began the sweeper's checkpoint-retention pass
+	// may still START a record (reconcileCheckpointRetentions); retentionSweepOpTimeout bounds
+	// each record's locked operation the pass starts, in place of retentionOpTimeout (PRD #1810;
+	// set in New, a test shrinks them).
+	retentionPassBudget     time.Duration
+	retentionSweepOpTimeout time.Duration
+	// retentionArmCursor rotates which forge-calling arm the retention pass starts with, one arm
+	// per pass (retentionArmOrder).
+	retentionArmCursor atomic.Uint32
 	// readyAt is the moment the worker-facing listener(s) became ready (PRD #1390 M1, D1),
 	// stored as Unix nanoseconds (0 = not yet ready). main.go writes it via SetReadyAt after
 	// binding every enabled listener; the sweeper goroutine reads it each tick to anchor the
@@ -1875,6 +1965,18 @@ func (s *Service) SetDeleteCheckpointFn(fn func(ctx context.Context, o pushbroke
 	s.deleteCheckpointFn = fn
 }
 
+// SetCreateRefFn overrides the go-git recovery-ref creator (PRD #1810 M3). Production leaves
+// the pushbroker.CreateRef default New installs; tests stub it with an in-memory forge.
+func (s *Service) SetCreateRefFn(fn func(ctx context.Context, o pushbroker.CreateRefOptions) error) {
+	s.createRefFn = fn
+}
+
+// SetListRefTipsFn overrides the go-git ref lister supersession uses (PRD #1810 M3).
+// Production leaves the pushbroker.ListRefTips default New installs.
+func (s *Service) SetListRefTipsFn(fn func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)) {
+	s.listRefTipsFn = fn
+}
+
 // SetBackground overrides the best-effort side-effect dispatcher (PRD #1030 M4).
 // Production leaves the `go fn()` default New installs; tests set a synchronous
 // runner so the async checkpoint delete is observed deterministically.
@@ -1943,11 +2045,23 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 	}
 	return &Service{
 		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), outbox: newOutboxTracker(),
-		publishFn:          pushbroker.Publish,
-		deleteCheckpointFn: pushbroker.Delete,
-		createSalvageFn:    pushbroker.CreateSalvageRef,
-		deleteSalvageFn:    pushbroker.DeleteRef,
-		background:         func(fn func()) { go fn() },
+		publishFn:            pushbroker.Publish,
+		deleteCheckpointFn:   pushbroker.Delete,
+		salvageListRefTipsFn: pushbroker.ListRefTips,
+		salvageCreateRefFn:   pushbroker.CreateRef,
+		salvageDeleteRefFn:   pushbroker.Delete,
+		createRefFn:          pushbroker.CreateRef,
+		listRefTipsFn:        pushbroker.ListRefTips,
+		background:           func(fn func()) { go fn() },
+		retentionSem:         make(chan struct{}, retentionDefaultConc),
+
+		terminalLockRetryBudget:   terminalPublishLockRetryBudget,
+		terminalLockRetryInterval: terminalPublishLockRetryInterval,
+
+		livePublishPrePushBudget:      livePublishPrePushBudget,
+		checkpointSupersessionCooling: checkpointSupersessionCooling,
+		retentionPassBudget:           retentionPassBudget,
+		retentionSweepOpTimeout:       retentionSweepOpTimeout,
 	}
 }
 
@@ -4405,6 +4519,13 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			}); relErr != nil {
 				slog.Warn("release custody on completion", "run", runID, "worker", wkr.ID, "generation", run.ClaimGeneration, "error", relErr)
 			}
+			// PRD #1810 D3: this release's settle trigger is retainOrDeleteCheckpoint below,
+			// which runs on every terminal transition AFTER the release. The record already
+			// exists by then: migration 00266's trigger inserted it in the terminal UPDATE's own
+			// transaction, as `retained` (this completing generation's hold was still open at
+			// that instant). retainOrDeleteCheckpoint re-reads that row and dispatches the settle
+			// it owes to SettleRetainedCheckpoint, which moves it to settling only once no hold
+			// of the run is open. A second trigger here would only race it.
 		}
 		// PRD #529 M4: an ephemeral worker exists only to serve its bound run, so a
 		// genuinely-applied terminal transition (rows>0) on that run — completed /
@@ -4412,17 +4533,19 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// committed transition; guarded on wkr.Ephemeral and busy-checked in-query so a
 		// normal run's completion is a no-op. Best-effort — never fails the report.
 		s.maybeTeardownEphemeral(ctx, wkr, run)
-		// PRD #1030 M4: on a COMMITTED terminal transition (completed, or a
+		// PRD #1030 M4 / PRD #1810 M1: on a COMMITTED terminal transition (completed, or a
 		// failed→cancelled/stopped/plan-reject/agent-failure route through the switch
-		// above), delete the run's now-stale checkpoint ref so it cannot later block a
-		// new run on the same branch with a not_descendant skip. Best-effort and
-		// dispatched OFF this goroutine — it must never delay or fail the worker's
-		// terminal report, and it runs AFTER the terminal state is durably recorded. The
-		// terminal guard keeps it off `running`/`awaiting_*` transitions; the helper
-		// kind-gates it to checkpoint-eligible issue runs. `failed` is terminal and NOT
-		// requeued, so deleting here cannot race a requeue-resume (PRD #1030 M4).
+		// above), settle the run's checkpoint ref. While any custody hold of the run is open
+		// (failed and cancelled runs keep theirs, above) the ref is RETAINED for recovery;
+		// with none open it is deleted CAS on its tip, so it cannot later block a new run on
+		// the same branch with a not_descendant skip. It runs AFTER the terminal state is
+		// durably recorded, and the forge call is dispatched OFF this goroutine — it must
+		// never delay or fail the worker's terminal report. The terminal guard keeps it off
+		// `running`/`awaiting_*` transitions; the helper kind-gates it to checkpoint-eligible
+		// runs. `failed` is terminal and NOT requeued, so a delete here cannot race a
+		// requeue-resume (PRD #1030 M4).
 		if terminalStatuses[run.Status] {
-			s.deleteCheckpointBestEffort(runID, run.Kind, run.IssueIid)
+			s.retainOrDeleteCheckpoint(ctx, runID, run.Kind, run.IssueIid)
 		}
 	}
 	if gateRefusal != nil && err == nil {
@@ -5192,7 +5315,8 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 
 // PublishResult is the outcome of a checkpoint publish (PRD #122 M8). Published is
 // true only when the push landed. Skipped names the benign reason a publish did NOT
-// advance the ref ("no_ref" | "not_descendant" | "unsupported" | "workflow_scope"); it
+// advance the ref ("no_ref" | "not_descendant" | "unsupported" | "workflow_scope" |
+// "superseded"); it
 // is empty on a successful publish. Either way Ref is the checkpoint ref the worker
 // asked about.
 type PublishResult struct {
@@ -5213,6 +5337,12 @@ type PublishResult struct {
 // and an error only for a genuine 5xx (misconfig, decrypt failure, transport fault)
 // the worker ignores as best-effort.
 func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID, tipOid string, pack []byte) (PublishResult, error) {
+	// PRD #1810 D2 (residual 2): the publish is routed on the status read below, and a
+	// live-routed push must be SENT within livePublishPrePushBudget of that routing. The clock
+	// starts BEFORE the read, so a slow read can only shorten the budget, never start it after the
+	// run's terminal commit.
+	routedAt := time.Now()
+
 	// 1. Server-derived authorization: the run must be owned by THIS worker.
 	// ErrRunNotOwned bubbles to the handler → 404. This is the only thing the worker
 	// named (the run id), and it can only reach its own runs.
@@ -5285,7 +5415,7 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	// The broker's Result.Ref equals the ref computed above; the service returns its
 	// own derived ref (never a value shaped by the worker's input), so the Result is
 	// consulted only for the error.
-	_, err = s.publishFn(ctx, pushbroker.Options{
+	opts := pushbroker.Options{
 		CloneURL:      cloneURL,
 		BaseURL:       rc.BaseUrl,
 		Branch:        branch,
@@ -5294,23 +5424,178 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		PAT:           string(botPAT),
 		DeclaredTip:   tipOid,
 		Pack:          pack,
-	})
+	}
+
+	// PRD #1810: a worker still bound to a TERMINAL run may publish (a shutdown checkpoint of a
+	// just-cancelled run may be its latest work), but not once the run's branch slot was handed to
+	// a newer run. With retention wired the whole terminal publish (the superseded check, the
+	// push, the tip persist and the record track) runs under the run's retention lock
+	// (publishTerminalLocked), so no supersession of this run can interleave with it. The route
+	// is taken on the status read above, so a run that turns terminal after this read publishes
+	// unlocked below. That push is bounded instead (residual 2): every push it sends is refused
+	// once livePublishPrePushBudget has passed since routedAt, a supersession of the run's record
+	// waits out checkpointSupersessionCooling after its terminal commit, and each push is recorded
+	// durably before it is sent (checkpoint_publish_attempts), so one whose outcome is unknown and
+	// that lands late anyway is reconciled by the sweeper (reconcilePublishAttempts).
+	push := &checkpointPush{s: s, runID: runID, run: owned, branch: branch, ref: ref, opts: opts, routedAt: routedAt}
+	if terminalStatuses[owned.Status] && s.retentionWired() {
+		return s.publishTerminalLocked(ctx, push, tipOid)
+	}
+	push.live = true
+
+	// PRD #1810 D2: another run's retained record may hold this branch's slot even when this
+	// publish would fast-forward over it (the new run's work descends from the old tip). The slot
+	// is claimed (the record superseded) BEFORE the push, or the push is refused.
+	if skip := s.claimCheckpointSlot(ctx, owned, branch); skip != "" {
+		return PublishResult{Published: false, Ref: ref, Skipped: skip}, nil
+	}
+	err = s.pushCheckpoint(ctx, push)
+	res, settle, err := s.publishOutcome(ctx, push, terminalStatuses[owned.Status], tipOid, err)
+	if settle {
+		s.SettleRetainedCheckpoint(runID)
+	}
+	return res, err
+}
+
+// publishTerminalLocked is Publish for a TERMINAL run with retention wired (PRD #1810): the
+// terminalPublishSuperseded check, the branch-slot check, the forge push, the tip persist and the
+// retention-record track all run under the run's retention lock, so a supersession of this run
+// (which takes the same lock) can neither begin between the check and the push nor land between
+// the push and the track. The single push is preceded by the lock's fence and skipped when it
+// errors; it is never retried (pushCheckpoint).
+//
+// A busy lock (another instance or the sweeper is working the run's record, or the retention
+// slots are full) is retried every terminalLockRetryInterval for up to terminalLockRetryBudget,
+// because the agent's shutdown checkpoint sink is one-shot: a cancelled run's last checkpoint
+// has no next tick. Only the lock acquisition is retried; nothing inside fn has run on a busy
+// attempt. A lock still busy after the budget, or a ctx done while waiting, is the benign
+// not_descendant skip with no forge call. A settle the track owes is dispatched only AFTER the
+// lock is released (SettleRetainedCheckpoint try-locks the same key, so dispatching it under the
+// lock could lose to this very holder).
+//
+// withRetentionLock detaches from ctx and applies its own deadline; every call inside uses the
+// context it hands to fn. The push is not subject to the live pre-push budget (the lock already
+// excludes a supersession), but it is recorded in checkpoint_publish_attempts like every push, so
+// one whose outcome is unknown and that the forge applies after the lock is released is reconciled
+// by the sweeper.
+func (s *Service) publishTerminalLocked(ctx context.Context, push *checkpointPush, tipOid string) (PublishResult, error) {
+	owned, branch, ref := push.run, push.branch, push.ref
+	runID := owned.ID
+	var (
+		res    PublishResult
+		resErr error
+		settle bool
+	)
+	locked := func(lctx context.Context, fence func(context.Context) error) error {
+		superseded, serr := s.terminalPublishSuperseded(lctx, runID)
+		if serr != nil {
+			resErr = serr
+			return nil
+		}
+		if superseded {
+			res = PublishResult{Published: false, Ref: ref, Skipped: "superseded"}
+			return nil
+		}
+		if skip := s.claimCheckpointSlot(lctx, owned, branch); skip != "" {
+			res = PublishResult{Published: false, Ref: ref, Skipped: skip}
+			return nil
+		}
+		if ferr := fence(lctx); ferr != nil {
+			slog.Warn("checkpoint: retention lock lost before a terminal publish; push skipped", "run", runID, "error", ferr)
+			res = PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}
+			return nil
+		}
+		perr := s.pushCheckpoint(lctx, push)
+		res, settle, resErr = s.publishOutcome(lctx, push, true, tipOid, perr)
+		return nil
+	}
+	busy := PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}
+	deadline := time.Now().Add(s.terminalLockRetryBudget)
+	for {
+		acquired, lerr := s.withRetentionLock(ctx, runID, locked)
+		if lerr != nil {
+			return PublishResult{}, fmt.Errorf("publish: %s", secretscrub.Scrub(lerr.Error()))
+		}
+		if acquired {
+			break
+		}
+		if !time.Now().Add(s.terminalLockRetryInterval).Before(deadline) {
+			return busy, nil
+		}
+		wait := time.NewTimer(s.terminalLockRetryInterval)
+		select {
+		case <-ctx.Done():
+			wait.Stop()
+			return busy, nil
+		case <-wait.C:
+		}
+	}
+	if settle {
+		s.SettleRetainedCheckpoint(runID)
+	}
+	return res, resErr
+}
+
+// pushCheckpoint hands the push to the broker and, on a not_descendant refusal, runs the
+// supersession fallback: a not_descendant refusal may still be a RETAINED checkpoint of an older
+// run on this branch (a record claimCheckpointSlot did not list: a settling record, or one that
+// appeared since). freeCheckpointSlot supersedes it (moving its tip to
+// refs/uzi-recovery/<old run id>, never deleting it) and reports whether the branch ref is now
+// free; only then is the publish retried, ONCE, with the same options (Pack is a re-readable
+// []byte). freeCheckpointSlot refuses a terminal run, so a TERMINAL publish is never retried:
+// its one push is the fenced push publishTerminalLocked makes under the run's retention lock.
+// Each push goes through checkpointPush.pushOnce: for a live-routed publish it is refused, with no
+// forge call, once the pre-push budget has elapsed (the retry comes after a supersession that can
+// take a while), and every push is recorded in checkpoint_publish_attempts before it is sent.
+func (s *Service) pushCheckpoint(ctx context.Context, push *checkpointPush) error {
+	err := push.pushOnce(ctx)
+	if errors.Is(err, pushbroker.ErrNotDescendant) && s.freeCheckpointSlot(ctx, push.run, push.branch) {
+		err = push.pushOnce(ctx)
+	}
+	return err
+}
+
+// publishOutcome maps the broker's result to Publish's response. On success it persists the tip
+// and tracks the run's retention record, both compare-and-set on what the push observed
+// immediately before its forge call (push.base); settle reports that the record now owes a settle,
+// which the caller dispatches (SettleRetainedCheckpoint) once no retention lock of the run is
+// held. The successful push's attempt row is removed only once its tip is persisted and tracked;
+// otherwise (a write failed, or found a newer value and moved nothing) the publish is UNTRACKED
+// and the sweeper's attempts arm reconciles the row.
+func (s *Service) publishOutcome(ctx context.Context, push *checkpointPush, terminal bool, tipOid string, err error) (res PublishResult, settle bool, _ error) {
+	ref := push.ref
 	switch {
+	case errors.Is(err, errPushRefused):
+		// No forge call was made (the live pre-push budget elapsed, or the attempt could not be
+		// recorded): the benign skip, retried on the worker's next tick.
+		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, false, nil
+	case err == nil && push.alreadyCurrent && !push.ownsTip(tipOid):
+		// PRD #1810: origin already held the declared tip, so this push wrote nothing, and the tip
+		// is not the run's own persisted one: another run's ref (retained, settling, or a late push
+		// the attempts arm is about to delete) at the same SHA. Counting it as published would let
+		// that run's CAS delete remove a ref this run records as durable. An outstanding attempt
+		// row is no proof either (it is written before its push, which may never have landed).
+		// The benign skip; the worker retries on its next tick. Nothing landed from this push.
+		s.clearPublishAttempt(ctx, push.landed)
+		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, false, nil
 	case err == nil:
 		// The CAS-accepted advance is the ONLY arm that persists the tip: it runs on
 		// EVERY successful publish (mid-run/park/shutdown all route through here), so
-		// runs.checkpoint_tip tracks the just-published tip and the terminal CAS-delete's
-		// stale-tip fallback stays diagnosable. Persist is best-effort — a failure must
-		// NOT fail the publish, since the ref is already advanced on the forge.
-		if _, perr := s.q.SetRunCheckpointTip(ctx, store.SetRunCheckpointTipParams{
-			CheckpointTip: pgtype.Text{String: tipOid, Valid: true},
-			ID:            runID,
-		}); perr != nil {
-			slog.Warn("checkpoint: persist tip", "run", runID, "tip", tipOid, "error", perr)
+		// runs.checkpoint_tip tracks the just-published tip, which is the tip the
+		// terminal-time retention record (checkpoint_retentions.tip) binds its CAS writes
+		// to. Persist is best-effort — a failure must NOT fail the publish, since the ref
+		// is already advanced on the forge.
+		persisted := s.persistPublishedTip(ctx, push, tipOid)
+		// PRD #1810: the run's retention record follows the ref to the tip just published
+		// (trackPublishedCheckpoint). Best-effort like the persist above.
+		var tracked bool
+		settle, tracked = s.trackPublishedCheckpoint(ctx, push, terminal, tipOid)
+		if persisted && tracked {
+			s.clearPublishAttempt(ctx, push.landed)
 		}
-		return PublishResult{Published: true, Ref: ref}, nil
+		return PublishResult{Published: true, Ref: ref}, settle, nil
 	case errors.Is(err, pushbroker.ErrNotDescendant):
-		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, nil
+		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, false, nil
 	case errors.Is(err, pushbroker.ErrWorkflowScopeRejected):
 		// The branch is behind on .github/workflows/** relative to the default branch,
 		// so the bot's repo-only PAT cannot push the checkpoint (PRD #456 M4). This is a
@@ -5318,14 +5603,14 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		// slog.Error default arm and never fails the run. Checkpoints stay best-effort;
 		// the finalize base-align (PRD #456 M1) is the real safety net that saves this
 		// run's work.
-		return PublishResult{Published: false, Ref: ref, Skipped: "workflow_scope"}, nil
+		return PublishResult{Published: false, Ref: ref, Skipped: "workflow_scope"}, false, nil
 	case errors.Is(err, pushbroker.ErrTipMissing),
 		errors.Is(err, pushbroker.ErrPackTooLarge),
 		errors.Is(err, pushbroker.ErrPackInvalid):
 		// A tip the pack never delivered, a pack over the reconstruction budget, or a
 		// malformed pack: all best-effort "unsupported" skips — never a 5xx. Neither an
 		// over-budget nor a malformed worker pack may OOM or 5xx-storm the shared api.
-		return PublishResult{Published: false, Ref: ref, Skipped: "unsupported"}, nil
+		return PublishResult{Published: false, Ref: ref, Skipped: "unsupported"}, false, nil
 	default:
 		// A genuine 5xx from the go-git broker (transport fault, non-sentinel
 		// go-git error). This is the ONE forge-touching path whose error does NOT
@@ -5335,8 +5620,42 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		// run it through the known-credential scrub. The pushbroker sentinels are all
 		// matched above, so this error is only logged/returned, never errors.Is-checked
 		// downstream — flattening the %w chain to a scrubbed string is safe here.
-		return PublishResult{}, fmt.Errorf("publish: %s", secretscrub.Scrub(err.Error()))
+		return PublishResult{}, false, fmt.Errorf("publish: %s", secretscrub.Scrub(err.Error()))
 	}
+}
+
+// persistPublishedTip records a successful push's tip on runs.checkpoint_tip and reports whether
+// it did. With the push's base observed (retention wired) the write is compare-and-set on the
+// runs.checkpoint_tip the push read immediately before its forge call (SetRunCheckpointTipIf): a
+// live-routed publish holds no retention lock and its write may arrive after a newer publish, or
+// the sweeper's attempts arm re-recording a newer late push, persisted a newer tip, which it must
+// not move backwards. A write that moves no row is logged and reported false, so the caller keeps
+// the push's attempt row for the arm.
+func (s *Service) persistPublishedTip(ctx context.Context, push *checkpointPush, tipOid string) bool {
+	runID := push.runID
+	if !push.base.observed {
+		if _, err := s.q.SetRunCheckpointTip(ctx, store.SetRunCheckpointTipParams{
+			CheckpointTip: pgtype.Text{String: tipOid, Valid: true},
+			ID:            runID,
+		}); err != nil {
+			slog.Warn("checkpoint: persist tip", "run", runID, "tip", tipOid, "error", err)
+			return false
+		}
+		return true
+	}
+	n, err := s.q.SetRunCheckpointTipIf(ctx, store.SetRunCheckpointTipIfParams{
+		CheckpointTip: tipOid, ID: runID, ExpectedTip: push.base.runTip,
+	})
+	if err != nil {
+		slog.Warn("checkpoint: persist tip", "run", runID, "tip", tipOid, "error", err)
+		return false
+	}
+	if n == 0 {
+		slog.Warn("checkpoint: runs.checkpoint_tip moved since this push was sent; not overwritten, the push is left to "+
+			"the sweeper's publish-attempt reconciliation", "run", runID, "tip", tipOid, "observed", push.base.runTip.String)
+		return false
+	}
+	return true
 }
 
 // forgeHostFromURL reduces a URL (here the clone URL, repo_web_url + ".git") to the
@@ -5353,115 +5672,6 @@ func forgeHostFromURL(raw string) (string, error) {
 		return "", fmt.Errorf("clone URL %q must be https with a host", raw)
 	}
 	return "https://" + strings.ToLower(u.Host), nil
-}
-
-// deleteCheckpointBestEffort removes a run's stale checkpoint ref
-// (refs/uzi-checkpoints/<branch>) from the forge on a TERMINAL transition (PRD #1030
-// M4). Once a run is terminal its checkpoint ref is stale scratch state; leaving it
-// behind later blocks a NEW run on the same branch with a not_descendant skip, so
-// every terminal path calls this.
-//
-// It is BEST-EFFORT and must NEVER block or fail the caller's terminal transition:
-// the terminal DB write has already committed by the time this runs, and the whole
-// forge round-trip is dispatched on s.background (a detached goroutine in production;
-// tests run it inline) under pushbroker.Delete's own short wall-clock timeout. Any
-// failure is logged and swallowed — a surviving stale ref only re-blocks a later run
-// with a benign skip, never corrupts anything, and the PVC refs/uzi-runner/* remains
-// the primary recovery path.
-//
-// It is gated to the SAME checkpoint-eligible set Publish supports (an issue run with a
-// valid issue iid, or a self_improve run — PRD #1062 M3): only these ever published a
-// checkpoint ref, so any other kind is a no-op with no forge call. The branch, repo
-// connection and PAT are derived SERVER-SIDE exactly as Publish derives them (via
-// checkpointBranch from run-row fields, GetRunClaimContext, the SSRF gate, box.Open),
-// never from the worker.
-func (s *Service) deleteCheckpointBestEffort(runID uuid.UUID, kind string, issueIid pgtype.Int8) {
-	// Kind-gate identically to Publish (dispatch on kind first): a run that never had a
-	// checkpoint ref has nothing to delete. Do this BEFORE dispatching so an ineligible
-	// kind makes no goroutine and no forge call.
-	branch, ok := checkpointBranch(kind, runID, issueIid)
-	if !ok {
-		return
-	}
-	// A deployment that never wired the delete seam or the SSRF gate, or a service
-	// built without a secretbox (some tests), cannot broker the delete — skip rather
-	// than dispatch a goroutine that would only fail. (publishFn/box/forgeBaseURLAllowed
-	// nil-checks mirror Publish's own guards.)
-	if s.deleteCheckpointFn == nil || s.forgeBaseURLAllowed == nil || s.box == nil || s.background == nil {
-		return
-	}
-	s.background(func() {
-		// s.background is a DETACHED goroutine in production, and pushbroker.Delete
-		// drives go-git (ListContext/PushContext), which has nil-deref panic paths on
-		// malformed forge responses. An unrecovered panic in ANY goroutine crashes the
-		// whole api process, so recover FIRST and swallow it — this cleanup is
-		// best-effort, and the failure it prevents (a later not_descendant skip) is
-		// benign. Mirrors forgesvc.ProjectSyncService.launchSeed's recover idiom.
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("checkpoint cleanup: delete panicked", "run", runID, "branch", branch, "panic", secretscrub.Scrub(fmt.Sprint(r)))
-			}
-		}()
-		// Detached from the request/report ctx (which is already returning to the
-		// worker): bind to a fresh context.Background, and let pushbroker.Delete apply
-		// its own bounded timeout on top. A slow/down forge cannot reach the caller.
-		ctx := context.Background()
-
-		rc, err := s.q.GetRunClaimContext(ctx, runID)
-		if err != nil {
-			// No repo/forge connection (a repo-less run) or the row vanished: there is
-			// nothing to delete. Benign.
-			if !errors.Is(err, pgx.ErrNoRows) {
-				slog.Warn("checkpoint cleanup: claim context", "run", runID, "error", err)
-			}
-			return
-		}
-		// Skip entirely when this run NEVER published a checkpoint (checkpoint_tip
-		// NULL): it owns no ref, so there is nothing to delete — and an unconditional
-		// delete could clobber a SIBLING run's fresh checkpoint on the same branch. This
-		// is load-bearing, not an optimisation. When set, rc.CheckpointTip.String is the
-		// CAS Old the delete must match (pushbroker.DeleteOptions.ExpectedOldTip), so
-		// origin's ref is removed only while it still points at exactly the tip THIS run
-		// published.
-		if !rc.CheckpointTip.Valid {
-			slog.Debug("checkpoint cleanup: skip (never published)", "run", runID, "branch", branch)
-			return
-		}
-
-		cloneURL := rc.RepoWebUrl + ".git"
-
-		// Same SSRF gate as Publish, BEFORE decrypting the PAT: never point go-git at
-		// an un-allowlisted host. A misconfigured gate is a skip here (best-effort),
-		// not the loud 500 Publish raises — this path must never fail a terminal report.
-		if !s.forgeBaseURLAllowed(rc.BaseUrl) {
-			slog.Warn("checkpoint cleanup: base URL not allowlisted", "run", runID)
-			return
-		}
-		cloneHost, err := forgeHostFromURL(cloneURL)
-		if err != nil || !s.forgeBaseURLAllowed(cloneHost) {
-			slog.Warn("checkpoint cleanup: clone host not allowlisted", "run", runID)
-			return
-		}
-
-		botPAT, err := s.box.Open(rc.TokenCiphertext)
-		if err != nil {
-			slog.Warn("checkpoint cleanup: bot PAT could not be decrypted", "run", runID)
-			return
-		}
-
-		if derr := s.deleteCheckpointFn(ctx, pushbroker.DeleteOptions{
-			CloneURL:       cloneURL,
-			Branch:         branch,
-			Username:       rc.BotUsername,
-			PAT:            string(botPAT),
-			ExpectedOldTip: rc.CheckpointTip.String,
-		}); derr != nil {
-			// Scrub any credential-bearing go-git error (its remote URL can carry the
-			// PAT in userinfo) before logging — the same invariant Publish's default arm
-			// keeps. Best-effort: the error is logged and swallowed, never surfaced.
-			slog.Warn("checkpoint cleanup: delete ref", "run", runID, "branch", branch, "error", secretscrub.Scrub(derr.Error()))
-		}
-	})
 }
 
 // -------------------------------------------------------------------------
@@ -6727,6 +6937,12 @@ type SweepResult struct {
 	// normal reap can then delete the worker. Normally 0: the candidate query reads only
 	// stuck holds, a set that is empty on a healthy instance.
 	CustodyReleased int64
+	// CheckpointRetentionsReconciled is the number of checkpoint_retentions records this pass
+	// drove to a final step (PRD #1810 M3/M4): an interrupted `superseding` record re-driven or
+	// exited, a failed delete retried, an unheld record whose settle trigger was lost settled, a
+	// terminal run with no record backfilled, or a deleted recovery ref audited. Normally 0: the
+	// post-commit triggers settle a record on the path that released its last hold.
+	CheckpointRetentionsReconciled int64
 	// RecoveryStalled is the number of durable-archive captures this pass flipped from a
 	// non-terminal upload state (preparing/uploading) to needs_action because they sat past
 	// the UZI_RECOVERY_UPLOAD_RETRY_WINDOW (PRD #1296 D3/D4). The custody hold is NOT released

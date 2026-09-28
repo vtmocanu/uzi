@@ -4186,6 +4186,9 @@ export interface RecoveryArchiveSummary {
 // archive_ready | needs_action | source_only | released | discarded); M4/M5 compute it and
 // M1 leaves it "". worker_name/capture_state are absent when empty; released_at is absent
 // while the hold is open. has_available_capture is true when a ready archive covers the hold.
+// checkpoint_ref/checkpoint_tip/checkpoint_state (PRD #1810) name where the run's retained
+// checkpoint lives on origin: the branch checkpoint ref, or refs/uzi-recovery/<run id> once
+// superseded; all three are absent when the run has no live retention record.
 export interface RecoveryCustodyHold {
   id: string;
   run_id: string;
@@ -4199,6 +4202,9 @@ export interface RecoveryCustodyHold {
   created_at: string;
   updated_at: string;
   released_at?: string;
+  checkpoint_ref?: string;
+  checkpoint_tip?: string;
+  checkpoint_state?: string;
 }
 
 // RecoveryCustodyAggregate is the owner-level custody summary the board alert and the

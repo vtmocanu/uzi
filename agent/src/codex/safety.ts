@@ -20,13 +20,16 @@ import type {
   BoundaryProcessHandle,
   BoundaryProcessRequest,
   BoundaryRequest,
+  BoundarySink,
   ChildQuiescence,
   CodexExecutionSafety,
   HarnessError,
   ProcessReap,
+  SafeBoundary,
   ToolDisposal,
 } from "../harness.js";
 import type { CaptureSettlement, ExecutionRegistry, ReapOutcome, RegisteredRoot } from "./registry.js";
+import { safeErrorName } from "./registry.js";
 
 /** Which OS identity a boundary action runs as. `worker_pat` is a PAT-bearing
  *  (credentialed) action (e.g. `git push`); `command` is the credential-free
@@ -120,6 +123,72 @@ export type CredentialFreeCaptureSettlement = CaptureSettlement;
  *  eventual permit and aborts at the single boundary deadline. */
 export type ReconcileBeforeBoundary = (request: BoundaryRequest, signal: AbortSignal) => Promise<ReconcileOutcome>;
 
+/** Issue #1864: caps for {@link CodexBoundaryError.diagnostic}. */
+const DIAGNOSTIC_MAX_ERRORS = 3;
+const DIAGNOSTIC_ERROR_MAX_CHARS = 160;
+/** The whole diagnostic never exceeds this; the runner refuses a longer one. */
+const CODEX_BOUNDARY_DIAGNOSTIC_MAX_CHARS = 500;
+const SINK_LABELS: Record<BoundarySink, string> = {
+  milestone_checkpoint: "milestone checkpoint",
+  done_checkpoint: "done checkpoint",
+};
+
+function capChars(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}\u2026`;
+}
+
+/** One code point in Unicode general category Cc (C0, DEL, C1), Cf (every format character:
+ *  zero-width, bidi, soft hyphen, word joiners, U+061C, U+180E, U+FEFF, tag characters) or
+ *  Zl/Zp (U+2028, U+2029): the characters that can break, hide or reorder log text. Keep in
+ *  step with `CODEX_BOUNDARY_DIAGNOSTIC_CHAR` in agent/src/runner.ts, which rejects the same set. */
+const DIAGNOSTIC_CONTROL = /^[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]$/u;
+
+function diagnosticText(raw: unknown): string {
+  const text = typeof raw === "string" ? raw : "";
+  // Each control-character run becomes one space, so "a\nb" stays two readable words.
+  let out = "";
+  let inControl = false;
+  // Iterate by code point so an astral format character (a tag character) is tested whole.
+  for (const ch of text) {
+    if (DIAGNOSTIC_CONTROL.test(ch)) {
+      if (!inControl) out += " ";
+      inControl = true;
+    } else {
+      out += ch;
+      inControl = false;
+    }
+  }
+  return capChars(out.trim(), DIAGNOSTIC_ERROR_MAX_CHARS);
+}
+
+/** Issue #1864: the one-line, secret-free boundary diagnostic. It names the stage, the sink
+ *  (or boundary) and up to {@link DIAGNOSTIC_MAX_ERRORS} harness error messages, which are
+ *  the harness's own secret-free evidence. The action error contributes only its class name:
+ *  its message and object can carry arbitrary sink output and never appear. */
+function boundaryDiagnostic(
+  stage: string,
+  errors: readonly HarnessError[],
+  actionError: unknown,
+  boundary: SafeBoundary | undefined,
+  sink: BoundarySink | undefined,
+): string {
+  const label =
+    sink !== undefined && Object.hasOwn(SINK_LABELS, sink)
+      ? SINK_LABELS[sink]
+      : typeof boundary === "string" && /^[a-z_]{1,32}$/.test(boundary)
+        ? boundary
+        : undefined;
+  const parts = errors.slice(0, DIAGNOSTIC_MAX_ERRORS).map((e) => diagnosticText(e?.message));
+  if (errors.length > DIAGNOSTIC_MAX_ERRORS) parts.push(`+${errors.length - DIAGNOSTIC_MAX_ERRORS} more`);
+  if (actionError !== undefined) {
+    const name = safeErrorName(actionError);
+    parts.push(`action error: ${name === "unknown" ? "Error" : name}`);
+  }
+  const details = parts.length > 0 ? parts.join("; ") : "no detail";
+  const head = `codex boundary failed at ${stage}${label !== undefined ? ` (${label})` : ""}`;
+  return capChars(`${head}: ${details}`, CODEX_BOUNDARY_DIAGNOSTIC_MAX_CHARS);
+}
+
 /** Thrown by `withBoundary` when the boundary cannot be established (quiesce/reap
  *  failed) or the action's own children left the epoch poisoned. The sink was
  *  never run, or ran but its cleanup was incomplete; either way the caller must
@@ -134,11 +203,20 @@ export class CodexBoundaryError extends Error {
   /** Issue #1766: set when a `reconcile`-stage block carried a vault-locked deferral. The
    *  registry is still poisoned; this only tells the runner the cause is recoverable. */
   readonly deferral?: "vault_locked";
+  /** Issue #1864: the boundary and the checkpoint sink that requested it, when known. */
+  readonly boundary?: SafeBoundary;
+  readonly sink?: BoundarySink;
+  /** Issue #1864: a one-line, secret-free summary of this failure, at most
+   *  {@link CODEX_BOUNDARY_DIAGNOSTIC_MAX_CHARS} UTF-16 code units, containing no code point in
+   *  Unicode general category Cc, Cf, Zl or Zp (see `DIAGNOSTIC_CONTROL`). `message` stays the bare
+   *  `codex boundary failed at <stage>`. */
+  readonly diagnostic: string;
   constructor(
     readonly stage: "reconcile" | "quiesce" | "reap" | "action",
     readonly errors: readonly HarnessError[],
     actionError?: unknown,
     deferral?: "vault_locked",
+    context?: { boundary?: SafeBoundary; sink?: BoundarySink },
   ) {
     super(
       `codex boundary failed at ${stage}`,
@@ -147,6 +225,9 @@ export class CodexBoundaryError extends Error {
     this.name = "CodexBoundaryError";
     this.actionError = actionError;
     if (deferral !== undefined) this.deferral = deferral;
+    if (context?.boundary !== undefined) this.boundary = context.boundary;
+    if (context?.sink !== undefined) this.sink = context.sink;
+    this.diagnostic = boundaryDiagnostic(stage, errors, actionError, context?.boundary, context?.sink);
   }
 }
 
@@ -268,6 +349,8 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     deadlineAt: number,
   ): Promise<T> {
     const boundaryAbort = new AbortController();
+    // Issue #1864: every boundary failure names the boundary and sink it happened at.
+    const where = { boundary: request.boundary, ...(request.sink !== undefined ? { sink: request.sink } : {}) };
     // Convert the public duration to one absolute deadline. Each acquisition stage
     // receives only the remaining budget, and the action receives the same deadline
     // signal. Action bodies must propagate that signal into non-registry I/O; we do
@@ -278,14 +361,14 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     if (atEntry <= 0) {
       const errors: readonly HarnessError[] = [{ category: "timeout", message: "codex boundary expired in the acquisition queue" }];
       this.registry.poison(errors);
-      throw new CodexBoundaryError("quiesce", errors);
+      throw new CodexBoundaryError("quiesce", errors, undefined, undefined, where);
     }
     const cancelDeadline = (this.seams.armDeadline ?? defaultArmDeadline)(request, atEntry, () => boundaryAbort.abort());
     const requireRemaining = (stage: "reconcile" | "quiesce" | "reap"): void => {
       if (!boundaryAbort.signal.aborted && remainingMs(deadlineAt) > 0) return;
       const errors: readonly HarnessError[] = [{ category: "timeout", message: `codex boundary deadline expired after ${stage}` }];
       this.registry.poison(errors);
-      throw new CodexBoundaryError(stage, errors);
+      throw new CodexBoundaryError(stage, errors, undefined, undefined, where);
     };
     try {
     // (1.5) PRD #1171 m4: per-sink auth-mode reconciliation, AFTER the serialization queue
@@ -303,7 +386,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       );
       if (reconciled.kind === "blocked") {
         this.registry.poison(reconciled.errors);
-        throw new CodexBoundaryError("reconcile", reconciled.errors, undefined, reconciled.deferral);
+        throw new CodexBoundaryError("reconcile", reconciled.errors, undefined, reconciled.deferral, where);
       }
       requireRemaining("reconcile");
     }
@@ -317,7 +400,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
           ? q.errors
           : [{ category: "protocol", message: `withBoundary: quiesce returned non-quiescent "${q.kind}"` }];
       this.registry.poison(errors);
-      throw new CodexBoundaryError("quiesce", errors);
+      throw new CodexBoundaryError("quiesce", errors, undefined, undefined, where);
     }
     requireRemaining("quiesce");
     const epoch = q.epoch;
@@ -336,7 +419,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
               },
             ];
       this.registry.poison(errors);
-      throw new CodexBoundaryError("reap", errors);
+      throw new CodexBoundaryError("reap", errors, undefined, undefined, where);
     }
     requireRemaining("reap");
 
@@ -389,6 +472,8 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
         "action",
         this.registry.poisonErrors(),
         outcome.ok ? undefined : outcome.error,
+        undefined,
+        where,
       );
     }
     if (!outcome.ok) throw outcome.error;
@@ -552,7 +637,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       this.registry.cancelReservation(reserved.reservation);
       const error: HarnessError = {
         category: "tool",
-        message: `spawnBoundaryAction: spawn failed (${e instanceof Error ? e.name : "unknown"})`,
+        message: `spawnBoundaryAction: spawn failed (${safeErrorName(e)})`,
       };
       this.registry.poison(error);
       return { kind: "poisoned", error };

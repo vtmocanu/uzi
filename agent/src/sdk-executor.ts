@@ -70,6 +70,7 @@ import {
   isNotCodePlan,
 } from "./prompt.js";
 import { resolveRunKind } from "./run-kind.js";
+import { defaultEnvProbeSpawner, environmentFactsSummary, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "./env-probe.js";
 import { readRepoInstructions } from "./repo-instructions.js";
 import {
   buildPreToolUseHook,
@@ -449,6 +450,20 @@ export interface SdkExecutorOptions {
    *  working directory (default run-procs.ts, an agent-uid helper reading the proc tree). Tests
    *  inject a fake. */
   runProcesses?: RunProcessOps;
+  /** issue #1866 M2: the run-start environment probe's spawner (default = spawnRunnerProbe
+   *  rooted at the run's worktree: the runner uid, its own process group, the SDK env, via
+   *  env-probe.ts defaultEnvProbeSpawner). Tests inject a fake to drive the facts. */
+  envProbeSpawner?: EnvProbeSpawner;
+}
+
+/** issue #1866 M2: one worker status line naming the run-start environment facts, emitted before
+ *  the first turn whenever there is something to report (environmentFactsSummary non-empty), for
+ *  every run kind. The prompts carry the matching block separately: the plan prompt on issue runs
+ *  only (the ci_fix and self_improve plan prompts carry none), and the implement prompt on first
+ *  implement turns (gated inside buildImplementPrompt) for every run kind. */
+function emitEnvironmentFactsStatus(ctx: RunContext, facts: EnvFacts): void {
+  const text = environmentFactsSummary(facts);
+  if (text) ctx.emit({ kind: "status", agent: "worker", payload: { text } });
 }
 
 /** PRD #1809 D4: the run-process attribution the executor uses (see run-procs.ts). */
@@ -651,6 +666,9 @@ interface DriveState {
     allowedSubagents: string[],
   ) => NonNullable<SdkOptions["hooks"]>["PreToolUse"];
   isIssueRun: boolean;
+  /** issue #1866 M2: the run-start environment facts (runEnvProbe), rendered into the plan
+   *  prompt and the first implement prompt. */
+  environmentFacts: EnvFacts;
   baseConfig: ClaudeTurnConfig;
   initialWallMs: number;
   // PRD #1189 M1 (D6): the LARGEST served wall (ms) applied so far — the monotonic
@@ -683,6 +701,8 @@ export class SdkExecutor implements Executor {
   private readonly quietSettleMs: number;
   /** PRD #1809 D4: see SdkExecutorOptions.runProcesses. */
   private readonly runProcesses: RunProcessOps;
+  /** issue #1866 M2: see SdkExecutorOptions.envProbeSpawner (undefined ⇒ defaultEnvProbeSpawner). */
+  private readonly envProbeSpawner?: EnvProbeSpawner;
   /** PRD #1809 D4: the current run's worktree, for the process attribution (a working directory
    *  inside it is the run's). Set at the start of run(). */
   private runWorktree: string | undefined;
@@ -763,6 +783,7 @@ export class SdkExecutor implements Executor {
     this.rootStartTime = opts.rootStartTime;
     this.quietSettleMs = opts.quietSettleMs ?? QUIET_SETTLE_MS;
     this.runProcesses = opts.runProcesses ?? defaultRunProcesses;
+    this.envProbeSpawner = opts.envProbeSpawner;
     this.secretPaths = opts.secretPaths ?? [];
     // Provisioning HOME + root are SHARED worker-lifetime paths (Decision 5): they
     // must NOT be derived from the per-run SDK homeDir, or the nix profile/devbox
@@ -1049,6 +1070,29 @@ export class SdkExecutor implements Executor {
       provision: this.provision,
     });
 
+    // issue #1783 (R2): the runner's attempt marker rides the CLI env, so every process the
+    // agent starts is positively attributable to this attempt by the quiescence reaper.
+    const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt);
+    // issue #1866 M2: measure the lead's execution environment once, before the plan turn. The
+    // probe runs as the runner uid with this SDK env in its own process group: a baseline for
+    // what the lead's commands can do, NOT provably identical to an SDK Bash tool call (the SDK
+    // may add its own sandboxing or env). An unconfirmed probe cleanup (EnvProbeCleanupError)
+    // propagates and fails the run here, before any plan turn. Probed BEFORE the JS-deps install
+    // starts: a throw from phaseSetup never reaches run()'s finally, so nothing started here
+    // would be reclaimed; the provisioning dir is removed on that path instead.
+    let environmentFacts: EnvFacts;
+    try {
+      environmentFacts = await runEnvProbe(
+        this.envProbeSpawner ?? defaultEnvProbeSpawner(ctx.worktreePath),
+        env,
+        { harness: "claude", dockerWired: this.dockerWired },
+      );
+    } catch (err) {
+      if (provisionDir) await removeProvisionDir(provisionDir, this.log);
+      throw err;
+    }
+    emitEnvironmentFactsStatus(ctx, environmentFacts);
+
     // Repo instructions (PRD #246 M2). When the repo owner opted in, read + sanitize
     // the clone's ROOT CLAUDE.md and frame it ONCE as a nonce-fenced UNTRUSTED/ADVISORY
     // block — read once (one file read), framed once (one nonce), threaded to BOTH
@@ -1116,9 +1160,6 @@ export class SdkExecutor implements Executor {
     // the prompt's consumer is the agent that will actually run the gates.
     let depsTruncated = false;
 
-    // issue #1783 (R2): the runner's attempt marker rides the CLI env, so every process the
-    // agent starts is positively attributable to this attempt by the quiescence reaper.
-    const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt);
     // PRD #122 M2: `let`, not `const` — the implement loop raises it to the server's
     // milestone-scaled ceiling when the state-report ACK serves one (Decisions 5/5b). The
     // claim config already carries the scaled value on a RESUME (the run is frozen); the
@@ -1471,6 +1512,7 @@ export class SdkExecutor implements Executor {
       subagentCanWrite,
       preToolUse,
       isIssueRun,
+      environmentFacts,
       baseConfig,
       initialWallMs,
       maxServedWallMs,
@@ -1502,6 +1544,7 @@ export class SdkExecutor implements Executor {
       planSubagentNames,
       subagentCanWrite,
       maxRevisions,
+      environmentFacts,
     } = drive;
     let resumeId = drive.resumeId;
     let frozenMilestones = drive.frozenMilestones;
@@ -1783,6 +1826,8 @@ export class SdkExecutor implements Executor {
             publishedTip: ctx.publishedTip,
             // PRD #501 REC B: thread the autopilot flag so the plan note renders.
             autoApprove: ctx.autoApprove,
+            // issue #1866 M2: the run-start environment facts (no block when nothing to say).
+            environmentFacts,
           });
         }
         // PRD #1247 M5b (D13): both paths below set `approvedPlan` + the candidate milestone list,
@@ -2088,6 +2133,7 @@ export class SdkExecutor implements Executor {
       idleMs,
       initialWallMs,
       toolEnv,
+      environmentFacts,
     } = drive;
     const preApproved = drive.preApproved!;
     const approvedPlan = drive.approvedPlan!;
@@ -2558,6 +2604,9 @@ export class SdkExecutor implements Executor {
             // PRD #390 M3: escalate this turn when the PREVIOUS work turn left the tracker with no
             // milestone in progress on a milestone-bearing run.
             progressMissedLastTurn,
+            // issue #1866 M2: the run-start environment facts, rendered on first turns only
+            // (gated inside buildImplementPrompt).
+            environmentFacts,
             // issue #279: teach the lead the report-only evidence path, ISSUE RUNS ONLY —
             // gated on the same isIssueRun discriminator the signal_done schema uses.
             reportOnly: isIssueRun,

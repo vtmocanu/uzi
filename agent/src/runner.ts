@@ -15,7 +15,7 @@ import {
 import type { SecretFinding } from "./secret-scan-guard.js";
 import type { CredentialFreeSettleOutcome, Executor, ExecutorResult, RunContext, WallParkOutcome, WallParkRefresh } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
-import type { BoundaryPermit, BoundaryRequest } from "./harness.js";
+import type { BoundaryPermit, BoundaryRequest, BoundarySink, SafeBoundary } from "./harness.js";
 import { SinkGate } from "./sink-gate.js";
 import { cloneKeyOf } from "./attempt-path.js";
 import {
@@ -237,6 +237,54 @@ const NON_CLOSING_BODY_UNCONFIRMED_REASON =
  *  outcome; a terminal/finalize sink lets it propagate to the failed-run report. */
 function isCodexBoundaryError(err: unknown): boolean {
   return err instanceof Error && err.name === "CodexBoundaryError";
+}
+
+/** Issue #1864: the most a CodexBoundaryError `diagnostic` may be (safety.ts caps it there too). */
+const CODEX_BOUNDARY_DIAGNOSTIC_MAX_CHARS = 500;
+const CODEX_BOUNDARY_STAGES: ReadonlySet<string> = new Set(["reconcile", "quiesce", "reap", "action"]);
+const CODEX_BOUNDARY_NAMES: ReadonlySet<SafeBoundary> = new Set<SafeBoundary>([
+  "checkpoint", "park", "shutdown", "terminal", "finalize", "credentialed_git",
+]);
+const CODEX_BOUNDARY_SINKS: ReadonlySet<BoundarySink> = new Set<BoundarySink>(["milestone_checkpoint", "done_checkpoint"]);
+
+/** Issue #1864: a code point a CodexBoundaryError `diagnostic` must not contain: Unicode general
+ *  category Cc (C0, DEL, C1), Cf (every format character: zero-width, bidi, soft hyphen, word
+ *  joiners, U+061C, U+180E, U+FEFF, tag characters) or Zl/Zp (U+2028, U+2029). Keep in step with
+ *  `DIAGNOSTIC_CONTROL` in agent/src/codex/safety.ts, which folds the same set to a space when
+ *  building the diagnostic. */
+const CODEX_BOUNDARY_DIAGNOSTIC_CHAR = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+
+/** Issue #1864: the one-line `diagnostic` a CodexBoundaryError carries (stage, checkpoint, the
+ *  unsettled work), read by name like {@link isCodexBoundaryError}. Returned only when it is a
+ *  string of at most 500 UTF-16 code units matching no {@link CODEX_BOUNDARY_DIAGNOSTIC_CHAR}; anything
+ *  else (a forged or malformed field) yields undefined, so the caller falls back to the bare
+ *  message. */
+function codexBoundaryDiagnosticOf(err: unknown): string | undefined {
+  if (!isCodexBoundaryError(err)) return undefined;
+  const diagnostic = (err as { diagnostic?: unknown }).diagnostic;
+  if (typeof diagnostic !== "string" || diagnostic.length > CODEX_BOUNDARY_DIAGNOSTIC_MAX_CHARS) return undefined;
+  if (CODEX_BOUNDARY_DIAGNOSTIC_CHAR.test(diagnostic)) return undefined;
+  return diagnostic;
+}
+
+/** Issue #1864: the redacted `diagnostic` log field for a best-effort sink's boundary warn;
+ *  empty when the error carries no valid diagnostic. */
+function codexBoundaryDiagnosticField(err: unknown, redact: (text: string) => string): { diagnostic?: string } {
+  const diagnostic = codexBoundaryDiagnosticOf(err);
+  return diagnostic === undefined ? {} : { diagnostic: redact(diagnostic) };
+}
+
+/** Issue #1864: the structured fields of a CodexBoundaryError, each kept only when it is one of
+ *  the closed set of values the harness can produce. */
+function codexBoundaryFieldsOf(err: unknown): { stage?: string; boundary?: SafeBoundary; sink?: BoundarySink } {
+  const e = err as { stage?: unknown; boundary?: unknown; sink?: unknown };
+  const out: { stage?: string; boundary?: SafeBoundary; sink?: BoundarySink } = {};
+  if (typeof e.stage === "string" && CODEX_BOUNDARY_STAGES.has(e.stage)) out.stage = e.stage;
+  if (typeof e.boundary === "string" && CODEX_BOUNDARY_NAMES.has(e.boundary as SafeBoundary)) {
+    out.boundary = e.boundary as SafeBoundary;
+  }
+  if (typeof e.sink === "string" && CODEX_BOUNDARY_SINKS.has(e.sink as BoundarySink)) out.sink = e.sink as BoundarySink;
+  return out;
 }
 
 /** Issue #1766: the harness-agnostic probe for a Codex credential DEFERRAL. A locked owner vault
@@ -2276,6 +2324,7 @@ export class RunRunner {
             runLog.warn("park checkpoint boundary blocked; nothing published to origin", {
               run_id: runId,
               error: errMessage(err),
+              ...codexBoundaryDiagnosticField(err, flight.redactText),
             });
           }
           // issue #1783: a blocked proof published nothing, so the report carries no durability
@@ -2504,6 +2553,7 @@ export class RunRunner {
               runLog.warn("shutdown checkpoint boundary blocked; checkpoint not published to origin", {
                 run_id: runId,
                 error: errMessage(err),
+                ...codexBoundaryDiagnosticField(err, flight.redactText),
               });
               return isCodexBoundaryTimeout(err) ? "timeout" : "boundary_blocked";
             }
@@ -3280,7 +3330,7 @@ export class RunRunner {
             ? err.message === "scratch_publication_refused: cannot verify fresh remote floor"
               ? "scratch_publication_refused: cannot verify fresh remote floor"
               : "scratch_publication_refused: candidate history cannot be published"
-            : errMessage(err);
+            : (codexBoundaryDiagnosticOf(err) ?? errMessage(err));
     const reason = redactText(rawReason);
     // PRD #69 M7a: derive the TRUSTED failure class from the RAW reason (before
     // redaction) so a fatal pre-start failure (provisioning / no token) carries a
@@ -3297,6 +3347,11 @@ export class RunRunner {
         ? err.failOrigin
         : failOriginForReason(rawReason);
     runLog.error("run failed", { error: reason });
+    // Issue #1864: a Codex boundary failure also logs which stage, boundary and sink failed.
+    const boundaryDiagnostic = codexBoundaryDiagnosticOf(err);
+    if (boundaryDiagnostic !== undefined) {
+      runLog.error("codex boundary failed", { ...codexBoundaryFieldsOf(err), detail: redactText(boundaryDiagnostic) });
+    }
     // PRD #1391 Run B M3 (D5): if the permanent-failure hook tripped, AWAIT its settlement first — it
     // journals `failed` durably and aborts the attempt (which routed us here), so the journal must be
     // observed as installed before the hasPendingTerminal check below. Resolves immediately when the
@@ -7594,7 +7649,7 @@ export class RunRunner {
         try {
           await this.reapForSink(
             executor,
-            { boundary: "checkpoint", deadlineMs: this.codexBoundaryDeadlineMs },
+            { boundary: "checkpoint", deadlineMs: this.codexBoundaryDeadlineMs, sink: opts.sink },
             async (permit) => {
               const midRunOverlay = hasNewWork
                 ? await this.buildCheckpointOverlay(claim, flight, barePath)
@@ -8134,7 +8189,7 @@ export class RunRunner {
       checkpoint: (opts) =>
         // issue #1597 M2: gated — waits for (and preempts) an in-flight mid-turn tick.
         this.runGatedSink(flight, async () => {
-          await checkpointBody({ reap: opts.reap, progress: opts.progress });
+          await checkpointBody({ reap: opts.reap, progress: opts.progress, sink: opts.sink });
         }),
       // Issue #281: a cheap fingerprint of the runner clone's committed + working-tree
       // state for the executor's no-progress detector — the runner-owned clone's branch
@@ -8517,6 +8572,7 @@ export class RunRunner {
           // Docker teardown already ran at the sink's first proof, and never blocks anyway.
           dockerHost: opts.processOnly ? undefined : this.dockerHost,
           registry: this.liveAttempts,
+          otherClaimInFlight: [...this.executionTails.keys()].some((id) => id !== flight.runId),
           site: opts.site,
         });
       } catch (err) {
@@ -11332,6 +11388,7 @@ export class RunRunner {
       if (!isCodexBoundaryError(err)) throw err;
       runLog.warn("recovery checkpoint boundary blocked; restore point saved locally but not published", {
         error: errMessage(err),
+        ...codexBoundaryDiagnosticField(err, flight.redactText),
       });
     }
     return { verified, published };
@@ -11903,6 +11960,7 @@ export class RunRunner {
       if (!isCodexBoundaryError(err)) throw err;
       runLog.warn("completion hold checkpoint boundary blocked; restore point saved locally but not published", {
         error: errMessage(err),
+        ...codexBoundaryDiagnosticField(err, flight.redactText),
       });
     }
     return { verified: true, published, mode: "same_worker_only", head };

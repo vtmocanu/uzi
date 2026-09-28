@@ -457,6 +457,7 @@ interface FakeProc {
   zombie?: boolean;
   /** `stat` field 22 (start time); default {@link DEFAULT_START}. */
   start?: number;
+  statError?: "EACCES";
 }
 
 const DEFAULT_START = 1000;
@@ -492,6 +493,7 @@ function fakeTable(procs: Record<number, FakeProc>, opts: { listThrows?: boolean
     },
     readStat: (pid) => {
       const p = get(pid);
+      if (p.statError) throw errno(p.statError);
       // Fields 3..22 (state … starttime): 15 zero fields sit between the session and field 22.
       return `${pid} (proc ${pid}) S ${p.ppid ?? 1} ${p.pgid ?? pid} ${p.sid ?? pid} ${"0 ".repeat(15)}${p.start ?? DEFAULT_START} 0 0`;
     },
@@ -645,7 +647,7 @@ describe("A-foreign-uids: worker, root and runner-cmd processes never make a rea
 
 describe("A-nondumpable: a runner-uid process whose environ is unreadable", () => {
   it("with no ancestry to a live attempt → unverified", async () => {
-    const { r, signalled } = await fakeReap({ 50: { uid: RUNNER, cwd: "EACCES", env: "EACCES", ppid: 1 } }, fakeReq());
+    const { r, signalled } = await fakeReap({ 50: { uid: ME, cwd: "EACCES", env: "EACCES", ppid: 1 } }, fakeReq({ targetUid: ME }));
     assert.equal(r.state, "unverified");
     assert.deepEqual(signalled, []);
     assert.deepEqual(r.processes.map((p) => [p.pid, p.cwd, p.reason]), [[50, "unreadable", "unreadable_unattributed"]]);
@@ -663,6 +665,208 @@ describe("A-nondumpable: a runner-uid process whose environ is unreadable", () =
       assert.equal(r.state, "quiescent", JSON.stringify(shape));
     }
   });
+});
+
+function solitaryReq(extra: Partial<ScanRequest> = {}): ScanRequest {
+  return { ...fakeReq(extra), mayKillUnreadableUnattributed: true } as ScanRequest & {
+    mayKillUnreadableUnattributed: boolean;
+  };
+}
+
+describe("UID-split solitary unreadable runner process", () => {
+  it("never signals an unreadable descendant of the scanner", () => {
+    const procs = { 49: { uid: RUNNER, cwd: "EACCES" as const, env: "EACCES" as const, ppid: SELF } };
+    const helper = scanOnce(solitaryReq(), fakeTable(procs), SELF, true);
+    assert.deepEqual(helper.kill, [], "the runner-uid helper owns and excludes all its descendants");
+    assert.deepEqual(helper.unverified, []);
+
+    const inProcess = scanOnce(solitaryReq(), fakeTable(procs), SELF, false);
+    assert.deepEqual(inProcess.kill, [], "without a readable attempt marker, scanner ancestry cannot authorize a kill");
+    assert.deepEqual(inProcess.unverified.map((p) => p.pid), [49]);
+  });
+
+  it("does not signal when an unreadable ancestor prevents excluding a scanner descendant", () => {
+    const procs: Record<number, FakeProc> = {
+      48: { uid: RUNNER, ppid: SELF, statError: "EACCES" },
+      49: { uid: RUNNER, cwd: "EACCES", env: "EACCES", ppid: 48 },
+    };
+    const result = scanOnce(solitaryReq(), fakeTable(procs), SELF, true);
+    assert.deepEqual(result.kill, []);
+    assert.deepEqual(result.unverified.map((p) => p.pid), [49]);
+  });
+
+  for (const mode of ["own", "seed", "capture"] as const) {
+    it(`${mode}: kills the sole unattributable runner-uid process and confirms its exit`, async () => {
+      const procs: Record<number, FakeProc> = {
+        50: { uid: RUNNER, cwd: "EACCES", env: "EACCES", ppid: 1 },
+      };
+      const { r, signalled } = await fakeReap(procs, solitaryReq({ mode }));
+      assert.equal(r.state, "quiescent", r.detail);
+      assert.deepEqual(signalled, [50]);
+      assert.deepEqual(r.killed, [50]);
+      assert.deepEqual(r.processes, []);
+    });
+  }
+
+  it("classifies the candidate before clone scope and keeps its start time private", () => {
+    const result = scanOnce(
+      solitaryReq({ mode: "seed", targetPaths: ["/another/clone"] }),
+      fakeTable({ 53: { uid: RUNNER, cwd: "EACCES", env: "EACCES", ppid: 1 } }),
+      SELF,
+    );
+    assert.deepEqual(result.kill, [{
+      pid: 53, uid: RUNNER, comm: "proc 53", cwd: "unreadable",
+      reason: "unreadable_no_other_claim", startTime: DEFAULT_START,
+    }]);
+    assert.deepEqual(result.unverified, []);
+  });
+
+  it("missing stat field 22 leaves an unreadable process unverified and unsignalled", async () => {
+    const base = fakeTable({ 54: { uid: RUNNER, cwd: "EACCES", env: "EACCES" } });
+    const table: ProcTable = { ...base, readStat: (pid) => base.readStat(pid).split(" ").slice(0, -3).join(" ") };
+    let now = 0;
+    const signalled: number[] = [];
+    const r = await reapProcesses(solitaryReq(), {
+      table, selfPid: SELF, deadlineMs: 20, intervalMs: 10,
+      now: () => now, sleep: async (ms) => { now += ms; },
+      kill: (pid) => { signalled.push(pid); },
+    });
+    assert.equal(r.state, "unverified");
+    assert.deepEqual(signalled, []);
+    assert.equal(r.processes[0]?.reason, "unreadable_unattributed");
+  });
+
+  it("does not signal readable residue when its start time cannot be checked", async () => {
+    const { r, signalled } = await fakeReap(
+      { 55: { uid: RUNNER, cwd: CLONE, statError: "EACCES" } },
+      solitaryReq(),
+    );
+    assert.equal(r.state, "survivors");
+    assert.deepEqual(signalled, []);
+    assert.equal(r.processes[0]?.reason, "unmarked_in_scope:kill_unconfirmed");
+  });
+
+  it("a live other attempt marker keeps an unreadable process unverified and unsignalled", async () => {
+    const { r, signalled } = await fakeReap(
+      { 51: { uid: RUNNER, cwd: "EACCES", env: "EACCES", ppid: 1 } },
+      solitaryReq({ mode: "seed", liveMarkers: [`other:${TERMINAL_ID}`] }),
+    );
+    assert.equal(r.state, "unverified");
+    assert.deepEqual(signalled, []);
+    assert.deepEqual(r.processes.map((p) => p.pid), [51]);
+  });
+
+  it("single-uid request construction keeps a solitary unreadable process unverified", async () => {
+    assert.notEqual(process.env.UZI_UID_SPLIT, "1", "this process must exercise the single-uid path");
+    const signalled: number[] = [];
+    let now = 0;
+    const req = {
+      mode: "own" as const,
+      attempt: undefined,
+      cloneKey: KEY,
+      targetPaths: [CLONE],
+      processes: true,
+      dockerHost: undefined,
+      registry: new LiveAttemptRegistry(),
+      otherClaimInFlight: false,
+    };
+    const out = await quiesceRunAttempt(req, {
+      targetUid: ME,
+      reap: {
+        table: fakeTable({ 52: { uid: ME, cwd: "EACCES", env: "EACCES", ppid: 1 } }),
+        selfPid: SELF,
+        deadlineMs: 20,
+        now: () => now,
+        sleep: async (ms) => { now += ms; },
+        kill: (pid) => { signalled.push(pid); },
+      },
+    });
+    assert.equal(out.process?.state, "unverified");
+    assert.deepEqual(signalled, []);
+    assert.deepEqual(out.process?.processes.map((p) => p.pid), [52]);
+  });
+
+  it("a recorded live root exempts its unreadable child", async () => {
+    const { r, signalled } = await fakeReap(
+      {
+        60: { uid: RUNNER, cwd: "/elsewhere", start: DEFAULT_START },
+        61: { uid: RUNNER, cwd: "EACCES", env: "EACCES", ppid: 60 },
+      },
+      solitaryReq({ liveRoots: [{ pid: 60, startTime: DEFAULT_START }] }),
+    );
+    assert.equal(r.state, "quiescent", r.detail);
+    assert.deepEqual(signalled, []);
+  });
+
+  it("an ineffective kill cannot prove quiescence", async () => {
+    let now = 0;
+    const signalled: number[] = [];
+    const r = await reapProcesses(solitaryReq({ mode: "capture" }), {
+      table: fakeTable({ 62: { uid: RUNNER, cwd: "EACCES", env: "EACCES" } }),
+      selfPid: SELF,
+      deadlineMs: 20,
+      intervalMs: 10,
+      now: () => now,
+      sleep: async (ms) => { now += ms; },
+      kill: (pid) => { signalled.push(pid); },
+    });
+    assert.equal(r.state, "survivors");
+    assert.ok(signalled.length > 0);
+    assert.deepEqual(r.processes.map((p) => p.pid), [62]);
+    assert.equal(r.processes[0]?.reason, "unreadable_no_other_claim:kill_unconfirmed");
+    assert.equal("startTime" in r.processes[0]!, false);
+  });
+
+  for (const afterReuse of ["readable out of scope", "vanished"] as const) {
+    it(`does not signal a pid reused after classification; the next scan sees ${afterReuse}`, async () => {
+      const pid = 65;
+      const procs: Record<number, FakeProc> = {
+        [pid]: { uid: RUNNER, cwd: "EACCES", env: "EACCES", start: DEFAULT_START },
+      };
+      const base = fakeTable(procs);
+      let statReads = 0;
+      let scans = 0;
+      const signalled: number[] = [];
+      const table: ProcTable = {
+        ...base,
+        listPids: () => { scans++; return base.listPids(); },
+        readStat: (candidate) => {
+          const stat = base.readStat(candidate);
+          if (candidate === pid && ++statReads === 2) {
+            // The first read builds the scan's pid map; the second names the classified
+            // unreadable candidate. Reuse it just after that classification read.
+            if (afterReuse === "vanished") delete procs[pid];
+            else procs[pid] = { uid: RUNNER, cwd: "/elsewhere", env: {}, start: DEFAULT_START + 1 };
+          }
+          return stat;
+        },
+      };
+      const r = await reapProcesses(solitaryReq(), {
+        table, selfPid: SELF, deadlineMs: 20, intervalMs: 10,
+        now: () => (scans - 1) * 10,
+        sleep: async () => {},
+        kill: (candidate) => { signalled.push(candidate); },
+      });
+      assert.deepEqual(signalled, [], "a changed start time must veto the signal");
+      assert.deepEqual(r.killed, []);
+      assert.ok(scans >= 2, "the reaper must rescan after declining the signal");
+      assert.equal(r.state, "quiescent", r.detail);
+    });
+  }
+
+  for (const defect of ["reused pid", "unreadable stat"] as const) {
+    it(`${defect} never exempts an unattributable process by a stale recorded root`, async () => {
+      const root: FakeProc = { uid: RUNNER, cwd: "/elsewhere", start: DEFAULT_START + 1 };
+      if (defect === "unreadable stat") root.statError = "EACCES";
+      const { r, signalled } = await fakeReap(
+        { 63: root, 64: { uid: RUNNER, cwd: "EACCES", env: "EACCES", ppid: 63 } },
+        fakeReq({ liveRoots: [{ pid: 63, startTime: DEFAULT_START }] }),
+      );
+      assert.equal(r.state, "unverified");
+      assert.deepEqual(signalled, []);
+      assert.deepEqual(r.processes.map((p) => p.pid), [64]);
+    });
+  }
 });
 
 describe("A-self on an injected table", () => {

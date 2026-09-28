@@ -252,12 +252,65 @@ export interface CustodyHoldView {
   // Ordered action set for this hold. The strongest verb (discard) only appears where the
   // worker-local source may be the only copy (no available archive).
   actions: CustodyHoldAction[];
+  // Where the run's retained published checkpoint currently lives on the forge (PRD #1810),
+  // or null when nothing is retained (checkpoint_ref absent/empty).
+  checkpoint: CustodyCheckpointView | null;
+}
+
+// CustodyCheckpointView locates a hold's retained checkpoint on the forge (PRD #1810). A
+// branch checkpoint sits at refs/uzi-checkpoints/<branch>; once a newer run on the same
+// branch takes that slot the work is MOVED (never deleted) to refs/uzi-recovery/<run-id>.
+export interface CustodyCheckpointView {
+  // "branch" = still at the branch checkpoint slot; "recovery" = moved to a recovery ref.
+  kind: "branch" | "recovery";
+  // Short plain-language label distinguishing the two locations (and a slot in motion).
+  label: string;
+  // The full ref, sanitized for display. Rendered monospace and break-anywhere.
+  ref: string;
+  // The tip trimmed to 12 characters for display; "" when the server sent none.
+  shortTip: string;
+  // A one-line explanation for the moved case, "" otherwise.
+  note: string;
+}
+
+const RECOVERY_REF_PREFIX = "refs/uzi-recovery/";
+const SHORT_TIP_LEN = 12;
+
+// custodyCheckpointView derives the checkpoint location from checkpoint_ref/_tip/_state.
+// The ref's own namespace decides the kind (it names where the work IS); a "superseded"
+// state is honoured too so a mismatched pair still reads as moved, never as the branch slot.
+// Ref and tip are sanitized (defense in depth): the ref embeds a branch name.
+function custodyCheckpointView(hold: RecoveryCustodyHold): CustodyCheckpointView | null {
+  const ref = stripUnsafeChars(hold.checkpoint_ref ?? "").trim();
+  if (!ref) return null;
+  const shortTip = stripUnsafeChars(hold.checkpoint_tip ?? "").trim().slice(0, SHORT_TIP_LEN);
+  const state = hold.checkpoint_state ?? "";
+  if (ref.startsWith(RECOVERY_REF_PREFIX) || state === "superseded") {
+    return {
+      kind: "recovery",
+      label: "Moved to recovery ref",
+      ref,
+      shortTip,
+      note: "A newer run took this branch, so this work was moved here. Nothing was deleted.",
+    };
+  }
+  const label =
+    state === "superseding"
+      ? "Branch checkpoint, moving to a recovery ref"
+      : state === "settling"
+        ? "Branch checkpoint, settling"
+        : "Branch checkpoint";
+  return { kind: "branch", label, ref, shortTip, note: "" };
 }
 
 // custodyHoldView maps one hold onto its presentation, from the server-derived `attention`
 // and `has_available_capture`. An UNKNOWN attention is treated as needing a decision
 // (fail toward the owner seeing it), never silently hidden or auto-actioned.
 export function custodyHoldView(hold: RecoveryCustodyHold): CustodyHoldView {
+  return { ...attentionView(hold), checkpoint: custodyCheckpointView(hold) };
+}
+
+function attentionView(hold: RecoveryCustodyHold): Omit<CustodyHoldView, "checkpoint"> {
   const hasArchive = hold.has_available_capture;
   switch (hold.attention) {
     case "active":

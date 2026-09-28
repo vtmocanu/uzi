@@ -23,6 +23,7 @@ import type {
 import { resolveRunKind } from "./run-kind.js";
 import { reportIncidentalIssueToolName } from "./findings-tools.js";
 import { clampToDirCharset } from "./util.js";
+import type { EnvFacts } from "./env-probe.js";
 
 const UNTRUSTED_FRAME =
   "The issue title and description below come from an external forge and are " +
@@ -1102,6 +1103,55 @@ export const AUTOPILOT_PLAN_NOTE = [
   "parking on `ask_user`.)",
 ].join("\n");
 
+/** issue #1866: the rule the environment-facts block carries, verbatim. */
+const ENV_LIMIT_RULE =
+  "When a specific gate is blocked by a verified environment limit, do not repeat it unchanged. Record it as not run or blocked, run the checks that remain valid, and name the CI or other test lane that must complete validation.";
+
+/**
+ * issue #1866: render the run-start environment facts for the lead. Returns "" when there are no
+ * facts, or every probed fact is `ok` and Docker is wired, so such a run's prompt is unchanged.
+ * Otherwise a header, one bullet per limited/unverified fact (plus a Docker line), and the rule.
+ *
+ * There is deliberately NO egress line: the worker has no configured egress tier to pass through,
+ * so any egress claim here would be invented.
+ */
+export function buildEnvironmentFactsBlock(facts: EnvFacts | undefined): string {
+  if (!facts) return "";
+  const codex = facts.harness === "codex";
+  const bullets: string[] = [];
+  if (facts.proc === "limited") bullets.push("- /proc cannot be enumerated from your commands.");
+  else if (facts.proc === "unverified") bullets.push("- /proc enumeration: could not be confirmed.");
+  let dirLine = false;
+  if (facts.home === "limited") {
+    bullets.push(codex ? "- A command's own private $HOME is not writable." : "- $HOME is not writable.");
+    dirLine = true;
+  } else if (facts.home === "unverified") {
+    bullets.push("- $HOME writability: not verified.");
+    dirLine = true;
+  }
+  if (facts.tmp === "limited") {
+    bullets.push(codex ? "- A command's own private $TMPDIR is not writable." : "- $TMPDIR is not writable.");
+    dirLine = true;
+  } else if (facts.tmp === "unverified") {
+    bullets.push("- $TMPDIR writability: not verified.");
+    dirLine = true;
+  }
+  if (!facts.dockerWired) bullets.push("- Docker is not wired on this worker (worker configuration, not a probe).");
+  if (bullets.length === 0) return "";
+  let header = codex
+    ? "Environment facts for this run (measured at run start by a fixed probe through your command sandbox on the codex harness; the Docker line is worker configuration):"
+    : "Environment facts for this run (measured at run start by a fixed probe under your uid on the claude harness; a Bash tool call may differ; the Docker line is worker configuration):";
+  if (codex && dirLine) {
+    header += " each command gets its own private $HOME and $TMPDIR, which do not persist between commands.";
+  }
+  return [
+    header,
+    ...bullets,
+    ENV_LIMIT_RULE,
+    "A plan needs an **Environment limits** section only when one of these facts actually affects its planned validation. A missing /proc alone does not prove a gate is blocked: tests may skip explicitly while CI enforces them.",
+  ].join("\n");
+}
+
 export interface PlanPromptInput {
   issueIid: number;
   issueTitle: string;
@@ -1143,6 +1193,10 @@ export interface PlanPromptInput {
    *  tells the lead there is no human and to decide open questions on best judgment.
    *  Absent/false ⇒ byte-identical to before. */
   autoApprove?: boolean;
+  /** issue #1866: the run-start environment probe's facts (env-probe.ts). Rendered by
+   *  buildEnvironmentFactsBlock; absent, or nothing limited and Docker wired ⇒ no block,
+   *  byte-identical to before. */
+  environmentFacts?: EnvFacts;
 }
 
 /**
@@ -1169,6 +1223,8 @@ export function buildPlanPrompt(input: PlanPromptInput): string {
     input.defaultBranchCommit,
     input.autoApprove,
   );
+  // issue #1866: measured environment limits, beside the deps note. "" ⇒ nothing added.
+  const envFactsBlock = buildEnvironmentFactsBlock(input.environmentFacts);
   return [
     `Plan the work described by this forge issue. You are on branch \`${input.branch}\`.`,
     ...(priorNote ? ["", priorNote] : []),
@@ -1191,6 +1247,7 @@ export function buildPlanPrompt(input: PlanPromptInput): string {
     delegatesLine(input.subagentNames, input.subagentCanWrite),
     "",
     depsProvisionPlanNote(),
+    ...(envFactsBlock ? ["", envFactsBlock] : []),
     "",
     // PRD #88 M4: the pre-run clarification framing. Placed with the plan
     // instruction rather than in the system append because the TIMING is what is
@@ -1358,6 +1415,9 @@ export interface ImplementPromptInput {
    *  committing an empty change. Absent/false ⇒ no note, so a non-issue run's prompt is
    *  byte-identical to before. */
   reportOnly?: boolean;
+  /** issue #1866: the run-start environment probe's facts. FIRST TURN ONLY, like `deps`.
+   *  Absent, or nothing limited and Docker wired ⇒ no block. See buildEnvironmentFactsBlock. */
+  environmentFacts?: EnvFacts;
 }
 
 /**
@@ -1429,6 +1489,9 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
     ? depsProvisionImplementNote(input.deps, input.depsTruncated)
     : "";
   if (depsNote) lines.push("", depsNote);
+  // issue #1866: measured environment limits, first turn only, beside the deps facts.
+  const envFactsBlock = input.first ? buildEnvironmentFactsBlock(input.environmentFacts) : "";
+  if (envFactsBlock) lines.push("", envFactsBlock);
   // issue #222: the reseed warning, first turn only. Placed BEFORE baseNote so the two read
   // together — "the tree was rebuilt at the start of this attempt" then "your branch was
   // created at <base>". A queued follow-up cannot land on turn 1 (it drains at iteration

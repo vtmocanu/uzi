@@ -55,6 +55,7 @@ import type { CodexEffectLaunchSpec, CodexRootHandle } from "../src/codex/launch
 // exact clause `tests` title; a no-op under a bare `npm test` (CODEX_M4_EVIDENCE unset).
 import { recordConformanceEvidence } from "./conformance-evidence.js";
 import { workerSecretDenyPaths } from "../src/guardrails.js";
+import { ENV_PROBE_SCRIPT } from "../src/env-probe.js";
 
 // The executor's homeRoot is KNOWN so the test can name the literal epoch-0 provider-HOME path.
 const HOME_ROOT = "/data/agent-home/run-1";
@@ -316,6 +317,9 @@ function makeRig(responder: Responder): Rig {
   const deps: CodexExecutorDeps = {
     launchProviderRoot: async (): Promise<CodexLaunchRootResult> => ({ root, transport, supervisorPid: 1234 }),
     spawnCommand: async (argv, cmdOpts) => {
+      // Issue #1866 M2: the run-start environment probe (the worker's own fixed command, before
+      // any turn) is answered here and kept out of spawnCommandCalls, which counts model commands.
+      if (argv[1] === "-e" && argv[2] === ENV_PROBE_SCRIPT) return { code: 0, stdout: "", stderr: "" };
       spawnCommandCalls.push({ argv, opts: cmdOpts });
       return { code: 0, stdout: "ok", stderr: "" };
     },

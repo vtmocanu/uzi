@@ -3,7 +3,7 @@
 -- PRD #1867 M2: the durable state of a failed run's checkpoint SALVAGE. Salvage is
 -- CREATE-ONLY: when a failed, checkpoint-eligible run has a published checkpoint tip, the
 -- api sweep creates a run-scoped refs/uzi-salvage/<run-id> at that tip
--- (pushbroker.CreateSalvageRef), only when refs/uzi-checkpoints/<branch> or
+-- (pushbroker.CreateRef, #1810's create-only primitive), only when refs/uzi-checkpoints/<branch> or
 -- refs/uzi-recovery/<run-id> is verified at the recorded tip, and later CAS-deletes that
 -- salvage ref when it expires. It never deletes or moves the branch checkpoint ref or a
 -- recovery ref: #1810's retention owns those. This table records that lifecycle, one row

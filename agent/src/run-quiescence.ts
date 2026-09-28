@@ -24,7 +24,8 @@
 //       ppid chain, process group or session leading to (or being) a recorded root of ANOTHER
 //       live attempt (a Claude CLI group or a Codex provider supervisor), or a long-lived
 //       runner-uid root the worker itself launched and recorded, is out of scope; anything else
-//       is `unverified`. A root is recorded as its pid AND its start time (`stat` field 22,
+//       is `unverified` unless the solitary uid-split permission and a stable stat start time
+//       permit reaping it. A root is recorded as its pid AND its start time (`stat` field 22,
 //       captured at spawn/registration) and matches only a live process with both, so a pid the
 //       kernel recycled after the root exited never exempts anything.
 //   R3  SCOPE first. A process is in scope iff its cwd lies (by whole path components) within a
@@ -444,6 +445,8 @@ export interface ScanRequest {
   ownMarker?: string;
   /** Markers of every OTHER live attempt on this worker. */
   liveMarkers: string[];
+  /** Explicit permission for solitary uid-split reaping; omission is false. */
+  mayKillUnreadableUnattributed?: boolean;
   /** Recorded roots (pid + start time) of every OTHER live attempt on this worker (Claude CLI
    *  groups, Codex provider supervisors), plus the long-lived runner-uid roots the worker itself
    *  launched. A root matches only while a live process has BOTH its pid and its start time. */
@@ -467,8 +470,13 @@ export interface QuiesceProcess {
   reason: string;
 }
 
+interface KillCandidate extends QuiesceProcess {
+  /** Internal identity captured during classification; never included in ProcessQuiescence. */
+  startTime: number | undefined;
+}
+
 interface ScanResult {
-  kill: QuiesceProcess[];
+  kill: KillCandidate[];
   survivors: QuiesceProcess[];
   unverified: QuiesceProcess[];
   tableError?: string;
@@ -549,18 +557,24 @@ export function scanOnce(
   // R5: never self, never an ancestor; a descendant only when an attempt marker proves residue.
   const excluded = new Set<number>([selfPid, ...ancestorsOf(selfPid, table)]);
   const parentOf = new Map<number, number>();
+  const startTimeOf = new Map<number, number>();
   for (const pid of pids) {
     const r = tryRead(() => table.readStat(pid));
     const facts = r.ok ? parseStat(r.value) : undefined;
-    if (facts) parentOf.set(pid, facts.ppid);
+    if (facts) {
+      parentOf.set(pid, facts.ppid);
+      if (facts.startTime !== undefined) startTimeOf.set(pid, facts.startTime);
+    }
   }
-  const isDescendant = (pid: number): boolean => {
+  const isDescendant = (pid: number): boolean | undefined => {
     let cur = parentOf.get(pid);
-    for (let depth = 0; cur !== undefined && cur > 1 && depth < 256; depth++) {
+    for (let depth = 0; depth < 256; depth++) {
+      if (cur === undefined) return undefined;
+      if (cur <= 1) return false;
       if (cur === selfPid) return true;
       cur = parentOf.get(cur);
     }
-    return false;
+    return undefined;
   };
   const liveMarkers = new Set(req.liveMarkers);
   const roots = indexRoots(req.liveRoots);
@@ -568,6 +582,9 @@ export function scanOnce(
   for (const pid of pids) {
     if (excluded.has(pid)) continue;
     const descendant = isDescendant(pid);
+    // The runner-uid helper owns every child it starts, including non-dumpable loader
+    // children whose environment cannot be inspected for an attempt marker.
+    if (descendant === true && excludeAllDescendants) continue;
     // R0: the owning uid FIRST, from the world-readable status file.
     const st = tryRead(() => table.readStatus(pid));
     if (!st.ok) {
@@ -586,19 +603,36 @@ export function scanOnce(
     const cwdRead = tryRead(() => table.readCwd(pid));
     if ((!envRead.ok && envRead.vanished) || (!cwdRead.ok && cwdRead.vanished)) continue;
     if (!envRead.ok || !cwdRead.ok) {
-      // A non-dumpable runner-uid process: attribute by ancestry, else fail closed.
+      // A non-dumpable runner-uid process: attribute by ancestry before considering a signal.
       if (attributedToOtherLive(pid, table, roots)) continue;
-      // The world-readable stat's comm names it for the operator (issue #1783 M2); the status
-      // Name line is the fallback when stat cannot be read.
       const statRead = tryRead(() => table.readStat(pid));
-      const statComm = statRead.ok ? parseStat(statRead.value)?.comm : undefined;
-      result.unverified.push({
+      const facts = statRead.ok ? parseStat(statRead.value) : undefined;
+      const entry: QuiesceProcess = {
         pid,
         uid: status.uid,
-        comm: statComm || status.comm,
+        comm: facts?.comm || status.comm,
         cwd: cwdRead.ok ? sanitizeForLog(cwdRead.value) : "unreadable",
         reason: "unreadable_unattributed",
-      });
+      };
+      // Under the uid split every runner-uid process is: (1) agent-controlled code of a
+      // current or finished claim, including deliberately unmarked dependency installs,
+      // provisioning builds, self-improve checks, stub git and runner-clone git that can run
+      // configured code; (2) a recorded worker-launched root or descendant (including the
+      // non-dumpable Codex supervisor); (3) a readable, worker-marked fixed-argv spawn that
+      // runs no repo code; or (4) this R5-excluded scanner. Thus an unreadable process with
+      // no recorded-root attribution and no other claim/attempt in flight is reapable residue,
+      // even when it came from a finished run. A future worker spawn that can become
+      // non-dumpable must be recorded as a root or this invariant breaks.
+      if (
+        req.mayKillUnreadableUnattributed === true &&
+        req.liveMarkers.length === 0 &&
+        descendant === false &&
+        facts?.startTime !== undefined
+      ) {
+        result.kill.push({ ...entry, reason: "unreadable_no_other_claim", startTime: facts.startTime });
+      } else {
+        result.unverified.push(entry);
+      }
       continue;
     }
     const env = parseEnviron(envRead.value);
@@ -607,7 +641,7 @@ export function scanOnce(
     // nonce is agent residue that copied it, and is classified like any other.
     if (env.get(WORKER_SPAWN_ENV) === req.workerNonce && env.get(RUN_ATTEMPT_ENV) === undefined) continue;
     // R5: a descendant is the scanner's own unless an attempt marker says it is agent residue.
-    if (descendant && (excludeAllDescendants || env.get(RUN_ATTEMPT_ENV) === undefined)) continue;
+    if (descendant === true && env.get(RUN_ATTEMPT_ENV) === undefined) continue;
     const cwd = cwdRead.value;
     // R3: the key alone never scopes a process (a foreign run can carry another key's
     // UZI_RUN_CLONE_KEY with no marker and wedge that key's every seed); only together with a
@@ -623,11 +657,12 @@ export function scanOnce(
       cwd: sanitizeForLog(cwd),
       reason,
     });
+    const candidate = (reason: string): KillCandidate => ({ ...entry(reason), startTime: startTimeOf.get(pid) });
     const marker = env.get(RUN_ATTEMPT_ENV);
-    if (marker !== undefined && marker === req.ownMarker) result.kill.push(entry("own_attempt"));
+    if (marker !== undefined && marker === req.ownMarker) result.kill.push(candidate("own_attempt"));
     else if (marker !== undefined && liveMarkers.has(marker)) result.survivors.push(entry("live_attempt_conflict"));
-    else if (marker !== undefined) result.kill.push(entry("terminal_attempt"));
-    else if (req.mode === "own") result.kill.push(entry("unmarked_in_scope"));
+    else if (marker !== undefined) result.kill.push(candidate("terminal_attempt"));
+    else if (req.mode === "own") result.kill.push(candidate("unmarked_in_scope"));
     else result.survivors.push(entry("unattributed_in_scope"));
   }
   return result;
@@ -700,12 +735,21 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
     // back EACCES for an instant. Only one that stays unattributable to the deadline counts.
     if ((last.kill.length === 0 && last.unverified.length === 0) || now() >= deadline) break;
     for (const p of last.kill) {
+      const statRead = tryRead(() => table.readStat(p.pid));
+      const currentStartTime = statRead.ok ? parseStat(statRead.value)?.startTime : undefined;
+      if (p.startTime === undefined || currentStartTime !== p.startTime) continue;
       kill(p.pid);
       killed.push(p.pid);
     }
     await sleep(deps.intervalMs ?? view?.intervalMs ?? REAP_INTERVAL_MS);
   }
-  const stuck = last.kill.map((p) => ({ ...p, reason: `${p.reason}:kill_unconfirmed` }));
+  const stuck: QuiesceProcess[] = last.kill.map((p) => ({
+    pid: p.pid,
+    uid: p.uid,
+    comm: p.comm,
+    cwd: p.cwd,
+    reason: `${p.reason}:kill_unconfirmed`,
+  }));
   if (last.unverified.length > 0) {
     return {
       state: "unverified",
@@ -1300,6 +1344,8 @@ export interface QuiesceRunRequest {
   processes: boolean;
   dockerHost: string | undefined;
   registry: LiveAttemptRegistry;
+  /** Whether another claim is executing, including before it registers an attempt. */
+  otherClaimInFlight?: boolean;
   /** The runner site asking (e.g. `finalize`, `park:after_runner_git` for a re-proof after a
    *  runner-clone git): diagnostic only, the proof itself never reads it. */
   site?: string;
@@ -1330,6 +1376,7 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       targetPaths: req.targetPaths.map((p) => path.resolve(p)),
       ownMarker: req.attempt?.marker,
       liveMarkers: others.map((a) => a.marker),
+      mayKillUnreadableUnattributed: uidSplitActive() && req.otherClaimInFlight === false && others.length === 0,
       // Other live attempts' recorded roots (Claude CLI groups, Codex provider supervisors) plus
       // every long-lived runner-uid root this worker launched and recorded itself.
       liveRoots: [
@@ -1365,6 +1412,7 @@ function isScanRequest(v: unknown): v is ScanRequest {
     strings(o.targetPaths) &&
     (o.ownMarker === undefined || typeof o.ownMarker === "string") &&
     strings(o.liveMarkers) &&
+    (o.mayKillUnreadableUnattributed === undefined || typeof o.mayKillUnreadableUnattributed === "boolean") &&
     Array.isArray(o.liveRoots) &&
     o.liveRoots.every(
       (r) =>
