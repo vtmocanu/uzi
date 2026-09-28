@@ -345,3 +345,104 @@ func TestEpisodeNotice_SlackMarkupInSummaryIsInert(t *testing.T) {
 		t.Errorf("SlackMrkdwn render kept a RAW <url|text> link (live phishing markup); want it neutralized. got %q", rendered)
 	}
 }
+
+// countDeliveredTo counts the successful sends addressed to uid.
+func countDeliveredTo(nf *fakeEpisodeNotifier, uid uuid.UUID) int {
+	n := 0
+	for _, d := range nf.delivered {
+		if d.UserID == uid {
+			n++
+		}
+	}
+	return n
+}
+
+// (issue #1499) A failed Notify releases the claimed slot, so the next still-danger tick
+// re-claims it and retries: the admin is notified exactly once after the failure clears, and
+// the admin whose send succeeded is never re-notified.
+func TestEpisodeNotice_FailedNotifyIsRetried(t *testing.T) {
+	a1, a2 := uuid.New(), uuid.New()
+	ep := uuid.New()
+	st := &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: ep, admins: []uuid.UUID{a1, a2}}
+	nf := &fakeEpisodeNotifier{}
+	ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{dangerCheckDTO("fleet.roll", "Worker image roll", "4 of 4 workers stuck")}}}
+	r := newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true})
+	ctx := context.Background()
+
+	r.Reconcile(ctx) // tick 1: opens the episode, no notice (debounce)
+	if len(nf.sent) != 0 {
+		t.Fatalf("tick 1 sent = %d, want 0 (opener tick)", len(nf.sent))
+	}
+
+	// Tick 2: a1's send fails, a2's succeeds.
+	nf.errFor = map[uuid.UUID]error{a1: errBoom}
+	r.Reconcile(ctx)
+	if len(st.releases) != 1 {
+		t.Fatalf("tick 2 releases = %d, want 1 (only the failed send is released)", len(st.releases))
+	}
+	if got := st.releases[0]; got.EpisodeID != ep || got.UserID != a1 {
+		t.Fatalf("tick 2 released %+v, want (episode %s, user %s)", got, ep, a1)
+	}
+	if got := countDeliveredTo(nf, a1); got != 0 {
+		t.Fatalf("tick 2 a1 delivered = %d, want 0 (its send failed)", got)
+	}
+	if got := countDeliveredTo(nf, a2); got != 1 {
+		t.Fatalf("tick 2 a2 delivered = %d, want 1", got)
+	}
+
+	// Tick 3: the failure clears; a1 is re-claimed and notified exactly once, a2 is not re-sent.
+	nf.errFor = nil
+	r.Reconcile(ctx)
+	if got := countDeliveredTo(nf, a1); got != 1 {
+		t.Fatalf("tick 3 a1 delivered = %d, want 1 (the released slot is retried)", got)
+	}
+	if got := countDeliveredTo(nf, a2); got != 1 {
+		t.Fatalf("tick 3 a2 delivered = %d, want 1 (no re-notify of a delivered admin)", got)
+	}
+
+	// Tick 4: both slots stay claimed; no further deliveries or releases.
+	r.Reconcile(ctx)
+	if got := countDeliveredTo(nf, a1); got != 1 {
+		t.Fatalf("tick 4 a1 delivered = %d, want 1 (exactly once)", got)
+	}
+	if got := countDeliveredTo(nf, a2); got != 1 {
+		t.Fatalf("tick 4 a2 delivered = %d, want 1 (exactly once)", got)
+	}
+	if len(nf.delivered) != 2 {
+		t.Fatalf("total delivered = %d, want 2", len(nf.delivered))
+	}
+	if len(st.releases) != 1 {
+		t.Fatalf("total releases = %d, want 1", len(st.releases))
+	}
+}
+
+// (issue #1499) A failing release is tolerated: it is logged, never panics or aborts the
+// fan-out, and the slot stays claimed, so that admin is not retried (suppressed, as logged).
+func TestEpisodeNotice_FailedReleaseIsTolerated(t *testing.T) {
+	a1, a2 := uuid.New(), uuid.New()
+	ep := uuid.New()
+	st := &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: ep, admins: []uuid.UUID{a1, a2}, releaseErr: errBoom}
+	nf := &fakeEpisodeNotifier{}
+	ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{dangerCheckDTO("fleet.roll", "Worker image roll", "4 of 4 workers stuck")}}}
+	r := newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true})
+	ctx := context.Background()
+
+	r.Reconcile(ctx) // opener
+	nf.errFor = map[uuid.UUID]error{a1: errBoom}
+	r.Reconcile(ctx) // a1 fails, release fails; a2 still delivered
+	if len(st.releases) != 1 {
+		t.Fatalf("releases = %d, want 1 (the failed send's release was attempted)", len(st.releases))
+	}
+	if got := countDeliveredTo(nf, a2); got != 1 {
+		t.Fatalf("a2 delivered = %d, want 1 (a failed release must not abort the fan-out)", got)
+	}
+
+	nf.errFor = nil
+	r.Reconcile(ctx) // a1's slot is still claimed: no retry
+	if got := countDeliveredTo(nf, a1); got != 0 {
+		t.Fatalf("a1 delivered = %d, want 0 (the unreleased slot stays claimed)", got)
+	}
+	if len(st.releases) != 1 {
+		t.Fatalf("releases = %d, want 1 (no further release attempts)", len(st.releases))
+	}
+}

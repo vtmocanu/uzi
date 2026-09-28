@@ -33,7 +33,7 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   watcher to return at the new gate.
 - **One trail line per state change, nothing in between.** `S/trail.sh '#PR' <state>`
   appends and prints `#1428: run completed → pr opened → ci green → cr rate-limited(57m) →
-  waiting → cr clean → rebase+renumber → pushed → admin-merged 3f2a… → main ci green`.
+  greptile pending → greptile clean → rebase+renumber → pushed → admin-merged 3f2a… → main ci green`.
   Use its vocabulary (header of the script). Say more only for a decision or a blocker.
 - **Full autonomy is the default.** Wait for the chosen reviewer, fix small findings locally, trigger
   a rework for big ones, rebase and renumber when needed, merge when ready, watch `main`:
@@ -57,9 +57,9 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   toolchain risk, and unexplained lockfile changes need review. State the decision. Reserve
   CodeRabbit/Greptile for large or high-risk work, and get user approval before requesting
   a review bot for Renovate-class work. Read references/renovate.md before landing one.
-- **Absent user = time is cheap.** In a large/high-risk bot lane, when the choice is wait
-  for CodeRabbit or switch reviewer, say it in one line with the default, start the patient
-  path in the same turn, and let a reply override it.
+- **Never wait out a CodeRabbit rate limit.** Switch at once: a large or trust-boundary PR
+  goes to Greptile (the buddy reviews too); a small PR to the buddy alone. Wait for the
+  reset only when the user asks for CodeRabbit on that PR.
 - **Claim what you land.** `takeover.sh` records this session as the PR's lander in the
   repo's shared state (`claims.sh`), so other landers, Claude or Codex, see who holds what
   and message you instead of double-driving it. A PR another live session holds stops you
@@ -101,8 +101,8 @@ this lander's second pair of eyes.
 | Lane | Required exact-head reviews |
 |---|---|
 | Small/mechanical non-Renovate PR | the buddy (the initial local reviewer) |
-| After a local fix | the buddy plus CodeRabbit (Greptile when CR is rate-limited) |
-| CodeRabbit rate-limited | switch to Greptile (step 3); the buddy reviews too |
+| After a local fix | the buddy plus CodeRabbit; when CR is rate-limited, see the next row |
+| CodeRabbit rate-limited | no waiting: a large or trust-boundary PR switches to Greptile (step 3) and the buddy reviews too; a small PR takes the buddy alone |
 | Bot skipped or absent | the buddy |
 | Skill or script maintenance (`[skip-cr]`) | the buddy plus the user |
 | Rebase or renumber only | the buddy's `APPROVE` of the range-diff on the new head, plus green CI (`watch-pr.sh --reviewer none`, which still checks current-head CI and live findings); a prior review of the old head carries over only when the range-diff changes no reviewed semantics. This is the one exception to the exact-SHA review rules below |
@@ -201,16 +201,16 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    CodeRabbit or Greptile; `--reviewer none` is an intentional local-review or
    CI-sufficient Renovate lane, not a missing review. First run `S/review-quota.sh
    OWNER/REPO`, then batch fixes into one push.
-   - **Rate-limited (exit 5).** Tell the user in one line with the default wait and the
-     local alternative. When quota timing matters, run
+   - **Rate-limited (exit 5).** Switch without waiting. A large or trust-boundary PR: post
+     `@greptileai review`, then `--reviewer greptile --reviewer-grace 2`, and the buddy
+     reviews the same head. A small PR: the buddy alone, with `--reviewer none`. Only when
+     the user asks for CodeRabbit on that PR, run
      `S/cr-rate-limit.sh OWNER/REPO PR --trigger-review`: it posts the exact two-word quota
      query, waits for the authoritative countdown or "Reviews are available now," then posts
      `@coderabbitai review` itself exactly once under a per-PR lock when safe and immediately
      execs `watch-pr.sh --reviewer coderabbit`. The atomic flag closes both background-callback
      gaps; never wait, post, or start the reviewer poller as separate agent steps. Its final exit
      is the `watch-pr.sh` result, so branch directly on step 2's exit table.
-     On `greptile`, post `@greptileai review`, then use `--reviewer greptile
-     --reviewer-grace 2`; on `local`, dispatch a local reviewer and use `--reviewer none`.
    - **Full review offered (exit 7).** CodeRabbit answered the normal trigger with
      “Already reviewed the last commit.” Decide whether the existing coverage plus a local
      review is sufficient for this risk class. If a bot review is still warranted, post
@@ -237,7 +237,7 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
      PR via `S/land-prep.sh OWNER/REPO PR` (it re-checks the rework lane and pushes with a
      lease), trail `fix local → pushed`. Before merging, require two clean reviews of that
      exact SHA: the buddy (`peers.py buddy ping` restores a lost reply route) plus
-     CodeRabbit (Greptile when CR is rate-limited). A later rebase-only push keeps them
+     CodeRabbit (rate-limited: Greptile on a large PR, the buddy alone on a small one). A later rebase-only push keeps them
      via the rebase lane (*Buddy*). Skill-maintenance `[skip-cr]` PRs keep
      their own rule below;
    - **big** (design-level, many files, needs the plan's context): `uzi run rework RUN -m
@@ -382,10 +382,11 @@ session-peers registry, so a Codex thread with a shim is a peer like any Claude 
 
 ## Waiting, uniformly
 
-Every long wait (a CR reset, a laggy `mr_rework`, a re-review, CI) is a background poller
+Every long wait (a CR reset, only when the user asked for CodeRabbit on that PR; a laggy `mr_rework`, a re-review, CI) is a background poller
 whose exit re-invokes you, never a foreground `--watch` or a long `sleep`; the harness reaps
-long processes, and a killed short poll simply re-fires. The patient path is the default;
-a user reply that arrives first wins.
+long processes, and a killed short poll simply re-fires. The patient path is the default
+(except a CodeRabbit rate limit, which switches reviewer at once); a user reply that
+arrives first wins.
 Branch on the poller's own `EXIT=`/`RESULT=` line, never on the harness's task status: a
 `script > log; echo "EXIT=$?"` wrapper always completes with 0.
 
