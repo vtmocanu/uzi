@@ -30,7 +30,8 @@ chmod 000 "$DENIED"
 
 # The fake commands. `skip N` appends N records and exits 0; `fail RC` exits RC after
 # appending one record (the list must still print); `rmlog RC` deletes the skip log and exits RC;
-# `unreadable RC` appends one record, makes the skip log unreadable (mode 000) and exits RC.
+# `unreadable RC` appends one record, makes the skip log unreadable (mode 000) and exits RC;
+# `concurrency FILE` writes UZI_AGENT_TEST_CONCURRENCY (or `<unset>`) to FILE and exits 0.
 FAKE="$TMP/fake-tests"
 cat > "$FAKE" <<'EOF'
 #!/bin/sh
@@ -56,6 +57,10 @@ case "$1" in
     chmod 000 "$UZI_REAL_PROCFS_SKIP_LOG"
     exit "$2"
     ;;
+  concurrency)
+    printf '%s\n' "${UZI_AGENT_TEST_CONCURRENCY-<unset>}" > "$2"
+    exit 0
+    ;;
 esac
 echo "fake-tests: unknown mode '$1'" >&2
 exit 99
@@ -67,14 +72,16 @@ OUT="$TMP/out"
 
 # run_case NAME EXPECTED_RC PROBE_DIR CI_VALUE COMMAND...
 # CI_VALUE "-" runs with CI unset (`env -u CI`); anything else exports CI=<value>.
+# UZI_AGENT_TEST_CONCURRENCY is always unset, so a caller's value cannot leak into a case;
+# a case that needs one sets it inside COMMAND (`env UZI_AGENT_TEST_CONCURRENCY=3 ...`).
 run_case() {
   name="$1" want="$2" probe="$3" ci="$4"
   shift 4
   got=0
   if [ "$ci" = "-" ]; then
-    env -u CI UZI_REAL_PROCFS_PROBE_DIR="$probe" "$@" > "$OUT" 2>&1 || got=$?
+    env -u CI -u UZI_AGENT_TEST_CONCURRENCY UZI_REAL_PROCFS_PROBE_DIR="$probe" "$@" > "$OUT" 2>&1 || got=$?
   else
-    env CI="$ci" UZI_REAL_PROCFS_PROBE_DIR="$probe" "$@" > "$OUT" 2>&1 || got=$?
+    env -u UZI_AGENT_TEST_CONCURRENCY CI="$ci" UZI_REAL_PROCFS_PROBE_DIR="$probe" "$@" > "$OUT" 2>&1 || got=$?
   fi
   if [ "$got" -eq "$want" ]; then
     echo "PASS: $name (exit $got)"
@@ -142,6 +149,36 @@ if [ "$(id -u)" -eq 0 ]; then
 else
   run_case "unreadable skip log, command rc 0" 1 "$ENUMERABLE" - "$CHECK" "$FAKE" unreadable 0 &&
     expect_output "an unreadable skip log is named" "cannot count the skip log"
+fi
+
+# (j) the pre-run probe caps agent test concurrency where enumeration is denied, and only
+# there. SEEN is what the fake command read from UZI_AGENT_TEST_CONCURRENCY.
+SEEN="$TMP/seen-concurrency"
+expect_seen() {
+  name="$1" want="$2"
+  got="$(cat "$SEEN" 2>/dev/null || echo '<no file>')"
+  if [ "$got" = "$want" ]; then
+    echo "PASS: $name"
+  else
+    echo "FAIL: $name: the command saw UZI_AGENT_TEST_CONCURRENCY=$got, expected $want"
+    failures=$((failures + 1))
+  fi
+}
+rm -f "$SEEN"
+run_case "enumerable: concurrency left unset" 0 "$ENUMERABLE" - "$CHECK" "$FAKE" concurrency "$SEEN" &&
+  expect_seen "enumerable: the command sees no concurrency cap" "<unset>"
+if [ "$(id -u)" -eq 0 ]; then
+  echo "SKIP: denied concurrency cap: running as uid 0, which enumerates a chmod-000 dir, so no denied probe dir can be built"
+else
+  rm -f "$SEEN"
+  run_case "denied: concurrency capped" 0 "$DENIED" - "$CHECK" "$FAKE" concurrency "$SEEN" && {
+    expect_seen "denied: the command sees UZI_AGENT_TEST_CONCURRENCY=1" "1"
+    expect_output "denied: the cap is explained" "running agent test files serially (UZI_AGENT_TEST_CONCURRENCY=1)"
+  }
+  rm -f "$SEEN"
+  run_case "denied + preset 3: concurrency kept" 0 "$DENIED" - \
+    env UZI_AGENT_TEST_CONCURRENCY=3 "$CHECK" "$FAKE" concurrency "$SEEN" &&
+    expect_seen "denied + preset 3: the command sees the caller's 3" "3"
 fi
 
 # (h) end to end through the real TypeScript recorder: agent/test/real-procfs.ts's
