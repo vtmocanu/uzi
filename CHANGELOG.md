@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Leads now learn their environment's limits at run start ([#1866](https://github.com/vtmocanu/uzi/issues/1866)).**
+  Before the plan turn (or the first implement turn on a plan-less resume), the worker runs a fixed probe measuring whether `/proc` can be enumerated and whether `$HOME`/`$TMPDIR` are writable, and folds the limits it found, plus whether Docker is wired on this worker, into a short prompt block with a rule: a gate blocked by a verified limit is recorded as blocked or not run rather than retried unchanged. The probe fails closed, so an unconfirmed cleanup fails the run rather than reporting a fact it can't stand behind. No egress tier is reported, since the worker receives none to pass through. A new uzi-watcher plan-trap check reads the worker's `environment facts` status line to catch a plan that ignores an affected gate.
+
 ### Changed
 
 - **A lone unreadable runner process no longer blocks every run on a split-uid worker ([#1854](https://github.com/vtmocanu/uzi/issues/1854)).**
