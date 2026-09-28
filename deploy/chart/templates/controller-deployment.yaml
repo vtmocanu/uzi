@@ -204,9 +204,12 @@ spec:
             # a worker on both tiers; validated at boot against both PVC ceilings, and
             # worker-invariants.yaml refuses a value over either. Empty leaves the
             # controller's built-in 20Gi.
-            {{- with .Values.workers.ephemeralWorkerDataSize }}
+            {{- /* Not `with`: a numeric 0 is falsy there and would silently render the 20Gi
+            default instead of reaching the controller, which refuses a non-positive size. */}}
+            {{- $ephemeralDataSize := .Values.workers.ephemeralWorkerDataSize }}
+            {{- if and (not (kindIs "invalid" $ephemeralDataSize)) (ne (toString $ephemeralDataSize) "") }}
             - name: UZI_WORKER_EPHEMERAL_DATA_SIZE
-              value: {{ . | quote }}
+              value: {{ toString $ephemeralDataSize | quote }}
             {{- end }}
             {{- /* Where the worker's join-token Secret mounts (issue #1761). Rendered only
             when set, so a default install renders byte-identically; OpenShift sets it
