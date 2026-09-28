@@ -91,7 +91,7 @@ jobs:
       - name: Surface the result (PR, or a tracking issue)
         if: >-
           steps.refresh.outputs.changed == 'true' || steps.refresh.outputs.warned == 'true'
-          || steps.refresh.outputs.parity_ok != 'true'
+          || steps.refresh.outputs.parity_ok != 'true' || steps.refresh.outputs.roster_needs_human == 'true'
         env:
           # The PAT (if set) is what lets the PR trigger its own CI; else the
           # built-in token, which can still push and open a PR where the repo
@@ -100,6 +100,7 @@ jobs:
           CHANGED: ${{ steps.refresh.outputs.changed }}
           PRODUCT_CHANGED: ${{ steps.refresh.outputs.product_changed }}
           ROSTER_CHANGED: ${{ steps.refresh.outputs.roster_changed }}
+          ROSTER_NEEDS_HUMAN: ${{ steps.refresh.outputs.roster_needs_human }}
           PARITY_OK: ${{ steps.refresh.outputs.parity_ok }}
           SUMMARY: ${{ steps.refresh.outputs.summary }}
           WARNINGS: ${{ steps.refresh.outputs.warnings }}
@@ -147,8 +148,13 @@ jobs:
                 done
           }
 
-          # Warnings (nothing was written, all or nothing), or a parity failure with
-          # nothing to commit: surface as an issue and stop.
+          # A PR is ready only when parity passed AND the roster needs nobody.
+          READY=false
+          [ "${PARITY_OK}" = "true" ] && [ "${ROSTER_NEEDS_HUMAN}" != "true" ] && READY=true
+          [ "${ROSTER_NEEDS_HUMAN}" = "true" ] && BODY="$(printf '%s\n\n**The roster sync needs a human** (see the roster section); this PR stays a draft until it is resolved.' "${BODY}")"
+
+          # Warnings (nothing was written, all or nothing), or a parity or roster
+          # problem with nothing to commit: surface as an issue and stop.
           if [ "${CHANGED}" != "true" ]; then
             upsert_issue "${BODY}"
             exit 0
@@ -199,16 +205,16 @@ jobs:
           if [ -n "${open_pr}" ]; then
             gh pr edit "${open_pr}" --body "${BODY}"
             is_draft="$(gh pr view "${open_pr}" --json isDraft --jq .isDraft)"
-            if [ "${PARITY_OK}" = "true" ] && [ "${is_draft}" = "true" ]; then
+            if [ "${READY}" = "true" ] && [ "${is_draft}" = "true" ]; then
               gh pr ready "${open_pr}"
-            elif [ "${PARITY_OK}" != "true" ] && [ "${is_draft}" != "true" ]; then
+            elif [ "${READY}" != "true" ] && [ "${is_draft}" != "true" ]; then
               gh pr ready --undo "${open_pr}"
             fi
             echo "Updated the open refresh PR #${open_pr}."
             exit 0
           fi
           draft=()
-          [ "${PARITY_OK}" = "true" ] || draft=(--draft)
+          [ "${READY}" = "true" ] || draft=(--draft)
           if gh pr create --base main --head "${BRANCH}" "${draft[@]}" \
                --title "chore(agenttmpl): sync builtin roles to skills ${UPSTREAM_TAG}" \
                --body "${BODY}"; then

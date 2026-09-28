@@ -27,7 +27,9 @@
 # The second form prints the newest vX.Y.Z tag (prereleases ignored), or exits 2.
 #
 # Outputs go to $GITHUB_OUTPUT when set and to stderr: changed, product_changed,
-# roster_changed, warned, parity_ok, summary, warnings, roster_report, parity_report.
+# roster_changed, roster_needs_human (a roster problem a human must resolve: an
+# unreadable agent file, a failed apply, or a local edit outside the allowlist),
+# warned, parity_ok, summary, warnings, roster_report, parity_report.
 # Exit codes: 0 ran (read the outputs), 2 an input or tool is missing.
 #
 # Test seams (scripts/refresh-role-manifest-test.sh): ROLE_SYNC_PY overrides the
@@ -90,12 +92,13 @@ done < <(jq -r 'keys[]' <<<"$manifest_roles")
 # `## For this repo` tail, so a frontmatter change is not reported as a body line.
 body_of() {
   awk 'NR == 1 && $0 == "---" { fm = 1; next } fm && $0 == "---" { fm = 0; next } fm { next }
-       /^## For this repo/ { exit } { print }' "$1"
+       /^## For this repo([^A-Za-z]|$)/ { exit } { print }' "$1"
 }
 
 warnings="$(jq -r '.warnings[] | "- WARNING: \(.)"' <<<"$plan")"
 product_changed=false
 roster_changed=false
+roster_needs_human=false
 parity_ok=false
 summary=""
 roster_report=""
@@ -135,6 +138,7 @@ else
     rc=0
     check_out="$(python3 "$sync_py" --library "$roles_yaml" --agents "$agents" check 2>&1)" || rc=$?
     if [ "$rc" -ge 2 ] || grep -qE '^[a-z0-9-]+ +.*[[:space:]](BAD-FM|ERROR)([[:space:]]|$)' <<<"$check_out"; then
+      roster_needs_human=true
       roster_report="$(printf 'Roster sync stopped: sync.py check reported an unreadable file or failed (exit %s):\n\n%s\n%s\n%s' "$rc" "$fence" "$check_out" "$fence")"
     else
       to_apply="$(awk '$0 ~ /[[:space:]](STALE|LEGACY)([[:space:]]|$)/ {print $1}' <<<"$check_out" | tr '\n' ' ')"
@@ -148,7 +152,7 @@ else
         fi
         unexpected="$(printf '%s\n- %s: %s' "$unexpected" "$role" "$detail")"
       done < <(grep -E '[[:space:]]MODIFIED([[:space:]]|$)' <<<"$check_out" || true)
-      [ -n "$unexpected" ] && roster_report="$(printf 'Left unchanged (edited locally at the library version; review by hand):%s' "$unexpected")"
+      [ -n "$unexpected" ] && roster_needs_human=true && roster_report="$(printf 'Left unchanged (edited locally at the library version; review by hand):%s' "$unexpected")"
       extra="$(grep -E '[[:space:]]CUSTOM([[:space:]]|$)|in the library, no file here' <<<"$check_out" || true)"
       [ -n "$extra" ] && roster_report="$(printf '%s\n\nRoster differences reported, not changed:\n\n%s\n%s\n%s' "$roster_report" "$fence" "$extra" "$fence")"
       if [ -n "${to_apply// /}" ]; then
@@ -178,6 +182,7 @@ else
             [ -e "$backup" ] || continue
             grep -qxF "$(basename "$backup")" <<<"$before" || rm -f "$backup"
           done
+          roster_needs_human=true
           roster_report="$(printf 'Roster sync stopped: sync.py apply failed for %s; nothing changed.\n\n%s' "${to_apply% }" "$roster_report")"
         fi
       fi
@@ -201,8 +206,8 @@ changed=false
 { [ "$product_changed" = true ] || [ "$roster_changed" = true ]; } && changed=true
 
 {
-  printf 'refresh: changed=%s product_changed=%s roster_changed=%s warned=%s parity_ok=%s\n' \
-    "$changed" "$product_changed" "$roster_changed" "$warned" "$parity_ok"
+  printf 'refresh: changed=%s product_changed=%s roster_changed=%s roster_needs_human=%s warned=%s parity_ok=%s\n' \
+    "$changed" "$product_changed" "$roster_changed" "$roster_needs_human" "$warned" "$parity_ok"
   [ -n "$summary" ] && printf '%s\n' "$summary"
   [ -n "$warnings" ] && printf '%s\n' "$warnings"
   [ -n "$roster_report" ] && printf '%s\n' "$roster_report"
@@ -211,8 +216,8 @@ changed=false
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   {
-    printf 'changed=%s\nproduct_changed=%s\nroster_changed=%s\nwarned=%s\nparity_ok=%s\n' \
-      "$changed" "$product_changed" "$roster_changed" "$warned" "$parity_ok"
+    printf 'changed=%s\nproduct_changed=%s\nroster_changed=%s\nroster_needs_human=%s\nwarned=%s\nparity_ok=%s\n' \
+      "$changed" "$product_changed" "$roster_changed" "$roster_needs_human" "$warned" "$parity_ok"
     printf 'summary<<REFRESH_EOF\n%s\nREFRESH_EOF\n' "$summary"
     printf 'warnings<<REFRESH_WARN_EOF\n%s\nREFRESH_WARN_EOF\n' "$warnings"
     printf 'roster_report<<REFRESH_ROSTER_EOF\n%s\nREFRESH_ROSTER_EOF\n' "$roster_report"

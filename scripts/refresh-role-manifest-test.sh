@@ -153,12 +153,31 @@ if run_case old; then
      && [ ! -e "$repo/.claude/agents/coder.md.pre-sync.2" ] && ! grep -q 'old words' "$ghout"; then ok "$case_name"; else bad "$case_name" "$(cat "$ghout")"; fi
 fi
 
+# 7c. a '## For this repository' heading is body, not the tail (sync.py's TAIL_RE).
+case_name="tail boundary matches sync.py"; new_case tailbound
+printf 'body line\n## For this repository\ngeneric after heading\n## For this repo\ntail\n' > "$repo/.claude/agents/coder.md"
+(cd "$repo" && git add -A && git -c user.email=t@t -c user.name=t commit -qm tb)
+printf 'coder         1 -> 2     tail 5B    LEGACY    body -1/+1 vs library\n' > "$stub/check.txt"; echo 1 > "$stub/check.rc"
+printf 'body line\n## For this repository\nnew generic line\n## For this repo\ntail\n' > "$stub/new/coder.md"
+if run_case old; then
+  if grep -q 'generic after heading' "$ghout"; then ok "$case_name"; else bad "$case_name" "$(cat "$ghout")"; fi
+fi
+
 # 8. allowlisted tester model is silent; another MODIFIED is reported.
 case_name="allowlisted MODIFIED is silent, others reported"; new_case allow
 printf 'tester\tmodel sonnet vs library opus\n' > "$case_dir/allow.tsv"
 printf 'tester        14         tail 9B    MODIFIED  model sonnet vs library opus\nreviewer      2          tail 9B    MODIFIED  body -1/+1 vs library\n' > "$stub/check.txt"; echo 1 > "$stub/check.rc"
 if run_case old; then
-  if ! grep -q -- '- tester:' "$ghout" && grep -q -- '- reviewer: body' "$ghout"; then ok "$case_name"; else bad "$case_name" "$(cat "$ghout")"; fi
+  if ! grep -q -- '- tester:' "$ghout" && grep -q -- '- reviewer: body' "$ghout" \
+     && [ "$(outv roster_needs_human)" = true ]; then ok "$case_name"; else bad "$case_name" "$(cat "$ghout")"; fi
+fi
+
+# 8b. the allowlisted difference alone needs nobody.
+case_name="allowlisted difference alone needs nobody"; new_case allowonly
+printf 'tester\tmodel sonnet vs library opus\n' > "$case_dir/allow.tsv"
+printf 'tester        14         tail 9B    MODIFIED  model sonnet vs library opus\n' > "$stub/check.txt"; echo 1 > "$stub/check.rc"
+if run_case old; then
+  if [ "$(outv roster_needs_human)" = false ] && [ "$(outv changed)" = false ]; then ok "$case_name"; else bad "$case_name" "$(cat "$ghout")"; fi
 fi
 
 # 9. tester with a body difference beyond the allowlisted model is still reported.
@@ -173,14 +192,16 @@ fi
 case_name="BAD-FM stops the roster half"; new_case badfm
 printf 'coder         1 -> 2     tail 5B    BAD-FM    unquoted colon\n' > "$stub/check.txt"; echo 1 > "$stub/check.rc"
 if run_case old; then
-  if [ "$(outv roster_changed)" = false ] && grep -q 'Roster sync stopped' "$ghout"; then ok "$case_name"; else bad "$case_name" "$out"; fi
+  if [ "$(outv roster_changed)" = false ] && [ "$(outv roster_needs_human)" = true ] \
+     && grep -q 'Roster sync stopped' "$ghout"; then ok "$case_name"; else bad "$case_name" "$out"; fi
 fi
 
 # 11. a failed apply restores the roster.
 case_name="failed apply restores the roster"; new_case applyfail
 printf 'coder         1 -> 2     tail 5B    STALE\n' > "$stub/check.txt"; echo 1 > "$stub/check.rc"; : > "$stub/apply.fail"
 if run_case old; then
-  if [ "$(outv roster_changed)" = false ] && clean && grep -q 'apply failed' "$ghout"; then ok "$case_name"; else bad "$case_name" "$out"; fi
+  if [ "$(outv roster_changed)" = false ] && [ "$(outv roster_needs_human)" = true ] && clean \
+     && grep -q 'apply failed' "$ghout"; then ok "$case_name"; else bad "$case_name" "$out"; fi
 fi
 
 # 12. latest stable tag ignores prereleases and sorts by version.
