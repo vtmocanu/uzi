@@ -35,17 +35,20 @@ exists.**
   dir holds `STEM.tgz` (bundle + `uncommitted.patch` + `untracked.tar.gz` + `meta.txt`)
   plus `run.json` / `plan.md` / `progress.txt` / `log-tail.ndjson`.
 - **B) The live PVC** (the worker pod still exists) — bundle `REF` out of the bare clone
-  per *Recovering a failed run's work from the worker PVC* above, then continue at step 3.
+  per *Recovering a failed run's work from the worker PVC* above, then start at step 1.
 - **C) The run's retained checkpoint or recovery ref** (PRD #1810: the branch checkpoint
   ref while custody is open, or `refs/uzi-recovery/<RUN>` once superseded) — fetch it
-  straight into `refs/heads/recover/STEM` the same way as the salvage ref below. There is
+  straight into `refs/heads/recover/STEM` (e.g. `git fetch origin
+  refs/uzi-recovery/<RUN>:refs/heads/recover/STEM`), as for the salvage ref below. There is
   no bundle: skip steps 1-2 and step 3's bundle fetch, run only step 3's
   `git worktree add` and `cd`, then continue at step 4.
 - **D) The worker's own tracking ref** (`REF` on the bare mirror, per *Recovering a
   failed run's work from the worker PVC* above) when the live clone (B) is gone but the
-  bare mirror survives.
+  bare mirror survives — bundle it out as for B (`FETCH_REF=REF`, `W=""`), then start at
+  step 1.
 - **E) The salvage ref** (`refs/uzi-salvage/<RUN>`, PRD #1867, `salvage_state: promoted`)
-  — compare its tip against A-D before using it in preference to any of them;
+  — compare its tip against A-D before using it in preference to any of them (read a
+  remote ref's tip without fetching it with `git ls-remote origin <ref>`);
   `git fetch origin refs/uzi-salvage/<RUN>:refs/heads/recover/STEM`, then, as for C,
   skip steps 1-2 and step 3's bundle fetch, run only step 3's `git worktree add` and
   `cd`, and continue at step 4.
@@ -56,7 +59,7 @@ exists.**
 cd <the repo>                              # your normal checkout; work happens in DIR, not here
 ```
 
-1. **Point `BUNDLE` at the bundle and VERIFY the bytes — for BOTH sources.** A truncated
+1. **Point `BUNDLE` at the bundle and VERIFY the bytes — for every bundle source (A, B, D).** A truncated
    bundle still lists its ref by name, so check before trusting it:
    ```sh
    # Source A (snapshot): the .tgz is gzip — test it end-to-end, then extract.
@@ -73,7 +76,7 @@ cd <the repo>                              # your normal checkout; work happens 
    #   BUNDLE=/path/to/r.bundle; FETCH_REF=REF; W=""
    ```
 2. **Prove the bundle is restorable** from INSIDE the real repo (it has the prerequisite
-   base commit the bundle excludes) — this runs for either source:
+   base commit the bundle excludes) — this runs for every bundle source:
    ```sh
    git bundle verify "$BUNDLE"                # "…is okay"; names the ref + the required base
    ```
