@@ -33,10 +33,10 @@ import { readRepoInstructions } from "./repo-instructions.js";
 import { LimitReachedError } from "./limit.js";
 import { provisionRunTools, removeProvisionDir } from "./provision-run.js";
 import type { provisionTools } from "./provision.js";
-import { AGENT_GIT_IDENTITY, gitEnv } from "./git.js";
+import { AGENT_GIT_IDENTITY, gitEnv, runnerGitCarriesWorkerMark } from "./git.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 import type { SdkAttemptEnv } from "./sdk-env.js";
-import { unmarkedSpawnEnv, type RecordedRoot } from "./worker-spawn-mark.js";
+import { unmarkedSpawnEnv, workerSpawnEnv, type RecordedRoot } from "./worker-spawn-mark.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -1124,10 +1124,15 @@ export interface StubExecutorOptions {
  */
 export async function readWorktreeHeadSha(worktreePath: string): Promise<string | undefined> {
   try {
-    const env: NodeJS.ProcessEnv = { ...gitEnv(), PATH: runnerPath() };
+    // issue #1783 (R4): a driver-free, worker-authored fixed argv, so it carries the worker mark
+    // exactly as runGitAsRunner does for the same subcommand (runnerGitCarriesWorkerMark); a
+    // concurrent quiescence scan must not read it as the run's own residue.
+    const sub = ["rev-parse", "--verify", "HEAD^{commit}"];
+    const base: NodeJS.ProcessEnv = { ...gitEnv(), PATH: runnerPath() };
+    const env: NodeJS.ProcessEnv = runnerGitCarriesWorkerMark(sub) ? workerSpawnEnv(base) : unmarkedSpawnEnv(base);
     const tmp = runnerTmpdir();
     if (tmp) env.TMPDIR = tmp;
-    const wrapped = runnerCommand("git", ["-C", worktreePath, "rev-parse", "--verify", "HEAD^{commit}"]);
+    const wrapped = runnerCommand("git", ["-C", worktreePath, ...sub]);
     const { stdout } = await execFileAsync(wrapped.command, wrapped.args, { env, timeout: 30_000 });
     return normalizeVerifiedSha(String(stdout));
   } catch {
