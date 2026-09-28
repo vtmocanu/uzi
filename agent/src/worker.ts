@@ -79,6 +79,12 @@ export class Worker {
     // PRD #1809 D8: the background per-run HOME measure. The heartbeat attaches its latest
     // finished sample as `stats.run_disk` and never waits on it.
     private readonly runDisk?: RunDiskSampler,
+    // issue #1863: builds the heartbeat's stats collector for the worker's data dir. Test seam
+    // only: a test injects a collector whose `processRss` is stubbed, because the default RSS
+    // read (process.memoryUsage) reads the proc filesystem, which a Landlock-confined test
+    // sandbox denies. Production uses the default.
+    private readonly newStatsCollector: (dataDir: string) => StatsCollector = (dataDir) =>
+      new StatsCollector({ dataDir }),
   ) {}
 
   /** The run lane's in-flight executions (issue #1759: a field so {@link isIdle} can read it). */
@@ -440,7 +446,7 @@ export class Worker {
     // just re-runs that omission.
     // Pass the data volume so the disk sample targets the worker's real data dir
     // (PRD #837 M1); /nix stays the fixed default inside the collector.
-    const stats = new StatsCollector({ dataDir: this.config.dataDir });
+    const stats = this.newStatsCollector(this.config.dataDir);
     while (!signal.aborted) {
       let ok = false;
       let sample: WorkerStats | undefined;

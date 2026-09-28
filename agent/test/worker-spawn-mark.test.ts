@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { recordRoot, statStartTime } from "../src/worker-spawn-mark.js";
+import { realProcfsSkip } from "./real-procfs.js";
 
 // issue #1783 (R0) — a recorded root is its pid AND its start time (field 22 of procfs `stat`).
 // The comm (field 2) is agent-controllable (`prctl(PR_SET_NAME)`, the executable's name) and may
@@ -34,7 +35,12 @@ describe("statStartTime", () => {
     assert.equal(statStartTime(statLine("x", 1).replace(" 1 12345678", " -1 12345678")), undefined, "a non-numeric start");
   });
 
-  it("parses this process's own procfs stat (Linux)", { skip: !fs.existsSync(path.join("/", "proc", "self", "stat")) }, () => {
+  // Reads the REAL stat file: a sandbox that denies enumerating the proc root denies this read
+  // too, and skips through the shared detector (issue #1863).
+  const ownStatSkip: string | false = !fs.existsSync(path.join("/", "proc", "self", "stat"))
+    ? "no procfs stat file (Linux only)"
+    : realProcfsSkip("statStartTime: parses this process's own procfs stat");
+  it("parses this process's own procfs stat (Linux)", { skip: ownStatSkip }, () => {
     const v = statStartTime(fs.readFileSync(path.join("/", "proc", "self", "stat"), "utf8"));
     assert.ok(v !== undefined && v > 0, String(v));
   });

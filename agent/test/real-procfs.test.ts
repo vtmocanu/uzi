@@ -69,7 +69,7 @@ describe("probeProcEnumeration", () => {
 
   /**
    * Run the probe on `root` while recording every directory it enumerates and every file read it
-   * attempts (readFileSync/openSync/readSync on the fs default export the helper imports). The probe
+   * attempts (readFileSync, openSync, readFile and open on the fs default export the helper imports). The probe
    * must enumerate the root and never read a file under it.
    */
   function probeRecording(root: string): { result: string | false; enumerated: string[]; reads: string[] } {

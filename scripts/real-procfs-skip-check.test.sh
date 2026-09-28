@@ -29,7 +29,8 @@ mkdir -p "$ENUMERABLE" "$DENIED"
 chmod 000 "$DENIED"
 
 # The fake commands. `skip N` appends N records and exits 0; `fail RC` exits RC after
-# appending one record (the list must still print); `rmlog RC` deletes the skip log and exits RC.
+# appending one record (the list must still print); `rmlog RC` deletes the skip log and exits RC;
+# `unreadable RC` appends one record, makes the skip log unreadable (mode 000) and exits RC.
 FAKE="$TMP/fake-tests"
 cat > "$FAKE" <<'EOF'
 #!/bin/sh
@@ -48,6 +49,11 @@ case "$1" in
     ;;
   rmlog)
     rm -f "$UZI_REAL_PROCFS_SKIP_LOG"
+    exit "$2"
+    ;;
+  unreadable)
+    printf 'unreadable label\treal-procfs-denied: unreadable reason\n' >> "$UZI_REAL_PROCFS_SKIP_LOG"
+    chmod 000 "$UZI_REAL_PROCFS_SKIP_LOG"
     exit "$2"
     ;;
 esac
@@ -127,6 +133,16 @@ run_case "missing probe dir + 1 skip" 1 "$TMP/does-not-exist" - "$CHECK" "$FAKE"
 run_case "skip log deleted, command rc 0" 1 "$ENUMERABLE" - "$CHECK" "$FAKE" rmlog 0 &&
   expect_output "a deleted skip log is named" "is missing (the command removed it)"
 run_case "skip log deleted, command rc 5 preserved" 5 "$ENUMERABLE" - "$CHECK" "$FAKE" rmlog 5 || true
+
+# (g2) a skip log that exists but cannot be read cannot be counted: fail closed (the "cannot
+# count the skip log" branch), never read as 0 skips. Root reads a mode-000 file anyway, so
+# this case cannot build an unreadable log under uid 0.
+if [ "$(id -u)" -eq 0 ]; then
+  echo "SKIP: unreadable skip log: running as uid 0, which reads a mode-000 file, so no unreadable log can be built"
+else
+  run_case "unreadable skip log, command rc 0" 1 "$ENUMERABLE" - "$CHECK" "$FAKE" unreadable 0 &&
+    expect_output "an unreadable skip log is named" "cannot count the skip log"
+fi
 
 # (h) end to end through the real TypeScript recorder: agent/test/real-procfs.ts's
 # realProcfsSkip, run under node + tsx with a forced denied value, must land its record in

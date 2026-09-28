@@ -27,7 +27,8 @@ import { RUN_ATTEMPT_ENV, RUN_CLONE_KEY_ENV } from "../src/worker-spawn-mark.js"
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { makeFakeProcRoot, plantUnreadableUnattributed, scopedRealView, withQuiescenceView } from "./fake-proc.js";
-import { restoreHermeticView } from "./setup/hermetic-proc.js";
+import { HERMETIC_VIEW, restoreHermeticView } from "./setup/hermetic-proc.js";
+import { REAL_PROCFS_DENIED, realProcfsSkip } from "./real-procfs.js";
 import { nullLogger, recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import {
   api,
@@ -55,6 +56,10 @@ installHarness();
 const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
 const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
 const HAS_PROCFS = process.platform === "linux";
+/** The skip for a case that plants or reaps REAL processes: none, "Linux only", or (a sandbox that
+ *  denies enumerating the proc root, issue #1863) the shared detector's recorded reason. */
+const realTableSkip = (label: string): string | false =>
+  !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip(`clone-attempt-paths: ${label}`);
 
 // ─── fake Docker daemon ────────────────────────────────────────────────────────────────────
 //
@@ -143,7 +148,11 @@ const orphans: number[] = [];
 // in a pidfile), never the host's other processes.
 const orphanPidDir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-orphan-pids-"));
 const orphanPidFile = path.join(orphanPidDir, "orphans.pids");
-const FILE_VIEW = scopedRealView({ pidFiles: [orphanPidFile] });
+// issue #1863: where the proc root cannot be enumerated (the Landlock command sandbox) the real view
+// is unreadable, so every proof over it is `unverified`. There the suites that plant or reap REAL
+// processes skip through the shared detector (realTableSkip), and the rest, which have no real
+// process in scope, run over the hermetic empty fake root: for them both views list nothing.
+const FILE_VIEW = REAL_PROCFS_DENIED ? HERMETIC_VIEW : scopedRealView({ pidFiles: [orphanPidFile] });
 before(() => setQuiescenceViewForTests(FILE_VIEW));
 after(() => {
   restoreHermeticView();
@@ -688,7 +697,7 @@ describe("issue #1783 M2 × #1766: a vault-lock park's exit capture releases a p
 // ─── P-capture-blocked ─────────────────────────────────────────────────────────────────────
 
 describe("issue #1783 M2 P-capture-blocked", { skip: !HAS_PROCFS }, () => {
-  it("survivors: an env-scrubbed process in the predecessor blocks the fetch-back; journal, ledger and path untouched", async () => {
+  it("survivors: an env-scrubbed process in the predecessor blocks the fetch-back; journal, ledger and path untouched", { skip: realTableSkip("P-capture-blocked: survivors") }, async () => {
     const iid = 2031;
     const runId = randomUUID();
     const pred = await seedPredecessor(iid, runId, { attempt: true });
@@ -853,7 +862,7 @@ describe("issue #1783 M2 P-worker-restart / P-foreign: the terminal-orphan recla
     assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "reclaimed", "STATE stays reclaimed");
   });
 
-  it("orphan_reclaim: a survivor in the owner's attempt path blocks the reclaim; nothing released (worker_residue_blocked)", async () => {
+  it("orphan_reclaim: a survivor in the owner's attempt path blocks the reclaim; nothing released (worker_residue_blocked)", { skip: realTableSkip("P-worker-restart / P-foreign: orphan_reclaim survivor") }, async () => {
     const iid = 2045;
     const owner = randomUUID();
     const pred = await seedPredecessor(iid, owner, { attempt: true });
@@ -1029,7 +1038,7 @@ describe("issue #1783 M2: the seed-time sweep over the key's NON-LIVE paths", { 
     return fs.readdirSync(runnerRepoDir()).filter((n) => n.startsWith(`issue-${iid}.attempt-`));
   }
 
-  it("survivors: an unattributed process in a non-live path blocks the seed; nothing is seeded or moved", async () => {
+  it("survivors: an unattributed process in a non-live path blocks the seed; nothing is seeded or moved", { skip: realTableSkip("seed-time sweep: survivors") }, async () => {
     const iid = 2071;
     const pred = await abandonedPredecessor(iid);
     const pid = orphanIn(pred);
@@ -1044,7 +1053,7 @@ describe("issue #1783 M2: the seed-time sweep over the key's NON-LIVE paths", { 
     assert.equal([...readLedger(iid).values()].some((e) => e.runId === claim.run_id), false, "no ledger entry for the blocked seed");
   });
 
-  it("a live-owner conflict (a live same-key attempt's process) blocks the seed", async () => {
+  it("a live-owner conflict (a live same-key attempt's process) blocks the seed", { skip: realTableSkip("seed-time sweep: live-owner conflict") }, async () => {
     const iid = 2072;
     const liveAttempts = new LiveAttemptRegistry();
     const livePath = `${canonicalFor(iid)}.attempt-${mintAttemptId(1)}`;
@@ -1073,7 +1082,7 @@ describe("issue #1783 M2: the seed-time sweep over the key's NON-LIVE paths", { 
     assert.equal(attemptDirs(iid).length, 1);
   });
 
-  it("kills a terminal attempt's residue, removes containers bound in non-live paths, keeps a live same-key attempt's and a sibling key's", async () => {
+  it("kills a terminal attempt's residue, removes containers bound in non-live paths, keeps a live same-key attempt's and a sibling key's", { skip: realTableSkip("seed-time sweep: kills a terminal attempt's residue") }, async () => {
     const iid = 2074;
     const pred = await abandonedPredecessor(iid);
     const deadMarker = `${randomUUID()}:${mintAttemptId(1)}`;
@@ -1135,7 +1144,7 @@ function codexFactory(onRun: (ctx: RunContext) => void = () => {}): { factory: E
 }
 
 describe("issue #1783 M2 review: a Codex run's seed and capture sweeps scan processes", { skip: !HAS_PROCFS }, () => {
-  it("seed: a survivor in a non-live path blocks a Codex run's seed exactly as a Claude run's", async () => {
+  it("seed: a survivor in a non-live path blocks a Codex run's seed exactly as a Claude run's", { skip: realTableSkip("Codex sweeps: seed survivor") }, async () => {
     const iid = 2081;
     const runId = randomUUID();
     const pred = await seedPredecessor(iid, runId, { attempt: true });
@@ -1151,7 +1160,7 @@ describe("issue #1783 M2 review: a Codex run's seed and capture sweeps scan proc
     assert.equal(alive(pid), true);
   });
 
-  it("capture: a survivor in the journaled predecessor blocks a Codex run's capture", async () => {
+  it("capture: a survivor in the journaled predecessor blocks a Codex run's capture", { skip: realTableSkip("Codex sweeps: capture survivor") }, async () => {
     const iid = 2082;
     const runId = randomUUID();
     const pred = await seedPredecessor(iid, runId, { attempt: true });

@@ -310,6 +310,9 @@ describe("StatsCollector — DinD data-root sample (issue #1759)", () => {
       procCgroupPath: "/nonexistent-proc-cgroup",
       now: () => 0n,
       cpuCount: () => 1,
+      // issue #1863: the default RSS read (process.memoryUsage) reads the proc filesystem,
+      // which the Landlock test sandbox denies; the subject here is the meter, not the RSS.
+      processRss: () => 1024,
       statfs: () => ({ bsize: 4096, blocks: 10, bfree: 5, bavail: 5 }),
       dindMeter: () => readDindMeterSample({ path: p, nowMs: () => NOW_MS }),
     });

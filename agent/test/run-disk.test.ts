@@ -14,6 +14,7 @@ import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import type { ChatClaimResponse, ClaimResponse, RunDiskEntry, WorkerStats } from "../src/protocol.js";
+import { StatsCollector } from "../src/stats.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 
 // PRD #1809 D8: the per-run HOME size on the heartbeat. The sampler measures in the background
@@ -455,6 +456,9 @@ describe("Worker heartbeat — PRD #1809 D8 run_disk", () => {
         undefined,
         undefined,
         sampler,
+        // issue #1863: stub only the RSS read (the default reads the proc filesystem, which the
+        // Landlock test sandbox denies), so every beat carries a stats sample to attach to.
+        (dataDir) => new StatsCollector({ dataDir, processRss: () => 64 * 1024 * 1024 }),
       );
       const ac = new AbortController();
       const done = worker.run(ac.signal);

@@ -18,6 +18,7 @@ import {
 } from "../src/run-quiescence.js";
 import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, statStartTime, workerSpawnNonce } from "../src/worker-spawn-mark.js";
 import { restoreHermeticView } from "./setup/hermetic-proc.js";
+import { realProcfsSkip } from "./real-procfs.js";
 
 // issue #1783 M4 — the CI incident on the REAL procfs, not a fake root. A real `ssh-agent` (on
 // Linux, OpenSSH makes it non-dumpable, and a setgid build is non-dumpable anyway, so a non-root
@@ -77,7 +78,8 @@ const SKIP: string | false =
     ? "the real procfs reap is Linux-only"
     : SSH_AGENT === undefined
       ? "ssh-agent is not on PATH"
-      : false;
+      : // issue #1863: last, so a skip is recorded only when the denied proc root decides it.
+        realProcfsSkip("run-quiescence procfs ssh-agent (issue #1783 M4)");
 
 let work: string;
 /** Every agent this file launched: pid -> its start time read at launch. */

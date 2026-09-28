@@ -11,6 +11,7 @@ import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import type { ChatClaimResponse, ClaimResponse } from "../src/protocol.js";
 import { DiskPressureController } from "../src/disk-reclaim.js";
+import { StatsCollector } from "../src/stats.js";
 import { nullLogger } from "./helpers.js";
 
 // PRD #1809 D5: the admission stop, driven through the REAL Worker heartbeat and claim loops
@@ -95,6 +96,10 @@ function harness(over: { admission?: boolean; admissionMaxWaitMs?: number; recla
     undefined,
     undefined,
     pressure,
+    undefined,
+    // issue #1863: stub only the RSS read (the default reads the proc filesystem, which the
+    // Landlock test sandbox denies); the disk sample stays the real statfs of os.tmpdir().
+    (dataDir) => new StatsCollector({ dataDir, processRss: () => 64 * 1024 * 1024 }),
   );
   const ac = new AbortController();
   const running = worker.run(ac.signal);

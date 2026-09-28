@@ -11,6 +11,7 @@ import type { ReviewRunner } from "../src/review-runner.js";
 import type { ClaimResponse, ChatClaimResponse, WorkerStats } from "../src/protocol.js";
 import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY } from "../src/codex/codex-runtime-probe.js";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
+import { StatsCollector } from "../src/stats.js";
 import { recordingLogger } from "./helpers.js";
 
 // These run-lane / chat-lane tests never claim a judge run, so a no-op JudgeRunner
@@ -222,8 +223,11 @@ describe("Worker — heartbeat carries a resource sample (PRD #49 M1)", () => {
       claimChat: async (): Promise<ChatClaimResponse | null> => null,
     } as unknown as WorkerClient;
 
+    // issue #1863: the RSS read is stubbed (the default reads the proc filesystem, which the
+    // Landlock test sandbox denies); the rest of the collector is the real one.
     const worker = new Worker(fakeConfig(), client, { ...noResumeRecoveries, execute: async () => {} } as unknown as RunRunner, {} as unknown as ChatRunner, noJudge,
-      noReview, recordingLogger().logger, okPreflight);
+      noReview, recordingLogger().logger, okPreflight, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      (dataDir) => new StatsCollector({ dataDir, processRss: () => 64 * 1024 * 1024 }));
     const done = worker.run(controller.signal);
     for (let i = 0; i < 500 && seen.length === 0; i++) await tick();
     controller.abort();

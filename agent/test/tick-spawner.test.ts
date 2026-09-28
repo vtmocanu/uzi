@@ -7,6 +7,7 @@ import path from "node:path";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "../src/harness.js";
 import { TickSpawner, argvClass, killProbeSaysGone, processGroupAlive } from "../src/tick-spawner.js";
 import { WORKER_SPAWN_ENV, workerSpawnEnv, workerSpawnNonce } from "../src/worker-spawn-mark.js";
+import { realProcfsSkip } from "./real-procfs.js";
 
 // issue #1597 M2 — the mid-turn checkpoint tick's spawner: own process group per child, SIGTERM
 // then SIGKILL after a grace, `completed` only after exit, settled(), and PROVEN-ownership lock
@@ -295,17 +296,18 @@ ${exitAfterMs === undefined ? "setInterval(() => {}, 1000);" : `setTimeout(() =>
 
 /** Proven-ownership removal and the `foreign` / `inode_mismatch` reasons need the /proc fd
  *  evidence tick-spawner.ts reads only on Linux; elsewhere every such lock is retained as
- *  `no_proc_evidence` by design, so those cases do not apply. */
-const NEEDS_PROC: string | false =
+ *  `no_proc_evidence` by design, so those cases do not apply. On Linux the proof needs the real
+ *  proc root, so a sandbox that denies enumerating it skips through the shared detector (issue #1863). */
+const needsProc = (label: string): string | false =>
   process.platform !== "linux"
     ? "lock-ownership proof reads /proc (Linux only); non-Linux retains every lock as no_proc_evidence by design"
-    : false;
+    : realProcfsSkip(`TickSpawner lock custody: ${label}`);
 
 describe("TickSpawner lock custody (issue #1597 M2)", () => {
   const branch = "agent/issue-7";
   const trackingLock = (): string => path.join(bare, "refs", "uzi-runner", "agent", "issue-7.lock");
 
-  it("proven-owned: a SIGKILLed child's held lock (absent pre-spawn, same inode) is removed", { skip: NEEDS_PROC }, async () => {
+  it("proven-owned: a SIGKILLed child's held lock (absent pre-spawn, same inode) is removed", { skip: needsProc("proven-owned") }, async () => {
     const ac = new AbortController();
     const sp = new TickSpawner({ signal: ac.signal, barePath: bare, branch, killGraceMs: 200 });
     const h = await sp.spawn(req([NODE, stubborn(trackingLock())]));
@@ -322,7 +324,7 @@ describe("TickSpawner lock custody (issue #1597 M2)", () => {
     assert.deepEqual(await sp.reconcileLocks(), { removed: [], retained: [] });
   });
 
-  it("foreign: a lock another process created during the cancellation is RETAINED with evidence", { skip: NEEDS_PROC }, async () => {
+  it("foreign: a lock another process created during the cancellation is RETAINED with evidence", { skip: needsProc("foreign") }, async () => {
     const ac = new AbortController();
     const sp = new TickSpawner({ signal: ac.signal, barePath: bare, branch, killGraceMs: 300 });
     const h = await sp.spawn(req([NODE, stubborn()]));
@@ -346,7 +348,7 @@ describe("TickSpawner lock custody (issue #1597 M2)", () => {
     assert.ok(fs.existsSync(path.join(bare, "packed-refs.lock")), "never deleted");
   });
 
-  it("replaced: the child held the lock but the path now has a different inode — RETAINED", { skip: NEEDS_PROC }, async () => {
+  it("replaced: the child held the lock but the path now has a different inode — RETAINED", { skip: needsProc("replaced") }, async () => {
     const ac = new AbortController();
     const sp = new TickSpawner({ signal: ac.signal, barePath: bare, branch, killGraceMs: 200 });
     const h = await sp.spawn(req([NODE, stubborn(trackingLock())]));

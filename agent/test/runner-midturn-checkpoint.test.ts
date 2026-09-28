@@ -16,6 +16,7 @@ import { CodexBoundaryError } from "../src/codex/safety.js";
 import { GitCache } from "../src/git.js";
 import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { defaultGitleaksShim, shimCalls, writeGitleaksShim as writeShim } from "./gitleaks-shim.js";
+import { realProcfsSkip } from "./real-procfs.js";
 import type { Logger } from "../src/log.js";
 import {
   api,
@@ -1128,14 +1129,15 @@ describe("mid-turn checkpoint quiescence (issue #1597 M2)", () => {
 
 /** Proven-ownership lock removal, and the `foreign` / `inode_mismatch` reasons for a SIGKILLed
  *  child, need the /proc fd evidence tick-spawner.ts reads only on Linux. Elsewhere every such lock
- *  is retained as `no_proc_evidence`, by design, so these cases do not apply. */
-const NEEDS_PROC: string | false =
+ *  is retained as `no_proc_evidence`, by design, so these cases do not apply. On Linux the proof needs
+ *  the real proc root, so a sandbox that denies enumerating it skips through the shared detector (issue #1863). */
+const needsProc = (label: string): string | false =>
   process.platform !== "linux"
     ? "lock-ownership proof reads /proc (Linux only); non-Linux retains every lock as no_proc_evidence by design"
-    : false;
+    : realProcfsSkip(`mid-turn checkpoint lock custody: ${label}`);
 
 describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
-  it("(i) proven-owned: the SIGKILLed fetch child's own refs/uzi-runner lock is removed and the next fetch-back works", { skip: NEEDS_PROC }, async () => {
+  it("(i) proven-owned: the SIGKILLed fetch child's own refs/uzi-runner lock is removed and the next fetch-back works", { skip: needsProc("(i) proven-owned") }, async () => {
     const tmp = scratchDir("owned");
     const shim = writeShim(tmp, "detect");
     const iid = 1597_230;
@@ -1182,7 +1184,7 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
     }
   });
 
-  it("(i) foreign: a lock a separate process created during the cancellation is RETAINED; later ticks skip; shutdown names bare_lock_retained", { skip: NEEDS_PROC }, async () => {
+  it("(i) foreign: a lock a separate process created during the cancellation is RETAINED; later ticks skip; shutdown names bare_lock_retained", { skip: needsProc("(i) foreign") }, async () => {
     const tmp = scratchDir("foreign");
     const shim = writeShim(tmp, "detect");
     const iid = 1597_231;
@@ -1412,7 +1414,7 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
     }
   });
 
-  it("(i) replaced: the child held the lock but after its exit the path is a different inode — RETAINED", { skip: NEEDS_PROC }, async () => {
+  it("(i) replaced: the child held the lock but after its exit the path is a different inode — RETAINED", { skip: needsProc("(i) replaced") }, async () => {
     const tmp = scratchDir("replaced");
     const shim = writeShim(tmp, "detect");
     const iid = 1597_232;

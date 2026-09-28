@@ -32,6 +32,7 @@ import { RUN_ATTEMPT_ENV, RUN_CLONE_KEY_ENV } from "../src/worker-spawn-mark.js"
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { scopedRealView } from "./fake-proc.js";
 import { restoreHermeticView } from "./setup/hermetic-proc.js";
+import { realProcfsSkip } from "./real-procfs.js";
 import { noProofReseed, nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
@@ -42,6 +43,10 @@ import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness,
 // fails the run typed `worker_residue_blocked`, with nothing moved. These tests run non-root.
 
 const HAS_PROCFS = process.platform === "linux";
+/** The skip for a case whose proof scans the REAL process table: none, "Linux only", or (a sandbox
+ *  that denies enumerating the proc root, issue #1863) the shared detector's recorded reason. */
+const realTableSkip = (label: string): string | false =>
+  !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip(`clone-residue: ${label}`);
 
 /** Directories made read-only by a test, restored (u+w) before the harness removes the fixture. */
 const readOnly: string[] = [];
@@ -399,7 +404,7 @@ describe("issue #1783 M3: journal classification runs before any free; a journal
 describe("issue #1783 M3: a blocked canonical free moves nothing and fails worker_residue_blocked", () => {
   it(
     "active owner: a live same-key attempt's marker process in scope blocks; it is never signalled and nothing moves",
-    { skip: HAS_PROCFS ? false : "reads procfs (Linux only)" },
+    { skip: realTableSkip("blocked canonical free: active owner") },
     async () => {
       const iid = 3201;
       const canonical = canonicalFor(iid);
@@ -942,7 +947,7 @@ describe("issue #1783 final: a timed-out canonical rm is waited out before any q
   });
 });
 
-describe("issue #1783 final (R3): the clone key alone never puts a process in a seed's scope", { skip: HAS_PROCFS ? false : "reads procfs (Linux only)" }, () => {
+describe("issue #1783 final (R3): the clone key alone never puts a process in a seed's scope", { skip: realTableSkip("final (R3): the clone key alone") }, () => {
   /** A canonical reseed of `iid` over the REAL in-process scan, its canonical_reseed verdicts recorded. */
   async function reseedWith(iid: number, liveAttempts: LiveAttemptRegistry) {
     const verdicts: QuiesceRunOutcome[] = [];

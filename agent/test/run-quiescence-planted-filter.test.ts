@@ -12,6 +12,7 @@ import { procfsTable, setQuiescenceViewForTests } from "../src/run-quiescence.js
 import { scopedRealView } from "./fake-proc.js";
 import { api, client, fakeGitHub, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 import { restoreHermeticView } from "./setup/hermetic-proc.js";
+import { realProcfsSkip } from "./real-procfs.js";
 
 // issue #1783 (auditor M1) — an agent-planted git filter driver must not outlive a park.
 //
@@ -29,6 +30,10 @@ import { restoreHermeticView } from "./setup/hermetic-proc.js";
 installHarness();
 
 const HAS_PROCFS = process.platform === "linux" && fs.existsSync(path.join("/", "proc", "self", "status"));
+/** The planted sleeps are found and reaped on the REAL process table: a sandbox that denies
+ *  enumerating the proc root skips through the shared detector (issue #1863). */
+const realTableSkip = (label: string): string | false =>
+  !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip(`run-quiescence-planted-filter: ${label}`);
 const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
 const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
 
@@ -153,7 +158,7 @@ describe("issue #1783 M1: the runner-clone git classification", () => {
   });
 });
 
-describe("issue #1783 M1: a planted filter driver does not survive a park", { skip: !HAS_PROCFS }, () => {
+describe("issue #1783 M1: a planted filter driver does not survive a park", { skip: realTableSkip("planted filter driver vs park") }, () => {
   it("limit park: the filter's detached sleep is reaped before the credentialed publish runs", async () => {
     const { gitlab } = fakeGitlab();
     const pidFile = path.join(scratch, "limit.pids");
@@ -269,7 +274,7 @@ function commitToOriginMain(files: Record<string, string>, msg: string): void {
   execFileSync("git", ["-C", fx.originPath, ...IDENT, "commit", "-m", msg], { env: GIT_ENV, stdio: "pipe" });
 }
 
-describe("issue #1783: a planted smudge filter does not survive into the finalize push", { skip: !HAS_PROCFS }, () => {
+describe("issue #1783: a planted smudge filter does not survive into the finalize push", { skip: realTableSkip("planted smudge filter vs finalize push") }, () => {
   it("base-align: the smudge's detached sleep is reaped before the PAT push runs", async () => {
     const pidFile = path.join(scratch, "align.pids");
     pidFiles.push(pidFile);

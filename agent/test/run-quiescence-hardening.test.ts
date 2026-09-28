@@ -24,6 +24,7 @@ import {
 } from "../src/run-quiescence.js";
 import { defaultCheckRunner } from "../src/self-improve.js";
 import { makeFakeProcRoot, scopedRealView, withQuiescenceView } from "./fake-proc.js";
+import { realProcfsSkip } from "./real-procfs.js";
 import { RUN_ATTEMPT_ENV, registerWorkerRunnerRoot, workerSpawnNonce } from "../src/worker-spawn-mark.js";
 
 // issue #1783 review round — the hardening of the run-quiescence reaper: attribution of a
@@ -572,7 +573,11 @@ describe("A-docker-hardening", () => {
 
 // ─── item 4: a self-improve check's leak is reaped ─────────────────────────────────────────
 
-describe("A-check-leak: a process leaked by a self-improve check is reaped", { skip: !HAS_PROCFS }, () => {
+// The leak is found and reaped on the REAL process table: a sandbox that denies enumerating the
+// proc root skips through the shared detector (issue #1863).
+describe("A-check-leak: a process leaked by a self-improve check is reaped", {
+  skip: !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip("run-quiescence-hardening A-check-leak"),
+}, () => {
   it("the check is NOT worker-marked, so its detached leak (cwd in the clone) is killed by the run's own reap", async () => {
     const repoDir = path.join(tmp, "check-leak", "runner", "github.com+o+check");
     const clone = path.join(repoDir, "issue-17");

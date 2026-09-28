@@ -23,6 +23,7 @@ import {
 import { SinkGate } from "../src/sink-gate.js";
 import { scopedRealView } from "./fake-proc.js";
 import { restoreHermeticView } from "./setup/hermetic-proc.js";
+import { realProcfsSkip } from "./real-procfs.js";
 import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV, recordRoot, workerSpawnEnv, workerSpawnNonce, type RecordedRoot } from "../src/worker-spawn-mark.js";
 
 // issue #1783 (R0/R3/R5 + Docker) — the run-quiescence reaper. Real processes where stated (single
@@ -31,6 +32,10 @@ import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV, re
 // non-dumpable processes). The runner-level fail-closed wiring is in run-quiescence-runner.test.ts.
 
 const HAS_PROCFS = process.platform === "linux" && fs.existsSync(path.join("/", "proc", "self", "status"));
+/** The skip for a suite on the REAL process table: none, "Linux only", or (a sandbox that denies
+ *  enumerating the proc root, issue #1863) the shared detector's recorded reason. */
+const realTableSkip = (label: string): string | false =>
+  !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip(`run-quiescence ${label}`);
 const ME = process.getuid?.() ?? 0;
 const RUNNER = 10002;
 
@@ -253,7 +258,7 @@ function killAgentTree(cli: ChildProcess): void {
 
 // ─── real processes ────────────────────────────────────────────────────────────────────────
 
-describe("A-core: a setsid'd agent tool survives killAgentTree; quiesce + retire removes it", { skip: !HAS_PROCFS }, () => {
+describe("A-core: a setsid'd agent tool survives killAgentTree; quiesce + retire removes it", { skip: realTableSkip("A-core") }, () => {
   it("reaps the attributed tool and its clone-bound containers, and never touches the issue-1769 sibling", async () => {
     const clones = makeClones("core", ["issue-17", "issue-1769"]);
     const daemon = await startFakeDaemon(path.join(tmp, "core-docker"));
@@ -314,7 +319,7 @@ describe("A-core: a setsid'd agent tool survives killAgentTree; quiesce + retire
   });
 });
 
-describe("A-concurrent: two unrelated healthy runs reap at the same time", { skip: !HAS_PROCFS }, () => {
+describe("A-concurrent: two unrelated healthy runs reap at the same time", { skip: realTableSkip("A-concurrent") }, () => {
   it("both are quiescent and each kills only its own residue", async () => {
     const clones = makeClones("concurrent", ["issue-17", "issue-1769"]);
     const registry = new LiveAttemptRegistry();
@@ -339,7 +344,7 @@ describe("A-concurrent: two unrelated healthy runs reap at the same time", { ski
   });
 });
 
-describe("A-component: issue-17 vs issue-1769 on a real process table", { skip: !HAS_PROCFS }, () => {
+describe("A-component: issue-17 vs issue-1769 on a real process table", { skip: realTableSkip("A-component (real table)") }, () => {
   it("scopes by whole path components for cwd and by exact key for UZI_RUN_CLONE_KEY", async () => {
     const clones = makeClones("component", ["issue-17", "issue-1769"]);
     const own = attemptFor("run-17", clones["issue-17"]!);
@@ -367,7 +372,7 @@ describe("A-component: issue-17 vs issue-1769 on a real process table", { skip: 
   });
 });
 
-describe("A-worker-op: a worker-marked op in the clone survives a concurrent reap", { skip: !HAS_PROCFS }, () => {
+describe("A-worker-op: a worker-marked op in the clone survives a concurrent reap", { skip: realTableSkip("A-worker-op") }, () => {
   it("the tick's git-like op, started under the sink gate, completes while the reap runs", async () => {
     const clones = makeClones("worker-op", ["issue-17"]);
     const own = attemptFor("run-17", clones["issue-17"]!);
@@ -397,7 +402,7 @@ describe("A-worker-op: a worker-marked op in the clone survives a concurrent rea
   });
 });
 
-describe("A-self: the scanner never kills itself or its ancestors", { skip: !HAS_PROCFS }, () => {
+describe("A-self: the scanner never kills itself or its ancestors", { skip: realTableSkip("A-self") }, () => {
   it("a helper started (via a wrapper) with this attempt's marker and cwd inside the clone stays alive", async () => {
     const clones = makeClones("self", ["issue-17"]);
     const own = attemptFor("run-17", clones["issue-17"]!);
@@ -429,7 +434,7 @@ process.exit(r.status === null ? 1 : r.status);`;
   });
 });
 
-describe("A-healthy: a normal run through runnerCommand (passthrough single-uid)", { skip: !HAS_PROCFS }, () => {
+describe("A-healthy: a normal run through runnerCommand (passthrough single-uid)", { skip: realTableSkip("A-healthy") }, () => {
   it("is quiescent with no residue, and reaps an own-marked straggler", async () => {
     const clones = makeClones("healthy", ["issue-17"]);
     const own = attemptFor("run-17", clones["issue-17"]!);

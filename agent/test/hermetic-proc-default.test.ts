@@ -6,6 +6,8 @@ import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { LiveAttemptRegistry, newRunAttempt, procfsTable, quiesceRunAttempt, reapRunProcesses } from "../src/run-quiescence.js";
 import { RUN_ATTEMPT_ENV, RUN_CLONE_KEY_ENV, workerSpawnNonce } from "../src/worker-spawn-mark.js";
+// Safe to import here: real-procfs.ts imports only node:fs and node:path and installs no view.
+import { realProcfsSkip } from "./real-procfs.js";
 
 // issue #1783 — the package.json `test` script preloads test/setup/hermetic-proc.ts into EVERY
 // test file's process (node --test forwards the parent's --import flags to each child). This file
@@ -37,7 +39,11 @@ function alive(pid: number | undefined): boolean {
   }
 }
 
-describe("hermetic default quiescence view (preloaded)", { skip: !HAS_PROCFS }, () => {
+// The straggler's liveness is read from the REAL proc root: a sandbox that denies enumerating it
+// skips through the shared detector (issue #1863).
+const SKIP: string | false = !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip("hermetic default quiescence view (preloaded)");
+
+describe("hermetic default quiescence view (preloaded)", { skip: SKIP }, () => {
   it("a reap with no injected table ignores the host's processes, even a real in-scope straggler", async () => {
     const clone = path.join(tmp, "runner", "github.com+o+r", "issue-17");
     fs.mkdirSync(clone, { recursive: true });

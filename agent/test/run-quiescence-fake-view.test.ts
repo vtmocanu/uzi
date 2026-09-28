@@ -32,6 +32,7 @@ import {
 } from "./fake-proc.js";
 import { api, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith, simulateCommittedWork, worktreeDirFor } from "./runner-harness.js";
 import { restoreHermeticView } from "./setup/hermetic-proc.js";
+import { realProcfsSkip } from "./real-procfs.js";
 
 // issue #1783 — the CI incident, made hermetic. A same-uid non-dumpable process anywhere on the
 // worker (on GitHub Actions a setgid ssh-agent: its environ reads back unreadable) is
@@ -239,7 +240,11 @@ describe("a malformed view is refused by the setter and by the helper", () => {
 
 // ─── the scoped real view (real procfs) ────────────────────────────────────────────────────
 
-describe("the scoped real view lists only this process's descendants and the registered pids", { skip: !HAS_LINUX }, () => {
+// This suite reads the REAL proc root: a sandbox that denies enumerating it skips through the
+// shared detector (issue #1863). The fake-root suites above and below keep running there.
+describe("the scoped real view lists only this process's descendants and the registered pids", {
+  skip: !HAS_LINUX ? true : realProcfsSkip("run-quiescence-fake-view: the scoped real view"),
+}, () => {
   it("a real non-descendant in the clone is excluded, and appears once registered by pid or pidfile (within 64 KiB)", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-scoped-view-"));
     const clone = path.join(tmp, "runner", "github.com+o+r", "issue-scoped");
