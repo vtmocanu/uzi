@@ -82,8 +82,9 @@
 # gate people cannot run is a gate that stops being run). gitleaks is not in that
 # category: it arrives through `go install pkg@version`, the Go toolchain is mandatory
 # in this repo, and `gate:api` ALREADY fetches two pinned remote tools over the
-# network (golangci-lint's release archive, deadcode via `go run`). So the population that cannot obtain gitleaks is the
-# population that cannot run `gate:api` either -- a skip would buy nobody anything
+# network (golangci-lint's release archive, deadcode via `go run`). So the
+# population that cannot obtain gitleaks is the population that cannot run
+# `gate:api` either -- a skip would buy nobody anything
 # and would put a fail-open branch in the one check where fail-open is worst.
 # There is consequently NO `UZI_SCAN_SECRETS_REQUIRED`: a variable guarding a
 # branch that does not exist is the vacuous-directive class this milestone is
