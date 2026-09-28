@@ -104,9 +104,9 @@ repo classifies something uzi's generic rules get wrong (generated code that
 doesn't match a common pattern, for example), add or adjust a
 `.gitattributes` entry for it; the size line has no repo-specific rules
 baked in. `uzi run get`'s own `SIZE` row and the run page's "Delivered"
-card both print a shorter cut of the same numbers: each omits a bucket that
-has a file but no added and no deleted lines, which the PR's own size line
-still shows.
+section both print a shorter cut of the same numbers: each omits a bucket
+that has a file but no added and no deleted lines, which the PR's own size
+line still shows.
 
 **Verification is only what the agent reported.** The Verification section
 never claims the CI passed (that's on the PR itself, from the forge) and
@@ -133,16 +133,20 @@ overwriting it; the completion block below it is still kept current.
 Text outside uzi's two blocks isn't untouchable, though: uzi rewrites the
 **whole** body, region and all, in a few specific cases where preserving text
 would let something it doesn't own slip through — a PR with none of uzi's
-markers and no previously published description; markers that are malformed,
-or a completion block that's gone missing, on an interlocked run (the
-publisher itself skips such a PR rather than write into damaged markers, and
-the completion interlock's own reconcile is what then rewrites it whole, on
-a verified `Closes` add exactly as on a hold's strip); a directive elsewhere
-in the body that would close the issue on a run whose delivery must not
-close it; or, when the PR can't even be read back, a blind non-closing
-rewrite as a last resort. A refresh run (`mr_rework`, or a `ci_fix` picking
-up an existing branch) never does this: it only ever touches its own two
-blocks, or leaves a PR with no uzi markers untouched entirely.
+markers and no previously published description; markers that are malformed
+(the publisher skips such a PR rather than write into damaged markers, and
+the completion interlock's own reconcile is what then rewrites it whole); a
+directive elsewhere in the body that would close the issue on a run whose
+delivery must not close it; or, when the PR can't even be read back, a blind
+non-closing rewrite as a last resort. A completion block that's gone
+missing is different: the publisher repairs it in place, appending a fresh
+completion block and keeping everything else, and the interlock's own
+reconcile only rewrites the whole body if the block is *still* missing when
+it reads the PR (the publisher's write failed or was stopped, or a human
+deleted the block afterwards). A refresh run (`mr_rework`, or a `ci_fix`
+picking up an existing branch) never does either kind of whole-body
+rewrite: it only ever touches its own two blocks, or leaves a PR with no
+uzi markers untouched entirely.
 
 **Where to see it.** The run page shows a "Delivered" section of the same
 card as the intent and plan summaries. `uzi run get <id>` prints the same

@@ -179,17 +179,17 @@ something goes wrong or a human has touched the request in between:
   issue. If it finds one anywhere it doesn't own (a human typed `Closes #N`
   into the description, or the request is an older one uzi adopted that
   already carried one), it rewrites the whole body to a non-closing form.
-  If that rewrite can't be *written*, or is written but a read-back to
-  confirm it fails, the run fails closed rather than leaving a
+  If that rewrite can't be *written*, or is written but the read-back
+  shows it did not land, the run fails closed rather than leaving a
   possibly-closing request open; if the request was unreadable to begin
   with, a blind rewrite that succeeds is still accepted, even though
-  nothing read the body back to confirm it. A failed read-back after the
-  rewrite is written plays out differently by run kind: on a legacy
-  (seeded) run, that failure has no further fallback and the run fails
-  closed there and then; on an interlocked run, that same failure falls
-  through to the same blind whole-body rewrite the unreadable case uses,
-  and is accepted on the same terms. This scan and rewrite apply to legacy
-  runs too, not only interlocked ones.
+  nothing read the body back to confirm it. A read-back that errors
+  outright after the rewrite is written plays out differently by run
+  kind: on a legacy (seeded) run, that failure has no further fallback
+  and the run fails closed there and then; on an interlocked run, that
+  same failure falls through to the same blind whole-body rewrite the
+  unreadable case uses, and is accepted on the same terms. This scan and
+  rewrite apply to legacy runs too, not only interlocked ones.
 
 ## Not the same as an owner pause
 
