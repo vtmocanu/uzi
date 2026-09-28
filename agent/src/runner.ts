@@ -6206,6 +6206,25 @@ export class RunRunner {
     // lead declared none) — same absent-vs-present discipline as prd_done_path, so the
     // server UNIONs them into milestones_completed only when actually declared and a
     // no-declaration completion is byte-identical to before.
+    // Phase 52 needs to cut the api after all forge and description work, but before
+    // the terminal is journaled. Tick count alone cannot locate this boundary: a
+    // slow runner can still be staging the PR description when the api goes down.
+    if (!interlocked && process.env.UZI_E2E_TERMINAL_BARRIER === "1" &&
+        claim.issue_description?.includes("UZI_STUB_OUTBOX")) {
+      const release = `/tmp/uzi-e2e-terminal-${runId}`;
+      runLog.info("e2e terminal boundary ready", { run_id: runId });
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline) {
+        try {
+          await fs.access(release);
+          break;
+        } catch {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      }
+      await fs.access(release); // a missing release fails the test run instead of hanging it
+      await fs.unlink(release);
+    }
     await finishCommittedPublish({
       status: "completed",
       branch: result.branch,

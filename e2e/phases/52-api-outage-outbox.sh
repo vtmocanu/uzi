@@ -38,8 +38,8 @@
 # fenced on `runs.last_seq` at the api, so a run that finishes while the api is down replays its
 # messages first and its outcome only once the trace is contiguous — no false `failed`, nothing
 # redone. The M6 cases use the SAME UZI_STUB_OUTBOX sentinel with a SHORTER stream
-# (UZI_STUB_OUTBOX_TICKS, e2e-only, exported below) so the run reaches its terminal INSIDE a
-# bounded outage that stays under the raised heartbeat-stale window:
+# (UZI_STUB_OUTBOX_TICKS, e2e-only, exported below) and pause at the pre-terminal
+# boundary until the api is down. This bounds the outage below the heartbeat-stale window:
 #   3. FINISH-DURING-OUTAGE: a run reaches `completed` (journaled write-ahead) while the api is
 #      down; on recovery it ends `completed` AFTER its gapless messages (the fence), at its
 #      original generation (replayed, not re-executed), with no transient `failed`. The judge /
@@ -235,6 +235,23 @@ wait_terminal_lost() {
   done
   return 1
 }
+# cut_api_at_terminal RUN — wait until all pre-terminal API and forge work has
+# finished, then stop the api and release the stub. The worker cannot reach its
+# journal before this release, so a slow PR-description step cannot consume the
+# outage window (or move the first terminal send past recovery).
+cut_api_at_terminal() {
+  local run="$1" f="$RUNROOT/.outbox-boundary.log" deadline=$((SECONDS + 120))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    "${COMPOSE[@]}" logs --no-color agent > "$f" 2>/dev/null || true
+    if awk -v r="$run" 'index($0, r) && index($0, "e2e terminal boundary ready") { hit = 1 } END { exit(hit ? 0 : 1) }' "$f"; then
+      "${COMPOSE[@]}" stop api >/dev/null 2>&1
+      "${COMPOSE[@]}" exec -T -u worker agent touch "/tmp/uzi-e2e-terminal-$run"
+      return 0
+    fi
+    sleep 1
+  done
+  fail "outbox phase: run $run never reached the pre-terminal boundary while the api was up"
+}
 # wait_permit_retrying RUN [TIMEOUT] — block until run RUN, finishing while the api is down, is
 # RETRYING its completion-permit request ("completion permit request failed, retrying", client.ts)
 # rather than failing. An interlocked run cannot journal `completed` before it holds a permit, so it
@@ -393,12 +410,13 @@ fi
 # `completed`/`failed` is journaled write-ahead to the outbox (M3, keyed by claim generation)
 # BEFORE its first network send and fenced on runs.last_seq at the api, so a run that finishes
 # while the api is down replays its messages first and its outcome only once the trace is
-# contiguous. These cases reuse the UZI_STUB_OUTBOX sentinel but with the SHORT e2e-only stream
-# (UZI_STUB_OUTBOX_TICKS) so the run reaches its terminal INSIDE a bounded outage that still stays
-# under the 90s heartbeat-stale window raised above — the worker stays leased across the outage.
+# contiguous. These cases reuse the UZI_STUB_OUTBOX sentinel with a SHORT e2e-only stream
+# (UZI_STUB_OUTBOX_TICKS). The worker pauses after PR publication, before terminal reporting;
+# the phase stops the api and releases it, keeping the outage under the 90s stale window.
 say "M6 (Run B): write-ahead terminal reports survive an api outage (finish-during, restart, sweep carve-out; interlocked permit wait)"
 unset WORKER_OUTBOX_RUN_MAX_BYTES            # back to DEFAULT quotas (a clean spill, no eviction) for the M6 runs
 export UZI_STUB_OUTBOX_TICKS=20              # ~20s stream (vs the 90s Run A default), e2e-only; unset at restore
+export UZI_E2E_TERMINAL_BARRIER=1
 "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
 wait_worker_online
 pass "agent recreated with WORKER_TRANSIENT_TRIP_MS=3s + a short UZI_STUB_OUTBOX stream for the M6 terminal-replay cases"
@@ -407,13 +425,11 @@ pass "agent recreated with WORKER_TRANSIENT_TRIP_MS=3s + a short UZI_STUB_OUTBOX
 # THIS file, never user input). Empty string for a SQL NULL (the 42-readoption idiom).
 rb_run_field() { db_psql "SELECT $2 FROM runs WHERE id = '$1'"; }
 
-# Each M6 outage is EVENT-GATED on the terminal being journaled AND its first live send lost to the
-# outage (wait_terminal_lost), not a fixed sleep: the run must REACH+JOURNAL its terminal AND have its
-# first send fail while the api is unreachable, so recovery is forced through the persisted journal.
-# How long the short stream takes to get there depends on the runner's speed, not this phase (a fixed
-# 30s under-shot it on the slow gitlab CI lane — the #1391 M6 regression this replaces). The gate's
-# timeout stays well under the 90s heartbeat-stale window, so the worker is never swept stale
-# mid-outage and the run is never requeued.
+# Each M6 outage starts at the worker's pre-terminal barrier. It is then EVENT-GATED on the
+# terminal being journaled AND its first live send lost to the outage (wait_terminal_lost):
+# recovery must pass through the persisted journal. The old third-tick cut let the PR
+# description's api calls consume the outage before this boundary. The gate's timeout stays
+# under the 90s heartbeat-stale window, so the worker is not swept stale mid-outage.
 
 # Cases 3-5 exercise the terminal journal, so their runs are created un-interlocked (set_interlock).
 # The trap restores the default even if a case fails.
@@ -428,7 +444,7 @@ make_outbox_run
 RUN_B1="$OUTBOX_RUN"
 GEN_B1="$(rb_run_field "$RUN_B1" claim_generation)"
 say "cutting the api so run $RUN_B1 reaches AND journals its terminal (write-ahead) while it is down"
-"${COMPOSE[@]}" stop api >/dev/null 2>&1
+cut_api_at_terminal "$RUN_B1"
 terminal_lost_b1=0; if wait_terminal_lost "$RUN_B1"; then terminal_lost_b1=1; fi
 api_back
 # Judge only AFTER the api is back: a `fail` with it still stopped would take every later phase down
@@ -467,7 +483,7 @@ RUN_B2="$OUTBOX_RUN"
 GEN_B2="$(rb_run_field "$RUN_B2" claim_generation)"
 RQ_B2="$(rb_run_field "$RUN_B2" requeue_count)"
 say "cutting the api so run $RUN_B2 spills its messages and journals its terminal while down"
-"${COMPOSE[@]}" stop api >/dev/null 2>&1
+cut_api_at_terminal "$RUN_B2"
 # Gate BEFORE the restart on the terminal being journaled AND its first live send lost: the run must
 # have spilled its messages AND installed its terminal journal (the batcher is final-flushed before
 # the terminal is journaled, so the message spill is already on disk by the time the journal line
@@ -532,7 +548,7 @@ pass "case 5: past-wall carve-out run held at 'running' across the sweep (carve-
 # Now lose its terminal to an outage. Without the journal replay this run would stay non-terminal
 # forever (the carve-out spares it from the timeout sweep AND the judge sweep never touches it).
 say "cutting the api so the carve-out run's terminal is journaled and its first send lost"
-"${COMPOSE[@]}" stop api >/dev/null 2>&1
+cut_api_at_terminal "$RUN_B3"
 terminal_lost_b3=0; if wait_terminal_lost "$RUN_B3"; then terminal_lost_b3=1; fi
 api_back
 [ "$terminal_lost_b3" = 1 ] \
@@ -581,7 +597,7 @@ pass "case 6: the interlocked run waited out the outage for its permit -> comple
 # RESTORE — return the api stale window and the agent outbox knobs to their defaults so
 # later phases (59-restart-agent, 60-62) are unaffected. Mirrors phase 46's restore.
 say "restore: recreate api + agent back to their defaults"
-unset E2E_WORKER_HEARTBEAT_STALE WORKER_TRANSIENT_TRIP_MS WORKER_OUTBOX_RUN_MAX_BYTES UZI_STUB_OUTBOX_TICKS
+unset E2E_WORKER_HEARTBEAT_STALE WORKER_TRANSIENT_TRIP_MS WORKER_OUTBOX_RUN_MAX_BYTES UZI_STUB_OUTBOX_TICKS UZI_E2E_TERMINAL_BARRIER
 "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate api >/dev/null
 wait_http
 login

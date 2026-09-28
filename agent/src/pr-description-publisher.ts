@@ -51,6 +51,7 @@ import {
   PrDescriptionConflict,
   PrDescriptionMalformedResponse,
   PrDescriptionRateLimited,
+  RequestError,
   isTransient,
   type WorkerClient,
 } from "./client.js";
@@ -420,7 +421,9 @@ async function replay<T>(fn: () => Promise<T>, sleep: (ms: number) => Promise<vo
       return await fn();
     } catch (e) {
       last = e;
-      const retryable = e instanceof PrDescriptionMalformedResponse || isTransient(e);
+      // A transport failure has no HTTP response and a retry can hold the run's
+      // terminal behind another full connect timeout. HTTP 408/429/5xx still replay.
+      const retryable = e instanceof RequestError && isTransient(e);
       if (!retryable || attempt === REPLAY_ATTEMPTS - 1) throw e;
       await sleep(e instanceof PrDescriptionRateLimited && e.retryAfterMs !== undefined ? e.retryAfterMs : 250 * (attempt + 1));
     }
@@ -500,6 +503,8 @@ export class PrDescriptionPublication {
   private signal: AbortSignal;
   /** A stale_claim / run_terminal 409 was answered: no further api call and no forge write. */
   private stopped = false;
+  /** An api transport failure in this publication. All api routes are advisory. */
+  private apiUnreachable = false;
   private readonly memo = new BodyMemo();
   /** The PR body as last read (or confirmed) from the forge, and the completion block uzi's last
    *  composition expected in it: what `closingRemains` is judged on. */
@@ -541,6 +546,12 @@ export class PrDescriptionPublication {
     return true;
   }
 
+  private noteApiFailure(e: unknown): void {
+    if (!(e instanceof RequestError) && !(e instanceof PrDescriptionMalformedResponse)) {
+      this.apiUnreachable = true;
+    }
+  }
+
   /** uzi's own region for the current staged version. */
   get region(): string {
     return this.staged.region;
@@ -573,7 +584,7 @@ export class PrDescriptionPublication {
     let fields: RawPrDescriptionFields = EMPTY_FIELDS;
     // A stopped publication (a 409 stale_claim/run_terminal) no longer owns the run: skip the
     // model pass, whose result would be thrown away, rather than spend the owner's credential on it.
-    if (!deterministic && !this.stopped) {
+    if (!deterministic && !this.stopped && !this.apiUnreachable) {
       const generated = await this.editorPass(snapshot);
       const lead = leadFields(spec.lead);
       if (generated) {
@@ -588,7 +599,7 @@ export class PrDescriptionPublication {
     const base = facts?.baseSha ?? null;
     if (this.stopped) {
       // A stopped publication stages nothing more (its region stays deterministic and unversioned).
-    } else if (base && SHA40_RE.test(base) && SHA40_RE.test(snapshot.headSha) && snapshot.targetBranch) {
+    } else if (!this.apiUnreachable && base && SHA40_RE.test(base) && SHA40_RE.test(snapshot.headSha) && snapshot.targetBranch) {
       try {
         // Stage is NEVER retried: a lost response may already have stored a version.
         version = (
@@ -607,13 +618,14 @@ export class PrDescriptionPublication {
           )
         ).version;
       } catch (e) {
+        this.noteApiFailure(e);
         this.stopOn(e);
         deps.log.warn("PR description: staging failed; the region carries the size line only", {
           run_id: spec.runId,
           error: errMsg(e),
         });
       }
-    } else {
+    } else if (!this.apiUnreachable) {
       deps.log.warn("PR description: the snapshot has no merge-base or head; the region is not staged", { run_id: spec.runId });
     }
     const input = { sizeLine, headSha: snapshot.headSha, targetBranch: snapshot.targetBranch };
@@ -642,7 +654,7 @@ export class PrDescriptionPublication {
   // ── api calls ──
 
   private async bind(mrIid: number, staged: Staged, hash: string): Promise<void> {
-    if (this.stopped || !staged.version || staged.boundHash !== undefined) return;
+    if (this.stopped || this.apiUnreachable || !staged.version || staged.boundHash !== undefined) return;
     try {
       const res = await replay(
         () =>
@@ -656,13 +668,14 @@ export class PrDescriptionPublication {
       staged.boundHash = hash;
       this.state = res.pr;
     } catch (e) {
+      this.noteApiFailure(e);
       this.stopOn(e);
       this.deps.log.warn("PR description: binding the version failed", { run_id: this.spec.runId, error: errMsg(e) });
     }
   }
 
   private async lookup(mrIid: number, hash: string): Promise<{ match: "published" | "pending" | "none" } | undefined> {
-    if (this.stopped) return undefined;
+    if (this.stopped || this.apiUnreachable) return undefined;
     try {
       const res = await replay(
         () =>
@@ -676,6 +689,7 @@ export class PrDescriptionPublication {
       if (res.pr) this.state = res.pr;
       return { match: res.match };
     } catch (e) {
+      this.noteApiFailure(e);
       this.stopOn(e);
       this.deps.log.warn("PR description: looking up the PR's region failed", { run_id: this.spec.runId, error: errMsg(e) });
       return undefined;
@@ -685,7 +699,7 @@ export class PrDescriptionPublication {
   /** Ack a BOUND version once. Only the six api outcomes exist; a lost compare-and-swap refreshes
    *  the lock version through a lookup and replays. */
   private async ack(mrIid: number, staged: Staged, outcome: PrDescriptionAckOutcome, observed?: string): Promise<void> {
-    if (this.stopped || !staged.version || staged.boundHash === undefined || staged.acked) return;
+    if (this.stopped || this.apiUnreachable || !staged.version || staged.boundHash === undefined || staged.acked) return;
     staged.acked = true;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
@@ -710,9 +724,10 @@ export class PrDescriptionPublication {
       } catch (e) {
         if (attempt === 0 && e instanceof PrDescriptionConflict && e.reason === "lock_conflict") {
           await this.lookup(mrIid, observed ?? regionSha256(""));
-          if (this.stopped) return;
+          if (this.stopped || this.apiUnreachable) return;
           continue;
         }
+        this.noteApiFailure(e);
         this.stopOn(e);
         this.deps.log.warn("PR description: the ack failed", { run_id: this.spec.runId, outcome, error: errMsg(e) });
         return;

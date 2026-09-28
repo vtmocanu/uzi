@@ -12,6 +12,7 @@ import {
   type DeliveryPass,
   type PublicationSpec,
   type PublisherForge,
+  type PublisherApi,
 } from "../src/pr-description-publisher.js";
 import {
   BODY_CAP_CHARS,
@@ -175,6 +176,71 @@ function rig(pass: FakePass | null = new FakePass(SUMMARY)): Rig {
   });
   return { forge, emitted, publisher, pass };
 }
+
+function apiWith(over: Partial<PublisherApi>): PublisherApi {
+  return {
+    stagePrDescription: client.stagePrDescription.bind(client),
+    bindPrDescription: client.bindPrDescription.bind(client),
+    lookupPrDescription: client.lookupPrDescription.bind(client),
+    ackPrDescription: client.ackPrDescription.bind(client),
+    ...over,
+  };
+}
+
+describe("api outage while publishing a PR description", () => {
+  it("skips later advisory api calls after staging loses transport, so terminal reporting is not held by retries", async () => {
+    const forge = new FakeForge();
+    const calls: string[] = [];
+    const publisher = new PrDescriptionPublisher({
+      forge,
+      api: apiWith({
+        stagePrDescription: async () => { calls.push("stage"); throw new TypeError("fetch failed"); },
+        lookupPrDescription: async () => { calls.push("lookup"); throw new TypeError("fetch failed"); },
+        bindPrDescription: async () => { calls.push("bind"); throw new TypeError("fetch failed"); },
+        ackPrDescription: async () => { calls.push("ack"); throw new TypeError("fetch failed"); },
+      }),
+      pass: null,
+      log: nullLogger(),
+      emit: () => {},
+      sleep: async () => { calls.push("sleep"); },
+      headLagRetryMs: 0,
+    });
+    const pub = await publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    forge.pr.description = pub.initialBody(completion(true));
+    await pub.publish(MR);
+    assert.deepEqual(calls, ["stage"]);
+  });
+
+  it("stops replaying after the first transport failure from lookup, but retries HTTP 503", async () => {
+    const forge = new FakeForge();
+    const calls: string[] = [];
+    const publisher = new PrDescriptionPublisher({
+      forge,
+      api: apiWith({
+        lookupPrDescription: async () => { calls.push("lookup"); throw new TypeError("fetch failed"); },
+        bindPrDescription: async () => { calls.push("bind"); throw new TypeError("fetch failed"); },
+        ackPrDescription: async () => { calls.push("ack"); throw new TypeError("fetch failed"); },
+      }),
+      pass: null,
+      log: nullLogger(),
+      emit: () => {},
+      sleep: async () => { calls.push("sleep"); },
+      headLagRetryMs: 0,
+    });
+    const pub = await publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    forge.pr.description = pub.initialBody(completion(true));
+    await pub.publish(MR);
+    assert.deepEqual(calls, ["lookup"]);
+
+    api.failNext("lookup", 503);
+    api.failNext("lookup", 503);
+    const healthy = rig(null);
+    const healthyPub = await healthy.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    healthy.forge.pr.description = healthyPub.initialBody(completion(true));
+    await healthyPub.publish(MR);
+    assert.equal(api.calls.filter((c) => c.op === "lookup").length, 3);
+  });
+});
 
 /** A new PR: prepare, create with the initial body, publish. */
 async function newPr(r: Rig, spec: PublicationSpec = makeSpec()) {
