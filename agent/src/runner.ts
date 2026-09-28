@@ -117,7 +117,7 @@ import { isCIConfigPlan } from "./prompt.js";
 import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
 import { computeSize } from "./pr-size.js";
 import { buildDeliveryContext } from "./pr-description-context.js";
-import { resolvePrdInput } from "./prd-link.js";
+import { resolvePrdInputFromBare } from "./prd-link.js";
 import {
   PrDescriptionPublisher,
   reconcileCompletion,
@@ -5620,9 +5620,17 @@ export class RunRunner {
           return { size, baseSha };
         },
         context: async (s, deadlineMs, previous) => {
-          const prd = flight.worktreePath
-            ? await resolvePrdInput(claim.issue_description ?? "", flight.worktreePath, claim.issue_iid, runLog)
-            : { prdText: null };
+          // From the bare snapshot at the described head, never the agent-writable worktree: a FIFO
+          // left at the PRD path would block an open there with no deadline (CodeRabbit on #1825).
+          const prd = await resolvePrdInputFromBare(
+            this.git,
+            barePath,
+            s.headSha,
+            claim.issue_description ?? "",
+            claim.issue_iid,
+            { timeoutMs: deadlineMs - Date.now(), signal: boundarySignal },
+            runLog,
+          );
           // flight.redactText scrubs every claim secret: the forge PAT, the Anthropic token, the join
           // token, the git basic credential and, on a Codex run, the Codex access token and capability.
           return buildDeliveryContext({

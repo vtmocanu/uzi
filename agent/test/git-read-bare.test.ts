@@ -10,6 +10,7 @@ import { PassThrough } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { GitCache, type BoundaryProcessSpawner } from "../src/git.js";
+import { resolvePrdInputFromBare } from "../src/prd-link.js";
 import type { BoundaryProcessRequest } from "../src/harness.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 
@@ -201,3 +202,35 @@ function processAlive(pid: number): boolean {
     return false;
   }
 }
+
+// PRD #1798 finalize (CodeRabbit on #1825): the delivery context reads the linked PRD from the bare
+// snapshot at the described head, never from the agent-writable worktree, where a FIFO at the PRD
+// path would block an open forever.
+describe("resolvePrdInputFromBare", () => {
+  it("reads the linked PRD at the given head from the bare, bounded, and never touches a worktree", async () => {
+    await withBare({ "prds.md": "x" }, async (gc, bare) => {
+      // A second commit adds the PRD, so the read is pinned to a real sha, not HEAD by accident.
+      const work = path.join(path.dirname(bare), "work");
+      fs.mkdirSync(path.join(work, "prds"));
+      fs.writeFileSync(path.join(work, "prds", "1798-x.md"), "# The PRD\n");
+      git(work, "add", "-A");
+      git(work, "commit", "-qm", "two");
+      const head = git(work, "rev-parse", "HEAD").trim();
+      git(path.dirname(bare), "--git-dir", bare, "fetch", "-q", work, "main:main");
+      // A worktree whose PRD path is a FIFO: opening it would block. The bare read never opens it.
+      const wt = path.join(path.dirname(bare), "wt");
+      fs.mkdirSync(path.join(wt, "prds"), { recursive: true });
+      execFileSync("mkfifo", [path.join(wt, "prds", "1798-x.md")]);
+
+      const r = await resolvePrdInputFromBare(gc, bare, head, "implements prds/1798-x.md", 1798, { timeoutMs: 30_000 });
+      assert.deepEqual(r, { prdPath: "prds/1798-x.md", prdText: "# The PRD\n" });
+
+      // No PRD link, a non-sha head, a missing file, or no time left: the nulls fallback, no throw.
+      const none = { prdPath: null, prdText: null };
+      assert.deepEqual(await resolvePrdInputFromBare(gc, bare, head, "no link here", 1798, { timeoutMs: 30_000 }), none);
+      assert.deepEqual(await resolvePrdInputFromBare(gc, bare, "HEAD", "implements prds/1798-x.md", 1798, { timeoutMs: 30_000 }), none);
+      assert.deepEqual(await resolvePrdInputFromBare(gc, bare, head, "implements prds/1798-missing.md", 1798, { timeoutMs: 30_000 }), none);
+      assert.deepEqual(await resolvePrdInputFromBare(gc, bare, head, "implements prds/1798-x.md", 1798, { timeoutMs: 0 }), none);
+    });
+  });
+});
