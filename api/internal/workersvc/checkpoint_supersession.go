@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
@@ -174,12 +175,16 @@ func (s *Service) supersedeLocked(ctx context.Context, runID uuid.UUID, fence fu
 		}
 		n, err := s.q.BeginCheckpointSupersession(ctx, store.BeginCheckpointSupersessionParams{
 			RunID: runID, RecoveryRef: pushbroker.RecoveryRefPrefix + runID.String(), Tip: row.Tip,
+			Cooling: pgtype.Interval{Microseconds: s.checkpointSupersessionCooling.Microseconds(), Valid: true},
 		})
 		if err != nil {
 			return false, fmt.Errorf("record supersession intent: %w", err)
 		}
 		if n == 0 {
-			// The tip advanced (a late publish) or the record moved on: the next trigger re-reads.
+			// The run is still inside its cooling period (checkpointSupersessionCooling: a push
+			// routed while it was live may still land and advance this record), the tip advanced
+			// (a late publish), or the record moved on. Nothing is written, so no backoff: the
+			// caller answers not_descendant and the next publish tick re-reads.
 			return false, nil
 		}
 		if row, err = s.q.GetCheckpointRetention(ctx, runID); err != nil {
@@ -255,10 +260,11 @@ func (s *Service) driveSupersession(ctx context.Context, row store.CheckpointRet
 	// be done: the branch ref at a later tip of the run, which the record does not name, would be
 	// left untracked by a superseded record, blocking every new run on the branch. A publish that
 	// Publish routed as TERMINAL holds this same retention lock from its superseded check through
-	// its track (publishTerminalLocked), but Publish routes on the status it read at its top: a
-	// run LIVE at that read whose status turns terminal (and whose record is inserted) while its
-	// unlocked push is in flight can still land inside this supersession. The list below catches
-	// that window (and a tip written outside Publish); it is load-bearing, not merely defensive.
+	// its track (publishTerminalLocked). One routed LIVE is sent only within its pre-push budget,
+	// and the cooling period keeps this supersession from starting until such a push has had time
+	// to land and be tracked; the list below is the backstop for what those delays cannot rule
+	// out: a push of unknown outcome that the forge applies late, a tip persist that lagged, and a
+	// ref written outside Publish.
 	if stop, err := s.branchHeldByOwnPublish(ctx, row, f, branchRef); stop || err != nil {
 		return false, err
 	}
@@ -289,19 +295,24 @@ func (s *Service) driveSupersession(ctx context.Context, row store.CheckpointRet
 
 // branchHeldByOwnPublish is step 3's follow-up list. It reports stop when origin
 // still advertises the branch ref at the recorded tip (the delete did not take) or at
-// runs.checkpoint_tip of THIS run (a later publish of the run's own tip). The record then stays
+// a tip of THIS run's own (a later publish of the run). The record then stays
 // superseding with last_error and a backoff: a re-drive repeats steps 2-3 harmlessly, and once no
 // hold is open the stuck exit (exitStuckSupersessionLocked) CAS-deletes the recovery ref at the
 // recorded tip and the branch ref at the run's own tip. An absent branch ref, or one at any other
-// tip (another run's publish), is done, as before. The run tip is read AFTER the list.
+// tip (another run's publish), is done, as before. The run's own tips are read AFTER the list.
+//
+// A tip is the run's own when it is runs.checkpoint_tip or a tip the run ATTEMPTED to push and has
+// not accounted for (checkpoint_publish_attempts, written before every push), so a push whose tip
+// persist lags, or whose outcome the api never learned, is still recognised here.
 //
 // Only a record of a TERMINAL run is ever superseded. A publish Publish routes as terminal runs its
 // superseded check, push and record track under this run's retention lock (publishTerminalLocked),
-// which the supersession holds throughout, so that publish cannot land inside a supersession. But
-// Publish routes on the run status it read at its top: a run that was LIVE at that read and turned
-// terminal (its record just inserted) while its unlocked push was in flight can still land its tip
-// inside a supersession of that record. The second arm is what catches that narrow window, so it is
-// load-bearing, not merely defensive; it also catches a ref written outside Publish.
+// which the supersession holds throughout. A publish routed LIVE is sent only within its pre-push
+// budget and the supersession waits out the cooling period first, so an ordinary in-flight push has
+// landed and been tracked before this runs. The list stays as the backstop for what those delays
+// cannot rule out: a push of unknown outcome the forge applies late, a delayed tip persist, and a
+// ref written outside Publish. A push that lands after this list is left to the sweeper's attempts
+// arm (reconcilePublishAttempts).
 func (s *Service) branchHeldByOwnPublish(ctx context.Context, row store.CheckpointRetention, f retentionForge, branchRef string) (stop bool, err error) {
 	tips, lerr := s.listRefTipsFn(ctx, pushbroker.ListRefsOptions{CloneURL: f.cloneURL, Username: f.username, PAT: f.pat}, branchRef)
 	if lerr != nil {
@@ -312,11 +323,11 @@ func (s *Service) branchHeldByOwnPublish(ctx context.Context, row store.Checkpoi
 		return false, nil
 	}
 	if tip != row.Tip {
-		runTip, rerr := s.q.GetRunCheckpointTipForRetention(ctx, row.RunID)
-		if rerr != nil && !errors.Is(rerr, pgx.ErrNoRows) {
-			return true, fmt.Errorf("read run checkpoint tip: %w", rerr)
+		own, oerr := s.ownPublishedTip(ctx, row.RunID, tip)
+		if oerr != nil {
+			return true, oerr
 		}
-		if !runTip.Valid || runTip.String != tip {
+		if !own {
 			return false, nil // another run's publish: the slot left this record
 		}
 	}

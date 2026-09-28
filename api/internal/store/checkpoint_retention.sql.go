@@ -69,21 +69,100 @@ SET state = 'superseding',
     last_error = NULL,
     next_attempt_at = now(),
     updated_at = now()
-WHERE run_id = $2
-  AND state = 'retained'
-  AND tip = $3::text
+WHERE checkpoint_retentions.run_id = $2
+  AND checkpoint_retentions.state = 'retained'
+  AND checkpoint_retentions.tip = $3::text
+  AND EXISTS (
+      SELECT 1 FROM runs r
+      WHERE r.id = checkpoint_retentions.run_id
+        AND r.status_since <= now() - $4::interval
+  )
 `
 
 type BeginCheckpointSupersessionParams struct {
-	RecoveryRef string    `json:"recovery_ref"`
-	RunID       uuid.UUID `json:"run_id"`
-	Tip         string    `json:"tip"`
+	RecoveryRef string          `json:"recovery_ref"`
+	RunID       uuid.UUID       `json:"run_id"`
+	Tip         string          `json:"tip"`
+	Cooling     pgtype.Interval `json:"cooling"`
 }
 
 // D2 step 1 (M3): retained -> superseding, persisting the recovery ref name BEFORE any forge
 // write, guarded on the tip the caller will CAS against.
+//
+// COOLING PERIOD (#1810 residual 2): the intent is refused (zero rows) until the run has been in
+// its current (terminal) status for at least @cooling, read on the database clock in the same
+// statement. A publish that was routed while the run was still live may be in flight when the run
+// turns terminal; waiting out the cooling period lets it land and be tracked (its tip advances this
+// record) before the record's tip is bound to a recovery ref. This is a DELAY that makes the
+// reconciliation path rare, not the correctness argument: a push whose outcome is unknown can
+// still land later, and checkpoint_publish_attempts plus the sweeper's attempts arm reconcile it.
+// runs.status_since is stamped by every statement that assigns runs.status (00163).
 func (q *Queries) BeginCheckpointSupersession(ctx context.Context, arg BeginCheckpointSupersessionParams) (int64, error) {
-	result, err := q.db.Exec(ctx, beginCheckpointSupersession, arg.RecoveryRef, arg.RunID, arg.Tip)
+	result, err := q.db.Exec(ctx, beginCheckpointSupersession,
+		arg.RecoveryRef,
+		arg.RunID,
+		arg.Tip,
+		arg.Cooling,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const checkpointTipClaimedByOtherRun = `-- name: CheckpointTipClaimedByOtherRun :one
+SELECT (
+    EXISTS (
+        SELECT 1 FROM runs r
+        WHERE r.repo_id = $1 AND r.id <> $2 AND r.checkpoint_tip = $3::text
+    )
+    OR EXISTS (
+        SELECT 1 FROM checkpoint_publish_attempts a
+        JOIN runs r ON r.id = a.run_id
+        WHERE r.repo_id = $1 AND a.run_id <> $2 AND a.tip = $3::text
+    )
+    OR EXISTS (
+        SELECT 1 FROM checkpoint_retentions c
+        WHERE c.repo_id = $1 AND c.run_id <> $2 AND c.tip = $3::text
+          AND c.state IN ('retained', 'superseding', 'superseded', 'settling')
+    )
+)::bool AS claimed
+`
+
+type CheckpointTipClaimedByOtherRunParams struct {
+	RepoID pgtype.UUID `json:"repo_id"`
+	RunID  uuid.UUID   `json:"run_id"`
+	Tip    string      `json:"tip"`
+}
+
+// Whether any OTHER run of the repo claims this tip (its persisted checkpoint tip, an outstanding
+// publish attempt, or a live retention record): a branch ref at such a tip is never deleted as
+// this run's late publish.
+func (q *Queries) CheckpointTipClaimedByOtherRun(ctx context.Context, arg CheckpointTipClaimedByOtherRunParams) (bool, error) {
+	row := q.db.QueryRow(ctx, checkpointTipClaimedByOtherRun, arg.RepoID, arg.RunID, arg.Tip)
+	var claimed bool
+	err := row.Scan(&claimed)
+	return claimed, err
+}
+
+const deferCheckpointPublishAttempt = `-- name: DeferCheckpointPublishAttempt :execrows
+UPDATE checkpoint_publish_attempts
+SET checks = checks + 1,
+    next_check_at = $1::timestamptz,
+    last_error = COALESCE($2::text, last_error)
+WHERE id = $3
+`
+
+type DeferCheckpointPublishAttemptParams struct {
+	NextCheckAt pgtype.Timestamptz `json:"next_check_at"`
+	Note        pgtype.Text        `json:"note"`
+	ID          uuid.UUID          `json:"id"`
+}
+
+// The comparison found nothing to reconcile yet (the ref is not at the attempted tip) or could not
+// run; check again after the caller-computed backoff. A non-NULL note replaces last_error.
+func (q *Queries) DeferCheckpointPublishAttempt(ctx context.Context, arg DeferCheckpointPublishAttemptParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deferCheckpointPublishAttempt, arg.NextCheckAt, arg.Note, arg.ID)
 	if err != nil {
 		return 0, err
 	}
@@ -115,6 +194,41 @@ func (q *Queries) DeferCheckpointRetentionVerify(ctx context.Context, arg DeferC
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const deleteCheckpointPublishAttempt = `-- name: DeleteCheckpointPublishAttempt :execrows
+DELETE FROM checkpoint_publish_attempts WHERE id = $1
+`
+
+// The push's outcome is accounted for (refused by the forge, or landed and tracked), or the
+// sweeper reconciled or retired it.
+func (q *Queries) DeleteCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteCheckpointPublishAttempt, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const getCheckpointPublishAttempt = `-- name: GetCheckpointPublishAttempt :one
+SELECT id, run_id, branch, ref, tip, attempted_at, next_check_at, checks, last_error FROM checkpoint_publish_attempts WHERE id = $1
+`
+
+func (q *Queries) GetCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (CheckpointPublishAttempt, error) {
+	row := q.db.QueryRow(ctx, getCheckpointPublishAttempt, id)
+	var i CheckpointPublishAttempt
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.Branch,
+		&i.Ref,
+		&i.Tip,
+		&i.AttemptedAt,
+		&i.NextCheckAt,
+		&i.Checks,
+		&i.LastError,
+	)
+	return i, err
 }
 
 const getCheckpointRetention = `-- name: GetCheckpointRetention :one
@@ -405,9 +519,10 @@ type ListCheckpointRetentionBackfillRow struct {
 // M4 backfill: terminal runs that published a checkpoint and own a checkpoint branch (an issue
 // run with an issue iid, or a self_improve run) but have NO record. Since migration 00265 every
 // terminal transition inserts its record in the same transaction (the runs.status trigger,
-// whichever writer made it), so what is left here is a run that went terminal before 00265, or
-// a terminal run's late first publish (after the transition, so the trigger saw no tip) whose
-// TrackTerminalCheckpointPublish insert failed. Bounded to
+// whichever writer made it), so what is left here is a terminal run whose first checkpoint tip was
+// persisted only AFTER the transition (the trigger saw no tip) and whose own track did not record
+// it: its TrackTerminalCheckpointPublish insert failed, or retention was not wired in the api
+// that served the publish. Bounded to
 // runs whose current status began at or after retention was enabled
 // (checkpoint_retention_meta.enabled_at), so it never reaches back to runs the old
 // delete-on-terminal path already handled.
@@ -571,6 +686,55 @@ func (q *Queries) ListCheckpointRetentionsForBranch(ctx context.Context, arg Lis
 	return items, nil
 }
 
+const listDueCheckpointPublishAttempts = `-- name: ListDueCheckpointPublishAttempts :many
+SELECT a.id, a.run_id, a.branch, a.ref, a.tip, a.attempted_at, a.next_check_at, a.checks, a.last_error FROM checkpoint_publish_attempts a
+LEFT JOIN runs r ON r.id = a.run_id
+WHERE a.next_check_at <= now()
+  AND (r.id IS NULL OR r.status IN ('completed', 'failed', 'cancelled'))
+  AND ($1::uuid IS NULL OR a.run_id = $1::uuid)
+ORDER BY a.next_check_at, a.id
+LIMIT $2::int
+`
+
+type ListDueCheckpointPublishAttemptsParams struct {
+	OnlyRunID pgtype.UUID `json:"only_run_id"`
+	MaxRows   int32       `json:"max_rows"`
+}
+
+// The sweeper's attempts arm: outstanding attempts, due for a comparison, whose run is TERMINAL
+// (or gone). A live run's own next publish fetches origin and builds on whatever landed; once it
+// is terminal nothing else of the run will. only_run_id NULL lists every run (production); a run
+// id confines the page (the LiveDB tests' isolation from a reused database).
+func (q *Queries) ListDueCheckpointPublishAttempts(ctx context.Context, arg ListDueCheckpointPublishAttemptsParams) ([]CheckpointPublishAttempt, error) {
+	rows, err := q.db.Query(ctx, listDueCheckpointPublishAttempts, arg.OnlyRunID, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []CheckpointPublishAttempt{}
+	for rows.Next() {
+		var i CheckpointPublishAttempt
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.Branch,
+			&i.Ref,
+			&i.Tip,
+			&i.AttemptedAt,
+			&i.NextCheckAt,
+			&i.Checks,
+			&i.LastError,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUnheldCheckpointRetentions = `-- name: ListUnheldCheckpointRetentions :many
 SELECT run_id, user_id, repo_id, branch, tip, ref, recovery_ref, state, attempts, next_attempt_at, last_error, verify_after, verified_at, created_at, updated_at, settled_at FROM checkpoint_retentions
 WHERE checkpoint_retentions.state IN ('retained', 'superseded')
@@ -662,6 +826,36 @@ func (q *Queries) MarkCheckpointSuperseded(ctx context.Context, runID uuid.UUID)
 	return state, err
 }
 
+const recordCheckpointPublishAttempt = `-- name: RecordCheckpointPublishAttempt :one
+
+INSERT INTO checkpoint_publish_attempts (run_id, branch, ref, tip)
+VALUES ($1, $2::text, $3::text, $4::text)
+RETURNING id
+`
+
+type RecordCheckpointPublishAttemptParams struct {
+	RunID  uuid.UUID `json:"run_id"`
+	Branch string    `json:"branch"`
+	Ref    string    `json:"ref"`
+	Tip    string    `json:"tip"`
+}
+
+// PRD #1810 D2 (residual 2): checkpoint_publish_attempts, the durable record of a checkpoint push
+// written BEFORE the forge call (migration 00266).
+// Written immediately before one push. The caller refuses the push when this fails: no push is
+// ever sent without its row.
+func (q *Queries) RecordCheckpointPublishAttempt(ctx context.Context, arg RecordCheckpointPublishAttemptParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, recordCheckpointPublishAttempt,
+		arg.RunID,
+		arg.Branch,
+		arg.Ref,
+		arg.Tip,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const recordCheckpointRetentionFailure = `-- name: RecordCheckpointRetentionFailure :execrows
 UPDATE checkpoint_retentions
 SET attempts = attempts + 1,
@@ -742,6 +936,27 @@ func (q *Queries) ReopenCheckpointRetentionSupersededIfHeld(ctx context.Context,
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const runHasCheckpointPublishAttempt = `-- name: RunHasCheckpointPublishAttempt :one
+SELECT EXISTS (
+    SELECT 1 FROM checkpoint_publish_attempts a
+    WHERE a.run_id = $1 AND a.tip = $2::text
+)::bool AS attempted
+`
+
+type RunHasCheckpointPublishAttemptParams struct {
+	RunID uuid.UUID `json:"run_id"`
+	Tip   string    `json:"tip"`
+}
+
+// Whether the run has an outstanding push of exactly this tip: a branch ref at that tip may be
+// the run's own (possibly late) publish, even when runs.checkpoint_tip never recorded it.
+func (q *Queries) RunHasCheckpointPublishAttempt(ctx context.Context, arg RunHasCheckpointPublishAttemptParams) (bool, error) {
+	row := q.db.QueryRow(ctx, runHasCheckpointPublishAttempt, arg.RunID, arg.Tip)
+	var attempted bool
+	err := row.Scan(&attempted)
+	return attempted, err
 }
 
 const runHasOpenCustodyHold = `-- name: RunHasOpenCustodyHold :one

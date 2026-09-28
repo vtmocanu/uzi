@@ -70,7 +70,8 @@ type ConnAcquirer interface {
 // or interleave a concurrent writer at the one point it matters. op names the write: "delete"
 // (a settling record's ref), "create" (supersession's recovery ref), "delete-branch"
 // (supersession's branch ref), "exit-recovery"/"exit-branch" (a stuck supersession's exit, M4)
-// or "audit-delete" (the post-settlement audit's stray recovery ref, M4). afterLock runs once the lock is held, with the pinned
+// "audit-delete" (the post-settlement audit's stray recovery ref, M4) or "attempt-delete" (a
+// terminal run's late publish the attempts arm deletes, #1810 residual 2). afterLock runs once the lock is held, with the pinned
 // connection, so a test can release the lock WITHOUT ending the session.
 type retentionTestHooks struct {
 	beforeForgeWrite func(runID uuid.UUID, op string)
@@ -210,8 +211,12 @@ func destroyRetentionConn(conn *pgxpool.Conn) {
 // the same retained/settling choice and the same never-reset rule as the inserts below. Both
 // inserts then move zero rows and the re-read finds the trigger's row; this path's job is to
 // dispatch the settle that row owes (a completed run's hold is released after the terminal commit,
-// so its row is typically `retained` at insert and settles here). The inserts stay as the
-// fallback for a database without the trigger. The cases:
+// so its row is typically `retained` at insert and settles here). The Go inserts below are reached
+// only for a run the trigger could not record: one that had no persisted checkpoint tip at its
+// terminal UPDATE but has one now (a publish whose tip persist committed after the terminal
+// transition, before this call). The same inserts serve the sweeper's backfill arm, which finds
+// the rest of that family: a terminal run's late first publish whose TrackTerminalCheckpointPublish
+// insert failed, or that landed while retention was unwired in this api. The cases:
 //
 //   - an ineligible kind (checkpointBranch), or any missing retention seam: no forge call (RETAIN);
 //   - a run that published a checkpoint and has an OPEN custody hold (any generation): a
@@ -243,7 +248,8 @@ func (s *Service) retainOrDeleteCheckpoint(ctx context.Context, runID uuid.UUID,
 // the run's record owes a settle. It makes no forge call. For a terminal transition committed
 // with migration 00265's trigger in place the record already exists, so inserted is false and
 // settle reflects the existing record's state; inserted is true only for a run the trigger never
-// recorded (one that went terminal before 00265, or a record the backfill finds missing).
+// recorded: one whose checkpoint tip was persisted only after its terminal transition (a late first
+// publish whose own track insert failed, or ran while retention was unwired).
 func (s *Service) recordCheckpointRetention(ctx context.Context, runID uuid.UUID, kind string, issueIid pgtype.Int8) (inserted, settle bool) {
 	branch, ok := checkpointBranch(kind, runID, issueIid)
 	if !ok {
@@ -537,55 +543,58 @@ func (s *Service) terminalPublishSuperseded(ctx context.Context, runID uuid.UUID
 // Neither statement is gated on terminal (the second runs only when the first matched no row):
 // TrackTerminalCheckpointPublish
 // reads the run's CURRENT status in SQL, so a run that turned terminal after Publish's top read is
-// tracked as terminal here. terminal (the status Publish read at its top) only gates the Warn below
+// tracked as terminal here. terminal (the status Publish read at its top) only gates the Warn (and tracked) below
 // and records how the publish was routed.
 //
 // A publish Publish routed as terminal reaches here under the run's retention lock, after
 // terminalPublishSuperseded refused a run whose slot was handed on (publishTerminalLocked), so a
-// supersession cannot interleave with it. A run LIVE at Publish's top read that turned terminal
-// while its unlocked push was in flight arrives here with terminal false and without the lock, and
-// its push may have landed inside a supersession of its record. When a run's publish moved no row
-// in either statement and the run is terminal (as read at Publish's top, or, for terminal false, as
-// re-read here), it published a branch ref no record tracks (a record in a state neither statement
-// moves: superseding, superseded, or one whose recovery ref is set); that ref blocks every new run
-// on the branch unless the supersession's post-delete list (branchHeldByOwnPublish) or its stuck
-// exit catches it, so a Warn names the run, branch and tip for an operator.
+// supersession cannot interleave with it. One routed LIVE arrives without the lock, possibly after
+// the run turned terminal. Its push was sent within livePublishPrePushBudget of the routing, and no
+// supersession intent is recorded until the run has been terminal for checkpointSupersessionCooling,
+// so an ordinary in-flight push is tracked here before any supersession binds the record's tip.
+// When a run's publish moved no row in either statement and the run is terminal (as read at
+// Publish's top, or, for terminal false, as re-read here), it published a branch ref no record
+// tracks (a record in a state neither statement moves: superseding, superseded, or one whose
+// recovery ref is set). A Warn names the run, branch and tip, and tracked is false: the caller
+// then keeps the push's checkpoint_publish_attempts row, and the sweeper's attempts arm
+// (reconcilePublishAttempts) re-records the tip or CAS-deletes the branch ref at it.
 //
-// Residual, logged not closed: that post-delete list reads runs.checkpoint_tip, which the late
-// publish persists (SetRunCheckpointTip, publishOutcome) only after its push lands. A push landing
-// any time after the supersession's recovery-ref create (after the branch CAS-delete too, as a
-// create from an absent ref) whose tip persist has not committed by the list read, or that lands
-// after the list, is taken for another run's publish or never seen, and the record ends superseded
-// (or settling) with its recovery ref set. Neither statement here then moves it, and the ref stays untracked until an
-// operator deletes it; the Warn is the only signal.
+// Residual: the tip persist (SetRunCheckpointTip, publishOutcome) and this track are best-effort
+// writes AFTER the push. If they fail, or are delayed past the cooling period's slack, the record's
+// tip lags the branch ref: a supersession then stops in resolveMissingSource ("branch ref is not at
+// the recorded tip") and holds the branch slot until the stuck exit clears it once the run's
+// custody holds release (the push's attempt row lets that exit recognise the tip as the run's own).
 //
 // Best-effort: a failure is logged and the publish still reports success (the ref already moved).
-func (s *Service) trackPublishedCheckpoint(ctx context.Context, runID uuid.UUID, terminal bool, branch, ref, tip string) (settle bool) {
+// tracked reports the tip is accounted for: recorded on the run's record, or the run is live (its
+// record, inserted at its terminal transition, then reads the tip persisted before it).
+func (s *Service) trackPublishedCheckpoint(ctx context.Context, runID uuid.UUID, terminal bool, branch, ref, tip string) (settle, tracked bool) {
 	if !s.retentionWired() {
-		return false
+		return false, true
 	}
 	state, err := s.q.TrackTerminalCheckpointPublish(ctx, store.TrackTerminalCheckpointPublishParams{
 		RunID: runID, Branch: branch, Ref: ref, Tip: tip,
 	})
 	switch {
 	case err == nil:
-		return state == retentionSettling
+		return state == retentionSettling, true
 	case !errors.Is(err, pgx.ErrNoRows):
 		slog.Warn("checkpoint retention: track terminal publish", "run", runID, "tip", tip, "error", err)
-		return false
+		return false, false
 	}
 	n, aerr := s.q.AdvanceCheckpointRetentionTip(ctx, store.AdvanceCheckpointRetentionTipParams{
 		RunID: runID, Ref: ref, Tip: tip,
 	})
 	if aerr != nil {
 		slog.Warn("checkpoint retention: advance tip", "run", runID, "tip", tip, "error", aerr)
-		return false
+		return false, false
 	}
 	if n == 0 && s.terminalAtTrack(ctx, runID, terminal) {
-		slog.Warn("checkpoint retention: a terminal run's publish is tracked by no record; the branch ref may block "+
-			"a new run on the branch until it is deleted", "run", runID, "branch", branch, "ref", ref, "tip", tip)
+		slog.Warn("checkpoint retention: a terminal run's publish is tracked by no record; left to the sweeper's "+
+			"publish-attempt reconciliation", "run", runID, "branch", branch, "ref", ref, "tip", tip)
+		return false, false
 	}
-	return false
+	return false, true
 }
 
 // terminalAtTrack reports whether a publish that moved no retention row belongs to a terminal run:

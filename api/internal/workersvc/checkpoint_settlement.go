@@ -50,16 +50,21 @@ func (s *Service) ReconcileCheckpointRetentions(ctx context.Context) (int64, err
 // test's forge); the zero value lists every run, as production does. The arms run in order:
 //
 //  1. backfill: terminal runs that own a checkpoint ref but have no record get one (retained
-//     with an open hold, else settling), so arm 2 settles a new settling record the same pass.
+//     with an open hold, else settling), so arm 3 settles a new settling record the same pass.
 //     Since migration 00265 every terminal transition records its run in the same transaction
-//     (the runs.status trigger), so this arm is left with runs that went terminal before 00265
-//     and terminal runs whose first publish landed after the transition and whose
-//     TrackTerminalCheckpointPublish insert failed;
-//  2. work: a due `settling` record retries its CAS delete; a due `superseding` record is
+//     (the runs.status trigger), so this arm is left with terminal runs whose first checkpoint
+//     tip was persisted only AFTER the transition (the trigger saw none) and whose own track
+//     insert did not record them: TrackTerminalCheckpointPublish failed, or retention was not
+//     wired in the api that served the publish;
+//  2. attempts: an outstanding checkpoint push of a terminal run (checkpoint_publish_attempts,
+//     written before the push and never accounted for) is compared with origin's branch ref; a
+//     ref at the attempted tip is re-recorded on the run's record, or CAS-deleted at that tip when
+//     the run's slot was handed on (reconcilePublishAttempts, #1810 residual 2);
+//  3. work: a due `settling` record retries its CAS delete; a due `superseding` record is
 //     re-driven, or, when its supersession stopped (last_error set) and no hold is open, exited;
-//  3. unheld: a `retained`/`superseded` record whose run has no open hold moves to settling and
+//  4. unheld: a `retained`/`superseded` record whose run has no open hold moves to settling and
 //     its ref is CAS-deleted;
-//  4. audit: a deleted record that named a recovery ref is re-verified once verify_after passed
+//  5. audit: a deleted record that named a recovery ref is re-verified once verify_after passed
 //     (a recovery ref found at the recorded tip while custody is open reopens the record instead
 //     of being deleted).
 func (s *Service) reconcileCheckpointRetentions(ctx context.Context, onlyRun pgtype.UUID) (int64, error) {
@@ -70,6 +75,11 @@ func (s *Service) reconcileCheckpointRetentions(ctx context.Context, onlyRun pgt
 	progressed, err := s.backfillCheckpointRetentions(ctx, onlyRun, !onlyRun.Valid)
 	if err != nil {
 		return 0, err
+	}
+	reconciled, err := s.reconcilePublishAttempts(ctx, onlyRun)
+	progressed += reconciled
+	if err != nil {
+		return progressed, err
 	}
 
 	work, err := s.q.ListCheckpointRetentionWork(ctx, store.ListCheckpointRetentionWorkParams{
@@ -256,15 +266,17 @@ func (s *Service) reconcileSuperseding(ctx context.Context, runID uuid.UUID) (do
 // the branch ref if origin holds it at a tip provably this run's own publish, and closes the
 // record as deleted (with a verify_after, since it names a recovery ref).
 //
-// The branch ref is this run's at the recorded tip, and also at runs.checkpoint_tip of THIS run:
-// the server-persisted latest tip the run itself published (the tip-lag case, where the record's
-// tip lags a later publish of the same run). A branch ref at any other tip, and a recovery ref at
-// any tip but the recorded one, is left alone.
+// The branch ref is this run's at the recorded tip, and also at a tip provably the run's own
+// (ownPublishedTip): runs.checkpoint_tip of THIS run (the tip-lag case, where the record's tip lags
+// a later publish of the same run), or a tip the run attempted to push and has not accounted for
+// (checkpoint_publish_attempts: a publish whose tip persist failed, or whose outcome the api never
+// learned). A branch ref at any other tip, and a recovery ref at any tip but the recorded one, is
+// left alone.
 //
-// Residual, by design: a branch ref at a tip that is neither (another writer's, or a publish of
-// this run whose tip persist failed) stays on origin, untracked. It blocks a new run's checkpoint
-// on the branch (that run's publishes keep getting the not_descendant skip) until a human deletes
-// it; nothing in uzi clears it later. The Warn names the branch and both tips so an operator can.
+// Residual, by design: a branch ref at a tip that is none of those (another writer's, outside
+// Publish) stays on origin, untracked. It blocks a new run's checkpoint on the branch (that run's
+// publishes keep getting the not_descendant skip) until a human deletes it; nothing in uzi clears
+// it later. The Warn names the branch and both tips so an operator can.
 func (s *Service) exitStuckSupersessionLocked(ctx context.Context, row store.CheckpointRetention, fence func(context.Context) error) (bool, error) {
 	runID := row.RunID
 	branchRef := checkpointRefPrefix + row.Branch
@@ -298,7 +310,12 @@ func (s *Service) exitStuckSupersessionLocked(ctx context.Context, row store.Che
 		if !ok {
 			continue
 		}
-		ours := tip == row.Tip || (step.ref == branchRef && runTip.Valid && tip == runTip.String)
+		ours := tip == row.Tip
+		if !ours && step.ref == branchRef {
+			if ours, err = s.ownPublishedTip(ctx, runID, tip); err != nil {
+				return false, err
+			}
+		}
 		if !ours {
 			slog.Warn("checkpoint retention: stuck supersession exit leaves a ref at a tip that is not this run's; "+
 				"a human must delete it (a new run's checkpoint on the branch stays skipped until then)", "run", runID,

@@ -591,6 +591,16 @@ type Store interface {
 	ReopenCheckpointRetentionSupersededIfHeld(ctx context.Context, arg store.ReopenCheckpointRetentionSupersededIfHeldParams) (int64, error)
 	TrackTerminalCheckpointPublish(ctx context.Context, arg store.TrackTerminalCheckpointPublishParams) (string, error)
 	GetRunCheckpointTipForRetention(ctx context.Context, runID uuid.UUID) (pgtype.Text, error)
+	// PRD #1810 D2 residual 2: the durable record of a checkpoint push written before the forge
+	// call (checkpoint_publish_attempts, 00266), and the sweeper's attempts arm that reconciles a
+	// push whose outcome the api never learned.
+	RecordCheckpointPublishAttempt(ctx context.Context, arg store.RecordCheckpointPublishAttemptParams) (uuid.UUID, error)
+	DeleteCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (int64, error)
+	GetCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (store.CheckpointPublishAttempt, error)
+	RunHasCheckpointPublishAttempt(ctx context.Context, arg store.RunHasCheckpointPublishAttemptParams) (bool, error)
+	ListDueCheckpointPublishAttempts(ctx context.Context, arg store.ListDueCheckpointPublishAttemptsParams) ([]store.CheckpointPublishAttempt, error)
+	DeferCheckpointPublishAttempt(ctx context.Context, arg store.DeferCheckpointPublishAttemptParams) (int64, error)
+	CheckpointTipClaimedByOtherRun(ctx context.Context, arg store.CheckpointTipClaimedByOtherRunParams) (bool, error)
 	// Issue #1582 M1: the predecessor-settle pair. GetCustodyHoldForSettle reads the exact hold
 	// (scoped to its run); ReleasePredecessorCustodyHoldByAncestry is the single guarded
 	// statement that releases that one older-generation hold with 'ancestry' evidence after the
@@ -1806,6 +1816,12 @@ type Service struct {
 	// shrinks them to stay fast).
 	terminalLockRetryBudget   time.Duration
 	terminalLockRetryInterval time.Duration
+	// livePublishPrePushBudget bounds how long after Publish routed a publish as LIVE any of its
+	// pushes may still be SENT (PRD #1810 D2, residual 2; set in New, a test shrinks it).
+	livePublishPrePushBudget time.Duration
+	// checkpointSupersessionCooling is how long a run must have been terminal before a supersession
+	// intent may be recorded for it (BeginCheckpointSupersession; set in New, a test shrinks it).
+	checkpointSupersessionCooling time.Duration
 	// readyAt is the moment the worker-facing listener(s) became ready (PRD #1390 M1, D1),
 	// stored as Unix nanoseconds (0 = not yet ready). main.go writes it via SetReadyAt after
 	// binding every enabled listener; the sweeper goroutine reads it each tick to anchor the
@@ -1996,6 +2012,9 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 
 		terminalLockRetryBudget:   terminalPublishLockRetryBudget,
 		terminalLockRetryInterval: terminalPublishLockRetryInterval,
+
+		livePublishPrePushBudget:      livePublishPrePushBudget,
+		checkpointSupersessionCooling: checkpointSupersessionCooling,
 	}
 }
 
@@ -4454,9 +4473,12 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				slog.Warn("release custody on completion", "run", runID, "worker", wkr.ID, "generation", run.ClaimGeneration, "error", relErr)
 			}
 			// PRD #1810 D3: this release's settle trigger is retainOrDeleteCheckpoint below,
-			// which runs on every terminal transition AFTER the release: it records the run
-			// (retained while an older hold is still open, else settling) and hands any record
-			// owing work to SettleRetainedCheckpoint. A second trigger here would only race it.
+			// which runs on every terminal transition AFTER the release. The record already
+			// exists by then: migration 00265's trigger inserted it in the terminal UPDATE's own
+			// transaction, as `retained` (this completing generation's hold was still open at
+			// that instant). retainOrDeleteCheckpoint re-reads that row and dispatches the settle
+			// it owes to SettleRetainedCheckpoint, which moves it to settling only once no hold
+			// of the run is open. A second trigger here would only race it.
 		}
 		// PRD #529 M4: an ephemeral worker exists only to serve its bound run, so a
 		// genuinely-applied terminal transition (rows>0) on that run — completed /
@@ -5268,6 +5290,12 @@ type PublishResult struct {
 // and an error only for a genuine 5xx (misconfig, decrypt failure, transport fault)
 // the worker ignores as best-effort.
 func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID, tipOid string, pack []byte) (PublishResult, error) {
+	// PRD #1810 D2 (residual 2): the publish is routed on the status read below, and a
+	// live-routed push must be SENT within livePublishPrePushBudget of that routing. The clock
+	// starts BEFORE the read, so a slow read can only shorten the budget, never start it after the
+	// run's terminal commit.
+	routedAt := time.Now()
+
 	// 1. Server-derived authorization: the run must be owned by THIS worker.
 	// ErrRunNotOwned bubbles to the handler → 404. This is the only thing the worker
 	// named (the run id), and it can only reach its own runs.
@@ -5355,12 +5383,18 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	// just-cancelled run may be its latest work), but not once the run's branch slot was handed to
 	// a newer run. With retention wired the whole terminal publish (the superseded check, the
 	// push, the tip persist and the record track) runs under the run's retention lock
-	// (publishTerminalLocked), so no supersession of this run can interleave with it. The branch
-	// is taken on the status read above: a run that turns terminal after this read publishes
-	// unlocked below, which the supersession's post-delete list (branchHeldByOwnPublish) covers.
+	// (publishTerminalLocked), so no supersession of this run can interleave with it. The route
+	// is taken on the status read above, so a run that turns terminal after this read publishes
+	// unlocked below. That push is bounded instead (residual 2): every push it sends is refused
+	// once livePublishPrePushBudget has passed since routedAt, a supersession of the run's record
+	// waits out checkpointSupersessionCooling after its terminal commit, and each push is recorded
+	// durably before it is sent (checkpoint_publish_attempts), so one whose outcome is unknown and
+	// that lands late anyway is reconciled by the sweeper (reconcilePublishAttempts).
+	push := &checkpointPush{s: s, runID: runID, run: owned, branch: branch, ref: ref, opts: opts, routedAt: routedAt}
 	if terminalStatuses[owned.Status] && s.retentionWired() {
-		return s.publishTerminalLocked(ctx, owned, branch, ref, tipOid, opts)
+		return s.publishTerminalLocked(ctx, push, tipOid)
 	}
+	push.live = true
 
 	// PRD #1810 D2: another run's retained record may hold this branch's slot even when this
 	// publish would fast-forward over it (the new run's work descends from the old tip). The slot
@@ -5368,8 +5402,8 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	if skip := s.claimCheckpointSlot(ctx, owned, branch); skip != "" {
 		return PublishResult{Published: false, Ref: ref, Skipped: skip}, nil
 	}
-	err = s.pushCheckpoint(ctx, owned, branch, opts)
-	res, settle, err := s.publishOutcome(ctx, runID, terminalStatuses[owned.Status], branch, ref, tipOid, err)
+	err = s.pushCheckpoint(ctx, push)
+	res, settle, err := s.publishOutcome(ctx, push, terminalStatuses[owned.Status], tipOid, err)
 	if settle {
 		s.SettleRetainedCheckpoint(runID)
 	}
@@ -5393,8 +5427,12 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 // lock could lose to this very holder).
 //
 // withRetentionLock detaches from ctx and applies its own deadline; every call inside uses the
-// context it hands to fn.
-func (s *Service) publishTerminalLocked(ctx context.Context, owned store.Run, branch, ref, tipOid string, opts pushbroker.Options) (PublishResult, error) {
+// context it hands to fn. The push is not subject to the live pre-push budget (the lock already
+// excludes a supersession), but it is recorded in checkpoint_publish_attempts like every push, so
+// one whose outcome is unknown and that the forge applies after the lock is released is reconciled
+// by the sweeper.
+func (s *Service) publishTerminalLocked(ctx context.Context, push *checkpointPush, tipOid string) (PublishResult, error) {
+	owned, branch, ref := push.run, push.branch, push.ref
 	runID := owned.ID
 	var (
 		res    PublishResult
@@ -5420,8 +5458,8 @@ func (s *Service) publishTerminalLocked(ctx context.Context, owned store.Run, br
 			res = PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}
 			return nil
 		}
-		perr := s.pushCheckpoint(lctx, owned, branch, opts)
-		res, settle, resErr = s.publishOutcome(lctx, runID, true, branch, ref, tipOid, perr)
+		perr := s.pushCheckpoint(lctx, push)
+		res, settle, resErr = s.publishOutcome(lctx, push, true, tipOid, perr)
 		return nil
 	}
 	busy := PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}
@@ -5459,19 +5497,29 @@ func (s *Service) publishTerminalLocked(ctx context.Context, owned store.Run, br
 // free; only then is the publish retried, ONCE, with the same options (Pack is a re-readable
 // []byte). freeCheckpointSlot refuses a terminal run, so a TERMINAL publish is never retried:
 // its one push is the fenced push publishTerminalLocked makes under the run's retention lock.
-func (s *Service) pushCheckpoint(ctx context.Context, owned store.Run, branch string, opts pushbroker.Options) error {
-	_, err := s.publishFn(ctx, opts)
-	if errors.Is(err, pushbroker.ErrNotDescendant) && s.freeCheckpointSlot(ctx, owned, branch) {
-		_, err = s.publishFn(ctx, opts)
+// Each push goes through checkpointPush.pushOnce: for a live-routed publish it is refused, with no
+// forge call, once the pre-push budget has elapsed (the retry comes after a supersession that can
+// take a while), and every push is recorded in checkpoint_publish_attempts before it is sent.
+func (s *Service) pushCheckpoint(ctx context.Context, push *checkpointPush) error {
+	err := push.pushOnce(ctx)
+	if errors.Is(err, pushbroker.ErrNotDescendant) && s.freeCheckpointSlot(ctx, push.run, push.branch) {
+		err = push.pushOnce(ctx)
 	}
 	return err
 }
 
 // publishOutcome maps the broker's result to Publish's response. On success it persists the tip
 // and tracks the run's retention record; settle reports that the record now owes a settle, which
-// the caller dispatches (SettleRetainedCheckpoint) once no retention lock of the run is held.
-func (s *Service) publishOutcome(ctx context.Context, runID uuid.UUID, terminal bool, branch, ref, tipOid string, err error) (res PublishResult, settle bool, _ error) {
+// the caller dispatches (SettleRetainedCheckpoint) once no retention lock of the run is held. The
+// successful push's attempt row is removed only once its tip is persisted and tracked; otherwise
+// the sweeper's attempts arm reconciles it.
+func (s *Service) publishOutcome(ctx context.Context, push *checkpointPush, terminal bool, tipOid string, err error) (res PublishResult, settle bool, _ error) {
+	runID, branch, ref := push.runID, push.branch, push.ref
 	switch {
+	case errors.Is(err, errPushRefused):
+		// No forge call was made (the live pre-push budget elapsed, or the attempt could not be
+		// recorded): the benign skip, retried on the worker's next tick.
+		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, false, nil
 	case err == nil:
 		// The CAS-accepted advance is the ONLY arm that persists the tip: it runs on
 		// EVERY successful publish (mid-run/park/shutdown all route through here), so
@@ -5479,15 +5527,20 @@ func (s *Service) publishOutcome(ctx context.Context, runID uuid.UUID, terminal 
 		// terminal-time retention record (checkpoint_retentions.tip) binds its CAS writes
 		// to. Persist is best-effort — a failure must NOT fail the publish, since the ref
 		// is already advanced on the forge.
-		if _, perr := s.q.SetRunCheckpointTip(ctx, store.SetRunCheckpointTipParams{
+		_, perr := s.q.SetRunCheckpointTip(ctx, store.SetRunCheckpointTipParams{
 			CheckpointTip: pgtype.Text{String: tipOid, Valid: true},
 			ID:            runID,
-		}); perr != nil {
+		})
+		if perr != nil {
 			slog.Warn("checkpoint: persist tip", "run", runID, "tip", tipOid, "error", perr)
 		}
 		// PRD #1810: the run's retention record follows the ref to the tip just published
 		// (trackPublishedCheckpoint). Best-effort like the persist above.
-		settle = s.trackPublishedCheckpoint(ctx, runID, terminal, branch, ref, tipOid)
+		var tracked bool
+		settle, tracked = s.trackPublishedCheckpoint(ctx, runID, terminal, branch, ref, tipOid)
+		if perr == nil && tracked {
+			s.clearPublishAttempt(ctx, push.landed)
+		}
 		return PublishResult{Published: true, Ref: ref}, settle, nil
 	case errors.Is(err, pushbroker.ErrNotDescendant):
 		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, false, nil

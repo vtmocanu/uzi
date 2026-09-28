@@ -189,6 +189,11 @@ const maxCreateRefDuration = 30 * time.Second
 // request can never run unbounded.
 const maxPublishDuration = 60 * time.Second
 
+// MaxPublishDuration exports maxPublishDuration for the retention timing relations in workersvc
+// (PRD #1810 D2: the supersession cooling period is sized above a live publish's pre-push budget
+// plus this client-side ceiling).
+const MaxPublishDuration = maxPublishDuration
+
 // checkpointRefPrefix is the uzi-owned ref namespace no CI watches (Rule 3). The
 // end-of-run push targets refs/heads/<branch>; checkpoints never do.
 const checkpointRefPrefix = "refs/uzi-checkpoints/"

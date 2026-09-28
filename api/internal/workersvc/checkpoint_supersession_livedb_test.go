@@ -245,6 +245,9 @@ func newSupersedeFixWith(t *testing.T, terminal func(f *supersedeFix)) *supersed
 		svc.SetDeleteCheckpointFn(forge.deleteRef)
 		svc.SetCreateRefFn(forge.createRef)
 		svc.SetListRefTipsFn(forge.listRefTips)
+		// Supersession is driven the moment the old run is terminal: the cooling period
+		// (BeginCheckpointSupersession) has its own tests in checkpoint_publish_attempt_livedb_test.go.
+		svc.checkpointSupersessionCooling = 0
 		return svc
 	}
 	f := &supersedeFix{e: e, rf: &retentionFix{e: e}, pat: pat, forge: forge, svc1: mk(), svc2: mk()}

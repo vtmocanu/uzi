@@ -955,7 +955,7 @@ func TestStaleTipGoneAfterLockLostLiveDB(t *testing.T) {
 func TestBeginSupersessionTipGuardLiveDB(t *testing.T) {
 	f := newSupersedeFix(t)
 	n, err := f.e.q.BeginCheckpointSupersession(f.e.ctx, store.BeginCheckpointSupersessionParams{
-		RunID: f.oldRun, RecoveryRef: f.recoveryRef, Tip: supersedeOtherTip,
+		RunID: f.oldRun, RecoveryRef: f.recoveryRef, Tip: supersedeOtherTip, Cooling: noCooling,
 	})
 	if err != nil || n != 0 {
 		t.Fatalf("BeginCheckpointSupersession at a stale tip moved %d rows (err %v), want 0", n, err)
@@ -964,7 +964,7 @@ func TestBeginSupersessionTipGuardLiveDB(t *testing.T) {
 		t.Fatalf("record = {state %q recovery %v}, want untouched", r.State, r.RecoveryRef)
 	}
 	n, err = f.e.q.BeginCheckpointSupersession(f.e.ctx, store.BeginCheckpointSupersessionParams{
-		RunID: f.oldRun, RecoveryRef: f.recoveryRef, Tip: retentionTestTip,
+		RunID: f.oldRun, RecoveryRef: f.recoveryRef, Tip: retentionTestTip, Cooling: noCooling,
 	})
 	if err != nil || n != 1 {
 		t.Fatalf("BeginCheckpointSupersession at the recorded tip moved %d rows (err %v), want 1", n, err)

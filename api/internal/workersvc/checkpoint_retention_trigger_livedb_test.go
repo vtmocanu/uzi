@@ -156,11 +156,23 @@ func TestTerminalTriggerContractLiveDB(t *testing.T) {
 		{"issue never published", runkind.Issue, false, true, "failed", ""},
 		{"ci_fix published", runkind.CIFix, true, true, "failed", ""},
 		{"task published", runkind.Task, true, false, "failed", ""},
+		// A NON-terminal transition of a published, held issue run records nothing: the
+		// trigger's WHEN clause is exactly the three terminal statuses.
+		{"issue paused", runkind.Issue, true, true, "paused", ""},
+		{"issue awaiting_input", runkind.Issue, true, true, "awaiting_input", ""},
+		{"issue limit_wait", runkind.Issue, true, true, "limit_wait", ""},
+		{"issue recovery_wait", runkind.Issue, true, true, "recovery_wait", ""},
+		{"issue awaiting_followup", runkind.Issue, true, false, "awaiting_followup", ""},
+		{"issue awaiting_approval", runkind.Issue, true, false, "awaiting_approval", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newRetentionFix(t)
 			runID, iid := trigRun(t, f, tc.kind, tc.published, tc.held)
-			f.e.exec(t, `UPDATE runs SET status = $2, finished_at = now() WHERE id = $1`, runID, tc.status)
+			if terminalStatuses[tc.status] {
+				f.e.exec(t, `UPDATE runs SET status = $2, finished_at = now() WHERE id = $1`, runID, tc.status)
+			} else {
+				f.e.exec(t, `UPDATE runs SET status = $2 WHERE id = $1`, runID, tc.status)
+			}
 			r, ok := f.row(t, runID)
 			if tc.wantState == "" {
 				if ok {

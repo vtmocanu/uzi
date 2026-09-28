@@ -105,6 +105,15 @@ WHERE run_id = @run_id
 -- name: BeginCheckpointSupersession :execrows
 -- D2 step 1 (M3): retained -> superseding, persisting the recovery ref name BEFORE any forge
 -- write, guarded on the tip the caller will CAS against.
+--
+-- COOLING PERIOD (#1810 residual 2): the intent is refused (zero rows) until the run has been in
+-- its current (terminal) status for at least @cooling, read on the database clock in the same
+-- statement. A publish that was routed while the run was still live may be in flight when the run
+-- turns terminal; waiting out the cooling period lets it land and be tracked (its tip advances this
+-- record) before the record's tip is bound to a recovery ref. This is a DELAY that makes the
+-- reconciliation path rare, not the correctness argument: a push whose outcome is unknown can
+-- still land later, and checkpoint_publish_attempts plus the sweeper's attempts arm reconcile it.
+-- runs.status_since is stamped by every statement that assigns runs.status (00163).
 UPDATE checkpoint_retentions
 SET state = 'superseding',
     recovery_ref = @recovery_ref::text,
@@ -112,9 +121,14 @@ SET state = 'superseding',
     last_error = NULL,
     next_attempt_at = now(),
     updated_at = now()
-WHERE run_id = @run_id
-  AND state = 'retained'
-  AND tip = @tip::text;
+WHERE checkpoint_retentions.run_id = @run_id
+  AND checkpoint_retentions.state = 'retained'
+  AND checkpoint_retentions.tip = @tip::text
+  AND EXISTS (
+      SELECT 1 FROM runs r
+      WHERE r.id = checkpoint_retentions.run_id
+        AND r.status_since <= now() - @cooling::interval
+  );
 
 -- name: MarkCheckpointSuperseded :one
 -- D2 step 4 (M3): superseding -> superseded once the recovery ref exists at the tip and the
@@ -261,9 +275,10 @@ SELECT now()::timestamptz AS listed_at;
 -- M4 backfill: terminal runs that published a checkpoint and own a checkpoint branch (an issue
 -- run with an issue iid, or a self_improve run) but have NO record. Since migration 00265 every
 -- terminal transition inserts its record in the same transaction (the runs.status trigger,
--- whichever writer made it), so what is left here is a run that went terminal before 00265, or
--- a terminal run's late first publish (after the transition, so the trigger saw no tip) whose
--- TrackTerminalCheckpointPublish insert failed. Bounded to
+-- whichever writer made it), so what is left here is a terminal run whose first checkpoint tip was
+-- persisted only AFTER the transition (the trigger saw no tip) and whose own track did not record
+-- it: its TrackTerminalCheckpointPublish insert failed, or retention was not wired in the api
+-- that served the publish. Bounded to
 -- runs whose current status began at or after retention was enabled
 -- (checkpoint_retention_meta.enabled_at), so it never reaches back to runs the old
 -- delete-on-terminal path already handled.
@@ -429,3 +444,72 @@ RETURNING checkpoint_retentions.state;
 -- successful publish). The stuck-supersession exit uses it to prove a branch ref at a tip the
 -- record does not name is still this run's own publish.
 SELECT checkpoint_tip FROM runs WHERE id = @run_id;
+
+-- PRD #1810 D2 (residual 2): checkpoint_publish_attempts, the durable record of a checkpoint push
+-- written BEFORE the forge call (migration 00266).
+
+-- name: RecordCheckpointPublishAttempt :one
+-- Written immediately before one push. The caller refuses the push when this fails: no push is
+-- ever sent without its row.
+INSERT INTO checkpoint_publish_attempts (run_id, branch, ref, tip)
+VALUES (@run_id, @branch::text, @ref::text, @tip::text)
+RETURNING id;
+
+-- name: DeleteCheckpointPublishAttempt :execrows
+-- The push's outcome is accounted for (refused by the forge, or landed and tracked), or the
+-- sweeper reconciled or retired it.
+DELETE FROM checkpoint_publish_attempts WHERE id = @id;
+
+-- name: GetCheckpointPublishAttempt :one
+SELECT * FROM checkpoint_publish_attempts WHERE id = @id;
+
+-- name: RunHasCheckpointPublishAttempt :one
+-- Whether the run has an outstanding push of exactly this tip: a branch ref at that tip may be
+-- the run's own (possibly late) publish, even when runs.checkpoint_tip never recorded it.
+SELECT EXISTS (
+    SELECT 1 FROM checkpoint_publish_attempts a
+    WHERE a.run_id = @run_id AND a.tip = @tip::text
+)::bool AS attempted;
+
+-- name: ListDueCheckpointPublishAttempts :many
+-- The sweeper's attempts arm: outstanding attempts, due for a comparison, whose run is TERMINAL
+-- (or gone). A live run's own next publish fetches origin and builds on whatever landed; once it
+-- is terminal nothing else of the run will. only_run_id NULL lists every run (production); a run
+-- id confines the page (the LiveDB tests' isolation from a reused database).
+SELECT a.* FROM checkpoint_publish_attempts a
+LEFT JOIN runs r ON r.id = a.run_id
+WHERE a.next_check_at <= now()
+  AND (r.id IS NULL OR r.status IN ('completed', 'failed', 'cancelled'))
+  AND (sqlc.narg(only_run_id)::uuid IS NULL OR a.run_id = sqlc.narg(only_run_id)::uuid)
+ORDER BY a.next_check_at, a.id
+LIMIT @max_rows::int;
+
+-- name: DeferCheckpointPublishAttempt :execrows
+-- The comparison found nothing to reconcile yet (the ref is not at the attempted tip) or could not
+-- run; check again after the caller-computed backoff. A non-NULL note replaces last_error.
+UPDATE checkpoint_publish_attempts
+SET checks = checks + 1,
+    next_check_at = @next_check_at::timestamptz,
+    last_error = COALESCE(sqlc.narg(note)::text, last_error)
+WHERE id = @id;
+
+-- name: CheckpointTipClaimedByOtherRun :one
+-- Whether any OTHER run of the repo claims this tip (its persisted checkpoint tip, an outstanding
+-- publish attempt, or a live retention record): a branch ref at such a tip is never deleted as
+-- this run's late publish.
+SELECT (
+    EXISTS (
+        SELECT 1 FROM runs r
+        WHERE r.repo_id = @repo_id AND r.id <> @run_id AND r.checkpoint_tip = @tip::text
+    )
+    OR EXISTS (
+        SELECT 1 FROM checkpoint_publish_attempts a
+        JOIN runs r ON r.id = a.run_id
+        WHERE r.repo_id = @repo_id AND a.run_id <> @run_id AND a.tip = @tip::text
+    )
+    OR EXISTS (
+        SELECT 1 FROM checkpoint_retentions c
+        WHERE c.repo_id = @repo_id AND c.run_id <> @run_id AND c.tip = @tip::text
+          AND c.state IN ('retained', 'superseding', 'superseded', 'settling')
+    )
+)::bool AS claimed;

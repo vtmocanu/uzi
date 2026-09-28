@@ -116,6 +116,18 @@ type BrandingAsset struct {
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
+type CheckpointPublishAttempt struct {
+	ID          uuid.UUID          `json:"id"`
+	RunID       uuid.UUID          `json:"run_id"`
+	Branch      string             `json:"branch"`
+	Ref         string             `json:"ref"`
+	Tip         string             `json:"tip"`
+	AttemptedAt pgtype.Timestamptz `json:"attempted_at"`
+	NextCheckAt pgtype.Timestamptz `json:"next_check_at"`
+	Checks      int32              `json:"checks"`
+	LastError   pgtype.Text        `json:"last_error"`
+}
+
 type CheckpointRetention struct {
 	RunID         uuid.UUID          `json:"run_id"`
 	UserID        uuid.UUID          `json:"user_id"`
