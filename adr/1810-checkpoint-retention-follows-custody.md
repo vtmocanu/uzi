@@ -1,4 +1,4 @@
-# ADR-1810: A published checkpoint is kept while its run's custody is open; supersession moves it rather than deleting it
+# ADR-1810: A published checkpoint stays while its run's custody is open; supersession preserves a held tip under a recovery ref
 
 **Status**: Accepted (PRD #1810 M1-M4 implemented, including rework rounds 1 and 2; M5 in progress)
 **Date**: 2026-09-27 (amended 2026-09-28, rework rounds 1 and 2)
@@ -8,9 +8,10 @@
 ## Decision (summary)
 
 > A published checkpoint survives its run's terminal transition while any
-> custody hold of the run is open, and is deleted once the last hold is
-> released or discarded. When a new run needs the branch slot, supersession
-> moves the tip to a run-scoped recovery ref rather than deleting it.
+> custody hold of the run is open. Once the last hold is released or
+> discarded, its ref is owed a CAS delete, retried until it succeeds. When a
+> new run needs the branch slot, supersession preserves a held run's tip
+> under a run-scoped recovery ref.
 
 The api no longer deletes a terminal run's `refs/uzi-checkpoints/<branch>`
 ref best-effort at each of the three writers that reach it (PRD #1030 M4):
