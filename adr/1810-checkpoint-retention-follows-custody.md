@@ -1,7 +1,7 @@
 # ADR-1810: A published checkpoint outlives its custody hold; supersession moves it, never deletes it
 
-**Status**: Accepted (PRD #1810 M1-M4 implemented; M5 in progress)
-**Date**: 2026-09-27
+**Status**: Accepted (PRD #1810 M1-M4 implemented, including rework rounds 1 and 2; M5 in progress)
+**Date**: 2026-09-27 (amended 2026-09-28, rework rounds 1 and 2)
 **Deciders**: agent team, per PRD #1810
 **PRD**: [PRD #1810](../prds/1810-retain-failed-run-checkpoint-ref.md)
 
@@ -166,6 +166,118 @@ ends up owing is dispatched only *after* the lock releases: dispatching it
 under the lock would have it try-lock the same key and lose to the lock
 this operation still holds.
 
+### The terminal `checkpoint_retentions` row is written in the same transaction as the status commit (rework round 2)
+
+Before this round the row was inserted only after the terminal status
+committed — by the post-commit Go path at the three original writers, or,
+for the seven other terminal writers named in the PRD's amended Problem
+statement, only later by the sweeper's backfill arm. In the window between
+a terminal commit at one of those seven writers and the backfill arm
+catching up, `claimCheckpointSlot` could list the branch's active records,
+see none, and push a new run's descendant tip straight over the old run's
+retained checkpoint. A migration-00265 (draft number; renumbered at merge)
+`AFTER UPDATE OF status` trigger on `runs` now inserts the
+`checkpoint_retentions` row in the SAME transaction as every terminal
+transition — `retained` while a custody hold is open, else `settling`, the
+branch derived exactly as `checkpointBranch` does (kind first: an issue run
+with an iid, or a self-improve run keyed on its own run id) — so any reader
+that observes the terminal status also observes the row, with no writer
+able to skip it. Because no new issue run exists until the old one is
+terminal (`uq_runs_one_active_per_issue`, migration 00170), no branch lock
+is needed for this fix. The Go post-commit path still runs afterward: it
+re-reads the row the trigger already wrote (`ON CONFLICT (run_id) DO
+NOTHING` keeps the trigger's own insert authoritative) and dispatches the
+settle that row owes. The sweeper's backfill arm stays wired as the
+backstop for whatever coverage gap the trigger itself does not close (a row
+inserted before this migration's deploy, a repo-less or non-checkpointing
+run kind).
+
+### Residual 2 closed by a durable pre-push record, not by the cooling period (rework round 2)
+
+Rework round 1 narrowed residual 2 to a specific window and left it open,
+relying on a five-minute cooling period (`checkpointSupersessionCooling`)
+before a supersession's recovery-ref create to reduce how often a
+live-routed publish's unlocked push could land inside that window. Reviewer
+and lander steering on that round held the cooling period does not prove
+the window closed: a client-side push timeout is evidence about the
+client, not about the forge — a receive-pack request already accepted can
+still land on origin after the client gave up, after the run went
+terminal, and after a newer run superseded its record. A per-publish lease
+was considered and rejected (see the PRD's D4): it lapses while a detached
+supersession's own forge round-trips are still running, is unsafe to clear
+after a push whose outcome is unknown, and is overwritten by two
+overlapping publishes of the same run.
+
+Round 2 instead makes the outcome durable and reconcilable rather than
+inferred from elapsed time. `routedAt` is stamped BEFORE the run's status
+read in `Publish` (so a slow read only shortens the budget below, never
+starts it after the run's terminal commit). A live-routed push carries a
+`livePublishPrePushBudget` (2 minutes): once that much time has passed
+since `routedAt`, the push is refused rather than sent. Independently of
+that budget, every push — live or terminal — writes a durable
+`checkpoint_publish_attempts` row (migration 00266, draft number) BEFORE
+the forge call: the branch, ref and tip the push would set, keyed to the
+run. The row is cleared only on a KNOWN outcome: a definitive refusal
+(nothing landed), or a successful push whose tip is persisted
+(`runs.checkpoint_tip`) and tracked on the run's retention record. A row
+whose outcome the api never learned, or whose landed tip no record tracks,
+stays.
+
+The sweeper's attempts arm (part of `ReconcileCheckpointRetentions`)
+compares the branch ref actually on origin against outstanding attempt
+rows for terminal runs. Under the run's retention lock it either
+re-records the landed tip on the run's retention record — compare-and-set
+against the tip the arm itself read immediately before listing origin, so
+it never overwrites a newer publish or another reconciliation — or, once
+no custody hold of the run is open, CAS-deletes the branch ref at exactly
+that tip (the run's slot was handed to a newer run, and no hold still needs
+the ref as its only copy). While a hold IS open, the arm leaves the ref in
+place and re-records instead: the newer run's checkpoints keep being
+refused `not_descendant` until that hold releases, the same cost the
+stuck-supersession exit already accepts elsewhere in this design. The
+publish path's own tip persist and record track are themselves
+compare-and-set against what the push observed immediately before its
+forge call, so a write that arrives late can never move either backwards
+over a newer publish or the sweeper's own re-record.
+
+`TestLatePublishLandsAfterCoolingLiveDB`
+(`api/internal/workersvc/checkpoint_publish_attempt_livedb_test.go`) drives
+a remote update that lands after the cooling window has already elapsed
+and asserts it cannot leave a permanently untracked branch ref. The cooling
+period is kept — it still reduces how often a late push and a
+supersession's recovery-ref create overlap in the first place — but is now
+documented as a delay that narrows exposure, not as the mechanism that
+proves the window safe; the durable attempt record and its CAS
+reconciliation are that mechanism.
+
+Two residuals remain, both documented rather than closed: while a custody
+hold stays open over a re-recorded late push, a newer run's checkpoints on
+that branch keep taking `not_descendant` skips until the hold releases; and
+an attempt row is retired after `publishAttemptHorizon` (7 days) or dropped
+with its run, so a push that lands on origin after either point still
+leaves an untracked branch ref for a human to clear.
+
+### The sweeper's retention pass is now time-bounded (rework round 2)
+
+`ReconcileCheckpointRetentions` previously ran each of its arms to
+completion with no time budget, so a slow or hung forge could stall the
+rest of that Sweep tick indefinitely. It now runs under a `retentionPass`:
+a pass-wide budget (`retentionPassBudget`, 30s) checked before starting
+each record, in every arm, never mid-record; each record's locked
+operation runs under an op timeout (`retentionSweepOpTimeout`) sized to
+the pass's single longest locked operation rather than the publish path's
+own shorter timeout — 160s, derived as five forge calls at a 30s ceiling
+each plus 10s slack. A record cut off by its own deadline still runs its
+failure bookkeeping and releases its lock on a fresh, un-cancelled context,
+so a hung forge call is recorded as a failure and backed off rather than
+left holding the lock. Per the code's own accounting, the worst case for
+one tick is `retentionPassBudget + retentionSweepOpTimeout + 4 × 10s = 30s
++ 160s + 40s = 230s`; any records or arms the pass could not reach are left
+for the next tick, logged once per pass rather than per record. The pass's
+four forge-calling arms (work, unheld, audit, attempts) also rotate which
+arm runs first each pass, so a burst of slow records in one arm cannot
+starve the arms after it across many consecutive passes.
+
 ### Empty pack, not "pack-less" (amends the PRD's D2)
 
 The PRD's D2 describes the recovery-ref create as "pack-less", since the
@@ -197,6 +309,18 @@ above.
 - **A checkpoint ref can now persist well past a run's terminal
   transition**, for as long as its custody holds stay open. This is the
   point: it is the fix for the data-loss mode PRD #1810 exists to close.
+- **The remaining coverage gap between a terminal writer's commit and the
+  api recording that run's retention is closed (rework round 2).** A
+  database trigger on `runs.status`, not a post-commit Go call, now writes
+  the `checkpoint_retentions` row in the same transaction as every terminal
+  transition, so the seven terminal writers that never called the original
+  Go retention path (see the PRD's amended Problem statement) can no longer
+  leave a window where a new run's `claimCheckpointSlot` sees no record for
+  the old run at all.
+- **The sweeper's retention reconciliation pass is now time-bounded
+  (rework round 2)**, trading unbounded work per tick (previously able to
+  stall on a hung forge) for a documented worst case per tick (~230s) and
+  leftover work that carries to the next tick under load.
 - **The api's forge-write surface for checkpoints grows**: a create-ref
   primitive alongside the existing publish/delete (ADR-0122), still CAS,
   still never forced.
@@ -211,26 +335,25 @@ above.
   can no longer land *inside* a supersession of that same run —
   `publishTerminalLocked` holds the same lock a supersession of it would
   need, across the check, the push and the track.
-- **Residual 2 is narrower, not closed.** A run that read as **live** at
-  the moment its own `Publish` call started — so it took the unlocked
-  live-run path rather than `publishTerminalLocked` — can still turn
-  terminal (a concurrent cancel or completion) while that unlocked push is
-  still in flight. The window that remains: the run's push lands any
-  time *after* a supersession's recovery-ref create (before the branch
-  CAS-delete, or after it as a create from an absent ref), and its
-  `runs.checkpoint_tip` persist does not commit before the supersession's
-  post-delete list (`branchHeldByOwnPublish`) reads it — or the push lands
-  after that list entirely. Then the list takes the branch ref's tip for
-  another run's publish (or never sees it), the record ends `superseded`
-  (or `settling`) with its recovery ref set, and
-  neither retention statement the run's own track runs
-  (`TrackTerminalCheckpointPublish`, `AdvanceCheckpointRetentionTip`) moves
-  a row for it, so the ref stays untracked and can block a new run on the
-  branch until an operator clears it. This is logged, not silently lost:
-  the track logs a Warn naming the run, branch and tip for an operator,
-  based on the run's *current* status at that point (a run live at
-  `Publish`'s top read can have turned terminal by the time the track
-  runs).
+- **Residual 2 is closed (2026-09-28, rework round 2) by a durable
+  pre-push record and sweeper reconciliation, not by the cooling period
+  alone.** A run that reads as **live** at the moment its own `Publish`
+  call starts — so it takes the unlocked live-run path rather than
+  `publishTerminalLocked` — can still turn terminal (a concurrent cancel or
+  completion) while that unlocked push is still in flight, and its push can
+  still land on origin after a supersession has already moved the branch
+  slot on. What closes the window is not the five-minute cooling period
+  (kept only as a delay that narrows how often this is even reachable) but
+  `checkpoint_publish_attempts`: a row written before every push, a
+  2-minute pre-push budget on a live-routed push, and a sweeper arm that
+  compares the branch ref actually on origin against outstanding attempt
+  rows for terminal runs and CAS re-records or CAS-deletes accordingly (see
+  the mechanism section above). Two residuals remain from this fix, both
+  documented rather than closed: a re-recorded late push under an open
+  custody hold costs a newer run `not_descendant` skips until that hold
+  releases, and an attempt row past its 7-day horizon, or one whose run no
+  longer exists, is no longer reconciled — a push that lands after either
+  point still leaves an untracked branch ref for a human to clear.
 - **A remaining known residual (tip lag), by design, rather than closed
   with a primitive the push broker does not have:** in the tip-lag case —
   the record's recorded tip lags what the run itself later published, and
