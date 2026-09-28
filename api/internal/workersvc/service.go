@@ -445,6 +445,10 @@ type Store interface {
 	// user_id, so the query joins through `workers`. See the query's own comment.
 	GetWorkerUpgradeSummaryForUser(ctx context.Context, userID uuid.UUID) ([]store.GetWorkerUpgradeSummaryForUserRow, error)
 	HeartbeatWorker(ctx context.Context, arg store.HeartbeatWorkerParams) (store.Worker, error)
+	// PRD #1809 M6 (D8): replace the worker's reported per-run HOME / cache sizes (display-only).
+	ReplaceWorkerRunDisk(ctx context.Context, arg store.ReplaceWorkerRunDiskParams) error
+	// PRD #1809 M6 (D8): record a park's checkpoint-durability report (display-only).
+	SetRunCheckpointContainsLatest(ctx context.Context, arg store.SetRunCheckpointContainsLatestParams) (int64, error)
 	DeleteWorkerForUser(ctx context.Context, arg store.DeleteWorkerForUserParams) (int64, error)
 	// DeleteEphemeralWorkerForRun tears down the ephemeral worker bound to a now-terminal
 	// run, guarded (embedded) on the worker holding no non-terminal run (PRD #529 M4).
@@ -1423,6 +1427,11 @@ type Params struct {
 	// caps the forge park), matching RUN_LIMIT_MAX_WAITS==0's "never park" shape. The positive
 	// default lives in config.go where the env is read.
 	RunForgeUnreachableMaxParks int
+	// RunDiskParkMax (PRD #1809 M5, D6), mirrored from config (UZI_RUN_DISK_PARK_MAX). The
+	// DATA-VOLUME-FULL park's lifetime cap: parkDataVolumeFull fails the run with the
+	// server-derived fail_origin='data_volume_full' instead of parking when a COUNTED park would
+	// take disk_park_count past it. A preventive park is neither counted nor capped. 0 = unlimited.
+	RunDiskParkMax int
 
 	// RunGateRefusalMax (PRD #1795 M1), mirrored from config RUN_GATE_REFUSAL_MAX. The refusal
 	// cap on plan-gate re-presentation: a refused awaiting_approval report counts once per claim
@@ -2125,6 +2134,30 @@ type WorkerStats struct {
 	DiskDindTotalBytes  *int64
 	DiskDindInodes      *int64
 	DiskDindTotalInodes *int64
+	// Data-volume inode sample (PRD #1809 M6, D8): used and total inodes of the data volume,
+	// beside the byte pair above, each nil when absent or invalid. DISPLAY-ONLY, never a
+	// disk_pressure input; the admin-health run-disk check reads it to warn on low free inodes.
+	DiskDataInodes      *int64
+	DiskDataTotalInodes *int64
+	// RunDisk is the per-run HOME / cache size list the worker sampled (PRD #1809 M6, D8),
+	// already validated, de-duplicated and capped by the handler. nil means the tick carried no
+	// run_disk at all (an older worker, or no sample this tick): the worker's stored rows are left
+	// untouched. A non-nil EMPTY slice is a real report of "no runs on this worker" and clears
+	// them. Display-only.
+	RunDisk []RunDiskSample
+}
+
+// RunDiskSample is one validated entry of a heartbeat's run_disk list (PRD #1809 M6, D8): the
+// run's HOME bytes and rebuildable-cache bytes on this worker, and whether the worker's size walk
+// was cut short (Truncated: both sizes are then lower bounds). SampledAt is when the worker's
+// measurement finished, as the entry reported it; nil when the entry carried none (an older
+// worker), which ReplaceWorkerRunDisk stores as the database's now(). The store clamps it.
+type RunDiskSample struct {
+	RunID      uuid.UUID
+	HomeBytes  int64
+	CacheBytes int64
+	Truncated  bool
+	SampledAt  *time.Time
 }
 
 // Heartbeat refreshes liveness, overwrites the worker's latest resource sample (PRD
@@ -2165,6 +2198,8 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		arg.StatsDiskDindTotalBytes = pgconv.Int8Ptr(stats.DiskDindTotalBytes)
 		arg.StatsDiskDindInodes = pgconv.Int8Ptr(stats.DiskDindInodes)
 		arg.StatsDiskDindTotalInodes = pgconv.Int8Ptr(stats.DiskDindTotalInodes)
+		arg.StatsDiskDataInodes = pgconv.Int8Ptr(stats.DiskDataInodes)
+		arg.StatsDiskDataTotalInodes = pgconv.Int8Ptr(stats.DiskDataTotalInodes)
 		// Disk-pressure debounce input (PRD #837 M4): whether THIS sample crossed the
 		// threshold. HeartbeatWorker increments the streak when true and resets it to 0
 		// when false; a nil stats leaves this false, which correctly resets the streak
@@ -2174,7 +2209,12 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 	// No snapshot (an old worker, or the field absent), or no pool wired (tests): the plain
 	// single-statement liveness write, unchanged.
 	if snapshot == nil || s.txBeginner == nil {
-		return s.q.HeartbeatWorker(ctx, arg)
+		updated, err := s.q.HeartbeatWorker(ctx, arg)
+		if err != nil {
+			return store.Worker{}, err
+		}
+		s.replaceRunDisk(ctx, updated, stats)
+		return updated, nil
 	}
 	tx, err := s.txBeginner.Begin(ctx)
 	if err != nil {
@@ -2260,7 +2300,94 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 	for _, r := range missingRequeued {
 		s.publishSwept(r.ID, r.Status)
 	}
+	s.replaceRunDisk(ctx, updated, stats)
 	return updated, nil
+}
+
+// checkpointDurabilityParks are the park statuses whose report may carry
+// checkpoint_contains_latest (PRD #1809 M6, D8).
+var checkpointDurabilityParks = map[string]bool{"limit_wait": true, "recovery_wait": true, "paused": true}
+
+// recordCheckpointDurability stores a park report's checkpoint_contains_latest (PRD #1809 M6,
+// D8) after the park transition applied. The write is guarded on the run still being this
+// worker's in the status the report asked for, so a park the transaction turned into something
+// else (a forge or disk park that cancelled or failed the run past its cap) or a run that already
+// moved on records nothing.
+//
+// Each park overwrites the value with what it carried, so the flag describes the LATEST park: a
+// report without the flag clears an older park's value to NULL ("not reported"). That clearing
+// write is skipped when the run has no stored value (owned, read before the transition), so a
+// worker that never reports the flag costs no extra statement. The next claim (ClaimRun) or
+// running report (SetRunRunning) clears the flag too, so a later park that does not pass through
+// here (a server-side credential_disabled, completion-hold or wall park) reads "not reported"
+// rather than an older park's value. Best-effort and display-only: a failed write is logged and
+// never fails the report, and custody never reads it.
+func (s *Service) recordCheckpointDurability(ctx context.Context, wkr store.Worker, owned store.Run, req StateRequest) {
+	if !checkpointDurabilityParks[req.State] {
+		return
+	}
+	s.setCheckpointDurability(ctx, wkr, owned, req.State, req.CheckpointContainsLatest)
+}
+
+// setCheckpointDurability is recordCheckpointDurability's write, shared with the wall-clock park
+// (ReportWallPark), which has its own endpoint. prev is the run as read before the park.
+// It returns the stored value and whether a row was written, so a caller that does not re-read
+// the run can reflect the write on the row it returns.
+func (s *Service) setCheckpointDurability(ctx context.Context, wkr store.Worker, prev store.Run, status string, reported *bool) (pgtype.Bool, bool) {
+	if reported == nil && !prev.CheckpointContainsLatest.Valid {
+		return pgtype.Bool{}, false
+	}
+	var v pgtype.Bool
+	if reported != nil {
+		v = pgtype.Bool{Bool: *reported, Valid: true}
+	}
+	n, err := s.q.SetRunCheckpointContainsLatest(ctx, store.SetRunCheckpointContainsLatestParams{
+		CheckpointContainsLatest: v,
+		ID:                       prev.ID,
+		WorkerID:                 pgconv.UUID(wkr.ID),
+		Status:                   status,
+	})
+	if err != nil {
+		slog.Warn("record checkpoint durability", "run", prev.ID, "error", err)
+		return pgtype.Bool{}, false
+	}
+	return v, n > 0
+}
+
+// replaceRunDisk stores a heartbeat's per-run size list (PRD #1809 M6, D8) after the liveness
+// write committed. It runs OUTSIDE the snapshot transaction and is best-effort: the sizes are
+// display-only, so a failed write is logged and never turns the heartbeat into an error or rolls
+// back its liveness refresh. A tick with no stats, or stats without a run_disk list (nil), leaves
+// the worker's stored rows untouched; readers age them out by sampled_at.
+func (s *Service) replaceRunDisk(ctx context.Context, wkr store.Worker, stats *WorkerStats) {
+	if stats == nil || stats.RunDisk == nil {
+		return
+	}
+	n := len(stats.RunDisk)
+	arg := store.ReplaceWorkerRunDiskParams{
+		WorkerID:   wkr.ID,
+		UserID:     wkr.UserID,
+		RunIds:     make([]uuid.UUID, 0, n),
+		HomeBytes:  make([]int64, 0, n),
+		CacheBytes: make([]int64, 0, n),
+		Truncated:  make([]bool, 0, n),
+		SampledAt:  make([]pgtype.Timestamptz, 0, n),
+	}
+	for _, e := range stats.RunDisk {
+		arg.RunIds = append(arg.RunIds, e.RunID)
+		arg.HomeBytes = append(arg.HomeBytes, e.HomeBytes)
+		arg.CacheBytes = append(arg.CacheBytes, e.CacheBytes)
+		arg.Truncated = append(arg.Truncated, e.Truncated)
+		// A nil (not reported) measurement time is a NULL element, stored as now() by the query.
+		var at pgtype.Timestamptz
+		if e.SampledAt != nil {
+			at = pgtype.Timestamptz{Time: *e.SampledAt, Valid: true}
+		}
+		arg.SampledAt = append(arg.SampledAt, at)
+	}
+	if err := s.q.ReplaceWorkerRunDisk(ctx, arg); err != nil {
+		slog.Warn("heartbeat: store run disk sizes", "worker_id", wkr.ID.String(), "error", err)
+	}
 }
 
 // snapshotRunIDs parses the run ids an ActiveSnapshot lists into uuids for the canonical pre-lock
@@ -2279,6 +2406,11 @@ func snapshotRunIDs(snap *ActiveSnapshot) []uuid.UUID {
 	}
 	return ids
 }
+
+// DiskPressureThreshold returns the configured UZI_DISK_PRESSURE_THRESHOLD (Params),
+// the same value Heartbeat applies via diskOverThreshold. The heartbeat handler echoes it
+// to the worker (PRD #1809 D5). Zero when Params left it unset.
+func (s *Service) DiskPressureThreshold() float64 { return s.p.DiskPressureThreshold }
 
 // RetainingUnpublishedWork reports whether wkr is the live holder of any OPEN
 // durable-recovery custody hold (issue #1759), owner-scoped to the worker row's own
@@ -3237,10 +3369,11 @@ type StateRequest struct {
 	SizeClass            *string   `json:"size_class"`
 	// RecoveryCause is the worker's TYPED cause for a 'recovery_wait' park (PRD #1392 M1).
 	// UNTRUSTED free text on arrival: SetState validates it against the server enum
-	// {forge_unreachable, empty_turn, provider_outage, vault_locked} BEFORE any state SQL and
-	// rejects an unknown non-nil value as ErrInvalidState (400), so a garbled cause can never
-	// reach the constrained column. Only recovery_cause == "forge_unreachable" triggers the
-	// dedicated custody-settling park transaction; the other causes take the ordinary park,
+	// {forge_unreachable, empty_turn, provider_outage, vault_locked, data_volume_full} BEFORE any
+	// state SQL and rejects an unknown non-nil value as ErrInvalidState (400), so a garbled cause
+	// can never reach the constrained column. Only recovery_cause == "forge_unreachable" triggers the
+	// dedicated custody-settling park transaction, and "data_volume_full" (PRD #1809 M5) its own
+	// counted park transaction (parkDataVolumeFull); the other causes take the ordinary park,
 	// which writes cause NULL (D9) except for vault_locked, which it persists (issue #1766 M2).
 	// Absent (nil) on every non-recovery_wait report and on a legacy worker's empty-turn park. httpx.DecodeJSON rejects unknown fields, so this field MUST
 	// exist here or a new worker's report 400s.
@@ -3262,6 +3395,24 @@ type StateRequest struct {
 	// presentation id is NULL and the payload is unchanged; otherwise it is refused
 	// (gate_adoption_stale). Requires PresentationID and claim_generation.
 	AdoptGateRevision *int64 `json:"adopt_gate_revision,omitempty"`
+	// DiskParkPreventive qualifies a recovery_cause "data_volume_full" park (PRD #1809 M5, D6):
+	// true means the worker stopped the run BEFORE its data volume filled (a pressure stop), so
+	// the park is neither counted in disk_park_count nor capped by UZI_RUN_DISK_PARK_MAX; absent
+	// or false is a counted park (a write actually failed disk-full). Only valid with that cause:
+	// SetState rejects it with any other cause, or none, as ErrInvalidState (400) before any SQL
+	// (validateDiskParkPreventive). httpx.DecodeJSON rejects unknown fields, so a worker sends it
+	// only once the api advertises the recovery_cause_data_volume_full feature.
+	DiskParkPreventive *bool `json:"disk_park_preventive"`
+	// CheckpointContainsLatest is the worker's durability report on a PARK (PRD #1809 M6, D8):
+	// true when the checkpoint the park published contains the run's latest committed work, false
+	// when it does not (the recovery pin or the fetch-back failed, so the only copy of the latest
+	// work is still on the worker, which keeps it under its custody hold). Absent (nil) is "not
+	// reported". It is honoured on an APPLIED limit_wait / recovery_wait / paused transition,
+	// every cause included, and stored in runs.checkpoint_contains_latest by
+	// recordCheckpointDurability; it is ignored on every other report. DISPLAY-ONLY: custody and
+	// every other decision ignore it. httpx.DecodeJSON rejects unknown fields, so a worker sends
+	// it only once the api advertises the run_checkpoint_durability feature.
+	CheckpointContainsLatest *bool `json:"checkpoint_contains_latest"`
 }
 
 // ProposalPayload is the structured idea a scheduled issues-mode prompt run emits on
@@ -3352,12 +3503,16 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// legacy untyped park). Only forge_unreachable triggers the dedicated park transaction
 	// below; empty_turn/provider_outage are accepted here (reserved, D9) but take the ordinary
 	// untyped park, which writes cause NULL. vault_locked (issue #1766 M2) takes the same
-	// ordinary park, which persists that one cause.
+	// ordinary park, which persists that one cause. data_volume_full (PRD #1809 M5) takes its
+	// own counted park transaction; disk_park_preventive is valid only alongside it.
 	if req.RecoveryCause != nil && serverRecoveryWaitCauses[*req.RecoveryCause] {
 		return store.Run{}, false, fmt.Errorf("%w: recovery_cause %q is server-only", ErrInvalidState, *req.RecoveryCause)
 	}
 	if req.RecoveryCause != nil && !recoveryWaitCauses[*req.RecoveryCause] {
 		return store.Run{}, false, fmt.Errorf("%w: unknown recovery_cause %q", ErrInvalidState, *req.RecoveryCause)
+	}
+	if err := validateDiskParkPreventive(req); err != nil {
+		return store.Run{}, false, err
 	}
 	owned, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
@@ -3948,6 +4103,20 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			}
 			break
 		}
+		// PRD #1809 M5 (D6): the DATA-VOLUME-FULL park is its own locked transaction too — the
+		// forge park's claim-generation fencing, a disk-only lifetime counter (bumped unless the
+		// park is preventive) and a cap past which the run fails with fail_origin
+		// 'data_volume_full'. It settles no custody hold (the park keeps custody) and, like the
+		// forge park, falls through to the shared post-switch fan-out. A stale claim returns
+		// early carrying the locked run for the handler's generic stale_claim 409.
+		if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseDataVolumeFull {
+			var drun store.Run
+			drun, rows, err = s.parkDataVolumeFull(ctx, wkr, owned, req, sessionID)
+			if err != nil {
+				return drun, false, err
+			}
+			break
+		}
 		// Transient-recovery park (issue #1197): a positively-empty SDK turn survived the
 		// worker's bounded in-process retries, so the run parks on a server-owned capped
 		// backoff and the sweeper auto-promotes it. This is the reusable transient-recovery
@@ -4112,6 +4281,11 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		}); mrErr != nil {
 			slog.Warn("reconcile run mr", "run", runID, "error", mrErr)
 		}
+	}
+	// PRD #1809 M6 (D8): an applied park records its checkpoint-durability report before the
+	// re-read, so the returned run carries it.
+	if rows > 0 {
+		s.recordCheckpointDurability(ctx, wkr, owned, req)
 	}
 	// Re-read so the worker sees the authoritative status. Ownership already
 	// held above, so 0 rows means the transition was not applied under either branch

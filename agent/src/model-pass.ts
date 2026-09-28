@@ -101,6 +101,20 @@ export interface ReadOnlyModelPassOpts {
  *  so no grace is waited). */
 const DEFAULT_ABORT_GRACE_MS = 500;
 
+/**
+ * PRD #1809 D7: the ephemeral HOMEs of the model passes live in THIS process, by absolute
+ * path. A dir is added right after its `mkdtemp` and removed only after its cleanup has been
+ * attempted, so while a pass can still touch its HOME the dir is in here. The disk reclaim
+ * never removes a dir listed here, whatever its age; see disk-reclaim.ts for how it treats a
+ * dir this process does not list (one a previous worker process left behind).
+ */
+const liveModelPassHomes = new Set<string>();
+
+/** PRD #1809 D7: whether a model pass in this process still owns `dir` (an absolute path). */
+export function isLiveModelPassHome(dir: string): boolean {
+  return liveModelPassHomes.has(dir);
+}
+
 /** Wait for the (possibly aborted) SDK query to settle before its HOME is removed, so the
  *  ephemeral HOME is not rm'd while the aborted CLI is still exiting and may still touch
  *  $HOME (the SDK's abort handler terminates the CLI asynchronously). Bounded by graceMs
@@ -144,6 +158,9 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
     throw new Error(`${opts.label} model pass requires a token or a codex claim`);
   }
   const homeDir = await fs.mkdtemp(path.join(opts.homeRoot, opts.homePrefix));
+  // PRD #1809 D7: unregistered after the cleanup attempt in the finally below (or on the
+  // chmod failure just after this).
+  liveModelPassHomes.add(homeDir);
   // PRD #51 M4: the advice SDK CLI runs as the `runner` uid (spawnClaudeCodeProcess ->
   // runnerSpawn), but fs.mkdtemp FORCES mode 0700 (Node ignores umask) and this runner
   // runs in the WORKER process, so the HOME is worker-owned 0700 — the runner gets ZERO
@@ -153,7 +170,14 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
   // does NOT let the worker rm it: the CLI writes runner-owned private (0700) dirs
   // inside, which only a `runner`-uid helper can remove (rmHomeTree, #1607). The unit-test / single-uid (#58)
   // path leaves 0700 (the pass runs as the worker — same uid, 0700 is correct + tighter).
-  if (uidSplitActive()) await fs.chmod(homeDir, 0o2770);
+  try {
+    if (uidSplitActive()) await fs.chmod(homeDir, 0o2770);
+  } catch (err) {
+    // Not reached in practice (the worker just created this dir). Unregister so the reclaim
+    // can collect the dir once it is old enough, then fail the pass exactly as before.
+    liveModelPassHomes.delete(homeDir);
+    throw err;
+  }
   // Wall-clock cap: abort the SDK query (native cancellation) AND hard-reject the race,
   // so a hung/retrying model call can never wedge the run — the pass settles within
   // timeoutMs and the caller falls back.
@@ -207,13 +231,17 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
     // aborted CLI while it is still exiting and may still touch $HOME. On the success path
     // the query has already settled, so this returns without waiting.
     await awaitQuerySettled(runPromise, opts.graceMs ?? DEFAULT_ABORT_GRACE_MS);
-    // Best-effort HOME cleanup. The M6 reclaim sweep will NEVER collect this directory:
-    // it is named `uzi-<label>-*`, not a run UUID, so the sweep's RUN_ID_RE filter skips
-    // it BY DESIGN — this warn is the only thing anywhere that will say a dir stranded.
-    // Still best-effort: a cleanup must never fail a run.
+    // Best-effort HOME cleanup. The startup sweep (PRD #108 M6) never collects this
+    // directory: it is named `uzi-<label>-*`, not a run UUID. The running disk reclaim
+    // (PRD #1809 D7, disk-reclaim.ts) collects a stranded one once no pass in this process
+    // owns it and it is older than any pass lives. Still best-effort: a cleanup must never
+    // fail a run.
     await rmHomeTree(homeDir).catch((e) =>
       opts.log.warn(`${opts.label} HOME cleanup failed`, { home_dir: homeDir, error: errMessage(e) }),
     );
+    // PRD #1809 D7: the pass is over; a dir its cleanup could not remove is now the disk
+    // reclaim's to collect.
+    liveModelPassHomes.delete(homeDir);
   }
 }
 

@@ -8,7 +8,7 @@ import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { EmittedMessage, RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import { CredentialSwitchSignal } from "../src/steering.js";
-import { nullLogger } from "./helpers.js";
+import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 
 // PRD #1247 M5b — the SdkExecutor half of a held-state credential switch, driven directly (the
 // pause-honor.test.ts harness shape): a switch that lands MID-TURN must abort the in-flight SDK
@@ -23,10 +23,7 @@ const OAUTH = "dummy-oauth-token-do-not-scan-0000";
 const FAKE_PAT = "dummy-forge-pat-do-not-scan-1111";
 const FAKE_JOIN_TOKEN = "dummy-join-token-do-not-scan-2222";
 
-let seq = 0;
-function nonexistentWorktree(): string {
-  return path.join(os.tmpdir(), `uzi-switch-sdk-wt-${process.pid}-${seq++}`);
-}
+const nonexistentWorktree = nonexistentWorktreeFactory("uzi-switch-sdk");
 
 function submitPlan(plan: string, sessionId = "sess-1"): SDKMessage {
   return {

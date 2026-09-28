@@ -486,6 +486,14 @@ type Config struct {
 	// fail_origin='gate_presentation_refused'. 0 = unlimited (never fail on the count); the
 	// default (3) lives in Load.
 	RunGateRefusalMax int
+	// Data-volume-full park cap (PRD #1809 M5, D6). A worker whose write to its data volume
+	// failed disk-full (after its reclaim and one retry) parks the run in 'recovery_wait' with
+	// recovery_wait_cause='data_volume_full'; disk_park_count is its DISK-ONLY lifetime counter
+	// (distinct from recovery_wait_count and forge_park_count), and this is the cap the
+	// park-or-fail decision consults inside SetState. Past the cap the run fails with
+	// fail_origin='data_volume_full'. A PREVENTIVE park (the worker stopped the run before the
+	// volume filled) is neither counted nor capped. 0 = unlimited; the default (3) lives in Load.
+	RunDiskParkMax int
 
 	// CI status integration (PRD #6). The pipeline sync rides the existing poller
 	// tick (no new interval). CIWatchRunWindow bounds how long a finished run's
@@ -1073,6 +1081,11 @@ func Load() (Config, error) {
 	// RUN_GATE_REFUSAL_MAX=0 is legal and means "unlimited", the same off switch as
 	// RUN_FORGE_UNREACHABLE_MAX_PARKS. Default 3 refused claims.
 	cfg.RunGateRefusalMax = parseNonNegInt("RUN_GATE_REFUSAL_MAX", 3)
+
+	// Data-volume-full park cap (PRD #1809 M5, D6). parseNonNegInt, the forge cap's parser:
+	// UZI_RUN_DISK_PARK_MAX=0 is legal and means "unlimited" (never fail on the count), and an
+	// invalid or negative value falls back to the default of 3 counted disk parks.
+	cfg.RunDiskParkMax = parseNonNegInt("UZI_RUN_DISK_PARK_MAX", 3)
 
 	cfg.SkillMaxBytes = parseInt("SKILL_MAX_BYTES", 65536)
 	cfg.SkillsMaxPerRun = parseInt("SKILLS_MAX_PER_RUN", 32)

@@ -236,7 +236,8 @@ func displayHealth(health string) string {
 // it lives on the run-get notice and the web panel. PRD #1590: "codex_account_unavailable"
 // reads "codex wait" here, its action living on the board second line and the detail park line;
 // a relogin_required hold is re-tokened "⚿ codex login" by palette.runStateToken. Issue
-// #1766: "vault_locked" reads "vault wait" (the run is waiting for vault unlock).
+// #1766: "vault_locked" reads "vault wait" (the run is waiting for vault unlock). PRD #1809:
+// "data_volume_full" reads "disk wait" (the worker's data volume is full or nearly full).
 //
 // LANDING (issue #1418): landingState is the run's server-derived LandingState. A `failed` run
 // whose value is "needs_landing" reads the word "needs landing" instead of "failed" — its
@@ -298,6 +299,11 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 		// work. Same wait-family glyph; the word says what it waits on.
 		if len(cause) > 0 && cause[0] == vaultLockedCause {
 			return "~", "vault wait"
+		}
+		// PRD #1809 M5: a run parked because its worker's data volume is full or nearly full. Same
+		// wait-family glyph; the retry and park count live on the second line / detail line.
+		if len(cause) > 0 && cause[0] == dataVolumeFullCause {
+			return "~", "disk wait"
 		}
 		return "~", "recovery wait"
 	case statusPaused:

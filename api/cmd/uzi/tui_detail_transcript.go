@@ -407,9 +407,10 @@ func (m tuiModel) transcriptViewport() int {
 	}
 	chrome := len(m.detailHeaderLines()) // the priority header: always 1 row (detailHeaderLines)
 	if limitWaitLine(m.detail.run, time.Now()) != "" || nearTimeoutLine(m.detail.run, time.Now()) != "" ||
-		codexAccountActionLine(m.detail.run) != "" || vaultParkLine(m.detail.run) != "" {
+		codexAccountActionLine(m.detail.run) != "" || vaultParkLine(m.detail.run) != "" ||
+		diskParkLine(m.detail.run) != "" {
 		chrome++ // the park / limit-wait line, the Codex account hold line (PRD #1590), the
-		// vault park line (issue #1766), or the near-timeout row (PRD #1170) — mutually
+		// vault park line (issue #1766), the disk park line (PRD #1809), or the near-timeout row (PRD #1170) — mutually
 		// exclusive (a limit_wait or recovery_wait run is not running, so it has no deadline_at,
 		// limit_wait and recovery_wait are distinct statuses, and the Codex hold and the vault
 		// park are distinct recovery_wait causes),

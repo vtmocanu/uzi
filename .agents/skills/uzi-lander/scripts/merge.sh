@@ -29,13 +29,20 @@
 #   0  merged — prints MERGE_SHA=<sha>; next: watch-run-ci.sh --sha <sha>
 #   1  a required check is failing on the head — not merged
 #   2  usage, or required checks still pending, not yet all reported, unreadable, none
-#      reported, none passed, or gh failed without a failing/pending check explaining it —
+#      reported, none passed, or gh failed without a failing/pending check explaining it, or
+#      the threads / code-scanning alerts / comments / ack store behind exit 5 unreadable —
 #      not merged
 #   3  gh error, or the merge command was refused (classifier block, ruleset, conflict):
 #      the exact command is printed for the user to run via a `!` line. Also the PR
 #      conflicting with its base (mergeable=CONFLICTING), checked before the required
 #      checks because GitHub runs no pull_request CI on a conflicting PR: run land-prep.sh
 #   4  an mr_rework run is active on this MR — defer
+#   5  every-author blockers live (lib/pr-comments.sh): ANY unresolved, non-outdated review
+#      thread (CodeRabbit, Greptile, CodeQL, a human, any other author), an open
+#      code-scanning alert on the head, or an unacknowledged comment / review body (listed
+#      as sanitized UNTRUSTED rows). Resolve, fix or dismiss, ack-comments.sh
+#      (--show ID, then ID@DIGEST); re-run.
+#      A lookup behind this check that cannot be read refuses with exit 2 instead.
 #   7  the merge lock is held by another live session (owner printed) — wait, re-run
 #   8  head mismatch vs --expect-head
 #   9  the merge command returned but the PR is not MERGED (auto-merge deferred / async
@@ -47,6 +54,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/state.sh"
 # shellcheck source=lib/required-checks.sh
 . "$HERE/lib/required-checks.sh"
+# shellcheck source=lib/review-threads.sh
+. "$HERE/lib/review-threads.sh"
+# shellcheck source=lib/pr-comments.sh
+. "$HERE/lib/pr-comments.sh"
 
 REPO=""; PR=""; EXPECT=""; METHOD="squash"; ADMIN=1; DELETE=1; REWORK_CHECK=1; CONFIRM_ONLY=0
 while [ $# -gt 0 ]; do
@@ -170,6 +181,32 @@ miss=$(missing_required "$req" "$cj") || { echo "cannot compare the required che
 [ "$cj_rc" -ne 0 ] && { echo "gh pr checks exited $cj_rc with no failing or pending check on ${head:0:8} (partial read?); not merging"; exit 2; }
 ok=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pass")]|length')
 [ "$ok" -gt 0 ] || { echo "no required check passed on ${head:0:8} (only: $(printf '%s' "$cj" | jq -r '[.[].bucket]|unique|join(",")')); not merging"; exit 2; }
+
+# ---- every-author blockers, last moment — FAIL CLOSED ---------------------------------------
+# Whatever the review bots said: any unresolved thread from anyone (bots included), an open
+# code-scanning alert on the head, or a comment / review body nobody acknowledged refuses
+# (exit 5). A lookup that cannot be read refuses too (exit 2). Rows are sanitized UNTRUSTED data.
+tn=$(fetch_review_threads "$REPO" "$PR") || { echo "cannot read the review threads of #$PR; not merging"; exit 2; }
+if ! ot=$(open_threads_json "$tn") || [ -z "$ot" ]; then echo "cannot classify the review threads of #$PR; not merging"; exit 2; fi
+code_scanning_open "$REPO" "$PR"
+case "$CS_STATE" in
+  ok) cs_items="$CS_ITEMS" ;;
+  unavailable) cs_items='[]'; echo "note: code_scanning=unavailable (${CS_NOTE}); counted as none" ;;
+  *) echo "cannot read the code-scanning alerts of #$PR (${CS_NOTE}); not merging"; exit 2 ;;
+esac
+issue_all=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -sce 'if length > 0 and all(.[]; type == "array") then add else error("x") end' 2>/dev/null) \
+  || { echo "cannot read the comments of #$PR; not merging"; exit 2; }
+reviews_all=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" 2>/dev/null | jq -sce 'if length > 0 and all(.[]; type == "array") then add else error("x") end' 2>/dev/null) \
+  || { echo "cannot read the reviews of #$PR; not merging"; exit 2; }
+ua=""
+if ma=$(must_ack_json "$issue_all" "$reviews_all") && acks=$(ack_read "$REPO" "$PR"); then ua=$(unacked_json "$ma" "$acks") || ua=""; fi
+[ -n "$ua" ] || { echo "cannot read the comment acknowledgements of #$PR; not merging"; exit 2; }
+blk=$(jq -nc --argjson a "$ot" --argjson b "$cs_items" --argjson c "$ua" '$a + $b + $c')
+if [ "$(printf '%s' "$blk" | jq 'length')" -gt 0 ]; then
+  print_items "$blk"
+  echo "BLOCKED: open_threads=$(printf '%s' "$ot" | jq length) code_scanning=$(printf '%s' "$cs_items" | jq length) unacknowledged=$(printf '%s' "$ua" | jq length) on #$PR — resolve each thread, fix or dismiss each alert, read each comment in full (ack-comments.sh $REPO $PR --show ID) and ack that version (ID@DIGEST); not merging"
+  exit 5
+fi
 
 # ---- merge lock (repo-wide, 10-min TTL) ----------------------------------------------------
 SD=$(state_dir) || SD=""

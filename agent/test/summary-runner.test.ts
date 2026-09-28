@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import os from "node:os";
@@ -46,8 +46,15 @@ const planInput: PlanSummaryInput = {
 
 // A tiny runner: stub queryFn, a 20ms cap so the timeout path is fast, and a dedicated
 // homeRoot so a test can assert the ephemeral HOME was cleaned up.
+// Each homeRoot is queued for removal when the file ends (PRD #1809 M2).
+const homeRoots: string[] = [];
+after(async () => {
+  for (const r of homeRoots.splice(0)) await fs.rm(r, { recursive: true, force: true });
+});
+
 async function makeRunner(queryFn: SdkQueryFn, modelTimeoutMs = 20) {
   const homeRoot = await fs.mkdtemp(path.join(os.tmpdir(), "summary-test-"));
+  homeRoots.push(homeRoot);
   const runner = new SummaryRunner(nullLogger(), { queryFn, homeRoot, modelTimeoutMs });
   return { runner, homeRoot };
 }

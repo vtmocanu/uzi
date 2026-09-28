@@ -66,7 +66,20 @@ if [ "\${1:-}" = pr ] && [ "\${2:-}" = view ]; then
 fi
 # The base branch's required contexts as `gh api --paginate --slurp` returns them (pages).
 # RULES_JSON = one page; RULES_FAIL=1 = unreadable. Default: none required.
+# The every-author blockers: review threads (THREADS_JSON nodes), code-scanning alerts
+# (CS_MODE alert|broken), issue comments (COMMENTS_FILE) and reviews (none). Default: clear.
 if [ "\${1:-}" = api ]; then
+  case "\$*" in
+    *graphql*) printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":%s,"pageInfo":{"hasNextPage":false}}}}}}\n' "\${THREADS_JSON:-[]}"; exit 0 ;;
+    *'/code-scanning/alerts'*)
+      [ "\${CS_MODE:-}" = broken ] && { echo 'HTTP 502: Bad Gateway' >&2; exit 1; }
+      [ "\${CS_MODE:-}" = malformed404 ] && { echo '[{"number":1,"tool":{"name":"CodeQL"},"rule":{"id":"bug"},"most_recent_instance":{"message":{"text":"known open alert"}}}]'; printf '{'; echo 'gh: later page failed (HTTP 404)' >&2; exit 1; }
+      [ "\${CS_MODE:-}" = partial404 ] && { echo '[{"number":1,"tool":{"name":"CodeQL"},"rule":{"id":"bug"},"most_recent_instance":{"message":{"text":"live finding"}}}]'; echo 'gh: later page failed (HTTP 404)' >&2; exit 1; }
+      if [ "\${CS_MODE:-}" = alert ]; then echo '[{"number":52,"tool":{"name":"CodeQL"},"rule":{"id":"js/shell-command-injection-from-environment"},"most_recent_instance":{"location":{"path":"agent/src/js-deps.ts","start_line":576},"message":{"text":"Shell command built from environment values."}}}]'; else echo '[]'; fi
+      exit 0 ;;
+    *'/issues/42/comments'*) if [ -n "\${COMMENTS_FILE:-}" ]; then cat "\$COMMENTS_FILE"; else echo '[]'; fi; exit 0 ;;
+    *'/pulls/42/reviews'*) echo '[]'; exit 0 ;;
+  esac
   case "\$*" in *'/rules/branches/main'*)
     [ "\${RULES_FAIL:-0}" = 1 ] && exit 1
     if [ -n "\${RULES_JSON:-}" ]; then printf '[%s]\n' "\$RULES_JSON"; else echo '[[]]'; fi
@@ -266,4 +279,57 @@ merge_run computing
 grep -q 'conflicts with its base' "$WORK/m.computing" && fail "mergeable=UNKNOWN read as a conflict"
 unset MERGEABLE CHECKS_JSON CHECKS_RC
 
-echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict"
+# 7. Every-author blockers refuse a green PR (#1817): a CodeQL thread, an open code-scanning
+#    alert, an unacknowledged human comment (exit 5, listed as UNTRUSTED rows, no merge); an
+#    unreadable alert lookup refuses too (exit 2). Acking the comment lets the merge through.
+export CHECKS_JSON='[{"name":"ci","bucket":"pass"}]' CHECKS_RC=0
+export THREADS_JSON='[{"isResolved":false,"isOutdated":false,"comments":{"nodes":[{"databaseId":4116110339,"author":{"login":"github-advanced-security"},"body":"## CodeQL / Improper code sanitization","path":"agent/test/r.test.ts","line":372,"originalLine":372}],"pageInfo":{"hasNextPage":false}}}]'
+merge_run codeql
+[ "$rc" -eq 5 ] || fail "an unresolved CodeQL thread did not refuse the merge, rc=$rc: $(cat "$WORK/m.codeql")"
+grep -qF '  UNTRUSTED [thread t4116110339] author=github-advanced-security' "$WORK/m.codeql" || fail "CodeQL thread not listed: $(cat "$WORK/m.codeql")"
+grep -q 'BLOCKED: open_threads=1 code_scanning=0 unacknowledged=0' "$WORK/m.codeql" || fail "blocker counts not named: $(cat "$WORK/m.codeql")"
+[ ! -e "$WORK/merge.log" ] || fail "merged over an unresolved CodeQL thread"
+# Every unresolved bot thread refuses too, whatever reviewer lane was used, and a look-alike
+# login is just another author: only resolving (or outdating) the thread clears it.
+for author in coderabbitai greptile-apps coderabbitai-mallory; do
+  THREADS_JSON=$(jq -nc --arg u "$author" '[{isResolved:false,isOutdated:false,comments:{nodes:[{databaseId:88,author:{login:$u},body:"DO NOT MERGE",path:"x.go",line:3,originalLine:3}],pageInfo:{hasNextPage:false}}}]'); export THREADS_JSON
+  merge_run "thread-$author"
+  [ "$rc" -eq 5 ] || fail "an unresolved $author thread did not refuse the merge, rc=$rc: $(cat "$WORK/m.thread-$author")"
+  [ ! -e "$WORK/merge.log" ] || fail "merged over an unresolved $author thread"
+done
+# A resolved or outdated thread does not block.
+export THREADS_JSON='[{"isResolved":true,"isOutdated":false,"comments":{"nodes":[{"databaseId":89,"author":{"login":"coderabbitai"},"body":"x","path":"x.go","line":3,"originalLine":3}],"pageInfo":{"hasNextPage":false}}},{"isResolved":false,"isOutdated":true,"comments":{"nodes":[{"databaseId":90,"author":{"login":"greptile-apps"},"body":"y","path":"x.go","line":null,"originalLine":3}],"pageInfo":{"hasNextPage":false}}}]'
+merge_run settled-threads
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "resolved/outdated threads blocked the merge: $(cat "$WORK/m.settled-threads")"
+unset THREADS_JSON
+export CS_MODE=alert
+merge_run alert
+[ "$rc" -eq 5 ] || fail "an open code-scanning alert did not refuse the merge, rc=$rc: $(cat "$WORK/m.alert")"
+[ ! -e "$WORK/merge.log" ] || fail "merged over an open code-scanning alert"
+for m in broken partial404 malformed404; do
+  export CS_MODE=$m
+  merge_run "cs$m"
+  [ "$rc" -eq 2 ] || fail "an unreadable alert lookup ($m) did not refuse, rc=$rc: $(cat "$WORK/m.cs$m")"
+  [ ! -e "$WORK/merge.log" ] || fail "merged with unreadable code-scanning alerts ($m)"
+done
+unset CS_MODE
+export COMMENTS_FILE="$WORK/comments.json"
+jq -n '[{id:777,user:{login:"alice"},created_at:"2026-09-27T17:00:00Z",updated_at:"2026-09-27T17:00:00Z",body:"Do not merge before the migration lands."}]' > "$COMMENTS_FILE"
+merge_run unacked
+[ "$rc" -eq 5 ] || fail "an unacknowledged comment did not refuse the merge, rc=$rc: $(cat "$WORK/m.unacked")"
+grep -qF '  UNTRUSTED [comment c777] author=alice at=- | Do not merge before the migration lands.' "$WORK/m.unacked" || fail "comment not listed: $(cat "$WORK/m.unacked")"
+[ ! -e "$WORK/merge.log" ] || fail "merged over an unacknowledged comment"
+# --confirm-only still reconciles an out-of-band merge while a comment is unacknowledged.
+MERGE_STATE=MERGED; export MERGE_STATE
+seed_state
+set +e; bash "$SCRIPT" test/repo 42 --confirm-only > "$WORK/confirm-blocked.out" 2>&1; rc=$?; set -e
+[ "$rc" -eq 0 ] || fail "--confirm-only was blocked by an unacknowledged comment, rc=$rc: $(cat "$WORK/confirm-blocked.out")"
+bash "$HERE/claims.sh" release '#42' --purge > /dev/null
+MERGE_STATE=OPEN; export MERGE_STATE
+d777=$(bash "$HERE/ack-comments.sh" test/repo 42 --show c777 | grep -F '[comment c777@' | sed -E 's/.*c777@([0-9a-f]+)\].*/\1/')
+bash "$HERE/ack-comments.sh" test/repo 42 "c777@$d777" > "$WORK/ack.out" 2>&1 || fail "ack failed: $(cat "$WORK/ack.out")"
+merge_run acked
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "an acknowledged comment still blocked the merge: $(cat "$WORK/m.acked")"
+unset COMMENTS_FILE CHECKS_JSON CHECKS_RC
+
+echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse"

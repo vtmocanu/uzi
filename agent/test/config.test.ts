@@ -175,6 +175,107 @@ describe("loadConfig UZI_HOME_RECLAIM (PRD #108 M6)", () => {
   });
 });
 
+// PRD #1809 D5/D7: the running disk reclaim + admission stop knobs.
+describe("loadConfig disk reclaim knobs (PRD #1809 D5/D7)", () => {
+  it("defaults: on, every 10m, soft margin 0.10, hard margin 0.03", () => {
+    const c = loadConfig(baseEnv());
+    assert.strictEqual(c.diskReclaimEnabled, true);
+    assert.strictEqual(c.diskReclaimIntervalMs, 10 * 60_000);
+    assert.strictEqual(c.diskSoftMargin, 0.1);
+    assert.strictEqual(c.diskHardMargin, 0.03);
+  });
+
+  it("UZI_DISK_RECLAIM is default-on: empty stays on, an explicit falsy value turns it off", () => {
+    assert.strictEqual(loadConfig(baseEnv({ UZI_DISK_RECLAIM: "" })).diskReclaimEnabled, true);
+    for (const v of ["0", "false", "no", "off"]) {
+      assert.strictEqual(loadConfig(baseEnv({ UZI_DISK_RECLAIM: v })).diskReclaimEnabled, false, `value ${v}`);
+    }
+  });
+
+  it("UZI_DISK_ADMISSION is default-on and independent of UZI_DISK_RECLAIM", () => {
+    const d = loadConfig(baseEnv());
+    assert.strictEqual(d.diskAdmissionEnabled, true);
+    assert.strictEqual(d.diskAdmissionMaxWaitMs, 15 * 60_000, "the bounded wait defaults to 15m");
+    assert.strictEqual(loadConfig(baseEnv({ UZI_DISK_ADMISSION: "" })).diskAdmissionEnabled, true);
+    for (const v of ["0", "false", "no", "off"]) {
+      const c = loadConfig(baseEnv({ UZI_DISK_ADMISSION: v }));
+      assert.strictEqual(c.diskAdmissionEnabled, false, `value ${v}`);
+      assert.strictEqual(c.diskReclaimEnabled, true, `value ${v}: the reclaim stays on`);
+    }
+    const off = loadConfig(baseEnv({ UZI_DISK_RECLAIM: "0" }));
+    assert.strictEqual(off.diskAdmissionEnabled, true, "UZI_DISK_RECLAIM=0 leaves the admission stop on");
+    assert.strictEqual(loadConfig(baseEnv({ UZI_DISK_ADMISSION_MAX_WAIT: "30m" })).diskAdmissionMaxWaitMs, 30 * 60_000);
+  });
+
+  it("carries the model-pass timeouts: judge and review 5m, summary from SUMMARY_MODEL_TIMEOUT_MS", () => {
+    const d = loadConfig(baseEnv());
+    assert.strictEqual(d.judgeModelTimeoutMs, 5 * 60_000);
+    assert.strictEqual(d.reviewModelTimeoutMs, 5 * 60_000);
+    assert.strictEqual(d.summaryModelTimeoutMs, 60_000);
+    assert.strictEqual(loadConfig(baseEnv({ SUMMARY_MODEL_TIMEOUT_MS: "7200000.9" })).summaryModelTimeoutMs, 7_200_000);
+    // "0.5" and "1e-3" are positive but floor to 0: a 0 ms timeout would fire instantly.
+    for (const v of ["abc", "0", "-5", "0.5", "1e-3", "Infinity"]) {
+      assert.strictEqual(loadConfig(baseEnv({ SUMMARY_MODEL_TIMEOUT_MS: v })).summaryModelTimeoutMs, 60_000, `value ${v}`);
+    }
+  });
+
+  it("UZI_RUN_DISK_SAMPLE_INTERVAL (PRD #1809 D8) defaults to 10m, parses as a duration, and 0 turns it off", () => {
+    assert.strictEqual(loadConfig(baseEnv()).runDiskSampleIntervalMs, 10 * 60_000);
+    assert.strictEqual(loadConfig(baseEnv({ UZI_RUN_DISK_SAMPLE_INTERVAL: "" })).runDiskSampleIntervalMs, 10 * 60_000);
+    assert.strictEqual(loadConfig(baseEnv({ UZI_RUN_DISK_SAMPLE_INTERVAL: "90s" })).runDiskSampleIntervalMs, 90_000);
+    assert.strictEqual(loadConfig(baseEnv({ UZI_RUN_DISK_SAMPLE_INTERVAL: "0" })).runDiskSampleIntervalMs, 0);
+  });
+
+  it("parses the interval as a duration and the margins as fractions in [0, 1)", () => {
+    const c = loadConfig(baseEnv({ UZI_DISK_RECLAIM_INTERVAL: "90s", UZI_DISK_SOFT_MARGIN: "0.2", UZI_DISK_HARD_MARGIN: "0" }));
+    assert.strictEqual(c.diskReclaimIntervalMs, 90_000);
+    assert.strictEqual(c.diskSoftMargin, 0.2);
+    assert.strictEqual(c.diskHardMargin, 0);
+  });
+
+  it("falls back to the default margin on garbage or out-of-range values", () => {
+    for (const v of ["abc", "-0.1", "1", "1.5", "NaN", "Infinity"]) {
+      assert.strictEqual(loadConfig(baseEnv({ UZI_DISK_SOFT_MARGIN: v })).diskSoftMargin, 0.1, `value ${v}`);
+      assert.strictEqual(loadConfig(baseEnv({ UZI_DISK_HARD_MARGIN: v })).diskHardMargin, 0.03, `value ${v}`);
+    }
+  });
+});
+
+// PRD #1809 D4: the in-run cache cap and the mid-turn pressure stop.
+describe("loadConfig cache cap and pressure stop knobs (PRD #1809 D4)", () => {
+  it("defaults: both layers on, cap fraction 0.5, low-water 0.6", () => {
+    const c = loadConfig(baseEnv());
+    assert.strictEqual(c.runCacheCapEnabled, true);
+    assert.strictEqual(c.diskHardStopEnabled, true);
+    assert.strictEqual(c.runCacheCapFraction, 0.5);
+    assert.strictEqual(c.runCacheLowWater, 0.6);
+  });
+
+  it("each layer can be disabled on its own", () => {
+    for (const v of ["0", "false", "no", "off"]) {
+      const cap = loadConfig(baseEnv({ UZI_RUN_CACHE_CAP_ENABLED: v }));
+      assert.strictEqual(cap.runCacheCapEnabled, false, `value ${v}`);
+      assert.strictEqual(cap.diskHardStopEnabled, true, `value ${v}: the hard layer stays on`);
+      const hard = loadConfig(baseEnv({ UZI_DISK_HARD_STOP_ENABLED: v }));
+      assert.strictEqual(hard.diskHardStopEnabled, false, `value ${v}`);
+      assert.strictEqual(hard.runCacheCapEnabled, true, `value ${v}: the soft layer stays on`);
+    }
+    assert.strictEqual(loadConfig(baseEnv({ UZI_RUN_CACHE_CAP_ENABLED: "" })).runCacheCapEnabled, true);
+  });
+
+  it("the cap fraction is in (0, 1], the low-water mark strictly in (0, 1)", () => {
+    const c = loadConfig(baseEnv({ UZI_RUN_CACHE_CAP_FRACTION: "1", UZI_RUN_CACHE_LOW_WATER: "0.75" }));
+    assert.strictEqual(c.runCacheCapFraction, 1);
+    assert.strictEqual(c.runCacheLowWater, 0.75);
+    for (const v of ["abc", "0", "-0.2", "1.5", "NaN", "Infinity"]) {
+      assert.strictEqual(loadConfig(baseEnv({ UZI_RUN_CACHE_CAP_FRACTION: v })).runCacheCapFraction, 0.5, `value ${v}`);
+    }
+    for (const v of ["abc", "0", "1", "-0.5", "2", "NaN"]) {
+      assert.strictEqual(loadConfig(baseEnv({ UZI_RUN_CACHE_LOW_WATER: v })).runCacheLowWater, 0.6, `value ${v}`);
+    }
+  });
+});
+
 // PRD #1391 M1: the outbox knobs. These pin the VALUES (not just "parses to a
 // number"), so a wrong multiplier — a retention window that is hours not days, or a
 // MiB that is really 1000*1000 — fails here rather than shipping silently.

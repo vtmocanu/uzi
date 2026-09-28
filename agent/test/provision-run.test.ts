@@ -4,11 +4,12 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { provisionRunTools, REASON_PROVISION_FAILED, type ProvisionRunDeps } from "../src/provision-run.js";
+import { provisionRunTools, REASON_PROVISION_FAILED, removeProvisionDir, type ProvisionRunDeps } from "../src/provision-run.js";
+import { restoreTreeWritability } from "../src/rmtree.js";
 import type { EmittedMessage, RunContext } from "../src/executor.js";
 import type { ClaimConfig } from "../src/protocol.js";
 import type { ProvisionInput, ProvisionResult } from "../src/provision.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
 
 let worktree: string;
 let provisionRoot: string;
@@ -181,6 +182,52 @@ describe("provisionRunTools tier-2 best-effort fallback (PRD #278 M2)", () => {
     assert.ok(
       h.statusTexts().some((t) => t.includes("blocked by policy") && t.includes("glab@1.2")),
       "a blocked-by-policy status naming the dropped tool was emitted",
+    );
+  });
+});
+
+/** A provision dir as a finished install leaves it under the uid split: a read-only (0555)
+ *  subtree holding a file, which a plain `fs.rm` as the worker cannot unlink. */
+async function readOnlyInstall(runDir: string): Promise<void> {
+  const ro = path.join(runDir, ".devbox", "nix", "profile");
+  await fs.mkdir(ro, { recursive: true });
+  await fs.writeFile(path.join(ro, "manifest.json"), "{}", "utf8");
+  await fs.chmod(ro, 0o555);
+}
+
+async function exists(p: string): Promise<boolean> {
+  return fs.lstat(p).then(() => true, () => false);
+}
+
+describe("provision dir cleanup is uid-aware (PRD #1809 M3)", () => {
+  it("removes a failed install's provision dir even with a read-only (0555) subtree", async (t) => {
+    if (process.getuid?.() === 0) {
+      t.skip("running as uid 0 — the 0555 part of this fixture is inert for root");
+      return;
+    }
+    // A failed run must not leave a read-only provision tree behind; if it does, restore write
+    // access so the suite's own cleanup can still remove it (and report the leak as the failure).
+    t.after(() => restoreTreeWritability(provisionRoot));
+    const h = makeCtx({ tool_packages: ["go@1.24"] });
+    const provision = (async (input: ProvisionInput): Promise<ProvisionResult> => {
+      await readOnlyInstall(input.runDir);
+      throw new Error("devbox install failed");
+    }) as unknown as ProvisionRunDeps["provision"];
+
+    await assert.rejects(provisionRunTools(h.ctx, makeDeps(provision)), (err: Error) =>
+      err.message.startsWith(REASON_PROVISION_FAILED),
+    );
+
+    assert.equal(await exists(path.join(provisionRoot, h.ctx.runId)), false, "the provision dir is removed");
+  });
+
+  it("removeProvisionDir never throws and logs a dir it cannot remove", async () => {
+    const { logger, lines } = recordingLogger();
+    // rmHomeTree refuses a relative path outright: the failure is logged, not thrown.
+    await removeProvisionDir("relative/provision/dir", logger);
+    assert.ok(
+      lines.some((l) => JSON.stringify(l).includes("provision dir cleanup failed")),
+      "the failed cleanup is logged",
     );
   });
 });

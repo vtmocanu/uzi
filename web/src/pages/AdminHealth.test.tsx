@@ -108,8 +108,8 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
     expect(container.querySelector('[role="alert"], [role="status"]')).toBeNull();
     expect(screen.queryByRole("heading", { name: /blocking|warning/ })).toBeNull();
     expect(attentionIds(container)).toEqual([]);
-    // Every check's shape carries its word; all 14 read OK, none Warn/Danger.
-    expect(screen.getAllByText("OK").length).toBe(14);
+    // Every check's shape carries its word; all 15 read OK, none Warn/Danger.
+    expect(screen.getAllByText("OK").length).toBe(15);
     expect(screen.queryByText(/^(Warn|Danger|Unknown)$/)).toBeNull();
     expect(screen.queryByLabelText(/health checks? needs? attention/)).toBeNull();
   });
@@ -227,8 +227,9 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
 describe("AdminHealth — All checks inventory (M4)", () => {
   it("counts: header and per-group status, na excluded from every denominator", async () => {
     await renderHealth(healthySilentDoc());
-    expect(screen.getByText("14 of 14 passing")).toBeTruthy();
-    for (const t of ["all 3 passing", "all 2 passing", "all 3 passing", "all 2 passing", "all 4 passing"]) {
+    expect(screen.getByText("15 of 15 passing")).toBeTruthy();
+    // workers (4, fleet.rundisk included), queue (2), control (3), integrations (2), housekeeping (4).
+    for (const t of ["all 4 passing", "all 2 passing", "all 3 passing", "all 2 passing", "all 4 passing"]) {
       expect(screen.getAllByText(t).length).toBeGreaterThan(0);
     }
     expect(screen.getAllByText(/^all \d passing$/).length).toBe(5);
@@ -236,8 +237,8 @@ describe("AdminHealth — All checks inventory (M4)", () => {
 
   it("incident: attention groups read 'K of N need attention'", async () => {
     await renderHealth(incidentDoc());
-    expect(screen.getByText("10 of 14 passing")).toBeTruthy();
-    expect(screen.getByText("2 of 3 need attention")).toBeTruthy();
+    expect(screen.getByText("11 of 15 passing")).toBeTruthy();
+    expect(screen.getByText("2 of 4 need attention")).toBeTruthy(); // workers: fleet.rundisk stays ok
     expect(screen.getAllByText("1 of 2 need attention").length).toBe(2); // queue, integrations
     expect(screen.getByText("all 3 passing")).toBeTruthy(); // control
   });
@@ -306,24 +307,25 @@ describe("AdminHealth — All checks inventory (M4)", () => {
     expect(screen.getByText("All systems normal.")).toBeTruthy();
     // fleet.roll, controller.report and slack.socket are N/A (never green, never gone).
     expect(screen.getAllByText("N/A").length).toBe(3);
-    expect(screen.getByText("11 of 11 passing, 3 not applicable")).toBeTruthy();
-    expect(screen.getAllByText("all 2 passing, 1 not applicable").length).toBe(2); // workers, control
+    expect(screen.getByText("12 of 12 passing, 3 not applicable")).toBeTruthy();
+    expect(screen.getByText("all 3 passing, 1 not applicable")).toBeTruthy(); // workers (fleet.rundisk applies)
+    expect(screen.getByText("all 2 passing, 1 not applicable")).toBeTruthy(); // control
     expect(screen.getByText("all 1 passing, 1 not applicable")).toBeTruthy(); // integrations
     expect(screen.queryByLabelText(/health checks? needs? attention/)).toBeNull();
   });
 
   it("a group with both attention and N/A checks counts N/A out of the denominator", async () => {
     // Workers group on the no-hosted fixture: fleet.roll N/A, fleet.capacity (now danger),
-    // fleet.disk OK. Applicable = 2, so "1 of 2", never "1 of 3".
+    // fleet.disk and fleet.rundisk OK. Applicable = 3, so "1 of 3", never "1 of 4".
     await renderHealth(withSeverity(noHostedWorkersDoc(), { "fleet.capacity": "danger" }));
-    expect(screen.getByText("1 of 2 need attention, 1 not applicable")).toBeTruthy();
-    expect(screen.queryByText(/^1 of 3 need attention/)).toBeNull();
+    expect(screen.getByText("1 of 3 need attention, 1 not applicable")).toBeTruthy();
+    expect(screen.queryByText(/^1 of 4 need attention/)).toBeNull();
   });
 
   it("a group whose checks are all N/A reads 'not applicable'", async () => {
     await renderHealth(withSeverity(noHostedWorkersDoc(), { "forge.ciwatch": "na" }));
     expect(screen.getByText("not applicable")).toBeTruthy();
-    expect(screen.getByText("10 of 10 passing, 4 not applicable")).toBeTruthy();
+    expect(screen.getByText("11 of 11 passing, 4 not applicable")).toBeTruthy();
   });
 
   it("no interactive element is nested inside another", async () => {

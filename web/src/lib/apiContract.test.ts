@@ -382,11 +382,12 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 // (handler/workers.go reportedRunsByWorker/builders), never null. The exemption is still needed:
 // json.Marshal(WorkerDTO{}) emits null for the nil slice, so worker.zero.json carries an explicit
 // `null`, which an optional `X[] | undefined` field rejects — the exemption tolerates it exactly
-// like capabilities.
+// like capabilities. run_disk (PRD #1809 M6) is the same handler-overlaid shape
+// (handler/workers.go runDiskByWorker/builders) and takes the same exemption.
 {
   const _workerMissing: never = null as unknown as Exclude<keyof Worker, keyof typeof workerFull>;
   const _workerExtra: never = null as unknown as Exclude<keyof typeof workerFull, keyof Worker>;
-  const _workerZero: ZeroOf<Worker, "capabilities" | "reported_runs"> = workerZero;
+  const _workerZero: ZeroOf<Worker, "capabilities" | "reported_runs" | "run_disk"> = workerZero;
   const _workerFull: Widen<Worker> = workerFull;
   void _workerMissing;
   void _workerExtra;
@@ -402,7 +403,7 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 {
   const _adminWorkerMissing: never = null as unknown as Exclude<keyof AdminWorker, keyof typeof adminWorkerFull>;
   const _adminWorkerExtra: never = null as unknown as Exclude<keyof typeof adminWorkerFull, keyof AdminWorker>;
-  const _adminWorkerZero: ZeroOf<AdminWorker, "capabilities" | "reported_runs"> = adminWorkerZero;
+  const _adminWorkerZero: ZeroOf<AdminWorker, "capabilities" | "reported_runs" | "run_disk"> = adminWorkerZero;
   const _adminWorkerFull: Widen<AdminWorker> = adminWorkerFull;
   void _adminWorkerMissing;
   void _adminWorkerExtra;

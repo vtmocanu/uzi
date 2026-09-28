@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
@@ -8,6 +9,9 @@ import { promisify } from "node:util";
 import {
   PURGE_CHILDREN_SCRIPT,
   type HomeRemovalDeps,
+  measureRunCaches,
+  measureRunHome,
+  rmHomeSubtree,
   rmHomeTree,
   rmTreeForce,
   restoreTreeWritability,
@@ -337,6 +341,481 @@ describe("PURGE_CHILDREN_SCRIPT (#1607)", () => {
     } finally {
       await forceCleanup(home);
       await forceCleanup(outside);
+    }
+  });
+});
+
+/**
+ * PRD #1809 D3. The subtree purge a process-ending park uses to drop a run's caches. As
+ * with rmHomeTree, the real cross-uid proof needs the uid split (`e2e/home-uid-split/`).
+ * These host tests run the real pinned-descriptor script: through the default wrappers
+ * (single-uid here, so the real `runnerCommand` is the identity and the real exit-code
+ * mapping decides), and through stand-in wrappers that script the per-uid passes a split
+ * worker makes. The script pins through `/proc/self/fd`, so a host without it (macOS)
+ * skips rather than passes vacuously.
+ */
+const noProcFd = !existsSync("/proc/self/fd");
+const NO_PROC_FD = "no /proc/self/fd on this host: the pinned walk refuses here by design";
+
+describe("rmHomeSubtree (PRD #1809)", () => {
+  /** A HOME with a `0555` module cache, the build cache, and siblings that must survive. */
+  async function seedHome(home: string): Promise<string> {
+    const mod = await makeGoModCacheFixture(home); // go/pkg/mod/... (0555) + .claude/projects
+    await fs.mkdir(path.join(home, "go", "bin"), { recursive: true });
+    await fs.writeFile(path.join(home, "go", "bin", "gopls"), "bin\n");
+    await fs.mkdir(path.join(home, ".cache", "go-build", "0a"), { recursive: true });
+    await fs.writeFile(path.join(home, ".cache", "go-build", "0a", "obj"), "o\n");
+    await fs.symlink("/nonexistent-target", path.join(home, ".cache", "go-build", "dangling"));
+    await fs.mkdir(path.join(home, ".cache", "other-tool"), { recursive: true });
+    await fs.writeFile(path.join(home, ".cache", "other-tool", "state"), "s\n");
+    await fs.writeFile(path.join(home, ".claude.json"), "{}\n");
+    await fs.chmod(path.dirname(mod), 0o555);
+    await fs.chmod(mod, 0o555);
+    return mod;
+  }
+
+  const SIBLINGS = ["go/bin/gopls", ".cache/other-tool/state", ".claude/projects/session.jsonl", ".claude.json"];
+
+  async function assertSiblingsKept(home: string, rename: Record<string, string> = {}): Promise<void> {
+    for (const rel of SIBLINGS) {
+      const [top, ...rest] = rel.split("/");
+      const p = path.join(home, rename[top!] ?? top!, ...rest);
+      assert.ok(await exists(p), `${rel} must survive`);
+    }
+  }
+
+  /** A stand-in wrapper that records each pass and runs the command as this uid. */
+  function recording(calls: string[], name: string, extra: string[] = []) {
+    return (command: string, args: readonly string[]) => {
+      calls.push(name);
+      return { command, args: [...args, ...extra] };
+    };
+  }
+
+  /** A stand-in wrapper whose pass exits `code` without running the script. */
+  function exitsWith(calls: string[], code: number) {
+    return () => {
+      calls.push(`exit${code}`);
+      return { command: process.execPath, args: ["-e", `process.exit(${code})`] };
+    };
+  }
+
+  it("default wrappers: drops the 0555 module cache and the build cache, nothing else, and leaves the HOME root's mode alone", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const home = await mktmp();
+    try {
+      await fs.chmod(home, 0o750);
+      const mod = await seedHome(home);
+      if (!asRoot) await assertReadOnlyDir(mod);
+      assert.strictEqual(await rmHomeSubtree(home, "go/pkg/mod"), "removed");
+      assert.strictEqual(await rmHomeSubtree(home, ".cache/go-build"), "removed");
+      assert.strictEqual(await exists(path.join(home, "go", "pkg", "mod")), false);
+      assert.strictEqual(await exists(path.join(home, ".cache", "go-build")), false);
+      assert.ok(await exists(path.join(home, "go", "pkg")), "the parent of a dropped cache stays");
+      await assertSiblingsKept(home);
+      assert.strictEqual(((await fs.lstat(home)).mode & 0o777).toString(8), "750", "the HOME root's mode is untouched");
+    } finally {
+      await forceCleanup(home);
+    }
+  });
+
+  it("default wrappers: a missing subtree, parent or HOME resolves absent", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const home = await mktmp();
+    try {
+      await fs.mkdir(path.join(home, "go"));
+      assert.strictEqual(await rmHomeSubtree(home, "go/pkg/mod"), "absent");
+      assert.strictEqual(await rmHomeSubtree(home, ".npm/_cacache"), "absent");
+      assert.strictEqual(await rmHomeSubtree(path.join(home, "no-such-home"), ".cache/go-build"), "absent");
+      assert.ok(await exists(path.join(home, "go")));
+    } finally {
+      await forceCleanup(home);
+    }
+  });
+
+  for (const [what, rel, link] of [
+    ["a symlinked `.cache`", ".cache/go-build", ".cache"],
+    ["a symlinked `go/pkg`", "go/pkg/mod", "go/pkg"],
+    ["a symlinked leaf", "go/pkg/mod", "go/pkg/mod"],
+  ] as const) {
+    it(`default wrappers: refuses ${what} as final, and never touches the target outside`, async (t) => {
+      if (noProcFd) return t.skip(NO_PROC_FD);
+      const home = await mktmp();
+      const outside = await mktmp();
+      try {
+        const leafInOutside = path.join(outside, ...rel.split("/").slice(link.split("/").length));
+        await fs.mkdir(leafInOutside, { recursive: true });
+        await fs.writeFile(path.join(leafInOutside, "precious"), "keep\n");
+        await fs.mkdir(path.dirname(path.join(home, link)), { recursive: true });
+        await fs.symlink(outside, path.join(home, link), "dir");
+        await assert.rejects(rmHomeSubtree(home, rel), { code: "ELOOP", message: /refusing/ });
+        // A refusal is final: no later uid pass runs after it.
+        const calls: string[] = [];
+        await assert.rejects(rmHomeSubtree(home, rel, { wrappers: [recording(calls, "a"), recording(calls, "b")] }), /refusing/);
+        assert.deepStrictEqual(calls, ["a"]);
+        assert.ok(await exists(path.join(leafInOutside, "precious")), "the symlink target survives");
+      } finally {
+        await forceCleanup(home);
+        await forceCleanup(outside);
+      }
+    });
+  }
+
+  it("split passes: stops at the first pass that settles it, and a partial or blocked pass hands on", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const home = await mktmp();
+    try {
+      await seedHome(home);
+      const calls: string[] = [];
+      // runner leaves runner-cmd's entries (exit 4), runner-cmd cannot open a component
+      // (exit 7), a helper fails outright (exit 1, e.g. setpriv), the second runner pass
+      // finishes: the stand-ins script those verdicts.
+      const wrappers = [
+        exitsWith(calls, 4),
+        exitsWith(calls, 7),
+        exitsWith(calls, 1),
+        recording(calls, "real"),
+        recording(calls, "unused"),
+      ];
+      assert.strictEqual(await rmHomeSubtree(home, "go/pkg/mod", { wrappers }), "removed");
+      assert.deepStrictEqual(calls, ["exit4", "exit7", "exit1", "real"]);
+      assert.strictEqual(await exists(path.join(home, "go", "pkg", "mod")), false);
+      await assertSiblingsKept(home);
+    } finally {
+      await forceCleanup(home);
+    }
+  });
+
+  it("split passes: throws when every pass leaves the subtree, and refuses outright without /proc/self/fd", async () => {
+    const home = await mktmp();
+    try {
+      const calls: string[] = [];
+      await assert.rejects(rmHomeSubtree(home, ".npm/_cacache", { wrappers: [exitsWith(calls, 7), exitsWith(calls, 4)] }), {
+        code: "ENOTEMPTY",
+        message: /still present.*entries remained/,
+      });
+      assert.deepStrictEqual(calls, ["exit7", "exit4"]);
+      calls.length = 0;
+      // A helper that ran but failed (setpriv, an uncaught throw) is named as such, not as a
+      // tree that kept entries.
+      await assert.rejects(rmHomeSubtree(home, ".npm/_cacache", { wrappers: [exitsWith(calls, 1)] }), {
+        code: "ENOTEMPTY",
+        message: /helper itself failed \(exit 1\)/,
+      });
+      calls.length = 0;
+      await assert.rejects(rmHomeSubtree(home, ".npm/_cacache", { wrappers: [exitsWith(calls, 5), exitsWith(calls, 0)] }), /refusing/);
+      assert.deepStrictEqual(calls, ["exit5"], "no fallback pass after an unsupported host");
+      calls.length = 0;
+      await assert.rejects(rmHomeSubtree(home, ".npm/_cacache", { wrappers: [exitsWith(calls, 8), exitsWith(calls, 0)] }), {
+        code: "ENOTEMPTY",
+        message: /ran out of its budget/,
+      });
+      assert.deepStrictEqual(calls, ["exit8"], "an exhausted budget ends the removal: another uid meets the same tree");
+      calls.length = 0;
+      await assert.rejects(
+        rmHomeSubtree(home, ".npm/_cacache", { wrappers: [exitsWith(calls, 0)], deadline: Date.now() - 1 }),
+        { code: "ENOTEMPTY", message: /deadline passed/ },
+      );
+      assert.deepStrictEqual(calls, [], "no pass starts after the caller's deadline");
+      await assert.rejects(
+        rmHomeSubtree(home, ".npm/_cacache", { wrappers: [() => ({ command: "/nonexistent/uzi-no-such-binary", args: [] })] }),
+        { code: "ENOENT" },
+        "a helper that cannot run is surfaced, not read as a verdict",
+      );
+    } finally {
+      await forceCleanup(home);
+    }
+  });
+
+  it("refuses anything not on the cache list, and a non-absolute HOME, before any pass runs", async () => {
+    const home = await mktmp();
+    try {
+      const calls: string[] = [];
+      const passes = [recording(calls, "pass")];
+      for (const rel of ["go", ".claude", "go/bin", "../x", "/etc", ".cache/go-build/../../.claude", ""]) {
+        await assert.rejects(rmHomeSubtree(home, rel, { wrappers: passes }), /not a listed cache subtree/, rel);
+      }
+      await assert.rejects(rmHomeSubtree("relative/home", "go/pkg/mod", { wrappers: passes }), /non-absolute/);
+      assert.deepStrictEqual(calls, []);
+    } finally {
+      await forceCleanup(home);
+    }
+  });
+
+  /**
+   * B1 (TOCTOU). A live `runner`/`runner-cmd` process, e.g. another run's, can rename a
+   * component of the chain and plant a symlink AFTER the walk verified it. The script's
+   * test seam pauses once the leaf is pinned; the test swaps a component for a symlink to
+   * a victim dir shaped like the subtree, then lets the removal continue. On 1eb02dbe
+   * (path-based removal after a one-shot check) the same swap deleted the victim.
+   */
+  async function removeWithSwap(
+    home: string,
+    rel: string,
+    swap: () => Promise<void>,
+    phase: "pinned" | "listed" = "pinned",
+  ) {
+    const sync = path.join(await mktmp(), "sync");
+    const pending = rmHomeSubtree(home, rel, { wrappers: [(c, a) => ({ command: c, args: [...a, sync, phase] })] }).then(
+      (v) => ({ v }),
+      (e: Error) => ({ e }),
+    );
+    const deadline = Date.now() + 10_000;
+    while (!(await exists(`${sync}.${phase}`))) {
+      if (Date.now() > deadline) throw new Error(`the script never reached its ${phase} pause`);
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    await swap();
+    await fs.writeFile(`${sync}.go`, "");
+    const out = await pending;
+    await forceCleanup(path.dirname(sync));
+    return out;
+  }
+
+  for (const [component, rel, victimShape] of [
+    [".cache", ".cache/go-build", "go-build"],
+    ["go", "go/pkg/mod", "pkg/mod"],
+  ] as const) {
+    it(`TOCTOU: \`${component}\` swapped for a symlink after the leaf is pinned removes only the pinned tree`, async (t) => {
+      if (noProcFd) return t.skip(NO_PROC_FD);
+      const home = await mktmp();
+      const victim = await mktmp();
+      try {
+        await seedHome(home);
+        await fs.mkdir(path.join(victim, victimShape), { recursive: true });
+        await fs.writeFile(path.join(victim, victimShape, "precious"), "keep\n");
+        const moved = `${component}.moved`;
+        const out = await removeWithSwap(home, rel, async () => {
+          await fs.rename(path.join(home, component), path.join(home, moved));
+          await fs.symlink(victim, path.join(home, component), "dir");
+        });
+        assert.ok(await exists(path.join(victim, victimShape, "precious")), "the victim outside the HOME survives");
+        assert.deepStrictEqual(out, { v: "removed" }, "the pinned tree's name is gone from its pinned parent");
+        const pinnedLeaf = path.join(home, moved, ...rel.split("/").slice(1));
+        assert.strictEqual(await exists(pinnedLeaf), false, "the pinned (now renamed) subtree was removed");
+        await assertSiblingsKept(home, { [component]: moved });
+      } finally {
+        await forceCleanup(home);
+        await forceCleanup(victim);
+      }
+    });
+  }
+
+  it("TOCTOU: a leaf swapped for a symlink is emptied through its pinned descriptor, then refused", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const home = await mktmp();
+    const victim = await mktmp();
+    try {
+      await seedHome(home);
+      await fs.writeFile(path.join(victim, "precious"), "keep\n");
+      const out = await removeWithSwap(home, "go/pkg/mod", async () => {
+        await fs.rename(path.join(home, "go", "pkg", "mod"), path.join(home, "go", "pkg", "mod.moved"));
+        await fs.symlink(victim, path.join(home, "go", "pkg", "mod"), "dir");
+      });
+      assert.ok(await exists(path.join(victim, "precious")), "the victim outside the HOME survives");
+      assert.ok("e" in out && /refusing/.test(out.e.message), `the planted symlink is refused: ${JSON.stringify(out)}`);
+      assert.deepStrictEqual(await fs.readdir(path.join(home, "go", "pkg", "mod.moved")), [], "the pinned leaf was emptied");
+      await assertSiblingsKept(home);
+    } finally {
+      await forceCleanup(home);
+      await forceCleanup(victim);
+    }
+  });
+
+  /**
+   * A CHILD directory inside the leaf is swapped for a symlink to a victim after the leaf
+   * was listed but before the child is pinned. The child pin's O_NOFOLLOW is what refuses
+   * it (the symlink itself is then unlinked); a pin that followed it would chmod and empty
+   * the victim.
+   */
+  it("TOCTOU: a child dir of the leaf swapped for a symlink after listing is unlinked, never followed", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const home = await mktmp();
+    const victim = await mktmp();
+    try {
+      await seedHome(home);
+      await fs.writeFile(path.join(victim, "precious"), "keep\n");
+      await fs.chmod(victim, 0o500);
+      const child = path.join(home, "go", "pkg", "mod", "gopkg.in");
+      const out = await removeWithSwap(
+        home,
+        "go/pkg/mod",
+        async () => {
+          await fs.rename(child, `${child}.moved`);
+          await fs.symlink(victim, child, "dir");
+        },
+        "listed",
+      );
+      assert.ok(await exists(path.join(victim, "precious")), "the victim outside the HOME survives");
+      assert.strictEqual(((await fs.lstat(victim)).mode & 0o777).toString(8), "500", "the victim's mode is untouched");
+      assert.deepStrictEqual(out, { v: "removed" }, "the leaf, the moved child included, is gone");
+      assert.strictEqual(await exists(path.join(home, "go", "pkg", "mod")), false);
+      await assertSiblingsKept(home);
+    } finally {
+      await forceCleanup(home);
+      await fs.chmod(victim, 0o700).catch(() => undefined);
+      await forceCleanup(victim);
+    }
+  });
+
+  it("a flat directory with more names than the pass's entry budget stops the removal and reports it", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const home = await mktmp();
+    try {
+      const leaf = path.join(home, ".npm", "_cacache");
+      await fs.mkdir(leaf, { recursive: true });
+      for (let i = 0; i < 300; i++) await fs.writeFile(path.join(leaf, `f${i}`), "");
+      await assert.rejects(rmHomeSubtree(home, ".npm/_cacache", { maxEntries: 50 }), {
+        code: "ENOTEMPTY",
+        message: /ran out of its budget \(50 entries/,
+      });
+      const left = (await fs.readdir(leaf)).length;
+      assert.strictEqual(left, 250, `exactly the budget's worth of names was removed: ${left} left`);
+      assert.strictEqual(await rmHomeSubtree(home, ".npm/_cacache"), "removed", "an unbounded pass finishes it");
+    } finally {
+      await forceCleanup(home);
+    }
+  });
+});
+
+describe("measureRunCaches (PRD #1809)", () => {
+  const identity = (command: string, args: readonly string[]) => ({ command, args: [...args] });
+
+  it("counts only the cache subtrees, without following a symlink out", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const home = await mktmp();
+    const outside = await mktmp();
+    try {
+      await fs.mkdir(path.join(home, ".cache", "go-build"), { recursive: true });
+      await fs.writeFile(path.join(home, ".cache", "go-build", "obj"), Buffer.alloc(64 * 1024, 1));
+      await fs.writeFile(path.join(home, "notes"), Buffer.alloc(1024 * 1024, 1));
+      await fs.mkdir(path.join(outside, "_cacache"));
+      await fs.writeFile(path.join(outside, "big"), Buffer.alloc(1024 * 1024, 1));
+      await fs.writeFile(path.join(outside, "_cacache", "big"), Buffer.alloc(1024 * 1024, 1));
+      await fs.symlink(outside, path.join(home, ".cache", "go-build", "escape"), "dir");
+      await fs.symlink(outside, path.join(home, ".npm"), "dir");
+      const r = await measureRunCaches(home);
+      assert.ok(r.cacheBytes >= 64 * 1024, `cache bytes counted: ${r.cacheBytes}`);
+      assert.ok(r.cacheBytes < 1024 * 1024, `neither the non-cache file nor a symlink target is counted: ${r.cacheBytes}`);
+      assert.strictEqual(r.truncated, false);
+    } finally {
+      await forceCleanup(home);
+      await forceCleanup(outside);
+    }
+  });
+
+  it("stops at its entry ceiling and flags the reading truncated", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const home = await mktmp();
+    try {
+      await fs.mkdir(path.join(home, "go", "pkg", "mod"), { recursive: true });
+      for (let i = 0; i < 5; i++) await fs.writeFile(path.join(home, "go", "pkg", "mod", `m${i}`), Buffer.alloc(8192, 1));
+      const full = await measureRunCaches(home, { wrappers: [identity] });
+      const capped = await measureRunCaches(home, { wrappers: [identity], maxEntries: 2 });
+      assert.strictEqual(full.truncated, false);
+      assert.strictEqual(full.entries, 5);
+      assert.strictEqual(capped.truncated, true);
+      assert.strictEqual(capped.entries, 2);
+      assert.ok(capped.cacheBytes < full.cacheBytes, `a truncated reading is a lower bound: ${capped.cacheBytes} < ${full.cacheBytes}`);
+    } finally {
+      await forceCleanup(home);
+    }
+  });
+
+  it("streams a flat directory with far more names than its ceiling: counts exactly the ceiling, flags truncated", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const home = await mktmp();
+    try {
+      const leaf = path.join(home, "go", "pkg", "mod");
+      await fs.mkdir(leaf, { recursive: true });
+      for (let i = 0; i < 2000; i++) await fs.writeFile(path.join(leaf, `m${i}`), "");
+      const r = await measureRunCaches(home, { wrappers: [identity], maxEntries: 10 });
+      assert.strictEqual(r.truncated, true);
+      assert.strictEqual(r.entries, 10, "every dirent read is counted, and the walk stops at the ceiling");
+      await assert.rejects(measureRunCaches(home, { wrappers: [identity], deadline: Date.now() - 1 }), /deadline passed/);
+    } finally {
+      await forceCleanup(home);
+    }
+  });
+
+  it("keeps the larger reading across uid passes, and rejects only when none ran", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const home = await mktmp();
+    try {
+      await fs.mkdir(path.join(home, "go", "pkg", "mod"), { recursive: true });
+      await fs.writeFile(path.join(home, "go", "pkg", "mod", "m"), Buffer.alloc(8192, 1));
+      const broken = () => ({ command: "/nonexistent/uzi-no-such-binary", args: [] });
+      const single = await measureRunCaches(home, { wrappers: [identity] });
+      assert.deepStrictEqual(await measureRunCaches(home, { wrappers: [broken, identity, identity] }), single);
+      await assert.rejects(measureRunCaches(home, { wrappers: [broken] }));
+      await assert.rejects(measureRunCaches("relative", { wrappers: [identity] }), /non-absolute/);
+    } finally {
+      await forceCleanup(home);
+    }
+  });
+});
+
+describe("measureRunHome (PRD #1809 D8)", () => {
+  const identity = (command: string, args: readonly string[]) => ({ command, args: [...args] });
+
+  it("counts the whole HOME and its cache share, without following a symlink out", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const home = await mktmp();
+    const outside = await mktmp();
+    try {
+      await fs.mkdir(path.join(home, ".cache", "go-build"), { recursive: true });
+      await fs.writeFile(path.join(home, ".cache", "go-build", "obj"), Buffer.alloc(256 * 1024, 1));
+      await fs.mkdir(path.join(home, ".cache", "other"), { recursive: true });
+      await fs.writeFile(path.join(home, ".cache", "other", "f"), Buffer.alloc(128 * 1024, 1));
+      await fs.writeFile(path.join(home, "notes"), Buffer.alloc(512 * 1024, 1));
+      await fs.writeFile(path.join(outside, "big"), Buffer.alloc(4 * 1024 * 1024, 1));
+      await fs.symlink(outside, path.join(home, "escape"), "dir");
+      await fs.symlink(outside, path.join(home, ".npm"), "dir");
+      const r = await measureRunHome(home, { wrappers: [identity] });
+      assert.ok(r.cacheBytes >= 256 * 1024 && r.cacheBytes < 384 * 1024, `only go-build is cache: ${r.cacheBytes}`);
+      assert.ok(r.homeBytes >= r.cacheBytes + 640 * 1024, `the HOME counts the cache, .cache/other and notes: ${r.homeBytes}`);
+      assert.ok(r.homeBytes < 4 * 1024 * 1024, `a symlink target is never counted: ${r.homeBytes}`);
+      assert.strictEqual(r.truncated, false);
+    } finally {
+      await forceCleanup(home);
+      await forceCleanup(outside);
+    }
+  });
+
+  it("is bounded: stops at its entry ceiling and at its deadline, flagging a lower bound", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const home = await mktmp();
+    try {
+      for (let i = 0; i < 50; i++) await fs.writeFile(path.join(home, `f${i}`), Buffer.alloc(4096, 1));
+      const full = await measureRunHome(home, { wrappers: [identity] });
+      const capped = await measureRunHome(home, { wrappers: [identity], maxEntries: 5 });
+      assert.strictEqual(full.truncated, false);
+      assert.strictEqual(full.entries, 50);
+      assert.strictEqual(capped.truncated, true);
+      assert.strictEqual(capped.entries, 5);
+      assert.ok(capped.homeBytes < full.homeBytes);
+      await assert.rejects(measureRunHome(home, { wrappers: [identity], deadline: Date.now() - 1 }), /deadline passed/);
+    } finally {
+      await forceCleanup(home);
+    }
+  });
+
+  it("rejects a missing or symlinked HOME and a relative path; keeps the larger reading across passes", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const home = await mktmp();
+    const link = path.join(os.tmpdir(), `uzi-home-link-${process.pid}-${Date.now()}`);
+    try {
+      await fs.writeFile(path.join(home, "f"), Buffer.alloc(8192, 1));
+      await fs.symlink(home, link, "dir");
+      await assert.rejects(measureRunHome(link, { wrappers: [identity] }), /exited 7/);
+      await assert.rejects(measureRunHome(path.join(home, "missing"), { wrappers: [identity] }), /exited 7/);
+      await assert.rejects(measureRunHome("relative", { wrappers: [identity] }), /non-absolute/);
+      const broken = () => ({ command: "/nonexistent/uzi-no-such-binary", args: [] });
+      const single = await measureRunHome(home, { wrappers: [identity] });
+      assert.deepStrictEqual(await measureRunHome(home, { wrappers: [broken, identity, identity] }), single);
+    } finally {
+      await fs.rm(link, { force: true });
+      await forceCleanup(home);
     }
   });
 });

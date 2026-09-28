@@ -186,6 +186,9 @@ func nextEvent(t *testing.T, s *RunStream, why string) apitypes.RunEventDTO {
 func TestStreamRunDecodesEveryFrameType(t *testing.T) {
 	srv := newStreamServer(t)
 	c := srv.client("uzc_test")
+	// Reconcile out of the way: its first tick emits a synthetic state/running seed
+	// frame that would interleave with, and shift, the strictly ordered reads below.
+	c.streamReconcile = time.Hour
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -310,6 +313,9 @@ func TestStreamRunRefusesPlaintextNonLoopbackURL(t *testing.T) {
 func TestStreamRunClassifiesUnknownEnumsInert(t *testing.T) {
 	srv := newStreamServer(t)
 	c := srv.client("uzc_test")
+	// Reconcile out of the way: its first tick emits a synthetic state/running seed
+	// frame that would interleave with, and shift, the strictly ordered reads below.
+	c.streamReconcile = time.Hour
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -367,7 +373,13 @@ func TestStreamRunRecoversADroppedTerminalStateFrame(t *testing.T) {
 	// The socket is healthy and delivers a message, so nothing here is a reconnect:
 	// the ONLY path to the terminal status below is the time-based re-read.
 	pushFrame(t, conn, apitypes.RunEventDTO{Type: "message", Seq: 1, Kind: "text"})
-	if ev := nextEvent(t, stream, "the live message frame"); ev.Seq != 1 {
+	// This test needs the fast reconcile, so its first tick's state/running seed frame
+	// may arrive before the message; skip it rather than read it as the message.
+	ev := nextEvent(t, stream, "the live message frame")
+	for ev.Type == RunEventTypeState && ev.Status == "running" {
+		ev = nextEvent(t, stream, "the live message frame")
+	}
+	if ev.Type != RunEventTypeMessage || ev.Seq != 1 {
 		t.Fatalf("first event = %+v, want the seq=1 message", ev)
 	}
 
@@ -430,6 +442,9 @@ func TestStreamRunReconcileIsQuietWhileStatusIsUnchanged(t *testing.T) {
 func TestStreamRunReplaysMissedMessagesOnReconnect(t *testing.T) {
 	srv := newStreamServer(t)
 	c := srv.client("uzc_test")
+	// Reconcile out of the way: its first tick emits a synthetic state/running seed
+	// frame that would interleave with, and shift, the strictly ordered reads below.
+	c.streamReconcile = time.Hour
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

@@ -121,6 +121,7 @@ Thresholds below are named constants in code
 | `fleet.roll` | Whether hosted worker pods are rolling cleanly to their target image tag, from the controller's per-pod roll signal | some hosted workers are stuck | every hosted worker is stuck | `unknown` when the newest roll signal is older than the controller-signal freshness window *and* `controller.report` is not `ok` (a genuinely silent controller, not just an idle fleet); `na` when no hosted workers are configured |
 | `fleet.capacity` | Whether an owner with queued work has no worker of their own that can take it (workers are per-owner, so this is a per-owner question) | — | for at least 5 minutes, some owner has a run waiting for a worker and zero of their own workers online, non-draining, and heartbeat-fresh | `unknown` when the run-health detector (`health_enabled`) is off, or its state could not be read |
 | `fleet.disk` | Whether any worker is under sustained disk pressure | any worker with a fresh heartbeat has a disk-pressure streak of 2+ consecutive polls | — | — |
+| `fleet.rundisk` | Whether one run is close to filling its worker's data volume (PRD #1809 M6, D8) | a fresh worker's largest reported run HOME is 40%+ of the data volume's total bytes, or the volume has less than 5% of its inodes free | — | `unknown` when the largest-run-size lookup itself fails |
 
 ### Queue
 

@@ -4750,6 +4750,58 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     expect(container.textContent).toContain("the run resumes at its next retry.");
     expect(container.textContent).not.toMatch(/retry \(/);
   });
+
+  // PRD #1809 M5: a data_volume_full park (the worker's data volume is full or nearly full)
+  // waits for disk space, resumes at its next retry, and shows the run's counted disk parks.
+  const diskPark = (over: Partial<Run> = {}) =>
+    run({
+      status: "recovery_wait",
+      recovery_wait_cause: "data_volume_full",
+      recovery_retry_not_before: "2026-01-01T09:30:00Z",
+      disk_park_count: 2,
+      // Forge counters set on purpose: this cause must never borrow the forge park count.
+      forge_park_count: 4,
+      forge_park_max: 5,
+      ...over,
+    });
+
+  it("data_volume_full: disk copy, next retry time and the disk-park count", () => {
+    const { container } = render(<RecoveryWaitPanel run={diskPark()} />);
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("Waiting for disk space");
+    expect(container.textContent).toContain(
+      `The worker's disk is full or nearly full. uzi frees space on the worker and the run resumes at its next retry (${hhmm("2026-01-01T09:30:00Z")}). No action is needed.`,
+    );
+    expect(container.textContent).toContain(
+      "Counted disk parks so far: 2. If the disk stays full, the run can fail after repeated counted parks.",
+    );
+    expect(container.textContent).not.toContain("uzi freed");
+    expect(container.textContent).not.toContain("transient interruption");
+    expect(container.textContent).not.toContain("Waiting for the forge");
+    expect(container.textContent).not.toContain("4 of 5");
+    expect(container.textContent).not.toMatch(/vault/i);
+    expect(container.querySelector("button")).toBeNull();
+  });
+
+  it("data_volume_full with no retry stamp or count drops the time and reads 0 parks", () => {
+    const { container } = render(
+      <RecoveryWaitPanel run={diskPark({ recovery_retry_not_before: null, disk_park_count: undefined })} />,
+    );
+    expect(container.textContent).toContain("the run resumes at its next retry. No action is needed.");
+    expect(container.textContent).not.toMatch(/retry \(/);
+    expect(container.textContent).toContain("Counted disk parks so far: 0.");
+  });
+
+  // PRD #1809: the disk park's footer says what actually holds (any branch or pushed checkpoint
+  // the run already has, the worker keeping the run's work), not the generic "keeps its branch and its history" line.
+  // Reddening mutation: drop the diskPark arm of the footer ternary.
+  it("data_volume_full: disk-specific footer, not the generic nothing-is-lost line", () => {
+    const { container } = render(<RecoveryWaitPanel run={diskPark()} />);
+    expect(container.textContent).toContain(
+      "Any branch or pushed checkpoint the run already has is kept, and the worker keeps the run's work until it resumes.",
+    );
+    expect(container.textContent).not.toContain("Nothing is lost");
+    expect(container.textContent).not.toContain("its branch and its history");
+  });
 });
 
 // PRD #1590 D6: a run held on an unusable Codex account. The copy is keyed on the
@@ -5079,6 +5131,21 @@ describe("RunView park announcement — recovery_wait (issue #1197, a11y)", () =
     );
     expect(region.textContent).not.toContain("transient interruption");
     expect(region.textContent).not.toMatch(/paused|unlock your vault/i);
+  });
+
+  // PRD #1809 M5: a data_volume_full park announces the disk space it waits on, not the
+  // generic transient interruption.
+  it("announces a data_volume_full park as waiting for disk space", async () => {
+    renderPage({ status: "recovery_wait", recovery_wait_cause: "data_volume_full" });
+    const region = await waitFor(() => {
+      const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement | null;
+      if (!el || el.textContent === "") throw new Error("not announced yet");
+      return el;
+    });
+    expect(region.textContent).toBe(
+      "This run is waiting for disk space. The worker's disk is full or nearly full; uzi frees space on the worker and the run resumes at its next retry.",
+    );
+    expect(region.textContent).not.toContain("transient interruption");
   });
 
   // PRD #1590 D6: a Codex account hold announces its own action, never the transient park.
@@ -6081,6 +6148,39 @@ describe("RunView — forge-aware MR/PR link fallback when mr_web_url is null (#
     // Non-vacuous: the old hard-coded GitLab path would end /-/merge_requests/42 and fail here.
     expect(href.endsWith("/pull/42")).toBe(true);
     expect(href).not.toContain("/-/merge_requests/");
+  });
+});
+
+// PRD #1809 M6 (D8): each parked panel carries the checkpoint-durability line and the run's HOME
+// size on its worker, and says neither when the server sent neither.
+describe("parked panels: checkpoint durability and run size (PRD #1809 M6)", () => {
+  const GIB = 1073741824;
+  const facts = { checkpoint_contains_latest: false, home_bytes: 4 * GIB, cache_bytes: 3 * GIB } as const;
+
+  it("the recovery park shows both facts", () => {
+    render(<RecoveryWaitPanel run={run({ status: "recovery_wait", ...facts })} />);
+    expect(screen.getByText(/does not contain the latest committed work/)).toBeTruthy();
+    expect(screen.getByText("Home on the worker: 4 GiB, including 3 GiB of rebuildable caches.")).toBeTruthy();
+  });
+
+  it("the pause park shows both facts", () => {
+    render(<PausedPanel run={run({ status: "paused", ...facts, checkpoint_contains_latest: true })} busy={false} onResume={vi.fn()} onStop={vi.fn()} />);
+    expect(screen.getByText("The published checkpoint contains the latest work.")).toBeTruthy();
+    expect(screen.getByText(/Home on the worker: 4 GiB/)).toBeTruthy();
+  });
+
+  it("the usage-limit park shows both facts", () => {
+    render(
+      <LimitWaitPanel run={run({ status: "limit_wait", wait_on_limit: true, ...facts })} busy={false} onToggle={vi.fn()} onStop={vi.fn()} />,
+    );
+    expect(screen.getByText(/does not contain the latest committed work/)).toBeTruthy();
+    expect(screen.getByText(/Home on the worker: 4 GiB/)).toBeTruthy();
+  });
+
+  it("a park with no report and no size adds neither line", () => {
+    render(<RecoveryWaitPanel run={run({ status: "recovery_wait" })} />);
+    expect(screen.queryByText(/published checkpoint/)).toBeNull();
+    expect(screen.queryByText(/Home on the worker/)).toBeNull();
   });
 });
 

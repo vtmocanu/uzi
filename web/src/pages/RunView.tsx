@@ -72,6 +72,7 @@ import { CredentialDisabledPanel, isCredentialDisabledHold } from "../components
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
 import { formatDuration } from "../components/RunEvent";
 import { RunUsagePanel } from "../components/RunUsage";
+import { RunParkDiskFacts } from "../components/RunParkDiskFacts";
 import { ActivityFeed } from "../components/ActivityFeed";
 import { SteerQueueCard } from "../components/SteerQueueCard";
 import { QuestionPanel, UnreadableQuestion } from "../components/QuestionPanel";
@@ -1025,6 +1026,8 @@ export function LimitWaitPanel({
           <p className="mt-1.5 text-xs text-muted">
             Nothing is lost — the run keeps its branch and its history and picks up where it left off.
           </p>
+          {/* PRD #1809 M6: checkpoint durability and the run's size on its worker. */}
+          <RunParkDiskFacts run={run} />
         </div>
         {/* A ROW, not a column. As a column with items-end it wrapped under the prose
             at ordinary widths and left the Stop button stranded mid-panel with the
@@ -1158,6 +1161,8 @@ export function PausedPanel({
           <p className="mt-1.5 text-xs text-muted">
             Nothing runs and nothing is spent while it waits.
           </p>
+          {/* PRD #1809 M6: checkpoint durability and the run's size on its worker. */}
+          <RunParkDiskFacts run={run} />
           {/* Worker / re-planning mechanics live behind a disclosure so the panel stays
               four sentences by default (mock note 7). */}
           <details className="mt-1.5 text-xs text-muted">
@@ -1601,8 +1606,14 @@ function codexHoldCopy(
  * unlock, with the next retry time from `recovery_retry_not_before`. The run resumes at that
  * timer-based retry once the vault is unlocked, never the instant of unlock.
  *
+ * PRD #1809 M5: when the cause is `data_volume_full` (the worker's data volume is full or nearly
+ * full) the panel renders DiskFullParkBody: waiting for disk space, the next retry time, and the
+ * run's lifetime count of counted disk parks (`disk_park_count`), with a disk-specific footer.
+ *
  * A null/other cause keeps the generic transient-interruption copy (issue #1197, widened
- * by issue #1088). The wording is kept consistent with the TUI and `uzi run get`.
+ * by issue #1088). The forge, vault and disk wording matches the TUI and `uzi run get`: the
+ * same heading words ("waiting for the forge", "waiting for vault unlock", "waiting for disk
+ * space") and, for the vault and disk parks, the same "resumes at its next retry (HH:MM)".
  *
  * Exported like the sibling panels so its copy is reachable without mounting the page.
  */
@@ -1619,6 +1630,9 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
   // Issue #1766: a vault_locked park waits for the run owner's vault to be unlocked; it
   // resumes at its next retry after that, not the instant of unlock.
   const vaultPark = run.recovery_wait_cause === "vault_locked";
+  // PRD #1809 M5: a data_volume_full park waits for disk space on its worker; it resumes at
+  // its next retry while uzi frees space on that worker.
+  const diskPark = run.recovery_wait_cause === "data_volume_full";
   // PRD #1590 D6: a Codex account hold has its own copy and, unlike the forge park, NO
   // retry time or park count — the hold has no timer, so nothing may count down.
   const codexHold =
@@ -1651,7 +1665,9 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
               ? "Waiting for the forge"
               : vaultPark
                 ? "Waiting for vault unlock"
-                : "Recovering and resuming automatically"}
+                : diskPark
+                  ? "Waiting for disk space"
+                  : "Recovering and resuming automatically"}
         </p>
         {codexHold ? (
           <>
@@ -1682,6 +1698,8 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
           </>
         ) : vaultPark ? (
           <VaultLockedParkBody retryAt={retryAt} />
+        ) : diskPark ? (
+          <DiskFullParkBody retryAt={retryAt} parkCount={run.disk_park_count ?? 0} />
         ) : (
           <>
             <p className="mt-0.5 text-xs text-muted">
@@ -1697,8 +1715,16 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
         <p className="mt-1.5 text-xs text-muted">
           {vaultPark
             ? "Nothing is lost: the run's work was saved before it parked, and it picks up where it left off."
-            : "Nothing is lost — the run keeps its branch and its history and picks up where it left off."}
+            : diskPark
+              ? // PRD #1809: a disk park frees space on the worker, so the generic "keeps its
+                // branch and its history" line is not the claim to make. A first-claim park may
+                // have no branch or checkpoint yet, so only what the run already has is kept,
+                // plus the run's work the worker keeps until it resumes.
+                "Any branch or pushed checkpoint the run already has is kept, and the worker keeps the run's work until it resumes."
+              : "Nothing is lost — the run keeps its branch and its history and picks up where it left off."}
         </p>
+        {/* PRD #1809 M6: checkpoint durability and the run's size on its worker. */}
+        <RunParkDiskFacts run={run} />
       </div>
     </div>
   );
@@ -1731,6 +1757,28 @@ function VaultLockedParkBody({ retryAt }: { retryAt: string | null }) {
           If this is your run, unlock your vault with the banner at the top of the page.
         </p>
       )}
+    </>
+  );
+}
+
+/**
+ * PRD #1809 M5: the body of a `data_volume_full` recovery park. The worker's data volume is full
+ * or nearly full (a park can be preventive, before the volume fills), uzi frees space on that
+ * worker, and the run resumes at its next retry (`retryAt`,
+ * HH:MM, or null when the server sent no stamp), the same words as `uzi run get` and the TUI.
+ * `parkCount` is the run's lifetime count of COUNTED disk parks: preventive parks are not
+ * counted, so it can read 0 across several parks. The server's cap on it is not on the DTO (and
+ * can be disabled), so the copy hedges that the run can fail without naming a number.
+ */
+function DiskFullParkBody({ retryAt, parkCount }: { retryAt: string | null; parkCount: number }) {
+  return (
+    <>
+      <p className="mt-0.5 text-xs text-muted">
+        {`The worker's disk is full or nearly full. uzi frees space on the worker and the run resumes at its next retry${retryAt ? ` (${retryAt})` : ""}. No action is needed.`}
+      </p>
+      <p className="mt-1.5 text-xs text-muted">
+        {`Counted disk parks so far: ${parkCount}. If the disk stays full, the run can fail after repeated counted parks.`}
+      </p>
     </>
   );
 }
@@ -2053,7 +2101,11 @@ export function RunView() {
                 // an owner-neutral sentence (an admin may be reading another owner's run).
                 run.recovery_wait_cause === "vault_locked"
                 ? "vault_locked"
-                : "recovery_wait"
+                : // PRD #1809 M5: a data_volume_full park waits on disk space, not a
+                  // transient interruption, so it gets its own stable key and sentence.
+                  run.recovery_wait_cause === "data_volume_full"
+                  ? "data_volume_full"
+                  : "recovery_wait"
             : run?.status === "paused" && run.hold_reason === "credential_disabled"
               ? "credential_disabled"
             : run?.status === "paused"
@@ -2074,6 +2126,8 @@ export function RunView() {
             ? "This run paused to recover from a transient interruption and will resume automatically."
             : parkKey === "vault_locked"
               ? "This run is waiting for vault unlock. The run owner's vault was locked when this Codex run needed its credential. Once the vault is unlocked, the run resumes at its next retry."
+            : parkKey === "data_volume_full"
+              ? "This run is waiting for disk space. The worker's disk is full or nearly full; uzi frees space on the worker and the run resumes at its next retry."
             : parkKey.startsWith("codex:")
               ? codexHoldCopy(parkKey.slice("codex:".length) || null, "").announce
             : parkKey === "credential_disabled"

@@ -63,6 +63,13 @@ type WorkerDTO struct {
 	// owner surface flags it as "retaining unpublished work" rather than idle. Always
 	// false once custody is released or discarded.
 	RetainingUnpublishedWork bool `json:"retaining_unpublished_work"`
+	// DiskPressureThreshold is the api's configured UZI_DISK_PRESSURE_THRESHOLD, the
+	// used/total fraction in (0,1] at/above which a volume counts as under disk pressure
+	// (PRD #1809 D5): the worker derives its soft reclaim/admission and hard stop
+	// thresholds from this. Set ONLY on the heartbeat response; every other WorkerDTO
+	// producer leaves it nil, so the admin/list JSON omits it. Absent from an older api
+	// (or a threshold outside (0,1]) → the worker assumes 0.90.
+	DiskPressureThreshold *float64 `json:"disk_pressure_threshold,omitempty"`
 	// Worker template (PRD #18): the UI-declared choice and the worker's
 	// self-reported value. Either may be null (no choice / older image); the UI
 	// badges drift when both are set and differ.
@@ -148,6 +155,16 @@ type WorkerDTO struct {
 	StatsDiskDindTotalBytes  *int64 `json:"stats_disk_dind_total_bytes"`
 	StatsDiskDindInodes      *int64 `json:"stats_disk_dind_inodes"`
 	StatsDiskDindTotalInodes *int64 `json:"stats_disk_dind_total_inodes"`
+	// Data-volume inode sample (PRD #1809 M6, D8): used + total inodes of the data volume,
+	// null until the worker reports them (and re-nulled if it stops). DISPLAY-ONLY, never a
+	// disk_pressure input. Same freshness contract as the fields above.
+	StatsDiskDataInodes      *int64 `json:"stats_disk_data_inodes"`
+	StatsDiskDataTotalInodes *int64 `json:"stats_disk_data_total_inodes"`
+	// RunDisk is the worker's largest runs by HOME size (PRD #1809 M6, D8), at most
+	// WorkerRunDiskTop entries, largest first, from its latest heartbeat's run_disk report
+	// (entries whose sampled_at is more than 25 minutes old are dropped). ALWAYS a JSON array,
+	// never null: the list handlers overlay it and the DTO builders seed it to []. Display-only.
+	RunDisk []WorkerRunDiskDTO `json:"run_disk"`
 	// Which Anthropic credential this worker's RUN-lane claims spend (PRD #104 M3).
 	// Both null means "unbound": the worker spends its owner's default token, which
 	// is every worker's state until someone binds one. The label rides alongside the
@@ -206,6 +223,23 @@ type WorkerDTO struct {
 type AdminWorkerDTO struct {
 	WorkerDTO
 	OwnerEmail string `json:"owner_email"`
+}
+
+// WorkerRunDiskTop is how many of a worker's largest runs WorkerDTO.RunDisk carries.
+const WorkerRunDiskTop = 5
+
+// WorkerRunDiskDTO is one run's disk size on a worker (PRD #1809 M6, D8): the bytes under the
+// run's HOME and, of those, the rebuildable caches. Truncated means the worker's size walk was cut
+// short, so both numbers are lower bounds. SampledAt is the MEASUREMENT time: when the worker's
+// size walk finished, as the worker reported it (clamped server-side to [now-24h, now+5m]; an older
+// worker that sends none gets the heartbeat's arrival time). It is what the 15-minute freshness
+// window is measured against. Nested in WorkerDTO.RunDisk.
+type WorkerRunDiskDTO struct {
+	RunID      string    `json:"run_id"`
+	HomeBytes  int64     `json:"home_bytes"`
+	CacheBytes int64     `json:"cache_bytes"`
+	Truncated  bool      `json:"truncated"`
+	SampledAt  time.Time `json:"sampled_at"`
 }
 
 // WorkerReportedRunDTO is one entry of a worker's reported active-run snapshot (PRD #1390

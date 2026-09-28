@@ -231,6 +231,8 @@ var runDTOKeys = []string{
 	// promotion stamp (a distinct column from retry_not_before, the limit park's); forge_park_count
 	// is the forge-only lifetime counter; forge_park_max is the effective cap (0 = unlimited).
 	"recovery_wait_cause", "recovery_retry_not_before", "forge_park_count", "forge_park_max",
+	// PRD #1809 M5: the disk-only lifetime counter of counted data_volume_full parks.
+	"disk_park_count",
 	// PRD #1590 D6: the derived owner action for a codex_account_unavailable hold (null otherwise).
 	"codex_account_action",
 	// Issue #1730: the run's bound alias id and its independent snapshotted label.
@@ -836,6 +838,9 @@ var workerDTOKeys = []string{
 	// Display-only, never a disk_pressure input (that stays nix/data only).
 	"stats_disk_dind_bytes", "stats_disk_dind_total_bytes",
 	"stats_disk_dind_inodes", "stats_disk_dind_total_inodes",
+	// PRD #1809 M6 (D8): data-volume used + total inodes, and the worker's largest runs by HOME
+	// size (always an array). Display-only.
+	"stats_disk_data_inodes", "stats_disk_data_total_inodes", "run_disk",
 	// PRD #104 M3: which Anthropic credential this worker's run-lane claims spend.
 	// Both null ⇒ unbound ⇒ the owner's default. The LABEL, never the token value —
 	// this DTO is the shape the web UI and the CLI both read.

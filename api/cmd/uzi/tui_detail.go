@@ -785,6 +785,11 @@ func (m tuiModel) renderDetail() string {
 	if line := fitVaultParkLine(d.run, m.width); line != "" {
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
 	}
+	// The disk park line (PRD #1809 M5), same slot, ink and shedding as the vault park line: a
+	// data_volume_full park is another recovery_wait cause, so the two never both draw.
+	if line := fitDiskParkLine(d.run, m.width); line != "" {
+		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
+	}
 
 	// The near-timeout countdown (PRD #1170), the run detail's OTHER conditional second
 	// row. Drawn only while the run is flagged `slow` and carries a deadline_at, in the

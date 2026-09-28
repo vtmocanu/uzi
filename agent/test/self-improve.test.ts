@@ -1,6 +1,6 @@
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -19,6 +19,11 @@ import {
   type CheckRunner,
   type SelfImproveCheck,
 } from "../src/self-improve.js";
+
+/** Every fixture dir in this file lives under ONE per-file root, removed when the file
+ *  ends, so no fixture outlives the run in TMPDIR (PRD #1809 M2). */
+const scratchRoot = mkdtempSync(join(tmpdir(), "self-improve-"));
+after(() => rmSync(scratchRoot, { recursive: true, force: true }));
 
 describe("flagGuardPaths", () => {
   it("flags guard-critical paths and ignores ordinary ones", () => {
@@ -176,7 +181,7 @@ describe("runSelfImproveChecks", () => {
 // NOT RUN — missing deps, missing binary, a 127, a timeout — is "skipped" with the
 // reason; only a check that actually ran and genuinely failed is "failed".
 describe("defaultCheckRunner status mapping (M8: skipped is never a false failure)", () => {
-  const worktree = mkdtempSync(join(tmpdir(), "si-checks-"));
+  const worktree = mkdtempSync(join(scratchRoot, "si-checks-"));
   mkdirSync(join(worktree, "web"), { recursive: true });
   mkdirSync(join(worktree, "api"), { recursive: true });
 
@@ -294,7 +299,7 @@ describe("defaultCheckRunner status mapping (M8: skipped is never a false failur
 // gap between what the manifest declares and what the tree contains is.
 describe("stale-dependency pre-flight (#154)", () => {
   const mkProject = (manifest: string, installed: string[] | null): string => {
-    const wt = mkdtempSync(join(tmpdir(), "si-stale-"));
+    const wt = mkdtempSync(join(scratchRoot, "si-stale-"));
     mkdirSync(join(wt, "web"), { recursive: true });
     writeFileSync(join(wt, "web", "package.json"), manifest);
     if (installed !== null) {
@@ -410,7 +415,7 @@ describe("buildCheckEnv scrubs worker-impersonation vars (M9)", () => {
   });
 
   it("a check spawned under the built env cannot see the token vars (end to end)", async () => {
-    const wt = mkdtempSync(join(tmpdir(), "si-env-"));
+    const wt = mkdtempSync(join(scratchRoot, "si-env-"));
     mkdirSync(join(wt, "api"), { recursive: true });
     // The probe exits 0 ONLY if the worker vars are all empty in its environment.
     const probe: SelfImproveCheck = {

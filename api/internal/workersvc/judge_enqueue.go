@@ -41,12 +41,13 @@ var preStartInfraFailOrigins = map[string]bool{
 
 // neverJudgeFailOrigins is the fail_origin set that skips the judge REGARDLESS of
 // iteration_count (PRD #1392 M1, SC3). Its members are origins that are never a real agent
-// defect, so there is nothing to retrospect however far the run got. forge_unreachable is
-// stamped ONLY inside SetState's forge-park transaction (a forge that stayed unreachable at
-// clone past the park cap), never by a worker report (workerReportableFailOrigins excludes it,
-// and CoerceFailOrigin drops a worker forging it), so an untrusted report cannot steer its
-// skip. worker_residue_blocked (issue #1783) is the one WORKER-REPORTABLE member, and the agent
-// can induce it (see its entry below). Unlike preStartInfraFailOrigins it is NOT
+// defect, so there is nothing to retrospect however far the run got. All but one are
+// SERVER-DERIVED. Its first member is forge_unreachable: it is stamped ONLY inside SetState's
+// forge-park transaction (a forge that stayed unreachable at clone past the park cap), never by
+// a worker report (workerReportableFailOrigins excludes it, and CoerceFailOrigin drops a worker
+// forging it), so an untrusted report can never steer its skip. worker_residue_blocked (issue
+// #1783) is the one WORKER-REPORTABLE member, and the agent can induce it (see its entry
+// below). Unlike preStartInfraFailOrigins it is NOT
 // gated on iteration_count == 0, because a resumed run's forge cap-fail carries
 // iteration_count > 0 (see preStartInfraFailOrigins). A strict subset of failorigin.go's
 // vocabulary. TestNeverJudgeFailOriginsExact pins the exact set.
@@ -71,6 +72,11 @@ var neverJudgeFailOrigins = map[string]bool{
 	// PRD #1795 M1: the refusal cap on plan-gate re-presentation fails the run inside SetState's
 	// awaiting_approval transaction. Server-derived (see failorigin.go), never an agent defect.
 	"gate_presentation_refused": true,
+	// PRD #1809 M5 (D6): a run failed past the disk park cap (its worker's data volume stayed
+	// full). Server-derived (stamped in parkDataVolumeFull, never a worker report) and an
+	// environment failure, not an agent defect, so it skips the judge regardless of
+	// iteration_count: it lands mid-run, where iteration_count is usually > 0.
+	"data_volume_full": true,
 }
 
 // envPublishFailOrigins is the fail_origin set for ENVIRONMENT-CAUSED publish failures (issue

@@ -8,7 +8,7 @@ import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { FollowUpOutcome, RunContext } from "../src/executor.js";
 import type { IterationBudget } from "../src/protocol.js";
 import type { PlanVerdict } from "../src/steering.js";
-import { nullLogger } from "./helpers.js";
+import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 
 /**
  * PRD #1189 M1 (D6) — the worker honors a SERVED wall-clock extension.
@@ -110,10 +110,7 @@ let saved: Record<string, string | undefined>;
 
 // A worktree path that never exists (the executor must not require it on disk) with a
 // unique-per-call basename to avoid the skills-plugin-dir race sdk-executor.test.ts documents.
-let wtSeq = 0;
-function nonexistentWorktree(): string {
-  return path.join(os.tmpdir(), `uzi-extend-wt-${process.pid}-${wtSeq++}`);
-}
+const nonexistentWorktree = nonexistentWorktreeFactory("uzi-extend");
 
 function makeCtx(overrides: Partial<RunContext> = {}): { ctx: RunContext } {
   const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };

@@ -434,6 +434,40 @@ export interface WorkerStats {
   disk_dind_inodes?: number;
   /** Total inodes on the DinD data root (`files`). */
   disk_dind_total_inodes?: number;
+  /** PRD #1809 D8: used inodes on the data volume (`files − ffree` from the same statfs as
+   *  disk_data_bytes). Paired with disk_data_total_inodes: both present or both absent; absent
+   *  when statfs fails or the filesystem keeps no inode accounting (`files` 0). */
+  disk_data_inodes?: number;
+  /** PRD #1809 D8: total inodes on the data volume (`files`). */
+  disk_data_total_inodes?: number;
+  /** PRD #1809 D8: the HOME size of each live or parked run with a HOME on this worker, from the
+   *  worker's latest background sample (run-disk.ts; sampled at most every
+   *  UZI_RUN_DISK_SAMPLE_INTERVAL, never on the heartbeat path; each entry says when it was
+   *  measured, `sampled_at`). Largest `home_bytes` first, at
+   *  most {@link RUN_DISK_MAX_ENTRIES} entries. Absent until the first sample completes, and when
+   *  the sampler is off. The api's stats decode ignores unknown keys, so no feature gate. */
+  run_disk?: RunDiskEntry[];
+}
+
+/** PRD #1809 D8: the most {@link WorkerStats.run_disk} entries one heartbeat carries. */
+export const RUN_DISK_MAX_ENTRIES = 50;
+
+/** PRD #1809 D8: one run's HOME size on this worker (see {@link WorkerStats.run_disk}). */
+export interface RunDiskEntry {
+  run_id: string;
+  /** Allocated bytes under the run's whole HOME (`<dataDir>/agent-home/<run>`), a lower bound. */
+  home_bytes: number;
+  /** Allocated bytes under the HOME's rebuildable cache subtrees (Go build and module caches,
+   *  the npm cache), part of `home_bytes`. */
+  cache_bytes: number;
+  /** The measure stopped at its entry or time budget, so both numbers are lower bounds.
+   *  Omitted when false. */
+  truncated?: boolean;
+  /** When the worker's sample that produced this entry finished measuring (RFC 3339, UTC, e.g.
+   *  `2026-09-28T12:00:00.000Z`). Entries of one heartbeat can differ: a partial sample keeps the
+   *  previous entry, with its own `sampled_at`, for a run it did not reach, so the api ages each
+   *  size by when it was measured rather than when the heartbeat arrived. */
+  sampled_at: string;
 }
 
 /**
@@ -1578,6 +1612,10 @@ export interface WallParkRequest {
    *  the fence refuses a released/superseded stale flight's reclaimed run. Optional so a legacy
    *  worker omits it (it never advertises wall_park_v1, so the sweep parks its run server-side). */
   claim_generation?: number;
+  /** PRD #1809 D8: whether the checkpoint this park published contains the run's latest committed
+   *  work (see {@link StateRequest.checkpoint_contains_latest}). Omitted when nothing was
+   *  published, and sent only to an api that advertised `run_checkpoint_durability`. */
+  checkpoint_contains_latest?: boolean;
 }
 
 /** Request body for POST /api/worker/runs/:id/findings (PRD #333 M2). The server
@@ -2194,17 +2232,39 @@ export interface StateRequest {
    *  permit to match. */
   head?: string;
   /** PRD #1392 M2 (D9/D10): the typed cause of a `recovery_wait` park. The worker sends
-   *  "forge_unreachable" (the pre-clone transient-forge park, gated on `recovery_park_cause`) and,
+   *  "forge_unreachable" (the pre-clone transient-forge park, gated on `recovery_park_cause`),
    *  issue #1766, "vault_locked" (a Codex credential refresh/release deferred by a locked owner
    *  vault, gated on `recovery_cause_vault_locked`; an api without that feature gets the untyped
-   *  park). The api validates it against its own enum
-   *  (forge_unreachable|empty_turn|provider_outage|vault_locked) before any SQL and a
-   *  legacy/untyped park omits it (NULL). Additive + optional and OMITTED ENTIRELY on every
+   *  park) and, PRD #1809 D6, "data_volume_full" (a write to the worker's data volume stayed
+   *  disk-full after a reclaim and one retry, or the claim preflight found the volume full; gated
+   *  on `recovery_cause_data_volume_full`, an api without it gets the untyped park; the api 400s
+   *  this cause without `claim_generation`, so it is never sent for a chat claim). The api
+   *  validates it against its own enum
+   *  (forge_unreachable|empty_turn|provider_outage|vault_locked|data_volume_full) before any SQL
+   *  and a legacy/untyped park omits it (NULL). Additive + optional and OMITTED ENTIRELY on every
    *  other report so a pre-#1392 worker's payload and an ordinary (empty-turn) recovery park
    *  stay byte-identical on the wire; an api that predates the field 400s a report carrying it,
    *  which the worker's capability-aware fallback avoids by only sending it when the api
    *  advertised `recovery_park_cause` at register (D7). */
   recovery_cause?: string;
+  /** PRD #1809 D6: qualifies a `recovery_cause: "data_volume_full"` park. `true` parks WITHOUT
+   *  counting toward the api's lifetime cap (UZI_RUN_DISK_PARK_MAX), for M4's soft cache-cap park;
+   *  absent or false is a counted park, and past the cap the api fails the run itself (fail_origin
+   *  data_volume_full). The api 400s it with any other cause, and only accepts it once it
+   *  advertises `recovery_cause_data_volume_full`. The disk-full handling (M5) never sends it. */
+  disk_park_preventive?: boolean;
+  /** PRD #1809 D8: on a process-ending park report that published a checkpoint (the usage-limit
+   *  park, the owner pause park, a recovery park including the mid-run `data_volume_full` one),
+   *  whether that published checkpoint contains the run's latest committed work. `false` when the
+   *  fetch-back of the clone into the worker bare failed or the bare's tracking ref does not cover
+   *  the clone's HEAD, so the checkpoint on origin is older than the work (the #1798 incident: the
+   *  park said "checkpoint published" while the latest commits lived on the worker only). OMITTED
+   *  when no checkpoint was published on this park or its content is unknown. "Checkpoint
+   *  published" keeps meaning only that a ref was published; this field says what it holds. Sent
+   *  ONLY to an api that advertised `run_checkpoint_durability` at register (the /state decode is
+   *  strict, so an older api would 400 it). Informational: the worker's custody handling does not
+   *  key on it. */
+  checkpoint_contains_latest?: boolean;
   /** PRD #1391 Run B M3 (D3): the worker's DURABLE message fence on a run-lane TERMINAL
    *  (completed/failed) report — the run's last emitted seq after the final batcher flush. The api
    *  refuses the transition with a typed 409 `messages_pending` while `runs.last_seq` is below it OR

@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { after } from "node:test";
 import type { CanonicalReseedOptions, GitCacheOptions } from "../src/git.js";
 import type { Logger } from "../src/log.js";
 import type { WorkerClient } from "../src/client.js";
@@ -28,6 +30,21 @@ async function plainScratchProvisioner(clonePath: string): Promise<void> {
   const existing = fs.existsSync(exclude) ? fs.readFileSync(exclude, "utf8") : "";
   if (existing.split("\n").includes("/.uzi/scratch/")) return;
   fs.appendFileSync(exclude, `${existing.length > 0 && !existing.endsWith("\n") ? "\n" : ""}/.uzi/scratch/\n`);
+}
+
+/** A factory of worktree paths that are never created, for executor suites that must
+ *  not require the worktree on disk. Each path sits inside ONE per-call mkdtemp root,
+ *  never directly in os.tmpdir(): the executor derives sibling dirs from a worktree
+ *  path (skillsPluginDir writes `.uzi-skills-<basename>` next to it), so a bare
+ *  os.tmpdir() child leaked that sibling into the scratch dir on every test (PRD #1809
+ *  M2; `task test:agent` fails on any leftover). The root is removed by an after()
+ *  hook registered where the factory is called: at module scope that is the file's
+ *  end, inside a describe() that suite's end. */
+export function nonexistentWorktreeFactory(prefix: string): () => string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-root-`));
+  after(() => fs.rmSync(root, { recursive: true, force: true }));
+  let seq = 0;
+  return () => path.join(root, `${prefix}-wt-${seq++}`);
 }
 
 /** A no-op logger so tests don't spray JSON lines into the reporter. */

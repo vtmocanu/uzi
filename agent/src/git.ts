@@ -5693,7 +5693,7 @@ export class GitCache {
    *  holds COMMITTED work that a report-only completion would orphan. `fetch()` mirrors
    *  `refs/uzi-checkpoints/<branch>` into the bare best-effort on every fetch, so this
    *  catches a checkpoint any PRIOR/cross-worker attempt landed; the runner pairs it with
-   *  its own `lastPublishedTip` to also catch a checkpoint THIS worker published mid-run
+   *  its own `landedCheckpoint` to also catch a checkpoint THIS worker published mid-run
    *  (not yet mirrored locally). The report-only completion guard uses the union to refuse
    *  orphaning a published checkpoint.
    *

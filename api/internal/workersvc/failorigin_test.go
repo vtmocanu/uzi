@@ -37,8 +37,10 @@ func TestCoerceFailOrigin(t *testing.T) {
 	// (else the split is stale). forge_unreachable (PRD #1392 M1) is server-derived: SetState's
 	// forge-park transaction stamps it directly, never the worker. task_undispatched (issue
 	// #1367) is server-derived too: the undispatched-handoff sweep stamps it inside its own
-	// conditional UPDATE, never a worker report.
-	serverOnly := []string{"worker_lost", "run_timeout", "plan_rejected", "auto_stopped", "guardrail_blocked", "forge_unreachable", "task_undispatched", "gate_presentation_refused"}
+	// conditional UPDATE, never a worker report. gate_presentation_refused (PRD #1795 M1) is stamped
+	// by SetState's awaiting_approval transaction past the refusal cap, and data_volume_full (PRD
+	// #1809 M5) by SetState's disk-park transaction past the disk park cap, never the worker.
+	serverOnly := []string{"worker_lost", "run_timeout", "plan_rejected", "auto_stopped", "guardrail_blocked", "forge_unreachable", "task_undispatched", "gate_presentation_refused", "data_volume_full"}
 	for _, s := range serverOnly {
 		if !failOriginSet[s] {
 			t.Fatalf("%q is in the server-only list but not in the stored vocabulary", s)

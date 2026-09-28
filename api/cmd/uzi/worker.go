@@ -74,7 +74,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 					version = "-"
 				}
 				rows = append(rows, []string{
-					w.ID, cellText(w.Name), statusCell(w), uptimeCell(w), version, upgradeCell(w), bindModeCell(w), reportedRunsCell(w), outboxCell(w),
+					w.ID, cellText(w.Name), statusCell(w), uptimeCell(w), version, upgradeCell(w), bindModeCell(w), reportedRunsCell(w), largestRunCell(w), outboxCell(w),
 				})
 			}
 			// VERSION is here because docs/run-auto-stopped.md's first remedy for an
@@ -97,7 +97,10 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			// snapshot), summarized per phase — so a split between the api's picture and the
 			// worker's is visible here instead of inferred from pod logs. "-" when it reports none.
 			// It sits before OUTBOX (kept last, its own test pins that) so neither shifts the other.
-			return p.Table([]string{"ID", "NAME", "STATUS", "UPTIME", "VERSION", "UPGRADE", "TOKEN", "RUNS", "OUTBOX"}, rows)
+			// LARGEST RUN is PRD #1809 M6 (D8): the HOME size of the worker's largest run, so one
+			// run growing toward filling the data volume is visible before it does. "-" when the
+			// worker reports no run sizes; also before OUTBOX.
+			return p.Table([]string{"ID", "NAME", "STATUS", "UPTIME", "VERSION", "UPGRADE", "TOKEN", "RUNS", "LARGEST RUN", "OUTBOX"}, rows)
 		},
 	}
 
@@ -412,6 +415,35 @@ func outboxCell(w apitypes.WorkerDTO) string {
 		s += " (blocked)"
 	}
 	return s
+}
+
+// largestRunCell renders the HOME size of the worker's largest run for `uzi worker list`'s
+// LARGEST RUN column (PRD #1809 M6, D8). The server sends run_disk largest first, so the first
+// entry is the answer. "-" when the worker reports no run sizes (an older worker, or none fresh).
+// The size is compact (no space, e.g. "4.2GiB") so the cell stays one whitespace-separated field;
+// a trailing "+" marks a truncated size walk, whose number is a lower bound. The run id and cache
+// bytes ride `--json` (run_disk) for scripting.
+func largestRunCell(w apitypes.WorkerDTO) string {
+	if len(w.RunDisk) == 0 {
+		return "-"
+	}
+	top := w.RunDisk[0]
+	for _, rd := range w.RunDisk[1:] {
+		if rd.HomeBytes > top.HomeBytes {
+			top = rd
+		}
+	}
+	cell := compactBytes(top.HomeBytes)
+	if top.Truncated {
+		cell += "+"
+	}
+	return cell
+}
+
+// compactBytes is humanBytes without the space ("4.2GiB", "512B"), for a table cell that must
+// stay one field.
+func compactBytes(n int64) string {
+	return strings.ReplaceAll(humanBytes(n), " ", "")
 }
 
 // reportedRunsCell summarizes the runs a worker SAYS it is executing, for `uzi worker list`'s

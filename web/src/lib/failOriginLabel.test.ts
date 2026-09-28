@@ -10,6 +10,14 @@ describe("failOriginLabel", () => {
     expect(failOriginLabel("worker_residue_blocked")).toBe("worker residue blocked");
   });
 
+  it("labels the data_volume_full origin (PRD #1809)", () => {
+    expect(failOriginLabel("data_volume_full")).toBe("data volume full");
+  });
+
+  it("labels the task_undispatched origin (issue #1367)", () => {
+    expect(failOriginLabel("task_undispatched")).toBe("task undispatched");
+  });
+
   it("labels a known origin", () => {
     expect(failOriginLabel("push_secret_blocked")).toBe("push secret blocked");
   });

@@ -8,7 +8,7 @@ import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { EmittedMessage, RunContext } from "../src/executor.js";
 import type { AnswerVerdict, PlanVerdict } from "../src/steering.js";
 import type { AskUserQuestion } from "../src/protocol.js";
-import { nullLogger } from "./helpers.js";
+import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 import { MAX_LEAD_FINAL_MESSAGE_LEN, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING } from "../src/plan-missing.js";
 
 // A worktree path that is UNIQUE PER PROCESS AND PER CALL, and that deliberately
@@ -22,10 +22,7 @@ import { MAX_LEAD_FINAL_MESSAGE_LEN, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING } f
 // measured 1 failure in 6 on the isolated pair, surfacing as ENOTEMPTY from one file's
 // recursive remove or ENOENT from the other's mkdir. Two different literals would have
 // been the same defect with a longer fuse; the basename has to be unique.
-let nonexistentWorktreeSeq = 0;
-function nonexistentWorktree(): string {
-  return path.join(os.tmpdir(), `uzi-nonexistent-wt-${process.pid}-${nonexistentWorktreeSeq++}`);
-}
+const nonexistentWorktree = nonexistentWorktreeFactory("uzi-nonexistent");
 
 
 // PRD #88 M4/M5 at the executor level: the pre-run park (which must NOT hit

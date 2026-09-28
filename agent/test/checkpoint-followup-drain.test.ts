@@ -6,7 +6,7 @@ import path from "node:path";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { RunContext } from "../src/executor.js";
-import { nullLogger } from "./helpers.js";
+import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 
 // Issue #1152: the implement loop's queued follow-up drain (`ctx.pullFollowUp`) must run
 // at a cooperative-checkpoint boundary too. Before the fix the checkpoint branch
@@ -25,10 +25,7 @@ const FAKE_JOIN_TOKEN = "dummy-join-token-do-not-scan-2222";
 
 // Per-process, per-call unique non-existent worktree (see the race note in
 // sdk-executor.test.ts: the executor materializes a sibling `.uzi-skills-<basename>`).
-let nonexistentWorktreeSeq = 0;
-function nonexistentWorktree(): string {
-  return path.join(os.tmpdir(), `uzi-ckpt-followup-wt-${process.pid}-${nonexistentWorktreeSeq++}`);
-}
+const nonexistentWorktree = nonexistentWorktreeFactory("uzi-ckpt-followup");
 
 function assistantText(text: string, sessionId = "sess-1"): SDKMessage {
   return { type: "assistant", session_id: sessionId, message: { content: [{ type: "text", text }] } } as unknown as SDKMessage;

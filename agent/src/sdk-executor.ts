@@ -36,7 +36,7 @@ import { buildCheckEnv, buildSdkEnv } from "./sdk-env.js";
 import { makeProgressObserver } from "./milestone-progress-observer.js";
 import type { DockerWiring } from "./docker-wiring.js";
 import { provisionTools } from "./provision.js";
-import { provisionRunTools } from "./provision-run.js";
+import { provisionRunTools, removeProvisionDir } from "./provision-run.js";
 import {
   installJsDeps,
   DETAIL_NO_LOCKFILE,
@@ -85,6 +85,8 @@ import {
 } from "./signals.js";
 import { classifyLimitEvidence, LimitReachedError } from "./limit.js";
 import { PauseNowSignal, CredentialSwitchSignal, PLAN_APPROVAL_TIMEOUT_REASON, type PlanVerdict } from "./steering.js";
+import { DiskParkSignal } from "./cache-cap.js";
+import { type RunProcessReap, type RunProcessScan, reapRunProcesses, scanRunProcesses } from "./run-procs.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { buildForgeToolsServer, FORGE_SERVER_NAME } from "./forge-tools.js";
 import { buildFindingsToolsServer, FINDINGS_SERVER_NAME } from "./findings-tools.js";
@@ -439,7 +441,44 @@ export interface SdkExecutorOptions {
    *  {@link EMPTY_TURN_MAX_RETRIES}; finite nonnegative overrides are floored,
    *  with zero disabling in-process retries. Invalid values use the default. */
   emptyTurnMaxRetries?: number;
+  /** PRD #1809 D4: how long the quiet-point probe waits for the previous turn's processes to
+   *  exit before it calls the run busy (default {@link QUIET_SETTLE_MS}). Injected in tests. */
+  quietSettleMs?: number;
+  /** PRD #1809 D4: find / SIGKILL the processes attributed to this run by environment (HOME) or
+   *  working directory (default run-procs.ts, an agent-uid helper reading the proc tree). Tests
+   *  inject a fake. */
+  runProcesses?: RunProcessOps;
 }
+
+/** PRD #1809 D4: the run-process attribution the executor uses (see run-procs.ts). */
+export interface RunProcessOps {
+  /** `spawnedPids`: the run's live CLI pids, which link an unreadable descendant to the run. */
+  scan: (home: string, worktree: string | undefined, spawnedPids: readonly number[]) => Promise<RunProcessScan>;
+  reap: (home: string, worktree: string | undefined, spawnedPids: readonly number[]) => Promise<RunProcessReap>;
+}
+
+const defaultRunProcesses: RunProcessOps = {
+  scan: (home, worktree, spawnedPids) => scanRunProcesses(home, worktree, spawnedPids),
+  reap: (home, worktree, spawnedPids) => reapRunProcesses(home, worktree, spawnedPids),
+};
+
+/**
+ * PRD #1809 D4: throw the hard layer's COUNTED disk park when the worker-local `disk` stop is set
+ * (steering's sticky pause mode). Called at every implement boundary and on every path that clears
+ * a trip and continues, because the stop's own turn drop is first-wins and can be swallowed there.
+ */
+function throwIfDiskStop(ctx: RunContext): void {
+  if (ctx.pauseModeRequested?.() === "disk") throw new DiskParkSignal(false);
+}
+
+/**
+ * PRD #1809 D4: how long the between-turns quiet-point probe polls for every process group of the
+ * run to be gone before it reports a live process. A finished turn's CLI can take a moment to exit
+ * after its result arrives, and a probe that called that "alive" would block a trim, or with a
+ * runaway cache even park the run, for no reason.
+ */
+const QUIET_SETTLE_MS = 2_000;
+const QUIET_POLL_MS = 100;
 
 /** What one turn observed: the session id, and any workflow signals. */
 interface TurnResult {
@@ -635,6 +674,13 @@ export class SdkExecutor implements Executor {
   private readonly kill: (pid: number | undefined) => boolean;
   private readonly killCliGroup: (pgid: number) => boolean;
   private readonly cliGroupPresent: (pgid: number) => boolean | undefined;
+  /** PRD #1809 D4: see SdkExecutorOptions.quietSettleMs. */
+  private readonly quietSettleMs: number;
+  /** PRD #1809 D4: see SdkExecutorOptions.runProcesses. */
+  private readonly runProcesses: RunProcessOps;
+  /** PRD #1809 D4: the current run's worktree, for the process attribution (a working directory
+   *  inside it is the run's). Set at the start of run(). */
+  private runWorktree: string | undefined;
   private readonly secretPaths: readonly string[];
   private readonly provisionRoot: string;
   private readonly provisionHomeDir: string;
@@ -706,6 +752,8 @@ export class SdkExecutor implements Executor {
     this.killCliGroup = opts.killCliGroup ?? killProcessGroupOnly;
     this.cliGroupPresent = opts.cliGroupPresent ?? processGroupPresent;
     this.rootStartTime = opts.rootStartTime;
+    this.quietSettleMs = opts.quietSettleMs ?? QUIET_SETTLE_MS;
+    this.runProcesses = opts.runProcesses ?? defaultRunProcesses;
     this.secretPaths = opts.secretPaths ?? [];
     // Provisioning HOME + root are SHARED worker-lifetime paths (Decision 5): they
     // must NOT be derived from the per-run SDK homeDir, or the nix profile/devbox
@@ -811,6 +859,29 @@ export class SdkExecutor implements Executor {
   }
 
   /**
+   * PRD #1809 D4: SIGKILL every live process attributed to this run by environment (`HOME` = this
+   * run's HOME) or working directory (inside the run's worktree or HOME), each by exact pid as the
+   * uid that owns it, re-verified immediately before the kill (run-procs.ts). The runner calls it
+   * right after {@link killAgentTree} wherever that reap must be complete: the disk parks, every
+   * park whose HOME cache drop runs, and the finalize security reap before the push. The pinned CLI
+   * spawns every Bash command detached (its own session and process group), so a backgrounded
+   * build survives the group kill. Never throws.
+   */
+  async reapAttributedProcesses(): Promise<void> {
+    const r = await this.runProcesses.reap(this.homeDir, this.runWorktree, [...this.spawnedPids]).catch(
+      (): RunProcessReap => ({ killed: [], left: [], complete: false }),
+    );
+    if (r.killed.length > 0 || r.left.length > 0 || !r.complete) {
+      this.log.warn("reaped the run's processes outside its CLI process groups", {
+        run_home: this.homeDir,
+        killed: r.killed,
+        ...(r.left.length > 0 ? { left: r.left } : {}),
+        ...(r.complete ? {} : { incomplete: true }),
+      });
+    }
+  }
+
+  /**
    * Log every dropped skill as a run message (PRD #16): the server's assembly
    * drops that rode the claim (ctx.skillsDropped — shadowed / over-limit) plus the
    * worker's own local cap drops (too_large / over_limit over the combined set).
@@ -892,6 +963,7 @@ export class SdkExecutor implements Executor {
     this.spawnedPids.clear();
     this.deadCliPids.clear();
     this.rootStartTimes.clear();
+    this.runWorktree = ctx.worktreePath;
     // Fresh per-run reducer: the first-truthy-session latch must not survive a
     // second run() on this instance (one executor per run is the norm, but keep
     // the latch honest regardless).
@@ -919,11 +991,8 @@ export class SdkExecutor implements Executor {
       this.killAgentTree();
       // Remove the per-run provisioning dir (the synthesized devbox.json + profile
       // symlinks). The nix STORE is global (on the data volume), NOT here, so this
-      // never evicts the warm-start cache. Best-effort.
-      if (drive.provisionDir)
-        await fs
-          .rm(drive.provisionDir, { recursive: true, force: true })
-          .catch(() => undefined);
+      // never evicts the warm-start cache. Best-effort, uid-aware (PRD #1809 M3).
+      if (drive.provisionDir) await removeProvisionDir(drive.provisionDir, this.log);
     }
   }
 
@@ -2229,6 +2298,12 @@ export class SdkExecutor implements Executor {
         // before control returns here. Throwing the same error takes the identical terminal cancel
         // path, so a late cancel is honored exactly like an in-flight one.
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+        // PRD #1809 D4: a worker-local `disk` stop parks at the next boundary, UNCONDITIONALLY. Its
+        // turn drop is first-wins with every other trip (trip()), so a stop that landed while a
+        // declined owner `now` park, a given-up credential switch or a refused wall park was being
+        // handled was swallowed by that path's `tripReason = undefined; continue`; checking the
+        // sticky mode here (not only inside the pause branch below) is what still parks it.
+        throwIfDiskStop(ctx);
         // PRD #122 M2: report the iteration (carrying the latest milestone progress) and
         // apply the server-served effective budget. The cap only ever RISES (a scaled run
         // gets more turns; a single/zero-milestone run's ACK carries none, so this is
@@ -2320,6 +2395,8 @@ export class SdkExecutor implements Executor {
           // pending mode reads `wall`. A post-attempt run never reaches here for a wall (the server's
           // #1226 carve-out steers it to the completion hold via budgetExhausted below instead), so
           // this pre-attempt boundary parks it at the wall.
+          // PRD #1809 D4: a worker-local `disk` stop is never an owner pause park.
+          throwIfDiskStop(ctx);
           if (ctx.pauseModeRequested?.() === "wall") {
             const outcome = await this.parkForWall(ctx, at);
             if (outcome === "parked" || outcome === "undeliverable") {
@@ -2354,6 +2431,16 @@ export class SdkExecutor implements Executor {
           completionHeld = { reason: REASON_COMPLETION_BUDGET_EXHAUSTED };
           break;
         }
+        // PRD #1809 D4 (soft layer): the per-run cache cap, at this turn boundary. The governor
+        // measures the run's caches and, over the cap, trims them only at a proven quiet point (the
+        // probe: no process of the run alive). A run that stays over the cap parks here, through
+        // the runner's process-ending data_volume_full park (preventive, uncounted), which drops
+        // its caches on the way out.
+        const capVerdict = await ctx.cacheCapBoundary?.(() => this.runProcessAlive());
+        // A hard stop requested while the boundary measured or trimmed wins: it is the COUNTED
+        // park, whatever the soft layer concluded.
+        throwIfDiskStop(ctx);
+        if (capVerdict === "park") throw new DiskParkSignal(true);
         ctx.emit({
           kind: "status",
           agent: "worker",
@@ -2497,6 +2584,7 @@ export class SdkExecutor implements Executor {
             }
             if (outcome === "gave_up") {
               state.tripReason = undefined;
+              throwIfDiskStop(ctx);
               continue;
             }
             throw err;
@@ -2510,6 +2598,10 @@ export class SdkExecutor implements Executor {
                 served?.completedCount ?? latestProgress?.completed.length ?? 0,
               total: frozenMilestones?.length,
             };
+            // PRD #1809 D4 (hard layer): a worker-local `disk` stop rides the same PauseNowSignal.
+            // It is not an owner pause and never a completion hold: the runner reaps the tree,
+            // captures what is committed and parks the run (data_volume_full, counted).
+            throwIfDiskStop(ctx);
             // PRD #1497 M2: a `wall` pause (the sweep's system-authored wall-clock park) rides the
             // SAME PauseNowSignal that drops the turn but carries no mode; branch on getPauseMode.
             if (ctx.pauseModeRequested?.() === "wall") {
@@ -2537,6 +2629,7 @@ export class SdkExecutor implements Executor {
               // declined-`now` path below): the wall lifts from the next reportIteration's total.
               if (outcome === "refused") ctx.clearWallMode?.();
               state.tripReason = undefined;
+              throwIfDiskStop(ctx);
               continue;
             }
             if (await this.requestPause(ctx, at)) {
@@ -2554,6 +2647,7 @@ export class SdkExecutor implements Executor {
             // the restarted turn via the re-armable ctx.onPauseNow interrupt (which trips this same
             // REASON_PAUSE_NOW). Both were silently dropped before this rework.
             state.tripReason = undefined;
+            throwIfDiskStop(ctx);
             continue;
           }
           // PRD #1226 M3 (D3): a POST-attempt WALL/IDLE trip routes to the completion hold (M4)
@@ -2594,6 +2688,7 @@ export class SdkExecutor implements Executor {
             if (outcome === "refused") {
               ctx.clearWallMode?.();
               state.tripReason = undefined;
+              throwIfDiskStop(ctx);
               continue;
             }
           }
@@ -3309,6 +3404,9 @@ export class SdkExecutor implements Executor {
         if (outcome === "released") return { released: true };
         if (outcome === "gave_up") {
           state.tripReason = undefined;
+          // PRD #1809 D4: a `disk` stop that landed during the switch attempt lost its trip to the
+          // switch's; it parks now instead of re-running the wait.
+          throwIfDiskStop(ctx);
           continue;
         }
         throw err; // no hook wired: let the runner's outer catch handle it, as before this fix
@@ -3875,6 +3973,48 @@ export class SdkExecutor implements Executor {
         ? `provider transient error persisted after bounded in-process retries: ${lastProviderErr.message}`
         : undefined,
     );
+  }
+
+  /**
+   * PRD #1809 D4: the quiet-point probe the cache cap trims behind. Resolves true while any process
+   * of this run is alive, by two checks, both of which must come back empty:
+   *  - the CLI process groups: each CLI this run spawned leads its own group (spawnDetached); a
+   *    group with members (or whose presence cannot be determined, fail closed) is alive. A group
+   *    confirmed gone (ESRCH) is pruned from the reap set, so a recycled pid is never signalled;
+   *  - the ATTRIBUTED processes (run-procs.ts): the pinned CLI spawns every Bash command detached,
+   *    in a new session and process group, so a backgrounded `go test ./... &` is in none of the
+   *    CLI's groups. It still carries `HOME=<this run's HOME>` (or a working directory inside the
+   *    run's trees), and the scan finds it. A scan that is incomplete (a budget ran out, a uid it
+   *    could not read, a helper that failed) is unknown, and unknown is alive.
+   * Polls up to {@link quietSettleMs} for both to empty, since the previous turn's CLI and its
+   * children may still be exiting. Only meaningful between turns, which is the only place the
+   * implement loop calls it.
+   */
+  private async runProcessAlive(): Promise<boolean> {
+    const started = Date.now();
+    for (;;) {
+      let alive = false;
+      // Deleting the current entry while iterating a Set is safe: iteration continues with the next.
+      for (const pid of this.spawnedPids) {
+        const present = this.cliGroupPresent(pid);
+        if (present === false) {
+          this.spawnedPids.delete(pid);
+          this.deadCliPids.delete(pid);
+          continue;
+        }
+        alive = true;
+        break;
+      }
+      if (!alive) {
+        const scan = await this.runProcesses
+          .scan(this.homeDir, this.runWorktree, [...this.spawnedPids])
+          .catch((): RunProcessScan => ({ pids: [], complete: false }));
+        alive = !scan.complete || scan.pids.length > 0;
+      }
+      if (!alive) return false;
+      if (Date.now() - started >= this.quietSettleMs) return true;
+      await sleep(QUIET_POLL_MS);
+    }
   }
 
   /**

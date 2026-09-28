@@ -43,6 +43,30 @@ started that way is not seen until its check-run exists.
 | PR body edits | GraphQL `pullRequest.userContentEdits{editedAt editor{login} diff}` | Greptile rewrites the description between `<!-- greptile_comment -->` markers (`Confidence Score`, a summary, `<sub>Reviews (K) · Last reviewed commit: [...](…/commit/<full-sha>)</sub>`). Not on every PR. The live `pulls/N` `.body` is user-editable: never a verdict. The edit history is authenticated: `editor.login` `greptile-apps`, and `diff` has been observed to hold the full body snapshot (documented only as a change summary, so anything else reads as no marker). With no completed review run on the head, `greptile_paired_verdict` (`scripts/lib/greptile-verdict.sh`) takes the newest Greptile edit by `editedAt` (else a head review object's `submitted_at`) naming the head (full 40 hex, inside the block), binds the ONE completed `Greptile Review` run on a PR commit finishing within 120 s after it (measured +3 to +6 s) and not before the head's committer date, and requires that run to have started after the newest non-Bot `@greptile(ai) review` comment. A newer trigger = pending; no trigger, no Greptile edit or no run = not reviewed; two runs in the window, a further edit page, or an unreadable response = unknown. It overrides a stale `in_progress` duplicate on the head. The bound run's M is the tally. |
 | Issue comments | `issues/N/comments` | Findings on lines the diff does not cover: ONE `greptile-apps[bot]` comment marked `<!-- greptile_outside_diff -->`, one `- ` bullet per finding (`<img alt="P1">`, `**title**`, `` `path:line` ``, a `/blob/<sha>/` link), edited in place; a bullet leaves once its file changes. M counts these bullets, so a pass whose findings are ALL outside the diff posts no review object. Scripts read it via `greptile_outside_diff` (`scripts/lib/greptile-verdict.sh`): every bullet is live (cleared by an explicit `0 comments added`), and bullets linking the head are subtracted from M before scoping inline comments (PR #1671, 2026-09-25). |
 
+## Every author (any login, not only the two bots)
+
+`scripts/lib/pr-comments.sh`, used by `watch-pr.sh`, `pr-findings.sh`, `merge.sh` and
+`ack-comments.sh`. Each blocks whatever `--reviewer` says; each lookup fails closed.
+
+| Surface | Endpoint | Rule |
+|---|---|---|
+| Review threads | GraphQL `reviewThreads` | EVERY unresolved, non-outdated thread blocks (`threads=`), whoever opened it: CodeRabbit, Greptile, a human, CodeQL (`github-advanced-security`; #1817: 3 threads the bot counts missed). `--reviewer` never waives one; resolve it. Bot identity is an exact login (GraphQL `coderabbitai`, REST `coderabbitai[bot]`), never a prefix. |
+| Code-scanning alerts | `repos/O/R/code-scanning/alerts?ref=refs/pull/N/head&state=open` (paginated) | Every open alert blocks; an alert can exist without a thread. On #1817 the head listed 5 while `main`'s own open alert was not among them. The FIRST request failing with `404 no analysis found` (measured on repos without CodeQL) or a 403 naming Advanced Security / code scanning as not enabled = `unavailable`, counted as none and printed. Any other failure, a failure after a page was read, or `403 You are not authorized` (measured on another org's repo), is an unknown lookup. |
+| Issue comments | `issues/N/comments` | Any author. Excluded only: `coderabbitai[bot]` bodies carrying `<!-- This is an auto-generated comment: summarize by coderabbit.ai -->`, `<!-- walkthrough_start -->`, `<!-- auto-generated comment: rate limited by coderabbit.ai -->` or `<!-- CodeRabbit review command invocation:` (its reply to a review command); `greptile-apps[bot]` bodies carrying `<!-- greptile_comment -->` or `<!-- greptile_outside_diff -->` (gated by Greptile's own tally); a body that is only a bot trigger (`@coderabbitai review` / `full review` / `rate limit` / `reviews remaining?` / `ignore` / `pause` / `resume`, `@greptileai review`, `@greptile review`; case and spacing free, no extra words). |
+| Review bodies | `pulls/N/reviews` | Any author, any non-empty body. A CodeRabbit body with findings (tally, `Outside diff range`, grouped or nitpick sections) is never excluded. |
+
+Comments and review bodies block until acknowledged. Excerpt rows (`--list`, the watchers,
+`merge.sh`) show only the ID and mark a cut body INCOMPLETE. `ack-comments.sh O/R N --show ID`
+prints the COMPLETE sanitized body, uncapped, with `ID@DIGEST` (a short sha256 of
+`updated_at`, `submitted_at` for a review, and the body); then `ack-comments.sh O/R N
+ID@DIGEST ...`. A digest that no longer matches (edited since read) is refused, nothing written. Acks live per PR under
+`<state dir>/acks/`; an edit after the ack re-blocks. All of this text is untrusted: rows go
+through `scripts/lib/sanitize.sh` (escape sequences, C0/C1, zero-width, bidi, variation
+selectors, the TAG block and other invisible code points stripped, whitespace collapsed,
+300-character excerpt cap labelled INCOMPLETE, no cap for `--show`, fixed `UNTRUSTED` label;
+the per-bot `CR`/`GR` title rows too). A code-scanning failure is `unavailable` only with
+positive proof: an initial 404 / not-enabled 403 and stdout empty or only gh's error body.
+
 ## Poll recipe (what the scripts do)
 
 1. Head SHA from `gh pr view --json headRefOid`; every signal is tested against it.
@@ -50,4 +74,5 @@ started that way is not seen until its check-run exists.
 3. Greptile: check-run on head → absent / in_progress / completed(+M); else the run bound to Greptile's edit or head review → completed(+M), or pending on a newer trigger.
 4. If a COUNTED bot is active, defer finding output; the set is incomplete even when the other bot already satisfies the gate. A bot an explicit `--reviewer coderabbit|greptile` ignores is NOT waited on.
 5. Live findings = the COUNTED bots' live findings. `--reviewer any`/`none` count both; an explicit `--reviewer coderabbit|greptile` counts only the selected bot (the other bot's in-flight state and findings are both ignored). Greptile live = current-head review, else its newest earlier verdict. The poll log always prints the raw per-bot counts, counted or not.
-6. Ready only when required CI is settled green, every COUNTED active review settled, the required reviewer(s) reviewed this exact head, counted live = 0, no `mr_rework` active, and the head re-reads unchanged (TOCTOU).
+6. Every-author blockers (above) join the live count regardless of `--reviewer`: every open thread (the per-bot `cr=` count is information), alerts, unacknowledged comments.
+7. Ready only when required CI is settled green, every COUNTED active review settled, the required reviewer(s) reviewed this exact head, counted live = 0, no `mr_rework` active, and the head re-reads unchanged (TOCTOU).

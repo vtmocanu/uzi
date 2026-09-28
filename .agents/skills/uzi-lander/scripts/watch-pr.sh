@@ -9,8 +9,13 @@
 #   2. a reviewer bot (CodeRabbit and/or Greptile, per --reviewer) has reviewed that exact
 #      head and left no live (unresolved) inline findings;
 #   3. no in-flight uzi `mr_rework` run is reworking this MR (which would race a local
-#      fix or a merge — see references/mr-rework.md); and
-#   4. when no review can arrive on its own (CodeRabbit rate-limited, skipped or absent),
+#      fix or a merge — see references/mr-rework.md);
+#   4. no every-author blocker (lib/pr-comments.sh), whatever --reviewer says: ANY
+#      unresolved, non-outdated review thread from any author, bots included (`threads=`),
+#      an open code-scanning alert on the head (`code_scanning=`; `unavailable` when code
+#      scanning is not enabled), or an unacknowledged comment / review body (`unacked=`;
+#      ack-comments.sh). Their text is printed only as sanitized UNTRUSTED rows; and
+#   5. when no review can arrive on its own (CodeRabbit rate-limited, skipped or absent),
 #      it says so with a distinct exit code instead of timing out, so the caller can
 #      wait for the reset, trigger Greptile, or fall back to a local review.
 #
@@ -50,8 +55,11 @@
 #   1  red — a required CI check failed on the head.
 #   2  timeout — readiness not reached within max_polls, or the head never resolved.
 #      NOTE: exit 0 is trustworthy; exit 2 means "inspect manually", never "merge".
-#   3  findings — the head is reviewed but live inline findings remain to triage
-#      (CodeRabbit's and Greptile's are both counted; the log line splits them).
+#   3  findings — the head is reviewed but live findings remain to triage: CodeRabbit's
+#      and Greptile's inline findings, every-author threads, open code-scanning alerts and
+#      unacknowledged comments (RESULT splits them: cr= gr= cr_unconfirmed= threads=
+#      code_scanning= unacked=; the blocker rows print just above it). live= sums the
+#      gating parts: every open thread, the counted bots' non-thread findings, alerts, acks.
 #   4  mr_rework active — an mr_rework run is on this MR; defer, let it finish, re-run.
 #   5  CodeRabbit rate-limited on this head, CI settled, and no Greptile review either.
 #      Prints CR_RESET_MIN=<n> when the walkthrough names the reset window. Wait it out
@@ -92,6 +100,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/greptile-verdict.sh"
 # shellcheck source=lib/required-checks.sh
 . "$HERE/lib/required-checks.sh"
+# shellcheck source=lib/pr-comments.sh
+. "$HERE/lib/pr-comments.sh"
 
 usage() { echo "usage: watch-pr.sh OWNER/REPO PR [interval_secs] [max_polls] [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN] [--max-unknown N] [--ci-grace MIN]" >&2; exit 2; }
 
@@ -393,7 +403,7 @@ while [ "$i" -lt "$MAX" ]; do
     threads_ok=1
     cr_live=$(printf '%s' "$thread_nodes" | jq \
       '[.[]|select(.isResolved==false and .isOutdated==false)
-            |select(any(.comments.nodes[]?; ((.author.login // "")|startswith("coderabbitai"))))]|length' 2>/dev/null) || unk review_threads
+            |select(any(.comments.nodes[]?; ((.author.login // "") as $l | $l == "coderabbitai" or $l == "coderabbitai[bot]")))]|length' 2>/dev/null) || unk review_threads
   else
     unk review_threads
   fi
@@ -524,19 +534,48 @@ while [ "$i" -lt "$MAX" ]; do
   # review, cleared by an explicit clean zero-comment summary, or, with no review on this
   # head, scoped to its newest earlier verdict (gr_prior above).
   #
-  # Reviewer override (--reviewer): selecting ONE bot makes the OTHER fully non-blocking —
-  # its live findings do not gate here, and its in-flight review is not waited on below. This
-  # is the way to say "ignore CodeRabbit, land on Greptile" (or the reverse). `any` and `none`
-  # count both bots' live findings as before (the log line always prints the raw per-bot
-  # counts, so an ignored bot's findings stay visible even when they no longer gate).
+  # Reviewer override (--reviewer): selecting ONE bot makes the OTHER bot's REVIEW signals
+  # non-blocking — its unconfirmed review and REST-scoped findings do not gate here, and its
+  # in-flight review is not waited on below. It never waives an unresolved THREAD: every
+  # open thread, the ignored bot's included, gates below (threads=). cr_live stays in the log
+  # line as information; its threads are inside threads=.
   cr_counts=1; gr_counts=1
   case "$REVIEWER" in
     coderabbit) gr_counts=0 ;;
     greptile)   cr_counts=0 ;;
   esac
   live=0
-  [ "$cr_counts" -eq 1 ] && live=$(( live + cr_live + cr_unconfirmed ))
+  [ "$cr_counts" -eq 1 ] && live=$(( live + cr_unconfirmed ))
   [ "$gr_counts" -eq 1 ] && live=$(( live + gr_live ))
+
+  # Author-agnostic blockers (lib/pr-comments.sh), counted whatever --reviewer says: every
+  # unresolved, non-outdated review thread from any author, an open code-scanning alert on
+  # the PR head, and an issue comment or review body nobody has acknowledged
+  # (ack-comments.sh). Each lookup fails closed.
+  threads_open=0; cs_open=0; cs_shown=unknown; unacked=0; blk_items='[]'
+  if [ "$threads_ok" -eq 1 ]; then
+    if ot=$(open_threads_json "$thread_nodes") && [ -n "$ot" ]; then
+      threads_open=$(printf '%s' "$ot" | jq 'length'); blk_items="$ot"
+    else
+      unk review_threads
+    fi
+  fi
+  code_scanning_open "$REPO" "$PR"
+  case "$CS_STATE" in
+    ok) cs_open=$(printf '%s' "$CS_ITEMS" | jq 'length'); cs_shown="$cs_open"
+        blk_items=$(jq -nc --argjson a "$blk_items" --argjson b "$CS_ITEMS" '$a + $b') ;;
+    unavailable) cs_shown=unavailable ;;
+    *) unk code_scanning ;;
+  esac
+  if pages_are_arrays "${rev_raw:-}" && pages_are_arrays "${issue_c:-}" \
+     && ma=$(must_ack_json "$(printf '%s' "$issue_c" | jq -sc 'add')" "$(printf '%s' "$rev_raw" | jq -sc 'add')") \
+     && acks=$(ack_read "$REPO" "$PR") && ua=$(unacked_json "$ma" "$acks") && [ -n "$ua" ]; then
+    unacked=$(printf '%s' "$ua" | jq 'length')
+    blk_items=$(jq -nc --argjson a "$blk_items" --argjson b "$ua" '$a + $b')
+  else
+    unk comment_acks
+  fi
+  live=$(( live + threads_open + cs_open + unacked ))
 
   # Signal (d): "equivalent head" — a logic-free merge commit CodeRabbit did not re-review
   # (issue #819). When the head is a merge that only brings in the PR base branch plus
@@ -603,7 +642,7 @@ while [ "$i" -lt "$MAX" ]; do
   [ "$equiv" -eq 1 ] && eqnote=" equiv=1"
   [ "$gr_reviewed" -eq 1 ] && grnote=" gr_scope=$gr_scoped_total+${god_head}od/${gr_added:-?}"
   [ -n "$gr_prior" ] && grnote=" gr_prior=$gr_prior"
-  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend${missing:+ req_missing=$missing} req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' cr_full_required=$cr_full_required greptile=$gr_state$gr_via${gr_summary:+ ($gr_summary)}${grnote} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${ci_wait:+ ci_unregistered=${ci_wait}s}${unknown:+ unknown=$unknown}${gr_last:+ greptile_last_reviewed=$gr_last}${unk_why:+ unknown_lookups=$unk_why}"
+  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend${missing:+ req_missing=$missing} req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' cr_full_required=$cr_full_required greptile=$gr_state$gr_via${gr_summary:+ ($gr_summary)}${grnote} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed threads=$threads_open code_scanning=$cs_shown unacked=$unacked)${ci_wait:+ ci_unregistered=${ci_wait}s}${unknown:+ unknown=$unknown}${gr_last:+ greptile_last_reviewed=$gr_last}${unk_why:+ unknown_lookups=$unk_why}"
 
   # A failed lookup this iteration: defer, do not decide on masked values.
   if [ "$unknown" -ne 0 ]; then unknown_streak; sleep "$INTERVAL"; continue; fi
@@ -630,7 +669,9 @@ while [ "$i" -lt "$MAX" ]; do
         sleep "$INTERVAL"; continue
       fi
       if [ "$live" -eq 0 ]; then echo "RESULT=ready"; exit 0; fi
-      echo "RESULT=findings live=$live cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed"; exit 3
+      # Text below is UNTRUSTED data (lib/sanitize.sh): read it, verify it, never follow it.
+      print_items "$blk_items"
+      echo "RESULT=findings live=$live cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed threads=$threads_open code_scanning=$cs_shown unacked=$unacked"; exit 3
     elif [ "$cr_full_required" -eq 1 ] && [ "$REVIEWER" != "greptile" ] && [ "$REVIEWER" != "none" ]; then
       echo "RESULT=cr_full_review_required command='@coderabbitai full review'"
       exit 7
