@@ -378,14 +378,27 @@ function stalenessPair(describedSha: string, headSha: string): string {
   return start >= 0 && end > start ? block.slice(start, end + STALENESS_END.length) : "";
 }
 
+/** The exact text stalenessLine (pr-description.ts) renders between the two inner markers. */
+const STALENESS_INNER_RE = /^\r?\nThis description may be outdated: it describes `[0-9a-f]{7}`; the PR head is `[0-9a-f]{7}`\.\r?\n$/u;
+
 /**
  * D17: `completion` (an existing block read from the forge) with ONLY its staleness line replaced
  * by `pair` ("" removes it). Everything else in the block is kept byte for byte. A block without a
  * staleness line gets the pair inserted before its footer rule (or its end marker).
+ *
+ * The existing pair is uzi's to rewrite only when each marker appears once and the text between
+ * them is exactly the rendered staleness line. Anything else (a duplicated or lone marker, or text a
+ * person or bot put between the markers, which may carry a closing directive) leaves the whole
+ * block untouched: a refresh must never change what the block closes.
  */
 export function withStalenessLine(completion: string, pair: string): string {
   const start = completion.indexOf(STALENESS_START);
   const end = completion.indexOf(STALENESS_END);
+  if (start >= 0 || end >= 0) {
+    const unique = start === completion.lastIndexOf(STALENESS_START) && end === completion.lastIndexOf(STALENESS_END);
+    if (!unique || start < 0 || end < start) return completion;
+    if (!STALENESS_INNER_RE.test(completion.slice(start + STALENESS_START.length, end))) return completion;
+  }
   if (start >= 0 && end > start) {
     const tail = end + STALENESS_END.length;
     if (pair) return completion.slice(0, start) + pair + completion.slice(tail);

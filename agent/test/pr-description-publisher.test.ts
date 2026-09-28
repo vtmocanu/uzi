@@ -1091,6 +1091,27 @@ describe("publisher helpers", () => {
     assert.equal(withStalenessLine(stale, otherPair), other);
   });
 
+  it("withStalenessLine leaves a block untouched when its staleness pair is not uzi's exact line", () => {
+    const stale = completion(true, { describedSha: H1, headSha: H2 });
+    const start = stale.indexOf(STALENESS_START) + STALENESS_START.length;
+    const end = stale.indexOf("<!-- /uzi:staleness -->");
+    // A person or review bot put a closing directive inside the pair: neither a removal nor a
+    // replacement may delete it, since that would change what the PR closes on a D17 refresh.
+    const forged = `${stale.slice(0, start)}\nCloses #7\n${stale.slice(end)}`;
+    const other = completion(true, { describedSha: H3, headSha: H2 });
+    const otherPair = other.slice(other.indexOf(STALENESS_START), other.indexOf("<!-- /uzi:staleness -->") + "<!-- /uzi:staleness -->".length);
+    assert.equal(withStalenessLine(forged, ""), forged);
+    assert.equal(withStalenessLine(forged, otherPair), forged);
+    // The genuine line with text appended inside the pair is an edit too.
+    const edited = `${stale.slice(0, end)}Closes #7\n${stale.slice(end)}`;
+    assert.equal(withStalenessLine(edited, ""), edited);
+    // A duplicated or lone marker is malformed: untouched, and nothing is inserted beside it.
+    const dup = `${stale}\n${STALENESS_START}`;
+    assert.equal(withStalenessLine(dup, ""), dup);
+    const lone = completion(true).replace(`\n---\n`, `\n${STALENESS_START}\n---\n`);
+    assert.equal(withStalenessLine(lone, otherPair), lone);
+  });
+
   it("isDeterministicRegion accepts only the size and provenance shapes", () => {
     assert.ok(isDeterministicRegion([REGION_START, SIZE_LINE, REGION_END].join("\n")));
     assert.ok(isDeterministicRegion(renderRegion({ sizeLine: SIZE_LINE, headSha: H1, targetBranch: "main" }).text));
