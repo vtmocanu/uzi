@@ -84,7 +84,7 @@ Three ways, pick one:
   stays fully editable and later `.env` edits are ignored — see
   [configuration.md](./configuration.md). Don't combine a seed var with its
   overlay counterpart (the API refuses to boot).
-- **Admin UI**: as an admin, open **Admin → Instance settings → Slack**:
+- **Admin UI**: as an admin, open **Admin → Instance → Slack**:
 
 1. Paste the bot token and app-level token; uzi validates each against Slack
    (`auth.test` for the bot token, a Socket Mode handshake for the app token)
