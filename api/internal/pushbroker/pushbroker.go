@@ -21,6 +21,7 @@ package pushbroker
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -38,6 +39,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport/client"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/go-git/go-git/v5/storage/memory"
+	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/redirectguard"
 )
@@ -159,6 +161,23 @@ const maxPublishDuration = 60 * time.Second
 // checkpointRefPrefix is the uzi-owned ref namespace no CI watches (Rule 3). The
 // end-of-run push targets refs/heads/<branch>; checkpoints never do.
 const checkpointRefPrefix = "refs/uzi-checkpoints/"
+
+// salvageRefPrefix is the run-scoped namespace a FAILED run's last published checkpoint
+// is promoted into (PRD #1867 decision 2). Keyed by run id, not branch, so a salvage ref
+// never blocks a later run on the same branch the way a stale branch-scoped checkpoint
+// ref does (a not_descendant skip); like refs/uzi-checkpoints/ no CI watches it.
+const salvageRefPrefix = "refs/uzi-salvage/"
+
+// SalvageRef names the salvage ref for runID: refs/uzi-salvage/<run-id>.
+func SalvageRef(runID uuid.UUID) string {
+	return salvageRefPrefix + runID.String()
+}
+
+// maxPromoteDuration is a hard wall-clock ceiling on ONE Promote (PRD #1867): a list,
+// at most one packless create, and the branch-ref CAS delete (its own list plus one
+// receive-pack). A caller with a shorter deadline (the sweep's per-tick budget) wins,
+// since context.WithTimeout never extends a parent deadline.
+const maxPromoteDuration = 45 * time.Second
 
 // Publish fetches origin's base objects, applies the worker's delta pack, verifies
 // the declared tip strictly descends origin's current tip, and pushes it —
@@ -414,16 +433,9 @@ func Delete(ctx context.Context, o DeleteOptions) error {
 	ref := checkpointRefPrefix + o.Branch
 	refName := plumbing.ReferenceName(ref)
 
-	repo, err := git.Init(memory.NewStorage(), nil)
+	remote, err := newOriginRemote(o.CloneURL)
 	if err != nil {
-		return fmt.Errorf("pushbroker: init: %w", err)
-	}
-	remote, err := repo.CreateRemote(&config.RemoteConfig{
-		Name: "origin",
-		URLs: []string{o.CloneURL},
-	})
-	if err != nil {
-		return fmt.Errorf("pushbroker: create remote: %w", err)
+		return err
 	}
 	auth := authFor(Options{Username: o.Username, PAT: o.PAT})
 
@@ -551,8 +563,242 @@ func casDelete(ctx context.Context, remote *git.Remote, auth transport.AuthMetho
 	case isCASDeleteRefusal(err):
 		return nil // ref moved out from under our Old in the list→delete window — benign
 	default:
-		return fmt.Errorf("pushbroker: cas delete checkpoint ref: %w", err)
+		return fmt.Errorf("pushbroker: cas delete %s: %w", refName, err)
 	}
+}
+
+// DeleteRefOptions carries a CAS-only delete of an arbitrary uzi-owned ref (PRD #1867
+// decision 5: the sweep expiring refs/uzi-salvage/<run-id>). Every field is derived by
+// the caller from its own rows, never from a worker. Unlike DeleteOptions there is no
+// unconditional form: ExpectedOldTip is REQUIRED, so an expiry can only ever remove the
+// exact tip the caller recorded.
+type DeleteRefOptions struct {
+	CloneURL       string
+	Ref            string
+	Username       string
+	PAT            string
+	ExpectedOldTip string
+}
+
+// DeleteRef CAS-deletes o.Ref from origin: it removes the ref ONLY while origin still
+// points it at o.ExpectedOldTip, and treats an absent or moved ref as benign success —
+// the same casDelete Delete's ExpectedOldTip path runs, generalized over the ref name.
+// It refuses, with an error and before any network I/O, a Ref outside the two uzi-owned
+// namespaces (refs/uzi-checkpoints/, refs/uzi-salvage/), a Ref with nothing after the
+// prefix, a trailing "/" or a "..", and an ExpectedOldTip that is not a full non-zero
+// 40-hex sha. It carries Delete's own maxDeleteDuration ceiling. A transport/session/auth
+// fault returns a wrapped error; like Delete's, the caller scrubs it (secretscrub)
+// before it reaches a log or a row.
+func DeleteRef(ctx context.Context, o DeleteRefOptions) error {
+	if err := validateUziRef(o.Ref); err != nil {
+		return err
+	}
+	tip, ok := parseFullSHA(o.ExpectedOldTip)
+	if !ok {
+		return errors.New("pushbroker: delete ref: expected old tip must be a full non-zero sha")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, maxDeleteDuration)
+	defer cancel()
+
+	remote, err := newOriginRemote(o.CloneURL)
+	if err != nil {
+		return err
+	}
+	auth := authFor(Options{Username: o.Username, PAT: o.PAT})
+	return casDelete(ctx, remote, auth, plumbing.ReferenceName(o.Ref), tip)
+}
+
+// validateUziRef admits only a ref inside a uzi-owned namespace, so DeleteRef can never
+// be pointed at refs/heads/*, refs/tags/* or another tool's refs.
+func validateUziRef(ref string) error {
+	var rest string
+	switch {
+	case strings.HasPrefix(ref, checkpointRefPrefix):
+		rest = strings.TrimPrefix(ref, checkpointRefPrefix)
+	case strings.HasPrefix(ref, salvageRefPrefix):
+		rest = strings.TrimPrefix(ref, salvageRefPrefix)
+	default:
+		return fmt.Errorf("pushbroker: delete ref: %q is outside the uzi-owned ref namespaces", ref)
+	}
+	if rest == "" || strings.HasSuffix(ref, "/") || strings.Contains(ref, "..") {
+		return fmt.Errorf("pushbroker: delete ref: %q is not a valid uzi-owned ref", ref)
+	}
+	return nil
+}
+
+// parseFullSHA accepts exactly a 40-hex, non-zero object id.
+func parseFullSHA(s string) (plumbing.Hash, bool) {
+	if len(s) != 40 {
+		return plumbing.ZeroHash, false
+	}
+	if _, err := hex.DecodeString(s); err != nil {
+		return plumbing.ZeroHash, false
+	}
+	h := plumbing.NewHash(s)
+	if h.IsZero() {
+		return plumbing.ZeroHash, false
+	}
+	return h, true
+}
+
+// PromoteOptions carries one salvage promotion (PRD #1867 decision 2). Every field is
+// derived by the caller (the sweep) from the run row: Tip is the persisted
+// runs.checkpoint_tip, Branch the run's checkpoint branch, RunID the failed run.
+type PromoteOptions struct {
+	CloneURL string
+	Branch   string
+	Username string
+	PAT      string
+	Tip      string
+	RunID    uuid.UUID
+}
+
+// PromoteResult is the outcome of Promote. The zero value is PromoteFailed, so a
+// forgotten assignment can never read as a success.
+type PromoteResult int
+
+const (
+	// PromoteFailed: nothing was confirmed salvaged (invalid input, a transport fault, or
+	// a refused create). The branch ref is untouched; the caller retries later.
+	PromoteFailed PromoteResult = iota
+	// PromoteDone: the salvage ref is at the tip and the branch ref is gone (deleted
+	// here, already absent, or moved by another owner — the CAS left it alone).
+	PromoteDone
+	// PromoteSalvagedBranchPending: the salvage ref is confirmed at the tip, but the
+	// branch-ref CAS delete failed. The next Promote finds the same-tip salvage ref
+	// (idempotent) and retries only the delete.
+	PromoteSalvagedBranchPending
+	// PromoteUnavailable: the branch ref is missing or no longer at the tip (a sibling
+	// run moved it). Nothing was written.
+	PromoteUnavailable
+	// PromoteRefused: the salvage ref already exists at a DIFFERENT tip. Never
+	// overwritten; nothing was written.
+	PromoteRefused
+)
+
+// String returns the snake_case name the caller persists or logs.
+func (r PromoteResult) String() string {
+	switch r {
+	case PromoteFailed:
+		return "failed"
+	case PromoteDone:
+		return "done"
+	case PromoteSalvagedBranchPending:
+		return "salvaged_branch_pending"
+	case PromoteUnavailable:
+		return "unavailable"
+	case PromoteRefused:
+		return "refused"
+	default:
+		return fmt.Sprintf("PromoteResult(%d)", int(r))
+	}
+}
+
+// emptyPack is a zero-object packfile: "PACK", version 2 and object count 0 (each a
+// big-endian uint32), then the SHA-1 of those 12 bytes as the trailer
+// (029d0882…3ed31e; pinned by TestEmptyPackTrailer). Real git receive-pack reads a pack
+// for any non-delete command and refuses one with no pack at all ("unpack eof before
+// pack header"); go-git sends none when Packfile is nil, so the salvage create ships
+// this explicitly. Never mutated: forwardPack reads it through a fresh bytes.Reader.
+var emptyPack = []byte{
+	'P', 'A', 'C', 'K', 0, 0, 0, 2, 0, 0, 0, 0,
+	0x02, 0x9d, 0x08, 0x82, 0x3b, 0xd8, 0xa8, 0xea, 0xb5, 0x10,
+	0xad, 0x6a, 0xc7, 0x5c, 0x82, 0x3c, 0xfd, 0x3e, 0xd3, 0x1e,
+}
+
+// Promote moves a FAILED run's last published checkpoint from the branch-scoped
+// refs/uzi-checkpoints/<branch> to the run-scoped refs/uzi-salvage/<run-id> (PRD #1867
+// decision 2), identity-bound to o.Tip and idempotent. In order:
+//
+//  1. It lists origin's refs ONCE (an empty remote reads as "nothing present").
+//  2. A salvage ref already AT the tip is an idempotent success: skip to step 5. One at
+//     any other tip is PromoteRefused, with no write — a salvage ref is never overwritten.
+//  3. A branch ref missing or not at the tip is PromoteUnavailable, with no write: the
+//     recorded tip is no longer the one origin holds, and a sibling's ref is not ours.
+//  4. It creates the salvage ref with a manual receive-pack command Old=zero, New=tip
+//     and emptyPack (origin already holds the tip, so no objects travel). A failure is
+//     PromoteFailed and the branch ref is NOT touched.
+//  5. Only after that confirmed create (or the idempotent find), it CAS-deletes the
+//     branch ref at the tip (casDelete). Success, or a benign absent/moved ref, is
+//     PromoteDone; a fault is PromoteSalvagedBranchPending with the wrapped error.
+//
+// Invalid input (a nil RunID, a Tip that is not a full non-zero sha, an empty Branch)
+// returns PromoteFailed and an error before any network I/O. It runs through the same
+// remote/auth/transport setup as Publish and Delete, under its own maxPromoteDuration
+// ceiling. Errors carry no credential from this package; the caller still scrubs them
+// (secretscrub) before persisting.
+func Promote(ctx context.Context, o PromoteOptions) (PromoteResult, error) {
+	if o.RunID == uuid.Nil {
+		return PromoteFailed, errors.New("pushbroker: promote: run id is required")
+	}
+	tip, ok := parseFullSHA(o.Tip)
+	if !ok {
+		return PromoteFailed, errors.New("pushbroker: promote: tip must be a full non-zero sha")
+	}
+	if o.Branch == "" {
+		return PromoteFailed, errors.New("pushbroker: promote: branch is required")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, maxPromoteDuration)
+	defer cancel()
+
+	remote, err := newOriginRemote(o.CloneURL)
+	if err != nil {
+		return PromoteFailed, err
+	}
+	auth := authFor(Options{Username: o.Username, PAT: o.PAT})
+	salvageRef := plumbing.ReferenceName(SalvageRef(o.RunID))
+	branchRef := plumbing.ReferenceName(checkpointRefPrefix + o.Branch)
+
+	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: auth})
+	if err != nil && !errors.Is(err, transport.ErrEmptyRemoteRepository) {
+		return PromoteFailed, fmt.Errorf("pushbroker: promote: list: %w", err)
+	}
+	var salvageAt, branchAt plumbing.Hash
+	for _, r := range advertised {
+		switch r.Name() {
+		case salvageRef:
+			salvageAt = r.Hash()
+		case branchRef:
+			branchAt = r.Hash()
+		}
+	}
+
+	switch {
+	case salvageAt == tip:
+		// Idempotent: a previous pass created it (possibly failing its branch delete).
+	case !salvageAt.IsZero():
+		return PromoteRefused, nil
+	case branchAt != tip:
+		return PromoteUnavailable, nil
+	default:
+		if err := forwardPack(ctx, remote, auth, salvageRef, plumbing.ZeroHash, tip, emptyPack); err != nil {
+			return PromoteFailed, fmt.Errorf("pushbroker: promote: create %s: %w", salvageRef, err)
+		}
+	}
+
+	if err := casDelete(ctx, remote, auth, branchRef, tip); err != nil {
+		return PromoteSalvagedBranchPending, fmt.Errorf("pushbroker: promote: branch ref delete after salvage: %w", err)
+	}
+	return PromoteDone, nil
+}
+
+// newOriginRemote builds the in-memory "origin" remote every broker operation dials:
+// no objects, one URL, the same transport resolution (httpTransport for http(s)).
+func newOriginRemote(cloneURL string) (*git.Remote, error) {
+	repo, err := git.Init(memory.NewStorage(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("pushbroker: init: %w", err)
+	}
+	remote, err := repo.CreateRemote(&config.RemoteConfig{
+		Name: "origin",
+		URLs: []string{cloneURL},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("pushbroker: create remote: %w", err)
+	}
+	return remote, nil
 }
 
 // forwardPack ships the worker's (non-thin) packfile to origin through a MANUAL
