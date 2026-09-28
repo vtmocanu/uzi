@@ -369,11 +369,13 @@ expires, or a pending one settles without being kept.
 
 **A run with no open custody hold usually gets no salvage copy at all.**
 Once such a run goes terminal, [custody retention](#where-the-work-is-kept)
-deletes its checkpoint ref on its own before the next salvage sweep looks,
-so salvage almost always settles that run `unavailable` — there is nothing
+usually deletes its checkpoint ref on its own before the next salvage sweep
+looks, so salvage almost always settles that run `unavailable` — there is nothing
 left for it to verify and copy. Salvage produces a copy only for a run whose
 custody hold is still open when the sweep runs (or, occasionally, an older
-run whose ref happened to survive from before this feature existed). If you
+run whose ref happened to survive from before this feature existed, or a run
+failed by auto-stop, a claim-assembly failure or a Codex account wait, whose
+ref custody retention deletes a little later). If you
 need a run's checkpoint and no salvage copy exists, check whether a
 [retained checkpoint or recovery ref](#where-the-work-is-kept) is still
 open first — that is usually where it is.

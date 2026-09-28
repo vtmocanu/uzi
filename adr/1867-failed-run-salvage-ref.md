@@ -267,7 +267,8 @@ its own right:
   delete), so the redundancy is bounded (salvage's own retention window)
   and one-directional, not a second copy of #1810's own state machine.
 - **No hold, no copy.** #1810 does not delete an unheld run's checkpoint
-  ref synchronously "at" the terminal transition: the transition dispatches
+  ref synchronously "at" the terminal transition: the worker-reported
+  terminal report, cancel and plan-reject paths dispatch
   `SettleRetainedCheckpoint` off the caller's own goroutine (a detached,
   best-effort background settle), and any record it could not settle there
   is picked up again by `ReconcileCheckpointRetentions`, #1810's own pass
@@ -278,8 +279,14 @@ its own right:
   an unheld run's ref by the time that tick's `SweepSalvage` looks (it
   races only the DB write and a fast forge round-trip, not a full sweep
   interval), so salvage still **almost always** settles such a row
-  `unavailable`. Salvage therefore produces a copy only for held runs (and
-  surviving pre-migration refs within the enqueue window above), and its
+  `unavailable`. The exception is a terminal writer that dispatches no
+  background settle and runs after the reconcile or outside the sweep
+  (auto-stop, claim-assembly failure, Codex account-wait failure): its
+  `settling` record waits for the next tick's reconcile, which runs after
+  that tick's `SweepSalvage`, so salvage usually copies such an unheld
+  run's ref before #1810 deletes it. Otherwise salvage produces a copy only
+  for held runs (and surviving pre-migration refs within the enqueue
+  window above), and its
   own value is the window between the hold settling and the copy's expiry.
   A hold that outlives the retention leaves a copy that only duplicated
   exposure. The #1856-shaped loss is prevented by #1810's retention when

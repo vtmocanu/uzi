@@ -328,7 +328,10 @@ All of it is in one repo. M1 and M2 touch disjoint files. A single uzi run execu
 - **No hold, no copy:** a failed run with no open custody hold has its branch ref CAS-deleted
   by #1810 soon after the terminal transition (a background settle, or the retention
   reconcile in the same sweep), usually before the salvage pass on a later tick tries the
-  create, so salvage almost always settles it `unavailable` and saves nothing. Salvage produces a copy only for
+  create, so salvage almost always settles it `unavailable` and saves nothing. The exception
+  is a failure path that dispatches no background settle (auto-stop, claim-assembly failure,
+  Codex account-wait failure): #1810 deletes its ref on the next tick's reconcile, after that
+  tick's salvage pass, so salvage usually does copy it. Salvage produces a copy only for
   held runs (and surviving pre-migration refs); for those, its own value is the window
   between the hold settling and the copy's expiry. If a hold stays open longer than the
   retention, the copy expires while #1810 still retains the tip and only duplicated
