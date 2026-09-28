@@ -25,7 +25,7 @@ import (
 // against the ref runs under a per-run SESSION advisory lock (withRetentionLock) and is
 // compare-and-swap on the recorded tip.
 
-// Checkpoint retention states (checkpoint_retentions.state; see migration 00261).
+// Checkpoint retention states (checkpoint_retentions.state; see migration 00263).
 const (
 	retentionRetained    = "retained"
 	retentionSuperseding = "superseding"

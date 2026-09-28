@@ -54,7 +54,7 @@ publish must not destroy the older generation's only off-worker copy either.
 At each of the three terminal writers that used to delete the ref (and
 later, through the sweeper backfill, for every other terminal writer) the
 api inserts a `checkpoint_retentions` row
-(one per run, migration 00261) recording the run's checkpoint branch, the
+(one per run, migration 00263) recording the run's checkpoint branch, the
 published tip, and the ref that currently carries it. A run with an open
 custody hold gets state `retained` and no forge call. A run with no open
 hold (a completed run whose hold already settled, or a failed/cancelled run
@@ -189,7 +189,7 @@ see the PRD's amended Problem statement), the sweeper's
 deletes with exponential backoff, drives due `superseding` records, settles
 records whose holds have since cleared, backfills a record for any terminal
 run that published a checkpoint but has none (a watermarked scan bounded by
-migration 00262's index), and runs the post-settlement audit described
+migration 00264's index), and runs the post-settlement audit described
 above.
 
 ## Consequences

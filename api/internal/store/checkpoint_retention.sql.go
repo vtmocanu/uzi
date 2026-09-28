@@ -418,7 +418,7 @@ type ListCheckpointRetentionBackfillRow struct {
 // publishes long after it went terminal is keyed at the publish, not left below the watermark.
 // The key never decreases (checkpoint_tip_at only moves forward, and a terminal status does not
 // change). The scan starts at the persisted watermark (backfilled_through) less a 10-minute
-// overlap and uses idx_runs_checkpoint_backfill (00262, on exactly this expression), so a
+// overlap and uses idx_runs_checkpoint_backfill (00264, on exactly this expression), so a
 // steady-state pass reads only recent candidates. The overlap covers commit-order skew: both
 // columns are the writer's transaction time, so a run committed after a pass advanced the
 // watermark past its key is still inside the window on the next pass. The caller derives the
