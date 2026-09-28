@@ -372,6 +372,31 @@ describe("RecoveryHoldsSurface", () => {
       expect(group.getAttribute("aria-describedby")).toBe("discard-warning-h-dec");
     });
 
+    // Only state 'open' keeps custody alive (the server's own allowlist), so a sibling hold in
+    // any other state, released or one this client has never seen, must not hide the warning.
+    it.each(["released", "future_state"])(
+      "still warns when the run's only sibling hold is %s, not open",
+      async (siblingState) => {
+        await renderSurface(
+          listing([
+            hold({
+              id: "h-last2",
+              run_id: "runrel01",
+              attention: "source_only",
+              checkpoint_ref: "refs/uzi-checkpoints/agent/issue-11",
+              checkpoint_state: "retained",
+            }),
+            // Only `state` varies; a non-decision attention keeps the sibling out of the rows.
+            hold({ id: "h-gone", run_id: "runrel01", state: siblingState, attention: "released", generation: 2 }),
+          ]),
+        );
+        const group = armConfirm("runrel01");
+        const warning = within(group).getByText(LAST_HOLD);
+        expect(warning.textContent).toContain("also deletes the retained checkpoint ref");
+        expect(warning.querySelector("code")?.textContent).toBe("refs/uzi-checkpoints/agent/issue-11");
+      },
+    );
+
     it("does not warn about a ref when the run's last open hold has no checkpoint", async () => {
       await renderSurface(listing([hold({ id: "h-bare", run_id: "runbare1", attention: "source_only" })]));
       const group = armConfirm("runbare1");

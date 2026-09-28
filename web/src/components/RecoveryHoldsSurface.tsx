@@ -48,9 +48,12 @@ export function RecoveryHoldsSurface() {
   // Open holds per run, counted over the FULL listing (not just the decision rows): the
   // retained checkpoint ref follows custody, so discarding a run's last open hold also deletes
   // that ref on the forge (PRD #1810). A healthy sibling hold filtered out above still counts.
+  // Allowlist, mirroring the server: it deletes the ref only when no hold of the run has
+  // state 'open', so any other state (released, discarded, or one this client does not
+  // know yet) must not suppress the warning.
   const openHoldsByRun = new Map<string, number>();
   for (const h of holds.holds) {
-    if (h.state === "released" || h.state === "discarded") continue;
+    if (h.state !== "open") continue;
     openHoldsByRun.set(h.run_id, (openHoldsByRun.get(h.run_id) ?? 0) + 1);
   }
   const { open_holds, custody_hold_limit, decision_needed } = holds.aggregate;
