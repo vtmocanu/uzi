@@ -9,11 +9,14 @@ import {
   newRunAttempt,
   procfsTable,
   quiesceRunAttempt,
-  setQuiescenceViewForTests,
+  reapProcesses,
   type ProcessQuiescence,
   type QuiesceProcess,
+  type QuiesceRunDeps,
+  type ReapDeps,
+  type ScanRequest,
 } from "../src/run-quiescence.js";
-import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, statStartTime } from "../src/worker-spawn-mark.js";
+import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, statStartTime, workerSpawnNonce } from "../src/worker-spawn-mark.js";
 import { restoreHermeticView } from "./setup/hermetic-proc.js";
 
 // issue #1783 M4 — the CI incident on the REAL procfs, not a fake root. A real `ssh-agent` (on
@@ -47,10 +50,8 @@ import { restoreHermeticView } from "./setup/hermetic-proc.js";
 // build). The markers test uses ANOTHER live attempt's markers (a registered attempt that is not the
 // one being seeded), so its readable branch proves `live_attempt_conflict`, not own-attempt reaping.
 //
-// These tests deliberately select the REAL process table: setQuiescenceViewForTests(undefined)
-// clears the hermetic default the `npm test` preload installed, which is what production runs
-// with. They only scan (seed mode never signals an unmarked process, and every clone path, key and
-// marker here is unique to this file), so no host process is signalled.
+// Every reap below reads only the tracked agent's real procfs entries. Only the unreadable
+// kill case can signal; its injected kill checks the recorded start time again.
 
 const PROC = path.join("/", "proc");
 
@@ -87,8 +88,7 @@ const SUN_PATH_MAX = 107;
 
 before(() => {
   work = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-procfs-ssh-agent-"));
-  // Real /proc and the production reap timings: no test view at all.
-  setQuiescenceViewForTests(undefined);
+  // Keep the hermetic default installed; each real procfs reap receives a narrowed table.
 });
 
 after(async () => {
@@ -282,7 +282,60 @@ function assertDetailNames(t: TestContext, q: ProcessQuiescence, pid: number): v
 
 const cloneKeyFor = (clone: string): string => newRunAttempt("run-key-probe", 1, clone, () => []).cloneKey;
 
+/** Read only this file's recorded agent. Signal only when explicitly allowed. */
+function trackedAgentDeps(pid: number, maySignal = false): ReapDeps {
+  const start = started.get(pid);
+  assert.ok(start !== undefined, `agent pid ${pid} was not tracked`);
+  return {
+    table: {
+      ...procfsTable,
+      listPids: () => stillOurs(pid, start) ? [pid] : [],
+    },
+    kill: (candidate) => {
+      assert.equal(candidate, pid, "only the tracked agent may be signalled");
+      assert.equal(maySignal, true, "observation cases must never signal");
+      if (stillOurs(pid, start)) process.kill(pid, "SIGKILL");
+    },
+  };
+}
+
+function trackedAgentReap(pid: number): QuiesceRunDeps {
+  return { reap: { ...trackedAgentDeps(pid), viaHelper: false } };
+}
+
 describe("the real procfs reap against a real ssh-agent", { skip: SKIP }, () => {
+  it("signals only a tracked unreadable unattributed agent through the narrowed real procfs table", { timeout: 60_000 }, async (t) => {
+    const clone = path.join(work, "runner", "github.com+o+r", "issue-9100");
+    const elsewhere = path.join(work, "elsewhere-9100");
+    fs.mkdirSync(clone, { recursive: true });
+    fs.mkdirSync(elsewhere, { recursive: true });
+    const pid = await startAgent(t, elsewhere, { PATH: process.env.PATH });
+    if (pid === undefined) return;
+    try {
+      if (dumpability(pid) === "readable") {
+        t.skip("this ssh-agent exposes its environment; the unreadable branch is unavailable");
+        return;
+      }
+      assert.equal(stillOurs(pid, started.get(pid)!), true);
+      const req = {
+        mode: "own" as const,
+        targetUid: process.getuid!(),
+        targetKey: cloneKeyFor(clone),
+        targetPaths: [clone],
+        ownMarker: undefined,
+        liveMarkers: [],
+        liveRoots: [],
+        workerNonce: workerSpawnNonce(),
+        mayKillUnreadableUnattributed: true,
+      } as ScanRequest & { mayKillUnreadableUnattributed: boolean };
+      const out = await reapProcesses(req, trackedAgentDeps(pid, true));
+      assert.equal(out.state, "quiescent", out.detail);
+      assert.deepEqual(out.killed, [pid]);
+      assert.equal(alive(pid), false);
+    } finally {
+      await stopByPid(pid);
+    }
+  });
   it("(a) in scope by cwd: a seed is blocked and names the agent's pid", { timeout: 60_000 }, async (t) => {
     const clone = path.join(work, "runner", "github.com+o+r", "issue-9101");
     fs.mkdirSync(clone, { recursive: true });
@@ -299,7 +352,7 @@ describe("the real procfs reap against a real ssh-agent", { skip: SKIP }, () => 
         processes: true,
         dockerHost: undefined,
         registry: new LiveAttemptRegistry(),
-      });
+      }, trackedAgentReap(pid));
       const q = out.process!;
       assert.notEqual(q.state, "quiescent", q.detail);
       const entry = q.processes.find((p) => p.pid === pid);
@@ -354,7 +407,7 @@ describe("the real procfs reap against a real ssh-agent", { skip: SKIP }, () => 
         processes: true,
         dockerHost: undefined,
         registry,
-      });
+      }, trackedAgentReap(pid));
       const q = out.process!;
       assert.notEqual(q.state, "quiescent", q.detail);
       const entry = q.processes.find((p) => p.pid === pid);
@@ -394,7 +447,7 @@ describe("the real procfs reap against a real ssh-agent", { skip: SKIP }, () => 
         processes: true,
         dockerHost: undefined,
         registry,
-      });
+      }, trackedAgentReap(pid));
       const q = out.process!;
       const entry = q.processes.find((p) => p.pid === pid);
       assert.ok(!q.killed.includes(pid), "an unrelated process is never signalled");

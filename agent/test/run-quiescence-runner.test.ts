@@ -9,6 +9,7 @@ import { LimitReachedError } from "../src/limit.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import type { CodexExecutionSafety, ToolDisposal } from "../src/harness.js";
 import { recordingLogger } from "./helpers.js";
+import { RunDiskLocks } from "../src/run-disk-locks.js";
 import {
   LiveAttemptRegistry,
   type ProcessQuiescenceState,
@@ -119,6 +120,57 @@ describe("issue #1783: park fails closed (A-park-fail-closed)", () => {
       assert.equal(fs.existsSync(path.join(worktreeDirFor(iid), "WORK.txt")), true);
     });
   }
+});
+
+const otherClaimInFlight = (req: QuiesceRunRequest | undefined): boolean | undefined =>
+  (req as (QuiesceRunRequest & { otherClaimInFlight: boolean }) | undefined)?.otherClaimInFlight;
+
+describe("UID-split solitary reaping at runner boundaries", () => {
+  it("passes the solitary claim predicate when a failed run retires", async () => {
+    const { gitlab } = fakeGitlab();
+    const iid = 1810;
+    const { calls, quiesceRun } = scriptedQuiescer(["quiescent"]);
+    const registry = new LiveAttemptRegistry();
+    const runner = runnerWith(() => ({
+      executor: { run: async (): Promise<ExecutorResult> => { throw new Error("agent crashed"); } },
+    }), gitlab, undefined, undefined, { quiesceRun, liveAttempts: registry });
+    await runner.execute(gitlabClaim(iid));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.mode, "own");
+    assert.equal(calls[0]?.registry, registry);
+    assert.equal(otherClaimInFlight(calls[0]), false, "the sole run has no other claim in flight");
+    assert.equal(fs.existsSync(worktreeDirFor(iid)), false, "confirmed solitary reap permits retirement");
+  });
+
+  it("recognizes a second execution before its attempt registers while another run reaps", async () => {
+    const { gitlab } = fakeGitlab();
+    const locks = new RunDiskLocks();
+    const first = gitlabClaim(1811);
+    const second = gitlabClaim(1812);
+    const releaseSecond = await locks.acquire(second.run_id);
+    const registry = new LiveAttemptRegistry();
+    const { calls, quiesceRun } = scriptedQuiescer(["unverified"]);
+    let secondFactoryEntered = false;
+    const runner = runnerWith(() => {
+      secondFactoryEntered = true;
+      return { executor: { run: async (): Promise<ExecutorResult> => { throw new Error("agent crashed"); } } };
+    }, gitlab, undefined, undefined, { diskLocks: locks, liveAttempts: registry, quiesceRun });
+    const held = runner.execute(second);
+    try {
+      assert.equal(runner.isExecuting(second.run_id), true);
+      assert.equal(secondFactoryEntered, false, "the second execution is held before attempt registration");
+      assert.deepEqual(registry.others(undefined), []);
+      await runner.execute(first);
+      assert.equal(runner.isExecuting(second.run_id), true);
+      assert.equal(calls[0]?.mode, "own");
+      assert.equal(calls[0]?.registry, registry);
+      assert.equal(otherClaimInFlight(calls[0]), true, "the held second claim counts before attempt registration");
+      assert.equal(fs.existsSync(worktreeDirFor(1811)), true, "the blocked reap keeps the clone");
+    } finally {
+      releaseSecond();
+      await held;
+    }
+  });
 });
 
 describe("issue #1783: terminal retire fails closed", () => {
