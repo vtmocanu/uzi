@@ -60,7 +60,7 @@ func TestRenderRunDetailSalvageStates(t *testing.T) {
 		"pending":        "pending: a salvage copy of the last published checkpoint is being made",
 		"unavailable":    "unavailable: not saved: the published checkpoint was no longer at its recorded tip on the forge",
 		"refused":        "refused: not saved: the salvage ref already pointed at a different commit",
-		"failed":         "failed: not saved: making the salvage copy kept failing",
+		"failed":         "failed: stopped after repeated attempts; any remaining ref is named in SALVAGE_ERROR",
 		"skipped_secret": "skipped_secret: not saved: the run failed on a secret-scan block",
 		"expired":        "expired: the salvage copy expired and was removed from the forge",
 		"disabled":       "disabled: not saved: salvage was turned off for this forge before a copy was made",

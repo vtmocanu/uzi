@@ -32,7 +32,7 @@ func salvageStateExplanation(state string) string {
 	case "refused":
 		return "not saved: the salvage ref already pointed at a different commit"
 	case "failed":
-		return "not saved: making the salvage copy kept failing"
+		return "stopped after repeated attempts; any remaining ref is named in SALVAGE_ERROR"
 	case "skipped_secret":
 		return "not saved: the run failed on a secret-scan block"
 	case "expired":

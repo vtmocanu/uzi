@@ -41,7 +41,8 @@ const (
 	// call), so a slow forge can never hold the shared sweeper tick. The pass runs serially
 	// on that tick before the run-liveness sweep, and the item in flight when the budget
 	// runs out may still spend up to salvageWriteTimeout on its detached outcome write, so
-	// budget + salvageWriteTimeout (15s) stays within the default SWEEP_INTERVAL (15s).
+	// salvage's own share of the tick is at most budget + salvageWriteTimeout (15s); other
+	// passes on the same tick (e.g. the checkpoint-retention reconcile, PRD #1810) add theirs.
 	salvagePassBudgetDefault = 10 * time.Second
 	// salvageMaxItems caps the broker items handled per pass, round-robin between due
 	// expiries and due pending rows. Which list leads alternates per pass
