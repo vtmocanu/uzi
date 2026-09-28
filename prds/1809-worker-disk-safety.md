@@ -1,7 +1,7 @@
 # PRD #1809: Worker disk safety for long runs
 
 **Issue**: #1809
-**Status**: In progress (M2 landed 2026-09-27; M4, M5, M6 landed 2026-09-28; M1 and M3 await the real uid-split fixture run; M7 awaits the maintainer's hosted-k8s acceptance)
+**Status**: In progress (M2 and M5 landed 2026-09-27, M4 2026-09-27/28, M6 2026-09-28; M1 and M3 await the real uid-split fixture run; M7 awaits the maintainer's hosted-k8s acceptance)
 **Priority**: High
 **Created**: 2026-09-27
 
