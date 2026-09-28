@@ -3439,8 +3439,10 @@ export class CodexExecutor implements Executor {
    *
    *  Issue #1866 M2: `facts` appends the run-start environment facts block (at most eight short
    *  lines) at the end. The Codex implement prompt is rebuilt every implement iteration, and the
-   *  block rides EVERY one (not only the first), so a turn on a recreated epoch still sees the
-   *  facts cached at run start. Empty block ⇒ byte-identical. */
+   *  block rides every iteration that uses this base prompt (not only the first), so a turn on a
+   *  recreated epoch still sees the facts cached at run start. The completion-rework follow-up
+   *  and the clarification continuation replace this prompt for their turn and do not carry the
+   *  block. Empty block ⇒ byte-identical. */
   private implementPrompt(ctx: RunContext, gatedPlan?: string, milestoneNote = "", facts?: EnvFacts): string {
     const approved = ctx.approvedPlan?.trim();
     const head = ctx.issueIid != null ? `Issue #${ctx.issueIid}: ${ctx.issueTitle}` : ctx.issueTitle;
@@ -3473,10 +3475,11 @@ export class CodexExecutor implements Executor {
    *  command seam (the same command root, sandbox and scrubbed env a model command gets; the
    *  seam forces the command env, so runEnvProbe's `env` argument is not used here). Cleanup is
    *  proven by the epoch registry: after the seam settles on ANY path, a poisoned registry (the
-   *  sticky flag reapRoot sets on an incomplete reap) or the seam's own "did not reap cleanly"
-   *  error throws ProbeCleanupError, which runEnvProbe turns into EnvProbeCleanupError. Any other
-   *  seam failure (e.g. "command aborted" on the probe timeout) with an unpoisoned registry is a
-   *  clean, unverified probe. */
+   *  sticky flag reapRoot sets on an incomplete reap, and registerRoot sets before refusing a
+   *  root's admission, whose best-effort dispose outcome the seam discards) or the seam's own
+   *  "did not reap cleanly" error throws ProbeCleanupError, which runEnvProbe turns into
+   *  EnvProbeCleanupError. Any other seam failure (e.g. "command aborted" on the probe timeout)
+   *  with an unpoisoned registry is a clean, unverified probe. */
   private envProbeSpawner(epoch: ProviderEpoch, worktreePath: string): EnvProbeSpawner {
     return async (argv, _env, signal) => {
       let result: SpawnCommandResult | undefined;
@@ -3487,7 +3490,7 @@ export class CodexExecutor implements Executor {
         failure = err;
       }
       if (epoch.registry.isPoisoned()) {
-        throw new ProbeCleanupError("the command registry was poisoned by the probe's reap");
+        throw new ProbeCleanupError("the command registry was poisoned during the probe");
       }
       if (failure instanceof Error && failure.message === COMMAND_ROOT_UNREAPED) {
         throw new ProbeCleanupError(failure.message);

@@ -457,7 +457,10 @@ export interface SdkExecutorOptions {
 }
 
 /** issue #1866 M2: one worker status line naming the run-start environment facts, emitted before
- *  the plan turn only when the prompt carries a facts block (environmentFactsSummary non-empty). */
+ *  the first turn whenever there is something to report (environmentFactsSummary non-empty), for
+ *  every run kind. The prompts carry the matching block separately: the plan prompt on issue runs
+ *  only (the ci_fix and self_improve plan prompts carry none), and the implement prompt on first
+ *  implement turns (gated inside buildImplementPrompt) for every run kind. */
 function emitEnvironmentFactsStatus(ctx: RunContext, facts: EnvFacts): void {
   const text = environmentFactsSummary(facts);
   if (text) ctx.emit({ kind: "status", agent: "worker", payload: { text } });

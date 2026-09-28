@@ -8614,14 +8614,15 @@ describe("CodexExecutor: run-start environment probe (issue #1866 M2)", () => {
   it("a pre-approved resume (no plan turn) still probes, and the implement prompt carries the facts", async () => {
     const rig = makeRig();
     rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
-    let probes = 0;
+    // The turn count each probe saw, recorded in the seam and asserted after the run: a throw
+    // inside the seam would be swallowed into a not-verified probe, never fail the test.
+    const turnsAtProbe: number[] = [];
     const { ctx, emitted } = makeCtx();
     await withTimeout(
       executorWith(rig, {
         spawnCommand: async (argv) => {
           if (isEnvProbe(argv)) {
-            probes += 1;
-            assert.equal(rig.transport.turnStartCount, 0, "probe before the implement turn");
+            turnsAtProbe.push(rig.transport.turnStartCount);
             return { code: 0, stdout: probeLine("ok", "limited", "ok"), stderr: "" };
           }
           return { code: 0, stdout: "ok", stderr: "" };
@@ -8630,7 +8631,8 @@ describe("CodexExecutor: run-start environment probe (issue #1866 M2)", () => {
       3000,
       "#1866 pre-approved run",
     );
-    assert.equal(probes, 1);
+    assert.deepEqual(turnsAtProbe, [0], "one probe, before the implement turn");
+    assert.equal(rig.transport.turnStartCount, 1, "the implement turn then ran");
     const [impl] = turnTexts(rig.transport);
     assert.ok(impl!.startsWith("the approved plan"), "the pre-approved implement prompt");
     assert.ok(impl!.includes("- A command's own private $HOME is not writable."));
@@ -8707,31 +8709,105 @@ describe("CodexExecutor: run-start environment probe (issue #1866 M2)", () => {
     assert.equal(rig.transport.turnStartCount, 0, "no turn ever started");
   });
 
+  /** Run `body` while recording every registry that reserves a `command` root launch (the
+   *  epoch's fileop root and, on the production seam, the probe's), restoring the prototype
+   *  afterwards. */
+  const withCommandRegistries = async (body: (registries: Set<ExecutionRegistry>) => Promise<void>): Promise<void> => {
+    const reserveLaunch = ExecutionRegistry.prototype.reserveLaunch;
+    const registries = new Set<ExecutionRegistry>();
+    const record = (registry: ExecutionRegistry): void => { registries.add(registry); };
+    ExecutionRegistry.prototype.reserveLaunch = function (kind) {
+      if (kind === "command") record(this);
+      return reserveLaunch.call(this, kind);
+    };
+    try {
+      await body(registries);
+    } finally {
+      ExecutionRegistry.prototype.reserveLaunch = reserveLaunch;
+    }
+  };
+
   it("a probe root whose reap is unconfirmed poisons the epoch registry and fails the run before any turn (production seam)", async () => {
     const rig = makeRig();
     rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
     const baseLaunch = rig.deps.launchEffectRoot!;
     let probeLaunches = 0;
     const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan: async () => approve });
-    await assert.rejects(
-      withTimeout(
-        executorWith(rig, {
-          // The PRODUCTION command seam (makeDefaultSpawnCommand) over a faked supervisor.
-          spawnCommand: undefined,
-          launchEffectRoot: async (spec, deadlineMs) => {
-            if (!spec.args.includes(ENV_PROBE_SCRIPT)) return baseLaunch(spec, deadlineMs);
-            probeLaunches += 1;
-            return probeRoot({ stdout: probeLine("ok", "ok", "ok"), unclean: true });
-          },
-        }).run(ctx),
-        3000,
-        "#1866 poisoned probe run",
-      ),
-      EnvProbeCleanupError,
-    );
+    await withCommandRegistries(async (registries) => {
+      await assert.rejects(
+        withTimeout(
+          executorWith(rig, {
+            // The PRODUCTION command seam (makeDefaultSpawnCommand) over a faked supervisor.
+            spawnCommand: undefined,
+            launchEffectRoot: async (spec, deadlineMs) => {
+              if (!spec.args.includes(ENV_PROBE_SCRIPT)) return baseLaunch(spec, deadlineMs);
+              probeLaunches += 1;
+              return probeRoot({ stdout: probeLine("ok", "ok", "ok"), unclean: true });
+            },
+          }).run(ctx),
+          3000,
+          "#1866 poisoned probe run",
+        ),
+        EnvProbeCleanupError,
+      );
+      assert.equal(registries.size, 1, "one epoch registry reserved command roots (fileop and probe)");
+      assert.equal([...registries][0]!.isPoisoned(), true, "the unconfirmed reap poisoned the epoch registry");
+    });
     assert.equal(probeLaunches, 1, "the probe launched as a registered command root");
     assert.equal(rig.transport.turnStartCount, 0, "no turn ever started");
     assert.equal(rig.providerLaunches(), 0, "no provider root ever launched (no turn, no epoch recreation)");
+  });
+
+  it("a probe root refused registry admission poisons the registry and fails the run before any turn, though the seam's error is not the unreaped one (production seam)", async () => {
+    // The registry's own admission refusal (a kind mismatch here) poisons it and makes the seam
+    // throw "command root failed registry admission", not "did not reap cleanly", after a
+    // best-effort dispose whose outcome is discarded. Only the spawner's isPoisoned() check
+    // turns that into a failed cleanup; without it the probe would read as clean, not verified.
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const baseLaunch = rig.deps.launchEffectRoot!;
+    let probeLaunches = 0;
+    const seamErrors: string[] = [];
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan: async () => approve });
+    // Set by the probe's launch, so only the probe root's admission (the very next registerRoot)
+    // is refused; the epoch's fileop root registers as a command root too.
+    let refuseNextAdmission = false;
+    const registerRoot = ExecutionRegistry.prototype.registerRoot;
+    ExecutionRegistry.prototype.registerRoot = function (reservation, root) {
+      if (!refuseNextAdmission) return registerRoot.call(this, reservation, root);
+      refuseNextAdmission = false;
+      const result = registerRoot.call(this, reservation, { ...root, kind: "boundary_action" });
+      if (!result.ok) seamErrors.push(result.error.message);
+      return result;
+    };
+    try {
+      await withCommandRegistries(async (registries) => {
+        await assert.rejects(
+          withTimeout(
+            executorWith(rig, {
+              spawnCommand: undefined,
+              launchEffectRoot: async (spec, deadlineMs) => {
+                if (!spec.args.includes(ENV_PROBE_SCRIPT)) return baseLaunch(spec, deadlineMs);
+                probeLaunches += 1;
+                refuseNextAdmission = true;
+                return probeRoot({ stdout: probeLine("ok", "ok", "ok"), unclean: true });
+              },
+            }).run(ctx),
+            3000,
+            "#1866 refused-admission probe run",
+          ),
+          (err: unknown) => err instanceof EnvProbeCleanupError && /poisoned/.test(err.message),
+        );
+        assert.equal(registries.size, 1, "one epoch registry reserved command roots (fileop and probe)");
+        assert.equal([...registries][0]!.isPoisoned(), true, "the refused admission poisoned the epoch registry");
+      });
+    } finally {
+      ExecutionRegistry.prototype.registerRoot = registerRoot;
+    }
+    assert.deepEqual(seamErrors, ["registerRoot: root kind does not match reservation"], "the registry refused the probe root");
+    assert.equal(probeLaunches, 1);
+    assert.equal(rig.transport.turnStartCount, 0, "no turn ever started");
+    assert.equal(rig.providerLaunches(), 0, "no provider root ever launched");
   });
 
   it("the production seam measures a clean probe root's output", async () => {
