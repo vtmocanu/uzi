@@ -377,6 +377,9 @@ tasks:
       # WITHOUT editing .github/workflows/** (which this branch must not touch). Ordered
       # before `scan:secrets`, which is deliberately last because it dominates.
       - task: test:migration-renumber
+      # #1851: the weekly role refresh (builtins + dev-team roster) is all-or-nothing
+      # and never widens the roster; temp repos and stubs, a second or two.
+      - task: test:refresh-role-manifest
       # #1720: the agent runtime-base input key must change for every runtime-stage input
       # and refuse any form it cannot account for; a gap there makes a release silently
       # reuse a stale base. Temp git repos, a few seconds.
@@ -1014,6 +1017,15 @@ tasks:
       # refusals, and the happy-path renumber. Prints `N passed, N failed` and exits nonzero
       # on any failure. See the script header.
       - ./scripts/migration-renumber-test.sh
+
+  test:refresh-role-manifest:
+    desc: offline fixture test of scripts/refresh-role-manifest.sh (weekly builtin + roster sync; issue 1851)
+    cmds:
+      # A gate:repo member. Temp repos, a stub sync.py and a stub parity command drive
+      # the real script: forward bump, all-or-nothing warnings, same-version body change,
+      # pin-only change, roster sync with dropped lines, the tester allowlist, BAD-FM,
+      # a failed apply, and stable-tag selection. Needs jq, yq and python3.
+      - ./scripts/refresh-role-manifest-test.sh
 
   check:spec-numbering:
     desc: specs/ai.md is frozen at section 637 (issue 1317), unique numbers, none above the head, count 637, with a canary proving both detectors fired

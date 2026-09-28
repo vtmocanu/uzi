@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **The weekly role refresh now does the whole sync ([#1851](https://github.com/vtmocanu/uzi/issues/1851)).**
+  It checks out the latest stable skills release, copies the builtin agent bodies, moves their versions and pin, and syncs this repo's `.claude/agents/` roster, in one PR with the two halves as separate commits and every dropped line listed. A role missing upstream or a version moving backward changes nothing and opens a tracking issue. It also no longer shows the tester's description with literal quote marks, and the agents docs were corrected for new users.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added

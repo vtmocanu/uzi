@@ -28,14 +28,18 @@ Nothing uzi-specific goes in those files:
 - `task nudge:builtins` (`scripts/builtin-parity.sh`, `api/cmd/builtinparity`)
   fetches `product-agents/` at `upstream_sha` and byte-compares every builtin.
   It never gates and needs network access.
-- The weekly `roles-manifest-refresh` workflow runs
-  `refresh-role-manifest.sh` and opens a manifest-bump PR when upstream versions
-  move. That reddens `TestBuiltinLibraryDrift` until the builtins' `version:`
-  stamps match. The test compares numbers only: bumping the stamps without
-  copying the bodies turns it green, so run `task nudge:builtins` to confirm
-  the bodies match.
+- The weekly `roles-manifest-refresh` workflow does the sync below for you
+  (#1851): it checks out the latest stable `vX.Y.Z` skills release and runs
+  `scripts/refresh-role-manifest.sh`, which copies the builtin bodies, moves the
+  versions and `upstream_sha`, syncs `.claude/agents/` with the library's
+  `sync.py`, and byte-checks parity. It opens one PR (a draft when parity fails)
+  with the builtins and the roster in separate commits, listing every body line
+  the roster sync dropped. A role missing upstream or a version moving backward
+  writes nothing and opens a tracking issue instead. `TestBuiltinLibraryDrift`
+  compares numbers only, so the parity line in that PR (or `task
+  nudge:builtins`) is what shows the bodies match.
 
-## Sync procedure
+## Sync procedure (what the bot does; by hand when needed)
 
 1. Pick the upstream commit (normally a release tag's commit) and note its SHA.
 2. Copy `product-agents/<role>.md` for the 11 roles into `builtins/`, unchanged.
@@ -44,6 +48,12 @@ Nothing uzi-specific goes in those files:
    `cd api && go test ./internal/agenttmpl/ ./internal/agentsource/`.
 5. If a copied body now contradicts the worker (a new uzi-specific need), fix it
    upstream, not here, and add the uzi half to `agent/src/prompt.ts`.
+
+The dev-team roster (`.claude/agents/`) follows the same release through the
+library's `sync.py apply`, which keeps each file's `## For this repo` tail and
+its `model:`. `scripts/role-sync-allowlist.tsv` lists the local differences the
+bot expects and does not report (today: `tester` runs on `sonnet`); it matches
+the exact `sync.py check` detail, so any other difference is still reported.
 
 Upstream ships more roles than uzi builds in (`release`, `tui-ux`,
 `skill-reviewer`). They are not builtins; an agent-source sync can still add them
