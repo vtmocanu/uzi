@@ -313,5 +313,71 @@ describe("RecoveryHoldsSurface", () => {
       // Control: the sibling hold with a ref DOES render the line, so the query can see it.
       expect(within(rowFor("runrec02")).getByText("Checkpoint on forge")).toBeTruthy();
     });
+
+    // Discarding a run's LAST open hold releases its custody, and the retained checkpoint ref
+    // follows custody, so the confirmation must say the ref goes too. Each case arms the
+    // confirmation and reads the group by identity; the negatives assert the base warning
+    // rendered, so an absent ref sentence is never a confirmation that never mounted.
+    const LAST_HOLD = /last open hold/;
+    const armConfirm = (runShort: string) => {
+      fireEvent.click(within(rowFor(runShort)).getByRole("button", { name: /Discard held work/ }));
+      return screen.getByRole("group", { name: new RegExp(`Discard held work for run ${runShort}`) });
+    };
+
+    it("warns that discarding the run's last open hold deletes its checkpoint ref", async () => {
+      await renderSurface(
+        listing([
+          hold({
+            id: "h-last",
+            run_id: "runlast1",
+            attention: "source_only",
+            checkpoint_ref: "refs/uzi-checkpoints/agent/issue-9",
+            checkpoint_tip: "b41e7d09a2c3f58e61d4a7b90c2e5f3a1d8b6c47",
+            checkpoint_state: "retained",
+          }),
+          // Another run's open hold must not count toward this run's.
+          hold({ id: "h-other", run_id: "runother", attention: "active" }),
+        ]),
+      );
+      const group = armConfirm("runlast1");
+      const warning = within(group).getByText(LAST_HOLD);
+      expect(warning.textContent).toContain("also deletes the retained checkpoint ref");
+      expect(warning.textContent).toContain("Fetch it first if you need it.");
+      const code = warning.querySelector("code");
+      expect(code?.textContent).toBe("refs/uzi-checkpoints/agent/issue-9");
+      // Announced: the group is described by both the base warning and the ref sentence.
+      const describedBy = (group.getAttribute("aria-describedby") ?? "").split(" ");
+      expect(describedBy).toContain(warning.id);
+      expect(describedBy).toContain("discard-warning-h-last");
+    });
+
+    it("does not warn about the ref while the run still has another open hold", async () => {
+      await renderSurface(
+        listing([
+          hold({
+            id: "h-dec",
+            run_id: "runtwo01",
+            attention: "source_only",
+            checkpoint_ref: "refs/uzi-checkpoints/agent/issue-10",
+            checkpoint_state: "retained",
+          }),
+          // A healthy sibling hold on the SAME run: filtered out of the decision rows, but it
+          // still keeps custody (and the ref) alive after this discard.
+          hold({ id: "h-sib", run_id: "runtwo01", attention: "active", generation: 2 }),
+        ]),
+      );
+      const group = armConfirm("runtwo01");
+      expect(within(group).getByText(/only copy/)).toBeTruthy();
+      expect(within(group).queryByText(LAST_HOLD)).toBeNull();
+      expect(group.getAttribute("aria-describedby")).toBe("discard-warning-h-dec");
+    });
+
+    it("does not warn about a ref when the run's last open hold has no checkpoint", async () => {
+      await renderSurface(listing([hold({ id: "h-bare", run_id: "runbare1", attention: "source_only" })]));
+      const group = armConfirm("runbare1");
+      expect(within(group).getByText(/only copy/)).toBeTruthy();
+      expect(within(group).queryByText(LAST_HOLD)).toBeNull();
+      expect(group.getAttribute("aria-describedby")).toBe("discard-warning-h-bare");
+    });
   });
 });

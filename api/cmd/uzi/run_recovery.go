@@ -242,6 +242,8 @@ func newRunDiscardCmd(env Env, gf *globalFlags) *cobra.Command {
 			"permanently destroy the work. An available recovery archive is NEVER deleted by this " +
 			"command (export it first with `run export`, or delete it separately); only a hold's " +
 			"in-progress/failed captures are settled.\n\n" +
+			"Discarding a run's last open hold also deletes its retained checkpoint ref on the forge; " +
+			"fetch that ref first if you need it.\n\n" +
 			"You must confirm interactively, or pass --yes for an unattended run. Without a terminal " +
 			"and without --yes the command refuses and changes nothing. List a run's holds with " +
 			"`run recovery <run-id>`.",
@@ -304,6 +306,7 @@ func confirmDiscardHold(env Env, runID, holdID string) (bool, error) {
 		"Discard custody hold %s on run %s?\n"+
 			"The worker-local source may be the ONLY copy of this work; no server archive can restore "+
 			"it after discard, and discard permits worker/PVC teardown that can permanently destroy it. "+
+			"Discarding a run's last open hold also deletes its retained checkpoint ref on the forge. "+
 			"[y/N]: ",
 		holdID, sanitizeTTY(runID))
 	line, err := bufio.NewReader(env.Stdin).ReadString('\n')

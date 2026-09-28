@@ -356,6 +356,32 @@ func TestRunDiscardConfirmCancelled(t *testing.T) {
 	}
 }
 
+// TestRunDiscardWarnsCheckpointRefDeletion proves both the interactive prompt and the help
+// text say that discarding a run's last open hold also deletes its retained checkpoint ref on
+// the forge (PRD #1810: retention follows custody).
+func TestRunDiscardWarnsCheckpointRefDeletion(t *testing.T) {
+	const want = "last open hold also deletes its retained checkpoint ref on the forge"
+	fc := &uzicli.FakeClient{}
+	env := fakeEnv(fc)
+	env.StdinTTY = true
+	env.Stdin = strings.NewReader("n\n")
+	_, errb, code := runCLI(t, env, "run", "discard", "run1", "--hold", "hold-x")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 on a declined prompt\nstderr=%q", code, errb)
+	}
+	if !strings.Contains(errb, "[y/N]") || !strings.Contains(errb, want) {
+		t.Errorf("prompt should warn about the checkpoint ref; stderr=%q", errb)
+	}
+
+	out, errb, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), "run", "discard", "--help")
+	if code != uzicli.ExitOK {
+		t.Fatalf("help exit = %d, want 0\nstderr=%q", code, errb)
+	}
+	if !strings.Contains(out, "Discard ONE exact custody hold") || !strings.Contains(out, want) {
+		t.Errorf("help should warn about the checkpoint ref; stdout=%q", out)
+	}
+}
+
 // TestRunDiscardConfirmAccepted proves that an accepted interactive prompt ("y") discards the
 // exact hold.
 func TestRunDiscardConfirmAccepted(t *testing.T) {

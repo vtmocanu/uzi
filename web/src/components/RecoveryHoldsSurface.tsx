@@ -45,6 +45,14 @@ export function RecoveryHoldsSurface() {
   const decisionHolds = holds.holds.filter((h) => custodyHoldView(h).needsDecision);
   if (decisionHolds.length === 0) return null;
   const groups = groupHoldsByWorker(decisionHolds);
+  // Open holds per run, counted over the FULL listing (not just the decision rows): the
+  // retained checkpoint ref follows custody, so discarding a run's last open hold also deletes
+  // that ref on the forge (PRD #1810). A healthy sibling hold filtered out above still counts.
+  const openHoldsByRun = new Map<string, number>();
+  for (const h of holds.holds) {
+    if (h.state === "released" || h.state === "discarded") continue;
+    openHoldsByRun.set(h.run_id, (openHoldsByRun.get(h.run_id) ?? 0) + 1);
+  }
   const { open_holds, custody_hold_limit, decision_needed } = holds.aggregate;
 
   return (
@@ -91,7 +99,12 @@ export function RecoveryHoldsSurface() {
             </div>
             <ul className="mt-2 space-y-2">
               {g.holds.map((hold) => (
-                <HoldRow key={hold.id} hold={hold} onChanged={load} />
+                <HoldRow
+                  key={hold.id}
+                  hold={hold}
+                  isLastOpenHold={openHoldsByRun.get(hold.run_id) === 1}
+                  onChanged={load}
+                />
               ))}
             </ul>
           </section>
@@ -108,9 +121,13 @@ export function RecoveryHoldsSurface() {
 // information only.
 function HoldRow({
   hold,
+  isLastOpenHold,
   onChanged,
 }: {
   hold: RecoveryCustodyHold;
+  // True when this is the run's only open hold, so discarding it releases the run's custody
+  // and with it the retained checkpoint ref on the forge.
+  isLastOpenHold: boolean;
   // Returns the parent's reload promise so the discard handler can await it and clear `busy`
   // only once the listing has settled (see discard's finally).
   onChanged: () => void | Promise<void>;
@@ -173,6 +190,8 @@ function HoldRow({
   const holdShort = shortId(hold.id);
   const workerName = hold.worker_name ? stripUnsafeChars(hold.worker_name) : "this worker";
   const warningId = `discard-warning-${hold.id}`;
+  const refWarningId = `discard-ref-warning-${hold.id}`;
+  const refWarning = isLastOpenHold ? view.checkpoint : null;
   const inputId = `discard-input-${hold.id}`;
   const canDiscard = typed.trim().toLowerCase() === "discard";
 
@@ -245,7 +264,7 @@ function HoldRow({
           tabIndex={-1}
           role="group"
           aria-label={`Discard held work for run ${runShort} on ${workerName}, generation ${hold.generation}`}
-          aria-describedby={warningId}
+          aria-describedby={refWarning ? `${warningId} ${refWarningId}` : warningId}
           onKeyDown={(e) => {
             if (e.key === "Escape") dismiss();
           }}
@@ -261,6 +280,13 @@ function HoldRow({
             its disk to be torn down, which can destroy this work permanently. This cannot be
             undone.
           </p>
+          {refWarning && (
+            <p id={refWarningId} className="text-sm text-danger">
+              This is the run&rsquo;s last open hold: discarding it also deletes the retained
+              checkpoint ref <code className="break-all font-mono">{refWarning.ref}</code> on the
+              forge. Fetch it first if you need it.
+            </p>
+          )}
           <div className="space-y-1.5">
             <label htmlFor={inputId} className="block text-xs font-medium text-muted">
               Type <span className="font-mono text-danger">discard</span> to confirm.
