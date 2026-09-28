@@ -137,35 +137,24 @@ function capChars(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 1)}\u2026`;
 }
 
-/** C0, DEL, C1, the two Unicode line/paragraph separators, and the zero-width and bidi
- *  formatting characters (U+200B-200F, U+202A-202E, U+2066-2069, U+FEFF) that can hide or
- *  reorder log text (a char-code test, since oxlint denies `no-control-regex`). Keep in step
- *  with `isCodexBoundaryDiagnosticChar` in agent/src/runner.ts, which rejects the same set. */
-function isDiagnosticControl(code: number): boolean {
-  return (
-    code <= 0x1f ||
-    (code >= 0x7f && code <= 0x9f) ||
-    (code >= 0x200b && code <= 0x200f) ||
-    code === 0x2028 ||
-    code === 0x2029 ||
-    (code >= 0x202a && code <= 0x202e) ||
-    (code >= 0x2066 && code <= 0x2069) ||
-    code === 0xfeff
-  );
-}
+/** One code point in Unicode general category Cc (C0, DEL, C1), Cf (every format character:
+ *  zero-width, bidi, soft hyphen, word joiners, U+061C, U+180E, U+FEFF, tag characters) or
+ *  Zl/Zp (U+2028, U+2029): the characters that can break, hide or reorder log text. Keep in
+ *  step with `CODEX_BOUNDARY_DIAGNOSTIC_CHAR` in agent/src/runner.ts, which rejects the same set. */
+const DIAGNOSTIC_CONTROL = /^[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]$/u;
 
 function diagnosticText(raw: unknown): string {
   const text = typeof raw === "string" ? raw : "";
   // Each control-character run becomes one space, so "a\nb" stays two readable words.
   let out = "";
   let inControl = false;
-  for (let i = 0; i < text.length; i++) {
-    const code = text.charCodeAt(i);
-    if (isDiagnosticControl(code)) {
+  // Iterate by code point so an astral format character (a tag character) is tested whole.
+  for (const ch of text) {
+    if (DIAGNOSTIC_CONTROL.test(ch)) {
       if (!inControl) out += " ";
       inControl = true;
     } else {
-      out += text[i];
+      out += ch;
       inControl = false;
     }
   }
@@ -217,8 +206,9 @@ export class CodexBoundaryError extends Error {
   /** Issue #1864: the boundary and the checkpoint sink that requested it, when known. */
   readonly boundary?: SafeBoundary;
   readonly sink?: BoundarySink;
-  /** Issue #1864: a one-line, secret-free summary free of control, zero-width and bidi characters of this failure,
-   *  at most {@link CODEX_BOUNDARY_DIAGNOSTIC_MAX_CHARS} characters. `message` stays the bare
+  /** Issue #1864: a one-line, secret-free summary of this failure, at most
+   *  {@link CODEX_BOUNDARY_DIAGNOSTIC_MAX_CHARS} UTF-16 code units, containing no code point in
+   *  Unicode general category Cc, Cf, Zl or Zp (see `DIAGNOSTIC_CONTROL`). `message` stays the bare
    *  `codex boundary failed at <stage>`. */
   readonly diagnostic: string;
   constructor(

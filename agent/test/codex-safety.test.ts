@@ -1016,6 +1016,21 @@ describe("CodexBoundaryError.diagnostic (issue #1864)", () => {
     assert.ok(!err.diagnostic.includes(zwsp), "no U+200B");
   });
 
+  // One code point per Unicode category (Cc, Cf, Zl, Zp) and per range the old hand-listed
+  // predicate missed; runner-codex-sinks.test.ts rejects the same list on the read side.
+  for (const cp of [
+    0x0007, 0x001b, 0x007f, 0x0085, 0x00ad, 0x061c, 0x180e, 0x200b, 0x200f, 0x2028,
+    0x2029, 0x202a, 0x202e, 0x2060, 0x2064, 0x2066, 0x2069, 0x206a, 0x206f, 0xfeff,
+  ]) {
+    const hex = `U+${cp.toString(16).toUpperCase().padStart(4, "0")}`;
+    it(`folds ${hex} to a space`, () => {
+      const ch = String.fromCodePoint(cp);
+      const err = new CodexBoundaryError("quiesce", [{ category: "protocol", message: `a${ch}b` }]);
+      assert.equal(err.diagnostic, "codex boundary failed at quiesce: a b");
+      assert.ok(!err.diagnostic.includes(ch), `no ${hex}`);
+    });
+  }
+
   it("caps each error at 160 characters and the whole diagnostic at 500", () => {
     const one = new CodexBoundaryError("reap", [{ category: "protocol", message: "x".repeat(400) }]);
     const detail = one.diagnostic.slice("codex boundary failed at reap: ".length);

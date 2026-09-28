@@ -873,6 +873,15 @@ describe("RunRunner #1864 — a Codex boundary failure names its stage, checkpoi
     ["an oversize", `codex boundary failed at quiesce: ${"x".repeat(600)}`],
     ["a control-character", "codex boundary failed at quiesce: forged\nline"],
     ["a bidi-override", `codex boundary failed at quiesce: forged${String.fromCharCode(0x202e)}enil`],
+    // One code point per Unicode category (Cc, Cf, Zl, Zp) and per range the old hand-listed
+    // predicate missed; codex-safety.test.ts folds the same list on the write side.
+    ...[
+      0x0007, 0x001b, 0x007f, 0x0085, 0x00ad, 0x061c, 0x180e, 0x200b, 0x200f, 0x2028,
+      0x2029, 0x202a, 0x202e, 0x2060, 0x2064, 0x2066, 0x2069, 0x206a, 0x206f, 0xfeff,
+    ].map((cp) => [
+      `a U+${cp.toString(16).toUpperCase().padStart(4, "0")}`,
+      `codex boundary failed at quiesce: forged${String.fromCodePoint(cp)}line`,
+    ] as const),
   ] as const) {
     it(`a forged CodexBoundaryError with ${label} diagnostic falls back to the bare message`, async () => {
       const r = await failMilestoneCheckpoint(1865, () => {
