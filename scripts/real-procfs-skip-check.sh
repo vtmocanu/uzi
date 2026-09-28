@@ -19,7 +19,7 @@
 #   the command's own non-zero status, when it failed (the skip list still prints)
 #   1 = the command passed but real-procfs tests skipped where they must run: in CI (CI
 #       non-empty), on a host whose proc root enumerates, or where the probe hit an error
-#       other than EACCES/EPERM
+#       other than EACCES/EPERM; or the skip log was missing or uncountable afterwards
 #   2 = usage / could not create the skip log / node missing for the probe
 #   0 = the command passed, and either nothing skipped or the probe confirms enumeration
 #       is denied (a banner states how many tests skipped)
@@ -44,12 +44,27 @@ trap 'exit 143' TERM
 rc=0
 UZI_REAL_PROCFS_SKIP_LOG="$log" "$@" || rc=$?
 
+# Fail closed when the log is gone (the command deleted it): the skip count is unknowable, and
+# counting a missing file as 0 would pass a run whose skips were never seen. A non-zero command
+# status still wins.
+if [ ! -f "$log" ]; then
+  echo "real-procfs-skip-check: the skip log $log is missing (the command removed it); cannot count real-procfs skips" >&2
+  if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+  exit 1
+fi
 # One record per line: `label<TAB>reason`.
 skips="$(wc -l < "$log" | tr -d ' ')"
+case "$skips" in
+  '' | *[!0-9]*)
+    echo "real-procfs-skip-check: cannot count the skip log $log (got '$skips')" >&2
+    if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+    exit 1
+    ;;
+esac
 if [ "$skips" -gt 0 ]; then
   tab="$(printf '\t')"
   while IFS="$tab" read -r label reason; do
-    echo "real-procfs skip: $label — $reason"
+    printf 'real-procfs skip: %s — %s\n' "$label" "$reason"
   done < "$log"
 fi
 

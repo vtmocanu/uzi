@@ -29,7 +29,7 @@ mkdir -p "$ENUMERABLE" "$DENIED"
 chmod 000 "$DENIED"
 
 # The fake commands. `skip N` appends N records and exits 0; `fail RC` exits RC after
-# appending one record (the list must still print).
+# appending one record (the list must still print); `rmlog RC` deletes the skip log and exits RC.
 FAKE="$TMP/fake-tests"
 cat > "$FAKE" <<'EOF'
 #!/bin/sh
@@ -44,6 +44,10 @@ case "$1" in
     ;;
   fail)
     printf 'failing label\treal-procfs-denied: failing reason\n' >> "$UZI_REAL_PROCFS_SKIP_LOG"
+    exit "$2"
+    ;;
+  rmlog)
+    rm -f "$UZI_REAL_PROCFS_SKIP_LOG"
     exit "$2"
     ;;
 esac
@@ -119,7 +123,37 @@ run_case "command rc 7 preserved" 7 "$ENUMERABLE" - "$CHECK" "$FAKE" fail 7 &&
 # (f) a probe error other than EACCES/EPERM does not excuse a skip.
 run_case "missing probe dir + 1 skip" 1 "$TMP/does-not-exist" - "$CHECK" "$FAKE" skip 1 || true
 
-# (g) usage.
+# (g) a vanished skip log fails closed; a non-zero command status still wins.
+run_case "skip log deleted, command rc 0" 1 "$ENUMERABLE" - "$CHECK" "$FAKE" rmlog 0 &&
+  expect_output "a deleted skip log is named" "is missing (the command removed it)"
+run_case "skip log deleted, command rc 5 preserved" 5 "$ENUMERABLE" - "$CHECK" "$FAKE" rmlog 5 || true
+
+# (h) end to end through the real TypeScript recorder: agent/test/real-procfs.ts's
+# realProcfsSkip, run under node + tsx with a forced denied value, must land its record in
+# the log this wrapper names, so the enumerable probe dir reports the vanished coverage. A
+# renamed env var on either side reddens here. node and tsx are required, never skipped.
+AGENT="$ROOT/agent"
+if ! command -v node > /dev/null 2>&1; then
+  echo "FAIL: end-to-end recorder: node is not on PATH"
+  failures=$((failures + 1))
+elif [ ! -e "$AGENT/node_modules/tsx" ]; then
+  echo "FAIL: end-to-end recorder: tsx is not installed under $AGENT/node_modules (install the agent deps)"
+  failures=$((failures + 1))
+else
+  E2E="$TMP/e2e-recorder.mts"
+  cat > "$E2E" <<EOF
+import { realProcfsSkip } from "$AGENT/test/real-procfs.ts";
+realProcfsSkip("e2e forced", "real-procfs-denied: forced by the e2e case");
+EOF
+  # shellcheck disable=SC2016 # the single-quoted program is expanded by the inner sh
+  run_case "end-to-end recorder + enumerable probe" 1 "$ENUMERABLE" - "$CHECK" \
+    sh -c 'cd "$1" && exec node --import tsx "$2"' sh "$AGENT" "$E2E" && {
+    expect_output "end-to-end lists the recorded skip" "real-procfs skip: e2e forced — real-procfs-denied: forced by the e2e case [e2e forced]"
+    expect_output "end-to-end names the vanished coverage" "coverage vanished: 1 real-procfs"
+  }
+fi
+
+# (i) usage.
 run_case "no command is a usage error" 2 "$ENUMERABLE" - "$CHECK" || true
 
 if [ "$failures" -gt 0 ]; then
