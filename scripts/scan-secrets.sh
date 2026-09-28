@@ -199,8 +199,8 @@ fi
 # failure here for the same reason it is one for lint:api.
 if ! command -v go >/dev/null 2>&1; then
   echo "scan-secrets: no go on PATH." >&2
-  echo "  gitleaks arrives via \`go install …@$VERSION\`, the same pinned-module route" >&2
-  echo "  gate:api already uses for golangci-lint and deadcode. Install Go." >&2
+  echo "  This gate builds gitleaks with \`go install …@$VERSION\`, so it needs Go," >&2
+  echo "  as gate:api already does. Install Go." >&2
   exit 2
 fi
 
