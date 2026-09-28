@@ -193,6 +193,13 @@ Check these traps before every approve:
 - **A plan that contradicts its own PRD.** Pause and identify the conflicting clauses. Ask
   the user which takes precedence, then `revise` the plan and require the PRD correction in
   the same branch before approval.
+- **A gate blocked by a measured environment limit.** When the run's environment facts (the
+  block the worker adds to the lead's plan prompt, visible in the run transcript) show a
+  limit or "not verified" fact that affects a gate the plan relies on, the plan must carry
+  an **Environment limits** section that records that gate as blocked/not run and names the
+  CI or other lane that completes validation; otherwise `revise`. A missing `/proc` alone
+  does not make a gate blocked. This covers human-reviewed plan gates only; unattended
+  (autopilot/sweep) plans get no such review.
 
 Each is a `revise` (or, for a genuine plan/PRD conflict, a question to the user), not a
 reject — the rest of a good plan stays.

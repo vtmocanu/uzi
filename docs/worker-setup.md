@@ -285,6 +285,38 @@ Codex also screens the shell working directory and uses Landlock where
 available. OS permissions and the worker/runner uid split still apply. The
 existing credential and `.git` restrictions also apply inside scratch.
 
+### Environment facts in the lead's prompt
+
+After the clone and tool provisioning, before the first plan turn, the worker
+runs a fixed probe it owns (a constant `node -e` script, never a repo script)
+with a roughly 2-second cap. It measures three facts: whether `/proc` can be
+enumerated, whether the command's actual `$HOME` is writable, and whether its
+actual `$TMPDIR` is writable. A probe that times out or fails is reported as
+"not verified", never as access being available.
+
+On Codex, the probe runs through the same command sandbox the agent's shell
+commands use, and its result is cached for the run rather than re-measured
+when the provider epoch is recreated. Each Codex command gets its own private
+`$HOME` and `$TMPDIR`, so "writable" there says nothing about what persists
+between commands. On Claude, the probe runs as the runner uid with the
+agent's SDK env — a useful baseline, but not provably identical to an SDK
+Bash tool call. Either way, if the worker cannot confirm the probe's own
+process was cleaned up, the run fails before planning rather than reporting
+a fact it can't stand behind.
+
+The worker also passes through, unprobed, the harness and whether Docker is
+wired — worker configuration, not a measurement. It reports no egress tier:
+the worker receives no egress-tier configuration to pass through.
+
+The lead's plan prompt (and its first implement prompt) gets a short block
+listing only the limits and "not verified" facts it found, nothing when
+there are none, plus a fixed rule: when a gate is blocked by a verified
+limit, the lead records it as not run or blocked, runs the checks that
+remain valid, and names the CI or other test lane that must complete
+validation. A plan needs an **Environment limits** section only when a
+measured fact actually affects its planned validation — a missing `/proc`
+alone does not prove a gate is blocked.
+
 ## Concurrent runs
 
 By default a worker executes one run at a time. Set `WORKER_MAX_CONCURRENT_RUNS`
