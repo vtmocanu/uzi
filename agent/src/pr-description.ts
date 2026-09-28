@@ -45,7 +45,7 @@
 // written ones, the api sanitizer's normalised forms, and common markup and entity splits (a keyword
 // split by an entity, a tag, a comment, a processing instruction, CDATA, a declaration or an empty
 // link). It is NOT a guarantee against deliberate obfuscation by someone with edit rights on the PR
-// description: that person can add a plain `Closes #N` at any time after uzi's write, so the scan
+// description: that person can add a plain `Closes #N` at any time after uzi's last write, so the scan
 // cannot be a boundary against them. Anyone without edit rights reaches the body only through the
 // api sanitizer (model and lead text) and this module's escaping (deterministic interpolations), D7.
 // Known gaps, documented and accepted (pinned in the hardening tests), including: a link destination
@@ -731,7 +731,7 @@ function refResolves(m: RegExpExecArray, iid: number, repoPath: string | undefin
  * What it catches, and what it does not (the module header's threat model): directives present in
  * the body when uzi writes it, written plainly, in the api sanitizer's normalised forms, or split by
  * common markup and entities. It is not a boundary against someone with edit rights on the PR
- * description, who can add a plain `Closes #N` after uzi's write. Accepted gaps include: a link
+ * description, who can add a plain `Closes #N` after uzi's last write. Accepted gaps include: a link
  * destination with balanced parentheses, escapes, a quoted `)` in its title or a pointy destination
  * holding `)` (`[Fix](a(b)c)es #7`, `[Fix](<1)>)es #7`), a custom tag with a quoted `>` in an
  * attribute (`Fix<foo title="a>b">es #7`), and (in parseOwnedBlocks, not here) list-item fences.

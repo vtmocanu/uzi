@@ -5021,8 +5021,9 @@ export class RunRunner {
     // reconcile's `nonClosing` scan via its `closes`, whether the verified reconcile ADDED Closes). The
     // rendered Closes line itself is decided by renderCloses/withCloses going into the renderer's
     // issueArm (agent/src/pr-description.ts), whose partial arms never write it. Any new partial or
-    // blocker arm (a delivery that must not close its issue) MUST set it here rather than add its own
-    // check at one of those sites.
+    // blocker arm (a delivery that must not close its issue) needs BOTH: a matching non-closing arm in
+    // issueArm (setting this flag alone still renders `Closes #N`, and the publisher's scan skips uzi's
+    // own completion block), and this flag set here rather than its own check at one of those sites.
     const nonClosingDelivery = isOwnerPartial || !!result.scopeCapped;
     const createCloses = renderCloses && !nonClosingDelivery;
     // H1: a forge response over its byte cap (ForgeResponseTooLarge) is a deterministic answer, not
