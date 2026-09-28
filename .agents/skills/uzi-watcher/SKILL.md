@@ -176,10 +176,8 @@ Check these traps before every approve:
   adds a new `uzi` command AND a new route must mount it in the `RequireUser` group
   (cookie **or** `uzc_` Bearer), not the cookie-only `RequireAuth` group, or the CLI
   Bearer 401s at runtime — is the cookie-only-route entry in the `uzi-cli` skill's *Send
-  to uzi* hazards. The concrete instance here was issue #428 (a task-runs route mounted
-  cookie-only broke `uzi handoff`); `revise` to move the route and to add a router-level
-  differential-auth test — a `FakeClient` test bypasses the real router and cannot catch
-  the mis-mount.
+  to uzi* hazards. `revise` to move the route and add a router-level differential-auth
+  test: a `FakeClient` test bypasses the real router and cannot catch the mis-mount.
 
 - **A gate step that inlines gate mechanics** — in the lead's plan, or in a `revise` you
   write. Keep any gate instruction high-level: have the worker run the component's canonical
@@ -189,6 +187,9 @@ Check these traps before every approve:
   one shared database and redden the gate. Run `gate:api` with `UZI_TEST_DATABASE_URL` UNSET
   (its LiveDB tests then skip cleanly) and run LiveDB separately via `./e2e/run-store-it.sh`
   only when needed (`.claude/rules/go.md`).
+- **A new api requirement on workers without a rollout path.** The api rolls before the
+  pinned fleet (`workers.image.tag`) drains. Gate a new required worker field behind a NEW
+  capability (`api/internal/capability`), or `revise` to document a staged rollout.
 - **A plan that contradicts its own PRD.** Pause and identify the conflicting clauses. Ask
   the user which takes precedence, then `revise` the plan and require the PRD correction in
   the same branch before approval.

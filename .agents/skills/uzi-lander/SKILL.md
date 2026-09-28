@@ -255,8 +255,16 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    - **big** (design-level, many files, needs the plan's context): `uzi run rework RUN -m
      'GUIDANCE'` (single-quoted), `SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)` captured first,
      `S/wait-mrrework.sh OWNER/REPO PR 45 60 "$SINCE"`, review its commit, trail `fix rework`.
+     Exit 3 means the rework is still running: re-run the waiter with the same `$SINCE`.
      A 409 "disabled" means rework is off for that run: `uzi run mr-rework RUN --enabled`,
-     then retry; do not downgrade a big fix to a local one because the lane was off;
+     then retry; do not downgrade a big fix to a local one because the lane was off.
+     **A rework already running** (uzi starts one on new bot comments; a second `uzi run
+     rework` then fails "already working this branch"): steer it with `uzi run follow-up
+     REWORK_RUN -m 'GUIDANCE'` instead. A finding an earlier cycle declined that resurfaces
+     with no new evidence: ask for a reasoned reply on the thread and no code change.
+     **Steer with facts and acceptance criteria.** Steer text reaches the rework's
+     validators as operator constraints, so name an identifier as binding only when
+     compatibility needs that exact name; otherwise call it an example;
    - **skip**: false positive, deliberate, or inherited base artifact; a real inherited bug
      is fixed or filed (sweepable: `bug`+`uzi`), never silently skipped.
    Decide, then report the decisions in one message (finding, label, choice, why) and
@@ -355,6 +363,13 @@ and they precede every merge (step 6):
   `text` messages (`uzi run logs RUN --json`) for checks it marks NOT RUN or failed, and run
   them on a capable host before merging. Skipping one needs the user's explicit exception,
   naming what stays unvalidated.
+- **Rollout compatibility.** When the diff makes the api refuse or require something new from
+  workers, check it against the pinned released worker (`workers.image.tag` in
+  `deploy/chart/values.yaml`): the api rolls first and the fleet drains later. A new
+  requirement keyed on a capability released workers already advertise breaks them for the
+  whole roll; it needs a new capability or a documented staged rollout (uzi-watcher's
+  plan-trap check, applied again to the diff). A fix changes planned behaviour, so it is
+  the user's call (*Stance*).
 - **The PR description is yours to edit.** A uzi rework cannot change it, so disclosures a
   rework reports (deferred items, behaviour changes, follow-ups) reach the PR body only
   through you: `gh pr edit PR --body-file FILE`, keeping the existing text.
