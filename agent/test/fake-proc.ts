@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { setQuiescenceViewForTests, type QuiescenceView } from "../src/run-quiescence.js";
 import { RUN_ATTEMPT_ENV, RUN_CLONE_KEY_ENV } from "../src/worker-spawn-mark.js";
+// Importing the setup module also installs the hermetic default for a bare single-file run.
 import { HERMETIC_VIEW } from "./setup/hermetic-proc.js";
 
 /** One planted fake process. */

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -10,6 +11,7 @@ import type { ExecutorFactory } from "../src/runner.js";
 import {
   LiveAttemptRegistry,
   newRunAttempt,
+  procfsTable,
   procfsTableAt,
   quiesceRunAttempt,
   reapProcesses,
@@ -20,7 +22,14 @@ import {
   type ScanRequest,
 } from "../src/run-quiescence.js";
 import { statStartTime, workerSpawnNonce } from "../src/worker-spawn-mark.js";
-import { makeFakeProcRoot, plantFakeProc, plantInScope, plantUnreadableUnattributed } from "./fake-proc.js";
+import {
+  makeFakeProcRoot,
+  plantFakeProc,
+  plantInScope,
+  plantUnreadableUnattributed,
+  scopedRealView,
+  withQuiescenceView,
+} from "./fake-proc.js";
 import { api, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith, simulateCommittedWork, worktreeDirFor } from "./runner-harness.js";
 import { restoreHermeticView } from "./setup/hermetic-proc.js";
 
@@ -178,6 +187,9 @@ const BAD_VIEWS: Array<[string, unknown]> = [
   ["a negative deadline", { procRoot: "/tmp/x", deadlineMs: -1 }],
   ["a fractional interval", { procRoot: "/tmp/x", intervalMs: 1.5 }],
   ["an unbounded deadline", { procRoot: "/tmp/x", deadlineMs: 10_001 }],
+  ["a deadline not below the helper timeout's margin", { procRoot: "/tmp/x", deadlineMs: 5_001 }],
+  ["a zero interval (a spinning reap loop)", { procRoot: "/tmp/x", intervalMs: 0 }],
+  ["an interval above the deadline cap", { procRoot: "/tmp/x", intervalMs: 5_001 }],
   ["a non-finite deadline", { procRoot: "/tmp/x", deadlineMs: "Infinity" }],
   ["both shapes at once", { procRoot: "/tmp/x", descendantsOf: 1 }],
   ["a non-pid descendant root", { descendantsOf: 0 }],
@@ -200,6 +212,16 @@ describe("a malformed view is refused by the setter and by the helper", () => {
     }
   });
 
+  it("control: the timing bounds themselves are accepted (deadline 0..5000 ms, interval 1..5000 ms)", () => {
+    for (const view of [
+      { procRoot: root, deadlineMs: 0, intervalMs: 1 },
+      { procRoot: root, deadlineMs: 5_000, intervalMs: 5_000 },
+      { descendantsOf: process.pid, deadlineMs: 5_000, intervalMs: 1 },
+    ]) {
+      assert.doesNotThrow(() => setQuiescenceViewForTests(view), JSON.stringify(view));
+    }
+  });
+
   it("the real proc root reached through a symlink is refused too", () => {
     const link = path.join(root, "proc-link");
     fs.symlinkSync(PROC, link);
@@ -214,6 +236,67 @@ describe("a malformed view is refused by the setter and by the helper", () => {
     assert.deepEqual(v.processes.map((p) => p.reason), ["unreadable_unattributed"]);
   });
 });
+
+// ─── the scoped real view (real procfs) ────────────────────────────────────────────────────
+
+describe("the scoped real view lists only this process's descendants and the registered pids", { skip: !HAS_LINUX }, () => {
+  it("a real non-descendant in the clone is excluded, and appears once registered by pid or pidfile (within 64 KiB)", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-scoped-view-"));
+    const clone = path.join(tmp, "runner", "github.com+o+r", "issue-scoped");
+    fs.mkdirSync(clone, { recursive: true });
+    // Backgrounded by a short-lived sh, so it is reparented away from this process: NOT a
+    // descendant. `$!` is the node process's own pid.
+    const orphan = Number(
+      execFileSync("sh", ["-c", '"$0" -e "setInterval(() => {}, 1000)" </dev/null >/dev/null 2>&1 & echo $!', process.execPath], {
+        cwd: clone,
+        env: { PATH: process.env.PATH },
+        encoding: "utf8",
+      }).trim(),
+    );
+    try {
+      assert.ok(Number.isSafeInteger(orphan) && orphan > 0);
+      const stat = procfsTable.readStat(orphan);
+      assert.notEqual(Number(stat.slice(stat.lastIndexOf(")") + 2).split(/\s+/)[1]), process.pid, "the orphan is not our child");
+      // Seed mode never signals an unmarked process, and the key and path are unique to this test.
+      const seed = req({ mode: "seed", ownMarker: undefined, targetKey: "github.com+o+r/issue-scoped", targetPaths: [clone] });
+      const listed = (r: ProcessQuiescence): number[] => r.processes.map((p) => p.pid);
+
+      const plain = await withQuiescenceView(scopedRealView(), () => reapProcesses(seed));
+      assert.equal(plain.state, "quiescent", plain.detail);
+      assert.ok(!listed(plain).includes(orphan), "a non-descendant is outside the scoped view");
+
+      const byPid = await withQuiescenceView(scopedRealView({ pids: [orphan] }), () => reapProcesses(seed));
+      assert.equal(byPid.state, "survivors", byPid.detail);
+      assert.deepEqual(byPid.processes.map((p) => [p.pid, p.reason]), [[orphan, "unattributed_in_scope"]]);
+
+      const pidFile = path.join(tmp, "pids");
+      fs.writeFileSync(pidFile, `${orphan}\n`);
+      const byFile = await withQuiescenceView(scopedRealView({ pidFiles: [pidFile] }), () => reapProcesses(seed));
+      assert.deepEqual(listed(byFile), [orphan], byFile.detail);
+
+      // Only the first 64 KiB of a pidfile is read: a pid listed after that is not in the view.
+      fs.writeFileSync(pidFile, `${"x\n".repeat(33 * 1024)}${orphan}\n`);
+      const pastCap = await withQuiescenceView(scopedRealView({ pidFiles: [pidFile] }), () => reapProcesses(seed));
+      assert.equal(pastCap.state, "quiescent", pastCap.detail);
+      assert.equal(alive(orphan), true, "no scan here signalled the orphan");
+    } finally {
+      try {
+        process.kill(orphan, "SIGKILL");
+      } catch {
+        // gone
+      }
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+function alive(pid: number): boolean {
+  try {
+    return !/^State:\s*[ZX]/m.test(procfsTable.readStatus(pid));
+  } catch {
+    return false;
+  }
+}
 
 // ─── runner flows over the real primitive ──────────────────────────────────────────────────
 

@@ -11,7 +11,10 @@ import { RUN_ATTEMPT_ENV, RUN_CLONE_KEY_ENV, workerSpawnNonce } from "../src/wor
 // test file's process (node --test forwards the parent's --import flags to each child). This file
 // deliberately does NOT import that module: it proves the preload reached it, by planting a REAL
 // own-marked straggler in a clone that a real-procfs reap would kill, and showing the default
-// reap (in-process and through the real helper) sees an empty table instead.
+// reap (in-process and through the real helper) sees an empty table instead. It imports none of
+// the shared test modules that also install the default (helpers.ts, runner-harness.ts,
+// fake-proc.ts), so it keeps proving the forwarding: run it through `npm test` (or with the same
+// `--import ./test/setup/hermetic-proc.ts`); a bare run without the preload is expected to fail.
 
 const HAS_PROCFS = process.platform === "linux" && fs.existsSync(path.join("/", "proc", "self", "status"));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-hermetic-default-"));

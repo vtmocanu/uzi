@@ -1,3 +1,9 @@
+// issue #1783 — install the hermetic quiescence view (an empty fake proc root) for any test file
+// importing this module, so a bare single-file run (`node --import tsx --test test/<file>.test.ts`,
+// which has no `npm test` preload) never reaps against the host's live process table. The module is
+// evaluated once per process (it is the same module the preload loads), so this import neither
+// re-runs nor clobbers a view a test later installs explicitly.
+import "./setup/hermetic-proc.js";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";

@@ -4,6 +4,12 @@
 // every proof `unverified`). A test that reaps real children opts into a scoped real view
 // (`descendantsOf`), and a test planting fake processes into its own fake root; either restores
 // this default with restoreHermeticView().
+//
+// test/helpers.ts, test/runner-harness.ts and test/fake-proc.ts import this module too, so a bare
+// single-file run without the preload is hermetic as well. ES modules evaluate once per process
+// (the preload's `./test/setup/hermetic-proc.ts` and a test's `./setup/hermetic-proc.js` resolve to
+// the same module), so the default is installed once, at load, before any test body can install
+// its own view.
 
 import fs from "node:fs";
 import os from "node:os";

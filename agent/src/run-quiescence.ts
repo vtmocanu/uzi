@@ -222,23 +222,32 @@ export const procfsTable: ProcTable = procfsTableAt(PROC_ROOT);
  * crosses into the helper with the request. Either a FAKE procfs-shaped root (a "kill" removes
  * `<procRoot>/<pid>`, so a fake pid never signals a real process), or the REAL procfs narrowed to
  * the descendants of one pid (plus pids the test registered, directly or in pidfiles read at every
- * listing: a `setsid` plant is reparented away from the test), killed for real. Production never
- * sets one: it is installed only through {@link setQuiescenceViewForTests}, never from the
- * environment, because a knob that narrows the scan would be a fail-open switch.
+ * listing: a `setsid` plant is reparented away from the test), killed for real. The worker installs
+ * one only through {@link setQuiescenceViewForTests} (no environment variable or config reads one,
+ * because a knob that narrows the scan would be a fail-open switch), and production code never
+ * calls that setter. The runner-uid helper is the one other reader: it honours whatever `view` its
+ * stdin request carries, and that stdin is the worker's own pipe to the child it spawned, so the
+ * worker forwards a view only when a test set one.
  */
 export type QuiescenceView =
   | { procRoot: string; deadlineMs?: number; intervalMs?: number }
   | { descendantsOf: number; extraPids?: number[]; extraPidFiles?: string[]; deadlineMs?: number; intervalMs?: number };
 
-const VIEW_TIMING_MAX_MS = 10_000;
+/** A view's reap deadline stays strictly below the helper's own timeout (HELPER_TIMEOUT_MS), so a
+ *  helper reaping a view answers before the worker gives up on it. */
+const VIEW_DEADLINE_MAX_MS = 5_000;
+/** A view's rescan interval is at least 1 ms (0 would spin the reap loop) and at most the deadline. */
+const VIEW_INTERVAL_MIN_MS = 1;
+/** At most this much of a view's pidfile is read at each listing. */
+const VIEW_PIDFILE_MAX_BYTES = 64 * 1024;
 const VIEW_EXTRA_PIDS_MAX = 1024;
 const FAKE_VIEW_DEADLINE_MS = 200;
 const FAKE_VIEW_INTERVAL_MS = 10;
 
 let testView: QuiescenceView | undefined;
 
-const viewTiming = (v: unknown): boolean =>
-  v === undefined || (Number.isSafeInteger(v) && (v as number) >= 0 && (v as number) <= VIEW_TIMING_MAX_MS);
+const viewTiming = (v: unknown, min: number): boolean =>
+  v === undefined || (Number.isSafeInteger(v) && (v as number) >= min && (v as number) <= VIEW_DEADLINE_MAX_MS);
 const positivePid = (v: unknown): boolean => Number.isSafeInteger(v) && (v as number) > 0;
 
 /** True for a well-formed view whose fake root (if any) is an absolute path that is not, and does
@@ -246,7 +255,7 @@ const positivePid = (v: unknown): boolean => Number.isSafeInteger(v) && (v as nu
 function isQuiescenceView(v: unknown): v is QuiescenceView {
   if (typeof v !== "object" || v === null) return false;
   const o = v as Record<string, unknown>;
-  if (!viewTiming(o.deadlineMs) || !viewTiming(o.intervalMs)) return false;
+  if (!viewTiming(o.deadlineMs, 0) || !viewTiming(o.intervalMs, VIEW_INTERVAL_MIN_MS)) return false;
   if ("procRoot" in o) {
     if (typeof o.procRoot !== "string" || !path.isAbsolute(o.procRoot) || "descendantsOf" in o) return false;
     let real = path.resolve(o.procRoot);
@@ -275,16 +284,35 @@ export function setQuiescenceViewForTests(view: QuiescenceView | undefined): voi
   testView = view === undefined ? undefined : structuredClone(view);
 }
 
-/** The pids listed one per line in `file` (none when it cannot be read). */
+/** The pids listed one per line in the first {@link VIEW_PIDFILE_MAX_BYTES} of `file` (none when it
+ *  cannot be read). */
 function pidsInFile(file: string): number[] {
+  let fd: number | undefined;
   try {
-    return fs
-      .readFileSync(file, "utf8")
+    fd = fs.openSync(file, "r");
+    const buf = Buffer.alloc(VIEW_PIDFILE_MAX_BYTES);
+    let len = 0;
+    for (;;) {
+      const n = fs.readSync(fd, buf, len, buf.length - len, null);
+      if (n === 0) break;
+      len += n;
+      if (len === buf.length) break;
+    }
+    let text = buf.toString("utf8", 0, len);
+    // A file cut at the cap drops its last, possibly truncated, line (a cut "12345" is not "123").
+    if (len === buf.length) text = text.slice(0, text.lastIndexOf("\n") + 1);
+    return text
       .split("\n")
       .filter((l) => /^\d+$/.test(l.trim()))
       .map(Number);
   } catch {
     return [];
+  } finally {
+    try {
+      if (fd !== undefined) fs.closeSync(fd);
+    } catch {
+      // nothing to recover: the pids were already read
+    }
   }
 }
 
@@ -422,8 +450,11 @@ export interface ScanRequest {
   liveRoots: RecordedRoot[];
   /** This worker's spawn nonce: a process carrying it is never run-owned. */
   workerNonce: string;
-  /** TEST ONLY: the {@link QuiescenceView} the helper reaps against. Production never sets it
-   *  (only {@link setQuiescenceViewForTests} does), so the helper scans the real procfs. */
+  /** TEST ONLY: the {@link QuiescenceView} the helper reaps against. The worker adds it to the
+   *  helper's stdin request only from the view a test installed with
+   *  {@link setQuiescenceViewForTests} (never from the environment), and the helper honours whatever
+   *  `view` that stdin request carries: the stdin is the worker's own pipe to its child. With no view
+   *  the helper scans the real procfs. */
   view?: QuiescenceView;
 }
 
