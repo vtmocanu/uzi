@@ -6,6 +6,9 @@ import { execFileSync } from "node:child_process";
 import type { ExecutorResult, RunContext } from "../src/executor.js";
 import { failOriginForReason, REASON_WORKER_RESIDUE_BLOCKED, type ExecutorFactory } from "../src/runner.js";
 import { LimitReachedError } from "../src/limit.js";
+import { skillsPluginDir } from "../src/skills-plugin.js";
+import type { CodexExecutionSafety, ToolDisposal } from "../src/harness.js";
+import { recordingLogger } from "./helpers.js";
 import {
   LiveAttemptRegistry,
   type ProcessQuiescenceState,
@@ -156,6 +159,55 @@ describe("issue #1783: terminal retire fails closed", () => {
     assert.equal(fs.existsSync(worktreeDirFor(iid)), false, "the clone is retired");
     assert.equal(journal(iid), undefined);
   });
+});
+
+describe("issue #1856: terminal Codex disposal gates clone retirement", () => {
+  for (const [name, outcome] of [
+    ["incomplete", { kind: "incomplete", errors: [{ category: "timeout", message: "writer survived disposal" }] }],
+    ["disposed", { kind: "disposed" }],
+    ["legacy_in_process", { kind: "legacy_in_process" }],
+    ["rejected", undefined],
+  ] as const) {
+    it(`${name}: retains only when terminal disposal is unproven`, async () => {
+      const { gitlab } = fakeGitlab();
+      const iid = 18560 + ["incomplete", "disposed", "legacy_in_process", "rejected"].indexOf(name);
+      const { logger, lines } = recordingLogger();
+      const { calls, quiesceRun } = scriptedQuiescer(["quiescent"]);
+      let clone = "";
+      const safety: CodexExecutionSafety = {
+        kind: "codex",
+        withBoundary: async () => { throw new Error("unexpected boundary"); },
+        spawnBoundaryProcess: async () => { throw new Error("unexpected spawn"); },
+        dispose: async () => {
+          if (outcome === undefined) throw new Error("disposal rejected");
+          return outcome as ToolDisposal;
+        },
+      };
+      const factory: ExecutorFactory = (runId) => ({
+        homeDir: path.join(homeDir, runId),
+        executor: {
+          safety,
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            clone = ctx.worktreePath;
+            fs.mkdirSync(skillsPluginDir(clone), { recursive: true });
+            throw new Error("agent crashed");
+          },
+        },
+      });
+      await runnerWith(factory, gitlab, undefined, logger, { quiesceRun }).execute(gitlabClaim(iid));
+      const retained = name === "incomplete" || name === "rejected";
+      assert.ok(api.states.some((s) => s.body.status === "failed"), "the original failure is reported");
+      assert.equal(fs.existsSync(clone), retained, "clone follows disposal proof");
+      assert.equal(journal(iid) !== undefined, retained, "recovery journal follows clone");
+      assert.equal(fs.existsSync(skillsPluginDir(clone)), retained, "paired skills directory follows clone");
+      if (retained) {
+        const reason = name === "incomplete" ? "writer survived disposal" : "disposal rejected";
+        assert.ok(lines.some((line) => JSON.stringify(line).includes(reason)), "the disposal reason is logged");
+      } else {
+        assert.equal(calls.length, 1, "proved disposal reaches the terminal scanner");
+      }
+    });
+  }
 });
 
 describe("issue #1783: finalize boundary fails closed", () => {

@@ -605,6 +605,36 @@ describe("issue #1783 M2 P-resume-unverified (C′)", { skip: !HAS_PROCFS }, () 
   });
 });
 
+describe("issue #1856: incomplete terminal disposal retains a predecessor journal", { skip: !HAS_PROCFS }, () => {
+  it("does not release a verified predecessor in place after incomplete disposal", async () => {
+    const iid = 18564;
+    const runId = randomUUID();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    const before = readJournal(iid);
+    const { factory: baseFactory, started } = codexFactory();
+    const factory: ExecutorFactory = (id) => {
+      const built = baseFactory(id);
+      built.executor.safety!.dispose = async () => ({
+        kind: "incomplete", errors: [{ category: "timeout", message: "predecessor drain unverified" }],
+      });
+      return built;
+    };
+    const { logger, lines } = recordingLogger();
+    const quiesceRun = async (): Promise<QuiesceRunOutcome> => ({
+      process: { state: "quiescent", processes: [], killed: [], detail: "verified" },
+      docker: { state: "not_wired", removed: [], detail: "" },
+    });
+    const { runner } = restartedWorker(factory, { quiesceRun }, logger);
+    await runner.execute(gitlabClaim(iid, { run_id: runId, session_id: randomUUID() }));
+    assert.equal(started(), 0, "predecessor capture ends before a fresh model runs");
+    assert.equal(trackingHas(iid, "ONLY_COPY.txt"), true, "the predecessor capture verified work before disposal");
+    assert.ok(lines.some((line) => JSON.stringify(line).includes("predecessor drain unverified")), "the disposal reason is logged");
+    assert.deepEqual(readJournal(iid), before, "incomplete disposal keeps the predecessor journal");
+    assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "live", "predecessor is not released");
+    assert.equal(fs.existsSync(pred.clonePath), true);
+  });
+});
+
 describe("issue #1783 M2 C′: the journal is cleared ONLY after a verified capture", { skip: !HAS_PROCFS }, () => {
   it("a run that turns terminal before its predecessor capture verified leaves journal, ledger and path as found", async () => {
     const iid = 2022;
