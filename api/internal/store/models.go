@@ -686,14 +686,14 @@ type Run struct {
 	BudgetFinalizeSeconds       int32              `json:"budget_finalize_seconds"`
 	ReleasedWorkerID            pgtype.UUID        `json:"released_worker_id"`
 	ReleasedWorkerNonce         pgtype.Text        `json:"released_worker_nonce"`
-	DiskParkCount               int32              `json:"disk_park_count"`
-	CheckpointContainsLatest    pgtype.Bool        `json:"checkpoint_contains_latest"`
 	GateRevision                int64              `json:"gate_revision"`
 	GatePresentationID          pgtype.UUID        `json:"gate_presentation_id"`
 	GatePresentedPayload        []byte             `json:"gate_presented_payload"`
 	GatePayloadDigest           []byte             `json:"gate_payload_digest"`
 	GateRefusalCount            int32              `json:"gate_refusal_count"`
 	GateRefusalGeneration       pgtype.Int8        `json:"gate_refusal_generation"`
+	DiskParkCount               int32              `json:"disk_park_count"`
+	CheckpointContainsLatest    pgtype.Bool        `json:"checkpoint_contains_latest"`
 }
 
 type RunCompletionAttempt struct {

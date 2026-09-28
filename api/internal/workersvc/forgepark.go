@@ -24,7 +24,7 @@ import (
 // answered 409 vault_locked (the owner's vault is locked); it takes the ordinary park too, but
 // it is the ONE cause that park persists (recoveryCauseStored), so the surfaces can say "waiting
 // for the vault to be unlocked" rather than the generic transient wording. PRD #1809 M5 (D6):
-// 'data_volume_full' (migration 00259) is reported by a worker whose write to its data volume
+// 'data_volume_full' (migration 00261) is reported by a worker whose write to its data volume
 // failed disk-full after a reclaim and one retry, or that stopped the run preventively before the
 // volume filled; SetState routes it to its own park transaction (parkDataVolumeFull), which stores
 // the cause and counts it toward the disk-only lifetime cap (UZI_RUN_DISK_PARK_MAX).

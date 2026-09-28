@@ -339,7 +339,7 @@ func TestDataVolumeFullConstraintsLiveDB(t *testing.T) {
 	}
 }
 
-// TestDataVolumeFullMigrationRoundTripLiveDB drives 00259 Down on an ISOLATED database: rows
+// TestDataVolumeFullMigrationRoundTripLiveDB drives 00261 Down on an ISOLATED database: rows
 // carrying the new cause and fail_origin are NULLed (not deleted), other values are untouched,
 // the restored CHECKs reject the new values again, and the new columns are gone. Mirrors
 // TestRecoveryWaitVaultLockedMigrationRoundTripLiveDB (00257); the version numbers are drafts
@@ -380,8 +380,8 @@ func TestDataVolumeFullMigrationRoundTripLiveDB(t *testing.T) {
 	u.Path = "/" + name
 	isoDSN := u.String()
 
-	if err := store.MigrateTo(ctx, isoDSN, 259); err != nil {
-		t.Fatalf("MigrateTo(259): %v", err)
+	if err := store.MigrateTo(ctx, isoDSN, 261); err != nil {
+		t.Fatalf("MigrateTo(261): %v", err)
 	}
 	pool, err := store.OpenPool(ctx, isoDSN)
 	if err != nil {
@@ -415,16 +415,19 @@ func TestDataVolumeFullMigrationRoundTripLiveDB(t *testing.T) {
 		                                  recovery_wait_cause, fail_origin, disk_park_count, checkpoint_contains_latest)
 		                VALUES ($1, $2, $3, 'issue', $4, 't', 'd', $5, NULLIF($6, ''), NULLIF($7, ''), 2, true)`,
 			id, userID, repoID, iid, status, cause, origin); err != nil {
-			t.Fatalf("seed run (cause %q, origin %q) at 00259: %v", cause, origin, err)
+			t.Fatalf("seed run (cause %q, origin %q) at 00261: %v", cause, origin, err)
 		}
 		return id
 	}
 	parked := seedRun(1, "recovery_wait", "data_volume_full", "")
 	failed := seedRun(2, "failed", "", "data_volume_full")
 	forge := seedRun(3, "recovery_wait", "forge_unreachable", "")
+	// 00260 (PRD #1795) added gate_presentation_refused BEFORE this migration: the Down must carry it
+	// in the restored CHECK and leave a run holding it untouched.
+	gateRefused := seedRun(4, "failed", "", "gate_presentation_refused")
 
-	if err := store.MigrateDownTo(ctx, isoDSN, 258); err != nil {
-		t.Fatalf("MigrateDownTo(258): %v", err)
+	if err := store.MigrateDownTo(ctx, isoDSN, 260); err != nil {
+		t.Fatalf("MigrateDownTo(260): %v", err)
 	}
 	read := func(id uuid.UUID) (cause, origin pgtype.Text) {
 		t.Helper()
@@ -441,6 +444,9 @@ func TestDataVolumeFullMigrationRoundTripLiveDB(t *testing.T) {
 	}
 	if c, _ := read(forge); !c.Valid || c.String != "forge_unreachable" {
 		t.Fatalf("after Down: forge run cause = %v, want forge_unreachable untouched", c)
+	}
+	if _, o := read(gateRefused); !o.Valid || o.String != "gate_presentation_refused" {
+		t.Fatalf("after Down: gate-refused run fail_origin = %v, want gate_presentation_refused untouched", o)
 	}
 	if err := exec(`UPDATE runs SET recovery_wait_cause = 'data_volume_full' WHERE id = $1`, parked); err == nil {
 		t.Fatal("after Down the restored recovery_wait_cause CHECK still admits data_volume_full")
