@@ -1659,10 +1659,13 @@ something to say:
 | `CHECKPOINT` | the run is parked (`limit_wait`, `recovery_wait`, or `paused`) and the worker reported it | whether the checkpoint published for this park contains the run's latest committed work: `contains the latest work`, or `does NOT contain the latest committed work (the worker keeps it)` |
 | `DISK` | the run is parked with cause `data_volume_full` | the [waiting-for-disk-space sentence](run-recovery-wait.md#worker-data-volume-full), the next retry time, and the run's lifetime count of counted disk parks |
 
-`CHECKPOINT` describes the latest park and is not cleared on resume, so it
-only shows while the run is actually parked. `uzi run list` / `uzi admin
-runs` append `(waiting for disk space)` to the STATUS cell for a
-`data_volume_full` park, the same pattern as `(waiting for vault unlock)`.
+`CHECKPOINT` shows while the run is actually parked (`limit_wait`,
+`recovery_wait`, or `paused`); the API clears the underlying flag on every
+claim and every `running` report, so a resumed run reports "not reported"
+until its next park, rather than carrying a stale value forward. `uzi run
+list` / `uzi admin runs` append `(waiting for disk space)` to the STATUS
+cell for a `data_volume_full` park, the same pattern as `(waiting for
+vault unlock)`.
 
 A run that **fails** because its worker's data volume stayed full past the
 disk-park cap gets a `FAIL_ORIGIN` row reading `data_volume_full (the

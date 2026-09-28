@@ -158,16 +158,23 @@ What the gauges mean:
 
 ## Worker disk safety (PRD #1809)
 
-A run's build caches (Go module cache, `node_modules`, npm/pip caches, and
-the like) can grow far faster than the worker's data volume shrinks on its
-own, so uzi bounds them on a worker instead of relying only on the
-last-resort [disk self-heal recycle](hosted-workers.md#disk-self-heal). Four
-mechanisms, from routine to last resort:
+A run's build caches can grow far faster than the worker's data volume
+shrinks on its own, so uzi bounds them on a worker instead of relying only
+on the last-resort [disk self-heal recycle](hosted-workers.md#disk-self-heal).
+The bounded subtrees are the Go build cache (`.cache/go-build`), the Go
+module cache (`go/pkg/mod`), and the npm cache (`.npm/_cacache`); other
+caches, including `node_modules` and pip's, are not individually tracked or
+trimmed by any of the mechanisms below. Four mechanisms, from routine to
+last resort:
 
-1. **Cache drop on park.** A run parked with its process ended (`limit_wait`,
-   `recovery_wait`, `paused`) has its rebuildable caches dropped immediately —
-   everything else in its HOME (the transcript, session state) stays for the
-   resume, so nothing needed to pick the run back up is lost.
+1. **Cache drop on park.** A Claude run parked with its process ended
+   (`limit_wait`, `recovery_wait`, `paused`) has its rebuildable caches
+   dropped immediately — everything else in its HOME (the transcript,
+   session state) stays for the resume, so nothing needed to pick the run
+   back up is lost. This immediate drop is Claude-run-only (a Codex run's
+   caches sit on its own per-run volume); the periodic reclaim pass below
+   drops the caches of any process-ended parked worker-owned HOME, no
+   harness filter.
 2. **In-run cache cap, two layers** (D4). A *soft* layer trims a running
    run's own caches (least-recently-used entries first) at a proven quiet
    point between turns — no live process, never judged from file mtimes —
@@ -185,19 +192,29 @@ mechanisms, from routine to last resort:
    prove safe to remove — a terminal run's leftover HOME, a parked run's
    rebuildable caches, an aged model-pass HOME — and runs the same sweep
    out of cycle whenever the volume crosses a soft threshold below the disk-
-   pressure line. If the volume is still over that soft threshold after a
-   reclaim pass, the worker briefly refuses to claim a *new* run (the
-   admission stop) rather than start one it may not have room to finish;
-   this stop is itself time-bounded, so a worker with nothing left to
-   reclaim does not idle forever.
-4. **Disk-full classification and a bounded park** (D6). If a write still
-   fails disk-full despite all of the above — a recognised `ENOSPC`/`EDQUOT`
-   signal or git's own diagnostics, confirmed against the volume's actual
-   free space and inodes — the worker runs one more reclaim pass, retries
-   once, and parks the run as `recovery_wait`/`data_volume_full` instead of
-   failing it outright. This park has a lifetime cap
-   (`UZI_RUN_DISK_PARK_MAX`); past it, the run fails with
-   `fail_origin=data_volume_full`. See [Worker data volume
+   pressure line. The worker stops claiming from the moment the volume
+   crosses that soft threshold — including a resume of one of its own
+   parked runs; the run-lane claim cannot be narrowed to this worker's own
+   work — not only after a reclaim pass finds it still over. This admission
+   stop is itself time-bounded: once a reclaim pass that started after the
+   crossing has finished and the volume is still over the soft threshold
+   `UZI_DISK_ADMISSION_MAX_WAIT` after the crossing, claims reopen (with a
+   warning) so a worker with nothing left to reclaim does not idle forever;
+   they close again only on the next fresh crossing.
+4. **Disk-full classification and a bounded park** (D6). This reclaim-retry-
+   park treatment covers only two writes: the claim/resume preflight (before
+   anything is cloned) and the clone/fetch itself. If either fails
+   disk-full — a recognised `ENOSPC`/`EDQUOT` signal or git's own
+   diagnostics, confirmed against the volume's actual free space and inodes
+   — the worker runs one more reclaim pass, retries once, and parks the run
+   as `recovery_wait`/`data_volume_full` instead of failing it outright. A
+   disk-full write *after* the clone exists (e.g. a build failing mid-turn)
+   takes the normal failure path instead — it is not retried or parked here.
+   Mid-run disk parks come only from mechanism 2 above: the soft cache-cap
+   park (uncounted) and the hard pressure stop (counted). The claim/resume
+   and clone/fetch park has the same lifetime cap
+   (`UZI_RUN_DISK_PARK_MAX`, shared with the hard-stop park); past it, the
+   run fails with `fail_origin=data_volume_full`. See [Worker data volume
    full](run-recovery-wait.md#worker-data-volume-full) for exactly what an
    owner sees and how counted parks differ from preventive ones.
 

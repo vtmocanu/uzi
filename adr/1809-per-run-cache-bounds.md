@@ -1,6 +1,6 @@
 # ADR-1809: a run's rebuildable caches stay per run and are bounded, trimmed and dropped through descriptor-pinned agent-uid removal
 
-**Status**: Accepted (issue #1809, M1-M6 landed; the real uid-split fixture run and the hosted-k8s acceptance are pending, see the PRD)
+**Status**: Accepted (issue #1809; implemented in this branch, with the M1/M3 real uid-split fixtures and the hosted-k8s acceptance pending, see the PRD)
 **Date**: 2026-09-28
 **Deciders**: agent team (issue #1809 milestones and review waves); the maintainer at plan review (the uncounted soft-cap park, trim-not-wipe).
 **Related**: PRD #1809 (`prds/1809-worker-disk-safety.md`, the decision log D1-D8 this ADR condenses the lasting parts of); [ADR-837](0837-worker-disk-lifecycle.md) (the pressure recycle this design sits in front of, unchanged); [ADR-1766](1766-codex-vault-lock-park.md) (the typed `recovery_wait` cause precedent `data_volume_full` follows); [ADR-1598](1598-codex-command-storage.md) (Codex's own per-run cache, out of scope here). Serves `specs/human.md` Feature #1809.
@@ -25,7 +25,7 @@ Only `.cache/go-build`, `go/pkg/mod` and `.npm/_cacache` (relative to the run HO
 
 ### D3: drops only on process-ended parks, Claude runs only
 
-The drop runs in the claim's `finally`, only for a Claude run that parked with its executor returned and its process tree reaped (usage limit, owner pause, recovery and disk parks). A gate park (`awaiting_approval`, `awaiting_input`, `awaiting_followup`) keeps a live executor and never reaches it. Codex runs keep their caches on their own per-run volume (ADR-1598). The drop is best-effort under one deadline and never throws: a failed drop leaves the HOME as it was before this change.
+The drop runs in the claim's `finally`, only for a Claude run that parked with its executor returned and its process tree reaped (usage limit, owner pause, recovery and disk parks). A gate park (`awaiting_approval`, `awaiting_input`, `awaiting_followup`) keeps a live executor and never reaches it. Codex runs keep their caches on their own per-run volume (ADR-1598). Separately, the worker's periodic reclaim drops the same named caches from any worker-owned HOME of a run the api reports parked with its process ended, whatever its runtime. The drop is best-effort under one deadline and never throws: a failed drop leaves the HOME as it was before this change.
 
 ## What outlives this work
 
@@ -53,7 +53,9 @@ Residual: a process that changes its HOME and leaves the run's directories is in
 
 ### Counted vs uncounted disk parks
 
-Every disk park is `recovery_wait` with cause `data_volume_full`. Parks that mean the volume actually filled or hit the hard threshold (disk-full classification, the mid-turn hard stop) are **counted** toward `UZI_RUN_DISK_PARK_MAX` (default 3; the run then fails with the `data_volume_full` fail origin). The soft-cap park is preventive and carries `disk_park_preventive: true`, so it is **uncounted**: a run that merely grew past its cap is never failed by it. The api accepts the flag only with that cause.
+Every disk park is `recovery_wait` with cause `data_volume_full`, and only four paths produce one: a disk-full failure of the clone/fetch, the claim/resume preflight, the soft cache cap and the mid-turn hard stop. Parks that mean the volume actually filled or hit the hard threshold (the first two, and the hard stop) are **counted** toward `UZI_RUN_DISK_PARK_MAX` (default 3; the run then fails with the `data_volume_full` fail origin). The soft-cap park is preventive and carries `disk_park_preventive: true`, so it is **uncounted**: a run that merely grew past its cap is never failed by it. The api accepts the flag only with that cause.
+
+A disk-full write anywhere else after the clone (a build or test mid-turn, a commit) is not classified: it takes the run's normal failure path with its own error. The cap and the hard stop are what keep a run from reaching that point; classify-reclaim-retry covers only the clone/fetch and the claim/resume preflight.
 
 ## Consequences
 

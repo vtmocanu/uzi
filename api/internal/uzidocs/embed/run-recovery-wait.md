@@ -234,19 +234,23 @@ recoverable, bounded condition, not an unlimited retry.
 Two kinds of park share the cause `data_volume_full`, and only one of them
 counts toward the failure cap:
 
-- A **preventive** park: uzi stops the run before the volume actually
-  fills. Either a background check on every stats tick finds the volume at
-  or over a hard threshold and stops whichever running Claude run holds the
-  largest caches, or a run's own caches stay over their per-run cap across
-  a few turn boundaries in a row. Neither is counted, so a run that keeps
-  triggering a preventive park cannot be failed by it.
-- A **counted** park: an actual write failed disk-full (a recognised
-  `ENOSPC`/`EDQUOT` signal, or git's own disk-full diagnostics, confirmed
-  against the volume's own free space and inodes) after uzi ran its
-  background reclaim and retried once. This counts toward the run's
-  lifetime disk-park cap, `UZI_RUN_DISK_PARK_MAX` (default 3; `0` means
-  unlimited). Past the cap, the next counted disk-full failure fails the
-  run instead of parking it again, with `fail_origin = data_volume_full`.
+- A **preventive**, uncounted park: the soft, per-run cache cap. At a turn
+  boundary, a run whose own caches stay over their per-run cap across a
+  few turn boundaries in a row is parked before it can fill the volume. A
+  run that keeps triggering this park alone cannot be failed by it.
+- A **counted** park: everything else that reaches this park, including
+  the hard, per-tick pressure stop — a background check on every stats
+  tick that finds the volume at or over a hard threshold and stops
+  whichever running Claude run holds the largest caches — and an actual
+  write that failed disk-full (a recognised `ENOSPC`/`EDQUOT` signal, or
+  git's own disk-full diagnostics, confirmed against the volume's own free
+  space and inodes, or a claim/resume preflight statfs still below the
+  floor after a reclaim pass) after uzi ran its background reclaim and
+  retried once — note this last case counts a park with no failed write at
+  all. Every counted case counts toward the run's lifetime disk-park cap,
+  `UZI_RUN_DISK_PARK_MAX` (default 3; `0` means unlimited). Past the cap,
+  the next counted disk-full park fails the run instead, with
+  `fail_origin = data_volume_full`.
 
 Both kinds park and resume on the same capped exponential backoff as an
 empty-turn park (`RUN_RECOVERY_PARK_BASE` up to `RUN_RECOVERY_MAX_PARK`);
@@ -267,10 +271,12 @@ remove that work before it is recovered.
 
 ### Where you'll see it
 
-- The run card and the run page read **waiting for disk space**: the
+- The run page's park panel reads **waiting for disk space**: the
   worker's data volume is full or nearly full, uzi frees space (including
   this run's own build caches), and the run resumes at its next retry. No
-  action is needed.
+  action is needed. The board and run list show only a generic recovery
+  wait status; see the STATUS-cell and `uzi tui` rows below for where the
+  disk-specific wording does appear.
 - `uzi run get <id>` — a `DISK` row with that sentence and the run's
   lifetime count of **counted** disk parks (`counted disk parks: N`); a
   preventive park never moves this number, so it can read 0 across several

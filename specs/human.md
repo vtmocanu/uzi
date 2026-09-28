@@ -933,10 +933,11 @@ Tracked as GitHub issue vtmocanu/uzi#1604; decision record `adr/1604-plan-gate-v
 Tracked as GitHub issue vtmocanu/uzi#1809; PRD at `prds/1809-worker-disk-safety.md`; ADR at `adr/1809-per-run-cache-bounds.md`.
 
 - A run's rebuildable caches (Go build and module cache, npm cache) stay per run, never shared between runs, and are bounded while the run lives. (AI-synced 2026-09-28)
-- A park that ends the run's process drops those caches and keeps everything a resume needs (session, config, unknown files); a gate-parked run and Codex runs are untouched. (AI-synced 2026-09-28)
-- A full data volume never fails a run silently: the run waits in `recovery_wait` with the stated cause `data_volume_full`, and fails with that cause only after a bounded number of such waits. (AI-synced 2026-09-28)
-- Each live or parked run's HOME size is visible to operators (worker list, admin health, run page) before it can fill a volume. (AI-synced 2026-09-28)
-- Every control can be switched off; with them off only the bounded `data_volume_full` wait remains. (AI-synced 2026-09-28)
+- A park that ends a Claude run's process drops those caches and keeps everything a resume needs (session, config, unknown files); a gate-parked run is untouched, and the park itself leaves Codex runs' caches alone. (AI-synced 2026-09-28)
+- The worker's periodic reclaim drops the same caches from any worker-owned HOME of a run parked with its process ended, and removes terminal runs' leftovers. (AI-synced 2026-09-28)
+- A full data volume at clone/fetch or at the claim/resume check, the cache cap (uncounted) and the hard disk stop (counted) park the run in `recovery_wait` with the cause `data_volume_full`; it fails with that cause only after a bounded number of counted waits. A disk-full write later in the run (e.g. a build mid-turn) fails the run with its own error, not this wait. (AI-synced 2026-09-28)
+- Each live or parked run's HOME and cache size is visible before it can fill a volume: `uzi run get` for any run, each worker's largest run in the worker lists, the run page's park panels; admin health warns on a large run (`fleet.rundisk`). (AI-synced 2026-09-28)
+- The in-run cache cap, the hard disk stop, the periodic reclaim and the admission stop each have an off switch; the park-time cache drop and the claim/resume disk check are always on. (AI-synced 2026-09-28)
 
 ## Startup admin seed
 

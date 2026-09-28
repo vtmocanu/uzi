@@ -1775,8 +1775,9 @@ var parkedStatuses = map[string]bool{statusLimitWait: true, statusRecoveryWait: 
 
 // checkpointDurabilityLine is the parked run's checkpoint-durability sentence (PRD #1809 M6, D8):
 // whether the checkpoint its latest park published contains the run's latest committed work. The
-// flag describes the latest park and is not cleared on resume, so it is shown only while the run
-// is parked. "" when the run is not parked or the worker did not report it.
+// api clears the flag on every claim and running report, so it only describes the park that
+// reported it; it is shown only while the run is parked. "" when the run is not parked or the
+// worker did not report it.
 func checkpointDurabilityLine(r apitypes.RunDTO) string {
 	if r.CheckpointContainsLatest == nil || !parkedStatuses[r.Status] {
 		return ""
