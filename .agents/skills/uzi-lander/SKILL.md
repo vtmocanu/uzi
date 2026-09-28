@@ -260,7 +260,10 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
      then retry; do not downgrade a big fix to a local one because the lane was off.
      **A rework already running** (uzi starts one on new bot comments; a second `uzi run
      rework` then fails "already working this branch"): steer it with `uzi run follow-up
-     REWORK_RUN -m 'GUIDANCE'` instead. A finding an earlier cycle declined that resurfaces
+     REWORK_RUN -m 'GUIDANCE'` instead, and wait on that run itself
+     (`.agents/skills/uzi-watcher/scripts/watch-run.sh REWORK_RUN completed,failed,cancelled 60`):
+     it predates any `$SINCE` you capture now, so `wait-mrrework.sh` would not see it.
+     A finding an earlier cycle declined that resurfaces
      with no new evidence: ask for a reasoned reply on the thread and no code change.
      **Steer with facts and acceptance criteria.** Steer text reaches the rework's
      validators as operator constraints, so name an identifier as binding only when
