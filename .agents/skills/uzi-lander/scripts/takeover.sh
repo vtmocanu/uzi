@@ -157,7 +157,22 @@ fr_head=$(printf '%s' "$wt_body" | awk '/final_review_risk_start/{f=1} f{print} 
 [ -n "$fr_head" ] && printf '%s' "$head" | grep -q "^$fr_head" && cr_reviewed=1
 echo "CR_REVIEWED_HEAD=$cr_reviewed"; echo "CR_UNCONFIRMED_ON_HEAD=$cr_unconfirmed"
 cr_reset=$(printf '%s' "$wt_body" | awk '/auto-generated comment: rate limited by coderabbit.ai/{f=1} f{print} /end of auto-generated comment: rate limited/{f=0}' | grep -oE 'available in [0-9]+ minutes' | tail -1 | grep -oE '[0-9]+' || true)
-[ -n "$cr_reset" ] && echo "CR_RESET_MIN=$cr_reset (as of the walkthrough's last edit; scripts/cr-rate-limit.sh for the live remainder)"
+if [ -n "$cr_reset" ]; then
+  # The figure is relative to the walkthrough's last edit, which can be hours old: report the
+  # remainder from that edit, never the raw figure (a 12 read as 12 while the live wait was 57).
+  wt_at=$(printf '%s' "$issue_c" | jq -r '[.[]|select(.user.login=="coderabbitai[bot]" and (.body|contains("rate limited by coderabbit.ai")))]|last|(.updated_at // .created_at // empty)' 2>/dev/null || true)
+  wt_epoch=$(jq -rn --arg t "$wt_at" '$t|sub("\\.[0-9]+";"")|fromdateiso8601' 2>/dev/null || true)
+  if [ -n "$wt_epoch" ]; then
+    left=$(( ( wt_epoch + cr_reset*60 - $(date +%s) + 59 ) / 60 ))
+    if [ "$left" -gt 0 ]; then
+      echo "CR_RESET_MIN=$left (from the walkthrough edited $wt_at; the account quota is shared, so scripts/cr-rate-limit.sh for the live remainder)"
+    else
+      echo "CR_RESET_MIN=unknown (the walkthrough's ${cr_reset}m window from $wt_at has passed; run scripts/cr-rate-limit.sh for the live remainder)"
+    fi
+  else
+    echo "CR_RESET_MIN=unknown (walkthrough said ${cr_reset}m at an unreadable time; run scripts/cr-rate-limit.sh)"
+  fi
+fi
 cr_tally=$(printf '%s' "$rev_raw" | jq -r '.[]|select(.user.login=="coderabbitai[bot]")|.body' 2>/dev/null | grep -oiE 'Actionable comments posted: [0-9]+' | tail -1 || true)
 [ -n "$cr_tally" ] && echo "CR_TALLY='$cr_tally'"
 
