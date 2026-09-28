@@ -562,6 +562,29 @@ PASS lines (tests 7, pass 7, fail 0, cancelled 0, skipped 0):
 ✔ M3: the canonical reseed renames it within the same parent, keeps it, and completes
 ```
 
+### Not re-run after rework 3 (the hermetic-test and bounded-capture rework)
+
+Rework 3 changed `agent/src` again (`run-quiescence.ts`: the test-only process-table
+view, the pid and comm in the operator reason; `runner.ts`: the bounded
+recovery-capture retry), so the acceptance above no longer covers the final code
+commit. `task test:clone-quiescence` was **not re-run** for it: the shared Docker
+daemon no longer held any image built from `agent/templates/base/Dockerfile`
+(neither the `uzi-agent-codex-git-trust:base` used above nor the script's own
+default tag), so the mounted-source fallback had nothing to mount into, and with
+10.2G free of the fixed 29.4G pool a fresh ~8.75GB build was not attempted. Run
+it again once a worker base image is available.
+
+What rework 3 was checked with instead: the agent unit suite (the hermetic view
+installed for every test file), `task gate:agent`, `gate:api`, `gate:web` and
+the `gate:repo` targets; and the maintainer's reproduction, `node:24-bookworm` as
+the non-root `node` user with a setgid, same-uid `ssh-agent` running for the
+whole of `task test:agent`, run with `--init`. There, the real-procfs ssh-agent
+tests all took the unreadable branch and passed, naming the agent's pid. The one
+remaining failure, `pr-size.test.ts`'s `--source` lookup, fails the same way at
+origin/main in that image (its git 2.39 lacks `check-attr --source`). Without
+`--init`, the container's PID 1 reaps no orphans, and seven process-group tests
+fail on zombies.
+
 ## Follow-ups and accepted risks
 
 These are not filed yet; listed here for the maintainer to file after merge.
