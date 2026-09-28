@@ -301,7 +301,7 @@ func TestBackfillWatermarkOverlapLiveDB(t *testing.T) {
 
 	first, firstRef := f.seedIssueRun(t, "failed", w, 1)
 	before := dbNow()
-	if _, err := f.svc2.backfillCheckpointRetentions(f.e.ctx, pgconv.UUID(first), true); err != nil {
+	if _, err := f.svc2.backfillCheckpointRetentions(f.e.ctx, pgconv.UUID(first), true, nil); err != nil {
 		t.Fatalf("backfill: %v", err)
 	}
 	after := dbNow()
@@ -321,7 +321,7 @@ func TestBackfillWatermarkOverlapLiveDB(t *testing.T) {
 	}
 	backfill := func(runID uuid.UUID) bool {
 		t.Helper()
-		if _, err := f.svc2.backfillCheckpointRetentions(f.e.ctx, pgconv.UUID(runID), false); err != nil {
+		if _, err := f.svc2.backfillCheckpointRetentions(f.e.ctx, pgconv.UUID(runID), false, nil); err != nil {
 			t.Fatalf("backfill: %v", err)
 		}
 		_, ok := f.record(t, runID)

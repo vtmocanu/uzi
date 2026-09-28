@@ -159,7 +159,7 @@ func (s *Service) clearPublishAttempt(ctx context.Context, id uuid.UUID) {
 	if id == uuid.Nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), retentionRecordTimeout)
+	ctx, cancel := retentionBookkeepingCtx(ctx)
 	defer cancel()
 	if _, err := s.q.DeleteCheckpointPublishAttempt(ctx, id); err != nil {
 		slog.Warn("checkpoint: clear publish attempt", "attempt", id, "error", err)
@@ -189,9 +189,14 @@ func (s *Service) ownPublishedTip(ctx context.Context, runID uuid.UUID, tip stri
 // released.
 //
 // Every row the arm could not resolve has its next comparison pushed out, whatever stopped it (a
-// read or write error, a recovered panic, the lock held elsewhere), so a row that keeps failing
-// never keeps its place at the head of the bounded, next_check_at-ordered page.
-func (s *Service) reconcilePublishAttempts(ctx context.Context, onlyRun pgtype.UUID) (int64, error) {
+// read or write error, a recovered panic, the lock held elsewhere, the locked step's own deadline),
+// so a row that keeps failing never keeps its place at the head of the bounded,
+// next_check_at-ordered page.
+//
+// The arm checks the pass budget before starting each row (and before the settle a row owes); each
+// locked step runs under pass.timeout(). A settle the budget stops is left to the work arm, which
+// lists the settling record on a later pass.
+func (s *Service) reconcilePublishAttempts(ctx context.Context, onlyRun pgtype.UUID, pass *retentionPass) (int64, error) {
 	due, err := s.q.ListDueCheckpointPublishAttempts(ctx, store.ListDueCheckpointPublishAttemptsParams{
 		Cooling:   pgtype.Interval{Microseconds: s.checkpointSupersessionCooling.Microseconds(), Valid: true},
 		OnlyRunID: onlyRun, MaxRows: reconcileAttemptBatch,
@@ -200,9 +205,13 @@ func (s *Service) reconcilePublishAttempts(ctx context.Context, onlyRun pgtype.U
 		return 0, fmt.Errorf("list checkpoint publish attempts: %w", err)
 	}
 	var progressed int64
-	for _, a := range due {
+	for i, a := range due {
+		if pass.spent(ctx) {
+			pass.leave(len(due) - i)
+			break
+		}
 		var settle bool
-		done, acquired, err := s.lockedRetentionStep(ctx, a.RunID, func(ctx context.Context, _ uuid.UUID, fence func(context.Context) error) (bool, error) {
+		done, acquired, err := s.lockedRetentionStep(ctx, a.RunID, pass.timeout(), func(ctx context.Context, _ uuid.UUID, fence func(context.Context) error) (bool, error) {
 			var (
 				d   bool
 				err error
@@ -222,8 +231,8 @@ func (s *Service) reconcilePublishAttempts(ctx context.Context, onlyRun pgtype.U
 		if done {
 			progressed++
 		}
-		if settle {
-			if _, _, err := s.settleRetainedCheckpointOnce(ctx, a.RunID); err != nil {
+		if settle && !pass.spent(ctx) {
+			if _, _, err := s.settleRetainedCheckpointOnce(ctx, a.RunID, pass.timeout()); err != nil {
 				slog.Warn("sweeper: checkpoint retention settle after a reconciled publish", "run", a.RunID, "error", err)
 			}
 		}
@@ -416,15 +425,14 @@ func (s *Service) dropPublishAttempt(ctx context.Context, id uuid.UUID) (done, s
 }
 
 // deferPublishAttempt pushes the attempt's next comparison out by the retry backoff; a non-empty
-// (already scrubbed) note replaces last_error. It runs on a fresh context detached from ctx and
-// bounded by retentionRecordTimeout, so the bookkeeping still lands when the locked step's own
-// context has expired.
+// (already scrubbed) note replaces last_error. It runs on retentionBookkeepingCtx, so the
+// bookkeeping still lands when the locked step's own context has expired.
 func (s *Service) deferPublishAttempt(ctx context.Context, a store.CheckpointPublishAttempt, note string) (done, settle bool, err error) {
 	var n pgtype.Text
 	if note != "" {
 		n = pgtype.Text{String: note, Valid: true}
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), retentionRecordTimeout)
+	ctx, cancel := retentionBookkeepingCtx(ctx)
 	defer cancel()
 	next := time.Now().Add(retentionBackoff(a.Checks))
 	if _, err := s.q.DeferCheckpointPublishAttempt(ctx, store.DeferCheckpointPublishAttemptParams{

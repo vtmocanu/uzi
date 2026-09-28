@@ -1824,6 +1824,15 @@ type Service struct {
 	// checkpointSupersessionCooling is how long a run must have been terminal before a supersession
 	// intent may be recorded for it (BeginCheckpointSupersession; set in New, a test shrinks it).
 	checkpointSupersessionCooling time.Duration
+	// retentionPassBudget bounds how long after it began the sweeper's checkpoint-retention pass
+	// may still START a record (reconcileCheckpointRetentions); retentionSweepOpTimeout bounds
+	// each record's locked operation the pass starts, in place of retentionOpTimeout (PRD #1810;
+	// set in New, a test shrinks them).
+	retentionPassBudget     time.Duration
+	retentionSweepOpTimeout time.Duration
+	// retentionArmCursor rotates which forge-calling arm the retention pass starts with, one arm
+	// per pass (retentionArmOrder).
+	retentionArmCursor atomic.Uint32
 	// readyAt is the moment the worker-facing listener(s) became ready (PRD #1390 M1, D1),
 	// stored as Unix nanoseconds (0 = not yet ready). main.go writes it via SetReadyAt after
 	// binding every enabled listener; the sweeper goroutine reads it each tick to anchor the
@@ -2017,6 +2026,8 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 
 		livePublishPrePushBudget:      livePublishPrePushBudget,
 		checkpointSupersessionCooling: checkpointSupersessionCooling,
+		retentionPassBudget:           retentionPassBudget,
+		retentionSweepOpTimeout:       retentionSweepOpTimeout,
 	}
 }
 

@@ -29,7 +29,7 @@ const newerTip = "7777777777777777777777777777777777777777"
 // reconcileAttempts runs the attempts arm alone on svc, confined to the old run.
 func (f *supersedeFix) reconcileAttempts(t *testing.T, svc *Service) {
 	t.Helper()
-	if _, err := svc.reconcilePublishAttempts(f.e.ctx, pgconv.UUID(f.oldRun)); err != nil {
+	if _, err := svc.reconcilePublishAttempts(f.e.ctx, pgconv.UUID(f.oldRun), nil); err != nil {
 		t.Fatalf("reconcilePublishAttempts: %v", err)
 	}
 }

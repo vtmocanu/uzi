@@ -363,7 +363,9 @@ func (s *Service) resolveMissingSource(ctx context.Context, row store.Checkpoint
 			"branch ref is not at the recorded tip (checkpoint tip lag or another writer); left in place")
 	}
 	const note = "origin holds the recorded tip under neither the branch ref nor the recovery ref"
-	if _, err := s.q.SetCheckpointSupersessionTipGone(ctx, store.SetCheckpointSupersessionTipGoneParams{RunID: row.RunID, LastError: note}); err != nil {
+	bctx, cancel := retentionBookkeepingCtx(ctx)
+	defer cancel()
+	if _, err := s.q.SetCheckpointSupersessionTipGone(bctx, store.SetCheckpointSupersessionTipGoneParams{RunID: row.RunID, LastError: note}); err != nil {
 		return false, true, fmt.Errorf("mark tip gone: %w", err)
 	}
 	slog.Warn("checkpoint retention: "+note+"; record closed", "run", row.RunID, "branch", row.Branch, "tip", row.Tip)

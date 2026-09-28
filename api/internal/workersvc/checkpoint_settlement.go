@@ -28,6 +28,13 @@ import (
 // record may cost a few forge round-trips, and the pass runs on the sweeper's tick.
 const reconcileRetentionBatch = 10
 
+const (
+	// retentionPassBudget: see Service.retentionPassBudget.
+	retentionPassBudget = 30 * time.Second
+	// retentionSweepOpTimeout: see Service.retentionSweepOpTimeout.
+	retentionSweepOpTimeout = 20 * time.Second
+)
+
 // Notes persisted on a record's last_error by the M4 arms (never carry forge output).
 const (
 	retentionGoneNote     = "run, repository or forge connection no longer exists"
@@ -41,21 +48,107 @@ const (
 // Returns the number of records it drove to a final step (a ref settled or verified, a record
 // backfilled, a supersession finished or exited). Inert unless every retention seam is wired. A
 // returned error (a candidate-list read) ends this pass only: Sweep logs it and continues.
+//
+// The pass is time-bounded so a slow or hung forge cannot stall Sweep's later passes: it starts no
+// record once Service.retentionPassBudget has passed since it began (the rest are left for the
+// next tick, and the pass returns without an error), and each record it starts runs under
+// Service.retentionSweepOpTimeout rather than the publish path's retentionOpTimeout.
 func (s *Service) ReconcileCheckpointRetentions(ctx context.Context) (int64, error) {
 	return s.reconcileCheckpointRetentions(ctx, pgtype.UUID{})
 }
 
+// retentionPass is one reconciliation pass's time budget. Every arm checks spent BEFORE STARTING
+// each record, never inside one, and runs the record's locked operation under opTimeout. A record
+// already started when the budget runs out finishes (or hits opTimeout), so with a forge call that
+// honours its context a pass takes about the budget plus one opTimeout. On top of that come the
+// bounded writes after a timed-out operation (the failure bookkeeping on retentionBookkeepingCtx
+// and the unlock, each bounded by its own 10-second timeout); the LiveDB test
+// TestSweepRetentionPassBudgetLiveDB measures the bound against a forge that hangs until its
+// context ends. A nil *retentionPass is unbounded (the direct arm calls in tests).
+type retentionPass struct {
+	deadline  time.Time
+	opTimeout time.Duration
+	// left counts the listed records the pass did not start; notStarted names the arms it did
+	// not list at all. Both only feed the budget log line.
+	left       int
+	notStarted []string
+}
+
+func (s *Service) newRetentionPass() *retentionPass {
+	return &retentionPass{deadline: time.Now().Add(s.retentionPassBudget), opTimeout: s.retentionSweepOpTimeout}
+}
+
+// spent reports that the pass must start no further record: its budget has passed, or the
+// sweeper's own context is done.
+func (p *retentionPass) spent(ctx context.Context) bool {
+	return p != nil && (ctx.Err() != nil || !time.Now().Before(p.deadline))
+}
+
+// leave records n listed records the pass stopped before starting.
+func (p *retentionPass) leave(n int) {
+	if p != nil {
+		p.left += n
+	}
+}
+
+// timeout is the bound of one record's locked operation.
+func (p *retentionPass) timeout() time.Duration {
+	if p == nil {
+		return retentionOpTimeout
+	}
+	return p.opTimeout
+}
+
+// logLeft reports, once per pass, what the spent budget left for the next tick.
+func (p *retentionPass) logLeft() {
+	if p == nil || (p.left == 0 && len(p.notStarted) == 0) {
+		return
+	}
+	slog.Info("sweeper: checkpoint retention pass budget spent; the rest is left for the next tick",
+		"records_left", p.left, "arms_not_started", p.notStarted, "budget_exceeded_by", time.Since(p.deadline).Round(time.Millisecond))
+}
+
+// retentionArm is one forge-calling arm of the pass.
+type retentionArm struct {
+	name string
+	run  func(ctx context.Context, onlyRun pgtype.UUID, pass *retentionPass) (int64, error)
+}
+
+// retentionArmOrder is the order the pass runs its n forge-calling arms in when its rotation
+// cursor reads cursor: the canonical order rotated to start at arm cursor mod n. Successive passes
+// start from successive arms, so over any n consecutive passes every arm runs first once, and a
+// burst of slow records in one arm (which spends the budget) cannot keep the arms after it from
+// ever starting.
+func retentionArmOrder(cursor uint32, n int) []int {
+	order := make([]int, n)
+	if n == 0 {
+		return order
+	}
+	start := int(cursor) % n
+	for i := range order {
+		order[i] = (start + i) % n
+	}
+	return order
+}
+
 // reconcileCheckpointRetentions is the pass body. onlyRun confines every arm's candidate list to
 // one run (the LiveDB tests, so a reused database's leftover records are never driven against a
-// test's forge); the zero value lists every run, as production does. The arms run in order:
+// test's forge); the zero value lists every run, as production does. The arms:
 //
-//  1. backfill: terminal runs that own a checkpoint ref but have no record get one (retained
-//     with an open hold, else settling), so arm 3 settles a new settling record the same pass.
+//  1. backfill (always first, and it makes no forge call): terminal runs that own a checkpoint ref
+//     but have no record get one (retained with an open hold, else settling), so the work arm
+//     settles a new settling record the same pass (budget permitting).
 //     Since migration 00265 every terminal transition records its run in the same transaction
 //     (the runs.status trigger), so this arm is left with terminal runs whose first checkpoint
 //     tip was persisted only AFTER the transition (the trigger saw none) and whose own track
 //     insert did not record them: TrackTerminalCheckpointPublish failed, or retention was not
 //     wired in the api that served the publish;
+//
+// then the four forge-calling arms, in the canonical order below rotated by one arm per pass
+// (retentionArmOrder, Service.retentionArmCursor). No forge arm depends on another having run
+// earlier in the same pass: each settles what it moves to settling itself, and what one leaves
+// for another is due on a later pass anyway.
+//
 //  2. attempts: an outstanding checkpoint push of a terminal run (checkpoint_publish_attempts,
 //     written before the push and never accounted for) is compared with origin's branch ref; a
 //     ref at the attempted tip is re-recorded on the run's record (compare-and-set on what was
@@ -68,37 +161,65 @@ func (s *Service) ReconcileCheckpointRetentions(ctx context.Context) (int64, err
 //  5. audit: a deleted record that named a recovery ref is re-verified once verify_after passed
 //     (a recovery ref found at the recorded tip while custody is open reopens the record instead
 //     of being deleted).
+//
+// Every arm, backfill included, checks the pass budget (retentionPass) before starting each
+// record; once it is spent the remaining records and arms are left for the next tick, logged once,
+// and the pass returns what it progressed with a nil error, so Sweep's later passes run.
 func (s *Service) reconcileCheckpointRetentions(ctx context.Context, onlyRun pgtype.UUID) (int64, error) {
 	if !s.supersessionWired() {
 		return 0, nil
 	}
+	pass := s.newRetentionPass()
+	defer pass.logLeft()
 	// Only an unconfined pass saw every candidate, so only it may advance the global watermark.
-	progressed, err := s.backfillCheckpointRetentions(ctx, onlyRun, !onlyRun.Valid)
+	progressed, err := s.backfillCheckpointRetentions(ctx, onlyRun, !onlyRun.Valid, pass)
 	if err != nil {
 		return 0, err
 	}
-	reconciled, err := s.reconcilePublishAttempts(ctx, onlyRun)
-	progressed += reconciled
-	if err != nil {
-		return progressed, err
+	arms := []retentionArm{
+		{"attempts", s.reconcilePublishAttempts},
+		{"work", s.reconcileRetentionWork},
+		{"unheld", s.reconcileUnheldRetentions},
+		{"audit", s.reconcileRetentionAudit},
 	}
+	for _, i := range retentionArmOrder(s.retentionArmCursor.Add(1)-1, len(arms)) {
+		if pass.spent(ctx) {
+			pass.notStarted = append(pass.notStarted, arms[i].name)
+			continue
+		}
+		n, err := arms[i].run(ctx, onlyRun, pass)
+		progressed += n
+		if err != nil {
+			return progressed, err
+		}
+	}
+	return progressed, nil
+}
 
+// reconcileRetentionWork is the pass's work arm: due `settling` records retry their CAS delete,
+// due `superseding` records are re-driven or exited (reconcileSuperseding).
+func (s *Service) reconcileRetentionWork(ctx context.Context, onlyRun pgtype.UUID, pass *retentionPass) (int64, error) {
 	work, err := s.q.ListCheckpointRetentionWork(ctx, store.ListCheckpointRetentionWorkParams{
 		States: []string{retentionSuperseding, retentionSettling}, OnlyRunID: onlyRun, MaxRows: reconcileRetentionBatch,
 	})
 	if err != nil {
-		return progressed, fmt.Errorf("list checkpoint retention work: %w", err)
+		return 0, fmt.Errorf("list checkpoint retention work: %w", err)
 	}
-	for _, r := range work {
+	var progressed int64
+	for i, r := range work {
+		if pass.spent(ctx) {
+			pass.leave(len(work) - i)
+			break
+		}
 		var (
 			done bool
 			err  error
 		)
 		switch r.State {
 		case retentionSuperseding:
-			done, _, err = s.reconcileSuperseding(ctx, r.RunID)
+			done, _, err = s.reconcileSuperseding(ctx, r.RunID, pass.timeout())
 		case retentionSettling:
-			done, _, err = s.settleRetainedCheckpointOnce(ctx, r.RunID)
+			done, _, err = s.settleRetainedCheckpointOnce(ctx, r.RunID, pass.timeout())
 		}
 		if err != nil {
 			slog.Warn("sweeper: checkpoint retention", "run", r.RunID, "state", r.State, "error", secretscrub.Scrub(err.Error()))
@@ -108,15 +229,25 @@ func (s *Service) reconcileCheckpointRetentions(ctx context.Context, onlyRun pgt
 			progressed++
 		}
 	}
+	return progressed, nil
+}
 
+// reconcileUnheldRetentions is the pass's unheld arm: a retained/superseded record whose run has
+// no open hold is settled.
+func (s *Service) reconcileUnheldRetentions(ctx context.Context, onlyRun pgtype.UUID, pass *retentionPass) (int64, error) {
 	unheld, err := s.q.ListUnheldCheckpointRetentions(ctx, store.ListUnheldCheckpointRetentionsParams{
 		OnlyRunID: onlyRun, MaxRows: reconcileRetentionBatch,
 	})
 	if err != nil {
-		return progressed, fmt.Errorf("list unheld checkpoint retentions: %w", err)
+		return 0, fmt.Errorf("list unheld checkpoint retentions: %w", err)
 	}
-	for _, r := range unheld {
-		done, _, err := s.settleRetainedCheckpointOnce(ctx, r.RunID)
+	var progressed int64
+	for i, r := range unheld {
+		if pass.spent(ctx) {
+			pass.leave(len(unheld) - i)
+			break
+		}
+		done, _, err := s.settleRetainedCheckpointOnce(ctx, r.RunID, pass.timeout())
 		if err != nil {
 			slog.Warn("sweeper: checkpoint retention settle", "run", r.RunID, "error", secretscrub.Scrub(err.Error()))
 			continue
@@ -125,15 +256,25 @@ func (s *Service) reconcileCheckpointRetentions(ctx context.Context, onlyRun pgt
 			progressed++
 		}
 	}
+	return progressed, nil
+}
 
+// reconcileRetentionAudit is the pass's audit arm: a deleted record that named a recovery ref is
+// re-verified (auditRecoveryRefLocked).
+func (s *Service) reconcileRetentionAudit(ctx context.Context, onlyRun pgtype.UUID, pass *retentionPass) (int64, error) {
 	audit, err := s.q.ListCheckpointRetentionAudit(ctx, store.ListCheckpointRetentionAuditParams{
 		OnlyRunID: onlyRun, MaxRows: reconcileRetentionBatch,
 	})
 	if err != nil {
-		return progressed, fmt.Errorf("list checkpoint retention audit: %w", err)
+		return 0, fmt.Errorf("list checkpoint retention audit: %w", err)
 	}
-	for _, r := range audit {
-		done, _, err := s.lockedRetentionStep(ctx, r.RunID, s.auditRecoveryRefLocked)
+	var progressed int64
+	for i, r := range audit {
+		if pass.spent(ctx) {
+			pass.leave(len(audit) - i)
+			break
+		}
+		done, _, err := s.lockedRetentionStep(ctx, r.RunID, pass.timeout(), s.auditRecoveryRefLocked)
 		if err != nil {
 			slog.Warn("sweeper: checkpoint retention audit", "run", r.RunID, "error", secretscrub.Scrub(err.Error()))
 			continue
@@ -151,7 +292,7 @@ func (s *Service) reconcileCheckpointRetentions(ctx context.Context, onlyRun pgt
 // (backfillWatermark). The list starts 10 minutes below the watermark, so a run whose transaction
 // committed after a pass moved the watermark past its backfill key (the later of its terminal
 // transition and its last publish) is still listed.
-func (s *Service) backfillCheckpointRetentions(ctx context.Context, onlyRun pgtype.UUID, advance bool) (int64, error) {
+func (s *Service) backfillCheckpointRetentions(ctx context.Context, onlyRun pgtype.UUID, advance bool, pass *retentionPass) (int64, error) {
 	// The database clock BEFORE the list: a page that was not full proves only up to here.
 	listedAt, err := s.q.GetCheckpointRetentionBackfillNow(ctx)
 	if err != nil {
@@ -166,6 +307,12 @@ func (s *Service) backfillCheckpointRetentions(ctx context.Context, onlyRun pgty
 	var progressed int64
 	recorded := make([]bool, len(page))
 	for i, r := range page {
+		if pass.spent(ctx) {
+			// Not started: recorded[i:] stay false, so the watermark stops below the first of
+			// them and the next pass lists them again.
+			pass.leave(len(page) - i)
+			break
+		}
 		inserted, _ := s.recordCheckpointRetention(ctx, r.ID, r.Kind, r.IssueIid)
 		if inserted {
 			slog.Info("sweeper: checkpoint retention backfilled", "run", r.ID)
@@ -213,9 +360,10 @@ func backfillWatermark(page []store.ListCheckpointRetentionBackfillRow, recorded
 	return through
 }
 
-// lockedRetentionStep runs one locked step for runID under its retention lock (try semantics),
-// recovering a panic from the go-git seams into err. done is meaningful only when acquired.
-func (s *Service) lockedRetentionStep(ctx context.Context, runID uuid.UUID,
+// lockedRetentionStep runs one locked step for runID under its retention lock (try semantics), the
+// whole operation bounded by timeout (withRetentionLockTimeout), recovering a panic from the go-git
+// seams into err. done is meaningful only when acquired.
+func (s *Service) lockedRetentionStep(ctx context.Context, runID uuid.UUID, timeout time.Duration,
 	step func(ctx context.Context, runID uuid.UUID, fence func(context.Context) error) (bool, error),
 ) (done, acquired bool, err error) {
 	defer func() {
@@ -223,7 +371,7 @@ func (s *Service) lockedRetentionStep(ctx context.Context, runID uuid.UUID,
 			err = fmt.Errorf("checkpoint retention step panicked: %s", secretscrub.Scrub(fmt.Sprint(r)))
 		}
 	}()
-	acquired, err = s.withRetentionLock(ctx, runID, func(ctx context.Context, fence func(context.Context) error) error {
+	acquired, err = s.withRetentionLockTimeout(ctx, runID, timeout, func(ctx context.Context, fence func(context.Context) error) error {
 		var ferr error
 		done, ferr = step(ctx, runID, fence)
 		return ferr
@@ -235,9 +383,10 @@ func (s *Service) lockedRetentionStep(ctx context.Context, runID uuid.UUID,
 // re-reads the record; one whose supersession STOPPED (last_error set: the tip lagged a later
 // publish, the recovery ref sits at another tip, or a forge step keeps failing) and whose run has
 // NO open custody hold is exited (exitStuckSupersessionLocked), since nothing needs its tip any
-// more. Every other superseding record is re-driven from step 2 (driveSupersession).
-func (s *Service) reconcileSuperseding(ctx context.Context, runID uuid.UUID) (done, acquired bool, err error) {
-	return s.lockedRetentionStep(ctx, runID, func(ctx context.Context, runID uuid.UUID, fence func(context.Context) error) (bool, error) {
+// more. Every other superseding record is re-driven from step 2 (driveSupersession). The whole
+// operation is bounded by timeout.
+func (s *Service) reconcileSuperseding(ctx context.Context, runID uuid.UUID, timeout time.Duration) (done, acquired bool, err error) {
+	return s.lockedRetentionStep(ctx, runID, timeout, func(ctx context.Context, runID uuid.UUID, fence func(context.Context) error) (bool, error) {
 		row, err := s.q.GetCheckpointRetention(ctx, runID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -287,7 +436,9 @@ func (s *Service) exitStuckSupersessionLocked(ctx context.Context, row store.Che
 	}
 	f, problem, gone := s.forgeForRetention(ctx, runID)
 	if gone {
-		if _, err := s.q.SetCheckpointRetentionAbandoned(ctx, store.SetCheckpointRetentionAbandonedParams{
+		bctx, cancel := retentionBookkeepingCtx(ctx)
+		defer cancel()
+		if _, err := s.q.SetCheckpointRetentionAbandoned(bctx, store.SetCheckpointRetentionAbandonedParams{
 			RunID: runID, LastError: retentionGoneNote, ExpectedState: retentionSuperseding,
 		}); err != nil {
 			return false, fmt.Errorf("mark abandoned: %w", err)
@@ -432,8 +583,11 @@ func (s *Service) markRetentionVerified(ctx context.Context, runID uuid.UUID, no
 }
 
 // deferRetentionVerify pushes a deleted record's audit out by the retry backoff, recording the
-// already-scrubbed msg.
+// already-scrubbed msg. The write runs on retentionBookkeepingCtx, so it lands after the
+// operation's own deadline too.
 func (s *Service) deferRetentionVerify(ctx context.Context, row store.CheckpointRetention, msg string) error {
+	ctx, cancel := retentionBookkeepingCtx(ctx)
+	defer cancel()
 	next := time.Now().Add(retentionBackoff(row.Attempts))
 	if _, err := s.q.DeferCheckpointRetentionVerify(ctx, store.DeferCheckpointRetentionVerifyParams{
 		RunID: row.RunID, LastError: msg, VerifyAfter: pgtype.Timestamptz{Time: next, Valid: true},

@@ -33,9 +33,11 @@ const (
 	retentionSettling    = "settling"
 	retentionDefaultConc = 2
 	// retentionOpTimeout bounds one whole locked operation (lock, re-read, forge round-trip,
-	// record), detached from the caller's context.
+	// record), detached from the caller's context. The publish and settle paths use it; a record
+	// the sweeper's pass starts uses the shorter Service.retentionSweepOpTimeout instead.
 	retentionOpTimeout = 2 * time.Minute
-	// retentionRecordTimeout bounds the terminal-time record inserts run on the caller's path.
+	// retentionRecordTimeout bounds the terminal-time record inserts run on the caller's path, and
+	// every failure-bookkeeping write (retentionBookkeepingCtx).
 	retentionRecordTimeout = 10 * time.Second
 	// retentionUnlockTimeout bounds the unlock, which runs on a fresh context because the
 	// operation's own may already have expired.
@@ -109,8 +111,8 @@ func (s *Service) retentionWired() bool {
 // or no pool is wired. The caller then leaves the ref alone (a later settle or the sweeper
 // retries); nothing destructive ever happens without the lock.
 //
-// The whole operation is detached from ctx's cancellation and bounded by retentionOpTimeout.
-// fn receives that context and a fence: fn MUST call fence immediately before every forge write
+// The whole operation is detached from ctx's cancellation and bounded by retentionOpTimeout
+// (withRetentionLockTimeout takes the bound explicitly). fn receives that context and a fence: fn MUST call fence immediately before every forge write
 // and skip the write when it errors. The fence re-reads pg_locks on the pinned session, so a lock
 // lost mid-operation (backend terminated, connection dropped) is observed before the write, not
 // after.
@@ -119,6 +121,15 @@ func (s *Service) retentionWired() bool {
 // connection is hijacked out of the pool and closed, so a session that may still hold the lock
 // is never handed to another caller.
 func (s *Service) withRetentionLock(ctx context.Context, runID uuid.UUID, fn func(ctx context.Context, fence func(context.Context) error) error) (acquired bool, err error) {
+	return s.withRetentionLockTimeout(ctx, runID, retentionOpTimeout, fn)
+}
+
+// withRetentionLockTimeout is withRetentionLock with the operation's bound passed explicitly: the
+// sweeper's pass passes Service.retentionSweepOpTimeout, so one slow forge call costs the pass at
+// most that long (reconcileCheckpointRetentions).
+func (s *Service) withRetentionLockTimeout(ctx context.Context, runID uuid.UUID, timeout time.Duration,
+	fn func(ctx context.Context, fence func(context.Context) error) error,
+) (acquired bool, err error) {
 	if s.retentionPool == nil || s.retentionSem == nil {
 		return false, nil
 	}
@@ -129,7 +140,7 @@ func (s *Service) withRetentionLock(ctx context.Context, runID uuid.UUID, fn fun
 	}
 	defer func() { <-s.retentionSem }()
 
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), retentionOpTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
 
 	conn, err := s.retentionPool.Acquire(ctx)
@@ -255,7 +266,7 @@ func (s *Service) recordCheckpointRetention(ctx context.Context, runID uuid.UUID
 	if !ok {
 		return false, false
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), retentionRecordTimeout)
+	ctx, cancel := retentionBookkeepingCtx(ctx)
 	defer cancel()
 	ref := checkpointRefPrefix + branch
 
@@ -316,7 +327,7 @@ func (s *Service) SettleRetainedCheckpoint(runID uuid.UUID) {
 
 // settleRetainedCheckpoint is SettleRetainedCheckpoint's body, run inline.
 func (s *Service) settleRetainedCheckpoint(ctx context.Context, runID uuid.UUID) {
-	_, acquired, err := s.settleRetainedCheckpointOnce(ctx, runID)
+	_, acquired, err := s.settleRetainedCheckpointOnce(ctx, runID, retentionOpTimeout)
 	if err != nil {
 		slog.Warn("checkpoint retention: settle", "run", runID, "error", secretscrub.Scrub(err.Error()))
 		return
@@ -327,10 +338,11 @@ func (s *Service) settleRetainedCheckpoint(ctx context.Context, runID uuid.UUID)
 }
 
 // settleRetainedCheckpointOnce runs one settle attempt for runID under its retention lock
-// (settleLocked). done reports the forge delete succeeded; acquired is false when the lock or a
-// concurrency slot was busy (nothing ran). A panic from the go-git seams is recovered into err.
-func (s *Service) settleRetainedCheckpointOnce(ctx context.Context, runID uuid.UUID) (done, acquired bool, err error) {
-	return s.lockedRetentionStep(ctx, runID, s.settleLocked)
+// (settleLocked), the whole operation bounded by timeout. done reports the forge delete succeeded;
+// acquired is false when the lock or a concurrency slot was busy (nothing ran). A panic from the
+// go-git seams is recovered into err.
+func (s *Service) settleRetainedCheckpointOnce(ctx context.Context, runID uuid.UUID, timeout time.Duration) (done, acquired bool, err error) {
+	return s.lockedRetentionStep(ctx, runID, timeout, s.settleLocked)
 }
 
 // settleLocked is one settle under the run's retention lock: a retained/superseded record with no
@@ -402,10 +414,22 @@ func (s *Service) forgeForRetention(ctx context.Context, runID uuid.UUID) (f ret
 	return retentionForge{cloneURL: cloneURL, username: rc.BotUsername, pat: string(botPAT)}, "", false
 }
 
+// retentionBookkeepingCtx is the context a retention record write runs on when it must land even
+// though the operation's own context may have expired (a forge call that ran into the operation's
+// deadline): detached from ctx's cancellation and bounded by retentionRecordTimeout. Without it an
+// expired operation records no backoff, and the record keeps its place at the head of its arm's
+// next_attempt_at-ordered page on every later pass.
+func retentionBookkeepingCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), retentionRecordTimeout)
+}
+
 // recordRetentionFailure records a failed (or refused) retention step on the record, guarded on
 // the state the caller acted in: attempts+1, the already-scrubbed msg as last_error, and the
-// next retry pushed out by the exponential backoff. The ref is left as it is.
+// next retry pushed out by the exponential backoff. The ref is left as it is. The write runs on
+// retentionBookkeepingCtx, so it lands after the operation's own deadline too.
 func (s *Service) recordRetentionFailure(ctx context.Context, row store.CheckpointRetention, expectedState, msg string) error {
+	ctx, cancel := retentionBookkeepingCtx(ctx)
+	defer cancel()
 	next := time.Now().Add(retentionBackoff(row.Attempts))
 	if _, err := s.q.RecordCheckpointRetentionFailure(ctx, store.RecordCheckpointRetentionFailureParams{
 		RunID: row.RunID, LastError: msg, NextAttemptAt: pgtype.Timestamptz{Time: next, Valid: true}, ExpectedState: expectedState,
@@ -427,8 +451,11 @@ func (s *Service) deleteSettlingRef(ctx context.Context, row store.CheckpointRet
 	f, problem, gone := s.forgeForRetention(ctx, runID)
 	if gone {
 		// The run, its repo or its forge connection is gone: the delete can never be
-		// brokered again. Keep the record as an audit row.
-		if _, aerr := s.q.SetCheckpointRetentionAbandoned(ctx, store.SetCheckpointRetentionAbandonedParams{
+		// brokered again. Keep the record as an audit row (on the bookkeeping context: the
+		// operation's own may have expired in forgeForRetention's reads).
+		bctx, cancel := retentionBookkeepingCtx(ctx)
+		defer cancel()
+		if _, aerr := s.q.SetCheckpointRetentionAbandoned(bctx, store.SetCheckpointRetentionAbandonedParams{
 			RunID: runID, LastError: "run, repository or forge connection no longer exists", ExpectedState: retentionSettling,
 		}); aerr != nil {
 			return false, fmt.Errorf("mark abandoned: %w", aerr)

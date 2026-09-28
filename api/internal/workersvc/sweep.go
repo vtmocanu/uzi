@@ -345,7 +345,11 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// read) is logged here and does NOT fail the sweep: the passes below (the recovery upload and
 	// retention expiries among them) must not be starved by a checkpoint-retention fault, and the
 	// next tick retries. The count is reported only for a pass that succeeded. Inert unless the
-	// retention seams are wired.
+	// retention seams are wired. The pass makes forge calls, so it is time-bounded for the same
+	// reason: it starts no record once Service.retentionPassBudget has passed and runs each record
+	// it starts under Service.retentionSweepOpTimeout, leaving the rest for the next tick with a nil
+	// error; its forge-calling arms start from a rotating arm each pass so one slow arm cannot
+	// starve the others (reconcileCheckpointRetentions).
 	if n, rerr := s.ReconcileCheckpointRetentions(ctx); rerr != nil {
 		slog.Error("sweeper: reconcile checkpoint retentions failed", "error", rerr)
 	} else {
