@@ -9,6 +9,9 @@
 #   Unless --no-claim, an open PR is CLAIMED for this session (claims.sh) so other landers
 #   see it; a PR another live session holds stops here with NEXT=claimed_by_other.
 #
+# SKILL_SCRIPTS_STALE=1 means these scripts differ from the local origin/main ref (a stale
+# checkout, or a local edit): rerun from a fresh detached origin/main worktree.
+#
 # Prints KEY=VALUE lines (empty when unknown), then NEXT=<state> — the branch point the
 # uzi-lander SKILL.md decision tree keys on:
 #   run_active:<status>   run not terminal (running, or a park: awaiting_*, limit_wait, …)
@@ -36,12 +39,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/greptile-verdict.sh"
 # shellcheck source=lib/review-threads.sh
 . "$HERE/lib/review-threads.sh"
+# shellcheck source=lib/freshness.sh
+. "$HERE/lib/freshness.sh"
 TARGET=""; REPO=""; CLAIM=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) REPO="${2:?}"; shift 2;;
     --no-claim) CLAIM=0; shift;;
-    -h|--help) sed -n '2,29p' "$0"; exit 3;;
+    -h|--help) sed -n '2,32p' "$0"; exit 3;;
     -*) echo "unknown flag: $1" >&2; exit 3;;
     *) if [ -z "$TARGET" ]; then TARGET="$1"; else echo "unexpected arg: $1" >&2; exit 3; fi; shift;;
   esac
@@ -51,6 +56,9 @@ if [ -z "$REPO" ]; then
   REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || { echo "cannot infer --repo" >&2; exit 3; }
 fi
 echo "REPO=$REPO"
+stale=$(skill_scripts_stale "$HERE")
+echo "SKILL_SCRIPTS_STALE=$stale"
+[ "$stale" = 1 ] && echo "WARNING: these uzi-lander scripts differ from origin/main; run them from a fresh detached origin/main worktree (git fetch origin main && git worktree add --detach ../uzi-lander-tools origin/main)" >&2
 
 have_uzi=0; command -v uzi >/dev/null 2>&1 && have_uzi=1
 # UNKNOWN is set by any lookup that fails or returns an unreadable payload; a snapshot with
