@@ -203,7 +203,7 @@ func (m *memForge) calls() (publish, create int) {
 // open) and a NEW running issue run on the same issue/branch, served by two Service instances.
 //
 // The old run's hold is opened BEFORE its terminal UPDATE, as in production (a hold is only ever
-// opened at claim): migration 00265's runs.status trigger records the retention row in the
+// opened at claim): migration 00266's runs.status trigger records the retention row in the
 // terminal transaction itself, and reads the open-hold state at that instant.
 type supersedeFix struct {
 	e          interlockLiveDB

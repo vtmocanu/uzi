@@ -197,7 +197,7 @@ func retentionArmOrder(cursor uint32, n int) []int {
 //  1. backfill (always first, and it makes no forge call): terminal runs that own a checkpoint ref
 //     but have no record get one (retained with an open hold, else settling), so the work arm
 //     settles a new settling record the same pass (budget permitting).
-//     Since migration 00265 every terminal transition records its run in the same transaction
+//     Since migration 00266 every terminal transition records its run in the same transaction
 //     (the runs.status trigger), so this arm is left with terminal runs whose first checkpoint
 //     tip was persisted only AFTER the transition (the trigger saw none) and whose own track
 //     insert did not record them: TrackTerminalCheckpointPublish failed, or retention was not

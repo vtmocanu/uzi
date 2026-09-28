@@ -28,7 +28,7 @@
 -- horizon (seven days). A push the forge applies after either still leaves a branch ref no record
 -- tracks, until a human deletes it.
 --
--- Plain columns, no ON DELETE CASCADE FK (the 00263 rationale): a run delete must not silently
+-- Plain columns, no ON DELETE CASCADE FK (the 00264 rationale): a run delete must not silently
 -- drop the record of a push that may still land. Purely additive.
 CREATE TABLE checkpoint_publish_attempts (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

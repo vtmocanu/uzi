@@ -54,7 +54,7 @@ publish must not destroy the older generation's only off-worker copy either.
 At each of the three terminal writers that used to delete the ref (and
 later, through the sweeper backfill, for every other terminal writer) the
 api inserts a `checkpoint_retentions` row
-(one per run, migration 00263) recording the run's checkpoint branch, the
+(one per run, migration 00264) recording the run's checkpoint branch, the
 published tip, and the ref that currently carries it. A run with an open
 custody hold gets state `retained` and no forge call. A run with no open
 hold (a completed run whose hold already settled, or a failed/cancelled run
@@ -175,7 +175,7 @@ statement, only later by the sweeper's backfill arm. In the window between
 a terminal commit at one of those seven writers and the backfill arm
 catching up, `claimCheckpointSlot` could list the branch's active records,
 see none, and push a new run's descendant tip straight over the old run's
-retained checkpoint. A migration-00265 (draft number; renumbered at merge)
+retained checkpoint. A migration-00266 (draft number; renumbered at merge)
 `AFTER UPDATE OF status` trigger on `runs` now inserts the
 `checkpoint_retentions` row in the SAME transaction as every terminal
 transition — `retained` while a custody hold is open, else `settling`, the
@@ -215,7 +215,7 @@ starts it after the run's terminal commit). A live-routed push carries a
 `livePublishPrePushBudget` (2 minutes): once that much time has passed
 since `routedAt`, the push is refused rather than sent. Independently of
 that budget, every push — live or terminal — writes a durable
-`checkpoint_publish_attempts` row (migration 00266, draft number) BEFORE
+`checkpoint_publish_attempts` row (migration 00267, draft number) BEFORE
 the forge call: the branch, ref and tip the push would set, keyed to the
 run. The row is cleared only on a KNOWN outcome: a definitive refusal
 (nothing landed), or a successful push whose tip is persisted
@@ -315,7 +315,7 @@ see the PRD's amended Problem statement), the sweeper's
 deletes with exponential backoff, drives due `superseding` records, settles
 records whose holds have since cleared, backfills a record for any terminal
 run that published a checkpoint but has none (a watermarked scan bounded by
-migration 00264's index), and runs the post-settlement audit described
+migration 00265's index), and runs the post-settlement audit described
 above.
 
 ## Consequences

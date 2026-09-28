@@ -87,7 +87,7 @@ func newHangingRetentionSvc(t *testing.T, e interlockLiveDB, h *hangingForge, p 
 }
 
 // seedSettlingRun seeds a failed issue run that published retentionTestTip and has no custody
-// hold, so migration 00265's trigger records it `settling` (due now) in its terminal transaction.
+// hold, so migration 00266's trigger records it `settling` (due now) in its terminal transaction.
 func seedSettlingRun(t *testing.T, e interlockLiveDB) uuid.UUID {
 	t.Helper()
 	w := e.seedWorker(t, nil)

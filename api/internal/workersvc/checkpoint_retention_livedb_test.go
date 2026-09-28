@@ -379,7 +379,7 @@ func (f *retentionFix) seedTerminalPublishedRun(t *testing.T, w uuid.UUID) (uuid
 }
 
 // seedTerminalPublishedRunWith is seedTerminalPublishedRun with a hook run on the still-running
-// run BEFORE its terminal UPDATE. Migration 00265's runs.status trigger records the retention row
+// run BEFORE its terminal UPDATE. Migration 00266's runs.status trigger records the retention row
 // in that UPDATE from the run row and its holds as they are then, so whatever a test needs the
 // terminal transition to see (an open hold, the run's kind, an unpublished tip) is set up here.
 func (f *retentionFix) seedTerminalPublishedRunWith(t *testing.T, w uuid.UUID, before func(runID uuid.UUID)) (uuid.UUID, int64) {

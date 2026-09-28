@@ -592,7 +592,7 @@ type Store interface {
 	TrackTerminalCheckpointPublish(ctx context.Context, arg store.TrackTerminalCheckpointPublishParams) (string, error)
 	GetRunCheckpointTipForRetention(ctx context.Context, runID uuid.UUID) (pgtype.Text, error)
 	// PRD #1810 D2 residual 2: the durable record of a checkpoint push written before the forge
-	// call (checkpoint_publish_attempts, 00266), and the sweeper's attempts arm that reconciles a
+	// call (checkpoint_publish_attempts, 00267), and the sweeper's attempts arm that reconciles a
 	// push whose outcome the api never learned.
 	RecordCheckpointPublishAttempt(ctx context.Context, arg store.RecordCheckpointPublishAttemptParams) (uuid.UUID, error)
 	DeleteCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (int64, error)
@@ -4487,7 +4487,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			}
 			// PRD #1810 D3: this release's settle trigger is retainOrDeleteCheckpoint below,
 			// which runs on every terminal transition AFTER the release. The record already
-			// exists by then: migration 00265's trigger inserted it in the terminal UPDATE's own
+			// exists by then: migration 00266's trigger inserted it in the terminal UPDATE's own
 			// transaction, as `retained` (this completing generation's hold was still open at
 			// that instant). retainOrDeleteCheckpoint re-reads that row and dispatches the settle
 			// it owes to SettleRetainedCheckpoint, which moves it to settling only once no hold

@@ -9,10 +9,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 )
 
-// checkpoint_retention_trigger_livedb_test.go pins migration 00265 (PRD #1810) against a REAL
+// checkpoint_retention_trigger_livedb_test.go pins migration 00266 (PRD #1810) against a REAL
 // Postgres: a run's checkpoint_retentions row is inserted by a trigger on runs.status IN THE SAME
 // TRANSACTION as its terminal status, whichever writer commits it, so no reader can see a terminal
-// run that published a checkpoint without its record. Before 00265 the record was inserted only
+// run that published a checkpoint without its record. Before 00266 the record was inserted only
 // after the terminal commit (three writers) or by the sweeper's backfill (every other writer), and
 // a new issue run's slot claim in that window saw no record and pushed over the old run's tip.
 //
@@ -268,7 +268,7 @@ func TestTerminalTriggerNeverResetsLiveDB(t *testing.T) {
 	})
 	t.Run("unchanged status fires nothing", func(t *testing.T) {
 		f := newRetentionFix(t)
-		// Already terminal at INSERT (the pre-00265 shape: no UPDATE of status ever fired the
+		// Already terminal at INSERT (the pre-00266 shape: no UPDATE of status ever fired the
 		// trigger), then a write that leaves the status as it was.
 		runID := uuid.New()
 		iid := *f.e.nextIID

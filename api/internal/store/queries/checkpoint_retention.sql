@@ -279,7 +279,7 @@ SELECT now()::timestamptz AS listed_at;
 
 -- name: ListCheckpointRetentionBackfill :many
 -- M4 backfill: terminal runs that published a checkpoint and own a checkpoint branch (an issue
--- run with an issue iid, or a self_improve run) but have NO record. Since migration 00265 every
+-- run with an issue iid, or a self_improve run) but have NO record. Since migration 00266 every
 -- terminal transition inserts its record in the same transaction (the runs.status trigger,
 -- whichever writer made it), so what is left here is a terminal run whose first checkpoint tip was
 -- persisted only AFTER the transition (the trigger saw no tip) and whose own track did not record
@@ -296,7 +296,7 @@ SELECT now()::timestamptz AS listed_at;
 -- publishes long after it went terminal is keyed at the publish, not left below the watermark.
 -- The key never decreases (checkpoint_tip_at only moves forward, and a terminal status does not
 -- change). The scan starts at the persisted watermark (backfilled_through) less a 10-minute
--- overlap and uses idx_runs_checkpoint_backfill (00264, on exactly this expression), so a
+-- overlap and uses idx_runs_checkpoint_backfill (00265, on exactly this expression), so a
 -- steady-state pass reads only recent candidates. The overlap covers commit-order skew: both
 -- columns are the writer's transaction time, so a run committed after a pass advanced the
 -- watermark past its key is still inside the window on the next pass. The caller derives the
@@ -423,7 +423,7 @@ WHERE checkpoint_retentions.run_id = @run_id
 -- publish, or the sweeper's attempts arm re-recording a newer late push, may have moved the record,
 -- and an unconditional write would move it BACKWARDS to a tip origin no longer carries. When no
 -- record was observed, the record may since have been inserted by the run's terminal transaction
--- from runs.checkpoint_tip (migration 00265), so a record at the runs.checkpoint_tip the publish
+-- from runs.checkpoint_tip (migration 00266), so a record at the runs.checkpoint_tip the publish
 -- observed (expected_run_tip) also matches: that tip predates this push. The insert arm (no record
 -- at all) is unconditional. No row moved: the caller treats the publish as untracked and keeps its
 -- attempt row for the sweeper.
@@ -468,7 +468,7 @@ RETURNING checkpoint_retentions.state;
 SELECT checkpoint_tip FROM runs WHERE id = @run_id;
 
 -- PRD #1810 D2 (residual 2): checkpoint_publish_attempts, the durable record of a checkpoint push
--- written BEFORE the forge call (migration 00266).
+-- written BEFORE the forge call (migration 00267).
 
 -- name: RecordCheckpointPublishAttempt :one
 -- Written immediately before one push. The caller refuses the push when this fails: no push is

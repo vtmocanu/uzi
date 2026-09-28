@@ -25,7 +25,7 @@ import (
 // against the ref runs under a per-run SESSION advisory lock (withRetentionLock) and is
 // compare-and-swap on the recorded tip.
 
-// Checkpoint retention states (checkpoint_retentions.state; see migration 00263).
+// Checkpoint retention states (checkpoint_retentions.state; see migration 00264).
 const (
 	retentionRetained    = "retained"
 	retentionSuperseding = "superseding"
@@ -98,7 +98,7 @@ func (s *Service) SetRetentionLockPool(p ConnAcquirer) { s.retentionPool = p }
 
 // retentionWired reports whether this service can broker a retained-ref delete at all. Any
 // missing seam means RETAIN: the Go terminal path records nothing and deletes nothing, and the
-// ref simply stays on origin. The record itself may still exist: migration 00265's trigger
+// ref simply stays on origin. The record itself may still exist: migration 00266's trigger
 // inserts it in the terminal transaction whatever this service has wired, and without the seams
 // nothing ever drives it to a delete.
 func (s *Service) retentionWired() bool {
@@ -222,7 +222,7 @@ func destroyRetentionConn(conn *pgxpool.Conn) {
 // AFTER the terminal state committed and never fails or delays the caller beyond two bounded
 // inserts and a re-read.
 //
-// The record is normally already there: migration 00265's trigger on runs.status inserts it in
+// The record is normally already there: migration 00266's trigger on runs.status inserts it in
 // the SAME transaction as the terminal status (so no reader, claimCheckpointSlot included, ever
 // sees a terminal run that published a checkpoint without its record), with the same columns,
 // the same retained/settling choice and the same never-reset rule as the inserts below. Both
@@ -263,7 +263,7 @@ func (s *Service) retainOrDeleteCheckpoint(ctx context.Context, runID uuid.UUID,
 // sweeper's backfill (PRD #1810 M4): it inserts the run's `retained` or `settling` record
 // (never resetting an existing one) and reports whether a record was inserted now and whether
 // the run's record owes a settle. It makes no forge call. For a terminal transition committed
-// with migration 00265's trigger in place the record already exists, so inserted is false and
+// with migration 00266's trigger in place the record already exists, so inserted is false and
 // settle reflects the existing record's state; inserted is true only for a run the trigger never
 // recorded: one whose checkpoint tip was persisted only after its terminal transition (a late first
 // publish whose own track insert failed, or ran while retention was unwired).

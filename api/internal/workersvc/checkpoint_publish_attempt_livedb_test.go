@@ -112,7 +112,7 @@ func (f *supersedeFix) coolOff(t *testing.T) {
 }
 
 // newInFlightFix builds the fixture with the OLD run's publish of lateTip (descending the retained
-// tip) held inside its forge call while the run is LIVE; the run then turns terminal (the 00265
+// tip) held inside its forge call while the run is LIVE; the run then turns terminal (the 00266
 // trigger records `retained` at the old tip, its hold open) and the NEW run is inserted.
 func newInFlightFix(t *testing.T, late bool) (*supersedeFix, *publishGate, <-chan publishOut) {
 	t.Helper()
