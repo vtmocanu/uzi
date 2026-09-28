@@ -6,13 +6,20 @@
 //  - the SOFT layer, the per-run cache cap. At every implement turn boundary the executor asks
 //    {@link DiskGovernor.boundary}; a run whose caches exceed its cap is TRIMMED (least recently
 //    used entries first, run-caches.ts trimRunCaches) only at a proven quiet point: between turns
-//    AND with no process of the run alive (the executor's own process tracking, never file
-//    mtimes). A run that stays over the cap is parked preventively (see {@link SOFT_PARK_RULE}).
+//    AND with no process of the run alive, never judged from file mtimes. "Alive" is the executor's
+//    probe: its CLI process groups, plus every process attributed to the run by environment
+//    (`HOME=<run HOME>`) or working directory (run-procs.ts), since the CLI runs each Bash command
+//    detached, outside its groups; an unknown answer is alive. A run that stays over the cap is
+//    parked preventively (see {@link SOFT_PARK_RULE}).
 //  - the HARD layer, the per-tick pressure stop. {@link DiskGovernor.observe} runs on every stats
 //    tick (the heartbeat cadence) independently of turn boundaries; at or over the hard threshold
 //    it stops the running Claude run with the largest caches through the steering channel's
 //    worker-local `disk` pause mode (the same turn drop as an owner's `pause --now`) and the
-//    executor parks it with a COUNTED `data_volume_full` park.
+//    executor parks it with a COUNTED `data_volume_full` park. Only a run inside its implement
+//    loop is stoppable: a run still cloning, planning or waiting at its plan gate, and a run that
+//    has left the loop to finalize, is never a candidate (the stop is only routed to the disk park
+//    at an implement boundary or turn). A stop that has not produced a park within
+//    {@link STOP_TIMEOUT_MS} is given up, so one lost stop cannot wedge the hard layer.
 //
 // Both parks end the executor, so the runner's park cache drop (run-caches.ts dropRunCaches, D2)
 // runs on the way out. Both layers can be disabled (UZI_RUN_CACHE_CAP_ENABLED,
@@ -53,6 +60,14 @@ const SOFT_PARK_RUNAWAY = 1.25;
 
 /** One boundary's measurement and the whole hard-layer selection each get this long. */
 const MEASURE_DEADLINE_MS = 60_000;
+
+/** A hard stop that has not ended its run's flight within this long is given up (logged), and
+ *  the hard layer may stop another run. */
+const STOP_TIMEOUT_MS = 10 * 60_000;
+
+/** While the volume stays over the hard threshold, the candidates are measured again at most this
+ *  often (every stats tick would otherwise re-walk every run's caches). */
+const SELECT_INTERVAL_MS = 60_000;
 
 /** PRD #1809 D4: the knobs, from config.ts. */
 export interface CacheCapConfig {
@@ -140,8 +155,13 @@ export class DiskGovernor {
   private readonly now: () => number;
   private readonly measure: NonNullable<DiskGovernorOptions["measure"]>;
   private readonly trim: NonNullable<DiskGovernorOptions["trim"]>;
-  /** The run the hard layer stopped, until its flight ends. At most one at a time. */
+  /** The run the hard layer stopped, until its flight ends (or it leaves its implement loop
+   *  without parking, or {@link STOP_TIMEOUT_MS} passes). At most one at a time. */
   private stopping: string | undefined;
+  /** When {@link stopping} was asked to stop. */
+  private stopRequestedAt = 0;
+  /** When the last hard-layer selection that stopped nothing ended ({@link SELECT_INTERVAL_MS}). */
+  private lastSelectionAt = Number.NEGATIVE_INFINITY;
   /** A hard-layer selection (measuring the candidates) is in flight. */
   private selecting = false;
   /** When the last stopped run's flight ended: a sample taken before it is not fresh. */
@@ -173,13 +193,33 @@ export class DiskGovernor {
   unregister(runId: string): void {
     if (!this.runs.delete(runId)) return;
     if (this.stopping !== runId) return;
-    this.stopping = undefined;
-    this.lastStopEndedAt = this.now();
+    this.releaseStop();
     if (this.opts.reclaim) {
       void this.opts.reclaim().catch((e: unknown) =>
         this.opts.log.warn("disk reclaim after a pressure stop failed", { run_id: runId, error: errMessage(e) }),
       );
     }
+  }
+
+  /**
+   * The run left its implement loop (its executor returned or threw): it is no longer a hard-stop
+   * candidate. `diskParked` says it left for a disk park, whose flight end ({@link unregister})
+   * releases the stop as before; otherwise a stop asked of it will never become a park (it
+   * finished, failed, or parked for another reason first), so it is released now.
+   */
+  leftLoop(runId: string, diskParked: boolean): void {
+    const run = this.runs.get(runId);
+    if (run) run.stoppable = false;
+    if (this.stopping !== runId || diskParked) return;
+    this.opts.log.warn("the run the hard layer stopped left its implement loop without a disk park; releasing the stop", {
+      run_id: runId,
+    });
+    this.releaseStop();
+  }
+
+  private releaseStop(): void {
+    this.stopping = undefined;
+    this.lastStopEndedAt = this.now();
   }
 
   /** The cap in bytes, from the volume's current size. */
@@ -252,6 +292,9 @@ export class DiskGovernor {
       }
     }
     run.overStreak += 1;
+    // A hard stop asked while this boundary measured or trimmed parks the run COUNTED at the
+    // executor's next check; the soft layer does not also resolve a (preventive) park.
+    if (run.stopRequested) return "continue";
     const runaway = alive && bytes >= cap * SOFT_PARK_RUNAWAY;
     if (run.overStreak >= SOFT_PARK_BOUNDARIES || runaway) {
       this.opts.log.warn("run caches stayed over the cap; parking the run so its caches are dropped", {
@@ -272,18 +315,30 @@ export class DiskGovernor {
    * measures the stoppable runs and stops the one with the largest caches. One stop at a time: the
    * next waits until the stopped run's flight has ended (parked) AND a sample taken after that is
    * still over: `sampledAtMs` is when the sample was taken (the heartbeat observes it only after
-   * its round-trip), and a sample taken before the last stopped run ended is ignored. Never throws
-   * and never waits.
+   * its round-trip), and a sample taken before the last stopped run ended is ignored. While the
+   * volume stays over, a selection that stopped nothing (which measured every candidate) is not
+   * repeated for {@link SELECT_INTERVAL_MS}. A stop still pending after {@link STOP_TIMEOUT_MS} is given up
+   * here. Never throws and never waits.
    */
   observe(usedFraction: number | undefined, sampledAtMs: number = this.now()): void {
-    if (!this.opts.config.hardStopEnabled || usedFraction === undefined) return;
+    if (!this.opts.config.hardStopEnabled) return;
+    if (this.stopping !== undefined && this.now() - this.stopRequestedAt >= STOP_TIMEOUT_MS) {
+      this.opts.log.warn("a pressure stop did not produce a park in time; giving it up", {
+        run_id: this.stopping,
+        timeout_ms: STOP_TIMEOUT_MS,
+      });
+      this.releaseStop();
+    }
+    if (usedFraction === undefined) return;
     if (sampledAtMs < this.lastStopEndedAt) return;
     const threshold = hardStopThreshold(this.opts.thresholdOf(), this.opts.config.hardMargin);
     if (usedFraction < threshold) {
       this.warnedNothingToStop = false;
+      this.lastSelectionAt = Number.NEGATIVE_INFINITY;
       return;
     }
     if (this.stopping !== undefined || this.selecting) return;
+    if (this.now() - this.lastSelectionAt < SELECT_INTERVAL_MS) return;
     const candidates = [...this.runs.entries()].filter(([, r]) => r.stoppable && !r.stopRequested);
     if (candidates.length === 0) {
       if (!this.warnedNothingToStop) {
@@ -312,6 +367,7 @@ export class DiskGovernor {
       if ((run.cacheBytes ?? 0) > (pick?.[1].cacheBytes ?? 0)) pick = entry;
     }
     if (!pick) {
+      this.lastSelectionAt = this.now();
       this.opts.log.warn("data volume at the hard threshold, but no running Claude run holds cache bytes to stop for", {
         used_fraction: usedFraction,
         hard_threshold: threshold,
@@ -319,10 +375,14 @@ export class DiskGovernor {
       return;
     }
     const [runId, run] = pick;
-    // It may have ended while it was being measured.
-    if (this.runs.get(runId) !== run) return;
+    // It may have ended (or left its implement loop) while it was being measured.
+    if (this.runs.get(runId) !== run || !run.stoppable) {
+      this.lastSelectionAt = this.now();
+      return;
+    }
     run.stopRequested = true;
     this.stopping = runId;
+    this.stopRequestedAt = this.now();
     this.opts.log.warn("data volume at the hard threshold; stopping the run with the largest caches and parking it", {
       run_id: runId,
       cache_bytes: run.cacheBytes,

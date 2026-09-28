@@ -618,7 +618,7 @@ process.stdout.write(JSON.stringify({ cacheBytes, entries, truncated }) + "\\n")
  *  command roots are members of group `runner` and can write into a group-writable HOME),
  *  then, for a removal, `runner` again for what the second pass unblocked. Single-uid the
  *  wrapper is the identity, so the one pass runs as the worker itself. */
-function agentWrappers(passes: "remove" | "measure"): CommandWrapper[] {
+export function agentWrappers(passes: "remove" | "measure"): CommandWrapper[] {
   if (!uidSplitActive()) return [runnerCommand];
   return passes === "remove" ? [runnerCommand, commandRootCommand, runnerCommand] : [runnerCommand, commandRootCommand];
 }
@@ -1037,16 +1037,22 @@ const TRIM_MAX_STDOUT = 48 * 1024 * 1024;
 
 /**
  * The pieces the two PRD #1809 D4 trim scripts share, on top of {@link PINNED_PRELUDE} and
- * {@link STREAM_PRELUDE}: argument checks, the entry and wall-time budget (`spend`), buffered
- * output (`w`, printed once at exit), `lst` (an `lstat` through a pinned parent, never
+ * {@link STREAM_PRELUDE}: argument checks, the entry and wall-time budget (`spend`), output
+ * (`w`, one line written to stdout as it is produced, so the helper never holds its whole
+ * listing), the control-character check (`bad`: a name holding a C0 control or DEL is never
+ * printed, since a newline or tab in it would forge protocol lines; `escaped` is the placeholder an
+ * unresolved entry prints instead, which never equals a real relpath), `lst` (an `lstat` through a pinned parent, never
  * following), `openChild` (a directory inside a pinned parent, pinned `O_NOFOLLOW` then reopened
  * for reading) and `pinRoot` (the cache root, pinned component by component from HOME, as
  * {@link PINNED_SUBTREE_SCRIPT} does: a symlinked component exits 3, a missing one 2).
  */
 const TRIM_PRELUDE = `
-const out = [];
-const w = (line) => out.push(line);
-const flush = () => { if (out.length) process.stdout.write(out.join("\\n") + "\\n"); };
+const w = (line) => process.stdout.write(line + "\\n");
+// Any C0 control character or DEL: such a name is never printed (a newline or tab in it would
+// forge protocol lines); the caller emits an unresolved entry instead.
+const CTRL = /[\\x00-\\x1f\\x7f]/;
+const bad = (name) => CTRL.test(name);
+const escaped = (rel) => "!bad:" + encodeURIComponent(rel);
 let seen = 0, exhausted = false, deadline = 0, maxEntries = 0;
 function budget(max, ms) {
   if (!(max >= 0) || !(ms >= 0)) process.exit(6);
@@ -1101,6 +1107,8 @@ function each(dirFd, fn) {
  * followed and never a unit. Prints tab-separated lines, then one `H\t<json>` summary line
  * (`truncated`: the entry or time budget ran out, so the listing is partial).
  *
+ * An eighth argument `<sync>` is a test seam only (see {@link TrimHelperOptions.sync}).
+ *
  * `<kind>` `go` (`<rel>` is `.cache/go-build`): one unit is a regular file named `*-a` or `*-d`
  * in a top-level directory (Go's own trim selects entries by that suffix,
  * `cmd/go/internal/cache/cache.go`), or a directory there (Go's executable cache entries are
@@ -1119,11 +1127,18 @@ function each(dirFd, fn) {
  * some uid); and every `content-v2/<algo>/<xx>/<yy>/<rest>`
  * file as `C\t<mtimeNs>\t<bytes>\t<rel>`.
  *
+ * A bucket is read only through a descriptor opened `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` and
+ * `fstat`ed: it must be a regular file of at most 8 MiB at read time, and at most 8 MiB + 1 bytes
+ * are read (the name can be swapped for a sparse file or a FIFO after the `lstat`; a FIFO's open
+ * does not block, and anything else is an `X`). A name holding a control character is never
+ * printed: `go` skips it (counted as `badNames`), `npm` prints an escaped `E` entry for it, so that
+ * listing is incomplete. The `H` summary is always the single last line.
+ *
  * Exit 0 (listed), 2 (the cache is absent), 3 (a symlinked component), 5, 6, 7 as the removal
  * script; a truncated listing still exits 0 and says so in its summary.
  */
 const TRIM_LIST_SCRIPT = `${PINNED_PRELUDE}${TRIM_PRELUDE}
-const [home, rel, kind, needArg, maxArg, maxUnitsArg, budgetArg] = process.argv.slice(1);
+const [home, rel, kind, needArg, maxArg, maxUnitsArg, budgetArg, sync] = process.argv.slice(1);
 const need = Number(needArg);
 const maxUnits = Number(maxUnitsArg);
 if ((kind !== "go" && kind !== "npm") || !(need >= 0) || !(maxUnits >= 0)) process.exit(6);
@@ -1147,14 +1162,18 @@ function treeBytes(dirFd) {
 if (kind === "go") {
   const KEEP = new Set(["README", "trim.txt", "testexpire.txt"]);
   const units = [];
+  let badNames = 0;
   each(root, (top) => {
     if (KEEP.has(top)) return;
+    // Never a unit, never printed: see CTRL. Go never writes such a name.
+    if (bad(top)) { badNames++; return; }
     const st = lst(root, top);
     if (!st || !st.isDirectory()) return;
     let sub;
     try { sub = openChild(root, top); } catch { return; }
     try {
       each(sub, (name) => {
+        if (bad(name)) { badNames++; return; }
         const cst = lst(sub, name);
         if (!cst) return;
         if (cst.isFile() && /-[ad]$/.test(name)) {
@@ -1178,14 +1197,47 @@ if (kind === "go") {
     sum += u[2];
     printed++;
   }
-  w("H\\t" + JSON.stringify({ units: units.length, bytes: total, truncated: exhausted }));
+  w("H\\t" + JSON.stringify({ units: units.length, bytes: total, truncated: exhausted, badNames }));
 } else {
   const INTEGRITY = /sha[0-9]+-[A-Za-z0-9+/=]+/g;
   const MAX_BUCKET = 8 * 1024 * 1024;
   let printed = 0;
   const unit = (line) => { if (printed >= maxUnits) { exhausted = true; return; } w(line); printed++; };
+  // A bucket's text, or undefined when it is not a regular file of at most MAX_BUCKET bytes AT
+  // READ TIME: the lstat size is only a hint, since the name can be swapped (a sparse file, a
+  // FIFO) between the lstat and the open. O_NONBLOCK keeps a FIFO's open from blocking; fstat on
+  // the open descriptor decides; at most MAX_BUCKET + 1 bytes are ever read.
+  function readBucket(dirFd, name) {
+    if (sync) {
+      // Test seam only (the worker never passes it): announce the bucket, wait for the go-ahead.
+      fs.writeFileSync(sync + ".bucket", "");
+      const cell = new Int32Array(new SharedArrayBuffer(4));
+      const until = Date.now() + 10000;
+      while (!fs.existsSync(sync + ".go") && Date.now() < until) Atomics.wait(cell, 0, 0, 10);
+    }
+    let fd;
+    try { fd = fs.openSync(at(dirFd, name), C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK); } catch { return undefined; }
+    try {
+      const st = fs.fstatSync(fd);
+      if (!st.isFile() || st.size > MAX_BUCKET) return undefined;
+      const buf = Buffer.alloc(Math.min(MAX_BUCKET + 1, st.size + 1));
+      let n = 0;
+      for (;;) {
+        if (n === buf.length) return undefined;
+        const r = fs.readSync(fd, buf, n, buf.length - n, null);
+        if (r === 0) break;
+        n += r;
+      }
+      return buf.toString("latin1", 0, n);
+    } catch {
+      return undefined;
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
   function walkIndex(dirFd, relp, depth) {
     each(dirFd, (name) => {
+      if (bad(name)) { w("E\\t" + escaped(relp + "/" + name)); return; }
       const st = lst(dirFd, name);
       if (!st) return;
       const r = relp + "/" + name;
@@ -1197,13 +1249,7 @@ if (kind === "go") {
         w("D\\t" + r);
         try { walkIndex(fd, r, depth + 1); } finally { fs.closeSync(fd); }
       } else if (st.isFile()) {
-        let text;
-        if (st.size <= MAX_BUCKET) {
-          try {
-            const fd = fs.openSync(at(dirFd, name), C.O_RDONLY | C.O_NOFOLLOW);
-            try { text = fs.readFileSync(fd, "latin1"); } finally { fs.closeSync(fd); }
-          } catch {}
-        }
+        const text = st.size <= MAX_BUCKET ? readBucket(dirFd, name) : undefined;
         if (text === undefined) { w("X\\t" + r); return; }
         const ints = [...new Set(text.match(INTEGRITY) || [])];
         unit("B\\t" + st.mtimeNs + "\\t" + bytesB(st) + "\\t" + r + "\\t" + ints.join(" "));
@@ -1216,6 +1262,7 @@ if (kind === "go") {
   }
   function walkContent(dirFd, relp, depth) {
     each(dirFd, (name) => {
+      if (bad(name)) { w("E\\t" + escaped(relp + "/" + name)); return; }
       const st = lst(dirFd, name);
       if (!st) return;
       const r = relp + "/" + name;
@@ -1249,7 +1296,6 @@ if (kind === "go") {
   }
   w("H\\t" + JSON.stringify({ truncated: exhausted }));
 }
-flush();
 `;
 
 /**
@@ -1340,7 +1386,6 @@ for (const line of input.split("\\n")) {
   }
 }
 w("H\\t" + JSON.stringify({ ...res, exhausted }));
-flush();
 `;
 
 /** One trim unit: a go-build entry, an npm index bucket, or an npm content file. */
@@ -1379,11 +1424,16 @@ export interface TrimHelperOptions {
   maxUnits?: number;
   /** Epoch ms after which no pass starts; a running one stops at its own budget. */
   deadline?: number;
+  /** Test seam only: the listing creates `<sync>.bucket` before it opens each npm bucket and
+   *  waits up to 10 s for `<sync>.go`, so a test can swap the bucket after its `lstat`. */
+  sync?: string;
 }
 
-/** Spawn one trim helper pass with `input` on stdin; resolve its exit status and stdout. The
- *  deadline and the no-kill caveat are {@link runHelper}'s; the stdout read back is capped. */
-async function runTrimHelper(
+/** Spawn one streaming helper pass (the trim helpers here, the run-process helper in
+ *  run-procs.ts) with `input` on stdin; resolve its exit status and stdout. The deadline and the
+ *  no-kill caveat are {@link runHelper}'s; the stdout read back is capped. It runs in `/`, so the
+ *  helper's own working directory is inside no run's tree. */
+export async function runAgentHelper(
   wrap: CommandWrapper,
   script: string,
   args: readonly string[],
@@ -1395,6 +1445,7 @@ async function runTrimHelper(
     let child: ChildProcess;
     try {
       child = spawn(wrapped.command, wrapped.args, {
+        cwd: "/",
         env: { PATH: "/usr/local/bin:/usr/bin:/bin" },
         stdio: ["pipe", "pipe", "ignore"],
       });
@@ -1435,13 +1486,61 @@ async function runTrimHelper(
   });
 }
 
-/** The helper's `H` summary line, or undefined when it printed none. */
+/**
+ * The helper's `H` summary: exactly one `H\t<json object>` line, and it is the LAST line. Anything
+ * else (none, two, one followed by more output, JSON that is not an object) is undefined: the pass
+ * is then a failed pass, never a throw that drops what the caller already accounted for.
+ */
 function summaryOf(stdout: string): Record<string, unknown> | undefined {
-  for (const line of stdout.split("\n")) {
-    if (line.startsWith("H\t")) return JSON.parse(line.slice(2)) as Record<string, unknown>;
+  const lines = stdout.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  const last = lines.length - 1;
+  if (last < 0 || !lines[last]!.startsWith("H\t")) return undefined;
+  for (let i = 0; i < last; i++) if (lines[i]!.startsWith("H")) return undefined;
+  try {
+    const v: unknown = JSON.parse(lines[last]!.slice(2));
+    return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
   }
-  return undefined;
 }
+
+/** Whether `s` holds a C0 control character or DEL (the helper never prints such a name; see
+ *  TRIM_PRELUDE). */
+function hasControl(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x20 || c === 0x7f) return true;
+  }
+  return false;
+}
+
+/** One relpath segment the eviction may act on: non-empty, not `.`/`..`, no `/`, no control. */
+function goodSegment(s: string): boolean {
+  return s !== "" && s !== "." && s !== ".." && !s.includes("/") && !hasControl(s);
+}
+
+/** A `.cache/go-build` unit's relpath: `<top>/<name>`, exactly two good segments. */
+function isGoUnitRel(rel: string): boolean {
+  const p = rel.split("/");
+  return p.length === 2 && p.every(goodSegment);
+}
+
+/** An npm index bucket's relpath: `index-v5/` then one to three good segments (cacache writes
+ *  `index-v5/<xx>/<yy>/<bucket>`; the helper descends no deeper). */
+function isNpmBucketRel(rel: string): boolean {
+  const p = rel.split("/");
+  return p[0] === "index-v5" && p.length >= 2 && p.length <= 4 && p.every(goodSegment);
+}
+
+/** An npm content file's relpath: `content-v2/<algo>/<xx>/<yy>/<rest>`, five good segments. */
+function isNpmContentRel(rel: string): boolean {
+  const p = rel.split("/");
+  return p[0] === "content-v2" && p.length === 5 && p.every(goodSegment);
+}
+
+const NS_RE = /^[0-9]+$/;
+const isBytes = (s: string | undefined): boolean => s !== undefined && /^[0-9]+$/.test(s) && Number.isSafeInteger(Number(s));
 
 function assertTrimmable(home: string, rel: string, caller: string): asserts rel is TrimmableCache {
   if (!path.isAbsolute(home)) throw new Error(`${caller}: refusing non-absolute HOME ${home}`);
@@ -1451,17 +1550,20 @@ function assertTrimmable(home: string, rel: string, caller: string): asserts rel
 }
 
 /**
- * Run the LIST pass over `rel` as each wrapper and hand each pass's stdout to `onPass`. A pass
- * that finds the cache absent (2) or refuses a symlinked component (3) contributes nothing; any
- * other non-zero status, a failed helper or a missing summary makes the result partial.
+ * Run the LIST pass over `rel` as each wrapper. A pass that finds the cache absent (2) or refuses a
+ * symlinked component (3) contributes nothing. Every other pass is parsed WHOLE by `parse` before
+ * anything is merged: a pass whose output has any line `parse` rejects (a malformed record, a
+ * relpath of the wrong shape), a missing or duplicated summary, a non-zero status or a failed
+ * helper contributes nothing and makes the result partial.
  */
-async function listPasses(
+async function listPasses<T>(
   home: string,
   rel: TrimmableCache,
   kind: "go" | "npm",
   needBytes: number,
   opts: TrimHelperOptions,
-  onPass: (stdout: string, index: number) => void,
+  parse: (lines: readonly string[], index: number) => T | undefined,
+  merge: (parsed: T) => void,
 ): Promise<{ partial: boolean }> {
   const wrappers = opts.wrappers ?? agentWrappers("measure");
   let partial = false;
@@ -1480,22 +1582,25 @@ async function listPasses(
       String(opts.maxEntries ?? TRIM_LIST_MAX_ENTRIES),
       String(opts.maxUnits ?? TRIM_LIST_MAX_UNITS),
       String(budgetMs),
+      ...(opts.sync ? [opts.sync] : []),
     ];
     let result;
     try {
-      result = await runTrimHelper(wrap, TRIM_LIST_SCRIPT, args, timeout);
+      result = await runAgentHelper(wrap, TRIM_LIST_SCRIPT, args, timeout);
     } catch {
       partial = true;
       continue;
     }
     if (result.code === 2 || result.code === 3) continue;
     const summary = result.code === 0 ? summaryOf(result.stdout) : undefined;
-    if (!summary) {
+    const lines = result.stdout.split("\n").filter((l) => l !== "");
+    const parsed = summary ? parse(lines.slice(0, -1), index) : undefined;
+    if (!summary || parsed === undefined) {
       partial = true;
       continue;
     }
-    if (summary.truncated === true) partial = true;
-    onPass(result.stdout, index);
+    if (summary.truncated !== false) partial = true;
+    merge(parsed);
   }
   return { partial };
 }
@@ -1520,7 +1625,8 @@ const byMtime = (a: CacheUnit, b: CacheUnit): number => {
  * PRD #1809 D4: list `.cache/go-build`'s oldest units (see {@link TRIM_LIST_SCRIPT}, kind `go`)
  * whose bytes reach `needBytes`, merged across the agent uids and sorted oldest-mtime first.
  * `truncated` when some pass ran out of budget or failed: the units are then the oldest of what
- * was seen, which is still safe to evict, just not globally oldest.
+ * was seen, which is still safe to evict, just not globally oldest. A pass with any malformed line
+ * (see {@link listPasses}) contributes no unit at all.
  */
 export async function listGoBuildUnits(
   home: string,
@@ -1530,14 +1636,36 @@ export async function listGoBuildUnits(
   const rel = ".cache/go-build";
   assertTrimmable(home, rel, "listGoBuildUnits");
   const byRel = new Map<string, CacheUnit>();
-  const { partial } = await listPasses(home, rel, "go", needBytes, opts, (stdout, index) => {
-    for (const line of stdout.split("\n")) {
-      const f = line.split("\t");
-      if (f[0] !== "U" || f.length !== 5) continue;
-      mergeUnit(byRel, { mtimeNs: f[1]!, type: f[2] === "d" ? "d" : "f", bytes: Number(f[3]), rel: f[4]!, seenBy: [index] }, index);
-    }
-  });
+  const { partial } = await listPasses(
+    home,
+    rel,
+    "go",
+    needBytes,
+    opts,
+    (lines, index) => {
+      const units: CacheUnit[] = [];
+      for (const line of lines) {
+        const f = line.split("\t");
+        if (f[0] !== "U" || f.length !== 5 || !NS_RE.test(f[1]!) || (f[2] !== "f" && f[2] !== "d") || !isBytes(f[3])) return undefined;
+        if (!isGoUnitRel(f[4]!)) return undefined;
+        units.push({ mtimeNs: f[1]!, type: f[2], bytes: Number(f[3]), rel: f[4]!, seenBy: [index] });
+      }
+      return { units, index };
+    },
+    ({ units, index }) => {
+      for (const u of units) mergeUnit(byRel, u, index);
+    },
+  );
   return { units: [...byRel.values()].sort(byMtime), truncated: partial };
+}
+
+/** One parsed npm listing pass. */
+interface NpmPass {
+  index: number;
+  buckets: NpmBucket[];
+  contents: CacheUnit[];
+  opened: string[];
+  unreadable: string[];
 }
 
 /**
@@ -1545,6 +1673,8 @@ export async function listGoBuildUnits(
  * and content files (see {@link TRIM_LIST_SCRIPT}, kind `npm`), merged across the agent uids.
  * `complete` only when no pass was partial and every index directory and bucket some uid could
  * not read was read by another: content may be judged unreferenced only against a complete index.
+ * A pass with any malformed line (a relpath of the wrong shape, a bucket listed twice, an unknown
+ * record) is a failed pass (see {@link listPasses}), so the listing is then not complete.
  */
 export async function listNpmCache(home: string, opts: TrimHelperOptions = {}): Promise<NpmCacheListing> {
   const rel = ".npm/_cacache";
@@ -1553,21 +1683,43 @@ export async function listNpmCache(home: string, opts: TrimHelperOptions = {}): 
   const contents = new Map<string, CacheUnit>();
   const opened = new Set<string>();
   const unreadable = new Set<string>();
-  const { partial } = await listPasses(home, rel, "npm", 0, opts, (stdout, index) => {
-    for (const line of stdout.split("\n")) {
-      const f = line.split("\t");
-      if (f[0] === "B" && f.length === 5) {
-        const integrities = f[4] ? f[4].split(" ").filter(Boolean) : [];
-        mergeUnit(buckets, { mtimeNs: f[1]!, bytes: Number(f[2]), rel: f[3]!, type: "f", seenBy: [index], integrities }, index);
-      } else if (f[0] === "C" && f.length === 4) {
-        mergeUnit(contents, { mtimeNs: f[1]!, bytes: Number(f[2]), rel: f[3]!, type: "f", seenBy: [index] }, index);
-      } else if (f[0] === "D" && f.length === 2) {
-        opened.add(f[1]!);
-      } else if ((f[0] === "E" || f[0] === "X") && f.length === 2) {
-        unreadable.add(f[1]!);
+  const { partial } = await listPasses(
+    home,
+    rel,
+    "npm",
+    0,
+    opts,
+    (lines, index): NpmPass | undefined => {
+      const pass: NpmPass = { index, buckets: [], contents: [], opened: [], unreadable: [] };
+      const seen = new Set<string>();
+      for (const line of lines) {
+        const f = line.split("\t");
+        if (f[0] === "B" && f.length === 5 && NS_RE.test(f[1]!) && isBytes(f[2]) && isNpmBucketRel(f[3]!)) {
+          if (seen.has(f[3]!)) return undefined;
+          seen.add(f[3]!);
+          const integrities = f[4] ? f[4].split(" ").filter(Boolean) : [];
+          pass.buckets.push({ mtimeNs: f[1]!, bytes: Number(f[2]), rel: f[3]!, type: "f", seenBy: [index], integrities });
+        } else if (f[0] === "C" && f.length === 4 && NS_RE.test(f[1]!) && isBytes(f[2]) && isNpmContentRel(f[3]!)) {
+          if (seen.has(f[3]!)) return undefined;
+          seen.add(f[3]!);
+          pass.contents.push({ mtimeNs: f[1]!, bytes: Number(f[2]), rel: f[3]!, type: "f", seenBy: [index] });
+        } else if (f[0] === "D" && f.length === 2 && f[1] !== "" && !hasControl(f[1]!)) {
+          pass.opened.push(f[1]!);
+        } else if ((f[0] === "E" || f[0] === "X") && f.length === 2 && f[1] !== "") {
+          pass.unreadable.push(f[1]!);
+        } else {
+          return undefined;
+        }
       }
-    }
-  });
+      return pass;
+    },
+    (pass) => {
+      for (const b of pass.buckets) mergeUnit(buckets, b, pass.index);
+      for (const c of pass.contents) mergeUnit(contents, c, pass.index);
+      for (const r of pass.opened) opened.add(r);
+      for (const r of pass.unreadable) unreadable.add(r);
+    },
+  );
   const unresolved = [...unreadable].some((r) => !opened.has(r) && !buckets.has(r));
   return {
     buckets: [...buckets.values()].sort(byMtime),
@@ -1580,8 +1732,9 @@ export async function listNpmCache(home: string, opts: TrimHelperOptions = {}): 
  * PRD #1809 D4: evict `units` (relative to the cache root `rel`) through the EVICT pass (see
  * {@link TRIM_EVICT_SCRIPT}): each uid gets only the units its own listing saw and that no
  * earlier uid removed. Resolves the set of units actually removed; a unit whose mtime or type
- * changed since the listing, or that is gone, is simply not in it. Never throws for a pass that
- * failed: what it did not remove stays.
+ * changed since the listing, or that is gone, is simply not in it. Only an `R` line naming a unit
+ * this pass was given counts as removed. Never throws for a pass that failed: what it did not
+ * remove stays, and what earlier passes removed is still reported.
  */
 export async function evictCacheUnits(
   home: string,
@@ -1590,12 +1743,13 @@ export async function evictCacheUnits(
   opts: TrimHelperOptions = {},
 ): Promise<{ removed: Set<string>; kept: number; failed: number }> {
   assertTrimmable(home, rel, "evictCacheUnits");
+  const valid = rel === ".cache/go-build" ? isGoUnitRel : (r: string) => isNpmBucketRel(r) || isNpmContentRel(r);
   const wrappers = opts.wrappers ?? agentWrappers("measure");
   const removed = new Set<string>();
   let kept = 0;
   let failed = 0;
   for (const [index, wrap] of wrappers.entries()) {
-    const mine = units.filter((u) => u.seenBy.includes(index) && !removed.has(u.rel));
+    const mine = units.filter((u) => u.seenBy.includes(index) && !removed.has(u.rel) && valid(u.rel) && NS_RE.test(u.mtimeNs));
     if (mine.length === 0) continue;
     const timeout = passTimeout(opts.deadline);
     if (timeout <= 0) break;
@@ -1605,16 +1759,17 @@ export async function evictCacheUnits(
     const input = mine.map((u) => `${u.type}\t${u.mtimeNs}\t${u.rel}`).join("\n") + "\n";
     let result;
     try {
-      result = await runTrimHelper(wrap, TRIM_EVICT_SCRIPT, [home, rel, String(maxEntries), String(budgetMs)], timeout, input);
+      result = await runAgentHelper(wrap, TRIM_EVICT_SCRIPT, [home, rel, String(maxEntries), String(budgetMs)], timeout, input);
     } catch {
       continue;
     }
+    const given = new Set(mine.map((u) => u.rel));
     for (const line of result.stdout.split("\n")) {
-      if (line.startsWith("R\t")) removed.add(line.slice(2));
+      if (line.startsWith("R\t") && given.has(line.slice(2))) removed.add(line.slice(2));
     }
     const summary = summaryOf(result.stdout);
-    kept = typeof summary?.kept === "number" ? summary.kept : kept;
-    failed = typeof summary?.failed === "number" ? summary.failed : failed;
+    if (typeof summary?.kept === "number") kept += summary.kept;
+    if (typeof summary?.failed === "number") failed += summary.failed;
   }
   return { removed, kept, failed };
 }

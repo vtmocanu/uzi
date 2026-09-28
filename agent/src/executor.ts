@@ -470,7 +470,8 @@ export interface RunContext {
   /**
    * PRD #1809 D4 (soft layer): called by the executor at every implement turn boundary, before
    * the next turn is driven. `processAlive` is the executor's quiet-point probe (true while any
-   * process of the run is alive, from its own process tracking); the runner's cache governor calls
+   * process of the run is alive: its CLI process groups, plus every process attributed to the run
+   * by HOME or working directory, run-procs.ts; unknown is alive); the runner's cache governor calls
    * it only when the run's caches are over its cap, trims them at a quiet point, and resolves
    * "park" when the run stays over the cap: the executor then throws a preventive
    * DiskParkSignal (cache-cap.ts) and the runner parks the run so its caches are dropped. Absent on the
@@ -778,6 +779,14 @@ export interface Executor {
    * it; the SDK executor also self-reaps in its own run() finally.
    */
   killAgentTree?(): void;
+  /**
+   * PRD #1809 D4: SIGKILL the run's processes that {@link killAgentTree}'s process-group reap
+   * misses (the pinned Claude CLI runs every Bash command detached, in its own session and group):
+   * every live process attributed to the run by `HOME` or working directory (run-procs.ts). The
+   * mid-run disk parks await it right after killAgentTree. Never rejects. Absent on the stub/test
+   * and Codex executors.
+   */
+  reapAttributedProcesses?(): Promise<void>;
   /** M3 (PRD #1171): a Codex-selected executor supplies this outer safety facade;
    * absence preserves Claude/stub callers (they take the literal legacy killAgentTree branch). */
   safety?: CodexExecutionSafety;

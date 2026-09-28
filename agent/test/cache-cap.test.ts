@@ -273,3 +273,117 @@ describe("hard layer: the per-tick pressure stop", () => {
     assert.strictEqual(harness({ config: { capEnabled: false } }).gov.enabled, true);
   });
 });
+
+describe("hard layer: a stop is never wedged, and never lost to the soft park (PRD #1809 D4 rework)", () => {
+  it("a hard stop requested while the soft boundary measures resolves the boundary to continue, never a (preventive) park (N1)", async () => {
+    const h = harness();
+    watch(h, "r1", Math.ceil(CAP * 1.5)); // runaway: a live process would park it at once
+    let stopAsked: () => void = () => {};
+    const asked = new Promise<void>((r) => (stopAsked = r));
+    h.gov.register("r1", {
+      home: "/data/agent-home/r1",
+      requestStop: () => {
+        h.stops.push("r1");
+        stopAsked();
+      },
+    });
+    await h.gov.boundary("r1", quiet); // stoppable; trimmed to the low-water mark
+    h.sizes.set("/data/agent-home/r1", Math.ceil(CAP * 1.5));
+    const verdict = h.gov.boundary("r1", async () => {
+      // The volume crosses the hard threshold while this boundary is between measure and trim.
+      h.gov.observe(0.95);
+      await asked;
+      return true;
+    });
+    assert.strictEqual(await verdict, "continue", "the pending stop parks it, COUNTED");
+    assert.deepStrictEqual(h.stops, ["r1"]);
+  });
+
+  it("a stopped run that leaves its implement loop without a disk park releases the stop, and is no candidate any more (N4)", async () => {
+    const h = harness();
+    watch(h, "a", 3 * GIB);
+    watch(h, "b", 2 * GIB);
+    await h.gov.boundary("a", quiet);
+    await h.gov.boundary("b", quiet);
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.stops, ["a"]);
+    h.clock.now += 1_000;
+    h.gov.leftLoop("a", false); // it finished its last turn: finalizing, not parking
+    h.clock.now += 1_000;
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.stops, ["a", "b"], "the hard layer is not wedged on a stop that will never park");
+  });
+
+  it("a finalizing run is never stopped (N4)", async () => {
+    const h = harness();
+    watch(h, "a", 3 * GIB);
+    await h.gov.boundary("a", quiet);
+    h.gov.leftLoop("a", false);
+    h.gov.observe(0.99);
+    await settle();
+    assert.deepStrictEqual(h.stops, []);
+  });
+
+  it("a run that left for its disk park keeps the stop until its flight ends", async () => {
+    const h = harness();
+    watch(h, "a", 3 * GIB);
+    watch(h, "b", 2 * GIB);
+    await h.gov.boundary("a", quiet);
+    await h.gov.boundary("b", quiet);
+    h.gov.observe(0.9);
+    await settle();
+    h.gov.leftLoop("a", true);
+    h.clock.now += 120_000;
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.stops, ["a"], "still parking: one stop at a time");
+  });
+
+  it("a stop that has not produced a park within 10 minutes is given up (BLOCKING 2)", async () => {
+    const h = harness();
+    watch(h, "a", 3 * GIB);
+    watch(h, "b", 2 * GIB);
+    await h.gov.boundary("a", quiet);
+    await h.gov.boundary("b", quiet);
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.stops, ["a"]);
+    h.clock.now += 9 * 60_000;
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.stops, ["a"], "still inside the timeout");
+    h.clock.now += 60_000;
+    h.gov.observe(0.9); // gives the stop up; this sample predates the release
+    await settle();
+    h.clock.now += 1_000;
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.stops, ["a", "b"], "the stuck run is not asked again; the next largest is stopped");
+  });
+
+  it("while over the threshold with nothing to stop, the candidates are measured at most once a minute (N5)", async () => {
+    const h = harness();
+    let measures = 0;
+    watch(h, "empty", 0);
+    await h.gov.boundary("empty", quiet);
+    const gov = h.gov as unknown as { measure: (home: string, o: { deadline: number }) => Promise<unknown> };
+    const inner = gov.measure;
+    gov.measure = async (home, o) => {
+      measures++;
+      return await inner(home, o);
+    };
+    for (let i = 0; i < 6; i++) {
+      h.gov.observe(0.95);
+      await settle();
+      h.clock.now += 5_000;
+    }
+    assert.strictEqual(measures, 1, "six ticks in 30 s: one selection");
+    h.clock.now += 60_000;
+    h.gov.observe(0.95);
+    await settle();
+    assert.strictEqual(measures, 2);
+    assert.deepStrictEqual(h.stops, []);
+  });
+});

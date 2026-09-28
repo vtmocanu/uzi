@@ -1038,6 +1038,9 @@ interface RunFlight {
   /** PRD #1809 D6: what a pre-clone park was taken for (its feed/log wording), set with
    *  `preClonePark`. Undefined reads as the forge-unreachable park. */
   preCloneParkReason?: string;
+  /** PRD #1809 D4 (N3): a mid-run disk park already dropped the run's caches before its capture,
+   *  so the finally's park drop only finishes what that one could not. */
+  cachesDroppedEarly?: boolean;
   /** Retain the only copy of unverified recovery work; never guard non-filesystem cleanup. */
   preserveRecoveryClone: boolean;
   /** Issue #1600: the budget off the latest REFUSED wall park's 409, held until the executor
@@ -2064,7 +2067,12 @@ export class RunRunner {
           batcher,
           reportState,
           runLog,
-          { kind: "data_volume_full", preventive: err instanceof DiskParkSignal && err.preventive },
+          // N1: a hard stop requested while the soft boundary measured or trimmed makes the park
+          // COUNTED, whatever the soft layer concluded: the sticky `disk` mode says it was asked.
+          {
+            kind: "data_volume_full",
+            preventive: err instanceof DiskParkSignal && err.preventive && steering.getPauseMode() !== "disk",
+          },
         );
       } else if (err instanceof TransientRecoveryError) {
         // Retry capture without abandoning the live claim. Only verified local
@@ -2603,7 +2611,9 @@ export class RunRunner {
       // runs only (no `executor.safety`): a Codex run's caches sit on its own per-run volume
       // (PRD #1809, Codex caches). Never throws: dropRunCaches logs and swallows its failures.
       if (runHome && preserveResumeArtifacts && flight.parked && !executor.safety) {
-        await dropRunCaches(runHome, runLog);
+        // A disk park already dropped them before its capture (N3): this pass only finishes what
+        // that one could not, and says nothing when there was nothing left.
+        await dropRunCaches(runHome, runLog, flight.cachesDroppedEarly ? { quietNoop: true } : {});
       }
       if (flight.preClonePark) {
         // PRD #1392 M2: a pre-clone forge-unreachable park. It preserves HOME/session only when a
@@ -7345,9 +7355,17 @@ export class RunRunner {
         )
       : undefined;
     let result: ExecutorResult;
+    let diskParked = false;
     try {
       result = await executor.run(ctx);
+    } catch (err) {
+      diskParked = err instanceof DiskParkSignal || (err instanceof PauseNowSignal && steering.getPauseMode() === "disk");
+      throw err;
     } finally {
+      // PRD #1809 D4 (N4): the run has left its implement loop, so it is no longer a hard-stop
+      // candidate (a finalizing run is not stoppable). A stop that it never turned into a disk park
+      // is released, so the hard layer can stop another run.
+      this.diskGovernor?.leftLoop(flight.runId, diskParked);
       await ticker?.stop();
       await runningReportChain;
     }
@@ -9288,6 +9306,20 @@ export class RunRunner {
     // data_volume_full park.
     const disk = cause.kind === "data_volume_full" ? cause : undefined;
     executor.killAgentTree?.();
+    if (disk) {
+      // The group reap above misses what the agent backgrounded: the pinned CLI runs every Bash
+      // command detached, in its own session and process group. Kill every process attributed to
+      // the run by HOME or working directory too (run-procs.ts), before anything is captured.
+      await executor.reapAttributedProcesses?.();
+      // N3: drop the rebuildable caches NOW, before the capture and fetch-back below: they are not
+      // part of the capture, and on a truly full volume the capture's own writes need the space.
+      // Claude runs only (a Codex run's caches sit on its own volume). The finally's park drop then
+      // finds them gone. Never throws.
+      if (flight.runHome && !executor.safety) {
+        await dropRunCaches(flight.runHome, runLog, { message: "run caches dropped before the disk park's capture" });
+        flight.cachesDroppedEarly = true;
+      }
+    }
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     let capture: { verified: boolean; published: boolean } | undefined;

@@ -8,6 +8,7 @@ import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import { WorkerClient } from "../src/client.js";
 import type { StateAck, StateRequest } from "../src/protocol.js";
 import { type CacheCapConfig, DiskGovernor, DiskParkSignal } from "../src/cache-cap.js";
+import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { nullLogger } from "./helpers.js";
 import { TOKEN, api, baseUrl, client, fakeGitlab, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
 
@@ -305,6 +306,161 @@ describe("RunRunner — PRD #1809 D4 both layers disabled", () => {
       assert.strictEqual(offered, undefined, "no cap boundary is offered to the executor");
       assert.deepStrictEqual(parks(runId), [], "and nothing parked the run");
       assert.ok(!api.states.some((s) => s.runId === runId && s.body.recovery_cause !== undefined));
+    });
+  });
+});
+
+/** Count the runner's custody settles, and snapshot the HOME's caches when the capture runs. */
+function instrument(runner: RunRunner, home: () => string): { settles: () => number; cachesAtCapture: () => boolean[] | undefined } {
+  const r = runner as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+  let settles = 0;
+  let atCapture: boolean[] | undefined;
+  const settle = r.reapThenSettleRecoveryGeneration!.bind(runner);
+  r.reapThenSettleRecoveryGeneration = async (...a) => {
+    settles++;
+    return await settle(...a);
+  };
+  const capture = r.captureRecoveryRestorePoint!.bind(runner);
+  r.captureRecoveryRestorePoint = async (...a) => {
+    atCapture ??= CACHES.map((rel) => fs.existsSync(path.join(home(), rel)));
+    return await capture(...a);
+  };
+  return { settles: () => settles, cachesAtCapture: () => atCapture };
+}
+
+describe("RunRunner — PRD #1809 D4 the mid-run disk park's reap, cache drop and custody", () => {
+  it("reaps the attributed processes right after the group reap, drops the caches BEFORE the capture (N3), and keeps custody (N2)", async (t) => {
+    if (!HAS_PROC_FD) return t.skip("no descriptor-pinned walk on this host: the cache drop refuses here by design");
+    await withHomeRoot(async (homeRoot) => {
+      client.protocolFeatures = [FEATURE, FENCE];
+      const probe = governor();
+      const order: string[] = [];
+      let home = "";
+      const factory: ExecutorFactory = (id) => {
+        home = path.join(homeRoot, id);
+        probe.sizes.set(home, CAP + GIB);
+        return {
+          homeDir: home,
+          executor: {
+            killAgentTree: () => {
+              order.push("group-reap");
+            },
+            reapAttributedProcesses: async () => {
+              order.push("attributed-reap");
+            },
+            run: async (ctx: RunContext): Promise<ExecutorResult> => {
+              seedHome(home);
+              for (let turn = 0; turn < 10; turn++) {
+                if ((await ctx.cacheCapBoundary?.(async () => true)) === "park") throw new DiskParkSignal(true);
+              }
+              throw new Error("the cap never parked the run");
+            },
+          },
+        };
+      };
+      const { gitlab } = fakeGitlab();
+      const runId = "18090000-0000-4000-8000-00000000d405";
+      const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { diskGovernor: probe.gov });
+      const spy = instrument(runner, () => home);
+      await runner.execute(gitlabClaim(1814, { run_id: runId, claim_generation: 3 }));
+      assert.strictEqual(parks(runId).length, 1, "parked");
+      const first = order.indexOf("attributed-reap");
+      assert.ok(first > 0 && order[first - 1] === "group-reap", `the attributed reap follows the group reap: ${JSON.stringify(order)}`);
+      assert.deepStrictEqual(spy.cachesAtCapture(), [false, false, false], "the caches were gone before the capture ran");
+      assert.strictEqual(spy.settles(), 0, "the disk park keeps the custody hold: no settle");
+    });
+  });
+
+  it("control: a transient recovery park DOES settle, so the custody spy above is live", async () => {
+    await withHomeRoot(async (homeRoot) => {
+      client.protocolFeatures = [FEATURE, FENCE];
+      const factory: ExecutorFactory = (id) => ({
+        homeDir: path.join(homeRoot, id),
+        executor: {
+          run: async (): Promise<ExecutorResult> => {
+            throw new TransientRecoveryError();
+          },
+        },
+      });
+      const { gitlab } = fakeGitlab();
+      const runId = "18090000-0000-4000-8000-00000000d406";
+      const runner = runnerWith(factory, gitlab, undefined, nullLogger());
+      const spy = instrument(runner, () => homeRoot);
+      await runner.execute(gitlabClaim(1815, { run_id: runId, claim_generation: 3 }));
+      assert.strictEqual(parks(runId).length, 1, "parked");
+      assert.ok(spy.settles() >= 1, "a transient park settles its generation");
+    });
+  });
+
+  it("a soft park that races a hard stop is COUNTED (N1)", async () => {
+    await withHomeRoot(async (homeRoot) => {
+      client.protocolFeatures = [FEATURE, FENCE];
+      const probe = governor();
+      const factory: ExecutorFactory = (id) => {
+        const home = path.join(homeRoot, id);
+        probe.sizes.set(home, 3 * GIB);
+        return {
+          homeDir: home,
+          executor: {
+            run: async (ctx: RunContext): Promise<ExecutorResult> => {
+              assert.strictEqual(await ctx.cacheCapBoundary?.(async () => false), "continue");
+              // The volume crosses the hard threshold; the stop lands on this (now stoppable) run.
+              const stopped = new Promise<void>((resolve) => ctx.signal?.addEventListener("abort", () => resolve(), { once: true }));
+              probe.gov.observe(0.95);
+              await stopped;
+              // ...but this executor's soft layer had concluded "park" in the same window.
+              throw new DiskParkSignal(true);
+            },
+          },
+        };
+      };
+      const { gitlab } = fakeGitlab();
+      const runId = "18090000-0000-4000-8000-00000000d407";
+      await runnerWith(factory, gitlab, undefined, nullLogger(), { diskGovernor: probe.gov }).execute(
+        gitlabClaim(1816, { run_id: runId, claim_generation: 3 }),
+      );
+      const [park] = parks(runId);
+      assert.strictEqual(park?.recovery_cause, "data_volume_full");
+      assert.strictEqual("disk_park_preventive" in (park ?? {}), false, "the stop makes it a COUNTED park");
+    });
+  });
+
+  it("a stopped run that ends another way releases the hard layer for the next run before its flight ends (N4)", async () => {
+    await withHomeRoot(async (homeRoot) => {
+      client.protocolFeatures = [FEATURE, FENCE];
+      const probe = governor();
+      let otherStopped = 0;
+      probe.sizes.set("/other/home", GIB);
+      probe.gov.register("other-run", { home: "/other/home", requestStop: () => otherStopped++ });
+      await probe.gov.boundary("other-run", async () => false);
+      let stoppedWhileFinalizing = -1;
+      const factory: ExecutorFactory = (id) => {
+        const home = path.join(homeRoot, id);
+        probe.sizes.set(home, 3 * GIB);
+        return {
+          homeDir: home,
+          executor: {
+            run: async (ctx: RunContext): Promise<ExecutorResult> => {
+              await ctx.cacheCapBoundary?.(async () => false);
+              probe.gov.observe(0.95); // stops THIS run (the largest)
+              await new Promise((r) => setTimeout(r, 10));
+              // It leaves its loop another way (here a failure), and a fresh sample still over the
+              // threshold arrives while the flight's catch reports it, before the flight ends.
+              setTimeout(() => {
+                probe.gov.observe(0.95);
+                setTimeout(() => (stoppedWhileFinalizing = otherStopped), 5);
+              }, 0);
+              throw new Error("the run ended another way");
+            },
+          },
+        };
+      };
+      const { gitlab } = fakeGitlab();
+      const runId = "18090000-0000-4000-8000-00000000d408";
+      await runnerWith(factory, gitlab, undefined, nullLogger(), { diskGovernor: probe.gov }).execute(
+        gitlabClaim(1817, { run_id: runId, claim_generation: 3 }),
+      );
+      assert.strictEqual(stoppedWhileFinalizing, 1, "the other run was stopped while the first was still finalizing");
     });
   });
 });
