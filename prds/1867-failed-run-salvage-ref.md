@@ -286,7 +286,8 @@ All of it is in one repo. M1 and M2 touch disjoint files. A single uzi run execu
 
 - With `UZI_SALVAGE_FORGES` empty and no existing `run_salvage` rows, nothing changes
   anywhere: no enqueue, no broker call. A row that already exists from before the setting
-  was cleared still runs its create/expire lifecycle to completion (decision 0).
+  was cleared still reaches a terminal state: a created copy still expires, and a pending
+  row settles `disabled` after a CAS delete of any unrecorded copy (decision 0).
 - On an enabled forge:
   - an eligible failed run whose checkpoint tip is still verified live under the branch
     checkpoint ref or its recovery ref gets a confirmed `refs/uzi-salvage/<run-id>`, and the
@@ -325,8 +326,9 @@ All of it is in one repo. M1 and M2 touch disjoint files. A single uzi run execu
   redundant for that window. Accepted, not eliminated — see the Decision Log and
   [ADR-1867](../adr/1867-failed-run-salvage-ref.md)'s "distinct value" section.
 - **No hold, no copy:** a failed run with no open custody hold has its branch ref CAS-deleted
-  by #1810 at the terminal transition, before the next sweep tick can enqueue it, so salvage
-  almost always settles it `unavailable` and saves nothing. Salvage produces a copy only for
+  by #1810 soon after the terminal transition (a background settle, or the retention
+  reconcile in the same sweep), usually before the salvage pass on a later tick tries the
+  create, so salvage almost always settles it `unavailable` and saves nothing. Salvage produces a copy only for
   held runs (and surviving pre-migration refs); for those, its own value is the window
   between the hold settling and the copy's expiry. If a hold stays open longer than the
   retention, the copy expires while #1810 still retains the tip and only duplicated
