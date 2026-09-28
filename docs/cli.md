@@ -889,18 +889,24 @@ SALVAGE_EXPIRES  2026-09-29T12:00:00Z
 SALVAGE_FETCH    git fetch origin refs/uzi-salvage/<run-id>
 ```
 
-The other states read `pending` (the copy is being made), `unavailable` (the published
-checkpoint was no longer on the forge), `refused` (the salvage ref already pointed at a
-different commit), `failed` (making the copy kept failing), `skipped_secret` (not saved:
-the run failed on a secret-scan block), `expired` (the copy was removed) and `disabled`
-(salvage was turned off for that forge). The same values are the run's `salvage_state`,
+The other states read `pending` (the copy is being made), `unavailable` (not saved: the
+published checkpoint was no longer at its recorded tip on the forge, either gone or moved),
+`refused` (the salvage ref already pointed at a different commit), `failed` (making the
+copy kept failing), `skipped_secret` (not saved: the run failed on a secret-scan block),
+`expired` (the copy was removed) and `disabled` (not saved: salvage was turned off for
+that forge before a copy was made). `SALVAGE_REF` and `SALVAGE_FETCH` print only for a
+ref of the exact form `refs/uzi-salvage/<run-id>` naming this run. The same values are the run's `salvage_state`,
 `salvage_ref`, `salvage_tip`, `salvage_expires_at` and `salvage_last_error` fields
 (`--json`, or `uzi run get <run-id> --field salvage_state`); all are null without a
 salvage record.
 
-While a failed run has a live salvage copy (or one being made), removing its repo or forge
-connection is refused with a 409 that names each `refs/uzi-salvage/<run-id>`; retry after
-the copies expire.
+While a failed run has a live salvage copy (made, or still being made), removing its repo
+or forge connection is refused with a 409. The body lists each created
+`refs/uzi-salvage/<run-id>` in `salvage_refs`, each run whose copy is still `pending` by
+run id in `salvage_pending_runs` (a pending copy may already have its ref), and the total
+in `salvage_count`; the error text names the same refs and runs. The block lifts when the
+copies expire, or when a pending copy settles (into `promoted`, which then holds until it
+expires, or into a state that saved nothing); retry the removal after that.
 
 ## uzi handoff: ephemeral branch-scoped task runs
 

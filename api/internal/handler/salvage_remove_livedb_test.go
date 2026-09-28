@@ -119,9 +119,9 @@ type salvageConflictBody struct {
 }
 
 // assertSalvage409 checks a 409 carrying the salvage body for one run naming exactly
-// wantRefs (its created salvage ref) or, with none, the run whose salvage copy is still
-// being made. The branch-scoped checkpoint ref (#1810's) is never named.
-func assertSalvage409(t *testing.T, rec *httptest.ResponseRecorder, what string, run uuid.UUID, wantRefs ...string) {
+// wantRefs (its created salvage ref) and, when pending, the run whose salvage copy has not
+// settled yet. The branch-scoped checkpoint ref (#1810's) is never named.
+func assertSalvage409(t *testing.T, rec *httptest.ResponseRecorder, what string, run uuid.UUID, pending bool, wantRefs ...string) {
 	t.Helper()
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("%s = %d, want 409\nbody: %s", what, rec.Code, rec.Body.String())
@@ -131,10 +131,10 @@ func assertSalvage409(t *testing.T, rec *httptest.ResponseRecorder, what string,
 		t.Fatalf("%s: decode 409 body: %v\n%s", what, err, rec.Body.String())
 	}
 	wantPending := []string{}
-	if len(wantRefs) == 0 {
+	if pending {
 		wantPending = []string{run.String()}
-		if !strings.Contains(body.Error, "a salvage copy is being made for run "+run.String()) {
-			t.Fatalf("%s: error text %q must say a salvage copy is being made for run %s", what, body.Error, run)
+		if !strings.Contains(body.Error, "run "+run.String()+", copy pending") {
+			t.Fatalf("%s: error text %q must name pending run %s", what, body.Error, run)
 		}
 	}
 	if body.SalvageCount != 1 || strings.Join(body.SalvageRefs, "\n") != strings.Join(wantRefs, "\n") ||
@@ -146,11 +146,13 @@ func assertSalvage409(t *testing.T, rec *httptest.ResponseRecorder, what string,
 			t.Fatalf("%s: error text %q must name %q", what, body.Error, ref)
 		}
 	}
-	if !strings.Contains(body.Error, "checkpointed commits") || strings.Contains(body.Error, "more run") {
-		t.Fatalf("%s: error text %q must name the checkpointed commits and no further runs", what, body.Error)
+	if !strings.Contains(body.Error, "live salvage copies") || strings.Contains(body.Error, "more run") {
+		t.Fatalf("%s: error text %q must name the live salvage copies and no further runs", what, body.Error)
 	}
-	if strings.Contains(rec.Body.String(), "uzi-checkpoints") {
-		t.Fatalf("%s: the 409 must never name a branch checkpoint ref: %s", what, rec.Body.String())
+	for _, bad := range []string{"uzi-checkpoints", "recover"} {
+		if strings.Contains(rec.Body.String(), bad) {
+			t.Fatalf("%s: the 409 must never contain %q: %s", what, bad, rec.Body.String())
+		}
 	}
 }
 
@@ -167,7 +169,8 @@ func TestDeleteWithLiveSalvageIs409LiveDB(t *testing.T) {
 	}{
 		// Pending, nothing created yet: the run is named, never its branch checkpoint ref.
 		{"pending", "pending", false, func(uuid.UUID) []string { return nil }},
-		// A created salvage ref on a still-pending row names only that salvage ref.
+		// A created salvage ref on a still-pending row names that salvage ref and, by state,
+		// the run as pending (its copy has not settled yet).
 		{"created-pending", "pending", true, func(run uuid.UUID) []string { return []string{"refs/uzi-salvage/" + run.String()} }},
 		{"promoted", "promoted", true, func(run uuid.UUID) []string { return []string{"refs/uzi-salvage/" + run.String()} }},
 	}
@@ -177,9 +180,9 @@ func TestDeleteWithLiveSalvageIs409LiveDB(t *testing.T) {
 			f.salvage(run, repo, tc.state, tc.created)
 
 			rec := cookieReq(t, f.router, http.MethodDelete, "/api/repos/"+repo.String(), f.jwt, "")
-			assertSalvage409(t, rec, "DELETE repo", run, tc.refs(run)...)
+			assertSalvage409(t, rec, "DELETE repo", run, tc.state == "pending", tc.refs(run)...)
 			rec = cookieReq(t, f.router, http.MethodDelete, "/api/forge/connections/"+conn.String(), f.jwt, "")
-			assertSalvage409(t, rec, "DELETE connection", run, tc.refs(run)...)
+			assertSalvage409(t, rec, "DELETE connection", run, tc.state == "pending", tc.refs(run)...)
 
 			for _, c := range []struct {
 				table string
@@ -325,7 +328,7 @@ func TestDeleteRacingSalvageInsertIs409LiveDB(t *testing.T) {
 			case <-time.After(20 * time.Second):
 				t.Fatalf("the handler never returned after the sweep committed")
 			}
-			assertSalvage409(t, rec, "racing DELETE "+route, run)
+			assertSalvage409(t, rec, "racing DELETE "+route, run, true)
 			if !f.exists(table, anchor) || !f.exists("runs", run) || !f.exists("run_salvage", run) {
 				t.Fatalf("the %s, run and committed salvage row must all survive the raced 409", route)
 			}

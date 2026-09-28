@@ -652,8 +652,10 @@ uzi version
   `SALVAGE_EXPIRES`, `SALVAGE_ERROR` when set, and, when `promoted`, `SALVAGE_FETCH` with
   `git fetch origin refs/uzi-salvage/<run-id>`. A promoted copy means checkpointed commits
   saved: the last **published** checkpoint, which may be behind the run's final local work,
-  kept until it expires. Other states: `pending`, `unavailable`, `refused`, `failed`,
-  `skipped_secret` (not saved: the run failed on a secret-scan block), `expired`, `disabled`.
+  kept until it expires. Other states: `pending`, `unavailable` (not saved: the published
+  checkpoint was no longer at its recorded tip on the forge), `refused`, `failed`,
+  `skipped_secret` (not saved: the run failed on a secret-scan block), `expired`, `disabled`
+  (not saved: salvage was turned off for this forge before a copy was made).
   Read it as `--field salvage_state` / `salvage_ref`; all `salvage_*` fields are null without a
   record. The branch's own checkpoint ref is never a salvage ref.
 - `uzi run discard <run-id> --hold <hold-id> [--yes]` — discard ONE exact custody hold (a held

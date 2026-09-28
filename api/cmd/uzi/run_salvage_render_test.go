@@ -58,12 +58,12 @@ func TestRenderRunDetailSalvagePromoted(t *testing.T) {
 func TestRenderRunDetailSalvageStates(t *testing.T) {
 	for state, want := range map[string]string{
 		"pending":        "pending: a salvage copy of the last published checkpoint is being made",
-		"unavailable":    "unavailable: not saved: the run's published checkpoint was no longer on the forge",
+		"unavailable":    "unavailable: not saved: the published checkpoint was no longer at its recorded tip on the forge",
 		"refused":        "refused: not saved: the salvage ref already pointed at a different commit",
 		"failed":         "failed: not saved: making the salvage copy kept failing",
 		"skipped_secret": "skipped_secret: not saved: the run failed on a secret-scan block",
 		"expired":        "expired: the salvage copy expired and was removed from the forge",
-		"disabled":       "disabled: not kept: salvage was turned off for this forge; any copy was removed",
+		"disabled":       "disabled: not saved: salvage was turned off for this forge before a copy was made",
 	} {
 		out := renderDetail(t, salvageRun(state))
 		if !strings.Contains(out, want) {
@@ -106,12 +106,24 @@ func TestRenderRunDetailSalvageUntrusted(t *testing.T) {
 		t.Fatalf("an unknown state must print bare and sanitized:\n%q", out)
 	}
 
-	for _, bad := range []string{"refs/uzi-checkpoints/agent/issue-7", "refs/uzi-salvage/x; rm -rf ~", "refs/uzi-salvage/", "refs/heads/main"} {
+	// Only refs/uzi-salvage/<the run's own canonical lower-case uuid> is echoed, as the
+	// SALVAGE_REF row or as a fetch command. Reddening mutation: go back to a hex/dash charset
+	// check (the dash runs and the foreign id pass it), or drop the own-id comparison.
+	for _, bad := range []string{
+		"refs/uzi-checkpoints/agent/issue-7", "refs/uzi-salvage/x; rm -rf ~", "refs/uzi-salvage/", "refs/heads/main",
+		"refs/uzi-salvage/----", "refs/uzi-salvage/-", "refs/uzi-salvage/abc",
+		"refs/uzi-salvage/" + strings.ToUpper(salvageRunID),
+		"refs/uzi-salvage/{" + salvageRunID + "}",
+		"refs/uzi-salvage/1f5f6a2c-3d4e-4f60-8a7b-9c0d1e2f3a4b",
+	} {
 		r = salvageRun("promoted")
 		ref := bad
 		r.SalvageRef = &ref
 		if line := salvageFetchLine(r); line != "" {
 			t.Errorf("salvageFetchLine(%q) = %q, want no command", bad, line)
+		}
+		if out := renderDetail(t, r); strings.Contains(out, "SALVAGE_REF") || strings.Contains(out, "SALVAGE_FETCH") {
+			t.Errorf("salvage_ref %q must print no SALVAGE_REF or SALVAGE_FETCH row:\n%s", bad, out)
 		}
 	}
 }

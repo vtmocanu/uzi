@@ -128,10 +128,11 @@ JOIN forge_connections c ON c.id = p.connection_id
 WHERE r.repo_id = @repo_id::uuid AND c.user_id = @user_id::uuid;
 
 -- name: ListLiveSalvageRefsForRepo :many
--- What the repo-removal 409 names, per live row: the run, its state, and salvage_ref, the
--- run-scoped salvage ref once created (empty before, while the salvage copy is still being
--- made). The branch-scoped checkpoint ref is never named: #1810's retention owns it, not
--- salvage. Owner-scoped like the count. Bounded by lim rows.
+-- What the repo-removal 409 names, per live row: the run, its state (a 'pending' row is
+-- named as a pending run whether or not its ref was already created), and salvage_ref, the
+-- run-scoped salvage ref once created (empty before). The branch-scoped checkpoint ref is
+-- never named: #1810's retention owns it, not salvage. Owner-scoped like the count. Bounded
+-- by lim rows.
 SELECT s.run_id, s.state,
        (CASE WHEN s.salvage_created_at IS NOT NULL
              THEN 'refs/uzi-salvage/' || s.run_id::text ELSE '' END)::text AS salvage_ref

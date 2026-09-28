@@ -196,10 +196,11 @@ type ListLiveSalvageRefsForRepoRow struct {
 	SalvageRef string    `json:"salvage_ref"`
 }
 
-// What the repo-removal 409 names, per live row: the run, its state, and salvage_ref, the
-// run-scoped salvage ref once created (empty before, while the salvage copy is still being
-// made). The branch-scoped checkpoint ref is never named: #1810's retention owns it, not
-// salvage. Owner-scoped like the count. Bounded by lim rows.
+// What the repo-removal 409 names, per live row: the run, its state (a 'pending' row is
+// named as a pending run whether or not its ref was already created), and salvage_ref, the
+// run-scoped salvage ref once created (empty before). The branch-scoped checkpoint ref is
+// never named: #1810's retention owns it, not salvage. Owner-scoped like the count. Bounded
+// by lim rows.
 func (q *Queries) ListLiveSalvageRefsForRepo(ctx context.Context, arg ListLiveSalvageRefsForRepoParams) ([]ListLiveSalvageRefsForRepoRow, error) {
 	rows, err := q.db.Query(ctx, listLiveSalvageRefsForRepo, arg.RepoID, arg.UserID, arg.Lim)
 	if err != nil {

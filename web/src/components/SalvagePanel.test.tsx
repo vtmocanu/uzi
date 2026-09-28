@@ -37,14 +37,14 @@ describe("SalvagePanel per-state copy", () => {
     ["pending", "Saving a copy of the last published checkpoint…", "Saving"],
     [
       "unavailable",
-      "No copy saved: the checkpoint was no longer on the forge at its recorded tip.",
+      "No copy saved: the published checkpoint was no longer at its recorded tip on the forge.",
       "Not saved",
     ],
     ["refused", "No copy saved: a different commit already holds this run's salvage ref.", "Not saved"],
     ["failed", "No copy saved after repeated attempts", "Not saved"],
     ["skipped_secret", "Not saved: this run failed on a secret-scan block.", "Not saved"],
     ["expired", "The saved copy expired and was removed.", "Expired"],
-    ["disabled", "Salvage was turned off for this forge.", "Off"],
+    ["disabled", "Not saved: salvage was turned off for this forge before a copy was made.", "Off"],
   ];
 
   it.each(cases)("%s renders its lead sentence and a worded badge", (state, lead, badge) => {

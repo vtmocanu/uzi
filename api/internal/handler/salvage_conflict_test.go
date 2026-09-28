@@ -56,40 +56,56 @@ func TestWriteSalvageConflict(t *testing.T) {
 		}
 		return b
 	}
-	a, p, c := uuid.New(), uuid.New(), uuid.New()
+	a, p, c, cp := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 
-	// A created row names its salvage ref; a row whose copy is still being made names its
-	// run. More runs than listed: the text says how many more. The branch-scoped checkpoint
-	// ref (#1810's) is never named.
+	// A promoted row names its salvage ref; a pending row is named by run id (and, once its
+	// ref was created, that ref too), decided by state, not by an empty ref. More runs than
+	// listed: the text says how many more. The branch-scoped checkpoint ref (#1810's) is
+	// never named. Reddening mutation: decide pending-ness by an empty SalvageRef again (the
+	// created-pending run cp drops out of salvage_pending_runs).
 	rec := httptest.NewRecorder()
 	writeSalvageConflict(rec, "repo", 7, []salvageConflictRow{
-		{RunID: a, SalvageRef: "refs/uzi-salvage/" + a.String()},
-		{RunID: p},
-		{RunID: c, SalvageRef: "refs/uzi-salvage/" + c.String()},
+		{RunID: a, State: "promoted", SalvageRef: "refs/uzi-salvage/" + a.String()},
+		{RunID: p, State: "pending"},
+		{RunID: cp, State: "pending", SalvageRef: "refs/uzi-salvage/" + cp.String()},
 	})
 	b := decode(rec)
-	if b.Count != 7 || strings.Join(b.Refs, ",") != "refs/uzi-salvage/"+a.String()+",refs/uzi-salvage/"+c.String() ||
-		strings.Join(b.Pending, ",") != p.String() {
-		t.Fatalf("body = %+v, want count 7, two salvage refs and one pending run", b)
+	if b.Count != 7 || strings.Join(b.Refs, ",") != "refs/uzi-salvage/"+a.String()+",refs/uzi-salvage/"+cp.String() ||
+		strings.Join(b.Pending, ",") != p.String()+","+cp.String() {
+		t.Fatalf("body = %+v, want count 7, two salvage refs and two pending runs", b)
 	}
 	for _, want := range []string{
-		"this repo has 7 failed run(s)", "refs/uzi-salvage/" + a.String(), "refs/uzi-salvage/" + c.String(),
-		"a salvage copy is being made for run " + p.String(), "and 4 more run(s)",
-		"checkpointed commits are kept on the forge for recovery until they expire", "remove the repo after that",
+		"this repo has live salvage copies, made or still being made, of the last published checkpoints of 7 failed run(s) (",
+		"(refs/uzi-salvage/" + a.String() + "; ",
+		"run " + p.String() + ", copy pending; ",
+		"run " + cp.String() + ", copy pending at refs/uzi-salvage/" + cp.String(),
+		"; and 4 more run(s))",
+		"the block lifts when the copies expire, or when a pending copy settles, so remove the repo after that",
 	} {
 		if !strings.Contains(b.Error, want) {
 			t.Errorf("message %q lacks %q", b.Error, want)
 		}
 	}
-	if strings.Contains(rec.Body.String(), "uzi-checkpoints") {
-		t.Fatalf("the 409 must never name a branch checkpoint ref: %s", rec.Body.String())
+	for _, bad := range []string{"uzi-checkpoints", "recover"} {
+		if strings.Contains(rec.Body.String(), bad) {
+			t.Fatalf("the 409 must never contain %q: %s", bad, rec.Body.String())
+		}
+	}
+
+	// A live row with no created ref and an unexpected state has no ref to name: it is
+	// reported as pending by run id rather than silently dropped.
+	rec = httptest.NewRecorder()
+	writeSalvageConflict(rec, "repo", 1, []salvageConflictRow{{RunID: c, State: "promoted"}})
+	b = decode(rec)
+	if len(b.Refs) != 0 || strings.Join(b.Pending, ",") != c.String() {
+		t.Fatalf("ref-less live row: %+v, want it listed as pending", b)
 	}
 
 	// A raced or failed lookup still refuses: count floored at 1, both lists empty arrays.
 	rec = httptest.NewRecorder()
 	writeSalvageConflict(rec, "connection", 0, nil)
 	b = decode(rec)
-	if b.Count != 1 || len(b.Refs) != 0 || len(b.Pending) != 0 || !strings.Contains(b.Error, "this connection has 1 failed run(s)") {
+	if b.Count != 1 || len(b.Refs) != 0 || len(b.Pending) != 0 || !strings.Contains(b.Error, "this connection has live salvage copies, made or still being made, of the last published checkpoints of 1 failed run(s);") {
 		t.Fatalf("floored conflict: %+v", b)
 	}
 	if strings.Contains(b.Error, " (") {
@@ -99,7 +115,7 @@ func TestWriteSalvageConflict(t *testing.T) {
 	// Every listed run named: no "more" suffix; a stale count below the listed runs is
 	// raised to it.
 	rec = httptest.NewRecorder()
-	writeSalvageConflict(rec, "repo", 1, []salvageConflictRow{{RunID: a, SalvageRef: "refs/uzi-salvage/a"}, {RunID: c, SalvageRef: "refs/uzi-salvage/b"}})
+	writeSalvageConflict(rec, "repo", 1, []salvageConflictRow{{RunID: a, State: "promoted", SalvageRef: "refs/uzi-salvage/a"}, {RunID: c, State: "promoted", SalvageRef: "refs/uzi-salvage/b"}})
 	b = decode(rec)
 	if b.Count != 2 || strings.Contains(b.Error, "more") {
 		t.Fatalf("fully listed conflict: %+v, want count 2 and no more-suffix", b)

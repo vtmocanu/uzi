@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
@@ -26,7 +28,7 @@ func salvageStateExplanation(state string) string {
 	case "promoted":
 		return "checkpointed commits saved (last published checkpoint; may be behind the run's final local work)"
 	case "unavailable":
-		return "not saved: the run's published checkpoint was no longer on the forge"
+		return "not saved: the published checkpoint was no longer at its recorded tip on the forge"
 	case "refused":
 		return "not saved: the salvage ref already pointed at a different commit"
 	case "failed":
@@ -36,22 +38,43 @@ func salvageStateExplanation(state string) string {
 	case "expired":
 		return "the salvage copy expired and was removed from the forge"
 	case "disabled":
-		return "not kept: salvage was turned off for this forge; any copy was removed"
+		return "not saved: salvage was turned off for this forge before a copy was made"
 	default:
 		return ""
 	}
 }
 
-// salvageFetchLine is the command that fetches a promoted salvage copy, "" unless the run is
-// promoted with a well-formed salvage ref (the server builds it from the run's UUID, so a ref
-// with anything but that shape is not echoed as a command).
-func salvageFetchLine(r apitypes.RunDTO) string {
-	if strOr(r.SalvageState, "") != "promoted" || r.SalvageRef == nil {
+// salvageRefFor returns the run's salvage ref when it is exactly refs/uzi-salvage/<uuid>, the
+// uuid in its canonical lower-case form, and (when the run carries an id) that uuid is the run's
+// own id; "" otherwise. The server builds the ref from the run's UUID, so any other shape (a
+// dash run, a foreign run's id, an upper-case or braced uuid) is never echoed.
+func salvageRefFor(r apitypes.RunDTO) string {
+	if r.SalvageRef == nil {
 		return ""
 	}
 	ref := *r.SalvageRef
-	id := strings.TrimPrefix(ref, salvageRefPrefix)
-	if id == ref || id == "" || strings.Trim(id, "0123456789abcdef-") != "" {
+	id, ok := strings.CutPrefix(ref, salvageRefPrefix)
+	if !ok {
+		return ""
+	}
+	parsed, err := uuid.Parse(id)
+	if err != nil || parsed.String() != id {
+		return ""
+	}
+	if r.ID != "" && r.ID != id {
+		return ""
+	}
+	return ref
+}
+
+// salvageFetchLine is the command that fetches a promoted salvage copy, "" unless the run is
+// promoted with a well-formed salvage ref of its own (salvageRefFor).
+func salvageFetchLine(r apitypes.RunDTO) string {
+	if strOr(r.SalvageState, "") != "promoted" {
+		return ""
+	}
+	ref := salvageRefFor(r)
+	if ref == "" {
 		return ""
 	}
 	return "git fetch origin " + ref
@@ -63,13 +86,13 @@ func salvageRows(r apitypes.RunDTO) [][]string {
 	if r.SalvageState == nil || *r.SalvageState == "" {
 		return nil
 	}
-	state := sanitizeTTY(*r.SalvageState)
+	state := cellText(*r.SalvageState)
 	if why := salvageStateExplanation(*r.SalvageState); why != "" {
 		state += ": " + why
 	}
 	rows := [][]string{{"SALVAGE", state}}
-	if r.SalvageRef != nil && *r.SalvageRef != "" {
-		rows = append(rows, []string{"SALVAGE_REF", cellText(*r.SalvageRef)})
+	if ref := salvageRefFor(r); ref != "" {
+		rows = append(rows, []string{"SALVAGE_REF", ref})
 	}
 	if r.SalvageTip != nil && *r.SalvageTip != "" {
 		rows = append(rows, []string{"SALVAGE_TIP", cellText(shortSHA(*r.SalvageTip))})

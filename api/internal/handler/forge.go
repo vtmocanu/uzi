@@ -506,9 +506,10 @@ func (h *Handler) DeleteConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// PRD #1867 M2: the connection delete cascades its repos and their runs, so a failed
-	// run's salvage row (live_run_id ON DELETE RESTRICT while a checkpoint or salvage ref
-	// may still exist on the forge) would otherwise error mid-cascade. Refuse with a 409
-	// naming the refs instead. Owner-scoped: a foreign id counts nothing and 404s below.
+	// run's live salvage row (live_run_id ON DELETE RESTRICT while its salvage copy is being
+	// made or exists on the forge) would otherwise error mid-cascade. Refuse with a 409
+	// naming the salvage refs and pending runs instead. Owner-scoped: a foreign id counts
+	// nothing and 404s below.
 	salvage, err := h.q.CountLiveSalvageForConnection(r.Context(), store.CountLiveSalvageForConnectionParams{ConnectionID: id, UserID: user.ID})
 	if err != nil {
 		slog.Error("count salvage refs for connection delete", "error", err)
@@ -966,9 +967,10 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	// PRD #1867 M2: a failed run's salvage row holds live_run_id (ON DELETE RESTRICT) while
-	// its checkpoint or salvage ref may still exist on the forge; the runs.repo_id cascade
-	// would error on it. Refuse with a 409 naming the refs until they expire.
+	// PRD #1867 M2: a failed run's live salvage row holds live_run_id (ON DELETE RESTRICT)
+	// while its salvage copy is being made or exists on the forge; the runs.repo_id cascade
+	// would error on it. Refuse with a 409 naming the salvage refs and pending runs until the
+	// copies expire or the pending ones settle.
 	salvage, err := h.q.CountLiveSalvageForRepo(r.Context(), store.CountLiveSalvageForRepoParams{RepoID: id, UserID: user.ID})
 	if err != nil {
 		slog.Error("count salvage refs for repo delete", "error", err)
@@ -1011,11 +1013,12 @@ func isSalvageRestrict(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == salvageRestrictConstraint
 }
 
-// salvageConflictRow is one live salvage row a removal 409 names: the run and its salvage
-// ref once created (empty while the salvage copy is still being made). The 409 names only
-// salvage's own refs, never the branch-scoped checkpoint ref, which #1810's retention owns.
+// salvageConflictRow is one live salvage row a removal 409 names: the run, its salvage state
+// and its salvage ref once created (empty before). The 409 names only salvage's own refs,
+// never the branch-scoped checkpoint ref, which #1810's retention owns.
 type salvageConflictRow struct {
 	RunID      uuid.UUID
+	State      string
 	SalvageRef string
 }
 
@@ -1035,7 +1038,7 @@ func (h *Handler) writeRepoSalvageConflict(ctx context.Context, w http.ResponseW
 	}
 	named := make([]salvageConflictRow, 0, len(rows))
 	for _, row := range rows {
-		named = append(named, salvageConflictRow{RunID: row.RunID, SalvageRef: row.SalvageRef})
+		named = append(named, salvageConflictRow{RunID: row.RunID, State: row.State, SalvageRef: row.SalvageRef})
 	}
 	writeSalvageConflict(w, "repo", count, named)
 }
@@ -1056,16 +1059,19 @@ func (h *Handler) writeConnectionSalvageConflict(ctx context.Context, w http.Res
 	}
 	named := make([]salvageConflictRow, 0, len(rows))
 	for _, row := range rows {
-		named = append(named, salvageConflictRow{RunID: row.RunID, SalvageRef: row.SalvageRef})
+		named = append(named, salvageConflictRow{RunID: row.RunID, State: row.State, SalvageRef: row.SalvageRef})
 	}
 	writeSalvageConflict(w, "connection", count, named)
 }
 
 // writeSalvageConflict writes the removal 409 for live salvage rows. what is "repo" or
 // "connection", count the total number of failed runs with a live salvage row, rows the
-// (at most salvageRefListCap) rows named. A created row names its refs/uzi-salvage/<run-id>;
-// a row whose salvage copy is still being made names its run instead. A lookup that failed
-// or raced still refuses: the count is floored at the number of rows named, and at 1.
+// (at most salvageRefListCap) rows named. Every created refs/uzi-salvage/<run-id> is listed
+// in salvage_refs; every row still in state pending (its copy not settled yet, whether or
+// not the ref was already created) is listed by run id in salvage_pending_runs. A live row
+// with no created ref is reported as pending whatever its state, since there is no ref to
+// name. A lookup that failed or raced still refuses: the count is floored at the number of
+// rows named, and at 1.
 func writeSalvageConflict(w http.ResponseWriter, what string, count int64, rows []salvageConflictRow) {
 	refs := []string{}
 	pending := []string{}
@@ -1073,11 +1079,17 @@ func writeSalvageConflict(w http.ResponseWriter, what string, count int64, rows 
 	for _, row := range rows {
 		if row.SalvageRef != "" {
 			refs = append(refs, row.SalvageRef)
+		}
+		if row.State != "pending" && row.SalvageRef != "" {
 			parts = append(parts, row.SalvageRef)
 			continue
 		}
 		pending = append(pending, row.RunID.String())
-		parts = append(parts, "a salvage copy is being made for run "+row.RunID.String())
+		part := "run " + row.RunID.String() + ", copy pending"
+		if row.SalvageRef != "" {
+			part += " at " + row.SalvageRef
+		}
+		parts = append(parts, part)
 	}
 	count = max(count, int64(len(rows)), 1)
 	named := ""
@@ -1088,8 +1100,8 @@ func writeSalvageConflict(w http.ResponseWriter, what string, count int64, rows 
 		named = " (" + strings.Join(parts, "; ") + ")"
 	}
 	httpx.JSON(w, http.StatusConflict, map[string]any{
-		"error": fmt.Sprintf("this %s has %d failed run(s) whose checkpointed commits are kept on the forge for recovery until they expire%s; "+
-			"they are removed automatically at expiry, so remove the %s after that", what, count, named, what),
+		"error": fmt.Sprintf("this %s has live salvage copies, made or still being made, of the last published checkpoints of %d failed run(s)%s; "+
+			"the block lifts when the copies expire, or when a pending copy settles, so remove the %s after that", what, count, named, what),
 		"salvage_refs":         refs,
 		"salvage_pending_runs": pending,
 		"salvage_count":        count,

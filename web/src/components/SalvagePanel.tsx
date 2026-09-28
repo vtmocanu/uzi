@@ -39,7 +39,7 @@ const STATE_VIEWS: Record<string, StateView> = {
   unavailable: {
     badge: "Not saved",
     tone: "warning",
-    lead: "No copy saved: the checkpoint was no longer on the forge at its recorded tip.",
+    lead: "No copy saved: the published checkpoint was no longer at its recorded tip on the forge.",
   },
   refused: {
     badge: "Not saved",
@@ -57,7 +57,7 @@ const STATE_VIEWS: Record<string, StateView> = {
     lead: "Not saved: this run failed on a secret-scan block.",
   },
   expired: { badge: "Expired", tone: "neutral", lead: "The saved copy expired and was removed." },
-  disabled: { badge: "Off", tone: "neutral", lead: "Salvage was turned off for this forge." },
+  disabled: { badge: "Off", tone: "neutral", lead: "Not saved: salvage was turned off for this forge before a copy was made." },
 };
 
 // isWellFormedSalvageRef gates the copyable fetch command.
