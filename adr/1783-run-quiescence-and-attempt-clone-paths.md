@@ -410,14 +410,31 @@ ppid chain) POSITIVELY ties it — pid and recorded start time both matching —
 to a recorded root of another live attempt or a worker-launched runner-uid
 root, in which case it is skipped entirely rather than reported. An
 unreadable process that is not positively attributed this way makes the
-whole scan `unverified`. Because `unverified` fails closed at every gated
-site, a single such process anywhere on the worker — an ssh-agent an
-unrelated tool started, not necessarily this run's own — is a **worker-wide
-lockout** for as long as it lives: terminal retire keeps the clone instead
-of removing it, canonical reseed refuses, and finalize and every
-recovery/credential-switch capture fail or skip (only the
+whole scan `unverified`. Because `unverified` fails closed everywhere the
+scan actually runs, a single such process anywhere on the worker — an
+ssh-agent an unrelated tool started, not necessarily this run's own — is a
+**worker-wide lockout** for as long as it lives, at every site the scan
+covers. Canonical reseed and the predecessor/orphan capture sites
+(`predecessor_capture`, `orphan_reclaim`) run `seed`/`capture` mode, which
+always scans regardless of executor (see the Invariants section above), so
+they lock out on any run, Codex included. Terminal retire, finalize, the
+`recovery_capture`/`credential_switch` sites, and the pause/wall/completion-
+hold parks all run `mode: "own"`, so for a Claude or stub run they are
+covered and lock out the same way, but **a Codex run's own-mode proof at
+those sites is not**: it skips the process scan outright (mode `"own"`, per
+the Invariants section above), so an unrelated unreadable process elsewhere
+on the worker does not lock out a Codex run's own finalize, terminal
+retire, or recovery/credential-switch capture the way it locks out a Claude
+or stub run's — a disclosed gap in the opposite direction from this
+lockout, covered by the Invariants section and Follow-up 4 below, not a
+new claim about a Codex run being more locked out than it is. Where one of
+those Codex own-mode sinks is credentialed through
+`reapForSink`/`withCodexBoundaryOnly` (finalize is one), the supervisor's
+own drain boundary substitutes for the skipped scan as that sink's process
+proof; it is not itself gated by this same-uid lockout either. (Only the
 `unverifiedOnlyByUnattributedUnreadable` exception for a fresh attempt seed
-is unaffected, because seeding a fresh path moves or frees nothing).
+is unaffected on any run, because seeding a fresh path moves or frees
+nothing.)
 
 **The maintainer's decision is to keep this fail-closed, not to relax it.**
 An unreadable, unattributed runner-uid process is never treated as out of
@@ -449,11 +466,16 @@ proof forever — this is what could hang a test run driving the same code
 path. It is now bounded: after `RECOVERY_CAPTURE_BLOCKED_ATTEMPTS` (5)
 CONSECUTIVE captures whose proof blocked, the run fails with the typed
 `fail_origin` `worker_residue_blocked`, the clone and session kept for
-inspection. That bound's wall time is up to roughly 30 s at the defaults
-(about 40 s on the vault-locked park, whose backoff doubles) only when every
-blocked proof is `unverified` (5 reap deadlines plus 4 backoffs); a
-`survivors` proof with nothing left to kill returns at once, so the bound
-can be reached in as little as ~4 s. Any capture outcome that is not a
+inspection. That bound's wall time is typically about 30 s at the defaults
+(5 reap deadlines of 5 s plus 4 backoffs; about 40 s on the vault-locked
+park, whose backoff doubles) — not a strict ceiling: a `survivors` proof
+with nothing left to kill returns at once, so the bound can be reached in as
+little as ~4 s, while a proof that also runs the best-effort Docker teardown
+(budget 15 s, on a Docker-wired worker) or the runner-uid helper (10 s
+timeout) to its own budget can take longer than the roughly-30 s figure —
+a `survivors` proof with an unconfirmed kill still runs the full 5 s reap
+deadline like an `unverified` one, it just reports a count rather than a
+pid. Any capture outcome that is not a
 blocked proof resets the count. Shutdown and cancellation still take
 precedence over this bound: the loop's top routes a shutdown to the retained
 posture and a cancel to the cancel report before the bound is ever checked,
@@ -483,7 +505,7 @@ Linux CI, the same shape that produced the original incident.
 whole class is proper per-run process ownership (a cgroup v2 boundary scoped
 to the attempt), separate from this PR's fail-closed-with-a-bound mitigation.
 Not built here; listed for the maintainer to file after merge, alongside
-Follow-ups 1-4 above.
+Follow-ups 1-4 below.
 
 ## Root-only acceptance at the final head
 

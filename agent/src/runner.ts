@@ -197,16 +197,19 @@ const CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS = 3;
  *  handleRecoveryExhausted stops retrying. Such a proof does not clear with time: a non-dumpable
  *  process that no attempt owns stays unattributable until someone kills it, and the loop's other
  *  exits (a cancel, a shutdown, the server moving the run) may never come, so an unbounded retry
- *  held the claim forever. After this many the run fails with fail_origin `worker_residue_blocked`
- *  (the failure_reason names the blocking pid and comm), the clone and session kept for
- *  inspection. Any capture outcome that is NOT a blocked proof resets the count. The wall time
- *  before that failure holds only when every blocked proof is `unverified`: 5 reap deadlines
- *  (5 s each) plus 4 recoveryRetryMs backoffs, up to roughly 30 s at the defaults, about 40 s
- *  on the vault-locked park, whose backoff doubles. A `survivors` proof with nothing left to kill
- *  returns at once, so the bound can be reached in as little as ~4 s; that is accepted because a
- *  non-dumpable same-uid process does not clear on its own, the operator reason names the pid to
- *  kill, failing closed is the maintainer's decision, and per-attempt cgroup v2 containment is the
- *  follow-up that removes the case. */
+ *  held the claim forever. After this many the run fails with fail_origin `worker_residue_blocked`,
+ *  the clone and session kept for inspection; the failure_reason names the blocking pid and comm
+ *  only when the block came from a process it could not attribute — a `survivors` proof instead
+ *  reports just a count of the in-scope processes that outlived the reap. Any capture outcome that
+ *  is NOT a blocked proof resets the count. The wall time before that failure is typically about
+ *  30 s at the defaults (5 reap deadlines of 5 s plus 4 recoveryRetryMs backoffs), about 40 s on
+ *  the vault-locked park, whose backoff doubles — this is not a strict ceiling: it runs faster when
+ *  a proof returns early (a `survivors` proof with nothing left to kill returns at once, so the
+ *  bound can be reached in as little as ~4 s), and can run longer when the best-effort Docker
+ *  teardown (budget 15 s on a Docker-wired worker) or the runner-uid helper (10 s timeout) runs out
+ *  its own budget on a given attempt. That is accepted because a non-dumpable same-uid process does
+ *  not clear on its own, failing closed is the maintainer's decision, and per-attempt cgroup v2
+ *  containment is the follow-up that removes the case. */
 const RECOVERY_CAPTURE_BLOCKED_ATTEMPTS = 5;
 
 /** PRD #1226 M4 (D5): the STATIC, content-free failure_reason a worker reports when the completion
@@ -10755,8 +10758,9 @@ export class RunRunner {
           if (blockedDetail !== undefined && blockedCaptures >= RECOVERY_CAPTURE_BLOCKED_ATTEMPTS) {
             // issue #1783 M3: the proof keeps blocking, and nothing else is guaranteed to end this
             // loop. Stop retrying: keep the clone and session for inspection (a surviving process
-            // may still be writing there) and fail the run worker_residue_blocked, its reason
-            // naming the blocking pid and comm. Reported here, not thrown: an error escaping this
+            // may still be writing there) and fail the run worker_residue_blocked; its reason names
+            // the blocking pid and comm when the block was an unattributed process, or just a count
+            // of survivors when it was not. Reported here, not thrown: an error escaping this
             // handler would leave executeClaim's catch arm without reaching reportGenericFailure.
             // A RunResidueBlockedError runs no credentialed pre-report reap; a vault-lock park
             // additionally keeps the custody hold (keepCustody), as its given-up receipt does.
