@@ -51,7 +51,7 @@ instance-default keys.
 nullable `users.appearance_mode` / `light_theme` / `dark_theme` / `typeface`
 columns, read and written through `GET/PUT /api/me/settings` (a field left
 `null` means "use the instance default"). The four instance defaults are
-`app_settings` keys, edited from **Admin → Instance settings**. Every write
+`app_settings` keys, edited from **Admin → Instance**. Every write
 path validates against the same Go registry, polarity-aware for the two
 theme slots (`ValidateFor("light", …)` / `ValidateFor("dark", …)`), so a dark
 id handed to the light slot is rejected rather than silently accepted.
@@ -91,7 +91,7 @@ flash before `me()` resolves the exact theme.
 
 - **Per-user**: Settings → Appearance — mode, a light theme, a dark theme,
   and a typeface. See [Appearance](./appearance.md) for the walkthrough.
-- **Instance default**: Admin → Instance settings → the four appearance
+- **Instance default**: Admin → Instance → the four appearance
   defaults. See [Admin settings](./admin-settings.md#default-appearance).
 - With nothing set anywhere (no user overrides, no admin defaults), every
   session renders `ember`, pixel-identical to before PRD #1167.

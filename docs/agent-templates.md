@@ -27,22 +27,27 @@ additionally publish a **Global** one for everyone. `lead` and
 
 ## Builtin roles
 
-uzi seeds twelve builtin templates:
+uzi seeds twelve builtin templates. `lead` is uzi's own. The other eleven are
+unchanged copies of uzi's upstream role library (the `product-agents/` folder of
+the skills repository, at the release commit pinned as `upstream_sha` in the uzi
+source's `api/internal/agenttmpl/library/manifest.json`), so their generic role
+text is the same as in a plain Claude Code agent team. uzi adds its runtime
+rules and, for `fact-checker`, its forge tools on top (both explained below):
 
-| Name | What it does |
-|---|---|
-| `lead` | Plans the task, delegates, and drives the run through the approval gate. |
-| `coder` | Implements features, fixes bugs, refactors code. |
-| `reviewer` | Reviews code changes for correctness, style, and edge cases. |
-| `auditor` | Audits code for security vulnerabilities and unsafe patterns. |
-| `tester` | Validates changes against representative real-world inputs, authoring and extending tests as part of the implementation phase. |
-| `architect` | Designs the approach before coding and reviews changes for architectural fit; writes design docs only, and only once the plan is approved. |
-| `documenter` | Updates documentation only; never touches source code. |
-| `fact-checker` | Adversarially verifies factual claims against authoritative sources. |
-| `spec-keeper` | Keeps `specs/` in sync with implementation work. |
-| `researcher` | Investigates the codebase or external sources to gather context; reports findings only. |
-| `web-ux` | Validates web interfaces in a real browser (agent-browser), reviewing UX, accessibility, and visual consistency; reports findings only. |
-| `ux-designer` | Sets opinionated visual and information-architecture direction, then builds and browser-validates the frontend/UI; owns the design layer and defers backend logic to the coder. |
+| Name | Model | What it does |
+|---|---|---|
+| `lead` | `opus` | Plans the task, delegates, and drives the run through the approval gate. |
+| `coder` | `opus` | Implements features, fixes bugs, refactors code. |
+| `reviewer` | `opus` | Reviews code changes for correctness, style, and edge cases. |
+| `auditor` | `opus` | Audits code for security vulnerabilities and unsafe patterns. |
+| `tester` | `opus` | Validates changes against representative real-world inputs, authoring and extending tests as part of the implementation phase. |
+| `architect` | `opus` | Designs the approach before coding and reviews changes for architectural fit; writes design docs only, and only once the plan is approved. |
+| `documenter` | `sonnet` | Updates documentation only; never touches source code. |
+| `fact-checker` | `opus` | Adversarially verifies factual claims against authoritative sources. |
+| `spec-keeper` | `opus` | Keeps `specs/` in sync with implementation work. |
+| `researcher` | `sonnet` | Investigates the codebase or external sources to gather context; reports findings only. |
+| `web-ux` | `opus` | Validates web interfaces in a real browser (agent-browser), reviewing UX, accessibility, and visual consistency; reports findings only. |
+| `ux-designer` | `opus` | Sets opinionated visual and information-architecture direction, then builds and browser-validates the frontend/UI; owns the design layer and defers backend logic to the coder. |
 
 The `lead` is the orchestrator: the main agent thread. It runs on `opus`
 by default unless you set a personal override in
@@ -50,13 +55,14 @@ by default unless you set a personal override in
 its persona and workflow; the primary-directive guardrails (never touch
 `main`, no `git push`, the plan gate) are enforced by the worker regardless.
 
-The builtin `fact-checker`'s `tools:` allowlist names six
-`mcp__forge__*` entries, so it alone can read the run's own forge (issues,
-merge requests, pipelines, label history) to check a claim against live
-state — see [Forge read tools](./forge-read-tools.md). A template with no
-`tools:` list inherits everything, forge tools included; a template with
-its own explicit allowlist gets forge access only if you add an
-`mcp__forge__*` entry to it yourself.
+The builtin `fact-checker` also gets six `mcp__forge__*` read tools, so it
+alone can read the run's own forge (issues, merge requests, pipelines, label
+history) to check a claim against live state; see
+[Forge read tools](./forge-read-tools.md). uzi adds them to its tools list
+when the template is seeded; they are not in the upstream file. A subagent
+reaches the forge only through an explicit `mcp__forge__*` entry in its
+`tools:` list: a template with no `tools:` list inherits the standard tools but
+not the forge ones. The lead is the exception and always has forge read access.
 
 ## Parallel dispatch
 
@@ -155,10 +161,13 @@ click **Reset to default**. It re-applies the shipped builtin body
 (say, `lead` or `coder`) and reset it to pick up a change shipped in a newer
 uzi version, your customization is gone, not folded into the new body.
 
-A shipped change to a builtin's prompt reaches a **pristine** template — one
-an admin has never edited — automatically on the next boot: uzi re-applies the
-body it ships for that builtin, so recipient fixes, prompt improvements, and
-sandbox tweaks land without a manual step. A builtin an admin has
+A shipped change to a builtin's prompt reaches a **pristine** template (one
+an admin has never edited and no [agent source](./agent-source.md) sync has
+replaced) automatically on the next boot after you upgrade uzi: uzi re-applies
+the body it ships for that builtin, so recipient fixes, prompt improvements, and
+sandbox tweaks land without a manual step. Nothing changes between upgrades; the
+role library a uzi version ships is the release commit pinned as `upstream_sha` in its
+`api/internal/agenttmpl/library/manifest.json`. A builtin an admin has
 **customized** is never overwritten on boot; your edit stays until you
 **Reset** it, so customizations remain durable across upgrades.
 
@@ -176,19 +185,20 @@ it. (A pristine builtin refreshes on boot, so it already matches and carries
 no badge.) Open the template before resetting: the editor shows exactly what's
 different, so you're not resetting blind.
 
-The shipped builtin roles other than `lead` are copied unchanged from uzi's
-upstream role library, the same `product-agents/` files an
-[agent source](./agent-source.md) sync reads. When a run starts, uzi adds its own
-runtime rules to each subagent (the run's scratch directory, the
-review-snapshot recipe, the safety rules) through a shared block, and gives the
-lead its own runtime guidance. Neither is part of the stored template.
+When a run starts, uzi adds its own runtime rules to each subagent (the run's
+scratch directory, the review-snapshot recipe, the safety rules) through a
+shared block, and gives the lead its own runtime guidance. Neither is part of
+the stored template, and neither can be edited from **Agents**; they live in
+the uzi source (`agent/src/prompt.ts`) and apply to your own templates and to
+repo-sourced agents too.
 
 A builtin can also arrive by a third route: an admin-configured
 [agent source](./agent-source.md) repo an admin has approved a sync from. A
 **synced** template shows a distinct `synced` badge instead of the drift
 badge — its body came from that source, not the shipped default and not a
 hand edit — and, if it's overriding a builtin, is still resettable back to
-the embedded body the same way a customized one is.
+the embedded body the same way a customized one is. A synced builtin does not
+take shipped changes on boot until it is reset.
 
 Drift and reset live in the web UI and the REST API — the badge, the
 shipped-vs-stored diff, and the reset action. There is no `uzi` command for

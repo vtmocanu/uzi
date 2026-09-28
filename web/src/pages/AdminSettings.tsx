@@ -1,4 +1,4 @@
-// Admin → Instance settings (PRD #19 M1): the DB-backed app_settings surface.
+// Admin → Instance (PRD #19 M1): the DB-backed app_settings surface.
 // Ships the two configurable forge labels; future instance settings (registration
 // policy, self-improvement toggle) slot in here without new plumbing. Admin-only
 // (gated by AdminRoute + the admin-only API). Validation mirrors the server

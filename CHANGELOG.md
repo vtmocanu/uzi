@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
   A follow-up round hardens this against a lockout CI caught: ANY runner-uid process on the worker whose `/proc` environ or cwd cannot be read (a setgid `ssh-agent`, for example, including one an agent starts) makes the process proof `unverified` unless ancestry attributes it to a recorded live root, and an `unverified` proof fails closed at every covered scan site (captures, parks, retirements, checkpoints, finalize, canonical reseeds), so one such process, anywhere on the worker, blocks those steps for every run there for as long as it lives. Two exceptions: seeding a fresh attempt path on a Docker-wired worker still proceeds (it moves or frees nothing) but skips that seed's retention deletions, and Codex own-mode sites skip this scan (the Codex gaps above). That stays fail-closed by design (ancestry can't be trusted to clear it; a double fork plus `setsid` would defeat it), but the failure reason now names the blocking process's pid and program name so an operator knows what to stop. A recovery capture whose quiescence proof keeps blocking no longer retries forever: after a bounded number of consecutive blocked proofs it now fails the run `worker_residue_blocked` with the clone kept, instead of hanging.
 
+- **The weekly role refresh now does the whole sync ([#1851](https://github.com/vtmocanu/uzi/issues/1851)).**
+  It checks out the latest stable skills release, copies the builtin agent bodies, moves their versions and pin, and syncs this repo's `.claude/agents/` roster, in one PR with the two halves as separate commits and every dropped line listed. A role missing upstream or a version moving backward changes nothing and opens a tracking issue. It also no longer shows the tester's description with literal quote marks, and the agents docs were corrected for new users.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added

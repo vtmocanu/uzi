@@ -148,7 +148,7 @@ the agent's forge tool server, neither configurable.
 ## Agent-source repo sync (PRD #602)
 
 See [Agent source](agent-source.md) for the admin-facing setup (URL, ref,
-interval, credential — all in **Admin → Instance settings**, not env vars)
+interval, credential — all in **Admin → Instance**, not env vars)
 and [ADR-0602](../adr/0602-agent-source-repo-sync.md) for the design. The
 one operator-only piece is the SSRF allowlist for the clone target, a
 **separate** list from `FORGE_ALLOWED_BASE_URLS` above:
@@ -429,7 +429,7 @@ The in-app chat agent ([chat.md](chat.md)) rides the run machinery as a `chat` r
 ## Run judge (PRD #46)
 
 See [judge.md](judge.md) for what the feature does; it's also gated by
-settings in **Admin → Instance settings** (global on/off, judge model), not
+settings in **Admin → Instance** (global on/off, judge model), not
 env vars. Self-improvement is no longer an admin instance setting or an env
 var — it's the `self-improve` [default job](scheduling.md#default-jobs),
 enabled per repo from the Schedules page; see [judge.md](judge.md) for how

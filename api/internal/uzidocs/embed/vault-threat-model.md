@@ -184,7 +184,7 @@ master-sealed and the claim gate requires an unlocked vault, so nothing runs for
 user until their first post-deploy login (which unlocks the vault and lazily
 rewraps their token). Communicate this before deploying. The seed admin is
 unaffected (boot-unlocked). Migration progress is visible to admins under
-Settings → Instance settings as a count of still-master-sealed secrets.
+Admin → Instance as a count of still-master-sealed secrets.
 
 ## Vault-lock Slack notice (PRD #890)
 

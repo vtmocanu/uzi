@@ -37,7 +37,7 @@ nothing, and records the failure as the sync's last error instead.
 
 Two switches, held by two different people. An admin flips the
 `github_project_sync_enabled` **instance kill switch** in **Admin →
-Instance settings** (see [Admin settings](./admin-settings.md)), off by
+Instance** (see [Admin settings](./admin-settings.md)), off by
 default and a strict no-op while off — nothing below works until this is
 on. Then, **per repo**, the repo's connection owner (or an admin) links it
 to a Projects v2 board from the **Boards** page: the repo row's "Project

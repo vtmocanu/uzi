@@ -13,7 +13,7 @@ request. This page explains what a hold looks like when the interlock catches
 something, and what you can do about it.
 
 This is **on by default for a new, unseeded issue run using either the Claude
-or Codex harness**. An admin can turn it off from **Admin → Instance settings →
+or Codex harness**. An admin can turn it off from **Admin → Instance →
 Completion check** (`completion_interlock_rollout`). An explicit off is the
 admin kill-switch for new runs. A cold settings read without a valid cache
 snapshot also leaves that new run unstamped; later runs can be stamped once

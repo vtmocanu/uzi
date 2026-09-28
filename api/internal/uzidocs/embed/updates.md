@@ -17,10 +17,10 @@ what the api last found.
 - **Everyone** sees a small brand-colored pip on the sidebar version badge when an
   update is available, and a "vX.Y.Z available" row in the build-info popover (hover
   or focus the version badge to open it). An admin gets an **Update guide** link from
-  that row into Admin → Instance settings → Updates; a member sees "Ask your operator
+  that row into Admin → Instance → Updates; a member sees "Ask your operator
   to update" instead, since only an admin can act on it. The collapsed sidebar rail
   has no room for the pip and drops it.
-- **Admins** get a full **Updates** card under Admin → Instance settings: the
+- **Admins** get a full **Updates** card under Admin → Instance: the
   current-vs-latest version delta, the release name and date, a short plain-text
   excerpt of the release notes with a link out to the full notes on GitHub, a
   copyable upgrade runbook (helm and docker compose), a **Check now** button, and
@@ -71,7 +71,7 @@ versions by semver, which orders `X.Y.Z-rc.N` before `X.Y.Z`, so a candidate nev
 ## Air-gapped and privacy installs
 
 Two independent admin toggles, both **on by default**, both editable at runtime from
-Admin → Instance settings → Updates with no redeploy:
+Admin → Instance → Updates with no redeploy:
 
 - **Enable update checks** (`release_check_enabled`, env `UZI_RELEASE_CHECK_ENABLED`)
   — the master gate. Turn it off and the api never contacts `github.com` again: no

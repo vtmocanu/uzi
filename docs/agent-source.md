@@ -20,7 +20,7 @@ before any role body actually changes — see
 
 ## 1. Configure it
 
-Open **Admin → Instance settings → Agent source**:
+Open **Admin → Instance → Agent source**:
 
 1. **Repository URL** — an `https://` git URL. It must be on the operator's
    `AGENT_SOURCE_ALLOWED_BASE_URLS` allowlist (see
@@ -71,10 +71,17 @@ hand. Two preconditions to know before you click it:
   a public source.** If `github.com` isn't allowlisted, the resolve is
   refused and the URL and folder still get filled — set a ref by hand, or
   ask whoever deployed uzi to allowlist it and try again.
-- **The preset is inert until the skills repo publishes a `product-agents/`
-  folder.** Until then, a sync against it stages nothing — that degrades
-  gracefully rather than failing — and the resolve may find no semver tag
-  to fill in.
+- **The preset syncs the same roles uzi already ships.** uzi's builtins are
+  copies of that folder at the release commit pinned as `upstream_sha` in its
+  `api/internal/agenttmpl/library/manifest.json`. Approving a sync of the preset
+  at that release still does three things: it adds the library roles uzi does
+  not ship as builtins (`release`, `tui-ux`, `skill-reviewer`) as global
+  templates, on by default; it replaces any builtin an admin has edited (see
+  below); and it marks the synced builtins as synced, so they stop taking
+  shipped changes on boot. At a newer release it also brings newer role text
+  before your next uzi upgrade; at an older one, older text. Use the preset for
+  those reasons; otherwise point the source at your own roles repo, or leave it
+  off.
 
 ## 2. Sync, review, approve
 
@@ -145,6 +152,8 @@ human reads the diff before it can run anywhere.
   default. It stays a builtin — still labeled and grouped as one, still
   resettable to the embedded default via **Reset to
   default** (see [Agent templates](./agent-templates.md#resetting-a-builtin-template)).
+  This replaces an admin's hand edits to that builtin too, and a synced builtin
+  stops taking shipped changes on boot until it is reset.
 - A synced role with a **new** name (no builtin or admin-authored global
   template by that name) is added as a global template, on by default like
   any other global template.

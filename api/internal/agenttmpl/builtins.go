@@ -108,7 +108,12 @@ func parse(raw []byte) (Definition, error) {
 			}
 			d.Version = n
 		case "description":
-			d.Description = val
+			// The upstream publisher double-quotes a description that would not
+			// round-trip as a bare YAML scalar (for example one containing ": "),
+			// and refuses any value that needs escaping. Strip that one layer, as
+			// the agent-source parser does, so the stored description has no
+			// literal quotes; Render adds them back.
+			d.Description = unquoteScalar(val)
 		case "model":
 			d.Model = val
 		case "tools":

@@ -29,15 +29,15 @@ Exposed as in-process MCP tools under the server name `forge`
 
 ## Which agents get them
 
-Only the `fact-checker` builtin lists these six tools in its `tools:`
-allowlist today — it is the run's dedicated adversarial verifier, and the
-tools exist to give it something to verify a claim against. An
-[agent template](./agent-templates.md) with no `tools:` list (the default
-`lead` and `coder`) inherits every tool, forge tools included; a template
-with its own explicit allowlist gets forge access only if you add an
-`mcp__forge__*` entry to it. A read-only validator template with its own
-allowlist (`reviewer`, `auditor`) does not get forge access unless you
-name one.
+The lead always has them. Among subagents, only the `fact-checker` builtin
+gets them by default: it is the run's dedicated adversarial verifier, and the
+tools exist to give it something to verify a claim against (uzi adds the six
+entries to its tools list; the upstream role file does not name them). A
+subagent reaches the forge only through an explicit `mcp__forge__*` entry in
+its [agent template](./agent-templates.md)'s `tools:` list. A template with no
+`tools:` list (such as `coder`) inherits the standard tools but not the forge
+ones, and a validator with its own allowlist (`reviewer`, `auditor`) gets
+none unless you add one.
 
 ## Credential-free, read-only, own project only
 

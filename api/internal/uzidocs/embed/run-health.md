@@ -108,7 +108,7 @@ right at the threshold may take one more sweep before the badge shows up.
 ## Tuning or turning a flag off
 
 An admin can change any threshold, or disable a single signal entirely by
-setting it to `0`, from **Admin → Instance settings → Run health** — see
+setting it to `0`, from **Admin → Instance → Run health** — see
 [Admin settings](./admin-settings.md#run-health). The loop-detection window
 itself (how many repeats, over how large a window) isn't tunable; every other
 signal is — the plain seconds thresholds, and **near timeout**'s share of the

@@ -163,9 +163,10 @@ recipe a later release renders into a running one.
   `api/internal/agenttmpl/builtins/*.md`, parsed at package `init()`. This is
   independent of the repo's own `.claude/agents/*.md` dev-team roster (PRD #17),
   which is free to drift and never touched by product changes. At every boot
-  `store.ReconcileBuiltinTemplates` inserts any missing builtin and never touches
-  an existing one, so admin edits survive restarts and future releases add or
-  upgrade builtins without a non-re-runnable SQL seed; a boot warning is logged if
+  `store.ReconcileBuiltinTemplates` inserts any missing builtin and
+  `RefreshPristineBuiltin` re-applies the shipped body to rows no admin edited
+  and no agent-source sync replaced, so admin edits survive restarts and future
+  releases add or upgrade builtins without a non-re-runnable SQL seed; a boot warning is logged if
   a non-builtin row already occupies a builtin's name.
 - **The `lead` is the main thread, not a subagent.** The worker
   (`agent/src/agents.ts`) partitions templates by name (`LEAD_NAME_RE`, matching
@@ -790,7 +791,7 @@ chain in the diagram above, with no intervening `running`.
   (`--partial`), or waive named unmet criteria (`--accept`), the latter two each
   requiring a reason and fencing the run's current `contract_revision`;
   provider-context durability is honestly `same_worker_only`. An admin can turn
-  the switch off from Admin → Instance settings → **Completion check**; a run created
+  the switch off from Admin → Instance → **Completion check**; a run created
   before the default changed is unaffected, since the switch is read once, at
   create. See
   [docs/run-completion-hold.md](docs/run-completion-hold.md) and

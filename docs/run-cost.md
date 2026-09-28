@@ -121,10 +121,11 @@ Every SDK session uzi spawns — lead and subagent alike — runs with
 cloned repo's own `CLAUDE.md`, `.claude/rules/*`, `.claude/agents/*`, or
 skills; the comment beside the option calls this out explicitly as
 prompt-injection defense, not a cost optimization, but it has the cost effect
-too. A subagent's entire role context is the body of its builtin template
-under `api/internal/agenttmpl/builtins/` — measured today at roughly 2–13 KB
-per role (`researcher.md` is the smallest at 2.3 KB, `tester.md` the largest
-at 13.2 KB). The cloned repo's *own* `CLAUDE.md` still reaches the run, but
+too. A subagent's role context is the body of its template (for a builtin,
+the file under `api/internal/agenttmpl/builtins/`, roughly 2–14 KB per role:
+`researcher.md` is the smallest at 2.0 KB, `tester.md` the largest at 13.8 KB,
+measured 2026-09-28) plus the runtime block uzi appends to every subagent
+(scratch directory, safety and findings rules, `agent/src/prompt.ts`). The cloned repo's *own* `CLAUDE.md` still reaches the run, but
 only the **lead** sees it, and only as a nonce-fenced `UNTRUSTED, ADVISORY`
 block appended last, after every guardrail instruction (`agent/src/prompt.ts`,
 PRD #246) — never as loaded instructions a model treats as authoritative.
