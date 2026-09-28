@@ -172,8 +172,10 @@ const TERMINAL_JOURNAL_PHASE = "running";
 const QUEUED_DUPLICATE_END_LOG = "queued duplicate claim ended without executing (ownership probe)";
 
 /** PRD #1226 M4 (D6): bounded in-call attempts to capture a VERIFIED completion-hold restore
- *  point before giving up. Mirrors handleRecoveryExhausted's retain-and-retry, but bounded (this
- *  runs synchronously inside the executor's completion loop, not the server-parked recovery loop).
+ *  point before giving up. Mirrors handleRecoveryExhausted's retain-and-retry, but bounded on every
+ *  cause (the recovery loop bounds only blocked proofs, at RECOVERY_CAPTURE_BLOCKED_ATTEMPTS),
+ *  because this runs synchronously inside the executor's completion loop, not the server-parked
+ *  recovery loop.
  *  A never-verified capture DOES NOT park: enterCompletionHold clears its preserve flags and returns
  *  false, so the run's normal terminal cleanup runs (no park, no leak). */
 const COMPLETION_HOLD_CAPTURE_ATTEMPTS = 3;
@@ -189,6 +191,16 @@ const COMPLETION_HOLD_CAPTURE_ATTEMPTS = 3;
  *  CredentialSwitchRetainedStop and the run is left non-terminal for requeue). Only the outer
  *  safety-net arm, which cannot continue in place, leaves a "gave_up" run non-terminal for requeue. */
 const CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS = 3;
+
+/** issue #1783 M3: CONSECUTIVE recovery captures whose quiescence proof blocked (a run-owned
+ *  process survived the reap, or a runner-uid process could not be attributed) before
+ *  handleRecoveryExhausted stops retrying. Such a proof does not clear with time: a non-dumpable
+ *  process that no attempt owns stays unattributable until someone kills it, and the loop's other
+ *  exits (a cancel, a shutdown, the server moving the run) may never come, so an unbounded retry
+ *  held the claim forever. After this many the run fails with fail_origin `worker_residue_blocked`
+ *  (the failure_reason names the blocking pid and comm), the clone and session kept for
+ *  inspection. Any capture outcome that is NOT a blocked proof resets the count. */
+const RECOVERY_CAPTURE_BLOCKED_ATTEMPTS = 5;
 
 /** PRD #1226 M4 (D5): the STATIC, content-free failure_reason a worker reports when the completion
  *  interlock cannot report completed AND cannot park the run for recovery (the restore point never
@@ -246,6 +258,16 @@ type RecoveryParkCause =
   | { kind: "transient" }
   | { kind: "vault_locked" }
   | { kind: "data_volume_full"; preventive: boolean };
+
+/** What {@link RunRunner.captureRecoveryRestorePoint} reports. `residueBlocked` (issue #1783 M3)
+ *  is true when the capture was skipped because its quiescence proof (or the re-proof after its
+ *  WIP marker) blocked; `residueDetail` is then that proof's detail. */
+interface RecoveryCaptureResult {
+  verified: boolean;
+  published: boolean;
+  residueBlocked?: boolean;
+  residueDetail?: string;
+}
 
 /** Issue #1766: how many doublings a vault-lock park's retry wait may grow by before it is capped
  *  (base recoveryRetryMs x 16). */
@@ -8380,8 +8402,13 @@ export class RunRunner {
    * it cannot, reports the sink blocked. Returns true when blocked. Never throws.
    */
   private async reproveAfterRunnerGit(flight: RunFlight, site: string): Promise<boolean> {
+    return (await this.reproveDetailAfterRunnerGit(flight, site)) !== undefined;
+  }
+
+  /** {@link reproveAfterRunnerGit}, returning the blocked proof's detail (undefined when quiescent). */
+  private async reproveDetailAfterRunnerGit(flight: RunFlight, site: string): Promise<string | undefined> {
     const q = await this.quiesceRun(flight, flight.executor, { mode: "own", site: `${site}:after_runner_git`, processOnly: true });
-    return q.blocked;
+    return q.blocked ? (q.outcome.process?.detail ?? "not quiescent") : undefined;
   }
 
   /**
@@ -8479,7 +8506,7 @@ export class RunRunner {
         flight.runLog.warn("run clone is not quiescent", {
           site: opts.site,
           state: outcome.process?.state,
-          detail: outcome.process?.detail,
+          detail: sanitizeForLog(outcome.process?.detail ?? ""),
           processes: describeProcesses(outcome.process),
         });
       } else if (outcome.process && outcome.process.killed.length > 0) {
@@ -10368,6 +10395,12 @@ export class RunRunner {
    * after current HEAD is verified in the worker-owned tracking ref. A failed
    * park report is retried too: live worker heartbeats preclude stale requeue.
    *
+   * issue #1783 M3: the capture retry is BOUNDED for one cause. A capture skipped because its
+   * quiescence proof blocked does not clear by waiting, so after
+   * RECOVERY_CAPTURE_BLOCKED_ATTEMPTS consecutive blocked proofs the run fails with fail_origin
+   * `worker_residue_blocked` (the clone and session kept). Other unverified captures (a failed WIP
+   * commit, fetch-back or verify) still retry until an exit below.
+   *
    * The worker-owned clone journal fences destructive reseeding after restart.
    * Shutdown retains an unverified clone and its session; cancellation and a
    * confirmed terminal state retain their existing cleanup semantics. The
@@ -10445,6 +10478,9 @@ export class RunRunner {
     flight.preserveSession = true;
     let capture: { verified: boolean; published: boolean } | undefined;
     let notified = false;
+    // issue #1783 M3: consecutive capture attempts whose quiescence proof blocked (see
+    // RECOVERY_CAPTURE_BLOCKED_ATTEMPTS); reset by any capture outcome that is not a blocked proof.
+    let blockedCaptures = 0;
     // #1539: the outcome of the cancel branch's pre-report reap, run ONCE while the run is
     // still actively-claimed. undefined = not yet attempted; true = reaped (settle after the
     // terminal report); false = a blocked/failed reap (RETAIN the hold, still report the cancel).
@@ -10687,10 +10723,12 @@ export class RunRunner {
           retries = 0;
         }
         if (!capture) {
+          let blockedDetail: string | undefined;
           try {
             const attempt = await this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
               credentialFree: vault,
             });
+            if (attempt.residueBlocked) blockedDetail = attempt.residueDetail ?? "not quiescent";
             if (attempt.verified) {
               capture = attempt;
               flight.preserveRecoveryClone = false;
@@ -10701,6 +10739,25 @@ export class RunRunner {
             runLog.warn("recovery capture failed; retaining work for retry", {
               error: errMessage(captureError),
             });
+          }
+          blockedCaptures = blockedDetail === undefined ? 0 : blockedCaptures + 1;
+          if (blockedDetail !== undefined && blockedCaptures >= RECOVERY_CAPTURE_BLOCKED_ATTEMPTS) {
+            // issue #1783 M3: the proof keeps blocking, and nothing else is guaranteed to end this
+            // loop. Stop retrying: keep the clone and session for inspection (a surviving process
+            // may still be writing there) and fail the run worker_residue_blocked, its reason
+            // naming the blocking pid and comm. Reported here, not thrown: an error escaping this
+            // handler would leave executeClaim's catch arm without reaching reportGenericFailure.
+            // A RunResidueBlockedError runs no credentialed pre-report reap; a vault-lock park
+            // additionally keeps the custody hold (keepCustody), as its given-up receipt does.
+            flight.preserveRecoveryClone = true;
+            flight.preserveSession = true;
+            runLog.warn("recovery capture: the clone stayed not provably quiescent; failing the run and keeping the clone", {
+              run_id: flight.runId,
+              attempts: blockedCaptures,
+              detail: sanitizeForLog(blockedDetail),
+            });
+            await this.reportGenericFailure(claim, flight, new RunResidueBlockedError(blockedDetail), { keepCustody: vault });
+            return false;
           }
           if (!capture) {
             if (vault) {
@@ -11132,7 +11189,7 @@ export class RunRunner {
     runLog: Logger,
     site: "recovery_capture" | "credential_switch",
     opts: { credentialFree?: boolean; publish?: boolean } = {},
-  ): Promise<{ verified: boolean; published: boolean }> {
+  ): Promise<RecoveryCaptureResult> {
     const barePath = flight.barePath;
     const worktreePath = flight.worktreePath;
     const branch = flight.branch;
@@ -11144,13 +11201,16 @@ export class RunRunner {
     }
     // issue #1783 (auditor M2): prove the clone quiescent BEFORE the capture (its wip marker, the
     // fetch-back and the credentialed overlay + publish). On survivors/unverified NOTHING runs:
-    // the result is unverified, which each caller already treats as its capture-failure branch
-    // (recovery-exhausted retains the clone + session and retries; the credential switch retries,
-    // then gives up with custody kept). The callers set preserveRecoveryClone up front.
+    // the result is unverified and `residueBlocked`, which each caller treats as its
+    // capture-failure branch, BOUNDED (issue #1783 M3): recovery-exhausted retains the clone +
+    // session and retries up to RECOVERY_CAPTURE_BLOCKED_ATTEMPTS consecutive blocked proofs, then
+    // fails the run worker_residue_blocked; the credential switch retries up to
+    // CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS, then gives up with custody kept. The callers set
+    // preserveRecoveryClone up front.
     const proof = await this.quiesceRun(flight, flight.executor, { mode: "own", site });
     if (proof.blocked) {
       runLog.warn("recovery capture skipped: the clone is not provably quiescent; nothing captured or published", { site });
-      return { verified: false, published: false };
+      return { verified: false, published: false, residueBlocked: true, residueDetail: proof.outcome.process?.detail ?? "not quiescent" };
     }
     // Distinguish dirty vs clean EXPLICITLY (runner-uid porcelain) rather than trusting
     // commitWipMarker's ambiguous false (false = a clean tree OR a commit error).
@@ -11173,9 +11233,10 @@ export class RunRunner {
     }
     // issue #1783 (auditor M1): re-prove after the status read / marker (either can start an agent-
     // planted filter) and before the fetch-back, the overlay's PAT fetch and the publish.
-    if (await this.reproveAfterRunnerGit(flight, site)) {
+    const reproofDetail = await this.reproveDetailAfterRunnerGit(flight, site);
+    if (reproofDetail !== undefined) {
       runLog.warn("recovery capture: clone not provably quiescent after the WIP marker; nothing captured or published", { site });
-      return { verified: false, published: false };
+      return { verified: false, published: false, residueBlocked: true, residueDetail: reproofDetail };
     }
     // Fetch the run's tip into the worker bare's tracking ref (refs/uzi-runner/<branch>).
     // fetchAgentBranch THROWS on failure (unlike the void fetchBackBestEffort), so a

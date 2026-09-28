@@ -360,6 +360,8 @@ function parseStatus(text: string): StatusFacts | undefined {
 }
 
 interface StatFacts {
+  /** The comm between the first "(" and the LAST ")", sanitized (a process chooses its own). */
+  comm: string;
   ppid: number;
   pgid: number;
   sid: number;
@@ -369,14 +371,16 @@ interface StatFacts {
 
 function parseStat(text: string): StatFacts | undefined {
   // `pid (comm) state ppid pgrp session …` — comm may itself contain ")" and spaces.
+  const open = text.indexOf("(");
   const close = text.lastIndexOf(")");
-  if (close < 0) return undefined;
+  if (open < 0 || close < open) return undefined;
+  const comm = sanitizeForLog(text.slice(open + 1, close), 64);
   const fields = text.slice(close + 2).trim().split(/\s+/);
   const ppid = Number(fields[1]);
   const pgid = Number(fields[2]);
   const sid = Number(fields[3]);
   if (![ppid, pgid, sid].every(Number.isInteger)) return undefined;
-  return { ppid, pgid, sid, startTime: statStartTime(text) };
+  return { comm, ppid, pgid, sid, startTime: statStartTime(text) };
 }
 
 function parseEnviron(text: string): Map<string, string> {
@@ -553,10 +557,14 @@ export function scanOnce(
     if (!envRead.ok || !cwdRead.ok) {
       // A non-dumpable runner-uid process: attribute by ancestry, else fail closed.
       if (attributedToOtherLive(pid, table, roots)) continue;
+      // The world-readable stat's comm names it for the operator (issue #1783 M2); the status
+      // Name line is the fallback when stat cannot be read.
+      const statRead = tryRead(() => table.readStat(pid));
+      const statComm = statRead.ok ? parseStat(statRead.value)?.comm : undefined;
       result.unverified.push({
         pid,
         uid: status.uid,
-        comm: status.comm,
+        comm: statComm || status.comm,
         cwd: cwdRead.ok ? sanitizeForLog(cwdRead.value) : "unreadable",
         reason: "unreadable_unattributed",
       });
@@ -672,7 +680,7 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
       state: "unverified",
       processes: [...last.unverified, ...last.survivors, ...stuck],
       killed,
-      detail: `${last.unverified.length} runner-uid process(es) could not be attributed`,
+      detail: unverifiedDetail(last.unverified),
     };
   }
   if (last.survivors.length > 0 || stuck.length > 0) {
@@ -684,6 +692,44 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
     };
   }
   return { state: "quiescent", processes: [], killed, detail: `reaped ${killed.length} process(es)` };
+}
+
+/** How many unverified pids an {@link unverifiedDetail} names before "+N more". */
+const UNVERIFIED_DETAIL_NAMED = 2;
+
+/** Why an unverified process could not be attributed, in an operator's words. */
+function unverifiedWhy(reason: string): string {
+  switch (reason) {
+    case "unreadable_unattributed":
+      return "env/cwd unreadable";
+    case "status_unreadable":
+      return "status unreadable";
+    case "status_unparsable":
+      return "status unparsable";
+    default:
+      return sanitizeForLog(reason, 64);
+  }
+}
+
+/**
+ * issue #1783 M2 — the detail of an `unverified` verdict, naming the first pid and its comm FIRST
+ * so they survive the 160-character cap RunResidueBlockedError / CloneResidueBlockedError put on
+ * the failure_reason (the first entry is at most ~130 characters: a 64-character comm plus fixed
+ * text): an operator reads which process to kill. Up to {@link UNVERIFIED_DETAIL_NAMED} pids are
+ * named, the rest counted as "+N more": the unreadable, unattributed ones first (they carry a comm),
+ * then by pid, so the same table always reads back the same detail.
+ */
+function unverifiedDetail(unverified: readonly QuiesceProcess[]): string {
+  const rank = (p: QuiesceProcess): number => (p.reason === "unreadable_unattributed" ? 0 : 1);
+  const [first, ...rest] = [...unverified].sort((a, b) => rank(a) - rank(b) || a.pid - b.pid);
+  if (first === undefined) return "no runner-uid process could be attributed";
+  const name = (p: QuiesceProcess): string => `pid ${p.pid} (${sanitizeForLog(p.comm, 64)})`;
+  let out = `runner-uid ${name(first)} could not be attributed (${unverifiedWhy(first.reason)})`;
+  const named = rest.slice(0, UNVERIFIED_DETAIL_NAMED - 1);
+  for (const p of named) out += `; ${name(p)} (${unverifiedWhy(p.reason)})`;
+  const more = rest.length - named.length;
+  if (more > 0) out += `; +${more} more`;
+  return out;
 }
 
 /**
@@ -1331,5 +1377,7 @@ export function describeProcesses(q: ProcessQuiescence | undefined): Array<Recor
     comm: sanitizeForLog(p.comm, 64),
     cwd: sanitizeForLog(p.cwd),
     reason: sanitizeForLog(p.reason, 64),
+    // issue #1783 M2: say plainly which entries are the operator's to identify and kill.
+    ...(p.reason === "unreadable_unattributed" ? { attribution: "could not be attributed" } : {}),
   }));
 }

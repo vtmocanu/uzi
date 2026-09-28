@@ -94,10 +94,12 @@ function fakeRecovery(): { recovery: RecoveryCoordinator; captures: () => number
 }
 
 /**
- * A quiescer answering `state` at every proof. A blocked recovery capture retries forever while
- * the run's ownership reads `running` (the retain-and-retry posture); after BLOCKED_ATTEMPTS
- * capture proofs it flips the ownership probe to `paused` (an owner action while the worker
- * retries), which ends handleRecoveryExhausted's loop non-parked with the preserve flags still set.
+ * A quiescer answering `state` at every proof. A blocked recovery capture retries while the run's
+ * ownership reads `running` (the retain-and-retry posture), up to the runner's cap of 5 consecutive
+ * blocked proofs (issue #1783 M3, runner-recovery-blocked-bounded.test.ts); after BLOCKED_ATTEMPTS
+ * (below that cap) capture proofs it flips the ownership probe to `paused` (an owner action while
+ * the worker retries), which ends handleRecoveryExhausted's loop non-parked with the preserve flags
+ * still set.
  */
 function quiescer(state: ProcessQuiescenceState, runId: string, order: string[]) {
   const calls: QuiesceRunRequest[] = [];
