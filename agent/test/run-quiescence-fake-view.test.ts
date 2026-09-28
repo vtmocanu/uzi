@@ -278,6 +278,22 @@ describe("the scoped real view lists only this process's descendants and the reg
       fs.writeFileSync(pidFile, `${"x\n".repeat(33 * 1024)}${orphan}\n`);
       const pastCap = await withQuiescenceView(scopedRealView({ pidFiles: [pidFile] }), () => reapProcesses(seed));
       assert.equal(pastCap.state, "quiescent", pastCap.detail);
+
+      // A line cut at the 64 KiB cap is dropped, not read as a pid: the orphan's pid followed by one
+      // more digit straddles the boundary so that exactly the orphan's pid lies inside the cap. Read
+      // as a pid, that fragment would list the orphan.
+      const cap = 64 * 1024;
+      const digits = String(orphan);
+      const padding = `${"x".repeat(cap - digits.length - 1)}\n`;
+      fs.writeFileSync(pidFile, `${padding}${digits}7\n`);
+      assert.equal(fs.readFileSync(pidFile, "utf8").slice(0, cap).split("\n").at(-1), digits, "the cut leaves the orphan's pid");
+      const straddle = await withQuiescenceView(scopedRealView({ pidFiles: [pidFile] }), () => reapProcesses(seed));
+      assert.equal(straddle.state, "quiescent", straddle.detail);
+      assert.ok(!listed(straddle).includes(orphan), "a truncated fragment is not read as a pid");
+      // Control: the same pid ending exactly at the cap, newline included, is read.
+      fs.writeFileSync(pidFile, `${"x".repeat(cap - digits.length - 2)}\n${digits}\n`);
+      const atCap = await withQuiescenceView(scopedRealView({ pidFiles: [pidFile] }), () => reapProcesses(seed));
+      assert.deepEqual(listed(atCap), [orphan], atCap.detail);
       assert.equal(alive(orphan), true, "no scan here signalled the orphan");
     } finally {
       try {

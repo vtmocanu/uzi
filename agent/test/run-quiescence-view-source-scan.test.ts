@@ -57,7 +57,8 @@ describe("production code never installs a quiescence test view", () => {
 
   it("in run-quiescence.ts, the test-view state is written only inside the setter", () => {
     const src = code(OWNER);
-    const writes = matches(src, /\btestView\s*=(?!=)[^;]*;/g);
+    // Plain `=` and the logical assignments `??=`, `||=`, `&&=` (never `==` / `===`).
+    const writes = matches(src, /\btestView\s*(?:\?\?|\|\||&&)?=(?!=)[^;]*;/g);
     assert.deepEqual(writes, ["testView = view === undefined ? undefined : structuredClone(view);"]);
     const setter = /export function setQuiescenceViewForTests\([^)]*\): void \{[\s\S]*?\n\}/.exec(src)?.[0] ?? "";
     assert.ok(setter.includes(writes[0]!), "the one write sits in the setter's body");
@@ -75,8 +76,11 @@ describe("production code never installs a quiescence test view", () => {
       "viewReapDeps(view: QuiescenceView",
     ]);
     assert.match(src, /JSON\.stringify\(testView === undefined \? req : \{ \.\.\.req, view: testView \}\)/);
-    // No other way of attaching one: no `.view =` assignment and no computed "view" key.
+    // No other way of attaching one: no `.view =` assignment, no computed "view" key, and no
+    // shorthand `view` property (`{ ...req, view }`): a bare `view` followed by "," or "}" that is not
+    // a member access or a spread (`o.view`, `...view`).
     assert.deepEqual(matches(src, /\.view\s*=(?!=)/g), []);
     assert.deepEqual(matches(src, /\[\s*["'`]view["'`]\s*\]/g), []);
+    assert.deepEqual(matches(src, /(?<![.\w$])view\s*[,}]/g), []);
   });
 });

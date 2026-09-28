@@ -13,7 +13,7 @@ import {
   type ProcessQuiescence,
   type QuiesceProcess,
 } from "../src/run-quiescence.js";
-import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV } from "../src/worker-spawn-mark.js";
+import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, statStartTime } from "../src/worker-spawn-mark.js";
 import { restoreHermeticView } from "./setup/hermetic-proc.js";
 
 // issue #1783 M4 — the CI incident on the REAL procfs, not a fake root. A real `ssh-agent` (on
@@ -31,8 +31,19 @@ import { restoreHermeticView } from "./setup/hermetic-proc.js";
 // the agent is reparented AWAY from this test process, like a real stray on a worker. As this
 // process's own descendant, a readable unmarked agent would be excluded as "the scanner's own"
 // (R5), which no production stray is. `$!` is the agent's own pid (sh forks, the child execs
-// ssh-agent), confirmed below from its world-readable stat. Every agent is stopped by that exact
-// pid.
+// ssh-agent), confirmed below from its world-readable stat. The launcher writes `$!` to a pidfile
+// before it prints it, so an agent whose launcher fails after starting it is still stopped. Every
+// agent is recorded with its start time (field 22 of its world-readable stat) at launch, and is
+// signalled only by that exact pid, and only while the pid's start time still matches: a pid the
+// kernel has since reused for an unrelated process is never signalled.
+//
+// What each branch actually exercises depends on the host. On a non-root CI runner with a
+// non-dumpable ssh-agent (OpenSSH's default on Linux, and any setgid build), BOTH (a) tests take the
+// unreadable branch: the agent's env and cwd cannot be read, so it is blocked as
+// `unreadable_unattributed` wherever it runs, and the cwd scoping of the first (a) test and the
+// marker scoping of the second are exercised only where the agent IS readable (root, or a dumpable
+// build). The markers test uses ANOTHER live attempt's markers (a registered attempt that is not the
+// one being seeded), so its readable branch proves `live_attempt_conflict`, not own-attempt reaping.
 //
 // These tests deliberately select the REAL process table: setQuiescenceViewForTests(undefined)
 // clears the hermetic default the `npm test` preload installed, which is what production runs
@@ -64,7 +75,13 @@ const SKIP: string | false =
       : false;
 
 let work: string;
-const started = new Set<number>();
+/** Every agent this file launched: pid -> its start time read at launch. */
+const started = new Map<number, number>();
+/** Socket dirs, kept short (under /tmp) so a long TMPDIR cannot overflow sun_path. */
+const sockDirs: string[] = [];
+
+/** sun_path is 108 bytes on Linux, including the terminating NUL. */
+const SUN_PATH_MAX = 107;
 
 before(() => {
   work = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-procfs-ssh-agent-"));
@@ -73,9 +90,10 @@ before(() => {
 });
 
 after(async () => {
-  for (const pid of started) await stopByPid(pid);
+  for (const pid of started.keys()) await stopByPid(pid);
   restoreHermeticView();
   fs.rmSync(work, { recursive: true, force: true });
+  for (const dir of sockDirs) fs.rmSync(dir, { recursive: true, force: true });
 });
 
 /** True while `pid` exists and is not a zombie. */
@@ -87,18 +105,41 @@ function alive(pid: number): boolean {
   }
 }
 
-/** SIGTERM `pid`, then SIGKILL it if it is still alive after 2 s. By exact pid only. */
+/** `pid`'s start time read from procfs now, or undefined when it is gone or unparsable. */
+function startTimeOf(pid: number): number | undefined {
+  try {
+    return statStartTime(procfsTable.readStat(pid));
+  } catch {
+    return undefined;
+  }
+}
+
+/** True while `pid` is alive and is still the process recorded at launch (same start time). */
+function stillOurs(pid: number, startTime: number): boolean {
+  return startTimeOf(pid) === startTime && alive(pid);
+}
+
+/** Record a launched agent by pid and start time; a pid already gone is not recorded. */
+function track(pid: number): void {
+  const startTime = startTimeOf(pid);
+  if (startTime !== undefined) started.set(pid, startTime);
+}
+
+/** SIGTERM `pid`, then SIGKILL it if it is still alive after 2 s. By exact pid only, and only while
+ *  its start time still matches the one recorded at launch, re-checked before each signal. */
 async function stopByPid(pid: number): Promise<void> {
-  if (!started.has(pid)) return;
+  const startTime = started.get(pid);
+  if (startTime === undefined) return;
   started.delete(pid);
+  if (!stillOurs(pid, startTime)) return; // gone, or the pid was reused
   try {
     process.kill(pid, "SIGTERM");
   } catch {
     return; // already gone
   }
   const end = Date.now() + 2_000;
-  while (alive(pid) && Date.now() < end) await new Promise((r) => setTimeout(r, 25));
-  if (alive(pid)) {
+  while (stillOurs(pid, startTime) && Date.now() < end) await new Promise((r) => setTimeout(r, 25));
+  if (stillOurs(pid, startTime)) {
     try {
       process.kill(pid, "SIGKILL");
     } catch {
@@ -107,20 +148,48 @@ async function stopByPid(pid: number): Promise<void> {
   }
 }
 
+/** A fresh, short socket dir: under /tmp when it is usable, else under os.tmpdir(). */
+function shortSockDir(): string {
+  for (const base of ["/tmp", os.tmpdir()]) {
+    try {
+      const dir = fs.mkdtempSync(path.join(base, "uzi-sa-"));
+      sockDirs.push(dir);
+      return dir;
+    } catch {
+      // not writable here; try the next base
+    }
+  }
+  throw new Error("no writable directory for the ssh-agent socket");
+}
+
 /** Start `ssh-agent -D -a <sock>` in `cwd` with exactly `env`, reparented away from this process;
- *  resolve once its socket exists (bounded), with the agent's own pid. */
-async function startAgent(cwd: string, env: NodeJS.ProcessEnv): Promise<number> {
-  const sockDir = fs.mkdtempSync(path.join(work, "sock-"));
+ *  resolve once its socket exists (bounded), with the agent's own pid. Skips the test (undefined)
+ *  when even the short socket path would not fit sun_path. */
+async function startAgent(t: TestContext, cwd: string, env: NodeJS.ProcessEnv): Promise<number | undefined> {
+  const sockDir = shortSockDir();
   const sock = path.join(sockDir, "agent.sock");
-  const out = execFileSync("sh", ["-c", '"$0" -D -a "$1" </dev/null >/dev/null 2>&1 & echo $!', SSH_AGENT!, sock], {
-    cwd,
-    env,
-    encoding: "utf8",
-    timeout: 10_000,
-  });
+  if (Buffer.byteLength(sock) > SUN_PATH_MAX) {
+    t.skip(`the socket path ${sock} exceeds sun_path (${SUN_PATH_MAX} bytes)`);
+    return undefined;
+  }
+  const pidFile = path.join(sockDir, "agent.pid");
+  let out: string;
+  try {
+    out = execFileSync(
+      "sh",
+      ["-c", '"$0" -D -a "$1" </dev/null >/dev/null 2>&1 & echo $! >"$2"; echo $!', SSH_AGENT!, sock, pidFile],
+      { cwd, env, encoding: "utf8", timeout: 10_000 },
+    );
+  } catch (err) {
+    // The launcher failed or timed out: recover the agent's pid from the pidfile, so the cleanup
+    // still stops it.
+    const recovered = Number(fs.existsSync(pidFile) ? fs.readFileSync(pidFile, "utf8").trim() : NaN);
+    if (Number.isSafeInteger(recovered) && recovered > 0) track(recovered);
+    throw err;
+  }
   const pid = Number(out.trim());
   assert.ok(Number.isSafeInteger(pid) && pid > 0, `no agent pid from the launcher: ${JSON.stringify(out)}`);
-  started.add(pid);
+  track(pid);
   const end = Date.now() + 10_000;
   while (!fs.existsSync(sock) && alive(pid) && Date.now() < end) await new Promise((r) => setTimeout(r, 25));
   assert.ok(fs.existsSync(sock), `ssh-agent (pid ${pid}) did not create its socket within 10 s`);
@@ -155,24 +224,29 @@ const UNVERIFIED_REASONS = new Set(["unreadable_unattributed", "status_unreadabl
  * or only counted in "+N more", which the assertion follows (and says so in a diagnostic).
  */
 function assertDetailNames(t: TestContext, q: ProcessQuiescence, pid: number): void {
-  t.diagnostic(`verdict detail (the failure_reason text): ${q.detail}`);
+  t.diagnostic(`verdict detail (what RunResidueBlockedError wraps): ${q.detail}`);
   const rank = (p: QuiesceProcess): number => (p.reason === "unreadable_unattributed" ? 0 : 1);
   const order = q.processes
     .filter((p) => UNVERIFIED_REASONS.has(p.reason))
     .sort((a, b) => rank(a) - rank(b) || a.pid - b.pid)
     .map((p) => p.pid);
   const at = order.indexOf(pid);
+  assert.ok(at >= 0, `pid ${pid} is among the unverified processes: ${JSON.stringify(q.processes)}`);
   if (at === 0) {
     assert.ok(
       q.detail.startsWith(`runner-uid pid ${pid} "ssh-agent" could not be attributed (env/cwd unreadable)`),
       q.detail,
     );
-    assert.ok(q.detail.includes(`pid ${pid} "ssh-agent" could not be attributed`), q.detail);
     return;
   }
   t.diagnostic(`another unattributable runner-uid process ranks first on this host: ${q.detail}`);
-  if (at === 1) assert.ok(q.detail.includes(`; pid ${pid} "ssh-agent" (env/cwd unreadable)`), q.detail);
-  else assert.match(q.detail, /; \+\d+ more$/);
+  if (at === 1) {
+    assert.ok(q.detail.includes(`; pid ${pid} "ssh-agent" (env/cwd unreadable)`), q.detail);
+    return;
+  }
+  // Ranked third or later: only counted, in "+N more", with N every unverified pid past the two named.
+  t.diagnostic(`pid ${pid} ranks ${at + 1}th, so it is only counted in "+N more", not named`);
+  assert.ok(q.detail.endsWith(`; +${order.length - 2} more`), q.detail);
 }
 
 const cloneKeyFor = (clone: string): string => newRunAttempt("run-key-probe", 1, clone, () => []).cloneKey;
@@ -181,7 +255,8 @@ describe("the real procfs reap against a real ssh-agent", { skip: SKIP }, () => 
   it("(a) in scope by cwd: a seed is blocked and names the agent's pid", { timeout: 60_000 }, async (t) => {
     const clone = path.join(work, "runner", "github.com+o+r", "issue-9101");
     fs.mkdirSync(clone, { recursive: true });
-    const pid = await startAgent(clone, { PATH: process.env.PATH });
+    const pid = await startAgent(t, clone, { PATH: process.env.PATH });
+    if (pid === undefined) return;
     try {
       const how = dumpability(pid);
       t.diagnostic(`ssh-agent pid ${pid}: env/cwd ${how} to uid ${process.getuid?.()}`);
@@ -230,12 +305,13 @@ describe("the real procfs reap against a real ssh-agent", { skip: SKIP }, () => 
     const other = newRunAttempt("run-9102", 2, clone, () => []);
     const registry = new LiveAttemptRegistry();
     registry.add(other);
-    const pid = await startAgent(elsewhere, {
+    const pid = await startAgent(t, elsewhere, {
       PATH: process.env.PATH,
       [RUN_ATTEMPT_ENV]: other.marker,
       [RUN_CLONE_ENV]: other.clonePath,
       [RUN_CLONE_KEY_ENV]: other.cloneKey,
     });
+    if (pid === undefined) return;
     try {
       const how = dumpability(pid);
       t.diagnostic(`ssh-agent pid ${pid}: env/cwd ${how} to uid ${process.getuid?.()}`);
@@ -274,7 +350,8 @@ describe("the real procfs reap against a real ssh-agent", { skip: SKIP }, () => 
     const own = newRunAttempt("run-9103", 1, clone, () => []);
     const registry = new LiveAttemptRegistry();
     registry.add(own);
-    const pid = await startAgent(elsewhere, { PATH: process.env.PATH });
+    const pid = await startAgent(t, elsewhere, { PATH: process.env.PATH });
+    if (pid === undefined) return;
     try {
       const how = dumpability(pid);
       t.diagnostic(`ssh-agent pid ${pid}: env/cwd ${how} to uid ${process.getuid?.()}`);
