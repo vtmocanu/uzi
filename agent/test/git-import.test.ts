@@ -145,6 +145,34 @@ function openSink(): Writable {
   return new Writable({ write: (_chunk, _enc, cb) => cb() });
 }
 
+/** A consumer stdin forwarding to `child`'s real stdin that, when the child exits, closes with no
+ *  error (as a supervisor transport may, and as Node does to a child's stdin on its exit). A late
+ *  write's EPIPE is swallowed, so the pipe never breaks: only the exit status and the tip probe
+ *  can judge the import. */
+function closeOnExitStdin(child: ChildProcess): Writable {
+  const target = child.stdin!;
+  target.on("error", () => undefined);
+  const stdin = new Writable({
+    write(chunk: Buffer, _enc, cb) {
+      if (target.destroyed || !target.writable) {
+        cb();
+        return;
+      }
+      target.write(chunk, () => cb());
+    },
+    final(cb) {
+      if (!target.destroyed && target.writable) target.end();
+      cb();
+    },
+    destroy(err, cb) {
+      target.destroy();
+      cb(err);
+    },
+  });
+  child.once("exit", () => stdin.destroy());
+  return stdin;
+}
+
 /** Await `p`, or fail after `ms` (killing `children` first) instead of hanging the suite: a torn-down
  *  path that is missing shows up as an import that never settles. */
 async function settleWithin<T>(p: Promise<T>, ms: number, children: () => (ChildProcess | undefined)[]): Promise<T> {
@@ -589,6 +617,86 @@ describe("GitCache.ensureRunnerCloneObjects (issue #1769 m2)", () => {
       () => [],
     );
     assert.ok(resolves(rc.path, defaultTip), "the tip resolves after the import");
+  });
+
+  // issue #1863: a consumer stdin that closes with no error no longer fails the pipe, so a
+  // consumer that exits 0 WITHOUT indexing the pack passes both exit checks; only the tip
+  // re-probe can refuse it. The replacement consumer's stdin forwards to a real child and, like a
+  // supervisor transport or Node on a child's exit, closes with no error when that child exits
+  // (an EPIPE on a late write is swallowed), so the probe is the only verdict left.
+  for (const [label, argv] of [
+    ["exits at once", ["true"]],
+    ["reads only a prefix", ["sh", "-c", "head -c 40 >/dev/null"]],
+  ] as const) {
+    it(`inside a boundary: a consumer that ${label} with status 0 without indexing fails the tip probe`, async () => {
+      const { bare, rc, defaultTip } = await setup(SELF);
+      let consumer: ChildProcess | undefined;
+      const spawner: BoundaryProcessSpawner = async (request) => {
+        if (!request.argv.includes("index-pack")) return spawnReal(request).handle;
+        const real = spawnReal({ ...request, argv: [...argv] });
+        consumer = real.child;
+        return { ...real.handle, stdin: closeOnExitStdin(real.child) };
+      };
+      const err = await settleWithin(
+        importError(git.withBoundaryProcessSpawner(spawner, new AbortController().signal, () =>
+          git.ensureRunnerCloneObjects(bare, rc.path, defaultTip, [rc.baseCommit]))),
+        30_000,
+        () => [consumer],
+      );
+      assert.strictEqual(err.causeMessage, "the imported pack did not make the tip resolvable in the clone");
+      assert.ok(consumer && consumer.exitCode === 0, "the replacement consumer exited 0");
+      assert.strictEqual(resolves(rc.path, defaultTip), false, "nothing was indexed");
+    });
+  }
+
+  it("inside a boundary: a pipe that breaks on the consumer side while both sides exit 0 names the side and both statuses", async () => {
+    const { bare, rc, defaultTip } = await setup(SELF);
+    const producerOut = new PassThrough();
+    const producerDone = deferred<void>();
+    producerOut.once("close", () => producerDone.resolve());
+    const spawner: BoundaryProcessSpawner = async (request) => {
+      if (request.argv.includes("pack-objects")) {
+        // Holds its output open until the import tears it down, then reports a clean exit.
+        return { stdin: openSink(), stdout: producerOut, stderr: null, completed: producerDone.promise.then(() => ({ code: 0 })) };
+      }
+      if (request.argv.includes("index-pack")) {
+        const stdin = openSink();
+        setImmediate(() => stdin.destroy(Object.assign(new Error("write EPIPE"), { code: "EPIPE" })));
+        return { stdin, stdout: null, stderr: null, completed: producerDone.promise.then(() => ({ code: 0 })) };
+      }
+      return spawnReal(request).handle;
+    };
+    const err = await settleWithin(
+      importError(git.withBoundaryProcessSpawner(spawner, new AbortController().signal, () =>
+        git.ensureRunnerCloneObjects(bare, rc.path, defaultTip, [rc.baseCommit]))),
+      10_000,
+      () => [],
+    );
+    assert.strictEqual(err.causeMessage, "pack stream failed (consumer side; pack-objects exited 0, index-pack exited 0): write EPIPE");
+  });
+
+  it("inside a boundary: a pipe that breaks on the producer side while both sides exit 0 names the side and both statuses", async () => {
+    const { bare, rc, defaultTip } = await setup(SELF);
+    const producerOut = new PassThrough();
+    const producerDone = deferred<void>();
+    producerOut.once("close", () => producerDone.resolve());
+    const spawner: BoundaryProcessSpawner = async (request) => {
+      if (request.argv.includes("pack-objects")) {
+        return { stdin: openSink(), stdout: producerOut, stderr: null, completed: producerDone.promise.then(() => ({ code: 0 })) };
+      }
+      if (request.argv.includes("index-pack")) {
+        setImmediate(() => producerOut.destroy(new Error("pack stream broke")));
+        return { stdin: openSink(), stdout: null, stderr: null, completed: producerDone.promise.then(() => ({ code: 0 })) };
+      }
+      return spawnReal(request).handle;
+    };
+    const err = await settleWithin(
+      importError(git.withBoundaryProcessSpawner(spawner, new AbortController().signal, () =>
+        git.ensureRunnerCloneObjects(bare, rc.path, defaultTip, [rc.baseCommit]))),
+      10_000,
+      () => [],
+    );
+    assert.match(err.causeMessage, /^pack stream failed \(producer side; pack-objects exited 0, index-pack exited 0\): .*pack stream broke/);
   });
 });
 

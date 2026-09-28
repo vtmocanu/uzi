@@ -5575,7 +5575,14 @@ export class GitCache {
     if (producerFailure && producerStopped) failures.push(`${producerFailure} (stopped after its peer failed)`);
     if (consumerFailure && consumerStopped) failures.push(`${consumerFailure} (stopped after its peer failed)`);
     if (failures.length > 0) throw fail(failures.join("; "));
-    if (pipeError !== undefined) throw fail(`pack stream failed: ${gitErrorMessage(pipeError)}`);
+    if (pipeError !== undefined) {
+      // Both sides exited 0 here, yet the stream between them broke: name the side whose stream
+      // errored first and both (settled) exit statuses, so the log says where to look.
+      const side = firstBroken ? `${firstBroken} side` : "side unknown";
+      throw fail(
+        `pack stream failed (${side}; pack-objects exited ${producerCode}, index-pack exited ${consumerResult.code}): ${gitErrorMessage(pipeError)}`,
+      );
+    }
     if (!(await cloneHasTip())) throw fail("the imported pack did not make the tip resolvable in the clone");
     this.log.info("runner clone: imported default-tip objects", {
       path: clonePath,
