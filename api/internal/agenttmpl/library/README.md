@@ -30,7 +30,10 @@ Nothing uzi-specific goes in those files:
   It never gates and needs network access.
 - The weekly `roles-manifest-refresh` workflow runs
   `refresh-role-manifest.sh` and opens a manifest-bump PR when upstream versions
-  move, which reddens `TestBuiltinLibraryDrift` until the bodies are copied.
+  move. That reddens `TestBuiltinLibraryDrift` until the builtins' `version:`
+  stamps match. The test compares numbers only: bumping the stamps without
+  copying the bodies turns it green, so run `task nudge:builtins` to confirm
+  the bodies match.
 
 ## Sync procedure
 

@@ -22,10 +22,13 @@ var productToolDelta = map[string][]string{
 }
 
 // WithProductTools returns d with its builtin's product-only tools appended to an
-// explicit allowlist, deduplicated, in delta order. An empty tools list means
-// "inherit all" and already includes every tool, so it is returned unchanged:
-// appending would turn inherit-all into a narrow allowlist. d itself is not
-// modified.
+// explicit allowlist, deduplicated, in delta order. An empty tools list
+// ("inherit all") is returned unchanged: appending would turn it into a narrow
+// allowlist. The cost is that an inherit-all role gets no delta tool, and the
+// worker attaches the forge MCP server only from an explicit mcp__forge__* grant
+// (agent/src/agents.ts toDefinition), so such a role has no forge access.
+// TestBuiltinsCarryProductToolDelta requires every delta role's shipped file to
+// list its tools. d itself is not modified.
 func WithProductTools(d Definition) Definition {
 	extra := productToolDelta[d.Name]
 	if len(extra) == 0 || len(d.Tools) == 0 {

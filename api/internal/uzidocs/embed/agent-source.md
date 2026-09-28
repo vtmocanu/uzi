@@ -177,7 +177,9 @@ synced body at the tag your uzi release was built from is the same text uzi
 ships: the builtins are unchanged copies of those files. Syncing an older tag
 gives your agents older text than the release ships. A sync that overrides a
 builtin keeps any tools uzi adds to that builtin (for example the fact-checker's
-forge tools), because the source library cannot list them.
+forge tools), because the source library cannot list them. That holds when the
+source role lists its tools; a source role that lists none inherits the default
+set, which does not include uzi's forge tools.
 
 ## Known limitation: an untrusted source can hide characters in a role body
 

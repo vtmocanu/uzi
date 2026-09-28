@@ -279,9 +279,13 @@ describe("issue #581: in-process MCP server wiring for subagents", () => {
   );
   // PRD #1849 D5: the file mirrors upstream, which cannot name uzi's forge tools; the
   // api appends them from agenttmpl/tool_delta.go (WithProductTools) before seeding.
-  // Read both halves, so dropping the grant on the api side still breaks this test.
+  // This builds a fact-checker-shaped allowlist from the file plus the
+  // "fact-checker" entry of that Go map, so it pins the HARNESS wiring (forge tools
+  // in the allowlist => the forge server is attached). What the api actually seeds
+  // is pinned on the Go side (TestBuiltinsCarryProductToolDelta).
   const toolDeltaPath = join(import.meta.dirname, "..", "..", "api", "internal", "agenttmpl", "tool_delta.go");
-  const deltaTools = [...readFileSync(toolDeltaPath, "utf8").matchAll(/"(mcp__forge__[a-z_]+)"/g)].map((m) => m[1]!);
+  const deltaEntry = readFileSync(toolDeltaPath, "utf8").match(/"fact-checker":\s*\{([^}]*)\}/)?.[1] ?? "";
+  const deltaTools = [...deltaEntry.matchAll(/"(mcp__forge__[a-z_]+)"/g)].map((m) => m[1]!);
   const factCheckerTools = [...parseToolsLine(readFileSync(factCheckerPath, "utf8")), ...deltaTools];
   const factChecker: AgentTemplate = {
     name: "fact-checker",
@@ -291,8 +295,8 @@ describe("issue #581: in-process MCP server wiring for subagents", () => {
     model: null,
   };
 
-  it("the real fact-checker builtin resolves to mcpServers ['forge','findings'] in deterministic order", () => {
-    // Anchor to the shipped builtin so the test breaks if it ever drops the forge grant:
+  it("a fact-checker allowlist with the shipped forge delta resolves to mcpServers ['forge','findings'] in deterministic order", () => {
+    // Anchor to the shipped file plus delta so the test breaks if either drops the forge grant:
     // the fact-checker is the whole reason this wiring exists (issue #581).
     assert.ok(
       factCheckerTools.some((t) => t.startsWith("mcp__forge__")),

@@ -77,6 +77,7 @@ func TestRunInstrumentFailures(t *testing.T) {
 		"no upstream flag":        {"-builtins", good},
 		"upstream dir missing":    {"-upstream", filepath.Join(good, "nope"), "-builtins", good},
 		"upstream has no roles":   {"-upstream", t.TempDir(), "-builtins", good},
+		"builtins has no roles":   {"-upstream", good, "-builtins", t.TempDir()},
 		"builtins dir unreadable": {"-upstream", good, "-builtins", filepath.Join(good, "nope")},
 	} {
 		t.Run(name, func(t *testing.T) {

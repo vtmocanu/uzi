@@ -62,6 +62,9 @@ func run(args []string) result {
 	if err != nil {
 		return result{code: 2, stderr: fmt.Sprintf("builtinparity: upstream: %v\n", err)}
 	}
+	if len(shipped) == 0 {
+		return result{code: 2, stderr: fmt.Sprintf("builtinparity: builtins: no role files in %s\n", *builtins)}
+	}
 	if len(up) == 0 {
 		return result{code: 2, stderr: fmt.Sprintf("builtinparity: upstream: no role files in %s\n", *upstream)}
 	}
