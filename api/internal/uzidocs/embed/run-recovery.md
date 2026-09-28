@@ -325,7 +325,9 @@ or at its recovery ref, `refs/uzi-recovery/<run-id>` (see
 [Where the work is kept](#where-the-work-is-kept)) — and, only then, copies
 it into a run-scoped `refs/uzi-salvage/<run-id>`. A promoted copy expires
 after `UZI_RECOVERY_READY_RETENTION` (the same window as the archive
-retention above), by CAS-deleting the salvage ref. Salvage never deletes or
+retention above), by CAS-deleting the salvage ref; if that delete keeps failing, uzi
+gives up after a bounded number of attempts and the last error names the ref that may
+remain. Salvage never deletes or
 moves any other ref: the branch checkpoint ref and any recovery ref stay
 [custody retention](#where-the-work-is-kept)'s, never salvage's, to manage
 — salvage only ever reads them as a source, and only ever creates or deletes

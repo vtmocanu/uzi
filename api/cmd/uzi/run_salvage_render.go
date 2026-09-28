@@ -36,7 +36,7 @@ func salvageStateExplanation(state string) string {
 	case "skipped_secret":
 		return "not saved: the run failed on a secret-scan block"
 	case "expired":
-		return "the salvage copy expired and was removed from the forge"
+		return "the salvage copy expired and was removed from the forge, unless removal kept failing; any remaining ref is named in SALVAGE_ERROR"
 	case "disabled":
 		return "not saved: salvage was turned off for this forge before a copy was made"
 	default:

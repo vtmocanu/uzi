@@ -525,7 +525,8 @@ type SettleSalvageParams struct {
 // CAS-deleted or confirmed absent, or its delete reached the hard ceiling). Any other
 // target state matches no row (0 rows).
 // Settling a row with a created salvage ref to 'unavailable' or 'refused' violates
-// run_salvage_created_keeps_live_check (23514): a public ref is never forgotten.
+// run_salvage_created_keeps_live_check (23514): a public ref is never forgotten, except
+// at the expiry hard ceiling, which settles 'expired' with last_error naming the ref.
 func (q *Queries) SettleSalvage(ctx context.Context, arg SettleSalvageParams) (int64, error) {
 	result, err := q.db.Exec(ctx, settleSalvage, arg.State, arg.RunID)
 	if err != nil {

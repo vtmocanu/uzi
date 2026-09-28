@@ -44,7 +44,7 @@ describe("SalvagePanel per-state copy", () => {
     ["refused", "No copy saved: a different commit already holds this run's salvage ref.", "Not saved"],
     ["failed", "Salvage stopped after repeated attempts.", "Not saved"],
     ["skipped_secret", "Not saved: this run failed on a secret-scan block.", "Not saved"],
-    ["expired", "The saved copy expired and was removed.", "Expired"],
+    ["expired", "The saved copy expired and was removed, unless removal kept failing; the last error names any ref that may remain.", "Expired"],
     ["disabled", "Not saved: salvage was turned off for this forge before a copy was made.", "Off"],
   ];
 
@@ -199,7 +199,7 @@ describe("SalvagePanel fetch command", () => {
     const { rerender } = render(<SalvagePanel run={promoted()} />);
     expect(copyButton()).not.toBeNull();
     rerender(<SalvagePanel run={promoted({ salvage_state: "expired" })} />);
-    expect(screen.getByText("The saved copy expired and was removed.")).toBeTruthy();
+    expect(screen.getByText("The saved copy expired and was removed, unless removal kept failing; the last error names any ref that may remain.")).toBeTruthy();
     expect(copyButton()).toBeNull();
   });
 });

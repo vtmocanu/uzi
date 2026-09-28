@@ -22,8 +22,9 @@
 -- record of a public ref. Settling the row clears the pointer, which lifts the restriction.
 -- The pointer tracks only the salvage ref: the branch checkpoint ref is #1810's, whatever
 -- the row's state. A created salvage ref settles only as 'expired' or 'disabled', both
--- after it is CAS-deleted or confirmed absent. 'unavailable' and 'refused' created no salvage
--- ref. 'failed' means no salvage ref was recorded: an unrecorded one was CAS-deleted first,
+-- after it is CAS-deleted or confirmed absent, except that the expiry hard ceiling settles
+-- 'expired' with no delete and names the ref that may remain in last_error. 'unavailable'
+-- and 'refused' created no salvage ref. 'failed' means no salvage ref was recorded: an unrecorded one was CAS-deleted first,
 -- or the hard ceiling gave up and names it in last_error.
 --
 -- The repo-removal and forge-connection-removal handlers turn that restriction into an
@@ -62,14 +63,16 @@ CREATE TABLE run_salvage (
         'failed',         -- no salvage ref was recorded: an unrecorded one was CAS-deleted
                           -- first, or the hard ceiling gave up and names it in last_error
         'skipped_secret', -- fail_origin push_secret_blocked: never salvaged
-        'expired',        -- the salvage ref was CAS-deleted (or confirmed absent)
+        'expired',        -- the salvage ref was CAS-deleted (or confirmed absent), or
+                          -- the expiry hard ceiling gave up and names it in last_error
         'disabled'        -- the forge was taken off UZI_SALVAGE_FORGES before the create
     )),
     attempts int NOT NULL DEFAULT 0,
     -- Bounded (and scrubbed by the caller) last broker error, shown on the run.
     last_error text CHECK (last_error IS NULL OR char_length(last_error) <= 512),
     -- Set once, when the salvage ref is confirmed to exist at the tip. From then on the row
-    -- keeps its live pointer until the salvage ref is removed ('expired' or 'disabled').
+    -- keeps its live pointer until the salvage ref is removed ('expired' or 'disabled'), or
+    -- the expiry hard ceiling gives up on removing it ('expired', naming it in last_error).
     salvage_created_at timestamptz,
     promoted_at timestamptz,
     expires_at timestamptz,
@@ -77,7 +80,8 @@ CREATE TABLE run_salvage (
     updated_at timestamptz NOT NULL DEFAULT now(),
     -- A created salvage ref is public until it is removed: once salvage_created_at is set,
     -- only 'expired' or 'disabled' (both settle only after the salvage ref is CAS-deleted or
-    -- confirmed absent) may drop the live pointer.
+    -- confirmed absent, except an 'expired' settled by the expiry hard ceiling, whose
+    -- last_error names the ref that may remain) may drop the live pointer.
     CONSTRAINT run_salvage_created_keeps_live_check
         CHECK (NOT (salvage_created_at IS NOT NULL AND state NOT IN ('expired', 'disabled')
                     AND live_run_id IS NULL)),

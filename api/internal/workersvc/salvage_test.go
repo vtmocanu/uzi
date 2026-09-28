@@ -1016,6 +1016,8 @@ func TestSweepSalvageExpiryBackoffPastCap(t *testing.T) {
 	for range salvageMaxItems + 2 {
 		rows = append(rows, expiring(salvageAttemptCap+2, 30*time.Minute))
 	}
+	// Exactly at the cap and recently touched: backed off (the bound is >=, not >).
+	rows = append(rows, expiring(salvageAttemptCap, 30*time.Minute))
 	due := expiring(salvageAttemptCap+2, salvageRetryBackoff) // exactly 1h old: due
 	below := expiring(salvageAttemptCap-1, 0)                 // below the cap: never backed off
 	rows = append(rows, due, below)

@@ -224,7 +224,9 @@ hourly attempts before it stops holding the RESTRICT pointer or spending
 forge calls. A failing expiry delete takes the same bound: past the cap it
 backs off to one retry per hour, and at the ceiling it is settled
 `expired` with no forge call, `last_error` naming the ref and tip left for
-manual deletion. A row is promoted only below the cap, so an expiry always
+manual deletion. The pending and expiry phases share the one `attempts`
+counter, so a copy promoted after several failed create attempts gets fewer
+fast expiry retries; a row is promoted only below the cap, so an expiry always
 gets at least one fast retry first. Both due lists are read up to 50 rows
 (`salvagePendingScanLimit`, `salvageExpiryScanLimit`) and backed-off rows
 are filtered out before the item budget. Each pass handles at most `salvageMaxItems` (5) broker items,

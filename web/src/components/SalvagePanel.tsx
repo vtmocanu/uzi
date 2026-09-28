@@ -59,7 +59,11 @@ const STATE_VIEWS: Record<string, StateView> = {
     tone: "neutral",
     lead: "Not saved: this run failed on a secret-scan block.",
   },
-  expired: { badge: "Expired", tone: "neutral", lead: "The saved copy expired and was removed." },
+  expired: {
+    badge: "Expired",
+    tone: "neutral",
+    lead: "The saved copy expired and was removed, unless removal kept failing; the last error names any ref that may remain.",
+  },
   disabled: { badge: "Off", tone: "neutral", lead: "Not saved: salvage was turned off for this forge before a copy was made." },
 };
 

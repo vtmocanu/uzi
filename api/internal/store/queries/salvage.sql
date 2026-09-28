@@ -102,7 +102,8 @@ WHERE run_id = @run_id::uuid AND state = 'pending' AND salvage_created_at IS NOT
 -- CAS-deleted or confirmed absent, or its delete reached the hard ceiling). Any other
 -- target state matches no row (0 rows).
 -- Settling a row with a created salvage ref to 'unavailable' or 'refused' violates
--- run_salvage_created_keeps_live_check (23514): a public ref is never forgotten.
+-- run_salvage_created_keeps_live_check (23514): a public ref is never forgotten, except
+-- at the expiry hard ceiling, which settles 'expired' with last_error naming the ref.
 UPDATE run_salvage
 SET state = @state::text,
     live_run_id = NULL,

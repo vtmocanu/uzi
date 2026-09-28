@@ -886,7 +886,9 @@ uzi run discard <run-id> --hold <hold-id> --yes
 Salvage is **off by default**. An operator turns it on per forge with
 `UZI_SALVAGE_FORGES` (a comma list of `github`, `gitlab`, `forgejo`). When it is on,
 uzi copies a failed run's last **published** checkpoint to a run-scoped ref,
-`refs/uzi-salvage/<run-id>`, and removes that copy after `UZI_RECOVERY_READY_RETENTION`.
+`refs/uzi-salvage/<run-id>`, and removes that copy after `UZI_RECOVERY_READY_RETENTION`
+(if the removal keeps failing, uzi stops trying and `SALVAGE_ERROR` names the ref that may
+remain).
 The copy is only what the run had checkpointed to the forge, so it may be behind the
 run's final local work. Salvage never moves or deletes the branch's own checkpoint ref.
 
@@ -906,7 +908,7 @@ The other states read `pending` (the copy is being made), `unavailable` (not sav
 published checkpoint was no longer at its recorded tip on the forge, either gone or moved),
 `refused` (the salvage ref already pointed at a different commit), `failed` (salvage stopped after
 repeated attempts; the last error names any ref that may remain), `skipped_secret` (not saved: the run failed on a secret-scan block),
-`expired` (the copy was removed) and `disabled` (not saved: salvage was turned off for
+`expired` (the copy was removed, unless removal kept failing; the last error names any ref that may remain) and `disabled` (not saved: salvage was turned off for
 that forge before a copy was made). `SALVAGE_REF` and `SALVAGE_FETCH` print only for a
 ref of the exact form `refs/uzi-salvage/<run-id>` naming this run. The same values are the run's `salvage_state`,
 `salvage_ref`, `salvage_tip`, `salvage_expires_at` and `salvage_last_error` fields

@@ -62,7 +62,7 @@ func TestRenderRunDetailSalvageStates(t *testing.T) {
 		"refused":        "refused: not saved: the salvage ref already pointed at a different commit",
 		"failed":         "failed: stopped after repeated attempts; any remaining ref is named in SALVAGE_ERROR",
 		"skipped_secret": "skipped_secret: not saved: the run failed on a secret-scan block",
-		"expired":        "expired: the salvage copy expired and was removed from the forge",
+		"expired":        "expired: the salvage copy expired and was removed from the forge, unless removal kept failing; any remaining ref is named in SALVAGE_ERROR",
 		"disabled":       "disabled: not saved: salvage was turned off for this forge before a copy was made",
 	} {
 		out := renderDetail(t, salvageRun(state))
