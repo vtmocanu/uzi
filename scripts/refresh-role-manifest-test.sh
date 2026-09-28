@@ -32,7 +32,10 @@ if os.path.exists(os.path.join(stub, "apply.fail")):
     sys.exit(1)
 for role in args[args.index("apply") + 1:]:
     path = os.path.join(agents, role + ".md")
-    shutil.copy(path, path + ".pre-sync")
+    backup = path + ".pre-sync"
+    if os.path.exists(backup):
+        backup = path + ".pre-sync.2"
+    shutil.copy(path, backup)
     shutil.copy(os.path.join(stub, "new", role + ".md"), path)
 PY
 }
@@ -135,6 +138,19 @@ printf 'agent coder new\n## For this repo\ntail\n' > "$stub/new/coder.md"
 if run_case old; then
   if [ "$(outv roster_changed)" = true ] && [ "$(outv product_changed)" = false ] \
      && grep -q 'agent coder old' "$ghout" && [ ! -e "$repo/.claude/agents/coder.md.pre-sync" ]; then ok "$case_name"; else bad "$case_name" "$out"; fi
+fi
+
+# 7b. a numbered backup is processed and removed, a pre-existing one kept, and a
+# frontmatter-only change is not reported as a dropped body line.
+case_name="numbered backups and body-only dropped lines"; new_case backups
+printf -- '---\nname: coder\ndescription: old words\n---\n\nsame body\n## For this repo\ntail\n' > "$repo/.claude/agents/coder.md"
+printf 'keep me\n' > "$repo/.claude/agents/coder.md.pre-sync"
+(cd "$repo" && git add -A && git -c user.email=t@t -c user.name=t commit -qm fm)
+printf 'coder         1 -> 2     tail 5B    LEGACY    description differs\n' > "$stub/check.txt"; echo 1 > "$stub/check.rc"
+printf -- '---\nname: coder\ndescription: new words\n---\n\nsame body\n## For this repo\ntail\n' > "$stub/new/coder.md"
+if run_case old; then
+  if [ "$(outv roster_changed)" = true ] && [ -e "$repo/.claude/agents/coder.md.pre-sync" ] \
+     && [ ! -e "$repo/.claude/agents/coder.md.pre-sync.2" ] && ! grep -q 'old words' "$ghout"; then ok "$case_name"; else bad "$case_name" "$(cat "$ghout")"; fi
 fi
 
 # 8. allowlisted tester model is silent; another MODIFIED is reported.

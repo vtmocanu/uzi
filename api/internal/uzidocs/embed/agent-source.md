@@ -72,7 +72,7 @@ hand. Two preconditions to know before you click it:
   refused and the URL and folder still get filled — set a ref by hand, or
   ask whoever deployed uzi to allowlist it and try again.
 - **The preset syncs the same roles uzi already ships.** uzi's builtins are
-  copies of that folder at the release named in its
+  copies of that folder at the release commit pinned as `upstream_sha` in its
   `api/internal/agenttmpl/library/manifest.json`, so a sync of the preset only
   changes something when you pick a newer release than your uzi version ships
   (or an older one, which gives your agents older text). It also adds the

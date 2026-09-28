@@ -86,6 +86,13 @@ while IFS= read -r role; do
   [ -f "$product/$role.md" ] || plan="$(jq -c --arg r "$role" '.warnings += ["role \"\($r)\" has no upstream product-agents/\($r).md"]' <<<"$plan")"
 done < <(jq -r 'keys[]' <<<"$manifest_roles")
 
+# body_of FILE: the generic body only, between the frontmatter and the
+# `## For this repo` tail, so a frontmatter change is not reported as a body line.
+body_of() {
+  awk 'NR == 1 && $0 == "---" { fm = 1; next } fm && $0 == "---" { fm = 0; next } fm { next }
+       /^## For this repo/ { exit } { print }' "$1"
+}
+
 warnings="$(jq -r '.warnings[] | "- WARNING: \(.)"' <<<"$plan")"
 product_changed=false
 roster_changed=false
@@ -145,13 +152,18 @@ else
       extra="$(grep -E '[[:space:]]CUSTOM([[:space:]]|$)|in the library, no file here' <<<"$check_out" || true)"
       [ -n "$extra" ] && roster_report="$(printf '%s\n\nRoster differences reported, not changed:\n\n%s\n%s\n%s' "$roster_report" "$fence" "$extra" "$fence")"
       if [ -n "${to_apply// /}" ]; then
+        # sync.py names a backup <role>.md.pre-sync, or .pre-sync.N when one exists;
+        # only the backups this run creates are read and removed.
+        before="$(ls -1 "$agents")"
         # shellcheck disable=SC2086 # to_apply is a space-separated list of role names
         if python3 "$sync_py" --library "$roles_yaml" --agents "$agents" apply ${to_apply} >/dev/null 2>&1; then
           dropped=""
-          for backup in "$agents"/*.md.pre-sync; do
+          for backup in "$agents"/*.md.pre-sync*; do
             [ -e "$backup" ] || continue
-            lines="$(diff "$backup" "${backup%.pre-sync}" | grep -E '^< ' | grep -vE '^< version: ' || true)"
-            [ -n "$lines" ] && dropped="$(printf '%s\n%s:\n%s' "$dropped" "$(basename "${backup%.pre-sync}")" "$lines")"
+            grep -qxF "$(basename "$backup")" <<<"$before" && continue
+            target="${backup%%.pre-sync*}"
+            lines="$(diff <(body_of "$backup") <(body_of "$target") | grep -E '^< ' || true)"
+            [ -n "$lines" ] && dropped="$(printf '%s\n%s:\n%s' "$dropped" "$(basename "$target")" "$lines")"
             rm -f "$backup"
           done
           roster_changed=true
@@ -162,7 +174,10 @@ else
           roster_report="$(printf '%s\n\n%s' "$applied" "$roster_report")"
         else
           git checkout -q -- "$agents" 2>/dev/null || true
-          rm -f "$agents"/*.md.pre-sync
+          for backup in "$agents"/*.md.pre-sync*; do
+            [ -e "$backup" ] || continue
+            grep -qxF "$(basename "$backup")" <<<"$before" || rm -f "$backup"
+          done
           roster_report="$(printf 'Roster sync stopped: sync.py apply failed for %s; nothing changed.\n\n%s' "${to_apply% }" "$roster_report")"
         fi
       fi

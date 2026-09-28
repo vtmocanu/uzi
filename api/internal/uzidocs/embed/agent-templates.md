@@ -29,9 +29,10 @@ additionally publish a **Global** one for everyone. `lead` and
 
 uzi seeds twelve builtin templates. `lead` is uzi's own. The other eleven are
 unchanged copies of uzi's upstream role library (the `product-agents/` folder of
-the skills repository, at the release named in the uzi source's
-`api/internal/agenttmpl/library/manifest.json`), so the same roles work the same
-way in uzi and in a plain Claude Code agent team:
+the skills repository, at the release commit pinned as `upstream_sha` in the uzi
+source's `api/internal/agenttmpl/library/manifest.json`), so their generic role
+text is the same as in a plain Claude Code agent team. uzi adds its runtime
+rules and, for `fact-checker`, its forge tools on top (both explained below):
 
 | Name | Model | What it does |
 |---|---|---|
@@ -165,7 +166,7 @@ an admin has never edited and no [agent source](./agent-source.md) sync has
 replaced) automatically on the next boot after you upgrade uzi: uzi re-applies
 the body it ships for that builtin, so recipient fixes, prompt improvements, and
 sandbox tweaks land without a manual step. Nothing changes between upgrades; the
-role library release a uzi version ships is the one named in its
+role library a uzi version ships is the release commit pinned as `upstream_sha` in its
 `api/internal/agenttmpl/library/manifest.json`. A builtin an admin has
 **customized** is never overwritten on boot; your edit stays until you
 **Reset** it, so customizations remain durable across upgrades.

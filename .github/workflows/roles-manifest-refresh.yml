@@ -54,10 +54,9 @@ jobs:
       - name: Checkout uzi
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
-          # The PAT (if set) is what lets the PR trigger its own CI; else the
-          # built-in token, which can still push and open a PR where the repo
-          # setting allows it, and otherwise the issue fallback runs.
-          token: ${{ secrets.ROLES_REFRESH_TOKEN || github.token }}
+          # No write credential on disk while the upstream release's sync.py runs:
+          # the last step authenticates only its own push and gh calls.
+          persist-credentials: false
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
@@ -90,8 +89,13 @@ jobs:
           scripts/refresh-role-manifest.sh "${RUNNER_TEMP}/skills" "${{ steps.upstream.outputs.sha }}"
 
       - name: Surface the result (PR, or a tracking issue)
-        if: steps.refresh.outputs.changed == 'true' || steps.refresh.outputs.warned == 'true'
+        if: >-
+          steps.refresh.outputs.changed == 'true' || steps.refresh.outputs.warned == 'true'
+          || steps.refresh.outputs.parity_ok != 'true'
         env:
+          # The PAT (if set) is what lets the PR trigger its own CI; else the
+          # built-in token, which can still push and open a PR where the repo
+          # setting allows it, and otherwise the issue fallback runs.
           GH_TOKEN: ${{ secrets.ROLES_REFRESH_TOKEN || github.token }}
           CHANGED: ${{ steps.refresh.outputs.changed }}
           PRODUCT_CHANGED: ${{ steps.refresh.outputs.product_changed }}
@@ -117,8 +121,8 @@ jobs:
           [ -n "${ROSTER_REPORT}" ] && BODY="$(printf '%s\n\n**Dev-team roster** (.claude/agents):\n\n%s' "${BODY}" "${ROSTER_REPORT}")"
           if [ "${PARITY_OK}" = "true" ]; then
             BODY="$(printf '%s\n\n**Parity:** %s' "${BODY}" "${PARITY_REPORT}")"
-          elif [ "${CHANGED}" = "true" ]; then
-            BODY="$(printf '%s\n\n**Parity check did not pass**, so this PR is a draft:\n\n%s' "${BODY}" "${PARITY_REPORT}")"
+          elif [ -n "${PARITY_REPORT}" ]; then
+            BODY="$(printf '%s\n\n**Parity check did not pass** (a PR stays a draft until it does):\n\n%s' "${BODY}" "${PARITY_REPORT}")"
           fi
           [ -n "${WARNINGS}" ] && BODY="$(printf '%s\n\n**Needs a human:**\n\n%s' "${BODY}" "${WARNINGS}")"
 
@@ -143,7 +147,8 @@ jobs:
                 done
           }
 
-          # Warnings: nothing was written (all or nothing). Surface and stop.
+          # Warnings (nothing was written, all or nothing), or a parity failure with
+          # nothing to commit: surface as an issue and stop.
           if [ "${CHANGED}" != "true" ]; then
             upsert_issue "${BODY}"
             exit 0
@@ -174,6 +179,9 @@ jobs:
             exit 0
           fi
 
+          # Authenticate git for this step only (checkout persisted no credential).
+          git config --local http.https://github.com/.extraheader \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)"
           git config user.name "github-actions[bot]"
           git config user.email "${BOT_EMAIL}"
           git checkout -B "${BRANCH}"
@@ -182,13 +190,21 @@ jobs:
             git commit -m "chore(agenttmpl): sync builtins to skills ${UPSTREAM_TAG}" -m "${TRAILER}"
           fi
           if [ "${ROSTER_CHANGED}" = "true" ]; then
-            git add .claude/agents
+            git add -- '.claude/agents/*.md'
             git commit -m "chore(agents): sync the dev-team roster to skills ${UPSTREAM_TAG}" -m "${TRAILER}"
           fi
           git push --force-with-lease="${BRANCH}:${inspected}" origin "${BRANCH}"
 
-          if [ -n "$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')" ]; then
-            echo "Updated the open refresh PR."
+          open_pr="$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "${open_pr}" ]; then
+            gh pr edit "${open_pr}" --body "${BODY}"
+            is_draft="$(gh pr view "${open_pr}" --json isDraft --jq .isDraft)"
+            if [ "${PARITY_OK}" = "true" ] && [ "${is_draft}" = "true" ]; then
+              gh pr ready "${open_pr}"
+            elif [ "${PARITY_OK}" != "true" ] && [ "${is_draft}" != "true" ]; then
+              gh pr ready --undo "${open_pr}"
+            fi
+            echo "Updated the open refresh PR #${open_pr}."
             exit 0
           fi
           draft=()
