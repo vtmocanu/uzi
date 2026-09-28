@@ -10,9 +10,9 @@ import {
   procfsTable,
   quiesceRunAttempt,
   reapProcesses,
+  setQuiescenceViewForTests,
   type ProcessQuiescence,
   type QuiesceProcess,
-  type QuiesceRunDeps,
   type ReapDeps,
   type ScanRequest,
 } from "../src/run-quiescence.js";
@@ -50,10 +50,10 @@ import { restoreHermeticView } from "./setup/hermetic-proc.js";
 // build). The markers test uses ANOTHER live attempt's markers (a registered attempt that is not the
 // one being seeded), so its readable branch proves `live_attempt_conflict`, not own-attempt reaping.
 //
-// Each reap lists only a tracked, test-owned agent as a candidate; ancestry checks can also
-// read other procfs stat entries. Only the unreadable kill case can signal that tracked PID,
-// after checking its recorded start time. That case injects a synthetic UID-split decision
-// through the test-only narrowed table, not through the single-UID production request path.
+// The observation cases scan the full real process table and cannot signal an unmarked
+// process. Only the unreadable kill case narrows the table to a tracked, test-owned agent;
+// it can signal that PID only after checking its recorded start time. That case injects a
+// synthetic UID-split decision, not the single-UID production request path.
 
 const PROC = path.join("/", "proc");
 
@@ -90,7 +90,8 @@ const SUN_PATH_MAX = 107;
 
 before(() => {
   work = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-procfs-ssh-agent-"));
-  // Keep the hermetic default installed; each real procfs reap receives a narrowed table.
+  // Real /proc and production reap timing for the signal-free observation cases.
+  setQuiescenceViewForTests(undefined);
 });
 
 after(async () => {
@@ -301,10 +302,6 @@ function trackedAgentDeps(pid: number, maySignal = false): ReapDeps {
   };
 }
 
-function trackedAgentReap(pid: number): QuiesceRunDeps {
-  return { reap: { ...trackedAgentDeps(pid), viaHelper: false } };
-}
-
 describe("the real procfs reap against a real ssh-agent", { skip: SKIP }, () => {
   it("signals only a tracked unreadable unattributed agent through the narrowed real procfs table", { timeout: 60_000 }, async (t) => {
     const clone = path.join(work, "runner", "github.com+o+r", "issue-9100");
@@ -354,7 +351,7 @@ describe("the real procfs reap against a real ssh-agent", { skip: SKIP }, () => 
         processes: true,
         dockerHost: undefined,
         registry: new LiveAttemptRegistry(),
-      }, trackedAgentReap(pid));
+      });
       const q = out.process!;
       assert.notEqual(q.state, "quiescent", q.detail);
       const entry = q.processes.find((p) => p.pid === pid);
@@ -409,7 +406,7 @@ describe("the real procfs reap against a real ssh-agent", { skip: SKIP }, () => 
         processes: true,
         dockerHost: undefined,
         registry,
-      }, trackedAgentReap(pid));
+      });
       const q = out.process!;
       assert.notEqual(q.state, "quiescent", q.detail);
       const entry = q.processes.find((p) => p.pid === pid);
@@ -449,7 +446,7 @@ describe("the real procfs reap against a real ssh-agent", { skip: SKIP }, () => 
         processes: true,
         dockerHost: undefined,
         registry,
-      }, trackedAgentReap(pid));
+      });
       const q = out.process!;
       const entry = q.processes.find((p) => p.pid === pid);
       assert.ok(!q.killed.includes(pid), "an unrelated process is never signalled");
