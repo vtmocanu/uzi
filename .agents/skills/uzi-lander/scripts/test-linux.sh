@@ -32,6 +32,7 @@ while [ $# -gt 0 ]; do
 done
 
 command -v docker >/dev/null 2>&1 || { echo "BROKEN: docker not on PATH" >&2; exit 2; }
+docker info >/dev/null 2>&1 || { echo "BROKEN: docker daemon unreachable" >&2; exit 2; }
 ROOT=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null) \
   || { echo "BROKEN: not inside a git checkout" >&2; exit 2; }
 if [ "${#TESTS[@]}" -eq 0 ]; then
@@ -48,6 +49,9 @@ trap cleanup EXIT INT TERM
 COPYFILE_DISABLE=1 tar --no-xattrs -C "$ROOT" -cf "$WORK/tree.tar" .agents Taskfile.yml   # no macOS xattr headers
 
 # The test list travels as positional arguments; the script inside reads them with "$@".
+# The container ends with a LANDER_TESTS_RC=<n> line; without it the harness broke (docker
+# refused the run, the image pull or package install failed), which is exit 2, never a test
+# failure.
 # shellcheck disable=SC2016
 docker run --rm --name "$NAME" -v "$WORK":/in:ro "$IMAGE" bash -c '
   set -u
@@ -62,5 +66,8 @@ docker run --rm --name "$NAME" -v "$WORK":/in:ro "$IMAGE" bash -c '
     if bash "$t" > /tmp/out 2>&1; then echo "PASS $t"
     else rc=1; echo "FAIL $t"; tail -5 /tmp/out | sed "s/^/    /"; fi
   done
-  exit "$rc"
-' test-linux "${TESTS[@]}"
+  echo "LANDER_TESTS_RC=$rc"
+' test-linux "${TESTS[@]}" 2>&1 | tee "$WORK/out" || true
+rc=$(sed -n 's/^LANDER_TESTS_RC=\([01]\)$/\1/p' "$WORK/out" | tail -1)
+[ -n "$rc" ] || { echo "BROKEN: the container finished without a test result" >&2; exit 2; }
+exit "$rc"
